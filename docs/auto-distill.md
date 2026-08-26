@@ -100,6 +100,50 @@ The installed receipt is owner-only (`0600`). It preserves which evaluation
 authorized the installed bytes; it does not authorize cron changes, service
 restarts, candidate publication, or rollout to another node.
 
+## Eleven-node Wiki publication
+
+Extraction and publication are intentionally separate. Each canary writes only
+`~/.hermes/logs/auto-<node>.md`; it does not touch a Wiki worktree or create a
+PR. Run `publish_wiki.py` from one designated collector to stage **one** batch
+for the exact canary roster:
+
+```bash
+python3 scripts/auto-distill/publish_wiki.py \
+  --remote seoseo=<ssh-host> --remote dungae=<ssh-host> \
+  --remote sogyo=<ssh-host> --remote nosuk=<ssh-host> \
+  --empty bangtong \
+  --remote yukson=<ssh-host> --remote soonwook=<ssh-host> \
+  --remote gwakga=<ssh-host> --remote jingun=<ssh-host> \
+  --local gongyung="$HOME/.hermes/logs/auto-gongyung.md" \
+  --remote daegyo=<ssh-host>
+```
+
+The default is a body-free preview. Replace `--empty bangtong` with a
+local/remote mapping as soon as that node has an output file. An empty
+declaration is valid only after the operator separately verifies a healthy run
+with zero candidates; a missing file, SSH error, and zero candidates are never
+silently treated as the same state.
+
+After reviewing the counts, add `--apply` to stage only
+`pages/nodes/<node>/AUTO.md`, or `--apply --submit` to invoke exactly one
+`wiki-agent pr`. The latter still does not authorize merge: the Family Wiki
+`wiki-pr-gate` deliberately stays red for AUTO.md, preserving TM-2380 V1's
+human merge gate. Do not put this command on every node or every 30-minute tick;
+that would create overlapping PRs and defeat the single-review batch.
+
+The collector requires all 11 nodes to be accounted for explicitly. It rejects
+ambiguous globs, wrong AUTO.md headers, duplicate candidate keys, merge markers,
+and secret-shaped content before the first Wiki write. Existing Wiki blocks win
+by stable key, so a local `unverified` copy cannot overwrite a human
+`promoted`/`discarded`/`fix-citation` verdict. This also makes a repeated batch
+idempotent. A prior attribution bug may leave an old `auto-<wrong-node>.md` on a
+host; map only the corrected node-specific path and never upload the stale file.
+
+`publish_wiki.py` is source-only collector tooling and is not installed by
+`install-auto-distill.sh`. It does not change `auto-distill.py`, so it does not
+invalidate the extractor's exact-source evaluation receipt. Fleet collection,
+cron scheduling, and live Wiki submission remain separate operating actions.
+
 ## Verification and rollout boundary
 
 Repository verification is hermetic and does not call a model:

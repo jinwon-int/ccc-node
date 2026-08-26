@@ -5,6 +5,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- **Single-batch 11-node auto-distill Wiki publication (#1298).** A designated
+  collector can now account for the exact TM-2380 roster with explicit
+  local/SSH/zero-candidate declarations, preview body-free counts, and merge
+  unseen stable keys into one Wiki worktree before optionally invoking one
+  `wiki-agent pr`. It fails closed on missing roster members, output/read
+  failures, wrong node attribution, duplicate keys, conflict markers, and
+  secret-shaped content; existing Wiki blocks win by key so human verdicts are
+  preserved and reruns are idempotent. Apply/submit are explicit opt-ins and
+  the existing AUTO.md red gate still requires a human merge. The collector is
+  source-only tooling and does not change or install the receipt-bound
+  extractor.
 - **auto-distill codex-lane support (#1295).** Codex-primary nodes can now
   join the TM-2380 canary: `iter_messages` recognizes the Codex CLI rollout
   schema (`response_item`/`message` payloads, `input_text`/`output_text`),
