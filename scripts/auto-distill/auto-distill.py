@@ -261,20 +261,29 @@ SELF_MARK = "AUTO-DISTILL-EXTRACTION-V1"
 SELF_MARK_LEGACY = "--- 발췌 시작 ---"
 
 
-def iter_messages(path):
+def iter_messages(path, since_line=0):
     """세션 파일에서 (lineno, id, role, text) 를 생성한다.
 
     두 스키마를 지원한다:
       - piri:        {"type":"message", "id":..., "message":{"role","content"}}
       - Claude Code: {"type":"user"|"assistant", "uuid":..., "message":{...}}
 
+    since_line: 이 줄 번호 이하는 **json.loads 전에** 건너뛴다. 워터마크
+    증가분만 필요할 때 이미 처리한 구간을 다시 파싱하는 비용을 없앤다
+    (예전에는 전 줄을 파싱하고 호출부가 n <= since_line 을 버렸다).
+
     INV-2 주의: 스키마 분기를 빠뜨리면 이 함수가 조용히 0건을 내고, 호출부는
     그것을 "건질 게 없는 세션"으로 오해한다. 그래서 인식된 스키마를 세어
     호출부가 '한 줄도 인식 못 함'과 '내용이 없음'을 구분할 수 있게 한다.
+    since_line > 0 은 이전 실행이 스키마를 인식하고 남긴 워터마크에서만 오므로
+    (lines==0 이면 호출부가 0 을 넘긴다), 건너뛴 구간은 인식된 것으로 친다 —
+    증가분이 비어 있을 때 too_small 이 unknown_schema 로 둔갑하지 않게.
     """
-    seen_schema = False
+    seen_schema = since_line > 0
     with open(path, errors="replace") as fh:
         for n, line in enumerate(fh, 1):
+            if n <= since_line:
+                continue
             line = line.strip()
             if not line:
                 continue
@@ -348,12 +357,13 @@ def digest_session(path, since_line=0):
     thinking / toolCall / toolResult 는 버린다. 실측 3.2MB -> 126KB (3%).
     각 줄에 메시지 id 를 붙여 모델이 인용할 앵커로 쓴다.
     """
-    kept, ids, n = [], {}, 0
+    # n 을 since_line 에서 시작: 증가분이 비어도 워터마크가 0 으로 퇴행해
+    # 다음 회차가 전체를 재처리하는 일이 없게 한다 (append-only 파일에서
+    # 예전 동작과 같은 값 — 마지막 yield 줄 == 직전 워터마크).
+    kept, ids, n = [], {}, since_line
     anon = 0
-    for n_, mid, role, txt in iter_messages(path):
+    for n_, mid, role, txt in iter_messages(path, since_line=since_line):
         n = n_
-        if n_ <= since_line:
-            continue
         if not mid:
             # 앵커 없는 줄은 증거로 인용될 수 없다. 파일 내 안정적인 대체 id를 준다.
             anon += 1
@@ -651,6 +661,27 @@ def _window_body(sec_lines, cap, focus="", match_idx=0):
     return head.rstrip() + "…"
 
 
+# section_body 는 항목·토큰마다 같은 위키 파일을 다시 readlines 했다.
+# 위키 캐시는 회차 시작에 한 번만 동기화되므로 실행 중에는 불변 — 실행 단위
+# 캐시로 중복 읽기를 없앤다. 크기 상한(FIFO)으로 긴 실행의 메모리를 묶는다.
+_SECTION_LINES_CACHE = {}      # path -> readlines() 결과 (실패는 None 으로 캐시)
+_SECTION_LINES_CACHE_MAX = 256
+
+
+def _section_lines(path):
+    if path in _SECTION_LINES_CACHE:
+        return _SECTION_LINES_CACHE[path]
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except Exception:
+        lines = None
+    if len(_SECTION_LINES_CACHE) >= _SECTION_LINES_CACHE_MAX:
+        _SECTION_LINES_CACHE.pop(next(iter(_SECTION_LINES_CACHE)))
+    _SECTION_LINES_CACHE[path] = lines
+    return lines
+
+
 def section_body(path, lineno=None, needle=None, cap=1500, focus=""):
     """매칭 라인이 속한 ## 섹션 본문 (heading → 다음 heading 직전).
 
@@ -663,11 +694,7 @@ def section_body(path, lineno=None, needle=None, cap=1500, focus=""):
     전부 같은 섹션). focus(항목 사실문)가 있고 뒤쪽 창 점수가 더 높으면
     그 창을 넘긴다. cap 자체는 높이지 않는다.
     """
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
-    except Exception:
-        return ""
+    lines = _section_lines(path)
     if not lines:
         return ""
     idx = None
@@ -722,19 +749,8 @@ TOKEN_RES = [
 ]
 
 
-def literal_hits(fact, limit=3):  # noqa: C901 - preserved production parser
-    """Wiki 캐시에서 **리터럴**로 같은 표식을 찾는다.
-
-    의미검색 인덱스는 임베딩 빌드 시점에 묶인다. 그런데 이 파이프라인의 최악
-    사례는 정확히 그 지연 구간에 있다 — 세션이 위키에 기록하고 30분 뒤 크론이
-    그 세션을 증류하는데, 인덱스는 몇 시간 전 것이다(2026-08-22 실측: 방금 머지한
-    LOG를 정본 대조가 못 보고 다시 후보로 올렸다).
-
-    캐시 파일은 rsync 로 오므로 임베딩 없이 즉시 최신이다. 의미검색이 못 보는
-    지연 구간과, 표현이 달라 유사도가 낮은 경우를 리터럴이 메운다.
-    """
-    if not os.path.isdir(WIKI_CACHE):
-        return []
+def _literal_tokens(fact):
+    """fact 에서 리터럴 대조용 토큰을 뽑는다 (literal_hits 의 선정 규칙 그대로)."""
     toks = []
     for rx in TOKEN_RES:
         for m in rx.finditer(fact or ""):
@@ -745,31 +761,95 @@ def literal_hits(fact, limit=3):  # noqa: C901 - preserved production parser
                 continue
             if t and t.lower() not in ("true", "false", "null", "none") and t not in toks:
                 toks.append(t)
+    return toks
+
+
+def _collect_literal_tokens(items):
+    """실행 항목 전체의 리터럴 토큰 합집합. 항목별 선정 순서(≤10개)를 보존한다."""
+    seen, out = set(), []
+    for it in items:
+        for t in _literal_tokens(it.get("fact", "") or "")[:10]:
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+    return out
+
+
+def build_literal_index(tokens, timeout=60):
+    """토큰 전부를 grep **한 번**으로 찾는다: token -> [(path, lineno, line)].
+
+    예전에는 항목마다 토큰(≤10)별 `grep -rIl` + 히트 파일당 `grep -n -m1` 을
+    돌려 회차당 수십~수백 프로세스가 떴다. 패턴 파일 하나로 트리를 한 번만
+    훑고, 조회는 인메모리로 한다. grep -r 의 트리 순회 순서는 패턴 수와
+    무관하므로 토큰별 (파일 순서, 파일당 첫 매치 줄) 이 기존과 동일하다.
+
+    -o 를 쓰지 않는 이유: 겹치는 토큰(`TM-2380` ⊂ `TM-2380-foo`)이 서로의
+    매치를 가리고, 발췌 실패 시 대체 발췌로 쓸 매치 줄 원문도 사라진다.
+    매치 줄 전체를 받아 파이썬 부분문자열 검사로 토큰에 배정하면 grep 을
+    토큰별로 돌린 것과 같은 결과가 나온다.
+    """
+    index = {t: [] for t in tokens}
+    if not tokens or not os.path.isdir(WIKI_CACHE):
+        return index
+    import tempfile
+    pats = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".pats", delete=False) as pf:
+            pf.write("\n".join(tokens) + "\n")
+            pats = pf.name
+        r = subprocess.run(
+            ["grep", "-rInF", "--include=*.md", "-f", pats, WIKI_CACHE],
+            capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return index          # 실패해도 열어 둔다 — 대조 불가는 폐기가 아니다
+    finally:
+        if pats:
+            try:
+                os.unlink(pats)
+            except OSError:
+                pass
+    seen = set()   # (token, path) — 파일당 첫 매치만 담는다 (grep -n -m1 과 동일)
+    for line in r.stdout.splitlines():
+        try:
+            path, no, text = line.split(":", 2)
+        except ValueError:
+            continue
+        if not no.isdigit():
+            continue
+        for t in tokens:
+            if t in text and (t, path) not in seen:
+                seen.add((t, path))
+                index[t].append((path, int(no), text))
+    return index
+
+
+def literal_hits(fact, limit=3, index=None):
+    """Wiki 캐시에서 **리터럴**로 같은 표식을 찾는다.
+
+    의미검색 인덱스는 임베딩 빌드 시점에 묶인다. 그런데 이 파이프라인의 최악
+    사례는 정확히 그 지연 구간에 있다 — 세션이 위키에 기록하고 30분 뒤 크론이
+    그 세션을 증류하는데, 인덱스는 몇 시간 전 것이다(2026-08-22 실측: 방금 머지한
+    LOG를 정본 대조가 못 보고 다시 후보로 올렸다).
+
+    캐시 파일은 rsync 로 오므로 임베딩 없이 즉시 최신이다. 의미검색이 못 보는
+    지연 구간과, 표현이 달라 유사도가 낮은 경우를 리터럴이 메운다.
+
+    index: build_literal_index() 가 만든 실행 단위 인덱스. 넘기면 grep 없이
+    조회만 한다 (canon_dedup 이 항목 루프 앞에서 한 번 만들어 재사용).
+    """
+    if not os.path.isdir(WIKI_CACHE):
+        return []
+    toks = _literal_tokens(fact)[:10]
     if not toks:
         return []
+    if index is None:
+        index = build_literal_index(toks)
     out = []
-    for t in toks[:10]:
-        try:
-            r = subprocess.run(
-                ["grep", "-rIl", "--include=*.md", "-F", "-e", t, WIKI_CACHE],
-                capture_output=True, text=True, timeout=20)
-        except Exception:
-            continue
-        for path in r.stdout.splitlines():
+    for t in toks:
+        for path, lineno, line in index.get(t, []):
             if CANON_EXCLUDE.search(path):     # 자기 자신(스테이징)은 정본이 아니다
                 continue
             rel = os.path.relpath(path, os.path.dirname(WIKI_CACHE))
-            try:
-                g = subprocess.run(["grep", "-n", "-m1", "-F", "-e", t, path],
-                                   capture_output=True, text=True, timeout=10)
-            except Exception:
-                continue
-            raw = g.stdout.strip()
-            lineno, line = None, raw
-            if raw and ":" in raw:
-                no, rest = raw.split(":", 1)
-                if no.isdigit():
-                    lineno, line = int(no), rest
             excerpt = section_body(path, lineno=lineno, needle=t, focus=fact) or (line.strip()[:400] if line else "")
             if excerpt:
                 out.append("%s :: [리터럴 `%s`] %s" % (rel, t, excerpt))
@@ -878,13 +958,16 @@ def canon_dedup(items, model_cmd, timeout, digest=""):
     """
     kept, dropped, total = [], [], {}
     self_addrs = self_canon_addrs(digest)
+    # 리터럴 채널 인덱스 — 실행당 grep 한 번. 항목별 토큰 선정 규칙은 그대로
+    # 두고 (같은 토큰이 같은 순서로 뽑힌다) 조회만 인메모리로 바꾼다.
+    lit_index = build_literal_index(_collect_literal_tokens(items))
     for it in items:
         fact = it.get("fact", "") or ""
         q = (it.get("title", "") or "")[:60] + " " + fact[:120]
         snips = canon_snippets(q.strip())
         # 리터럴 채널 — 의미검색의 인덱스 지연과 표현 차이를 메운다. 두 채널을
         # 합쳐 넘기고 판정은 한 번만 한다(호출 수를 늘리지 않는다).
-        lits = literal_hits(fact)
+        lits = literal_hits(fact, index=lit_index)
         # 세션이 밝힌 주소의 정본 본문 — 검색이 못 찾는 구간을 정확히 메운다.
         # 발췌 창은 항목 사실문에 맞춘다(같은 LOG 라도 항목마다 다른 문단).
         self_addr = format_self_canon(self_addrs, focus=fact)
@@ -1150,7 +1233,16 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
         got = glob.glob(d + "/*/*.jsonl") + glob.glob(d + "/*.jsonl")
         print("소스 %s: %d개" % (name, len(got)))
         files += got
-    files = sorted(set(files), key=os.path.getmtime, reverse=True)
+    # stat 은 파일당 한 번만 한다 — 정렬키·지평·워터마크(·워터마크 저장)가 같은
+    # 값을 재사용한다. 나열과 stat 사이에 사라진 파일은 조용히 제외한다
+    # (예전에는 정렬 도중 getmtime 이 예외를 던져 회차 전체가 죽었다).
+    mtimes = {}
+    for f in set(files):
+        try:
+            mtimes[f] = os.path.getmtime(f)
+        except OSError:
+            continue
+    files = sorted(mtimes, key=mtimes.__getitem__, reverse=True)
 
     # 콜드스타트 지평. 워터마크가 없는 첫 회차에는 모든 과거 세션이 "신규"로 보인다
     # (실측 2026-08-22: 소교 697 · 노숙 193 · 곽가 90 · 육손 78). 지평이 없으면
@@ -1160,18 +1252,24 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     too_old = 0
     horizon = time.time() - args.max_age_days * 86400 if args.max_age_days > 0 else 0
     for f in files:
-        if horizon and os.path.getmtime(f) < horizon:
+        mtime = mtimes[f]
+        if horizon and mtime < horizon:
             too_old += 1
+            continue
+        # 싼 게이트(워터마크/mtime)를 먼저 — 변화 없는 파일은 열지 않는다.
+        # 예전에는 is_self_call 이 먼저라 1000+ 파일 전부를 매 회차 열어 JSON
+        # 파싱했다. 워터마크로 걸러진 자기호출 세션은 이제 skip(self_call)
+        # 감사 이벤트를 매 회차 남기지 않는다 — 의도된 로그 소음 제거.
+        key = hashlib.sha256(f.encode()).hexdigest()[:16]
+        prev = wm.get(key, {})
+        if not (prev.get("lines", 0) == 0 or mtime > prev.get("mtime", 0)):
             continue
         if is_self_call(f):
             self_calls += 1
             log_audit({"event": "skip", "session": os.path.basename(f)[:24],
                        "reason": "self_call"})
             continue
-        key = hashlib.sha256(f.encode()).hexdigest()[:16]
-        prev = wm.get(key, {})
-        if prev.get("lines", 0) == 0 or os.path.getmtime(f) > prev.get("mtime", 0):
-            todo.append((f, key, prev.get("lines", 0)))
+        todo.append((f, key, prev.get("lines", 0)))
     if args.only:
         todo = [t for t in todo if args.only in os.path.basename(t[0])]
     skipped = max(0, len(todo) - args.cap)
@@ -1199,7 +1297,9 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
             print("  skip  %s  (%s, 증가분 %dB < %dB)" % (name, reason, len(digest), MIN_TEXT))
             log_audit({"event": "skip", "session": name, "reason": reason, "bytes": len(digest)})
             if not args.dry_run:
-                wm[key] = {"lines": total, "mtime": os.path.getmtime(f), "path": f}
+                # 스캔 시점 mtime 을 기록한다: 다이제스트 이후 붙은 내용이 있으면
+                # 파일 mtime 이 이보다 새로워져 다음 회차가 반드시 다시 본다.
+                wm[key] = {"lines": total, "mtime": mtimes[f], "path": f}
             continue
         print("  추출  %s  증가분 %dB / %d줄 ... " % (name, len(digest), total - since), end="", flush=True)
         data, (err, usage, raw) = extract(digest, model_cmd, args.timeout)
@@ -1332,7 +1432,7 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
                 rendered_dup += skipped_dup
 
         if not args.dry_run:
-            wm[key] = {"lines": total, "mtime": os.path.getmtime(f), "path": f}
+            wm[key] = {"lines": total, "mtime": mtimes[f], "path": f}
 
     print()
     print("=" * 60)

@@ -314,5 +314,184 @@ class ModelCommandTest(unittest.TestCase):
         self.assertNotIn("argv", audit[0])
 
 
+class IterMessagesSinceLineTest(unittest.TestCase):
+    """iter_messages(since_line=...) skips already-processed lines pre-parse."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    @staticmethod
+    def message(index: int, role: str = "user") -> str:
+        return json.dumps({
+            "type": "message",
+            "id": "m%07d" % index,
+            "message": {"role": role, "content": "line %d" % index},
+        })
+
+    def write_session(self, lines: list[str]) -> Path:
+        path = self.root / "session.jsonl"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_default_scan_yields_every_message_with_unchanged_shape(self) -> None:
+        path = self.write_session([self.message(1), self.message(2, "assistant")])
+        got = list(AUTO_DISTILL.iter_messages(str(path)))
+        self.assertEqual(
+            [(1, "m0000001", "user", "line 1"), (2, "m0000002", "assistant", "line 2")],
+            got,
+        )
+        self.assertTrue(AUTO_DISTILL.iter_messages.last_schema_ok)
+
+    def test_since_line_skips_lines_before_json_parse(self) -> None:
+        path = self.write_session([
+            "{this line is not JSON and must never reach json.loads",
+            self.message(2),
+            self.message(3, "assistant"),
+            self.message(4),
+        ])
+        parsed: list[str] = []
+        real_loads = json.loads
+
+        def counting_loads(text, *args, **kwargs):
+            parsed.append(text)
+            return real_loads(text, *args, **kwargs)
+
+        with patch.object(AUTO_DISTILL.json, "loads", side_effect=counting_loads):
+            got = list(AUTO_DISTILL.iter_messages(str(path), since_line=2))
+        self.assertEqual(
+            [(3, "m0000003", "assistant", "line 3"), (4, "m0000004", "user", "line 4")],
+            got,
+        )
+        # Lines 1-2 (the malformed line included) were skipped before parsing.
+        self.assertEqual(len(parsed), 2)
+        self.assertTrue(all("line is not JSON" not in text for text in parsed))
+
+    def test_since_line_past_content_marks_schema_ok(self) -> None:
+        path = self.write_session([self.message(1), self.message(2)])
+        got = list(AUTO_DISTILL.iter_messages(str(path), since_line=2))
+        self.assertEqual(got, [])
+        # A positive watermark only exists because a previous run recognized
+        # the schema, so an empty increment must not read as unknown_schema.
+        self.assertTrue(AUTO_DISTILL.iter_messages.last_schema_ok)
+
+    def test_digest_session_reads_only_the_increment(self) -> None:
+        path = self.write_session(
+            [self.message(1), self.message(2, "assistant"), self.message(3)]
+        )
+        digest, ids, total = AUTO_DISTILL.digest_session(str(path), since_line=1)
+        self.assertEqual(total, 3)
+        self.assertNotIn("line 1", digest)
+        self.assertIn("line 2", digest)
+        self.assertIn("line 3", digest)
+        self.assertEqual(sorted(ids), ["m0000002", "m0000003"])
+
+    def test_digest_session_empty_increment_keeps_watermark_total(self) -> None:
+        path = self.write_session([self.message(1), self.message(2)])
+        digest, ids, total = AUTO_DISTILL.digest_session(str(path), since_line=2)
+        self.assertEqual(digest, "")
+        self.assertEqual(ids, {})
+        # total must stay at the watermark, not collapse to 0 (a 0 watermark
+        # would make every later run reprocess the whole file).
+        self.assertEqual(total, 2)
+
+
+class LiteralHitsIndexTest(unittest.TestCase):
+    """One-pass grep index preserves per-item literal_hits semantics."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.pages = Path(self.temp.name) / "wiki-cache" / "pages"
+        (self.pages / "log").mkdir(parents=True)
+        (self.pages / "nodes" / "x").mkdir(parents=True)
+        (self.pages / "log" / "alpha.md").write_text(
+            "# doc\n"
+            "## TM-2380-foo rollout\n"
+            "GUARD_TOKEN appears with detail\n",
+            encoding="utf-8",
+        )
+        (self.pages / "log" / "beta.md").write_text(
+            "intro\n"
+            "## beta section\n"
+            "GUARD_TOKEN appears again\n",
+            encoding="utf-8",
+        )
+        # Staging page: must be indexable but filtered out of literal_hits.
+        (self.pages / "nodes" / "x" / "AUTO.md").write_text(
+            "TM-2380-foo staged copy with GUARD_TOKEN\n", encoding="utf-8"
+        )
+        self.cache_patch = patch.object(
+            AUTO_DISTILL, "WIKI_CACHE", str(self.pages)
+        )
+        self.cache_patch.start()
+
+    def tearDown(self) -> None:
+        self.cache_patch.stop()
+        self.temp.cleanup()
+
+    def test_index_records_first_match_line_per_file(self) -> None:
+        index = AUTO_DISTILL.build_literal_index(["GUARD_TOKEN"])
+        hits = {path: lineno for path, lineno, _text in index["GUARD_TOKEN"]}
+        self.assertEqual(
+            hits,
+            {
+                str(self.pages / "log" / "alpha.md"): 3,
+                str(self.pages / "log" / "beta.md"): 3,
+                str(self.pages / "nodes" / "x" / "AUTO.md"): 1,
+            },
+        )
+
+    def test_overlapping_tokens_are_both_indexed(self) -> None:
+        # A grep -o pass would report only the longest match at a position;
+        # substring assignment must keep BOTH tokens for the same line.
+        index = AUTO_DISTILL.build_literal_index(["TM-2380", "TM-2380-foo"])
+        alpha = str(self.pages / "log" / "alpha.md")
+        self.assertIn((alpha, 2), [(p, n) for p, n, _t in index["TM-2380"]])
+        self.assertIn((alpha, 2), [(p, n) for p, n, _t in index["TM-2380-foo"]])
+
+    def test_literal_hits_with_shared_index_matches_self_built(self) -> None:
+        fact = "TM-2380-foo rollout uses GUARD_TOKEN"
+        tokens = AUTO_DISTILL._collect_literal_tokens([{"fact": fact}])
+        shared = AUTO_DISTILL.build_literal_index(tokens)
+        self.assertEqual(
+            AUTO_DISTILL.literal_hits(fact),
+            AUTO_DISTILL.literal_hits(fact, index=shared),
+        )
+
+    def test_literal_hits_excludes_staging_and_formats_relative_paths(self) -> None:
+        hits = AUTO_DISTILL.literal_hits("GUARD_TOKEN observed")
+        self.assertTrue(hits)
+        self.assertTrue(all("AUTO.md" not in hit for hit in hits))
+        self.assertTrue(
+            all(hit.startswith("pages/log/") and " :: [리터럴 `GUARD_TOKEN`] " in hit
+                for hit in hits)
+        )
+
+    def test_literal_hits_honours_limit(self) -> None:
+        hits = AUTO_DISTILL.literal_hits("GUARD_TOKEN observed", limit=1)
+        self.assertEqual(len(hits), 1)
+
+    def test_missing_cache_dir_fails_open_to_empty(self) -> None:
+        with patch.object(AUTO_DISTILL, "WIKI_CACHE", str(self.pages / "absent")):
+            self.assertEqual(AUTO_DISTILL.literal_hits("GUARD_TOKEN observed"), [])
+            self.assertEqual(
+                AUTO_DISTILL.build_literal_index(["GUARD_TOKEN"]),
+                {"GUARD_TOKEN": []},
+            )
+
+    def test_section_body_lines_are_cached_per_run(self) -> None:
+        target = self.pages / "log" / "cached.md"
+        target.write_text("## cached head\nGUARD_TOKEN body line\n", encoding="utf-8")
+        first = AUTO_DISTILL.section_body(str(target), lineno=2)
+        self.assertIn("GUARD_TOKEN", first)
+        target.unlink()
+        # The wiki cache is static within a run; the cached lines must serve
+        # repeat lookups without re-reading the file.
+        self.assertEqual(AUTO_DISTILL.section_body(str(target), lineno=2), first)
+
+
 if __name__ == "__main__":
     unittest.main()
