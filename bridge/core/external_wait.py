@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -145,6 +146,9 @@ class ExternalWaitRegistry:
         self._path = Path(path)
         self._lock = threading.Lock()
         self._clock = clock
+        # Exact bytes of the last payload this process wrote; reused as the
+        # previous-good backup source (see TaskLedger._write).
+        self._last_payload: Optional[bytes] = None
 
     @property
     def _backup_path(self) -> Path:
@@ -181,9 +185,14 @@ class ExternalWaitRegistry:
         payload = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         try:
             if self._path.exists():
-                previous = self._path.read_bytes()
+                previous = self._last_payload
+                if previous is None:
+                    previous = self._path.read_bytes()
+                    if previous.strip():
+                        json.loads(previous)
+                    else:
+                        previous = b""
                 if previous.strip():
-                    json.loads(previous)
                     _atomic_write_bytes(self._backup_path, previous)
         except Exception:
             pass
@@ -191,6 +200,7 @@ class ExternalWaitRegistry:
             _atomic_write_bytes(self._path, payload)
         except SessionStoreDurabilityError:
             logger.warning("External-wait registry dir-fsync unconfirmed; state written")
+        self._last_payload = payload
 
     def _mutate(self, fn) -> Any:
         with self._lock:
@@ -482,6 +492,43 @@ class ExternalWaitRegistry:
             if rec.get("state") == STATE_MONITORING
             and float(rec.get("next_poll_epoch") or 0) <= now_value
         ]
+
+    _MISSING_STATE_IDENTITY = ("missing",)
+
+    def state_file_identity(self) -> Optional[tuple]:
+        """Cheap stat-based identity of the registry file (no read/parse).
+
+        A missing file is a stable sentinel (empty registry); an unreadable
+        one is None so callers never treat it as unchanged.
+        """
+        try:
+            info = os.stat(self._path)
+        except FileNotFoundError:
+            return self._MISSING_STATE_IDENTITY
+        except OSError:
+            return None
+        return (info.st_mtime_ns, info.st_size, info.st_ino)
+
+    def idle_snapshot_identity(self) -> Optional[tuple]:
+        """Identity of the state file iff it holds no actionable work.
+
+        Returns the current ``state_file_identity`` only when there is no
+        monitoring record and no pending wake — the one situation where time
+        alone cannot create work, so a caller may skip re-reading until the
+        file identity changes. Any other state returns None.
+        """
+        identity = self.state_file_identity()
+        if identity is None:
+            return None
+        with self._lock:
+            records = self._read()
+        for rec in records.values():
+            if rec.get("state") == STATE_MONITORING:
+                return None
+            wake = rec.get("wake")
+            if isinstance(wake, dict) and wake.get("state") == "pending":
+                return None
+        return identity
 
     def records(self) -> List[Dict[str, Any]]:
         with self._lock:

@@ -548,6 +548,9 @@ class CodexRuntimeRecorderTests(unittest.IsolatedAsyncioTestCase):
                 last={"inputTokens": 400, "outputTokens": 100},
             )
         )
+        # Mid-turn updates are coalesced; the turn boundary is the durable
+        # recording point and must carry the implied baseline unchanged.
+        runtime._flush_thread_usage("thread-resumed")
         self.assertEqual(observed, [(6600, 800)])
 
     async def test_resumed_threads_first_turn_falls_back_to_last_total(self) -> None:
@@ -570,6 +573,7 @@ class CodexRuntimeRecorderTests(unittest.IsolatedAsyncioTestCase):
                 last={"totalTokens": 500},
             )
         )
+        runtime._flush_thread_usage("thread-resumed")
         # Only the turn total is exposed: it is attributed to input so the
         # turn is still metered (6500 implied input baseline, output intact).
         self.assertEqual(observed, [(6500, 900)])
@@ -640,7 +644,39 @@ class CodexRuntimeRecorderTests(unittest.IsolatedAsyncioTestCase):
                 last={"totalTokens": 600},
             )
         )
+        runtime._flush_thread_usage("thread-resumed")
         self.assertEqual(observed, [(0, 0)])
+
+    async def test_mid_turn_updates_coalesce_into_one_recorder_call(self) -> None:
+        # A streamed turn fires many tokenUsage updates with growing
+        # cumulative totals; each recorder call is a durable meter rewrite.
+        # The burst must telescope into ONE call whose (previous, current)
+        # pair spans the whole turn — identical recorded delta, one write.
+        runtime = self._runtime()
+        observed: list[tuple[object, tuple[int, int]]] = []
+        runtime.set_usage_recorder(
+            lambda _tid, prev, cur: observed.append(
+                (
+                    None
+                    if prev is None
+                    else (prev.input_tokens or 0, prev.output_tokens or 0),
+                    (cur.input_tokens or 0, cur.output_tokens or 0),
+                )
+            )
+        )
+        runtime._started_turn_ids["turn-ours"] = None
+        for totals in ((100, 10), (300, 40), (700, 90)):
+            runtime._route_notification(
+                self._notification_for(
+                    "thread-created", *totals, turn_id="turn-ours"
+                )
+            )
+        self.assertEqual(observed, [])
+        runtime._flush_thread_usage("thread-created")
+        self.assertEqual(observed, [(None, (700, 90))])
+        # Flushing again must not double-record the burst.
+        runtime._flush_thread_usage("thread-created")
+        self.assertEqual(observed, [(None, (700, 90))])
 
     async def test_history_notifications_without_our_turn_still_baseline(self) -> None:
         runtime = self._runtime()

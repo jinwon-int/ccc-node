@@ -225,6 +225,9 @@ ClientFactory = Callable[[ServerRequestHandler], AppServerClient]
 UsageRecorder = Callable[[str, UsageSnapshot | None, UsageSnapshot], object]
 _CODEX_OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _RECENT_TERMINAL_TURN_LIMIT = 512
+# Mid-turn usage coalescing horizon: bounds both the worst-case metering loss
+# on a hard crash and how stale the durable meter can run behind a long turn.
+_USAGE_COALESCE_MAX_AGE_SECONDS = 5.0
 _ASYNC_DIAGNOSTIC_COUNTER_MAX = (1 << 31) - 1
 
 
@@ -338,6 +341,9 @@ class CodexSession:
                 finally:
                     active.finished = True
                     active.turn_ready.set()
+                    # The turn boundary is the natural durability point for
+                    # the usage coalesced across this turn's token updates.
+                    self._runtime._flush_thread_usage(self._thread_id)
                     if self._runtime._active_turns.get(self._thread_id) is active:
                         self._runtime._active_turns.pop(self._thread_id, None)
 
@@ -456,6 +462,15 @@ class CodexRuntime:
         self._active_turns: dict[str, _ActiveTurn] = {}
         self._thread_locks: dict[str, asyncio.Lock] = {}
         self._thread_usage: dict[str, UsageSnapshot] = {}
+        # Coalesced mid-turn usage per thread: (burst-start previous snapshot,
+        # latest snapshot, burst-start monotonic time). tokenUsage/updated
+        # fires many times per streamed turn, and each recorder call is a
+        # durable flock+reload+rewrite of the meter file; totals are
+        # cumulative, so recording the burst once at the turn boundary (or
+        # after the max-age below) telescopes to the identical delta.
+        self._pending_thread_usage: dict[
+            str, tuple[UsageSnapshot | None, UsageSnapshot, float]
+        ] = {}
         # Threads created (not resumed) by this process: their cumulative
         # usage totals contain no prior-session history, so the first
         # observation is real new spend rather than a resume baseline.
@@ -1048,6 +1063,7 @@ class CodexRuntime:
             if self._closed:
                 return
             self._closed = True
+            self._flush_thread_usage()
             self._fail_active_turns("codex_runtime_closed", "Codex runtime closed")
             if self._dispatcher_task is not None:
                 self._dispatcher_task.cancel()
@@ -1318,10 +1334,47 @@ class CodexRuntime:
         self._thread_usage = dict(tuple(self._thread_usage.items())[-128:])
         if self._usage_recorder is None:
             return
+        pending = self._pending_thread_usage.get(thread_id)
+        if pending is not None:
+            # Keep the burst's original baseline; only the endpoint advances.
+            previous = pending[0]
+            burst_started = pending[2]
+        else:
+            burst_started = time.monotonic()
+        if (
+            self._is_our_turn_notification(thread_id, params)
+            and time.monotonic() - burst_started
+            < _USAGE_COALESCE_MAX_AGE_SECONDS
+        ):
+            self._pending_thread_usage[thread_id] = (
+                previous,
+                snapshot,
+                burst_started,
+            )
+            return
+        self._pending_thread_usage.pop(thread_id, None)
         try:
             self._usage_recorder(thread_id, previous, snapshot)
         except Exception:
             logger.exception("Codex usage recorder failed; dispatch continues")
+
+    def _flush_thread_usage(self, thread_id: str | None = None) -> None:
+        """Durably record coalesced usage for one thread (or every thread)."""
+        if thread_id is None:
+            items = tuple(self._pending_thread_usage.items())
+            self._pending_thread_usage.clear()
+        else:
+            pending = self._pending_thread_usage.pop(thread_id, None)
+            items = ((thread_id, pending),) if pending is not None else ()
+        if self._usage_recorder is None:
+            return
+        for pending_thread_id, (previous, snapshot, _started) in items:
+            try:
+                self._usage_recorder(pending_thread_id, previous, snapshot)
+            except Exception:
+                logger.exception(
+                    "Codex usage recorder failed; dispatch continues"
+                )
 
     def _is_our_turn_notification(
         self, thread_id: str, params: Mapping[str, JsonValue]

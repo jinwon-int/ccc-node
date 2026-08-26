@@ -11,7 +11,7 @@ import asyncio
 import hashlib
 from pathlib import Path
 import threading
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -484,6 +484,11 @@ def test_collector_loop_hard_bounds_provider_attempts_per_sweep() -> None:
             distill_extraction_poll_interval=0.001,
             codex_skill_collector_max_jobs_per_sweep=2,
         ),
+    )
+    # The loop scans through the mixin's shared journal sweep; bind the real
+    # helper so this duck-typed lifecycle exercises the production path.
+    lifecycle._distill_sweep_jobs = MethodType(
+        BotLifecycleMixin._distill_sweep_jobs, lifecycle
     )
     asyncio.run(
         BotLifecycleMixin._skill_candidate_collector_loop(lifecycle, stop_event)

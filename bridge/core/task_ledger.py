@@ -96,6 +96,10 @@ class TaskLedger:
     def __init__(self, path: Path):
         self._path = Path(path)
         self._lock = threading.Lock()
+        # Exact bytes of the last payload this process wrote (validated when
+        # produced); reused as the previous-good backup source so each state
+        # transition stops re-reading and re-parsing the file it just wrote.
+        self._last_payload: Optional[bytes] = None
 
     @property
     def _backup_path(self) -> Path:
@@ -136,12 +140,19 @@ class TaskLedger:
         payload = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         # Preserve the current-good file as .bak before overwriting, mirroring
         # SessionStore's durability contract (#352). Best-effort: a backup hiccup
-        # must never block the primary write (fail-open ledger).
+        # must never block the primary write (fail-open ledger). The bytes this
+        # process wrote last (validated when produced) serve as previous-good;
+        # only the first write after start re-reads and re-parses the file.
         try:
             if self._path.exists():
-                previous = self._path.read_bytes()
+                previous = self._last_payload
+                if previous is None:
+                    previous = self._path.read_bytes()
+                    if previous.strip():
+                        json.loads(previous)  # only back up decodable bytes
+                    else:
+                        previous = b""
                 if previous.strip():
-                    json.loads(previous)  # only back up decodable bytes
                     _atomic_write_bytes(self._backup_path, previous)
         except Exception:
             pass
@@ -152,6 +163,7 @@ class TaskLedger:
             _atomic_write_bytes(self._path, payload)
         except SessionStoreDurabilityError:
             logger.warning("Task ledger dir-fsync unconfirmed; state written")
+        self._last_payload = payload
 
     def _mutate(self, fn) -> Any:
         """Run ``fn(records) -> result`` under the lock, persisting mutations."""

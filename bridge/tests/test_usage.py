@@ -658,6 +658,12 @@ def test_collector_prunes_expired_snapshots(tmp_path: Path) -> None:
     )
     old = tmp_path / "state" / "usage" / status_snapshot_name("old-session")
     os.utime(old, (1, 1))
+    # The prune sweep is interval-gated by a marker file (it used to walk and
+    # stat the whole snapshot directory on every status-line render); age the
+    # marker past the interval so this run is one where the sweep is due.
+    marker = tmp_path / "state" / "usage" / ".last-prune"
+    if marker.exists():
+        os.utime(marker, (1, 1))
 
     _run_collector(
         tmp_path,
@@ -665,6 +671,7 @@ def test_collector_prunes_expired_snapshots(tmp_path: Path) -> None:
     )
 
     assert not old.exists()
+    assert marker.exists()
 
 
 def test_renderer_marks_unavailable_and_is_telegram_bounded() -> None:

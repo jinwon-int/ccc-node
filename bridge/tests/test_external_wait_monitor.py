@@ -702,3 +702,50 @@ async def test_lifecycle_resume_delivery_failure_is_journaled_on_the_record(
     stored = registry._read()[wait_id]
     assert stored["delivery_failed"]["reason"] == "BadRequest"
     assert stored["delivery_failed"]["at"]
+
+
+@pytest.mark.anyio
+async def test_idle_monitor_skips_registry_reads_until_state_changes(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    registry = ExternalWaitRegistry(default_registry_path(tmp_path), clock=clock)
+    reads = 0
+    original_read = registry._read
+
+    def counting_read():
+        nonlocal reads
+        reads += 1
+        return original_read()
+
+    registry._read = counting_read  # type: ignore[method-assign]
+    transport = FakeTransport([PrState("abc1234", "pending")])
+    recorder = Recorder()
+    monitor = _monitor(registry, transport, recorder, clock)
+
+    await monitor._tick()  # full pass proves the registry holds no work
+    baseline = reads
+    assert baseline > 0
+    for _ in range(20):
+        clock.advance(5)
+        await monitor._tick()  # stat-only fast path: no reads, no parses
+    assert reads == baseline
+
+    # A new registration rewrites the file; the next tick must rescan and
+    # actually poll the registered wait.
+    registry.register(
+        repo="jinwon-int/ccc-node",
+        pr_number=1,
+        head_sha="abc1234",
+        user_id=7,
+        chat_id=70,
+        session_id="sess-1",
+        summary="watch CI",
+        timeout_seconds=1_000,
+        poll_interval_seconds=5,
+        now=clock(),
+    )
+    reads_before_tick = reads
+    await monitor._tick()
+    assert reads > reads_before_tick
+    assert transport.calls
