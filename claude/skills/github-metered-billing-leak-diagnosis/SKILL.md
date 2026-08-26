@@ -7,11 +7,11 @@ description: Trace an unexplained GitHub metered-billing charge (GHAS/Secret Pro
 
 Scope: **GitHub org metered billing only.** Not Anthropic/token cost.
 
-The happy path is three API calls. The value of this skill is the four traps
+The happy path is three API calls. The value of this skill is the five traps
 below — each was independently re-derived across several separate
 investigations before being written down.
 
-## The four traps
+## The five traps
 
 **1. The legacy billing endpoints are dead.**
 `/orgs/{org}/settings/billing/actions` returns 404, or `total_ms: 0`, which
@@ -35,7 +35,35 @@ that looks for "last charged day" alone will therefore report "still charging"
 forever. **Freshness is the signal, not amount**: compare the newest charged
 date against today and treat anything older than ~2 days as stopped.
 
-A fifth, milder trap for Actions specifically: **net spend is a lagging
+**5. `budget_amount` is licenses, not dollars — and `ghas` is not a usable
+budget SKU.** Three separate rejections hide here, and the error text is the
+only documentation that resolves them:
+- The stop flag is `prevent_further_usage`, **not**
+  `stop_usage_when_budget_exhausted`.
+- `budget_type=ProductPricing` + `budget_product_sku=ghas` returns **500**:
+  *"High watermark products cannot have PreventFurtherUsage budget alerting
+  except for GHAS SKUs."* Read that as permission, not refusal — GHAS is the
+  documented exception, but only at **`SkuPricing`** granularity.
+- For license-based products `budget_amount` is **the number of licenses**,
+  not a dollar cap. `budget_amount: 0` means *zero seats allowed*, not
+  *$0 of spend*. (GitHub's own parameter doc: "The budget amount in whole
+  dollars. For license-based products, this represents the number of
+  licenses.")
+
+**The error message is the SKU catalog.** The valid-SKU list is not worth
+guessing at. Post a deliberately invalid SKU and the API enumerates all of
+them:
+```bash
+gh api --method POST "/organizations/$ORG/settings/billing/budgets" \
+  -f budget_type=SkuPricing -f budget_product_sku=zzz \
+  -f budget_scope=organization 2>&1 | tr ',' '\n'
+# → SKU 'zzz' not found. Available SKUs: actions_cache_storage, actions_linux,
+#   ... ghas_code_security_licenses, ghas_secret_protection_licenses, ...
+```
+This POST is rejected at validation, so it creates nothing — but it *is* a
+POST, not a GET. Treat it as the one probe that leaves the read-only path.
+
+A sixth, milder trap for Actions specifically: **net spend is a lagging
 indicator.** It stays `$0` until the included tier is exhausted mid-month, then
 jumps. Track *minutes*, not dollars, to see the cliff coming.
 
@@ -101,18 +129,38 @@ projected = minutes_so_far * days_in_month / distinct_days_with_data
 ```
 
 ### 7. Stop the bleed, then verify by the meter
-Disable at the repo level first. If charges persist, set a hard stop:
+Disable at the repo level first. If charges persist, set a hard stop.
+
+Check what already exists before adding anything:
 ```bash
-gh api -X POST "/organizations/$ORG/settings/billing/budgets" \
-  -f budget_amount=0 -F prevent_further_usage=true
+gh api "/organizations/$ORG/settings/billing/budgets" \
+  --jq '.budgets[]|"\(.budget_product_sku)\t\(.budget_type)\tamount=\(.budget_amount)\tstop=\(.prevent_further_usage)"'
 ```
+GHAS bills as two separate license SKUs and **each needs its own budget** —
+capping one leaves the other charging. The full body is required; a partial
+body returns `400 Missing required fields`:
+```bash
+for sku in ghas_secret_protection_licenses ghas_code_security_licenses; do
+  jq -nc --arg sku "$sku" '{budget_amount:0, prevent_further_usage:true,
+    budget_scope:"organization", budget_entity_name:"",
+    budget_type:"SkuPricing", budget_product_sku:$sku,
+    budget_alerting:{will_alert:false, alert_recipients:[]}}' \
+  | gh api --method POST "/organizations/$ORG/settings/billing/budgets" --input -
+done
+```
+`budget_amount:0` here means **zero licenses**, not zero dollars (trap 5). With
+`prevent_further_usage:true` an org already over zero seats is blocked
+immediately, not merely alerted.
+
 Then re-run step 3 the next day. The toggle is not the proof; the missing row
 is.
 
 ## Safety
-- **Read-only by default.** Steps 1–6 are `gh api` GETs. Only step 7 mutates,
-  and a `budget_amount=0` hard stop can block real work — get owner approval
-  before setting it.
+- **Read-only by default.** Steps 1–6 are `gh api` GETs. Only step 7 mutates
+  (plus the SKU-enumeration probe in trap 5, a POST that fails validation and
+  creates nothing). A `budget_amount:0` hard stop on a license SKU means **zero
+  seats**, so it blocks the feature outright for everyone — get owner approval
+  before setting it, and note that removing the budget is what restores use.
 - Never read, print, echo or copy the owner token. SSH runs `gh` remotely so
   the credential never leaves that host.
 - Redact long opaque strings before pasting output anywhere.
