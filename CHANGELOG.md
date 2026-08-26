@@ -141,7 +141,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
   CAP is applied, preventing a permanently failing newest session from
   starving healthy work. The last successful cursor is preserved; file growth
   grants a fresh retry budget, dry runs do not consume it, and body-free
-  reasons plus held/new state are exposed in audit and run summaries.
+  reasons plus held/new state are exposed in audit and run summaries. The
+  exact source passed a genuine isolated evaluation (TM-2408: recheck 8/12,
+  suspect 0; TP 13, FP 1, FN 10, TN 23; collateral damage 0).
 - Review-sweep follow-up (LOW batch): bridge robustness — clean-repo
   statusline parity in the health renderer (crush label + timezone-naive
   `updated_at` no longer a TypeError), non-UTF-8 `.env` bytes and unknown

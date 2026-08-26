@@ -3,7 +3,7 @@
   "pipeline": 6,
   "subject": {
     "path": "scripts/auto-distill/auto-distill.py",
-    "sha256": "792099bab6b7a9d7ab1dc5e59f26125fbbba11259f8c8cdc372410ecdfd1b70a",
+    "sha256": "595f653c93f9082a35dc7633cc62f893828e04570d16d5e83a69633335035be7",
     "surface_schema": "ccc.auto-distill.canon-surface.v1",
     "surface_sha256": "fa1e3a99cccae1e6e054c4cf44e4147664f8deb6a1a7e47eade12768558c9f52",
     "surface_members": [
@@ -28,9 +28,9 @@
     ]
   },
   "evaluation": {
-    "id": "TM-2407",
-    "evaluated_source_sha256": "792099bab6b7a9d7ab1dc5e59f26125fbbba11259f8c8cdc372410ecdfd1b70a",
-    "completed_at": "2026-08-26T17:27:10+09:00",
+    "id": "TM-2408",
+    "evaluated_source_sha256": "595f653c93f9082a35dc7633cc62f893828e04570d16d5e83a69633335035be7",
+    "completed_at": "2026-08-26T14:00:12.187811Z",
     "provider": "claude-code-oauth",
     "model": "haiku",
     "corpus": {
@@ -47,13 +47,13 @@
       "recheck_addr_sha256": "01ad650774f1e90c31052d21775ec2a0d45c9518962970458f9195b8204e3e70"
     },
     "artifacts": {
-      "eval_log_sha256": "4d64ed342a055d54736e15cd08d6e023d84fa575df162a93b6fb7279e0248a46",
-      "eval_result_sha256": "83bb557e783f26336f25189f3388a070e8eb08d6c1ec1b2927f4e8fa739debe4",
-      "recheck_log_sha256": "b436180d1b03a9d44e78ec3480fc1defca77aaf6a295542da0640bb600cdf18d"
+      "eval_log_sha256": "6abe3e06be8f45026bc43093df2d17595badb47a5e7816a5d8d39b3ec5ebe2b1",
+      "eval_result_sha256": "b1b9e5314e900646177195ae5ea088843ed87bdadcfbaf72a7cbfdad7de6383b",
+      "recheck_log_sha256": "e7c7ab43576b850f1dfce019411b0c3990d40b0b9ae51fcbc3b3c17c1784f06e"
     },
     "recheck": {
       "baseline_duplicates": 1,
-      "duplicates": 7,
+      "duplicates": 8,
       "cases": 12,
       "suspect": 0
     },
@@ -66,5 +66,5 @@
     "collateral_damage": 0,
     "passed": true
   },
-  "issued_at": "2026-08-26T17:46:32+09:00"
+  "issued_at": "2026-08-26T23:01:02+09:00"
 }
