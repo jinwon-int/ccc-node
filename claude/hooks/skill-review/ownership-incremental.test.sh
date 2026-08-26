@@ -491,6 +491,127 @@ rc=$?
 ok "marker-only recovery records rolled_back and releases cap" \
   '[ "$rc" = 0 ] && jq -s -e "[.[] | select(.transaction_id == \"marker-only-recovery\" and .outcome == \"rolled_back\")] | length == 1" "$STATE/skill-autosave-ownership.jsonl" >/dev/null'
 
+# One apply-proposal invocation reads the ledger exactly once, including the
+# retry after an interrupted prepared transaction: the recovery terminal must
+# reach the fresh attempt's cap accounting in memory (daily cap 1 only admits
+# the retry if the dangling automatic slot was released) without a re-read.
+RB_STATE="$TMP/read-batch-state"
+RB_SKILLS="$TMP/read-batch-skills"
+mkdir -m 700 "$RB_STATE" "$RB_SKILLS"
+mkdir -m 700 "$RB_SKILLS/retry-batch"
+printf -- '---\nname: retry-batch\ndescription: A sufficiently detailed recurring workflow for incremental ownership tests.\n---\n\n# retry-batch\n\n## Procedure\n1. Read.\n2. Verify.\n3. Record.\n' \
+  > "$RB_SKILLS/retry-batch/SKILL.md"
+chmod 600 "$RB_SKILLS/retry-batch/SKILL.md"
+python3 "$TOOL" --provider codex --skills-dir "$RB_SKILLS" --state-dir "$RB_STATE" mark-created retry-batch >/dev/null
+rb_sha="$(sha256sum "$RB_SKILLS/retry-batch/SKILL.md" | awk '{print $1}')"
+jq -nc --arg sha "$rb_sha" '{
+  schema_version:2,
+  proposal_id:("a"*64),
+  provenance:{
+    provider:"codex",
+    source_thread_hash:("b"*64),
+    trigger:"checkpoint",
+    distilled_at:"2026-07-27T00:00:00Z"
+  },
+  proposal:{
+    action:"patch",
+    target_skill:"retry-batch",
+    relative_target:"SKILL.md",
+    expected_sha256:$sha,
+    old_text:"1. Read.",
+    new_text:"1. Read after retry.",
+    improvement_reason:"Preserve a repeatable verified improvement.",
+    reason:"Improve the existing overlapping skill.",
+    evidence_excerpt:"repeatable improvement"
+  }
+}' > "$TMP/read-batch.json"
+chmod 600 "$TMP/read-batch.json"
+TOOL_PATH="$TOOL" SKILLS_PATH="$RB_SKILLS" STATE_PATH="$RB_STATE" PROPOSAL_PATH="$TMP/read-batch.json" python3 - <<'PY'
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("ownership_incremental_read_batching", os.environ["TOOL_PATH"])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+context = module.Context(
+    provider="codex",
+    skills_dir=Path(os.environ["SKILLS_PATH"]),
+    state_dir=Path(os.environ["STATE_PATH"]),
+    uid=os.geteuid(),
+)
+with module._MutationLock(context):
+    envelope = module._incremental_proposal(
+        Path(os.environ["PROPOSAL_PATH"]),
+        context,
+    )
+    plan = module._build_incremental_plan(
+        context,
+        envelope,
+        automatic=True,
+    )
+    backup = module._incremental_backup(context, plan)
+    fields = module._incremental_transaction_fields(
+        context,
+        plan,
+        backup,
+        automatic=True,
+        cap_day=module._now().date().isoformat(),
+        cap_slot=1,
+    )
+    module._append_ledger(
+        context,
+        module._transaction_record(
+            "skill-proposal-apply",
+            "read-batch-dangling",
+            outcome="prepared",
+            fields=fields,
+        ),
+    )
+real_read_ledger = module._read_ledger
+ledger_reads = 0
+
+
+def counted_read_ledger(context_arg):
+    global ledger_reads
+    ledger_reads += 1
+    return real_read_ledger(context_arg)
+
+
+module._read_ledger = counted_read_ledger
+result = module._command_apply_proposal(
+    context,
+    Path(os.environ["PROPOSAL_PATH"]),
+    dry_run=False,
+    automatic=True,
+    daily_cap=1,
+)
+assert ledger_reads == 1, ledger_reads
+assert result["code"] == "applied", result
+assert result["changed"] is True and result["counted"] is True, result
+module._read_ledger = real_read_ledger
+rows = real_read_ledger(context)
+aborted = [
+    row
+    for row in rows
+    if row.get("transaction_id") == "read-batch-dangling"
+    and row.get("outcome") == "aborted"
+]
+assert len(aborted) == 1, rows
+applied = [
+    row
+    for row in rows
+    if row.get("proposal_id") == "a" * 64 and row.get("outcome") == "applied"
+]
+assert len(applied) == 1 and applied[0].get("cap_slot") == 1, rows
+PY
+rc=$?
+ok "apply-proposal retry after recovery reads the ledger once" \
+  '[ "$rc" = 0 ] && grep -q "1. Read after retry." "$RB_SKILLS/retry-batch/SKILL.md" && jq -s -e "[.[] | select(.transaction_id == \"read-batch-dangling\" and .outcome == \"aborted\")] | length == 1" "$RB_STATE/skill-autosave-ownership.jsonl" >/dev/null'
+
 # Cap accounting rejects impossible or corrupted transaction state instead of
 # letting an unknown last outcome release a previously consumed slot.
 jq -nc '{

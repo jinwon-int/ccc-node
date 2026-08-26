@@ -309,5 +309,66 @@ tool run >/dev/null
 out="$(tool status iota)"
 ok "inter-run bump is never overwritten by a run" 'jq -e ".skills[0].telemetry.use_count == 2" >/dev/null <<<"$out"'
 
+# --- 12. read batching: one mutating run reads the ledger exactly once ---------
+# Recovery, patch sync and every first-sight seed must share a single ledger
+# read; batch-one's marker loses created_at so its seed can only come from the
+# shared create/adopt index, not from a hidden per-skill re-read.
+RB_TMP="$(mktemp -d)"; RB_STATE="$RB_TMP/state"; RB_SKILLS="$RB_TMP/skills"
+mkdir -m 700 "$RB_STATE" "$RB_SKILLS"
+for name in batch-one batch-two; do
+  mkdir -m 700 "$RB_SKILLS/$name"
+  printf -- '---\nname: %s\ndescription: A sufficiently detailed recurring workflow for read batching tests.\n---\n\n# %s\n' "$name" "$name" > "$RB_SKILLS/$name/SKILL.md"
+  chmod 600 "$RB_SKILLS/$name/SKILL.md"
+  python3 "$OWN" --provider claude --skills-dir "$RB_SKILLS" --state-dir "$RB_STATE" mark-created "$name" >/dev/null
+done
+jq -c 'del(.created_at)' "$RB_SKILLS/batch-one/.autosave-meta.json" > "$RB_TMP/marker"
+mv "$RB_TMP/marker" "$RB_SKILLS/batch-one/.autosave-meta.json"
+chmod 600 "$RB_SKILLS/batch-one/.autosave-meta.json"
+TOOL_PATH="$TOOL" SKILLS_PATH="$RB_SKILLS" STATE_PATH="$RB_STATE" python3 - <<'PY'
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("curator_read_batching_test", os.environ["TOOL_PATH"])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+real_read_ledger = module.ownership._read_ledger
+ledger_reads = 0
+
+
+def counted_read_ledger(context: object) -> list[dict[str, object]]:
+    global ledger_reads
+    ledger_reads += 1
+    return real_read_ledger(context)
+
+
+module.ownership._read_ledger = counted_read_ledger
+context = module.ownership.Context(
+    provider="claude",
+    skills_dir=Path(os.environ["SKILLS_PATH"]),
+    state_dir=Path(os.environ["STATE_PATH"]),
+    uid=os.geteuid(),
+)
+report = module._command_run(context, dry_run=False, auto=False)
+assert report["counts"]["seeded"] == 2, report
+assert ledger_reads == 1, ledger_reads
+usage = module._load_usage(context, strict=False)
+record = usage["records"]["claude:batch-one"]
+created = [
+    row["ts"]
+    for row in real_read_ledger(context)
+    if row.get("event") == "create"
+    and row.get("outcome") == "changed"
+    and row.get("name") == "batch-one"
+]
+assert record["created_at"] == module._ts(module._parse_ts(created[-1])), record
+PY
+rc=$?
+ok "mutating run reads the ownership ledger exactly once" '[ "$rc" = 0 ]'
+rm -rf "$RB_TMP"
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

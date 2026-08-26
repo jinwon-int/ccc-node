@@ -499,6 +499,18 @@ def _load_controls(context: Context) -> dict[str, Any]:
     return value
 
 
+def _preload_controls(context: Context) -> dict[str, Any] | None:
+    """Single best-effort control read shared by per-skill classification loops.
+
+    Returns None when the control file is unreadable so each _classification
+    call falls back to its own load, preserving per-skill error reporting.
+    """
+    try:
+        return _load_controls(context)
+    except ContractError:
+        return None
+
+
 def _control_record(context: Context, controls: dict[str, Any], name: str) -> dict[str, Any] | None:
     record = controls["records"].get(f"{context.provider}:{name}")
     if record is None:
@@ -568,7 +580,12 @@ def _validate_autosave_marker(
     return 0, _sha256(_canonical_json(marker))
 
 
-def _classification(context: Context, name: str) -> dict[str, Any]:
+def _classification(
+    context: Context,
+    name: str,
+    *,
+    controls: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     _validate_name(name)
     target_id = _target_id(context, name)
     try:
@@ -577,7 +594,10 @@ def _classification(context: Context, name: str) -> dict[str, Any]:
         if directory_before is None:
             raise ContractError("skill_missing")
         skill = _read_target(context, name, "SKILL.md")
-        controls = _load_controls(context)
+        # Per-skill loops pass one preloaded controls object; a lone call
+        # keeps loading (inside the try, so control errors stay per-skill).
+        if controls is None:
+            controls = _load_controls(context)
         pin = _control_record(context, controls, name)
         managed_path = skill_dir / _MANAGED_MARKER
         autosave_path = skill_dir / _AUTOSAVE_MARKER
@@ -1152,16 +1172,23 @@ def _write_marker_exclusive(
 
 def _command_status(context: Context, name: str | None) -> dict[str, Any]:
     names = [name] if name else _skill_names(context)
+    controls = _preload_controls(context)
     return {
         "ok": True,
         "command": "status",
         "provider": context.provider,
-        "skills": [_classification(context, item) for item in names],
+        "skills": [
+            _classification(context, item, controls=controls) for item in names
+        ],
     }
 
 
 def _command_list_unmanaged(context: Context) -> dict[str, Any]:
-    records = [_classification(context, name) for name in _skill_names(context)]
+    controls = _preload_controls(context)
+    records = [
+        _classification(context, name, controls=controls)
+        for name in _skill_names(context)
+    ]
     return {
         "ok": True,
         "command": "list-unmanaged",
@@ -3039,7 +3066,19 @@ def _replay_incremental_apply(
             ),
             rows,
         )
-    return None, _read_ledger(context)
+    # The mutation lock is held, so the only ledger change since ``rows`` was
+    # read is the terminal row the recovery just appended for ``prepared``.
+    # Mirror it in memory instead of re-reading the whole ledger; the fresh
+    # attempt's cap accounting then sees the released slot exactly as a
+    # re-read would (``ts`` is regenerated but no rows consumer inspects it).
+    return None, rows + [
+        _transaction_record(
+            "skill-proposal-apply",
+            prepared["transaction_id"],
+            outcome=recovery,
+            fields=_transaction_fields_from_record(prepared),
+        )
+    ]
 
 
 def _patch_plan_payload(
