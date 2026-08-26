@@ -137,6 +137,55 @@ fresh explicit user approval in the current conversation, in both directions.
    If local `seoseo-ai` lacks repository merge permission, use the exact-head
    Seoseo merge fallback below. Do not weaken branch protection.
 
+   **`mergeable: UNKNOWN` is "not computed yet", not "blocked".** GitHub builds
+   a throwaway test merge commit in a background job; until it finishes the
+   GraphQL enum reads `UNKNOWN` ("The mergeability of the pull request is still
+   being calculated") and REST `mergeable` reads `null`, which the REST docs
+   tell you to resolve by resubmitting the request. Closed and merged PRs also
+   report `UNKNOWN`, so it is never by itself evidence of a problem. Re-read
+   until it settles instead of reaching for a workaround:
+
+   ```bash
+   for i in $(seq 1 30); do
+     read -r m s <<<"$(gh pr view <n> --repo <owner/repo> \
+       --json mergeable,mergeStateStatus --jq '"\(.mergeable) \(.mergeStateStatus)"')"
+     [ "$m" = UNKNOWN ] || { echo "mergeable=$m mergeStateStatus=$s"; break; }
+     sleep 10
+   done
+   ```
+
+   Then act on `mergeStateStatus`, not on the merge command's failure text:
+   `CLEAN` merge; `UNSTABLE`/`BLOCKED` means checks or required reviews are the
+   real gate — fix those; `DIRTY` is a genuine conflict (see
+   `github-merge-state-conflict-diagnosis`); `BEHIND` means the base moved.
+
+   Two failures here look like merge problems but are repository settings, and
+   neither justifies `--admin`, weaker protection, or a credential escalation:
+
+   `gh pr view --json` exposes neither capability flag — it only carries
+   `autoMergeRequest`. Read them over GraphQL before attempting either command:
+
+   ```bash
+   gh api graphql -f query='
+   query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){
+     viewerCanEnableAutoMerge viewerCanUpdateBranch}}}' \
+     -F o=<owner> -F r=<repo> -F n=<n> --jq .data.repository.pullRequest
+   ```
+
+   - `gh pr merge --auto` fails when the repo has `allow_auto_merge: false`
+     (`viewerCanEnableAutoMerge: false`; also `gh api repos/<owner>/<repo> --jq
+     .allow_auto_merge`). The observed message is roughly `Auto merge is not
+     allowed for this repository` — match it loosely, since GitHub does not
+     document the string and a configured merge queue can produce it too.
+     Enabling the setting is a repository-settings change and a separate
+     approval; without it, poll and merge in the foreground instead.
+   - `gh pr update-branch` only does something when the head is genuinely
+     behind. Gate it on `viewerCanUpdateBranch`, which GitHub documents as
+     `false` when the head is already up to date. The REST endpoint answers
+     `202 Accepted` with `"Updating pull request branch."` — an async
+     acknowledgement, not proof a commit was created — so confirm by comparing
+     `headRefOid` before and after rather than trusting the success line.
+
 7. Verify and clean up:
 
    ```bash
