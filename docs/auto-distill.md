@@ -100,6 +100,21 @@ The installed receipt is owner-only (`0600`). It preserves which evaluation
 authorized the installed bytes; it does not authorize cron changes, service
 restarts, candidate publication, or rollout to another node.
 
+## Extraction retry budget
+
+An unchanged session snapshot gets at most three consecutive extraction
+attempts. The third failure records a body-free `dead_letter` reason and parks
+that session before the per-run CAP is applied, so a permanently failing newest
+session cannot starve older healthy work. Parked sessions remain visible in the
+run summary and automatically receive a fresh three-attempt budget only after
+their append-only source file grows. The age horizon remains the final cleanup
+boundary.
+
+The watermark keeps the last successful line/mtime cursor while storing retry
+metadata separately. Dry runs report failures without consuming the persistent
+budget, and audit/summary records contain only the sanitized failure class,
+never model stderr or source text.
+
 ## Eleven-node Wiki publication
 
 Extraction and publication are intentionally separate. Each canary writes only

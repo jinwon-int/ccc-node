@@ -136,6 +136,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
   per the i18n policy.
 
 ### Fixed
+- **Bounded auto-distill extraction retries (#1297).** Three consecutive
+  failures on the same session snapshot now dead-letter it before the per-run
+  CAP is applied, preventing a permanently failing newest session from
+  starving healthy work. The last successful cursor is preserved; file growth
+  grants a fresh retry budget, dry runs do not consume it, and body-free
+  reasons plus held/new state are exposed in audit and run summaries.
 - Review-sweep follow-up (LOW batch): bridge robustness — clean-repo
   statusline parity in the health renderer (crush label + timezone-naive
   `updated_at` no longer a TypeError), non-UTF-8 `.env` bytes and unknown
