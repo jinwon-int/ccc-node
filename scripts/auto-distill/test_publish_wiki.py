@@ -38,6 +38,16 @@ def item(key: str, *, status: str = "unverified", fact: str = "durable fact") ->
 """
 
 
+def legacy_item(key: str) -> str:
+    return f"""\
+### ✅ 승격 후보 — legacy candidate {key}
+
+- **사실**: pre-pipeline fact
+- **분류**: `decision` · **키**: `{key}`
+- **출처**: 세션 `session-safe` · 근거 `message-legacy` · 2026-08-22 20:00 KST
+"""
+
+
 def document(node: str, *items: str) -> str:
     return f"""\
 # [DOC-auto-{node}] {node} AUTO — 자동 승격 후보 (auto-distill)
@@ -144,6 +154,43 @@ class PublishWikiTest(unittest.TestCase):
         self.assertEqual(report2["appended"], 0)
         self.assertEqual(report2["changed_pages"], 0)
         self.assertEqual(target.read_text(encoding="utf-8"), body)
+
+    def test_legacy_source_metadata_is_strict_by_default_and_explicitly_skippable(self) -> None:
+        source = self.source(
+            "nosuk",
+            document("nosuk", legacy_item("c" * 12), item("d" * 12)),
+        )
+        strict = self.run_publisher(self.full_args(local={"nosuk": source}))
+        self.assertEqual(strict.returncode, 2)
+        self.assertIn("candidate metadata incomplete", strict.stderr)
+
+        skipped = self.run_publisher(
+            [
+                *self.full_args(local={"nosuk": source}),
+                "--skip-legacy-metadata",
+                "--apply",
+            ]
+        )
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        report = json.loads(skipped.stdout)
+        self.assertEqual(report["source_candidates"], 1)
+        self.assertEqual(report["rejected_legacy"], 1)
+        target = self.worktree / "pages/nodes/nosuk/AUTO.md"
+        body = target.read_text(encoding="utf-8")
+        self.assertNotIn("cccccccccccc", body)
+        self.assertIn("dddddddddddd", body)
+
+    def test_historical_target_without_current_metadata_is_preserved(self) -> None:
+        target = self.worktree / "pages/nodes/gwakga/AUTO.md"
+        original = document("gwakga", legacy_item("e" * 12))
+        target.write_text(original, encoding="utf-8")
+        source = self.source("gwakga", document("gwakga", item("f" * 12)))
+        result = self.run_publisher([*self.full_args(local={"gwakga": source}), "--apply"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = target.read_text(encoding="utf-8")
+        self.assertTrue(body.startswith(original.rstrip("\n") + "\n"))
+        self.assertIn("eeeeeeeeeeee", body)
+        self.assertIn("ffffffffffff", body)
 
     def test_duplicate_key_fails_closed(self) -> None:
         source = self.source(

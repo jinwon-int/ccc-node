@@ -82,6 +82,7 @@ class SourceSpec:
 class AutoDocument:
     prefix: str
     blocks: tuple[tuple[str, str], ...]
+    rejected_legacy: int = 0
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,7 @@ class PlanRow:
     existing_count: int
     appended: int
     skipped_existing: int
+    rejected_legacy: int
     target: Path | None
     content: str | None
     declared_empty: bool = False
@@ -168,7 +170,9 @@ def read_source(spec: SourceSpec, ssh_bin: str, timeout: int) -> str | None:
     return result.stdout
 
 
-def split_document(text: str, expected_node: str, label: str) -> AutoDocument:
+def split_document(
+    text: str, expected_node: str, label: str, *, metadata_policy: str = "require"
+) -> AutoDocument:
     if CONFLICT_RE.search(text):
         raise PublishError(f"merge-conflict marker detected: node={expected_node} source={label}")
     if TOKEN_RE.search(text) or ASSIGN_RE.search(text):
@@ -183,7 +187,10 @@ def split_document(text: str, expected_node: str, label: str) -> AutoDocument:
     first = re.search(r"(?m)^### ", text)
     prefix = text if first is None else text[: first.start()]
     raw_blocks = [] if first is None else re.split(r"(?m)(?=^### )", text[first.start() :])
+    if metadata_policy not in {"require", "skip", "preserve"}:
+        raise ValueError(f"invalid metadata policy: {metadata_policy}")
     blocks: list[tuple[str, str]] = []
+    rejected_legacy = 0
     seen: set[str] = set()
     for raw in raw_blocks:
         if not raw.strip():
@@ -196,11 +203,19 @@ def split_document(text: str, expected_node: str, label: str) -> AutoDocument:
         key = keys[0]
         if key in seen:
             raise PublishError(f"duplicate candidate key in source: node={expected_node} key={key}")
-        if not STATUS_RE.search(raw) or not PIPELINE_RE.search(raw):
-            raise PublishError(f"candidate metadata incomplete: node={expected_node} key={key}")
         seen.add(key)
+        if not STATUS_RE.search(raw) or not PIPELINE_RE.search(raw):
+            if metadata_policy == "require":
+                raise PublishError(f"candidate metadata incomplete: node={expected_node} key={key}")
+            if metadata_policy == "skip":
+                rejected_legacy += 1
+                continue
         blocks.append((key, raw.rstrip("\n") + "\n"))
-    return AutoDocument(prefix=prefix.rstrip("\n") + "\n", blocks=tuple(blocks))
+    return AutoDocument(
+        prefix=prefix.rstrip("\n") + "\n",
+        blocks=tuple(blocks),
+        rejected_legacy=rejected_legacy,
+    )
 
 
 def safe_target(worktree: Path, node: str) -> Path:
@@ -219,17 +234,43 @@ def safe_target(worktree: Path, node: str) -> Path:
     return target
 
 
-def plan_node(worktree: Path, spec: SourceSpec, source_text: str | None) -> PlanRow:
+def plan_node(
+    worktree: Path,
+    spec: SourceSpec,
+    source_text: str | None,
+    *,
+    skip_legacy_metadata: bool,
+) -> PlanRow:
     if source_text is None:
-        return PlanRow(spec.node, 0, 0, 0, 0, None, None, declared_empty=True)
-    source = split_document(source_text, spec.node, spec.kind)
+        return PlanRow(
+            node=spec.node,
+            source_count=0,
+            existing_count=0,
+            appended=0,
+            skipped_existing=0,
+            rejected_legacy=0,
+            target=None,
+            content=None,
+            declared_empty=True,
+        )
+    source = split_document(
+        source_text,
+        spec.node,
+        spec.kind,
+        metadata_policy="skip" if skip_legacy_metadata else "require",
+    )
     target = safe_target(worktree, spec.node)
     if target.exists():
         try:
             existing_text = target.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             raise PublishError(f"cannot read Wiki target: node={spec.node}: {exc}") from exc
-        existing = split_document(existing_text, spec.node, "wiki-target")
+        # Historical target blocks predate the status/pipeline markers. They
+        # remain immutable, key-addressable Wiki content; requiring today's
+        # metadata here would make preservation impossible.
+        existing = split_document(
+            existing_text, spec.node, "wiki-target", metadata_policy="preserve"
+        )
         existing_keys = {key for key, _ in existing.blocks}
         base = existing_text.rstrip("\n") + "\n"
     else:
@@ -245,6 +286,7 @@ def plan_node(worktree: Path, spec: SourceSpec, source_text: str | None) -> Plan
         existing_count=len(existing.blocks),
         appended=len(unseen),
         skipped_existing=len(source.blocks) - len(unseen),
+        rejected_legacy=source.rejected_legacy,
         target=target,
         content=content,
     )
@@ -317,6 +359,11 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--wiki-agent-bin", default="wiki-agent")
     ap.add_argument("--ssh-bin", default="ssh")
     ap.add_argument("--ssh-timeout", type=int, default=30)
+    ap.add_argument(
+        "--skip-legacy-metadata",
+        action="store_true",
+        help="exclude and count pre-pipeline source blocks missing current metadata",
+    )
     ap.add_argument("--apply", action="store_true", help="write the fully validated plan")
     ap.add_argument("--submit", action="store_true", help="invoke one wiki-agent pr after apply")
     ap.add_argument("--json", action="store_true")
@@ -335,7 +382,15 @@ def run(argv: Sequence[str] | None = None) -> int:
     sources = {node: read_source(specs[node], args.ssh_bin, args.ssh_timeout) for node in ROSTER}
     # Build every row before the first write: one bad node leaves the Wiki
     # worktree untouched rather than partially staging a fleet batch.
-    rows = [plan_node(worktree, specs[node], sources[node]) for node in ROSTER]
+    rows = [
+        plan_node(
+            worktree,
+            specs[node],
+            sources[node],
+            skip_legacy_metadata=args.skip_legacy_metadata,
+        )
+        for node in ROSTER
+    ]
     changed = [row for row in rows if row.content is not None]
     if args.apply:
         for row in changed:
@@ -352,6 +407,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         "source_candidates": sum(row.source_count for row in rows),
         "appended": sum(row.appended for row in rows),
         "skipped_existing": sum(row.skipped_existing for row in rows),
+        "rejected_legacy": sum(row.rejected_legacy for row in rows),
         "changed_pages": len(changed),
         "submitted": bool(args.submit and changed),
         "nodes": [
@@ -362,6 +418,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 "existing_candidates": row.existing_count,
                 "appended": row.appended,
                 "skipped_existing": row.skipped_existing,
+                "rejected_legacy": row.rejected_legacy,
             }
             for row in rows
         ],
@@ -371,7 +428,7 @@ def run(argv: Sequence[str] | None = None) -> int:
     else:
         print(
             "auto-distill Wiki batch: mode=%s roster=%d empty=%d source=%d "
-            "append=%d existing=%d pages=%d submitted=%s"
+            "append=%d existing=%d legacy-rejected=%d pages=%d submitted=%s"
             % (
                 report["mode"],
                 report["roster"],
@@ -379,6 +436,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 report["source_candidates"],
                 report["appended"],
                 report["skipped_existing"],
+                report["rejected_legacy"],
                 report["changed_pages"],
                 str(report["submitted"]).lower(),
             )
@@ -386,7 +444,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         for row in rows:
             state = "empty" if row.declared_empty else "ready"
             print(
-                "  %-9s %-5s source=%d existing=%d append=%d skip=%d"
+                "  %-9s %-5s source=%d existing=%d append=%d skip=%d legacy-rejected=%d"
                 % (
                     row.node,
                     state,
@@ -394,6 +452,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                     row.existing_count,
                     row.appended,
                     row.skipped_existing,
+                    row.rejected_legacy,
                 )
             )
     return 0
