@@ -82,6 +82,8 @@ STATE = os.path.join(HOME, ".hermes/state/auto-distill.watermark.json")
 AUDIT = os.path.join(HOME, ".hermes/logs/auto-distill-audit.jsonl")
 
 MIN_TEXT = 400          # 이보다 짧은 다이제스트는 건질 게 없다
+# 다이제스트 상한(#1295): 초과 시 오래된 앞부분부터 자른다(digest_session 참조).
+MAX_DIGEST_BYTES = 400_000
 # 현행 파이프라인 버전. 감사로그와 **렌더된 항목 양쪽**에 각인한다.
 #   1 = 구조검증만  2 = +함의검증  3 = +격리레인/비용계측
 #   4 = +가치판정/인용보수  5 = +정본 중복 대조
@@ -297,19 +299,37 @@ def iter_messages(path, since_line=0):
             if ty == "message":                       # piri
                 m = o.get("message", {}) or {}
                 role, mid = m.get("role"), (o.get("id") or "")[:8]
+                c = m.get("content")
             elif ty in ("user", "assistant"):          # Claude Code
                 m = o.get("message", {}) or {}
                 role, mid = (m.get("role") or ty), (o.get("uuid") or "")[:8]
+                c = m.get("content")
+            elif ty == "response_item":                # Codex CLI rollout (#1295)
+                p = o.get("payload") or {}
+                if p.get("type") != "message":
+                    continue
+                role, mid = p.get("role"), (p.get("id") or "")[:8]
+                c = p.get("content")
+                # codex user 턴에는 도구 맥락/시스템 프리앰블이 섞여 든다
+                # (실측: 166 user 중 ~80건이 [/#/< 시작 블록, 오너 발화는 아님).
+                # 이 노드의 오너 발화는 한국어 대화체라 세 패턴과 충돌하지
+                # 않는다. assistant 응답은 그대로 유지한다.
+                if role == "user":
+                    _c0 = c[0].get("text", "").lstrip()[:1] \
+                        if isinstance(c, list) and c and isinstance(c[0], dict) \
+                        else str(c or "").lstrip()[:1]
+                    if _c0 in ("[", "#", "<"):
+                        continue
             else:
                 continue
             if role not in ("user", "assistant"):
                 continue
             seen_schema = True
-            c = m.get("content")
             if isinstance(c, list):
                 # thinking / tool_use / tool_result 는 버린다
+                # (codex rollout 은 input_text/output_text 만 본문으로 취급)
                 txt = "".join(p.get("text", "") for p in c
-                              if isinstance(p, dict) and p.get("type") == "text")
+                              if isinstance(p, dict) and p.get("type") in ("text", "input_text", "output_text"))
             else:
                 txt = str(c or "")
             txt = txt.strip()
@@ -372,6 +392,20 @@ def digest_session(path, since_line=0):
         # 판단하게 되므로 넉넉히 보관하고, 사람이 보는 출력에서만 자른다.
         ids[mid] = "%s: %s" % (role, txt[:1200].replace("\n", " "))
         kept.append("[%s] %s: %s" % (mid, role, txt))
+    # Codex 롤아웃은 시스템 프리앰블/도구 맥락이 user 턴으로 섞여 들어와
+    # 다이제스트가 600KB+ 로 커질 수 있다(#1295 실측 625KB). piri/claude 실측은
+    # ~126KB. 상한을 넘으면 **오래된 앞부분부터** 자른다 — 대화 끝이 최신 사실
+    # 이고, 증거 앤커(ids)도 남은 줄만 유지해 끊긴 인용을 막는다.
+    if len("\n".join(kept)) > MAX_DIGEST_BYTES:
+        kept_bytes, cut = 0, len(kept)
+        for i, chunk in enumerate(kept):
+            kept_bytes += len(chunk) + 1
+            if kept_bytes > MAX_DIGEST_BYTES:
+                cut = i
+                break
+        kept = kept[cut:]
+        kept_ids = {m.group(1) for c in kept for m in [re.match(r"\[([^\]]+)\]", c)] if m}
+        ids = {k: v for k, v in ids.items() if k in kept_ids}
     digest_session.last_anon = anon
     return "\n".join(kept), ids, n
 
@@ -435,9 +469,20 @@ def unwrap_claude_envelope(out):
     return usage, str(env.get("result") or "")
 
 
+# 리졸브된 엔진 전용 환경(#1295): main 에서 resolve_model_command() 결과로
+# 채우고 extract_json 이 자식 환경에 merge 한다. codex 엔진의 CODEX_HOME
+# 격리가 여기를 거치지 않으면(초기화 누락) 추출 세션이 원본 ~/.codex/sessions
+# 에 쌓여 자기호출 되먹임이 재발한다 — seoseo 실측으로 잡은 결함이다.
+ENGINE_ENV = {}
+
+
 def extract_json(prompt, model_cmd, timeout):
     """모델을 호출해 strict JSON 하나를 받아온다. 추출·함의검증 공용."""
     child_env = os.environ.copy()
+    # Engine-specific overrides (codex: CODEX_HOME isolation — see
+    # model_command.codex_scratch_home).
+    if ENGINE_ENV:
+        child_env.update(ENGINE_ENV)
     # Every extractor backend receives the legacy Claude-hook recursion guard.
     # Piri normally creates no Claude session, but carrying the guard keeps a
     # wrapper or future backend from re-entering SessionStart/End distill.
@@ -1177,6 +1222,7 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
         log_audit({"event": "engine_unavailable", "reason": message})
         return 2
     model_cmd = list(selected_model.argv)
+    ENGINE_ENV.update(dict(getattr(selected_model, "env_overrides", ())))
     reason = " reason=%s" % selected_model.reason if selected_model.reason else ""
     print("모델 엔진: engine=%s source=%s%s"
           % (selected_model.engine, selected_model.source, reason))
@@ -1199,11 +1245,28 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
         except Exception as e:
             print("      ⚠ Wiki 캐시 동기화 실패 (리터럴 대조가 낡을 수 있음): %s" % e)
 
-    picked = [(k, v) for k, v in SOURCES.items()
+    # INV-2: codex 로그는 어떤 경로로도 입력이 될 수 없다.
+    # 예외 (#1295): CCC_AUTO_DISTILL_CODEX=1 인 노드(codex 레인)는 추출 엔진도
+    # codex 로 리졸브됐을 때만 원본 codex 롤아웃을 소스로 허용한다. 추출 호출은
+    # CODEX_HOME 스크래치 리다이렉트로 격리되므로(model_command 참조) 추출기의
+    # 세션이 원본 트리에 떨어지는 일이 구조적으로 없다 — INV-2 ④ 실측이 이를
+    # 입증한다. 다른 엔진이면 격리가 없으므로 fail-closed.
+    codex_opt_in = os.environ.get("CCC_AUTO_DISTILL_CODEX", "").strip() == "1"
+    sources = dict(SOURCES)
+    if codex_opt_in:
+        sources["codex"] = FORBIDDEN
+    picked = [(k, v) for k, v in sources.items()
               if (args.source in ("auto", k)) and os.path.isdir(v)]
+    if codex_opt_in and picked and any(k == "codex" for k, _ in picked) \
+            and getattr(selected_model, "engine", None) != "codex":
+        print("FATAL: codex 소스는 codex 엔진(CODEX_HOME 격리)에서만 읽을 수 있다",
+              file=sys.stderr)
+        return 2
     for name, d in picked:
         rd = os.path.realpath(d)
         if rd == fb or rd.startswith(fb + os.sep):
+            if codex_opt_in and name == "codex":
+                continue  # 위 가드가 통과된 경우만 여기 온다
             print("FATAL: 소스 %s 가 codex 로그를 가리킨다" % name, file=sys.stderr)
             return 2
     if not picked:
@@ -1230,7 +1293,9 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     import glob
     files = []
     for name, d in picked:
-        got = glob.glob(d + "/*/*.jsonl") + glob.glob(d + "/*.jsonl")
+        # codex 롤아웃은 세대/월/일 3단 아래에 있다 (sessions/YYYY/MM/DD/*.jsonl).
+        got = (glob.glob(d + "/*/*.jsonl") + glob.glob(d + "/*.jsonl")
+               + glob.glob(d + "/*/*/*/*.jsonl"))
         print("소스 %s: %d개" % (name, len(got)))
         files += got
     # stat 은 파일당 한 번만 한다 — 정렬키·지평·워터마크(·워터마크 저장)가 같은

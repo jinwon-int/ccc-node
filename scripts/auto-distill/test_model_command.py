@@ -22,6 +22,7 @@ from model_command import (  # noqa: E402
     CLAUDE_ARGS,
     PIRI_ARGS,
     ModelCommandError,
+    codex_scratch_home,
     parse_systemd_environment,
     read_bridge_unit_environment,
     resolve_explicit_model_command,
@@ -220,9 +221,11 @@ class ModelCommandTest(unittest.TestCase):
         self.assertEqual(selected.reason, "no-runnable-piri")
 
     def test_invalid_dedicated_provider_fails_closed(self) -> None:
-        with self.assertRaisesRegex(ModelCommandError, "must be auto, piri, or claude"):
+        # "codex" became a valid dedicated provider in #1295; use a still-
+        # invalid value to pin the validation error.
+        with self.assertRaisesRegex(ModelCommandError, "must be auto"):
             resolve_model_command(
-                process_environment={"CCC_AUTO_DISTILL_PROVIDER": "codex"},
+                process_environment={"CCC_AUTO_DISTILL_PROVIDER": "gpt"},
                 unit_environment={},
                 home=self.home,
                 which=self.no_which,
@@ -397,6 +400,113 @@ class IterMessagesSinceLineTest(unittest.TestCase):
         # total must stay at the watermark, not collapse to 0 (a 0 watermark
         # would make every later run reprocess the whole file).
         self.assertEqual(total, 2)
+
+
+class CodexRolloutParserTest(unittest.TestCase):
+    """iter_messages recognizes the Codex CLI rollout schema (#1295)."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def write_rollout(self, lines: list[str]) -> Path:
+        path = self.root / "rollout.jsonl"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    @staticmethod
+    def response_item(idx: int, role: str, text: str) -> str:
+        return json.dumps({
+            "timestamp": "2026-08-26T00:00:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "msg_%03d" % idx,
+                "role": role,
+                "content": [{"type": "output_text" if role == "assistant" else "input_text", "text": text}],
+            },
+        })
+
+    def test_codex_messages_yield_with_id_and_role(self) -> None:
+        path = self.write_rollout([
+            json.dumps({"type": "session_meta", "payload": {"session_id": "s1"}}),
+            self.response_item(1, "user", "위키 레포 미머지 피알 머지하자"),
+            self.response_item(2, "assistant", "머지 완료했습니다"),
+        ])
+        got = list(AUTO_DISTILL.iter_messages(str(path)))
+        self.assertEqual(
+            [(2, "msg_001", "user", "위키 레포 미머지 피알 머지하자"),
+             (3, "msg_002", "assistant", "머지 완료했습니다")],
+            got,
+        )
+        self.assertTrue(AUTO_DISTILL.iter_messages.last_schema_ok)
+
+    def test_non_message_response_items_are_skipped_but_schema_stays_ok(self) -> None:
+        path = self.write_rollout([
+            self.response_item(1, "user", "질문"),
+            json.dumps({"type": "response_item", "payload": {"type": "reasoning"}}),
+            json.dumps({"type": "response_item", "payload": {"type": "custom_tool_call", "id": "t1"}}),
+            json.dumps({"type": "event_msg", "payload": {"type": "token_count"}}),
+        ])
+        got = list(AUTO_DISTILL.iter_messages(str(path)))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][2], "user")
+        self.assertTrue(AUTO_DISTILL.iter_messages.last_schema_ok)
+
+    def test_unknown_file_is_not_schema_ok(self) -> None:
+        path = self.write_rollout(["not json at all", "{\"type\": \"world_state\"}"])
+        got = list(AUTO_DISTILL.iter_messages(str(path)))
+        self.assertEqual(got, [])
+        self.assertFalse(AUTO_DISTILL.iter_messages.last_schema_ok)
+
+
+class CodexScratchHomeTest(unittest.TestCase):
+    """codex_scratch_home symlinks auth/config and fails closed without auth."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.home = Path(self.temp.name) / "home"
+        self.home.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_missing_auth_fails_closed(self) -> None:
+        with self.assertRaisesRegex(ModelCommandError, "auth.json"):
+            codex_scratch_home(home=self.home)
+
+    def test_scratch_symlinks_auth_and_config(self) -> None:
+        real = self.home / ".codex"
+        real.mkdir()
+        (real / "auth.json").write_text("{}", encoding="utf-8")
+        (real / "config.toml").write_text("model=x", encoding="utf-8")
+        scratch = codex_scratch_home(home=self.home)
+        self.assertEqual(scratch, self.home / ".codex-auto-distill-scratch")
+        link = scratch / "auth.json"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(os.path.realpath(link), str(real / "auth.json"))
+        self.assertTrue((scratch / "config.toml").is_symlink())
+
+
+class CodexResolverTest(unittest.TestCase):
+    """provider=codex resolves the codex engine and never falls back."""
+
+    def test_explicit_codex_provider_requires_codex_cli(self) -> None:
+        with self.assertRaisesRegex(ModelCommandError, "refusing Piri/Claude fallback"):
+            resolve_model_command(
+                process_environment={"CCC_AUTO_DISTILL_PROVIDER": "codex"},
+                which=lambda _: None,
+            )
+
+    def test_dedicated_provider_validation_accepts_codex(self) -> None:
+        with self.assertRaisesRegex(ModelCommandError, "must be auto"):
+            resolve_model_command(
+                process_environment={"CCC_AUTO_DISTILL_PROVIDER": "gpt"},
+                which=lambda _: None,
+            )
 
 
 class LiteralHitsIndexTest(unittest.TestCase):
