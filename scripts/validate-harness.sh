@@ -184,7 +184,8 @@ SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh claude/hooks/lifecycle-fe
           scripts/ccc-broker-reconcile.sh scripts/ccc-broker-reconcile.test.sh \
           claude/hooks/observability.test.sh scripts/validate-harness.sh \
           scripts/bridge-watchdog.sh scripts/bridge-watchdog.test.sh \
-          scripts/resource-pressure-guard.sh scripts/resource-pressure-guard.test.sh)
+          scripts/resource-pressure-guard.sh scripts/resource-pressure-guard.test.sh \
+          scripts/honcho-peer-staleness-canary.sh scripts/honcho-peer-staleness-canary.test.sh)
 if command -v shellcheck >/dev/null 2>&1; then
   SC_PRESENT=()
   for f in "${SC_SCOPE[@]}"; do
@@ -381,6 +382,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/agent-cron.test.sh scripts/agent-cron-lib.test.sh scripts/a2a-termux-native-worker.test.sh \
          scripts/a2a-termux-native-worker-health.test.sh \
          scripts/resource-pressure-guard.test.sh \
+         scripts/honcho-peer-staleness-canary.test.sh \
          scripts/install-memory-refresh-cron.test.sh scripts/install-nunchi.test.sh scripts/auto-distill.test.sh scripts/install-termux-mempalace.test.sh scripts/ccc-skill-autosave.test.sh \
          scripts/cost-ledger.test.sh \
          scripts/cost-ledger-weekly.test.sh \

@@ -103,6 +103,7 @@ CRON_AUX_MARKERS = (
 CRON_KNOWN_UNMANAGED_MARKERS = (
     "# ccc-node:self-update",
     "# ccc-node:live-backups-rotate",
+    "# ccc-node:honcho-staleness-canary",
 )
 CRON_MARKER_RE = re.compile(r"# (?:ccc-node:[A-Za-z0-9:-]+|nunchi:[A-Za-z0-9#:-]+)")
 CRON_GEN_RE = re.compile(r"\bgen=(h_[0-9a-f]{12})\b")
