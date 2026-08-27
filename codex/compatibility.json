@@ -190,6 +190,16 @@
       "pattern": "skills/shared/schema-change-mixed-data-validation/**",
       "compatibility": "claude-only",
       "reason": "generic schema-changeover data-validation procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "skills/shared/infra-gate-admin-merge-discipline/**",
+      "compatibility": "adapted",
+      "codex_skill": "infra-gate-admin-merge-discipline"
+    },
+    {
+      "pattern": "skills/shared/staleness-threshold-empirical-calibration/**",
+      "compatibility": "adapted",
+      "codex_skill": "staleness-threshold-empirical-calibration"
     }
   ],
   "managed_skills": [
