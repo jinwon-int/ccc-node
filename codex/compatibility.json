@@ -193,13 +193,13 @@
     },
     {
       "pattern": "skills/shared/infra-gate-admin-merge-discipline/**",
-      "compatibility": "adapted",
-      "codex_skill": "infra-gate-admin-merge-discipline"
+      "compatibility": "claude-only",
+      "reason": "generic CI-gate diagnosis and sanctioned admin-merge procedure surfaced only in the Claude harness; no codex counterpart"
     },
     {
       "pattern": "skills/shared/staleness-threshold-empirical-calibration/**",
-      "compatibility": "adapted",
-      "codex_skill": "staleness-threshold-empirical-calibration"
+      "compatibility": "claude-only",
+      "reason": "generic staleness-threshold calibration procedure surfaced only in the Claude harness; no codex counterpart"
     }
   ],
   "managed_skills": [
