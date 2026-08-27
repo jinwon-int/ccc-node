@@ -71,6 +71,14 @@ managed checkout on `main`; see CONTRIBUTING.md. Since #1060 these aborts
 notify the owner rather than failing silently, but the alert is a safety net,
 not a substitute for the separation.
 
+The alert alone proved insufficient: the same stall recurred on two more nodes
+after #1061 documented the discipline (#1328). A Telegram alert is a one-shot
+event, so a node that stalls while nobody is reading chat stays stalled and
+invisible. `ccc-doctor` therefore also reports the stall on demand — see the
+`self-update` row in [doctor](doctor.md). The abort log line records the
+offending branch (`branch=<cur> expected=<want>`), which distinguishes a stray
+feature branch from a misconfigured `CCC_SELF_UPDATE_BRANCH`.
+
 `ccc-self-update.sh` exit codes remain authoritative. In particular, exit `8`
 means the update was deferred because the bridge is serving work; the bridge
 compatibility entry point preserves that code and does not claim completion.

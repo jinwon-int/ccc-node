@@ -390,8 +390,14 @@ ccc_validate_self_update_repo "$REPO" "$CLAUDE_DIR" "$HERMES_ROOT" || exit 4
 # moving IS the failure, so a SHA-keyed alert would describe a different incident
 # each time it fired. push_notifier drops repeats inside a 300s window, so the
 # scheduled 04:45/05:45 ticks yield at most one alert apiece.
-notify_stalled() { # <reason> <text>
-  log "abort reason=$1 repo=$REPO"
+# The optional third argument appends `key=value` detail to the log line only.
+# It exists because the abort line recorded the reason but not the offending
+# value, so a later reader could see `reason=wrong-branch` without learning
+# which branch — the one fact needed to judge whether the stall is a stray
+# feature branch or a misconfigured CCC_SELF_UPDATE_BRANCH. Keep it out of the
+# notification text, which already spells the value out in prose.
+notify_stalled() { # <reason> <text> [log-detail]
+  log "abort reason=$1 repo=$REPO${3:+ $3}"
   notify "$2 ~/.claude/state/self-update.log" "stalled-$1"
 }
 if [ ! -d "$REPO/.git" ]; then
@@ -401,7 +407,7 @@ if [ ! -d "$REPO/.git" ]; then
 fi
 CUR_BRANCH="$(git -C "$REPO" symbolic-ref --short HEAD 2>/dev/null || echo '?')"
 if [ "$CUR_BRANCH" != "$BRANCH" ]; then
-  notify_stalled wrong-branch "self-update 정지: 레포가 '$CUR_BRANCH' 브랜치에 있습니다 (기대: '$BRANCH'). 이 노드는 복구 전까지 갱신되지 않습니다 — 관리 체크아웃은 '$BRANCH' 고정, 개발은 git worktree로 분리하세요."
+  notify_stalled wrong-branch "self-update 정지: 레포가 '$CUR_BRANCH' 브랜치에 있습니다 (기대: '$BRANCH'). 이 노드는 복구 전까지 갱신되지 않습니다 — 관리 체크아웃은 '$BRANCH' 고정, 개발은 git worktree로 분리하세요." "branch=$CUR_BRANCH expected=$BRANCH"
   say "self-update: repo is on '$CUR_BRANCH', expected '$BRANCH'; aborting (fail-closed)" >&2
   exit 4
 fi

@@ -451,6 +451,10 @@ out="$(run_selfup run 2>&1)"; rc=$?
 ok "wrong-branch exits 4" '[ "$rc" = 4 ]'
 ok "wrong-branch notifies" 'spool_text | grep -q "self-update 정지" && spool_text | grep -q "sidetrack"'
 ok "wrong-branch dedup keys on reason, not SHA" 'spool_dedup | grep -qx "SelfUpdate:stalled-wrong-branch"'
+# The abort line used to record only reason= and repo=, so a later reader could
+# not tell a stray feature branch from a misconfigured branch setting (#1328).
+ok "wrong-branch abort logs the offending branch and the expected one" \
+  'grep -q "abort reason=wrong-branch .*branch=sidetrack expected=main" "$STATE/self-update.log"'
 git -C "$REPO" checkout -q main
 git -C "$REPO" branch -qD sidetrack
 

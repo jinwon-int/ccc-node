@@ -128,6 +128,31 @@ their labels; unknown markers are `경고` so stale duplicates like the `#1079`
 ghost entries stay visible. The check reads only the crontab of the user
 running doctor.
 
+## self-update stall
+
+One `self-update` row, read from `$CCC_STATE_DIR/self-update.log` (falling back
+to `<claude-dir>/state`). The verdict is the **last terminal record**, not the
+presence of any abort in history:
+
+| State | Class | Meaning |
+|---|---|---|
+| log absent | `정상` | node does not run self-update |
+| no terminal record in the log tail | `정상` | nothing to judge |
+| last record is `done`/audit JSON | `정상` | last attempt reached an end state |
+| `wrong-branch`, `dirty-tree`, `no-repo` | `수동필요` | node receives no harness updates until a human restores the checkout |
+| any other abort (e.g. `fetch-failed`) | `경고` | transient; the next tick retries |
+
+`consecutive=N` counts the unbroken run of the newest reason only — a different
+earlier reason is a separate incident, and inflating the streak would misreport
+how long the current one has persisted. A repaired node reads `수동필요` until
+its next successful tick, which is the honest reading: no successful update has
+happened since the failure.
+
+Why this exists as a pull-based check even though #1060 already alerts: the
+alert is a one-shot event. After #1061 documented the worktree discipline the
+same stall still recurred on two nodes (#1328), because nothing surfaced a node
+that had quietly stopped updating days earlier.
+
 ## Fleet matrix
 
 `ccc-doctor-fleet-matrix.sh` summarizes already-collected doctor output; it does not SSH or mutate nodes.
