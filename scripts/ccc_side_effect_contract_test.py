@@ -122,9 +122,11 @@ class SideEffectContractTest(unittest.TestCase):
                 "agent_cron.spool_notify",
                 "external_wait.wake_resume",
                 "skill_autosave.sweep",
+                "service_control.restart",
+                "telegram.terminal_cleanup",
             ],
         )
-        self.assertEqual(len(observations), 30)
+        self.assertEqual(len(observations), 40)
         by_op = {
             operation.operation: {
                 item.boundary: item for item in observations if item.operation == operation.operation
@@ -162,6 +164,20 @@ class SideEffectContractTest(unittest.TestCase):
         self.assertEqual(autosave_dup.attempts, 1)
         self.assertEqual(autosave_dup.unique_effects, 1)
         self.assertFalse(autosave_dup.ack_recorded)
+        service_dup = by_op["service_control.restart"][
+            CONTRACT.RecoveryBoundary.DUPLICATE_RESTART_REPLAY
+        ]
+        self.assertEqual(service_dup.action.value, "reconcile")
+        self.assertEqual(service_dup.attempts, 1)
+        self.assertEqual(service_dup.unique_effects, 1)
+        self.assertTrue(service_dup.ack_recorded)
+        cleanup_ambiguous = by_op["telegram.terminal_cleanup"][
+            CONTRACT.RecoveryBoundary.AFTER_EXTERNAL_SUCCESS_BEFORE_ACK
+        ]
+        self.assertEqual(cleanup_ambiguous.action.value, "reconcile")
+        self.assertEqual(cleanup_ambiguous.attempts, 1)
+        self.assertEqual(cleanup_ambiguous.unique_effects, 1)
+        self.assertTrue(cleanup_ambiguous.ack_recorded)
 
     def test_compensate_fixture_undoes_the_unacked_effect(self) -> None:
         operation = _operation()
