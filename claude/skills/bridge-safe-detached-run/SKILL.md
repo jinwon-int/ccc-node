@@ -85,6 +85,33 @@ Remember `--collect` removes the unit on exit, so once the job succeeds
 `systemctl status` says "could not be found" — that is normal and is **not**
 evidence of failure. The log's `EXIT=` marker is the only durable proof.
 
+## Receiving `<task-notification status=stopped>` — classify first
+
+The watcher stopping is not the job failing (ccc-node #1267): a session or
+bridge restart (#822), a dying poll loop, and a lost child all surface as the
+same line. The only wrong move is acting on the notification alone — #1258's
+near-miss was a finished 12/12 job about to be re-run because of it. Read the
+registry instead; it is stateless, so no surviving watcher is required:
+
+```bash
+python3 ~/.claude/hooks/lib/detached_jobs.py list --json  # done/running/lost with real EXIT codes
+python3 ~/.claude/hooks/lib/detached_jobs.py sweep        # human-readable, byte-capped
+```
+
+| verdict | meaning | action |
+|---|---|---|
+| `done`, `EXIT=0` | completed successfully | report success; `ack --unit <job>` |
+| `done`, nonzero/absent EXIT | the work itself failed | inspect the log tail, then decide |
+| `running` | work alive — only the watcher died | nothing to fix; optionally start a fresh watcher |
+| `lost` | stale log, no EXIT marker | investigate unit/log before any re-run |
+
+If the job was never registered, fall back to raw evidence: `journalctl -u
+<job>.service -n 20` while the unit lives (`--collect` removes it afterwards)
+plus the log's `EXIT=` marker — then register it so later notifications
+classify cleanly. Re-running stays approval-gated whenever the command is
+destructive or non-idempotent; a stopped notification never lowers that gate
+by itself.
+
 ## Step 3 — Short synchronous variant
 
 For a command you want isolated from the bridge but still want to wait on inline:
@@ -121,3 +148,5 @@ systemctl stop <job>.service                               # abort a running job
 - The job keeps running across a bridge/session restart (that's the point)
 - `detached_jobs.py list` shows the job, and a later SessionStart reports it as
   `done`/`running`/`lost` even if this session is gone
+- A `status=stopped` notification is answered from `list --json` without
+  restarting or re-running anything
