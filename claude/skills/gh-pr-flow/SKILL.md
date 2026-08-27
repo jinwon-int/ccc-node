@@ -81,6 +81,13 @@ fresh explicit user approval in the current conversation, in both directions.
 
    - Old approvals, memory, environment state, or approval for another PR do
      not count. If approval is absent or ambiguous, stop and ask.
+   - **One narrow exception, and it is not this one.** Some repos deny
+     infrastructure paths (`scripts/`, `.github/`) at a required check on every
+     branch and deliberately leave `enforce_admins` false, documenting the admin
+     merge as the *intended* way in. That is a sanctioned hatch, not a bypass —
+     see `infra-gate-admin-merge-discipline`, which also covers the trap that
+     such gates exit before running their own tests. It applies only when the
+     gate's own source sanctions it; absent that sentence, this rule stands.
    - After approval, set the approval flag only on the one approved command.
 
    Helper scripts live next to this SKILL.md. Resolve the directory once —
