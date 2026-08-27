@@ -2083,5 +2083,158 @@ class UnownedCompletionListenerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observations, [])
 
 
+class _DurableCapableRuntime(CodexRuntime):
+    """Test double declaring the supported capability contract (#646)."""
+
+    @staticmethod
+    def async_completion_capability() -> Any:
+        from telegram_bot.core.agent_runtime import AsyncCompletionCapability
+
+        return AsyncCompletionCapability(
+            provider="codex",
+            state="supported",
+            protocol_version="1",
+            notification_method="turn/completed",
+            recovery_method="thread/read",
+            ownership_scope="detached_task",
+            supports_durable_delivery=True,
+            reason_code="test_contract",
+        )
+
+
+class DurableCompletionListenerTests(unittest.IsolatedAsyncioTestCase):
+    """The slice-2 promotion seam fires only under a declared capability."""
+
+    async def asyncSetUp(self) -> None:
+        self.clients: list[FakeClient] = []
+
+        def factory(
+            handler: Callable[[CodexServerRequest], Awaitable[Mapping[str, Any]]],
+        ) -> FakeClient:
+            client = FakeClient(handler)
+            client.thread_start_result = {"thread": {"id": "thread-known"}}
+            self.clients.append(client)
+            return client
+
+        self.runtime = _DurableCapableRuntime(client_factory=factory)
+
+    async def asyncTearDown(self) -> None:
+        await self.runtime.close()
+
+    def _completed_notification(self, text: str = "detached result") -> CodexNotification:
+        return CodexNotification(
+            "turn/completed",
+            {
+                "threadId": "thread-known",
+                "turn": {
+                    "id": "turn-detached",
+                    "status": "completed",
+                    "itemsView": "full",
+                    "items": [
+                        {"id": "m1", "type": "agentMessage", "text": text}
+                    ],
+                },
+            },
+        )
+
+    async def test_durable_listener_receives_bounded_body(self) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+        observations: list[tuple[str, str, str | None]] = []
+        self.runtime.set_durable_completion_listener(
+            lambda thread_id, turn_id, text: observations.append(
+                (thread_id, turn_id, text)
+            )
+        )
+
+        self.runtime._route_notification(self._completed_notification())
+
+        self.assertEqual(observations, [("thread-known", "turn-detached", "detached result")])
+
+    async def test_degraded_runtime_never_promotes(self) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+        # Force the degraded capability back onto the instance class path.
+        observations: list[tuple[str, str, str | None]] = []
+        self.runtime.set_durable_completion_listener(
+            lambda thread_id, turn_id, text: observations.append(
+                (thread_id, turn_id, text)
+            )
+        )
+        original = type(self.runtime).async_completion_capability
+        type(self.runtime).async_completion_capability = staticmethod(  # type: ignore[method-assign]
+            CodexRuntime.async_completion_capability
+        )
+        try:
+            self.runtime._route_notification(self._completed_notification())
+        finally:
+            type(self.runtime).async_completion_capability = staticmethod(original)  # type: ignore[method-assign]
+
+        self.assertEqual(observations, [])
+
+    async def test_durable_listener_exception_is_swallowed(self) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+
+        def raising_listener(thread_id: str, turn_id: str, text: str | None) -> None:
+            raise RuntimeError("promotion exploded")
+
+        self.runtime.set_durable_completion_listener(raising_listener)
+
+        self.runtime._route_notification(self._completed_notification())
+
+        self.assertEqual(
+            self.runtime.async_completion_diagnostics().unowned_completed, 1
+        )
+
+    async def test_late_active_duplicate_never_promotes(self) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+        observations: list[tuple[str, str, str | None]] = []
+        self.runtime.set_durable_completion_listener(
+            lambda thread_id, turn_id, text: observations.append(
+                (thread_id, turn_id, text)
+            )
+        )
+        self.runtime._remember_terminal_turn("turn-detached")
+
+        self.runtime._route_notification(self._completed_notification())
+
+        self.assertEqual(observations, [])
+
+    async def test_bodyless_completion_promotes_with_none_text(self) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+        observations: list[tuple[str, str, str | None]] = []
+        self.runtime.set_durable_completion_listener(
+            lambda thread_id, turn_id, text: observations.append(
+                (thread_id, turn_id, text)
+            )
+        )
+
+        notification = CodexNotification(
+            "turn/completed",
+            {
+                "threadId": "thread-known",
+                "turn": {
+                    "id": "turn-detached",
+                    "status": "completed",
+                    "itemsView": "full",
+                    "items": [],
+                },
+            },
+        )
+        self.runtime._route_notification(notification)
+
+        self.assertEqual(
+            observations, [("thread-known", "turn-detached", None)]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
