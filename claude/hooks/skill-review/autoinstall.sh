@@ -246,6 +246,107 @@ gate_codex_compat() { # <skill.md> — Codex nodes reject Claude-only couplings
   return 0
 }
 
+gate_unverified_claims() { # <skill.md> — falsifiable assertions must carry a citation
+  # Rationale (#1307 follow-up): the machine cannot check whether a claim is
+  # TRUE, but it can check whether the claim is CITED. Two auto-installed
+  # drafts on 2026-08-27 asserted a `gh` exit code that does not exist and a
+  # docs URL that 404s; both were uncheckable by the reader as written. This
+  # gate is therefore about citability, not truth: a draft that states a
+  # falsifiable technical fact with no way to re-derive it stays pending for
+  # human review. Reasons are pattern labels only — draft content is never
+  # quoted, so logs/markers/notifications stay redaction-safe.
+  local f="$1" risky="" url code checked=0
+  [ "${CCC_SKILL_GATE_CLAIMS:-1}" = 1 ] || return 0
+
+  # --- risky claim families -------------------------------------------------
+  if grep -qiE '(exits?|exited|exit[[:space:]]+(code|status))[[:space:]]+(with[[:space:]]+)?(code[[:space:]]+)?[0-9]{1,3}([^0-9]|$)' "$f" 2>/dev/null; then
+    risky="exit-code"
+  elif grep -qiE '(HTTP|status[[:space:]]+code)[[:space:]]+[0-9]{3}([^0-9]|$)' "$f" 2>/dev/null; then
+    risky="http-status"
+  elif grep -qiE '(^|[^a-z0-9_.-])v?[0-9]+\.[0-9]+\.[0-9]+([^0-9]|$)' "$f" 2>/dev/null; then
+    risky="version-pin"
+  fi
+
+  if [ -n "$risky" ]; then
+    # --- evidence markers that make the claim re-derivable -------------------
+    if grep -qE 'https?://' "$f" 2>/dev/null; then :
+    elif grep -qE '\.(go|py|ts|tsx|js|jsx|rs|sh|rb|java|cc?|cpp|hp?p?|ya?ml|json|toml):[0-9]+' "$f" 2>/dev/null; then :
+    elif grep -qE '(--help|[[:space:]]help[[:space:]]|--version)' "$f" 2>/dev/null; then :
+    elif grep -qiE '(verified|confirmed|measured|observed|검증|확인)[^\n]{0,40}20[0-9]{2}-[0-9]{2}-[0-9]{2}' "$f" 2>/dev/null; then :
+    else
+      printf 'unverified-claim %s' "$risky"; return 1
+    fi
+  fi
+
+  # --- dead citations -------------------------------------------------------
+  # Fail-OPEN on network trouble (cron may run offline); block only on a
+  # definitive 404/410, which means the citation cannot be checked by anyone.
+  [ "${CCC_SKILL_GATE_URLCHECK:-1}" = 1 ] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  while IFS= read -r url; do
+    [ "$checked" -lt "${CCC_SKILL_GATE_URLMAX:-6}" ] || break
+    checked=$((checked + 1))
+    if url_missing "$url"; then printf 'dead-citation http-404'; return 1; fi
+  done < <(claim_urls "$f")
+  return 0
+}
+
+url_missing() { # <url> — 0 only when the URL is DEFINITIVELY gone
+  # Fail-open everywhere else. Two classes of 404 are not dead citations:
+  #   * template placeholders (OWNER/REPO/NUM/<sha>) — 404 by construction
+  #   * private GitHub resources — indistinguishable from deleted ones without
+  #     auth, so re-check with `gh` before condemning them
+  local u="$1" code slug api
+  case "$u" in
+    *OWNER*|*REPO*|*NUM*|*SHA*|*BRANCH*|*PR_*|*_ID*|*'<'*|*'{'*|*example.com*|*path/to/*|*YOUR*|*xxx*)
+      return 1 ;;
+  esac
+  # Some doc hosts (support.google.com, nvd.nist.gov) 403/404 curl's default
+  # UA, so a browser UA is sent and a HEAD-hostile host is retried with GET.
+  local UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+  code="$(curl -sIL -A "$UA" -o /dev/null -w '%{http_code}' --max-time 8 "$u" 2>/dev/null)" || return 1
+  case "$code" in
+    404|410)
+      code="$(curl -sL -A "$UA" -o /dev/null -w '%{http_code}' --max-time 10 "$u" 2>/dev/null)" || return 1
+      case "$code" in 404|410) ;; *) return 1 ;; esac
+      ;;
+    *) return 1 ;;
+  esac
+  if printf '%s' "$u" | grep -qE '^https?://(www\.)?github\.com/'; then
+    command -v gh >/dev/null 2>&1 || return 1
+    slug="$(printf '%s' "$u" | sed -E 's#^https?://(www\.)?github\.com/##; s#/$##')"
+    api="$(printf '%s' "$slug" \
+      | sed -E 's#^([^/]+/[^/]+)/pull/([0-9]+)$#repos/\1/pulls/\2#
+                s#^([^/]+/[^/]+)/issues/([0-9]+)$#repos/\1/issues/\2#
+                s#^([^/]+/[^/]+)$#repos/\1#')"
+    case "$api" in
+      repos/*) gh api "$api" >/dev/null 2>&1 && return 1 ;;
+      *) return 1 ;;
+    esac
+  fi
+  return 0
+}
+
+claim_urls() { # <skill.md> — every citable URL, deduped, scheme-normalized
+  # Schemeless citations ("docs.github.com/en/rest/pulls/") are the common form
+  # in prose and were missed by a scheme-anchored match, so they are collected
+  # too and probed over https. Requires host.tld/ shape, which excludes source
+  # refs like checks.go:303 and relative paths like docs/skill-autosave.md.
+  # A line that documents a URL as broken ("...this form 404s — use X instead")
+  # is a warning to the reader, not a citation, so those lines are excluded
+  # before extraction. Otherwise a skill can never record a known-dead path.
+  local f="$1" body
+  # Note the trailing [a-z]* — "404s"/"410s" read naturally in prose and a
+  # plain \b404\b silently fails to match them.
+  body="$(grep -viE '(^|[^0-9])(404|410)[a-z]*([^0-9]|$)|dead[- ]?(link|citation)|no longer (exists|valid|works)|deprecated|obsolete' "$f" 2>/dev/null)"
+  {
+    printf '%s\n' "$body" | grep -oE 'https?://[A-Za-z0-9._~:/?#@!$&*+,;=%-]+'
+    printf '%s\n' "$body" | grep -oE '(^|[^A-Za-z0-9._/@:-])([A-Za-z0-9-]+\.)+[A-Za-z]{2,24}/[A-Za-z0-9._~:/?#@!$&*+,;=%-]*' \
+      | sed -E 's#^[^A-Za-z0-9]*##; s#^#https://#'
+  } 2>/dev/null | sed -E 's#[.,)`"'"'"']+$##' \
+    | grep -E '^https?://[^/]+\.[A-Za-z]{2,24}(/|$)' | sort -u
+}
+
 norm_name() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -dc 'a-z0-9'; }
 
 desc_tokens() { # <text> — one lowercase token (len>=3) per line, unique+sorted
@@ -480,6 +581,9 @@ do_run() {
       record_block "$dir" "$id" "$verdict"; continue
     fi
     if ! verdict="$(gate_codex_compat "$f")"; then
+      record_block "$dir" "$id" "$verdict"; continue
+    fi
+    if ! verdict="$(gate_unverified_claims "$f")"; then
       record_block "$dir" "$id" "$verdict"; continue
     fi
     if ! verdict="$(gate_dedup "$name" "$desc" "$work")"; then
@@ -790,6 +894,11 @@ do_apply() {
         return 2
       }
       verdict="$(gate_codex_compat "$f")" || {
+        rm -f "$f"
+        jq -nc --arg code "$verdict" '{ok:false,code:$code}'
+        return 2
+      }
+      verdict="$(gate_unverified_claims "$f")" || {
         rm -f "$f"
         jq -nc --arg code "$verdict" '{ok:false,code:$code}'
         return 2

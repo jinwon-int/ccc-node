@@ -335,5 +335,111 @@ out="$(CCC_SKILL_REVIEW_STATE_DIR="$Q_STATE" CCC_STATE_DIR="$Q_DECOY" CLAUDE_SKI
 ok "CCC_STATE_DIR does not relocate installs" 'jq -e "(.installed | index(\"queue-anchor\")) != null" >/dev/null <<<"$out" && [ -f "$Q_SKILLS/queue-anchor/SKILL.md" ]'
 ok "CCC_STATE_DIR decoy queue stays untouched" '[ -z "$(ls -A "$Q_DECOY/pending-skills")" ] && [ ! -e "$Q_DECOY/skill-autosave-install.jsonl" ]'
 
+# --- 12) unverified factual claims are blocked --------------------------------
+# The machine cannot check whether a claim is TRUE, only whether it is CITED.
+# URL probing is disabled here so the suite stays hermetic; the dead-citation
+# path is covered below through claim_urls/url_missing, which need no network.
+# The daily cap is already spent by section 7, and a cap deferral is not a gate
+# verdict — raise it so these cases exercise the claim gate and nothing else.
+run_claims() {
+  run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_GATE_URLCHECK=0 \
+    CCC_SKILL_AUTOSAVE_DAILY_CAP=99 bash "$AUTO" run >/dev/null
+}
+
+make_draft 20260101-000020-a-exitcode exit-claim-skill "Diagnose the recurring watch timeout by reading the command exit status." \
+"# Exit claim
+
+## Procedure
+1. Run the checks command and observe that it exits 124 immediately.
+2. Query the rollup instead.
+3. Wait and retry.
+4. Resume the watch.
+5. Merge once green."
+run_claims
+ok "uncited exit-code claim blocked" \
+  '[ ! -e "$SKILLS/exit-claim-skill" ] && jq -e ".reason == \"unverified-claim exit-code\"" "$PENDING/20260101-000020-a-exitcode/autosave-block.json" >/dev/null'
+ok "claim block marker never quotes the draft" \
+  '! grep -q "124" "$PENDING/20260101-000020-a-exitcode/autosave-block.json"'
+
+make_draft 20260101-000021-b-cited exit-cited-skill "Diagnose the recurring watch timeout using the documented command exit status." \
+"# Exit claim with a source citation
+
+## Procedure
+1. The command exits 8 when checks are pending (pkg/cmd/pr/checks/checks.go:251).
+2. Query the rollup instead.
+3. Wait and retry.
+4. Resume the watch.
+5. Merge once green."
+run_claims
+ok "exit-code claim with source ref installs" '[ -f "$SKILLS/exit-cited-skill/SKILL.md" ]'
+
+make_draft 20260101-000022-c-helpcited exit-help-skill "Diagnose the recurring watch failure by consulting the command help output." \
+"# Exit claim backed by a runnable check
+
+## Procedure
+1. Run the command with --help to read its documented exit codes.
+2. Confirm the pending code from that output.
+3. Query the rollup instead.
+4. Wait and retry.
+5. Merge once green."
+run_claims
+ok "exit-code claim with --help installs" '[ -f "$SKILLS/exit-help-skill/SKILL.md" ]'
+
+make_draft 20260101-000023-d-httpstatus http-claim-skill "Audit the recurring API failure path by classifying the returned status." \
+"# HTTP claim
+
+## Procedure
+1. The endpoint answers HTTP 409 when the branch is stale.
+2. Refresh the branch.
+3. Retry the request.
+4. Confirm the result.
+5. Record it."
+run_claims
+ok "uncited http-status claim blocked" \
+  'jq -e ".reason == \"unverified-claim http-status\"" "$PENDING/20260101-000023-d-httpstatus/autosave-block.json" >/dev/null'
+
+make_draft 20260101-000024-e-version version-claim-skill "Pin the recurring upgrade procedure to the release that fixed the defect." \
+"# Version claim
+
+## Procedure
+1. Confirm the toolchain is at least 2.96.0 before continuing.
+2. Upgrade if it is older.
+3. Re-run the check.
+4. Confirm the result.
+5. Record it."
+run_claims
+ok "uncited version-pin claim blocked" \
+  'jq -e ".reason == \"unverified-claim version-pin\"" "$PENDING/20260101-000024-e-version/autosave-block.json" >/dev/null'
+
+make_draft 20260101-000025-f-noclaim no-claim-skill "Capture the recurring review walkthrough that carries no factual assertions." \
+"# No falsifiable claim
+
+## Procedure
+1. Read the diff end to end.
+2. Note anything surprising.
+3. Ask the author about it.
+4. Record the outcome.
+5. Close the review."
+run_claims
+ok "claim gate leaves claim-free drafts alone" '[ -f "$SKILLS/no-claim-skill/SKILL.md" ]'
+
+# claim_urls / url_missing are pure text handling for these inputs — assert them
+# directly rather than through a run, so no network call is needed.
+# shellcheck disable=SC1090
+. <(sed -n '/^claim_urls()/,/^}/p;/^url_missing()/,/^}/p' "$AUTO")
+CU="$TMP/cu.md"
+printf '%s\n' \
+  'See https://example.org/a for details.' \
+  'Also docs.github.com/en/rest/pulls covers it.' \
+  'The old docs.github.com/en/repositories/configuring-branches-and-merges/ form 404s now.' \
+  'Source is pkg/cmd/pr/checks/checks.go:303 and notes live in docs/notes.md.' > "$CU"
+urls="$(claim_urls "$CU")"
+ok "scheme-bearing URL extracted" 'grep -qx "https://example.org/a" <<<"$urls"'
+ok "schemeless citation extracted and normalized" 'grep -qx "https://docs.github.com/en/rest/pulls" <<<"$urls"'
+ok "URL documented as dead is not re-probed as a citation" '! grep -q "configuring-branches-and-merges/" <<<"$urls"'
+ok "source ref is not mistaken for a URL" '! grep -q "checks.go" <<<"$urls"'
+ok "relative doc path is not mistaken for a URL" '! grep -q "docs/notes.md" <<<"$urls"'
+ok "template placeholder URL is never condemned" '! url_missing "https://github.com/OWNER/REPO/pull/NUM.diff"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
