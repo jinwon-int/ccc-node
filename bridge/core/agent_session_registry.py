@@ -398,6 +398,27 @@ class AgentSessionRegistry:
             if record.cached is not None
         )
 
+    def find_route_by_session_id(self, session_id: str) -> StreamKey | None:
+        """Reverse-map one live provider session id to its conversation route.
+
+        Synchronous, event-loop-confined read like every other registry
+        accessor; the resident cache is small so the linear scan is bounded.
+        Returns ``None`` when no resident cached session owns that session id
+        — callers must treat that as fail-closed (no route attribution) and
+        never fabricate a route for it (#646).
+        """
+
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        for key, record in self._records.items():
+            slot = record.cached
+            if slot is None:
+                continue
+            session = slot.entry.session
+            if getattr(session, "session_id", None) == session_id:
+                return key
+        return None
+
     def prepare_close(self) -> tuple[ActiveSessionHandle, ...]:
         """Deny approvals/waiting projections and snapshot active handles."""
 

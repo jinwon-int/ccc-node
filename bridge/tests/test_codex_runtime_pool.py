@@ -29,6 +29,10 @@ class _Runtime:
         self.snapshot_requests: list[str] = []
         self.closed = False
         self.recycle_calls = 0
+        self.listener = None
+
+    def set_unowned_completion_listener(self, listener) -> None:
+        self.listener = listener
 
     async def start_or_resume(self, request: SessionRequest) -> _Session:
         self.requests.append(request)
@@ -219,3 +223,43 @@ async def test_pool_rejects_snapshot_route_collision() -> None:
             memory_audience="private",
             memory_scope=second_scope,
         )
+
+
+@pytest.mark.anyio
+async def test_pool_fans_unowned_completion_listener_out_to_children() -> None:
+    """The #646 seam reaches lazily-created runtimes, before and after."""
+    created: list[_Runtime] = []
+
+    def factory(environment: Mapping[str, str]) -> _Runtime:
+        runtime = _Runtime(environment)
+        created.append(runtime)
+        return runtime
+
+    pool = CodexRuntimePool(
+        shared_environment=_environment("shared"),
+        runtime_factory=factory,
+    )
+    observations: list[tuple[str, str]] = []
+
+    # A runtime created before registration still receives the listener.
+    await pool.list_models()
+    assert created, "expected the shared runtime to be created"
+
+    pool.set_unowned_completion_listener(
+        lambda thread_id, turn_id: observations.append((thread_id, turn_id))
+    )
+    assert created[0].listener is not None
+
+    # A runtime created after registration inherits the listener directly.
+    request = SessionRequest(
+        working_directory="/workspace",
+        session_id="thread-audience",
+        memory_environment=_environment("private"),
+    )
+    await pool.start_or_resume(request)
+    assert len(created) == 2
+    assert created[1].listener is not None
+
+    pool.set_unowned_completion_listener(None)
+    assert created[0].listener is None
+    assert created[1].listener is None

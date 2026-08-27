@@ -201,10 +201,15 @@ class JsonJournalCore:
 
     def list_record_ids(self) -> tuple[str, ...]:
         with self._exclusive():
-            paths = sorted(self.root.glob("*.json"))
-            for path in paths:
-                self._validate_record_name(path)
-            return tuple(path.stem for path in paths)
+            return self._record_ids_unlocked()
+
+    def _record_ids_unlocked(self) -> tuple[str, ...]:
+        """Caller holds ``_exclusive()``; never re-acquire the file lock."""
+
+        paths = sorted(self.root.glob("*.json"))
+        for path in paths:
+            self._validate_record_name(path)
+        return tuple(path.stem for path in paths)
 
     @contextmanager
     def claim_record(self, record_id: str) -> Iterator[bool]:

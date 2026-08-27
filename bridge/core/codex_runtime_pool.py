@@ -57,6 +57,22 @@ class CodexRuntimePool:
         self._thread_runtimes: dict[str, _UsageRuntime] = {}
         self._lock = asyncio.Lock()
         self._closed = False
+        # Fan-out target for the #646 unowned-completion seam: applied to
+        # every runtime this pool already created and to every runtime the
+        # factory creates from now on, so the composition root can register
+        # one observer without knowing the pool's lazily-built children.
+        self._unowned_completion_listener: Callable[[str, str], object] | None = None
+
+    def set_unowned_completion_listener(
+        self, listener: Callable[[str, str], object] | None
+    ) -> None:
+        """Mirror the listener onto every child runtime, present and future."""
+
+        self._unowned_completion_listener = listener
+        for runtime in self._runtimes.values():
+            setter = getattr(runtime, "set_unowned_completion_listener", None)
+            if callable(setter):
+                setter(listener)
 
     @staticmethod
     def _environment_key(environment: Mapping[str, str]) -> EnvironmentKey:
@@ -79,6 +95,13 @@ class CodexRuntimePool:
             runtime = self._runtimes.get(key)
             if runtime is None:
                 runtime = self._runtime_factory(dict(environment))
+                listener = self._unowned_completion_listener
+                if listener is not None:
+                    setter = getattr(
+                        runtime, "set_unowned_completion_listener", None
+                    )
+                    if callable(setter):
+                        setter(listener)
                 self._runtimes[key] = runtime
             return runtime
 

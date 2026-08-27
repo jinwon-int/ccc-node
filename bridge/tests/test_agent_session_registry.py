@@ -262,3 +262,36 @@ def test_deactivate_mismatch_warning_carries_finite_age() -> None:
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_find_route_by_session_id_is_fail_closed() -> None:
+    """#646: reverse route attribution only for resident cached sessions."""
+
+    from telegram_bot.core.agent_session_registry import AgentSessionRegistry
+    from telegram_bot.core.project_chat_types import AgentSessionEntry
+
+    class _Session:
+        def __init__(self, session_id: str) -> None:
+            self.session_id = session_id
+
+    registry = AgentSessionRegistry()
+    assert registry.find_route_by_session_id("thread-1") is None
+    assert registry.find_route_by_session_id("") is None
+
+    registry.put_cached((7, 42), AgentSessionEntry(session=_Session("thread-1")))
+    registry.put_cached((8, 43), AgentSessionEntry(session=_Session("thread-2")))
+
+    assert registry.find_route_by_session_id("thread-2") == (8, 43)
+    assert registry.find_route_by_session_id("thread-1") == (7, 42)
+    assert registry.find_route_by_session_id("thread-missing") is None
+
+    # An entry whose session lacks a session_id attribute never matches.
+    registry.put_cached((9, 44), AgentSessionEntry(session=object()))
+    assert registry.find_route_by_session_id("thread-2") == (8, 43)
+
+
+def test_generation_high_water_defaults_to_zero() -> None:
+    from telegram_bot.core.agent_session_registry import AgentSessionRegistry
+
+    registry = AgentSessionRegistry()
+    assert registry.generation_high_water((7, 42)) == 0

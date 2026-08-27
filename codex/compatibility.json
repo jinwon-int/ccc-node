@@ -190,6 +190,16 @@
       "pattern": "skills/shared/schema-change-mixed-data-validation/**",
       "compatibility": "claude-only",
       "reason": "generic schema-changeover data-validation procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "skills/shared/infra-gate-admin-merge-discipline/**",
+      "compatibility": "claude-only",
+      "reason": "generic CI-gate diagnosis and sanctioned admin-merge procedure surfaced only in the Claude harness; no codex counterpart"
+    },
+    {
+      "pattern": "skills/shared/staleness-threshold-empirical-calibration/**",
+      "compatibility": "claude-only",
+      "reason": "generic staleness-threshold calibration procedure surfaced only in the Claude harness; no codex counterpart"
     }
   ],
   "managed_skills": [
