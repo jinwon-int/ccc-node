@@ -61,4 +61,5 @@ fi
 
 [ "$(id -u)" -eq 0 ] || die 'production restart must run as root via the installed wrapper'
 [ "$script_uid" -eq 0 ] || die 'production wrapper must be owned by root'
+# ccc-side-effect: service_control.restart
 exec /usr/bin/systemctl restart -- "$unit"

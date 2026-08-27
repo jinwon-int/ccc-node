@@ -393,6 +393,7 @@ class BotLifecycleMixin:
             )
         await self._drain_terminal_ops(application.bot, ledger)
 
+    # ccc-side-effect: telegram.terminal_cleanup
     async def _drain_terminal_ops(self, bot, ledger=None) -> None:
         """Retry pending terminal cleanups (the ledger's mini terminal-outbox)."""
         ledger = ledger or self._lifecycle_task_ledger()

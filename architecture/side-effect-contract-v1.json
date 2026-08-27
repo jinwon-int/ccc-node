@@ -154,6 +154,56 @@
         "after_ack_before_terminal": "safe-replay",
         "duplicate_restart_replay": "manual-review"
       }
+    },
+    {
+      "operation": "service_control.restart",
+      "owner": "root-installed service restart wrapper",
+      "registration": {
+        "kind": "shell-main",
+        "path": "scripts/ccc-service-control.sh",
+        "symbol": "<top-level>"
+      },
+      "external": true,
+      "idempotency": "none",
+      "idempotency_key": "none",
+      "retry_class": "manual-only",
+      "ambiguous_window": "systemctl accepted the restart before the unit reached its target state or the wrapper exited while the stop/start cycle was still in flight",
+      "reconcile": "query",
+      "compensation": "none",
+      "audit_surface": "wrapper stderr naming only the unit plus systemd journal records for the restarted unit",
+      "approval_boundary": "root-owned regular wrapper plus exact-unit allowlist /etc/ccc-node/service-control.allow with no group/world writable paths",
+      "recovery": {
+        "before_intent": "safe-replay",
+        "after_intent_before_call": "safe-replay",
+        "after_external_success_before_ack": "reconcile",
+        "after_ack_before_terminal": "safe-replay",
+        "duplicate_restart_replay": "reconcile"
+      }
+    },
+    {
+      "operation": "telegram.terminal_cleanup",
+      "owner": "bridge lifecycle terminal-outbox drain",
+      "registration": {
+        "kind": "python-symbol",
+        "path": "bridge/core/bot_lifecycle.py",
+        "symbol": "BotLifecycleMixin._drain_terminal_ops"
+      },
+      "external": true,
+      "idempotency": "local-ledger",
+      "idempotency_key": "task ledger terminal_op records keyed by task_id and journaled before the first Telegram call, with an attempts cap of 20",
+      "retry_class": "safe",
+      "ambiguous_window": "Telegram accepted the edit or delete before resolve_terminal_op could purge the outbox entry, so a later drain repeats it until BadRequest confirms an already-gone or unmodified state",
+      "reconcile": "receipt",
+      "compensation": "none",
+      "audit_surface": "body-free task ledger terminal_op attempts counter plus bridge debug diagnostics naming task ids only",
+      "approval_boundary": "automatic housekeeping limited to bot-authored status messages recorded in the task ledger; user content is never deleted",
+      "recovery": {
+        "before_intent": "safe-replay",
+        "after_intent_before_call": "safe-replay",
+        "after_external_success_before_ack": "reconcile",
+        "after_ack_before_terminal": "safe-replay",
+        "duplicate_restart_replay": "reconcile"
+      }
     }
   ]
 }
