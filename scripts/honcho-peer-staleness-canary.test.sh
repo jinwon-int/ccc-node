@@ -69,5 +69,5 @@ okc $? 0 "malformed date row skipped, rest checked"
 content_hits="$(grep -cE 'select .*content|\* from documents' "$G" || true)"
 okc "$content_hits" 0 "script never selects document content"
 
-echo "pass=$pass fail=$fail"
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
