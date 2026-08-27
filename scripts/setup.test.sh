@@ -268,7 +268,9 @@ printf 'stale copy\n' > "$legacy_claude/skills/wiki-record/SKILL.md"
 printf 'node-local\n' > "$legacy_claude/skills/node-local-only/SKILL.md"
 printf 'ghost\n' > "$legacy_claude/skills/ghost-skill/SKILL.md"
 printf 'edited\n' > "$legacy_claude/skills/edited-skill/SKILL.md"
-ghost_hash="$(cd "$legacy_claude/skills/ghost-skill" && find . -type f -exec sha256sum {} + | sort -k2 | sha256sum | awk '{print $1}')"
+# Hash recipe must match skill_tree_hash() exactly, including the LC_ALL=C
+# collation pin — the prune verdict compares this recorded hash against one.
+ghost_hash="$(cd "$legacy_claude/skills/ghost-skill" && find . -type f -exec sha256sum {} + | LC_ALL=C sort -k2 | sha256sum | awk '{print $1}')"
 printf 'ghost-skill %s\nedited-skill %s\n' "$ghost_hash" "deadbeef" > "$legacy_claude/state/repo-skills.manifest"
 HOME="$legacy_home" CCC_CLAUDE_DIR="$legacy_claude" CCC_HERMES_DIR="$legacy_home/.hermes" \
   bash "$SETUP" --no-backup >/dev/null 2>&1
@@ -288,12 +290,17 @@ ok "setup records the installed skill set in the manifest" \
 # stale hash and the prune above can never fire for it. This case runs on a
 # non-canonical CLAUDE_DIR *and* checkout, so the rewrite really does fire.
 manifest_hashes_match() { # manifest_hashes_match <claude-dir>
+  # setup.sh records hashes with skill_tree_hash(), which pins LC_ALL=C for the
+  # path sort. This verifier MUST use the identical recipe or mixed-case file
+  # names (gh-pr-flow: SKILL.md vs approve-*.sh) collate differently under a
+  # UTF-8 locale and read as drift — the false FAIL of #1292 that only passes
+  # on CI because runners run under the C locale.
   local root="$1" sname shash actual
   [ -f "$root/state/repo-skills.manifest" ] || return 1
   while read -r sname shash; do
     [ -n "$sname" ] || continue
     [ -d "$root/skills/$sname" ] || continue
-    actual="$(cd "$root/skills/$sname" && find . -type f -exec sha256sum {} + | sort -k2 | sha256sum | awk '{print $1}')"
+    actual="$(cd "$root/skills/$sname" && find . -type f -exec sha256sum {} + | LC_ALL=C sort -k2 | sha256sum | awk '{print $1}')"
     [ "$actual" = "$shash" ] || { echo "  manifest hash drift: $sname" >&2; return 1; }
   done < "$root/state/repo-skills.manifest"
   return 0
