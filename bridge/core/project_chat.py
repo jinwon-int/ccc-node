@@ -47,6 +47,10 @@ from telegram_bot.core.usage import (
 )
 from telegram_bot.core.usage_cost_ledger import CostLedger
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE, UsageMeter
+from telegram_bot.core.async_completion_event import (
+    NormalizedAsyncCompletionEvent,
+)
+from telegram_bot.core.async_completion_journal import AsyncCompletionJournal
 from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
 from telegram_bot.core.conversation_paths import claude_project_dir_name
 from telegram_bot.core.session_scope import stream_key
@@ -202,6 +206,31 @@ class ProjectChatHandler(
         self._agent_runtime = agent_runtime
         self._agent_session_registry = AgentSessionRegistry()
         self._agent_runtime_closed = False
+        # Durable, body-free journal for out-of-turn completions (#646 slice
+        # 1). Construction stays in-memory only to preserve the composition
+        # root's deferred-initialization invariant (no filesystem access
+        # before the first observation); initialization, stale-claim recovery,
+        # and listener registration are all fail-open so any failure keeps
+        # the degraded no-delivery boundary and only loses the evidence trail.
+        self._async_completion_journal: Optional[AsyncCompletionJournal] = None
+        self._async_completion_recovery_done = False
+        try:
+            self._async_completion_journal = AsyncCompletionJournal(
+                self.project_root / ".telegram_bot" / "async-completions"
+            )
+            listener_setter = getattr(
+                self._agent_runtime,
+                "set_unowned_completion_listener",
+                None,
+            )
+            if callable(listener_setter):
+                listener_setter(self._observe_unowned_codex_completion)
+        except Exception:
+            self._async_completion_journal = None
+            logger.exception(
+                "Async completion journal unavailable; continuing without "
+                "durable completion evidence"
+            )
         self._shutdown_draining = False
         self._agent_interrupt_timeout_seconds = 10.0
         self._session_guard_lock = asyncio.Lock()
@@ -302,6 +331,15 @@ class ProjectChatHandler(
         meter already logged it) and nothing accumulates on disk.
         """
 
+        self._write_owner_notice_spool(
+            "usage-budget", message, f"usage-budget:{message}"
+        )
+
+    def _write_owner_notice_spool(
+        self, event: str, message: str, dedup: str
+    ) -> None:
+        """Queue one body-free owner push notice via the spool contract."""
+
         if not bool(getattr(self._config, "push_enabled", False)):
             return
         spool_dir = Path(
@@ -309,20 +347,85 @@ class ProjectChatHandler(
             or (Path.home() / ".claude" / "state" / "telegram-spool")
         )
         payload = {
-            "event": "usage-budget",
+            "event": event,
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "text": message,
-            "dedup": f"usage-budget:{message}",
+            "dedup": dedup,
         }
         try:
             spool_dir.mkdir(parents=True, exist_ok=True)
-            target = spool_dir / f"usage-budget-{time.time_ns()}.json"
+            target = spool_dir / f"{event}-{time.time_ns()}.json"
             tmp = target.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             os.chmod(tmp, 0o600)
             os.replace(tmp, target)
         except OSError:
-            logger.warning("Usage budget alert spool write failed; alert stays log-only")
+            logger.warning("Owner notice spool write failed; notice stays log-only")
+
+    def _observe_unowned_codex_completion(
+        self, thread_id: str, turn_id: str
+    ) -> None:
+        """Journal one validated unowned Codex completion (#646 slice 1).
+
+        Runs inline on the runtime's notification path, so it must stay
+        synchronous and fast. Attribution is fail-closed: without a resident
+        cached session owning the thread, or without a lifecycle generation
+        for that route, no normalized identity is fabricated and only the
+        runtime's own degraded counters remember the observation. The owner
+        fallback notice is at-most-once per identity (``mark_noticed`` first,
+        spool second) so a restart can never re-notify an old record.
+        """
+
+        journal = self._async_completion_journal
+        if journal is None:
+            return
+        try:
+            journal.initialize()
+            if not self._async_completion_recovery_done:
+                self._async_completion_recovery_done = True
+                recovered = journal.recover_stale_claimed()
+                if recovered:
+                    logger.warning(
+                        "Recovered %d stale claimed async completion record(s)",
+                        len(recovered),
+                    )
+        except Exception:
+            self._async_completion_journal = None
+            logger.exception(
+                "Async completion journal initialization failed; continuing "
+                "without durable completion evidence"
+            )
+            return
+        key = self._agent_session_registry.find_route_by_session_id(thread_id)
+        if key is None:
+            return
+        generation = self._agent_session_registry.generation_high_water(key)
+        if generation < 1:
+            return
+        user_id, chat_id = key
+        conversation_route_id = (
+            str(user_id) if user_id == chat_id else f"{user_id}:{chat_id}"
+        )
+        event = NormalizedAsyncCompletionEvent(
+            provider="codex",
+            thread_id=thread_id,
+            conversation_route_id=conversation_route_id,
+            session_generation=generation,
+            turn_id=turn_id,
+        )
+        if not journal.observe(event):
+            return
+        journal.mark_noticed(event.idempotency_key)
+        logger.warning(
+            "Unowned Codex completion recorded (degraded, no delivery); "
+            "owner fallback notice queued"
+        )
+        self._write_owner_notice_spool(
+            "async-completion",
+            "Unowned Codex turn completed on a live thread — recorded at "
+            "the degraded boundary (no auto-delivery; #646)",
+            event.idempotency_key,
+        )
 
     def build_distill_extraction_worker(
         self,

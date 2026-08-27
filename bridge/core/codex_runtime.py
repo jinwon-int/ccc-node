@@ -488,6 +488,10 @@ class CodexRuntime:
         self._recent_terminal_turn_ids: dict[str, None] = {}
         self._ignored_unowned_completions = 0
         self._ignored_late_active_duplicates = 0
+        # Optional body-free observer for validated unowned completions
+        # (#646 slice 1). The runtime never awaits or trusts the listener; a
+        # raising listener is swallowed exactly like a failed meter write.
+        self._unowned_completion_listener: Callable[[str, str], object] | None = None
         self._closed = False
 
     @property
@@ -527,6 +531,20 @@ class CodexRuntime:
             late_active_duplicates=self._ignored_late_active_duplicates,
             recent_terminal_turns=len(self._recent_terminal_turn_ids),
         )
+
+    def set_unowned_completion_listener(
+        self, listener: Callable[[str, str], object] | None
+    ) -> None:
+        """Observe validated unowned completions without promoting them.
+
+        The listener receives ``(thread_id, turn_id)`` only after every
+        fail-closed shape check in ``_observe_unowned_completion`` passed, so
+        it never sees malformed or provider-foreign input.  It must be
+        synchronous and non-blocking; exceptions are swallowed because the
+        degraded no-delivery boundary must never break the turn path.
+        """
+
+        self._unowned_completion_listener = listener
 
     def set_turn_attempt_recorder(self, recorder: Callable[[], object]) -> None:
         """Observe each turn/start the provider accepted (the spend boundary).
@@ -1303,6 +1321,16 @@ class CodexRuntime:
                 self._ignored_unowned_completions + 1,
                 _ASYNC_DIAGNOSTIC_COUNTER_MAX,
             )
+            listener = self._unowned_completion_listener
+            if listener is not None:
+                try:
+                    listener(thread_id, turn_id)
+                except Exception:
+                    logger.warning(
+                        "Unowned completion listener failed; degraded no-delivery "
+                        "behavior is unchanged",
+                        exc_info=True,
+                    )
 
     def _remember_terminal_turn(self, turn_id: str) -> None:
         if _CODEX_OPAQUE_ID_RE.fullmatch(turn_id) is None:
