@@ -1971,5 +1971,117 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await cast(Any, failed_stream).aclose()
 
 
+class UnownedCompletionListenerTests(unittest.IsolatedAsyncioTestCase):
+    """The #646 slice-1 observer seam stays body-free and fail-open."""
+
+    async def asyncSetUp(self) -> None:
+        self.clients: list[FakeClient] = []
+
+        def factory(
+            handler: Callable[[CodexServerRequest], Awaitable[Mapping[str, Any]]],
+        ) -> FakeClient:
+            client = FakeClient(handler)
+            client.thread_start_result = {"thread": {"id": "thread-known"}}
+            self.clients.append(client)
+            return client
+
+        self.runtime = CodexRuntime(client_factory=factory)
+
+    async def asyncTearDown(self) -> None:
+        await self.runtime.close()
+
+    def _completed_notification(self) -> CodexNotification:
+        return CodexNotification(
+            "turn/completed",
+            {
+                "threadId": "thread-known",
+                "turn": {
+                    "id": "turn-detached",
+                    "status": "completed",
+                    "itemsView": "full",
+                    "items": [],
+                },
+            },
+        )
+
+    async def test_listener_receives_each_validated_observation(self) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+        observations: list[tuple[str, str]] = []
+        self.runtime.set_unowned_completion_listener(
+            lambda thread_id, turn_id: observations.append((thread_id, turn_id))
+        )
+
+        self.runtime._route_notification(self._completed_notification())
+        self.runtime._route_notification(self._completed_notification())
+
+        # The seam observes every validated occurrence; exactly-once identity
+        # dedup is the journal's contract (see the wiring tests in
+        # test_async_completion_wiring.py).
+        self.assertEqual(
+            observations,
+            [("thread-known", "turn-detached"), ("thread-known", "turn-detached")],
+        )
+        self.assertEqual(
+            self.runtime.async_completion_diagnostics().unowned_completed, 2
+        )
+
+    async def test_listener_exception_is_swallowed(self) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+
+        def raising_listener(thread_id: str, turn_id: str) -> None:
+            raise RuntimeError("observer exploded")
+
+        self.runtime.set_unowned_completion_listener(raising_listener)
+
+        self.runtime._route_notification(self._completed_notification())
+
+        self.assertEqual(
+            self.runtime.async_completion_diagnostics().unowned_completed, 1
+        )
+
+    async def test_late_active_duplicate_never_reaches_listener(self) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+        observations: list[tuple[str, str]] = []
+        self.runtime.set_unowned_completion_listener(
+            lambda thread_id, turn_id: observations.append((thread_id, turn_id))
+        )
+        self.runtime._remember_terminal_turn("turn-tombstoned")
+
+        self.runtime._route_notification(
+            CodexNotification(
+                "turn/completed",
+                {
+                    "threadId": "thread-known",
+                    "turn": {
+                        "id": "turn-tombstoned",
+                        "status": "completed",
+                        "items": [],
+                    },
+                },
+            )
+        )
+
+        self.assertEqual(observations, [])
+        self.assertEqual(
+            self.runtime.async_completion_diagnostics().late_active_duplicates, 1
+        )
+
+    async def test_unknown_thread_never_reaches_listener(self) -> None:
+        observations: list[tuple[str, str]] = []
+        self.runtime.set_unowned_completion_listener(
+            lambda thread_id, turn_id: observations.append((thread_id, turn_id))
+        )
+
+        self.runtime._route_notification(self._completed_notification())
+
+        self.assertEqual(observations, [])
+
+
 if __name__ == "__main__":
     unittest.main()
