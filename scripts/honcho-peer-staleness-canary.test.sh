@@ -11,7 +11,6 @@ pass=0; fail=0
 ok()  { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 okc() { if [ "$1" = "$2" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $3 (want rc=$2 got rc=$1)"; fi; }
 
-TODAY="$(date +%F)"
 OLD="$(date -d "30 days ago" +%F)"
 RECENT="$(date -d "3 days ago" +%F)"
 EDGE="$(date -d "14 days ago" +%F)"
@@ -55,16 +54,16 @@ okc "$rc" 0 "age == limit stays fresh"
 out="$(run_with_rows "family-assistant|$OLD
 jingun|$OLD")"; rc=$?
 okc "$rc" 1 "exempt feed skipped while real stale still caught"
-ok "family-assistant never flagged" '! grep -q "STALE peer=family-assistant" <<<"$out"'
+ok "family-assistant never flagged" "! grep -q 'STALE peer=family-assistant' <<<'$out'"
 
 # ---- unreachable database fails closed ----------------------------------------
 CCC_HONCHO_STALENESS_PSQL_CMD="false" bash "$G" >/dev/null 2>&1
 okc $? 2 "query failure exits 2"
 
 # ---- malformed row skipped without aborting -----------------------------------
-out="$(run_with_rows "jingun|not-a-date
-daegyo|$RECENT")"; rc=$?
-okc "$rc" 0 "malformed date row skipped, rest checked"
+run_with_rows "jingun|not-a-date
+daegyo|$RECENT" >/dev/null 2>&1
+okc $? 0 "malformed date row skipped, rest checked"
 
 # ---- read-only contract: aggregate dates only, never content ------------------
 content_hits="$(grep -cE 'select .*content|\* from documents' "$G" || true)"

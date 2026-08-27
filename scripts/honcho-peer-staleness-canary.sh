@@ -35,7 +35,9 @@ esac
 query="select observed, max(created_at)::date from documents where deleted_at is null and workspace_name = '${workspace}' and level = '${level}' group by observed order by observed;"
 
 rows=""
-if ! rows="$(printf '%s\n' "$query" | $psql_cmd 2>/dev/null)"; then  # shellcheck disable=SC2086 — transport is a simple argv list by contract
+# transport is a simple argv list by contract
+# shellcheck disable=SC2086
+if ! rows="$(printf '%s\n' "$query" | $psql_cmd 2>/dev/null)"; then
   printf 'honcho-staleness-canary: cannot reach central honcho database\n' >&2
   exit 2
 fi
@@ -49,7 +51,9 @@ while IFS='|' read -r peer day; do
     [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
     *) printf 'honcho-staleness-canary: malformed row skipped (peer redacted)\n' >&2; continue ;;
   esac
-  for exempt in $exempt_peers; do  # shellcheck disable=SC2086 — space-separated allowlist
+  # space-separated allowlist by contract
+  # shellcheck disable=SC2086
+  for exempt in $exempt_peers; do
     [ "$peer" = "$exempt" ] && continue 2
   done
   checked=$((checked + 1))
