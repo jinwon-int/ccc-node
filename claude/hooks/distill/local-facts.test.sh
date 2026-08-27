@@ -16,6 +16,15 @@ trap 'rm -rf "$TMP"' EXIT
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
 export CCC_STATE_DIR="$TMP/state"
+# Hermetic against operator shells (#1250 follow-up, #1292 class): audience-
+# scoped nodes export CCC_MEMORY_FACTS_FILE/CCC_RESUME_FILE (plus audience
+# roots) globally, and local-memory-commit.py hard-rejects any facts/resume
+# path outside $CCC_STATE_DIR. Inherited values made every assertion here
+# fail off-CI while CI stayed green under its clean runner environment.
+unset CCC_MEMORY_FACTS_FILE CCC_RESUME_FILE \
+      CCC_MEMORY_INDEX_DB CCC_MEMORY_CACHE_DIR \
+      CCC_MEMORY_AUDIENCE CCC_MEMORY_AUDIENCE_SCOPED \
+      CCC_MEMORY_AUDIENCE_ROOT CCC_MEMORY_SCOPE
 mkdir -p "$CCC_STATE_DIR"
 FACTS="$CCC_STATE_DIR/memory-facts.jsonl"
 
