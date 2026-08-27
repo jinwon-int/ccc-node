@@ -22,7 +22,7 @@ differ per provider. `skill-review/provider.sh` resolves both.
 | Capability | Claude | Codex |
 |---|---|---|
 | Install target | `~/.claude/skills/<name>/` (`CLAUDE_SKILLS_DIR`) | `${CODEX_HOME:-~/.codex}/skills/<name>/` (`CODEX_SKILLS_DIR`) |
-| Machine gates (secret / node-fact / dedup / lint) | ✅ identical | ✅ identical |
+| Machine gates (secret / node-fact / dedup / lint / claims) | ✅ identical | ✅ identical |
 | Mode / daily cap / off-switch / ledger / rollback | ✅ identical | ✅ identical |
 | Codex-compat screen (rejects `claude -p`, `~/.claude`, `CLAUDE_*`) | n/a | ✅ isolates Claude-only drafts as pending |
 | Secure install dir (0700, no-symlink leaf, fail-closed) | existing dir untouched | ✅ created owner-only |
@@ -199,6 +199,22 @@ surface + enforced authoring standards + after-the-fact visibility:
    CLI (`claude -p`), the `~/.claude` tree, or `CLAUDE_*` env can't run on a
    Codex node, so it is isolated as pending (`codex-incompat <label>`) instead
    of installed. Prose that merely mentions "Claude Code" is untouched.
+6. **Unverified factual claims**: a draft that asserts an exit code, an HTTP
+   status, or a pinned version while giving the reader **no way to re-derive
+   it** is isolated as pending (`unverified-claim <exit-code|http-status|version-pin>`).
+   Any one of a URL, a `file.ext:line` source reference, a shown
+   `--help`/`--version` invocation, or a dated "verified" marker satisfies it.
+   A cited URL answering 404/410 blocks as `dead-citation http-404`; template
+   placeholders (`OWNER`/`REPO`/`NUM`) and private GitHub resources (re-checked
+   through `gh`) are exempt, and any network trouble fails **open** so an
+   offline cron never blocks on it. Disable with `CCC_SKILL_GATE_CLAIMS=0`;
+   skip only the URL probe with `CCC_SKILL_GATE_URLCHECK=0`.
+
+   This gate checks **citability, not truth** — a machine cannot know whether a
+   claim is correct, only whether a reader could check it. It is a floor, not a
+   guarantee: a fabricated CLI flag, an inverted rule, or a `grep` pattern that
+   can never match all pass it. Auto mode still needs periodic factual audit of
+   what it has installed.
 
 Passing drafts are installed to `~/.claude/skills/<name>/` immediately and
 recorded in the `installed-by=autosave` ledger
