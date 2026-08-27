@@ -120,9 +120,11 @@ class SideEffectContractTest(unittest.TestCase):
                 "honcho.deliver_distill",
                 "self_update.apply",
                 "agent_cron.spool_notify",
+                "external_wait.wake_resume",
+                "skill_autosave.sweep",
             ],
         )
-        self.assertEqual(len(observations), 20)
+        self.assertEqual(len(observations), 30)
         by_op = {
             operation.operation: {
                 item.boundary: item for item in observations if item.operation == operation.operation
@@ -147,6 +149,19 @@ class SideEffectContractTest(unittest.TestCase):
         self.assertEqual(cron_ambiguous.action.value, "reconcile")
         self.assertEqual(cron_ambiguous.attempts, 1)
         self.assertTrue(cron_ambiguous.ack_recorded)
+        wake_ambiguous = by_op["external_wait.wake_resume"][
+            CONTRACT.RecoveryBoundary.AFTER_EXTERNAL_SUCCESS_BEFORE_ACK
+        ]
+        self.assertEqual(wake_ambiguous.action.value, "reconcile")
+        self.assertEqual(wake_ambiguous.attempts, 1)
+        self.assertTrue(wake_ambiguous.ack_recorded)
+        autosave_dup = by_op["skill_autosave.sweep"][
+            CONTRACT.RecoveryBoundary.DUPLICATE_RESTART_REPLAY
+        ]
+        self.assertEqual(autosave_dup.action.value, "manual-review")
+        self.assertEqual(autosave_dup.attempts, 1)
+        self.assertEqual(autosave_dup.unique_effects, 1)
+        self.assertFalse(autosave_dup.ack_recorded)
 
     def test_compensate_fixture_undoes_the_unacked_effect(self) -> None:
         operation = _operation()

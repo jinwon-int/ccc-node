@@ -343,6 +343,7 @@ class ExternalWaitMonitor:
         )
 
     # -- wake delivery -------------------------------------------------------------
+    # ccc-side-effect: external_wait.wake_resume
     async def _deliver_wake(self, record: Dict[str, Any]) -> None:
         wait_id = record["wait_id"]
         skip_reason = await self._resume_skip_reason(record)

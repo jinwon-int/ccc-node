@@ -104,6 +104,56 @@
         "after_ack_before_terminal": "safe-replay",
         "duplicate_restart_replay": "reconcile"
       }
+    },
+    {
+      "operation": "external_wait.wake_resume",
+      "owner": "bridge external-wait monitor",
+      "registration": {
+        "kind": "python-symbol",
+        "path": "bridge/core/external_wait_monitor.py",
+        "symbol": "ExternalWaitMonitor._deliver_wake"
+      },
+      "external": true,
+      "idempotency": "local-ledger",
+      "idempotency_key": "registry pending-wake journal keyed by wait_id; terminal finish is journaled before any delivery",
+      "retry_class": "safe",
+      "ambiguous_window": "owner notice accepted by the push spool or continuation admitted before mark_wake persists, so a later drain may repeat it",
+      "reconcile": "query",
+      "compensation": "none",
+      "audit_surface": "external-wait registry wake record (delivered/resumed/skip_reason) plus body-free bridge diagnostics",
+      "approval_boundary": "auto-resume gate: resume_enabled flag, daily cap, and exact-head terminal pinning; gh transport stays read-only",
+      "recovery": {
+        "before_intent": "safe-replay",
+        "after_intent_before_call": "safe-replay",
+        "after_external_success_before_ack": "reconcile",
+        "after_ack_before_terminal": "safe-replay",
+        "duplicate_restart_replay": "reconcile"
+      }
+    },
+    {
+      "operation": "skill_autosave.sweep",
+      "owner": "skill autosave cron sweep",
+      "registration": {
+        "kind": "shell-main",
+        "path": "scripts/ccc-skill-autosave.sh",
+        "symbol": "<top-level>"
+      },
+      "external": true,
+      "idempotency": "local-ledger",
+      "idempotency_key": "skill-autosave.seen and .notified ledgers keyed by transcript identity and growth snapshot",
+      "retry_class": "conditional",
+      "ambiguous_window": "auto-mode installer moved a passing draft before its post-hoc notice was queued or logged, leaving install state verifiable only via the installed-by ledger",
+      "reconcile": "manual",
+      "compensation": "restore-snapshot",
+      "audit_surface": "pending-skills queue, installed-by=autosave ownership ledger, rollback archive, and skill-autosave.log",
+      "approval_boundary": "approve mode by default installs nothing; auto install requires explicit mode opt-in plus the machine gate and daily cap in autoinstall.sh",
+      "recovery": {
+        "before_intent": "safe-replay",
+        "after_intent_before_call": "safe-replay",
+        "after_external_success_before_ack": "manual-review",
+        "after_ack_before_terminal": "safe-replay",
+        "duplicate_restart_replay": "manual-review"
+      }
     }
   ]
 }
