@@ -115,7 +115,7 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
 
 5. **Author on approval only.** For each approved deterministic candidate, create `~/.claude/skills/<name>/SKILL.md`:
    - Frontmatter: `name` (kebab-case) + a detailed `description` (it drives auto-matching).
-   - Body: numbered steps, exact commands, and safety rules (no raw secrets — read keys from `~/.hermes/.env`; redact in output).
+   - Body: numbered steps, exact commands, and safety rules (no raw secrets — read keys from the node's env file, **resolved at run time rather than hardcoded**; redact in output). A 2026-08-28 fleet check found `~/.hermes/.env` on 8 of 11 nodes and `/opt/ccc-node/bridge/.env` on the others, so a skill that names one path is wrong on roughly a third of the fleet. This matters here specifically: a path baked into this authoring rule is reproduced into every skill drafted from it.
    - Offer to also land it in the `jinwon-int/ccc-node` template (`claude/skills/`) via PR, and record it in the Wiki (use the `wiki-record` skill).
    - When landing a new `claude/skills/<name>/` in the template, also add its classification entry to `codex/compatibility.json` (`adapted` with a codex mirror, or `claude-only` with a reason). The catalog is fail-closed: an unclassified skill fails `validate-harness` (`catalog_unclassified`) and blocks CI (#789).
 

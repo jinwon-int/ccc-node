@@ -71,7 +71,7 @@ Confirm the merge commit is on main and no orphaned/queued workflows remain.
 - **No bypass**: normal merge flow only; never force-push, never admin-bypass checks.
 - **Finite timeout**: always cap attempts (~2 h); never infinite retry.
 - **Idempotent**: retrying an already-merged PR is a no-op.
-- **Credentials**: use `gh` auth / env from `~/.hermes/.env`; never inline tokens in scripts or logs.
+- **Credentials**: use `gh` auth, or env from the node's env file (`~/.hermes/.env` on most nodes, `/opt/ccc-node/bridge/.env` on others — resolve it, don't assume); never inline tokens in scripts or logs.
 
 ## Related Skills
 - bridge-safe-detached-run (watcher runtime), gh-ci-wait (CI wait registration), gh-pr-flow (overall PR lifecycle)
