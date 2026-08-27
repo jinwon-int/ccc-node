@@ -263,7 +263,14 @@ class HealthProbe:
 
     def collect(self, now: float) -> HealthSignals:
         try:
-            active_requests, oldest_age = self.project_chat.workload_snapshot(now)
+            # Foreground turns only (#1291): workload_snapshot() folds in
+            # provider background-task ages, but those are not bounded by
+            # _process_timeout_seconds — only the turn stream is. A healthy
+            # long-running background Bash task therefore read as a request
+            # lifecycle leak here and re-armed every probe tick.
+            active_requests, oldest_age = self.project_chat.foreground_workload_snapshot(
+                now
+            )
         except Exception:
             active_requests, oldest_age = 0, 0.0
 
