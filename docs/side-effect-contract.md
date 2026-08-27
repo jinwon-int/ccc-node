@@ -32,6 +32,8 @@ exactly-once를 주장하지 않으며 실제 Telegram, Honcho, self-update를 �
 | `honcho.deliver_distill` | memory Honcho sink worker | native: `ccc-distill-<job-id> and ccc-distill-<job-id>-session` | safe | HTTP success before durable outbox ACK and journal completion | none | none | owner-only outbox plus leased distill journal status | configured memory route and Honcho enable gate | `bridge/memory/distill_honcho_worker.py::CodexDistillHonchoSinkWorker.write_once` |
 | `self_update.apply` | pre-approved node maintenance | local-ledger: `old and new commit SHA plus installer generation stamps` | conditional | repository or installed artifacts changed before terminal audit | query | restore-snapshot | body-free self-update audit record and notification result | reviewed procedure plus operator-owned service allowlist | `scripts/ccc-self-update.sh::<top-level>` |
 | `agent_cron.spool_notify` | agent-cron owner notification | local-ledger: `agent-cron:<task-id>:<run-id>:<status>` | conditional | spool file created before lastRunAt/runHistory ACK | receipt | delete | body-free spool path and redacted owner text envelope | notify=telegram-owner or allowlisted telegram-chat | `scripts/agent_cron.py::write_owner_spool` |
+| `external_wait.wake_resume` | bridge external-wait monitor | local-ledger: `registry pending-wake journal keyed by wait_id; terminal finish is journaled before any delivery` | safe | owner notice accepted by the push spool or continuation admitted before mark_wake persists, so a later drain may repeat it | query | none | external-wait registry wake record (delivered/resumed/skip_reason) plus body-free bridge diagnostics | auto-resume gate: resume_enabled flag, daily cap, and exact-head terminal pinning; gh transport stays read-only | `bridge/core/external_wait_monitor.py::ExternalWaitMonitor._deliver_wake` |
+| `skill_autosave.sweep` | skill autosave cron sweep | local-ledger: `skill-autosave.seen and .notified ledgers keyed by transcript identity and growth snapshot` | conditional | auto-mode installer moved a passing draft before its post-hoc notice was queued or logged, leaving install state verifiable only via the installed-by ledger | manual | restore-snapshot | pending-skills queue, installed-by=autosave ownership ledger, rollback archive, and skill-autosave.log | approve mode by default installs nothing; auto install requires explicit mode opt-in plus the machine gate and daily cap in autoinstall.sh | `scripts/ccc-skill-autosave.sh::<top-level>` |
 
 ### Deterministic recovery matrix
 
@@ -41,6 +43,8 @@ exactly-once를 주장하지 않으며 실제 Telegram, Honcho, self-update를 �
 | `honcho.deliver_distill` | safe-replay | safe-replay | safe-replay | safe-replay | safe-replay |
 | `self_update.apply` | safe-replay | safe-replay | reconcile | safe-replay | reconcile |
 | `agent_cron.spool_notify` | safe-replay | safe-replay | reconcile | safe-replay | reconcile |
+| `external_wait.wake_resume` | safe-replay | safe-replay | reconcile | safe-replay | reconcile |
+| `skill_autosave.sweep` | safe-replay | safe-replay | manual-review | safe-replay | manual-review |
 <!-- ccc-side-effect-contract:end -->
 
 초기 범위는 이슈 #872의 제안 순서에 따라 Telegram text delivery, Honcho distill

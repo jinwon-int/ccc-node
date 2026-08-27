@@ -128,6 +128,7 @@ if [ "$AUTONOMY_STATE" = "kill" ]; then
   exit 0
 fi
 
+# ccc-side-effect: skill_autosave.sweep
 # --- 1) refresh the deterministic candidate report (best-effort) -------------
 if [ -f "$SCAN" ]; then
   if bash "$SCAN" >/dev/null 2>>"$LOG"; then
