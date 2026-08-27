@@ -653,6 +653,27 @@ class ProjectChatHandler(
             oldest_age = max(oldest_age, max(0.0, float(background_oldest_age)))
         return count, oldest_age
 
+    def foreground_workload_snapshot(self, now: float) -> tuple[int, float]:
+        """Return ``(active_turn_count, oldest_active_turn_age_seconds)``.
+
+        Same registry metrics :meth:`workload_snapshot` starts from, but
+        WITHOUT folding provider background-task ages (#1291). Background
+        tasks (Claude run-in-background Bash) deliberately outlive their
+        interactive turn and are NOT bounded by ``_process_timeout_seconds``
+        — the ``wait_for`` that enforces that lifetime covers only the turn
+        stream. Consumers must pick the snapshot matching what bounds their
+        comparison: restart gating wants background work counted (a SIGTERM
+        would destroy it), while the health probe's request-lifetime alert
+        compares against exactly that per-turn timeout and must see only
+        interactive turns. Clock contract is identical: ``now`` must come
+        from the event-loop clock so it is comparable to recorded turn start
+        times.
+        """
+        metrics = self._agent_session_registry.metrics()
+        oldest_started = metrics.oldest_started_at
+        oldest_age = (now - oldest_started) if oldest_started is not None else 0.0
+        return metrics.active_sessions, max(0.0, oldest_age)
+
     def begin_drain(self) -> bool:
         """Atomically close admission for new provider turns.
 

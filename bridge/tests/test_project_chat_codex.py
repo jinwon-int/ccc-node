@@ -214,6 +214,30 @@ def test_workload_snapshot_includes_optional_provider_background_work(
     assert handler.workload_snapshot(100.0) == (1, 23.0)
 
 
+def test_foreground_workload_snapshot_excludes_provider_background_work(
+    tmp_path: Path,
+) -> None:
+    """#1291: background tasks legitimately outlive the turn timeout, so the
+    request-lifetime leak alert must measure active interactive turns only.
+    Complement of the fold test above: same state, no fold in this snapshot."""
+    handler = _handler(tmp_path, FakeRuntime())
+    session = SimpleNamespace(
+        background_workload_snapshot=lambda now: (1, 23.0),
+    )
+    handler._agent_session_registry.put_cached(
+        (7, 70),
+        AgentSessionEntry(session=session, last_used_at=1.0),
+    )
+    # A cached-only session (background task still running, turn long gone)
+    # contributes nothing; an active turn does.
+    assert handler.foreground_workload_snapshot(100.0) == (0, 0.0)
+
+    handler._agent_session_registry.register_active((8, 80), object(), started_at=40.0)
+    count, oldest = handler.foreground_workload_snapshot(100.0)
+    assert count == 1
+    assert oldest == 60.0
+
+
 async def _wait_until(predicate, *, timeout: float = 1.0) -> None:
     async with asyncio.timeout(timeout):
         while not predicate():

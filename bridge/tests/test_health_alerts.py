@@ -141,7 +141,7 @@ class ProbeLoopHotSpinRegressionTests(unittest.IsolatedAsyncioTestCase):
                     push_enabled=False,
                 )
                 self._project_chat = SimpleNamespace(
-                    workload_snapshot=lambda now: ticks.append(now) or (0, 0.0),
+                    foreground_workload_snapshot=lambda now: ticks.append(now) or (0, 0.0),
                     _process_timeout_seconds=600.0,
                 )
                 self._push_notifier = SimpleNamespace(spool_dir=Path(tmp) / "spool")
@@ -273,7 +273,7 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
             (spool / "pending-2.json").write_text("{}", encoding="utf-8")
 
             handler = SimpleNamespace(
-                workload_snapshot=lambda now: (2, 750.0),
+                foreground_workload_snapshot=lambda now: (2, 750.0),
                 waiting_for_turn_snapshot=lambda: 1,
                 session_resource_snapshot=lambda: {
                     "resident_sessions": 3,
@@ -317,6 +317,35 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
                     "request_outlived_lifetime",
                 ],
             )
+
+    async def test_background_task_age_does_not_trip_request_lifetime_alert(self):
+        """#1291: run-in-background Bash tasks legitimately outlive the turn
+        timeout and used to be folded into oldest_request_age_seconds, so a
+        healthy long-running background task re-armed the "lifecycle leaked"
+        alert every probe tick for hours while nothing leaked. The probe must
+        compare only foreground turn age against _process_timeout_seconds."""
+        import tempfile
+
+        handler = SimpleNamespace(
+            foreground_workload_snapshot=lambda now: (1, 100.0),
+            workload_snapshot=lambda now: (2, 20000.0),  # what pre-#1291 saw
+            waiting_for_turn_snapshot=lambda: 0,
+            session_resource_snapshot=lambda: {},
+            _process_timeout_seconds=600.0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = HealthProbe(
+                project_chat=handler,
+                spool_dir=Path(tmp) / "spool",
+                orphan_probe=lambda: [],
+                health_snapshot=lambda: {"recovery": {}},
+            )
+            signals = probe.collect(now=1000.0)
+
+        self.assertEqual(signals.active_requests, 1)
+        self.assertEqual(signals.oldest_request_age_seconds, 100.0)
+        self.assertEqual(signals.request_lifetime_seconds, 600.0)
+        self.assertEqual([a.code for a in evaluate_alerts(signals, AlertThresholds())], [])
 
     async def test_probe_is_fail_open_on_broken_collaborators(self):
         def broken_snapshot():
