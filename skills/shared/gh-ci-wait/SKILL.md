@@ -1,6 +1,6 @@
 ---
 name: gh-ci-wait
-description: Register a durable GitHub CI wait when you promise to continue after CI finishes (#740). Use whenever you pushed or opened/updated a PR and would otherwise say "I'll continue once CI is green/failed" — the promise is real only with a wait_id. Never claim auto-resume without one.
+description: Register a durable GitHub CI wait when you promise to continue after CI finishes (#740). Use whenever you pushed or opened/updated a PR and would otherwise say "I'll continue once CI is green/failed" — the promise is real only with a wait_id. Never claim auto-resume without one. Also use when SessionStart injects a `⚠ 미완 약속` block and you must triage it — active `⏳` waits must NOT be re-registered, while dropped promises branch on their skip_reason.
 ---
 
 # gh-ci-wait — durable GitHub CI wait (#740)
@@ -65,6 +65,43 @@ Never claim auto-resume anyway. Either:
 
 `route-unavailable` means the bridge could not bind this conversation —
 do not retry blindly more than once.
+
+## Resuming a dropped promise at SessionStart
+
+The SessionStart hook injects a `⚠ 미완 약속` block after a session timeout,
+bridge restart, Telegram reconnect, or multi-bundle work that ended early. It
+has two halves, and they need **opposite** actions:
+
+**`⏳ 아직 대기 중`** — registrations that are still live (no `skip_reason`).
+
+- **Do NOT re-register.** The wait is alive; a second registration just creates
+  duplicate polling against the same head. This is the counter-default move —
+  the instinct on seeing a pending list is to re-arm everything.
+- Confirm the condition is genuinely still pending (CI still running).
+- If a wait has outlived its plausible window (say >4h), investigate whether the
+  external system is stuck rather than registering another one.
+- Otherwise leave it alone; it self-resolves on its next poll.
+
+**`⚠ 알림은 갔으나 이어가지 못한`** — the notification fired but the
+continuation never ran. Each entry carries a `skip_reason`. Branch on it:
+
+- `session_moved` — the session ended before the condition completed. This says
+  nothing about whether the external event succeeded. Open the PR, read the
+  **current** CI status, and act on what you find now: if it is green and
+  mergeable, proceed manually (subject to the usual approvals); if it is still
+  pending, register a fresh wait for the **current** head SHA.
+- any other `skip_reason` (route/provider/user mismatch) — do not re-register
+  blindly. Inspect the live registry with `... external_wait_cli list` and
+  confirm the route metadata is restorable first. Re-registering onto a broken
+  route reproduces the same drop.
+
+Before acting on any of these entries, remember they are **inherited claims**
+written before the session boundary — see `handoff-premise-freshness-verification`
+for the write-time vs merge-time check.
+
+**Verification:** the next SessionStart should not re-surface the same promises.
+If one does, check whether its `skip_reason` changed or the registry entry
+leaked, and audit `external_wait_cli list` against what SessionStart printed.
 
 ## User controls
 

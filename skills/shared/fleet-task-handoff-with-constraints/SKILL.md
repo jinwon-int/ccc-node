@@ -54,12 +54,44 @@ That is invisible to the successor unless you write it down.
    the successor cannot reconstruct from the repo, and it is worth more than the
    status table.
 
-6. **Write it to a durable file, then link it.** A handoff that exists only in chat
+6. **List the DO-NOT-COPY traps** — only when handing off between *phases* of the
+   same project. The expensive phase-handoff failure is a successor copying a
+   working pattern from the previous phase into one with different semantics. For
+   each such pattern write three things, not one:
+   - what the prior pattern was, and why it worked *there*;
+   - the **specific failure mechanism** if it is copied here (a changed signature,
+     a one-shot trigger where this phase is level-triggered, a check that needs a
+     real resource where the prior one could stub it);
+   - the evidence — a commit SHA, a signature, or the failing result.
+
+   "Be careful, this phase is different" is not a trap entry. Separate
+   show-stoppers from optimizations, and label what was *observed* in prior work
+   versus what you are *predicting* for this phase — that blur is what makes a
+   successor trust a guess.
+
+7. **Mark what you could not verify, explicitly.** Where your own conclusion rests
+   on interpretation, say so in the first person and say why you cannot settle it
+   — e.g. "I believe this is the right reading, but I cannot verify it
+   independently." A confident handoff with a silent guess inside it is worse than
+   one that flags the guess, because the successor inherits the confidence too.
+
+8. **Write it to a durable file, then link it.** A handoff that exists only in chat
    dies at the next compaction. Write to a path, then reference that path from the
    issue comment.
 
-7. **Close with a single "next move"** — the one action the successor should take
+   **Check the size before posting.** A GitHub comment caps at roughly 65,000
+   characters, and an oversized post can be rejected or silently truncated —
+   losing the tail, which is where the next-move section lives. If the document
+   is near the limit, keep the file as the source of truth and post a short index
+   plus the link rather than the full body.
+
+9. **Close with a single "next move"** — the one action the successor should take
    first, with its node and its command. Ambiguity at step 1 stalls the whole handoff.
+
+**If the handoff will be reviewed:** the reviewer must not have participated in
+the earlier phases. A reviewer who was there reconstructs the missing context
+from memory and cannot see what the document fails to say — which is the only
+thing the review is for.
 
 # Safety
 
