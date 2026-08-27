@@ -51,6 +51,9 @@ from telegram_bot.core.async_completion_event import (
     NormalizedAsyncCompletionEvent,
 )
 from telegram_bot.core.async_completion_journal import AsyncCompletionJournal
+from telegram_bot.core.async_completion_delivery import (
+    AsyncCompletionDeliveryCoordinator,
+)
 from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
 from telegram_bot.core.conversation_paths import claude_project_dir_name
 from telegram_bot.core.session_scope import stream_key
@@ -214,6 +217,11 @@ class ProjectChatHandler(
         # the degraded no-delivery boundary and only loses the evidence trail.
         self._async_completion_journal: Optional[AsyncCompletionJournal] = None
         self._async_completion_recovery_done = False
+        # Delivery seams for durable-capable runtimes (#646 slice 2). The
+        # sender is attached by the lifecycle layer once the bot exists; the
+        # coordinator is built lazily from wired seams on first use.
+        self._async_completion_sender: Any = None
+        self._async_completion_delivery: Optional[AsyncCompletionDeliveryCoordinator] = None
         try:
             self._async_completion_journal = AsyncCompletionJournal(
                 self.project_root / ".telegram_bot" / "async-completions"
@@ -225,6 +233,13 @@ class ProjectChatHandler(
             )
             if callable(listener_setter):
                 listener_setter(self._observe_unowned_codex_completion)
+            durable_setter = getattr(
+                self._agent_runtime,
+                "set_durable_completion_listener",
+                None,
+            )
+            if callable(durable_setter):
+                durable_setter(self._observe_durable_codex_completion)
         except Exception:
             self._async_completion_journal = None
             logger.exception(
@@ -362,23 +377,30 @@ class ProjectChatHandler(
         except OSError:
             logger.warning("Owner notice spool write failed; notice stays log-only")
 
-    def _observe_unowned_codex_completion(
-        self, thread_id: str, turn_id: str
-    ) -> None:
-        """Journal one validated unowned Codex completion (#646 slice 1).
+    def set_async_completion_sender(self, sender: Any) -> None:
+        """Wire the conversation delivery seam for durable completions (#646).
 
-        Runs inline on the runtime's notification path, so it must stay
-        synchronous and fast. Attribution is fail-closed: without a resident
-        cached session owning the thread, or without a lifecycle generation
-        for that route, no normalized identity is fabricated and only the
-        runtime's own degraded counters remember the observation. The owner
-        fallback notice is at-most-once per identity (``mark_noticed`` first,
-        spool second) so a restart can never re-notify an old record.
+        ``sender(user_id, chat_id, text) -> bool`` is built by the lifecycle
+        layer once the bot handle exists.  Until it is wired, durable-capable
+        observations fall back to the slice-1 owner notice — the capability
+        declaration alone never enables delivery.
+        """
+
+        self._async_completion_sender = sender
+        # A newly wired sender invalidates any coordinator built without one.
+        self._async_completion_delivery = None
+
+    def _init_async_completion_journal(self) -> AsyncCompletionJournal | None:
+        """Initialize the journal once; return ``None`` when unavailable.
+
+        Shared fail-open initialization for both #646 observer seams: any
+        failure keeps the conversation path working and only loses the
+        durable evidence trail.
         """
 
         journal = self._async_completion_journal
         if journal is None:
-            return
+            return None
         try:
             journal.initialize()
             if not self._async_completion_recovery_done:
@@ -395,6 +417,45 @@ class ProjectChatHandler(
                 "Async completion journal initialization failed; continuing "
                 "without durable completion evidence"
             )
+            return None
+        return journal
+
+    def _delivery_for(self, journal: AsyncCompletionJournal) -> Any:
+        """Build (once) the delivery coordinator from wired seams."""
+
+        if self._async_completion_delivery is not None:
+            return self._async_completion_delivery
+        sender = self._async_completion_sender
+        if sender is None:
+            return None
+        self._async_completion_delivery = AsyncCompletionDeliveryCoordinator(
+            journal,
+            lock_factory=self._get_conversation_lock,
+            sender=sender,
+            generation_probe=lambda user_id, chat_id: (
+                self._agent_session_registry.generation_high_water(
+                    (user_id, chat_id)
+                )
+            ),
+        )
+        return self._async_completion_delivery
+
+    def _observe_unowned_codex_completion(
+        self, thread_id: str, turn_id: str
+    ) -> None:
+        """Journal one validated unowned Codex completion (#646 slice 1).
+
+        Runs inline on the runtime's notification path, so it must stay
+        synchronous and fast. Attribution is fail-closed: without a resident
+        cached session owning the thread, or without a lifecycle generation
+        for that route, no normalized identity is fabricated and only the
+        runtime's own degraded counters remember the observation. The owner
+        fallback notice is at-most-once per identity (``mark_noticed`` first,
+        spool second) so a restart can never re-notify an old record.
+        """
+
+        journal = self._init_async_completion_journal()
+        if journal is None:
             return
         key = self._agent_session_registry.find_route_by_session_id(thread_id)
         if key is None:
@@ -424,6 +485,112 @@ class ProjectChatHandler(
             "async-completion",
             "Unowned Codex turn completed on a live thread — recorded at "
             "the degraded boundary (no auto-delivery; #646)",
+            event.idempotency_key,
+        )
+
+    def _observe_durable_codex_completion(
+        self, thread_id: str, turn_id: str, text: str | None
+    ) -> None:
+        """Promote one validated unowned completion to durable delivery.
+
+        Invoked by the runtime only when its capability declares
+        ``supports_durable_delivery`` (#646 slice 2).  The journal is the
+        exactly-once gate: only the first observation of an identity schedules
+        a delivery task, and every failure mode stays inside the journal state
+        machine.  Without a wired sender or a running loop the observation
+        degrades to the slice-1 owner-notice path — capability alone never
+        delivers.
+        """
+
+        journal = self._init_async_completion_journal()
+        if journal is None:
+            return
+        key = self._agent_session_registry.find_route_by_session_id(thread_id)
+        if key is None:
+            return
+        generation = self._agent_session_registry.generation_high_water(key)
+        if generation < 1:
+            return
+        user_id, chat_id = key
+        conversation_route_id = (
+            str(user_id) if user_id == chat_id else f"{user_id}:{chat_id}"
+        )
+        event = NormalizedAsyncCompletionEvent(
+            provider="codex",
+            thread_id=thread_id,
+            conversation_route_id=conversation_route_id,
+            session_generation=generation,
+            turn_id=turn_id,
+        )
+        coordinator = self._delivery_for(journal)
+        if coordinator is None:
+            # No delivery seam wired (e.g. lifecycle never attached the bot):
+            # keep the evidence and use the at-most-once owner fallback.
+            if journal.observe(event):
+                journal.mark_noticed(event.idempotency_key)
+                logger.warning(
+                    "Durable-capable Codex completion observed without a "
+                    "delivery seam; owner fallback notice queued"
+                )
+                self._write_owner_notice_spool(
+                    "async-completion",
+                    "Codex async completion recorded without a delivery "
+                    "seam — no conversation delivery (no auto-delivery; #646)",
+                    event.idempotency_key,
+                )
+            return
+        if not journal.observe(event, deliverable=True):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "Durable completion observed outside an event loop; "
+                "delivery skipped and record kept queued"
+            )
+            return
+        loop.create_task(
+            self._deliver_durable_codex_completion(
+                journal, coordinator, event, user_id, chat_id, text
+            )
+        )
+
+    async def _deliver_durable_codex_completion(
+        self,
+        journal: AsyncCompletionJournal,
+        coordinator: Any,
+        event: NormalizedAsyncCompletionEvent,
+        user_id: int,
+        chat_id: int,
+        text: str | None,
+    ) -> None:
+        """Run one delivery to the end (never raises to the caller's loop)."""
+
+        try:
+            delivered = await coordinator.deliver(
+                event.idempotency_key,
+                user_id=user_id,
+                chat_id=chat_id,
+                session_generation=event.session_generation,
+                text=text,
+            )
+        except Exception:
+            logger.exception(
+                "Async completion delivery task crashed; record kept for "
+                "stale-claim recovery"
+            )
+            return
+        if delivered:
+            logger.info("Async completion delivered to conversation (#646)")
+            return
+        record = journal.get(event.idempotency_key)
+        if record is None or record.noticed_at is not None:
+            return
+        journal.mark_noticed(event.idempotency_key)
+        self._write_owner_notice_spool(
+            "async-completion",
+            "Codex async completion could not be delivered to its "
+            "conversation — terminal at the delivery boundary (#646)",
             event.idempotency_key,
         )
 

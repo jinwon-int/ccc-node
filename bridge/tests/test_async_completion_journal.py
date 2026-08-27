@@ -226,6 +226,130 @@ class TestRecoveryAndRetention:
         assert journal.get(live.idempotency_key) is not None
 
 
+class TestRouteBinding:
+    """Schema-2 route-bound deliverable records (#646 slice 2)."""
+
+    def test_deliverable_observation_binds_route(self, tmp_path):
+        journal = _make_journal(tmp_path)
+        event = _event()
+
+        assert journal.observe(event, deliverable=True) is True
+        record = journal.get(event.idempotency_key)
+        assert record is not None
+        assert record.conversation_route_id == "7360371189"
+
+    def test_plain_observation_stays_route_free(self, tmp_path):
+        journal = _make_journal(tmp_path)
+        event = _event()
+        journal.observe(event)
+        record = journal.get(event.idempotency_key)
+        assert record is not None
+        assert record.conversation_route_id is None
+
+    def test_duplicate_deliverable_observation_changes_nothing(self, tmp_path):
+        journal = _make_journal(tmp_path)
+        event = _event()
+        assert journal.observe(event, deliverable=True) is True
+        assert journal.observe(event) is False
+        assert journal.observe(event, deliverable=True) is False
+        record = journal.get(event.idempotency_key)
+        assert record is not None
+        assert record.conversation_route_id == "7360371189"
+
+    def test_malformed_route_is_rejected(self, tmp_path):
+        journal = _make_journal(tmp_path)
+        event = NormalizedAsyncCompletionEvent(
+            provider="codex",
+            thread_id="thread-aaaa",
+            conversation_route_id="not-a-route",
+            session_generation=3,
+            turn_id="turn-1111",
+        )
+        with pytest.raises(ValueError):
+            journal.observe(event, deliverable=True)
+
+    def test_list_deliverable_queued_filters_and_orders(self, tmp_path):
+        journal = _make_journal(tmp_path)
+        deliverable = _event(turn_id="turn-2222")
+        evidence = _event(turn_id="turn-3333")
+        journal.observe(deliverable, deliverable=True)
+        journal.observe(evidence)
+        assert [r.idempotency_key for r in journal.list_deliverable_queued()] == [
+            deliverable.idempotency_key
+        ]
+        journal.mark(deliverable.idempotency_key, "claimed")
+        assert journal.list_deliverable_queued() == ()
+
+    def test_parse_route_private_and_group(self, tmp_path):
+        journal = _make_journal(tmp_path)
+        private = _event(turn_id="turn-2222")
+        journal.observe(private, deliverable=True)
+        record = journal.get(private.idempotency_key)
+        assert record is not None
+        assert AsyncCompletionJournal.parse_route(record) == (7360371189, 7360371189)
+
+        group = _event(turn_id="turn-3333")
+        group = NormalizedAsyncCompletionEvent(
+            provider="codex",
+            thread_id="thread-aaaa",
+            conversation_route_id="111:222",
+            session_generation=3,
+            turn_id="turn-3333",
+        )
+        journal.observe(group, deliverable=True)
+        record = journal.get(group.idempotency_key)
+        assert record is not None
+        assert AsyncCompletionJournal.parse_route(record) == (111, 222)
+
+    def test_parse_route_evidence_only_is_none(self, tmp_path):
+        journal = _make_journal(tmp_path)
+        event = _event()
+        journal.observe(event)
+        record = journal.get(event.idempotency_key)
+        assert record is not None
+        assert AsyncCompletionJournal.parse_route(record) is None
+
+    def test_v1_payload_without_route_still_decodes(self, tmp_path):
+        journal = _make_journal(tmp_path)
+        event = _event()
+        journal.observe(event, deliverable=True)
+        record_id = journal.record_id_for(event.idempotency_key)
+        path = journal.root / f"{record_id}.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        # Downgrade to a legacy schema-1 record exactly as slice 1 wrote it.
+        payload["schema_version"] = 1
+        payload.pop("conversation_route_id")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        record = journal.get(event.idempotency_key)
+        assert record is not None
+        assert record.conversation_route_id is None
+
+    def test_v1_payload_with_route_is_rejected(self, tmp_path):
+        journal = _make_journal(tmp_path)
+        event = _event()
+        journal.observe(event, deliverable=True)
+        record_id = journal.record_id_for(event.idempotency_key)
+        path = journal.root / f"{record_id}.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["schema_version"] = 1
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError):
+            journal.get(event.idempotency_key)
+
+    def test_route_bound_record_stays_body_free(self, tmp_path):
+        journal = _make_journal(tmp_path)
+        event = _event(turn_id="turn-secret-2", thread_id="thread-secret-2")
+        journal.observe(event, deliverable=True)
+        record_id = journal.record_id_for(event.idempotency_key)
+        serialized = (journal.root / f"{record_id}.json").read_text(
+            encoding="utf-8"
+        )
+        assert "turn-secret-2" not in serialized
+        assert "thread-secret-2" not in serialized
+
+
 class TestRecordIdMapping:
     def test_record_id_for_rejects_foreign_keys(self):
         with pytest.raises(ValueError):
