@@ -670,6 +670,10 @@ class ProjectChatProcessMixin:
 
         async with self._conversation_turn(user_id, chat_id):
             loop = asyncio.get_running_loop()
+            # Next-turn reclaim of route-bound async completions (#646 slice
+            # 3): body-free notice under the conversation lock, before any
+            # turn output. Fail-open; interactive turns only.
+            await self._maybe_reclaim_async_completions(user_id, chat_id, usage_mode)
             progress_coordinator = RequestProgressCoordinator(
                 ledger_create=self._ledger_create,
                 progress_loop=self._agent_progress_loop,
