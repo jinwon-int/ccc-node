@@ -45,6 +45,21 @@ def run_tool(
     )
 
 
+def registry_managed_active() -> int:
+    """Expected active managed-skill count, derived from the registry (#1338).
+
+    The committed registry is CI-enforced truth (validate-harness re-derives
+    it from the repo tree), so a hardcoded count here would silently forgive a
+    catalog that drifted from the skills it is supposed to describe.
+    """
+    data = json.loads((ROOT / "skills" / "registry.json").read_text(encoding="utf-8"))
+    return sum(
+        1
+        for skill in data["skills"]
+        if skill["managed"] and skill["status"] == "active"
+    )
+
+
 def tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
     if not root.exists():
@@ -95,14 +110,14 @@ class CodexManagedSkillsTest(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertTrue(payload["ok"])
         self.assertGreater(payload["classified_assets"], 20)
-        self.assertEqual(payload["managed_skills"], 11)
+        self.assertEqual(payload["managed_skills"], registry_managed_active())
 
     def test_plan_is_body_free_and_does_not_create_codex_home(self) -> None:
         result = run_tool("plan", "--codex-home", str(self.home))
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual({item["status"] for item in payload["skills"]}, {"create"})
-        self.assertEqual(len(payload["skills"]), 11)
+        self.assertEqual(len(payload["skills"]), registry_managed_active())
         self.assertFalse(self.home.exists())
         self.assertNotIn("description", result.stdout.lower())
         self.assertNotIn("procedure", result.stdout.lower())
@@ -113,7 +128,7 @@ class CodexManagedSkillsTest(unittest.TestCase):
         first_digest = tree_digest(self.home)
         payload = json.loads(first.stdout)
         names = {item["name"] for item in payload["skills"]}
-        self.assertEqual(len(names), 11)
+        self.assertEqual(len(names), registry_managed_active())
         for name in names:
             target = self.home / "skills" / name
             marker = json.loads((target / ".ccc-node-managed.json").read_text())
@@ -323,6 +338,47 @@ class CodexManagedSkillsTest(unittest.TestCase):
         self.assertTrue(inventory)
         self.assertEqual(inventory, sorted(inventory))
         self.assertTrue(all(not entry.startswith("/") for entry in inventory))
+
+    def test_deprecated_managed_skill_is_not_provisioned(self) -> None:
+        # Lifecycle (#1338): deprecation retires a managed skill from
+        # plan/apply everywhere while the catalog entry stays until an
+        # operator removes it; the remaining skills provision unchanged.
+        repo = self.copy_repo_surface()
+        skill = repo / "codex" / "skills" / "ccc-doctor" / "SKILL.md"
+        skill.write_text(
+            skill.read_text().replace(
+                "\nname: ccc-doctor\n",
+                "\nname: ccc-doctor\nstatus: deprecated\n",
+                1,
+            )
+        )
+
+        planned = run_tool("plan", "--codex-home", str(self.home), repo=repo)
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        names = {item["name"] for item in json.loads(planned.stdout)["skills"]}
+        self.assertNotIn("ccc-doctor", names)
+        self.assertIn("ccc-node-status", names)
+
+        applied = self.apply(repo=repo)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertFalse((self.home / "skills" / "ccc-doctor").exists())
+        self.assertTrue((self.home / "skills" / "ccc-node-status").exists())
+
+    def test_frontmatter_rejects_unknown_lifecycle_status(self) -> None:
+        repo = self.copy_repo_surface()
+        skill = repo / "codex" / "skills" / "ccc-doctor" / "SKILL.md"
+        skill.write_text(
+            skill.read_text().replace(
+                "\nname: ccc-doctor\n",
+                "\nname: ccc-doctor\nstatus: archived\n",
+                1,
+            )
+        )
+
+        result = run_tool("validate", repo=repo)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("codex_skill_invalid", result.stderr)
 
     def test_codex_skill_with_claude_only_reference_fails_validation(self) -> None:
         repo = self.copy_repo_surface()

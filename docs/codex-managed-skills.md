@@ -39,6 +39,13 @@ the shared text is already runtime-clean, directly from `skills/shared/` — the
 catalog's `managed_skills[].source` records which, and the installed
 `.ccc-node-managed.json` carries that provenance.
 
+Marking a managed skill's `SKILL.md` frontmatter `status: deprecated` retires
+it from `plan`/`apply` on every node while the catalog entry stays until an
+operator removes it. The managed-skill count is not hardcoded anywhere:
+`scripts/ccc_codex_skills_test.py` derives it from `skills/registry.json`, the
+generated CI-enforced view over all skill sources — see
+[`skill-registry.md`](skill-registry.md).
+
 Claude-native lifecycle hooks, sub-agent definitions, MCP registration, and
 transcript skill-autosave assets are not copied or presented as Codex features.
 

@@ -232,6 +232,7 @@ PY_COMPILE_FILES=(claude/hooks/statusline-usage.py \
                   claude/hooks/skill-review/ownership.py \
                   claude/hooks/skill-review/curator.py \
                   scripts/ccc_codex_github_policy.py \
+                  scripts/ccc-skill-registry.py \
                   scripts/ccc-skill-promotion.py \
                   scripts/ccc-fleet-skills-sync.py \
                   scripts/ccc_memory_probe.py \
@@ -287,6 +288,13 @@ if python3 scripts/ccc_codex_skills.py validate --repo-root . >"$TMP/codex-skill
 else
   err "Codex managed-skill validation/tests failed"
   tail -10 "$TMP/codex-skills-validate.out" "$TMP/codex-skills-test.out" 2>/dev/null
+fi
+if python3 scripts/ccc-skill-registry.py validate --repo-root . >"$TMP/skill-registry.out" 2>&1 \
+   && bash scripts/ccc-skill-registry.test.sh >"$TMP/skill-registry-test.out" 2>&1; then
+  say "  ok Skill registry freshness + lifecycle tests (#1338)"
+else
+  err "skill registry validation/tests failed"
+  tail -10 "$TMP/skill-registry.out" "$TMP/skill-registry-test.out" 2>/dev/null
 fi
 if python3 scripts/ccc_memory_timeparse_test.py >"$TMP/timeparse-test.out" 2>&1; then
   say "  ok NL as_of time-reference estimation tests (#871)"
