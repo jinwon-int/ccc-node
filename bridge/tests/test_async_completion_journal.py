@@ -280,6 +280,40 @@ class TestRouteBinding:
         journal.mark(deliverable.idempotency_key, "claimed")
         assert journal.list_deliverable_queued() == ()
 
+    def test_list_route_bound_includes_retryable_and_filters_states(
+        self, tmp_path
+    ):
+        journal = _make_journal(tmp_path)
+        queued = _event(turn_id="turn-2222")
+        retryable = _event(turn_id="turn-3333")
+        delivered = _event(turn_id="turn-4444")
+        evidence = _event(turn_id="turn-5555")
+        journal.observe(queued, deliverable=True)
+        journal.observe(retryable, deliverable=True)
+        journal.observe(delivered, deliverable=True)
+        journal.observe(evidence)
+        journal.mark(retryable.idempotency_key, "claimed")
+        journal.mark(
+            retryable.idempotency_key, "retryable_failed", error_code="x"
+        )
+        journal.mark(delivered.idempotency_key, "claimed")
+        journal.mark(delivered.idempotency_key, "delivered")
+
+        both = journal.list_route_bound(frozenset({"queued", "retryable_failed"}))
+        assert [r.idempotency_key for r in both] == [
+            queued.idempotency_key,
+            retryable.idempotency_key,
+        ]
+        queued_only = journal.list_deliverable_queued()
+        assert [r.idempotency_key for r in queued_only] == [
+            queued.idempotency_key
+        ]
+
+    def test_list_route_bound_rejects_unknown_state(self, tmp_path):
+        journal = _make_journal(tmp_path)
+        with pytest.raises(ValueError):
+            journal.list_route_bound(frozenset({"bogus_state"}))
+
     def test_parse_route_private_and_group(self, tmp_path):
         journal = _make_journal(tmp_path)
         private = _event(turn_id="turn-2222")

@@ -390,6 +390,21 @@ class AsyncCompletionJournal(JsonJournalCore):
         no-delivery even after restarts.
         """
 
+        return self.list_route_bound(frozenset({_QUEUED}))
+
+    def list_route_bound(
+        self, states: frozenset[str] = frozenset({_QUEUED})
+    ) -> tuple[AsyncCompletionRecord, ...]:
+        """Return route-bound records in the given states, oldest first.
+
+        The next-turn reclaimer (#646 slice 3) reads ``queued`` plus
+        ``retryable_failed`` — a failed reclaim send must retry on a later
+        user turn.  Evidence-only records never appear here.
+        """
+
+        for state in states:
+            if state not in _TRANSITIONS and state != _QUEUED:
+                raise ValueError("async completion record state is invalid")
         with self._exclusive():
             records = [
                 self._read_unlocked(record_id)
@@ -400,7 +415,7 @@ class AsyncCompletionJournal(JsonJournalCore):
                 (
                     record
                     for record in records
-                    if record.state == _QUEUED
+                    if record.state in states
                     and record.conversation_route_id is not None
                 ),
                 key=lambda record: record.created_at,

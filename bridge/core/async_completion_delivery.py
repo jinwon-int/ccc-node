@@ -36,6 +36,7 @@ from .async_completion_journal import AsyncCompletionJournal
 logger = logging.getLogger(__name__)
 
 MAX_COMPLETION_TEXT_BYTES = 4096
+MAX_RECLAIM_PER_TURN = 5
 _DEFAULT_MAX_ATTEMPTS = 3
 _DEFAULT_ATTEMPT_BACKOFF_SECONDS = 1.0
 _DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
@@ -249,6 +250,122 @@ class AsyncCompletionSender(Protocol):
     async def __call__(self, user_id: int, chat_id: int, text: str) -> bool: ...
 
 
+def format_reclaim_notice(reclaimed: int, remaining: int = 0) -> str:
+    """Render the body-free next-turn reclaim notice (#646 slice 3).
+
+    Never carries a completion body: after a restart the durable journal
+    cannot know one (bodies are never persisted), so the notice only tells
+    the conversation that completions were recorded without delivery.
+    """
+
+    plural = "s" if reclaimed != 1 else ""
+    text = (
+        f"⟳ {reclaimed} undelivered background completion{plural} from a "
+        "previous session (no body available)"
+    )
+    if remaining > 0:
+        text += f" — {remaining} more on a later turn"
+    return text
+
+
+class AsyncCompletionReclaimer:
+    """Drain route-bound queued completions on the next user turn.
+
+    The restart half of the #646 flow: after a bridge restart the in-memory
+    delivery task is gone and the journal cannot know a body (bodies are
+    never persisted, provider thread ids stay hash-only), so the only honest
+    recovery is a body-free notice to the conversation.  It runs inside the
+    conversation's turn admission (the caller holds the conversation lock)
+    and is therefore naturally serialized per conversation.
+
+    The generation guard does not apply here: a body-free notice delivers no
+    provider payload, so a session rotation cannot misdeliver anything.  The
+    notice explicitly says the session is a previous one.
+    """
+
+    def __init__(
+        self,
+        journal: AsyncCompletionJournal,
+        *,
+        sender: Sender,
+        max_per_turn: int = MAX_RECLAIM_PER_TURN,
+        send_timeout_seconds: float = 5.0,
+    ) -> None:
+        if max_per_turn <= 0:
+            raise ValueError("reclaim max_per_turn must be positive")
+        self._journal = journal
+        self._sender = sender
+        self._max_per_turn = max_per_turn
+        self._send_timeout_seconds = send_timeout_seconds
+
+    async def reclaim_for_route(self, user_id: int, chat_id: int) -> int:
+        """Reclaim one bounded batch; return the reclaimed count.
+
+        Never raises: every failure mode folds into the journal state machine
+        and a ``0`` return.  On a failed send the claimed records return to
+        ``retryable_failed('reclaim_send_failed')`` so a later user turn
+        retries them naturally.
+        """
+
+        route_key = (user_id, chat_id)
+        candidates = [
+            record
+            for record in self._journal.list_route_bound(
+                frozenset({"queued", "retryable_failed"})
+            )
+            if self._journal.parse_route(record) == route_key
+        ]
+        if not candidates:
+            return 0
+        batch = candidates[: self._max_per_turn]
+        claimed: list[str] = []
+        for record in batch:
+            try:
+                self._journal.mark(record.idempotency_key, "claimed")
+            except ValueError:
+                # Lost a claim race (e.g. a live delivery coordinator for the
+                # same identity): skip — that path delivers instead.
+                continue
+            claimed.append(record.idempotency_key)
+        if not claimed:
+            return 0
+        remaining = max(0, len(candidates) - len(claimed))
+        try:
+            sent = await asyncio.wait_for(
+                self._sender(
+                    user_id,
+                    chat_id,
+                    format_reclaim_notice(len(claimed), remaining),
+                ),
+                timeout=self._send_timeout_seconds,
+            )
+        except Exception:
+            sent = False
+            logger.warning(
+                "Async completion reclaim send failed for chat %s",
+                chat_id,
+                exc_info=True,
+            )
+        if not sent:
+            for key in claimed:
+                try:
+                    self._journal.mark(
+                        key, "retryable_failed", error_code="reclaim_send_failed"
+                    )
+                except ValueError:
+                    continue
+            return 0
+        for key in claimed:
+            try:
+                self._journal.mark(
+                    key, "delivered", error_code="body_free_reclaim"
+                )
+            except ValueError:
+                # Evicted by retention between claim and mark: nothing to do.
+                continue
+        return len(claimed)
+
+
 def build_telegram_sender(
     bot: Any,
     *,
@@ -286,9 +403,12 @@ def build_telegram_sender(
 
 __all__ = [
     "AsyncCompletionDeliveryCoordinator",
+    "AsyncCompletionReclaimer",
     "AsyncCompletionSender",
     "MAX_COMPLETION_TEXT_BYTES",
+    "MAX_RECLAIM_PER_TURN",
     "bounded_completion_text",
     "build_telegram_sender",
     "format_completion_notice",
+    "format_reclaim_notice",
 ]

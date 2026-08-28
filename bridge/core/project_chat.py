@@ -53,6 +53,7 @@ from telegram_bot.core.async_completion_event import (
 from telegram_bot.core.async_completion_journal import AsyncCompletionJournal
 from telegram_bot.core.async_completion_delivery import (
     AsyncCompletionDeliveryCoordinator,
+    AsyncCompletionReclaimer,
 )
 from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
 from telegram_bot.core.conversation_paths import claude_project_dir_name
@@ -222,6 +223,7 @@ class ProjectChatHandler(
         # coordinator is built lazily from wired seams on first use.
         self._async_completion_sender: Any = None
         self._async_completion_delivery: Optional[AsyncCompletionDeliveryCoordinator] = None
+        self._async_completion_reclaimer: Optional[AsyncCompletionReclaimer] = None
         try:
             self._async_completion_journal = AsyncCompletionJournal(
                 self.project_root / ".telegram_bot" / "async-completions"
@@ -389,6 +391,7 @@ class ProjectChatHandler(
         self._async_completion_sender = sender
         # A newly wired sender invalidates any coordinator built without one.
         self._async_completion_delivery = None
+        self._async_completion_reclaimer = None
 
     def _init_async_completion_journal(self) -> AsyncCompletionJournal | None:
         """Initialize the journal once; return ``None`` when unavailable.
@@ -439,6 +442,72 @@ class ProjectChatHandler(
             ),
         )
         return self._async_completion_delivery
+
+    def _reclaimer_for(self, journal: AsyncCompletionJournal) -> Any:
+        """Build (once) the next-turn reclaimer from wired seams."""
+
+        if self._async_completion_reclaimer is not None:
+            return self._async_completion_reclaimer
+        sender = self._async_completion_sender
+        if sender is None:
+            return None
+        self._async_completion_reclaimer = AsyncCompletionReclaimer(
+            journal,
+            sender=sender,
+        )
+        return self._async_completion_reclaimer
+
+    async def _maybe_reclaim_async_completions(
+        self, user_id: int, chat_id: int, usage_mode: str
+    ) -> None:
+        """Drain route-bound queued completions on a user turn (#646 slice 3).
+
+        Called inside the conversation turn (the caller holds the conversation
+        lock), before the turn's response machinery starts, so the body-free
+        reclaim notice arrives before the reply.  Interactive turns only —
+        autonomous wakeup turns must not consume the user's reclaim window.
+        Fail-open: any failure keeps the turn path working.
+        """
+
+        if usage_mode != MODE_INTERACTIVE:
+            return
+        # Route-bound records can only exist under a runtime that declares
+        # durable delivery, so a degraded runtime (every production provider
+        # today) skips the journal scan entirely — the per-turn hot path
+        # stays free of filesystem work.
+        capability_getter = getattr(
+            self._agent_runtime, "async_completion_capability", None
+        )
+        if not callable(capability_getter):
+            return
+        try:
+            capability = capability_getter()
+        except Exception:
+            return
+        if not getattr(capability, "supports_durable_delivery", False):
+            return
+        journal = self._init_async_completion_journal()
+        if journal is None:
+            return
+        reclaimer = self._reclaimer_for(journal)
+        if reclaimer is None:
+            return
+        try:
+            reclaimed = await reclaimer.reclaim_for_route(user_id, chat_id)
+        except Exception:
+            logger.warning(
+                "Async completion reclaim failed; turn continues",
+                exc_info=True,
+            )
+            return
+        if reclaimed:
+            logger.info(
+                "Reclaimed %d route-bound async completion(s) for user %s "
+                "chat %s (body-free next-turn notice)",
+                reclaimed,
+                user_id,
+                chat_id,
+            )
 
     def _observe_unowned_codex_completion(
         self, thread_id: str, turn_id: str
