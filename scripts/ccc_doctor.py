@@ -507,6 +507,7 @@ class Doctor:
         self.check_cron_drift()
         self.check_provider_readiness()
         self.check_distill_readiness()
+        self.check_self_update_stall()
         # Managed Codex skills are provider-native (#647): diagnose them only on
         # a Codex node. Claude-only asset findings above stay non-readiness
         # (교정가능/정상), so they never block a Codex node's readiness.
@@ -1315,6 +1316,123 @@ class Doctor:
             f"configured={configuration}; state=private-{mode:04o}",
             "none",
         )
+
+    # Aborts that a scheduled tick cannot clear on its own: a human has to put
+    # the managed checkout back. These make the node fail doctor's exit code,
+    # because the node silently stops receiving harness updates until fixed
+    # (#1039, #1061, #1328). `fetch-failed` is deliberately absent — it is
+    # transient and the next tick may well succeed.
+    _SELF_UPDATE_MANUAL_REASONS = frozenset({"wrong-branch", "dirty-tree", "no-repo"})
+
+    # How much of the log tail to inspect. The file interleaves plain
+    # `<ts> <verb> k=v` lines with JSONL audit records, and a single run emits
+    # many non-terminal lines (per-service, per-installer), so the window has to
+    # be generous enough to reach the previous terminal record.
+    _SELF_UPDATE_LOG_TAIL_BYTES = 65536
+
+    def check_self_update_stall(self) -> None:
+        """Report whether the last self-update attempt ended in a stall.
+
+        #1060 added a Telegram alert for these aborts, but an alert is a
+        one-shot event: a node that stalls while nobody is reading chat stays
+        stalled and invisible. This surfaces the same fact in the pull-based
+        report, so `ccc-doctor` and the fleet matrix can find a node that quietly
+        stopped updating days ago.
+
+        The verdict is the LAST terminal record, not the presence of any abort
+        in history. A node that stalled and was then repaired reads as stalled
+        only until its next successful tick — which is the honest reading: no
+        successful update has happened since the failure.
+        """
+        item = "self-update"
+        state_dir = Path(
+            os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")
+        ).expanduser()
+        log_path = state_dir / "self-update.log"
+        try:
+            size = log_path.stat().st_size
+            with log_path.open("rb") as handle:
+                if size > self._SELF_UPDATE_LOG_TAIL_BYTES:
+                    handle.seek(size - self._SELF_UPDATE_LOG_TAIL_BYTES)
+                    handle.readline()  # drop the partial first line
+                tail = handle.read().decode("utf-8", "replace").splitlines()
+        except FileNotFoundError:
+            # Not every node runs self-update; absence is not drift.
+            self.add("정상", item, "log=absent", "none")
+            return
+        except OSError:
+            self.add(
+                "수동필요",
+                item,
+                "log=unreadable",
+                f"inspect {log_path} permissions; self-update state cannot be verified",
+            )
+            return
+
+        aborts: list[str] = []
+        outcome: str | None = None
+        for line in reversed(tail):
+            reason = self._self_update_abort_reason(line)
+            if reason is not None:
+                aborts.append(reason)
+                continue
+            if self._is_self_update_success(line):
+                outcome = "ok"
+                break
+        if not aborts:
+            status = "last=ok" if outcome else "last=none-recorded"
+            self.add("정상", item, status, "none")
+            return
+
+        # Count only the unbroken run of the newest reason; a different earlier
+        # reason is a separate incident and inflating the streak would misreport
+        # how long THIS one has persisted.
+        reason = aborts[0]
+        streak = 0
+        for entry in aborts:
+            if entry != reason:
+                break
+            streak += 1
+        status = f"last=abort; reason={reason}; consecutive={streak}"
+        if reason not in self._SELF_UPDATE_MANUAL_REASONS:
+            self.add("경고", item, status, f"review {log_path}; retries on the next tick")
+            return
+        self.add(
+            "수동필요",
+            item,
+            status,
+            "restore the managed checkout to a clean 'main' "
+            "(see CONTRIBUTING.md: develop in a git worktree); "
+            "the node receives no harness updates until then",
+        )
+
+    @staticmethod
+    def _self_update_abort_reason(line: str) -> str | None:
+        """Return the reason of an `abort` log line, else None.
+
+        Matches the shell writer's format: `<ISO8601Z> abort reason=<r> repo=<p>`.
+        """
+        match = re.match(r"^\S+Z\s+abort\s+reason=(\S+)", line.strip())
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _is_self_update_success(line: str) -> bool:
+        """Return True for a terminal non-abort record.
+
+        Two writers produce one: `log "done result=..."` plain lines and the
+        JSONL `audit` records. Both mean the run reached an end state, so both
+        close out any older abort streak.
+        """
+        stripped = line.strip()
+        if re.match(r"^\S+Z\s+done\s+result=", stripped):
+            return True
+        if not stripped.startswith("{"):
+            return False
+        try:
+            record = json.loads(stripped)
+        except ValueError:
+            return False
+        return isinstance(record, dict) and "result" in record
 
     @staticmethod
     def has_systemd() -> bool:
