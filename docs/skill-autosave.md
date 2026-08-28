@@ -19,19 +19,23 @@ provider-neutral: it screens a `SKILL.md` and installs the passing draft into a
 skills directory. Only the **install target** and a **compatibility screen**
 differ per provider. `skill-review/provider.sh` resolves both.
 
-| Capability | Claude | Codex |
-|---|---|---|
-| Install target | `~/.claude/skills/<name>/` (`CLAUDE_SKILLS_DIR`) | `${CODEX_HOME:-~/.codex}/skills/<name>/` (`CODEX_SKILLS_DIR`) |
-| Machine gates (secret / node-fact / dedup / lint / claims) | ✅ identical | ✅ identical |
-| Mode / daily cap / off-switch / ledger / rollback | ✅ identical | ✅ identical |
-| Codex-compat screen (rejects `claude -p`, `~/.claude`, `CLAUDE_*`) | n/a | ✅ isolates Claude-only drafts as pending |
-| Secure install dir (0700, no-symlink leaf, fail-closed) | existing dir untouched | ✅ created owner-only |
-| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ✅ v2 create/patch/write_file/noop engine + real `codex exec` backend + Codex-only default-ON collector (`CCC_CODEX_SKILL_COLLECTOR=false` opts out) |
+| Capability | Claude | Codex | Piri |
+|---|---|---|---|
+| Install target | `~/.claude/skills/<name>/` (`CLAUDE_SKILLS_DIR`) | `${CODEX_HOME:-~/.codex}/skills/<name>/` (`CODEX_SKILLS_DIR`) | `${PIRI_CODING_AGENT_DIR:-~/.piri/agent}/skills/<name>/` (`PIRI_SKILLS_DIR`) |
+| Machine gates (secret / node-fact / dedup / lint / claims) | ✅ identical | ✅ identical | ✅ identical |
+| Mode / daily cap / off-switch / ledger / rollback | ✅ identical | ✅ identical | ✅ identical |
+| Codex-compat screen (rejects `claude -p`, `~/.claude`, `CLAUDE_*`) | n/a | ✅ isolates Claude-only drafts as pending | ✅ same screen (shared non-Claude coupling rules) |
+| Secure install dir (0700, no-symlink leaf, fail-closed) | existing dir untouched | ✅ created owner-only | ✅ created owner-only |
+| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ✅ v2 create/patch/write_file/noop engine + real `codex exec` backend + Codex-only default-ON collector (`CCC_CODEX_SKILL_COLLECTOR=false` opts out) | ✅ same collector engine over Piri distill jobs via `RuntimeCliSkillCandidateBackend`, default-ON (`CCC_PIRI_SKILL_COLLECTOR=false` opts out) |
 
-Select the provider explicitly with `CCC_SKILL_PROVIDER=claude|codex`. When
+Select the provider explicitly with `CCC_SKILL_PROVIDER=claude|codex|piri`. When
 unset it auto-detects: a node with a Codex home but no `~/.claude` and no
 `claude` binary resolves to `codex`; everything else stays `claude`
-(back-compatible — existing Claude nodes are unchanged).
+(back-compatible — existing Claude nodes are unchanged). **Piri is
+explicit-only**: bridge nodes commonly carry a `~/.piri/agent` tree for A2A
+workers while their interactive lane stays Claude, so set
+`CCC_SKILL_PROVIDER=piri` in the collector/installer environment (cron line or
+systemd drop-in) for the piri install target to engage.
 
 The Codex install pipeline (gates, cap, ledger, rollback, concurrency-safe
 single-runner lock) is complete and covered by

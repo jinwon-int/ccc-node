@@ -148,6 +148,70 @@ def _distill_extraction_authorized(
     return False
 
 
+def _build_skill_candidate_collector(
+    settings: Settings,
+    *,
+    distill_journal: Any,
+    usage_meter: Any,
+) -> Any | None:
+    """Compose the Codex/Piri skill-candidate collector, or None (#749)."""
+
+    collector_provider = (
+        settings.agent_provider
+        if settings.agent_provider in {"codex", "piri"}
+        else None
+    )
+    if not (
+        collector_provider
+        and getattr(
+            settings,
+            f"{collector_provider}_skill_collector_enabled",
+            True,
+        )
+        and distill_journal is not None
+    ):
+        return None
+    from telegram_bot.memory.skill_candidate import SkillCandidateSink
+    from telegram_bot.memory.skill_candidate_backend import (
+        CodexExecSkillCandidateBackend,
+    )
+    from telegram_bot.memory.skill_candidate_worker import (
+        SkillCandidateCollectorWorker,
+    )
+
+    if collector_provider == "codex":
+        backend = CodexExecSkillCandidateBackend(
+            model=settings.codex_distill_model,
+            timeout_seconds=settings.codex_distill_timeout_seconds,
+            audience_auth_mode=settings.codex_audience_auth_mode,
+        )
+    else:
+        from telegram_bot.memory.distill_backend_factory import (
+            resolve_distill_model_timeout,
+        )
+        from telegram_bot.memory.runtime_cli_backend import (
+            RuntimeCliSkillCandidateBackend,
+        )
+
+        model, timeout = resolve_distill_model_timeout(settings, "piri")
+        backend = RuntimeCliSkillCandidateBackend(
+            "piri",
+            executable=settings.piri_cli_path,
+            model=model,
+            timeout_seconds=timeout,
+        )
+    return SkillCandidateCollectorWorker(
+        journal=distill_journal,
+        backend=backend,
+        sink=SkillCandidateSink(
+            settings.bot_data_dir / "skill-candidates",
+            settings.codex_skill_pending_dir,
+        ),
+        usage_meter=usage_meter,
+        provider=collector_provider,
+    )
+
+
 def build_context(
     settings: Settings,
     *,
@@ -405,36 +469,15 @@ def build_context(
             require_memory_route=audience_scoped,
         )
 
-    # Default-on Codex skill-candidate collector (#749). Three-guard: Codex
-    # node, no explicit opt-out, and a distill journal to read snapshots from.
-    # Claude composition is unchanged and installation remains approve-first.
-    skill_candidate_collector_worker = None
-    if (
-        settings.agent_provider == "codex"
-        and getattr(settings, "codex_skill_collector_enabled", True)
-        and distill_journal is not None
-    ):
-        from telegram_bot.memory.skill_candidate import SkillCandidateSink
-        from telegram_bot.memory.skill_candidate_backend import (
-            CodexExecSkillCandidateBackend,
-        )
-        from telegram_bot.memory.skill_candidate_worker import (
-            SkillCandidateCollectorWorker,
-        )
-
-        skill_candidate_collector_worker = SkillCandidateCollectorWorker(
-            journal=distill_journal,
-            backend=CodexExecSkillCandidateBackend(
-                model=settings.codex_distill_model,
-                timeout_seconds=settings.codex_distill_timeout_seconds,
-                audience_auth_mode=settings.codex_audience_auth_mode,
-            ),
-            sink=SkillCandidateSink(
-                settings.bot_data_dir / "skill-candidates",
-                settings.codex_skill_pending_dir,
-            ),
-            usage_meter=project_chat.usage_meter,
-        )
+    # Default-on Codex/Piri skill-candidate collector (#749, piri parity).
+    # Three-guard per provider: matching node provider, no explicit opt-out, and
+    # a distill journal to read snapshots from. Claude composition is unchanged
+    # and installation remains approve-first.
+    skill_candidate_collector_worker = _build_skill_candidate_collector(
+        settings,
+        distill_journal=distill_journal,
+        usage_meter=project_chat.usage_meter,
+    )
 
     return AppContext(
         settings=settings,

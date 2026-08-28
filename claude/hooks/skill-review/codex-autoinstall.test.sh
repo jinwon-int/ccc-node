@@ -97,6 +97,21 @@ ok "installed skill discoverable by codex skills resolver" '
   d="$(CODEX_SKILLS_DIR="$CODEX_SKILLS" ccc_skills_dir codex)";
   [ -f "$d/codex-clean-one/SKILL.md" ] && head -1 "$d/codex-clean-one/SKILL.md" | grep -q "^---"'
 
+# --- 3b) provider.sh resolves the piri audience (explicit-only, #667 piri) -------
+ok "piri provider resolves explicitly" '
+  . "$HERE/provider.sh";
+  [ "$(CCC_SKILL_PROVIDER=piri ccc_skill_provider)" = "piri" ]'
+ok "piri provider is never auto-detected from a piri home" '
+  . "$HERE/provider.sh";
+  home="$(mktemp -d)"; mkdir -p -m 700 "$home/.piri/agent";
+  p="$(HOME="$home" ccc_skill_provider)"; rm -rf "$home";
+  [ "$p" = "claude" ]'
+ok "piri skills dir honors overrides and default" '
+  . "$HERE/provider.sh";
+  d="$(PIRI_SKILLS_DIR=/tmp/x ccc_skills_dir piri)"; [ "$d" = "/tmp/x" ] && \
+  d2="$(PIRI_CODING_AGENT_DIR=/tmp/agent ccc_skills_dir piri)"; [ "$d2" = "/tmp/agent/skills" ] && \
+  d3="$(ccc_skills_dir piri)"; [ "$d3" = "$HOME/.piri/agent/skills" ]'
+
 # --- 4) secret / node-specific drafts blocked (redaction-safe reason) ------------
 make_draft 20260101-000001-b-leaky codex-leaky "Automate the recurring Codex token rotation procedure for the deploy pipeline." \
 "# Leaky

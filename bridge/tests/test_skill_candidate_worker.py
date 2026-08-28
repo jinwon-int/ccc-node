@@ -90,6 +90,34 @@ def _output() -> SkillCandidateOutput:
     )
 
 
+def _piri_output() -> SkillCandidateOutput:
+    skill_md = (
+        "---\nname: piri-release-check\n"
+        "description: Capture the recurring Piri release verification checklist procedure.\n"
+        "---\n\n# piri-release-check\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n"
+    )
+    return SkillCandidateOutput.model_validate(
+        {
+            "schema_version": 1,
+            "provenance": {
+                "provider": "piri",
+                "source_thread_hash": THREAD_HASH,
+                "trigger": "checkpoint",
+                "distilled_at": "2026-07-23T11:00:05Z",
+            },
+            "candidates": [
+                {
+                    "name": "piri-release-check",
+                    "summary": "Capture the recurring Piri release verification checklist procedure.",
+                    "reason": "The session repeated the same release verification steps.",
+                    "evidence_excerpt": "release checklist",
+                    "skill_md": skill_md,
+                }
+            ],
+        }
+    )
+
+
 class _FakeBackend:
     def __init__(self, output: SkillCandidateOutput) -> None:
         self._output = output
@@ -143,6 +171,7 @@ def _worker(
     usage_meter=None,
     clock=lambda: 1_000.0,
     sink=None,
+    provider="codex",
 ) -> SkillCandidateCollectorWorker:
     if sink is None:
         sink = SkillCandidateSink(
@@ -154,6 +183,7 @@ def _worker(
         backend=backend,
         sink=sink,
         usage_meter=usage_meter,
+        provider=provider,
         clock=clock,
     )
 
@@ -192,6 +222,51 @@ def test_collect_skips_non_codex_job(tmp_path: Path) -> None:
     worker = _worker(tmp_path, _FakeJournal(_job(provider="claude")), backend)
     assert asyncio.run(worker.collect_once(job_id=JOB_ID)) is None
     assert backend.calls == 0
+
+
+def test_collect_accepts_piri_job_when_provider_piri(tmp_path: Path) -> None:
+    backend = _FakeBackend(_piri_output())
+    worker = _worker(
+        tmp_path,
+        _FakeJournal(_job(provider="piri")),
+        backend,
+        provider="piri",
+    )
+    result = asyncio.run(worker.collect_once(job_id=JOB_ID))
+    assert result is not None and result.candidates_staged == 1
+    assert backend.calls == 1
+    assert backend.seen_provenance.provider == "piri"
+    drafts = list((tmp_path / "state" / "pending-skills").iterdir())
+    assert len(drafts) == 1
+
+
+def test_default_worker_skips_piri_job(tmp_path: Path) -> None:
+    backend = _FakeBackend(_piri_output())
+    worker = _worker(tmp_path, _FakeJournal(_job(provider="piri")), backend)
+    assert asyncio.run(worker.collect_once(job_id=JOB_ID)) is None
+    assert backend.calls == 0
+
+
+def test_piri_worker_skips_codex_job(tmp_path: Path) -> None:
+    backend = _FakeBackend(_output())
+    worker = _worker(
+        tmp_path,
+        _FakeJournal(_job(provider="codex")),
+        backend,
+        provider="piri",
+    )
+    assert asyncio.run(worker.collect_once(job_id=JOB_ID)) is None
+    assert backend.calls == 0
+
+
+def test_worker_rejects_unsupported_provider(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        _worker(
+            tmp_path,
+            _FakeJournal(_job()),
+            _FakeBackend(_output()),
+            provider="claude",
+        )
 
 
 def test_collect_reserves_body_free_autonomous_usage(tmp_path: Path) -> None:
