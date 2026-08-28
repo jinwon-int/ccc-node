@@ -196,14 +196,19 @@ surface + enforced authoring standards + after-the-fact visibility:
    paths, non-loopback IPs, `user@host`/emails (git@github.com allowed).
 3. **Dedup** against installed skills: existing directory is never
    overwritten; normalized-name and description-similarity matches are blocked.
-4. **Structure lint** (Hermes HARDLINE-style): frontmatter with kebab-case
-   `name` (≤64), routing-friendly `description` (20–1024 chars), non-trivial
-   body with headings.
-5. **Codex-compat** (Codex provider only): a draft that hard-codes the Claude
+4. **Structure lint** (Hermes HARDLINE-style + Agent Skills spec): frontmatter
+   with kebab-case `name` (≤64, no leading/trailing/consecutive hyphens),
+   routing-friendly `description` (20–1024 chars), non-trivial body with
+   headings, and an optional `compatibility` field of at most 500 chars
+   (agentskills.io spec).
+5. **Body size** (progressive disclosure): a `SKILL.md` over 500 lines is
+   isolated as `size oversized-body` — the author splits it into
+   `references/` with read-when pointers per the official guidance.
+6. **Codex-compat** (Codex provider only): a draft that hard-codes the Claude
    CLI (`claude -p`), the `~/.claude` tree, or `CLAUDE_*` env can't run on a
    Codex node, so it is isolated as pending (`codex-incompat <label>`) instead
    of installed. Prose that merely mentions "Claude Code" is untouched.
-6. **Unverified factual claims**: a draft that asserts an exit code, an HTTP
+7. **Unverified factual claims**: a draft that asserts an exit code, an HTTP
    status, or a pinned version while giving the reader **no way to re-derive
    it** is isolated as pending (`unverified-claim <exit-code|http-status|version-pin>`).
    Any one of a URL, a `file.ext:line` source reference, a shown

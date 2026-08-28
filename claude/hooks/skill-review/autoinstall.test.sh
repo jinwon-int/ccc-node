@@ -210,6 +210,39 @@ printf '# no frontmatter\njust text\n' > "$PENDING/20260101-000008-i-nofm/SKILL.
 run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "missing frontmatter blocked" 'jq -e ".reason == \"lint no-frontmatter\"" "$PENDING/20260101-000008-i-nofm/autosave-block.json" >/dev/null'
 
+# --- 5b) size gate (#1347 rubric: progressive disclosure) ------------------------
+# 501 non-empty lines exceed the official <500-line guidance: the draft is
+# blocked with an oversized-body reason and must be split by the author.
+big="$PENDING/20260101-000009-j-bigbody"
+mkdir -p "$big"
+{
+  printf -- '---\nname: big-body-skill\ndescription: Exercise the progressive disclosure size gate with an oversized body.\n---\n\n# Big\n\n'
+  seq -f 'Filler line %g.' 1 501
+} > "$big/SKILL.md"
+run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
+ok "oversized body blocked" 'jq -e ".reason | startswith(\"size oversized-body\")" "$PENDING/20260101-000009-j-bigbody/autosave-block.json" >/dev/null'
+
+# 500 lines is exactly at the official limit and must pass the size gate.
+edge="$PENDING/20260101-000010-k-edgebody"
+mkdir -p "$edge"
+{
+  printf -- '---\nname: edge-body-skill\ndescription: Sit exactly at the progressive disclosure limit and stay installable.\n---\n\n# Edge\n\n'
+  seq -f 'Filler line %g.' 1 493
+} > "$edge/SKILL.md"
+run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
+ok "body at the 500-line limit installs" '[ -f "$SKILLS/edge-body-skill/SKILL.md" ]'
+
+# --- 5c) compatibility field lint (official spec: <=500 chars) -------------------
+long_compat="$PENDING/20260101-000011-l-longcompat"
+mkdir -p "$long_compat"
+{
+  printf -- '---\nname: long-compat-skill\n'
+  printf 'compatibility: %s\n' "$(printf 'Requires %s ' $(seq 1 120))"
+  printf -- 'description: Exercise the optional compatibility field length lint.\n---\n\n# Compat\n\n1. Step.\n2. Step.\n3. Step.\n'
+} > "$long_compat/SKILL.md"
+run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
+ok "over-long compatibility field blocked" 'jq -e ".reason == \"lint compatibility-too-long\"" "$PENDING/20260101-000011-l-longcompat/autosave-block.json" >/dev/null'
+
 # --- 6) dedup gate ----------------------------------------------------------------
 mkdir -p "$SKILLS/existing-skill"
 printf -- '---\nname: existing-skill\ndescription: Run the recurring wiki record procedure for durable decisions.\n---\n\n# Existing\n' \
