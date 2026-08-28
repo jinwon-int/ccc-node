@@ -136,6 +136,24 @@ def _frontmatter(path: Path) -> dict[str, str]:
     return values
 
 
+def _walk_skill_dir(skill_dir: Path) -> tuple[list[Path], int]:
+    """All regular files under one skill dir, fail-closed on anything odd."""
+    if not skill_dir.is_dir() or skill_dir.is_symlink():
+        raise RegistryError("registry_skill_source_invalid")
+    files: list[Path] = []
+    total = 0
+    for path in sorted(skill_dir.rglob("*")):
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RegistryError("registry_skill_source_invalid")
+        if stat.S_ISREG(metadata.st_mode):
+            total += metadata.st_size
+            files.append(path)
+        elif not stat.S_ISDIR(metadata.st_mode):
+            raise RegistryError("registry_skill_source_invalid")
+    return files, total
+
+
 def _skill_files(skill_dir: Path, listed: set[str] | None, root_prefix: str) -> list[Path]:
     """Files of one skill dir, git's view preferred, filesystem walk fallback.
 
@@ -145,19 +163,7 @@ def _skill_files(skill_dir: Path, listed: set[str] | None, root_prefix: str) -> 
     ``listed`` carries git-tracked repo-relative paths for the whole repo.
     """
     if listed is None:
-        files: list[Path] = []
-        total = 0
-        if not skill_dir.is_dir() or skill_dir.is_symlink():
-            raise RegistryError("registry_skill_source_invalid")
-        for path in sorted(skill_dir.rglob("*")):
-            metadata = path.lstat()
-            if stat.S_ISLNK(metadata.st_mode):
-                raise RegistryError("registry_skill_source_invalid")
-            if stat.S_ISREG(metadata.st_mode):
-                total += metadata.st_size
-                files.append(path)
-            elif not stat.S_ISDIR(metadata.st_mode):
-                raise RegistryError("registry_skill_source_invalid")
+        files, total = _walk_skill_dir(skill_dir)
     else:
         files = []
         total = 0
@@ -181,17 +187,7 @@ def _skill_files(skill_dir: Path, listed: set[str] | None, root_prefix: str) -> 
             # Untracked new skill dir: git has no opinion yet, so walk the dir
             # itself. A tracked dir never lands here (its files are listed),
             # keeping the stray-file protection where it matters.
-            if not skill_dir.is_dir() or skill_dir.is_symlink():
-                raise RegistryError("registry_skill_source_invalid")
-            for path in sorted(skill_dir.rglob("*")):
-                metadata = path.lstat()
-                if stat.S_ISLNK(metadata.st_mode):
-                    raise RegistryError("registry_skill_source_invalid")
-                if stat.S_ISREG(metadata.st_mode):
-                    total += metadata.st_size
-                    files.append(path)
-                elif not stat.S_ISDIR(metadata.st_mode):
-                    raise RegistryError("registry_skill_source_invalid")
+            files, total = _walk_skill_dir(skill_dir)
     if not files or len(files) > MAX_SKILL_FILES or total > MAX_SKILL_BYTES:
         raise RegistryError("registry_skill_source_invalid")
     return files
