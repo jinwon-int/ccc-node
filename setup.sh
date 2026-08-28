@@ -654,6 +654,9 @@ install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <
       run rm -rf "$stage"
       run cp -r "$source" "$stage"
       if [ -d "$target" ]; then
+        if [ -f "$target/.ccc-fleet-skill.json" ]; then
+          note "absorbing fleet-installed skill $name into the repo-managed copy (precedence: repo > fleet, #1344)"
+        fi
         run rm -rf "$target.prev"
         run mv "$target" "$target.prev"
       fi

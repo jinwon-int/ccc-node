@@ -1,6 +1,6 @@
 ---
 name: gh-pr-flow
-description: Ship code through the PR-first GitHub flow on this node, including protected PRs that need an independent cross-account review in either direction — jinon86-authored PR approved as seoseo-ai (local secondary account) or seoseo-ai-authored PR approved/merged as jinon86 (Seoseo-held session) — after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. Enforces no direct main pushes, exact-head and green-check validation, independent review, secret-safe credential use, squash merge, and verified cleanup. Not for Wiki edits (use wiki-record).
+description: Ship code through the PR-first GitHub flow on this node, including protected PRs that need an independent cross-account review in either direction — jinon86-authored PR approved via the Seoseo-held seoseo-ai profile (exact-head) or seoseo-ai-authored PR approved/merged as jinon86 (Seoseo-held session) — after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. Enforces no direct main pushes, exact-head and green-check validation, independent review, secret-safe credential use, squash merge, and verified cleanup. Not for Wiki edits (use wiki-record).
 ---
 
 # gh-pr-flow — PR-first GitHub flow
@@ -11,15 +11,17 @@ For Wiki content use `wiki-record` instead.
 
 ## Identities and review directions
 
-A node's local `gh` may hold `jinon86` (typically active) and `seoseo-ai` as a
-secondary account; Seoseo separately holds an authorized `jinon86` session.
-Check with `gh auth status`. Whichever account authored the PR, the OTHER
-account reviews it — both directions are supported symmetrically:
+A node's local `gh` holds `jinon86` (typically the only local account).
+`seoseo-ai` review authority lives on Seoseo as an isolated profile config
+(`/root/.config/gh-seoseo-ai`), and Seoseo separately holds an authorized
+`jinon86` session. Check with `gh auth status`. Whichever account authored
+the PR, the OTHER account reviews it — both directions are supported
+symmetrically:
 
 | PR author | Reviewer / merger | Mechanism |
 |---|---|---|
-| `jinon86` | `seoseo-ai` reviews; `jinon86` merges | `approve-as-seoseo-ai.sh` (local secondary account, no account switch) |
-| `seoseo-ai` | `jinon86` reviews and, if needed, merges | `approve-via-seoseo.sh` / `merge-via-seoseo.sh` (Seoseo-held session over SSH) |
+| `jinon86` | `seoseo-ai` reviews; `jinon86` merges | `approve-via-seoseo.sh --review-profile seoseo-ai` (Seoseo-held profile, exact-head) |
+| `seoseo-ai` | `jinon86` reviews and, if needed, merges | `approve-via-seoseo.sh --review-profile jinon86` (exact-head) / `merge-via-seoseo.sh` (Seoseo-held session over SSH) |
 
 Every cross-account review or merge is a privileged credential use and needs
 fresh explicit user approval in the current conversation, in both directions.
@@ -108,32 +110,59 @@ fresh explicit user approval in the current conversation, in both directions.
    `$HOME/ccc-node`, `/root/ccc-node` — instead of hardcoding one; nodes install
    the repo in different places, which previously forked this snippet per node.)
 
-   **Direction A — `jinon86`-authored PR, `seoseo-ai` reviews (local):**
+   **Direction A — `jinon86`-authored PR, `seoseo-ai` reviews (Seoseo-held
+   profile):**
+
+   Both directions use the same exact-head profile helper. It ships with the
+   managed Codex skills that `setup.sh` installs on every node. Resolve it
+   first, with template-checkout fallback:
 
    ```bash
-   CCC_EXPLICIT_USER_APPROVAL=1 \
-     "$GH_PR_FLOW_DIR/approve-as-seoseo-ai.sh" <owner/repo> <pr-number>
+   SEOSEO_FLOW_DIR="${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts"
+   if [ ! -d "$SEOSEO_FLOW_DIR" ]; then
+     for _cand in /opt/ccc-node "$HOME/ccc-node" /root/ccc-node; do
+       [ -d "$_cand/codex/skills/gh-pr-flow/scripts" ] || continue
+       SEOSEO_FLOW_DIR="$_cand/codex/skills/gh-pr-flow/scripts"; break
+     done
+   fi
    ```
 
-   The helper accepts only `jinwon-int/*`, requires an open `main` PR authored
-   by `jinon86` (override with `CCC_LOCAL_REVIEW_EXPECTED_AUTHOR` only when the
-   user names a different author), verifies the acting identity is `seoseo-ai`,
-   and refuses self-review. It uses the locally stored secondary `seoseo-ai`
-   credential scoped to its own process for that one invocation — it never
-   prints the token and never switches the persistent active `gh` account.
-   After approval, `jinon86` (the active account) merges normally in step 6.
+   ```bash
+   head_sha="$(gh pr view <n> --repo <owner/repo> --json headRefOid --jq .headRefOid)"
+   CCC_EXPLICIT_USER_APPROVAL=1 \
+     bash "$SEOSEO_FLOW_DIR/approve-via-seoseo.sh" \
+     --review-profile seoseo-ai --repo <owner/repo> --pr <n> \
+     --expected-head "$head_sha" --operator-approved
+   ```
+
+   The helper runs `gh` on Seoseo with the isolated `seoseo-ai` profile config
+   — credentials never leave Seoseo and are never printed, copied, or switched.
+   It fail-closes unless the remote actor is `seoseo-ai`, the open default-
+   branch PR is authored by `jinon86`, `seoseo-ai` is the requested reviewer
+   (request it with `gh pr edit --add-reviewer seoseo-ai` when missing), the
+   head matches `--expected-head` exactly, the PR is mergeable, and every
+   reported check on that head is successful. `--operator-approved` records
+   the fresh user authorization for this exact PR and head. After approval,
+   `jinon86` (the local account) merges normally in step 6.
 
    **Direction B — `seoseo-ai`-authored PR, `jinon86` reviews (via Seoseo):**
 
+   Same helper, opposite profile:
+
    ```bash
+   head_sha="$(gh pr view <n> --repo <owner/repo> --json headRefOid --jq .headRefOid)"
    CCC_EXPLICIT_USER_APPROVAL=1 \
-     "$GH_PR_FLOW_DIR/approve-via-seoseo.sh" <owner/repo> <pr-number>
+     bash "$SEOSEO_FLOW_DIR/approve-via-seoseo.sh" \
+     --review-profile jinon86 --repo <owner/repo> --pr <n> \
+     --expected-head "$head_sha" --operator-approved
    ```
 
-   The helper accepts only `jinwon-int/*`, verifies the remote actor is
-   `jinon86`, and requires an open `main` PR authored by `seoseo-ai` with
-   `jinon86` requested. It refuses self-review and returns only safe review
-   status. The GitHub credential remains behind Seoseo's `gh` session boundary.
+   It runs `gh` on Seoseo with the root-owned `jinon86` config and fail-closes
+   unless the remote actor is `jinon86`, the open default-branch PR is authored
+   by `seoseo-ai` with `jinon86` requested, the head matches `--expected-head`
+   exactly, the PR is mergeable, and every reported check on that head is
+   successful. The approval is commit-bound and the credential never leaves
+   Seoseo.
 
 6. With required review and checks green, squash-merge normally:
 
@@ -141,7 +170,7 @@ fresh explicit user approval in the current conversation, in both directions.
    gh pr merge <n> --repo <owner/repo> --squash --delete-branch
    ```
 
-   If local `seoseo-ai` lacks repository merge permission, use the exact-head
+   If the local identity lacks repository merge permission, use the exact-head
    Seoseo merge fallback below. Do not weaken branch protection.
 
    **`mergeable: UNKNOWN` is "not computed yet", not "blocked".** GitHub builds
@@ -249,10 +278,12 @@ permission is unavailable, report it rather than moving a credential.
   Run `gh` on Seoseo so the credential stays there. Do not enable shell trace,
   switch the persistent local account, or put credentials in arguments,
   commits, PR text, logs, or memory.
-- The local `seoseo-ai` secondary credential follows the same discipline: use
-  it only through `approve-as-seoseo-ai.sh`, which scopes the token to its own
-  process for a single approved invocation. Never print it, never `gh auth
-  switch` to it, and never reuse one approval for a second invocation.
+- The Seoseo-held `seoseo-ai` profile credential follows the same discipline:
+  use it only through the exact-head `approve-via-seoseo.sh` profile helper,
+  which runs `gh` on Seoseo with the isolated profile config for a single
+  approved invocation. Never print it, never copy it off Seoseo, never
+  `gh auth switch` to it, and never reuse one approval for a second invocation
+  or a different head.
 - An approval flag records a fresh user decision; it does not grant standing
   authority. Set it for one approved invocation only. Review approval and merge
   approval are separate privileged writes unless the user's current instruction
