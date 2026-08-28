@@ -826,7 +826,18 @@ class Doctor:
         }
         budget_name = f"CCC_USAGE_BUDGET_TOKENS_{effective.upper()}"
         try:
-            budget = int(os.environ.get(budget_name, "0") or 0)
+            # Fleet sweeps and systemd-run transient units run doctor from a
+            # clean login shell, while the live bridge can receive its budget
+            # from the unit's drop-ins (#1318). Resolve the budget through the
+            # same trusted unit fallback as CCC_PIRI_CLI_PATH below: only a
+            # unit whose ExecStart matches this checkout's bridge root is
+            # consulted, so a stale twin checkout cannot leak its budget in.
+            budget_raw = (
+                os.environ.get(budget_name)
+                or self.bridge_unit_environment_value(budget_name)
+                or "0"
+            )
+            budget = int(budget_raw or 0)
         except ValueError:
             budget = 0
         if not allow_unbounded and (not meter_enabled or budget <= 0):
