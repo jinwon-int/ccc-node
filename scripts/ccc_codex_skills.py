@@ -176,7 +176,12 @@ def _frontmatter(path: Path) -> dict[str, str]:
         if key in values or not value:
             raise ContractError("codex_skill_invalid")
         values[key] = value
-    if set(values) != {"name", "description"}:
+    if set(values) not in (
+        {"name", "description"},
+        {"name", "description", "status"},
+    ):
+        raise ContractError("codex_skill_invalid")
+    if "status" in values and values["status"] not in {"active", "deprecated"}:
         raise ContractError("codex_skill_invalid")
     if not _NAME_RE.fullmatch(values["name"]):
         raise ContractError("codex_skill_invalid")
@@ -287,6 +292,12 @@ def _managed_skill_entries(
         frontmatter = _frontmatter(source / "SKILL.md")
         if frontmatter["name"] != name:
             raise ContractError("codex_skill_invalid")
+        if frontmatter.get("status") == "deprecated":
+            # Lifecycle (#1338): a deprecated managed skill stays in the repo
+            # and in the catalog until an operator removes it, but it is no
+            # longer provisioned to any node.
+            seen.add(name)
+            continue
         source_files = _source_files(source)
         if not (source / "agents" / "openai.yaml").is_file():
             raise ContractError("codex_skill_invalid")

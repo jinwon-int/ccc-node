@@ -11,6 +11,7 @@ Living operator docs stay at the top level of `docs/`; historical closeouts and 
 | [`security-audit.md`](security-audit.md) | Read-only security audit and fleet matrix reporting. |
 | [`agent-cron.md`](agent-cron.md) | Durable local task definitions, due/lock/run/scheduler commands. |
 | [`skill-autosave.md`](skill-autosave.md) | Hermes-style auto-skillification: skill-review hook, daily sweep cron, Telegram approval flow. |
+| [`skill-registry.md`](skill-registry.md) | Generated single registry over all repo skill sources; CI-enforced freshness; lifecycle `status` field (#1338). |
 | [`codex-managed-skills.md`](codex-managed-skills.md) | Static Codex operating-skill catalog, safe provisioning, collision policy, and rollback. |
 | [`lifecycle-observability.md`](lifecycle-observability.md) | Provider-neutral lifecycle observation contract, shared redaction, owner-only audit ledger (#645). |
 | [`approval-audit.md`](approval-audit.md) | Provider-neutral approval snapshots, request/display binding, and body-free owner audit metrics (#870). |
