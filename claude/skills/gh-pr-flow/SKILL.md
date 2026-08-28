@@ -21,7 +21,7 @@ symmetrically:
 | PR author | Reviewer / merger | Mechanism |
 |---|---|---|
 | `jinon86` | `seoseo-ai` reviews; `jinon86` merges | `approve-via-seoseo.sh --review-profile seoseo-ai` (Seoseo-held profile, exact-head) |
-| `seoseo-ai` | `jinon86` reviews and, if needed, merges | `approve-via-seoseo.sh --review-profile jinon86` / `merge-via-seoseo.sh` (Seoseo-held session over SSH) |
+| `seoseo-ai` | `jinon86` reviews and, if needed, merges | `approve-via-seoseo.sh --review-profile jinon86` (exact-head) / `merge-via-seoseo.sh` (Seoseo-held session over SSH) |
 
 Every cross-account review or merge is a privileged credential use and needs
 fresh explicit user approval in the current conversation, in both directions.
@@ -113,8 +113,9 @@ fresh explicit user approval in the current conversation, in both directions.
    **Direction A — `jinon86`-authored PR, `seoseo-ai` reviews (Seoseo-held
    profile):**
 
-   The profile helper ships with the managed Codex skills that `setup.sh`
-   installs on every node. Resolve it first, with template-checkout fallback:
+   Both directions use the same exact-head profile helper. It ships with the
+   managed Codex skills that `setup.sh` installs on every node. Resolve it
+   first, with template-checkout fallback:
 
    ```bash
    SEOSEO_FLOW_DIR="${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts"
@@ -146,15 +147,22 @@ fresh explicit user approval in the current conversation, in both directions.
 
    **Direction B — `seoseo-ai`-authored PR, `jinon86` reviews (via Seoseo):**
 
+   Same helper, opposite profile:
+
    ```bash
+   head_sha="$(gh pr view <n> --repo <owner/repo> --json headRefOid --jq .headRefOid)"
    CCC_EXPLICIT_USER_APPROVAL=1 \
-     "$GH_PR_FLOW_DIR/approve-via-seoseo.sh" <owner/repo> <pr-number>
+     bash "$SEOSEO_FLOW_DIR/approve-via-seoseo.sh" \
+     --review-profile jinon86 --repo <owner/repo> --pr <n> \
+     --expected-head "$head_sha" --operator-approved
    ```
 
-   The helper accepts only `jinwon-int/*`, verifies the remote actor is
-   `jinon86`, and requires an open `main` PR authored by `seoseo-ai` with
-   `jinon86` requested. It refuses self-review and returns only safe review
-   status. The GitHub credential remains behind Seoseo's `gh` session boundary.
+   It runs `gh` on Seoseo with the root-owned `jinon86` config and fail-closes
+   unless the remote actor is `jinon86`, the open default-branch PR is authored
+   by `seoseo-ai` with `jinon86` requested, the head matches `--expected-head`
+   exactly, the PR is mergeable, and every reported check on that head is
+   successful. The approval is commit-bound and the credential never leaves
+   Seoseo.
 
 6. With required review and checks green, squash-merge normally:
 
@@ -162,7 +170,7 @@ fresh explicit user approval in the current conversation, in both directions.
    gh pr merge <n> --repo <owner/repo> --squash --delete-branch
    ```
 
-   If local `seoseo-ai` lacks repository merge permission, use the exact-head
+   If the local identity lacks repository merge permission, use the exact-head
    Seoseo merge fallback below. Do not weaken branch protection.
 
    **`mergeable: UNKNOWN` is "not computed yet", not "blocked".** GitHub builds
