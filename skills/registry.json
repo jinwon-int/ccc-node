@@ -114,17 +114,6 @@
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Trace an unexplained GitHub metered-billing charge (GHAS/Secret Protection, Actions minutes) to the exact product, SKU, repo and day; separate gross from net, reconcile the meter against entitlement APIs and the payment receipt, and stop the bleed. Use when an org's GitHub bill is higher than expected, when a billing alert fires, when asked where a charge comes from or whether a feature is still being billed, or when deciding between Team and Enterprise on Actions minutes.",
-      "files": 1,
-      "managed": false,
-      "name": "github-metered-billing-leak-diagnosis",
-      "source": "claude/skills/github-metered-billing-leak-diagnosis",
-      "status": "active",
-      "tree_sha256": "84eae59c5bebde9215d3595c8cba9410486ab511d982291ce4698a742c2a2478"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
       "description": "Produce a Korean HWP/HWPX document that inherits an institutional form's exact formatting on Linux without Hangul Office, by choosing between template-inheritance build (hwp-forge hwpx_template_build.py) and donor-restore surgery (reuse a known-good prior .hwpx as donor and edit Contents/section0.xml while reusing its paraPr/charPr/borderFill IDs), then verifying with an independent parser. Use when asked to generate, revise, or re-issue a .hwp/.hwpx report or official form (기관 양식, 보고서, 붙임 서식) on a server, when a previous revision must be amended in place, or when hand-written zip/XML surgery scripts keep being re-invented per document.",
       "files": 1,
       "managed": false,
@@ -132,17 +121,6 @@
       "source": "claude/skills/hwp-forge-donor-template-restore-build",
       "status": "active",
       "tree_sha256": "7871592f953aa4faf517f261e336edf5dd9598412304c888be0077658cab07df"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Make an opt-in installer flag survive self-update by materializing it into the ccc.install-record.v1 argv, then re-run the installer on each node so its record carries the flag. Use when adding an opt-in flag to a ccc-node installer, when an approved per-node setting silently reverted, or when a managed cron line is missing on nodes that should have it.",
-      "files": 1,
-      "managed": false,
-      "name": "install-record-flag-materialization",
-      "source": "claude/skills/install-record-flag-materialization",
-      "status": "active",
-      "tree_sha256": "20e8547ce7a4f008b6e0f4760fa5fdf89f0afa4d8bff079bd33d7e49db4623a4"
     },
     {
       "audience": "claude",

@@ -1,6 +1,12 @@
----
-name: github-metered-billing-leak-diagnosis
-description: Trace an unexplained GitHub metered-billing charge (GHAS/Secret Protection, Actions minutes) to the exact product, SKU, repo and day; separate gross from net, reconcile the meter against entitlement APIs and the payment receipt, and stop the bleed. Use when an org's GitHub bill is higher than expected, when a billing alert fires, when asked where a charge comes from or whether a feature is still being billed, or when deciding between Team and Enterprise on Actions minutes.
+# [ARCHIVED SKILL] github-metered-billing-leak-diagnosis
+
+> **Archived:** 2026-08-28 — retroactive skill audit round 1 (ccc-node#1347).  
+> **Reason:** 일회성 과금 사건 진단(해결됨). 2026-08-28 감사(#1347)에서 본 노드 직접 로드 0건 확인. GitHub 과금 재조사 시 참조용.  
+> **Original location:** `claude/skills/github-metered-billing-leak-diagnosis/SKILL.md`  
+> **Original description:** Trace an unexplained GitHub metered-billing charge (GHAS/Secret Protection, Actions minutes) to the exact product, SKU, repo and day; separate gross from net, reconcile the meter against entitlement APIs and the payment receipt, and stop the bleed. Use when an org's GitHub bill is higher than expected, when a billing alert fires, when asked where a charge comes from or whether a feature is still being billed, or when deciding between Team and Enterprise on Actions minutes.
+
+Skill routing에서 퇴역해 세션 컨텍스트에 더는 노출되지 않는다. 내용은 참조용으로 보존.
+
 ---
 
 # GitHub metered-billing leak diagnosis

@@ -1,6 +1,12 @@
----
-name: install-record-flag-materialization
-description: Make an opt-in installer flag survive self-update by materializing it into the ccc.install-record.v1 argv, then re-run the installer on each node so its record carries the flag. Use when adding an opt-in flag to a ccc-node installer, when an approved per-node setting silently reverted, or when a managed cron line is missing on nodes that should have it.
+# [ARCHIVED SKILL] install-record-flag-materialization
+
+> **Archived:** 2026-08-28 — retroactive skill audit round 1 (ccc-node#1347).  
+> **Reason:** 일회성 설치자 절차(해결됨). 2026-08-28 감사(#1347)에서 본 노드 직접 로드 0건 확인.  
+> **Original location:** `claude/skills/install-record-flag-materialization/SKILL.md`  
+> **Original description:** Make an opt-in installer flag survive self-update by materializing it into the ccc.install-record.v1 argv, then re-run the installer on each node so its record carries the flag. Use when adding an opt-in flag to a ccc-node installer, when an approved per-node setting silently reverted, or when a managed cron line is missing on nodes that should have it.
+
+Skill routing에서 퇴역해 세션 컨텍스트에 더는 노출되지 않는다. 내용은 참조용으로 보존.
+
 ---
 
 # When to Use
