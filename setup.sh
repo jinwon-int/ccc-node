@@ -975,8 +975,9 @@ cat <<'EOF'
   6. Auth GitHub:  gh auth login   (or place token per node policy; never commit it).
   7. Start a fresh Claude Code session and confirm the SessionStart snapshot injects.
   8. (Optional) MCP tool servers: ./claude/mcp-setup.sh
-     Registers searxng (Tailnet SearXNG) + context7 (docs) + firecrawl (web scrape;
-     key read from ~/.hermes/.env). Idempotent; tool perms pre-allowed in settings.json.
+     Registers searxng (explicit Tailnet fallback) + context7 (docs) + firecrawl
+     (search + scrape; key read from ~/.hermes/.env). Idempotent; tool perms
+     pre-allowed in settings.json.
   9. (Optional) Telegram bridge: cd bridge && cp .env.example .env && edit, then
      ./start.sh --path $BRIDGE_DEFAULT_PATH -d   (daemon-supervised). See bridge/README.md.
      Linux reboot-persistence: ./start.sh --path $BRIDGE_DEFAULT_PATH --install-systemd   (systemd unit).

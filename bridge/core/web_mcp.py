@@ -1,4 +1,4 @@
-"""Curated SearXNG search + Firecrawl fetch/developer routing for Claude."""
+"""Curated Firecrawl search + scrape/developer routing, with explicit SearXNG fallback."""
 
 from __future__ import annotations
 
@@ -22,14 +22,17 @@ WEB_ROUTING_PROMPT = """
 
 ## Curated web routing
 
-- For every web search, use `mcp__searxng__searxng_web_search`.
+- For every general web search, use `mcp__firecrawl__firecrawl_search`.
+- Use `mcp__searxng__searxng_web_search` only as an explicit fallback: Korean
+  or Naver-oriented lookup, Tailnet-local privacy, or when Firecrawl search
+  failed. Do not switch silently; pick the tool explicitly.
 - For every known-URL fetch, read, scrape, or extraction, use
   `mcp__firecrawl__firecrawl_scrape`.
 - For public developer artifacts (documentation, repository READMEs, issues,
   and merged pull requests), use
   `mcp__firecrawl__firecrawl_developer_search`.
-- Claude's built-in WebSearch/WebFetch, Firecrawl general search, and SearXNG
-  URL fetch are unavailable in this mode. Do not claim that you used them.
+- Claude's built-in WebSearch/WebFetch and SearXNG URL fetch are unavailable
+  in this mode. Do not claim that you used them.
 """
 
 FIRECRAWL_ROUTING_PROMPT = """
@@ -139,6 +142,7 @@ def build_curated_web_mcp(settings: Any) -> dict[str, Any] | None:
         },
         "process_env": {"FIRECRAWL_API_KEY": firecrawl_key},
         "allowed_tools": [
+            FIRECRAWL_SEARCH_TOOL,
             SEARXNG_SEARCH_TOOL,
             FIRECRAWL_SCRAPE_TOOL,
             FIRECRAWL_DEVELOPER_SEARCH_TOOL,
@@ -146,7 +150,6 @@ def build_curated_web_mcp(settings: Any) -> dict[str, Any] | None:
         "disallowed_tools": [
             *NATIVE_WEB_TOOLS,
             SEARXNG_FETCH_TOOL,
-            FIRECRAWL_SEARCH_TOOL,
         ],
         "system_prompt": WEB_ROUTING_PROMPT,
     }

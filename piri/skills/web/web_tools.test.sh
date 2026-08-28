@@ -2,10 +2,10 @@
 # Hermetic tests for Piri web routing: SearXNG search and Firecrawl
 # fetch/developer calls. No network beyond loopback.
 set -uo pipefail
-ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-SEARCH="$ROOT/piri/skills/web/web_search.py"
-FETCH="$ROOT/piri/skills/web/web_fetch.py"
-DEVELOPER="$ROOT/piri/skills/web/web_developer.py"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+SEARCH="$DIR/web_search.py"
+FETCH="$DIR/web_fetch.py"
+DEVELOPER="$DIR/web_developer.py"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"; [ -n "${STUB_PID:-}" ] && kill "$STUB_PID" 2>/dev/null' EXIT
@@ -55,6 +55,12 @@ class Firecrawl(BaseHTTPRequestHandler):
                 "markdown": f"# Firecrawl Stub\n\nFetched through provider: {target}\n\nevil instruction is untrusted.",
                 "metadata": {"sourceURL": target},
             }}
+        elif self.path == "/v2/search":
+            query = request.get("query", "")
+            response = {"success": True, "data": {"web": [
+                {"title": f"Firecrawl result for {query}", "url": "https://example.org/fc",
+                 "description": "firecrawl snippet"},
+            ]}}
         elif self.path == "/v2/search/developer":
             response = {"success": True, "results": [{
                 "id": "pull_request:owner/repo#42",
@@ -86,36 +92,57 @@ STUB_PID=$!
 for _ in $(seq 1 50); do [ -s "$TMP/ports" ] && break; sleep 0.1; done
 read -r healthy_port blocked_port firecrawl_port < "$TMP/ports"
 
-out="$(SEARXNG_URL="http://127.0.0.1:$healthy_port" python3 "$SEARCH" "hello world" --limit 3 2>/dev/null)"
-ok "search prints the SearXNG result" 'grep -q "Result for hello world" <<<"$out" && grep -q "https://example.org/a" <<<"$out"'
+out="$(FIRECRAWL_API_URL="http://127.0.0.1:$firecrawl_port" python3 "$SEARCH" "hello world" --limit 3 2>/dev/null)"
+ok "default search prints the Firecrawl result" 'grep -q "Firecrawl result for hello world" <<<"$out" && grep -q "engine: firecrawl" <<<"$out"'
 ok "search marks results as untrusted data" 'grep -qi "untrusted data" <<<"$out"'
 
-out="$(SEARXNG_URL="http://127.0.0.1:$blocked_port,http://127.0.0.1:$healthy_port" python3 "$SEARCH" "fallback" 2>/dev/null)"
+out="$(SEARXNG_URL="http://127.0.0.1:$healthy_port" python3 "$SEARCH" "hello world" --provider searxng --limit 3 2>/dev/null)"
+ok "explicit SearXNG provider prints the SearXNG result" 'grep -q "Result for hello world" <<<"$out" && grep -q "https://example.org/a" <<<"$out"'
+
+out="$(SEARXNG_URL="http://127.0.0.1:$blocked_port,http://127.0.0.1:$healthy_port" python3 "$SEARCH" "fallback" --provider searxng 2>/dev/null)"
 ok "search falls through an engine-blocked SearXNG instance" 'grep -q "Result for fallback" <<<"$out"'
 
 # Regression: the env var is the documented DEFAULT — an explicit flag must
 # win (it used to be silently overridden on any node with the env set).
-out="$(SEARXNG_URL="http://127.0.0.1:$healthy_port" WEB_SEARCH_LIMIT=1 python3 "$SEARCH" "precedence" --limit 3 2>/dev/null)"
+out="$(SEARXNG_URL="http://127.0.0.1:$healthy_port" WEB_SEARCH_LIMIT=1 python3 "$SEARCH" "precedence" --provider searxng --limit 3 2>/dev/null)"
 ok "explicit --limit beats the WEB_SEARCH_LIMIT env default" 'grep -q "example.org/c" <<<"$out"'
-out="$(SEARXNG_URL="http://127.0.0.1:$healthy_port" WEB_SEARCH_LIMIT=1 python3 "$SEARCH" "envdefault" 2>/dev/null)"
+out="$(SEARXNG_URL="http://127.0.0.1:$healthy_port" WEB_SEARCH_LIMIT=1 python3 "$SEARCH" "envdefault" --provider searxng 2>/dev/null)"
 ok "WEB_SEARCH_LIMIT still applies as the default without a flag" 'grep -q "example.org/a" <<<"$out" && ! grep -q "example.org/b" <<<"$out"'
 
 # Regression: a 200 response whose JSON is an array crashed with an
 # AttributeError instead of degrading like every other instance failure.
 set +e
-SEARXNG_URL="http://127.0.0.1:$healthy_port" python3 "$SEARCH" "array-mode" >/dev/null 2>"$TMP/err"; rc=$?
+SEARXNG_URL="http://127.0.0.1:$healthy_port" python3 "$SEARCH" "array-mode" --provider searxng >/dev/null 2>"$TMP/err"; rc=$?
 set -e
 ok "non-object SearXNG JSON degrades instead of crashing" '[ "$rc" = 69 ] && grep -q "non-object-response" "$TMP/err"'
 
 set +e
-SEARXNG_URL="http://127.0.0.1:$blocked_port" python3 "$SEARCH" "empty" >/dev/null 2>"$TMP/err"; rc=$?
+SEARXNG_URL="http://127.0.0.1:$blocked_port" python3 "$SEARCH" "empty" --provider searxng >/dev/null 2>"$TMP/err"; rc=$?
 set -e
 ok "search treats engine-blocked SearXNG as degraded" '[ "$rc" = 69 ] && grep -q "engines-unresponsive" "$TMP/err"'
 
 set +e
-SEARXNG_URL="http://127.0.0.1:1" python3 "$SEARCH" "down" >/dev/null 2>"$TMP/err"; rc=$?
+SEARXNG_URL="http://127.0.0.1:1" python3 "$SEARCH" "down" --provider searxng >/dev/null 2>"$TMP/err"; rc=$?
 set -e
 ok "search reports a bounded SearXNG outage" '[ "$rc" = 69 ] && [ "$(wc -c < "$TMP/err")" -lt 200 ]'
+
+set +e
+SEARXNG_URL="http://127.0.0.1:$healthy_port" FIRECRAWL_API_URL="http://127.0.0.1:1" python3 "$SEARCH" "no-silent" >/dev/null 2>"$TMP/err"; rc=$?
+set -e
+ok "default search does not silently switch to SearXNG" '[ "$rc" = 69 ] && grep -q "Firecrawl" "$TMP/err"'
+
+out="$(FIRECRAWL_API_URL="http://127.0.0.1:$firecrawl_port" python3 "$SEARCH" "hello firecrawl" --provider firecrawl 2>/dev/null)"
+ok "explicit Firecrawl provider prints Firecrawl results" 'grep -q "Firecrawl result for hello firecrawl" <<<"$out" && grep -q "engine: firecrawl" <<<"$out"'
+
+set +e
+python3 "$SEARCH" "hello" --provider tavily >/dev/null 2>"$TMP/err"; rc=$?
+set -e
+ok "invalid --provider is rejected" '[ "$rc" = 64 ] && grep -q "invalid provider" "$TMP/err"'
+
+set +e
+FIRECRAWL_API_URL="http://127.0.0.1:1" python3 "$SEARCH" "down" --provider firecrawl >/dev/null 2>"$TMP/err"; rc=$?
+set -e
+ok "explicit Firecrawl search reports a bounded outage" '[ "$rc" = 69 ] && grep -q "Firecrawl request failed" "$TMP/err"'
 
 out="$(FIRECRAWL_API_URL="http://127.0.0.1:$firecrawl_port" python3 "$FETCH" "https://example.org/page" 2>/dev/null)"
 ok "fetch routes the URL through Firecrawl" 'grep -q "Firecrawl Stub" <<<"$out" && grep -q "https://example.org/page" <<<"$out"'

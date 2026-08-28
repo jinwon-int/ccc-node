@@ -586,9 +586,10 @@ class Config(
         default="off",
         alias="CCC_BRIDGE_WEB_MCP_MODE",
         description=(
-            "Opt-in curated bridge web routing. searxng-firecrawl injects SearXNG "
-            "search + Firecrawl scrape; firecrawl injects Firecrawl search + scrape "
-            "only (no SearXNG). Neither loads user filesystem settings."
+            "Opt-in curated bridge web routing. searxng-firecrawl injects Firecrawl "
+            "search + scrape + Developer Index, with SearXNG search as explicit "
+            "fallback; firecrawl injects Firecrawl search + scrape only (no SearXNG). "
+            "Neither loads user filesystem settings."
         ),
     )
     bridge_searxng_url: Optional[str] = Field(

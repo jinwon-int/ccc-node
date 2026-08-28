@@ -24,7 +24,11 @@ from telegram_bot.core.claude_runtime import (
     _classify_cli_stderr,
 )
 from telegram_bot.core.memory_audience import MemoryAudience
-from telegram_bot.core.web_mcp import FIRECRAWL_SCRAPE_TOOL, SEARXNG_SEARCH_TOOL
+from telegram_bot.core.web_mcp import (
+    FIRECRAWL_SCRAPE_TOOL,
+    FIRECRAWL_SEARCH_TOOL,
+    SEARXNG_SEARCH_TOOL,
+)
 
 
 async def _reject(_tool_name, _tool_input, _context):
@@ -253,6 +257,7 @@ def test_curated_web_mcp_replaces_native_web_tools(tmp_path: Path) -> None:
         settings=_settings(tmp_path, bridge_web_mcp_mode="searxng-firecrawl")
     )
     options = _build(runtime, tmp_path)
+    assert FIRECRAWL_SEARCH_TOOL in options.allowed_tools
     assert SEARXNG_SEARCH_TOOL in options.allowed_tools
     assert FIRECRAWL_SCRAPE_TOOL in options.allowed_tools
     assert "WebSearch" not in options.allowed_tools

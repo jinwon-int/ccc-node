@@ -46,6 +46,7 @@ def test_curated_web_mcp_builds_search_scrape_and_developer_index(tmp_path: Path
     options = build_curated_web_mcp(_settings(tmp_path))
     assert options is not None
     assert options["allowed_tools"] == [
+        FIRECRAWL_SEARCH_TOOL,
         SEARXNG_SEARCH_TOOL,
         FIRECRAWL_SCRAPE_TOOL,
         FIRECRAWL_DEVELOPER_SEARCH_TOOL,
@@ -54,8 +55,9 @@ def test_curated_web_mcp_builds_search_scrape_and_developer_index(tmp_path: Path
         "WebSearch",
         "WebFetch",
         SEARXNG_FETCH_TOOL,
-        FIRECRAWL_SEARCH_TOOL,
     ]
+    assert FIRECRAWL_SEARCH_TOOL in options["system_prompt"]
+    assert "silently" in options["system_prompt"]
     assert options["mcp_servers"]["searxng"]["env"] == {
         "SEARXNG_URL": "https://search.example.com"
     }
