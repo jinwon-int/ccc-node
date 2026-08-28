@@ -6,8 +6,10 @@ reaches ``SNAPSHOT_DONE``) and stages skill candidates through the idempotent
 ``SkillCandidateSink``. It never claims, advances, or mutates a distill job, so
 the memory-distill pipeline is unaffected whether or not this collector runs.
 
-Codex nodes compose this worker by default. A node can opt out with
-``CCC_CODEX_SKILL_COLLECTOR=false``; Claude nodes never compose it.
+Codex and Piri nodes compose this worker (one instance per provider, bound to
+that provider's journal jobs and install target). A node can opt out with
+``CCC_CODEX_SKILL_COLLECTOR=false`` / ``CCC_PIRI_SKILL_COLLECTOR=false``;
+Claude nodes never compose it.
 """
 
 from __future__ import annotations
@@ -77,8 +79,12 @@ class SkillCandidateCollectorWorker:
         backend: SkillCandidateBackend,
         sink: SkillCandidateSink,
         usage_meter: _AutonomousSpendGate | None,
+        provider: str = "codex",
         clock: Callable[[], float] = time.time,
     ) -> None:
+        if provider not in {"codex", "piri"}:
+            raise ValueError("unsupported skill-candidate collector provider")
+        self._provider = provider
         self._journal = journal
         self._backend = backend
         self._sink = sink
@@ -119,7 +125,7 @@ class SkillCandidateCollectorWorker:
 
         job = await asyncio.to_thread(self._journal.get, job_id)
         snapshot = getattr(job, "snapshot", None)
-        if snapshot is None or getattr(job, "provider", None) != "codex":
+        if snapshot is None or getattr(job, "provider", None) != self._provider:
             return None
         # A non-blocking per-job lease closes the preflight/provider TOCTOU
         # across bridge processes. Contenders defer instead of waiting and
@@ -134,7 +140,7 @@ class SkillCandidateCollectorWorker:
                 return None
             provenance = DistillProvenance.model_validate(
                 {
-                    "provider": "codex",
+                    "provider": self._provider,
                     "source_thread_hash": job.thread_hash,
                     "trigger": job.trigger,
                     "distilled_at": job.updated_at,
@@ -153,7 +159,7 @@ class SkillCandidateCollectorWorker:
                     # this is an atomic gate; with budget=0 it still records
                     # body-free autonomous use.
                     reservation = self._usage_meter.reserve_autonomous_spend(
-                        "codex",
+                        self._provider,
                         input_tokens=(
                             _RESERVED_OVERHEAD_TOKENS
                             + len(SKILL_CANDIDATE_PROMPT.encode("utf-8"))

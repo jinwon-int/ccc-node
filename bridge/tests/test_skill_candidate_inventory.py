@@ -64,6 +64,18 @@ def _builder(skills: Path, state: Path) -> SkillCandidateInventoryBuilder:
     )
 
 
+def test_from_environment_resolves_piri_skills_dir() -> None:
+    env = {
+        "HOME": "/home/operator",
+        "PIRI_CODING_AGENT_DIR": "/home/operator/.piri/agent",
+    }
+    builder = SkillCandidateInventoryBuilder.from_environment(env, provider="piri")
+    assert builder._skills_dir == Path("/home/operator/.piri/agent/skills")
+    assert SkillCandidateInventoryBuilder.from_environment(env)._skills_dir == Path(
+        "/home/operator/.codex/skills"
+    )
+
+
 def test_inventory_exposes_only_bounded_autonomous_content(tmp_path: Path) -> None:
     skills, state = _make_managed_skill(tmp_path)
     references = skills / "existing-skill" / "references"

@@ -4,6 +4,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Added
+- **Piri skill-candidate provider (#667 extension).** The skill-autosave
+  pipeline now covers Piri nodes end to end: `provider.sh` resolves an
+  explicit-only `piri` provider (install target
+  `~/.piri/agent/skills`), `ownership.py` tracks piri provenance, the
+  collector worker accepts `provider="piri"` journal jobs, and a new
+  `RuntimeCliSkillCandidateBackend` drives the ephemeral Claude/Piri CLI
+  isolation with the skill-candidate contract. Piri nodes compose the
+  collector by default (`CCC_PIRI_SKILL_COLLECTOR=false` opts out); the
+  shared non-Claude compatibility screen applies to piri installs.
+
 ### Changed
 - **Legacy AUTO.md boundary in the batch publisher (#1301).** Existing Wiki
   blocks from before status/pipeline metadata are preserved by stable key

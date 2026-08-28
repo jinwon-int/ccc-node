@@ -123,6 +123,17 @@ ok "adopt audit has durable prepared and terminal phases" 'jq -s -e "[.[] | sele
 tool rollback-check user-one >/dev/null 2>&1; rc=$?
 ok "adopted user skill is never rollback eligible" '[ "$rc" != 0 ]'
 
+# Piri provider shares the provenance contract with its own skills dir.
+make_skill piri-owned-one
+tool_piri() {
+  python3 "$TOOL" --provider piri --skills-dir "$SKILLS" --state-dir "$STATE" "$@"
+}
+out="$(tool_piri mark-created piri-owned-one)"
+ok "piri mark-created installs v2 provenance" 'jq -e ".ok == true and .changed == true" >/dev/null <<<"$out"'
+ok "piri marker records the piri provider" 'jq -e ".provider == \"piri\" and .ownership == \"autosave-managed\"" "$SKILLS/piri-owned-one/.autosave-meta.json" >/dev/null'
+out="$(tool_piri status piri-owned-one)"
+ok "piri classification is autosave-managed" 'jq -e ".skills[0].classification == \"autosave-managed\"" >/dev/null <<<"$out"'
+
 # V2 ccc-node rollback validation and archive rename share one ownership lock.
 make_skill rollback-one
 tool mark-created rollback-one >/dev/null

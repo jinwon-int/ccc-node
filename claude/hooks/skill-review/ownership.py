@@ -190,7 +190,7 @@ def _validate_name(name: str) -> None:
 
 def _provider_from_env() -> str:
     explicit = os.environ.get("CCC_SKILL_PROVIDER", "")
-    if explicit in {"claude", "codex"}:
+    if explicit in {"claude", "codex", "piri"}:
         return explicit
     home = Path(os.environ.get("HOME", "/root"))
     if (
@@ -204,7 +204,7 @@ def _provider_from_env() -> str:
 
 def _build_context(args: argparse.Namespace) -> Context:
     provider = args.provider or _provider_from_env()
-    if provider not in {"claude", "codex"}:
+    if provider not in {"claude", "codex", "piri"}:
         raise ContractError("invalid_provider")
     home = Path(os.environ.get("HOME", "/root"))
     claude_dir = Path(os.environ.get("CCC_CLAUDE_DIR", home / ".claude"))
@@ -213,6 +213,9 @@ def _build_context(args: argparse.Namespace) -> Context:
     elif provider == "codex":
         codex_home = Path(os.environ.get("CODEX_HOME", home / ".codex"))
         skills_dir = Path(os.environ.get("CODEX_SKILLS_DIR", codex_home / "skills"))
+    elif provider == "piri":
+        piri_agent = Path(os.environ.get("PIRI_CODING_AGENT_DIR", home / ".piri" / "agent"))
+        skills_dir = Path(os.environ.get("PIRI_SKILLS_DIR", piri_agent / "skills"))
     else:
         skills_dir = Path(os.environ.get("CLAUDE_SKILLS_DIR", claude_dir / "skills"))
     # Node-global anchor, not CCC_STATE_DIR: the bridge scopes that per memory
@@ -3628,7 +3631,7 @@ def _command_apply_proposal(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--provider", choices=("claude", "codex"))
+    parser.add_argument("--provider", choices=("claude", "codex", "piri"))
     parser.add_argument("--skills-dir", type=Path)
     parser.add_argument("--state-dir", type=Path)
     subparsers = parser.add_subparsers(dest="command", required=True)
