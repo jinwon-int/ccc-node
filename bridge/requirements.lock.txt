@@ -386,9 +386,9 @@ mcp==1.29.0 \
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   claude-agent-sdk
-openai==3.2.0 \
-    --hash=sha256:1d26bd6f49738f6848bcce370794ee03acc0561d468070df010b44178da8e797 \
-    --hash=sha256:e97a64a2df665460fbb1f23adbe3e4b717f6ac04b5740552889ad1d8dd9025c2
+openai==3.3.1 \
+    --hash=sha256:6f22807de1a976c932cecda620e8172a8c3fdbaeed29c7f21564e0c2410edf56 \
+    --hash=sha256:9652df7fdf8ee6f5bd58e0a12f2b1d414a18e0f06bb7a9a57c8643a5f5469bd3
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   ccc-telegram-bridge (bridge/pyproject.toml)
