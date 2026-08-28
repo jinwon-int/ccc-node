@@ -10,8 +10,10 @@ import unittest
 from telegram_bot.core.async_completion_delivery import (
     MAX_COMPLETION_TEXT_BYTES,
     AsyncCompletionDeliveryCoordinator,
+    AsyncCompletionReclaimer,
     bounded_completion_text,
     format_completion_notice,
+    format_reclaim_notice,
 )
 from telegram_bot.core.async_completion_event import (
     NormalizedAsyncCompletionEvent,
@@ -317,6 +319,155 @@ class TestCoordinatorDelivery(unittest.IsolatedAsyncioTestCase):
                 generation_probe=lambda user_id, chat_id: 0,
                 max_attempts=0,
             )
+
+
+class TestFormatReclaimNotice(unittest.TestCase):
+    def test_singular_and_plural(self):
+        self.assertIn("1 undelivered background completion from", format_reclaim_notice(1))
+        self.assertIn("3 undelivered background completions from", format_reclaim_notice(3))
+
+    def test_remaining_suffix(self):
+        notice = format_reclaim_notice(5, remaining=2)
+        self.assertIn("2 more on a later turn", notice)
+
+
+class TestReclaimerDelivery(unittest.IsolatedAsyncioTestCase):
+    """Next-turn body-free reclaim (#646 slice 3)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.journal = _make_journal(Path(self._tmp.name))
+
+    def _observe(self, turn_id, route="7:42", generation=4):
+        event = NormalizedAsyncCompletionEvent(
+            provider="codex",
+            thread_id="thread-aaaa",
+            conversation_route_id=route,
+            session_generation=generation,
+            turn_id=turn_id,
+        )
+        assert self.journal.observe(event, deliverable=True) is True
+        return event
+
+    async def test_reclaims_batch_and_marks_delivered(self):
+        self._observe("turn-1")
+        self._observe("turn-2")
+        sent = []
+
+        async def sender(user_id, chat_id, text):
+            sent.append((user_id, chat_id, text))
+            return True
+
+        reclaimer = AsyncCompletionReclaimer(self.journal, sender=sender)
+        reclaimed = await reclaimer.reclaim_for_route(7, 42)
+
+        self.assertEqual(reclaimed, 2)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("2 undelivered", sent[0][2])
+        for record in self.journal.list_records():
+            self.assertEqual(record.state, "delivered")
+            self.assertEqual(record.last_error_code, "body_free_reclaim")
+
+    async def test_other_routes_and_evidence_records_are_ignored(self):
+        self._observe("turn-1", route="7:42")
+        self._observe("turn-2", route="9:9")
+        evidence = NormalizedAsyncCompletionEvent(
+            provider="codex",
+            thread_id="thread-aaaa",
+            conversation_route_id="7:42",
+            session_generation=4,
+            turn_id="turn-3",
+        )
+        self.journal.observe(evidence)
+        sends = 0
+
+        async def sender(user_id, chat_id, text):
+            nonlocal sends
+            sends += 1
+            return True
+
+        reclaimer = AsyncCompletionReclaimer(self.journal, sender=sender)
+        self.assertEqual(await reclaimer.reclaim_for_route(7, 42), 1)
+        # A second drain for the same route finds nothing new.
+        self.assertEqual(await reclaimer.reclaim_for_route(7, 42), 0)
+        self.assertEqual(sends, 1)
+
+    async def test_cap_leaves_remaining_queued(self):
+        for index in range(7):
+            self._observe(f"turn-{index}")
+
+        async def sender(user_id, chat_id, text):
+            return True
+
+        reclaimer = AsyncCompletionReclaimer(
+            self.journal, sender=sender, max_per_turn=5
+        )
+        reclaimed = await reclaimer.reclaim_for_route(7, 42)
+
+        self.assertEqual(reclaimed, 5)
+        states = [r.state for r in self.journal.list_records()]
+        self.assertEqual(states.count("delivered"), 5)
+        self.assertEqual(states.count("queued"), 2)
+
+    async def test_send_failure_returns_records_to_retryable(self):
+        self._observe("turn-1")
+        self._observe("turn-2")
+
+        async def sender(user_id, chat_id, text):
+            return False
+
+        reclaimer = AsyncCompletionReclaimer(self.journal, sender=sender)
+        self.assertEqual(await reclaimer.reclaim_for_route(7, 42), 0)
+        for record in self.journal.list_records():
+            self.assertEqual(record.state, "retryable_failed")
+            self.assertEqual(record.last_error_code, "reclaim_send_failed")
+        # The next turn retries the retryable batch.
+
+        async def ok_sender(user_id, chat_id, text):
+            return True
+
+        retry = AsyncCompletionReclaimer(self.journal, sender=ok_sender)
+        self.assertEqual(await retry.reclaim_for_route(7, 42), 2)
+
+    async def test_lost_claim_race_is_skipped(self):
+        self._observe("turn-1")
+        event2 = self._observe("turn-2")
+        sends = 0
+
+        async def sender(user_id, chat_id, text):
+            nonlocal sends
+            sends += 1
+            return True
+
+        reclaimer = AsyncCompletionReclaimer(self.journal, sender=sender)
+        # Simulate a live delivery coordinator claiming turn-2 between the
+        # reclaimer's selection and its mark: the claim raises and the
+        # reclaimer must skip it without sending.
+        original_mark = self.journal.mark
+
+        def racing_mark(key, state, **kwargs):
+            if key == event2.idempotency_key and state == "claimed":
+                # The other coordinator wins the claim, then ours raises.
+                original_mark(key, state)
+                raise ValueError("async completion state transition is invalid")
+            return original_mark(key, state, **kwargs)
+
+        self.journal.mark = racing_mark  # type: ignore[method-assign]
+        reclaimed = await reclaimer.reclaim_for_route(7, 42)
+
+        self.assertEqual(reclaimed, 1)
+        self.assertEqual(sends, 1)
+        record = self.journal.get(event2.idempotency_key)
+        assert record is not None
+        self.assertEqual(record.state, "claimed")
+
+    def test_invalid_configuration_is_rejected(self):
+        async def sender(user_id, chat_id, text):
+            return True
+
+        with self.assertRaises(ValueError):
+            AsyncCompletionReclaimer(self.journal, sender=sender, max_per_turn=0)
 
 
 class TestTelegramSender(unittest.IsolatedAsyncioTestCase):

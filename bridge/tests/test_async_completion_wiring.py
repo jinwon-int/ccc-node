@@ -297,5 +297,116 @@ class TestDurableDeliveryWiring(unittest.IsolatedAsyncioTestCase):
         assert records[0].conversation_route_id is None
 
 
+class TestNextTurnReclaimWiring(unittest.IsolatedAsyncioTestCase):
+    """Slice-3 next-turn reclaim hook (#646): interactive only, fail-open."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.runtime = _DurableCapableRuntime()
+        self.handler = ProjectChatHandler(
+            settings=_settings(Path(self._tmp.name)), agent_runtime=self.runtime
+        )
+        self.journal = self.handler._async_completion_journal
+        assert self.journal is not None
+        self.journal.initialize()
+        self.sent: list[tuple[int, int, str]] = []
+
+        async def sender(user_id, chat_id, text):
+            self.sent.append((user_id, chat_id, text))
+            return True
+
+        self.handler.set_async_completion_sender(sender)
+
+    def _observe_route_bound(self, turn_id: str, route: str = "7:42") -> None:
+        from telegram_bot.core.async_completion_event import (
+            NormalizedAsyncCompletionEvent,
+        )
+
+        event = NormalizedAsyncCompletionEvent(
+            provider="codex",
+            thread_id="thread-aaaa",
+            conversation_route_id=route,
+            session_generation=4,
+            turn_id=turn_id,
+        )
+        assert self.journal.observe(event, deliverable=True) is True
+
+    async def test_interactive_turn_reclaims_body_free_once(self) -> None:
+        from telegram_bot.core.usage_meter import MODE_INTERACTIVE
+
+        self._observe_route_bound("turn-1")
+
+        await self.handler._maybe_reclaim_async_completions(
+            7, 42, MODE_INTERACTIVE
+        )
+
+        assert len(self.sent) == 1
+        assert "undelivered background completion" in self.sent[0][2]
+        records = self.journal.list_records()
+        assert records[0].state == "delivered"
+        assert records[0].last_error_code == "body_free_reclaim"
+        # A later turn finds nothing left to reclaim.
+        await self.handler._maybe_reclaim_async_completions(
+            7, 42, MODE_INTERACTIVE
+        )
+        assert len(self.sent) == 1
+
+    async def test_autonomous_turn_does_not_reclaim(self) -> None:
+        from telegram_bot.core.usage_meter import MODE_AUTONOMOUS
+
+        self._observe_route_bound("turn-1")
+
+        await self.handler._maybe_reclaim_async_completions(
+            7, 42, MODE_AUTONOMOUS
+        )
+
+        assert self.sent == []
+        assert self.journal.list_records()[0].state == "queued"
+
+    async def test_reclaim_fail_open_without_journal(self) -> None:
+        from telegram_bot.core.usage_meter import MODE_INTERACTIVE
+
+        self.handler._async_completion_journal = None
+
+        await self.handler._maybe_reclaim_async_completions(
+            7, 42, MODE_INTERACTIVE
+        )
+
+        assert self.sent == []
+
+    async def test_reclaim_without_sender_is_noop(self) -> None:
+        from telegram_bot.core.usage_meter import MODE_INTERACTIVE
+
+        self.handler.set_async_completion_sender(None)
+        self._observe_route_bound("turn-1")
+
+        await self.handler._maybe_reclaim_async_completions(
+            7, 42, MODE_INTERACTIVE
+        )
+
+        assert self.sent == []
+        assert self.journal.list_records()[0].state == "queued"
+
+    async def test_evidence_only_records_never_reclaim(self) -> None:
+        """Slice-1 degraded observations stay owner-notice-only (#646)."""
+
+        from telegram_bot.core.usage_meter import MODE_INTERACTIVE
+
+        _bind_resident_session(self.handler)
+        self.handler._observe_unowned_codex_completion(
+            "thread-known", "turn-detached"
+        )
+
+        await self.handler._maybe_reclaim_async_completions(
+            7, 42, MODE_INTERACTIVE
+        )
+
+        assert self.sent == []
+        record = self.journal.list_records()[0]
+        assert record.conversation_route_id is None
+        assert record.state == "queued"
+
+
 if __name__ == "__main__":
     unittest.main()
