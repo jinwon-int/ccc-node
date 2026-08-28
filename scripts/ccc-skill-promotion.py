@@ -23,6 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 
@@ -95,6 +96,10 @@ class Config:
     enabled: bool
     publisher_enabled: bool
     collect_nodes: tuple[str, ...]
+    dispatch_enabled: bool
+    broker_url: str
+    a2a_nexus_dir: Path
+    dispatch_ci_wait_sec: int
     autonomy: str
 
 
@@ -252,6 +257,15 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         publisher_enabled = False
     else:
         raise PromotionError("publisher_invalid")
+    dispatch_raw = env.get("CCC_SKILL_PROMOTION_DISPATCH")
+    if dispatch_raw is None:
+        dispatch_enabled = _read_enabled_file(state_dir / "skill-promotion.dispatch", trust_root=home)
+    elif dispatch_raw.lower() in {"1", "true", "yes"}:
+        dispatch_enabled = True
+    elif dispatch_raw.lower() in {"0", "false", "no"}:
+        dispatch_enabled = False
+    else:
+        raise PromotionError("dispatch_invalid")
     collect_raw = env.get("CCC_SKILL_PROMOTION_COLLECT_NODES")
     collect_nodes = (
         tuple(part.strip() for part in collect_raw.split(",") if part.strip())
@@ -289,6 +303,14 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         enabled=enabled,
         publisher_enabled=publisher_enabled,
         collect_nodes=collect_nodes,
+        dispatch_enabled=dispatch_enabled,
+        broker_url=env.get("CCC_SKILL_PROMOTION_BROKER_URL", "http://127.0.0.1:8787").rstrip("/"),
+        a2a_nexus_dir=Path(
+            env.get("CCC_SKILL_PROMOTION_A2A_NEXUS_DIR", str(home / "work" / "a2a" / "a2a-nexus"))
+        ).absolute(),
+        dispatch_ci_wait_sec=_bounded_int(
+            env.get("CCC_SKILL_PROMOTION_DISPATCH_CI_WAIT_SEC"), 600, 60, 3600
+        ),
         autonomy=_autonomy_state(env, state_dir, trust_root=home),
     )
 
@@ -427,6 +449,7 @@ def _run(
     cwd: Path | None = None,
     check: bool = True,
     env: dict[str, str] | None = None,
+    timeout: int = 120,
 ) -> subprocess.CompletedProcess[bytes]:
     try:
         completed = subprocess.run(
@@ -437,7 +460,7 @@ def _run(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            timeout=120,
+            timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
         raise PromotionError("command_failed") from None
@@ -1460,6 +1483,353 @@ def _ack_result(config: Config, transport_id: str) -> dict[str, object]:
     }
 
 
+# --- Phase C: A2A intake review dispatch (a2a-nexus#2007) --------------------
+# The central publisher dispatches exactly one skills-intake-review task for
+# every intake PR it opens or finds open. Fleet rules carried over from the
+# manual Phase A round (2026-08-29, fleet-skills#18): the edge secret only
+# ever lives in the publisher's local environment (never GH secrets), task ids
+# are unique per round (a2a-nexus#2010), a handler crash is a crash — never a
+# verdict — and dispatch failure never closes a PR. Verdicts stay with the
+# a2a-receipts workflow; there is no auto-close and the human `reviewed_by`
+# promotion gate is untouched.
+
+_INTAKE_LANE = "skills_intake_review"
+_INTAKE_RUBRIC_VERSION = "2026-08-28.2"  # must match docs/skills-intake-review.md
+_DISPATCH_DOC_START = "## Worker procedure"
+_DISPATCH_DOC_END = "## Receipt projection"
+
+_INTAKE_VERDICT_SCHEMA: dict[str, object] = {
+    "verdict": "approve | revise | reject",
+    "findings": [
+        {
+            "severity": "info|minor|major|blocker",
+            "area": "safety|spec|triggering|disclosure|quality|claims|duplication|utility",
+            "note": "...",
+        }
+    ],
+    "evidence": [{"kind": "grep|url|diff", "detail": "..."}],
+    "model": "<runtime model id>",
+    "reviewer_node": "<your node id>",
+    "head_sha": "<40-char full head sha>",
+    "rubric_version": _INTAKE_RUBRIC_VERSION,
+    "note": "any major/blocker finding MUST carry a machine re-verifiable evidence entry; emit the verdict JSON only",
+}
+
+
+def _worker_procedure_from_docs(nexus_dir: Path) -> str:
+    """Extract the worker procedure section from the a2a-nexus intake spec."""
+    try:
+        text = (nexus_dir / "docs" / "skills-intake-review.md").read_text(encoding="utf-8")
+    except OSError as error:
+        raise PromotionError("dispatch_docs_unreadable") from error
+    start = text.find(_DISPATCH_DOC_START)
+    end = text.find(_DISPATCH_DOC_END)
+    if start < 0 or end < 0 or end <= start:
+        raise PromotionError("dispatch_docs_section_missing")
+    procedure = text[start:end].strip()
+    if len(procedure) < 256:
+        raise PromotionError("dispatch_docs_section_missing")
+    return procedure
+
+
+def _broker_id(config: Config, secret: str) -> str:
+    try:
+        completed = _run(
+            ["curl", "-fsS", "-H", f"x-a2a-edge-secret: {secret}", f"{config.broker_url}/health"]
+        )
+        health = json.loads(completed.stdout.decode("utf-8"))
+    except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PromotionError("dispatch_broker_unreachable") from error
+    broker_id = health.get("brokerId") if isinstance(health, dict) else None
+    if not isinstance(broker_id, str) or not broker_id.strip():
+        raise PromotionError("dispatch_broker_id_missing")
+    return broker_id.strip()
+
+
+def _dispatch_target_worker(config: Config, author_node: str) -> str:
+    """Stable keyring-worker pick excluding the author; the broker enforces
+    author disqualification independently, so this is defense in depth."""
+    completed = _run(
+        ["gh", "api", f"repos/{config.repo}/contents/refs/a2a-public-keyring.json?ref={config.base}"]
+    )
+    try:
+        payload = json.loads(completed.stdout.decode("utf-8"))
+        keyring = json.loads(base64.b64decode(payload["content"]).decode("utf-8"))
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PromotionError("dispatch_keyring_invalid") from error
+    keys = keyring.get("keys") if isinstance(keyring, dict) else None
+    workers: list[str] = []
+    if isinstance(keys, dict):
+        for key_id in sorted(keys):
+            match = re.fullmatch(r"worker:([a-z0-9_-]{2,32}):g\d+:v\d+", key_id)
+            if match and match.group(1) != author_node:
+                workers.append(match.group(1))
+    if not workers:
+        raise PromotionError("dispatch_no_reviewer")
+    return workers[0]
+
+
+def _branch_head_sha(config: Config, branch: str) -> str:
+    completed = _run(["gh", "api", f"repos/{config.repo}/commits/{branch}", "--jq", ".sha"])
+    sha = completed.stdout.decode("utf-8").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise PromotionError("dispatch_head_invalid")
+    return sha
+
+
+def _wait_for_skills_check(config: Config, head: str, timeout_sec: int) -> bool:
+    """Block until the CI `skills` check on this exact head completes. The
+    machine gate is a precondition of dispatch: no green, no dispatch."""
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        try:
+            completed = _run(
+                [
+                    "gh", "api", f"repos/{config.repo}/commits/{head}/check-runs",
+                    "--jq", '[.check_runs[] | select(.name == "skills")][0] | "\\(.status)/\\(.conclusion // "")"',
+                ]
+            )
+            state = completed.stdout.decode("utf-8").strip()
+        except PromotionError:
+            state = ""
+        if state.startswith("completed/"):
+            return state == "completed/success"
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(15)
+
+
+def _build_dispatch_manifest(  # noqa: C901
+    config: Config,
+    candidate: Candidate,
+    *,
+    pr_number: str,
+    branch: str,
+    head: str,
+    reviewer: str,
+    broker_id: str,
+    procedure: str,
+    inventory: list[dict[str, str]],
+    now: str,
+) -> dict[str, object]:
+    skill_files: list[dict[str, str]] = []
+    for item in candidate.files:
+        try:
+            skill_files.append({"path": item.relative, "content": item.content.decode("utf-8")})
+        except UnicodeDecodeError as error:
+            raise PromotionError("dispatch_content_invalid") from error
+    round_id = f"{_INTAKE_LANE}-pr{pr_number}-auto-{head[:8]}-{now}"
+    task_id = f"{_INTAKE_LANE}-pr{pr_number}-{candidate.node}-{now}"
+    return {
+        "roundId": round_id,
+        "brokerUrl": config.broker_url,
+        "requester": {"id": config.node, "role": "publisher"},
+        "defaults": {"intent": _INTAKE_LANE},
+        "lanes": [
+            {
+                "id": task_id,
+                "target": {"id": reviewer, "role": "reviewer"},
+                "intent": _INTAKE_LANE,
+                "message": (
+                    f"skills-intake-reviewer procedure invoked: review fleet-skills intake "
+                    f"PR #{pr_number} ({candidate.name}, author node {candidate.node}) per "
+                    f"skills.skill-intake-review.v1 (rubric {_INTAKE_RUBRIC_VERSION}). Apply "
+                    "rubric areas A-H in order and return ONLY the verdict JSON. Bind your "
+                    f"output to skillName={candidate.name}, "
+                    f"sourceTreeSha256={candidate.tree_sha256}, headPrefix={head[:8]}."
+                ),
+                "payload": {
+                    "schema": "skills.skill-intake-review.v1",
+                    "rubricVersion": _INTAKE_RUBRIC_VERSION,
+                    "skillName": candidate.name,
+                    "provenance": {
+                        "author_node": candidate.node,
+                        "intake_pr": int(pr_number),
+                        "branch": branch,
+                        "head_sha": head,
+                        "source_tree_sha256": candidate.tree_sha256,
+                    },
+                    "machineGate": {
+                        "secret_scan": "pass",
+                        "node_facts": "pass",
+                        "structure": "pass",
+                        "dedup": "n/a",
+                        "codex_compat": "n/a",
+                        "claims": "n/a",
+                    },
+                    "skillFiles": skill_files,
+                    "inventorySnapshot": inventory,
+                    "verdictSchema": _INTAKE_VERDICT_SCHEMA,
+                    "workerProcedure": procedure,
+                    "review": {"required": True, "authorWorkerId": candidate.node},
+                    "originBrokerId": broker_id,
+                    "brokerOfRecordId": broker_id,
+                    "operatorFacingOwner": "local",
+                },
+            }
+        ],
+    }
+
+
+def _inventory_snapshot(config: Config, *, limit: int = 64) -> list[dict[str, str]]:
+    """Read-only name/audience/description snapshot of approved skills — the
+    reviewer's rubric-G duplication surface, identical to the manual round."""
+    completed = _run(
+        ["gh", "api", f"repos/{config.repo}/git/trees/{config.base}?recursive=1", "--jq",
+         '[.tree[].path | select(test("^approved/[^/]+/[^/]+/SKILL.md$"))] | .[:' + str(limit) + "]"]
+    )
+    try:
+        paths = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PromotionError("dispatch_keyring_invalid") from error
+    if not isinstance(paths, list):
+        raise PromotionError("dispatch_keyring_invalid")
+    snapshot: list[dict[str, str]] = []
+    for path in paths[:limit]:
+        item = _run(["gh", "api", f"repos/{config.repo}/contents/{path}?ref={config.base}"])
+        try:
+            body = base64.b64decode(json.loads(item.stdout.decode("utf-8"))["content"]).decode("utf-8", "replace")
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise PromotionError("dispatch_keyring_invalid") from error
+        name_match = re.search(r"^name:\s*(.+)$", body, re.M)
+        desc_match = re.search(r"^description:\s*(.+)$", body, re.M)
+        snapshot.append(
+            {
+                "name": name_match.group(1).strip() if name_match else Path(path).parts[-2],
+                "audience": path.split("/")[1],
+                "description": (desc_match.group(1).strip()[:200] if desc_match else ""),
+            }
+        )
+    return snapshot
+
+
+def _dispatch_intake_review(  # noqa: C901
+    config: Config,
+    candidate: Candidate,
+    outcome: dict[str, object],
+    *,
+    transport_id: str,
+) -> dict[str, object]:
+    """Best-effort fail-safe: never raises, never closes the PR. Skips are
+    recorded so the next collect cycle can retry non-terminal failures."""
+    url = outcome.get("url")
+    branch = outcome.get("branch")
+    if not isinstance(url, str) or not url:
+        return {"outcome": "dispatch-skipped", "code": "dispatch_no_pr_url"}
+    if not isinstance(branch, str) or not branch:
+        return {"outcome": "dispatch-skipped", "code": "dispatch_no_branch"}
+    pr_match = re.search(r"/pull/(\d+)$", url.rstrip("/"))
+    if pr_match is None:
+        return {"outcome": "dispatch-skipped", "code": "dispatch_no_pr_number"}
+    pr_number = pr_match.group(1)
+    nexus_script = config.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"
+    if not nexus_script.is_file():
+        return {"outcome": "dispatch-skipped", "code": "dispatch_nexus_missing"}
+    secret = os.environ.get("A2A_EDGE_SECRET", "")
+    if not secret:
+        return {"outcome": "dispatch-skipped", "code": "dispatch_secret_missing"}
+    try:
+        head = _branch_head_sha(config, branch)
+    except PromotionError as error:
+        return {"outcome": "dispatch-skipped", "code": error.code}
+    # Idempotency: one dispatch per transport_id + head, crash-safe via ledger.
+    try:
+        ledger_text = (config.promotion_state_dir / "ledger.jsonl").read_text(encoding="utf-8")
+        for line in ledger_text.splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(record, dict)
+                and record.get("kind") == "a2a-dispatch"
+                and record.get("transport_id") == transport_id
+                and record.get("head_sha") == head
+            ):
+                return {"outcome": "dispatch-skipped", "code": "dispatch_already"}
+    except OSError:
+        pass
+    try:
+        if not _wait_for_skills_check(config, head, config.dispatch_ci_wait_sec):
+            return {"outcome": "dispatch-skipped", "code": "dispatch_ci_not_green"}
+        procedure = _worker_procedure_from_docs(config.a2a_nexus_dir)
+        reviewer = _dispatch_target_worker(config, candidate.node)
+        broker_id = _broker_id(config, secret)
+        inventory = _inventory_snapshot(config)
+        now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        manifest = _build_dispatch_manifest(
+            config, candidate,
+            pr_number=pr_number, branch=branch, head=head, reviewer=reviewer,
+            broker_id=broker_id, procedure=procedure, inventory=inventory, now=now,
+        )
+    except PromotionError as error:
+        return {"outcome": "dispatch-skipped", "code": error.code}
+    descriptor, manifest_path = tempfile.mkstemp(
+        prefix="dispatch-manifest-", suffix=".json", dir=config.promotion_state_dir
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False)
+        env = dict(os.environ)
+        env["A2A_EDGE_SECRET"] = secret
+        try:
+            completed = _run(
+                ["node", str(nexus_script), "--manifest", str(manifest_path), "--verify", "--json"],
+                env=env,
+                timeout=300,
+            )
+            result = json.loads(completed.stdout.decode("utf-8"))
+        except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            return {"outcome": "dispatch-skipped", "code": "dispatch_round_failed", "detail": str(error)[:120]}
+    finally:
+        try:
+            os.unlink(manifest_path)
+        except OSError:
+            pass
+    rows = result.get("results") if isinstance(result, dict) else None
+    created = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else None
+    dispatched_task = created.get("taskId") if created else None
+    if not isinstance(dispatched_task, str) or not dispatched_task:
+        return {"outcome": "dispatch-skipped", "code": "dispatch_round_failed"}
+    lane = manifest["lanes"][0]
+    task_id = lane["id"]
+    _append_ledger(
+        config,
+        {
+            "ts": _utc_now(),
+            "kind": "a2a-dispatch",
+            "transport_id": transport_id,
+            "head_sha": head,
+            "round_id": manifest["roundId"],
+            "task_id": task_id,
+            "dispatched_task": dispatched_task,
+            "reviewer_node": reviewer,
+            "broker_id": broker_id,
+            "pr_url": url,
+        },
+    )
+    try:
+        _run(
+            [
+                "gh", "pr", "comment", pr_number, "--repo", config.repo,
+                "--body",
+                f"A2A intake review dispatched automatically (Phase C): task `{dispatched_task}` "
+                f"→ reviewer `{reviewer}` (round `{manifest['roundId']}`, broker `{broker_id}`). "
+                "The signed receipt will project `a2a/receipts` on this head; human `reviewed_by` "
+                "sign-off remains required per policies/REVIEW.md.",
+            ]
+        )
+    except PromotionError:
+        pass
+    return {
+        "outcome": "dispatched",
+        "task_id": task_id,
+        "dispatched_task": dispatched_task,
+        "reviewer_node": reviewer,
+        "round_id": manifest["roundId"],
+    }
+
+
 # Collection deliberately sequences visibility, remote reads, publication, and ack.
 def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:  # noqa: C901
     if not config.publisher_enabled:
@@ -1551,6 +1921,10 @@ def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:  # noqa: C9
             except PromotionError as error:
                 errors.append(
                     {"source": source, "name": candidate.name, "code": error.code}
+                )
+            if config.dispatch_enabled:
+                row["dispatch"] = _dispatch_intake_review(
+                    config, candidate, outcome, transport_id=transport_id
                 )
     return {
         "ok": not errors,
