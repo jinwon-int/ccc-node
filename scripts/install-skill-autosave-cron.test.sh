@@ -163,8 +163,14 @@ run env CCC_STATE_DIR="$TMP/no-identity" bash "$SC" --apply
 okc "$RC" 0 "unresolved identity still installs cron"
 ok "unresolved identity omits CCC_NODE" '! grep -qF "CCC_NODE=" "$CRON_STORE"'
 ok "unresolved identity is reported" 'grep -q "no fleet identity resolved" "$OUT"'
+# Pin the no-guess assertion to the CCC_NODE assignment itself. Grepping the
+# whole store for the hostname string false-positives on nodes whose username
+# equals the hostname (#1339): the crontab lines legitimately embed
+# /home/<user> paths that contain it.
+hn="$(hostname -s 2>/dev/null || echo __no_hostname__)"
+guess="CCC_NODE=\"${hn}\""
 ok "unresolved identity never guesses the hostname" \
-  '! grep -qF "$(hostname -s 2>/dev/null || echo __no_hostname__)" "$CRON_STORE"'
+  '! grep -qF "$guess" "$CRON_STORE"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
