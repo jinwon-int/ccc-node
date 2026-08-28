@@ -10,6 +10,7 @@ assertions with observed behavior.
 import asyncio
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -312,6 +313,27 @@ class ResolvePathsExtensionTests(unittest.TestCase):
         _os.truncate(big, 60 * 1024 * 1024)  # 60 MB > 50 MB ceiling
 
         self.assertEqual(self._resolve(tmpdir, f"here {tmpdir}/huge.pdf"), [])
+
+    def test_unreadable_path_is_skipped_not_fatal(self):
+        # A reply quoting a path the process cannot stat — e.g. inside another
+        # user's 0700 home directory — must not crash delivery. Python 3.12's
+        # pathlib deliberately re-raises EACCES out of is_file(), so the
+        # resolver has to absorb the OSError itself (#1330).
+        tmpdir = Path(tempfile.mkdtemp())
+        (tmpdir / "ok.txt").write_text("x", encoding="utf-8")
+        content = f"check /root/.config/gh/hosts.yml and {tmpdir}/ok.txt"
+
+        real_stat = Path.stat
+
+        def selective_stat(self, *args, **kwargs):
+            if str(self).startswith("/root/"):
+                raise PermissionError(13, "Permission denied")
+            return real_stat(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", selective_stat):
+            resolved = self._resolve(tmpdir, content)
+
+        self.assertEqual(resolved, ["ok.txt"])
 
 
 class MaybePromptOutsideFilesTests(unittest.TestCase):

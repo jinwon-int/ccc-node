@@ -309,15 +309,27 @@ class BotDeliveryMixin:
         await self._enqueue_user_task(conversation_key, run_task, on_overflow)
 
     def _resolve_paths(self, content: str) -> List[FilePath]:
-        """Extract file paths and resolve relative ones against injected PROJECT_ROOT."""
+        """Extract file paths and resolve relative ones against injected PROJECT_ROOT.
+
+        A quoted path the process cannot stat (another user's private
+        directory, a traversal-denied mountpoint) is not a deliverable
+        artifact — it must never crash the reply itself (#1332).
+        """
         paths = []
         seen = set()
         for m in self._FILE_PATH_RE.findall(content):
             p = FilePath(m.strip())
             if not p.is_absolute():
                 p = self._project_root() / p
-            p = p.resolve()
-            if p not in seen and p.is_file() and p.stat().st_size < MAX_SEND_FILE_BYTES:
+            try:
+                p = p.resolve()
+                deliverable = p.is_file() and p.stat().st_size < MAX_SEND_FILE_BYTES
+            except OSError:
+                # pathlib only ignores ENOENT/ENOTDIR/ELOOP-class errors on
+                # stat; EACCES and friends raise out of is_file(). Skip the
+                # undeliverable path instead of failing the whole reply.
+                continue
+            if p not in seen and deliverable:
                 seen.add(p)
                 paths.append(p)
         return paths
