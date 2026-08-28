@@ -117,5 +117,56 @@ out="$(env "${base_env[@]}" python3 "$SYNC" plan --ref main)"; rc=$?
 ok "floating main ref is refused" \
   '[ "$rc" = 2 ] && jq -e ".code == \"exact_commit_required\"" >/dev/null <<<"$out"'
 
+
+# Graduation precedence (#1344): repo-managed(setup) > fleet-approved(sync).
+# A repo-managed target is skipped, never fought; the lower-precedence layer
+# must converge to a no-op while the higher layer owns the directory.
+GRAD_HOME="$TMP/grad-home"
+GRAD_CLAUDE="$GRAD_HOME/.claude/skills"
+GRAD_CODEX="$GRAD_HOME/.codex/skills"
+mkdir -p "$GRAD_CLAUDE/release-checklist" "$GRAD_CODEX" "$GRAD_HOME/.claude/state"
+chmod 700 "$GRAD_HOME" "$GRAD_HOME/.claude" "$GRAD_HOME/.claude/state" "$GRAD_HOME/.codex" "$GRAD_CLAUDE" "$GRAD_CODEX" "$GRAD_CLAUDE/release-checklist"
+printf 'pre-graduation fleet-era copy\n' > "$GRAD_CLAUDE/release-checklist/SKILL.md"
+printf 'release-checklist 0\n' > "$GRAD_HOME/.claude/state/repo-skills.manifest"
+grad_env=("${base_env[@]}" HOME="$GRAD_HOME" \
+  CCC_FLEET_SKILLS_STATE_DIR="$GRAD_HOME/.claude/state/fleet-skills" \
+  CCC_FLEET_SKILLS_CLAUDE_DIR="$GRAD_CLAUDE" \
+  CCC_FLEET_SKILLS_CODEX_DIR="$GRAD_CODEX")
+
+# 1) claude-side repo ownership comes from setup.sh's repo-skills.manifest.
+out="$(env "${grad_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
+ok "graduated plan skips repo-managed claude target and keeps codex install" \
+  '[ "$rc" = 0 ] && jq -e "(.operations | any(.provider == \"claude\" and .action == \"skip-repo-managed\")) and (.operations | any(.provider == \"codex\" and .action == \"install\"))" >/dev/null <<<"$out"'
+
+# 2) end-to-end graduation sequence: fleet-install -> the repo layer takes
+#    ownership (setup absorbs: repo bytes + manifest entry; the codex
+#    provisioner markers its copy) -> sync skips both, mutating nothing.
+out="$(env "${grad_env[@]}" python3 "$SYNC" apply --ref "$REF")"; rc=$?
+ok "graduated apply installs only the codex copy" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 1" >/dev/null <<<"$out"'
+printf 'repo-managed copy\n' > "$GRAD_CLAUDE/release-checklist/SKILL.md"
+rm -f "$GRAD_CLAUDE/release-checklist/.ccc-fleet-skill.json"
+repo_hash="$(cd "$GRAD_CLAUDE/release-checklist" && find . -type f -exec sha256sum {} + | LC_ALL=C sort -k2 | sha256sum | awk '{print $1}')"
+printf 'release-checklist %s\n' "$repo_hash" > "$GRAD_HOME/.claude/state/repo-skills.manifest"
+jq -n '{manager:"ccc-node",name:"release-checklist"}' > "$GRAD_CODEX/release-checklist/.ccc-node-managed.json"
+rm -f "$GRAD_CODEX/release-checklist/.ccc-fleet-skill.json"
+sha_before_claude="$(sha256sum "$GRAD_CLAUDE/release-checklist/SKILL.md" | awk '{print $1}')"
+sha_before_codex="$(sha256sum "$GRAD_CODEX/release-checklist/SKILL.md" | awk '{print $1}')"
+
+out="$(env "${grad_env[@]}" python3 "$SYNC" apply --ref "$REF")"; rc=$?
+ok "sync after graduation skips both repo-managed targets without error" \
+  '[ "$rc" = 0 ] && jq -e "(.changed == 0) and (.operations | all(.action == \"skip-repo-managed\"))" >/dev/null <<<"$out"'
+sha_after_claude="$(sha256sum "$GRAD_CLAUDE/release-checklist/SKILL.md" | awk '{print $1}')"
+sha_after_codex="$(sha256sum "$GRAD_CODEX/release-checklist/SKILL.md" | awk '{print $1}')"
+ok "repo-managed copies are byte-untouched by the skip" \
+  '[ "$sha_after_claude" = "$sha_before_claude" ] && [ "$sha_after_codex" = "$sha_before_codex" ]'
+
+# 3) tampered repo markers still fail closed — skip is for genuine ownership
+#    by the repo layer, and a wrong-manager marker is refused, not skipped.
+jq -n '{manager:"intruder",name:"release-checklist"}' > "$GRAD_CODEX/release-checklist/.ccc-node-managed.json"
+out="$(env "${grad_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
+ok "tampered repo-managed marker fails closed" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"repo_managed_marker_invalid\"" >/dev/null <<<"$out"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

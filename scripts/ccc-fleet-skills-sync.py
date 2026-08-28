@@ -90,6 +90,12 @@ class Operation:
     action: str
 
 
+# Actions that must never reach apply_operations: noop (already exact) and
+# skip-repo-managed (a repo-managed installation owns the target — the higher
+# precedence layer, #1344).
+SKIP_ACTIONS = frozenset({"noop", "skip-repo-managed"})
+
+
 def json_line(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -420,6 +426,65 @@ def installed_matches(path: Path, skill: ApprovedSkill) -> bool:
     return actual == wanted
 
 
+def repo_managed_marker(path: Path) -> dict[str, Any] | None:
+    """The Codex provisioner's ownership marker, fail-closed on tampering."""
+    marker_path = path / ".ccc-node-managed.json"
+    if not marker_path.exists():
+        return None
+    try:
+        metadata = marker_path.lstat()
+        if (
+            marker_path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_size > 16 * 1024
+        ):
+            raise SyncError("repo_managed_marker_unsafe")
+        value = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise SyncError("repo_managed_marker_unsafe") from None
+    if not isinstance(value, dict) or value.get("manager") != "ccc-node":
+        raise SyncError("repo_managed_marker_invalid")
+    return value
+
+
+def repo_managed_names(cfg: Config) -> set[str]:
+    """Skill names the repo layer currently owns via setup.sh's manifest.
+
+    setup.sh tracks its Claude-side repo skills in
+    ``<claude-dir>/state/repo-skills.manifest`` (no per-directory marker), so
+    manifest membership is the ownership signal there. A missing manifest
+    simply means the repo layer owns nothing — the fail-safe direction.
+    """
+    manifest = cfg.claude_root.parent / "state" / "repo-skills.manifest"
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+    if len(text) > 256 * 1024:
+        raise SyncError("repo_managed_manifest_unsafe")
+    names: set[str] = set()
+    for line in text.splitlines():
+        name = line.split(" ", 1)[0].strip()
+        if name:
+            names.add(name)
+    return names
+
+
+def is_repo_managed(cfg: Config, provider: str, target: Path, name: str) -> bool:
+    """Whether the target is owned by the higher-precedence repo layer.
+
+    Precedence contract (#1344): repo-managed(setup) > fleet-approved(sync)
+    > autosave-owned > user-owned. The repo layer signals ownership through
+    the Codex provisioner marker (codex root) or the setup manifest (claude
+    root); fleet-sync must skip, never fight it.
+    """
+    if provider == "claude":
+        return name in repo_managed_names(cfg)
+    return repo_managed_marker(target) is not None
+
+
 def operations(cfg: Config, skills: list[ApprovedSkill], *, create_roots: bool) -> list[Operation]:
     roots = {"claude": cfg.claude_root, "codex": cfg.codex_root}
     for root in roots.values():
@@ -434,6 +499,9 @@ def operations(cfg: Config, skills: list[ApprovedSkill], *, create_roots: bool) 
                     raise SyncError("target_conflict")
                 current = existing_marker(target)
                 if current is None:
+                    if is_repo_managed(cfg, provider, target, skill.name):
+                        rows.append(Operation(provider, skill, target, "skip-repo-managed"))
+                        continue
                     raise SyncError("target_user_owned")
                 wanted = marker(cfg, provider, skill)
                 action = "noop" if current == wanted and installed_matches(target, skill) else "update"
@@ -460,7 +528,7 @@ def write_skill(stage: Path, cfg: Config, operation: Operation) -> None:
 
 
 def apply_operations(cfg: Config, rows: list[Operation]) -> int:
-    changed = [row for row in rows if row.action != "noop"]
+    changed = [row for row in rows if row.action not in SKIP_ACTIONS]
     if not changed:
         return 0
     backup_root = cfg.state_dir / "backups" / cfg.ref
