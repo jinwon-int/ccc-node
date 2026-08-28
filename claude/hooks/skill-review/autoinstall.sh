@@ -184,9 +184,18 @@ gate_lint() { # <skill.md>
   [ -n "$desc" ] || { printf 'lint missing-description'; return 1; }
   [ "${#desc}" -ge "$DESC_MIN" ] || { printf 'lint description-too-short'; return 1; }
   [ "${#desc}" -le "$DESC_MAX" ] || { printf 'lint description-too-long'; return 1; }
+  compat="$(fm_field "$f" compatibility)"
+  [ "${#compat}" -le 500 ] || { printf 'lint compatibility-too-long'; return 1; }
   body_lines="$(awk -v s="$close" 'NR>s && NF' "$f" 2>/dev/null | wc -l | tr -d '[:space:]')"
   [ "${body_lines:-0}" -ge "$BODY_MIN_LINES" ] || { printf 'lint body-too-short'; return 1; }
   awk -v s="$close" 'NR>s' "$f" 2>/dev/null | grep -q '^#' || { printf 'lint no-headings'; return 1; }
+  return 0
+}
+
+gate_size() { # <skill.md> — progressive disclosure: oversized bodies must split
+  local f="$1" lines
+  lines="$(wc -l < "$f" 2>/dev/null | tr -d '[:space:]')"
+  [ "${lines:-0}" -le 500 ] || { printf 'size oversized-body %s-lines' "$lines"; return 1; }
   return 0
 }
 
@@ -574,6 +583,9 @@ do_run() {
       esac
     fi
     if ! verdict="$(gate_lint "$f")"; then
+      record_block "$dir" "$id" "$verdict"; continue
+    fi
+    if ! verdict="$(gate_size "$f")"; then
       record_block "$dir" "$id" "$verdict"; continue
     fi
     name="$(fm_field "$f" name)"

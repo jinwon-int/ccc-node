@@ -22,13 +22,22 @@ graduates into ccc-node, and the fleet-skills copy retires.
       by eye before making it public.
 - [ ] **Secret & privacy review**: graduation publishes the skill into a
       PUBLIC repository. This is irreversible — do the final scan here.
-- [ ] **Frontmatter standard**: `name` equals the directory name,
-      `description` 20–1024 chars, `status: active`.
+- [ ] **Frontmatter standard** (Agent Skills spec): `name` equals the
+      directory name, `description` 20–1024 chars, `status: active`;
+      optional `license`, `compatibility` (<=500 chars), `metadata`, and
+      `allowed-tools` fields are spec-conformant when present.
+- [ ] **Progressive disclosure conformance**: SKILL.md <=500 lines; longer
+      content is split into `references/` with read-when pointers; reference
+      files >300 lines carry a table of contents.
+- [ ] **License & attribution decided for PUBLIC**: third-party content is
+      attributed; the skill's license field states the chosen license.
 - [ ] **Runtime classification decided**: `skills/shared` (runtime-neutral)
       or `claude/skills` (Claude-specific references present). The skill must
       pass the compatibility catalog's classification for its target root.
 - [ ] **Operator sponsorship**: a human names this candidate and owns the
       promotion PR. There is no automatic graduation.
+- [ ] **Effect evidence (optional, recommended)**: with-skill vs baseline
+      comparison recorded per the `skill-creator` evaluation method.
 
 ## Procedure
 
