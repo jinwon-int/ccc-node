@@ -36,6 +36,7 @@ from telegram_bot.core.dead_session_recovery import (
     recover_dead_session_notifications,
     run_periodic_dead_session_recovery,
 )
+from telegram_bot.core.async_completion_delivery import build_telegram_sender
 from telegram_bot.core.dead_session_wakeup import (
 
     recovery_should_defer_to_wakeup,
@@ -109,6 +110,8 @@ class _LifecycleProjectChat(Protocol):
     async def enforce_session_resource_limits(
         self, *, now: float | None = None
     ) -> dict[str, int | float]: ...
+
+    def set_async_completion_sender(self, sender: Any) -> None: ...
 
     async def close(self) -> None: ...
 
@@ -332,6 +335,13 @@ class BotLifecycleMixin:
         # message. Then drain any terminal ops left pending by failed cleanups.
         await self._reconcile_task_ledger(application)
         await self._recover_dead_session_notifications(application)
+
+        # Conversation delivery seam for durable async completions (#646
+        # slice 2). Inert until a runtime declares durable delivery; wiring
+        # it here keeps the handler free of bot handles.
+        self._project_chat.set_async_completion_sender(
+            build_telegram_sender(application.bot)
+        )
 
         await self._set_bot_commands()
         logger.info("Bot initialization complete")

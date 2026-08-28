@@ -60,8 +60,25 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
    ```
    A pending draft with an `autosave-block.json` file was machine-rejected by
    the auto mode gate — `jq . "$STATE/pending-skills/<id>/autosave-block.json"`
-   shows the reason (secret / node-specific / lint / dedup). Give those extra
-   scrutiny before approving.
+   shows the reason (secret / node-specific / lint / dedup / codex-incompat /
+   **unverified-claim** / **dead-citation**). Give those extra scrutiny before
+   approving.
+
+   The last two come from `gate_unverified_claims` and mean the draft states a
+   falsifiable technical fact the reader cannot re-derive:
+   - `unverified-claim exit-code|http-status|version-pin` — the draft asserts an
+     exit code, HTTP status, or pinned version with **no citation**: no URL, no
+     `file.ext:line` source reference, no `--help`/`--version` command shown,
+     and no dated "verified" marker. Do not approve by judging whether the claim
+     *sounds* right. Re-derive it: run the command, or read the source, then
+     require the draft to carry that evidence before approval.
+   - `dead-citation http-404|http-410` — a URL the draft cites is gone. Find the
+     live path and correct the citation; a dead citation is indistinguishable
+     from a fabricated one to the next reader.
+
+   The gate checks **citability, not truth** — a machine cannot verify a claim
+   is correct, only that it is checkable. Approving one of these means *you*
+   became the verification step; actually do the check.
 
 1b. **Autosave post-hoc review / rollback** (auto mode installs are tracked in a
    ledger and always reversible):
@@ -98,7 +115,7 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
 
 5. **Author on approval only.** For each approved deterministic candidate, create `~/.claude/skills/<name>/SKILL.md`:
    - Frontmatter: `name` (kebab-case) + a detailed `description` (it drives auto-matching).
-   - Body: numbered steps, exact commands, and safety rules (no raw secrets — read keys from `~/.hermes/.env`; redact in output).
+   - Body: numbered steps, exact commands, and safety rules (no raw secrets — read keys from the node's env file, **resolved at run time rather than hardcoded**; redact in output). A 2026-08-28 fleet check found `~/.hermes/.env` on 8 of 11 nodes and `/opt/ccc-node/bridge/.env` on the others, so a skill that names one path is wrong on roughly a third of the fleet. This matters here specifically: a path baked into this authoring rule is reproduced into every skill drafted from it.
    - Offer to also land it in the `jinwon-int/ccc-node` template (`claude/skills/`) via PR, and record it in the Wiki (use the `wiki-record` skill).
    - When landing a new `claude/skills/<name>/` in the template, also add its classification entry to `codex/compatibility.json` (`adapted` with a codex mirror, or `claude-only` with a reason). The catalog is fail-closed: an unclassified skill fails `validate-harness` (`catalog_unclassified`) and blocks CI (#789).
 

@@ -336,12 +336,12 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
         for boundary in (
             "exact bridge-owned active turn",
             "no detached ownership signal or negotiated protocol version",
-            "body-free bounded diagnostics",
+            "never auto-delivered",
+            "journaled body-free",
+            "reclaimed body-free on the next user turn",
+            "no thread/read replay",
+            "no Claude transcript inference",
             "machine-readable degraded boundary",
-            "no Telegram send",
-            "journal",
-            "thread/read replay",
-            "Claude transcript inference",
             "supports_async_completion_delivery=false",
         ):
             self.assertIn(boundary, status.reason)

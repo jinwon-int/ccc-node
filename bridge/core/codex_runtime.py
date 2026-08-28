@@ -38,6 +38,7 @@ from .agent_runtime import (
     ToolStartedEvent,
     deny_approval,
 )
+from .async_completion_delivery import bounded_completion_text
 from .codex_app_server import (
     CodexAppServerClient,
     CodexNotification,
@@ -492,6 +493,13 @@ class CodexRuntime:
         # (#646 slice 1). The runtime never awaits or trusts the listener; a
         # raising listener is swallowed exactly like a failed meter write.
         self._unowned_completion_listener: Callable[[str, str], object] | None = None
+        # Optional promotion listener for runtimes that declare durable
+        # delivery (#646 slice 2). Receives the same fail-closed-validated
+        # observation plus the bounded body text (or None); invoked only when
+        # async_completion_capability() reports supports_durable_delivery.
+        self._durable_completion_listener: (
+            Callable[[str, str, str | None], object] | None
+        ) = None
         self._closed = False
 
     @property
@@ -545,6 +553,21 @@ class CodexRuntime:
         """
 
         self._unowned_completion_listener = listener
+
+    def set_durable_completion_listener(
+        self, listener: Callable[[str, str, str | None], object] | None
+    ) -> None:
+        """Promote validated unowned completions to durable delivery (#646).
+
+        The listener receives ``(thread_id, turn_id, text)`` where ``text`` is
+        the bounded agent-message body (``None`` when none is extractable).
+        It is invoked only when :meth:`async_completion_capability` declares
+        ``supports_durable_delivery`` — a degraded runtime never promotes and
+        never hands out provider payload text.  The same synchronicity and
+        exception-swallowing rules as the slice-1 observer apply.
+        """
+
+        self._durable_completion_listener = listener
 
     def set_turn_attempt_recorder(self, recorder: Callable[[], object]) -> None:
         """Observe each turn/start the provider accepted (the spend boundary).
@@ -1331,6 +1354,18 @@ class CodexRuntime:
                         "behavior is unchanged",
                         exc_info=True,
                     )
+            if self.async_completion_capability().supports_durable_delivery:
+                durable_listener = self._durable_completion_listener
+                if durable_listener is not None:
+                    text = bounded_completion_text(turn.get("items"))
+                    try:
+                        durable_listener(thread_id, turn_id, text)
+                    except Exception:
+                        logger.warning(
+                            "Durable completion listener failed; promotion "
+                            "skipped for this observation",
+                            exc_info=True,
+                        )
 
     def _remember_terminal_turn(self, turn_id: str) -> None:
         if _CODEX_OPAQUE_ID_RE.fullmatch(turn_id) is None:

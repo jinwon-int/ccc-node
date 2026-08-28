@@ -135,7 +135,7 @@ systemctl stop <job>.service                               # abort a running job
 - This skill detaches *execution*, not *authority*: destructive or approval-gated
   commands still need owner approval before launch — detaching does not bypass gates.
 - Never put secrets in the unit name, command line, or log (unit cmdlines are
-  visible in `systemctl`/journal); read keys from files (e.g. `~/.hermes/.env`) inside the script.
+  visible in `systemctl`/journal); read keys inside the script from the node's env file, resolved at run time (`~/.hermes/.env` on most nodes, `/opt/ccc-node/bridge/.env` on others).
 - Multi-user/rootless nodes: user services may need lingering
   (`loginctl enable-linger`) for the unit to survive logout; on non-systemd
   nodes (Termux) this skill does not apply — use `nohup`/`setsid` + log + EXIT

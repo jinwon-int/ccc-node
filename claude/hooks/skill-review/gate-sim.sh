@@ -47,6 +47,7 @@ done
 # trivially collide with itself and report a meaningless BLOCK.
 GATES=(gate_lint gate_secrets gate_node_specific)
 declare -f gate_codex_compat >/dev/null 2>&1 && GATES+=(gate_codex_compat)
+declare -f gate_unverified_claims >/dev/null 2>&1 && GATES+=(gate_unverified_claims)
 
 json=0
 args=()
