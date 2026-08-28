@@ -10,20 +10,26 @@
 #
 # Source this file; it defines functions only and has no side effects.
 #
-#   CCC_SKILL_PROVIDER   claude | codex   (explicit; wins over auto-detect)
+#   CCC_SKILL_PROVIDER   claude | codex | piri   (explicit; wins over auto-detect)
 #   CLAUDE_SKILLS_DIR    Claude install target (default ~/.claude/skills)
 #   CODEX_SKILLS_DIR     Codex install target  (default $CODEX_HOME/skills)
 #   CODEX_HOME           Codex home            (default ~/.codex)
+#   PIRI_SKILLS_DIR      Piri install target   (default $PIRI_CODING_AGENT_DIR/skills)
+#   PIRI_CODING_AGENT_DIR Piri agent home      (default ~/.piri/agent)
 
-# ccc_skill_provider — echo the active provider, one of: claude | codex.
+# ccc_skill_provider — echo the active provider, one of: claude | codex | piri.
 #
 # Explicit CCC_SKILL_PROVIDER always wins. When unset we auto-detect: a node
 # with a Codex home but no Claude home/binary is a Codex node; everything else
-# defaults to claude (the historical, back-compatible behavior).
+# defaults to claude (the historical, back-compatible behavior). Piri is
+# explicit-only: bridge nodes commonly carry a ~/.piri/agent tree for A2A
+# workers while their interactive lane stays Claude, so a home-dir probe can
+# never select piri on its own.
 ccc_skill_provider() {
   local p="${CCC_SKILL_PROVIDER:-}"
   case "$p" in
     codex) printf 'codex'; return 0 ;;
+    piri) printf 'piri'; return 0 ;;
     claude) printf 'claude'; return 0 ;;
   esac
   local home="${HOME:-/root}"
@@ -42,6 +48,9 @@ ccc_skills_dir() {
   case "$provider" in
     codex)
       printf '%s' "${CODEX_SKILLS_DIR:-${CODEX_HOME:-$home/.codex}/skills}"
+      ;;
+    piri)
+      printf '%s' "${PIRI_SKILLS_DIR:-${PIRI_CODING_AGENT_DIR:-$home/.piri/agent}/skills}"
       ;;
     *)
       printf '%s' "${CLAUDE_SKILLS_DIR:-${CCC_CLAUDE_DIR:-$home/.claude}/skills}"

@@ -226,14 +226,18 @@ gate_node_specific() { # <skill.md> — hardcoded node facts stay human-reviewed
   return 0
 }
 
-gate_codex_compat() { # <skill.md> — Codex nodes reject Claude-only couplings
-  # No-op for the Claude provider. On a Codex node a draft that hard-codes the
-  # Claude CLI, the ~/.claude tree, or CLAUDE_* env can't run, so it stays
-  # human-reviewed (pending) instead of installing. Prose that merely mentions
-  # "Claude Code" is untouched — only concrete path/CLI/env couplings match, and
-  # the reason is a label only so markers/logs stay redaction-safe.
+gate_codex_compat() { # <skill.md> — non-Claude providers reject Claude-only couplings
+  # No-op for the Claude provider. On a Codex or Piri install target a draft
+  # that hard-codes the Claude CLI, the ~/.claude tree, or CLAUDE_* env can't
+  # run, so it stays human-reviewed (pending) instead of installing. Prose
+  # that merely mentions "Claude Code" is untouched — only concrete path/CLI/env
+  # couplings match, and the reason is a label only so markers/logs stay
+  # redaction-safe. Reason labels keep the historical codex-incompat prefix.
   local f="$1"
-  [ "${SKILL_PROVIDER:-claude}" = "codex" ] || return 0
+  case "${SKILL_PROVIDER:-claude}" in
+    codex|piri) ;;
+    *) return 0 ;;
+  esac
   if grep -qE '(^|[^A-Za-z0-9_-])claude[[:space:]]+-p([[:space:]]|$)' "$f" 2>/dev/null; then
     printf 'codex-incompat claude-cli'; return 1
   fi

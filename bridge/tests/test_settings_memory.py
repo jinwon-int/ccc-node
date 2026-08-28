@@ -42,6 +42,7 @@ MEMORY_FIELDS = {
     "codex_skill_collector_enabled": "CCC_CODEX_SKILL_COLLECTOR",
     "codex_skill_collector_max_jobs_per_sweep": "CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP",
     "codex_skill_pending_dir": "CCC_SKILL_REVIEW_PENDING_DIR",
+    "piri_skill_collector_enabled": "CCC_PIRI_SKILL_COLLECTOR",
 }
 
 
