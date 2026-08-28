@@ -362,6 +362,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh claude/hooks/skill-review.test.sh \
          claude/hooks/skill-review/ownership.test.sh \
          claude/hooks/skill-review/ownership-incremental.test.sh \
+         claude/hooks/skill-review/ownership-nolink-fallback.test.sh \
          claude/hooks/skill-review/curator.test.sh \
          claude/hooks/skill-review/autoinstall.test.sh \
          claude/hooks/skill-review/autoinstall-incremental.test.sh \

@@ -1098,6 +1098,46 @@ class _MutationLock:
                 os.close(descriptor)
 
 
+def _publish_exclusive(
+    source: str,
+    target: str,
+    dir_fd: int,
+    *,
+    already_exists: str,
+) -> None:
+    """Publish ``target`` from a fully written ``source`` without clobbering.
+
+    Prefers hardlink-based exclusive publish: ``os.link`` fails when the
+    target already exists, so the published name either appears atomically
+    with complete content or not at all. Platforms without ``os.link``
+    (e.g. Termux/Android, where mark-created installs otherwise fail closed
+    with ``provenance-write``) fall back to rename-after-recheck; the
+    per-node mutation lock serializes writers and the caller has already
+    stat-checked the target, so the re-check window is not reachable in
+    practice.
+    """
+    link = getattr(os, "link", None)
+    if link is not None:
+        try:
+            link(
+                source,
+                target,
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+                follow_symlinks=False,
+            )
+            return
+        except FileExistsError:
+            raise ContractError(already_exists) from None
+    try:
+        os.stat(target, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise ContractError(already_exists)
+    os.rename(source, target, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+
+
 def _write_marker_exclusive(
     context: Context,
     skill_dir: Path,
@@ -1139,18 +1179,17 @@ def _write_marker_exclusive(
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
-        try:
-            os.link(
-                temporary,
-                _AUTOSAVE_MARKER,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-                follow_symlinks=False,
-            )
-        except FileExistsError:
-            raise ContractError("autosave_marker_already_exists") from None
+        _publish_exclusive(
+            temporary,
+            _AUTOSAVE_MARKER,
+            directory_fd,
+            already_exists="autosave_marker_already_exists",
+        )
         published = True
-        os.unlink(temporary, dir_fd=directory_fd)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
         os.fsync(directory_fd)
     except OSError:
         if published:
@@ -2632,16 +2671,12 @@ def _create_target_noreplace(
                     parent_before.st_ino,
                 ):
                     raise ContractError("target_parent_drift")
-            try:
-                os.link(
-                    temporary,
-                    leaf,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError:
-                raise ContractError("target_already_exists") from None
+            _publish_exclusive(
+                temporary,
+                leaf,
+                parent_fd,
+                already_exists="target_already_exists",
+            )
             linked = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
             if (linked.st_dev, linked.st_ino) != temporary_identity:
                 raise ContractError("incremental_rollback_conflict")
@@ -2659,7 +2694,9 @@ def _create_target_noreplace(
             linked = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
             if (linked.st_dev, linked.st_ino) != temporary_identity:
                 raise ContractError("incremental_rollback_conflict")
-            os.unlink(temporary, dir_fd=parent_fd)
+            # Identity-checked so the rename-fallback publish (where the
+            # helper already consumed the temporary name) stays tolerant.
+            _unlink_if_identity(parent_fd, temporary, temporary_identity)
             temporary_identity = None
             os.fsync(parent_fd)
         except ContractError:
