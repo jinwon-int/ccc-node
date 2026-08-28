@@ -228,20 +228,28 @@ class ProjectChatHandler(
             self._async_completion_journal = AsyncCompletionJournal(
                 self.project_root / ".telegram_bot" / "async-completions"
             )
-            listener_setter = getattr(
-                self._agent_runtime,
-                "set_unowned_completion_listener",
-                None,
-            )
-            if callable(listener_setter):
-                listener_setter(self._observe_unowned_codex_completion)
-            durable_setter = getattr(
-                self._agent_runtime,
-                "set_durable_completion_listener",
-                None,
-            )
-            if callable(durable_setter):
-                durable_setter(self._observe_durable_codex_completion)
+            # Observer registration is mode-exclusive (#646): a runtime that
+            # declares durable delivery gets only the promotion observer —
+            # the degraded observer would otherwise journal the identity as
+            # evidence-only first, and the promotion observe would then be
+            # rejected as a duplicate. Degraded runtimes keep the slice-1
+            # observer and never promote.
+            if self._runtime_declares_durable_delivery():
+                durable_setter = getattr(
+                    self._agent_runtime,
+                    "set_durable_completion_listener",
+                    None,
+                )
+                if callable(durable_setter):
+                    durable_setter(self._observe_durable_codex_completion)
+            else:
+                listener_setter = getattr(
+                    self._agent_runtime,
+                    "set_unowned_completion_listener",
+                    None,
+                )
+                if callable(listener_setter):
+                    listener_setter(self._observe_unowned_codex_completion)
         except Exception:
             self._async_completion_journal = None
             logger.exception(
@@ -379,6 +387,20 @@ class ProjectChatHandler(
         except OSError:
             logger.warning("Owner notice spool write failed; notice stays log-only")
 
+    def _runtime_declares_durable_delivery(self) -> bool:
+        """Whether the injected runtime claims durable delivery (#646)."""
+
+        capability_getter = getattr(
+            self._agent_runtime, "async_completion_capability", None
+        )
+        if not callable(capability_getter):
+            return False
+        try:
+            capability = capability_getter()
+        except Exception:
+            return False
+        return bool(getattr(capability, "supports_durable_delivery", False))
+
     def set_async_completion_sender(self, sender: Any) -> None:
         """Wire the conversation delivery seam for durable completions (#646).
 
@@ -475,16 +497,7 @@ class ProjectChatHandler(
         # durable delivery, so a degraded runtime (every production provider
         # today) skips the journal scan entirely — the per-turn hot path
         # stays free of filesystem work.
-        capability_getter = getattr(
-            self._agent_runtime, "async_completion_capability", None
-        )
-        if not callable(capability_getter):
-            return
-        try:
-            capability = capability_getter()
-        except Exception:
-            return
-        if not getattr(capability, "supports_durable_delivery", False):
+        if not self._runtime_declares_durable_delivery():
             return
         journal = self._init_async_completion_journal()
         if journal is None:

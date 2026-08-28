@@ -492,13 +492,13 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "explicitly at-least-once."
         ),
         codex=_degraded(
-            "Only turn/completed for the exact bridge-owned active turn is handled. "
-            "The official app-server contract exposes thread/read but no detached "
-            "ownership signal or negotiated protocol version, "
-            "so otherwise-valid unowned completions remain undelivered and are counted "
-            "only through body-free bounded diagnostics; no Telegram send, journal, "
-            "thread/read replay, or Claude transcript inference occurs. Runtime reports "
-            "a machine-readable degraded boundary and "
+            "Only turn/completed for the exact bridge-owned active turn is "
+            "delivered. There is still no detached ownership signal or negotiated "
+            "protocol version, so otherwise-valid unowned completions are never "
+            "auto-delivered: they are journaled body-free (route-bound only under "
+            "a declared durable-delivery capability, reclaimed body-free on the "
+            "next user turn), with no thread/read replay and no Claude transcript "
+            "inference. Runtime reports a machine-readable degraded boundary and "
             "supports_async_completion_delivery=false.",
             "#646",
         ),
