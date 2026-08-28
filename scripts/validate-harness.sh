@@ -289,12 +289,11 @@ else
   err "Codex managed-skill validation/tests failed"
   tail -10 "$TMP/codex-skills-validate.out" "$TMP/codex-skills-test.out" 2>/dev/null
 fi
-if python3 scripts/ccc-skill-registry.py validate --repo-root . >"$TMP/skill-registry.out" 2>&1 \
-   && bash scripts/ccc-skill-registry.test.sh >"$TMP/skill-registry-test.out" 2>&1; then
-  say "  ok Skill registry freshness + lifecycle tests (#1338)"
+if python3 scripts/ccc-skill-registry.py validate --repo-root . >"$TMP/skill-registry.out" 2>&1; then
+  say "  ok Skill registry freshness (#1338)"
 else
-  err "skill registry validation/tests failed"
-  tail -10 "$TMP/skill-registry.out" "$TMP/skill-registry-test.out" 2>/dev/null
+  err "skill registry validation failed"
+  tail -10 "$TMP/skill-registry.out" 2>/dev/null
 fi
 if python3 scripts/ccc_memory_timeparse_test.py >"$TMP/timeparse-test.out" 2>&1; then
   say "  ok NL as_of time-reference estimation tests (#871)"
@@ -402,6 +401,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/cost-ledger.test.sh \
          scripts/cost-ledger-weekly.test.sh \
          scripts/ccc-skill-promotion.test.sh \
+         scripts/ccc-skill-registry.test.sh \
          scripts/ccc-fleet-skills-sync.test.sh \
          scripts/gh-pr-flow-seoseo-merge.test.sh \
          scripts/ccc-self-update.test.sh scripts/self-update-check.test.sh scripts/ccc-provenance.test.sh \

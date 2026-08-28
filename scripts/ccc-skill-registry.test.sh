@@ -189,5 +189,5 @@ out="$(python3 "$REG" update --repo-root "$TMP/gitmode" 2>/dev/null)"
 ok "untracked new skill dir registers in git mode" 'echo "$out" | jq -e ".ok == true and .written == true and .skills == 5" >/dev/null'
 ok "git-mode tree validates fresh" 'python3 "$REG" validate --repo-root "$TMP/gitmode" | jq -e ".ok == true" >/dev/null'
 
-echo "pass=$pass fail=$fail"
+echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
