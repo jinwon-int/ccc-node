@@ -1,6 +1,6 @@
 ---
 name: web-routing
-description: Route general web search through the fleet SearXNG, known public URL reads through Firecrawl scrape, and public developer documentation/README/issue/merged-PR lookup through Firecrawl Developer Index. Use for web research and URL reading.
+description: Route general web search through Firecrawl Search, known public URL reads through Firecrawl scrape, public developer documentation/README/issue/merged-PR lookup through Firecrawl Developer Index, and explicit SearXNG only as a fallback. Use for web research and URL reading.
 ---
 
 # Fleet web routing
@@ -9,11 +9,13 @@ Keep these retrieval surfaces separate.
 
 ## General web search
 
-Use `mcp__searxng__searxng_web_search` for broad web search, current events,
+Use `mcp__firecrawl__firecrawl_search` for broad web search, current events,
 news, comparisons, and finding an unknown URL.
 
-Do not use Firecrawl general search when the SearXNG tool is available. If
-SearXNG fails, report the outage instead of silently changing providers.
+Use `mcp__searxng__searxng_web_search` only as an explicit fallback: Korean or
+Naver-oriented lookup, Tailnet-local privacy, or when Firecrawl search failed.
+If Firecrawl search fails, report the outage instead of silently changing
+providers.
 
 ## Known public URL
 

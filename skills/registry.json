@@ -257,13 +257,13 @@
     {
       "audience": "piri",
       "classification": null,
-      "description": "Search the public web through the fleet SearXNG, fetch/read known public URLs through Firecrawl, and search Firecrawl Developer Index for public documentation, README, issue, and merged-PR evidence. Use for current external facts and developer research. NOT for Family Wiki content or private/internal URLs.",
+      "description": "Search the public web through Firecrawl Search (default) or explicit fleet SearXNG, fetch/read known public URLs through Firecrawl scrape, and search Firecrawl Developer Index for public documentation, README, issue, and merged-PR evidence. Use for current external facts and developer research. NOT for Family Wiki content or private/internal URLs.",
       "files": 5,
       "managed": false,
       "name": "web",
       "source": "piri/skills/web",
       "status": "active",
-      "tree_sha256": "79c31b66a13bc5f8df41000ac1ff43e1b26d8e3b440b33216e1076beeeb6079f"
+      "tree_sha256": "ad5ae95f22b10921342ca215f907c5a4d7c764aa24e780636243694e1adb660a"
     },
     {
       "audience": "shared",
@@ -389,13 +389,13 @@
     {
       "audience": "shared",
       "classification": "adapted",
-      "description": "Route general web search through the fleet SearXNG, known public URL reads through Firecrawl scrape, and public developer documentation/README/issue/merged-PR lookup through Firecrawl Developer Index. Use for web research and URL reading.",
+      "description": "Route general web search through Firecrawl Search, known public URL reads through Firecrawl scrape, public developer documentation/README/issue/merged-PR lookup through Firecrawl Developer Index, and explicit SearXNG only as a fallback. Use for web research and URL reading.",
       "files": 2,
       "managed": true,
       "name": "web-routing",
       "source": "skills/shared/web-routing",
       "status": "active",
-      "tree_sha256": "79653a646749abd5c90dba3d275fac709d70b0a27156c759afdf3c6979dfdd37"
+      "tree_sha256": "90be74aa3cafb501eea20290d25a792422d82770f92042568ba6a5e158d9ba51"
     },
     {
       "audience": "shared",

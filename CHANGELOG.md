@@ -4,6 +4,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- **Fleet web search default is Firecrawl Search.** Curated `searxng-firecrawl`
+  mode now allows `mcp__firecrawl__firecrawl_search` as the general search tool
+  and keeps SearXNG search as an explicit fallback (Korean/Naver, Tailnet
+  privacy, or Firecrawl failure). Firecrawl scrape and Developer Index are
+  unchanged. Piri `web_search.py` defaults to Firecrawl and requires
+  `--provider searxng` for the Tailnet engine. No silent provider switch.
+
 ### Added
 - **Piri skill-candidate provider (#667 extension).** The skill-autosave
   pipeline now covers Piri nodes end to end: `provider.sh` resolves an
