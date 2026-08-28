@@ -118,7 +118,14 @@ class BridgeStatusVerdictTest(unittest.TestCase):
         ), patch.object(
             doctor,
             "bridge_unit_environment_value",
-            side_effect=AssertionError("Codex path must not come from the bridge unit"),
+            # The budget lookup may consult the unit (#1318), but the CLI
+            # path must never: the Codex readiness check runs live probes
+            # and its service wrapper is not a probe-safe binary.
+            side_effect=lambda key: (
+                AssertionError("Codex path must not come from the bridge unit")
+                if key == "CCC_PIRI_CLI_PATH"
+                else None
+            ),
         ):
             doctor.check_distill_readiness()
 
@@ -137,6 +144,75 @@ class BridgeStatusVerdictTest(unittest.TestCase):
         self.assertEqual(doctor.distill_readiness, "static-ready")
         self.assertIn("live auth unproven", doctor.rows[-1].status)
 
+    def test_budget_falls_back_to_matching_bridge_unit_dropin(self) -> None:
+        """Clean-shell sweeps read the drop-in budget, not just os.environ (#1318)."""
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp) / "ccc-node"
+            root.mkdir()
+            executable = Path(temp) / "ccc-piri"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            unit = Path(temp) / "ccc-telegram-bridge.service"
+            unit.write_text(
+                "[Service]\n"
+                f"ExecStart=/bin/bash {root}/bridge/start.sh --path {temp}\n",
+                encoding="utf-8",
+            )
+            dropin_dir = unit.parent / f"{unit.name}.d"
+            dropin_dir.mkdir()
+            dropin = dropin_dir / "memory-budget.conf"
+            dropin.write_text(
+                "[Service]\n"
+                "Environment=CCC_USAGE_BUDGET_TOKENS_PIRI=4000000\n",
+                encoding="utf-8",
+            )
+            stale_unit = Path(temp) / "stale-bridge.service"
+            stale_unit.write_text(
+                "[Service]\n"
+                "Environment=CCC_USAGE_BUDGET_TOKENS_PIRI=1\n"
+                f"ExecStart=/bin/bash {temp}/stale/bridge/start.sh --path {temp}\n",
+                encoding="utf-8",
+            )
+            doctor = Doctor(root, Path(temp) / ".claude", "settings")
+            doctor.provider = "piri"
+            doctor._bridge_provider_state = ("piri", "healthy")
+            with patch.dict(
+                "os.environ",
+                {"CCC_MEMORY_DISTILL_PROVIDER": "auto"},
+                clear=True,
+            ), patch.object(
+                doctor,
+                "bridge_systemd_units",
+                return_value=[stale_unit, unit],
+            ), patch.object(
+                doctor, "running_bridge_root", return_value=str(root)
+            ), patch(
+                "ccc_doctor.shutil.which", return_value=str(executable)
+            ):
+                doctor.check_distill_readiness()
+
+        # The drop-in budget resolves: fail-closed must NOT fire. The stale
+        # twin unit's budget=1 is ignored (ExecStart root mismatch).
+        self.assertEqual(doctor.distill_readiness, "ready")
+        self.assertNotIn("fail-closed", doctor.rows[-1].status)
+
+    def test_budget_fallback_keeps_fail_closed_without_any_unit(self) -> None:
+        """No unit, no budget: the fail-closed warning stays hermetic (#1318)."""
+
+        doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
+        doctor.provider = "codex"
+        doctor._bridge_provider_state = ("codex", "healthy")
+        with patch.dict(
+            "os.environ",
+            {"CCC_MEMORY_DISTILL_PROVIDER": "auto"},
+            clear=True,
+        ), patch.object(doctor, "bridge_systemd_units", return_value=[]):
+            doctor.check_distill_readiness()
+
+        self.assertEqual(doctor.distill_readiness, "blocked")
+        self.assertIn("fail-closed", doctor.rows[-1].status)
+
     def test_distill_without_finite_budget_is_safely_blocked(self) -> None:
         doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
         doctor.provider = "codex"
@@ -145,6 +221,12 @@ class BridgeStatusVerdictTest(unittest.TestCase):
             "os.environ",
             {"CCC_MEMORY_DISTILL_PROVIDER": "auto"},
             clear=True,
+        ), patch.object(
+            # Hermetic against the host: a node whose own unit drop-in sets
+            # this budget must not flip the expectation (#1318 follow-up).
+            doctor,
+            "bridge_unit_environment_value",
+            return_value=None,
         ):
             doctor.check_distill_readiness()
 
