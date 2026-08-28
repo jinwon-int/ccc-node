@@ -82,3 +82,22 @@ by the provisioner.
   paths, hashes); no secrets, no generated skill bodies.
 - Fleet-wide approval and private learned-skill intake remain in
   `jinwon-int/fleet-skills`; this registry describes this repository only.
+
+## Skill precedence
+
+Skill directories have one owner; every tool respects the highest layer and
+never fights it (#1344):
+
+```
+repo-managed (setup.sh manifest / .ccc-node-managed.json)
+  > fleet-approved (.ccc-fleet-skill.json)
+    > autosave-owned (installed-by=autosave ledger)
+      > user-owned (no tool touches)
+```
+
+`ccc-fleet-skills-sync.py` reports `skip-repo-managed` for targets the repo
+layer owns (claude root: manifest membership; codex root: provisioner
+marker) instead of failing, and setup absorbs fleet-installed copies of repo
+skills with a log line. The full contract, the graduation checklist, and the
+fleet-skills retirement procedure live in
+[`skill-graduation.md`](skill-graduation.md).

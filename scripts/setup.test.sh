@@ -654,5 +654,26 @@ out="$(HOME="$TMP/dm-home-1235" CCC_CLAUDE_DIR="$dm_claude" CCC_HERMES_DIR="$TMP
 ok "dry-run reports the preserved pin without writing" \
   '[ "$dm_before" = "$(cat "$dm_claude/settings.json")" ] && grep -q "preserve node-local model pin" <<<"$out"'
 
+# Graduation precedence (#1344): when a fleet-installed skill graduates into
+# the repo, setup.sh absorbs the fleet copy wholesale — repo bytes win, the
+# fleet provenance marker disappears, and the absorption is visible in the
+# log instead of being yet another silent skill-dir replacement (#1330).
+fleet_home="$TMP/fleet-grad-home"
+fleet_claude="$fleet_home/.claude"
+mkdir -p "$fleet_claude/skills/wiki-record" "$fleet_claude/state"
+printf 'fleet-era copy\n' > "$fleet_claude/skills/wiki-record/SKILL.md"
+jq -n '{schema_version:1,manager:"ccc-node-fleet-skills",repo:"jinwon-int/fleet-skills",commit:"0123456789abcdef0123456789abcdef01234567",provider:"claude",audience:"shared",name:"wiki-record",tree_sha256:("f"*64),source_candidate_id:"wiki-record-000000000000",source_tree_sha256:("0"*64),reviewed_by:"independent-reviewer"}' > "$fleet_claude/skills/wiki-record/.ccc-fleet-skill.json"
+fleet_out="$TMP/fleet-grad-setup.out"
+HOME="$fleet_home" CCC_CLAUDE_DIR="$fleet_claude" CCC_HERMES_DIR="$fleet_home/.hermes" \
+  bash "$SETUP" --no-backup >"$fleet_out" 2>&1
+ok "setup absorbs a fleet-installed copy of a repo skill" \
+  'cmp -s "$fleet_claude/skills/wiki-record/SKILL.md" "$ROOT/skills/shared/wiki-record/SKILL.md"'
+ok "setup removes the fleet provenance marker on absorption" \
+  '[ ! -e "$fleet_claude/skills/wiki-record/.ccc-fleet-skill.json" ]'
+ok "setup records the absorbed skill in the repo manifest" \
+  'grep -q "^wiki-record " "$fleet_claude/state/repo-skills.manifest"'
+ok "fleet absorption is logged, not silent" \
+  'grep -q "absorbing fleet-installed skill wiki-record" "$fleet_out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
