@@ -101,3 +101,25 @@ marker) instead of failing, and setup absorbs fleet-installed copies of repo
 skills with a log line. The full contract, the graduation checklist, and the
 fleet-skills retirement procedure live in
 [`skill-graduation.md`](skill-graduation.md).
+
+## Usage telemetry & monthly audit
+
+`claude/hooks/skill-usage-log.sh` (PostToolUse `Read|Skill`) appends one
+owner-only line per skill load to
+`$CCC_CLAUDE_DIR/state/skill-usage/usage.jsonl` — the Skill tool and Read of
+any `*/skills/*/SKILL.md` both count, which is how bridge-resolved skills
+actually load. Best-effort by contract: every failure exits 0 and never
+blocks a read.
+
+Monthly retroactive audit (first cycle: 2026-08-28, #1347):
+
+1. `bash ~/.claude/hooks/skill-usage-log.sh report 30` — per-skill load
+   counts for the window.
+2. Diff against the registry: zero-load skills become cull/archive/keep
+   candidates, decided with the graduation checklist's evidence bar
+   ([`skill-graduation.md`](skill-graduation.md)).
+3. Archive demotions land in `docs/archive/skills/`; removals re-render the
+   registry (files + update command).
+
+Known gap: bridge sessions with audience-isolated settings may bypass host
+hooks — a bridge-side log line is the follow-up.
