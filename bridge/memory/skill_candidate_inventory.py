@@ -15,7 +15,7 @@ import re
 import stat
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Literal
 
 from .skill_candidate import _CREDENTIAL_PATTERNS, _DIRECTIVE_RE
 
@@ -228,14 +228,22 @@ class SkillCandidateInventoryBuilder:
 
     @classmethod
     def from_environment(
-        cls, environment: dict[str, str] | None = None
+        cls,
+        environment: dict[str, str] | None = None,
+        *,
+        provider: Literal["codex", "piri"] = "codex",
     ) -> "SkillCandidateInventoryBuilder":
         env = dict(os.environ if environment is None else environment)
         home = Path(env.get("HOME", "/root"))
         codex_home = Path(env.get("CODEX_HOME", home / ".codex"))
         claude_dir = Path(env.get("CCC_CLAUDE_DIR", home / ".claude"))
+        if provider == "piri":
+            piri_agent = Path(env.get("PIRI_CODING_AGENT_DIR", home / ".piri" / "agent"))
+            skills_dir = Path(env.get("PIRI_SKILLS_DIR", piri_agent / "skills"))
+        else:
+            skills_dir = Path(env.get("CODEX_SKILLS_DIR", codex_home / "skills"))
         return cls(
-            skills_dir=Path(env.get("CODEX_SKILLS_DIR", codex_home / "skills")),
+            skills_dir=skills_dir,
             state_dir=Path(env.get("CCC_STATE_DIR", claude_dir / "state")),
             ownership_tool=Path(
                 env.get(

@@ -54,6 +54,7 @@ _SKILL_SCHEMA: Final = (
     / "schemas"
     / "codex-skill-candidate-v2.schema.json"
 )
+SKILL_SCHEMA_PATH = _SKILL_SCHEMA
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _PROVIDER_DEFAULT_MODEL = "provider-default"
 _MAX_TIMEOUT_SECONDS = 10 * 60.0
@@ -218,6 +219,7 @@ class CodexExecSkillCandidateBackend:
 __all__ = [
     "SKILL_CANDIDATE_PROMPT",
     "MAX_SKILL_CANDIDATE_OUTPUT_BYTES",
+    "SKILL_SCHEMA_PATH",
     "SkillCandidateBackendError",
     "CodexExecSkillCandidateBackend",
     "canonical_skill_candidate_input_bytes",
