@@ -1703,6 +1703,7 @@ def _build_dispatch_manifest(  # noqa: C901
                 "payload": {
                     "schema": "skills.skill-intake-review.v1",
                     "rubricVersion": _INTAKE_RUBRIC_VERSION,
+                    "scope": "fleet-internal",
                     "skillName": candidate.name,
                     "provenance": {
                         "author_node": candidate.node,
