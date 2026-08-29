@@ -357,5 +357,116 @@ out="$(env "${base_env[@]}" CCC_STATE_DIR="$outside_state" python3 "$PROMOTER" s
 ok "a state dir outside HOME still resolves through the unanchored walk" \
   '[ "$rc" = 0 ] && jq -e ".enabled == true" >/dev/null <<<"$out"'
 
+# ─── R1 autorepair (#1357) ──────────────────────────────────────────────────
+
+cat > "$TMP/ar-driver.py" <<'PYDRIVER'
+import importlib.util, json, os, pathlib, sys
+promoter, tmp, case_arg = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location("promo_ar", promoter)
+m = importlib.util.module_from_spec(spec); sys.modules["promo_ar"] = m; spec.loader.exec_module(m)
+case = json.load(open(case_arg))
+home = pathlib.Path(tmp) / "home"
+env = {"HOME": str(home), "PATH": os.environ["PATH"]}
+cfg = m._config(env)
+result = {"autorepair": cfg.autorepair_enabled}
+if case.get("mode") == "repair":
+    skills = home / ".claude" / "skills"
+    skill_dir = skills / case["name"]
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(case["content"], encoding="utf-8")
+    marker = {"schema_version": 2, "manager": "ccc-node-skill-autosave", "ownership": "autosave-managed",
+              "provider": "claude", "name": case["name"], "target_id": "t", "skill_sha256": case["old_sha"],
+              "created_by": "ccc-node", "rollback_eligible": True, "provenance_revision": 1}
+    (skill_dir / ".autosave-meta.json").write_text(json.dumps(marker), encoding="utf-8")
+    try:
+        if case["call"] == "frontmatter":
+            m._repair_skill_frontmatter(skill_dir, case["name"])
+            body = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+            result.update({"name_ok": f"name: {case['name']}" in body,
+                           "desc_kept": "Validate the demo procedure" in body})
+        elif case["call"] == "couplings":
+            repaired_flag = m._autorepair_candidate(cfg, "claude", case["name"], "runtime_specific_claude")
+            body = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+            result.update({"repaired_flag": repaired_flag,
+                           "coupling_free": ("claude -p" not in body and "CLAUDE_MODEL" not in body)})
+        else:
+            sys.exit(3)
+    except m.PromotionError as e:
+        result.update({"error": e.code})
+print(json.dumps(result))
+PYDRIVER
+
+ar_case() { # $1 = case json content, echoes driver output
+  printf '%s' "$1" > "$TMP/ar-case.json"
+  env "PATH=$BIN:$PATH" T_AUTOREPAIR="${T_AUTOREPAIR:-}" \
+    python3 "$TMP/ar-driver.py" "$PROMOTER" "$TMP" "$TMP/ar-case.json"
+}
+
+# default off
+T_AUTOREPAIR='' out="$(ar_case '{"mode":"config"}')"
+ok "autorepair defaults to off" 'jq -e ".autorepair | not" >/dev/null <<<"$out"'
+
+# state file enables
+mkdir -p "$STATE" && printf 'true\n' > "$STATE/skill-promotion.autorepair" && chmod 600 "$STATE/skill-promotion.autorepair"
+T_AUTOREPAIR='' out="$(ar_case '{"mode":"config"}')"
+ok "autorepair state file enables the gate" 'jq -e ".autorepair == true" >/dev/null <<<"$out"'
+
+# frontmatter repair: broken frontmatter rebuilt, name restored, marker re-stamped
+cat > "$TMP/case-fm.json" <<'JSON'
+{"mode":"repair","call":"frontmatter","name":"demo-skill","old_sha":"old","content":"---\nname: wrong-name\nclumsy line without colon\n---\n\n## When to Use\n\nValidate the demo procedure against a live system and record the evidence.\n"}
+JSON
+T_AUTOREPAIR=1 out="$(ar_case "$(cat "$TMP/case-fm.json")")"
+ok "frontmatter autorepair rebuilds name and derives description" \
+  'jq -e ".name_ok == true and .desc_kept == true" >/dev/null <<<"$out"'
+
+# coupling repair: stub claude neutralizes runtime-specific text
+cat > "$BIN/claude" <<'STUB'
+#!/usr/bin/env bash
+prompt="${*: -1}"
+body="${prompt##*---}"
+printf '%s\n' "$(printf '%s' "$body" | sed -E 's/claude -p/the coding agent CLI/g; s/CLAUDE_MODEL/the model env/g; s|\.claude/|the agent config dir|g')"
+STUB
+chmod +x "$BIN/claude"
+cat > "$TMP/case-coupling.json" <<'JSON'
+{"mode":"repair","call":"couplings","name":"demo-skill","old_sha":"old","content":"---\nname: demo-skill\ndescription: Run the model verify procedure against the live worker and record outputs.\n---\n\n## When to Use\n\nRun `claude -p` with CLAUDE_MODEL set and inspect the .claude/ config dir.\n"}
+JSON
+T_AUTOREPAIR=1 out="$(ar_case "$(cat "$TMP/case-coupling.json")")"
+ok "runtime coupling repair neutralizes text and re-stamps marker" \
+  'jq -e ".repaired_flag == true and .coupling_free == true" >/dev/null <<<"$out"'
+
+# persisting coupling -> fail-closed error
+cat > "$BIN/claude-stub-echo" <<'STUB'
+#!/usr/bin/env bash
+cat
+STUB
+chmod +x "$BIN/claude-stub-echo"
+mkdir -p "$TMP/badbin"
+cat > "$TMP/badbin/claude" <<'BADSTUB'
+#!/usr/bin/env bash
+for _ in 1 2 3; do printf '%s\n' "still says claude -p and CLAUDE_MODEL here"; done
+BADSTUB
+chmod +x "$TMP/badbin/claude"
+out="$(PATH="$TMP/badbin:$(dirname "$(command -v python3)"):/usr/bin:/bin" T_AUTOREPAIR=1 python3 - "$PROMOTER" "$TMP" "$TMP/case-coupling.json" <<'PYINNER'
+import importlib.util, json, os, pathlib, sys
+promoter, tmp, case_path = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location("promo_ar2", promoter)
+m = importlib.util.module_from_spec(spec); sys.modules["promo_ar2"] = m; spec.loader.exec_module(m)
+case = json.load(open(case_path))
+home = pathlib.Path(tmp) / "ar-home2"
+env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+cfg = m._config(env)
+skills = home / ".claude" / "skills"
+skill_dir = skills / case["name"]
+skill_dir.mkdir(parents=True, exist_ok=True)
+(skill_dir / "SKILL.md").write_text(case["content"], encoding="utf-8")
+try:
+    m._autorepair_llm(skill_dir, "claude")
+    print(json.dumps({"repaired": True}))
+except m.PromotionError as e:
+    print(json.dumps({"error": e.code}))
+PYINNER
+)"
+ok "unrepaired couplings fail closed" 'jq -e ".error == \"runtime_specific_claude\"" >/dev/null <<<"$out"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
