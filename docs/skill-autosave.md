@@ -336,6 +336,36 @@ same branch and PR already exist, the next sweep reuses it and acknowledges the
 local envelope. `CCC_AUTONOMY=dry-run` previews staging/collection and
 `CCC_AUTONOMY=kill` stops both with the rest of the autosave sweep.
 
+### Drop-recommendation sweep report (#1363)
+
+When the auto-revision gate's reviser answers `outcome: drop_recommendation`,
+the publisher records it in its ledger (`kind a2a-revise-result`, status
+`drop-recommended`) and leaves the intake PR open. Drop execution is always a
+human decision (#1357 open decision (b)); the `drop-report` subcommand is the
+read-only periodic sweep over those records:
+
+```bash
+python3 ~/.claude/hooks/ccc-skill-promotion.py drop-report
+# weekly, optionally with human-processed bookkeeping:
+python3 ~/.claude/hooks/ccc-skill-promotion.py drop-report --ack <task-id>
+```
+
+Each pending item joins the drop record with its revise dispatch and carries
+skill name, author node, provider, intake PR link, revise round,
+`dropRecommendation.reason`, and the first recorded time. The summary reports
+new items (recorded since the previous sweep), total pending items, pending
+lineages, and per-node distribution. The report never deletes a ledger record,
+comments, or touches a PR; GitHub automation is intentionally absent.
+Two `0600` owner-only state files beside the ledger carry the bookkeeping under
+the same safety invariants: `drop-report.acked.jsonl` (task ids a human marked
+processed via `--ack`, repeatable and idempotent) and
+`drop-report.sweeps.jsonl` (task ids prior sweeps already showed, so `new`
+stays accurate). Both reads fail closed on unsafe state, the report stays
+viewable under `CCC_AUTONOMY=kill`/`dry-run`, and a failed sweep recording only
+degrades the `new` computation (reported as `sweep_recorded: false`). The
+publisher node runs the report on a weekly cron (see the deployment record for
+the installed schedule).
+
 ### Installing approved private skills
 
 Setup installs the consumer beside the autosave hooks, but does not run it.
