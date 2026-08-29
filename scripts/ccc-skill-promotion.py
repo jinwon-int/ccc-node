@@ -1546,9 +1546,31 @@ def _broker_id(config: Config, secret: str) -> str:
     return broker_id.strip()
 
 
-def _dispatch_target_worker(config: Config, author_node: str) -> str:
-    """Stable keyring-worker pick excluding the author; the broker enforces
-    author disqualification independently, so this is defense in depth."""
+def _broker_online_worker_ids(config: Config, secret: str) -> set[str]:
+    try:
+        completed = _run(
+            ["curl", "-fsS", "-H", f"x-a2a-edge-secret: {secret}", f"{config.broker_url}/workers"]
+        )
+        payload = json.loads(completed.stdout.decode("utf-8"))
+    except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PromotionError("dispatch_broker_unreachable") from error
+    items = payload.get("items") if isinstance(payload, dict) else None
+    online: set[str] = set()
+    if isinstance(items, list):
+        for row in items:
+            node_id = row.get("nodeId") if isinstance(row, dict) else None
+            if isinstance(node_id, str) and node_id.strip():
+                online.add(node_id.strip())
+    return online
+
+
+def _dispatch_target_worker(config: Config, author_node: str, secret: str) -> str:
+    """Pick a reviewer that is actually homed on the target broker: keyring
+    workers minus the author, intersected with the broker's online workers.
+    A keyring worker registered on the OTHER broker would 404 at task creation
+    (#2011 rollout, 2026-08-29: daegyo is T2-homed while seoseo dispatches on
+    T1). The broker also enforces author disqualification independently."""
+    online = _broker_online_worker_ids(config, secret)
     completed = _run(
         ["gh", "api", f"repos/{config.repo}/contents/refs/a2a-public-keyring.json?ref={config.base}"]
     )
@@ -1562,10 +1584,10 @@ def _dispatch_target_worker(config: Config, author_node: str) -> str:
     if isinstance(keys, dict):
         for key_id in sorted(keys):
             match = re.fullmatch(r"worker:([a-z0-9_-]{2,32}):g\d+:v\d+", key_id)
-            if match and match.group(1) != author_node:
+            if match and match.group(1) != author_node and match.group(1) in online:
                 workers.append(match.group(1))
     if not workers:
-        raise PromotionError("dispatch_no_reviewer")
+        raise PromotionError("dispatch_no_reviewer_online")
     return workers[0]
 
 
@@ -1623,12 +1645,12 @@ def _build_dispatch_manifest(  # noqa: C901
     return {
         "roundId": round_id,
         "brokerUrl": config.broker_url,
-        "requester": {"id": config.node, "role": "publisher"},
+        "requester": {"id": config.node, "role": "operator"},
         "defaults": {"intent": _INTAKE_LANE},
         "lanes": [
             {
                 "id": task_id,
-                "target": {"id": reviewer, "role": "reviewer"},
+                "target": {"id": reviewer, "role": "analyst"},
                 "intent": _INTAKE_LANE,
                 "message": (
                     f"skills-intake-reviewer procedure invoked: review fleet-skills intake "
@@ -1753,7 +1775,7 @@ def _dispatch_intake_review(  # noqa: C901
         if not _wait_for_skills_check(config, head, config.dispatch_ci_wait_sec):
             return {"outcome": "dispatch-skipped", "code": "dispatch_ci_not_green"}
         procedure = _worker_procedure_from_docs(config.a2a_nexus_dir)
-        reviewer = _dispatch_target_worker(config, candidate.node)
+        reviewer = _dispatch_target_worker(config, candidate.node, secret)
         broker_id = _broker_id(config, secret)
         inventory = _inventory_snapshot(config)
         now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
