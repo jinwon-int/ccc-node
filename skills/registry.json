@@ -389,13 +389,13 @@
     {
       "audience": "shared",
       "classification": "adapted",
-      "description": "Route general web search through Firecrawl Search, known public URL reads through Firecrawl scrape, public developer documentation/README/issue/merged-PR lookup through Firecrawl Developer Index, and explicit SearXNG only as a fallback. Use for web research and URL reading.",
+      "description": "Route general web search through Firecrawl Search, known public URL reads through Firecrawl scrape, public developer documentation/README/issue/merged-PR lookup through Firecrawl Developer Index, and explicit SearXNG only as a fallback. Use when doing web research, reading known public URLs, or looking up developer documentation/issues/PRs.",
       "files": 2,
       "managed": true,
       "name": "web-routing",
       "source": "skills/shared/web-routing",
       "status": "active",
-      "tree_sha256": "90be74aa3cafb501eea20290d25a792422d82770f92042568ba6a5e158d9ba51"
+      "tree_sha256": "f829c9261120969bf858f3fc5206e414852329476a69e37527bd081ad9a5fe46"
     },
     {
       "audience": "shared",
