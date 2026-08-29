@@ -1,6 +1,6 @@
 ---
 name: ghost-process-cleanup-and-verification
-description: "Identify, back up, and cleanly remove stale background processes (cron, timers, scheduled tasks) while verifying parallel installations aren't collateral damage."
+description: Identify, back up, and cleanly remove stale background processes (cron, timers, scheduled tasks) while verifying parallel installations aren't collateral damage. Use when a background process (cron job, systemd timer, at job, scheduled task) exists but should not, or when the same task exists in multiple places and only one copy should remain.
 ---
 
 ## When to Use

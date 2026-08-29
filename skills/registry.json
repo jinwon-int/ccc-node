@@ -4,13 +4,13 @@
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Systematically review bilingual medical terminology pairs in multilingual clinical content (NCLEX, etc.) across all changed keys, validating semantic equivalence, clinical accuracy, and standards compliance, then render structured PASS/BLOCK verdict.",
+      "description": "Systematically review bilingual medical terminology pairs in multilingual clinical content (NCLEX, etc.) across all changed keys, validating semantic equivalence, clinical accuracy, and standards compliance, then render structured PASS/BLOCK verdict. Use when reviewing A2AD terminology_bilingual lanes for NCLEX or similar multilingual clinical content, where every changed TERM-REC key must be individually validated and accounted for before screen-to-reviewed promotion.",
       "files": 1,
       "managed": false,
       "name": "bilingual-terminology-review-gate",
       "source": "claude/skills/bilingual-terminology-review-gate",
       "status": "active",
-      "tree_sha256": "d7d486e342239be9c9cb21de448f334bec41f04ac8b55fd18d60090522d856dc"
+      "tree_sha256": "5312ead3403326090a2c8a977fa6f9a04f44268cbfba92960c977cf57c71068c"
     },
     {
       "audience": "claude",
@@ -37,13 +37,13 @@
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Diagnose and safely adjust service timeout configuration for performance-limited workloads; includes backup, restart, and post-restart verification that config loaded",
+      "description": "Diagnose and safely adjust service timeout configuration for performance-limited workloads; includes backup, restart, and post-restart verification that config loaded Use when a service or bridge consistently times out during resource-intensive operations and the timeout looks like a hard limit rather than a genuine hang or deadlock.",
       "files": 1,
       "managed": false,
       "name": "bridge-timeout-performance-tuning-and-verification",
       "source": "claude/skills/bridge-timeout-performance-tuning-and-verification",
       "status": "active",
-      "tree_sha256": "0634546ce5a1e5bdc863a8f010b243cd771c864047b4d7acec64d2a90afafbe2"
+      "tree_sha256": "d53cd37ea68f910411dd30b3c22a1a84ea093c30467c8ad14323f5ada25f8466"
     },
     {
       "audience": "claude",
@@ -59,13 +59,13 @@
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Manually trigger / inspect / toggle the Session Distiller (TM-1058) — the PreCompact+SessionEnd memory pipeline that distills transcripts via Haiku and routes to Honcho + wiki-candidates. Use when the operator says `/distill`, asks to \"run distill now\", wants to see what the last distill captured, wants aggregate distill health stats, wants to flip between LIVE and DRY-RUN, or wants to turn distill off. Arg is one of: (empty)/`manual` (fire now), `status` (show last result + queue), `stats [days]` (read-only log summary), `dryrun` (enable dry-run mode), `live` (disable dry-run), `disable` (off-switch), `enable` (clear off-switch), `compact` (retroactive de-dup of pending wiki-candidates backlog).",
+      "description": "Manually trigger / inspect / toggle the Session Distiller (TM-1058) — the PreCompact+SessionEnd memory pipeline that distills transcripts via Haiku and routes to Honcho + wiki-candidates. Use when the operator says `/distill`, asks to \"run distill now\", wants to see what the last distill captured, wants aggregate distill health stats, wants to flip between LIVE and DRY-RUN, or wants to turn distill off. Arg options are (empty)/`manual` (fire now), `status` (show last result + queue), `stats [days]` (read-only log summary), `dryrun` (enable dry-run mode), `live` (disable dry-run), `disable` (off-switch), `enable` (clear off-switch), `compact` (retroactive de-dup of pending wiki-candidates backlog).",
       "files": 1,
       "managed": false,
       "name": "distill",
       "source": "claude/skills/distill",
       "status": "active",
-      "tree_sha256": "e10d80e3090ab1955cf89cfd386fbc1d32d64b8c747e9974fb6ebba7a0656add"
+      "tree_sha256": "ead2f7fba6ef988f5ffc14b3b911657003181cd36ea73d9620781ebceecc8a8e"
     },
     {
       "audience": "claude",
@@ -81,13 +81,13 @@
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "\"Identify, back up, and cleanly remove stale background processes (cron, timers, scheduled tasks) while verifying parallel installations aren't collateral damage.\"",
+      "description": "Identify, back up, and cleanly remove stale background processes (cron, timers, scheduled tasks) while verifying parallel installations aren't collateral damage. Use when a background process (cron job, systemd timer, at job, scheduled task) exists but should not, or when the same task exists in multiple places and only one copy should remain.",
       "files": 1,
       "managed": false,
       "name": "ghost-process-cleanup-and-verification",
       "source": "claude/skills/ghost-process-cleanup-and-verification",
       "status": "active",
-      "tree_sha256": "5979d0c2fd62567f643b1e3f77f1431153e15d95dc1b862887ba22f67ead81bb"
+      "tree_sha256": "2e3226b8a54e586ca96da061d47c9e2a464fa5f736cdd093c60075b80660ff08"
     },
     {
       "audience": "claude",
@@ -136,13 +136,13 @@
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Drive a jinwon-int/nclex content PR through the full narrow-gate A2A pipeline — terminology lane dispatch, result-preservation rerun on verdict fail, coverage review projection, CI recovery (stale base.sha), content 2-lane dispatch with keyring-trusted worker routing, signed receipt posting, and a2a/receipts verification. Use when authoring or shepherding an NCLEX 출제 PR (new_case/rewrite/remediation), when a terminology or content lane must be dispatched, when a lane returns review_verdict_failed, or when receipts must be projected to the PR. 확립: 2026-08-13 RRP-003(#249)·PA-006(#251) 2회 완주.",
+      "description": "Drive a jinwon-int/nclex content PR through the full narrow-gate A2A pipeline — terminology lane dispatch, result-preservation rerun on verdict fail, coverage review projection, CI recovery (stale base.sha), content 2-lane dispatch with keyring-trusted worker routing, signed receipt posting, and a2a/receipts verification. Use when authoring or shepherding an NCLEX 출제 PR (new_case/rewrite/remediation), when a terminology or content lane must be dispatched, when a lane returns review_verdict_failed, or when receipts must be projected to the PR. 확립 2026-08-13 RRP-003(#249)·PA-006(#251) 2회 완주.",
       "files": 1,
       "managed": false,
       "name": "nclex-a2a-content-pipeline",
       "source": "claude/skills/nclex-a2a-content-pipeline",
       "status": "active",
-      "tree_sha256": "4f9442736ac35990a9dd8f1be818afa28b2fed65895357ac7540e7824bd0458d"
+      "tree_sha256": "5e919fbe82b937ac0a941e0908dd07eeb9a518100901806b61dcb7e816dc7188"
     },
     {
       "audience": "claude",

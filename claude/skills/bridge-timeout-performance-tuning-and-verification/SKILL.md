@@ -1,6 +1,6 @@
 ---
 name: bridge-timeout-performance-tuning-and-verification
-description: Diagnose and safely adjust service timeout configuration for performance-limited workloads; includes backup, restart, and post-restart verification that config loaded
+description: Diagnose and safely adjust service timeout configuration for performance-limited workloads; includes backup, restart, and post-restart verification that config loaded Use when a service or bridge consistently times out during resource-intensive operations and the timeout looks like a hard limit rather than a genuine hang or deadlock.
 metadata:
   type: ccc-skill
 ---

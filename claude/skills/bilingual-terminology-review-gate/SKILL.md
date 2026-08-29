@@ -1,6 +1,6 @@
 ---
 name: bilingual-terminology-review-gate
-description: Systematically review bilingual medical terminology pairs in multilingual clinical content (NCLEX, etc.) across all changed keys, validating semantic equivalence, clinical accuracy, and standards compliance, then render structured PASS/BLOCK verdict.
+description: Systematically review bilingual medical terminology pairs in multilingual clinical content (NCLEX, etc.) across all changed keys, validating semantic equivalence, clinical accuracy, and standards compliance, then render structured PASS/BLOCK verdict. Use when reviewing A2AD terminology_bilingual lanes for NCLEX or similar multilingual clinical content, where every changed TERM-REC key must be individually validated and accounted for before screen-to-reviewed promotion.
 metadata:
   type: claude
 ---
