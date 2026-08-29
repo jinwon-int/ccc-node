@@ -460,13 +460,409 @@ skill_dir = skills / case["name"]
 skill_dir.mkdir(parents=True, exist_ok=True)
 (skill_dir / "SKILL.md").write_text(case["content"], encoding="utf-8")
 try:
-    m._autorepair_llm(skill_dir, "claude")
+    m._autorepair_llm(skill_dir, "claude", cfg.review_llm_cmd)
     print(json.dumps({"repaired": True}))
 except m.PromotionError as e:
     print(json.dumps({"error": e.code}))
 PYINNER
 )"
 ok "unrepaired couplings fail closed" 'jq -e ".error == \"runtime_specific_claude\"" >/dev/null <<<"$out"'
+
+# ─── R2 revise rounds (#1357) + CCC_SKILL_REVIEW_LLM_CMD ───────────────────
+
+# Config: revise tri-state and the bounded review LLM command contract.
+out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_REVISE=maybe python3 "$PROMOTER" status)"; rc=$?
+ok "invalid revise flag fails closed" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"revise_invalid\"" >/dev/null <<<"$out"'
+out="$(env "${base_env[@]}" CCC_SKILL_REVIEW_LLM_CMD='   ' python3 "$PROMOTER" status)"; rc=$?
+ok "empty review LLM command fails closed" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"review_llm_cmd_invalid\"" >/dev/null <<<"$out"'
+cat > "$TMP/llm-driver.py" <<'PY'
+import importlib.util, json, pathlib, sys
+promoter, tmp, llm_cmd = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location("promo_llm", promoter)
+m = importlib.util.module_from_spec(spec); sys.modules["promo_llm"] = m; spec.loader.exec_module(m)
+home = pathlib.Path(tmp) / "llm-home"
+env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "CCC_SKILL_REVIEW_LLM_CMD": llm_cmd}
+cfg = m._config(env)
+skill_dir = home / ".claude" / "skills" / "llm-cmd-skill"
+skill_dir.mkdir(parents=True, exist_ok=True)
+(skill_dir / "SKILL.md").write_text(
+    "---\nname: llm-cmd-skill\ndescription: Run the model verify procedure against the live worker and record outputs.\n"
+    "---\n\n## Steps\n\nRun `claude -p` and check CLAUDE_MODEL before continuing.\n", encoding="utf-8")
+try:
+    m._autorepair_llm(skill_dir, "claude", cfg.review_llm_cmd)
+    body = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    print(json.dumps({"cmd": list(cfg.review_llm_cmd), "repaired": "claude -p" not in body}))
+except m.PromotionError as e:
+    print(json.dumps({"cmd": list(cfg.review_llm_cmd), "error": e.code}))
+PY
+cat > "$TMP/neutralize" <<'STUB'
+#!/usr/bin/env bash
+prompt="${*: -1}"
+body="${prompt##*---}"
+printf '%s\n' "$(printf '%s' "$body" | sed -E 's/claude -p/the coding agent CLI/g; s/CLAUDE_MODEL/the model env/g')"
+STUB
+chmod +x "$TMP/neutralize"
+out="$(env "PATH=$BIN:$PATH" python3 "$TMP/llm-driver.py" "$PROMOTER" "$TMP" "$TMP/neutralize")"
+ok "custom review LLM command repairs the candidate" \
+  'jq -e ".repaired == true" >/dev/null <<<"$out" && jq -r ".cmd[0]" <<<"$out" | grep -q neutralize'
+
+# ─── R2 end-to-end: dispatch → verdict → revise → republish (hermetic) ──────
+
+R2TMP="$TMP/r2"
+NEXUS="$R2TMP/a2a-nexus"
+CURL_STATE="$R2TMP/curl-state"
+R2_GH_STATE="$R2TMP/gh-state"
+mkdir -p "$NEXUS/docs" "$NEXUS/scripts" "$CURL_STATE" "$R2_GH_STATE"
+cat > "$NEXUS/docs/skills-intake-review.md" <<'DOC'
+# intake review
+
+## Worker procedure
+
+Read the packet in full and apply the rubric in order, recording one finding
+per failed check. Reviewers never modify the packet, never re-dispatch on a
+failed verdict, and never see the edge secret. Severity floors apply: any
+blocker forces reject and any major forces at least revise. Emit the verdict
+JSON only, bound to the exact skill name, source tree hash, and head prefix.
+
+## Receipt projection
+
+On PASS the publisher composes the receipt from the broker result.
+DOC
+cat > "$NEXUS/docs/skills-intake-revise.md" <<'DOC'
+# intake revise
+
+## Worker procedure
+
+Read the findings and the candidate copy in full; touch nothing else. The
+revision is a holistic edit: regenerate the full revised set rather than
+appending tail rules, keep the frontmatter name, and keep the description an
+honest what-and-when router. Address every major and blocker finding, note
+anything unresolved in the change summary, and never weaken safety or add
+credentials, node facts, or runtime-specific couplings. If the candidate is a
+single-incident checklist that cannot be generalized, return a drop
+recommendation with the reason instead of a cosmetic rewrite. Emit the result
+JSON only, bound to the exact skill name and source tree hash from the packet.
+
+## Result schema
+
+See the reviseResultSchema field embedded in the packet.
+DOC
+: > "$NEXUS/scripts/a2a-dispatch-round.mjs"
+printf '{"brokerId":"seoseo"}\n' > "$CURL_STATE/health.json"
+printf '{"items":[{"nodeId":"testnode"},{"nodeId":"reviewer1"}]}\n' > "$CURL_STATE/workers.json"
+printf '{"status":"queued"}\n' > "$CURL_STATE/review-task.json"
+cat > "$BIN/curl" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+url=""
+for argument in "$@"; do case "$argument" in http*) url="$argument";; esac; done
+state="$CURL_TEST_STATE"
+case "$url" in
+  */health) cat "$state/health.json" ;;
+  */workers) cat "$state/workers.json" ;;
+  *skills_intake_revise*)
+    pr="$(printf '%s' "$url" | sed -E 's|.*-pr([0-9]+)-.*|\1|')"
+    file="$state/revise-task-pr$pr.json"
+    [ -f "$file" ] || printf '{"status":"queued"}\n' > "$file"
+    cat "$file" ;;
+  */tasks/*) cat "$state/review-task.json" ;;
+  *) printf '{}\n' ;;
+esac
+STUB
+chmod +x "$BIN/curl"
+cat > "$BIN/node" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+manifest=""
+previous=""
+for argument in "$@"; do
+  [ "$previous" = "--manifest" ] && manifest="$argument"
+  previous="$argument"
+done
+lane_id="$(jq -r '.lanes[0].id' "$manifest")"
+printf '{"results":[{"taskId":"%s-broker-1"}]}\n' "$lane_id"
+STUB
+chmod +x "$BIN/node"
+# Extend the gh stub: pr comments, api reads against the bare remote.
+cat > "$BIN/gh" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+state="$GH_TEST_STATE"
+remote_git="$GH_TEST_REMOTE"
+mkdir -p "$state"
+printf '%s\n' "$*" >> "$state/calls"
+case "${1:-} ${2:-}" in
+  "auth status") exit 0 ;;
+  "repo view")
+    if [ "${GH_TEST_PRIVATE:-true}" = "true" ]; then
+      printf '{"isPrivate":true,"visibility":"PRIVATE"}\n'
+    else
+      printf '{"isPrivate":false,"visibility":"PUBLIC"}\n'
+    fi ;;
+  "pr list")
+    head=""
+    previous=""
+    for argument in "$@"; do
+      [ "$previous" = "--head" ] && head="$argument"
+      previous="$argument"
+    done
+    key="$(printf '%s' "$head" | sha256sum | awk '{print $1}')"
+    if [ -f "$state/created-$key" ]; then
+      printf '[{"url":"https://github.com/test/repo/pull/1","state":"OPEN","isDraft":true}]\n'
+    else
+      printf '[]\n'
+    fi ;;
+  "pr create")
+    head=""
+    previous=""
+    for argument in "$@"; do
+      [ "$previous" = "--head" ] && head="$argument"
+      previous="$argument"
+    done
+    key="$(printf '%s' "$head" | sha256sum | awk '{print $1}')"
+    printf '%s\n' "$*" >> "$state/create.args"
+    : > "$state/created-$key"
+    number="$(printf '%s\n' "$state"/created-* 2>/dev/null | wc -l)"
+    printf 'https://github.com/test/repo/pull/%s\n' "$number" ;;
+  "pr comment")
+    body=""
+    previous=""
+    for argument in "$@"; do
+      [ "$previous" = "--body" ] && body="$argument"
+      previous="$argument"
+    done
+    printf '%s\n' "$body" >> "$state/comments" ;;
+  "api "*)
+    url="$2"
+    jq_expr=""
+    [ "${3:-}" = "--jq" ] && jq_expr="$4"
+    case "$url" in
+      */check-runs) printf 'completed/success\n' ;;
+      */commits/*)
+        ref="${url#*/commits/}"
+        git --git-dir="$remote_git" rev-parse "$ref" ;;
+      *git/trees/*)
+        ref="$(printf '%s' "$url" | sed -E 's|.*/git/trees/([^/?]+).*|\1|')"
+        payload="$(git --git-dir="$remote_git" ls-tree -r "$ref" \
+          | jq -Rs 'split("\n") | map(select(length > 0) | split("\t")
+                    | {mode: (.[0] | split(" ")[0]), type: "blob", path: .[1]})')"
+        if [ -n "$jq_expr" ]; then
+          printf '{"tree": %s}' "$payload" | jq "$jq_expr"
+        else
+          printf '{"tree": %s}\n' "$payload"
+        fi ;;
+      *contents/*)
+        path="${url#*contents/}"; path="${path%%\?*}"
+        ref="${url##*ref=}"
+        content="$(git --git-dir="$remote_git" show "$ref:$path" | base64 -w0)"
+        printf '{"content": "%s"}\n' "$content" ;;
+      *) exit 9 ;;
+    esac ;;
+  *) exit 9 ;;
+esac
+STUB
+chmod +x "$BIN/gh"
+# Keyring on the remote main: reviewer1 reviews, testnode revises.
+KEYRING="$R2TMP/keyring"
+git clone -q "$REMOTE" "$KEYRING"
+mkdir -p "$KEYRING/refs"
+jq -n '{keys:{"worker:reviewer1:g1:v1":{node:"reviewer1"},"worker:testnode:g1:v1":{node:"testnode"}}}' \
+  > "$KEYRING/refs/a2a-public-keyring.json"
+git -C "$KEYRING" add refs
+git -C "$KEYRING" -c user.name=test -c user.email=test@example.invalid commit -qm keyring
+git -C "$KEYRING" push -q origin main
+r2_env=(
+  "${publish_env[@]}"
+  "CCC_SKILL_PROMOTION_DISPATCH=true"
+  "CCC_SKILL_PROMOTION_REVISE=true"
+  "CCC_SKILL_PROMOTION_A2A_NEXUS_DIR=$NEXUS"
+  "CCC_SKILL_PROMOTION_BROKER_URL=http://broker.test"
+  "A2A_EDGE_SECRET=test-secret"
+  "CURL_TEST_STATE=$CURL_STATE"
+  "GH_TEST_REMOTE=$REMOTE"
+  "GH_TEST_STATE=$R2_GH_STATE"
+)
+ledger="$STATE/skill-promotion/ledger.jsonl"
+
+write_verdict() { # $1 head, $2 verdict
+  python3 - "$CURL_STATE/review-task.json" "$1" "${2:-revise}" <<'PY'
+import json, sys
+path, head, verdict = sys.argv[1], sys.argv[2], sys.argv[3]
+task = {"status": "succeeded", "result": {"output": {
+    "verdict": verdict,
+    "findings": [{"severity": "major", "area": "utility",
+                  "note": "Single-incident checklist; generalize before promotion."}],
+    "evidence": [{"kind": "grep", "detail": "pins one incident"}],
+    "model": "test-model", "reviewer_node": "reviewer1",
+    "head_sha": head, "rubric_version": "2026-08-28.2",
+}}}
+json.dump(task, open(path, "w"))
+PY
+}
+write_revised() { # $1 source tree, $2 extra step line, $3 intake pr number
+  python3 - "$CURL_STATE/revise-task-pr${3:-1}.json" "$1" "${2:-4}" <<'PY'
+import json, sys
+path, tree, marker = sys.argv[1], sys.argv[2], sys.argv[3]
+skill = ("---\nname: r2-skill\ndescription: Capture a reusable and safely shareable release verification procedure.\n"
+         "---\n\n# Procedure\n\n1. Inspect the release state.\n2. Run the bounded verification.\n"
+         f"3. Record the result.\n{marker}. Generalize the evidence for any release, not one incident.\n")
+task = {"status": "succeeded", "result": {"output": {
+    "outcome": "revised", "skillName": "r2-skill", "sourceTreeSha256": tree,
+    "skillFiles": [{"path": "SKILL.md", "content": skill}],
+    "changeSummary": "Generalized per the major utility finding.", "model": "test-model",
+    "reviser_node": "testnode"}}}
+json.dump(task, open(path, "w"))
+PY
+}
+latest_tree() { jq -r 'select(.kind=="a2a-revise-result" and .status=="republished") | .new_tree_sha256' "$ledger" | tail -1; }
+branch_of() { printf 'skill-intake/testnode/r2-skill-claude-%s' "${1:0:12}"; }
+
+# Phase 1: PR opens, review dispatches, revise poll pends on the queued task.
+write_skill r2-skill ""
+write_status r2-skill
+env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true "PATH=$BIN:$PATH" python3 "$PROMOTER" run >/dev/null
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+branches="$(git --git-dir="$REMOTE" for-each-ref --format='%(refname:short)' refs/heads | grep '^skill-intake/testnode/r2-skill' | sort)"
+branch1="$(head -1 <<<"$branches")"
+head1="$(git --git-dir="$REMOTE" rev-parse "$branch1")"
+tree1="$(jq -r '.published[0].tree_sha256' <<<"$out")"
+ok "R2 p1: PR opened, review dispatched, queued verdict pends" \
+  '[ "$rc" = 0 ] && jq -e ".published[0].outcome == \"pr-opened\" and .revise.verdicts[0].outcome == \"verdict-pending\" and (.revise.results | length) == 0" >/dev/null <<<"$out"'
+ok "R2 p1: review dispatch ledger row carries lineage fields" \
+  'jq -e "select(.kind==\"a2a-dispatch\") | .node==\"testnode\" and .provider==\"claude\" and .name==\"r2-skill\" and .reviewer_node==\"reviewer1\"" >/dev/null "$ledger"'
+
+# Autonomy dry-run only polls — no verdict consumption, no comments.
+out="$(env "${r2_env[@]}" CCC_AUTONOMY=dry-run python3 "$PROMOTER" collect)"; rc=$?
+ok "R2: autonomy dry-run polls verdicts without consuming" \
+  '[ "$rc" = 0 ] && jq -e ".mode == \"collect-dry-run\" and .revise.verdicts[0].outcome == \"would-poll-verdict\"" >/dev/null <<<"$out"'
+
+# Phase 2: revise verdict → findings comment + revision dispatch to the author.
+write_verdict "$head1" revise
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "R2 p2: revise verdict triggers round-1 revision dispatch" \
+  '[ "$rc" = 0 ] && jq -e ".revise.verdicts[0].verdict == \"revise\" and .revise.verdicts[0].revise.outcome == \"revise-dispatched\" and .revise.verdicts[0].revise.round == 1" >/dev/null <<<"$out"'
+ok "R2 p2: revise dispatch row binds lineage, round, and revise lane" \
+  'jq -e "select(.kind==\"a2a-revise-dispatch\") | .node==\"testnode\" and .name==\"r2-skill\" and .round==1 and .reviser_node==\"testnode\" and (.task_id|startswith(\"skills_intake_revise-pr1\"))" >/dev/null "$ledger"'
+ok "R2 p2: verdict and findings become visible on the intake PR" \
+  'grep -q "auto-revision round 1/2" "$R2_GH_STATE/comments" && grep -q "major/utility" "$R2_GH_STATE/comments"'
+
+# Phase 3: reviser returns a valid revision → full re-gate → fresh intake PR.
+write_revised "$tree1" 4
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "R2 p3: revised tree republished through the full gate path" \
+  '[ "$rc" = 0 ] && jq -e ".revise.results[0].outcome == \"republished\"" >/dev/null <<<"$out"'
+ok "R2 p3: fresh intake PR opened and independent re-review dispatched" \
+  'jq -e "select(.kind==\"a2a-revise-result\" and .status==\"republished\") | .new_pr_url | endswith(\"pull/2\")" >/dev/null "$ledger" && [ "$(jq -s "[.[] | select(.kind==\"a2a-dispatch\")] | length" "$ledger")" -ge 2 ]'
+ok "R2 p3: superseded PR keeps its human lane (no auto-close)" \
+  'grep -q "superseded and left open" "$R2_GH_STATE/comments"'
+tree2="$(latest_tree)"
+head2="$(git --git-dir="$REMOTE" rev-parse "$(branch_of "$tree2")")"
+
+# Phase 4: second revise verdict on the fresh PR → round 2.
+write_verdict "$head2" revise
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "R2 p4: second round dispatches while under the lineage cap" \
+  '[ "$rc" = 0 ] && jq -e ".revise.verdicts[0].revise.outcome == \"revise-dispatched\" and .revise.verdicts[0].revise.round == 2" >/dev/null <<<"$out"'
+
+# Phase 5: second revision → second republish.
+write_revised "$tree2" 5 2
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "R2 p5: round-2 revision republishes a third tree" \
+  '[ "$rc" = 0 ] && jq -e ".revise.results[0].outcome == \"republished\"" >/dev/null <<<"$out"'
+tree3="$(latest_tree)"
+head3="$(git --git-dir="$REMOTE" rev-parse "$(branch_of "$tree3")")"
+
+# Phase 6: third revise verdict exceeds the cap → handoff, no auto-close.
+write_verdict "$head3" revise
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "R2 p6: round cap reached — handoff to human, no further dispatch" \
+  '[ "$rc" = 0 ] && jq -e ".revise.verdicts[0].verdict == \"revise\" and .revise.verdicts[0].revise.outcome == \"revise-handoff\"" >/dev/null <<<"$out"'
+ok "R2 p6: exactly two revision rounds ran for the lineage" \
+  '[ "$(jq -s "[.[] | select(.kind==\"a2a-revise-dispatch\")] | length" "$ledger")" = 2 ] && grep -q "Revise round limit reached" "$R2_GH_STATE/comments"'
+
+# Scenario: drop recommendation is recorded for the human sweep, not executed.
+printf '{"status":"queued"}\n' > "$CURL_STATE/review-task.json"
+write_skill r2-drop ""
+write_status r2-drop
+env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true "PATH=$BIN:$PATH" python3 "$PROMOTER" run >/dev/null
+drop_out1="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+out="$drop_out1"
+branch_drop="$(git --git-dir="$REMOTE" for-each-ref --format='%(refname:short)' refs/heads | grep 'r2-drop' | head -1)"
+head_drop="$(git --git-dir="$REMOTE" rev-parse "$branch_drop")"
+manifest_drop="$(git --git-dir="$REMOTE" ls-tree -r --name-only "$branch_drop" | grep 'manifest.json' | head -1)"
+tree_drop="$(git --git-dir="$REMOTE" show "$branch_drop:$manifest_drop" | jq -r .tree_sha256)"
+write_verdict "$head_drop" revise
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+pr_drop="$(jq -r '.published[0].url' <<<"$drop_out1" | grep -o '[0-9]*$')"
+python3 - "$CURL_STATE/revise-task-pr$pr_drop.json" "$tree_drop" <<'PY'
+import json, sys
+path, tree = sys.argv[1], sys.argv[2]
+json.dump({"status": "succeeded", "result": {"output": {
+    "outcome": "drop_recommendation", "skillName": "r2-drop", "sourceTreeSha256": tree,
+    "dropRecommendation": {"reason": "Pins one outage; no general procedure survives."},
+    "model": "test-model", "reviser_node": "testnode"}}}, open(path, "w"))
+PY
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "drop recommendation is recorded for the human sweep"   '[ "$rc" = 0 ] && jq -e ".revise.results[0].outcome == \"drop-recommended\"" >/dev/null <<<"$out" && jq -e "select(.kind==\"a2a-revise-result\" and .status==\"drop-recommended\") | .reason | startswith(\"Pins one outage\")" >/dev/null "$ledger"'
+ok "drop recommendation never closes or republishes"   'grep -q "Drop recommendation (auto-revision gate)" "$R2_GH_STATE/comments" && [ "$(jq -s "[.[] | select(.name==\"r2-drop\" and .kind==\"a2a-revise-result\" and .status==\"republished\")] | length" "$ledger")" = 0 ]'
+
+# Scenario: a malformed verdict is a handler failure — consumed once, no PR
+# comment, no revision dispatch.
+printf '{"status":"queued"}\n' > "$CURL_STATE/review-task.json"
+write_skill r2-mal ""
+write_status r2-mal
+env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true "PATH=$BIN:$PATH" python3 "$PROMOTER" run >/dev/null
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+branch_mal="$(git --git-dir="$REMOTE" for-each-ref --format='%(refname:short)' refs/heads | grep 'r2-mal' | head -1)"
+head_mal="$(git --git-dir="$REMOTE" rev-parse "$branch_mal")"
+python3 - "$CURL_STATE/review-task.json" "$head_mal" <<'PY'
+import json, sys
+path, head = sys.argv[1], sys.argv[2]
+json.dump({"status": "succeeded", "result": {"output": {
+    "verdict": "excellent", "head_sha": head}}}, open(path, "w"))
+PY
+before_comments="$(wc -l < "$R2_GH_STATE/comments" 2>/dev/null || echo 0)"
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "malformed verdict consumed as a handler failure"   '[ "$rc" = 0 ] && jq -e ".revise.verdicts[0].outcome == \"verdict-malformed\"" >/dev/null <<<"$out" && jq -e "select(.kind==\"a2a-verdict\" and .status==\"malformed\")" >/dev/null "$ledger"'
+ok "malformed verdict triggers no comment and no revision"   '[ "$(wc -l < "$R2_GH_STATE/comments")" = "$before_comments" ] && [ "$(jq -s "[.[] | select(.name==\"r2-mal\" and .kind==\"a2a-revise-dispatch\")] | length" "$ledger")" = 0 ]'
+
+# Scenario: per-node daily cap bounds same-day revision cost.
+printf '{"status":"queued"}\n' > "$CURL_STATE/review-task.json"
+write_skill r2-cap ""
+write_status r2-cap
+env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true "PATH=$BIN:$PATH" python3 "$PROMOTER" run >/dev/null
+cap_env=("${r2_env[@]}" "CCC_SKILL_PROMOTION_REVISE_DAILY_CAP=1")
+cap_out0="$(env "${cap_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+out="$cap_out0"
+branch_cap="$(git --git-dir="$REMOTE" for-each-ref --format='%(refname:short)' refs/heads | grep 'r2-cap' | head -1)"
+head_cap="$(git --git-dir="$REMOTE" rev-parse "$branch_cap")"
+manifest_cap="$(git --git-dir="$REMOTE" ls-tree -r --name-only "$branch_cap" | grep 'manifest.json' | head -1)"
+tree_cap="$(git --git-dir="$REMOTE" show "$branch_cap:$manifest_cap" | jq -r .tree_sha256)"
+write_verdict "$head_cap" revise
+cap_out1="$(env "${cap_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+out="$cap_out1"
+ok "daily cap admits the first revision dispatch"   '[ "$rc" = 0 ] && jq -e ".revise.verdicts[0].revise.outcome == \"revise-dispatched\"" >/dev/null <<<"$out"'
+pr_cap="$(jq -r '.published[0].url' <<<"$cap_out0" | grep -o '[0-9]*$')"
+python3 - "$CURL_STATE/revise-task-pr$pr_cap.json" "$tree_cap" <<'PY'
+import json, sys
+path, tree = sys.argv[1], sys.argv[2]
+skill = ("---\nname: r2-cap\ndescription: Capture a reusable and safely shareable release verification procedure.\n"
+         "---\n\n# Procedure\n\n1. Inspect the release state.\n2. Run the bounded verification.\n"
+         "3. Record the result.\n4. Generalize the evidence for any release.\n")
+json.dump({"status": "succeeded", "result": {"output": {
+    "outcome": "revised", "skillName": "r2-cap", "sourceTreeSha256": tree,
+    "skillFiles": [{"path": "SKILL.md", "content": skill}],
+    "changeSummary": "Generalized.", "model": "test-model", "reviser_node": "testnode"}}},
+    open(path, "w"))
+PY
+out="$(env "${cap_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+branch_cap2="$(git --git-dir="$REMOTE" for-each-ref --format='%(refname:short)' refs/heads | grep 'r2-cap' | sort | tail -1)"
+head_cap2="$(git --git-dir="$REMOTE" rev-parse "$branch_cap2")"
+write_verdict "$head_cap2" revise
+out="$(env "${cap_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "daily cap blocks the second same-day revision dispatch"   '[ "$rc" = 0 ] && jq -e ".revise.verdicts[0].revise.outcome == \"revise-skipped\" and .revise.verdicts[0].revise.code == \"revise_daily_cap\"" >/dev/null <<<"$out"'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
