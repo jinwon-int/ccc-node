@@ -25,7 +25,7 @@ Use this when work produces reusable operating knowledge (a decision, runbook, n
    ```bash
    W=$HOME/.wiki-agent/wiki-pr-work/seoyoon-family-wiki
    # next section id (DOC-/TM-/ND- share one space): max+1
-   grep -rhoE "\[(TM|ND)-[0-9]+\]" "$W/pages" | grep -oE "[0-9]+" | sort -n | tail -1
+   grep -rhoE "\[(DOC|TM|ND)-[0-9]+\]" "$W/pages" | grep -oE "[0-9]+" | sort -n | tail -1
    # next log sequence for this KST date and node (replace <node> first):
    KST_DAY="$(TZ=Asia/Seoul date +%Y%m%d)"
    NODE_SLUG="<node>"
@@ -33,7 +33,7 @@ Use this when work produces reusable operating knowledge (a decision, runbook, n
      | sed -E 's/.*-([0-9]+)$/\1/' | sort -n | tail -1)"
    seq=$(( ${last_seq:-0} + 1 ))
    ```
-   - New section heading: `## [TM-<max+1>] <title>` (or `ND-` for node RUNBOOK pages).
+   - New section heading: `## [TM-<max+1>] <title>` — or the matching prefix for the target page class: `ND-` for node RUNBOOK/CHANGES pages, `DOC-` for standalone reference/runbook pages.
    - New log entry: `## [LOG-YYYYMMDD-<node>-<seq>] YYYY-MM-DD KST — <title>` — a level-2 heading.
    - `<node>` is the lowercase executing-node slug: `seoseo`, `dungae`, `sogyo`, `nosuk`, `bangtong`, `yukson`, `soonwook`, `gwakga`, `jingun`, `gongyung`, `daegyo`, or `gongmyoung`. Some historical slugs carry digits/hyphens (`vps4`, `racknerd-167be94`); `<seq>` is always the trailing `-N`.
    - `<seq>` starts at `1` and is `max(seq)+1` among entries for the same KST date and node — counting **both** regions below, which share one id space.
