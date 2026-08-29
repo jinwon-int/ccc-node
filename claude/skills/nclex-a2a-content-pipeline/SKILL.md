@@ -1,6 +1,6 @@
 ---
 name: nclex-a2a-content-pipeline
-description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2A pipeline — terminology lane dispatch, result-preservation rerun on verdict fail, coverage review projection, CI recovery (stale base.sha), content 2-lane dispatch with keyring-trusted worker routing, signed receipt posting, and a2a/receipts verification. Use when authoring or shepherding an NCLEX 출제 PR (new_case/rewrite/remediation), when a terminology or content lane must be dispatched, when a lane returns review_verdict_failed, or when receipts must be projected to the PR. 확립: 2026-08-13 RRP-003(#249)·PA-006(#251) 2회 완주.
+description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2A pipeline — terminology lane dispatch, result-preservation rerun on verdict fail, coverage review projection, CI recovery (stale base.sha), content 2-lane dispatch with keyring-trusted worker routing, signed receipt posting, and a2a/receipts verification. Use when authoring or shepherding an NCLEX 출제 PR (new_case/rewrite/remediation), when a terminology or content lane must be dispatched, when a lane returns review_verdict_failed, or when receipts must be projected to the PR. 확립 2026-08-13 RRP-003(#249)·PA-006(#251) 2회 완주.
 ---
 
 # nclex A2A content pipeline (좁은 문 규율)
