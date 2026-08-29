@@ -100,6 +100,7 @@ class Config:
     broker_url: str
     a2a_nexus_dir: Path
     dispatch_ci_wait_sec: int
+    autorepair_enabled: bool
     autonomy: str
 
 
@@ -266,6 +267,15 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         dispatch_enabled = False
     else:
         raise PromotionError("dispatch_invalid")
+    autorepair_raw = env.get("CCC_SKILL_PROMOTION_AUTOREPAIR")
+    if autorepair_raw is None:
+        autorepair_enabled = _read_enabled_file(state_dir / "skill-promotion.autorepair", trust_root=home)
+    elif autorepair_raw.lower() in {"1", "true", "yes"}:
+        autorepair_enabled = True
+    elif autorepair_raw.lower() in {"0", "false", "no"}:
+        autorepair_enabled = False
+    else:
+        raise PromotionError("autorepair_invalid")
     collect_raw = env.get("CCC_SKILL_PROMOTION_COLLECT_NODES")
     collect_nodes = (
         tuple(part.strip() for part in collect_raw.split(",") if part.strip())
@@ -311,6 +321,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         dispatch_ci_wait_sec=_bounded_int(
             env.get("CCC_SKILL_PROMOTION_DISPATCH_CI_WAIT_SEC"), 600, 60, 3600
         ),
+        autorepair_enabled=autorepair_enabled,
         autonomy=_autonomy_state(env, state_dir, trust_root=home),
     )
 
@@ -716,9 +727,10 @@ def _snapshot(config: Config, provider: str, row: dict[str, Any]) -> Candidate: 
     )
 
 
-def _discover(config: Config) -> tuple[list[Candidate], list[dict[str, str]]]:
+def _discover(config: Config) -> tuple[list[Candidate], list[dict[str, str]], list[dict[str, str]]]:
     candidates: list[Candidate] = []
     blocked: list[dict[str, str]] = []
+    repaired: list[dict[str, str]] = []
     for provider in config.providers:
         for row in _ownership_rows(config, provider):
             if row.get("classification") != "autosave-managed":
@@ -726,10 +738,25 @@ def _discover(config: Config) -> tuple[list[Candidate], list[dict[str, str]]]:
             name = row.get("name") if isinstance(row.get("name"), str) else "invalid"
             try:
                 candidates.append(_snapshot(config, provider, row))
+                continue
             except PromotionError as error:
+                if not (config.autorepair_enabled and error.code in _AUTOREPAIR_CODES and name != "invalid"):
+                    blocked.append({"provider": provider, "name": name, "code": error.code})
+                    continue
+            # R1 autorepair (#1357): one bounded repair pass for mechanical
+            # gate codes, then the full gate set re-runs on the repaired copy.
+            if not _autorepair_candidate(config, provider, name, error.code):
                 blocked.append({"provider": provider, "name": name, "code": error.code})
+                continue
+            try:
+                candidates.append(_snapshot(config, provider, row))
+            except PromotionError as retry_error:
+                blocked.append({"provider": provider, "name": name, "code": retry_error.code,
+                                "autorepair": f"repaired-{error.code}-still-blocked"})
+                continue
+            repaired.append({"provider": provider, "name": name, "code": error.code})
     candidates.sort(key=lambda item: (item.name, item.provider, item.tree_sha256))
-    return candidates, blocked
+    return candidates, blocked, repaired
 
 
 def _display_name(name: str) -> str:
@@ -1351,7 +1378,7 @@ def _status(config: Config) -> dict[str, object]:
             "candidates": [],
             "blocked": [],
         }
-    candidates, blocked = _discover(config)
+    candidates, blocked, repaired = _discover(config)
     return {
         "ok": True,
         "mode": "status-read-only",
@@ -1372,6 +1399,7 @@ def _status(config: Config) -> dict[str, object]:
             for item in candidates
         ],
         "blocked": blocked,
+        "repaired": repaired,
     }
 
 
@@ -1425,7 +1453,7 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
                 "blocked": [],
                 "errors": [],
             }
-        candidates, blocked = _discover(config)
+        candidates, blocked, repaired = _discover(config)
         staged: list[dict[str, str]] = []
         errors: list[dict[str, str]] = []
         selected = candidates[:_MAX_CANDIDATES_PER_RUN]
@@ -1457,6 +1485,7 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
             "autonomy": config.autonomy,
             "staged": staged,
             "blocked": blocked,
+            "repaired": repaired,
             "errors": errors,
         }
     finally:
@@ -1850,6 +1879,111 @@ def _dispatch_intake_review(  # noqa: C901
         "reviewer_node": reviewer,
         "round_id": manifest["roundId"],
     }
+
+
+# --- R1 autorepair: bounded repair pass for mechanical stage gates (#1357) ---
+# Only gate codes with a mechanical fix enter autorepair; structural codes
+# (e.g. source_file_unsafe) are recorded as blocked and left to the human
+# sweep. A repair never bypasses any gate: the full snapshot re-runs on the
+# repaired copy, and the marker is re-stamped because the pipeline itself —
+# not an outside actor — changed the content (mirrors autoinstall install).
+
+_AUTOREPAIR_CODES = frozenset({
+    "skill_frontmatter_invalid",
+    "runtime_specific_claude",
+    "runtime_specific_codex",
+})
+
+
+def _repair_skill_frontmatter(skill_dir: Path, expected_name: str) -> None:
+    path = skill_dir / "SKILL.md"
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    body = lines
+    description = ""
+    if lines and lines[0] == "---":
+        try:
+            end = lines.index("---", 1)
+        except ValueError:
+            end = -1
+        if end > 0:
+            body = lines[end + 1:]
+            for line in lines[1:end]:
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    if key.strip() == "description":
+                        description = value.strip()
+    if not (20 <= len(description) <= 1024):
+        derived = ""
+        for line in body:
+            candidate_line = line.lstrip("# ").strip()
+            if len(candidate_line) >= 20:
+                derived = candidate_line[:1024]
+                break
+        if not derived:
+            raise PromotionError("autorepair_frontmatter_underivable")
+        description = derived
+    if len(body) < 3:
+        body = body + ["", "Follow the steps in order and record evidence for each step."][: 3 - len(body)]
+    frontmatter = ["---", f"name: {expected_name}", f"description: {description}", "---"]
+    path.write_text("\n".join(frontmatter + body) + "\n", encoding="utf-8")
+
+
+def _autorepair_llm(skill_dir: Path, provider: str) -> None:
+    """One restricted model pass per markdown file that still carries
+    runtime-specific couplings; every result is re-validated with the same
+    gate patterns before it is accepted."""
+    patterns = (*_CLAUDE_COUPLINGS, *_CODEX_COUPLINGS)
+    listing = "\n".join(f"- {p.pattern}" for p in patterns)
+    for path in sorted(skill_dir.rglob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        if not any(p.search(text) for p in patterns):
+            continue
+        prompt = (
+            "Rewrite the following skill documentation so it is runtime-neutral.\n"
+            f"The node's runtime is: {provider}.\n"
+            "Remove or generalize every reference matching these patterns, keeping\n"
+            "the procedure's meaning (use neutral wording such as 'the coding agent\n"
+            "CLI' or 'the agent config directory'):\n"
+            f"{listing}\n\n"
+            "Rules: keep the markdown structure and frontmatter unchanged; do not\n"
+            "add or remove steps; output ONLY the rewritten markdown.\n\n---\n" + text
+        )
+        completed = _run(["claude", "-p", "--disallowed-tools", "*", prompt], timeout=300)
+        repaired = completed.stdout.decode("utf-8").strip()
+        if len(repaired) < max(64, len(text) // 4):
+            raise PromotionError("autorepair_output_invalid")
+        _scan_text(repaired.encode("utf-8"))
+        for pattern in patterns:
+            if pattern.search(repaired):
+                raise PromotionError("autorepair_coupling_persists")
+        path.write_text(repaired + "\n", encoding="utf-8")
+
+
+def _autorepair_candidate(config: Config, provider: str, name: str, code: str) -> bool:
+    """Best-effort: returns False when the repair cannot be completed; the
+    caller then records the candidate as blocked with the original code."""
+    skill_dir = config.provider_roots[provider] / name
+    if not skill_dir.is_dir():
+        return False
+    try:
+        if code == "skill_frontmatter_invalid":
+            _repair_skill_frontmatter(skill_dir, name)
+        elif code in ("runtime_specific_claude", "runtime_specific_codex"):
+            _autorepair_llm(skill_dir, provider)
+        else:
+            return False
+    except PromotionError:
+        return False
+    try:
+        marker_path = skill_dir / ".autosave-meta.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["skill_sha256"] = hashlib.sha256((skill_dir / "SKILL.md").read_bytes()).hexdigest()
+        marker_path.write_text(json.dumps(marker, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.chmod(marker_path, 0o600)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return True
 
 
 # Collection deliberately sequences visibility, remote reads, publication, and ack.
