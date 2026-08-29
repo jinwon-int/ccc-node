@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -101,6 +102,10 @@ class Config:
     a2a_nexus_dir: Path
     dispatch_ci_wait_sec: int
     autorepair_enabled: bool
+    revise_enabled: bool
+    revise_round_limit: int
+    revise_daily_cap: int
+    review_llm_cmd: tuple[str, ...]
     autonomy: str
 
 
@@ -286,6 +291,24 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         trust_root=home,
         error_code="autorepair_invalid",
     )
+    revise_enabled = _tri_state_enabled(
+        env.get("CCC_SKILL_PROMOTION_REVISE"),
+        state_dir / "skill-promotion.revise",
+        trust_root=home,
+        error_code="revise_invalid",
+    )
+    raw_llm_cmd = env.get("CCC_SKILL_REVIEW_LLM_CMD")
+    if raw_llm_cmd is None:
+        review_llm_cmd: tuple[str, ...] = ("claude", "-p", "--disallowed-tools", "*")
+    else:
+        tokens = shlex.split(raw_llm_cmd)
+        if (
+            not tokens
+            or len(tokens) > 8
+            or any(not token.strip() or len(token) > 256 for token in tokens)
+        ):
+            raise PromotionError("review_llm_cmd_invalid")
+        review_llm_cmd = tuple(tokens)
     collect_raw = env.get("CCC_SKILL_PROMOTION_COLLECT_NODES")
     collect_nodes = (
         tuple(part.strip() for part in collect_raw.split(",") if part.strip())
@@ -332,6 +355,10 @@ def _config(environment: dict[str, str] | None = None) -> Config:
             env.get("CCC_SKILL_PROMOTION_DISPATCH_CI_WAIT_SEC"), 600, 60, 3600
         ),
         autorepair_enabled=autorepair_enabled,
+        revise_enabled=revise_enabled,
+        revise_round_limit=_bounded_int(env.get("CCC_SKILL_PROMOTION_REVISE_ROUNDS"), 2, 1, 2),
+        revise_daily_cap=_bounded_int(env.get("CCC_SKILL_PROMOTION_REVISE_DAILY_CAP"), 3, 1, 8),
+        review_llm_cmd=review_llm_cmd,
         autonomy=_autonomy_state(env, state_dir, trust_root=home),
     )
 
@@ -1399,6 +1426,9 @@ def _status(config: Config) -> dict[str, object]:
         "repo": config.repo,
         "max_prs_per_run": config.max_prs,
         "collect_nodes": list(config.collect_nodes),
+        "revise_enabled": config.revise_enabled,
+        "revise_round_limit": config.revise_round_limit,
+        "revise_daily_cap": config.revise_daily_cap,
         "candidates": [
             {
                 "node": item.node,
@@ -1538,6 +1568,21 @@ _INTAKE_RUBRIC_VERSION = "2026-08-28.2"  # must match docs/skills-intake-review.
 _DISPATCH_DOC_START = "## Worker procedure"
 _DISPATCH_DOC_END = "## Receipt projection"
 
+# --- R2 revise rounds (#1357): verdict-driven automatic revision -------------
+# When a review lands `revise`, the publisher dispatches exactly one bounded
+# revision task to the AUTHOR node (skills_intake_revise). The reviser is
+# tool-blocked and edits only the candidate copy in the packet; the publisher
+# re-validates the returned files through the full envelope path (secrets,
+# node facts, runtime couplings, frontmatter, tree-hash consistency) before a
+# fresh intake PR is opened and re-dispatched for independent review. Rounds
+# are capped per skill lineage (author node + name) and per node per day;
+# drop_recommendation is recorded for the human sweep, never auto-executed.
+_REVISE_LANE = "skills_intake_revise"
+_REVISE_SCHEMA = "skills.skill-intake-revise.v1"
+_REVISE_DOC_NAME = "skills-intake-revise.md"
+_REVISE_DOC_END = "## Result schema"
+_TERMINAL_TASK_STATUSES = frozenset({"succeeded", "failed", "canceled"})
+
 _INTAKE_VERDICT_SCHEMA: dict[str, object] = {
     "verdict": "approve | revise | reject",
     "findings": [
@@ -1555,15 +1600,30 @@ _INTAKE_VERDICT_SCHEMA: dict[str, object] = {
     "note": "any major/blocker finding MUST carry a machine re-verifiable evidence entry; emit the verdict JSON only",
 }
 
+_REVISE_RESULT_SCHEMA: dict[str, object] = {
+    "outcome": "revised | drop_recommendation",
+    "skillName": "<the skillName from the packet>",
+    "sourceTreeSha256": "<the source_tree_sha256 from the packet>",
+    "skillFiles": [{"path": "SKILL.md", "content": "..."}],
+    "changeSummary": "<which findings were addressed and how>",
+    "dropRecommendation": {"reason": "<why this candidate should be dropped instead of revised>"},
+    "model": "<runtime model id>",
+    "reviser_node": "<your node id>",
+    "note": (
+        "emit the result JSON only; include skillFiles/changeSummary exactly when outcome=revised, "
+        "dropRecommendation exactly when outcome=drop_recommendation"
+    ),
+}
 
-def _worker_procedure_from_docs(nexus_dir: Path) -> str:
-    """Extract the worker procedure section from the a2a-nexus intake spec."""
+
+def _worker_procedure_from_docs(nexus_dir: Path, *, doc_name: str, end_marker: str) -> str:
+    """Extract the worker procedure section from an a2a-nexus intake spec."""
     try:
-        text = (nexus_dir / "docs" / "skills-intake-review.md").read_text(encoding="utf-8")
+        text = (nexus_dir / "docs" / doc_name).read_text(encoding="utf-8")
     except OSError as error:
         raise PromotionError("dispatch_docs_unreadable") from error
     start = text.find(_DISPATCH_DOC_START)
-    end = text.find(_DISPATCH_DOC_END)
+    end = text.find(end_marker)
     if start < 0 or end < 0 or end <= start:
         raise PromotionError("dispatch_docs_section_missing")
     procedure = text[start:end].strip()
@@ -1815,7 +1875,11 @@ def _dispatch_intake_review(  # noqa: C901
     try:
         if not _wait_for_skills_check(config, head, config.dispatch_ci_wait_sec):
             return {"outcome": "dispatch-skipped", "code": "dispatch_ci_not_green"}
-        procedure = _worker_procedure_from_docs(config.a2a_nexus_dir)
+        procedure = _worker_procedure_from_docs(
+            config.a2a_nexus_dir,
+            doc_name="skills-intake-review.md",
+            end_marker=_DISPATCH_DOC_END,
+        )
         reviewer = _dispatch_target_worker(config, candidate.node, secret)
         broker_id = _broker_id(config, secret)
         inventory = _inventory_snapshot(config)
@@ -1869,6 +1933,11 @@ def _dispatch_intake_review(  # noqa: C901
             "reviewer_node": reviewer,
             "broker_id": broker_id,
             "pr_url": url,
+            "node": candidate.node,
+            "provider": candidate.provider,
+            "name": candidate.name,
+            "tree_sha256": candidate.tree_sha256,
+            "branch": branch,
         },
     )
     try:
@@ -1890,6 +1959,872 @@ def _dispatch_intake_review(  # noqa: C901
         "dispatched_task": dispatched_task,
         "reviewer_node": reviewer,
         "round_id": manifest["roundId"],
+    }
+
+
+# --- R2 revise rounds: verdict-driven automatic revision (#1357) ------------
+
+
+def _ledger_rows(config: Config) -> list[dict[str, object]]:
+    try:
+        text = (config.promotion_state_dir / "ledger.jsonl").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    rows: list[dict[str, object]] = []
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            rows.append(record)
+    return rows
+
+
+def _split_transport_id(transport_id: str, provider: str) -> tuple[str, str, str] | None:
+    """Split "<node>-<provider>-<name>-<tree12>" into (node, name, tree12).
+    Node and name may both contain hyphens; the provider marker and the fixed
+    12-char tree suffix make the split unambiguous."""
+    marker = f"-{provider}-"
+    if marker not in transport_id:
+        return None
+    node, rest = transport_id.split(marker, 1)
+    if "-" not in rest:
+        return None
+    name, tree12 = rest.rsplit("-", 1)
+    if not node or not name or not re.fullmatch(r"[0-9a-f]{12}", tree12):
+        return None
+    return node, name, tree12
+
+
+def _pr_number_from_url(url: str) -> str | None:
+    match = re.search(r"/pull/(\d+)$", url.rstrip("/"))
+    return match.group(1) if match else None
+
+
+def _pr_comment(config: Config, pr_number: str, body: str) -> None:
+    _run(["gh", "pr", "comment", pr_number, "--repo", config.repo, "--body", body])
+
+
+def _broker_task(config: Config, task_id: str, secret: str) -> dict[str, object]:
+    try:
+        completed = _run(
+            [
+                "curl", "-fsS", "--max-time", "30",
+                "-H", f"x-a2a-edge-secret: {secret}",
+                f"{config.broker_url}/tasks/{task_id}",
+            ],
+        )
+        payload = json.loads(completed.stdout.decode("utf-8"))
+    except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PromotionError("revise_broker_unreachable") from error
+    if not isinstance(payload, dict):
+        raise PromotionError("revise_broker_unreachable")
+    return payload
+
+
+def _task_result_output(task: dict[str, object]) -> dict[str, object] | None:
+    result = task.get("result")
+    output = result.get("output") if isinstance(result, dict) else None
+    return output if isinstance(output, dict) else None
+
+
+def _verdict_from_task(
+    task: dict[str, object], expected_head: str
+) -> tuple[str, list[dict[str, str]]] | None:
+    """Extract and bind a reviewer verdict. Returns None for anything that is
+    not a well-formed verdict bound to the exact dispatched head — a malformed
+    result is a handler failure, never a verdict (Phase C discipline)."""
+    output = _task_result_output(task)
+    if output is None:
+        return None
+    verdict = output.get("verdict")
+    findings = output.get("findings")
+    if verdict not in {"approve", "revise", "reject"} or not isinstance(findings, list):
+        return None
+    head_sha = output.get("head_sha")
+    if not isinstance(head_sha, str) or head_sha != expected_head:
+        return None
+    clean: list[dict[str, str]] = []
+    for finding in findings[:16]:
+        if not isinstance(finding, dict):
+            continue
+        clean.append(
+            {
+                "severity": str(finding.get("severity", "info"))[:16],
+                "area": str(finding.get("area", "general"))[:32],
+                "note": str(finding.get("note", ""))[:600],
+            }
+        )
+    return str(verdict), clean
+
+
+def _verdict_comment_body(
+    verdict: str, findings: list[dict[str, str]], reviewer: str, dispatched: str, note: str
+) -> str:
+    lines = [
+        "## A2A intake review verdict (auto-recorded)",
+        "",
+        f"- verdict: **{verdict}** — reviewer `{reviewer}`, task `{dispatched}`",
+    ]
+    if note:
+        lines.append(f"- {note}")
+    if findings:
+        lines.extend(["", "Findings:"])
+        for index, finding in enumerate(findings[:8], 1):
+            lines.append(f"{index}. **{finding['severity']}/{finding['area']}** — {finding['note']}")
+        if len(findings) > 8:
+            lines.append(f"(+{len(findings) - 8} more findings in the broker record)")
+    return "\n".join(lines)
+
+
+def _pr_manifest_tree(
+    config: Config, *, node: str, provider: str, candidate_id: str, head: str
+) -> str:
+    """Full source tree SHA-256 from the intake manifest on the PR head —
+    pre-R2 dispatch records carry only the 12-char transport suffix."""
+    item = _run(
+        [
+            "gh", "api",
+            f"repos/{config.repo}/contents/intake/{node}/{provider}/{candidate_id}/manifest.json?ref={head}",
+        ]
+    )
+    try:
+        raw = base64.b64decode(json.loads(item.stdout.decode("utf-8"))["content"])
+        tree = json.loads(raw.decode("utf-8")).get("tree_sha256")
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise PromotionError("revise_pr_unreadable") from error
+    if not isinstance(tree, str) or not re.fullmatch(r"[0-9a-f]{64}", tree):
+        raise PromotionError("revise_pr_unreadable")
+    return tree
+
+
+def _pr_skill_files(
+    config: Config, *, node: str, provider: str, candidate_id: str, head: str
+) -> list[tuple[str, bytes, bool]]:
+    """Read the current candidate tree from the intake PR head, with exec bits."""
+    prefix = f"intake/{node}/{provider}/{candidate_id}/skill/"
+    completed = _run(
+        [
+            "gh", "api", f"repos/{config.repo}/git/trees/{head}?recursive=1",
+            "--jq", '[.tree[] | select(.type == "blob") | {path, mode}]',
+        ]
+    )
+    try:
+        entries = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PromotionError("revise_pr_unreadable") from error
+    if not isinstance(entries, list):
+        raise PromotionError("revise_pr_unreadable")
+    files: list[tuple[str, bytes, bool]] = []
+    total = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        if not isinstance(path, str) or not path.startswith(prefix):
+            continue
+        relative = path[len(prefix):]
+        item = _run(["gh", "api", f"repos/{config.repo}/contents/{path}?ref={head}"])
+        try:
+            content = base64.b64decode(json.loads(item.stdout.decode("utf-8"))["content"])
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise PromotionError("revise_pr_unreadable") from error
+        total += len(content)
+        if len(files) >= _MAX_FILES or total > _MAX_TOTAL_BYTES or len(content) > _MAX_FILE_BYTES:
+            raise PromotionError("revise_pr_unreadable")
+        files.append((relative, content, entry.get("mode") == "100755"))
+    files.sort(key=lambda item: item[0])
+    if not files or files[0][0] != "SKILL.md":
+        raise PromotionError("revise_pr_unreadable")
+    return files
+
+
+def _revised_files_from_output(
+    output: dict[str, object], expected_name: str, expected_tree: str
+) -> list[tuple[str, bytes]] | None:
+    """Validate a reviser result against the packet bindings and size caps.
+    Returns (path, bytes) pairs, or None when the result is not an acceptable
+    "revised" outcome (malformed results are handler failures, not revisions)."""
+    if output.get("outcome") != "revised":
+        return None
+    if output.get("skillName") != expected_name:
+        return None
+    if output.get("sourceTreeSha256") != expected_tree:
+        return None
+    change_summary = output.get("changeSummary")
+    if not isinstance(change_summary, str) or not change_summary.strip():
+        return None
+    raw_files = output.get("skillFiles")
+    if not isinstance(raw_files, list) or not 1 <= len(raw_files) <= _MAX_FILES:
+        return None
+    files: list[tuple[str, bytes]] = []
+    seen: set[str] = set()
+    total = 0
+    for raw in raw_files:
+        if not isinstance(raw, dict):
+            return None
+        path = raw.get("path")
+        content = raw.get("content")
+        if not isinstance(path, str) or not isinstance(content, str) or path in seen:
+            return None
+        seen.add(path)
+        try:
+            blob = content.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        total += len(blob)
+        if len(blob) > _MAX_FILE_BYTES or total > _MAX_TOTAL_BYTES:
+            return None
+        files.append((path, blob))
+    if "SKILL.md" not in seen:
+        return None
+    return files
+
+
+def _candidate_from_revised_files(
+    node: str,
+    provider: str,
+    name: str,
+    revised: list[tuple[str, bytes]],
+    original_exec: dict[str, bool],
+) -> Candidate:
+    """Rebuild a Candidate through the full envelope path: path safety, size
+    caps, secret/node-fact/coupling scans, frontmatter rules, and tree-hash
+    consistency all re-apply — a revision never bypasses the machine gates."""
+    files = [
+        SnapshotFile(relative=path, content=blob, executable=original_exec.get(path, False))
+        for path, blob in revised
+    ]
+    files.sort(key=lambda item: item.relative)
+    skill_blob = next(item.content for item in files if item.relative == "SKILL.md")
+    description = _frontmatter(skill_blob, name)
+    skill_sha = hashlib.sha256(skill_blob).hexdigest()
+    digest = hashlib.sha256()
+    for item in files:
+        digest.update(item.relative.encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(item.content).hexdigest().encode())
+        digest.update(b"\0")
+    tree_sha = digest.hexdigest()
+    value = {
+        "schema_version": 1,
+        "transport_id": f"{node}-{provider}-{name}-{tree_sha[:12]}",
+        "created_at": _utc_now(),
+        "node": node,
+        "provider": provider,
+        "name": name,
+        "description": description,
+        "skill_sha256": skill_sha,
+        "tree_sha256": tree_sha,
+        "files": [
+            {
+                "path": item.relative,
+                "content_b64": base64.b64encode(item.content).decode("ascii"),
+                "executable": item.executable,
+            }
+            for item in files
+        ],
+    }
+    return _candidate_from_envelope(value)[0]
+
+
+def _revise_dispatched(rows: list[dict[str, object]], pr: str, head: str) -> bool:
+    return any(
+        row.get("kind") == "a2a-revise-dispatch" and row.get("pr") == pr and row.get("head_sha") == head
+        for row in rows
+    )
+
+
+def _build_revise_manifest(
+    config: Config,
+    *,
+    pr_number: str,
+    branch: str,
+    head: str,
+    node: str,
+    provider: str,
+    name: str,
+    tree_sha256: str,
+    round_no: int,
+    findings: list[dict[str, str]],
+    skill_files: list[dict[str, str]],
+    procedure: str,
+    broker_id: str,
+    now: str,
+) -> dict[str, object]:
+    task_id = f"{_REVISE_LANE}-pr{pr_number}-{node}-{now}"
+    round_id = f"{_REVISE_LANE}-pr{pr_number}-r{round_no}-{head[:8]}-{now}"
+    return {
+        "roundId": round_id,
+        "brokerUrl": config.broker_url,
+        "requester": {"id": config.node, "role": "operator"},
+        "defaults": {"intent": _REVISE_LANE},
+        "lanes": [
+            {
+                "id": task_id,
+                "target": {"id": node, "role": "publisher"},
+                "intent": _REVISE_LANE,
+                "message": (
+                    f"skills-intake-reviser procedure invoked: revise the fleet-skills intake "
+                    f"candidate {name} (intake PR #{pr_number}, author node {node}, revision "
+                    f"round {round_no}) per {_REVISE_SCHEMA}. Address the attached findings with a "
+                    f"holistic edit and return ONLY the result JSON. Bind your output to "
+                    f"skillName={name}, sourceTreeSha256={tree_sha256}."
+                ),
+                "payload": {
+                    "schema": _REVISE_SCHEMA,
+                    "rubricVersion": _INTAKE_RUBRIC_VERSION,
+                    "scope": "fleet-internal",
+                    "skillName": name,
+                    "provenance": {
+                        "author_node": node,
+                        "provider": provider,
+                        "intake_pr": int(pr_number),
+                        "branch": branch,
+                        "head_sha": head,
+                        "source_tree_sha256": tree_sha256,
+                        "revise_round": round_no,
+                        "revise_round_limit": config.revise_round_limit,
+                    },
+                    "findings": findings,
+                    "skillFiles": skill_files,
+                    "reviseResultSchema": _REVISE_RESULT_SCHEMA,
+                    "workerProcedure": procedure,
+                    "review": {
+                        "required": False,
+                        "note": (
+                            "author-executed revision; the publisher re-runs every machine gate "
+                            "on the returned files and opens a fresh intake PR that is "
+                            "re-dispatched to an independent reviewer"
+                        ),
+                    },
+                    "originBrokerId": broker_id,
+                    "brokerOfRecordId": broker_id,
+                    "operatorFacingOwner": "local",
+                },
+            }
+        ],
+    }
+
+
+def _comment_once(
+    config: Config,
+    rows: list[dict[str, object]],
+    *,
+    pr: str,
+    head: str,
+    marker: str,
+    body: str,
+    kind: str = "a2a-revise-comment",
+) -> None:
+    """Post a PR comment at most once per (pr, head, marker); idempotency is
+    tracked in the ledger so repeated collect cycles never spam the PR."""
+    for row in rows:
+        if (
+            row.get("kind") == kind
+            and row.get("pr") == pr
+            and row.get("head_sha") == head
+            and row.get("marker") == marker
+        ):
+            return
+    try:
+        _pr_comment(config, pr, body)
+    except PromotionError:
+        return
+    record = {"ts": _utc_now(), "kind": kind, "pr": pr, "head_sha": head, "marker": marker}
+    _append_ledger(config, record)
+    rows.append(record)
+
+
+def _revise_dispatch_target(
+    row: dict[str, object],
+) -> tuple[str, str, str, str, str, str, str] | str:
+    """Parse a review-dispatch ledger row into (node, name, tree12, pr,
+    provider, head, pr_url) — the revision target — or return a skip code.
+    Pre-R2 rows carry only transport_id/head/pr_url, so the provider marker
+    is recovered from the transport id."""
+    transport_id = row.get("transport_id")
+    head = row.get("head_sha")
+    pr_url = row.get("pr_url")
+    if (
+        not isinstance(transport_id, str)
+        or not isinstance(head, str)
+        or not isinstance(pr_url, str)
+    ):
+        return "revise_record_invalid"
+    provider = row.get("provider")
+    if provider not in {"claude", "codex"}:
+        provider = next(
+            (name for name in ("claude", "codex") if f"-{name}-" in transport_id), None
+        )
+    if provider is None:
+        return "revise_record_invalid"
+    parsed = _split_transport_id(transport_id, str(provider))
+    pr = _pr_number_from_url(pr_url)
+    if parsed is None or pr is None:
+        return "revise_record_invalid"
+    node, name, tree12 = parsed
+    return node, name, tree12, pr, str(provider), head, pr_url
+
+
+def _dispatch_intake_revise(
+    config: Config,
+    row: dict[str, object],
+    rows: list[dict[str, object]],
+    findings: list[dict[str, str]],
+    reviewer: str,
+    *,
+    dry_run: bool,
+) -> dict[str, object]:
+    """Dispatch one bounded revision task to the author node. Best-effort and
+    fail-safe like the review dispatch: never raises, skip codes recorded."""
+    if not os.environ.get("A2A_EDGE_SECRET"):
+        return {"outcome": "revise-skipped", "code": "revise_secret_missing"}
+    target = _revise_dispatch_target(row)
+    if isinstance(target, str):
+        return {"outcome": "revise-skipped", "code": target}
+    node, name, tree12, pr, provider, head, pr_url = target
+    if dry_run:
+        return {"outcome": "would-dispatch-revise", "pr": pr, "node": node, "name": name}
+    lineage = [
+        item
+        for item in rows
+        if item.get("kind") == "a2a-revise-dispatch" and item.get("node") == node and item.get("name") == name
+    ]
+    round_no = len(lineage) + 1
+    if round_no > config.revise_round_limit:
+        _comment_once(
+            config,
+            rows,
+            pr=pr,
+            head=head,
+            marker="round-limit",
+            body=(
+                f"Revise round limit reached ({config.revise_round_limit} rounds for this skill "
+                "lineage). Per the auto-revision gate policy the PR stays open for human judgment "
+                "— no auto-close, no further automatic revision."
+            ),
+        )
+        return {"outcome": "revise-handoff", "round": round_no - 1, "pr": pr}
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily = sum(
+        1
+        for item in lineage
+        if isinstance(item.get("ts"), str) and item["ts"].startswith(today)
+    )
+    if daily >= config.revise_daily_cap:
+        return {"outcome": "revise-skipped", "code": "revise_daily_cap"}
+    if _revise_dispatched(rows, pr, head):
+        return {"outcome": "revise-skipped", "code": "revise_already"}
+    secret = os.environ["A2A_EDGE_SECRET"]
+    nexus_script = config.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"
+    if not nexus_script.is_file():
+        return {"outcome": "revise-skipped", "code": "revise_nexus_missing"}
+    try:
+        online = _broker_online_worker_ids(config, secret)
+        if node not in online:
+            return {"outcome": "revise-skipped", "code": "revise_author_offline"}
+        broker_id = _broker_id(config, secret)
+        procedure = _worker_procedure_from_docs(
+            config.a2a_nexus_dir, doc_name=_REVISE_DOC_NAME, end_marker=_REVISE_DOC_END
+        )
+        branch = row.get("branch") if isinstance(row.get("branch"), str) and row.get("branch") else f"skill-intake/{node}/{name}-{provider}-{tree12}"
+        tree_sha256 = row.get("tree_sha256") if isinstance(row.get("tree_sha256"), str) and row.get("tree_sha256") else _pr_manifest_tree(
+            config, node=node, provider=str(provider), candidate_id=f"{name}-{tree12}", head=head
+        )
+        if not tree_sha256.startswith(tree12):
+            return {"outcome": "revise-skipped", "code": "revise_record_invalid"}
+        pr_files = _pr_skill_files(
+            config, node=node, provider=str(provider), candidate_id=f"{name}-{tree12}", head=head
+        )
+        skill_files = [
+            {"path": relative, "content": content.decode("utf-8")}
+            for relative, content, _ in pr_files
+        ]
+        now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        manifest = _build_revise_manifest(
+            config,
+            pr_number=pr,
+            branch=branch,
+            head=head,
+            node=node,
+            provider=str(provider),
+            name=name,
+            tree_sha256=tree_sha256,
+            round_no=round_no,
+            findings=findings,
+            skill_files=skill_files,
+            procedure=procedure,
+            broker_id=broker_id,
+            now=now,
+        )
+    except PromotionError as error:
+        return {"outcome": "revise-skipped", "code": error.code}
+    descriptor, manifest_path = tempfile.mkstemp(
+        prefix="revise-manifest-", suffix=".json", dir=config.promotion_state_dir
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False)
+        env = dict(os.environ)
+        env["A2A_EDGE_SECRET"] = secret
+        try:
+            completed = _run(
+                ["node", str(nexus_script), "--manifest", str(manifest_path), "--verify", "--json"],
+                env=env,
+                timeout=300,
+            )
+            result = json.loads(completed.stdout.decode("utf-8"))
+        except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            return {"outcome": "revise-skipped", "code": "revise_round_failed", "detail": str(error)[:120]}
+    finally:
+        try:
+            os.unlink(manifest_path)
+        except OSError:
+            pass
+    dispatch_rows = result.get("results") if isinstance(result, dict) else None
+    created = dispatch_rows[0] if isinstance(dispatch_rows, list) and dispatch_rows and isinstance(dispatch_rows[0], dict) else None
+    dispatched_task = created.get("taskId") if created else None
+    if not isinstance(dispatched_task, str) or not dispatched_task:
+        return {"outcome": "revise-skipped", "code": "revise_round_failed"}
+    lane = manifest["lanes"][0]
+    task_id = str(lane["id"])
+    record = {
+        "ts": _utc_now(),
+        "kind": "a2a-revise-dispatch",
+        "task_id": task_id,
+        "dispatched_task": dispatched_task,
+        "pr": pr,
+        "pr_url": pr_url,
+        "branch": branch,
+        "head_sha": head,
+        "node": node,
+        "provider": str(provider),
+        "name": name,
+        "tree_sha256": tree_sha256,
+        "round": round_no,
+        "reviser_node": node,
+        "broker_id": broker_id,
+    }
+    _append_ledger(config, record)
+    rows.append(record)
+    try:
+        _pr_comment(
+            config,
+            pr,
+            _verdict_comment_body(
+                "revise",
+                findings,
+                reviewer,
+                str(row.get("dispatched_task", "")),
+                (
+                    f"auto-revision round {round_no}/{config.revise_round_limit}: revision task "
+                    f"`{dispatched_task}` dispatched to author node `{node}`; the revised tree will "
+                    "be re-gated and re-reviewed on a fresh intake PR"
+                ),
+            ),
+        )
+    except PromotionError:
+        pass
+    return {
+        "outcome": "revise-dispatched",
+        "pr": pr,
+        "round": round_no,
+        "task_id": task_id,
+        "dispatched_task": dispatched_task,
+    }
+
+
+def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object]]:
+    """Poll dispatched review tasks, record verdicts, post verdict/findings
+    comments (the #1357 visibility gap), and trigger bounded revision rounds."""
+    rows = _ledger_rows(config)
+    consumed = {
+        row.get("task_id") for row in rows if row.get("kind") == "a2a-verdict"
+    }
+    pending = [
+        row for row in rows if row.get("kind") == "a2a-dispatch" and row.get("dispatched_task") not in consumed
+    ]
+    processed: list[dict[str, object]] = []
+    for row in reversed(pending[-8:]):
+        dispatched = row.get("dispatched_task")
+        if not isinstance(dispatched, str):
+            continue
+        if dry_run:
+            processed.append({"outcome": "would-poll-verdict", "task_id": dispatched})
+            continue
+        try:
+            task = _broker_task(config, dispatched, os.environ.get("A2A_EDGE_SECRET", ""))
+        except PromotionError:
+            processed.append({"outcome": "verdict-pending", "task_id": dispatched})
+            continue
+        if task.get("status") not in _TERMINAL_TASK_STATUSES:
+            processed.append({"outcome": "verdict-pending", "task_id": dispatched})
+            continue
+        head = row.get("head_sha") if isinstance(row.get("head_sha"), str) else ""
+        verdict_data = _verdict_from_task(task, head)
+        if verdict_data is None:
+            _append_ledger(
+                config,
+                {
+                    "ts": _utc_now(),
+                    "kind": "a2a-verdict",
+                    "task_id": dispatched,
+                    "status": "malformed",
+                    "task_status": str(task.get("status", "")),
+                },
+            )
+            processed.append({"outcome": "verdict-malformed", "task_id": dispatched})
+            continue
+        verdict, findings = verdict_data
+        _append_ledger(
+            config,
+            {
+                "ts": _utc_now(),
+                "kind": "a2a-verdict",
+                "task_id": dispatched,
+                "status": "consumed",
+                "verdict": verdict,
+                "findings": len(findings),
+                "head_sha": head,
+            },
+        )
+        note = ""
+        if verdict == "revise":
+            revise_outcome = _dispatch_intake_revise(
+                config, row, rows, findings, str(row.get("reviewer_node", "unknown")), dry_run=False
+            )
+            processed.append({"outcome": "verdict-consumed", "verdict": verdict, "revise": revise_outcome})
+            continue
+        if verdict == "reject":
+            note = "reject verdict fails the gate — human decision required, no auto-close"
+        elif verdict == "approve":
+            note = "signed receipt projection and human `reviewed_by` sign-off still required"
+        try:
+            _pr_comment(
+                config,
+                _pr_number_from_url(str(row.get("pr_url", ""))) or "",
+                _verdict_comment_body(verdict, findings, str(row.get("reviewer_node", "unknown")), dispatched, note),
+            )
+        except PromotionError:
+            pass
+        processed.append({"outcome": "verdict-consumed", "verdict": verdict, "findings": len(findings)})
+    return processed
+
+
+def _consume_revise_results(config: Config, *, dry_run: bool) -> list[dict[str, object]]:
+    """Consume terminal revision tasks: republish revised trees through the
+    full gate path on a fresh intake PR, or record drop recommendations for
+    the human sweep. Failed or malformed results are consumed once and never
+    re-dispatched (one revision dispatch per PR head)."""
+    rows = _ledger_rows(config)
+    consumed = {
+        row.get("task_id") for row in rows if row.get("kind") == "a2a-revise-result"
+    }
+    pending = [
+        row for row in rows if row.get("kind") == "a2a-revise-dispatch" and row.get("task_id") not in consumed
+    ]
+    results: list[dict[str, object]] = []
+    for row in reversed(pending[-8:]):
+        task_id = row.get("task_id")
+        pr = row.get("pr")
+        head = row.get("head_sha")
+        node = row.get("node")
+        name = row.get("name")
+        provider = row.get("provider")
+        tree = row.get("tree_sha256")
+        if not all(isinstance(value, str) for value in (task_id, pr, head, node, name, provider, tree)):
+            continue
+        if dry_run:
+            results.append({"outcome": "would-poll-revise", "task_id": task_id})
+            continue
+        try:
+            task = _broker_task(config, str(task_id), os.environ.get("A2A_EDGE_SECRET", ""))
+        except PromotionError:
+            results.append({"outcome": "revise-pending", "task_id": task_id})
+            continue
+        status = task.get("status")
+        if status not in _TERMINAL_TASK_STATUSES:
+            results.append({"outcome": "revise-pending", "task_id": task_id})
+            continue
+        if status != "succeeded":
+            _append_ledger(
+                config,
+                {"ts": _utc_now(), "kind": "a2a-revise-result", "task_id": task_id, "status": "failed",
+                 "task_status": str(status)},
+            )
+            _comment_once(
+                config,
+                rows,
+                pr=str(pr),
+                head=str(head),
+                marker=f"revise-failed:{task_id}",
+                body=(
+                    f"Revision task `{task_id}` ended as `{status}` — a handler failure is a crash, "
+                    "never a verdict. No automatic retry; human judgment continues on this PR."
+                ),
+            )
+            results.append({"outcome": "revise-failed", "task_id": task_id, "task_status": str(status)})
+            continue
+        output = _task_result_output(task)
+        revised = _revised_files_from_output(output, str(name), str(tree)) if output is not None else None
+        if revised is not None:
+            results.append(
+                _republish_revised_candidate(
+                    config, rows, revised=revised,
+                    task_id=str(task_id), pr=str(pr), head=str(head), node=str(node),
+                    name=str(name), provider=str(provider), tree=str(tree),
+                )
+            )
+            continue
+        drop_reason = ""
+        if output is not None and output.get("outcome") == "drop_recommendation":
+            recommendation = output.get("dropRecommendation")
+            if (
+                isinstance(recommendation, dict)
+                and recommendation.get("reason")
+                and output.get("skillName") == name
+                and output.get("sourceTreeSha256") == tree
+            ):
+                drop_reason = str(recommendation.get("reason"))[:600]
+        if drop_reason:
+            _append_ledger(
+                config,
+                {"ts": _utc_now(), "kind": "a2a-revise-result", "task_id": task_id,
+                 "status": "drop-recommended", "node": node, "name": name, "pr": pr,
+                 "head_sha": head, "reason": drop_reason},
+            )
+            _comment_once(
+                config,
+                rows,
+                pr=str(pr),
+                head=str(head),
+                marker=f"drop-recommend:{task_id}",
+                body=(
+                    "## Drop recommendation (auto-revision gate)\n\n"
+                    f"- reviser `{node}` recommends dropping `{name}`: {drop_reason}\n"
+                    "- recorded for the periodic human sweep; the PR stays open, nothing is auto-closed"
+                ),
+            )
+            results.append({"outcome": "drop-recommended", "task_id": task_id})
+            continue
+        _append_ledger(
+            config,
+            {"ts": _utc_now(), "kind": "a2a-revise-result", "task_id": task_id, "status": "invalid"},
+        )
+        _comment_once(
+            config,
+            rows,
+            pr=str(pr),
+            head=str(head),
+            marker=f"revise-invalid:{task_id}",
+            body=(
+                f"Revision task `{task_id}` returned a malformed result — treated as a handler "
+                "failure, not a revision. No automatic retry; human judgment continues on this PR."
+            ),
+        )
+        results.append({"outcome": "revise-invalid", "task_id": task_id})
+    return results
+
+
+def _republish_revised_candidate(
+    config: Config,
+    rows: list[dict[str, object]],
+    *,
+    revised: list[tuple[str, bytes]],
+    task_id: str,
+    pr: str,
+    head: str,
+    node: str,
+    name: str,
+    provider: str,
+    tree: str,
+) -> dict[str, object]:
+    try:
+        original = _pr_skill_files(
+            config, node=node, provider=provider, candidate_id=f"{name}-{tree[:12]}", head=head
+        )
+        original_exec = {relative: executable for relative, _, executable in original}
+        candidate = _candidate_from_revised_files(node, provider, name, revised, original_exec)
+    except PromotionError as error:
+        _append_ledger(
+            config,
+            {"ts": _utc_now(), "kind": "a2a-revise-result", "task_id": task_id,
+             "status": "invalid", "node": node, "name": name, "code": error.code},
+        )
+        _comment_once(
+            config,
+            rows,
+            pr=pr,
+            head=head,
+            marker=f"revise-invalid:{task_id}",
+            body=(
+                f"Revision task `{task_id}` returned files that failed re-gating (`{error.code}`) — "
+                "treated as a handler failure, not a revision. No automatic retry; human judgment "
+                "continues on this PR."
+            ),
+        )
+        return {"outcome": "revise-invalid", "task_id": task_id, "code": error.code}
+    if candidate.tree_sha256 == tree:
+        _append_ledger(
+            config,
+            {"ts": _utc_now(), "kind": "a2a-revise-result", "task_id": task_id,
+             "status": "unchanged", "node": node, "name": name},
+        )
+        return {"outcome": "revise-unchanged", "task_id": task_id}
+    try:
+        outcome = _publish(config, candidate, created_at=_utc_now())
+    except PromotionError as error:
+        _append_ledger(
+            config,
+            {"ts": _utc_now(), "kind": "a2a-revise-result", "task_id": task_id,
+             "status": "publish-failed", "node": node, "name": name, "code": error.code},
+        )
+        return {"outcome": "republish-failed", "task_id": task_id, "code": error.code}
+    new_tree = candidate.tree_sha256
+    record = {
+        "ts": _utc_now(),
+        "kind": "a2a-revise-result",
+        "task_id": task_id,
+        "status": "republished",
+        "node": node,
+        "provider": provider,
+        "name": name,
+        "pr": pr,
+        "head_sha": head,
+        "new_tree_sha256": new_tree,
+        "new_transport_id": _transport_id(candidate),
+        "new_branch": outcome.get("branch", ""),
+        "new_pr_url": outcome.get("url", ""),
+    }
+    _append_ledger(config, record)
+    rows.append(record)
+    if outcome["outcome"] in {"pr-opened", "existing-pr"}:
+        try:
+            _dispatch_intake_review(config, candidate, outcome, transport_id=_transport_id(candidate))
+        except PromotionError:
+            pass
+    new_pr = _pr_number_from_url(str(outcome.get("url", ""))) or "(pending)"
+    _comment_once(
+        config,
+        rows,
+        pr=pr,
+        head=head,
+        marker=f"republished:{task_id}",
+        body=(
+            "## Revised candidate republished (auto-revision gate)\n\n"
+            f"- revision task `{task_id}` produced a new tree `{new_tree[:12]}`\n"
+            f"- fresh intake PR: {new_pr} — machine gates re-ran and an independent re-review was "
+            "dispatched\n"
+            "- this PR is superseded and left open for the human to close (no auto-close)"
+        ),
+    )
+    return {
+        "outcome": "republished",
+        "task_id": task_id,
+        "new_tree_sha256": new_tree,
+        "new_pr_url": outcome.get("url", ""),
     }
 
 
@@ -1941,7 +2876,7 @@ def _repair_skill_frontmatter(skill_dir: Path, expected_name: str) -> None:
     path.write_text("\n".join(frontmatter + body) + "\n", encoding="utf-8")
 
 
-def _autorepair_llm(skill_dir: Path, provider: str) -> None:
+def _autorepair_llm(skill_dir: Path, provider: str, llm_cmd: tuple[str, ...]) -> None:
     """One restricted model pass per markdown file that still carries
     runtime-specific couplings; every result is re-validated with the same
     gate patterns before it is accepted."""
@@ -1961,7 +2896,7 @@ def _autorepair_llm(skill_dir: Path, provider: str) -> None:
             "Rules: keep the markdown structure and frontmatter unchanged; do not\n"
             "add or remove steps; output ONLY the rewritten markdown.\n\n---\n" + text
         )
-        completed = _run(["claude", "-p", "--disallowed-tools", "*", prompt], timeout=300)
+        completed = _run([*llm_cmd, prompt], timeout=300)
         repaired = completed.stdout.decode("utf-8").strip()
         if len(repaired) < max(64, len(text) // 4):
             raise PromotionError("autorepair_output_invalid")
@@ -1982,7 +2917,7 @@ def _autorepair_candidate(config: Config, provider: str, name: str, code: str) -
         if code == "skill_frontmatter_invalid":
             _repair_skill_frontmatter(skill_dir, name)
         elif code in ("runtime_specific_claude", "runtime_specific_codex"):
-            _autorepair_llm(skill_dir, provider)
+            _autorepair_llm(skill_dir, provider, config.review_llm_cmd)
         else:
             return False
     except PromotionError:
@@ -2094,6 +3029,12 @@ def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:  # noqa: C9
                 row["dispatch"] = _dispatch_intake_review(
                     config, candidate, outcome, transport_id=transport_id
                 )
+    revise: dict[str, object] | None = None
+    if config.revise_enabled:
+        revise = {
+            "verdicts": _process_verdicts(config, dry_run=dry_run),
+            "results": _consume_revise_results(config, dry_run=dry_run),
+        }
     return {
         "ok": not errors,
         "mode": "collect-dry-run" if dry_run else "collect",
@@ -2102,6 +3043,7 @@ def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:  # noqa: C9
         "repo": config.repo,
         "published": published,
         "errors": errors,
+        "revise": revise,
     }
 
 
