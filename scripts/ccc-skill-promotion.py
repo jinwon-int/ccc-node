@@ -1107,18 +1107,26 @@ def _publish(
     }
 
 
-def _append_ledger(config: Config, record: dict[str, object]) -> None:
-    path = config.promotion_state_dir / "ledger.jsonl"
+def _append_jsonl(
+    config: Config, filename: str, record: dict[str, object], *, code: str = "ledger_unsafe"
+) -> None:
+    """Append one JSON line to a private state file under the same invariants
+    as the ledger: owner-only 0600 regular file, no hardlinks, owned by us."""
+    path = config.promotion_state_dir / filename
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
     descriptor = os.open(path, flags, 0o600)
     try:
         metadata = os.fstat(descriptor)
         if metadata.st_uid != os.geteuid() or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise PromotionError("ledger_unsafe")
+            raise PromotionError(code)
         os.write(descriptor, (_json_line(record) + "\n").encode())
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _append_ledger(config: Config, record: dict[str, object]) -> None:
+    _append_jsonl(config, "ledger.jsonl", record)
 
 
 def _transport_id(candidate: Candidate) -> str:
@@ -2934,6 +2942,189 @@ def _autorepair_candidate(config: Config, provider: str, name: str, code: str) -
 
 
 # Collection deliberately sequences visibility, remote reads, publication, and ack.
+# --- R3 drop-recommendation sweep report (#1363) -----------------------------
+# Read-only human sweep over the drop recommendations the auto-revision gate
+# recorded (kind a2a-revise-result, status drop-recommended). The report only
+# summarizes: it never deletes a ledger record, never comments, and never
+# touches a PR — drop execution stays with a human (#1357 open decision (b)).
+# Two private state files carry the sweep bookkeeping (same 0600/owner-only/
+# no-hardlink invariants as the ledger):
+#   drop-report.acked.jsonl  — task ids a human marked processed (--ack)
+#   drop-report.sweeps.jsonl — task ids each prior report already showed,
+#                              so "new_items" means "recorded since the last
+#                              sweep ran".
+
+_DROP_ACK_FILE = "drop-report.acked.jsonl"
+_DROP_SWEEPS_FILE = "drop-report.sweeps.jsonl"
+_DROP_LINEAGE_FIELDS = ("node", "name", "provider", "pr")
+
+
+def _read_drop_jsonl(config: Config, filename: str, *, max_bytes: int = 262144) -> list[dict[str, object]]:
+    """Safely read one drop-report state file; a missing file is empty and an
+    unsafe one (symlink, hardlink, wrong mode or owner) fails closed."""
+    path = config.promotion_state_dir / filename
+    try:
+        metadata = path.lstat()
+        if (
+            not _path_components_safe(path, final_kind="file", trust_root=config.home)
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > max_bytes
+        ):
+            raise PromotionError("drop_state_unsafe")
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError):
+        raise PromotionError("drop_state_unsafe") from None
+    rows: list[dict[str, object]] = []
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            rows.append(record)
+    return rows
+
+
+def _drop_recommendation_items(config: Config) -> list[dict[str, object]]:
+    """Join every drop-recommended ledger row with its revise dispatch so each
+    item carries the fields the human sweep needs (author node, provider,
+    intake PR link, revise round, reason, recorded time)."""
+    rows = _ledger_rows(config)
+    dispatches = {
+        row["task_id"]: row
+        for row in rows
+        if isinstance(row.get("task_id"), str) and row.get("kind") == "a2a-revise-dispatch"
+    }
+    items: list[dict[str, object]] = []
+    for row in rows:
+        if row.get("kind") != "a2a-revise-result" or row.get("status") != "drop-recommended":
+            continue
+        task_id = row.get("task_id")
+        dispatch = dispatches.get(task_id) if isinstance(task_id, str) else None
+        extra = dispatch if isinstance(dispatch, dict) else {}
+        pr = row.get("pr")
+        pr_url = extra.get("pr_url")
+        if not isinstance(pr_url, str) or not pr_url:
+            pr_url = (
+                f"https://github.com/{config.repo}/pull/{pr}"
+                if isinstance(pr, str) and pr.isdigit()
+                else ""
+            )
+        items.append(
+            {
+                "task_id": task_id if isinstance(task_id, str) else "",
+                "node": row.get("node"),
+                "name": row.get("name"),
+                "provider": extra.get("provider"),
+                "pr": pr,
+                "pr_url": pr_url,
+                "round": extra.get("round"),
+                "reason": row.get("reason"),
+                "recorded_at": row.get("ts"),
+            }
+        )
+    return items
+
+
+def _drop_lineage_key(item: dict[str, object]) -> tuple[str, str, str, str]:
+    """One human decision: a skill lineage (author node + name + provider) on
+    one intake PR. Multiple rounds land as separate items in the lineage."""
+    return tuple(str(item.get(field) or "") for field in _DROP_LINEAGE_FIELDS)  # type: ignore[return-value]
+
+
+def _drop_process_acks(
+    config: Config, acks: list[str], acked: set[str]
+) -> list[dict[str, object]]:
+    """Record human-processed task ids in the ack state file (local
+    bookkeeping only — never touches the ledger or a PR)."""
+    _private_state_dir(config.promotion_state_dir)
+    ack_results = []
+    for task_id in acks:
+        already = task_id in acked
+        if not already:
+            _append_jsonl(
+                config,
+                _DROP_ACK_FILE,
+                {"ts": _utc_now(), "kind": "drop-report-ack", "task_id": task_id},
+                code="drop_state_unsafe",
+            )
+            acked.add(task_id)
+        ack_results.append(
+            {"task_id": task_id, "outcome": "already-acked" if already else "acked"}
+        )
+    return ack_results
+
+
+def _drop_report(config: Config, *, acks: list[str]) -> dict[str, object]:
+    for task_id in acks:
+        if not _SAFE_COMPONENT_RE.fullmatch(task_id):
+            raise PromotionError("drop_ack_invalid")
+    acked_rows = _read_drop_jsonl(config, _DROP_ACK_FILE)
+    acked = {row["task_id"] for row in acked_rows if isinstance(row.get("task_id"), str)}
+    seen: set[str] = set()
+    for row in _read_drop_jsonl(config, _DROP_SWEEPS_FILE):
+        values = row.get("seen")
+        if isinstance(values, list):
+            seen.update(value for value in values if isinstance(value, str))
+    ack_results = _drop_process_acks(config, acks, acked) if acks else []
+    items = _drop_recommendation_items(config)
+    firsts: dict[tuple[str, str, str, str], str] = {}
+    for item in items:
+        key = _drop_lineage_key(item)
+        recorded = item.get("recorded_at")
+        if isinstance(recorded, str) and recorded and (key not in firsts or recorded < firsts[key]):
+            firsts[key] = recorded
+    for item in items:
+        item["first_recorded_at"] = firsts[_drop_lineage_key(item)]
+    pending = sorted(
+        (item for item in items if item["task_id"] not in acked),
+        key=lambda item: (str(item["first_recorded_at"]), str(item["node"]), str(item["name"])),
+    )
+    for item in pending:
+        item["new"] = item["task_id"] not in seen
+    lineages = {_drop_lineage_key(item) for item in pending}
+    nodes: dict[str, int] = {}
+    for key in lineages:
+        nodes[key[0]] = nodes.get(key[0], 0) + 1
+    result: dict[str, object] = {
+        "ok": True,
+        "mode": "drop-report",
+        "summary": {
+            "new_items": sum(1 for item in pending if item["new"]),
+            "pending_items": len(pending),
+            "pending_lineages": len(lineages),
+            "nodes": dict(sorted(nodes.items())),
+        },
+        "pending": pending,
+    }
+    if ack_results:
+        result["ack"] = ack_results
+    swept = False
+    if acks or pending:
+        try:
+            _append_jsonl(
+                config,
+                _DROP_SWEEPS_FILE,
+                {
+                    "ts": _utc_now(),
+                    "kind": "drop-report-sweep",
+                    "seen": [item["task_id"] for item in pending],
+                },
+                code="drop_state_unsafe",
+            )
+            swept = True
+        except PromotionError:
+            pass
+    result["sweep_recorded"] = swept
+    return result
+
+
 def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:  # noqa: C901
     if not config.publisher_enabled:
         return {
@@ -3059,6 +3250,20 @@ def _parser() -> argparse.ArgumentParser:
     ack_parser.add_argument("transport_id")
     collect_parser = subparsers.add_parser("collect")
     collect_parser.add_argument("--dry-run", action="store_true")
+    drop_parser = subparsers.add_parser(
+        "drop-report",
+        help=(
+            "summarize drop_recommendation records for the human sweep "
+            "(read-only; --ack only records local bookkeeping)"
+        ),
+    )
+    drop_parser.add_argument(
+        "--ack",
+        action="append",
+        default=[],
+        metavar="TASK_ID",
+        help="mark a recommendation as processed by a human (repeatable)",
+    )
     return parser
 
 
@@ -3074,6 +3279,8 @@ def main(argv: list[str] | None = None) -> int:
             result = _export_result(config, limit=args.limit)
         elif args.command == "ack":
             result = _ack_result(config, args.transport_id)
+        elif args.command == "drop-report":
+            result = _drop_report(config, acks=args.ack)
         else:
             result = _collect(config, dry_run=args.dry_run)
     except PromotionError as error:

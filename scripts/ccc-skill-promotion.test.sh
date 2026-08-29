@@ -864,5 +864,81 @@ write_verdict "$head_cap2" revise
 out="$(env "${cap_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
 ok "daily cap blocks the second same-day revision dispatch"   '[ "$rc" = 0 ] && jq -e ".revise.verdicts[0].revise.outcome == \"revise-skipped\" and .revise.verdicts[0].revise.code == \"revise_daily_cap\"" >/dev/null <<<"$out"'
 
+# ─── R3 drop-report: read-only human sweep over drop recommendations (#1363)
+
+DROP_HOME="$TMP/drop-home"
+DROP_STATE="$DROP_HOME/.claude/state"
+DROP_DIR="$DROP_STATE/skill-promotion"
+DROP_LEDGER="$DROP_DIR/ledger.jsonl"
+mkdir -p "$DROP_DIR"
+chmod 700 "$DROP_HOME" "$DROP_HOME/.claude" "$DROP_STATE" "$DROP_DIR"
+touch "$DROP_LEDGER" && chmod 600 "$DROP_LEDGER"
+drop_env=(
+  "HOME=$DROP_HOME" "CCC_CLAUDE_DIR=$DROP_HOME/.claude" "CCC_STATE_DIR=$DROP_STATE"
+  "CCC_SKILL_PROMOTION_ENABLED=true" "CCC_NODE=testnode"
+  "CCC_SKILL_PROMOTION_REPO=test/repo" "CCC_SKILL_PROMOTION_PROVIDERS=claude"
+  "CCC_SKILL_PROMOTION_OWNERSHIP_TOOL=$OWNERSHIP" "PROMOTION_TEST_STATUS=$STATUS_JSON"
+)
+drop_row() { jq -cn --argjson row "$1" '$row' >> "$DROP_LEDGER"; }
+
+out="$(env "${drop_env[@]}" python3 "$PROMOTER" drop-report)"; rc=$?
+ok "drop-report on an empty ledger is ok and empty" \
+  '[ "$rc" = 0 ] && jq -e ".ok and .summary.pending_items == 0 and (.pending | length) == 0" >/dev/null <<<"$out"'
+
+drop_row '{"ts":"2026-08-28T10:00:00Z","kind":"a2a-revise-dispatch","task_id":"drop-task-a",
+  "pr":"101","pr_url":"https://github.com/test/repo/pull/101","node":"nodea",
+  "provider":"claude","name":"skilla","round":1}'
+drop_row '{"ts":"2026-08-28T12:00:00Z","kind":"a2a-revise-result","task_id":"drop-task-a",
+  "status":"drop-recommended","node":"nodea","name":"skilla","pr":"101",
+  "reason":"Pins one outage."}'
+drop_row '{"ts":"2026-08-29T09:00:00Z","kind":"a2a-revise-dispatch","task_id":"drop-task-b",
+  "pr":"102","pr_url":"https://github.com/test/repo/pull/102","node":"nodeb",
+  "provider":"codex","name":"skillb","round":2}'
+drop_row '{"ts":"2026-08-29T11:00:00Z","kind":"a2a-revise-result","task_id":"drop-task-b",
+  "status":"drop-recommended","node":"nodeb","name":"skillb","pr":"102",
+  "reason":"Single-incident only."}'
+drop_row '{"ts":"2026-08-29T12:00:00Z","kind":"a2a-verdict","task_id":"other","status":"ok"}'
+ledger_lines_before="$(grep -c . "$DROP_LEDGER")"
+
+out="$(env "${drop_env[@]}" python3 "$PROMOTER" drop-report)"; rc=$?
+ok "drop-report joins dispatch rows and reports both lineages" \
+  '[ "$rc" = 0 ] && jq -e ".summary.pending_items == 2 and .summary.pending_lineages == 2
+    and .summary.new_items == 2 and .summary.nodes.nodea == 1 and .summary.nodes.nodeb == 1
+    and .sweep_recorded" >/dev/null <<<"$out"'
+ok "drop-report items carry the human-sweep fields" \
+  'jq -e ".pending[0].node == \"nodea\" and .pending[0].name == \"skilla\"
+    and .pending[0].provider == \"claude\" and .pending[0].round == 1
+    and .pending[0].pr_url == \"https://github.com/test/repo/pull/101\"
+    and .pending[0].reason == \"Pins one outage.\"
+    and .pending[0].first_recorded_at == \"2026-08-28T12:00:00Z\"" >/dev/null <<<"$out"'
+ok "drop-report never writes to the ledger" \
+  '[ "$(grep -c . "$DROP_LEDGER")" = "$ledger_lines_before" ] && [ "$(jq -s "[.[] | select(.kind | startswith(\"drop-report\"))] | length" "$DROP_LEDGER")" = 0 ]'
+
+out="$(env "${drop_env[@]}" python3 "$PROMOTER" drop-report)"; rc=$?
+ok "second sweep reports the same items as not new" \
+  '[ "$rc" = 0 ] && jq -e ".summary.pending_items == 2 and .summary.new_items == 0" >/dev/null <<<"$out"'
+
+out="$(env "${drop_env[@]}" python3 "$PROMOTER" drop-report --ack drop-task-a)"; rc=$?
+ok "ack marks one recommendation processed" \
+  '[ "$rc" = 0 ] && jq -e ".ack[0].outcome == \"acked\" and .summary.pending_items == 1
+    and .pending[0].task_id == \"drop-task-b\"" >/dev/null <<<"$out"'
+out="$(env "${drop_env[@]}" python3 "$PROMOTER" drop-report --ack drop-task-a)"; rc=$?
+ok "re-ack is idempotent" \
+  '[ "$rc" = 0 ] && jq -e ".ack[0].outcome == \"already-acked\" and .summary.pending_items == 1" >/dev/null <<<"$out"'
+
+out="$(env "${drop_env[@]}" CCC_AUTONOMY=kill python3 "$PROMOTER" drop-report)"; rc=$?
+ok "drop-report stays viewable under autonomy kill" \
+  '[ "$rc" = 0 ] && jq -e ".ok and .summary.pending_items == 1" >/dev/null <<<"$out"'
+
+ln -sf /nonexistent "$DROP_DIR/drop-report.acked.jsonl"
+out="$(env "${drop_env[@]}" python3 "$PROMOTER" drop-report)"; rc=$?
+ok "drop-report fails closed on an unsafe ack state file" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"drop_state_unsafe\"" >/dev/null <<<"$out"'
+rm -f "$DROP_DIR/drop-report.acked.jsonl"
+
+out="$(env "${drop_env[@]}" python3 "$PROMOTER" drop-report --ack '../escape')"; rc=$?
+ok "drop-report rejects unsafe ack ids" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"drop_ack_invalid\"" >/dev/null <<<"$out"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
