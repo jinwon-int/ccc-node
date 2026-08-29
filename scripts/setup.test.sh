@@ -307,6 +307,183 @@ manifest_hashes_match() { # manifest_hashes_match <claude-dir>
 }
 ok "setup records manifest hashes matching the installed bytes after the rewrite" \
   'manifest_hashes_match "$legacy_claude"'
+
+# --- #1330: reinstalling a repo-managed skill must never silently destroy
+# node edits to the installed copy. Three verdicts at install time, keyed off
+# the manifest baseline: node-edited + repo unchanged -> keep the node copy;
+# node-edited + both changed -> install the repo copy but preserve the node
+# copy under backups/skill-edits/; anything else installs as before.
+#
+# Unit half: exercise the extracted functions directly so every branch of the
+# verdict matrix is reachable without mutating the real repo trees.
+unit_functions="$(sed -n \
+  -e '/^skill_tree_hash()/,/^}/p' \
+  -e '/^manifest_hash_for()/,/^}/p' \
+  -e '/^install_repo_skills_into()/,/^}/p' \
+  -e '/^refresh_skill_manifest_hashes()/,/^}/p' \
+  "$SETUP")"
+[ -n "$unit_functions" ]
+ok "setup.sh exposes the skill-install functions for unit extraction" '[ -n "$unit_functions" ]'
+
+unit_run() { # unit_run <case-name> <snippet> — sandbox + extracted functions, prints captured output
+  local cdir="$TMP/unit/$1" snippet="$2"
+  rm -rf "$cdir"; mkdir -p "$cdir/repo-skills" "$cdir/skills" "$cdir/state"
+  ( set -uo pipefail
+    DRY=0
+    run() { "$@"; }
+    note() { printf '  - %s\n' "$*"; }
+    source /dev/stdin <<<"$unit_functions"
+    cd "$cdir" || exit 1
+    eval "$snippet"
+  ) 2>&1
+}
+unit_manifest() { printf '%s/state/repo-skills.manifest\n' "$TMP/unit/$1"; }
+# identical recipe to skill_tree_hash(); kept outside snippets so quoted awk
+# bodies never fight the snippet quoting
+tree_hash_of() { (cd "$1" && find . -type f -exec sha256sum {} + | LC_ALL=C sort -k2 | sha256sum | awk '{print $1}'); }
+
+# Case: fresh install (no existing copy) records the repo tree hash.
+unit_run fresh '
+  mkdir -p repo-skills/skill-a
+  printf "repo bytes\n" > repo-skills/skill-a/SKILL.md
+  install_repo_skills_into skills state/repo-skills.manifest repo-skills
+'
+ok "unit: fresh install writes the skill and records its hash" \
+  '[ "$(cat "$TMP/unit/fresh/skills/skill-a/SKILL.md")" = "repo bytes" ] && grep -q "^skill-a " "$(unit_manifest fresh)"'
+
+# Case: node edited, repo unchanged -> keep the node copy, baseline preserved.
+out="$(unit_run keep '
+  mkdir -p repo-skills/skill-a skills/skill-a state
+  printf "repo bytes\n" > repo-skills/skill-a/SKILL.md
+  printf "node edits\n" > skills/skill-a/SKILL.md
+  printf "skill-a %s\n" "$(tree_hash_of repo-skills/skill-a)" > state/repo-skills.manifest
+  install_repo_skills_into skills state/repo-skills.manifest repo-skills
+')"
+ok "unit: keep leaves the node copy byte-intact" \
+  '[ "$(cat "$TMP/unit/keep/skills/skill-a/SKILL.md")" = "node edits" ]'
+ok "unit: keep preserves the manifest baseline instead of re-recording node bytes" \
+  'grep -q "skill-a $(tree_hash_of "$TMP/unit/keep/repo-skills/skill-a")" "$(unit_manifest keep)"'
+ok "unit: keep announces itself and backs nothing up" \
+  'grep -q "kept node-modified skill skill-a" <<<"$out" && [ ! -e "$TMP/unit/keep/backups" ]'
+
+# Case: node edited AND repo changed -> repo copy installs, node copy is
+# preserved under backups/skill-edits/, retention keeps the newest 3.
+out="$(unit_run conflict '
+  mkdir -p repo-skills/skill-a skills/skill-a state
+  printf "repo v2\n" > repo-skills/skill-a/SKILL.md
+  printf "skill-a deadbeef-v1-baseline\n" > state/repo-skills.manifest
+  printf "node edits\n" > skills/skill-a/SKILL.md
+  # seed five stale backups so the conflict backup triggers retention (newest 3)
+  for i in 1 2 3 4 5; do mkdir -p "backups/skill-edits/skill-a/2026010$i-00000000"; done
+  install_repo_skills_into skills state/repo-skills.manifest repo-skills
+')"
+ok "unit: conflict installs the repo copy" \
+  '[ "$(cat "$TMP/unit/conflict/skills/skill-a/SKILL.md")" = "repo v2" ]'
+ok "unit: conflict preserves the node copy under backups/skill-edits" \
+  'find "$TMP/unit/conflict/backups/skill-edits/skill-a" -path "*/node/SKILL.md" -exec grep -q "node edits" {} +'
+ok "unit: conflict is announced" 'grep -q "backed up node-modified skill skill-a" <<<"$out"'
+ok "unit: backup retention keeps the newest 3" \
+  '[ "$(find "$TMP/unit/conflict/backups/skill-edits/skill-a" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 3 ]'
+ok "unit: conflict re-records the repo baseline" \
+  'grep -q "skill-a $(tree_hash_of "$TMP/unit/conflict/repo-skills/skill-a")" "$(unit_manifest conflict)"'
+
+# Case: node applied the same fix the repo now ships (current == repo) ->
+# plain refresh, no backup theatre.
+out="$(unit_run converge '
+  mkdir -p repo-skills/skill-a skills/skill-a state
+  printf "repo v2\n" > repo-skills/skill-a/SKILL.md
+  printf "skill-a oldbaseline\n" > state/repo-skills.manifest
+  printf "repo v2\n" > skills/skill-a/SKILL.md
+  install_repo_skills_into skills state/repo-skills.manifest repo-skills
+')"
+ok "unit: node copy identical to new repo bytes installs quietly without a backup" \
+  '[ ! -e "$TMP/unit/converge/backups" ] && ! grep -q "node-modified" <<<"$out"'
+
+# Case: fleet-installed copy keeps the documented repo > fleet precedence
+# (#1344) — absorbed even though it differs from the manifest baseline.
+out="$(unit_run fleet '
+  mkdir -p repo-skills/skill-a skills/skill-a state
+  printf "repo bytes\n" > repo-skills/skill-a/SKILL.md
+  printf "skill-a %s\n" "$(tree_hash_of repo-skills/skill-a)" > state/repo-skills.manifest
+  printf "fleet bytes\n" > skills/skill-a/SKILL.md
+  printf "{}" > skills/skill-a/.ccc-fleet-skill.json
+  install_repo_skills_into skills state/repo-skills.manifest repo-skills
+')"
+ok "unit: fleet copy is absorbed (repo > fleet, #1344) despite differing from baseline" \
+  '[ "$(cat "$TMP/unit/fleet/skills/skill-a/SKILL.md")" = "repo bytes" ] && grep -q "absorbing fleet-installed skill skill-a" <<<"$out"'
+
+# Case: the same name from a second source root must not read the copy this
+# run just installed as a node edit — last-wins stays the contract.
+out="$(unit_run two-roots '
+  mkdir -p repo-skills/skill-a state
+  printf "repo bytes\n" > repo-skills/skill-a/SKILL.md
+  printf "skill-a oldbaseline\n" > state/repo-skills.manifest
+  install_repo_skills_into skills state/repo-skills.manifest repo-skills
+  mkdir -p repo-skills-2/skill-a
+  printf "shared bytes\n" > repo-skills-2/skill-a/SKILL.md
+  install_repo_skills_into skills state/repo-skills.manifest repo-skills repo-skills-2
+')"
+ok "unit: second source root wins without misreading the fresh copy as node-edited" \
+  '[ "$(cat "$TMP/unit/two-roots/skills/skill-a/SKILL.md")" = "shared bytes" ] && ! grep -q "node-modified" <<<"$out"'
+
+# Case: refresh_skill_manifest_hashes must not re-baseline a kept copy (#1330)
+# — recording the node bytes would make the next run treat them as pristine.
+out="$(unit_run refresh-kept '
+  mkdir -p skills/skill-a state
+  printf "node edits\n" > skills/skill-a/SKILL.md
+  printf "skill-a repobaseline\n" > state/repo-skills.manifest
+  refresh_skill_manifest_hashes skills state/repo-skills.manifest skill-a
+')"
+ok "unit: refresh preserves the baseline of a kept node-modified copy" \
+  'grep -q "^skill-a repobaseline$" "$(unit_manifest refresh-kept)"'
+out="$(unit_run refresh-plain '
+  mkdir -p skills/skill-a state
+  printf "installed bytes\n" > skills/skill-a/SKILL.md
+  printf "skill-a old\n" > state/repo-skills.manifest
+  refresh_skill_manifest_hashes skills state/repo-skills.manifest
+')"
+ok "unit: refresh re-records ordinary installed copies" \
+  'grep -q "skill-a $(tree_hash_of "$TMP/unit/refresh-plain/skills/skill-a")" "$(unit_manifest refresh-plain)"'
+
+# Case: DRY run reports the verdicts without touching anything.
+out="$(unit_run dry '
+  mkdir -p repo-skills/skill-a repo-skills/skill-b skills/skill-a skills/skill-b state
+  printf "repo bytes\n" > repo-skills/skill-a/SKILL.md
+  printf "repo bytes\n" > repo-skills/skill-b/SKILL.md
+  printf "skill-a %s\nskill-b %s\n" "$(tree_hash_of repo-skills/skill-a)" "$(tree_hash_of repo-skills/skill-b)" > state/repo-skills.manifest
+  printf "node edits\n" > skills/skill-a/SKILL.md
+  DRY=1 install_repo_skills_into skills state/repo-skills.manifest repo-skills
+')"
+ok "unit: DRY run announces would-keep for the node-edited copy" \
+  'grep -q "would KEEP node-modified skill skill-a" <<<"$out"'
+ok "unit: DRY run leaves the node copy and manifest untouched" \
+  '[ "$(cat "$TMP/unit/dry/skills/skill-a/SKILL.md")" = "node edits" ] && grep -q "^skill-b" "$(unit_manifest dry)"'
+
+# Integration half (the issue's ask): a real setup rerun preserves a node edit
+# to an installed repo-managed skill. bridge-yield-continue is a repo skill
+# with no canonical-path rewrite targets, so its manifest baseline equals the
+# repo bytes on any node and the keep verdict is exact.
+disco_home="$TMP/disco-home"
+disco_claude="$disco_home/.claude"
+HOME="$disco_home" CCC_CLAUDE_DIR="$disco_claude" CCC_HERMES_DIR="$disco_home/.hermes" \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
+disco_skill="$disco_claude/skills/bridge-yield-continue/SKILL.md"
+printf '\nnode-local addendum (#1330 fixture)\n' >> "$disco_skill"
+baseline="$(awk '$1 == "bridge-yield-continue" { print $2 }' "$disco_claude/state/repo-skills.manifest")"
+out="$(HOME="$disco_home" CCC_CLAUDE_DIR="$disco_claude" CCC_HERMES_DIR="$disco_home/.hermes" \
+  bash "$SETUP" --dry-run 2>&1)"
+ok "setup DRY run flags the node-edited repo skill as would-keep" \
+  'grep -q "would KEEP node-modified skill bridge-yield-continue" <<<"$out"'
+out="$(HOME="$disco_home" CCC_CLAUDE_DIR="$disco_claude" CCC_HERMES_DIR="$disco_home/.hermes" \
+  bash "$SETUP" --no-backup 2>&1)"
+ok "setup rerun preserves the node edit to an installed repo skill" \
+  'grep -q "node-local addendum (#1330 fixture)" "$disco_skill"'
+ok "setup rerun announces the kept skill" \
+  'grep -q "kept node-modified skill bridge-yield-continue" <<<"$out"'
+ok "setup rerun keeps the manifest baseline for the kept skill" \
+  '[ -n "$baseline" ] && [ "$(awk '\''$1 == "bridge-yield-continue" { print $2 }'\'' "$disco_claude/state/repo-skills.manifest")" = "$baseline" ]'
+ok "setup rerun still refreshes an unmodified repo skill" \
+  'cmp -s "$disco_claude/skills/fleet-disk-constraint-triage/SKILL.md" "$ROOT/skills/shared/fleet-disk-constraint-triage/SKILL.md"'
 # Slash commands invoke repo scripts verbatim; installed copies must point at
 # THIS checkout, not the canonical /opt/ccc-node (broken on e.g. /root/ccc-node
 # nodes). Repo templates stay canonical — only installed copies are rewritten.

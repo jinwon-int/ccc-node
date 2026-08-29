@@ -627,7 +627,13 @@ run cp "$SRC/claude/commands/"*.md "$CLAUDE_DIR/commands/"
 # updater, not a copy-format flaw. A manifest ($state/repo-skills.manifest)
 # records what we installed: repo-removed skills are pruned when the copy is
 # unmodified, kept with a warning when the node edited it; skills whose names
-# are not in the repo set (node-local/autosave) are never touched.
+# are not in the repo set (node-local/autosave) are never touched. The same
+# protection now covers skills the repo still ships (#1330): a node-edited
+# installed copy is never overwritten silently — when the repo copy is
+# unchanged since the manifest recorded it, the node copy wins; when both
+# changed, the repo copy installs and the node copy is preserved under
+# backups/skill-edits/ first. Fleet-installed copies stay subject to the
+# documented repo > fleet precedence (#1344).
 skill_tree_hash() { # <dir> — deterministic content hash over file contents
   # LC_ALL=C: collation must not depend on the caller's locale, or the same
   # pristine tree hashes differently between an operator shell (UTF-8) and
@@ -635,12 +641,43 @@ skill_tree_hash() { # <dir> — deterministic content hash over file contents
   # (the hook-tree dedup above pins its sort the same way).
   (cd "$1" && find . -type f -exec sha256sum {} + | LC_ALL=C sort -k2 | sha256sum | awk '{print $1}')
 }
+manifest_hash_for() { # manifest_hash_for <manifest> <name> — recorded tree hash, empty when absent
+  local manifest="$1" name="$2"
+  [ -f "$manifest" ] || return 0
+  awk -v n="$name" '$1 == n { print $2; exit }' "$manifest"
+}
 install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <source-root>...
   local dest_root="$1" manifest="$2"; shift 2
-  local root source name target stage retired current_hash recorded_hash
+  local root source name target stage retired current_hash recorded_hash repo_hash
+  local backup_root backup_dir fleet_copy idx
   local -a current=()
+  local -a record_hash=()
   INSTALLED_REPO_SKILLS=()
+  SKILLS_KEPT_NODE_MODIFIED=()
   if [ "$DRY" = 1 ]; then
+    # (#1330) surface node-edit verdicts before the summary so a dry run shows
+    # which skills would be kept vs backed up instead of just "refresh"
+    for root in "$@"; do
+      [ -d "$root" ] || continue
+      for source in "$root"/*/; do
+        [ -d "$source" ] || continue
+        name="$(basename "$source")"
+        target="$dest_root/$name"
+        [ -d "$target" ] || continue
+        if [ -f "$target/.ccc-fleet-skill.json" ]; then continue; fi
+        current_hash="$(skill_tree_hash "$target")"
+        recorded_hash="$(manifest_hash_for "$manifest" "$name")"
+        repo_hash="$(skill_tree_hash "$source")"
+        if [ -n "$recorded_hash" ] && [ "$current_hash" != "$recorded_hash" ] \
+           && [ "$current_hash" != "$repo_hash" ]; then
+          if [ "$repo_hash" = "$recorded_hash" ]; then
+            note "repo skills: would KEEP node-modified skill $name (repo unchanged; local edits preserved)"
+          else
+            note "repo skills: would back up node-modified skill $name under $(dirname "$dest_root")/backups/skill-edits/, then install the repo copy (both changed)"
+          fi
+        fi
+      done
+    done
     note "repo skills: would refresh copies in $dest_root (atomic copy + manifest prune)"
     return 0
   fi
@@ -651,11 +688,57 @@ install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <
       name="$(basename "$source")"
       target="$dest_root/$name"
       stage="$dest_root/.stage-$name"
+      repo_hash="$(skill_tree_hash "$source")"
       run rm -rf "$stage"
       run cp -r "$source" "$stage"
       if [ -d "$target" ]; then
+        fleet_copy=0
         if [ -f "$target/.ccc-fleet-skill.json" ]; then
+          # #1344 precedence: repo > fleet, checked before the node-edit guard
+          # below so a fleet-synced copy never blocks a repo refresh.
+          fleet_copy=1
           note "absorbing fleet-installed skill $name into the repo-managed copy (precedence: repo > fleet, #1344)"
+        fi
+        recorded_hash="$(manifest_hash_for "$manifest" "$name")"
+        current_hash=""
+        if [ "$fleet_copy" = 0 ] && [ -n "$recorded_hash" ]; then
+          current_hash="$(skill_tree_hash "$target")"
+          # Skip the guard when this run already installed the same name from an
+          # earlier source root — comparing against the manifest would misread
+          # our own fresh copy as a node edit (last-wins stays the contract).
+          case " ${current[*]} " in *" $name "*) current_hash="" ;; esac
+        fi
+        if [ -n "$current_hash" ] && [ "$current_hash" != "$recorded_hash" ] \
+           && [ "$current_hash" != "$repo_hash" ]; then
+          if [ "$repo_hash" = "$recorded_hash" ]; then
+            # (#1330) Node edited its copy and the repo copy is byte-identical
+            # to what this manifest recorded — reinstalling would destroy the
+            # local edits and change nothing else. Keep the node copy and keep
+            # the recorded baseline so later runs re-derive the same verdict.
+            note "kept node-modified skill $name (repo unchanged; local edits preserved — diff vs $source to reconcile)"
+            current+=("$name")
+            record_hash+=("$recorded_hash")
+            SKILLS_KEPT_NODE_MODIFIED+=("$name")
+            continue
+          fi
+          # (#1330) Both sides changed since the last install. The repo stays
+          # canonical (same precedence as the prune loop below), but the node's
+          # edits are preserved instead of being deleted with the .prev swap.
+          backup_root="$(dirname "$dest_root")/backups/skill-edits/$name"
+          backup_dir="$backup_root/$(date +%Y%m%dT%H%M%S)-${current_hash:0:8}"
+          run mkdir -p "$backup_dir"
+          run cp -r "$target" "$backup_dir/node"
+          note "backed up node-modified skill $name to $backup_dir before installing the repo copy (both changed; diff node/ to re-apply edits)"
+          # keep the newest 3 backups per skill; the rest are stale evidence
+          local -a old_backups=()
+          while IFS= read -r old; do
+            if [ -n "$old" ]; then old_backups+=("$old"); fi
+          done < <(find "$backup_root" -mindepth 1 -maxdepth 1 -type d | sort)
+          if [ "${#old_backups[@]}" -gt 3 ]; then
+            for old in "${old_backups[@]:0:$((${#old_backups[@]} - 3))}"; do
+              run rm -rf "$old"
+            done
+          fi
         fi
         run rm -rf "$target.prev"
         run mv "$target" "$target.prev"
@@ -663,6 +746,7 @@ install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <
       run mv "$stage" "$target"
       run rm -rf "$target.prev"
       current+=("$name")
+      record_hash+=("$(skill_tree_hash "$target")")
     done
   done
   # Prune repo-removed skills recorded in the manifest; keep node-edited ones.
@@ -682,8 +766,12 @@ install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <
   fi
   if [ "${#current[@]}" -gt 0 ]; then
     : > "$manifest.tmp"
-    for name in "${current[@]}"; do
-      printf '%s %s\n' "$name" "$(skill_tree_hash "$dest_root/$name")" >> "$manifest.tmp"
+    for idx in "${!current[@]}"; do
+      # (#1330) kept node-modified skills re-record their manifest baseline
+      # (repo bytes at install time), never the node-edited tree hash —
+      # otherwise the next run would read the local edits as the baseline
+      # and overwrite them.
+      printf '%s %s\n' "${current[$idx]}" "${record_hash[$idx]}" >> "$manifest.tmp"
     done
     run mv "$manifest.tmp" "$manifest"
   fi
@@ -702,17 +790,30 @@ install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <
 # forever — it can never be pruned when the repo drops it. Re-record hashes
 # once the rewrite has run. Entries whose directory is gone keep their recorded
 # hash, so a later prune can still tell an edited copy from a pristine one.
-refresh_skill_manifest_hashes() { # refresh_skill_manifest_hashes <dest-root> <manifest>
-  local dest_root="$1" manifest="$2" name recorded
+refresh_skill_manifest_hashes() { # refresh_skill_manifest_hashes <dest-root> <manifest> [kept-skill-name...]
+  local dest_root="$1" manifest="$2" name recorded kept
   if [ "$DRY" = 1 ]; then
     note "repo skills: would re-record $manifest hashes after the canonical-path rewrite"
     return 0
   fi
   [ -f "$manifest" ] || return 0
+  shift 2
+  local -a kept_names=()
+  if [ $# -gt 0 ]; then kept_names=("$@"); fi
   : > "$manifest.tmp"
   while read -r name recorded; do
     [ -n "$name" ] || continue
-    if [ -d "$dest_root/$name" ]; then
+    kept=0
+    for kept in ${kept_names[@]+"${kept_names[@]}"}; do
+      if [ "$kept" = "$name" ]; then kept=1; break; fi
+    done
+    if [ "$kept" = 1 ]; then
+      # (#1330) this copy was deliberately kept node-modified — it was not
+      # installed this run, so the rewrite did not baseline it. Re-recording
+      # its tree hash would poison the manifest baseline and the next run
+      # would read the local edits as pristine and overwrite them.
+      printf '%s %s\n' "$name" "$recorded" >> "$manifest.tmp"
+    elif [ -d "$dest_root/$name" ]; then
       printf '%s %s\n' "$name" "$(skill_tree_hash "$dest_root/$name")" >> "$manifest.tmp"
     else
       printf '%s %s\n' "$name" "$recorded" >> "$manifest.tmp"
@@ -727,6 +828,11 @@ install_repo_skills_into "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state/repo-skills.man
 # canonical-path rewrite reads it. Piri skills install outside $CLAUDE_DIR and
 # are not rewrite targets.
 CLAUDE_REPO_SKILLS=(${INSTALLED_REPO_SKILLS[@]+"${INSTALLED_REPO_SKILLS[@]}"})
+# Same snapshot discipline for node-modified skills this run deliberately kept
+# (#1330): the Piri install below resets the global, and the canonical-path
+# rewrite / manifest re-record afterwards must know which entries NOT to
+# re-baseline.
+CLAUDE_SKILLS_KEPT_NODE_MODIFIED=(${SKILLS_KEPT_NODE_MODIFIED[@]+"${SKILLS_KEPT_NODE_MODIFIED[@]}"})
 
 # Piri skills (web search/fetch helpers) — only on nodes that already have a
 # Piri agent dir, so non-Piri nodes stay untouched.
@@ -807,7 +913,7 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ] || [ "$SRC" != "/opt/ccc-node" ]; then
     # Skill copies were hashed before this rewrite touched them — re-record so
     # the manifest matches the bytes on disk. Only the Claude tree needs it:
     # $PIRI_AGENT_DIR/skills is not in rewrite_targets, so those hashes stand.
-    refresh_skill_manifest_hashes "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state/repo-skills.manifest"
+    refresh_skill_manifest_hashes "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state/repo-skills.manifest" ${CLAUDE_SKILLS_KEPT_NODE_MODIFIED[@]+"${CLAUDE_SKILLS_KEPT_NODE_MODIFIED[@]}"}
   fi
 fi
 

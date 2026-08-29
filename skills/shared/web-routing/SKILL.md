@@ -1,6 +1,6 @@
 ---
 name: web-routing
-description: Route general web search through Firecrawl Search, known public URL reads through Firecrawl scrape, public developer documentation/README/issue/merged-PR lookup through Firecrawl Developer Index, and explicit SearXNG only as a fallback. Use for web research and URL reading.
+description: Route general web search through Firecrawl Search, known public URL reads through Firecrawl scrape, public developer documentation/README/issue/merged-PR lookup through Firecrawl Developer Index, and explicit SearXNG only as a fallback. Use when doing web research, reading known public URLs, or looking up developer documentation/issues/PRs.
 ---
 
 # Fleet web routing
