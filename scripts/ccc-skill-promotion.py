@@ -171,6 +171,22 @@ def _read_enabled_file(path: Path, *, trust_root: Path | None = None) -> bool:
         return False
 
 
+def _tri_state_enabled(
+    raw: str | None,
+    state_file: Path,
+    *,
+    trust_root: Path | None = None,
+    error_code: str,
+) -> bool:
+    if raw is None:
+        return _read_enabled_file(state_file, trust_root=trust_root)
+    if raw.lower() in {"1", "true", "yes"}:
+        return True
+    if raw.lower() in {"0", "false", "no"}:
+        return False
+    raise PromotionError(error_code)
+
+
 def _private_lines(path: Path, *, max_bytes: int = 4096, trust_root: Path | None = None) -> tuple[str, ...]:
     try:
         metadata = path.lstat()
@@ -258,24 +274,18 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         publisher_enabled = False
     else:
         raise PromotionError("publisher_invalid")
-    dispatch_raw = env.get("CCC_SKILL_PROMOTION_DISPATCH")
-    if dispatch_raw is None:
-        dispatch_enabled = _read_enabled_file(state_dir / "skill-promotion.dispatch", trust_root=home)
-    elif dispatch_raw.lower() in {"1", "true", "yes"}:
-        dispatch_enabled = True
-    elif dispatch_raw.lower() in {"0", "false", "no"}:
-        dispatch_enabled = False
-    else:
-        raise PromotionError("dispatch_invalid")
-    autorepair_raw = env.get("CCC_SKILL_PROMOTION_AUTOREPAIR")
-    if autorepair_raw is None:
-        autorepair_enabled = _read_enabled_file(state_dir / "skill-promotion.autorepair", trust_root=home)
-    elif autorepair_raw.lower() in {"1", "true", "yes"}:
-        autorepair_enabled = True
-    elif autorepair_raw.lower() in {"0", "false", "no"}:
-        autorepair_enabled = False
-    else:
-        raise PromotionError("autorepair_invalid")
+    dispatch_enabled = _tri_state_enabled(
+        env.get("CCC_SKILL_PROMOTION_DISPATCH"),
+        state_dir / "skill-promotion.dispatch",
+        trust_root=home,
+        error_code="dispatch_invalid",
+    )
+    autorepair_enabled = _tri_state_enabled(
+        env.get("CCC_SKILL_PROMOTION_AUTOREPAIR"),
+        state_dir / "skill-promotion.autorepair",
+        trust_root=home,
+        error_code="autorepair_invalid",
+    )
     collect_raw = env.get("CCC_SKILL_PROMOTION_COLLECT_NODES")
     collect_nodes = (
         tuple(part.strip() for part in collect_raw.split(",") if part.strip())
@@ -740,21 +750,22 @@ def _discover(config: Config) -> tuple[list[Candidate], list[dict[str, str]], li
                 candidates.append(_snapshot(config, provider, row))
                 continue
             except PromotionError as error:
-                if not (config.autorepair_enabled and error.code in _AUTOREPAIR_CODES and name != "invalid"):
-                    blocked.append({"provider": provider, "name": name, "code": error.code})
+                code = error.code
+                if not (config.autorepair_enabled and code in _AUTOREPAIR_CODES and name != "invalid"):
+                    blocked.append({"provider": provider, "name": name, "code": code})
                     continue
             # R1 autorepair (#1357): one bounded repair pass for mechanical
             # gate codes, then the full gate set re-runs on the repaired copy.
-            if not _autorepair_candidate(config, provider, name, error.code):
-                blocked.append({"provider": provider, "name": name, "code": error.code})
+            if not _autorepair_candidate(config, provider, name, code):
+                blocked.append({"provider": provider, "name": name, "code": code})
                 continue
             try:
                 candidates.append(_snapshot(config, provider, row))
             except PromotionError as retry_error:
                 blocked.append({"provider": provider, "name": name, "code": retry_error.code,
-                                "autorepair": f"repaired-{error.code}-still-blocked"})
+                                "autorepair": f"repaired-{code}-still-blocked"})
                 continue
-            repaired.append({"provider": provider, "name": name, "code": error.code})
+            repaired.append({"provider": provider, "name": name, "code": code})
     candidates.sort(key=lambda item: (item.name, item.provider, item.tree_sha256))
     return candidates, blocked, repaired
 
