@@ -131,7 +131,7 @@ ok "installer backs up a previous installation on reinstall" \
   '[ "$rc" = 0 ] && ls "$DEST"/a2a-intent-dispatcher.sh.bak-* >/dev/null 2>&1'
 bash "$INSTALLER" --dest "$DEST/relative/path" >/dev/null 2>&1; rc=$?
 ok "installer creates the destination directory" '[ "$rc" = 0 ] && [ -x "$DEST/relative/path/skills-intake-review-handler.sh" ]'
-"$INSTALLER" --termux --dest "$TMP/termux-dest" >/dev/null 2>&1; rc=$?
+bash "$INSTALLER" --termux --dest "$TMP/termux-dest" >/dev/null 2>&1; rc=$?
 ok "installer accepts the Termux profile flag"   '[ "$rc" = 0 ] && [ -x "$TMP/termux-dest/a2a-intent-dispatcher.sh" ] && [ -x "$TMP/termux-dest/skills-intake-review-handler.sh" ]'
 
 echo "PASS=$pass FAIL=$fail"
