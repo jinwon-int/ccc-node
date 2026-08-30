@@ -40,7 +40,7 @@ log "routing intent=${intent:-<none>}"
 case "$intent" in
   skills-intake-review|skills_intake_review)
     [ -x "$INTAKE_REVIEW_HANDLER" ] || { echo "a2a-intent-dispatcher: review handler not executable: $INTAKE_REVIEW_HANDLER" >&2; exit 1; }
-    exec "$INTAKE_REVIEW_HANDLER" < "$tmp"
+    exec bash "$INTAKE_REVIEW_HANDLER" < "$tmp"
     ;;
   *)
     # Intentional word split of an operator-owned command line (shellcheck-disable=SC2086)
