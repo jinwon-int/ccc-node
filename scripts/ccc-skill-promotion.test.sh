@@ -940,5 +940,38 @@ out="$(env "${drop_env[@]}" python3 "$PROMOTER" drop-report --ack '../escape')";
 ok "drop-report rejects unsafe ack ids" \
   '[ "$rc" = 2 ] && jq -e ".code == \"drop_ack_invalid\"" >/dev/null <<<"$out"'
 
+# ─── negative-verdict binding (a2a-nexus#2016) ───────────────────────────────
+# Failed review tasks carry the negative verdict as negativeVerdictEvidence;
+# the publisher must bind it (visibility + bounded revision), while a bare
+# crash with no evidence stays malformed.
+
+NVE_FIXTURE="$TMP/nve-fixture.json"
+cat > "$NVE_FIXTURE" <<'FIXTURE'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("promo_nve", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["promo_nve"] = m
+spec.loader.exec_module(m)
+head = "a" * 64
+succeeded = {"status": "succeeded",
+             "result": {"output": {"verdict": "approve", "head_sha": head, "findings": []}}}
+failed_nve = {"status": "failed",
+              "error": {"code": "review_verdict_failed"},
+              "negativeVerdictEvidence": {"reviewerNodeId": "rn", "verdict": "fail",
+                "result": {"output": {"verdict": "revise", "head_sha": head,
+                  "findings": [{"severity": "major", "area": "claims", "note": "x"}]}}}}
+bare_crash = {"status": "failed", "error": {"code": "handler_exit_nonzero"}}
+ok1 = m._verdict_from_task(succeeded, head)
+ok2 = m._verdict_from_task(failed_nve, head)
+ok3 = m._verdict_from_task(bare_crash, head)
+assert ok1 == ("approve", []), ok1
+verdict, findings = ok2
+assert verdict == "revise" and len(findings) == 1, ok2
+assert ok3 is None, ok3
+print("NVE-BINDING-OK")
+FIXTURE
+python3 "$NVE_FIXTURE" "$PROMOTER" >/dev/null 2>&1; rc=$?
+ok "publisher binds negative verdict evidence from failed review tasks" '[ "$rc" = 0 ]'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
