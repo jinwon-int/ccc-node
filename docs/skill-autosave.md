@@ -366,6 +366,39 @@ degrades the `new` computation (reported as `sweep_recorded: false`). The
 publisher node runs the report on a weekly cron (see the deployment record for
 the installed schedule).
 
+### Canonical intake review dispatcher/handler
+
+The review lane's node-side runtime is canonical in this repo:
+`scripts/a2a-intent-dispatcher.sh` (intent routing) and
+`scripts/skills-intake-review-handler.sh` (rubric execution + verdict result
+composition), deployed to each worker by
+`scripts/install-a2a-review-handler.sh [--dest DIR]` with an automatic backup
+of any previous copy. Historically these were hand-copied per node and forked;
+two 2026-08 fleet bugs trace to that drift: a composer that omitted the
+snake_case `head_sha` binding (the publisher discarded every verdict as
+malformed) and a hardcoded `claude` invocation (review capacity died with one
+provider's quota).
+
+Node configuration lives in the worker env file the handler child inherits:
+
+- `REVIEW_AGENT_BIN` / `REVIEW_AGENT_ARGS` — the reviewer executable and
+  arguments (default `claude` / `-p --disallowed-tools *`); a node whose main
+  bridge runs another agent pins its own, e.g. a grok node sets
+  `REVIEW_AGENT_BIN=/opt/piri/pi-test.sh` and
+  `REVIEW_AGENT_ARGS="-p --no-tools --model xai/grok-4.6"`;
+- `REVIEW_TIMEOUT_SEC` — reviewer wall clock (default 480);
+- `INTAKE_REVIEW_HANDLER` / `DEFAULT_TASK_HANDLER` — dispatcher routing
+  overrides (defaults resolve next to the installed dispatcher);
+- reviewer identity resolves from `WORKER_ID`, then `A2A_WORKER_ID`.
+
+The result contract binds `head_sha` (snake_case) to the dispatched head —
+the publisher's `_verdict_from_task` discards unbound outputs as malformed by
+design, so the snake_case keys are load-bearing; camelCase mirrors exist only
+for older receipts tooling. Negative verdicts (`revise`/`reject`) currently
+terminate the broker task as failed without a preserved result
+(a2a-nexus#2016), so only approve verdicts reach the publisher until that gap
+closes.
+
 ### Installing approved private skills
 
 Setup installs the consumer beside the autosave hooks, but does not run it.

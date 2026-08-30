@@ -180,6 +180,8 @@ SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh claude/hooks/lifecycle-fe
           claude/hooks/lib/lifecycle-common.sh \
           claude/hooks/notify.sh claude/hooks/statusline.sh claude/headless.sh codex/headless.sh crush/headless.sh \
           scripts/ccc-service-control.sh \
+          scripts/a2a-intent-dispatcher.sh scripts/skills-intake-review-handler.sh \
+          scripts/install-a2a-review-handler.sh \
           scripts/ccc-service-control.test.sh \
           scripts/ccc-broker-reconcile.sh scripts/ccc-broker-reconcile.test.sh \
           claude/hooks/observability.test.sh scripts/validate-harness.sh \
@@ -402,6 +404,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/cost-ledger.test.sh \
          scripts/cost-ledger-weekly.test.sh \
          scripts/ccc-skill-promotion.test.sh \
+         scripts/a2a-review-handler.test.sh \
          scripts/ccc-skill-registry.test.sh \
          scripts/ccc-fleet-skills-sync.test.sh \
          scripts/gh-pr-flow-seoseo-merge.test.sh \
