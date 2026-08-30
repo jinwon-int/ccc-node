@@ -44,6 +44,10 @@ case "\${REVIEW_STUB_MODE:-approve}" in
   prose)
     printf 'This candidate looks generally fine to me.'
     ;;
+  stdouterr)
+    printf 'quota exceeded: weekly limit'
+    exit 1
+    ;;
   crash) exit 1 ;;
   empty) exit 0 ;;
 esac
@@ -98,6 +102,9 @@ ok "blocker finding forces reject" \
 make_task "$HEAD_OK"
 REVIEW_STUB_MODE=crash run_handler "$TMP/task.json" >/dev/null 2>&1; rc=$?
 ok "agent crash is a retryable handler failure" '[ "$rc" != 0 ]'
+REVIEW_STUB_MODE=stdouterr run_handler "$TMP/task.json" >/dev/null 2>"$TMP/err-stdouterr.txt"; rc=$?
+ok "agent stdout failure message reaches handler logs" \
+  '[ "$rc" != 0 ] && grep -q "quota exceeded" "$TMP/err-stdouterr.txt"'
 
 make_task "$HEAD_OK"
 REVIEW_STUB_MODE=empty run_handler "$TMP/task.json" >/dev/null 2>&1; rc=$?

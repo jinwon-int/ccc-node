@@ -111,7 +111,12 @@ HDR
 log "prompt built: $(wc -c < "$tmp/prompt.txt") bytes"
 read -ra review_argv <<<"$REVIEW_AGENT_BIN $REVIEW_AGENT_ARGS"
 if ! model_out="$(timeout "$REVIEW_TIMEOUT_SEC" "${review_argv[@]}" < "$tmp/prompt.txt" 2>"$tmp/agent.err")"; then
-  log "review agent run failed: $(tail -c 300 "$tmp/agent.err" 2>/dev/null | tr "\n" " ")"
+  # Surface BOTH streams: e.g. `claude -p` reports quota exhaustion on stdout
+  # with empty stderr, which left the broker failure note empty (nosuk pr75/76,
+  # 2026-08-30). stdout is already in model_out even on failure.
+  agent_out="$(printf '%s' "$model_out" | tail -c 300 | tr "\n" " ")"
+  agent_err="$(tail -c 300 "$tmp/agent.err" 2>/dev/null | tr "\n" " ")"
+  log "review agent run failed: out[${agent_out}] err[${agent_err}]"
   fail "review agent run failed"
 fi
 [ -n "$model_out" ] || fail "empty model output"
