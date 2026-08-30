@@ -123,13 +123,13 @@ ok "dispatcher default handler path works from the repo checkout" '[ "$rc" = 0 ]
 
 # ─── installer ────────────────────────────────────────────────────────────────
 DEST="$TMP/install-dest"
-"$INSTALLER" --dest "$DEST" >/dev/null 2>&1; rc=$?
+bash "$INSTALLER" --dest "$DEST" >/dev/null 2>&1; rc=$?
 ok "installer copies dispatcher and handler executable into dest" \
   '[ "$rc" = 0 ] && [ -x "$DEST/a2a-intent-dispatcher.sh" ] && [ -x "$DEST/skills-intake-review-handler.sh" ]'
-"$INSTALLER" --dest "$DEST" >/dev/null 2>&1; rc=$?
+bash "$INSTALLER" --dest "$DEST" >/dev/null 2>&1; rc=$?
 ok "installer backs up a previous installation on reinstall" \
   '[ "$rc" = 0 ] && ls "$DEST"/a2a-intent-dispatcher.sh.bak-* >/dev/null 2>&1'
-"$INSTALLER" --dest "$DEST/relative/path" >/dev/null 2>&1; rc=$?
+bash "$INSTALLER" --dest "$DEST/relative/path" >/dev/null 2>&1; rc=$?
 ok "installer creates the destination directory" '[ "$rc" = 0 ] && [ -x "$DEST/relative/path/skills-intake-review-handler.sh" ]'
 
 echo "PASS=$pass FAIL=$fail"
