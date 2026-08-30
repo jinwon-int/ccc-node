@@ -2034,7 +2034,19 @@ def _broker_task(config: Config, task_id: str, secret: str) -> dict[str, object]
 def _task_result_output(task: dict[str, object]) -> dict[str, object] | None:
     result = task.get("result")
     output = result.get("output") if isinstance(result, dict) else None
-    return output if isinstance(output, dict) else None
+    if isinstance(output, dict):
+        return output
+    # a2a-nexus#2016: negative review verdicts (revise/reject) terminate the
+    # broker task as failed, with the full handler result preserved as
+    # negativeVerdictEvidence. Bind it — a negative verdict is a real verdict
+    # (visibility + bounded revision), never a handler failure.
+    evidence = task.get("negativeVerdictEvidence")
+    if isinstance(evidence, dict):
+        evidence_result = evidence.get("result")
+        evidence_output = evidence_result.get("output") if isinstance(evidence_result, dict) else None
+        if isinstance(evidence_output, dict):
+            return evidence_output
+    return None
 
 
 def _verdict_from_task(
