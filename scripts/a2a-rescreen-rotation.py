@@ -52,6 +52,14 @@ def load_json(path: str) -> Any:
         return json.load(fh)
 
 
+def load_workers(path: str) -> Any:
+    """Accept a bare worker array or a probe payload with a "workers" key."""
+    data = load_json(path)
+    if isinstance(data, dict) and isinstance(data.get("workers"), list):
+        return data["workers"]
+    return data
+
+
 def dump_json(path: str, payload: Any) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
@@ -255,7 +263,8 @@ def _broker_online_workers(broker_url: str, edge_env_file: str) -> tuple[list[st
     construction, not by suppression).
     Returns (sorted ids, error).
     """
-    script = ('. "$EDGE_ENV"; '
+    script = ('EDGE_ENV="$1"; BROKER_URL="$2"; '
+              '. "$EDGE_ENV"; '
               'curl -fsS -H "x-a2a-edge-secret: $A2A_EDGE_SECRET" "$BROKER_URL/workers"')
     try:
         proc = subprocess.run(
@@ -303,8 +312,8 @@ def _ssh_probe_provider(node: str) -> dict[str, Any] | None:
             bin_name = line.split("=", 1)[1].strip().strip('"')
         elif line.startswith("REVIEW_AGENT_ARGS="):
             args = line.split("=", 1)[1].strip().strip('"')
-    if not proc.stdout and proc.returncode != 0:
-        return None
+    if proc.returncode == 255:
+        return None  # ssh unreachable. rc=1 (no grep match) means unwired → claude default.
     provider, model = provider_from_env(bin_name, args)
     return {"bin": bin_name or "claude(default)", "args": args, "provider": provider, "model": model}
 
@@ -453,7 +462,7 @@ def cmd_manifests(args: argparse.Namespace) -> int:
 
 def cmd_plan(args: argparse.Namespace) -> int:
     cases = load_json(args.cases)
-    workers = load_json(args.workers)
+    workers = load_workers(args.workers)
     failures = load_json(args.failures) if args.failures else None
     now = _parse_ts(args.now) if args.now else None
     result = plan(
