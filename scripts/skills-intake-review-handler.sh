@@ -109,6 +109,24 @@ HDR
 } > "$tmp/prompt.txt"
 
 log "prompt built: $(wc -c < "$tmp/prompt.txt") bytes"
+# #2027 review provenance: the handler knows exactly what it executed —
+# agent family from the binary basename, model from an explicit --model
+# argument when the fleet config carries one. Self-reported verdict "model"
+# stays as a fallback for agents that announce it themselves.
+review_agent="$(basename "$REVIEW_AGENT_BIN")"
+review_model=""
+read -ra review_args_tokens <<<"$REVIEW_AGENT_ARGS"
+_prev_arg=""
+for _tok in "${review_args_tokens[@]}"; do
+  if [ -z "$review_model" ]; then
+    case "$_tok" in
+      --model=*) review_model="${_tok#--model=}" ;;
+      --model) : ;; # value taken on the next token
+    esac
+    if [ "$_prev_arg" = "--model" ] && [ -z "$review_model" ]; then review_model="$_tok"; fi
+  fi
+  _prev_arg="$_tok"
+done
 read -ra review_argv <<<"$REVIEW_AGENT_BIN $REVIEW_AGENT_ARGS"
 if ! model_out="$(timeout "$REVIEW_TIMEOUT_SEC" "${review_argv[@]}" < "$tmp/prompt.txt" 2>"$tmp/agent.err")"; then
   # Surface BOTH streams: e.g. `claude -p` reports quota exhaustion on stdout
@@ -122,11 +140,11 @@ fi
 [ -n "$model_out" ] || fail "empty model output"
 printf '%s' "$model_out" > "$tmp/model-out.txt"
 
-task_result="$(python3 - "$tmp/model-out.txt" "$task_id" "$skill_name" "$tree_sha" "$head_prefix" "$head_sha" "${rubric_version:-2026-08-28.2}" <<'PYEOF'
+task_result="$(python3 - "$tmp/model-out.txt" "$task_id" "$skill_name" "$tree_sha" "$head_prefix" "$head_sha" "${rubric_version:-2026-08-28.2}" "$review_agent" "$review_model" <<'PYEOF'
 import json, os, sys
 
 raw = open(sys.argv[1], encoding="utf-8").read()
-task_id, skill_name, tree, head_prefix, head_sha, rubric_version = sys.argv[2:8]
+task_id, skill_name, tree, head_prefix, head_sha, rubric_version, review_agent, review_model_arg = sys.argv[2:10]
 reviewer_node = os.environ.get("WORKER_ID") or os.environ.get("A2A_WORKER_ID") or "unknown"
 
 candidates = []
@@ -195,6 +213,11 @@ if "head_sha" in verdict_obj and str(verdict_obj.get("head_sha")) != head_sha:
                      "note": "verdict head_sha does not match packet provenance"})
     verdict = "revise"
 
+model_self = str(verdict_obj.get("model", "unknown"))
+# #2027 provenance: deterministic handler-side fields. An explicit --model in
+# REVIEW_AGENT_ARGS wins; otherwise fall back to the agent's self-report.
+review_model = review_model_arg if review_model_arg else model_self
+
 note = (f"rubric {verdict_obj.get('rubric_version', rubric_version)} review: "
         f"verdict {verdict}, {len(findings)} finding(s)")
 
@@ -215,7 +238,9 @@ result = {
         "rubric_version": str(verdict_obj.get("rubric_version", rubric_version)),
         "findings": findings,
         "evidence": evidence,
-        "model": str(verdict_obj.get("model", "unknown")),
+        "model": model_self,
+        "review_agent": review_agent,
+        "review_model": review_model,
         "reviewer_node": reviewer_node,
         "note": note,
     },
