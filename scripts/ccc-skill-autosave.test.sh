@@ -208,5 +208,81 @@ ok "autonomy=dry-run previews central promotion" 'grep -qx "run --dry-run" "$TMP
 out="$(CCC_STATE_DIR="$STATE3" CCC_AUTONOMY=kill bash "$AUTOSAVE" status 2>&1)"
 ok "status reflects autonomy=kill" 'printf "%s" "$out" | grep -q "^autonomy: kill"'
 
+# --- 8) codex drafting branch (#1353, opt-in, default off) -------------------
+# Rollouts are projected by the REAL codex-rollout-normalize.py (no stub — the
+# mapping is the contract), then dispatched through the SAME real skill-review.sh
+# with CCC_SKILL_PROVIDER=codex and the normalized tree as CLAUDE_PROJECTS_DIR.
+CODEX_HOME4="$TMP/codex"
+CODEX_SESS="$CODEX_HOME4/sessions/2026/08/31"
+mkdir -p "$CODEX_SESS"
+cat > "$CODEX_SESS/rollout-2026-08-31T09-00-00-aaaa-bbbb.jsonl" <<'EOF'
+{"timestamp":"2026-08-31T00:00:00Z","type":"session_meta","payload":{"session_id":"codexsess-1","cwd":"/root/app","originator":"codex_cli"}}
+{"timestamp":"2026-08-31T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"deployment health check please"}]}}
+{"timestamp":"2026-08-31T00:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checking service status"}]}}
+{"timestamp":"2026-08-31T00:00:03Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"systemctl status app --no-pager\"]}"}}
+{"timestamp":"2026-08-31T00:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"service is active"}]}}
+EOF
+cat > "$CODEX_SESS/rollout-2026-08-31T09-05-00-cccc-dddd.jsonl" <<'EOF'
+{"timestamp":"2026-08-31T00:05:00Z","type":"session_meta","payload":{"session_id":"machinesess-1","cwd":"/root/app","originator":"codex_exec"}}
+{"timestamp":"2026-08-31T00:05:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"machine driven run"}]}}
+EOF
+
+STATE4="$TMP/state4"; PROJECTS4="$TMP/projects4"; SPOOL4="$TMP/spool4"
+mkdir -p "$STATE4" "$PROJECTS4"
+chmod 700 "$STATE4"
+
+# 8a) default OFF: the sessions tree is not even walked.
+run4() { # <extra env...>
+  env "$@" CCC_STATE_DIR="$STATE4" CLAUDE_PROJECTS_DIR="$PROJECTS4" CCC_PUSH_SPOOL="$SPOOL4" \
+    CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+    CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion4.touched" \
+    CCC_SKILL_CODEX_NORMALIZE_CMD="$HERE/codex-rollout-normalize.py" \
+    CODEX_HOME="$CODEX_HOME4" CLAUDE_SKILLS_DIR="$TMP/skills4" \
+    CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode \
+    bash "$AUTOSAVE" run
+}
+run4
+ok "codex branch default off logs not-enabled" 'grep -q "codex skipped reason=not-enabled" "$STATE4/skill-autosave.log"'
+ok "default off walks no sessions (no normalized tree)" '[ ! -d "$STATE4/codex-normalized" ]'
+
+# 8b) opt-in via state file: projection + dispatch + shared-state ledger.
+printf '1\n' > "$STATE4/skill-autosave.codex-drafting"
+run4
+proj4="$STATE4/codex-normalized/-root-app/codexsess-1.jsonl"
+ok "opt-in projects the rollout into the branch-local tree" '[ -f "$proj4" ]'
+ok "projection lands in the Claude shape (Bash tool_use)" \
+  'grep -q "\"type\": \"tool_use\", \"name\": \"Bash\"" "$proj4"'
+excluded_ledgered=0
+while IFS=$'\t' read -r key _rest; do
+  [ "$key" = "rollout-2026-08-31T09-05-00-cccc-dddd" ] && excluded_ledgered=1
+done < "$STATE4/skill-autosave.codex-seen"
+ok "codex_exec session excluded and ledgered" \
+  'grep -q "codex excluded session=rollout-2026-08-31T09-05-00-cccc-dddd reason=codex_exec" "$STATE4/skill-autosave.log" && [ "$excluded_ledgered" = 1 ]'
+ok "excluded session produced no normalized file" '[ ! -e "$STATE4/codex-normalized/-root-app/machinesess-1.jsonl" ]'
+ok "codex dispatch through real skill-review logged ok" 'grep -q "codex review ok session=rollout-2026-08-31T09-00-00-aaaa-bbbb" "$STATE4/skill-autosave.log"'
+drafted_ledgered=0
+while IFS=$'\t' read -r key _rest; do
+  [ "$key" = "rollout-2026-08-31T09-00-00-aaaa-bbbb" ] && drafted_ledgered=1
+done < "$STATE4/skill-autosave.codex-seen"
+ok "codex sweep summary counted one draft" \
+  '[ "$drafted_ledgered" = 1 ]'
+
+# 8c) rerun without growth: regrowth ledger prevents re-normalization/re-draft.
+log_before="$(grep -c "codex review ok" "$STATE4/skill-autosave.log")"
+run4
+log_after="$(grep -c "codex review ok" "$STATE4/skill-autosave.log")"
+ok "unchanged rollout not re-drafted" '[ "$log_after" = "$log_before" ]'
+
+# 8d) opt-in on a node without codex sessions is a clean no-op.
+STATE5="$TMP/state5"; mkdir -p "$STATE5"; chmod 700 "$STATE5"
+printf '1\n' > "$STATE5/skill-autosave.codex-drafting"
+env CCC_STATE_DIR="$STATE5" CLAUDE_PROJECTS_DIR="$TMP/projects5" CCC_PUSH_SPOOL="$TMP/spool5" \
+  CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+  CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion5.touched" \
+  CCC_SKILL_CODEX_NORMALIZE_CMD="$HERE/codex-rollout-normalize.py" \
+  CODEX_HOME="$TMP/no-codex-home" CLAUDE_SKILLS_DIR="$TMP/skills5" \
+  CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode bash "$AUTOSAVE" run
+ok "missing sessions tree is a clean skip" 'grep -q "codex skipped reason=no-sessions-tree" "$STATE5/skill-autosave.log"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

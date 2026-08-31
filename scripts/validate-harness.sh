@@ -403,6 +403,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/resource-pressure-guard.test.sh \
          scripts/honcho-peer-staleness-canary.test.sh \
          scripts/install-memory-refresh-cron.test.sh scripts/install-nunchi.test.sh scripts/auto-distill.test.sh scripts/install-termux-mempalace.test.sh scripts/ccc-skill-autosave.test.sh \
+         scripts/codex-rollout-normalize.test.sh \
          scripts/cost-ledger.test.sh \
          scripts/cost-ledger-weekly.test.sh \
          scripts/ccc-skill-promotion.test.sh \
