@@ -187,7 +187,8 @@ SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh claude/hooks/lifecycle-fe
           claude/hooks/observability.test.sh scripts/validate-harness.sh \
           scripts/bridge-watchdog.sh scripts/bridge-watchdog.test.sh \
           scripts/resource-pressure-guard.sh scripts/resource-pressure-guard.test.sh \
-          scripts/honcho-peer-staleness-canary.sh scripts/honcho-peer-staleness-canary.test.sh)
+          scripts/honcho-peer-staleness-canary.sh scripts/honcho-peer-staleness-canary.test.sh \
+          scripts/git-hooks/managed-checkout-guard scripts/managed-checkout-guard.test.sh)
 if command -v shellcheck >/dev/null 2>&1; then
   SC_PRESENT=()
   for f in "${SC_SCOPE[@]}"; do
@@ -393,6 +394,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          claude/hooks/nunchi/bridge-journal.test.sh claude/hooks/nunchi/codex-feed.test.sh \
          scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-codex-memory.test.sh scripts/ccc-codex.test.sh scripts/ccc-piri.test.sh piri/skills/web/web_tools.test.sh scripts/ccc-codex-github-policy.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-distill-fleet-matrix.test.sh scripts/ccc-security-audit.test.sh \
          scripts/ccc-script-interpreter-check.test.sh \
+         scripts/managed-checkout-guard.test.sh \
          scripts/ccc-fleet-matrix.test.sh scripts/ccc-wiki-triage.test.sh scripts/setup.test.sh \
          scripts/harness-paths.test.sh scripts/canonical-paths.test.sh \
          scripts/installer-gen-stamp.test.sh \

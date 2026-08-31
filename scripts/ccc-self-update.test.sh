@@ -499,6 +499,82 @@ cat > "$TMP/seed/setup.sh" <<'SH'
 echo "setup ran at $(git rev-parse --short HEAD)" >> "${SETUP_MARKER:?}"
 SH
 
+# --- #1328: conditional auto-recovery from a wrong-branch stall ----------------
+# Safe shape (validated by the yukson 2026-08-27 recovery): stray branch fully
+# pushed to origin + clean tree — switching back to main cannot lose anything.
+# Every other wrong-branch shape must stay fail-closed.
+# This section performs real update runs, so give them the working allowlist
+# (section 3 left 'bad-unit', #971 left external restart/health commands) and
+# the update path stays clean end-to-end.
+printf '%s\n' 'hermes-broker' 'a2a-worker' > "$CLAUDE/self-update.services"
+rm -f "$CLAUDE/self-update.restart-cmd" "$CLAUDE/self-update.health-cmd" \
+      "$TMP/restart-should-not-run" "$TMP/runtime-healthy"
+
+# (1) recoverable: fully pushed stray branch, clean tree -> back on main, update flows.
+rm -f "$TMP/spool"/*.json
+git -C "$REPO" checkout -q -b auto-recover-me
+git -C "$REPO" push -q origin auto-recover-me
+echo recover > "$TMP/seed/file.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm six && git -C "$TMP/seed" push -q origin main
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "fully-pushed stray branch auto-recovers (rc 0)" '[ "$rc" = 0 ]'
+ok "recovery switched back to main" '[ "$(git -C "$REPO" symbolic-ref --short HEAD)" = "main" ]'
+ok "recovery kept the update flowing (ff to origin/main)" \
+  '[ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
+ok "recovery logged with the stray branch name" \
+  'grep -q "recover reason=wrong-branch from=auto-recover-me" "$STATE/self-update.log"'
+ok "recovery notified the owner" 'grep -rh "자동 복구" "$TMP/spool" >/dev/null 2>&1'
+ok "recovery leaves the stray branch ref in place (no destructive cleanup)" \
+  'git -C "$REPO" rev-parse --verify --quiet refs/heads/auto-recover-me >/dev/null'
+
+# (2) unpushed stray branch: the only copy of that commit is local -> fail-closed.
+rm -f "$TMP/spool"/*.json
+git -C "$REPO" checkout -q -b unpushed-work
+echo local-only > "$REPO/wip.txt"
+git -C "$REPO" add wip.txt && git -C "$REPO" commit -qm wip
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "unpushed stray branch stays fail-closed (rc 4)" '[ "$rc" = 4 ]'
+ok "unpushed stray branch aborts with both branch names logged" \
+  'grep -q "abort reason=wrong-branch .*branch=unpushed-work expected=main" "$STATE/self-update.log"'
+ok "unpushed stray branch still checked out, work intact" \
+  '[ "$(git -C "$REPO" symbolic-ref --short HEAD)" = "unpushed-work" ] && git -C "$REPO" rev-parse --verify refs/heads/unpushed-work >/dev/null'
+git -C "$REPO" checkout -q main
+git -C "$REPO" branch -qD unpushed-work
+
+# (3) dirty tree on a pushed stray branch: unknown local state -> fail-closed.
+rm -f "$TMP/spool"/*.json
+git -C "$REPO" checkout -q -b dirty-stray
+git -C "$REPO" push -q origin dirty-stray
+echo mess > "$REPO/file.txt"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "dirty tree on pushed stray branch stays fail-closed (rc 4)" '[ "$rc" = 4 ]'
+ok "dirty stray branch still checked out" '[ "$(git -C "$REPO" symbolic-ref --short HEAD)" = "dirty-stray" ]'
+git -C "$REPO" checkout -q -- file.txt
+git -C "$REPO" checkout -q main
+git -C "$REPO" branch -qD dirty-stray
+
+# (4) main held by a linked worktree: git refuses the double checkout -> fail-closed.
+git -C "$REPO" checkout -q -b stray-wt
+git -C "$REPO" push -q origin stray-wt
+git -C "$REPO" worktree add -q "$TMP/held-main" main
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "main held by a linked worktree keeps fail-closed (rc 4)" '[ "$rc" = 4 ]'
+ok "worktree-held main leaves the stray branch checked out" \
+  '[ "$(git -C "$REPO" symbolic-ref --short HEAD)" = "stray-wt" ]'
+git -C "$REPO" worktree remove --force "$TMP/held-main"
+git -C "$REPO" checkout -q main
+git -C "$REPO" branch -qD stray-wt
+
+# (5) operator kill-switch restores the unconditional fail-closed abort.
+rm -f "$TMP/spool"/*.json
+git -C "$REPO" checkout -q -b switch-off
+git -C "$REPO" push -q origin switch-off
+out="$(CCC_SELF_UPDATE_AUTO_RECOVER=0 run_selfup run 2>&1)"; rc=$?
+ok "CCC_SELF_UPDATE_AUTO_RECOVER=0 keeps fail-closed abort (rc 4)" '[ "$rc" = 4 ]'
+ok "kill-switch abort notifies as stalled" 'spool_dedup | grep -qx "SelfUpdate:stalled-wrong-branch"'
+git -C "$REPO" checkout -q main
+git -C "$REPO" branch -qD switch-off
+
 # --- #1081 phase 2: installer re-apply on gen drift --------------------------
 # Plant the real gen-stamp lib + a stub installer in the fixture repo so
 # self-update can recompute stamps and invoke a hermetic --apply.
