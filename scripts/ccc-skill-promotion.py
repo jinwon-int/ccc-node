@@ -2597,6 +2597,42 @@ def _revise_target_broker(config: Config, node: str, secret: str) -> dict[str, s
     raise PromotionError("revise_author_offline")
 
 
+def _run_revise_round(
+    config: Config,
+    revise_rb: dict[str, str] | None,
+    secret: str,
+    manifest: dict[str, object],
+    nexus_script,
+) -> dict[str, object]:
+    """Dispatch one revise round on the resolved broker (primary locally, or
+    the author-homed remote broker over SSH). Returns the dispatcher result
+    JSON; raises PromotionError(revise_round_failed: …) on any transport or
+    parse failure."""
+    if revise_rb is not None:
+        return _remote_dispatch_round(config, revise_rb, manifest)
+    descriptor, manifest_path = tempfile.mkstemp(
+        prefix="revise-manifest-", suffix=".json", dir=config.promotion_state_dir
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False)
+        env = dict(os.environ)
+        env["A2A_EDGE_SECRET"] = secret
+        completed = _run(
+            ["node", str(nexus_script), "--manifest", str(manifest_path), "--verify", "--json"],
+            env=env,
+            timeout=300,
+        )
+        return json.loads(completed.stdout.decode("utf-8"))
+    except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PromotionError(f"revise_round_failed: {str(error)[:100]}") from error
+    finally:
+        try:
+            os.unlink(manifest_path)
+        except OSError:
+            pass
+
+
 def _dispatch_intake_revise(
     config: Config,
     row: dict[str, object],
@@ -2650,12 +2686,12 @@ def _dispatch_intake_revise(
     # #2024: the author node may be homed on a secondary broker. Dispatch the
     # revision where the author is actually online — primary first, then each
     # configured remote broker. Same codes when nowhere online.
+    nexus_script = config.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"
+    if not nexus_script.is_file():
+        return {"outcome": "revise-skipped", "code": "revise_nexus_missing"}
     try:
         revise_rb = _revise_target_broker(config, node, secret)
         if revise_rb is None:
-            nexus_script = config.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"
-            if not nexus_script.is_file():
-                return {"outcome": "revise-skipped", "code": "revise_nexus_missing"}
             broker_id = _broker_id(config, secret)
             broker_url = config.broker_url
         else:
@@ -2697,34 +2733,10 @@ def _dispatch_intake_revise(
         )
     except PromotionError as error:
         return {"outcome": "revise-skipped", "code": error.code}
-    if revise_rb is None:
-        descriptor, manifest_path = tempfile.mkstemp(
-            prefix="revise-manifest-", suffix=".json", dir=config.promotion_state_dir
-        )
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(manifest, handle, ensure_ascii=False)
-            env = dict(os.environ)
-            env["A2A_EDGE_SECRET"] = secret
-            try:
-                completed = _run(
-                    ["node", str(nexus_script), "--manifest", str(manifest_path), "--verify", "--json"],
-                    env=env,
-                    timeout=300,
-                )
-                result = json.loads(completed.stdout.decode("utf-8"))
-            except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
-                return {"outcome": "revise-skipped", "code": "revise_round_failed", "detail": str(error)[:120]}
-        finally:
-            try:
-                os.unlink(manifest_path)
-            except OSError:
-                pass
-    else:
-        try:
-            result = _remote_dispatch_round(config, revise_rb, manifest)
-        except PromotionError as error:
-            return {"outcome": "revise-skipped", "code": "revise_round_failed", "detail": str(error)[:120]}
+    try:
+        result = _run_revise_round(config, revise_rb, secret, manifest, nexus_script)
+    except PromotionError as error:
+        return {"outcome": "revise-skipped", "code": "revise_round_failed", "detail": str(error)[:120]}
     dispatch_rows = result.get("results") if isinstance(result, dict) else None
     created = dispatch_rows[0] if isinstance(dispatch_rows, list) and dispatch_rows and isinstance(dispatch_rows[0], dict) else None
     dispatched_task = created.get("taskId") if created else None
