@@ -40,6 +40,53 @@ from datetime import datetime, timedelta, timezone
 RECENT_FAILURE_LIMIT = 1  # >=1 task.failed inside the window excludes the node
 
 
+def _record_dispatch_ledger(
+    m,
+    cfg,
+    *,
+    case: dict,
+    name: str,
+    cand,
+    head: str,
+    manifest: dict,
+    reviewer: str,
+    broker_name: str,
+    broker_id: str,
+    dispatched_task: str,
+) -> str:
+    """Append an a2a-dispatch ledger row — the #2024 "ledger에 broker 기록"
+    requirement. The nightly publisher collect polls pending rows' "broker"
+    field, so without this row a rescreen verdict (on either broker) is never
+    consumed and never reaches the intake PR. Best-effort: a ledger failure is
+    reported in the result JSON but never fails the dispatch itself."""
+    try:
+        m._append_ledger(
+            cfg,
+            {
+                "ts": m._utc_now(),
+                "kind": "a2a-dispatch",
+                "transport_id": m._transport_id(cand),
+                "head_sha": head,
+                "round_id": manifest["roundId"],
+                "task_id": manifest["lanes"][0]["id"],
+                "dispatched_task": dispatched_task,
+                "reviewer_node": reviewer,
+                "broker_id": broker_id,
+                "broker": broker_name,
+                "pr_url": f"https://github.com/{cfg.repo}/pull/{case['pr']}",
+                "node": case["node"],
+                "provider": case["provider"],
+                "name": name,
+                "tree_sha256": case["tree_sha256"],
+                "branch": case["branch"],
+                "rescreen": True,
+            },
+        )
+        return "recorded"
+    except Exception as exc:  # noqa: BLE001 — dispatch stands, gap surfaced
+        return f"record-failed:{str(exc)[:80]}"
+
+
 def _load_promoter() -> tuple[object, pathlib.Path]:
     """Load the canonical promoter module for its broker/dispatch internals."""
     candidates = [
@@ -258,11 +305,12 @@ def main() -> int:
                            tree_sha256=case["tree_sha256"],
                            source_dir=pathlib.Path("/tmp"), files=files, description="")
         now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"{index:02d}"
+        broker_id_used = (m._remote_broker_id(cfg, chosen["rb"]) if chosen["rb"] is not None
+                          else m._broker_id(cfg, secret))
         manifest = m._build_dispatch_manifest(
             cfg, cand, pr_number=str(case["pr"]), branch=case["branch"], head=head,
             reviewer=chosen["node"],
-            broker_id=(m._remote_broker_id(cfg, chosen["rb"]) if chosen["rb"] is not None
-                       else m._broker_id(cfg, secret)),
+            broker_id=broker_id_used,
             broker_url=(chosen["rb"]["broker_url"] if chosen["rb"] is not None else cfg.broker_url),
             procedure=procedure, inventory=[], now=now)
         manifest["lanes"][0]["payload"]["scope"] = "public-elevation"
@@ -297,6 +345,12 @@ def main() -> int:
             except Exception as error:  # noqa: BLE001 — record and continue
                 entry_result["outcome"] = "rescreen-dispatch-failed"
                 entry_result["error"] = str(error)[:120]
+        if isinstance(entry_result.get("task"), str) and entry_result["task"]:
+            entry_result["ledger"] = _record_dispatch_ledger(
+                m, cfg, case=case, name=name, cand=cand, head=head, manifest=manifest,
+                reviewer=chosen["node"], broker_name=chosen["broker"],
+                broker_id=broker_id_used,
+                dispatched_task=entry_result["task"])
         results.append(entry_result)
 
     summary = {"ok": True, "dryrun": bool(args.dry_run),
