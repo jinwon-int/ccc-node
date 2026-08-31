@@ -407,6 +407,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/cost-ledger-weekly.test.sh \
          scripts/ccc-skill-promotion.test.sh \
          scripts/a2a-review-handler.test.sh \
+         scripts/a2a-rescreen-rotation.test.sh \
          scripts/ccc-skill-registry.test.sh \
          scripts/ccc-fleet-skills-sync.test.sh \
          scripts/gh-pr-flow-seoseo-merge.test.sh \
