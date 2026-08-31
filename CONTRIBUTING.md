@@ -11,9 +11,13 @@ it.**
 
 The updater is fail-closed: it refuses to run unless the checkout is on `main`
 with a clean tree. So the moment you branch or leave an edit there, that node
-stops updating — not until the next tick, but until a human puts it back. Before
-the alerting added in #1060 nothing announced this, and a node sat 23h behind
-`main` because a feature branch was left checked out (#1039).
+stops updating — not until the next tick, but until a human puts it back
+(#1039). Two mechanical guards back this up (#1328): setup.sh installs a
+post-checkout hook into the managed checkout that warns AT THE MOMENT you
+switch off `main`, and the updater itself now auto-recovers a wrong-branch
+stall when it is provably lossless (clean tree and the stray branch fully
+pushed — every commit already on the remote). Unpushed commits, dirty trees,
+or a `main` held by a linked worktree still require the human path below.
 
 Develop in a separate worktree instead:
 
@@ -28,11 +32,13 @@ things a worktree does **not** solve:
 - `setup.sh` installs from its own location, so running it from a dev worktree
   installs unmerged code as the node's harness. Run it only from the managed
   checkout.
-- Reverting a stray branch is itself a repo mutation. Check the bridge's idle
-  gate (`~/.telegram_bot/health.json`, `workload.active_requests`) first — the
+- Reverting a stray branch is itself a repo mutation. The updater's
+  auto-recovery (#1328) only fires on the provably lossless shape and only
+  after the bridge's idle gate; a MANUAL `git checkout` bypasses that
+  protection. Check the bridge's idle gate
+  (`~/.telegram_bot/health.json`, `workload.active_requests`) first — the
   updater defers while the bridge is busy precisely because swapping the tree
-  under a running session destroys in-flight work, and a manual `git checkout`
-  bypasses that protection.
+  under a running session destroys in-flight work.
 
 ## Claim an issue before you build it
 

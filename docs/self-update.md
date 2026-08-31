@@ -17,7 +17,12 @@ rather than composing the steps ad hoc.
 2. fail-closed preconditions: clean working tree, on the expected branch
    (`CCC_SELF_UPDATE_BRANCH`, default `main`); Claude/Hermes/state/repository
    paths must be absolute, normalized, non-root, non-overlapping, and free of
-   symlink components; managed artifacts must not be symlinks or hardlinks
+   symlink components; managed artifacts must not be symlinks or hardlinks.
+   A wrong-branch stall self-recovers only when the stray branch is fully
+   pushed (origin has it at the exact local SHA) and the tree is clean —
+   switching back then cannot lose anything (#1328; opt out with
+   `CCC_SELF_UPDATE_AUTO_RECOVER=0`). Every other wrong-branch shape stays
+   fail-closed and notifies
 3. `git fetch` + `merge --ff-only` (never rewrites local history; diverged →
    abort)
 4. if HEAD changed (or `run --force`): snapshot the managed Claude artifacts

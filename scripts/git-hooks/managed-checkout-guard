@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# managed-checkout-guard — post-checkout guard for a node's MANAGED ccc-node
+# checkout. setup.sh installs this into <managed repo>/.git/hooks/post-checkout
+# (marker-guarded, idempotent); that is the only place it should ever live.
+# marker: ccc-node:managed-checkout-guard v1
+#
+# Why (#1328): ccc-self-update.sh is fail-closed — it refuses to run unless the
+# managed checkout sits on the expected branch with a clean tree. Creating or
+# checking out a feature branch HERE silently freezes that node's harness
+# updates (#1039, #1061, yukson 2026-08-27, gwakga 2026-08-28). CONTRIBUTING.md
+# documents the rule, but nobody reads it at the moment `git switch -c` runs,
+# so this hook exposes the discipline exactly then. It only WARNS; it never
+# blocks a checkout — the mechanical fixes live elsewhere (self-update
+# conditional auto-recovery, doctor drift report).
+#
+# Silent no-ops:
+#   - checkouts landing on the expected branch (including self-update's own
+#     auto-recovery switching back to it)
+#   - file checkouts (flag=0) — only branch switches matter here
+#   - linked worktrees (the sanctioned dev path): their gitdir is a
+#     .../.git/worktrees/<name> dir, not the common dir. Git >=2.36 resolves
+#     hooks from the common dir, so the hook DOES fire there and must opt out
+#     itself (verified on git 2.43).
+#   - repos other than the node's managed checkout (when
+#     ~/.claude/self-update.repo names one)
+# Kill switch: CCC_MANAGED_CHECKOUT_GUARD=0 disables the warning entirely.
+set -uo pipefail
+
+[ "${CCC_MANAGED_CHECKOUT_GUARD:-1}" = "1" ] || exit 0
+# post-checkout args: <prev-head> <new-head> <flag>; flag=1 only for branch checkouts.
+[ "${3:-0}" = "1" ] || exit 0
+
+gitdir="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
+commondir="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+[ "$gitdir" = "$commondir" ] || exit 0
+case "$commondir" in
+  .git|*/.git) ;;      # a normal (non-bare) checkout
+  *) exit 0 ;;         # bare/odd layout — not a managed checkout
+esac
+repo="$(cd "$commondir/.." 2>/dev/null && pwd)" || exit 0
+
+# Stay silent in repos the node does not manage: self-update resolves its repo
+# as the first line of ~/.claude/self-update.repo when that file exists.
+repo_file="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}/self-update.repo"
+if [ -f "$repo_file" ]; then
+  managed="$(head -1 "$repo_file" | tr -d '[:space:]')"
+  [ "$repo" = "$managed" ] || exit 0
+fi
+
+expected="${CCC_SELF_UPDATE_BRANCH:-main}"
+current="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+[ -n "$current" ] && [ "$current" = "$expected" ] && exit 0
+
+detached=""
+[ -n "$current" ] || detached="(detached HEAD)"
+
+cat >&2 <<EOF
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠  MANAGED CHECKOUT: HEAD just left '$expected' $detached
+   이 저장소는 self-update가 갱신하는 관리 체크아웃입니다. '$expected'가 아니면
+   갱신이 fail-closed로 정지하고, 노드는 해결 전까지 하네스 업데이트를 받지
+   못합니다. 개발/PR 작업은 worktree로 분리하세요:
+
+     git worktree add ~/dev/<slug> -b <type>/<slug> origin/$expected
+
+   커밋이 전부 원격에 있고 트리가 clean이면 다음 self-update tick이 자동으로
+   '$expected'로 복구합니다(#1328). unpushed 커밋이나 dirty tree는 수동 복구가
+   필요합니다 — see CONTRIBUTING.md.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EOF
+exit 0

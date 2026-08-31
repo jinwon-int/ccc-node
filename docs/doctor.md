@@ -139,7 +139,7 @@ presence of any abort in history:
 | log absent | `정상` | node does not run self-update |
 | no terminal record in the log tail | `정상` | nothing to judge |
 | last record is `done`/audit JSON | `정상` | last attempt reached an end state |
-| `wrong-branch`, `dirty-tree`, `no-repo` | `수동필요` | node receives no harness updates until a human restores the checkout |
+| `wrong-branch`, `dirty-tree`, `no-repo` | `수동필요` | node receives no harness updates until a human restores the checkout. Note: a `wrong-branch` stall whose stray branch is fully pushed with a clean tree now self-recovers at the next tick (#1328), so it only reaches this row when recovery is impossible (unpushed commits, dirty tree, `main` held elsewhere) or was disabled with `CCC_SELF_UPDATE_AUTO_RECOVER=0` |
 | any other abort (e.g. `fetch-failed`) | `경고` | transient; the next tick retries |
 
 `consecutive=N` counts the unbroken run of the newest reason only — a different

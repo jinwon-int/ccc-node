@@ -13,6 +13,9 @@ TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
+# Later guard-hook cases need the REAL tar/python/jq: the fake tar above only
+# serves the backup-failure cases and would break a full install run.
+REAL_PATH="$PATH"
 
 # Route every setup-run systemd interaction away from the live tree (#885).
 # A full (non-dry-run) $SETUP run reaches bridge/service-systemd.sh reconcile;
@@ -851,6 +854,57 @@ ok "setup records the absorbed skill in the repo manifest" \
   'grep -q "^wiki-record " "$fleet_claude/state/repo-skills.manifest"'
 ok "fleet absorption is logged, not silent" \
   'grep -q "absorbing fleet-installed skill wiki-record" "$fleet_out"'
+
+# --- managed-checkout guard hook (#1328) --------------------------------------
+# setup.sh installs a post-checkout guard into the MANAGED checkout's .git/hooks
+# only. The suite runs setup.sh from $ROOT, which IS a managed checkout — so
+# these cases copy the runtime trees into a scratch git repo and run setup.sh
+# from THERE; a test must never touch the real checkout's .git.
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+
+guard_repo="$TMP/guard-repo-copy"
+mkdir -p "$guard_repo"
+tar -C "$ROOT" -cf - --exclude=.git --exclude=bridge/venv --exclude=bridge/tests . \
+  | (cd "$guard_repo" && tar -xf -)
+git -C "$guard_repo" init -q -b main && git -C "$guard_repo" add -A && git -C "$guard_repo" commit -qm fixture
+
+run_setup_in() { # <repo-copy> <home> [extra setup args...]
+  local repo="$1" home="$2"; shift 2
+  (cd "$repo" && HOME="$home" CCC_CLAUDE_DIR="$home/.claude" CCC_HERMES_DIR="$home/.hermes" \
+    PATH="$REAL_PATH" bash "$repo/setup.sh" --no-backup "$@" 2>&1)
+}
+
+GUARD_HOOK="$guard_repo/.git/hooks/post-checkout"
+guard_home="$TMP/guard-home"
+out="$(run_setup_in "$guard_repo" "$guard_home")"
+ok "setup installs the managed-checkout guard into the managed repo" \
+  '[ -x "$GUARD_HOOK" ] && grep -q "ccc-node:managed-checkout-guard" "$GUARD_HOOK"'
+ok "guard install is logged, not silent" 'grep -q "managed-checkout guard installed" <<<"$out"'
+
+out="$(run_setup_in "$guard_repo" "$guard_home")"
+ok "re-run keeps the guard installed (idempotent update in place)" \
+  '[ -x "$GUARD_HOOK" ] && grep -q "ccc-node:managed-checkout-guard" "$GUARD_HOOK"'
+
+# An existing post-checkout hook without our marker is never clobbered.
+printf '#!/bin/sh\necho foreign\n' > "$GUARD_HOOK"
+out="$(run_setup_in "$guard_repo" "$guard_home")"
+ok "foreign post-checkout hook is left untouched" \
+  'grep -q "foreign" "$GUARD_HOOK" && grep -q "is not ours — left untouched" <<<"$out"'
+rm -f "$GUARD_HOOK"
+
+# When self-update.repo names a DIFFERENT checkout, this checkout is not managed.
+other_home="$TMP/guard-other-home"
+mkdir -p "$other_home/.claude"
+printf '%s\n' "$TMP/some-other-repo" > "$other_home/.claude/self-update.repo"
+out="$(run_setup_in "$guard_repo" "$other_home")"
+ok "setup skips the guard when another checkout is the managed repo" \
+  'grep -q "not the self-update managed repo" <<<"$out" && [ ! -e "$GUARD_HOOK" ]'
+
+# Dry-run announces without installing.
+dry_home="$TMP/guard-dry-home"
+out="$(run_setup_in "$guard_repo" "$dry_home" --dry-run)"
+ok "dry-run reports the guard install without touching .git" \
+  'grep -q "would install managed-checkout guard" <<<"$out" && [ ! -e "$GUARD_HOOK" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
