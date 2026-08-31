@@ -447,7 +447,7 @@ echo "session log line"
 echo "CODEX-ANSWER"
 EOF
 chmod +x "$synth_bin/claude" "$synth_bin/codex"
-out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+out="$(PATH="$synth_bin:/usr/bin:/bin" NUNCHI_PIRI=0 HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
 ok "logged-out claude falls back to an authenticated codex" \
   'grep -q "CODEX-ANSWER" <<<"$out" && ! grep -q "Not logged in" <<<"$out"'
 ok "codex fallback still takes the final block, not a session log line" \
@@ -459,7 +459,7 @@ cat > "$synth_bin/claude" <<'EOF'
 echo "CLAUDE-ANSWER"
 EOF
 chmod +x "$synth_bin/claude"
-out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+out="$(PATH="$synth_bin:/usr/bin:/bin" NUNCHI_PIRI=0 HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
 ok "a healthy claude is still preferred over codex" \
   'grep -q "CLAUDE-ANSWER" <<<"$out" && ! grep -q "CODEX-ANSWER" <<<"$out"'
 
@@ -469,9 +469,97 @@ cat > "$synth_bin/claude" <<'EOF'
 echo "boom"; exit 3
 EOF
 chmod +x "$synth_bin/claude"
-out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+out="$(PATH="$synth_bin:/usr/bin:/bin" NUNCHI_PIRI=0 HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
 ok "a crashing backend also falls through to the next candidate" \
   'grep -q "CODEX-ANSWER" <<<"$out"'
+
+# ---- piri (pi harness) as the last synthesis candidate (#gongyung fallback) --
+# pi carries its own provider auth, so a node whose claude is quota-capped and
+# whose codex auth is dead still has a working synthesis lane through pi. The
+# flags must strip the harness to a bare one-shot call, and NUNCHI_PIRI=0 must
+# be able to turn the candidate off entirely.
+cat > "$synth_bin/pi" <<'EOF'
+#!/usr/bin/env bash
+# fail unless the sweep passed the harness-stripping flags
+for arg in "$@"; do
+  case "$arg" in
+    --no-session|--no-tools|--no-extensions|--no-skills|--no-prompt-templates|--no-context-files) ;;
+    -p) ;;
+    *) printf 'PIRI-GOT:%s\n' "$arg" ;;
+  esac
+done
+echo "PIRI-ANSWER"
+EOF
+chmod +x "$synth_bin/pi"
+cat > "$synth_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "Not logged in · Please run /login"
+EOF
+cat > "$synth_bin/codex" <<'EOF'
+#!/usr/bin/env bash
+echo "Not logged in · Please run /login"
+EOF
+chmod +x "$synth_bin/claude" "$synth_bin/codex"
+out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "expired claude+codex fall through to a working piri" \
+  'grep -q "PIRI-ANSWER" <<<"$out"'
+ok "pi runs as a bare one-shot call (prompt reaches the model, no harness noise)" \
+  'grep -q "PIRI-GOT:" <<<"$out" && grep -q "PIRI-ANSWER" <<<"$out"' 
+out="$(PATH="$synth_bin:/usr/bin:/bin" NUNCHI_PIRI_ARGS="--provider openai-codex --model gpt-5.6-sol" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "NUNCHI_PIRI_ARGS overrides reach the pi invocation" \
+  'grep -q "PIRI-GOT:--provider" <<<"$out" && grep -q "PIRI-GOT:gpt-5.6-sol" <<<"$out"'
+out="$(PATH="$synth_bin:/usr/bin:/bin" NUNCHI_PIRI=0 HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "NUNCHI_PIRI=0 turns the candidate off" \
+  '! grep -q "PIRI-ANSWER" <<<"$out" && grep -q "합성 백엔드 사용 불가" <<<"$out"'
+
+# ordering: a healthy claude still outranks piri.
+cat > "$synth_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "CLAUDE-ANSWER"
+EOF
+chmod +x "$synth_bin/claude"
+out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "a healthy claude still outranks piri" \
+  'grep -q "CLAUDE-ANSWER" <<<"$out" && ! grep -q "PIRI-ANSWER" <<<"$out"'
+
+# a crashing piri is named in the final notice instead of masking the outage.
+cat > "$synth_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "Not logged in · Please run /login"
+EOF
+cat > "$synth_bin/pi" <<'EOF'
+#!/usr/bin/env bash
+echo "pi boom"; exit 1
+EOF
+chmod +x "$synth_bin/claude" "$synth_bin/pi"
+out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "a crashing piri is named in the all-backends-failed notice" \
+  'grep -q "claude:unavailable" <<<"$out" && grep -q "piri:exit-1" <<<"$out"'
+
+# Repo probes: the fleet runs pi from a checkout — built dist (/opt/piri or
+# ~/piri) or tsx-from-source. HOME-scoped fakes prove both resolutions wire
+# into the same candidate without any real pi on PATH. The probe needs node;
+# CI keeps it in /usr/local/bin, outside this suite's constrained PATH, so a
+# wrapper pinned to the host's real node goes on PATH instead.
+real_node="$(command -v node)"
+printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$real_node" > "$synth_bin/node"
+chmod +x "$synth_bin/node"
+rm -f "$synth_bin/pi"
+mkdir -p "$TMP/home/piri/packages/coding-agent/dist"
+printf 'console.log("PIRI-DIST-ANSWER")\n' > "$TMP/home/piri/packages/coding-agent/dist/cli.js"
+out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "a ~/piri built dist resolves the piri candidate" \
+  'grep -q "PIRI-DIST-ANSWER" <<<"$out"'
+
+rm -rf "$TMP/home/piri/packages/coding-agent/dist"
+mkdir -p "$TMP/home/piri/node_modules/tsx/dist" "$TMP/home/piri/packages/coding-agent/src"
+printf 'console.log("PIRI-TSX-ANSWER")\n' > "$TMP/home/piri/node_modules/tsx/dist/cli.mjs"
+: > "$TMP/home/piri/packages/coding-agent/src/cli.ts"
+printf '{}\n' > "$TMP/home/piri/tsconfig.json"
+out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "a tsx-from-source checkout resolves the piri candidate" \
+  'grep -q "PIRI-TSX-ANSWER" <<<"$out"'
+rm -rf "$TMP/home/piri"
 
 # When every present backend is unusable, say so instead of passing a notice off
 # as an answer — that masking is what corrupted the #827 parity sample.
@@ -484,7 +572,7 @@ cat > "$synth_bin/claude" <<'EOF'
 echo "Not logged in · Please run /login"
 EOF
 chmod +x "$synth_bin/claude" "$synth_bin/codex"
-out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+out="$(PATH="$synth_bin:/usr/bin:/bin" NUNCHI_PIRI=0 HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
 ok "all-unusable reports each backend and its reason" \
   'grep -q "합성 백엔드 사용 불가" <<<"$out" && grep -q "claude:unavailable" <<<"$out" && grep -q "codex:unavailable" <<<"$out"'
 
@@ -495,7 +583,7 @@ cat > "$synth_bin/claude" <<'STUBEOF'
 echo "(합성 백엔드 사용 불가: claude:exit-1) You've hit your weekly limit · resets 1am (UTC)"
 STUBEOF
 chmod +x "$synth_bin/claude"
-out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+out="$(PATH="$synth_bin:/usr/bin:/bin" NUNCHI_PIRI=0 HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
 ok "a weekly-limit quota text is unavailable, not an answer" \
   'grep -q "claude:unavailable" <<<"$out"'
 
