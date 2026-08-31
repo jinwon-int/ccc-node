@@ -27,6 +27,8 @@ import os
 import pathlib
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -246,15 +248,31 @@ def _load_hook_module(path: pathlib.Path):
     return module
 
 
-def _broker_online_workers(hook, broker_url: str, secret: str) -> list[str]:
-    """Query the broker for online worker ids via the promotion module."""
-    class _Cfg:  # minimal duck-typed config for _broker_online_worker_ids
-        pass
-
-    cfg = _Cfg()
-    ids = hook._broker_online_worker_ids(cfg, secret) if hasattr(hook, "_broker_online_worker_ids") else []
-    _ = broker_url
-    return sorted(str(i) for i in ids or [])
+def _broker_online_workers(broker_url: str, secret_env: str) -> tuple[list[str], str | None]:
+    """Query broker online worker ids directly (GET /workers, edge-secret header).
+    Implemented inline — not via the promotion hook — so no secret dataflow
+    passes through dynamically loaded module calls (CodeQL py/clear-text-logging).
+    Returns (sorted ids, error).
+    """
+    secret = os.environ.get(secret_env, "")
+    if not secret:
+        return [], "edge-secret-missing"
+    try:
+        request = urllib.request.Request(
+            broker_url.rstrip("/") + "/workers",
+            headers={"x-a2a-edge-secret": secret},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return [], "broker-unreachable"
+    items = payload.get("items") if isinstance(payload, dict) else None
+    online: set[str] = set()
+    for row in items or []:
+        node_id = row.get("nodeId") if isinstance(row, dict) else None
+        if isinstance(node_id, str) and node_id.strip():
+            online.add(node_id.strip())
+    return sorted(online), None
 
 
 def _ssh_probe_provider(node: str) -> dict[str, Any] | None:
@@ -286,16 +304,13 @@ def _ssh_probe_provider(node: str) -> dict[str, Any] | None:
 
 
 def cmd_probe(args: argparse.Namespace) -> int:
-    hook_path = _find_hook_module()
-    if hook_path is None:
-        print(json.dumps({"ok": False, "error": "promotion-hook-not-found"}))
+    online, error = _broker_online_workers(args.broker_url, args.edge_secret_env)
+    if error == "edge-secret-missing":
+        print(json.dumps({"ok": False, "error": error, "env": args.edge_secret_env}))
         return 1
-    hook = _load_hook_module(hook_path)
-    secret = os.environ.get(args.edge_secret_env, "")
-    if not secret:
-        print(json.dumps({"ok": False, "error": "edge-secret-missing", "env": args.edge_secret_env}))
+    if error:
+        print(json.dumps({"ok": False, "error": error}))
         return 1
-    online = _broker_online_workers(hook, args.broker_url, secret)
     workers: list[dict[str, Any]] = []
     nodes = [n.strip() for n in args.nodes.split(",") if n.strip()] if args.nodes else []
     for node in nodes:
