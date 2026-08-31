@@ -706,5 +706,35 @@ sys.stdout.buffer.write('{\"session_id\":\"strunc\",\"honcho\":[{\"kind\":\"fact
 ok "ingest rejects truncated stdin cleanly (no traceback, nonzero exit)" \
   '[ "$rc" != 0 ] && ! grep -q "Traceback\|UnicodeDecodeError" <<<"$out"'
 
+# ---- #1336: merge folds a duplicate into its survivor (no new text) --------
+# Earlier sections already filled ids 1..N, so capture the freshly inserted pair.
+read -r M_A M_B <<<"$(python3 - "$NUNCHI_DB" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+a = c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,created_at)"
+              " VALUES('s1','user','fact','same fact A','ev-a','2026-08-30T00:00:00+00:00','2026-08-30T00:00:00+00:00')").lastrowid
+b = c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,created_at)"
+              " VALUES('s1','user','fact','same fact B','ev-b','2026-08-30T01:00:00+00:00','2026-08-30T01:00:00+00:00')").lastrowid
+c.commit()
+print(a, b)
+PY
+)"
+out="$(python3 "$NP" merge "$M_B" --into "$M_A" 2>&1)"; rc=$?
+ok "#1336 merge closes the duplicate" '[ "$rc" = 0 ] && grep -q "merged into" <<<"$out"'
+row="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute('SELECT valid_to IS NOT NULL FROM peer_facts WHERE id=$M_B').fetchone()[0])")"
+evdup="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute('SELECT evidence FROM peer_facts WHERE id=$M_B').fetchone()[0])")"
+ok "#1336 dup row closed, history intact, merged-away marker kept" \
+  '[ "$row" = 1 ] && [[ "$evdup" == *"ev-b"* ]] && [[ "$evdup" == *"merged-away:#$M_A"* ]]'
+row="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute('SELECT valid_to IS NOT NULL FROM peer_facts WHERE id=$M_A').fetchone()[0])")"
+ok "#1336 survivor stays open" '[ "$row" = 0 ]'
+sur="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute('SELECT evidence FROM peer_facts WHERE id=$M_A').fetchone()[0])")"
+ok "#1336 survivor evidence carries the merged marker" '[[ "$sur" == *"merged:#$M_B"* ]]'
+out="$(python3 "$NP" merge "$M_B" --into "$M_A" 2>&1)"; rc=$?
+ok "#1336 re-merge of a closed duplicate fails closed" '[ "$rc" != 0 ] && grep -q "already closed" <<<"$out"'
+out="$(python3 "$NP" merge "$M_A" --into "$M_A" 2>&1)"; rc=$?
+ok "#1336 self-merge rejected" '[ "$rc" != 0 ]'
+out="$(python3 "$NP" merge 999999 --into "$M_A" 2>&1)"; rc=$?
+ok "#1336 unknown fact rejected" '[ "$rc" != 0 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

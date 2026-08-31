@@ -323,5 +323,39 @@ ok "local parser rejects overlong Codex rationale fail-closed" '[ "$(review_of "
 ok "overlong output body is absent from audit" \
   'grep -q '\''"codex:schema-invalid"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "xxxxxxxxxxxxxxxx" "$NUNCHI_HOME/judge-audit.jsonl"'
 
+# ---- #1336: TTL-imminent observation evidence is annotated, not silent -----
+TTLFIX="$TMP/ttl-fixture.py"
+cat > "$TTLFIX" <<'FIXTURE'
+import importlib.util, sys
+from datetime import datetime, timedelta, timezone
+spec = importlib.util.spec_from_file_location("jb_ttl", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["jb_ttl"] = m
+spec.loader.exec_module(m)
+now = datetime.now(timezone.utc)
+# 6.5-day-old observation against the default 7d TTL -> within 24h of expiry
+note = m.observation_ttl_note((now - timedelta(days=6, hours=12)).isoformat())
+assert note.startswith("observation evidence expires in ~"), note
+# young evidence -> silent
+assert m.observation_ttl_note((now - timedelta(days=1)).isoformat()) == "", "young"
+# sweep disabled -> always silent (policy: no sweep, no expiry race)
+m.nunchi._OBSERVATION_TTL_DAYS = 0
+assert m.observation_ttl_note((now - timedelta(days=30)).isoformat()) == "", "disabled"
+m.nunchi._OBSERVATION_TTL_DAYS = 7
+# garbage timestamp -> silent (never block a batch on formatting)
+assert m.observation_ttl_note("not-a-date") == "", "garbage"
+# the judge prompt carries the note only for near-expiry observations
+item_old = (11, "user", "observation", "aging evidence", 1,
+            (now - timedelta(days=6, hours=12)).isoformat(), "")
+item_fact = (12, "user", "fact", "durable evidence", 1,
+             (now - timedelta(days=6, hours=12)).isoformat(), "")
+sibs = [(21, "sibling fact")]
+assert "Evidence-weight note" in m.build_judge_prompt(item_old, sibs), "prompt-note"
+assert "Evidence-weight note" not in m.build_judge_prompt(item_fact, sibs), "prompt-clean"
+print("TTL-NOTE-OK")
+FIXTURE
+python3 "$TTLFIX" "$JB" >/dev/null 2>&1; rc=$?
+ok "#1336 TTL-imminent observation evidence annotated in the judge prompt" '[ "$rc" = 0 ]'
+
 printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

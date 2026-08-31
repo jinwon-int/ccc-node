@@ -47,6 +47,7 @@ Usage:
   nunchi.py dialectic <query> [--target T]   # facts + MemPalace + Haiku
   nunchi.py synthesize <query>               # answer from stdin evidence (bench Wiki layer)
   nunchi.py supersede <fact_id> <new text>   # close old, insert new
+  nunchi.py merge <dup_id> --into <fact_id>  # fold a duplicate into its survivor (#1336)
   nunchi.py annotate <fact_id> --because <reason>  # backfill a decision's reason
   nunchi.py snapshot [--limit N]             # SessionStart-ready summary
   nunchi.py review-stale [--close]           # G1 retro pass over old facts
@@ -925,6 +926,44 @@ def supersede(fid, new_text):
     print(f"#{fid} closed; inserted successor")
 
 
+def merge(dup_id, survivor_id):
+    """#1336 — fold a duplicate fact into its survivor. Closes the duplicate
+    and stamps a greppable merge lineage into BOTH evidence fields; no new
+    text is inserted, which is the point: supersede replaces text and therefore
+    multiplies facts, while merge shrinks them. The full history of the
+    duplicate (fact, evidence, because, dates) stays on its own row, so this
+    is reversible by hand exactly like supersede (clear valid_to)."""
+    if dup_id == survivor_id:
+        sys.exit("merge: duplicate and survivor are the same fact")
+    c = db()
+    dup = c.execute(
+        "SELECT fact, evidence, valid_to FROM peer_facts WHERE id=?", (dup_id,)).fetchone()
+    survivor = c.execute(
+        "SELECT fact, evidence, valid_to FROM peer_facts WHERE id=?", (survivor_id,)).fetchone()
+    if not dup:
+        sys.exit(f"no fact #{dup_id}")
+    if not survivor:
+        sys.exit(f"no fact #{survivor_id}")
+    if dup[2] is not None:
+        sys.exit(f"#{dup_id} is already closed ({dup[2]}) — nothing to merge")
+    if survivor[2] is not None:
+        sys.exit(f"#{survivor_id} is closed — the merge survivor must be open")
+    marker = f"merged:#{dup_id}"
+    survivor_evidence = ((survivor[1] or "") + " " + marker).strip()
+    if marker in (survivor[1] or "").split():
+        print(f"#{dup_id} already merged into #{survivor_id} — nothing to do")
+        return
+    stamp = now()
+    c.execute("UPDATE peer_facts SET valid_to=?, evidence=? WHERE id=?",
+              (stamp, ((dup[1] or "") + f" merged-away:#{survivor_id}").strip(), dup_id))
+    c.execute("UPDATE peer_facts SET evidence=? WHERE id=?", (survivor_evidence, survivor_id))
+    c.commit()
+    print(f"#{dup_id} merged into #{survivor_id}")
+    print(f"  duplicate: {dup[0][:90]}")
+    print(f"  closed {stamp}; history intact on #{dup_id}; audit markers in evidence")
+    print(f"  survivor review flag unchanged — clear if resolved: nunchi.py review {survivor_id} --clear")
+
+
 def snapshot(limit):
     c = db()
     _close_expired_observations(c)
@@ -1013,7 +1052,8 @@ def review(fact_id=None, clear=False):
     for fid, o, k, f, r in rows:
         print(f"#{fid} rank={r} {o} ({k}) {f}")
     print(f"{len(rows)} pending — clear: nunchi.py review <id> --clear;"
-          " replace: nunchi.py supersede <id> <new text>")
+          " replace: nunchi.py supersede <id> <new text>;"
+          " fold a duplicate: nunchi.py merge <dup_id> --into <id>")
 
 
 def review_stale(do_close):
@@ -1118,6 +1158,10 @@ if __name__ == "__main__":
         annotate(int(args[0]), flag("--because", ""))
     elif cmd == "supersede":
         supersede(int(args[0]), args[1])
+    elif cmd == "merge":
+        if len(args) != 3 or args[1] != "--into":
+            sys.exit("usage: nunchi.py merge <dup_id> --into <survivor_id>")
+        merge(int(args[0]), int(args[2]))
     elif cmd == "snapshot":
         snapshot(int(flag("--limit", 25)))
     elif cmd == "review":
