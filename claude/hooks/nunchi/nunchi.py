@@ -612,7 +612,12 @@ def recall(query, target, limit):
 # silent failure this guards against.
 SYNTH_UNAVAILABLE_RE = re.compile(
     "Not logged in|Please run /login|Invalid API key|authentication_error"
-    "|insufficient_quota|rate_limit_exceeded",
+    "|insufficient_quota|rate_limit_exceeded"
+    # #1210 — nunchi.py's own graceful-degradation notice and the provider's
+    # quota text passed through verbatim. Unrecognized, both came back as
+    # "answers" (nosuk/gongyung 2026-08-24/08-31). Kept byte-identical to
+    # bench.sh's INVALID_RE default; nunchi.test.sh asserts the two stay in sync.
+    "|합성 백엔드 사용 불가|hit your weekly limit",
     re.IGNORECASE,
 )
 
