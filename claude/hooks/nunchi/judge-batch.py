@@ -234,12 +234,37 @@ JUDGE_SYSTEM = (
 )
 
 
-def build_judge_prompt(item, siblings):
-    fid, observed, kind, text, rank, _created, _because = item
-    sib_lines = "\n".join(f"- #{sid}: {sfact}" for sid, sfact in siblings[:5])
-    return f"""Flagged fact #{fid} (kind={kind}, observed={observed}, source_rank={rank}):
-{text}
+def observation_ttl_note(created):
+    """#1336 — codified evidence-weight policy for the TTL race. The
+    deterministic pass re-finds live siblings at batch time, but an observation
+    within 24h of the NUNCHI_OBSERVATION_TTL_DAYS sweep can evaporate between
+    the judge's verdict and the human who acts on the report. Wherever such
+    evidence is judged, the note travels with the decision (prompt, decision
+    dict, audit line, report row) so the reduced durability is explicit instead
+    of silent. Returns "" when there is no TTL concern or the sweep is disabled."""
+    if nunchi._OBSERVATION_TTL_DAYS <= 0:
+        return ""
+    try:
+        created_dt = datetime.fromisoformat(created)
+    except (TypeError, ValueError):
+        return ""
+    age_h = (datetime.now(timezone.utc) - created_dt).total_seconds() / 3600.0
+    remaining_h = nunchi._OBSERVATION_TTL_DAYS * 24.0 - age_h
+    if remaining_h >= 24.0:
+        return ""
+    return f"observation evidence expires in ~{max(int(remaining_h), 0)}h (TTL sweep)"
 
+
+def build_judge_prompt(item, siblings):
+    fid, observed, kind, text, rank, created, _because = item
+    sib_lines = "\n".join(f"- #{sid}: {sfact}" for sid, sfact in siblings[:5])
+    ttl_note = observation_ttl_note(created) if kind == "observation" else ""
+    ttl_line = (
+        f"\nEvidence-weight note: {ttl_note} — treat this evidence as aging,"
+        " lower-confidence input.\n" if ttl_note else ""
+    )
+    return f"""Flagged fact #{fid} (kind={kind}, observed={observed}, source_rank={rank}):
+{text}{ttl_line}
 Open sibling fact(s) with high overlap:
 {sib_lines}
 
@@ -546,6 +571,10 @@ def triage_queue(conn, queue):
                 "supersede_proposal": verdict["supersede_proposal"],
                 "backend": verdict["backend"],
                 "attempts": verdict["attempts"],
+                # #1336 — TTL-imminent observation evidence is surfaced in the
+                # prompt, audit line, and report so the reduced durability of
+                # the verdict is never silent.
+                "ttl_note": observation_ttl_note(item[5]) if item[2] == "observation" else "",
             })
     return decisions
 
@@ -594,6 +623,8 @@ def build_report(stamp, decisions, clears, humans, applied, backup):
         lines += ["", "| id | class | backend | verdict | rationale |", "|---|---|---|---|---|"]
         for d in decisions:
             rationale = d["rationale"].replace("|", "\\|")
+            if d.get("ttl_note"):
+                rationale += f" ⏳ {d['ttl_note']}".replace("|", "\\|")
             backend = d.get("backend") or "—"
             lines.append(
                 f"| #{d['id']} | {d['class']} | {backend} | {d['verdict']} | {rationale} |"
