@@ -107,6 +107,11 @@ class Config:
     revise_daily_cap: int
     review_llm_cmd: tuple[str, ...]
     autonomy: str
+    # Optional secondary brokers (#2024). Each entry: {name, ssh_host,
+    # broker_url, nexus_dir, secret_cmd} where secret_cmd is a REMOTE shell
+    # command that prints that broker's edge secret — the value itself never
+    # leaves the remote host. Empty tuple = single-broker behavior (default).
+    remote_brokers: tuple[dict[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,6 +131,51 @@ class Candidate:
     source_dir: Path
     files: tuple[SnapshotFile, ...]
     description: str
+
+
+def _parse_remote_brokers(raw: str) -> tuple[dict[str, str], ...]:
+    """Parse the optional CCC_SKILL_PROMOTION_REMOTE_BROKERS registry (#2024).
+    Each entry names one secondary broker reachable only from its own host:
+    dispatch/poll commands run over SSH on that host and the edge secret is
+    read remotely via secret_cmd, so the value never transits this node.
+    Invalid or incomplete entries are dropped — mirroring is opt-in and
+    fail-safe, never a reason to fail the single-broker path."""
+    if not raw or not raw.strip():
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    brokers: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        ssh_host = entry.get("ssh_host")
+        broker_url = entry.get("broker_url")
+        nexus_dir = entry.get("nexus_dir")
+        secret_cmd = entry.get("secret_cmd")
+        if not all(isinstance(value, str) and value.strip() for value in (name, ssh_host, broker_url, nexus_dir, secret_cmd)):
+            continue
+        if not re.match(r"^https?://", broker_url):
+            continue
+        clean_name = name.strip()
+        if clean_name in seen or clean_name == "primary":
+            continue
+        seen.add(clean_name)
+        brokers.append(
+            {
+                "name": clean_name,
+                "ssh_host": ssh_host.strip(),
+                "broker_url": broker_url.strip().rstrip("/"),
+                "nexus_dir": nexus_dir.strip(),
+                "secret_cmd": secret_cmd.strip(),
+            }
+        )
+    return tuple(brokers)
 
 
 def _utc_now() -> str:
@@ -360,6 +410,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         revise_daily_cap=_bounded_int(env.get("CCC_SKILL_PROMOTION_REVISE_DAILY_CAP"), 3, 1, 8),
         review_llm_cmd=review_llm_cmd,
         autonomy=_autonomy_state(env, state_dir, trust_root=home),
+        remote_brokers=_parse_remote_brokers(env.get("CCC_SKILL_PROMOTION_REMOTE_BROKERS", "")),
     )
 
 
@@ -1434,6 +1485,7 @@ def _status(config: Config) -> dict[str, object]:
         "repo": config.repo,
         "max_prs_per_run": config.max_prs,
         "collect_nodes": list(config.collect_nodes),
+        "remote_brokers": [rb["name"] for rb in config.remote_brokers],
         "revise_enabled": config.revise_enabled,
         "revise_round_limit": config.revise_round_limit,
         "revise_daily_cap": config.revise_daily_cap,
@@ -1672,13 +1724,145 @@ def _broker_online_worker_ids(config: Config, secret: str) -> set[str]:
     return online
 
 
-def _dispatch_target_worker(config: Config, author_node: str, secret: str) -> str:
-    """Pick a reviewer that is actually homed on the target broker: keyring
-    workers minus the author, intersected with the broker's online workers.
-    A keyring worker registered on the OTHER broker would 404 at task creation
-    (#2011 rollout, 2026-08-29: daegyo is T2-homed while seoseo dispatches on
-    T1). The broker also enforces author disqualification independently."""
-    online = _broker_online_worker_ids(config, secret)
+def _remote_ssh_capture(config: Config, rb: dict[str, str], remote_script: str, *, timeout: int = 120) -> bytes:
+    """Run a shell snippet on the remote broker host and return stdout. The
+    snippet sources the edge secret remotely (rb.secret_cmd prints it on that
+    host) — the secret value itself never crosses to this node."""
+    completed = _run(["ssh", "-o", "BatchMode=yes", rb["ssh_host"], remote_script], timeout=timeout)
+    return completed.stdout
+
+
+def _remote_online_worker_ids(config: Config, rb: dict[str, str]) -> set[str]:
+    """Online worker ids on a remote broker. Uses the stale-inclusive read
+    path and filters on the projected status, because older brokers return an
+    empty default list for fresh registrations."""
+    try:
+        payload = json.loads(
+            _remote_ssh_capture(
+                config,
+                rb,
+                'S=$(' + rb["secret_cmd"] + ') || exit 75\n'
+                'curl -fsS -H "x-a2a-edge-secret: $S" "' + rb["broker_url"] + '/workers?include=stale_read_path&limit=100"\n',
+            ).decode("utf-8")
+        )
+    except (PromotionError, UnicodeDecodeError, json.JSONDecodeError):
+        return set()
+    items = payload.get("items") if isinstance(payload, dict) else None
+    online: set[str] = set()
+    if isinstance(items, list):
+        for row in items:
+            node_id = row.get("nodeId") if isinstance(row, dict) else None
+            if isinstance(node_id, str) and node_id.strip() and row.get("status") == "online":
+                online.add(node_id.strip())
+    return online
+
+
+def _remote_broker_id(config: Config, rb: dict[str, str]) -> str:
+    payload = json.loads(
+        _remote_ssh_capture(
+            config,
+            rb,
+            'S=$(' + rb["secret_cmd"] + ') || exit 75\n'
+            'curl -fsS -H "x-a2a-edge-secret: $S" "' + rb["broker_url"] + '/health"\n',
+        ).decode("utf-8")
+    )
+    broker_id = payload.get("brokerId") if isinstance(payload, dict) else None
+    if not isinstance(broker_id, str) or not broker_id.strip():
+        raise PromotionError("dispatch_broker_id_missing")
+    return broker_id.strip()
+
+
+def _remote_broker_task(config: Config, rb: dict[str, str], task_id: str) -> dict[str, object]:
+    payload = json.loads(
+        _remote_ssh_capture(
+            config,
+            rb,
+            'S=$(' + rb["secret_cmd"] + ') || exit 75\n'
+            'curl -fsS -H "x-a2a-edge-secret: $S" "' + rb["broker_url"] + '/tasks/' + task_id + '"\n',
+        ).decode("utf-8")
+    )
+    if not isinstance(payload, dict):
+        raise PromotionError("dispatch_broker_unreachable")
+    return payload
+
+
+def _remote_dispatch_round(config: Config, rb: dict[str, str], manifest: dict[str, object]) -> dict[str, object]:
+    """Run the a2a-nexus dispatcher on the remote broker host against its own
+    loopback broker. The manifest is copied over — never the secret."""
+    remote_manifest = f"/tmp/dispatch-manifest-{manifest['roundId']}.json"
+    descriptor, local_manifest = tempfile.mkstemp(
+        prefix=f"remote-dispatch-{rb['name']}-", suffix=".json", dir=config.promotion_state_dir
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False)
+        _run(["scp", "-q", str(local_manifest), f"{rb['ssh_host']}:{remote_manifest}"])
+    finally:
+        try:
+            os.unlink(local_manifest)
+        except OSError:
+            pass
+    script = (
+        'set -eu\n'
+        'S=$(' + rb["secret_cmd"] + ')\n'
+        '[ -n "$S" ]\n'
+        'cd ' + json.dumps(rb["nexus_dir"]) + '\n'
+        'A2A_EDGE_SECRET="$S" node scripts/a2a-dispatch-round.mjs --manifest ' + json.dumps(remote_manifest) + ' --verify --json\n'
+        'rm -f ' + json.dumps(remote_manifest) + '\n'
+    )
+    try:
+        stdout = _remote_ssh_capture(config, rb, script, timeout=300)
+        result = json.loads(stdout.decode("utf-8"))
+    except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PromotionError(f"dispatch_round_failed: {str(error)[:100]}") from error
+    if not isinstance(result, dict):
+        raise PromotionError("dispatch_round_failed")
+    return result
+
+
+def _broker_for_row(config: Config, row: dict[str, object]) -> dict[str, str] | None:
+    """Resolve the broker a ledger row was dispatched on. Rows written before
+    #2024 (and 'primary') route to the local broker."""
+    name = row.get("broker")
+    if not isinstance(name, str):
+        return None
+    for rb in config.remote_brokers:
+        if rb["name"] == name:
+            return rb
+    return None
+
+
+def _broker_task_on(config: Config, row: dict[str, object], task_id: str, secret: str) -> dict[str, object]:
+    rb = _broker_for_row(config, row)
+    if rb is None:
+        return _broker_task(config, task_id, secret)
+    return _remote_broker_task(config, rb, task_id)
+
+
+def _dispatch_target_worker(config: Config, author_node: str, secret: str) -> tuple[str, dict[str, str] | None]:
+    """Pick a reviewer for the dispatch target broker: keyring workers minus
+    the author, intersected with that broker's online workers. A keyring
+    worker registered on the OTHER broker would 404 at task creation (#2011
+    rollout, 2026-08-29: daegyo is T2-homed while seoseo dispatches on T1).
+    The broker also enforces author disqualification independently.
+
+    #2024: the primary broker is searched first (unchanged behavior), then
+    each configured remote broker in order. Returns (node, remote_broker)
+    where remote_broker is None for the primary."""
+    keyring_workers = _keyring_worker_ids(config)
+    primary = _broker_online_worker_ids(config, secret)
+    candidates = sorted(w for w in keyring_workers if w != author_node and w in primary)
+    if candidates:
+        return candidates[0], None
+    for rb in config.remote_brokers:
+        online = _remote_online_worker_ids(config, rb)
+        candidates = sorted(w for w in keyring_workers if w != author_node and w in online)
+        if candidates:
+            return candidates[0], rb
+    raise PromotionError("dispatch_no_reviewer_online")
+
+
+def _keyring_worker_ids(config: Config) -> list[str]:
     completed = _run(
         ["gh", "api", f"repos/{config.repo}/contents/refs/a2a-public-keyring.json?ref={config.base}"]
     )
@@ -1692,11 +1876,9 @@ def _dispatch_target_worker(config: Config, author_node: str, secret: str) -> st
     if isinstance(keys, dict):
         for key_id in sorted(keys):
             match = re.fullmatch(r"worker:([a-z0-9_-]{2,32}):g\d+:v\d+", key_id)
-            if match and match.group(1) != author_node and match.group(1) in online:
+            if match:
                 workers.append(match.group(1))
-    if not workers:
-        raise PromotionError("dispatch_no_reviewer_online")
-    return workers[0]
+    return workers
 
 
 def _branch_head_sha(config: Config, branch: str) -> str:
@@ -1738,6 +1920,7 @@ def _build_dispatch_manifest(  # noqa: C901
     head: str,
     reviewer: str,
     broker_id: str,
+    broker_url: str | None = None,
     procedure: str,
     inventory: list[dict[str, str]],
     now: str,
@@ -1752,7 +1935,7 @@ def _build_dispatch_manifest(  # noqa: C901
     task_id = f"{_INTAKE_LANE}-pr{pr_number}-{candidate.node}-{now}"
     return {
         "roundId": round_id,
-        "brokerUrl": config.broker_url,
+        "brokerUrl": broker_url or config.broker_url,
         "requester": {"id": config.node, "role": "operator"},
         "defaults": {"intent": _INTAKE_LANE},
         "lanes": [
@@ -1853,9 +2036,6 @@ def _dispatch_intake_review(  # noqa: C901
     if pr_match is None:
         return {"outcome": "dispatch-skipped", "code": "dispatch_no_pr_number"}
     pr_number = pr_match.group(1)
-    nexus_script = config.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"
-    if not nexus_script.is_file():
-        return {"outcome": "dispatch-skipped", "code": "dispatch_nexus_missing"}
     secret = os.environ.get("A2A_EDGE_SECRET", "")
     if not secret:
         return {"outcome": "dispatch-skipped", "code": "dispatch_secret_missing"}
@@ -1888,39 +2068,53 @@ def _dispatch_intake_review(  # noqa: C901
             doc_name="skills-intake-review.md",
             end_marker=_DISPATCH_DOC_END,
         )
-        reviewer = _dispatch_target_worker(config, candidate.node, secret)
-        broker_id = _broker_id(config, secret)
+        reviewer, review_rb = _dispatch_target_worker(config, candidate.node, secret)
+        if review_rb is None:
+            nexus_script = config.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"
+            if not nexus_script.is_file():
+                return {"outcome": "dispatch-skipped", "code": "dispatch_nexus_missing"}
+            broker_id = _broker_id(config, secret)
+            broker_url = config.broker_url
+        else:
+            broker_id = _remote_broker_id(config, review_rb)
+            broker_url = review_rb["broker_url"]
         inventory = _inventory_snapshot(config)
         now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         manifest = _build_dispatch_manifest(
             config, candidate,
             pr_number=pr_number, branch=branch, head=head, reviewer=reviewer,
-            broker_id=broker_id, procedure=procedure, inventory=inventory, now=now,
+            broker_id=broker_id, broker_url=broker_url, procedure=procedure, inventory=inventory, now=now,
         )
     except PromotionError as error:
         return {"outcome": "dispatch-skipped", "code": error.code}
-    descriptor, manifest_path = tempfile.mkstemp(
-        prefix="dispatch-manifest-", suffix=".json", dir=config.promotion_state_dir
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(manifest, handle, ensure_ascii=False)
-        env = dict(os.environ)
-        env["A2A_EDGE_SECRET"] = secret
+    if review_rb is None:
+        descriptor, manifest_path = tempfile.mkstemp(
+            prefix="dispatch-manifest-", suffix=".json", dir=config.promotion_state_dir
+        )
         try:
-            completed = _run(
-                ["node", str(nexus_script), "--manifest", str(manifest_path), "--verify", "--json"],
-                env=env,
-                timeout=300,
-            )
-            result = json.loads(completed.stdout.decode("utf-8"))
-        except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, ensure_ascii=False)
+            env = dict(os.environ)
+            env["A2A_EDGE_SECRET"] = secret
+            try:
+                completed = _run(
+                    ["node", str(nexus_script), "--manifest", str(manifest_path), "--verify", "--json"],
+                    env=env,
+                    timeout=300,
+                )
+                result = json.loads(completed.stdout.decode("utf-8"))
+            except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                return {"outcome": "dispatch-skipped", "code": "dispatch_round_failed", "detail": str(error)[:120]}
+        finally:
+            try:
+                os.unlink(manifest_path)
+            except OSError:
+                pass
+    else:
+        try:
+            result = _remote_dispatch_round(config, review_rb, manifest)
+        except PromotionError as error:
             return {"outcome": "dispatch-skipped", "code": "dispatch_round_failed", "detail": str(error)[:120]}
-    finally:
-        try:
-            os.unlink(manifest_path)
-        except OSError:
-            pass
     rows = result.get("results") if isinstance(result, dict) else None
     created = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else None
     dispatched_task = created.get("taskId") if created else None
@@ -1940,6 +2134,7 @@ def _dispatch_intake_review(  # noqa: C901
             "dispatched_task": dispatched_task,
             "reviewer_node": reviewer,
             "broker_id": broker_id,
+            "broker": review_rb["name"] if review_rb else "primary",
             "pr_url": url,
             "node": candidate.node,
             "provider": candidate.provider,
@@ -2271,13 +2466,14 @@ def _build_revise_manifest(
     skill_files: list[dict[str, str]],
     procedure: str,
     broker_id: str,
+    broker_url: str | None = None,
     now: str,
 ) -> dict[str, object]:
     task_id = f"{_REVISE_LANE}-pr{pr_number}-{node}-{now}"
     round_id = f"{_REVISE_LANE}-pr{pr_number}-r{round_no}-{head[:8]}-{now}"
     return {
         "roundId": round_id,
-        "brokerUrl": config.broker_url,
+        "brokerUrl": broker_url or config.broker_url,
         "requester": {"id": config.node, "role": "operator"},
         "defaults": {"intent": _REVISE_LANE},
         "lanes": [
@@ -2388,6 +2584,55 @@ def _revise_dispatch_target(
     return node, name, tree12, pr, str(provider), head, pr_url
 
 
+def _revise_target_broker(config: Config, node: str, secret: str) -> dict[str, str] | None:
+    """Broker where the author node is currently online (#2024): primary
+    first, then each configured remote broker. None = primary. Raises
+    revise_author_offline when the author is online nowhere — the revise
+    round then stays skipped exactly as in the single-broker world."""
+    if node in _broker_online_worker_ids(config, secret):
+        return None
+    for rb in config.remote_brokers:
+        if node in _remote_online_worker_ids(config, rb):
+            return rb
+    raise PromotionError("revise_author_offline")
+
+
+def _run_revise_round(
+    config: Config,
+    revise_rb: dict[str, str] | None,
+    secret: str,
+    manifest: dict[str, object],
+    nexus_script,
+) -> dict[str, object]:
+    """Dispatch one revise round on the resolved broker (primary locally, or
+    the author-homed remote broker over SSH). Returns the dispatcher result
+    JSON; raises PromotionError(revise_round_failed: …) on any transport or
+    parse failure."""
+    if revise_rb is not None:
+        return _remote_dispatch_round(config, revise_rb, manifest)
+    descriptor, manifest_path = tempfile.mkstemp(
+        prefix="revise-manifest-", suffix=".json", dir=config.promotion_state_dir
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False)
+        env = dict(os.environ)
+        env["A2A_EDGE_SECRET"] = secret
+        completed = _run(
+            ["node", str(nexus_script), "--manifest", str(manifest_path), "--verify", "--json"],
+            env=env,
+            timeout=300,
+        )
+        return json.loads(completed.stdout.decode("utf-8"))
+    except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PromotionError(f"revise_round_failed: {str(error)[:100]}") from error
+    finally:
+        try:
+            os.unlink(manifest_path)
+        except OSError:
+            pass
+
+
 def _dispatch_intake_revise(
     config: Config,
     row: dict[str, object],
@@ -2438,14 +2683,20 @@ def _dispatch_intake_revise(
     if _revise_dispatched(rows, pr, head):
         return {"outcome": "revise-skipped", "code": "revise_already"}
     secret = os.environ["A2A_EDGE_SECRET"]
+    # #2024: the author node may be homed on a secondary broker. Dispatch the
+    # revision where the author is actually online — primary first, then each
+    # configured remote broker. Same codes when nowhere online.
     nexus_script = config.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"
     if not nexus_script.is_file():
         return {"outcome": "revise-skipped", "code": "revise_nexus_missing"}
     try:
-        online = _broker_online_worker_ids(config, secret)
-        if node not in online:
-            return {"outcome": "revise-skipped", "code": "revise_author_offline"}
-        broker_id = _broker_id(config, secret)
+        revise_rb = _revise_target_broker(config, node, secret)
+        if revise_rb is None:
+            broker_id = _broker_id(config, secret)
+            broker_url = config.broker_url
+        else:
+            broker_id = _remote_broker_id(config, revise_rb)
+            broker_url = revise_rb["broker_url"]
         procedure = _worker_procedure_from_docs(
             config.a2a_nexus_dir, doc_name=_REVISE_DOC_NAME, end_marker=_REVISE_DOC_END
         )
@@ -2477,32 +2728,15 @@ def _dispatch_intake_revise(
             skill_files=skill_files,
             procedure=procedure,
             broker_id=broker_id,
+            broker_url=broker_url,
             now=now,
         )
     except PromotionError as error:
         return {"outcome": "revise-skipped", "code": error.code}
-    descriptor, manifest_path = tempfile.mkstemp(
-        prefix="revise-manifest-", suffix=".json", dir=config.promotion_state_dir
-    )
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(manifest, handle, ensure_ascii=False)
-        env = dict(os.environ)
-        env["A2A_EDGE_SECRET"] = secret
-        try:
-            completed = _run(
-                ["node", str(nexus_script), "--manifest", str(manifest_path), "--verify", "--json"],
-                env=env,
-                timeout=300,
-            )
-            result = json.loads(completed.stdout.decode("utf-8"))
-        except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            return {"outcome": "revise-skipped", "code": "revise_round_failed", "detail": str(error)[:120]}
-    finally:
-        try:
-            os.unlink(manifest_path)
-        except OSError:
-            pass
+        result = _run_revise_round(config, revise_rb, secret, manifest, nexus_script)
+    except PromotionError as error:
+        return {"outcome": "revise-skipped", "code": "revise_round_failed", "detail": str(error)[:120]}
     dispatch_rows = result.get("results") if isinstance(result, dict) else None
     created = dispatch_rows[0] if isinstance(dispatch_rows, list) and dispatch_rows and isinstance(dispatch_rows[0], dict) else None
     dispatched_task = created.get("taskId") if created else None
@@ -2526,6 +2760,7 @@ def _dispatch_intake_revise(
         "round": round_no,
         "reviser_node": node,
         "broker_id": broker_id,
+        "broker": revise_rb["name"] if revise_rb else "primary",
     }
     _append_ledger(config, record)
     rows.append(record)
@@ -2575,7 +2810,7 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
             processed.append({"outcome": "would-poll-verdict", "task_id": dispatched})
             continue
         try:
-            task = _broker_task(config, dispatched, os.environ.get("A2A_EDGE_SECRET", ""))
+            task = _broker_task_on(config, row, dispatched, os.environ.get("A2A_EDGE_SECRET", ""))
         except PromotionError:
             processed.append({"outcome": "verdict-pending", "task_id": dispatched})
             continue
@@ -2660,7 +2895,7 @@ def _consume_revise_results(config: Config, *, dry_run: bool) -> list[dict[str, 
             results.append({"outcome": "would-poll-revise", "task_id": task_id})
             continue
         try:
-            task = _broker_task(config, str(task_id), os.environ.get("A2A_EDGE_SECRET", ""))
+            task = _broker_task_on(config, row, str(task_id), os.environ.get("A2A_EDGE_SECRET", ""))
         except PromotionError:
             results.append({"outcome": "revise-pending", "task_id": task_id})
             continue

@@ -663,3 +663,31 @@ selects the install surface), `CODEX_SKILLS_DIR` (Codex install target override,
 default `${CODEX_HOME:-~/.codex}/skills`),
 `CCC_CODEX_SKILL_COLLECTOR` (Codex-only candidate collection, default true),
 `CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP` (default 1, range 1–10).
+
+## Dual-broker review dispatch (#2024)
+
+The intake review lane and its R2 revision round are broker-routed:
+
+- **Primary broker** — `CCC_SKILL_PROMOTION_BROKER_URL` (default
+  `http://127.0.0.1:8787`) with `A2A_EDGE_SECRET` from the local environment.
+  Reviewers are keyring workers minus the author, intersected with the
+  broker's online workers (unchanged behavior).
+- **Remote brokers** — optional registry in
+  `CCC_SKILL_PROMOTION_REMOTE_BROKERS` (JSON array). Each entry:
+  `{"name", "ssh_host", "broker_url", "nexus_dir", "secret_cmd"}` where
+  `nexus_dir` is the dispatcher checkout on that host and `secret_cmd` is a
+  remote shell command that prints that broker's edge secret. The secret is
+  evaluated only on the remote host — dispatch and polling run over SSH
+  there, and the value never transits the publisher node.
+
+Review dispatch prefers the primary broker and falls through to the remote
+brokers when no eligible reviewer is online there (e.g. a whole-broker outage
+or an exhausted reviewer pool). The R2 revision round is dispatched to the
+broker where the AUTHOR node is online, so an author homed on the secondary
+broker receives its revision task there; when the author is online on no
+configured broker the round is skipped with `revise_author_offline` as before.
+
+Verdict and revision-result polling route through the broker recorded on each
+ledger row (`"broker": "primary" | <name>`); rows written before #2024
+continue to poll the primary broker. Every recorded verdict still lands in
+the promotion ledger, so a broker outage delays consumption but loses nothing.

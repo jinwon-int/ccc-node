@@ -973,5 +973,105 @@ FIXTURE
 python3 "$NVE_FIXTURE" "$PROMOTER" >/dev/null 2>&1; rc=$?
 ok "publisher binds negative verdict evidence from failed review tasks" '[ "$rc" = 0 ]'
 
+# ---- #2024: remote broker mirroring — parser + reviewer fallthrough + task routing ----
+RB_STATE="$TMP/rb-state"
+mkdir -p "$RB_STATE"
+RB_JSON='[{"name":"t2","ssh_host":"gwakga-stub","broker_url":"http://127.0.0.1:8787","nexus_dir":"/remote/nexus","secret_cmd":"cat /remote/edge-secret"}]'
+
+cat > "$BIN/gh" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+for argument in "$@"; do
+  case "$argument" in
+    *a2a-public-keyring*)
+      printf '{"content":"%s"}' "$(printf '{"keys":{"worker:authorx:g1:v1":{},"worker:t2reviewer:g1:v1":{}}}' | base64 -w0)"
+      exit 0
+      ;;
+  esac
+done
+exit 1
+STUB
+chmod +x "$BIN/gh"
+
+cat > "$BIN/curl" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >> "$RB_STATE/curl-calls"
+case " $* " in
+  *"/health"*) printf '{"brokerId":"primary-broker"}' ;;
+  *"/workers"*) printf '{"items":[{"nodeId":"authorx","status":"online"}]}' ;;
+  *) printf '{}' ;;
+esac
+STUB
+chmod +x "$BIN/curl"
+
+cat > "$BIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >> "$RB_STATE/ssh-calls"
+case " $* " in
+  *"/workers"*) printf '{"items":[{"nodeId":"t2reviewer","status":"online"},{"nodeId":"stale-one","status":"stale"}]}' ;;
+  *"/health"*) printf '{"brokerId":"t2-broker"}' ;;
+  *"/tasks/"*) printf '{"status":"running","id":"rv-x"}' ;;
+  *) exit 8 ;;
+esac
+STUB
+chmod +x "$BIN/ssh"
+
+cat > "$BIN/scp" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+exit 0
+STUB
+chmod +x "$BIN/scp"
+
+RB_FIXTURE="$TMP/rb-fixture.py"
+cat > "$RB_FIXTURE" <<FIXTURE
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location("csp_t2", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["csp_t2"] = m
+spec.loader.exec_module(m)
+
+assert m._parse_remote_brokers("") == ()
+assert m._parse_remote_brokers("not-json") == ()
+assert m._parse_remote_brokers("[]") == ()
+assert m._parse_remote_brokers('[{"name":"bad"}]') == ()
+assert m._parse_remote_brokers('[{"name":"primary","ssh_host":"x","broker_url":"http://x/","nexus_dir":"/n","secret_cmd":"c"}]') == ()
+good = m._parse_remote_brokers('[{"name":"t2","ssh_host":"h","broker_url":"http://127.0.0.1:8787/","nexus_dir":"/n","secret_cmd":"c"}]')
+assert len(good) == 1 and good[0]["broker_url"] == "http://127.0.0.1:8787"
+print("RB-PARSE-OK")
+
+config = m._config()
+assert [rb["name"] for rb in config.remote_brokers] == ["t2"], config.remote_brokers
+
+# Primary has only the author online -> fall through to the remote broker.
+reviewer, rb = m._dispatch_target_worker(config, "authorx", "s3cret-value")
+assert reviewer == "t2reviewer" and rb is not None and rb["name"] == "t2", (reviewer, rb)
+
+# Primary eligible path is unchanged when the author lives on the remote.
+reviewer2, rb2 = m._dispatch_target_worker(config, "t2reviewer", "s3cret-value")
+assert reviewer2 == "authorx" and rb2 is None, (reviewer2, rb2)
+
+# Row routing: 't2' row polls over ssh, legacy/primary row polls over curl.
+task = m._broker_task_on(config, {"broker": "t2"}, "rv-x", "s3cret-value")
+assert task.get("status") == "running", task
+task2 = m._broker_task_on(config, {"kind": "a2a-dispatch"}, "rv-y", "s3cret-value")
+assert isinstance(task2, dict)
+
+# The secret VALUE never crosses to this node — only the remote command text.
+ssh_calls = open(os.environ["RB_STATE"] + "/ssh-calls").read()
+assert "s3cret-value" not in ssh_calls, "edge secret leaked into ssh argv"
+assert "/remote/edge-secret" in ssh_calls
+print("RB-ROUTING-OK")
+FIXTURE
+env "${base_env[@]}" CCC_SKILL_PROMOTION_REMOTE_BROKERS="$RB_JSON" PATH="$BIN:$PATH" RB_STATE="$RB_STATE" \
+  python3 "$RB_FIXTURE" "$PROMOTER" > "$RB_STATE/out" 2>&1; rc=$?
+ok "remote broker parse, reviewer fallthrough, and task routing (#2024)" \
+  '[ "$rc" = 0 ] && grep -q "RB-PARSE-OK" "$RB_STATE/out" && grep -q "RB-ROUTING-OK" "$RB_STATE/out"'
+
+# The mirrored reviewer actually lands in the dispatch manifest (no local
+# dispatch here — the routing unit above covers broker selection).
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
