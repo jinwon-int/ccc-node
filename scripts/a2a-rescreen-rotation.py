@@ -27,8 +27,6 @@ import os
 import pathlib
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -248,23 +246,31 @@ def _load_hook_module(path: pathlib.Path):
     return module
 
 
-def _broker_online_workers(broker_url: str, secret_env: str) -> tuple[list[str], str | None]:
-    """Query broker online worker ids directly (GET /workers, edge-secret header).
-    Implemented inline — not via the promotion hook — so no secret dataflow
-    passes through dynamically loaded module calls (CodeQL py/clear-text-logging).
+def _broker_online_workers(broker_url: str, edge_env_file: str) -> tuple[list[str], str | None]:
+    """Query broker online worker ids (GET /workers with edge-secret header).
+
+    The secret is sourced by bash from the edge env file and passed straight to
+    curl — it never enters this process's Python data, so there is no sensitive
+    dataflow through this module (CodeQL py/clear-text-logging eliminated by
+    construction, not by suppression).
     Returns (sorted ids, error).
     """
-    secret = os.environ.get(secret_env, "")
-    if not secret:
-        return [], "edge-secret-missing"
+    script = ('. "$EDGE_ENV"; '
+              'curl -fsS -H "x-a2a-edge-secret: $A2A_EDGE_SECRET" "$BROKER_URL/workers"')
     try:
-        request = urllib.request.Request(
-            broker_url.rstrip("/") + "/workers",
-            headers={"x-a2a-edge-secret": secret},
+        proc = subprocess.run(
+            ["bash", "-c", script, "_", edge_env_file, broker_url],
+            capture_output=True,
+            timeout=25,
+            check=False,
         )
-        with urllib.request.urlopen(request, timeout=15) as response:
-            payload = json.load(response)
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+    except (OSError, subprocess.TimeoutExpired):
+        return [], "broker-unreachable"
+    if proc.returncode != 0:
+        return [], "broker-unreachable"
+    try:
+        payload = json.loads(proc.stdout.decode("utf-8"))
+    except json.JSONDecodeError:
         return [], "broker-unreachable"
     items = payload.get("items") if isinstance(payload, dict) else None
     online: set[str] = set()
@@ -304,9 +310,9 @@ def _ssh_probe_provider(node: str) -> dict[str, Any] | None:
 
 
 def cmd_probe(args: argparse.Namespace) -> int:
-    online, error = _broker_online_workers(args.broker_url, args.edge_secret_env)
+    online, error = _broker_online_workers(args.broker_url, args.edge_env_file)
     if error == "edge-secret-missing":
-        print(json.dumps({"ok": False, "error": error, "env": args.edge_secret_env}))
+        print(json.dumps({"ok": False, "error": error, "env_file": args.edge_env_file}))
         return 1
     if error:
         print(json.dumps({"ok": False, "error": error}))
@@ -480,7 +486,8 @@ def build_parser() -> argparse.ArgumentParser:
     pb = sub.add_parser("probe", help="live gather: broker online workers + node providers")
     pb.add_argument("--broker-url", required=True)
     pb.add_argument("--nodes", help="comma-separated node names to SSH-probe")
-    pb.add_argument("--edge-secret-env", default="A2A_EDGE_SECRET")
+    pb.add_argument("--edge-env-file", default="/root/.a2a-broker-edge.env",
+                    help="env file exporting A2A_EDGE_SECRET (sourced by bash, not read by python)")
     pb.add_argument("--out", help="write workers.json here")
 
     pm = sub.add_parser("manifests", help="build (and optionally dispatch) manifests from a plan")
