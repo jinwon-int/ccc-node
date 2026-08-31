@@ -111,3 +111,5 @@ operations.
   `scripts/ccc-version.sh` resolves the intended tag after `git fetch --tags`.
 - Creating/pushing tags and GitHub Releases is a separate release approval gate;
   do not do it as part of a normal PR without explicit operator approval.
+
+<!-- ruleset attribution check 2026-08-31 -->
