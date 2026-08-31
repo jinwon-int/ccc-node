@@ -26,7 +26,11 @@
 #
 # Procedure (run):
 #   1. take a lock; resolve the repo (env > repo file > script location > ~/ccc-node)
-#   2. preconditions: .git present, clean working tree, on the expected branch
+#   2. preconditions: .git present, clean working tree, on the expected branch.
+#      A wrong-branch stall self-recovers ONLY when the stray branch is fully
+#      pushed (origin has it at the exact local SHA) and the tree is clean —
+#      switching back then cannot lose anything (#1328). Every other
+#      wrong-branch shape stays fail-closed and notifies.
 #   3. git fetch + merge --ff-only (never rewrites local history)
 #   4. if HEAD changed (or --force): snapshot Claude + Hermes managed artifacts
 #      and the Codex GitHub policy config, run ./setup.sh, validate bridge
@@ -42,6 +46,8 @@
 #
 # Modes: run [--force] | status
 # Env: CCC_SELF_UPDATE_REPO, CCC_SELF_UPDATE_BRANCH (default main),
+#      CCC_SELF_UPDATE_AUTO_RECOVER (default 1; 0 restores the unconditional
+#      wrong-branch fail-closed abort, #1328),
 #      CCC_SELF_UPDATE_SYSTEMCTL (default systemctl; tests inject a fake),
 #      CCC_STATE_DIR, CCC_PUSH_SPOOL, CCC_NODE.
 # Idle gate: before touching anything the run defers (exit 8) while the telegram
@@ -111,7 +117,11 @@ notify() { # <text> <dedup-suffix>
   local node now fname
   node="${CCC_NODE:-$(hostname -s 2>/dev/null || echo node)}"
   now="$(ts)"
-  fname="$SPOOL/$(printf '%s' "$now" | tr ':' '-')-SelfUpdate-$$.json"
+  # $RANDOM in the name: one run can legitimately emit TWO notifies (e.g. the
+  # #1328 wrong-branch recovery notice followed by the completion notice), and
+  # a second-resolution timestamp + pid alone made the second file silently
+  # overwrite the first.
+  fname="$SPOOL/$(printf '%s' "$now" | tr ':' '-')-SelfUpdate-$$_$RANDOM.json"
   jq -nc --arg ts "$now" --arg node "$node" --arg text "$1" --arg d "$2" \
     '{ts:$ts, event:"SelfUpdate", node:$node, text:$text, dedup:("SelfUpdate:"+$d)}' \
     > "$fname" 2>/dev/null || rm -f "$fname" 2>/dev/null
@@ -247,6 +257,29 @@ reset_repo_to_old_sha() {
   git -C "$REPO" reset --hard "$OLD_SHA" >/dev/null 2>&1 || return 1
   [ "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" = "$OLD_SHA" ] || return 1
   [ -z "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]
+}
+
+# Lossless wrong-branch recovery (#1328): switch back to $BRANCH only when
+# nothing could possibly be lost. Three conditions, ALL verified; any failure
+# keeps the fail-closed abort:
+#   1. clean working tree — nothing uncommitted to strand
+#   2. origin already has the stray branch at the exact local HEAD — every
+#      commit is safe on the remote, so checking out $BRANCH loses nothing
+#      (the yukson 2026-08-27 recovery validated exactly this shape)
+#   3. local $BRANCH exists and the switch actually lands on it (a linked
+#      worktree holding $BRANCH makes git refuse — that state needs a human)
+# The stray branch ref itself is deliberately left in place: deleting refs is
+# a mutation beyond recovery's mandate.
+recover_stray_branch() { # <stray-branch>
+  [ -n "${1:-}" ] || return 1
+  [ -z "$(git -C "$REPO" status --porcelain 2>/dev/null)" ] || return 1
+  git -C "$REPO" fetch origin >/dev/null 2>&1 || return 1
+  local remote_sha
+  remote_sha="$(git -C "$REPO" rev-parse --verify --quiet "refs/remotes/origin/$1" 2>/dev/null)" || return 1
+  [ "$remote_sha" = "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" ] || return 1
+  git -C "$REPO" rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null 2>&1 || return 1
+  git -C "$REPO" checkout -q "$BRANCH" >/dev/null 2>&1 || return 1
+  [ "$(git -C "$REPO" symbolic-ref --short HEAD 2>/dev/null)" = "$BRANCH" ]
 }
 
 bridge_service_allowlisted() {
@@ -407,9 +440,22 @@ if [ ! -d "$REPO/.git" ]; then
 fi
 CUR_BRANCH="$(git -C "$REPO" symbolic-ref --short HEAD 2>/dev/null || echo '?')"
 if [ "$CUR_BRANCH" != "$BRANCH" ]; then
-  notify_stalled wrong-branch "self-update 정지: 레포가 '$CUR_BRANCH' 브랜치에 있습니다 (기대: '$BRANCH'). 이 노드는 복구 전까지 갱신되지 않습니다 — 관리 체크아웃은 '$BRANCH' 고정, 개발은 git worktree로 분리하세요." "branch=$CUR_BRANCH expected=$BRANCH"
-  say "self-update: repo is on '$CUR_BRANCH', expected '$BRANCH'; aborting (fail-closed)" >&2
-  exit 4
+  # #1328 proposal 2: a stray branch that is fully pushed with a clean tree is
+  # a stall the node can fix itself — switching back cannot lose anything.
+  # Anything else (unpushed commits, dirty tree, missing/double-checked-out
+  # '$BRANCH') must keep failing closed: auto-mutating around those could
+  # destroy the only copy of someone's work. This runs AFTER the bridge-busy
+  # gate above, so recovery never swaps the tree under a live session.
+  # Opt out with CCC_SELF_UPDATE_AUTO_RECOVER=0.
+  if [ "${CCC_SELF_UPDATE_AUTO_RECOVER:-1}" = "1" ] && recover_stray_branch "$CUR_BRANCH"; then
+    log "recover reason=wrong-branch from=$CUR_BRANCH sha=$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
+    notify "self-update: 관리 체크아웃이 '$CUR_BRANCH' 브랜치에 있었으나 커밋이 전부 원격에 있어(동일 SHA, clean tree) '$BRANCH'로 자동 복구했습니다. 브랜치 작업은 git worktree로 분리하세요. ~/.claude/state/self-update.log" "wrong-branch-recovered"
+    say "self-update: recovered from stray branch '$CUR_BRANCH' (fully pushed, clean tree) — back on '$BRANCH'"
+  else
+    notify_stalled wrong-branch "self-update 정지: 레포가 '$CUR_BRANCH' 브랜치에 있습니다 (기대: '$BRANCH'). 이 노드는 복구 전까지 갱신되지 않습니다 — 관리 체크아웃은 '$BRANCH' 고정, 개발은 git worktree로 분리하세요." "branch=$CUR_BRANCH expected=$BRANCH"
+    say "self-update: repo is on '$CUR_BRANCH', expected '$BRANCH'; aborting (fail-closed)" >&2
+    exit 4
+  fi
 fi
 if [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]; then
   notify_stalled dirty-tree "self-update 정지: $REPO 작업 트리에 미커밋 변경이 있습니다. 이 노드는 복구 전까지 갱신되지 않습니다."

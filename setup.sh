@@ -1045,6 +1045,45 @@ else
 fi
 note "Existing ccc-telegram-bridge systemd unit checked against the canonical renderer"
 
+# Managed-checkout guard hook (#1328): install a post-checkout warning into the
+# managed checkout's .git/hooks so creating/switching to a non-main branch here
+# is announced AT THE MOMENT it happens, instead of the node silently freezing
+# its harness updates until someone notices. Installs ONLY when THIS checkout is
+# the one self-update manages (same resolution order: env > self-update.repo >
+# this checkout) and is a normal checkout, never a dev worktree or a secondary
+# clone — matching CONTRIBUTING.md's worktree discipline. An existing
+# post-checkout hook without our marker is left untouched (never clobbered);
+# a marker hook is updated in place. Warn-only: CCC_MANAGED_CHECKOUT_GUARD=0
+# silences the installed hook.
+GUARD_SRC="$SRC/scripts/git-hooks/managed-checkout-guard"
+if [ -n "${CCC_SELF_UPDATE_REPO:-}" ]; then
+  MANAGED_REPO="$CCC_SELF_UPDATE_REPO"
+elif [ -f "$CLAUDE_DIR/self-update.repo" ]; then
+  MANAGED_REPO="$(head -1 "$CLAUDE_DIR/self-update.repo" | tr -d '[:space:]')"
+else
+  MANAGED_REPO="$(cd "$SRC" 2>/dev/null && pwd)"
+fi
+SRC_ABS="$(cd "$SRC" && pwd)"
+src_gitdir="$(cd "$SRC" && git rev-parse --git-dir 2>/dev/null || true)"
+src_commondir="$(cd "$SRC" && git rev-parse --git-common-dir 2>/dev/null || true)"
+GUARD_HOOK="$MANAGED_REPO/.git/hooks/post-checkout"
+if [ "$MANAGED_REPO" != "$SRC_ABS" ] || [ ! -d "$SRC/.git" ]; then
+  note "managed-checkout guard: this checkout is not the self-update managed repo ($MANAGED_REPO) — skipped"
+elif [ -z "$src_gitdir" ] || [ "$src_gitdir" != "$src_commondir" ]; then
+  note "managed-checkout guard: running from a linked worktree/bare checkout — skipped (install from the managed checkout)"
+elif [ -f "$GUARD_HOOK" ] && ! grep -q 'ccc-node:managed-checkout-guard' "$GUARD_HOOK"; then
+  note "managed-checkout guard: existing $GUARD_HOOK is not ours — left untouched"
+elif [ ! -f "$GUARD_SRC" ]; then
+  echo "ERROR: managed-checkout guard source missing: $GUARD_SRC" >&2
+  exit 2
+elif [ "$DRY" = 1 ]; then
+  note "would install managed-checkout guard -> $GUARD_HOOK"
+else
+  run atomic_install "$GUARD_SRC" "$GUARD_HOOK"
+  run chmod 755 "$GUARD_HOOK"
+  note "managed-checkout guard installed -> $GUARD_HOOK (warns when the checkout leaves the update branch; CCC_MANAGED_CHECKOUT_GUARD=0 disables)"
+fi
+
 # #968: Termux/Android hash-locked installs may need to build packages from
 # source (cryptography 50 has no Android wheel -> maturin -> Rust). A missing
 # toolchain killed the daegyo bridge on 2026-08-06 and the prerequisite lived
