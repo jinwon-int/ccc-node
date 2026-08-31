@@ -108,7 +108,13 @@ TARGET="${NUNCHI_BENCH_TARGET:-seo-jin-on}"
 OUT="$NUNCHI_HOME/bench-$(date +%Y%m%d).md"
 # Provider notices that mean "no answer was produced". Extended-regex,
 # case-insensitive, overridable per node for providers not covered here.
-INVALID_RE="${NUNCHI_BENCH_INVALID_RE:-Not logged in|Please run /login|Invalid API key|authentication_error|insufficient_quota|rate_limit_exceeded}"
+# #1210 — two more observed shapes: nunchi.py's own graceful-degradation
+# notice ("합성 백엔드 사용 불가: <backend>:exit-N") and the provider's quota
+# text passed through verbatim ("You've hit your weekly limit"). Unmatched,
+# both scored as substantive answers on nosuk/gongyung (2026-08-24 and 08-31
+# runs): every positive row ANSWERED and every negative control FABRICATED —
+# a dead backend graded best-in-fabrication.
+INVALID_RE="${NUNCHI_BENCH_INVALID_RE:-Not logged in|Please run /login|Invalid API key|authentication_error|insufficient_quota|rate_limit_exceeded|합성 백엔드 사용 불가|hit your weekly limit}"
 # Ways an answer says "the evidence does not contain this". The dialectic prompt
 # asks for the literal "기록 없음", but backends paraphrase it, and a literal
 # match scored those paraphrases as successes. Kept byte-identical to
@@ -146,6 +152,8 @@ mkdir -p "$NUNCHI_HOME"
 # run from the same day, so the summary must count THIS run only.
 LEDGER="$(mktemp "${TMPDIR:-/tmp}/nunchi-bench-XXXXXX")" || exit 2
 trap 'rm -f "$LEDGER"' EXIT
+# #1210 — UTC window start for the backend-health cross-check after the loop.
+bench_start_utc="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
 
 # TM-2370 P1-A — the Q-set gained `source` and `evidence` columns in #1207.
 # `read` folds every unread column into the last variable, so a 4-variable read
@@ -265,9 +273,43 @@ read -r by_nunchi by_wiki answered unanswered correct_reject fabricated <<<"$(
 )"
 pos_valid=$(( answered + unanswered ))
 neg_valid=$(( correct_reject + fabricated ))
-# TM-2370 P1-A gate thresholds. Overridable so a node can be calibrated without
-# a code change during the first month of 48-question runs.
-UNANSWERED_MAX_PCT="${NUNCHI_BENCH_UNANSWERED_MAX_PCT:-10}"
+# #1210 — cross-check nunchi.py's backend-health ledger (same file and entry
+# shape `nunchi.py backend-status` reads). A synthesis backend that died during
+# the run poisons the sample in both directions: its error text scores as
+# ANSWERED (and FABRICATED on the negative controls) when unrecognized, and a
+# fully-dead backend pair scores as 100% unanswered. A strict majority of this
+# run's attempts having no winner — or the run ending inside an outage —
+# therefore escalates the verdict to INDETERMINATE whatever the rows say:
+# an unhealthy backend cannot produce a gate verdict.
+bh_file="${NUNCHI_BACKEND_HEALTH:-$(dirname "${NUNCHI_DB:-$NUNCHI_HOME/facts.db}")/backend-health.json}"
+read -r bh_total bh_failed <<<"$(python3 - "$bh_file" "$bench_start_utc" <<'PY'
+import json, sys
+try:
+    hist = json.load(open(sys.argv[1], encoding="utf-8")).get("history", [])
+except Exception:
+    hist = []
+total = failed = 0
+for e in hist:
+    if str(e.get("ts", "")) < sys.argv[2]:
+        continue
+    total += 1
+    if not e.get("winner"):
+        failed += 1
+print(total, failed)
+PY
+)" 2>/dev/null || { bh_total=0; bh_failed=0; }
+bh_total="${bh_total:-0}"; bh_failed="${bh_failed:-0}"
+backend_degraded=no
+if [ "$bh_total" -ge 5 ] && [ "$((bh_failed * 2))" -gt "$bh_total" ]; then
+  backend_degraded=yes
+fi
+# TM-2370 P1-A gate threshold, calibrated on the first two 48-question fleet
+# runs (#1210, 2026-08-24/08-31, 12 nodes). Healthy-backend node-weeks span
+# 13–48% unanswered (median 30%, IQR 20–34%), so the TM-2370 placeholder 10%
+# failed 17/17 healthy node-weeks — no discriminative power. 40% passes about
+# four of five healthy node-weeks while still failing the worst tail; ratchet
+# down as Wiki-layer coverage matures. Still overridable per node.
+UNANSWERED_MAX_PCT="${NUNCHI_BENCH_UNANSWERED_MAX_PCT:-40}"
 unanswered_pct=0
 [ "$pos_valid" -gt 0 ] && unanswered_pct=$(( unanswered * 100 / pos_valid ))
 {
@@ -291,12 +333,16 @@ unanswered_pct=0
     echo "- correct rejections: $correct_reject"
     echo "- fabrications (부정형 조작): $fabricated"
   fi
+  [ "$bh_total" -gt 0 ] \
+    && echo "- backend attempts during run: $bh_total (failed: $bh_failed)"
   echo "- unanswered rate: ${unanswered_pct}% of $pos_valid positive (threshold ≤${UNANSWERED_MAX_PCT}%)"
   # The verdict is advisory and never changes the exit code. bench.sh is a cron
   # job on every node and #1078 already settled that the bench is not the
   # failing unit — a failing gate must not turn into fleet-wide cron noise.
   if [ "$invalid" -gt 0 ]; then
     verdict="INDETERMINATE — sample contaminated ($invalid invalid)"
+  elif [ "$backend_degraded" = yes ]; then
+    verdict="INDETERMINATE — synthesis backend degraded during run ($bh_failed/$bh_total attempts failed)"
   elif [ "$fabricated" -gt 0 ]; then
     verdict="FAIL — $fabricated fabrication(s) on negative controls (hard fail)"
   elif [ "$pos_valid" -eq 0 ]; then

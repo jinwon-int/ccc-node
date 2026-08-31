@@ -216,7 +216,7 @@ ok "refusing a negative control is graded CORRECT-REJECT, not retrieval failure"
 ok "correct rejections do not inflate the unanswered gate candidates" \
   'grep -q "^- correct rejections: 2$" "$good" && grep -q "^- unanswered (gate candidates): 0$" "$good"'
 ok "a clean run passes the gate and reports the rate against positives only" \
-  'grep -q "^- unanswered rate: 0% of 3 positive (threshold ≤10%)$" "$good" \
+  'grep -q "^- unanswered rate: 0% of 3 positive (threshold ≤40%)$" "$good" \
    && grep -q "^- gate verdict: PASS$" "$good"'
 ok "the gate verdict reaches the cron log on stdout" \
   'grep -q "gate=PASS" "$TMP/p1a-ok"'
@@ -237,10 +237,10 @@ HOME="$p1a_home" CCC_STATE_DIR="$p1a_state" NUNCHI_HOME="$p1a_nh" \
   NUNCHI_BENCH_WIKI_CLI=/nonexistent \
   bash "$p1a_hooks/bench.sh" > "$TMP/p1a-thr" 2>&1
 thr="$(find "$p1a_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
-ok "an all-unanswered positive set fails the default 10% threshold" \
+ok "an all-unanswered positive set fails the default 40% threshold" \
   '[ "$(grep -c "^- fabrications (부정형 조작): 0$" "$thr")" = 1 ] \
-   && grep -q "^- unanswered rate: 100% of 3 positive (threshold ≤10%)$" "$thr" \
-   && grep -q "^- gate verdict: FAIL — unanswered 100% > 10%$" "$thr"'
+   && grep -q "^- unanswered rate: 100% of 3 positive (threshold ≤40%)$" "$thr" \
+   && grep -q "^- gate verdict: FAIL — unanswered 100% > 40%$" "$thr"'
 
 # The threshold is overridable so the first month of 48-question runs can be
 # calibrated without a code change.
@@ -486,6 +486,107 @@ p_rc=$?
 p_out="$(find "$s_unscoped" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
 ok "an unscoped node still benches \$NUNCHI_HOME and emits no scope label" \
   '[ "$p_rc" = 0 ] && [ -n "$p_out" ] && grep -q "node=plain-node$" "$p_out"'
+
+# ---- #1210: quota/limit notices are provider failures, not answers ---------
+# nosuk/gongyung 2026-08-24+08-31: a claude weekly-limit notice passed through
+# as the answer text with exit 0. It matched neither the old INVALID_RE nor
+# NO_RECORD_RE, so all 43 positives scored ANSWERED and all 5 negative controls
+# FABRICATED — a dead backend graded best-in-fabrication.
+wl_home="$TMP/home-weeklylimit"
+wl_hooks="$wl_home/.claude/hooks/nunchi"
+wl_state="$wl_home/.claude/state"
+wl_nh="$wl_home/.nunchi"
+mkdir -p "$wl_hooks" "$wl_state" "$wl_nh"
+cp "$ROOT/claude/hooks/nunchi/bench.sh" "$wl_hooks/bench.sh"
+chmod 700 "$wl_hooks/bench.sh"
+printf 'on' > "$wl_state/nunchi.mode"
+cp "$p1a_hooks/bench-qset.tsv" "$wl_hooks/bench-qset.tsv"
+
+cat > "$wl_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+sys.stdin.read()
+print("(합성 백엔드 사용 불가: claude:exit-1) You've hit your weekly limit · resets 1am (UTC)")
+PY
+HOME="$wl_home" CCC_STATE_DIR="$wl_state" NUNCHI_HOME="$wl_nh" \
+  NUNCHI_BENCH_QSET="$wl_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent \
+  bash "$wl_hooks/bench.sh" > "$TMP/wl-stdout" 2>&1
+wl_out="$(find "$wl_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+
+ok "a weekly-limit quota notice is provider-failure, not an answer" \
+  '[ -n "$wl_out" ] && [ "$(grep -c "rc=0 status=INVALID reason=provider-failure" "$wl_out")" = 5 ]'
+ok "a quota-notice run has zero valid samples and is INDETERMINATE" \
+  'grep -q "^- valid: 0$" "$wl_out" && grep -q "INDETERMINATE — sample contaminated (5 invalid)" "$wl_out"'
+ok "the quota text is preserved for human review" \
+  'grep -q "weekly limit" "$wl_out"'
+ok "quota contamination reaches the cron log" \
+  'grep -q "valid=0 invalid=5" "$TMP/wl-stdout"'
+
+# ---- #1210: a dead synthesis backend escalates the verdict to INDETERMINATE -
+# gwakga 2026-08-24+08-31: both backends exit-1'd all run, every row graded
+# UNANSWERED, and the gate reported a misleading FAIL instead of "the backend
+# was down". When a strict majority of this run's backend-health attempts have
+# no winner — or the run ends inside an outage — the sheet cannot produce a
+# gate verdict whatever its rows say. This also outranks the fabrication hard
+# fail, because quota-notice "fabrications" are exactly the artifact this
+# escalation exists for.
+bh_home="$TMP/home-backendhealth"
+bh_hooks="$bh_home/.claude/hooks/nunchi"
+bh_state="$bh_home/.claude/state"
+bh_nh="$bh_home/.nunchi"
+mkdir -p "$bh_hooks" "$bh_state" "$bh_nh"
+cp "$ROOT/claude/hooks/nunchi/bench.sh" "$bh_hooks/bench.sh"
+chmod 700 "$bh_hooks/bench.sh"
+printf 'on' > "$bh_state/nunchi.mode"
+cp "$p1a_hooks/bench-qset.tsv" "$bh_hooks/bench-qset.tsv"
+
+# Backend answers every query substantively — the rows look healthy.
+cat > "$bh_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+sys.stdin.read()
+print("확정적인 답변입니다")
+PY
+python3 - "$bh_nh/backend-health.json" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+hist = [{"ts": now, "primary": "claude", "winner": None,
+         "attempts": "claude:exit-1, codex:exit-1"} for _ in range(6)]
+json.dump({"history": hist}, open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False)
+PY
+HOME="$bh_home" CCC_STATE_DIR="$bh_state" NUNCHI_HOME="$bh_nh" \
+  NUNCHI_BENCH_QSET="$bh_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent \
+  bash "$bh_hooks/bench.sh" > "$TMP/bh-stdout" 2>&1
+bh_out="$(find "$bh_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+
+ok "a majority-dead backend during the run escalates to INDETERMINATE" \
+  'grep -q "^- gate verdict: INDETERMINATE — synthesis backend degraded during run (6/6 attempts failed)$" "$bh_out"'
+ok "the backend attempt counts are surfaced in the summary" \
+  'grep -q "^- backend attempts during run: 6 (failed: 6)$" "$bh_out"'
+ok "escalation is distinct from sample contamination" \
+  '! grep -q "SAMPLE CONTAMINATED" "$bh_out"'
+
+# A healthy backend-health ledger must not escalate: same rows, no failures.
+python3 - "$bh_nh/backend-health.json" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+hist = [{"ts": now, "primary": "claude", "winner": "claude", "attempts": None}
+        for _ in range(6)]
+json.dump({"history": hist}, open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False)
+PY
+rm -f "$bh_nh"/bench-*.md
+HOME="$bh_home" CCC_STATE_DIR="$bh_state" NUNCHI_HOME="$bh_nh" \
+  NUNCHI_BENCH_QSET="$bh_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent \
+  bash "$bh_hooks/bench.sh" > "$TMP/bh-ok-stdout" 2>&1
+bh_ok="$(find "$bh_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "a healthy backend ledger leaves the fabrication hard-fail in force" \
+  'grep -q "^- gate verdict: FAIL — 2 fabrication(s) on negative controls (hard fail)$" "$bh_ok" \
+   && grep -q "^- backend attempts during run: 6 (failed: 0)$" "$bh_ok"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
