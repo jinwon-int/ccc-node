@@ -320,31 +320,13 @@ def main() -> int:
             results.append(entry_result)
             continue
 
-        if chosen["rb"] is not None:
-            try:
-                result = m._remote_dispatch_round(cfg, chosen["rb"], manifest)
-                trow = (result.get("results") or [{}])[0]
-                entry_result["task"] = trow.get("taskId")
-            except m.PromotionError as error:
-                entry_result["outcome"] = "rescreen-dispatch-failed"
-                entry_result["error"] = str(error)[:120]
-        else:
-            manifest_path = f"/tmp/rescreen-manifest-{name}.json"
-            with open(manifest_path, "w", encoding="utf-8") as fh:
-                json.dump(manifest, fh, ensure_ascii=False)
-            env = dict(os.environ)
-            env["A2A_EDGE_SECRET"] = secret
-            try:
-                completed = m._run(
-                    ["node", str(cfg.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"),
-                     "--manifest", manifest_path, "--verify", "--json"],
-                    env=env, timeout=300)
-                result = json.loads(completed.stdout.decode("utf-8"))
-                trow = (result.get("results") or [{}])[0]
-                entry_result["task"] = trow.get("taskId")
-            except Exception as error:  # noqa: BLE001 — record and continue
-                entry_result["outcome"] = "rescreen-dispatch-failed"
-                entry_result["error"] = str(error)[:120]
+        try:
+            result = _run_dispatch(m, cfg, secret, manifest, chosen["rb"], name)
+            trow = (result.get("results") or [{}])[0]
+            entry_result["task"] = trow.get("taskId")
+        except Exception as error:  # noqa: BLE001 — record and continue
+            entry_result["outcome"] = "rescreen-dispatch-failed"
+            entry_result["error"] = str(error)[:120]
         if isinstance(entry_result.get("task"), str) and entry_result["task"]:
             entry_result["ledger"] = _record_dispatch_ledger(
                 m, cfg, case=case, name=name, cand=cand, head=head, manifest=manifest,
@@ -361,6 +343,24 @@ def main() -> int:
                                              encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False))
     return 0
+
+
+def _run_dispatch(m, cfg, secret: str, manifest: dict, rb, name: str) -> dict:
+    """Dispatch one rescreen manifest on its broker (remote over SSH, primary
+    via the local dispatcher). Returns the dispatcher result JSON; raises on
+    transport failure (caller records the skip)."""
+    if rb is not None:
+        return m._remote_dispatch_round(cfg, rb, manifest)
+    manifest_path = f"/tmp/rescreen-manifest-{name}.json"
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False)
+    env = dict(os.environ)
+    env["A2A_EDGE_SECRET"] = secret
+    completed = m._run(
+        ["node", str(cfg.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"),
+         "--manifest", manifest_path, "--verify", "--json"],
+        env=env, timeout=300)
+    return json.loads(completed.stdout.decode("utf-8"))
 
 
 def tree_of(case: dict) -> str:
