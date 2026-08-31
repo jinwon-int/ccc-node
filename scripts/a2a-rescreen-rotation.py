@@ -16,6 +16,12 @@ whose healthy-node lists were hardcoded and blind to node state. This tool:
 Safety: plan never touches the network; probe is read-only; manifests without
 --dispatch write files only. Dispatch (with --dispatch) reuses the existing
 a2a-dispatch-round.mjs verify path and records rationale in the plan artifact.
+
+Dual broker (#2024): probe, plan, and dispatch also cover the optional
+CCC_SKILL_PROMOTION_REMOTE_BROKERS registry (the same one the promotion
+publisher uses). Remote brokers are reached over SSH on their own host and
+their edge secret is read remotely via secret_cmd, so the value never leaves
+that host. Registry absent = today's single-broker behavior, unchanged.
 """
 from __future__ import annotations
 
@@ -88,15 +94,33 @@ def provider_from_env(bin_name: str, args: str) -> tuple[str, str]:
 
 
 def _normalize_workers(raw: Any) -> list[dict[str, Any]]:
-    workers: list[dict[str, Any]] = []
+    """Normalize worker rows and collapse multi-broker duplicates (#2024).
+    A node reachable on several brokers is one reviewer: the primary broker
+    wins, otherwise the alphabetically-first broker name keeps picks
+    deterministic. Reachability is OR-merged across broker rows. Rows without
+    a broker field are primary (pre-#2024 input)."""
+    seen: dict[str, dict[str, Any]] = {}
     for item in raw or []:
         node = str(item.get("node", "")).strip()
         if not node:
             continue
-        online = bool(item.get("online", False))
-        provider = str(item.get("provider", "unknown")).strip().lower() or "unknown"
-        model = str(item.get("model", "unknown")).strip() or "unknown"
-        workers.append({"node": node, "provider": provider, "model": model, "online": online})
+        row = {
+            "node": node,
+            "provider": str(item.get("provider", "unknown")).strip().lower() or "unknown",
+            "model": str(item.get("model", "unknown")).strip() or "unknown",
+            "online": bool(item.get("online", False)),
+            "broker": str(item.get("broker", "primary")).strip() or "primary",
+        }
+        prev = seen.get(node)
+        if prev is None:
+            seen[node] = row
+            continue
+        prev["online"] = prev["online"] or row["online"]
+        if prev["broker"] != "primary" and (row["broker"] == "primary" or row["broker"] < prev["broker"]):
+            prev["broker"] = row["broker"]
+            prev["provider"] = row["provider"]
+            prev["model"] = row["model"]
+    workers = list(seen.values())
     workers.sort(key=lambda w: w["node"])
     return workers
 
@@ -207,6 +231,7 @@ def plan(
                 "reviewer": chosen,
                 "provider": prov,
                 "model": by_node[chosen]["model"],
+                "broker": by_node[chosen]["broker"],
                 "rationale": {
                     "selected_by": "provider-balance/round-robin",
                     "excluded": case_excluded,
@@ -224,6 +249,10 @@ def plan(
         "start_offset": start_offset,
         "failure_window_hours": failure_window_hours,
         "count": len(assignments),
+        "broker_counts": {
+            broker: sum(1 for a in assignments if a["broker"] == broker)
+            for broker in sorted({a["broker"] for a in assignments})
+        },
     }
 
 
@@ -290,6 +319,91 @@ def _broker_online_workers(broker_url: str, edge_env_file: str) -> tuple[list[st
     return sorted(online), None
 
 
+# ------------------------------------------------------- remote brokers (#2024)
+
+
+def _load_rotation_hook():
+    """Load the ccc-skill-promotion hook module (registry parsing). None when
+    unavailable — remote-broker coverage then degrades to primary-only."""
+    path = _find_hook_module()
+    if path is None:
+        return None
+    try:
+        return _load_hook_module(path)
+    except Exception:  # noqa: BLE001 — hook import must never break probing
+        return None
+
+
+def _remote_broker_registry(edge_env_file: str) -> tuple[tuple[dict[str, str], ...], str | None]:
+    """Read the optional CCC_SKILL_PROMOTION_REMOTE_BROKERS registry by
+    sourcing the edge env file in bash. Only the registry (plain config:
+    names, hosts, URLs, a remote secret command) crosses to this process —
+    the edge secret values themselves never do. Returns (brokers, error)."""
+    script = 'EDGE_ENV="$1"; . "$EDGE_ENV" || exit 9; printf %s "$CCC_SKILL_PROMOTION_REMOTE_BROKERS"'
+    try:
+        proc = subprocess.run(
+            ["bash", "-c", script, "_", edge_env_file],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return (), "env-file-unreadable"
+    if proc.returncode != 0:
+        return (), "env-file-unreadable"
+    raw = proc.stdout.decode("utf-8", "replace").strip()
+    if not raw:
+        return (), None
+    hook = _load_rotation_hook()
+    if hook is None:
+        return (), "promotion-hook-not-found"
+    return hook._parse_remote_brokers(raw), None
+
+
+def _remote_ssh_capture(rb: dict[str, str], remote_script: str, *, timeout: int = 30) -> tuple[bytes, str | None]:
+    """Run a shell snippet on the remote broker host (read-only probing). The
+    snippet sources the secret remotely via rb["secret_cmd"] — the value is
+    printed and consumed on that host, never transiting this node."""
+    try:
+        proc = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=12", rb["ssh_host"], remote_script],
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return b"", "broker-unreachable"
+    if proc.returncode != 0:
+        return b"", "broker-unreachable"
+    return proc.stdout, None
+
+
+def _remote_broker_online_workers(rb: dict[str, str]) -> tuple[set[str], str | None]:
+    """Online worker ids on a remote broker, stale-inclusive read filtered on
+    projected status (older brokers return an empty default list for fresh
+    registrations) — same discipline as the promotion publisher."""
+    script = (
+        'S=$(' + rb["secret_cmd"] + ') || exit 75\n'
+        'curl -fsS -H "x-a2a-edge-secret: $S" "' + rb["broker_url"] + '/workers?include=stale_read_path&limit=100"\n'
+    )
+    stdout, error = _remote_ssh_capture(rb, script)
+    if error:
+        return set(), error
+    try:
+        payload = json.loads(stdout.decode("utf-8"))
+    except json.JSONDecodeError:
+        return set(), "broker-unreachable"
+    items = payload.get("items") if isinstance(payload, dict) else None
+    online: set[str] = set()
+    for row in items or []:
+        if not isinstance(row, dict):
+            continue
+        node_id = row.get("nodeId")
+        if isinstance(node_id, str) and node_id.strip() and row.get("status") == "online":
+            online.add(node_id.strip())
+    return online, None
+
+
 def _ssh_probe_provider(node: str) -> dict[str, Any] | None:
     """SSH-read a node's REVIEW_AGENT_* wiring (read-only)."""
     remote = (
@@ -326,17 +440,35 @@ def cmd_probe(args: argparse.Namespace) -> int:
     if error:
         print(json.dumps({"ok": False, "error": error}))
         return 1
+    primary_online = set(online)
+    brokers: dict[str, dict[str, Any]] = {
+        "primary": {"broker_url": args.broker_url, "online": sorted(primary_online)}
+    }
+    # #2024: also probe each configured remote broker (SSH onto its host;
+    # the edge secret is sourced remotely and never transits this node).
+    remote_brokers, registry_error = _remote_broker_registry(args.edge_env_file)
+    worker_broker: dict[str, str] = {}
+    for rb in remote_brokers:
+        remote_online, remote_error = _remote_broker_online_workers(rb)
+        entry: dict[str, Any] = {"broker_url": rb["broker_url"], "online": sorted(remote_online)}
+        if remote_error:
+            entry["error"] = remote_error
+        brokers[rb["name"]] = entry
+        for node in remote_online:
+            worker_broker.setdefault(node, rb["name"])
     workers: list[dict[str, Any]] = []
     nodes = [n.strip() for n in args.nodes.split(",") if n.strip()] if args.nodes else []
     for node in nodes:
         info = _ssh_probe_provider(node)
+        on_primary = node in primary_online
         workers.append(
             {
                 "node": node,
-                "online": node in online,
+                "online": on_primary or node in worker_broker,
                 "provider": (info or {}).get("provider", "unknown"),
                 "model": (info or {}).get("model", "unknown"),
                 "probe": (info or {}).get("bin", "unreachable"),
+                "broker": "primary" if on_primary else worker_broker.get(node, "primary"),
             }
         )
     payload = {
@@ -345,7 +477,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
         "broker_url": args.broker_url,
         "online_workers": online,
         "workers": workers,
+        "brokers": brokers,
     }
+    if registry_error:
+        payload["registry_error"] = registry_error
     if args.out:
         dump_json(args.out, payload)
     print(json.dumps(payload, ensure_ascii=False))
@@ -353,6 +488,21 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
 
 # ------------------------------------------------------- manifest emission
+
+
+def _resolve_assignment_broker(
+    hook, cfg, secret: str, broker_name: str
+) -> tuple[dict[str, str] | None, str]:
+    """Resolve an assignment's broker (#2024) to (remote_entry, broker_id).
+    remote_entry None = primary. Unknown names and unreachable brokers raise —
+    the manifests loop records the failure per item and continues."""
+    name = (broker_name or "primary").strip()
+    if name == "primary":
+        return None, hook._broker_id(cfg, secret)
+    for rb in cfg.remote_brokers:
+        if rb["name"] == name:
+            return rb, hook._remote_broker_id(cfg, rb)
+    raise ValueError(f"unknown-broker:{name}")
 
 
 def cmd_manifests(args: argparse.Namespace) -> int:
@@ -373,18 +523,26 @@ def cmd_manifests(args: argparse.Namespace) -> int:
     cases = {str(c.get("name")): c for c in load_json(args.cases)}
     out_dir = pathlib.Path(args.manifest_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    broker_id = hook._broker_id(cfg, secret)
     procedure = hook._worker_procedure_from_docs(
         cfg.a2a_nexus_dir, doc_name="skills-intake-review.md", end_marker=hook._DISPATCH_DOC_END
     )
 
-    written: list[dict[str, str]] = []
+    written: list[dict[str, Any]] = []
     seq = 0
     for item in plan_data.get("assignments", []):
         case = cases.get(str(item.get("name")))
         if not case:
             continue
         seq += 1
+        # #2024: each assignment dispatches on the broker its reviewer is
+        # homed on (plan output "broker", default primary).
+        try:
+            rb, broker_id = _resolve_assignment_broker(hook, cfg, secret, str(item.get("broker", "primary")))
+        except Exception as exc:  # noqa: BLE001 — record and continue
+            row = {"name": case["name"], "outcome": "manifest-failed", "error": str(exc)[:120]}
+            print(json.dumps(row), flush=True)
+            written.append(row)
+            continue
         files = tuple(
             hook.SnapshotFile(
                 relative=f["path"],
@@ -404,7 +562,7 @@ def cmd_manifests(args: argparse.Namespace) -> int:
             description="",
         )
         head = hook._branch_head_sha(cfg, case["branch"])
-        now = hook._utcnow().strftime("%Y%m%dT%H%M%SZ") + f"{seq:02d}"
+        now = _utcnow().strftime("%Y%m%dT%H%M%SZ") + f"{seq:02d}"  # local datetime helper (hook exposes _utc_now: str)
         manifest = hook._build_dispatch_manifest(
             cfg,
             cand,
@@ -413,6 +571,7 @@ def cmd_manifests(args: argparse.Namespace) -> int:
             head=head,
             reviewer=str(item["reviewer"]),
             broker_id=broker_id,
+            broker_url=(rb["broker_url"] if rb is not None else cfg.broker_url),
             procedure=procedure,
             inventory=[],
             now=now,
@@ -420,38 +579,95 @@ def cmd_manifests(args: argparse.Namespace) -> int:
         manifest["lanes"][0]["payload"]["scope"] = "public-elevation"
         path = out_dir / f"rs-{case['name']}.json"
         dump_json(str(path), manifest)
-        written.append({"name": case["name"], "reviewer": str(item["reviewer"]), "manifest": str(path)})
-        print(json.dumps({"name": case["name"], "reviewer": item["reviewer"], "manifest": str(path)}), flush=True)
+        entry = {
+            "name": case["name"],
+            "reviewer": str(item["reviewer"]),
+            "broker": "primary" if rb is None else rb["name"],
+            "manifest": str(path),
+            "manifest_data": manifest,
+            "rb": rb,
+            "broker_id": broker_id,
+            "head": head,
+            "pr": str(case["pr"]),
+            "branch": case["branch"],
+            "cand": {
+                "node": case["node"],
+                "provider": case["provider"],
+                "name": case["name"],
+                "tree_sha256": case["tree_sha256"],
+            },
+        }
+        written.append(entry)
+        print(json.dumps({k: entry[k] for k in ("name", "reviewer", "broker", "manifest")}), flush=True)
 
     if not args.dispatch:
         print(json.dumps({"ok": True, "mode": "manifests-dryrun", "written": len(written)}))
         return 0
     results = []
     for entry in written:
+        if "rb" not in entry:
+            results.append({"name": entry["name"], "outcome": entry["outcome"]})
+            print(json.dumps(results[-1]), flush=True)
+            continue
         try:
-            completed = hook._run(
-                [
-                    "node",
-                    str(cfg.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"),
-                    "--manifest",
-                    entry["manifest"],
-                    "--verify",
-                    "--json",
-                ],
-                env={**env, "A2A_EDGE_SECRET": secret},
-                timeout=300,
-            )
-            result = json.loads(completed.stdout.decode("utf-8"))
+            if entry["rb"] is None:
+                completed = hook._run(
+                    [
+                        "node",
+                        str(cfg.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"),
+                        "--manifest",
+                        entry["manifest"],
+                        "--verify",
+                        "--json",
+                    ],
+                    env={**env, "A2A_EDGE_SECRET": secret},
+                    timeout=300,
+                )
+                result = json.loads(completed.stdout.decode("utf-8"))
+            else:
+                result = hook._remote_dispatch_round(cfg, entry["rb"], entry["manifest_data"])
             trow = result.get("results", [{}])[0]
+            dispatched_task = trow.get("taskId") if isinstance(trow, dict) else None
             results.append(
                 {
                     "name": entry["name"],
-                    "task": trow.get("taskId"),
-                    "classification": trow.get("classification"),
+                    "broker": entry["broker"],
+                    "task": dispatched_task,
+                    "classification": trow.get("classification") if isinstance(trow, dict) else None,
                 }
             )
+            if isinstance(dispatched_task, str) and dispatched_task:
+                # #2024: ledger row routes nightly verdict consumption to the
+                # right broker (collect polls rows' "broker" field).
+                cand = entry["cand"]
+                try:
+                    hook._append_ledger(
+                        cfg,
+                        {
+                            "ts": hook._utc_now(),  # ISO-8601 Z, same format the publisher writes
+                            "kind": "a2a-dispatch",
+                            "transport_id": f"{cand['node']}-{cand['provider']}-{cand['name']}-{cand['tree_sha256'][:12]}",
+                            "head_sha": entry["head"],
+                            "round_id": entry["manifest_data"]["roundId"],
+                            "task_id": entry["manifest_data"]["lanes"][0]["id"],
+                            "dispatched_task": dispatched_task,
+                            "reviewer_node": entry["reviewer"],
+                            "broker_id": entry["broker_id"],
+                            "broker": entry["broker"],
+                            "pr_url": f"https://github.com/{cfg.repo}/pull/{entry['pr']}",
+                            "node": cand["node"],
+                            "provider": cand["provider"],
+                            "name": cand["name"],
+                            "tree_sha256": cand["tree_sha256"],
+                            "branch": entry["branch"],
+                            "rescreen": True,
+                        },
+                    )
+                    results[-1]["ledger"] = "recorded"
+                except Exception as exc:  # noqa: BLE001 — dispatch stands, ledger gap surfaced
+                    results[-1]["ledger"] = f"record-failed:{str(exc)[:80]}"
         except Exception as exc:  # noqa: BLE001 — record and continue, rescreen semantics
-            results.append({"name": entry["name"], "outcome": "dispatch-failed", "error": str(exc)[:120]})
+            results.append({"name": entry["name"], "broker": entry["broker"], "outcome": "dispatch-failed", "error": str(exc)[:120]})
         print(json.dumps(results[-1]), flush=True)
     print(json.dumps({"ok": True, "mode": "manifests-dispatch", "count": len(results)}))
     return 0

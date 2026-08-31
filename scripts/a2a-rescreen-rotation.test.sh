@@ -182,6 +182,115 @@ ok "T8 claude default detected" "$ASSERT $FIX/prov.json 'd[0] == [\"claude\", \"
 ok "T8 xai provider parsed"     "$ASSERT $FIX/prov.json 'd[1] == [\"xai\", \"xai/grok-4.6\"]'"
 ok "T8 codex provider parsed"   "$ASSERT $FIX/prov.json 'd[2] == [\"openai-codex\", \"openai-codex/gpt-5.6-sol\"]'"
 
+# ---- T9: dual-broker plan (#2024) — broker passthrough, dedup, counts ------
+
+cat > "$FIX/workers-dual.json" <<'EOF'
+[
+  {"node": "alpha", "provider": "claude", "model": "m", "online": true,  "broker": "primary"},
+  {"node": "beta",  "provider": "xai",    "model": "xai/grok", "online": true, "broker": "t2"},
+  {"node": "alpha", "provider": "claude", "model": "m-dup", "online": false, "broker": "t2"},
+  {"node": "gamma", "provider": "codex",  "model": "openai-codex/gpt", "online": true, "broker": "t2"}
+]
+EOF
+run_plan "$FIX/cases3.json" "$FIX/workers-dual.json" "$FIX/plan-dual.json" ""
+ok "T9 dual assigns all 3 cases" "$ASSERT $FIX/plan-dual.json 'd[\"count\"] == 3'"
+ok "T9 broker recorded on every assignment" \
+  "$ASSERT $FIX/plan-dual.json 'all(\"broker\" in a for a in d[\"assignments\"])'"
+ok "T9 broker_counts sum == count" \
+  "$ASSERT $FIX/plan-dual.json 'sum(d[\"broker_counts\"].values()) == d[\"count\"]'"
+ok "T9 t2-only worker reachable via t2 broker" \
+  "$ASSERT $FIX/plan-dual.json 'any(a[\"reviewer\"] == \"gamma\" and a[\"broker\"] == \"t2\" for a in d[\"assignments\"])'"
+
+python3 - "$TOOL" > "$FIX/norm.json" <<'EOF'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("rot", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+workers = mod._normalize_workers([
+    {"node": "alpha", "provider": "claude", "model": "m", "online": True, "broker": "primary"},
+    {"node": "alpha", "provider": "claude", "model": "m-dup", "online": False, "broker": "t2"},
+    {"node": "zeta", "provider": "x", "model": "x", "online": False, "broker": "t9"},
+    {"node": "zeta", "provider": "x", "model": "x2", "online": True, "broker": "t2"},
+    {"node": "legacy", "provider": "claude", "model": "m", "online": True},
+])
+print(json.dumps(workers))
+EOF
+ok "T9 normalize dedups (alpha=primary, zeta=t2 OR-online, legacy=primary-default)" \
+  "$ASSERT $FIX/norm.json 'len(d) == 3 and [w for w in d if w[\"node\"] == \"alpha\"][0][\"broker\"] == \"primary\" and [w for w in d if w[\"node\"] == \"alpha\"][0][\"online\"] is True and [w for w in d if w[\"node\"] == \"zeta\"][0][\"broker\"] == \"t2\" and [w for w in d if w[\"node\"] == \"zeta\"][0][\"online\"] is True and [w for w in d if w[\"node\"] == \"legacy\"][0][\"broker\"] == \"primary\"'"
+
+python3 - "$FIX/plan-dual.json" > "$FIX/alpha-brokers.txt" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+alpha_brokers = {a["broker"] for a in d["assignments"] if a["reviewer"] == "alpha"}
+print(",".join(sorted(alpha_brokers)) or "none")
+EOF
+ok "T9 duplicate alpha assignment-side stays primary-only" "grep -qv t2 $FIX/alpha-brokers.txt"
+
+# ---- T10: registry read is fail-closed, secret-free (#2024) ----------------
+
+mkdir -p "$TMP/claude/hooks"
+cat > "$TMP/claude/hooks/ccc-skill-promotion.py" <<'PYEOF'
+import json, re
+def _parse_remote_brokers(raw):
+    if not raw or not raw.strip():
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    brokers, seen = [], set()
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        values = [entry.get(k) for k in ("name", "ssh_host", "broker_url", "nexus_dir", "secret_cmd")]
+        if not all(isinstance(v, str) and v.strip() for v in values):
+            continue
+        if not re.match(r"^https?://", entry["broker_url"]):
+            continue
+        name = entry["name"].strip()
+        if name in seen or name == "primary":
+            continue
+        seen.add(name)
+        brokers.append({k: entry[k].strip() for k in ("name", "ssh_host", "broker_url", "nexus_dir", "secret_cmd")})
+    return tuple(brokers)
+PYEOF
+
+mk_reg_case() { # $1 out.json $2 registry-value (single-quoted into env file)
+  : > "$TMP/reg.env"
+  printf "export CCC_SKILL_PROMOTION_REMOTE_BROKERS='%s'\n" "$2" >> "$TMP/reg.env"
+  CCC_CLAUDE_DIR="$TMP/claude" python3 - "$TOOL" > "$1" <<EOF
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("rot", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+brokers, error = mod._remote_broker_registry("$TMP/reg.env")
+print(json.dumps({"count": len(brokers), "names": [b["name"] for b in brokers], "error": error}))
+EOF
+}
+
+VALID='[{"name":"t2","ssh_host":"gwakga","broker_url":"http://127.0.0.1:8787","nexus_dir":"/root/work/a2a/a2a-nexus","secret_cmd":"cat /x | cut -d= -f2"}]'
+mk_reg_case "$FIX/reg-valid.json" "$VALID"
+ok "T10 valid registry parsed" "$ASSERT $FIX/reg-valid.json 'd[\"count\"] == 1 and d[\"names\"] == [\"t2\"] and d[\"error\"] is None'"
+ok "T10 registry carries no secret material" \
+  "! grep -qE 'SECRET=[A-Za-z0-9+/=_-]{8,}' $FIX/reg-valid.json"
+mk_reg_case "$FIX/reg-empty.json" ""
+ok "T10 absent registry = primary-only, no error" "$ASSERT $FIX/reg-empty.json 'd[\"count\"] == 0 and d[\"error\"] is None'"
+mk_reg_case "$FIX/reg-invalid.json" 'not-json-at-all'
+ok "T10 invalid registry dropped fail-closed" "$ASSERT $FIX/reg-invalid.json 'd[\"count\"] == 0'"
+: > "$TMP/reg-broken.env"
+printf "this is 'not shell-safe\n" >> "$TMP/reg-broken.env"
+CCC_CLAUDE_DIR="$TMP/claude" python3 - "$TOOL" > "$FIX/reg-broken.json" <<EOF
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("rot", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+brokers, error = mod._remote_broker_registry("$TMP/reg-broken.env")
+print(json.dumps({"count": len(brokers), "error": error}))
+EOF
+ok "T10 unreadable env file degrades to primary-only" "$ASSERT $FIX/reg-broken.json 'd[\"count\"] == 0 and d[\"error\"] == \"env-file-unreadable\"'"
+
 # ---- summary ----------------------------------------------------------------
 
 echo "PASS=$pass FAIL=$fail"
