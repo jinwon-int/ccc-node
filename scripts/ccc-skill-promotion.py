@@ -2791,9 +2791,46 @@ def _dispatch_intake_revise(
     }
 
 
+# #1370: human-readable explanations for a consumed revise verdict whose R2
+# dispatch did not reach a revision round. The raw skip code stays in the text
+# (backticked) so operators can grep the PR for the exact reason.
+_REVISE_SKIP_NOTES = {
+    "revise_secret_missing": "revision dispatch unavailable: `A2A_EDGE_SECRET` is not configured on this publisher",
+    "revise_daily_cap": "revision dispatch deferred: the daily revision cap is reached — a later review cycle can dispatch it",
+    "revise_already": "a revision for this PR head was already dispatched",
+    "revise_nexus_missing": "revision dispatch unavailable: `a2a-dispatch-round.mjs` was not found in the nexus checkout",
+    "revise_author_offline": "revision dispatch skipped: the author node is not currently an online broker worker — the findings below stay visible for human follow-up",
+    "revise_record_invalid": "revision dispatch skipped: the review-dispatch ledger record failed validation",
+    "revise_round_failed": "revision dispatch failed (transport or handler error) — no automatic retry; human judgment continues on this PR",
+}
+
+
+def _revise_outcome_note(outcome: dict[str, object]) -> str:
+    """One human-readable line describing how a consumed revise verdict
+    resolved, for the standard verdict comment (#1370). Empty for a successful
+    dispatch — that path already posts the full verdict comment with the round
+    note, and a second one would duplicate it."""
+    kind = outcome.get("outcome")
+    if kind == "revise-dispatched":
+        return ""
+    if kind == "revise-handoff":
+        rounds = outcome.get("round") if isinstance(outcome.get("round"), int) else 0
+        return (
+            f"auto-revision rounds exhausted ({rounds} dispatched) — "
+            "human judgment required; reviewer findings below"
+        )
+    code = outcome.get("code") if isinstance(outcome.get("code"), str) else ""
+    known = _REVISE_SKIP_NOTES.get(code)
+    text = known if known else "revision dispatch skipped"
+    detail = outcome.get("detail") if isinstance(outcome.get("detail"), str) else ""
+    suffix = f" — {detail}" if detail else ""
+    return f"{text}{suffix} (`{code}`)"
+
+
 def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object]]:
     """Poll dispatched review tasks, record verdicts, post verdict/findings
-    comments (the #1357 visibility gap), and trigger bounded revision rounds."""
+    comments (the #1357 visibility gap, extended to skipped revise dispatches
+    by #1370), and trigger bounded revision rounds."""
     rows = _ledger_rows(config)
     consumed = {
         row.get("task_id") for row in rows if row.get("kind") == "a2a-verdict"
@@ -2850,6 +2887,31 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
             revise_outcome = _dispatch_intake_revise(
                 config, row, rows, findings, str(row.get("reviewer_node", "unknown")), dry_run=False
             )
+            # #1370: approve/reject post the standard verdict comment below, but
+            # a revise whose R2 dispatch skipped (author offline, caps, transport
+            # failure) used to consume the verdict and vanish — the reviewer's
+            # findings never surfaced on the PR, and with the head consumed no
+            # later cycle would surface them. Post the same verdict comment with
+            # a human-readable outcome note; _comment_once keeps repeated
+            # collects from duplicating the same head+reason. A successful
+            # dispatch already posted the comment (with the round note), so its
+            # note is empty and nothing is added here.
+            revise_note = _revise_outcome_note(revise_outcome)
+            if revise_note:
+                _comment_once(
+                    config,
+                    rows,
+                    pr=_pr_number_from_url(str(row.get("pr_url", ""))) or "",
+                    head=head,
+                    marker=f"revise-verdict:{revise_outcome.get('code') or revise_outcome.get('outcome')}",
+                    body=_verdict_comment_body(
+                        "revise",
+                        findings,
+                        str(row.get("reviewer_node", "unknown")),
+                        dispatched,
+                        revise_note,
+                    ),
+                )
             processed.append({"outcome": "verdict-consumed", "verdict": verdict, "revise": revise_outcome})
             continue
         if verdict == "reject":

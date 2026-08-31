@@ -864,6 +864,34 @@ write_verdict "$head_cap2" revise
 out="$(env "${cap_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
 ok "daily cap blocks the second same-day revision dispatch"   '[ "$rc" = 0 ] && jq -e ".revise.verdicts[0].revise.outcome == \"revise-skipped\" and .revise.verdicts[0].revise.code == \"revise_daily_cap\"" >/dev/null <<<"$out"'
 
+# Scenario (#1370): a revise verdict whose R2 dispatch SKIPS must still surface
+# the verdict+findings on the PR — exactly once, with a human-readable reason.
+# Live gap (2026-08-31, fleet-skills#79): revise_author_offline consumed the
+# verdict and left the PR with zero trace of the review.
+printf '{"status":"queued"}\n' > "$CURL_STATE/review-task.json"
+write_skill r2-off ""
+write_status r2-off
+env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true "PATH=$BIN:$PATH" python3 "$PROMOTER" run >/dev/null
+off_out0="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+out="$off_out0"
+branch_off="$(git --git-dir="$REMOTE" for-each-ref --format='%(refname:short)' refs/heads | grep 'r2-off' | head -1)"
+head_off="$(git --git-dir="$REMOTE" rev-parse "$branch_off")"
+# Author node (testnode) drops off the broker's online-worker list:
+printf '{"items":[{"nodeId":"reviewer1"}]}\n' > "$CURL_STATE/workers.json"
+write_verdict "$head_off" revise
+skip_rows() { jq -s "[.[] | select(.kind==\"a2a-revise-comment\" and .marker==\"revise-verdict:revise_author_offline\")] | length" "$ledger"; }
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "#1370: offline-author revise skip is recorded as revise-skipped" \
+  '[ "$rc" = 0 ] && jq -e ".revise.verdicts[0].verdict == \"revise\" and .revise.verdicts[0].revise.outcome == \"revise-skipped\" and .revise.verdicts[0].revise.code == \"revise_author_offline\"" >/dev/null <<<"$out"'
+ok "#1370: skipped verdict still posts the verdict comment once (ledger-marked)" \
+  '[ "$(skip_rows)" = 1 ] && [ "$(grep -c "revise_author_offline" "$R2_GH_STATE/comments")" = 1 ]'
+ok "#1370: the skip comment carries a human-readable reason and the findings" \
+  'grep -q "stay visible for human follow-up" "$R2_GH_STATE/comments" && grep -q "Single-incident checklist" "$R2_GH_STATE/comments"'
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "#1370: repeated collect does not duplicate the skip comment" \
+  '[ "$(skip_rows)" = 1 ] && [ "$(grep -c "revise_author_offline" "$R2_GH_STATE/comments")" = 1 ]'
+printf '{"items":[{"nodeId":"testnode"},{"nodeId":"reviewer1"}]}\n' > "$CURL_STATE/workers.json"
+
 # ─── R3 drop-report: read-only human sweep over drop recommendations (#1363)
 
 DROP_HOME="$TMP/drop-home"
@@ -1072,6 +1100,32 @@ ok "remote broker parse, reviewer fallthrough, and task routing (#2024)" \
 
 # The mirrored reviewer actually lands in the dispatch manifest (no local
 # dispatch here — the routing unit above covers broker selection).
+
+# ─── #1370: _revise_outcome_note mapping (unit) ───────
+NOTE_FIXTURE="$TMP/note-fixture.json"
+cat > "$NOTE_FIXTURE" <<'FIXTURE'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("promo_note", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["promo_note"] = m
+spec.loader.exec_module(m)
+# A successful dispatch already posts the full verdict comment — no extra note.
+assert m._revise_outcome_note({"outcome": "revise-dispatched"}) == "", "dispatched"
+# Handoff surfaces the exhaustion and defers to human judgment.
+note = m._revise_outcome_note({"outcome": "revise-handoff", "round": 2})
+assert "exhausted" in note and "2 dispatched" in note and "human judgment" in note, note
+# Known skip codes render the human text plus the raw code for greppability.
+note = m._revise_outcome_note({"outcome": "revise-skipped", "code": "revise_author_offline"})
+assert "not currently an online broker worker" in note and "(`revise_author_offline`)" in note, note
+# Unknown codes still render, with the raw code; transport detail is appended.
+note = m._revise_outcome_note({"outcome": "revise-skipped", "code": "revise_round_failed", "detail": "boom"})
+assert "no automatic retry" in note and "boom" in note and "(`revise_round_failed`)" in note, note
+note = m._revise_outcome_note({"outcome": "revise-skipped", "code": "revise_whatever"})
+assert note == "revision dispatch skipped (`revise_whatever`)", note
+print("NOTE-MAPPING-OK")
+FIXTURE
+python3 "$NOTE_FIXTURE" "$PROMOTER" >/dev/null 2>&1; rc=$?
+ok "revise outcome notes map skip codes to human-readable text" '[ "$rc" = 0 ]'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
