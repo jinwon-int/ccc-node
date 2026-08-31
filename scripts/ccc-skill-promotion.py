@@ -2850,6 +2850,32 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
             revise_outcome = _dispatch_intake_revise(
                 config, row, rows, findings, str(row.get("reviewer_node", "unknown")), dry_run=False
             )
+            # #1370: a skipped revision round (author offline, caps, transport
+            # failure) must not swallow the verdict — the dispatched and
+            # round-limit paths already comment, so only the skip carries the
+            # verdict + findings onto the PR here.
+            if isinstance(revise_outcome, dict) and revise_outcome.get("outcome") == "revise-skipped":
+                skip_code = str(revise_outcome.get("code", "unknown"))
+                skip_detail = revise_outcome.get("detail")
+                skip_note = (
+                    f"auto-revision round not dispatched: {skip_code}"
+                    + (f" ({skip_detail})" if isinstance(skip_detail, str) and skip_detail else "")
+                    + " — the PR stays open for human judgment, no auto-close"
+                )
+                try:
+                    _pr_comment(
+                        config,
+                        _pr_number_from_url(str(row.get("pr_url", ""))) or "",
+                        _verdict_comment_body(
+                            verdict,
+                            findings,
+                            str(row.get("reviewer_node", "unknown")),
+                            dispatched,
+                            skip_note,
+                        ),
+                    )
+                except PromotionError:
+                    pass
             processed.append({"outcome": "verdict-consumed", "verdict": verdict, "revise": revise_outcome})
             continue
         if verdict == "reject":

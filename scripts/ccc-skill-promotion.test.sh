@@ -1073,5 +1073,58 @@ ok "remote broker parse, reviewer fallthrough, and task routing (#2024)" \
 # The mirrored reviewer actually lands in the dispatch manifest (no local
 # dispatch here — the routing unit above covers broker selection).
 
+# ---- #1370: a skipped revise round still posts the verdict + findings ----
+NVE2_STATE="$TMP/nve2-state"
+mkdir -p "$NVE2_STATE/../state/skill-promotion"
+cat > "$BIN/curl" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+printf '{"status":"failed","error":{"code":"review_verdict_failed"},"negativeVerdictEvidence":{"result":{"output":{"verdict":"revise","head_sha":"%s","findings":[{"severity":"major","area":"claims","note":"unverifiable pinned claim"}]}}}}' "$NVE2_HEAD" 
+STUB
+chmod +x "$BIN/curl"
+NVE2_FIXTURE="$TMP/nve2-fixture.py"
+cat > "$NVE2_FIXTURE" <<FIXTURE
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location("csp_1370", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["csp_1370"] = m
+spec.loader.exec_module(m)
+
+config = m._config()
+head = "a" * 40
+with open(config.promotion_state_dir / "ledger.jsonl", "w") as handle:
+    handle.write(json.dumps({
+        "ts": "2026-08-31T00:00:00Z", "kind": "a2a-dispatch",
+        "task_id": "rv-1370", "dispatched_task": "rv-1370",
+        "head_sha": head, "reviewer_node": "rn",
+        "pr_url": "https://github.com/test/repo/pull/9",
+    }) + "\\n")
+
+comments = []
+m._pr_comment = lambda config, pr, body: comments.append((pr, body))
+
+# Skip path: no revise dispatch, but the verdict must reach the PR.
+m._dispatch_intake_revise = lambda *a, **k: {"outcome": "revise-skipped", "code": "revise_author_offline"}
+out = m._process_verdicts(config, dry_run=False)
+assert out and out[0]["outcome"] == "verdict-consumed" and out[0]["verdict"] == "revise", out
+assert len(comments) == 1, comments
+pr, body = comments[0]
+assert pr == "9", pr
+assert "revise" in body and "revise_author_offline" in body and "no auto-close" in body
+assert "unverifiable pinned claim" in body
+
+# Dispatched/handoff paths already comment inside the revise dispatcher —
+# the verdicts flow must not double-post.
+comments.clear()
+m._dispatch_intake_revise = lambda *a, **k: {"outcome": "revise-dispatched", "round": 1}
+out = m._process_verdicts(config, dry_run=False)
+assert out == [] , out  # the row was consumed above — no reprocessing
+print("NVE2-SKIP-COMMENT-OK")
+FIXTURE
+env "${base_env[@]}" CCC_STATE_DIR="$NVE2_STATE/../state" HOME="$NVE2_STATE/.." PATH="$BIN:$PATH" NVE2_HEAD=$(printf 'a%.0s' $(seq 40)) \
+  python3 "$NVE2_FIXTURE" "$PROMOTER" > "$NVE2_STATE/out" 2>&1; rc=$?
+ok "skipped revise round posts verdict comment with findings (#1370)" \
+  '[ "$rc" = 0 ] && grep -q "NVE2-SKIP-COMMENT-OK" "$NVE2_STATE/out"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
