@@ -196,6 +196,8 @@ def main() -> int:
         node_agents = json.loads(pathlib.Path(args.node_agents).read_text(encoding="utf-8"))
 
     cases = json.loads(pathlib.Path(args.cases).read_text(encoding="utf-8"))
+    if isinstance(cases, list):  # ad-hoc rescreen-*.py format: index by name
+        cases = {c["name"]: c for c in cases if isinstance(c, dict) and "name" in c}
     wanted = [n.strip() for n in args.names.split(",") if n.strip()]
     names = wanted or sorted(cases)
 
