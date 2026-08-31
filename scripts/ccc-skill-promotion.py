@@ -2260,6 +2260,21 @@ def _verdict_from_task(
     head_sha = output.get("head_sha")
     if not isinstance(head_sha, str) or head_sha != expected_head:
         return None
+    # #2027 review provenance: reviewer_node/review_agent/review_model are
+    # first-class verdict fields injected by the canonical handler. Verdicts
+    # composed before that handler rolled out lack them — warn so operators
+    # can spot the stragglers, never fail (backward compatibility).
+    missing_provenance = [
+        field for field in ("reviewer_node", "review_agent", "review_model")
+        if not str(output.get(field, "") or "").strip()
+    ]
+    if missing_provenance:
+        bound_task = str(output.get("taskId", "")) or "?"
+        print(
+            f"warn: verdict {bound_task} is missing review provenance field(s): "
+            f"{', '.join(missing_provenance)} (pre-#2027 verdict)",
+            file=sys.stderr,
+        )
     clean: list[dict[str, str]] = []
     for finding in findings[:16]:
         if not isinstance(finding, dict):

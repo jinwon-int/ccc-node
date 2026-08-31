@@ -1127,5 +1127,39 @@ FIXTURE
 python3 "$NOTE_FIXTURE" "$PROMOTER" >/dev/null 2>&1; rc=$?
 ok "revise outcome notes map skip codes to human-readable text" '[ "$rc" = 0 ]'
 
+# ---- #2027: publisher warns (never fails) on verdicts missing provenance ----
+PROV_FIXTURE="$TMP/prov-fixture.py"
+cat > "$PROV_FIXTURE" <<FIXTURE
+import importlib.util, io, json, os, sys, contextlib
+spec = importlib.util.spec_from_file_location("csp_prov", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["csp_prov"] = m
+spec.loader.exec_module(m)
+
+head = "c" * 40
+base = {"taskId": "rv-prov", "verdict": "revise", "head_sha": head,
+        "findings": [{"severity": "minor", "area": "quality", "note": "n"}]}
+
+legacy = {"status": "succeeded", "result": {"output": dict(base)}}  # no provenance fields
+modern = {"status": "succeeded", "result": {"output": dict(base, reviewer_node="rn", review_agent="pi", review_model="xai/grok-4.6")}}
+
+err = io.StringIO()
+with contextlib.redirect_stderr(err):
+    out = m._verdict_from_task(legacy, head)
+assert out is not None and out[0] == "revise", out
+warned = err.getvalue()
+assert "missing review provenance" in warned and "review_agent" in warned, warned
+
+err2 = io.StringIO()
+with contextlib.redirect_stderr(err2):
+    out2 = m._verdict_from_task(modern, head)
+assert out2 is not None and out2[0] == "revise", out2
+assert "missing review provenance" not in err2.getvalue(), err2.getvalue()
+print("PROV-WARN-OK")
+FIXTURE
+env "${base_env[@]}" python3 "$PROV_FIXTURE" "$PROMOTER" > "$TMP/prov-out" 2>&1; rc=$?
+ok "publisher warns on legacy verdicts missing provenance, never fails (#2027)" \
+  '[ "$rc" = 0 ] && grep -q "PROV-WARN-OK" "$TMP/prov-out"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

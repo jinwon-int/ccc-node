@@ -141,5 +141,30 @@ ok "installer creates the destination directory" '[ "$rc" = 0 ] && [ -x "$DEST/r
 bash "$INSTALLER" --termux --dest "$TMP/termux-dest" >/dev/null 2>&1; rc=$?
 ok "installer accepts the Termux profile flag"   '[ "$rc" = 0 ] && [ -x "$TMP/termux-dest/a2a-intent-dispatcher.sh" ] && [ -x "$TMP/termux-dest/skills-intake-review-handler.sh" ]'
 
+bash "$INSTALLER" --termux --dest "$TMP/termux-dest" >/dev/null 2>&1; rc=$?
+ok "installer accepts the Termux profile flag"   '[ "$rc" = 0 ] && [ -x "$TMP/termux-dest/a2a-intent-dispatcher.sh" ] && [ -x "$TMP/termux-dest/skills-intake-review-handler.sh" ]'
+
+# ---- #2027: review provenance fields (review_agent / review_model) ----
+make_task "$HEAD_OK"
+REVIEW_AGENT_BIN="$BIN/stub-agent" REVIEW_AGENT_ARGS="-p --model xai/grok-4.6" REVIEW_TIMEOUT_SEC=30 \
+  WORKER_ID=testnode REVIEW_STUB_HEAD="$HEAD_OK" REVIEW_STUB_OTHER_HEAD="$HEAD_OTHER" REVIEW_STUB_MODE=approve \
+  bash "$HANDLER" < "$TMP/task.json" > "$TMP/out-prov-model.json" 2>/dev/null; rc=$?
+ok "explicit --model in REVIEW_AGENT_ARGS becomes review_model, bin becomes review_agent (#2027)" \
+  '[ "$rc" = 0 ] && jq -e ".output.review_agent == \"stub-agent\" and .output.review_model == \"xai/grok-4.6\"
+    and .output.reviewer_node == \"testnode\"" >/dev/null "$TMP/out-prov-model.json"'
+
+make_task "$HEAD_OK"
+REVIEW_AGENT_BIN="$BIN/stub-agent" REVIEW_AGENT_ARGS="--model=openai/gpt-5.6-sol -p" REVIEW_TIMEOUT_SEC=30 \
+  WORKER_ID=testnode REVIEW_STUB_HEAD="$HEAD_OK" REVIEW_STUB_OTHER_HEAD="$HEAD_OTHER" REVIEW_STUB_MODE=approve \
+  bash "$HANDLER" < "$TMP/task.json" > "$TMP/out-prov-eq.json" 2>/dev/null; rc=$?
+ok "--model= form parses too (#2027)" \
+  '[ "$rc" = 0 ] && jq -e ".output.review_model == \"openai/gpt-5.6-sol\"" >/dev/null "$TMP/out-prov-eq.json"'
+
+# No --model configured: fall back to the agent self-report (stub emits model).
+make_task "$HEAD_OK"
+run_handler "$TMP/task.json" > "$TMP/out-prov-fallback.json" 2>/dev/null; rc=$?
+ok "review_model falls back to the agent self-report when args carry no --model (#2027)" \
+  '[ "$rc" = 0 ] && jq -e ".output.review_agent == \"stub-agent\" and .output.review_model == \"stub-model\"" >/dev/null "$TMP/out-prov-fallback.json"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
