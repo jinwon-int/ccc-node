@@ -255,7 +255,8 @@ def _broker_online_workers(broker_url: str, edge_env_file: str) -> tuple[list[st
     construction, not by suppression).
     Returns (sorted ids, error).
     """
-    script = ('. "$EDGE_ENV"; '
+    script = ('EDGE_ENV="$1"; BROKER_URL="$2"; '
+              '. "$EDGE_ENV"; '
               'curl -fsS -H "x-a2a-edge-secret: $A2A_EDGE_SECRET" "$BROKER_URL/workers"')
     try:
         proc = subprocess.run(
