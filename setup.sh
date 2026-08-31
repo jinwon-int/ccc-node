@@ -471,6 +471,9 @@ run atomic_install "$SRC/scripts/ccc-memory-benchmark-export.sh" "$CLAUDE_DIR/ho
 # Skill autosave sweep — covers bridge/SDK sessions that never fire SessionEnd
 # hooks; scheduled separately via scripts/install-skill-autosave-cron.sh.
 run atomic_install "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
+# Codex rollout projector for the autosave codex branch (#1353) — installs
+# beside the sweep it serves; opt-in via CCC_SKILL_CODEX_DRAFTING (default off).
+run atomic_install "$SRC/scripts/codex-rollout-normalize.py" "$CLAUDE_DIR/hooks/codex-rollout-normalize.py"
 # Opt-in autosave skill intake boundary. Nodes stage owner-only outboxes; only
 # the separately enabled central publisher may open private draft intake PRs.
 run atomic_install "$SRC/scripts/ccc-skill-promotion.py" "$CLAUDE_DIR/hooks/ccc-skill-promotion.py"
@@ -541,6 +544,7 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/ccc-memory-eval.sh"
   "$CLAUDE_DIR/hooks/ccc-memory-benchmark-export.sh"
   "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
+  "$CLAUDE_DIR/hooks/codex-rollout-normalize.py"
   "$CLAUDE_DIR/hooks/ccc-skill-promotion.py"
   "$CLAUDE_DIR/hooks/ccc-fleet-skills-sync.py"
   "$CLAUDE_DIR/hooks/ccc-self-update.sh"

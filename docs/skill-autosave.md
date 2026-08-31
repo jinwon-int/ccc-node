@@ -119,6 +119,52 @@ draft. A directory containing both legacy `SKILL.md` and v2 `proposal.json`
 fails closed. Schema-v1 create-only backend output remains accepted and is
 migrated in memory; new backend output uses strict schema v2.
 
+## Codex rollout drafting (#1353, opt-in)
+
+The sweep's main loop drafts only from the Claude transcript tree
+(`~/.claude/projects/**.jsonl`). Codex sessions live in
+`${CODEX_HOME:-~/.codex}/sessions/YYYY/MM/DD/rollout-*.jsonl` with a different
+record shape, so their procedures never reach the drafting brain. When opted
+in, the sweep runs a **codex branch** right after the Claude draft loop:
+
+1. `codex-rollout-normalize.py` projects each rollout into the Claude
+   transcript shape (user/assistant text rows + Bash `tool_use` rows; the
+   `bash -lc` wrapper is unwrapped to the script payload) into a branch-local
+   tree at `<CCC_STATE_DIR>/codex-normalized/<encoded-cwd>/<session-id>.jsonl`.
+   Injected noise (session_meta/base_instructions, developer-role instruction
+   blocks, turn_context/world_state/token_count/reasoning) is discarded.
+   Headless rollouts that record the conversation only as `event_msg` fall
+   back to those events; when real `response_item` messages exist they are
+   skipped so turns are not duplicated.
+2. The projected transcript is pushed through the SAME `skill-review.sh`
+   pipeline with `CCC_SKILL_PROVIDER=codex` and
+   `CLAUDE_PROJECTS_DIR=<normalized tree>` — provider.sh routes installs to
+   `$CODEX_HOME/skills`, promotion staging reads the branch provider from
+   `.autosave-meta.json`, and `scan.sh` reuses the normalized tree via
+   `CLAUDE_PROJECTS_DIR` unchanged. The pending queue and the autoinstall
+   daily-cap ledger stay shared (`CCC_SKILL_REVIEW_STATE_DIR`), so install
+   counts sum across both branches.
+3. A separate regrowth ledger (`skill-autosave.codex-seen`, same 16 KiB
+   semantics and `MAX_SESSIONS` per-run budget as the Claude branch) prevents
+   re-processing unchanged rollouts.
+
+**Opt in** with `CCC_SKILL_CODEX_DRAFTING=1` (or `1` in
+`<CCC_STATE_DIR>/skill-autosave.codex-drafting`). Default is off: nodes without
+the flag pay nothing — the sessions tree is not even walked.
+
+Safety rails:
+
+- Sessions with `originator=="codex_exec"` are excluded at projection time —
+  machine-driven runs must not self-reference into skill drafts (the same bias
+  control as promotion's self-review ban). `CCC_SKILL_CODEX_INCLUDE_EXEC=1`
+  (or `--include-exec`) lifts it.
+- Projection is capped at 512 KiB per session (`--max-bytes`); the downstream
+  tail bounds (extract.sh 500 lines / 60 KiB) apply unchanged.
+
+Canary guidance: enable on the heaviest codex-using (hybrid) node first,
+observe 1–2 weeks of draft quality, cost, and zero codex_exec self-reference
+before rolling fleet-wide.
+
 ## Enable the daily sweep
 
 ```bash

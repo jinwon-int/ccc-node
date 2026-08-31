@@ -177,13 +177,111 @@ else
   done < <(find "$PROJECTS_DIR" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" 2>/dev/null \
              | xargs -r ls -t 2>/dev/null)
 
+  # --- 2a) codex branch (#1353, opt-in) --------------------------------------
+  # Codex sessions live in $CODEX_HOME/sessions/**/rollout-*.jsonl with a
+  # different record shape, so the drafting brain above never sees them. When
+  # opted in, each rollout is projected into the Claude transcript shape
+  # (codex-rollout-normalize.py) into a branch-local tree, then pushed through
+  # the SAME skill-review.sh pipeline with CCC_SKILL_PROVIDER=codex — provider.sh
+  # then routes installs to $CODEX_HOME/skills, promotion staging reads the
+  # branch provider from .autosave-meta.json, and scan.sh reuses the normalized
+  # tree via CLAUDE_PROJECTS_DIR — all unchanged downstream.
+  # Default OFF (CCC_SKILL_CODEX_DRAFTING=1, or state file
+  # skill-autosave.codex-drafting): nodes without the flag pay nothing — the
+  # sessions tree is not even walked. Machine-driven codex_exec sessions are
+  # excluded at projection time (self-reference bias, same as promotion's
+  # self-review ban); CCC_SKILL_CODEX_INCLUDE_EXEC=1 lifts it.
+  codex_drafted=0
+  codex_opt_in="${CCC_SKILL_CODEX_DRAFTING:-}"
+  if [ -z "$codex_opt_in" ] && [ -f "$STATE_DIR/skill-autosave.codex-drafting" ]; then
+    codex_opt_in=1
+  fi
+  codex_home="${CODEX_HOME:-${HOME:-/root}/.codex}"
+  codex_normalizer="${CCC_SKILL_CODEX_NORMALIZE_CMD:-}"
+  if [ -z "$codex_normalizer" ]; then
+    for _codex_norm in "$CLAUDE_DIR/hooks/codex-rollout-normalize.py" \
+                       "$AUTOSAVE_SELF_DIR/codex-rollout-normalize.py" \
+                       "$AUTOSAVE_SELF_DIR/../scripts/codex-rollout-normalize.py"; do
+      [ -f "$_codex_norm" ] && { codex_normalizer="$_codex_norm"; break; }
+    done
+    unset _codex_norm
+  fi
+  if [ "$codex_opt_in" != "1" ]; then
+    log "codex skipped reason=not-enabled"
+  elif [ ! -f "$codex_normalizer" ]; then
+    log "codex skipped reason=no-normalizer"
+  elif [ ! -d "$codex_home/sessions" ]; then
+    log "codex skipped reason=no-sessions-tree path=$codex_home/sessions"
+  else
+    codex_tree="$STATE_DIR/codex-normalized"
+    codex_ledger="$STATE_DIR/skill-autosave.codex-seen"
+    mkdir -p "$codex_tree" 2>/dev/null
+    touch "$codex_ledger" 2>/dev/null
+    codex_record_ledger() {
+      local tmp="$codex_ledger.tmp.$$"
+      { awk -F'\t' -v s="$1" '$1!=s' "$codex_ledger" 2>/dev/null;
+        printf '%s\t%s\t%s\n' "$1" "$(ts)" "$2"; } > "$tmp" 2>/dev/null \
+        && mv "$tmp" "$codex_ledger" 2>/dev/null
+    }
+    while IFS= read -r rollout; do
+      [ "$codex_drafted" -ge "$MAX_SESSIONS" ] && break
+      [ -f "$rollout" ] || continue
+      sid="$(basename "$rollout" .jsonl)"
+      size="$(wc -c < "$rollout" 2>/dev/null | tr -d '[:space:]')"
+      case "$size" in ''|*[!0-9]*) size=0 ;; esac
+      last_size="$(awk -F'\t' -v s="$sid" '$1==s {sz=$3} END {print sz+0}' "$codex_ledger" 2>/dev/null)"
+      case "$last_size" in ''|*[!0-9]*) last_size=0 ;; esac
+      if [ "$last_size" -gt 0 ] && [ $((size - last_size)) -lt "$REGROWTH_BYTES" ]; then
+        continue
+      fi
+      norm_args=("--out-dir" "$codex_tree")
+      [ "${CCC_SKILL_CODEX_INCLUDE_EXEC:-0}" = "1" ] && norm_args+=("--include-exec")
+      summary="$(python3 "$codex_normalizer" "$rollout" "${norm_args[@]}" 2>>"$LOG")" || {
+        log "codex normalize failed session=$sid (non-fatal)"
+        continue
+      }
+      excluded="$(printf '%s' "$summary" | jq -r '.excluded // false' 2>/dev/null)"
+      empty="$(printf '%s' "$summary" | jq -r '.empty // false' 2>/dev/null)"
+      out_path="$(printf '%s' "$summary" | jq -r '.out_path // empty' 2>/dev/null)"
+      if [ "$excluded" = "true" ]; then
+        codex_record_ledger "$sid" "$size"
+        log "codex excluded session=$sid reason=codex_exec"
+        continue
+      fi
+      if [ "$empty" = "true" ] || [ -z "$out_path" ] || [ ! -f "$out_path" ]; then
+        codex_record_ledger "$sid" "$size"
+        log "codex empty projection session=$sid"
+        continue
+      fi
+      # Scoped branch env: provider.sh resolves the codex install target
+      # ($CODEX_HOME/skills) from CCC_SKILL_PROVIDER, skill-review.sh re-roots
+      # its project discovery at the normalized tree, and the shared
+      # CCC_SKILL_REVIEW_STATE_DIR keeps the pending queue and the autoinstall
+      # daily-cap ledger summed across both branches (#1353).
+      if jq -nc --arg sid "$sid" --arg tp "$out_path" \
+          '{session_id:$sid, transcript_path:$tp}' 2>/dev/null \
+          | env CCC_SKILL_PROVIDER=codex \
+                CLAUDE_PROJECTS_DIR="$codex_tree" \
+                CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" \
+                bash "$REVIEW" manual >>"$LOG" 2>&1; then
+        codex_drafted=$((codex_drafted + 1))
+        codex_record_ledger "$sid" "$size"
+        log "codex review ok session=$sid size=$size"
+      else
+        log "codex review failed session=$sid (non-fatal)"
+      fi
+    done < <(find "$codex_home/sessions" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" 2>/dev/null \
+               | xargs -r ls -t 2>/dev/null)
+    log "codex sweep done drafted_sessions=$codex_drafted"
+  fi
+
   # skill-review.sh stages drafts from a detached background pipeline; give it
   # a bounded window to settle so this run's notification (step 3) can already
   # count fresh drafts. A quiet pipeline (no reusable procedure found) simply
   # times out and the next scheduled run picks up whatever landed later.
   SETTLE="${CCC_SKILL_AUTOSAVE_SETTLE_SECONDS:-90}"
   case "$SETTLE" in ''|*[!0-9]*) SETTLE=90 ;; esac
-  if [ "$drafted" -gt 0 ] && [ "$SETTLE" -gt 0 ]; then
+  if [ $((drafted + codex_drafted)) -gt 0 ] && [ "$SETTLE" -gt 0 ]; then
     waited=0
     while [ "$waited" -lt "$SETTLE" ]; do
       [ "$(pending_count)" != "$before" ] && break
@@ -191,7 +289,7 @@ else
     done
   fi
   after="$(pending_count)"
-  log "sweep done drafted_sessions=$drafted pending_before=$before pending_after=$after"
+  log "sweep done drafted_sessions=$drafted codex_drafted=$codex_drafted pending_before=$before pending_after=$after"
 fi
 
 # --- 2b) auto mode (#355): machine-gate + install passing drafts -------------
