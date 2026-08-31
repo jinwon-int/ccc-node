@@ -1074,8 +1074,13 @@ ok "remote broker parse, reviewer fallthrough, and task routing (#2024)" \
 # dispatch here — the routing unit above covers broker selection).
 
 # ---- #1370: a skipped revise round still posts the verdict + findings ----
+# NOTE: pre-created state dirs must be 0700 — the promoter's ownership
+# contract fail-closes on group/other-accessible state paths regardless of
+# the runner's umask (CI runs 0022).
 NVE2_STATE="$TMP/nve2-state"
-mkdir -p "$NVE2_STATE/../state/skill-promotion"
+mkdir -p "$NVE2_STATE/home/.claude/state/skill-promotion"
+chmod 700 "$NVE2_STATE" "$NVE2_STATE/home" "$NVE2_STATE/home/.claude" \
+  "$NVE2_STATE/home/.claude/state" "$NVE2_STATE/home/.claude/state/skill-promotion"
 cat > "$BIN/curl" <<'STUB'
 #!/usr/bin/env bash
 set -eu
@@ -1099,6 +1104,7 @@ with open(config.promotion_state_dir / "ledger.jsonl", "w") as handle:
         "head_sha": head, "reviewer_node": "rn",
         "pr_url": "https://github.com/test/repo/pull/9",
     }) + "\\n")
+os.chmod(config.promotion_state_dir / "ledger.jsonl", 0o600)  # ledger_unsafe contract
 
 comments = []
 m._pr_comment = lambda config, pr, body: comments.append((pr, body))
@@ -1121,7 +1127,13 @@ out = m._process_verdicts(config, dry_run=False)
 assert out == [] , out  # the row was consumed above — no reprocessing
 print("NVE2-SKIP-COMMENT-OK")
 FIXTURE
-env "${base_env[@]}" CCC_STATE_DIR="$NVE2_STATE/../state" HOME="$NVE2_STATE/.." PATH="$BIN:$PATH" NVE2_HEAD=$(printf 'a%.0s' $(seq 40)) \
+env "${base_env[@]}" \
+  CCC_STATE_DIR="$NVE2_STATE/home/.claude/state" \
+  CCC_SKILL_PROMOTION_CLAUDE_SKILLS_DIR="$NVE2_STATE/home/.claude/skills" \
+  CCC_SKILL_PROMOTION_CODEX_SKILLS_DIR="$NVE2_STATE/home/.codex/skills" \
+  CCC_SKILL_PROMOTION_OWNERSHIP_TOOL="$NVE2_STATE/ownership.py" \
+  PROMOTION_TEST_STATUS="$NVE2_STATE/status.json" \
+  HOME="$NVE2_STATE/home" PATH="$BIN:$PATH" NVE2_HEAD=$(printf 'a%.0s' $(seq 40)) \
   python3 "$NVE2_FIXTURE" "$PROMOTER" > "$NVE2_STATE/out" 2>&1; rc=$?
 ok "skipped revise round posts verdict comment with findings (#1370)" \
   '[ "$rc" = 0 ] && grep -q "NVE2-SKIP-COMMENT-OK" "$NVE2_STATE/out"'
