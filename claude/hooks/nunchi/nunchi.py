@@ -630,6 +630,43 @@ def _synth_candidates():
     )
 
 
+def _piri_candidate():
+    """Resolve the pi harness entry, or None when the node has no usable pi.
+
+    pi carries its own provider auth (~/.piri/agent/auth.json) and talks to the
+    model API directly, so on a node whose pi is logged in, synthesis can answer
+    even when the claude/codex CLIs are expired or quota-capped (gongyung:
+    claude weekly limit + dead codex auth, working openai-codex via pi).
+    pi manages its own token refresh — no credential is shared or transformed
+    across tools, so the node's working pi channel is never put at risk.
+    Probes, in order: `pi` on PATH; the fleet checkout run from source via
+    tsx — the exact invocation the fleet bridges use — then a built dist
+    (~/piri, /opt/piri). NUNCHI_PIRI=0 opts a node out entirely.
+    """
+    if os.environ.get("NUNCHI_PIRI", "") == "0":
+        return None
+    import shutil
+    exe = shutil.which("pi")
+    if exe:
+        return [exe]
+    node = shutil.which("node")
+    if not node:
+        return None
+    repo = os.path.expanduser("~/piri")
+    tsx = os.path.join(repo, "node_modules", "tsx", "dist", "cli.mjs")
+    src = os.path.join(repo, "packages", "coding-agent", "src", "cli.ts")
+    tsconfig = os.path.join(repo, "tsconfig.json")
+    if os.path.isfile(tsx) and os.path.isfile(src) and os.path.isfile(tsconfig):
+        return [node, tsx, "--tsconfig", tsconfig, src]
+    # A user-local checkout outranks the fleet /opt install: it is the more
+    # specific choice, and it keeps the resolution testable under a fake HOME.
+    for dist in (os.path.join(repo, "packages", "coding-agent", "dist", "cli.js"),
+                 "/opt/piri/packages/coding-agent/dist/cli.js"):
+        if os.path.isfile(dist):
+            return [node, dist]
+    return None
+
+
 def _run_synth_backend(name, argv, env):
     """Run one backend. Returns (text, reason) — reason is None when usable.
 
@@ -754,9 +791,26 @@ def llm_synthesize(prompt):
     import shutil
     env = {**os.environ, "CLAUDE_DISTILL_INFLIGHT": "1"}
     attempts, last_text = [], ""
-    primary = next((n for n, _ in _synth_candidates() if shutil.which(n)), None)
-    for name, template in _synth_candidates():
-        if not shutil.which(name):
+    candidates = list(_synth_candidates())
+    piri_argv = _piri_candidate()
+    if piri_argv:
+        # pi harness backend: the flags strip the agent harness to a bare
+        # one-shot LLM call — no tools, no extensions/skills/templates, no
+        # context files, no session litter. The node's pi provider settings
+        # (settings.json) decide which model answers.
+        # NUNCHI_PIRI_ARGS — per-node provider/model override appended before
+        # the prompt (e.g. gongyung: --provider openai-codex --model
+        # gpt-5.6-sol, because its pi default provider kimi-coding is logged
+        # out while the openai-codex channel carries fresh auth).
+        import shlex
+        piri_args = shlex.split(os.environ.get("NUNCHI_PIRI_ARGS", ""))
+        candidates.append(("piri", piri_argv + [
+            "-p", "--no-session", "--no-tools", "--no-extensions",
+            "--no-skills", "--no-prompt-templates", "--no-context-files",
+        ] + piri_args + ["{prompt}"]))
+    primary = next((n for n, t in candidates if shutil.which(t[0])), None)
+    for name, template in candidates:
+        if not shutil.which(template[0]):
             continue
         argv = [prompt if part == "{prompt}" else part for part in template]
         text, reason = _run_synth_backend(name, argv, env)
@@ -767,7 +821,7 @@ def llm_synthesize(prompt):
         last_text = text or last_text
     _record_backend_outcome(primary, None, ", ".join(attempts) or "no candidates present")
     if not attempts:
-        return "(합성 백엔드 없음: claude/codex CLI 부재)"
+        return "(합성 백엔드 없음: claude/codex/piri 부재)"
     # Every present backend failed. Name them so the failure is diagnosable
     # instead of surfacing one CLI's notice as if it were an answer.
     return f"(합성 백엔드 사용 불가: {', '.join(attempts)}) {last_text}".strip()
