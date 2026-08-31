@@ -4,6 +4,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Added
+- **Rotation tools close the #2024 ledger/broker gap.**
+  `a2a-rescreen-rotation.py` probe/plan/manifests now cover the
+  `CCC_SKILL_PROMOTION_REMOTE_BROKERS` registry end to end (SSH-only secret
+  handling, broker-tagged workers, per-assignment broker dispatch) and both
+  rotation tools append `a2a-dispatch` ledger rows with the `broker` field on
+  dispatch — the nightly collect can finally consume rescreen verdicts that
+  land on either broker. Also fixes a latent `hook._utcnow` AttributeError in
+  the manifests path (hook exposes `_utc_now`).
+
 ### Changed
 - **Fleet web search default is Firecrawl Search.** Curated `searxng-firecrawl`
   mode now allows `mcp__firecrawl__firecrawl_search` as the general search tool

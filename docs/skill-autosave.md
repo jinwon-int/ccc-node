@@ -738,6 +738,22 @@ ledger row (`"broker": "primary" | <name>`); rows written before #2024
 continue to poll the primary broker. Every recorded verdict still lands in
 the promotion ledger, so a broker outage delays consumption but loses nothing.
 
+The rotation tools carry the same dual-broker discipline:
+
+- `scripts/a2a-rescreen-rotation.py` — `probe` also queries each registry
+  broker over SSH (secret sourced remotely, never transiting the planner
+  node) and tags every worker with its home broker; `plan` carries the
+  broker through to each assignment (multi-broker duplicates collapse to
+  one reviewer, primary preferred); `manifests --dispatch` builds each
+  manifest for the assignment's broker and dispatches remote reviewers via
+  the publisher's `_remote_dispatch_round` path. Successful dispatches
+  append an `a2a-dispatch` ledger row with the broker recorded, so the
+  nightly `collect` consumes rescreen verdicts on the right broker.
+- `scripts/rescreen-rotation.py` — the pool already spans primary + registry
+  brokers; successful dispatches now append the same `a2a-dispatch` ledger
+  row (`"broker"` field, `"rescreen": true`), closing the gap where a
+  rescreen verdict landed on the broker but was never collected.
+
 ### Rescreen rotation — standard procedure (#2028)
 
 Re-review rounds (e.g. after a reviewer-pool outage or a rubric revision) are
