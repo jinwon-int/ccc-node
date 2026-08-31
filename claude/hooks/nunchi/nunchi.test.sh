@@ -538,7 +538,12 @@ ok "a crashing piri is named in the all-backends-failed notice" \
 
 # Repo probes: the fleet runs pi from a checkout — built dist (/opt/piri or
 # ~/piri) or tsx-from-source. HOME-scoped fakes prove both resolutions wire
-# into the same candidate without any real pi on PATH.
+# into the same candidate without any real pi on PATH. The probe needs node;
+# CI keeps it in /usr/local/bin, outside this suite's constrained PATH, so a
+# wrapper pinned to the host's real node goes on PATH instead.
+real_node="$(command -v node)"
+printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$real_node" > "$synth_bin/node"
+chmod +x "$synth_bin/node"
 rm -f "$synth_bin/pi"
 mkdir -p "$TMP/home/piri/packages/coding-agent/dist"
 printf 'console.log("PIRI-DIST-ANSWER")\n' > "$TMP/home/piri/packages/coding-agent/dist/cli.js"
