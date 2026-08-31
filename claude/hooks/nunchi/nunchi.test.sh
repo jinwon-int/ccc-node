@@ -488,6 +488,17 @@ out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic 
 ok "all-unusable reports each backend and its reason" \
   'grep -q "합성 백엔드 사용 불가" <<<"$out" && grep -q "claude:unavailable" <<<"$out" && grep -q "codex:unavailable" <<<"$out"'
 
+# #1210 - the provider's own quota text must also count as unusable, not as an
+# answer: nosuk/gongyung graded a weekly-limit notice best-in-fabrication.
+cat > "$synth_bin/claude" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "(합성 백엔드 사용 불가: claude:exit-1) You've hit your weekly limit · resets 1am (UTC)"
+STUBEOF
+chmod +x "$synth_bin/claude"
+out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "a weekly-limit quota text is unavailable, not an answer" \
+  'grep -q "claude:unavailable" <<<"$out"'
+
 # Cross-file constant check (#1072 precedent): the Python matcher and bench.sh's
 # shell default must not drift — a pattern known to one and not the other
 # reintroduces exactly the silent failure both exist to catch.
