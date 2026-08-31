@@ -2584,6 +2584,19 @@ def _revise_dispatch_target(
     return node, name, tree12, pr, str(provider), head, pr_url
 
 
+def _revise_target_broker(config: Config, node: str, secret: str) -> dict[str, str] | None:
+    """Broker where the author node is currently online (#2024): primary
+    first, then each configured remote broker. None = primary. Raises
+    revise_author_offline when the author is online nowhere — the revise
+    round then stays skipped exactly as in the single-broker world."""
+    if node in _broker_online_worker_ids(config, secret):
+        return None
+    for rb in config.remote_brokers:
+        if node in _remote_online_worker_ids(config, rb):
+            return rb
+    raise PromotionError("revise_author_offline")
+
+
 def _dispatch_intake_revise(
     config: Config,
     row: dict[str, object],
@@ -2637,18 +2650,8 @@ def _dispatch_intake_revise(
     # #2024: the author node may be homed on a secondary broker. Dispatch the
     # revision where the author is actually online — primary first, then each
     # configured remote broker. Same codes when nowhere online.
-    revise_rb = None
     try:
-        online = _broker_online_worker_ids(config, secret)
-        if node in online:
-            revise_rb = None
-        else:
-            for rb in config.remote_brokers:
-                if node in _remote_online_worker_ids(config, rb):
-                    revise_rb = rb
-                    break
-        if revise_rb is None and node not in online:
-            return {"outcome": "revise-skipped", "code": "revise_author_offline"}
+        revise_rb = _revise_target_broker(config, node, secret)
         if revise_rb is None:
             nexus_script = config.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"
             if not nexus_script.is_file():
