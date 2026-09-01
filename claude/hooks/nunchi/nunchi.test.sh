@@ -835,5 +835,28 @@ ok "#1336 self-merge rejected" '[ "$rc" != 0 ]'
 out="$(python3 "$NP" merge 999999 --into "$M_A" 2>&1)"; rc=$?
 ok "#1336 unknown fact rejected" '[ "$rc" != 0 ]'
 
+# ---- N. NUNCHI_SYNTH_ORDER: per-node synthesis ordering (2026-09-01) -----
+order_out="$(NUNCHI_SYNTH_ORDER="piri,claude,codex" python3 -c "
+import sys; sys.path.insert(0, '$HERE')
+import nunchi
+cands = [('claude', ['claude']), ('codex', ['codex']), ('piri', ['piri'])]
+print(' '.join(n for n, _ in nunchi._apply_synth_order(cands)))
+")"
+ok "NUNCHI_SYNTH_ORDER reorders candidates" '[ "$order_out" = "piri claude codex" ]'
+order_out="$(python3 -c "
+import sys; sys.path.insert(0, '$HERE')
+import nunchi
+cands = [('claude', ['claude']), ('codex', ['codex']), ('piri', ['piri'])]
+print(' '.join(n for n, _ in nunchi._apply_synth_order(cands)))
+")"
+ok "unset NUNCHI_SYNTH_ORDER keeps default order" '[ "$order_out" = "claude codex piri" ]'
+order_out="$(NUNCHI_SYNTH_ORDER="ghost,p,PirI" python3 -c "
+import sys; sys.path.insert(0, '$HERE')
+import nunchi
+cands = [('claude', ['claude']), ('codex', ['codex']), ('piri', ['piri'])]
+print(' '.join(n for n, _ in nunchi._apply_synth_order(cands)))
+")"
+ok "unknown names ignored, match is case-insensitive" '[ "$order_out" = "piri claude codex" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
