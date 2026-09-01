@@ -211,5 +211,71 @@ out="$(env "${norev_env[@]}" python3 "$SYNC" plan --ref "$REF2")"; rc=$?
 ok "no-reviewed_by install converges to noops" \
   '[ "$rc" = 0 ] && jq -e '"'"'.operations | all(.action == "noop")'"'"' >/dev/null <<<"$out"'
 
+# ─── 5) Termux app-private root walk (#1390) ──────────────────────────────
+#    Android /data and /data/data are system-owned 0771 and the Termux app
+#    root's files/ is 0771 by bootstrap default, so the strict anchor walk
+#    rejected every state/skills path on gongyung/daegyo. When the validated
+#    app-private root (kernel-enforced, only app uid + root traverse) lies
+#    on the path, the walk starts there; hostile parents above it are
+#    skipped and group/other-write bits below it stop mattering. The final
+#    state dir stays fully strict, and nothing outside the root relaxes.
+ANDROID="$TMP/android"
+APP_ROOT="$ANDROID/data/data/com.termux"
+TERMUX_HOME="$APP_ROOT/files/home"
+T_CLAUDE="$TERMUX_HOME/.claude/skills"
+T_CODEX="$TERMUX_HOME/.codex/skills"
+T_STATE="$TERMUX_HOME/.claude/state/fleet-skills"
+mkdir -p "$APP_ROOT/files" "$T_CLAUDE" "$T_CODEX" "$TERMUX_HOME/.claude/state"
+chmod 777 "$ANDROID" "$ANDROID/data" "$ANDROID/data/data"
+chmod 700 "$APP_ROOT"
+chmod 771 "$APP_ROOT/files"
+chmod 700 "$TERMUX_HOME" "$TERMUX_HOME/.claude" "$TERMUX_HOME/.claude/state" \
+  "$T_CLAUDE" "$T_CODEX"
+termux_env=("${base_env[@]}"
+  "CCC_FLEET_SKILLS_APP_ROOT=$APP_ROOT"
+  "HOME=$TERMUX_HOME"
+  "CCC_FLEET_SKILLS_STATE_DIR=$T_STATE"
+  "CCC_FLEET_SKILLS_CLAUDE_DIR=$T_CLAUDE"
+  "CCC_FLEET_SKILLS_CODEX_DIR=$T_CODEX"
+)
+
+out="$(env "${termux_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
+ok "termux plan passes hostile system-owned parents (#1390)" \
+  '[ "$rc" = 0 ] && jq -e "(.operations | length) == 2 and (.operations | all(.action == \"install\"))" >/dev/null <<<"$out"'
+
+out="$(env "${termux_env[@]}" python3 "$SYNC" apply --ref "$REF")"; rc=$?
+ok "termux apply installs both provider copies (#1390)" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 2" >/dev/null <<<"$out" && cmp -s "$SKILL/SKILL.md" "$T_CLAUDE/release-checklist/SKILL.md"'
+ok "termux state receipt is owner-only" \
+  '[ "$(stat -c %a "$T_STATE/installed.json")" = 600 ]'
+
+chmod 711 "$APP_ROOT"
+out="$(env "${termux_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
+ok "group/other-traversable app root keeps the strict anchor walk" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"state_path_unsafe\"" >/dev/null <<<"$out"'
+chmod 700 "$APP_ROOT"
+
+mv "$APP_ROOT" "$APP_ROOT.real"
+ln -s "$ANDROID/data" "$APP_ROOT"
+out="$(env "${termux_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
+ok "symlinked app root keeps the strict anchor walk" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"state_path_unsafe\"" >/dev/null <<<"$out"'
+rm "$APP_ROOT"
+mv "$APP_ROOT.real" "$APP_ROOT"
+
+OPEN="$TMP/open-state-parent"
+mkdir -p "$OPEN/state"
+chmod 777 "$OPEN"
+out="$(env "${base_env[@]}" CCC_FLEET_SKILLS_APP_ROOT="$APP_ROOT" \
+  CCC_FLEET_SKILLS_STATE_DIR="$OPEN/state" python3 "$SYNC" plan --ref "$REF")"; rc=$?
+ok "world-writable parent outside the app root still fails" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"state_path_unsafe\"" >/dev/null <<<"$out"'
+
+chmod 750 "$T_STATE"
+out="$(env "${termux_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
+ok "final state dir below the app root stays strictly private" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"state_path_unsafe\"" >/dev/null <<<"$out"'
+chmod 700 "$T_STATE"
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
