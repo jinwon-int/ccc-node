@@ -2,182 +2,6 @@
   "schema_version": 1,
   "skills": [
     {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Systematically review bilingual medical terminology pairs in multilingual clinical content (NCLEX, etc.) across all changed keys, validating semantic equivalence, clinical accuracy, and standards compliance, then render structured PASS/BLOCK verdict. Use when reviewing A2AD terminology_bilingual lanes for NCLEX or similar multilingual clinical content, where every changed TERM-REC key must be individually validated and accounted for before screen-to-reviewed promotion.",
-      "files": 1,
-      "managed": false,
-      "name": "bilingual-terminology-review-gate",
-      "source": "claude/skills/bilingual-terminology-review-gate",
-      "status": "active",
-      "tree_sha256": "5312ead3403326090a2c8a977fa6f9a04f44268cbfba92960c977cf57c71068c"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Restart the systemd service that hosts the CURRENT bridge/agent session (Telegram bridge, gateway, broker tunnel) without losing the post-restart verification step. A plain `systemctl restart <own-service>` kills the calling shell/session mid-command — any verification lines written after it never run, and the next session sees no evidence. Detach the restart+verify sequence into an independent `systemd-run` transient unit BEFORE issuing the restart, so it survives being severed from its own parent, then read its log/registry entry from the next session. Use whenever you are about to restart a service you are currently running inside of (config reload, timeout tuning, self-update checkout swap), not for restarting a peer/unrelated service (plain `systemctl restart` is fine there).",
-      "files": 1,
-      "managed": false,
-      "name": "bridge-detached-self-restart",
-      "source": "claude/skills/bridge-detached-self-restart",
-      "status": "active",
-      "tree_sha256": "e38e520d15aeb068b4032e4769f1bf59e38a903e3624e83ae05e8ad859c7c0f5"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Run a long-running command as a detached systemd transient unit so it survives Telegram-bridge/session restarts — with persistent log file, EXIT marker, HOME/PATH env injection, and a durable job registry that lets any later session read the completion evidence. Use when a task may outlive the current session (installs, mining/indexing, builds, migrations, long tests), when a previous background task was killed by a bridge restart (ccc-node #822), when a watcher died and a finished job looks failed (ccc-node #1258), or when systemd-run output mysteriously fails due to missing HOME.",
-      "files": 1,
-      "managed": false,
-      "name": "bridge-safe-detached-run",
-      "source": "claude/skills/bridge-safe-detached-run",
-      "status": "active",
-      "tree_sha256": "1675b4bef266c19460d1d23d8c4046be7576bf46094649b5862e710a286f3ef0"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Diagnose and safely adjust service timeout configuration for performance-limited workloads; includes backup, restart, and post-restart verification that config loaded Use when a service or bridge consistently times out during resource-intensive operations and the timeout looks like a hard limit rather than a genuine hang or deadlock.",
-      "files": 1,
-      "managed": false,
-      "name": "bridge-timeout-performance-tuning-and-verification",
-      "source": "claude/skills/bridge-timeout-performance-tuning-and-verification",
-      "status": "active",
-      "tree_sha256": "d53cd37ea68f910411dd30b3c22a1a84ea093c30467c8ad14323f5ada25f8466"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Inject extra memory/snapshot content into codex bridge sessions via the CCC_CODEX_MEMORY_LOADER extension point — wrap the base loader, merge JSON, wire .env, restart, and verify the materialize chain. Use when adding a new memory source to codex session startup without touching ccc-node managed files.",
-      "files": 1,
-      "managed": false,
-      "name": "codex-memory-loader-injection",
-      "source": "claude/skills/codex-memory-loader-injection",
-      "status": "active",
-      "tree_sha256": "68cb596329b32a8297cecf62539ad32c41803215fad7fd7ec1948411c66361d9"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Manually trigger / inspect / toggle the Session Distiller (TM-1058) — the PreCompact+SessionEnd memory pipeline that distills transcripts via Haiku and routes to Honcho + wiki-candidates. Use when the operator says `/distill`, asks to \"run distill now\", wants to see what the last distill captured, wants aggregate distill health stats, wants to flip between LIVE and DRY-RUN, or wants to turn distill off. Arg options are (empty)/`manual` (fire now), `status` (show last result + queue), `stats [days]` (read-only log summary), `dryrun` (enable dry-run mode), `live` (disable dry-run), `disable` (off-switch), `enable` (clear off-switch), `compact` (retroactive de-dup of pending wiki-candidates backlog).",
-      "files": 1,
-      "managed": false,
-      "name": "distill",
-      "source": "claude/skills/distill",
-      "status": "active",
-      "tree_sha256": "ead2f7fba6ef988f5ffc14b3b911657003181cd36ea73d9620781ebceecc8a8e"
-    },
-    {
-      "audience": "claude",
-      "classification": "adapted",
-      "description": "Ship code through the PR-first GitHub flow on this node, including protected PRs that need an independent cross-account review in either direction — jinon86-authored PR approved via the Seoseo-held seoseo-ai profile (exact-head) or seoseo-ai-authored PR approved/merged as jinon86 (Seoseo-held session) — after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. Enforces no direct main pushes, exact-head and green-check validation, independent review, secret-safe credential use, squash merge, and verified cleanup. Not for Wiki edits (use wiki-record).",
-      "files": 2,
-      "managed": false,
-      "name": "gh-pr-flow",
-      "source": "claude/skills/gh-pr-flow",
-      "status": "active",
-      "tree_sha256": "253862eadeb0e25fe8f908e43de12f70e0849e222aedda06063b7b1888791822"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Identify, back up, and cleanly remove stale background processes (cron, timers, scheduled tasks) while verifying parallel installations aren't collateral damage. Use when a background process (cron job, systemd timer, at job, scheduled task) exists but should not, or when the same task exists in multiple places and only one copy should remain.",
-      "files": 1,
-      "managed": false,
-      "name": "ghost-process-cleanup-and-verification",
-      "source": "claude/skills/ghost-process-cleanup-and-verification",
-      "status": "active",
-      "tree_sha256": "2e3226b8a54e586ca96da061d47c9e2a464fa5f736cdd093c60075b80660ff08"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Recover a green, mergeable PR through a GitHub infrastructure outage — poll the githubstatus components API until Actions/Pull Requests recover, re-run only failed workflow jobs, then land the PR with an exact-head (SHA-pinned) squash merge that falls back from GraphQL to REST and retries on a fixed interval via a detached background watcher. Use when GitHub returns 5xx/timeouts on CI or merge writes while the PR itself has no code problem. Established during the 2026-08-17 GitHub incident (jinwon-int/nclex #210 campaign).",
-      "files": 1,
-      "managed": false,
-      "name": "github-incident-recovery-merge-retry",
-      "source": "claude/skills/github-incident-recovery-merge-retry",
-      "status": "active",
-      "tree_sha256": "73cb2fae394b3f0df22424fa2c2c56a15607b4334ce3e3ea46e41209c06db0d3"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Diagnose a PR whose merge/CI state is untrustworthy — no checks appear at all (statusCheckRollup empty), mergeStateStatus is DIRTY/BEHIND/BLOCKED, or mergeable stays UNKNOWN — by reading the right field, testing conflicts locally without touching the worktree, and detecting a stale base whose green CI no longer proves anything. Use when CI is silent on a PR, when a gh-ci-wait poll times out with nothing queued, when mergeable will not resolve, or before trusting a green check on a PR whose base has moved.",
-      "files": 1,
-      "managed": false,
-      "name": "github-merge-state-conflict-diagnosis",
-      "source": "claude/skills/github-merge-state-conflict-diagnosis",
-      "status": "active",
-      "tree_sha256": "e6edcac6f27d8909e90d776d30375effb8bd675e693efe1f6d16d0b14fbe1e1c"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Produce a Korean HWP/HWPX document that inherits an institutional form's exact formatting on Linux without Hangul Office, by choosing between template-inheritance build (hwp-forge hwpx_template_build.py) and donor-restore surgery (reuse a known-good prior .hwpx as donor and edit Contents/section0.xml while reusing its paraPr/charPr/borderFill IDs), then verifying with an independent parser. Use when asked to generate, revise, or re-issue a .hwp/.hwpx report or official form (기관 양식, 보고서, 붙임 서식) on a server, when a previous revision must be amended in place, or when hand-written zip/XML surgery scripts keep being re-invented per document.",
-      "files": 1,
-      "managed": false,
-      "name": "hwp-forge-donor-template-restore-build",
-      "source": "claude/skills/hwp-forge-donor-template-restore-build",
-      "status": "active",
-      "tree_sha256": "7871592f953aa4faf517f261e336edf5dd9598412304c888be0077658cab07df"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Register a Claude Code MCP tool server at user scope (node-global), reading any API key from the node's resolved env file so the secret never appears in a command, transcript, or commit. Use when adding web search, fetch/scrape, docs, or other MCP tools to this node. Idempotent; also pre-allows the tool in settings.json.",
-      "files": 1,
-      "managed": false,
-      "name": "mcp-add",
-      "source": "claude/skills/mcp-add",
-      "status": "active",
-      "tree_sha256": "e19c2cdc4b5e013714e71e02a73c83cf2b093b126b88198e86752d217c637837"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Drive a jinwon-int/nclex content PR through the full narrow-gate A2A pipeline — terminology lane dispatch, result-preservation rerun on verdict fail, coverage review projection, CI recovery (stale base.sha), content 2-lane dispatch with keyring-trusted worker routing, signed receipt posting, and a2a/receipts verification. Use when authoring or shepherding an NCLEX 출제 PR (new_case/rewrite/remediation), when a terminology or content lane must be dispatched, when a lane returns review_verdict_failed, or when receipts must be projected to the PR. 확립 2026-08-13 RRP-003(#249)·PA-006(#251) 2회 완주.",
-      "files": 1,
-      "managed": false,
-      "name": "nclex-a2a-content-pipeline",
-      "source": "claude/skills/nclex-a2a-content-pipeline",
-      "status": "active",
-      "tree_sha256": "5e919fbe82b937ac0a941e0908dd07eeb9a518100901806b61dcb7e816dc7188"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Pre-flight validate one or many jinwon-int/nclex content PRs against the CURRENT main gate before A2A dispatch or rebase — pin each head in a detached worktree, replay the gate job's validation steps, reproduce the stale-base trap that makes an old green CI turn red on push, classify failures per tool (validate_refs, ko_terminology, ko_coverage, content_process/coverage, a2a_quorum, similarity), and emit READY / NEEDS_FIX / NEEDS_REBASE verdicts with preserved evidence. Use when triaging a batch of open nclex PRs, when a PR's merge base is weeks behind main, when a PR shows green checks but you suspect the rules moved, or before dispatching to nclex-a2a-content-pipeline.",
-      "files": 1,
-      "managed": false,
-      "name": "nclex-multi-pr-pre-flight-gate-validation",
-      "source": "claude/skills/nclex-multi-pr-pre-flight-gate-validation",
-      "status": "active",
-      "tree_sha256": "6ef531aff1d352cca547b6fbeaf5dbbe44f8084fa76796d5d66d16152c4965e7"
-    },
-    {
-      "audience": "claude",
-      "classification": "adapted",
-      "description": "Safely update this node's ccc-node harness (~/.claude) to GitHub latest — detect drift, show the diff, back up, run setup.sh, validate, and roll back on failure. Use when asked to update/upgrade the harness, sync a node to the latest ccc-node, or check harness drift across the fleet. Approval-gated; detection is read-only and applying never happens without explicit OK. Not for the Telegram bridge (use bridge/start.sh --upgrade).",
-      "files": 2,
-      "managed": false,
-      "name": "self-update",
-      "source": "claude/skills/self-update",
-      "status": "active",
-      "tree_sha256": "22df3caf8f1d9fb136f71c82703ed8c321530c018e96e6cfe964bebab4a96ae5"
-    },
-    {
-      "audience": "claude",
-      "classification": "claude-only",
-      "description": "Detect repeated procedures and review create, patch, or support-file skill proposals (human-in-the-loop), and audit or roll back autosave auto-mode changes. Use when asked to find automatable routines, improve an existing skill, review skill candidates, or list and roll back autosave-installed skills.",
-      "files": 2,
-      "managed": false,
-      "name": "skillsuggest",
-      "source": "claude/skills/skillsuggest",
-      "status": "active",
-      "tree_sha256": "28ba67ef7ea74178a4fcbeaa2e25d36edb524dcf40a70c92c77951a37a170a70"
-    },
-    {
       "audience": "codex",
       "classification": null,
       "description": "Inspect, validate, preview, and safely manage ccc-node agent-cron task definitions and execution boundaries. Use when the operator asks about scheduled agent work, due tasks, locks, retries, adding or changing a task, or previewing a scheduler tick.",
@@ -266,13 +90,57 @@
       "tree_sha256": "ad5ae95f22b10921342ca215f907c5a4d7c764aa24e780636243694e1adb660a"
     },
     {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Systematically review bilingual medical terminology pairs in multilingual clinical content (NCLEX, etc.) across all changed keys, validating semantic equivalence, clinical accuracy, and standards compliance, then render structured PASS/BLOCK verdict. Use when reviewing A2AD terminology_bilingual lanes for NCLEX or similar multilingual clinical content, where every changed TERM-REC key must be individually validated and accounted for before screen-to-reviewed promotion.",
+      "files": 1,
+      "managed": false,
+      "name": "bilingual-terminology-review-gate",
+      "source": "skills/bilingual-terminology-review-gate",
+      "status": "active",
+      "tree_sha256": "5312ead3403326090a2c8a977fa6f9a04f44268cbfba92960c977cf57c71068c"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Restart the systemd service that hosts the CURRENT bridge/agent session (Telegram bridge, gateway, broker tunnel) without losing the post-restart verification step. A plain `systemctl restart <own-service>` kills the calling shell/session mid-command — any verification lines written after it never run, and the next session sees no evidence. Detach the restart+verify sequence into an independent `systemd-run` transient unit BEFORE issuing the restart, so it survives being severed from its own parent, then read its log/registry entry from the next session. Use whenever you are about to restart a service you are currently running inside of (config reload, timeout tuning, self-update checkout swap), not for restarting a peer/unrelated service (plain `systemctl restart` is fine there).",
+      "files": 1,
+      "managed": false,
+      "name": "bridge-detached-self-restart",
+      "source": "skills/bridge-detached-self-restart",
+      "status": "active",
+      "tree_sha256": "e38e520d15aeb068b4032e4769f1bf59e38a903e3624e83ae05e8ad859c7c0f5"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Run a long-running command as a detached systemd transient unit so it survives Telegram-bridge/session restarts — with persistent log file, EXIT marker, HOME/PATH env injection, and a durable job registry that lets any later session read the completion evidence. Use when a task may outlive the current session (installs, mining/indexing, builds, migrations, long tests), when a previous background task was killed by a bridge restart (ccc-node #822), when a watcher died and a finished job looks failed (ccc-node #1258), or when systemd-run output mysteriously fails due to missing HOME.",
+      "files": 1,
+      "managed": false,
+      "name": "bridge-safe-detached-run",
+      "source": "skills/bridge-safe-detached-run",
+      "status": "active",
+      "tree_sha256": "1675b4bef266c19460d1d23d8c4046be7576bf46094649b5862e710a286f3ef0"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Diagnose and safely adjust service timeout configuration for performance-limited workloads; includes backup, restart, and post-restart verification that config loaded Use when a service or bridge consistently times out during resource-intensive operations and the timeout looks like a hard limit rather than a genuine hang or deadlock.",
+      "files": 1,
+      "managed": false,
+      "name": "bridge-timeout-performance-tuning-and-verification",
+      "source": "skills/bridge-timeout-performance-tuning-and-verification",
+      "status": "active",
+      "tree_sha256": "d53cd37ea68f910411dd30b3c22a1a84ea093c30467c8ad14323f5ada25f8466"
+    },
+    {
       "audience": "shared",
       "classification": "adapted",
       "description": "Register a durable bridge baton for the next authorized work bundle and end the current turn cleanly. Use when multi-bundle work remains after the current logical unit, including after handling a GitHub CI external event, and the next unit needs no new user choice or approval.",
       "files": 2,
       "managed": true,
       "name": "bridge-yield-continue",
-      "source": "skills/shared/bridge-yield-continue",
+      "source": "skills/bridge-yield-continue",
       "status": "active",
       "tree_sha256": "bdb62da7dba77e94c962a73e7e31b85c2a546a85bba3260d483c0d5b5053ca90"
     },
@@ -283,9 +151,20 @@
       "files": 1,
       "managed": false,
       "name": "cli-diagnostic-stderr-sink-detection",
-      "source": "skills/shared/cli-diagnostic-stderr-sink-detection",
+      "source": "skills/cli-diagnostic-stderr-sink-detection",
       "status": "active",
       "tree_sha256": "2dea48f4a649cf82cdd7485e6ce676517e1065541b42ed0c179e892c1dc385f7"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Inject extra memory/snapshot content into codex bridge sessions via the CCC_CODEX_MEMORY_LOADER extension point — wrap the base loader, merge JSON, wire .env, restart, and verify the materialize chain. Use when adding a new memory source to codex session startup without touching ccc-node managed files.",
+      "files": 1,
+      "managed": false,
+      "name": "codex-memory-loader-injection",
+      "source": "skills/codex-memory-loader-injection",
+      "status": "active",
+      "tree_sha256": "68cb596329b32a8297cecf62539ad32c41803215fad7fd7ec1948411c66361d9"
     },
     {
       "audience": "shared",
@@ -294,9 +173,20 @@
       "files": 1,
       "managed": false,
       "name": "debug-long-running-agent-tasks",
-      "source": "skills/shared/debug-long-running-agent-tasks",
+      "source": "skills/debug-long-running-agent-tasks",
       "status": "active",
       "tree_sha256": "096a9d29fc92ae3a1cbf004829b1c655b5fa9d94b6b645694698dce66335a926"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Manually trigger / inspect / toggle the Session Distiller (TM-1058) — the PreCompact+SessionEnd memory pipeline that distills transcripts via Haiku and routes to Honcho + wiki-candidates. Use when the operator says `/distill`, asks to \"run distill now\", wants to see what the last distill captured, wants aggregate distill health stats, wants to flip between LIVE and DRY-RUN, or wants to turn distill off. Arg options are (empty)/`manual` (fire now), `status` (show last result + queue), `stats [days]` (read-only log summary), `dryrun` (enable dry-run mode), `live` (disable dry-run), `disable` (off-switch), `enable` (clear off-switch), `compact` (retroactive de-dup of pending wiki-candidates backlog).",
+      "files": 1,
+      "managed": false,
+      "name": "distill",
+      "source": "skills/distill",
+      "status": "active",
+      "tree_sha256": "ead2f7fba6ef988f5ffc14b3b911657003181cd36ea73d9620781ebceecc8a8e"
     },
     {
       "audience": "shared",
@@ -305,7 +195,7 @@
       "files": 2,
       "managed": true,
       "name": "fleet-disk-constraint-triage",
-      "source": "skills/shared/fleet-disk-constraint-triage",
+      "source": "skills/fleet-disk-constraint-triage",
       "status": "active",
       "tree_sha256": "f611770784b65b749486c0152cd88ecd95295174ee55e95fdc8964adcacc878a"
     },
@@ -316,7 +206,7 @@
       "files": 1,
       "managed": false,
       "name": "fleet-task-handoff-with-constraints",
-      "source": "skills/shared/fleet-task-handoff-with-constraints",
+      "source": "skills/fleet-task-handoff-with-constraints",
       "status": "active",
       "tree_sha256": "3834b22a8c849d621dcd95ad3f8546c8fd341129e6bbffe49e5c45f8094c71b2"
     },
@@ -327,9 +217,64 @@
       "files": 2,
       "managed": true,
       "name": "gh-ci-wait",
-      "source": "skills/shared/gh-ci-wait",
+      "source": "skills/gh-ci-wait",
       "status": "active",
       "tree_sha256": "14b8d1037470fa80fc30d4418234b18bd5edde45ee1e507971e3e1b1bac42610"
+    },
+    {
+      "audience": "claude",
+      "classification": "adapted",
+      "description": "Ship code through the PR-first GitHub flow on this node, including protected PRs that need an independent cross-account review in either direction — jinon86-authored PR approved via the Seoseo-held seoseo-ai profile (exact-head) or seoseo-ai-authored PR approved/merged as jinon86 (Seoseo-held session) — after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. Enforces no direct main pushes, exact-head and green-check validation, independent review, secret-safe credential use, squash merge, and verified cleanup. Not for Wiki edits (use wiki-record).",
+      "files": 2,
+      "managed": false,
+      "name": "gh-pr-flow",
+      "source": "skills/gh-pr-flow",
+      "status": "active",
+      "tree_sha256": "253862eadeb0e25fe8f908e43de12f70e0849e222aedda06063b7b1888791822"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Identify, back up, and cleanly remove stale background processes (cron, timers, scheduled tasks) while verifying parallel installations aren't collateral damage. Use when a background process (cron job, systemd timer, at job, scheduled task) exists but should not, or when the same task exists in multiple places and only one copy should remain.",
+      "files": 1,
+      "managed": false,
+      "name": "ghost-process-cleanup-and-verification",
+      "source": "skills/ghost-process-cleanup-and-verification",
+      "status": "active",
+      "tree_sha256": "2e3226b8a54e586ca96da061d47c9e2a464fa5f736cdd093c60075b80660ff08"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Recover a green, mergeable PR through a GitHub infrastructure outage — poll the githubstatus components API until Actions/Pull Requests recover, re-run only failed workflow jobs, then land the PR with an exact-head (SHA-pinned) squash merge that falls back from GraphQL to REST and retries on a fixed interval via a detached background watcher. Use when GitHub returns 5xx/timeouts on CI or merge writes while the PR itself has no code problem. Established during the 2026-08-17 GitHub incident (jinwon-int/nclex #210 campaign).",
+      "files": 1,
+      "managed": false,
+      "name": "github-incident-recovery-merge-retry",
+      "source": "skills/github-incident-recovery-merge-retry",
+      "status": "active",
+      "tree_sha256": "73cb2fae394b3f0df22424fa2c2c56a15607b4334ce3e3ea46e41209c06db0d3"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Diagnose a PR whose merge/CI state is untrustworthy — no checks appear at all (statusCheckRollup empty), mergeStateStatus is DIRTY/BEHIND/BLOCKED, or mergeable stays UNKNOWN — by reading the right field, testing conflicts locally without touching the worktree, and detecting a stale base whose green CI no longer proves anything. Use when CI is silent on a PR, when a gh-ci-wait poll times out with nothing queued, when mergeable will not resolve, or before trusting a green check on a PR whose base has moved.",
+      "files": 1,
+      "managed": false,
+      "name": "github-merge-state-conflict-diagnosis",
+      "source": "skills/github-merge-state-conflict-diagnosis",
+      "status": "active",
+      "tree_sha256": "e6edcac6f27d8909e90d776d30375effb8bd675e693efe1f6d16d0b14fbe1e1c"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Produce a Korean HWP/HWPX document that inherits an institutional form's exact formatting on Linux without Hangul Office, by choosing between template-inheritance build (hwp-forge hwpx_template_build.py) and donor-restore surgery (reuse a known-good prior .hwpx as donor and edit Contents/section0.xml while reusing its paraPr/charPr/borderFill IDs), then verifying with an independent parser. Use when asked to generate, revise, or re-issue a .hwp/.hwpx report or official form (기관 양식, 보고서, 붙임 서식) on a server, when a previous revision must be amended in place, or when hand-written zip/XML surgery scripts keep being re-invented per document.",
+      "files": 1,
+      "managed": false,
+      "name": "hwp-forge-donor-template-restore-build",
+      "source": "skills/hwp-forge-donor-template-restore-build",
+      "status": "active",
+      "tree_sha256": "7871592f953aa4faf517f261e336edf5dd9598412304c888be0077658cab07df"
     },
     {
       "audience": "shared",
@@ -338,9 +283,20 @@
       "files": 1,
       "managed": false,
       "name": "infra-gate-admin-merge-discipline",
-      "source": "skills/shared/infra-gate-admin-merge-discipline",
+      "source": "skills/infra-gate-admin-merge-discipline",
       "status": "active",
       "tree_sha256": "524bc8cbb5db8b0af6afa0ba1ad7cdb4aa911dfbbe4e42553011c9ae8d90f4d4"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Register a Claude Code MCP tool server at user scope (node-global), reading any API key from the node's resolved env file so the secret never appears in a command, transcript, or commit. Use when adding web search, fetch/scrape, docs, or other MCP tools to this node. Idempotent; also pre-allows the tool in settings.json.",
+      "files": 1,
+      "managed": false,
+      "name": "mcp-add",
+      "source": "skills/mcp-add",
+      "status": "active",
+      "tree_sha256": "e19c2cdc4b5e013714e71e02a73c83cf2b093b126b88198e86752d217c637837"
     },
     {
       "audience": "shared",
@@ -349,9 +305,31 @@
       "files": 1,
       "managed": false,
       "name": "metric-counting-method-verification",
-      "source": "skills/shared/metric-counting-method-verification",
+      "source": "skills/metric-counting-method-verification",
       "status": "active",
       "tree_sha256": "c8ed02c3f40976a0a0fb3a7772dca94d627982862a55e86220646c3e1fb86d3c"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Drive a jinwon-int/nclex content PR through the full narrow-gate A2A pipeline — terminology lane dispatch, result-preservation rerun on verdict fail, coverage review projection, CI recovery (stale base.sha), content 2-lane dispatch with keyring-trusted worker routing, signed receipt posting, and a2a/receipts verification. Use when authoring or shepherding an NCLEX 출제 PR (new_case/rewrite/remediation), when a terminology or content lane must be dispatched, when a lane returns review_verdict_failed, or when receipts must be projected to the PR. 확립 2026-08-13 RRP-003(#249)·PA-006(#251) 2회 완주.",
+      "files": 1,
+      "managed": false,
+      "name": "nclex-a2a-content-pipeline",
+      "source": "skills/nclex-a2a-content-pipeline",
+      "status": "active",
+      "tree_sha256": "5e919fbe82b937ac0a941e0908dd07eeb9a518100901806b61dcb7e816dc7188"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Pre-flight validate one or many jinwon-int/nclex content PRs against the CURRENT main gate before A2A dispatch or rebase — pin each head in a detached worktree, replay the gate job's validation steps, reproduce the stale-base trap that makes an old green CI turn red on push, classify failures per tool (validate_refs, ko_terminology, ko_coverage, content_process/coverage, a2a_quorum, similarity), and emit READY / NEEDS_FIX / NEEDS_REBASE verdicts with preserved evidence. Use when triaging a batch of open nclex PRs, when a PR's merge base is weeks behind main, when a PR shows green checks but you suspect the rules moved, or before dispatching to nclex-a2a-content-pipeline.",
+      "files": 1,
+      "managed": false,
+      "name": "nclex-multi-pr-pre-flight-gate-validation",
+      "source": "skills/nclex-multi-pr-pre-flight-gate-validation",
+      "status": "active",
+      "tree_sha256": "6ef531aff1d352cca547b6fbeaf5dbbe44f8084fa76796d5d66d16152c4965e7"
     },
     {
       "audience": "shared",
@@ -360,7 +338,7 @@
       "files": 1,
       "managed": false,
       "name": "scheduled-verification-with-session-fallback",
-      "source": "skills/shared/scheduled-verification-with-session-fallback",
+      "source": "skills/scheduled-verification-with-session-fallback",
       "status": "active",
       "tree_sha256": "7b1b83db5d78032a1d7ae6a241b8cc6f08be64e477ad094ae7c98ac41c927b89"
     },
@@ -371,9 +349,31 @@
       "files": 1,
       "managed": false,
       "name": "schema-change-mixed-data-validation",
-      "source": "skills/shared/schema-change-mixed-data-validation",
+      "source": "skills/schema-change-mixed-data-validation",
       "status": "active",
       "tree_sha256": "c43f7694271d84f44902128ba10199e0765205f4b7fcd86a288c553fb514637f"
+    },
+    {
+      "audience": "claude",
+      "classification": "adapted",
+      "description": "Safely update this node's ccc-node harness (~/.claude) to GitHub latest — detect drift, show the diff, back up, run setup.sh, validate, and roll back on failure. Use when asked to update/upgrade the harness, sync a node to the latest ccc-node, or check harness drift across the fleet. Approval-gated; detection is read-only and applying never happens without explicit OK. Not for the Telegram bridge (use bridge/start.sh --upgrade).",
+      "files": 2,
+      "managed": false,
+      "name": "self-update",
+      "source": "skills/self-update",
+      "status": "active",
+      "tree_sha256": "22df3caf8f1d9fb136f71c82703ed8c321530c018e96e6cfe964bebab4a96ae5"
+    },
+    {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Detect repeated procedures and review create, patch, or support-file skill proposals (human-in-the-loop), and audit or roll back autosave auto-mode changes. Use when asked to find automatable routines, improve an existing skill, review skill candidates, or list and roll back autosave-installed skills.",
+      "files": 2,
+      "managed": false,
+      "name": "skillsuggest",
+      "source": "skills/skillsuggest",
+      "status": "active",
+      "tree_sha256": "28ba67ef7ea74178a4fcbeaa2e25d36edb524dcf40a70c92c77951a37a170a70"
     },
     {
       "audience": "shared",
@@ -382,7 +382,7 @@
       "files": 1,
       "managed": false,
       "name": "staleness-threshold-empirical-calibration",
-      "source": "skills/shared/staleness-threshold-empirical-calibration",
+      "source": "skills/staleness-threshold-empirical-calibration",
       "status": "active",
       "tree_sha256": "ea810e2c6851fea1acbd7124203b7db716960ba9c89bbd67c2e72821c59b77de"
     },
@@ -393,7 +393,7 @@
       "files": 2,
       "managed": true,
       "name": "web-routing",
-      "source": "skills/shared/web-routing",
+      "source": "skills/web-routing",
       "status": "active",
       "tree_sha256": "f829c9261120969bf858f3fc5206e414852329476a69e37527bd081ad9a5fe46"
     },
@@ -404,7 +404,7 @@
       "files": 1,
       "managed": false,
       "name": "wiki-record",
-      "source": "skills/shared/wiki-record",
+      "source": "skills/wiki-record",
       "status": "active",
       "tree_sha256": "ddf1db8c23c4ebb03057227862530deb63800f3f867e18199d4e277f63ddecb0"
     }

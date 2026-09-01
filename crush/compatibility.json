@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
   "notes": [
-    "crush scans ~/.claude/skills natively, so claude skills need no port. compatibility=native means the stock skill directory is picked up as-is.",
+    "crush scans ~/.claude/skills natively, so claude skills need no port. compatibility=native means the stock skill directory is picked up as-is. Repo skill sources are unified under skills/ (#1393) and setup.sh still installs them flat into ~/.claude/skills, so the runtime layout is unchanged.",
     "claude/commands/*.md are Claude Code command-runtime files; crush has no equivalent runtime, so those stay claude-only unless a crush agent profile is authored later."
   ],
   "classifications": [
     {
-      "pattern": "claude/skills/**",
+      "pattern": "skills/**",
       "compatibility": "native",
-      "reason": "crush discovers ~/.claude/skills and project .claude/skills without configuration; our 33 skills use only name+description frontmatter, which the Agent Skills standard parses"
+      "reason": "crush discovers ~/.claude/skills and project .claude/skills without configuration; our 29 canonical skills (claude + shared unified under repo skills/, #1393) use only name+description frontmatter, which the Agent Skills standard parses"
     },
     {
       "pattern": "claude/commands/**",

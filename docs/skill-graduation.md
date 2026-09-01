@@ -5,7 +5,7 @@ levels, and graduation is the one-way path between them:
 
 | Repository | Role | Trust level |
 |---|---|---|
-| **ccc-node** (`skills/shared`, `claude/skills`, …) | Official distribution — hand-written, reviewed skills; `setup.sh` installs them on every node | product-code level |
+| **ccc-node** (`skills/`, plus `codex/skills`, `piri/skills`) | Official distribution — hand-written, reviewed skills; `setup.sh` installs them on every node | product-code level |
 | **fleet-skills** (private, `approved/`) | Quarantine — skills nodes learned automatically (autosave → promotion → intake PR) | isolated verification |
 
 Auto-generated content never enters the public repository directly
@@ -31,9 +31,11 @@ graduates into ccc-node, and the fleet-skills copy retires.
       files >300 lines carry a table of contents.
 - [ ] **License & attribution decided for PUBLIC**: third-party content is
       attributed; the skill's license field states the chosen license.
-- [ ] **Runtime classification decided**: `skills/shared` (runtime-neutral)
-      or `claude/skills` (Claude-specific references present). The skill must
-      pass the compatibility catalog's classification for its target root.
+- [ ] **Runtime classification decided**: the compatibility catalog entry
+      states `compatibility` and `audience` — `"audience": "shared"`
+      (runtime-neutral) or `"audience": "claude"` (Claude-specific references
+      present). The skill must pass the compatibility catalog's classification
+      for `skills/`.
 - [ ] **Operator sponsorship**: a human names this candidate and owns the
       promotion PR. There is no automatic graduation.
 - [ ] **Effect evidence (optional, recommended)**: with-skill vs baseline
@@ -43,9 +45,9 @@ graduates into ccc-node, and the fleet-skills copy retires.
 
 1. **Promotion PR in ccc-node** (authored per `gh-pr-flow`):
    - copy the skill files from fleet-skills `approved/<audience>/<name>/`
-     into the target directory (`skills/shared/<name>/` or
-     `claude/skills/<name>/`);
-   - add the `compatibility.json` classification for the target root;
+     into the canonical root (`skills/<name>/`);
+   - add the `compatibility.json` classification with `compatibility` and
+     `audience` for the skill;
    - run `python3 scripts/ccc-skill-registry.py update --repo-root .` and
      commit the refreshed `skills/registry.json`;
    - PR body must record the provenance: the fleet-skills intake PR number

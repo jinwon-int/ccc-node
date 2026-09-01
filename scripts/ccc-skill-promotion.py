@@ -927,7 +927,9 @@ def _update_catalog(root: Path, candidate: Candidate) -> None:
     managed = data.get("managed_skills")
     if not isinstance(classifications, list) or not isinstance(managed, list):
         raise PromotionError("catalog_invalid")
-    pattern = f"skills/shared/{candidate.name}/**"
+    # Unified canonical root (#1393): promoted fleet skills land in skills/,
+    # the provider split is a compatibility.json audience concern, not a path.
+    pattern = f"skills/{candidate.name}/**"
     if any(isinstance(item, dict) and item.get("pattern") == pattern for item in classifications):
         raise PromotionError("central_name_exists")
     if any(isinstance(item, dict) and item.get("name") == candidate.name for item in managed):
@@ -935,7 +937,7 @@ def _update_catalog(root: Path, candidate: Candidate) -> None:
     classifications.append(
         {"pattern": pattern, "compatibility": "adapted", "codex_skill": candidate.name}
     )
-    managed.append({"name": candidate.name, "source": f"skills/shared/{candidate.name}"})
+    managed.append({"name": candidate.name, "source": f"skills/{candidate.name}"})
     managed.sort(key=lambda item: str(item.get("name", "")) if isinstance(item, dict) else "")
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Single generated registry over every repo skill source (#1338).
 
-Scans the four skill audiences (``skills/shared``, ``claude/skills``,
-``codex/skills``, ``piri/skills``), reads each ``SKILL.md`` frontmatter and
+Scans the skill roots (the unified ``skills`` root plus ``codex/skills`` and
+``piri/skills``), reads each ``SKILL.md`` frontmatter and
 ``codex/compatibility.json``, and emits ``skills/registry.json``.
 
 ``validate-harness`` re-derives the registry and fails closed on drift, so the
@@ -47,20 +47,23 @@ MAX_REGISTRY_BYTES = 256 * 1024
 MAX_SKILL_FILES = 64
 MAX_SKILL_BYTES = 1024 * 1024
 
-# audience -> repo-relative skill root
-AUDIENCES: dict[str, str] = {
-    "shared": "skills/shared",
-    "claude": "claude/skills",
+# repo-relative skill root -> root key. The unified root "skills" (#1393)
+# holds every canonical skill; its entries' audience comes from the
+# compatibility catalog. codex and piri keep provider-specific roots and
+# their audience is the root key itself.
+SKILL_ROOTS: dict[str, str] = {
+    "skills": "skills",
     "codex": "codex/skills",
     "piri": "piri/skills",
 }
-# Audiences whose files the compatibility catalog classifies (pattern roots
-# "claude/" and "skills/shared/"). codex and piri skills carry no
-# classification — their parity contract lives in the provisioner, not here.
-CLASSIFIED_AUDIENCES = frozenset({"shared", "claude"})
+# Root whose skills the compatibility catalog must classify and give an
+# audience to. codex and piri skills carry no classification — their parity
+# contract lives in the provisioner, not here.
+CLASSIFIED_ROOTS = frozenset({"skills"})
 CLASSIFICATION_VALUES = frozenset(
     {"shared", "adapted", "claude-only", "codex-only", "unsupported"}
 )
+AUDIENCE_VALUES = frozenset({"claude", "shared"})
 
 
 class RegistryError(RuntimeError):
@@ -257,13 +260,18 @@ def _load_catalog(repo: Path) -> tuple[list[dict[str, str]], dict[str, str]]:
             raise RegistryError("registry_catalog_invalid")
         pattern = value.get("pattern")
         compatibility = value.get("compatibility")
+        audience = value.get("audience")
         if (
             not isinstance(pattern, str)
-            or not pattern.startswith(("claude/", "skills/shared/"))
+            or not pattern.startswith(("claude/", "skills/"))
             or compatibility not in CLASSIFICATION_VALUES
+            or (audience is not None and audience not in AUDIENCE_VALUES)
         ):
             raise RegistryError("registry_catalog_invalid")
-        rules.append({"pattern": pattern, "compatibility": compatibility})
+        rule = {"pattern": pattern, "compatibility": compatibility}
+        if audience is not None:
+            rule["audience"] = audience
+        rules.append(rule)
     raw_managed = catalog.get("managed_skills")
     if not isinstance(raw_managed, list):
         raise RegistryError("registry_catalog_invalid")
@@ -283,17 +291,30 @@ def _load_catalog(repo: Path) -> tuple[list[dict[str, str]], dict[str, str]]:
 
 def _classification_for(
     relative_files: list[str], rules: list[dict[str, str]]
-) -> str | None:
+) -> tuple[str | None, str | None]:
+    """(compatibility, audience) for one skill's files, None when unclassified.
+
+    The audience is taken from the matched catalog entries (#1393); rules
+    without an audience (non-skill assets such as claude/commands) never
+    contribute one. More than one distinct value of either kind is an
+    overlap error, mirroring the fail-closed catalog contract.
+    """
     matched: set[str] = set()
+    matched_audiences: set[str] = set()
     for relative in relative_files:
         for rule in rules:
             if fnmatch.fnmatchcase(relative, rule["pattern"]):
                 matched.add(rule["compatibility"])
+                audience = rule.get("audience")
+                if audience is not None:
+                    matched_audiences.add(audience)
     if not matched:
-        return None
+        return None, None
     if len(matched) > 1:
         raise RegistryError("registry_classification_overlap")
-    return matched.pop()
+    if len(matched_audiences) > 1:
+        raise RegistryError("registry_audience_overlap")
+    return matched.pop(), (matched_audiences.pop() if matched_audiences else None)
 
 
 def build(repo: Path) -> tuple[list[dict[str, Any]], list[str]]:
@@ -301,33 +322,38 @@ def build(repo: Path) -> tuple[list[dict[str, Any]], list[str]]:
     skipped so one bad skill cannot hide the state of the other 38."""
     rules, managed = _load_catalog(repo)
     managed_sources = set(managed.values())
-    roots = [root for root in AUDIENCES.values() if (repo / root).is_dir()]
+    roots = [root for root in SKILL_ROOTS.values() if (repo / root).is_dir()]
     listed = _git_listed(repo, roots)
     skills: list[dict[str, Any]] = []
     errors: list[str] = []
-    for audience in sorted(AUDIENCES):
-        root = repo / AUDIENCES[audience]
+    for root_key in sorted(SKILL_ROOTS):
+        root = repo / SKILL_ROOTS[root_key]
         if not root.is_dir():
             continue
         if root.is_symlink():
-            errors.append(f"registry_skill_source_invalid {AUDIENCES[audience]}")
+            errors.append(f"registry_skill_source_invalid {SKILL_ROOTS[root_key]}")
             continue
         for skill_dir in sorted(root.iterdir()):
             if not skill_dir.is_dir() or skill_dir.name.startswith("."):
                 continue
-            source = f"{AUDIENCES[audience]}/{skill_dir.name}"
+            source = f"{SKILL_ROOTS[root_key]}/{skill_dir.name}"
             try:
                 frontmatter = _frontmatter(skill_dir / "SKILL.md")
                 if frontmatter["name"] != skill_dir.name:
                     raise RegistryError("registry_skill_invalid")
-                files = _skill_files(skill_dir, listed, AUDIENCES[audience])
+                files = _skill_files(skill_dir, listed, SKILL_ROOTS[root_key])
                 hashes = _file_hashes(files, skill_dir)
-                classification = _classification_for(
+                classification, audience = _classification_for(
                     sorted(f"{source}/{relative}" for relative in hashes),
                     rules,
                 )
-                if classification is None and audience in CLASSIFIED_AUDIENCES:
-                    raise RegistryError("registry_unclassified")
+                if root_key in CLASSIFIED_ROOTS:
+                    if classification is None:
+                        raise RegistryError("registry_unclassified")
+                    if audience is None:
+                        raise RegistryError("registry_audience_missing")
+                else:
+                    audience = root_key
                 skills.append(
                     {
                         "audience": audience,

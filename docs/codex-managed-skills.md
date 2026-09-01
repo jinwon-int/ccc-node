@@ -9,8 +9,7 @@ provisioning, not the learned-skill pipeline tracked by issue #643.
 `codex/compatibility.json` classifies every file under:
 
 - `claude/commands`
-- `claude/skills`
-- `skills/shared`
+- `skills` (the unified canonical root, #1393)
 - `claude/agents`
 - `claude/hooks`
 
@@ -29,13 +28,13 @@ The managed set is:
 | `ccc-agent-cron` | Scheduled-task inspection and explicit execution boundary |
 | `ccc-self-update` | Drift check and approval-gated transactional update |
 | `ccc-wiki-record` | Family Wiki PR-first durable recording |
-| `gh-ci-wait` | Durable GitHub CI wait registration (sourced from `skills/shared/`) |
-| `fleet-disk-constraint-triage` | Fleet disk audit and node-local cleanup delegation (sourced from `skills/shared/`) |
+| `gh-ci-wait` | Durable GitHub CI wait registration (sourced from `skills/`) |
+| `fleet-disk-constraint-triage` | Fleet disk audit and node-local cleanup delegation (sourced from `skills/`) |
 | `gh-pr-flow` | Exact-head protected PR review and normal squash merge |
 | `web-routing` | SearXNG search, Firecrawl URL scrape, and Developer Index routing |
 
 Managed skills are sourced from `codex/skills/` (Codex-adapted ports) or, when
-the shared text is already runtime-clean, directly from `skills/shared/` — the
+the shared text is already runtime-clean, directly from `skills/` — the
 catalog's `managed_skills[].source` records which, and the installed
 `.ccc-node-managed.json` carries that provenance.
 
