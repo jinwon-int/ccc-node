@@ -93,10 +93,26 @@ class Operation:
     action: str
 
 
+@dataclass(frozen=True)
+class Retirement:
+    """An installed fleet skill the repo no longer distributes (fleet-skills#92)."""
+
+    provider: str
+    name: str
+    target: Path
+    action: str  # "retire" (unmodified → prune) | "retire-keep" (drifted → warn)
+    recorded: str | None
+    current: str
+
+
 # Actions that must never reach apply_operations: noop (already exact) and
 # skip-repo-managed (a repo-managed installation owns the target — the higher
 # precedence layer, #1344).
 SKIP_ACTIONS = frozenset({"noop", "skip-repo-managed"})
+# Retirement reconcile (#92): unmodified orphans are pruned, drifted orphans
+# are kept and reported — setup.sh's #1330 prune philosophy, fleet edition.
+RETIRE_PRUNE = "retire"
+RETIRE_KEEP = "retire-keep"
 
 
 def json_line(value: object) -> str:
@@ -480,6 +496,40 @@ def installed_matches(path: Path, skill: ApprovedSkill) -> bool:
     return actual == wanted
 
 
+def installed_tree_sha256(path: Path) -> str:
+    """The skill_tree digest of an installed copy, for retirement reconcile.
+
+    Replicates skill_tree()'s enumeration (sorted files, marker excluded) so
+    an untouched install hashes back to its marker's tree_sha256. Any
+    unreadable, non-regular, or symlinked entry is drift — reported as "".
+    """
+    digest = hashlib.sha256()
+    try:
+        entries = sorted(path.rglob("*"))
+    except OSError:
+        return ""
+    for item in entries:
+        relative = item.relative_to(path).as_posix()
+        if relative == ".ccc-fleet-skill.json":
+            continue
+        try:
+            metadata = item.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                return ""
+            if stat.S_ISDIR(metadata.st_mode):
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                return ""
+            payload = item.read_bytes()
+        except OSError:
+            return ""
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(payload).hexdigest().encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def repo_managed_marker(path: Path) -> dict[str, Any] | None:
     """The Codex provisioner's ownership marker, fail-closed on tampering."""
     marker_path = path / ".ccc-node-managed.json"
@@ -565,6 +615,49 @@ def operations(cfg: Config, skills: list[ApprovedSkill], *, create_roots: bool) 
     return rows
 
 
+def retirements(cfg: Config, skills: list[ApprovedSkill]) -> list[Retirement]:
+    """Installed fleet skills the repo no longer distributes (fleet-skills#92).
+
+    Only directories carrying a valid fleet marker are considered: names the
+    current plan still covers are skipped, markerless directories are
+    node-local/autosave/repo-managed and are never touched (the existing
+    target_user_owned fail-closed stays the only interaction they get). An
+    orphan whose tree still hashes to its marker's recorded tree_sha256 is
+    unmodified → retire (pruned under backups/ on apply); anything else is
+    drifted → retire-keep (kept, reported, never touched). A tampered marker
+    is itself drift: it keeps the directory and is reported, not fatal —
+    reconcile never deletes on ambiguous ownership.
+    """
+    planned: dict[str, set[str]] = {"claude": set(), "codex": set()}
+    for skill in skills:
+        providers = ("claude", "codex") if skill.audience == "shared" else (skill.audience,)
+        for provider in providers:
+            planned[provider].add(skill.name)
+    roots = {"claude": cfg.claude_root, "codex": cfg.codex_root}
+    rows: list[Retirement] = []
+    for provider, root in roots.items():
+        if not root.is_dir() or root.is_symlink():
+            continue
+        for child in sorted(item for item in root.iterdir() if item.is_dir() and not item.is_symlink()):
+            name = child.name
+            if name in planned[provider]:
+                continue
+            try:
+                fleet_marker = existing_marker(child)
+            except SyncError:
+                rows.append(Retirement(provider, name, child, RETIRE_KEEP, None, ""))
+                continue
+            if fleet_marker is None:
+                continue
+            recorded = fleet_marker.get("tree_sha256")
+            if not isinstance(recorded, str) or not HASH_RE.fullmatch(recorded):
+                recorded = None
+            current = installed_tree_sha256(child)
+            action = RETIRE_PRUNE if recorded is not None and recorded == current else RETIRE_KEEP
+            rows.append(Retirement(provider, name, child, action, recorded, current))
+    return rows
+
+
 def write_skill(stage: Path, cfg: Config, operation: Operation) -> None:
     stage.chmod(0o700)
     for row in operation.skill.files:
@@ -581,33 +674,63 @@ def write_skill(stage: Path, cfg: Config, operation: Operation) -> None:
     marker_path.chmod(0o600)
 
 
-def apply_operations(cfg: Config, rows: list[Operation]) -> int:
+def stage_and_install(cfg: Config, backup_root: Path, changed: list[Operation], staged: dict[tuple[str, str], Path],
+                      backups: dict[tuple[str, str], Path], applied: list[Operation]) -> None:
+    for row in changed:
+        stage = Path(tempfile.mkdtemp(prefix=f".ccc-fleet-stage-{row.skill.name}-", dir=row.target.parent))
+        write_skill(stage, cfg, row)
+        staged[(row.provider, row.skill.name)] = stage
+    for row in changed:
+        key = (row.provider, row.skill.name)
+        backup = backup_root / f"{row.provider}-{row.skill.name}"
+        if backup.exists():
+            raise SyncError("backup_collision")
+        if row.target.exists():
+            if row.target.stat().st_dev != backup_root.stat().st_dev:
+                raise SyncError("backup_cross_device")
+            os.replace(row.target, backup)
+            backups[key] = backup
+        os.replace(staged[key], row.target)
+        applied.append(row)
+
+
+def prune_retirements(backup_root: Path, prunes: list[Retirement], pruned: list[Retirement]) -> None:
+    """Move unmodified orphans into backups/; never hard-delete (fleet-skills#92)."""
+    for row in prunes:
+        backup = backup_root / f"{row.provider}-{row.name}"
+        if backup.exists():
+            raise SyncError("backup_collision")
+        if row.target.stat().st_dev != backup_root.stat().st_dev:
+            raise SyncError("backup_cross_device")
+        os.replace(row.target, backup)
+        pruned.append(row)
+
+
+def rollback_prunes(backup_root: Path, pruned: list[Retirement]) -> None:
+    for row in reversed(pruned):
+        backup = backup_root / f"{row.provider}-{row.name}"
+        if backup.exists() and not row.target.exists():
+            os.replace(backup, row.target)
+
+
+def apply_operations(cfg: Config, rows: list[Operation], retired: list[Retirement]) -> int:
     changed = [row for row in rows if row.action not in SKIP_ACTIONS]
-    if not changed:
+    prunes = [row for row in retired if row.action == RETIRE_PRUNE]
+    if not changed and not prunes:
         return 0
     backup_root = cfg.state_dir / "backups" / cfg.ref
     private_dir(backup_root)
     staged: dict[tuple[str, str], Path] = {}
     backups: dict[tuple[str, str], Path] = {}
     applied: list[Operation] = []
+    pruned: list[Retirement] = []
     try:
-        for row in changed:
-            stage = Path(tempfile.mkdtemp(prefix=f".ccc-fleet-stage-{row.skill.name}-", dir=row.target.parent))
-            write_skill(stage, cfg, row)
-            staged[(row.provider, row.skill.name)] = stage
-        for row in changed:
-            key = (row.provider, row.skill.name)
-            backup = backup_root / f"{row.provider}-{row.skill.name}"
-            if backup.exists():
-                raise SyncError("backup_collision")
-            if row.target.exists():
-                if row.target.stat().st_dev != backup_root.stat().st_dev:
-                    raise SyncError("backup_cross_device")
-                os.replace(row.target, backup)
-                backups[key] = backup
-            os.replace(staged[key], row.target)
-            applied.append(row)
+        stage_and_install(cfg, backup_root, changed, staged, backups, applied)
+        # Retirement reconcile runs after installs settle; prunes get the
+        # same backup-and-rollback transaction as installs (#92).
+        prune_retirements(backup_root, prunes, pruned)
     except (OSError, SyncError):
+        rollback_prunes(backup_root, pruned)
         for row in reversed(changed):
             key = (row.provider, row.skill.name)
             if key in backups and backups[key].exists():
@@ -645,7 +768,7 @@ def apply_operations(cfg: Config, rows: list[Operation]) -> int:
     finally:
         os.close(descriptor)
     os.replace(temporary, receipt)
-    return len(changed)
+    return len(changed) + len(pruned)
 
 
 def execute(cfg: Config, *, apply: bool) -> dict[str, object]:
@@ -663,7 +786,8 @@ def execute(cfg: Config, *, apply: bool) -> dict[str, object]:
         with tempfile.TemporaryDirectory(prefix="checkout-", dir=cfg.state_dir) as raw:
             skills = approved_skills(checkout(cfg, Path(raw)))
             rows = operations(cfg, skills, create_roots=apply)
-            changed = apply_operations(cfg, rows) if apply else 0
+            retired = retirements(cfg, skills)
+            changed = apply_operations(cfg, rows, retired) if apply else 0
     finally:
         os.close(lock_fd)
     return {
@@ -681,6 +805,16 @@ def execute(cfg: Config, *, apply: bool) -> dict[str, object]:
                 "tree_sha256": row.skill.tree_sha256,
             }
             for row in rows
+        ],
+        "retirements": [
+            {
+                "provider": row.provider,
+                "name": row.name,
+                "action": row.action,
+                "tree_sha256_recorded": row.recorded,
+                "tree_sha256_current": row.current,
+            }
+            for row in retired
         ],
     }
 

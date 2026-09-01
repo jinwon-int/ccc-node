@@ -277,5 +277,66 @@ ok "final state dir below the app root stays strictly private" \
   '[ "$rc" = 2 ] && jq -e ".code == \"state_path_unsafe\"" >/dev/null <<<"$out"'
 chmod 700 "$T_STATE"
 
+# ─── 6) retirement reconcile (#92) ──────────────────────────────
+#    The repo dropping an approved skill must propagate: marker-carrying
+#    installs whose tree still hashes to the marker are pruned (backed up),
+#    locally edited or marker-tampered copies are kept and reported, and
+#    markerless (user-owned) siblings are never touched.
+RET_HOME="$TMP/retire-home"
+RET_CLAUDE="$RET_HOME/.claude/skills"
+RET_CODEX="$RET_HOME/.codex/skills"
+RET_STATE="$RET_HOME/.claude/state/fleet-skills"
+mkdir -p "$RET_CLAUDE" "$RET_CODEX" "$RET_HOME/.claude/state"
+chmod 700 "$RET_HOME" "$RET_HOME/.claude" "$RET_HOME/.claude/state" \
+  "$RET_HOME/.codex" "$RET_CLAUDE" "$RET_CODEX"
+ret_env=("${base_env[@]}" HOME="$RET_HOME" \
+  CCC_FLEET_SKILLS_STATE_DIR="$RET_STATE" \
+  CCC_FLEET_SKILLS_CLAUDE_DIR="$RET_CLAUDE" \
+  CCC_FLEET_SKILLS_CODEX_DIR="$RET_CODEX")
+
+out="$(env "${ret_env[@]}" python3 "$SYNC" apply --ref "$REF")"; rc=$?
+ok "retirement fixture installs the shared skill first" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 2" >/dev/null <<<"$out"'
+mkdir -p "$RET_CLAUDE/user-own"
+printf 'local
+' > "$RET_CLAUDE/user-own/SKILL.md"
+
+SEED3="$TMP/seed-empty"
+REMOTE3="$TMP/remote-empty.git"
+mkdir -p "$SEED3/approved/shared" "$SEED3/approved/claude" "$SEED3/approved/codex"
+touch "$SEED3/approved/shared/.gitkeep" "$SEED3/approved/claude/.gitkeep" "$SEED3/approved/codex/.gitkeep"
+git -C "$SEED3" init -q -b main
+git -C "$SEED3" -c user.name=test -c user.email=test@example.invalid add .
+git -C "$SEED3" -c user.name=test -c user.email=test@example.invalid commit -qm retire-all
+REF3="$(git -C "$SEED3" rev-parse HEAD)"
+git clone -q --bare "$SEED3" "$REMOTE3"
+
+out="$(env "${ret_env[@]}" CCC_FLEET_SKILLS_REMOTE="$REMOTE3" python3 "$SYNC" plan --ref "$REF3")"; rc=$?
+ok "plan reports both unmodified installs as retire (#92)" \
+  '[ "$rc" = 0 ] && jq -e "(.operations | length) == 0 and (.retirements | length) == 2 and (.retirements | all(.action == \"retire\")) and ([.retirements[].provider] | sort) == [\"claude\",\"codex\"]" >/dev/null <<<"$out"'
+ok "plan does not prune and ignores the markerless sibling" \
+  '[ -d "$RET_CLAUDE/release-checklist" ] && [ -d "$RET_CODEX/release-checklist" ] && [ ! -e "$RET_STATE/backups/$REF3" ]'
+
+printf '\nlocal edits\n' >> "$RET_CLAUDE/release-checklist/SKILL.md"
+out="$(env "${ret_env[@]}" CCC_FLEET_SKILLS_REMOTE="$REMOTE3" python3 "$SYNC" plan --ref "$REF3")"; rc=$?
+ok "drifted copy is kept and reported, pristine copy still retires" \
+  '[ "$rc" = 0 ] && jq -e "(.retirements | any(.provider == \"claude\" and .action == \"retire-keep\")) and (.retirements | any(.provider == \"codex\" and .action == \"retire\"))" >/dev/null <<<"$out"'
+
+out="$(env "${ret_env[@]}" CCC_FLEET_SKILLS_REMOTE="$REMOTE3" python3 "$SYNC" apply --ref "$REF3")"; rc=$?
+ok "apply prunes only the unmodified orphan" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 1" >/dev/null <<<"$out" && [ ! -e "$RET_CODEX/release-checklist" ] && [ -d "$RET_CLAUDE/release-checklist" ] && [ -f "$RET_CLAUDE/user-own/SKILL.md" ]'
+ok "pruned copy is preserved under backups" \
+  '[ -f "$RET_STATE/backups/$REF3/codex-release-checklist/SKILL.md" ]'
+ok "receipt after retirement lists no skills" \
+  '[ "$(stat -c %a "$RET_STATE/installed.json")" = 600 ] && jq -e "(.skills | length) == 0" >/dev/null <<<"$out"'
+
+printf 'junk' > "$RET_CLAUDE/release-checklist/.ccc-fleet-skill.json"
+out="$(env "${ret_env[@]}" CCC_FLEET_SKILLS_REMOTE="$REMOTE3" python3 "$SYNC" plan --ref "$REF3")"; rc=$?
+ok "tampered marker reads as drift: kept and reported, not fatal" \
+  '[ "$rc" = 0 ] && jq -e "(.retirements | length) == 1 and (.retirements[0].provider == \"claude\") and (.retirements[0].action == \"retire-keep\")" >/dev/null <<<"$out"'
+out="$(env "${ret_env[@]}" CCC_FLEET_SKILLS_REMOTE="$REMOTE3" python3 "$SYNC" apply --ref "$REF3")"; rc=$?
+ok "tampered-marker orphan is never deleted by apply" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 0" >/dev/null <<<"$out" && [ -d "$RET_CLAUDE/release-checklist" ]'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
