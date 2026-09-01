@@ -168,5 +168,48 @@ out="$(env "${grad_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
 ok "tampered repo-managed marker fails closed" \
   '[ "$rc" = 2 ] && jq -e ".code == \"repo_managed_marker_invalid\"" >/dev/null <<<"$out"'
 
+# ─── 4) approval.json without reviewed_by is valid (#2030) ─────────────────
+#    The owner decision in a2a-nexus#2030 retires the human reviewed_by gate;
+#    approvals omit the field, installed markers carry null, and reruns stay
+#    idempotent.
+SEED2="$TMP/seed-norev"
+REMOTE2="$TMP/remote-norev.git"
+SKILL2="$SEED2/approved/shared/minimal-skill"
+mkdir -p "$SKILL2" "$SEED2/approved/claude" "$SEED2/approved/codex"
+printf -- '---\nname: minimal-skill\ndescription: Approve without a human reviewer.\n---\n\n# Minimal skill\n\n1. Do the step.\n2. Record the result.\n' > "$SKILL2/SKILL.md"
+jq -n '{schema_version:1,source_candidate_id:"minimal-skill-000000000000",
+  source_tree_sha256:("0" * 64),approved_at:"2026-09-01T00:00:00Z"}' > "$SKILL2/approval.json"
+git -C "$SEED2" init -q -b main
+git -C "$SEED2" -c user.name=test -c user.email=test@example.invalid add .
+git -C "$SEED2" -c user.name=test -c user.email=test@example.invalid commit -qm seed
+REF2="$(git -C "$SEED2" rev-parse HEAD)"
+git clone -q --bare "$SEED2" "$REMOTE2"
+
+HOME_DIR2="$TMP/home-norev"
+CLAUDE_ROOT2="$HOME_DIR2/.claude/skills"
+CODEX_ROOT2="$HOME_DIR2/.codex/skills"
+STATE2="$HOME_DIR2/.claude/state/fleet-skills"
+mkdir -p "$CLAUDE_ROOT2" "$CODEX_ROOT2" "$HOME_DIR2/.claude/state"
+chmod 700 "$HOME_DIR2" "$HOME_DIR2/.claude" "$HOME_DIR2/.claude/state" \
+  "$HOME_DIR2/.codex" "$CLAUDE_ROOT2" "$CODEX_ROOT2"
+norev_env=(
+  "HOME=$HOME_DIR2"
+  "CCC_FLEET_SKILLS_STATE_DIR=$STATE2"
+  "CCC_FLEET_SKILLS_CLAUDE_DIR=$CLAUDE_ROOT2"
+  "CCC_FLEET_SKILLS_CODEX_DIR=$CODEX_ROOT2"
+  "CCC_FLEET_SKILLS_REPO=test/repo"
+  "CCC_FLEET_SKILLS_REMOTE=$REMOTE2"
+  "GH_SYNC_STATE=$GH_STATE"
+  "PATH=$BIN:$PATH"
+)
+
+out="$(env "${norev_env[@]}" python3 "$SYNC" apply --ref "$REF2")"; rc=$?
+ok "approval.json without reviewed_by installs (#2030)" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 2" >/dev/null <<<"$out" && jq -e '"'"'.reviewed_by == null'"'"' "$CLAUDE_ROOT2/minimal-skill/.ccc-fleet-skill.json" >/dev/null'
+
+out="$(env "${norev_env[@]}" python3 "$SYNC" plan --ref "$REF2")"; rc=$?
+ok "no-reviewed_by install converges to noops" \
+  '[ "$rc" = 0 ] && jq -e '"'"'.operations | all(.action == "noop")'"'"' >/dev/null <<<"$out"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

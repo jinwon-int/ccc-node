@@ -79,7 +79,7 @@ class ApprovedSkill:
     tree_sha256: str
     source_candidate_id: str
     source_tree_sha256: str
-    reviewed_by: str
+    reviewed_by: str | None
 
 
 @dataclass(frozen=True)
@@ -253,11 +253,17 @@ def approval(path: Path, name: str) -> tuple[str, str, str]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise SyncError("approval_invalid") from None
-    expected = {
+    # a2a-nexus#2030: reviewed_by is optional (legacy approvals keep it).
+    required = {
         "schema_version", "source_candidate_id", "source_tree_sha256",
-        "approved_at", "reviewed_by",
+        "approved_at",
     }
-    if not isinstance(value, dict) or set(value) != expected or value.get("schema_version") != 1:
+    keys = set(value)
+    if (
+        not isinstance(value, dict)
+        or keys not in (required, required | {"reviewed_by"})
+        or value.get("schema_version") != 1
+    ):
         raise SyncError("approval_invalid")
     candidate_id = value.get("source_candidate_id")
     source_hash = value.get("source_tree_sha256")
@@ -269,8 +275,10 @@ def approval(path: Path, name: str) -> tuple[str, str, str]:
         or not re.fullmatch(r"[a-z0-9-]+-[0-9a-f]{12}", candidate_id)
         or not isinstance(source_hash, str)
         or not HASH_RE.fullmatch(source_hash)
-        or not isinstance(reviewer, str)
-        or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", reviewer)
+        or (reviewer is not None and (
+            not isinstance(reviewer, str)
+            or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", reviewer)
+        ))
         or not isinstance(timestamp, str)
         or not timestamp.endswith("Z")
     ):
