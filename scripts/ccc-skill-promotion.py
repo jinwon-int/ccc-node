@@ -1620,8 +1620,9 @@ def _ack_result(config: Config, transport_id: str) -> dict[str, object]:
 # ever lives in the publisher's local environment (never GH secrets), task ids
 # are unique per round (a2a-nexus#2010), a handler crash is a crash — never a
 # verdict — and dispatch failure never closes a PR. Verdicts stay with the
-# a2a-receipts workflow; there is no auto-close and the human `reviewed_by`
-# promotion gate is untouched.
+# a2a-receipts workflow; there is no auto-close. Per the owner decision in
+# a2a-nexus#2030 the A2A verdict is the final promotion gate (the human
+# `reviewed_by` gate is retired once the #2024 validation window closes).
 
 _INTAKE_LANE = "skills_intake_review"
 _INTAKE_RUBRIC_VERSION = "2026-08-28.2"  # must match docs/skills-intake-review.md
@@ -2150,8 +2151,9 @@ def _dispatch_intake_review(  # noqa: C901
                 "--body",
                 f"A2A intake review dispatched automatically (Phase C): task `{dispatched_task}` "
                 f"→ reviewer `{reviewer}` (round `{manifest['roundId']}`, broker `{broker_id}`). "
-                "The signed receipt will project `a2a/receipts` on this head; human `reviewed_by` "
-                "sign-off remains required per policies/REVIEW.md.",
+                "The signed receipt will project `a2a/receipts` on this head; an `approve` verdict "
+                "with a verified receipt is the final promotion gate per policies/REVIEW.md "
+                "(a2a-nexus#2030).",
             ]
         )
     except PromotionError:
@@ -2930,9 +2932,9 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
             processed.append({"outcome": "verdict-consumed", "verdict": verdict, "revise": revise_outcome})
             continue
         if verdict == "reject":
-            note = "reject verdict fails the gate — human decision required, no auto-close"
+            note = "reject verdict fails the gate — owner escalation required, no auto-close"
         elif verdict == "approve":
-            note = "signed receipt projection and human `reviewed_by` sign-off still required"
+            note = "signed receipt projection pending verification; A2A verdict is the final gate (a2a-nexus#2030)"
         try:
             _pr_comment(
                 config,
