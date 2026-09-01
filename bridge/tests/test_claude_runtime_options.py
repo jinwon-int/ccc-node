@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from pydantic import SecretStr
@@ -377,6 +378,37 @@ def test_stderr_classes_cover_the_shapes_worth_telling_apart() -> None:
     assert _classify_cli_stderr(["certificate verify failed"]) == "tls"
     assert _classify_cli_stderr(["something nobody enumerated"]) == "other"
     assert _classify_cli_stderr([]) is None
+
+
+def test_bare_runtime_does_not_pin_system_claude_cli(tmp_path: Path) -> None:
+    # Unbound runtimes must keep the pre-#623 request-only options, including
+    # cli_path=None so the SDK bundled CLI remains the default in tests.
+    with patch("telegram_bot.core.claude_runtime_options.shutil.which", return_value="/usr/bin/claude"):
+        options = _build(ClaudeRuntime(), tmp_path)
+    assert options.cli_path is None
+
+
+def test_configured_claude_cli_path_beats_path_lookup(tmp_path: Path) -> None:
+    runtime = ClaudeRuntime(
+        settings=_settings(tmp_path, claude_cli_path=Path("/opt/pinned/claude"))
+    )
+    with patch("telegram_bot.core.claude_runtime_options.shutil.which", return_value="/usr/bin/claude"):
+        options = _build(runtime, tmp_path)
+    assert options.cli_path == "/opt/pinned/claude"
+
+
+def test_bound_settings_use_system_claude_when_unconfigured(tmp_path: Path) -> None:
+    runtime = ClaudeRuntime(settings=_settings(tmp_path, claude_cli_path=None))
+    with patch("telegram_bot.core.claude_runtime_options.shutil.which", return_value="/usr/bin/claude"):
+        options = _build(runtime, tmp_path)
+    assert options.cli_path == "/usr/bin/claude"
+
+
+def test_bound_settings_leave_cli_path_unset_when_claude_missing(tmp_path: Path) -> None:
+    runtime = ClaudeRuntime(settings=_settings(tmp_path, claude_cli_path=None))
+    with patch("telegram_bot.core.claude_runtime_options.shutil.which", return_value=None):
+        options = _build(runtime, tmp_path)
+    assert options.cli_path is None
 
 
 def test_approval_target_kind_is_body_free() -> None:
