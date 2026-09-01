@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -33,6 +34,23 @@ _PERMISSION_MODES = frozenset(
     {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"}
 )
 _EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def resolve_claude_cli_path(settings: Any) -> str | None:
+    """Choose the Claude CLI the SDK should spawn.
+
+    Bound settings with ``claude_cli_path`` win. Otherwise a ``claude`` on
+    PATH is used so fleet-updated system CLIs beat the SDK-bundled binary
+    (which lags and 400s on newer model IDs). Unbound runtimes keep the SDK
+    default so unit tests stay request-only.
+    """
+    if settings is None:
+        return None
+    configured = getattr(settings, "claude_cli_path", None)
+    if configured not in (None, ""):
+        return str(configured)
+    found = shutil.which("claude")
+    return found or None
 
 
 class ClaudeRuntimeOptionsMixin:
@@ -83,6 +101,9 @@ class ClaudeRuntimeOptionsMixin:
             # limit, which an image-bearing tool result overflows and kills
             # the reader task for the rest of the turn (incident 2026-08-03).
             max_buffer_size=self._max_buffer_size,
+            # None → SDK bundled CLI. An explicit path skips that binary so a
+            # fleet-updated /usr/bin/claude is what actually serves the turn.
+            cli_path=resolve_claude_cli_path(self._settings),
         )
         if self._settings is not None:
             self._apply_execution_profile(options, request)
