@@ -43,6 +43,9 @@ SECRET_PATTERNS = (
     ),
 )
 HOME_PATH_RE = re.compile(r"(?:^|[^A-Za-z0-9_])/(?:root|home|Users)/[^\s`'\"<>]+")
+# Android (Termux) app-private root: the kernel only lets the app uid and
+# root traverse into it, unlike its system-owned 0771 parents (#1390).
+TERMUX_APP_ROOT = Path("/data/data/com.termux")
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 
@@ -162,23 +165,78 @@ def private_repo_required(cfg: Config) -> None:
         raise SyncError("target_repo_not_private")
 
 
-def private_dir(path: Path) -> None:
-    current = Path(path.anchor)
-    for component in path.parts[1:]:
+def private_root(path: Path) -> Path:
+    """Validated platform-private root where the component walk may start.
+
+    The walk normally starts at the filesystem anchor and requires every
+    parent component to be root/euid-owned and not group/other-writable.
+    Under Termux that is unsatisfiable by construction: HOME lives under
+    /data/data/com.termux, whose /data and /data/data parents are
+    system-owned 0771, and the app root's own files/ is 0771 by bootstrap
+    default — so no state or skills path could ever pass (#1390). When the
+    app root lies on the path and validates as a private root/euid 0700
+    directory (the kernel-enforced app sandbox), the walk starts there.
+    Everything else keeps the strict anchor walk. The env override exists
+    for tests; it must satisfy the same validation, so it is safe by
+    construction.
+    """
+    candidate = TERMUX_APP_ROOT
+    if override := os.environ.get("CCC_FLEET_SKILLS_APP_ROOT"):
+        candidate = Path(override)
+        if not candidate.is_absolute():
+            return Path(path.anchor)
+    if path != candidate and candidate not in path.parents:
+        return Path(path.anchor)
+    try:
+        metadata = candidate.lstat()
+    except OSError:
+        return Path(path.anchor)
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid not in {0, os.geteuid()}
+        or mode & 0o077
+    ):
+        return Path(path.anchor)
+    return candidate
+
+
+def protected_walk(path: Path, code: str, *, create: bool, private_final: bool) -> None:
+    """Validate path's parent components against the ownership walk.
+
+    Components below a validated private root keep the symlink/dir and
+    root/euid-ownership checks but skip the group/other-write check: no
+    other user can traverse the private root, so those bits are inert
+    there. The final component always stays fully strict.
+    """
+    start = private_root(path)
+    sandboxed = start != Path(path.anchor)
+    current = start
+    for component in path.relative_to(start).parts:
         current /= component
         try:
             metadata = current.lstat()
         except FileNotFoundError:
+            if not create:
+                raise
             current.mkdir(mode=0o700)
             metadata = current.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise SyncError("state_path_unsafe")
+            raise SyncError(code)
         mode = stat.S_IMODE(metadata.st_mode)
         sticky = metadata.st_uid == 0 and bool(mode & stat.S_ISVTX)
-        if metadata.st_uid not in {0, os.geteuid()} or (mode & 0o022 and not sticky):
-            raise SyncError("state_path_unsafe")
-        if current == path and mode & 0o077:
-            raise SyncError("state_path_unsafe")
+        writable_relaxed = sandboxed and current != path
+        if metadata.st_uid not in {0, os.geteuid()} or (
+            mode & 0o022 and not sticky and not writable_relaxed
+        ):
+            raise SyncError(code)
+        if private_final and current == path and mode & 0o077:
+            raise SyncError(code)
+
+
+def private_dir(path: Path) -> None:
+    protected_walk(path, "state_path_unsafe", create=True, private_final=True)
 
 
 def safe_root(path: Path, *, create: bool) -> None:
@@ -186,19 +244,7 @@ def safe_root(path: Path, *, create: bool) -> None:
         path.mkdir(parents=True, mode=0o700, exist_ok=True)
     if not path.is_dir() or path.is_symlink():
         raise SyncError("skills_root_unsafe")
-    current = Path(path.anchor)
-    for component in path.parts[1:]:
-        current /= component
-        metadata = current.lstat()
-        mode = stat.S_IMODE(metadata.st_mode)
-        sticky = metadata.st_uid == 0 and bool(mode & stat.S_ISVTX)
-        if (
-            stat.S_ISLNK(metadata.st_mode)
-            or not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid not in {0, os.geteuid()}
-            or (mode & 0o022 and not sticky)
-        ):
-            raise SyncError("skills_root_unsafe")
+    protected_walk(path, "skills_root_unsafe", create=False, private_final=False)
 
 
 def scan(payload: bytes) -> str:
