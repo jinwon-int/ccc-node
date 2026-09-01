@@ -3,7 +3,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WIKI_QUEUE="$HERE/wiki-queue.sh"
-SKILL="$HERE/../../skills/distill/SKILL.md"
+SKILL="$HERE/../../../skills/distill/SKILL.md"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

@@ -62,10 +62,11 @@ OUTPUT_STYLE_FILES = ["output-styles/ccc-report.md"]
 #   agents/    top-level *.md; the a2a-* worker roster is role-gated, so it is
 #              only expected when this node opted in (CCC_A2A_ROLE=worker or
 #              the persisted ~/.claude/a2a-role marker).
-#   skills/    per-skill directory trees from TWO repo roots. Skills whose name
-#              is not in the repo set (node-local, autosave) are never touched
-#              by setup.sh and must never be reported here.
-SKILL_SOURCE_ROOTS = ("claude/skills", "skills/shared")
+#   skills/    per-skill directory trees from the single canonical root
+#              (#1393). Skills whose name is not in the repo set (node-local,
+#              autosave) are never touched by setup.sh and must never be
+#              reported here.
+SKILL_SOURCE_ROOTS = ("skills",)
 VALID_SCOPES = {"settings", "files", "hooks", "output-styles", "all"}
 # Installer-managed cron markers and the repo script that renders their lines
 # (#1081). Each managed line carries a `gen=h_<sha256:12>` stamp of the

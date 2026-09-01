@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for claude/skills/self-update/check.sh — the self-update detection step.
+# Tests for skills/self-update/check.sh — the self-update detection step.
 #
 # The regression this pins (#1033): check.sh answered "is the checkout current"
 # while printing a verdict operators read as "is the harness current". A
@@ -9,7 +9,7 @@ set -uo pipefail
 umask 077
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-CHECK="$ROOT/claude/skills/self-update/check.sh"
+CHECK="$ROOT/skills/self-update/check.sh"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$ROOT/claude/hooks/lib/test-stub.sh"
 ccc_test_reset_hook_env

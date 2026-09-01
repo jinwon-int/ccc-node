@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPT="$ROOT/claude/skills/gh-pr-flow/merge-via-seoseo.sh"
+SCRIPT="$ROOT/skills/gh-pr-flow/merge-via-seoseo.sh"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$ROOT/claude/hooks/lib/test-stub.sh"
 # Fixtures supply every CCC_* input this suite needs; ambient harness variables

@@ -7,10 +7,16 @@ re-derived from the tree — never maintained by hand.
 
 ## What it covers
 
+Every canonical skill lives under the single root `skills/` (#1393); codex and
+piri keep provider-specific roots. The `audience` of a `skills/` skill is not
+derived from a directory any more — each skill's classification entry in
+`codex/compatibility.json` carries an explicit `audience` field (`claude` or
+`shared`), and the registry reads it from there.
+
 | Audience | Root | Notes |
 |---|---|---|
-| shared | `skills/shared` | runtime-neutral; compatibility-classified |
-| claude | `claude/skills` | Claude-native; compatibility-classified |
+| shared | `skills/` (via catalog `audience`) | runtime-neutral; compatibility-classified |
+| claude | `skills/` (via catalog `audience`) | Claude-coupled; compatibility-classified |
 | codex | `codex/skills` | Codex-adapted managed ports; the provisioning contract stays in `scripts/ccc_codex_skills.py` |
 | piri | `piri/skills` | Piri-native; outside the compatibility catalog |
 

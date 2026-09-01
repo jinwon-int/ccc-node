@@ -622,9 +622,10 @@ fi
 run mkdir -p "$CLAUDE_DIR/commands"
 run cp "$SRC/claude/commands/"*.md "$CLAUDE_DIR/commands/"
 # Custom skills (reusable procedures) — refreshed as near-atomic per-skill
-# copies on every setup run (stage + single rename), from two trees:
-# claude/skills (harness-coupled) and skills/shared (runtime-agnostic, Wiki
-# TM-2331 superseded note). Real dirs only by design: the managed-artifact
+# copies on every setup run (stage + single rename), from the single
+# canonical tree skills/ (claude/shared provider split unified in #1393;
+# audience is compatibility.json metadata now, not a directory). Real dirs
+# only by design: the managed-artifact
 # guard (scripts/lib/harness_paths.py) refuses symlinks in managed paths, so
 # skills are never symlinked from the checkout. Freshness comes from
 # self-update running setup.sh — 2026-08-07 gongmyoung drift was a dead
@@ -826,7 +827,7 @@ refresh_skill_manifest_hashes() { # refresh_skill_manifest_hashes <dest-root> <m
   mv "$manifest.tmp" "$manifest"
 }
 run mkdir -p "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state"
-install_repo_skills_into "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state/repo-skills.manifest" "$SRC/claude/skills" "$SRC/skills/shared"
+install_repo_skills_into "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state/repo-skills.manifest" "$SRC/skills"
 # Snapshot immediately: the Piri install below reuses the function and would
 # otherwise leave its own set in INSTALLED_REPO_SKILLS by the time the
 # canonical-path rewrite reads it. Piri skills install outside $CLAUDE_DIR and
@@ -894,9 +895,9 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ] || [ "$SRC" != "/opt/ccc-node" ]; then
         rewrite_targets+=("$CLAUDE_DIR/$source_tree/${source_file#"$SRC/claude/$source_tree/"}")
       done < <(find "$SRC/claude/$source_tree" -type f -print0)
     done
-    # Skills come from more than one repo root (claude/skills + skills/shared)
-    # and land flat in $CLAUDE_DIR/skills, so walk what install_repo_skills_into
-    # actually installed instead of re-listing the roots here (#1072). Node-local
+    # Skills come from the single repo root skills/ (#1393) and land flat in
+    # $CLAUDE_DIR/skills, so walk what install_repo_skills_into
+    # actually installed instead of re-listing the root here (#1072). Node-local
     # and autosave skills are absent from that list and stay untouched.
     for skill_name in ${CLAUDE_REPO_SKILLS[@]+"${CLAUDE_REPO_SKILLS[@]}"}; do
       [ -d "$CLAUDE_DIR/skills/$skill_name" ] || continue

@@ -11,16 +11,17 @@ trap 'rm -rf "$TMP"' EXIT
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
-# A minimal but complete fixture repo: one skill per audience, one managed
-# shared skill, classifications for every classified-root file. Always from
-# scratch — a stale artifact or a leftover skill from an earlier case would
-# otherwise leak across cases.
+# A minimal but complete fixture repo: one skill per root — two audiences in
+# the unified skills/ root (#1393, audience from compatibility.json) plus the
+# codex and piri provider roots — with one managed skill and classifications
+# for every classified-root file. Always from scratch — a stale artifact or a
+# leftover skill from an earlier case would otherwise leak across cases.
 make_fixture() {
   local root="$1"
   rm -rf "$root"
-  mkdir -p "$root/skills/shared/demo-skill" "$root/claude/skills/claude-skill" \
+  mkdir -p "$root/skills/demo-skill" "$root/skills/claude-skill" \
            "$root/codex/skills/codex-skill/agents" "$root/piri/skills/piri-skill" "$root/codex"
-  cat > "$root/skills/shared/demo-skill/SKILL.md" <<'MD'
+  cat > "$root/skills/demo-skill/SKILL.md" <<'MD'
 ---
 name: demo-skill
 description: Do the demo procedure end to end whenever the operator asks for it.
@@ -32,7 +33,7 @@ Step one.
 Step two.
 Step three.
 MD
-  cat > "$root/claude/skills/claude-skill/SKILL.md" <<'MD'
+  cat > "$root/skills/claude-skill/SKILL.md" <<'MD'
 ---
 name: claude-skill
 description: Claude-only procedure that references nested metadata blocks safely.
@@ -69,11 +70,11 @@ MD
 {
   "schema_version": 1,
   "classifications": [
-    {"pattern": "skills/shared/demo-skill/**", "compatibility": "shared"},
-    {"pattern": "claude/skills/claude-skill/**", "compatibility": "claude-only"}
+    {"pattern": "skills/demo-skill/**", "compatibility": "adapted", "audience": "shared", "codex_skill": "codex-skill"},
+    {"pattern": "skills/claude-skill/**", "compatibility": "claude-only", "audience": "claude"}
   ],
   "managed_skills": [
-    {"name": "demo-skill", "source": "skills/shared/demo-skill"}
+    {"name": "demo-skill", "source": "skills/demo-skill"}
   ]
 }
 JSON
@@ -88,8 +89,10 @@ ok "render exits 0 on a valid fixture" 'test "$rc1" = 0'
 python3 "$REG" render --repo-root "$TMP/fx" > "$TMP/r2.json" 2>/dev/null
 ok "render is byte-deterministic" 'cmp -s "$TMP/r1.json" "$TMP/r2.json"'
 ok "render lists all four skills" 'test "$(jq ".skills | length" "$TMP/r1.json")" = 4'
-ok "managed shared skill is flagged" 'jq -e ".skills[] | select(.name == \"demo-skill\" and .managed == true and .classification == \"shared\")" "$TMP/r1.json" >/dev/null'
-ok "piri skill carries no classification" 'jq -e ".skills[] | select(.name == \"piri-skill\" and .classification == null)" "$TMP/r1.json" >/dev/null'
+ok "managed unified-root skill is flagged with its catalog audience" 'jq -e ".skills[] | select(.name == \"demo-skill\" and .managed == true and .classification == \"adapted\" and .audience == \"shared\")" "$TMP/r1.json" >/dev/null'
+ok "claude-only skill derives audience=claude from the catalog" 'jq -e ".skills[] | select(.name == \"claude-skill\" and .classification == \"claude-only\" and .audience == \"claude\")" "$TMP/r1.json" >/dev/null'
+ok "codex root skill keeps codex audience and no classification" 'jq -e ".skills[] | select(.name == \"codex-skill\" and .audience == \"codex\" and .classification == null)" "$TMP/r1.json" >/dev/null'
+ok "piri skill carries no classification" 'jq -e ".skills[] | select(.name == \"piri-skill\" and .classification == null and .audience == \"piri\")" "$TMP/r1.json" >/dev/null'
 
 # 2) update writes a fresh artifact atomically; a second run is a no-op
 fixture_ok
@@ -103,16 +106,16 @@ ok "validate passes on a fresh fixture" 'python3 "$REG" validate --repo-root "$T
 # 3) content drift is detected as registry_stale
 make_fixture "$TMP/stale"
 python3 "$REG" update --repo-root "$TMP/stale" >/dev/null
-printf '\nnew content\n' >> "$TMP/stale/skills/shared/demo-skill/SKILL.md"
+printf '\nnew content\n' >> "$TMP/stale/skills/demo-skill/SKILL.md"
 err="$(python3 "$REG" validate --repo-root "$TMP/stale" 2>&1 >/dev/null)"
 rc=$?
 ok "stale tree fails validation" 'test "$rc" = 2'
 ok "stale failure names registry_stale" 'grep -q "registry_stale" <<<"$err"'
 
-# 4) an unclassified shared skill fails closed and update refuses to write
+# 4) an unclassified unified-root skill fails closed and update refuses to write
 fixture_ok   # fresh fixture: no artifact exists yet, so refusal = nothing written
-mkdir -p "$TMP/fx/skills/shared/other-skill"
-cat > "$TMP/fx/skills/shared/other-skill/SKILL.md" <<'MD'
+mkdir -p "$TMP/fx/skills/other-skill"
+cat > "$TMP/fx/skills/other-skill/SKILL.md" <<'MD'
 ---
 name: other-skill
 description: An unclassified skill that must fail catalog validation.
@@ -123,19 +126,50 @@ description: An unclassified skill that must fail catalog validation.
 Body line.
 MD
 err="$(python3 "$REG" render --repo-root "$TMP/fx" 2>&1 >/dev/null)"
-ok "unclassified skill fails render" 'grep -q "registry_unclassified" <<<"$err"'
+ok "unclassified unified-root skill fails render" 'grep -q "registry_unclassified" <<<"$err"'
 ok "update refuses an invalid tree" '! python3 "$REG" update --repo-root "$TMP/fx" >/dev/null 2>&1'
 ok "no artifact written over an invalid tree" 'test ! -e "$TMP/fx/skills/registry.json"'
 
+# 4b) a classified unified-root skill whose catalog entry lacks the audience
+#     field fails closed (#1393): directory position no longer answers the
+#     claude-vs-shared question, so the catalog must.
+fixture_ok
+python3 - "$TMP/fx/codex/compatibility.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+for rule in data["classifications"]:
+    rule.pop("audience", None)
+json.dump(data, open(path, "w"))
+PY
+err="$(python3 "$REG" render --repo-root "$TMP/fx" 2>&1 >/dev/null)"
+ok "classified skill without catalog audience fails render" 'grep -q "registry_audience_missing" <<<"$err"'
+
+# 4c) two matched rules disagreeing on the audience is an overlap error
+fixture_ok
+mkdir -p "$TMP/fx/skills/claude-skill/sub"
+printf 'extra\n' > "$TMP/fx/skills/claude-skill/sub/note.md"
+python3 - "$TMP/fx/codex/compatibility.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+data["classifications"].append(
+    {"pattern": "skills/claude-skill/sub/*", "compatibility": "claude-only", "audience": "shared"}
+)
+json.dump(data, open(path, "w"))
+PY
+err="$(python3 "$REG" render --repo-root "$TMP/fx" 2>&1 >/dev/null)"
+ok "conflicting catalog audiences fail as overlap" 'grep -q "registry_audience_overlap" <<<"$err"'
+
 # 5) an unknown lifecycle status is rejected
 make_fixture "$TMP/badstatus"
-sed -i 's/^name: claude-skill$/name: claude-skill\nstatus: archived/' "$TMP/badstatus/claude/skills/claude-skill/SKILL.md"
+sed -i 's/^name: claude-skill$/name: claude-skill\nstatus: archived/' "$TMP/badstatus/skills/claude-skill/SKILL.md"
 err="$(python3 "$REG" render --repo-root "$TMP/badstatus" 2>&1 >/dev/null)"
 ok "unknown status fails closed" 'grep -q "registry_status_invalid" <<<"$err"'
 
 # 6) a deprecated skill stays in the registry with its lifecycle state
 make_fixture "$TMP/deprecated"
-sed -i 's/^name: claude-skill$/name: claude-skill\nstatus: deprecated/' "$TMP/deprecated/claude/skills/claude-skill/SKILL.md"
+sed -i 's/^name: claude-skill$/name: claude-skill\nstatus: deprecated/' "$TMP/deprecated/skills/claude-skill/SKILL.md"
 python3 "$REG" render --repo-root "$TMP/deprecated" > "$TMP/dep.json" 2>/dev/null
 ok "deprecated skill renders with status=deprecated" 'jq -e ".skills[] | select(.name == \"claude-skill\" and .status == \"deprecated\")" "$TMP/dep.json" >/dev/null'
 out="$(python3 "$REG" update --repo-root "$TMP/deprecated" 2>/dev/null)"
@@ -147,7 +181,7 @@ python3 - "$TMP/orphan/codex/compatibility.json" <<'PY'
 import json, sys
 path = sys.argv[1]
 data = json.load(open(path))
-data["managed_skills"].append({"name": "ghost-skill", "source": "skills/shared/ghost-skill"})
+data["managed_skills"].append({"name": "ghost-skill", "source": "skills/ghost-skill"})
 json.dump(data, open(path, "w"))
 PY
 err="$(python3 "$REG" render --repo-root "$TMP/orphan" 2>&1 >/dev/null)"
@@ -162,11 +196,11 @@ git init -q "$TMP/gitmode" \
   && git -C "$TMP/gitmode" -c user.email=t@local -c user.name=t commit -qm init
 ok "git fixture initialized" 'test -d "$TMP/gitmode/.git"'
 python3 "$REG" update --repo-root "$TMP/gitmode" >/dev/null 2>&1
-printf 'stray\n' > "$TMP/gitmode/skills/shared/demo-skill/stray-file.txt"
+printf 'stray\n' > "$TMP/gitmode/skills/demo-skill/stray-file.txt"
 out="$(python3 "$REG" update --repo-root "$TMP/gitmode" 2>/dev/null)"
 ok "stray file beside tracked skill does not change hashes" 'echo "$out" | jq -e ".ok == true and .written == false" >/dev/null'
-mkdir -p "$TMP/gitmode/skills/shared/new-skill"
-cat > "$TMP/gitmode/skills/shared/new-skill/SKILL.md" <<'MD'
+mkdir -p "$TMP/gitmode/skills/new-skill"
+cat > "$TMP/gitmode/skills/new-skill/SKILL.md" <<'MD'
 ---
 name: new-skill
 description: Brand-new untracked skill that must register before git add.
@@ -181,7 +215,7 @@ import json, sys
 path = sys.argv[1]
 data = json.load(open(path))
 data["classifications"].append(
-    {"pattern": "skills/shared/new-skill/**", "compatibility": "shared"}
+    {"pattern": "skills/new-skill/**", "compatibility": "adapted", "audience": "shared"}
 )
 json.dump(data, open(path, "w"))
 PY

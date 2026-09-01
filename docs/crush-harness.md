@@ -10,7 +10,7 @@ ccc-node의 세 번째 하네스. [crush](https://github.com/charmbracelet/crush
 
 - 단일 Go 바이너리 (기동 user time ~0.36s; Node 기반 CLI의 1/6)
 - Z.ai·Moonshot 내장/커스텀 프로바이더 — K3와 GLM-5.2를 한 하네스로
-- `~/.claude/skills` 네이티브 스캔 — 스킬 33개 무이식 재사용
+- `~/.claude/skills` 네이티브 스캔 — 레포 스킬 29개(`skills/` 통합 루트, #1393) 무이식 재사용
 - `crush run` 비대화형 모드 + bash 스타일 `crushrc`
 
 ## 설치 (노드 옵트인)

@@ -130,14 +130,12 @@ install_managed_trees() { # <fixture-dir>
     mkdir -p "$dir/home/.claude/commands"
     cp "$dir/repo/claude/commands/"*.md "$dir/home/.claude/commands/" 2>/dev/null || true
   fi
-  for skill_root in "$dir/repo/claude/skills" "$dir/repo/skills/shared"; do
-    [ -d "$skill_root" ] || continue
-    mkdir -p "$dir/home/.claude/skills"
-    for skill in "$skill_root"/*/; do
-      [ -d "$skill" ] || continue
-      rm -rf "$dir/home/.claude/skills/$(basename "$skill")"
-      cp -r "$skill" "$dir/home/.claude/skills/$(basename "$skill")"
-    done
+  skill_root="$dir/repo/skills"
+  mkdir -p "$dir/home/.claude/skills"
+  for skill in "$skill_root"/*/; do
+    [ -d "$skill" ] || continue
+    rm -rf "$dir/home/.claude/skills/$(basename "$skill")"
+    cp -r "$skill" "$dir/home/.claude/skills/$(basename "$skill")"
   done
   for f in "$dir/home/.claude/commands" "$dir/home/.claude/skills"; do
     [ -d "$f" ] || continue
@@ -931,22 +929,22 @@ ok "no repo script is subprocess-exec'd without an explicit interpreter" \
   '! grep -nE "subprocess\.(run|check_output|Popen)\(\[str\(" "$ROOT/scripts/ccc_doctor.py"'
 
 # --- managed skills/agents/commands drift (#1037) ----------------------------
-# setup.sh installs four trees; doctor watched two, so a stale skill, agent or
-# slash command was invisible to /doctor AND to self-update's check.sh, which
-# delegates to doctor. These fixtures pin the extended watch and, just as
-# importantly, the cases that must NOT fire.
+# setup.sh installs the skills/commands/agents trees; doctor watches them all,
+# so a stale skill, agent or slash command is invisible to neither /doctor nor
+# self-update's check.sh, which delegates to doctor. These fixtures pin the
+# watch and, just as importantly, the cases that must NOT fire.
 mt="$(make_fixture managed-trees standalone)"
-mkdir -p "$mt/repo/claude/commands" "$mt/repo/claude/skills/demo" "$mt/repo/skills/shared/shared-demo" \
+mkdir -p "$mt/repo/claude/commands" "$mt/repo/skills/demo" "$mt/repo/skills/shared-demo" \
          "$mt/repo/claude/agents"
 printf '# demo command\n' > "$mt/repo/claude/commands/demo.md"
-printf '# demo skill\n'   > "$mt/repo/claude/skills/demo/SKILL.md"
-printf '# shared skill\n' > "$mt/repo/skills/shared/shared-demo/SKILL.md"
+printf '# demo skill\n'   > "$mt/repo/skills/demo/SKILL.md"
+printf '# shared skill\n' > "$mt/repo/skills/shared-demo/SKILL.md"
 install_managed_trees "$mt"
 
 out="$(run_doctor "$mt")"; rc=$?
 ok "fully installed managed trees are 정상" \
   '[ "$rc" = 0 ] && grep -q "정상.*commands/demo.md" <<<"$out" && grep -q "정상.*skills/demo/SKILL.md" <<<"$out"'
-ok "the second skill source root (skills/shared) is watched too" \
+ok "the second unified-root skill (skills/shared-demo) is watched too" \
   'grep -q "skills/shared-demo/SKILL.md" <<<"$out"'
 
 # A node-local skill setup.sh never installs must never be reported.

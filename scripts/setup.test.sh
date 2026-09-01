@@ -278,7 +278,7 @@ printf 'ghost-skill %s\nedited-skill %s\n' "$ghost_hash" "deadbeef" > "$legacy_c
 HOME="$legacy_home" CCC_CLAUDE_DIR="$legacy_claude" CCC_HERMES_DIR="$legacy_home/.hermes" \
   bash "$SETUP" --no-backup >/dev/null 2>&1
 ok "setup refreshes repo skill copies from the claude + shared trees" \
-  'cmp -s "$legacy_claude/skills/wiki-record/SKILL.md" "$ROOT/skills/shared/wiki-record/SKILL.md" && [ ! -L "$legacy_claude/skills/wiki-record" ] && [ -f "$legacy_claude/skills/gh-pr-flow/SKILL.md" ] && ! grep -q "stale copy" "$legacy_claude/skills/wiki-record/SKILL.md"'
+  'cmp -s "$legacy_claude/skills/wiki-record/SKILL.md" "$ROOT/skills/wiki-record/SKILL.md" && [ ! -L "$legacy_claude/skills/wiki-record" ] && [ -f "$legacy_claude/skills/gh-pr-flow/SKILL.md" ] && ! grep -q "stale copy" "$legacy_claude/skills/wiki-record/SKILL.md"'
 ok "setup prunes repo-removed skills when the copy is unmodified" \
   '[ ! -e "$legacy_claude/skills/ghost-skill" ]'
 ok "setup keeps repo-removed skills the node edited locally" \
@@ -486,7 +486,7 @@ ok "setup rerun announces the kept skill" \
 ok "setup rerun keeps the manifest baseline for the kept skill" \
   '[ -n "$baseline" ] && [ "$(awk '\''$1 == "bridge-yield-continue" { print $2 }'\'' "$disco_claude/state/repo-skills.manifest")" = "$baseline" ]'
 ok "setup rerun still refreshes an unmodified repo skill" \
-  'cmp -s "$disco_claude/skills/fleet-disk-constraint-triage/SKILL.md" "$ROOT/skills/shared/fleet-disk-constraint-triage/SKILL.md"'
+  'cmp -s "$disco_claude/skills/fleet-disk-constraint-triage/SKILL.md" "$ROOT/skills/fleet-disk-constraint-triage/SKILL.md"'
 # Slash commands invoke repo scripts verbatim; installed copies must point at
 # THIS checkout, not the canonical /opt/ccc-node (broken on e.g. /root/ccc-node
 # nodes). Repo templates stay canonical — only installed copies are rewritten.
@@ -514,7 +514,7 @@ fi
 # pins the canonical constants across files (#1072).
 skill_roots_agree() {
   local declared doctor
-  declared="$(grep -oE '"\$SRC/(claude/skills|skills/shared)"' "$SETUP" | tr -d '"' | sed "s|\$SRC/||" | sort -u | tr '\n' ' ')"
+  declared="$(grep -oE '"\$SRC/skills"' "$SETUP" | tr -d '"' | sed "s|\$SRC/||" | sort -u | tr '\n' ' ')"
   doctor="$(python3 - "$ROOT/scripts/ccc_doctor.py" <<'PY'
 import ast, sys
 tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
@@ -847,7 +847,7 @@ fleet_out="$TMP/fleet-grad-setup.out"
 HOME="$fleet_home" CCC_CLAUDE_DIR="$fleet_claude" CCC_HERMES_DIR="$fleet_home/.hermes" \
   bash "$SETUP" --no-backup >"$fleet_out" 2>&1
 ok "setup absorbs a fleet-installed copy of a repo skill" \
-  'cmp -s "$fleet_claude/skills/wiki-record/SKILL.md" "$ROOT/skills/shared/wiki-record/SKILL.md"'
+  'cmp -s "$fleet_claude/skills/wiki-record/SKILL.md" "$ROOT/skills/wiki-record/SKILL.md"'
 ok "setup removes the fleet provenance marker on absorption" \
   '[ ! -e "$fleet_claude/skills/wiki-record/.ccc-fleet-skill.json" ]'
 ok "setup records the absorbed skill in the repo manifest" \
