@@ -630,6 +630,35 @@ def _synth_candidates():
     )
 
 
+def _apply_synth_order(candidates):
+    """Reorder synthesis candidates per NUNCHI_SYNTH_ORDER (2026-09-01 incident).
+
+    Comma-separated backend names (claude/codex/piri). Named backends run in
+    the listed order; unlisted backends keep their default order after them.
+    Unknown names are ignored — a typo degrades to the shipped order, never to
+    "no backend". Unset/empty env keeps the default (claude first).
+
+    Why: gongyung and nosuk shared one Anthropic Max account whose weekly pool
+    died mid-fleet on 2026-08-31 while gongyung's openai-codex channel (pi
+    harness) was healthy — but the order was hardcoded, so the only fix was a
+    node-local patch the next ccc-node update would revert. This makes the
+    ordering per-node config instead.
+    """
+    raw = os.environ.get("NUNCHI_SYNTH_ORDER", "")
+    if not raw.strip():
+        return candidates
+    wanted, seen = [], set()
+    for part in raw.split(","):
+        name = part.strip().lower()
+        if name and name not in seen:
+            wanted.append(name)
+            seen.add(name)
+    by_name = dict(candidates)
+    ordered = [(n, by_name[n]) for n in wanted if n in by_name]
+    ordered += [(n, t) for n, t in candidates if n not in seen]
+    return ordered
+
+
 def _piri_candidate():
     """Resolve the pi harness entry, or None when the node has no usable pi.
 
@@ -808,6 +837,7 @@ def llm_synthesize(prompt):
             "-p", "--no-session", "--no-tools", "--no-extensions",
             "--no-skills", "--no-prompt-templates", "--no-context-files",
         ] + piri_args + ["{prompt}"]))
+    candidates = _apply_synth_order(candidates)
     primary = next((n for n, t in candidates if shutil.which(t[0])), None)
     for name, template in candidates:
         if not shutil.which(template[0]):
