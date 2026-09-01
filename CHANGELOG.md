@@ -4,7 +4,27 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Fixed
+- **ccc-doctor stops flagging every node's cost-ledger cron as unmanaged
+  (#1079).** `install-cost-ledger-cron.sh` has rendered stamped
+  `# ccc-node:cost-ledger` lines since #1205, but the lane was never listed in
+  `CRON_MARKER_INSTALLERS`, so the 2026-09-02 fleet sweep reported the
+  correctly-installed entry as an unknown hand-installed marker on 12/12
+  nodes. It now gets its own `cron gen cost-ledger` row (gen-stamp drift
+  detection included); its BEGIN/END guards join `CRON_AUX_MARKERS`. The
+  cost-ledger gen inputs are deliberately unchanged so no fleet entry
+  re-stamps.
+
 ### Added
+- **`install-fleet-skills-sync-cron.sh`** owns the daily fleet-skills sync
+  entry that every node carried as a hand-written, unstamped
+  `# ccc-node:fleet-skills-sync` line. Same shape as the sibling cron
+  installers (dry-run default, BEGIN/END block, gen stamp over script + shared
+  cron lib, install record, `--remove`); the legacy bare line is migrated into
+  the block on first `--apply`. The rendered body resolves the exact
+  fleet-skills HEAD at fire time and skips the apply when offline instead of
+  passing an empty `--ref`. ccc-doctor lists the lane, so the current bare
+  lines surface as `unstamped` with the installer as the action.
 - **Rotation tools close the #2024 ledger/broker gap.**
   `a2a-rescreen-rotation.py` probe/plan/manifests now cover the
   `CCC_SKILL_PROMOTION_REMOTE_BROKERS` registry end to end (SSH-only secret
