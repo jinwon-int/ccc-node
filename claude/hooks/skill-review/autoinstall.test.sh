@@ -103,6 +103,17 @@ ok "provenance failure leaves draft pending and unledgered" '[ -d "$PENDING/2026
 ok "provenance cleanup result is explicit" 'grep -q "name=provenance-fail reason=provenance-write detail=stubbed_unsafe_skills_root cleanup=complete" "$STATE/skill-autoinstall.log"'
 rm -rf "$PENDING/20260101-000001-c-provenance"
 
+# Unsafe skills root (#1415): a group/other-writable root is caught up front
+# with an actionable skip — no per-draft install churn, draft stays pending.
+make_draft 20260101-000001-d-unsafe-root unsafe-root-skill "Track the recurring unsafe skills root remediation procedure."
+chmod 775 "$SKILLS"
+out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "unsafe skills root skips the sweep" 'jq -e ".skipped == \"unsafe-skills-root\"" >/dev/null <<<"$out"'
+ok "unsafe root never touches the draft" '[ -d "$PENDING/20260101-000001-d-unsafe-root" ] && [ ! -e "$SKILLS/unsafe-root-skill" ]'
+ok "unsafe root log carries an actionable hint" 'grep -q "reason=unsafe-skills-root" "$STATE/skill-autoinstall.log" && grep -q "hint=.chmod 700" "$STATE/skill-autoinstall.log"'
+chmod 700 "$SKILLS"
+rm -rf "$PENDING/20260101-000001-d-unsafe-root"
+
 # --- 3) secret drafts are blocked and stay pending ------------------------------
 : > "$STATE/skill-autosave-install.jsonl"
 find "$SPOOL" -type f -delete 2>/dev/null
@@ -393,16 +404,18 @@ rm -f "$A_STATE/autonomy.dry-run"
 out="$(CCC_SKILL_REVIEW_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "default autonomy=active installs" '[ -f "$A_SKILLS/kill-me/SKILL.md" ]'
 
-# --- failed counter (#770): a non-compliant skills root fail-closes the
-# install and is reported as failed, distinct from a silent skip --------------
+# --- failed counter (#770/#1415): a non-compliant skills root fail-closes
+# the whole sweep up front as a LOUD skip (skipped=unsafe-skills-root with an
+# actionable hint) — never a silent skip, never a partial install -------------
 F_STATE="$TMP/failstate"; F_SKILLS="$TMP/failskills"
 mkdir -p "$F_STATE/pending-skills" "$F_SKILLS"
 chmod 700 "$F_STATE"
 chmod 777 "$F_SKILLS"  # deliberately non-compliant: contract must fail closed
 make_draft_at "$F_STATE" "$F_SKILLS" f-fail fail-one "Capture the recurring failed-counter verification procedure here."
 out="$(CCC_SKILL_REVIEW_STATE_DIR="$F_STATE" CLAUDE_SKILLS_DIR="$F_SKILLS" CCC_PUSH_SPOOL="$TMP/fspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
-ok "non-compliant root reports failed=1, installs nothing" 'jq -e ".failed == 1 and (.installed | length == 0)" >/dev/null <<<"$out" && [ ! -e "$F_SKILLS/fail-one" ]'
-ok "failed install leaves draft pending" '[ -d "$F_STATE/pending-skills/f-fail" ]'
+ok "non-compliant root skips the sweep fail-closed" 'jq -e ".skipped == \"unsafe-skills-root\" and (.installed | length == 0)" >/dev/null <<<"$out" && [ ! -e "$F_SKILLS/fail-one" ]'
+ok "skipped sweep leaves draft pending" '[ -d "$F_STATE/pending-skills/f-fail" ]'
+ok "non-compliant root log carries an actionable hint" 'grep -q "reason=unsafe-skills-root dir=$F_SKILLS mode=777" "$F_STATE/skill-autoinstall.log" && grep -q "hint=.chmod 700 $F_SKILLS" "$F_STATE/skill-autoinstall.log"'
 
 # --- queue anchor: CCC_STATE_DIR must NOT relocate the queue -----------------
 # The bridge exports CCC_STATE_DIR per memory audience while the collector
