@@ -27,7 +27,9 @@
 # Procedure (run):
 #   1. take a lock; resolve the repo (env > repo file > script location > ~/ccc-node)
 #   2. preconditions: .git present, clean working tree, on the expected branch.
-#      A wrong-branch stall self-recovers ONLY when the stray branch is fully
+#      A wrong-branch stall self-recovers when the tree is clean (#1397 C:
+#      unpushed history is pinned under refs/ccc-stray/ first); it stays
+#      fail-closed on a dirty tree. Historically it recovered ONLY when fully
 #      pushed (origin has it at the exact local SHA) and the tree is clean —
 #      switching back then cannot lose anything (#1328). Every other
 #      wrong-branch shape stays fail-closed and notifies.
@@ -270,14 +272,29 @@ reset_repo_to_old_sha() {
 #      worktree holding $BRANCH makes git refuse — that state needs a human)
 # The stray branch ref itself is deliberately left in place: deleting refs is
 # a mutation beyond recovery's mandate.
+# #1397 (proposal C): an UNPUSHED stray branch is recoverable too. Switching
+# the checkout back to $BRANCH never deletes the stray branch ref, so the
+# commits stay reachable; the fail-closed rule existed for the dirty-tree
+# case, not for unpushed history. Belt and braces: before switching, the
+# stray HEAD is pinned under refs/ccc-stray/<branch>/<utc-ts> so even a later
+# `git branch -D` by an operator cannot orphan it. RECOVERY_KIND reports
+# which shape was handled (pushed | unpushed) for the notice and the audit.
+RECOVERY_KIND=""
 recover_stray_branch() { # <stray-branch>
   [ -n "${1:-}" ] || return 1
   [ -z "$(git -C "$REPO" status --porcelain 2>/dev/null)" ] || return 1
   git -C "$REPO" fetch origin >/dev/null 2>&1 || return 1
-  local remote_sha
-  remote_sha="$(git -C "$REPO" rev-parse --verify --quiet "refs/remotes/origin/$1" 2>/dev/null)" || return 1
-  [ "$remote_sha" = "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" ] || return 1
+  local remote_sha head_sha
+  head_sha="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" || return 1
+  remote_sha="$(git -C "$REPO" rev-parse --verify --quiet "refs/remotes/origin/$1" 2>/dev/null || true)"
   git -C "$REPO" rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null 2>&1 || return 1
+  if [ "$remote_sha" = "$head_sha" ]; then
+    RECOVERY_KIND="pushed"
+  else
+    # Unpushed (or partially pushed) history: pin it before touching HEAD.
+    git -C "$REPO" update-ref "refs/ccc-stray/$1/$(date -u +%Y%m%dT%H%M%SZ)" "$head_sha" >/dev/null 2>&1 || return 1
+    RECOVERY_KIND="unpushed"
+  fi
   git -C "$REPO" checkout -q "$BRANCH" >/dev/null 2>&1 || return 1
   [ "$(git -C "$REPO" symbolic-ref --short HEAD 2>/dev/null)" = "$BRANCH" ]
 }
@@ -448,9 +465,14 @@ if [ "$CUR_BRANCH" != "$BRANCH" ]; then
   # gate above, so recovery never swaps the tree under a live session.
   # Opt out with CCC_SELF_UPDATE_AUTO_RECOVER=0.
   if [ "${CCC_SELF_UPDATE_AUTO_RECOVER:-1}" = "1" ] && recover_stray_branch "$CUR_BRANCH"; then
-    log "recover reason=wrong-branch from=$CUR_BRANCH sha=$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
-    notify "self-update: 관리 체크아웃이 '$CUR_BRANCH' 브랜치에 있었으나 커밋이 전부 원격에 있어(동일 SHA, clean tree) '$BRANCH'로 자동 복구했습니다. 브랜치 작업은 git worktree로 분리하세요. ~/.claude/state/self-update.log" "wrong-branch-recovered"
-    say "self-update: recovered from stray branch '$CUR_BRANCH' (fully pushed, clean tree) — back on '$BRANCH'"
+    log "recover reason=wrong-branch from=$CUR_BRANCH kind=$RECOVERY_KIND sha=$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
+    if [ "$RECOVERY_KIND" = "unpushed" ]; then
+      notify "self-update: 관리 체크아웃이 '$CUR_BRANCH' 브랜치에 있어 '$BRANCH'로 자동 복구했습니다(clean tree). 이 브랜치에는 원격에 없는 커밋이 있습니다 — 브랜치 ref와 refs/ccc-stray/$CUR_BRANCH/* 에 보존됐으니 worktree에서 이어서 푸시하세요. ~/.claude/state/self-update.log" "wrong-branch-recovered"
+      say "self-update: recovered from stray branch '$CUR_BRANCH' (unpushed commits preserved on the branch + refs/ccc-stray) — back on '$BRANCH'"
+    else
+      notify "self-update: 관리 체크아웃이 '$CUR_BRANCH' 브랜치에 있었으나 커밋이 전부 원격에 있어(동일 SHA, clean tree) '$BRANCH'로 자동 복구했습니다. 브랜치 작업은 git worktree로 분리하세요. ~/.claude/state/self-update.log" "wrong-branch-recovered"
+      say "self-update: recovered from stray branch '$CUR_BRANCH' (fully pushed, clean tree) — back on '$BRANCH'"
+    fi
   else
     notify_stalled wrong-branch "self-update 정지: 레포가 '$CUR_BRANCH' 브랜치에 있습니다 (기대: '$BRANCH'). 이 노드는 복구 전까지 갱신되지 않습니다 — 관리 체크아웃은 '$BRANCH' 고정, 개발은 git worktree로 분리하세요." "branch=$CUR_BRANCH expected=$BRANCH"
     say "self-update: repo is on '$CUR_BRANCH', expected '$BRANCH'; aborting (fail-closed)" >&2
