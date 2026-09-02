@@ -5,6 +5,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Fixed
+- **skill autoinstall no longer misreads long drafts as headingless
+  (#1399).** `gate_lint` checked for a heading with `awk … | grep -q`; under
+  `set -o pipefail` grep exits on the first heading, awk dies of EPIPE writing
+  the rest, and the pipeline's failure became `lint no-headings` — measured
+  6/20 at ~100 KB and 20/20 at ~1 MB of body on mawk 1.3.4, which is why the
+  500/501-line size-gate fixtures flaked on CI and never locally. The check is
+  now awk-only. A deterministic 1 MB regression pins it (size gate verdict,
+  not a false lint), and the size-gate assertions dump tail-safe diagnostics
+  when they fail.
+
+### Fixed
 - **SessionStart no longer lists superseded external waits as dropped
   promises (#1408).** A wait whose head moved is superseded by the newer
   registration for the same PR; its own notification fired with
