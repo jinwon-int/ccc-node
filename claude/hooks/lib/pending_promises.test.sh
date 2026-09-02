@@ -127,5 +127,30 @@ ok "unknown free-text fields are not rendered" '! grep -q "SECRET" <<<"$out"'
 # The summary line format is load-bearing: validate-harness.sh's
 # suite_summary() greps for exactly ^PASS=<n> FAIL=<n>$, so a lowercase variant
 # reads as a suite that asserted nothing.
+# ---- #1408: superseded waits are not owed promises --------------------------
+# Head moved → the older registration is superseded by a newer one for the same
+# PR. The old record carries wake.state=done/resumed=false (its notification
+# fired) but nobody owes it: the newer wait does. It must not surface.
+w superseded '{"old":{"wait_id":"old1","state":"superseded","repo":"o/r","pr_number":7,"head_sha":"aaaaaaaa11","created_at":"2026-09-02T01:00:00Z",
+  "wake":{"state":"done","resumed":false,"skip_reason":"non_terminal_rollup"}},
+ "new":{"wait_id":"new1","state":"success","repo":"o/r","pr_number":7,"head_sha":"bbbbbbbb22","created_at":"2026-09-02T02:00:00Z",
+  "wake":{"state":"done","resumed":true}}}'
+out="$(python3 "$MOD" "$TMP/superseded.json")"
+ok "superseded wait is not reported as dropped" '[ -z "$out" ]'
+
+# A genuinely dropped promise that has NO newer wait for its PR still surfaces.
+w dropped_only '{"d":{"wait_id":"d1","state":"failure","repo":"o/r","pr_number":8,"head_sha":"cccccccc33","created_at":"2026-09-02T01:00:00Z",
+  "wake":{"state":"done","resumed":false,"skip_reason":"session_moved"}}}'
+out="$(python3 "$MOD" "$TMP/dropped_only.json")"
+ok "dropped promise without a newer wait still surfaces" 'grep -q "o/r#8" <<<"$out" && grep -q "session_moved" <<<"$out"'
+
+# An older dropped record is hidden when a NEWER record for the same PR exists
+# (whatever that newer record's own state is) — the newer one is the live promise.
+w shadowed '{"a":{"wait_id":"a1","state":"failure","repo":"o/r","pr_number":9,"head_sha":"dddddddd44","created_at":"2026-09-02T01:00:00Z",
+  "wake":{"state":"done","resumed":false,"skip_reason":"session_moved"}},
+ "b":{"wait_id":"b1","state":"monitoring","repo":"o/r","pr_number":9,"head_sha":"eeeeeeee55","created_at":"2026-09-02T03:00:00Z"}}'
+out="$(python3 "$MOD" "$TMP/shadowed.json")"
+ok "older dropped record is hidden behind the newer wait for the same PR" '! grep -q "dddddddd" <<<"$out" && grep -q "아직 대기 중" <<<"$out" && grep -q "eeeeeeee" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
