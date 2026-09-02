@@ -4,6 +4,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Added
+- **`scripts/tunnel-audit.sh`** (ccc-node#1366): read-only, node-local
+  inventory of the exposure surface — tunnel-class systemd units (cloudflared,
+  `ssh -R`/`-L`, ngrok/frp/bore) with token arguments masked, crontab/cron.d
+  tunnel lines, non-loopback listeners tagged public/tailnet/other, tailscale
+  serve/funnel state (a crashing CLI is reported as `crashed`, not parsed), and
+  `*.removed-*` residue. JSON by default, `--markdown` for a summary. Missing
+  tools on Termux are facts in the `tools` block, never a failure. This is the
+  per-node collector the fleet registry ([DOC-3283]) comparison runs on; it
+  installs no cron and mutates nothing.
 ### Changed
 - **Autonomous usage budget defaults to 2,000,000 tokens per provider per
   day.** `CCC_USAGE_BUDGET_TOKENS_{CLAUDE,CODEX,PIRI}` defaulted to `0`
