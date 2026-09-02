@@ -53,6 +53,7 @@ DEFAULT_MAX_BYTES = 1024
 MAX_ROWS_PER_SECTION = 5
 
 STATE_MONITORING = "monitoring"
+STATE_SUPERSEDED = "superseded"
 
 
 def registry_path(argv: List[str]) -> str:
@@ -104,6 +105,14 @@ def load_records(path: str) -> List[Dict[str, Any]]:
     return [rec for rec in values if isinstance(rec, dict)]
 
 
+
+def _pr_key(rec: Dict[str, Any]):
+    repo = str(rec.get("repo") or "").strip()
+    pr = rec.get("pr_number")
+    if not repo or pr is None or str(pr).strip() == "":
+        return None
+    return (repo, str(pr).strip())
+
 def classify(records: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
     """Split into (still monitoring, promise dropped).
 
@@ -114,11 +123,31 @@ def classify(records: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
     """
     monitoring: List[Dict] = []
     dropped: List[Dict] = []
+    # A wait that was superseded by a newer registration for the same PR (head
+    # moved, #740 exact-head contract) is not an owed promise: the newer wait
+    # carries it. Reporting it as "dropped" produced six permanent alarms on
+    # 2026-09-02 for PRs that were already merged (#1408). Also hide any
+    # non-monitoring record whose PR has a later record — the later one is the
+    # live promise, whatever its own state.
+    superseded_states = {STATE_SUPERSEDED}
+    latest_by_pr: Dict[Tuple[str, str], str] = {}
+    for rec in records:
+        key = _pr_key(rec)
+        if key is None:
+            continue
+        created = str(rec.get("created_at") or "")
+        if created >= latest_by_pr.get(key, ""):
+            latest_by_pr[key] = created
     for rec in records:
         wake = rec.get("wake")
         wake = wake if isinstance(wake, dict) else {}
         if rec.get("state") == STATE_MONITORING:
             monitoring.append(rec)
+            continue
+        if rec.get("state") in superseded_states:
+            continue
+        key = _pr_key(rec)
+        if key is not None and str(rec.get("created_at") or "") < latest_by_pr.get(key, ""):
             continue
         if wake.get("state") == "done" and wake.get("resumed") is False:
             dropped.append(rec)
