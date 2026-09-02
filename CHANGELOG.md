@@ -4,6 +4,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Fixed
+- **ccc-doctor no longer reports the Piri CLI missing on Termux.** The
+  distill-extractor probe resolved `CCC_PIRI_CLI_PATH` from the environment or
+  the bridge's systemd unit only; Termux has no unit, so the 2026-09-02 sweep
+  flagged gongyung and daegyo `수동필요 executable=missing` although their
+  bridges run with the harness launcher `hooks/ccc-piri`. Doctor now falls back
+  to that launcher when it exists (and still reports missing when it does not).
+
 ### Added
 - **`scripts/tunnel-audit.sh`** (ccc-node#1366): read-only, node-local
   inventory of the exposure surface — tunnel-class systemd units (cloudflared,

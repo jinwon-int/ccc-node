@@ -890,6 +890,16 @@ class Doctor:
             # do not import CCC_CODEX_CLI_PATH: the Codex readiness check runs
             # live probes and its service wrapper is not a probe-safe binary.
             piri_path = self.bridge_unit_environment_value("CCC_PIRI_CLI_PATH") or ""
+        if effective == "piri" and not piri_path:
+            # Termux nodes have no systemd unit to read the launcher path
+            # from, yet the bridge there runs with CCC_PIRI_CLI_PATH pointing
+            # at the harness-installed launcher (setup.sh: hooks/ccc-piri).
+            # Fall back to that launcher before declaring the executable
+            # missing — the 2026-09-02 sweep flagged gongyung and daegyo
+            # 수동필요 for a probe gap, not a broken node.
+            launcher = self.claude_dir / "hooks" / "ccc-piri"
+            if launcher.is_file():
+                piri_path = str(launcher)
         configured_paths = {
             "claude": os.environ.get("CLAUDE_CLI_PATH", "claude"),
             "codex": os.environ.get("CCC_CODEX_CLI_PATH", "codex"),
