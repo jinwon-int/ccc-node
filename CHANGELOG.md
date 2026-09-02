@@ -5,6 +5,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Fixed
+- **nunchi ingest tick is robust on Termux and scoped lanes (#1419 follow-up).**
+  `piri-feed.sh` resolves the Piri launcher like ccc-doctor does (env →
+  `hooks/ccc-piri` → PATH) instead of failing on Termux nodes with no unit,
+  and writes a `skipped: cli-not-runnable` liveness tick when nothing is
+  runnable so the lane never silently ages out. ccc-doctor now ages the newest
+  scoped `<audience-root>/*/nunchi/ingest.status.json` for audience-scoped
+  lanes instead of a claude-era top-level leftover (nosuk 2026-09-02: scoped
+  tick 5 min old, top-level 10 h → false `ingest-tick-stale`).
+
+### Fixed
 - **nunchi piri/codex feeds now write the ingest liveness tick.** Only
   `ingest-cron.sh` (claude lane) wrote `ingest.status.json`; ccc-doctor judges
   the ingest lane by that file's age, so a node re-aligned from the claude feed

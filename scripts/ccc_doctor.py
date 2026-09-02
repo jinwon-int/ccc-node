@@ -1717,12 +1717,17 @@ class Doctor:
         except Exception:
             collection = "none"
 
+        # Scoped lanes write their ingest tick under the audience root too
+        # (#1419); the top-level file is a claude-era leftover there and must
+        # not be aged (nosuk 2026-09-02: scoped tick fresh, top-level 10h old).
+        scoped_ingest = self._newest_scoped_status(m_root, "ingest.status.json") if scope_count else None
         ticks, stale = self._nunchi_tick_freshness(
             configured,
             nunchi_home,
             sweep_finished,
             sweep_cron_present=m is not None,
             scoped=scope_count > 0,
+            ingest_status=scoped_ingest,
         )
         if scope_count:
             ticks = f"scopes={scope_count} {ticks}"
@@ -1749,6 +1754,18 @@ class Doctor:
             "~/.nunchi/*.cron.log and the cron PATH (#996/#1200 class)",
         )
 
+    @staticmethod
+    def _newest_scoped_status(m_root, name: str) -> Path | None:
+        """Newest ``<audience-root>/*/nunchi/<name>`` or None (scoped lanes, #1202/#1419)."""
+        if not m_root:
+            return None
+        cands = sorted(
+            Path(m_root.group(1)).glob(f"*/nunchi/{name}"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )
+        return cands[0] if cands else None
+
     def _nunchi_tick_freshness(
         self,
         configured: str,
@@ -1757,6 +1774,7 @@ class Doctor:
         *,
         sweep_cron_present: bool,
         scoped: bool = False,
+        ingest_status: Path | None = None,
     ) -> tuple[str, list[str]]:
         """Age the newest ingest/sweep ticks for check_nunchi_collection (#1200).
 
@@ -1791,7 +1809,7 @@ class Doctor:
             # status file vanished) — the lane never ran where it should.
             stale.append("sweep-status-missing")
 
-        ingest_file = Path(
+        ingest_file = ingest_status or Path(
             os.environ.get("CCC_NUNCHI_INGEST_STATUS", nunchi_home / "ingest.status.json")
         )
         ingest_tick = "none"

@@ -102,7 +102,14 @@ if [ -z "${PIR_SESSIONS_DIR:-}" ]; then
   fi
 fi
 # The Piri CLI the bridge runs (ccc-node PiriRuntime). Falls back to `piri` on PATH.
-PIR_CLI="${CCC_PIRI_CLI_PATH:-piri}"
+# Launcher resolution mirrors ccc-doctor (#1407): env → the harness-installed
+# launcher hooks/ccc-piri (Termux nodes have no systemd unit exporting
+# CCC_PIRI_CLI_PATH, yet their bridge runs with exactly that launcher) → PATH.
+PIR_CLI="${CCC_PIRI_CLI_PATH:-}"
+if [ -z "$PIR_CLI" ]; then
+  _launcher="${CCC_CLAUDE_DIR:-$HOME/.claude}/hooks/ccc-piri"
+  if [ -x "$_launcher" ]; then PIR_CLI="$_launcher"; else PIR_CLI="piri"; fi
+fi
 # Isolate extractor runs so their own sessions never land under PIR_SESSIONS_DIR
 # (which would make every cron tick re-extract the previous extractor's session).
 EXTRACTOR_SESSION_DIR="$NUNCHI_HOME/.piri-feed-extractor-sessions"
@@ -132,7 +139,12 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
   # directories (a checkout root ships ./piri), which used to pass the guard.
   command -v "$PIR_CLI" >/dev/null 2>&1 || {
     { [ -f "$PIR_CLI" ] && [ -x "$PIR_CLI" ]; } || {
-      echo "piri-feed: Piri CLI not runnable (CCC_PIRI_CLI_PATH unset and piri not on PATH) — extraction skipped" >&2
+      echo "piri-feed: Piri CLI not runnable (CCC_PIRI_CLI_PATH unset, no hooks/ccc-piri, piri not on PATH) — extraction skipped" >&2
+      # Still a liveness tick: the lane ran, it just had nothing runnable. Without
+      # this the doctor ages the previous tick into ingest-tick-stale (gongyung
+      # 2026-09-02) and the real cause (no launcher) stays invisible.
+      _status="${CCC_NUNCHI_INGEST_STATUS:-$NUNCHI_HOME/ingest.status.json}"
+      printf '{"schema":"ccc.nunchi.ingest.v1","finished_at":%d,"sources":0,"ingested":0,"retired":0,"deferred":0,"feed":"piri","skipped":"cli-not-runnable"}\n' "$(date -u +%s)" > "$_status.$$" 2>/dev/null && mv -f "$_status.$$" "$_status" 2>/dev/null
       exit 0
     }
   }
