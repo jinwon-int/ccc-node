@@ -541,6 +541,13 @@ chmod 700 "$bh_hooks/bench.sh"
 printf 'on' > "$bh_state/nunchi.mode"
 cp "$p1a_hooks/bench-qset.tsv" "$bh_hooks/bench-qset.tsv"
 
+# #1399 — pin the window start BEFORE seeding rows. bench.sh takes its own
+# `date -u` only after python has written the fixture; on a slow runner that
+# crosses a second boundary and every seeded row lands outside the window
+# (observed: CI attempt 2 of ccc-node#1398, 0 of 6 rows counted).
+bh_start="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+sleep 1
+
 # Backend answers every query substantively — the rows look healthy.
 cat > "$bh_hooks/nunchi.py" <<'PY'
 #!/usr/bin/env python3
@@ -558,7 +565,7 @@ json.dump({"history": hist}, open(sys.argv[1], "w", encoding="utf-8"), ensure_as
 PY
 HOME="$bh_home" CCC_STATE_DIR="$bh_state" NUNCHI_HOME="$bh_nh" \
   NUNCHI_BENCH_QSET="$bh_hooks/bench-qset.tsv" CCC_NODE=test-node \
-  NUNCHI_BENCH_WIKI_CLI=/nonexistent \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent NUNCHI_BENCH_START_UTC="$bh_start" \
   bash "$bh_hooks/bench.sh" > "$TMP/bh-stdout" 2>&1
 bh_out="$(find "$bh_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
 
@@ -581,12 +588,42 @@ PY
 rm -f "$bh_nh"/bench-*.md
 HOME="$bh_home" CCC_STATE_DIR="$bh_state" NUNCHI_HOME="$bh_nh" \
   NUNCHI_BENCH_QSET="$bh_hooks/bench-qset.tsv" CCC_NODE=test-node \
-  NUNCHI_BENCH_WIKI_CLI=/nonexistent \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent NUNCHI_BENCH_START_UTC="$bh_start" \
   bash "$bh_hooks/bench.sh" > "$TMP/bh-ok-stdout" 2>&1
 bh_ok="$(find "$bh_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
 ok "a healthy backend ledger leaves the fabrication hard-fail in force" \
   'grep -q "^- gate verdict: FAIL — 2 fabrication(s) on negative controls (hard fail)$" "$bh_ok" \
    && grep -q "^- backend attempts during run: 6 (failed: 0)$" "$bh_ok"'
+
+# The pin must not widen the window: rows older than the pinned start stay out.
+python3 - "$bh_nh/backend-health.json" <<'PY'
+import json, sys
+hist = [{"ts": "2000-01-01T00:00:00+00:00", "primary": "claude", "winner": None,
+         "attempts": "claude:exit-1"} for _ in range(6)]
+json.dump({"history": hist}, open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False)
+PY
+rm -f "$bh_nh"/bench-*.md
+HOME="$bh_home" CCC_STATE_DIR="$bh_state" NUNCHI_HOME="$bh_nh" \
+  NUNCHI_BENCH_QSET="$bh_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent NUNCHI_BENCH_START_UTC="$bh_start" \
+  bash "$bh_hooks/bench.sh" > "$TMP/bh-old-stdout" 2>&1
+bh_old="$(find "$bh_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "rows stamped before the pinned window start are not counted (#1399)" \
+  '! grep -q "backend attempts during run" "$bh_old" \
+   && grep -q "^- gate verdict: FAIL — 2 fabrication(s) on negative controls (hard fail)$" "$bh_old"'
+
+# The same stale rows become visible when the pin is moved behind them — this
+# is the assertion that proves bench.sh honours NUNCHI_BENCH_START_UTC at all
+# (without the override it takes `date -u` and the rows stay invisible).
+rm -f "$bh_nh"/bench-*.md
+HOME="$bh_home" CCC_STATE_DIR="$bh_state" NUNCHI_HOME="$bh_nh" \
+  NUNCHI_BENCH_QSET="$bh_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent NUNCHI_BENCH_START_UTC="1999-12-31T00:00:00+00:00" \
+  bash "$bh_hooks/bench.sh" > "$TMP/bh-pin-stdout" 2>&1
+bh_pin="$(find "$bh_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "NUNCHI_BENCH_START_UTC moves the window start (#1399)" \
+  'grep -q "^- backend attempts during run: 6 (failed: 6)$" "$bh_pin" \
+   && grep -q "^- gate verdict: INDETERMINATE — synthesis backend degraded during run (6/6 attempts failed)$" "$bh_pin"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
