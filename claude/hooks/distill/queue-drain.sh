@@ -12,7 +12,7 @@
 # load-memory/load-tools/checkpoint/etc. and avoid recursion.
 set -uo pipefail
 
-case "${CCC_HONCHO_MEMORY_ENABLED:-1}" in
+case "${CCC_HONCHO_MEMORY_ENABLED:-0}" in
   0|false|FALSE|off|OFF|no|NO) exit 0 ;;
 esac
 

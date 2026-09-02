@@ -32,7 +32,11 @@ printf 'user likes concise Korean reports\n' > "$mem/USER.md"
 printf 'wiki cache contains Honcho hybrid memory profile\n' > "$cache/wiki.txt"
 printf 'honcho cache contains practical evidence reports\n' > "$cache/honcho.txt"
 
+# Honcho defaults to OFF since the 2026-09-01 retirement: with the toggle unset
+# the check must report the source as disabled even when a cache file exists.
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check default reports honcho disabled, wiki ok" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"ok\" and .honcho.status == \"disabled\"" >/dev/null <<<"$out"'
+out="$(CCC_HONCHO_MEMORY_ENABLED=1 CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check json succeeds" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"ok\" and .honcho.status == \"ok\"" >/dev/null <<<"$out"'
 ok "memory check reports inactive new stack without reading bodies" 'jq -e ".nunchi.status == \"off\" and .mempalace.status == \"off\"" >/dev/null <<<"$out"'
 

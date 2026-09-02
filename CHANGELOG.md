@@ -13,6 +13,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
   harness re-render (#1402). The bridge setting and ccc-doctor now share one
   default (`USAGE_BUDGET_TOKENS_DEFAULT`, pinned equal by a test); `0` still
   disables the budget explicitly. Interactive turns are unaffected.
+- **Honcho is off by default (fleet retirement 2026-09-01, TM-2029 phase 3).**
+  `CCC_HONCHO_MEMORY_ENABLED` now defaults to `0` in the bridge settings and in
+  every hook that consulted it (`load-memory`, `refresh-memory`, `distill`,
+  `distill/queue-drain`, `distill/honcho-push`, `ccc-memory-check`). The
+  retirement had been applied as a per-node `settings.json` env flag, which the
+  next harness re-render dropped on all 12 nodes (#1402), so every session and
+  refresh cron went back to probing the stopped endpoint and doctor reported
+  `honcho=stale` fleet-wide. `CCC_HONCHO_MEMORY_ENABLED=1` opts a node back in.
 
 ### Fixed
 - **ccc-doctor documents the five residual hand-installed cron lanes.** After
