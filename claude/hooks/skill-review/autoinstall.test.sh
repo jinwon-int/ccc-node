@@ -91,12 +91,16 @@ rm -f "$STATE/skill-autosave.mode"
 # leaves the draft pending, and never publishes an install ledger row.
 make_draft 20260101-000001-c-provenance provenance-fail "Capture the recurring provenance failure recovery procedure."
 mkdir -p "$TMP/fail-bin"
-printf '#!/bin/sh\nexit 2\n' > "$TMP/fail-bin/python3"
+cat > "$TMP/fail-bin/python3" <<'STUB'
+#!/bin/sh
+printf '%s\n' '{"ok": false, "code": "stubbed_unsafe_skills_root"}'
+exit 2
+STUB
 chmod +x "$TMP/fail-bin/python3"
 out="$(run_auto env PATH="$TMP/fail-bin:$PATH" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "provenance failure leaves no partial install directory" '[ ! -e "$SKILLS/provenance-fail" ]'
 ok "provenance failure leaves draft pending and unledgered" '[ -d "$PENDING/20260101-000001-c-provenance" ] && ! jq -e "select(.event == \"install\" and .name == \"provenance-fail\")" "$STATE/skill-autosave-install.jsonl" >/dev/null'
-ok "provenance cleanup result is explicit" 'grep -q "name=provenance-fail reason=provenance-write cleanup=complete" "$STATE/skill-autoinstall.log"'
+ok "provenance cleanup result is explicit" 'grep -q "name=provenance-fail reason=provenance-write detail=stubbed_unsafe_skills_root cleanup=complete" "$STATE/skill-autoinstall.log"'
 rm -rf "$PENDING/20260101-000001-c-provenance"
 
 # --- 3) secret drafts are blocked and stay pending ------------------------------
@@ -219,8 +223,22 @@ mkdir -p "$big"
   printf -- '---\nname: big-body-skill\ndescription: Exercise the progressive disclosure size gate with an oversized body.\n---\n\n# Big\n\n'
   seq -f 'Filler line %g.' 1 501
 } > "$big/SKILL.md"
-run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
+big_out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run 2>&1)"
 ok "oversized body blocked" 'jq -e ".reason | startswith(\"size oversized-body\")" "$PENDING/20260101-000009-j-bigbody/autosave-block.json" >/dev/null'
+# #1399: this assertion failed once on CI (2026-09-02) with no reproduction in
+# 7 local runs, then again in the CI run of the diagnostics PR itself. The
+# harness runner keeps only the tail of a failing suite, so the dump is three
+# compact lines with the run summary LAST (it carries "skipped": locked /
+# daily-cap / incremental-usage-unavailable — the likeliest common cause of
+# both this and the 500-line edge case failing in the same run).
+diag_1399() { # <draft-dir> <label> <run-output>
+  echo "#1399[$2] dir=$(ls -d "$1"* 2>/dev/null | tr '\n' ' ') block=$(cat "$1/autosave-block.json" 2>/dev/null | head -c 200) lines=$(wc -l < "$1/SKILL.md" 2>/dev/null) installs_today=$(grep -c '"event":"install"' "$STATE/skill-autosave-install.jsonl" 2>/dev/null)"
+  echo "#1399[$2] log: $(tail -n 4 "$STATE/skill-autoinstall.log" 2>/dev/null | tr '\n' '|' | head -c 400)"
+  echo "#1399[$2] run: $(printf '%s' "$3" | tr '\n' ' ' | head -c 400)"
+}
+if ! jq -e ".reason | startswith(\"size oversized-body\")" "$PENDING/20260101-000009-j-bigbody/autosave-block.json" >/dev/null 2>&1; then
+  diag_1399 "$PENDING/20260101-000009-j-bigbody" bigbody "$big_out"
+fi
 
 # 500 lines is exactly at the official limit and must pass the size gate.
 edge="$PENDING/20260101-000010-k-edgebody"
@@ -229,8 +247,40 @@ mkdir -p "$edge"
   printf -- '---\nname: edge-body-skill\ndescription: Sit exactly at the progressive disclosure limit and stay installable.\n---\n\n# Edge\n\n'
   seq -f 'Filler line %g.' 1 493
 } > "$edge/SKILL.md"
-run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
+edge_out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run 2>&1)"
 ok "body at the 500-line limit installs" '[ -f "$SKILLS/edge-body-skill/SKILL.md" ]'
+if [ ! -f "$SKILLS/edge-body-skill/SKILL.md" ]; then
+  diag_1399 "$PENDING/20260101-000010-k-edgebody" edgebody "$edge_out"
+fi
+
+# --- 5b-ii) #1399: a body larger than the pipe buffer must still see its heading.
+# gate_lint used `awk | grep -q`; grep exits on the first heading, awk then dies
+# of EPIPE writing the rest, and pipefail turned that into "lint no-headings".
+# 493 lines × ~200 bytes ≈ 100 KB (> 64 KB pipe buffer) reproduces it every
+# time on a pipe; the awk-only check is immune.
+wide="$PENDING/20260101-000011-l-widebody"
+mkdir -p "$wide"
+{
+  printf -- '---\nname: wide-body-skill\ndescription: Long lines below the limit must not trip the heading check.\n---\n\n# Wide\n\n'
+  seq -f 'Filler line %g. abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz' 1 493
+} > "$wide/SKILL.md"
+run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOSAVE_DAILY_CAP=99 bash "$AUTO" run >/dev/null
+ok "body larger than the pipe buffer still passes the heading lint (#1399)" \
+  '[ -f "$SKILLS/wide-body-skill/SKILL.md" ] && [ ! -f "$wide/autosave-block.json" ]'
+
+# Deterministic form of the same race: ~1 MB after the heading fails 20/20 on
+# the old pipeline (measured on mawk 1.3.4). Such a body is over the size limit,
+# so the CORRECT verdict is the size gate; the pre-fix verdict was the lint gate
+# lying about the heading, which runs first.
+huge="$PENDING/20260101-000012-m-hugebody"
+mkdir -p "$huge"
+{
+  printf -- '---\nname: huge-body-skill\ndescription: A megabyte of body must be judged by the size gate, not misread as headingless.\n---\n\n# Huge\n\n'
+  seq -f 'Filler line %g. abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz' 1 5000
+} > "$huge/SKILL.md"
+run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOSAVE_DAILY_CAP=99 bash "$AUTO" run >/dev/null
+ok "megabyte body is blocked by the size gate, not by a false no-headings (#1399)" \
+  'jq -e ".reason | startswith(\"size oversized-body\")" "$huge/autosave-block.json" >/dev/null'
 
 # --- 5c) compatibility field lint (official spec: <=500 chars) -------------------
 long_compat="$PENDING/20260101-000011-l-longcompat"
