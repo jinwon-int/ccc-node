@@ -4,6 +4,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Fixed
+- **tunnel-audit: funnel false positive and multi-line ExecStart (#1366).**
+  `tailscale funnel status` echoes the whole serve config with "(tailnet
+  only)" tags, so any serve-only node (seoseo, dungae on the 2026-09-02 first
+  fleet run) was reported as funnel-exposed; funnel is now only the entries
+  tagged "(Funnel on)". Reverse tunnels written with backslash-continued
+  `ExecStart=` lines were read from the first line only and classified
+  `other`; continuation lines are joined, so `-R` units classify as
+  ssh-reverse.
+
 ### Added
 - **Periodic fleet tunnel audit (ccc-node#1366, final slice).**
   `scripts/tunnel-audit-fleet.sh` runs the per-node `tunnel-audit.sh`

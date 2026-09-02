@@ -99,9 +99,17 @@ def run(cmd, timeout=8):
 
 
 def unit_field(text: str, key: str) -> str:
-    for line in text.splitlines():
+    # systemd allows a trailing backslash to continue a value on the next
+    # line; the fleet's reverse tunnels are written that way, so a first-line
+    # read saw only "ssh -N -T \\" and classified them as "other".
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
         if line.startswith(key + "="):
-            return line[len(key) + 1:].strip()
+            value = line[len(key) + 1:]
+            while value.rstrip().endswith("\\") and i + 1 < len(lines):
+                value = value.rstrip()[:-1] + " " + lines[i + 1]
+                i += 1
+            return " ".join(value.split())
     return ""
 
 
@@ -222,9 +230,16 @@ def scan_tailscale():
         if any("panic" in l or "goroutine" in l for l in lines):
             result[sub] = {"status": "crashed", "lines": lines[:2]}
             continue
-        configured = bool(lines) and not any(
-            "No serve config" in l or "not running" in l or "Funnel is not" in l for l in lines
-        )
+        if sub == "funnel":
+            # `tailscale funnel status` prints the whole serve config and
+            # tags tailnet-only entries "(tailnet only)"; funnel is on only
+            # for entries marked "(Funnel on)". Treating any output as
+            # "configured" flagged seoseo and dungae (serve-only) as public.
+            configured = any("(Funnel on)" in l or "Funnel on" in l for l in lines)
+        else:
+            configured = bool(lines) and not any(
+                "No serve config" in l or "not running" in l or "Funnel is not" in l for l in lines
+            )
         result[sub] = {"status": status, "configured": configured, "lines": lines[:6]}
     return result
 
