@@ -635,7 +635,7 @@ print(json.dumps({
 }, ensure_ascii=False))
 PY_EOF
 SHEBANG_REPO="$TMP/shebangrepo"
-sout="$(DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" SHEBANG_REPO="$SHEBANG_REPO" python3 "$TMP/shebang.py" 2>"$TMP/shebang.err")"
+sout="$(CCC_HONCHO_MEMORY_ENABLED=1 DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" SHEBANG_REPO="$SHEBANG_REPO" python3 "$TMP/shebang.py" 2>"$TMP/shebang.err")"
 ok "memory probe survives an unresolvable shebang (not 'diagnostic unavailable')" \
   '[ -n "$sout" ] && jq -e ".status != \"diagnostic unavailable\"" <<<"$sout" >/dev/null'
 ok "memory probe reports the real cache state through bash" \
