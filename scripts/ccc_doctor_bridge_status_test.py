@@ -216,15 +216,23 @@ class BridgeStatusVerdictTest(unittest.TestCase):
     def test_unset_budget_uses_the_fleet_default_and_is_ready(self) -> None:
         """No env, no unit: doctor judges the same 2M default the bridge runs with."""
 
-        doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
-        doctor.provider = "codex"
-        doctor._bridge_provider_state = ("codex", "healthy")
-        with patch.dict(
-            "os.environ",
-            {"CCC_MEMORY_DISTILL_PROVIDER": "auto"},
-            clear=True,
-        ), patch.object(doctor, "bridge_systemd_units", return_value=[]):
-            doctor.check_distill_readiness()
+        with TemporaryDirectory() as temp:
+            # Hermetic against the host: CI runners have no provider CLI, so the
+            # executable probe is stubbed exactly like the drop-in test above.
+            executable = Path(temp) / "codex"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
+            doctor.provider = "codex"
+            doctor._bridge_provider_state = ("codex", "healthy")
+            with patch.dict(
+                "os.environ",
+                {"CCC_MEMORY_DISTILL_PROVIDER": "auto"},
+                clear=True,
+            ), patch.object(doctor, "bridge_systemd_units", return_value=[]), patch(
+                "ccc_doctor.shutil.which", return_value=str(executable)
+            ):
+                doctor.check_distill_readiness()
 
         self.assertEqual(doctor.distill_readiness, "ready")
         self.assertNotIn("fail-closed", doctor.rows[-1].status)
