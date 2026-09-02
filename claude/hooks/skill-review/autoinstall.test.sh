@@ -219,8 +219,21 @@ mkdir -p "$big"
   printf -- '---\nname: big-body-skill\ndescription: Exercise the progressive disclosure size gate with an oversized body.\n---\n\n# Big\n\n'
   seq -f 'Filler line %g.' 1 501
 } > "$big/SKILL.md"
-run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
+big_out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run 2>&1)"
 ok "oversized body blocked" 'jq -e ".reason | startswith(\"size oversized-body\")" "$PENDING/20260101-000009-j-bigbody/autosave-block.json" >/dev/null'
+# #1399: this assertion failed once on CI (2026-09-02) with no reproduction in
+# 7 local runs. When it fails, dump what the run actually did so the next
+# occurrence is diagnosable instead of a bare FAIL line.
+if ! jq -e ".reason | startswith(\"size oversized-body\")" "$PENDING/20260101-000009-j-bigbody/autosave-block.json" >/dev/null 2>&1; then
+  echo "--- #1399 diagnostics: oversized body ---"
+  echo "run summary: $(printf '%s' "$big_out" | head -c 600)"
+  echo "draft dir: $(ls -d "$PENDING"/20260101-000009-j-bigbody* 2>/dev/null | tr '\n' ' ')"
+  echo "block file: $(cat "$PENDING/20260101-000009-j-bigbody/autosave-block.json" 2>/dev/null | head -c 300)"
+  echo "line count: $(wc -l < "$PENDING/20260101-000009-j-bigbody/SKILL.md" 2>/dev/null)"
+  echo "log tail:"; tail -n 12 "$STATE/skill-autoinstall.log" 2>/dev/null | sed 's/^/  /'
+  echo "installs today: $(grep -c '"event":"install"' "$STATE/skill-autosave-install.jsonl" 2>/dev/null)"
+  echo "--- end diagnostics ---"
+fi
 
 # 500 lines is exactly at the official limit and must pass the size gate.
 edge="$PENDING/20260101-000010-k-edgebody"
