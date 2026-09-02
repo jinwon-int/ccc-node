@@ -12,6 +12,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
   on the next tick. Env keys the template does not declare are now captured
   before the merge and re-applied after it; template-declared keys stay
   repo-owned (a node override of one is still dropped, by design).
+- **SessionStart no longer lists superseded external waits as dropped
+  promises (#1408).** A wait whose head moved is superseded by the newer
+  registration for the same PR; its own notification fired with
+  `resumed=false`, so `pending_promises` rendered it under "알림은 갔으나
+  이어가지 못한 약속" forever (six permanent rows on 2026-09-02 for PRs that
+  were already merged). `state=superseded` records and any non-monitoring
+  record shadowed by a newer record for the same PR are now excluded; a
+  dropped promise with no newer wait still surfaces.
 
 ### Fixed
 - **ccc-doctor no longer reports the Piri CLI missing on Termux.** The
