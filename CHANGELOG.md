@@ -12,6 +12,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   on the next tick. Env keys the template does not declare are now captured
   before the merge and re-applied after it; template-declared keys stay
   repo-owned (a node override of one is still dropped, by design).
+- **setup.sh registers the self-update agent-cron task only where the
+  scheduler timer exists (#1403).** The #909 registration ran on every node,
+  leaving a permanently `unknown` task on the eight nodes without
+  `ccc-agent-cron.timer` and re-creating it after each operator cleanup (the
+  2026-09-02 sweep removed it on 8 nodes; the next self-update put it back on
+  all of them). The task is now registered only when the timer is enabled in
+  the system scope or the runtime user's `--user` manager; otherwise setup
+  says so and the crontab lane keeps covering self-update.
+  `CCC_SELF_UPDATE_REGISTER_CRON=force` bypasses the gate.
 - **SessionStart no longer lists superseded external waits as dropped
   promises (#1408).** A wait whose head moved is superseded by the newer
   registration for the same PR; its own notification fired with
