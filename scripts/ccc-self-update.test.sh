@@ -389,8 +389,10 @@ out="$(run_selfup run 2>&1)"; rc=$?
 ok "dirty tree aborts" '[ "$rc" = 4 ] && grep -q "not clean" <<<"$out"'
 git -C "$REPO" checkout -q -- file.txt
 git -C "$REPO" checkout -q -b feature-x
-out="$(run_selfup run 2>&1)"; rc=$?
-ok "non-main branch aborts" '[ "$rc" = 4 ] && grep -q "expected .main." <<<"$out"'
+# Auto-recovery (#1328/#1397) would now fix this shape; pin it off to keep the
+# fail-closed abort path itself under test.
+out="$(CCC_SELF_UPDATE_AUTO_RECOVER=0 run_selfup run 2>&1)"; rc=$?
+ok "non-main branch aborts (auto-recover off)" '[ "$rc" = 4 ] && grep -q "expected .main." <<<"$out"'
 git -C "$REPO" checkout -q main
 
 # --- 6) status is read-only ------------------------------------------------------
@@ -447,8 +449,8 @@ spool_dedup() { cat "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | jq -r .dedup 2>
 
 rm -f "$TMP/spool"/*.json
 git -C "$REPO" checkout -q -b sidetrack
-out="$(run_selfup run 2>&1)"; rc=$?
-ok "wrong-branch exits 4" '[ "$rc" = 4 ]'
+out="$(CCC_SELF_UPDATE_AUTO_RECOVER=0 run_selfup run 2>&1)"; rc=$?
+ok "wrong-branch exits 4 (auto-recover off)" '[ "$rc" = 4 ]'
 ok "wrong-branch notifies" 'spool_text | grep -q "self-update 정지" && spool_text | grep -q "sidetrack"'
 ok "wrong-branch dedup keys on reason, not SHA" 'spool_dedup | grep -qx "SelfUpdate:stalled-wrong-branch"'
 # The abort line used to record only reason= and repo=, so a later reader could
@@ -521,25 +523,33 @@ ok "fully-pushed stray branch auto-recovers (rc 0)" '[ "$rc" = 0 ]'
 ok "recovery switched back to main" '[ "$(git -C "$REPO" symbolic-ref --short HEAD)" = "main" ]'
 ok "recovery kept the update flowing (ff to origin/main)" \
   '[ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
-ok "recovery logged with the stray branch name" \
-  'grep -q "recover reason=wrong-branch from=auto-recover-me" "$STATE/self-update.log"'
+ok "recovery logged with the stray branch name (kind=pushed)" \
+  'grep -q "recover reason=wrong-branch from=auto-recover-me kind=pushed" "$STATE/self-update.log"'
 ok "recovery notified the owner" 'grep -rh "자동 복구" "$TMP/spool" >/dev/null 2>&1'
 ok "recovery leaves the stray branch ref in place (no destructive cleanup)" \
   'git -C "$REPO" rev-parse --verify --quiet refs/heads/auto-recover-me >/dev/null'
 
-# (2) unpushed stray branch: the only copy of that commit is local -> fail-closed.
+# (2) unpushed stray branch, clean tree (#1397 C): recover, but pin the local-only
+# history first. The branch ref survives the switch; refs/ccc-stray/ survives
+# even a later branch -D.
 rm -f "$TMP/spool"/*.json
 git -C "$REPO" checkout -q -b unpushed-work
 echo local-only > "$REPO/wip.txt"
 git -C "$REPO" add wip.txt && git -C "$REPO" commit -qm wip
+wip_sha="$(git -C "$REPO" rev-parse HEAD)"
 out="$(run_selfup run 2>&1)"; rc=$?
-ok "unpushed stray branch stays fail-closed (rc 4)" '[ "$rc" = 4 ]'
-ok "unpushed stray branch aborts with both branch names logged" \
-  'grep -q "abort reason=wrong-branch .*branch=unpushed-work expected=main" "$STATE/self-update.log"'
-ok "unpushed stray branch still checked out, work intact" \
-  '[ "$(git -C "$REPO" symbolic-ref --short HEAD)" = "unpushed-work" ] && git -C "$REPO" rev-parse --verify refs/heads/unpushed-work >/dev/null'
-git -C "$REPO" checkout -q main
+ok "unpushed stray branch with clean tree recovers (rc 0)" '[ "$rc" = 0 ]'
+ok "unpushed recovery switched back to main" '[ "$(git -C "$REPO" symbolic-ref --short HEAD)" = "main" ]'
+ok "unpushed recovery keeps the branch ref and its commit" \
+  '[ "$(git -C "$REPO" rev-parse refs/heads/unpushed-work)" = "$wip_sha" ] && git -C "$REPO" cat-file -e "$wip_sha:wip.txt"'
+ok "unpushed recovery pins the stray HEAD under refs/ccc-stray/<branch>/" \
+  '[ "$(git -C "$REPO" for-each-ref --format="%(objectname)" "refs/ccc-stray/unpushed-work/" | head -1)" = "$wip_sha" ]'
+ok "unpushed recovery is logged as kind=unpushed" \
+  'grep -q "recover reason=wrong-branch from=unpushed-work kind=unpushed" "$STATE/self-update.log"'
+ok "unpushed recovery notice names the preserved refs" 'grep -rh "refs/ccc-stray/unpushed-work" "$TMP/spool" >/dev/null 2>&1'
 git -C "$REPO" branch -qD unpushed-work
+ok "after branch -D the pinned ref still reaches the commit" 'git -C "$REPO" cat-file -e "$wip_sha:wip.txt"'
+git -C "$REPO" for-each-ref --format="%(refname)" "refs/ccc-stray/" | while read -r r; do git -C "$REPO" update-ref -d "$r"; done
 
 # (3) dirty tree on a pushed stray branch: unknown local state -> fail-closed.
 rm -f "$TMP/spool"/*.json
