@@ -122,11 +122,28 @@ All rows are non-fatal: they never change the exit code. `install-nunchi.sh`
 re-applies need the node's original provider/audience flags.
 
 Marked lines no repo installer renders are classified separately as
-`cron unmanaged markers`: documented hand-installed lines
-(`# ccc-node:self-update`, `# ccc-node:live-backups-rotate`) are `정상` with
+`cron unmanaged markers`: documented hand-installed lines are `정상` with
 their labels; unknown markers are `경고` so stale duplicates like the `#1079`
 ghost entries stay visible. The check reads only the crontab of the user
 running doctor.
+
+Documented hand-installed markers (`CRON_KNOWN_UNMANAGED_MARKERS`):
+
+| marker | what it runs | where |
+|---|---|---|
+| `# ccc-node:self-update` | `ccc-self-update.sh run` (docs/self-update.md) | every node |
+| `# ccc-node:live-backups-rotate` | `ccc-live-backups-rotate.sh` | every node |
+| `# ccc-node:honcho-staleness-canary` | `honcho-peer-staleness-canary.sh` | opt-in |
+| `# ccc-node:skill-promotion-collect` | `ccc-skill-promotion.py collect` nightly | hub (seoseo) |
+| `# ccc-node:skill-promotion-drop-report` | `ccc-skill-promotion.py drop-report` weekly | hub (seoseo) |
+| `# ccc-node:gate-sim` | `skill-review/gate-sim.sh` nightly simulation | opt-in |
+| `# ccc-node:kimi-mail-monitor` | operator-owned node-local mail monitor | daegyo |
+| `# ccc-node:wiki-log-rotation-reminder` | operator-owned reminder script | yukson |
+
+A marker in this table is a *known lane without an installer*: the line is
+expected, but nothing re-renders it and it never carries a gen stamp. Promote a
+lane to an installer (and `CRON_MARKER_INSTALLERS`) once its command shape has
+to change fleet-wide — that is what happened to `fleet-skills-sync` in #1398.
 
 ## self-update stall
 

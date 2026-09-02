@@ -935,6 +935,13 @@ cd_out="$(run_cd "45 4,5 * * * bash -lc 'x' >> /l 2>&1  # ccc-node:self-update
 30 4 * * * /x/ccc-live-backups-rotate.sh >/dev/null 2>&1  # ccc-node:live-backups-rotate")"
 ok "documented hand-installed markers are 정상 with labels" \
   'jq -e ".rows[] | select(.item == \"cron unmanaged markers\" and .klass == \"정상\") | .status | contains(\"ccc-node:self-update\") and contains(\"live-backups-rotate\")" <<<"$cd_out" >/dev/null'
+cd_out="$(run_cd "0 23 * * * bash -lc 'x' >> /l 2>&1  # ccc-node:skill-promotion-collect
+30 23 * * 0 python3 x drop-report >> /l 2>&1 # ccc-node:skill-promotion-drop-report
+40 22 * * * bash -lc 'x' # ccc-node:gate-sim
+*/10 * * * * /x/kimi-mail-cron.sh >> /l 2>&1 # ccc-node:kimi-mail-monitor
+0 9 16,17,20,25 * * bash -lc 'x' # ccc-node:wiki-log-rotation-reminder")"
+ok "2026-09-02 residual hand-installed lanes are documented 정상, not 경고" \
+  '! jq -e ".rows[] | select(.item == \"cron unmanaged markers\" and .klass == \"경고\")" <<<"$cd_out" >/dev/null && jq -e ".rows[] | select(.item == \"cron unmanaged markers\" and .klass == \"정상\") | .status | contains(\"skill-promotion-collect\") and contains(\"gate-sim\") and contains(\"kimi-mail-monitor\") and contains(\"wiki-log-rotation-reminder\")" <<<"$cd_out" >/dev/null'
 cd_out="$(run_cd "*/5 * * * * bash /x/ghost.sh  # ccc-node:ghost-lane")"
 ok "unknown unmanaged marker is a 경고 with the label" \
   'jq -e ".rows[] | select(.item == \"cron unmanaged markers\" and .klass == \"경고\") | .status | contains(\"ccc-node:ghost-lane\")" <<<"$cd_out" >/dev/null'
