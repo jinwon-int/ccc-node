@@ -14,6 +14,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   tools on Termux are facts in the `tools` block, never a failure. This is the
   per-node collector the fleet registry ([DOC-3283]) comparison runs on; it
   installs no cron and mutates nothing.
+### Changed
+- **Honcho is off by default (fleet retirement 2026-09-01, TM-2029 phase 3).**
+  `CCC_HONCHO_MEMORY_ENABLED` now defaults to `0` in the bridge settings and in
+  every hook that consulted it (`load-memory`, `refresh-memory`, `distill`,
+  `distill/queue-drain`, `distill/honcho-push`, `ccc-memory-check`). The
+  retirement had been applied as a per-node `settings.json` env flag, which the
+  next harness re-render dropped on all 12 nodes (#1402), so every session and
+  refresh cron went back to probing the stopped endpoint and doctor reported
+  `honcho=stale` fleet-wide. `CCC_HONCHO_MEMORY_ENABLED=1` opts a node back in.
 
 ### Fixed
 - **ccc-doctor documents the five residual hand-installed cron lanes.** After

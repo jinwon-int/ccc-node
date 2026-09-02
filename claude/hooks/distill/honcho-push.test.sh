@@ -42,6 +42,9 @@ cat > "$CFG" <<'JSON'
 JSON
 export CCC_HONCHO_CFG="$CFG"
 export CCC_STATE_DIR="$TMP/state"
+# Honcho defaults to OFF since the 2026-09-01 retirement; this suite exercises
+# the enabled push path, so opt in explicitly. The default is asserted below.
+export CCC_HONCHO_MEMORY_ENABLED=1
 INVALIDATE="$TMP/state/honcho-refresh.invalidate"
 
 PAYLOAD_WITH_FACTS='{"session_id":"sess-1","trigger":"manual","distilled_at":"2026-01-01T00:00:00Z","source_cwd":"/root/project-a","source_project":"-root-project-a","honcho":[{"kind":"context","text":"fact one","subject":"session"}],"wiki_candidates":[]}'
@@ -50,6 +53,8 @@ unset CCC_NODE
 printf 'seoseo\n' > "$TMP/state/node.txt"
 
 : > "$CURL_STUB_LOG"
+out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | env -u CCC_HONCHO_MEMORY_ENABLED bash "$PUSH" 2>&1)"; rc=$?
+ok "unset toggle (fleet default) skips the push" '[ "$rc" = 0 ] && printf "%s" "$out" | grep -q "skipped: disabled" && [ ! -s "$CURL_STUB_LOG" ]'
 out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CCC_HONCHO_MEMORY_ENABLED=0 bash "$PUSH" 2>&1)"; rc=$?
 ok "disabled Honcho path performs no network call" '[ "$rc" = 0 ] && grep -q "skipped: disabled" <<<"$out" && [ ! -s "$CURL_STUB_LOG" ]'
 
