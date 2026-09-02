@@ -51,7 +51,7 @@ ccc_installer_gen_inputs() {
     # The three crontab installers render through the shared cron lib (#1077).
     # (install-cost-ledger-cron.sh also sources the lib but is deliberately NOT
     # listed: adding it would re-stamp 12 already-correct fleet entries.)
-    install-memory-refresh-cron.sh|install-pr-status-poll-cron.sh|install-skill-autosave-cron.sh|install-fleet-skills-sync-cron.sh)
+    install-memory-refresh-cron.sh|install-pr-status-poll-cron.sh|install-skill-autosave-cron.sh|install-fleet-skills-sync-cron.sh|install-tunnel-audit-cron.sh)
       extras="installer-cron-common.sh" ;;
   esac
   printf '%s\n' "$self"

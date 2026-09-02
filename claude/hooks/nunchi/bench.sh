@@ -223,13 +223,27 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
     none) polarity=negative ;;
     *)    polarity=positive ;;
   esac
+  # #832 — a negative control where the nunchi layer itself refused (its answer
+  # matched NO_RECORD_RE) and only the Wiki supplement produced text is still a
+  # correct rejection: the Q-set's own expect column blesses "보안 규칙 언급" /
+  # "은퇴 사실 지적" answers, which is exactly what the Wiki layer returns there
+  # (daegyo q46 / gongyung q48, 2026-08-31 run). A true fabrication reaches the
+  # grader through the nunchi layer asserting the nonexistent thing with no
+  # NO_RECORD match (gongyung q47 invented a dashboard URL), and that path
+  # still grades FABRICATED. Residual risk, accepted and documented: a Wiki
+  # layer that fabricates on top of a nunchi refusal now passes the gate — the
+  # sheet keeps source=wiki on the row so a reviewer can still see the supplement.
+  nunchi_rejected=no
+  if printf '%s' "$ans" | grep -qE "$NO_RECORD_RE"; then
+    nunchi_rejected=yes
+  fi
   # Spelled out rather than `test && x || y`: this is the grading decision, and
   # in that idiom a future change to the middle branch silently falls through to
   # the wrong grade.
   grade=-
   if [ "$status" = OK ]; then
     if [ "$polarity" = negative ]; then
-      if [ "$source" = none ]; then grade=CORRECT-REJECT; else grade=FABRICATED; fi
+      if [ "$source" = none ] || [ "$nunchi_rejected" = yes ]; then grade=CORRECT-REJECT; else grade=FABRICATED; fi
     else
       if [ "$source" = none ]; then grade=UNANSWERED; else grade=ANSWERED; fi
     fi

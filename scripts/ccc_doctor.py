@@ -97,6 +97,8 @@ CRON_MARKER_INSTALLERS = (
      "run scripts/install-cost-ledger-cron.sh --apply (add --weekly if the node had the weekly line)"),
     ("fleet-skills-sync", "# ccc-node:fleet-skills-sync", "scripts/install-fleet-skills-sync-cron.sh",
      "run scripts/install-fleet-skills-sync-cron.sh --apply"),
+    ("tunnel-audit", "# ccc-node:tunnel-audit", "scripts/install-tunnel-audit-cron.sh",
+     "run scripts/install-tunnel-audit-cron.sh --apply (hub node only)"),
     ("nunchi", "# nunchi:#816", "scripts/install-nunchi.sh",
      "run scripts/install-nunchi.sh --apply with the node's original provider/audience flags"),
 )
@@ -113,6 +115,8 @@ CRON_AUX_MARKERS = (
     "# ccc-node:cost-ledger:end",
     "# ccc-node:fleet-skills-sync:begin",
     "# ccc-node:fleet-skills-sync:end",
+    "# ccc-node:tunnel-audit:begin",
+    "# ccc-node:tunnel-audit:end",
 )
 # Hand-installed markers the repo documents but no installer renders: the
 # self-update and live-backups schedule lines are operator-placed by design

@@ -4,6 +4,18 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Added
+- **Periodic fleet tunnel audit (ccc-node#1366, final slice).**
+  `scripts/tunnel-audit-fleet.sh` runs the per-node `tunnel-audit.sh`
+  collector over ssh on every fleet node, keeps each node's latest JSON and an
+  operator-ACCEPTED baseline under `state/tunnel-audit/`, and reports per node
+  `OK | NEW <items> | GONE <items> | UNBASELINED | UNREACHABLE | NOSCRIPT`.
+  New exposure (tunnel unit, cron tunnel line, non-loopback listener, funnel
+  on, residue) or an unreachable node exits 1 so an agent-cron on-failure
+  notification reaches the owner; `--accept-baseline[=nodes]` freezes what the
+  Wiki registry ([DOC-3283]) has reviewed. `scripts/install-tunnel-audit-cron.sh`
+  installs the weekly hub-node cron (`20 6 * * 1`, opt-in, same BEGIN/END +
+  gen-stamp shape as the sibling installers); ccc-doctor knows the lane.
 ### Changed
 - **Wrong-branch recovery no longer requires the stray branch to be pushed
   (#1397 C).** `ccc-self-update.sh` recovers a clean-tree stray branch whether

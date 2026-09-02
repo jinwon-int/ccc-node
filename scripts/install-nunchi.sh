@@ -631,8 +631,13 @@ case "$ACTION" in
     # $NUNCHI_DIR, which on a scoped node stops receiving facts as soon as
     # ingest becomes scoped. That made the Phase 2 parity gate (#827) measure
     # a store frozen weeks earlier on every audience-scoped node.
-    append_cron_line "7 8 * * 1 CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK gen=$GEN"
-    echo "weekly bench cron added (Mon 08:07)"
+    # #832 — Mon 11:07, after the z.ai weekly quota reset (Mon 10:00 KST). The
+    # old 08:07 slot ran while the previous week's pool was still exhausted and
+    # produced contaminated sheets on nosuk/gongyung (2026-08-24 and 08-31,
+    # #1210). The claude→codex→piri fallback chain (#1385) limits the damage,
+    # but a post-reset slot keeps the primary backend consistent week to week.
+    append_cron_line "7 11 * * 1 CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK gen=$GEN"
+    echo "weekly bench cron added (Mon 11:07, post-quota-reset)"
     if [ "$JUDGE" = 1 ]; then
       # #1204 daily review-queue triage. Dry-run unless --judge-apply is passed:
       # flipping to apply is a fresh-approval, per-node action, never a default.
