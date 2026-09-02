@@ -5,6 +5,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Fixed
+- **setup.sh keeps node-local `settings.json` env keys across a re-render
+  (#1402).** settings.json is recomposed from repo templates on every setup /
+  self-update tick; only `model` was carved out (#1235). The 2026-09-01
+  Honcho retirement flag (`CCC_HONCHO_MEMORY_ENABLED=0`, 12 nodes) vanished
+  on the next tick. Env keys the template does not declare are now captured
+  before the merge and re-applied after it; template-declared keys stay
+  repo-owned (a node override of one is still dropped, by design).
+
+### Fixed
 - **ccc-doctor no longer reports the Piri CLI missing on Termux.** The
   distill-extractor probe resolved `CCC_PIRI_CLI_PATH` from the environment or
   the bridge's systemd unit only; Termux has no unit, so the 2026-09-02 sweep

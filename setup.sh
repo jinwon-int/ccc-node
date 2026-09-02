@@ -305,6 +305,40 @@ neutralize_bypass_if_root() {
 # So carve out this one key, the same node-local-survives-setup contract
 # settings.local.json already has (#454). Everything else in the file stays
 # repo-owned.
+# #1402: the same erasure hit `env`. The 2026-09-01 Honcho retirement set
+# CCC_HONCHO_MEMORY_ENABLED=0 in settings.json env on 12 nodes and the next
+# re-render dropped it on all 12. Keys the repo template does NOT declare are
+# node-local by definition (the template owns the ones it ships), so capture
+# them before the merge and re-apply them after — same contract as `model`.
+read_node_local_env() { # <settings-path> <template-path> -> JSON object of node-local env keys
+  local src="$1" tpl="$2"
+  [ -f "$src" ] || { printf '{}'; return 0; }
+  jq -c --slurpfile tpl "$tpl" '
+    ((.env // {}) | with_entries(select(.value | type == "string"))) as $node
+    | (($tpl[0].env // {}) | keys) as $owned
+    | $node | with_entries(select(.key as $k | ($owned | index($k)) | not))
+  ' "$src" 2>/dev/null || printf '{}'
+}
+restore_node_local_env() { # <settings-path> <env-json>
+  local dest="$1" extra="$2"
+  [ -n "$extra" ] && [ "$extra" != "{}" ] || return 0
+  if [ "$DRY" = 1 ]; then
+    echo "[dry-run] preserve node-local settings env keys: $(jq -r 'keys | join(",")' <<<"$extra")"
+    return 0
+  fi
+  [ -f "$dest" ] || return 0
+  local tmp; tmp="$(mktemp "${dest}.XXXXXX")" || { echo "ERROR: mktemp failed for $dest" >&2; return 1; }
+  # Template-declared keys win (repo-owned); only keys the template lacks are re-applied.
+  if jq --argjson extra "$extra" '.env = ($extra + (.env // {}))' "$dest" > "$tmp" 2>/dev/null \
+     && jq -e . "$tmp" >/dev/null 2>&1; then
+    mv "$tmp" "$dest"
+    note "preserved node-local settings env keys: $(jq -r 'keys | join(",")' <<<"$extra")"
+  else
+    rm -f "$tmp"
+    echo "ERROR: failed to re-apply node-local settings env keys (existing file left untouched)" >&2
+    return 1
+  fi
+}
 read_node_local_model() { # <settings-path> -> pin on stdout (empty if none)
   local src="$1"
   [ -f "$src" ] || return 0
@@ -382,6 +416,7 @@ run mkdir -p "$CLAUDE_DIR/hooks" "$CLAUDE_DIR/hooks/lib"
 # render from repo templates and mv over the destination, so nothing survives
 # unless it was captured first (#1235).
 NODE_LOCAL_MODEL="$(read_node_local_model "$CLAUDE_DIR/settings.json")"
+NODE_LOCAL_ENV="$(read_node_local_env "$CLAUDE_DIR/settings.json" "$SRC/claude/settings.base.json")"
 if [ "$WITH_PLUGIN" = 1 ]; then
   note "plugin mode: lean settings (portable hooks come from the ccc-node plugin)"
   run atomic_install "$SRC/claude/settings.base.json" "$CLAUDE_DIR/settings.json"
@@ -389,6 +424,7 @@ else
   merge_settings_json "$SRC/claude/settings.base.json" "$SRC/claude/hooks/enforcement-overlay.json" "$CLAUDE_DIR/settings.json"
 fi
 restore_node_local_model "$CLAUDE_DIR/settings.json" "$NODE_LOCAL_MODEL"
+restore_node_local_env "$CLAUDE_DIR/settings.json" "$NODE_LOCAL_ENV"
 neutralize_bypass_if_root "$CLAUDE_DIR/settings.json"
 # settings.local.json is the NODE-LOCAL approvals file — seed it from the
 # template ONLY when absent so a node's accumulated/hand-added approvals are
