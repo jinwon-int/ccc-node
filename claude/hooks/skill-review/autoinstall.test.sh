@@ -222,17 +222,18 @@ mkdir -p "$big"
 big_out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run 2>&1)"
 ok "oversized body blocked" 'jq -e ".reason | startswith(\"size oversized-body\")" "$PENDING/20260101-000009-j-bigbody/autosave-block.json" >/dev/null'
 # #1399: this assertion failed once on CI (2026-09-02) with no reproduction in
-# 7 local runs. When it fails, dump what the run actually did so the next
-# occurrence is diagnosable instead of a bare FAIL line.
+# 7 local runs, then again in the CI run of the diagnostics PR itself. The
+# harness runner keeps only the tail of a failing suite, so the dump is three
+# compact lines with the run summary LAST (it carries "skipped": locked /
+# daily-cap / incremental-usage-unavailable — the likeliest common cause of
+# both this and the 500-line edge case failing in the same run).
+diag_1399() { # <draft-dir> <label> <run-output>
+  echo "#1399[$2] dir=$(ls -d "$1"* 2>/dev/null | tr '\n' ' ') block=$(cat "$1/autosave-block.json" 2>/dev/null | head -c 200) lines=$(wc -l < "$1/SKILL.md" 2>/dev/null) installs_today=$(grep -c '"event":"install"' "$STATE/skill-autosave-install.jsonl" 2>/dev/null)"
+  echo "#1399[$2] log: $(tail -n 4 "$STATE/skill-autoinstall.log" 2>/dev/null | tr '\n' '|' | head -c 400)"
+  echo "#1399[$2] run: $(printf '%s' "$3" | tr '\n' ' ' | head -c 400)"
+}
 if ! jq -e ".reason | startswith(\"size oversized-body\")" "$PENDING/20260101-000009-j-bigbody/autosave-block.json" >/dev/null 2>&1; then
-  echo "--- #1399 diagnostics: oversized body ---"
-  echo "run summary: $(printf '%s' "$big_out" | head -c 600)"
-  echo "draft dir: $(ls -d "$PENDING"/20260101-000009-j-bigbody* 2>/dev/null | tr '\n' ' ')"
-  echo "block file: $(cat "$PENDING/20260101-000009-j-bigbody/autosave-block.json" 2>/dev/null | head -c 300)"
-  echo "line count: $(wc -l < "$PENDING/20260101-000009-j-bigbody/SKILL.md" 2>/dev/null)"
-  echo "log tail:"; tail -n 12 "$STATE/skill-autoinstall.log" 2>/dev/null | sed 's/^/  /'
-  echo "installs today: $(grep -c '"event":"install"' "$STATE/skill-autosave-install.jsonl" 2>/dev/null)"
-  echo "--- end diagnostics ---"
+  diag_1399 "$PENDING/20260101-000009-j-bigbody" bigbody "$big_out"
 fi
 
 # 500 lines is exactly at the official limit and must pass the size gate.
@@ -242,8 +243,11 @@ mkdir -p "$edge"
   printf -- '---\nname: edge-body-skill\ndescription: Sit exactly at the progressive disclosure limit and stay installable.\n---\n\n# Edge\n\n'
   seq -f 'Filler line %g.' 1 493
 } > "$edge/SKILL.md"
-run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
+edge_out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run 2>&1)"
 ok "body at the 500-line limit installs" '[ -f "$SKILLS/edge-body-skill/SKILL.md" ]'
+if [ ! -f "$SKILLS/edge-body-skill/SKILL.md" ]; then
+  diag_1399 "$PENDING/20260101-000010-k-edgebody" edgebody "$edge_out"
+fi
 
 # --- 5c) compatibility field lint (official spec: <=500 chars) -------------------
 long_compat="$PENDING/20260101-000011-l-longcompat"
