@@ -115,5 +115,22 @@ ok "expected=trunk warns while sitting on main" '[ "$RC" = 0 ] && [ -n "$OUT" ]'
 run_hook_in "$TMP" -- "$HEAD_SHA" "$HEAD_SHA" 1
 ok "hook outside a git repo exits 0 silently" '[ "$RC" = 0 ] && [ -z "$OUT" ]'
 
+# ---- #1397 A: pre-commit mode -------------------------------------------------
+git -C "$M" checkout -q main
+run_hook_in "$M" CCC_MANAGED_CHECKOUT_GUARD_HOOK=pre-commit --
+ok "pre-commit on main exits 0 silently" '[ "$RC" = 0 ] && [ -z "$OUT" ]'
+git -C "$M" checkout -q -b stray-commit-branch
+run_hook_in "$M" CCC_MANAGED_CHECKOUT_GUARD_HOOK=pre-commit --
+ok "pre-commit on a stray branch is refused (exit 1)" '[ "$RC" = 1 ]'
+ok "pre-commit refusal names the branch and the worktree escape hatch" 'grep -q "commit on .stray-commit-branch. refused" <<<"$OUT" && grep -q "git worktree add" <<<"$OUT"'
+run_hook_in "$M" CCC_MANAGED_CHECKOUT_GUARD_HOOK=pre-commit CCC_MANAGED_CHECKOUT_GUARD=warn --
+ok "pre-commit with GUARD=warn is advisory (exit 0, notice printed)" '[ "$RC" = 0 ] && grep -q "refused" <<<"$OUT"'
+run_hook_in "$M" CCC_MANAGED_CHECKOUT_GUARD_HOOK=pre-commit CCC_MANAGED_CHECKOUT_GUARD=0 --
+ok "pre-commit with GUARD=0 is silent" '[ "$RC" = 0 ] && [ -z "$OUT" ]'
+run_hook "$HEAD_SHA" "$HEAD_SHA" 0
+ok "post-checkout file checkout (flag=0) on a stray branch stays silent" '[ "$RC" = 0 ] && [ -z "$OUT" ]'
+git -C "$M" checkout -q main
+git -C "$M" branch -qD stray-commit-branch
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
