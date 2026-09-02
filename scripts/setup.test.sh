@@ -250,6 +250,23 @@ selfupdate_ino_before="$(stat -c '%i' "$rewrite_claude/hooks/ccc-self-update.sh"
 hooktree_ino_before="$(stat -c '%i' "$rewrite_claude/hooks/checkpoint.sh")"
 HOME="$TMP/rewrite-home" CCC_CLAUDE_DIR="$rewrite_claude" CCC_HERMES_DIR="$rewrite_hermes" \
   bash "$SETUP" --no-backup >/dev/null 2>&1
+# --- #1402: node-local settings.json env keys survive a re-render -------------
+# Keys the template does not declare (e.g. CCC_HONCHO_MEMORY_ENABLED=0 from the
+# 2026-09-01 retirement) are node-local and must be re-applied; template keys
+# stay repo-owned (a node-local override of one is dropped, by design).
+env_home="$TMP/env-home"; env_claude="$env_home/.claude"; env_hermes="$env_home/.hermes"
+mkdir -p "$env_claude" "$env_hermes"
+HOME="$env_home" CCC_CLAUDE_DIR="$env_claude" CCC_HERMES_DIR="$env_hermes" bash "$SETUP" --no-backup >/dev/null 2>&1
+jq '.env.CCC_HONCHO_MEMORY_ENABLED = "0" | .env.CCC_USAGE_BUDGET_TOKENS_CLAUDE = "5000000" | .env.BASH_MAX_TIMEOUT_MS = "1"' \
+  "$env_claude/settings.json" > "$TMP/env-seeded.json" && mv "$TMP/env-seeded.json" "$env_claude/settings.json"
+out="$(HOME="$env_home" CCC_CLAUDE_DIR="$env_claude" CCC_HERMES_DIR="$env_hermes" bash "$SETUP" --no-backup 2>&1)"
+ok "node-local env keys survive setup re-render (#1402)" \
+  'jq -e ".env.CCC_HONCHO_MEMORY_ENABLED == \"0\" and .env.CCC_USAGE_BUDGET_TOKENS_CLAUDE == \"5000000\"" "$env_claude/settings.json" >/dev/null'
+ok "template-declared env keys stay repo-owned (node override dropped)" \
+  '[ "$(jq -r ".env.BASH_MAX_TIMEOUT_MS" "$env_claude/settings.json")" = "$(jq -r ".env.BASH_MAX_TIMEOUT_MS" "$ROOT/claude/settings.base.json")" ]'
+ok "env preservation is logged with the key names" 'grep -q "preserved node-local settings env keys: .*CCC_HONCHO_MEMORY_ENABLED" <<<"$out"'
+out="$(HOME="$env_home" CCC_CLAUDE_DIR="$env_claude" CCC_HERMES_DIR="$env_hermes" bash "$SETUP" --no-backup --dry-run 2>&1)"
+ok "dry-run only announces env preservation" 'grep -q "\[dry-run\] preserve node-local settings env keys" <<<"$out"'
 # --- #1403: the self-update agent-cron task is registered only where the
 # ccc-agent-cron timer exists. The fixture systemctl stub above exits 0 for
 # every verb, i.e. "timer enabled", which is why the registration test passes.

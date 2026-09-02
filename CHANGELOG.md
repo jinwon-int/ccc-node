@@ -34,6 +34,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
   hooks. Foreign hooks are still never clobbered.
 
 ### Fixed
+- **setup.sh keeps node-local `settings.json` env keys across a re-render
+  (#1402).** settings.json is recomposed from repo templates on every setup /
+  self-update tick; only `model` was carved out (#1235). The 2026-09-01
+  Honcho retirement flag (`CCC_HONCHO_MEMORY_ENABLED=0`, 12 nodes) vanished
+  on the next tick. Env keys the template does not declare are now captured
+  before the merge and re-applied after it; template-declared keys stay
+  repo-owned (a node override of one is still dropped, by design).
 - **skill autoinstall no longer misreads long drafts as headingless
   (#1399).** `gate_lint` checked for a heading with `awk … | grep -q`; under
   `set -o pipefail` grep exits on the first heading, awk dies of EPIPE writing
