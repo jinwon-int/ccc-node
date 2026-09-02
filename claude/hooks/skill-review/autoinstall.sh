@@ -639,16 +639,25 @@ do_run() {
       continue
     fi
     sha="$(file_sha "$dest/SKILL.md")"
-    if ! ownership_cmd mark-created "$name" >/dev/null; then
+    if ! ownership_out="$(ownership_cmd mark-created "$name" 2>/dev/null)"; then
       # This directory was created by this locked install attempt and has not
       # been published as installed yet. Fail closed and leave the draft
-      # pending if durable v2 provenance cannot be established.
+      # pending if durable v2 provenance cannot be established. Surface the
+      # ownership contract's own error code in the failure log — the generic
+      # provenance-write label alone buried the real cause for five weeks on
+      # gongmyoung (group-writable skills root, #1415).
+      detail="unknown"
+      if command -v jq >/dev/null 2>&1 && [ -n "$ownership_out" ]; then
+        extracted="$(printf '%s' "$ownership_out" | jq -r '.code // empty' 2>/dev/null)"
+        extracted="$(printf '%s' "$extracted" | tr -c 'A-Za-z0-9_-' '.' | cut -c1-40)"
+        [ -n "$extracted" ] && detail="$extracted"
+      fi
       failed=$((failed + 1))
       rm -f "$dest/SKILL.md" "$dest/.autosave-meta.json" 2>/dev/null
       if rmdir "$dest" 2>/dev/null; then
-        log "install failed id=$id name=$name reason=provenance-write cleanup=complete trigger=$TRIGGER"
+        log "install failed id=$id name=$name reason=provenance-write detail=$detail cleanup=complete trigger=$TRIGGER"
       else
-        log "install failed id=$id name=$name reason=provenance-write cleanup=incomplete trigger=$TRIGGER"
+        log "install failed id=$id name=$name reason=provenance-write detail=$detail cleanup=incomplete trigger=$TRIGGER"
       fi
       continue
     fi
