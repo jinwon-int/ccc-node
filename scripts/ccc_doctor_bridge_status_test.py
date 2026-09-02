@@ -213,6 +213,51 @@ class BridgeStatusVerdictTest(unittest.TestCase):
         self.assertEqual(doctor.distill_readiness, "blocked")
         self.assertIn("fail-closed", doctor.rows[-1].status)
 
+    def test_piri_launcher_fallback_when_no_unit_exposes_the_path(self) -> None:
+        """Termux: no unit, no env — the harness launcher hooks/ccc-piri counts as the executable."""
+
+        with TemporaryDirectory() as temp:
+            claude_dir = Path(temp) / ".claude"
+            (claude_dir / "hooks").mkdir(parents=True)
+            launcher = claude_dir / "hooks" / "ccc-piri"
+            launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            launcher.chmod(0o700)
+            doctor = Doctor(Path.cwd(), claude_dir, "settings")
+            doctor.provider = "piri"
+            doctor._bridge_provider_state = ("piri", "healthy")
+            with patch.dict(
+                "os.environ",
+                {"CCC_MEMORY_DISTILL_PROVIDER": "auto"},
+                clear=True,
+            ), patch.object(doctor, "bridge_systemd_units", return_value=[]), patch(
+                "ccc_doctor.shutil.which", return_value=None
+            ):
+                doctor.check_distill_readiness()
+
+        self.assertNotEqual(doctor.distill_readiness, "failed")
+        self.assertNotIn("executable=missing", doctor.rows[-1].status)
+
+    def test_piri_without_launcher_or_unit_is_still_missing(self) -> None:
+        """The fallback only helps when the launcher file really exists."""
+
+        with TemporaryDirectory() as temp:
+            claude_dir = Path(temp) / ".claude"
+            (claude_dir / "hooks").mkdir(parents=True)
+            doctor = Doctor(Path.cwd(), claude_dir, "settings")
+            doctor.provider = "piri"
+            doctor._bridge_provider_state = ("piri", "healthy")
+            with patch.dict(
+                "os.environ",
+                {"CCC_MEMORY_DISTILL_PROVIDER": "auto"},
+                clear=True,
+            ), patch.object(doctor, "bridge_systemd_units", return_value=[]), patch(
+                "ccc_doctor.shutil.which", return_value=None
+            ):
+                doctor.check_distill_readiness()
+
+        self.assertEqual(doctor.distill_readiness, "failed")
+        self.assertIn("executable=missing", doctor.rows[-1].status)
+
     def test_unset_budget_uses_the_fleet_default_and_is_ready(self) -> None:
         """No env, no unit: doctor judges the same 2M default the bridge runs with."""
 

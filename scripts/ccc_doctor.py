@@ -774,6 +774,30 @@ class Doctor:
         self.add("정상", "Codex login", "authenticated", "none")
         self.readiness = "ready"
 
+    def _piri_launcher_path(self, effective: str) -> str:
+        """Resolve the Piri launcher for the static existence check only.
+
+        Order: environment → bridge systemd unit drop-in → the harness-installed
+        launcher ``<claude_dir>/hooks/ccc-piri``. The fleet sweep runs doctor
+        from a clean login shell while the live bridge receives its launcher
+        path from systemd; Termux nodes have no unit at all, yet their bridge
+        runs with CCC_PIRI_CLI_PATH pointing at hooks/ccc-piri (setup.sh), so
+        the 2026-09-02 sweep flagged gongyung and daegyo 수동필요 for a probe
+        gap, not a broken node. Do not import CCC_CODEX_CLI_PATH here: the
+        Codex readiness check runs live probes and its service wrapper is not
+        a probe-safe binary.
+        """
+        if effective != "piri":
+            return ""
+        piri_path = os.environ.get("CCC_PIRI_CLI_PATH", "").strip()
+        if not piri_path and self._bridge_provider_state == ("piri", "healthy"):
+            piri_path = self.bridge_unit_environment_value("CCC_PIRI_CLI_PATH") or ""
+        if not piri_path:
+            launcher = self.claude_dir / "hooks" / "ccc-piri"
+            if launcher.is_file():
+                piri_path = str(launcher)
+        return piri_path
+
     def check_distill_readiness(self) -> None:
         """Report extractor readiness separately without making a provider call."""
 
@@ -878,18 +902,7 @@ class Doctor:
                 f"enable usage metering and set a finite {budget_name}; explicit unbounded opt-in is not recommended",
             )
             return
-        piri_path = os.environ.get("CCC_PIRI_CLI_PATH", "").strip()
-        if (
-            effective == "piri"
-            and not piri_path
-            and self._bridge_provider_state == ("piri", "healthy")
-        ):
-            # The fleet sweep runs doctor from a clean login shell, while the
-            # live bridge can receive its launcher path from systemd. Resolve
-            # that path only for this static existence check. In particular,
-            # do not import CCC_CODEX_CLI_PATH: the Codex readiness check runs
-            # live probes and its service wrapper is not a probe-safe binary.
-            piri_path = self.bridge_unit_environment_value("CCC_PIRI_CLI_PATH") or ""
+        piri_path = self._piri_launcher_path(effective)
         configured_paths = {
             "claude": os.environ.get("CLAUDE_CLI_PATH", "claude"),
             "codex": os.environ.get("CCC_CODEX_CLI_PATH", "codex"),
