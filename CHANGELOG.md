@@ -5,6 +5,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Fixed
+- **ccc-doctor documents the five residual hand-installed cron lanes.** After
+  #1398 the 2026-09-02 sweep still flagged `skill-promotion-collect`,
+  `skill-promotion-drop-report` (seoseo hub), `gate-sim`, `kimi-mail-monitor`
+  (daegyo) and `wiki-log-rotation-reminder` (yukson) as unknown unmanaged
+  markers. They are known lanes with no installer by design, so they join
+  `CRON_KNOWN_UNMANAGED_MARKERS` (정상 with labels) and docs/doctor.md now
+  carries the table of documented markers. Unknown markers stay 경고.
 - **nunchi bench test no longer races the second boundary (#1399).**
   `bench.test.sh` seeded backend-health rows with `ts=now` and only then
   launched `bench.sh`, which took its own `date -u` as the window start — on a
