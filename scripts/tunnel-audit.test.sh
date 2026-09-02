@@ -5,9 +5,11 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AUDIT="$ROOT/scripts/tunnel-audit.sh"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/ccc-tunnel-audit.XXXXXX")"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$ROOT/claude/hooks/lib/test-stub.sh"
+ccc_test_reset_hook_env
+TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
-BASH_BIN="$(command -v bash)"
 
 pass=0; fail=0
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
@@ -48,12 +50,10 @@ EOF
 printf '*/5 * * * * pgrep -f searxng-tunnel.sh || ~/bin/searxng-tunnel.sh --token abc123\n0 4 * * * echo unrelated\n' > "$TMP/crontab.txt"
 printf '# comment tunnel\n17 * * * * root /usr/bin/autossh -M 0 -N -L 9000:127.0.0.1:9000 hub\n' > "$TMP/cron.d/hub"
 
-cat > "$TMP/bin/crontab" <<EOF
-#!$BASH_BIN
+write_exec_stub "$TMP/bin/crontab" <<EOF
 [ "\${1:-}" = "-l" ] && cat "$TMP/crontab.txt"
 EOF
-cat > "$TMP/bin/ss" <<EOF
-#!$BASH_BIN
+write_exec_stub "$TMP/bin/ss" <<EOF
 cat <<'SS'
 LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=1,fd=3))
 LISTEN 0 128 127.0.0.1:8787 0.0.0.0:* users:(("node",pid=2,fd=4))
@@ -62,18 +62,15 @@ LISTEN 0 128 [::]:443 [::]:* users:(("caddy",pid=4,fd=6))
 LISTEN 0 128 [fd7a:115c:a1e0::2f35:ab7d]:38602 [::]:* users:(("tailscaled",pid=5,fd=7))
 SS
 EOF
-cat > "$TMP/bin/systemctl" <<EOF
-#!$BASH_BIN
+write_exec_stub "$TMP/bin/systemctl" <<EOF
 case "\$2" in cloudflared.service) echo active ;; ngrok-web.service) echo failed ;; *) echo inactive ;; esac
 EOF
-cat > "$TMP/bin/tailscale" <<EOF
-#!$BASH_BIN
+write_exec_stub "$TMP/bin/tailscale" <<EOF
 case "\$1" in
   serve) printf 'https://node.tailnet.ts.net (tailnet only)\n|-- / proxy http://127.0.0.1:8888\n' ;;
   funnel) printf 'No serve config\n' ;;
 esac
 EOF
-chmod +x "$TMP/bin/"*
 export PATH="$TMP/bin:$PATH"
 export CCC_TUNNEL_AUDIT_SYSTEMD_DIR="$SYSD" CCC_TUNNEL_AUDIT_CROND_DIR="$TMP/cron.d"
 export CCC_TUNNEL_AUDIT_CRONTAB_CMD="$TMP/bin/crontab" CCC_TUNNEL_AUDIT_SS_CMD="$TMP/bin/ss" CCC_TUNNEL_AUDIT_TAILSCALE_CMD="$TMP/bin/tailscale"
@@ -110,8 +107,7 @@ ok "missing tools reported in tools block" 'jq -e ".tools.units == \"missing-dir
 ok "no units or listeners when tools are missing" 'jq -e "(.units | length == 0) and (.listeners | length == 0)" <<<"$out" >/dev/null'
 
 # Tailscale CLI crash (gongyung 2026-08-30 observation) is surfaced, not parsed as config.
-cat > "$TMP/bin/tailscale" <<EOF
-#!$BASH_BIN
+write_exec_stub "$TMP/bin/tailscale" <<EOF
 printf 'panic: runtime error\ngoroutine 1 [running]:\n'
 EOF
 out="$(bash "$AUDIT" 2>/dev/null)"
