@@ -1161,5 +1161,137 @@ env "${base_env[@]}" python3 "$PROV_FIXTURE" "$PROMOTER" > "$TMP/prov-out" 2>&1;
 ok "publisher warns on legacy verdicts missing provenance, never fails (#2027)" \
   '[ "$rc" = 0 ] && grep -q "PROV-WARN-OK" "$TMP/prov-out"'
 
+# --- #1394 defect 1: canon-lane revise targets get an explicit code -------
+CANON_FIXTURE="$TMP/canon-fixture.py"
+cat > "$CANON_FIXTURE" <<FIXTURE
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("csp_canon", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["csp_canon"] = m
+spec.loader.exec_module(m)
+
+head = "a" * 40
+url = "https://github.com/test/repo/pull/52"
+
+# Observed seoseo ledger rows (#1394): canon re-review lanes carry harness
+# providers — R2 rows have the field, pre-R2 rows only the transport id.
+r2_shared = {
+    "transport_id": "ccc-node-shared-fleet-task-handoff-with-constraints-3834b22a8c84",
+    "head_sha": head, "pr_url": url, "provider": "shared",
+}
+pre_r2_piri = {
+    "transport_id": "ccc-node-piri-web-ad5ae95f22b1",
+    "head_sha": head, "pr_url": "https://github.com/test/repo/pull/67",
+}
+pre_r2_bridge = {
+    "transport_id": "ccc-node-bridge-setup-af322ef16783",
+    "head_sha": head, "pr_url": "https://github.com/test/repo/pull/68",
+}
+canon_claude = {
+    "transport_id": "ccc-node-claude-web-routing-1234567890ab",
+    "head_sha": head, "pr_url": "https://github.com/test/repo/pull/70",
+    "provider": "claude",
+}
+for label, row in (("r2-shared", r2_shared), ("pre-r2-piri", pre_r2_piri),
+                   ("pre-r2-bridge", pre_r2_bridge), ("canon-claude", canon_claude)):
+    got = m._revise_dispatch_target(row)
+    assert got == "revise_canon_lane", (label, got)
+
+# Regular author lanes still parse into the dispatch tuple.
+tree = "0123456789ab"
+regular = {
+    "transport_id": f"testnode-claude-r2-skill-{tree}",
+    "head_sha": head, "pr_url": "https://github.com/test/repo/pull/1",
+    "provider": "claude",
+}
+got = m._revise_dispatch_target(regular)
+assert got == ("testnode", "r2-skill", tree, "1", "claude", head, regular["pr_url"]), got
+
+# Genuinely unknown providers stay revise_record_invalid.
+bad = {
+    "transport_id": "testnode-bogus-skill-0123456789ab",
+    "head_sha": head, "pr_url": url, "provider": "bogus",
+}
+assert m._revise_dispatch_target(bad) == "revise_record_invalid", bad
+
+# The skip note must exist so the #1370 verdict comment stays explanatory.
+assert "revise_canon_lane" in m._REVISE_SKIP_NOTES
+print("CANON-LANE-OK")
+FIXTURE
+env "${base_env[@]}" python3 "$CANON_FIXTURE" "$PROMOTER" > "$TMP/canon-out" 2>&1; rc=$?
+ok "canon harness lanes return revise_canon_lane, regular lanes still parse (#1394)" \
+  '[ "$rc" = 0 ] && grep -q "CANON-LANE-OK" "$TMP/canon-out"'
+
+# --- #1394 defect 2: FIFO collect window drains backlogs -----------------
+WINDOW_FIXTURE="$TMP/window-fixture.py"
+cat > "$WINDOW_FIXTURE" <<FIXTURE
+import importlib.util, json, os, sys, tempfile
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("csp_win", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["csp_win"] = m
+spec.loader.exec_module(m)
+
+# Isolated state: never touch the shared promotion state other tests use.
+iso_state = Path(tempfile.mkdtemp()) / "skill-promotion"
+iso_state.mkdir(parents=True, exist_ok=True)
+env = dict(os.environ)
+env["CCC_STATE_DIR"] = str(iso_state.parent)
+state = iso_state
+rows = []
+for i in range(40):
+    rows.append({
+        "ts": f"2026-09-01T00:{i:02d}:00Z", "kind": "a2a-dispatch",
+        "transport_id": f"testnode-claude-win-skill-{i:012x}",
+        "head_sha": "d" * 40,
+        "pr_url": "https://github.com/test/repo/pull/9",
+        "dispatched_task": f"task-{i:02d}", "reviewer_node": "reviewer1",
+        "node": "testnode", "provider": "claude",
+        "name": f"win-skill-{i:012x}", "tree_sha256": "e" * 64,
+        "branch": "skill-intake/testnode/win-skill",
+    })
+with open(state / "ledger.jsonl", "w", encoding="utf-8") as handle:
+    for row in rows:
+        handle.write(json.dumps(row) + "\n")
+os.chmod(state / "ledger.jsonl", 0o600)
+
+# Non-terminal tasks keep every dispatch pending, like a real backlog.
+m._broker_task_on = lambda config, row, task, secret: {"status": "running"}
+
+config = m._config(env)
+assert config.collect_window == 32, config.collect_window
+processed = m._process_verdicts(config, dry_run=False)
+polled = [p["task_id"] for p in processed if p.get("outcome") == "verdict-pending"]
+assert polled == [f"task-{i:02d}" for i in range(32)], polled[:4]
+overflow = [p for p in processed if p.get("outcome") == "verdict-window-overflow"]
+assert len(overflow) == 1, processed
+assert overflow[0]["remaining"] == 8 and overflow[0]["oldest_ts"] == "2026-09-01T00:32:00Z", overflow[0]
+
+# Env override is honored and bounded.
+small = m._config({**env, "CCC_SKILL_PROMOTION_COLLECT_WINDOW": "5"})
+assert small.collect_window == 5, small.collect_window
+big = m._config({**env, "CCC_SKILL_PROMOTION_COLLECT_WINDOW": "999"})
+assert big.collect_window == 32, big.collect_window
+
+# Revise-result collection overflows symmetrically (a2a-revise-dispatch rows).
+with open(state / "ledger.jsonl", "a", encoding="utf-8") as handle:
+    for i in range(40):
+        handle.write(json.dumps({
+            "ts": f"2026-09-02T00:{i:02d}:00Z", "kind": "a2a-revise-dispatch",
+            "task_id": f"rtask-{i:02d}", "pr": "9", "head_sha": "f" * 40,
+            "node": "testnode", "name": f"win-skill-{i:012x}",
+            "provider": "claude", "tree_sha256": "e" * 64,
+        }) + "\n")
+results = m._consume_revise_results(config, dry_run=True)
+revise_overflow = [r for r in results if r.get("outcome") == "revise-window-overflow"]
+assert len(revise_overflow) == 1 and revise_overflow[0]["remaining"] == 8, revise_overflow
+would = [r for r in results if r.get("outcome") == "would-poll-revise"]
+assert len(would) == 32 and would[0]["task_id"] == "rtask-00", would[:2]
+print("WINDOW-FIFO-OK")
+FIXTURE
+env "${base_env[@]}" python3 "$WINDOW_FIXTURE" "$PROMOTER" > "$TMP/window-out" 2>&1; rc=$?
+ok "collect window is FIFO, drains 32/run, and surfaces overflow (#1394)" \
+  '[ "$rc" = 0 ] && grep -q "WINDOW-FIFO-OK" "$TMP/window-out"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

@@ -105,6 +105,7 @@ class Config:
     revise_enabled: bool
     revise_round_limit: int
     revise_daily_cap: int
+    collect_window: int
     review_llm_cmd: tuple[str, ...]
     autonomy: str
     # Optional secondary brokers (#2024). Each entry: {name, ssh_host,
@@ -408,6 +409,13 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         revise_enabled=revise_enabled,
         revise_round_limit=_bounded_int(env.get("CCC_SKILL_PROMOTION_REVISE_ROUNDS"), 2, 1, 2),
         revise_daily_cap=_bounded_int(env.get("CCC_SKILL_PROMOTION_REVISE_DAILY_CAP"), 3, 1, 8),
+        # #1394: verdict/revise-result collect window. The old fixed cap of 8
+        # polled newest-first (LIFO), so any backlog beyond 8 starved the oldest
+        # dispatches forever under a daily cron. FIFO over a larger, bounded
+        # window (default 32, env-tunable 1..128) drains backlogs instead.
+        collect_window=_bounded_int(
+            env.get("CCC_SKILL_PROMOTION_COLLECT_WINDOW"), 32, 1, 128
+        ),
         review_llm_cmd=review_llm_cmd,
         autonomy=_autonomy_state(env, state_dir, trust_root=home),
         remote_brokers=_parse_remote_brokers(env.get("CCC_SKILL_PROMOTION_REMOTE_BROKERS", "")),
@@ -2578,7 +2586,11 @@ def _revise_dispatch_target(
     """Parse a review-dispatch ledger row into (node, name, tree12, pr,
     provider, head, pr_url) — the revision target — or return a skip code.
     Pre-R2 rows carry only transport_id/head/pr_url, so the provider marker
-    is recovered from the transport id."""
+    is recovered from the transport id. #1394: the vocabulary covers every
+    observed intake lane (not just claude/codex), and canon harness lanes
+    (node ccc-node) return an explicit revise_canon_lane code — the repo is
+    not a broker worker, so the old generic revise_record_invalid
+    misdiagnosed every canon record."""
     transport_id = row.get("transport_id")
     head = row.get("head_sha")
     pr_url = row.get("pr_url")
@@ -2589,18 +2601,25 @@ def _revise_dispatch_target(
     ):
         return "revise_record_invalid"
     provider = row.get("provider")
-    if provider not in {"claude", "codex"}:
+    if not (isinstance(provider, str) and provider in _REVISE_PROVIDER_VOCABULARY):
         provider = next(
-            (name for name in ("claude", "codex") if f"-{name}-" in transport_id), None
+            (
+                name
+                for name in _REVISE_PROVIDER_VOCABULARY
+                if f"-{name}-" in transport_id
+            ),
+            None,
         )
     if provider is None:
         return "revise_record_invalid"
-    parsed = _split_transport_id(transport_id, str(provider))
+    parsed = _split_transport_id(transport_id, provider)
     pr = _pr_number_from_url(pr_url)
     if parsed is None or pr is None:
         return "revise_record_invalid"
     node, name, tree12 = parsed
-    return node, name, tree12, pr, str(provider), head, pr_url
+    if node == "ccc-node":
+        return "revise_canon_lane"
+    return node, name, tree12, pr, provider, head, pr_url
 
 
 def _revise_target_broker(config: Config, node: str, secret: str) -> dict[str, str] | None:
@@ -2810,6 +2829,14 @@ def _dispatch_intake_revise(
     }
 
 
+# #1394: every provider lane observed on fleet-skills intake — the publisher's
+# own claude/codex targets plus the ccc-node harness trees (shared/bridge/piri
+# canon re-review). Order matters: claude/codex first so a skill name that
+# merely contains a harness marker never wins the transport-id scan. Records
+# outside this vocabulary stay revise_record_invalid.
+_REVISE_PROVIDER_VOCABULARY = ("claude", "codex", "shared", "bridge", "piri")
+
+
 # #1370: human-readable explanations for a consumed revise verdict whose R2
 # dispatch did not reach a revision round. The raw skip code stays in the text
 # (backticked) so operators can grep the PR for the exact reason.
@@ -2819,6 +2846,7 @@ _REVISE_SKIP_NOTES = {
     "revise_already": "a revision for this PR head was already dispatched",
     "revise_nexus_missing": "revision dispatch unavailable: `a2a-dispatch-round.mjs` was not found in the nexus checkout",
     "revise_author_offline": "revision dispatch skipped: the author node is not currently an online broker worker — the findings below stay visible for human follow-up",
+    "revise_canon_lane": "revision dispatch skipped: canon harness lanes (skills maintained inside the ccc-node repo) are revised through ccc-node PRs, not broker revision rounds — the findings below stay visible for human follow-up",
     "revise_record_invalid": "revision dispatch skipped: the review-dispatch ledger record failed validation",
     "revise_round_failed": "revision dispatch failed (transport or handler error) — no automatic retry; human judgment continues on this PR",
 }
@@ -2858,7 +2886,10 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
         row for row in rows if row.get("kind") == "a2a-dispatch" and row.get("dispatched_task") not in consumed
     ]
     processed: list[dict[str, object]] = []
-    for row in reversed(pending[-8:]):
+    # #1394: FIFO over the oldest pending dispatches. The previous LIFO window
+    # (newest 8 only) permanently starved older verdicts once the backlog
+    # exceeded the window — a daily collect could never catch up.
+    for row in pending[: config.collect_window]:
         dispatched = row.get("dispatched_task")
         if not isinstance(dispatched, str):
             continue
@@ -2946,6 +2977,22 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
         except PromotionError:
             pass
         processed.append({"outcome": "verdict-consumed", "verdict": verdict, "findings": len(findings)})
+    if len(pending) > config.collect_window:
+        # #1394: surface window overflow so silent starvation cannot recur —
+        # the report names how many dispatches were left unpended and the
+        # oldest still-pending timestamp.
+        remaining_rows = pending[config.collect_window :]
+        oldest = next(
+            (row.get("ts") for row in remaining_rows if isinstance(row.get("ts"), str)), ""
+        )
+        processed.append(
+            {
+                "outcome": "verdict-window-overflow",
+                "polled": config.collect_window,
+                "remaining": len(pending) - config.collect_window,
+                "oldest_ts": oldest,
+            }
+        )
     return processed
 
 
@@ -2962,7 +3009,8 @@ def _consume_revise_results(config: Config, *, dry_run: bool) -> list[dict[str, 
         row for row in rows if row.get("kind") == "a2a-revise-dispatch" and row.get("task_id") not in consumed
     ]
     results: list[dict[str, object]] = []
-    for row in reversed(pending[-8:]):
+    # #1394: FIFO like _process_verdicts — oldest revision results first.
+    for row in pending[: config.collect_window]:
         task_id = row.get("task_id")
         pr = row.get("pr")
         head = row.get("head_sha")
@@ -3061,6 +3109,20 @@ def _consume_revise_results(config: Config, *, dry_run: bool) -> list[dict[str, 
             ),
         )
         results.append({"outcome": "revise-invalid", "task_id": task_id})
+    if len(pending) > config.collect_window:
+        # #1394: same overflow visibility as the verdict window.
+        remaining_rows = pending[config.collect_window :]
+        oldest = next(
+            (row.get("ts") for row in remaining_rows if isinstance(row.get("ts"), str)), ""
+        )
+        results.append(
+            {
+                "outcome": "revise-window-overflow",
+                "polled": config.collect_window,
+                "remaining": len(pending) - config.collect_window,
+                "oldest_ts": oldest,
+            }
+        )
     return results
 
 
