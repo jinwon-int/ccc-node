@@ -4,6 +4,23 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- **Wrong-branch recovery no longer requires the stray branch to be pushed
+  (#1397 C).** `ccc-self-update.sh` recovers a clean-tree stray branch whether
+  or not origin has it: switching back to the update branch never deletes the
+  branch ref, and the stray HEAD is additionally pinned under
+  `refs/ccc-stray/<branch>/<utc-ts>` first, so even a later `branch -D`
+  cannot orphan the work. The notice says which shape was handled
+  (`kind=pushed|unpushed`) and where unpushed commits live. A dirty tree still
+  fails closed. gongmyoung 2026-09-01 (4 stalled ticks on an unpushed branch)
+  would have self-healed.
+- **The managed-checkout guard now also refuses commits on a stray branch
+  (#1397 A).** setup.sh installs the same guard as `pre-commit` next to
+  `post-checkout`: committing in the managed checkout while off the update
+  branch exits 1 with the worktree escape hatch printed.
+  `CCC_MANAGED_CHECKOUT_GUARD=warn` keeps it advisory, `=0` silences both
+  hooks. Foreign hooks are still never clobbered.
+
 ### Fixed
 - **setup.sh keeps node-local `settings.json` env keys across a re-render
   (#1402).** settings.json is recomposed from repo templates on every setup /
