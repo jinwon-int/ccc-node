@@ -80,6 +80,9 @@ printf 'prompt one\n' > "$state/current-prompt.txt"
 
 export WIKI_CALL_LOG="$TMP/wiki-calls.log"
 export HONCHO_CALL_LOG="$TMP/honcho-calls.log"
+# Honcho defaults to OFF since the 2026-09-01 retirement; this suite exercises
+# the Honcho refresh path, so opt in explicitly.
+export CCC_HONCHO_MEMORY_ENABLED=1
 : > "$WIKI_CALL_LOG"
 : > "$HONCHO_CALL_LOG"
 

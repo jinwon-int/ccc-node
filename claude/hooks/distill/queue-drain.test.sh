@@ -44,6 +44,11 @@ cat > "$CFG" <<'JSON'
 JSON
 export CCC_HONCHO_CFG="$CFG"
 export CCC_STATE_DIR="$TMP/state"
+# Honcho defaults to OFF since the 2026-09-01 retirement; the drain must be a
+# silent no-op then, and the rest of this suite opts in explicitly.
+env -u CCC_HONCHO_MEMORY_ENABLED bash "$DRAIN"; rc=$?
+ok "unset toggle (fleet default) exits 0 without touching curl" '[ "$rc" = 0 ] && [ ! -s "$CURL_STUB_LOG" ]'
+export CCC_HONCHO_MEMORY_ENABLED=1
 unset CCC_NODE
 printf 'nosuk\n' > "$TMP/state/node.txt"
 
