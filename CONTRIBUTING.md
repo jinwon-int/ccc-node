@@ -12,11 +12,14 @@ it.**
 The updater is fail-closed: it refuses to run unless the checkout is on `main`
 with a clean tree. So the moment you branch or leave an edit there, that node
 stops updating — not until the next tick, but until a human puts it back
-(#1039). Two mechanical guards back this up (#1328): setup.sh installs a
-post-checkout hook into the managed checkout that warns AT THE MOMENT you
-switch off `main`, and the updater itself now auto-recovers a wrong-branch
-stall when it is provably lossless (clean tree and the stray branch fully
-pushed — every commit already on the remote). Unpushed commits, dirty trees,
+(#1039). Three mechanical guards back this up (#1328, #1397): setup.sh
+installs the managed-checkout guard as a post-checkout hook that warns AT THE
+MOMENT you switch off `main` and as a pre-commit hook that REFUSES commits
+while off `main` (`CCC_MANAGED_CHECKOUT_GUARD=warn` makes it advisory, `=0`
+silences both); and the updater auto-recovers a wrong-branch stall whenever
+the tree is clean — a fully pushed stray branch switches straight back, an
+unpushed one is pinned under `refs/ccc-stray/<branch>/<utc-ts>` first so no
+commit can be orphaned, and the notice tells you where it lives. A dirty tree
 or a `main` held by a linked worktree still require the human path below.
 
 Develop in a separate worktree instead:
