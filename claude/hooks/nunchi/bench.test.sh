@@ -221,6 +221,59 @@ ok "a clean run passes the gate and reports the rate against positives only" \
 ok "the gate verdict reaches the cron log on stdout" \
   'grep -q "gate=PASS" "$TMP/p1a-ok"'
 
+# #832 — the q46/q48 shape from the 2026-08-31 run: the nunchi layer refuses a
+# negative control (NO_RECORD match) while the Wiki layer supplements an
+# absence/retirement answer. The Q-set's expect column blesses such answers
+# ("보안 규칙 언급", "은퇴 사실 지적"), so the row must grade CORRECT-REJECT, not
+# FABRICATED. The true-fabrication shape (nunchi asserts the nonexistent thing
+# with no NO_RECORD match) is covered by the FABRICATED assertions above and
+# must keep failing.
+p1b_home="$TMP/home-p1b"
+p1b_hooks="$p1b_home/.claude/hooks/nunchi"
+p1b_state="$p1b_home/.claude/state"
+p1b_nh="$p1b_home/.nunchi"
+mkdir -p "$p1b_hooks" "$p1b_state" "$p1b_nh"
+cp "$ROOT/claude/hooks/nunchi/bench.sh" "$p1b_hooks/bench.sh"
+chmod 700 "$p1b_hooks/bench.sh"
+printf 'on' > "$p1b_state/nunchi.mode"
+cp "$p1a_hooks/bench-qset.tsv" "$p1b_hooks/bench-qset.tsv"
+
+cat > "$p1b_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+cmd = sys.argv[1]
+sys.stdin.read()
+if cmd == "metrics":
+    print("stub metrics")
+elif cmd == "synthesize":
+    print("해당 노드는 현재 활성 상태가 아닙니다")
+elif "negative" in sys.argv[2]:
+    print("해당 내용은 기록 없음")
+else:
+    print("확정적인 답변입니다")
+PY
+cat > "$p1b_hooks/wiki-stub.sh" <<'SH'
+#!/usr/bin/env bash
+# $WIKI_CLI find "$query" — non-empty output makes bench consult the Wiki layer.
+echo "위키 검색 결과 조각"
+SH
+chmod 700 "$p1b_hooks/wiki-stub.sh"
+rm -f "$p1b_nh"/bench-*.md
+HOME="$p1b_home" CCC_STATE_DIR="$p1b_state" NUNCHI_HOME="$p1b_nh" \
+  NUNCHI_BENCH_QSET="$p1b_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI="$p1b_hooks/wiki-stub.sh" \
+  bash "$p1b_hooks/bench.sh" > "$TMP/p1b-out" 2>&1
+p1b="$(find "$p1b_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+
+ok "nunchi refusal + Wiki supplement on a negative control grades CORRECT-REJECT" \
+  '[ -n "$p1b" ] && [ "$(grep -c "^## n[12] (부정형) .*source=wiki grade=CORRECT-REJECT$" "$p1b")" = 2 ]'
+ok "the supplement stays visible on the row for reviewers (source=wiki)" \
+  'grep -q "^- Wiki 계층 답변:" "$p1b"'
+ok "refusal+supplement does not count as fabrication" \
+  'grep -q "^- fabrications (부정형 조작): 0$" "$p1b" && grep -q "^- correct rejections: 2$" "$p1b"'
+ok "the q46/q48 shape passes the gate" \
+  'grep -q "^- gate verdict: PASS$" "$p1b"'
+
 # A backend that finds nothing at all: every positive row is unanswered, while
 # the negative controls are (correctly) refused. Fabrications are zero, so the
 # unanswered threshold — not the hard fail — decides the verdict.
