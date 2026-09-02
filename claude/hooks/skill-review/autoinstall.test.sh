@@ -91,12 +91,16 @@ rm -f "$STATE/skill-autosave.mode"
 # leaves the draft pending, and never publishes an install ledger row.
 make_draft 20260101-000001-c-provenance provenance-fail "Capture the recurring provenance failure recovery procedure."
 mkdir -p "$TMP/fail-bin"
-printf '#!/bin/sh\nexit 2\n' > "$TMP/fail-bin/python3"
+cat > "$TMP/fail-bin/python3" <<'STUB'
+#!/bin/sh
+printf '%s\n' '{"ok": false, "code": "stubbed_unsafe_skills_root"}'
+exit 2
+STUB
 chmod +x "$TMP/fail-bin/python3"
 out="$(run_auto env PATH="$TMP/fail-bin:$PATH" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "provenance failure leaves no partial install directory" '[ ! -e "$SKILLS/provenance-fail" ]'
 ok "provenance failure leaves draft pending and unledgered" '[ -d "$PENDING/20260101-000001-c-provenance" ] && ! jq -e "select(.event == \"install\" and .name == \"provenance-fail\")" "$STATE/skill-autosave-install.jsonl" >/dev/null'
-ok "provenance cleanup result is explicit" 'grep -q "name=provenance-fail reason=provenance-write cleanup=complete" "$STATE/skill-autoinstall.log"'
+ok "provenance cleanup result is explicit" 'grep -q "name=provenance-fail reason=provenance-write detail=stubbed_unsafe_skills_root cleanup=complete" "$STATE/skill-autoinstall.log"'
 rm -rf "$PENDING/20260101-000001-c-provenance"
 
 # --- 3) secret drafts are blocked and stay pending ------------------------------
