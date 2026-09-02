@@ -493,6 +493,35 @@ do_run() {
   fi
   today_used=$((legacy_used + incremental_used))
 
+  # Preflight (#1415): the ownership contract fail-closes on a skills root
+  # that is not owned by the runner or is group/other-writable (#770). Catch
+  # that up front with an actionable hint instead of churning every draft
+  # through mkdir/cp/mark-created -> provenance-write. A missing root is fine
+  # — the install path creates it 0700 via ccc_ensure_skills_dir.
+  if [ -d "$SKILLS_DIR" ] && [ ! -L "$SKILLS_DIR" ]; then
+    root_mode="$(stat -c %a "$SKILLS_DIR" 2>/dev/null)"
+    root_owner="$(stat -c %u "$SKILLS_DIR" 2>/dev/null)"
+    unsafe=""
+    case "$root_mode" in
+      ''|*[!0-7]*) unsafe="unreadable-mode" ;;
+      *)
+        if [ $((8#$root_mode & 8#022)) -ne 0 ]; then
+          unsafe="group/other-writable"
+        fi
+        ;;
+    esac
+    if [ -n "$unsafe" ]; then
+      log "skip reason=unsafe-skills-root dir=$SKILLS_DIR mode=${root_mode:-unknown} cause=$unsafe hint='chmod 700 $SKILLS_DIR' trigger=$TRIGGER"
+      printf '{"mode":"auto","skipped":"unsafe-skills-root"}\n'
+      return 0
+    fi
+    if [ "$root_owner" != "$(id -u)" ]; then
+      log "skip reason=unsafe-skills-root dir=$SKILLS_DIR owner=$root_owner cause=not-owned-by-runner trigger=$TRIGGER"
+      printf '{"mode":"auto","skipped":"unsafe-skills-root"}\n'
+      return 0
+    fi
+  fi
+
   # Appends to do_run's blocked/newly_blocked via bash dynamic scoping. The
   # -d re-check swallows the hook/sweep race: if the other layer installed and
   # archived this draft mid-loop, a gate "failure" against the vanished dir
