@@ -83,6 +83,13 @@ CRON_MARKER_INSTALLERS = (
      "run scripts/install-pr-status-poll-cron.sh --apply"),
     ("skill-autosave", "# ccc-node:skill-autosave", "scripts/install-skill-autosave-cron.sh",
      "run scripts/install-skill-autosave-cron.sh --apply"),
+    # cost-ledger has rendered stamped lines since #1205, but was never listed
+    # here, so every node's correctly-installed entry surfaced as an unknown
+    # unmanaged marker (12/12 nodes on the 2026-09-02 fleet sweep).
+    ("cost-ledger", "# ccc-node:cost-ledger", "scripts/install-cost-ledger-cron.sh",
+     "run scripts/install-cost-ledger-cron.sh --apply (add --weekly if the node had the weekly line)"),
+    ("fleet-skills-sync", "# ccc-node:fleet-skills-sync", "scripts/install-fleet-skills-sync-cron.sh",
+     "run scripts/install-fleet-skills-sync-cron.sh --apply"),
     ("nunchi", "# nunchi:#816", "scripts/install-nunchi.sh",
      "run scripts/install-nunchi.sh --apply with the node's original provider/audience flags"),
 )
@@ -95,6 +102,10 @@ CRON_AUX_MARKERS = (
     "# ccc-node:memory-refresh:end",
     "# ccc-node:pr-status-poll:begin",
     "# ccc-node:pr-status-poll:end",
+    "# ccc-node:cost-ledger:begin",
+    "# ccc-node:cost-ledger:end",
+    "# ccc-node:fleet-skills-sync:begin",
+    "# ccc-node:fleet-skills-sync:end",
 )
 # Hand-installed markers the repo documents but no installer renders: the
 # self-update and live-backups schedule lines are operator-placed by design

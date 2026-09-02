@@ -833,7 +833,7 @@ cdrepo="$TMP/cron-drift-repo"
 mkdir -p "$cdrepo/scripts/lib" "$cdrepo/.claude"
 cp "$ROOT/scripts/lib/installer-gen-stamp.sh" "$cdrepo/scripts/lib/"
 cp "$ROOT/scripts/lib/installer-cron-common.sh" "$cdrepo/scripts/lib/"
-for s in install-memory-refresh-cron install-pr-status-poll-cron install-skill-autosave-cron install-nunchi; do
+for s in install-memory-refresh-cron install-pr-status-poll-cron install-skill-autosave-cron install-cost-ledger-cron install-fleet-skills-sync-cron install-nunchi; do
   cp "$ROOT/scripts/$s.sh" "$cdrepo/scripts/"
 done
 # shellcheck source=/dev/null
@@ -841,6 +841,8 @@ done
 gen_mr="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-memory-refresh-cron.sh")"
 gen_pp="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-pr-status-poll-cron.sh")"
 gen_sa="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-skill-autosave-cron.sh")"
+gen_cl="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-cost-ledger-cron.sh")"
+gen_fs="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-fleet-skills-sync-cron.sh")"
 gen_nu="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-nunchi.sh")"
 cat > "$TMP/cron-drift.py" <<'PY_EOF'
 import json, os, sys
@@ -867,10 +869,10 @@ run_cd() {  # <cron-text> [repo-dir]
 }
 
 cd_out="$(run_cd "")"
-ok "empty crontab: four opt-in rows, all 정상" \
-  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 4 ]'
-ok "empty crontab: rows are the four known markers" \
-  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen nunchi\"]" <<<"$cd_out" >/dev/null'
+ok "empty crontab: six opt-in rows, all 정상" \
+  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 6 ]'
+ok "empty crontab: rows are the six known markers" \
+  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen nunchi\"]" <<<"$cd_out" >/dev/null'
 
 full_cron="# ccc-node:memory-refresh:begin
 */30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=$gen_mr
@@ -882,11 +884,18 @@ full_cron="# ccc-node:memory-refresh:begin
 CRON_TZ=Etc/UTC
 45 20 * * * bash -lc 'x' >> /l 2>&1  # ccc-node:skill-autosave gen=$gen_sa
 # ccc-node:autosave-schedule:end
+# ccc-node:cost-ledger:begin
+29 3 * * * bash -lc 'x' >> /l 2>&1  # ccc-node:cost-ledger gen=$gen_cl
+17 5 * * 1 bash -lc 'w' >> /l 2>&1  # ccc-node:cost-ledger gen=$gen_cl
+# ccc-node:cost-ledger:end
+# ccc-node:fleet-skills-sync:begin
+0 5 * * * bash -lc 'x' >> /l 2>&1  # ccc-node:fleet-skills-sync gen=$gen_fs
+# ccc-node:fleet-skills-sync:end
 */10 * * * * bash /h/ingest-cron.sh >> /l 2>&1 # nunchi:#816 gen=$gen_nu
 17 * * * * bash /h/mempalace-refresh.sh codex /s >> /l 2>&1 # nunchi:#816 gen=$gen_nu
 7 8 * * 1 bash /h/bench.sh >> /l 2>&1 # nunchi:#816 gen=$gen_nu"
 cd_out="$(run_cd "$full_cron")"
-ok "all-stamped current entries: four 정상 rows" \
+ok "all-stamped current entries: six 정상 rows" \
   'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null'
 ok "nunchi row reports all three lines current" \
   'jq -e ".rows[] | select(.item == \"cron gen nunchi\") | .status | contains(\"lines=3\")" <<<"$cd_out" >/dev/null'
@@ -894,6 +903,20 @@ ok "block-wrapped lanes count entries only, not BEGIN/END markers" \
   'jq -e ".rows[] | select(.item == \"cron gen memory-refresh\") | .status | contains(\"lines=1\")" <<<"$cd_out" >/dev/null'
 ok "BEGIN/END block markers are not misread as unmanaged" \
   '! jq -e ".rows[] | select(.item == \"cron unmanaged markers\")" <<<"$cd_out" >/dev/null'
+ok "cost-ledger daily+weekly lines are counted under their own lane (#1079)" \
+  'jq -e ".rows[] | select(.item == \"cron gen cost-ledger\" and .klass == \"정상\") | .status | contains(\"lines=2\")" <<<"$cd_out" >/dev/null'
+
+# The fleet's 2026-09-02 shape: stamped cost-ledger block + hand-written bare
+# fleet-skills-sync line. Neither may surface as an unknown unmanaged marker;
+# the bare line is an unstamped entry of a known lane instead.
+cd_out="$(run_cd "# ccc-node:cost-ledger:begin
+29 3 * * * bash -lc 'x' >> /l 2>&1  # ccc-node:cost-ledger gen=$gen_cl
+# ccc-node:cost-ledger:end
+0 5 * * * bash -lc 'S=x; python3 sync apply --ref \$S' >> /l 2>&1 # ccc-node:fleet-skills-sync")"
+ok "stamped cost-ledger block is 정상, not an unknown marker" \
+  '! jq -e ".rows[] | select(.item == \"cron unmanaged markers\")" <<<"$cd_out" >/dev/null && jq -e ".rows[] | select(.item == \"cron gen cost-ledger\" and .klass == \"정상\")" <<<"$cd_out" >/dev/null'
+ok "hand-installed fleet-skills-sync line is an unstamped 경고 pointing at its installer" \
+  'jq -e ".rows[] | select(.item == \"cron gen fleet-skills-sync\" and .klass == \"경고\") | (.status | contains(\"unstamped\")) and (.action | contains(\"install-fleet-skills-sync-cron.sh --apply\"))" <<<"$cd_out" >/dev/null'
 
 cd_out="$(run_cd "*/30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=h_000000000000")"
 ok "stale gen stamp is a non-fatal 경고 naming both stamps" \
