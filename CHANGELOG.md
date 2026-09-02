@@ -5,6 +5,20 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Fixed
+- **self-update: hand-pulled checkout no longer masks an undeployed install
+  (#1422).** The tick decided "up-to-date" from `HEAD == origin/main` alone,
+  so when another agent `git pull`ed the managed checkout without running
+  `setup.sh`, five nodes kept stale `~/.claude/hooks` (the #1419 nunchi feed
+  fix never reached them) while every tick reported up-to-date.
+  `ccc-self-update.sh` now records the SHA that `setup.sh` last deployed in
+  `~/.claude/state/self-update.installed-sha` (written right after setup
+  succeeds, before restarts); an up-to-date tick whose marker lags HEAD logs
+  `install-drift installed=<sha> checkout=<sha>` and takes the normal redeploy
+  path (setup + allowlisted restarts + notification, with the installed SHA as
+  the "from" side). A missing marker adopts HEAD silently on the first tick —
+  doctor's per-file `drifted` rows already cover that one-off — so the change
+  does not trigger a fleet-wide redeploy. Tests: marker adoption, hand-pulled
+  checkout redeploys and logs install-drift, next tick up-to-date again.
 - **tunnel-audit: funnel false positive and multi-line ExecStart (#1366).**
   `tailscale funnel status` echoes the whole serve config with "(tailnet
   only)" tags, so any serve-only node (seoseo, dungae on the 2026-09-02 first
