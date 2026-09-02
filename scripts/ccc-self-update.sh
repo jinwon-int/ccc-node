@@ -516,6 +516,25 @@ NEW_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
 CHANGED=false
 [ "$OLD_SHA" != "$NEW_SHA" ] && CHANGED=true
 
+# Installed-SHA marker (#1422): the checkout SHA alone cannot tell whether
+# setup.sh ever deployed it. When another agent `git pull`s the managed
+# checkout by hand, HEAD already equals origin, so the pre-#1422 tick said
+# "up-to-date" forever while ~/.claude/hooks stayed at the older commit.
+# The marker records the last SHA setup.sh installed; a lagging marker turns
+# an "up-to-date" tick into a normal redeploy (OLD_SHA = installed SHA so the
+# notification and rollback describe the real transition). A missing marker
+# (first tick after this change) adopts HEAD silently — doctor's per-file
+# drift rows still cover that one-off case — instead of a fleet-wide redeploy.
+INSTALLED_SHA_FILE="$STATE_DIR/self-update.installed-sha"
+INSTALLED_SHA="$(tr -d '[:space:]' < "$INSTALLED_SHA_FILE" 2>/dev/null || :)"
+if [ "$CHANGED" = "false" ] && [ -n "$INSTALLED_SHA" ] && [ "$INSTALLED_SHA" != "$NEW_SHA" ]; then
+  log "install-drift installed=$INSTALLED_SHA checkout=$NEW_SHA reason=checkout-advanced-without-setup"
+  OLD_SHA="$INSTALLED_SHA"
+  CHANGED=true
+elif [ "$CHANGED" = "false" ] && [ -z "$INSTALLED_SHA" ]; then
+  printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || log "warn installed-sha marker write failed path=$INSTALLED_SHA_FILE"
+fi
+
 if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
   # Second-slot runtime recovery (#971): code is current, but an earlier
   # chained restart may have failed and left the runtime down. When the
@@ -579,6 +598,9 @@ if ! (cd "$REPO" && bash setup.sh >>"$LOG" 2>&1); then
   say "self-update: setup failed and rollback was degraded; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
   exit 9
 fi
+# setup.sh deployed NEW_SHA: record it before restarts, so a later restart
+# failure retries restarts (existing path) rather than a full redeploy.
+printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || log "warn installed-sha marker write failed path=$INSTALLED_SHA_FILE"
 if bridge_service_allowlisted && ! bridge_runtime_config_preflight; then
   SETUP_OK=false
   REPO_ROLLBACK_OK=true

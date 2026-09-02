@@ -404,6 +404,10 @@ HFILE="$TMP/health.json"
 export CCC_SELF_UPDATE_HEALTH_FILE="$HFILE"
 # Bring the node fully up-to-date so a *proceed* is a clean exit-0 (no side effects).
 git -C "$REPO" fetch -q origin main; git -C "$REPO" reset --hard -q origin/main
+# ...including the installed-SHA marker (#1422): a bare reset is exactly the
+# hand-pulled shape that now triggers a redeploy, and this section tests the
+# idle gate, not the deploy path.
+git -C "$REPO" rev-parse HEAD > "$STATE/self-update.installed-sha"
 now_iso() { python3 -c "from datetime import datetime,timezone as z;print(datetime.now(z.utc).isoformat().replace('+00:00','Z'))"; }
 old_iso() { python3 -c "from datetime import datetime,timezone as z,timedelta as d;print((datetime.now(z.utc)-d(seconds=600)).isoformat().replace('+00:00','Z'))"; }
 mk_health() { printf '{"updated_at":"%s","workload":{"active_requests":%s,"oldest_request_age_seconds":%s}}' "$1" "$2" "$3" > "$HFILE"; }
@@ -673,6 +677,28 @@ out="$(CCC_TEST_REAPPLY_FAIL=1 run_selfup run 2>&1)"; rc=$?
 ok "failed re-apply exits 12" '[ "$rc" = 12 ]'
 ok "failed re-apply restores the pre-reapply crontab" 'grep -qF "echo keepme" "$FAKE_CRON" && ! grep -qF "ccc-node:fake" "$FAKE_CRON"'
 ok "failed re-apply notifies" 'grep -rh "cron 재적용 실패" "$TMP/spool" >/dev/null 2>&1'
+
+# --- 9) installed-SHA marker (#1422) ------------------------------------------
+# 9a) marker absent on an up-to-date tick: adopt HEAD silently, no setup.
+rm -f "$STATE/install-fake-cron.json" "$STATE/self-update.installed-sha" "$SETUP_MARKER" "$TMP/systemctl.calls"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "marker-absent tick stays up-to-date" '[ "$rc" = 0 ] && grep -q "already up to date" <<<"$out" && [ ! -f "$SETUP_MARKER" ]'
+ok "marker-absent tick adopts HEAD as installed" '[ "$(cat "$STATE/self-update.installed-sha")" = "$(git -C "$REPO" rev-parse HEAD)" ]'
+# 9b) another agent git-pulls the checkout by hand: HEAD == origin, but the
+#     installed marker lags → the tick must run setup instead of "up-to-date".
+echo drift > "$TMP/seed/drift.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm hand-pull && git -C "$TMP/seed" push -q origin main
+git -C "$REPO" pull -q --ff-only origin main
+LAGGING="$(cat "$STATE/self-update.installed-sha")"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "hand-pulled checkout exits 0" '[ "$rc" = 0 ]'
+ok "hand-pulled checkout re-runs setup" '[ -f "$SETUP_MARKER" ] && grep -q "$(git -C "$REPO" rev-parse --short HEAD)" "$SETUP_MARKER"'
+ok "hand-pulled checkout logs install-drift" 'grep -q "install-drift installed=$LAGGING checkout=$(git -C "$REPO" rev-parse HEAD)" "$STATE/self-update.log"'
+ok "hand-pulled checkout restarts allowlisted services" 'grep -q "restart hermes-broker" "$TMP/systemctl.calls"'
+ok "marker advances to HEAD after setup" '[ "$(cat "$STATE/self-update.installed-sha")" = "$(git -C "$REPO" rev-parse HEAD)" ]'
+rm -f "$SETUP_MARKER"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "following tick is up-to-date again" '[ "$rc" = 0 ] && grep -q "already up to date" <<<"$out" && [ ! -f "$SETUP_MARKER" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
