@@ -5,6 +5,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Fixed
+- **setup.sh registers the self-update agent-cron task only where the
+  scheduler timer exists (#1403).** The #909 registration ran on every node,
+  leaving a permanently `unknown` task on the eight nodes without
+  `ccc-agent-cron.timer` and re-creating it after each operator cleanup (the
+  2026-09-02 sweep removed it on 8 nodes; the next self-update put it back on
+  all of them). The task is now registered only when the timer is enabled in
+  the system scope or the runtime user's `--user` manager; otherwise setup
+  says so and the crontab lane keeps covering self-update.
+  `CCC_SELF_UPDATE_REGISTER_CRON=force` bypasses the gate.
+
+### Fixed
 - **ccc-doctor no longer reports the Piri CLI missing on Termux.** The
   distill-extractor probe resolved `CCC_PIRI_CLI_PATH` from the environment or
   the bridge's systemd unit only; Termux has no unit, so the 2026-09-02 sweep

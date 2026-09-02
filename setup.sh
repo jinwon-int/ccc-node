@@ -557,7 +557,26 @@ run chmod +x "${installed_hook_scripts[@]}" "${hook_tree_targets[@]}"
 # CCC_SELF_UPDATE_REGISTER_CRON=false. successExitCodes 0,8,11 treats a clean
 # update, a bridge-busy defer (8), and a no-services-allowlist degraded run
 # (11) as non-failures so on-failure alerts fire only for real aborts.
-if [ "${CCC_SELF_UPDATE_REGISTER_CRON:-true}" != "false" ] && [ "$DRY" != 1 ] && [ -x "$SRC/scripts/agent-cron.sh" ]; then
+# #1403: the task only means something where the agent-cron scheduler timer
+# exists. Registering it everywhere left a permanently `unknown` task on the
+# eight timer-less nodes (and re-registered it after every operator cleanup),
+# so gate on the timer: system scope or the runtime user's --user manager.
+# CCC_SELF_UPDATE_REGISTER_CRON=force skips the gate (e.g. the timer is about
+# to be installed by hand).
+agent_cron_timer_present() {
+  local ctl="${CCC_SYSTEMCTL:-systemctl}"
+  command -v "$ctl" >/dev/null 2>&1 || return 1
+  "$ctl" is-enabled ccc-agent-cron.timer >/dev/null 2>&1 && return 0
+  "$ctl" --user is-enabled ccc-agent-cron.timer >/dev/null 2>&1 && return 0
+  return 1
+}
+register_cron="${CCC_SELF_UPDATE_REGISTER_CRON:-true}"
+if [ "$register_cron" != "false" ] && [ "$register_cron" != "force" ] && [ "$DRY" != 1 ] \
+   && [ -x "$SRC/scripts/agent-cron.sh" ] && ! agent_cron_timer_present; then
+  note "agent-cron timer absent (system and --user) — self-update task not registered; the crontab lane covers self-update (#1403)"
+  register_cron="false"
+fi
+if [ "$register_cron" != "false" ] && [ "$DRY" != 1 ] && [ -x "$SRC/scripts/agent-cron.sh" ]; then
   agent_cron_store="$CLAUDE_DIR/state/agent-cron/tasks.json"
   if CCC_AGENT_CRON_STORE="$agent_cron_store" \
        bash "$SRC/scripts/agent-cron.sh" list --json 2>/dev/null \
