@@ -26,7 +26,9 @@ cat > "$SYSD/gwakga-broker-public-tunnel.service" <<'EOF'
 [Unit]
 Description=reverse tunnel to seoseo
 [Service]
-ExecStart=/usr/bin/ssh -N -R 127.0.0.1:8799:127.0.0.1:8787 seoseo
+ExecStart=/usr/bin/ssh -N -T \
+  -o ExitOnForwardFailure=yes \
+  -R 127.0.0.1:8799:127.0.0.1:8787 seoseo
 EOF
 cat > "$SYSD/seoseo-broker-tunnel.service" <<'EOF'
 [Unit]
@@ -68,7 +70,7 @@ EOF
 write_exec_stub "$TMP/bin/tailscale" <<EOF
 case "\$1" in
   serve) printf 'https://node.tailnet.ts.net (tailnet only)\n|-- / proxy http://127.0.0.1:8888\n' ;;
-  funnel) printf 'No serve config\n' ;;
+  funnel) printf 'https://node.tailnet.ts.net (tailnet only)\n|-- / proxy http://127.0.0.1:8888\n' ;;
 esac
 EOF
 export PATH="$TMP/bin:$PATH"
@@ -90,7 +92,24 @@ ok "crontab tunnel line found, unrelated line skipped, cron token masked" '[ "$(
 ok "cron.d autossh -L line found, comment skipped" 'jq -e ".cron[] | select(.source == \"cron.d/hub\") | .line | test(\"autossh\")" <<<"$out" >/dev/null && [ "$(jq ".cron | length" <<<"$out")" = 2 ]'
 ok "loopback listener excluded; public/tailnet (v4 + fd7a ULA v6) classified" '[ "$(jq ".listeners | length" <<<"$out")" = 4 ] && jq -e "[.listeners[] | select(.bind == \"public\")] | length == 2" <<<"$out" >/dev/null && jq -e "[.listeners[] | select(.bind == \"tailnet\")] | length == 2" <<<"$out" >/dev/null'
 ok "listener process names captured" 'jq -e ".listeners[] | select(.local == \"[::]:443\") | .process == \"caddy\"" <<<"$out" >/dev/null'
-ok "tailscale serve configured, funnel not" 'jq -e ".tailscale.serve.configured == true and .tailscale.funnel.configured == false" <<<"$out" >/dev/null'
+ok "tailscale serve configured; funnel status echoing a tailnet-only serve is NOT funnel" 'jq -e ".tailscale.serve.configured == true and .tailscale.funnel.configured == false" <<<"$out" >/dev/null'
+ok "multi-line ExecStart (backslash continuation) is joined and classified as reverse" 'jq -e ".units[] | select(.unit == \"gwakga-broker-public-tunnel.service\") | .kind == \"ssh-reverse\" and (.exec_start | test(\"-R 127.0.0.1:8799\"))" <<<"$out" >/dev/null'
+# Real funnel: an entry tagged "(Funnel on)" flips the flag.
+write_exec_stub "$TMP/bin/tailscale" <<EOF
+case "\$1" in
+  serve) printf 'https://node.tailnet.ts.net (tailnet only)\n' ;;
+  funnel) printf 'https://node.tailnet.ts.net (Funnel on)\n|-- / proxy http://127.0.0.1:8888\n' ;;
+esac
+EOF
+fun_out="$(bash "$AUDIT" 2>/dev/null)"
+ok "an entry tagged (Funnel on) is reported as funnel" 'jq -e ".tailscale.funnel.configured == true and .exposure.funnel_configured == true" <<<"$fun_out" >/dev/null'
+write_exec_stub "$TMP/bin/tailscale" <<EOF
+case "\$1" in
+  serve) printf 'https://node.tailnet.ts.net (tailnet only)\n|-- / proxy http://127.0.0.1:8888\n' ;;
+  funnel) printf 'https://node.tailnet.ts.net (tailnet only)\n|-- / proxy http://127.0.0.1:8888\n' ;;
+esac
+EOF
+out="$(bash "$AUDIT" 2>/dev/null)"
 ok "exposure summary counts" 'jq -e ".exposure == {cloudflared_units:1, reverse_ssh_units:1, public_tunnel_units:1, public_listeners:2, funnel_configured:false, residue_files:1}" <<<"$out" >/dev/null'
 ok "stderr is empty" '[ ! -s "$TMP/err" ]'
 

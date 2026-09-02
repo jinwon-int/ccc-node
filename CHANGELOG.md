@@ -15,6 +15,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
   tick 5 min old, top-level 10 h → false `ingest-tick-stale`).
 
 ### Fixed
+- **tunnel-audit: funnel false positive and multi-line ExecStart (#1366).**
+  `tailscale funnel status` echoes the whole serve config with "(tailnet
+  only)" tags, so any serve-only node (seoseo, dungae on the 2026-09-02 first
+  fleet run) was reported as funnel-exposed; funnel is now only the entries
+  tagged "(Funnel on)". Reverse tunnels written with backslash-continued
+  `ExecStart=` lines were read from the first line only and classified
+  `other`; continuation lines are joined, so `-R` units classify as
+  ssh-reverse.
 - **nunchi piri/codex feeds now write the ingest liveness tick.** Only
   `ingest-cron.sh` (claude lane) wrote `ingest.status.json`; ccc-doctor judges
   the ingest lane by that file's age, so a node re-aligned from the claude feed
