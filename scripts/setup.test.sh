@@ -250,6 +250,22 @@ selfupdate_ino_before="$(stat -c '%i' "$rewrite_claude/hooks/ccc-self-update.sh"
 hooktree_ino_before="$(stat -c '%i' "$rewrite_claude/hooks/checkpoint.sh")"
 HOME="$TMP/rewrite-home" CCC_CLAUDE_DIR="$rewrite_claude" CCC_HERMES_DIR="$rewrite_hermes" \
   bash "$SETUP" --no-backup >/dev/null 2>&1
+# --- #1403: the self-update agent-cron task is registered only where the
+# ccc-agent-cron timer exists. The fixture systemctl stub above exits 0 for
+# every verb, i.e. "timer enabled", which is why the registration test passes.
+gate_home="$TMP/gate-home"; gate_claude="$gate_home/.claude"; gate_hermes="$gate_home/.hermes"
+mkdir -p "$gate_claude" "$gate_hermes"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/systemctl-no-timer"
+chmod +x "$TMP/systemctl-no-timer"
+out="$(HOME="$gate_home" CCC_CLAUDE_DIR="$gate_claude" CCC_HERMES_DIR="$gate_hermes" \
+  CCC_SYSTEMCTL="$TMP/systemctl-no-timer" bash "$SETUP" --no-backup 2>&1)"
+ok "no agent-cron timer: self-update task is NOT registered (#1403)" \
+  '{ [ ! -f "$gate_claude/state/agent-cron/tasks.json" ] || [ "$(jq "[.tasks[]? | select(.id == \"self-update\")] | length" "$gate_claude/state/agent-cron/tasks.json")" = 0 ]; }'
+ok "no agent-cron timer: setup says why" 'grep -q "agent-cron timer absent" <<<"$out"'
+out="$(HOME="$gate_home" CCC_CLAUDE_DIR="$gate_claude" CCC_HERMES_DIR="$gate_hermes" \
+  CCC_SYSTEMCTL="$TMP/systemctl-no-timer" CCC_SELF_UPDATE_REGISTER_CRON=force bash "$SETUP" --no-backup 2>&1)"
+ok "CCC_SELF_UPDATE_REGISTER_CRON=force bypasses the timer gate" \
+  '[ "$(jq "[.tasks[]? | select(.id == \"self-update\")] | length" "$gate_claude/state/agent-cron/tasks.json")" = 1 ]'
 ok "setup self-update task registration is idempotent" \
   '[ "$(jq '\''[.tasks[] | select(.id == "self-update")] | length'\'' "$rewrite_agent_cron")" = 1 ]'
 ok "reinstall replaces the self-update hook inode (rename, never in-place truncate)" \
