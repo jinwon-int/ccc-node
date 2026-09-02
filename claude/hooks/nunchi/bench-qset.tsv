@@ -36,7 +36,7 @@ q34	절차런북	운영 일지가 계속 쌓이면 어떻게 정리하기로 했
 q35	절차런북	wiki-lint.py가 자동으로 점검하는 항목들은	broken-link·dup-doc·orphan·oversize·stale-log·secret-like	wiki	runbooks/wiki-maintenance-scripts [RB-403] 표
 q36	절차런북	credential은 위키에 어떻게 기록해야 하나	값 기록 금지 — 보관 위치·재발급 절차·의존 서비스만 기록	wiki	Wiki 루트 CLAUDE.md [FW-03]
 q37	절차런북	브로커 세션에서 대형 A2A/GitHub closeout 작업은 어디서 수행해야 하나	Telegram foreground 금지 — isolated subagent/TaskFlow/A2A worker/스크립트로 분리, DM은 시작 보고·승인·요약만	wiki	runbooks/a2a-broker-operating-rules [RB-33]
-q38	시간축	곽가의 현재 owner-facing 모델과 effort는	claude-fable-5 / xhigh (2026-08-17~18 정렬; mutable — settings.json/세션 live-check 허용)	either	rules/fleet-model 2026-08-18 블록 / nodes/gwakga/README AI model 행
+q38	시간축	곽가의 현재 owner-facing 모델과 effort는	claude-opus-5 / medium (model 2026-09-02 settings.json live-check; effort 위키 2026-08-22 정렬; mutable — live-check 허용)	either	nodes/gwakga/README AI model 행 / rules/fleet-model 최신 블록
 q39	시간축	ccc bridge Claude provider의 현행 모델 정본은 어느 파일 어느 키인가	~/.claude/settings.json의 model 키 — ~/.claude.json은 브리지가 안 읽음, 키 없으면 /new 때 세션 pin이 None으로 덮임	wiki	rules/fleet-model 2026-08-17 블록 (LOG-20260817-gongyung-3)
 q40	시간축	현재 Piri 레인에서 zai/glm-5.3을 쓰는 노드는	soonwook·jingun·daegyo (2026-08-19 기준, effort high; mutable — live-check 허용)	either	rules/fleet-model ND-2363·ND-2365 블록
 q41	시간축	xai 자격증명은 지금 어느 노드 한 곳에 모여 있지	sogyo 단일 보유 (2026-08-19 통합, 5노드 백업 auth.json.bak-pre-xai-consolidate-*)	nunchi	facts.db id 759(→703 supersede 체인)·701·691 — 패러프레이즈+시간축 프로브
