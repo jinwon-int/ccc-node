@@ -137,6 +137,7 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
     }
   }
   n=0
+  sources=$(find "$PIR_SESSIONS_DIR" -type f -name "*.jsonl" 2>/dev/null | wc -l | tr -d " ")
   visited=0
   # oldest-first so backfill is chronological; NUL delimiters preserve safe
   # configured paths containing whitespace. Symlinks are excluded here and
@@ -237,4 +238,18 @@ PYEOF
   done < <(find "$PIR_SESSIONS_DIR" -type f -name "*.jsonl" \
     -printf '%T@ %p\0' 2>/dev/null | sort -z -n)
   python3 "$FM" snapshot --limit 25 >/dev/null 2>&1 || true
+  # Liveness tick shared with ingest-cron.sh (schema ccc.nunchi.ingest.v1):
+  # ccc-doctor judges the ingest lane by this file's age, so a lane that runs
+  # but never writes it looks stale forever once a node switches provider
+  # (2026-09-02: five nodes flagged ingest-tick-stale after moving to the
+  # piri/codex feeds — the claude-era file just aged out). sources = session
+  # files considered this run, ingested = sessions processed.
+  _status="${CCC_NUNCHI_INGEST_STATUS:-$NUNCHI_HOME/ingest.status.json}"
+  _tmp="$_status.$$"
+  if printf '{"schema":"ccc.nunchi.ingest.v1","finished_at":%d,"sources":%d,"ingested":%d,"retired":0,"deferred":0,"feed":"%s"}\n' \
+      "$(date -u +%s)" "${sources:-0}" "${n:-0}" "piri" > "$_tmp" 2>/dev/null; then
+    mv -f "$_tmp" "$_status" 2>/dev/null || rm -f "$_tmp"
+  else
+    rm -f "$_tmp" 2>/dev/null
+  fi
 ) 9>"$LOCK"
