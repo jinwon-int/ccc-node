@@ -926,6 +926,8 @@ os.environ["PROJECT_ROOT"] = str(root / "project")
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
 os.environ["ALLOWED_USER_IDS"] = "1"
 os.environ["CCC_AGENT_PROVIDER"] = "codex"
+# The fleet default is now finite (2,000,000); fail-closed needs an explicit 0.
+os.environ["CCC_USAGE_BUDGET_TOKENS_CODEX"] = "0"
 
 from telegram_bot.__main__ import build_context, load_runtime_settings
 
