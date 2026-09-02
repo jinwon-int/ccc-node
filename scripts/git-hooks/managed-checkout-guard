@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# managed-checkout-guard — post-checkout guard for a node's MANAGED ccc-node
-# checkout. setup.sh installs this into <managed repo>/.git/hooks/post-checkout
+# managed-checkout-guard — post-checkout (warn) + pre-commit (block) guard for
+# a node's MANAGED ccc-node checkout. setup.sh installs this into
+# <managed repo>/.git/hooks/post-checkout and .git/hooks/pre-commit
 # (marker-guarded, idempotent); that is the only place it should ever live.
 # marker: ccc-node:managed-checkout-guard v1
 #
@@ -23,12 +24,23 @@
 #     itself (verified on git 2.43).
 #   - repos other than the node's managed checkout (when
 #     ~/.claude/self-update.repo names one)
-# Kill switch: CCC_MANAGED_CHECKOUT_GUARD=0 disables the warning entirely.
+# Kill switch: CCC_MANAGED_CHECKOUT_GUARD=0 disables both hooks; =warn keeps pre-commit advisory.
 set -uo pipefail
 
-[ "${CCC_MANAGED_CHECKOUT_GUARD:-1}" = "1" ] || exit 0
-# post-checkout args: <prev-head> <new-head> <flag>; flag=1 only for branch checkouts.
-[ "${3:-0}" = "1" ] || exit 0
+guard_mode="${CCC_MANAGED_CHECKOUT_GUARD:-1}"
+[ "$guard_mode" = "0" ] && exit 0
+# The same file serves two hooks (#1397 A). setup.sh installs it as
+# post-checkout (warn when HEAD leaves the update branch) AND as pre-commit
+# (refuse to grow unpushed history on a stray branch in the managed checkout —
+# that is the shape self-update's recovery had to fail closed on). The hook
+# name is taken from how git invoked it; CCC_MANAGED_CHECKOUT_GUARD_HOOK
+# overrides it for tests. CCC_MANAGED_CHECKOUT_GUARD=warn keeps pre-commit
+# advisory (exit 0 with the notice); =0 silences both.
+hook_kind="${CCC_MANAGED_CHECKOUT_GUARD_HOOK:-$(basename "$0")}"
+if [ "$hook_kind" != "pre-commit" ]; then
+  # post-checkout args: <prev-head> <new-head> <flag>; flag=1 only for branch checkouts.
+  [ "${3:-0}" = "1" ] || exit 0
+fi
 
 gitdir="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
 commondir="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
@@ -53,6 +65,20 @@ current="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
 
 detached=""
 [ -n "$current" ] || detached="(detached HEAD)"
+
+if [ "$hook_kind" = "pre-commit" ]; then
+  cat >&2 <<EOF
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⛔ MANAGED CHECKOUT: commit on '${current:-$detached}' refused (expected '$expected')
+   이 저장소는 self-update가 갱신하는 관리 체크아웃입니다. 여기서 만든 커밋은
+   원격에 없는 상태로 남아 하네스 갱신을 막습니다(#1328/#1397). 작업은 worktree로:
+     git worktree add ~/dev/<slug> -b <type>/<slug> origin/$expected
+   정말 여기서 커밋해야 하면: CCC_MANAGED_CHECKOUT_GUARD=warn git commit …
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EOF
+  [ "$guard_mode" = "warn" ] && exit 0
+  exit 1
+fi
 
 cat >&2 <<EOF
 

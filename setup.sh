@@ -1090,22 +1090,28 @@ fi
 SRC_ABS="$(cd "$SRC" && pwd)"
 src_gitdir="$(cd "$SRC" && git rev-parse --git-dir 2>/dev/null || true)"
 src_commondir="$(cd "$SRC" && git rev-parse --git-common-dir 2>/dev/null || true)"
-GUARD_HOOK="$MANAGED_REPO/.git/hooks/post-checkout"
 if [ "$MANAGED_REPO" != "$SRC_ABS" ] || [ ! -d "$SRC/.git" ]; then
   note "managed-checkout guard: this checkout is not the self-update managed repo ($MANAGED_REPO) — skipped"
 elif [ -z "$src_gitdir" ] || [ "$src_gitdir" != "$src_commondir" ]; then
   note "managed-checkout guard: running from a linked worktree/bare checkout — skipped (install from the managed checkout)"
-elif [ -f "$GUARD_HOOK" ] && ! grep -q 'ccc-node:managed-checkout-guard' "$GUARD_HOOK"; then
-  note "managed-checkout guard: existing $GUARD_HOOK is not ours — left untouched"
 elif [ ! -f "$GUARD_SRC" ]; then
   echo "ERROR: managed-checkout guard source missing: $GUARD_SRC" >&2
   exit 2
-elif [ "$DRY" = 1 ]; then
-  note "would install managed-checkout guard -> $GUARD_HOOK"
 else
-  run atomic_install "$GUARD_SRC" "$GUARD_HOOK"
-  run chmod 755 "$GUARD_HOOK"
-  note "managed-checkout guard installed -> $GUARD_HOOK (warns when the checkout leaves the update branch; CCC_MANAGED_CHECKOUT_GUARD=0 disables)"
+  # #1397 A: the same guard is installed twice — post-checkout warns, pre-commit
+  # refuses commits on a stray branch (CCC_MANAGED_CHECKOUT_GUARD=warn relaxes).
+  for guard_name in post-checkout pre-commit; do
+    GUARD_HOOK="$MANAGED_REPO/.git/hooks/$guard_name"
+    if [ -f "$GUARD_HOOK" ] && ! grep -q 'ccc-node:managed-checkout-guard' "$GUARD_HOOK"; then
+      note "managed-checkout guard: existing $GUARD_HOOK is not ours — left untouched"
+    elif [ "$DRY" = 1 ]; then
+      note "would install managed-checkout guard -> $GUARD_HOOK"
+    else
+      run atomic_install "$GUARD_SRC" "$GUARD_HOOK"
+      run chmod 755 "$GUARD_HOOK"
+      note "managed-checkout guard installed -> $GUARD_HOOK ($guard_name; CCC_MANAGED_CHECKOUT_GUARD=0 disables, =warn keeps pre-commit advisory)"
+    fi
+  done
 fi
 
 # #968: Termux/Android hash-locked installs may need to build packages from
