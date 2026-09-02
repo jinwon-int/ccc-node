@@ -833,7 +833,7 @@ cdrepo="$TMP/cron-drift-repo"
 mkdir -p "$cdrepo/scripts/lib" "$cdrepo/.claude"
 cp "$ROOT/scripts/lib/installer-gen-stamp.sh" "$cdrepo/scripts/lib/"
 cp "$ROOT/scripts/lib/installer-cron-common.sh" "$cdrepo/scripts/lib/"
-for s in install-memory-refresh-cron install-pr-status-poll-cron install-skill-autosave-cron install-cost-ledger-cron install-fleet-skills-sync-cron install-nunchi; do
+for s in install-memory-refresh-cron install-pr-status-poll-cron install-skill-autosave-cron install-cost-ledger-cron install-fleet-skills-sync-cron install-tunnel-audit-cron install-nunchi; do
   cp "$ROOT/scripts/$s.sh" "$cdrepo/scripts/"
 done
 # shellcheck source=/dev/null
@@ -843,6 +843,7 @@ gen_pp="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-pr-status-poll-c
 gen_sa="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-skill-autosave-cron.sh")"
 gen_cl="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-cost-ledger-cron.sh")"
 gen_fs="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-fleet-skills-sync-cron.sh")"
+gen_ta="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-tunnel-audit-cron.sh")"
 gen_nu="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-nunchi.sh")"
 cat > "$TMP/cron-drift.py" <<'PY_EOF'
 import json, os, sys
@@ -869,10 +870,10 @@ run_cd() {  # <cron-text> [repo-dir]
 }
 
 cd_out="$(run_cd "")"
-ok "empty crontab: six opt-in rows, all 정상" \
-  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 6 ]'
+ok "empty crontab: seven opt-in rows, all 정상" \
+  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 7 ]'
 ok "empty crontab: rows are the six known markers" \
-  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen nunchi\"]" <<<"$cd_out" >/dev/null'
+  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen tunnel-audit\", \"cron gen nunchi\"]" <<<"$cd_out" >/dev/null'
 
 full_cron="# ccc-node:memory-refresh:begin
 */30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=$gen_mr
@@ -891,11 +892,14 @@ CRON_TZ=Etc/UTC
 # ccc-node:fleet-skills-sync:begin
 0 5 * * * bash -lc 'x' >> /l 2>&1  # ccc-node:fleet-skills-sync gen=$gen_fs
 # ccc-node:fleet-skills-sync:end
+# ccc-node:tunnel-audit:begin
+20 6 * * 1 bash -lc 'x' >> /l 2>&1  # ccc-node:tunnel-audit gen=$gen_ta
+# ccc-node:tunnel-audit:end
 */10 * * * * bash /h/ingest-cron.sh >> /l 2>&1 # nunchi:#816 gen=$gen_nu
 17 * * * * bash /h/mempalace-refresh.sh codex /s >> /l 2>&1 # nunchi:#816 gen=$gen_nu
 7 8 * * 1 bash /h/bench.sh >> /l 2>&1 # nunchi:#816 gen=$gen_nu"
 cd_out="$(run_cd "$full_cron")"
-ok "all-stamped current entries: six 정상 rows" \
+ok "all-stamped current entries: seven 정상 rows" \
   'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null'
 ok "nunchi row reports all three lines current" \
   'jq -e ".rows[] | select(.item == \"cron gen nunchi\") | .status | contains(\"lines=3\")" <<<"$cd_out" >/dev/null'
