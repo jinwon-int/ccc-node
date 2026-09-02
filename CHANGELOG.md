@@ -4,6 +4,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- **Autonomous usage budget defaults to 2,000,000 tokens per provider per
+  day.** `CCC_USAGE_BUDGET_TOKENS_{CLAUDE,CODEX,PIRI}` defaulted to `0`
+  (budget off), which provider-neutral distill treats as fail-closed — the
+  2026-09-02 fleet sweep showed `distill extractor … autonomous spend
+  fail-closed` on 10/12 nodes, and a per-node env override does not survive a
+  harness re-render (#1402). The bridge setting and ccc-doctor now share one
+  default (`USAGE_BUDGET_TOKENS_DEFAULT`, pinned equal by a test); `0` still
+  disables the budget explicitly. Interactive turns are unaffected.
+
 ### Fixed
 - **ccc-doctor documents the five residual hand-installed cron lanes.** After
   #1398 the 2026-09-02 sweep still flagged `skill-promotion-collect`,

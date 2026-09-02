@@ -39,7 +39,8 @@ For an enabled dead-session wakeup loop, `bridge/start.sh --path <project>
 cover active, locked, quarantined, cooldown, attempts-cap, and autonomous-budget
 gates; a budget-only scan is therefore visible even when no wakeup is triggered.
 Legacy health snapshots without these additive counters remain readable. The
-`CCC_USAGE_BUDGET_TOKENS_*` settings cap only the provider's daily autonomous
+`CCC_USAGE_BUDGET_TOKENS_*` settings (fleet default 2,000,000 per provider per
+KST day since 2026-09-02; `0` disables) cap only the provider's daily autonomous
 input+output tokens: interactive turns remain metered in `usage-meter.json`, but
 never consume that allowance or get rejected by it.
 

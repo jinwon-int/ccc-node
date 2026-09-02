@@ -76,6 +76,13 @@ VALID_SCOPES = {"settings", "files", "hooks", "output-styles", "all"}
 # --audience-scoped are unknowable at check time, so a re-rendered comparison
 # would false-positive on exactly the #996 emergency configuration).
 # Fields: short name, marker substring, installer path, re-apply hint.
+# Fleet default daily autonomous token allowance per provider. Mirrors
+# bridge/utils/config.py USAGE_BUDGET_TOKENS_DEFAULT (pinned equal by
+# bridge/tests/test_usage_budget_default.py): when neither the environment nor
+# the bridge unit sets CCC_USAGE_BUDGET_TOKENS_<PROVIDER>, the bridge runs with
+# this allowance, so doctor must judge the same number instead of "0".
+USAGE_BUDGET_TOKENS_DEFAULT = 2_000_000
+
 CRON_MARKER_INSTALLERS = (
     ("memory-refresh", "# ccc-node:memory-refresh", "scripts/install-memory-refresh-cron.sh",
      "run scripts/install-memory-refresh-cron.sh --apply"),
@@ -857,7 +864,7 @@ class Doctor:
             budget_raw = (
                 os.environ.get(budget_name)
                 or self.bridge_unit_environment_value(budget_name)
-                or "0"
+                or str(USAGE_BUDGET_TOKENS_DEFAULT)
             )
             budget = int(budget_raw or 0)
         except ValueError:
