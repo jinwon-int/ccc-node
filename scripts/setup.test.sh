@@ -880,6 +880,8 @@ out="$(run_setup_in "$guard_repo" "$guard_home")"
 ok "setup installs the managed-checkout guard into the managed repo" \
   '[ -x "$GUARD_HOOK" ] && grep -q "ccc-node:managed-checkout-guard" "$GUARD_HOOK"'
 ok "guard install is logged, not silent" 'grep -q "managed-checkout guard installed" <<<"$out"'
+ok "setup also installs the guard as pre-commit (#1397 A)" \
+  '[ -x "$guard_repo/.git/hooks/pre-commit" ] && grep -q "ccc-node:managed-checkout-guard" "$guard_repo/.git/hooks/pre-commit"'
 
 out="$(run_setup_in "$guard_repo" "$guard_home")"
 ok "re-run keeps the guard installed (idempotent update in place)" \
