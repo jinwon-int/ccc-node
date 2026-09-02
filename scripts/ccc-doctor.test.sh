@@ -886,10 +886,10 @@ run_cd() {  # <cron-text> [repo-dir]
 }
 
 cd_out="$(run_cd "")"
-ok "empty crontab: seven opt-in rows, all 정상" \
-  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 7 ]'
-ok "empty crontab: rows are the six known markers" \
-  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen tunnel-audit\", \"cron gen nunchi\"]" <<<"$cd_out" >/dev/null'
+ok "empty crontab: eight opt-in rows, all 정상" \
+  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 8 ]'
+ok "empty crontab: rows are the eight known markers" \
+  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen tunnel-audit\", \"cron gen t2-starvation-observe\", \"cron gen nunchi\"]" <<<"$cd_out" >/dev/null'
 
 full_cron="# ccc-node:memory-refresh:begin
 */30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=$gen_mr
