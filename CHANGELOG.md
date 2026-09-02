@@ -5,6 +5,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Fixed
+- **nunchi bench test no longer races the second boundary (#1399).**
+  `bench.test.sh` seeded backend-health rows with `ts=now` and only then
+  launched `bench.sh`, which took its own `date -u` as the window start — on a
+  slow CI runner the seeded rows fell one second before the window and the
+  healthy/degraded cross-check counted 0 of 6 attempts (ccc-node#1398 attempt
+  2). `bench.sh` now honours `NUNCHI_BENCH_START_UTC`; the test pins it before
+  seeding and adds a pair of assertions that prove the pin is respected
+  (RED when the override is removed).
 - **ccc-doctor stops flagging every node's cost-ledger cron as unmanaged
   (#1079).** `install-cost-ledger-cron.sh` has rendered stamped
   `# ccc-node:cost-ledger` lines since #1205, but the lane was never listed in

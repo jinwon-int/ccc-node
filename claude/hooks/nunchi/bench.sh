@@ -153,7 +153,11 @@ mkdir -p "$NUNCHI_HOME"
 LEDGER="$(mktemp "${TMPDIR:-/tmp}/nunchi-bench-XXXXXX")" || exit 2
 trap 'rm -f "$LEDGER"' EXIT
 # #1210 — UTC window start for the backend-health cross-check after the loop.
-bench_start_utc="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+# NUNCHI_BENCH_START_UTC pins it (#1399): a harness that seeds backend-health
+# rows *before* launching this script otherwise races the second boundary —
+# rows stamped one tick before this `date` fall outside the window and the
+# healthy/degraded cross-check silently counts 0 attempts.
+bench_start_utc="${NUNCHI_BENCH_START_UTC:-$(date -u +%Y-%m-%dT%H:%M:%S+00:00)}"
 
 # TM-2370 P1-A — the Q-set gained `source` and `evidence` columns in #1207.
 # `read` folds every unread column into the last variable, so a 4-variable read
