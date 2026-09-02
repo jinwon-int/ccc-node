@@ -99,6 +99,12 @@ CRON_MARKER_INSTALLERS = (
      "run scripts/install-fleet-skills-sync-cron.sh --apply"),
     ("tunnel-audit", "# ccc-node:tunnel-audit", "scripts/install-tunnel-audit-cron.sh",
      "run scripts/install-tunnel-audit-cron.sh --apply (hub node only)"),
+    # t2-starvation-observe (#1421) is a seoseo-hub-only observation cron; like
+    # cost-ledger before #1398 it landed without a registry entry and surfaced
+    # as an unknown unmanaged marker on the 2026-09-02 evening sweep.
+    ("t2-starvation-observe", "# ccc-node:t2-starvation-observe",
+     "scripts/install-t2-starvation-observe-cron.sh",
+     "run scripts/install-t2-starvation-observe-cron.sh --apply (seoseo hub only)"),
     ("nunchi", "# nunchi:#816", "scripts/install-nunchi.sh",
      "run scripts/install-nunchi.sh --apply with the node's original provider/audience flags"),
 )
@@ -117,6 +123,8 @@ CRON_AUX_MARKERS = (
     "# ccc-node:fleet-skills-sync:end",
     "# ccc-node:tunnel-audit:begin",
     "# ccc-node:tunnel-audit:end",
+    "# ccc-node:t2-starvation-observe:begin",
+    "# ccc-node:t2-starvation-observe:end",
 )
 # Hand-installed markers the repo documents but no installer renders: the
 # self-update and live-backups schedule lines are operator-placed by design

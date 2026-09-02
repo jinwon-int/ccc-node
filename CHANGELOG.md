@@ -29,6 +29,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   tick 5 min old, top-level 10 h → false `ingest-tick-stale`).
 
 ### Fixed
+- **doctor: t2-starvation-observe cron registered; registry guard test.**
+  `install-t2-starvation-observe-cron.sh` (#1421) landed without a
+  `CRON_MARKER_INSTALLERS` / `CRON_AUX_MARKERS` entry, so the seoseo hub's
+  correctly-installed block surfaced as `경고 cron unmanaged markers` on the
+  2026-09-02 evening sweep — the same omission cost-ledger had before #1398.
+  The lane is now registered (`cron gen t2-starvation-observe`, opt-in), and
+  a new `scripts/ccc_doctor_marker_registry_test.py` (wired into
+  validate-harness) fails at PR time when any `scripts/install-*-cron.sh`
+  renders a `MARKER=` / `BLOCK_BEGIN=` / `BLOCK_END=` the doctor does not know.
 - **tunnel-audit: funnel false positive and multi-line ExecStart (#1366).**
   `tailscale funnel status` echoes the whole serve config with "(tailnet
   only)" tags, so any serve-only node (seoseo, dungae on the 2026-09-02 first

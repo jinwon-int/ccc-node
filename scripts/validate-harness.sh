@@ -342,6 +342,12 @@ else
   err "doctor self-update stall verdict tests failed"
   tail -10 "$TMP/doctor-selfupdate-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_marker_registry_test.py >"$TMP/doctor-marker-registry-test.out" 2>&1; then
+  say "  ok doctor cron marker registry covers every install-*-cron.sh"
+else
+  err "doctor cron marker registry guard failed (add the installer to CRON_MARKER_INSTALLERS / CRON_AUX_MARKERS)"
+  tail -10 "$TMP/doctor-marker-registry-test.out" 2>/dev/null
+fi
 if python3 scripts/a2a_piri_memory_snapshot_test.py >"$TMP/a2a-piri-memory-test.out" 2>&1; then
   say "  ok A2A Piri shared memory snapshot producer tests"
 else
