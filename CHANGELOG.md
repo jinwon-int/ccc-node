@@ -19,6 +19,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
   doctor's per-file `drifted` rows already cover that one-off — so the change
   does not trigger a fleet-wide redeploy. Tests: marker adoption, hand-pulled
   checkout redeploys and logs install-drift, next tick up-to-date again.
+- **nunchi ingest tick is robust on Termux and scoped lanes (#1419 follow-up).**
+  `piri-feed.sh` resolves the Piri launcher like ccc-doctor does (env →
+  `hooks/ccc-piri` → PATH) instead of failing on Termux nodes with no unit,
+  and writes a `skipped: cli-not-runnable` liveness tick when nothing is
+  runnable so the lane never silently ages out. ccc-doctor now ages the newest
+  scoped `<audience-root>/*/nunchi/ingest.status.json` for audience-scoped
+  lanes instead of a claude-era top-level leftover (nosuk 2026-09-02: scoped
+  tick 5 min old, top-level 10 h → false `ingest-tick-stale`).
+
+### Fixed
 - **tunnel-audit: funnel false positive and multi-line ExecStart (#1366).**
   `tailscale funnel status` echoes the whole serve config with "(tailnet
   only)" tags, so any serve-only node (seoseo, dungae on the 2026-09-02 first
