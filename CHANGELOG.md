@@ -12,6 +12,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
   on the next tick. Env keys the template does not declare are now captured
   before the merge and re-applied after it; template-declared keys stay
   repo-owned (a node override of one is still dropped, by design).
+- **skill autoinstall no longer misreads long drafts as headingless
+  (#1399).** `gate_lint` checked for a heading with `awk … | grep -q`; under
+  `set -o pipefail` grep exits on the first heading, awk dies of EPIPE writing
+  the rest, and the pipeline's failure became `lint no-headings` — measured
+  6/20 at ~100 KB and 20/20 at ~1 MB of body on mawk 1.3.4, which is why the
+  500/501-line size-gate fixtures flaked on CI and never locally. The check is
+  now awk-only. A deterministic 1 MB regression pins it (size gate verdict,
+  not a false lint), and the size-gate assertions dump tail-safe diagnostics
+  when they fail.
+
+### Fixed
 - **setup.sh registers the self-update agent-cron task only where the
   scheduler timer exists (#1403).** The #909 registration ran on every node,
   leaving a permanently `unknown` task on the eight nodes without
