@@ -61,6 +61,13 @@ CODEX_ARGV_FILE="$argv_file" CODEX_PID_FILE="$pid_file" \
 feed_rc=$?
 
 ok "feed run completes despite a hanging codex" '[ "$feed_rc" = 0 ]'
+# Liveness tick (2026-09-02): the codex/piri feeds must leave the same
+# ingest.status.json ingest-cron.sh does, or ccc-doctor's ingest-tick age
+# check reads a provider-switched node's stale claude-era file as STALE.
+ok "feed writes the ingest liveness tick" '[ -f "$NUNCHI_HOME/ingest.status.json" ]'
+ok "tick carries the shared schema and the codex feed tag" 'jq -e ".schema == \"ccc.nunchi.ingest.v1\" and .feed == \"codex\" and (.sources|type) == \"number\"" "$NUNCHI_HOME/ingest.status.json" >/dev/null'
+ok "tick finished_at is now-ish" '[ $(( $(date -u +%s) - $(jq -r .finished_at "$NUNCHI_HOME/ingest.status.json") )) -lt 600 ]'
+ok "piri feed carries the same tick writer" 'grep -q "ccc.nunchi.ingest.v1" "$ROOT/claude/hooks/nunchi/piri-feed.sh" && grep -q "\"feed\":\"%s\"" "$ROOT/claude/hooks/nunchi/piri-feed.sh"'
 ok "stale lane process is swept at feed start" '! kill -0 "$stale_pid" 2>/dev/null'
 lane_pid="$(tail -n 1 "$pid_file" 2>/dev/null || true)"
 ok "this run's codex exec is killed by the bounded timeout" '[ -n "$lane_pid" ] && ! kill -0 "$lane_pid" 2>/dev/null'

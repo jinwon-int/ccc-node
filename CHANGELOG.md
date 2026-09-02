@@ -13,6 +13,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
   `ExecStart=` lines were read from the first line only and classified
   `other`; continuation lines are joined, so `-R` units classify as
   ssh-reverse.
+- **nunchi piri/codex feeds now write the ingest liveness tick.** Only
+  `ingest-cron.sh` (claude lane) wrote `ingest.status.json`; ccc-doctor judges
+  the ingest lane by that file's age, so a node re-aligned from the claude feed
+  to piri/codex kept the claude-era file and was flagged
+  `ingest-tick-stale` after 360 min although the feed ran every 10 min
+  (2026-09-02: 5/12 nodes right after the provider re-alignment). Both feeds
+  now leave the same `ccc.nunchi.ingest.v1` record (plus `feed`) at the end of
+  every run.
 
 ### Added
 - **Periodic fleet tunnel audit (ccc-node#1366, final slice).**
