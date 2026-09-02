@@ -67,6 +67,27 @@ ok "feed run completes despite a hanging codex" '[ "$feed_rc" = 0 ]'
 ok "feed writes the ingest liveness tick" '[ -f "$NUNCHI_HOME/ingest.status.json" ]'
 ok "tick carries the shared schema and the codex feed tag" 'jq -e ".schema == \"ccc.nunchi.ingest.v1\" and .feed == \"codex\" and (.sources|type) == \"number\"" "$NUNCHI_HOME/ingest.status.json" >/dev/null'
 ok "tick finished_at is now-ish" '[ $(( $(date -u +%s) - $(jq -r .finished_at "$NUNCHI_HOME/ingest.status.json") )) -lt 600 ]'
+PIRI_FEED="$ROOT/claude/hooks/nunchi/piri-feed.sh"
+# --- piri-feed liveness + launcher resolution (2026-09-02, gongyung) --------
+# (1) No runnable CLI anywhere: the lane must still leave a tick, tagged as
+#     skipped, instead of exiting before the status write (doctor then aged the
+#     previous tick into ingest-tick-stale and hid the real cause).
+PN1="$TMP/pn1"; PS1="$TMP/psess1"; CL1="$TMP/claude-nolauncher"; mkdir -p "$PN1" "$PS1" "$CL1/hooks" "$TMP/bin-nopiri"
+CCC_STATE_DIR="$STATE" NUNCHI_HOME="$PN1" PIR_SESSIONS_DIR="$PS1" CCC_CLAUDE_DIR="$CL1" \
+  PATH="$TMP/bin-nopiri:/usr/bin:/bin" bash "$PIRI_FEED" >"$TMP/pf1.out" 2>"$TMP/pf1.err"; pf_rc=$?
+ok "piri feed without any CLI exits 0" '[ "$pf_rc" = 0 ]'
+ok "piri feed without any CLI names all three lookups in its notice" 'grep -q "no hooks/ccc-piri" "$TMP/pf1.err"'
+ok "piri feed without any CLI still writes a skipped liveness tick" 'jq -e ".schema == \"ccc.nunchi.ingest.v1\" and .feed == \"piri\" and .skipped == \"cli-not-runnable\"" "$PN1/ingest.status.json" >/dev/null'
+# (2) Launcher fallback: CCC_PIRI_CLI_PATH unset, piri not on PATH, but the
+#     harness launcher hooks/ccc-piri exists → resolved, no skip notice.
+PN2="$TMP/pn2"; PS2="$TMP/psess2"; CL2="$TMP/claude-launcher"; mkdir -p "$PN2" "$PS2" "$CL2/hooks"
+write_exec_stub "$CL2/hooks/ccc-piri" <<'SH'
+printf '{"honcho":[]}\n'
+SH
+CCC_STATE_DIR="$STATE" NUNCHI_HOME="$PN2" PIR_SESSIONS_DIR="$PS2" CCC_CLAUDE_DIR="$CL2" \
+  PATH="$TMP/bin-nopiri:/usr/bin:/bin" bash "$PIRI_FEED" >"$TMP/pf2.out" 2>"$TMP/pf2.err"; pf_rc=$?
+ok "piri feed resolves the harness launcher when env and PATH are empty" '[ "$pf_rc" = 0 ] && ! grep -q "not runnable" "$TMP/pf2.err"'
+ok "resolved-launcher run writes a normal (unskipped) tick" 'jq -e ".schema == \"ccc.nunchi.ingest.v1\" and .feed == \"piri\" and (has(\"skipped\") | not)" "$PN2/ingest.status.json" >/dev/null'
 ok "piri feed carries the same tick writer" 'grep -q "ccc.nunchi.ingest.v1" "$ROOT/claude/hooks/nunchi/piri-feed.sh" && grep -q "\"feed\":\"%s\"" "$ROOT/claude/hooks/nunchi/piri-feed.sh"'
 ok "stale lane process is swept at feed start" '! kill -0 "$stale_pid" 2>/dev/null'
 lane_pid="$(tail -n 1 "$pid_file" 2>/dev/null || true)"
@@ -80,7 +101,6 @@ kill "$spawner" 2>/dev/null || true
 # #1264: both feed lanes must prompt for decision facts with a because reason,
 # and the two prompt blocks must not drift apart (the legacy 4-kind prompt is
 # how decision rationale never reached piri/codex nodes — bench q7).
-PIRI_FEED="$ROOT/claude/hooks/nunchi/piri-feed.sh"
 ok "codex lane prompt requires decision+because" 'grep -q "decision" "$FEED" && grep -q "because" "$FEED"'
 ok "piri lane prompt requires decision+because" 'grep -q "decision" "$PIRI_FEED" && grep -q "because" "$PIRI_FEED"'
 ok "both feed lanes forbid inventing a missing decision reason" \

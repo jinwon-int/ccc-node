@@ -824,6 +824,22 @@ nc="$(run_nc piri "$scoped_cron" "" "$nbin/mempalace")"
 ok "audience-scoped lane with a genuinely stale scoped tick is a 경고 (sweep-tick-stale)" \
   'jq -e ".klass == \"경고\" and (.status | contains(\"scopes=1\") and contains(\"sweep-tick-stale\"))" <<<"$nc" >/dev/null'
 
+# #1419: scoped lanes write ingest.status.json under the scope too. A fresh
+# scoped ingest tick must win over a stale claude-era top-level file (nosuk
+# 2026-09-02: scoped 5 min, top-level 10 h → falsely ingest-tick-stale).
+printf '%s' "$ok_json" > "$nc_aud/private-x/nunchi/mempalace-refresh.status.json"
+now_s="$(date -u +%s)"
+printf '{"schema":"ccc.nunchi.ingest.v1","finished_at":%d,"sources":1,"ingested":1,"retired":0,"deferred":0,"feed":"piri"}' "$now_s" > "$nc_aud/private-x/nunchi/ingest.status.json"
+stale_ingest="$(printf '{"schema":"ccc.nunchi.ingest.v1","finished_at":%d,"sources":0,"ingested":0,"retired":0,"deferred":0}' "$((now_s - 36000))")"
+nc="$(run_nc piri "$scoped_cron" "$ok_json" "$nbin/mempalace" "" "$stale_ingest")"
+ok "scoped fresh ingest tick beats a stale top-level ingest file (정상)" \
+  'jq -e ".klass == \"정상\" and (.status | contains(\"scopes=1\") and (contains(\"ingest-tick-stale\") | not))" <<<"$nc" >/dev/null'
+printf '{"schema":"ccc.nunchi.ingest.v1","finished_at":%d,"sources":1,"ingested":0,"retired":0,"deferred":0,"feed":"piri"}' "$((now_s - 36000))" > "$nc_aud/private-x/nunchi/ingest.status.json"
+nc="$(run_nc piri "$scoped_cron" "$ok_json" "$nbin/mempalace" "" "")"
+ok "genuinely stale scoped ingest tick is a 경고 (ingest-tick-stale)" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"scopes=1\") and contains(\"ingest-tick-stale\"))" <<<"$nc" >/dev/null'
+rm -f "$nc_aud/private-x/nunchi/ingest.status.json"
+
 # #1081: doctor surfaces installer-managed cron entries frozen at older code.
 # One row per known marker (absent = opt-in 정상; gen match = 정상; unstamped
 # or mismatched gen = non-fatal 경고) plus unmanaged-marker classification.
