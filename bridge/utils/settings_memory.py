@@ -32,9 +32,13 @@ class MemorySettingsMixin:
         description="Family Wiki memory source/sink toggle; external profile always overrides off.",
     )
     honcho_memory_enabled: bool = Field(
-        default=True,
+        # Honcho was retired fleet-wide on 2026-09-01 (TM-2029 phase 3; server
+        # stopped, 12 nodes flagged off). The per-node settings.json flag did not
+        # survive the next harness re-render (#1402), so the retirement lives
+        # here as the default. Set CCC_HONCHO_MEMORY_ENABLED=1 to opt back in.
+        default=False,
         alias="CCC_HONCHO_MEMORY_ENABLED",
-        description="Honcho read/write memory toggle.",
+        description="Honcho read/write memory toggle (default off since the 2026-09-01 retirement).",
     )
     honcho_config_path: Path = Field(
         default_factory=lambda: Path.home() / ".hermes" / "honcho.json",

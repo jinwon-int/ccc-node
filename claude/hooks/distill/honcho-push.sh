@@ -19,7 +19,7 @@ HONCHO_INVALIDATE_FILE="$STATE_DIR/honcho-refresh.invalidate"
 HONCHO_INVALIDATE_LOCK="$STATE_DIR/.honcho-refresh-invalidate.lock"
 mkdir -p "$STATE_DIR" 2>/dev/null
 
-case "${CCC_HONCHO_MEMORY_ENABLED:-1}" in
+case "${CCC_HONCHO_MEMORY_ENABLED:-0}" in
   0|false|FALSE|off|OFF|no|NO)
     echo "honcho push skipped: disabled"
     exit 0

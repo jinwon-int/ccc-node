@@ -340,7 +340,7 @@ if [ -f "$MEMORY_PROBE" ]; then
 fi
 writeback_json="$(writeback_queue_json "$DISTILL_JOURNAL_DIR")"
 
-honcho_enabled="${CCC_HONCHO_MEMORY_ENABLED:-1}"
+honcho_enabled="${CCC_HONCHO_MEMORY_ENABLED:-0}"
 wiki_enabled="${CCC_WIKI_MEMORY_ENABLED:-1}"
 if [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ]; then
   wiki_enabled=0
