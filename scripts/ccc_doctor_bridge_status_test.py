@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ccc_doctor import Doctor  # noqa: E402
+from ccc_doctor import USAGE_BUDGET_TOKENS_DEFAULT, Doctor  # noqa: E402
 
 
 class BridgeStatusVerdictTest(unittest.TestCase):
@@ -198,14 +198,14 @@ class BridgeStatusVerdictTest(unittest.TestCase):
         self.assertNotIn("fail-closed", doctor.rows[-1].status)
 
     def test_budget_fallback_keeps_fail_closed_without_any_unit(self) -> None:
-        """No unit, no budget: the fail-closed warning stays hermetic (#1318)."""
+        """No unit, explicit zero budget: the fail-closed warning stays hermetic (#1318)."""
 
         doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
         doctor.provider = "codex"
         doctor._bridge_provider_state = ("codex", "healthy")
         with patch.dict(
             "os.environ",
-            {"CCC_MEMORY_DISTILL_PROVIDER": "auto"},
+            {"CCC_MEMORY_DISTILL_PROVIDER": "auto", "CCC_USAGE_BUDGET_TOKENS_CODEX": "0"},
             clear=True,
         ), patch.object(doctor, "bridge_systemd_units", return_value=[]):
             doctor.check_distill_readiness()
@@ -213,13 +213,40 @@ class BridgeStatusVerdictTest(unittest.TestCase):
         self.assertEqual(doctor.distill_readiness, "blocked")
         self.assertIn("fail-closed", doctor.rows[-1].status)
 
+    def test_unset_budget_uses_the_fleet_default_and_is_ready(self) -> None:
+        """No env, no unit: doctor judges the same 2M default the bridge runs with."""
+
+        with TemporaryDirectory() as temp:
+            # Hermetic against the host: CI runners have no provider CLI, so the
+            # executable probe is stubbed exactly like the drop-in test above.
+            executable = Path(temp) / "codex"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
+            doctor.provider = "codex"
+            doctor._bridge_provider_state = ("codex", "healthy")
+            with patch.dict(
+                "os.environ",
+                {"CCC_MEMORY_DISTILL_PROVIDER": "auto"},
+                clear=True,
+            ), patch.object(doctor, "bridge_systemd_units", return_value=[]), patch(
+                "ccc_doctor.shutil.which", return_value=str(executable)
+            ):
+                doctor.check_distill_readiness()
+
+        self.assertEqual(doctor.distill_readiness, "ready")
+        self.assertNotIn("fail-closed", doctor.rows[-1].status)
+        self.assertGreater(USAGE_BUDGET_TOKENS_DEFAULT, 0)
+
     def test_distill_without_finite_budget_is_safely_blocked(self) -> None:
         doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
         doctor.provider = "codex"
         doctor._bridge_provider_state = ("codex", "healthy")
         with patch.dict(
             "os.environ",
-            {"CCC_MEMORY_DISTILL_PROVIDER": "auto"},
+            # The fleet default is finite now; "without finite budget" must be
+            # spelled out as an explicit 0.
+            {"CCC_MEMORY_DISTILL_PROVIDER": "auto", "CCC_USAGE_BUDGET_TOKENS_CODEX": "0"},
             clear=True,
         ), patch.object(
             # Hermetic against the host: a node whose own unit drop-in sets

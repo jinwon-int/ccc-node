@@ -64,6 +64,11 @@ CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
 # MemorySettingsMixin completes the #584 P2-3 domain split. Keep Config's
 # existing docstring stable because pydantic exports it as JSON Schema metadata.
+# Daily autonomous token allowance per provider (input+output). Mirrored by
+# scripts/ccc_doctor.py USAGE_BUDGET_TOKENS_DEFAULT; a test pins the two equal.
+USAGE_BUDGET_TOKENS_DEFAULT = 2_000_000
+
+
 class Config(
     MemorySettingsMixin,
     VoiceSettingsMixin,
@@ -231,7 +236,12 @@ class Config(
         ),
     )
     usage_budget_tokens_claude: int = Field(
-        default=0,
+        # Fleet default since 2026-09-02: a finite daily autonomous allowance so
+        # provider-neutral distill and wakeups are not fail-closed on every node
+        # (doctor "distill extractor ... autonomous spend fail-closed" 10/12 on
+        # the 2026-09-02 sweep). Keep in sync with USAGE_BUDGET_TOKENS_DEFAULT
+        # in scripts/ccc_doctor.py. 0 disables the budget again.
+        default=USAGE_BUDGET_TOKENS_DEFAULT,
         ge=0,
         alias="CCC_USAGE_BUDGET_TOKENS_CLAUDE",
         description=(
@@ -243,7 +253,8 @@ class Config(
         ),
     )
     usage_budget_tokens_codex: int = Field(
-        default=0,
+        # Same fleet default as Claude (see usage_budget_tokens_claude).
+        default=USAGE_BUDGET_TOKENS_DEFAULT,
         ge=0,
         alias="CCC_USAGE_BUDGET_TOKENS_CODEX",
         description=(
@@ -255,7 +266,10 @@ class Config(
         ),
     )
     usage_budget_tokens_piri: int = Field(
-        default=0,
+        # Same fleet default as Claude/Codex; Piri meters request counts, so the
+        # allowance is effectively a request-side guard until token usage is
+        # normalized.
+        default=USAGE_BUDGET_TOKENS_DEFAULT,
         ge=0,
         alias="CCC_USAGE_BUDGET_TOKENS_PIRI",
         description=(

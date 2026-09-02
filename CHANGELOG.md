@@ -15,6 +15,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
   per-node collector the fleet registry ([DOC-3283]) comparison runs on; it
   installs no cron and mutates nothing.
 ### Changed
+- **Autonomous usage budget defaults to 2,000,000 tokens per provider per
+  day.** `CCC_USAGE_BUDGET_TOKENS_{CLAUDE,CODEX,PIRI}` defaulted to `0`
+  (budget off), which provider-neutral distill treats as fail-closed — the
+  2026-09-02 fleet sweep showed `distill extractor … autonomous spend
+  fail-closed` on 10/12 nodes, and a per-node env override does not survive a
+  harness re-render (#1402). The bridge setting and ccc-doctor now share one
+  default (`USAGE_BUDGET_TOKENS_DEFAULT`, pinned equal by a test); `0` still
+  disables the budget explicitly. Interactive turns are unaffected.
 - **Honcho is off by default (fleet retirement 2026-09-01, TM-2029 phase 3).**
   `CCC_HONCHO_MEMORY_ENABLED` now defaults to `0` in the bridge settings and in
   every hook that consulted it (`load-memory`, `refresh-memory`, `distill`,
