@@ -455,6 +455,20 @@ if [ ! -d "$REPO/.git" ]; then
   say "self-update: no git repo at $REPO (set CCC_SELF_UPDATE_REPO or $REPO_FILE)" >&2
   exit 4
 fi
+# Checkout owner guard (#1426): on a dual-domain host (gongmyoung — root ssh,
+# runtime user owns /opt/ccc-node) a root-context tick fast-forwards the repo as
+# root, leaves .git objects root-owned, and deploys hooks into the WRONG home
+# while the runtime user's harness silently stays stale. Nothing about that
+# self-heals, so it is a terminal abort like no-repo/wrong-branch. Opt out only
+# for a deliberately shared checkout: CCC_SELF_UPDATE_ALLOW_OWNER_MISMATCH=1.
+REPO_OWNER_UID="$(stat -c %u "$REPO/.git" 2>/dev/null || echo '')"
+EUID_NOW="$(id -u 2>/dev/null || echo '')"
+if [ -n "$REPO_OWNER_UID" ] && [ -n "$EUID_NOW" ] && [ "$REPO_OWNER_UID" != "$EUID_NOW" ] \
+   && [ "${CCC_SELF_UPDATE_ALLOW_OWNER_MISMATCH:-0}" != "1" ]; then
+  notify_stalled owner-mismatch "self-update 정지: $REPO 체크아웃 소유자(uid $REPO_OWNER_UID)와 실행 계정(uid $EUID_NOW)이 다릅니다. 소유자 계정으로 실행하거나(예: sudo -u <owner>) 공유 체크아웃이 의도라면 CCC_SELF_UPDATE_ALLOW_OWNER_MISMATCH=1 을 설정하세요." "owner=$REPO_OWNER_UID euid=$EUID_NOW"
+  say "self-update: checkout $REPO is owned by uid $REPO_OWNER_UID but running as uid $EUID_NOW; aborting (fail-closed, #1426)" >&2
+  exit 4
+fi
 CUR_BRANCH="$(git -C "$REPO" symbolic-ref --short HEAD 2>/dev/null || echo '?')"
 if [ "$CUR_BRANCH" != "$BRANCH" ]; then
   # #1328 proposal 2: a stray branch that is fully pushed with a clean tree is

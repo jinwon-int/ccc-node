@@ -22,7 +22,14 @@ rather than composing the steps ad hoc.
    pushed (origin has it at the exact local SHA) and the tree is clean —
    switching back then cannot lose anything (#1328; opt out with
    `CCC_SELF_UPDATE_AUTO_RECOVER=0`). Every other wrong-branch shape stays
-   fail-closed and notifies
+   fail-closed and notifies. The checkout's `.git` must be owned by the uid
+   running the tick (`abort reason=owner-mismatch`, #1426): on a dual-domain
+   host such as gongmyoung (root ssh, runtime user owns `/opt/ccc-node`) a
+   root-context run would fast-forward the repo as root and deploy hooks into
+   the wrong home. Run the tick as the owner (`sudo -u <owner>` with the user
+   bus env) or set `CCC_SELF_UPDATE_ALLOW_OWNER_MISMATCH=1` for a deliberately
+   shared checkout; `setup.sh` applies the same guard
+   (`CCC_SETUP_ALLOW_OWNER_MISMATCH=1`)
 3. `git fetch` + `merge --ff-only` (never rewrites local history; diverged →
    abort)
 4. if HEAD changed (or `run --force`): snapshot the managed Claude artifacts

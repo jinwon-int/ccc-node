@@ -941,5 +941,18 @@ out="$(run_setup_in "$guard_repo" "$dry_home" --dry-run)"
 ok "dry-run reports the guard install without touching .git" \
   'grep -q "would install managed-checkout guard" <<<"$out" && [ ! -e "$GUARD_HOOK" ]'
 
+# Checkout owner guard (#1426): setup.sh run as a uid that does not own the
+# source checkout (gongmyoung root-ssh shape) must abort before touching the
+# target. The seam is accepted only under the writable /tmp root, like
+# CCC_SETUP_TEST_EUID.
+og_claude="$TMP/owner-guard-claude"
+out="$(HOME="$TMP/owner-guard-home" CCC_CLAUDE_DIR="$og_claude" CCC_HERMES_DIR="$TMP/owner-guard-hermes" \
+  CCC_SETUP_TEST_REPO_OWNER_UID=65534 bash "$SETUP" --no-backup 2>&1)"; rc=$?
+ok "foreign-owned checkout aborts setup (exit 2)" '[ "$rc" = 2 ] && grep -q "owned by uid 65534" <<<"$out"'
+ok "foreign-owned checkout installs nothing" '[ ! -e "$og_claude/settings.json" ]'
+HOME="$TMP/owner-guard-home" CCC_CLAUDE_DIR="$og_claude" CCC_HERMES_DIR="$TMP/owner-guard-hermes" \
+  CCC_SETUP_TEST_REPO_OWNER_UID=65534 CCC_SETUP_ALLOW_OWNER_MISMATCH=1 bash "$SETUP" --no-backup --dry-run >/dev/null 2>&1; rc=$?
+ok "owner mismatch override proceeds" '[ "$rc" = 0 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

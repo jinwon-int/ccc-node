@@ -29,6 +29,21 @@ All notable changes to the Claude Code node harness. Dates are KST.
   tick 5 min old, top-level 10 h → false `ingest-tick-stale`).
 
 ### Fixed
+- **self-update / setup.sh: checkout owner guard (#1426).** gongmyoung is
+  a dual-domain host (root ssh, runtime user `gongmyoung` owns
+  `/opt/ccc-node`); a root-context `ccc-self-update.sh run` on 2026-09-02
+  fast-forwarded the checkout as root (27 root-owned files under `.git`),
+  deployed hooks into `/root/.claude`, and left the runtime user's harness at
+  the pre-#1423 version while reporting ok. Both entry points now abort
+  fail-closed when the checkout's `.git` owner uid differs from the running
+  uid — self-update as a terminal `abort reason=owner-mismatch owner=<uid>
+  euid=<uid>` (exit 4, notified like no-repo/wrong-branch), setup.sh with
+  exit 2 before touching the target. Opt out for a deliberately shared
+  checkout with `CCC_SELF_UPDATE_ALLOW_OWNER_MISMATCH=1` /
+  `CCC_SETUP_ALLOW_OWNER_MISMATCH=1`. Tests: self-update `stat` stub
+  (foreign owner aborts, no pull/setup, logs uids, notifies; override
+  proceeds); setup.sh tmp-scoped `CCC_SETUP_TEST_REPO_OWNER_UID` seam
+  (aborts with nothing installed; override dry-run proceeds).
 - **doctor: t2-starvation-observe cron registered; registry guard test.**
   `install-t2-starvation-observe-cron.sh` (#1421) landed without a
   `CRON_MARKER_INSTALLERS` / `CRON_AUX_MARKERS` entry, so the seoseo hub's
