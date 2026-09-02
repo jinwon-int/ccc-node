@@ -98,6 +98,38 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 # inheriting root-only assumptions. Defaults preserve the existing root VPS
 # layout when HOME=/root.
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}"
+# Checkout owner guard (#1426): on a dual-domain host (gongmyoung — root ssh,
+# runtime user owns /opt/ccc-node) running setup.sh as root deploys the harness
+# into root's home and leaves the checkout partly root-owned, while the runtime
+# user's harness silently stays stale. Abort before touching anything unless the
+# operator states the checkout is deliberately shared
+# (CCC_SETUP_ALLOW_OWNER_MISMATCH=1). The test seam mirrors _ccc_is_root: it is
+# honoured only when the install target resolves under the writable temp root.
+_ccc_checkout_owner_guard() {
+  local owner="" euid="" readlink_bin="" test_root="" test_target="" candidate
+  [ -e "$SRC/.git" ] || return 0  # a worktree checkout has a .git FILE
+  [ "${CCC_SETUP_ALLOW_OWNER_MISMATCH:-0}" = "1" ] && return 0
+  if [ -n "${CCC_SETUP_TEST_REPO_OWNER_UID:-}" ] && [ -n "${CCC_CLAUDE_DIR:-}" ]; then
+    for candidate in /usr/bin/readlink /bin/readlink; do
+      if [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ]; then readlink_bin="$candidate"; break; fi
+    done
+    if [ -n "$readlink_bin" ]; then
+      test_root="$("$readlink_bin" -m -- "${TMPDIR:-/tmp}" 2>/dev/null || true)"
+      test_target="$("$readlink_bin" -m -- "$CCC_CLAUDE_DIR" 2>/dev/null || true)"
+    fi
+    if [ -n "$test_root" ] && [ -d "$test_root" ] && [ -w "$test_root" ]; then
+      case "$test_target" in "$test_root"/*) owner="$CCC_SETUP_TEST_REPO_OWNER_UID" ;; esac
+    fi
+  fi
+  [ -n "$owner" ] || owner="$(/usr/bin/stat -c %u "$SRC/.git" 2>/dev/null || true)"
+  euid="$(/usr/bin/id -u 2>/dev/null || true)"
+  case "$owner$euid" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$owner" != "$euid" ] || return 0
+  echo "ERROR: checkout $SRC is owned by uid $owner but setup.sh is running as uid $euid." >&2
+  echo "       Run it as the checkout owner (e.g. sudo -u <owner> ... with the user bus env), or set CCC_SETUP_ALLOW_OWNER_MISMATCH=1 for a deliberately shared checkout (#1426)." >&2
+  return 1
+}
+_ccc_checkout_owner_guard || exit 2
 MEM_DIR="$CLAUDE_DIR/memories"          # node-owned memory (Hermes-independent)
 HERMES_ROOT="${CCC_HERMES_DIR:-$HOME/.hermes}"
 HERMES_DIR="$HERMES_ROOT/memories"      # legacy memory location (fallback only)

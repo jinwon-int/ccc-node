@@ -700,5 +700,29 @@ rm -f "$SETUP_MARKER"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "following tick is up-to-date again" '[ "$rc" = 0 ] && grep -q "already up to date" <<<"$out" && [ ! -f "$SETUP_MARKER" ]'
 
+# --- 10) checkout owner guard (#1426) -----------------------------------------
+# gongmyoung shape: the checkout belongs to the runtime user, but a root ssh
+# session ran the tick. The `stat` stub reports a foreign owner only for the
+# fixture repo's .git, and only while CCC_TEST_FAKE_REPO_OWNER is set.
+cat > "$FAKEBIN/stat" <<SH
+#!/usr/bin/env bash
+if [ -n "\${CCC_TEST_FAKE_REPO_OWNER:-}" ]; then
+  for a in "\$@"; do [ "\$a" = "$REPO/.git" ] && { echo "\$CCC_TEST_FAKE_REPO_OWNER"; exit 0; }; done
+fi
+exec /usr/bin/stat "\$@"
+SH
+chmod +x "$FAKEBIN/stat"
+rm -f "$SETUP_MARKER" "$TMP/spool"/*.json
+echo owner > "$TMP/seed/owner.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm owner && git -C "$TMP/seed" push -q origin main
+out="$(CCC_TEST_FAKE_REPO_OWNER=65534 run_selfup run 2>&1)"; rc=$?
+ok "foreign-owned checkout aborts (exit 4)" '[ "$rc" = 4 ] && grep -q "owned by uid 65534" <<<"$out"'
+ok "foreign-owned checkout does not pull or run setup" '[ ! -f "$SETUP_MARKER" ] && [ "$(git -C "$REPO" rev-parse HEAD)" != "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
+ok "foreign-owned checkout logs owner-mismatch with uids" 'grep -q "abort reason=owner-mismatch .*owner=65534 euid=$(id -u)" "$STATE/self-update.log"'
+ok "foreign-owned checkout notifies" 'grep -rh "소유" "$TMP/spool" >/dev/null 2>&1'
+out="$(CCC_TEST_FAKE_REPO_OWNER=65534 CCC_SELF_UPDATE_ALLOW_OWNER_MISMATCH=1 run_selfup run 2>&1)"; rc=$?
+ok "explicit override proceeds" '[ "$rc" = 0 ] && [ -f "$SETUP_MARKER" ]'
+rm -f "$FAKEBIN/stat"
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
