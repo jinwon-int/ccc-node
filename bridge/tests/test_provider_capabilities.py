@@ -202,10 +202,6 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
                 "claude/hooks/distill/resume-write.sh",
                 "claude/hooks/distill/local-facts.sh",
             ),
-            "memory_sink_honcho": (
-                "bridge/memory/distill_honcho_worker.py",
-                "bridge/__main__.py",
-            ),
             "memory_sink_wiki_candidate": ("claude/hooks/distill/wiki-queue.sh",),
         }
         for axis_key, relative_paths in grounded_files.items():
@@ -243,13 +239,6 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
             capability_status("codex", "memory_writeback_distill").state,
             CapabilityState.SUPPORTED,
         )
-        self.assertIs(
-            capability_status("codex", "memory_sink_honcho").state,
-            CapabilityState.SUPPORTED,
-        )
-        self.assertTrue(
-            (REPO_ROOT / "bridge/memory/distill_honcho_worker.py").is_file()
-        )
 
     def test_piri_memory_parity_is_grounded_in_runtime_and_roundtrip_tests(self) -> None:
         from telegram_bot.core.piri_runtime import PiriRuntime
@@ -258,7 +247,6 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
             "memory_read_bootstrap",
             "memory_writeback_distill",
             "memory_sink_local",
-            "memory_sink_honcho",
             "memory_sink_wiki_candidate",
             "memory_roundtrip",
         ):

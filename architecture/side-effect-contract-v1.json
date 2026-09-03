@@ -31,31 +31,6 @@
       }
     },
     {
-      "operation": "honcho.deliver_distill",
-      "owner": "memory Honcho sink worker",
-      "registration": {
-        "kind": "python-symbol",
-        "path": "bridge/memory/distill_honcho_worker.py",
-        "symbol": "CodexDistillHonchoSinkWorker.write_once"
-      },
-      "external": true,
-      "idempotency": "native",
-      "idempotency_key": "ccc-distill-<job-id> and ccc-distill-<job-id>-session",
-      "retry_class": "safe",
-      "ambiguous_window": "HTTP success before durable outbox ACK and journal completion",
-      "reconcile": "none",
-      "compensation": "none",
-      "audit_surface": "owner-only outbox plus leased distill journal status",
-      "approval_boundary": "configured memory route and Honcho enable gate",
-      "recovery": {
-        "before_intent": "safe-replay",
-        "after_intent_before_call": "safe-replay",
-        "after_external_success_before_ack": "safe-replay",
-        "after_ack_before_terminal": "safe-replay",
-        "duplicate_restart_replay": "safe-replay"
-      }
-    },
-    {
       "operation": "self_update.apply",
       "owner": "pre-approved node maintenance",
       "registration": {

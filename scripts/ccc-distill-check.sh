@@ -2,15 +2,12 @@
 # ccc-distill-check.sh — read-only distill health snapshot for fleet verification (#82).
 #
 # Reports toggle state, last result, queue size, recent log, and trigger counts.
-# No mutations, no network calls, no Honcho sends.
+# No mutations and no network calls.
 # Usage: bash scripts/ccc-distill-check.sh [--json]
 set -uo pipefail
 
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
-HONCHO_CFG="${CCC_HONCHO_CFG:-${HOME:-/root}/.hermes/honcho.json}"
 LOG="$STATE_DIR/distill.log"
-QUEUE="$STATE_DIR/honcho-queue.jsonl"
-DEAD="$STATE_DIR/honcho-queue.jsonl.dead"
 LAST="$STATE_DIR/distill-last.json"
 CKPT_DIR="$STATE_DIR/checkpoints"
 DISABLED="$STATE_DIR/distill.disabled"
@@ -36,14 +33,6 @@ else                          MODE="LIVE"
 fi
 
 # ---- queue counts -----------------------------------------------------------
-queue_lines=0
-[ -f "$QUEUE" ] && [ -s "$QUEUE" ] && queue_lines="$(wc -l < "$QUEUE" | tr -d '[:space:]')"
-case "$queue_lines" in ''|*[!0-9]*) queue_lines=0 ;; esac
-
-dead_lines=0
-[ -f "$DEAD" ] && [ -s "$DEAD" ] && dead_lines="$(wc -l < "$DEAD" | tr -d '[:space:]')"
-case "$dead_lines" in ''|*[!0-9]*) dead_lines=0 ;; esac
-
 # ---- provider-neutral journal/circuit counts (body-free) -------------------
 common_total=0; common_ready=0; common_retryable=0; common_done=0; common_terminal=0
 if [ -d "$COMMON_JOURNAL" ]; then
@@ -101,12 +90,6 @@ if [ -f "$LOG" ] && [ -s "$LOG" ]; then
   drain_drop="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {if(match($0,/dropped=[0-9]+/)) {n+=substr($0,RSTART+8,RLENGTH-8)}} END{print n+0}' "$LOG" 2>/dev/null)"
 fi
 
-# ---- Honcho config reachability note ----------------------------------------
-honcho_base="(missing)"
-if [ -f "$HONCHO_CFG" ]; then
-  honcho_base="$(jq -r '.baseUrl // "unset"' "$HONCHO_CFG" 2>/dev/null || echo "parse-error")"
-fi
-
 # ---- state dir existence ----------------------------------------------------
 state_dir_ok="yes"
 [ -d "$STATE_DIR" ] || state_dir_ok="no (missing)"
@@ -118,12 +101,9 @@ if [ "$OUTPUT" = "--json" ]; then
     --arg last "$last_summary" \
     --arg state_dir "$STATE_DIR" \
     --arg state_dir_ok "$state_dir_ok" \
-    --arg honcho_base "$honcho_base" \
     --arg ckpt_dir "$CKPT_DIR" \
     --arg ckpt_last "$checkpoint_last" \
     --argjson ckpt_snapshots "$checkpoint_snapshots" \
-    --argjson queue_lines "$queue_lines" \
-    --argjson dead_lines "$dead_lines" \
     --argjson manual "$manual_c" \
     --argjson sessionend "$sessionend_c" \
     --argjson precompact "$precompact_c" \
@@ -138,8 +118,6 @@ if [ "$OUTPUT" = "--json" ]; then
     --argjson common_terminal "$common_terminal" \
     --argjson cooldown_files "$cooldown_files" \
     '{mode:$mode, last:$last, state_dir:$state_dir, state_dir_ok:$state_dir_ok,
-      honcho_base:$honcho_base,
-      queue:{lines:$queue_lines, dead:$dead_lines},
       checkpoint:{dir:$ckpt_dir, snapshots:$ckpt_snapshots, last:$ckpt_last},
       triggers:{manual:$manual, sessionend:$sessionend, precompact:$precompact},
       drain:{ok:$drain_ok, failed:$drain_failed, dropped:$drain_drop},
@@ -151,10 +129,8 @@ else
   printf -- '- state dir:  `%s` (%s)\n' "$STATE_DIR" "$state_dir_ok"
   printf -- '- mode:       `%s`\n' "$MODE"
   printf -- '- last:       %s\n' "$last_summary"
-  printf -- '- queue:      %s lines (dead: %s)\n' "$queue_lines" "$dead_lines"
   printf -- '- common:     %s jobs (ready: %s, retryable: %s, done: %s, terminal: %s, cooldown files: %s)\n' "$common_total" "$common_ready" "$common_retryable" "$common_done" "$common_terminal" "$cooldown_files"
   printf -- '- checkpoint: %s snapshots (last: %s)\n' "$checkpoint_snapshots" "$checkpoint_last"
-  printf -- '- honcho:     %s\n' "$honcho_base"
   printf '\n## triggers (14d)\n\n'
   printf -- '- manual:     %s\n' "$manual_c"
   printf -- '- sessionend: %s\n' "$sessionend_c"

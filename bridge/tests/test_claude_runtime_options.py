@@ -51,8 +51,6 @@ def _settings(tmp_path: Path, **overrides) -> SimpleNamespace:
         bot_data_dir=tmp_path / ".telegram_bot",
         bridge_memory_audience_root=None,
         claude_settings_path=tmp_path / ".claude" / "settings.json",
-        honcho_config_path=tmp_path / ".hermes" / "honcho.json",
-        honcho_memory_enabled=True,
         hook_policy_environment=lambda: {"CCC_WIKI_MEMORY_ENABLED": "0"},
         bridge_web_mcp_mode="off",
         bridge_searxng_url="https://search.example.com",

@@ -136,7 +136,6 @@ async def test_index_failure_retries_body_free_without_duplicating_fact(
         "#!/bin/sh\n"
         "[ -z \"${TELEGRAM_BOT_TOKEN:-}${CODEX_API_KEY:-}${CCC_HONCHO_TOKEN:-}\" ] || exit 7\n"
         "[ \"${CCC_WIKI_MEMORY_ENABLED:-}\" = 0 ] || exit 8\n"
-        "[ \"${CCC_HONCHO_MEMORY_ENABLED:-}\" = 0 ] || exit 9\n"
         "exit 0\n"
     )
     indexer.chmod(0o700)

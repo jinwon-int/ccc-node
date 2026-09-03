@@ -28,7 +28,6 @@ async def extracted_job(
     memory_audience: str | None = "private",
     memory_scope: str | None = PRIVATE_SCOPE,
     wiki_enabled: bool = True,
-    honcho_enabled: bool = True,
     provider: str = "codex",
 ) -> DistillJob:
     queued = journal.enqueue_once(
@@ -57,7 +56,6 @@ async def extracted_job(
         usage_meter=None,
         owner_token="extract-worker",
         wiki_enabled=wiki_enabled,
-        honcho_enabled=honcho_enabled,
     ).extract_once(job_id=queued.job_id)
 
 

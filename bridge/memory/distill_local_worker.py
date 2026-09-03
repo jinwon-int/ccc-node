@@ -332,7 +332,6 @@ class CodexDistillLocalSinkWorker:
                 "CCC_MEMORY_DIR": str(scope_root / "memories"),
                 "CCC_MEMORY_INDEX_DISTILL": "0",
                 "CCC_WIKI_MEMORY_ENABLED": "0",
-                "CCC_HONCHO_MEMORY_ENABLED": "0",
                 "CCC_MEMORY_NO_REFRESH": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",
             }

@@ -72,12 +72,12 @@ out="$(PRIMARY_AUDIENCE=shared PRIMARY_JSON="$pj" RECENT_JSON="$rj" python3 "$MO
 ok "merge labels a shared scope's task and recent rows as shared" 'jq -e '\''[.results[].memoryAudience] | all(. == "shared")'\'' >/dev/null <<<"$out"'
 
 # ---- dynamic-budget ---------------------------------------------------------
-# alloc = max(maxlocal, total - reserve - m - r - w - h); limit clamped [base,maxlim].
-out="$(python3 "$MOD" dynamic-budget 12000 1000 3000 180 5 25 2000 500 0 0)"
+# alloc = max(maxlocal, total - reserve - m - r - w); limit clamped [base,maxlim].
+out="$(python3 "$MOD" dynamic-budget 12000 1000 3000 180 5 25 2000 500 0)"
 ok "budget reclaims slack for the local block" '[ "$out" = "8500 25" ]'
-out="$(python3 "$MOD" dynamic-budget 12000 1000 500 180 5 25 4000 2000 5000 4000)"
+out="$(python3 "$MOD" dynamic-budget 12000 1000 500 180 5 25 4000 2000 5000)"
 ok "budget never drops below the static floor / base limit" '[ "$out" = "500 5" ]'
-out="$(python3 "$MOD" dynamic-budget 12000 1000 3000 180 5 25 2000 500 4000 3000)"
+out="$(python3 "$MOD" dynamic-budget 12000 1000 3000 180 5 25 2000 500 7000)"
 ok "budget mid-range limit follows ~180B/result" '[ "$out" = "3000 16" ]'
 
 # ---- run-memory-search-bounded ---------------------------------------------

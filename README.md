@@ -26,7 +26,7 @@ cd bridge
 After setup:
 
 1. Fill placeholders in `~/.claude/CLAUDE.md` and template config files.
-2. Provide node-local credentials through their normal tools (`claude` login, `gh auth login`, `~/.hermes/honcho.json`, wiki-agent install). Do not commit secrets.
+2. Provide node-local credentials through their normal tools (`claude` login, `gh auth login`, wiki-agent install). Do not commit secrets.
 3. Verify: `scripts/ccc-doctor.sh`, `scripts/validate-harness.sh`, and—if using the bridge—`bridge/start.sh --path /root --status`.
 4. Start a fresh Claude Code session and confirm memory injection/status line behavior.
 
@@ -77,8 +77,8 @@ setup.sh                   Idempotent bootstrap; refuses to overwrite real node 
 | `CCC_BRIDGE_DEFAULT_PATH` | `$HOME` | Suggested Telegram bridge workspace |
 | `CODEX_HOME` | `$HOME/.codex` | Codex config and managed-skill target; setup applies the GitHub CLI-first toggle and reconciles the explicit compatibility catalog |
 | `CCC_STATE_DIR` | `$CCC_CLAUDE_DIR/state` | Local node state and memory index |
-| `CCC_MEMORY_PROFILE` | `honcho` | Memory profile: `honcho`, `hybrid`, or `max-perf` |
-| `CCC_MEMORY_CACHE_DIR` | `$CCC_CLAUDE_DIR/hooks/cache` | Wiki/Honcho cache metadata |
+| `CCC_MEMORY_PROFILE` | `standard` | Memory profile: `standard`, `hybrid`, or `max-perf` |
+| `CCC_MEMORY_CACHE_DIR` | `$CCC_CLAUDE_DIR/hooks/cache` | Wiki cache metadata |
 | `CCC_NODE_ISOLATION_PROFILE` | `fleet` | `external` forces Family Wiki memory off (injection/refresh/index/distill queue). This is a memory-source gate, not an execution boundary — the node has no PreToolUse policy hook (removed, TM-1306); see [`docs/service-control.md`](docs/service-control.md) for the real enforcement split |
 | `CCC_WIKI_MEMORY_ENABLED` | `1` | Set `0` to disable Wiki injection, refresh, indexing, and distill queue writes |
 | `CCC_MEMORY_USER_LABEL` / `CCC_MEMORY_ASSISTANT_LABEL` | fleet-compatible labels | Node-local relationship labels for injection/distill |
@@ -95,7 +95,6 @@ Never store raw secrets in this repository. Node-local credentials stay outside 
 |---|---|
 | Claude OAuth | `claude` login creates `~/.claude/.credentials.json` |
 | GitHub token | `gh auth login` node-local config |
-| Honcho endpoint | `~/.hermes/honcho.json` |
 | Real `MEMORY.md` / `USER.md` | node-local files derived from templates |
 | Telegram bot token | bridge `.env` only |
 

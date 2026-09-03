@@ -58,13 +58,12 @@ jq -n \
   --argjson max_total "${CCC_MEMORY_MAX_BYTES:-12000}" \
   --argjson max_mem "${CCC_BUILTIN_MEMORY_MAX_BYTES:-4000}" \
   --argjson max_wiki "$WIKI_BUDGET" \
-  --argjson max_honcho "${CCC_HONCHO_MAX_BYTES:-4000}" \
   --argjson max_local "${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}" \
-  '{ok:true, query:$query, retrievalMode:$retrieval, paths:{state_dir:$state_dir,cache_dir:$cache_dir,memory_dir:$memory_dir}, budgets:{total:$max_total,built_in:$max_mem,wiki:$max_wiki,honcho:$max_honcho,local_hot:$max_local}, cache:$check, search:$search, safety:{read_only:true, no_network:true, raw_secret_output:false, retrieved_context_is_untrusted:true}}' \
+  '{ok:true, query:$query, retrievalMode:$retrieval, paths:{state_dir:$state_dir,cache_dir:$cache_dir,memory_dir:$memory_dir}, budgets:{total:$max_total,built_in:$max_mem,wiki:$max_wiki,local_hot:$max_local}, cache:$check, search:$search, safety:{read_only:true, no_network:true, raw_secret_output:false, retrieved_context_is_untrusted:true}}' \
   > "$EXPLAIN_OUT"
 if [ "$OUTPUT" = "json" ]; then
   cat "$EXPLAIN_OUT"
 else
-  jq -r '"# ccc memory explain\n\n- query: \(.query)\n- retrievalMode: \(.retrievalMode)\n- state: \(.paths.state_dir)\n- cache: \(.paths.cache_dir)\n- total budget: \(.budgets.total) bytes\n- wiki status: \(.cache.wiki.status // "unknown")\n- honcho status: \(.cache.honcho.status // "unknown")\n\n## Top results\n" + ((.search.results // []) | to_entries | map("\(.key+1). [\(.value.source)] \(.value.path) score=\(.value.score // "n/a")") | join("\n"))' "$EXPLAIN_OUT"
+  jq -r '"# ccc memory explain\n\n- query: \(.query)\n- retrievalMode: \(.retrievalMode)\n- state: \(.paths.state_dir)\n- cache: \(.paths.cache_dir)\n- total budget: \(.budgets.total) bytes\n- wiki status: \(.cache.wiki.status // "unknown")\n\n## Top results\n" + ((.search.results // []) | to_entries | map("\(.key+1). [\(.value.source)] \(.value.path) score=\(.value.score // "n/a")") | join("\n"))' "$EXPLAIN_OUT"
 fi
 rm -f "$EXPLAIN_OUT"

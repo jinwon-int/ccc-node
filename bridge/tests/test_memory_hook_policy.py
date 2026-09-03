@@ -50,8 +50,6 @@ def test_external_policy_forces_wiki_off_and_exports_only_validated_fields(tmp_p
     assert exported == {
         "CCC_NODE_ISOLATION_PROFILE": "external",
         "CCC_WIKI_MEMORY_ENABLED": "0",
-        # Honcho defaults to off since the 2026-09-01 fleet retirement.
-        "CCC_HONCHO_MEMORY_ENABLED": "0",
         "CCC_MEMORY_USER_LABEL": "Etter Ahn",
         "CCC_MEMORY_ASSISTANT_LABEL": "Karellen",
         "CCC_LIFECYCLE_AUDIT": "0",
@@ -115,19 +113,3 @@ def test_exported_hook_env_drives_python_cli_to_live_observer_ledger(
 def test_unknown_isolation_profile_fails_closed_at_config_validation(tmp_path):
     with pytest.raises(ValidationError):
         _load(tmp_path, {"CCC_NODE_ISOLATION_PROFILE": "unknown"})
-
-
-def test_honcho_toggle_defaults_off_and_opts_in_explicitly(tmp_path):
-    # Retirement default (2026-09-01): nothing set → hooks see "0".
-    off_root = tmp_path / "default"
-    on_root = tmp_path / "opt-in"
-    off_root.mkdir()
-    on_root.mkdir()
-    assert _load(off_root, {}).hook_policy_environment()["CCC_HONCHO_MEMORY_ENABLED"] == "0"
-    # A node with a live endpoint can still opt back in.
-    assert (
-        _load(on_root, {"CCC_HONCHO_MEMORY_ENABLED": "1"}).hook_policy_environment()[
-            "CCC_HONCHO_MEMORY_ENABLED"
-        ]
-        == "1"
-    )

@@ -8,16 +8,11 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 mkdir -p "$TMP/state" "$TMP/hermes" "$TMP/common-journal"
-cat > "$TMP/honcho.json" <<'JSON'
-{"baseUrl":"http://honcho.example","workspace":"test"}
-JSON
 export CCC_STATE_DIR="$TMP/state"
-export CCC_HONCHO_CFG="$TMP/honcho.json"
 export CCC_DISTILL_JOURNAL_DIR="$TMP/common-journal"
 out="$(bash "$CHECK" --json 2>&1)"; rc=$?
 ok "empty state exits 0" '[ "$rc" = 0 ]'
-ok "empty state reports live mode" 'jq -e ".mode == \"LIVE\" and .queue.lines == 0 and .checkpoint.snapshots == 0 and .triggers.precompact == 0" <<<"$out" >/dev/null'
-ok "empty state reports honcho base without network" 'jq -e ".honcho_base == \"http://honcho.example\"" <<<"$out" >/dev/null'
+ok "empty state reports live mode" 'jq -e ".mode == \"LIVE\" and .checkpoint.snapshots == 0 and .triggers.precompact == 0" <<<"$out" >/dev/null'
 ok "empty state reports provider-neutral counters" 'jq -e ".provider_neutral.total == 0 and .provider_neutral.cooldown_files == 0" <<<"$out" >/dev/null'
 # Timestamps must stay inside the checker's 14-day window on ANY run date —
 # hardcoded dates rot and start failing two weeks after they were written.
@@ -31,13 +26,6 @@ $D2 start trigger=sessionend dryrun=0 pid=3
 $D2 [drain] drained ok=2 failed=1 dropped=1 processed=4
 $D1 start trigger=precompact dryrun=0 pid=5
 LOG
-cat > "$TMP/state/honcho-queue.jsonl" <<'JSONL'
-{"session_id":"a"}
-{"session_id":"b"}
-JSONL
-cat > "$TMP/state/honcho-queue.jsonl.dead" <<'JSONL'
-{"session_id":"dead"}
-JSONL
 cat > "$TMP/state/distill-last.json" <<'JSON'
 {"session_id":"s1","trigger":"precompact","distilled_at":"2026-06-22T00:00:01Z","honcho":[{"text":"x"}],"wiki_candidates":[{"title":"w"}]}
 JSON
@@ -48,7 +36,6 @@ touch -t 202606210000 "$TMP/state/checkpoints/working-state-20260621_000000.md"
 touch -t 202606220000 "$TMP/state/checkpoints/working-state-20260622_000000.md"
 out="$(bash "$CHECK" --json 2>&1)"; rc=$?
 ok "populated state exits 0" '[ "$rc" = 0 ]'
-ok "populated counts queue/dead" 'jq -e ".queue.lines == 2 and .queue.dead == 1" <<<"$out" >/dev/null'
 ok "populated counts triggers" 'jq -e ".triggers.manual == 1 and .triggers.sessionend == 1 and .triggers.precompact == 1" <<<"$out" >/dev/null'
 ok "populated reports checkpoints" 'jq -e ".checkpoint.snapshots == 2 and (.checkpoint.last | contains(\"working-state-20260622_000000.md\"))" <<<"$out" >/dev/null'
 ok "populated counts drain" 'jq -e ".drain.ok == 2 and .drain.failed == 1 and .drain.dropped == 1" <<<"$out" >/dev/null'

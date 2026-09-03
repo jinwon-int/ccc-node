@@ -96,7 +96,6 @@ class TelegramBot(
         distill_local_sink_worker: Any = None,
         memory_promoter: Any = None,
         distill_wiki_sink_worker: Any = None,
-        distill_honcho_sink_worker: Any = None,
         skill_candidate_collector_worker: Any = None,
         application_builder_factory: Any = None,
         clock: Any = None,
@@ -115,7 +114,6 @@ class TelegramBot(
         self._distill_local_sink_worker = distill_local_sink_worker
         self._memory_promoter = memory_promoter
         self._distill_wiki_sink_worker = distill_wiki_sink_worker
-        self._distill_honcho_sink_worker = distill_honcho_sink_worker
         self._skill_candidate_collector_worker = skill_candidate_collector_worker
         self._application_builder_factory = (
             application_builder_factory or Application.builder
@@ -294,13 +292,13 @@ class TelegramBot(
         ):
             # The journal marks a routeless job UNROUTABLE with no error_code and
             # no log line, so a node whose memory mode yields no audience loses the
-            # local lane (resume.md, memory facts) silently. Wiki/Honcho sinks are
+            # local lane (resume.md, memory facts) silently. The wiki sink is
             # unaffected. Warn once per process so the gap is observable.
             self._local_sink_unroutable_warned = True
             logger.warning(
                 "distill local sink unroutable: bridge_memory_mode=%r resolves no memory "
                 "audience, so resume.md and local memory facts will not be written "
-                "(wiki/honcho sinks unaffected)",
+                "(wiki sink unaffected)",
                 getattr(self._config, "bridge_memory_mode", None),
             )
         enqueue_kwargs = {
