@@ -101,14 +101,25 @@ collect() { # <node> -> writes current/<node>.json ; returns 0 ok, 1 unreachable
 }
 
 # Comparable identity of what matters: units by name+kind, cron lines, non-loopback
-# listeners by local address + process, funnel flag, residue files.
+# listeners by local address + process, funnel flag, residue files, and the host
+# firewall (ufw status + default incoming policy + allow-rule hash, #1431) — a
+# public bind accepted on the strength of default-deny must re-surface as NEW
+# when the policy or the rule set changes. Nodes whose JSON predates the
+# firewall block contribute no firewall line, so old baselines compare as NEW
+# once (re-accept after reviewing).
 signature() { # <json> -> sorted "kind\tid" lines
   jq -r '
     ([.units[]? | "unit\t\(.unit) [\(.kind)]"]
      + [.cron[]? | "cron\t\(.source): \(.line | .[0:120])"]
      + [.listeners[]? | select(.bind != "loopback") | "listener\t\(.local) \(.process // "-") [\(.bind)]"]
      + (if (.exposure.funnel_configured // false) then ["funnel\tenabled"] else [] end)
-     + [.residue[]? | "residue\t\(.file)"])
+     + [.residue[]? | "residue\t\(.file)"]
+     + (if .firewall.ufw? then
+          [ .firewall.ufw
+            | if .status == "active"
+              then "firewall\tufw active default-in=\(.default_incoming) rules=\(.rules_hash | .[0:8]) (\(.rules | length))"
+              else "firewall\tufw \(.status)" end ]
+        else [] end))
     | .[]' "$1" 2>/dev/null | sort -u
 }
 

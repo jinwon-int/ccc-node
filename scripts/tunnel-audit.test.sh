@@ -73,7 +73,22 @@ case "\$1" in
   funnel) printf 'https://node.tailnet.ts.net (tailnet only)\n|-- / proxy http://127.0.0.1:8888\n' ;;
 esac
 EOF
+write_exec_stub "$TMP/bin/ufw" <<'EOF'
+cat <<'UFW'
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), deny (routed)
+New profiles: skip
+
+To                         Action      From
+--                         ------      ----
+22/tcp on tailscale0       ALLOW IN    Anywhere                   # tailscale-ssh
+8123/tcp                   ALLOW IN    192.168.55.0/24            # home-assistant-lan
+22/tcp (v6) on tailscale0  ALLOW IN    Anywhere (v6)              # tailscale-ssh
+UFW
+EOF
 export PATH="$TMP/bin:$PATH"
+export CCC_TUNNEL_AUDIT_UFW_CMD="$TMP/bin/ufw"
 export CCC_TUNNEL_AUDIT_SYSTEMD_DIR="$SYSD" CCC_TUNNEL_AUDIT_CROND_DIR="$TMP/cron.d"
 export CCC_TUNNEL_AUDIT_CRONTAB_CMD="$TMP/bin/crontab" CCC_TUNNEL_AUDIT_SS_CMD="$TMP/bin/ss" CCC_TUNNEL_AUDIT_TAILSCALE_CMD="$TMP/bin/tailscale"
 export CCC_NODE=test-node
@@ -110,12 +125,68 @@ case "\$1" in
 esac
 EOF
 out="$(bash "$AUDIT" 2>/dev/null)"
-ok "exposure summary counts" 'jq -e ".exposure == {cloudflared_units:1, reverse_ssh_units:1, public_tunnel_units:1, public_listeners:2, funnel_configured:false, residue_files:1}" <<<"$out" >/dev/null'
+ok "exposure summary counts" 'jq -e ".exposure == {cloudflared_units:1, reverse_ssh_units:1, public_tunnel_units:1, public_listeners:2, funnel_configured:false, residue_files:1, firewall_default_deny:true}" <<<"$out" >/dev/null'
+ok "ufw active: default incoming + 3 normalised rules (comments stripped, whitespace collapsed)" 'jq -e ".firewall.ufw | .status == \"active\" and .default_incoming == \"deny\" and (.rules | length == 3) and (.rules | index([\"8123/tcp ALLOW IN 192.168.55.0/24\"]) != null) and (.rules_hash | length == 64)" <<<"$out" >/dev/null && ! jq -r ".firewall.ufw.rules[]" <<<"$out" | grep -q "home-assistant-lan"'
+# Rule comment / column-spacing / order changes must not move the hash; a rule change must.
+h0="$(jq -r ".firewall.ufw.rules_hash" <<<"$out")"
+write_exec_stub "$TMP/bin/ufw" <<'EOF'
+cat <<'UFW'
+Status: active
+Default: deny (incoming), allow (outgoing), disabled (routed)
+
+To                         Action      From
+--                         ------      ----
+8123/tcp    ALLOW IN    192.168.55.0/24   # renamed-comment
+22/tcp on tailscale0       ALLOW IN    Anywhere
+22/tcp (v6) on tailscale0  ALLOW IN    Anywhere (v6)
+UFW
+EOF
+h1="$(bash "$AUDIT" 2>/dev/null | jq -r ".firewall.ufw.rules_hash")"
+ok "ufw rules hash is stable across comment/order/spacing changes" '[ "$h0" = "$h1" ]'
+write_exec_stub "$TMP/bin/ufw" <<'EOF'
+cat <<'UFW'
+Status: active
+Default: allow (incoming), allow (outgoing), deny (routed)
+
+To                         Action      From
+--                         ------      ----
+22/tcp on tailscale0       ALLOW IN    Anywhere
+8123/tcp                   ALLOW IN    Anywhere
+22/tcp (v6) on tailscale0  ALLOW IN    Anywhere (v6)
+UFW
+EOF
+open_out="$(bash "$AUDIT" 2>/dev/null)"
+ok "widened rule changes the hash; default allow clears firewall_default_deny" '[ "$(jq -r ".firewall.ufw.rules_hash" <<<"$open_out")" != "$h0" ] && jq -e ".firewall.ufw.default_incoming == \"allow\" and .exposure.firewall_default_deny == false" <<<"$open_out" >/dev/null'
+write_exec_stub "$TMP/bin/ufw" <<'EOF'
+printf 'Status: inactive\n'
+EOF
+ok "ufw inactive reported as fact" 'bash "$AUDIT" 2>/dev/null | jq -e ".firewall.ufw.status == \"inactive\" and .exposure.firewall_default_deny == false" >/dev/null'
+write_exec_stub "$TMP/bin/ufw" <<'EOF'
+echo "ERROR: You need to be root to run this script" >&2; exit 1
+EOF
+ok "ufw non-root is unavailable, exit 0" 'o="$(bash "$AUDIT" 2>/dev/null)"; [ $? = 0 ] && jq -e ".firewall.ufw.status == \"unavailable\"" <<<"$o" >/dev/null'
+ok "ufw missing is a fact, exit 0" 'o="$(CCC_TUNNEL_AUDIT_UFW_CMD=/nonexistent/ufw bash "$AUDIT" 2>/dev/null)"; [ $? = 0 ] && jq -e ".firewall.ufw.status == \"missing\" and .tools.ufw == false" <<<"$o" >/dev/null'
+# restore the active stub for the markdown checks below
+write_exec_stub "$TMP/bin/ufw" <<'EOF'
+cat <<'UFW'
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), deny (routed)
+New profiles: skip
+
+To                         Action      From
+--                         ------      ----
+22/tcp on tailscale0       ALLOW IN    Anywhere                   # tailscale-ssh
+8123/tcp                   ALLOW IN    192.168.55.0/24            # home-assistant-lan
+22/tcp (v6) on tailscale0  ALLOW IN    Anywhere (v6)              # tailscale-ssh
+UFW
+EOF
 ok "stderr is empty" '[ ! -s "$TMP/err" ]'
 
 md="$(bash "$AUDIT" --markdown 2>/dev/null)"; rc=$?
 ok "markdown mode exits 0" '[ "$rc" = 0 ]'
 ok "markdown headline carries counts" 'grep -q "cloudflared units: 1 · reverse ssh: 1 · public tunnel units: 1 · public listeners: 2 · funnel: no · residue: 1" <<<"$md"'
+ok "markdown carries the ufw line and rules" 'grep -q "^- ufw: active · default incoming deny · 3 rules · hash" <<<"$md" && grep -q "8123/tcp ALLOW IN 192.168.55.0/24" <<<"$md"'
 ok "markdown lists units and residue" 'grep -q "gwakga-broker-public-tunnel.service" <<<"$md" && grep -q "removed-20260626" <<<"$md"'
 ok "markdown never leaks the token" '! grep -q "SECRETVALUE123" <<<"$md"'
 
