@@ -188,9 +188,9 @@ cat > "$tools/ccc-memory-consolidate.sh" <<'SH'
 exit 0
 SH
 chmod +x "$tools/ccc-memory-index.sh" "$tools/ccc-memory-consolidate.sh"
-out="$(PATH="$fakebin:$PATH" HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_WIKI_AGENT_BIN="$TMP/missing/wiki-agent" CCC_HONCHO_MEMORY_ENABLED=0 bash "$ROOT/claude/hooks/refresh-memory.sh" 2>&1)"; rc=$?
-ok "refresh-memory exits 0 when wiki missing and honcho disabled" '[ "$rc" = 0 ]'
-ok "refresh-memory writes source meta without network success" 'jq -e ".sources.wiki.status == \"missing\" and .sources.honcho.status == \"disabled\" and .sources.local_index.status == \"ok\"" "$cache/meta.json" >/dev/null'
+out="$(PATH="$fakebin:$PATH" HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_WIKI_AGENT_BIN="$TMP/missing/wiki-agent" bash "$ROOT/claude/hooks/refresh-memory.sh" 2>&1)"; rc=$?
+ok "refresh-memory exits 0 when the wiki agent is missing" '[ "$rc" = 0 ]'
+ok "refresh-memory writes source meta without network success" 'jq -e ".sources.wiki.status == \"missing\" and .sources.local_index.status == \"ok\"" "$cache/meta.json" >/dev/null'
 ok "refresh-memory lock and meta stay local" '[ -f "$cache/.refresh.lock" ] && [ -f "$cache/.last-refresh" ]'
 
 cat > "$fakebin/wiki-agent" <<'SH'
@@ -200,81 +200,17 @@ printf 'unexpected wiki payload\n'
 SH
 chmod +x "$fakebin/wiki-agent"
 rm -f "$TMP/wiki-called"
-out="$(PATH="$fakebin:$PATH" WIKI_CALL_MARKER="$TMP/wiki-called" HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_WIKI_AGENT_BIN="$fakebin/wiki-agent" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 CCC_HONCHO_MEMORY_ENABLED=0 bash "$ROOT/claude/hooks/refresh-memory.sh" 2>&1)"; rc=$?
+out="$(PATH="$fakebin:$PATH" WIKI_CALL_MARKER="$TMP/wiki-called" HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_WIKI_AGENT_BIN="$fakebin/wiki-agent" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/claude/hooks/refresh-memory.sh" 2>&1)"; rc=$?
 ok "wiki-disabled refresh does not invoke wiki-agent" '[ "$rc" = 0 ] && [ ! -e "$TMP/wiki-called" ]'
 ok "wiki-disabled refresh reports effective disabled status" 'jq -e ".sources.wiki.status == \"disabled\" and .sources.wiki.bytes == 0" "$cache/meta.json" >/dev/null'
 
-cat > "$fakebin/curl" <<'SH'
-#!/usr/bin/env bash
-url=""
-for arg in "$@"; do
-  case "$arg" in http://*|https://*) url="$arg" ;; esac
-done
-printf '%s\n' "$url" >> "${HONCHO_URL_LOG:?}"
-case "$url" in
-  *family--ccc-private-00000000000000000000000000000000*)
-    printf '{"content":"PRIVATE_HONCHO_ONLY"}\n'
-    ;;
-  *family--ccc-shared*)
-    printf '{"content":"SHARED_HONCHO_PUBLIC"}\n'
-    ;;
-  */workspaces/family/peers/*)
-    printf '{"content":"LEGACY_HONCHO_PRIVATE_ONLY"}\n'
-    ;;
-  *)
-    printf '{"content":""}\n'
-    ;;
-esac
-SH
-chmod +x "$fakebin/curl"
-honcho_cfg="$TMP/honcho.json"
-printf '%s\n' '{"baseUrl":"https://honcho.invalid","workspace":"family","peerName":"peer-a"}' > "$honcho_cfg"
-chmod 600 "$honcho_cfg"
-honcho_url_log="$TMP/honcho-urls.log"
-
-: > "$honcho_url_log"
-rm -f "$audroot/shared/cache/honcho.txt"
-out="$(PATH="$fakebin:$PATH" HONCHO_URL_LOG="$honcho_url_log" HOME="$TMP/home" \
-  CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=shared CCC_MEMORY_SCOPE=shared \
-  CCC_MEMORY_AUDIENCE_ROOT="$audroot" \
-  CCC_STATE_DIR="$audroot/shared/state" CCC_MEMORY_CACHE_DIR="$audroot/shared/cache" \
-  CCC_MEMORY_DIR="$shared_mem" CCC_MEMORY_INDEX_DB="$audroot/shared/state/memory-index.sqlite" \
-  CCC_MEMORY_FACTS_FILE="$audroot/shared/state/memory-facts.jsonl" \
-  CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
-  CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
-  CCC_MEMORY_SHARED_DIR="$shared_mem" \
-  CCC_MEMORY_SHARED_FACTS_FILE="$audroot/shared/state/memory-facts.jsonl" \
-  CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" \
-  CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=1 \
-  CCC_HONCHO_AUDIENCE_SCOPED=1 CCC_HONCHO_WORKSPACE_SCOPE=shared \
-  CCC_HONCHO_SHARED_WORKSPACE_SCOPE=shared CCC_HONCHO_CFG="$honcho_cfg" \
-  bash "$ROOT/claude/hooks/refresh-memory.sh" 2>&1)"; rc=$?
-ok "shared audience refresh queries only its physical Honcho workspace" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$honcho_url_log")" = 1 ] && grep -q "family--ccc-shared" "$honcho_url_log" && ! grep -q "private-\|/workspaces/family/" "$honcho_url_log"'
-ok "shared audience cache contains no private or legacy Honcho result" \
-  'grep -q "SHARED_HONCHO_PUBLIC" "$audroot/shared/cache/honcho.txt" && ! grep -q "PRIVATE_HONCHO_ONLY\|LEGACY_HONCHO_PRIVATE_ONLY" "$audroot/shared/cache/honcho.txt"'
-
-: > "$honcho_url_log"
-rm -f "$audroot/$private_scope/cache/honcho.txt"
-out="$(PATH="$fakebin:$PATH" HONCHO_URL_LOG="$honcho_url_log" HOME="$TMP/home" \
-  CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private CCC_MEMORY_SCOPE="$private_scope" \
-  CCC_MEMORY_AUDIENCE_ROOT="$audroot" \
-  CCC_STATE_DIR="$audroot/$private_scope/state" CCC_MEMORY_CACHE_DIR="$audroot/$private_scope/cache" \
-  CCC_MEMORY_DIR="$private_mem" CCC_MEMORY_INDEX_DB="$audroot/$private_scope/state/memory-index.sqlite" \
-  CCC_MEMORY_FACTS_FILE="$audroot/$private_scope/state/memory-facts.jsonl" \
-  CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
-  CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
-  CCC_MEMORY_SHARED_DIR="$shared_mem" \
-  CCC_MEMORY_SHARED_FACTS_FILE="$audroot/shared/state/memory-facts.jsonl" \
-  CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" \
-  CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=1 \
-  CCC_HONCHO_AUDIENCE_SCOPED=1 CCC_HONCHO_WORKSPACE_SCOPE="$private_scope" \
-  CCC_HONCHO_SHARED_WORKSPACE_SCOPE=shared CCC_HONCHO_CFG="$honcho_cfg" \
-  bash "$ROOT/claude/hooks/refresh-memory.sh" 2>&1)"; rc=$?
-ok "private audience refresh queries private shared and private-only legacy workspaces" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$honcho_url_log")" = 3 ] && grep -q "family--ccc-$private_scope" "$honcho_url_log" && grep -q "family--ccc-shared" "$honcho_url_log" && grep -q "/workspaces/family/peers/" "$honcho_url_log"'
-ok "private audience cache labels all allowed Honcho sources" \
-  'grep -q "PRIVATE_HONCHO_ONLY" "$audroot/$private_scope/cache/honcho.txt" && grep -q "SHARED_HONCHO_PUBLIC" "$audroot/$private_scope/cache/honcho.txt" && grep -q "LEGACY_HONCHO_PRIVATE_ONLY" "$audroot/$private_scope/cache/honcho.txt"'
+# The Honcho refresh path retired with #1436; the load-memory Honcho cache
+# consumers below are fed hand-written per-audience caches instead of
+# refresh output.
+mkdir -p "$audroot/shared/cache"
+printf 'SHARED_HONCHO_PUBLIC\n' > "$audroot/shared/cache/honcho.txt"
+mkdir -p "$audroot/$private_scope/cache"
+printf '### Honcho private audience\nPRIVATE_HONCHO_ONLY\n\n### Honcho shared audience\nSHARED_HONCHO_PUBLIC\n\n### Honcho private-only legacy\nLEGACY_HONCHO_PRIVATE_ONLY\n' > "$audroot/$private_scope/cache/honcho.txt"
 
 out="$(HOME="$TMP/home" \
   CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=shared CCC_MEMORY_SCOPE=shared \
@@ -309,52 +245,6 @@ ok "private audience injects private shared and private-only legacy Honcho cache
   '[ "$rc" = 0 ] && grep -q "PRIVATE_HONCHO_ONLY" <<<"$out" && grep -q "SHARED_HONCHO_PUBLIC" <<<"$out" && grep -q "LEGACY_HONCHO_PRIVATE_ONLY" <<<"$out"'
 
 
-# --- #781: a dead endpoint must not read like a quiet one ------------------
-# honcho_chat used to pipe curl into jq, so the function returned JQ's status.
-# jq exits 0 on empty input, which made a timeout, a refused connection and a
-# genuine empty answer produce one indistinguishable outcome: "empty Honcho
-# response". Operators chasing a stale cache were handed the least useful of
-# the three readings. Each case now has its own status.
-nc_home="$TMP/nchome"; mkdir -p "$nc_home"
-nc_cache="$TMP/nccache"; nc_state="$TMP/ncstate"
-nc_cfg="$TMP/nc-honcho.json"
-printf '%s\n' '{"baseUrl":"https://honcho.invalid","workspace":"family","peerName":"peer-a"}' > "$nc_cfg"
-chmod 600 "$nc_cfg"
-nc_bin="$TMP/ncbin"; mkdir -p "$nc_bin"
-
-run_honcho() { # <curl-body-script>
-  rm -rf "$nc_cache" "$nc_state"; mkdir -p "$nc_cache" "$nc_state"
-  # /bin/sh, not `#!/usr/bin/env bash`: Termux has no /usr/bin/env, and execvp
-  # treats the resulting ENOENT as "not found here" and keeps walking PATH —
-  # so a stub with that shebang silently hands the call to the real curl and the
-  # test passes against the network instead of the fixture.
-  printf '#!/bin/sh\n%s\n' "$1" > "$nc_bin/curl"
-  chmod +x "$nc_bin/curl"
-  PATH="$nc_bin:$PATH" HOME="$nc_home" \
-    CCC_STATE_DIR="$nc_state" CCC_MEMORY_CACHE_DIR="$nc_cache" \
-    CCC_HOOK_DIR="$ROOT/claude/hooks" \
-    CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=1 \
-    CCC_MEMORY_AUDIENCE_SCOPED=0 CCC_HONCHO_AUDIENCE_SCOPED=0 \
-    CCC_HONCHO_CFG="$nc_cfg" \
-    bash "$ROOT/claude/hooks/refresh-memory.sh" >/dev/null 2>&1
-  jq -r '.sources.honcho.status' "$nc_cache/meta.json" 2>/dev/null
-}
-
-st="$(run_honcho 'printf "{\"content\":null}\n"')"
-ok "content:null is reported as no-content, not as an empty/transport failure" '[ "$st" = "no-content" ]'
-
-st="$(run_honcho 'exit 7')"
-ok "a failing curl is reported as error, not as an empty response" '[ "$st" = "error" ]'
-
-st="$(run_honcho 'exit 124')"
-ok "a timed-out curl is reported as error, not as an empty response" '[ "$st" = "error" ]'
-
-st="$(run_honcho 'printf "not json at all\n"')"
-ok "a non-JSON body is reported as error, not as an empty response" '[ "$st" = "error" ]'
-
-st="$(run_honcho 'printf "{\"content\":\"real recalled memory\"}\n"')"
-ok "a real answer still succeeds" '[ "$st" = "ok" ]'
-ok "a real answer is written to the cache" 'grep -q "real recalled memory" "$nc_cache/honcho.txt"'
 
 # --- #897 step 1: SessionStart stage timing instrumentation ---
 tstate="$TMP/timing-state"; mkdir -p "$tstate"

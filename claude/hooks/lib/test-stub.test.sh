@@ -116,8 +116,7 @@ ok "mktemp symlink directory is rejected" \
 # `#!/usr/bin/env bash` stub shebang — the only such line in each file is its
 # own line-1 shebang (stubs go through write_exec_stub).
 HOOKS="$(cd "$HERE/.." && pwd)"
-for t in distill/extract.test.sh distill/honcho-push.test.sh \
-         distill/queue-drain.test.sh skill-review.test.sh distill-scope.test.sh; do
+for t in distill/extract.test.sh skill-review.test.sh distill-scope.test.sh; do
   # shellcheck disable=SC2034  # $n is consumed via eval in ok()
   n="$(grep -c '#!/usr/bin/env bash' "$HOOKS/$t")"
   ok "$t writes no /usr/bin/env stub shebang" '[ "$n" = 1 ]'

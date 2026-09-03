@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """nunchi — thin peer/dialectic layer over local SQLite (Wiki TM-1330/TM-1332, #816).
 
-Shadow of Honcho's working/relational memory. Ingests the SAME distill
-extraction ({honcho:[{kind,text,subject}], ...}) that honcho-push.sh sends to
-Honcho — zero extra LLM cost. Recall is local FTS5; dialectic adds one
+Shadow of the retired Honcho working/relational memory. Ingests the SAME
+distill extraction ({honcho:[{kind,text,subject}], ...}; the key name is a
+historical artifact of the retired Honcho sink) — zero extra LLM cost. Recall is local FTS5; dialectic adds one
 query-time Haiku synthesis call and, when a MemPalace palace is present,
 combines verbatim transcript excerpts (decision §3). Falls back to
 peer_facts-only when MemPalace is absent.
