@@ -80,6 +80,62 @@ out="$(payload s10 fact node "20260807 롤아웃을 완료했다" | python3 "$NP
 ok "bare date stamp not misclassified as SHA" 'grep -q "ingested 1/1" <<<"$out"'
 out="$(python3 "$NP" recall "카렐렌" 2>&1)"
 ok "skipped state fact absent from recall" '! grep -q "NRestarts" <<<"$out"'
+
+# ---- 3d. source_refs structured provenance (#1264 P1-3) ---------------------
+TFILE="$TMP/transcript-s12.jsonl"
+printf '{"content":"evidence raw line"}\n' > "$TFILE"
+SR_PAYLOAD="$(python3 - "$TFILE" <<'PY'
+import json, sys
+print(json.dumps({
+  "session_id": "s12",
+  "distilled_at": "2026-07-31T00:00:00+00:00",
+  "transcript_path": sys.argv[1],
+  "honcho": [{"kind": "decision", "subject": "user",
+              "text": "사용자는 A를 B보다 우선한다",
+              "because": "TM-1332 결정 기록에 따른다",
+              "evidence": "decisions/memory-system §TM-1332 · CLAUDE.md §FW-03 근거 인용"}],
+}, ensure_ascii=False))
+PY
+)"
+printf '%s' "$SR_PAYLOAD" | python3 "$NP" ingest - >/dev/null
+sr="$(python3 - "$NUNCHI_DB" "$TFILE" <<'PY'
+import json, sqlite3, sys
+row = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT source_refs FROM peer_facts WHERE fact LIKE '%A를 B보다%'").fetchone()
+refs = json.loads(row[0])
+out = ["types=" + ",".join(sorted({r["type"] for r in refs}))]
+tr = [r for r in refs if r["type"] == "transcript"][0]
+out.append("hashlen=" + str(len(tr["sha256_8"])))
+out.append("trpath=" + str(tr["ref"] == sys.argv[2]))
+out.append("wiki=" + ",".join(sorted(r["ref"] for r in refs if r["type"] == "wiki")))
+q = [r for r in refs if r["type"] == "quote"]
+out.append("quote=" + ("yes" if q and "TM-1332" in q[0]["ref"] else "no"))
+print(";".join(out))
+PY
+)"
+ok "source_refs carries all four ref types" 'grep -q "types=quote,session,transcript,wiki" <<<"$sr"'
+ok "transcript ref pins path + 8-hex byte hash" 'grep -q "hashlen=8" <<<"$sr" && grep -q "trpath=True" <<<"$sr"'
+ok "wiki anchors extracted from the citation, deduped" 'grep -q "wiki=FW-03,TM-1332" <<<"$sr"'
+ok "model citation preserved as quote ref" 'grep -q "quote=yes" <<<"$sr"'
+FID="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT id FROM peer_facts WHERE fact LIKE '%B보다 우선%'\").fetchone()[0])")"
+out="$(python3 "$NP" refs "$FID" 2>&1)"; rc=$?
+ok "refs command renders the provenance chain" '[ "$rc" = 0 ] && grep -q "session: s12" <<<"$out" && grep -q "sha256_8" <<<"$out" && grep -q "wiki: TM-1332" <<<"$out"'
+# orphan payload: no session/transcript/citation → column stays NULL
+printf '{"distilled_at":"2026-07-31T00:00:00+00:00","honcho":[{"kind":"fact","subject":"node","text":"고아 세션 사실"}]}' | python3 "$NP" ingest - >/dev/null
+nrefs="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT COUNT(*) FROM peer_facts WHERE source_refs IS NOT NULL AND fact='고아 세션 사실'\").fetchone()[0])")"
+ok "orphan payload keeps source_refs NULL" '[ "$nrefs" = "0" ]'
+# pre-#1264 DB: migration adds the column in place; refs says so
+PRE="$TMP/pre1264.db"
+python3 - "$PRE" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("CREATE TABLE peer_facts (id INTEGER PRIMARY KEY, observer TEXT, observed TEXT, kind TEXT, fact TEXT, evidence TEXT, confidence REAL, valid_from TEXT, valid_to TEXT, supersedes INTEGER, dedup TEXT UNIQUE, created_at TEXT, source_rank INTEGER, review INTEGER, because TEXT)")
+c.execute("INSERT INTO peer_facts (observer, observed, kind, fact, evidence, valid_from, created_at) VALUES ('o','p','fact','old pre-gate row','distill:old','2026-01-01','2026-01-01')")
+c.commit()
+PY
+out="$(NUNCHI_DB="$PRE" python3 "$NP" refs 1 2>&1)"; rc=$?
+ok "pre-#1264 DB migrated in place, refs renders gracefully" '[ "$rc" = 0 ] && grep -q "none — pre-#1264 row" <<<"$out"'
+ok "migrated DB gains source_refs column" 'python3 -c "import sqlite3;cols=[r[1] for r in sqlite3.connect('"'"'$PRE'"'"').execute('"'"'PRAGMA table_info(peer_facts)'"'"')];exit(0 if '"'"'source_refs'"'"' in cols else 1)"'
 # ---- 3c. observation TTL class + review-queue alert (#1010 proposals 2/3) ---
 out="$(payload s11 observation node "TEMP-OBS-7749" | python3 "$NP" ingest - 2>&1)"
 ok "observation kind ingested" 'grep -q "ingested 1/1" <<<"$out"'
