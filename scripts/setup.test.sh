@@ -63,7 +63,7 @@ nonroot_hermes="$TMP/custom-hermes"
 nonroot_wiki="$TMP/custom-wiki-agent/bin/wiki-agent"
 nonroot_bridge="$TMP/nonroot-workspace"
 out="$(HOME="$nonroot_home" CCC_CLAUDE_DIR="$nonroot_claude" CCC_HERMES_DIR="$nonroot_hermes" CCC_WIKI_AGENT_BIN="$nonroot_wiki" CCC_BRIDGE_DEFAULT_PATH="$nonroot_bridge" bash "$SETUP" --dry-run 2>&1)"; rc=$?
-ok "setup dry-run accepts explicit non-root path overrides" '[ "$rc" = 0 ] && grep -q "$nonroot_claude/CLAUDE.md" <<<"$out" && grep -q "$nonroot_hermes/honcho.json" <<<"$out" && grep -q "$nonroot_wiki" <<<"$out" && grep -q -- "--path $nonroot_bridge" <<<"$out"'
+ok "setup dry-run accepts explicit non-root path overrides" '[ "$rc" = 0 ] && grep -q "$nonroot_claude/CLAUDE.md" <<<"$out" && grep -q "CCC_HERMES_DIR=$nonroot_hermes" <<<"$out" && grep -q "$nonroot_wiki" <<<"$out" && grep -q -- "--path $nonroot_bridge" <<<"$out"'
 escaped_hooks="$(printf '%q' "$nonroot_claude/hooks")"
 ok "setup dry-run renders the shared argv plan with shell escaping" \
   'grep -Fq -- "[dry-run] mkdir -p $escaped_hooks" <<<"$out"'
@@ -251,22 +251,27 @@ hooktree_ino_before="$(stat -c '%i' "$rewrite_claude/hooks/checkpoint.sh")"
 HOME="$TMP/rewrite-home" CCC_CLAUDE_DIR="$rewrite_claude" CCC_HERMES_DIR="$rewrite_hermes" \
   bash "$SETUP" --no-backup >/dev/null 2>&1
 # --- #1402: node-local settings.json env keys survive a re-render -------------
-# Keys the template does not declare (e.g. CCC_HONCHO_MEMORY_ENABLED=0 from the
-# 2026-09-01 retirement) are node-local and must be re-applied; template keys
-# stay repo-owned (a node-local override of one is dropped, by design).
+# Keys the template does not declare (e.g. a node-local experiment flag) are
+# node-local and must be re-applied; template keys stay repo-owned (a
+# node-local override of one is dropped, by design).
 env_home="$TMP/env-home"; env_claude="$env_home/.claude"; env_hermes="$env_home/.hermes"
 mkdir -p "$env_claude" "$env_hermes"
 HOME="$env_home" CCC_CLAUDE_DIR="$env_claude" CCC_HERMES_DIR="$env_hermes" bash "$SETUP" --no-backup >/dev/null 2>&1
-jq '.env.CCC_HONCHO_MEMORY_ENABLED = "0" | .env.CCC_USAGE_BUDGET_TOKENS_CLAUDE = "5000000" | .env.BASH_MAX_TIMEOUT_MS = "1"' \
+jq '.env.CCC_NODE_LOCAL_EXPERIMENT_FLAG = "off" | .env.CCC_USAGE_BUDGET_TOKENS_CLAUDE = "5000000" | .env.BASH_MAX_TIMEOUT_MS = "1"' \
   "$env_claude/settings.json" > "$TMP/env-seeded.json" && mv "$TMP/env-seeded.json" "$env_claude/settings.json"
 out="$(HOME="$env_home" CCC_CLAUDE_DIR="$env_claude" CCC_HERMES_DIR="$env_hermes" bash "$SETUP" --no-backup 2>&1)"
 ok "node-local env keys survive setup re-render (#1402)" \
-  'jq -e ".env.CCC_HONCHO_MEMORY_ENABLED == \"0\" and .env.CCC_USAGE_BUDGET_TOKENS_CLAUDE == \"5000000\"" "$env_claude/settings.json" >/dev/null'
+  'jq -e ".env.CCC_NODE_LOCAL_EXPERIMENT_FLAG == \"off\" and .env.CCC_USAGE_BUDGET_TOKENS_CLAUDE == \"5000000\"" "$env_claude/settings.json" >/dev/null'
 ok "template-declared env keys stay repo-owned (node override dropped)" \
   '[ "$(jq -r ".env.BASH_MAX_TIMEOUT_MS" "$env_claude/settings.json")" = "$(jq -r ".env.BASH_MAX_TIMEOUT_MS" "$ROOT/claude/settings.base.json")" ]'
-ok "env preservation is logged with the key names" 'grep -q "preserved node-local settings env keys: .*CCC_HONCHO_MEMORY_ENABLED" <<<"$out"'
+ok "env preservation is logged with the key names" 'grep -q "preserved node-local settings env keys: .*CCC_NODE_LOCAL_EXPERIMENT_FLAG" <<<"$out"'
 out="$(HOME="$env_home" CCC_CLAUDE_DIR="$env_claude" CCC_HERMES_DIR="$env_hermes" bash "$SETUP" --no-backup --dry-run 2>&1)"
 ok "dry-run only announces env preservation" 'grep -q "\[dry-run\] preserve node-local settings env keys" <<<"$out"'
+# --- #1436: the retired Honcho credential is never resurrected by setup ------
+# Two full setup runs above would have re-seeded hermes/honcho.template.json
+# on the old behavior; the disposal (slice 5) must stick.
+ok "setup does not resurrect the retired honcho.json credential (#1436)" \
+  '[ ! -e "$env_hermes/honcho.json" ]'
 # --- #1403: the self-update agent-cron task is registered only where the
 # ccc-agent-cron timer exists. The fixture systemctl stub above exits 0 for
 # every verb, i.e. "timer enabled", which is why the registration test passes.
@@ -703,7 +708,7 @@ ok "setup failure after the Codex policy step exits non-zero" '[ "$rc" != 0 ]'
 ok "rollback restores a pre-existing Codex config.toml byte-for-byte (#1131)" \
   '[ "$(sha256sum "$codex_txn_codex/config.toml")" = "$codex_txn_cfg_before" ]'
 ok "rollback report names the Codex policy config in the restored scope (#1131)" \
-  'grep -Fq "restored previous installed artifacts (Claude harness, honcho.json, Codex GitHub policy config)" <<<"$out"'
+  'grep -Fq "restored previous installed artifacts (Claude harness, Codex GitHub policy config)" <<<"$out"'
 
 codex_new_codex="$TMP/codex-new-codex"
 out="$(HOME="$TMP/codex-new-home" PATH="$TMP/fail-skills-bin:$PATH" \
