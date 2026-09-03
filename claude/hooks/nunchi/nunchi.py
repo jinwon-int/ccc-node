@@ -691,13 +691,89 @@ def _expand_query(query):
     return words + extra
 
 
+_HALLWAY_EXPANSION_MAX = 4
+
+
+def _hallways_file():
+    """#1264 P2-6 — locate MemPalace's hallways.json without importing it.
+
+    Mempalace is an external uv tool, never vendored (#816); its file format
+    (a JSON list of {entity_a, entity_b, co_occurrence_count, ...} edges) is
+    the only coupling. Resolution order mirrors both sides: NUNCHI_HALLWAYS_FILE
+    (tests) beats CCC_NUNCHI_MEMPALACE_HOME (the scoped-home redirect _mp_search
+    honors), which beats the mempalace env chain and the ~/.mempalace/palace
+    default.
+    """
+    override = os.environ.get("NUNCHI_HALLWAYS_FILE")
+    if override:
+        return override
+    base = os.environ.get("CCC_NUNCHI_MEMPALACE_HOME")
+    if base:
+        return os.path.join(os.path.expanduser(base),
+                            ".mempalace", "palace", "hallways.json")
+    palace = (os.environ.get("MEMPALACE_PALACE_PATH")
+              or os.environ.get("MEMPAL_PALACE_PATH")
+              or os.path.expanduser("~/.mempalace/palace"))
+    return os.path.join(os.path.expanduser(palace), "hallways.json")
+
+
+def _hallway_expansions(query, max_terms=_HALLWAY_EXPANSION_MAX):
+    """#1264 P2-6 — associative 1-hop expansion via MemPalace hallways.
+
+    The measured gap (dungae bench): the auto-built entity association graph
+    existed but neither recall nor dialectic used it, so "similar past
+    incident" queries missed facts that share an entity with the query
+    rather than a keyword. A hallway fires when one of its endpoint
+    entities occurs in the query; the OTHER endpoint joins the FTS query as
+    an extra OR term. bm25 still ranks exact keyword matches first, so the
+    widening adds recall without burying precision.
+
+    Purely mechanical (substring match, no LLM, no subprocess). Silent []
+    on any failure — missing/malformed file degrades to today's behavior.
+    """
+    path = _hallways_file()
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            halls = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(halls, list):
+        return []
+    # Alias-aware haystack: 곽가 must reach the entity "gwakga", so the query
+    # is joined with its B3 canonical-slug projection before matching.
+    q = (str(query) + " " + " ".join(_expand_query(query))).lower()
+    hits = []
+    for h in halls:
+        if not isinstance(h, dict):
+            continue
+        a, b = h.get("entity_a"), h.get("entity_b")
+        if not a or not b:
+            continue
+        a_l, b_l = str(a).lower(), str(b).lower()
+        if a_l in q and b_l not in q:
+            hits.append((h.get("co_occurrence_count") or 0, str(b)))
+        elif b_l in q and a_l not in q:
+            hits.append((h.get("co_occurrence_count") or 0, str(a)))
+    hits.sort(key=lambda t: -t[0])
+    out = []
+    for _cnt, term in hits:
+        if term.lower() in q or term in out:
+            continue
+        out.append(term)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
 def search(c, query, target=None, limit=10, include_history=False):
     where = "f.valid_to IS NULL" if not include_history else "1=1"
     args = []
     if target:
         where += " AND f.observed = ?"
         args.append(target)
-    words = _expand_query(query)
+    words = _expand_query(query) + _hallway_expansions(query)
     q = " OR ".join(f'"{w}"' for w in words) or f'"{query}"'
     try:
         rows = c.execute(
