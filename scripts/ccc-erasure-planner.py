@@ -27,6 +27,12 @@ Requests (#873 §2):
   cache-rebuild                      derived caches/indexes only
   prune-expired                      expired retry/rollback artifacts
   fact-correction                    pointer: handled by nunchi annotate/supersede
+  scan --json                        inventory drift diagnostics (no request):
+                                     unknown files in managed state roots +
+                                     absent inventoried classes (#873 step 3)
+  scan --json                        inventory drift diagnostics (no request):
+                                     unknown files in managed state roots +
+                                     absent inventoried classes (#873 step 3)
 
 Exit codes: 0 plan (blockers allowed, they are reported), 2 usage, 3 unknown
 request type. Read-only is contractual — this script never writes, never
@@ -241,6 +247,47 @@ def plan(request: str, inventory: dict, audience: str | None,
     }
 
 
+def _run_scan(inventory: dict) -> dict:
+    """#873 step 3 — inventory drift/unknown diagnostics for the security
+    audit and doctor. Versioned, body-free, read-only."""
+    known_files, known_dirs, roots = _scan(inventory)
+    unknown = _unknown_blockers(inventory)
+    absent = []
+    for entry in inventory.get("artifacts", []):
+        resolved = resolve_entry(entry)
+        if not resolved or not (os.path.isdir(resolved)
+                                or os.path.isfile(resolved)):
+            absent.append({"artifact": entry["id"], "path": resolved})
+    return {
+        "schema": "ccc.memory-inventory-scan.v1",
+        "read_only": True,
+        "roots": roots,
+        "known_dirs": sorted(known_dirs),
+        "known_files_count": len(known_files),
+        "unknown": unknown,
+        "absent": absent,
+    }
+
+
+def _print_plan_human(doc: dict) -> None:
+    print(f"erasure plan — request={doc['request']} key={doc['key'] or '-'} "
+          f"(READ-ONLY, no mutation performed)")
+    for t in doc["targets"]:
+        est = t["estimate"]
+        state = "present" if t["present"] else "absent"
+        print(f"  - {t['artifact']}: {t['action']} [{state}] "
+              f"files={est['files']} bytes={est['bytes']}")
+        if t["path"]:
+            print(f"      {t['path']}")
+    for h in doc["external_handoff"]:
+        print(f"  - external handoff: {h['artifact']} (owner={h['owner']})")
+    for b in doc["blockers"]:
+        print(f"  ! blocker: {b['path']} — {b['reason']}")
+    if doc["blockers"]:
+        print(f"  {len(doc['blockers'])} blocker(s): an apply slice must stop "
+              "until these are classified.")
+
+
 def main(argv: list[str]) -> int:
     args = argv[1:]
     if "--help" in args or "-h" in args or not args:
@@ -255,17 +302,6 @@ def main(argv: list[str]) -> int:
         inventory_path = args[idx + 1]
         args = args[:idx] + args[idx + 2:]
     request = args[0] if args else ""
-    if request not in REQUESTS:
-        print(f"erasure-planner: unknown request '{request}' "
-              f"(known: {', '.join(REQUESTS)})", file=sys.stderr)
-        return 3
-    arg_name = REQUESTS[request]["arg"]
-    value = None
-    if arg_name:
-        if arg_name not in args:
-            print(f"erasure-planner: {request} requires {arg_name}", file=sys.stderr)
-            return 2
-        value = args[args.index(arg_name) + 1]
     try:
         with open(inventory_path, encoding="utf-8") as fh:
             inventory = json.load(fh)
@@ -277,28 +313,27 @@ def main(argv: list[str]) -> int:
         print(f"erasure-planner: inventory schema mismatch: "
               f"{inventory.get('schema')}", file=sys.stderr)
         return 2
+    if request == "scan":
+        print(json.dumps(_run_scan(inventory), ensure_ascii=False, indent=2))
+        return 0
+    if request not in REQUESTS:
+        print(f"erasure-planner: unknown request '{request}' "
+              f"(known: {', '.join(REQUESTS)}, scan)", file=sys.stderr)
+        return 3
+    arg_name = REQUESTS[request]["arg"]
+    value = None
+    if arg_name:
+        if arg_name not in args:
+            print(f"erasure-planner: {request} requires {arg_name}", file=sys.stderr)
+            return 2
+        value = args[args.index(arg_name) + 1]
     doc = plan(request, inventory,
                value if request == "audience-erasure" else None,
                value if request == "telegram-user-erasure" else None)
     if "--json" in args:
         print(json.dumps(doc, ensure_ascii=False, indent=2))
     else:
-        print(f"erasure plan — request={request} key={doc['key'] or '-'} "
-              f"(READ-ONLY, no mutation performed)")
-        for t in doc["targets"]:
-            est = t["estimate"]
-            state = "present" if t["present"] else "absent"
-            print(f"  - {t['artifact']}: {t['action']} [{state}] "
-                  f"files={est['files']} bytes={est['bytes']}")
-            if t["path"]:
-                print(f"      {t['path']}")
-        for h in doc["external_handoff"]:
-            print(f"  - external handoff: {h['artifact']} (owner={h['owner']})")
-        for b in doc["blockers"]:
-            print(f"  ! blocker: {b['path']} — {b['reason']}")
-        if doc["blockers"]:
-            print(f"  {len(doc['blockers'])} blocker(s): an apply slice must stop "
-                  "until these are classified.")
+        _print_plan_human(doc)
     return 0
 
 

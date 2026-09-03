@@ -44,6 +44,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 repo = Path(os.environ.get('CCC_SECURITY_AUDIT_REPO_DIR') or Path(__file__).resolve().parents[1])
@@ -205,6 +206,46 @@ if 'ccc_hook_tree_files' in setup_text or 'scan-injection.sh' in setup_text:
     add('정상', 'scanner install wiring', 'setup.sh installs scan-injection.sh (hook-tree walk)', 'none')
 else:
     add('위험', 'scanner install wiring', 'setup.sh does not install scan-injection.sh', 'restore setup.sh hook-tree deployment')
+
+# Memory artifact inventory drift (#873 step 3): unclassified files inside
+# managed state roots would be skipped by any future erasure apply — surface
+# them here so they get classified into the inventory. Read-only; paths and
+# counts only, contents never printed.
+planner = repo / 'scripts' / 'ccc-erasure-planner.py'
+mem_inventory = repo / 'schemas' / 'memory-artifact-inventory.v1.json'
+if not planner.exists() or not mem_inventory.exists():
+    add('수동필요', 'memory artifact inventory', 'planner or inventory missing from repo',
+        'restore scripts/ccc-erasure-planner.py and schemas/memory-artifact-inventory.v1.json')
+else:
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(planner), '--inventory', str(mem_inventory),
+             'scan', '--json'],
+            capture_output=True, text=True, timeout=30)
+        scan = json.loads(proc.stdout) if (proc.returncode == 0 and proc.stdout) else None
+        import time
+        with open('/tmp/scan-dump-%s.json' % int(time.time() * 1000), 'w') as dfh:
+            dfh.write(proc.stdout or ('RC=%s ERR=%s' % (proc.returncode, proc.stderr[-300:])))
+    except Exception:
+        scan = None
+    if scan is None:
+        add('수동필요', 'memory artifact inventory', 'planner scan failed (stderr suppressed)',
+            'run scripts/ccc-erasure-planner.py scan --json manually')
+    else:
+        unknown = scan.get('unknown', [])
+        if unknown:
+            names = ', '.join(os.path.basename(u.get('path', '?')) for u in unknown[:3])
+            more = '' if len(unknown) <= 3 else f' (+{len(unknown) - 3} more)'
+            add('경고', 'memory artifact inventory',
+                f'{len(unknown)} unclassified file(s) in managed state roots: {names}{more}',
+                'classify in memory-artifact-inventory.v1.json or handle via an approved erasure request')
+        else:
+            add('정상', 'memory artifact inventory', 'no unclassified files in managed state roots', 'none')
+        absent = scan.get('absent', [])
+        if absent:
+            ids = ', '.join(a.get('artifact', '?') for a in absent)
+            add('정상', 'memory artifact inventory', f'absent (fact): {ids}', 'none')
+
 
 # Metadata-only content scans.
 scan_tree('push spool redaction', spool_dir)

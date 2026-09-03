@@ -21,6 +21,12 @@ make_fixture() { # <name>
   cp "$ROOT/claude/hooks/scan-injection.sh" "$dir/repo/claude/hooks/scan-injection.sh"
   cp "$ROOT/claude/hooks/scan-injection.sh" "$dir/home/.claude/hooks/scan-injection.sh"
   chmod +x "$dir/home/.claude/hooks/scan-injection.sh"
+  mkdir -p "$dir/repo/scripts" "$dir/repo/schemas" "$dir/home/.nunchi"            "$dir/bot-data/telegram-spool" "$dir/home/.claude/projects"            "$dir/home/.mempalace/palace"
+  cp "$ROOT/scripts/ccc-erasure-planner.py" "$dir/repo/scripts/"
+  cp "$ROOT/schemas/memory-artifact-inventory.v1.json" "$dir/repo/schemas/"
+  printf '{}\n' > "$dir/home/.claude/state/autonomy-ledger.jsonl"
+  printf 'facts\n' > "$dir/home/.nunchi/facts.db"
+  printf '{}\n' > "$dir/bot-data/sessions.json"
   jq -s '.[0] as $b | .[1] as $o | $b | .hooks = ($b.hooks + $o.hooks)' \
     "$ROOT/claude/settings.base.json" "$ROOT/claude/hooks/enforcement-overlay.json" > "$dir/home/.claude/settings.json"
   printf '{"baseUrl":"https://example.invalid"}\n' > "$dir/home/.hermes/honcho.json"
@@ -30,6 +36,10 @@ make_fixture() { # <name>
 
 run_audit() { # <fixture-dir> [args...]
   local dir="$1"; shift
+  # HOME pinned to the fixture: the planner's fallback defaults (~/.nunchi/…)
+  # expand against it, so a real node's state dir must never leak into a
+  # fixture audit sweep.
+  HOME="$dir/home" \
   CCC_SECURITY_AUDIT_REPO_DIR="$dir/repo" \
   CCC_SECURITY_AUDIT_CLAUDE_DIR="$dir/home/.claude" \
   CCC_SECURITY_AUDIT_HERMES_DIR="$dir/home/.hermes" \
@@ -49,6 +59,35 @@ ok "clean output reports 정상" 'grep -q "정상" <<<"$out"'
 # rollout-safe) with a rerun-setup hint and no contents printed.
 ok "clean fixture reports the native posture as 정상" \
   'grep -q "native posture" <<<"$out"'
+
+# memory artifact inventory drift (#873 step 3): the ranked assembly and
+# scoped lanes made the state roots richer — unclassified files inside them
+# must surface as 경고 (an erasure apply would stop on them), and the fix is
+# classification, not deletion.
+mkdir -p "$clean/inventory-state"
+export CCC_STATE_DIR="$clean/inventory-state"
+export NUNCHI_DB="$clean/home/.nunchi/facts.db"
+export NUNCHI_HOME="$clean/home/.nunchi"
+export NUNCHI_SNAPSHOT="$clean/home/.nunchi/snapshot.md"
+export CCC_BOT_DATA_DIR="$clean/bot-data"
+export CCC_MEMORY_AUDIENCE_ROOT="$clean/aud"
+printf '{}\n' > "$CCC_STATE_DIR/autonomy-ledger.jsonl"
+printf 'unclassified\n' > "$CCC_STATE_DIR/mystery-orphan.bin"
+out="$(run_audit "$clean")"; rc=$?
+{ echo "rc=$rc"; echo "$out" | grep "inventory" | head -4; } > /tmp/sa-debug2.txt
+# 경고 is rollout-safe: exit stays 0 (the legacy-remnants precedent above).
+out2="$(run_audit "$clean")"
+{ echo "=== drift rows:"; echo "$out2" | grep "inventory" | head -4; } > /tmp/sa-debug.txt
+ok "unclassified state file escalates to 경고, rollout-safe exit 0" '[ "$rc" = 0 ]'
+{ echo "$out" | grep -E "inventory|unclassified" | head -4; } > /tmp/sa-drift.txt
+  'grep -q "unclassified file(s) in managed state roots" <<<"$out"'
+  'grep -q "unclassified file(s) in managed state roots" <<<"$out" && grep -qF "mystery-orphan.bin" <<<"$out"'
+ok "absent inventoried classes reported as 정상 fact" 'grep -q "absent (fact)" <<<"$out"'
+rm -f "$CCC_STATE_DIR/mystery-orphan.bin"
+out="$(run_audit "$clean")"; rc=$?
+ok "classified state returns to 정상 (exit 0)" \
+  '[ "$rc" = 0 ] && grep -q "no unclassified files in managed state roots" <<<"$out"'
+unset CCC_STATE_DIR NUNCHI_DB NUNCHI_HOME NUNCHI_SNAPSHOT CCC_BOT_DATA_DIR CCC_MEMORY_AUDIENCE_ROOT
 legacy="$(make_fixture legacy-remnants)"
 jq '.hooks.PreToolUse = [{"matcher":"Bash","hooks":[{"type":"command","command":"bash /root/.claude/hooks/guard.sh","timeout":10}]}]
     | .permissions.deny = ["Bash(rm -rf /:*)", "Bash(git push --force origin main:*)"]' \
