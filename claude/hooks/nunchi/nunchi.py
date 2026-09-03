@@ -1414,7 +1414,7 @@ def assemble(budget, hint, limit=25):
         " AND kind = 'constraint' ORDER BY id DESC").fetchall()
     for o, f in cons:
         lines.append(f"- [제약/{o}] {f}")
-    used = sum(len(l.encode()) + 1 for l in lines)
+    used = sum(len(ln.encode()) + 1 for ln in lines)
     hint = (hint or "").strip()
     hint_ids = []
     if hint:
@@ -1447,7 +1447,7 @@ def assemble(budget, hint, limit=25):
         if live_included:
             lines.append(
                 f"- ⟳ live-check {live_included}건 — 가변 운영 사실, 단정 전 실측(#1264 P1-4)")
-        lines.extend(l for l, _m in fact_lines)
+        lines.extend(ln for ln, _m in fact_lines)
     print("\n".join(lines))
 
 
