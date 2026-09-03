@@ -117,7 +117,6 @@ class SideEffectContractTest(unittest.TestCase):
             [item.operation for item in contract.operations],
             [
                 "telegram.send_text",
-                "honcho.deliver_distill",
                 "self_update.apply",
                 "agent_cron.spool_notify",
                 "external_wait.wake_resume",
@@ -126,7 +125,7 @@ class SideEffectContractTest(unittest.TestCase):
                 "telegram.terminal_cleanup",
             ],
         )
-        self.assertEqual(len(observations), 40)
+        self.assertEqual(len(observations), 35)
         by_op = {
             operation.operation: {
                 item.boundary: item for item in observations if item.operation == operation.operation
@@ -139,12 +138,6 @@ class SideEffectContractTest(unittest.TestCase):
         self.assertEqual(telegram_ambiguous.action.value, "manual-review")
         self.assertEqual(telegram_ambiguous.attempts, 1)
         self.assertFalse(telegram_ambiguous.ack_recorded)
-        honcho_dup = by_op["honcho.deliver_distill"][
-            CONTRACT.RecoveryBoundary.DUPLICATE_RESTART_REPLAY
-        ]
-        self.assertEqual(honcho_dup.action.value, "safe-replay")
-        self.assertEqual(honcho_dup.attempts, 2)
-        self.assertEqual(honcho_dup.unique_effects, 1)
         cron_ambiguous = by_op["agent_cron.spool_notify"][
             CONTRACT.RecoveryBoundary.AFTER_EXTERNAL_SUCCESS_BEFORE_ACK
         ]

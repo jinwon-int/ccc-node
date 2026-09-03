@@ -12,7 +12,7 @@ This document covers the Claude Code harness pieces installed by `setup.sh`: set
 | `claude/CLAUDE.md.template` | Operating-policy skeleton with placeholders for node/user identity. |
 | `claude/hooks/` | Memory loading, tool loading, guard/audit/redact/notify, distill, skill-review, statusline, evidence gate. |
 | `claude/output-styles/ccc-report.md` | Korean structured-reporting default. |
-| `hermes/` | Hermes-side templates for memory and Honcho config; real values stay node-local. |
+| `hermes/` | Hermes-side local config templates; real values stay node-local. |
 
 ## Standalone vs plugin mode
 
@@ -60,11 +60,11 @@ Switch interactively through Claude Code `/config` → Output style when needed.
 | Variable | Default | Purpose |
 |---|---|---|
 | `CCC_CLAUDE_DIR` | `$HOME/.claude` | Claude Code harness, hooks, memories, output styles, commands, skills |
-| `CCC_HERMES_DIR` | `$HOME/.hermes` | `honcho.json` and Hermes-side local config templates |
+| `CCC_HERMES_DIR` | `$HOME/.hermes` | Hermes-side local config templates |
 | `CCC_WIKI_AGENT_BIN` | `$HOME/.wiki-agent/bin/wiki-agent` | Printed checklist path for Family Wiki tooling |
 | `CCC_BRIDGE_DEFAULT_PATH` | `$HOME` | Suggested Telegram bridge workspace in setup output |
 | `CCC_STATE_DIR` | `$CCC_CLAUDE_DIR/state` | State files plus local `memory-index.sqlite` |
-| `CCC_MEMORY_CACHE_DIR` | `$CCC_CLAUDE_DIR/hooks/cache` | Wiki/Honcho cache and refresh metadata |
+| `CCC_MEMORY_CACHE_DIR` | `$CCC_CLAUDE_DIR/hooks/cache` | Wiki cache and refresh metadata |
 
 Example preview:
 

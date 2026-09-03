@@ -81,7 +81,6 @@ async def test_thread_a_fact_appears_once_in_isolated_thread_b_snapshot(
     assert json.loads(completed.stdout)["status"] in {"updated", "unchanged"}
     snapshot = (audience.codex_home / "AGENTS.md").read_text()
     assert snapshot.count(FACT) == 1
-    assert "Honcho disabled" in snapshot
     assert "Family Wiki disabled" in snapshot
 
 
@@ -109,8 +108,6 @@ async def test_piri_thread_a_fact_appears_in_next_audience_bootstrap(
     assert '"provider":"piri"' in local_facts
     settings = SimpleNamespace(
         claude_settings_path=tmp_path / "legacy" / ".claude" / "settings.json",
-        honcho_memory_enabled=False,
-        honcho_config_path=tmp_path / ".hermes" / "honcho.json",
     )
     environment = os.environ.copy()
     environment.update(audience.piri_environment(settings))

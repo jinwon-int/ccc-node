@@ -211,10 +211,6 @@ _CRUSH_STATUSES: Mapping[str, CapabilityStatus] = {
         "Local memory sink is not wired for crush.",
         "#926",
     ),
-    "memory_sink_honcho": _unsupported(
-        "Honcho sink is not wired for crush.",
-        "#926",
-    ),
     "memory_sink_wiki_candidate": _unsupported(
         "Wiki-candidate sink is not wired for crush.",
         "#926",
@@ -552,7 +548,7 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "memory_read_bootstrap",
         MEMORY_GROUP,
         "Memory: read bootstrap",
-        "The MEMORY/USER/local/Wiki/Honcho/resume startup snapshot is recognized "
+        "The MEMORY/USER/local/Wiki/resume startup snapshot is recognized "
         "at session start.",
         claude=_supported(
             "SessionStart injects the bounded local snapshot via "
@@ -605,8 +601,8 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "shutdown-queue triggers, extraction, and the local sink are scheduled. "
             "Provider/model/turn-byte/duration accounting and shared warn/enforce "
             "cost gates are body-free; Wiki candidates enter a local human-review "
-            "queue and Honcho facts use an owner-only retrying outbox. The extractor "
-            "factory defaults to the main Codex runtime and supports explicit override.",
+            "queue. The extractor factory defaults to the main Codex runtime and "
+            "supports explicit override.",
         ),
         piri=_supported(
             "Session-reset, explicit, checkpoint, and shutdown triggers enter the "
@@ -631,27 +627,6 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         piri=_supported(
             "Audience-routed Piri jobs use the same independently leased replay-safe "
             "local facts/resume sink while retaining provider=piri provenance."
-        ),
-    ),
-    _axis(
-        "memory_sink_honcho",
-        MEMORY_GROUP,
-        "Memory: Honcho sink",
-        "Redacted conclusions push to Honcho through a durable retry queue.",
-        claude=_supported(
-            "Redacted payloads push through the bridge distill honcho sink worker "
-            "using an owner-only durable outbox with independently leased retries."
-        ),
-        codex=_supported(
-            "Validated facts use an owner-only per-job outbox, stable idempotency "
-            "keys, independently leased retries, and body-free failures. "
-            "Audience-scoped jobs additionally use scope-partitioned outboxes and "
-            "physically distinct Honcho workspaces; unscoped jobs fail closed in "
-            "that mode."
-        ),
-        piri=_supported(
-            "Validated Piri facts use the same owner-only scope-partitioned Honcho "
-            "outbox, idempotency keys, retry leases, and distinct workspaces."
         ),
     ),
     _axis(

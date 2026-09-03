@@ -136,24 +136,6 @@ class MemoryAudience:
             "NUNCHI_SNAPSHOT": str(self.nunchi_home / "snapshot.md"),
             "CCC_NUNCHI_SHARED_HOME": str(self.shared_root / "nunchi"),
             "CCC_NUNCHI_MEMPALACE_HOME": str(self.mempalace_home),
-            # Honcho derives a distinct server-side workspace from this opaque
-            # scope. Private recall may additionally read the shared workspace
-            # and the private-only legacy workspace; public routes never do.
-            "CCC_HONCHO_MEMORY_ENABLED": (
-                "1" if getattr(settings, "honcho_memory_enabled", False) else "0"
-            ),
-            "CCC_HONCHO_AUDIENCE_SCOPED": "1",
-            "CCC_HONCHO_WORKSPACE_SCOPE": self.scope,
-            "CCC_HONCHO_SHARED_WORKSPACE_SCOPE": AUDIENCE_SHARED,
-            "CCC_HONCHO_CFG": str(
-                Path(
-                    getattr(
-                        settings,
-                        "honcho_config_path",
-                        Path.home() / ".hermes" / "honcho.json",
-                    )
-                ).expanduser()
-            ),
             # The pre-scope Wiki cache is private legacy input. A private DM may
             # read it and refresh a route-local cache; public routes remain off.
             "CCC_WIKI_MEMORY_ENABLED": "1" if private_wiki else "0",

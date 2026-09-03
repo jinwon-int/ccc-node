@@ -285,15 +285,15 @@ def cmd_merge_local_hot(argv):
 
 def cmd_dynamic_budget(argv):
     """argv: <total> <reserve> <maxlocal> <bytes-per-result> <base-limit>
-    <max-limit> <mem-size> <resume-size> <wiki-size> <honcho-size>.
+    <max-limit> <mem-size> <resume-size> <wiki-size>.
 
     Relevance-aware budget arithmetic (see load-memory.sh): alloc = byte budget
     for the local hot block (>= maxlocal, reclaiming slack up to the total minus
     the scaffold reserve); the second number = how many results to fetch to fill
     it (~bpr bytes/result, clamped to [base, maxlim]). Prints "alloc limit".
     """
-    total, reserve, maxlocal, bpr, base, maxlim, m, r, w, h = (int(x) for x in argv)
-    alloc = max(maxlocal, total - reserve - m - r - w - h)
+    total, reserve, maxlocal, bpr, base, maxlim, m, r, w = (int(x) for x in argv)
+    alloc = max(maxlocal, total - reserve - m - r - w)
     print(alloc, max(base, min(maxlim, alloc // bpr)))
 
 

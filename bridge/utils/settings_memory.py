@@ -31,20 +31,6 @@ class MemorySettingsMixin:
         alias="CCC_WIKI_MEMORY_ENABLED",
         description="Family Wiki memory source/sink toggle; external profile always overrides off.",
     )
-    honcho_memory_enabled: bool = Field(
-        # Honcho was retired fleet-wide on 2026-09-01 (TM-2029 phase 3; server
-        # stopped, 12 nodes flagged off). The per-node settings.json flag did not
-        # survive the next harness re-render (#1402), so the retirement lives
-        # here as the default. Set CCC_HONCHO_MEMORY_ENABLED=1 to opt back in.
-        default=False,
-        alias="CCC_HONCHO_MEMORY_ENABLED",
-        description="Honcho read/write memory toggle (default off since the 2026-09-01 retirement).",
-    )
-    honcho_config_path: Path = Field(
-        default_factory=lambda: Path.home() / ".hermes" / "honcho.json",
-        alias="CCC_HONCHO_CFG",
-        description="Owner-only node-local Honcho endpoint/credential config.",
-    )
     codex_skill_collector_enabled: bool = Field(
         default=True,
         alias="CCC_CODEX_SKILL_COLLECTOR",
@@ -289,7 +275,6 @@ class MemorySettingsMixin:
             "CCC_WIKI_MEMORY_ENABLED": (
                 "0" if profile == "external" else ("1" if self.wiki_memory_enabled else "0")
             ),
-            "CCC_HONCHO_MEMORY_ENABLED": "1" if self.honcho_memory_enabled else "0",
             "CCC_MEMORY_USER_LABEL": self.memory_user_label,
             "CCC_MEMORY_ASSISTANT_LABEL": self.memory_assistant_label,
             # The bridge settings loader does not mutate os.environ. Export the

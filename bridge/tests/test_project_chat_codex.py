@@ -300,8 +300,6 @@ async def test_project_chat_binds_opaque_claude_audiences_at_request_time(
     settings.bridge_memory_audience_root = None
     settings.bridge_memory_audience_key_path = None
     settings.bridge_unsafe_shared_all_memory = False
-    settings.honcho_memory_enabled = True
-    settings.honcho_config_path = tmp_path / ".hermes" / "honcho.json"
     settings.hook_policy_environment = lambda: {
         "CCC_NODE_ISOLATION_PROFILE": "external"
     }
@@ -337,8 +335,6 @@ async def test_project_chat_binds_opaque_piri_audiences_at_request_time(
     settings.bridge_memory_audience_root = None
     settings.bridge_memory_audience_key_path = None
     settings.bridge_unsafe_shared_all_memory = False
-    settings.honcho_memory_enabled = True
-    settings.honcho_config_path = tmp_path / ".hermes" / "honcho.json"
     runtime = FakeRuntime()
     handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
     handler._task_ledger_cache = False

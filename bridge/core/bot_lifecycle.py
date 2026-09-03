@@ -155,10 +155,6 @@ class _DistillWikiSinkWorker(Protocol):
     async def write_once(self, *, job_id: str) -> DistillJob: ...
 
 
-class _DistillHonchoSinkWorker(Protocol):
-    async def write_once(self, *, job_id: str) -> DistillJob: ...
-
-
 class _SkillCandidateCollectorWorker(Protocol):
     def should_collect(self, *, job_id: str) -> bool: ...
 
@@ -228,7 +224,6 @@ class BotLifecycleMixin:
     _distill_extraction_worker: _DistillExtractionWorker
     _distill_local_sink_worker: _DistillLocalSinkWorker
     _distill_wiki_sink_worker: _DistillWikiSinkWorker
-    _distill_honcho_sink_worker: _DistillHonchoSinkWorker
     _skill_candidate_collector_worker: _SkillCandidateCollectorWorker
     _push_notifier: _LifecyclePushNotifier
     _clock: _LifecycleClock
@@ -808,7 +803,6 @@ class BotLifecycleMixin:
             distill_extraction_task = None
             distill_local_sink_task = None
             distill_wiki_sink_task = None
-            distill_honcho_sink_task = None
             skill_candidate_collector_task = None
             health_alerts_task = None
             session_resource_guard_task = None
@@ -937,15 +931,6 @@ class BotLifecycleMixin:
                         self._distill_wiki_sink_loop(stop_event),
                         name="distill-wiki-sink",
                     )
-                distill_honcho_sink_task = None
-                if (
-                    self._distill_honcho_sink_worker is not None
-                    and self._distill_journal is not None
-                ):
-                    distill_honcho_sink_task = asyncio.create_task(
-                        self._distill_honcho_sink_loop(stop_event),
-                        name="distill-honcho-sink",
-                    )
                 if (
                     self._skill_candidate_collector_worker is not None
                     and self._distill_journal is not None
@@ -1048,7 +1033,6 @@ class BotLifecycleMixin:
                     distill_extraction_task,
                     distill_local_sink_task,
                     distill_wiki_sink_task,
-                    distill_honcho_sink_task,
                     skill_candidate_collector_task,
                 ):
                     if _task and not _task.done():
@@ -1991,37 +1975,6 @@ class BotLifecycleMixin:
                 logger.warning(
                     "Skill-candidate collector sweep failed; continuing",
                     exc_info=True,
-                )
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            except (TimeoutError, asyncio.TimeoutError):
-                continue
-
-    async def _distill_honcho_sink_loop(self, stop_event: asyncio.Event) -> None:
-        """Drive independently leased Honcho delivery from the durable outbox."""
-
-        from telegram_bot.memory.distill_types import DistillHonchoSinkStatus
-
-        worker = self._distill_honcho_sink_worker
-        interval = float(
-            getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
-        )
-        while not stop_event.is_set():
-            try:
-                for job in await self._distill_sweep_jobs(interval):
-                    if stop_event.is_set():
-                        break
-                    if job.honcho_sink_status not in (
-                        DistillHonchoSinkStatus.PENDING,
-                        DistillHonchoSinkStatus.RETRYABLE_FAILED,
-                    ):
-                        continue
-                    await worker.write_once(job_id=job.job_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Distill Honcho-sink sweep failed; continuing", exc_info=True
                 )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval)

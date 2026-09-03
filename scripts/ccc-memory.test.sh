@@ -29,15 +29,10 @@ chmod 700 "$state"
 printf 'test-node\n' > "$state/node.txt"
 printf 'allowed operation policy\n' > "$mem/MEMORY.md"
 printf 'user likes concise Korean reports\n' > "$mem/USER.md"
-printf 'wiki cache contains Honcho hybrid memory profile\n' > "$cache/wiki.txt"
-printf 'honcho cache contains practical evidence reports\n' > "$cache/honcho.txt"
+printf 'wiki cache contains practical evidence reports\n' > "$cache/wiki.txt"
 
-# Honcho defaults to OFF since the 2026-09-01 retirement: with the toggle unset
-# the check must report the source as disabled even when a cache file exists.
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
-ok "memory check default reports honcho disabled, wiki ok" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"ok\" and .honcho.status == \"disabled\"" >/dev/null <<<"$out"'
-out="$(CCC_HONCHO_MEMORY_ENABLED=1 CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
-ok "memory check json succeeds" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"ok\" and .honcho.status == \"ok\"" >/dev/null <<<"$out"'
+ok "memory check default reports wiki ok without the retired honcho source" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"ok\" and (.honcho | not)" >/dev/null <<<"$out"'
 ok "memory check reports inactive new stack without reading bodies" 'jq -e ".nunchi.status == \"off\" and .mempalace.status == \"off\"" >/dev/null <<<"$out"'
 
 # Body-free nunchi + MemPalace readiness projection (#827).
@@ -475,9 +470,9 @@ ok "memory check reports a missing write-back queue without creating it" '[ "$rc
     status:"missing", jobs:0, pending_jobs:0, invalid_records:0,
     record_bytes:0, snapshot_bytes:0,
     oldest_age_seconds:-1, oldest_pending_age_seconds:-1,
-    retries:{snapshot:0, extraction:0, local:0, wiki:0, honcho:0, total:0},
+    retries:{snapshot:0, extraction:0, local:0, wiki:0, total:0},
     accounting:{accounted_attempts:0, turn_bytes:0, duration_ms:0, estimated_max_tokens:0, model_counts:{}},
-    status_counts:{}, local_status_counts:{}, wiki_status_counts:{}, honcho_status_counts:{}
+    status_counts:{}, local_status_counts:{}, wiki_status_counts:{}
   }'\'' >/dev/null <<<"$out" && [ ! -e "$missing_journal" ]'
 
 empty_journal="$TMP/empty-distill-journal"
@@ -521,12 +516,11 @@ ok "memory check aggregates active and degraded write-back state" '[ "$rc" = 0 ]
   and .writeback_queue.snapshot_bytes == 620
   and .writeback_queue.oldest_age_seconds == 120
   and .writeback_queue.oldest_pending_age_seconds == 120
-  and .writeback_queue.retries == {snapshot:4, extraction:4, local:5, wiki:0, honcho:0, total:13}
+  and .writeback_queue.retries == {snapshot:4, extraction:4, local:5, wiki:0, total:13}
   and .writeback_queue.accounting == {accounted_attempts:3, turn_bytes:800, duration_ms:3750, estimated_max_tokens:225000, model_counts:{"gpt-5-mini":3}}
   and .writeback_queue.status_counts == {queued:1, extraction_done:2}
   and .writeback_queue.local_status_counts == {done:1, retryable_failed:1}
   and .writeback_queue.wiki_status_counts == {}
-  and .writeback_queue.honcho_status_counts == {}
 '\'' >/dev/null <<<"$out"'
 ok "memory check write-back JSON never exposes journal bodies or identities" '! grep -q "$secret_thread\|$secret_message\|$secret_output\|private-deadbeef\|private-feedface" <<<"$out"'
 text_out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" text 2>&1)"; rc=$?
@@ -559,7 +553,7 @@ ok "memory check batched pass aggregates an all-valid multi-file queue" '[ "$rc"
   and .writeback_queue.invalid_records == 0
   and .writeback_queue.snapshot_bytes == 620
   and .writeback_queue.oldest_age_seconds == 120
-  and .writeback_queue.retries == {snapshot:4, extraction:4, local:5, wiki:0, honcho:0, total:13}
+  and .writeback_queue.retries == {snapshot:4, extraction:4, local:5, wiki:0, total:13}
   and .writeback_queue.accounting.accounted_attempts == 3
   and .writeback_queue.status_counts == {queued:1, extraction_done:2}
   and .writeback_queue.local_status_counts == {done:1, retryable_failed:1}
@@ -572,9 +566,6 @@ ok "memory check exposes body-free ready Codex snapshot diagnostics" '[ "$rc" = 
 rm -rf "$codex_home"
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CODEX_HOME="$codex_home" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check reports a missing Codex snapshot without creating CODEX_HOME" '[ "$rc" = 0 ] && jq -e '\''.codex.status == "missing"'\'' >/dev/null <<<"$out" && [ ! -e "$codex_home" ]'
-
-out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HONCHO_MEMORY_ENABLED=FALSE bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
-ok "memory check treats uppercase FALSE as disabled" '[ "$rc" = 0 ] && jq -e ".honcho.status == \"disabled\"" >/dev/null <<<"$out"'
 
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "external isolation overrides an explicit Wiki enable in diagnostics" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"disabled\"" >/dev/null <<<"$out"'
@@ -616,7 +607,7 @@ printf '%s\n' '{"honcho":[{"text":"STALE_VALID_HONCHO_KEEP"}],"wiki_candidates":
 CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DISTILL=1 bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
 out="$(CCC_STATE_DIR="$state" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-search.sh" 'STALE_VALID_WIKI_DROP' 2>&1)"; rc=$?
 ok "external search immediately hides stale valid distill-history rows" '[ "$rc" = 0 ] && jq -e "(.results | length) == 0" >/dev/null <<<"$out"'
-out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY='STALE_VALID_WIKI_DROP' CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY='STALE_VALID_WIKI_DROP' CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "external SessionStart immediately hides stale valid distill-history rows" '[ "$rc" = 0 ] && ! grep -q "STALE_VALID_WIKI_DROP\|stale-valid.json" <<<"$out"'
 printf '%s\n' '{"wiki_candidates":[{"summary":"MALFORMED_HISTORY_WIKI_DROP"}]' > "$state/distill-history/malformed.json"
 CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DISTILL=1 CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-index.sh" update >/dev/null 2>&1
@@ -653,7 +644,7 @@ finally:
 PY
 )"
 ok "wiki-disabled index update reports effective policy" '[ "$rc" = 0 ] && jq -e ".wiki_enabled == false" >/dev/null <<<"$out"'
-ok "wiki-disabled index removes stale Wiki rows but keeps Honcho" '! grep -q "/wiki.txt$" <<<"$indexed_paths" && grep -q "/honcho.txt$" <<<"$indexed_paths"'
+ok "wiki-disabled index removes stale Wiki rows" '! grep -q "/wiki.txt$" <<<"$indexed_paths" && grep -q "/MEMORY.md$" <<<"$indexed_paths"'
 printf '%s\n' '{"honcho":[{"text":"HONCHO_DISTILL_KEEP"}],"wiki_candidates":[{"summary":"WIKI_DISTILL_DROP"}]}' > "$state/distill-last.json"
 printf 'WIKI_QUEUE_DROP\n' > "$state/wiki-candidates.md"
 mkdir -p "$state/distill-history"
@@ -700,10 +691,10 @@ ok "memory index rebuild scrubs old raw db bytes" '[ "$rc" = 0 ] && [ "$old_mark
 
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_DISABLE_FTS5=1 bash "$ROOT/scripts/ccc-memory-index.sh" rebuild 2>&1)"; rc=$?
 ok "memory index degrades to docs-only when FTS5 is disabled" '[ "$rc" = 0 ] && jq -e ".ok == true and .fts5_enabled == false" >/dev/null <<<"$out"'
-out="$(CCC_STATE_DIR="$state" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" Honcho 2>&1)"; rc=$?
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" 'concise Korean reports' 2>&1)"; rc=$?
 ok "memory search LIKE fallback works when FTS5 is unavailable" '[ "$rc" = 0 ] && jq -e ".results | length > 0" >/dev/null <<<"$out"'
 
-out="$(CCC_STATE_DIR="$state" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" Honcho 2>&1)"; rc=$?
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" 'practical evidence reports' 2>&1)"; rc=$?
 ok "memory search finds cache docs" '[ "$rc" = 0 ] && jq -e ".results | length > 0" >/dev/null <<<"$out"'
 
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_PROFILE=hybrid CCC_LOCAL_MEMORY_ENABLED=1 CCC_MEMORY_QUERY=Honcho bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
@@ -1311,7 +1302,7 @@ for cmd in bash cat python3 jq date wc hostname dirname; do
   ln -s "$(command -v "$cmd")" "$no_setsid_bin/$cmd"
 done
 rm -f "$gr_fifo"; mkfifo "$gr_fifo"
-gr_run PATH="$no_setsid_bin" CCC_LOCAL_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=0
+gr_run PATH="$no_setsid_bin" CCC_LOCAL_MEMORY_ENABLED=0
 if read -t 5 _l <>"$gr_fifo"; then gr_no_setsid=fired; else gr_no_setsid=silent; fi
 ok "load-memory refresh falls back when setsid is unavailable" '[ "$gr_no_setsid" = fired ]'
 
