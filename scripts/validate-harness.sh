@@ -395,6 +395,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          claude/hooks/distill/local-facts.test.sh claude/hooks/memory-hooks.test.sh \
          claude/hooks/refresh-memory-freshness.test.sh \
          claude/hooks/nunchi/nunchi.test.sh claude/hooks/nunchi/bench.test.sh \
+         claude/hooks/nunchi/assemble-fixtures.test.sh \
          claude/hooks/nunchi/sessionstart.test.sh \
          claude/hooks/nunchi/judge-batch.test.sh \
          claude/hooks/nunchi/bridge-journal.test.sh claude/hooks/nunchi/codex-feed.test.sh \
