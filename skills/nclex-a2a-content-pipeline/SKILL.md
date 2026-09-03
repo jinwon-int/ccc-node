@@ -94,8 +94,8 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
    + intentContract(요청서 intentHash) + currentTargets(전체 케이스 객체) +
    structuredEvidence + evidenceExcerpts(원문 인용) + machineGate +
    terminologyReview(서명 태스크 참조) + exactHeadTextIntegrity(파일 sha256).
-3. 라우팅: reviewer가 T2면 manifest를 gwakga로 scp → gwakga에서 CLI 실행,
-   T1이면 로컬 실행. 레인별 reviewer는 서로 다르고 저자 제척·keyring 등록 필수.
+3. 라우팅: reviewer가 T2면 manifest를 브로커 호스트로 scp → 브로커 호스트에서
+   CLI 실행, T1이면 로컬 실행. 레인별 reviewer는 서로 다르고 저자 제척·keyring 등록 필수.
 4. 핸들러 크래시(`handler_exit_nonzero`)는 판정이 아니다 — 동일 packet 재시도 1회,
    반복 시 다른 신뢰 워커로 재라우팅. 워커가 클레임을 안 하면 워커 노드에서
    `a2a-hermes-worker` 저널 확인(취소 태스크 zombie heartbeat면 서비스 재시작 —
