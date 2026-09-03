@@ -66,18 +66,6 @@ def build_curated_memory_settings(
                         },
                         {
                             "type": "command",
-                            "command": (
-                                "CLAUDE_DISTILL_INFLIGHT=1 "
-                                + _command(
-                                    hook_dir,
-                                    "distill/queue-drain.sh",
-                                    background=True,
-                                )
-                            ),
-                            "timeout": 5,
-                        },
-                        {
-                            "type": "command",
                             "command": _command(
                                 hook_dir,
                                 "distill/pending-drain.sh",

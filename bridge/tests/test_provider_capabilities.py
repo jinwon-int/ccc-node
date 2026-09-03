@@ -203,8 +203,8 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
                 "claude/hooks/distill/local-facts.sh",
             ),
             "memory_sink_honcho": (
-                "claude/hooks/distill/honcho-push.sh",
-                "claude/hooks/distill/queue-drain.sh",
+                "bridge/memory/distill_honcho_worker.py",
+                "bridge/__main__.py",
             ),
             "memory_sink_wiki_candidate": ("claude/hooks/distill/wiki-queue.sh",),
         }

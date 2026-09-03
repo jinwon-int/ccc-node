@@ -133,7 +133,6 @@ Documented hand-installed markers (`CRON_KNOWN_UNMANAGED_MARKERS`):
 |---|---|---|
 | `# ccc-node:self-update` | `ccc-self-update.sh run` (docs/self-update.md) | every node |
 | `# ccc-node:live-backups-rotate` | `ccc-live-backups-rotate.sh` | every node |
-| `# ccc-node:honcho-staleness-canary` | `honcho-peer-staleness-canary.sh` | opt-in |
 | `# ccc-node:skill-promotion-collect` | `ccc-skill-promotion.py collect` nightly | hub (seoseo) |
 | `# ccc-node:skill-promotion-drop-report` | `ccc-skill-promotion.py drop-report` weekly | hub (seoseo) |
 | `# ccc-node:gate-sim` | `skill-review/gate-sim.sh` nightly simulation | opt-in |

@@ -28,7 +28,6 @@ DISTILL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" 
 wiki_memory_disabled() {
   [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ] || is_disabled "${CCC_WIKI_MEMORY_ENABLED:-1}"
 }
-honcho_memory_disabled() { is_disabled "${CCC_HONCHO_MEMORY_ENABLED:-0}"; }
 
 # ---- recursion guard (FIRST line of executable logic) ----------------------
 if [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ]; then
@@ -162,12 +161,6 @@ run_bg_pipeline() {
   python3 "$HOOKDIR/distill/local-memory-commit.py" --mode both < "$STASH" >> "$LOG" 2>&1 || \
     log "local-memory-commit non-zero"
 
-  if honcho_memory_disabled; then
-    log "honcho-push skipped reason=disabled"
-  else
-    bash "$HOOKDIR/distill/honcho-push.sh" < "$STASH" >> "$LOG" 2>&1 || \
-      log "honcho-push non-zero (queued for retry)"
-  fi
   if wiki_memory_disabled; then
     log "wiki-queue skipped reason=disabled"
   else

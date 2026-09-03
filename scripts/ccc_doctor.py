@@ -134,7 +134,6 @@ CRON_AUX_MARKERS = (
 CRON_KNOWN_UNMANAGED_MARKERS = (
     "# ccc-node:self-update",
     "# ccc-node:live-backups-rotate",
-    "# ccc-node:honcho-staleness-canary",
     # Documented hand-installed lanes that the 2026-09-02 fleet sweep still
     # flagged after #1079 landed (docs/doctor.md "hand-installed markers"):
     # the skill-promotion nightly collect / weekly drop-report (seoseo, hub

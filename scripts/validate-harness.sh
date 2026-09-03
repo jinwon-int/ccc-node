@@ -187,7 +187,6 @@ SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh claude/hooks/lifecycle-fe
           claude/hooks/observability.test.sh scripts/validate-harness.sh \
           scripts/bridge-watchdog.sh scripts/bridge-watchdog.test.sh \
           scripts/resource-pressure-guard.sh scripts/resource-pressure-guard.test.sh \
-          scripts/honcho-peer-staleness-canary.sh scripts/honcho-peer-staleness-canary.test.sh \
           scripts/git-hooks/managed-checkout-guard scripts/managed-checkout-guard.test.sh \
           skills/nclex-a2a-content-pipeline/watch-task.sh)
 if command -v shellcheck >/dev/null 2>&1; then
@@ -392,8 +391,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          claude/hooks/lib/test-stub.test.sh \
          claude/hooks/lib/hook-common.test.sh \
          claude/hooks/statusline.test.sh \
-         claude/hooks/distill/extract.test.sh claude/hooks/distill/honcho-push.test.sh \
-         claude/hooks/distill/queue-drain.test.sh claude/hooks/distill/pending-drain.test.sh claude/hooks/distill/wiki-queue.test.sh \
+         claude/hooks/distill/extract.test.sh claude/hooks/distill/pending-drain.test.sh claude/hooks/distill/wiki-queue.test.sh \
          claude/hooks/distill/local-facts.test.sh claude/hooks/memory-hooks.test.sh \
          claude/hooks/refresh-memory-freshness.test.sh \
          claude/hooks/nunchi/nunchi.test.sh claude/hooks/nunchi/bench.test.sh \
@@ -408,7 +406,6 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/agent-cron.test.sh scripts/agent-cron-lib.test.sh scripts/a2a-termux-native-worker.test.sh \
          scripts/a2a-termux-native-worker-health.test.sh \
          scripts/resource-pressure-guard.test.sh \
-         scripts/honcho-peer-staleness-canary.test.sh \
          scripts/install-memory-refresh-cron.test.sh scripts/install-nunchi.test.sh scripts/auto-distill.test.sh scripts/install-termux-mempalace.test.sh scripts/ccc-skill-autosave.test.sh \
          scripts/codex-rollout-normalize.test.sh \
          scripts/cost-ledger.test.sh \
