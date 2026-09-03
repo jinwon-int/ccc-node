@@ -225,13 +225,7 @@ begin_install_transaction() {
   mkdir -p "$parent"
   SETUP_TXN_DIR="$(mktemp -d "$parent/.ccc-node-setup-rollback.XXXXXX")"
   snapshot_paths "$CLAUDE_DIR" "$SETUP_TXN_DIR/claude.tar.gz" "${CCC_MANAGED_PATHS[@]}"
-  if [ -e "$HERMES_ROOT/honcho.json" ] || [ -L "$HERMES_ROOT/honcho.json" ]; then
-    tar -czf "$SETUP_TXN_DIR/hermes.tar.gz" -C "$HERMES_ROOT" honcho.json
-  else
-    tar -czf "$SETUP_TXN_DIR/hermes.tar.gz" --files-from /dev/null
-  fi
   tar -tzf "$SETUP_TXN_DIR/claude.tar.gz" >/dev/null
-  tar -tzf "$SETUP_TXN_DIR/hermes.tar.gz" >/dev/null
   ccc_snapshot_codex_policy_state "$CODEX_DIR" "$SETUP_TXN_DIR"
   SETUP_TXN_ACTIVE=1
 }
@@ -242,11 +236,9 @@ rollback_install_transaction() {
   for item in "${CCC_MANAGED_PATHS[@]}"; do rm -rf -- "$CLAUDE_DIR/$item" || failed=1; done
   mkdir -p "$CLAUDE_DIR" "$HERMES_ROOT" || failed=1
   tar -xzf "$SETUP_TXN_DIR/claude.tar.gz" -C "$CLAUDE_DIR" || failed=1
-  rm -f -- "$HERMES_ROOT/honcho.json" || failed=1
-  tar -xzf "$SETUP_TXN_DIR/hermes.tar.gz" -C "$HERMES_ROOT" || failed=1
   ccc_restore_codex_policy_state "$CODEX_DIR" "$SETUP_TXN_DIR" || failed=1
   if [ "$failed" = 0 ]; then
-    echo "ERROR: setup failed; restored previous installed artifacts (Claude harness, honcho.json, Codex GitHub policy config)" >&2
+    echo "ERROR: setup failed; restored previous installed artifacts (Claude harness, Codex GitHub policy config)" >&2
   else
     echo "ERROR: setup failed and artifact rollback was degraded; inspect $SETUP_TXN_DIR" >&2
     return 1
@@ -948,9 +940,9 @@ seed "$SRC/claude/hooks/tools-cheatsheet.md"      "$CLAUDE_DIR/hooks/tools-cheat
 # load-memory.sh reads here first, falling back to ~/.hermes/memories only if absent.
 seed "$SRC/hermes/memories/MEMORY.template.md"    "$MEM_DIR/MEMORY.md"
 seed "$SRC/hermes/memories/USER.template.md"      "$MEM_DIR/USER.md"
-# honcho.json stays node-local under ~/.hermes (documentation/Hermes-side; not a hard CC dep).
-seed "$SRC/hermes/honcho.template.json"           "$HERMES_ROOT/honcho.json"
-
+# honcho.json is NO LONGER seeded: Honcho was retired fleet-wide on 2026-09-01
+# (TM-2029 phase 3) and slice 5 of #1436 disposed every node-local credential.
+# Re-seeding a template here would resurrect a credential-shaped file (#1436).
 # 2b) Canonical-path rewrite — the settings/hook/skill/command templates use
 # /root/.claude as the canonical harness path and /opt/ccc-node as the canonical
 # repo checkout. On nodes where either differs (e.g. Termux HOME, or a
@@ -1051,27 +1043,18 @@ PY
 apply_node_identity
 
 # 3c) Placeholder-residue warning — a config left with unresolved <TOKEN> placeholders
-# silently breaks fail-open consumers. Worst case is honcho.json: refresh-memory.sh /
-# distill read baseUrl, treat the placeholder as a value, fail with curl errors, and the
-# memory pipeline goes dark with NO alert. This happened fleet-wide on 2026-07-08 when a
-# retirement sweep removed ~/.hermes and this seed step quietly reinstated the template
-# on 3 nodes (seoyoon-family-wiki LOG-1579). Warn loudly so the operator fills values now.
+# silently breaks fail-open consumers. Warn loudly so the operator fills values now.
+# (The honcho.json check this banner originally existed for retired with #1436 —
+# the template is no longer seeded and disposed credentials are not resurrected.)
 warn_placeholder_residue() {
-  local f residue found=0 honcho_checked=0
-  # honcho.json is checked even when it was NOT freshly seeded this run — an old
-  # placeholder left from a previous run is just as fatal to the memory pipeline.
-  for f in "$HERMES_ROOT/honcho.json" ${SEEDED[@]+"${SEEDED[@]}"}; do
+  local f residue found=0
+  for f in ${SEEDED[@]+"${SEEDED[@]}"}; do
     [ -f "$f" ] || continue
     case "$(basename "$f")" in
       # Documentation ships literal <NODE>/<USER_PEER>/<PLACEHOLDER> as
-      # examples; flagging it on every fresh install buried the honcho.json
-      # warning this banner exists for.
+      # examples; flagging it on every fresh install buried the signal.
       tools-cheatsheet.md) continue ;;
     esac
-    if [ "$f" = "$HERMES_ROOT/honcho.json" ]; then          # dedupe when freshly seeded
-      [ "$honcho_checked" = 1 ] && continue
-      honcho_checked=1
-    fi
     residue="$(grep -hoE '<[A-Z][A-Z0-9_]+>' "$f" 2>/dev/null | sort -u | tr '\n' ' ' || true)"
     [ -n "${residue// /}" ] || continue
     if [ "$found" = 0 ]; then
@@ -1082,12 +1065,8 @@ warn_placeholder_residue() {
   done
   if [ "$found" = 1 ]; then
     cat <<'WEOF'
-    A placeholder baseUrl in honcho.json DISABLES the Honcho memory pipeline
-    silently (refresh/distill are fail-open — they log an error and move on).
-    Fill in real values before relying on memory recall on this node.
-    If this node had a working config that a cleanup/retirement sweep moved away,
-    look for it under backup/quarantine dirs (e.g. /root/hermes-retired-*/root.hermes/)
-    and restore it instead of re-filling by hand.
+    Unresolved <PLACEHOLDER> values in seeded configs break their fail-open
+    consumers silently. Fill in real values before relying on those paths.
 WEOF
   fi
 }
@@ -1213,23 +1192,22 @@ cat <<'EOF'
                                          (Pass --node/--display/--slot/--user-* to setup.sh to pre-fill these.)
   2. Edit ~/.claude/memories/MEMORY.md — node-specific durable facts (NO raw secrets).
   3. Edit ~/.claude/memories/USER.md   — who you work for + preferences.
-  4. Edit $HERMES_ROOT/honcho.json        — set baseUrl / peerName / target (this is node-local; gitignored).
-  5. Install wiki-agent at $WIKI_AGENT_BIN (canonical: jinwon-int/wiki-agent).
-  6. Auth GitHub:  gh auth login   (or place token per node policy; never commit it).
-  7. Start a fresh Claude Code session and confirm the SessionStart snapshot injects.
-  8. (Optional) MCP tool servers: ./claude/mcp-setup.sh
+  4. Install wiki-agent at $WIKI_AGENT_BIN (canonical: jinwon-int/wiki-agent).
+  5. Auth GitHub:  gh auth login   (or place token per node policy; never commit it).
+  6. Start a fresh Claude Code session and confirm the SessionStart snapshot injects.
+  7. (Optional) MCP tool servers: ./claude/mcp-setup.sh
      Registers searxng (explicit Tailnet fallback) + context7 (docs) + firecrawl
      (search + scrape; key read from ~/.hermes/.env). Idempotent; tool perms
      pre-allowed in settings.json.
-  9. (Optional) Telegram bridge: cd bridge && cp .env.example .env && edit, then
+  8. (Optional) Telegram bridge: cd bridge && cp .env.example .env && edit, then
      ./start.sh --path $BRIDGE_DEFAULT_PATH -d   (daemon-supervised). See bridge/README.md.
      Linux reboot-persistence: ./start.sh --path $BRIDGE_DEFAULT_PATH --install-systemd   (systemd unit).
-  10. (Optional) Keep the memory snapshot warm on idle nodes:
+  9. (Optional) Keep the memory snapshot warm on idle nodes:
      ./scripts/install-memory-refresh-cron.sh --apply   (cron runs refresh-memory.sh; dry-run by default).
-  11. (Optional Codex) Keep CCC_CODEX_CLI_PATH on ~/.claude/hooks/ccc-codex,
+  10. (Optional Codex) Keep CCC_CODEX_CLI_PATH on ~/.claude/hooks/ccc-codex,
       set CCC_CODEX_REAL_CLI_PATH only for a non-PATH binary, and require
       `ccc-memory-check.sh --json` to report `.codex.status == "ready"`.
-  12. (Optional Piri) Point CCC_PIRI_CLI_PATH at ~/.claude/hooks/ccc-piri and
+  11. (Optional Piri) Point CCC_PIRI_CLI_PATH at ~/.claude/hooks/ccc-piri and
       CCC_PIRI_REAL_CLI_PATH at the real Piri CLI so every node-global Piri
       launch materializes the same memory snapshot into the Piri global
       context file first.
@@ -1237,14 +1215,12 @@ cat <<'EOF'
 Secrets that are intentionally NOT installed by this script:
   - ~/.claude/.credentials.json   (Claude OAuth — created on `claude` login)
   - GitHub token                  (gh auth login)
-  - Honcho endpoint value         (you set it in ~/.hermes/honcho.json)
 EOF
 
 printf '\nResolved path configuration (override with CCC_* env vars; no secrets printed):\n'
 printf '  - CCC_CLAUDE_DIR=%s\n' "$CLAUDE_DIR"
 printf '  - CLAUDE.md=%s/CLAUDE.md\n' "$CLAUDE_DIR"
 printf '  - CCC_HERMES_DIR=%s\n' "$HERMES_ROOT"
-printf '  - honcho.json=%s/honcho.json\n' "$HERMES_ROOT"
 printf '  - CCC_WIKI_AGENT_BIN=%s\n' "$WIKI_AGENT_BIN"
 printf '  - CCC_BRIDGE_DEFAULT_PATH=%s\n' "$BRIDGE_DEFAULT_PATH"
 printf '  - CCC_CODEX_CLI_PATH=%s/hooks/ccc-codex\n' "$CLAUDE_DIR"
