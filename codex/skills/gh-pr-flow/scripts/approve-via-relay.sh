@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Submit an exact-head approval through one allowlisted Seoseo review profile.
-# Credentials remain on Seoseo and are never printed, copied, or reconfigured.
+# Submit an exact-head approval through one allowlisted relay-held review profile.
+# Credentials remain on the relay node and are never printed, copied, or reconfigured.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: approve-via-seoseo.sh --review-profile seoseo-ai|jinon86 \
+Usage: approve-via-relay.sh --review-profile seoseo-ai|jinon86 \
   --repo jinwon-int/REPO --pr NUMBER --expected-head 40_HEX_SHA \
   --operator-approved [--ssh-target HOST] [--dry-run]
 EOF
@@ -21,7 +21,7 @@ pr=""
 expected_head=""
 review_profile=""
 profile_seen=0
-ssh_target="seoseo"
+ssh_target="${CCC_RELAY_SSH_TARGET:-relay}"
 approved=0
 dry_run=0
 
@@ -91,9 +91,9 @@ expected_author="$7"
 credential_file="$review_config/hosts.yml"
 
 command -v gh >/dev/null 2>&1 \
-  || { echo "ERROR: Seoseo gh is unavailable" >&2; exit 69; }
+  || { echo "ERROR: remote gh is unavailable" >&2; exit 69; }
 command -v jq >/dev/null 2>&1 \
-  || { echo "ERROR: Seoseo jq is unavailable" >&2; exit 69; }
+  || { echo "ERROR: remote jq is unavailable" >&2; exit 69; }
 [ -d "$review_config" ] && [ ! -L "$review_config" ] \
   || { echo "ERROR: isolated gh config directory is unsafe" >&2; exit 65; }
 [ -f "$credential_file" ] && [ ! -L "$credential_file" ] \
@@ -165,7 +165,7 @@ fi
 review_gh api --method POST "repos/$repo/pulls/$pr/reviews" \
   -f event=APPROVE \
   -f "commit_id=$expected_head" \
-  -f "body=Approved after exact-head validation and fresh operator authorization using the Seoseo-held $actor credential." \
+  -f "body=Approved after exact-head validation and fresh operator authorization using the relay-held $actor credential." \
   >/dev/null
 
 after="$(review_gh pr view "$pr" --repo "$repo" \

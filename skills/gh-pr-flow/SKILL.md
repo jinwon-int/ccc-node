@@ -1,6 +1,6 @@
 ---
 name: gh-pr-flow
-description: Ship code through the PR-first GitHub flow on this node, including protected PRs that need an independent cross-account review in either direction — jinon86-authored PR approved via the Seoseo-held seoseo-ai profile (exact-head) or seoseo-ai-authored PR approved/merged as jinon86 (Seoseo-held session) — after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. Enforces no direct main pushes, exact-head and green-check validation, independent review, secret-safe credential use, squash merge, and verified cleanup. Not for Wiki edits (use wiki-record).
+description: Ship code through the PR-first GitHub flow on this node, including protected PRs that need an independent cross-account review in either direction — jinon86-authored PR approved via the relay-held seoseo-ai profile (exact-head) or seoseo-ai-authored PR approved/merged as jinon86 (relay-held session) — after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. Enforces no direct main pushes, exact-head and green-check validation, independent review, secret-safe credential use, squash merge, and verified cleanup. Not for Wiki edits (use wiki-record).
 ---
 
 # gh-pr-flow — PR-first GitHub flow
@@ -12,16 +12,16 @@ For Wiki content use `wiki-record` instead.
 ## Identities and review directions
 
 A node's local `gh` holds `jinon86` (typically the only local account).
-`seoseo-ai` review authority lives on Seoseo as an isolated profile config
-(`/root/.config/gh-seoseo-ai`), and Seoseo separately holds an authorized
+`seoseo-ai` review authority lives on the relay node as an isolated,
+root-owned profile config, and the relay node separately holds an authorized
 `jinon86` session. Check with `gh auth status`. Whichever account authored
 the PR, the OTHER account reviews it — both directions are supported
 symmetrically:
 
 | PR author | Reviewer / merger | Mechanism |
 |---|---|---|
-| `jinon86` | `seoseo-ai` reviews; `jinon86` merges | `approve-via-seoseo.sh --review-profile seoseo-ai` (Seoseo-held profile, exact-head) |
-| `seoseo-ai` | `jinon86` reviews and, if needed, merges | `approve-via-seoseo.sh --review-profile jinon86` (exact-head) / `merge-via-seoseo.sh` (Seoseo-held session over SSH) |
+| `jinon86` | `seoseo-ai` reviews; `jinon86` merges | `approve-via-relay.sh --review-profile seoseo-ai` (relay-held profile, exact-head) |
+| `seoseo-ai` | `jinon86` reviews and, if needed, merges | `approve-via-relay.sh --review-profile jinon86` (exact-head) / `merge-via-relay.sh` (relay-held session over SSH) |
 
 Every cross-account review or merge is a privileged credential use and needs
 fresh explicit user approval in the current conversation, in both directions.
@@ -94,7 +94,7 @@ fresh explicit user approval in the current conversation, in both directions.
 
    Helper scripts live next to this SKILL.md. Resolve the directory once —
    the installed copy first, the template checkout as fallback (e.g. when an
-   installed copy is stale, as on gongmyoung 2026-08-07):
+   installed copy is stale, as happened on one node on 2026-08-07):
 
    ```bash
    GH_PR_FLOW_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}/skills/gh-pr-flow"
@@ -110,7 +110,7 @@ fresh explicit user approval in the current conversation, in both directions.
    `$HOME/ccc-node`, `/root/ccc-node` — instead of hardcoding one; nodes install
    the repo in different places, which previously forked this snippet per node.)
 
-   **Direction A — `jinon86`-authored PR, `seoseo-ai` reviews (Seoseo-held
+   **Direction A — `jinon86`-authored PR, `seoseo-ai` reviews (relay-held
    profile):**
 
    Both directions use the same exact-head profile helper. It ships with the
@@ -118,25 +118,29 @@ fresh explicit user approval in the current conversation, in both directions.
    first, with template-checkout fallback:
 
    ```bash
-   SEOSEO_FLOW_DIR="${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts"
-   if [ ! -d "$SEOSEO_FLOW_DIR" ]; then
+   RELAY_FLOW_DIR="${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts"
+   if [ ! -d "$RELAY_FLOW_DIR" ]; then
      for _cand in /opt/ccc-node "$HOME/ccc-node" /root/ccc-node; do
        [ -d "$_cand/codex/skills/gh-pr-flow/scripts" ] || continue
-       SEOSEO_FLOW_DIR="$_cand/codex/skills/gh-pr-flow/scripts"; break
+       RELAY_FLOW_DIR="$_cand/codex/skills/gh-pr-flow/scripts"; break
      done
    fi
    ```
 
+   Pass `--ssh-target` explicitly (or export `CCC_RELAY_SSH_TARGET`) when the
+   credential-holding relay node's SSH alias differs from the helper default:
+
    ```bash
    head_sha="$(gh pr view <n> --repo <owner/repo> --json headRefOid --jq .headRefOid)"
    CCC_EXPLICIT_USER_APPROVAL=1 \
-     bash "$SEOSEO_FLOW_DIR/approve-via-seoseo.sh" \
+     bash "$RELAY_FLOW_DIR/approve-via-relay.sh" \
      --review-profile seoseo-ai --repo <owner/repo> --pr <n> \
      --expected-head "$head_sha" --operator-approved
    ```
 
-   The helper runs `gh` on Seoseo with the isolated `seoseo-ai` profile config
-   — credentials never leave Seoseo and are never printed, copied, or switched.
+   The helper runs `gh` on the relay node with the isolated `seoseo-ai` profile
+   config — credentials never leave the relay node and are never printed,
+   copied, or switched.
    It fail-closes unless the remote actor is `seoseo-ai`, the open default-
    branch PR is authored by `jinon86`, `seoseo-ai` is the requested reviewer
    (request it with `gh pr edit --add-reviewer seoseo-ai` when missing), the
@@ -145,24 +149,25 @@ fresh explicit user approval in the current conversation, in both directions.
    the fresh user authorization for this exact PR and head. After approval,
    `jinon86` (the local account) merges normally in step 6.
 
-   **Direction B — `seoseo-ai`-authored PR, `jinon86` reviews (via Seoseo):**
+   **Direction B — `seoseo-ai`-authored PR, `jinon86` reviews (via the relay
+   node):**
 
    Same helper, opposite profile:
 
    ```bash
    head_sha="$(gh pr view <n> --repo <owner/repo> --json headRefOid --jq .headRefOid)"
    CCC_EXPLICIT_USER_APPROVAL=1 \
-     bash "$SEOSEO_FLOW_DIR/approve-via-seoseo.sh" \
+     bash "$RELAY_FLOW_DIR/approve-via-relay.sh" \
      --review-profile jinon86 --repo <owner/repo> --pr <n> \
      --expected-head "$head_sha" --operator-approved
    ```
 
-   It runs `gh` on Seoseo with the root-owned `jinon86` config and fail-closes
+   It runs `gh` on the relay node with the root-owned `jinon86` config and fail-closes
    unless the remote actor is `jinon86`, the open default-branch PR is authored
    by `seoseo-ai` with `jinon86` requested, the head matches `--expected-head`
    exactly, the PR is mergeable, and every reported check on that head is
    successful. The approval is commit-bound and the credential never leaves
-   Seoseo.
+   the relay node.
 
 6. With required review and checks green, squash-merge normally:
 
@@ -171,7 +176,7 @@ fresh explicit user approval in the current conversation, in both directions.
    ```
 
    If the local identity lacks repository merge permission, use the exact-head
-   Seoseo merge fallback below. Do not weaken branch protection.
+   exact-head relay merge fallback below. Do not weaken branch protection.
 
    **`mergeable: UNKNOWN` is "not computed yet", not "blocked".** GitHub builds
    a throwaway test merge commit in a background job; until it finishes the
@@ -237,14 +242,14 @@ fresh explicit user approval in the current conversation, in both directions.
    the PR is merged, `main` contains the change, and the remote branch is gone.
    If the PR links an issue with a closing keyword, verify that issue is closed.
 
-## Seoseo `jinon86` exact-head merge fallback
+## Relay-held `jinon86` exact-head merge fallback
 
 Use this only when all of the following are true:
 
 - The operator explicitly approved merging this specific repository and PR in
   the current task. Approval does not carry to another PR or a changed head.
-- The local identity cannot merge it, while Seoseo already has the authorized
-  `jinon86` GitHub session.
+- The local identity cannot merge it, while the relay node already has the
+  authorized `jinon86` GitHub session.
 - The PR is non-draft, targets `main`, is `MERGEABLE`/`CLEAN`, has all required
   reviews, and its exact head has passing GitHub checks or documented equivalent
   validation.
@@ -253,12 +258,12 @@ Capture the exact head locally, then call the fail-closed helper:
 
 ```bash
 head_sha="$(gh pr view <n> --repo <owner/repo> --json headRefOid --jq .headRefOid)"
-bash "$GH_PR_FLOW_DIR/merge-via-seoseo.sh" \
+bash "$GH_PR_FLOW_DIR/merge-via-relay.sh" \
   --repo <owner/repo> --pr <n> --expected-head "$head_sha" \
   --operator-approved
 ```
 
-The helper verifies actor `jinon86`, re-reads the PR on Seoseo, requires the
+The helper verifies actor `jinon86`, re-reads the PR on the relay node, requires the
 same head SHA and clean merge state, rejects pending or failed checks, and uses
 GitHub's merge API with the SHA precondition. It never uses an admin bypass. A
 PR with no reported checks is allowed only when exact-head equivalent evidence
@@ -274,14 +279,15 @@ permission is unavailable, report it rather than moving a credential.
   independent.
 - Only merge with green required checks and a mergeable state. Report failed or
   pending checks instead of forcing the merge.
-- Never read, print, copy, persist, export, or re-login with the Seoseo token.
-  Run `gh` on Seoseo so the credential stays there. Do not enable shell trace,
-  switch the persistent local account, or put credentials in arguments,
-  commits, PR text, logs, or memory.
-- The Seoseo-held `seoseo-ai` profile credential follows the same discipline:
-  use it only through the exact-head `approve-via-seoseo.sh` profile helper,
-  which runs `gh` on Seoseo with the isolated profile config for a single
-  approved invocation. Never print it, never copy it off Seoseo, never
+- Never read, print, copy, persist, export, or re-login with the relay's gh
+  token. Run `gh` on the relay node so the credential stays there. Do not
+  enable shell trace, switch the persistent local account, or put credentials
+  in arguments, commits, PR text, logs, or memory.
+- The relay-held `seoseo-ai` profile credential follows the same discipline:
+  use it only through the exact-head `approve-via-relay.sh` profile helper,
+  which runs `gh` on the relay node with the isolated profile config for a
+  single approved invocation. Never print it, never copy it off the relay
+  node, never
   `gh auth switch` to it, and never reuse one approval for a second invocation
   or a different head.
 - An approval flag records a fresh user decision; it does not grant standing

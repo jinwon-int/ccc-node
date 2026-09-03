@@ -48,7 +48,7 @@
 #
 #   watch-task.sh --broker "http://127.0.0.1:18787" \
 #     --task-id "nclex-pr459-terminology-...:RNM-...:terminology_bilingual" \
-#     --requester-id nosuk --requester-role analyst \
+#     --requester-id <node> --requester-role analyst \
 #     --secret-file /etc/default/a2a-hermes-worker:BROKER_EDGE_SECRET \
 #     --out /root/nclex-dispatch/watch-pr459-terminology.json
 #

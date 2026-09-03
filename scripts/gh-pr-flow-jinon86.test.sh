@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HELPER="$ROOT/codex/skills/gh-pr-flow/scripts/approve-via-seoseo.sh"
+HELPER="$ROOT/codex/skills/gh-pr-flow/scripts/approve-via-relay.sh"
 WRAPPER="$ROOT/codex/skills/gh-pr-flow/scripts/approve-via-jinon86.sh"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$ROOT/claude/hooks/lib/test-stub.sh"

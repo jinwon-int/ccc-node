@@ -5,7 +5,7 @@ description: Manually trigger / inspect / toggle the Session Distiller (TM-1058)
 
 # distill — Session Distiller manual control
 
-Wraps `~/.claude/hooks/distill.sh` with a single operator-facing UX. Design: see Wiki `pages/team/dungae/DECISIONS.md` [TM-1058] and runbook [ND-1059..1061].
+Wraps `~/.claude/hooks/distill.sh` with a single operator-facing UX. Design: see Wiki `pages/team/<design-node>/DECISIONS.md` [TM-1058] and runbook [ND-1059..1061].
 
 ## Modes
 
