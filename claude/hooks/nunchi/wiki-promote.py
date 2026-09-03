@@ -430,6 +430,114 @@ def write_report(payload):
         fh.write(payload)
 
 
+def select_candidates(rows, fleet, seen, seen_hashes,
+                      queued_ids, queued_hashes, hay_norm):
+    """Fixed-order gate + dedup layers → (skipped, eligible).
+
+    skipped is a list of (fid, reason); eligible is a list of
+    (row, digest, refs_rendered) in oldest-first order.
+    """
+    skipped, eligible = [], []
+    for row in rows:
+        fid = row[0]
+        ok, reason = check_row(row, fleet)
+        if not ok:
+            skipped.append((fid, reason))
+            continue
+        digest = normhash(row[3])
+        if fid in seen or digest in seen_hashes:
+            skipped.append((fid, "already-promoted"))
+            continue
+        if fid in queued_ids or digest in queued_hashes:
+            skipped.append((fid, "already-queued"))
+            continue
+        if wiki_hit(row[3], hay_norm):
+            skipped.append((fid, "wiki-cache-hit"))
+            continue
+        rendered, _types = parse_source_refs(row[5])
+        eligible.append((row, digest, rendered))
+    return skipped, eligible
+
+
+def write_queue_entries(chosen, scope_tag, stamp):
+    """APPLY: append entries + the seen ledger. Returns count queued."""
+    try:
+        existed = (os.path.getsize(QUEUE) > 0)
+    except OSError:
+        existed = False
+    text = queue_text_or_header()
+    cand_id = next_cand_id(text)
+    blocks = []
+    seen_rows = []
+    for row, digest, rendered in chosen:
+        blocks.append(
+            render_entry(cand_id, row, rendered, digest, scope_tag))
+        seen_rows.append((row[0], digest, stamp))
+        cand_id += 1
+    with open(QUEUE, "a", encoding="utf-8") as fh:
+        # A queue this batch creates must carry the same bootstrap header the
+        # distill path writes (same file, same conventions — #1447: 새 전송
+        # 경로 신설 금지).
+        if not existed:
+            fh.write(QUEUE_HEADER)
+        fh.write("".join(blocks))
+    append_seen(seen_rows)
+    return len(chosen)
+
+
+def audit_and_report(rows, skipped, chosen, queued, overflow,
+                     backpressure_skipped, pending, scope_tag, stamp):
+    """Body-free audit lines + report file + cron-log line."""
+    mode = "APPLY" if APPLY else "dry-run"
+    for fid, reason in skipped:
+        audit({"ts": stamp, "mode": mode, "db": DB, "scope": scope_tag,
+               "id": fid, "verdict": "skip", "reason": reason})
+    for row, _digest, _rendered in chosen:
+        audit({"ts": stamp, "mode": mode, "db": DB, "scope": scope_tag,
+               "id": row[0], "verdict": "candidate",
+               "reason": "eligible",
+               "applied": bool(APPLY and queued)})
+
+    reasons = {}
+    for _fid, reason in skipped:
+        reasons[reason] = reasons.get(reason, 0) + 1
+    skip_text = ", ".join(f"{k}={v}" for k, v in sorted(reasons.items()))
+    report = [
+        f"# nunchi wiki-promote report — {stamp}",
+        "",
+        f"- mode: **{mode}**"
+        f" (NUNCHI_WIKI_PROMOTE_APPLY={'1' if APPLY else 'unset'})",
+        f"- db: `{DB}` (read-only)",
+        f"- scope: {scope_tag}",
+        f"- open facts examined: {len(rows)}",
+        f"- eligible candidates: {len(chosen) + max(overflow, 0)}"
+        f" (cap {CAP}, overflow {max(overflow, 0)})",
+        f"- queued: {queued}"
+        + (" — run SKIPPED: queue backpressure"
+           f" (pending {pending} > {BACKPRESSURE})"
+           if backpressure_skipped else ""),
+        f"- skips: {skip_text or 'none'}",
+        "",
+        "| id | verdict | reason |",
+        "|---|---|---|",
+    ]
+    decided = [(fid, "skip", reason) for fid, reason in skipped]
+    decided += [(row[0], "candidate",
+                 "eligible" + (" · queued" if APPLY and queued
+                               else " · dry-run only"))
+                for row, _digest, _rendered in chosen]
+    for fid, verdict, reason in sorted(decided):
+        report.append(f"| #{fid} | {verdict} | {reason} |")
+    write_report("\n".join(report) + "\n")
+
+    print(f"wiki-promote ({mode}): examined={len(rows)},"
+          f" candidates={len(chosen) + max(overflow, 0)},"
+          f" queued={queued}"
+          + (f", SKIPPED backpressure(pending={pending})"
+             if backpressure_skipped else "")
+          + (f", skips: {skip_text}" if skip_text else ""))
+
+
 def run_single_db():
     if not os.path.isfile(DB):
         print(f"wiki-promote: no fact store at {DB} — nothing to do")
@@ -451,32 +559,11 @@ def run_single_db():
             " ORDER BY created_at ASC, id ASC").fetchall()
         conn.close()
 
-        fleet = roster()
-        seen = load_seen()
-        seen_hashes = set(seen.values())
         pending, queued_ids, queued_hashes = queue_state()
-        hay_norm = normalize(wiki_cache_text())
-
-        skipped = []          # (fid, reason)
-        eligible = []         # (row, digest, refs_rendered)
-        for row in rows:
-            fid = row[0]
-            ok, reason = check_row(row, fleet)
-            if not ok:
-                skipped.append((fid, reason))
-                continue
-            digest = normhash(row[3])
-            if fid in seen or digest in seen_hashes:
-                skipped.append((fid, "already-promoted"))
-                continue
-            if fid in queued_ids or digest in queued_hashes:
-                skipped.append((fid, "already-queued"))
-                continue
-            if wiki_hit(row[3], hay_norm):
-                skipped.append((fid, "wiki-cache-hit"))
-                continue
-            rendered, _types = parse_source_refs(row[5])
-            eligible.append((row, digest, rendered))
+        seen = load_seen()
+        skipped, eligible = select_candidates(
+            rows, roster(), seen, set(seen.values()),
+            queued_ids, queued_hashes, normalize(wiki_cache_text()))
 
         overflow = len(eligible) - CAP
         chosen = eligible[:CAP]
@@ -491,77 +578,10 @@ def run_single_db():
 
         queued = 0
         if APPLY and chosen:
-            try:
-                existed = (os.path.getsize(QUEUE) > 0)
-            except OSError:
-                existed = False
-            text = queue_text_or_header()
-            cand_id = next_cand_id(text)
-            blocks = []
-            seen_rows = []
-            for row, digest, rendered in chosen:
-                blocks.append(
-                    render_entry(cand_id, row, rendered, digest, scope_tag))
-                seen_rows.append((row[0], digest, stamp))
-                cand_id += 1
-            with open(QUEUE, "a", encoding="utf-8") as fh:
-                # A queue this batch creates must carry the same bootstrap
-                # header the distill path writes (same file, same
-                # conventions — #1447: 새 전송 경로 신설 금지).
-                if not existed:
-                    fh.write(QUEUE_HEADER)
-                fh.write("".join(blocks))
-            append_seen(seen_rows)
-            queued = len(chosen)
+            queued = write_queue_entries(chosen, scope_tag, stamp)
 
-        mode = "APPLY" if APPLY else "dry-run"
-        for fid, reason in skipped:
-            audit({"ts": stamp, "mode": mode, "db": DB, "scope": scope_tag,
-                   "id": fid, "verdict": "skip", "reason": reason})
-        for row, digest, _rendered in chosen:
-            audit({"ts": stamp, "mode": mode, "db": DB, "scope": scope_tag,
-                   "id": row[0], "verdict": "candidate",
-                   "reason": "eligible",
-                   "applied": bool(APPLY and queued)})
-
-        reasons = {}
-        for _fid, reason in skipped:
-            reasons[reason] = reasons.get(reason, 0) + 1
-        skip_text = ", ".join(f"{k}={v}" for k, v in sorted(reasons.items()))
-        report = [
-            f"# nunchi wiki-promote report — {stamp}",
-            "",
-            f"- mode: **{mode}**"
-            f" (NUNCHI_WIKI_PROMOTE_APPLY={'1' if APPLY else 'unset'})",
-            f"- db: `{DB}` (read-only)",
-            f"- scope: {scope_tag}",
-            f"- open facts examined: {len(rows)}",
-            f"- eligible candidates: {len(chosen) + max(overflow, 0)}"
-            f" (cap {CAP}, overflow {max(overflow, 0)})",
-            f"- queued: {queued}"
-            + (" — run SKIPPED: queue backpressure"
-               f" (pending {pending} > {BACKPRESSURE})"
-               if backpressure_skipped else ""),
-            f"- skips: {skip_text or 'none'}",
-            "",
-            "| id | verdict | reason |",
-            "|---|---|---|",
-        ]
-        decided = [(fid, "skip", reason) for fid, reason in skipped]
-        decided += [(row[0], "candidate",
-                     "eligible" + (" · queued" if APPLY and queued
-                                   else " · dry-run only"))
-                    for row, _digest, _rendered in chosen]
-        for fid, verdict, reason in sorted(decided):
-            report.append(f"| #{fid} | {verdict} | {reason} |")
-        write_report("\n".join(report) + "\n")
-
-        print(f"wiki-promote ({mode}): examined={len(rows)},"
-              f" candidates={len(chosen) + max(overflow, 0)},"
-              f" queued={queued}"
-              + (f", SKIPPED backpressure(pending={pending})"
-                 if backpressure_skipped else "")
-              + (f", skips: {skip_text}" if skip_text else ""))
+        audit_and_report(rows, skipped, chosen, queued, overflow,
+                         backpressure_skipped, pending, scope_tag, stamp)
         return 0
 
 
