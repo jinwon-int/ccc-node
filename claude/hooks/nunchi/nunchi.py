@@ -105,7 +105,8 @@ CREATE TABLE IF NOT EXISTS peer_facts (
   created_at TEXT NOT NULL,
   source_rank INTEGER DEFAULT 1,
   review INTEGER DEFAULT 0,
-  because TEXT
+  because TEXT,
+  source_refs TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_peer ON peer_facts(observer, observed, valid_to);
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
@@ -141,11 +142,13 @@ def _migrate_fts(c):
 
 def _migrate_gate_cols(c):
     """#890 — add write-gate columns to a pre-gate DB, lossless in place.
-    #1264 adds `because` (G5) through the same path."""
+    #1264 adds `because` (G5) through the same path; #1264 P1-3 adds
+    `source_refs` (structured provenance) the same way."""
     cols = [r[1] for r in c.execute("PRAGMA table_info(peer_facts)")]
     for name, ddl in (("source_rank", "source_rank INTEGER DEFAULT 1"),
                       ("review", "review INTEGER DEFAULT 0"),
-                      ("because", "because TEXT")):
+                      ("because", "because TEXT"),
+                      ("source_refs", "source_refs TEXT")):
         if name not in cols:
             try:
                 c.execute(f"ALTER TABLE peer_facts ADD COLUMN {ddl}")
@@ -487,6 +490,64 @@ def _transcript_text(payload):
     return _quote_key("\n".join(out))
 
 
+_SOURCE_REFS_QUOTE_MAX = 240
+_SOURCE_REFS_ANCHOR_MAX = 4
+_WIKI_ANCHOR_RE = re.compile(r"\b[A-Z]{2,6}-\d+\b")
+
+
+def _transcript_ref(payload):
+    """#1264 P1-3 — mechanical transcript provenance, computed once per run.
+
+    {"type":"transcript","ref":<path>,"sha256_8":<first-8-hex>} when the
+    transcript file resolves, else None. The hash pins the exact bytes the
+    fact was extracted from, so backtracking survives transcript rotation.
+    """
+    path = _transcript_path(payload)
+    if not (path and os.path.exists(path)):
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return {"type": "transcript", "ref": path, "sha256_8": h.hexdigest()[:8]}
+    except OSError:
+        return None
+
+
+def _source_refs(sid, item, transcript_ref):
+    """#1264 P1-3 — structured, MECHANICALLY-derived provenance for one fact.
+
+    The measured defect (bench q7 family): `evidence` used to be either a
+    bare `distill:<sid>` pointer (model citation discarded at insert) or a
+    free-text quote — neither gives lossless fact → source backtracking.
+    Everything here is derived from what the pipeline already knows; nothing
+    is trusted from the model except its own citation text, which is stored
+    as a quoted ref (capped) alongside the wiki anchors it cites.
+
+    Ref shapes:
+      {"type":"session","ref":<session_id>}            — always, when known
+      {"type":"transcript","ref":<path>,"sha256_8":..} — once per run
+      {"type":"quote","ref":<model citation, capped>}   — the discarded citation
+      {"type":"wiki","ref":"TM-1332"}                   — anchors cited in it
+
+    Returns a JSON string, or None when there is nothing (no session, no
+    transcript, no citation) so the column stays NULL like pre-#1264 rows.
+    """
+    refs = []
+    if sid and sid != "unknown":
+        refs.append({"type": "session", "ref": str(sid)})
+    if transcript_ref:
+        refs.append(transcript_ref)
+    quote = (item.get("evidence") or "").strip()
+    if quote:
+        refs.append({"type": "quote", "ref": quote[:_SOURCE_REFS_QUOTE_MAX]})
+        for anchor in list(dict.fromkeys(
+                _WIKI_ANCHOR_RE.findall(quote)))[:_SOURCE_REFS_ANCHOR_MAX]:
+            refs.append({"type": "wiki", "ref": anchor})
+    return json.dumps(refs, ensure_ascii=False) if refs else None
+
+
 def ingest(path):
     try:
         payload = (json.loads(_read_stdin_text()) if path == "-"
@@ -500,6 +561,7 @@ def ingest(path):
     )
     auto_supersede = os.environ.get("NUNCHI_NO_AUTO_SUPERSEDE") != "1"
     transcript = _transcript_text(payload)
+    transcript_ref = _transcript_ref(payload)  # #1264 P1-3 — once per run
     c = db()
     n = 0
     skipped_mutable = 0
@@ -539,17 +601,18 @@ def ingest(path):
         if superseded is None and kind not in ("correction", "constraint", "observation"):
             review = review or _conflict_review(c, observed, text, kind)
         dedup = hashlib.sha1(f"{OBSERVER}|{it.get('subject')}|{text}".encode()).hexdigest()
+        source_refs = _source_refs(sid, it, transcript_ref)
         evidence = (f"auto:correction:{sid}" if kind == "correction" and superseded is not None
                     else f"auto:update:{sid}" if superseded is not None
                     else f"distill:{sid}")
         try:
             c.execute(
                 "INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,"
-                "supersedes,dedup,created_at,source_rank,review,because)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "supersedes,dedup,created_at,source_rank,review,because,source_refs)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (OBSERVER, observed, kind, text, evidence,
                  payload.get("distilled_at") or now(), superseded, dedup, now(),
-                 rank, review, because))
+                 rank, review, because, source_refs))
             n += 1
         except sqlite3.IntegrityError:
             pass  # duplicate fact already stored
@@ -1010,6 +1073,44 @@ def annotate(fid, because):
     print(f"#{fid} because set (review flag unchanged — clear: nunchi.py review {fid} --clear)")
 
 
+def refs(fid):
+    """#1264 P1-3 — print the structured provenance of one fact.
+
+    Human-readable rendering of the source_refs JSON: session → transcript
+    (path + byte-hash) → the extractor's citation quote → wiki anchors it
+    cites. Rows written before P1-3 have no refs; say so instead of failing.
+    """
+    c = db()
+    row = c.execute(
+        "SELECT observer, observed, kind, fact, evidence, because, source_refs"
+        " FROM peer_facts WHERE id=?", (fid,)).fetchone()
+    if not row:
+        sys.exit(f"refs: no fact #{fid}")
+    observer, observed, kind, fact, evidence, because, raw = row
+    print(f"#{fid} [{kind}] {fact}")
+    print(f"  observer={observer} observed={observed}")
+    print(f"  evidence={evidence or '-'}")
+    if because:
+        print(f"  because: {because}")
+    if not raw:
+        print("  source_refs: (none — pre-#1264 row)")
+        return
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, list):
+        print(f"  source_refs: (unparsable) {raw[:120]}")
+        return
+    for r in parsed:
+        if not isinstance(r, dict):
+            continue
+        line = f"  - {r.get('type', '?')}: {r.get('ref', '')}"
+        if r.get("sha256_8"):
+            line += f" (sha256_8={r['sha256_8']})"
+        print(line)
+
+
 def supersede(fid, new_text):
     c = db()
     row = c.execute("SELECT observer,observed,kind FROM peer_facts WHERE id=?", (fid,)).fetchone()
@@ -1255,6 +1356,8 @@ if __name__ == "__main__":
         synthesize_stdin(args[0])
     elif cmd == "annotate":
         annotate(int(args[0]), flag("--because", ""))
+    elif cmd == "refs":
+        refs(int(args[0]))
     elif cmd == "supersede":
         supersede(int(args[0]), args[1])
     elif cmd == "merge":
