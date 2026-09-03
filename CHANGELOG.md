@@ -5,6 +5,21 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- **tunnel-audit collects the host firewall (ufw) so a rule change re-surfaces
+  an accepted public bind (#1431).** gongmyoung's Home Assistant /
+  music-assistant / go2rtc listeners bind 0.0.0.0 but were accepted into the
+  baseline (Wiki [TNL-10]) on the strength of `ufw` default-deny plus a
+  LAN/tailnet allowlist — exposure that the listener scan alone cannot see
+  move. `scripts/tunnel-audit.sh` now emits a `firewall.ufw` block (status
+  active/inactive/missing/unavailable, default incoming policy, allow rules
+  normalised with comments stripped, sha256 of the rule set) and
+  `exposure.firewall_default_deny`; `tunnel-audit-fleet.sh` folds
+  `ufw <status> default-in=<policy> rules=<hash8>` into the node signature, so
+  a policy flip, a widened/removed rule, or ufw going inactive is NEW (exit 1,
+  owner notified) while comment/order/spacing edits keep the hash. Missing or
+  non-root ufw is a fact, not a failure. Rollout note: nodes whose baseline
+  predates the block compare as NEW once — review that the diff is only the
+  firewall line, then `--accept-baseline`. Env `CCC_TUNNEL_AUDIT_UFW_CMD`.
 - **Sanctioned A2A task watcher template (`watch-task.sh`, #1389).** During
   nclex PR #459 an ad-hoc polling watcher waited on terminal statuses
   (`completed|cancelled|review_verdict_failed`) that are not broker

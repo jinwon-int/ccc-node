@@ -20,6 +20,10 @@
 #   4. tailscale serve / funnel status (funnel = public exposure)
 #   5. removed-unit residue (`*.removed-*`, `*.disabled`) so orphans stay
 #      visible until an operator deletes them
+#   6. host firewall (ufw): default incoming policy + normalised allow rules
+#      and their hash (ccc-node#1431). A public bind is only as exposed as the
+#      firewall lets it be — gongmyoung's home-server listeners are accepted
+#      on the strength of ufw default-deny, so a rule change must show up.
 #
 # The registry comparison (what is NEW vs the Wiki page) is deliberately not
 # done here: this script has no Wiki access and must stay meaningful on a node
@@ -45,7 +49,7 @@ listeners, tailscale serve/funnel state, and removed-unit residue. Prints JSON
 arguments. Env: CCC_TUNNEL_AUDIT_SYSTEMD_DIR (default /etc/systemd/system),
 CCC_TUNNEL_AUDIT_CRONTAB_CMD (default crontab), CCC_TUNNEL_AUDIT_SS_CMD (default ss),
 CCC_TUNNEL_AUDIT_TAILSCALE_CMD (default tailscale), CCC_TUNNEL_AUDIT_CROND_DIR
-(default /etc/cron.d).
+(default /etc/cron.d), CCC_TUNNEL_AUDIT_UFW_CMD (default ufw).
 EOF
       exit 0
       ;;
@@ -58,9 +62,11 @@ export CCC_TUNNEL_AUDIT_CRONTAB_CMD="${CCC_TUNNEL_AUDIT_CRONTAB_CMD:-crontab}"
 export CCC_TUNNEL_AUDIT_SS_CMD="${CCC_TUNNEL_AUDIT_SS_CMD:-ss}"
 export CCC_TUNNEL_AUDIT_TAILSCALE_CMD="${CCC_TUNNEL_AUDIT_TAILSCALE_CMD:-tailscale}"
 export CCC_TUNNEL_AUDIT_CROND_DIR="${CCC_TUNNEL_AUDIT_CROND_DIR:-/etc/cron.d}"
+export CCC_TUNNEL_AUDIT_UFW_CMD="${CCC_TUNNEL_AUDIT_UFW_CMD:-ufw}"
 export CCC_TUNNEL_AUDIT_MODE="$MODE"
 
 python3 - <<'PY'
+import hashlib
 import json
 import os
 import re
@@ -79,6 +85,7 @@ CROND_DIR = Path(os.environ["CCC_TUNNEL_AUDIT_CROND_DIR"])
 CRONTAB = os.environ["CCC_TUNNEL_AUDIT_CRONTAB_CMD"]
 SS = os.environ["CCC_TUNNEL_AUDIT_SS_CMD"]
 TAILSCALE = os.environ["CCC_TUNNEL_AUDIT_TAILSCALE_CMD"]
+UFW = os.environ["CCC_TUNNEL_AUDIT_UFW_CMD"]
 MODE = os.environ["CCC_TUNNEL_AUDIT_MODE"]
 
 
@@ -244,10 +251,52 @@ def scan_tailscale():
     return result
 
 
+def scan_firewall():
+    """ufw only (the fleet's firewall front-end). Missing / non-root / inactive
+    are facts, never failures. Rules are normalised to one line each so their
+    hash is stable across `ufw status verbose` cosmetic changes."""
+    out, status = run([UFW, "status", "verbose"])
+    ufw = {"status": "missing", "default_incoming": "", "rules": [], "rules_hash": "", "cmd_status": status}
+    if out is None:
+        return ufw
+    lines = [l.rstrip() for l in out.splitlines()]
+    text = "\n".join(lines)
+    if "need to be root" in text.lower() or "permission denied" in text.lower():
+        ufw["status"] = "unavailable"
+        return ufw
+    if not any(l.startswith("Status:") for l in lines):
+        ufw["status"] = "unavailable"
+        return ufw
+    if any(l.startswith("Status: inactive") for l in lines):
+        ufw["status"] = "inactive"
+        return ufw
+    ufw["status"] = "active"
+    m = re.search(r"^Default:\s*(\w+)\s*\(incoming\)", text, re.M)
+    ufw["default_incoming"] = m.group(1).lower() if m else "unknown"
+    rules = []
+    in_table = False
+    for l in lines:
+        if l.startswith("--"):
+            in_table = True
+            continue
+        if not in_table or not l.strip():
+            continue
+        # "8123/tcp on tailscale0   ALLOW IN   Anywhere   # comment" → drop the
+        # comment (operator prose) and collapse whitespace.
+        rule = " ".join(l.split("#", 1)[0].split())
+        if rule:
+            rules.append(rule)
+    rules = sorted(set(rules))
+    ufw["rules"] = rules
+    ufw["rules_hash"] = hashlib.sha256("\n".join(rules).encode()).hexdigest()
+    return ufw
+
+
 units, residue, units_status = scan_units()
 cron_lines, cron_status = scan_cron()
 listeners, ss_status = scan_listeners()
 tailscale = scan_tailscale()
+firewall = {"ufw": scan_firewall()}
 
 public_listeners = [l for l in listeners if l["bind"] == "public"]
 funnel = tailscale.get("funnel", {})
@@ -258,6 +307,8 @@ exposure = {
     "public_listeners": len(public_listeners),
     "funnel_configured": bool(funnel.get("configured")),
     "residue_files": len(residue),
+    "firewall_default_deny": firewall["ufw"]["status"] == "active"
+    and firewall["ufw"]["default_incoming"] in ("deny", "reject"),
 }
 
 doc = {
@@ -268,6 +319,7 @@ doc = {
         "systemctl": shutil.which("systemctl") is not None,
         "ss": shutil.which(SS) is not None,
         "tailscale": shutil.which(TAILSCALE) is not None,
+        "ufw": shutil.which(UFW) is not None,
         "units": units_status,
         "crontab": cron_status,
         "ss_status": ss_status,
@@ -278,6 +330,7 @@ doc = {
     "listeners": listeners,
     "tailscale": tailscale,
     "residue": residue,
+    "firewall": firewall,
 }
 
 if MODE == "json":
@@ -289,6 +342,11 @@ print("")
 print(f"- cloudflared units: {exposure['cloudflared_units']} · reverse ssh: {exposure['reverse_ssh_units']}"
       f" · public tunnel units: {exposure['public_tunnel_units']} · public listeners: {exposure['public_listeners']}"
       f" · funnel: {'YES' if exposure['funnel_configured'] else 'no'} · residue: {exposure['residue_files']}")
+ufw = firewall["ufw"]
+if ufw["status"] == "active":
+    print(f"- ufw: active · default incoming {ufw['default_incoming']} · {len(ufw['rules'])} rules · hash {ufw['rules_hash'][:8]}")
+else:
+    print(f"- ufw: {ufw['status']}")
 if units:
     print("")
     print("| unit | kind | active | exec |")
@@ -309,4 +367,8 @@ if residue:
     print("")
     for r in residue:
         print(f"- residue: `{r['file']}`")
+if ufw["rules"]:
+    print("")
+    for r in ufw["rules"]:
+        print(f"- ufw: `{r}`")
 PY

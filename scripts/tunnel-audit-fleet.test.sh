@@ -76,6 +76,30 @@ doc inactive "" false "[]" > "$TMP/reply/alpha"
 out="$(bash "$FLEET" 2>&1)"; rc=$?
 ok "active/inactive flip alone is not a NEW exposure" '[ "$rc" = 0 ] && grep -q "^OK alpha" <<<"$out"'
 
+# 6b) firewall (#1431): a baseline without a firewall block gains one → NEW once;
+#     afterwards policy / rule-hash / inactive changes are NEW, same state is OK.
+fw() { # <status> <default> <hash>
+  jq --arg st "$1" --arg d "$2" --arg h "$3" '.firewall = {ufw: {status: $st, default_incoming: $d, rules_hash: $h, rules: ["r"]}}'
+}
+doc active "" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "firewall block appearing over an old baseline is NEW (re-accept needed)" '[ "$rc" = 1 ] && grep -q "^NEW alpha: .*ufw active default-in=deny rules=aaaaaaaa (1)" <<<"$out"'
+bash "$FLEET" --accept-baseline=alpha >/dev/null 2>&1
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "same firewall state after accept is OK" '[ "$rc" = 0 ] && grep -q "^OK alpha" <<<"$out"'
+doc active "" false "[]" | fw active deny bbbbbbbb2222 > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "ufw rule-set change (hash) is NEW, exit 1" '[ "$rc" = 1 ] && grep -q "^NEW alpha: .*rules=bbbbbbbb" <<<"$out"'
+doc active "" false "[]" | fw active allow aaaaaaaa1111 > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "ufw default incoming deny→allow is NEW" '[ "$rc" = 1 ] && grep -q "default-in=allow" <<<"$out"'
+doc active "" false "[]" | fw inactive "" "" > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "ufw turning inactive is NEW" '[ "$rc" = 1 ] && grep -q "^NEW alpha: .*ufw inactive" <<<"$out"'
+doc active "" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "restored firewall state is OK again" '[ "$rc" = 0 ] && grep -q "^OK alpha" <<<"$out"'
+
 # 7) unreachable node → UNREACHABLE, exit 1; other node still evaluated
 rm -f "$TMP/reply/beta"
 out="$(bash "$FLEET" 2>&1)"; rc=$?
