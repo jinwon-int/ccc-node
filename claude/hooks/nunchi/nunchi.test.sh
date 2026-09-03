@@ -214,6 +214,27 @@ ok "static row keeps legacy snapshot shape" 'grep -q "^- (seo-jin-on/decision) �
 ok "live-check row grouped with ⟳ marker" 'grep -q "^- ⟳ (nosuk/context) 곽가 로컬 게이트" "$NUNCHI_SNAPSHOT"'
 ok "live-check legend line present with count" 'grep -q "⟳ live-check .*단정 전 실측(#1264 P1-4)" "$NUNCHI_SNAPSHOT"'
 ok "volatile row also lands in the ⟳ group" 'grep -q "^- ⟳ (nosuk/task-progress) 워커 마이그레이션 2단계" "$NUNCHI_SNAPSHOT"'
+
+# ---- 3f. taxonomy gate + retag (#1264 P1-5) ---------------------------------
+out="$(payload t1 measurement node "하네스 첫 구동 7/7 통과" | python3 "$NP" ingest - 2>&1)"
+ok "off-taxonomy kind kept but flagged (fail-safe, not dropped)" 'grep -q "ingested 1/1" <<<"$out" && grep -q "flagged_unknown_kind=1" <<<"$out"'
+trev="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT review FROM peer_facts WHERE fact='하네스 첫 구동 7/7 통과'\").fetchone()[0])")"
+ok "off-taxonomy row enters review queue" '[ "$trev" = "1" ]'
+out="$(payload t2 procedure node "배포 전 스냅샷 백업 후 진행" | python3 "$NP" ingest - 2>&1)"
+ok "whitelisted procedure unflagged (intent documented)" 'grep -q "ingested 1/1" <<<"$out" && grep -q "flagged_unknown_kind=0" <<<"$out"'
+out="$(payload t3 correction node "카렐렌 러너는 실제로 638e5a1이다" | python3 "$NP" ingest - 2>&1)"
+ok "internal correction kind unflagged" 'grep -q "ingested 1/1" <<<"$out" && grep -q "flagged_unknown_kind=0" <<<"$out"'
+out="$(payload t4 fact node "레거시 fact kind 호환 행" | python3 "$NP" ingest - 2>&1)"
+ok "legacy fact kind grandfathered (no mass-flag on rollout)" 'grep -q "ingested 1/1" <<<"$out" && grep -q "flagged_unknown_kind=0" <<<"$out"'
+TID="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT id FROM peer_facts WHERE fact='하네스 첫 구동 7/7 통과'\").fetchone()[0])")"
+out="$(python3 "$NP" retag "$TID" observation 2>&1)"; rc=$?
+ok "retag retypes and recalculates mutability" '[ "$rc" = 0 ] && grep -q "kind → observation (mutability recalculated: live-check)" <<<"$out"'
+mm="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT kind||'/'||mutability FROM peer_facts WHERE id=$TID\").fetchone()[0])")"
+ok "retagged row kind+mutability consistent" '[ "$mm" = "observation/live-check" ]'
+out="$(python3 "$NP" retag "$TID" philosophy 2>&1)"; rc=$?
+ok "retag rejects off-taxonomy target" '[ "$rc" != 0 ] && grep -q "unknown kind" <<<"$out"'
+# restore queue state for the later G5-count sections (t1 was flag-only)
+python3 "$NP" review "$TID" --clear >/dev/null
 python3 - "$NUNCHI_DB" <<'PY'
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
