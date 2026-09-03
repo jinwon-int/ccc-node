@@ -211,6 +211,11 @@ ok "backpressure skip is audited" 'grep -q "backpressure-skip" "$AUDIT"'
 rm -rf "$QUEUE" "$SEEN" "$TMP/state-scoped"
 ROOT="$TMP/audiences"
 mkdir -p -m 700 "$ROOT/shared/nunchi" "$ROOT/private-0123456789abcdef0123456789abcdef/nunchi"
+# mkdir -p -m applies to the deepest component only (SC2174): the canonical
+# scope enumerator rejects ANY group/other bit, so harden every level — CI
+# runners use umask 022 and root shells don't (measured 2026-09-04, #1462).
+chmod 700 "$ROOT" "$ROOT/shared" "$ROOT/private-0123456789abcdef0123456789abcdef" \
+          "$ROOT/shared/nunchi" "$ROOT/private-0123456789abcdef0123456789abcdef/nunchi"
 export CCC_NUNCHI_AUDIENCE_ROOT="$ROOT" CCC_NUNCHI_AUDIENCE_SCOPED=1
 seed_scoped() { # seed_scoped <scope> <label>
   local scope="$1" label="$2" db="$ROOT/$1/nunchi/facts.db"
