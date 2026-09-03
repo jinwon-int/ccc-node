@@ -25,13 +25,15 @@ f="$TMP/reply/\$node"
 cat "\$f"
 EOF
 
-doc() { # <cloudflared-active> <extra-listener-json-or-empty> <funnel> <residue-json>
+UFW_MISSING='{"status":"missing"}'
+doc() { # <cloudflared-active> <extra-listener-json-or-empty> <funnel> <residue-json> <ufw-object-json>
+  local ufw="${5:-$UFW_MISSING}"
   cat <<EOF
 {"schema":"ccc.tunnel-audit.v1","node":"x","exposure":{"funnel_configured":$3},
  "units":[{"unit":"cloudflared.service","kind":"cloudflared","active":"$1"},{"unit":"seoseo-broker-tunnel.service","kind":"ssh-forward","active":"active"}],
  "cron":[],
  "listeners":[{"local":"0.0.0.0:22","bind":"public","process":"sshd"}$2],
- "tailscale":{},"residue":$4}
+ "tailscale":{},"firewall":{"ufw":$ufw},"residue":$4}
 EOF
 }
 doc active "" false "[]" > "$TMP/reply/alpha"
@@ -75,6 +77,22 @@ bash "$FLEET" --accept-baseline=alpha >/dev/null 2>&1
 doc inactive "" false "[]" > "$TMP/reply/alpha"
 out="$(bash "$FLEET" 2>&1)"; rc=$?
 ok "active/inactive flip alone is not a NEW exposure" '[ "$rc" = 0 ] && grep -q "^OK alpha" <<<"$out"'
+
+# 6b) firewall posture lands in the signature (#1431): accepted, then any
+# policy/rule/status change is NEW — including ufw being dropped.
+doc inactive "" false "[]" '{"status":"active","default_incoming":"deny","rules":["22/tcp ALLOW IN Anywhere"],"rules_sha256":"deadbeefcafe0123"}' > "$TMP/reply/alpha"
+bash "$FLEET" --accept-baseline=alpha >/dev/null 2>&1
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "accepted ufw posture with no change is OK" '[ "$rc" = 0 ] && grep -q "^OK alpha" <<<"$out"'
+ok "baseline stores the accepted ufw posture" 'jq -e ".firewall.ufw.status == \"active\" and .firewall.ufw.default_incoming == \"deny\" and .firewall.ufw.rules_sha256 == \"deadbeefcafe0123\"" "$TMP/state/tunnel-audit/baseline/alpha.json" >/dev/null'
+doc inactive "" false "[]" '{"status":"active","default_incoming":"deny","rules":["22/tcp ALLOW IN Anywhere","8080 ALLOW IN Anywhere"],"rules_sha256":"0011223344556677"}' > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "widened allowlist is NEW exit 1 naming the hash8" '[ "$rc" = 1 ] && grep -q "^NEW alpha: ufw active default-in=deny rules=00112233" <<<"$out"'
+doc inactive "" false "[]" '{"status":"inactive"}' > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "ufw dropped (inactive) is NEW exit 1 — the scary direction pages too" '[ "$rc" = 1 ] && grep -q "ufw inactive" <<<"$out"'
+doc inactive "" false "[]" > "$TMP/reply/alpha"
+bash "$FLEET" --accept-baseline=alpha >/dev/null 2>&1
 
 # 7) unreachable node → UNREACHABLE, exit 1; other node still evaluated
 rm -f "$TMP/reply/beta"

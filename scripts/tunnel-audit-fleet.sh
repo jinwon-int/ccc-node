@@ -101,13 +101,21 @@ collect() { # <node> -> writes current/<node>.json ; returns 0 ok, 1 unreachable
 }
 
 # Comparable identity of what matters: units by name+kind, cron lines, non-loopback
-# listeners by local address + process, funnel flag, residue files.
+# listeners by local address + process, funnel flag, firewall (ufw) posture,
+# residue files. The firewall line carries status + default-in policy + the
+# first 8 hex of the rules hash, so a dropped ufw, a widened allowlist, or a
+# reordered ruleset all surface as NEW (#1431). No line for status=missing so
+# nodes without ufw never diff against an empty baseline.
 signature() { # <json> -> sorted "kind\tid" lines
   jq -r '
     ([.units[]? | "unit\t\(.unit) [\(.kind)]"]
      + [.cron[]? | "cron\t\(.source): \(.line | .[0:120])"]
      + [.listeners[]? | select(.bind != "loopback") | "listener\t\(.local) \(.process // "-") [\(.bind)]"]
      + (if (.exposure.funnel_configured // false) then ["funnel\tenabled"] else [] end)
+     + (if (.firewall.ufw.status // "missing") == "missing" then []
+        elif .firewall.ufw.status == "active" then
+          ["firewall\tufw active default-in=\(.firewall.ufw.default_incoming // "?") rules=\((.firewall.ufw.rules_sha256 // "?")[0:8])"]
+        else ["firewall\tufw \(.firewall.ufw.status)"] end)
      + [.residue[]? | "residue\t\(.file)"])
     | .[]' "$1" 2>/dev/null | sort -u
 }

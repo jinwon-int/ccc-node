@@ -20,6 +20,10 @@
 #   4. tailscale serve / funnel status (funnel = public exposure)
 #   5. removed-unit residue (`*.removed-*`, `*.disabled`) so orphans stay
 #      visible until an operator deletes them
+#   6. host firewall (ufw) status, default incoming policy, normalized rules
+#      and their sha256 (#1431) — gongmyoung accepted 0.0.0.0 binds as private
+#      on "ufw default-deny + allowlist" grounds (Wiki [TNL-10]); a dropped or
+#      widened ruleset must be as visible as a new listener
 #
 # The registry comparison (what is NEW vs the Wiki page) is deliberately not
 # done here: this script has no Wiki access and must stay meaningful on a node
@@ -45,7 +49,7 @@ listeners, tailscale serve/funnel state, and removed-unit residue. Prints JSON
 arguments. Env: CCC_TUNNEL_AUDIT_SYSTEMD_DIR (default /etc/systemd/system),
 CCC_TUNNEL_AUDIT_CRONTAB_CMD (default crontab), CCC_TUNNEL_AUDIT_SS_CMD (default ss),
 CCC_TUNNEL_AUDIT_TAILSCALE_CMD (default tailscale), CCC_TUNNEL_AUDIT_CROND_DIR
-(default /etc/cron.d).
+(default /etc/cron.d), CCC_TUNNEL_AUDIT_UFW_CMD (default ufw).
 EOF
       exit 0
       ;;
@@ -58,6 +62,7 @@ export CCC_TUNNEL_AUDIT_CRONTAB_CMD="${CCC_TUNNEL_AUDIT_CRONTAB_CMD:-crontab}"
 export CCC_TUNNEL_AUDIT_SS_CMD="${CCC_TUNNEL_AUDIT_SS_CMD:-ss}"
 export CCC_TUNNEL_AUDIT_TAILSCALE_CMD="${CCC_TUNNEL_AUDIT_TAILSCALE_CMD:-tailscale}"
 export CCC_TUNNEL_AUDIT_CROND_DIR="${CCC_TUNNEL_AUDIT_CROND_DIR:-/etc/cron.d}"
+export CCC_TUNNEL_AUDIT_UFW_CMD="${CCC_TUNNEL_AUDIT_UFW_CMD:-ufw}"
 export CCC_TUNNEL_AUDIT_MODE="$MODE"
 
 python3 - <<'PY'
@@ -79,6 +84,7 @@ CROND_DIR = Path(os.environ["CCC_TUNNEL_AUDIT_CROND_DIR"])
 CRONTAB = os.environ["CCC_TUNNEL_AUDIT_CRONTAB_CMD"]
 SS = os.environ["CCC_TUNNEL_AUDIT_SS_CMD"]
 TAILSCALE = os.environ["CCC_TUNNEL_AUDIT_TAILSCALE_CMD"]
+UFW = os.environ["CCC_TUNNEL_AUDIT_UFW_CMD"]
 MODE = os.environ["CCC_TUNNEL_AUDIT_MODE"]
 
 
@@ -244,13 +250,69 @@ def scan_tailscale():
     return result
 
 
+def scan_ufw():
+    """Host firewall posture (#1431). Every outcome is a fact, never an error:
+    status is active / inactive / missing (no binary) / unavailable (present
+    but rc != 0 — non-root, broken backend) / unknown (unparsable output).
+    `ufw status verbose` prints metadata, a "To Action From" header, a dashed
+    separator, then the rule table — so everything AFTER the first dashed
+    separator row is a rule. Rule order is meaningful in ufw (first match
+    wins): the normalized list keeps order, only whitespace collapses, and
+    "(v6)" markers stay so v4/v6 pairs remain distinguishable. The hash covers
+    the ordered normalized ruleset, so ANY widening, narrowing, or reordering
+    changes it."""
+    out, status = run([UFW, "status", "verbose"])
+    if out is None:
+        # `status verbose` missing on old ufw → retry plain `status`.
+        out, status = run([UFW, "status"])
+    if out is None:
+        fact = "missing" if status == "missing" else "unavailable"
+        return {"status": fact, "default_incoming": None, "rules": [], "rules_sha256": None}
+    if status != "rc=0":
+        return {"status": "unavailable", "default_incoming": None, "rules": [], "rules_sha256": None}
+    lines = out.splitlines()
+    m = re.search(r"^Status:\s*(\S+)", out, re.M)
+    state = m.group(1).lower() if m else "unknown"
+    default_incoming = None
+    dm = re.search(r"^Default:\s*(\S+)\s*\(incoming\)", out, re.M | re.I)
+    if dm:
+        default_incoming = dm.group(1).lower()
+    sep = None
+    for i, line in enumerate(lines):
+        t = line.strip().replace(" ", "")
+        if len(t) >= 4 and set(t) == {"-"}:
+            sep = i
+            break
+    rules = []
+    if sep is not None:
+        for line in lines[sep + 1:]:
+            t = " ".join(line.split())
+            if t:
+                rules.append(t)
+    rules_sha256 = None
+    if rules:
+        import hashlib
+        rules_sha256 = hashlib.sha256("\n".join(rules).encode("utf-8", "replace")).hexdigest()
+    return {"status": state, "default_incoming": default_incoming, "rules": rules, "rules_sha256": rules_sha256}
+
+
 units, residue, units_status = scan_units()
 cron_lines, cron_status = scan_cron()
 listeners, ss_status = scan_listeners()
 tailscale = scan_tailscale()
+ufw = scan_ufw()
 
 public_listeners = [l for l in listeners if l["bind"] == "public"]
 funnel = tailscale.get("funnel", {})
+# firewall_default_deny: true only when the host firewall is enforcing a deny
+# (or reject) default on incoming — the property gongmyoung's baseline rests
+# on. inactive/allow → false; missing/unavailable/unknown → null (unknown,
+# not safe).
+firewall_default_deny = None
+if ufw["status"] == "active":
+    firewall_default_deny = ufw["default_incoming"] in ("deny", "reject")
+elif ufw["status"] == "inactive":
+    firewall_default_deny = False
 exposure = {
     "cloudflared_units": sum(1 for u in units if u["kind"] == "cloudflared"),
     "reverse_ssh_units": sum(1 for u in units if u["kind"] == "ssh-reverse"),
@@ -258,6 +320,7 @@ exposure = {
     "public_listeners": len(public_listeners),
     "funnel_configured": bool(funnel.get("configured")),
     "residue_files": len(residue),
+    "firewall_default_deny": firewall_default_deny,
 }
 
 doc = {
@@ -277,6 +340,7 @@ doc = {
     "cron": cron_lines,
     "listeners": listeners,
     "tailscale": tailscale,
+    "firewall": {"ufw": ufw},
     "residue": residue,
 }
 
@@ -289,6 +353,10 @@ print("")
 print(f"- cloudflared units: {exposure['cloudflared_units']} · reverse ssh: {exposure['reverse_ssh_units']}"
       f" · public tunnel units: {exposure['public_tunnel_units']} · public listeners: {exposure['public_listeners']}"
       f" · funnel: {'YES' if exposure['funnel_configured'] else 'no'} · residue: {exposure['residue_files']}")
+ufw_brief = ufw["status"]
+if ufw["status"] == "active":
+    ufw_brief += f" (default-in {ufw['default_incoming'] or '?'}, {len(ufw['rules'])} rules)"
+print(f"- ufw: {ufw_brief}")
 if units:
     print("")
     print("| unit | kind | active | exec |")

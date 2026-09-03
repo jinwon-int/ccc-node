@@ -5,6 +5,24 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- **tunnel-audit now sees the host firewall (#1431).** gongmyoung accepted
+  0.0.0.0 binds as private on "ufw default-deny + allowlist" grounds
+  (Wiki [TNL-10]), but the audit only collected listener binds — a dropped or
+  widened ruleset still audited OK. `tunnel-audit.sh` gains a
+  `firewall.ufw` block (status active/inactive/missing/unavailable as facts,
+  exit stays 0; default incoming policy; ordered normalized rules with
+  `(v6)` markers kept since rule order is meaningful in ufw; sha256 of the
+  ruleset) and `exposure.firewall_default_deny` (true only when enforcing
+  deny/reject on incoming, false for inactive/allow, null when unknown).
+  `tunnel-audit-fleet.sh` extends its signature with
+  `firewall\tufw <status> default-in=<policy> rules=<hash8>` so a dropped
+  firewall, a widened allowlist, or a reordered ruleset pages the owner as
+  NEW (exit 1); no signature line for status=missing so ufw-less nodes
+  (Termux) never diff against an empty baseline. First fleet run after
+  rollout flags every node NEW on the firewall item alone — verify the diff
+  is firewall-only, then `--accept-baseline` once (per #1431 ops note).
+  Tests: 8 new ufw cases in `tunnel-audit.test.sh` (36 total) and a 6b
+  posture block in `tunnel-audit-fleet.test.sh` (25 total).
 - **Sanctioned A2A task watcher template (`watch-task.sh`, #1389).** During
   nclex PR #459 an ad-hoc polling watcher waited on terminal statuses
   (`completed|cancelled|review_verdict_failed`) that are not broker
