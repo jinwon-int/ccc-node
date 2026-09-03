@@ -215,6 +215,57 @@ ok "live-check row grouped with ⟳ marker" 'grep -q "^- ⟳ (nosuk/context) 곽
 ok "live-check legend line present with count" 'grep -q "⟳ live-check .*단정 전 실측(#1264 P1-4)" "$NUNCHI_SNAPSHOT"'
 ok "volatile row also lands in the ⟳ group" 'grep -q "^- ⟳ (nosuk/task-progress) 워커 마이그레이션 2단계" "$NUNCHI_SNAPSHOT"'
 
+# ---- 3g. hallways associative recall expansion (#1264 P2-6) -----------------
+HWFILE="$TMP/hallways.json"
+python3 - "$HWFILE" <<'PY'
+import json, sys
+json.dump([
+  {"id": "h1", "wing": "ops", "entity_a": "gwakga", "entity_b": "broker-tunnel",
+   "co_occurrence_count": 7},
+  {"id": "h2", "wing": "ops", "entity_a": "gwakga", "entity_b": "chromadb-build",
+   "co_occurrence_count": 3},
+  {"id": "h3", "wing": "ops", "entity_a": "seoseo", "entity_b": "broker-tunnel",
+   "co_occurrence_count": 5},
+  {"id": "h4", "wing": "ops", "entity_a": "termux", "entity_b": "peer-facts-only",
+   "co_occurrence_count": 2},
+  {"id": "h5", "wing": "ops", "entity_a": "corpus", "entity_b": "corpus", "co_occurrence_count": 9},
+  "not-a-dict"
+], open(sys.argv[1], "w"))
+PY
+exp="$(NUNCHI_HALLWAYS_FILE="$HWFILE" python3 - "$NP" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("nx", sys.argv[1])
+nx = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(nx)
+print("gwakga-q:" + ",".join(nx._hallway_expansions("곽가 broker-tunnel 상태는?")))
+print("bt-q:" + ",".join(nx._hallway_expansions("termux 사실만 확인했다")))
+print("nohit-q:" + "|".join(nx._hallway_expansions("완전 다른 주제 질문")))
+PY
+)"
+ok "1-hop expansion fires with co-occurrence ordering (alias-aware)" 'grep -q "gwakga-q:seoseo,chromadb-build" <<<"$exp"'
+ok "other-endpoint direction works" 'grep -q "bt-q:peer-facts-only" <<<"$exp"'
+ok "no matching hallway expands to nothing" 'grep -q "nohit-q:" <<<"$exp" && ! grep -q "nohit-q:." <<<"$exp"'
+# self-entity in query never expands to itself (corpus/corpus edge + containment)
+selfr="$(NUNCHI_HALLWAYS_FILE="$HWFILE" python3 - "$NP" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("nx", sys.argv[1])
+nx = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(nx)
+print(",".join(nx._hallway_expansions("corpus 전반 분석")))
+PY
+)"
+ok "self edges and query-contained terms are skipped" '[ -z "$selfr" ]'
+
+# end-to-end: recall of an entity-B-only fact via an entity-A query
+payload hw1 observation gwakga "chromadb-build 은 aarch64 빌드 불가로 보류됐다" | python3 "$NP" ingest - >/dev/null
+out="$(NUNCHI_HALLWAYS_FILE="$HWFILE" python3 "$NP" recall "gwakga 관련 이슈는?" 2>&1)"
+ok "recall finds entity-B fact through hallway expansion" 'grep -q "aarch64 빌드 불가" <<<"$out"'
+out="$(NUNCHI_HALLWAYS_FILE=/nonexistent/hallways.json python3 "$NP" recall "gwakga" 2>&1)"; rc=$?
+ok "missing hallways file degrades silently" '[ "$rc" = 0 ]'
+printf 'not json' > "$TMP/bad-hallways.json"
+out="$(NUNCHI_HALLWAYS_FILE="$TMP/bad-hallways.json" python3 "$NP" recall "gwakga" 2>&1)"; rc=$?
+ok "malformed hallways file degrades silently" '[ "$rc" = 0 ]'
+
 # ---- 3f. taxonomy gate + retag (#1264 P1-5) ---------------------------------
 out="$(payload t1 measurement node "하네스 첫 구동 7/7 통과" | python3 "$NP" ingest - 2>&1)"
 ok "off-taxonomy kind kept but flagged (fail-safe, not dropped)" 'grep -q "ingested 1/1" <<<"$out" && grep -q "flagged_unknown_kind=1" <<<"$out"'
