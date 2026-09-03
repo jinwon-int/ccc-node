@@ -1060,38 +1060,7 @@ print("COMPOSED-WIKI-SINK-WORKER-OK")
     assert "COMPOSED-WIKI-SINK-WORKER-OK" in result.stdout
 
 
-def test_build_context_composes_honcho_sink_only_when_enabled(tmp_path):
-    result = _run_probe(
-        """
-import os
-from pathlib import Path
-root = Path(os.environ["PROBE_ROOT"])
-(root / "project").mkdir(parents=True, exist_ok=True)
-os.environ.update({
-    "PROJECT_ROOT": str(root / "project"),
-    "TELEGRAM_BOT_TOKEN": "123456:test",
-    "ALLOWED_USER_IDS": "1",
-    "CCC_AGENT_PROVIDER": "codex",
-    "CCC_HONCHO_MEMORY_ENABLED": "1",
-    "CCC_HONCHO_CFG": str(root / "honcho.json"),
-})
-from telegram_bot.__main__ import build_context, create_app, load_runtime_settings
-from telegram_bot.memory.distill_honcho_worker import CodexDistillHonchoSinkWorker
-enabled = build_context(load_runtime_settings())
-worker = enabled.distill_honcho_sink_worker
-assert isinstance(worker, CodexDistillHonchoSinkWorker)
-assert create_app(enabled)._distill_honcho_sink_worker is worker
-os.environ["CCC_HONCHO_MEMORY_ENABLED"] = "0"
-assert build_context(load_runtime_settings()).distill_honcho_sink_worker is None
-print("COMPOSED-HONCHO-SINK-WORKER-OK")
-""",
-        probe_root=tmp_path,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "COMPOSED-HONCHO-SINK-WORKER-OK" in result.stdout
-
-
-def test_audience_memory_composes_scoped_wiki_and_honcho_sinks(tmp_path):
+def test_audience_memory_composes_scoped_wiki_sink(tmp_path):
     result = _run_probe(
         """
 import os
@@ -1109,8 +1078,6 @@ os.environ.update({
     "CCC_CODEX_AUDIENCE_AUTH_MODE": "keyring",
     "CCC_USAGE_BUDGET_TOKENS_CODEX": "200000",
     "CCC_WIKI_MEMORY_ENABLED": "1",
-    "CCC_HONCHO_MEMORY_ENABLED": "1",
-    "CCC_HONCHO_CFG": str(root / "honcho.json"),
 })
 
 from telegram_bot.__main__ import build_context, load_runtime_settings
@@ -1122,13 +1089,7 @@ assert context.distill_wiki_sink_worker._sink.queue_dir == (
     context.settings.bot_data_dir / "wiki-candidates"
 )
 assert context.distill_wiki_sink_worker._require_memory_route is True
-assert context.distill_honcho_sink_worker is not None
-assert context.distill_honcho_sink_worker._outbox.root == (
-    context.settings.bot_data_dir / "honcho-outbox"
-)
-assert context.distill_honcho_sink_worker._require_memory_route is True
 assert context.distill_extraction_worker._wiki_enabled is True
-assert context.distill_extraction_worker._honcho_enabled is True
 print("AUDIENCE-SCOPED-EXTERNAL-SINKS-OK")
 """,
         probe_root=tmp_path,
@@ -1187,8 +1148,6 @@ os.environ.update({
     "CCC_AGENT_PROVIDER": "piri",
     "CCC_BRIDGE_MEMORY_MODE": "audience-scoped",
     "CCC_BRIDGE_MEMORY_AUDIENCE_ROOT": str(root / "audiences"),
-    "CCC_HONCHO_MEMORY_ENABLED": "1",
-    "CCC_HONCHO_CFG": str(root / "honcho.json"),
     "CCC_USAGE_BUDGET_TOKENS_PIRI": "200000",
 })
 
@@ -1204,7 +1163,6 @@ assert isinstance(context.distill_snapshot_worker, CodexThreadSnapshotter)
 assert context.distill_snapshot_worker._runtime is context.agent_runtime
 assert context.distill_local_sink_worker is not None
 assert context.distill_wiki_sink_worker is not None
-assert context.distill_honcho_sink_worker is not None
 assert context.distill_extraction_worker._extractor_provider == "piri"
 assert context.distill_extraction_worker._backend.provider == "piri"
 print("COMPOSED-PIRI-MEMORY-PIPELINE-OK")
@@ -1237,7 +1195,6 @@ context = build_context(load_runtime_settings())
 assert context.distill_snapshot_worker is None
 assert context.distill_extraction_worker is None
 assert context.distill_wiki_sink_worker is None
-assert context.distill_honcho_sink_worker is None
 print("DISTILL-OFF-OK")
 """,
         probe_root=tmp_path,

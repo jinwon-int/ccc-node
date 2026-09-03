@@ -56,7 +56,7 @@ user that runs ccc-node.
 - The stored-session reader accepts only bounded, owner-only, non-symlink
   Piri JSONL transcripts whose header contains the exact requested session id.
 - Session-end, provider-switch, `/new`, shutdown, and `/distill` checkpoints
-  enter the same local, Honcho, and Family Wiki writeback pipeline used by
+  enter the same local and Family Wiki writeback pipeline used by
   Codex. The source provenance remains `piri`.
 - Writeback extraction currently uses the isolated Codex extraction backend,
   so a working Codex CLI and authentication are required for Piri distillation;

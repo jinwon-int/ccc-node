@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SessionStart memory bootstrap for a Claude Code node (node-owned memory).
-# Serves built-in MEMORY/USER + bounded cached Family Wiki/Honcho/local hot memory instantly,
+# Serves built-in MEMORY/USER + bounded cached Family Wiki/local hot memory instantly,
 # then fires a detached background refresh so the next session is fresh.
 set -uo pipefail
 
@@ -14,12 +14,11 @@ STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 CACHE="${CCC_MEMORY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
 HOOKDIR="${CCC_HOOK_DIR:-${HOME:-/root}/.claude/hooks}"
 MEMDIR="${CCC_MEMORY_DIR:-${HOME:-/root}/.claude/memories}"
-PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
+PROFILE="${CCC_MEMORY_PROFILE:-standard}"
 TTL="${CCC_MEMORY_CACHE_TTL_SEC:-21600}"
 MAX_TOTAL="${CCC_MEMORY_MAX_BYTES:-12000}"
 MAX_MEM="${CCC_BUILTIN_MEMORY_MAX_BYTES:-4000}"
 MAX_WIKI="${CCC_WIKI_MAX_BYTES:-5000}"
-MAX_HONCHO="${CCC_HONCHO_MAX_BYTES:-4000}"
 MAX_LOCAL="${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}"
 # Skill index (#1145): node skills are plain files the session cannot see, so
 # name-keyword searches miss them (gh-pr-flow sat undiscovered through three
@@ -29,7 +28,6 @@ MAX_SKILLS="${CCC_SKILL_INDEX_MAX_BYTES:-1500}"
 SKILLS_ENABLED="${CCC_SKILL_INDEX_ENABLED:-1}"
 SKILLS_DIR="${CCC_SKILLS_DIR:-${HOME:-/root}/.claude/skills}"
 MAX_RESUME="${CCC_RESUME_MAX_BYTES:-2000}"
-HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-0}"
 WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
 ISOLATION_PROFILE="${CCC_NODE_ISOLATION_PROFILE:-fleet}"
 [ "$ISOLATION_PROFILE" = "external" ] && WIKI_ENABLED=0
@@ -159,9 +157,6 @@ if ! is_disabled "$AUDIENCE_SCOPED"; then
         '{hookSpecificOutput:{hookEventName:$event,additionalContext:"Audience-scoped memory unavailable: invalid audience metadata."}}'
       exit 0
   fi
-  if ! honcho_scope_valid; then
-    HONCHO_ENABLED=0
-  fi
 fi
 
 scan_injection_block() { # <label> <text>
@@ -226,7 +221,7 @@ scan_capped_block() { # <label> <max> <text>
 }
 
 # Cross-source injection dedup. The local hot-memory search re-surfaces hits from
-# MEMORY.md/USER.md (source=memory) and the wiki/honcho caches (source=cache) that
+# MEMORY.md/USER.md (source=memory) and the wiki cache (source=cache) that
 # are ALSO injected verbatim as their own blocks above — double-spending the
 # bounded injection budget. Drop such a hit only when its snippet is already fully
 # present in the injected text, so anything truncated away from the canonical
@@ -331,15 +326,6 @@ if ! is_disabled "$WIKI_ENABLED"; then
     wiki="$(cat "$LEGACY_CACHE_DIR/wiki.txt" 2>/dev/null)"
   fi
 fi
-honcho=""
-if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then
-  honcho="$(cat "$CACHE/honcho.txt" 2>/dev/null)"
-  if ! is_disabled "$AUDIENCE_SCOPED" \
-    && [ "$MEMORY_AUDIENCE" = "private" ] \
-    && [ -z "$honcho" ]; then
-    honcho="$(cat "$LEGACY_CACHE_DIR/honcho.txt" 2>/dev/null)"
-  fi
-fi
 resume="$(cat "$RESUME_FILE" 2>/dev/null)"
 if ! is_disabled "$AUDIENCE_SCOPED" && [ "$MEMORY_AUDIENCE" = "private" ]; then
   legacy_resume="$(cat "$LEGACY_RESUME_FILE" 2>/dev/null)"
@@ -423,7 +409,6 @@ if [ -n "$scan_dir" ]; then
   if ! is_disabled "$WIKI_ENABLED"; then
     scan_lane wiki family-wiki-cache "$MAX_WIKI" "$wiki" &
   fi
-  scan_lane honcho honcho-cache "$MAX_HONCHO" "$honcho" &
   wait
   _mark scan_parallel
 fi
@@ -437,12 +422,11 @@ fi
 if ! is_disabled "$WIKI_ENABLED"; then
   wiki="$(scanned_block wiki family-wiki-cache "$MAX_WIKI" "$wiki")"
 fi
-honcho="$(scanned_block honcho honcho-cache "$MAX_HONCHO" "$honcho")"
 if [ -n "$scan_dir" ]; then rm -rf "$scan_dir"; fi
 
 # Relevance-aware budget. The per-block caps sum to more than CCC_MEMORY_MAX_BYTES,
-# so today the tail (Honcho) is simply truncated and any budget a small/empty block
-# leaves unused (no wiki/honcho cache, or max-perf which drops Honcho) is wasted —
+# so today the tail (wiki) is simply truncated and any budget a small/empty block
+# leaves unused (no wiki cache) is wasted —
 # while the local hot block is also under-filled because the search returns only
 # CCC_MEMORY_SEARCH_LIMIT (5) results regardless. Reclaim that slack for the local
 # hot block — the task-conditioned, most query-relevant source — by growing BOTH
@@ -454,7 +438,6 @@ search_limit="${CCC_MEMORY_SEARCH_LIMIT:-}"
 if ! is_disabled "${CCC_MEMORY_DYNAMIC_BUDGET:-1}"; then
   msize="$(byte_len "$mem")"
   wsize="$(byte_len "$wiki")"
-  hsize="$(byte_len "$honcho")"
   # The working-state block is a second pointer-class block next to resume;
   # count it there so the local hot block cannot reclaim bytes it occupies.
   rsize="$(( $(byte_len "$resume") + $(byte_len "$ws") ))"
@@ -462,7 +445,7 @@ if ! is_disabled "${CCC_MEMORY_DYNAMIC_BUDGET:-1}"; then
   # minus a ~1000B scaffold reserve); dyn_limit = results to fetch to fill it
   # (~180B/result, clamped to [5,25]). The final limit_bytes is the hard bound.
   budget_out="$(python3 "$MEMORY_RENDER_PY" dynamic-budget \
-    "$MAX_TOTAL" 1000 "$MAX_LOCAL" 180 5 25 "$msize" "$rsize" "$wsize" "$hsize" 2>/dev/null || true)"
+    "$MAX_TOTAL" 1000 "$MAX_LOCAL" 180 5 25 "$msize" "$rsize" "$wsize" 2>/dev/null || true)"
   alloc_candidate="${budget_out%% *}"
   limit_candidate="${budget_out##* }"
   case "$alloc_candidate" in ''|*[!0-9]*) ;; *) alloc_local="$alloc_candidate" ;; esac
@@ -575,8 +558,7 @@ if [ -n "$local_hot" ]; then
   # post-truncation) before rendering it — so it surfaces index-only content
   # (distilled facts) instead of echoing the canonical blocks.
   local_hot="$(dedup_local_hot "$mem
-$wiki
-$honcho" "$local_hot")"
+$wiki" "$local_hot")"
   _mark dedup
   # Render the search JSON to compact readable lines, then apply the (possibly
   # enlarged) local byte budget (scan + cap in one process).
@@ -591,20 +573,6 @@ wiki_note="Family Wiki disabled"
 if ! is_disabled "$WIKI_ENABLED"; then
   wiki_note="$(stale_note 'Family Wiki' "$CACHE/wiki.txt")"
 fi
-honcho_note="Honcho disabled"
-if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then
-  honcho_note="$(stale_note 'Honcho' "$CACHE/honcho.txt")"
-fi
-
-# Gate-3 transition (#824 Phase 1): on nunchi-enabled nodes the nunchi
-# snapshot hook is the primary working memory; label Honcho secondary so the
-# model weighs sources accordingly. Honcho stays injected for verification
-# until Phase 3 (freeze/retire).
-honcho_role=""
-nunchi_mode="${CCC_NUNCHI_MODE:-$(cat "$STATE_DIR/nunchi.mode" 2>/dev/null || printf 'off')}"
-if [ "$nunchi_mode" = "on" ]; then
-  honcho_role=" (secondary — nunchi snapshot is primary during the gate-3 transition)"
-fi
 
 resume_block=""
 if [ -n "${resume:-}" ]; then
@@ -614,7 +582,7 @@ ${resume}
 fi
 
 # Working-state block (#1176). Placed right after MEMORY+USER so the byte caps
-# downstream (the materializer truncates from the tail) cut Honcho/Wiki before
+# downstream (the materializer truncates from the tail) cut the wiki block before
 # the live task pointer. Stale guard mirrors checkpoint.sh: CCC_CKPT_STALE_DAYS
 # (default 14, 0 disables) — a weeks-old objective must not read as current.
 ws_block=""
@@ -747,16 +715,14 @@ ctx="# ${node_label} session memory (auto-injected: $EVENT)
 
 ${resume_block}${operational_note}
 ${audience_note}
-Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}; ${honcho_note}. A background refresh runs each session for the next one.
+Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}. A background refresh runs each session for the next one.
 
 ## Built-in MEMORY + USER
 ${mem:-(memory files unavailable)}
 ${ws_block}${promises_block}${detached_block}
 ## Local hot memory (task-conditioned cache search)
 ${local_hot:-(local hot memory disabled or no hits)}
-${skills_block}${wiki_block}
-## Honcho working memory — ${USER_LABEL}${honcho_role}
-${honcho:-(Honcho disabled or no Honcho cache yet)}"
+${skills_block}${wiki_block}"
 
 ctx="$(printf '%s' "$ctx" | limit_bytes "$MAX_TOTAL")"
 

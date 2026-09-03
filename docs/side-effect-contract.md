@@ -18,7 +18,7 @@ python3 scripts/ccc_side_effect_contract.py --repo-root .
 recovery drill은 외부 네트워크 대신 in-memory fake sink를 사용한다. native key는
 같은 key의 두 번째 attempt를 한 effect로 축약하고, local-ledger 또는 무키 효과의
 ambiguous window는 계약대로 reconcile/manual/compensation에서 멈춘다. 이 검사는
-exactly-once를 주장하지 않으며 실제 Telegram, Honcho, self-update를 실행하지 않는다.
+exactly-once를 주장하지 않으며 실제 Telegram, self-update를 실행하지 않는다.
 
 아래 두 표는 JSON에서 생성된다. 직접 수정하지 않고 contract를 변경한 뒤
 `--render-document` 출력으로 함께 갱신한다.
@@ -29,7 +29,6 @@ exactly-once를 주장하지 않으며 실제 Telegram, Honcho, self-update를 �
 | Operation | Owner | Idempotency / key | Retry | Ambiguous window | Reconcile | Compensation | Audit | Approval boundary | Implementation |
 |---|---|---|---|---|---|---|---|---|---|
 | `telegram.send_text` | bridge delivery | none: `none` | conditional | request accepted before response or process exit before caller ACK | manual | delete | body-free bridge diagnostics and Telegram receipt when returned | authorized bridge delivery path | `bridge/utils/tg_robust.py::send_with_retry` |
-| `honcho.deliver_distill` | memory Honcho sink worker | native: `ccc-distill-<job-id> and ccc-distill-<job-id>-session` | safe | HTTP success before durable outbox ACK and journal completion | none | none | owner-only outbox plus leased distill journal status | configured memory route and Honcho enable gate | `bridge/memory/distill_honcho_worker.py::CodexDistillHonchoSinkWorker.write_once` |
 | `self_update.apply` | pre-approved node maintenance | local-ledger: `old and new commit SHA plus installer generation stamps` | conditional | repository or installed artifacts changed before terminal audit | query | restore-snapshot | body-free self-update audit record and notification result | reviewed procedure plus operator-owned service allowlist | `scripts/ccc-self-update.sh::<top-level>` |
 | `agent_cron.spool_notify` | agent-cron owner notification | local-ledger: `agent-cron:<task-id>:<run-id>:<status>` | conditional | spool file created before lastRunAt/runHistory ACK | receipt | delete | body-free spool path and redacted owner text envelope | notify=telegram-owner or allowlisted telegram-chat | `scripts/agent_cron.py::write_owner_spool` |
 | `external_wait.wake_resume` | bridge external-wait monitor | local-ledger: `registry pending-wake journal keyed by wait_id; terminal finish is journaled before any delivery` | safe | owner notice accepted by the push spool or continuation admitted before mark_wake persists, so a later drain may repeat it | query | none | external-wait registry wake record (delivered/resumed/skip_reason) plus body-free bridge diagnostics | auto-resume gate: resume_enabled flag, daily cap, and exact-head terminal pinning; gh transport stays read-only | `bridge/core/external_wait_monitor.py::ExternalWaitMonitor._deliver_wake` |
@@ -42,7 +41,6 @@ exactly-once를 주장하지 않으며 실제 Telegram, Honcho, self-update를 �
 | Operation | Before intent | Intent → call | Success → ACK | ACK → terminal | Duplicate/restart |
 |---|---|---|---|---|---|
 | `telegram.send_text` | safe-replay | safe-replay | manual-review | safe-replay | manual-review |
-| `honcho.deliver_distill` | safe-replay | safe-replay | safe-replay | safe-replay | safe-replay |
 | `self_update.apply` | safe-replay | safe-replay | reconcile | safe-replay | reconcile |
 | `agent_cron.spool_notify` | safe-replay | safe-replay | reconcile | safe-replay | reconcile |
 | `external_wait.wake_resume` | safe-replay | safe-replay | reconcile | safe-replay | reconcile |

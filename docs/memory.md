@@ -7,7 +7,6 @@ ccc-node memory starts from a no-network SessionStart snapshot and refreshes cac
 - Built-in `MEMORY.md` / `USER.md` templates for stable facts.
 - Local hot-memory SQLite FTS/fuzzy index.
 - Cached Family Wiki prefetch.
-- Cached Honcho working memory.
 - Optional local nunchi snapshot on nodes that explicitly enable nunchi mode.
 - Distilled local facts from the Session Distiller pipeline.
 
@@ -38,8 +37,8 @@ from `observed_at` (when the system learned the fact). Boundary rule:
 - `CCC_NODE_ISOLATION_PROFILE=external` is the higher-priority external-node placement policy. The bridge validates and exports it to Claude hooks; it forces Family Wiki off (injection, refresh, local indexing, and distill queue writes). It is a **memory-source gate, not an execution boundary**: the node has no PreToolUse policy hook (removed, TM-1306), so path/URL/command/MCP execution is governed by behavioral policy plus the OS-level wrappers documented in [`docs/service-control.md`](service-control.md).
 - `CCC_WIKI_MEMORY_ENABLED=0` disables the Family Wiki read and write path: no cache injection, refresh, local indexing, distill candidate generation, or Wiki queue writes. Existing cache files are ignored and removed from the local index on its next update/rebuild. An external isolation profile overrides an attempted `=1`.
 - `CCC_MEMORY_USER_LABEL` and `CCC_MEMORY_ASSISTANT_LABEL` set the node-local relationship labels used by memory injection and distill. Defaults preserve the existing Seoyoon fleet behavior.
-- `CCC_HONCHO_MEMORY_ENABLED` defaults to `0` since the 2026-09-01 fleet retirement of Honcho (TM-2029 phase 3; the gwakga stack is stopped). `=1` re-enables the Honcho read and Codex write-back path on a node that still has a live endpoint. `=0` disables the Honcho read and Codex write-back path. A node may therefore run built-in/local memory only, Honcho without Wiki, or the default combined profile. `CCC_HONCHO_CFG` selects the owner-only endpoint/credential config (default `~/.hermes/honcho.json`).
-- `CCC_BRIDGE_MEMORY_MODE=audience-scoped` derives a distinct Honcho workspace as `<configured-workspace>--ccc-<opaque-scope>`. Shared routes read and write only the shared workspace. Private routes write only their private workspace and may recall that workspace plus the shared workspace and the original configured workspace as private-only legacy input. The legacy workspace is never queried by a group/channel route or copied into shared storage. When Wiki memory is enabled, Codex may generate human-review candidates, but the bridge partitions them under an opaque audience scope and labels every record with its `private` or `shared` audience. No candidate is sent to Family Wiki automatically. `CCC_HONCHO_MEMORY_ENABLED=0` and `CCC_WIKI_MEMORY_ENABLED=0` still disable their respective paths.
+- Honcho was retired fleet-wide on 2026-09-01 (TM-2029 phase 3) and the Honcho read/write plumbing has been removed (#1436): there is no `CCC_HONCHO_MEMORY_ENABLED` toggle, no Honcho cache injection/refresh, and no Honcho distill sink. The `honcho` key in the distill extraction contract survives as a historical field name (`#1436`); node-local `~/.hermes/honcho.json` credential files are pending owner-approved disposal (TM-2029 phase 5).
+- `CCC_BRIDGE_MEMORY_MODE=audience-scoped` partitions local facts and Wiki candidates by an opaque audience scope. Shared routes read and write only the shared workspace; private routes read private, shared, and private-only legacy stores, and the legacy store is never queried by a group/channel route or copied into shared storage. When Wiki memory is enabled, Codex may generate human-review candidates, but the bridge partitions them under an opaque audience scope and labels every record with its `private` or `shared` audience. No candidate is sent to Family Wiki automatically. `CCC_WIKI_MEMORY_ENABLED=0` disables the Wiki path.
 - In audience-scoped mode, an authorized user may explicitly run `/memory_promote distill-<12 lowercase hex>` from their private DM. The bridge resolves the caller's opaque private scope, accepts only a validated `auto-local` private fact already stored in that scope, copies a whitelisted fact body into shared local memory, appends a body-free owner-only audit record, and refreshes the shared index. Stable promotion/destination ids and a shared sink lock make retries and concurrent duplicate commands idempotent. Group/channel commands, arbitrary text, model-inferred shareability, private legacy facts, and unvalidated records fail closed. Audit and promoted-source metadata contain hashes and fact ids, never raw Telegram numeric ids or the opaque private scope.
 
 ## Codex global snapshot materializer
@@ -239,12 +238,11 @@ There is no Codex user-session A2A launch path in current ccc-node main. The #47
 - Startup injection is fail-open and no-network.
 - SessionStart local-hot retrieval is read-only and has an inner deadline controlled by `CCC_MEMORY_SEARCH_TIMEOUT_SEC` (default 3 seconds, capped at 10 below the outer 15-second hook limit). A timeout drops only local-hot results; bounded MEMORY/USER/cache/resume blocks still inject.
 - Background refresh uses single-flight locking and should not block the interactive session.
-- The managed warmer may still run every 30 minutes so Family Wiki stays current,
-  but a successful or empty Honcho read is reused for
-  `CCC_HONCHO_CACHE_MAX_AGE_SEC` (default 21600 seconds) while its task query and
-  non-secret configuration fingerprint are unchanged. Fresh skips do not advance
-  `refreshed_at`. `CCC_HONCHO_FORCE_REFRESH=1`, a material task/config change,
-  expiry, or a successful distill push/replay forces the next Honcho read.
+- The managed warmer may still run every 30 minutes so Family Wiki stays current.
+  A successful or empty Wiki prefetch is reused for `CCC_WIKI_CACHE_MAX_AGE_SEC`
+  (default 21600 seconds) while its task query is unchanged; fresh skips do not
+  advance `refreshed_at`. `CCC_WIKI_FORCE_REFRESH=1`, a material task change, or
+  expiry forces the next prefetch.
 - Diagnostics should report counts, statuses, paths, and cache ages only; do not print memory snippets or secrets in fleet reports.
 - On Termux, use `${TMPDIR:-$HOME/tmp}` for scratch and keep state under the user's writable home/state directory.
 
@@ -285,7 +283,7 @@ python3 "${CCC_CLAUDE_DIR:-$HOME/.claude}/hooks/ccc_local_memory_transaction.py"
 
 Audience-scoped memory uses a separate state directory and rollback head for
 each opaque private/shared scope. The operation affects local memory only; it
-does not undo Honcho delivery or a Wiki candidate.
+does not undo a Wiki candidate.
 
 ## Provider-neutral distill contract and extractor backends
 
@@ -346,10 +344,12 @@ bounded by `CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP` (1).
   `DistillBackend` protocol, privacy gates, canonical input serializer, strict JSON
   parser, and body-free diagnostics.
 - `schemas/codex-distill-extraction-v1.schema.json` is the checked-in provider output
-  schema. Every object rejects additional properties. Honcho facts are capped at 12,
-  Wiki candidates at 3, Wiki paths are limited to relative `pages/team/...`,
-  `pages/nodes/...`, or `pages/log.md` targets, and resume/evidence fields are bounded.
-  Each Honcho fact carries a required-but-nullable `because` (#1264): extractors set
+  schema. Every object rejects additional properties. Facts are capped at 12
+  (historically serialized under the `honcho` key — the name outlived the
+  retired Honcho sink, #1436), Wiki candidates at 3, Wiki paths are limited to
+  relative `pages/team/...`, `pages/nodes/...`, or `pages/log.md` targets, and
+  resume/evidence fields are bounded.
+  Each fact carries a required-but-nullable `because` (#1264): extractors set
   it to the transcript-supported one-sentence reason for every `kind=decision` fact
   — a decision without its why gets blindly re-litigated or blindly obeyed (weekly
   bench q7 measured a decision whose reason survived only in the Wiki). The parser
@@ -363,7 +363,7 @@ bounded by `CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP` (1).
   non-empty `wiki_candidates` result then fails closed.
 - Transcript text remains untrusted data. Credential-like content is redacted before
   canonical input serialization, while credential-like or directive-like durable
-  Honcho/Wiki output is rejected.
+  output is rejected.
 - `bridge/memory/codex_exec_backend.py` implements the isolated provider adapter. It
   launches `codex exec` with `--ephemeral`, `--ignore-user-config`, `--ignore-rules`,
   `--sandbox read-only`, an empty private cwd, checked-in output schema, canonical
@@ -392,20 +392,11 @@ bounded by `CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP` (1).
   audience-scoped mode, the worker fails closed on a legacy job with no route instead
   of placing it in the global queue. This
   path never invokes `wiki-agent`, writes a Wiki page, creates a branch/PR, or merges.
-  Empty candidate sets complete without a queue record. Honcho routing remains under
-  an independent lease: legacy jobs use the owner-only
-  `${BOT_DATA_DIR}/honcho-outbox/<job-id>.json`, while audience-routed jobs use
-  `${BOT_DATA_DIR}/honcho-outbox/<opaque-scope>/<job-id>.json` and deliver to the
-  matching physical Honcho workspace with explicit audience/scope labels. Audience
-  mode rejects a legacy job with no route rather than sending it globally. Delivery
-  uses a stable `Idempotency-Key`; network/config outages keep the scoped outbox
-  record retryable without re-extraction, and success acknowledges it. The Honcho
-  payload contains strict facts, opaque route labels, and hashed provenance, never a
-  raw thread, Telegram numeric identity, transcript, or credential value.
+  Empty candidate sets complete without a queue record.
 - A completed audience-local sink write refreshes that scope's derived SQLite
   index with the installed `ccc-memory-index.sh` before the journal marks the
   local stage done. The bounded subprocess receives only local path/policy
-  variables, disables Wiki/Honcho and optional embedding commands, suppresses
+  variables, disables Wiki and optional embedding commands, suppresses
   output bodies, and retries safely after a partial fact commit. This makes a
   newly distilled durable fact available to the immediately following scoped
   Codex materialization without waiting for the next background refresh.

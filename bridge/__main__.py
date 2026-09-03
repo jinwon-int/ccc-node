@@ -43,7 +43,6 @@ class AppContext:
     distill_local_sink_worker: Any
     memory_promoter: Any
     distill_wiki_sink_worker: Any
-    distill_honcho_sink_worker: Any
     project_chat: Any
     agent_runtime: Any
     sdk_factory: Any
@@ -350,9 +349,6 @@ def build_context(
         settings.node_isolation_profile != "external"
         and settings.wiki_memory_enabled
     )
-    honcho_enabled = (
-        settings.honcho_memory_enabled
-    )
     distill_provider = resolve_distill_provider(
         settings.agent_provider,
         settings.memory_distill_provider,
@@ -379,7 +375,6 @@ def build_context(
                 codex_environment=distill_environment,
             ),
             wiki_enabled=wiki_enabled,
-            honcho_enabled=honcho_enabled,
             extractor_provider=distill_provider,
             model=distill_model,
             guard=DistillGuard(),
@@ -448,27 +443,6 @@ def build_context(
             queue_dir=settings.bot_data_dir / "wiki-candidates",
             require_memory_route=audience_scoped,
         )
-    distill_honcho_sink_worker = None
-    if (
-        distill_provider is not None
-        and settings.agent_provider in {"claude", "codex", "piri"}
-        and honcho_enabled
-    ):
-        from telegram_bot.memory.distill_honcho_worker import (
-            CodexDistillHonchoSinkWorker,
-            HonchoHttpSender,
-        )
-
-        distill_honcho_sink_worker = CodexDistillHonchoSinkWorker(
-            distill_journal,
-            outbox_dir=settings.bot_data_dir / "honcho-outbox",
-            sender=HonchoHttpSender(
-                settings.honcho_config_path,
-                node_label=os.environ.get("CCC_NODE", "ccc-node"),
-            ),
-            require_memory_route=audience_scoped,
-        )
-
     # Default-on Codex/Piri skill-candidate collector (#749, piri parity).
     # Three-guard per provider: matching node provider, no explicit opt-out, and
     # a distill journal to read snapshots from. Claude composition is unchanged
@@ -490,7 +464,6 @@ def build_context(
         distill_local_sink_worker=distill_local_sink_worker,
         memory_promoter=memory_promoter,
         distill_wiki_sink_worker=distill_wiki_sink_worker,
-        distill_honcho_sink_worker=distill_honcho_sink_worker,
         project_chat=project_chat,
         agent_runtime=agent_runtime,
         sdk_factory=sdk_factory,
@@ -514,7 +487,6 @@ def create_app(context: AppContext):
         distill_local_sink_worker=context.distill_local_sink_worker,
         memory_promoter=context.memory_promoter,
         distill_wiki_sink_worker=context.distill_wiki_sink_worker,
-        distill_honcho_sink_worker=context.distill_honcho_sink_worker,
         application_builder_factory=context.telegram_port,
         clock=context.clock,
     )
