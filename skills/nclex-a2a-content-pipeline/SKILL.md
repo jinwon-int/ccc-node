@@ -1,6 +1,6 @@
 ---
 name: nclex-a2a-content-pipeline
-description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2A pipeline — terminology lane dispatch, result-preservation rerun on verdict fail, coverage review projection, CI recovery (stale base.sha), content 2-lane dispatch with keyring-trusted worker routing, signed receipt posting, and a2a/receipts verification. Use when authoring or shepherding an NCLEX 출제 PR (new_case/rewrite/remediation), when a terminology or content lane must be dispatched, when a lane returns review_verdict_failed, or when receipts must be projected to the PR. 확립 2026-08-13 RRP-003(#249)·PA-006(#251) 2회 완주.
+description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2A pipeline — terminology lane dispatch, result-preservation rerun on verdict fail, coverage review projection, CI recovery (stale base.sha), content 2-lane dispatch with keyring-trusted worker routing, signed receipt posting, and a2a/receipts verification. Includes the sanctioned task watcher (watch-task.sh, #1389) for polling broker tasks with the correct terminal vocabulary. Use when authoring or shepherding an NCLEX 출제 PR (new_case/rewrite/remediation), when a terminology or content lane must be dispatched, when a lane returns review_verdict_failed, when polling an A2A lane task, or when receipts must be projected to the PR. 확립 2026-08-13 RRP-003(#249)·PA-006(#251) 2회 완주.
 ---
 
 # nclex A2A content pipeline (좁은 문 규율)
@@ -47,8 +47,27 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
    `terminology_bilingual`, reviewer는 저자 아닌 신뢰 워커(선례 sogyo),
    `sourceBundle.files[0].content`에 계약+changedRecords(75쌍)+relevantRules+
    machineGate 내장. `terminalBrief.notificationOwnership` 필수.
-3. dry-run → 디스패치 → 브로커 GET `/tasks/<url-enc-id>`로 감시.
+3. dry-run → 디스패치 → 브로커 감시는 **스킬 동봉 워처 `watch-task.sh`**(같은
+   디렉터리)로 한다. 즉석 폴링 스크립트 작성 금지 — #1389 사고(워처가
+   `completed|cancelled` 등 존재하지 않는 상태를 기다려 38회 `state=succeeded`
+   로그를 남기고도 타임아웃, 결과 파일 미저장)의 재발 방지 계약:
+   - 종료 상태는 브로커 TaskStatus 어휘 그대로 `succeeded|failed|canceled`
+     (비종료: `blocked|queued|claimed|running`; 원전 a2a-nexus
+     `packages/broker/src/core/broker-status-predicates.ts`).
+   - 첫 폴링에서 실측 status를 출력해 어휘를 검증한다.
+   - 어휘 밖 상태가 3회 연속 관측되면 `unknown_state`로 즉시 종료·결과 저장
+     (성공을 놓치는 것보다 오탐 종료가 안전).
+   - 모든 종료 경로(타임아웃·네트워크 실패 포함)에 결과 파일을 쓴다 —
+     **결과 파일이 없으면 워처는 끝까지 살아 있었던 것이 아니다**.
+   - secret은 `--secret-file`(argv·출력 노출 없음, env 스타일 파일은
+     `FILE:VAR_NAME` 추출)로만 전달한다.
+   예: `watch-task.sh --broker "$BROKER_URL" --task-id "$LANE_ID" \
+     --requester-id <manifest requester.id> --requester-role <requester.role> \
+     --secret-file <env-file>:BROKER_EDGE_SECRET \
+     --out /root/nclex-dispatch/watch-<lane>.json`
 4. **`review_verdict_failed`이면 먼저 GET `/tasks/:id` 와 `/tasks/:id/diagnostics`를 본다.**
+   (`review_verdict_failed`는 status가 아니라 result/error의 **코드**다 — 그때
+   status는 `failed`로 온다. 상태 어휘와 판정 코드를 혼합하지 않는 것도 #1389 교훈.)
    `sameSourceRedispatch.action=skip` 이거나 `negativeVerdictEvidence`에
    소견(findings/note)이 있으면 **같은 소스 diagnostic/결과보존 재생을 하지 않는다**
    (#1815 item 5, #1878 + redispatch classifier). merge gate는 그대로 fail-closed.

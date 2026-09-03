@@ -188,7 +188,8 @@ SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh claude/hooks/lifecycle-fe
           scripts/bridge-watchdog.sh scripts/bridge-watchdog.test.sh \
           scripts/resource-pressure-guard.sh scripts/resource-pressure-guard.test.sh \
           scripts/honcho-peer-staleness-canary.sh scripts/honcho-peer-staleness-canary.test.sh \
-          scripts/git-hooks/managed-checkout-guard scripts/managed-checkout-guard.test.sh)
+          scripts/git-hooks/managed-checkout-guard scripts/managed-checkout-guard.test.sh \
+          skills/nclex-a2a-content-pipeline/watch-task.sh)
 if command -v shellcheck >/dev/null 2>&1; then
   SC_PRESENT=()
   for f in "${SC_SCOPE[@]}"; do
@@ -416,6 +417,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/rescreen-rotation.test.sh \
          scripts/a2a-review-handler.test.sh \
          scripts/a2a-rescreen-rotation.test.sh \
+         scripts/nclex-a2a-watch-task.test.sh \
          scripts/ccc-skill-registry.test.sh \
          scripts/ccc-fleet-skills-sync.test.sh \
          scripts/gh-pr-flow-seoseo-merge.test.sh \
