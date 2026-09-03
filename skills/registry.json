@@ -54,7 +54,7 @@
       "name": "ccc-self-update",
       "source": "codex/skills/ccc-self-update",
       "status": "active",
-      "tree_sha256": "a59fd19b6ed7df4596ae7b9a382f2db1ebdfcb3a206c83cf6fd2d2941c53a401"
+      "tree_sha256": "bc6bd44ec8440d7dda36c4d33cbb63dd269a18763da223f2f2380c3cb6342acf"
     },
     {
       "audience": "codex",

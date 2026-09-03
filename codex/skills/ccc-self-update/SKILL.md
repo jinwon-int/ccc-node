@@ -38,7 +38,7 @@ Verification record (pinned at ccc-node main `64fce88`, 2026-09-03 KST):
 | `scripts/ccc-bridge-locate.sh --json` | usage `--json` documented at lines 16–17; flag parsed at line 36 |
 | `setup.sh --dry-run` | usage at line 13; flag parsed at line 80; `[dry-run]` output prefix at line 161 |
 | `scripts/validate-harness.sh` | run by CI ("Validate harness": JSON, shell syntax, shellcheck, hook tests, frontmatter — `.github/workflows/ci.yml`) |
-| durable operator backup | `backup_claude_dir()` — setup.sh:412, writes `~/.claude/backups/ccc-node-setup-<ts>.tar.gz`, archive validated with `tar -tzf` |
+| durable operator backup | `backup_claude_dir()` — setup.sh:412, writes `ccc-node-setup-<ts>.tar.gz` into the harness configuration directory's `backups/`, archive validated with `tar -tzf` |
 | transactional rollback | `begin_install_transaction()` setup.sh:221–237; `rollback_install_transaction()` setup.sh:239–255 (auto-runs via exit trap) |
 
 Re-verify this table against the checkout after each Gate A sync; if a line
@@ -101,18 +101,23 @@ reference drifted, re-confirm the surface by hand before Gate B.
    approval ask:  explicit yes/no for Gate B only
    ```
 
-6. **Gate B — apply with backup** (only after a separate explicit yes):
+6. **Gate B — apply with backup** (only after a separate explicit yes).
+   The restore-archive location is the `backups/` subdirectory of the harness
+   configuration directory — read its resolved path from step 5's closing
+   "Resolved path configuration" output (it respects the `CCC_*` overrides;
+   do not hardcode it in this skill):
    ```bash
-   ls -t ~/.claude/backups/ccc-node-setup-*.tar.gz 2>/dev/null | head -1   # prior newest, if any
+   BACKUPS_DIR="<backups dir from step 5 resolved output>"
+   ls -t "$BACKUPS_DIR"/ccc-node-setup-*.tar.gz 2>/dev/null | head -1   # prior newest, if any
    "$ROOT/setup.sh"
    ```
    setup.sh itself takes the backups — the operator never passes `--no-backup`:
-   a durable restore point at `~/.claude/backups/ccc-node-setup-<ts>.tar.gz`
-   (validated with `tar -tzf`), plus a private pre-apply transaction snapshot
-   that powers automatic rollback. Verify after apply:
+   a durable restore point `ccc-node-setup-<ts>.tar.gz` (validated with
+   `tar -tzf`), plus a private pre-apply transaction snapshot that powers
+   automatic rollback. Verify after apply:
    - exit code 0, and the closing "Resolved path configuration" block printed;
-   - a **new** archive now exists: `ls -t ~/.claude/backups/ccc-node-setup-*.tar.gz | head -1`
-     is newer than the prior newest recorded above.
+   - a **new** archive now exists: the newest `ccc-node-setup-*.tar.gz` in
+     `$BACKUPS_DIR` is newer than the prior newest recorded above.
    If the new backup is absent, treat the apply as unverified: stop, report,
    do not declare success (rollback path below still exists via the internal
    transaction snapshot only while setup ran).
@@ -131,8 +136,9 @@ reference drifted, re-confirm the surface by hand before Gate B.
    instead of assuming it:
    - expected stderr: `ERROR: setup failed; restored previous installed
      artifacts (Claude harness, honcho.json, Codex GitHub policy config)` —
-     if instead it reports rollback was **degraded**, preserve
-     `.ccc-node-setup-rollback.*` next to the harness dir and escalate
+     if instead it reports rollback was **degraded**, preserve the
+     `.ccc-node-setup-rollback.*` directory named in that message (it sits
+     next to the resolved harness configuration directory) and escalate
      immediately;
    - re-run step 7's validate-harness — it must pass against the restored
      harness;
