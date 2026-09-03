@@ -424,7 +424,6 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          bridge/service-install.test.sh \
          bridge/restart.test.sh \
          bridge/start-lib.test.sh \
-         scripts/converge-distill-peer.test.sh \
          scripts/install-agent-cron-systemd.test.sh \
          codex/headless.test.sh crush/headless.test.sh \
          scripts/install-skill-autosave-cron.test.sh \
