@@ -164,6 +164,24 @@ ok "ufw inactive reported as fact" 'bash "$AUDIT" 2>/dev/null | jq -e ".firewall
 write_exec_stub "$TMP/bin/ufw" <<'EOF'
 echo "ERROR: You need to be root to run this script" >&2; exit 1
 EOF
+# Non-root with passwordless sudo (gongmyoung user lane, #1434): sudo -n fallback reads ufw.
+write_exec_stub "$TMP/bin/sudo" <<'EOF'
+[ "$1" = "-n" ] || exit 1
+cat <<'UFW'
+Status: active
+Default: deny (incoming), allow (outgoing), deny (routed)
+
+To                         Action      From
+--                         ------      ----
+8123/tcp                   ALLOW IN    192.168.55.0/24
+UFW
+EOF
+ok "ufw non-root falls back to sudo -n and reads the policy" 'o="$(bash "$AUDIT" 2>/dev/null)"; jq -e ".firewall.ufw | .status == \"active\" and .default_incoming == \"deny\" and (.rules | length == 1) and (.cmd_status | test(\"via=sudo\"))" <<<"$o" >/dev/null'
+write_exec_stub "$TMP/bin/sudo" <<'EOF'
+echo "sudo: a password is required" >&2; exit 1
+EOF
+ok "ufw non-root with sudo refused stays unavailable, exit 0" 'o="$(bash "$AUDIT" 2>/dev/null)"; [ $? = 0 ] && jq -e ".firewall.ufw.status == \"unavailable\"" <<<"$o" >/dev/null'
+rm -f "$TMP/bin/sudo"
 ok "ufw non-root is unavailable, exit 0" 'o="$(bash "$AUDIT" 2>/dev/null)"; [ $? = 0 ] && jq -e ".firewall.ufw.status == \"unavailable\"" <<<"$o" >/dev/null'
 ok "ufw missing is a fact, exit 0" 'o="$(CCC_TUNNEL_AUDIT_UFW_CMD=/nonexistent/ufw bash "$AUDIT" 2>/dev/null)"; [ $? = 0 ] && jq -e ".firewall.ufw.status == \"missing\" and .tools.ufw == false" <<<"$o" >/dev/null'
 # restore the active stub for the markdown checks below

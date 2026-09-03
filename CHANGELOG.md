@@ -4,6 +4,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Fixed
+- **tunnel-audit: ufw is read through `sudo -n` when the probe runs as a
+  non-root user (#1434).** The fleet ssh lands on gongmyoung's harness user,
+  so the first post-#1432 fleet run reported `ufw unavailable` on the one node
+  whose baseline rests on ufw ([TNL-10]). When `ufw status` needs root and
+  `sudo` exists, the collector retries once with `sudo -n` (non-interactive;
+  a refusal keeps `unavailable`) and tags `cmd_status` with `via=sudo`.
+
 ### Added
 - **tunnel-audit collects the host firewall (ufw) so a rule change re-surfaces
   an accepted public bind (#1431).** gongmyoung's Home Assistant /

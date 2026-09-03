@@ -255,18 +255,30 @@ def scan_firewall():
     """ufw only (the fleet's firewall front-end). Missing / non-root / inactive
     are facts, never failures. Rules are normalised to one line each so their
     hash is stable across `ufw status verbose` cosmetic changes."""
-    out, status = run([UFW, "status", "verbose"])
+    def probe(cmd):
+        o, st = run(cmd)
+        has_status = o is not None and any(l.startswith("Status:") for l in o.splitlines())
+        return o, st, has_status
+
+    out, status, ok = probe([UFW, "status", "verbose"])
     ufw = {"status": "missing", "default_incoming": "", "rules": [], "rules_hash": "", "cmd_status": status}
     if out is None:
         return ufw
+    if not ok and shutil.which("sudo"):
+        # ufw only answers root and writes its refusal to stderr (which run()
+        # drops), so "no Status: line" is the signal. User-lane nodes
+        # (gongmyoung: the fleet ssh lands on the harness user, #1434) can
+        # read it through passwordless sudo; -n keeps it non-interactive and a
+        # refusal falls through to "unavailable".
+        sout, sstatus, sok = probe(["sudo", "-n", UFW, "status", "verbose"])
+        if sok:
+            out, status, ok = sout, sstatus + " via=sudo", True
+            ufw["cmd_status"] = status
+    if not ok:
+        ufw["status"] = "unavailable"
+        return ufw
     lines = [l.rstrip() for l in out.splitlines()]
     text = "\n".join(lines)
-    if "need to be root" in text.lower() or "permission denied" in text.lower():
-        ufw["status"] = "unavailable"
-        return ufw
-    if not any(l.startswith("Status:") for l in lines):
-        ufw["status"] = "unavailable"
-        return ufw
     if any(l.startswith("Status: inactive") for l in lines):
         ufw["status"] = "inactive"
         return ufw
