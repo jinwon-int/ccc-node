@@ -1,0 +1,477 @@
+{
+  "schema": "ccc.memory-artifact-inventory.v1",
+  "note": "#873 step-1 inventory. Machine-readable policy registration for every private/body-bearing artifact class the harness writes. Paths are RESOLVER CHAINS (first existing candidate wins), never globs — an apply slice must go through these same chains, never raw $HOME expansion. Fields: role (source|derived|outbox|audit|index|operational), owner, requests (lifecycle request -> action; 'external-handoff' means a node-local run must not touch it). related_dirs (optional, dir-kind entries): sibling directories owned by the same class — classified alongside the resolved dir, never flagged unknown.",
+  "artifacts": [
+    {
+      "id": "nunchi.peer_facts",
+      "path_class": "node-local sqlite",
+      "contains": [
+        "distilled-fact",
+        "because-reason",
+        "source_refs",
+        "hashed-dedup"
+      ],
+      "role": "source",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_DB",
+            "path": "~/.nunchi/facts.db"
+          }
+        ]
+      },
+      "retention": "supersede-chain + observation-ttl(7d)",
+      "requests": {
+        "audience-erasure": "out-of-scope (global DB; scoped DBs live under the audience root entry)",
+        "node-decommission": "handoff-or-drop",
+        "telegram-user-erasure": "redact-by-observed (planner slice 2: row-level)",
+        "cache-rebuild": "rebuild-fts",
+        "fact-correction": "pointer:nunchi-annotate-supersede"
+      },
+      "derived_copies": [
+        "facts_fts"
+      ],
+      "verification": "row-count + sqlite integrity"
+    },
+    {
+      "id": "nunchi.snapshot",
+      "path_class": "node-local derived",
+      "contains": [
+        "fact-lines",
+        "constraint-lines",
+        "review-counters"
+      ],
+      "role": "derived",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_SNAPSHOT",
+            "path": "~/.nunchi/snapshot.md"
+          }
+        ]
+      },
+      "retention": "regenerated every snapshot/assemble call",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete",
+        "cache-rebuild": "rebuild"
+      },
+      "derived_copies": [],
+      "verification": "exists + mtime + regenerate-diff"
+    },
+    {
+      "id": "nunchi.backend_health",
+      "path_class": "node-local audit",
+      "contains": [
+        "backend-attempt-counters"
+      ],
+      "role": "audit",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_DB",
+            "path": "~/.nunchi/backend-health.json"
+          }
+        ]
+      },
+      "retention": "bounded history",
+      "requests": {
+        "node-decommission": "delete",
+        "prune-expired": "prune-old-entries"
+      },
+      "derived_copies": [],
+      "verification": "json-parses"
+    },
+    {
+      "id": "nunchi.judge_audit",
+      "path_class": "node-local audit append-only",
+      "contains": [
+        "judge-verdicts",
+        "batch-counters"
+      ],
+      "role": "audit",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "path": "judge-audit.jsonl"
+          },
+          {
+            "path": "~/.nunchi/judge-audit.jsonl"
+          }
+        ]
+      },
+      "retention": "append-only (erasure conflict: pseudonymize, never delete)",
+      "requests": {
+        "audience-erasure": "pseudonymize",
+        "node-decommission": "retain"
+      },
+      "derived_copies": [],
+      "verification": "jsonl line count"
+    },
+    {
+      "id": "nunchi.bench_sheets",
+      "path_class": "node-local audit",
+      "contains": [
+        "48q-measurement-rows",
+        "aggregate-counters"
+      ],
+      "role": "audit",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "path": "bench-19700101.md"
+          },
+          {
+            "path": "~/.nunchi/bench-19700101.md"
+          }
+        ]
+      },
+      "retention": "retain (calibration evidence, #1210)",
+      "requests": {
+        "node-decommission": "retain"
+      },
+      "derived_copies": [],
+      "verification": "sheet count"
+    },
+    {
+      "id": "audience.state_root",
+      "path_class": "audience-scoped",
+      "audience_scoped_subpath": true,
+      "contains": [
+        "working-state",
+        "scoped-nunchi-db",
+        "scoped-snapshot",
+        "audience-caches"
+      ],
+      "role": "source",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_MEMORY_AUDIENCE_ROOT",
+            "path": "~/.telegram_bot/memory-audiences/default",
+            "kind": "dir"
+          }
+        ]
+      },
+      "retention": "until audience erasure",
+      "requests": {
+        "audience-erasure": "delete-whole-root",
+        "node-decommission": "delete",
+        "cache-rebuild": "rebuild-snapshot"
+      },
+      "derived_copies": [
+        "scoped facts_fts",
+        "scoped snapshot"
+      ],
+      "verification": "root absent + scoped-db row count 0"
+    },
+    {
+      "id": "distill.journal",
+      "path_class": "node-local outbox",
+      "contains": [
+        "distilled-payloads",
+        "session-ids",
+        "decision-reasons"
+      ],
+      "role": "outbox",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "path": "distill-journal",
+            "kind": "dir"
+          },
+          {
+            "path": "~/.telegram_bot/distill-journal",
+            "kind": "dir"
+          }
+        ]
+      },
+      "retention": "bounded; drained entries prunable",
+      "requests": {
+        "audience-erasure": "delete-entries-by-audience",
+        "node-decommission": "delete",
+        "prune-expired": "prune-drained"
+      },
+      "derived_copies": [],
+      "verification": "journal entry count"
+    },
+    {
+      "id": "distill.wiki_candidates",
+      "path_class": "node-local outbox external-adjacent",
+      "contains": [
+        "promotion-candidates"
+      ],
+      "role": "outbox",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "path": "~/.telegram_bot/wiki-candidates",
+            "kind": "dir"
+          }
+        ]
+      },
+      "retention": "until human review (external handoff once promoted)",
+      "requests": {
+        "node-decommission": "external-handoff",
+        "prune-expired": "prune-stale-candidates"
+      },
+      "handoff_note": "promoted candidates live in the Family Wiki — owner workflow, never node-local deletion",
+      "derived_copies": [],
+      "verification": "queue depth"
+    },
+    {
+      "id": "session.resume_working_state",
+      "path_class": "node-local derived",
+      "contains": [
+        "resume-summary",
+        "working-state-objectives"
+      ],
+      "role": "derived",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "resume.md"
+          },
+          {
+            "path": "~/.claude/state/resume.md"
+          }
+        ]
+      },
+      "retention": "overwritten per session",
+      "requests": {
+        "node-decommission": "delete",
+        "cache-rebuild": "rebuild-from-transcripts"
+      },
+      "derived_copies": [],
+      "verification": "file exists, body-free size check"
+    },
+    {
+      "id": "audit.autonomy_ledger",
+      "path_class": "node-local audit append-only",
+      "contains": [
+        "autonomy-events",
+        "approval-records"
+      ],
+      "role": "audit",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "path": "~/.claude/state/autonomy-ledger.jsonl"
+          }
+        ]
+      },
+      "retention": "append-only (erasure conflict: pseudonymize)",
+      "requests": {
+        "audience-erasure": "pseudonymize",
+        "node-decommission": "retain"
+      },
+      "derived_copies": [],
+      "verification": "jsonl line count"
+    },
+    {
+      "id": "external.wait_registry",
+      "path_class": "node-local operational",
+      "contains": [
+        "wait-ids",
+        "pr-numbers"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "path": "~/.telegram_bot/external-wait",
+            "kind": "dir"
+          }
+        ]
+      },
+      "retention": "until terminal wake (loss = missed continuation, explicit acceptance)",
+      "requests": {
+        "node-decommission": "delete",
+        "prune-expired": "prune-terminal"
+      },
+      "derived_copies": [],
+      "verification": "registry count"
+    },
+    {
+      "id": "telegram.spool_media_uploads",
+      "path_class": "node-local cache outbox",
+      "contains": [
+        "notification-spool",
+        "media",
+        "uploads"
+      ],
+      "role": "outbox",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "path": "telegram-spool",
+            "kind": "dir"
+          },
+          {
+            "path": "~/.telegram_bot/telegram-spool",
+            "kind": "dir"
+          }
+        ]
+      },
+      "retention": "until delivered/uploaded",
+      "requests": {
+        "telegram-user-erasure": "delete-by-chat",
+        "node-decommission": "delete",
+        "prune-expired": "prune-delivered"
+      },
+      "derived_copies": [],
+      "verification": "queue depth 0",
+      "related_dirs": [
+        "audio",
+        "uploads",
+        "continuation"
+      ]
+    },
+    {
+      "id": "telegram.sessions_tasks_usage",
+      "path_class": "node-local operational cost-audit",
+      "contains": [
+        "session-config",
+        "task-store",
+        "usage-counters",
+        "cost-ledger"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "path": "sessions.json"
+          },
+          {
+            "path": "~/.telegram_bot/sessions.json"
+          }
+        ]
+      },
+      "retention": "config live; cost ledger retain (audit)",
+      "requests": {
+        "telegram-user-erasure": "redact-chat-ids",
+        "node-decommission": "delete-or-handoff"
+      },
+      "derived_copies": [],
+      "verification": "json-parses",
+      "note": "representative file (sessions.json); tasks.json / usage-meter.json / cost-ledger share the same policy"
+    },
+    {
+      "id": "skill.autosave_lifecycle",
+      "path_class": "node-local lifecycle audit",
+      "contains": [
+        "candidate-install-rollback-records"
+      ],
+      "role": "audit",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "skill-autosave-install.jsonl"
+          },
+          {
+            "path": "~/.claude/state/skill-autosave-install.jsonl"
+          }
+        ]
+      },
+      "retention": "per #752 lifecycle",
+      "requests": {
+        "node-decommission": "delete",
+        "prune-expired": "prune-archived"
+      },
+      "derived_copies": [],
+      "verification": "record count",
+      "note": "representative ledger file; siblings (ownership/rollback/archive) share the same policy — a full per-file split is planner-slice-2"
+    },
+    {
+      "id": "mempalace.palace",
+      "path_class": "node-local derived index",
+      "contains": [
+        "transcript-excerpts",
+        "hallway-edges",
+        "embedder-identity"
+      ],
+      "role": "index",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "MEMPALACE_PALACE_PATH",
+            "path": "~/.mempalace/palace",
+            "kind": "dir"
+          }
+        ]
+      },
+      "retention": "rebuildable from transcripts (source upstream)",
+      "requests": {
+        "audience-erasure": "delete-entries-by-room",
+        "node-decommission": "delete",
+        "cache-rebuild": "re-index"
+      },
+      "derived_copies": [
+        "chroma index"
+      ],
+      "verification": "re-index diff"
+    },
+    {
+      "id": "upstream.session_transcripts",
+      "path_class": "upstream-adjacent",
+      "contains": [
+        "raw-conversation-bodies"
+      ],
+      "role": "source",
+      "owner": "operator",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "HOME",
+            "join": true,
+            "path": ".claude/projects",
+            "kind": "dir"
+          },
+          {
+            "path": "~/.claude/projects",
+            "kind": "dir"
+          }
+        ]
+      },
+      "retention": "operator-owned (Anthropic CLI artifact) — outside this contract; listed so source_refs backtracking has a named target",
+      "requests": {
+        "node-decommission": "external-handoff"
+      },
+      "handoff_note": "operator decides; node-local agents must not delete transcript archives",
+      "derived_copies": [],
+      "verification": "external-pending"
+    }
+  ]
+}
