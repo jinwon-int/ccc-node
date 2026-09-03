@@ -312,13 +312,13 @@
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Drive a jinwon-int/nclex content PR through the full narrow-gate A2A pipeline — terminology lane dispatch, result-preservation rerun on verdict fail, coverage review projection, CI recovery (stale base.sha), content 2-lane dispatch with keyring-trusted worker routing, signed receipt posting, and a2a/receipts verification. Use when authoring or shepherding an NCLEX 출제 PR (new_case/rewrite/remediation), when a terminology or content lane must be dispatched, when a lane returns review_verdict_failed, or when receipts must be projected to the PR. 확립 2026-08-13 RRP-003(#249)·PA-006(#251) 2회 완주.",
+      "description": "Drive a jinwon-int/nclex content PR through the full narrow-gate A2A pipeline — terminology lane dispatch, result-preservation rerun on verdict fail, coverage review projection, CI recovery (stale base.sha), content 2-lane dispatch with keyring-trusted worker routing, signed receipt posting, and a2a/receipts verification. Includes the sanctioned task watcher (watch-task.sh, #1389) for polling broker tasks with the correct terminal vocabulary. Use when authoring or shepherding an NCLEX 출제 PR (new_case/rewrite/remediation), when a terminology or content lane must be dispatched, when a lane returns review_verdict_failed, when polling an A2A lane task, or when receipts must be projected to the PR. 확립 2026-08-13 RRP-003(#249)·PA-006(#251) 2회 완주.",
       "files": 1,
       "managed": false,
       "name": "nclex-a2a-content-pipeline",
       "source": "skills/nclex-a2a-content-pipeline",
       "status": "active",
-      "tree_sha256": "5e919fbe82b937ac0a941e0908dd07eeb9a518100901806b61dcb7e816dc7188"
+      "tree_sha256": "fb6d2dd187bc81069751425adfd7aaf696b1ef59ac00d8822acc79a10872daa9"
     },
     {
       "audience": "claude",
