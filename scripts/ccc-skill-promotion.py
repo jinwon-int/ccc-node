@@ -1863,6 +1863,25 @@ def _task_readback_on(config: Config, rb: dict[str, str] | None, task_id: str, s
     return _remote_broker_task(config, rb, task_id)
 
 
+def _dispatch_bor_violation(
+    config: Config, rb: dict[str, str] | None, task_id: str, secret: str, broker_id: str
+) -> str | None:
+    """Post-dispatch routing gate (2026-09 collect-gap repair): read the
+    created task back and return a violation detail when it CONFIRMEDLY
+    records a foreign brokerOfRecord — a ledger row must never point at a
+    broker that does not own the task. A readback failure is tolerated
+    (fail-safe: the task exists either way, and older brokers omit the
+    field), so only positive evidence blocks."""
+    try:
+        created_task = _task_readback_on(config, rb, task_id, secret)
+        created_bor = created_task.get("brokerOfRecord") if isinstance(created_task, dict) else None
+        if isinstance(created_bor, str) and created_bor.strip() and created_bor.strip() != broker_id:
+            return f"brokerOfRecord={created_bor.strip()} != {broker_id}"
+    except PromotionError:
+        pass
+    return None
+
+
 def _task_bor_matches(task: dict[str, object], broker_id: str) -> bool:
     """True when the task's brokerOfRecord is absent (older brokers — the
     gate stays open rather than blocking) or names exactly the expected
@@ -2210,21 +2229,9 @@ def _dispatch_intake_review(  # noqa: C901
         return {"outcome": "dispatch-skipped", "code": "dispatch_round_failed"}
     lane = manifest["lanes"][0]
     task_id = lane["id"]
-    # Routing gate (2026-09 collect-gap repair): read the created task back
-    # and refuse to record a ledger row that points at the wrong broker. A
-    # readback failure is tolerated (the task exists either way); only a
-    # CONFIRMED foreign brokerOfRecord blocks the row.
-    try:
-        created_task = _task_readback_on(config, review_rb, task_id, secret)
-        created_bor = created_task.get("brokerOfRecord") if isinstance(created_task, dict) else None
-        if isinstance(created_bor, str) and created_bor.strip() and created_bor.strip() != broker_id:
-            return {
-                "outcome": "dispatch-skipped",
-                "code": "broker_mismatch",
-                "detail": f"brokerOfRecord={created_bor.strip()} != {broker_id}"[:160],
-            }
-    except PromotionError:
-        pass
+    violation = _dispatch_bor_violation(config, review_rb, task_id, secret, broker_id)
+    if violation:
+        return {"outcome": "dispatch-skipped", "code": "broker_mismatch", "detail": violation[:160]}
     _append_ledger(
         config,
         {
@@ -2892,17 +2899,9 @@ def _dispatch_intake_revise(
         "broker_id": broker_id,
         "broker": revise_rb["name"] if revise_rb else "primary",
     }
-    # Routing gate (2026-09 collect-gap repair): same readback discipline as
-    # the review dispatch — a confirmed foreign brokerOfRecord must not enter
-    # the ledger as a revise dispatch, or the collect would poll a broker
-    # that does not own the task forever.
-    try:
-        created_task = _task_readback_on(config, revise_rb, task_id, secret)
-        created_bor = created_task.get("brokerOfRecord") if isinstance(created_task, dict) else None
-        if isinstance(created_bor, str) and created_bor.strip() and created_bor.strip() != broker_id:
-            return {"outcome": "revise-skipped", "code": "broker_mismatch", "detail": f"brokerOfRecord={created_bor.strip()} != {broker_id}"[:160]}
-    except PromotionError:
-        pass
+    violation = _dispatch_bor_violation(config, revise_rb, task_id, secret, broker_id)
+    if violation:
+        return {"outcome": "revise-skipped", "code": "broker_mismatch", "detail": violation[:160]}
     _append_ledger(config, record)
     rows.append(record)
     try:
