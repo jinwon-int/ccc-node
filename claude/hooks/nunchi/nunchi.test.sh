@@ -168,7 +168,7 @@ PY
 ok "mutability derivation: static kinds" 'grep -q "^static,static,static,static," <<<"$mut_of"'
 ok "mutability derivation: task-progress volatile; observation/context/unknown live-check" 'grep -q "volatile,live-check,live-check,live-check$" <<<"$mut_of"'
 payload m1 decision user "사용자는 근거 있는 결정을 선호한다" | python3 "$NP" ingest - >/dev/null
-payload m2 task-progress node "워커 마이그레이션 진행 중" | python3 "$NP" ingest - >/dev/null
+CCC_NODE=nosuk payload m2 task-progress node "워커 마이그레이션 진행 중" | CCC_NODE=nosuk python3 "$NP" ingest - >/dev/null
 mm="$(python3 -c "
 import sqlite3
 c = sqlite3.connect('$NUNCHI_DB')
@@ -208,7 +208,7 @@ PY
 )"
 ok "pre-P1-4 DB backfilled on open (decision=static, context=live-check)" '[ "$mm4" = "static,live-check" ]'
 # snapshot: static rows keep their old shape; live-check group carries ⟳ + legend
-payload m3 context node "곽가 로컬 게이트는 CI와 커버리지 페리티가 다르다" | python3 "$NP" ingest - >/dev/null
+CCC_NODE=nosuk payload m3 context node "곽가 로컬 게이트는 CI와 커버리지 페리티가 다르다" | CCC_NODE=nosuk python3 "$NP" ingest - >/dev/null
 python3 "$NP" snapshot --limit 25 >/dev/null
 ok "static row keeps legacy snapshot shape" 'grep -q "^- (seo-jin-on/decision) 사용자는 근거 있는 결정을 선호한다$" "$NUNCHI_SNAPSHOT"'
 ok "live-check row grouped with ⟳ marker" 'grep -q "^- ⟳ (nosuk/context) 곽가 로컬 게이트" "$NUNCHI_SNAPSHOT"'
