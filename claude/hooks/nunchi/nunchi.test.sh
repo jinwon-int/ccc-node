@@ -153,6 +153,88 @@ PY
 python3 "$NP" snapshot --limit 25 >/dev/null
 closed="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT COUNT(*) FROM peer_facts WHERE fact='OLD-OBS-8861' AND valid_to IS NOT NULL\").fetchone()[0])")"
 ok "expired observation auto-closed on snapshot sweep" '[ "$closed" = 1 ]'
+
+# ---- 3e. mutability derivation + snapshot live-check group (#1264 P1-4) -----
+mut_of="$(python3 - "$NP" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("nx", sys.argv[1])
+nx = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(nx)
+print(",".join(nx._mutability(k) for k in
+      ("preference", "decision", "constraint", "procedure",
+       "task-progress", "observation", "context", "measurement")))
+PY
+)"
+ok "mutability derivation: static kinds" 'grep -q "^static,static,static,static," <<<"$mut_of"'
+ok "mutability derivation: task-progress volatile; observation/context/unknown live-check" 'grep -q "volatile,live-check,live-check,live-check$" <<<"$mut_of"'
+payload m1 decision user "사용자는 근거 있는 결정을 선호한다" | python3 "$NP" ingest - >/dev/null
+CCC_NODE=nosuk payload m2 task-progress node "워커 마이그레이션 진행 중" | CCC_NODE=nosuk python3 "$NP" ingest - >/dev/null
+mm="$(python3 -c "
+import sqlite3
+c = sqlite3.connect('$NUNCHI_DB')
+d = c.execute(\"SELECT mutability FROM peer_facts WHERE fact LIKE '%근거 있는 결정%'\").fetchone()[0]
+v = c.execute(\"SELECT mutability FROM peer_facts WHERE fact LIKE '%마이그레이션 진행 중%'\").fetchone()[0]
+print(f'{d},{v}')")"
+ok "ingest stores derived mutability (decision=static, task-progress=volatile)" '[ "$mm" = "static,volatile" ]'
+# supersede successor inherits the derivation via kind
+SFID="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT id FROM peer_facts WHERE fact LIKE '%마이그레이션 진행 중%'\").fetchone()[0])")"
+python3 "$NP" supersede "$SFID" "워커 마이그레이션 2단계 진행 중" >/dev/null
+sm="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT mutability FROM peer_facts WHERE fact LIKE '%2단계 진행 중%'\").fetchone()[0])")"
+ok "superseded successor derives mutability from inherited kind" '[ "$sm" = "volatile" ]'
+# pre-P1-4 DB: backfill classifies legacy rows on first open
+PRE4="$TMP/pre-p14.db"
+python3 - "$PRE4" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("CREATE TABLE peer_facts (id INTEGER PRIMARY KEY, observer TEXT, observed TEXT, kind TEXT, fact TEXT, evidence TEXT, confidence REAL, valid_from TEXT, valid_to TEXT, supersedes INTEGER, dedup TEXT UNIQUE, created_at TEXT, source_rank INTEGER, review INTEGER, because TEXT, source_refs TEXT)")
+c.execute("INSERT INTO peer_facts (observer, observed, kind, fact, evidence, valid_from, created_at) VALUES ('o','p','decision','pre p14 decision','d:1','2026-01-01','2026-01-01')")
+c.execute("INSERT INTO peer_facts (observer, observed, kind, fact, evidence, valid_from, created_at) VALUES ('o','p','context','pre p14 context','d:2','2026-01-01','2026-01-01')")
+c.commit()
+PY
+NUNCHI_DB="$PRE4" python3 - "$PRE4" "$NP" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("nx", sys.argv[2])
+nx = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(nx)
+nx.db()  # open triggers migration + backfill
+PY
+mm4="$(python3 - "$PRE4" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+d = c.execute("SELECT mutability FROM peer_facts WHERE fact='pre p14 decision'").fetchone()[0]
+x = c.execute("SELECT mutability FROM peer_facts WHERE fact='pre p14 context'").fetchone()[0]
+print(f"{d},{x}")
+PY
+)"
+ok "pre-P1-4 DB backfilled on open (decision=static, context=live-check)" '[ "$mm4" = "static,live-check" ]'
+# snapshot: static rows keep their old shape; live-check group carries ⟳ + legend
+CCC_NODE=nosuk payload m3 context node "곽가 로컬 게이트는 CI와 커버리지 페리티가 다르다" | CCC_NODE=nosuk python3 "$NP" ingest - >/dev/null
+python3 "$NP" snapshot --limit 25 >/dev/null
+ok "static row keeps legacy snapshot shape" 'grep -q "^- (seo-jin-on/decision) 사용자는 근거 있는 결정을 선호한다$" "$NUNCHI_SNAPSHOT"'
+ok "live-check row grouped with ⟳ marker" 'grep -q "^- ⟳ (nosuk/context) 곽가 로컬 게이트" "$NUNCHI_SNAPSHOT"'
+ok "live-check legend line present with count" 'grep -q "⟳ live-check .*단정 전 실측(#1264 P1-4)" "$NUNCHI_SNAPSHOT"'
+ok "volatile row also lands in the ⟳ group" 'grep -q "^- ⟳ (nosuk/task-progress) 워커 마이그레이션 2단계" "$NUNCHI_SNAPSHOT"'
+
+# ---- 3f. taxonomy gate + retag (#1264 P1-5) ---------------------------------
+out="$(payload t1 measurement node "하네스 첫 구동 7/7 통과" | python3 "$NP" ingest - 2>&1)"
+ok "off-taxonomy kind kept but flagged (fail-safe, not dropped)" 'grep -q "ingested 1/1" <<<"$out" && grep -q "flagged_unknown_kind=1" <<<"$out"'
+trev="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT review FROM peer_facts WHERE fact='하네스 첫 구동 7/7 통과'\").fetchone()[0])")"
+ok "off-taxonomy row enters review queue" '[ "$trev" = "1" ]'
+out="$(payload t2 procedure node "배포 전 스냅샷 백업 후 진행" | python3 "$NP" ingest - 2>&1)"
+ok "whitelisted procedure unflagged (intent documented)" 'grep -q "ingested 1/1" <<<"$out" && grep -q "flagged_unknown_kind=0" <<<"$out"'
+out="$(payload t3 correction node "카렐렌 러너는 실제로 638e5a1이다" | python3 "$NP" ingest - 2>&1)"
+ok "internal correction kind unflagged" 'grep -q "ingested 1/1" <<<"$out" && grep -q "flagged_unknown_kind=0" <<<"$out"'
+out="$(payload t4 fact node "레거시 fact kind 호환 행" | python3 "$NP" ingest - 2>&1)"
+ok "legacy fact kind grandfathered (no mass-flag on rollout)" 'grep -q "ingested 1/1" <<<"$out" && grep -q "flagged_unknown_kind=0" <<<"$out"'
+TID="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT id FROM peer_facts WHERE fact='하네스 첫 구동 7/7 통과'\").fetchone()[0])")"
+out="$(python3 "$NP" retag "$TID" observation 2>&1)"; rc=$?
+ok "retag retypes and recalculates mutability" '[ "$rc" = 0 ] && grep -q "kind → observation (mutability recalculated: live-check)" <<<"$out"'
+mm="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT kind||'/'||mutability FROM peer_facts WHERE id=$TID\").fetchone()[0])")"
+ok "retagged row kind+mutability consistent" '[ "$mm" = "observation/live-check" ]'
+out="$(python3 "$NP" retag "$TID" philosophy 2>&1)"; rc=$?
+ok "retag rejects off-taxonomy target" '[ "$rc" != 0 ] && grep -q "unknown kind" <<<"$out"'
+# restore queue state for the later G5-count sections (t1 was flag-only)
+python3 "$NP" review "$TID" --clear >/dev/null
 python3 - "$NUNCHI_DB" <<'PY'
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])

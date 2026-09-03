@@ -106,7 +106,8 @@ CREATE TABLE IF NOT EXISTS peer_facts (
   source_rank INTEGER DEFAULT 1,
   review INTEGER DEFAULT 0,
   because TEXT,
-  source_refs TEXT
+  source_refs TEXT,
+  mutability TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_peer ON peer_facts(observer, observed, valid_to);
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
@@ -142,19 +143,29 @@ def _migrate_fts(c):
 
 def _migrate_gate_cols(c):
     """#890 — add write-gate columns to a pre-gate DB, lossless in place.
-    #1264 adds `because` (G5) through the same path; #1264 P1-3 adds
-    `source_refs` (structured provenance) the same way."""
+    #1264 adds `because` (G5) through the same path; P1-3 adds `source_refs`
+    and P1-4 adds `mutability` (derived, backfilled for legacy rows)."""
     cols = [r[1] for r in c.execute("PRAGMA table_info(peer_facts)")]
     for name, ddl in (("source_rank", "source_rank INTEGER DEFAULT 1"),
                       ("review", "review INTEGER DEFAULT 0"),
                       ("because", "because TEXT"),
-                      ("source_refs", "source_refs TEXT")):
+                      ("source_refs", "source_refs TEXT"),
+                      ("mutability", "mutability TEXT")):
         if name not in cols:
             try:
                 c.execute(f"ALTER TABLE peer_facts ADD COLUMN {ddl}")
                 c.commit()
             except sqlite3.Error:
                 pass
+    # P1-4 backfill — kind-based derivation is idempotent and pure, so any
+    # NULL row (legacy or exotic kinds) gets classified on first open.
+    # After the first pass this SELECT returns nothing and the open is free.
+    for (kind,) in c.execute(
+            "SELECT DISTINCT kind FROM peer_facts WHERE mutability IS NULL").fetchall():
+        c.execute(
+            "UPDATE peer_facts SET mutability=?"
+            " WHERE mutability IS NULL AND kind=?", (_mutability(kind), kind))
+    c.commit()
 
 
 def db():
@@ -219,6 +230,39 @@ _MUTABLE_OPS = re.compile(
 
 def _is_mutable_ops_fact(text):
     return bool(_MUTABLE_OPS.search(text))
+
+
+# #1264 P1-5 — the documented fact taxonomy. procedure is a first-class kind,
+# not an accident: multi-step operational procedures whose canonical home may
+# be skills/Wiki still need their pointer/summary recallable here (measured
+# 2026-09-03, nosuk: 14 rows in active use — the old "procedure 0건" question
+# is settled as "intended, now populated"). correction is internal machinery
+# (auto-supersede) and never owner-facing.
+_KINDS = ("preference", "decision", "observation", "context",
+          "task-progress", "procedure", "constraint")
+_INTERNAL_KINDS = ("correction",)
+# Legacy kinds grandfathered at ingest: the extractor no longer emits them,
+# but mass-flagging every existing legacy row would flood all 12 review
+# queues on rollout (the #1270/#1078 lesson). They store as-is; `retag` is
+# the migration path an owner runs per row.
+_LEGACY_KINDS = ("fact", "node")
+
+
+# #1264 P1-4 — mechanical mutability derivation. Kind-primary by design:
+# source_rank expresses CONFIDENCE (who said it), not DURABILITY (how long
+# it stays true) — a user-stated node revision ages exactly like an inferred
+# one, so rank deliberately does not flip the class. Unknown kinds derive
+# to live-check: an unclassified fact must be verified, never asserted
+# blind (fail-safe). Aligns with ccc-memory durability (#871).
+_MUTABILITY_STATIC = ("preference", "decision", "constraint", "procedure")
+
+
+def _mutability(kind):
+    if kind == "task-progress":
+        return "volatile"
+    if kind in _MUTABILITY_STATIC:
+        return "static"
+    return "live-check"  # observation, context, legacy/unknown kinds
 
 
 # #1010 proposal 2 — volatile `observation` class: searchable via recall but
@@ -566,6 +610,7 @@ def ingest(path):
     n = 0
     skipped_mutable = 0
     skipped_reasonless_decisions = 0
+    flagged_unknown_kind = 0
     for it in items:
         # Gate order matters (#890): normalize → rank-verify → update/close →
         # conflict-review → dedup. Normalizing first is what lets the same
@@ -592,6 +637,15 @@ def ingest(path):
             continue
         if _g5_reasonless_decision(kind, text, because):
             review = 1
+        # P1-5 — taxonomy gate: genuinely unknown kinds are kept (data loss
+        # is never the fix for misclassification) but flagged for owner
+        # triage, so drift like the measured `measurement`/`learning` rows
+        # cannot accumulate silently again. Legacy fact/node are
+        # grandfathered (see _LEGACY_KINDS).
+        if (kind not in _KINDS and kind not in _INTERNAL_KINDS
+                and kind not in _LEGACY_KINDS):
+            review = 1
+            flagged_unknown_kind += 1
         superseded = None
         if auto_supersede:
             if kind == "correction":
@@ -601,6 +655,7 @@ def ingest(path):
         if superseded is None and kind not in ("correction", "constraint", "observation"):
             review = review or _conflict_review(c, observed, text, kind)
         dedup = hashlib.sha1(f"{OBSERVER}|{it.get('subject')}|{text}".encode()).hexdigest()
+        mut = _mutability(kind)
         source_refs = _source_refs(sid, it, transcript_ref)
         evidence = (f"auto:correction:{sid}" if kind == "correction" and superseded is not None
                     else f"auto:update:{sid}" if superseded is not None
@@ -608,11 +663,11 @@ def ingest(path):
         try:
             c.execute(
                 "INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,"
-                "supersedes,dedup,created_at,source_rank,review,because,source_refs)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "supersedes,dedup,created_at,source_rank,review,because,source_refs,mutability)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (OBSERVER, observed, kind, text, evidence,
                  payload.get("distilled_at") or now(), superseded, dedup, now(),
-                 rank, review, because, source_refs))
+                 rank, review, because, source_refs, mut))
             n += 1
         except sqlite3.IntegrityError:
             pass  # duplicate fact already stored
@@ -620,7 +675,8 @@ def ingest(path):
     print(
         f"ingested {n}/{len(items)} facts (session={sid},"
         f" skipped_mutable_ops={skipped_mutable},"
-        f" skipped_reasonless_decisions={skipped_reasonless_decisions})"
+        f" skipped_reasonless_decisions={skipped_reasonless_decisions},"
+        f" flagged_unknown_kind={flagged_unknown_kind})"
     )
 
 
@@ -1111,6 +1167,26 @@ def refs(fid):
         print(line)
 
 
+def retag(fid, new_kind):
+    """P1-5 — owner-facing taxonomy retype (the migration tool).
+
+    Automatic kind rewriting is deliberately NOT done at ingest or migration:
+    a legacy `fact` can be a durable preference or a stale observation, and
+    that judgment is content-informed. What the code provides is the gate
+    (off-taxonomy kinds enter flagged) and this tool: retag recalculates the
+    derived mutability (P1-4) together with the kind so the two never drift.
+    """
+    if new_kind not in _KINDS:
+        sys.exit(f"retag: unknown kind '{new_kind}' (taxonomy: {', '.join(_KINDS)})")
+    c = db()
+    cur = c.execute("UPDATE peer_facts SET kind=?, mutability=? WHERE id=?",
+                    (new_kind, _mutability(new_kind), fid))
+    if cur.rowcount == 0:
+        sys.exit(f"retag: no fact #{fid}")
+    c.commit()
+    print(f"#{fid} kind → {new_kind} (mutability recalculated: {_mutability(new_kind)})")
+
+
 def supersede(fid, new_text):
     c = db()
     row = c.execute("SELECT observer,observed,kind FROM peer_facts WHERE id=?", (fid,)).fetchone()
@@ -1119,9 +1195,10 @@ def supersede(fid, new_text):
     c.execute("UPDATE peer_facts SET valid_to=? WHERE id=?", (now(), fid))
     dedup = hashlib.sha1(f"{row[0]}|manual|{new_text}".encode()).hexdigest()
     c.execute(
-        "INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,supersedes,dedup,created_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?)",
-        (row[0], row[1], row[2], new_text, "manual:supersede", now(), fid, dedup, now()))
+        "INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,supersedes,dedup,created_at,mutability)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (row[0], row[1], row[2], new_text, "manual:supersede", now(), fid, dedup, now(),
+         _mutability(row[2])))
     c.commit()
     print(f"#{fid} closed; inserted successor")
 
@@ -1169,7 +1246,7 @@ def snapshot(limit):
     _close_expired_observations(c)
     c.commit()
     rows = c.execute(
-        "SELECT observed,kind,fact FROM peer_facts WHERE valid_to IS NULL"
+        "SELECT observed,kind,fact,mutability FROM peer_facts WHERE valid_to IS NULL"
         " AND kind NOT IN ('constraint','observation') ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     # G4 — constraints are never crowded out by recency: a rule you must not
     # break is exactly the fact whose miss is an incident, not a staleness.
@@ -1222,7 +1299,17 @@ def snapshot(limit):
             " `nunchi.py annotate <id> --because <이유>`로만 해소")
     for o, f in cons:
         lines.append(f"- [제약/{o}] {f}")
-    lines += [f"- ({o}/{k}) {f}" for o, k, f in rows]
+    # #1264 P1-4 — live-check facts are grouped AFTER the static block and
+    # carry the ⟳ marker: the fleet policy ("운영 사실은 가변 — live-check")
+    # becomes a visual contract. Static rows keep their exact old shape so
+    # every existing snapshot consumer/prompt habit is untouched.
+    static_rows = [r for r in rows if r[3] == "static"]
+    live_rows = [r for r in rows if r[3] != "static"]
+    lines += [f"- ({o}/{k}) {f}" for o, k, f, _m in static_rows]
+    if live_rows:
+        lines.append(
+            f"- ⟳ live-check {len(live_rows)}건 — 가변 운영 사실, 단정 전 실측(#1264 P1-4)")
+        lines += [f"- ⟳ ({o}/{k}) {f}" for o, k, f, _m in live_rows]
     text = "\n".join(lines)
     os.makedirs(os.path.dirname(SNAPSHOT), exist_ok=True)
     open(SNAPSHOT, "w").write(text)
@@ -1356,6 +1443,10 @@ if __name__ == "__main__":
         synthesize_stdin(args[0])
     elif cmd == "annotate":
         annotate(int(args[0]), flag("--because", ""))
+    elif cmd == "retag":
+        if len(args) < 2:
+            sys.exit("usage: nunchi.py retag <id> <kind>")
+        retag(int(args[0]), args[1])
     elif cmd == "refs":
         refs(int(args[0]))
     elif cmd == "supersede":
