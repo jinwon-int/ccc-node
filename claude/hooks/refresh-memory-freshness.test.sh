@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Hermetic Honcho + Wiki freshness tests. No provider or Wiki network calls.
+# Hermetic Wiki freshness tests. No Wiki network calls.
+# (The Honcho freshness half retired with the Honcho plumbing, #1436.)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -40,16 +41,6 @@ printf 'wiki\n' >> "${WIKI_CALL_LOG:?}"
 printf 'fresh Wiki fixture\n'
 SH
 
-write_exec_stub "$bin/curl" <<'SH'
-printf 'honcho\n' >> "${HONCHO_CALL_LOG:?}"
-case "${HONCHO_STUB_MODE:-ok}" in
-  ok) printf '{"content":"task-aware Honcho fixture"}\n' ;;
-  empty) printf '{}\n' ;;
-  error) printf 'fixture failure\n' >&2; exit 1 ;;
-  *) exit 2 ;;
-esac
-SH
-
 write_exec_stub "$tools/ccc-memory-query.sh" <<'SH'
 task="$(sed -n '1,40p' "${CCC_STATE_DIR:?}/current-task.txt" 2>/dev/null | tr '\n' ' ')"
 printf 'task: %s; node: fixture' "${task:-current task}"
@@ -70,21 +61,11 @@ write_exec_stub "$tools/ccc-memory-index.sh" <<'SH'
 exit 0
 SH
 
-cfg="$TMP/honcho.json"
-printf '%s\n' \
-  '{"baseUrl":"https://honcho.invalid","workspace":"fixture","peerName":"peer-a","target":"owner-a","reasoningLevel":"low","authToken":"token-a"}' \
-  > "$cfg"
-chmod 600 "$cfg"
 printf 'task alpha\n' > "$state/current-task.txt"
 printf 'prompt one\n' > "$state/current-prompt.txt"
 
 export WIKI_CALL_LOG="$TMP/wiki-calls.log"
-export HONCHO_CALL_LOG="$TMP/honcho-calls.log"
-# Honcho defaults to OFF since the 2026-09-01 retirement; this suite exercises
-# the Honcho refresh path, so opt in explicitly.
-export CCC_HONCHO_MEMORY_ENABLED=1
 : > "$WIKI_CALL_LOG"
-: > "$HONCHO_CALL_LOG"
 
 run_refresh() {
   PATH="$bin:$PATH" \
@@ -94,83 +75,28 @@ run_refresh() {
   CCC_HOOK_DIR="$ROOT/claude/hooks" \
   CCC_MEMORY_TOOLS_DIR="$tools" \
   CCC_WIKI_AGENT_BIN="$bin/wiki-agent" \
-  CCC_HONCHO_CFG="$cfg" \
-  CCC_HONCHO_CACHE_MAX_AGE_SEC=21600 \
+  CCC_WIKI_CACHE_MAX_AGE_SEC=21600 \
     bash "$REFRESH" 2>&1
 }
 
 out="$(run_refresh)"; rc=$?
-ok "first refresh calls both sources" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 1 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ]'
-ok "first refresh records only hashes for the Honcho freshness key" \
-  'jq -e ".status == \"ok\" and (.query_hash | length) == 64 and (.config_hash | length) == 64 and has(\"query\") == false" "$cache/.honcho.status.json" >/dev/null'
-first_refreshed_at="$(jq -r '.refreshed_at' "$cache/.honcho.status.json")"
+ok "first refresh calls the wiki prefetch" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ]'
+ok "first refresh records only hashes, never the query" \
+  'jq -e ".status == \"ok\" and (.query_hash | length) == 64 and has(\"query\") == false" "$cache/.wiki.status.json" >/dev/null'
+first_refreshed_at="$(jq -r '.refreshed_at' "$cache/.wiki.status.json")"
 
 printf 'prompt two should not churn the stable task key\n' > "$state/current-prompt.txt"
 out="$(run_refresh)"; rc=$?
-ok "fresh same-task refresh skips Honcho and Wiki alike" \
-  '[ "$rc" = 0 ] && grep -q "honcho refresh skipped reason=fresh" <<<"$out" && grep -q "wiki refresh skipped reason=fresh" <<<"$out" && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 1 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ]'
+ok "fresh same-task refresh skips the wiki prefetch" \
+  '[ "$rc" = 0 ] && grep -q "wiki refresh skipped reason=fresh" <<<"$out" && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ]'
 ok "fresh skip does not advance refreshed_at" \
-  '[ "$(jq -r ".refreshed_at" "$cache/.honcho.status.json")" = "$first_refreshed_at" ]'
-ok "wiki freshness key stores only hashes, never the query" \
-  'jq -e ".status == \"ok\" and (.query_hash | length) == 64 and has(\"query\") == false" "$cache/.wiki.status.json" >/dev/null'
-
-out="$(CCC_HONCHO_FORCE_REFRESH=1 run_refresh)"; rc=$?
-ok "explicit force refresh bypasses freshness" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 2 ]'
+  '[ "$(jq -r ".refreshed_at" "$cache/.wiki.status.json")" = "$first_refreshed_at" ]'
 
 printf 'task beta\n' > "$state/current-task.txt"
 out="$(run_refresh)"; rc=$?
-ok "material task change refreshes Honcho" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 3 ]'
-ok "material task change refreshes Wiki too" \
-  '[ "$(wc -l < "$WIKI_CALL_LOG")" = 2 ]'
-
-jq '.reasoningLevel = "medium"' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
-chmod 600 "$cfg"
-out="$(run_refresh)"; rc=$?
-ok "non-secret config change refreshes Honcho" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 4 ]'
-
-printf 'distill-success:fixture\n' > "$state/honcho-refresh.invalidate"
-out="$(run_refresh)"; rc=$?
-ok "distill invalidation forces one refresh and is consumed on success" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 5 ] && [ ! -e "$state/honcho-refresh.invalidate" ]'
-
-jq '.refreshed_at = "2000-01-01T00:00:00Z"' "$cache/.honcho.status.json" \
-  > "$cache/.honcho.status.json.tmp" \
-  && mv "$cache/.honcho.status.json.tmp" "$cache/.honcho.status.json"
-out="$(run_refresh)"; rc=$?
-ok "expired success refreshes Honcho" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 6 ]'
-
-printf 'distill-success-before-error:fixture\n' > "$state/honcho-refresh.invalidate"
-out="$(HONCHO_STUB_MODE=error run_refresh)"; rc=$?
-ok "provider error is recorded without failing the warmer or consuming invalidation" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 7 ] && [ -s "$state/honcho-refresh.invalidate" ] && jq -e ".status == \"error\"" "$cache/.honcho.status.json" >/dev/null'
-out="$(run_refresh)"; rc=$?
-ok "error state is retried even inside the TTL" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 8 ] && [ ! -e "$state/honcho-refresh.invalidate" ] && jq -e ".status == \"ok\"" "$cache/.honcho.status.json" >/dev/null'
-
-out="$(CCC_HONCHO_FORCE_REFRESH=1 HONCHO_STUB_MODE=empty run_refresh)"; rc=$?
-ok "empty provider result is a successful freshness state" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 9 ] && jq -e ".status == \"empty\"" "$cache/.honcho.status.json" >/dev/null'
-out="$(HONCHO_STUB_MODE=empty run_refresh)"; rc=$?
-ok "fresh empty result is reused inside the TTL" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 9 ]'
-
-jq '.authToken = "rotated-token-not-in-fingerprint"' "$cfg" > "$cfg.tmp" \
-  && mv "$cfg.tmp" "$cfg"
-chmod 600 "$cfg"
-out="$(HONCHO_STUB_MODE=empty run_refresh)"; rc=$?
-ok "credential rotation alone does not expose or churn the non-secret fingerprint" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 9 ] && ! grep -q "rotated-token-not-in-fingerprint" "$cache/.honcho.status.json"'
-
-# Wiki freshness gates independently: none of the honcho-side churn above
-# (force refresh, config change, invalidation, error retries) re-ran the
-# prefetch while the wiki's own key stayed fresh.
-ok "wiki refresh stays gated across honcho-side churn" \
-  '[ "$(wc -l < "$WIKI_CALL_LOG")" = 2 ]'
+ok "material task change refreshes the wiki prefetch" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 2 ]'
 
 out="$(CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?
 ok "explicit wiki force refresh bypasses freshness" \

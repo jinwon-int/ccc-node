@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Background refresh of Family Wiki + Honcho memory caches.
+# Background refresh of the Family Wiki memory cache.
 # Run detached from the SessionStart hook so startup never blocks on slow LLM calls.
 # Single-flight via flock; each source fail-open; caches updated atomically only on success.
 set -uo pipefail
@@ -10,20 +10,13 @@ STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 CACHE="${CCC_MEMORY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
 HOOKDIR="${CCC_HOOK_DIR:-${HOME:-/root}/.claude/hooks}"
 WIKI="${CCC_WIKI_AGENT_BIN:-${HOME:-/root}/.wiki-agent/bin/wiki-agent}"
-HONCHO_CFG="${CCC_HONCHO_CFG:-${CCC_HERMES_DIR:-${HOME:-/root}/.hermes}/honcho.json}"
 WIKI_TIMEOUT="${CCC_WIKI_TIMEOUT_SEC:-60}"
-HONCHO_TIMEOUT="${CCC_HONCHO_TIMEOUT_SEC:-60}"
-HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-0}"
-HONCHO_FORCE_REFRESH="${CCC_HONCHO_FORCE_REFRESH:-0}"
 WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
 WIKI_FORCE_REFRESH="${CCC_WIKI_FORCE_REFRESH:-0}"
 ISOLATION_PROFILE="${CCC_NODE_ISOLATION_PROFILE:-fleet}"
 [ "$ISOLATION_PROFILE" = "external" ] && WIKI_ENABLED=0
-PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
 INDEX_DB="${CCC_MEMORY_INDEX_DB:-$STATE_DIR/memory-index.sqlite}"
 FACTS_FILE="${CCC_MEMORY_FACTS_FILE:-$STATE_DIR/memory-facts.jsonl}"
-HONCHO_INVALIDATE_FILE="$STATE_DIR/honcho-refresh.invalidate"
-HONCHO_INVALIDATE_LOCK="$STATE_DIR/.honcho-refresh-invalidate.lock"
 
 REFRESH_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || REFRESH_LIB_DIR="$HOOKDIR"
 # shellcheck source=claude/hooks/lib/hook-common.sh
@@ -37,9 +30,6 @@ if ! is_disabled "$AUDIENCE_SCOPED"; then
     && [ "$SHARED_FACTS_FILE" = "$AUDIENCE_ROOT/shared/state/memory-facts.jsonl" ] \
     || exit 0
   [ "$MEMORY_AUDIENCE" = "private" ] || WIKI_ENABLED=0
-  if ! honcho_scope_valid; then
-    HONCHO_ENABLED=0
-  fi
 fi
 umask 077
 mkdir -p "$CACHE" "$STATE_DIR"
@@ -74,7 +64,6 @@ record_status() { # <name> <status> <duration_ms> <bytes> <error> [query] [confi
   qhash="$(printf '%s' "$query" | sha256sum 2>/dev/null | cut -d' ' -f1)"
   case "$name" in
     wiki) max_age="${CCC_WIKI_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}" ;;
-    honcho) max_age="${CCC_HONCHO_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}" ;;
     *) max_age="${CCC_LOCAL_MEMORY_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}" ;;
   esac
   jq -n --arg source "$name" --arg status "$status" --arg refreshed_at "$(now_iso)" \
@@ -85,30 +74,6 @@ record_status() { # <name> <status> <duration_ms> <bytes> <error> [query] [confi
       + (if $config_hash == "" then {} else {config_hash:$config_hash} end))' \
     > "$CACHE/.${name}.status.json"
   cp "$CACHE/.${name}.status.json" "$CACHE/${name}.meta.json" 2>/dev/null || true
-}
-
-honcho_cache_is_fresh() { # <query_hash> <config_hash>
-  local query_hash="$1" config_hash="$2"
-  local status_file="$CACHE/.honcho.status.json"
-  local max_age="${CCC_HONCHO_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}"
-  is_disabled "$HONCHO_FORCE_REFRESH" || return 1
-  [ ! -e "$HONCHO_INVALIDATE_FILE" ] || return 1
-  case "$max_age" in ""|*[!0-9]*) return 1 ;; esac
-  [ "$max_age" -gt 0 ] || return 1
-  [ -f "$status_file" ] || return 1
-  jq -e --arg query_hash "$query_hash" --arg config_hash "$config_hash" \
-    --argjson now "$(date -u +%s)" --argjson max_age "$max_age" '
-      # no-content joins ok/empty deliberately (#781): the server WAS reached and
-      # answered, so re-asking inside the TTL buys nothing and costs a 20-35s LLM
-      # call per node per cycle. It is split from "empty" for reporting only.
-      ((.status == "ok") or (.status == "empty") or (.status == "no-content"))
-      and (.query_hash == $query_hash)
-      and (.config_hash == $config_hash)
-      and ((try (.refreshed_at | fromdateiso8601) catch 0) as $refreshed
-        | $refreshed > 0
-        and $now >= $refreshed
-        and (($now - $refreshed) < $max_age))
-    ' "$status_file" >/dev/null 2>&1
 }
 
 wiki_cache_is_fresh() { # <query_hash>
@@ -135,16 +100,6 @@ wiki_cache_is_fresh() { # <query_hash>
         and $now >= $refreshed
         and (($now - $refreshed) < $max_age))
     ' "$status_file" >/dev/null 2>&1
-}
-
-clear_honcho_invalidation() { # <token-observed-before-refresh>
-  local observed="$1" current
-  [ -n "$observed" ] || return 0
-  (
-    flock 8 || exit 0
-    current="$(cat "$HONCHO_INVALIDATE_FILE" 2>/dev/null || true)"
-    [ "$current" = "$observed" ] && rm -f "$HONCHO_INVALIDATE_FILE"
-  ) 8>"$HONCHO_INVALIDATE_LOCK"
 }
 
 refresh_wiki() {
@@ -185,183 +140,8 @@ refresh_wiki() {
   record_status wiki "$status" "$duration" "$bytes" "$err" "$q_stable"
 }
 
-honcho_chat() { # <base> <workspace> <peer> <target> <token> <reasoning> <query> <output> <error>
-  local honcho="$1" workspace="$2" peer="$3" target="$4" token="$5"
-  local rl="$6" query="$7" output="$8" error="$9" workspace_path peer_path
-  local -a auth_args=()
-  workspace_path="$(jq -rn --arg value "$workspace" '$value|@uri')"
-  peer_path="$(jq -rn --arg value "$peer" '$value|@uri')"
-  if [ -n "$token" ]; then
-    auth_args=(-H "Authorization: Bearer $token")
-  fi
-  # curl and jq are deliberately NOT piped together. In a pipeline the function
-  # returns jq's status, and jq exits 0 on empty input — so a timeout, a refused
-  # connection, and a genuine empty answer were all indistinguishable, and every
-  # one of them surfaced as "empty Honcho response". A dead endpoint read exactly
-  # like a quiet one (#781).
-  local raw="$output.raw" rc=0
-  # `|| rc=$?`, not `if ! …; then rc=$?`: inside the then-branch of a negated
-  # command, $? is the status of the negation (always 0), so the latter form
-  # silently reports every transport failure as success.
-  timeout "$HONCHO_TIMEOUT" curl -sS -X POST \
-    "$honcho/v3/workspaces/$workspace_path/peers/$peer_path/chat" \
-    -H 'Content-Type: application/json' \
-    "${auth_args[@]}" \
-    -d "$(jq -n --arg query "$query" --arg target "$target" --arg rl "$rl" \
-      '{query:$query,target:$target,reasoning_level:$rl}')" \
-    >"$raw" 2>"$error" || rc=$?
-  if [ "$rc" != 0 ]; then
-    if [ "$rc" = 124 ]; then
-      printf 'honcho request timed out after %ss\n' "$HONCHO_TIMEOUT" >>"$error"
-    fi
-    rm -f "$raw"
-    return "$rc"
-  fi
-  if ! jq -e . >/dev/null 2>>"$error" <"$raw"; then
-    printf 'honcho returned a non-JSON body (%s bytes)\n' "$(bytes_for "$raw")" >>"$error"
-    rm -f "$raw"
-    return 1
-  fi
-  # An explicit `"content": null` is the server answering "I have nothing" — a
-  # real condition, distinct from not reaching the server at all, and the one
-  # the live fleet actually hits. A body that omits the key entirely is a
-  # different shape and keeps the existing `empty` reading (#778's contract):
-  # both are benign, but only one is the server declining to answer.
-  if jq -e 'has("content") and .content == null' >/dev/null 2>&1 <"$raw"; then
-    printf 'honcho answered with content:null (workspace=%s peer=%s level=%s)\n' \
-      "$workspace" "$peer" "$rl" >>"$error"
-    : > "$output"
-    rm -f "$raw"
-    return 3
-  fi
-  jq -r '.content // empty' <"$raw" > "$output" 2>>"$error"
-  rm -f "$raw"
-}
-
-refresh_honcho() {
-  local start end duration honcho ws peer target token tmp status err query rl
-  local private_tmp shared_tmp legacy_tmp config_json config_hash query_hash
-  local invalidation_token
-  start="$(now_ms)"
-  tmp="$CACHE/honcho.txt.tmp.$$"
-  status="ok"; err=""; query=""
-  if is_disabled "$HONCHO_ENABLED" || [ "$PROFILE" = "max-perf" ]; then
-    status="disabled"; err="Honcho read path disabled"
-  elif [ ! -f "$HONCHO_CFG" ]; then
-    status="missing"; err="honcho config missing"
-  else
-    # Config may use the nested `.hosts.hermes.*` schema (aiPeer/peerName/workspace/
-    # apiKey) instead of the legacy top-level keys; read top-level first, fall back to
-    # the nested block so both layouts work.
-    honcho="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.baseUrl) // nz(.hosts|objects|.hermes.baseUrl) // empty' "$HONCHO_CFG" 2>/dev/null)"
-    ws="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.workspace) // nz(.hosts|objects|.hermes.workspace) // "seoyoon-family"' "$HONCHO_CFG" 2>/dev/null)"
-    peer="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.peerName) // nz(.hosts|objects|.hermes.peerName) // empty' "$HONCHO_CFG" 2>/dev/null)"
-    target="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.target) // nz(.hosts|objects|.hermes.peerName) // "seo-jin-on"' "$HONCHO_CFG" 2>/dev/null)"
-    token="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.authToken) // nz(.apiKey) // nz(.hosts|objects|.hermes.apiKey) // empty' "$HONCHO_CFG" 2>/dev/null)"
-    rl="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.reasoningLevel) // nz(.hosts|objects|.hermes.dialecticReasoningLevel) // "low"' "$HONCHO_CFG" 2>/dev/null)"
-    query="Current ccc-node task context: $(query_from_state 0). Summarize only directly relevant user preferences, operating constraints, and current priorities. Avoid repeating generic facts."
-    query_hash="$(printf '%s' "$query" | sha256sum 2>/dev/null | cut -d' ' -f1)"
-    config_json="$(jq -nc \
-      --arg base_url "$honcho" --arg workspace "$ws" --arg peer "$peer" \
-      --arg target "$target" --arg reasoning_level "$rl" \
-      --arg audience_scoped "$AUDIENCE_SCOPED" --arg audience "$MEMORY_AUDIENCE" \
-      --arg workspace_scope "$HONCHO_WORKSPACE_SCOPE" \
-      --arg shared_workspace_scope "$HONCHO_SHARED_WORKSPACE_SCOPE" \
-      '{base_url:$base_url,workspace:$workspace,peer:$peer,target:$target,reasoning_level:$reasoning_level,audience_scoped:$audience_scoped,audience:$audience,workspace_scope:$workspace_scope,shared_workspace_scope:$shared_workspace_scope}')"
-    config_hash="$(printf '%s' "$config_json" | sha256sum 2>/dev/null | cut -d' ' -f1)"
-    if [ -z "$honcho" ] || [ -z "$peer" ]; then
-      status="missing"; err="honcho baseUrl or peerName missing"
-    elif honcho_cache_is_fresh "$query_hash" "$config_hash"; then
-      printf 'honcho refresh skipped reason=fresh max_age_sec=%s\n' \
-        "${CCC_HONCHO_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}" >&2
-      return 0
-    else
-      invalidation_token="$(cat "$HONCHO_INVALIDATE_FILE" 2>/dev/null || true)"
-      if ! is_disabled "$AUDIENCE_SCOPED"; then
-        private_tmp="$tmp.private"
-        shared_tmp="$tmp.shared"
-        legacy_tmp="$tmp.legacy"
-        # rc=3 is "server reached and answered with nothing" — classify it
-        # no-content exactly like the unscoped path below, or the #781 TTL
-        # freshness cache (which accepts ok|empty|no-content only) never
-        # engages for scoped nodes and every background refresh re-pays the
-        # full multi-call dialectic.
-        if [ "$MEMORY_AUDIENCE" = "shared" ]; then
-          chat_rc=0
-          honcho_chat "$honcho" "$ws--ccc-$HONCHO_SHARED_WORKSPACE_SCOPE" \
-            "$peer" "$target" "$token" "$rl" "$query" "$shared_tmp" "$tmp.err" || chat_rc=$?
-          if [ "$chat_rc" = 0 ]; then
-            {
-              printf '### Honcho shared audience\n'
-              cat "$shared_tmp"
-            } > "$tmp"
-            mv "$tmp" "$CACHE/honcho.txt"
-          elif [ "$chat_rc" = 3 ]; then
-            status="no-content"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
-          else
-            status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
-          fi
-        else
-          chat_rc=0
-          honcho_chat "$honcho" "$ws--ccc-$HONCHO_WORKSPACE_SCOPE" \
-            "$peer" "$target" "$token" "$rl" "$query" "$private_tmp" "$tmp.err" || chat_rc=$?
-          if [ "$chat_rc" = 0 ]; then
-            honcho_chat "$honcho" "$ws--ccc-$HONCHO_SHARED_WORKSPACE_SCOPE" \
-              "$peer" "$target" "$token" "$rl" "$query" "$shared_tmp" "$tmp.err" || chat_rc=$?
-          fi
-          if [ "$chat_rc" = 0 ]; then
-            honcho_chat "$honcho" "$ws" "$peer" "$target" "$token" "$rl" \
-              "$query" "$legacy_tmp" "$tmp.err" || chat_rc=$?
-          fi
-          if [ "$chat_rc" = 0 ]; then
-            {
-              printf '### Honcho private audience\n'
-              cat "$private_tmp"
-              printf '\n\n### Honcho shared audience\n'
-              cat "$shared_tmp"
-              printf '\n\n### Honcho private-only legacy\n'
-              cat "$legacy_tmp"
-            } > "$tmp"
-            mv "$tmp" "$CACHE/honcho.txt"
-          elif [ "$chat_rc" = 3 ]; then
-            status="no-content"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
-          else
-            status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
-          fi
-        fi
-      else
-        honcho_chat "$honcho" "$ws" "$peer" "$target" "$token" "$rl" \
-          "$query" "$tmp" "$tmp.err"; chat_rc=$?
-        if [ "$chat_rc" = 3 ]; then
-          # Server reached and answered, with nothing in it. Named separately
-          # from a transport failure so the operator can tell "Honcho has no
-          # answer for this query" from "Honcho is unreachable" — the two need
-          # opposite responses, and the cache goes stale either way.
-          status="no-content"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
-        elif [ "$chat_rc" != 0 ]; then
-          status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
-        elif [ ! -s "$tmp" ]; then
-          status="empty"; err="empty Honcho response"
-        else
-          mv "$tmp" "$CACHE/honcho.txt"
-        fi
-      fi
-    fi
-  fi
-  rm -f "$tmp" "$tmp.err" "$tmp.raw" "$tmp.private" "$tmp.shared" "$tmp.legacy"
-  rm -f "$tmp.private.raw" "$tmp.shared.raw" "$tmp.legacy.raw"
-  end="$(now_ms)"; duration="$((end - start))"
-  record_status honcho "$status" "$duration" "$(bytes_for "$CACHE/honcho.txt")" \
-    "$err" "$query" "${config_hash:-}"
-  case "$status" in
-    ok|empty) clear_honcho_invalidation "${invalidation_token:-}" ;;
-  esac
-}
-
 refresh_wiki & wiki_pid=$!
-refresh_honcho & honcho_pid=$!
 wait "$wiki_pid" || true
-wait "$honcho_pid" || true
 
 # Consolidate near-duplicate distilled facts BEFORE indexing, so superseded
 # copies drop out of this same refresh. Best-effort; never blocks startup.
@@ -403,13 +183,12 @@ if ! is_disabled "$AUDIENCE_SCOPED" \
   CCC_MEMORY_DIR="$SHARED_MEMDIR" \
   CCC_MEMORY_FACTS_FILE="${SHARED_FACTS_FILE:-$SHARED_STATE_DIR/memory-facts.jsonl}" \
   CCC_WIKI_MEMORY_ENABLED=0 \
-  CCC_HONCHO_MEMORY_ENABLED=0 \
     timeout 30 "$index_script" update >/dev/null 2>&1 || true
 fi
 
 # Merge per-source statuses into one meta document.
 jq -s '{generated_at:(now|todate), sources: map({(.source): del(.source)}) | add}' \
-  "$CACHE/.wiki.status.json" "$CACHE/.honcho.status.json" \
+  "$CACHE/.wiki.status.json" \
   "$CACHE/.fact_consolidate.status.json" "$CACHE/.local_index.status.json" \
   > "$CACHE/meta.json.tmp" 2>/dev/null && mv "$CACHE/meta.json.tmp" "$CACHE/meta.json"
 

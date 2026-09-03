@@ -639,8 +639,8 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "Memory: Honcho sink",
         "Redacted conclusions push to Honcho through a durable retry queue.",
         claude=_supported(
-            "Redacted payloads push via claude/hooks/distill/honcho-push.sh with the "
-            "queue-drain retry path."
+            "Redacted payloads push through the bridge distill honcho sink worker "
+            "using an owner-only durable outbox with independently leased retries."
         ),
         codex=_supported(
             "Validated facts use an owner-only per-job outbox, stable idempotency "
