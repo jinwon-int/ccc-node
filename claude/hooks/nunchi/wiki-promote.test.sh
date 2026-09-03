@@ -306,7 +306,11 @@ ok "at exactly the threshold (20 pending) the run proceeds" \
 reset_db
 AUD="$TMP/aud"
 mkdir -m 700 -p "$AUD/shared/nunchi" "$AUD/private-b3362e2106be28b2f3221f38d9624b84/nunchi"
-chmod 700 "$AUD" "$AUD/private-b3362e2106be28b2f3221f38d9624b84"
+# mkdir -p applies -m ONLY to the final components: intermediate dirs follow
+# the umask, so on a 022 runner $AUD/shared would land 0755 and the canonical
+# scope gate would (correctly, per the judge-batch-identical contract)
+# fail-closed to a no-op. Fix every level explicitly.
+chmod 700 "$AUD" "$AUD/shared" "$AUD/private-b3362e2106be28b2f3221f38d9624b84"
 NUNCHI_DB="$AUD/shared/nunchi/facts.db" python3 "$NP" init >/dev/null
 NUNCHI_DB="$AUD/private-b3362e2106be28b2f3221f38d9624b84/nunchi/facts.db" python3 "$NP" init >/dev/null
 sh1="$(NUNCHI_DB="$AUD/shared/nunchi/facts.db" seed jingun procedure "shared 스코프의 플릿 절차" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
