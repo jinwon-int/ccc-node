@@ -20,6 +20,26 @@ All notable changes to the Claude Code node harness. Dates are KST.
   non-root ufw is a fact, not a failure. Rollout note: nodes whose baseline
   predates the block compare as NEW once — review that the diff is only the
   firewall line, then `--accept-baseline`. Env `CCC_TUNNEL_AUDIT_UFW_CMD`.
+- **Sanctioned A2A task watcher template (`watch-task.sh`, #1389).** During
+  nclex PR #459 an ad-hoc polling watcher waited on terminal statuses
+  (`completed|cancelled|review_verdict_failed`) that are not broker
+  TaskStatus values, logged `state=succeeded` 38 times, timed out after 40
+  polls, and never wrote a result file — the finished task stayed invisible
+  until the next session manually checked the broker. The nclex
+  a2a-content-pipeline skill now ships `watch-task.sh`: terminal vocabulary
+  pinned to the broker's real enum (`succeeded|failed|canceled`, per
+  a2a-nexus `isTerminalTaskStatus`), first-poll status printed for vocabulary
+  verification, unknown statuses trip-wire an `unknown_state` exit after 3
+  consecutive sightings (fail-safe beats missing a success), and EVERY exit
+  path (timeout, response failure, 4xx, interrupt) atomically writes the
+  `--out` file with a `nclex-a2a-watch-result.v1` verdict — no result file
+  means the watcher never finished. Edge secret travels via `--secret-file`
+  into curl `--header @file` (never argv or output); lane ids are
+  percent-encoded (they contain `:` and `,`); 404 and other 4xx fail fast
+  instead of burning the poll budget. SKILL.md §2.3 now mandates the watcher
+  and bans ad-hoc polling scripts. Tests: 26 hermetic cases against a local
+  mock broker, including the #1389 regression (`completed` cannot hang the
+  watch) and header/encoding assertions.
 
 ### Fixed
 - **self-update: hand-pulled checkout no longer masks an undeployed install
