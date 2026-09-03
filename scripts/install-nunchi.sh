@@ -12,6 +12,11 @@
 #   install-nunchi.sh --apply --judge-apply  # judge batch in APPLY mode — MUTATES
 #                                            # the fact store; implies --judge and
 #                                            # needs fresh per-node approval (#1264)
+#   install-nunchi.sh --apply --wiki-promote  # + weekly fleet-fact Wiki promotion
+#                                            # batch (#1447); dry-run by default —
+#                                            # --wiki-promote-apply enables queue
+#                                            # writes (fact store stays read-only;
+#                                            # fresh per-node approval, #1270)
 #   install-nunchi.sh --apply --target-user gongmyoung
 #   install-nunchi.sh --remove             # mode off + managed cron/hook removal
 #   install-nunchi.sh                      # status
@@ -31,6 +36,8 @@ PROVIDER="${CCC_NUNCHI_PROVIDER:-auto}"
 TARGET_USER="${CCC_NUNCHI_TARGET_USER:-}"
 JUDGE="${CCC_NUNCHI_JUDGE:-0}"
 JUDGE_APPLY="${CCC_NUNCHI_JUDGE_APPLY:-0}"
+WIKI_PROMOTE="${CCC_NUNCHI_WIKI_PROMOTE:-0}"
+WIKI_PROMOTE_APPLY="${CCC_NUNCHI_WIKI_PROMOTE_APPLY:-0}"
 AUDIENCE_SCOPED="${CCC_NUNCHI_AUDIENCE_SCOPED:-0}"
 AUDIENCE_ROOT="${CCC_NUNCHI_AUDIENCE_ROOT:-}"
 ORIGINAL_ARGS=("$@")
@@ -51,6 +58,9 @@ while [ $# -gt 0 ]; do
     # Implies --judge: an apply-mode cron with no judge cron is not a state
     # the installer can express, so asking for one is asking for both.
     --judge-apply) JUDGE=1; JUDGE_APPLY=1 ;;
+    --wiki-promote) WIKI_PROMOTE=1 ;;
+    # Implies --wiki-promote for the same reason as --judge-apply implies --judge.
+    --wiki-promote-apply) WIKI_PROMOTE=1; WIKI_PROMOTE_APPLY=1 ;;
     --help|-h)
       sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -655,6 +665,24 @@ case "$ACTION" in
         echo "daily judge-batch cron added (04:41, dry-run)"
       fi
     fi
+    if [ "$WIKI_PROMOTE" = 1 ]; then
+      # #1447 weekly fleet-fact Wiki promotion batch (Mon 06:40 — ahead of the
+      # working day, off the 04:41 judge slot). Dry-run unless
+      # --wiki-promote-apply: flipping to apply writes wiki-candidates queue
+      # entries (the fact store stays read-only in every mode) and is a fresh
+      # per-node approval, never a default (#1270 judge precedent). APPLY cron
+      # activation is a FURTHER approval on top (#1447 design note) — this flag
+      # only lets an approved node survive strip_cron replays without silently
+      # downgrading, the exact #1264 half-apply class.
+      wp_apply_env=""
+      if [ "$WIKI_PROMOTE_APPLY" = 1 ]; then wp_apply_env="NUNCHI_WIKI_PROMOTE_APPLY=1 "; fi
+      append_cron_line "41 6 * * 1 CCC_STATE_DIR=$(cron_quote "$STATE") ${wp_apply_env}${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") CCC_MEMORY_CACHE_DIR=$(cron_quote "${CCC_MEMORY_CACHE_DIR:-$CLAUDE_DIR/hooks/cache}") $(cron_quote "$python3_bin") $(cron_quote "$HOOKS/wiki-promote.py") >> $(cron_quote "$NUNCHI_DIR/wiki-promote.cron.log") 2>&1 $MARK gen=$GEN"
+      if [ "$WIKI_PROMOTE_APPLY" = 1 ]; then
+        echo "weekly wiki-promote cron added (Mon 06:40, APPLY — writes the wiki-candidates queue; fact store stays read-only)"
+      else
+        echo "weekly wiki-promote cron added (Mon 06:40, dry-run)"
+      fi
+    fi
     if [ "$resolved_provider" = "claude" ]; then
       set_sessionstart_hook add
     else
@@ -677,6 +705,11 @@ case "$ACTION" in
     # replay reproduces apply mode instead of silently downgrading to dry-run.
     if [ "$JUDGE_APPLY" = 1 ]; then record_argv+=(--judge-apply)
     elif [ "$JUDGE" = 1 ]; then record_argv+=(--judge); fi
+    # --wiki-promote materialization, same replay-loss mechanism as --judge:
+    # the line is opt-in, so an unrecorded flag is silently DELETED by the
+    # next replay (measured judge-batch loss, 2026-08-25 — 1 of 11 nodes).
+    if [ "$WIKI_PROMOTE_APPLY" = 1 ]; then record_argv+=(--wiki-promote-apply)
+    elif [ "$WIKI_PROMOTE" = 1 ]; then record_argv+=(--wiki-promote); fi
     ccc_installer_record_write "$STATE" "$NUNCHI_SELF_DIR/install-nunchi.sh" "$MARK" "$GEN" -- \
       "${record_argv[@]}" \
       || echo "WARNING: install record write failed — self-update re-apply will not track these entries" >&2
