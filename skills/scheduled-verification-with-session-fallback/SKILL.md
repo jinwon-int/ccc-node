@@ -93,7 +93,7 @@ used — the explicit session-boundary risk. Never promise auto-resume for tier 
 
 ## Evidence — the failure this skill encodes
 
-2026-08-26, node `yukson`, issue #1287 verification:
+2026-08-26, node `node-y`, issue #1287 verification:
 
 - Step 1 was performed as inventory only (`list-timers` / `crontab -l` read as
   "0 entries") → concluded **"this node cannot schedule durably."**
@@ -103,7 +103,7 @@ used — the explicit session-boundary risk. Never promise auto-resume for tier 
 - Recovery was possible *only* because the fallback checklist had been written to
   `working-state.md`.
 - The false constraint was then written into durable memory **5+ times**
-  ("yukson has no systemd timers/crontab, durable scheduling impossible").
+  ("`node-y` has no systemd timers/crontab, durable scheduling impossible").
 - Live re-check the next session: `/usr/bin/systemd-run` present,
   `systemctl is-system-running` → `running`, **7 active timers, 23 crontab
   lines**. A transient timer was created successfully on the first attempt.
