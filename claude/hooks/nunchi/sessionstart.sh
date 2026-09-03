@@ -24,8 +24,33 @@ NUNCHI_HOME="${NUNCHI_HOME:-$HOME/.nunchi}"
 SNAP="${NUNCHI_SNAPSHOT:-$NUNCHI_HOME/snapshot.md}"
 [ -f "$SNAP" ] || exit 0
 
-# Inject current snapshot immediately (never block start).
-head -c 3000 "$SNAP" 2>/dev/null || true
+# P2-7 (#1264): ranked, budget-bounded assembly replaces the blind `head -c`
+# truncation when enabled (default on; CCC_NUNCHI_ASSEMBLE=0 opts out). The
+# task hint joins the same task-conditioned prefetch path load-memory.sh uses
+# (ccc-memory-query.sh --mode local, then current-task.txt); without a hint
+# the assembly degrades to constraints-first + recency, which is still
+# strictly better than recency-only truncation where newer filler could cut
+# off a constraint. ANY failure inside the assembly falls back to the exact
+# legacy `head -c 3000`, so the worst case stays today's behavior.
+inject_legacy() { head -c 3000 "$SNAP" 2>/dev/null || true; }
+
+if [ "${CCC_NUNCHI_ASSEMBLE:-1}" = "0" ] || [ "${CCC_NUNCHI_ASSEMBLE:-1}" = "false" ]; then
+  inject_legacy
+else
+  hint=""
+  for d in "${CCC_MEMORY_TOOLS_DIR:-}" "$HERE/../../scripts"; do
+    [ -n "$d" ] || continue
+    if [ -f "$d/ccc-memory-query.sh" ]; then
+      hint="$("$d" --mode local 2>/dev/null || true)"
+      break
+    fi
+  done
+  [ -n "$hint" ] || hint="$(cat "${STATE}/current-task.txt" 2>/dev/null || true)"
+  if ! python3 "$HERE/nunchi.py" assemble \
+       --budget "${CCC_NUNCHI_ASSEMBLE_BUDGET:-3000}" --hint "$hint" 2>/dev/null; then
+    inject_legacy
+  fi
+fi
 
 # Regenerate asynchronously if stale (>15min); cron refreshes every 10min normally.
 # The background refresh updates the snapshot for the next session; this session
