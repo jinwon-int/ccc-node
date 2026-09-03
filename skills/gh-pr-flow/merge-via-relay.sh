@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Fail-closed squash merge through Seoseo's existing jinon86 gh session.
-# The token never leaves Seoseo; this helper sends only repository metadata.
+# Fail-closed squash merge through the relay node's existing jinon86 gh session.
+# The token never leaves the relay node; this helper sends only repository metadata.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: merge-via-seoseo.sh --repo OWNER/REPO --pr NUMBER \
+Usage: merge-via-relay.sh --repo OWNER/REPO --pr NUMBER \
   --expected-head 40_HEX_SHA --operator-approved [--ssh-target HOST] [--dry-run]
 EOF
 }
@@ -13,8 +13,8 @@ EOF
 repo=""
 pr=""
 expected_head=""
-ssh_target="${CCC_SEOSEO_SSH_TARGET:-seoseo}"
-expected_actor="${CCC_SEOSEO_MERGE_ACTOR:-jinon86}"
+ssh_target="${CCC_RELAY_SSH_TARGET:-relay}"
+expected_actor="${CCC_RELAY_MERGE_ACTOR:-jinon86}"
 approved=0
 dry_run=0
 
@@ -57,7 +57,7 @@ done
 }
 command -v ssh >/dev/null 2>&1 || { echo "ssh is required" >&2; exit 2; }
 
-ssh -o BatchMode=yes -o ConnectTimeout="${CCC_SEOSEO_SSH_TIMEOUT:-8}" \
+ssh -o BatchMode=yes -o ConnectTimeout="${CCC_RELAY_SSH_TIMEOUT:-8}" \
   "$ssh_target" bash -s -- \
   "$repo" "$pr" "${expected_head,,}" "$expected_actor" "$dry_run" <<'REMOTE'
 set -euo pipefail
@@ -68,8 +68,8 @@ expected_head="$3"
 expected_actor="$4"
 dry_run="$5"
 
-command -v gh >/dev/null 2>&1 || { echo "Seoseo gh is unavailable" >&2; exit 3; }
-command -v jq >/dev/null 2>&1 || { echo "Seoseo jq is unavailable" >&2; exit 3; }
+command -v gh >/dev/null 2>&1 || { echo "remote gh is unavailable" >&2; exit 3; }
+command -v jq >/dev/null 2>&1 || { echo "remote jq is unavailable" >&2; exit 3; }
 
 actor="$(gh api user --jq .login)"
 [ "$actor" = "$expected_actor" ] || {

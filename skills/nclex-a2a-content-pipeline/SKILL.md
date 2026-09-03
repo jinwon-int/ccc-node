@@ -17,13 +17,13 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
   (기존 manifest들이 템플릿 — `manifest-pr249-*.json`, `manifest-pr251-*.json`).
 - 디스패치 CLI: `a2a-nexus` 체크아웃의 `scripts/a2a-dispatch-round.mjs`
   (`--manifest F --dry-run` → `--verify`). **edge secret은 브로커가 있는 노드의
-  로컬 env에서만 읽는다** — T1(Seoseo)=이 노드 `/etc/default/a2a-hermes-worker`의
-  `BROKER_EDGE_SECRET`(터널 `http://127.0.0.1:18787`), T2(Gwakga)=gwakga의
-  `/root/a2a-nexus/packages/broker/.env`의 `EDGE_SECRET`(**gwakga에서 SSH로 실행**,
-  값 이동·출력 금지).
-- 신뢰 워커(keyring `refs/a2a-public-keyring.json` 등록): sogyo·nosuk(T1),
-  dungae·daegyo·gongmyoung(T2), yukson(저자 제척). **soonwook·jingun 미등록** —
-  이들의 PASS는 `a2a/receipts`에서 무효. jingun은 Claude 인증 없음(핸들러 즉사).
+  로컬 env에서만 읽는다** — T1(로컬 브로커)=브로커 노드 env의
+  `BROKER_EDGE_SECRET`(로컬 터널 `http://127.0.0.1:<port>`), T2(원격 브로커)=브로커
+  호스트 a2a-nexus 체크아웃 `packages/broker/.env`의 `EDGE_SECRET`(**브로커
+  호스트에서 SSH로 실행**, 값 이동·출력 금지).
+- 신뢰 워커는 keyring `refs/a2a-public-keyring.json` 등록 노드만 — 레인별 등록
+  목록은 키링 파일이 정본이고 저자 노드는 구조적 제척. **미등록 노드의 PASS는
+  `a2a/receipts`에서 무효** — 디스패치 전 등록 여부를 확인한다.
 - PR 본문에 기계 판독 8필드 필수(값=머지된 claim 레코드와 정확 일치):
   `- TASK_ID/TASK_KIND/AUTHOR_NODE/TARGET_IDS/SOURCE_PACKET/REFS_MANIFEST_SHA256/BASE_SHA/RISK_CLASS`.
 
@@ -44,7 +44,7 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
 1. 신규 용어 후보(coverage 레코드 `candidates`)를 terms.json에 KMA 근거로 먼저 등록
    → `node tools/ko_coverage.js --build` → 후보 0 확인 → 커밋.
 2. manifest: 스키마 `nclex.terminology-bilingual-review.v1`, lane
-   `terminology_bilingual`, reviewer는 저자 아닌 신뢰 워커(선례 sogyo),
+   `terminology_bilingual`, reviewer는 저자 아닌 keyring 등록 신뢰 워커,
    `sourceBundle.files[0].content`에 계약+changedRecords(75쌍)+relevantRules+
    machineGate 내장. `terminalBrief.notificationOwnership` 필수.
 3. dry-run → 디스패치 → 브로커 감시는 **스킬 동봉 워처 `watch-task.sh`**(같은
@@ -111,7 +111,7 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
    `gh api repos/<r>/commits/<head>/status`.
 3. `success: "signed receipts complete: N lane(s), N reviewer(s), exact-head"`
    확인 후 **머지는 별도 사용자 승인** → gh-pr-flow(Direction B: jinon86
-   exact-head squash via seoseo).
+   exact-head squash via the relay merge helper).
 
 ## 안전 규칙
 
