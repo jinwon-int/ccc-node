@@ -286,6 +286,35 @@ out="$(python3 "$NP" retag "$TID" philosophy 2>&1)"; rc=$?
 ok "retag rejects off-taxonomy target" '[ "$rc" != 0 ] && grep -q "unknown kind" <<<"$out"'
 # restore queue state for the later G5-count sections (t1 was flag-only)
 python3 "$NP" review "$TID" --clear >/dev/null
+
+# ---- 3g. assemble: ranked, budget-bounded assembly (#1264 P2-7) -------------
+# older hint-target first, then newer fillers (recency tail)
+payload a1 context user "HINT-TARGET 프록시 대신 직접 연결 채택" | python3 "$NP" ingest - >/dev/null
+payload a2 context node "FILLER-ONE 컨텍스트" | python3 "$NP" ingest - >/dev/null
+payload a3 context node "FILLER-TWO 컨텍스트" | python3 "$NP" ingest - >/dev/null
+python3 - "$NUNCHI_DB" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review,mutability)"
+          " VALUES('family-assistant','yukson','constraint','CONSTRAINT-RULE-7749 은 규칙이다','2026-08-07','cons-7749','2026-08-07T00:00:00+00:00',3,0,'static')")
+c.commit()
+PY
+ASM="$(python3 "$NP" assemble --budget 8192 --hint "HINT-TARGET" 2>&1)"
+nline="$(grep -n "HINT-TARGET 프록시" <<<"$ASM" | cut -d: -f1)"
+f1line="$(grep -n "FILLER-ONE" <<<"$ASM" | cut -d: -f1)"
+ok "hint-matched older fact ranks above newer fillers" '[ -n "$nline" ] && [ -n "$f1line" ] && [ "$nline" -lt "$f1line" ]'
+ok "constraints always included" 'grep -q "CONSTRAINT-RULE-7749" <<<"$ASM"'
+ok "observation kind excluded from assembly" '! grep -q "TEMP-OBS" <<<"$ASM"'
+SMALL="$(python3 "$NP" assemble --budget 400 --hint "HINT-TARGET" 2>&1)"
+ok "tiny budget: constraints still present" 'grep -q "CONSTRAINT-RULE-7749" <<<"$SMALL"'
+ok "tiny budget: top-ranked fact survives the cut" 'grep -q "HINT-TARGET" <<<"$SMALL"'
+total="$(python3 "$NP" assemble --budget 8192 --hint "HINT-TARGET" | wc -c)"
+ok "output stays within the byte budget" '[ "$total" -le 8192 ]'
+NOHINT="$(python3 "$NP" assemble --budget 8192 2>&1)"
+ft="$(grep -n "FILLER-TWO" <<<"$NOHINT" | cut -d: -f1)"
+fo="$(grep -n "FILLER-ONE" <<<"$NOHINT" | cut -d: -f1)"
+ok "hint-less assembly falls back to pure recency (newest first)" '[ -n "$ft" ] && [ -n "$fo" ] && [ "$ft" -lt "$fo" ]'
+ok "live-check marker renders inline in assembly" 'grep -q "^- ⟳ (.*/context) FILLER-ONE" <<<"$ASM"'
 python3 - "$NUNCHI_DB" <<'PY'
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])

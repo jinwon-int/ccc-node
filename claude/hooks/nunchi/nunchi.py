@@ -1317,41 +1317,17 @@ def merge(dup_id, survivor_id):
     print(f"  survivor review flag unchanged — clear if resolved: nunchi.py review {survivor_id} --clear")
 
 
-def snapshot(limit):
-    c = db()
-    _close_expired_observations(c)
-    c.commit()
-    rows = c.execute(
-        "SELECT observed,kind,fact,mutability FROM peer_facts WHERE valid_to IS NULL"
-        " AND kind NOT IN ('constraint','observation') ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-    # G4 — constraints are never crowded out by recency: a rule you must not
-    # break is exactly the fact whose miss is an incident, not a staleness.
-    cons = c.execute(
-        "SELECT observed,fact FROM peer_facts WHERE valid_to IS NULL"
-        " AND kind = 'constraint' ORDER BY id DESC").fetchall()
+def _snapshot_header(c):
+    """Warning surface shared by snapshot() and assemble() (P2-7): the
+    backend-state and review-queue lines every injection must carry."""
     queued = c.execute(
         "SELECT kind,fact,because FROM peer_facts"
         " WHERE valid_to IS NULL AND review=1").fetchall()
-    # #1264 — a G5-flagged decision is owner-actionable ONLY while its reason
-    # is still recoverable, and usually it is not: measured 2026-08-25 on this
-    # node, 139 of 144 had their source transcript already deleted and
-    # `evidence` holds a distill pointer, not the reason. judge-batch can never
-    # clear them (#1270), so counting them in the alert pins ⚠⚠ on forever and
-    # the escalation stops carrying information — the exact silent-backlog
-    # failure #1010 proposal 3 introduced it to prevent. They are split out and
-    # given their own line rather than hidden: the gap stays visible, but the
-    # threshold now tracks the queue an owner can actually drain.
     g5_blocked = sum(1 for k, f, b in queued
                      if _g5_reasonless_decision(k, f, b))
     pending = len(queued) - g5_blocked
-    # #1010 proposal 3 — escalate the wording once the queue crosses the
-    # alert threshold (default 10; NUNCHI_REVIEW_QUEUE_ALERT) so a silently
-    # growing review backlog becomes visible in the SessionStart snapshot.
     alert_at = int(os.environ.get("NUNCHI_REVIEW_QUEUE_ALERT", "10"))
     lines = ["## nunchi working memory (primary — gate-3 transition, #824)"]
-    # #1263 — a working fallback looks identical to a healthy primary unless
-    # something surfaces the substitution. Same escalation pattern as the
-    # review queue: silent while healthy, visible the moment it isn't.
     backend_state, backend_detail = backend_health_state()
     if backend_state == "outage":
         lines.append(
@@ -1373,6 +1349,23 @@ def snapshot(limit):
         lines.append(
             f"- ⚠ 근거 결측 결정 {g5_blocked}건 — 자동 판정 불가(G5, #1264)."
             " `nunchi.py annotate <id> --because <이유>`로만 해소")
+    return lines
+
+
+def snapshot(limit):
+    c = db()
+    _close_expired_observations(c)
+    c.commit()
+    rows = c.execute(
+        "SELECT observed,kind,fact,mutability FROM peer_facts WHERE valid_to IS NULL"
+        " AND kind NOT IN ('constraint','observation') ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    # G4 — constraints are never crowded out by recency: a rule you must not
+    # break is exactly the fact whose miss is an incident, not a staleness.
+    cons = c.execute(
+        "SELECT observed,fact FROM peer_facts WHERE valid_to IS NULL"
+        " AND kind = 'constraint' ORDER BY id DESC").fetchall()
+    # G5-split rationale moved to _snapshot_header (P2-7 shares the surface).
+    lines = _snapshot_header(c)
     for o, f in cons:
         lines.append(f"- [제약/{o}] {f}")
     # #1264 P1-4 — live-check facts are grouped AFTER the static block and
@@ -1390,6 +1383,72 @@ def snapshot(limit):
     os.makedirs(os.path.dirname(SNAPSHOT), exist_ok=True)
     open(SNAPSHOT, "w").write(text)
     print(text)
+
+
+def assemble(budget, hint, limit=25):
+    """P2-7 — task-conditioned ranked snapshot assembly, bounded in bytes.
+
+    Fixed ranking contract (#1264 P2-7):
+      1. header warnings (backend state, review-queue surface) — always
+      2. constraints — always, never dropped to fit the budget (G4: a rule
+         you must not break is exactly the fact whose miss is an incident)
+      3. facts ranked: --hint FTS matches first (bm25 relevance via the
+         P2-6-widened search), then plain recency (id DESC) filling what
+         remains. Each fact line keeps its P1-4 ⟳ live-check marker inline
+         so the verification contract survives reordering.
+
+    The budget bounds the FACT block best-effort: a line that does not fit
+    is skipped (a later, shorter line can still fit); when nothing has been
+    added yet the first line is always taken, so a tiny budget degrades to
+    one fact instead of an empty block. Prints to STDOUT — the static
+    snapshot.md stays the production artifact until this ranking wins its
+    fixture validation and a consumer slice wires it in (#1264:
+    "랭킹 변경은 fixture 승부 후 반영").
+    """
+    c = db()
+    _close_expired_observations(c)
+    c.commit()
+    lines = _snapshot_header(c)
+    cons = c.execute(
+        "SELECT observed,fact FROM peer_facts WHERE valid_to IS NULL"
+        " AND kind = 'constraint' ORDER BY id DESC").fetchall()
+    for o, f in cons:
+        lines.append(f"- [제약/{o}] {f}")
+    used = sum(len(l.encode()) + 1 for l in lines)
+    hint = (hint or "").strip()
+    hint_ids = []
+    if hint:
+        hint_ids = [r[0] for r in search(c, hint, limit=limit, include_history=False)]
+    rest_rows = c.execute(
+        "SELECT id,observed,kind,fact,mutability FROM peer_facts WHERE valid_to IS NULL"
+        " AND kind NOT IN ('constraint','observation') ORDER BY id DESC", ()).fetchall()
+    rest = {r[0]: r for r in rest_rows}
+    ordered, seen = [], set()
+    for fid in hint_ids:
+        if fid in rest and fid not in seen:
+            ordered.append(rest[fid])
+            seen.add(fid)
+    for r in rest_rows:
+        if r[0] not in seen:
+            ordered.append(r)
+            seen.add(r[0])
+    fact_lines = []  # (rendered line, is_live) — budget-filtered in order
+    for fid, o, k, f, m in ordered:
+        marker = "" if m == "static" else "⟳ "
+        line = f"- {marker}({o}/{k}) {f}"
+        b = len(line.encode()) + 1
+        if fact_lines and used + b > budget:
+            continue
+        fact_lines.append((line, marker != ""))
+        used += b
+    facts_added = len(fact_lines)
+    if facts_added:
+        live_included = sum(1 for _l, is_live in fact_lines if is_live)
+        if live_included:
+            lines.append(
+                f"- ⟳ live-check {live_included}건 — 가변 운영 사실, 단정 전 실측(#1264 P1-4)")
+        lines.extend(l for l, _m in fact_lines)
+    print("\n".join(lines))
 
 
 def review(fact_id=None, clear=False):
@@ -1533,6 +1592,9 @@ if __name__ == "__main__":
         merge(int(args[0]), int(args[2]))
     elif cmd == "snapshot":
         snapshot(int(flag("--limit", 25)))
+    elif cmd == "assemble":
+        assemble(int(flag("--budget", "4096")), flag("--hint", ""),
+                 int(flag("--limit", "25")))
     elif cmd == "review":
         pos = [a for a in args if not a.startswith("--")]
         review(int(pos[0]) if pos else None, clear="--clear" in args)
