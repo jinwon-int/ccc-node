@@ -232,6 +232,22 @@ def _is_mutable_ops_fact(text):
     return bool(_MUTABLE_OPS.search(text))
 
 
+# #1264 P1-5 — the documented fact taxonomy. procedure is a first-class kind,
+# not an accident: multi-step operational procedures whose canonical home may
+# be skills/Wiki still need their pointer/summary recallable here (measured
+# 2026-09-03, nosuk: 14 rows in active use — the old "procedure 0건" question
+# is settled as "intended, now populated"). correction is internal machinery
+# (auto-supersede) and never owner-facing.
+_KINDS = ("preference", "decision", "observation", "context",
+          "task-progress", "procedure", "constraint")
+_INTERNAL_KINDS = ("correction",)
+# Legacy kinds grandfathered at ingest: the extractor no longer emits them,
+# but mass-flagging every existing legacy row would flood all 12 review
+# queues on rollout (the #1270/#1078 lesson). They store as-is; `retag` is
+# the migration path an owner runs per row.
+_LEGACY_KINDS = ("fact", "node")
+
+
 # #1264 P1-4 — mechanical mutability derivation. Kind-primary by design:
 # source_rank expresses CONFIDENCE (who said it), not DURABILITY (how long
 # it stays true) — a user-stated node revision ages exactly like an inferred
@@ -594,6 +610,7 @@ def ingest(path):
     n = 0
     skipped_mutable = 0
     skipped_reasonless_decisions = 0
+    flagged_unknown_kind = 0
     for it in items:
         # Gate order matters (#890): normalize → rank-verify → update/close →
         # conflict-review → dedup. Normalizing first is what lets the same
@@ -620,6 +637,15 @@ def ingest(path):
             continue
         if _g5_reasonless_decision(kind, text, because):
             review = 1
+        # P1-5 — taxonomy gate: genuinely unknown kinds are kept (data loss
+        # is never the fix for misclassification) but flagged for owner
+        # triage, so drift like the measured `measurement`/`learning` rows
+        # cannot accumulate silently again. Legacy fact/node are
+        # grandfathered (see _LEGACY_KINDS).
+        if (kind not in _KINDS and kind not in _INTERNAL_KINDS
+                and kind not in _LEGACY_KINDS):
+            review = 1
+            flagged_unknown_kind += 1
         superseded = None
         if auto_supersede:
             if kind == "correction":
@@ -649,7 +675,8 @@ def ingest(path):
     print(
         f"ingested {n}/{len(items)} facts (session={sid},"
         f" skipped_mutable_ops={skipped_mutable},"
-        f" skipped_reasonless_decisions={skipped_reasonless_decisions})"
+        f" skipped_reasonless_decisions={skipped_reasonless_decisions},"
+        f" flagged_unknown_kind={flagged_unknown_kind})"
     )
 
 
@@ -1140,6 +1167,26 @@ def refs(fid):
         print(line)
 
 
+def retag(fid, new_kind):
+    """P1-5 — owner-facing taxonomy retype (the migration tool).
+
+    Automatic kind rewriting is deliberately NOT done at ingest or migration:
+    a legacy `fact` can be a durable preference or a stale observation, and
+    that judgment is content-informed. What the code provides is the gate
+    (off-taxonomy kinds enter flagged) and this tool: retag recalculates the
+    derived mutability (P1-4) together with the kind so the two never drift.
+    """
+    if new_kind not in _KINDS:
+        sys.exit(f"retag: unknown kind '{new_kind}' (taxonomy: {', '.join(_KINDS)})")
+    c = db()
+    cur = c.execute("UPDATE peer_facts SET kind=?, mutability=? WHERE id=?",
+                    (new_kind, _mutability(new_kind), fid))
+    if cur.rowcount == 0:
+        sys.exit(f"retag: no fact #{fid}")
+    c.commit()
+    print(f"#{fid} kind → {new_kind} (mutability recalculated: {_mutability(new_kind)})")
+
+
 def supersede(fid, new_text):
     c = db()
     row = c.execute("SELECT observer,observed,kind FROM peer_facts WHERE id=?", (fid,)).fetchone()
@@ -1396,6 +1443,10 @@ if __name__ == "__main__":
         synthesize_stdin(args[0])
     elif cmd == "annotate":
         annotate(int(args[0]), flag("--because", ""))
+    elif cmd == "retag":
+        if len(args) < 2:
+            sys.exit("usage: nunchi.py retag <id> <kind>")
+        retag(int(args[0]), args[1])
     elif cmd == "refs":
         refs(int(args[0]))
     elif cmd == "supersede":
