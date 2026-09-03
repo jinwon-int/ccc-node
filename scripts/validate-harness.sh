@@ -298,6 +298,12 @@ else
   err "skill registry validation failed"
   tail -10 "$TMP/skill-registry.out" 2>/dev/null
 fi
+if bash scripts/canon-node-name-scan.sh >"$TMP/canon-scan.out" 2>&1; then
+  say "  ok Canon node-name scan — public-safe skill jurisdiction (#1446)"
+else
+  err "canon node-name scan failed — node identifiers in the canon skill sets"
+  tail -20 "$TMP/canon-scan.out" 2>/dev/null
+fi
 if python3 scripts/ccc_memory_timeparse_test.py >"$TMP/timeparse-test.out" 2>&1; then
   say "  ok NL as_of time-reference estimation tests (#871)"
 else
@@ -421,6 +427,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/ccc-skill-registry.test.sh \
          scripts/ccc-fleet-skills-sync.test.sh \
          scripts/gh-pr-flow-relay-merge.test.sh \
+         scripts/canon-node-name-scan.test.sh \
          scripts/ccc-self-update.test.sh scripts/self-update-check.test.sh scripts/ccc-provenance.test.sh \
          scripts/bridge-watchdog.test.sh \
          scripts/ccc-bridge-locate.test.sh \
