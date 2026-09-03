@@ -70,13 +70,13 @@
     {
       "audience": "codex",
       "classification": null,
-      "description": "Validate, independently review, and normally squash-merge protected GitHub pull requests. Use when a PR must pass exact-head, green-check, author/reviewer separation, or required-review gates; when a jinon86- or seoseo-ai-authored PR needs approval from the other Seoseo-held account; or when landing changes without weakening branch protection.",
+      "description": "Validate, independently review, and normally squash-merge protected GitHub pull requests. Use when a PR must pass exact-head, green-check, author/reviewer separation, or required-review gates; when a jinon86- or seoseo-ai-authored PR needs approval from the other relay-held account; or when landing changes without weakening branch protection.",
       "files": 5,
       "managed": true,
       "name": "gh-pr-flow",
       "source": "codex/skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "827647d28444f682846b00ae9f2057fa552229a16ebf69e077e7ae65640f748b"
+      "tree_sha256": "77071c30422df0b788eaa3b44f993f1a3b7d4c65af582c5bb8dc1392d8d1a8ab"
     },
     {
       "audience": "piri",
@@ -109,7 +109,7 @@
       "name": "bridge-detached-self-restart",
       "source": "skills/bridge-detached-self-restart",
       "status": "active",
-      "tree_sha256": "e38e520d15aeb068b4032e4769f1bf59e38a903e3624e83ae05e8ad859c7c0f5"
+      "tree_sha256": "e7dfbd31630756632acf5fd15b0fa5e0f360a0da1c67da04c1cee71775cfc4e0"
     },
     {
       "audience": "claude",
@@ -186,7 +186,7 @@
       "name": "distill",
       "source": "skills/distill",
       "status": "active",
-      "tree_sha256": "ead2f7fba6ef988f5ffc14b3b911657003181cd36ea73d9620781ebceecc8a8e"
+      "tree_sha256": "2f61b0d55a1d382b5c58325e35d1f5916f330ffe551067318c9f53dee1cfdbfc"
     },
     {
       "audience": "shared",
@@ -208,7 +208,7 @@
       "name": "fleet-task-handoff-with-constraints",
       "source": "skills/fleet-task-handoff-with-constraints",
       "status": "active",
-      "tree_sha256": "3834b22a8c849d621dcd95ad3f8546c8fd341129e6bbffe49e5c45f8094c71b2"
+      "tree_sha256": "b04139a83645f1b717da95b1e8953930970427437daa1e03bd053c715c1837ac"
     },
     {
       "audience": "shared",
@@ -224,13 +224,13 @@
     {
       "audience": "claude",
       "classification": "adapted",
-      "description": "Ship code through the PR-first GitHub flow on this node, including protected PRs that need an independent cross-account review in either direction — jinon86-authored PR approved via the Seoseo-held seoseo-ai profile (exact-head) or seoseo-ai-authored PR approved/merged as jinon86 (Seoseo-held session) — after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. Enforces no direct main pushes, exact-head and green-check validation, independent review, secret-safe credential use, squash merge, and verified cleanup. Not for Wiki edits (use wiki-record).",
+      "description": "Ship code through the PR-first GitHub flow on this node, including protected PRs that need an independent cross-account review in either direction — jinon86-authored PR approved via the relay-held seoseo-ai profile (exact-head) or seoseo-ai-authored PR approved/merged as jinon86 (relay-held session) — after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. Enforces no direct main pushes, exact-head and green-check validation, independent review, secret-safe credential use, squash merge, and verified cleanup. Not for Wiki edits (use wiki-record).",
       "files": 2,
       "managed": false,
       "name": "gh-pr-flow",
       "source": "skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "253862eadeb0e25fe8f908e43de12f70e0849e222aedda06063b7b1888791822"
+      "tree_sha256": "c546dcb0fdcf951ac84f0bdd57ba4487ed7a15ab4167c8905e1a1568e96d73b1"
     },
     {
       "audience": "claude",
@@ -318,7 +318,7 @@
       "name": "nclex-a2a-content-pipeline",
       "source": "skills/nclex-a2a-content-pipeline",
       "status": "active",
-      "tree_sha256": "ffb9060303a102a6ce2759ca5825d555f894edd4d6587c579beeb8cad0446f24"
+      "tree_sha256": "6f97626000a2336dc3ffc13bfe37915a939b48b5152c57943fa356aef288d185"
     },
     {
       "audience": "claude",
@@ -340,7 +340,7 @@
       "name": "scheduled-verification-with-session-fallback",
       "source": "skills/scheduled-verification-with-session-fallback",
       "status": "active",
-      "tree_sha256": "7b1b83db5d78032a1d7ae6a241b8cc6f08be64e477ad094ae7c98ac41c927b89"
+      "tree_sha256": "e51de28e76b73da61b4852d9ba1e68178b5eda86ec4e7cf59cbdb0a74d2e1650"
     },
     {
       "audience": "shared",
@@ -406,7 +406,7 @@
       "name": "wiki-record",
       "source": "skills/wiki-record",
       "status": "active",
-      "tree_sha256": "ddf1db8c23c4ebb03057227862530deb63800f3f867e18199d4e277f63ddecb0"
+      "tree_sha256": "cc228c19ce4f30556e434acc351cc82677707f0ba70e6618ab920e0a3d50e217"
     }
   ]
 }

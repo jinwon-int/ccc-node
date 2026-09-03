@@ -40,9 +40,9 @@ That is invisible to the successor unless you write it down.
 3. **Attach node constraints to every delegatable item.** Do not write "avoid node X" —
    write the mechanism, or it reads as arbitrary and gets ignored:
 
-   > ③④ must run on a node other than `yukson`. `yukson` and `nosuk` are in the
-   > 08-27~28 APPLY pilot and their **inflow rate** is the observed variable. A
-   > session on `yukson` runs distill, which writes new review-queue facts — the
+   > ③④ must run on a node other than `node-a`. `node-a` and `node-b` are in
+   > the pilot cohort and their **inflow rate** is the observed variable. A
+   > session on `node-a` runs distill, which writes new review-queue facts — the
    > work would be counted as pilot inflow and the measurement becomes unusable.
 
 4. **Verify every metric before it enters the document.** Run the counting method

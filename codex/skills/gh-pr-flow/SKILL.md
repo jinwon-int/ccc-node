@@ -1,6 +1,6 @@
 ---
 name: gh-pr-flow
-description: Validate, independently review, and normally squash-merge protected GitHub pull requests. Use when a PR must pass exact-head, green-check, author/reviewer separation, or required-review gates; when a jinon86- or seoseo-ai-authored PR needs approval from the other Seoseo-held account; or when landing changes without weakening branch protection.
+description: Validate, independently review, and normally squash-merge protected GitHub pull requests. Use when a PR must pass exact-head, green-check, author/reviewer separation, or required-review gates; when a jinon86- or seoseo-ai-authored PR needs approval from the other relay-held account; or when landing changes without weakening branch protection.
 ---
 
 # GitHub PR Flow
@@ -25,28 +25,31 @@ protection, or move a credential between nodes.
 4. Verify the merged commit and remote branch deletion before removing a local
    squash-merged branch.
 
-## Seoseo-held cross-account review
+## Relay-held cross-account review
 
 Use the allowlisted review profile matching the PR author. Both directions
 require fresh explicit approval for the exact repository, PR, and head:
 
 | PR author | Review profile | Expected reviewer | Remote gh config |
 | --- | --- | --- | --- |
-| `jinon86` | `seoseo-ai` | `seoseo-ai` | `/root/.config/gh-seoseo-ai` |
-| `seoseo-ai` | `jinon86` | `jinon86` | `/root/.config/gh` |
+| `jinon86` | `seoseo-ai` | `seoseo-ai` | isolated root-owned profile config |
+| `seoseo-ai` | `jinon86` | `jinon86` | root default gh config |
+
+`relay` below is the SSH alias of the credential-holding relay node in your
+fleet; pass `--ssh-target` explicitly or export `CCC_RELAY_SSH_TARGET`:
 
 ```bash
 CCC_EXPLICIT_USER_APPROVAL=1 \
-  bash "${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts/approve-via-seoseo.sh" \
+  bash "${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts/approve-via-relay.sh" \
     --review-profile seoseo-ai \
     --repo jinwon-int/REPO --pr NUMBER --expected-head FULL_40_CHAR_SHA \
-    --ssh-target seoseo --operator-approved
+    --ssh-target relay --operator-approved
 
 CCC_EXPLICIT_USER_APPROVAL=1 \
-  bash "${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts/approve-via-seoseo.sh" \
+  bash "${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts/approve-via-relay.sh" \
     --review-profile jinon86 \
     --repo jinwon-int/REPO --pr NUMBER --expected-head FULL_40_CHAR_SHA \
-    --ssh-target seoseo --operator-approved
+    --ssh-target relay --operator-approved
 ```
 
 The helper maps each profile to a fixed actor, opposite author, and gh config.

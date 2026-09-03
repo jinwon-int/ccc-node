@@ -9,8 +9,8 @@ cd "$ROOT" || exit 1
 # Private scratch dir. Validation writes fixed-name artifacts (rendered.json,
 # rendered.json, htest.out, ...); pointing at a SHARED ${TMPDIR:-/tmp} makes
 # runs collide with other users' stale copies — with fs.protected_regular the
-# open is denied outright — and the run false-FAILs (observed on gwakga:
-# /tmp/rendered.json left by another account). Always use a fresh private dir.
+# open is denied outright — and the run false-FAILs (observed on a shared
+# worker node: /tmp/rendered.json left by another account). Always use a fresh private dir.
 TMP="$(mktemp -d 2>/dev/null || mktemp -d -t ccc-validate 2>/dev/null)" \
   || { TMP="$ROOT/.harness-tmp.$$"; mkdir -p "$TMP"; }
 trap 'rm -rf "$TMP" 2>/dev/null || true' EXIT
@@ -417,7 +417,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/nclex-a2a-watch-task.test.sh \
          scripts/ccc-skill-registry.test.sh \
          scripts/ccc-fleet-skills-sync.test.sh \
-         scripts/gh-pr-flow-seoseo-merge.test.sh \
+         scripts/gh-pr-flow-relay-merge.test.sh \
          scripts/ccc-self-update.test.sh scripts/self-update-check.test.sh scripts/ccc-provenance.test.sh \
          scripts/bridge-watchdog.test.sh \
          scripts/ccc-bridge-locate.test.sh \

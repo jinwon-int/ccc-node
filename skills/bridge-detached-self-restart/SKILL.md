@@ -90,8 +90,8 @@ the caller.
 ## Safety
 
 - Restarting bridge/gateway/broker-tunnel infrastructure is approval-gated
-  (`gwakga-broker-public-tunnel.service` and
-  `a2a-daegyo-team2-auth-proxy.service` must not be stopped without explicit
+  (broker-public-tunnel and auth-proxy units on broker/relay hosts — e.g.
+  `<node>-broker-public-tunnel.service` — must not be stopped without explicit
   operator approval; broker/Gateway restarts require fresh approval per
   USER.md). Detaching the restart does not bypass that — get approval before
   step 2, not after.
