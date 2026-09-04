@@ -347,6 +347,35 @@ def plan(request: str, inventory: dict, audience: str | None,
     }
 
 
+def _outbox_depths(inventory: dict) -> list[dict]:
+    """Pending-entry estimates for outbox-role classes (#873 step 5).
+
+    Drain-first facts for the closeout checklist: an outbox with a backlog
+    must be reviewed/pruned before any decommission apply. Counts only —
+    dir entries or non-empty lines, never contents.
+    """
+    depths = []
+    for entry in inventory.get("artifacts", []):
+        if entry.get("role") != "outbox":
+            continue
+        resolved = resolve_entry(entry)
+        present = bool(resolved and (os.path.isfile(resolved)
+                                     or os.path.isdir(resolved)))
+        pending = 0
+        if present and os.path.isdir(resolved):
+            for root, _dirs, names in os.walk(resolved):
+                pending += len(names)
+        elif present:
+            try:
+                with open(resolved, encoding="utf-8", errors="replace") as fh:
+                    pending = sum(1 for line in fh if line.strip())
+            except OSError:
+                pending = 0
+        depths.append({"artifact": entry["id"], "path": resolved,
+                       "present": present, "pending": pending})
+    return depths
+
+
 def _run_scan(inventory: dict) -> dict:
     """#873 step 3 — inventory drift/unknown diagnostics for the security
     audit and doctor. Versioned, body-free, read-only."""
@@ -366,6 +395,7 @@ def _run_scan(inventory: dict) -> dict:
         "known_files_count": len(known_files),
         "unknown": unknown,
         "absent": absent,
+        "outbox_depths": _outbox_depths(inventory),
     }
 
 
