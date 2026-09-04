@@ -63,9 +63,14 @@ ok "migrated DB answers node-name query (B1)" 'grep -q "노드 상태 정상" <<
 payload s1 fact user "사용자는 병렬 실행을 선호한다" | python3 "$NP" ingest - >/dev/null
 out="$(payload s1 fact user "사용자는 병렬 실행을 선호한다" | python3 "$NP" ingest - 2>&1)"
 ok "duplicate fact deduped" 'grep -q "ingested 0/1" <<<"$out"'
-CCC_NODE="카렐렌" payload s2 fact node "이 노드는 코덱스 러너다" | CCC_NODE="카렐렌" python3 "$NP" ingest - >/dev/null
+CCC_NODE="육손" payload s2 fact node "이 노드는 코덱스 러너다" | CCC_NODE="육손" python3 "$NP" ingest - >/dev/null
 row="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT observed FROM peer_facts WHERE fact LIKE '%코덱스 러너%'\").fetchone()[0])")"
 ok "persona node subject canonicalized to slug (B3)" '[ "$row" = "yukson" ]'
+# #1472 — the stale 카렐렌→yukson persona alias is removed: karellen is a
+# separate external friend node, so its facts must NOT normalize onto yukson.
+CCC_NODE="카렐렌" payload sk1 fact node "카렐렌 노드는 외부 친구 노드다" | CCC_NODE="카렐렌" python3 "$NP" ingest - >/dev/null
+row="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT observed FROM peer_facts WHERE fact LIKE '%외부 친구 노드%'\").fetchone()[0])")"
+ok "stale 카렐렌 alias removed — observed stays literal, never yukson (#1472)" '[ "$row" = "카렐렌" ]'
 
 # ---- 3b. ingest: mutable-ops facts filtered (#1010) ------------------------
 out="$(payload s6 fact node "카렐렌 ccc-node 커밋 efe088b, Bridge active/enabled, NRestarts=0" | python3 "$NP" ingest - 2>&1)"

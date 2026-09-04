@@ -13,7 +13,7 @@ Canonicalized from the 3-node hand-deployed pilot with the TM-1332 backlog:
       pilot DBs are migrated in place on first `init`/open.
   B2  kind=correction auto-supersedes the best-matching open fact for the
       same observed peer (conservative: token-overlap >= 0.5, single fact).
-  B3  node persona aliases (카렐렌→yukson, 등애→dungae, …) normalized at
+  B3  node persona aliases (육손→yukson, 등애→dungae, …) normalized at
       ingest and expanded at query time.
 
 Write gate (#890 — graph-engineering review):
@@ -71,13 +71,20 @@ USER_PEER = "seo-jin-on"
 OBSERVER = "family-assistant"  # TM-1249 unified distill author peer
 
 # B3 — node persona/hangul aliases → canonical node slug (DOC-140 12 nodes).
-# Personas (e.g. yukson's "카렐렌") drift into fact text and subjects; queries
+# Personas (e.g. yukson's "육손") drift into fact text and subjects; queries
 # and observed values must converge on the canonical slug or node-name recall
 # silently misses (measured on yukson: 57 node facts unreachable).
+# #1472 — karellen is NOT a yukson alias: 카렐렌 separated into its own
+# external friend node on 2026-07-14 (wiki LOG-20260714-soonwook-1, OC-32
+# boundary), so the persona-era mappings ("카렐렌"/"karellen"→yukson) were
+# removed — they mis-attributed karellen facts to the yukson slug. Karellen
+# stays outside the family roster on purpose: its facts still ingest and
+# remain FTS-recallable by fact text, but never normalize onto a family node
+# and never enter the #1447 Wiki-promotion roster.
 NODE_ALIASES = {
     "dungae": "dungae", "등애": "dungae",
     "soonwook": "soonwook", "순욱": "soonwook",
-    "yukson": "yukson", "육손": "yukson", "카렐렌": "yukson", "karellen": "yukson",
+    "yukson": "yukson", "육손": "yukson",
     "gongmyoung": "gongmyoung", "공명": "gongmyoung",
     "gongyung": "gongyung", "공융": "gongyung",
     "seoseo": "seoseo", "서서": "seoseo",
