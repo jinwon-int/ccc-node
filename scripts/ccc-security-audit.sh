@@ -245,6 +245,14 @@ else:
         if absent:
             ids = ', '.join(a.get('artifact', '?') for a in absent)
             add('정상', 'memory artifact inventory', f'absent (fact): {ids}', 'none')
+        # Outbox depth (#873 step 5): drain-first facts for the closeout
+        # checklist — an outbox backlog must be reviewed/pruned before any
+        # decommission apply. Fact rows only; the owner owns the decision.
+        for row in scan.get('outbox_depths', []):
+            state = 'present' if row.get('present') else 'absent'
+            add('정상', 'outbox drain-first (closeout)',
+                f"{row.get('artifact')}: {row.get('pending')} pending [{state}]",
+                'drain before any erasure apply — docs/erasure-closeout.md')
 
 
 # Metadata-only content scans.
