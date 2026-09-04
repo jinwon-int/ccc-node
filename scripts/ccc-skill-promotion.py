@@ -1850,6 +1850,102 @@ def _broker_task_on(config: Config, row: dict[str, object], task_id: str, secret
     return _remote_broker_task(config, rb, task_id)
 
 
+def _broker_pool(config: Config) -> list[tuple[str, dict[str, str] | None]]:
+    """Every configured broker as (name, remote-or-None) — the primary first,
+    then each #2024 secondary in config order."""
+    return [("primary", None)] + [(rb["name"], rb) for rb in config.remote_brokers]
+
+
+def _task_readback_on(config: Config, rb: dict[str, str] | None, task_id: str, secret: str) -> dict[str, object]:
+    """Read one task back from a specific broker (None = the primary)."""
+    if rb is None:
+        return _broker_task(config, task_id, secret)
+    return _remote_broker_task(config, rb, task_id)
+
+
+def _dispatch_bor_violation(
+    config: Config, rb: dict[str, str] | None, task_id: str, secret: str, broker_id: str
+) -> str | None:
+    """Post-dispatch routing gate (2026-09 collect-gap repair): read the
+    created task back and return a violation detail when it CONFIRMEDLY
+    records a foreign brokerOfRecord — a ledger row must never point at a
+    broker that does not own the task. A readback failure is tolerated
+    (fail-safe: the task exists either way, and older brokers omit the
+    field), so only positive evidence blocks."""
+    try:
+        created_task = _task_readback_on(config, rb, task_id, secret)
+        created_bor = created_task.get("brokerOfRecord") if isinstance(created_task, dict) else None
+        if isinstance(created_bor, str) and created_bor.strip() and created_bor.strip() != broker_id:
+            return f"brokerOfRecord={created_bor.strip()} != {broker_id}"
+    except PromotionError:
+        pass
+    return None
+
+
+def _task_bor_matches(task: dict[str, object], broker_id: str) -> bool:
+    """True when the task's brokerOfRecord is absent (older brokers — the
+    gate stays open rather than blocking) or names exactly the expected
+    broker. A NON-matching value is the only contradiction."""
+    bor = task.get("brokerOfRecord")
+    if not isinstance(bor, str) or not bor.strip():
+        return True
+    return bor.strip() == broker_id
+
+
+def _broker_task_gated(config: Config, row: dict[str, object], task_id: str, secret: str) -> tuple[dict[str, object] | None, str]:
+    """Fetch a task for a ledger row with the T1/T2 routing gate (2026-09
+    collect-gap repair, #2024 follow-up): a task must be read from the broker
+    it records as its brokerOfRecord — the pr104 class of failure, where a
+    row claimed one broker but the task lived on another, starved as
+    verdict-pending forever until an operator hand-edited the ledger.
+
+    Resolution order:
+      1. the claimed broker via row routing (the unchanged fast path); the
+         expected broker id comes from the row's own `broker_id` claim when
+         present, else from the routed broker's health;
+      2. on a clean miss (404) or a foreign brokerOfRecord, poll every OTHER
+         configured broker once and accept a copy that self-reports that
+         broker — the misrouted-row case, recorded as "corrected:<name>";
+      3. otherwise return the claimed copy with "mismatch" so the caller
+         records a distinct, visible status instead of a silent drop.
+
+    Returns (task, resolution): resolution is "claimed", "corrected:<name>",
+    "mismatch", or "missing" (not on any broker — treat like the old
+    unreachable case, never as a verdict)."""
+    try:
+        task = _broker_task_on(config, row, task_id, secret)
+    except PromotionError:
+        task = None
+    claimed_id = row.get("broker_id")
+    claimed_id = claimed_id.strip() if isinstance(claimed_id, str) else ""
+    if isinstance(task, dict):
+        rb = _broker_for_row(config, row)
+        try:
+            routed_id = _remote_broker_id(config, rb) if rb is not None else _broker_id(config, secret)
+        except PromotionError:
+            routed_id = ""
+        expected = claimed_id or routed_id
+        if not expected or _task_bor_matches(task, expected):
+            return task, "claimed"
+        claimed = str(row.get("broker") or "primary")
+    else:
+        claimed = str(row.get("broker") or "primary")
+    for name, other_rb in _broker_pool(config):
+        same = (other_rb is None and claimed == "primary") or (other_rb is not None and other_rb["name"] == claimed)
+        if same:
+            continue
+        try:
+            candidate = _task_readback_on(config, other_rb, task_id, secret)
+            other_id = _remote_broker_id(config, other_rb) if other_rb is not None else _broker_id(config, secret)
+        except PromotionError:
+            continue
+        if isinstance(candidate, dict) and _task_bor_matches(candidate, other_id):
+            return candidate, f"corrected:{name}"
+    if isinstance(task, dict):
+        return task, "mismatch"
+    return None, "missing"
+
+
 def _dispatch_target_worker(config: Config, author_node: str, secret: str) -> tuple[str, dict[str, str] | None]:
     """Pick a reviewer for the dispatch target broker: keyring workers minus
     the author, intersected with that broker's online workers. A keyring
@@ -2133,6 +2229,9 @@ def _dispatch_intake_review(  # noqa: C901
         return {"outcome": "dispatch-skipped", "code": "dispatch_round_failed"}
     lane = manifest["lanes"][0]
     task_id = lane["id"]
+    violation = _dispatch_bor_violation(config, review_rb, task_id, secret, broker_id)
+    if violation:
+        return {"outcome": "dispatch-skipped", "code": "broker_mismatch", "detail": violation[:160]}
     _append_ledger(
         config,
         {
@@ -2800,6 +2899,9 @@ def _dispatch_intake_revise(
         "broker_id": broker_id,
         "broker": revise_rb["name"] if revise_rb else "primary",
     }
+    violation = _dispatch_bor_violation(config, revise_rb, task_id, secret, broker_id)
+    if violation:
+        return {"outcome": "revise-skipped", "code": "broker_mismatch", "detail": violation[:160]}
     _append_ledger(config, record)
     rows.append(record)
     try:
@@ -2896,10 +2998,38 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
         if dry_run:
             processed.append({"outcome": "would-poll-verdict", "task_id": dispatched})
             continue
-        try:
-            task = _broker_task_on(config, row, dispatched, os.environ.get("A2A_EDGE_SECRET", ""))
-        except PromotionError:
+        task, routing = _broker_task_gated(config, row, dispatched, os.environ.get("A2A_EDGE_SECRET", ""))
+        if task is None or routing == "missing":
             processed.append({"outcome": "verdict-pending", "task_id": dispatched})
+            continue
+        if routing == "mismatch":
+            # The routing gate found the task only on a broker that denies
+            # owning it (brokerOfRecord contradiction). Consume once with a
+            # distinct, visible status instead of a silent malformed drop —
+            # the ledger must never quietly poison a head.
+            _append_ledger(
+                config,
+                {
+                    "ts": _utc_now(),
+                    "kind": "a2a-verdict",
+                    "task_id": dispatched,
+                    "status": "broker-mismatch",
+                    "task_status": str(task.get("status", "")),
+                },
+            )
+            _comment_once(
+                config,
+                rows,
+                pr=_pr_number_from_url(str(row.get("pr_url", ""))) or "",
+                head=row.get("head_sha") if isinstance(row.get("head_sha"), str) else "",
+                marker=f"broker-mismatch:{dispatched}",
+                body=(
+                    f"Collect routing gate: task `{dispatched}` is recorded on a broker that does "
+                    "not own it (brokerOfRecord contradiction). The verdict is withheld — an "
+                    "operator should reconcile the ledger row's broker against the brokers."
+                ),
+            )
+            processed.append({"outcome": "verdict-broker-mismatch", "task_id": dispatched})
             continue
         if task.get("status") not in _TERMINAL_TASK_STATUSES:
             processed.append({"outcome": "verdict-pending", "task_id": dispatched})
@@ -2915,6 +3045,7 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
                     "task_id": dispatched,
                     "status": "malformed",
                     "task_status": str(task.get("status", "")),
+                    **({"broker_corrected": routing} if routing.startswith("corrected:") else {}),
                 },
             )
             processed.append({"outcome": "verdict-malformed", "task_id": dispatched})
@@ -2930,6 +3061,7 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
                 "verdict": verdict,
                 "findings": len(findings),
                 "head_sha": head,
+                **({"broker_corrected": routing} if routing.startswith("corrected:") else {}),
             },
         )
         note = ""
@@ -3023,10 +3155,29 @@ def _consume_revise_results(config: Config, *, dry_run: bool) -> list[dict[str, 
         if dry_run:
             results.append({"outcome": "would-poll-revise", "task_id": task_id})
             continue
-        try:
-            task = _broker_task_on(config, row, str(task_id), os.environ.get("A2A_EDGE_SECRET", ""))
-        except PromotionError:
+        task, routing = _broker_task_gated(config, row, str(task_id), os.environ.get("A2A_EDGE_SECRET", ""))
+        if task is None or routing == "missing":
             results.append({"outcome": "revise-pending", "task_id": task_id})
+            continue
+        if routing == "mismatch":
+            _append_ledger(
+                config,
+                {"ts": _utc_now(), "kind": "a2a-revise-result", "task_id": task_id,
+                 "status": "broker-mismatch", "task_status": str(task.get("status", ""))},
+            )
+            _comment_once(
+                config,
+                rows,
+                pr=str(pr),
+                head=str(head),
+                marker=f"broker-mismatch:{task_id}",
+                body=(
+                    f"Collect routing gate: revision task `{task_id}` is recorded on a broker that "
+                    "does not own it (brokerOfRecord contradiction). The result is withheld — an "
+                    "operator should reconcile the ledger row's broker against the brokers."
+                ),
+            )
+            results.append({"outcome": "revise-broker-mismatch", "task_id": task_id})
             continue
         status = task.get("status")
         if status not in _TERMINAL_TASK_STATUSES:
