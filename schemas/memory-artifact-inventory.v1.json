@@ -533,6 +533,64 @@
       "verification": "queue depth"
     },
     {
+      "id": "distill.wiki_candidates_queue",
+      "path_class": "node-local outbox external-adjacent",
+      "contains": [
+        "promotion-candidates",
+        "nunchi-p3-8-markers"
+      ],
+      "role": "outbox",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "wiki-candidates.md"
+          },
+          {
+            "path": "~/.claude/state/wiki-candidates.md"
+          }
+        ]
+      },
+      "retention": "until human review (external handoff once promoted); .bak-* copies are owner-decision blockers",
+      "requests": {
+        "node-decommission": "external-handoff",
+        "prune-expired": "prune-stale-candidates"
+      },
+      "handoff_note": "the human-review queue written by distill wiki-queue.sh and the #1447 batch — promoted entries live in the Family Wiki — owner workflow, never node-local deletion",
+      "derived_copies": [],
+      "verification": "queue depth"
+    },
+    {
+      "id": "distill.wiki_candidates_seen",
+      "path_class": "node-local operational",
+      "contains": [
+        "title-hash-dedup-rows"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "wiki-candidates.seen"
+          },
+          {
+            "path": "~/.claude/state/wiki-candidates.seen"
+          }
+        ]
+      },
+      "retention": "TTL window (CCC_DISTILL_SEEN_TTL_DAYS, default 7d); loss is benign",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "line count (4-column rows)"
+    },
+    {
       "id": "session.resume_working_state",
       "path_class": "node-local derived",
       "contains": [
