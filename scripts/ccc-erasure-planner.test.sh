@@ -88,12 +88,16 @@ printf 'log' > "$NUNCHI_HOME/wiki-promote.cron.log"
 printf 'lock' > "$NUNCHI_HOME/.judge.lock"
 printf 'sheet' > "$NUNCHI_HOME/bench-20260803.md"
 printf 'sheet' > "$NUNCHI_HOME/bench-20260907.md"
+printf 'queue' > "$CCC_STATE_DIR/wiki-candidates.md"
+printf '000 000 1 abcdef123456\n' > "$CCC_STATE_DIR/wiki-candidates.seen"
 out="$(run scan --json)"
 scan_unknowns="$(python3 -c 'import json,sys; print("\n".join(u["path"] for u in json.load(sys.stdin)["unknown"]))' <<<"$out")"
 ok "locks classified via extra_paths" '! grep -qF ".judge.lock" <<<"$scan_unknowns"'
 ok "cron logs classified via extra_paths" '! grep -qF "cron.log" <<<"$scan_unknowns"'
 ok "dated bench sheets classified via pattern" \
   '! grep -qF "bench-20260803" <<<"$scan_unknowns" && ! grep -qF "bench-20260907" <<<"$scan_unknowns"'
+ok "state-dir wiki queue + seen ledger classified" \
+  '! grep -qF "wiki-candidates.md" <<<"$scan_unknowns" && ! grep -qF "wiki-candidates.seen" <<<"$scan_unknowns"'
 ok "mystery orphan still a blocker (fail-closed intact)" 'grep -qF "mystery-orphan" <<<"$scan_unknowns"'
 out="$(run node-decommission --json)"
 ok "multi-file class emits per-path targets" \
