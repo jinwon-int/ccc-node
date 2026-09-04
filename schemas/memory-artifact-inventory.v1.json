@@ -332,7 +332,12 @@
         "cache-rebuild": "rebuild"
       },
       "derived_copies": [],
-      "verification": "json-parses"
+      "verification": "json-parses",
+      "extra_paths": [
+        {
+          "path": "~/.nunchi/mempalace-refresh.status.json"
+        }
+      ]
     },
     {
       "id": "nunchi.ingest_seen_state",
@@ -362,6 +367,9 @@
         },
         {
           "path": "~/.nunchi/ingested-files"
+        },
+        {
+          "path": "~/.nunchi/piri-seen"
         }
       ],
       "retention": "dedup ledgers; loss is benign (re-ingestion re-dedupes against the store itself)",
@@ -560,7 +568,15 @@
       },
       "handoff_note": "the human-review queue written by distill wiki-queue.sh and the #1447 batch — promoted entries live in the Family Wiki — owner workflow, never node-local deletion",
       "derived_copies": [],
-      "verification": "queue depth"
+      "verification": "queue depth",
+      "extra_paths": [
+        {
+          "path": "~/.claude/state/wiki-candidates.md"
+        },
+        {
+          "path": "~/.claude/state/wiki-candidates.seen"
+        }
+      ]
     },
     {
       "id": "distill.wiki_candidates_seen",
@@ -617,7 +633,15 @@
         "cache-rebuild": "rebuild-from-transcripts"
       },
       "derived_copies": [],
-      "verification": "file exists, body-free size check"
+      "verification": "file exists, body-free size check",
+      "extra_paths": [
+        {
+          "path": "~/.claude/state/resume.md"
+        },
+        {
+          "path": "~/.claude/state/working-state.md"
+        }
+      ]
     },
     {
       "id": "audit.autonomy_ledger",
@@ -639,6 +663,29 @@
       "retention": "append-only (erasure conflict: pseudonymize)",
       "requests": {
         "audience-erasure": "pseudonymize",
+        "node-decommission": "retain"
+      },
+      "derived_copies": [],
+      "verification": "jsonl line count"
+    },
+    {
+      "id": "state.cost_ledger",
+      "path_class": "node-local audit",
+      "contains": [
+        "cost-ledger-rows"
+      ],
+      "role": "audit",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "path": "~/.claude/state/cost-ledger.jsonl"
+          }
+        ]
+      },
+      "retention": "cost accounting — operator property, retain on decommission (#873)",
+      "requests": {
+        "audience-erasure": "delete",
         "node-decommission": "retain"
       },
       "derived_copies": [],
@@ -828,6 +875,733 @@
       "handoff_note": "operator decides; node-local agents must not delete transcript archives",
       "derived_copies": [],
       "verification": "external-pending"
+    },
+    {
+      "id": "state.runtime_locks",
+      "path_class": "node-local operational",
+      "contains": [
+        "flock-advisory-locks"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": ".local-memory-sink.lock"
+          },
+          {
+            "path": "~/.claude/state/.local-memory-sink.lock"
+          }
+        ]
+      },
+      "retention": "runtime-scoped; content-free flock anchors",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "file presence",
+      "extra_paths": [
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": ".local-memory-transaction.lock"
+        },
+        {
+          "path": "~/.claude/state/.local-memory-transaction.lock"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": ".skill-autosave-ownership.lock"
+        },
+        {
+          "path": "~/.claude/state/.skill-autosave-ownership.lock"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "autonomy-ledger.jsonl.lock"
+        },
+        {
+          "path": "~/.claude/state/autonomy-ledger.jsonl.lock"
+        },
+        {
+          "path": "~/.claude/state/.local-memory-sink.lock"
+        }
+      ]
+    },
+    {
+      "id": "state.runtime_logs",
+      "path_class": "node-local derived",
+      "contains": [
+        "runtime-log-lines"
+      ],
+      "role": "derived",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "[a-z0-9][a-z0-9.-]*\\.log"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.claude/state/[a-z0-9][a-z0-9.-]*\\.log"
+          }
+        ]
+      },
+      "retention": "regenerable runtime output",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete",
+        "cache-rebuild": "rebuild"
+      },
+      "derived_copies": [],
+      "verification": "file presence"
+    },
+    {
+      "id": "state.installer_records",
+      "path_class": "node-local operational",
+      "contains": [
+        "installer-argv-records"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "install-[a-z0-9-]+\\.json"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.claude/state/install-[a-z0-9-]+\\.json"
+          }
+        ]
+      },
+      "retention": "live config = the latest record per installer; superseded records prunable",
+      "requests": {
+        "audience-erasure": "retain",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "json-parses"
+    },
+    {
+      "id": "state.memory_lane",
+      "path_class": "node-local source",
+      "contains": [
+        "distilled-local-facts",
+        "memory-index",
+        "usage-timing"
+      ],
+      "role": "derived",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "memory-facts.jsonl"
+          },
+          {
+            "path": "~/.claude/state/memory-facts.jsonl"
+          }
+        ]
+      },
+      "retention": "regenerated by the local memory sink; index rebuildable from transcripts",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete",
+        "cache-rebuild": "rebuild"
+      },
+      "derived_copies": [],
+      "verification": "sqlite integrity + line count",
+      "extra_paths": [
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "memory-index.sqlite"
+        },
+        {
+          "path": "~/.claude/state/memory-index.sqlite"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "memory-timing.jsonl"
+        },
+        {
+          "path": "~/.claude/state/memory-timing.jsonl"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "memory-usage.json"
+        },
+        {
+          "path": "~/.claude/state/memory-usage.json"
+        },
+        {
+          "path": "~/.claude/state/memory-facts.jsonl"
+        }
+      ]
+    },
+    {
+      "id": "state.distill_runtime",
+      "path_class": "node-local operational",
+      "contains": [
+        "last-distill-state",
+        "cooldown-marker"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "distill-last.json"
+          },
+          {
+            "path": "~/.claude/state/distill-last.json"
+          }
+        ]
+      },
+      "retention": "latest-run only; loss benign",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "file presence",
+      "extra_paths": [
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "distill-last-error.json"
+        },
+        {
+          "path": "~/.claude/state/distill-last-error.json"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "distill.cooldown"
+        },
+        {
+          "path": "~/.claude/state/distill.cooldown"
+        },
+        {
+          "path": "~/.claude/state/distill-last.json"
+        }
+      ]
+    },
+    {
+      "id": "state.self_update_state",
+      "path_class": "node-local operational",
+      "contains": [
+        "installed-sha-marker"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "self-update.installed-sha"
+          },
+          {
+            "path": "~/.claude/state/self-update.installed-sha"
+          }
+        ]
+      },
+      "retention": "latest-run only",
+      "requests": {
+        "audience-erasure": "retain",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "file presence"
+    },
+    {
+      "id": "state.detached_jobs",
+      "path_class": "node-local operational",
+      "contains": [
+        "job-registry-rows"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "detached-jobs.jsonl"
+          },
+          {
+            "path": "~/.claude/state/detached-jobs.jsonl"
+          }
+        ]
+      },
+      "retention": "job registry; loss benign (jobs self-report)",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "jsonl line count"
+    },
+    {
+      "id": "state.node_identity",
+      "path_class": "node-local operational",
+      "contains": [
+        "node-slug"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "node.txt"
+          },
+          {
+            "path": "~/.claude/state/node.txt"
+          }
+        ]
+      },
+      "retention": "node identity marker",
+      "requests": {
+        "audience-erasure": "retain",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "file presence"
+    },
+    {
+      "id": "state.watchdog_state",
+      "path_class": "node-local operational",
+      "contains": [
+        "watchdog-state-snapshots"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "[a-z0-9-]+\\.latest\\.txt"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.claude/state/[a-z0-9-]+\\.latest\\.txt"
+          },
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "[a-z0-9-]+\\.state"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.claude/state/[a-z0-9-]+\\.state"
+          }
+        ]
+      },
+      "retention": "latest-run only",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "file presence"
+    },
+    {
+      "id": "nunchi.runtime_state",
+      "path_class": "node-local operational",
+      "contains": [
+        "judge-report-md",
+        "mode-marker"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "nunchi-review-report.md"
+          },
+          {
+            "path": "~/.claude/state/nunchi-review-report.md"
+          }
+        ]
+      },
+      "retention": "report regenerated per judge run; mode marker is config",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "file presence",
+      "extra_paths": [
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "nunchi.mode"
+        },
+        {
+          "path": "~/.claude/state/nunchi.mode"
+        }
+      ]
+    },
+    {
+      "id": "state.hooks_audit",
+      "path_class": "node-local audit append-only",
+      "contains": [
+        "hook-audit-events"
+      ],
+      "role": "audit",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "audit.jsonl"
+          },
+          {
+            "path": "~/.claude/state/audit.jsonl"
+          }
+        ]
+      },
+      "retention": "append-only (erasure conflict: pseudonymize, never delete)",
+      "requests": {
+        "audience-erasure": "pseudonymize",
+        "node-decommission": "retain"
+      },
+      "derived_copies": [],
+      "verification": "jsonl line count",
+      "extra_paths": [
+        {
+          "path": "~/.claude/state/audit.jsonl"
+        }
+      ]
+    },
+    {
+      "id": "state.skill_autosave_state",
+      "path_class": "node-local operational",
+      "contains": [
+        "autosave-mode-markers",
+        "ownership-rows",
+        "usage-counters"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "skill-autosave.mode"
+          },
+          {
+            "path": "~/.claude/state/skill-autosave.mode"
+          }
+        ]
+      },
+      "retention": "mode markers + dedup ledgers; loss benign (re-detectable)",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "file presence",
+      "extra_paths": [
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "skill-autosave.notified"
+        },
+        {
+          "path": "~/.claude/state/skill-autosave.notified"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "skill-autosave.seen"
+        },
+        {
+          "path": "~/.claude/state/skill-autosave.seen"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "skill-autosave-ownership.jsonl"
+        },
+        {
+          "path": "~/.claude/state/skill-autosave-ownership.jsonl"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "skill-autosave-usage.json"
+        },
+        {
+          "path": "~/.claude/state/skill-autosave-usage.json"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "skill-review-last.json"
+        },
+        {
+          "path": "~/.claude/state/skill-review-last.json"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "skill-review.last"
+        },
+        {
+          "path": "~/.claude/state/skill-review.last"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "skill-promotion.enabled"
+        },
+        {
+          "path": "~/.claude/state/skill-promotion.enabled"
+        }
+      ]
+    },
+    {
+      "id": "state.skill_promotion_queue",
+      "path_class": "node-local outbox external-adjacent",
+      "contains": [
+        "skill-promotion-candidates"
+      ],
+      "role": "outbox",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "skill-candidates.md"
+          },
+          {
+            "path": "~/.claude/state/skill-candidates.md"
+          }
+        ]
+      },
+      "retention": "until human review (external handoff once promoted)",
+      "requests": {
+        "node-decommission": "external-handoff"
+      },
+      "derived_copies": [],
+      "verification": "queue depth",
+      "handoff_note": "human-review queue for skill promotion — promoted entries live in the skills repo, owner workflow"
+    },
+    {
+      "id": "bot.runtime_state",
+      "path_class": "node-local operational",
+      "contains": [
+        "pid-health-heartbeats",
+        "followup-queue",
+        "usage-ledgers"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "path": "bot.pid"
+          },
+          {
+            "path": "~/.telegram_bot/bot.pid"
+          }
+        ]
+      },
+      "retention": "runtime state; cost ledgers belong to operator accounting (retain on decommission)",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "retain"
+      },
+      "derived_copies": [],
+      "verification": "json-parses + file presence",
+      "extra_paths": [
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "health.json"
+        },
+        {
+          "path": "~/.telegram_bot/health.json"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "heartbeats.json"
+        },
+        {
+          "path": "~/.telegram_bot/heartbeats.json"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "followup-queue.json"
+        },
+        {
+          "path": "~/.telegram_bot/followup-queue.json"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "duration.jsonl"
+        },
+        {
+          "path": "~/.telegram_bot/duration.jsonl"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": ".last_cleanup"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "tasks.json"
+        },
+        {
+          "path": "~/.telegram_bot/tasks.json"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "usage-meter.json"
+        },
+        {
+          "path": "~/.telegram_bot/usage-meter.json"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "usage-meter.json.lock"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "usage-cost-ledger.jsonl"
+        },
+        {
+          "path": "~/.telegram_bot/usage-cost-ledger.jsonl"
+        },
+        {
+          "path": "~/.telegram_bot/.last_cleanup"
+        },
+        {
+          "path": "~/.telegram_bot/usage-meter.json.lock"
+        }
+      ]
+    },
+    {
+      "id": "state.skill_manifest",
+      "path_class": "node-local operational",
+      "contains": [
+        "repo-skills-manifest"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "path": "~/.claude/state/repo-skills.manifest"
+          }
+        ]
+      },
+      "retention": "regenerated by fleet-skills-sync",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "file presence"
+    },
+    {
+      "id": "bot.env_config",
+      "path_class": "node-local config",
+      "contains": [
+        "bridge-env",
+        "credential-locations"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "path": ".env"
+          },
+          {
+            "path": "~/.telegram_bot/.env"
+          }
+        ]
+      },
+      "retention": "live config with credential references — rotate via the credential manager (FW-03); never delete via erasure",
+      "requests": {
+        "audience-erasure": "retain",
+        "node-decommission": "retain",
+        "telegram-user-erasure": "retain"
+      },
+      "derived_copies": [],
+      "verification": "file presence",
+      "handoff_note": ".bak-* copies are owner-decision blockers (credential-adjacent)"
+    },
+    {
+      "id": "bot.credential_key",
+      "path_class": "node-local config",
+      "contains": [
+        "audience-routing-key-material"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "path": "memory-audience.key"
+          },
+          {
+            "path": "~/.telegram_bot/memory-audience.key"
+          }
+        ]
+      },
+      "retention": "key material — rotate via the credential manager (FW-03); never delete via erasure",
+      "requests": {
+        "audience-erasure": "retain",
+        "node-decommission": "retain",
+        "telegram-user-erasure": "retain"
+      },
+      "derived_copies": [],
+      "verification": "file presence"
     }
   ]
 }
