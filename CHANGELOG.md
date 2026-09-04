@@ -13,6 +13,32 @@ All notable changes to the Claude Code node harness. Dates are KST.
   a refusal keeps `unavailable`) and tags `cmd_status` with `via=sudo`.
 
 ### Added
+- **nunchi wiki-promote: weekly fleet-fact → wiki-candidates batch (#1447,
+  #1264 P3-8).** Fleet-entity facts that live only in a node-local nunchi
+  store have no reason to stay local (the Wiki is the single source of
+  truth, FW-05), but automatic Wiki writes stay forbidden — so the batch
+  feeds eligible facts into the EXISTING human-gated path
+  (distill → wiki candidate → wiki-record review) and never touches the
+  Wiki itself. Owner-approved design (2026-09-03): shared scope ONLY
+  (scoped nodes open the canonical `shared` child; private-* is never
+  opened — physical separation, not a filter; unscoped nodes rely on the
+  fleet-roster gate); mechanical eligibility (roster slug ∪ approved
+  services, kind ∈ {fact, decision, procedure} + G5 because, mutability
+  static with stored/derived agreement, P1-3 session/transcript
+  source_refs, open+unreviewed+unsuperseded); fail-closed body screen
+  (local paths, token shapes, key material — excluded, never rewritten);
+  3-layer dedup (in-queue markers → cheap wiki-cache substring → human
+  review); cap 5/run oldest-first with queue backpressure (pending > 20
+  skips the run); permanent `wiki-promoted.seen` idempotence ledger; the
+  nunchi store is opened sqlite READ-ONLY; output is the wiki-queue.sh
+  entry schema verbatim appended to the SAME wiki-candidates queue with a
+  `nunchi-p3-8 fact#ID` traceability marker; audit/report are body-free.
+  Dry-run is the default; `install-nunchi.sh --wiki-promote` adds the
+  Mon 06:40 cron and `--wiki-promote-apply` materializes
+  `NUNCHI_WIKI_PROMOTE_APPLY=1` on it (approval must survive replays, the
+  #1264 lesson). `claude/hooks/nunchi/wiki-promote.py` +
+  `wiki-promote.test.sh` (54 assertions) + installer tests. Fleet rollout
+  is a separate, pilot-first step (#1270/#1271 precedent).
 - **tunnel-audit collects the host firewall (ufw) so a rule change re-surfaces
   an accepted public bind (#1431).** gongmyoung's Home Assistant /
   music-assistant / go2rtc listeners bind 0.0.0.0 but were accepted into the
