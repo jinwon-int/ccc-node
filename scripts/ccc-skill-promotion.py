@@ -2659,7 +2659,7 @@ def _comment_once(
     marker: str,
     body: str,
     kind: str = "a2a-revise-comment",
-) -> None:
+) -> bool:
     """Post a PR comment at most once per (pr, head, marker); idempotency is
     tracked in the ledger so repeated collect cycles never spam the PR."""
     for row in rows:
@@ -2669,14 +2669,15 @@ def _comment_once(
             and row.get("head_sha") == head
             and row.get("marker") == marker
         ):
-            return
+            return True
     try:
         _pr_comment(config, pr, body)
     except PromotionError:
-        return
+        return False
     record = {"ts": _utc_now(), "kind": kind, "pr": pr, "head_sha": head, "marker": marker}
     _append_ledger(config, record)
     rows.append(record)
+    return True
 
 
 def _revise_dispatch_target(
@@ -3018,6 +3019,108 @@ def _build_intake_receipt(
     }
 
 
+def _receipt_already_posted(config: Config, pr: str, body: str) -> bool:
+    """Recover an accepted POST whose response/local ledger write was lost.
+
+    Compare the full receipt, including signed result and exact head. A
+    comment that merely mentions the task or a marker is not sufficient.
+    """
+    response = _run(["gh", "api", "--paginate", "--slurp",
+                     f"repos/{config.repo}/issues/{pr}/comments"])
+    try:
+        pages = json.loads(response.stdout)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise PromotionError("receipt_comments_invalid") from exc
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+        raise PromotionError("receipt_comments_invalid")
+    return any(isinstance(comment, dict) and comment.get("body") == body
+               for page in pages for comment in page)
+
+
+def _project_intake_receipt(config: Config, rows: list[dict[str, object]],
+                            row: dict[str, object], task: dict[str, object],
+                            *, retry: bool = False) -> str:
+    """Receipt delivery has its own durable state, separate from verdict use."""
+    dispatched = str(row["dispatched_task"])
+    head = str(row.get("head_sha", ""))
+    pr = _pr_number_from_url(str(row.get("pr_url", ""))) or ""
+    reviewer, author = str(row.get("reviewer_node", "unknown")), str(row.get("node", "unknown"))
+    receipt = _build_intake_receipt(task, dispatched, head, reviewer, author)
+    status = "unavailable" if receipt is None else "pending"
+    if receipt is not None:
+        body = _receipt_comment_markdown(receipt, reviewer, author)
+        marker = f"receipt:{dispatched}"
+        try:
+            if retry and _receipt_already_posted(config, pr, body):
+                record = {"ts": _utc_now(), "kind": "a2a-revise-comment", "pr": pr,
+                          "head_sha": head, "marker": marker}
+                _append_ledger(config, record)
+                rows.append(record)
+                status = "posted"
+            elif _comment_once(config, rows, pr=pr, head=head, marker=marker, body=body):
+                status = "posted"
+        except PromotionError:
+            # A failed read must not risk a duplicate POST. Leave it pending.
+            pass
+    record = {"ts": _utc_now(), "kind": "a2a-receipt", "task_id": dispatched,
+              "head_sha": head, "status": status}
+    _append_ledger(config, record)
+    rows.append(record)
+    return status
+
+
+def _receipt_retries(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Backfill old consumed verdicts too; rotate failures behind untried work."""
+    consumed = {r.get("task_id") for r in rows
+                if r.get("kind") == "a2a-verdict" and r.get("status") == "consumed"}
+    posted = {(r.get("pr"), r.get("head_sha"), r.get("marker")) for r in rows
+              if r.get("kind") == "a2a-revise-comment"}
+    attempted = {r.get("task_id"): (i, r.get("status")) for i, r in enumerate(rows)
+                 if r.get("kind") == "a2a-receipt"}
+    pending = []
+    seen = set()
+    for row in rows:
+        task_id = row.get("dispatched_task")
+        if row.get("kind") != "a2a-dispatch" or task_id not in consumed or task_id in seen:
+            continue
+        seen.add(task_id)
+        key = (_pr_number_from_url(str(row.get("pr_url", ""))) or "",
+               row.get("head_sha"), f"receipt:{task_id}")
+        if key in posted or attempted.get(task_id, (-1, ""))[1] in {"posted", "unavailable"}:
+            continue
+        pending.append(row)
+    return sorted(pending, key=lambda r: attempted.get(r.get("dispatched_task"), (-1, ""))[0])
+
+
+def _retry_intake_receipts(config: Config, rows: list[dict[str, object]],
+                          *, dry_run: bool) -> list[dict[str, object]]:
+    """Use a separate bounded window so unavailable receipts cannot starve reviews."""
+    results = []
+    pending = _receipt_retries(rows)
+    for row in pending[:config.collect_window]:
+        dispatched = str(row["dispatched_task"])
+        if dry_run:
+            results.append({"outcome": "would-retry-receipt", "task_id": dispatched})
+            continue
+        task, routing = _broker_task_gated(config, row, dispatched, os.environ.get("A2A_EDGE_SECRET", ""))
+        status = "pending"
+        if (task is not None and routing not in {"missing", "mismatch"}
+                and task.get("status") in _TERMINAL_TASK_STATUSES
+                and _verdict_from_task(task, str(row.get("head_sha", ""))) is not None):
+            status = _project_intake_receipt(config, rows, row, task, retry=True)
+        else:
+            # Rotate even a missing/mismatched broker result; never publish it.
+            record = {"ts": _utc_now(), "kind": "a2a-receipt", "task_id": dispatched,
+                      "head_sha": row.get("head_sha"), "status": status}
+            _append_ledger(config, record)
+            rows.append(record)
+        results.append({"outcome": f"receipt-{status}", "task_id": dispatched})
+    if len(pending) > config.collect_window:
+        results.append({"outcome": "receipt-window-overflow",
+                        "remaining": len(pending) - config.collect_window})
+    return results
+
+
 def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object]]:
     """Poll dispatched review tasks, record verdicts, post verdict/findings
     comments (the #1357 visibility gap, extended to skipped revise dispatches
@@ -3029,7 +3132,7 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
     pending = [
         row for row in rows if row.get("kind") == "a2a-dispatch" and row.get("dispatched_task") not in consumed
     ]
-    processed: list[dict[str, object]] = []
+    processed = _retry_intake_receipts(config, rows, dry_run=dry_run)
     # #1394: FIFO over the oldest pending dispatches. The previous LIFO window
     # (newest 8 only) permanently starved older verdicts once the backlog
     # exceeded the window — a daily collect could never catch up.
@@ -3110,21 +3213,7 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
         # countersig, carried verbatim in the task result) onto the PR. The
         # a2a-receipts workflow verifies it against the keyring and flips the
         # a2a/receipts gate — the promotion precondition — to success.
-        receipt = _build_intake_receipt(
-            task, dispatched, head,
-            str(row.get("reviewer_node", "unknown")), str(row.get("node", "unknown")),
-        )
-        if receipt is not None:
-            _comment_once(
-                config,
-                rows,
-                pr=_pr_number_from_url(str(row.get("pr_url", ""))) or "",
-                head=head,
-                marker=f"receipt:{dispatched}",
-                body=_receipt_comment_markdown(
-                    receipt, str(row.get("reviewer_node", "unknown")), str(row.get("node", "unknown")),
-                ),
-            )
+        receipt_status = _project_intake_receipt(config, rows, row, task)
         note = ""
         if verdict == "revise":
             revise_outcome = _dispatch_intake_revise(
@@ -3163,8 +3252,8 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
             note = (
                 "signed receipt projected on this PR; a2a/receipts CI verifies it — "
                 "A2A verdict is the final gate (a2a-nexus#2030)"
-                if receipt is not None
-                else "signed receipt projection pending verification; A2A verdict is the final gate (a2a-nexus#2030)"
+                if receipt_status == "posted"
+                else "signed receipt has not been projected; delivery is pending or signed provenance is unavailable"
             )
         try:
             _pr_comment(

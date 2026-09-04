@@ -205,4 +205,5 @@ ok "audience-erasure without --audience exits 2" '[ "$rc" = 2 ]'
 
 echo "----------------------------------------"
 echo "PASS=$pass FAIL=$fail"
+python3 "$ROOT/scripts/ccc_erasure_regression_test.py" || fail=$((fail+1))
 [ "$fail" = 0 ]

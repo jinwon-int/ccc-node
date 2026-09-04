@@ -62,13 +62,13 @@ REQUESTS = {
 
 # Path-class prefixes a request scope covers. path_class may carry extra
 # qualifiers ("node-local audit append-only"), so this is prefix matching.
+# Only ownership-scoped requests need this additional restriction. For
+# cache/prune/user requests the explicit inventory action is authoritative:
+# roles such as "derived" and "outbox" are NOT path-class prefixes.
 REQUEST_SCOPES = {
     "audience-erasure": ("audience-scoped",),
     "node-decommission": ("node-local", "audience-scoped",
                           "upstream-adjacent", "external-adjacent"),
-    "telegram-user-erasure": ("telegram",),
-    "cache-rebuild": ("derived",),
-    "prune-expired": ("outbox",),
 }
 
 
@@ -132,14 +132,15 @@ def secondary_paths(entry: dict) -> list[str]:
     runtime locks) register every file they write. Returns deduplicated
     absolute paths; the primary resolve_entry path is NOT included.
     """
+    primary = resolve_entry(entry)
+    primary_path = os.path.abspath(primary) if primary else None
     out: list[str] = []
     for spec in entry.get("extra_paths", []):
         _base, literal = _spec_base_and_literal(spec)
         if literal and os.path.isfile(literal):
             p = os.path.abspath(literal)
-            if p not in out:
+            if p != primary_path and p not in out:
                 out.append(p)
-    primary = resolve_entry(entry)
     for base, regex in _pattern_specs(entry):
         if not os.path.isdir(base):
             continue
@@ -153,7 +154,7 @@ def secondary_paths(entry: dict) -> list[str]:
             p = os.path.abspath(os.path.join(base, name))
             if not os.path.isfile(p):
                 continue
-            if p == (os.path.abspath(primary) if primary else None):
+            if p == primary_path:
                 continue
             if p not in out:
                 out.append(p)

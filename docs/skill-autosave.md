@@ -738,6 +738,17 @@ ledger row (`"broker": "primary" | <name>`); rows written before #2024
 continue to poll the primary broker. Every recorded verdict still lands in
 the promotion ledger, so a broker outage delays consumption but loses nothing.
 
+Receipt publication is tracked separately from verdict consumption. A failed
+GitHub comment remains pending and is retried on later collections, including
+older consumed verdicts whose receipt was never published. Retries have their
+own bounded window, rotate failures behind untried tasks, and never dispatch
+the revision round again. A retry reads existing PR comments first and matches
+the full signed receipt, preventing a duplicate when GitHub accepted a comment
+but its response was lost. A failed comment read leaves delivery pending.
+Terminal results without signed provenance are recorded as unavailable; they
+cannot satisfy the receipt gate. Dry-run reports retries without network calls
+or ledger writes.
+
 The rotation tools carry the same dual-broker discipline:
 
 - `scripts/a2a-rescreen-rotation.py` — `probe` also queries each registry

@@ -35,6 +35,21 @@ the handoff manifest is a REQUEST, not an action.
    (digest / blockers / owner-only / rollback-first). See the apply module
    docstring for the full contract.
 
+Armed runs hold a shared lock in the backup base and revalidate the plan
+under that lock. Every run gets its own exclusive backup directory, including
+two runs in the same second. Before the first deletion, `manifest.json` is
+durably written with `phase: prepared` and the target-to-backup mapping. The
+final atomic update sets `phase: completed` and records deletion failures and
+verification. If a run is interrupted, a prepared manifest still identifies
+the recovery files; it does not claim that all targets remain present.
+
+The planner preserves each inventory entry's explicit action for
+`cache-rebuild`, `prune-expired`, and `telegram-user-erasure`; unsupported
+actions remain visible in the plan and are skipped by apply. Audience
+erasure remains restricted to its audience root. Primary paths are not repeated
+as secondary targets, and conflicting actions on a present path block apply
+before deletion.
+
 ## Wiki promotion records (#1447 batch)
 
 The nunchi wiki-promote batch embeds `<!-- nunchi-p3-8 fact#ID -->` markers
