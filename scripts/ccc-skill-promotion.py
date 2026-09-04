@@ -2986,9 +2986,9 @@ def _receipt_comment_markdown(
     lines = [
         "## Signed A2A intake review receipt",
         "",
-        f"Worker-signed + broker-countersigned review receipt for head \`{receipt['signed_head_prefix']}\` "
-        f"(reviewer \`{reviewer}\`, author node \`{author}\`). Verify with",
-        "\`node tools/a2a_skills_receipt_check.js\` against \`refs/a2a-public-keyring.json\`.",
+        f"Worker-signed + broker-countersigned review receipt for head `{receipt['signed_head_prefix']}` "
+        f"(reviewer `{reviewer}`, author node `{author}`). Verify with",
+        "`node tools/a2a_skills_receipt_check.js` against `refs/a2a-public-keyring.json`.",
         "",
         "```json",
         json.dumps(receipt, ensure_ascii=False, sort_keys=True),
