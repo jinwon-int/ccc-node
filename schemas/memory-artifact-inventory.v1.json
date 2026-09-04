@@ -1,6 +1,6 @@
 {
   "schema": "ccc.memory-artifact-inventory.v1",
-  "note": "#873 step-1 inventory. Machine-readable policy registration for every private/body-bearing artifact class the harness writes. Paths are RESOLVER CHAINS (first existing candidate wins), never globs — an apply slice must go through these same chains, never raw $HOME expansion. Fields: role (source|derived|outbox|audit|index|operational), owner, requests (lifecycle request -> action; 'external-handoff' means a node-local run must not touch it). related_dirs (optional, dir-kind entries): sibling directories owned by the same class — classified alongside the resolved dir, never flagged unknown.",
+  "note": "#873 step-1 inventory. Machine-readable policy registration for every private/body-bearing artifact class the harness writes. Paths are RESOLVER CHAINS (first existing candidate wins), never globs — an apply slice must go through these same chains, never raw $HOME expansion. Fields: role (source|derived|outbox|audit|index|operational), owner, requests (lifecycle request -> action; 'external-handoff' means a node-local run must not touch it). related_dirs (optional, dir-kind entries): sibling directories owned by the same class — classified alongside the resolved dir, never flagged unknown. extra_paths (optional, file-kind entries): additional literal candidates owned by the SAME class (multi-file classes like the managed cron logs) — classified, estimated and targeted per path. resolve candidates may also carry kind=pattern: an ANCHORED regex over sibling file names under the candidate's base (join form: env is the base; absolute form: dirname is the base) — lets one class own dated artifacts (bench-YYYYMMDD.md) without inventing files; name matching only, never glob expansion.",
   "artifacts": [
     {
       "id": "nunchi.peer_facts",
@@ -172,6 +172,207 @@
       "verification": "jsonl line count"
     },
     {
+      "id": "nunchi.batch_logs",
+      "path_class": "node-local derived",
+      "contains": [
+        "cron-run-summaries"
+      ],
+      "role": "derived",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "path": "cron.log"
+          },
+          {
+            "path": "~/.nunchi/cron.log"
+          }
+        ]
+      },
+      "extra_paths": [
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "bench.cron.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "judge.cron.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "wiki-promote.cron.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "mempalace-sweep.cron.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "mempalace-mine.log"
+        },
+        {
+          "path": "~/.nunchi/bench.cron.log"
+        },
+        {
+          "path": "~/.nunchi/judge.cron.log"
+        },
+        {
+          "path": "~/.nunchi/wiki-promote.cron.log"
+        },
+        {
+          "path": "~/.nunchi/mempalace-sweep.cron.log"
+        },
+        {
+          "path": "~/.nunchi/mempalace-mine.log"
+        }
+      ],
+      "retention": "regenerable runtime output",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete",
+        "cache-rebuild": "rebuild"
+      },
+      "derived_copies": [],
+      "verification": "file presence + size"
+    },
+    {
+      "id": "nunchi.runtime_locks",
+      "path_class": "node-local operational",
+      "contains": [
+        "flock-advisory-locks"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "path": ".ingest.lock"
+          },
+          {
+            "path": "~/.nunchi/.ingest.lock"
+          }
+        ]
+      },
+      "extra_paths": [
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": ".judge.lock"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": ".wiki-promote.lock"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": ".piri-feed.lock"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "mempalace-refresh.lock"
+        },
+        {
+          "path": "~/.nunchi/.judge.lock"
+        },
+        {
+          "path": "~/.nunchi/.wiki-promote.lock"
+        },
+        {
+          "path": "~/.nunchi/.piri-feed.lock"
+        },
+        {
+          "path": "~/.nunchi/mempalace-refresh.lock"
+        }
+      ],
+      "retention": "runtime-scoped; content-free flock anchors",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "file presence"
+    },
+    {
+      "id": "nunchi.mempalace_status",
+      "path_class": "node-local operational",
+      "contains": [
+        "refresh-run-status",
+        "error-classes"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "path": "mempalace-refresh.status.json"
+          },
+          {
+            "path": "~/.nunchi/mempalace-refresh.status.json"
+          }
+        ]
+      },
+      "retention": "latest-run only",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete",
+        "cache-rebuild": "rebuild"
+      },
+      "derived_copies": [],
+      "verification": "json-parses"
+    },
+    {
+      "id": "nunchi.ingest_seen_state",
+      "path_class": "node-local operational",
+      "contains": [
+        "ingest-dedup-hashes"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "path": "piri-seen"
+          },
+          {
+            "path": "~/.nunchi/piri-seen"
+          }
+        ]
+      },
+      "extra_paths": [
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "ingested-files"
+        },
+        {
+          "path": "~/.nunchi/ingested-files"
+        }
+      ],
+      "retention": "dedup ledgers; loss is benign (re-ingestion re-dedupes against the store itself)",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "file presence + line count"
+    },
+    {
       "id": "nunchi.bench_sheets",
       "path_class": "node-local audit",
       "contains": [
@@ -189,6 +390,16 @@
           },
           {
             "path": "~/.nunchi/bench-19700101.md"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "bench-[0-9]{8}\\.md"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/bench-[0-9]{8}\\.md"
           }
         ]
       },

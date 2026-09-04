@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -73,6 +74,90 @@ REQUEST_SCOPES = {
 
 def _expand(path: str) -> str:
     return os.path.expanduser(path)
+
+
+def _spec_base_and_literal(cand: dict) -> tuple[str | None, str | None]:
+    """(base_dir, literal_path) for one resolve candidate spec.
+
+    join form: env value is the base directory, cand["path"] the suffix.
+    absolute form: cand["path"] is the literal path itself.
+    """
+    env_name = cand.get("env")
+    base = os.environ.get(env_name) if env_name else None
+    if cand.get("join"):
+        if not base:
+            return None, None
+        return _expand(base), _expand(base.rstrip("/") + "/" + cand["path"].lstrip("/"))
+    path = _expand(cand["path"])
+    return os.path.dirname(path) or "/", path
+
+
+def _pattern_specs(entry: dict) -> list[tuple[str, re.Pattern[str]]]:
+    """Anchored (base_dir, regex) pairs from kind=pattern resolve candidates.
+
+    Pattern candidates let one class own DATED artifacts (bench-YYYYMMDD.md)
+    without inventing files: the regex is matched against sibling FILE NAMES
+    under the candidate's base directory — name matching only, no glob
+    expansion, no filesystem writes. join form: env is the base, path is the
+    regex; absolute form: dirname is the base, basename the regex.
+    """
+    specs = []
+    for cand in (entry.get("resolve") or {}).get("candidates", []):
+        if cand.get("kind") != "pattern":
+            continue
+        env_name = cand.get("env")
+        base_env = os.environ.get(env_name) if env_name else None
+        if cand.get("join"):
+            if not base_env:
+                continue
+            base = _expand(base_env)
+            regex_src = cand["path"]
+        else:
+            path = _expand(cand["path"])
+            base = os.path.dirname(path) or "/"
+            regex_src = os.path.basename(path)
+        try:
+            specs.append((base, re.compile(regex_src)))
+        except re.error:
+            continue  # a broken pattern classifies nothing — never aborts
+    return specs
+
+
+def secondary_paths(entry: dict) -> list[str]:
+    """Every existing file that belongs to this class BEYOND the primary
+    resolution: extra_paths literals + pattern matches.
+
+    extra_paths are additional literal candidates with the same shape as
+    resolve.candidates — multi-file classes (the managed cron logs, the
+    runtime locks) register every file they write. Returns deduplicated
+    absolute paths; the primary resolve_entry path is NOT included.
+    """
+    out: list[str] = []
+    for spec in entry.get("extra_paths", []):
+        _base, literal = _spec_base_and_literal(spec)
+        if literal and os.path.isfile(literal):
+            p = os.path.abspath(literal)
+            if p not in out:
+                out.append(p)
+    primary = resolve_entry(entry)
+    for base, regex in _pattern_specs(entry):
+        if not os.path.isdir(base):
+            continue
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for name in names:
+            if not regex.fullmatch(name):
+                continue
+            p = os.path.abspath(os.path.join(base, name))
+            if not os.path.isfile(p):
+                continue
+            if p == (os.path.abspath(primary) if primary else None):
+                continue
+            if p not in out:
+                out.append(p)
+    return out
 
 
 def resolve_entry(entry: dict) -> str | None:
@@ -136,6 +221,11 @@ def _scan(inventory: dict) -> tuple[set[str], set[str], list[str]]:
         elif not entry_is_dir and os.path.isfile(resolved):
             known_files.add(resolved)
             parent = os.path.dirname(resolved)
+            if parent not in roots:
+                roots.append(parent)
+        for secondary in secondary_paths(entry):
+            known_files.add(secondary)
+            parent = os.path.dirname(secondary)
             if parent not in roots:
                 roots.append(parent)
     return known_files, known_dirs, roots
@@ -236,6 +326,16 @@ def plan(request: str, inventory: dict, audience: str | None,
             "action": action,
             "estimate": _estimate_entry(entry, resolved),
         })
+        # Multi-file classes (extra_paths + pattern matches) target per path:
+        # an apply slice must name every file it would touch, never a class.
+        for secondary in secondary_paths(entry):
+            targets.append({
+                "artifact": entry["id"],
+                "path": secondary,
+                "present": True,
+                "action": action,
+                "estimate": _estimate(secondary),
+            })
     return {
         "schema": SCHEMA,
         "request": request,

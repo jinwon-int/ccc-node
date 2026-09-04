@@ -78,6 +78,29 @@ ok "audience-erasure without --audience exits 2" '[ "$rc" = 2 ]'
 run --inventory /dev/null node-decommission >/dev/null 2>&1; rc=$?
 ok "schema-mismatched inventory rejected" '[ "$rc" = 2 ]'
 
+# --- 5) extra_paths + pattern classification (#873 step 4) -------------------
+# Multi-file classes (managed cron logs, runtime locks) and dated artifacts
+# (bench sheets) must classify every file they own — never surface as
+# blockers — and must appear as PER-PATH targets in the plan.
+printf 'log' > "$NUNCHI_HOME/cron.log"
+printf 'log' > "$NUNCHI_HOME/judge.cron.log"
+printf 'log' > "$NUNCHI_HOME/wiki-promote.cron.log"
+printf 'lock' > "$NUNCHI_HOME/.judge.lock"
+printf 'sheet' > "$NUNCHI_HOME/bench-20260803.md"
+printf 'sheet' > "$NUNCHI_HOME/bench-20260907.md"
+out="$(run scan --json)"
+scan_unknowns="$(python3 -c 'import json,sys; print("\n".join(u["path"] for u in json.load(sys.stdin)["unknown"]))' <<<"$out")"
+ok "locks classified via extra_paths" '! grep -qF ".judge.lock" <<<"$scan_unknowns"'
+ok "cron logs classified via extra_paths" '! grep -qF "cron.log" <<<"$scan_unknowns"'
+ok "dated bench sheets classified via pattern" \
+  '! grep -qF "bench-20260803" <<<"$scan_unknowns" && ! grep -qF "bench-20260907" <<<"$scan_unknowns"'
+ok "mystery orphan still a blocker (fail-closed intact)" 'grep -qF "mystery-orphan" <<<"$scan_unknowns"'
+out="$(run node-decommission --json)"
+ok "multi-file class emits per-path targets" \
+  '[ "$(grep -cF "nunchi.batch_logs" <<<"$out")" -ge 3 ]'
+ok "bench pattern targets appear per path" \
+  '[ "$(grep -cF "nunchi.bench_sheets" <<<"$out")" -ge 3 ]'
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
