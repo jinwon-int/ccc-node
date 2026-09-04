@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ccc.erasure-handoff-manifest.v1",
+  "title": "#873 step-5 erasure handoff manifest",
+  "description": "The reviewable REQUEST artifact a node hands to external owners (Family Wiki, operator) during a closeout. Body-free by contract: ids, paths, counts, digests — never file contents or secrets. The node never touches Wiki/operator material; this manifest is what the owner reviews and ACKs.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "ccc.erasure-handoff-manifest.v1"
+    },
+    "ts": {
+      "description": "UTC closeout-start timestamp (ISO-8601, seconds).",
+      "type": "string"
+    },
+    "request": {
+      "description": "Lifecycle request this closeout serves (planner vocabulary).",
+      "type": "string",
+      "enum": [
+        "audience-erasure",
+        "node-decommission",
+        "telegram-user-erasure",
+        "cache-rebuild",
+        "prune-expired",
+        "fact-correction"
+      ]
+    },
+    "key": {
+      "type": ["string", "null"]
+    },
+    "plan_digest": {
+      "description": "Canonical sha256 of the plan this manifest was generated from — documents the closeout START state. The apply step re-plans fresh and binds its own digest.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "external": {
+      "description": "Planner external_handoff rows, verbatim owners and notes.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "artifact": {"type": "string"},
+          "owner": {"type": "string"},
+          "note": {"type": "string"}
+        },
+        "required": ["artifact", "owner"]
+      }
+    },
+    "operator_decision_required": {
+      "description": "Owner=operator material: listed for the operator to decide; node-local runs never touch it.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "artifact": {"type": "string"},
+          "note": {"type": "string"}
+        },
+        "required": ["artifact"]
+      }
+    },
+    "wiki_disposition": {
+      "description": "One proposal per family-wiki artifact. annotate is the default; the owner may override to archive or retain at ACK time.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "artifact": {"type": "string"},
+          "proposal": {"type": "string", "enum": ["annotate", "archive", "retain"]},
+          "decision": {
+            "type": ["string", "null"],
+            "enum": ["annotate", "archive", "retain", null]
+          }
+        },
+        "required": ["artifact", "proposal", "decision"]
+      }
+    },
+    "drain_first": {
+      "description": "Outbox-role classes that must be drained (reviewed/pruned) before the apply step. Counts are body-free estimates.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "artifact": {"type": "string"},
+          "path": {"type": ["string", "null"]},
+          "present": {"type": "boolean"},
+          "pending": {"type": "integer", "minimum": 0}
+        },
+        "required": ["artifact", "present", "pending"]
+      }
+    },
+    "wiki_markers": {
+      "description": "Aggregated promotion markers (--queue input): fact ids queued by the nunchi wiki-promote batch, by queue status. null when no queue was supplied.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "queue_path": {"type": "string"},
+        "pending": {"type": "integer"},
+        "merged": {"type": "integer"},
+        "rejected": {"type": "integer"},
+        "fact_ids": {
+          "type": "array",
+          "items": {"type": "integer"}
+        }
+      },
+      "required": ["queue_path", "pending", "merged", "rejected", "fact_ids"]
+    },
+    "ack": {
+      "description": "Owner ACK (Fresh-approval manual ACK). Filled at ACK time; an apply slice must require granted_at non-null.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "required": {"type": "boolean"},
+        "granted_at": {
+          "type": ["string", "null"]
+        },
+        "granted_by": {
+          "type": ["string", "null"]
+        }
+      },
+      "required": ["required", "granted_at", "granted_by"]
+    },
+    "next_apply": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hint": {"type": "string"},
+        "note": {"type": "string"}
+      },
+      "required": ["hint", "note"]
+    }
+  },
+  "required": [
+    "schema",
+    "ts",
+    "request",
+    "key",
+    "plan_digest",
+    "external",
+    "operator_decision_required",
+    "wiki_disposition",
+    "drain_first",
+    "wiki_markers",
+    "ack",
+    "next_apply"
+  ]
+}

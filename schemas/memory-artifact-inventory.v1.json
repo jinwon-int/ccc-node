@@ -373,6 +373,36 @@
       "verification": "file presence + line count"
     },
     {
+      "id": "erasure.handoff_manifests",
+      "path_class": "node-local operational",
+      "contains": [
+        "closeout-manifest-records"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "erasure-handoff-[a-z]+(-[a-z]+)*-[0-9TZ]+\\.(json|md)"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.claude/state/erasure-handoff-[a-z]+(-[a-z]+)*-[0-9TZ]+\\.(json|md)"
+          }
+        ]
+      },
+      "retention": "until closeout completes; retain or archive at owner ACK (#873 step 5)",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "retain"
+      },
+      "derived_copies": [],
+      "verification": "file presence + json-parses"
+    },
+    {
       "id": "nunchi.bench_sheets",
       "path_class": "node-local audit",
       "contains": [
