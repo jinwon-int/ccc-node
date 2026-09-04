@@ -2976,6 +2976,48 @@ def _revise_outcome_note(outcome: dict[str, object]) -> str:
     return f"{text}{suffix} (`{code}`)"
 
 
+def _receipt_comment_markdown(
+    receipt: dict[str, object], reviewer: str, author: str
+) -> str:
+    """Render the signed receipt fence (#1470): the a2a-receipts workflow
+    extracts this JSON from PR comments and verifies the worker signature +
+    broker countersig against the keyring, then projects the a2a/receipts
+    status that policies/REVIEW.md binds promotion to."""
+    lines = [
+        "## Signed A2A intake review receipt",
+        "",
+        f"Worker-signed + broker-countersigned review receipt for head \`{receipt['signed_head_prefix']}\` "
+        f"(reviewer \`{reviewer}\`, author node \`{author}\`). Verify with",
+        "\`node tools/a2a_skills_receipt_check.js\` against \`refs/a2a-public-keyring.json\`.",
+        "",
+        "```json",
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True),
+        "```",
+    ]
+    return "\n".join(lines)
+
+
+def _build_intake_receipt(
+    task: dict[str, object], dispatched: str, head: str, reviewer: str, author: str
+) -> dict[str, object] | None:
+    """Assemble the receipt object from a terminal review task (#1470).
+    Returns None when the task result carries no signed provenance (pre-receipt
+    rounds) — those stay on the awaiting-receipt gate state."""
+    result = task.get("result")
+    provenance = result.get("provenance") if isinstance(result, dict) else None
+    if not isinstance(provenance, dict):
+        return None
+    return {
+        "task_id": dispatched,
+        "head_sha": head,
+        "signed_head_prefix": head[:8],
+        "lane": _INTAKE_LANE,
+        "reviewer_node": reviewer,
+        "author_node": author,
+        "result": result,
+    }
+
+
 def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object]]:
     """Poll dispatched review tasks, record verdicts, post verdict/findings
     comments (the #1357 visibility gap, extended to skipped revise dispatches
@@ -3064,6 +3106,25 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
                 **({"broker_corrected": routing} if routing.startswith("corrected:") else {}),
             },
         )
+        # #1470: project the signed receipt (worker EdDSA signature + broker
+        # countersig, carried verbatim in the task result) onto the PR. The
+        # a2a-receipts workflow verifies it against the keyring and flips the
+        # a2a/receipts gate — the promotion precondition — to success.
+        receipt = _build_intake_receipt(
+            task, dispatched, head,
+            str(row.get("reviewer_node", "unknown")), str(row.get("node", "unknown")),
+        )
+        if receipt is not None:
+            _comment_once(
+                config,
+                rows,
+                pr=_pr_number_from_url(str(row.get("pr_url", ""))) or "",
+                head=head,
+                marker=f"receipt:{dispatched}",
+                body=_receipt_comment_markdown(
+                    receipt, str(row.get("reviewer_node", "unknown")), str(row.get("node", "unknown")),
+                ),
+            )
         note = ""
         if verdict == "revise":
             revise_outcome = _dispatch_intake_revise(
@@ -3099,7 +3160,12 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
         if verdict == "reject":
             note = "reject verdict fails the gate — owner escalation required, no auto-close"
         elif verdict == "approve":
-            note = "signed receipt projection pending verification; A2A verdict is the final gate (a2a-nexus#2030)"
+            note = (
+                "signed receipt projected on this PR; a2a/receipts CI verifies it — "
+                "A2A verdict is the final gate (a2a-nexus#2030)"
+                if receipt is not None
+                else "signed receipt projection pending verification; A2A verdict is the final gate (a2a-nexus#2030)"
+            )
         try:
             _pr_comment(
                 config,
