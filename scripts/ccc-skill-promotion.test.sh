@@ -1368,7 +1368,7 @@ row = {
     "tree_sha256": "b" * 64, "branch": "skill-intake/testnode/gate-skill",
 }
 with open(iso_state / "ledger.jsonl", "w", encoding="utf-8") as handle:
-    handle.write(json.dumps(row) + "\\n")
+    handle.write(json.dumps(row) + chr(10))
 os.chmod(iso_state / "ledger.jsonl", 0o600)
 
 # A contradicting brokerOfRecord must surface as broker-mismatch, not as a
@@ -1391,6 +1391,81 @@ FIXTURE
 env "${base_env[@]}" python3 "$GATE_FIXTURE" "$PROMOTER" > "$TMP/gate-out" 2>&1; rc=$?
 ok "broker routing gate: bor semantics, gated fetch resolutions, visible mismatch consumption" \
   '[ "$rc" = 0 ] && grep -q "GATE-UNIT-OK" "$TMP/gate-out" && grep -q "GATE-CONSUME-OK" "$TMP/gate-out"'
+
+# --- 2026-09-04 #1470: signed receipt projection at consumption -----------
+RECEIPT_FIXTURE="$TMP/receipt-fixture.py"
+cat > "$RECEIPT_FIXTURE" <<'FIXTURE'
+import importlib.util, json, os, sys, tempfile
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("csp_rcpt", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["csp_rcpt"] = m
+spec.loader.exec_module(m)
+
+iso_state = Path(tempfile.mkdtemp()) / "skill-promotion"
+iso_state.mkdir(parents=True)
+env = dict(os.environ)
+env["CCC_STATE_DIR"] = str(iso_state.parent)
+config = m._config(env)
+
+class Cfg:
+    remote_brokers = ()
+m._broker_task_gated = lambda config, row, task_id, secret: ({
+    "status": "succeeded",
+    "brokerOfRecord": "seoseo",
+    "result": {
+        "summary": "skills intake review: approve (1 finding(s))",
+        "output": {
+            "taskId": "gt-2", "verdict": "approve", "skillName": "gate-skill",
+            "sourceTreeSha256": "c" * 64, "headPrefix": "aaaaaaa",
+            "head_sha": "a" * 40, "head_sha2": "a" * 40,
+            "rubric_version": "2026-08-28.2", "findings": [],
+            "reviewer_node": "reviewer1",
+        },
+        "validations": [{"kind": "review", "nodeId": "reviewer1", "verdict": "pass"}],
+        "provenance": {"schemaVersion": "a2a.result.provenance.v1",
+                       "workerKeyId": "worker:reviewer1:g2:v1"},
+    },
+}, "claimed")
+posted = []
+m._pr_comment = lambda config, pr, body: posted.append((pr, body))
+
+row = {
+    "ts": "2026-09-04T00:00:00Z", "kind": "a2a-dispatch",
+    "transport_id": "testnode-claude-gate-skill-0123456789ab",
+    "head_sha": "a" * 40, "round_id": "r", "task_id": "gt-2",
+    "dispatched_task": "gt-2", "reviewer_node": "reviewer1",
+    "broker_id": "seoseo", "broker": "primary",
+    "pr_url": "https://github.com/test/repo/pull/8",
+    "node": "authornode", "provider": "claude", "name": "gate-skill",
+    "tree_sha256": "c" * 64, "branch": "skill-intake/authornode/gate-skill",
+}
+with open(iso_state / "ledger.jsonl", "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(row) + chr(10))
+os.chmod(iso_state / "ledger.jsonl", 0o600)
+
+processed = m._process_verdicts(config, dry_run=False)
+assert any(p.get("outcome") == "verdict-consumed" for p in processed), processed
+# Receipt fence posted BEFORE the verdict comment, with bindings.
+assert len(posted) == 2, [b[:80] for _, b in posted]
+receipt_body = posted[0][1]
+assert receipt_body.index("Signed A2A intake review receipt") < receipt_body.index("```json"), receipt_body
+assert '"task_id": "gt-2"' in receipt_body
+assert '"lane": "skills_intake_review"' in receipt_body
+assert '"head_sha": "' + "a" * 40 + '"' in receipt_body
+assert '"author_node": "authornode"' in receipt_body
+assert '"reviewer_node": "reviewer1"' in receipt_body
+assert '"provenance"' in receipt_body
+# Verdict comment still posts, and the approve note reflects the projected receipt.
+verdict_body = posted[1][1]
+assert "signed receipt projected on this PR" in verdict_body, verdict_body
+# Ledger row consumed once with the receipt marker absent from verdict rows.
+verdict_rows = [json.loads(l) for l in open(iso_state / "ledger.jsonl")]
+assert sum(1 for r in verdict_rows if r.get("status") == "consumed") == 1, verdict_rows
+print("RECEIPT-PROJECTION-OK")
+FIXTURE
+env "${base_env[@]}" python3 "$RECEIPT_FIXTURE" "$PROMOTER" > "$TMP/receipt-out" 2>&1; rc=$?; ok "signed receipt fence is projected at verdict consumption (#1470)" \
+  '[ "$rc" = 0 ] && grep -q "RECEIPT-PROJECTION-OK" "$TMP/receipt-out"'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
