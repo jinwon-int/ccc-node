@@ -251,4 +251,6 @@ ok "shared-scope report written next to the queue" \
 
 echo "----------------------------------------"
 echo "wiki-promote.test.sh: $pass pass, $fail fail"
-[ "$fail" = 0 ]
+# validate-harness's suite_summary greps for exactly this final line.
+printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
