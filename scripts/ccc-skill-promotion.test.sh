@@ -1468,4 +1468,5 @@ env "${base_env[@]}" python3 "$RECEIPT_FIXTURE" "$PROMOTER" > "$TMP/receipt-out"
   '[ "$rc" = 0 ] && grep -q "RECEIPT-PROJECTION-OK" "$TMP/receipt-out"'
 
 echo "PASS=$pass FAIL=$fail"
+python3 "$HERE/ccc_skill_receipt_retry_test.py" || fail=$((fail+1))
 [ "$fail" -eq 0 ]
