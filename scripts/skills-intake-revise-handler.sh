@@ -15,13 +15,16 @@
 # The publisher re-runs every machine gate on the returned files before they
 # can reach an intake PR, so a hostile packet cannot bypass review.
 #
-# Agent configuration (same surface as the review handler):
+# Agent configuration (same surface and defaults as the review handler):
 #   REVIEW_AGENT_BIN / REVIEW_AGENT_ARGS   tool-blocked reviser command line
+#                                          (default: claude / "-p --disallowed-tools *")
 #   REVISE_TIMEOUT_SEC (fallback REVIEW_TIMEOUT_SEC, default 480)
 set -uo pipefail
 
 REVIEW_TIMEOUT_SEC="${REVIEW_TIMEOUT_SEC:-480}"
 REVISION_TIMEOUT_SEC="${REVISE_TIMEOUT_SEC:-$REVIEW_TIMEOUT_SEC}"
+REVIEW_AGENT_BIN="${REVIEW_AGENT_BIN:-claude}"
+REVIEW_AGENT_ARGS="${REVIEW_AGENT_ARGS:--p --disallowed-tools *}"
 REVISER_NODE="${WORKER_ID:-$(hostname -s 2>/dev/null || echo unknown)}"
 
 log() { echo "skills-intake-revise-handler: $*" >&2; }
@@ -115,7 +118,7 @@ for _tok in "${reviser_args_tokens[@]}"; do
   fi
   _prev_arg="$_tok"
 done
-read -ra reviser_argv <<<"${REVIEW_AGENT_BIN:?REVIEW_AGENT_BIN is required} ${REVIEW_AGENT_ARGS:-}"
+read -ra reviser_argv <<<"$REVIEW_AGENT_BIN $REVIEW_AGENT_ARGS"
 if ! model_out="$(timeout "$REVISION_TIMEOUT_SEC" "${reviser_argv[@]}" < "$tmp/prompt.txt" 2>"$tmp/agent.err")"; then
   # Surface BOTH streams: `claude -p` reports quota exhaustion on stdout with
   # empty stderr (nosuk pr75/76 lesson, 2026-08-30).
