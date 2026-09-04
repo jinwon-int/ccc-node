@@ -90,6 +90,12 @@ printf 'sheet' > "$NUNCHI_HOME/bench-20260803.md"
 printf 'sheet' > "$NUNCHI_HOME/bench-20260907.md"
 printf 'queue' > "$CCC_STATE_DIR/wiki-candidates.md"
 printf '000 000 1 abcdef123456\n' > "$CCC_STATE_DIR/wiki-candidates.seen"
+printf 'log' > "$CCC_STATE_DIR/checkpoint.log"
+printf '{}' > "$CCC_STATE_DIR/install-test-installer.json"
+printf 'facts' > "$CCC_STATE_DIR/memory-facts.jsonl"
+printf 'lock' > "$CCC_STATE_DIR/.local-memory-sink.lock"
+printf 'audit' > "$CCC_STATE_DIR/audit.jsonl"
+printf '150\n' > "$CCC_BOT_DATA_DIR/bot.pid"
 out="$(run scan --json)"
 scan_unknowns="$(python3 -c 'import json,sys; print("\n".join(u["path"] for u in json.load(sys.stdin)["unknown"]))' <<<"$out")"
 ok "locks classified via extra_paths" '! grep -qF ".judge.lock" <<<"$scan_unknowns"'
@@ -98,6 +104,11 @@ ok "dated bench sheets classified via pattern" \
   '! grep -qF "bench-20260803" <<<"$scan_unknowns" && ! grep -qF "bench-20260907" <<<"$scan_unknowns"'
 ok "state-dir wiki queue + seen ledger classified" \
   '! grep -qF "wiki-candidates.md" <<<"$scan_unknowns" && ! grep -qF "wiki-candidates.seen" <<<"$scan_unknowns"'
+ok "c-batch: runtime log classified via pattern" '! grep -qF "checkpoint.log" <<<"$scan_unknowns"'
+ok "c-batch: installer record classified via pattern" '! grep -qF "install-test-installer.json" <<<"$scan_unknowns"'
+ok "c-batch: memory lane + hooks audit + locks classified" \
+  '! grep -qF "memory-facts.jsonl" <<<"$scan_unknowns" && ! grep -qF "audit.jsonl" <<<"$scan_unknowns" && ! grep -qF ".local-memory-sink.lock" <<<"$scan_unknowns"'
+ok "c-batch: bot runtime state classified" '! grep -qF "bot.pid" <<<"$scan_unknowns"'
 ok "mystery orphan still a blocker (fail-closed intact)" 'grep -qF "mystery-orphan" <<<"$scan_unknowns"'
 out="$(run node-decommission --json)"
 ok "multi-file class emits per-path targets" \
