@@ -14,6 +14,8 @@
 # Env (worker child inherits the worker env file, so node config lives there):
 #   INTAKE_REVIEW_HANDLER  review handler path
 #                          (default: this script's dir / skills-intake-review-handler.sh)
+#   INTAKE_REVISE_HANDLER  revise handler path
+#                          (default: this script's dir / skills-intake-revise-handler.sh)
 #   DEFAULT_TASK_HANDLER   default dispatcher command line
 #                          (default: node <this dir>/a2a-task-handler.mjs)
 #
@@ -23,6 +25,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INTAKE_REVIEW_HANDLER="${INTAKE_REVIEW_HANDLER:-$SCRIPT_DIR/skills-intake-review-handler.sh}"
+INTAKE_REVISE_HANDLER="${INTAKE_REVISE_HANDLER:-$SCRIPT_DIR/skills-intake-revise-handler.sh}"
 DEFAULT_TASK_HANDLER="${DEFAULT_TASK_HANDLER:-node $SCRIPT_DIR/a2a-task-handler.mjs}"
 
 log() { echo "a2a-intent-dispatcher: $*" >&2; }
@@ -41,6 +44,18 @@ case "$intent" in
   skills-intake-review|skills_intake_review)
     [ -x "$INTAKE_REVIEW_HANDLER" ] || { echo "a2a-intent-dispatcher: review handler not executable: $INTAKE_REVIEW_HANDLER" >&2; exit 1; }
     exec bash "$INTAKE_REVIEW_HANDLER" < "$tmp"
+    ;;
+  skills-intake-revise|skills_intake_revise)
+    # #1460: without this route the generic handler acked revise tasks and the
+    # collect consumed the acks as invalid — the R2 lane was a dispatch-only
+    # no-op. A node without the revise handler must fail LOUDLY here
+    # (handler_exit_nonzero, bounded by the broker requeue cap) so the
+    # failure is visible on the PR, never a silent ack.
+    if [ ! -x "$INTAKE_REVISE_HANDLER" ]; then
+      log "revise handler not installed or not executable: $INTAKE_REVISE_HANDLER (revise-unsupported node)"
+      exit 1
+    fi
+    exec bash "$INTAKE_REVISE_HANDLER" < "$tmp"
     ;;
   *)
     # Intentional word split of an operator-owned command line (shellcheck-disable=SC2086)
