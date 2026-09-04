@@ -115,6 +115,63 @@
       "verification": "jsonl line count"
     },
     {
+      "id": "nunchi.wiki_promote_seen",
+      "path_class": "node-local operational ledger",
+      "contains": [
+        "fact-hash-dedup-rows"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "path": "wiki-promoted.seen"
+          },
+          {
+            "path": "~/.nunchi/wiki-promoted.seen"
+          }
+        ]
+      },
+      "retention": "no-TTL dedup ledger (#1447); loss is benign (possible re-promotion of already-reviewed facts)",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "line count (4-column rows)"
+    },
+    {
+      "id": "nunchi.wiki_promote_audit",
+      "path_class": "node-local audit append-only",
+      "contains": [
+        "promotion-decisions",
+        "batch-counters"
+      ],
+      "role": "audit",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "path": "wiki-promote-audit.jsonl"
+          },
+          {
+            "path": "~/.nunchi/wiki-promote-audit.jsonl"
+          }
+        ]
+      },
+      "retention": "append-only (erasure conflict: pseudonymize, never delete)",
+      "requests": {
+        "audience-erasure": "pseudonymize",
+        "node-decommission": "retain"
+      },
+      "derived_copies": [],
+      "verification": "jsonl line count"
+    },
+    {
       "id": "nunchi.bench_sheets",
       "path_class": "node-local audit",
       "contains": [
