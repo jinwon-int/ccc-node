@@ -1293,5 +1293,104 @@ env "${base_env[@]}" python3 "$WINDOW_FIXTURE" "$PROMOTER" > "$TMP/window-out" 2
 ok "collect window is FIFO, drains 32/run, and surfaces overflow (#1394)" \
   '[ "$rc" = 0 ] && grep -q "WINDOW-FIFO-OK" "$TMP/window-out"'
 
+# --- 2026-09 collect-gap repair: T1/T2 broker routing gate -----------------
+GATE_FIXTURE="$TMP/gate-fixture.py"
+cat > "$GATE_FIXTURE" <<FIXTURE
+import importlib.util, json, os, sys, tempfile
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("csp_gate", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["csp_gate"] = m
+spec.loader.exec_module(m)
+
+# --- _task_bor_matches semantics: absent bor keeps the gate open -----------
+assert m._task_bor_matches({}, "seoseo") is True
+assert m._task_bor_matches({"brokerOfRecord": "seoseo"}, "seoseo") is True
+assert m._task_bor_matches({"brokerOfRecord": " gwakga "}, "gwakga") is True
+assert m._task_bor_matches({"brokerOfRecord": "gwakga"}, "seoseo") is False
+
+# --- _broker_task_gated resolutions over a stubbed broker pool -------------
+class Cfg:
+    remote_brokers = ({"name": "t2", "ssh_host": "h", "broker_url": "http://127.0.0.1:8787/",
+                       "nexus_dir": "/n", "secret_cmd": "c"},)
+
+row_t2 = {"broker": "t2", "broker_id": "gwakga"}
+row_primary = {"broker": "primary", "broker_id": "seoseo"}
+
+# claimed: the fetched task self-reports the row's claimed broker id.
+m._broker_task_on = lambda config, row, task_id, secret: {
+    "status": "succeeded", "brokerOfRecord": "gwakga"}
+m._broker_id = lambda config, secret: "seoseo"
+m._remote_broker_id = lambda config, rb: "gwakga"
+task, resolution = m._broker_task_gated(Cfg(), row_t2, "t-1", "s")
+assert resolution == "claimed" and task["status"] == "succeeded", (task, resolution)
+
+# mismatch: task found on the claimed broker but it names another owner, and
+# no other broker serves the same id -> visible mismatch, never a verdict.
+m._broker_task_on = lambda config, row, task_id, secret: {
+    "status": "succeeded", "brokerOfRecord": "seoseo"}
+m._task_readback_on = lambda config, rb, task_id, secret: (_ for _ in ()).throw(
+    m.PromotionError("dispatch_broker_unreachable"))
+task, resolution = m._broker_task_gated(Cfg(), row_t2, "t-2", "s")
+assert resolution == "mismatch" and task["brokerOfRecord"] == "seoseo", (task, resolution)
+
+# corrected: the claimed broker 404s, the OTHER broker serves the task and
+# self-reports its own id (the pr104 misrouted-row case).
+m._broker_task_on = lambda config, row, task_id, secret: (_ for _ in ()).throw(
+    m.PromotionError("dispatch_broker_unreachable"))
+m._task_readback_on = lambda config, rb, task_id, secret: {
+    "status": "succeeded", "brokerOfRecord": "gwakga"} if rb is not None else (_ for _ in ()).throw(
+    m.PromotionError("dispatch_broker_unreachable"))
+task, resolution = m._broker_task_gated(Cfg(), row_primary, "t-3", "s")
+assert resolution == "corrected:t2" and task["brokerOfRecord"] == "gwakga", (task, resolution)
+
+# missing: unreachable everywhere.
+m._task_readback_on = lambda config, rb, task_id, secret: (_ for _ in ()).throw(
+    m.PromotionError("dispatch_broker_unreachable"))
+task, resolution = m._broker_task_gated(Cfg(), row_t2, "t-4", "s")
+assert task is None and resolution == "missing", (task, resolution)
+print("GATE-UNIT-OK")
+
+# --- _process_verdicts records broker-mismatch instead of malformed -------
+iso_state = Path(tempfile.mkdtemp()) / "skill-promotion"
+iso_state.mkdir(parents=True)
+env = dict(os.environ)
+env["CCC_STATE_DIR"] = str(iso_state.parent)
+config = m._config(env)
+row = {
+    "ts": "2026-09-04T00:00:00Z", "kind": "a2a-dispatch",
+    "transport_id": "testnode-claude-gate-skill-0123456789ab",
+    "head_sha": "a" * 40, "round_id": "r", "task_id": "gt-1",
+    "dispatched_task": "gt-1", "reviewer_node": "reviewer1",
+    "broker_id": "gwakga", "broker": "t2",
+    "pr_url": "https://github.com/test/repo/pull/7",
+    "node": "testnode", "provider": "claude", "name": "gate-skill",
+    "tree_sha256": "b" * 64, "branch": "skill-intake/testnode/gate-skill",
+}
+with open(iso_state / "ledger.jsonl", "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(row) + "\\n")
+os.chmod(iso_state / "ledger.jsonl", 0o600)
+
+# A contradicting brokerOfRecord must surface as broker-mismatch, not as a
+# silent malformed verdict drop.
+m._broker_task_on = lambda config, r, task_id, secret: {
+    "status": "succeeded", "brokerOfRecord": "seoseo",
+    "result": {"output": {"verdict": "approve", "findings": [], "head_sha": "a" * 40}},
+}
+m._task_readback_on = lambda config, rb, task_id, secret: (_ for _ in ()).throw(
+    m.PromotionError("dispatch_broker_unreachable"))
+m._broker_id = lambda config, secret: "seoseo"
+m._remote_broker_id = lambda config, rb: "gwakga"
+processed = m._process_verdicts(config, dry_run=False)
+assert any(p.get("outcome") == "verdict-broker-mismatch" for p in processed), processed
+verdict_rows = [json.loads(l) for l in open(iso_state / "ledger.jsonl")]
+assert any(r.get("status") == "broker-mismatch" for r in verdict_rows), verdict_rows
+assert not any(r.get("status") == "consumed" for r in verdict_rows), verdict_rows
+print("GATE-CONSUME-OK")
+FIXTURE
+env "${base_env[@]}" python3 "$GATE_FIXTURE" "$PROMOTER" > "$TMP/gate-out" 2>&1; rc=$?
+ok "broker routing gate: bor semantics, gated fetch resolutions, visible mismatch consumption" \
+  '[ "$rc" = 0 ] && grep -q "GATE-UNIT-OK" "$TMP/gate-out" && grep -q "GATE-CONSUME-OK" "$TMP/gate-out"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
