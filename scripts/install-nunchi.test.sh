@@ -28,7 +28,7 @@ cron_store="$TMP/crontab"
 piri_sessions="$home/.piri/agent/sessions"
 mkdir -p "$hooks/nunchi" "$state" "$codex_home/sessions" "$piri_sessions" \
   "$home/.claude/projects" "$home/.local/bin" "$nunchi_home" "$fake_bin"
-cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,judge-verdict.schema.json,codex-feed.sh,piri-feed.sh,ingest-cron.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
+cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,wiki-promote.py,judge-verdict.schema.json,codex-feed.sh,piri-feed.sh,ingest-cron.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
 cp "$ROOT/claude/hooks/scan-injection.sh" "$hooks/scan-injection.sh"
 chmod 700 "$hooks/nunchi/codex-loader.py" "$hooks/nunchi/nunchi.py" "$hooks/scan-injection.sh"
 chmod 755 "$hooks/nunchi"/*.sh
@@ -159,6 +159,45 @@ ok "re-applying with plain --judge disarms APPLY on the cron line" \
   '[ "$rc" = 0 ] && grep -q "judge-batch.py" "$cron_store" && ! grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY"'
 ok "stepping down also rewrites the install record to --judge" \
   'jq -e ".argv==[\"--apply\",\"--codex\",\"--judge\"]" "$nrec" >/dev/null'
+run_install --apply --codex >/dev/null 2>&1
+
+# --- Wiki-promote batch (#1447): opt-in via --wiki-promote, a 5th managed line
+# that is ALWAYS dry-run on the cron by design — APPLY queues fleet facts for
+# human wiki-record review, so flipping it is a fresh, per-node approval.
+out="$(run_install --apply --codex --wiki-promote 2>&1)"; rc=$?
+ok "--wiki-promote adds a managed weekly wiki-promote cron alongside feed/refresh/bench" \
+  '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 4 ] && grep -q "wiki-promote.py" "$cron_store" && ! grep -q "judge-batch.py" "$cron_store"'
+ok "wiki-promote cron is weekly Mon 06:40, dry-run only, with the gen stamp" \
+  'grep "wiki-promote.py" "$cron_store" | grep -qE "^40 6 \\* \\* 1 " && ! grep "wiki-promote.py" "$cron_store" | grep -q "NUNCHI_WIKI_PROMOTE_APPLY" && grep "wiki-promote.py" "$cron_store" | grep -qE "gen=h_[0-9a-f]{12}$"'
+# Same silent-revert class as --judge (#1264): the record must materialize the
+# flag or a self-update replay deletes the cron with no error.
+ok "install record materializes --wiki-promote so a self-update replay keeps the cron" \
+  'jq -e ".argv==[\"--apply\",\"--codex\",\"--wiki-promote\"]" "$nrec" >/dev/null'
+ok "replaying the recorded argv preserves the wiki-promote cron line" \
+  'run_install --apply --codex --wiki-promote >/dev/null 2>&1 && [ "$(grep -c "wiki-promote.py" "$cron_store")" = 1 ]'
+ok "a deliberate re-apply without --wiki-promote removes the wiki-promote cron" \
+  'run_install --apply --codex >/dev/null 2>&1 && [ "$(grep -c "wiki-promote.py" "$cron_store")" = 0 ]'
+ok "opting out also drops --wiki-promote from the install record" \
+  'jq -e ".argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
+
+# --- Wiki-promote APPLY mode: same approval-must-survive-replay contract as
+# --judge-apply (#1264) — the flag materializes NUNCHI_WIKI_PROMOTE_APPLY=1 on
+# the cron line so an approved pilot cannot be silently switched back off.
+out="$(run_install --apply --codex --wiki-promote-apply 2>&1)"; rc=$?
+ok "--wiki-promote-apply puts NUNCHI_WIKI_PROMOTE_APPLY=1 on the cron line" \
+  '[ "$rc" = 0 ] && grep "wiki-promote.py" "$cron_store" | grep -q "NUNCHI_WIKI_PROMOTE_APPLY=1"'
+ok "--wiki-promote-apply implies --wiki-promote (one line, not zero or two)" \
+  '[ "$(grep -c "wiki-promote.py" "$cron_store")" = 1 ]'
+ok "--wiki-promote-apply announces that it writes the queue" 'grep -q "APPLY — writes the wiki-candidates queue" <<<"$out"'
+ok "install record materializes --wiki-promote-apply, not the weaker flag" \
+  'jq -e ".argv==[\"--apply\",\"--codex\",\"--wiki-promote-apply\"]" "$nrec" >/dev/null'
+ok "replaying the recorded argv keeps APPLY (no silent downgrade to dry-run)" \
+  'run_install --apply --codex --wiki-promote-apply >/dev/null 2>&1 && grep "wiki-promote.py" "$cron_store" | grep -q "NUNCHI_WIKI_PROMOTE_APPLY=1"'
+out="$(run_install --apply --codex --wiki-promote 2>&1)"; rc=$?
+ok "re-applying with plain --wiki-promote disarms APPLY on the cron line" \
+  '[ "$rc" = 0 ] && grep -q "wiki-promote.py" "$cron_store" && ! grep "wiki-promote.py" "$cron_store" | grep -q "NUNCHI_WIKI_PROMOTE_APPLY"'
+ok "stepping down also rewrites the install record to --wiki-promote" \
+  'jq -e ".argv==[\"--apply\",\"--codex\",\"--wiki-promote\"]" "$nrec" >/dev/null'
 run_install --apply --codex >/dev/null 2>&1
 
 # --- Piri lane: Piri has no distill feed, so its lane runs a per-session
