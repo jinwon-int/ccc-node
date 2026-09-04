@@ -166,5 +166,125 @@ run_handler "$TMP/task.json" > "$TMP/out-prov-fallback.json" 2>/dev/null; rc=$?
 ok "review_model falls back to the agent self-report when args carry no --model (#2027)" \
   '[ "$rc" = 0 ] && jq -e ".output.review_agent == \"stub-agent\" and .output.review_model == \"stub-model\"" >/dev/null "$TMP/out-prov-fallback.json"'
 
+# ─── #1460: skills-intake revise handler ─────────────────────────────────
+REVISE_HANDLER="$ROOT/scripts/skills-intake-revise-handler.sh"
+TREE_OK="c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2"
+
+cat > "$BIN/revise-stub-agent" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null
+REVISE_STUB_HEAD="${TREE_OK}"
+case "\${REVIEW_STUB_MODE:-revised}" in
+  revised)
+    printf '{"outcome":"revised","skillName":"stub-skill","sourceTreeSha256":"%s","changeSummary":"addressed findings 1-2 by rewriting the procedure","skillFiles":[{"path":"SKILL.md","content":"# revised stub skill"}],"model":"stub-model"}' "\$REVISE_STUB_HEAD"
+    ;;
+  revised-unbound)
+    # omits the bindings — the handler fills them node-side
+    printf '{"outcome":"revised","changeSummary":"rewrote the procedure","skillFiles":[{"path":"SKILL.md","content":"# revised stub skill"}]}'
+    ;;
+  wrongbinding)
+    printf '{"outcome":"revised","skillName":"other-skill","sourceTreeSha256":"%s","changeSummary":"x","skillFiles":[{"path":"SKILL.md","content":"# x"}]}' "\$REVISE_STUB_HEAD"
+    ;;
+  unsafepath)
+    printf '{"outcome":"revised","skillName":"stub-skill","sourceTreeSha256":"%s","changeSummary":"x","skillFiles":[{"path":"../escape.md","content":"# x"}]}' "\$REVISE_STUB_HEAD"
+    ;;
+  nofiles)
+    printf '{"outcome":"revised","skillName":"stub-skill","sourceTreeSha256":"%s","changeSummary":"x"}' "\$REVISE_STUB_HEAD"
+    ;;
+  droprec)
+    printf '{"outcome":"drop_recommendation","skillName":"stub-skill","sourceTreeSha256":"%s","dropRecommendation":{"reason":"superseded by the approved shared-id-registry skill"}}' "\$REVISE_STUB_HEAD"
+    ;;
+  prose)
+    printf 'I revised the skill and it looks great now.'
+    ;;
+  crash) exit 1 ;;
+esac
+STUB
+chmod +x "$BIN/revise-stub-agent"
+
+make_revise_task() {
+  local head64 tree12
+  head64="$(printf 'd%.0s' $(seq 1 64))"
+  tree12="${TREE_OK:0:12}"
+  jq -n --arg tree "$TREE_OK" --arg head64 "$head64" --arg tree12 "$tree12" \
+    '{id:"revise-task-1", intent:"skills_intake_revise",
+      payload:{skillName:"stub-skill",
+        provenance:{author_node:"authornode", provider:"claude", intake_pr:7,
+          branch:("skill-intake/authornode/stub-skill-claude-" + $tree12),
+          head_sha:$head64, source_tree_sha256:$tree, revise_round:1, revise_round_limit:2},
+        findings:[{severity:"major", area:"procedure", note:"the procedure is one past incident narrowed"}],
+        skillFiles:[{path:"SKILL.md", content:"# stub skill"}],
+        reviseResultSchema:{outcome:"revised | drop_recommendation"},
+        workerProcedure:"## Worker procedure\nAddress the findings holistically."}}' > "$TMP/revise-task.json"
+}
+run_revise_handler() {
+  REVIEW_AGENT_BIN="$BIN/revise-stub-agent" REVIEW_AGENT_ARGS="" REVIEW_TIMEOUT_SEC=30 \
+    WORKER_ID=testnode REVIEW_STUB_MODE="${REVIEW_STUB_MODE:-revised}" \
+    bash "$REVISE_HANDLER" < "$TMP/revise-task.json"
+}
+
+make_revise_task
+REVIEW_STUB_MODE=revised run_revise_handler > "$TMP/out-revised.json" 2>/dev/null; rc=$?
+ok "revised outcome composes a bound TaskResult (#1460)" \
+  '[ "$rc" = 0 ] && jq -e ".output.outcome == \"revised\" and .output.skillName == \"stub-skill\"
+    and .output.sourceTreeSha256 == \"$TREE_OK\" and (.output.skillFiles | length) == 1
+    and .output.skillFiles[0].path == \"SKILL.md\" and .output.reviser_node == \"testnode\"
+    and .output.reviser_agent == \"revise-stub-agent\" and .output.model == \"stub-model\"" >/dev/null "$TMP/out-revised.json"'
+
+make_revise_task
+REVIEW_STUB_MODE=revised-unbound run_revise_handler > "$TMP/out-unbound.json" 2>/dev/null; rc=$?
+ok "missing bindings are filled node-side from the packet (#1460)" \
+  '[ "$rc" = 0 ] && jq -e ".output.outcome == \"revised\" and .output.skillName == \"stub-skill\"
+    and .output.sourceTreeSha256 == \"$TREE_OK\"" >/dev/null "$TMP/out-unbound.json"'
+
+make_revise_task
+REVIEW_STUB_MODE=wrongbinding run_revise_handler >/dev/null 2>&1; rc=$?
+ok "contradicting skillName binding is a handler failure, never a revision (#1460)" '[ "$rc" != 0 ]'
+
+make_revise_task
+REVIEW_STUB_MODE=unsafepath run_revise_handler >/dev/null 2>&1; rc=$?
+ok "unsafe candidate path (../) is rejected (#1460)" '[ "$rc" != 0 ]'
+
+make_revise_task
+REVIEW_STUB_MODE=nofiles run_revise_handler >/dev/null 2>&1; rc=$?
+ok "revised outcome without skillFiles is a handler failure (#1460)" '[ "$rc" != 0 ]'
+
+make_revise_task
+REVIEW_STUB_MODE=droprec run_revise_handler > "$TMP/out-droprec.json" 2>/dev/null; rc=$?
+ok "drop_recommendation outcome composes a bounded result (#1460)" \
+  '[ "$rc" = 0 ] && jq -e ".output.outcome == \"drop_recommendation\"
+    and .output.dropRecommendation.reason != \"\" and .output.skillFiles == null" >/dev/null "$TMP/out-droprec.json"'
+
+make_revise_task
+REVIEW_STUB_MODE=prose run_revise_handler >/dev/null 2>&1; rc=$?
+ok "prose-only reviser output is a handler failure (#1460)" '[ "$rc" != 0 ]'
+
+make_revise_task
+REVIEW_STUB_MODE=crash run_revise_handler >/dev/null 2>&1; rc=$?
+ok "reviser agent crash is a retryable handler failure (#1460)" '[ "$rc" != 0 ]'
+
+# non-revise intents stay rejected by the revise handler
+printf '{"id":"x","intent":"skills_intake_review","payload":{}}\n' | \
+  REVIEW_AGENT_BIN="$BIN/revise-stub-agent" bash "$REVISE_HANDLER" >/dev/null 2>&1; rc=$?
+ok "revise handler rejects non-revise intents" '[ "$rc" != 0 ]'
+
+# ─── dispatcher revise routing (#1460) ──────────────────────────────────
+printf '#!/usr/bin/env bash\necho REVISE-HANDLER-CALLED\n' > "$BIN/revise-route-stub"
+chmod +x "$BIN/revise-route-stub"
+printf '{"intent":"skills_intake_revise","payload":{}}\n' > "$TMP/i-revise.json"
+out="$(INTAKE_REVISE_HANDLER="$BIN/revise-route-stub" DEFAULT_TASK_HANDLER="$BIN/default-stub" bash "$DISPATCHER" < "$TMP/i-revise.json" 2>/dev/null)"; rc=$?
+ok "dispatcher routes revise intents to the revise handler (#1460)" '[ "$rc" = 0 ] && [ "$out" = "REVISE-HANDLER-CALLED" ]'
+# A node without the revise handler fails LOUDLY (never a generic ack).
+out="$(INTAKE_REVISE_HANDLER="$TMP/definitely-missing.sh" DEFAULT_TASK_HANDLER="$BIN/default-stub" bash "$DISPATCHER" < "$TMP/i-revise.json" 2>&1 >/dev/null)"; rc=$?
+ok "missing revise handler fails loudly instead of acking (#1460)" \
+  '[ "$rc" != 0 ] && grep -q "revise-unsupported" <<<"$out"'
+# ─── installer ships the revise handler (#1460) ─────────────────────────────
+DEST="$TMP/install-dest-1460"
+bash "$INSTALLER" --dest "$DEST" >/dev/null 2>&1; rc=$?
+ok "installer copies dispatcher + review + revise handlers into dest (#1460)" \
+  '[ "$rc" = 0 ] && [ -x "$DEST/skills-intake-revise-handler.sh" ] && [ -x "$DEST/skills-intake-review-handler.sh" ]'
+bash "$INSTALLER" --termux --dest "$TMP/termux-dest-1460" >/dev/null 2>&1; rc=$?
+ok "installer Termux profile ships the revise handler (#1460)" '[ "$rc" = 0 ] && [ -x "$TMP/termux-dest-1460/skills-intake-revise-handler.sh" ]'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
