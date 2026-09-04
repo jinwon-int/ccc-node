@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install-a2a-review-handler.sh — install the canonical skills-intake review
-# dispatcher + handler from this repo onto a node, replacing (with backup) any
-# drifted node-local copies.
+# dispatcher + review/revise handlers from this repo onto a node, replacing
+# (with backup) any drifted node-local copies.
 #
 # Usage:
 #   install-a2a-review-handler.sh [--dest DIR] [--termux]
@@ -47,7 +47,7 @@ mkdir -p "$DEST"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$DEST"
 installed=0
-for name in a2a-intent-dispatcher.sh skills-intake-review-handler.sh; do
+for name in a2a-intent-dispatcher.sh skills-intake-review-handler.sh skills-intake-revise-handler.sh; do
   src="$HERE/$name"
   [ -f "$src" ] || { echo "missing source: $src" >&2; exit 1; }
   dst="$DEST/$name"
