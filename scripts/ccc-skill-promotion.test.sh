@@ -6,6 +6,10 @@ PROMOTER="$HERE/ccc-skill-promotion.py"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$HERE/../claude/hooks/lib/test-stub.sh"
 ccc_test_reset_hook_env
+# The promoter imports its sibling ccc_secure_fs (#1484); setup.sh installs
+# both beside each other in hooks/. Drivers below load the promoter through
+# importlib from other directories, so make the sibling importable once here.
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 pass=0
 fail=0
 TMP="$(ccc_test_tmpdir)" || exit 1
@@ -259,9 +263,18 @@ time.sleep(float(sys.argv[3]))
 PY
 LOCK_READY="$TMP/lock-ready"
 rm -f "$LOCK_READY"
-python3 "$LOCK_HOLDER" "$STATE/skill-promotion/promotion.lock" "$LOCK_READY" 30 &
+python3 "$LOCK_HOLDER" "$STATE/skill-promotion/promotion.lock" "$LOCK_READY" 90 &
 lock_holder_pid=$!
-for _ in $(seq 1 100); do [ -e "$LOCK_READY" ] && break; sleep 0.05; done
+# Bounded 30 s (600 x 50 ms): 5 s flaked once on a loaded CI shard (#1497).
+# Fail loudly instead of silently running the locked-state assertions below
+# against an unheld lock.
+lock_ready=0
+for _ in $(seq 1 600); do [ -e "$LOCK_READY" ] && { lock_ready=1; break; }; sleep 0.05; done
+if [ "$lock_ready" != 1 ]; then
+  echo "FAIL: #1477 lock-holder helper never signalled readiness within 30s (pid $lock_holder_pid)" >&2
+  kill "$lock_holder_pid" 2>/dev/null; wait "$lock_holder_pid" 2>/dev/null
+  exit 1
+fi
 LOCK_GH_STATE="$TMP/lock-gh-state"
 lock_env=("${publish_env[@]}" "GH_TEST_STATE=$LOCK_GH_STATE")
 ledger_lines_locked="$(grep -c . "$STATE/skill-promotion/ledger.jsonl")"

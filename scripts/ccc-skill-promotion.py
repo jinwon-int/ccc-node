@@ -14,7 +14,6 @@ import base64
 import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 import json
 import os
@@ -27,6 +26,8 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterator
+
+import ccc_secure_fs as _secure_fs
 
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -183,20 +184,8 @@ def _parse_remote_brokers(raw: str) -> tuple[dict[str, str], ...]:
     return tuple(brokers)
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _json_line(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _bounded_int(raw: str | None, default: int, minimum: int, maximum: int) -> int:
-    try:
-        value = int(raw if raw is not None else default)
-    except (TypeError, ValueError):
-        return default
-    return value if minimum <= value <= maximum else default
+_utc_now = _secure_fs.utc_now_iso
+_json_line = _secure_fs.json_line
 
 
 def _safe_node(raw: str) -> str:
@@ -397,7 +386,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
                 )
             ).absolute(),
         },
-        max_prs=_bounded_int(env.get("CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN"), 1, 1, 3),
+        max_prs=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN", 1, 1, 3),
         enabled=enabled,
         publisher_enabled=publisher_enabled,
         collect_nodes=collect_nodes,
@@ -406,20 +395,16 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         a2a_nexus_dir=Path(
             env.get("CCC_SKILL_PROMOTION_A2A_NEXUS_DIR", str(home / "work" / "a2a" / "a2a-nexus"))
         ).absolute(),
-        dispatch_ci_wait_sec=_bounded_int(
-            env.get("CCC_SKILL_PROMOTION_DISPATCH_CI_WAIT_SEC"), 600, 60, 3600
-        ),
+        dispatch_ci_wait_sec=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_DISPATCH_CI_WAIT_SEC", 600, 60, 3600),
         autorepair_enabled=autorepair_enabled,
         revise_enabled=revise_enabled,
-        revise_round_limit=_bounded_int(env.get("CCC_SKILL_PROMOTION_REVISE_ROUNDS"), 2, 1, 2),
-        revise_daily_cap=_bounded_int(env.get("CCC_SKILL_PROMOTION_REVISE_DAILY_CAP"), 3, 1, 8),
+        revise_round_limit=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_ROUNDS", 2, 1, 2),
+        revise_daily_cap=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_DAILY_CAP", 3, 1, 8),
         # #1394: verdict/revise-result collect window. The old fixed cap of 8
         # polled newest-first (LIFO), so any backlog beyond 8 starved the oldest
         # dispatches forever under a daily cron. FIFO over a larger, bounded
         # window (default 32, env-tunable 1..128) drains backlogs instead.
-        collect_window=_bounded_int(
-            env.get("CCC_SKILL_PROMOTION_COLLECT_WINDOW"), 32, 1, 128
-        ),
+        collect_window=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_COLLECT_WINDOW", 32, 1, 128),
         review_llm_cmd=review_llm_cmd,
         autonomy=_autonomy_state(env, state_dir, trust_root=home),
         remote_brokers=_parse_remote_brokers(env.get("CCC_SKILL_PROMOTION_REMOTE_BROKERS", "")),
@@ -463,19 +448,11 @@ def _promotion_lock(config: Config) -> Iterator[bool]:
     """
     _private_state_dir(config.promotion_state_dir)
     lock_path = config.promotion_state_dir / "promotion.lock"
-    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
     try:
-        metadata = os.fstat(lock_fd)
-        if metadata.st_uid != os.geteuid() or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise PromotionError("lock_unsafe")
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
-        yield True
-    finally:
-        os.close(lock_fd)
+        with _secure_fs.flock_guard(lock_path, owner_id=os.geteuid(), exact_mode=0o600) as acquired:
+            yield acquired
+    except _secure_fs.SecureFsError:
+        raise PromotionError("lock_unsafe") from None
 
 
 def _component_safe(metadata: os.stat_result) -> bool:
@@ -645,46 +622,15 @@ def _ownership_rows(config: Config, provider: str) -> list[dict[str, Any]]:
 
 
 def _safe_read(path: Path, *, max_bytes: int, exact_mode: int | None = None) -> tuple[bytes, os.stat_result]:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
+        return _secure_fs.read_owner_only_bytes(
+            path, max_bytes=max_bytes, owner_id=os.geteuid(), exact_mode=exact_mode
+        )
+    except _secure_fs.SecureFsError as error:
+        code = "source_changed" if error.reason == "changed" else "source_file_unsafe"
+        raise PromotionError(code) from None
     except OSError:
         raise PromotionError("source_file_unsafe") from None
-    try:
-        before = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_uid != os.geteuid()
-            or before.st_nlink != 1
-            or stat.S_IMODE(before.st_mode) & 0o022
-            or before.st_size > max_bytes
-            or (exact_mode is not None and stat.S_IMODE(before.st_mode) != exact_mode)
-        ):
-            raise PromotionError("source_file_unsafe")
-        payload = b""
-        while len(payload) <= max_bytes:
-            chunk = os.read(descriptor, min(65536, max_bytes + 1 - len(payload)))
-            if not chunk:
-                break
-            payload += chunk
-        after = os.fstat(descriptor)
-        if len(payload) > max_bytes or (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        ) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ):
-            raise PromotionError("source_changed")
-        return payload, after
-    finally:
-        os.close(descriptor)
 
 
 def _frontmatter(payload: bytes, expected_name: str) -> str:
@@ -1209,16 +1155,10 @@ def _append_jsonl(
     """Append one JSON line to a private state file under the same invariants
     as the ledger: owner-only 0600 regular file, no hardlinks, owned by us."""
     path = config.promotion_state_dir / filename
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(path, flags, 0o600)
     try:
-        metadata = os.fstat(descriptor)
-        if metadata.st_uid != os.geteuid() or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise PromotionError(code)
-        os.write(descriptor, (_json_line(record) + "\n").encode())
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        _secure_fs.append_jsonl_line(path, record, owner_id=os.geteuid())
+    except _secure_fs.SecureFsError:
+        raise PromotionError(code) from None
 
 
 def _append_ledger(config: Config, record: dict[str, object]) -> None:
@@ -1389,24 +1329,7 @@ def _stage_candidate(config: Config, candidate: Candidate) -> dict[str, str]:
             raise PromotionError("outbox_collision")
         return {"outcome": "already-staged", "transport_id": transport_id}
     value = _envelope(candidate, created_at=_utc_now())
-    descriptor, raw = tempfile.mkstemp(prefix=".candidate-", dir=outbox)
-    temporary = Path(raw)
-    try:
-        os.fchmod(descriptor, 0o600)
-        os.write(descriptor, (_json_line(value) + "\n").encode())
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    try:
-        os.replace(temporary, destination)
-        directory_fd = os.open(outbox, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    _secure_fs.atomic_write_bytes(destination, (_json_line(value) + "\n").encode(), mode=0o600)
     _append_ledger(
         config,
         {
@@ -2316,15 +2239,7 @@ def _ledger_rows(config: Config) -> list[dict[str, object]]:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return []
-    rows: list[dict[str, object]] = []
-    for line in text.splitlines():
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(record, dict):
-            rows.append(record)
-    return rows
+    return _secure_fs.parse_jsonl_rows(text)
 
 
 def _split_transport_id(transport_id: str, provider: str) -> tuple[str, str, str] | None:
@@ -3692,30 +3607,15 @@ def _read_drop_jsonl(config: Config, filename: str, *, max_bytes: int = 262144) 
     unsafe one (symlink, hardlink, wrong mode or owner) fails closed."""
     path = config.promotion_state_dir / filename
     try:
-        metadata = path.lstat()
-        if (
-            not _path_components_safe(path, final_kind="file", trust_root=config.home)
-            or not stat.S_ISREG(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-            or metadata.st_size > max_bytes
-        ):
-            raise PromotionError("drop_state_unsafe")
-        text = path.read_text(encoding="utf-8")
+        rows = _secure_fs.read_jsonl_rows(
+            path, max_bytes=max_bytes, owner_id=os.geteuid(), exact_mode=0o600
+        )
     except FileNotFoundError:
         return []
-    except (OSError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError, _secure_fs.SecureFsError):
         raise PromotionError("drop_state_unsafe") from None
-    rows: list[dict[str, object]] = []
-    for line in text.splitlines():
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(record, dict):
-            rows.append(record)
+    if not _path_components_safe(path, final_kind="file", trust_root=config.home):
+        raise PromotionError("drop_state_unsafe")
     return rows
 
 

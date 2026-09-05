@@ -140,6 +140,102 @@ out="$(env PATH="$TMP/empty-path" "$(command -v python3)" "$MOD" run-memory-sear
 ok "bounded runner notes an unspawnable interpreter on stderr (#1159)" \
   '[ "$rc" = 0 ] && [ -z "$out" ] && grep -q "cannot spawn tool" "$TMP/spawn-err.txt"'
 
+# ---- pipeline (#1484) -------------------------------------------------------
+# One interpreter for budget -> search -> [filter] -> dedup -> render plus the
+# promises/detached blocks. Pinned against the standalone subcommands so the
+# in-process chain can never drift from the contract the shell glue had.
+pj='{"results":[{"source":"memory","path":"/m/MEMORY.md","snippet":"alpha bravo charlie delta echo"},{"source":"structured","path":"/s/facts.jsonl","snippet":"… [Fact] pipeline keeps this …"},{"source":"cache","path":"/c/wiki.txt","snippet":"stale wiki row"}]}'
+cat > "$TMP/pipe-tool.sh" <<SH
+#!/usr/bin/env bash
+printf '%s' '$pj'
+SH
+chmod +x "$TMP/pipe-tool.sh"
+pdir="$TMP/pipe-out"; mkdir -p "$pdir"
+meta="$(INJECTED='context alpha bravo charlie delta echo tail' python3 "$MOD" pipeline out="$pdir" \
+  budget=12000,1000,3000,180,5,25,2000,500,0 alloc=3000 limit= \
+  tool="$TMP/pipe-tool.sh" query=q state_dir="$TMP/state-p" timeout=3 \
+  audience_scoped=0 wiki_enabled=1 dedup=1 render=1)"; rc=$?
+expected="$(SEARCH_JSON="$(INJECTED='context alpha bravo charlie delta echo tail' SEARCH_JSON="$pj" python3 "$MOD" dedup-local-hot)" python3 "$MOD" render-local-hot)"
+ok "pipeline: exit 0 and budget line equals dynamic-budget output" \
+  '[ "$rc" = 0 ] && [ "${meta%% search_local=*}" = "alloc=8500 limit=25" ]'
+ok "pipeline: reports the search lane stage in ms" 'grep -Eq " search_local=[0-9]+$" <<<"$meta"'
+ok "pipeline: local_hot equals dedup-local-hot | render-local-hot byte-for-byte" \
+  '[ "$(cat "$pdir/local_hot")" = "$expected" ] && grep -q "^- (fact) Fact pipeline keeps this$" "$pdir/local_hot" && ! grep -q "alpha bravo" "$pdir/local_hot"'
+ok "pipeline: wiki_enabled=1 keeps the cache row" 'grep -q "^- (cache) stale wiki row$" "$pdir/local_hot"'
+ok "pipeline: empty evidence paths write empty blocks" '[ ! -s "$pdir/promises" ] && [ ! -s "$pdir/detached" ]'
+
+meta="$(INJECTED='' python3 "$MOD" pipeline out="$pdir" alloc=3000 limit=7 \
+  tool="$TMP/pipe-tool.sh" query=q state_dir="$TMP/state-p" timeout=3 \
+  audience_scoped=0 wiki_enabled=0 dedup=1 render=1)"
+ok "pipeline: wiki_enabled=0 applies filter-disabled-wiki-hits (fails closed on wiki rows)" \
+  '! grep -q "stale wiki row" "$pdir/local_hot" && grep -q "Fact pipeline keeps this" "$pdir/local_hot"'
+ok "pipeline: no budget spec keeps the static alloc and an explicit limit" \
+  '[ "${meta%% search_local=*}" = "alloc=3000 limit=7" ]'
+
+INJECTED='' python3 "$MOD" pipeline out="$pdir" alloc=3000 limit= \
+  tool="$TMP/pipe-tool.sh" query=q state_dir="$TMP/state-p" timeout=3 \
+  audience_scoped=0 wiki_enabled=1 dedup=0 render=0 >/dev/null
+ok "pipeline: dedup=0 render=0 injects the raw search JSON" '[ "$(cat "$pdir/local_hot")" = "$pj" ]'
+
+python3 "$MOD" pipeline out="$pdir" alloc=3000 limit= tool="$TMP/fail-tool.sh" query=q \
+  state_dir= timeout=3 audience_scoped=0 wiki_enabled=1 dedup=1 render=1 >/dev/null
+ok "pipeline: a failing tool yields an empty local_hot (nothing injected, no error)" '[ ! -s "$pdir/local_hot" ]'
+meta="$(python3 "$MOD" pipeline out="$pdir" alloc=3000 limit= tool= query=q \
+  state_dir= timeout=3 audience_scoped=0 wiki_enabled=1 dedup=1 render=1)"
+ok "pipeline: no tool means no search stage and an empty block" \
+  '[ "$meta" = "alloc=3000 limit=" ] && [ ! -s "$pdir/local_hot" ]'
+
+# Evidence blocks: byte-identical to the modules' own stdout.
+ew="$TMP/pipe-ew"; mkdir -p "$ew"
+printf '%s' '{"w1":{"wait_id":"w1","state":"monitoring","repo":"o/r","pr_number":7,"summary":"CI running"}}' > "$ew/waits.json"
+djlog="$TMP/pipe-dj.log"; printf 'work\nEXIT=0\n' > "$djlog"
+djreg="$TMP/pipe-dj.jsonl"
+printf '{"unit":"dj1","log":"%s","started_at":%s,"summary":"recheck"}\n' "$djlog" "$(date +%s)" > "$djreg"
+python3 "$MOD" pipeline out="$pdir" alloc=3000 limit= tool= query=q state_dir= timeout=3 \
+  audience_scoped=0 wiki_enabled=1 dedup=1 render=1 \
+  promises_file="$ew/waits.json" promises_max=1024 detached_registry="$djreg" detached_max=1024 >/dev/null
+ok "pipeline: promises block equals pending_promises.py output" \
+  '[ "$(cat "$pdir/promises")" = "$(python3 "$HERE/pending_promises.py" "$ew/waits.json" --max-bytes 1024)" ] && grep -q "o/r#7" "$pdir/promises"'
+ok "pipeline: detached block equals detached_jobs.py sweep output" \
+  '[ "$(cat "$pdir/detached")" = "$(python3 "$HERE/detached_jobs.py" sweep "$djreg" --max-bytes 1024)" ] && grep -q "EXIT=0" "$pdir/detached"'
+printf 'not json{{{' > "$ew/waits.json"
+python3 "$MOD" pipeline out="$pdir" alloc=3000 limit= tool= query=q state_dir= timeout=3 \
+  audience_scoped=0 wiki_enabled=1 dedup=1 render=1 promises_file="$ew/waits.json" promises_max=1024 >/dev/null; rc=$?
+ok "pipeline: a corrupt promises registry fails open to an empty block" '[ "$rc" = 0 ] && [ ! -s "$pdir/promises" ]'
+
+# Audience lanes: concurrent under one global budget; the stalled lane is cut,
+# the others merge with audience labels.
+cat > "$TMP/lane-tool.sh" <<'SH'
+#!/usr/bin/env bash
+case "${CCC_STATE_DIR:-}" in
+  */shared) sleep 5; printf '{"results":[{"source":"cache","path":"/shared/f","snippet":"SHARED_HIT","score":0.5}]}' ;;
+  */legacy) printf '{"results":[{"source":"cache","path":"/legacy/f","snippet":"LEGACY_HIT","score":0.4}]}' ;;
+  *) printf '{"results":[{"source":"cache","path":"/private/f","snippet":"PRIVATE_HIT %s","score":0.9}]}' "$1" ;;
+esac
+SH
+chmod +x "$TMP/lane-tool.sh"
+start="$(date +%s)"
+meta="$(python3 "$MOD" pipeline out="$pdir" alloc=3000 limit=5 tool="$TMP/lane-tool.sh" query=q \
+  state_dir="$TMP/private" timeout=3 recent_timeout=1 \
+  shared_state_dir="$TMP/shared" shared_timeout=3 legacy_state_dir="$TMP/legacy" legacy_timeout=2 \
+  audience_scoped=1 audience=private parallel=1 global_timeout=1 \
+  wiki_enabled=1 dedup=0 render=0)"; rc=$?
+elapsed=$(( $(date +%s) - start ))
+ok "pipeline: parallel audience lanes finish within the global budget, stalled lane dropped" \
+  '[ "$rc" = 0 ] && [ "$elapsed" -le 3 ] && grep -q "search_parallel=" <<<"$meta" && ! grep -q "SHARED_HIT" "$pdir/local_hot"'
+# recent and primary share path /private/f, so merge keeps the recent row
+# (first) and drops the primary duplicate — the merge-local-hot contract.
+ok "pipeline: surviving lanes are merged with audience labels (recent lane first)" \
+  'jq -e ".results | map(.snippet) == [\"PRIVATE_HIT distilled text\", \"LEGACY_HIT\"] and (.[0].memoryAudience == \"private\") and (.[1].memoryAudience == \"private-legacy\")" "$pdir/local_hot" >/dev/null'
+meta="$(python3 "$MOD" pipeline out="$pdir" alloc=3000 limit=5 tool="$TMP/lane-tool.sh" query=q \
+  state_dir="$TMP/private" timeout=3 recent_timeout=1 legacy_state_dir="$TMP/legacy" legacy_timeout=2 \
+  audience_scoped=1 audience=private parallel=0 wiki_enabled=1 dedup=0 render=0)"
+ok "pipeline: serial audience mode reports one stage per lane in order" \
+  'grep -Eq " search_local=[0-9]+ search_recent=[0-9]+ search_legacy=[0-9]+$" <<<"$meta"'
+
+python3 "$MOD" pipeline out="$TMP/no-such-dir" alloc=3000 limit= >/dev/null 2>&1; rc=$?
+ok "pipeline: a missing out dir is refused (exit 2 -> shell fallback path)" '[ "$rc" = 2 ]'
+
 # ---- dispatcher -------------------------------------------------------------
 python3 "$MOD" no-such-subcommand </dev/null >/dev/null 2>&1; rc=$?
 ok "dispatcher rejects unknown subcommands (exit 2 -> shell fallback path)" '[ "$rc" = 2 ]'

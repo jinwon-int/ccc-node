@@ -14,6 +14,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import ccc_secure_fs as _secure_fs
+
 
 def age_seconds(path: Path, now: int) -> int:
     try:
@@ -63,12 +65,9 @@ def _safe_owned_file(path: Path, mode: int | None = None) -> bool:
         info = path.lstat()
     except OSError:
         return False
-    return (
-        stat.S_ISREG(info.st_mode)
-        and info.st_uid == os.getuid()
-        and info.st_nlink == 1
-        and (mode is None or stat.S_IMODE(info.st_mode) == mode)
-    )
+    return _secure_fs.owner_only_regular_violation(
+        info, owner_id=os.getuid(), unsafe_mode_mask=0
+    ) is None and (mode is None or stat.S_IMODE(info.st_mode) == mode)
 
 
 def _safe_owned_directory(path: Path, mode: int) -> bool:

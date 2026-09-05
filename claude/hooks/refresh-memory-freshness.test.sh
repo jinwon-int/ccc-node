@@ -85,6 +85,10 @@ ok "first refresh calls the wiki prefetch" \
 ok "first refresh records only hashes, never the query" \
   'jq -e ".status == \"ok\" and (.query_hash | length) == 64 and has(\"query\") == false" "$cache/.wiki.status.json" >/dev/null'
 first_refreshed_at="$(jq -r '.refreshed_at' "$cache/.wiki.status.json")"
+# #1484: per-source status files are written tmp+mv (atomic, like meta.json) and
+# duration_ms comes from EPOCHREALTIME (no python3 fork) — still an integer.
+ok "status files are written atomically (no tmp leftovers) with integer durations" \
+  '[ "$(find "$cache" -name ".*.status.json.tmp.*" | wc -l)" = 0 ] && jq -e ".duration_ms | type == \"number\" and . >= 0" "$cache/.wiki.status.json" >/dev/null && jq -e ".sources.wiki.duration_ms >= 0" "$cache/meta.json" >/dev/null'
 
 printf 'prompt two should not churn the stable task key\n' > "$state/current-prompt.txt"
 out="$(run_refresh)"; rc=$?
