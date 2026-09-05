@@ -25,11 +25,14 @@
 #   host-specific and opt-in.
 #
 # Refresh policy: run this script on a clean checkout, commit BOTH lock files
-# (plus any bridge-ci.in change) in ONE pull request, and let the full CI
-# matrix (bridge-tests, python-lint, wheel-smoke, pip check, pip-audit)
-# validate the refreshed resolution before merge. Dependabot bumps to
-# bridge/requirements.txt lower bounds follow the same rule: regenerate here
-# and ship one verified PR unit.
+# (plus bridge/requirements.txt, which this script re-pins to the runtime lock,
+# and any bridge-ci.in change) in ONE pull request, and let the full CI matrix
+# (bridge-tests, python-lint, wheel-smoke, pip check, pip-audit) validate the
+# refreshed resolution before merge. Routine bumps arrive the same way: the
+# weekly deps-lock workflow (.github/workflows/deps-lock.yml, driven by
+# scripts/ccc-deps-lock-pr.sh) runs this script with --upgrade and opens one
+# bot PR per round. Dependabot pip version PRs are disabled because Dependabot
+# cannot perform this derivation and moved one lock without the other (#1483).
 #
 # Targeted upgrades: by default pip-compile PRESERVES every pin that still
 # satisfies the inputs, so a plain run only re-derives a consistent lock pair and
@@ -40,26 +43,34 @@
 # Only the named packages may move; everything else stays pinned, keeping the
 # diff reviewable. Name the transitive dependencies that gate the bump too — a
 # package pinned at an older version silently caps its dependents (mypy 2.3.0
-# needs librt>=0.13.0, so upgrading mypy alone stops at 2.2.0). Dependabot
-# remains the normal path for routine bumps; this flag is for versions it cannot
-# propose, such as one whose PR was closed and its branch deleted (#1012).
+# needs librt>=0.13.0, so upgrading mypy alone stops at 2.2.0). A spec such as
+# `--upgrade-package ruff==0.14.0` pins the named package to that exact
+# version. `--upgrade` (no name) lets EVERY pin move to the newest version the
+# inputs permit — the weekly bot round uses it; humans should prefer naming.
 set -euo pipefail
 
 usage() {
     cat >&2 <<'USAGE'
-usage: scripts/ccc-deps-lock.sh [--upgrade-package NAME]...
+usage: scripts/ccc-deps-lock.sh [--upgrade] [--upgrade-package NAME[==VER]]...
 
 Regenerates both hash locks from bridge/pyproject.toml. Without arguments every
 existing pin that still satisfies the inputs is preserved. Each
 --upgrade-package NAME allows that one package to move to the newest version the
-inputs permit.
+inputs permit (NAME==VER pins it to that version); --upgrade lets every pin
+move. bridge/requirements.txt is re-pinned to the regenerated runtime lock.
 USAGE
 }
 
 UPGRADE_ARGS=()
 UPGRADE_NAMES=()
+UPGRADE_ALL=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --upgrade)
+            UPGRADE_ARGS+=(--upgrade)
+            UPGRADE_ALL=1
+            shift
+            ;;
         --upgrade-package)
             [ "$#" -ge 2 ] || { echo "❌ --upgrade-package requires a package name" >&2; exit 2; }
             UPGRADE_ARGS+=(--upgrade-package "$2")
@@ -104,7 +115,9 @@ echo "== creating lock toolchain venv ($PYTHON_BIN, $PIP_TOOLS_SPEC) =="
 "$PYTHON_BIN" -m venv "$WORKDIR/venv"
 "$WORKDIR/venv/bin/pip" install -q "$PIP_TOOLS_SPEC"
 
-if [ "${#UPGRADE_NAMES[@]}" -gt 0 ]; then
+if [ "$UPGRADE_ALL" -eq 1 ]; then
+    echo "== --upgrade: every pin may move to the newest version the inputs permit =="
+elif [ "${#UPGRADE_NAMES[@]}" -gt 0 ]; then
     echo "== targeted upgrades: ${UPGRADE_NAMES[*]} =="
 else
     echo "== no targeted upgrades: every satisfiable pin is preserved =="
@@ -139,5 +152,33 @@ if drift:
 print(f"✓ {len(runtime)} runtime pins all match the CI lock ({len(ci)} pins)")
 PY
 
-echo "✅ Locks regenerated. Commit both lock files (and bridge-ci.in if changed)"
-echo "   together in one PR and let CI validate the refreshed resolution."
+# bridge/requirements.txt is the CCC_DEPS_UNLOCKED=1 fallback and must mirror
+# the runtime lock as EXACT pins (tests/test_runtime_deps_lock.py). Re-pin
+# every entry it lists to the version the runtime lock just resolved; comments
+# and ordering are preserved, and nothing is added or removed.
+echo "== re-pinning bridge/requirements.txt to the runtime lock =="
+"$WORKDIR/venv/bin/python" - <<'PY'
+import re
+from pathlib import Path
+
+pin = re.compile(r"^([A-Za-z0-9_.-]+)(?:\[[A-Za-z0-9_.,-]+\])?==([A-Za-z0-9_.!+-]+)", re.M)
+canon = lambda name: re.sub(r"[-_.]+", "-", name).lower()
+lock = {canon(n): v for n, v in pin.findall(Path("bridge/requirements.lock.txt").read_text(encoding="utf-8"))}
+path = Path("bridge/requirements.txt")
+out, moved = [], []
+for line in path.read_text(encoding="utf-8").splitlines():
+    m = pin.match(line)
+    if m and canon(m.group(1)) in lock and lock[canon(m.group(1))] != m.group(2):
+        moved.append(f"{m.group(1)} {m.group(2)} -> {lock[canon(m.group(1))]}")
+        line = f"{m.group(1)}=={lock[canon(m.group(1))]}"
+    out.append(line)
+if moved:
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    print("✓ re-pinned: " + ", ".join(moved))
+else:
+    print("✓ bridge/requirements.txt already matches the runtime lock")
+PY
+
+echo "✅ Locks regenerated. Commit both lock files, bridge/requirements.txt (and"
+echo "   bridge-ci.in if changed) together in one PR and let CI validate the"
+echo "   refreshed resolution."
