@@ -1,5 +1,11 @@
 # Changelog
 
+- **Termux startup repairs cryptography libpython linkage.** Native extension
+  and SDK imports now fail closed, including on dependency cache hits. Known
+  Android link failures are repaired atomically with `patchelf`, retaining the
+  original for recovery. A successful health probe can no longer hide a
+  failed self-update restart.
+
 - **Audience-scoped Claude bridges can invoke installed skills without
   reopening host settings.** Audience memory isolation intentionally gives the
   Agent SDK `setting_sources=[]`, but that also made Telegram `/skillsuggest`

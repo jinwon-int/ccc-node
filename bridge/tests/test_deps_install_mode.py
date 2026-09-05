@@ -147,6 +147,7 @@ class DepsInstallExecutionTests(unittest.TestCase):
         for filename in (
             "start.sh",
             "dependency_bootstrap.py",
+            "termux_native.py",
             "requirements.txt",
             "pyproject.toml",
             ".env.example",
@@ -209,6 +210,7 @@ class DepsInstallExecutionTests(unittest.TestCase):
                 "CLAUDE_CLI_PATH": "/bin/true",
                 "PIP_CALLS_LOG": str(pip_log),
                 "FAIL_PIP_ARG": "-e",
+                SMOKE_IMPORTS_ENV: "json",
             }
         )
         env.update(extra_env or {})
@@ -397,6 +399,8 @@ class RustToolchainPreflightTests(unittest.TestCase):
         pip = bin_dir / "pip"
         pip.write_text(f"#!/bin/bash\nexit {pip_exit}\n", encoding="utf-8")
         pip.chmod(0o755)
+        (bin_dir / "python").write_text("#!/bin/sh\nexit 0\n")
+        (bin_dir / "python").chmod(0o755)
         return DependencyPaths(
             bridge_dir=bridge,
             venv_dir=bridge / "venv",
@@ -495,13 +499,13 @@ class BinaryExtensionSmokeTests(unittest.TestCase):
             paths = self._make_paths(Path(tmpdir))
             out = io.StringIO()
             rc = smoke_import_binary_extensions(
-                paths, environ={SMOKE_IMPORTS_ENV: "ccc_missing_mod_9f8e7d"}, stdout=out
+                paths, environ={SMOKE_IMPORTS_ENV: "ccc_missing_mod_9f8e7d", SMOKE_STRICT_ENV: "0"}, stdout=out
             )
             self.assertEqual(rc, 0)
             text = out.getvalue()
             self.assertIn("install ok is not usable", text)
             self.assertIn("ccc_missing_mod_9f8e7d", text)
-            self.assertIn("LATENT", text)
+            self.assertIn("during startup", text)
             self.assertIn("warn-only", text)
 
     def test_smoke_failure_fails_closed_when_strict(self):
@@ -528,6 +532,7 @@ class BinaryExtensionSmokeTests(unittest.TestCase):
                 environ={
                     SMOKE_IMPORTS_ENV: "ccc_missing_mod_9f8e7d",
                     "TERMUX_VERSION": "0.118.0",
+                    SMOKE_STRICT_ENV: "0",
                 },
                 stdout=out,
             )
@@ -542,7 +547,7 @@ class BinaryExtensionSmokeTests(unittest.TestCase):
             out = io.StringIO()
             rc = smoke_import_binary_extensions(
                 paths,
-                environ={SMOKE_IMPORTS_ENV: "json,ccc_missing_mod_9f8e7d os"},
+                environ={SMOKE_IMPORTS_ENV: "json,ccc_missing_mod_9f8e7d os", SMOKE_STRICT_ENV: "0"},
                 stdout=out,
             )
             self.assertEqual(rc, 0)
@@ -568,7 +573,7 @@ class BinaryExtensionSmokeTests(unittest.TestCase):
             rc = sync_dependencies(
                 paths,
                 InstallMode.LOCKED,
-                environ={SMOKE_IMPORTS_ENV: "ccc_missing_mod_9f8e7d"},
+                environ={SMOKE_IMPORTS_ENV: "ccc_missing_mod_9f8e7d", SMOKE_STRICT_ENV: "0"},
                 stdout=out,
             )
             self.assertEqual(rc, 0)

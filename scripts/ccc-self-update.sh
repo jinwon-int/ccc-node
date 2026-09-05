@@ -158,8 +158,8 @@ resolve_health_cmd() {
 }
 
 # Run the operator's external restart command INSIDE the audit/notify boundary.
-# Outcome: health-cmd poll (when configured, up to RESTART_WAIT_SECONDS), else
-# the command's own exit code. Returns 0 = runtime back, 1 = still down.
+# Outcome: restart must succeed, then health-cmd must pass (when configured,
+# up to RESTART_WAIT_SECONDS). A probe cannot erase a failed restart. Returns 0 = runtime back, 1 = still down.
 run_external_restart() {
   local rcmd hcmd rc waited
   rcmd="$(resolve_restart_cmd)" || return 1
@@ -172,6 +172,7 @@ run_external_restart() {
   fi
   rc=$?
   log "external-restart exit=$rc"
+  [ "$rc" -eq 0 ] || return "$rc"
   if [ -n "$hcmd" ]; then
     waited=0
     until bash -c "$hcmd" >>"$LOG" 2>&1; do
