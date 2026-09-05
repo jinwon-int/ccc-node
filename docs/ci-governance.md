@@ -34,6 +34,15 @@ list on failure. Workflow job names and this manifest are guarded by
 `tests/test_ci_required_contexts.py` so a rename cannot silently strand the
 live required context.
 
+`validate-harness` is an aggregator job since #1482: the work runs in
+`validate-harness-static` (non-test phases, once) and the
+`validate-harness-shard (<n>)` matrix (hook-test suites, bin-packed), and the
+`validate-harness` job `needs` both, runs `if: always()`, and exits non-zero
+unless every leg reports `success`. The required context therefore keeps its
+name and its gate without any branch-protection mutation; the leg jobs are
+deliberately NOT declared as required contexts (a matrix leg rename would
+strand them, and the aggregator already covers them).
+
 ## Dependency lock governance (issue #349)
 
 Two hash locks share one generation source, `bridge/pyproject.toml`, and are

@@ -28,10 +28,45 @@ if [ "${1:-}" = "--print-scratch" ]; then
   printf '%s\n%s\n' "$TMP" "$TMPDIR"
   exit 0
 fi
+# Phase / shard selection (#1482) — opt-in, CI-facing. With none of these set
+# the run is the single full validation it has always been.
+#   CCC_HARNESS_PHASE=static      everything EXCEPT the hook-test suite runs
+#                                 (JSON, bash -n, shellcheck, py_compile,
+#                                 inline python checks, registration guard,
+#                                 frontmatter, hook wiring, statusline)
+#   CCC_HARNESS_PHASE=hook-tests  only the registration guard + hook-test runs
+#   CCC_HARNESS_SHARD=<i>/<n>     run shard i of n of the hook-test work list
+#                                 (implies PHASE=hook-tests when PHASE is unset)
+#   CCC_HARNESS_LIST_ONLY=1       print the shard assignment for every shard
+#                                 (no suite runs) and exit 0
+phase_static=1; phase_hook_tests=1
+if [ -n "${CCC_HARNESS_SHARD:-}" ] && [ -z "${CCC_HARNESS_PHASE:-}" ]; then
+  CCC_HARNESS_PHASE="hook-tests"
+fi
+case "${CCC_HARNESS_PHASE:-all}" in
+  all) ;;
+  static) phase_hook_tests=0 ;;
+  hook-tests) phase_static=0 ;;
+  *) printf 'FAIL: CCC_HARNESS_PHASE must be static|hook-tests|all (got: %s)\n' "$CCC_HARNESS_PHASE"; exit 2 ;;
+esac
+shard_i=1; shard_n=1
+if [ -n "${CCC_HARNESS_SHARD:-}" ]; then
+  if [[ "$CCC_HARNESS_SHARD" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]] \
+     && [ "${BASH_REMATCH[1]}" -le "${BASH_REMATCH[2]}" ]; then
+    shard_i="${BASH_REMATCH[1]}"; shard_n="${BASH_REMATCH[2]}"
+  else
+    printf 'FAIL: CCC_HARNESS_SHARD must be <i>/<n> with 1 <= i <= n (got: %s)\n' "$CCC_HARNESS_SHARD"; exit 2
+  fi
+fi
+if [ "${CCC_HARNESS_LIST_ONLY:-0}" = 1 ]; then phase_static=0; phase_hook_tests=1; fi
 fail=0
 say() { printf '%s\n' "$*"; }
 err() { printf 'FAIL: %s\n' "$*"; fail=1; }
 
+# Static phase, part 1 (sections 1-3c). Bodies are deliberately NOT
+# re-indented under the phase gate: it keeps the diff reviewable and the
+# other branch that edits this file mergeable (#1482).
+if [ "$phase_static" = 1 ]; then
 # 1) JSON validity
 # Plugin layout: marketplace at .claude-plugin/marketplace.json (source ./claude);
 # the plugin root is claude/, so its manifest is claude/.claude-plugin/plugin.json and
@@ -282,9 +317,13 @@ if command -v python3 >/dev/null 2>&1; then
 else
   say "  (python3 absent — skipped)"
 fi
+fi # phase_static, part 1
 
 # 4) hook tests
 say "== hook tests =="
+# The inline python checks below take ~5 s in total, so they stay with the
+# static phase; only the bash suite runs further down are sharded.
+if [ "$phase_static" = 1 ]; then
 if python3 scripts/ccc_codex_skills.py validate --repo-root . >"$TMP/codex-skills-validate.out" 2>&1 \
    && python3 scripts/ccc_codex_skills_test.py >"$TMP/codex-skills-test.out" 2>&1; then
   say "  ok Codex compatibility catalog + managed-skill transaction tests"
@@ -360,6 +399,7 @@ else
   err "A2A Piri shared memory snapshot producer tests failed"
   tail -10 "$TMP/a2a-piri-memory-test.out" 2>/dev/null
 fi
+fi # phase_static, inline python checks
 # A suite must not inherit the harness environment of the node it runs on
 # (#1064). The per-suite guard `ccc_test_reset_hook_env` (#1023) only reaches
 # suites that source test-stub.sh, so Python-driven suites fell outside it and
@@ -489,16 +529,10 @@ suite_summary() { # <output-file> <suite> [label]
   else err "no 'PASS=<n> FAIL=<n>' summary line: $2${3:+ $3}"; fi
 }
 
-for t in "${HARNESS_SUITES[@]}"; do
-  [ -f "$t" ] || { err "missing test: $t"; continue; }
-  if run_suite "$t" >"$TMP/htest.out" 2>&1; then suite_summary "$TMP/htest.out" "$t";
-  else err "test failed: $t"; tail -5 "$TMP/htest.out"; fi
-done
-
 # Umask-0002 variant (#770): the ownership contract fail-closes on
 # group/other-writable skill dirs, so the umask-sensitive suites must also
 # pass on nodes whose default umask is 0002. CI runs 0022 — run these twice.
-for t in claude/hooks/skill-review.test.sh \
+UMASK_SUITES=(claude/hooks/skill-review.test.sh \
          claude/hooks/distill-scope.test.sh \
          claude/hooks/distill/pending-drain.test.sh \
          claude/hooks/skill-review/autoinstall.test.sh \
@@ -507,12 +541,104 @@ for t in claude/hooks/skill-review.test.sh \
          scripts/ccc-codex-github-policy.test.sh \
          scripts/ccc-codex-memory.test.sh \
          scripts/install-nunchi.test.sh \
-         scripts/setup.test.sh; do
-  [ -f "$t" ] || { err "missing test: $t"; continue; }
-  if ( umask 0002; run_suite "$t" ) >"$TMP/htest.out" 2>&1; then suite_summary "$TMP/htest.out" "$t" "(umask 0002)";
-  else err "test failed (umask 0002): $t"; tail -5 "$TMP/htest.out"; fi
-done
+         scripts/setup.test.sh)
 
+# Hook-test work list: every registered suite once, then the umask-0002
+# re-runs — one flat list so the shard split below sees both kinds of run.
+# Entry shape: "<suite>" or "<suite><TAB>umask0002".
+HOOK_RUNS=()
+for t in "${HARNESS_SUITES[@]}"; do HOOK_RUNS+=("$t"); done
+for t in "${UMASK_SUITES[@]}"; do HOOK_RUNS+=("$t"$'\t'"umask0002"); done
+hook_run_suite() { printf '%s' "${1%%$'\t'*}"; }
+hook_run_label() { # <run> -> "<suite>" or "<suite> (umask 0002)"
+  case "$1" in
+    *$'\t'umask0002) printf '%s (umask 0002)' "${1%%$'\t'*}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# Per-run weight in seconds, used only to split the list into shards. Only
+# the known-heavy suites are listed (measured on main run 33930573500,
+# #1482: setup 189 s + 185 s under umask 0002, ccc-doctor 63 s,
+# install-nunchi 34 s + 32 s); the other ~127 runs averaged ~3 s.
+hook_run_weight() { # <suite> -> seconds
+  case "$1" in
+    scripts/setup.test.sh) echo 190 ;;
+    scripts/ccc-doctor.test.sh) echo 65 ;;
+    scripts/install-nunchi.test.sh) echo 35 ;;
+    *) echo 3 ;;
+  esac
+}
+
+# Shard assignment (CCC_HARNESS_SHARD=<i>/<n>): deterministic greedy
+# bin-packing (LPT) — runs are taken heaviest-first (list order breaks
+# ties) and each goes to the currently lightest shard, so the two
+# setup.test.sh runs, ccc-doctor and install-nunchi land on DIFFERENT shards
+# instead of colliding the way index-modulo-n could. Each shard then runs
+# its runs in list order. n=1 (the default) puts everything on shard 1,
+# i.e. the plain full run, in exactly today's order.
+HOOK_RUN_SHARD=()
+shard_load=()
+for ((s = 1; s <= shard_n; s++)); do shard_load[s]=0; done
+while read -r _ idx w; do
+  idx=$((10#$idx))
+  best=1
+  for ((s = 2; s <= shard_n; s++)); do
+    [ "${shard_load[s]}" -lt "${shard_load[best]}" ] && best=$s
+  done
+  HOOK_RUN_SHARD[idx]=$best
+  shard_load[best]=$((shard_load[best] + w))
+done < <(
+  for ((i = 0; i < ${#HOOK_RUNS[@]}; i++)); do
+    w="$(hook_run_weight "$(hook_run_suite "${HOOK_RUNS[i]}")")"
+    printf '%06d %06d %d\n' "$((999999 - w))" "$i" "$w"
+  done | LC_ALL=C sort
+)
+shard_count() { # <shard> -> number of runs assigned to it
+  local i n=0
+  for ((i = 0; i < ${#HOOK_RUNS[@]}; i++)); do
+    [ "${HOOK_RUN_SHARD[i]}" = "$1" ] && n=$((n + 1))
+  done
+  echo "$n"
+}
+shard_list() { # <shard> -> one label per line
+  local i
+  for ((i = 0; i < ${#HOOK_RUNS[@]}; i++)); do
+    [ "${HOOK_RUN_SHARD[i]}" = "$1" ] && say "    $(hook_run_label "${HOOK_RUNS[i]}")"
+  done
+}
+
+if [ "${CCC_HARNESS_LIST_ONLY:-0}" = 1 ]; then
+  say "== hook-test shard assignment (${#HOOK_RUNS[@]} runs, $shard_n shard(s)) =="
+  for ((s = 1; s <= shard_n; s++)); do
+    say "  shard $s/$shard_n: $(shard_count "$s") runs, est. ${shard_load[s]}s"
+    shard_list "$s"
+  done
+  exit 0
+fi
+
+if [ "$phase_hook_tests" = 1 ]; then
+if [ "$shard_n" -gt 1 ]; then
+  say "  shard $shard_i/$shard_n: $(shard_count "$shard_i") of ${#HOOK_RUNS[@]} hook-test runs (est. ${shard_load[shard_i]}s)"
+  shard_list "$shard_i"
+fi
+for ((i = 0; i < ${#HOOK_RUNS[@]}; i++)); do
+  [ "${HOOK_RUN_SHARD[i]}" = "$shard_i" ] || continue
+  t="$(hook_run_suite "${HOOK_RUNS[i]}")"
+  [ -f "$t" ] || { err "missing test: $t"; continue; }
+  case "${HOOK_RUNS[i]}" in
+    *$'\t'umask0002)
+      if ( umask 0002; run_suite "$t" ) >"$TMP/htest.out" 2>&1; then suite_summary "$TMP/htest.out" "$t" "(umask 0002)";
+      else err "test failed (umask 0002): $t"; tail -5 "$TMP/htest.out"; fi ;;
+    *)
+      if run_suite "$t" >"$TMP/htest.out" 2>&1; then suite_summary "$TMP/htest.out" "$t";
+      else err "test failed: $t"; tail -5 "$TMP/htest.out"; fi ;;
+  esac
+done
+fi # phase_hook_tests
+
+# Static phase, part 2 (sections 5-7).
+if [ "$phase_static" = 1 ]; then
 # 5) skill + agent frontmatter (must start with --- and carry name: + description:)
 say "== frontmatter =="
 fm_check() { # <file> — nonzero on any finding so the caller's `&& say ok`
@@ -548,10 +674,16 @@ for f in claude/commands/*.md; do
 done
 
 # 6) hooks referenced by settings (base + overlay) must exist on disk
+# The character class admits `/` so subdirectory hooks (distill/pending-drain.sh,
+# skill-review/curator-bump.sh) are checked too — the old class silently dropped
+# them from REFS (#1476). Paths are compared relative to /root/.claude/hooks/, and
+# a `..` segment is an error rather than a silent skip.
 say "== referenced hooks exist =="
-mapfile -t REFS < <(jq -r '.. | .command? // empty' claude/settings.base.json claude/hooks/enforcement-overlay.json 2>/dev/null | grep -oE '/root/.claude/hooks/[A-Za-z0-9_.-]+\.sh' | sort -u)
+mapfile -t REFS < <(jq -r '.. | .command? // empty' claude/settings.base.json claude/hooks/enforcement-overlay.json 2>/dev/null | grep -oE '/root/.claude/hooks/[A-Za-z0-9_./-]+\.sh' | sort -u)
 for r in "${REFS[@]}"; do
-  base="claude/hooks/$(basename "$r")"
+  rel="${r#/root/.claude/hooks/}"
+  case "/$rel/" in */../*) err "settings hook reference escapes the hook tree: $r"; continue ;; esac
+  base="claude/hooks/$rel"
   if [ -f "$base" ]; then say "  ok $base"; else err "settings references missing hook: $r ($base)"; fi
 done
 
@@ -573,7 +705,7 @@ fi
 mapfile -t DEPLOYED < <(ccc_hook_tree_files "$ROOT")
 [ "${#DEPLOYED[@]}" -gt 0 ] || err "hook-tree walk found no deployable hooks under claude/hooks"
 for r in "${REFS[@]}"; do
-  hook="$(basename "$r")"
+  hook="${r#/root/.claude/hooks/}"  # relative form matches the walk's output (#1476)
   if printf '%s\n' "${DEPLOYED[@]}" | grep -Fxq -- "$hook"; then
     say "  ok setup.sh installs $hook"
   else
@@ -680,6 +812,7 @@ if [ -n "$OS" ]; then
      || [ -f "claude/output-styles/$OS.md" ]; then say "  ok outputStyle -> $OS";
   else err "settings outputStyle '$OS' has no matching claude/output-styles/*.md"; fi
 fi
+fi # phase_static, part 2
 
 say "===================="
 if [ "$fail" = "0" ]; then say "HARNESS VALIDATION: PASS"; else say "HARNESS VALIDATION: FAIL"; fi
