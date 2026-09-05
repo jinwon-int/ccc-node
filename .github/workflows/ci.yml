@@ -16,8 +16,18 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  validate-harness:
-    name: validate-harness
+  # #1482: `bash scripts/validate-harness.sh` ran 15m42s on main (run
+  # 33930573500) and was the sole critical path — 14m33s of it the sequential
+  # hook-test loop. It is now split three ways:
+  #   validate-harness-static   the non-test phases, once (CCC_HARNESS_PHASE=static)
+  #   validate-harness-shard    the hook-test runs, bin-packed across a 4-way
+  #                             matrix (CCC_HARNESS_SHARD=<i>/<n>; est. ~3.6 min each)
+  #   validate-harness          pure aggregator: fails unless BOTH legs succeeded
+  # The aggregator exists so the required-check context `validate-harness`
+  # (.github/required-checks.json, tests/test_ci_required_contexts.py) keeps
+  # its name and keeps gating main without a branch-protection change.
+  validate-harness-static:
+    name: validate-harness-static
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -47,12 +57,76 @@ jobs:
           done
           echo "apt failed/hung after 3 attempts" >&2
           exit 1
-      - name: Validate harness (JSON, shell syntax, shellcheck, hook tests, frontmatter)
+      - name: Validate harness — static phase (JSON, shell syntax, shellcheck, py_compile, registration guard, frontmatter)
         env:
           TMPDIR: ${{ runner.temp }}/ccc-tmp
+          CCC_HARNESS_PHASE: static
         run: |
           mkdir -p "$TMPDIR"
           bash scripts/validate-harness.sh
+
+  validate-harness-shard:
+    name: validate-harness-shard (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Shard assignment (which suites this leg runs)
+        env:
+          CCC_HARNESS_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+          CCC_HARNESS_LIST_ONLY: "1"
+        run: bash scripts/validate-harness.sh
+      - name: Install jq + shellcheck
+        # Same bounded apt install as validate-harness-static — see the
+        # rationale there (mirror stalls, 2026-08-19). Keep the two in sync.
+        env:
+          APT_OPTS: -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
+        run: |
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get $APT_OPTS update -qq \
+              && sudo timeout 240 apt-get $APT_OPTS install -y -qq jq shellcheck; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed or hung; retrying" >&2
+            sleep 5
+          done
+          echo "apt failed/hung after 3 attempts" >&2
+          exit 1
+      - name: Validate harness — hook tests (shard ${{ matrix.shard }} of ${{ strategy.job-total }})
+        env:
+          TMPDIR: ${{ runner.temp }}/ccc-tmp
+          CCC_HARNESS_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+        run: |
+          mkdir -p "$TMPDIR"
+          bash scripts/validate-harness.sh
+
+  validate-harness:
+    name: validate-harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [validate-harness-static, validate-harness-shard]
+    # Run even when a leg failed/was cancelled/was skipped, and fail unless
+    # every leg is `success` — a skipped or cancelled leg must NOT pass the
+    # required context (a matrix `result` is the aggregate over all legs).
+    if: always()
+    steps:
+      - name: Gate on every validate-harness leg
+        env:
+          STATIC_RESULT: ${{ needs.validate-harness-static.result }}
+          SHARD_RESULT: ${{ needs.validate-harness-shard.result }}
+        run: |
+          echo "validate-harness-static: $STATIC_RESULT"
+          echo "validate-harness-shard (all legs): $SHARD_RESULT"
+          if [ "$STATIC_RESULT" = success ] && [ "$SHARD_RESULT" = success ]; then
+            echo "validate-harness: PASS"
+          else
+            echo "validate-harness: FAIL (a leg did not succeed)" >&2
+            exit 1
+          fi
 
   python-lint:
     name: python-lint
