@@ -1,0 +1,77 @@
+name: deps-lock
+
+# #1483: weekly lock-pair regeneration. .github/requirements/bridge-ci.txt and
+# bridge/requirements.lock.txt are ONE lock pair derived from
+# bridge/pyproject.toml by scripts/ccc-deps-lock.sh (runtime lock constrained
+# to the CI lock). Dependabot cannot run that derivation and its groups do not
+# span directories, so its pip PRs (#1453-#1457, #1495) moved one lock only and
+# failed tests/test_runtime_deps_lock.py; pip version updates are therefore
+# disabled in .github/dependabot.yml and this workflow opens the one bot PR per
+# round instead. Step logic lives in scripts/ccc-deps-lock-pr.sh (tested by
+# scripts/ccc-deps-lock-pr.test.sh); this file only wires the runner.
+#
+# GitHub facts the design rests on: pushes/PRs made with GITHUB_TOKEN do not
+# trigger `pull_request`/`push` workflows, but `workflow_dispatch` does, so the
+# script dispatches ci.yml and codeql.yml on the bot branch and their check
+# runs attach to the head SHA under the required-context names. Repository
+# setting "Allow GitHub Actions to create and approve pull requests" must be ON
+# for `gh pr create` to succeed under GITHUB_TOKEN.
+#
+# Manual run (targeted):  gh workflow run deps-lock.yml -f upgrade="ruff==0.14.0 mypy"
+# Manual run (all):       gh workflow run deps-lock.yml
+
+on:
+  schedule:
+    # Mondays 04:17 UTC (13:17 KST) — quiet hour, before the workday.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      upgrade:
+        description: >-
+          Optional whitespace-separated packages that may move (pkg or
+          pkg==ver), each passed as --upgrade-package. Empty = plain --upgrade
+          (every pin bridge/pyproject.toml permits may move).
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+# Never run two regenerations at once (both would force-push the same branch);
+# a queued second run simply refreshes the branch after the first finishes.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  lock-pair:
+    name: lock-pair
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write       # push deps/lock-pair-<date>
+      pull-requests: write  # open/update/close the bot PR
+      actions: write        # gh workflow run ci.yml / codeql.yml --ref <branch>
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          persist-credentials: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # scripts/ccc-deps-lock.sh compiles the locks on CPython 3.11 only.
+          python-version: "3.11"
+      - name: Regenerate lock pair and open/update the bot PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CCC_DEPS_LOCK_PYTHON: python
+          CCC_DEPS_LOCK_PR_UPGRADE: ${{ inputs.upgrade }}
+          TMPDIR: ${{ runner.temp }}/ccc-tmp
+        run: |
+          mkdir -p "$TMPDIR"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python --version
+          bash scripts/ccc-deps-lock-pr.sh --base main
