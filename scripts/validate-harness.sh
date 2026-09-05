@@ -548,10 +548,16 @@ for f in claude/commands/*.md; do
 done
 
 # 6) hooks referenced by settings (base + overlay) must exist on disk
+# The character class admits `/` so subdirectory hooks (distill/pending-drain.sh,
+# skill-review/curator-bump.sh) are checked too — the old class silently dropped
+# them from REFS (#1476). Paths are compared relative to /root/.claude/hooks/, and
+# a `..` segment is an error rather than a silent skip.
 say "== referenced hooks exist =="
-mapfile -t REFS < <(jq -r '.. | .command? // empty' claude/settings.base.json claude/hooks/enforcement-overlay.json 2>/dev/null | grep -oE '/root/.claude/hooks/[A-Za-z0-9_.-]+\.sh' | sort -u)
+mapfile -t REFS < <(jq -r '.. | .command? // empty' claude/settings.base.json claude/hooks/enforcement-overlay.json 2>/dev/null | grep -oE '/root/.claude/hooks/[A-Za-z0-9_./-]+\.sh' | sort -u)
 for r in "${REFS[@]}"; do
-  base="claude/hooks/$(basename "$r")"
+  rel="${r#/root/.claude/hooks/}"
+  case "/$rel/" in */../*) err "settings hook reference escapes the hook tree: $r"; continue ;; esac
+  base="claude/hooks/$rel"
   if [ -f "$base" ]; then say "  ok $base"; else err "settings references missing hook: $r ($base)"; fi
 done
 
@@ -573,7 +579,7 @@ fi
 mapfile -t DEPLOYED < <(ccc_hook_tree_files "$ROOT")
 [ "${#DEPLOYED[@]}" -gt 0 ] || err "hook-tree walk found no deployable hooks under claude/hooks"
 for r in "${REFS[@]}"; do
-  hook="$(basename "$r")"
+  hook="${r#/root/.claude/hooks/}"  # relative form matches the walk's output (#1476)
   if printf '%s\n' "${DEPLOYED[@]}" | grep -Fxq -- "$hook"; then
     say "  ok setup.sh installs $hook"
   else
