@@ -18,6 +18,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import sys
 import uuid
 from typing import Any
 
@@ -93,6 +94,10 @@ _CODEX_INCOMPAT_RE = re.compile(
     r"(?:\bclaude\s+-p\b|~/\.claude\b|\bCLAUDE_[A-Z0-9_]+\b)"
 )
 _RENAME_NOREPLACE = 1
+# #1481 — process-local ledger diagnostics surfaced by main() in the command
+# report and on stderr. `torn_tail` counts unterminated trailing fragments a
+# read skipped; `torn_tail_repaired` counts fragments an append truncated.
+_LEDGER_DIAGNOSTICS: dict[str, int] = {"torn_tail": 0, "torn_tail_repaired": 0}
 
 
 class ContractError(RuntimeError):
@@ -192,7 +197,7 @@ def _provider_from_env() -> str:
     explicit = os.environ.get("CCC_SKILL_PROVIDER", "")
     if explicit in {"claude", "codex", "piri"}:
         return explicit
-    home = Path(os.environ.get("HOME", "/root"))
+    home = Path(os.environ["HOME"]) if os.environ.get("HOME") else Path.home()
     if (
         ("CODEX_HOME" in os.environ or (home / ".codex").is_dir())
         and not (home / ".claude").is_dir()
@@ -206,7 +211,7 @@ def _build_context(args: argparse.Namespace) -> Context:
     provider = args.provider or _provider_from_env()
     if provider not in {"claude", "codex", "piri"}:
         raise ContractError("invalid_provider")
-    home = Path(os.environ.get("HOME", "/root"))
+    home = Path(os.environ["HOME"]) if os.environ.get("HOME") else Path.home()
     claude_dir = Path(os.environ.get("CCC_CLAUDE_DIR", home / ".claude"))
     if args.skills_dir is not None:
         skills_dir = args.skills_dir
@@ -890,6 +895,43 @@ def _preflight_ledger(context: Context) -> None:
         raise ContractError("unsafe_ownership_ledger")
 
 
+def _torn_tail_offset(descriptor: int, size: int) -> int | None:
+    """Offset where an unterminated trailing fragment starts, or None if clean."""
+    if size <= 0 or os.pread(descriptor, 1, size - 1) == b"\n":
+        return None
+    end = size
+    while end > 0:
+        start = max(0, end - 65536)
+        cut = os.pread(descriptor, end - start, start).rfind(b"\n")
+        if cut >= 0:
+            return start + cut + 1
+        end = start
+    return 0
+
+
+def _repair_torn_tail(descriptor: int) -> None:
+    """#1481 — drop an unterminated trailing fragment before appending.
+
+    A crash mid-append can leave a partial last line. _read_ledger skips and
+    reports such a fragment, so it never counted as a row; merely newline-
+    terminating it would turn it into mid-file garbage that fails every later
+    read closed. The truncation is re-verified under an exclusive flock on the
+    ledger itself so two concurrent first appends cannot cut a fresh row.
+    """
+    if _torn_tail_offset(descriptor, os.fstat(descriptor).st_size) is None:
+        return
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    try:
+        offset = _torn_tail_offset(descriptor, os.fstat(descriptor).st_size)
+        if offset is None:
+            return
+        os.ftruncate(descriptor, offset)
+        os.fsync(descriptor)
+        _LEDGER_DIAGNOSTICS["torn_tail_repaired"] += 1
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
 def _append_ledger(context: Context, record: dict[str, Any]) -> None:
     _preflight_ledger(context)
     path = context.state_dir / _LEDGER_FILE
@@ -900,8 +942,10 @@ def _append_ledger(context: Context, record: dict[str, Any]) -> None:
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_DIRECTORY", 0)
     )
+    # O_RDWR (not O_WRONLY): the torn-tail repair needs pread/ftruncate on the
+    # same verified descriptor; O_APPEND still pins every write to the end.
     flags = (
-        os.O_WRONLY
+        os.O_RDWR
         | os.O_APPEND
         | os.O_CREAT
         | getattr(os, "O_CLOEXEC", 0)
@@ -931,8 +975,11 @@ def _append_ledger(context: Context, record: dict[str, Any]) -> None:
             )
         ):
             raise ContractError("unsafe_ownership_ledger")
+        _repair_torn_tail(descriptor)
         payload = _canonical_json(record)
         view = memoryview(payload)
+        # The whole newline-terminated row goes to one os.write; the loop only
+        # resumes after a short write, so a torn tail needs a crash mid-call.
         while view:
             written = os.write(descriptor, view)
             if written <= 0:
@@ -998,9 +1045,17 @@ def _read_ledger(context: Context) -> list[dict[str, Any]]:
             raise ContractError("ownership_ledger_changed")
     finally:
         os.close(descriptor)
+    # #1481 — every row is written newline-terminated, so bytes after the last
+    # "\n" are a crash-mid-append fragment: skip it, count it (main() reports
+    # ownership_ledger_torn_tail), and let the next append truncate it. Any
+    # other unparseable line (mid-file, or newline-terminated) still fails
+    # closed: that is corruption, not a torn write.
+    body, _newline, torn_tail = payload.rpartition(b"\n")
+    if torn_tail:
+        _LEDGER_DIAGNOSTICS["torn_tail"] = 1
     rows: list[dict[str, Any]] = []
     try:
-        for line in payload.decode("utf-8").splitlines():
+        for line in body.decode("utf-8").splitlines():
             if not line:
                 continue
             row = json.loads(line)
@@ -3734,20 +3789,34 @@ def _dispatch_command(
     return handler()
 
 
+def _report_ledger_diagnostics(result: dict[str, Any] | None) -> None:
+    """#1481 — surface torn-tail observations in the report and on stderr."""
+    for key, count in _LEDGER_DIAGNOSTICS.items():
+        if not count:
+            continue
+        if result is not None:
+            result[f"ownership_ledger_{key}"] = count
+        print(f"ownership_ledger_{key}={count}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         context = _build_context(args)
         result = _dispatch_command(context, args)
     except ContractError as error:
+        _report_ledger_diagnostics(None)
         print(json.dumps({"ok": False, "code": error.code}, sort_keys=True))
         return 2
     except OSError:
+        _report_ledger_diagnostics(None)
         print(json.dumps({"ok": False, "code": "filesystem_error"}, sort_keys=True))
         return 2
     except (TypeError, ValueError, RecursionError):
+        _report_ledger_diagnostics(None)
         print(json.dumps({"ok": False, "code": "invalid_data"}, sort_keys=True))
         return 2
+    _report_ledger_diagnostics(result)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     if args.command == "guard-proposal" and not result["allowed"]:
         return 3
