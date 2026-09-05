@@ -15,6 +15,7 @@ V1 계약:
   - V1 은 PR 생성까지. 머지는 사람이 한다.
 """
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -116,10 +117,36 @@ CAP_PER_RUN = 5         # 회당 세션 상한
 EXTRACT_FAIL_BUDGET = 3  # 같은 파일 스냅샷의 연속 추출 실패 상한 (#1297)
 
 
+def utc_ts():
+    """#1481 — UTC `ts` for audit/quarantine rows (was local TZ, so rows from
+    nodes in different zones did not sort). Same `%z` shape as before, so any
+    strptime/fromisoformat consumer keeps parsing; only the offset is +0000."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _atomic_write_text(path, text):
+    """#1481 — same-dir temp + fsync + os.replace so a reader never sees a torn
+    file. Local on purpose (the shared helper lane is a later PR)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def log_audit(rec):
     os.makedirs(os.path.dirname(AUDIT), exist_ok=True)
-    rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    with open(AUDIT, "a") as fh:
+    rec["ts"] = utc_ts()
+    with open(AUDIT, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
@@ -224,7 +251,8 @@ def merge_auto_md(path, node, chunk):
     """
     existing = ""
     if os.path.exists(path):
-        existing = open(path, errors="replace").read()
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            existing = fh.read()
     else:
         existing = AUTO_HEADER % {"node": node}
     have = set(re.findall(r"\*\*키\*\*: `([0-9a-f]{12})`", existing))
@@ -239,9 +267,8 @@ def merge_auto_md(path, node, chunk):
         kept_chunk.append(block)
         added += 1
     if kept_chunk:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w") as fh:
-            fh.write(existing.rstrip("\n") + "\n" + "".join(kept_chunk).rstrip("\n") + "\n")
+        _atomic_write_text(
+            path, existing.rstrip("\n") + "\n" + "".join(kept_chunk).rstrip("\n") + "\n")
     return added, skipped
 
 
@@ -254,8 +281,8 @@ def write_quarantine(path, rec):
     '정본 직행 금지 + unverified 격리'이지 삭제가 아니다.
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    with open(path, "a") as fh:
+    rec["ts"] = utc_ts()
+    with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
@@ -357,19 +384,36 @@ def is_self_call(path, max_bytes=8000):
 
 
 def load_watermark():
+    """Watermark or {}. Missing file → {} silently.
+
+    #1481 — a corrupt file used to be swallowed into {} too, which silently
+    re-extracted the whole --max-age-days window every run. Now it is moved
+    aside as `<name>.corrupt-<utcts>` (evidence kept, never re-read) and an
+    audit row is written before returning {}. Other OSErrors propagate.
+    """
     try:
-        with open(STATE) as fh:
-            return json.load(fh)
-    except Exception:
+        with open(STATE, encoding="utf-8") as fh:
+            wm = json.load(fh)
+        if not isinstance(wm, dict):
+            raise ValueError("watermark_not_object")
+        return wm
+    except FileNotFoundError:
+        return {}
+    except ValueError as e:  # JSONDecodeError / UnicodeDecodeError included
+        quarantine = "%s.corrupt-%s" % (
+            STATE, datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+        try:
+            os.replace(STATE, quarantine)
+        except OSError:
+            quarantine = None
+        log_audit({"event": "watermark_corrupt",
+                   "reason": extract_failure_reason(e),
+                   "quarantined": os.path.basename(quarantine) if quarantine else None})
         return {}
 
 
 def save_watermark(wm):
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    tmp = STATE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(wm, fh, ensure_ascii=False, indent=1)
-    os.replace(tmp, STATE)
+    _atomic_write_text(STATE, json.dumps(wm, ensure_ascii=False, indent=1))
 
 
 def extract_failure_reason(error):
@@ -1607,7 +1651,7 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
         # --render-dry-run 으로 연다 (그래도 Wiki 에는 반영되지 않는다).
         if (not args.dry_run) or args.render_dry_run:
             chunk = render_items(args.node, kept, quarantined, name,
-                                 time.strftime("%Y-%m-%d %H:%M %Z"))
+                                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
             if chunk:
                 added, skipped_dup = merge_auto_md(render_path, args.node, chunk)
                 rendered_add += added
