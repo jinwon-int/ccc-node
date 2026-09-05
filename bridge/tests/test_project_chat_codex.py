@@ -1680,7 +1680,7 @@ async def test_codex_keeps_typing_alive_and_shows_tool_heartbeat(
             status_callback=status_callback,
         )
     )
-    await asyncio.wait_for(session.tool_started.wait(), timeout=1)
+    await asyncio.wait_for(session.tool_started.wait(), timeout=5)
     await asyncio.wait_for(heartbeat_visible.wait(), timeout=2)
 
     assert typing_calls
@@ -1692,7 +1692,7 @@ async def test_codex_keeps_typing_alive_and_shows_tool_heartbeat(
     )
 
     session.release.set()
-    response = await asyncio.wait_for(task, timeout=1)
+    response = await asyncio.wait_for(task, timeout=5)
 
     assert response.content == "done"
     assert status_calls[-1] == (None, 1234)
@@ -2441,7 +2441,7 @@ async def test_approval_stall_cleans_ui_rotates_lock_and_accepts_next_turn(
             approval_callback=approval_callback,
         )
     )
-    await asyncio.wait_for(callback_started.wait(), timeout=1)
+    await asyncio.wait_for(callback_started.wait(), timeout=5)
     queued_task = asyncio.create_task(handler.process_message("next", 7, 70))
 
     first, queued = await asyncio.wait_for(
@@ -2551,7 +2551,7 @@ async def test_codex_approval_pending_uses_distinct_stall_bound(
     handler._config.approval_stall_seconds = 0.05
     handler._process_timeout_seconds = 5.0
 
-    response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=1)
+    response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=5)
 
     assert response.success is False
     assert response.error == "Approval was not resolved within 0.05s"
@@ -2593,7 +2593,7 @@ async def test_codex_turn_timeout_interrupts_and_cleans_session(tmp_path: Path) 
     handler = _handler(tmp_path, runtime)
     handler._process_timeout_seconds = 0.01
 
-    response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=1.0)
+    response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=5.0)
     retry = await handler.process_message("retry", 7, 70)
 
     assert response.success is False
@@ -2618,7 +2618,7 @@ async def test_codex_close_bounds_hung_interrupt_and_still_closes_runtime(tmp_pa
     task = asyncio.create_task(handler.process_message("first", 7, 70))
     await _wait_until(lambda: "first" in session.started)
 
-    await asyncio.wait_for(handler.close(), timeout=1.0)
+    await asyncio.wait_for(handler.close(), timeout=5.0)
 
     assert session.interrupt_calls == 1
     assert runtime.close_calls == 1

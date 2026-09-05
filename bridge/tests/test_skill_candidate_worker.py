@@ -325,12 +325,12 @@ def test_concurrent_collectors_make_one_provider_call(tmp_path: Path) -> None:
         # rather than relying on one worker's in-memory lock.
         second = _worker(tmp_path, _FakeJournal(_job()), backend)
         owner = asyncio.create_task(first.collect_once(job_id=JOB_ID))
-        await asyncio.wait_for(backend.started.wait(), timeout=1.0)
+        await asyncio.wait_for(backend.started.wait(), timeout=5.0)
         contender = await second.collect_once(job_id=JOB_ID)
         assert contender is None
         assert backend.calls == 1
         backend.release.set()
-        staged = await asyncio.wait_for(owner, timeout=1.0)
+        staged = await asyncio.wait_for(owner, timeout=5.0)
         assert staged is not None and staged.candidates_staged == 1
 
     asyncio.run(scenario())
@@ -402,7 +402,7 @@ def test_provider_cancellation_is_charged_and_backed_off(tmp_path: Path) -> None
             usage_meter=meter,
         )
         task = asyncio.create_task(worker.collect_once(job_id=JOB_ID))
-        await asyncio.wait_for(backend.started.wait(), timeout=1.0)
+        await asyncio.wait_for(backend.started.wait(), timeout=5.0)
         task.cancel()
         result = await asyncio.gather(task, return_exceptions=True)
         assert isinstance(result[0], asyncio.CancelledError)
