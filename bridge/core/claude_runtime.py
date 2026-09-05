@@ -306,6 +306,18 @@ class ClaudeRuntime(ClaudeSessionBrowserMixin, ClaudeRuntimeOptionsMixin):
             self._sessions.remove(session)
         except ValueError:
             pass
+        # Prune the per-id lock so ``/new`` churn cannot grow the map forever
+        # (#1479). A held lock (a turn still admitted on it) or one shared
+        # with another live session of the same id is left for a later forget.
+        session_id = session._session_id
+        if session_id is None:
+            return
+        lock = self._session_locks.get(session_id)
+        if lock is None or lock.locked():
+            return
+        if any(other._session_id == session_id for other in self._sessions):
+            return
+        self._session_locks.pop(session_id, None)
 
     # -- AgentRuntime protocol ---------------------------------------------
 

@@ -224,6 +224,10 @@ class ProjectChatHandler(
         self._async_completion_sender: Any = None
         self._async_completion_delivery: Optional[AsyncCompletionDeliveryCoordinator] = None
         self._async_completion_reclaimer: Optional[AsyncCompletionReclaimer] = None
+        # Strong references to in-flight delivery tasks: the loop keeps only
+        # weak references, so an untracked task may be collected mid-flight
+        # (#1479). Deliberately never cancelled — the journal owns recovery.
+        self._async_completion_tasks: set[asyncio.Task[None]] = set()
         try:
             self._async_completion_journal = AsyncCompletionJournal(
                 self.project_root / ".telegram_bot" / "async-completions"
@@ -631,11 +635,13 @@ class ProjectChatHandler(
                 "delivery skipped and record kept queued"
             )
             return
-        loop.create_task(
+        task = loop.create_task(
             self._deliver_durable_codex_completion(
                 journal, coordinator, event, user_id, chat_id, text
             )
         )
+        self._async_completion_tasks.add(task)
+        task.add_done_callback(self._async_completion_tasks.discard)
 
     async def _deliver_durable_codex_completion(
         self,

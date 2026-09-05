@@ -272,6 +272,9 @@ class WebhookNudgeServer:
         )
         self._sock: Optional[socket.socket] = None
         self._accept_task: Optional[asyncio.Task] = None
+        # Strong references to per-connection tasks so the loop's weak task
+        # references cannot let one be garbage-collected mid-flight (#1479).
+        self._connection_tasks: set[asyncio.Task[None]] = set()
         self._closing = False
         self._window_start = 0.0
         self._window_count = 0
@@ -337,6 +340,10 @@ class WebhookNudgeServer:
                 pass
             except Exception:
                 logger.exception("Webhook nudge accept loop raised on shutdown")
+        for conn_task in tuple(self._connection_tasks):
+            conn_task.cancel()
+        if self._connection_tasks:
+            await asyncio.gather(*self._connection_tasks, return_exceptions=True)
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -405,7 +412,12 @@ class WebhookNudgeServer:
             except OSError:
                 conn.close()
                 continue
-            asyncio.create_task(self._serve_accepted(conn))
+            self._spawn_serve(conn)
+
+    def _spawn_serve(self, conn: socket.socket) -> None:
+        task = asyncio.create_task(self._serve_accepted(conn))
+        self._connection_tasks.add(task)
+        task.add_done_callback(self._connection_tasks.discard)
 
     async def _serve_accepted(self, conn: socket.socket) -> None:
         loop = asyncio.get_running_loop()
