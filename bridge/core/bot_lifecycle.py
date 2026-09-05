@@ -19,6 +19,12 @@ from telegram.request import BaseRequest, HTTPXRequest
 from telegram_bot.core import crash_policy, media
 from telegram_bot.core import restart_handoff
 from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control
+from telegram_bot.core.bot_ports import (
+    BotConfigPort,
+    ClockPort,
+    ProjectChatPort,
+    SessionManagerPort,
+)
 from telegram_bot.core.tool_policy import (
     EXECUTION_OWNER_OPERATOR,
     effective_bash_policy,
@@ -66,56 +72,6 @@ from telegram_bot.utils.orphan_reaper import (
 logger = logging.getLogger(__name__)
 
 
-class _LifecycleConfig(Protocol):
-    @property
-    def bot_data_dir(self) -> FilePath: ...
-
-    @property
-    def telegram_bot_token(self) -> str: ...
-
-    @property
-    def claude_cli_path(self) -> Optional[FilePath]: ...
-
-    @property
-    def piri_cli_path(self) -> str: ...
-
-
-class _LifecycleSessionManager(Protocol):
-    def validate_storage_path(self) -> None: ...
-
-    def initialize(self) -> None: ...
-
-    async def get_session(self, user_id: int) -> dict[str, Any]: ...
-
-
-class _LifecycleProjectChat(Protocol):
-    @property
-    def conversations_dir(self) -> FilePath: ...
-
-    @property
-    def usage_meter(self) -> Any | None: ...
-
-    async def process_message(
-        self, user_message: str, user_id: int, chat_id: int, **kwargs: Any
-    ) -> Any: ...
-
-    def workload_snapshot(self, now: float) -> tuple[int, float]: ...
-
-    def foreground_workload_snapshot(self, now: float) -> tuple[int, float]: ...
-
-    def begin_drain(self) -> bool: ...
-
-    def waiting_for_turn_snapshot(self) -> int: ...
-
-    async def enforce_session_resource_limits(
-        self, *, now: float | None = None
-    ) -> dict[str, int | float]: ...
-
-    def set_async_completion_sender(self, sender: Any) -> None: ...
-
-    async def close(self) -> None: ...
-
-
 class _LifecycleDistillJournal(Protocol):
     def validate_path(self) -> None: ...
 
@@ -133,10 +89,6 @@ class _LifecyclePushNotifier(Protocol):
     async def run(
         self, application: Application, stop_event: asyncio.Event
     ) -> None: ...
-
-
-class _LifecycleClock(Protocol):
-    def time(self) -> float: ...
 
 
 class _DistillSnapshotWorker(Protocol):
@@ -216,9 +168,9 @@ class _DeliverMarkdown(Protocol):
 
 
 class BotLifecycleMixin:
-    _config: _LifecycleConfig
-    _session_manager: _LifecycleSessionManager
-    _project_chat: _LifecycleProjectChat
+    _config: BotConfigPort
+    _session_manager: SessionManagerPort
+    _project_chat: ProjectChatPort
     _distill_journal: _LifecycleDistillJournal
     _distill_snapshot_worker: _DistillSnapshotWorker
     _distill_extraction_worker: _DistillExtractionWorker
@@ -226,7 +178,7 @@ class BotLifecycleMixin:
     _distill_wiki_sink_worker: _DistillWikiSinkWorker
     _skill_candidate_collector_worker: _SkillCandidateCollectorWorker
     _push_notifier: _LifecyclePushNotifier
-    _clock: _LifecycleClock
+    _clock: ClockPort
     _audio_dir: FilePath
     _image_dir: FilePath
     _document_dir: FilePath

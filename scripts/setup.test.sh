@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# harness: umask-rerun
 # Tests for setup.sh backup safety.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

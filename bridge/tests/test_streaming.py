@@ -22,6 +22,17 @@ config_module.config = SimpleNamespace(
 )
 sys.modules["telegram_bot.utils.config"] = config_module
 
+
+def _settings_with_bubble(max_bubble_chars: int) -> SimpleNamespace:
+    """Stub settings that pin the per-bubble size explicitly (the stub default
+    otherwise follows the Settings Field default, 1200)."""
+    return SimpleNamespace(
+        draft_update_min_chars=config_module.config.draft_update_min_chars,
+        draft_update_interval=config_module.config.draft_update_interval,
+        enable_streaming_tool_calls=config_module.config.enable_streaming_tool_calls,
+        telegram_max_bubble_chars=max_bubble_chars,
+    )
+
 from telegram_bot.core.streaming import StreamingMessageHandler
 from telegram_bot.utils import tg_entities
 
@@ -213,7 +224,9 @@ class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
         sequential round-trips that also tripped Telegram's edit flood limit).
         """
         bot = _BotRecorder()
-        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        handler = StreamingMessageHandler(
+            bot=bot, chat_id=42, user_id=7, settings=_settings_with_bubble(4000)
+        )
 
         await handler.update_if_needed("x" * 1500)  # ~10 slices under old code
 
@@ -268,17 +281,20 @@ class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertLessEqual(split, len(prefix) + len("\n\n"))
 
-    async def test_default_bubble_size_falls_back_to_4000(self):
+    async def test_default_bubble_size_falls_back_to_field_default(self):
         bot = _BotRecorder()
         handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
-        # Test config stub has no telegram_max_bubble_chars -> safe default.
-        self.assertEqual(handler.max_bubble_chars, 4000)
+        # Test config stub has no telegram_max_bubble_chars -> the fallback
+        # must match the Settings Field default (1200), not a private literal.
+        self.assertEqual(handler.max_bubble_chars, 1200)
 
     async def test_large_block_api_calls_scale_with_drafts_not_length(self):
         """A multi-draft block splits by the 4000-char limit, and the number of
         Telegram API calls tracks the draft count — not the text length."""
         bot = _BotRecorder()
-        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        handler = StreamingMessageHandler(
+            bot=bot, chat_id=42, user_id=7, settings=_settings_with_bubble(4000)
+        )
 
         await handler.update_if_needed("x" * 9000)  # ~60 slices under old code
 

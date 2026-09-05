@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# harness: umask-rerun
 # Tests for skill-review/autoinstall.sh (#355) — hermetic, deterministic,
 # no provider/network calls (the gates are pure shell/jq).
 set -uo pipefail
