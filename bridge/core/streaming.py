@@ -52,10 +52,14 @@ class StreamingMessageHandler:
         # Max characters per Telegram message ("bubble"). Long replies overflow
         # into a new draft at this size during streaming so no single bubble is
         # overwhelming. Clamped to the Telegram hard limit as a safety bound.
+        # The getattr fallback exists only for test config stubs that omit the
+        # field; it must equal the ``telegram_max_bubble_chars`` Field default
+        # in utils/config.py (1200) so the documented default is not silently
+        # re-declared here (#1484).
         self.max_bubble_chars = max(
             200,
             min(
-                int(getattr(runtime_config, "telegram_max_bubble_chars", 4000)),
+                int(getattr(runtime_config, "telegram_max_bubble_chars", 1200)),
                 tg_md.TELEGRAM_LIMIT,
             ),
         )
