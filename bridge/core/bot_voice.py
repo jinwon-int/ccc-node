@@ -5,7 +5,7 @@ import os
 import platform
 import time
 from pathlib import Path as FilePath
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from telegram import (
     Chat,
@@ -20,6 +20,12 @@ from telegram.ext import (
 )
 from telegram_bot.core import media
 from telegram_bot.core.bot_shared import build_reply_context_prefix
+from telegram_bot.core.bot_ports import (
+    BotConfigPort,
+    EnqueueUserTaskFn,
+    ProcessUserMessageTextFn,
+    ReplySmartFn,
+)
 from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.transcription import (
@@ -35,128 +41,8 @@ logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 
-
-class _VoiceConfig(Protocol):
-    @property
-    def transcription_provider(self) -> str: ...
-
-    @property
-    def openai_api_key(self) -> str | None: ...
-
-    @property
-    def openai_base_url(self) -> str | None: ...
-
-    @property
-    def whisper_model(self) -> str: ...
-
-    @property
-    def max_voice_duration(self) -> int: ...
-
-    @property
-    def ffmpeg_path(self) -> str | None: ...
-
-    @property
-    def voice_reply_persona(self) -> str: ...
-
-    @property
-    def volcengine_app_id(self) -> str | None: ...
-
-    @property
-    def volcengine_token(self) -> str | None: ...
-
-    @property
-    def volcengine_access_key(self) -> str | None: ...
-
-    @property
-    def volcengine_secret_access_key(self) -> str | None: ...
-
-    @property
-    def volcengine_tos_bucket_name(self) -> str | None: ...
-
-    @property
-    def volcengine_tos_endpoint(self) -> str: ...
-
-    @property
-    def volcengine_tos_region(self) -> str: ...
-
-    @property
-    def volcengine_tos_signed_url_ttl_seconds(self) -> int: ...
-
-    @property
-    def volcengine_cluster(self) -> str: ...
-
-    @property
-    def volcengine_resource_id(self) -> str: ...
-
-    @property
-    def volcengine_model_name(self) -> str: ...
-
-    @property
-    def volcengine_submit_endpoint(self) -> str: ...
-
-    @property
-    def volcengine_query_endpoint(self) -> str: ...
-
-    @property
-    def volcengine_timeout_seconds(self) -> float: ...
-
-    @property
-    def volcengine_max_retries(self) -> int: ...
-
-    @property
-    def volcengine_initial_backoff(self) -> float: ...
-
-    @property
-    def volcengine_poll_interval_seconds(self) -> float: ...
-
-    @property
-    def volcengine_max_poll_seconds(self) -> float: ...
-
-    @property
-    def telegram_bot_token(self) -> str: ...
-
-    @property
-    def enable_option_buttons(self) -> bool: ...
-
-    @property
-    def max_document_size_mb(self) -> int: ...
-
-    @property
-    def image_context_guard(self) -> bool: ...
-
-    @property
-    def telegram_max_image_bytes(self) -> int: ...
-
-    @property
-    def telegram_max_image_pixels(self) -> int: ...
-
-
-class _ProcessUserMessageText(Protocol):
-    def __call__(
-        self,
-        update: Update,
-        user_id: int,
-        text: str,
-        message_source: str = "text",
-        voice_input_preview: Optional[str] = None,
-        sensitive_log_event: Optional[str] = None,
-    ) -> Awaitable[None]: ...
-
-
-class _ReplySmart(Protocol):
-    def __call__(
-        self,
-        message: Message,
-        content: str,
-        parse_mode: str = "Markdown",
-        force_options: bool = False,
-        streamed: bool = False,
-        user_id: Optional[int] = None,
-    ) -> Awaitable[None]: ...
-
-
 class BotVoiceMixin:
-    _config: _VoiceConfig
+    _config: BotConfigPort
     _user_voice_tasks: Dict[Any, set[asyncio.Task[Any]]]
     _audio_processor: AudioProcessor
     _audio_dir: FilePath
@@ -177,7 +63,7 @@ class BotVoiceMixin:
         [List[str]],
         Optional[InlineKeyboardMarkup],
     ]
-    _reply_smart: _ReplySmart
+    _reply_smart: ReplySmartFn
     _require_application: Callable[
         [],
         Application[Any, Any, Any, Any, Any, Any],
@@ -188,15 +74,8 @@ class BotVoiceMixin:
     _require_chat: Callable[[Update], Chat]
     _conversation_key: Callable[[int, int | None], Any]
     _own_bot_id: Callable[[], int | None]
-    _process_user_message_text: _ProcessUserMessageText
-    _enqueue_user_task: Callable[
-        [
-            int,
-            Callable[[], Awaitable[None]],
-            Callable[[], Awaitable[None]],
-        ],
-        Awaitable[bool],
-    ]
+    _process_user_message_text: ProcessUserMessageTextFn
+    _enqueue_user_task: EnqueueUserTaskFn
     _MAX_INFLIGHT_MESSAGES: int
 
     # Lazily constructed voice collaborators (initialized to None by the
@@ -207,7 +86,7 @@ class BotVoiceMixin:
     _volcengine_tos_uploader: Optional[VolcengineTOSUploader]
     _tts_synthesizer: Optional[MacOSTtsSynthesizer]
 
-    def _voice_config(self) -> _VoiceConfig:
+    def _voice_config(self) -> BotConfigPort:
         return self._config
 
     def _prune_voice_tasks(self, key: Any) -> set[asyncio.Task]:
