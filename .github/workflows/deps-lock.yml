@@ -52,7 +52,9 @@ jobs:
     permissions:
       contents: write       # push deps/lock-pair-<date>
       pull-requests: write  # open/update/close the bot PR
-      actions: write        # gh workflow run ci.yml / codeql.yml --ref <branch>
+      actions: write        # gh workflow run ci.yml / codeql.yml --ref <branch>;
+                            # also POST /actions/runs/<id>/approve for the PR's
+                            # own action_required pull_request runs (#1483)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
