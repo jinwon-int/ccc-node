@@ -284,5 +284,81 @@ env CCC_STATE_DIR="$STATE5" CLAUDE_PROJECTS_DIR="$TMP/projects5" CCC_PUSH_SPOOL=
   CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode bash "$AUTOSAVE" run
 ok "missing sessions tree is a clean skip" 'grep -q "codex skipped reason=no-sessions-tree" "$STATE5/skill-autosave.log"'
 
+# 8d) opt-in on a node without codex sessions is a clean no-op.
+STATE5="$TMP/state5"; mkdir -p "$STATE5"; chmod 700 "$STATE5"
+printf '1\n' > "$STATE5/skill-autosave.codex-drafting"
+env CCC_STATE_DIR="$STATE5" CLAUDE_PROJECTS_DIR="$TMP/projects5" CCC_PUSH_SPOOL="$TMP/spool5" \
+  CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+  CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion5.touched" \
+  CCC_SKILL_CODEX_NORMALIZE_CMD="$HERE/codex-rollout-normalize.py" \
+  CODEX_HOME="$TMP/no-codex-home" CLAUDE_SKILLS_DIR="$TMP/skills5" \
+  CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode bash "$AUTOSAVE" run
+ok "missing sessions tree is a clean skip" 'grep -q "codex skipped reason=no-sessions-tree" "$STATE5/skill-autosave.log"'
+
+# --- 9) piri drafting branch (opt-in, default off; mirrors the codex branch) --
+# Sessions are projected by the REAL piri-session-normalize.py (no stub — the
+# mapping is the contract), then dispatched through the SAME real skill-review.sh
+# with CCC_SKILL_PROVIDER=piri and the normalized tree as CLAUDE_PROJECTS_DIR.
+PIRI_HOME4="$TMP/piri-agent"
+PIRI_SESS="$PIRI_HOME4/sessions/-home-gongmyoung--"
+mkdir -p "$PIRI_SESS"
+cat > "$PIRI_SESS/2026-09-05T09-00-00-1111-2222.jsonl" <<'EOF'
+{"type":"session","version":3,"id":"pirisess-1","timestamp":"2026-09-05T09:00:00.000Z","cwd":"/home/gongmyoung"}
+{"type":"message","id":"u1","timestamp":"2026-09-05T09:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"백업 상태 확인해줘"}]}}
+{"type":"message","id":"a1","timestamp":"2026-09-05T09:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","text":"noise"}]}}
+{"type":"message","id":"a2","timestamp":"2026-09-05T09:00:03.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"ls -la /var/backups | head"}}]}}
+{"type":"message","id":"a3","timestamp":"2026-09-05T09:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"백업 정상입니다"}]}}
+EOF
+
+run9() { # <extra env...>
+  env "$@" CCC_STATE_DIR="$STATE9" CLAUDE_PROJECTS_DIR="$PROJECTS9" CCC_PUSH_SPOOL="$SPOOL9" \
+    CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+    CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion9.touched" \
+    CCC_SKILL_PIRI_NORMALIZE_CMD="$HERE/piri-session-normalize.py" \
+    PIRI_CODING_AGENT_DIR="$PIRI_HOME4" CLAUDE_SKILLS_DIR="$TMP/skills9" \
+    CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode \
+    bash "$AUTOSAVE" run
+}
+STATE9="$TMP/state9"; PROJECTS9="$TMP/projects9"; SPOOL9="$TMP/spool9"
+mkdir -p "$STATE9" "$PROJECTS9"
+chmod 700 "$STATE9"
+
+# 9a) default OFF: the sessions tree is not even walked.
+run9
+ok "piri branch default off logs not-enabled" 'grep -q "piri skipped reason=not-enabled" "$STATE9/skill-autosave.log"'
+ok "default off walks no piri sessions (no normalized tree)" '[ ! -d "$STATE9/piri-normalized" ]'
+
+# 9b) opt-in via state file: projection + dispatch + shared-state ledger.
+printf '1\n' > "$STATE9/skill-autosave.piri-drafting"
+run9
+proj9="$STATE9/piri-normalized/-home-gongmyoung/pirisess-1.jsonl"
+ok "opt-in projects the piri session into the branch-local tree" '[ -f "$proj9" ]'
+ok "projection lands in the Claude shape (Bash tool_use)" \
+  'grep -q "\"type\": \"tool_use\", \"name\": \"Bash\"" "$proj9" && grep -q "ls -la /var/backups" "$proj9"'
+ok "thinking noise is not projected" '! grep -q "noise" "$proj9"'
+ok "piri dispatch through real skill-review logged ok" 'grep -q "piri review ok session=2026-09-05T09-00-00-1111-2222" "$STATE9/skill-autosave.log"'
+piri_ledgered=0
+while IFS=$'\t' read -r key _rest; do
+  [ "$key" = "2026-09-05T09-00-00-1111-2222" ] && piri_ledgered=1
+done < "$STATE9/skill-autosave.piri-seen"
+ok "piri sweep summary counted one draft" '[ "$piri_ledgered" = 1 ]'
+
+# 9c) rerun without growth: regrowth ledger prevents re-normalization/re-draft.
+log_before9="$(grep -c "piri review ok" "$STATE9/skill-autosave.log")"
+run9
+log_after9="$(grep -c "piri review ok" "$STATE9/skill-autosave.log")"
+ok "unchanged piri session not re-drafted" '[ "$log_after9" = "$log_before9" ]'
+
+# 9d) opt-in on a node without piri sessions is a clean no-op.
+STATE10="$TMP/state10"; mkdir -p "$STATE10"; chmod 700 "$STATE10"
+printf '1\n' > "$STATE10/skill-autosave.piri-drafting"
+env CCC_STATE_DIR="$STATE10" CLAUDE_PROJECTS_DIR="$TMP/projects10" CCC_PUSH_SPOOL="$TMP/spool10" \
+  CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+  CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion10.touched" \
+  CCC_SKILL_PIRI_NORMALIZE_CMD="$HERE/piri-session-normalize.py" \
+  PIRI_CODING_AGENT_DIR="$TMP/no-piri-home" CLAUDE_SKILLS_DIR="$TMP/skills10" \
+  CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode bash "$AUTOSAVE" run
+ok "missing piri sessions tree is a clean skip" 'grep -q "piri skipped reason=no-sessions-tree" "$STATE10/skill-autosave.log"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
