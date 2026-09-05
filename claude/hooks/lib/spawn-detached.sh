@@ -38,9 +38,11 @@ spawn_detached() {
     else
       setsid bash "$script" "$@" </dev/null >/dev/null 2>&1 &
     fi
+    # shellcheck disable=SC2034  # result variable read by the sourcing caller (header)
     SPAWN_DETACHED_MODE=setsid
   else
     ( "$fallback_fn" "$@" ) </dev/null >/dev/null 2>&1 &
+    # shellcheck disable=SC2034  # result variable read by the sourcing caller (header)
     SPAWN_DETACHED_MODE=subshell
   fi
 

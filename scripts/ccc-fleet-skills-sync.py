@@ -25,7 +25,7 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SUPPORT_DIRS = {"references", "scripts", "templates"}
-AUDIENCES = {"shared", "claude", "codex"}
+AUDIENCES = {"shared", "claude", "codex", "piri"}
 MAX_FILES = 16
 MAX_FILE_BYTES = 64 * 1024
 MAX_TOTAL_BYTES = 256 * 1024
@@ -65,6 +65,7 @@ class Config:
     ref: str
     claude_root: Path
     codex_root: Path
+    piri_root: Path
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,12 @@ def config(args: argparse.Namespace) -> Config:
             os.environ.get(
                 "CCC_FLEET_SKILLS_CODEX_DIR",
                 Path(os.environ.get("CODEX_HOME", home / ".codex")) / "skills",
+            )
+        ).absolute(),
+        piri_root=Path(
+            os.environ.get(
+                "CCC_FLEET_SKILLS_PIRI_DIR",
+                home / ".piri" / "agent" / "skills",
             )
         ).absolute(),
     )
@@ -553,15 +560,18 @@ def repo_managed_marker(path: Path) -> dict[str, Any] | None:
     return value
 
 
-def repo_managed_names(cfg: Config) -> set[str]:
+def repo_managed_names(cfg: Config, manifest: Path | None = None) -> set[str]:
     """Skill names the repo layer currently owns via setup.sh's manifest.
 
     setup.sh tracks its Claude-side repo skills in
     ``<claude-dir>/state/repo-skills.manifest`` (no per-directory marker), so
-    manifest membership is the ownership signal there. A missing manifest
-    simply means the repo layer owns nothing — the fail-safe direction.
+    manifest membership is the ownership signal there. The Piri layer keeps
+    the same manifest discipline at ``<piri-agent-dir>/state/``. A missing
+    manifest simply means the repo layer owns nothing — the fail-safe
+    direction.
     """
-    manifest = cfg.claude_root.parent / "state" / "repo-skills.manifest"
+    if manifest is None:
+        manifest = cfg.claude_root.parent / "state" / "repo-skills.manifest"
     try:
         text = manifest.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -582,20 +592,41 @@ def is_repo_managed(cfg: Config, provider: str, target: Path, name: str) -> bool
     Precedence contract (#1344): repo-managed(setup) > fleet-approved(sync)
     > autosave-owned > user-owned. The repo layer signals ownership through
     the Codex provisioner marker (codex root) or the setup manifest (claude
-    root); fleet-sync must skip, never fight it.
+    and piri roots); fleet-sync must skip, never fight it.
     """
     if provider == "claude":
         return name in repo_managed_names(cfg)
+    if provider == "piri":
+        return name in repo_managed_names(
+            cfg, cfg.piri_root.parent / "state" / "repo-skills.manifest"
+        )
     return repo_managed_marker(target) is not None
 
 
-def operations(cfg: Config, skills: list[ApprovedSkill], *, create_roots: bool) -> list[Operation]:
+def provider_roots(cfg: Config) -> dict[str, Path]:
+    """Install roots this node consumes, keyed by provider.
+
+    Piri rides along only on nodes where the Piri agent skills root already
+    exists — the same "only nodes that already run Piri" gate setup.sh uses
+    for its piri skills install (setup mkdir -p's the root itself), so
+    non-Piri nodes are never touched and plan never creates directories.
+    """
     roots = {"claude": cfg.claude_root, "codex": cfg.codex_root}
+    if cfg.piri_root.is_dir() and not cfg.piri_root.is_symlink():
+        roots["piri"] = cfg.piri_root
+    return roots
+
+
+def operations(cfg: Config, skills: list[ApprovedSkill], *, create_roots: bool) -> list[Operation]:
+    roots = provider_roots(cfg)
     for root in roots.values():
         safe_root(root, create=create_roots)
     rows: list[Operation] = []
     for skill in skills:
-        providers = ("claude", "codex") if skill.audience == "shared" else (skill.audience,)
+        providers = tuple(roots) if skill.audience == "shared" else (skill.audience,)
+        # An audience whose root this node does not consume (e.g. approved/piri/
+        # on a non-Piri node) is simply not planned here.
+        providers = tuple(provider for provider in providers if provider in roots)
         for provider in providers:
             target = roots[provider] / skill.name
             if target.exists() or target.is_symlink():
@@ -628,12 +659,12 @@ def retirements(cfg: Config, skills: list[ApprovedSkill]) -> list[Retirement]:
     is itself drift: it keeps the directory and is reported, not fatal —
     reconcile never deletes on ambiguous ownership.
     """
-    planned: dict[str, set[str]] = {"claude": set(), "codex": set()}
+    planned: dict[str, set[str]] = {"claude": set(), "codex": set(), "piri": set()}
     for skill in skills:
-        providers = ("claude", "codex") if skill.audience == "shared" else (skill.audience,)
+        providers = tuple(provider_roots(cfg)) if skill.audience == "shared" else (skill.audience,)
         for provider in providers:
             planned[provider].add(skill.name)
-    roots = {"claude": cfg.claude_root, "codex": cfg.codex_root}
+    roots = provider_roots(cfg)
     rows: list[Retirement] = []
     for provider, root in roots.items():
         if not root.is_dir() or root.is_symlink():

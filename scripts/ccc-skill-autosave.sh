@@ -275,6 +275,94 @@ else
     log "codex sweep done drafted_sessions=$codex_drafted"
   fi
 
+  # --- 2b) piri branch (opt-in, mirrors the #1353 codex branch) ---------------
+  # Piri (pi) sessions live in $PIRI_CODING_AGENT_DIR/sessions/**/*.jsonl with a
+  # different record shape, so the drafting brain above never sees them. When
+  # opted in, each session is projected into the Claude transcript shape
+  # (piri-session-normalize.py) into a branch-local tree, then pushed through
+  # the SAME skill-review.sh pipeline with CCC_SKILL_PROVIDER=piri — provider.sh
+  # then routes installs to the piri skills dir, promotion staging reads the
+  # branch provider from .autosave-meta.json, and scan.sh reuses the normalized
+  # tree via CLAUDE_PROJECTS_DIR — all unchanged downstream.
+  # Default OFF (CCC_SKILL_PIRI_DRAFTING=1, or state file
+  # skill-autosave.piri-drafting): nodes without the flag pay nothing — the
+  # sessions tree is not even walked.
+  piri_drafted=0
+  piri_opt_in="${CCC_SKILL_PIRI_DRAFTING:-}"
+  if [ -z "$piri_opt_in" ] && [ -f "$STATE_DIR/skill-autosave.piri-drafting" ]; then
+    piri_opt_in=1
+  fi
+  piri_home="${PIRI_CODING_AGENT_DIR:-${HOME:-/root}/.piri/agent}"
+  piri_normalizer="${CCC_SKILL_PIRI_NORMALIZE_CMD:-}"
+  if [ -z "$piri_normalizer" ]; then
+    for _piri_norm in "$CLAUDE_DIR/hooks/piri-session-normalize.py" \
+                       "$AUTOSAVE_SELF_DIR/piri-session-normalize.py" \
+                       "$AUTOSAVE_SELF_DIR/../scripts/piri-session-normalize.py"; do
+      [ -f "$_piri_norm" ] && { piri_normalizer="$_piri_norm"; break; }
+    done
+    unset _piri_norm
+  fi
+  if [ "$piri_opt_in" != "1" ]; then
+    log "piri skipped reason=not-enabled"
+  elif [ ! -f "$piri_normalizer" ]; then
+    log "piri skipped reason=no-normalizer"
+  elif [ ! -d "$piri_home/sessions" ]; then
+    log "piri skipped reason=no-sessions-tree path=$piri_home/sessions"
+  else
+    piri_tree="$STATE_DIR/piri-normalized"
+    piri_ledger="$STATE_DIR/skill-autosave.piri-seen"
+    mkdir -p "$piri_tree" 2>/dev/null
+    touch "$piri_ledger" 2>/dev/null
+    piri_record_ledger() {
+      local tmp="$piri_ledger.tmp.$$"
+      { awk -F'\t' -v s="$1" '$1!=s' "$piri_ledger" 2>/dev/null;
+        printf '%s\t%s\t%s\n' "$1" "$(ts)" "$2"; } > "$tmp" 2>/dev/null \
+        && mv "$tmp" "$piri_ledger" 2>/dev/null
+    }
+    while IFS= read -r session; do
+      [ "$piri_drafted" -ge "$MAX_SESSIONS" ] && break
+      [ -f "$session" ] || continue
+      sid="$(basename "$session" .jsonl)"
+      size="$(wc -c < "$session" 2>/dev/null | tr -d '[:space:]')"
+      case "$size" in ''|*[!0-9]*) size=0 ;; esac
+      last_size="$(awk -F'\t' -v s="$sid" '$1==s {sz=$3} END {print sz+0}' "$piri_ledger" 2>/dev/null)"
+      case "$last_size" in ''|*[!0-9]*) last_size=0 ;; esac
+      if [ "$last_size" -gt 0 ] && [ $((size - last_size)) -lt "$REGROWTH_BYTES" ]; then
+        continue
+      fi
+      summary="$(python3 "$piri_normalizer" "$session" --out-dir "$piri_tree" 2>>"$LOG")" || {
+        log "piri normalize failed session=$sid (non-fatal)"
+        continue
+      }
+      empty="$(printf '%s' "$summary" | jq -r '.empty // false' 2>/dev/null)"
+      out_path="$(printf '%s' "$summary" | jq -r '.out_path // empty' 2>/dev/null)"
+      if [ "$empty" = "true" ] || [ -z "$out_path" ] || [ ! -f "$out_path" ]; then
+        piri_record_ledger "$sid" "$size"
+        log "piri empty projection session=$sid"
+        continue
+      fi
+      # Scoped branch env: provider.sh resolves the piri install target
+      # (~/.piri/agent/skills) from CCC_SKILL_PROVIDER, skill-review.sh re-roots
+      # its project discovery at the normalized tree, and the shared
+      # CCC_SKILL_REVIEW_STATE_DIR keeps the pending queue and the autoinstall
+      # daily-cap ledger summed across all branches (codex #1353 precedent).
+      if jq -nc --arg sid "$sid" --arg tp "$out_path" \
+          '{session_id:$sid, transcript_path:$tp}' 2>/dev/null \
+          | env CCC_SKILL_PROVIDER=piri \
+                CLAUDE_PROJECTS_DIR="$piri_tree" \
+                CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" \
+                bash "$REVIEW" manual >>"$LOG" 2>&1; then
+        piri_drafted=$((piri_drafted + 1))
+        piri_record_ledger "$sid" "$size"
+        log "piri review ok session=$sid size=$size"
+      else
+        log "piri review failed session=$sid (non-fatal)"
+      fi
+    done < <(find "$piri_home/sessions" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" 2>/dev/null \
+               | xargs -r ls -t 2>/dev/null)
+    log "piri sweep done drafted_sessions=$piri_drafted"
+  fi
+
   # skill-review.sh stages drafts from a detached background pipeline; give it
   # a bounded window to settle so this run's notification (step 3) can already
   # count fresh drafts. A quiet pipeline (no reusable procedure found) simply
