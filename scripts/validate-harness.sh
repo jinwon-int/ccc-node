@@ -3,6 +3,18 @@
 # Validates the Claude Code harness template: settings JSON, hook scripts, hook tests,
 # skill/agent frontmatter, and that hooks referenced by settings.json exist.
 # Exit non-zero on any failure. shellcheck/bats are optional (skipped with a note if absent).
+#
+# What runs is DISCOVERED from the git index (#1484) — there is no hand-kept
+# list of suites, python files or shellcheck targets to update any more:
+#   hook-test suites    every tracked *.test.sh (byte order) minus HARNESS_EXCLUDE
+#   umask-0002 re-runs  suites whose leading comment block carries the exact
+#                       line `# harness: umask-rerun` (UMASK_MARKER)
+#   py_compile          every tracked *.py outside PY_COMPILE_EXCLUDE prefixes
+#   warning-level lint  every tracked *.sh plus SC_SCOPE_EXTRA minus the
+#                       SC_WARN_BASELINE ratchet (pre-existing findings only)
+# The manifests live in the "manifests (#1484)" block below; every entry is
+# guarded (stale entry = FAIL). `--dump-plan` prints the discovered plan as
+# `<kind><TAB><path>` lines and exits (equivalence/diff seam).
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
@@ -62,6 +74,220 @@ if [ "${CCC_HARNESS_LIST_ONLY:-0}" = 1 ]; then phase_static=0; phase_hook_tests=
 fail=0
 say() { printf '%s\n' "$*"; }
 err() { printf 'FAIL: %s\n' "$*"; fail=1; }
+
+# --- manifests (#1484) -------------------------------------------------------
+# The ONLY hand-maintained inputs to what this script validates. Everything
+# else is discovered from `git ls-files` (block below). Each entry here is
+# guarded — a stale entry (file no longer tracked, baseline script now clean)
+# fails the run — so these cannot rot the way the old explicit lists did
+# (almost every commit to this file in the 30 days before #1484 was list
+# maintenance).
+# Tracked *.test.sh that must NOT run in the hook-test loop. None today: the
+# old explicit list was byte-for-byte the tracked set.
+HARNESS_EXCLUDE=()
+# A suite that must also pass under umask 0002 (#770: the ownership contract
+# fail-closes on group-writable skill dirs; CI runs 0022) declares this exact
+# line in its leading comment block, i.e. before the first non-comment line.
+UMASK_MARKER='# harness: umask-rerun'
+# Tracked *.py NOT syntax-compiled here (path-prefix match). bridge/ is
+# covered by its own pytest matrix (3.11 + 3.12), mypy and the wheel smoke.
+PY_COMPILE_EXCLUDE=(bridge/)
+# Tracked shell scripts without a .sh suffix that still get warning-level
+# lint (the `*.sh` discovery cannot see them).
+SC_SCOPE_EXTRA=(scripts/git-hooks/managed-checkout-guard)
+# Warning-level shellcheck baseline: tracked scripts that carry PRE-EXISTING
+# warning-severity findings and are therefore linted at error level only
+# (the repo-wide sweep in 3a). Snapshot 2026-09-05; the set is identical
+# under shellcheck 0.9.0 (CI, ubuntu-latest apt) and 0.11.0. Ratchet: an
+# entry that becomes clean FAILS the run until it is removed; a NEW script
+# is never added here — it is linted at warning level from its first commit.
+SC_WARN_BASELINE=(bridge/service-install.test.sh
+         bridge/service-launchd.sh
+         bridge/setup.sh
+         bridge/start.sh
+         claude/hooks/checkpoint.test.sh
+         claude/hooks/distill-scope.test.sh
+         claude/hooks/distill/extract.sh
+         claude/hooks/distill/extract.test.sh
+         claude/hooks/distill/local-facts.test.sh
+         claude/hooks/distill/pending-drain.test.sh
+         claude/hooks/distill/provider-guard.sh
+         claude/hooks/distill/wiki-queue.sh
+         claude/hooks/distill/wiki-queue.test.sh
+         claude/hooks/lib/autonomy-guard.test.sh
+         claude/hooks/lib/detached_jobs.test.sh
+         claude/hooks/lib/memory-common.sh
+         claude/hooks/lib/memory_render.test.sh
+         claude/hooks/lib/mtime-prune.test.sh
+         claude/hooks/lib/pending_promises.test.sh
+         claude/hooks/lib/spawn-detached.sh
+         claude/hooks/lib/test-stub.test.sh
+         claude/hooks/load-memory.sh
+         claude/hooks/memory-hooks.test.sh
+         claude/hooks/nunchi/assemble-fixtures.test.sh
+         claude/hooks/nunchi/codex-feed.test.sh
+         claude/hooks/nunchi/judge-batch.test.sh
+         claude/hooks/nunchi/nunchi.test.sh
+         claude/hooks/nunchi/sessionstart.test.sh
+         claude/hooks/nunchi/wiki-promote.test.sh
+         claude/hooks/redact.test.sh
+         claude/hooks/refresh-memory-freshness.test.sh
+         claude/hooks/scan-injection.test.sh
+         claude/hooks/skill-review.test.sh
+         claude/hooks/skill-review/autoinstall-incremental.test.sh
+         claude/hooks/skill-review/autoinstall.test.sh
+         claude/hooks/skill-review/codex-autoinstall.test.sh
+         claude/hooks/skill-review/curator.test.sh
+         claude/hooks/skill-review/ownership-incremental.test.sh
+         claude/hooks/skill-review/ownership-nolink-fallback.test.sh
+         claude/hooks/skill-review/ownership.test.sh
+         claude/hooks/skill-usage-log.test.sh
+         piri/skills/web/web_tools.test.sh
+         scripts/a2a-review-handler.test.sh
+         scripts/a2a-termux-native-worker.test.sh
+         scripts/agent-cron.test.sh
+         scripts/canonical-paths.test.sh
+         scripts/ccc-bridge-locate.test.sh
+         scripts/ccc-codex-github-policy.test.sh
+         scripts/ccc-codex.test.sh
+         scripts/ccc-distill-check.test.sh
+         scripts/ccc-distill-fleet-matrix.test.sh
+         scripts/ccc-doctor.test.sh
+         scripts/ccc-erasure-apply.test.sh
+         scripts/ccc-erasure-handoff.test.sh
+         scripts/ccc-erasure-planner.test.sh
+         scripts/ccc-fleet-matrix.test.sh
+         scripts/ccc-fleet-skills-sync.test.sh
+         scripts/ccc-live-backups-rotate.test.sh
+         scripts/ccc-memory.test.sh
+         scripts/ccc-piri.test.sh
+         scripts/ccc-pr-status-poll.test.sh
+         scripts/ccc-provenance.test.sh
+         scripts/ccc-security-audit.test.sh
+         scripts/ccc-self-update.sh
+         scripts/ccc-self-update.test.sh
+         scripts/ccc-skill-autosave.sh
+         scripts/ccc-skill-autosave.test.sh
+         scripts/ccc-skill-promotion.test.sh
+         scripts/ccc-skill-registry.test.sh
+         scripts/ccc-wiki-triage.test.sh
+         scripts/codex-rollout-normalize.test.sh
+         scripts/cost-ledger-weekly.test.sh
+         scripts/cost-ledger.test.sh
+         scripts/gh-pr-flow-jinon86.test.sh
+         scripts/harness-paths.test.sh
+         scripts/install-fleet-skills-sync-cron.test.sh
+         scripts/install-memory-refresh-cron.test.sh
+         scripts/install-nunchi.sh
+         scripts/install-nunchi.test.sh
+         scripts/install-pr-status-poll-cron.test.sh
+         scripts/install-skill-autosave-cron.test.sh
+         scripts/install-tunnel-audit-cron.test.sh
+         scripts/lib/harness-paths.sh
+         scripts/lib/installer-cron-common.test.sh
+         scripts/rescreen-rotation.test.sh
+         scripts/setup.test.sh
+         scripts/tunnel-audit-fleet.sh
+         scripts/tunnel-audit-fleet.test.sh
+         scripts/tunnel-audit.test.sh
+         setup.sh
+         skills/skillsuggest/scan.sh)
+# --- end manifests -----------------------------------------------------------
+
+# --- discovery (#1484) -------------------------------------------------------
+# discover_plan fills HARNESS_SUITES, UMASK_SUITES, PY_COMPILE_FILES and
+# SC_SCOPE from the git index plus the manifests above. Order is the index's
+# byte order (`git ls-files`), which is stable across nodes; no suite depends
+# on another having run first (CI has run them split across shards since
+# #1482, so any such dependency would already have broken). Discovery only
+# reads; every guard finding goes through err(). Test seam: the
+# validate-harness.test.sh suite evals this block with its own manifests
+# inside a fixture repo, so keep it free of references to anything else.
+list_has() { # <needle> <item>... -> 0 when needle is one of the items
+  local n="$1" x; shift
+  for x in "$@"; do [ "$x" = "$n" ] && return 0; done
+  return 1
+}
+has_prefix() { # <path> <prefix>... -> 0 when path starts with any prefix
+  local p="$1" x; shift
+  for x in "$@"; do case "$p" in "$x"*) return 0 ;; esac; done
+  return 1
+}
+has_shebang() { # <file> -> 0 when line 1 starts with #!
+  local l; IFS= read -r l < "$1" 2>/dev/null && [[ "$l" == '#!'* ]]
+}
+tracked_guard() { # <label> <path>... -> err for every path not in the index
+  local label="$1" f; shift
+  [ "$#" -gt 0 ] || return 0
+  local -a found=()
+  mapfile -t found < <(git ls-files -- "$@")
+  for f in "$@"; do
+    list_has "$f" ${found[@]+"${found[@]}"} || { err "stale $label entry (not tracked): $f"; plan_findings=$((plan_findings + 1)); }
+  done
+}
+plan_findings=0; HARNESS_EXCLUDED_N=0
+discover_plan() {
+  HARNESS_SUITES=(); UMASK_SUITES=(); PY_COMPILE_FILES=(); SC_SCOPE=()
+  local f
+  if ! command -v git >/dev/null 2>&1 || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    err "git is required to discover the validation plan (suites, py_compile, shellcheck scope)"
+    plan_findings=$((plan_findings + 1))
+    return 1
+  fi
+  # 1) hook-test suites: every tracked *.test.sh minus HARNESS_EXCLUDE. A
+  #    suite is run as `bash <suite>`, so the executable bit is not required,
+  #    but a missing shebang means it was never meant to run as a script.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if list_has "$f" ${HARNESS_EXCLUDE[@]+"${HARNESS_EXCLUDE[@]}"}; then
+      HARNESS_EXCLUDED_N=$((HARNESS_EXCLUDED_N + 1)); continue
+    fi
+    HARNESS_SUITES+=("$f")
+    has_shebang "$f" || { err "test suite has no shebang line: $f"; plan_findings=$((plan_findings + 1)); }
+  done < <(git ls-files -- '*.test.sh')
+  tracked_guard HARNESS_EXCLUDE ${HARNESS_EXCLUDE[@]+"${HARNESS_EXCLUDE[@]}"}
+  [ "${#HARNESS_SUITES[@]}" -gt 0 ] || { err "no tracked *.test.sh suite discovered"; plan_findings=$((plan_findings + 1)); }
+  # 2) umask-0002 re-run set: suites whose leading comment block (from line 1
+  #    up to the first line that is neither a comment nor blank) carries the
+  #    exact UMASK_MARKER line. Same order as HARNESS_SUITES.
+  if [ "${#HARNESS_SUITES[@]}" -gt 0 ]; then
+    mapfile -t UMASK_SUITES < <(awk -v m="$UMASK_MARKER" '
+      FNR == 1 { header = 1 }
+      header && $0 == m { print FILENAME; nextfile }
+      header && !/^#/ && !/^[[:space:]]*$/ { header = 0; nextfile }
+    ' "${HARNESS_SUITES[@]}")
+  fi
+  [ "${#UMASK_SUITES[@]}" -gt 0 ] || { err "no suite declares '$UMASK_MARKER' — the umask-0002 contract (#770) would have no coverage"; plan_findings=$((plan_findings + 1)); }
+  # 3) python syntax scope: every tracked *.py outside the excluded prefixes.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    has_prefix "$f" "${PY_COMPILE_EXCLUDE[@]}" && continue
+    PY_COMPILE_FILES+=("$f")
+  done < <(git ls-files -- '*.py')
+  # 4) warning-level shellcheck scope: every tracked *.sh plus the suffix-less
+  #    extras, minus the baseline (which stays under the error-level sweep).
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    list_has "$f" "${SC_WARN_BASELINE[@]}" && continue
+    SC_SCOPE+=("$f")
+  done < <(git ls-files -- '*.sh' "${SC_SCOPE_EXTRA[@]}")
+  tracked_guard SC_SCOPE_EXTRA "${SC_SCOPE_EXTRA[@]}"
+  tracked_guard SC_WARN_BASELINE "${SC_WARN_BASELINE[@]}"
+  [ "$plan_findings" -eq 0 ]
+}
+# --- end discovery -----------------------------------------------------------
+discover_plan || true
+
+# Equivalence/diff seam: print the discovered plan and exit (used to prove
+# the discovery reproduces a hand-kept list, and by the test suite).
+if [ "${1:-}" = "--dump-plan" ]; then
+  dump_kind() { local k="$1" x; shift; for x in "$@"; do printf '%s\t%s\n' "$k" "$x"; done; }
+  dump_kind suite ${HARNESS_SUITES[@]+"${HARNESS_SUITES[@]}"}
+  dump_kind umask-rerun ${UMASK_SUITES[@]+"${UMASK_SUITES[@]}"}
+  dump_kind py_compile ${PY_COMPILE_FILES[@]+"${PY_COMPILE_FILES[@]}"}
+  dump_kind shellcheck-warning ${SC_SCOPE[@]+"${SC_SCOPE[@]}"}
+  exit "$fail"
+fi
 
 # Static phase, part 1 (sections 1-3c). Bodies are deliberately NOT
 # re-indented under the phase gate: it keeps the diff reviewable and the
@@ -209,21 +435,11 @@ for f in "${SH[@]}"; do
   if bash -n "$f" 2>/dev/null; then say "  ok $f"; else err "bash -n: $f"; fi
 done
 
-# 3) shellcheck — scoped to reviewed scripts (blocking); others get bash -n only above.
+# 3) shellcheck — warning level (blocking) on SC_SCOPE: every tracked *.sh plus
+# SC_SCOPE_EXTRA minus the SC_WARN_BASELINE ratchet (discovered above, #1484).
+# Baseline scripts get the error-level sweep in 3a only, until they are
+# cleaned up and dropped from the baseline.
 say "== shellcheck =="
-SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh claude/hooks/lifecycle-feed.sh \
-          claude/hooks/lib/lifecycle-common.sh \
-          claude/hooks/notify.sh claude/hooks/statusline.sh claude/headless.sh codex/headless.sh crush/headless.sh \
-          scripts/ccc-service-control.sh \
-          scripts/a2a-intent-dispatcher.sh scripts/skills-intake-review-handler.sh \
-          scripts/install-a2a-review-handler.sh \
-          scripts/ccc-service-control.test.sh \
-          scripts/ccc-broker-reconcile.sh scripts/ccc-broker-reconcile.test.sh \
-          claude/hooks/observability.test.sh scripts/validate-harness.sh \
-          scripts/bridge-watchdog.sh scripts/bridge-watchdog.test.sh \
-          scripts/resource-pressure-guard.sh scripts/resource-pressure-guard.test.sh \
-          scripts/git-hooks/managed-checkout-guard scripts/managed-checkout-guard.test.sh \
-          skills/nclex-a2a-content-pipeline/watch-task.sh)
 if command -v shellcheck >/dev/null 2>&1; then
   SC_PRESENT=()
   for f in "${SC_SCOPE[@]}"; do
@@ -240,6 +456,21 @@ if command -v shellcheck >/dev/null 2>&1; then
       if shellcheck --severity=warning -e SC2155,SC1090,SC1091 "$f"; then say "  ok $f"; else err "shellcheck: $f"; fi
     done
   fi
+  say "  ok warning-level scope: ${#SC_PRESENT[@]} script(s) (tracked *.sh + ${#SC_SCOPE_EXTRA[@]} extra - ${#SC_WARN_BASELINE[@]} baseline)"
+  # Baseline ratchet: an SC_WARN_BASELINE entry that no longer has any
+  # warning-level finding must leave the baseline (and thereby join
+  # SC_SCOPE), or the manifest would silently grow stale. Evaluated per
+  # file, exactly as a developer runs it: in a batch, shellcheck follows
+  # `source`d files that happen to be co-inputs and can hide a finding
+  # (e.g. SC2034 in distill/extract.sh disappears next to provider-guard.sh).
+  sc_base_n=0; sc_stale=0
+  for f in "${SC_WARN_BASELINE[@]}"; do
+    [ -f "$f" ] || continue
+    sc_base_n=$((sc_base_n + 1))
+    shellcheck --severity=warning -e SC2155,SC1090,SC1091 "$f" >/dev/null 2>&1 \
+      && { err "SC_WARN_BASELINE entry is clean at warning level — remove it: $f"; sc_stale=$((sc_stale + 1)); }
+  done
+  [ "$sc_stale" -eq 0 ] && say "  ok SC_WARN_BASELINE ratchet: $sc_base_n script(s) still carry pre-existing warning-level findings"
   # 3a) Repo-wide error-severity sweep — every tracked script gets at least
   # error-level lint, so a new script cannot escape shellcheck entirely
   # (previously anything outside SC_SCOPE only got bash -n). SC_SCOPE keeps
@@ -261,30 +492,14 @@ else
   say "  (shellcheck absent — skipped)"
 fi
 
-# 3b) python hook helpers — a syntax error would break the statusline helper, so
-# compile the shipped python here.
-say "== python hook helpers =="
-PY_COMPILE_FILES=(claude/hooks/statusline-usage.py \
-                  claude/hooks/lib/memory_render.py \
-                  claude/hooks/distill/pending_journal.py \
-                  claude/hooks/skill-review/ownership.py \
-                  claude/hooks/skill-review/curator.py \
-                  scripts/ccc_codex_github_policy.py \
-                  scripts/ccc-skill-registry.py \
-                  scripts/ccc-skill-promotion.py \
-                  scripts/ccc-fleet-skills-sync.py \
-                  scripts/ccc_memory_probe.py \
-                  scripts/cost-ledger-weekly.py \
-                  scripts/ccc_memory_timeparse.py \
-                  scripts/ccc_memory_timeparse_test.py \
-                  bridge/runtime_config_check.py \
-                  scripts/ccc_script_interpreter_check.py \
-                  scripts/ccc_script_interpreter_check_test.py \
-                  scripts/ccc_architecture_contract.py \
-                  scripts/ccc_architecture_contract_test.py \
-                  scripts/ccc_side_effect_contract.py \
-                  scripts/ccc_side_effect_contract_test.py)
-if command -v python3 >/dev/null 2>&1; then
+# 3b) python syntax — a syntax error would break the statusline helper (and
+# every other shipped python), so compile every tracked *.py outside the
+# PY_COMPILE_EXCLUDE prefixes (discovered above, #1484). This is syntax only:
+# the bridge package has its own pytest/mypy matrix and is excluded.
+say "== python syntax (py_compile) =="
+if [ "${#PY_COMPILE_FILES[@]}" -eq 0 ]; then
+  err "py_compile scope is empty (discovery failed?)"
+elif command -v python3 >/dev/null 2>&1; then
   # One interpreter compiles the whole list (was one python3 spawn per file);
   # only when the batch fails re-run per file so the broken/missing file is
   # attributed. The per-file "ok ... compiles" lines are printed either way.
@@ -418,106 +633,17 @@ run_suite() { # <suite-path>
   env ${scrub[@]+"${scrub[@]}"} bash "$1"
 }
 
-HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
-         claude/hooks/skill-usage-log.test.sh \
-         scripts/validate-harness.test.sh \
-         claude/hooks/redact.test.sh claude/hooks/scan-injection.test.sh \
-         claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh claude/hooks/skill-review.test.sh \
-         claude/hooks/skill-review/ownership.test.sh \
-         claude/hooks/skill-review/ownership-incremental.test.sh \
-         claude/hooks/skill-review/ownership-nolink-fallback.test.sh \
-         claude/hooks/skill-review/curator.test.sh \
-         claude/hooks/skill-review/autoinstall.test.sh \
-         claude/hooks/skill-review/autoinstall-incremental.test.sh \
-         claude/hooks/skill-review/codex-autoinstall.test.sh \
-         claude/hooks/lib/mtime-prune.test.sh \
-         claude/hooks/lib/memory_render.test.sh \
-         claude/hooks/lib/pending_promises.test.sh \
-         claude/hooks/lib/detached_jobs.test.sh \
-         claude/hooks/lib/test-stub.test.sh \
-         claude/hooks/lib/hook-common.test.sh \
-         claude/hooks/statusline.test.sh \
-         claude/hooks/distill/extract.test.sh claude/hooks/distill/pending-drain.test.sh claude/hooks/distill/wiki-queue.test.sh \
-         claude/hooks/distill/local-facts.test.sh claude/hooks/memory-hooks.test.sh \
-         claude/hooks/refresh-memory-freshness.test.sh \
-         claude/hooks/nunchi/nunchi.test.sh claude/hooks/nunchi/bench.test.sh \
-         claude/hooks/nunchi/assemble-fixtures.test.sh \
-         claude/hooks/nunchi/sessionstart.test.sh \
-         scripts/ccc-erasure-planner.test.sh \
-         scripts/ccc-erasure-apply.test.sh \
-         scripts/ccc-erasure-handoff.test.sh \
-         claude/hooks/nunchi/judge-batch.test.sh claude/hooks/nunchi/wiki-promote.test.sh \
-         claude/hooks/nunchi/bridge-journal.test.sh claude/hooks/nunchi/codex-feed.test.sh \
-         scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-codex-memory.test.sh scripts/ccc-codex.test.sh scripts/ccc-piri.test.sh piri/skills/web/web_tools.test.sh scripts/ccc-codex-github-policy.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-distill-fleet-matrix.test.sh scripts/ccc-security-audit.test.sh \
-         scripts/ccc-script-interpreter-check.test.sh \
-         scripts/managed-checkout-guard.test.sh \
-         scripts/ccc-fleet-matrix.test.sh scripts/ccc-wiki-triage.test.sh scripts/setup.test.sh \
-         scripts/harness-paths.test.sh scripts/canonical-paths.test.sh \
-         scripts/installer-gen-stamp.test.sh \
-         scripts/agent-cron.test.sh scripts/agent-cron-lib.test.sh scripts/a2a-termux-native-worker.test.sh \
-         scripts/a2a-termux-native-worker-health.test.sh \
-         scripts/resource-pressure-guard.test.sh \
-         scripts/install-memory-refresh-cron.test.sh scripts/install-nunchi.test.sh scripts/auto-distill.test.sh scripts/install-termux-mempalace.test.sh scripts/ccc-skill-autosave.test.sh \
-         scripts/codex-rollout-normalize.test.sh \
-         scripts/cost-ledger.test.sh \
-         scripts/cost-ledger-weekly.test.sh \
-         scripts/ccc-skill-promotion.test.sh \
-         scripts/rescreen-rotation.test.sh \
-         scripts/a2a-review-handler.test.sh \
-         scripts/a2a-rescreen-rotation.test.sh \
-         scripts/nclex-a2a-watch-task.test.sh \
-         scripts/ccc-skill-registry.test.sh \
-         scripts/ccc-fleet-skills-sync.test.sh \
-         scripts/gh-pr-flow-relay-merge.test.sh \
-         scripts/canon-node-name-scan.test.sh \
-         scripts/ccc-self-update.test.sh scripts/self-update-check.test.sh scripts/ccc-provenance.test.sh \
-         scripts/bridge-watchdog.test.sh \
-         scripts/ccc-bridge-locate.test.sh \
-         bridge/service-install.test.sh \
-         bridge/restart.test.sh \
-         bridge/start-lib.test.sh \
-         scripts/install-agent-cron-systemd.test.sh \
-         codex/headless.test.sh crush/headless.test.sh \
-         scripts/install-skill-autosave-cron.test.sh \
-         scripts/gh-pr-flow-jinon86.test.sh \
-         scripts/gh-pr-flow-seoseo-ai.test.sh \
-         scripts/ccc-service-control.test.sh \
-         scripts/ccc-broker-reconcile.test.sh \
-         claude/hooks/lib/autonomy-guard.test.sh \
-         claude/hooks/skill-review/gate-sim.test.sh \
-         claude/mcp-setup.test.sh \
-         scripts/ccc-live-backups-rotate.test.sh \
-         scripts/ccc-pr-status-poll.test.sh \
-         scripts/fleet-bridge-watch.test.sh \
-         scripts/install-pr-status-poll-cron.test.sh \
-         scripts/install-fleet-skills-sync-cron.test.sh \
-         scripts/tunnel-audit.test.sh \
-         scripts/tunnel-audit-fleet.test.sh \
-         scripts/install-tunnel-audit-cron.test.sh \
-         scripts/ccc-deps-lock-pr.test.sh \
-         scripts/lib/installer-cron-common.test.sh)
-
-# Registration guard — a suite that exists but is not listed above never runs,
-# which is worse than having no suite at all: the tree looks covered and CI is
-# green while the assertions are dead. Seven suites (139 assertions) had drifted
-# into exactly that state before this guard existed. Mirrors the repo-wide
-# lint sweep above (the one that stops a new script escaping shellcheck): the
-# explicit list keeps its ordering and grouping, and this pass only ever
-# catches a NEW suite that forgot to join it.
-if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  unregistered=0
-  while IFS= read -r suite; do
-    [ -n "$suite" ] || continue
-    case " ${HARNESS_SUITES[*]} " in
-      *" $suite "*) ;;
-      *) err "unregistered test suite (never runs): $suite"; unregistered=$((unregistered+1)) ;;
-    esac
-  done < <(git ls-files '*.test.sh')
-  [ "$unregistered" -eq 0 ] && say "  ok every tracked *.test.sh is registered (${#HARNESS_SUITES[@]} suites)"
+# Discovery report (#1484). HARNESS_SUITES is every tracked *.test.sh minus
+# HARNESS_EXCLUDE and UMASK_SUITES is the subset carrying UMASK_MARKER — both
+# filled by discover_plan above. This replaces the registration guard: a suite
+# cannot be "unregistered" any more because there is no register; what CAN go
+# wrong (no shebang, stale exclude, marker set empty) was already reported by
+# discover_plan through err(), so only summarise here.
+if [ "$plan_findings" -eq 0 ]; then
+  say "  ok ${#HARNESS_SUITES[@]} tracked *.test.sh suites discovered (${HARNESS_EXCLUDED_N} excluded), all with a shebang; ${#UMASK_SUITES[@]} declare '$UMASK_MARKER'"
 else
-  say "  (git unavailable — test-suite registration guard skipped)"
+  err "suite discovery reported $plan_findings finding(s) — see FAIL lines above"
 fi
-
 # A suite reports its own tally on a final `PASS=<n> FAIL=<n>` line, which is
 # what gets echoed next to its name below. A suite that omits it still shows
 # "ok", just with a blank count — so a suite that silently asserted nothing
@@ -533,18 +659,9 @@ suite_summary() { # <output-file> <suite> [label]
 # Umask-0002 variant (#770): the ownership contract fail-closes on
 # group/other-writable skill dirs, so the umask-sensitive suites must also
 # pass on nodes whose default umask is 0002. CI runs 0022 — run these twice.
-UMASK_SUITES=(claude/hooks/skill-review.test.sh \
-         claude/hooks/distill-scope.test.sh \
-         claude/hooks/distill/pending-drain.test.sh \
-         claude/hooks/skill-review/autoinstall.test.sh \
-         claude/hooks/skill-review/autoinstall-incremental.test.sh \
-         claude/hooks/skill-review/codex-autoinstall.test.sh \
-         scripts/ccc-codex-github-policy.test.sh \
-         scripts/ccc-codex-memory.test.sh \
-         scripts/install-nunchi.test.sh \
-         scripts/setup.test.sh)
+# UMASK_SUITES = the suites declaring UMASK_MARKER in their header (discovered).
 
-# Hook-test work list: every registered suite once, then the umask-0002
+# Hook-test work list: every discovered suite once, then the umask-0002
 # re-runs — one flat list so the shard split below sees both kinds of run.
 # Entry shape: "<suite>" or "<suite><TAB>umask0002".
 HOOK_RUNS=()
