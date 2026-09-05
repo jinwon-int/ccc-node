@@ -56,6 +56,10 @@ sys.path.insert(0, HERE)
 # _tokens/_conflict_review — a copied rule would drift (#1204 design note,
 # mirrored from the "두 레인이 다른 의미를 쓰면 이후 감사가 오염" lesson of #1211).
 import nunchi  # noqa: E402
+# #1508 — nunchi put the hooks root (~/.claude/hooks, where setup.sh installs
+# bridge/utils/secure_fs.py as ccc_secure_fs.py) on sys.path, or registered the
+# canonical repo module under that name, so the plain import resolves here.
+import ccc_secure_fs  # noqa: E402
 
 DB = os.environ.get("NUNCHI_DB", os.path.expanduser("~/.nunchi/facts.db"))
 HOME_DIR = os.environ.get("NUNCHI_HOME", os.path.expanduser("~/.nunchi"))
@@ -73,18 +77,10 @@ LOCK = os.path.join(HOME_DIR, ".judge.lock")
 BACKUP_DIR = os.path.join(HOME_DIR, "backup")
 
 
-def _int_env(name, default, low, high):
-    try:
-        val = int(os.environ.get(name, str(default)))
-    except ValueError:
-        val = default
-    return max(low, min(high, val))
-
-
-CAP = _int_env("NUNCHI_JUDGE_CAP", 10, 1, 50)
-MIN_AGE_HOURS = _int_env("NUNCHI_JUDGE_MIN_AGE_HOURS", 24, 1, 24 * 30)
-JUDGE_TIMEOUT = _int_env("NUNCHI_JUDGE_TIMEOUT_SEC", 120, 10, 600)
-MAX_SCOPES = _int_env("CCC_NUNCHI_MAX_SCOPES_PER_RUN", 64, 1, 64)
+CAP = ccc_secure_fs.bounded_int_env(os.environ, "NUNCHI_JUDGE_CAP", 10, 1, 50, clamp=True)
+MIN_AGE_HOURS = ccc_secure_fs.bounded_int_env(os.environ, "NUNCHI_JUDGE_MIN_AGE_HOURS", 24, 1, 24 * 30, clamp=True)
+JUDGE_TIMEOUT = ccc_secure_fs.bounded_int_env(os.environ, "NUNCHI_JUDGE_TIMEOUT_SEC", 120, 10, 600, clamp=True)
+MAX_SCOPES = ccc_secure_fs.bounded_int_env(os.environ, "CCC_NUNCHI_MAX_SCOPES_PER_RUN", 64, 1, 64, clamp=True)
 
 VERDICTS = ("clear", "conflict", "human")
 _CODEX_ENV_NAMES = (

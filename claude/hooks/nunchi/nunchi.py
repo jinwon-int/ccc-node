@@ -84,8 +84,35 @@ import sqlite3
 import time
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timedelta, timezone
+
+# ---------------------------------------------------------------------------
+# Shared fs helpers (#1508). Convention for installed hook python: setup.sh
+# installs bridge/utils/secure_fs.py verbatim as ~/.claude/hooks/ccc_secure_fs.py,
+# so a module in ~/.claude/hooks/<subdir>/ puts its hooks root
+# (Path(__file__).resolve().parents[1]) first on sys.path and does
+# `import ccc_secure_fs`. The file is generated at install time, so inside the
+# repository tree the canonical bridge/utils/secure_fs.py is loaded under the
+# same module name (identical bytes; setup.test.sh cmp-guards the copy).
+# Sibling scripts that `import nunchi` (judge-batch, wiki-promote) reuse it.
+# ---------------------------------------------------------------------------
+_HOOKS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _HOOKS_ROOT not in sys.path:
+    sys.path.insert(0, _HOOKS_ROOT)
+try:
+    import ccc_secure_fs
+except ImportError:
+    import importlib.util
+
+    _SECURE_FS_SPEC = importlib.util.spec_from_file_location(
+        "ccc_secure_fs",
+        os.path.join(os.path.dirname(os.path.dirname(_HOOKS_ROOT)), "bridge/utils/secure_fs.py"),
+    )
+    if _SECURE_FS_SPEC is None or _SECURE_FS_SPEC.loader is None:
+        raise RuntimeError("secure_fs_unavailable") from None
+    ccc_secure_fs = importlib.util.module_from_spec(_SECURE_FS_SPEC)
+    sys.modules["ccc_secure_fs"] = ccc_secure_fs
+    _SECURE_FS_SPEC.loader.exec_module(ccc_secure_fs)
 
 DB = os.environ.get("NUNCHI_DB", os.path.expanduser("~/.nunchi/facts.db"))
 SNAPSHOT = os.environ.get("NUNCHI_SNAPSHOT", os.path.expanduser("~/.nunchi/snapshot.md"))
@@ -262,25 +289,12 @@ def _atomic_write_text(path, text):
     """#1478 — replace `path` atomically: same-dir temp file, fsync, os.replace.
 
     A reader (SessionStart's `head -c`/assemble, backend_status) can never see
-    a truncated file. Local on purpose: the hooks dir is deployed standalone,
-    so scripts/ccc_secure_fs.py is not importable from here without sys.path
-    games. The temp file is unlinked on any failure.
+    a truncated file. #1508 — delegates to the shared ccc_secure_fs helper;
+    mode=0o600 keeps the #1494 owner-only result the mkstemp version produced
+    (the helper would otherwise inherit an existing target's mode).
     """
-    d = os.path.dirname(path) or "."
-    os.makedirs(d, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=d)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    ccc_secure_fs.atomic_write_text(path, text, mode=0o600)
 
 
 def _node_name():

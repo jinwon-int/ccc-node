@@ -22,6 +22,35 @@ import sys
 import uuid
 from typing import Any
 
+# ---------------------------------------------------------------------------
+# Shared owner-only fs / lock / clock helpers (#1508).
+#
+# Convention for installed hook python: setup.sh installs the canonical
+# bridge/utils/secure_fs.py verbatim as ~/.claude/hooks/ccc_secure_fs.py, so a
+# module living in ~/.claude/hooks/<subdir>/ puts its hooks root
+# (Path(__file__).resolve().parents[1]) at the front of sys.path and does
+# `import ccc_secure_fs`. That file is generated at install time and does not
+# exist inside the repository tree, so the fallback loads the canonical
+# bridge/utils/secure_fs.py under the same module name: tests exercise the
+# identical bytes setup.sh installs (scripts/setup.test.sh cmp-guards the copy).
+# ---------------------------------------------------------------------------
+_HOOKS_ROOT = str(Path(__file__).resolve().parents[1])
+if _HOOKS_ROOT not in sys.path:
+    sys.path.insert(0, _HOOKS_ROOT)
+try:
+    import ccc_secure_fs
+except ImportError:
+    import importlib.util
+
+    _SECURE_FS_SPEC = importlib.util.spec_from_file_location(
+        "ccc_secure_fs", Path(__file__).resolve().parents[3] / "bridge/utils/secure_fs.py"
+    )
+    if _SECURE_FS_SPEC is None or _SECURE_FS_SPEC.loader is None:
+        raise RuntimeError("secure_fs_unavailable") from None
+    ccc_secure_fs = importlib.util.module_from_spec(_SECURE_FS_SPEC)
+    sys.modules["ccc_secure_fs"] = ccc_secure_fs
+    _SECURE_FS_SPEC.loader.exec_module(ccc_secure_fs)
+
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _ATTEMPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -34,6 +63,13 @@ _ROLLBACK_DIR = "skill-autosave-rollback"
 _PROPOSAL_BACKUP_DIR = "skill-autosave-proposal-backups"
 _LOCK_FILE = ".skill-autosave-ownership.lock"
 _MAX_JSON_BYTES = 64 * 1024
+_MAX_LEDGER_BYTES = 8 * 1024 * 1024
+# SecureFsError.reason -> ledger contract code (order preserved by _preflight_ledger).
+_LEDGER_READ_CODES = {
+    "unsafe": "unsafe_ownership_ledger",
+    "too_large": "ownership_ledger_too_large",
+    "changed": "ownership_ledger_changed",
+}
 _MAX_PROPOSAL_BACKUP_BYTES = 2 * 1024 * 1024
 _MAX_TARGET_BYTES = 1024 * 1024
 _MAX_PATCH_TEXT_BYTES = 32 * 1024
@@ -150,7 +186,9 @@ def _now() -> datetime:
 
 
 def _timestamp(value: datetime | None = None) -> str:
-    return (value or _now()).isoformat(timespec="seconds").replace("+00:00", "Z")
+    if value is None:
+        return ccc_secure_fs.utc_now_iso()
+    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _canonical_json(value: object) -> bytes:
@@ -300,62 +338,19 @@ def _safe_json_file(
     exact_mode: int | None = None,
     max_bytes: int = _MAX_JSON_BYTES,
 ) -> dict[str, Any]:
-    metadata = _lstat(path)
-    if metadata is None:
+    if _lstat(path) is None:
         raise FileNotFoundError(path)
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != owner
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) & 0o022
-        or (exact_mode is not None and stat.S_IMODE(metadata.st_mode) != exact_mode)
-        or metadata.st_size > max_bytes
-    ):
-        raise ContractError("unsafe_metadata")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
         try:
-            opened = os.fstat(descriptor)
-            if (
-                opened.st_dev != metadata.st_dev
-                or opened.st_ino != metadata.st_ino
-                or not stat.S_ISREG(opened.st_mode)
-                or opened.st_uid != owner
-                or opened.st_nlink != 1
-                or stat.S_IMODE(opened.st_mode) & 0o022
-                or (exact_mode is not None and stat.S_IMODE(opened.st_mode) != exact_mode)
-            ):
-                raise ContractError("unsafe_metadata")
-            chunks: list[bytes] = []
-            remaining = max_bytes + 1
-            while remaining > 0:
-                chunk = os.read(descriptor, min(65536, remaining))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            payload = b"".join(chunks)
-            after = os.fstat(descriptor)
-            if (
-                opened.st_dev,
-                opened.st_ino,
-                opened.st_size,
-                opened.st_mtime_ns,
-                opened.st_ctime_ns,
-            ) != (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            ):
-                raise ContractError("metadata_changed_during_read")
-        finally:
-            os.close(descriptor)
-        if len(payload) > max_bytes:
-            raise ContractError("metadata_too_large")
+            payload, _ = ccc_secure_fs.read_owner_only_bytes(
+                path, max_bytes=max_bytes, owner_id=owner, exact_mode=exact_mode
+            )
+        except ccc_secure_fs.SecureFsError as error:
+            # "unsafe" and the pre-read size bound both fail the lstat-time
+            # check as unsafe_metadata; only a mid-read change is distinct.
+            if error.reason == "changed":
+                raise ContractError("metadata_changed_during_read") from None
+            raise ContractError("unsafe_metadata") from None
         value = json.loads(
             payload,
             object_pairs_hook=_reject_duplicate_json_keys,
@@ -833,15 +828,6 @@ def _write_private_atomic(path: Path, value: object, context: Context) -> None:
         | getattr(os, "O_DIRECTORY", 0)
     )
     directory_fd: int | None = None
-    descriptor: int | None = None
-    temporary = f".{path.name}.tmp.{uuid.uuid4().hex}"
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
     try:
         directory_fd = os.open(path.parent, directory_flags)
         directory_metadata = os.fstat(directory_fd)
@@ -851,34 +837,13 @@ def _write_private_atomic(path: Path, value: object, context: Context) -> None:
             or stat.S_IMODE(directory_metadata.st_mode) != 0o700
         ):
             raise ContractError("unsafe_state_directory")
-        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
-        os.fchmod(descriptor, 0o600)
-        view = memoryview(payload)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("short write")
-            view = view[written:]
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        os.replace(
-            temporary,
-            path.name,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-        )
-        os.fsync(directory_fd)
+        # 0600 O_EXCL temp file, fsync, rename and directory fsync, all
+        # relative to the validated directory descriptor.
+        ccc_secure_fs.atomic_write_bytes_at(directory_fd, path.name, payload)
     except OSError:
         raise ContractError("metadata_write_failed") from None
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
         if directory_fd is not None:
-            try:
-                os.unlink(temporary, dir_fd=directory_fd)
-            except OSError:
-                pass
             os.close(directory_fd)
 
 
@@ -1001,50 +966,14 @@ def _read_ledger(context: Context) -> list[dict[str, Any]]:
 
     _preflight_ledger(context)
     path = context.state_dir / _LEDGER_FILE
-    metadata = _lstat(path)
-    if metadata is None:
+    if _lstat(path) is None:
         return []
-    if metadata.st_size > 8 * 1024 * 1024:
-        raise ContractError("ownership_ledger_too_large")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
     try:
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid != context.uid
-            or opened.st_nlink != 1
-            or stat.S_IMODE(opened.st_mode) != 0o600
-            or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
-        ):
-            raise ContractError("unsafe_ownership_ledger")
-        payload = b""
-        while len(payload) <= 8 * 1024 * 1024:
-            chunk = os.read(descriptor, 65536)
-            if not chunk:
-                break
-            payload += chunk
-        after = os.fstat(descriptor)
-        if (
-            len(payload) > 8 * 1024 * 1024
-            or (
-                opened.st_dev,
-                opened.st_ino,
-                opened.st_size,
-                opened.st_mtime_ns,
-                opened.st_ctime_ns,
-            )
-            != (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            )
-        ):
-            raise ContractError("ownership_ledger_changed")
-    finally:
-        os.close(descriptor)
+        payload, _ = ccc_secure_fs.read_owner_only_bytes(
+            path, max_bytes=_MAX_LEDGER_BYTES, owner_id=context.uid, exact_mode=0o600
+        )
+    except ccc_secure_fs.SecureFsError as error:
+        raise ContractError(_LEDGER_READ_CODES[error.reason]) from None
     # #1481 — every row is written newline-terminated, so bytes after the last
     # "\n" are a crash-mid-append fragment: skip it, count it (main() reports
     # ownership_ledger_torn_tail), and let the next append truncate it. Any
@@ -1116,33 +1045,19 @@ class _MutationLock:
     def __enter__(self) -> "_MutationLock":
         _prepare_state(self.context)
         path = self.context.state_dir / _LOCK_FILE
-        flags = (
-            os.O_RDWR
-            | os.O_CREAT
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
         try:
-            self.descriptor = os.open(path, flags, 0o600)
-            metadata = os.fstat(self.descriptor)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != self.context.uid
-                or metadata.st_nlink != 1
-                or stat.S_IMODE(metadata.st_mode) & 0o077
-            ):
-                raise ContractError("unsafe_ownership_lock")
-            os.fchmod(self.descriptor, 0o600)
-            fcntl.flock(self.descriptor, fcntl.LOCK_EX)
-        except (OSError, ContractError) as error:
-            if self.descriptor is not None:
-                try:
-                    os.close(self.descriptor)
-                except OSError:
-                    pass
-                self.descriptor = None
-            if isinstance(error, ContractError):
-                raise
+            self.descriptor = ccc_secure_fs.open_lock_descriptor(
+                path, mode=0o600, owner_id=self.context.uid, unsafe_mode_mask=0o077
+            )
+        except ccc_secure_fs.SecureFsError:
+            raise ContractError("unsafe_ownership_lock") from None
+        except OSError:
+            raise ContractError("ownership_lock_failed") from None
+        try:
+            ccc_secure_fs.acquire_flock(self.descriptor, blocking=True)
+        except OSError:
+            os.close(self.descriptor)
+            self.descriptor = None
             raise ContractError("ownership_lock_failed") from None
         return self
 

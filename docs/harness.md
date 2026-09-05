@@ -32,6 +32,33 @@ Plugin marketplace:
 
 `validate-harness.sh` asserts the overlay and plugin `hooks/hooks.json` stay equivalent.
 
+## Hook python: shared `ccc_secure_fs` import convention
+
+`setup.sh` installs the canonical `bridge/utils/secure_fs.py` verbatim as
+`~/.claude/hooks/ccc_secure_fs.py` (`scripts/setup.test.sh` `cmp`-guards the
+copy), so every installed hook module shares one implementation of the
+owner-only read / JSONL / atomic-replace / flock / clock helpers instead of
+re-implementing them (#1484, #1503, #1508).
+
+- Scripts installed directly into `~/.claude/hooks/` (e.g. `ccc-skill-promotion.py`)
+  simply `import ccc_secure_fs`: Python puts the script's own directory first
+  on `sys.path`.
+- Hook modules installed into a subdirectory (`~/.claude/hooks/skill-review/`,
+  `~/.claude/hooks/nunchi/`, ...) insert their hooks root —
+  `Path(__file__).resolve().parents[1]` — at the front of `sys.path` and then
+  `import ccc_secure_fs`. `claude/hooks/ccc_secure_fs.py` is generated at install
+  time and does not exist in the repository tree, so the same block falls back
+  to loading `bridge/utils/secure_fs.py` (`parents[3]`) under the module name
+  `ccc_secure_fs`; repo tests therefore exercise the identical bytes `setup.sh`
+  installs. Siblings that already import a converted module (`curator.py` via
+  `ownership.py`; `judge-batch.py`/`wiki-promote.py` via `nunchi.py`) rely on
+  that registration and use the plain import.
+- Keep hook-local wrappers only where the contract differs: the module maps
+  `SecureFsError.reason` onto its own error codes (`unsafe_metadata`,
+  `unsafe_ownership_ledger`, `ownership_ledger_changed`, ...) rather than leaking
+  the shared exception, and directory-descriptor-relative writes go through
+  `atomic_write_bytes_at` after the caller has validated the directory.
+
 ## Status line
 
 `hooks/statusline.sh` emits a compact Claude Code status line:
