@@ -3,7 +3,7 @@
   "pipeline": 6,
   "subject": {
     "path": "scripts/auto-distill/auto-distill.py",
-    "sha256": "595f653c93f9082a35dc7633cc62f893828e04570d16d5e83a69633335035be7",
+    "sha256": "598dfadabe238e0a0d849fe47d9d370fe56d339aff853dbc57916ad27f3e7e40",
     "surface_schema": "ccc.auto-distill.canon-surface.v1",
     "surface_sha256": "fa1e3a99cccae1e6e054c4cf44e4147664f8deb6a1a7e47eade12768558c9f52",
     "surface_members": [
@@ -28,9 +28,9 @@
     ]
   },
   "evaluation": {
-    "id": "TM-2408",
-    "evaluated_source_sha256": "595f653c93f9082a35dc7633cc62f893828e04570d16d5e83a69633335035be7",
-    "completed_at": "2026-08-26T14:00:12.187811Z",
+    "id": "TM-3298",
+    "evaluated_source_sha256": "598dfadabe238e0a0d849fe47d9d370fe56d339aff853dbc57916ad27f3e7e40",
+    "completed_at": "2026-09-05T13:01:16Z",
     "provider": "claude-code-oauth",
     "model": "haiku",
     "corpus": {
@@ -47,24 +47,24 @@
       "recheck_addr_sha256": "01ad650774f1e90c31052d21775ec2a0d45c9518962970458f9195b8204e3e70"
     },
     "artifacts": {
-      "eval_log_sha256": "6abe3e06be8f45026bc43093df2d17595badb47a5e7816a5d8d39b3ec5ebe2b1",
-      "eval_result_sha256": "b1b9e5314e900646177195ae5ea088843ed87bdadcfbaf72a7cbfdad7de6383b",
-      "recheck_log_sha256": "e7c7ab43576b850f1dfce019411b0c3990d40b0b9ae51fcbc3b3c17c1784f06e"
+      "eval_log_sha256": "d213ea160e9b05b1d58a7c23acc296f4a7f51ab69ff7170bf8d96eb92911c9cc",
+      "eval_result_sha256": "e55bd1b326da86960bf028c4c37df0ccec0a1494fda993ed68acfbb595746fd0",
+      "recheck_log_sha256": "0346ec197862a4707802b19b5d25f3f82a4051d94e1d98265e27bf1d2ecde512"
     },
     "recheck": {
       "baseline_duplicates": 1,
-      "duplicates": 8,
+      "duplicates": 4,
       "cases": 12,
       "suspect": 0
     },
     "confusion": {
-      "tp": 13,
+      "tp": 12,
       "fp": 1,
-      "fn": 10,
+      "fn": 11,
       "tn": 23
     },
     "collateral_damage": 0,
     "passed": true
   },
-  "issued_at": "2026-08-26T23:01:02+09:00"
+  "issued_at": "2026-09-05T22:02:30+09:00"
 }
