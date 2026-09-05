@@ -35,7 +35,18 @@ umask 077
 mkdir -p "$CACHE" "$STATE_DIR"
 # find_memory_tool comes from lib/hook-common.sh.
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+# bash 5 EPOCHREALTIME (no fork); the python3 fallback only runs where the
+# variable is unset (bash 4) — it used to cost two interpreter starts per
+# source refresh (#1484). Locale-safe: the separator may be `.` or `,`.
+now_ms() {
+  local t
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    t="${EPOCHREALTIME//[.,]/}"
+    printf '%s\n' "$(( t / 1000 ))"
+  else
+    python3 -c 'import time; print(int(time.time()*1000))'
+  fi
+}
 bytes_for() { [ -f "$1" ] && wc -c < "$1" | tr -d '[:space:]' || printf '0'; }
 
 # Non-blocking single-flight lock: if a refresh is already running, exit.
@@ -87,7 +98,13 @@ record_status() { # <name> <status> <duration_ms> <bytes> <error> [query] [confi
     --argjson max_age_sec "${max_age:-0}" \
     '({source:$source,status:$status,refreshed_at:$refreshed_at,duration_ms:$duration_ms,bytes:$bytes,error:$error,error_class:(if $error=="" then "" else ($status) end),query_hash:$query_hash,max_age_sec:$max_age_sec,stale:false}
       + (if $config_hash == "" then {} else {config_hash:$config_hash} end))' \
-    > "$CACHE/.${name}.status.json"
+    > "$CACHE/.${name}.status.json.tmp.$$" 2>/dev/null
+  # Atomic like meta.json below: wiki_cache_is_fresh and the doctor read this
+  # file while a refresh may be rewriting it; a torn/empty read must not happen.
+  if ! mv -f "$CACHE/.${name}.status.json.tmp.$$" "$CACHE/.${name}.status.json" 2>/dev/null; then
+    rm -f "$CACHE/.${name}.status.json.tmp.$$"
+    return 0
+  fi
   cp "$CACHE/.${name}.status.json" "$CACHE/${name}.meta.json" 2>/dev/null || true
 }
 

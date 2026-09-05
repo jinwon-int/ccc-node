@@ -7,7 +7,9 @@ set -uo pipefail
 [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] && exit 0
 
 EVENT="${1:-SessionStart}"
-CHEAT=${HOME:-/root}/.claude/hooks/tools-cheatsheet.md
+# Same hook-dir override load-memory.sh honours, so a test/alternate tree can
+# point at its own cheatsheet (#1484).
+CHEAT="${CCC_HOOK_DIR:-${HOME:-/root}/.claude/hooks}/tools-cheatsheet.md"
 
 ctx="$(cat "$CHEAT" 2>/dev/null)"
 [ -z "$ctx" ] && ctx="(tools cheatsheet missing: $CHEAT)"

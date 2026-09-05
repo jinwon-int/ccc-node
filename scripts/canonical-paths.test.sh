@@ -61,6 +61,32 @@ out="$(python3 "$LIB" "$TMP/g" "/opt/ccc-node" 2>&1)"; rc=$?
 ok "CLI refuses an unpaired argument list" \
   '[ "$rc" = 2 ] && grep -q "usage:" <<<"$out" && grep -Fxq "x" "$TMP/g"'
 
+# --files-from - (#1484): setup.sh feeds its whole rewrite set through ONE
+# interpreter. Same per-file transform; the first failure stops the run with
+# exit 1 (later files untouched), which is what the old per-file loop did under
+# setup.sh's `set -e`.
+mkdir -p "$TMP/batch"
+printf '/opt/ccc-node/one\n' > "$TMP/batch/one"
+printf 'plain\n' > "$TMP/batch/two"
+printf '/root/.claude/three\n' > "$TMP/batch/three"
+out="$(printf '%s\0' "$TMP/batch/one" "$TMP/batch/two" "$TMP/batch/three" \
+  | python3 "$LIB" --files-from - "/opt/ccc-node" "/root/ccc-node" "/root/.claude" "/home/n/.claude" 2>&1)"; rc=$?
+ok "batch CLI rewrites every NUL-separated file in one process" \
+  '[ "$rc" = 0 ] && [ -z "$out" ] && grep -Fxq "/root/ccc-node/one" "$TMP/batch/one" && grep -Fxq "plain" "$TMP/batch/two" && grep -Fxq "/home/n/.claude/three" "$TMP/batch/three"'
+printf '/opt/ccc-node/one\n' > "$TMP/batch/one"
+printf '\xff\xfe binary /opt/ccc-node\n' > "$TMP/batch/bad"
+printf '/opt/ccc-node/four\n' > "$TMP/batch/four"
+out="$(printf '%s\0' "$TMP/batch/one" "$TMP/batch/bad" "$TMP/batch/four" \
+  | python3 "$LIB" --files-from - "/opt/ccc-node" "/root/ccc-node" 2>&1)"; rc=$?
+ok "batch CLI stops at the first failing file with exit 1 and names it" \
+  '[ "$rc" = 1 ] && grep -Fq "$TMP/batch/bad" <<<"$out" && grep -Fxq "/root/ccc-node/one" "$TMP/batch/one" && grep -Fxq "/opt/ccc-node/four" "$TMP/batch/four"'
+out="$(printf '' | python3 "$LIB" --files-from - "/opt/ccc-node" "/root/ccc-node" 2>&1)"; rc=$?
+ok "batch CLI with no files is a no-op exit 0" '[ "$rc" = 0 ] && [ -z "$out" ]'
+out="$(printf '%s\0' "$TMP/batch/one" | python3 "$LIB" --files-from - "/opt/ccc-node" 2>&1)"; rc=$?
+ok "batch CLI refuses an unpaired argument list" '[ "$rc" = 2 ] && grep -q "usage:" <<<"$out"'
+ok "setup.sh feeds the rewrite set through the batch CLI" \
+  'grep -Fq "canonical_paths.py\" --files-from -" "$ROOT/setup.sh"'
+
 # This module holds the canonical literals, so an installed copy would have its
 # own constants rewritten by the transform it defines.
 ok "module is not installed into the harness directory" \

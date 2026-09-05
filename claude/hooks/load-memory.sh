@@ -134,11 +134,33 @@ _timing_flush() { # append one bounded JSON line; best-effort, never fails the h
       && mv -f "$file.tmp" "$file" 2>/dev/null || rm -f "$file.tmp"
   fi
 }
+_mark_split() { # <stage> <ms> — a stage timed by a child process (the render
+  # pipeline reports its search lanes); advance the previous mark past it so the
+  # enclosing bash-timed stage excludes those milliseconds.
+  [ "$TIMING_ENABLED" = 1 ] || return 0
+  case "$2" in ''|*[!0-9]*) return 0 ;; esac
+  [ -n "$_timing_marks" ] && _timing_marks+=" "
+  _timing_marks+="$1=$2"
+  _TIMING_PREV=$(( _TIMING_PREV + $2 * 1000 ))
+}
 _timing_begin() {
   [ "$TIMING_ENABLED" = 1 ] || return 0
   _TIMING_START="$(_now_us)"
   _TIMING_PREV="$_TIMING_START"
 }
+
+# Scratch directories (parallel scan lanes, render-pipeline output) are removed
+# where they are consumed; the trap covers the paths that never get there
+# (killed by the hook deadline, a failing `set -u` expansion, ...). Background
+# lanes are async subshells, which reset traps, so they cannot fire this early.
+scan_dir=""
+pipe_dir=""
+_cleanup_scratch() {
+  [ -n "$scan_dir" ] && rm -rf "$scan_dir" 2>/dev/null
+  [ -n "$pipe_dir" ] && rm -rf "$pipe_dir" 2>/dev/null
+  return 0
+}
+trap _cleanup_scratch EXIT
 
 scoped_paths_valid() {
   memory_scope_core_valid \
@@ -220,52 +242,23 @@ scan_capped_block() { # <label> <max> <text>
   fi
 }
 
-# Cross-source injection dedup. The local hot-memory search re-surfaces hits from
-# MEMORY.md/USER.md (source=memory) and the wiki cache (source=cache) that
-# are ALSO injected verbatim as their own blocks above — double-spending the
-# bounded injection budget. Drop such a hit only when its snippet is already fully
-# present in the injected text, so anything truncated away from the canonical
-# block is still kept (lossless). Structured (distilled-fact) and distill-state
-# hits have no other injection path and are always kept.
-# Set CCC_MEMORY_INJECT_DEDUP=0/false/off to disable.
-dedup_local_hot() { # <injected-text> <search-json>
-  if is_disabled "${CCC_MEMORY_INJECT_DEDUP:-1}"; then printf '%s' "$2"; return 0; fi
-  # JSON is passed via env, not argv: large blocks would risk ARG_MAX limits.
-  INJECTED="$1" SEARCH_JSON="$2" python3 "$MEMORY_RENDER_PY" dedup-local-hot 2>/dev/null || printf '%s' "$2"
-}
-
-# Fail closed immediately when Wiki memory is disabled, even before the next
-# background index update removes a stale wiki.txt row from SQLite.
-filter_disabled_wiki_hits() { # <search-json>
-  if ! is_disabled "$WIKI_ENABLED"; then printf '%s' "$1"; return 0; fi
-  SEARCH_JSON="$1" python3 "$MEMORY_RENDER_PY" filter-disabled-wiki-hits 2>/dev/null || printf '%s' '{"results":[]}'
-}
-
-# Render the (deduped) local hot-memory search JSON as compact, readable lines
-# for injection. The raw search JSON carries full filesystem paths, a per-result
-# score and an 8-field `signals` object that are debug-only noise to the model
-# and waste the bounded injection budget — the agent only needs the snippet and
-# which source it came from. The search tool and ccc-memory-explain still emit
-# full JSON for diagnostics; this only changes what gets injected.
-# Set CCC_MEMORY_INJECT_RENDER=0/false/off to inject the raw JSON instead.
-render_local_hot() { # <search-json>
-  if is_disabled "${CCC_MEMORY_INJECT_RENDER:-1}"; then printf '%s' "$1"; return 0; fi
-  SEARCH_JSON="$1" python3 "$MEMORY_RENDER_PY" render-local-hot 2>/dev/null || printf '%s' "$1"
-}
+# The local hot-memory chain — dynamic budget, bounded search lane(s), audience
+# merge, disabled-wiki filter, cross-source dedup, compact render — plus the
+# pending-promises and detached-jobs evidence blocks all run inside ONE
+# `memory_render.py pipeline` interpreter (#1484). They used to be one python3
+# start each (5-7 on the critical path). The knobs are unchanged:
+#   CCC_MEMORY_INJECT_DEDUP=0   inject search hits even when the snippet is
+#                               already fully present in MEMORY/USER/wiki
+#   CCC_MEMORY_INJECT_RENDER=0  inject the raw search JSON instead of lines
+#   CCC_MEMORY_DYNAMIC_BUDGET=0 keep the static local byte cap / result limit
+# scan-injection.sh stays a separate spawn after the pipeline: it is the
+# security boundary for every injected block and is not importable by design.
+# Fail-open is preserved stage by stage inside the pipeline; if the pipeline
+# itself cannot run (module missing, scratch dir unavailable) the local hot
+# block is empty and the evidence blocks fall back to their own modules —
+# exactly what a missing memory_render.py produced before.
 
 # find_memory_tool comes from lib/hook-common.sh.
-
-run_memory_search_bounded() { # <tool> <query> <limit> <timeout-seconds> [state-dir]
-  local tool="$1" query="$2" limit="$3" timeout_sec="$4" state_override="${5:-}"
-  python3 "$MEMORY_RENDER_PY" run-memory-search-bounded \
-    "$tool" "$query" "$limit" "$timeout_sec" "$state_override" 2>/dev/null || true
-}
-
-merge_local_hot() { # <primary-json> <recent-primary-json> [shared-json] [legacy-private-json]
-  PRIMARY_JSON="$1" RECENT_JSON="${2:-}" SHARED_JSON="${3:-}" LEGACY_JSON="${4:-}" \
-    PRIMARY_AUDIENCE="${MEMORY_AUDIENCE:-private}" \
-    python3 "$MEMORY_RENDER_PY" merge-local-hot 2>/dev/null || printf '%s' "$1"
-}
 
 build_memory_query() {
   if [ -n "${QUERY:-}" ]; then printf '%s' "$QUERY"; return 0; fi
@@ -377,7 +370,6 @@ scan_parallel_worthwhile() {
   case "$cores" in ''|*[!0-9]*) return 1 ;; esac
   [ "$cores" -ge "$CCC_MEMORY_SCAN_MIN_CORES" ]
 }
-scan_dir=""
 scan_lane() { # <name> <label> <max> <text>
   scan_capped_block "$2" "$3" "$4" > "$scan_dir/$1" 2>/dev/null \
     && : > "$scan_dir/$1.done"
@@ -422,7 +414,7 @@ fi
 if ! is_disabled "$WIKI_ENABLED"; then
   wiki="$(scanned_block wiki family-wiki-cache "$MAX_WIKI" "$wiki")"
 fi
-if [ -n "$scan_dir" ]; then rm -rf "$scan_dir"; fi
+if [ -n "$scan_dir" ]; then rm -rf "$scan_dir"; scan_dir=""; fi
 
 # Relevance-aware budget. The per-block caps sum to more than CCC_MEMORY_MAX_BYTES,
 # so today the tail (wiki) is simply truncated and any budget a small/empty block
@@ -433,8 +425,11 @@ if [ -n "$scan_dir" ]; then rm -rf "$scan_dir"; fi
 # its byte budget AND how many results we fetch to fill it. Purely additive: never
 # below MAX_LOCAL / the default limit (worst case == today); the final MAX_TOTAL
 # cap still bounds the whole injection. Disable with CCC_MEMORY_DYNAMIC_BUDGET=0.
+# The arithmetic itself runs inside the render pipeline below; only the block
+# sizes are measured here (no fork).
 alloc_local="$MAX_LOCAL"
 search_limit="${CCC_MEMORY_SEARCH_LIMIT:-}"
+budget_spec=""
 if ! is_disabled "${CCC_MEMORY_DYNAMIC_BUDGET:-1}"; then
   msize="$(byte_len "$mem")"
   wsize="$(byte_len "$wiki")"
@@ -444,125 +439,96 @@ if ! is_disabled "${CCC_MEMORY_DYNAMIC_BUDGET:-1}"; then
   # alloc = byte budget for local (>= MAX_LOCAL, reclaiming slack up to the total
   # minus a ~1000B scaffold reserve); dyn_limit = results to fetch to fill it
   # (~180B/result, clamped to [5,25]). The final limit_bytes is the hard bound.
-  budget_out="$(python3 "$MEMORY_RENDER_PY" dynamic-budget \
-    "$MAX_TOTAL" 1000 "$MAX_LOCAL" 180 5 25 "$msize" "$rsize" "$wsize" 2>/dev/null || true)"
-  alloc_candidate="${budget_out%% *}"
-  limit_candidate="${budget_out##* }"
-  case "$alloc_candidate" in ''|*[!0-9]*) ;; *) alloc_local="$alloc_candidate" ;; esac
-  if [ -z "$search_limit" ]; then
-    case "$limit_candidate" in ''|*[!0-9]*) ;; *) search_limit="$limit_candidate" ;; esac
-  fi
+  budget_spec="$MAX_TOTAL,1000,$MAX_LOCAL,180,5,25,$msize,$rsize,$wsize"
 fi
-
-local_hot=""
 _mark dynamic_budget
-recent_hot=""
-shared_hot=""
-legacy_hot=""
+
+# Search lane(s). No line-cap on the tool output: dedup/render parse the whole
+# JSON (a partial cut would break json.loads and fall back to raw). Result
+# count is bounded by search_limit and the byte budget by the scan cap below.
+# SessionStart is read-only and must finish before the outer 15-second hook
+# deadline. A short inner deadline drops only local-hot results; canonical
+# MEMORY/USER/cache/resume blocks assembled above still inject. The runner uses
+# Python rather than GNU timeout so the same contract works on Termux.
+# #897 step 2: in audience mode the local/recent/shared/legacy lanes are
+# independent DB queries — the pipeline runs them concurrently under ONE global
+# budget (default 3s) instead of the serial 3+1+3+2s chain, each lane keeping
+# its own inner timeout; CCC_MEMORY_SEARCH_PARALLEL=0 restores the serial path.
+search_tool=""
 if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || ! is_disabled "$LOCAL_ENABLED"; then
   search_tool="$(find_memory_tool ccc-memory-search.sh 2>/dev/null || true)"
-  if [ -n "$search_tool" ]; then
-    # No line-cap here: dedup/render parse the whole JSON (a partial cut would
-    # break json.loads and fall back to raw). Result count is bounded by
-    # search_limit and the byte budget is enforced by limit_bytes below.
-    # SessionStart is read-only and must finish before the outer 15-second hook
-    # deadline. A short inner deadline drops only local-hot results; canonical
-    # MEMORY/USER/cache/resume blocks assembled above still inject. The helper
-    # uses Python rather than GNU timeout so the same contract works on Termux.
-    # #897 step 2: in audience mode the local/recent/shared/legacy lanes are
-    # independent DB queries — run them concurrently under ONE global budget
-    # (default 3s) instead of the serial 3+1+3+2s chain. Each lane keeps its
-    # own inner timeout so a killed wait never orphans an unbounded search;
-    # CCC_MEMORY_SEARCH_PARALLEL=0 restores the serial path. Needs EPOCHREALTIME
-    # (bash 5) for the deadline; without it the serial path is used.
-    search_dir=""
-    if ! is_disabled "$AUDIENCE_SCOPED" \
-      && ! is_disabled "${CCC_MEMORY_SEARCH_PARALLEL:-1}" \
-      && [ -n "${EPOCHREALTIME:-}" ]; then
-      search_dir="$(mktemp -d "${TMPDIR:-/tmp}/ccc-mem-search.XXXXXX" 2>/dev/null || true)"
-    fi
-    if ! is_disabled "$AUDIENCE_SCOPED" && [ -n "$search_dir" ]; then
-      ( run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$STATE_DIR" > "$search_dir/local" 2>/dev/null ) &
-      ( run_memory_search_bounded "$search_tool" "distilled text" "$search_limit" "${CCC_MEMORY_RECENT_SEARCH_TIMEOUT_SEC:-1}" "$STATE_DIR" > "$search_dir/recent" 2>/dev/null ) &
-      if [ "$MEMORY_AUDIENCE" = "private" ] \
-        && [ -n "$SHARED_STATE_DIR" ] \
-        && [ "$SHARED_STATE_DIR" != "$STATE_DIR" ]; then
-        ( run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$SHARED_STATE_DIR" > "$search_dir/shared" 2>/dev/null ) &
-        if [ -n "$LEGACY_STATE_DIR" ] \
-          && [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] \
-          && [ "$LEGACY_STATE_DIR" != "$SHARED_STATE_DIR" ]; then
-          ( run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_LEGACY_SEARCH_TIMEOUT_SEC:-2}" "$LEGACY_STATE_DIR" > "$search_dir/legacy" 2>/dev/null ) &
-        fi
-      fi
-      search_budget="${CCC_MEMORY_SEARCH_GLOBAL_TIMEOUT_SEC:-3}"
-      case "$search_budget" in ''|*[!0-9]*) search_budget=3 ;; esac
-      deadline_us=$(( $(_now_us) + search_budget * 1000000 ))
-      while :; do
-        alive=0
-        for search_pid in $(jobs -p); do
-          kill -0 "$search_pid" 2>/dev/null && alive=1
-        done
-        [ "$alive" = 0 ] && break
-        [ "$(_now_us)" -ge "$deadline_us" ] && break
-        sleep 0.05
-      done
-      for search_pid in $(jobs -p); do
-        kill "$search_pid" 2>/dev/null
-      done
-      wait 2>/dev/null
-      local_hot="$(cat "$search_dir/local" 2>/dev/null)"
-      recent_hot="$(cat "$search_dir/recent" 2>/dev/null)"
-      shared_hot="$(cat "$search_dir/shared" 2>/dev/null)"
-      legacy_hot="$(cat "$search_dir/legacy" 2>/dev/null)"
-      rm -rf "$search_dir"
-      _mark search_parallel
-    else
-      local_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$STATE_DIR")"
-      _mark search_local
-    fi
-    if ! is_disabled "$AUDIENCE_SCOPED"; then
-      if [ -z "$search_dir" ]; then
-        # A just-committed Codex fact may not match the checkout-derived startup
-        # query yet. The write-back indexer tags these rows `distilled`; merge one
-        # small recent-fact lane so the immediately following isolated thread sees
-        # the durable fact without waiting for another turn or background refresh.
-        recent_hot="$(run_memory_search_bounded "$search_tool" "distilled text" "$search_limit" "${CCC_MEMORY_RECENT_SEARCH_TIMEOUT_SEC:-1}" "$STATE_DIR")"
-        _mark search_recent
-        if [ "$MEMORY_AUDIENCE" = "private" ] \
-          && [ -n "$SHARED_STATE_DIR" ] \
-          && [ "$SHARED_STATE_DIR" != "$STATE_DIR" ]; then
-          shared_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$SHARED_STATE_DIR")"
-          _mark search_shared
-          if [ -n "$LEGACY_STATE_DIR" ] \
-            && [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] \
-            && [ "$LEGACY_STATE_DIR" != "$SHARED_STATE_DIR" ]; then
-            legacy_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_LEGACY_SEARCH_TIMEOUT_SEC:-2}" "$LEGACY_STATE_DIR")"
-            _mark search_legacy
-          fi
-        fi
-      fi
-      local_hot="$(merge_local_hot "$local_hot" "$recent_hot" "$shared_hot" "$legacy_hot")"
-      _mark merge
+fi
+pipe_audience=0; pipe_parallel=0; pipe_shared_state=""; pipe_legacy_state=""
+if ! is_disabled "$AUDIENCE_SCOPED"; then
+  pipe_audience=1
+  is_disabled "${CCC_MEMORY_SEARCH_PARALLEL:-1}" || pipe_parallel=1
+  if [ "$MEMORY_AUDIENCE" = "private" ] \
+    && [ -n "$SHARED_STATE_DIR" ] \
+    && [ "$SHARED_STATE_DIR" != "$STATE_DIR" ]; then
+    pipe_shared_state="$SHARED_STATE_DIR"
+    if [ -n "$LEGACY_STATE_DIR" ] \
+      && [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] \
+      && [ "$LEGACY_STATE_DIR" != "$SHARED_STATE_DIR" ]; then
+      pipe_legacy_state="$LEGACY_STATE_DIR"
     fi
   fi
 fi
+pipe_wiki=1; is_disabled "$WIKI_ENABLED" && pipe_wiki=0
+pipe_dedup=1; is_disabled "${CCC_MEMORY_INJECT_DEDUP:-1}" && pipe_dedup=0
+pipe_render=1; is_disabled "${CCC_MEMORY_INJECT_RENDER:-1}" && pipe_render=0
+pipe_promises=""
+if ! is_disabled "$PROMISES_INJECT" && [ -r "$PENDING_PROMISES_PY" ]; then
+  pipe_promises="$EXTERNAL_WAIT_HOME/waits.json"
+fi
+pipe_detached=""
+if ! is_disabled "$DETACHED_JOBS_INJECT" && [ -r "$DETACHED_JOBS_PY" ]; then
+  pipe_detached="$DETACHED_JOBS_REGISTRY"
+fi
+search_budget="${CCC_MEMORY_SEARCH_GLOBAL_TIMEOUT_SEC:-3}"
+case "$search_budget" in ''|*[!0-9]*) search_budget=3 ;; esac
 
-# The whole post-processing chain transforms "" into "" through four Python
-# starts; skip it when no search lane produced anything (tool missing, search
-# disabled, or every lane timed out).
+local_hot=""
+promises=""
+detached=""
+pipe_ok=0
+if [ -r "$MEMORY_RENDER_PY" ]; then
+  pipe_dir="$(mktemp -d "${TMPDIR:-/tmp}/ccc-mem-pipe.XXXXXX" 2>/dev/null || true)"
+fi
+if [ -n "$pipe_dir" ]; then
+  # INJECTED (dedup reference: what is ACTUALLY injected above, post-redaction,
+  # post-truncation) rides on env, not argv — large blocks would risk ARG_MAX.
+  if pipe_meta="$(INJECTED="$mem
+$wiki" python3 "$MEMORY_RENDER_PY" pipeline out="$pipe_dir" \
+      budget="$budget_spec" alloc="$MAX_LOCAL" limit="$search_limit" \
+      tool="$search_tool" query="$QUERY" state_dir="$STATE_DIR" \
+      timeout="${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" \
+      audience_scoped="$pipe_audience" audience="${MEMORY_AUDIENCE:-private}" \
+      parallel="$pipe_parallel" global_timeout="$search_budget" \
+      recent_timeout="${CCC_MEMORY_RECENT_SEARCH_TIMEOUT_SEC:-1}" \
+      shared_state_dir="$pipe_shared_state" shared_timeout="${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" \
+      legacy_state_dir="$pipe_legacy_state" legacy_timeout="${CCC_MEMORY_LEGACY_SEARCH_TIMEOUT_SEC:-2}" \
+      wiki_enabled="$pipe_wiki" dedup="$pipe_dedup" render="$pipe_render" \
+      promises_file="$pipe_promises" promises_max="$MAX_PROMISES" \
+      detached_registry="$pipe_detached" detached_max="$MAX_DETACHED_JOBS" 2>/dev/null)"; then
+    pipe_ok=1
+    for pipe_kv in $pipe_meta; do
+      case "$pipe_kv" in
+        alloc=*)
+          case "${pipe_kv#alloc=}" in ''|*[!0-9]*) ;; *) alloc_local="${pipe_kv#alloc=}" ;; esac ;;
+        limit=*) ;;
+        *=*) _mark_split "${pipe_kv%%=*}" "${pipe_kv#*=}" ;;
+      esac
+    done
+    [ -f "$pipe_dir/local_hot" ] && local_hot="$(<"$pipe_dir/local_hot")"
+    [ -f "$pipe_dir/promises" ] && promises="$(<"$pipe_dir/promises")"
+    [ -f "$pipe_dir/detached" ] && detached="$(<"$pipe_dir/detached")"
+  fi
+  rm -rf "$pipe_dir"; pipe_dir=""
+fi
+_mark pipeline
+
 if [ -n "$local_hot" ]; then
-  local_hot="$(filter_disabled_wiki_hits "$local_hot")"
-  _mark filter_wiki
-
-  # Dedup the local hot block against what we ACTUALLY inject above (post-redaction,
-  # post-truncation) before rendering it — so it surfaces index-only content
-  # (distilled facts) instead of echoing the canonical blocks.
-  local_hot="$(dedup_local_hot "$mem
-$wiki" "$local_hot")"
-  _mark dedup
-  # Render the search JSON to compact readable lines, then apply the (possibly
-  # enlarged) local byte budget (scan + cap in one process).
-  local_hot="$(render_local_hot "$local_hot")"
+  # Apply the (possibly enlarged) local byte budget: scan + cap in one process.
   local_hot="$(scan_capped_block local-hot-memory "$alloc_local" "$local_hot")"
   _mark render
 fi
@@ -609,8 +575,9 @@ fi
 # a missing/broken helper yields an empty block, never a failed hook.
 promises_block=""
 if ! is_disabled "$PROMISES_INJECT"; then
-  promises=""
-  if [ -r "$PENDING_PROMISES_PY" ]; then
+  # Rendered inside the pipeline above; only a pipeline that could not run
+  # falls back to the module's own interpreter.
+  if [ "$pipe_ok" != 1 ] && [ -r "$PENDING_PROMISES_PY" ]; then
     promises="$(python3 "$PENDING_PROMISES_PY" \
       "$EXTERNAL_WAIT_HOME/waits.json" --max-bytes "$MAX_PROMISES" 2>/dev/null)" || promises=""
   fi
@@ -630,8 +597,8 @@ fi
 # yields an empty block, never a failed hook.
 detached_block=""
 if ! is_disabled "$DETACHED_JOBS_INJECT"; then
-  detached=""
-  if [ -r "$DETACHED_JOBS_PY" ]; then
+  # Same pipeline-first / module fallback as the promises block.
+  if [ "$pipe_ok" != 1 ] && [ -r "$DETACHED_JOBS_PY" ]; then
     detached="$(python3 "$DETACHED_JOBS_PY" sweep \
       "$DETACHED_JOBS_REGISTRY" --max-bytes "$MAX_DETACHED_JOBS" 2>/dev/null)" || detached=""
   fi
@@ -724,7 +691,21 @@ ${ws_block}${promises_block}${detached_block}
 ${local_hot:-(local hot memory disabled or no hits)}
 ${skills_block}${wiki_block}"
 
-ctx="$(printf '%s' "$ctx" | limit_bytes "$MAX_TOTAL")"
+# Final hard cap. limit-bytes passes an under-cap payload through unchanged, so
+# spend the interpreter only when there is something to cut; the shell-side
+# path only has to mirror the trailing-newline strip of the `$(...)` it replaces.
+# A non-numeric cap keeps going through the interpreter (its behaviour, not a
+# new one here).
+case "$MAX_TOTAL" in
+  ''|*[!0-9]*) ctx="$(printf '%s' "$ctx" | limit_bytes "$MAX_TOTAL")" ;;
+  *)
+    if [ "$MAX_TOTAL" -gt 0 ] && [ "$(byte_len "$ctx")" -gt "$MAX_TOTAL" ]; then
+      ctx="$(printf '%s' "$ctx" | limit_bytes "$MAX_TOTAL")"
+    else
+      ctx="${ctx%"${ctx##*[!$'\n']}"}"
+    fi
+    ;;
+esac
 
 jq -n --arg ctx "$ctx" --arg event "$EVENT" \
   '{hookSpecificOutput:{hookEventName:$event,additionalContext:$ctx}}'
