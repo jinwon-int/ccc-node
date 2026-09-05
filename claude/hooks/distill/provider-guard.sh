@@ -12,7 +12,7 @@ ccc_distill_classify_text() {
   case "$text" in
     *"Not logged in"*|*"Please run /login"*) printf '%s\n' not_logged_in ;;
     *"OAuth session expired"*|*"could not be refreshed"*) printf '%s\n' oauth_expired ;;
-    *"weekly limit"*|*"Weekly limit"*|*"hit your weekly limit"*) printf '%s\n' weekly_limit ;;
+    *"weekly limit"*|*"Weekly limit"*) printf '%s\n' weekly_limit ;;
     *"rate limit"*|*"Rate limit"*|*"rate_limit"*) printf '%s\n' rate_limited ;;
     *) printf '%s\n' extract_failed ;;
   esac
@@ -39,7 +39,7 @@ ccc_distill_last_error_path() {
 
 ccc_distill_cooldown_until_iso() {
   local cls="${1:-extract_failed}"
-  local now epoch until_epoch auth_s rate_s
+  local now until_epoch auth_s rate_s
   now="$(date -u +%s)"
   auth_s="${CCC_DISTILL_AUTH_COOLDOWN_SEC:-21600}"
   rate_s="${CCC_DISTILL_RATE_COOLDOWN_SEC:-1800}"

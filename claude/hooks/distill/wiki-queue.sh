@@ -139,7 +139,7 @@ seen_row() { # <hash>
 }
 
 update_seen() { # <hash> <first> <last> <count>
-  local hash="$1" first="$2" last="$3" count="$4" tmp found=0
+  local hash="$1" first="$2" last="$3" count="$4" tmp
   tmp="$SEEN.tmp.$$"
   awk -v h="$hash" -v first="$first" -v last="$last" -v count="$count" '
     $4 == h { print first, last, count, h; found=1; next }

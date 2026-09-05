@@ -9,6 +9,7 @@ _CCC_HARNESS_PATHS_PY="$_CCC_HARNESS_PATHS_DIR/harness_paths.py"
 # approvals file, not a managed artifact. setup.sh seeds it from
 # claude/settings.local.template.json only when absent; self-update must never
 # redeploy, snapshot, or roll it back over a node's accumulated approvals (#454).
+# shellcheck disable=SC2034  # sourced library: consumed by setup.sh / ccc-self-update.sh
 CCC_MANAGED_PATHS=(
   settings.json hooks output-styles headless.sh
   agents commands skills CLAUDE.md memories

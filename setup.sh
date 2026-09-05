@@ -179,7 +179,6 @@ _ccc_checkout_owner_guard() {
 _ccc_checkout_owner_guard || exit 2
 MEM_DIR="$CLAUDE_DIR/memories"          # node-owned memory (Hermes-independent)
 HERMES_ROOT="${CCC_HERMES_DIR:-$HOME/.hermes}"
-HERMES_DIR="$HERMES_ROOT/memories"      # legacy memory location (fallback only)
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 WIKI_AGENT_BIN="${CCC_WIKI_AGENT_BIN:-$HOME/.wiki-agent/bin/wiki-agent}"
 BRIDGE_DEFAULT_PATH="${CCC_BRIDGE_DEFAULT_PATH:-$HOME}"
@@ -280,7 +279,7 @@ begin_install_transaction() {
 rollback_install_transaction() {
   local item failed=0
   trap - EXIT
-  for item in "${CCC_MANAGED_PATHS[@]}"; do rm -rf -- "$CLAUDE_DIR/$item" || failed=1; done
+  for item in "${CCC_MANAGED_PATHS[@]}"; do rm -rf -- "${CLAUDE_DIR:?}/$item" || failed=1; done
   mkdir -p "$CLAUDE_DIR" "$HERMES_ROOT" || failed=1
   tar -xzf "$SETUP_TXN_DIR/claude.tar.gz" -C "$CLAUDE_DIR" || failed=1
   ccc_restore_codex_policy_state "$CODEX_DIR" "$SETUP_TXN_DIR" || failed=1

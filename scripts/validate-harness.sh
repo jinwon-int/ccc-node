@@ -103,26 +103,18 @@ SC_SCOPE_EXTRA=(scripts/git-hooks/managed-checkout-guard)
 # is never added here — it is linted at warning level from its first commit.
 SC_WARN_BASELINE=(bridge/service-install.test.sh
          bridge/service-launchd.sh
-         bridge/setup.sh
-         bridge/start.sh
          claude/hooks/checkpoint.test.sh
          claude/hooks/distill-scope.test.sh
-         claude/hooks/distill/extract.sh
          claude/hooks/distill/extract.test.sh
          claude/hooks/distill/local-facts.test.sh
          claude/hooks/distill/pending-drain.test.sh
-         claude/hooks/distill/provider-guard.sh
-         claude/hooks/distill/wiki-queue.sh
          claude/hooks/distill/wiki-queue.test.sh
          claude/hooks/lib/autonomy-guard.test.sh
          claude/hooks/lib/detached_jobs.test.sh
-         claude/hooks/lib/memory-common.sh
          claude/hooks/lib/memory_render.test.sh
          claude/hooks/lib/mtime-prune.test.sh
          claude/hooks/lib/pending_promises.test.sh
-         claude/hooks/lib/spawn-detached.sh
          claude/hooks/lib/test-stub.test.sh
-         claude/hooks/load-memory.sh
          claude/hooks/memory-hooks.test.sh
          claude/hooks/nunchi/assemble-fixtures.test.sh
          claude/hooks/nunchi/codex-feed.test.sh
@@ -183,14 +175,12 @@ SC_WARN_BASELINE=(bridge/service-install.test.sh
          scripts/install-pr-status-poll-cron.test.sh
          scripts/install-skill-autosave-cron.test.sh
          scripts/install-tunnel-audit-cron.test.sh
-         scripts/lib/harness-paths.sh
          scripts/lib/installer-cron-common.test.sh
          scripts/rescreen-rotation.test.sh
          scripts/setup.test.sh
          scripts/tunnel-audit-fleet.sh
          scripts/tunnel-audit-fleet.test.sh
          scripts/tunnel-audit.test.sh
-         setup.sh
          skills/skillsuggest/scan.sh)
 # --- end manifests -----------------------------------------------------------
 

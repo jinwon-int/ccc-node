@@ -8,6 +8,9 @@
 # implemented separately (epic #584 P1-2) — a divergence there is a fail-open
 # cross-audience leak hazard, so the core rules live in exactly one place.
 
+# Sourced library: AUDIENCE_SCOPED / SHARED_FACTS_FILE are consumed by the
+# sourcing hook (refresh-memory.sh), not by this file.
+# shellcheck disable=SC2034
 AUDIENCE_SCOPED="${CCC_MEMORY_AUDIENCE_SCOPED:-0}"
 MEMORY_AUDIENCE="${CCC_MEMORY_AUDIENCE:-legacy}"
 MEMORY_SCOPE="${CCC_MEMORY_SCOPE:-}"
@@ -15,6 +18,7 @@ AUDIENCE_ROOT="${CCC_MEMORY_AUDIENCE_ROOT:-}"
 SHARED_STATE_DIR="${CCC_MEMORY_SHARED_STATE_DIR:-}"
 SHARED_CACHE_DIR="${CCC_MEMORY_SHARED_CACHE_DIR:-}"
 SHARED_MEMDIR="${CCC_MEMORY_SHARED_DIR:-}"
+# shellcheck disable=SC2034  # consumed by refresh-memory.sh (see header note)
 SHARED_FACTS_FILE="${CCC_MEMORY_SHARED_FACTS_FILE:-}"
 
 # memory_scope_core_valid — audience:scope shape plus the scoped paths every
