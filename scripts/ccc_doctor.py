@@ -27,6 +27,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -194,6 +195,51 @@ def load_owner_only_json(path: Path, *, max_bytes: int) -> dict[str, Any]:
             os.close(descriptor)
 CODEX_PROBE_TIMEOUT_SECONDS = 5.0
 CODEX_PROBE_TIMEOUT_MAX_SECONDS = 10.0
+# Every subprocess the doctor spawns is bounded (#1481). A wedged `git
+# describe` (stale index lock, hung credential helper) or a `tar` on a stalled
+# mount used to hang the whole diagnosis, and doctor runs under cron and
+# self-update's check.sh where nothing would ever kill it. Probes take the
+# short bound; backup/restore archives of ~/.claude take a longer one because
+# they genuinely stream data. CCC_DOCTOR_SUBPROCESS_TIMEOUT overrides both
+# (the test suite uses it to keep the hang fixtures fast).
+SUBPROCESS_TIMEOUT_SECONDS = 30.0
+ARCHIVE_TIMEOUT_SECONDS = 120.0
+
+
+def subprocess_timeout(default: float = SUBPROCESS_TIMEOUT_SECONDS) -> float:
+    """Seconds to allow a doctor subprocess; env override, never below 0.1s."""
+    value = os.environ.get("CCC_DOCTOR_SUBPROCESS_TIMEOUT", "")
+    try:
+        timeout = float(value) if value else default
+    except ValueError:
+        return default
+    return max(timeout, 0.1)
+
+
+def atomic_write_bytes(dst: Path, payload: bytes, mode: int) -> None:
+    """Replace ``dst`` through a same-directory temp file and rename (#1481).
+
+    Mirrors setup.sh's atomic_install: a reader that opens settings.json or a
+    hook mid-repair sees either the old or the new file, never a truncated one,
+    and the temp file is removed on any failure. ``mode`` is applied to the temp
+    file before the rename so the target never flips permissions. A symlinked
+    destination is written through to its target so the link itself survives.
+    """
+    if dst.is_symlink():
+        dst = dst.resolve()
+    fd, raw_tmp = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=dst.parent)
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
 
 _CANONICAL_PATHS: Any = None
 _CANONICAL_PATHS_TRIED = False
@@ -295,16 +341,15 @@ class Doctor:
             return False
 
     def install_source_file(self, src: Path, dst: Path) -> None:
-        """Install a template the same way setup.sh does, rewrite included."""
+        """Install a template the same way setup.sh does, rewrite included.
+
+        Atomic (temp + rename in the destination directory, #1481): a hook
+        Claude Code fires between the truncate and the final write of a plain
+        overwrite would have executed a half-written script.
+        """
         expected = self.expected_installed_text(src)
-        if expected is None:
-            shutil.copyfile(src, dst)
-        else:
-            dst.write_text(expected, encoding="utf-8")
-        try:
-            shutil.copymode(src, dst)
-        except Exception:
-            pass
+        payload = src.read_bytes() if expected is None else expected.encode("utf-8")
+        atomic_write_bytes(dst, payload, stat.S_IMODE(src.stat().st_mode))
 
     def check_canonical_rewrite(self) -> None:
         if canonical_paths_module() is None:
@@ -438,18 +483,43 @@ class Doctor:
                 # the script's `#!/usr/bin/env bash` shebang cannot be resolved
                 # on Termux (no /usr/bin/env), where direct exec raises ENOENT.
                 out = subprocess.check_output(
-                    ["bash", str(version)], env={**os.environ, "CCC_VERSION_REPO_DIR": str(self.repo)}, text=True, stderr=subprocess.DEVNULL
+                    ["bash", str(version)], env={**os.environ, "CCC_VERSION_REPO_DIR": str(self.repo)}, text=True, stderr=subprocess.DEVNULL,
+                    timeout=subprocess_timeout(),
                 ).strip()
                 if out:
                     return out
+            except subprocess.TimeoutExpired:
+                self.note_timeout("ccc-version.sh")
             except Exception:
                 pass  # fall through to git describe rather than giving up (#771)
         try:
             return subprocess.check_output(
-                ["git", "-C", str(self.repo), "describe", "--tags", "--dirty", "--always"], text=True, stderr=subprocess.DEVNULL
+                ["git", "-C", str(self.repo), "describe", "--tags", "--dirty", "--always"], text=True, stderr=subprocess.DEVNULL,
+                timeout=subprocess_timeout(),
             ).strip()
+        except subprocess.TimeoutExpired:
+            self.note_timeout("git describe")
+            return "unknown (timed out)"
         except Exception:
             return "unknown"
+
+    def note_timeout(self, what: str, timeout: float | None = None) -> None:
+        """Say on stderr that a bounded probe hit its limit (never silent, #1481)."""
+        limit = subprocess_timeout() if timeout is None else timeout
+        print(f"ccc-doctor: {what} timed out after {limit:g}s; treating as failed", file=sys.stderr)
+
+    def run_archive(self, args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any] | None:
+        """Run a tar step under the archive bound; None means it timed out."""
+        timeout = subprocess_timeout(ARCHIVE_TIMEOUT_SECONDS)
+        try:
+            return subprocess.run(args, timeout=timeout, check=False, **kwargs)
+        except subprocess.TimeoutExpired:
+            self.note_timeout(" ".join(args[:2]), timeout)
+            return None
+
+    def archive_step_ok(self, args: list[str], **kwargs: Any) -> bool:
+        proc = self.run_archive(args, **kwargs)
+        return proc is not None and proc.returncode == 0
 
     def diagnose(self) -> None:  # noqa: C901 -- #348 baseline hotspot
         if not self.settings.exists():
@@ -2029,10 +2099,15 @@ class Doctor:
     def validate_settings_backup(self, archive: Path | None) -> bool:
         if not archive or not archive.is_file():
             return False
-        return subprocess.run(["tar", "-tzf", str(archive), "settings.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        return self.archive_step_ok(
+            ["tar", "-tzf", str(archive), "settings.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
 
     def timestamp(self) -> str:
-        return subprocess.check_output(["date", "+%Y%m%d-%H%M%S"], text=True).strip()
+        # Backup-name suffix only. Local time, exactly what the former
+        # `date +%Y%m%d-%H%M%S` subprocess produced, so archive names stay
+        # comparable with older backups on the same node.
+        return datetime.now().strftime("%Y%m%d-%H%M%S")
 
     def apply_settings_repair(self) -> bool:
         desired = self.desired_settings()
@@ -2042,11 +2117,18 @@ class Doctor:
         backup_dir = self.claude_dir / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
         archive = backup_dir / f"ccc-doctor-{ts}.tar.gz"
-        ok = subprocess.run(["tar", "-czf", str(archive), "-C", str(self.claude_dir), "settings.json"]).returncode == 0
+        ok = self.archive_step_ok(["tar", "-czf", str(archive), "-C", str(self.claude_dir), "settings.json"])
         if not ok or not self.validate_settings_backup(archive):
             print(f"failed to create valid settings backup: {archive}", file=sys.stderr)
             return False
-        self.settings.write_text(json.dumps(desired, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        # Keep the live file's mode (setup.sh's atomic_install does the same
+        # for an existing destination); fall back to owner-only if it is gone.
+        try:
+            mode = stat.S_IMODE(self.settings.stat().st_mode)
+        except OSError:
+            mode = 0o600
+        payload = (json.dumps(desired, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        atomic_write_bytes(self.settings, payload, mode)
         print(f"applied settings.json repair; backup={archive}")
         return True
 
@@ -2065,18 +2147,16 @@ class Doctor:
         backup_dir.mkdir(parents=True, exist_ok=True)
         pre_archive = backup_dir / f"ccc-doctor-pre-rollback-{ts}.tar.gz"
         if self.settings.is_file():
-            created = subprocess.run(
+            created = self.archive_step_ok(
                 ["tar", "-czf", str(pre_archive), "-C", str(self.claude_dir), "settings.json"],
-                check=False,
-            ).returncode == 0
+            )
             if not created or not self.validate_settings_backup(pre_archive):
                 pre_archive.unlink(missing_ok=True)
                 print("failed to create valid pre-rollback settings backup; refusing rollback.", file=sys.stderr)
                 return False
-        restored = subprocess.run(
+        restored = self.archive_step_ok(
             ["tar", "-xzf", str(archive), "-C", str(self.claude_dir), "settings.json"],
-            check=False,
-        ).returncode == 0
+        )
         if not restored:
             print(f"failed to restore settings.json; recovery backup preserved at {pre_archive}", file=sys.stderr)
             return False
@@ -2131,13 +2211,8 @@ class Doctor:
     def validate_file_repair_backup(self, archive: Path, expected: list[str]) -> bool:
         if not archive.is_file():
             return False
-        listing = subprocess.run(
-            ["tar", "-tzf", str(archive)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if listing.returncode != 0:
+        listing = self.run_archive(["tar", "-tzf", str(archive)], capture_output=True, text=True)
+        if listing is None or listing.returncode != 0:
             return False
         archived = {line.rstrip("/") for line in listing.stdout.splitlines() if line}
         return set(expected).issubset(archived)
@@ -2155,19 +2230,17 @@ class Doctor:
                     fh.write(rel + "\n")
                 list_path = fh.name
             try:
-                created = subprocess.run(
+                created = self.archive_step_ok(
                     ["tar", "-czf", str(archive), "-C", str(self.claude_dir), "-T", list_path],
-                    check=False,
-                ).returncode == 0
+                )
             finally:
                 Path(list_path).unlink(missing_ok=True)
         else:
-            created = subprocess.run(
+            created = self.archive_step_ok(
                 ["tar", "-czf", str(archive), "-C", str(self.claude_dir), "--files-from", "/dev/null", "--warning=no-file-changed"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                check=False,
-            ).returncode == 0
+            )
         if not created or not self.validate_file_repair_backup(archive, existing):
             archive.unlink(missing_ok=True)
             manifest.unlink(missing_ok=True)
