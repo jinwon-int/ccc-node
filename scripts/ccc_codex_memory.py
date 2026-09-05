@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -122,17 +121,14 @@ class MaterializeOptions:
         loader_raw = (env.get("CCC_CODEX_MEMORY_LOADER") or "").strip()
         return cls(
             codex_home=codex_home,
-            memory_max_bytes=_bounded_int(
-                env.get("CCC_CODEX_MEMORY_MAX_BYTES"), 8192, minimum=128, maximum=24576
+            memory_max_bytes=_secure_fs.bounded_int_env(
+                env, "CCC_CODEX_MEMORY_MAX_BYTES", 8192, 128, 24576, clamp=True
             ),
             # Floor covers the static header (markers, metadata, policy
             # blocks — ~1.6 KiB after #1176) so a minimum budget is still
             # satisfiable by a non-empty snapshot.
-            agents_budget_bytes=_bounded_int(
-                env.get("CCC_CODEX_AGENTS_BUDGET_BYTES"),
-                24576,
-                minimum=2048,
-                maximum=32768,
+            agents_budget_bytes=_secure_fs.bounded_int_env(
+                env, "CCC_CODEX_AGENTS_BUDGET_BYTES", 24576, 2048, 32768, clamp=True
             ),
             lock_timeout_seconds=_bounded_float(
                 env.get("CCC_CODEX_LOCK_TIMEOUT_SEC"), 3.0, minimum=0.05, maximum=10.0
@@ -214,14 +210,6 @@ class _ParsedBlock:
     github_policy: str | None
     working_state_policy: str | None
     snapshot: str | None
-
-
-def _bounded_int(raw: str | None, default: int, *, minimum: int, maximum: int) -> int:
-    try:
-        value = int(raw) if raw is not None else default
-    except (TypeError, ValueError):
-        value = default
-    return min(max(value, minimum), maximum)
 
 
 def _bounded_float(raw: str | None, default: float, *, minimum: float, maximum: float) -> float:
@@ -463,31 +451,21 @@ def _atomic_write(dir_fd: int, name: str, payload: bytes) -> bool:
 
 
 def _lock(dir_fd: int, timeout_seconds: float) -> int:
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(LOCK_NAME, flags, 0o600, dir_fd=dir_fd)
-        opened = os.fstat(descriptor)
-        validate_owned_regular(opened)
-        os.fchmod(descriptor, 0o600)
-    except MaterializeError:
-        raise
-    except OSError:
+        descriptor = _secure_fs.open_lock_descriptor(
+            LOCK_NAME, dir_fd=dir_fd, owner_id=os.geteuid()
+        )
+    except (OSError, _secure_fs.SecureFsError):
         raise MaterializeError("codex_agents_unsafe") from None
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return descriptor
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                os.close(descriptor)
-                raise MaterializeError("codex_lock_timeout") from None
-            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-        except OSError:
-            os.close(descriptor)
-            raise MaterializeError("codex_lock_timeout") from None
+    try:
+        acquired = _secure_fs.acquire_flock(descriptor, timeout=timeout_seconds)
+    except OSError:
+        os.close(descriptor)
+        raise MaterializeError("codex_lock_timeout") from None
+    if not acquired:
+        os.close(descriptor)
+        raise MaterializeError("codex_lock_timeout")
+    return descriptor
 
 
 def _same_read(left: _ReadFile | None, right: _ReadFile | None) -> bool:
@@ -567,7 +545,7 @@ def materialize_snapshot(snapshot: str, options: MaterializeOptions) -> Material
         metadata_existing = _read_named(dir_fd, METADATA_NAME)
 
         bounded, truncated = _truncate_utf8(snapshot, options.memory_max_bytes)
-        materialized_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        materialized_at = _secure_fs.utc_now_iso(timespec="auto")
         block, digest = _render_block(bounded, materialized_at=materialized_at)
         merged = _merge_block(existing_text, parsed, block)
         if len(merged.encode("utf-8")) > options.agents_budget_bytes:

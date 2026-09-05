@@ -1,17 +1,421 @@
-"""Shared owner-only filesystem primitives for bridge persistence."""
+"""Shared owner-only filesystem primitives for bridge persistence.
+
+setup.sh installs this exact file as ``~/.claude/hooks/ccc_secure_fs.py`` and
+``scripts/ccc_secure_fs.py`` re-exports it inside the repository, so every
+standalone script (skill promotion, doctor, agent-cron, memory probe, Codex
+materializer) shares one implementation of the owner-only read / append /
+atomic-replace / flock / clock helpers (#1484). Keep it stdlib-only.
+"""
 
 from __future__ import annotations
 
+import contextlib
 import errno
+import fcntl
+import json
 import logging
 import os
 import secrets
 import stat
 import tempfile
 import time
+from collections.abc import Iterator, Mapping
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+class SecureFsError(Exception):
+    """An owner-only invariant failed.
+
+    ``reason`` is one of ``"unsafe"`` (symlink, wrong owner/mode/link count,
+    not a regular file, empty when non-empty was required), ``"too_large"``
+    (size above the caller's bound before reading) or ``"changed"`` (the file
+    changed or grew past the bound while being read). Plain ``OSError`` from
+    ``lstat``/``open`` is deliberately *not* wrapped so callers keep their
+    existing missing-file handling.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def utc_now_iso(*, timespec: str = "seconds") -> str:
+    """Current UTC time as ISO-8601 with a ``Z`` suffix (``timespec`` as isoformat)."""
+    return datetime.now(timezone.utc).isoformat(timespec=timespec).replace("+00:00", "Z")
+
+
+def bounded_int_env(
+    env: Mapping[str, str],
+    key: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+    *,
+    clamp: bool = False,
+) -> int:
+    """Integer from ``env[key]`` bounded to ``[minimum, maximum]``.
+
+    Unparseable values fall back to ``default``. Out-of-range values fall back
+    to ``default`` too unless ``clamp`` is set, in which case they are clamped.
+    """
+    raw = env.get(key)
+    try:
+        value = int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        value = default
+    if clamp:
+        return min(max(value, minimum), maximum)
+    return value if minimum <= value <= maximum else default
+
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+
+def _stat_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _check_owner_only_regular(
+    metadata: os.stat_result,
+    *,
+    owner_id: int,
+    unsafe_mode_mask: int,
+    exact_mode: int | None,
+) -> None:
+    if owner_only_regular_violation(
+        metadata, owner_id=owner_id, unsafe_mode_mask=unsafe_mode_mask
+    ) is not None:
+        raise SecureFsError("unsafe")
+    if exact_mode is not None and stat.S_IMODE(metadata.st_mode) != exact_mode:
+        raise SecureFsError("unsafe")
+
+
+def read_owner_only_bytes(
+    path: str | os.PathLike[str],
+    *,
+    max_bytes: int,
+    owner_id: int | None = None,
+    unsafe_mode_mask: int = 0o022,
+    exact_mode: int | None = None,
+    require_nonempty: bool = False,
+) -> tuple[bytes, os.stat_result]:
+    """Read a small owner-only regular file without following link races.
+
+    ``lstat`` refuses symlinks up front, the file is opened ``O_NOFOLLOW`` and
+    the descriptor is re-checked (same dev/ino, regular, single link, owned by
+    ``owner_id`` — default the effective uid — mode not matching
+    ``unsafe_mode_mask``, optionally exactly ``exact_mode``). At most
+    ``max_bytes`` are accepted; a post-read ``fstat`` must match the pre-read
+    one or ``SecureFsError("changed")`` is raised. Returns the payload and the
+    final ``fstat`` result.
+    """
+    owner = os.geteuid() if owner_id is None else owner_id
+    linked = os.lstat(path)
+    if stat.S_ISLNK(linked.st_mode):
+        raise SecureFsError("unsafe")
+    descriptor = os.open(path, os.O_RDONLY | _CLOEXEC | _NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (linked.st_dev, linked.st_ino):
+            raise SecureFsError("unsafe")
+        _check_owner_only_regular(
+            before, owner_id=owner, unsafe_mode_mask=unsafe_mode_mask, exact_mode=exact_mode
+        )
+        if require_nonempty and before.st_size <= 0:
+            raise SecureFsError("unsafe")
+        if before.st_size > max_bytes:
+            raise SecureFsError("too_large")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if len(payload) > max_bytes or _stat_signature(before) != _stat_signature(after):
+            raise SecureFsError("changed")
+        return payload, after
+    finally:
+        os.close(descriptor)
+
+
+def parse_jsonl_rows(text: str, *, on_invalid: str = "skip") -> list[dict[str, Any]]:
+    """Per-line ``json.loads`` keeping only objects.
+
+    ``on_invalid="skip"`` drops undecodable lines; ``"raise"`` re-raises the
+    ``json.JSONDecodeError``. Non-object rows are always dropped.
+    """
+    rows: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            if on_invalid == "raise":
+                raise
+            continue
+        if isinstance(record, dict):
+            rows.append(record)
+    return rows
+
+
+def read_jsonl_rows(
+    path: str | os.PathLike[str],
+    *,
+    max_bytes: int,
+    on_invalid: str = "skip",
+    owner_id: int | None = None,
+    unsafe_mode_mask: int = 0o022,
+    exact_mode: int | None = None,
+) -> list[dict[str, Any]]:
+    """``read_owner_only_bytes`` + UTF-8 decode + ``parse_jsonl_rows``."""
+    payload, _ = read_owner_only_bytes(
+        path,
+        max_bytes=max_bytes,
+        owner_id=owner_id,
+        unsafe_mode_mask=unsafe_mode_mask,
+        exact_mode=exact_mode,
+    )
+    return parse_jsonl_rows(payload.decode("utf-8"), on_invalid=on_invalid)
+
+
+def json_line(value: object) -> str:
+    """Canonical compact JSONL serialization (sorted keys, no ASCII escaping)."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError(errno.EIO, "short write")
+        view = view[written:]
+
+
+def append_jsonl_line(
+    path: str | os.PathLike[str],
+    record: object,
+    *,
+    mode: int = 0o600,
+    fsync: bool = True,
+    owner_id: int | None = None,
+) -> None:
+    """Append ``json_line(record)`` + newline to an owner-only JSONL file.
+
+    The file is created ``mode`` when missing and opened ``O_APPEND`` /
+    ``O_NOFOLLOW``; the descriptor must then be a single-link regular file
+    owned by ``owner_id`` (default effective uid) with exactly ``mode``. A
+    symlink or any violated invariant raises ``SecureFsError("unsafe")``
+    before a byte is written.
+    """
+    owner = os.geteuid() if owner_id is None else owner_id
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | _CLOEXEC | _NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, mode)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise SecureFsError("unsafe") from None
+        raise
+    try:
+        _check_owner_only_regular(
+            os.fstat(descriptor), owner_id=owner, unsafe_mode_mask=0, exact_mode=mode
+        )
+        _write_all(descriptor, (json_line(record) + "\n").encode("utf-8"))
+        if fsync:
+            os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write_bytes(
+    path: str | os.PathLike[str],
+    payload: bytes,
+    *,
+    mode: int | None = None,
+    durable: bool = True,
+    resolve_symlink: bool = False,
+) -> bool:
+    """Replace ``path`` through a private same-directory temp file and rename.
+
+    A reader sees either the old or the new file, never a truncated one, and
+    the temp file is removed on any failure. ``mode`` is applied to the temp
+    file before the rename so the target never flips permissions; ``None``
+    keeps an existing regular target's mode (like setup.sh's atomic_install)
+    and falls back to ``0o600``. ``durable`` fsyncs the file and then the
+    directory (tolerating filesystems without directory fsync). With
+    ``resolve_symlink`` a symlinked destination is written through to its
+    target so the link itself survives; otherwise the link entry is replaced.
+    Returns whether the directory sync was confirmed.
+    """
+    destination = Path(path)
+    if resolve_symlink and destination.is_symlink():
+        destination = destination.resolve()
+    if mode is None:
+        mode = 0o600
+        try:
+            existing = destination.lstat()
+        except OSError:
+            existing = None
+        if existing is not None and stat.S_ISREG(existing.st_mode):
+            mode = stat.S_IMODE(existing.st_mode)
+    descriptor, raw_temp = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    temporary = Path(raw_temp)
+    try:
+        try:
+            os.fchmod(descriptor, mode)
+            _write_all(descriptor, payload)
+            if durable:
+                os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    if not durable:
+        return False
+    directory_fd = os.open(destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        return fsync_directory_fd(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def atomic_write_text(
+    path: str | os.PathLike[str],
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    mode: int | None = None,
+    durable: bool = True,
+    resolve_symlink: bool = False,
+) -> bool:
+    """``atomic_write_bytes`` for text."""
+    return atomic_write_bytes(
+        path,
+        text.encode(encoding),
+        mode=mode,
+        durable=durable,
+        resolve_symlink=resolve_symlink,
+    )
+
+
+def open_lock_descriptor(
+    path: str | os.PathLike[str],
+    *,
+    dir_fd: int | None = None,
+    mode: int = 0o600,
+    owner_id: int | None = None,
+    unsafe_mode_mask: int = 0o022,
+    exact_mode: int | None = None,
+) -> int:
+    """Open (creating ``mode``) and validate an owner-only lock file.
+
+    ``O_NOFOLLOW`` + ``O_CLOEXEC``; the descriptor must be a single-link
+    regular file owned by ``owner_id`` (default effective uid) whose mode does
+    not match ``unsafe_mode_mask`` (optionally exactly ``exact_mode``), and is
+    then ``fchmod``-ed to ``mode``. A symlink or violated invariant raises
+    ``SecureFsError("unsafe")``; other ``OSError`` propagate. The caller owns
+    the returned descriptor.
+    """
+    owner = os.geteuid() if owner_id is None else owner_id
+    flags = os.O_RDWR | os.O_CREAT | _CLOEXEC | _NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, mode, dir_fd=dir_fd)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise SecureFsError("unsafe") from None
+        raise
+    try:
+        _check_owner_only_regular(
+            os.fstat(descriptor),
+            owner_id=owner,
+            unsafe_mode_mask=unsafe_mode_mask,
+            exact_mode=exact_mode,
+        )
+        os.fchmod(descriptor, mode)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def acquire_flock(
+    descriptor: int, *, blocking: bool = False, timeout: float | None = None
+) -> bool:
+    """Take ``LOCK_EX`` on ``descriptor``.
+
+    ``blocking`` waits indefinitely. Otherwise ``timeout=None`` tries once and
+    ``timeout=N`` polls (50 ms steps) for up to ``N`` seconds. Returns whether
+    the lock was acquired; contention never raises.
+    """
+    if blocking:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return True
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if deadline is None or time.monotonic() >= deadline:
+                return False
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+@contextlib.contextmanager
+def flock_guard(
+    path: str | os.PathLike[str],
+    *,
+    blocking: bool = False,
+    timeout: float | None = None,
+    dir_fd: int | None = None,
+    mode: int = 0o600,
+    owner_id: int | None = None,
+    unsafe_mode_mask: int = 0o022,
+    exact_mode: int | None = None,
+) -> Iterator[bool]:
+    """Hold an owner-only flock for the block; yields whether it was acquired.
+
+    Combines ``open_lock_descriptor`` and ``acquire_flock``; the lock is
+    released and the descriptor closed on exit. The parent directory must
+    already exist (callers validate/create it under their own policy).
+    """
+    descriptor = open_lock_descriptor(
+        path,
+        dir_fd=dir_fd,
+        mode=mode,
+        owner_id=owner_id,
+        unsafe_mode_mask=unsafe_mode_mask,
+        exact_mode=exact_mode,
+    )
+    acquired = False
+    try:
+        acquired = acquire_flock(descriptor, blocking=blocking, timeout=timeout)
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def owner_only_regular_violation(

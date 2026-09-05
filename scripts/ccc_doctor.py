@@ -31,6 +31,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import ccc_secure_fs as _secure_fs
+
 # Fallback only. The live list is walked from the repo (see hook_files) using the
 # same rule as ccc_hook_tree_files in scripts/lib/harness-paths.sh, which setup.sh
 # and validate-harness.sh already share. This list used to be authoritative and
@@ -157,42 +159,20 @@ CRON_BLOCK_MARKER_RE = re.compile(r"# ccc-node:[A-Za-z0-9-]+:(?:begin|end)\s*$")
 def load_owner_only_json(path: Path, *, max_bytes: int) -> dict[str, Any]:
     """Read one small owner-only JSON file without following link races."""
 
-    metadata = path.lstat()
-    if (
-        path.is_symlink()
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or metadata.st_uid != os.getuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or metadata.st_size <= 0
-        or metadata.st_size > max_bytes
-    ):
-        raise ValueError("unsafe owner-only JSON state")
-    descriptor = -1
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        opened = os.fstat(descriptor)
-        if (
-            opened.st_dev != metadata.st_dev
-            or opened.st_ino != metadata.st_ino
-            or not stat.S_ISREG(opened.st_mode)
-            or opened.st_nlink != 1
-            or opened.st_uid != os.getuid()
-            or stat.S_IMODE(opened.st_mode) != 0o600
-            or opened.st_size <= 0
-            or opened.st_size > max_bytes
-        ):
-            raise ValueError("unsafe owner-only JSON state")
-        with os.fdopen(descriptor, "rb", closefd=True) as stream:
-            descriptor = -1
-            raw = stream.read(max_bytes + 1)
-        value = json.loads(raw.decode("utf-8"))
-        if not isinstance(value, dict):
-            raise ValueError("owner-only JSON state is not an object")
-        return value
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+        raw, _ = _secure_fs.read_owner_only_bytes(
+            path,
+            max_bytes=max_bytes,
+            owner_id=os.getuid(),
+            exact_mode=0o600,
+            require_nonempty=True,
+        )
+    except _secure_fs.SecureFsError:
+        raise ValueError("unsafe owner-only JSON state") from None
+    value = json.loads(raw.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("owner-only JSON state is not an object")
+    return value
 CODEX_PROBE_TIMEOUT_SECONDS = 5.0
 CODEX_PROBE_TIMEOUT_MAX_SECONDS = 10.0
 # Every subprocess the doctor spawns is bounded (#1481). A wedged `git
@@ -225,20 +205,7 @@ def atomic_write_bytes(dst: Path, payload: bytes, mode: int) -> None:
     file before the rename so the target never flips permissions. A symlinked
     destination is written through to its target so the link itself survives.
     """
-    if dst.is_symlink():
-        dst = dst.resolve()
-    fd, raw_tmp = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=dst.parent)
-    tmp = Path(raw_tmp)
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, dst)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    _secure_fs.atomic_write_bytes(dst, payload, mode=mode, resolve_symlink=True)
 
 
 _CANONICAL_PATHS: Any = None
