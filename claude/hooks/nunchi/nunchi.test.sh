@@ -1081,5 +1081,97 @@ print(' '.join(n for n, _ in nunchi._apply_synth_order(cands)))
 ")"
 ok "unknown names ignored, match is case-insensitive" '[ "$order_out" = "piri claude codex" ]'
 
+# ---- O. #1478 sqlite concurrency + atomic writes ---------------------------
+# Every case pins its own NUNCHI_DB/NUNCHI_SNAPSHOT: the shared suite DB is
+# left alone so earlier sections' state cannot leak into these assertions.
+cc_home="$TMP/cc-home"; mkdir -p "$cc_home"
+CDB="$cc_home/facts.db"; CSNAP="$cc_home/snapshot.md"
+cc() { NUNCHI_DB="$CDB" NUNCHI_SNAPSHOT="$CSNAP" "$@"; }
+payload c1 constraint user "CC-CONSTRAINT 잠금 중에도 스냅샷" | cc python3 "$NP" ingest - >/dev/null
+jm="$(python3 -c "import sqlite3;print(sqlite3.connect('$CDB').execute('PRAGMA journal_mode').fetchone()[0])")"
+ok "#1478 DB runs in WAL by default" '[ "$jm" = "wal" ]'
+# hold_lock <db> <seconds>: BEGIN IMMEDIATE + a pending UPDATE, held open so
+# any other writer sees "database is locked" until the holder exits. stdout/
+# stderr go to /dev/null: a background child sharing the $(...) pipe would
+# make the command substitution wait for the holder instead of the lock.
+hold_lock() {
+  python3 - "$1" "$2" <<'PY' >/dev/null 2>&1 &
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1], timeout=5)
+c.execute("BEGIN IMMEDIATE")
+c.execute("UPDATE peer_facts SET confidence=confidence WHERE id=1")
+time.sleep(float(sys.argv[2]))
+c.commit()
+PY
+  echo $!
+}
+# (a) snapshot degrades to read-only while ingest-side lock is held: exit 0,
+#     snapshot.md produced, one stderr line, no 10 s stall.
+holder="$(hold_lock "$CDB" 4)"; sleep 0.5
+rm -f "$CSNAP"
+start_ns="$(date +%s%N)"
+out="$(NUNCHI_SQLITE_SWEEP_TIMEOUT_MS=200 cc python3 "$NP" snapshot --limit 5 2>"$TMP/cc-snap.err")"; rc=$?
+elapsed_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+ok "#1478 snapshot exits 0 while another process holds the write lock" '[ "$rc" = 0 ]'
+ok "#1478 snapshot.md produced under lock, non-empty, constraint present" \
+  '[ -s "$CSNAP" ] && grep -q "CC-CONSTRAINT" "$CSNAP" && grep -q "CC-CONSTRAINT" <<<"$out"'
+ok "#1478 sweep skip logged once to stderr" '[ "$(grep -c "observation sweep skipped" "$TMP/cc-snap.err")" = 1 ]'
+ok "#1478 snapshot did not stall for the full busy timeout (${elapsed_ms}ms)" '[ "$elapsed_ms" -lt 3000 ]'
+# assemble is the synchronous SessionStart path — same degradation contract.
+out="$(NUNCHI_SQLITE_SWEEP_TIMEOUT_MS=200 cc python3 "$NP" assemble --budget 4096 --hint "" 2>/dev/null)"; rc=$?
+ok "#1478 assemble exits 0 under lock and still emits the constraint" \
+  '[ "$rc" = 0 ] && grep -q "CC-CONSTRAINT" <<<"$out"'
+wait "$holder" 2>/dev/null
+# busy timeout: a writer blocked by a short-lived holder waits and succeeds
+# instead of dying with "database is locked" (the pre-#1478 failure mode).
+holder="$(hold_lock "$CDB" 1)"; sleep 0.3
+out="$(NUNCHI_SQLITE_TIMEOUT=5 payload c2 fact user "CC-AFTER-LOCK 대기 후 저장" | NUNCHI_SQLITE_TIMEOUT=5 cc python3 "$NP" ingest - 2>&1)"; rc=$?
+wait "$holder" 2>/dev/null
+ok "#1478 ingest waits out a short lock holder (busy timeout) and stores the fact" \
+  '[ "$rc" = 0 ] && grep -q "ingested 1/1" <<<"$out"'
+# (b) snapshot.md atomicity: temp file replaced, no leftovers, content == stdout.
+out="$(cc python3 "$NP" snapshot --limit 5 2>/dev/null)"
+leftovers="$(find "$cc_home" -name '*snapshot.md*' ! -name snapshot.md | wc -l)"
+ok "#1478 snapshot.md written atomically: no temp leftovers, non-empty" \
+  '[ "$leftovers" = 0 ] && [ -s "$CSNAP" ]'
+ok "#1478 snapshot.md content equals printed snapshot (utf-8)" '[ "$(cat "$CSNAP")" = "$out" ]'
+# WAL opt-out: NUNCHI_SQLITE_JOURNAL=delete reverts the DB on an uncontended open.
+NUNCHI_SQLITE_JOURNAL=delete cc python3 "$NP" init >/dev/null
+jm="$(python3 -c "import sqlite3;print(sqlite3.connect('$CDB').execute('PRAGMA journal_mode').fetchone()[0])")"
+ok "#1478 NUNCHI_SQLITE_JOURNAL=delete opts out of WAL" '[ "$jm" = "delete" ]'
+out="$(NUNCHI_SQLITE_JOURNAL=delete cc python3 "$NP" snapshot --limit 5 2>&1)"; rc=$?
+ok "#1478 snapshot still works in rollback-journal mode" '[ "$rc" = 0 ] && grep -q "CC-CONSTRAINT" <<<"$out"'
+# (c) the session-scope predicate is served by idx_observed (EXPLAIN QUERY PLAN).
+plan="$(cc python3 - "$HERE" "$CDB" <<'PY'
+import sqlite3, sys
+sys.path.insert(0, sys.argv[1])
+import nunchi
+c = sqlite3.connect(sys.argv[2])
+for observed in ("session:abc", "yukson"):
+    where, params = nunchi._scope_where(observed)
+    rows = c.execute("EXPLAIN QUERY PLAN SELECT id FROM peer_facts WHERE " + where
+                     + " AND valid_to IS NULL", params).fetchall()
+    print(observed + ": " + " | ".join(r[3] for r in rows))
+PY
+)"
+ok "#1478 session-scope predicate uses idx_observed (no full scan)" \
+  'grep -q "^session:abc: .*idx_observed" <<<"$plan" && ! grep -q "^session:abc: .*SCAN peer_facts" <<<"$plan"'
+ok "#1478 plain observed=? scope uses idx_observed" 'grep -q "^yukson: .*idx_observed" <<<"$plan"'
+# (d) backend-health.json: concurrent appenders serialize on the flock sidecar
+#     and the file is replaced atomically — no entry lost, no partial JSON.
+bh="$cc_home/backend-health.json"; rm -f "$bh"
+for i in 1 2 3 4 5 6 7 8; do
+  NUNCHI_BACKEND_HEALTH="$bh" python3 - "$HERE" "$i" <<'PY' &
+import sys; sys.path.insert(0, sys.argv[1])
+import nunchi
+nunchi._record_backend_outcome("claude", "codex" if int(sys.argv[2]) % 2 else "claude", None)
+PY
+done
+wait
+bh_n="$(python3 -c "import json;print(len(json.load(open('$bh', encoding='utf-8'))['history']))")"
+bh_left="$(find "$cc_home" -name '*backend-health.json.*' ! -name 'backend-health.json.lock' | wc -l)"
+ok "#1478 8 concurrent health appends all land (flock RMW)" '[ "$bh_n" = 8 ]'
+ok "#1478 health file replaced atomically: no temp leftovers" '[ "$bh_left" = 0 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
