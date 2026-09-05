@@ -28,6 +28,20 @@ All notable changes to the Claude Code node harness. Dates are KST.
   whose baseline rests on ufw ([TNL-10]). When `ufw status` needs root and
   `sudo` exists, the collector retries once with `sudo -n` (non-interactive;
   a refusal keeps `unavailable`) and tags `cmd_status` with `via=sudo`.
+- **shell: proxy userinfo redacted in the start banner; flock fallback for
+  refresh-memory / pending-drain (#1480 items 1, 3).** `start.sh` echoed the
+  raw `PROXY_URL` (`http://user:pass@host`) and in daemon mode that line lands
+  in supervisor.log/restart.log; the banner now goes through
+  `redact_url_userinfo` (`http://<redacted>@host:port`), the exported
+  `*_proxy` vars are unchanged. Both hooks assumed util-linux `flock`: on
+  nodes without it (Termux) `refresh-memory.sh` exited before its body on
+  every run (permanent cache staleness) and `pending-drain.sh` read the
+  probe's exit 127 as "held" for every lock file, tripping the inflight cap
+  on every SessionStart. refresh-memory falls back to an atomic `mkdir` lock
+  (released on exit, reclaimed after 30 min when a dead holder left it);
+  pending-drain skips the probe and does not count unprobed locks. Both log
+  the fallback once; `CCC_FLOCK_CLI` overrides the binary (install-nunchi
+  style).
 
 ### Added
 - **nunchi wiki-promote: weekly fleet-fact → wiki-candidates batch (#1447,

@@ -39,8 +39,23 @@ now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 bytes_for() { [ -f "$1" ] && wc -c < "$1" | tr -d '[:space:]' || printf '0'; }
 
 # Non-blocking single-flight lock: if a refresh is already running, exit.
-exec 9>"$CACHE/.refresh.lock"
-flock -n 9 || exit 0
+# util-linux flock is absent on some nodes (Termux); a bare `flock` there
+# exits 127 and this hook never refreshed, pinning the cache stale (#1480).
+# Without it an atomic mkdir lock stands in: released on exit, reclaimed when
+# a dead holder left it behind (a kernel flock releases on death; a dir does not).
+FLOCK_BIN="${CCC_FLOCK_CLI:-$(command -v flock || true)}"
+if [ -n "$FLOCK_BIN" ] && [ -f "$FLOCK_BIN" ] && [ -x "$FLOCK_BIN" ]; then
+  exec 9>"$CACHE/.refresh.lock"
+  "$FLOCK_BIN" -n 9 || exit 0
+else
+  LOCK_DIR="$CACHE/.refresh.lock.d"
+  if [ -d "$LOCK_DIR" ] && [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
+  mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+  printf 'refresh lock: flock unavailable; using mkdir fallback\n'
+fi
 
 query_from_state() {
   local include_prompt="${1:-1}"
