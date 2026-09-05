@@ -494,6 +494,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/tunnel-audit.test.sh \
          scripts/tunnel-audit-fleet.test.sh \
          scripts/install-tunnel-audit-cron.test.sh \
+         scripts/ccc-deps-lock-pr.test.sh \
          scripts/lib/installer-cron-common.test.sh)
 
 # Registration guard — a suite that exists but is not listed above never runs,

@@ -4,6 +4,13 @@ on:
   pull_request:
   push:
     branches: [main]
+  # #1483: the deps-lock workflow pushes deps/lock-pair-<date> and opens its PR
+  # with GITHUB_TOKEN, which never triggers `pull_request`/`push` runs. It
+  # dispatches this workflow on that branch instead; the check runs attach to
+  # the head SHA under the same job names, so the required contexts
+  # (.github/required-checks.json) still gate the bot PR. No job may key an
+  # `if:` on github.event_name, or a dispatch run would strand a context.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,6 +18,9 @@ permissions:
 # Cancel superseded runs on the same ref (PR pushes); never cancel main builds.
 # Every job carries timeout-minutes: without it a runner stalled on a package
 # mirror blocks the PR for the 6h default (2026-08-19, run 32233059105).
+# A workflow_dispatch run on deps/lock-pair-<date> groups under refs/heads/…
+# (not refs/pull/…), so only a newer dispatch on that same branch — a same-day
+# deps-lock rerun that force-refreshed it — cancels it; that is intended.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
