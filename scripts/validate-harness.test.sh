@@ -183,6 +183,76 @@ ok "a suite with no summary line at all is rejected" '[[ "$missing" == ERR:* ]]'
 partial="$(summary_probe 'checking PASS= handling')"
 ok "a partial PASS= mention does not count as a summary" '[[ "$partial" == ERR:* ]]'
 
+# --- #1476: subdirectory hooks reach the referenced-hook checks ---------------
+# The REFS regex used to exclude `/`, so a hook wired as
+# /root/.claude/hooks/distill/pending-drain.sh never entered REFS and checks 6/6a
+# silently skipped it. Run the real extracted blocks against a fixture tree.
+REFS_SRC="$(sed -n '/^# 6) hooks referenced by settings/,/^done$/p' "$VALIDATE")"
+INSTALL_SRC="$(sed -n '/^mapfile -t DEPLOYED /,/^done$/p' "$VALIDATE")"
+ok "referenced-hooks block (check 6) is present in validate-harness.sh" \
+  '[ -n "$REFS_SRC" ] && grep -q "^mapfile -t REFS " <<<"$REFS_SRC"'
+ok "installed-hooks block (check 6a) is present in validate-harness.sh" \
+  '[ -n "$INSTALL_SRC" ] && grep -q "setup.sh installs" <<<"$INSTALL_SRC"'
+
+FIX="$TMPD/hooks-fixture"
+mkdir -p "$FIX/claude/hooks/sub"
+printf '#!/bin/sh\n' > "$FIX/claude/hooks/top.sh"
+printf '#!/bin/sh\n' > "$FIX/claude/hooks/sub/dir-hook.sh"
+cat > "$FIX/claude/settings.base.json" <<'JSON'
+{"hooks":{"SessionStart":[{"hooks":[
+  {"type":"command","command":"bash /root/.claude/hooks/top.sh"},
+  {"type":"command","command":"bash /root/.claude/hooks/sub/dir-hook.sh >/dev/null 2>&1 &"}
+]}]}}
+JSON
+cat > "$FIX/claude/hooks/enforcement-overlay.json" <<'JSON'
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"bash /root/.claude/hooks/../escape.sh"}]}]}}
+JSON
+
+VALIDATE_LIB="$ROOT/scripts/lib/harness-paths.sh"
+refs_probe() { # <fixture-root> -> check 6 + 6a output with stubbed say/err
+  (
+    cd "$1" || exit 1
+    # The extracted 6a block walks "$ROOT"; point it at the fixture for this
+    # subshell only (SC2030/SC2031: that locality is the intent).
+    # shellcheck disable=SC2030,SC2031
+    ROOT="$1"
+    err() { echo "ERR: $*"; }
+    say() { echo "SAY: $*"; }
+    # shellcheck source=lib/harness-paths.sh disable=SC1091
+    . "$VALIDATE_LIB"
+    eval "$REFS_SRC"
+    eval "$INSTALL_SRC"
+    printf 'REFS=%s\n' "${REFS[@]}"
+  )
+}
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+subdir_out="$(refs_probe "$FIX")"
+ok "subdirectory hook referenced in settings enters REFS" \
+  'grep -Fxq "REFS=/root/.claude/hooks/sub/dir-hook.sh" <<<"$subdir_out"'
+ok "top-level hook still enters REFS" \
+  'grep -Fxq "REFS=/root/.claude/hooks/top.sh" <<<"$subdir_out"'
+ok "subdirectory hook present on disk passes check 6 by its relative path" \
+  'grep -Fxq "SAY:   ok claude/hooks/sub/dir-hook.sh" <<<"$subdir_out"'
+ok "subdirectory hook is matched against the hook-tree walk by its relative path (6a)" \
+  'grep -Fxq "SAY:   ok setup.sh installs sub/dir-hook.sh" <<<"$subdir_out"'
+ok "top-level hook still passes 6/6a" \
+  'grep -Fxq "SAY:   ok claude/hooks/top.sh" <<<"$subdir_out" && grep -Fxq "SAY:   ok setup.sh installs top.sh" <<<"$subdir_out"'
+ok "a .. segment in a hook reference is an error, not a silent skip" \
+  'grep -Fq "ERR: settings hook reference escapes the hook tree: /root/.claude/hooks/../escape.sh" <<<"$subdir_out"'
+# Every ERR line concerns the traversal reference (6 rejects it, 6a cannot find it
+# in the walk); the well-formed top-level and subdirectory hooks raise none.
+ok "no error is raised for the well-formed hooks in the fixture" \
+  '! grep "^ERR:" <<<"$subdir_out" | grep -Fv "../escape.sh" | grep -q .'
+
+# Remove the subdirectory hook: it must now be reported missing by 6 AND 6a.
+rm -f "$FIX/claude/hooks/sub/dir-hook.sh"
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+missing_out="$(refs_probe "$FIX")"
+ok "a referenced subdirectory hook missing from disk fails check 6" \
+  'grep -Fq "ERR: settings references missing hook: /root/.claude/hooks/sub/dir-hook.sh (claude/hooks/sub/dir-hook.sh)" <<<"$missing_out"'
+ok "a referenced subdirectory hook missing from the walk fails check 6a" \
+  'grep -Fq "ERR: setup.sh does not install referenced hook: sub/dir-hook.sh" <<<"$missing_out"'
+
 # Deliberately NOT asserted here: that all 81 registered suites honour the
 # contract. Conformance is a property of a suite's *output*, and the source
 # spellings vary legitimately (`echo "----"; echo "PASS=..."` on one line,
