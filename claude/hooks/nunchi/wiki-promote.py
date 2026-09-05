@@ -76,6 +76,10 @@ sys.path.insert(0, HERE)
 # G5 decision-reason rule must mean exactly what nunchi.py means (#1204's
 # drift lesson — a copied rule is a rule that drifts).
 import nunchi  # noqa: E402
+# #1508 — nunchi put the hooks root (~/.claude/hooks, where setup.sh installs
+# bridge/utils/secure_fs.py as ccc_secure_fs.py) on sys.path, or registered the
+# canonical repo module under that name, so the plain import resolves here.
+import ccc_secure_fs  # noqa: E402
 
 DB = os.environ.get("NUNCHI_DB", os.path.expanduser("~/.nunchi/facts.db"))
 HOME_DIR = os.environ.get("NUNCHI_HOME", os.path.expanduser("~/.nunchi"))
@@ -111,16 +115,8 @@ EXCHANGE_KINDS = ("fact", "decision", "procedure")
 TRACEABLE_REF_TYPES = ("session", "transcript")
 
 
-def _int_env(name, default, low, high):
-    try:
-        val = int(os.environ.get(name, str(default)))
-    except ValueError:
-        val = default
-    return max(low, min(high, val))
-
-
-CAP = _int_env("NUNCHI_WIKI_PROMOTE_CAP", 5, 1, 50)
-BACKPRESSURE = _int_env("NUNCHI_WIKI_PROMOTE_BACKPRESSURE", 20, 1, 200)
+CAP = ccc_secure_fs.bounded_int_env(os.environ, "NUNCHI_WIKI_PROMOTE_CAP", 5, 1, 50, clamp=True)
+BACKPRESSURE = ccc_secure_fs.bounded_int_env(os.environ, "NUNCHI_WIKI_PROMOTE_BACKPRESSURE", 20, 1, 200, clamp=True)
 
 # Body screen — the second mechanical line behind distill redaction. Anything
 # hit is EXCLUDED (fail-closed), never rewritten: a redaction mistake must not

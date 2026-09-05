@@ -50,6 +50,12 @@ def _load_ownership():
 ownership = _load_ownership()
 ContractError = ownership.ContractError
 
+# Shared owner-only fs / lock helpers (#1508): loading ownership.py above put the
+# hooks root (~/.claude/hooks, where setup.sh installs bridge/utils/secure_fs.py
+# as ccc_secure_fs.py) on sys.path — or, in the repository tree, registered the
+# canonical bridge module under that name — so the plain import resolves here.
+import ccc_secure_fs  # noqa: E402
+
 _USAGE_FILE = "skill-autosave-usage.json"
 _CURATOR_STATE_FILE = "skill-autosave-curator-state.json"
 _ARCHIVE_DIR = "skill-autosave-archive"
@@ -1667,34 +1673,22 @@ class _BumpLock:
     def __enter__(self) -> "_BumpLock":
         ownership._prepare_state(self.context)
         path = self.context.state_dir / ownership._LOCK_FILE
-        flags = (
-            os.O_RDWR
-            | os.O_CREAT
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
         try:
-            self.descriptor = os.open(path, flags, 0o600)
-            metadata = os.fstat(self.descriptor)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != self.context.uid
-                or metadata.st_nlink != 1
-                or stat.S_IMODE(metadata.st_mode) & 0o077
-            ):
-                raise ContractError("unsafe_ownership_lock")
-            os.fchmod(self.descriptor, 0o600)
-            fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (OSError, ContractError) as error:
-            if self.descriptor is not None:
-                try:
-                    os.close(self.descriptor)
-                except OSError:
-                    pass
-                self.descriptor = None
-            if isinstance(error, ContractError):
-                raise
+            self.descriptor = ccc_secure_fs.open_lock_descriptor(
+                path, mode=0o600, owner_id=self.context.uid, unsafe_mode_mask=0o077
+            )
+        except ccc_secure_fs.SecureFsError:
+            raise ContractError("unsafe_ownership_lock") from None
+        except OSError:
             raise ContractError("bump_lock_busy") from None
+        try:
+            acquired = ccc_secure_fs.acquire_flock(self.descriptor, blocking=False)
+        except OSError:
+            acquired = False
+        if not acquired:
+            os.close(self.descriptor)
+            self.descriptor = None
+            raise ContractError("bump_lock_busy")
         return self
 
     def __exit__(self, *_args: object) -> None:
