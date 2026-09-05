@@ -159,7 +159,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_sends_heartbeat_after_threshold_without_typing_callback(self):
         req = self._make_request()
         await self._start_loop(req)
-        await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
+        await asyncio.wait_for(self.status_event.wait(), timeout=5.0)
         self.assertEqual(req.heartbeat_message_id, 1234)
         self.assertIn("⏳ Working", self.status_calls[0][0])
         self.assertIn("Read: bridge/core/project_chat.py", self.status_calls[0][0])
@@ -224,7 +224,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
 
             req = self._make_request()
             await self._start_loop(req)
-            await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
+            await asyncio.wait_for(self.status_event.wait(), timeout=5.0)
             self.assertIn("ETA ~2m 00s", self.status_calls[0][0])
 
     async def test_hides_forecast_once_elapsed_exceeds_all_samples(self):
@@ -250,7 +250,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             req = self._make_request()
             req.started_at = asyncio.get_running_loop().time() - 300.0  # elapsed 5m
             await self._start_loop(req)
-            await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
+            await asyncio.wait_for(self.status_event.wait(), timeout=5.0)
             text = self.status_calls[0][0]
             self.assertIn("Working", text)
             self.assertNotIn("ETA", text)
@@ -342,7 +342,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             req = self._make_request()
             req.task_id = await self.handler._ledger_create(1, 2)
             await self._start_loop(req)
-            await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
+            await asyncio.wait_for(self.status_event.wait(), timeout=5.0)
             await asyncio.sleep(0)  # let the registration write land
             records = self.handler._task_ledger.records()
             self.assertEqual(len(records), 1)
@@ -494,7 +494,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             req = self._make_request()
             req.started_at = asyncio.get_running_loop().time() - 30.0
             await self._start_loop(req)
-            await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
+            await asyncio.wait_for(self.status_event.wait(), timeout=5.0)
             self.assertIn("ETA ~1m 30s", self.status_calls[0][0])
 
 

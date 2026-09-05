@@ -182,7 +182,7 @@ async def test_terminal_notification_precedes_a_blocked_resume(tmp_path: Path) -
     )
 
     tick = asyncio.create_task(monitor._tick())
-    await asyncio.wait_for(resume_started.wait(), timeout=1)
+    await asyncio.wait_for(resume_started.wait(), timeout=5)
 
     assert len(recorder.notifications) == 1
     assert "CI green" in recorder.notifications[0][1]

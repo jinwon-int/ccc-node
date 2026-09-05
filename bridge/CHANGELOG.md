@@ -189,6 +189,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`BotConfigPort` is sliced by `Settings` section; the Codex turn-attempt
+  meter write leaves the event loop (#1509, precursor to #896).**
+  `core/bot_ports.py` now declares six per-section config slices —
+  `RuntimeDataConfigPort` (data dir / project root / token / CLI paths /
+  busy-notice threshold), `AccessControlConfigPort` (allowlist, tool policy,
+  restart hand-off), `HeartbeatConfigPort`, `MemoryConfigPort`
+  (`bridge_memory_mode`), `StreamingConfigPort` (bubble sizing, renderers,
+  option buttons) and `VoiceMediaConfigPort` (transcription + inbound media
+  caps) — and `BotConfigPort` is their intersection. Each mixin annotates
+  `_config` with only the slices it reads (a private per-mixin intersection
+  `Protocol`), while `TelegramBot` re-declares `_config: BotConfigPort` so
+  the composed class keeps one name and mypy accepts the narrower sibling
+  declarations. No behaviour or signature changes. Separately, the one meter
+  write #1498 deferred — `record_agent_turn_request`, which `CodexRuntime`
+  invokes synchronously once per accepted `turn/start` — is now wired
+  through `ProjectChatHandler._record_agent_turn_request`, a wrapper that
+  schedules the flock + rewrite via `_schedule_usage_write` behind the same
+  per-handler FIFO lock as the thread-usage recorder (so the request count
+  and the token deltas still land in issue order); the direct
+  `record_agent_turn_request` verb stays synchronous for its other callers.
+  Tests: `test_usage_meter_wiring.py` gains off-loop-thread / FIFO and
+  no-running-loop assertions for the turn-attempt seam.
+
 - **Bot mixins share one set of structural ports; MRO-shadowed queue methods
   are gone; the remaining `bot_commands` transcript scans leave the event loop
   (#1484, precursor to #896).** `core/bot_ports.py` is now the single home for
@@ -269,6 +292,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `gh-ci-wait` skill teaches agents the registration contract.
 
 ### Fixed
+- **Test-suite completion waits relaxed to 5s; per-test pytest-timeout cap in
+  CI (#1512, #1482).** Eighteen `asyncio.wait_for(..., timeout=1.0)` /
+  `timeout=1` waits across `test_skill_candidate_worker`,
+  `test_heartbeat_loop`, `test_project_chat_codex`, `test_codex_app_server`
+  and `test_external_wait_monitor` only asserted that a task *eventually*
+  completes, yet a 1s cap flaked on a loaded CI runner
+  (`test_concurrent_collectors_make_one_provider_call`, run 33965158010). The
+  cap is now 5s at every completion-gating site; waits that deliberately
+  assert a timeout fires (`timeout=0.1` in the heartbeat suite) are
+  untouched. `pytest-timeout` joins the CI lock
+  (`.github/requirements/bridge-ci.in`; runtime lock unchanged) and
+  `[tool.pytest.ini_options] timeout = 120` in `bridge/pyproject.toml` turns
+  a genuinely hung test into a fast failure with a stack dump instead of a
+  runner stall. The default signal method covers both `asyncio.run` and
+  `anyio` tests; local runs without the plugin see one
+  `Unknown config option: timeout` warning and are otherwise unaffected.
 - **Spawned-task references and session-lock pruning (#1479).** The crush
   permission handler, the webhook nudge per-connection server, and the
   durable Codex completion delivery each spawned a task with a bare

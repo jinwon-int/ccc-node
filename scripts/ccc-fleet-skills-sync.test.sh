@@ -338,5 +338,91 @@ out="$(env "${ret_env[@]}" CCC_FLEET_SKILLS_REMOTE="$REMOTE3" python3 "$SYNC" ap
 ok "tampered-marker orphan is never deleted by apply" \
   '[ "$rc" = 0 ] && jq -e ".changed == 0" >/dev/null <<<"$out" && [ -d "$RET_CLAUDE/release-checklist" ]'
 
+# ─── Piri third provider ────────────────────────────────────────────────
+#    Piri joins only on nodes that already have ~/.piri/agent (setup.sh's
+#    own gate for its piri skills install): shared skills install to all
+#    three roots, audience-piri skills route to piri only, and non-Piri
+#    nodes plan zero piri operations.
+PIRI_HOME="$TMP/piri-home"
+PIRI_ROOT="$PIRI_HOME/.piri/agent/skills"
+PIRI_STATE="$PIRI_HOME/.claude/state/fleet-skills"
+mkdir -p "$PIRI_HOME/.claude/skills" "$PIRI_HOME/.claude/state" \
+  "$PIRI_HOME/.codex/skills" "$PIRI_HOME/.piri/agent/skills"
+chmod 700 "$PIRI_HOME" "$PIRI_HOME/.claude" "$PIRI_HOME/.claude/state" \
+  "$PIRI_HOME/.claude/skills" "$PIRI_HOME/.codex" "$PIRI_HOME/.codex/skills" \
+  "$PIRI_HOME/.piri" "$PIRI_HOME/.piri/agent" "$PIRI_HOME/.piri/agent/skills"
+piri_env=("HOME=$PIRI_HOME" \
+  "CCC_FLEET_SKILLS_STATE_DIR=$PIRI_STATE" \
+  "CCC_FLEET_SKILLS_REPO=test/repo" \
+  "CCC_FLEET_SKILLS_REMOTE=$REMOTE" \
+  "GH_SYNC_STATE=$GH_STATE" \
+  "PATH=$BIN:$PATH")
+
+out="$(env "${piri_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
+ok "piri node plans shared skill for all three providers" \
+  '[ "$rc" = 0 ] && jq -e "(.operations | length) == 3 and ([.operations[].provider] | sort) == [\"claude\",\"codex\",\"piri\"]" >/dev/null <<<"$out"'
+
+out="$(env "${piri_env[@]}" python3 "$SYNC" apply --ref "$REF")"; rc=$?
+ok "piri apply installs the third provider copy with provenance" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 3" >/dev/null <<<"$out" && cmp -s "$SKILL/SKILL.md" "$PIRI_ROOT/release-checklist/SKILL.md" && jq -e ".provider == \"piri\"" "$PIRI_ROOT/release-checklist/.ccc-fleet-skill.json" >/dev/null'
+
+out="$(env "${piri_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
+ok "piri rerun converges to noops" \
+  '[ "$rc" = 0 ] && jq -e ".operations | all(.action == \"noop\")" >/dev/null <<<"$out"'
+
+# Piri user-owned (markerless) target fails closed like claude/codex.
+PIRI2_HOME="$TMP/piri-conflict-home"
+mkdir -p "$PIRI2_HOME/.claude/skills" "$PIRI2_HOME/.claude/state" \
+  "$PIRI2_HOME/.codex/skills" "$PIRI2_HOME/.piri/agent/skills/release-checklist"
+chmod 700 "$PIRI2_HOME" "$PIRI2_HOME/.claude" "$PIRI2_HOME/.claude/state" \
+  "$PIRI2_HOME/.claude/skills" "$PIRI2_HOME/.codex" "$PIRI2_HOME/.codex/skills" \
+  "$PIRI2_HOME/.piri" "$PIRI2_HOME/.piri/agent" "$PIRI2_HOME/.piri/agent/skills" \
+  "$PIRI2_HOME/.piri/agent/skills/release-checklist"
+printf 'user owned\n' > "$PIRI2_HOME/.piri/agent/skills/release-checklist/notes"
+out="$(env "${piri_env[@]}" HOME="$PIRI2_HOME" \
+  CCC_FLEET_SKILLS_STATE_DIR="$PIRI2_HOME/.claude/state/fleet-skills" \
+  python3 "$SYNC" apply --ref "$REF")"; rc=$?
+ok "piri user-owned target blocks the entire apply" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"target_user_owned\"" >/dev/null <<<"$out" && [ ! -e "$PIRI2_HOME/.claude/skills/release-checklist" ]'
+
+# Piri repo-managed ownership comes from the piri setup manifest.
+PIRI3_HOME="$TMP/piri-grad-home"
+mkdir -p "$PIRI3_HOME/.claude/skills" "$PIRI3_HOME/.claude/state" \
+  "$PIRI3_HOME/.codex/skills" "$PIRI3_HOME/.piri/agent/skills/release-checklist" \
+  "$PIRI3_HOME/.piri/agent/state"
+chmod 700 "$PIRI3_HOME" "$PIRI3_HOME/.claude" "$PIRI3_HOME/.claude/state" \
+  "$PIRI3_HOME/.claude/skills" "$PIRI3_HOME/.codex" "$PIRI3_HOME/.codex/skills" \
+  "$PIRI3_HOME/.piri" "$PIRI3_HOME/.piri/agent" "$PIRI3_HOME/.piri/agent/skills" \
+  "$PIRI3_HOME/.piri/agent/skills/release-checklist" "$PIRI3_HOME/.piri/agent/state"
+printf 'repo-managed copy\n' > "$PIRI3_HOME/.piri/agent/skills/release-checklist/SKILL.md"
+printf 'release-checklist 0\n' > "$PIRI3_HOME/.piri/agent/state/repo-skills.manifest"
+out="$(env "${piri_env[@]}" HOME="$PIRI3_HOME" \
+  CCC_FLEET_SKILLS_STATE_DIR="$PIRI3_HOME/.claude/state/fleet-skills" \
+  python3 "$SYNC" plan --ref "$REF")"; rc=$?
+ok "piri repo-managed target is skipped; claude/codex still planned" \
+  '[ "$rc" = 0 ] && jq -e "(.operations | any(.provider == \"piri\" and .action == \"skip-repo-managed\")) and (.operations | any(.provider == \"claude\" and .action == \"install\")) and (.operations | any(.provider == \"codex\" and .action == \"install\"))" >/dev/null <<<"$out"'
+
+# Audience-piri skills route to piri only; non-Piri nodes plan nothing.
+SEED2="$TMP/seed2"
+REMOTE2="$TMP/remote2.git"
+SKILL_PIRI="$SEED2/approved/piri/piri-only-tool"
+mkdir -p "$SKILL_PIRI"
+printf -- '---\nname: piri-only-tool\ndescription: A piri-audience skill for routing tests.\n---\n\n# Piri-only tool\n\n1. Do the piri thing.\n' > "$SKILL_PIRI/SKILL.md"
+jq -n '{schema_version:1,source_candidate_id:"piri-only-tool-000000000000",
+  source_tree_sha256:("0" * 64),approved_at:"2026-09-05T00:00:00Z"}' > "$SKILL_PIRI/approval.json"
+git -C "$SEED2" init -q -b main
+git -C "$SEED2" -c user.name=test -c user.email=test@example.invalid add .
+git -C "$SEED2" -c user.name=test -c user.email=test@example.invalid commit -qm seed2
+REF2B="$(git -C "$SEED2" rev-parse HEAD)"
+git clone -q --bare "$SEED2" "$REMOTE2"
+
+out="$(env "${piri_env[@]}" CCC_FLEET_SKILLS_REMOTE="$REMOTE2" python3 "$SYNC" plan --ref "$REF2B")"; rc=$?
+ok "audience-piri skill plans piri-only on a piri node" \
+  '[ "$rc" = 0 ] && jq -e "(.operations | length) == 1 and .operations[0].provider == \"piri\" and .operations[0].action == \"install\"" >/dev/null <<<"$out"'
+
+out="$(env "${base_env[@]}" CCC_FLEET_SKILLS_REMOTE="$REMOTE2" python3 "$SYNC" plan --ref "$REF2B")"; rc=$?
+ok "audience-piri skill plans nothing on a non-piri node" \
+  '[ "$rc" = 0 ] && jq -e "(.operations | length) == 0" >/dev/null <<<"$out"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

@@ -30,6 +30,7 @@ EXTRACT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" 
 . "$EXTRACT_LIB_DIR/../lib/hook-common.sh" || exit 0
 # shellcheck source=claude/hooks/distill/provider-guard.sh
 . "$EXTRACT_LIB_DIR/provider-guard.sh" 2>/dev/null || true
+# shellcheck disable=SC2034  # read at call time by provider-guard.sh (ccc_distill_state_dir fallback)
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 
 fail_extract() {

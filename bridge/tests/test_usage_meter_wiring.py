@@ -376,6 +376,71 @@ class UsageWriteOffloadTests(unittest.IsolatedAsyncioTestCase):
         day_buckets = next(iter(_meter_state(self.root)["days"].values()))
         self.assertEqual(day_buckets["codex"]["interactive"]["input_tokens"], 30)
 
+    async def test_turn_attempt_seam_writes_off_the_loop_thread_in_fifo_order(self) -> None:
+        # Call site 4 (#1509, the path #1498 deferred): the runtime's
+        # synchronous turn-attempt seam, invoked once per accepted
+        # turn/start. The wrapper schedules the request count and shares the
+        # per-handler lock with the usage recorder, so a slow first write
+        # cannot reorder the request against the thread-usage deltas.
+        runtime = _ScriptedTurnRuntime([])
+        handler = ProjectChatHandler(
+            settings=_settings(self.root, provider="codex"), agent_runtime=runtime
+        )
+        meter = handler.usage_meter
+        assert meter is not None
+        spy = _RecordSpy(meter, delay_first=0.05)
+        meter.record = spy  # type: ignore[method-assign]
+        self.assertEqual(runtime.turn_attempt_recorder, handler._record_agent_turn_request)
+        assert runtime.turn_attempt_recorder is not None
+        assert runtime.recorder is not None
+
+        runtime.turn_attempt_recorder()
+        runtime.recorder(
+            "thread-1",
+            None,
+            UsageSnapshot(provider="codex", input_tokens=500, output_tokens=100),
+        )
+        runtime.recorder(
+            "thread-1",
+            UsageSnapshot(provider="codex", input_tokens=500, output_tokens=100),
+            UsageSnapshot(provider="codex", input_tokens=800, output_tokens=150),
+        )
+        runtime.turn_attempt_recorder()
+        # Nothing has been written synchronously on the loop thread.
+        self.assertEqual(spy.calls, [])
+        self.assertFalse((self.root / ".telegram_bot" / "usage-meter.json").exists())
+
+        await handler.drain_usage_writes()
+
+        self.assertEqual(
+            [(c[0], c[1], c[2]) for c in spy.calls],
+            [
+                ("codex", "interactive", {"requests": 1}),
+                ("codex", "interactive", {"input_tokens": 300, "output_tokens": 50}),
+                ("codex", "interactive", {"requests": 1}),
+            ],
+        )
+        self.assertEqual([c[3] for c in spy.calls], [False, False, False], "writes ran on the loop thread")
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(
+            day_buckets["codex"]["interactive"],
+            {"input_tokens": 300, "output_tokens": 50, "requests": 2},
+        )
+
+    def test_turn_attempt_seam_runs_inline_without_a_running_loop(self) -> None:
+        # Synchronous callers (no event loop) keep the old inline behavior,
+        # and the direct verb stays synchronous for its other callers.
+        runtime = _ScriptedTurnRuntime([])
+        handler = ProjectChatHandler(
+            settings=_settings(self.root, provider="codex"), agent_runtime=runtime
+        )
+        assert runtime.turn_attempt_recorder is not None
+        runtime.turn_attempt_recorder()
+        handler.record_agent_turn_request()
+        self.assertEqual(handler._usage_write_tasks, set())
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(day_buckets["codex"]["interactive"]["requests"], 2)
+
 
 class _ScriptedTurnSession:
     def __init__(self, runtime: "_ScriptedTurnRuntime", session_id: str) -> None:
@@ -531,10 +596,14 @@ class ProductionCompositionTests(unittest.IsolatedAsyncioTestCase):
         handler._task_ledger_cache = False
 
         await handler.process_message("first", 7, 9)
+        # The turn-attempt seam is a scheduled write since #1509; land it
+        # before reading the meter file.
+        await handler.drain_usage_writes()
         day_buckets = next(iter(_meter_state(self.root)["days"].values()))
         self.assertEqual(day_buckets["codex"]["interactive"]["requests"], 1)
 
         await handler.process_message("second", 7, 9)
+        await handler.drain_usage_writes()
         day_buckets = next(iter(_meter_state(self.root)["days"].values()))
         self.assertEqual(day_buckets["codex"]["interactive"]["requests"], 2)
 

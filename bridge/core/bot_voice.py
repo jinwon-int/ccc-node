@@ -5,7 +5,7 @@ import os
 import platform
 import time
 from pathlib import Path as FilePath
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple
 
 from telegram import (
     Chat,
@@ -21,10 +21,12 @@ from telegram.ext import (
 from telegram_bot.core import media
 from telegram_bot.core.bot_shared import build_reply_context_prefix
 from telegram_bot.core.bot_ports import (
-    BotConfigPort,
     EnqueueUserTaskFn,
     ProcessUserMessageTextFn,
     ReplySmartFn,
+    RuntimeDataConfigPort,
+    StreamingConfigPort,
+    VoiceMediaConfigPort,
 )
 from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.chat_logger import log_debug
@@ -41,8 +43,14 @@ logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 
+class _VoiceConfigPort(
+    VoiceMediaConfigPort, RuntimeDataConfigPort, StreamingConfigPort, Protocol
+):
+    """Config slices this mixin reads (#1509): transcription / media caps, ``telegram_bot_token``, option buttons."""
+
+
 class BotVoiceMixin:
-    _config: BotConfigPort
+    _config: _VoiceConfigPort
     _user_voice_tasks: Dict[Any, set[asyncio.Task[Any]]]
     _audio_processor: AudioProcessor
     _audio_dir: FilePath
@@ -86,7 +94,7 @@ class BotVoiceMixin:
     _volcengine_tos_uploader: Optional[VolcengineTOSUploader]
     _tts_synthesizer: Optional[MacOSTtsSynthesizer]
 
-    def _voice_config(self) -> BotConfigPort:
+    def _voice_config(self) -> _VoiceConfigPort:
         return self._config
 
     def _prune_voice_tasks(self, key: Any) -> set[asyncio.Task]:
