@@ -300,7 +300,7 @@ def _autonomy_state(env: dict[str, str], state_dir: Path, *, trust_root: Path | 
 
 def _config(environment: dict[str, str] | None = None) -> Config:
     env = dict(os.environ if environment is None else environment)
-    home = Path(env.get("HOME", "/root")).absolute()
+    home = (Path(env["HOME"]) if env.get("HOME") else Path.home()).absolute()
     claude_dir = Path(env.get("CCC_CLAUDE_DIR", home / ".claude")).absolute()
     state_dir = Path(env.get("CCC_STATE_DIR", claude_dir / "state")).absolute()
     promotion_state_dir = Path(

@@ -6,6 +6,8 @@ import asyncio
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 import unittest
 
@@ -169,7 +171,9 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
         )
         meter = handler.usage_meter
         assert meter is not None
-        self.assertEqual(runtime.recorder, meter.record_codex_thread_usage)
+        # #1479: the runtime seam is the handler's offloading wrapper, not the
+        # meter method itself (the runtime calls it synchronously on the loop).
+        self.assertEqual(runtime.recorder, handler._record_codex_thread_usage)
         assert runtime.recorder is not None
 
         runtime.recorder(
@@ -182,6 +186,7 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
             UsageSnapshot(provider="codex", input_tokens=500, output_tokens=100),
             UsageSnapshot(provider="codex", input_tokens=800, output_tokens=150),
         )
+        await handler.drain_usage_writes()
         handler.record_agent_turn_request()
 
         day_buckets = next(iter(_meter_state(self.root)["days"].values()))
@@ -189,6 +194,187 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
             day_buckets["codex"]["interactive"],
             {"input_tokens": 300, "output_tokens": 50, "requests": 1},
         )
+
+
+class _ClaudeAdapterRuntime:
+    """Scripted runtime WITHOUT the turn-attempt seam: the Claude adapter path.
+
+    ``record_claude_adapter_attempt`` only meters when the runtime exposes no
+    ``set_turn_attempt_recorder``, exactly like ClaudeRuntime.
+    """
+
+    def __init__(self, scripts: list) -> None:
+        self.scripts = list(scripts)
+        self.turn_attempt_recorder = None
+
+    async def start_or_resume(self, request: SessionRequest) -> "_ScriptedTurnSession":
+        return _ScriptedTurnSession(self, request.session_id or "claude-scripted")  # type: ignore[arg-type]
+
+
+class _RecordSpy:
+    """Wraps ``UsageMeter.record`` and notes which thread each write ran on."""
+
+    def __init__(self, meter, *, delay_first: float = 0.0) -> None:
+        self._real = meter.record
+        self._delay_first = delay_first
+        self.calls: list[tuple[str, str, dict, bool]] = []
+        self.loop_thread = threading.current_thread()
+
+    def __call__(self, provider, mode, **kwargs):
+        if not self.calls and self._delay_first:
+            time.sleep(self._delay_first)
+        on_loop_thread = threading.current_thread() is self.loop_thread
+        self.calls.append((provider, mode, dict(kwargs), on_loop_thread))
+        return self._real(provider, mode, **kwargs)
+
+
+class UsageWriteOffloadTests(unittest.IsolatedAsyncioTestCase):
+    """#1479: every meter write from the turn path leaves the event loop."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    async def test_claude_attempt_and_result_writes_run_off_the_loop_thread(self) -> None:
+        # Call sites 1 + 2: record_claude_adapter_attempt at the spend boundary
+        # and record_claude_adapter_result on the terminal ResultEvent, both
+        # driven through the real process_message turn loop.
+        runtime = _ClaudeAdapterRuntime(
+            [
+                [
+                    TextDeltaEvent("answer"),
+                    ResultEvent(
+                        result={
+                            "status": "completed",
+                            "usage": {"input_tokens": 100, "output_tokens": 20},
+                        }
+                    ),
+                    CompletionEvent(stop_reason="end_turn"),
+                ]
+            ]
+        )
+        handler = ProjectChatHandler(settings=_settings(self.root), agent_runtime=runtime)
+        handler._task_ledger_cache = False
+        meter = handler.usage_meter
+        assert meter is not None
+        spy = _RecordSpy(meter)
+        meter.record = spy  # type: ignore[method-assign]
+
+        await handler.process_message("hello", 7, 9)
+
+        self.assertEqual(
+            [(c[0], c[1], c[2]) for c in spy.calls],
+            [
+                ("claude", "interactive", {"requests": 1}),
+                ("claude", "interactive", {"input_tokens": 100, "output_tokens": 20}),
+            ],
+        )
+        self.assertEqual([c[3] for c in spy.calls], [False, False], "writes ran on the loop thread")
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(
+            day_buckets["claude"]["interactive"],
+            {"input_tokens": 100, "output_tokens": 20, "requests": 1},
+        )
+
+    async def test_codex_recorder_seam_writes_off_the_loop_thread_in_fifo_order(self) -> None:
+        # Call site 3: the runtime's synchronous usage-recorder seam. The
+        # wrapper schedules the write and the per-handler lock keeps the
+        # non-commutative baseline read-modify-write in issue order even when
+        # the first write is slow.
+        runtime = _RecorderRuntime()
+        handler = ProjectChatHandler(
+            settings=_settings(self.root, provider="codex"), agent_runtime=runtime
+        )
+        meter = handler.usage_meter
+        assert meter is not None
+        spy = _RecordSpy(meter, delay_first=0.05)
+        meter.record = spy  # type: ignore[method-assign]
+        assert runtime.recorder is not None
+
+        totals = [(500, 100), (800, 150), (1000, 200), (1300, 260), (1500, 300)]
+        previous = None
+        for input_tokens, output_tokens in totals:
+            current = UsageSnapshot(
+                provider="codex", input_tokens=input_tokens, output_tokens=output_tokens
+            )
+            runtime.recorder("thread-1", previous, current)
+            previous = current
+        # Nothing has been written synchronously on the loop thread.
+        self.assertEqual(spy.calls, [])
+        self.assertFalse((self.root / ".telegram_bot" / "usage-meter.json").exists())
+
+        await handler.drain_usage_writes()
+
+        self.assertEqual(
+            [(c[2]["input_tokens"], c[2]["output_tokens"]) for c in spy.calls],
+            [(300, 50), (200, 50), (300, 60), (200, 40)],
+        )
+        self.assertTrue(all(c[3] is False for c in spy.calls))
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(
+            day_buckets["codex"]["interactive"],
+            {"input_tokens": 1000, "output_tokens": 200, "requests": 0},
+        )
+
+    async def test_scheduled_recorder_failure_is_logged_not_raised(self) -> None:
+        runtime = _RecorderRuntime()
+        handler = ProjectChatHandler(
+            settings=_settings(self.root, provider="codex"), agent_runtime=runtime
+        )
+        meter = handler.usage_meter
+        assert meter is not None
+
+        def explode(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("meter offline")
+
+        meter.record_codex_thread_usage = explode  # type: ignore[method-assign]
+        assert runtime.recorder is not None
+        with self.assertLogs("telegram_bot.core.project_chat", level="ERROR"):
+            runtime.recorder(
+                "thread-1",
+                UsageSnapshot(provider="codex", input_tokens=1, output_tokens=1),
+                UsageSnapshot(provider="codex", input_tokens=2, output_tokens=2),
+            )
+            await handler.drain_usage_writes()
+
+    async def test_close_drains_the_final_scheduled_write(self) -> None:
+        # CodexRuntime.close() flushes coalesced usage through the recorder
+        # seam; the handler's close() must land that scheduled write.
+        runtime = _RecorderRuntime()
+        handler = ProjectChatHandler(
+            settings=_settings(self.root, provider="codex"), agent_runtime=runtime
+        )
+        assert runtime.recorder is not None
+        runtime.recorder(
+            "thread-1",
+            UsageSnapshot(provider="codex", input_tokens=10, output_tokens=5),
+            UsageSnapshot(provider="codex", input_tokens=40, output_tokens=15),
+        )
+
+        await handler.close()
+
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(
+            day_buckets["codex"]["interactive"],
+            {"input_tokens": 30, "output_tokens": 10, "requests": 0},
+        )
+
+    def test_recorder_seam_runs_inline_without_a_running_loop(self) -> None:
+        # Synchronous callers (no event loop) keep the old inline behavior.
+        runtime = _RecorderRuntime()
+        handler = ProjectChatHandler(
+            settings=_settings(self.root, provider="codex"), agent_runtime=runtime
+        )
+        assert runtime.recorder is not None
+        runtime.recorder(
+            "thread-1",
+            UsageSnapshot(provider="codex", input_tokens=10, output_tokens=5),
+            UsageSnapshot(provider="codex", input_tokens=40, output_tokens=15),
+        )
+        self.assertEqual(handler._usage_write_tasks, set())
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(day_buckets["codex"]["interactive"]["input_tokens"], 30)
 
 
 class _ScriptedTurnSession:
