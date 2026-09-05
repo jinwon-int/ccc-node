@@ -45,6 +45,21 @@ case "${1:-} ${2:-}" in
       shift
     done ;;
   "pr close"|"workflow run") ;;
+  "api "*)
+    case "$*" in
+      *"/actions/runs?"*)
+        # Nth list call; FAKE_GH_RUNS_AFTER=N hides the runs until call N
+        # (polling test), default 1 = visible at once.
+        n=$(( $(cat "${FAKE_GH_LIST_COUNT:?}" 2>/dev/null || echo 0) + 1 ))
+        printf '%s\n' "$n" > "$FAKE_GH_LIST_COUNT"
+        if [ "$n" -ge "${FAKE_GH_RUNS_AFTER:-1}" ]; then printf '%s\n' "${FAKE_GH_RUNS:-}"; fi ;;
+      *"/actions/runs/"*"/approve"*)
+        if [ "${FAKE_GH_APPROVE_RC:-0}" -ne 0 ]; then
+          echo "gh: Resource not accessible by integration (HTTP 403)" >&2
+          exit "$FAKE_GH_APPROVE_RC"
+        fi ;;
+      *) echo "unexpected fake gh api invocation: $*" >&2; exit 90 ;;
+    esac ;;
   *) echo "unexpected fake gh invocation: $*" >&2; exit 90 ;;
 esac
 SH
@@ -101,11 +116,16 @@ LOCK
   printf '%s\n' "$work"
 }
 
-run() { # <repo> <args...>  (stdout+stderr -> $TMP/out, rc -> $rc)
+run() { # <repo> <args...>  (stdout+stderr -> $TMP/out, rc -> $rc, job summary -> $TMP/summary.md)
   local work="$1"; shift
-  export FAKE_GH_LOG="$TMP/gh.log" FAKE_GH_BODY="$TMP/body.md" FAKE_LOCK_ARGS="$TMP/lock.args"
-  : > "$FAKE_GH_LOG"; rm -f "$FAKE_GH_BODY" "$FAKE_LOCK_ARGS"
+  export FAKE_GH_LOG="$TMP/gh.log" FAKE_GH_BODY="$TMP/body.md" FAKE_LOCK_ARGS="$TMP/lock.args" \
+    FAKE_GH_LIST_COUNT="$TMP/gh.list-count"
+  : > "$FAKE_GH_LOG"; : > "$TMP/summary.md"; rm -f "$FAKE_GH_BODY" "$FAKE_LOCK_ARGS" "$FAKE_GH_LIST_COUNT"
+  # One look at the pull_request runs, no waiting, unless a case sets its own.
   (cd "$work" && CCC_DEPS_LOCK_SCRIPT="$TMP/lock.sh" CCC_DEPS_LOCK_PR_DATE=20260905 \
+      CCC_DEPS_LOCK_PR_APPROVE_WAIT="${CCC_DEPS_LOCK_PR_APPROVE_WAIT-0}" \
+      CCC_DEPS_LOCK_PR_APPROVE_POLL="${CCC_DEPS_LOCK_PR_APPROVE_POLL-1}" \
+      GITHUB_STEP_SUMMARY="$TMP/summary.md" \
       bash scripts/ccc-deps-lock-pr.sh "$@") > "$TMP/out" 2>&1
   rc=$?
 }
@@ -191,6 +211,59 @@ check "flag-shaped upgrade entries are rejected" '[ "$rc" -eq 2 ] && grep -q "no
 W="$(fresh_repo nodispatch)"
 FAKE_LOCK_MODE=bump CCC_DEPS_LOCK_PR_DISPATCH="" run "$W"
 check "empty dispatch list skips workflow runs" '[ "$rc" -eq 0 ] && ! grep -q "^workflow run" "$TMP/gh.log" && grep -q "^pr create" "$TMP/gh.log"'
+
+# --- 7. approving the PR's own action_required pull_request runs (#1483) ---
+# (a) every action_required run the API reports for the head is approved
+W="$(fresh_repo approve)"
+FAKE_LOCK_MODE=bump FAKE_GH_RUNS=$'900\t.github/workflows/ci.yml\n901\t.github/workflows/codeql.yml' run "$W"
+HEAD_SHA="$(git -C "$W" rev-parse HEAD)"
+check "approve: exits 0" '[ "$rc" -eq 0 ]'
+check "approve: lists pull_request runs on the bot branch" \
+  'grep -q "^api repos/{owner}/{repo}/actions/runs?branch=deps/lock-pair-20260905&event=pull_request&per_page=50 --jq " "$TMP/gh.log"'
+check "approve: list filters on the pushed head SHA and action_required" \
+  'grep "^api repos/{owner}/{repo}/actions/runs?" "$TMP/gh.log" | grep -q "head_sha == \"$HEAD_SHA\" and .conclusion == \"action_required\""'
+check "approve: POSTs /approve for each run id" \
+  'grep -qx "api -X POST repos/{owner}/{repo}/actions/runs/900/approve" "$TMP/gh.log" && grep -qx "api -X POST repos/{owner}/{repo}/actions/runs/901/approve" "$TMP/gh.log"'
+check "approve: exactly two approve calls" '[ "$(grep -c "/approve$" "$TMP/gh.log")" -eq 2 ]'
+check "approve: runs after the dispatch step" \
+  '[ "$(grep -n "^workflow run codeql.yml" "$TMP/gh.log" | cut -d: -f1)" -lt "$(grep -n "/actions/runs/900/approve" "$TMP/gh.log" | cut -d: -f1)" ]'
+check "approve: log names each approved run" 'grep -q "approved pull_request run 900 (.github/workflows/ci.yml)" "$TMP/out" && grep -q "approved pull_request run 901 (.github/workflows/codeql.yml)" "$TMP/out"'
+check "approve: job summary records OK per run" 'grep -q "^#### pull_request run approval (#1483)" "$TMP/summary.md" && grep -q "approved run 900 (\`.github/workflows/ci.yml\`): OK" "$TMP/summary.md" && grep -q "approved run 901" "$TMP/summary.md"'
+check "approve: PR body documents the gate and the manual command" 'grep -q "action_required" "$TMP/body.md" && grep -q "actions/runs/<id>/approve" "$TMP/body.md"'
+
+# (b) approval failure is non-fatal and prints the manual command
+W="$(fresh_repo approve-fail)"
+FAKE_LOCK_MODE=bump FAKE_GH_RUNS=$'900\t.github/workflows/ci.yml' FAKE_GH_APPROVE_RC=1 run "$W"
+check "approve failure: still exits 0" '[ "$rc" -eq 0 ]'
+check "approve failure: approve was attempted" 'grep -qx "api -X POST repos/{owner}/{repo}/actions/runs/900/approve" "$TMP/gh.log"'
+check "approve failure: warns with the HTTP status" 'grep -q "could not approve pull_request run 900 (.github/workflows/ci.yml): rc=1 HTTP 403" "$TMP/out"'
+check "approve failure: prints the manual command" 'grep -q "manual fallback: gh api -X POST repos/{owner}/{repo}/actions/runs/900/approve" "$TMP/out"'
+check "approve failure: job summary says FAILED + manual command" 'grep -q "approve run 900 (\`.github/workflows/ci.yml\`) FAILED (rc=1 HTTP 403)" "$TMP/summary.md" && grep -q "actions/runs/900/approve\` manually" "$TMP/summary.md"'
+check "approve failure: final success line still printed" 'grep -q "^✅ deps-lock-pr: PR #77" "$TMP/out"'
+
+# (c) no action_required run -> no approve call
+W="$(fresh_repo approve-none)"
+FAKE_LOCK_MODE=bump FAKE_GH_RUNS="" run "$W"
+check "no pending runs: exits 0" '[ "$rc" -eq 0 ]'
+check "no pending runs: runs were listed" 'grep -q "^api repos/{owner}/{repo}/actions/runs?" "$TMP/gh.log"'
+check "no pending runs: no approve call" '! grep -q "/approve$" "$TMP/gh.log"'
+check "no pending runs: log + summary say nothing to approve" 'grep -q "nothing to approve" "$TMP/out" && grep -q "nothing approved" "$TMP/summary.md"'
+
+# (d) runs that appear late are picked up by the bounded poll
+W="$(fresh_repo approve-poll)"
+FAKE_LOCK_MODE=bump FAKE_GH_RUNS=$'900\t.github/workflows/ci.yml\n901\t.github/workflows/codeql.yml' FAKE_GH_RUNS_AFTER=2 \
+  CCC_DEPS_LOCK_PR_APPROVE_WAIT=5 CCC_DEPS_LOCK_PR_APPROVE_POLL=1 run "$W"
+check "poll: exits 0" '[ "$rc" -eq 0 ]'
+check "poll: listed more than once" '[ "$(cat "$TMP/gh.list-count")" -ge 2 ]'
+check "poll: late runs approved" '[ "$(grep -c "/approve$" "$TMP/gh.log")" -eq 2 ]'
+
+# (e) skip knob: no list, no approve; bad value refused
+W="$(fresh_repo approve-skip)"
+FAKE_LOCK_MODE=bump FAKE_GH_RUNS=$'900\t.github/workflows/ci.yml' CCC_DEPS_LOCK_PR_APPROVE_WAIT=skip run "$W"
+check "skip: exits 0 without any api call" '[ "$rc" -eq 0 ] && ! grep -q "^api " "$TMP/gh.log" && grep -q "runs skipped (CCC_DEPS_LOCK_PR_APPROVE_WAIT=skip)" "$TMP/summary.md"'
+W="$(fresh_repo approve-bad)"
+FAKE_LOCK_MODE=bump CCC_DEPS_LOCK_PR_APPROVE_WAIT=soon run "$W"
+check "bad wait value: refused before regeneration (exit 2, no lock script, no gh)" '[ "$rc" -eq 2 ] && [ ! -e "$TMP/lock.args" ] && [ ! -s "$TMP/gh.log" ]'
 
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

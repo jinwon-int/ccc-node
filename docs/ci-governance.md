@@ -130,7 +130,49 @@ logic in `scripts/ccc-deps-lock-pr.sh`, tested by
    `workflow_dispatch` does, and check runs attach to the head SHA under the
    same job names — so the required contexts above gate the bot PR without
    any PAT or GitHub App. `ci.yml` therefore declares `workflow_dispatch` and
-   must not key any job `if:` on `github.event_name`.
+   must not key any job `if:` on `github.event_name`;
+5. approves the PR's own `pull_request` runs. Observed on the first bot PR
+   (#1505, heads `2f66c3f` and `d1dd911`): GitHub still registered
+   `pull_request` runs of `harness-ci` and `codeql` for the
+   `github-actions[bot]` author and parked them at
+   `conclusion=action_required` (workflow-approval gate; repository policy
+   `first_time_contributors`). Their check suites counted as incomplete, so
+   the PR stayed `mergeStateStatus=BLOCKED` with every dispatched required
+   check green and a review in place, until a human approved runs
+   33962069430/33962069445 and then 33963658260/33963658264. The script now
+   polls (bounded, `CCC_DEPS_LOCK_PR_APPROVE_WAIT`, default 90 s) for
+   `pull_request` runs on the new head in `action_required` and POSTs
+   `/repos/{owner}/{repo}/actions/runs/{id}/approve` for each with the job's
+   `GITHUB_TOKEN` — `actions: write` is already granted for
+   `gh workflow run`, no new permission. The step is non-fatal and reports
+   per-run outcome (HTTP status) in the job summary.
+
+   Caveats: the approve endpoint is documented for pull requests from public
+   forks; whether GitHub lets `GITHUB_TOKEN` approve a same-repository run
+   the bot itself triggered was **not verified** at the time of writing — the
+   first real dispatch after this change is the evidence (check the job
+   summary, record the outcome on #1483). Skipping bot-authored jobs inside
+   `ci.yml`/`codeql.yml` is *not* an alternative: an `action_required` run has
+   zero jobs (run 33961834862), i.e. the gate fires before any job `if:` is
+   evaluated, so the suite would still be created and still block.
+
+Manual fallback when a `deps/lock-pair-*` PR is `BLOCKED` with green
+required checks (approval step failed, or the workflow ran before this
+step existed):
+
+```sh
+gh pr view <n> --json mergeStateStatus,headRefOid
+gh run list --branch deps/lock-pair-<date> --event pull_request \
+  --json databaseId,name,conclusion,headSha          # conclusion=action_required
+gh api -X POST repos/{owner}/{repo}/actions/runs/<id>/approve   # per run
+gh run watch <id>                                   # both complete -> CLEAN
+```
+
+Then merge as below. `deps/lock-pair-*` PRs are authored by
+`github-actions[bot]`, so the required review comes from a non-author
+account and the squash merge goes through the relay-held credential
+(`codex/skills/gh-pr-flow/SKILL.md`, "Relay-held cross-account review");
+never approve or merge from the same account that opened the PR.
 
 Manual runs:
 
@@ -139,8 +181,9 @@ gh workflow run deps-lock.yml                                  # every pin may m
 gh workflow run deps-lock.yml -f upgrade="ruff==0.14.0 mypy"   # only the named packages
 ```
 
-Review the bot PR like any other: the pin table is the change list, and the
-dispatched required checks are the evidence. If a bot PR falls behind `main`
+Review the bot PR like any other: the pin table is the change list, the
+dispatched required checks are the evidence, and the deps-lock job summary
+shows whether its `pull_request` runs were approved. If a bot PR falls behind `main`
 (strict up-to-date checking), update the branch from the PR page — a
 human-initiated update triggers `pull_request` normally — or rerun the
 workflow, which regenerates on the current `main`. Repository prerequisite:
