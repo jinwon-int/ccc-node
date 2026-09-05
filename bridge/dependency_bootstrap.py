@@ -24,9 +24,9 @@ from typing import TextIO
 
 
 if __package__:
-    from .termux_native import ensure_termux_cryptography
+    from .termux_native import dependency_lock, ensure_termux_cryptography
 else:
-    from termux_native import ensure_termux_cryptography
+    from termux_native import dependency_lock, ensure_termux_cryptography
 
 
 class InstallMode(str, Enum):
@@ -318,6 +318,22 @@ def sync_dependencies(
     environ: Mapping[str, str] | None = None,
     stdout: TextIO = sys.stdout,
 ) -> int:
+    """Serialize Termux cache/pip/repair/smoke work across bridge projects."""
+    env = dict(os.environ if environ is None else environ)
+    try:
+        with dependency_lock(paths.venv_dir, env):
+            return _sync_dependencies(paths, mode, force_install=force_install,
+                                      environ=env, stdout=stdout)
+    except (OSError, ValueError) as exc:
+        print(f"❌ Dependency reconciliation lock failed: {type(exc).__name__}",
+              file=stdout, flush=True)
+        return 1
+
+
+def _sync_dependencies(
+    paths: DependencyPaths, mode: InstallMode, *, force_install: bool,
+    environ: Mapping[str, str], stdout: TextIO,
+) -> int:
     """Install dependencies when the cache key changes; return a shell status."""
     _remove_legacy_package_link()
     child_env = dict(os.environ if environ is None else environ)
@@ -381,7 +397,7 @@ def sync_dependencies(
 
 
 def _verify_dependencies(paths: DependencyPaths, env: Mapping[str, str], stdout: TextIO) -> int:
-    if ensure_termux_cryptography(paths.pip.with_name("python"), paths.venv_dir, env, stdout):
+    if ensure_termux_cryptography(paths.pip.with_name("python"), paths.venv_dir, env, stdout, lock_held=True):
         return 1
     return smoke_import_binary_extensions(paths, environ=env, stdout=stdout)
 

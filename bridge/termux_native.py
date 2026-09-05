@@ -13,7 +13,8 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TextIO
 
@@ -44,7 +45,8 @@ def _extension_info(python: Path, venv: Path, env: Mapping[str, str]) -> tuple[P
     )
     filename, library = json.loads(result.stdout)
     extension = Path(filename)
-    if not extension.is_absolute() or not extension.is_relative_to(venv.absolute()):
+    if (not extension.is_absolute() or ".." in extension.parts
+            or not extension.is_relative_to(venv.absolute())):
         raise ValueError("cryptography extension is outside the selected venv")
     if not isinstance(library, str) or not library.startswith("libpython") or "/" in library:
         raise ValueError("interpreter did not report a libpython shared-library name")
@@ -101,43 +103,53 @@ def _repair(
     print("✅ Repaired Termux cryptography libpython linkage", file=stdout, flush=True)
 
 
+@contextmanager
+def dependency_lock(venv: Path, env: Mapping[str, str]) -> Iterator[None]:
+    """Serialize all Termux pip reconciliation and native repair in this venv."""
+    if not (env.get("TERMUX_VERSION") or "/com.termux/" in env.get("PREFIX", "")):
+        yield
+        return
+    import fcntl
+
+    lock_path = venv / ".termux-native.lock"
+    for item in (lock_path, *lock_path.parents):
+        if item.is_symlink():
+            raise ValueError(f"symlink rejected: {item}")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+") as lock:
+        _regular_owned(lock_path)
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def ensure_termux_cryptography(
     python: Path, venv: Path, env: Mapping[str, str], stdout: TextIO,
+    *, lock_held: bool = False,
 ) -> int:
-    """Import or repair cryptography on Termux; fail before starting a broken bot."""
+    """Import or repair cryptography; lock_held is for the bootstrap caller."""
     if not (env.get("TERMUX_VERSION") or "/com.termux/" in env.get("PREFIX", "")):
         return 0
     try:
-        # fcntl is unavailable on Windows; import it only on the Termux path.
-        import fcntl
-
-        if _probe(python, env).returncode == 0:
+        if not lock_held:
+            with dependency_lock(venv, env):
+                return ensure_termux_cryptography(python, venv, env, stdout, lock_held=True)
+        result = _probe(python, env)
+        if result.returncode == 0:
             return 0
-        lock_path = venv / ".termux-native.lock"
-        for item in (lock_path, *lock_path.parents):
-            if item.is_symlink():
-                raise ValueError(f"symlink rejected: {item}")
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "r+") as lock:
-            _regular_owned(lock_path)
-            os.fchmod(lock.fileno(), 0o600)
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            result = _probe(python, env)
-            if result.returncode == 0:
-                return 0
-            if 'cannot locate symbol "Py' not in result.stderr:
-                raise RuntimeError("cryptography import failed for a reason other than libpython linkage")
-            extension, library = _extension_info(python, venv, env)
-            patchelf = shutil.which("patchelf", path=env.get("PATH"))
-            if patchelf is None:
-                raise RuntimeError("missing patchelf; run: pkg install patchelf")
-            needed = subprocess.run(
-                [patchelf, "--print-needed", str(extension)], env=env,
-                capture_output=True, text=True, check=True, timeout=30,
-            ).stdout.splitlines()
-            if library in needed:
-                raise RuntimeError("cryptography already links libpython but cannot import")
-            _repair(extension, library, python, patchelf, env, stdout)
+        if 'cannot locate symbol "Py' not in result.stderr:
+            raise RuntimeError("cryptography import failed for a reason other than libpython linkage")
+        extension, library = _extension_info(python, venv, env)
+        patchelf = shutil.which("patchelf", path=env.get("PATH"))
+        if patchelf is None:
+            raise RuntimeError("missing patchelf; run: pkg install patchelf")
+        needed = subprocess.run(
+            [patchelf, "--print-needed", str(extension)], env=env,
+            capture_output=True, text=True, check=True, timeout=30,
+        ).stdout.splitlines()
+        if library in needed:
+            raise RuntimeError("cryptography already links libpython but cannot import")
+        _repair(extension, library, python, patchelf, env, stdout)
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         # Do not print child command output: the target interpreter may have

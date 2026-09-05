@@ -5,9 +5,11 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from telegram_bot.dependency_bootstrap import (
     DependencyPaths, InstallMode, dependency_fingerprint, sync_dependencies,
@@ -85,6 +87,42 @@ elif sys.argv[1] == '--add-needed':
             results = list(pool.map(lambda _: self.run_repair()[0], range(2)))
         self.assertEqual(results, [0, 0])
         self.assertEqual((self.root / 'calls').read_text(), 'patch\n')
+
+    def test_pip_reconciliation_waits_for_other_projects_native_repair(self):
+        from telegram_bot import termux_native
+        paths = DependencyPaths.from_roots(self.root, self.venv, self.root / 'project.env')
+        paths.lock.write_text('fixture lock')
+        paths.hash_cache.write_text(dependency_fingerprint(paths, InstallMode.LOCKED))
+        marker = self.root / 'pip-entered'
+        self._script(paths.pip, f'from pathlib import Path\nPath({str(marker)!r}).touch()\n')
+        entered = threading.Event()
+        release = threading.Event()
+        original_repair = termux_native._repair
+
+        def paused_repair(*args):
+            entered.set()
+            if not release.wait(10):
+                raise AssertionError('test failed to release repair')
+            return original_repair(*args)
+
+        def sync(force):
+            return sync_dependencies(paths, InstallMode.LOCKED, force_install=force,
+                                     environ=self.env, stdout=io.StringIO())
+
+        with patch.object(termux_native, '_repair', side_effect=paused_repair):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                repair = pool.submit(sync, False)
+                try:
+                    self.assertTrue(entered.wait(5))
+                    installer = pool.submit(sync, True)
+                    # The second caller must not reach its actual pip process
+                    # until the first caller has completed the native repair.
+                    self.assertFalse(threading.Event().wait(0.2) or marker.exists())
+                finally:
+                    release.set()
+                self.assertEqual(repair.result(timeout=10), 0)
+                self.assertEqual(installer.result(timeout=10), 0)
+        self.assertTrue(marker.exists())
 
     def test_healthy_native_import_needs_no_patchelf(self):
         self.extension.write_bytes(b'linked')

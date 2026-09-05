@@ -80,7 +80,9 @@ and the Agent SDK. A failed native/SDK import stops startup by default.
 For the known Android `PyLong_Type`/`PyExc_*` link failure, bootstrap uses
 `patchelf` to add the current interpreter's shared-library dependency to the
 venv's extension, validates the candidate with that interpreter, then replaces
-it atomically. Concurrent repairs serialize on `venv/.termux-native.lock`.
+it atomically. Concurrent bootstrap installs and repairs serialize on
+`venv/.termux-native.lock`, including distinct bridge projects sharing a venv.
+Do not run an independent pip installer against that venv during bootstrap.
 Originals are retained in a private `.ccc-native-recovery-*` directory beside
 the extension. No pinned package version or download hash is changed. A
 subsequent package reinstall is checked and repaired again; a missing
