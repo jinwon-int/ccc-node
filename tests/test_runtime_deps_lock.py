@@ -100,7 +100,8 @@ def test_runtime_lock_is_version_consistent_subset_of_ci_lock():
         f"runtime lock drifted from CI lock: {drift}; the two locks are one "
         f"pair (#349) — regenerate both with scripts/ccc-deps-lock.sh, or sync "
         f"the pin+hash block into .github/requirements/bridge-ci.txt "
-        f"(Dependabot covers both via the multi-directory pip config)"
+        f"(the weekly deps-lock workflow regenerates both; Dependabot pip "
+        f"version PRs are disabled for this reason, #1483)"
     )
 
 

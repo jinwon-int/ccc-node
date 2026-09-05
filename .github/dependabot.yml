@@ -10,20 +10,25 @@ updates:
         patterns:
           - github/codeql-action/*
   - package-ecosystem: pip
-    # #349: bridge/requirements.lock.txt (runtime) and
-    # .github/requirements/bridge-ci.txt (CI) are one logical lock pair —
+    # #349/#1483: bridge/requirements.lock.txt (runtime) and
+    # .github/requirements/bridge-ci.txt (CI) are one logical lock pair that
+    # scripts/ccc-deps-lock.sh DERIVES from bridge/pyproject.toml (the runtime
+    # lock is compiled with the CI lock as a pip constraint), and
     # tests/test_runtime_deps_lock.py fails CI when their shared pins drift.
-    # Listing both directories is necessary but NOT sufficient: without a
-    # group Dependabot still opens one PR per package per directory, so a
-    # shared pin moves in one lock and not the other and the pair test fails
-    # (#999-#1001, then again #1453-#1457 — five PRs for one weekly round,
-    # #1483). The catch-all group below folds every pip bump, across both
-    # directories, into a single PR that regenerates the pair together.
+    # Dependabot cannot perform that derivation, and its groups do not span
+    # directories, so every pip version PR it opened moved a pin in one lock
+    # only and failed the pair test (#999-#1001, #1453-#1457, #1495). pip
+    # VERSION updates are therefore disabled (open-pull-requests-limit: 0);
+    # the weekly deps-lock workflow (.github/workflows/deps-lock.yml, via
+    # scripts/ccc-deps-lock-pr.sh) regenerates the pair and opens one bot PR
+    # per round instead — see docs/ci-governance.md. The block stays so
+    # Dependabot SECURITY updates and alerts keep their pip configuration.
     directories:
       - /bridge
       - /.github
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
     groups:
       python-lock-pair:
         patterns:

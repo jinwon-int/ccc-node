@@ -61,14 +61,61 @@ regenerated together by `scripts/ccc-deps-lock.sh`:
    build a locked artifact.
 
 `tests/test_runtime_deps_lock.py` enforces that the runtime lock stays a
-version-consistent subset of the CI lock, that every pin carries hashes, and
-that the wheel-smoke/audit gates stay wired. Lock refreshes — including
-Dependabot-driven bumps — are regenerated via the script and land as one
-verified PR unit validated by the full required-check matrix; lock files are
-never hand-edited. The platform marker/lock policy (single Linux-compiled
-lock for glibc Linux, macOS, and Termux; sdist hashes cover source builds;
-platform-specific deps require explicit environment markers in
+version-consistent subset of the CI lock, that every pin carries hashes, that
+`bridge/requirements.txt` (the `CCC_DEPS_UNLOCKED=1` fallback) mirrors the
+runtime pins exactly, and that the wheel-smoke/audit gates stay wired. Lock
+refreshes — routine weekly bumps included — are regenerated via the script and
+land as one verified PR unit validated by the full required-check matrix; lock
+files are never hand-edited. The platform marker/lock policy (single
+Linux-compiled lock for glibc Linux, macOS, and Termux; sdist hashes cover
+source builds; platform-specific deps require explicit environment markers in
 `bridge/pyproject.toml`) is documented in `scripts/ccc-deps-lock.sh`.
+
+## Weekly lock-pair regeneration (issue #1483)
+
+Dependabot **pip version updates are disabled** (`open-pull-requests-limit: 0`
+in `.github/dependabot.yml`; the block and its `ignore` entry stay so security
+updates keep their configuration). Dependabot cannot run the derivation above
+and its `groups` do not span directories, so every pip PR it opened
+(#999-#1001, #1453-#1457, #1495) moved a pin in one lock only and failed
+`tests/test_runtime_deps_lock.py`, `python-lint` and `wheel-smoke`.
+`github-actions` updates are unaffected.
+
+The replacement is the `deps-lock` workflow (`.github/workflows/deps-lock.yml`,
+logic in `scripts/ccc-deps-lock-pr.sh`, tested by
+`scripts/ccc-deps-lock-pr.test.sh`):
+
+1. runs weekly (Mondays 04:17 UTC) or on demand, checks out `main`, and runs
+   `scripts/ccc-deps-lock.sh --upgrade` on CPython 3.11 (or
+   `--upgrade-package` per named package when the `upgrade` input is set);
+2. if the lock set (`bridge-ci.txt`, `requirements.lock.txt`,
+   `bridge/requirements.txt`) is unchanged it exits with "no lock changes";
+3. otherwise it commits the set on `deps/lock-pair-<YYYYMMDD>` (bot-owned;
+   force-refreshed on a same-day rerun — force-push is confined to that
+   prefix), opens or updates the PR against `main` with a per-package pin
+   table and `Refs #1483`, and closes any older open `deps/lock-pair-*` PR as
+   superseded;
+4. dispatches `ci.yml` and `codeql.yml` on the branch. Pushes and PRs made
+   with `GITHUB_TOKEN` never trigger `pull_request`/`push` workflows, but
+   `workflow_dispatch` does, and check runs attach to the head SHA under the
+   same job names — so the required contexts above gate the bot PR without
+   any PAT or GitHub App. `ci.yml` therefore declares `workflow_dispatch` and
+   must not key any job `if:` on `github.event_name`.
+
+Manual runs:
+
+```sh
+gh workflow run deps-lock.yml                                  # every pin may move
+gh workflow run deps-lock.yml -f upgrade="ruff==0.14.0 mypy"   # only the named packages
+```
+
+Review the bot PR like any other: the pin table is the change list, and the
+dispatched required checks are the evidence. If a bot PR falls behind `main`
+(strict up-to-date checking), update the branch from the PR page — a
+human-initiated update triggers `pull_request` normally — or rerun the
+workflow, which regenerates on the current `main`. Repository prerequisite:
+Actions setting **"Allow GitHub Actions to create and approve pull requests"**
+must be ON, or `gh pr create` fails under `GITHUB_TOKEN`.
 
 ## CodeQL update atomicity
 
