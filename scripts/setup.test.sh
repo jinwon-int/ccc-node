@@ -358,8 +358,12 @@ ok "setup records manifest hashes matching the installed bytes after the rewrite
 # Unit half: exercise the extracted functions directly so every branch of the
 # verdict matrix is reachable without mutating the real repo trees.
 unit_functions="$(sed -n \
+  -e '/^atomic_install()/,/^}/p' \
   -e '/^skill_tree_hash()/,/^}/p' \
   -e '/^manifest_hash_for()/,/^}/p' \
+  -e '/^repo_file_hash()/,/^}/p' \
+  -e '/^manifest_entry_hash()/,/^}/p' \
+  -e '/^install_repo_files_into()/,/^}/p' \
   -e '/^install_repo_skills_into()/,/^}/p' \
   -e '/^refresh_skill_manifest_hashes()/,/^}/p' \
   "$SETUP")"
@@ -485,6 +489,54 @@ out="$(unit_run refresh-plain '
 ')"
 ok "unit: refresh re-records ordinary installed copies" \
   'grep -q "skill-a $(tree_hash_of "$TMP/unit/refresh-plain/skills/skill-a")" "$(unit_manifest refresh-plain)"'
+
+# --- #1480: flat command/output-style sets share the manifest discipline ----
+# install_repo_files_into: atomic per-file install, prune only what a previous
+# manifest recorded (and only when unmodified), never touch node-local files.
+file_hash_of() { sha256sum "$1" | awk '{print $1}'; }
+out="$(unit_run files '
+  mkdir -p repo-cmds cmds state
+  printf "repo cmd a\n" > repo-cmds/a.md
+  printf "repo cmd b\n" > repo-cmds/b.md
+  printf "node-local\n" > cmds/local.md
+  printf "ghost\n" > cmds/ghost.md
+  printf "edited\n" > cmds/edited.md
+  printf "ghost.md %s\nedited.md deadbeef\n" "$(sha256sum cmds/ghost.md | awk "{print \$1}")" > state/repo-commands.manifest
+  install_repo_files_into cmds state/repo-commands.manifest repo-cmds
+')"
+ok "unit(files): installs the repo set" \
+  '[ "$(cat "$TMP/unit/files/cmds/a.md")" = "repo cmd a" ] && [ "$(cat "$TMP/unit/files/cmds/b.md")" = "repo cmd b" ]'
+ok "unit(files): prunes a repo-removed entry the manifest recorded as unmodified" \
+  '[ ! -e "$TMP/unit/files/cmds/ghost.md" ] && grep -q "pruned repo-removed cmds entry ghost.md" <<<"$out"'
+ok "unit(files): keeps a repo-removed entry the node edited" \
+  '[ -f "$TMP/unit/files/cmds/edited.md" ] && grep -q "kept cmds/edited.md" <<<"$out"'
+ok "unit(files): never touches a node-local file the manifest never recorded" \
+  '[ "$(cat "$TMP/unit/files/cmds/local.md")" = "node-local" ]'
+ok "unit(files): records exactly the installed set with content hashes" \
+  '[ "$(cat "$TMP/unit/files/state/repo-commands.manifest")" = "$(printf "a.md %s\nb.md %s" "$(file_hash_of "$TMP/unit/files/repo-cmds/a.md")" "$(file_hash_of "$TMP/unit/files/repo-cmds/b.md")")" ]'
+ok "unit(files): leaves no staging temp behind" \
+  '[ -z "$(find "$TMP/unit/files/cmds" -name ".*.??????" 2>/dev/null)" ]'
+out="$(unit_run files-dry '
+  mkdir -p repo-cmds cmds state
+  printf "repo cmd a\n" > repo-cmds/a.md
+  printf "ghost\n" > cmds/ghost.md
+  printf "ghost.md %s\n" "$(sha256sum cmds/ghost.md | awk "{print \$1}")" > state/repo-commands.manifest
+  # the sandbox run() executes unconditionally; mirror setup.sh DRY rendering
+  run() { printf "[dry-run] %s\n" "$*"; }
+  DRY=1 install_repo_files_into cmds state/repo-commands.manifest repo-cmds
+')"
+ok "unit(files): DRY run renders the install and the prune without writing" \
+  '[ ! -e "$TMP/unit/files-dry/cmds/a.md" ] && [ -f "$TMP/unit/files-dry/cmds/ghost.md" ] && grep -q "^ghost.md " "$TMP/unit/files-dry/state/repo-commands.manifest"'
+# refresh_skill_manifest_hashes re-records flat entries too (the canonical-path
+# rewrite edits installed commands after they were hashed).
+unit_run refresh-files '
+  mkdir -p cmds state
+  printf "rewritten bytes\n" > cmds/a.md
+  printf "a.md old\n" > state/repo-commands.manifest
+  refresh_skill_manifest_hashes cmds state/repo-commands.manifest
+' >/dev/null
+ok "unit(files): manifest refresh re-records a flat file entry" \
+  'grep -q "^a.md $(file_hash_of "$TMP/unit/refresh-files/cmds/a.md")$" "$TMP/unit/refresh-files/state/repo-commands.manifest"'
 
 # Case: DRY run reports the verdicts without touching anything.
 out="$(unit_run dry '
@@ -893,6 +945,56 @@ ok "setup records the absorbed skill in the repo manifest" \
 ok "fleet absorption is logged, not silent" \
   'grep -q "absorbing fleet-installed skill wiki-record" "$fleet_out"'
 
+# --- #1480: commands/ and output-styles/ are installed like skills ------------
+# Integration half: a real setup run prunes an upstream-removed command that a
+# previous manifest recorded, keeps a node-local extra file, keeps a removed
+# command the node edited, and replaces installed inodes by rename. The
+# fixture CLAUDE_DIR is non-canonical, so the path rewrite fires on doctor.md
+# and the manifest must still match the bytes on disk afterwards.
+cm_home="$TMP/cm-home-1480"; cm_claude="$cm_home/.claude"
+mkdir -p "$cm_claude/commands" "$cm_claude/output-styles" "$cm_claude/state"
+printf 'node-local command\n' > "$cm_claude/commands/my-local.md"
+printf 'ghost command\n' > "$cm_claude/commands/ghost-cmd.md"
+printf 'edited command\n' > "$cm_claude/commands/edited-cmd.md"
+printf 'ghost style\n' > "$cm_claude/output-styles/ghost-style.md"
+printf 'ghost-cmd.md %s\nedited-cmd.md deadbeef\n' "$(file_hash_of "$cm_claude/commands/ghost-cmd.md")" \
+  > "$cm_claude/state/repo-commands.manifest"
+printf 'ghost-style.md %s\n' "$(file_hash_of "$cm_claude/output-styles/ghost-style.md")" \
+  > "$cm_claude/state/repo-output-styles.manifest"
+out="$(HOME="$cm_home" CCC_CLAUDE_DIR="$cm_claude" CCC_HERMES_DIR="$cm_home/.hermes" \
+  bash "$SETUP" --no-backup 2>&1)"; rc=$?
+ok "commands: upstream-removed command recorded in the manifest is pruned (#1480)" \
+  '[ "$rc" = 0 ] && [ ! -e "$cm_claude/commands/ghost-cmd.md" ] && grep -q "pruned repo-removed commands entry ghost-cmd.md" <<<"$out"'
+ok "commands: node-local extra file survives" \
+  '[ "$(cat "$cm_claude/commands/my-local.md")" = "node-local command" ]'
+ok "commands: upstream-removed but node-edited command is kept" \
+  '[ -f "$cm_claude/commands/edited-cmd.md" ] && grep -q "kept commands/edited-cmd.md" <<<"$out"'
+ok "output-styles: upstream-removed style recorded in the manifest is pruned" \
+  '[ ! -e "$cm_claude/output-styles/ghost-style.md" ]'
+ok "commands/output-styles: repo set installed and recorded" \
+  '[ -f "$cm_claude/commands/doctor.md" ] && grep -q "^doctor.md " "$cm_claude/state/repo-commands.manifest" && cmp -s "$cm_claude/output-styles/ccc-report.md" "$ROOT/claude/output-styles/ccc-report.md" && grep -q "^ccc-report.md " "$cm_claude/state/repo-output-styles.manifest"'
+flat_manifest_matches() { # <dir> <manifest> — every recorded entry hashes to the installed bytes
+  local dir="$1" manifest="$2" name hash
+  [ -f "$manifest" ] || return 1
+  while read -r name hash; do
+    [ -n "$name" ] || continue
+    [ -f "$dir/$name" ] || continue
+    [ "$(file_hash_of "$dir/$name")" = "$hash" ] || { echo "  manifest hash drift: $name" >&2; return 1; }
+  done < "$manifest"
+}
+ok "commands manifest hashes match the installed bytes after the path rewrite" \
+  'flat_manifest_matches "$cm_claude/commands" "$cm_claude/state/repo-commands.manifest"'
+# shellcheck disable=SC2034  # consumed via eval in ok()
+doctor_ino_before="$(stat -c '%i' "$cm_claude/commands/doctor.md")"
+HOME="$cm_home" CCC_CLAUDE_DIR="$cm_claude" CCC_HERMES_DIR="$cm_home/.hermes" \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "commands: reinstall replaces the inode (rename, never in-place truncate)" \
+  '[ "$(stat -c "%i" "$cm_claude/commands/doctor.md")" != "$doctor_ino_before" ]'
+ok "commands: rerun keeps the node-local file and the kept edited copy" \
+  '[ -f "$cm_claude/commands/my-local.md" ] && [ -f "$cm_claude/commands/edited-cmd.md" ]'
+ok "setup no longer bulk-copies commands or output styles" \
+  '! grep -Eq "run cp \"\\\$SRC/claude/(commands|output-styles)/\"" "$SETUP"'
+
 # --- managed-checkout guard hook (#1328) --------------------------------------
 # setup.sh installs a post-checkout guard into the MANAGED checkout's .git/hooks
 # only. The suite runs setup.sh from $ROOT, which IS a managed checkout — so
@@ -958,6 +1060,33 @@ ok "foreign-owned checkout installs nothing" '[ ! -e "$og_claude/settings.json" 
 HOME="$TMP/owner-guard-home" CCC_CLAUDE_DIR="$og_claude" CCC_HERMES_DIR="$TMP/owner-guard-hermes" \
   CCC_SETUP_TEST_REPO_OWNER_UID=65534 CCC_SETUP_ALLOW_OWNER_MISMATCH=1 bash "$SETUP" --no-backup --dry-run >/dev/null 2>&1; rc=$?
 ok "owner mismatch override proceeds" '[ "$rc" = 0 ]'
+
+# #1480: Termux has no /usr, so the hardcoded /usr/bin/stat and /usr/bin/id
+# resolved to nothing and the guard passed silently on empty values. The
+# candidate dirs are now resolved like readlink (/usr/bin, /bin, $PREFIX/bin);
+# when none has both tools the guard says so. The sysbin seam is accepted only
+# under the writable temp root, like the uid seams.
+out="$(HOME="$TMP/owner-guard-home" CCC_CLAUDE_DIR="$og_claude" CCC_HERMES_DIR="$TMP/owner-guard-hermes" \
+  CCC_SETUP_TEST_SYSBIN_DIRS="$TMP/no-such-bin" bash "$SETUP" --dry-run 2>&1)"; rc=$?
+ok "owner guard notes when stat/id resolve from no system dir (#1480)" \
+  '[ "$rc" = 0 ] && grep -q "owner guard skipped: stat/id not found" <<<"$out"'
+ok "owner guard skip note names the searched dirs" \
+  'grep -q "not found under /usr/bin, /bin" <<<"$out"'
+# A Termux-shaped layout: the tools live only under $PREFIX/bin.
+termux_bin="$TMP/termux-prefix/bin"; mkdir -p "$termux_bin"
+ln -s "$(command -v stat)" "$termux_bin/stat"; ln -s "$(command -v id)" "$termux_bin/id"
+out="$(HOME="$TMP/owner-guard-home" CCC_CLAUDE_DIR="$og_claude" CCC_HERMES_DIR="$TMP/owner-guard-hermes" \
+  CCC_SETUP_TEST_SYSBIN_DIRS="$TMP/no-such-bin $termux_bin" CCC_SETUP_TEST_REPO_OWNER_UID=65534 \
+  bash "$SETUP" --no-backup 2>&1)"; rc=$?
+ok "owner guard resolves stat/id from a PREFIX-style dir and still aborts on mismatch" \
+  '[ "$rc" = 2 ] && grep -q "owned by uid 65534" <<<"$out" && ! grep -q "owner guard skipped" <<<"$out"'
+# Outside the writable temp root the seam is ignored: the real system dirs are
+# used and the guard runs normally (same uid, so no abort and no skip note).
+mkdir -p "$TMP/elsewhere"
+out="$(HOME="$TMP/owner-guard-home" CCC_CLAUDE_DIR="$og_claude" CCC_HERMES_DIR="$TMP/owner-guard-hermes" \
+  TMPDIR="$TMP/elsewhere" CCC_SETUP_TEST_SYSBIN_DIRS="$TMP/no-such-bin" bash "$SETUP" --dry-run 2>&1)"; rc=$?
+ok "sysbin seam is refused when the install target is outside the temp root" \
+  '[ "$rc" = 0 ] && ! grep -q "owner guard skipped" <<<"$out"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

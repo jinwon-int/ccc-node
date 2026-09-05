@@ -44,6 +44,50 @@ DRY=0; WITH_PLUGIN=0; BACKUP=1
 OPT_NODE=""; OPT_DISPLAY=""; OPT_SLOT=""; OPT_FLEET_ROLE=""; OPT_LANG=""
 OPT_USER_NAME=""; OPT_USER_GH=""; OPT_USER_TZ=""; OPT_USER_CONTEXT=""
 need_val() { [ -n "${2:-}" ] || { echo "Flag $1 requires a value" >&2; exit 2; }; }
+note() { printf '  - %s\n' "$*"; }
+# Deterministic CI seam gate shared by the uid/owner/sysbin seams below: a seam
+# is honoured only when the install target resolves beneath the caller's
+# existing writable temp root. Resolve readlink only from exact system paths
+# because distro layouts may place coreutils in /bin or /usr/bin; never trust
+# PATH for this security boundary. A production install target (e.g.
+# /root/.claude) never resolves under TMPDIR, so no seam can activate outside
+# tests.
+_ccc_setup_test_seam_ok() {
+  local readlink_bin="" candidate test_root="" test_target=""
+  [ -n "${CCC_CLAUDE_DIR:-}" ] || return 1
+  for candidate in /usr/bin/readlink /bin/readlink; do
+    if [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ]; then
+      readlink_bin="$candidate"
+      break
+    fi
+  done
+  [ -n "$readlink_bin" ] || return 1
+  test_root="$("$readlink_bin" -m -- "${TMPDIR:-/tmp}" 2>/dev/null || true)"
+  test_target="$("$readlink_bin" -m -- "$CCC_CLAUDE_DIR" 2>/dev/null || true)"
+  { [ -n "$test_root" ] && [ -d "$test_root" ] && [ -w "$test_root" ]; } || return 1
+  case "$test_target" in "$test_root"/*) return 0 ;; esac
+  return 1
+}
+# Exact system dirs only — never PATH — for the coreutils the uid/owner guards
+# need (#1480). Termux has no /usr, so the hardcoded /usr/bin/stat and
+# /usr/bin/id resolved to nothing there and the owner guard silently passed on
+# an empty owner/euid; Termux ships them under $PREFIX/bin instead.
+_ccc_sysbin() { # <name> — prints the first candidate path; rc 1 when none resolves
+  local dir candidate
+  local -a dirs=(/usr/bin /bin)
+  [ -n "${PREFIX:-}" ] && dirs+=("$PREFIX/bin")
+  if [ -n "${CCC_SETUP_TEST_SYSBIN_DIRS+x}" ] && _ccc_setup_test_seam_ok; then
+    read -r -a dirs <<<"$CCC_SETUP_TEST_SYSBIN_DIRS"
+  fi
+  for dir in ${dirs[@]+"${dirs[@]}"}; do
+    candidate="$dir/$1"
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
 _ccc_is_root() {
   local uid="" test_root="" test_target="" readlink_bin="" candidate
   # Deterministic CI seam for the root-aware bypassPermissions neutralization,
@@ -69,7 +113,11 @@ _ccc_is_root() {
       esac
     fi
   fi
-  [ -n "$uid" ] || uid="$(/usr/bin/id -u 2>/dev/null || echo invalid)"
+  if [ -z "$uid" ]; then
+    local id_bin=""
+    id_bin="$(_ccc_sysbin id || true)"
+    if [ -n "$id_bin" ]; then uid="$("$id_bin" -u 2>/dev/null || echo invalid)"; else uid=invalid; fi
+  fi
   case "$uid" in
     ''|*[!0-9]*) return 1 ;;
   esac
@@ -106,23 +154,22 @@ CLAUDE_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}"
 # (CCC_SETUP_ALLOW_OWNER_MISMATCH=1). The test seam mirrors _ccc_is_root: it is
 # honoured only when the install target resolves under the writable temp root.
 _ccc_checkout_owner_guard() {
-  local owner="" euid="" readlink_bin="" test_root="" test_target="" candidate
+  local owner="" euid="" stat_bin="" id_bin=""
   [ -e "$SRC/.git" ] || return 0  # a worktree checkout has a .git FILE
   [ "${CCC_SETUP_ALLOW_OWNER_MISMATCH:-0}" = "1" ] && return 0
-  if [ -n "${CCC_SETUP_TEST_REPO_OWNER_UID:-}" ] && [ -n "${CCC_CLAUDE_DIR:-}" ]; then
-    for candidate in /usr/bin/readlink /bin/readlink; do
-      if [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ]; then readlink_bin="$candidate"; break; fi
-    done
-    if [ -n "$readlink_bin" ]; then
-      test_root="$("$readlink_bin" -m -- "${TMPDIR:-/tmp}" 2>/dev/null || true)"
-      test_target="$("$readlink_bin" -m -- "$CCC_CLAUDE_DIR" 2>/dev/null || true)"
-    fi
-    if [ -n "$test_root" ] && [ -d "$test_root" ] && [ -w "$test_root" ]; then
-      case "$test_target" in "$test_root"/*) owner="$CCC_SETUP_TEST_REPO_OWNER_UID" ;; esac
-    fi
+  if [ -n "${CCC_SETUP_TEST_REPO_OWNER_UID:-}" ] && _ccc_setup_test_seam_ok; then
+    owner="$CCC_SETUP_TEST_REPO_OWNER_UID"
   fi
-  [ -n "$owner" ] || owner="$(/usr/bin/stat -c %u "$SRC/.git" 2>/dev/null || true)"
-  euid="$(/usr/bin/id -u 2>/dev/null || true)"
+  stat_bin="$(_ccc_sysbin stat || true)"
+  id_bin="$(_ccc_sysbin id || true)"
+  # Say so instead of passing on empty values (#1480): a silent pass is what
+  # hid the missing /usr on Termux.
+  if { [ -z "$owner" ] && [ -z "$stat_bin" ]; } || [ -z "$id_bin" ]; then
+    note "owner guard skipped: stat/id not found under /usr/bin, /bin${PREFIX:+, $PREFIX/bin} (#1480)"
+    return 0
+  fi
+  [ -n "$owner" ] || owner="$("$stat_bin" -c %u "$SRC/.git" 2>/dev/null || true)"
+  euid="$("$id_bin" -u 2>/dev/null || true)"
   case "$owner$euid" in ''|*[!0-9]*) return 0 ;; esac
   [ "$owner" != "$euid" ] || return 0
   echo "ERROR: checkout $SRC is owned by uid $owner but setup.sh is running as uid $euid." >&2
@@ -169,7 +216,7 @@ run() {
     "$@"
   fi
 }
-note() { printf '  - %s\n' "$*"; }
+# note() is defined near the top (the checkout owner guard reports through it).
 
 # Atomic single-file install (#1042). A plain `cp` truncates and rewrites the
 # DESTINATION INODE in place; bash reads scripts incrementally, so a process
@@ -655,9 +702,9 @@ if [ "$register_cron" != "false" ] && [ "$DRY" != 1 ] && [ -x "$SRC/scripts/agen
   fi
 fi
 # Tier 3: status line (node·model·git·context·cost·A2A) wired via settings.json statusLine.
-# Output style (한국어 구조화 보고) — node-agnostic; settings.json activates it as outputStyle.
-run mkdir -p "$CLAUDE_DIR/output-styles"
-run cp "$SRC/claude/output-styles/"*.md "$CLAUDE_DIR/output-styles/"
+# Output style (한국어 구조화 보고) — node-agnostic; settings.json activates it as
+# outputStyle. Installed below with the slash commands (manifest + prune +
+# atomic copy, #1480), after the shared manifest helpers are defined.
 # Headless runner for cron/A2A/CI (`claude -p` wrapper).
 run atomic_install "$SRC/claude/headless.sh" "$CLAUDE_DIR/headless.sh"
 run chmod +x "$CLAUDE_DIR/headless.sh"
@@ -697,9 +744,8 @@ else
   done
   note "A2A worker sub-agent roster not installed (non-worker role); A2A runs through the nexus/broker flow"
 fi
-# Slash commands (quick prompt templates: /node-status, /a2a-claim, /wiki-log) — node-agnostic
-run mkdir -p "$CLAUDE_DIR/commands"
-run cp "$SRC/claude/commands/"*.md "$CLAUDE_DIR/commands/"
+# Slash commands (quick prompt templates: /node-status, /a2a-claim, /wiki-log)
+# — node-agnostic; installed below with the output style (#1480).
 # Custom skills (reusable procedures) — refreshed as near-atomic per-skill
 # copies on every setup run (stage + single rename), from the single
 # canonical tree skills/ (claude/shared provider split unified in #1393;
@@ -729,6 +775,60 @@ manifest_hash_for() { # manifest_hash_for <manifest> <name> — recorded tree ha
   local manifest="$1" name="$2"
   [ -f "$manifest" ] || return 0
   awk -v n="$name" '$1 == n { print $2; exit }' "$manifest"
+}
+repo_file_hash() { # <file> — content hash for a flat manifest entry
+  sha256sum "$1" | awk '{print $1}'
+}
+manifest_entry_hash() { # <path> — tree hash for a skill dir, content hash for a file
+  if [ -d "$1" ]; then skill_tree_hash "$1"; else repo_file_hash "$1"; fi
+}
+# Flat *.md sets (commands/, output-styles/) under the same discipline as the
+# skills below (#1480): per-file atomic install (stage + rename, never an
+# in-place truncate) and a manifest of what THIS repo installed, so a file the
+# repo drops is pruned on the next run when the copy is unmodified and kept
+# with a note when the node edited it. Files the manifest never recorded
+# (node-local commands) are never touched. `cp` did neither: a running
+# reader could see a half-written file, and upstream-deleted commands lived
+# on every node forever.
+install_repo_files_into() { # install_repo_files_into <dest-dir> <manifest> <source-dir>
+  local dest_dir="$1" manifest="$2" source_dir="$3"
+  local source name retired recorded_hash current_hash idx what
+  local -a current=()
+  local -a record_hash=()
+  what="$(basename "$dest_dir")"
+  for source in "$source_dir"/*.md; do
+    [ -f "$source" ] || continue
+    name="$(basename "$source")"
+    run atomic_install "$source" "$dest_dir/$name"
+    current+=("$name")
+    [ "$DRY" = 1 ] || record_hash+=("$(repo_file_hash "$dest_dir/$name")")
+  done
+  # Prune repo-removed entries recorded in the manifest; keep node-edited ones.
+  if [ -f "$manifest" ]; then
+    while read -r retired recorded_hash; do
+      [ -n "$retired" ] || continue
+      case " ${current[*]} " in *" $retired "*) continue;; esac
+      [ -f "$dest_dir/$retired" ] || continue
+      current_hash="$(repo_file_hash "$dest_dir/$retired")"
+      if [ "$current_hash" = "$recorded_hash" ]; then
+        run rm -f "$dest_dir/$retired"
+        note "pruned repo-removed $what entry $retired (copy was unmodified)"
+      else
+        note "kept $what/$retired: repo removed it but the installed copy was modified locally"
+      fi
+    done < "$manifest"
+  fi
+  if [ "$DRY" = 1 ]; then
+    note "repo $what: would record the installed set in $manifest"
+    return 0
+  fi
+  if [ "${#current[@]}" -gt 0 ]; then
+    : > "$manifest.tmp"
+    for idx in "${!current[@]}"; do
+      printf '%s %s\n' "${current[$idx]}" "${record_hash[$idx]}" >> "$manifest.tmp"
+    done
+    mv "$manifest.tmp" "$manifest"
+  fi
 }
 install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <source-root>...
   local dest_root="$1" manifest="$2"; shift 2
@@ -897,15 +997,18 @@ refresh_skill_manifest_hashes() { # refresh_skill_manifest_hashes <dest-root> <m
       # its tree hash would poison the manifest baseline and the next run
       # would read the local edits as pristine and overwrite them.
       printf '%s %s\n' "$name" "$recorded" >> "$manifest.tmp"
-    elif [ -d "$dest_root/$name" ]; then
-      printf '%s %s\n' "$name" "$(skill_tree_hash "$dest_root/$name")" >> "$manifest.tmp"
+    elif [ -e "$dest_root/$name" ]; then
+      # skill dirs and flat command/output-style files share this re-record (#1480)
+      printf '%s %s\n' "$name" "$(manifest_entry_hash "$dest_root/$name")" >> "$manifest.tmp"
     else
       printf '%s %s\n' "$name" "$recorded" >> "$manifest.tmp"
     fi
   done < "$manifest"
   mv "$manifest.tmp" "$manifest"
 }
-run mkdir -p "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state"
+run mkdir -p "$CLAUDE_DIR/output-styles" "$CLAUDE_DIR/commands" "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state"
+install_repo_files_into "$CLAUDE_DIR/output-styles" "$CLAUDE_DIR/state/repo-output-styles.manifest" "$SRC/claude/output-styles"
+install_repo_files_into "$CLAUDE_DIR/commands" "$CLAUDE_DIR/state/repo-commands.manifest" "$SRC/claude/commands"
 install_repo_skills_into "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state/repo-skills.manifest" "$SRC/skills"
 # Snapshot immediately: the Piri install below reuses the function and would
 # otherwise leave its own set in INSTALLED_REPO_SKILLS by the time the
@@ -998,6 +1101,12 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ] || [ "$SRC" != "/opt/ccc-node" ]; then
     # the manifest matches the bytes on disk. Only the Claude tree needs it:
     # $PIRI_AGENT_DIR/skills is not in rewrite_targets, so those hashes stand.
     refresh_skill_manifest_hashes "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state/repo-skills.manifest" ${CLAUDE_SKILLS_KEPT_NODE_MODIFIED[@]+"${CLAUDE_SKILLS_KEPT_NODE_MODIFIED[@]}"}
+    # Same for the flat command/output-style sets: the rewrite edits installed
+    # commands (doctor.md, node-status.md embed the checkout path), so without
+    # this every rewritten command would read as node-modified and could never
+    # be pruned when the repo drops it (#1480).
+    refresh_skill_manifest_hashes "$CLAUDE_DIR/commands" "$CLAUDE_DIR/state/repo-commands.manifest"
+    refresh_skill_manifest_hashes "$CLAUDE_DIR/output-styles" "$CLAUDE_DIR/state/repo-output-styles.manifest"
   fi
 fi
 
