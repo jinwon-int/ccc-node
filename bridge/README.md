@@ -69,6 +69,28 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 - **WSL (Ubuntu/Debian-style Linux userland)** — supported for foreground run, `--daemon`, `--status`, and `--stop`
 - **Native Windows (PowerShell / CMD)** — not supported
 
+## Android / Termux dependencies
+
+Install `rust`, `rust-std-aarch64-linux-android`, and `patchelf` with `pkg`
+when provisioning a Termux bridge. Python source builds can produce a
+`cryptography` extension without its `libpython` dependency. At every start,
+including a requirements-cache hit, bootstrap imports the native extension
+and the Agent SDK. A failed native/SDK import stops startup by default.
+
+For the known Android `PyLong_Type`/`PyExc_*` link failure, bootstrap uses
+`patchelf` to add the current interpreter's shared-library dependency to the
+venv's extension, validates the candidate with that interpreter, then replaces
+it atomically. Concurrent repairs serialize on `venv/.termux-native.lock`.
+Originals are retained in a private `.ccc-native-recovery-*` directory beside
+the extension. No pinned package version or download hash is changed. A
+subsequent package reinstall is checked and repaired again; a missing
+`patchelf` produces an explicit installation instruction.
+
+`CCC_DEPS_SMOKE_IMPORTS` overrides the general import list, and
+`CCC_DEPS_SMOKE_STRICT=0` makes that diagnostic warn-only. Neither bypasses the
+Termux cryptography repair gate. Do not use those overrides to hide a broken
+startup dependency.
+
 ## Quick Start
 
 ```bash

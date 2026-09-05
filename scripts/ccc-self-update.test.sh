@@ -182,6 +182,19 @@ ok "failed recovery exits 7" '[ "$rc" = 7 ]'
 ok "failed recovery audited as runtime-down" 'grep -q "\"result\":\"runtime-down\"" "$STATE/self-update.log"'
 ok "failed recovery notifies" 'grep -rh "복구 재시작도 실패" "$TMP/spool" >/dev/null 2>&1'
 
+# A failed restart cannot be hidden by a stale/overbroad successful probe.
+# The Termux incident used pgrep, which matched a launcher instead of the bot.
+printf '%s\n' 'exit 4' > "$CLAUDE/self-update.restart-cmd"
+printf '%s\n' 'exit 0' > "$CLAUDE/self-update.health-cmd"
+echo healthmask > "$TMP/seed/healthmask.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm healthmask && git -C "$TMP/seed" push -q origin main
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "successful probe cannot mask failed external restart" '[ "$rc" = 7 ]'
+ok "masked restart retains recovery snapshot" 'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "masked restart audited as failure" 'grep '^{' "$STATE/self-update.log" | tail -1 | grep -q "restart-failures"'
+
+rm -rf "$STATE"/self-update-install-rollback.*
+
 # cleanup: restore the allowlist and drop the external-cmd fixtures.
 rm -f "$CLAUDE/self-update.restart-cmd" "$CLAUDE/self-update.health-cmd"
 printf '%s\n' 'hermes-broker' 'a2a-worker' > "$CLAUDE/self-update.services"

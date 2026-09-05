@@ -23,6 +23,12 @@ from pathlib import Path
 from typing import TextIO
 
 
+if __package__:
+    from .termux_native import ensure_termux_cryptography
+else:
+    from termux_native import ensure_termux_cryptography
+
+
 class InstallMode(str, Enum):
     """Supported dependency installation policies."""
 
@@ -178,7 +184,7 @@ def _is_termux_env(env: Mapping[str, str]) -> bool:
 # bootstrap boundary with its real name instead of as a "JWT bug".
 SMOKE_IMPORTS_ENV = "CCC_DEPS_SMOKE_IMPORTS"
 SMOKE_STRICT_ENV = "CCC_DEPS_SMOKE_STRICT"
-DEFAULT_SMOKE_IMPORTS = ("cryptography",)
+DEFAULT_SMOKE_IMPORTS = ("cryptography.hazmat.bindings._rust", "claude_agent_sdk")
 
 
 def _smoke_import_modules(environ: Mapping[str, str]) -> tuple[str, ...]:
@@ -194,12 +200,10 @@ def smoke_import_binary_extensions(
     environ: Mapping[str, str] | None = None,
     stdout: TextIO = sys.stdout,
 ) -> int:
-    """Import-check binary extensions in the venv interpreter (#969).
+    """Check native and SDK imports before the bridge starts.
 
-    Warn-only by default: both Termux bridges run healthy today precisely
-    because nothing imports cryptography there, so a hard failure would turn
-    a latent break into a self-inflicted outage. Returns 1 on failure only
-    when CCC_DEPS_SMOKE_STRICT=1 opts into the closed gate.
+    Fail closed by default. CCC_DEPS_SMOKE_STRICT=0 retains an explicit
+    warn-only diagnostic mode; it does not disable the Termux repair gate.
     """
     env = dict(os.environ if environ is None else environ)
     modules = _smoke_import_modules(env)
@@ -228,10 +232,10 @@ def smoke_import_binary_extensions(
         )
     except OSError as exc:
         print(f"⚠️  Binary-extension smoke probe could not run: {exc}", file=stdout, flush=True)
-        return 1 if env.get(SMOKE_STRICT_ENV) == "1" else 0
+        return 1 if env.get(SMOKE_STRICT_ENV, "1") != "0" else 0
     if result.returncode == 0:
         return 0
-    strict = env.get(SMOKE_STRICT_ENV) == "1"
+    strict = env.get(SMOKE_STRICT_ENV, "1") != "0"
     detail = result.stdout.strip() or result.stderr.strip() or "unknown import failure"
     print(
         "⚠️  Binary-extension import smoke failed — install ok is not usable (#969)",
@@ -257,19 +261,8 @@ def smoke_import_binary_extensions(
             flush=True,
         )
     print(
-        "   The bridge does not import these modules on any current code path, so this is",
-        file=stdout,
-        flush=True,
-    )
-    print(
-        "   LATENT today — the first pyjwt RS256/ES256 path (service-account JWT, signed",
-        file=stdout,
-        flush=True,
-    )
-    print(
-        "   webhook, OIDC) fails at runtime on this host instead of at install time.",
-        file=stdout,
-        flush=True,
+        "   The SDK imports cryptography during startup; repair the dependency before retrying.",
+        file=stdout, flush=True,
     )
     if not strict:
         print(
@@ -327,6 +320,7 @@ def sync_dependencies(
 ) -> int:
     """Install dependencies when the cache key changes; return a shell status."""
     _remove_legacy_package_link()
+    child_env = dict(os.environ if environ is None else environ)
     current_hash = dependency_fingerprint(paths, mode)
     saved_hash = _saved_fingerprint(paths.hash_cache)
     if not force_install and saved_hash and saved_hash == current_hash:
@@ -337,10 +331,9 @@ def sync_dependencies(
         )
         # Hash match only says the inputs did not change; the artifact on disk
         # may still be unloadable (#969 — Termux's inert cryptography wheel).
-        return smoke_import_binary_extensions(paths, environ=environ, stdout=stdout)
+        return _verify_dependencies(paths, child_env, stdout)
 
     print("📦 Installing Python dependencies...", file=stdout, flush=True)
-    child_env = dict(os.environ if environ is None else environ)
     ensure_android_api_level(child_env, stdout=stdout)
     rust_missing = _is_termux_env(child_env) and not _cargo_available(child_env)
     if rust_missing:
@@ -374,6 +367,8 @@ def sync_dependencies(
             _print_install_failure(mode, index, stdout, rust_missing=rust_missing)
             return 1
 
+    if _verify_dependencies(paths, child_env, stdout):
+        return 1
     try:
         paths.hash_cache.write_text(f"{current_hash}\n", encoding="utf-8")
     except OSError:
@@ -382,7 +377,13 @@ def sync_dependencies(
         # launch but does not turn an otherwise successful install into fail.
         pass
     print("✅ Dependencies are up to date", file=stdout, flush=True)
-    return smoke_import_binary_extensions(paths, environ=environ, stdout=stdout)
+    return 0
+
+
+def _verify_dependencies(paths: DependencyPaths, env: Mapping[str, str], stdout: TextIO) -> int:
+    if ensure_termux_cryptography(paths.pip.with_name("python"), paths.venv_dir, env, stdout):
+        return 1
+    return smoke_import_binary_extensions(paths, environ=env, stdout=stdout)
 
 
 def _parser() -> argparse.ArgumentParser:

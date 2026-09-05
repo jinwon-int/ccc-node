@@ -84,6 +84,23 @@ A2A fleet rollout) resolves to the guarded, audited
 `~/.claude/hooks/ccc-self-update.sh run` — no `CCC_ALLOW_GATED` needed and no
 per-restart approval friction.
 
+## External bridge restart and health commands
+
+For a Termux daemon, the operator-owned `~/.claude/self-update.restart-cmd`
+can invoke `bash "$HOME/ccc-node/bridge/start.sh" --path "$HOME" --restart -d`.
+Use the actual bridge status in `~/.claude/self-update.health-cmd`:
+
+```bash
+bash "$HOME/ccc-node/bridge/start.sh" --path "$HOME" --status 2>/dev/null | grep -Fq "Bot status: available"
+```
+
+Avoid `pgrep -f telegram_bot`: it can match the health-check shell or a
+launcher while the bot is dead. `unavailable` must not match `available`.
+A restart's nonzero exit is always reported as failure, even if the health
+command succeeds. After a successful restart, a configured health command
+must also pass. Failure retains the recovery snapshot and notification;
+a later healthy tick can confirm recovery without erasing the failed attempt.
+
 ## Idle gate (don't restart mid-task)
 
 `systemctl restart` SIGTERMs the whole service cgroup. For the telegram bridge
