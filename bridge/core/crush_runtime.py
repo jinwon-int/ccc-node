@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -55,6 +56,8 @@ from .agent_runtime import (
     ToolStartedEvent,
     deny_approval,
 )
+
+logger = logging.getLogger(__name__)
 
 _CRUSH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
@@ -580,6 +583,10 @@ class CrushRuntime:
             self._client_factory = default_factory
         self._client: CrushClient | None = self._client_factory()
         self._dispatcher: asyncio.Task[None] | None = None
+        # Strong references to in-flight permission handlers: the event loop
+        # only keeps weak references to tasks, so an untracked task may be
+        # garbage-collected mid-flight (#1479).
+        self._permission_tasks: set[asyncio.Task[None]] = set()
         self._active_turns: dict[str, _ActiveTurn] = {}
         self._turn_locks: dict[str, asyncio.Lock] = {}
         self._workspaces: dict[str, str] = {}  # cwd -> workspace_id
@@ -609,6 +616,10 @@ class CrushRuntime:
         if self._dispatcher is not None:
             self._dispatcher.cancel()
             self._dispatcher = None
+        for task in tuple(self._permission_tasks):
+            task.cancel()
+        if self._permission_tasks:
+            await asyncio.gather(*self._permission_tasks, return_exceptions=True)
         if self._client is not None:
             await self._client.close()
             self._client = None
@@ -875,7 +886,9 @@ class CrushRuntime:
     # -- approvals (fail-closed) ---------------------------------------------
 
     def _spawn_permission(self, event: CrushEvent) -> None:
-        asyncio.create_task(self._handle_permission(event))
+        task = asyncio.create_task(self._handle_permission(event))
+        self._permission_tasks.add(task)
+        task.add_done_callback(self._permission_tasks.discard)
 
     async def _handle_permission(self, event: CrushEvent) -> None:
         decision = ApprovalDecision.DENY
@@ -889,7 +902,12 @@ class CrushRuntime:
                     event.workspace_id, event.payload, decision.value,
                 )
             except Exception:
-                pass
+                logger.warning(
+                    "crush permission reply failed for request %s (decision %s)",
+                    event.payload.get("id"),
+                    decision.value,
+                    exc_info=True,
+                )
 
     async def _decide_permission(self, event: CrushEvent) -> ApprovalDecision:
         payload = event.payload

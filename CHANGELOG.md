@@ -22,6 +22,21 @@ All notable changes to the Claude Code node harness. Dates are KST.
   instead of ~16.
 
 ### Fixed
+- **doctor: every subprocess is bounded by a timeout; `--fix --apply` writes
+  settings.json and hooks atomically (#1481).** `harness_version` (the
+  `ccc-version.sh` and `git describe` probes) and the six `tar` backup /
+  validate / restore steps ran with no `timeout=`, so a wedged git (stale
+  index lock, credential helper waiting on a tty) or a tar on a stalled mount
+  hung the whole diagnosis — under cron and self-update's `check.sh`, where
+  nothing would ever kill it. Probes now get 30s, archive steps 120s
+  (`CCC_DOCTOR_SUBPROCESS_TIMEOUT` overrides both); a timeout is a stderr
+  diagnostic plus `unknown (timed out)` / a failed-closed backup, never a
+  hang. The `date` subprocess behind backup names is replaced by
+  `datetime.now()` (same local-time format). settings.json and reinstalled
+  hooks are written through a same-directory temp file + rename, keeping the
+  live file's mode (settings) or the repo source's mode (hooks), so a reader
+  or a firing hook never sees a truncated file. `ccc-doctor.test.sh` +9
+  (hung git/tar shims, timeout clamp, temp-residue and mode checks).
 - **tunnel-audit: ufw is read through `sudo -n` when the probe runs as a
   non-root user (#1434).** The fleet ssh lands on gongmyoung's harness user,
   so the first post-#1432 fleet run reported `ufw unavailable` on the one node
