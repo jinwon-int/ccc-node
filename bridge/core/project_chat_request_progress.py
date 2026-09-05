@@ -22,7 +22,7 @@ class LedgerCreate(Protocol):
         chat_id: int,
         *,
         initial_state: str,
-    ) -> str | None: ...
+    ) -> Awaitable[str | None]: ...
 
 
 class DurationLogAppend(Protocol):
@@ -43,7 +43,7 @@ class LedgerFinish(Protocol):
         state: str,
         *,
         cleanup_done: bool,
-    ) -> None: ...
+    ) -> Awaitable[None]: ...
 
 
 ProgressLoop = Callable[[_PendingRequest], Coroutine[Any, Any, None]]
@@ -104,7 +104,7 @@ class RequestProgressCoordinator:
             return self._clock()
         return asyncio.get_running_loop().time()
 
-    def start(
+    async def start(
         self,
         *,
         user_id: int,
@@ -116,7 +116,12 @@ class RequestProgressCoordinator:
         streaming_handler: Any | None,
         usage_mode: str,
     ) -> RequestProgressHandle:
-        """Create one request and its visible-progress task."""
+        """Create one request and its visible-progress task.
+
+        Async because the ledger create is an fsync-backed write the handler
+        offloads to a worker thread (#1479); the progress task is only spawned
+        once the durable record exists, exactly as before.
+        """
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[None] = loop.create_future()
@@ -133,7 +138,7 @@ class RequestProgressCoordinator:
         )
         request.usage_mode = usage_mode
         request.started_at = self._now()
-        request.task_id = self._ledger_create(
+        request.task_id = await self._ledger_create(
             user_id,
             chat_id,
             initial_state=RequestPhase.WAITING_FOR_TURN.value,
@@ -174,7 +179,7 @@ class RequestProgressCoordinator:
             duration_ms=duration_ms,
             success=terminal_outcome is RequestPhase.COMPLETED,
         )
-        self._ledger_finish(
+        await self._ledger_finish(
             request,
             terminal_outcome.value,
             cleanup_done=cleaned,

@@ -8,6 +8,10 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Compiled once at import (#1479): ``_clean_response`` runs on every delivered
+# response, so a per-call ``re.compile`` was pure event-loop overhead.
+_ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
 
 def _first_text_block(content: Any) -> str:
     """First non-empty ``text`` block from a content list, or a stripped string.
@@ -170,8 +174,7 @@ class ProjectChatHistoryMixin:
         return None
 
     def _clean_response(self, response: str) -> str:
-        ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-        cleaned = ansi_escape.sub("", response)
+        cleaned = _ANSI_ESCAPE_RE.sub("", response)
         cleaned = "".join(
             char for char in cleaned if ord(char) >= 32 or char in "\n\r\t"
         )

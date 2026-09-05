@@ -155,6 +155,19 @@ class TranscriptHistoryTests(unittest.TestCase):
         self.assertEqual(sid, "alpha")
         self.assertEqual(preview, "first real question")
 
+    def test_clean_response_strips_ansi_and_control_chars_via_module_regex(self):
+        """#1479: the ANSI pattern is compiled once at import, not per call."""
+        from telegram_bot.core import project_chat_history
+
+        self.assertIs(
+            project_chat_history._ANSI_ESCAPE_RE,
+            project_chat_history._ANSI_ESCAPE_RE,
+        )
+        raw = "\x1b[31mred\x1b[0m\x1b]0;title\x07 text\x00\tkeep\n"
+        cleaned = self.host._clean_response(raw)
+        self.assertEqual(cleaned, "red0;title text\tkeep")
+        self.assertNotIn("\x1b", cleaned)
+
 
 if __name__ == "__main__":
     unittest.main()

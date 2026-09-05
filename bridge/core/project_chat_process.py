@@ -205,6 +205,32 @@ def _claim_request_terminal(request: _PendingRequest, phase: RequestPhase, *, ca
     return attempt.kind is TerminalAttemptKind.WON
 
 
+async def _await_offloaded_write(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> None:
+    """Run a best-effort fsync-backed write in a worker thread, cancel-safely.
+
+    ``asyncio.to_thread`` cannot interrupt the thread, so a cancellation that
+    arrives mid-write is re-raised only once the write has landed (the same
+    shape as ``TimeoutPreservingEventReader._drain_pending``). That keeps a
+    turn's ``publish_active_turn`` / ``clear_active_turn`` pair ordered: the
+    finally-block clear can never overtake a publish still in flight and leave
+    a stale route behind (#1479). The write itself is fail-open.
+    """
+
+    write = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+    interrupted: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(write)
+        except asyncio.CancelledError as exc:
+            interrupted = exc
+            if write.done():
+                break
+            continue
+        break
+    if interrupted is not None:
+        raise interrupted
+
+
 async def _finalize_request_progress(
     *,
     coordinator: RequestProgressCoordinator,
@@ -681,7 +707,7 @@ class ProjectChatProcessMixin:
                 append_duration_log=self._append_duration_log,
                 ledger_finish=self._ledger_finish,
             )
-            progress_handle = progress_coordinator.start(
+            progress_handle = await progress_coordinator.start(
                 user_id=user_id,
                 chat_id=chat_id,
                 model=model,
@@ -800,15 +826,6 @@ class ProjectChatProcessMixin:
                         model=model,
                         route_bot=notification_bot or bot,
                     )
-                    # #740: publish which conversation this turn serves so the
-                    # agent-side external-wait CLI can bind CI registrations to
-                    # the correct route (cleared in the turn finally below).
-                    publish_active_turn(
-                        self._external_wait_home(),
-                        user_id=user_id,
-                        chat_id=chat_id,
-                        session_id=session.session_id,
-                    )
                     # Same cadence as the unsolicited route: (re-)register the
                     # /usage observation seam each turn.
                     self._register_agent_frame_observer(
@@ -819,6 +836,22 @@ class ProjectChatProcessMixin:
                         session,
                         started_at=loop.time(),
                     )
+                # #740: publish which conversation this turn serves so the
+                # agent-side external-wait CLI can bind CI registrations to
+                # the correct route (cleared in the turn finally below). This
+                # is an fsync-backed file write, so it runs in a worker thread
+                # and outside the session guard lock (#1479): the lock only
+                # protects registry/runtime state against the resource guard,
+                # nothing under it reads the route file, the conversation lock
+                # already serializes same-conversation turns, and the route is
+                # still published before send_turn() hands control to the agent.
+                await _await_offloaded_write(
+                    publish_active_turn,
+                    self._external_wait_home(),
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    session_id=session.session_id,
+                )
                 generation = turn_token.generation
                 output = TurnOutputBuffer()
                 turn_state = TurnEventState()
@@ -849,14 +882,14 @@ class ProjectChatProcessMixin:
                     # observed the event yet.
                     if progress_request.lifecycle.admit():
                         self._agent_session_registry.admit_if_same(turn_token)
-                        self._project_request_phase(progress_request)
+                        await self._project_request_phase(progress_request)
                     approval_lease = progress_request.lifecycle.begin_approval()
                     if approval_lease is None:
                         return _deny("lifecycle-refused")
                     callback_task = asyncio.current_task()
                     if callback_task is not None:
                         active_approval_callbacks.add(callback_task)
-                    self._project_request_phase(progress_request)
+                    await self._project_request_phase(progress_request)
                     try:
                         try:
                             decision = await approval_callback(chat_id, user_id, event, generation)
@@ -867,7 +900,7 @@ class ProjectChatProcessMixin:
                             return _deny("callback-exception")
                     finally:
                         if progress_request.lifecycle.end_approval(approval_lease):
-                            self._project_request_phase(progress_request)
+                            await self._project_request_phase(progress_request)
                         if callback_task is not None:
                             active_approval_callbacks.discard(callback_task)
                     if decision is ApprovalDecision.ALLOW:
@@ -932,7 +965,7 @@ class ProjectChatProcessMixin:
                         turn_state.mark_admitted()
                         self._agent_session_registry.admit_if_same(turn_token)
                         if request_admitted:
-                            self._project_request_phase(progress_request)
+                            await self._project_request_phase(progress_request)
                     progress_request.last_event_at = now
                     if turn_state.needs_attempt_recording:
                         # Claude adapter-path spend boundary (#388): ClaudeRuntime
@@ -1407,14 +1440,20 @@ class ProjectChatProcessMixin:
                         requested_session_id=session_id,
                     )
                 finally:
-                    clear_active_turn(
-                        self._external_wait_home(),
-                        user_id=user_id,
-                        chat_id=chat_id,
-                        session_id=session.session_id if session is not None else None,
-                    )
-                    if turn_token is not None:
-                        self._agent_session_registry.deactivate_if_same(
-                            turn_token,
-                            touch_at=loop.time(),
+                    try:
+                        # Offloaded fsync write (#1479); a cancellation landing
+                        # here is honoured only after the clear has landed so
+                        # the route can never outlive the turn.
+                        await _await_offloaded_write(
+                            clear_active_turn,
+                            self._external_wait_home(),
+                            user_id=user_id,
+                            chat_id=chat_id,
+                            session_id=session.session_id if session is not None else None,
                         )
+                    finally:
+                        if turn_token is not None:
+                            self._agent_session_registry.deactivate_if_same(
+                                turn_token,
+                                touch_at=loop.time(),
+                            )
