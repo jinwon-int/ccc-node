@@ -175,5 +175,103 @@ ok "proxy banner call site routes through redact_url_userinfo" \
 ok "proxy exports keep the raw URL (no redaction on the env path)" \
   'grep -q "export https_proxy=\"\$proxy_url\"" "$ROOT/bridge/start.sh"'
 
+# --- atomic token lock (#1480) ------------------------------------------------
+# The old claim was read+kill-0 then printf: two concurrent starts both passed
+# and both wrote the file. acquire_token_lock must let exactly one contender
+# through, refuse the rest while the holder lives, and reclaim a dead holder
+# (stale pid) — in both the flock path and the flock-less mkdir fallback.
+# TOKEN_LOCK_FILE is pinned directly so init_token_lock's token lookup is
+# bypassed; each contender runs in its own subshell (the lock fd is per process).
+lock_root="$TMP/locks"; mkdir -p "$lock_root"
+# shellcheck disable=SC2034  # read by the sourced lock helpers, not this file
+TOKEN_LOCK_FILE="$lock_root/token.pid"
+wait_for_file() { # <path> — bounded poll
+  for _ in $(seq 1 100); do [ -e "$1" ] && return 0; sleep 0.1; done
+  return 1
+}
+hold_lock() { # <name> — background holder until $TMP/<name>.release exists
+  ( acquire_token_lock "$BASHPID" >"$TMP/$1.out" 2>&1 || exit 1
+    printf '%s' "$BASHPID" > "$TMP/$1.pid"
+    while [ ! -e "$TMP/$1.release" ]; do sleep 0.1; done ) &
+  wait_for_file "$TMP/$1.pid"
+}
+release_lock() { touch "$TMP/$1.release"; wait 2>/dev/null; }
+contend() { # <name> — one-shot contender; rc in <name>.rc, output in <name>.out
+  ( acquire_token_lock "$BASHPID" >"$TMP/$1.out" 2>&1; echo $? > "$TMP/$1.rc" )
+}
+race() { # <name> <n> — n contenders released together; winners append their pid
+  local name="$1" n="$2"
+  rm -f "$TMP/$name.go" "$TMP/$name.winners"
+  for _ in $(seq 1 "$n"); do
+    ( while [ ! -e "$TMP/$name.go" ]; do sleep 0.05; done
+      if acquire_token_lock "$BASHPID" >/dev/null 2>&1; then
+        echo "$BASHPID" >> "$TMP/$name.winners"; sleep 3
+      fi ) &
+  done
+  sleep 0.3; touch "$TMP/$name.go"; wait
+}
+
+# Tiers: util-linux flock(1); python fcntl on the same inherited fd (Termux
+# without util-linux); mkdir claim dir (no flock AND no python3). The same seam
+# as refresh-memory.sh forces past flock(1); a PATH without python3 forces the
+# last resort. The subshells only need these tools beyond bash builtins.
+lock_bin_min="$TMP/bin-min"; mkdir -p "$lock_bin_min"
+for tool in sleep cat mkdir rm mv rmdir find seq touch wc grep; do
+  ln -s "$(command -v "$tool")" "$lock_bin_min/$tool"
+done
+LOCK_TEST_PATH="$PATH"
+for lock_mode in flock python mkdir; do
+  rm -rf "$lock_root"; mkdir -p "$lock_root"
+  PATH="$LOCK_TEST_PATH"
+  case "$lock_mode" in
+    flock) unset CCC_FLOCK_CLI ;;
+    python) export CCC_FLOCK_CLI="$TMP/no-such-flock" ;;
+    mkdir) export CCC_FLOCK_CLI="$TMP/no-such-flock"; PATH="$lock_bin_min" ;;
+  esac
+  hold_lock "h-$lock_mode"
+  ok "[$lock_mode] holder acquires and records its pid" \
+    '[ "$(cat "$TOKEN_LOCK_FILE")" = "$(cat "$TMP/h-$lock_mode.pid")" ]'
+  contend "c-$lock_mode"
+  ok "[$lock_mode] contender is refused while the holder lives" \
+    '[ "$(cat "$TMP/c-$lock_mode.rc")" = 1 ] && grep -q "already using the same Bot Token (PID: $(cat "$TMP/h-$lock_mode.pid"))" "$TMP/c-$lock_mode.out"'
+  ok "[$lock_mode] refused contender leaves the holder's pid in place" \
+    '[ "$(cat "$TOKEN_LOCK_FILE")" = "$(cat "$TMP/h-$lock_mode.pid")" ]'
+  # Dead holder: SIGKILL runs no cleanup, so the pid file (and, in fallback,
+  # the claim dir) is left behind exactly as a crashed bridge would leave it.
+  # (The holder's last `sleep` child inherited the lock fd; give it its 100 ms
+  # to exit — in production that inheritance is the daemon child, by design.)
+  kill -9 "$(cat "$TMP/h-$lock_mode.pid")" 2>/dev/null; wait 2>/dev/null; sleep 0.3
+  contend "s-$lock_mode"
+  ok "[$lock_mode] stale claim of a dead holder is reclaimed" \
+    '[ "$(cat "$TMP/s-$lock_mode.rc")" = 0 ]'
+  # The one-shot reclaimer above exited without cleanup, so this race starts
+  # against a stale claim: the hardest case for the mkdir tier (all five see a
+  # dead holder and all try to reclaim at once).
+  race "r-$lock_mode" 5
+  ok "[$lock_mode] concurrent launch against a stale claim: exactly one of five wins" \
+    '[ "$(wc -l < "$TMP/r-$lock_mode.winners")" -eq 1 ]'
+  ok "[$lock_mode] the recorded pid is the winner's" \
+    '[ "$(cat "$TOKEN_LOCK_FILE")" = "$(cat "$TMP/r-$lock_mode.winners")" ]'
+  ( cleanup_token_lock )
+  race "q-$lock_mode" 5
+  ok "[$lock_mode] concurrent launch from a clean state: exactly one of five wins" \
+    '[ "$(wc -l < "$TMP/q-$lock_mode.winners")" -eq 1 ]'
+done
+PATH="$LOCK_TEST_PATH"
+ok "mkdir tier announces itself" 'grep -q "flock unavailable; using mkdir fallback" "$TMP/h-mkdir.out"'
+ok "flock and python tiers are silent about the fallback" \
+  '! grep -q "mkdir fallback" "$TMP/h-flock.out" "$TMP/h-python.out"'
+ok "mkdir tier leaves no reclaim token behind" '[ ! -e "$TOKEN_LOCK_FILE.d.reclaim" ]'
+( cleanup_token_lock )
+ok "cleanup removes the pid file and the fallback claim dir" \
+  '[ ! -e "$TOKEN_LOCK_FILE" ] && [ ! -e "$TOKEN_LOCK_FILE.d" ]'
+unset CCC_FLOCK_CLI
+# Call-site pins: both run paths claim atomically BEFORE prepare_runtime, and
+# nothing else writes the pid into the lock file any more.
+ok "daemon supervisor claims the lock atomically before prepare_runtime" \
+  'grep -A1 "acquire_token_lock \"\$\$\" || exit 1" "$ROOT/bridge/start.sh" | grep -q prepare_runtime'
+ok "no bare write_token_lock claim remains outside acquire_token_lock" \
+  '[ "$(grep -c "^ *write_token_lock \"\\$\\$\"" "$ROOT/bridge/start.sh")" = 0 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

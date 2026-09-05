@@ -895,7 +895,17 @@ do_upgrade() {
 }
 
 # ── Token-based global lock (prevents duplicate instances across different project dirs) ──
+# The lock FILE records the holder's pid (read by --status/--stop, the python
+# health reporter, and service-launchd.sh: that contract is unchanged). What
+# changed (#1480): the CLAIM is atomic. A read-then-write claim let two
+# concurrent starts both pass the pre-flight check and both write the file,
+# ending in a getUpdates Conflict. acquire_token_lock now holds a kernel flock
+# on fd 8 for the holder's lifetime (inherited across `exec python`, so the
+# bot itself keeps it), or — where util-linux flock is absent (Termux) — an
+# atomic mkdir claim next to the file, with the pid file still deciding
+# liveness so a dead holder is reclaimed exactly as before.
 TOKEN_LOCK_FILE=""
+TOKEN_LOCK_HELD=""
 
 init_token_lock() {
     if [ -n "$TOKEN_LOCK_FILE" ]; then
@@ -922,11 +932,114 @@ write_token_lock() {
     printf '%s\n' "$1" > "$TOKEN_LOCK_FILE"
 }
 
+token_lock_holder_pid() {
+    cat "$TOKEN_LOCK_FILE" 2>/dev/null || true
+}
+
+# flock(1) stand-in: a kernel flock is attached to the OPEN FILE DESCRIPTION,
+# which a child inherits, so python locking the inherited fd locks it for this
+# shell too and the lock outlives the python child. Nodes without util-linux
+# (Termux) still have python3 — the bot cannot run without it.
+_flock_fd_via_python() { # <fd>
+    python3 - "$1" <<'PY'
+import fcntl, sys
+try:
+    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)
+PY
+}
+
+_token_lock_refuse() {
+    echo "⚠️  Another instance is already using the same Bot Token (PID: $(token_lock_holder_pid)). Stop it first."
+    return 1
+}
+
+# Atomically claim the token lock for <pid> (the process that will serve the
+# token: the foreground bot after exec, or the daemon supervisor). Returns 0
+# with the claim held for this process's lifetime, 1 (after printing why) when
+# another live instance holds it. Never falls through to a shared claim.
+acquire_token_lock() { # <pid>
+    local pid="$1" flock_bin lock_dir reclaim
+    init_token_lock
+    flock_bin="${CCC_FLOCK_CLI:-$(command -v flock || true)}"
+    if [ -n "$flock_bin" ] && [ -f "$flock_bin" ] && [ -x "$flock_bin" ]; then
+        TOKEN_LOCK_HELD="flock"
+    elif command -v python3 >/dev/null 2>&1; then
+        TOKEN_LOCK_HELD="python-flock"
+    else
+        TOKEN_LOCK_HELD="mkdir"
+    fi
+    if [ "$TOKEN_LOCK_HELD" != mkdir ]; then
+        # Append mode: opening must never truncate a live holder's pid. The fd
+        # stays open on purpose — closing it releases the lock. A kernel flock
+        # dies with its holder, so a stale pid file never blocks a restart.
+        if ! { exec 8>>"$TOKEN_LOCK_FILE"; } 2>/dev/null; then
+            echo "❌ Error: cannot open token lock file: $TOKEN_LOCK_FILE"
+            TOKEN_LOCK_HELD=""
+            return 1
+        fi
+        if [ "$TOKEN_LOCK_HELD" = flock ]; then
+            "$flock_bin" -n 8
+        else
+            _flock_fd_via_python 8
+        fi || {
+            exec 8>&-
+            TOKEN_LOCK_HELD=""
+            _token_lock_refuse
+            return 1
+        }
+        write_token_lock "$pid"
+        return 0
+    fi
+    # Last resort (no flock, no python3 — the bot itself cannot start then):
+    # mkdir is atomic (same fallback as refresh-memory.sh, #1487). A directory
+    # outlives a dead holder, so the pid file keeps deciding liveness — the
+    # stale-pid recovery the old check had. The short wait covers a winner
+    # that owns the dir but has not recorded its pid yet. Removing a dead
+    # holder's dir goes through a sole-reclaimer token so two reclaimers can
+    # never delete each other's fresh claim; a token abandoned by a reclaimer
+    # killed mid-step is dropped after a minute.
+    lock_dir="$TOKEN_LOCK_FILE.d"
+    reclaim="$lock_dir.reclaim"
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        sleep 1
+        is_token_locked && { TOKEN_LOCK_HELD=""; _token_lock_refuse; return 1; }
+        if [ -d "$reclaim" ] && [ -n "$(find "$reclaim" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+            rmdir "$reclaim" 2>/dev/null || true
+        fi
+        mkdir "$reclaim" 2>/dev/null || { TOKEN_LOCK_HELD=""; _token_lock_refuse; return 1; }
+        # Re-check under the token: a reclaimer that finished between our
+        # first check and this point recorded its pid before releasing it.
+        if is_token_locked; then
+            rmdir "$reclaim" 2>/dev/null || true
+            TOKEN_LOCK_HELD=""
+            _token_lock_refuse
+            return 1
+        fi
+        rm -rf "$lock_dir"
+        if ! mkdir "$lock_dir" 2>/dev/null; then
+            rmdir "$reclaim" 2>/dev/null || true
+            TOKEN_LOCK_HELD=""
+            _token_lock_refuse
+            return 1
+        fi
+        write_token_lock "$pid"
+        rmdir "$reclaim" 2>/dev/null || true
+        echo "🔒 token lock: flock unavailable; using mkdir fallback"
+        return 0
+    fi
+    echo "🔒 token lock: flock unavailable; using mkdir fallback"
+    write_token_lock "$pid"
+}
+
 cleanup_token_lock() {
     if [ -z "$TOKEN_LOCK_FILE" ]; then
         init_token_lock
     fi
-    [ -n "$TOKEN_LOCK_FILE" ] && rm -f "$TOKEN_LOCK_FILE"
+    [ -n "$TOKEN_LOCK_FILE" ] || return 0
+    rm -f "$TOKEN_LOCK_FILE"
+    rmdir "$TOKEN_LOCK_FILE.d" 2>/dev/null || true
 }
 
 cleanup_token_lock_if_safe() {
@@ -1329,18 +1442,26 @@ prepare_runtime() {
         fi
     fi
 
-    cd "$REPO_ROOT"
+    # No global `set -e`: an ignored failure here would exec the bot from the
+    # wrong working directory (#1480).
+    cd "$REPO_ROOT" || {
+        echo "❌ Error: cannot enter repo root: $REPO_ROOT"
+        exit 1
+    }
 }
 
 exec_bot_once() {
     export BOT_PROCESS_MODE="$PROCESS_MODE"
     export BOT_TOKEN_LOCK_FILE="$TOKEN_LOCK_FILE"
     export BOT_OWNS_TOKEN_LOCK="1"
-    write_token_lock "$$"
+    # The token lock was claimed atomically for $$ before prepare_runtime
+    # (acquire_token_lock); `exec` keeps the pid AND the lock fd, so the python
+    # process is the holder for its whole life.
     # Write PID file so `--status` works in foreground/systemd mode.
     # `exec` replaces the current shell with the Python process, keeping the
     # same PID ($$), so this file stays valid after exec.  do_status() already
     # handles stale PIDs via kill-0 + cleanup_pid, so no extra cleanup is needed.
+    # Only the lock holder reaches this write, so it is serialized by the lock.
     echo $$ > "$PID_FILE"
 
     _acquire_platform_wakelock
@@ -1403,11 +1524,13 @@ run_daemon_supervisor() {
         cleanup_token_lock
     }
 
+    # The token lock is already held for $$ (claimed atomically in the dispatch
+    # branch before prepare_runtime, so a losing supervisor exits before this
+    # trap exists and never removes the winner's lock).
     trap daemon_cleanup EXIT
     trap 'exit 143' TERM INT
 
     echo $$ > "$SUPERVISOR_PID_FILE"
-    write_token_lock "$$"
 
     # Debug: log environment variables for daemon supervisor
     echo "DEBUG: VENV_DIR=$VENV_DIR" >> "$LOGS_DIR/supervisor.log"
@@ -1523,6 +1646,10 @@ if [ "$DAEMON_MODE" -eq 1 ] && [ "$RUN_AS_DAEMON_SUPERVISOR" -eq 0 ]; then
 fi
 
 if [ "$RUN_AS_DAEMON_SUPERVISOR" -eq 1 ]; then
+    # Atomic claim FIRST: two `start.sh -d` launched together both pass the
+    # parent's advisory pre-check above; exactly one supervisor wins here and
+    # the loser exits within the parent's readiness window (#1480).
+    acquire_token_lock "$$" || exit 1
     prepare_runtime
     run_daemon_supervisor
     exit $?
@@ -1540,10 +1667,9 @@ if [ "$INTERNAL_RUN" -eq 0 ]; then
     fi
 fi
 
-if is_token_locked; then
-    echo "⚠️  Another instance is already using the same Bot Token (PID: $(cat "$TOKEN_LOCK_FILE")). Stop it first."
-    exit 1
-fi
+# Atomic claim for the foreground bot: `exec` below keeps $$ and the lock fd,
+# so the python process itself is the holder (#1480).
+acquire_token_lock "$$" || exit 1
 
 prepare_runtime
 exec_bot_once
