@@ -266,6 +266,9 @@ class ProjectChatHandler(
         self._session_guard_lock = asyncio.Lock()
         # Orders the offloaded task-ledger writes (see _run_ledger_write).
         self._task_ledger_write_lock = asyncio.Lock()
+        # Orders the offloaded usage-meter writes (see _run_usage_write).
+        self._usage_write_lock = asyncio.Lock()
+        self._usage_write_tasks: set[asyncio.Task[Any]] = set()
         self._session_guard_evictions = 0
         self._session_guard_runtime_recycles = 0
         self._session_guard_last_tree_rss_mb = 0.0
@@ -322,7 +325,10 @@ class ProjectChatHandler(
         if self._usage_meter is not None and self._agent_runtime is not None:
             set_usage_recorder = getattr(self._agent_runtime, "set_usage_recorder", None)
             if callable(set_usage_recorder):
-                set_usage_recorder(self._usage_meter.record_codex_thread_usage)
+                # The runtime invokes the recorder synchronously from its
+                # notification router; the wrapper offloads the fsync-backed
+                # meter write off the event loop in FIFO order (#1479).
+                set_usage_recorder(self._record_codex_thread_usage)
             set_turn_attempt_recorder = getattr(
                 self._agent_runtime, "set_turn_attempt_recorder", None
             )
@@ -715,6 +721,80 @@ class ProjectChatHandler(
             input_total = snapshot.input_tokens or 0
         return input_total, snapshot.output_tokens or 0
 
+    # -- usage-meter write offload (#1479) -----------------------------------
+    #
+    # UsageMeter.record() takes flock + re-reads + atomically rewrites
+    # usage-meter.json under a thread lock, so it must not run on the event
+    # loop. The record verbs below keep their synchronous, fail-open signature
+    # (other callers and tests use them directly); coroutine call sites go
+    # through _run_usage_write and synchronous runtime seams through
+    # _schedule_usage_write. Writes are FIFO-ordered by a per-handler asyncio
+    # lock because record_codex_thread_usage is a non-commutative
+    # read-modify-write of its per-thread baseline: two coalesced
+    # observations of one thread landing out of order would re-baseline
+    # against the wrong total and over-record the next delta.
+
+    async def _run_usage_write(
+        self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Run one usage-meter write in a worker thread, in issue order."""
+
+        lock = getattr(self, "_usage_write_lock", None)
+        if lock is None:
+            lock = self._usage_write_lock = asyncio.Lock()
+        async with lock:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+
+    async def _run_usage_write_logged(
+        self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> None:
+        try:
+            await self._run_usage_write(fn, *args, **kwargs)
+        except Exception:
+            logger.exception("Usage metering failed; turn continues")
+
+    def _schedule_usage_write(
+        self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> None:
+        """Offload a meter write from a synchronous seam on the loop thread.
+
+        Runtime recorders (``set_usage_recorder``) are invoked synchronously
+        from the runtime's notification router, so the write is scheduled as
+        a tracked task and awaited by :meth:`drain_usage_writes` at shutdown.
+        Without a running loop the write runs inline, as before.
+        """
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            fn(*args, **kwargs)
+            return
+        tasks = getattr(self, "_usage_write_tasks", None)
+        if tasks is None:
+            tasks = self._usage_write_tasks = set()
+        task = loop.create_task(self._run_usage_write_logged(fn, *args, **kwargs))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def drain_usage_writes(self) -> None:
+        """Await every scheduled (fire-and-forget) usage-meter write."""
+
+        tasks = tuple(getattr(self, "_usage_write_tasks", ()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _record_codex_thread_usage(
+        self, thread_id: str, previous: Any, current: Any
+    ) -> None:
+        """Runtime usage-recorder seam: offloaded, FIFO-ordered meter write."""
+
+        meter = self._usage_meter
+        if meter is None:
+            return
+        self._schedule_usage_write(
+            meter.record_codex_thread_usage, thread_id, previous, current
+        )
+
     def _meter_claude_tokens(self, delta: Tuple[int, int], mode: str = MODE_INTERACTIVE) -> None:
         if self._usage_meter is None:
             return
@@ -1047,6 +1127,20 @@ class ProjectChatHandler(
         first = not self._shutdown_draining
         self._shutdown_draining = True
         return first
+
+    async def close(self) -> None:
+        """Close the shared runtime, then land its final coalesced usage writes.
+
+        ``CodexRuntime.close`` flushes every coalesced thread usage through the
+        recorder seam, which now schedules the meter write instead of running
+        it inline (#1479); draining here keeps that last write ahead of loop
+        teardown.
+        """
+
+        try:
+            await super().close()
+        finally:
+            await self.drain_usage_writes()
 
     @property
     def is_draining(self) -> bool:

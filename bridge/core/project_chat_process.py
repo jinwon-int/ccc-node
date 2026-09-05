@@ -638,8 +638,11 @@ class ProjectChatProcessMixin:
             return
         if isinstance(transition, ResultTransition):
             # Terminal usage payload: the Claude adapter path meters its tokens
-            # here; Codex meters via the runtime's usage-recorder seam.
-            self.record_claude_adapter_result(transition.event, mode=usage_mode)
+            # here; Codex meters via the runtime's usage-recorder seam. The
+            # meter write is fsync-backed, so it runs off the loop (#1479).
+            await self._run_usage_write(
+                self.record_claude_adapter_result, transition.event, mode=usage_mode
+            )
             return
         if isinstance(transition, DelegatedTaskLifecycleTransition):
             # Aggregate lifecycle state is consumed by the timeout selector and
@@ -971,7 +974,10 @@ class ProjectChatProcessMixin:
                         # Claude adapter-path spend boundary (#388): ClaudeRuntime
                         # has no turn-attempt seam, so the first accepted event
                         # meters the request. Codex meters at its own boundary.
-                        self.record_claude_adapter_attempt(mode=usage_mode)
+                        # Offloaded fsync-backed meter write (#1479).
+                        await self._run_usage_write(
+                            self.record_claude_adapter_attempt, mode=usage_mode
+                        )
                         turn_state.mark_attempt_recorded()
                     # Opt-in lifecycle audit (#645): fail-open tap, never blocks
                     # the turn. No-op on a default node.

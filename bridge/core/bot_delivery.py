@@ -1,4 +1,5 @@
 # ruff: noqa: E402
+import asyncio
 import logging
 import secrets
 from pathlib import Path as FilePath
@@ -266,7 +267,10 @@ class BotDeliveryMixin:
                 # Claude's legacy transcript path provides a progress summary.
                 # Codex selections must not access Claude transcript files.
                 if provider == "claude":
-                    last_msg = self._project_chat.get_session_last_assistant_message(sid)
+                    # Transcript read runs off the event loop (#1479).
+                    last_msg = await asyncio.to_thread(
+                        self._project_chat.get_session_last_assistant_message, sid
+                    )
                     if last_msg:
                         progress = f"📋 {last_msg}"
                         await message.reply_text(progress)

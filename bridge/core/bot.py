@@ -1017,7 +1017,10 @@ class TelegramBot(
                 and current_session["provider"] == "claude"
             ):
                 try:
-                    recent = self._project_chat.get_recent_messages(stale_session_id, limit=6)
+                    # Full transcript scan: run it off the event loop (#1479).
+                    recent = await asyncio.to_thread(
+                        self._project_chat.get_recent_messages, stale_session_id, limit=6
+                    )
                     if recent:
                         send_text = compose_history_injection(recent, text)
                         if sensitive_log_event:
