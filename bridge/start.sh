@@ -1167,6 +1167,21 @@ spawn_start_sh_detached() { # <log> <args...>
     SPAWNED_PID=$!
 }
 
+# Mask the userinfo of a URL for log output: http://user:pass@host:port/p
+# becomes http://<redacted>@host:port/p. In daemon mode stdout lands in
+# supervisor.log/restart.log, so the banner must never carry proxy
+# credentials (#1480). Only the authority (up to the first '/') is inspected,
+# and everything through its LAST '@' is dropped, so a raw '@' inside a
+# password can never leak. URLs without userinfo pass through unchanged.
+redact_url_userinfo() { # <url>
+    local url="$1" head="" authority tail
+    case "$url" in *://*) head="${url%%://*}://"; url="${url#*://}" ;; esac
+    authority="${url%%/*}"
+    tail="${url#"$authority"}"
+    case "$authority" in *@*) authority="<redacted>@${authority##*@}" ;; esac
+    printf '%s%s%s' "$head" "$authority" "$tail"
+}
+
 # ── Unit-test seam (#584 P3-2) ──
 #
 # Sourcing this file with CCC_START_SH_LIB_ONLY=1 yields the helper definitions
@@ -1214,7 +1229,7 @@ load_optional_env() {
         export https_proxy="$proxy_url"
         export all_proxy="$proxy_url"
         export no_proxy="localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
-        echo "🌐 Proxy configured: $proxy_url"
+        echo "🌐 Proxy configured: $(redact_url_userinfo "$proxy_url")"
     fi
 }
 

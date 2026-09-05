@@ -210,6 +210,30 @@ ok "inflight-cap 0 drain logs skip reason" 'grep -q "\[pending-drain\] skip reas
 ok "inflight-cap 0 drain retains pending jobs" \
   '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d " ")" = "$before_jobs" ]'
 
+# flock absent (Termux): a bare `flock` exits 127 and every lock file counted
+# as held, so the cap tripped on every SessionStart (#1480). An isolated state
+# dir with one stale lock and no jobs keeps this from spawning anything.
+NOFLOCK_STATE="$TMP/state-noflock"
+mkdir -p "$NOFLOCK_STATE/distill-pending"
+: > "$NOFLOCK_STATE/distill-pending/stale.json.lock"
+HOME="$TMP/home" CCC_STATE_DIR="$NOFLOCK_STATE" CCC_DISTILL_PENDING_INFLIGHT_MAX=1 \
+  CCC_DISTILL_PENDING_NPROC=3 \
+  CCC_DISTILL_PENDING_LOADAVG_PATH="$TMP/loadavg.cool" \
+  CCC_DISTILL_PENDING_MEMINFO_PATH="$TMP/meminfo.ok" \
+  CCC_FLOCK_CLI="$TMP/no-such-flock" bash "$DRAIN" >/dev/null 2>&1
+ok "no flock: unprobed lock does not trip the inflight cap" \
+  '! grep -q "\[pending-drain\] skip reason=inflight-cap" "$NOFLOCK_STATE/distill.log"'
+ok "no flock: fallback is logged" \
+  'grep -q "\[pending-drain\] flock unavailable; inflight cap not probed" "$NOFLOCK_STATE/distill.log"'
+: > "$NOFLOCK_STATE/distill.log"
+HOME="$TMP/home" CCC_STATE_DIR="$NOFLOCK_STATE" CCC_DISTILL_PENDING_INFLIGHT_MAX=1 \
+  CCC_DISTILL_PENDING_NPROC=3 \
+  CCC_DISTILL_PENDING_LOADAVG_PATH="$TMP/loadavg.cool" \
+  CCC_DISTILL_PENDING_MEMINFO_PATH="$TMP/meminfo.ok" \
+  bash "$DRAIN" >/dev/null 2>&1
+ok "flock present: stale unheld lock file still does not count as held" \
+  '! grep -q "\[pending-drain\] skip reason=inflight-cap" "$NOFLOCK_STATE/distill.log" && ! grep -q "flock unavailable" "$NOFLOCK_STATE/distill.log"'
+
 : > "$STATE/distill.log"
 printf '%s\n' success > "$CLAUDE_STUB_MODE_FILE"
 HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_FAIL_BACKOFF_SEC=0 \
