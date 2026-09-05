@@ -13,13 +13,21 @@ updates:
     # #349: bridge/requirements.lock.txt (runtime) and
     # .github/requirements/bridge-ci.txt (CI) are one logical lock pair —
     # tests/test_runtime_deps_lock.py fails CI when their shared pins drift.
-    # Listing both directories keeps every bump in a single PR that updates
-    # the pair together (single-directory bumps broke this in #999-#1001).
+    # Listing both directories is necessary but NOT sufficient: without a
+    # group Dependabot still opens one PR per package per directory, so a
+    # shared pin moves in one lock and not the other and the pair test fails
+    # (#999-#1001, then again #1453-#1457 — five PRs for one weekly round,
+    # #1483). The catch-all group below folds every pip bump, across both
+    # directories, into a single PR that regenerates the pair together.
     directories:
       - /bridge
       - /.github
     schedule:
       interval: weekly
+    groups:
+      python-lock-pair:
+        patterns:
+          - "*"
     ignore:
       # pydantic-core is not a direct dependency of bridge/pyproject.toml; it is
       # transitive and pydantic pins it exactly (pydantic 2.13.4 requires
