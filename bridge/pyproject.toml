@@ -63,6 +63,12 @@ packages = [
 # remembering an env var. Relative to this file's directory, i.e. rootdir.
 [tool.pytest.ini_options]
 pythonpath = ["../.github/pythonpath"]
+# Per-test wall-clock cap (pytest-timeout, locked CI-only via
+# .github/requirements/bridge-ci.in). Generous by design: individual tests
+# finish in well under a second, so 120s only catches genuine hangs and turns
+# a stalled runner into a fast failure with a stack dump. Local runs without
+# the plugin ignore this key (pytest warns about the unknown ini option).
+timeout = 120
 
 [tool.coverage.run]
 branch = true
