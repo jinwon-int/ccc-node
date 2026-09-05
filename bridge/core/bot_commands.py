@@ -5,16 +5,13 @@ import json
 import logging
 import re
 from datetime import datetime
-from pathlib import Path as FilePath
 from typing import (
     Any,
     Awaitable,
     Callable,
-    Iterable,
     Mapping,
     Optional,
     Protocol,
-    Sequence,
 )
 
 from telegram import (
@@ -44,9 +41,6 @@ from telegram_bot.core.continuation import (
 )
 from telegram_bot.core.agent_runtime import (
     JsonValue as AgentJsonValue,
-    ModelInfo,
-    SessionHistory,
-    SessionSummary,
 )
 from telegram_bot.core.project_chat_types import (
     AgentApprovalCallback,
@@ -54,9 +48,17 @@ from telegram_bot.core.project_chat_types import (
     InterimMessageCallback,
     PermissionCallback,
     StatusCallback,
-    TypingCallback,
 )
 from telegram_bot.core.task_queue import UserTaskQueue
+from telegram_bot.core.bot_ports import (
+    BotConfigPort,
+    ClearUserQueueFn,
+    ClockPort,
+    EnqueueUserTaskFn,
+    ProjectChatPort,
+    ReplySmartFn,
+    SessionManagerPort,
+)
 from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.core.skill_command import (
     SkillCommandResolutionError,
@@ -75,99 +77,6 @@ STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 from telegram_bot.core.bot_shared import (
     _esc_md2,
 )
-
-
-class _CommandConfig(Protocol):
-    @property
-    def bot_data_dir(self) -> FilePath: ...
-
-    @property
-    def restart_service_unit(self) -> str: ...
-
-    @property
-    def restart_delay_seconds(self) -> int: ...
-
-    @property
-    def claude_settings_path(self) -> FilePath: ...
-
-
-class _CommandSessionManager(Protocol):
-    async def get_session(self, key: Any) -> dict[str, Any]: ...
-
-    async def patch_session(
-        self,
-        key: Any,
-        *,
-        updates: Optional[Mapping[str, Any]] = None,
-        remove_fields: Iterable[str] = (),
-    ) -> None: ...
-
-
-class _CommandProjectChat(Protocol):
-    @property
-    def conversations_dir(self) -> FilePath: ...
-
-    async def get_usage(
-        self, user_id: int, chat_id: int, session_id: str | None
-    ) -> UsageSnapshot: ...
-
-    async def process_message(
-        self,
-        user_message: str,
-        user_id: int,
-        chat_id: int,
-        message_id: Optional[int] = None,
-        session_id: Optional[str] = None,
-        model: Optional[str] = None,
-        effort: Optional[str] = None,
-        approval_policy: Optional[str] = None,
-        approvals_reviewer: Optional[str] = None,
-        sandbox_policy: Optional[Mapping[str, AgentJsonValue]] = None,
-        new_session: bool = False,
-        permission_callback: Optional[PermissionCallback] = None,
-        approval_callback: Optional[AgentApprovalCallback] = None,
-        typing_callback: Optional[TypingCallback] = None,
-        status_callback: Optional[StatusCallback] = None,
-        bot: Optional[Any] = None,
-        notification_bot: Optional[Any] = None,
-        interim_message_callback: Optional[InterimMessageCallback] = None,
-        sensitive_log_event: Optional[str] = None,
-        usage_mode: str = ...,
-    ) -> ChatResponse: ...
-
-    async def list_runtime_models(self) -> Sequence[ModelInfo]: ...
-
-    async def list_runtime_sessions(
-        self, *, limit: int = 10
-    ) -> Sequence[SessionSummary]: ...
-
-    async def read_runtime_session(
-        self, session_id: str, *, limit: int = 5
-    ) -> SessionHistory: ...
-
-    def list_sessions(self, limit: int = 10) -> list[tuple[str, str, float]]: ...
-
-    async def stop(self, user_id: int, chat_id: Optional[int] = None) -> bool: ...
-
-    def get_recent_messages(
-        self, session_id: str, limit: int = 5
-    ) -> list[dict[str, Any]]: ...
-
-    def get_conversation_history(
-        self, session_id: str, limit: int = 50
-    ) -> list[dict[str, Any]]: ...
-
-    async def clear_user_stream(
-        self, user_id: int, chat_id: Optional[int] = None
-    ) -> None: ...
-
-    def clear_pending_permissions(
-        self, user_id: int, chat_id: Optional[int] = None
-    ) -> None: ...
-
-    async def cancel_user_streaming(
-        self, user_id: int, chat_id: Optional[int] = None
-    ) -> bool: ...
 
 
 class _EnqueuePreviousCodexSession(Protocol):
@@ -205,18 +114,6 @@ class _SaveSessionId(Protocol):
     ) -> Awaitable[None]: ...
 
 
-class _ReplySmart(Protocol):
-    def __call__(
-        self,
-        message: Message,
-        content: str,
-        parse_mode: str = "Markdown",
-        force_options: bool = False,
-        streamed: bool = False,
-        user_id: int | None = None,
-    ) -> Awaitable[None]: ...
-
-
 class _BuildHistoryKeyboard(Protocol):
     def __call__(
         self,
@@ -244,14 +141,10 @@ class _CommandDistillLocalSinkWorker(Protocol):
     ) -> None: ...
 
 
-class _CommandClock(Protocol):
-    def time(self) -> float: ...
-
-
 class BotCommandMixin:
-    _config: _CommandConfig
-    _session_manager: _CommandSessionManager
-    _project_chat: _CommandProjectChat
+    _config: BotConfigPort
+    _session_manager: SessionManagerPort
+    _project_chat: ProjectChatPort
     _require_application: Callable[
         [],
         Application[Any, Any, Any, Any, Any, Any],
@@ -280,13 +173,17 @@ class BotCommandMixin:
     _codex_approval_callback: AgentApprovalCallback
     _make_status_callback: Callable[[Any, int], StatusCallback]
     _make_interim_reply_callback: Callable[[Message], InterimMessageCallback]
-    _reply_smart: _ReplySmart
+    _reply_smart: ReplySmartFn
     _runtime_active_sessions: set[Any]
     _memory_promoter: _MemoryPromoter
     _distill_local_sink_worker: _CommandDistillLocalSinkWorker
     MODELS: list[tuple[str, str]]
-    _clock: _CommandClock
+    _clock: ClockPort
     _tasks: UserTaskQueue
+    # Provided by BotFollowupQueueMixin, which precedes this mixin in
+    # TelegramBot's MRO; do not define these here (#1484).
+    _enqueue_user_task: EnqueueUserTaskFn
+    _clear_user_queue: ClearUserQueueFn
     _build_history_keyboard: _BuildHistoryKeyboard
     _build_revert_mode_keyboard: Callable[[int], InlineKeyboardMarkup]
     _user_voice_tasks: dict[Any, set[asyncio.Task[Any]]]
@@ -1220,7 +1117,8 @@ class BotCommandMixin:
                 args=context.args or [],
             )
             return
-        sessions = self._project_chat.list_sessions(limit=10)
+        # Transcript directory scan: run it off the event loop (#1479).
+        sessions = await asyncio.to_thread(self._project_chat.list_sessions, limit=10)
         if not sessions:
             reply = "📭 No session history found."
             await message.reply_text(reply)
@@ -1413,7 +1311,10 @@ class BotCommandMixin:
                 for item in history.messages
             ]
         else:
-            messages = self._project_chat.get_recent_messages(session_id, limit=5)
+            # Full transcript scan: run it off the event loop (#1479).
+            messages = await asyncio.to_thread(
+                self._project_chat.get_recent_messages, session_id, limit=5
+            )
 
         if not messages:
             reply = "📭 No history available for this session."
@@ -1823,17 +1724,6 @@ class BotCommandMixin:
         except Exception as e:
             logger.error(f"Failed to cancel streaming for user {user_id}: {e}")
             return False
-
-    async def _clear_user_queue(self, user_id: int) -> tuple[int, int, int]:
-        return self._tasks.clear(user_id), 0, 0
-
-    async def _enqueue_user_task(
-        self,
-        user_id: int,
-        run_task: Callable[[], Awaitable[None]],
-        on_overflow: Callable[[], Awaitable[None]],
-    ) -> bool:
-        return await self._tasks.enqueue(user_id, run_task, on_overflow)
 
     async def _skill_aware_slash_message(
         self, message: Message, slash_cmd: str

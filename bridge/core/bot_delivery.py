@@ -9,9 +9,7 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
-    Iterable,
     List,
-    Mapping,
     Optional,
     Pattern,
     Protocol,
@@ -38,6 +36,13 @@ from telegram.ext import (
 from telegram_bot.core import ui
 from telegram_bot.core import paths as path_scope
 from telegram_bot.core.bot_shared import build_reply_context_prefix
+from telegram_bot.core.bot_ports import (
+    BotConfigPort,
+    EnqueueUserTaskFn,
+    ProcessUserMessageTextFn,
+    ProjectChatPort,
+    SessionManagerPort,
+)
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.tg_format import wrap_markdown_tables
 from telegram_bot.utils.tg_robust import send_with_retry
@@ -53,55 +58,6 @@ STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 MAX_SEND_FILE_BYTES = 50 * 1024 * 1024
 
 
-
-
-class _DeliveryConfig(Protocol):
-    @property
-    def bridge_memory_mode(self) -> str: ...
-
-    @property
-    def telegram_max_bubble_chars(self) -> int: ...
-
-    @property
-    def enable_readable_renderer(self) -> bool: ...
-
-    @property
-    def enable_loose_spacing(self) -> bool: ...
-
-    @property
-    def spacing_lines(self) -> int: ...
-
-    @property
-    def enable_entity_renderer(self) -> bool: ...
-
-    @property
-    def enable_option_buttons(self) -> bool: ...
-
-
-class _DeliverySessionManager(Protocol):
-    async def get_session(self, user_id: int) -> Dict[str, Any]: ...
-
-    async def patch_session(
-        self,
-        user_id: int,
-        *,
-        updates: Optional[Mapping[str, Any]] = None,
-        remove_fields: Iterable[str] = (),
-    ) -> None: ...
-
-    async def get_pending_question(
-        self, user_id: int
-    ) -> Optional[Dict[str, Any]]: ...
-
-    async def clear_pending_question(self, user_id: int) -> None: ...
-
-
-class _DeliveryProjectChat(Protocol):
-    def get_session_last_assistant_message(
-        self, session_id: str, max_chars: int = 300
-    ) -> Optional[str]: ...
-
-
 class _SendContentArtifacts(Protocol):
     def __call__(
         self,
@@ -112,24 +68,12 @@ class _SendContentArtifacts(Protocol):
     ) -> Awaitable[None]: ...
 
 
-class _ProcessUserMessageText(Protocol):
-    def __call__(
-        self,
-        update: Update,
-        user_id: int,
-        text: str,
-        message_source: str = "text",
-        voice_input_preview: Optional[str] = None,
-        sensitive_log_event: Optional[str] = None,
-    ) -> Awaitable[None]: ...
-
-
 class BotDeliveryMixin:
-    _config: _DeliveryConfig
-    _session_manager: _DeliverySessionManager
-    _project_chat: _DeliveryProjectChat
+    _config: BotConfigPort
+    _session_manager: SessionManagerPort
+    _project_chat: ProjectChatPort
     _send_content_artifacts: _SendContentArtifacts
-    _process_user_message_text: _ProcessUserMessageText
+    _process_user_message_text: ProcessUserMessageTextFn
     _require_application: Callable[
         [],
         Application[Any, Any, Any, Any, Any, Any],
@@ -149,14 +93,7 @@ class BotDeliveryMixin:
         Awaitable[None],
     ]
     _own_bot_id: Callable[[], int | None]
-    _enqueue_user_task: Callable[
-        [
-            int,
-            Callable[[], Awaitable[None]],
-            Callable[[], Awaitable[None]],
-        ],
-        Awaitable[bool],
-    ]
+    _enqueue_user_task: EnqueueUserTaskFn
     _project_root: Callable[[], FilePath]
     _runtime_active_sessions: set[Any]
     _FILE_PATH_RE: Pattern[str]
