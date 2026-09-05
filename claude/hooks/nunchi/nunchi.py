@@ -81,6 +81,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 import subprocess
 import sys
 import tempfile
@@ -210,6 +211,9 @@ def _float_env(name, default):
 # the same handler; the PRAGMA is issued too so the value is visible in the
 # connection itself (and re-settable per operation, see the sweep helper).
 _SQLITE_TIMEOUT_S = _float_env("NUNCHI_SQLITE_TIMEOUT", "10")
+_JOURNAL_MODE_ATTEMPTS = 8          # #1478: bounded retry for the WAL<->delete switch
+_JOURNAL_MODE_BACKOFF_S = 0.05      # 0.05*(1+..+7) = 1.4 s worst case, then keep current mode
+
 _SQLITE_SWEEP_TIMEOUT_MS = _float_env("NUNCHI_SQLITE_SWEEP_TIMEOUT_MS", "1000")
 
 
@@ -224,10 +228,23 @@ def _apply_journal_mode(c):
     mode = os.environ.get("NUNCHI_SQLITE_JOURNAL", "wal").strip().lower()
     if mode not in ("wal", "delete"):
         return
-    try:
-        c.execute(f"PRAGMA journal_mode={mode}").fetchone()
-    except sqlite3.Error:
-        pass
+    # Switching modes needs every other connection gone; a holder that is
+    # still winding down makes the PRAGMA return the *old* mode instead of
+    # raising (observed as a CI flake on the delete opt-out, #1478). Retry a
+    # few times with a short back-off, then give up silently as before.
+    for attempt in range(_JOURNAL_MODE_ATTEMPTS):
+        try:
+            row = c.execute(f"PRAGMA journal_mode={mode}").fetchone()
+            if row and str(row[0]).lower() == mode:
+                return
+        except sqlite3.OperationalError:
+            # "database is locked": busy_timeout does not cover the mode
+            # switch, it raises at once while any other connection is open.
+            pass
+        except sqlite3.Error:
+            return
+        if attempt + 1 < _JOURNAL_MODE_ATTEMPTS:
+            time.sleep(_JOURNAL_MODE_BACKOFF_S * (attempt + 1))
 
 
 def db():
