@@ -365,6 +365,97 @@ async def test_external_wait_route_is_independent_of_approval_generation(
     assert resolve_active_route(home) is None
 
 
+@pytest.mark.anyio
+async def test_turn_route_publish_and_clear_run_off_the_event_loop_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1479: both route writes are fsync-backed, so they run in a worker thread."""
+    import threading
+
+    from telegram_bot.core import project_chat_process
+
+    home = tmp_path / ".telegram_bot" / "external-wait"
+    session = _FakeSession("sess-1", home)
+    settings = SimpleNamespace(
+        agent_provider="claude",
+        project_root=tmp_path,
+        execution_profile="strict-project",
+        bash_policy="disabled",
+        allowed_user_ids=[7],
+        require_allowlist=True,
+        claude_cli_path=None,
+        claude_settings_path=tmp_path / "claude" / "settings.json",
+        enable_streaming=False,
+        enable_partial_streaming=False,
+        bot_data_dir=None,
+        task_ledger_path=None,
+        session_guard_enabled=False,
+    )
+    handler = ProjectChatHandler(settings=settings, agent_runtime=_FakeRuntime(session))
+    handler._task_ledger_cache = False
+
+    loop_thread = threading.get_ident()
+    observed: dict[str, tuple[bool, bool]] = {}
+    process_globals = ProjectChatHandler._process_agent_message.__globals__
+
+    def _record(name: str, original):
+        def wrapper(*args, **kwargs):
+            observed[name] = (
+                threading.get_ident() != loop_thread,
+                handler._session_guard_lock.locked(),
+            )
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setitem(
+        process_globals,
+        "publish_active_turn",
+        _record("publish", project_chat_process.publish_active_turn),
+    )
+    monkeypatch.setitem(
+        process_globals,
+        "clear_active_turn",
+        _record("clear", project_chat_process.clear_active_turn),
+    )
+
+    response = await handler.process_message("hello", 7, 70)
+
+    assert response.success is True
+    assert session.route_during_turn is not None
+    assert session.route_during_turn["session_id"] == "sess-1"
+    assert resolve_active_route(home) is None
+    # (off the loop thread, session guard lock not held) for both writes.
+    assert observed == {"publish": (True, False), "clear": (True, False)}
+
+
+@pytest.mark.anyio
+async def test_offloaded_write_cancellation_waits_for_the_write_to_land() -> None:
+    """#1479: a cancel mid-write is re-raised only after the thread finished."""
+    import threading
+
+    from telegram_bot.core.project_chat_process import _await_offloaded_write
+
+    entered = threading.Event()
+    release = threading.Event()
+    finished: list[bool] = []
+
+    def blocking_write() -> None:
+        entered.set()
+        release.wait(timeout=5)
+        finished.append(True)
+
+    task = asyncio.create_task(_await_offloaded_write(blocking_write))
+    await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0.02)
+    assert not task.done()  # cancellation is deferred until the write lands
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished == [True]
+
+
 def test_mark_delivery_failed_stamps_reason_and_ignores_unknown_wait(
     tmp_path: Path,
 ) -> None:

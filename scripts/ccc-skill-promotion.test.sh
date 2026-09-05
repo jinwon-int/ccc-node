@@ -240,6 +240,57 @@ ok "central collector publishes a matching remote-node envelope" \
 ok "remote candidate is acknowledged only after PR publication" \
   'grep -q " ack $remote_transport" "$REMOTE_SSH_STATE/calls"'
 
+# ─── #1477: collect / drop-report --ack share promotion.lock with run ─────────
+# A second collect while another holds the lock must report status=locked and
+# touch nothing (no PR, no ack, no ledger row); collect --dry-run is read-only
+# and deliberately ignores the lock so a manual preview never starves behind
+# the nightly collect waiting on CI.
+write_skill lock-check ""
+write_status lock-check
+env "${stage_env[@]}" python3 "$PROMOTER" run >/dev/null
+lock_transport="$(env "${stage_env[@]}" python3 "$PROMOTER" export --limit 1 | jq -r '.envelopes[0].transport_id')"
+LOCK_HOLDER="$TMP/lock-holder.py"
+cat > "$LOCK_HOLDER" <<'PY'
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+time.sleep(float(sys.argv[3]))
+PY
+LOCK_READY="$TMP/lock-ready"
+rm -f "$LOCK_READY"
+python3 "$LOCK_HOLDER" "$STATE/skill-promotion/promotion.lock" "$LOCK_READY" 30 &
+lock_holder_pid=$!
+for _ in $(seq 1 100); do [ -e "$LOCK_READY" ] && break; sleep 0.05; done
+LOCK_GH_STATE="$TMP/lock-gh-state"
+lock_env=("${publish_env[@]}" "GH_TEST_STATE=$LOCK_GH_STATE")
+ledger_lines_locked="$(grep -c . "$STATE/skill-promotion/ledger.jsonl")"
+out="$(env "${lock_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "#1477: collect under a held promotion.lock reports locked (same shape as run)" \
+  '[ "$rc" = 0 ] && jq -e ".ok and .mode == \"collect\" and .status == \"locked\" and .publisher_enabled and .published == [] and .errors == []" >/dev/null <<<"$out"'
+ok "#1477: locked collect makes no GitHub call, no ack, no ledger row" \
+  '[ ! -e "$LOCK_GH_STATE/calls" ] && [ -f "$STATE/skill-promotion/outbox/$lock_transport.json" ] && [ ! -e "$STATE/skill-promotion/sent/$lock_transport.json" ] && [ "$(grep -c . "$STATE/skill-promotion/ledger.jsonl")" = "$ledger_lines_locked" ]'
+out="$(env "${stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
+ok "#1477: run under a held promotion.lock still reports locked" \
+  '[ "$rc" = 0 ] && jq -e ".ok and .mode == \"run\" and .status == \"locked\" and .staged == []" >/dev/null <<<"$out"'
+out="$(env "${lock_env[@]}" python3 "$PROMOTER" collect --dry-run)"; rc=$?
+ok "#1477: collect --dry-run is read-only and skips the lock" \
+  '[ "$rc" = 0 ] && jq -e ".mode == \"collect-dry-run\" and (.status // \"\") != \"locked\" and .published[0].outcome == \"would-open-private-intake-pr\" and .published[0].name == \"lock-check\"" >/dev/null <<<"$out"'
+ok "#1477: dry-run collect under the lock mutates nothing" \
+  '[ -f "$STATE/skill-promotion/outbox/$lock_transport.json" ] && [ "$(grep -c . "$STATE/skill-promotion/ledger.jsonl")" = "$ledger_lines_locked" ] && ! grep -q "pr create" "$LOCK_GH_STATE/calls"'
+out="$(env "${stage_env[@]}" python3 "$PROMOTER" drop-report --ack lock-task-x)"; rc=$?
+ok "#1477: drop-report --ack under a held lock records nothing and says so" \
+  '[ "$rc" = 0 ] && jq -e ".ok and .status == \"locked\" and .ack[0].task_id == \"lock-task-x\" and .ack[0].outcome == \"locked\" and .sweep_recorded == false" >/dev/null <<<"$out" && [ ! -e "$STATE/skill-promotion/drop-report.acked.jsonl" ]'
+out="$(env "${stage_env[@]}" python3 "$PROMOTER" drop-report)"; rc=$?
+ok "#1477: plain drop-report sweep stays viewable under a held lock" \
+  '[ "$rc" = 0 ] && jq -e ".ok and (.status // \"\") != \"locked\" and .mode == \"drop-report\"" >/dev/null <<<"$out"'
+kill "$lock_holder_pid" 2>/dev/null; wait "$lock_holder_pid" 2>/dev/null
+out="$(env "${lock_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "#1477: collect proceeds once the lock is released" \
+  '[ "$rc" = 0 ] && jq -e "(.status // \"\") != \"locked\" and .published[0].outcome == \"pr-opened\" and .published[0].name == \"lock-check\"" >/dev/null <<<"$out" && [ -f "$STATE/skill-promotion/sent/$lock_transport.json" ]'
+ok "#1477: promotion.lock stays owner-only" \
+  '[ "$(stat -c %a "$STATE/skill-promotion/promotion.lock")" = 600 ]'
+
 # Fresh scans continue to fail closed before any envelope is staged.
 write_skill leaky-skill '4. token=abcdefghijklmnop1234567890'
 write_status leaky-skill
@@ -967,6 +1018,24 @@ rm -f "$DROP_DIR/drop-report.acked.jsonl"
 out="$(env "${drop_env[@]}" python3 "$PROMOTER" drop-report --ack '../escape')"; rc=$?
 ok "drop-report rejects unsafe ack ids" \
   '[ "$rc" = 2 ] && jq -e ".code == \"drop_ack_invalid\"" >/dev/null <<<"$out"'
+
+# #1477: ledger.jsonl is read whole; an oversized ledger (> 8 MiB) fails closed
+# with ledger_too_large on every reader instead of stalling the run.
+cp "$DROP_LEDGER" "$TMP/drop-ledger.bak"
+truncate -s $((8 * 1024 * 1024 + 1)) "$DROP_LEDGER"
+out="$(env "${drop_env[@]}" python3 "$PROMOTER" drop-report)"; rc=$?
+ok "#1477: drop-report fails closed on an oversized ledger" \
+  '[ "$rc" = 2 ] && jq -e ".ok == false and .code == \"ledger_too_large\"" >/dev/null <<<"$out"'
+out="$(env "${drop_env[@]}" CCC_SKILL_PROMOTION_PUBLISHER=true CCC_SKILL_PROMOTION_REMOTE="$REMOTE" \
+  CCC_SKILL_PROMOTION_REVISE=true GH_TEST_STATE="$TMP/oversize-gh-state" GH_TEST_PRIVATE=true \
+  GH_TEST_REMOTE="$REMOTE" PATH="$BIN:$PATH" python3 "$PROMOTER" collect)"; rc=$?
+ok "#1477: collect fails closed on an oversized ledger before polling verdicts" \
+  '[ "$rc" = 2 ] && jq -e ".ok == false and .code == \"ledger_too_large\"" >/dev/null <<<"$out"'
+truncate -s $((8 * 1024 * 1024)) "$DROP_LEDGER"
+out="$(env "${drop_env[@]}" python3 "$PROMOTER" drop-report)"; rc=$?
+ok "#1477: a ledger exactly at the cap is still readable" \
+  '[ "$rc" = 0 ] && jq -e ".ok and .mode == \"drop-report\"" >/dev/null <<<"$out"'
+cp "$TMP/drop-ledger.bak" "$DROP_LEDGER"
 
 # ─── negative-verdict binding (a2a-nexus#2016) ───────────────────────────────
 # Failed review tasks carry the negative verdict as negativeVerdictEvidence;

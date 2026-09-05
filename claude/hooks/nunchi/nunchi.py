@@ -40,6 +40,25 @@ Write gate (#890 — graph-engineering review):
       rejected before storage so the review queue is not an ingestion sink for
       a known-invalid extraction.
 
+Storage / concurrency (#1478):
+  - Every connection carries a busy timeout (NUNCHI_SQLITE_TIMEOUT, default
+    10 s) and the DB runs in WAL journal mode so `snapshot`/`assemble` reads
+    never wait on an in-flight `ingest` write. WAL on Termux/FUSE-backed
+    storage is unverified (shared-memory index): NUNCHI_SQLITE_JOURNAL=delete
+    opts a node out (and reverts a WAL DB to rollback journal on the next
+    uncontended open); a failing PRAGMA is ignored and the DB keeps whatever
+    journal mode it already had.
+  - `ingest` commits once per item: items are independent facts with a
+    dedup UNIQUE key, so a partial run is re-runnable, while the write lock
+    is held per item instead of across the whole payload.
+  - `snapshot`/`assemble` treat the observation-TTL sweep as opportunistic:
+    if the write lock is busy (NUNCHI_SQLITE_SWEEP_TIMEOUT_MS, default 1000)
+    they log one stderr line and continue read-only, so SessionStart
+    injection never fails because ingest holds the lock.
+  - snapshot.md and backend-health.json are replaced atomically (same-dir
+    temp file + os.replace, UTF-8); the health read-modify-write is
+    serialized by an flock on a `.lock` sidecar.
+
 Usage:
   nunchi.py init
   nunchi.py ingest <distill.json | ->     # mirror distill honcho[] items
@@ -55,6 +74,7 @@ Usage:
   nunchi.py backend-status                   # synthesis backend health (#1263)
   nunchi.py stats
 """
+import fcntl
 import glob
 import hashlib
 import json
@@ -63,6 +83,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 DB = os.environ.get("NUNCHI_DB", os.path.expanduser("~/.nunchi/facts.db"))
@@ -117,6 +138,7 @@ CREATE TABLE IF NOT EXISTS peer_facts (
   mutability TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_peer ON peer_facts(observer, observed, valid_to);
+CREATE INDEX IF NOT EXISTS idx_observed ON peer_facts(observed, valid_to);
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
   fact, observed, content='peer_facts', content_rowid='id');
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON peer_facts BEGIN
@@ -175,13 +197,73 @@ def _migrate_gate_cols(c):
     c.commit()
 
 
+def _float_env(name, default):
+    """Malformed env must not turn every nunchi command into an import-time
+    traceback (this runs before argument parsing, so even `snapshot` died)."""
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# #1478 — busy handling. sqlite3.connect(timeout=) and PRAGMA busy_timeout set
+# the same handler; the PRAGMA is issued too so the value is visible in the
+# connection itself (and re-settable per operation, see the sweep helper).
+_SQLITE_TIMEOUT_S = _float_env("NUNCHI_SQLITE_TIMEOUT", "10")
+_SQLITE_SWEEP_TIMEOUT_MS = _float_env("NUNCHI_SQLITE_SWEEP_TIMEOUT_MS", "1000")
+
+
+def _apply_journal_mode(c):
+    """#1478 — WAL by default; NUNCHI_SQLITE_JOURNAL=delete opts a node out.
+
+    Any other value leaves the DB's current mode untouched. The PRAGMA needs
+    an uncontended DB to switch modes and may fail on storage without shared
+    memory (Termux/FUSE is unverified), so failure is silent: the DB simply
+    keeps whatever journal mode it already has and everything still works.
+    """
+    mode = os.environ.get("NUNCHI_SQLITE_JOURNAL", "wal").strip().lower()
+    if mode not in ("wal", "delete"):
+        return
+    try:
+        c.execute(f"PRAGMA journal_mode={mode}").fetchone()
+    except sqlite3.Error:
+        pass
+
+
 def db():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
-    c = sqlite3.connect(DB)
+    c = sqlite3.connect(DB, timeout=_SQLITE_TIMEOUT_S)
+    c.execute(f"PRAGMA busy_timeout={int(_SQLITE_TIMEOUT_S * 1000)}")
+    _apply_journal_mode(c)
     c.executescript(SCHEMA)
     _migrate_fts(c)
     _migrate_gate_cols(c)
     return c
+
+
+def _atomic_write_text(path, text):
+    """#1478 — replace `path` atomically: same-dir temp file, fsync, os.replace.
+
+    A reader (SessionStart's `head -c`/assemble, backend_status) can never see
+    a truncated file. Local on purpose: the hooks dir is deployed standalone,
+    so scripts/ccc_secure_fs.py is not importable from here without sys.path
+    games. The temp file is unlinked on any failure.
+    """
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _node_name():
@@ -275,15 +357,6 @@ def _mutability(kind):
 # #1010 proposal 2 — volatile `observation` class: searchable via recall but
 # never injected into the snapshot, never G3-flagged, and auto-closed once
 # older than NUNCHI_OBSERVATION_TTL_DAYS (default 7; <=0 disables the sweep).
-def _float_env(name, default):
-    """Malformed env must not turn every nunchi command into an import-time
-    traceback (this runs before argument parsing, so even `snapshot` died)."""
-    try:
-        return float(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        return float(default)
-
-
 _OBSERVATION_TTL_DAYS = _float_env("NUNCHI_OBSERVATION_TTL_DAYS", "7")
 
 
@@ -300,7 +373,93 @@ def _close_expired_observations(c):
     return cur.rowcount
 
 
-def _auto_supersede(c, observed, correction_text, sid):
+def _sweep_expired_observations(c):
+    """#1478 — the snapshot/assemble variant of the TTL sweep: opportunistic.
+
+    The sweep is housekeeping that cron's `snapshot` retries every tick, while
+    SessionStart's `assemble` and the nohup'd `snapshot` must never fail (or
+    stall for the full busy timeout) because an `ingest` holds the write lock.
+    Waits at most NUNCHI_SQLITE_SWEEP_TIMEOUT_MS, then logs one stderr line
+    and leaves the connection read-only for the rest of the run. Returns True
+    when the sweep committed.
+    """
+    try:
+        c.execute(f"PRAGMA busy_timeout={int(_SQLITE_SWEEP_TIMEOUT_MS)}")
+        _close_expired_observations(c)
+        c.commit()
+        return True
+    except sqlite3.OperationalError as exc:
+        c.rollback()
+        print(f"nunchi: observation sweep skipped ({exc}); continuing read-only",
+              file=sys.stderr)
+        return False
+    finally:
+        c.execute(f"PRAGMA busy_timeout={int(_SQLITE_TIMEOUT_S * 1000)}")
+
+
+# #1478 — index-friendly form of `observed LIKE 'session:%'`. LIKE is
+# case-insensitive by default, so SQLite refuses to drive it through a
+# BINARY-collated index; the half-open range (';' is the code point after
+# ':') is the same set of strings and lets idx_observed serve both OR arms.
+_SESSION_RANGE_SQL = "(observed >= 'session:' AND observed < 'session;')"
+
+
+def _scope_where(observed):
+    """SQL predicate + params for the G1/G3 candidate scope of `observed`."""
+    if str(observed).startswith("session:"):
+        return f"(observed=? OR {_SESSION_RANGE_SQL})", (observed,)
+    return "observed=?", (observed,)
+
+
+class _OpenPool:
+    """#1478 — open-fact candidate pool for one ingest run.
+
+    Before, every ingested item re-queried and re-tokenised its whole G1/G3
+    scope (O(items x open facts) tokenisation). The pool loads each scope
+    once (id order, exactly the order the old full-table scans produced, so
+    first-max tie-breaks are unchanged), tokenises once, and is updated as
+    facts are closed or inserted — every item still sees precisely the DB
+    state the per-item queries used to see.
+
+    Scope key: `session:*` for session peers (G1/G3 cross-match all session
+    ids), the observed value itself otherwise. Rows: id -> (observed, kind,
+    fact, source_rank, tokens).
+    """
+
+    def __init__(self, c):
+        self.c = c
+        self.scopes = {}
+
+    @staticmethod
+    def _key(observed):
+        return "session:*" if str(observed).startswith("session:") else observed
+
+    def rows(self, observed):
+        key = self._key(observed)
+        if key not in self.scopes:
+            where, params = _scope_where(observed)
+            self.scopes[key] = {
+                fid: (o, k, f, r, _tokens(f)) for fid, o, k, f, r in self.c.execute(
+                    "SELECT id, observed, kind, fact, source_rank FROM peer_facts"
+                    f" WHERE {where} AND valid_to IS NULL ORDER BY id", params)}
+        return self.scopes[key]
+
+    def close(self, fid):
+        for scope in self.scopes.values():
+            scope.pop(fid, None)
+
+    def add(self, fid, observed, kind, fact, rank):
+        scope = self.scopes.get(self._key(observed))
+        if scope is not None:
+            scope[fid] = (observed, kind, fact, rank, _tokens(fact))
+
+
+def _close_fact(c, pool, fid):
+    c.execute("UPDATE peer_facts SET valid_to=? WHERE id=?", (now(), fid))
+    pool.close(fid)
+
+
+def _auto_supersede(c, pool, observed, correction_text, sid):
     """B2 — close the open fact this correction most plausibly replaces.
 
     Conservative on purpose: same observed peer only, token-overlap of the
@@ -312,16 +471,15 @@ def _auto_supersede(c, observed, correction_text, sid):
     if not corr:
         return None
     best, best_ratio = None, 0.0
-    rows = c.execute(
-        "SELECT id, fact FROM peer_facts WHERE observed=? AND valid_to IS NULL",
-        (observed,)).fetchall()
-    for fid, fact in rows:
-        inter = len(corr & _tokens(fact))
+    for fid, (o, _k, _f, _r, old) in pool.rows(observed).items():
+        if o != observed:
+            continue
+        inter = len(corr & old)
         ratio = inter / len(corr)
         if ratio > best_ratio:
             best, best_ratio = fid, ratio
     if best is not None and best_ratio >= 0.5:
-        c.execute("UPDATE peer_facts SET valid_to=? WHERE id=?", (now(), best))
+        _close_fact(c, pool, best)
         return best
     return None
 
@@ -394,29 +552,19 @@ def _verify_rank(item, transcript_key):
     return 1, 1
 
 
-def _g1_pool(c, observed):
-    """G1 candidate pool. session:* peers are one actor's in-flight log split
-    by session id — a completion routinely lands in a later session than the
-    fact it closes (measured retro on dungae: same-observed matching found 1
-    of ~20 stale facts). Cross-match all session peers; user/node peers stay
-    strictly scoped."""
-    if str(observed).startswith("session:"):
-        return c.execute(
-            "SELECT id, fact, source_rank FROM peer_facts"
-            " WHERE (observed=? OR observed LIKE 'session:%') AND valid_to IS NULL",
-            (observed,)).fetchall()
-    return c.execute(
-        "SELECT id, fact, source_rank FROM peer_facts"
-        " WHERE observed=? AND valid_to IS NULL", (observed,)).fetchall()
-
-
-def _update_supersede(c, observed, text, new_rank):
+def _update_supersede(c, pool, observed, text, new_rank):
     """G1 — close the in-flight fact this completion most plausibly updates.
 
     Old fact carries a progress marker, the new text a completion marker,
     token overlap >= 0.4, and the newcomer's source rank is not lower than
     the old fact's (G2 guard). One fact at most, reversible exactly like B2
     (clear valid_to; `supersedes` keeps the link).
+
+    Candidate pool: session:* peers are one actor's in-flight log split by
+    session id — a completion routinely lands in a later session than the
+    fact it closes (measured retro on dungae: same-observed matching found 1
+    of ~20 stale facts). Cross-match all session peers; user/node peers stay
+    strictly scoped (see _OpenPool).
     """
     if not _DONE.search(text):
         return None
@@ -424,23 +572,21 @@ def _update_supersede(c, observed, text, new_rank):
     if not new:
         return None
     best, best_ratio = None, 0.0
-    rows = _g1_pool(c, observed)
-    for fid, fact, old_rank in rows:
+    for fid, (_o, _k, fact, old_rank, old) in pool.rows(observed).items():
         if not _PROGRESS.search(fact) or (old_rank or 1) > new_rank:
             continue
-        old = _tokens(fact)
         if not old:
             continue
         ratio = len(new & old) / min(len(new), len(old))
         if ratio > best_ratio:
             best, best_ratio = fid, ratio
     if best is not None and best_ratio >= 0.4:
-        c.execute("UPDATE peer_facts SET valid_to=? WHERE id=?", (now(), best))
+        _close_fact(c, pool, best)
         return best
     return None
 
 
-def _conflict_review(c, observed, text, kind=None):
+def _conflict_review(pool, observed, text, kind=None):
     """G3 — flag (never resolve) a suspicious high-overlap open sibling.
 
     A newcomer overlapping an open same-peer fact >= 0.6 without matching the
@@ -448,11 +594,11 @@ def _conflict_review(c, observed, text, kind=None):
     stay open and the newcomer is flagged review=1 for the owner queue.
 
     #1255: session:* peers are one distiller's log split across many session
-    ids (same pattern as G1's `_g1_pool`) — a plain `observed=?` match can
+    ids (same pattern as G1's pool scope) — a plain `observed=?` match can
     never see a near-duplicate landed under a *different* session id, so the
     same conclusion re-extracted by several sessions on the same day was
     silently stored N times with no conflict ever flagged. Cross-match all
-    session peers for the same `kind`, exactly like `_g1_pool`; user/node
+    session peers for the same `kind`, exactly like G1 (_OpenPool); user/node
     peers stay strictly scoped (a single observed value already, no fan-out
     to widen). Restricting to same-kind avoids matching a `context` note
     against an unrelated `decision` sentence that happens to share tokens.
@@ -460,17 +606,9 @@ def _conflict_review(c, observed, text, kind=None):
     new = _tokens(text)
     if not new:
         return 0
-    if str(observed).startswith("session:"):
-        where, params = "(observed=? OR observed LIKE 'session:%')", (observed,)
-    else:
-        where, params = "observed=?", (observed,)
-    if kind is not None:
-        where += " AND kind=?"
-        params = params + (kind,)
-    for _fid, fact, _r in c.execute(
-            f"SELECT id, fact, source_rank FROM peer_facts"
-            f" WHERE {where} AND valid_to IS NULL", params).fetchall():
-        old = _tokens(fact)
+    for _o, k, _f, _r, old in pool.rows(observed).values():
+        if kind is not None and k != kind:
+            continue
         if old and len(new & old) / min(len(new), len(old)) >= 0.6:
             return 1
     return 0
@@ -501,23 +639,17 @@ def _transcript_path(payload):
     return hits[0] if len(hits) == 1 else ""
 
 
-def _transcript_text(payload):
-    """Skeleton transcript body for G2 quote checks, '' when unavailable.
+_TRANSCRIPT_TEXT_MAX = 64 * 1024 * 1024
+
+
+def _transcript_skeleton(text):
+    """Skeleton transcript body for G2 quote checks.
 
     Decodes the .jsonl instead of skeletonizing its raw bytes: `_quote_key`
     strips the backslash but leaves the escape letter, so a raw-byte skeleton
     turns `\\n` into a literal `n` and no quote spanning a line break could
     ever match. Parsing first removes that whole class of false demotion.
     """
-    path = _transcript_path(payload)
-    try:
-        if not (path and os.path.exists(path)
-                and os.path.getsize(path) < 64 * 1024 * 1024):
-            return ""
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            lines = fh.read().splitlines()
-    except OSError:
-        return ""
     out = []
 
     def walk(o):
@@ -530,7 +662,7 @@ def _transcript_text(payload):
             for v in o:
                 walk(v)
 
-    for line in lines:
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -541,29 +673,38 @@ def _transcript_text(payload):
     return _quote_key("\n".join(out))
 
 
-_SOURCE_REFS_QUOTE_MAX = 240
-_SOURCE_REFS_ANCHOR_MAX = 4
-_WIKI_ANCHOR_RE = re.compile(r"\b[A-Z]{2,6}-\d+\b")
+def _transcript_load(payload):
+    """One pass over the transcript (#1478): returns (skeleton, provenance ref).
 
-
-def _transcript_ref(payload):
-    """#1264 P1-3 — mechanical transcript provenance, computed once per run.
-
-    {"type":"transcript","ref":<path>,"sha256_8":<first-8-hex>} when the
-    transcript file resolves, else None. The hash pins the exact bytes the
-    fact was extracted from, so backtracking survives transcript rotation.
+    skeleton — `_transcript_skeleton` of the decoded body for G2 quote
+    checks, '' when the file is missing/unreadable or >= 64 MiB (the text is
+    not kept for oversized files, but they are still hashed).
+    ref — #1264 P1-3 {"type":"transcript","ref":<path>,"sha256_8":<first-8-hex>}
+    when the file resolves, else None. The hash pins the exact bytes the
+    facts were extracted from, so backtracking survives transcript rotation.
     """
     path = _transcript_path(payload)
     if not (path and os.path.exists(path)):
-        return None
+        return "", None
     try:
-        h = hashlib.sha256()
+        keep = os.path.getsize(path) < _TRANSCRIPT_TEXT_MAX
+        h, chunks = hashlib.sha256(), []
         with open(path, "rb") as fh:
             for chunk in iter(lambda: fh.read(1 << 20), b""):
                 h.update(chunk)
-        return {"type": "transcript", "ref": path, "sha256_8": h.hexdigest()[:8]}
+                if keep:
+                    chunks.append(chunk)
     except OSError:
-        return None
+        return "", None
+    ref = {"type": "transcript", "ref": path, "sha256_8": h.hexdigest()[:8]}
+    if not keep:
+        return "", ref
+    return _transcript_skeleton(b"".join(chunks).decode("utf-8", "replace")), ref
+
+
+_SOURCE_REFS_QUOTE_MAX = 240
+_SOURCE_REFS_ANCHOR_MAX = 4
+_WIKI_ANCHOR_RE = re.compile(r"\b[A-Z]{2,6}-\d+\b")
 
 
 def _source_refs(sid, item, transcript_ref):
@@ -611,9 +752,9 @@ def ingest(path):
         payload.get("decision_reason_contract") == _DECISION_REASON_CONTRACT
     )
     auto_supersede = os.environ.get("NUNCHI_NO_AUTO_SUPERSEDE") != "1"
-    transcript = _transcript_text(payload)
-    transcript_ref = _transcript_ref(payload)  # #1264 P1-3 — once per run
+    transcript, transcript_ref = _transcript_load(payload)  # once per run (#1264 P1-3)
     c = db()
+    pool = _OpenPool(c)  # #1478 — G1/G3/B2 candidates, tokenised once per scope
     n = 0
     skipped_mutable = 0
     skipped_reasonless_decisions = 0
@@ -656,11 +797,11 @@ def ingest(path):
         superseded = None
         if auto_supersede:
             if kind == "correction":
-                superseded = _auto_supersede(c, observed, text, sid)
+                superseded = _auto_supersede(c, pool, observed, text, sid)
             else:
-                superseded = _update_supersede(c, observed, text, rank)
+                superseded = _update_supersede(c, pool, observed, text, rank)
         if superseded is None and kind not in ("correction", "constraint", "observation"):
-            review = review or _conflict_review(c, observed, text, kind)
+            review = review or _conflict_review(pool, observed, text, kind)
         dedup = hashlib.sha1(f"{OBSERVER}|{it.get('subject')}|{text}".encode()).hexdigest()
         mut = _mutability(kind)
         source_refs = _source_refs(sid, it, transcript_ref)
@@ -668,7 +809,7 @@ def ingest(path):
                     else f"auto:update:{sid}" if superseded is not None
                     else f"distill:{sid}")
         try:
-            c.execute(
+            cur = c.execute(
                 "INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,"
                 "supersedes,dedup,created_at,source_rank,review,because,source_refs,mutability)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -676,9 +817,13 @@ def ingest(path):
                  payload.get("distilled_at") or now(), superseded, dedup, now(),
                  rank, review, because, source_refs, mut))
             n += 1
+            pool.add(cur.lastrowid, observed, kind, text, rank)
         except sqlite3.IntegrityError:
             pass  # duplicate fact already stored
-    c.commit()
+        # #1478 — commit per item. Items are independent facts (dedup UNIQUE
+        # makes a partial run re-runnable; a close+insert pair stays in one
+        # transaction), so the write lock is held per item, not per payload.
+        c.commit()
     print(
         f"ingested {n}/{len(items)} facts (session={sid},"
         f" skipped_mutable_ops={skipped_mutable},"
@@ -955,18 +1100,23 @@ def _record_backend_outcome(primary, winner, attempts):
     `snapshot()` read it to surface a degraded/outage warning instead of the
     silent "it still answered" state #1263 found on nosuk/jingun/bangtong.
     """
-    data = _load_backend_health()
-    data["history"].append({
+    entry = {
         "ts": now(),
         "primary": primary,
         "winner": winner,
         "attempts": attempts,
-    })
-    data["history"] = data["history"][-_BACKEND_HEALTH_WINDOW:]
+    }
     try:
         os.makedirs(os.path.dirname(BACKEND_HEALTH) or ".", exist_ok=True)
-        with open(BACKEND_HEALTH, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False)
+        # #1478 — the read-modify-write is serialized on a sidecar flock so
+        # two concurrent dialectic calls cannot drop each other's entry, and
+        # the file is replaced atomically so a reader never sees partial JSON.
+        with open(BACKEND_HEALTH + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            data = _load_backend_health()
+            data["history"].append(entry)
+            data["history"] = data["history"][-_BACKEND_HEALTH_WINDOW:]
+            _atomic_write_text(BACKEND_HEALTH, json.dumps(data, ensure_ascii=False))
     except OSError:
         pass  # status tracking is best-effort; never block synthesis on it
 
@@ -1361,8 +1511,7 @@ def _snapshot_header(c):
 
 def snapshot(limit):
     c = db()
-    _close_expired_observations(c)
-    c.commit()
+    _sweep_expired_observations(c)  # #1478 — read-only on lock contention
     rows = c.execute(
         "SELECT observed,kind,fact,mutability FROM peer_facts WHERE valid_to IS NULL"
         " AND kind NOT IN ('constraint','observation') ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
@@ -1387,8 +1536,7 @@ def snapshot(limit):
             f"- ⟳ live-check {len(live_rows)}건 — 가변 운영 사실, 단정 전 실측(#1264 P1-4)")
         lines += [f"- ⟳ ({o}/{k}) {f}" for o, k, f, _m in live_rows]
     text = "\n".join(lines)
-    os.makedirs(os.path.dirname(SNAPSHOT), exist_ok=True)
-    open(SNAPSHOT, "w").write(text)
+    _atomic_write_text(SNAPSHOT, text)  # #1478 — SessionStart never reads a torn file
     print(text)
 
 
@@ -1413,8 +1561,7 @@ def assemble(budget, hint, limit=25):
     "랭킹 변경은 fixture 승부 후 반영").
     """
     c = db()
-    _close_expired_observations(c)
-    c.commit()
+    _sweep_expired_observations(c)  # #1478 — read-only on lock contention
     lines = _snapshot_header(c)
     cons = c.execute(
         "SELECT observed,fact FROM peer_facts WHERE valid_to IS NULL"
@@ -1497,7 +1644,7 @@ def review_stale(do_close):
     rows = c.execute(
         "SELECT id, observed, fact, source_rank FROM peer_facts"
         " WHERE valid_to IS NULL ORDER BY id").fetchall()
-    # Mirror _g1_pool: all session:* peers form one retro pool; user/node
+    # Mirror _OpenPool: all session:* peers form one retro pool; user/node
     # peers stay scoped to themselves.
     by_obs = {}
     for r in rows:

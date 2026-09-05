@@ -2,6 +2,8 @@ import asyncio
 import os
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -338,7 +340,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(delattr, project_chat.config, "bot_data_dir")
             self.handler._task_ledger_cache = None
             req = self._make_request()
-            req.task_id = self.handler._ledger_create(1, 2)
+            req.task_id = await self.handler._ledger_create(1, 2)
             await self._start_loop(req)
             await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
             await asyncio.sleep(0)  # let the registration write land
@@ -359,12 +361,12 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
 
             req = self._make_request()
             req.status_callback = failing_status_callback
-            req.task_id = self.handler._ledger_create(1, 2)
+            req.task_id = await self.handler._ledger_create(1, 2)
             self.handler._task_ledger.set_status_message(req.task_id, 999)
             req.heartbeat_message_id = 999
             cleaned = await self.handler._cleanup_heartbeat(req)
             self.assertFalse(cleaned)
-            self.handler._ledger_finish(req, "completed", cleanup_done=cleaned)
+            await self.handler._ledger_finish(req, "completed", cleanup_done=cleaned)
             ops = self.handler._task_ledger.pending_terminal_ops()
             self.assertEqual(len(ops), 1)
             self.assertEqual(ops[0][1]["message_id"], 999)
@@ -375,13 +377,74 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(delattr, project_chat.config, "bot_data_dir")
             self.handler._task_ledger_cache = None
             req = self._make_request()
-            req.task_id = self.handler._ledger_create(1, 2)
+            req.task_id = await self.handler._ledger_create(1, 2)
             self.handler._task_ledger.set_status_message(req.task_id, 555)
             req.heartbeat_message_id = 555
             cleaned = await self.handler._cleanup_heartbeat(req)
             self.assertTrue(cleaned)
-            self.handler._ledger_finish(req, "completed", cleanup_done=cleaned)
+            await self.handler._ledger_finish(req, "completed", cleanup_done=cleaned)
             self.assertEqual(self.handler._task_ledger.records(), [])
+
+    async def test_ledger_verbs_run_off_the_event_loop_thread(self):
+        """#1479: create/phase/finish are fsync-backed and must not block the loop."""
+        with tempfile.TemporaryDirectory() as td:
+            project_chat.config.bot_data_dir = Path(td)
+            self.addCleanup(delattr, project_chat.config, "bot_data_dir")
+            self.handler._task_ledger_cache = None
+            led = self.handler._task_ledger
+            loop_thread = threading.get_ident()
+            off_loop: dict[str, bool] = {}
+            for name in ("create", "set_state", "finish"):
+                original = getattr(led, name)
+
+                def wrapper(*args, _name=name, _orig=original, **kwargs):
+                    off_loop[_name] = threading.get_ident() != loop_thread
+                    return _orig(*args, **kwargs)
+
+                setattr(led, name, wrapper)
+
+            req = self._make_request()
+            req.task_id = await self.handler._ledger_create(1, 2)
+            self.assertIsNotNone(req.task_id)
+            self.assertTrue(req.lifecycle.admit())
+            await self.handler._project_request_phase(req)
+            self.assertEqual(led.records()[0]["state"], "working")
+            req.lifecycle.try_terminal(
+                project_chat.RequestPhase.COMPLETED, cause="normal-completion"
+            )
+            await self.handler._ledger_finish(req, "completed", cleanup_done=True)
+            self.assertEqual(led.records(), [])
+            self.assertEqual(
+                off_loop, {"create": True, "set_state": True, "finish": True}
+            )
+
+    async def test_concurrent_phase_projections_land_in_issue_order(self):
+        """#1479: a slow earlier projection must not overwrite a newer phase."""
+        with tempfile.TemporaryDirectory() as td:
+            project_chat.config.bot_data_dir = Path(td)
+            self.addCleanup(delattr, project_chat.config, "bot_data_dir")
+            self.handler._task_ledger_cache = None
+            led = self.handler._task_ledger
+            original_set_state = led.set_state
+            calls: list[str] = []
+
+            def slow_working_set_state(task_id, state):
+                if state == "working":
+                    time.sleep(0.05)  # outside the ledger lock: only the caller waits
+                calls.append(state)
+                return original_set_state(task_id, state)
+
+            led.set_state = slow_working_set_state
+            req = self._make_request()
+            req.task_id = await self.handler._ledger_create(1, 2)
+            self.assertTrue(req.lifecycle.admit())
+            first = asyncio.create_task(self.handler._project_request_phase(req))
+            await asyncio.sleep(0)  # first snapshots "working" and enters the write
+            self.assertIsNotNone(req.lifecycle.begin_approval())
+            second = asyncio.create_task(self.handler._project_request_phase(req))
+            await asyncio.gather(first, second)
+            self.assertEqual(calls, ["working", "input-required"])
+            self.assertEqual(led.records()[0]["state"], "input-required")
 
     async def test_ledger_projection_failures_do_not_change_lifecycle(self):
         class ExplodingLedger:
@@ -398,7 +461,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(req.lifecycle.admit())
         with self.assertLogs(project_chat.logger, level="WARNING"):
-            self.handler._project_request_phase(req)
+            await self.handler._project_request_phase(req)
         self.assertEqual(req.lifecycle.phase, project_chat.RequestPhase.WORKING)
 
         req.lifecycle.try_terminal(
@@ -406,7 +469,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             cause="normal-completion",
         )
         with self.assertLogs(project_chat.logger, level="WARNING"):
-            self.handler._ledger_finish(req, "completed", cleanup_done=True)
+            await self.handler._ledger_finish(req, "completed", cleanup_done=True)
         self.assertEqual(req.lifecycle.phase, project_chat.RequestPhase.COMPLETED)
 
     async def test_forecast_shrinks_as_task_progresses(self):
