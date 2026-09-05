@@ -40,21 +40,20 @@ EOF
 OUT="$TMP/out"
 summary="$(normalize "$FIX" "$OUT")"
 printf '%s' "$summary" > "$TMP/summary.json"
-proj="$OUT/-home-gongmyoung/01a057f6-9ef1.jsonl"
 
 ok "summary reports session identity and outcome fields" \
   'jq -e ".session_id==\"01a057f6-9ef1\" and .cwd==\"/home/gongmyoung\" and .excluded==false and .truncated==false and .empty==false" "$TMP/summary.json" >/dev/null'
-ok "projection lands in the encoded-cwd tree under the session id" '[ -f "$proj" ]'
+ok "projection lands in the encoded-cwd tree under the session id" '[ -f "$OUT/-home-gongmyoung/01a057f6-9ef1.jsonl" ]'
 ok "bash toolCalls become Claude Bash tool_use rows" \
-  'grep -q "\"type\": \"tool_use\", \"name\": \"Bash\", \"input\": {\"command\": \"df -h / && journalctl -p err -n 20\"}" "$proj"'
+  'grep -q "\"type\": \"tool_use\", \"name\": \"Bash\", \"input\": {\"command\": \"df -h / && journalctl -p err -n 20\"}" "$OUT/-home-gongmyoung/01a057f6-9ef1.jsonl"'
 ok "every bash command is projected (multiple per message)" \
-  'grep -q "du -sh /var/log" "$proj"'
+  'grep -q "du -sh /var/log" "$OUT/-home-gongmyoung/01a057f6-9ef1.jsonl"'
 ok "user and assistant text turns are projected" \
-  'grep -q "디스크 상태 점검해줘" "$proj" && grep -q "로그가 큽니다" "$proj"'
-ok "thinking noise is discarded" '! grep -q "df부터 본다" "$proj"'
-ok "toolResult messages are discarded" '! grep -q "Filesystem columns" "$proj"'
-ok "non-command toolCalls are discarded" '! grep -q "os-release" "$proj"'
-ok "bookkeeping records are discarded" '! grep -q "model_change" "$proj"'
+  'grep -q "디스크 상태 점검해줘" "$OUT/-home-gongmyoung/01a057f6-9ef1.jsonl" && grep -q "로그가 큽니다" "$OUT/-home-gongmyoung/01a057f6-9ef1.jsonl"'
+ok "thinking noise is discarded" '! grep -q "df부터 본다" "$OUT/-home-gongmyoung/01a057f6-9ef1.jsonl"'
+ok "toolResult messages are discarded" '! grep -q "Filesystem columns" "$OUT/-home-gongmyoung/01a057f6-9ef1.jsonl"'
+ok "non-command toolCalls are discarded" '! grep -q "os-release" "$OUT/-home-gongmyoung/01a057f6-9ef1.jsonl"'
+ok "bookkeeping records are discarded" '! grep -q "model_change" "$OUT/-home-gongmyoung/01a057f6-9ef1.jsonl"'
 ok "malformed lines are skipped" 'jq -e ".records_in == 10" "$TMP/summary.json" >/dev/null'
 
 # Empty projection: a session with only bookkeeping/noise records.
