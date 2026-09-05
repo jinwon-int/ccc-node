@@ -90,57 +90,120 @@ probe_clean="$(
 )"
 ok "no harness vars set: suite still runs" '[[ "$probe_clean" == *"CCC=[unset]"* ]]'
 
-# --- test-suite registration guard -----------------------------------------
-# A *.test.sh that exists but is not in HARNESS_SUITES never runs, so the tree
-# looks covered while its assertions are dead. Seven suites had drifted into
-# that state; these pin both the list and the guard that protects it.
-SUITES_SRC="$(sed -n '/^HARNESS_SUITES=(/,/)$/p' "$VALIDATE")"
-GUARD_SRC="$(sed -n '/^# Registration guard/,/^fi$/p' "$VALIDATE")"
-# Fail loudly if either extraction breaks, instead of silently passing on empty.
-ok "HARNESS_SUITES array is present in validate-harness.sh" \
-  '[ -n "$SUITES_SRC" ] && grep -q "observability.test.sh" <<<"$SUITES_SRC"'
-ok "registration guard is present in validate-harness.sh" \
-  '[ -n "$GUARD_SRC" ] && grep -q "unregistered test suite" <<<"$GUARD_SRC"'
+# --- #1484: the plan is DISCOVERED, not hand-listed --------------------------
+# HARNESS_SUITES / UMASK_SUITES / PY_COMPILE_FILES / SC_SCOPE used to be
+# explicit arrays (almost every commit to the script in the 30 days before
+# #1484 was list maintenance) with a registration guard proving the suite
+# list was redundant with `git ls-files`. discover_plan now derives all four from the index plus
+# small guarded manifests. Run the real extracted block inside a fixture repo
+# with fixture manifests and pin every rule and guard.
+DISCOVERY_SRC="$(sed -n '/^# --- discovery (#1484)/,/^# --- end discovery/p' "$VALIDATE")"
+ok "discovery block is present in validate-harness.sh" \
+  '[ -n "$DISCOVERY_SRC" ] && grep -q "^discover_plan() {" <<<"$DISCOVERY_SRC"'
 
-# Every tracked suite must be registered. This is the property the guard
-# enforces, asserted here directly so it fails in milliseconds rather than
-# only at the end of a full harness run.
-# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
-missing_suites="$(
-  eval "$SUITES_SRC"
-  cd "$ROOT" || exit 1
-  git ls-files '*.test.sh' | while IFS= read -r s; do
-    case " ${HARNESS_SUITES[*]} " in *" $s "*) ;; *) echo "$s" ;; esac
-  done
-)"
-ok "every tracked *.test.sh is registered in HARNESS_SUITES" '[ -z "$missing_suites" ]'
+DFIX="$HOSTILE/discovery-fixture"
+mkdir -p "$DFIX/a" "$DFIX/b" "$DFIX/c" "$DFIX/bridge" "$DFIX/vendor" "$DFIX/extra"
+printf '#!/usr/bin/env bash\n# harness: umask-rerun\n# more header\nset -u\n' > "$DFIX/a/one.test.sh"
+# Marker AFTER the first non-comment line: not a header declaration, must not count.
+printf '#!/usr/bin/env bash\nset -u\n# harness: umask-rerun\n' > "$DFIX/a/two.test.sh"
+printf '#!/usr/bin/env bash\n' > "$DFIX/b/skip.test.sh"
+printf 'echo no shebang here\n' > "$DFIX/c/noshebang.test.sh"
+printf 'x = 1\n' > "$DFIX/x.py"
+printf 'y = 1\n' > "$DFIX/bridge/y.py"
+printf 'z = 1\n' > "$DFIX/vendor/z.py"
+for f in "$DFIX/s1.sh" "$DFIX/s2.sh" "$DFIX/extra/hook"; do printf '#!/bin/sh\n' > "$f"; done
+git -C "$DFIX" init -q 2>/dev/null
+git -C "$DFIX" add -A 2>/dev/null
+# An untracked suite must stay invisible: discovery reads the index, not the tree.
+printf '#!/usr/bin/env bash\n' > "$DFIX/c/untracked.test.sh"
 
-# The guard itself must actually fire. Run the real extracted block against a
-# stubbed git that reports one suite the list does not contain.
+disco_probe() { # <manifest assignments> -> ERR/RC/array dump of one discover_plan run
+  (
+    cd "$DFIX" || exit 1
+    err() { echo "ERR: $*"; }
+    say() { echo "SAY: $*"; }
+    fail=0
+    eval "$1"
+    eval "$DISCOVERY_SRC"
+    discover_plan; echo "RC=$?"
+    printf 'SUITE=%s\n' ${HARNESS_SUITES[@]+"${HARNESS_SUITES[@]}"}
+    printf 'UMASK=%s\n' ${UMASK_SUITES[@]+"${UMASK_SUITES[@]}"}
+    printf 'PY=%s\n' ${PY_COMPILE_FILES[@]+"${PY_COMPILE_FILES[@]}"}
+    printf 'SC=%s\n' ${SC_SCOPE[@]+"${SC_SCOPE[@]}"}
+    echo "EXCLUDED=$HARNESS_EXCLUDED_N"
+  )
+}
+FIX_MANIFEST='HARNESS_EXCLUDE=(b/skip.test.sh); UMASK_MARKER="# harness: umask-rerun";
+  PY_COMPILE_EXCLUDE=(bridge/ vendor/); SC_SCOPE_EXTRA=(extra/hook); SC_WARN_BASELINE=(s2.sh)'
 # shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
-guard_out="$(
-  eval "$SUITES_SRC"
+disco_out="$(disco_probe "$FIX_MANIFEST")"
+ok "suites = every tracked *.test.sh in index order minus HARNESS_EXCLUDE (untracked stays invisible)" \
+  '[ "$(grep "^SUITE=" <<<"$disco_out" | tr "\n" " ")" = "SUITE=a/one.test.sh SUITE=a/two.test.sh SUITE=c/noshebang.test.sh " ]'
+ok "excluded suite is counted, not run" 'grep -Fxq "EXCLUDED=1" <<<"$disco_out"'
+ok "a suite without a shebang is a discovery finding" \
+  'grep -Fxq "ERR: test suite has no shebang line: c/noshebang.test.sh" <<<"$disco_out" && grep -Fxq "RC=1" <<<"$disco_out"'
+ok "umask set = suites with the marker in the leading comment block only" \
+  '[ "$(grep "^UMASK=" <<<"$disco_out" | tr "\n" " ")" = "UMASK=a/one.test.sh " ]'
+ok "py_compile = tracked *.py minus PY_COMPILE_EXCLUDE prefixes" \
+  '[ "$(grep "^PY=" <<<"$disco_out" | tr "\n" " ")" = "PY=x.py " ]'
+# *.test.sh files are *.sh too, so suites are linted as well (as on main).
+ok "shellcheck scope = tracked *.sh + SC_SCOPE_EXTRA - SC_WARN_BASELINE" \
+  '[ "$(grep "^SC=" <<<"$disco_out" | tr "\n" " ")" = "SC=a/one.test.sh SC=a/two.test.sh SC=b/skip.test.sh SC=c/noshebang.test.sh SC=extra/hook SC=s1.sh " ]'
+ok "no stale-manifest finding when every manifest entry is tracked" \
+  '! grep -q "^ERR: stale" <<<"$disco_out"'
+
+# Stale manifest entries (file gone / never tracked) must fail, not rot.
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+stale_out="$(disco_probe 'HARNESS_EXCLUDE=(b/gone.test.sh); UMASK_MARKER="# harness: umask-rerun";
+  PY_COMPILE_EXCLUDE=(bridge/); SC_SCOPE_EXTRA=(extra/nope); SC_WARN_BASELINE=(s2.sh missing.sh)')"
+ok "stale HARNESS_EXCLUDE entry is a finding" \
+  'grep -Fxq "ERR: stale HARNESS_EXCLUDE entry (not tracked): b/gone.test.sh" <<<"$stale_out"'
+ok "stale SC_SCOPE_EXTRA entry is a finding" \
+  'grep -Fxq "ERR: stale SC_SCOPE_EXTRA entry (not tracked): extra/nope" <<<"$stale_out"'
+ok "stale SC_WARN_BASELINE entry is a finding; tracked entries are not" \
+  'grep -Fxq "ERR: stale SC_WARN_BASELINE entry (not tracked): missing.sh" <<<"$stale_out" && ! grep -Fq "not tracked): s2.sh" <<<"$stale_out"'
+
+# The umask-0002 contract (#770) must never silently lose all coverage.
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+nomarker_out="$(disco_probe 'HARNESS_EXCLUDE=(); UMASK_MARKER="# harness: never-declared";
+  PY_COMPILE_EXCLUDE=(bridge/); SC_SCOPE_EXTRA=(); SC_WARN_BASELINE=(s2.sh)')"
+ok "an empty umask-rerun set is a finding" \
+  'grep -q "^ERR: no suite declares .# harness: never-declared." <<<"$nomarker_out"'
+
+# Without git there is no index to discover from: fail closed (empty plan +
+# finding), never a silently green run with zero suites.
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+nogit_out="$(
+  cd "$DFIX" || exit 1
   err() { echo "ERR: $*"; }
   say() { echo "SAY: $*"; }
-  git() {
-    case "$1" in
-      rev-parse) return 0 ;;
-      ls-files) printf '%s\n' "${HARNESS_SUITES[0]}" "scripts/never-registered.test.sh" ;;
-      *) return 1 ;;
-    esac
-  }
-  eval "$GUARD_SRC"
+  git() { return 1; }
+  eval "$FIX_MANIFEST"
+  eval "$DISCOVERY_SRC"
+  discover_plan; echo "RC=$?"
+  echo "N=${#HARNESS_SUITES[@]}"
 )"
-ok "guard flags an unregistered suite" \
-  '[ -n "$guard_out" ] && grep -q "ERR: unregistered test suite (never runs): scripts/never-registered.test.sh" <<<"$guard_out"'
-ok "guard stays quiet when every suite is registered" \
-  '! grep -q "ERR:" <<<"$(
-     eval "$SUITES_SRC"
-     err() { echo "ERR: $*"; }
-     say() { echo "SAY: $*"; }
-     git() { case "$1" in rev-parse) return 0 ;; ls-files) printf "%s\n" "${HARNESS_SUITES[0]}" ;; *) return 1 ;; esac; }
-     eval "$GUARD_SRC"
-   )"'
+ok "git unavailable: discovery fails closed with an empty plan" \
+  'grep -q "^ERR: git is required" <<<"$nogit_out" && grep -Fxq "RC=1" <<<"$nogit_out" && grep -Fxq "N=0" <<<"$nogit_out"'
+
+# Real repo: the discovered plan must equal the tracked set (HARNESS_EXCLUDE is
+# empty today), carry no finding, and every umask-rerun suite must really
+# declare the marker in its header. Asserted via the --dump-plan seam so it
+# fails in milliseconds rather than only at the end of a full harness run.
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+plan_out="$(cd "$ROOT" && bash "$VALIDATE" --dump-plan; echo "RC=$?")"
+ok "--dump-plan on the real repo exits 0 with no FAIL line" \
+  'grep -Fxq "RC=0" <<<"$plan_out" && ! grep -q "^FAIL:" <<<"$plan_out"'
+ok "real repo: discovered suites == git ls-files *.test.sh" \
+  'diff <(awk -F"\t" "\$1==\"suite\"{print \$2}" <<<"$plan_out") <(cd "$ROOT" && git ls-files "*.test.sh") >/dev/null'
+ok "real repo: every umask-rerun suite carries the marker on a header line" \
+  '[ "$(grep -c "^umask-rerun" <<<"$plan_out")" -gt 0 ] && ! awk -F"\t" "\$1==\"umask-rerun\"{print \$2}" <<<"$plan_out" | while IFS= read -r s; do grep -Fxq "# harness: umask-rerun" "$ROOT/$s" || echo "$s"; done | grep -q .'
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+TAB=$'\t'
+ok "real repo: py_compile scope excludes bridge/ and is non-empty" \
+  '[ "$(grep -c "^py_compile" <<<"$plan_out")" -gt 0 ] && ! grep -q "^py_compile${TAB}bridge/" <<<"$plan_out"'
+ok "real repo: warning-level shellcheck scope includes the suffix-less git hook" \
+  'grep -Fxq "shellcheck-warning${TAB}scripts/git-hooks/managed-checkout-guard" <<<"$plan_out"'
 
 # --- suite summary-line contract ------------------------------------------
 # The harness echoes each suite's own `PASS=<n> FAIL=<n>` tally. A suite that

@@ -920,9 +920,10 @@ class TelegramBot(
                 chat.id,
                 asyncio.get_running_loop().time(),
             )
-            threshold = float(
-                getattr(self._config, "busy_notice_min_elapsed_seconds", 10.0)
-            )
+            # Validated Settings always carries this Field (default 10.0 in
+            # utils/config.py); no literal fallback so the Field stays the
+            # single source of truth (#1484).
+            threshold = float(self._config.busy_notice_min_elapsed_seconds)
             if busy_seconds is not None and busy_seconds >= threshold:
                 reply = busy_notice_text(busy_seconds)
                 try:

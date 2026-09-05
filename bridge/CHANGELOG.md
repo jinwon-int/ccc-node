@@ -189,6 +189,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Bot mixins share one set of structural ports; MRO-shadowed queue methods
+  are gone; the remaining `bot_commands` transcript scans leave the event loop
+  (#1484, precursor to #896).** `core/bot_ports.py` is now the single home for
+  the `Protocol`s describing the objects `TelegramBot.__init__` injects
+  (`BotConfigPort` for the validated `Settings`, `SessionManagerPort`,
+  `ProjectChatPort`, `ClockPort`) plus the bound-method ports two mixins used
+  to duplicate (`ReplySmartFn`, `ProcessUserMessageTextFn`,
+  `EnqueueUserTaskFn`, `ClearUserQueueFn`). The seven per-mixin copies had
+  drifted (`get_session(key: Any)` vs `get_session(user_id: int)`,
+  `bot_data_dir -> Path` vs `Path | None`, and two stubs for
+  `get_pending_question` / `clear_pending_question` that no `SessionManager`
+  implements); every member is now declared once with the signature of its
+  concrete implementation. `BotCommandMixin._enqueue_user_task` and
+  `_clear_user_queue`, which `TelegramBot`'s MRO always resolved to
+  `BotFollowupQueueMixin` instead, are removed rather than kept as dead code.
+  `/resume`'s `list_sessions` and `/history`'s `get_recent_messages` scans are
+  awaited via `asyncio.to_thread`, completing the #1479 offload. Config
+  defaults re-declared next to `getattr` fallbacks are aligned with their
+  `Settings` `Field`: the busy-notice threshold reads
+  `busy_notice_min_elapsed_seconds` directly (no literal), and the streaming
+  bubble-size fallback (test stubs only) is 1200 like the documented default
+  instead of a private 4000.
 - **Usage-meter writes, no-op session updates, and the last-assistant
   transcript read leave the event loop (#1479).** `UsageMeter.record()`
   (flock + full reload + atomic rewrite) ran synchronously on the loop from

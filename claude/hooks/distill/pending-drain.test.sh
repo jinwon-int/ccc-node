@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# harness: umask-rerun
 # Durable distill enqueue/recovery tests. Provider and network are stubbed.
 set -uo pipefail
 # The secure pending journal requires private fixture ancestors regardless of

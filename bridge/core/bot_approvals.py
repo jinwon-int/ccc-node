@@ -6,15 +6,16 @@ import asyncio
 from datetime import datetime, timezone
 import logging
 import secrets
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
 
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
+from telegram_bot.core.bot_ports import BotConfigPort, ProjectChatPort
 from telegram_bot.core.approval_audit import (
     ApprovalAuditDecision,
     ApprovalAuditLedger,
@@ -86,26 +87,11 @@ class _PendingCodexApproval:
     terminal_audit_recorded: bool = False
 
 
-class _ApprovalConfig(Protocol):
-    @property
-    def allowed_user_ids(self) -> Sequence[int]: ...
-
-
-class _ApprovalProjectChat(Protocol):
-    def invalidate_agent_approvals(
-        self, user_id: int, chat_id: int | None = None
-    ) -> None: ...
-
-    def is_agent_approval_active(
-        self, user_id: int, chat_id: int, generation: int
-    ) -> bool: ...
-
-
 class BotApprovalMixin:
     """Manage bounded, one-shot approval tokens without exposing request data."""
 
-    _config: _ApprovalConfig
-    _project_chat: _ApprovalProjectChat
+    _config: BotConfigPort
+    _project_chat: ProjectChatPort
     _pending_codex_approvals: dict[str, _PendingCodexApproval]
     _active_codex_approval_fingerprints: dict[
         tuple[int, int, int, str], tuple[str, str]

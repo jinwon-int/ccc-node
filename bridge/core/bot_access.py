@@ -3,59 +3,22 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path as FilePath
-from typing import Any, Callable, Iterable, List, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Iterable, List, Optional
 
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from telegram import Update
 
 from telegram_bot.core import paths as path_scope
 from telegram_bot.core import tool_policy
+from telegram_bot.core.bot_ports import BotConfigPort, SessionManagerPort
 
 logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 
-class _AccessConfig(Protocol):
-    @property
-    def allowed_user_ids(self) -> Sequence[int]: ...
-
-    @property
-    def project_root(self) -> FilePath | str: ...
-
-    @property
-    def execution_profile(self) -> str: ...
-
-    @property
-    def require_allowlist(self) -> bool: ...
-
-    @property
-    def bash_policy(self) -> str | None: ...
-
-
-class _AccessSessionManager(Protocol):
-    async def get_session(self, key: Any) -> dict[str, Any]: ...
-
-    async def patch_session(
-        self,
-        key: Any,
-        *,
-        updates: Mapping[str, Any] | None = None,
-        remove_fields: Iterable[str] = (),
-    ) -> None: ...
-
-    async def patch_session_if(
-        self,
-        key: Any,
-        *,
-        expected: Mapping[str, Any],
-        updates: Mapping[str, Any] | None = None,
-        remove_fields: Iterable[str] = (),
-    ) -> bool: ...
-
-
 class BotAccessMixin:
-    _config: _AccessConfig
-    _session_manager: _AccessSessionManager
+    _config: BotConfigPort
+    _session_manager: SessionManagerPort
     _conversation_key: Callable[[int, int | None], Any]
     _ALLOW_OUTSIDE_ONCE_TOKEN: str
     _DENY_OUTSIDE_TOKEN: str
