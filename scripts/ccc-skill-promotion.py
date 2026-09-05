@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -25,7 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any
+from typing import Any, Iterator
 
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -36,6 +37,9 @@ _MAX_FILES = 16
 _MAX_FILE_BYTES = 64 * 1024
 _MAX_TOTAL_BYTES = 256 * 1024
 _MAX_COMMAND_OUTPUT = 1024 * 1024
+# #1477: ledger.jsonl is append-only and read whole on every collect; cap it
+# like the ownership ledger (8 MiB) so an unbounded file cannot stall a run.
+_MAX_LEDGER_BYTES = 8 * 1024 * 1024
 _MAX_CANDIDATES_PER_RUN = 64
 _CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("gh-token", re.compile(r"(?:ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}", re.I)),
@@ -441,6 +445,37 @@ def _private_state_dir(path: Path) -> None:
             writable_ancestor and not trusted_sticky_ancestor
         ) or (is_final and mode & 0o077):
             raise PromotionError("state_path_unsafe")
+
+
+@contextlib.contextmanager
+def _promotion_lock(config: Config) -> Iterator[bool]:
+    """Hold `promotion.lock` (owner-only, `flock LOCK_EX|LOCK_NB`) for the
+    duration of one state-mutating command. Yields True when acquired and
+    False on contention, in which case the caller reports `status: "locked"`
+    and touches nothing.
+
+    #1477: `run` always held this lock but `collect` did not, so an overlapping
+    cron/manual collect snapshotted the same pending ledger rows, then both
+    blocked in `_wait_for_skills_check` (up to DISPATCH_CI_WAIT_SEC) and each
+    posted the same PR comment / revise dispatch. Every command that appends
+    to the ledger or the drop-report state now shares this one lock; read-only
+    previews (`collect --dry-run`) deliberately do not take it.
+    """
+    _private_state_dir(config.promotion_state_dir)
+    lock_path = config.promotion_state_dir / "promotion.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        metadata = os.fstat(lock_fd)
+        if metadata.st_uid != os.geteuid() or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise PromotionError("lock_unsafe")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(lock_fd)
 
 
 def _component_safe(metadata: os.stat_result) -> bool:
@@ -1544,16 +1579,8 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
     if not config.node:
         raise PromotionError("node_identity_unresolved")
     dry_run = dry_run or config.autonomy == "dry-run"
-    _private_state_dir(config.promotion_state_dir)
-    lock_path = config.promotion_state_dir / "promotion.lock"
-    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
-    try:
-        metadata = os.fstat(lock_fd)
-        if metadata.st_uid != os.geteuid() or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise PromotionError("lock_unsafe")
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    with _promotion_lock(config) as acquired:
+        if not acquired:
             return {
                 "ok": True,
                 "mode": "run",
@@ -1599,8 +1626,6 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
             "repaired": repaired,
             "errors": errors,
         }
-    finally:
-        os.close(lock_fd)
 
 
 def _export_result(config: Config, *, limit: int) -> dict[str, object]:
@@ -2280,8 +2305,15 @@ def _dispatch_intake_review(  # noqa: C901
 
 
 def _ledger_rows(config: Config) -> list[dict[str, object]]:
+    """Read every ledger row; a missing ledger is empty. The file is read
+    whole, so an oversized ledger (> _MAX_LEDGER_BYTES) fails closed with
+    `ledger_too_large` instead of stalling every collect (#1477) — rotate or
+    archive it by hand."""
+    path = config.promotion_state_dir / "ledger.jsonl"
     try:
-        text = (config.promotion_state_dir / "ledger.jsonl").read_text(encoding="utf-8")
+        if path.stat().st_size > _MAX_LEDGER_BYTES:
+            raise PromotionError("ledger_too_large")
+        text = path.read_text(encoding="utf-8")
     except OSError:
         return []
     rows: list[dict[str, object]] = []
@@ -3761,6 +3793,27 @@ def _drop_report(config: Config, *, acks: list[str]) -> dict[str, object]:
     for task_id in acks:
         if not _SAFE_COMPONENT_RE.fullmatch(task_id):
             raise PromotionError("drop_ack_invalid")
+    if not acks:
+        return _drop_report_unlocked(config, acks=acks)
+    # #1477: --ack appends to the ack state file, so it shares promotion.lock
+    # with run/collect. A plain sweep stays lock-free (viewable while a collect
+    # is mid-flight); on contention no ack is recorded and each requested id
+    # says so explicitly instead of looking acked.
+    with _promotion_lock(config) as acquired:
+        if not acquired:
+            return {
+                "ok": True,
+                "mode": "drop-report",
+                "status": "locked",
+                "summary": {"new_items": 0, "pending_items": 0, "pending_lineages": 0, "nodes": {}},
+                "pending": [],
+                "ack": [{"task_id": task_id, "outcome": "locked"} for task_id in acks],
+                "sweep_recorded": False,
+            }
+        return _drop_report_unlocked(config, acks=acks)
+
+
+def _drop_report_unlocked(config: Config, *, acks: list[str]) -> dict[str, object]:
     acked_rows = _read_drop_jsonl(config, _DROP_ACK_FILE)
     acked = {row["task_id"] for row in acked_rows if isinstance(row.get("task_id"), str)}
     seen: set[str] = set()
@@ -3821,7 +3874,7 @@ def _drop_report(config: Config, *, acks: list[str]) -> dict[str, object]:
     return result
 
 
-def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:  # noqa: C901
+def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:
     if not config.publisher_enabled:
         return {
             "ok": True,
@@ -3842,10 +3895,32 @@ def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:  # noqa: C9
             "errors": [],
         }
     dry_run = dry_run or config.autonomy == "dry-run"
-    _private_state_dir(config.promotion_state_dir)
-    _run(["gh", "auth", "status", "--hostname", "github.com"])
-    _require_private_repo(config)
-    errors: list[dict[str, str]] = []
+    if dry_run:
+        # A dry-run collect is read-only end to end: it previews envelopes
+        # (`would-open-private-intake-pr`), never acks/publishes/dispatches, and
+        # the verdict/revise passes only report `would-poll-*`. It therefore
+        # skips promotion.lock so a manual preview neither blocks nor is
+        # blocked by the nightly collect waiting on CI (#1477).
+        _private_state_dir(config.promotion_state_dir)
+        return _collect_unlocked(config, dry_run=True)
+    with _promotion_lock(config) as acquired:
+        if not acquired:
+            return {
+                "ok": True,
+                "mode": "collect",
+                "publisher_enabled": True,
+                "autonomy": config.autonomy,
+                "status": "locked",
+                "published": [],
+                "errors": [],
+            }
+        return _collect_unlocked(config, dry_run=False)
+
+
+def _collect_envelopes(
+    config: Config, errors: list[dict[str, str]]
+) -> list[tuple[Candidate, str, str, str]]:
+    """Gather local + remote pending envelopes, de-duplicated by transport id."""
     collected: list[tuple[Candidate, str, str, str]] = []
     seen: set[str] = set()
 
@@ -3869,6 +3944,15 @@ def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:  # noqa: C9
                 accept(value, node, node)
         except PromotionError as error:
             errors.append({"source": node, "code": error.code})
+    return collected
+
+
+def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
+    """The collect body; the caller holds promotion.lock unless dry_run."""
+    _run(["gh", "auth", "status", "--hostname", "github.com"])
+    _require_private_repo(config)
+    errors: list[dict[str, str]] = []
+    collected = _collect_envelopes(config, errors)
 
     published: list[dict[str, str]] = []
     opened = 0
@@ -3918,6 +4002,9 @@ def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:  # noqa: C9
                 )
     revise: dict[str, object] | None = None
     if config.revise_enabled:
+        # Two ledger reads on purpose: _process_verdicts appends verdict,
+        # comment, and a2a-revise-dispatch rows that _consume_revise_results
+        # must see in the same cycle (fresh revise tasks are polled at once).
         revise = {
             "verdicts": _process_verdicts(config, dry_run=dry_run),
             "results": _consume_revise_results(config, dry_run=dry_run),

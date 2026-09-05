@@ -2235,9 +2235,11 @@ async def test_codex_terminal_stall_releases_turn_and_queued_request_proceeds(
     handler, stalled = _stall_handler(tmp_path, runtime, monkeypatch)
     terminal_states: list[tuple[str, bool]] = []
     duration_success: list[bool] = []
-    handler._ledger_finish = lambda _req, state, *, cleanup_done: terminal_states.append(
-        (state, cleanup_done)
-    )
+
+    async def record_ledger_finish(_req, state, *, cleanup_done) -> None:
+        terminal_states.append((state, cleanup_done))
+
+    handler._ledger_finish = record_ledger_finish
     handler._append_duration_log = (
         lambda _req, *, session_id, duration_ms, success: duration_success.append(
             success
