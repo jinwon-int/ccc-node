@@ -526,6 +526,59 @@ chmod 600 "$BOOL_STATE/skill-autosave-control.json"
 out="$(python3 "$TOOL" --provider claude --skills-dir "$SKILLS" --state-dir "$BOOL_STATE" status user-two)"
 ok "boolean control schema fails all autonomous writes closed" 'jq -e ".skills[0].classification == \"unknown/unreadable\" and (.skills[0].autonomous_write_allowed | not)" >/dev/null <<<"$out"'
 
+# --- #1481 torn ledger tail: tolerate+report, mid-file garbage fails closed,
+# --- next append repairs. Every row is newline-terminated, so bytes after the
+# --- last "\n" can only be a crash-mid-append fragment.
+TORN_STATE="$TMP/torn-state"
+TORN_SKILLS="$TMP/torn-skills"
+mkdir -m 700 "$TORN_STATE" "$TORN_SKILLS"
+tool_torn() {
+  python3 "$TOOL" --provider claude --skills-dir "$TORN_SKILLS" --state-dir "$TORN_STATE" "$@"
+}
+TORN_LEDGER="$TORN_STATE/skill-autosave-ownership.jsonl"
+mkdir -m 700 "$TORN_SKILLS/torn-one" "$TORN_SKILLS/torn-two"
+for n in torn-one torn-two; do
+  printf -- '---\nname: %s\ndescription: A sufficiently detailed recurring workflow for ownership contract tests.\n---\n\n# %s\n\n## Steps\n1. Read.\n2. Verify.\n3. Record.\n' "$n" "$n" > "$TORN_SKILLS/$n/SKILL.md"
+  chmod 600 "$TORN_SKILLS/$n/SKILL.md"
+done
+tool_torn adopt torn-one >/dev/null
+rows_before="$(wc -l < "$TORN_LEDGER")"
+printf '{"event":"adopt","name":"torn-cra' >> "$TORN_LEDGER"
+out="$(tool_torn automatic-usage 2>"$TMP/torn-stderr")"; rc=$?
+ok "torn ledger tail is tolerated by a read-only command" '[ "$rc" = 0 ] && jq -e ".ok == true and .used == 0" >/dev/null <<<"$out"'
+ok "torn ledger tail is reported in the command report" 'jq -e ".ownership_ledger_torn_tail == 1" >/dev/null <<<"$out"'
+ok "torn ledger tail is reported on stderr" 'grep -qx "ownership_ledger_torn_tail=1" "$TMP/torn-stderr"'
+out="$(tool_torn status torn-one 2>/dev/null)"
+ok "torn tail does not fail status closed" 'jq -e ".skills[0].classification == \"autosave-managed\"" >/dev/null <<<"$out"'
+
+# Next append truncates the fragment (it never counted as a row) and reports it;
+# reads afterwards are clean and the ledger stays wholly valid JSONL.
+out="$(tool_torn adopt torn-two 2>"$TMP/torn-stderr")"; rc=$?
+ok "append after torn tail succeeds and reports the repair" '[ "$rc" = 0 ] && jq -e ".skill.classification == \"autosave-managed\" and .ownership_ledger_torn_tail_repaired == 1" >/dev/null <<<"$out" && grep -qx "ownership_ledger_torn_tail_repaired=1" "$TMP/torn-stderr"'
+ok "repaired ledger has no fragment and every line is a JSON object" '! grep -q "torn-cra" "$TORN_LEDGER" && [ "$(tail -c1 "$TORN_LEDGER" | od -An -c | tr -d " ")" = "\\n" ] && jq -e "type == \"object\"" "$TORN_LEDGER" >/dev/null && [ "$(jq -c "select(.name == \"torn-two\") | .outcome" "$TORN_LEDGER" | tr "\n" " ")" = "\"prepared\" \"changed\" " ]'
+ok "repair kept every row that preceded the fragment" '[ "$(head -n "$rows_before" "$TORN_LEDGER" | jq -r "select(.name == \"torn-one\") | .outcome" | tr "\n" " ")" = "prepared changed " ]'
+out="$(tool_torn automatic-usage 2>"$TMP/torn-stderr")"; rc=$?
+ok "read after repair reports no torn tail" '[ "$rc" = 0 ] && jq -e "has(\"ownership_ledger_torn_tail\") | not" >/dev/null <<<"$out" && [ ! -s "$TMP/torn-stderr" ]'
+
+# Newline-terminated garbage (mid-file or last) is corruption, not a torn
+# write: still fails closed with ownership_ledger_invalid.
+cp "$TORN_LEDGER" "$TMP/torn-ledger.bak"
+printf 'not json\n' >> "$TORN_LEDGER"
+out="$(tool_torn automatic-usage 2>/dev/null)"; rc=$?
+ok "newline-terminated garbage line still fails closed" '[ "$rc" = 2 ] && jq -e ".code == \"ownership_ledger_invalid\"" >/dev/null <<<"$out"'
+{ head -n 1 "$TMP/torn-ledger.bak"; printf '{"event":"adopt","name":"mid-cra\n'; tail -n +2 "$TMP/torn-ledger.bak"; } > "$TORN_LEDGER"
+out="$(tool_torn automatic-usage 2>/dev/null)"; rc=$?
+ok "mid-file fragment still fails closed" '[ "$rc" = 2 ] && jq -e ".code == \"ownership_ledger_invalid\"" >/dev/null <<<"$out"'
+{ head -n 1 "$TMP/torn-ledger.bak"; printf '[]\n'; tail -n +2 "$TMP/torn-ledger.bak"; } > "$TORN_LEDGER"
+out="$(tool_torn automatic-usage 2>/dev/null)"; rc=$?
+ok "non-object JSON row still fails closed" '[ "$rc" = 2 ] && jq -e ".code == \"ownership_ledger_invalid\"" >/dev/null <<<"$out"'
+
+# A torn tail that cuts a multi-byte UTF-8 sequence is still just a torn tail.
+cp "$TMP/torn-ledger.bak" "$TORN_LEDGER"
+printf '{"name":"\xed\x95' >> "$TORN_LEDGER"
+out="$(tool_torn automatic-usage 2>/dev/null)"; rc=$?
+ok "torn tail inside a multi-byte character is tolerated" '[ "$rc" = 0 ] && jq -e ".ownership_ledger_torn_tail == 1" >/dev/null <<<"$out"'
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

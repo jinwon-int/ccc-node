@@ -1035,7 +1035,7 @@ def probe_mempalace(
 
 
 def main() -> int:
-    home = Path(os.environ.get("HOME") or "/root")
+    home = Path(os.environ["HOME"]) if os.environ.get("HOME") else Path.home()
     cron = crontab_text()
     managed_environment, configuration_conflicts = managed_cron_environment(cron)
     scoped_raw = (
