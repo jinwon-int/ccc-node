@@ -269,6 +269,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `gh-ci-wait` skill teaches agents the registration contract.
 
 ### Fixed
+- **Test-suite completion waits relaxed to 5s; per-test pytest-timeout cap in
+  CI (#1512, #1482).** Eighteen `asyncio.wait_for(..., timeout=1.0)` /
+  `timeout=1` waits across `test_skill_candidate_worker`,
+  `test_heartbeat_loop`, `test_project_chat_codex`, `test_codex_app_server`
+  and `test_external_wait_monitor` only asserted that a task *eventually*
+  completes, yet a 1s cap flaked on a loaded CI runner
+  (`test_concurrent_collectors_make_one_provider_call`, run 33965158010). The
+  cap is now 5s at every completion-gating site; waits that deliberately
+  assert a timeout fires (`timeout=0.1` in the heartbeat suite) are
+  untouched. `pytest-timeout` joins the CI lock
+  (`.github/requirements/bridge-ci.in`; runtime lock unchanged) and
+  `[tool.pytest.ini_options] timeout = 120` in `bridge/pyproject.toml` turns
+  a genuinely hung test into a fast failure with a stack dump instead of a
+  runner stall. The default signal method covers both `asyncio.run` and
+  `anyio` tests; local runs without the plugin see one
+  `Unknown config option: timeout` warning and are otherwise unaffected.
 - **Spawned-task references and session-lock pruning (#1479).** The crush
   permission handler, the webhook nudge per-connection server, and the
   durable Codex completion delivery each spawned a task with a bare

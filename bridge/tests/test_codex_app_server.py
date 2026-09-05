@@ -189,7 +189,7 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
 
         first_attempt.cancel()
         with self.assertRaises(asyncio.CancelledError):
-            await asyncio.wait_for(asyncio.shield(first_attempt), timeout=1)
+            await asyncio.wait_for(asyncio.shield(first_attempt), timeout=5)
 
         # The failed attempt must not leave a half-initialized transport
         # behind: no reader/writer/process installed, and the abandoned
@@ -213,7 +213,7 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
         assert first_message["method"] == "initialize"
         processes[1].stdin.feed({"id": first_message["id"], "result": {"userAgent": "fake"}})
 
-        second_result = await asyncio.wait_for(second_attempt, timeout=1)
+        second_result = await asyncio.wait_for(second_attempt, timeout=5)
 
         # The retry must spawn a genuinely new process rather than resending
         # "initialize" on the abandoned one.
@@ -549,7 +549,7 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
         big_value = "x" * (200 * 1024)  # 200 KiB — well past the 64 KiB default
         writer.feed({"id": request["id"], "result": {"blob": big_value}})
 
-        result = await asyncio.wait_for(request_task, timeout=1)
+        result = await asyncio.wait_for(request_task, timeout=5)
         assert result == {"blob": big_value}
         await client.close()
 

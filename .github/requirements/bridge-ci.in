@@ -6,6 +6,10 @@ ruff
 mypy
 build
 pip-audit
+# Per-test wall-clock cap for the bridge suite (bridge/pyproject.toml sets
+# [tool.pytest.ini_options] timeout). CI-only: a hung test fails fast with a
+# stack dump instead of stalling the runner until the job-level timeout.
+pytest-timeout
 # Pinned build backend so the wheel-smoke job builds with --no-isolation and
 # never fetches an unhashed setuptools at build time (bridge/pyproject.toml
 # requires setuptools>=68).
