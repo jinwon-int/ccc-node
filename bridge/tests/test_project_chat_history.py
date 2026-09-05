@@ -7,6 +7,7 @@ rules (last-block vs first-non-empty vs first-block-with-'<'-filter), the revert
 view's file-line index, and the now-uniform skip-malformed-line behavior.
 """
 
+import json
 import sys
 import types
 import unittest
@@ -22,7 +23,51 @@ if "telegram_bot" not in sys.modules:
 from telegram_bot.core.project_chat_history import (  # noqa: E402
     ProjectChatHistoryMixin,
     iter_transcript_messages,
+    read_last_assistant_text,
 )
+
+
+class _CountingHandle:
+    """Binary file proxy that counts the bytes actually read."""
+
+    def __init__(self, handle):
+        self._handle = handle
+        self.bytes_read = 0
+        self.reads = 0
+
+    def seek(self, *args):
+        return self._handle.seek(*args)
+
+    def read(self, size=-1):
+        data = self._handle.read(size)
+        self.bytes_read += len(data)
+        self.reads += 1
+        return data
+
+
+def _forward_last_assistant_text(path: Path):
+    """The pre-#1479 full-scan rule, kept as the oracle for the tail read."""
+    last_text = None
+    for _idx, _role, content, _ts in iter_transcript_messages(path, types=("assistant",)):
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "").strip()
+                if text:
+                    last_text = text
+    return last_text
+
+
+def _assistant_line(text: str, *, extra_blocks=()) -> str:
+    blocks = list(extra_blocks) + [{"type": "text", "text": text}]
+    return json.dumps(
+        {"type": "assistant", "message": {"role": "assistant", "content": blocks}}
+    )
+
+
+def _user_line(text: str) -> str:
+    return json.dumps({"type": "user", "message": {"role": "user", "content": text}})
 
 
 class _Host(ProjectChatHistoryMixin):
@@ -154,6 +199,88 @@ class TranscriptHistoryTests(unittest.TestCase):
         sid, preview, _mtime = sessions[0]
         self.assertEqual(sid, "alpha")
         self.assertEqual(preview, "first real question")
+
+    # -- #1479: tail-first last-assistant read ------------------------------
+
+    def test_tail_read_on_multi_mb_transcript_reads_a_few_blocks_only(self):
+        # ~4 MB transcript: 4000 user/assistant pairs with 500-byte payloads,
+        # ending in a user line and an assistant tool_use-only record so the
+        # scan has to skip past two non-matching records first.
+        lines = []
+        for i in range(4000):
+            lines.append(_user_line(f"q{i} " + "u" * 500))
+            lines.append(_assistant_line(f"a{i} " + "x" * 500))
+        lines.append(_assistant_line("", extra_blocks=[{"type": "tool_use", "id": "t"}]))
+        lines.append(_user_line("trailing user"))
+        path = self._write("big", lines)
+        size = path.stat().st_size
+        self.assertGreater(size, 3 * 1024 * 1024)
+
+        with open(path, "rb") as raw:
+            handle = _CountingHandle(raw)
+            got = read_last_assistant_text(handle)
+
+        self.assertEqual(got, "a3999 " + "x" * 500)
+        self.assertEqual(got, _forward_last_assistant_text(path))
+        # One 64 KiB block suffices; the full scan would have read every byte.
+        self.assertEqual(handle.reads, 1)
+        self.assertLessEqual(handle.bytes_read, 64 * 1024)
+        self.assertLess(handle.bytes_read * 20, size)
+        # The mixin accessor is the same read plus truncation.
+        self.assertEqual(
+            self.host.get_session_last_assistant_message("big", max_chars=5), "a3999..."
+        )
+
+    def test_tail_read_carries_partial_lines_across_block_boundaries(self):
+        # Records longer than one block must be re-assembled from the carry;
+        # malformed trailing lines and a trailing newline-less line are skipped.
+        long_text = "L" * 5000
+        lines = [
+            _assistant_line("early"),
+            _assistant_line(long_text),
+            "BROKEN {{{",
+            _user_line("u" * 3000),
+        ]
+        path = self._write("span", lines)
+        for block in (7, 64, 1024, 4096, 1 << 20):
+            with open(path, "rb") as raw:
+                self.assertEqual(
+                    read_last_assistant_text(raw, block_bytes=block), long_text, block
+                )
+        # No trailing newline at all.
+        path.write_bytes(path.read_bytes().rstrip(b"\n"))
+        with open(path, "rb") as raw:
+            self.assertEqual(read_last_assistant_text(raw, block_bytes=64), long_text)
+
+    def test_tail_read_matches_forward_scan_on_edge_shapes(self):
+        cases = {
+            "rich": self._RICH,
+            "only_users": [_user_line("a"), _user_line("b")],
+            "string_content": [
+                '{"type":"assistant","message":{"role":"assistant","content":"plain"}}'
+            ],
+            "empty_then_text": [
+                _assistant_line("kept"),
+                '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"  "}]}}',
+            ],
+            "role_mismatch_last": [
+                _assistant_line("real"),
+                '{"type":"assistant","message":{"role":"user","content":[{"type":"text","text":"nope"}]}}',
+            ],
+            "last_block_wins": [
+                '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]}}'
+            ],
+            "empty_file": [],
+        }
+        for name, lines in cases.items():
+            path = self.dir / f"{name}.jsonl"
+            path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+            expected = _forward_last_assistant_text(path)
+            with open(path, "rb") as raw:
+                self.assertEqual(read_last_assistant_text(raw, block_bytes=16), expected, name)
+            self.assertEqual(
+                self.host.get_session_last_assistant_message(name), expected, name
+            )
 
     def test_clean_response_strips_ansi_and_control_chars_via_module_regex(self):
         """#1479: the ANSI pattern is compiled once at import, not per call."""

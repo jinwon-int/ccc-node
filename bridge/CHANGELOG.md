@@ -189,6 +189,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Usage-meter writes, no-op session updates, and the last-assistant
+  transcript read leave the event loop (#1479).** `UsageMeter.record()`
+  (flock + full reload + atomic rewrite) ran synchronously on the loop from
+  the Claude adapter attempt/result sites and the Codex usage-recorder seam;
+  the turn loop now awaits those writes through `asyncio.to_thread`, and the
+  runtime seam (invoked synchronously by `CodexRuntime`) schedules the write
+  as a tracked task drained by `ProjectChatHandler.close()`. All meter writes
+  share a per-handler FIFO lock because `record_codex_thread_usage` is a
+  non-commutative read-modify-write of its per-thread baseline (`record()`'s
+  own counters are plain deltas). `SessionStore.update()` now skips the
+  backup + primary commit (four fsyncs) when the merged session is unchanged,
+  matching `patch()`; `set_last_user_message_at` stays a separate update
+  because it must land before the turn runs and regardless of its outcome.
+  `get_session_last_assistant_message` reads the transcript tail-first in
+  64 KiB blocks and stops at the first assistant record with text (one block
+  on a ~4 MB transcript instead of a full scan); the history-injection
+  `get_recent_messages` and the resume-selection last-assistant read are
+  awaited via `asyncio.to_thread`. The two `bot_commands.py` transcript scans
+  are left for the mixin/Protocol consolidation lane.
 - **Ledger and active-turn fsync writes leave the event loop (#1479).** The
   task-ledger `create` / phase projection / `finish` verbs and the
   external-wait `publish_active_turn` / `clear_active_turn` route writes each

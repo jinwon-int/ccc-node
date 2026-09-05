@@ -1122,3 +1122,50 @@ def test_concurrent_set_update_delete_remains_consistent(tmp_path):
             assert value is None
         else:
             assert value == {"value": user_id, "updated": True}
+
+
+def test_identical_update_skips_the_commit(tmp_path, monkeypatch):
+    """#1479: update() with no effective change must not rewrite the files."""
+    path = tmp_path / "sessions.json"
+    store = initialized_store(path)
+    run(store.set(1, {"provider": "claude", "last_user_message_at": "t1"}))
+    before = path.read_bytes()
+    commits: list[str] = []
+    real_commit = store._commit
+
+    def spy(key, mutation):
+        commits.append(key)
+        return real_commit(key, mutation)
+
+    monkeypatch.setattr(store, "_commit", spy)
+
+    run(store.update(1, {"provider": "claude"}))
+    run(store.update(1, {"last_user_message_at": "t1", "provider": "claude"}))
+    run(store.update(1, {}))
+
+    assert commits == []
+    assert path.read_bytes() == before
+    assert run(store.get(1)) == {"provider": "claude", "last_user_message_at": "t1"}
+
+
+def test_changed_update_still_commits_and_missing_key_is_created(tmp_path, monkeypatch):
+    path = tmp_path / "sessions.json"
+    store = initialized_store(path)
+    run(store.set(1, {"provider": "claude", "last_user_message_at": "t1"}))
+    commits: list[str] = []
+    real_commit = store._commit
+
+    def spy(key, mutation):
+        commits.append(key)
+        return real_commit(key, mutation)
+
+    monkeypatch.setattr(store, "_commit", spy)
+
+    run(store.update(1, {"last_user_message_at": "t2"}))
+    run(store.update(2, {}))  # a brand-new key is materialized, as before
+
+    assert commits == ["telegram_session:1", "telegram_session:2"]
+    assert read_json(path) == {
+        "telegram_session:1": {"provider": "claude", "last_user_message_at": "t2"},
+        "telegram_session:2": {},
+    }

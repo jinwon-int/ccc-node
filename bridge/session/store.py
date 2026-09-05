@@ -378,6 +378,11 @@ class SessionStore:
         async with self._lock:
             data = copy.deepcopy(self._local_data.get(key, {}))
             data.update(copy.deepcopy(updates))
+            # No-op detection (#1479): every commit rewrites backup + primary
+            # with four fsyncs, so an update that leaves the stored session
+            # byte-for-byte equal skips the disk round trip, like patch().
+            if key in self._local_data and self._local_data[key] == data:
+                return
             await asyncio.to_thread(
                 self._commit, key, lambda: self._local_data.__setitem__(key, data)
             )
