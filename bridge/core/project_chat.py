@@ -7,6 +7,7 @@ import os
 import time
 import asyncio
 import logging
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -263,6 +264,8 @@ class ProjectChatHandler(
         self._shutdown_draining = False
         self._agent_interrupt_timeout_seconds = 10.0
         self._session_guard_lock = asyncio.Lock()
+        # Orders the offloaded task-ledger writes (see _run_ledger_write).
+        self._task_ledger_write_lock = asyncio.Lock()
         self._session_guard_evictions = 0
         self._session_guard_runtime_recycles = 0
         self._session_guard_last_tree_rss_mb = 0.0
@@ -1067,38 +1070,67 @@ class ProjectChatHandler(
         self._task_ledger_cache = TaskLedger(path) if path else False
         return self._task_ledger_cache or None
 
-    def _ledger_create(
+    async def _run_ledger_write(
+        self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Run one fsync-backed ledger mutation in a worker thread (#1479).
+
+        Every ``TaskLedger`` verb re-reads, re-serializes, and atomically
+        rewrites ``tasks.json`` with a file + directory fsync, so it must not run
+        on the event loop. The per-handler asyncio lock keeps writes issued
+        from the loop landing in issue order even when two coroutines of the
+        same request (approval callback vs. event consumer) project a phase
+        concurrently — the default executor gives no FIFO guarantee across
+        threads, and a stale projection must never overwrite a newer one.
+        """
+
+        lock = getattr(self, "_task_ledger_write_lock", None)
+        if lock is None:
+            lock = self._task_ledger_write_lock = asyncio.Lock()
+        async with lock:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+
+    async def _ledger_create(
         self,
         user_id: int,
         chat_id: int,
         *,
         initial_state: str = RequestPhase.WORKING.value,
-    ):
+    ) -> Optional[str]:
         led = self._task_ledger
         if not led:
             return None
         try:
-            return led.create(user_id, chat_id, initial_state=initial_state)
+            return await self._run_ledger_write(
+                led.create, user_id, chat_id, initial_state=initial_state
+            )
         except Exception as exc:
             logger.warning("Task ledger create failed: %s", type(exc).__name__)
             return None
 
-    def _project_request_phase(self, req: _PendingRequest) -> None:
+    async def _project_request_phase(self, req: _PendingRequest) -> None:
         """Best-effort durable projection of the in-memory request phase."""
 
         led = self._task_ledger
         if not led or not req.task_id or req.lifecycle.is_terminal:
             return
+        # Snapshot on the loop so the write carries the phase as of this call,
+        # exactly like the former synchronous projection did.
+        phase = req.lifecycle.phase.value
         try:
-            led.set_state(req.task_id, req.lifecycle.phase.value)
+            await self._run_ledger_write(led.set_state, req.task_id, phase)
         except Exception as exc:
             logger.warning("Task ledger phase projection failed: %s", type(exc).__name__)
 
-    def _ledger_finish(self, req: _PendingRequest, state: str, *, cleanup_done: bool) -> None:
+    async def _ledger_finish(
+        self, req: _PendingRequest, state: str, *, cleanup_done: bool
+    ) -> None:
         led = self._task_ledger
         if led and req.task_id:
             try:
-                led.finish(req.task_id, state, cleanup_done=cleanup_done)
+                await self._run_ledger_write(
+                    led.finish, req.task_id, state, cleanup_done=cleanup_done
+                )
             except Exception as exc:
                 logger.warning("Task ledger finish failed: %s", type(exc).__name__)
 
@@ -1128,7 +1160,7 @@ class ProjectChatHandler(
                 # Offload the (now fsync-backed) ledger write off the event loop
                 # so a heartbeat-path mutation never stalls message delivery.
                 try:
-                    await asyncio.to_thread(led.set_status_message, req.task_id, None)
+                    await self._run_ledger_write(led.set_status_message, req.task_id, None)
                 except Exception as exc:
                     logger.warning(
                         "Task ledger heartbeat cleanup projection failed: %s",
@@ -1213,7 +1245,7 @@ class ProjectChatHandler(
                 if led and req.task_id:
                     # Offload the (now fsync-backed) ledger write off the event
                     # loop so a heartbeat-path mutation never stalls delivery.
-                    await asyncio.to_thread(led.set_status_message, req.task_id, message_id)
+                    await self._run_ledger_write(led.set_status_message, req.task_id, message_id)
         except Exception as e:
             logger.warning(
                 "Heartbeat update failed for user %s chat %s: %s",

@@ -28,7 +28,7 @@ class EffectRecorder:
         self.duration_args: tuple[str | None, int, bool] | None = None
         self.finish_args: tuple[str, bool] | None = None
 
-    def ledger_create(
+    async def ledger_create(
         self,
         user_id: int,
         chat_id: int,
@@ -60,7 +60,7 @@ class EffectRecorder:
         self.order.append("duration")
         self.duration_args = (session_id, duration_ms, success)
 
-    def ledger_finish(
+    async def ledger_finish(
         self,
         request: _PendingRequest,
         state: str,
@@ -101,8 +101,8 @@ def _coordinator(
     )
 
 
-def _start(coordinator: RequestProgressCoordinator) -> RequestProgressHandle:
-    return coordinator.start(
+async def _start(coordinator: RequestProgressCoordinator) -> RequestProgressHandle:
+    return await coordinator.start(
         user_id=7,
         chat_id=70,
         model="test-model",
@@ -119,7 +119,7 @@ async def test_start_and_finalize_preserve_effect_order_and_values() -> None:
     recorder = EffectRecorder(cleaned=False)
     clock = MutableClock(10.0)
     coordinator = _coordinator(recorder, clock=clock)
-    handle = _start(coordinator)
+    handle = await _start(coordinator)
     await asyncio.sleep(0)
     clock.value = 10.125
 
@@ -166,7 +166,7 @@ async def test_duration_is_sampled_after_heartbeat_cleanup() -> None:
         cleanup_heartbeat=cleanup_after_delay,
         clock=clock,
     )
-    handle = _start(coordinator)
+    handle = await _start(coordinator)
 
     await coordinator.finalize(
         handle,
@@ -183,7 +183,7 @@ async def test_already_completed_future_is_not_set_twice() -> None:
     recorder = EffectRecorder()
     clock = MutableClock(10.0)
     coordinator = _coordinator(recorder, clock=clock)
-    handle = _start(coordinator)
+    handle = await _start(coordinator)
     handle.request.future.set_result(None)
     clock.value = 9.0
 
@@ -201,7 +201,7 @@ async def test_already_completed_future_is_not_set_twice() -> None:
 async def test_independently_cancelled_progress_task_is_reaped_then_finalized() -> None:
     recorder = EffectRecorder()
     coordinator = _coordinator(recorder)
-    handle = _start(coordinator)
+    handle = await _start(coordinator)
     handle.request.future.cancel()
 
     await coordinator.finalize(
@@ -233,7 +233,7 @@ async def test_stalled_progress_task_is_cancelled_and_gathered_before_cleanup() 
         progress_loop=stalled,
         reap_timeout_seconds=0.001,
     )
-    handle = _start(coordinator)
+    handle = await _start(coordinator)
     await asyncio.sleep(0)
 
     await coordinator.finalize(
@@ -252,7 +252,7 @@ async def test_stalled_progress_task_is_cancelled_and_gathered_before_cleanup() 
 async def test_duplicate_finalize_fails_closed_without_repeating_effects() -> None:
     recorder = EffectRecorder()
     coordinator = _coordinator(recorder)
-    handle = _start(coordinator)
+    handle = await _start(coordinator)
     await coordinator.finalize(
         handle,
         terminal_outcome=RequestPhase.INTERRUPTED,
@@ -278,7 +278,7 @@ async def test_process_finalizer_claims_fallback_and_resolves_live_session() -> 
     recorder = EffectRecorder()
     clock = MutableClock(10.0)
     coordinator = _coordinator(recorder, clock=clock)
-    handle = _start(coordinator)
+    handle = await _start(coordinator)
     clock.value = 10.125
 
     class Session:
@@ -301,7 +301,7 @@ async def test_process_finalizer_uses_requested_session_fallback_exactly_once() 
     recorder = EffectRecorder()
     clock = MutableClock(10.0)
     coordinator = _coordinator(recorder, clock=clock)
-    handle = _start(coordinator)
+    handle = await _start(coordinator)
     clock.value = 11.0
     handle.request.lifecycle.try_terminal(
         RequestPhase.INTERRUPTED,
@@ -342,7 +342,7 @@ async def test_duration_failure_propagates_before_ledger_finish() -> None:
         raise OSError("duration unavailable")
 
     coordinator = _coordinator(recorder, append_duration_log=fail_duration)
-    handle = _start(coordinator)
+    handle = await _start(coordinator)
 
     with pytest.raises(OSError, match="duration unavailable"):
         await coordinator.finalize(
@@ -360,12 +360,12 @@ async def test_duration_failure_propagates_before_ledger_finish() -> None:
 async def test_ledger_failure_propagates_after_duration() -> None:
     recorder = EffectRecorder()
 
-    def fail_ledger(*_args, **_kwargs) -> None:
+    async def fail_ledger(*_args, **_kwargs) -> None:
         recorder.order.append("ledger-failed")
         raise OSError("ledger unavailable")
 
     coordinator = _coordinator(recorder, ledger_finish=fail_ledger)
-    handle = _start(coordinator)
+    handle = await _start(coordinator)
 
     with pytest.raises(OSError, match="ledger unavailable"):
         await coordinator.finalize(
@@ -396,7 +396,7 @@ async def test_caller_cancellation_propagates_and_cancels_progress_task() -> Non
         progress_loop=stalled,
         reap_timeout_seconds=60.0,
     )
-    handle = _start(coordinator)
+    handle = await _start(coordinator)
     finalizer = asyncio.create_task(
         coordinator.finalize(
             handle,

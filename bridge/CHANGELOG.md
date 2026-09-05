@@ -189,6 +189,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Ledger and active-turn fsync writes leave the event loop (#1479).** The
+  task-ledger `create` / phase projection / `finish` verbs and the
+  external-wait `publish_active_turn` / `clear_active_turn` route writes each
+  rewrite a JSON file atomically with a file and directory fsync, and ran
+  synchronously inside coroutines (`publish_active_turn` even under the
+  session guard lock). They now run through `asyncio.to_thread`: ledger
+  writes are serialized by a per-handler asyncio lock so projections still
+  land in issue order, `RequestProgressCoordinator.start` became async, the
+  route publish moved out of the guard lock (nothing under it reads the
+  route file, and it is still published before `send_turn`), and a
+  cancellation arriving while a route write is in flight is re-raised only
+  after the write lands so a turn's clear can never overtake its publish.
+  `_clean_response` also compiles its ANSI-escape pattern once at import.
 - **Python-owned dependency bootstrap (#584 P3-2).** `start.sh` now delegates
   dependency mode resolution, requirements fingerprint/cache handling,
   hash-lock enforcement, pip argv/execution, and Termux Android API detection
