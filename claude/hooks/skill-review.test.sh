@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# harness: umask-rerun
 # Tests for skill-review.sh / skill-review/extract.sh — no provider/network calls.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

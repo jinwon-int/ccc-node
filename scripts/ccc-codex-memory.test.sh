@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# harness: umask-rerun
 # Hermetic unit tests for the Codex memory materializer (#419).
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

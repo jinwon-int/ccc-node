@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 
+import ccc_secure_fs as _secure_fs
 from agent_cron_schema import validate_store
 
 
@@ -33,19 +33,12 @@ def write_doc(path: Path, data: dict[str, Any]) -> None:
     if errors:
         raise ValueError(f"refusing invalid agent-cron store: {errors[0]}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    try:
-        temporary.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
-            encoding="utf-8",
-        )
-        temporary.chmod(0o600)
-        temporary.replace(path)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    _secure_fs.atomic_write_text(
+        path,
+        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
+        mode=0o600,
+        durable=False,
+    )
 
 
 __all__ = ["empty_doc", "load_doc", "write_doc"]

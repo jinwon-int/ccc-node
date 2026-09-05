@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# harness: umask-rerun
 # Hermetic installer coverage: provider routing, managed Codex loader safety,
 # cron idempotence, Claude hook ownership, rollback and target-user isolation.
 set -uo pipefail

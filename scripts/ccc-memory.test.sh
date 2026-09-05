@@ -304,9 +304,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 from unittest import mock
 
+# The probe imports its sibling ccc_secure_fs (installed beside it in hooks/).
+sys.path.insert(0, str(Path(os.environ["PROBE_PY"]).resolve().parent))
 spec = importlib.util.spec_from_file_location("ccc_memory_probe", os.environ["PROBE_PY"])
 assert spec and spec.loader
 probe = importlib.util.module_from_spec(spec)

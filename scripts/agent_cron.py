@@ -6,7 +6,6 @@
 # entrypoint directly when possible.
 import os as _os
 import contextlib
-import fcntl
 import shlex as _shlex
 import sys as _sys
 from pathlib import Path as _Path
@@ -98,6 +97,7 @@ from agent_cron_repository import (  # noqa: E402
     load_doc as load_store,
     write_doc as write_store,
 )
+import ccc_secure_fs as _secure_fs  # noqa: E402
 
 script_root = Path(__file__).resolve().parents[1]
 _canonical_redaction = None
@@ -154,15 +154,8 @@ def store_lock():
     """
     path = store_lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with _secure_fs.flock_guard(path, blocking=True):
         yield
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
 
 
 # Fields a run owns. Everything else on the task (schedule, prompt, enabled,
@@ -225,16 +218,8 @@ def task_lock_guard(task_id):
     """Serialize ownership checks and mutations for one task lock."""
     path = lock_guard_path(task_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with _secure_fs.flock_guard(path, blocking=True):
         yield
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
 
 
 _boot_id_cache = None
@@ -334,20 +319,12 @@ def write_lock(path, payload):
 
 def replace_lock(path, payload):
     """Atomically replace an owned lock record without a torn JSON window."""
-    temporary = path.with_name(f'.{path.name}.tmp.{os.getpid()}')
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    try:
-        fd = os.open(str(temporary), flags, 0o600)
-        try:
-            os.write(fd, (json.dumps(payload, ensure_ascii=False, sort_keys=True) + '\n').encode('utf-8'))
-        finally:
-            os.close(fd)
-        temporary.replace(path)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    _secure_fs.atomic_write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, sort_keys=True) + '\n',
+        mode=0o600,
+        durable=False,
+    )
 
 
 def parse_lock_args():
@@ -1460,7 +1437,7 @@ def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
             'redacted': False,
             'reason': 'canonical-redaction-unavailable',
         }
-    ts = fmt_dt(at) or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    ts = fmt_dt(at) or _secure_fs.utc_now_iso()
     payload = {
         'version': 1,
         'ts': ts,

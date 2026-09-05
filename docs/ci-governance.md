@@ -43,6 +43,36 @@ name and its gate without any branch-protection mutation; the leg jobs are
 deliberately NOT declared as required contexts (a matrix leg rename would
 strand them, and the aggregator already covers them).
 
+## validate-harness discovery rules (issue #1484)
+
+`scripts/validate-harness.sh` no longer keeps hand-maintained lists of what
+it validates; the plan is discovered from the git index and a few small,
+guarded manifests at the top of the script (`# --- manifests (#1484)`). What a
+contributor has to know:
+
+| Kind | Discovered as | Manifest / marker | Guard |
+| --- | --- | --- | --- |
+| hook-test suites | every tracked `*.test.sh`, index (byte) order | `HARNESS_EXCLUDE` — suites deliberately not run (empty today) | no shebang = FAIL; stale exclude = FAIL; git missing = FAIL (fail closed) |
+| umask-0002 re-runs | suites whose leading comment block carries the exact line `# harness: umask-rerun` | the marker itself (`UMASK_MARKER`) | empty set = FAIL |
+| `py_compile` | every tracked `*.py` outside `PY_COMPILE_EXCLUDE` prefixes | `PY_COMPILE_EXCLUDE=(bridge/)` — bridge has its own pytest/mypy | empty scope = FAIL |
+| shellcheck (warning level) | every tracked `*.sh` plus `SC_SCOPE_EXTRA` (suffix-less scripts) minus `SC_WARN_BASELINE` | `SC_WARN_BASELINE` — scripts with pre-existing warning-level findings | stale entry = FAIL; entry that became clean = FAIL (ratchet: remove it) |
+
+Practical rules:
+
+- A new `*.test.sh` runs as soon as it is tracked (`git add`); there is nothing
+  to register. It must start with a shebang. If it must also pass under
+  umask 0002 (permission-contract suites, #770), put `# harness: umask-rerun`
+  on its own line in the header comment block, before the first non-comment line.
+- A new `*.sh` is shellcheck-linted at warning level from its first commit.
+  Never add a new script to `SC_WARN_BASELINE`; fix the findings instead.
+  When you clean a baseline script, remove it from the baseline in the same
+  PR (the ratchet fails the run otherwise).
+- A new `*.py` outside `bridge/` is syntax-compiled automatically.
+- `bash scripts/validate-harness.sh --dump-plan` prints the discovered plan as
+  `<kind><TAB><path>` lines (kinds: `suite`, `umask-rerun`, `py_compile`,
+  `shellcheck-warning`) and is the seam for diffing plans across revisions.
+  `CCC_HARNESS_LIST_ONLY=1` still prints the shard assignment.
+
 ## Dependency lock governance (issue #349)
 
 Two hash locks share one generation source, `bridge/pyproject.toml`, and are

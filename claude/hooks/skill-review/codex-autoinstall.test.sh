@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# harness: umask-rerun
 # Tests for Codex-native skill-autosave install parity (#643) — hermetic,
 # deterministic, no provider/network calls. Exercises autoinstall.sh with
 # CCC_SKILL_PROVIDER=codex so the same gate/ledger/rollback pipeline installs
