@@ -33,9 +33,11 @@ rather than composing the steps ad hoc.
 3. `git fetch` + `merge --ff-only` (never rewrites local history; diverged →
    abort)
 4. if HEAD changed (or `run --force`): snapshot the managed Claude artifacts
-   plus Hermes `honcho.json`, then let `./setup.sh` redeploy the harness; a
-   setup failure verifies rollback of both the repository SHA and installed
-   artifacts before reporting success
+   (plus the legacy Hermes `honcho.json` where one still exists — Honcho is
+   retired, #1436; the file is only carried through the rollback snapshot
+   until its owner-approved disposal, TM-2029 phase 5), then let `./setup.sh`
+   redeploy the harness; a setup failure verifies rollback of both the
+   repository SHA and installed artifacts before reporting success
 5. if any `~/.claude/state/install-*.json` record's generation stamp drifted
    against the current checkout: snapshot crontab, replay the recorded argv
    (the resolved `--apply --schedule …` the installer materialized), verify

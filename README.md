@@ -35,11 +35,13 @@ After setup:
 | Area | One-line summary | Details |
 |---|---|---|
 | Memory hooks | SessionStart/PostCompact memory snapshot + background refresh; startup is no-network/fail-open. Per-provider feature status (incl. degraded lanes) is owned by [`docs/provider-capability-matrix.md`](docs/provider-capability-matrix.md). | [`docs/memory.md`](docs/memory.md) |
+| nunchi | Opt-in node-local working memory: a scoped fact store fed by session/bridge ingest, judge and wiki-promote batches, and a bounded snapshot prepended to the startup context on nunchi-mode nodes; Wiki promotion stays human-gated. | [`docs/memory.md`](docs/memory.md) |
 | Telegram bridge | Telegram ↔ Claude Code bridge with daemon/supervisor, streaming UI, push notifier, voice/media helpers. | [`bridge/README.md`](bridge/README.md), [`docs/bridge-ops.md`](docs/bridge-ops.md) |
 | Harness settings | Claude settings, status line, Korean output style, plugin/standalone hook modes. | [`docs/harness.md`](docs/harness.md) |
 | Doctor diagnostics | Read-only drift report plus conservative dry-run/apply repairs for settings and allowlisted files. | [`docs/doctor.md`](docs/doctor.md) |
 | Security audit | Metadata-only permission/config/redaction checks; no matched secret text printed. | [`docs/security-audit.md`](docs/security-audit.md) |
 | Agent-cron | Durable local task definitions, due/lock/run primitives, explicit scheduler execution. | [`docs/agent-cron.md`](docs/agent-cron.md) |
+| Skill autosave / promotion | Skill-review hook and daily sweep with Telegram approval; opt-in private central intake through draft PRs with dual-broker review, auto-revision, and signed receipts; fleet-skills graduation criteria. | [`docs/skill-autosave.md`](docs/skill-autosave.md), [`docs/skill-graduation.md`](docs/skill-graduation.md) |
 | GitHub transport | Local `git` + `gh` CLI by default; the Codex GitHub connector plugin is disabled during setup. | [`docs/github-transport.md`](docs/github-transport.md) |
 | A2A worker lane | Claude Code A2A poller/analysis-backend wiring, native Termux worker preflight. | [`docs/a2a-claude-worker.md`](docs/a2a-claude-worker.md) |
 | Termux parity | Android/Termux constraints and VPS parity notes. | [`docs/android-termux-claude.md`](docs/android-termux-claude.md), [`docs/termux-vps-parity.md`](docs/termux-vps-parity.md) |

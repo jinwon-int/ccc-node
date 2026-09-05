@@ -53,8 +53,9 @@ exactly-once를 주장하지 않으며 실제 Telegram, self-update를 실행하
 초기 범위는 이슈 #872의 제안 순서에 따라 Telegram text delivery, Honcho distill
 delivery, self-update apply였고, 이후 슬라이스가 agent-cron owner spool,
 external-wait wake, skill-autosave sweep, lifecycle terminal-outbox cleanup,
-service-control restart를 같은 marker와 policy gate로 추가했다. 실제 Telegram
-전송·드래프트 편집 중 전송 경로는 계속 `telegram.send_text`가 담당한다.
-Honcho replay, callback query 직접 편집(단일 소유 symbol 부재), skill
+service-control restart를 같은 marker와 policy gate로 추가했다. Honcho distill
+delivery는 2026-09-01 Honcho 퇴역(#1436)으로 sink와 함께 inventory에서 제거됐다.
+실제 Telegram 전송·드래프트 편집 중 전송 경로는 계속 `telegram.send_text`가
+담당한다. callback query 직접 편집(단일 소유 symbol 부재), skill
 install/rollback/archive 하위연산, GitHub write는 후속 inventory 확장 때 같은
 방식으로 추가한다.
