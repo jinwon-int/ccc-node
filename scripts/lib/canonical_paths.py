@@ -28,6 +28,7 @@ rewritten by the very transform it defines.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 import re
@@ -80,17 +81,49 @@ def rewrite_file(path: str | Path, pairs: dict[str, str]) -> bool:
     return True
 
 
+USAGE = (
+    "usage: canonical_paths.py <file> <old> <new> [<old> <new> ...]\n"
+    "       canonical_paths.py --files-from - <old> <new> [<old> <new> ...]"
+    "  (NUL-separated paths on stdin)"
+)
+
+
+def _pairs(rest: list[str]) -> dict[str, str]:
+    return {old: new for old, new in zip(rest[0::2], rest[1::2]) if old != new}
+
+
 def main(argv: list[str]) -> int:
-    # <file> <old> <new> [<old> <new> ...] — the shape setup.sh calls with.
+    # `--files-from -` (#1484): one interpreter for the whole install-time
+    # rewrite set. setup.sh used to start python3 once per target (~130 files
+    # on every non-canonical node, i.e. every Termux install). Files are
+    # processed in order and the first failure stops the run with exit 1 and
+    # the offending path on stderr — the same observable outcome as the old
+    # per-file loop under setup.sh's `set -e`: later files untouched, install
+    # aborted (and rolled back) at that point.
+    if argv[:2] == ["--files-from", "-"]:
+        rest = argv[2:]
+        if len(rest) < 2 or len(rest) % 2 == 1:
+            print(USAGE, file=sys.stderr)
+            return 2
+        pairs = _pairs(rest)
+        raw = sys.stdin.buffer.read()
+        for chunk in raw.split(b"\0"):
+            if not chunk:
+                continue
+            path = os.fsdecode(chunk)
+            try:
+                rewrite_file(path, pairs)
+            except Exception as exc:  # noqa: BLE001 - report the file, then stop
+                print(f"canonical_paths.py: {path}: {exc}", file=sys.stderr)
+                return 1
+        return 0
+    # <file> <old> <new> [<old> <new> ...] — the single-file shape (kept for
+    # compatibility with the tests and any out-of-tree caller).
     if len(argv) < 3 or len(argv) % 2 == 0:
-        print(
-            "usage: canonical_paths.py <file> <old> <new> [<old> <new> ...]",
-            file=sys.stderr,
-        )
+        print(USAGE, file=sys.stderr)
         return 2
     path, rest = argv[0], argv[1:]
-    pairs = {old: new for old, new in zip(rest[0::2], rest[1::2]) if old != new}
-    rewrite_file(path, pairs)
+    rewrite_file(path, _pairs(rest))
     return 0
 
 

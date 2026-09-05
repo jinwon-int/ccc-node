@@ -343,6 +343,8 @@ ok "scan: missing scanner still injects memory (fail-open) on both paths" \
 ok "scan: fail-open output does not depend on the path" '[ "$fo_serial" = "$fo_parallel" ]'
 ok "scan: parallel lanes leave no scratch directory behind" \
   '[ "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name "ccc-mem-scan.*" 2>/dev/null | wc -l)" = 0 ]'
+ok "pipeline: render pipeline leaves no scratch directory behind (#1484)" \
+  '[ "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name "ccc-mem-pipe.*" 2>/dev/null | wc -l)" = 0 ]'
 
 # --- Skill index injection (#1145) ---
 skills="$TMP/skills"; mkdir -p "$skills/gh-pr-flow" "$skills/no-frontmatter"
@@ -552,6 +554,58 @@ ok "detached-jobs: CCC_MEMORY_INJECT_DETACHED_JOBS=0 disables the block" \
 out="$(run_detached 'not json{{{')"
 ok "detached-jobs: a corrupt registry degrades to no block, not a failed hook" \
   '! grep -q "detached 작업 상태" <<<"$out" && grep -q "additionalContext" <<<"$out"'
+
+# --- #1484: single-process render pipeline ---------------------------------
+# The whole local-hot chain (budget/search/dedup/render) and the two evidence
+# blocks now run in ONE memory_render.py start. Count interpreter starts on the
+# critical path with a PATH shim, and pin the fallback: a tree whose
+# memory_render.py is missing must still inject the canonical blocks and the
+# evidence blocks through their own modules (the pre-#1484 fail-open shape).
+pipe_bin="$TMP/pipe-bin"; mkdir -p "$pipe_bin"
+cat > "$pipe_bin/python3" <<EOF
+#!/usr/bin/env bash
+printf 'py\n' >> "\${CCC_PY_COUNT:?}"
+exec "$(command -v python3)" "\$@"
+EOF
+chmod +x "$pipe_bin/python3"
+pipe_state="$TMP/pipe-state"; mkdir -p "$pipe_state"
+: > "$TMP/py-count"
+out="$(PATH="$pipe_bin:$PATH" CCC_PY_COUNT="$TMP/py-count" HOME="$TMP/home" CCC_STATE_DIR="$pipe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" \
+  CCC_MEMORY_TOOLS_DIR="$tools" CCC_EXTERNAL_WAIT_HOME="$ew" CCC_DETACHED_JOBS_REGISTRY="$djreg" \
+  CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 \
+  bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+# scan lanes (mem/resume/wiki) + pipeline + local-hot scan = 5; the fixture
+# search tool is a bash stub (no interpreter) and the tiny context is under the
+# final cap, so no limit-bytes start either.
+ok "pipeline: at most 5 python3 starts on the fixture critical path" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$TMP/py-count")" -le 5 ] && grep -q "Local hot memory result" <<<"$out"'
+ok "pipeline: timing line carries the pipeline stage next to the search lane" \
+  'jq -e ".stages | has(\"pipeline\") and has(\"search_local\") and has(\"render\")" "$pipe_state/memory-timing.jsonl" >/dev/null'
+
+nomod_hooks="$TMP/nomod-hooks"; mkdir -p "$nomod_hooks"
+cp -R "$ROOT/claude/hooks/." "$nomod_hooks/"
+rm -f "$nomod_hooks/lib/memory_render.py"
+printf '%s' '{"w1":{"wait_id":"w1","state":"monitoring","repo":"o/r","pr_number":77,"summary":"still owed"}}' > "$ew/waits.json"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_HOOK_DIR="$nomod_hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_EXTERNAL_WAIT_HOME="$ew" \
+  CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 \
+  bash "$nomod_hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "pipeline: missing memory_render.py still injects canonical blocks (fail-open)" \
+  '[ "$rc" = 0 ] && grep -q "Node memory: safe fact" <<<"$out" && grep -q "Cached wiki fact" <<<"$out" && ! grep -q "Traceback" <<<"$out"'
+ok "pipeline: missing memory_render.py leaves local hot memory empty, never a failed hook" \
+  'grep -q "local hot memory disabled or no hits" <<<"$out"'
+ok "pipeline: missing memory_render.py falls back to the promises module itself" \
+  'grep -q "o/r#77" <<<"$out"'
+rm -f "$ew/waits.json"
+
+# --- #1484: load-tools.sh honours CCC_HOOK_DIR like load-memory.sh -----------
+lt_hooks="$TMP/lt-hooks"; mkdir -p "$lt_hooks"
+printf 'LT_CHEATSHEET_SENTINEL\n' > "$lt_hooks/tools-cheatsheet.md"
+out="$(HOME="$TMP/home" CCC_HOOK_DIR="$lt_hooks" bash "$ROOT/claude/hooks/load-tools.sh" SessionStart 2>&1)"; rc=$?
+ok "load-tools: CCC_HOOK_DIR resolves the cheatsheet" '[ "$rc" = 0 ] && grep -q "LT_CHEATSHEET_SENTINEL" <<<"$out"'
+out="$(HOME="$TMP/home" bash "$ROOT/claude/hooks/load-tools.sh" SessionStart 2>&1)"
+ok "load-tools: default stays HOME/.claude/hooks" 'grep -q "cheatsheet missing: $TMP/home/.claude/hooks/tools-cheatsheet.md" <<<"$out"'
 
 
 echo "----"; echo "PASS=$pass FAIL=$fail"

@@ -24,8 +24,21 @@ if [ -z "$MAX_BYTES" ]; then
   if [ "$MODE" = "remote" ]; then MAX_BYTES="${CCC_MEMORY_REMOTE_QUERY_MAX_BYTES:-900}"; else MAX_BYTES="${CCC_MEMORY_LOCAL_QUERY_MAX_BYTES:-1400}"; fi
 fi
 
-read_file_trim() { [ -f "$1" ] && sed -n '1,40p' "$1" 2>/dev/null || true; }
-first_line_file() { [ -f "$1" ] && sed -n '1p' "$1" 2>/dev/null || true; }
+# Bash builtins instead of one sed fork per file (#1484): this runs on the
+# SessionStart critical path (load-memory.sh) and again from refresh-memory.sh.
+read_file_trim() { # first 40 lines (was: sed -n '1,40p')
+  local -a lines=()
+  [ -f "$1" ] || return 0
+  mapfile -t -n 40 lines 2>/dev/null < "$1" || return 0
+  [ "${#lines[@]}" -gt 0 ] && printf '%s\n' "${lines[@]}"
+  return 0
+}
+first_line_file() { # first line (was: sed -n '1p')
+  local line=""
+  [ -f "$1" ] || return 0
+  IFS= read -r line 2>/dev/null < "$1" || [ -n "$line" ] || return 0
+  printf '%s\n' "$line"
+}
 
 node_val="${CCC_NODE:-$(first_line_file "$STATE_DIR/node.txt")}"; [ -n "$node_val" ] || node_val="$(hostname -s 2>/dev/null || printf 'ccc-node')"
 cwd_val="${CCC_WORKTREE:-$(first_line_file "$STATE_DIR/cwd.txt")}"; [ -n "$cwd_val" ] || cwd_val="$(pwd 2>/dev/null || printf '')"
@@ -41,8 +54,66 @@ pr_val="${CCC_TASK_PR_URL:-${GITHUB_PR_URL:-}}"
 git_branch_val=""
 git_paths_val=""
 if [ -n "$cwd_val" ] && [ -d "$cwd_val/.git" ]; then
-  git_branch_val="$(git -C "$cwd_val" branch --show-current 2>/dev/null || true)"
-  git_paths_val="$(git -C "$cwd_val" status --short --untracked-files=no 2>/dev/null | sed -E 's/^...//' | sed -n '1,20p' | tr '\n' ' ' | cut -c1-400)"
+  # Git state with the same 5s TSV cache statusline.sh keeps (#1484): the key
+  # is the cwd with non-alphanumerics folded to `_` (last 200 chars), the TTL
+  # is EPOCHSECONDS-based. Two files under the shared cache dir:
+  #   <key>.tsv        statusline's  ts<TAB>branch<TAB>dirty(0|1)
+  #   <key>.query.tsv  this script's ts<TAB>branch<TAB>changed-paths
+  # A fresh statusline row with dirty=0 already proves there are no changed
+  # tracked paths, so it answers this script's question without a git fork; a
+  # dirty=1 row does not (it may be untracked files only), so that case falls
+  # through to this script's own row, then to git. Only the query row is
+  # written here: the porcelain output this script needs (--untracked-files=no)
+  # cannot produce statusline's dirty flag, so its row is never guessed at.
+  git_cache_dir="${CCC_GIT_STATUS_CACHE_DIR:-${HOME:-/root}/.claude/cache/git-status}"
+  git_cache_key="${cwd_val//[!a-zA-Z0-9]/_}"
+  [ "${#git_cache_key}" -gt 200 ] && git_cache_key="${git_cache_key:${#git_cache_key}-200}"
+  git_cache_ttl="${CCC_GIT_STATUS_CACHE_TTL:-5}"
+  case "$git_cache_ttl" in ''|*[!0-9]*) git_cache_ttl=5 ;; esac
+  git_now="${EPOCHSECONDS:-$(date +%s)}"
+  git_hit=0
+  git_cache_fresh() { # <ts>
+    case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$((git_now - $1))" -lt "$git_cache_ttl" ]
+  }
+  if [ -r "$git_cache_dir/$git_cache_key.query.tsv" ]; then
+    c_ts=""; c_br=""; c_paths=""
+    IFS=$'\t' read -r c_ts c_br c_paths 2>/dev/null < "$git_cache_dir/$git_cache_key.query.tsv" || true
+    if git_cache_fresh "$c_ts"; then
+      git_branch_val="$c_br"; git_paths_val="$c_paths"; git_hit=1
+    fi
+  fi
+  if [ "$git_hit" = 0 ] && [ -r "$git_cache_dir/$git_cache_key.tsv" ]; then
+    c_ts=""; c_br=""; c_dirty=""
+    IFS=$'\t' read -r c_ts c_br c_dirty 2>/dev/null < "$git_cache_dir/$git_cache_key.tsv" || true
+    if git_cache_fresh "$c_ts" && [ "$c_dirty" = "0" ]; then
+      git_branch_val="$c_br"; git_paths_val=""; git_hit=1
+    fi
+  fi
+  if [ "$git_hit" = 0 ]; then
+    git_branch_val="$(git -C "$cwd_val" branch --show-current 2>/dev/null || true)"
+    # Was: status --short | sed 's/^...//' | sed -n '1,20p' | tr '\n' ' ' | cut -c1-400
+    # — one builtin pass now (first 20 rows, strip the XY+space prefix, join
+    # with spaces, cap at 400 bytes like GNU cut -c).
+    git_status_lines=()
+    mapfile -t -n 20 git_status_lines < <(git -C "$cwd_val" status --short --untracked-files=no 2>/dev/null)
+    git_paths_val=""
+    for git_status_line in ${git_status_lines[@]+"${git_status_lines[@]}"}; do
+      git_paths_val+="${git_status_line:3} "
+    done
+    if [ -n "$git_paths_val" ]; then
+      git_paths_val="$(LC_ALL=C; printf '%s' "${git_paths_val:0:400}")"
+    fi
+    # Best-effort, atomic (tmp + mv): the query must never fail on cache I/O.
+    if mkdir -p "$git_cache_dir" 2>/dev/null; then
+      git_cache_tmp="$git_cache_dir/$git_cache_key.query.tsv.$$"
+      if printf '%s\t%s\t%s\n' "$git_now" "$git_branch_val" "$git_paths_val" > "$git_cache_tmp" 2>/dev/null; then
+        mv -f "$git_cache_tmp" "$git_cache_dir/$git_cache_key.query.tsv" 2>/dev/null || rm -f "$git_cache_tmp" 2>/dev/null
+      else
+        rm -f "$git_cache_tmp" 2>/dev/null
+      fi
+    fi
+  fi
 fi
 
 export CCC_QUERY_NODE="$node_val" CCC_QUERY_CWD="$cwd_val" CCC_QUERY_TASK="$task_val" \

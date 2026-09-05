@@ -1092,11 +1092,19 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ] || [ "$SRC" != "/opt/ccc-node" ]; then
     # files against these templates. While this was an inline heredoc, doctor
     # compared byte-exact and reported permanent phantom drift on every
     # non-canonical node (2026-07-30 fleet sweep).
+    # One interpreter for the whole set (#1484): the per-file loop started
+    # python3 ~130 times on every non-canonical node. `--files-from -` keeps
+    # the per-file semantics (first failure => exit 1 => set -e aborts here).
+    rewrite_batch=()
     for rewrite_file in "${rewrite_targets[@]}"; do
       [ -f "$rewrite_file" ] || continue
-      python3 "$SRC/scripts/lib/canonical_paths.py" "$rewrite_file" \
-        "/opt/ccc-node" "$SRC" "/root/.claude" "$CLAUDE_DIR"
+      rewrite_batch+=("$rewrite_file")
     done
+    if [ "${#rewrite_batch[@]}" -gt 0 ]; then
+      printf '%s\0' "${rewrite_batch[@]}" \
+        | python3 "$SRC/scripts/lib/canonical_paths.py" --files-from - \
+            "/opt/ccc-node" "$SRC" "/root/.claude" "$CLAUDE_DIR"
+    fi
     # Skill copies were hashed before this rewrite touched them — re-record so
     # the manifest matches the bytes on disk. Only the Claude tree needs it:
     # $PIRI_AGENT_DIR/skills is not in rewrite_targets, so those hashes stand.

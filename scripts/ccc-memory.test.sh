@@ -734,12 +734,64 @@ printf 'query-node\n' > "$query_state/node.txt"
 printf '%s\n' "$query_cwd" > "$query_state/cwd.txt"
 printf 'Implement issue 186 memory roadmap with Honcho cache TTL\n' > "$query_state/current-task.txt"
 ( cd "$query_cwd" && git init -q && git config user.email test@example.invalid && git config user.name test && printf 'x\n' > changed-memory-file.txt && git add changed-memory-file.txt && git commit -q -m init && printf 'changed\n' >> changed-memory-file.txt )
-out="$(CCC_STATE_DIR="$query_state" CCC_MEMORY_QUERY_EXTRA='Authorization: Bearer QUERY_SECRET_SHOULD_NOT_LEAK' bash "$ROOT/scripts/ccc-memory-query.sh" --mode remote 2>&1)"; rc=$?
+query_git_cache="$TMP/git-status-cache"
+out="$(CCC_STATE_DIR="$query_state" CCC_GIT_STATUS_CACHE_DIR="$query_git_cache" CCC_MEMORY_QUERY_EXTRA='Authorization: Bearer QUERY_SECRET_SHOULD_NOT_LEAK' bash "$ROOT/scripts/ccc-memory-query.sh" --mode remote 2>&1)"; rc=$?
 ok "memory query helper builds redacted task-aware query" '[ "$rc" = 0 ] && grep -q "issue 186" <<<"$out" && grep -q "changed-memory-file.txt" <<<"$out" && ! grep -q "QUERY_SECRET_SHOULD_NOT_LEAK" <<<"$out"'
+
+# --- #1484: git state reuses statusline.sh's 5s TSV cache ---------------------
+# The query runs on the SessionStart critical path and again from the detached
+# refresh; each paid two git forks. Count them with a PATH shim.
+query_git_bin="$TMP/query-git-bin"; mkdir -p "$query_git_bin"
+cat > "$query_git_bin/git" <<EOF
+#!/usr/bin/env bash
+printf 'git\n' >> "\${QUERY_GIT_COUNT:?}"
+exec "$(command -v git)" "\$@"
+EOF
+chmod +x "$query_git_bin/git"
+run_query_counted() { # [env...] — prints the query; git forks land in $QUERY_GIT_COUNT
+  PATH="$query_git_bin:$PATH" QUERY_GIT_COUNT="$TMP/query-git-count" CCC_STATE_DIR="$query_state" \
+    CCC_WORKTREE="$query_cwd" CCC_GIT_STATUS_CACHE_DIR="$query_git_cache" env "$@" \
+    bash "$ROOT/scripts/ccc-memory-query.sh" --mode local 2>/dev/null
+}
+query_key="${query_cwd//[!a-zA-Z0-9]/_}"
+rm -rf "$query_git_cache"; : > "$TMP/query-git-count"
+q_cold="$(run_query_counted CCC_GIT_STATUS_CACHE_TTL=5)"
+n_cold="$(wc -l < "$TMP/query-git-count")"
+ok "query: cold cache runs git and writes its own TSV row (ts, branch, paths)" \
+  '[ "$n_cold" = 2 ] && grep -q "git_changed_paths: changed-memory-file.txt" <<<"$q_cold" && [ "$(cut -f2 "$query_git_cache/$query_key.query.tsv")" = "$(git -C "$query_cwd" branch --show-current)" ] && grep -q "changed-memory-file.txt" "$query_git_cache/$query_key.query.tsv"'
+: > "$TMP/query-git-count"
+q_warm="$(run_query_counted CCC_GIT_STATUS_CACHE_TTL=5)"
+ok "query: a fresh own row answers with zero git forks and identical output" \
+  '[ "$(wc -l < "$TMP/query-git-count")" = 0 ] && [ "$q_warm" = "$q_cold" ]'
+# statusline.sh row: ts<TAB>branch<TAB>dirty. dirty=0 proves no changed paths.
+rm -rf "$query_git_cache"; mkdir -p "$query_git_cache"
+printf '%s\t%s\t%s\n' "$(date +%s)" "statusline-branch" "0" > "$query_git_cache/$query_key.tsv"
+: > "$TMP/query-git-count"
+q_sl="$(run_query_counted CCC_GIT_STATUS_CACHE_TTL=5)"
+ok "query: a fresh statusline row with dirty=0 is reused (branch, no paths, no git)" \
+  '[ "$(wc -l < "$TMP/query-git-count")" = 0 ] && grep -q "git_branch: statusline-branch" <<<"$q_sl" && ! grep -q "git_changed_paths" <<<"$q_sl"'
+printf '%s\t%s\t%s\n' "$(date +%s)" "statusline-branch" "1" > "$query_git_cache/$query_key.tsv"
+: > "$TMP/query-git-count"
+q_dirty="$(run_query_counted CCC_GIT_STATUS_CACHE_TTL=5)"
+ok "query: a dirty=1 statusline row cannot answer (may be untracked only) — git runs" \
+  '[ "$(wc -l < "$TMP/query-git-count")" = 2 ] && grep -q "git_changed_paths: changed-memory-file.txt" <<<"$q_dirty" && ! grep -q "statusline-branch" <<<"$q_dirty"'
+printf '%s\t%s\t%s\n' "$(( $(date +%s) - 60 ))" "stale-branch" "old-path" > "$query_git_cache/$query_key.query.tsv"
+: > "$TMP/query-git-count"
+q_stale="$(run_query_counted CCC_GIT_STATUS_CACHE_TTL=5)"
+ok "query: an expired own row is recomputed, not trusted" \
+  '[ "$(wc -l < "$TMP/query-git-count")" = 2 ] && ! grep -q "stale-branch\|old-path" <<<"$q_stale"'
+ok "query: cache write is atomic (no tmp leftovers)" \
+  '[ "$(find "$query_git_cache" -name "*.tsv.*" | wc -l)" = 0 ]'
+# Bash-builtin file reads replaced four sed forks; the rendered fields must not move.
+printf 'line1\nline2\n' > "$query_state/current-prompt.txt"
+q_files="$(CCC_STATE_DIR="$query_state" CCC_WORKTREE="$query_cwd" CCC_GIT_STATUS_CACHE_DIR="$query_git_cache" bash "$ROOT/scripts/ccc-memory-query.sh" --mode local 2>/dev/null)"
+ok "query: node/task/prompt fields still come from the first line / first 40 lines" \
+  'grep -q "^task: Implement issue 186" <<<"$q_files" && grep -q "prompt: line1 line2;" <<<"$q_files" && grep -q "node: query-node;" <<<"$q_files"'
+rm -f "$query_state/current-prompt.txt"
 
 printf 'Implement issue 186 memory roadmap with Honcho cache TTL and changed-memory-file context\n' > "$mem/MEMORY.md"
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild 2>&1)"; rc=$?
-helper_query="$(CCC_STATE_DIR="$query_state" CCC_WORKTREE="$query_cwd" bash "$ROOT/scripts/ccc-memory-query.sh" --mode local)"
+helper_query="$(CCC_STATE_DIR="$query_state" CCC_WORKTREE="$query_cwd" CCC_GIT_STATUS_CACHE_DIR="$query_git_cache" bash "$ROOT/scripts/ccc-memory-query.sh" --mode local)"
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" "$helper_query" 2>&1)"; rc=$?
 ok "memory search tolerates task-aware helper query punctuation" '[ "$rc" = 0 ] && jq -e "(.results | length) > 0 and (.tokens | index(\"honcho\") != null)" >/dev/null <<<"$out"'
 
