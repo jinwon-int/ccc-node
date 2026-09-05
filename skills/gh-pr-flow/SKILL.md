@@ -127,8 +127,11 @@ fresh explicit user approval in the current conversation, in both directions.
    fi
    ```
 
-   Pass `--ssh-target` explicitly (or export `CCC_RELAY_SSH_TARGET`) when the
-   credential-holding relay node's SSH alias differs from the helper default:
+   Both relay helpers (`approve-via-relay.sh`, `merge-via-relay.sh`) default
+   to `--ssh-target relay`. A node without a `relay` ssh alias must pass the
+   credential-holding node explicitly (or export `CCC_RELAY_SSH_TARGET`) —
+   observed 2026-09-05 on a node whose ssh config names the relay node by its
+   own hostname alias, not `relay`:
 
    ```bash
    head_sha="$(gh pr view <n> --repo <owner/repo> --json headRefOid --jq .headRefOid)"
@@ -226,6 +229,18 @@ fresh explicit user approval in the current conversation, in both directions.
      `202 Accepted` with `"Updating pull request branch."` — an async
      acknowledgement, not proof a commit was created — so confirm by comparing
      `headRefOid` before and after rather than trusting the success line.
+
+   **Several PRs under strict up-to-date protection.** Once one merges, every
+   sibling flips to `BEHIND`. Refresh each over REST — older `gh` builds have
+   no `gh pr update-branch` subcommand, the endpoint works on any build:
+
+   ```bash
+   gh api -X PUT repos/<owner>/<repo>/pulls/<n>/update-branch
+   ```
+
+   Then wait for CI on the new head and re-run the relay approval: approvals
+   are commit-bound to `--expected-head`, so the pre-refresh approval no
+   longer counts.
 
 7. Verify and clean up:
 

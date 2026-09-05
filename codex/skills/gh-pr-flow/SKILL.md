@@ -25,6 +25,12 @@ protection, or move a credential between nodes.
 4. Verify the merged commit and remote branch deletion before removing a local
    squash-merged branch.
 
+Under strict up-to-date protection, merging one PR flips its siblings to
+`BEHIND`. Refresh via REST (older `gh` builds lack `gh pr update-branch`):
+`gh api -X PUT repos/OWNER/REPO/pulls/NUMBER/update-branch`, wait for CI on
+the new head, then re-run the relay approval — it is commit-bound to
+`--expected-head`.
+
 ## Relay-held cross-account review
 
 Use the allowlisted review profile matching the PR author. Both directions
@@ -36,7 +42,10 @@ require fresh explicit approval for the exact repository, PR, and head:
 | `seoseo-ai` | `jinon86` | `jinon86` | root default gh config |
 
 `relay` below is the SSH alias of the credential-holding relay node in your
-fleet; pass `--ssh-target` explicitly or export `CCC_RELAY_SSH_TARGET`:
+fleet and the helper default; a node without that alias must pass
+`--ssh-target <relay-host-alias>` explicitly or export `CCC_RELAY_SSH_TARGET`
+(observed 2026-09-05 on a node whose ssh config names the relay node by its
+own hostname alias):
 
 ```bash
 CCC_EXPLICIT_USER_APPROVAL=1 \

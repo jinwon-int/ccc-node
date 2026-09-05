@@ -57,8 +57,127 @@ All notable changes to the Claude Code node harness. Dates are KST.
   pending-drain skips the probe and does not count unprobed locks. Both log
   the fallback once; `CCC_FLOCK_CLI` overrides the binary (install-nunchi
   style).
+- **bridge: spawned asyncio tasks keep a reference; session locks are pruned
+  on forget (#1479, #1486).** Three `asyncio.create_task` calls held no
+  reference (crush `_spawn_permission`, webhook-nudge `_accept_loop`,
+  project-chat durable-completion delivery), so a GC'd task could drop a
+  permission reply and stall a crush turn for good; each class now keeps a
+  task set with discard-on-done and `close()` cancels what is outstanding.
+  `ClaudeRuntime._session_locks` gained one UUID per `/new` and was never
+  popped; `_forget_session` drops the lock unless it is held or another live
+  session shares the id. A failed `permission_reply` logs a warning instead of
+  `pass`. `bridge/tests/test_task_refs.py` +10; details in
+  `bridge/CHANGELOG.md`.
+- **validate-harness: subdirectory hooks enter the referenced-hook checks
+  (#1476, #1485).** Checks 6/6a extracted hook paths with a character class
+  that excluded `/`, so `distill/pending-drain.sh` (SessionStart) and
+  `skill-review/curator-bump.sh` were silently skipped — and the `basename`
+  flattening would have mis-compared them anyway. The class now accepts `/`
+  (a `..` segment is reported as an error) and both loops compare the path
+  relative to the hook root, exactly what `ccc_hook_tree_files` emits.
+- **erasure recovery preserved; signed intake receipts retried (#1475).**
+  Lifecycle plans could omit cache/prune/user targets or repeat a default
+  path, and same-second erasure runs could overwrite an earlier recovery
+  copy: explicit inventory actions are honored within audience boundaries,
+  repeated primary paths are removed and conflicting actions rejected, per-run
+  backups are allocated under a shared lock, and a prepared recovery manifest
+  is persisted before deletion. A failed intake-receipt POST used to consume
+  the review permanently; delivery state is now persisted separately from
+  verdict consumption, older missing receipts are recovered, existing comments
+  are checked before a retry, and the retry window is bounded without
+  repeating revision dispatches. 19 new regression tests.
+- **nunchi: stale karellen→yukson persona alias dropped (#1472, #1473).**
+  Karellen became a separate external friend node on 2026-07-14, but the
+  B3-era `NODE_ALIASES` entry still normalized `"카렐렌"`/`"karellen"` to the
+  yukson slug and could mis-tag its facts. Observed facts keep the karellen
+  text as-is (regression case added); as a side effect the node leaves the
+  #1447 wiki-promote roster automatically. nunchi 157 PASS.
+- **skills-intake revise handler mirrors the review handler's agent defaults
+  (#1469).** The revise handler required `REVIEW_AGENT_BIN` strictly while
+  the review handler defaults to the node's `claude` CLI
+  (`-p --disallowed-tools *`), so an unconfigured node could review but not
+  revise; revise capability now tracks review capability everywhere.
+- **skill-promotion: broker routing gate binds ledger rows to the owning
+  broker (#1459).** A ledger row that claimed broker `t2` while the task
+  lived on the primary broker (pr104, 2026-09-03) polled the wrong broker
+  forever until an operator hand-edited it. `_broker_task_gated()` requires
+  the row's `broker_id` to match the task's `brokerOfRecord`, probes every
+  other configured broker once on a miss or contradiction
+  (`claimed` / `corrected:<name>` / `mismatch` / `missing`), a contradicted
+  row is consumed once as a visible `broker-mismatch` status + PR warning
+  instead of a silent drop, and dispatch reads the created task back and
+  refuses to append a row that points at the wrong broker. Promotion suite
+  74/0.
 
 ### Added
+- **skill-promotion: signed intake receipt projected on the PR at verdict
+  consumption (#1470, #1471).** The skills-intake review chain never emitted
+  the signed receipt that fleet-skills `policies/REVIEW.md` binds promotion
+  to, so the `a2a/receipts` commit status sat at failure on every open intake
+  PR. The review task result already carries full provenance (worker EdDSA
+  signature + broker countersignature); `_build_intake_receipt()` assembles
+  `task_id` / `head_sha` / lane / reviewer / author bindings plus the verbatim
+  signed result, and `_process_verdicts()` posts it as a ```json fence
+  (deduped by `receipt:<task_id>`) before the verdict comment. Verification
+  stays solely in the `a2a-receipts` workflow; results without provenance keep
+  the awaiting state. Promotion suite 75/0.
+- **memory: c-batch inventory classification — routine state/bot artifacts
+  (#1468 slice 1, #1474).** `schemas/memory-artifact-inventory.v1.json`
+  25→41: runtime locks and logs (pattern), installer records, the memory
+  lane, distill/self-update/watchdog/detached-job state, the hooks audit
+  (append-only), skill-autosave state + promotion queue, bot runtime state,
+  and `.env` / `memory-audience.key` (retain on every request — rotated
+  through the credential manager, never erased). The apply boundary's blocker
+  list is left with only the owner-policy groups. Read-only classification;
+  nothing is deleted. Planner suite 25 PASS.
+- **memory: human-review wiki queue classified in the inventory (#873,
+  #1467).** `wiki-candidates.md` (shared by distill `wiki-queue.sh` and the
+  #1447 batch) and its `.seen` ledger were unclassified and blocked apply on
+  every node: `distill.wiki_candidates_queue` (outbox; decommission =
+  external-handoff, drain-first) and `distill.wiki_candidates_seen` (delete,
+  TTL window). `.bak-*` copies stay deliberate blockers for the owner.
+- **skills-intake revise handler — the R2 auto-revision lane gets an
+  executor (#1460, #1466).** The dispatcher could send `skills_intake_revise`
+  tasks but no node ran them: the intent fell through to the generic handler
+  and was acked as success, which the collector consumed as `revise-invalid`
+  — a dispatch-only no-op since the lane shipped. New
+  `scripts/skills-intake-revise-handler.sh` validates the packet, runs the
+  node's tool-blocked agent (`REVIEW_AGENT_BIN` / `REVIEW_AGENT_ARGS`, packet
+  content is untrusted data) and binds the result node-side (`revised` needs
+  a change summary + bounded skillFiles; `drop_recommendation` needs a
+  reason; a contradicted skillName/sha is a handler failure, never a
+  revision). The dispatcher routes `skills-intake-revise` to it, a node
+  without the handler fails loudly (`revise-unsupported`) instead of acking,
+  and `install-a2a-review-handler.sh` ships it. Review-handler suite 33/0,
+  promotion 74/0. Nodes execute revisions only after the installer is re-run.
+- **memory: erasure handoff manifest writer — #873 step 5 (#1465).**
+  `scripts/ccc-erasure-handoff.py` writes a versioned, body-free
+  `erasure-handoff-<request>-<stamp>.json` + `.md` twin (0600) under the state
+  dir: external owners, operator decision rows, Wiki disposition proposals
+  (annotate by default), drain-first outbox depths, `nunchi-p3-8` promotion
+  markers, and an unsigned owner-ACK row — a REQUEST, never an action; the
+  node touches no Wiki/operator material. Schema
+  `schemas/erasure-handoff-manifest.v1.schema.json`; planner `scan` gains
+  `outbox_depths`, rendered by `ccc-security-audit.sh`;
+  `docs/erasure-closeout.md` documents the closeout order. 16 new cases.
+- **memory: approval-gated erasure apply boundary — #873 step 4 (#1464).**
+  `scripts/ccc-erasure-apply.py` (separate from the planner, whose
+  MUTATES-NOTHING contract stays structural) mutates only when four
+  fail-closed gates hold: the plan digest matches `--plan-digest` AND a live
+  re-plan in the same process; zero blockers; owner-only target + parent path
+  checks (symlinks refused); every pre-image copied with sha256 into an
+  owner-only backup dir before the first delete. v1 executes only file
+  targets whose action is exactly `delete`; other actions are reported as
+  skipped. Default is plan-only; `ERASURE_APPLY=1` arms it (per-node fresh
+  approval, #1270 precedent) and a body-free `manifest.json` records the
+  result. The inventory gains `extra_paths` and `kind=pattern` (16→22
+  artifacts). 23 new cases; planner +6.
+- **memory: wiki-promote ledgers registered in the artifact inventory
+  (#1447, #873, #1463).** `nunchi.wiki_promote_seen` (operational;
+  erasure/decommission = delete) and `nunchi.wiki_promote_audit` (append-only;
+  pseudonymize / retain) join `schemas/memory-artifact-inventory.v1.json`
+  (16→18) — the inventory delta the #1461 landing had left out — so planner
+  `scan` classifies both files on nodes running the batch.
 - **nunchi wiki-promote: weekly fleet-fact → wiki-candidates batch (#1447,
   #1264 P3-8).** Fleet-entity facts that live only in a node-local nunchi
   store have no reason to stay local (the Wiki is the single source of
