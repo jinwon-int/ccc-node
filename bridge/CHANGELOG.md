@@ -189,6 +189,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`BotConfigPort` is sliced by `Settings` section; the Codex turn-attempt
+  meter write leaves the event loop (#1509, precursor to #896).**
+  `core/bot_ports.py` now declares six per-section config slices —
+  `RuntimeDataConfigPort` (data dir / project root / token / CLI paths /
+  busy-notice threshold), `AccessControlConfigPort` (allowlist, tool policy,
+  restart hand-off), `HeartbeatConfigPort`, `MemoryConfigPort`
+  (`bridge_memory_mode`), `StreamingConfigPort` (bubble sizing, renderers,
+  option buttons) and `VoiceMediaConfigPort` (transcription + inbound media
+  caps) — and `BotConfigPort` is their intersection. Each mixin annotates
+  `_config` with only the slices it reads (a private per-mixin intersection
+  `Protocol`), while `TelegramBot` re-declares `_config: BotConfigPort` so
+  the composed class keeps one name and mypy accepts the narrower sibling
+  declarations. No behaviour or signature changes. Separately, the one meter
+  write #1498 deferred — `record_agent_turn_request`, which `CodexRuntime`
+  invokes synchronously once per accepted `turn/start` — is now wired
+  through `ProjectChatHandler._record_agent_turn_request`, a wrapper that
+  schedules the flock + rewrite via `_schedule_usage_write` behind the same
+  per-handler FIFO lock as the thread-usage recorder (so the request count
+  and the token deltas still land in issue order); the direct
+  `record_agent_turn_request` verb stays synchronous for its other callers.
+  Tests: `test_usage_meter_wiring.py` gains off-loop-thread / FIFO and
+  no-running-loop assertions for the turn-attempt seam.
+
 - **Bot mixins share one set of structural ports; MRO-shadowed queue methods
   are gone; the remaining `bot_commands` transcript scans leave the event loop
   (#1484, precursor to #896).** `core/bot_ports.py` is now the single home for

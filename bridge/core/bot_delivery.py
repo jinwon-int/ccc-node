@@ -37,11 +37,12 @@ from telegram_bot.core import ui
 from telegram_bot.core import paths as path_scope
 from telegram_bot.core.bot_shared import build_reply_context_prefix
 from telegram_bot.core.bot_ports import (
-    BotConfigPort,
     EnqueueUserTaskFn,
+    MemoryConfigPort,
     ProcessUserMessageTextFn,
     ProjectChatPort,
     SessionManagerPort,
+    StreamingConfigPort,
 )
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.tg_format import wrap_markdown_tables
@@ -68,8 +69,12 @@ class _SendContentArtifacts(Protocol):
     ) -> Awaitable[None]: ...
 
 
+class _DeliveryConfigPort(StreamingConfigPort, MemoryConfigPort, Protocol):
+    """Config slices this mixin reads (#1509): bubble sizing / renderers and ``bridge_memory_mode``."""
+
+
 class BotDeliveryMixin:
-    _config: BotConfigPort
+    _config: _DeliveryConfigPort
     _session_manager: SessionManagerPort
     _project_chat: ProjectChatPort
     _send_content_artifacts: _SendContentArtifacts

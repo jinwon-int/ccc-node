@@ -3,21 +3,29 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path as FilePath
-from typing import Any, Callable, Iterable, List, Optional
+from typing import Any, Callable, Iterable, List, Optional, Protocol
 
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from telegram import Update
 
 from telegram_bot.core import paths as path_scope
 from telegram_bot.core import tool_policy
-from telegram_bot.core.bot_ports import BotConfigPort, SessionManagerPort
+from telegram_bot.core.bot_ports import (
+    AccessControlConfigPort,
+    RuntimeDataConfigPort,
+    SessionManagerPort,
+)
 
 logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 
+class _AccessConfigPort(RuntimeDataConfigPort, AccessControlConfigPort, Protocol):
+    """Config slices this mixin reads (#1509): ``project_root`` and the allowlist / tool-policy fields."""
+
+
 class BotAccessMixin:
-    _config: BotConfigPort
+    _config: _AccessConfigPort
     _session_manager: SessionManagerPort
     _conversation_key: Callable[[int, int | None], Any]
     _ALLOW_OUTSIDE_ONCE_TOKEN: str

@@ -12,8 +12,14 @@ per mixin. The concrete objects are ``utils.config.Settings``,
 ``session.manager.SessionManager``, ``core.project_chat.ProjectChatHandler``
 and the ``time`` module, so grouping by collaborator makes it impossible for
 the same member to be declared twice with different shapes. The config port
-is the largest because ``Settings`` is one object; it is sectioned by concern
-so that #896 can slice it further if a mixin ever moves out of the bot.
+is the largest because ``Settings`` is one object; #1509 sliced it by the
+``Settings`` sections in ``utils/config.py`` (``RuntimeDataConfigPort``,
+``AccessControlConfigPort``, ``HeartbeatConfigPort``, ``MemoryConfigPort``,
+``StreamingConfigPort``, ``VoiceMediaConfigPort``) and ``BotConfigPort`` is
+their intersection, so a mixin annotates only the slices it reads while the
+composed ``TelegramBot`` keeps one name. mypy requires the composed class to
+re-declare ``_config: BotConfigPort`` because sibling bases may not declare
+one attribute with different (non-equivalent) types.
 
 Every signature below is derived from the concrete implementation, not from
 the old stubs. Bound-method ports (``ReplySmartFn`` etc.) describe methods the
@@ -61,16 +67,15 @@ from telegram_bot.core.usage_meter import MODE_INTERACTIVE, UsageMeter
 ConversationKey = int | str
 
 
-class BotConfigPort(Protocol):
-    """Attributes of the validated ``Settings`` object the bot mixins read directly.
+class RuntimeDataConfigPort(Protocol):
+    """``# Runtime data`` section of ``utils/config.py`` plus the identity
+    fields beside it (agent-provider CLI paths, ``# Telegram Bot`` token).
 
-    Members are typed exactly as their ``Field`` declarations in
-    ``utils/config.py`` and the ``settings_*`` sections it composes. Optional
-    attributes read through ``getattr(self._config, ..., default)`` are not
-    required to appear here.
+    Read by every mixin that touches the data directory or project root;
+    ``busy_notice_min_elapsed_seconds`` is the composed bot's own read in
+    ``bot.py`` (validated ``Settings`` always carries the Field).
     """
 
-    # --- paths / identity -------------------------------------------------
     @property
     def bot_data_dir(self) -> Path: ...
 
@@ -89,7 +94,14 @@ class BotConfigPort(Protocol):
     @property
     def piri_cli_path(self) -> str: ...
 
-    # --- access control ----------------------------------------------------
+    @property
+    def busy_notice_min_elapsed_seconds(self) -> float: ...
+
+
+class AccessControlConfigPort(Protocol):
+    """``# Access Control`` section: allowlist, tool policy and the restart
+    hand-off fields declared alongside them."""
+
     @property
     def allowed_user_ids(self) -> Sequence[int]: ...
 
@@ -102,12 +114,15 @@ class BotConfigPort(Protocol):
     @property
     def bash_policy(self) -> str: ...
 
-    # --- lifecycle / restart ----------------------------------------------
     @property
     def restart_service_unit(self) -> str: ...
 
     @property
     def restart_delay_seconds(self) -> int: ...
+
+
+class HeartbeatConfigPort(Protocol):
+    """``HeartbeatSettingsMixin`` (``utils/settings_heartbeat.py``)."""
 
     @property
     def heartbeat_store_path(self) -> Optional[Path]: ...
@@ -115,9 +130,16 @@ class BotConfigPort(Protocol):
     @property
     def heartbeat_delete_on_done(self) -> bool: ...
 
-    # --- delivery / rendering ---------------------------------------------
+
+class MemoryConfigPort(Protocol):
+    """``MemorySettingsMixin`` (``utils/settings_memory.py``)."""
+
     @property
     def bridge_memory_mode(self) -> Literal["off", "curated", "audience-scoped"]: ...
+
+
+class StreamingConfigPort(Protocol):
+    """``# Streaming configuration`` section: bubble sizing and renderers."""
 
     @property
     def telegram_max_bubble_chars(self) -> int: ...
@@ -136,6 +158,11 @@ class BotConfigPort(Protocol):
 
     @property
     def enable_option_buttons(self) -> bool: ...
+
+
+class VoiceMediaConfigPort(Protocol):
+    """``VoiceSettingsMixin`` (``utils/settings_voice.py``) plus the inbound
+    media caps (``# Inbound documents`` and the image context guard fields)."""
 
     # --- inbound media -----------------------------------------------------
     @property
@@ -225,6 +252,26 @@ class BotConfigPort(Protocol):
 
     @property
     def volcengine_max_poll_seconds(self) -> float: ...
+
+
+class BotConfigPort(
+    RuntimeDataConfigPort,
+    AccessControlConfigPort,
+    HeartbeatConfigPort,
+    MemoryConfigPort,
+    StreamingConfigPort,
+    VoiceMediaConfigPort,
+    Protocol,
+):
+    """Attributes of the validated ``Settings`` object the bot mixins read directly.
+
+    The intersection of the per-section slices above (#1509): ``TelegramBot``
+    declares ``_config`` with this one name, while each mixin annotates the
+    narrower slices it actually reads. Members are typed exactly as their
+    ``Field`` declarations in ``utils/config.py`` and the ``settings_*``
+    sections it composes. Optional attributes read through
+    ``getattr(self._config, ..., default)`` are not required to appear here.
+    """
 
 
 class SessionManagerPort(Protocol):

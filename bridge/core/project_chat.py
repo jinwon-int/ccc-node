@@ -335,8 +335,11 @@ class ProjectChatHandler(
             if callable(set_turn_attempt_recorder):
                 # The runtime invokes this at its spend boundary (provider
                 # accepted turn/start), so cancelled-before-first-event turns
-                # still count and pre-boundary failures charge nothing.
-                set_turn_attempt_recorder(self.record_agent_turn_request)
+                # still count and pre-boundary failures charge nothing. Like
+                # the usage recorder it is called synchronously from the
+                # runtime, so the wrapper schedules the write off the loop
+                # thread behind the same FIFO lock (#1509).
+                set_turn_attempt_recorder(self._record_agent_turn_request)
         logger.info(f"ProjectChatHandler initialized for {self.project_root}")
 
     @property
@@ -795,6 +798,21 @@ class ProjectChatHandler(
             meter.record_codex_thread_usage, thread_id, previous, current
         )
 
+    def _record_agent_turn_request(self) -> None:
+        """Runtime turn-attempt seam: offloaded, FIFO-ordered request count.
+
+        ``CodexRuntime._record_turn_attempt`` calls this synchronously once per
+        accepted ``turn/start``; scheduling the write keeps the flock + rewrite
+        off the event loop, and the shared lock keeps it in issue order with
+        the thread-usage deltas (#1509, completes #1498).
+        """
+
+        meter = self._usage_meter
+        if meter is None:
+            return
+        provider = getattr(self._config, "agent_provider", "claude")
+        self._schedule_usage_write(meter.record, provider, MODE_INTERACTIVE, requests=1)
+
     def _meter_claude_tokens(self, delta: Tuple[int, int], mode: str = MODE_INTERACTIVE) -> None:
         if self._usage_meter is None:
             return
@@ -809,7 +827,11 @@ class ProjectChatHandler(
             logger.exception("Claude usage metering failed; turn continues")
 
     def record_agent_turn_request(self) -> None:
-        """Count one completed interactive agent-runtime turn, fail-open."""
+        """Count one completed interactive agent-runtime turn, fail-open.
+
+        Synchronous, inline write for direct callers; the runtime seam goes
+        through :meth:`_record_agent_turn_request` instead.
+        """
 
         if self._usage_meter is None:
             return

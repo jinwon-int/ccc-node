@@ -20,9 +20,11 @@ from telegram_bot.core import crash_policy, media
 from telegram_bot.core import restart_handoff
 from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control
 from telegram_bot.core.bot_ports import (
-    BotConfigPort,
+    AccessControlConfigPort,
     ClockPort,
+    HeartbeatConfigPort,
     ProjectChatPort,
+    RuntimeDataConfigPort,
     SessionManagerPort,
 )
 from telegram_bot.core.tool_policy import (
@@ -167,8 +169,14 @@ class _DeliverMarkdown(Protocol):
     ) -> None: ...
 
 
+class _LifecycleConfigPort(
+    RuntimeDataConfigPort, AccessControlConfigPort, HeartbeatConfigPort, Protocol
+):
+    """Config slices this mixin reads (#1509): paths / token / CLI paths, tool policy, heartbeat store."""
+
+
 class BotLifecycleMixin:
-    _config: BotConfigPort
+    _config: _LifecycleConfigPort
     _session_manager: SessionManagerPort
     _project_chat: ProjectChatPort
     _distill_journal: _LifecycleDistillJournal

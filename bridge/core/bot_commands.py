@@ -51,12 +51,14 @@ from telegram_bot.core.project_chat_types import (
 )
 from telegram_bot.core.task_queue import UserTaskQueue
 from telegram_bot.core.bot_ports import (
-    BotConfigPort,
+    AccessControlConfigPort,
     ClearUserQueueFn,
     ClockPort,
     EnqueueUserTaskFn,
+    MemoryConfigPort,
     ProjectChatPort,
     ReplySmartFn,
+    RuntimeDataConfigPort,
     SessionManagerPort,
 )
 from telegram_bot.core.usage import UsageSnapshot, render_usage
@@ -141,8 +143,14 @@ class _CommandDistillLocalSinkWorker(Protocol):
     ) -> None: ...
 
 
+class _CommandConfigPort(
+    RuntimeDataConfigPort, AccessControlConfigPort, MemoryConfigPort, Protocol
+):
+    """Config slices this mixin reads (#1509): data dir / settings path, restart hand-off + allowlist, memory mode."""
+
+
 class BotCommandMixin:
-    _config: BotConfigPort
+    _config: _CommandConfigPort
     _session_manager: SessionManagerPort
     _project_chat: ProjectChatPort
     _require_application: Callable[
