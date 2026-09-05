@@ -9,13 +9,17 @@ import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
 
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
-from telegram_bot.core.bot_ports import BotConfigPort, ProjectChatPort
+from telegram_bot.core.bot_ports import (
+    AccessControlConfigPort,
+    ProjectChatPort,
+    RuntimeDataConfigPort,
+)
 from telegram_bot.core.approval_audit import (
     ApprovalAuditDecision,
     ApprovalAuditLedger,
@@ -87,10 +91,14 @@ class _PendingCodexApproval:
     terminal_audit_recorded: bool = False
 
 
+class _ApprovalConfigPort(RuntimeDataConfigPort, AccessControlConfigPort, Protocol):
+    """Config slices this mixin reads (#1509): ``bot_data_dir`` and ``allowed_user_ids``."""
+
+
 class BotApprovalMixin:
     """Manage bounded, one-shot approval tokens without exposing request data."""
 
-    _config: BotConfigPort
+    _config: _ApprovalConfigPort
     _project_chat: ProjectChatPort
     _pending_codex_approvals: dict[str, _PendingCodexApproval]
     _active_codex_approval_fingerprints: dict[

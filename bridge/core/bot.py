@@ -70,6 +70,7 @@ from telegram_bot.core.bot_delivery import BotDeliveryMixin
 from telegram_bot.core.bot_voice import BotVoiceMixin
 from telegram_bot.core.bot_approvals import BotApprovalMixin
 from telegram_bot.core.bot_callbacks import BotCallbackMixin
+from telegram_bot.core.bot_ports import BotConfigPort
 
 
 class TelegramBot(
@@ -83,6 +84,10 @@ class TelegramBot(
     BotVoiceMixin,
     BotApprovalMixin,
 ):
+    # The intersection of the per-section config slices (#1509). mypy requires
+    # the composed class to re-declare the attribute because sibling mixins
+    # annotate ``_config`` with different (narrower) slices.
+    _config: BotConfigPort
 
     def __init__(
         self,

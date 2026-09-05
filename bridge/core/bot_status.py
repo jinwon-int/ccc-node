@@ -1,9 +1,9 @@
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 import telegram.error
 
-from telegram_bot.core.bot_ports import BotConfigPort
+from telegram_bot.core.bot_ports import HeartbeatConfigPort, RuntimeDataConfigPort
 from telegram_bot.utils.heartbeat_store import (
     discard_heartbeat,
     record_heartbeat,
@@ -13,8 +13,12 @@ from telegram_bot.utils.heartbeat_store import (
 logger = logging.getLogger(__name__)
 
 
+class _StatusConfigPort(RuntimeDataConfigPort, HeartbeatConfigPort, Protocol):
+    """Config slices this mixin reads (#1509): ``bot_data_dir`` and the heartbeat store fields."""
+
+
 class BotStatusMixin:
-    _config: BotConfigPort
+    _config: _StatusConfigPort
 
     def _heartbeat_store_path(self):
         """Resolve the heartbeat id registry path, or None when unavailable."""
