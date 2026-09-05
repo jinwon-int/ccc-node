@@ -4,6 +4,23 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- **CI: `validate-harness` hook tests are sharded across a 4-way matrix
+  (#1482).** The job ran 15m42s on main (run 33930573500) and was the sole
+  critical path — 14m33s of it the sequential hook-test loop (setup.test.sh
+  alone 189 s + 185 s under umask 0002). `scripts/validate-harness.sh` gains
+  an opt-in env interface: `CCC_HARNESS_PHASE=static|hook-tests`,
+  `CCC_HARNESS_SHARD=<i>/<n>` (deterministic greedy bin-packing by a small
+  weight table so the heavy suites land on different shards; the umask-0002
+  re-runs are part of the same work list) and `CCC_HARNESS_LIST_ONLY=1`
+  (print the assignment, exit 0). With nothing set the script is the same
+  single full run as before. `ci.yml` now has `validate-harness-static`
+  (non-test phases, once), a `validate-harness-shard (1..4)` matrix, and a
+  `validate-harness` aggregator (`needs` both, `if: always()`, fails unless
+  every leg succeeded) so the required-check context keeps its name and
+  `.github/required-checks.json` is untouched. Expected wall time ~4-5 min
+  instead of ~16.
+
 ### Fixed
 - **tunnel-audit: ufw is read through `sudo -n` when the probe runs as a
   non-root user (#1434).** The fleet ssh lands on gongmyoung's harness user,
