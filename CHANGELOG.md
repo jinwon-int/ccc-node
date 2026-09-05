@@ -5,6 +5,99 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- **SessionStart memory render is one Python process; setup's canonical-path
+  rewrite is one call (#1484, #1504).** `load-memory.sh` drove the memory
+  pipeline as four `memory_render.py` subcommands around bash parallel lanes
+  (`sleep 0.05` polling, mktemp search dirs); a new `pipeline` subcommand does
+  dynamic-budget → bounded search lanes (threads under one global deadline) →
+  merge → filter → dedup → render + promises/detached blocks in a single
+  process, and the final `limit-bytes` pass only spawns when the cap is
+  exceeded (`scan-injection.sh` stays its own spawn — it is a security
+  boundary). `ccc-memory-query.sh` reuses the statusline's 5 s git-state TSV
+  cache (dirty=0 → no git call) and replaces its sed/tr/cut chains with
+  builtins; `refresh-memory.sh` takes `now_ms` from `EPOCHREALTIME` (python
+  fallback) and writes `.status.json` through tmp + `mv -f`.
+  `scripts/lib/canonical_paths.py` gains `--files-from -` (NUL-separated), so
+  `setup.sh` rewrites the install tree in one call instead of one interpreter
+  per file. Measured (12 cores, live-copy fixture, median of 5 interleaved
+  runs): python3 execve on the SessionStart critical path 14 → 8, total execve
+  51 → 40 (38 warm), total_ms 539 → 367 (340 warm), dynamic_budget 39 → 12 ms,
+  render 76 → 39 ms; `additionalContext` byte-identical in all 5 pairs.
+  `setup.sh` (real install, non-canonical HOME): python3 132 → 7, exec
+  751 → 627, install tree 127/127 identical. 17 suites FAIL=0; pytest
+  8 + 103 passed.
+- **scripts: fs/lock/time helpers consolidated into `ccc_secure_fs`
+  (#1484, #1503).** The UTC-now, bounded-int-env, owner-only read, JSONL
+  read/append, atomic-replace and flock helpers copied across
+  `ccc-skill-promotion.py`, `ccc_doctor.py`, `agent_cron*.py`,
+  `ccc_codex_memory.py` and `ccc_memory_probe.py` now live once in
+  `bridge/utils/secure_fs.py` (installed verbatim as
+  `~/.claude/hooks/ccc_secure_fs.py`; `scripts/ccc_secure_fs.py` re-exports):
+  `utc_now_iso`, `bounded_int_env`, `read_owner_only_bytes`,
+  `parse_jsonl_rows` / `read_jsonl_rows`, `json_line` / `append_jsonl_line`,
+  `atomic_write_bytes/text`, `open_lock_descriptor` / `acquire_flock` /
+  `flock_guard`. Every call site keeps its error codes, exit codes, on-disk
+  formats and modes; the divergences all point the fail-closed way
+  (`O_NOFOLLOW` on the promotion lock/ledger and the agent-cron store lock, a
+  short-write loop on ledger appends, fd re-check on drop-state reads,
+  `O_CLOEXEC` on the codex-memory lock, agent-cron `write_doc` temp created
+  0600 instead of umask-then-chmod). Hook-side Python (`ownership.py`,
+  `curator.py`, nunchi) keeps its private copies — `hooks/lib/` has no import
+  convention yet. The #1477 promotion-lock test wait is a bounded 30 s poll
+  that fails loudly. `test_secure_fs_module.py` +14; consumer scripts
+  +86 / −272 LOC.
+- **validate-harness: suites, py_compile and shellcheck scope are discovered
+  from `git ls-files` + markers; the hand-maintained lists are gone
+  (#1484, #1502).** `discover_plan()` replaces four arrays: every tracked
+  `*.test.sh` is a suite (minus `HARNESS_EXCLUDE`, empty — the old 109-entry
+  list was byte-for-byte the tracked set; no shebang / stale exclude / no git /
+  zero suites all FAIL), the umask-0002 re-run set is the suites whose header
+  comment carries `# harness: umask-rerun` (marker added to the same 10),
+  py_compile covers every tracked `*.py` outside `bridge/` (20 → 91;
+  `bridge/runtime_config_check.py` is covered by the bridge pytest matrix),
+  and warning-level shellcheck covers every tracked `*.sh` plus
+  `scripts/git-hooks/managed-checkout-guard` (25 → 132) minus a 91-entry
+  `SC_WARN_BASELINE` ratchet — a baseline entry that becomes clean, or goes
+  stale, fails the run, and new scripts are never added to it. `--dump-plan`
+  prints the plan (`suite` / `umask-rerun` / `py_compile` /
+  `shellcheck-warning`). Equivalence vs the old script in the same tree: suite
+  set 109 = 109, umask 10 = 10, `LIST_ONLY` n=1 identical (119 runs, est.
+  857 s), n=4 shard counts/loads/union identical (per-shard membership shifts
+  because LPT ties now break in index order; the heavy suites still land
+  apart). The #1482/#1488 shard interface is untouched; contributor rules in
+  `docs/ci-governance.md`. `validate-harness.test.sh` 32 → 45.
+- **bridge: one `bot_ports` Protocol set; MRO-shadowed queue methods dropped;
+  `bot_commands` history scans offloaded; config-default drift aligned
+  (#1484, #1500).** The seven per-mixin Protocol copies (21 classes) had
+  drifted from the objects `TelegramBot.__init__` injects; `core/bot_ports.py`
+  declares each once with its concrete signature.
+  `BotCommandMixin._enqueue_user_task` / `_clear_user_queue`, which the MRO
+  always resolved to `BotFollowupQueueMixin`, are removed rather than kept as
+  dead code. The
+  `/resume` and `/history` transcript scans deferred by #1498 go through
+  `asyncio.to_thread`; the `busy_notice_min_elapsed_seconds` literal fallback
+  is gone and the streaming bubble-size stub fallback is 1200 like the
+  `Settings` default. +122 / −483; bridge 2764 passed. Details in
+  `bridge/CHANGELOG.md`.
+- **bridge: usage-meter writes, no-op session `update()` and the
+  last-assistant transcript read leave the event loop (#1479, #1498).**
+  `UsageMeter.record()` (flock + reload + atomic rewrite) is awaited through
+  `asyncio.to_thread` under a per-handler FIFO lock (the Codex per-thread
+  baseline is a non-commutative read-modify-write); `SessionStore.update()`
+  skips the four fsyncs when nothing changed;
+  `get_session_last_assistant_message` reads the transcript tail-first in
+  64 KiB blocks — on a 15.1 MB / 24,001-line synthetic transcript: 1 read,
+  65,536 bytes (0.43%), 0.27 ms vs 107.4 ms for the forward scan, same
+  result. Bridge 2764 passed (+10). Details in `bridge/CHANGELOG.md`.
+- **bridge: ledger and active-turn fsync writes leave the event loop; ANSI
+  regex hoisted (#1479, #1493).** `_ledger_create` / `_project_request_phase`
+  / `_ledger_finish` run through `asyncio.to_thread` under a per-handler lock
+  so projections land in issue order; `publish_active_turn` moved out of
+  `_session_guard_lock` (its critical section no longer contains disk I/O)
+  and both route writes are shielded so a `/stop` mid-publish cannot let the
+  `finally` clear overtake the publish and leave a stale 6 h route.
+  `RequestProgressCoordinator.start` became async. 5 new tests; bridge 2754
+  passed. Details in `bridge/CHANGELOG.md`.
 - **CI: `validate-harness` hook tests are sharded across a 4-way matrix
   (#1482).** The job ran 15m42s on main (run 33930573500) and was the sole
   critical path — 14m33s of it the sequential hook-test loop (setup.test.sh
@@ -22,6 +115,60 @@ All notable changes to the Claude Code node harness. Dates are KST.
   instead of ~16.
 
 ### Fixed
+- **shell: atomic bridge token lock; Termux-safe checkout owner guard;
+  manifest + prune for `commands/` and `output-styles/` (#1480 items 2, 4, 5;
+  #1499).** `bridge/start.sh` took its token lock as read + `kill -0` +
+  `printf >`, so two concurrent `start.sh -d` both passed;
+  `acquire_token_lock` now tries `flock -n` on fd 8 (held for the process
+  lifetime, so the bot is the holder after `exec python`), then python
+  `fcntl.flock` on the same inherited fd, then the #1487 mkdir claim with a
+  sole-reclaimer token (the concurrent stale-reclaim race the test reproduced).
+  The lock-file format is unchanged, so `--status/--stop`, `health.py` and
+  `service-launchd.sh` keep their contract; `prepare_runtime`'s `cd` failure
+  is no longer ignored (SC2164). `setup.sh` hardcoded `/usr/bin/stat` and
+  `/usr/bin/id`, so on Termux (no `/usr`) the checkout owner guard compared
+  empty strings and silently passed; `_ccc_sysbin` searches
+  `/usr/bin /bin ${PREFIX}/bin` (PATH is not trusted) and an unresolved binary
+  is a noted skip. `commands/` and `output-styles/` were plain `cp` with no
+  prune; they now go through `install_repo_files_into` (per-file
+  `atomic_install`, `state/repo-{commands,output-styles}.manifest`, prune of
+  previous-manifest entries only — modified files are kept with a note,
+  node-local files untouched). start-lib 58, service-install 124, setup 171,
+  unittest 43. Termux not verified on a device.
+- **skill-review ownership: a torn ledger tail is reported, not fail-closed;
+  `Path.home()` defaults (#1481 items 3, 5; #1497).** `_read_ledger` raised
+  `ownership_ledger_invalid` on any parse error, so a crash mid-append left
+  every later ledger-reading command failing closed for good. Rows are always
+  newline-terminated in one `os.write`, so bytes after the last `\n` can only
+  be a torn write: the read skips the fragment and reports
+  `ownership_ledger_torn_tail=1` (JSON report + stderr); any other bad line
+  (mid-file, newline-terminated non-JSON, non-object row) still fails closed;
+  `_append_ledger` truncates the fragment under an exclusive `flock` before
+  writing (`ownership_ledger_torn_tail_repaired=1`). The hardcoded `/root`
+  HOME default in `ownership.py`, `ccc-skill-promotion.py` and
+  `ccc_memory_probe.py` is `Path.home()`. `ownership.test.sh` +11 (70/0).
+  Item 4 (auto-distill atomic AUTO.md/watermark writes) is parked pending a
+  receipt refresh — the exact-source SHA pinned by `evaluation-receipt.json`
+  would move.
+- **nunchi: sqlite busy timeout + WAL (opt-out), atomic snapshot/health
+  writes, index-driven session scope, single-pass transcript (#1478,
+  #1494).** `sqlite3.connect` had no busy timeout, `ingest` held one write
+  transaction across its whole loop, and `sessionstart.sh` launches
+  `snapshot` concurrently — "database is locked" was caught nowhere, so the
+  SessionStart-side snapshot/assemble died. Connections open with a 10 s
+  timeout (`NUNCHI_SQLITE_TIMEOUT`) and `journal_mode=WAL`
+  (`NUNCHI_SQLITE_JOURNAL=delete` opts a node out and reverts an already-WAL
+  DB; unverified on Termux/FUSE storage); `snapshot`/`assemble` bound the TTL
+  sweep (`NUNCHI_SQLITE_SWEEP_TIMEOUT_MS`, 1000) and continue read-only on
+  contention; ingest commits per item. `snapshot.md` and
+  `backend-health.json` are written tmp + fsync + `os.replace` (health under
+  a `flock` sidecar; both now 0600). `observed LIKE 'session:%'` could not
+  use an index; a range predicate plus the new
+  `idx_observed(observed, valid_to)` gives `MULTI-INDEX OR` instead of
+  `SCAN peer_facts`; each ingest scope is loaded and tokenised once
+  (`_OpenPool`) and the transcript is hashed and read in one pass. Outputs
+  and rows identical to the old module on a multi-session fixture. nunchi
+  157 → 172 PASS.
 - **doctor: every subprocess is bounded by a timeout; `--fix --apply` writes
   settings.json and hooks atomically (#1481).** `harness_version` (the
   `ccc-version.sh` and `git describe` probes) and the six `tar` backup /
@@ -110,6 +257,27 @@ All notable changes to the Claude Code node harness. Dates are KST.
   74/0.
 
 ### Added
+- **CI: weekly lock-pair regeneration workflow; Dependabot pip version PRs
+  disabled (#1483, #1496).** `.github/requirements/bridge-ci.txt` and
+  `bridge/requirements.lock.txt` are one hash-lock pair that
+  `scripts/ccc-deps-lock.sh` derives from `bridge/pyproject.toml`; Dependabot
+  cannot run that derivation and its groups do not span directories, so every
+  Dependabot pip PR (#1453–#1457, #1495) moved a pin in one lock only and
+  failed `test_runtime_deps_lock` / `python-lint` / `wheel-smoke`. New
+  `deps-lock.yml` (Mondays 04:17 UTC + `workflow_dispatch` with an optional
+  `upgrade` package list) runs `scripts/ccc-deps-lock-pr.sh`: regenerate,
+  commit the lock set on `deps/lock-pair-<YYYYMMDD>`, open-or-update the PR
+  with a per-package pin table, close older `deps/lock-pair-*` PRs as
+  superseded, then `gh workflow run ci.yml` / `codeql.yml` on the branch —
+  `workflow_dispatch` runs triggered with `GITHUB_TOKEN` do create check runs
+  under the same job names, so every `.github/required-checks.json` context
+  still gates the bot PR with no PAT or App. `ci.yml` gains
+  `workflow_dispatch:`; `ccc-deps-lock.sh` gains `--upgrade` and re-pins
+  `bridge/requirements.txt` to the regenerated runtime lock;
+  `dependabot.yml` pip `open-pull-requests-limit: 0` (security updates keep
+  their config; `github-actions` unchanged). Requires "Allow GitHub Actions
+  to create and approve pull requests" in the repository settings.
+  `ccc-deps-lock-pr.test.sh` 43/0; new section in `docs/ci-governance.md`.
 - **skill-promotion: signed intake receipt projected on the PR at verdict
   consumption (#1470, #1471).** The skills-intake review chain never emitted
   the signed receipt that fleet-skills `policies/REVIEW.md` binds promotion
