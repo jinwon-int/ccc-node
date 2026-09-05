@@ -670,8 +670,12 @@ ok "non-success fleet signals produce bounded allowlist-only owner/chat alert ti
   '[ "$rc" = 0 ] && jq -e ".payloads == 2 and (.title | contains(\"DOWN=2 UNREACHABLE=1 DRIFT=2 BOOTPATH=1\"))" <<<"$out" >/dev/null'
 
 ISOLATED="$TMP/redaction-unavailable"
-mkdir -p "$ISOLATED/scripts"
+mkdir -p "$ISOLATED/scripts" "$ISOLATED/bridge/utils"
 cp "$ROOT/scripts"/agent_cron*.py "$ISOLATED/scripts/"
+# agent_cron imports its sibling ccc_secure_fs adapter (#1484), which loads
+# bridge/utils/secure_fs.py; ship both so only redaction.py is absent here.
+cp "$ROOT/scripts/ccc_secure_fs.py" "$ISOLATED/scripts/"
+cp "$ROOT/bridge/utils/secure_fs.py" "$ISOLATED/bridge/utils/"
 out="$(python3 - "$ISOLATED" "$TMP/redaction-unavailable-spool" <<'PY'
 import importlib.util
 import json
