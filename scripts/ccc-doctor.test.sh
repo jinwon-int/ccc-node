@@ -264,8 +264,52 @@ out="$(PATH="$backup_fail/bin:$PATH" CCC_DOCTOR_REPO_DIR="$backup_fail/repo" CCC
 settings_after="$(cat "$backup_fail/home/.claude/settings.json")"
 ok "--fix --apply fails closed when backup tar validation fails" '[ "$rc" = 1 ] && grep -q "failed to create valid settings backup" <<<"$out" && [ "$settings_before" = "$settings_after" ]'
 
+# --- #1481: every subprocess is bounded; --fix writes are atomic -------------
+# A hung `git describe` (stale index lock, credential helper waiting on a tty)
+# used to hang the whole diagnosis, and doctor runs under cron/self-update where
+# nothing kills it. The shim exec's into sleep so the killed child IS the sleeper
+# (no orphaned grandchild holding the stdout pipe open past the bound).
+hang="$(make_fixture hang standalone)"
+mkdir -p "$hang/bin"
+printf '#!/usr/bin/env bash\nexec sleep 20\n' > "$hang/bin/git"
+chmod +x "$hang/bin/git"
+hang_start="$(date +%s)"
+out="$(PATH="$hang/bin:$PATH" CCC_DOCTOR_SUBPROCESS_TIMEOUT=0.3 run_doctor "$hang" 2>&1)"; rc=$?
+hang_elapsed=$(( $(date +%s) - hang_start ))
+ok "hung git describe is bounded, not a hang" '[ "$hang_elapsed" -lt 10 ]'
+ok "bounded git describe reports a timeout diagnostic, exit code unchanged" \
+  '[ "$rc" = 0 ] && grep -q "harness version: .unknown (timed out)." <<<"$out" && grep -q "git describe timed out after 0.3s" <<<"$out"'
+
+# The same bound covers the backup tar under --fix --apply: a timeout is a
+# failed backup, so the repair fails closed and settings.json is untouched.
+tar_hang="$(make_fixture tar-hang standalone)"
+jq '.outputStyle="plain"' "$tar_hang/home/.claude/settings.json" > "$tar_hang/home/.claude/settings.json.tmp"
+mv "$tar_hang/home/.claude/settings.json.tmp" "$tar_hang/home/.claude/settings.json"
+mkdir -p "$tar_hang/bin"
+printf '#!/usr/bin/env bash\nexec sleep 20\n' > "$tar_hang/bin/tar"
+chmod +x "$tar_hang/bin/tar"
+settings_before="$(cat "$tar_hang/home/.claude/settings.json")"
+hang_start="$(date +%s)"
+out="$(PATH="$tar_hang/bin:$PATH" CCC_DOCTOR_SUBPROCESS_TIMEOUT=0.3 CCC_DOCTOR_REPO_DIR="$tar_hang/repo" CCC_DOCTOR_CLAUDE_DIR="$tar_hang/home/.claude" bash "$DOCTOR" --fix --apply 2>&1)"; rc=$?
+hang_elapsed=$(( $(date +%s) - hang_start ))
+settings_after="$(cat "$tar_hang/home/.claude/settings.json")"
+ok "hung backup tar is bounded and --fix --apply fails closed" \
+  '[ "$hang_elapsed" -lt 10 ] && [ "$rc" = 1 ] && grep -q "tar -czf timed out after 0.3s" <<<"$out" && grep -q "failed to create valid settings backup" <<<"$out" && [ "$settings_before" = "$settings_after" ]'
+ok "subprocess timeout override below the floor is clamped, not rejected" \
+  '[ "$(CCC_DOCTOR_SUBPROCESS_TIMEOUT=0 python3 -c "import sys; sys.path.insert(0, \"$ROOT/scripts\"); import ccc_doctor as m; print(m.subprocess_timeout())")" = "0.1" ]'
+ok "unparseable subprocess timeout override falls back to the default" \
+  '[ "$(CCC_DOCTOR_SUBPROCESS_TIMEOUT=abc python3 -c "import sys; sys.path.insert(0, \"$ROOT/scripts\"); import ccc_doctor as m; print(m.subprocess_timeout())")" = "30.0" ]'
+
+# settings.json is rewritten atomically (temp + rename in ~/.claude) and keeps
+# the live file's mode, so a reader never sees a truncated file and an
+# owner-only settings.json never flips to the umask default.
+chmod 600 "$repair/home/.claude/settings.json"
 out="$(run_doctor "$repair" --fix --apply 2>&1)"; rc=$?
 ok "--fix --apply repairs drift" '[ "$rc" = 0 ]'
+ok "--fix --apply leaves no settings temp file behind" \
+  '! find "$repair/home/.claude" -maxdepth 1 -name ".settings.json.*" | grep -q .'
+ok "--fix --apply keeps settings.json mode and valid JSON" \
+  '[ "$(stat -c %a "$repair/home/.claude/settings.json")" = 600 ] && jq -e . "$repair/home/.claude/settings.json" >/dev/null'
 ok "--fix --apply restores outputStyle" 'jq -e ".outputStyle == \"ccc-report\"" "$repair/home/.claude/settings.json" >/dev/null'
 ok "--fix --apply restores statusLine" 'jq -e ".statusLine.command | contains(\"statusline.sh\")" "$repair/home/.claude/settings.json" >/dev/null'
 ok "--fix --apply restores PostCompact hook" 'jq -e ".hooks.PostCompact" "$repair/home/.claude/settings.json" >/dev/null'
@@ -323,6 +367,11 @@ out="$(run_doctor "$files" --fix --apply --scope=files 2>&1)"; rc=$?
 ok "--fix --apply --scope=files repairs allowlisted files" '[ "$rc" = 0 ] && grep -q "applied scoped file repair" <<<"$out"'
 ok "file repair restores missing hook" 'cmp -s "$ROOT/claude/hooks/statusline.sh" "$files/home/.claude/hooks/statusline.sh"'
 ok "file repair restores output style drift" 'cmp -s "$ROOT/claude/output-styles/ccc-report.md" "$files/home/.claude/output-styles/ccc-report.md"'
+# #1481: hook reinstall is atomic too — no temp residue, source mode carried over.
+ok "file repair leaves no temp file behind" \
+  '! find "$files/home/.claude/hooks" "$files/home/.claude/output-styles" -name ".*.tmp" | grep -q .'
+ok "file repair keeps the repo hook mode" \
+  '[ "$(stat -c %a "$files/home/.claude/hooks/statusline.sh")" = "$(stat -c %a "$ROOT/claude/hooks/statusline.sh")" ]'
 ok "file repair creates scoped backup tar" 'find "$files/home/.claude/backups" -name "ccc-doctor-files-*.tar.gz" | grep -q .'
 backup_count_before="$(find "$files/home/.claude/backups" -name "ccc-doctor-files-*.tar.gz" | wc -l)"
 out="$(run_doctor "$files" --fix --apply --scope=files 2>&1)"; rc=$?
