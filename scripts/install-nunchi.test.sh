@@ -31,6 +31,11 @@ mkdir -p "$hooks/nunchi" "$state" "$codex_home/sessions" "$piri_sessions" \
   "$home/.claude/projects" "$home/.local/bin" "$nunchi_home" "$fake_bin"
 cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,wiki-promote.py,judge-verdict.schema.json,codex-feed.sh,piri-feed.sh,ingest-cron.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
 cp "$ROOT/claude/hooks/scan-injection.sh" "$hooks/scan-injection.sh"
+# setup.sh installs bridge/utils/secure_fs.py verbatim as hooks/ccc_secure_fs.py;
+# nunchi.py/judge-batch.py/wiki-promote.py import it from the hooks root (#1508),
+# so the fixture must ship it the same way a real node does.
+cp "$ROOT/bridge/utils/secure_fs.py" "$hooks/ccc_secure_fs.py"
+chmod 644 "$hooks/ccc_secure_fs.py"
 chmod 700 "$hooks/nunchi/codex-loader.py" "$hooks/nunchi/nunchi.py" "$hooks/scan-injection.sh"
 chmod 755 "$hooks/nunchi"/*.sh
 
