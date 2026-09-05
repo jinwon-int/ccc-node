@@ -215,6 +215,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `gh-ci-wait` skill teaches agents the registration contract.
 
 ### Fixed
+- **Spawned-task references and session-lock pruning (#1479).** The crush
+  permission handler, the webhook nudge per-connection server, and the
+  durable Codex completion delivery each spawned a task with a bare
+  `asyncio.create_task` and dropped the handle; the event loop keeps only
+  weak references, so such a task may be garbage-collected mid-flight. Each
+  spawner now keeps the task in a per-instance set until it finishes (the
+  pattern `codex_app_server` already used), `CrushRuntime.close()` and
+  `WebhookNudgeServer.close()` cancel and join any that are still running,
+  and a failed crush `permission_reply` logs a warning with the request id
+  instead of passing silently. `ClaudeRuntime._forget_session` also prunes
+  the per-session-id turn lock (unless it is held or shared with another
+  live session of the same id), so `/new` churn no longer grows the lock map
+  without bound.
 - **Termux isolated Codex execution (#844).** The distill and skill-candidate
   subprocess environment now prepends an owner-controlled, non-writable
   `PREFIX/bin` when present, so Termux `env sh` wrappers can resolve both

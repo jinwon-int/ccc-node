@@ -119,15 +119,24 @@ fi
 
 # Global cap across concurrent SessionStarts. Held claim locks == live workers
 # in this STATE_DIR (flock releases on death, so stale files do not count).
+# Without util-linux flock (Termux) the probe cannot run: a bare `flock`
+# exits 127, which counted EVERY lock file as held and tripped the cap on
+# every SessionStart (#1480). An unprobed lock is not a live worker; the
+# per-job claim lock in the Python adapter still prevents double processing.
 held=0
-shopt -s nullglob
-for lock in "$PENDING_DIR"/*.json.lock; do
-  [ -e "$lock" ] || continue
-  if ! flock -n "$lock" true 2>/dev/null; then
-    held=$((held + 1))
-  fi
-done
-shopt -u nullglob
+flock_bin="${CCC_FLOCK_CLI:-$(command -v flock || true)}"
+if [ -n "$flock_bin" ] && [ -f "$flock_bin" ] && [ -x "$flock_bin" ]; then
+  shopt -s nullglob
+  for lock in "$PENDING_DIR"/*.json.lock; do
+    [ -e "$lock" ] || continue
+    if ! "$flock_bin" -n "$lock" true 2>/dev/null; then
+      held=$((held + 1))
+    fi
+  done
+  shopt -u nullglob
+else
+  log "flock unavailable; inflight cap not probed max=$MAX_INFLIGHT"
+fi
 slots=$((MAX_INFLIGHT - held))
 if [ "$slots" -le 0 ]; then
   log "skip reason=inflight-cap held=$held max=$MAX_INFLIGHT"

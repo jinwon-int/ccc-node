@@ -114,6 +114,22 @@ out="$(run_refresh)"; rc=$?
 ok "cleared wiki cache file repopulates despite a fresh ok status" \
   '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 5 ] && [ -s "$cache/wiki.txt" ]'
 
+# --- flock absent (Termux): mkdir fallback keeps the refresh running (#1480) --
+lockdir="$cache/.refresh.lock.d"
+out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?
+ok "no flock: refresh still runs its body via the mkdir fallback" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 6 ]'
+ok "no flock: fallback is logged once and the lock dir is released on exit" \
+  '[ "$(grep -c "flock unavailable; using mkdir fallback" <<<"$out")" = 1 ] && [ ! -d "$lockdir" ]'
+mkdir -p "$lockdir"
+out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?
+ok "no flock: a live lock dir keeps the run single-flight" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 6 ] && [ -d "$lockdir" ]'
+touch -d '-2 hours' "$lockdir"
+out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?
+ok "no flock: a stale lock dir from a dead holder is reclaimed" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 7 ] && [ ! -d "$lockdir" ]'
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

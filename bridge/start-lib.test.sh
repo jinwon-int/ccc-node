@@ -154,5 +154,26 @@ ok "detached spawn forwards its arguments" \
 ok "detached spawn leaves no interpreter error in the log" \
   '! grep -qi "no such file\|bad interpreter" "$spawn_log"'
 
+# --- proxy banner redaction (#1480) -------------------------------------------
+# In daemon mode the startup banner lands in supervisor.log/restart.log, so the
+# proxy URL's userinfo must never reach it. The env vars themselves stay intact.
+ok "redact: userinfo is masked, host/port/path survive" \
+  '[ "$(redact_url_userinfo "http://alice:s3cret@proxy.example:7890/p?q=1")" = "http://<redacted>@proxy.example:7890/p?q=1" ]'
+ok "redact: a raw @ inside the password does not leak" \
+  '[ "$(redact_url_userinfo "socks5://u:p@ss@proxy.example:1080")" = "socks5://<redacted>@proxy.example:1080" ]'
+ok "redact: @ in the path is not userinfo" \
+  '[ "$(redact_url_userinfo "http://proxy.example:7890/a@b")" = "http://proxy.example:7890/a@b" ]'
+ok "redact: URL without userinfo passes through unchanged" \
+  '[ "$(redact_url_userinfo "http://127.0.0.1:7890")" = "http://127.0.0.1:7890" ]'
+ok "redact: scheme-less authority is masked too" \
+  '[ "$(redact_url_userinfo "user:pw@proxy.example:7890")" = "<redacted>@proxy.example:7890" ]'
+# load_optional_env is defined below the seam (run-flow only), so the banner
+# call site is pinned statically: the echo must go through the redactor while
+# the exports keep the raw value.
+ok "proxy banner call site routes through redact_url_userinfo" \
+  'grep -q "Proxy configured: \$(redact_url_userinfo \"\$proxy_url\")" "$ROOT/bridge/start.sh"'
+ok "proxy exports keep the raw URL (no redaction on the env path)" \
+  'grep -q "export https_proxy=\"\$proxy_url\"" "$ROOT/bridge/start.sh"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
