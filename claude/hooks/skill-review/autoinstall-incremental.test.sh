@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# harness: umask-rerun
 # End-to-end v2 proposal routing through autoinstall.sh (#751).
 set -uo pipefail
 

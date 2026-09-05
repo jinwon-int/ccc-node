@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# harness: umask-rerun
 # Tests for distill.sh cwd scoping — no provider/network calls.
 set -uo pipefail
 # The production hook creates private state under umask 077. Keep fixtures on
