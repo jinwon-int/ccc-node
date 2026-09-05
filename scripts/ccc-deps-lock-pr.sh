@@ -23,6 +23,17 @@
 #      trigger `pull_request`/`push` workflows, but `workflow_dispatch` does,
 #      and the resulting check runs attach to the head SHA, so the required
 #      contexts (.github/required-checks.json) still gate the bot PR.
+#   5. approve the PR's own `pull_request` runs: on the first two bot PRs
+#      (#1505, heads 2f66c3f/d1dd911) GitHub DID register `pull_request` runs
+#      of harness-ci and codeql for the github-actions[bot] author, but parked
+#      them at conclusion=action_required (workflow-approval gate, repository
+#      policy `first_time_contributors`). Their check suites then counted as
+#      incomplete and the PR stayed mergeStateStatus=BLOCKED even though the
+#      dispatched required checks were green — until a human POSTed
+#      /actions/runs/<id>/approve on both (runs 33962069430/33962069445 and
+#      33963658260/33963658264). This step polls for such runs on the new head
+#      and approves them with the job's GITHUB_TOKEN (actions: write). See
+#      approve_pending_runs for what is and is not verified about that.
 #
 # Everything network-facing goes through `git push` and `gh`, so a test can
 # point the remote at a local bare repo and put a stub `gh` on PATH.
@@ -47,6 +58,13 @@ environment:
   CCC_DEPS_LOCK_PR_DISPATCH   workflows to dispatch on the branch
                               (default: "ci.yml codeql.yml"; empty = none)
   CCC_DEPS_LOCK_PR_ISSUE      tracking issue number (default: 1483)
+  CCC_DEPS_LOCK_PR_APPROVE_WAIT
+                              seconds to wait for the PR's own `pull_request`
+                              runs to appear in action_required before
+                              approving them (default: 90; 0 = one look, no
+                              wait; "skip" = do not approve at all)
+  CCC_DEPS_LOCK_PR_APPROVE_POLL
+                              poll interval in seconds (default: 5)
   GH_TOKEN / GH_REPO          consumed by gh as usual
 USAGE
 }
@@ -84,6 +102,8 @@ LOCK_SCRIPT="${CCC_DEPS_LOCK_SCRIPT:-$REPO_ROOT/scripts/ccc-deps-lock.sh}"
 REMOTE="${CCC_DEPS_LOCK_PR_REMOTE:-origin}"
 DISPATCH="${CCC_DEPS_LOCK_PR_DISPATCH-ci.yml codeql.yml}"
 ISSUE="${CCC_DEPS_LOCK_PR_ISSUE:-1483}"
+APPROVE_WAIT="${CCC_DEPS_LOCK_PR_APPROVE_WAIT:-90}"
+APPROVE_POLL="${CCC_DEPS_LOCK_PR_APPROVE_POLL:-5}"
 BRANCH_PREFIX="deps/lock-pair-"
 DATE_UTC="${CCC_DEPS_LOCK_PR_DATE:-$(date -u +%Y%m%d)}"
 [ -n "$BRANCH" ] || BRANCH="${BRANCH_PREFIX}${DATE_UTC}"
@@ -105,6 +125,10 @@ fi
 case "$BRANCH" in
     "$BRANCH_PREFIX"*) ;;
     *) echo "❌ refusing to force-push outside the bot prefix ${BRANCH_PREFIX}*: $BRANCH" >&2; exit 2 ;;
+esac
+case "$APPROVE_WAIT/$APPROVE_POLL" in
+    skip/*|[0-9]*/[0-9]*) ;;
+    *) echo "❌ CCC_DEPS_LOCK_PR_APPROVE_WAIT must be seconds or 'skip' and _POLL seconds: $APPROVE_WAIT / $APPROVE_POLL" >&2; exit 2 ;;
 esac
 
 BASE_SHA="$(git rev-parse HEAD)"
@@ -234,6 +258,8 @@ Both locks move together in this one commit, which is what per-directory Dependa
 
 Pushes and pull requests made with \`GITHUB_TOKEN\` do not trigger \`pull_request\`/\`push\` workflows, so the workflow dispatched $DISPATCH_NOTE on \`$BRANCH\` via \`workflow_dispatch\`; those check runs attach to the head SHA and satisfy the required contexts. If the checks are missing, re-run \`gh workflow run deps-lock.yml\` (same-day reruns refresh this branch) or dispatch the workflows on this ref manually.
 
+GitHub may still register this PR's own \`pull_request\` runs and park them at **action_required** (workflow-approval gate for the bot author), which keeps the PR \`BLOCKED\` even with green required checks. The workflow tries to approve those runs itself (see its job summary); if that failed, approve them manually — \`gh run list --branch $BRANCH --event pull_request\`, then \`gh api -X POST repos/{owner}/{repo}/actions/runs/<id>/approve\` per run — and merge after they complete (\`docs/ci-governance.md\`, "Weekly lock-pair regeneration").
+
 Refs #$ISSUE
 EOF
 
@@ -264,10 +290,78 @@ for wf in $DISPATCH; do
     echo "== deps-lock-pr: dispatched $wf on $BRANCH =="
 done
 
+# --- 5. approve the PR's own action_required `pull_request` runs ----------
+# `<run id>\t<workflow path>` for every `pull_request` run on this branch whose
+# head is our commit and which is parked at the approval gate. Such a run is
+# status=completed/conclusion=action_required with zero jobs (verified on run
+# 33961834862): nothing in the workflow — not even a job-level `if:` — is
+# evaluated before approval, which is why skipping bot runs inside ci.yml /
+# codeql.yml cannot avoid the gate.
+pending_pull_request_runs() {
+    gh api "repos/{owner}/{repo}/actions/runs?branch=$BRANCH&event=pull_request&per_page=50" \
+        --jq ".workflow_runs[] | select(.head_sha == \"$HEAD_SHA\" and .conclusion == \"action_required\") | \"\(.id)\t\(.path)\""
+}
+
+# Never fatal: the dispatched runs (step 4) already carry the required
+# contexts, so a failed approval leaves only mergeability blocked, and the
+# manual command is printed for the reviewer. The approve endpoint is
+# documented for pull requests from public forks
+# (POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve, fine-grained
+# permission actions: write, which deps-lock.yml already grants for
+# `gh workflow run`). Whether GitHub accepts it from GITHUB_TOKEN for a
+# same-repository PR authored by github-actions[bot] — i.e. the bot approving
+# its own run — is NOT documented; the finalizer validates it on the next real
+# deps-lock dispatch and records the outcome on issue #$ISSUE. Until then this
+# step's job-summary lines (HTTP status per run) are the evidence either way.
+APPROVE_NOTE=""
+approve_pending_runs() {
+    local deadline now runs expected_n found_n id path out rc msg
+    expected_n="$(printf '%s\n' $DISPATCH | grep -c .)" || expected_n=0
+    now="$(date +%s)"; deadline=$((now + APPROVE_WAIT))
+    runs=""
+    while :; do
+        runs="$(pending_pull_request_runs 2>&1)" || { APPROVE_NOTE="- could not list workflow runs: ${runs//$'\n'/ } — approve manually if the PR stays BLOCKED"; return 0; }
+        found_n="$(printf '%s\n' "$runs" | grep -c .)" || found_n=0
+        [ "$found_n" -ge "$expected_n" ] && break
+        now="$(date +%s)"; [ "$now" -ge "$deadline" ] && break
+        sleep "$APPROVE_POLL"
+    done
+    if [ "$found_n" -eq 0 ]; then
+        echo "== deps-lock-pr: no action_required pull_request run on ${HEAD_SHA:0:12} after ${APPROVE_WAIT}s (nothing to approve) =="
+        APPROVE_NOTE="- no \`pull_request\` run was parked at action_required on \`${HEAD_SHA:0:12}\` within ${APPROVE_WAIT}s; nothing approved"
+        return 0
+    fi
+    while IFS=$'\t' read -r id path; do
+        [ -n "$id" ] || continue
+        rc=0
+        out="$(gh api -X POST "repos/{owner}/{repo}/actions/runs/$id/approve" 2>&1)" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            echo "== deps-lock-pr: approved pull_request run $id ($path) =="
+            APPROVE_NOTE="$APPROVE_NOTE"$'\n'"- approved run $id (\`$path\`): OK"
+        else
+            # gh prints e.g. "gh: Must have admin rights ... (HTTP 403)"; keep the status.
+            msg="$(printf '%s\n' "$out" | grep -m1 -o 'HTTP [0-9]\{3\}' || true)"
+            [ -n "$msg" ] || msg="$(printf '%s\n' "$out" | head -1)"
+            echo "⚠ could not approve pull_request run $id ($path): rc=$rc $msg" >&2
+            echo "  manual fallback: gh api -X POST repos/{owner}/{repo}/actions/runs/$id/approve" >&2
+            APPROVE_NOTE="$APPROVE_NOTE"$'\n'"- approve run $id (\`$path\`) FAILED (rc=$rc $msg) — run \`gh api -X POST repos/{owner}/{repo}/actions/runs/$id/approve\` manually, then merge"
+        fi
+    done <<< "$runs"
+    APPROVE_NOTE="${APPROVE_NOTE#$'\n'}"
+}
+
+if [ "$APPROVE_WAIT" = skip ]; then
+    echo "== deps-lock-pr: pull_request run approval skipped (CCC_DEPS_LOCK_PR_APPROVE_WAIT=skip) =="
+    APPROVE_NOTE="- approval of \`pull_request\` runs skipped (CCC_DEPS_LOCK_PR_APPROVE_WAIT=skip)"
+else
+    approve_pending_runs
+fi
+
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {
         printf '### deps-lock\n\nPR #%s on `%s` (`%s`), mode: %s\n\n' "$PR_NUMBER" "$BRANCH" "${HEAD_SHA:0:12}" "$MODE_LABEL"
-        printf '%s\n' "$TABLE"
+        printf '%s\n\n' "$TABLE"
+        printf '#### pull_request run approval (#%s)\n\n%s\n' "$ISSUE" "$APPROVE_NOTE"
     } >> "$GITHUB_STEP_SUMMARY"
 fi
 echo "✅ deps-lock-pr: PR #$PR_NUMBER head ${HEAD_SHA:0:12} ($PIN_COUNT pin(s) changed)"
