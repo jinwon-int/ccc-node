@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from typing import ClassVar
 
@@ -346,41 +347,17 @@ class DepsInstallExecutionTests(unittest.TestCase):
             self.assertIn("Dependencies unchanged (requirements hash match)", second.stdout)
             self.assertEqual(second_calls, "")
 
-    def test_termux_detection_sets_api_level_for_pip_without_changing_parent(self):
+    def test_termux_hint_without_android_interpreter_fails_before_pip(self):
         with tempfile.TemporaryDirectory(dir=self.repo_root / "tests") as tmpdir:
             script_root = self._prepare_workspace(tmpdir)
             project_root = self._prepare_project(tmpdir, ["CCC_DEPS_UNLOCKED=1"])
-            fake_bin = Path(tmpdir) / "fake bin"
-            fake_bin.mkdir()
-            getprop = fake_bin / "getprop"
-            getprop.write_text("#!/bin/sh\nprintf 'android-35-preview\\n'\n", encoding="utf-8")
-            getprop.chmod(0o755)
-
-            result, _ = self._run_start(
-                script_root,
-                project_root,
-                tmpdir,
-                extra_env={
-                    "TERMUX_VERSION": "0.118",
-                    "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
-                },
-            )
-
-            self.assertIn("Android API level auto-detected: 35", result.stdout)
-            self.assertIn("ANDROID_API_LEVEL=35", (Path(tmpdir) / "pip-calls.log").read_text())
-
-    def test_operator_android_api_level_skips_getprop(self):
-        with tempfile.TemporaryDirectory(dir=self.repo_root / "tests") as tmpdir:
-            script_root = self._prepare_workspace(tmpdir)
-            project_root = self._prepare_project(tmpdir, ["CCC_DEPS_UNLOCKED=1"])
-            result, _ = self._run_start(
-                script_root,
-                project_root,
-                tmpdir,
+            result, calls = self._run_start(
+                script_root, project_root, tmpdir,
                 extra_env={"TERMUX_VERSION": "0.118", "ANDROID_API_LEVEL": "34"},
             )
-            self.assertNotIn("auto-detected", result.stdout)
-            self.assertIn("ANDROID_API_LEVEL=34", (Path(tmpdir) / "pip-calls.log").read_text())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Android platform contract failed", result.stdout)
+            self.assertEqual(calls, "")
 
 
 class RustToolchainPreflightTests(unittest.TestCase):
@@ -430,9 +407,10 @@ class RustToolchainPreflightTests(unittest.TestCase):
                 "PATH": f"{fake_bin}{os.pathsep}/usr/bin{os.pathsep}/bin",
             }
             buf = io.StringIO()
-            rc = sync_dependencies(
-                paths, InstallMode.LOCKED, force_install=True, environ=environ, stdout=buf
-            )
+            with patch("telegram_bot.dependency_bootstrap.android_build_api", return_value=24):
+                rc = sync_dependencies(
+                    paths, InstallMode.LOCKED, force_install=True, environ=environ, stdout=buf
+                )
             return rc, buf.getvalue()
 
     def test_termux_without_cargo_warns_upfront_and_diagnoses_failure(self):

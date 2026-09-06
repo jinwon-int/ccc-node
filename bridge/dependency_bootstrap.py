@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -146,28 +147,36 @@ def _remove_legacy_package_link() -> None:
             pass
 
 
+def android_build_api() -> int:
+    """Read this bootstrap interpreter's Android build/packaging contract.
+
+    start.sh invokes this module with the selected venv Python. Termux patches
+    platform.android_ver() to its package API; device OS SDK is not a build
+    target. Never derive a target from getprop or an arbitrary environment.
+    """
+    getter = getattr(sys, "getandroidapilevel", None)
+    api = getter() if getter else None
+    target = re.fullmatch(r"android-([0-9]+)-[A-Za-z0-9_]+", sysconfig.get_platform())
+    android_ver = getattr(platform, "android_ver", None)
+    packaging_api = android_ver().api_level if android_ver else None
+    if (type(api) is not int or not 16 <= api <= 1000 or target is None
+            or int(target[1]) != api or type(packaging_api) is not int
+            or packaging_api < api):
+        raise ValueError("Android interpreter build/packaging API is unavailable or inconsistent")
+    return api
+
+
 def ensure_android_api_level(
     env: MutableMapping[str, str], *, stdout: TextIO = sys.stdout
 ) -> None:
-    """Populate ANDROID_API_LEVEL from getprop for Termux installs."""
-    if env.get("ANDROID_API_LEVEL"):
+    """Use the Python build API for Termux source builds, never the OS SDK."""
+    if not _is_termux_env(env):
         return
-    is_termux = bool(env.get("TERMUX_VERSION")) or "/com.termux/" in env.get("PREFIX", "")
-    getprop = shutil.which("getprop", path=env.get("PATH"))
-    if not is_termux or getprop is None:
-        return
-    result = subprocess.run(
-        [getprop, "ro.build.version.sdk"],
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=env,
-    )
-    sdk = "".join(character for character in result.stdout if "0" <= character <= "9")
-    if sdk:
-        env["ANDROID_API_LEVEL"] = sdk
-        print(f"\033[90m✓ Android API level auto-detected: {sdk}\033[0m", file=stdout, flush=True)
+    api = str(android_build_api())
+    if env.get("ANDROID_API_LEVEL") and env["ANDROID_API_LEVEL"] != api:
+        raise ValueError(f"ANDROID_API_LEVEL must match Python build API {api}; remove the override")
+    env["ANDROID_API_LEVEL"] = api
+    print(f"✓ Android build API from Python: {api}", file=stdout, flush=True)
 
 
 def _is_termux_env(env: Mapping[str, str]) -> bool:
@@ -335,8 +344,13 @@ def _sync_dependencies(
     environ: Mapping[str, str], stdout: TextIO,
 ) -> int:
     """Install dependencies when the cache key changes; return a shell status."""
-    _remove_legacy_package_link()
     child_env = dict(os.environ if environ is None else environ)
+    try:
+        ensure_android_api_level(child_env, stdout=stdout)
+    except ValueError as exc:
+        print(f"❌ Android platform contract failed: {exc}", file=stdout, flush=True)
+        return 1
+    _remove_legacy_package_link()
     current_hash = dependency_fingerprint(paths, mode)
     saved_hash = _saved_fingerprint(paths.hash_cache)
     if not force_install and saved_hash and saved_hash == current_hash:
@@ -350,7 +364,6 @@ def _sync_dependencies(
         return _verify_dependencies(paths, child_env, stdout)
 
     print("📦 Installing Python dependencies...", file=stdout, flush=True)
-    ensure_android_api_level(child_env, stdout=stdout)
     rust_missing = _is_termux_env(child_env) and not _cargo_available(child_env)
     if rust_missing:
         print(
@@ -399,7 +412,26 @@ def _sync_dependencies(
 def _verify_dependencies(paths: DependencyPaths, env: Mapping[str, str], stdout: TextIO) -> int:
     if ensure_termux_cryptography(paths.pip.with_name("python"), paths.venv_dir, env, stdout, lock_held=True):
         return 1
-    return smoke_import_binary_extensions(paths, environ=env, stdout=stdout)
+    if smoke_import_binary_extensions(paths, environ=env, stdout=stdout):
+        return 1
+    if _is_termux_env(env):
+        # Catch incompatible wheel tags even on a requirements cache hit.
+        # Keep dependency checks enabled; do not retag an installed binary.
+        try:
+            result = subprocess.run(
+                [str(paths.pip.with_name("python")), "-I", "-B", "-m", "pip", "check"],
+                env=dict(env, PIP_DISABLE_PIP_VERSION_CHECK="1", PIP_NO_INPUT="1"),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, check=False, timeout=30,
+            )
+            if result.returncode == 0:
+                return 0
+        except (OSError, subprocess.SubprocessError):
+            pass
+        print("❌ Termux pip check failed; rebuild dependencies in an isolated environment "
+              "using the Python build API before retrying (#1532)", file=stdout, flush=True)
+        return 1
+    return 0
 
 
 def _parser() -> argparse.ArgumentParser:

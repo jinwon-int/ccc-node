@@ -19,6 +19,9 @@ from telegram_bot.termux_native import ensure_termux_cryptography
 
 class TermuxNativeTests(unittest.TestCase):
     def setUp(self):
+        api = patch("telegram_bot.dependency_bootstrap.android_build_api", return_value=24)
+        api.start()
+        self.addCleanup(api.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -32,6 +35,8 @@ class TermuxNativeTests(unittest.TestCase):
         self._script(self.python, '''
 import json, os, pathlib, sys
 p = pathlib.Path(os.environ['EXTENSION'])
+if sys.argv[1:] == ['-I', '-B', '-m', 'pip', 'check']:
+    sys.exit(1 if os.environ.get('PIP_CHECK_FAIL') else 0)
 code = sys.argv[2]
 if 'sysconfig' in code:
     print(json.dumps([str(p), 'libpython3.14.so']))
@@ -123,6 +128,20 @@ elif sys.argv[1] == '--add-needed':
                 self.assertEqual(repair.result(timeout=10), 0)
                 self.assertEqual(installer.result(timeout=10), 0)
         self.assertTrue(marker.exists())
+
+    def test_cached_native_success_does_not_hide_pip_tag_failure(self):
+        paths = DependencyPaths.from_roots(self.root, self.venv, self.root / 'project.env')
+        paths.lock.write_text('fixture lock')
+        paths.hash_cache.write_text(dependency_fingerprint(paths, InstallMode.LOCKED))
+        self.extension.write_bytes(b'linked')
+        self.env['PIP_CHECK_FAIL'] = '1'
+        saved = paths.hash_cache.read_bytes()
+        out = io.StringIO()
+        self.assertEqual(sync_dependencies(paths, InstallMode.LOCKED,
+                                          environ=self.env, stdout=out), 1)
+        self.assertIn('Termux pip check failed', out.getvalue())
+        self.assertEqual(paths.hash_cache.read_bytes(), saved)
+        self.assertNotIn('ANDROID_API_LEVEL', self.env)
 
     def test_healthy_native_import_needs_no_patchelf(self):
         self.extension.write_bytes(b'linked')

@@ -209,3 +209,35 @@ nor observed bridge downtime. If persisting receipts, use an owner-only file:
 ```
 
 Keep credentials, environment dumps and raw task bodies out of receipts.
+
+
+### Python build API and Android wheel tags (#1532)
+
+Termux intentionally patches `platform.android_ver().api_level` to its package
+build API. In Python 3.14.6-1 this is 24 even on OS SDK 33 or 36. The upstream
+[Termux patch](https://github.com/termux/termux-packages/blob/fe7ac2107098332e4ee457e71d823064c8831040/packages/python/hardcode-android-api-level.diff)
+explains why a device's OS SDK is not the build target for its Python packages.
+The previous bootstrap used `getprop ro.build.version.sdk` as
+`ANDROID_API_LEVEL`; maturin then produced Android 33/36 wheels while pip
+accepted Android 24 and below. Native import success does not make these tags
+consistent.
+
+Bootstrap now derives the build target from its selected venv interpreter's
+`sys.getandroidapilevel()` and checks `sysconfig.get_platform()` plus Python's
+packaging API. Explicit `ANDROID_API_LEVEL` must match this build target;
+unknown/inconsistent interpreter metadata or an incompatible override fails
+before pip runs, including on a requirements-cache hit. The child environment
+receives this value for locked and unlocked installs; the parent's environment
+is unchanged. Termux reconciliation also runs isolated `pip check` after
+native/SDK checks, including on cache hits, before reporting success.
+
+For an existing mismatched environment, first preserve it and prepare a separate
+venv and source checkout. Remove the old OS-SDK override from that isolated
+invocation and run the bootstrap there with its venv Python. Rebuild artifacts
+from their original source using the normal hash lock; do not rename wheels,
+rewrite installed WHEEL metadata, override pip's supported tags, or disable its
+checks. Verify native/SDK/AES and pip checks after installation and forced
+reinstallation. If compilation or lock verification fails, retain the log and
+failed environment; it is not a successful migration. Only promote an environment
+in a separately verified service transition. This source fix does not rewrite
+existing wheels or automatically migrate a serving venv.
