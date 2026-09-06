@@ -5,6 +5,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- **Termux Python build API (#1532).** Dependency builds use the interpreter's
+  API contract instead of the device OS SDK. Conflicting overrides fail before
+  installation, and native/SDK success cannot hide a failed Termux pip check.
 - **Runtime readiness receipts (#1525, #1527).** A read-only observer checks
   native imports, SDK, AES-GCM and installed dependency consistency with
   bounded child-process waits. It emits platform/source/lock provenance and

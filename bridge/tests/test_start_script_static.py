@@ -29,7 +29,7 @@ class StartScriptStaticTests(unittest.TestCase):
     def test_dependency_bootstrap_owns_android_api_detection(self):
         text = DEPENDENCY_BOOTSTRAP.read_text(encoding="utf-8")
         self.assertIn("def ensure_android_api_level(", text)
-        self.assertIn('"ro.build.version.sdk"', text)
+        self.assertIn("def android_build_api()", text)
         self.assertIn('if env.get("ANDROID_API_LEVEL")', text)
 
     def test_start_sh_never_logs_proxy_values(self):
