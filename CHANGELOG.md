@@ -4,6 +4,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Prepared bridge restart now requires a fresh matching serving generation,
+  rather than generic availability, before reporting success (#1559, #1527).
+
 - Unmanaged bridge stop/restart now honors the bounded drain with one70s grace
   budget, avoids duplicate termination signals, and retains bookkeeping on
   failed stops (#1554, #1527).

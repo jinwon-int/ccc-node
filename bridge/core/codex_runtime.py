@@ -22,6 +22,7 @@ from .agent_runtime import (
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequestEvent,
+    ApprovalResolvedEvent,
     CompletionEvent,
     ErrorEvent,
     JsonValue as AgentJsonValue,
@@ -1602,6 +1603,15 @@ class CodexRuntime:
             decision = ApprovalDecision.DENY
         if active.finished or self._active_turns.get(cast(str, thread_id)) is not active:
             decision = ApprovalDecision.DENY
+        # #1555: settle the turn's approval lease from the adapter, not from
+        # whichever later frame happens to arrive.
+        active.queue.put_nowait(
+            ApprovalResolvedEvent(
+                request_id=approval.request_id,
+                action=approval.action,
+                decision=decision,
+            )
+        )
         return self._approval_response(request.method, decision, request.params)
 
     @staticmethod

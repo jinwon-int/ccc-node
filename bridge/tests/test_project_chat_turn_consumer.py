@@ -9,7 +9,9 @@ import pytest
 
 from telegram_bot.core.agent_runtime import (
     AgentEvent,
+    ApprovalDecision,
     ApprovalRequestEvent,
+    ApprovalResolvedEvent,
     DelegatedTaskLifecycleEvent,
     TextDeltaEvent,
     ToolCompletedEvent,
@@ -56,6 +58,7 @@ class ScriptedStream:
                 item,
                 (
                     ApprovalRequestEvent,
+                    ApprovalResolvedEvent,
                     DelegatedTaskLifecycleEvent,
                     TextDeltaEvent,
                     ToolCompletedEvent,
@@ -579,3 +582,74 @@ async def test_repeated_consumer_cancellation_reaps_read_before_close() -> None:
         "aclose",
     ]
     assert stream.closed == 1
+
+
+@pytest.mark.anyio
+async def test_resolved_delegated_approval_never_trips_the_approval_stall() -> None:
+    # #1555 reproduction: a delegated (sub-agent) Write is requested, the
+    # bridge allows it, and the provider then stays busy on delegated work
+    # without any further main-session frame. The approval grace must not
+    # release the turn — the delegated bound is the only live limit.
+    order: list[str] = []
+    stream = ScriptedStream(
+        [
+            TextDeltaEvent("delegating"),
+            DelegatedTaskLifecycleEvent(1, 0.0, "started"),
+            ApprovalRequestEvent(
+                "toolu_01", "Write", {"file_path": "/x/lane.md", "content": "c"}, "write"
+            ),
+            ApprovalResolvedEvent("toolu_01", "Write", ApprovalDecision.ALLOW),
+        ],
+        order=order,
+    )
+    state = TurnEventState()
+
+    outcome = await consume_turn_stream(
+        stream,
+        state=state,
+        has_text=lambda: True,
+        on_event=_observer(state),
+        interrupt=_record_action(order, "interrupt"),
+        abort_stalled_turn=_record_action(order, "abort"),
+        admission_timeout_seconds=1.0,
+        approval_stall_seconds=0.01,
+        terminal_stall_seconds=60.0,
+        delegated_task_stall_seconds=0.08,
+        interrupt_timeout_seconds=1.0,
+    )
+
+    assert outcome is TurnStreamOutcome.DELEGATED_TASK_STALL
+    assert state.approval_pending is False
+    assert state.approval_pending_label is None
+
+
+@pytest.mark.anyio
+async def test_unresolved_delegated_approval_still_trips_the_approval_stall() -> None:
+    # The guard keeps its purpose: a request with no decision still stalls.
+    order: list[str] = []
+    stream = ScriptedStream(
+        [
+            TextDeltaEvent("delegating"),
+            DelegatedTaskLifecycleEvent(1, 0.0, "started"),
+            ApprovalRequestEvent("toolu_02", "Bash", {"command": "true"}, "run"),
+        ],
+        order=order,
+    )
+    state = TurnEventState()
+
+    outcome = await consume_turn_stream(
+        stream,
+        state=state,
+        has_text=lambda: True,
+        on_event=_observer(state),
+        interrupt=_record_action(order, "interrupt"),
+        abort_stalled_turn=_record_action(order, "abort"),
+        admission_timeout_seconds=1.0,
+        approval_stall_seconds=0.01,
+        terminal_stall_seconds=60.0,
+        delegated_task_stall_seconds=60.0,
+        interrupt_timeout_seconds=1.0,
+    )
+
+    assert outcome is TurnStreamOutcome.APPROVAL_STALL
+    assert state.approval_pending_label == "Bash command"

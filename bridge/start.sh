@@ -1216,6 +1216,7 @@ do_restart() {
     [ -z "${CCC_BRIDGE_RESTART_SPAWN:-}" ] && spawn_launcher=(bash)
     local waited live ready new_pid spawn_pid="" restart_log="" unit scope_flag
     local caller_ancestor="" daemon_hint=""
+    local prepared_report="" serving_report="" launched_after=""
 
     # Refuse before ANY destructive lifecycle action when this restart driver
     # is a descendant of the bridge it would stop. This is intentionally before
@@ -1259,7 +1260,15 @@ do_restart() {
     # bot stayed down because the start half could not resolve its token).
     merge_env_files
     check_env
-    validate_prepared_runtime || exit 6
+    if [ -n "$PREPARED_RUNTIME" ]; then
+        # Pin the exact successful pre-stop identity; never replace it with a
+        # later receipt or infer the selected generation from generic status.
+        prepared_report="$(validate_prepared_runtime)" || {
+            printf '%s\n' "$prepared_report"
+            exit 6
+        }
+        printf '%s\n' "$prepared_report"
+    fi
 
     RESTART_OLD_PID="$(read_pid)"
     RESTART_OLD_SUPERVISOR_PID="$(read_supervisor_pid)"
@@ -1292,6 +1301,7 @@ do_restart() {
 
     # Start via the same code paths the plain flags use, pinned to THIS
     # checkout's start.sh (a wrong-checkout start.sh was a 2026-07-19 mode).
+    launched_after="$(date -u +%s)"
     local spawn_args=("--path" "$PROJECT_ROOT")
     [ -n "$PREPARED_RUNTIME" ] && spawn_args+=("--prepared-runtime" "$PREPARED_RUNTIME")
     [ -n "$BOT_DEBUG" ] && spawn_args+=("--debug")
@@ -1317,7 +1327,21 @@ do_restart() {
     waited=0
     ready=0
     while [ "$waited" -lt "$ready_timeout" ]; do
-        if restart_status_snapshot | grep -q "Bot status: available"; then
+        if [ -n "$PREPARED_RUNTIME" ]; then
+            new_pid="$(read_pid)"
+            if [ -n "$new_pid" ] && [ "$new_pid" != "$RESTART_OLD_PID" ] \
+                && stop_pid_alive "$new_pid"; then
+                if serving_report="$(printf '%s\n' "$prepared_report" | \
+                    "$VENV_DIR/bin/python" -I -B "$SCRIPT_DIR/prepared_serving.py" \
+                    --health-file "$HEALTH_FILE" --pid "$new_pid" \
+                    --not-before "$launched_after" --max-age "$HEALTH_STALE_SECONDS")" \
+                    && [ "$(read_pid)" = "$new_pid" ] && stop_pid_alive "$new_pid"; then
+                    ready=1
+                    printf '%s\n' "$serving_report"
+                    break
+                fi
+            fi
+        elif restart_status_snapshot | grep -q "Bot status: available"; then
             ready=1
             break
         fi
@@ -1331,6 +1355,9 @@ do_restart() {
 
     if [ "$ready" -ne 1 ]; then
         echo "❌ Restart failed: not-available-within-timeout (${ready_timeout}s)"
+        if [ -n "$PREPARED_RUNTIME" ]; then
+            echo "   Selected prepared generation was not verified in a fresh serving process."
+        fi
         echo "── last status ──"
         restart_status_snapshot
         echo "💡 The new process (if any) was left running — inspect with: $0 --path \"$PROJECT_ROOT\" --status"

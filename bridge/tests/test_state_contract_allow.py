@@ -24,6 +24,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 _SECRET_MARKER = "STATE-CONTRACT-SECRET-MARKER"
 
@@ -178,6 +179,10 @@ class ClaudeRuntimeContractAllowTests(unittest.IsolatedAsyncioTestCase):
         self.settings = SimpleNamespace(
             claude_settings_path=str(Path(self.tmp.name) / "settings.json"),
             state_contract_allow_enabled=True,
+            # These tests pin the single-file contract rule in isolation; the
+            # broader #1555 path rule (state dir, /tmp, ~/ccc-wt) has its own
+            # suite below and would otherwise allow the sibling paths here.
+            state_path_allow_enabled=False,
         )
         # Pin the process-level CCC_STATE_DIR away from the real node state.
         self._old_env = os.environ.get("CCC_STATE_DIR")
@@ -319,3 +324,275 @@ class ClaudeRuntimeContractAllowTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- #1555: structured writes under the state dir(s), /tmp and ~/ccc-wt -------
+
+
+class PathPredicateTests(unittest.TestCase):
+    """``state_path_allows`` / ``path_allow_roots`` narrowness."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        self.state = base / "state"
+        self.scratch = base / "scratch"
+        self.worktrees = base / "ccc-wt"
+        for directory in (self.state, self.scratch, self.worktrees):
+            directory.mkdir()
+        self.outside = base / "outside"
+        self.outside.mkdir()
+        self.roots = (self.state, self.scratch, self.worktrees)
+
+    def _allows(self, action, args, **kw):
+        return _sc().state_path_allows(action, args, roots=self.roots, **kw)
+
+    def test_structured_writes_under_each_root_allow(self) -> None:
+        for root in self.roots:
+            for action in ("Write", "Edit", "MultiEdit"):
+                with self.subTest(root=root.name, action=action):
+                    self.assertTrue(
+                        self._allows(action, {"file_path": str(root / "lane-bridge-1.md")})
+                    )
+                    self.assertTrue(
+                        self._allows(
+                            action, {"file_path": str(root / "fix" / "branch" / "a.py")}
+                        )
+                    )
+
+    def test_bash_and_other_actions_never_match(self) -> None:
+        target = self.state / "lane.md"
+        for action in ("Bash", "Read", "NotebookEdit", "Agent", "", None):
+            with self.subTest(action=action):
+                self.assertFalse(self._allows(action, {"file_path": str(target)}))
+                self.assertFalse(self._allows(action, {"command": f"echo x > {target}"}))
+
+    def test_root_itself_outside_relative_and_malformed_refuse(self) -> None:
+        cases = [
+            {"file_path": str(self.state)},
+            {"file_path": str(self.state) + "/"},
+            {"file_path": str(self.outside / "lane.md")},
+            {"file_path": str(self.state) + "-sibling/lane.md"},
+            {"file_path": str(self.state / ".." / "outside" / "x.md")},
+            {"file_path": "state/lane.md"},
+            {"file_path": "lane.md"},
+            {"file_path": str(self.state / "x") + "\x00"},
+            {"file_path": ""},
+            {"file_path": 42},
+            {"path": str(self.state / "x")},
+            {},
+            None,
+        ]
+        for args in cases:
+            with self.subTest(args=args):
+                self.assertFalse(self._allows("Write", args))
+
+    def test_symlinked_root_refuses(self) -> None:
+        link_root = Path(self.tmp.name) / "linked-root"
+        os.symlink(self.outside, link_root)
+        allows = _sc().state_path_allows(
+            "Write", {"file_path": str(link_root / "x.md")}, roots=(link_root,)
+        )
+        self.assertFalse(allows)
+
+    def test_symlink_escaping_a_root_refuses_and_link_into_root_allows(self) -> None:
+        escape = self.state / "escape"
+        os.symlink(self.outside, escape)
+        self.assertFalse(self._allows("Write", {"file_path": str(escape / "x.md")}))
+        alias = Path(self.tmp.name) / "alias-dir"
+        os.symlink(self.worktrees, alias)
+        self.assertTrue(self._allows("Write", {"file_path": str(alias / "repo" / "x.md")}))
+
+    def test_kill_switch_refuses(self) -> None:
+        self.assertFalse(
+            self._allows("Write", {"file_path": str(self.state / "x.md")}, enabled=False)
+        )
+
+    def test_enabled_resolution_requires_contract_switch_then_settings_env_default(self) -> None:
+        sc = _sc()
+        self.assertTrue(sc.state_path_allow_enabled(None, environ={}))
+        self.assertFalse(
+            sc.state_path_allow_enabled(None, environ={sc.PATH_ALLOW_KILL_SWITCH_ENV: "0"})
+        )
+        self.assertFalse(
+            sc.state_path_allow_enabled(None, environ={sc.PATH_ALLOW_KILL_SWITCH_ENV: "off"})
+        )
+        # The contract kill-switch also turns the path rule off.
+        self.assertFalse(sc.state_path_allow_enabled(None, environ={sc.KILL_SWITCH_ENV: "0"}))
+        settings_off = SimpleNamespace(
+            state_contract_allow_enabled=True, state_path_allow_enabled=False
+        )
+        self.assertTrue(sc.state_contract_enabled(settings_off, environ={}))
+        self.assertFalse(sc.state_path_allow_enabled(settings_off, environ={}))
+        settings_on = SimpleNamespace(state_path_allow_enabled=True)
+        self.assertTrue(
+            sc.state_path_allow_enabled(
+                settings_on, environ={sc.PATH_ALLOW_KILL_SWITCH_ENV: "0"}
+            )
+        )
+        contract_off = SimpleNamespace(
+            state_contract_allow_enabled=False, state_path_allow_enabled=True
+        )
+        self.assertFalse(sc.state_path_allow_enabled(contract_off, environ={}))
+
+    def test_path_allow_roots_default_scoped_and_fixed_extra_roots(self) -> None:
+        sc = _sc()
+        home = Path(self.tmp.name) / "home"
+        env = {"HOME": str(home)}
+        self.assertEqual(
+            sc.path_allow_roots(None, environ=env),
+            (home / ".claude" / "state", Path("/tmp"), home / "ccc-wt"),
+        )
+        env_state = {"HOME": str(home), "CCC_STATE_DIR": str(self.state)}
+        self.assertEqual(
+            sc.path_allow_roots(None, environ=env_state),
+            (self.state, Path("/tmp"), home / "ccc-wt"),
+        )
+        scoped = Path(self.tmp.name) / "aud" / "private-x" / "state"
+        self.assertEqual(
+            sc.path_allow_roots(
+                None,
+                extra_state_dirs=(str(scoped), None, "", str(scoped)),
+                include_default=False,
+                environ=env,
+            ),
+            (scoped, Path("/tmp"), home / "ccc-wt"),
+        )
+        # Only fixed roots ever appear: nothing from the request, nothing wider.
+        self.assertEqual(sc.PATH_ALLOW_EXTRA_ROOTS, ("/tmp", "~/ccc-wt"))
+
+
+class ClaudeRuntimePathAllowTests(unittest.IsolatedAsyncioTestCase):
+    """The runtime allows only the fixed roots, with a ``state-path-allow`` trace."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        self.state = base / "state"
+        self.home = base / "home"
+        self.worktrees = self.home / "ccc-wt"
+        self.state.mkdir()
+        self.worktrees.mkdir(parents=True)
+        self.settings = SimpleNamespace(
+            claude_settings_path=str(base / "settings.json"),
+            state_contract_allow_enabled=True,
+            state_path_allow_enabled=True,
+        )
+        self._old_env = {key: os.environ.get(key) for key in ("CCC_STATE_DIR", "HOME")}
+        os.environ["CCC_STATE_DIR"] = str(self.state)
+        os.environ["HOME"] = str(self.home)
+        # Hermetic across TMPDIR placements: locally the fixture tree lives
+        # under /tmp, which is itself a fixed root, so the /tmp root is taken
+        # out here and exercised on its own in test_tmp_subtree_allows.
+        self._roots_patch = mock.patch.object(_sc(), "PATH_ALLOW_EXTRA_ROOTS", ("~/ccc-wt",))
+        self._roots_patch.start()
+        self.addCleanup(self._roots_patch.stop)
+
+    def tearDown(self) -> None:
+        for key, value in self._old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    async def _request(self, session, tool="Write", path=None, tool_use_id="toolu_path_1"):
+        return await session._handle_permission_request(
+            tool,
+            {"file_path": str(path), "content": _SECRET_MARKER},
+            SimpleNamespace(tool_use_id=tool_use_id, title=None),
+        )
+
+    async def test_delegated_lane_checkpoint_under_state_dir_allows_without_route(self) -> None:
+        # The yukson 2026-09-06 shape: a sub-agent creates ~/.claude/state/lane-*.md.
+        session = _session(settings=self.settings)  # turn=none
+        with self.assertLogs("telegram_bot.core.claude_runtime", level="INFO") as logs:
+            result = await self._request(session, path=self.state / "lane-bridge-1555.md")
+        self.assertEqual(type(result).__name__, "PermissionResultAllow")
+        joined = "\n".join(logs.output)
+        self.assertIn("outcome=allowed reason=state-path-allow", joined)
+        self.assertIn("turn=none", joined)
+        self.assertNotIn(_SECRET_MARKER, joined)
+        self.assertNotIn(str(self.state), joined)
+
+    async def test_active_turn_never_reaches_handler_or_queues_a_request(self) -> None:
+        ar = _agent_runtime()
+        calls: list[object] = []
+
+        async def deny(request):
+            calls.append(request)
+            return ar.ApprovalDecision.DENY
+
+        session = _session(deny, settings=self.settings)
+        for tool, path in (
+            ("Write", self.worktrees / "fix" / "branch" / "bridge" / "x.py"),
+            ("Edit", self.state / "lane-bridge-1555.md"),
+            ("MultiEdit", self.worktrees / "notes.md"),
+        ):
+            with self.subTest(tool=tool):
+                with self.assertLogs("telegram_bot.core.claude_runtime", level="INFO") as logs:
+                    result = await self._request(session, tool=tool, path=path)
+                self.assertEqual(type(result).__name__, "PermissionResultAllow")
+                self.assertIn(
+                    "turn=active outcome=allowed reason=state-path-allow",
+                    "\n".join(logs.output),
+                )
+        self.assertEqual(calls, [])
+        # No ApprovalRequestEvent was queued, so no approval_pending lease exists.
+        self.assertTrue(session._active_turn.queue.empty())
+
+    @unittest.skipIf(os.path.islink("/tmp"), "/tmp is a symlink on this host")
+    async def test_tmp_subtree_allows(self) -> None:
+        self._roots_patch.stop()  # the real fixed roots, /tmp included
+        session = _session(settings=self.settings)
+        result = await self._request(session, path=Path("/tmp/ccc-1555-probe/never-created.md"))
+        self.assertEqual(type(result).__name__, "PermissionResultAllow")
+        refused = await self._request(session, path=Path("/tmp"))
+        self.assertEqual(type(refused).__name__, "PermissionResultDeny")
+        self._roots_patch.start()
+
+    async def test_outside_paths_and_bash_keep_fail_closed_flow(self) -> None:
+        ar = _agent_runtime()
+
+        async def deny(_request):
+            return ar.ApprovalDecision.DENY
+
+        session = _session(deny, settings=self.settings)
+        for tool, tool_input in (
+            ("Write", {"file_path": "/srv/ccc-1555/outside.md"}),
+            ("Write", {"file_path": str(self.home / "other" / "x.md")}),
+            ("Write", {"file_path": str(self.state)}),  # the root itself
+            ("Write", {"file_path": "lane.md"}),
+            ("Bash", {"command": f"echo x > {self.state}/lane.md"}),
+            ("Bash", {"command": "true", "file_path": str(self.state / "lane.md")}),
+        ):
+            with self.subTest(tool=tool, tool_input=tool_input):
+                with self.assertLogs("telegram_bot.core.claude_runtime", level="INFO") as logs:
+                    result = await session._handle_permission_request(
+                        tool, tool_input, SimpleNamespace(tool_use_id="toolu_out", title=None)
+                    )
+                self.assertEqual(type(result).__name__, "PermissionResultDeny")
+                self.assertIn("reason=handler-deny", result.message)
+                self.assertNotIn("state-path-allow", "\n".join(logs.output))
+
+    async def test_kill_switches_restore_fail_closed_deny(self) -> None:
+        for attr in ("state_path_allow_enabled", "state_contract_allow_enabled"):
+            with self.subTest(attr=attr):
+                settings = SimpleNamespace(**vars(self.settings))
+                setattr(settings, attr, False)
+                session = _session(settings=settings)
+                with self.assertLogs("telegram_bot.core.claude_runtime", level="INFO") as logs:
+                    result = await self._request(session, path=self.state / "lane.md")
+                self.assertEqual(type(result).__name__, "PermissionResultDeny")
+                self.assertIn("outcome=denied-no-route", "\n".join(logs.output))
+
+    async def test_shared_audience_session_excludes_unscoped_state_dir(self) -> None:
+        scoped = Path(self.tmp.name) / "aud" / "shared" / "state"
+        scoped.mkdir(parents=True)
+        session = _session(settings=self.settings, contract_dirs=(str(scoped),))
+        session._contract_include_default = False
+        allowed = await self._request(session, path=scoped / "lane.md")
+        self.assertEqual(type(allowed).__name__, "PermissionResultAllow")
+        refused = await self._request(session, path=self.state / "lane.md")
+        self.assertEqual(type(refused).__name__, "PermissionResultDeny")
