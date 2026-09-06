@@ -24,6 +24,9 @@
 #      and their hash (ccc-node#1431). A public bind is only as exposed as the
 #      firewall lets it be — gongmyoung's home-server listeners are accepted
 #      on the strength of ufw default-deny, so a rule change must show up.
+#      Rules whose ufw comment mentions fail2ban (`# by Fail2Ban after N
+#      attempts …`) are dynamic bans, not policy: they are listed under
+#      `dynamic_rules` (only when present) and left out of the hash (#1536).
 #
 # The registry comparison (what is NEW vs the Wiki page) is deliberately not
 # done here: this script has no Wiki access and must stay meaningful on a node
@@ -286,6 +289,7 @@ def scan_firewall():
     m = re.search(r"^Default:\s*(\w+)\s*\(incoming\)", text, re.M)
     ufw["default_incoming"] = m.group(1).lower() if m else "unknown"
     rules = []
+    dynamic = []
     in_table = False
     for l in lines:
         if l.startswith("--"):
@@ -295,12 +299,26 @@ def scan_firewall():
             continue
         # "8123/tcp on tailscale0   ALLOW IN   Anywhere   # comment" → drop the
         # comment (operator prose) and collapse whitespace.
-        rule = " ".join(l.split("#", 1)[0].split())
-        if rule:
+        body, _, comment = l.partition("#")
+        rule = " ".join(body.split())
+        if not rule:
+            continue
+        # Fail2Ban inserts / removes "REJECT IN <ip>  # by Fail2Ban after N
+        # attempts against <jail>" on its own schedule (ccc-node#1536). Those
+        # are dynamic, not operator policy: keep them out of `rules` and the
+        # hash so a ban coming and going does not flip the fleet baseline,
+        # but report them separately so they stay observable.
+        if "fail2ban" in comment.lower():
+            dynamic.append(rule)
+        else:
             rules.append(rule)
     rules = sorted(set(rules))
     ufw["rules"] = rules
     ufw["rules_hash"] = hashlib.sha256("\n".join(rules).encode()).hexdigest()
+    if dynamic:
+        # Only present when non-empty: a node without dynamic rules emits the
+        # exact JSON it did before #1536 (accepted baselines stay valid).
+        ufw["dynamic_rules"] = sorted(set(dynamic))
     return ufw
 
 
@@ -356,7 +374,9 @@ print(f"- cloudflared units: {exposure['cloudflared_units']} · reverse ssh: {ex
       f" · funnel: {'YES' if exposure['funnel_configured'] else 'no'} · residue: {exposure['residue_files']}")
 ufw = firewall["ufw"]
 if ufw["status"] == "active":
-    print(f"- ufw: active · default incoming {ufw['default_incoming']} · {len(ufw['rules'])} rules · hash {ufw['rules_hash'][:8]}")
+    dyn = ufw.get("dynamic_rules") or []
+    print(f"- ufw: active · default incoming {ufw['default_incoming']} · {len(ufw['rules'])} rules · hash {ufw['rules_hash'][:8]}"
+          + (f" · dynamic {len(dyn)} (fail2ban, excluded from hash)" if dyn else ""))
 else:
     print(f"- ufw: {ufw['status']}")
 if units:
@@ -383,4 +403,6 @@ if ufw["rules"]:
     print("")
     for r in ufw["rules"]:
         print(f"- ufw: `{r}`")
+for r in ufw.get("dynamic_rules") or []:
+    print(f"- ufw (dynamic): `{r}`")
 PY

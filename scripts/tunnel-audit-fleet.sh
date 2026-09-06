@@ -105,7 +105,11 @@ collect() { # <node> -> writes current/<node>.json ; returns 0 ok, 1 unreachable
 # public bind accepted on the strength of default-deny must re-surface as NEW
 # when the policy or the rule set changes. Nodes whose JSON predates the
 # firewall block contribute no firewall line, so old baselines compare as NEW
-# once (re-accept after reviewing).
+# once (re-accept after reviewing). Fail2Ban's dynamic bans are NOT part of
+# this identity: the collector keeps them out of rules/rules_hash and lists
+# them under firewall.ufw.dynamic_rules (#1536); dynamic_count() surfaces the
+# count on the verdict as an observation so a ban coming or going never
+# flips a node NEW/GONE.
 signature() { # <json> -> sorted "kind\tid" lines
   jq -r '
     ([.units[]? | "unit\t\(.unit) [\(.kind)]"]
@@ -120,6 +124,9 @@ signature() { # <json> -> sorted "kind\tid" lines
               else "firewall\tufw \(.status)" end ]
         else [] end))
     | .[]' "$1" 2>/dev/null | sort -u
+}
+dynamic_count() { # <json> -> number of fail2ban-style dynamic ufw rules (0 when absent / old collector)
+  jq -r '(.firewall.ufw.dynamic_rules // []) | length' "$1" 2>/dev/null || echo 0
 }
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -156,6 +163,9 @@ for node in $NODES; do
         verdict="OK $node"
       fi
     fi
+    # Observation only (never compared): active fail2ban bans on the node.
+    dyn="$(dynamic_count "$cur")"
+    [ "${dyn:-0}" -gt 0 ] 2>/dev/null && verdict="$verdict (ufw dynamic=$dyn)"
   fi
   printf '%s\n' "$verdict" >> "$run_file"
   [ "$QUIET" = 1 ] || printf '%s\n' "$verdict"
