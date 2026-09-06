@@ -84,7 +84,9 @@ fixture_ok() { make_fixture "$TMP/fx"; }
 
 # 1) render is deterministic
 fixture_ok
-python3 "$REG" render --repo-root "$TMP/fx" > "$TMP/r1.json" 2>"$TMP/r1.err"; rc1=$?
+python3 "$REG" render --repo-root "$TMP/fx" > "$TMP/r1.json" 2>"$TMP/r1.err"
+# shellcheck disable=SC2034  # rc1 is read via eval inside ok()
+rc1=$?
 ok "render exits 0 on a valid fixture" 'test "$rc1" = 0'
 python3 "$REG" render --repo-root "$TMP/fx" > "$TMP/r2.json" 2>/dev/null
 ok "render is byte-deterministic" 'cmp -s "$TMP/r1.json" "$TMP/r2.json"'
@@ -99,6 +101,7 @@ fixture_ok
 out="$(python3 "$REG" update --repo-root "$TMP/fx")"
 ok "update writes the artifact" 'echo "$out" | jq -e ".ok == true and .written == true" >/dev/null'
 ok "artifact mode is 0644" 'test "$(stat -c %a "$TMP/fx/skills/registry.json")" = 644'
+# shellcheck disable=SC2034  # out2 is read via eval inside ok()
 out2="$(python3 "$REG" update --repo-root "$TMP/fx")"
 ok "second update is byte-idempotent (written=false)" 'echo "$out2" | jq -e ".written == false" >/dev/null'
 ok "validate passes on a fresh fixture" 'python3 "$REG" validate --repo-root "$TMP/fx" | jq -e ".ok == true" >/dev/null'
@@ -108,6 +111,7 @@ make_fixture "$TMP/stale"
 python3 "$REG" update --repo-root "$TMP/stale" >/dev/null
 printf '\nnew content\n' >> "$TMP/stale/skills/demo-skill/SKILL.md"
 err="$(python3 "$REG" validate --repo-root "$TMP/stale" 2>&1 >/dev/null)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "stale tree fails validation" 'test "$rc" = 2'
 ok "stale failure names registry_stale" 'grep -q "registry_stale" <<<"$err"'
@@ -184,6 +188,7 @@ data = json.load(open(path))
 data["managed_skills"].append({"name": "ghost-skill", "source": "skills/ghost-skill"})
 json.dump(data, open(path, "w"))
 PY
+# shellcheck disable=SC2034  # err is read via eval inside ok()
 err="$(python3 "$REG" render --repo-root "$TMP/orphan" 2>&1 >/dev/null)"
 ok "unknown managed source fails closed" 'grep -q "registry_managed_unknown" <<<"$err"'
 
@@ -219,6 +224,7 @@ data["classifications"].append(
 )
 json.dump(data, open(path, "w"))
 PY
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(python3 "$REG" update --repo-root "$TMP/gitmode" 2>/dev/null)"
 ok "untracked new skill dir registers in git mode" 'echo "$out" | jq -e ".ok == true and .written == true and .skills == 5" >/dev/null'
 ok "git-mode tree validates fresh" 'python3 "$REG" validate --repo-root "$TMP/gitmode" | jq -e ".ok == true" >/dev/null'

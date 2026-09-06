@@ -112,9 +112,12 @@ make_write() { # name relative content id output
 
 make_skill patch-one
 make_patch patch-one SKILL.md "1. Read." "1. Read twice." "$(printf '1%.0s' {1..64})" "$TMP/patch.json"
+# shellcheck disable=SC2034  # before is read via eval inside ok()
 before="$(sha256sum "$SKILLS/patch-one/SKILL.md")"
+# shellcheck disable=SC2034  # ledger_before is read via eval inside ok()
 ledger_before="$(grep -c '"event":"skill-proposal-apply"' "$STATE/skill-autosave-ownership.jsonl" || true)"
 out="$(tool apply-proposal --proposal "$TMP/patch.json" --dry-run)"
+# shellcheck disable=SC2034  # ledger_after is read via eval inside ok()
 ledger_after="$(grep -c '"event":"skill-proposal-apply"' "$STATE/skill-autosave-ownership.jsonl" || true)"
 ok "patch dry-run reports hashes without mutation" \
   'jq -e ".dry_run == true and .changed == false" >/dev/null <<<"$out" && [ "$before" = "$(sha256sum "$SKILLS/patch-one/SKILL.md")" ] && [ "$ledger_before" = "$ledger_after" ]'
@@ -332,8 +335,12 @@ tool apply-proposal --proposal "$TMP/cap-a.json" --automatic --daily-cap 1 >"$TM
 p1=$!
 tool apply-proposal --proposal "$TMP/cap-b.json" --automatic --daily-cap 1 >"$TMP/cap-b.out" &
 p2=$!
-wait "$p1"; r1=$?
-wait "$p2"; r2=$?
+wait "$p1"
+# shellcheck disable=SC2034  # r1 is read via eval inside ok()
+r1=$?
+wait "$p2"
+# shellcheck disable=SC2034  # r2 is read via eval inside ok()
+r2=$?
 ok "concurrent auto apply cannot double-spend the last cap slot" \
   '[ "$(( (r1 == 0) + (r2 == 0) ))" = 1 ] && [ "$(cat "$TMP/cap-a.out" "$TMP/cap-b.out" | jq -s "[.[] | select(.code == \"incremental_daily_cap_exhausted\")] | length")" = 1 ]'
 
@@ -624,7 +631,10 @@ jq -nc '{
   automatic:true,
   cap_day:"2099-01-01"
 }' >> "$STATE/skill-autosave-ownership.jsonl"
-out="$(tool automatic-usage --day 2099-01-01)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(tool automatic-usage --day 2099-01-01)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "invalid cap-ledger transition fails closed" \
   '[ "$rc" = 2 ] && jq -e ".code == \"incremental_ledger_state_invalid\"" >/dev/null <<<"$out"'
 

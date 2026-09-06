@@ -100,6 +100,7 @@ ok "Codex apply removes standalone nunchi hooks but preserves the canonical load
 # installer. Appended after the marker; strip_cron matches by substring.
 # shellcheck source=/dev/null
 . "$ROOT/scripts/lib/installer-gen-stamp.sh"
+# shellcheck disable=SC2034  # want_gen is read via eval inside ok()
 want_gen="$(ccc_installer_gen_stamp "$ROOT/scripts/install-nunchi.sh")"
 ok "all three managed cron lines carry the gen stamp" \
   '[ "$(grep -cE "nunchi:#816 gen=h_[0-9a-f]{12}$" "$cron_store")" = 3 ]'
@@ -108,6 +109,7 @@ ok "gen stamp matches installer content" \
 
 # --- install record (#1081 phase 2): self-update replay material. The record
 # must materialize the RESOLVED provider, not the ambient env.
+# shellcheck disable=SC2034  # nrec is read via eval inside ok()
 nrec="$state/install-nunchi.json"
 ok "apply writes an install record with resolved provider argv" \
   'jq -e ".schema==\"ccc.install-record.v1\" and .marker==\"# nunchi:#816\" and .gen==\"$want_gen\" and .argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
@@ -228,7 +230,7 @@ ok "Piri apply pins the resolved extractor CLI into the feed cron" \
   '[ "$rc" = 0 ] && grep -q "CCC_PIRI_CLI_PATH=$fake_bin/piri-real.sh" "$cron_store"'
 ok "Piri apply with a resolvable CLI does not warn" \
   '! grep -q "no runnable Piri CLI" <<<"$out"'
-out="$(CCC_PIRI_REAL_CLI_PATH= CCC_PIRI_CLI_PATH= CCC_PIRI_DEFAULT_CLI_PATH="$fake_bin/absent.sh" PATH="$fake_bin:/usr/bin:/bin" run_install --apply --piri 2>&1)"; rc=$?
+out="$(CCC_PIRI_REAL_CLI_PATH='' CCC_PIRI_CLI_PATH='' CCC_PIRI_DEFAULT_CLI_PATH="$fake_bin/absent.sh" PATH="$fake_bin:/usr/bin:/bin" run_install --apply --piri 2>&1)"; rc=$?
 ok "Piri apply without any runnable CLI warns loudly instead of installing a dead cron" \
   '[ "$rc" = 0 ] && grep -q "no runnable Piri CLI" <<<"$out"'
 ok "Piri apply without a CLI leaves the feed cron unpinned" \
@@ -347,9 +349,15 @@ run_edge_refresh() {
     CCC_TEST_TIMEOUT_CAPTURE="$timeout_capture" "$@" \
     bash "$hooks/nunchi/mempalace-refresh.sh" codex "$codex_home/sessions"
 }
-run_edge_refresh CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=0 >/dev/null 2>&1; rc_zero=$?
+run_edge_refresh CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=0 >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc_zero is read via eval inside ok()
+rc_zero=$?
+# shellcheck disable=SC2034  # zero_args is read via eval inside ok()
 zero_args="$(cat "$timeout_capture")"
-run_edge_refresh CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=99999 >/dev/null 2>&1; rc_large=$?
+run_edge_refresh CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=99999 >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc_large is read via eval inside ok()
+rc_large=$?
+# shellcheck disable=SC2034  # large_args is read via eval inside ok()
 large_args="$(cat "$timeout_capture")"
 ok "zero and oversized refresh timeouts cannot disable the 3300-second bound" \
   '[ "$rc_zero" = 0 ] && [ "$rc_large" = 0 ] && [[ "$zero_args" == "-k 30s 3300 "* ]] && [[ "$large_args" == "-k 30s 3300 "* ]]'
@@ -432,7 +440,9 @@ out="$(env "${common_env[@]}" PATH="$weird_mp_dir:/usr/bin:/bin" \
   CCC_NUNCHI_MEMPALACE_STATUS="$weird_status" NUNCHI_SWEEP_DIR="$weird_sweep" \
   bash "$ROOT/scripts/install-nunchi.sh" --apply --codex 2>&1)"; rc=$?
 refresh_line="$(grep 'mempalace-refresh.sh' "$cron_store")"
+# shellcheck disable=SC2034  # feed_line is read via eval inside ok()
 feed_line="$(grep 'codex-feed.sh' "$cron_store")"
+# shellcheck disable=SC2034  # bench_line is read via eval inside ok()
 bench_line="$(grep 'bench.sh' "$cron_store")"
 runtime_cmd="$(cut -d ' ' -f 6- <<<"$refresh_line")"
 runtime_cmd="${runtime_cmd% \# nunchi:#816 gen=h_*}"
@@ -440,7 +450,9 @@ runtime_cmd="${runtime_cmd% \# nunchi:#816}"
 # crond removes the escape that protects each literal percent before /bin/sh.
 runtime_cmd="${runtime_cmd//\\%/%}"
 env -i HOME="$home" PATH="/usr/bin:/bin" CCC_TEST_MEMPALACE_CAPTURE="$weird_capture" \
-  /bin/sh -c "$runtime_cmd" >/dev/null 2>&1; cron_rc=$?
+  /bin/sh -c "$runtime_cmd" >/dev/null 2>&1
+  # shellcheck disable=SC2034  # cron_rc is read via eval inside ok()
+  cron_rc=$?
 ok "generated refresh cron preserves restricted-PATH custom and Termux-style paths" \
   '[ "$rc" = 0 ] && [ "$cron_rc" = 0 ] && grep -q "CCC_NUNCHI_MEMPALACE_CLI=" <<<"$refresh_line" && grep -qx "mine $weird_sweep --mode convos --wing codex" "$weird_capture" && jq -e '\'' .provider == "codex" and .state == "ok" '\'' "$weird_status" >/dev/null && [ "$(stat -c %a "$weird_status")" = 600 ]'
 ok "generated cron protects quotes, percent and semicolon from splitting or injection" \
@@ -474,13 +486,16 @@ mkdir -p "$home/.claude/projects"
 
 out="$(run_install --remove 2>&1)"; rc=$?
 env "${common_env[@]}" python3 "$ROOT/scripts/ccc_codex_memory.py" materialize --json \
-  > "$TMP/materialize-off.json" 2> "$TMP/materialize-off.err"; materialize_rc=$?
+  > "$TMP/materialize-off.json" 2> "$TMP/materialize-off.err"
+  # shellcheck disable=SC2034  # materialize_rc is read via eval inside ok()
+  materialize_rc=$?
 ok "--remove immediately rolls Codex back to canonical memory" \
   '[ "$rc" = 0 ] && [ "$materialize_rc" = 0 ] && [ "$(cat "$state/nunchi.mode")" = off ] && grep -q "INSTALLER_BASE_SENTINEL" "$codex_home/AGENTS.md" && ! grep -q "INSTALLER_NUNCHI_SENTINEL" "$codex_home/AGENTS.md"'
 ok "--remove strips managed cron and standalone hook state while retaining the DB" \
   '[ "$(grep -c "nunchi:#816" "$cron_store" || true)" = 0 ] && grep -qxF "$unrelated_sweep" "$cron_store" && ! grep -q "nunchi/sessionstart.sh" "$claude_dir/settings.local.json" && [ -s "$nunchi_home/facts.db" ]'
 ok "--remove drops the install record (no resurrection via re-apply)" '[ ! -f "$nrec" ]'
 
+# shellcheck disable=SC2034  # cron_before_dependency_failure is read via eval inside ok()
 cron_before_dependency_failure="$(cat "$cron_store")"
 out="$(env "${common_env[@]}" CCC_NUNCHI_TIMEOUT_CLI="$TMP/missing-timeout" \
   bash "$ROOT/scripts/install-nunchi.sh" --apply --codex 2>&1)"; rc=$?
@@ -664,7 +679,10 @@ chmod +x "$auth_bin/claude"
 out="$(PATH="$auth_bin:$PATH" run_install --apply --codex 2>&1)"; rc=$?
 ok "apply stays quiet once claude is authenticated" \
   '[ "$rc" = 0 ] && ! grep -q "no authenticated LLM backend" <<<"$out"'
-out="$(PATH="$auth_bin:$PATH" run_install 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(PATH="$auth_bin:$PATH" run_install 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "status reports backend_auth=ok once a backend is authenticated" \
   '[ "$rc" = 0 ] && grep -q "^backend_auth: ok" <<<"$out"'
 

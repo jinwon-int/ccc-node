@@ -165,12 +165,14 @@ stage_env=(
   "PATH=$BIN:$PATH"
 )
 out="$(env "${stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
+# shellcheck disable=SC2034  # outbox_file is read via eval inside ok()
 outbox_file="$(find "$STATE/skill-promotion/outbox" -maxdepth 1 -type f -name '*.json' | head -1)"
 ok "live node run stages one owner-only envelope" \
   '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"staged\"" >/dev/null <<<"$out" && [ "$(stat -c %a "$outbox_file")" = 600 ]'
 ok "node-local staging makes no GitHub or SSH call" \
   '[ ! -e "$GH_STATE/calls" ] && [ ! -e "$TMP/ssh-state/calls" ]'
 out="$(env "${stage_env[@]}" python3 "$PROMOTER" export --limit 1)"; rc=$?
+# shellcheck disable=SC2034  # transport_id is read via eval inside ok()
 transport_id="$(jq -r '.envelopes[0].transport_id' <<<"$out")"
 ok "read-only export returns a hash-verified envelope" \
   '[ "$rc" = 0 ] && jq -e ".mode == \"export-read-only\" and .envelopes[0].node == \"testnode\" and (.envelopes[0].files[0].content_b64 | length > 20)" >/dev/null <<<"$out"'
@@ -194,7 +196,9 @@ publish_env=(
   "GH_TEST_PRIVATE=true"
 )
 out="$(env "${publish_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+# shellcheck disable=SC2034  # branch is read via eval inside ok()
 branch="$(jq -r '.published[0].branch' <<<"$out")"
+# shellcheck disable=SC2034  # candidate_id is read via eval inside ok()
 candidate_id="release-checklist-$(jq -r '.published[0].tree_sha256[0:12]' <<<"$out")"
 ok "central publisher opens a private draft intake PR" \
   '[ "$rc" = 0 ] && jq -e ".published[0].outcome == \"pr-opened\" and .published[0].draft == \"true\"" >/dev/null <<<"$out" && grep -q -- "--draft" "$GH_STATE/create.args"'
@@ -207,12 +211,14 @@ ok "successful collection retains the envelope in sent and clears export" \
 write_skill visibility-check ""
 write_status visibility-check
 env "${stage_env[@]}" python3 "$PROMOTER" run >/dev/null
+# shellcheck disable=SC2034  # remote_before is read via eval inside ok()
 remote_before="$(git --git-dir="$REMOTE" for-each-ref --format='%(refname)' refs/heads | wc -l)"
 SSH_STATE="$TMP/ssh-state"
 mkdir -p "$SSH_STATE"
 out="$(env "${publish_env[@]}" GH_TEST_PRIVATE=false \
   CCC_SKILL_PROMOTION_COLLECT_NODES=remotenode SSH_TEST_STATE="$SSH_STATE" \
   SSH_TEST_EXPORT="$TMP/unused" python3 "$PROMOTER" collect)"; rc=$?
+# shellcheck disable=SC2034  # remote_after is read via eval inside ok()
 remote_after="$(git --git-dir="$REMOTE" for-each-ref --format='%(refname)' refs/heads | wc -l)"
 ok "public repository visibility fails closed before data leaves the publisher" \
   '[ "$rc" = 2 ] && jq -e ".code == \"target_repo_not_private\"" >/dev/null <<<"$out" && [ "$remote_before" = "$remote_after" ] && [ ! -e "$SSH_STATE/calls" ]'
@@ -252,6 +258,7 @@ ok "remote candidate is acknowledged only after PR publication" \
 write_skill lock-check ""
 write_status lock-check
 env "${stage_env[@]}" python3 "$PROMOTER" run >/dev/null
+# shellcheck disable=SC2034  # lock_transport is read via eval inside ok()
 lock_transport="$(env "${stage_env[@]}" python3 "$PROMOTER" export --limit 1 | jq -r '.envelopes[0].transport_id')"
 LOCK_HOLDER="$TMP/lock-holder.py"
 cat > "$LOCK_HOLDER" <<'PY'
@@ -277,6 +284,7 @@ if [ "$lock_ready" != 1 ]; then
 fi
 LOCK_GH_STATE="$TMP/lock-gh-state"
 lock_env=("${publish_env[@]}" "GH_TEST_STATE=$LOCK_GH_STATE")
+# shellcheck disable=SC2034  # ledger_lines_locked is read via eval inside ok()
 ledger_lines_locked="$(grep -c . "$STATE/skill-promotion/ledger.jsonl")"
 out="$(env "${lock_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
 ok "#1477: collect under a held promotion.lock reports locked (same shape as run)" \
@@ -887,6 +895,7 @@ path, head = sys.argv[1], sys.argv[2]
 json.dump({"status": "succeeded", "result": {"output": {
     "verdict": "excellent", "head_sha": head}}}, open(path, "w"))
 PY
+# shellcheck disable=SC2034  # before_comments is read via eval inside ok()
 before_comments="$(wc -l < "$R2_GH_STATE/comments" 2>/dev/null || echo 0)"
 out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
 ok "malformed verdict consumed as a handler failure"   '[ "$rc" = 0 ] && jq -e ".revise.verdicts[0].outcome == \"verdict-malformed\"" >/dev/null <<<"$out" && jq -e "select(.kind==\"a2a-verdict\" and .status==\"malformed\")" >/dev/null "$ledger"'
@@ -990,6 +999,7 @@ drop_row '{"ts":"2026-08-29T11:00:00Z","kind":"a2a-revise-result","task_id":"dro
   "status":"drop-recommended","node":"nodeb","name":"skillb","pr":"102",
   "reason":"Single-incident only."}'
 drop_row '{"ts":"2026-08-29T12:00:00Z","kind":"a2a-verdict","task_id":"other","status":"ok"}'
+# shellcheck disable=SC2034  # ledger_lines_before is read via eval inside ok()
 ledger_lines_before="$(grep -c . "$DROP_LEDGER")"
 
 out="$(env "${drop_env[@]}" python3 "$PROMOTER" drop-report)"; rc=$?
@@ -1546,7 +1556,10 @@ verdict_rows = [json.loads(l) for l in open(iso_state / "ledger.jsonl")]
 assert sum(1 for r in verdict_rows if r.get("status") == "consumed") == 1, verdict_rows
 print("RECEIPT-PROJECTION-OK")
 FIXTURE
-env "${base_env[@]}" python3 "$RECEIPT_FIXTURE" "$PROMOTER" > "$TMP/receipt-out" 2>&1; rc=$?; ok "signed receipt fence is projected at verdict consumption (#1470)" \
+env "${base_env[@]}" python3 "$RECEIPT_FIXTURE" "$PROMOTER" > "$TMP/receipt-out" 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "signed receipt fence is projected at verdict consumption (#1470)" \
   '[ "$rc" = 0 ] && grep -q "RECEIPT-PROJECTION-OK" "$TMP/receipt-out"'
 
 echo "PASS=$pass FAIL=$fail"

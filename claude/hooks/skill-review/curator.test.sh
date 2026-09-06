@@ -119,7 +119,9 @@ ok "managed/bundled skill is never auto-archived" '[ -d "$SKILLS/managedone" ] &
 # --- 5. dry-run is mutation-free ----------------------------------------------
 make_managed gamma
 tool run >/dev/null
+# shellcheck disable=SC2034  # before_ledger is read via eval inside ok()
 before_ledger="$(ledger_rows)"
+# shellcheck disable=SC2034  # before_backups is read via eval inside ok()
 before_backups="$(ls "$STATE/skill-autosave-curator-backups" 2>/dev/null | wc -l)"
 out="$(at 300 run --dry-run)"
 ok "dry-run reports the would-archive" 'jq -e ".counts.archived == 1 and .dry_run == true" >/dev/null <<<"$out"'
@@ -146,6 +148,7 @@ ok "manual archive of pinned is denied" '[ "$rc" -eq 2 ] && jq -e ".code == \"li
 for i in 1 2 3 4 5 6 7; do
   at "$((300 + i))" backup --reason "retention-test" >/dev/null
 done
+# shellcheck disable=SC2034  # count is read via eval inside ok()
 count="$(ls "$STATE/skill-autosave-curator-backups" | wc -l)"
 ok "backup retention keeps only the newest 5" '[ "$count" -eq 5 ]'
 out="$(tool list-backups)"
@@ -239,6 +242,7 @@ ln -s "$TMP/outside-data" "$SKILLS/theta/linked-dir"
 out="$(at 800 run)"
 ok "dir-symlink skill is quarantined, not archived" 'jq -e "[.decisions[] | select(.name == \"theta\" and .action == \"quarantine\")] | length == 1" >/dev/null <<<"$out" && [ -d "$SKILLS/theta" ]'
 ok "quarantine is reported at the top level" 'jq -e ".quarantined == [\"theta\"]" >/dev/null <<<"$out"'
+# shellcheck disable=SC2034  # backup_dir is read via eval inside ok()
 backup_dir="$(jq -r '.backup.backup_id' <<<"$out")"
 ok "quarantined skill is absent from the snapshot" '[ ! -e "$STATE/skill-autosave-curator-backups/$backup_dir/skills/theta" ]'
 ok "outside data never enters the backup" '[ ! -e "$STATE/skill-autosave-curator-backups/$backup_dir/skills/theta/linked-dir/blob.bin" ]'
@@ -257,6 +261,7 @@ printf -- '---\nname: kappa\ndescription: Drifted content for the rollback hones
 rm -rf "$STATE/skill-autosave-curator-backups/$partial_backup/skills/kappa"
 out="$(tool rollback --id "$partial_backup")"; rc=$?
 ok "rollback with a missing member fails closed" '[ "$rc" -eq 2 ] && jq -e ".code == \"backup_member_missing\"" >/dev/null <<<"$out"'
+# shellcheck disable=SC2034  # tail_row is read via eval inside ok()
 tail_row="$(grep '"curator-rollback"' "$STATE/skill-autosave-ownership.jsonl" | tail -1)"
 ok "partial rollback records conflict with the applied count" 'jq -e ".outcome == \"conflict\" and .applied == 1" >/dev/null <<<"$tail_row"'
 ok "the applied skill kept its restored content" 'grep -q "curator lifecycle tests" "$SKILLS/iota/SKILL.md"'
@@ -289,6 +294,7 @@ lock_pid=$!
 sleep 1
 start="$(date +%s)"
 out="$(tool bump --event use --name iota)"; rc=$?
+# shellcheck disable=SC2034  # elapsed is read via eval inside ok()
 elapsed=$(( $(date +%s) - start ))
 ok "bump behind a held lock returns fast and degraded" '[ "$rc" -eq 0 ] && [ "$elapsed" -lt 5 ] && jq -e ".recorded == false and .degraded == true" >/dev/null <<<"$out"'
 wait "$lock_pid" 2>/dev/null
@@ -366,6 +372,7 @@ created = [
 ]
 assert record["created_at"] == module._ts(module._parse_ts(created[-1])), record
 PY
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "mutating run reads the ownership ledger exactly once" '[ "$rc" = 0 ]'
 rm -rf "$RB_TMP"

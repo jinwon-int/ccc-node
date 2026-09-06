@@ -45,8 +45,10 @@ ok "fresh apply creates the canonical disabled plugin entry" \
 ok "fresh config is private" \
   '[ "$(stat -c %a "$fresh/config.toml")" = 600 ]'
 
+# shellcheck disable=SC2034  # fresh_before is read via eval inside ok()
 fresh_before="$(sha256sum "$fresh/config.toml")"
 out="$(python3 "$POLICY" apply --codex-home "$fresh" --json)"; rc=$?
+# shellcheck disable=SC2034  # fresh_after is read via eval inside ok()
 fresh_after="$(sha256sum "$fresh/config.toml")"
 ok "second apply is byte-idempotent" \
   '[ "$rc" = 0 ] && [ "$fresh_before" = "$fresh_after" ] && jq -e '\''.changed == false'\'' <<<"$out" >/dev/null'
@@ -81,8 +83,10 @@ mkdir -p "$inline"
 chmod 700 "$inline"  # contract-compliant home under any umask (#772)
 printf '%s\n' '[plugins]' '"github@openai-curated-remote" = { enabled = true }' > "$inline/config.toml"
 chmod 600 "$inline/config.toml"  # contract-compliant config under any umask (#772)
+# shellcheck disable=SC2034  # inline_before is read via eval inside ok()
 inline_before="$(sha256sum "$inline/config.toml")"
 out="$(python3 "$POLICY" apply --codex-home "$inline" --json)"; rc=$?
+# shellcheck disable=SC2034  # inline_after is read via eval inside ok()
 inline_after="$(sha256sum "$inline/config.toml")"
 ok "noncanonical inline plugin config fails closed" \
   '[ "$rc" = 2 ] && [ "$inline_before" = "$inline_after" ] && jq -e '\''.code == "plugin_config_noncanonical"'\'' <<<"$out" >/dev/null'
@@ -92,8 +96,10 @@ mkdir -p "$invalid"
 chmod 700 "$invalid"  # contract-compliant home under any umask (#772)
 printf '%s\n' 'not valid = [' > "$invalid/config.toml"
 chmod 600 "$invalid/config.toml"  # contract-compliant config under any umask (#772)
+# shellcheck disable=SC2034  # invalid_before is read via eval inside ok()
 invalid_before="$(sha256sum "$invalid/config.toml")"
 out="$(python3 "$POLICY" apply --codex-home "$invalid" --json)"; rc=$?
+# shellcheck disable=SC2034  # invalid_after is read via eval inside ok()
 invalid_after="$(sha256sum "$invalid/config.toml")"
 ok "invalid TOML fails without rewriting the file" \
   '[ "$rc" = 2 ] && [ "$invalid_before" = "$invalid_after" ] && jq -e '\''.code == "config_invalid_toml"'\'' <<<"$out" >/dev/null'
@@ -103,8 +109,10 @@ mkdir -p "$linked"
 chmod 700 "$linked"  # contract-compliant home under any umask (#772)
 printf '%s\n' 'sentinel = "outside"' > "$TMP/outside.toml"
 ln -s "$TMP/outside.toml" "$linked/config.toml"
+# shellcheck disable=SC2034  # outside_before is read via eval inside ok()
 outside_before="$(sha256sum "$TMP/outside.toml")"
 out="$(python3 "$POLICY" apply --codex-home "$linked" --json)"; rc=$?
+# shellcheck disable=SC2034  # outside_after is read via eval inside ok()
 outside_after="$(sha256sum "$TMP/outside.toml")"
 ok "config symlinks are rejected without touching the target" \
   '[ "$rc" = 2 ] && [ "$outside_before" = "$outside_after" ] && jq -e '\''.code == "config_unsafe"'\'' <<<"$out" >/dev/null'
@@ -113,7 +121,10 @@ home_target="$TMP/home-target"
 home_link="$TMP/home-link"
 mkdir -p "$home_target"
 ln -s "$home_target" "$home_link"
-out="$(python3 "$POLICY" apply --codex-home "$home_link" --json)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(python3 "$POLICY" apply --codex-home "$home_link" --json)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "Codex home symlinks are rejected before config creation" \
   '[ "$rc" = 2 ] && [ ! -e "$home_target/config.toml" ] && jq -e '\''.code == "codex_home_unsafe"'\'' <<<"$out" >/dev/null'
 

@@ -136,8 +136,10 @@ ok "summary counts newly blocked" 'jq -e ".newly_blocked | length == 1" >/dev/nu
 ok "block notification queued" 'jq -r ".text" "$SPOOL"/*SkillAutoInstall*.json | grep -q "차단 1건"'
 
 # second run: same block is not "new" — no duplicate notification
+# shellcheck disable=SC2034  # spool_before is read via eval inside ok()
 spool_before="$(ls "$SPOOL" | wc -l | tr -d '[:space:]')"
 out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+# shellcheck disable=SC2034  # spool_after is read via eval inside ok()
 spool_after="$(ls "$SPOOL" | wc -l | tr -d '[:space:]')"
 ok "still-blocked draft is not re-notified" '[ "$spool_before" = "$spool_after" ]'
 ok "still-blocked draft reported but not newly" 'jq -e "(.blocked | length == 1) and (.newly_blocked | length == 0)" >/dev/null <<<"$out"'
@@ -367,7 +369,9 @@ ok "rollback --all leaves hand-made skill" '[ -f "$SKILLS/hand-made/SKILL.md" ]'
 out="$(run_auto bash "$AUTO" adopt hand-made --dry-run)"
 ok "autoinstall proxy exposes adopt dry-run" 'jq -e ".dry_run == true and .reason == \"would-adopt\"" >/dev/null <<<"$out"'
 run_auto bash "$AUTO" adopt hand-made >/dev/null
-run_auto bash "$AUTO" rollback hand-made >/dev/null 2>&1; rc=$?
+run_auto bash "$AUTO" rollback hand-made >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "adopted hand-made skill cannot be rolled back" '[ "$rc" != 0 ] && [ -f "$SKILLS/hand-made/SKILL.md" ] && jq -e ".created_by == \"operator-adopt\" and .rollback_eligible == false" "$SKILLS/hand-made/.autosave-meta.json" >/dev/null'
 
 # --- 10) status is read-only ------------------------------------------------------------
@@ -380,7 +384,7 @@ mkdir -p "$A_STATE/pending-skills" "$A_SKILLS"
 chmod 700 "$A_STATE"
 chmod 700 "$A_SKILLS"  # contract-compliant root under any umask (#770)
 make_draft_at() { # <store> <skills> <id> <name> <desc>
-  local st="$1" sk="$2" id="$3" nm="$4" desc="$5"
+  local st="$1" id="$3" nm="$4" desc="$5"
   mkdir -p "$st/pending-skills/$id"
   printf -- '---\nname: %s\ndescription: %s\n---\n\n# %s\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' "$nm" "$desc" "$nm" > "$st/pending-skills/$id/SKILL.md"
   jq -nc --arg id "$id" --arg name "$nm" '{id:$id,name:$name,status:"pending",session_id:"s"}' > "$st/pending-skills/$id/meta.json"
@@ -428,6 +432,7 @@ chmod 700 "$Q_STATE" "$Q_SKILLS" "$Q_DECOY"
 make_draft_at "$Q_STATE" "$Q_SKILLS" q-anchor queue-anchor "Capture the recurring queue anchor verification procedure here."
 out="$(CCC_SKILL_REVIEW_STATE_DIR="$Q_STATE" CCC_STATE_DIR="$Q_DECOY" CLAUDE_SKILLS_DIR="$Q_SKILLS" CCC_PUSH_SPOOL="$TMP/qspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" status)"
 ok "CCC_STATE_DIR does not hide the real queue" 'grep -q "pending drafts: 1" <<<"$out"'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(CCC_SKILL_REVIEW_STATE_DIR="$Q_STATE" CCC_STATE_DIR="$Q_DECOY" CLAUDE_SKILLS_DIR="$Q_SKILLS" CCC_PUSH_SPOOL="$TMP/qspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "CCC_STATE_DIR does not relocate installs" 'jq -e "(.installed | index(\"queue-anchor\")) != null" >/dev/null <<<"$out" && [ -f "$Q_SKILLS/queue-anchor/SKILL.md" ]'
 ok "CCC_STATE_DIR decoy queue stays untouched" '[ -z "$(ls -A "$Q_DECOY/pending-skills")" ] && [ ! -e "$Q_DECOY/skill-autosave-install.jsonl" ]'
@@ -530,6 +535,7 @@ printf '%s\n' \
   'Also docs.github.com/en/rest/pulls covers it.' \
   'The old docs.github.com/en/repositories/configuring-branches-and-merges/ form 404s now.' \
   'Source is pkg/cmd/pr/checks/checks.go:303 and notes live in docs/notes.md.' > "$CU"
+# shellcheck disable=SC2034  # urls is read via eval inside ok()
 urls="$(claim_urls "$CU")"
 ok "scheme-bearing URL extracted" 'grep -qx "https://example.org/a" <<<"$urls"'
 ok "schemeless citation extracted and normalized" 'grep -qx "https://docs.github.com/en/rest/pulls" <<<"$urls"'

@@ -60,7 +60,10 @@ $TARGET_SHORT
 EOF
 
 NODES=converged,behindnode,nochecker,downnode,ghostnode,hostless
-out="$(bash "$SUT" --path-probe "$TMP/probe.txt" --target-commit "$TARGET" --node-list "$NODES")"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(bash "$SUT" --path-probe "$TMP/probe.txt" --target-commit "$TARGET" --node-list "$NODES")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 
 ok "emits a single JSON object for issue 82" \
   '[ "$rc" = 0 ] && jq -e ".issue == 82 and (.nodes | length) == 6" <<<"$out" >/dev/null'
@@ -139,6 +142,7 @@ cat > "$TMP/probe-nocommit.txt" <<'EOF'
 HOST=quiet.example
 CANDIDATE=/root/ccc-node
 EOF
+# shellcheck disable=SC2034  # nc_out is read via eval inside ok()
 nc_out="$(bash "$SUT" --path-probe "$TMP/probe-nocommit.txt" --target-commit "$TARGET" --node-list quiet)"
 ok "a reporting node without a commit is blocked, not silently pending" \
   'jq -e ".nodes[0].checker_available == true and .nodes[0].verification == \"blocked\"
@@ -158,6 +162,7 @@ HOST=converged.example
 CANDIDATE=/root/ccc-node
 $TARGET
 EOF
+# shellcheck disable=SC2034  # long_out is read via eval inside ok()
 long_out="$(bash "$SUT" --path-probe "$TMP/probe-long.txt" --target-commit "$TARGET" --node-list converged)"
 ok "a 40-char probe commit compares equal to the target" \
   'jq -e ".nodes[0].verification == \"verified\" and .nodes[0].commit_compare == \"equal\"" <<<"$long_out" >/dev/null'
@@ -170,6 +175,7 @@ cat > "$TMP/status.txt" <<'EOF'
 HOST=converged.example
 NO_CHECKER_FOUND
 EOF
+# shellcheck disable=SC2034  # merged is read via eval inside ok()
 merged="$(bash "$SUT" --status "$TMP/status.txt" --path-probe "$TMP/probe.txt" --target-commit "$TARGET" --node-list converged)"
 ok "a status-file marker overrides an otherwise converged probe" \
   'jq -e ".nodes[0].status == \"NO_CHECKER_FOUND\" and .nodes[0].verification == \"blocked\"" <<<"$merged" >/dev/null'
@@ -178,7 +184,10 @@ ok "both source files are recorded when given" \
 
 # --- degenerate inputs ------------------------------------------------------
 : > "$TMP/empty.txt"
-empty_out="$(bash "$SUT" --path-probe "$TMP/empty.txt" --target-commit "$TARGET" --node-list converged)"; erc=$?
+# shellcheck disable=SC2034  # empty_out is read via eval inside ok()
+empty_out="$(bash "$SUT" --path-probe "$TMP/empty.txt" --target-commit "$TARGET" --node-list converged)"
+# shellcheck disable=SC2034  # erc is read via eval inside ok()
+erc=$?
 ok "an empty evidence file yields a no_evidence node, not a crash" \
   '[ "$erc" = 0 ] && jq -e ".summary.total == 1 and .summary.verified == 0
       and .nodes[0].blocker_reason == \"no_evidence_in_probe\"" <<<"$empty_out" >/dev/null'

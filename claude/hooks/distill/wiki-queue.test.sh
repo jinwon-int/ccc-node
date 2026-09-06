@@ -3,6 +3,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WIKI_QUEUE="$HERE/wiki-queue.sh"
+# shellcheck disable=SC2034  # SKILL is read via eval inside ok()
 SKILL="$HERE/../../../skills/distill/SKILL.md"
 pass=0; fail=0
 TMP="$(mktemp -d)"
@@ -47,8 +48,10 @@ out="$(printf '%s' "$LEGACY_PAYLOAD" | bash "$WIKI_QUEUE" 2>&1)"; rc=$?
 ok "single-hash legacy seen line is normalized and deduped" '[ "$rc" = 0 ] && grep -q "added=0 skipped(dup)=1 total_in=1" <<<"$out" && awk -v h="$LEGACY_HASH" '\''$4 == h && NF == 4 {found=1} END{exit !found}'\'' "$CCC_STATE_DIR/wiki-candidates.seen"'
 
 EMPTY='{"session_id":"sess-empty","trigger":"manual","wiki_candidates":[],"honcho":[]}'
+# shellcheck disable=SC2034  # before is read via eval inside ok()
 before="$(find "$CCC_STATE_DIR" -type f -printf '%P %s\n' | sort)"
 out="$(printf '%s' "$EMPTY" | bash "$WIKI_QUEUE" 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # after is read via eval inside ok()
 after="$(find "$CCC_STATE_DIR" -type f -printf '%P %s\n' | sort)"
 ok "empty candidates exits 0" '[ "$rc" = 0 ] && grep -q "no wiki candidates" <<<"$out"'
 ok "empty candidates performs no writes when no stale entry exists" '[ "$before" = "$after" ]'
@@ -72,7 +75,9 @@ cat >> "$CCC_STATE_DIR/wiki-candidates.md" <<'MD'
 - summary: Old merged item.
 MD
 out="$(printf '%s' "$EMPTY" | bash "$WIKI_QUEUE" 2>&1)"; rc=$?
-out2="$(printf '%s' "$EMPTY" | bash "$WIKI_QUEUE" 2>&1)"; rc2=$?
+printf '%s' "$EMPTY" | bash "$WIKI_QUEUE" >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc2 is read via eval inside ok()
+rc2=$?
 ok "stale pending entry is marked once" '[ "$rc" = 0 ] && grep -q "\[CAND-99\].*(stale: pending review)" "$CCC_STATE_DIR/wiki-candidates.md" && [ "$(grep -c "stale: pending review" "$CCC_STATE_DIR/wiki-candidates.md")" = 1 ] && [ "$rc2" = 0 ]'
 ok "merged entries are not marked stale" '! grep -q "\[CAND-100\].*(stale: pending review)" "$CCC_STATE_DIR/wiki-candidates.md"'
 ok "distill status documents pending stale hot counts" 'grep -q "pending=.*stale=.*hot=" "$SKILL" || grep -q "pending/stale/hot" "$SKILL"'
@@ -203,13 +208,16 @@ cat > "$CCC_STATE_DIR/wiki-candidates.md" <<'MD'
 - status: pending
 - summary: distinct topic must survive
 MD
-out="$(bash "$WIKI_QUEUE" --compact 2>&1)"; rc=$?
+out="$(bash "$WIKI_QUEUE" --compact 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "compact exits 0 and reports drops" '[ "$rc" = 0 ] && grep -q "kept=3 dropped(dup)=2 buckets=2" <<<"$out"'
 ok "compact keeps newest #82 pending variant" 'grep -q "\[CAND-3\]" "$CCC_STATE_DIR/wiki-candidates.md" && ! grep -q "\[CAND-1\]" "$CCC_STATE_DIR/wiki-candidates.md" && ! grep -q "\[CAND-2\]" "$CCC_STATE_DIR/wiki-candidates.md"'
 ok "compact keeps merged and distinct entries" 'grep -q "\[CAND-4\]" "$CCC_STATE_DIR/wiki-candidates.md" && grep -q "\[CAND-5\]" "$CCC_STATE_DIR/wiki-candidates.md"'
 ok "compact refreshes seen for surviving buckets" '[ "$(wc -l < "$CCC_STATE_DIR/wiki-candidates.seen")" = 2 ]'
 out="$(printf '%s' "{\"session_id\":\"sess-after-compact\",\"trigger\":\"manual\",\"wiki_candidates\":[{\"title\":\"#82 yet another variant\",\"suggested_path\":\"pages/log.md\",\"summary\":\"x\"}],\"honcho\":[]}" | bash "$WIKI_QUEUE" 2>&1)"
 ok "post-compact re-extraction of same issue is deduped" 'grep -q "added=0 skipped(dup)=1 total_in=1" <<<"$out"'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(bash "$WIKI_QUEUE" --compact 2>&1)"
 ok "compact is idempotent" 'grep -q "dropped(dup)=0" <<<"$out"'
 

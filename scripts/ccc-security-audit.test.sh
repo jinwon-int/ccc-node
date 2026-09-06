@@ -72,18 +72,24 @@ export NUNCHI_SNAPSHOT="$clean/home/.nunchi/snapshot.md"
 export CCC_BOT_DATA_DIR="$clean/bot-data"
 export CCC_MEMORY_AUDIENCE_ROOT="$clean/aud"
 printf '{}\n' > "$CCC_STATE_DIR/autonomy-ledger.jsonl"
-printf 'unclassified\n' > "$CCC_STATE_DIR/mystery-orphan.bin"
+# The orphan must sit in a root the planner actually sweeps. Sweep roots are
+# the parents of RESOLVED inventory files; audit.autonomy_ledger's candidate
+# carries env CCC_STATE_DIR without `join`, so the planner reads the env as a
+# full file path, finds a directory, and falls back to the HOME default —
+# $clean/inventory-state is never swept (#1545: this is why the two
+# assertions below could never pass, at #1452 or any commit since).
+orphan="$clean/home/.claude/state/mystery-orphan.bin"
+printf 'unclassified\n' > "$orphan"
 out="$(run_audit "$clean")"; rc=$?
-{ echo "rc=$rc"; echo "$out" | grep "inventory" | head -4; } > /tmp/sa-debug2.txt
 # 경고 is rollout-safe: exit stays 0 (the legacy-remnants precedent above).
-out2="$(run_audit "$clean")"
-{ echo "=== drift rows:"; echo "$out2" | grep "inventory" | head -4; } > /tmp/sa-debug.txt
 ok "unclassified state file escalates to 경고, rollout-safe exit 0" '[ "$rc" = 0 ]'
-{ echo "$out" | grep -E "inventory|unclassified" | head -4; } > /tmp/sa-drift.txt
+# Restored (#1545): the two assertions below lost their ok() headers in #1452.
+ok "unclassified state file is reported as inventory drift (count only)" \
   'grep -q "unclassified file(s) in managed state roots" <<<"$out"'
+ok "inventory drift row names the unclassified file (basename, never contents)" \
   'grep -q "unclassified file(s) in managed state roots" <<<"$out" && grep -qF "mystery-orphan.bin" <<<"$out"'
 ok "absent inventoried classes reported as 정상 fact" 'grep -q "absent (fact)" <<<"$out"'
-rm -f "$CCC_STATE_DIR/mystery-orphan.bin"
+rm -f "$orphan"
 out="$(run_audit "$clean")"; rc=$?
 ok "classified state returns to 정상 (exit 0)" \
   '[ "$rc" = 0 ] && grep -q "no unclassified files in managed state roots" <<<"$out"'
@@ -109,8 +115,13 @@ ok "cache prompt injection is reported by category" 'grep -q "prompt-injection" 
 ok "raw credential never printed" '! grep -q "abcdefghijklmnopqrstuvwxyz1234567890" <<<"$out"'
 ok "permission drift reported without file contents" 'grep -q "permissions" <<<"$out"'
 
+# shellcheck disable=SC2034  # before is read via eval inside ok()
 before="$(find "$bad" -type f -printf '%P %m %s %T@\n' | sort)"
-out="$(run_audit "$bad" --fix 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(run_audit "$bad" --fix 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+# shellcheck disable=SC2034  # after is read via eval inside ok()
 after="$(find "$bad" -type f -printf '%P %m %s %T@\n' | sort)"
 ok "--fix is explicitly not implemented" '[ "$rc" = 2 ] && grep -q "not implemented" <<<"$out"'
 ok "--fix made no filesystem changes" '[ "$before" = "$after" ]'

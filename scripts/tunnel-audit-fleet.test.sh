@@ -152,7 +152,10 @@ ok "quiet mode still writes the run file" '[ "$(ls "$TMP/state/tunnel-audit/runs
 CCC_TUNNEL_AUDIT_KEEP_RUNS=3 bash "$FLEET" --quiet >/dev/null 2>&1
 ok "run history pruned to KEEP_RUNS" '[ "$(ls "$TMP/state/tunnel-audit/runs" | wc -l)" = 3 ]'
 
-out="$(bash "$FLEET" --bogus 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(bash "$FLEET" --bogus 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "unknown flag exits 2" '[ "$rc" = 2 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
