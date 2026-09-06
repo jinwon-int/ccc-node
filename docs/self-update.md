@@ -176,7 +176,7 @@ plain `ccc-self-update.sh run` with no shell chaining.
 | `CCC_SELF_UPDATE_SYSTEMCTL` | `systemctl` | service manager command (tests inject a fake) |
 | `CCC_SELF_UPDATE_RESTART_CMD` | `~/.claude/self-update.restart-cmd` | external restart command for hosts where systemd cannot reach the bridge (Termux, user-scoped). Runs inside the audit/notify boundary (#971) |
 | `CCC_SELF_UPDATE_HEALTH_CMD` | `~/.claude/self-update.health-cmd` | runtime health probe (exit 0 = healthy); with a restart command configured, an up-to-date tick that finds the runtime down attempts one recovery restart |
-| `CCC_SELF_UPDATE_RESTART_WAIT_SECONDS` | `60` | health-poll budget after an external restart |
+| `CCC_SELF_UPDATE_RESTART_WAIT_SECONDS` | `60` | wall-time budget for the up-to-date health probe and, separately, post-restart polling (integer 1..86400 seconds); includes command execution and sleeps |
 | `CCC_SELF_UPDATE_HEALTH_FILE` | `~/.telegram_bot/health.json` | bridge health file the idle gate reads |
 | `CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS` | `90` | max age of `health.json` for its workload to count |
 | `CCC_SELF_UPDATE_BUSY_MAX_SECONDS` | `1800` | never defer for a task older than this |
@@ -206,3 +206,23 @@ false success. Normal success and successful rollback remove it automatically.
 degraded and prints the retained private transaction directory. The outer
 self-update layer must still verify its own repository + Claude + Hermes
 rollback rather than treating that exit as a complete restore.
+
+### Forced reapply and bounded operator commands (#1523)
+
+`run --force` reapplies and restarts the external runtime even when source and
+installed SHA are identical. With no allowlisted services or external restart
+command it reports degraded (exit 11), rather than claiming a runtime refresh.
+
+External commands require coreutils-compatible `timeout` with `--kill-after`.
+An unavailable or incompatible timeout fails closed; the command is never run
+without a deadline. The restart command has a 180-second budget. Each health
+probe receives the remaining health budget, including execution and retry
+sleeps. The initial up-to-date probe has a separate health budget; an unhealthy
+result permits the existing single recovery attempt. A TERM-resistant command
+may use one additional second before its process group is killed. A command
+that deliberately starts a new session escapes this group boundary and must
+provide its own bounded cleanup; health probes should remain synchronous.
+
+Timeouts follow the existing failure audit, notification and recovery-snapshot
+retention path. This change does not turn health success into permission to
+ignore a failed restart.

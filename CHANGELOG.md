@@ -5,6 +5,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- **Self-update forced recovery and health deadlines (#1523).** Same-SHA
+  forced updates restart external runtimes; operator commands fail closed
+  without timeout support, and health budgets include probe execution.
 - **SessionStart memory render is one Python process; setup's canonical-path
   rewrite is one call (#1484, #1504).** `load-memory.sh` drove the memory
   pipeline as four `memory_render.py` subcommands around bash parallel lanes
