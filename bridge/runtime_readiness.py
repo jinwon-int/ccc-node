@@ -62,12 +62,15 @@ def git_identity(bridge_dir: Path, timeout: float = 4.0) -> dict[str, object]:
         if remaining <= 0:
             return {"head": head, "tracked_changes": None}
         result = subprocess.run(
-            ["git", "-c", "diff.autoRefreshIndex=false", "-C", str(bridge_dir),
-             "diff", "--quiet", "HEAD", "--"],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ["git", "-c", "core.fsmonitor=false", "-C", str(bridge_dir), "status",
+             "--porcelain=v1", "--untracked-files=no", "--ignore-submodules=none"],
+            env=env, capture_output=True, text=True,
             timeout=min(2, remaining), check=False,
         )
-        return {"head": head, "tracked_changes": {0: False, 1: True}.get(result.returncode)}
+        # status refreshes the stat cache in memory to distinguish touch-only
+        # changes; GIT_OPTIONAL_LOCKS=0 prevents writing that refresh to index.
+        # Names/bodies from porcelain output are never included in receipts.
+        return {"head": head, "tracked_changes": bool(result.stdout) if result.returncode == 0 else None}
     except (OSError, subprocess.SubprocessError):
         return {"head": None, "tracked_changes": None}
 
