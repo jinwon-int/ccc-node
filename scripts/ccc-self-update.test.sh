@@ -212,6 +212,41 @@ ok "masked restart audited as failure" 'grep "^{" "$STATE/self-update.log" | tai
 
 rm -rf "$STATE"/self-update-install-rollback.*
 
+# #1577: the real restart controller refuses a Termux dependency failure
+# before the owned service marker is touched. The updater must still retain
+# recovery artifacts and report failure even though its health command passes.
+mkdir -p "$TMP/gated-venv/bin" "$TMP/gated-project"
+write_exec_stub "$TMP/gated-venv/bin/python" <<'SH'
+exit 6
+SH
+write_exec_stub "$TMP/gated-restart" <<'SH'
+CCC_START_SH_LIB_ONLY=1 . "$GATE_START" --path "$GATE_PROJECT" >/dev/null
+VENV_DIR="$GATE_VENV"
+PREFIX=/data/data/com.termux/files/usr
+restart_caller_bridge_ancestor() { :; }
+bash() { case "$1" in */service-systemd.sh) return 1;; *) exit 99;; esac; }
+merge_env_files() { :; }
+check_env() { :; }
+read_pid() { :; }
+read_supervisor_pid() { :; }
+find_project_bot_pids() { :; }
+do_stop() { echo stopped > "$GATE_PROJECT/stopped"; return 1; }
+do_restart
+SH
+export GATE_START="$ROOT/bridge/start.sh" GATE_PROJECT="$TMP/gated-project" GATE_VENV="$TMP/gated-venv"
+printf 'bash "%s"\n' "$TMP/gated-restart" > "$CLAUDE/self-update.restart-cmd"
+printf 'test ! -e "%s"\n' "$TMP/gated-project/stopped" > "$CLAUDE/self-update.health-cmd"
+echo gated > "$TMP/seed/gated.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm gated && git -C "$TMP/seed" push -q origin main
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "pre-stop Termux gate retains live service marker" '[ ! -e "$TMP/gated-project/stopped" ]'
+ok "pre-stop refusal is still a failed update" '[ "$rc" = 7 ]'
+ok "pre-stop refusal retains recovery snapshot" 'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "pre-stop refusal logs preparation-required reason" 'grep -q "Termux runtime preparation required" "$STATE/self-update.log"'
+ok "pre-stop refusal audited as external failure" 'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"restart-failures\" and .services[0].ok == false" >/dev/null'
+rm -rf "$STATE"/self-update-install-rollback.*
+unset GATE_START GATE_PROJECT GATE_VENV
+
 # #1523: forcing unchanged source must also reapply external runtime state.
 printf 'touch %s\n' "$TMP/forced-runtime" > "$CLAUDE/self-update.restart-cmd"
 printf 'test -f %s\n' "$TMP/forced-runtime" > "$CLAUDE/self-update.health-cmd"

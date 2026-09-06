@@ -61,6 +61,42 @@ measure the separate [restart command budget](self-update.md#budget-the-complete
 in the updater environment before a transition. The post-restart health wait
 is a different limit.
 
+## Ordinary Termux restart guard
+
+An ordinary Termux `start.sh --restart` now checks its existing `bridge/venv`
+before stopping anything (#1577), even with an explicit spawn override. It
+requires a matching Python Android build API, no conflicting
+`ANDROID_API_LEVEL`, a bootstrap fingerprint matching the current dependency
+inputs/install mode, all five native imports, SDK import, AES-GCM and `pip check`.
+The checks share a 30-second probe budget. Missing Python, missing/changed
+inputs or failed checks return **exit6: preparation required**, preserving the
+old process. No venv creation, dependency installation, native repair or cache
+write runs in this gate. Non-Termux and explicit prepared-runtime paths retain
+their existing behavior.
+
+For read-only preflight using the same selected interpreter:
+
+```bash
+"$source/bridge/venv/bin/python" -I -B "$source/bridge/restart_preflight.py" \
+  --bridge-dir "$source/bridge" --venv-dir "$source/bridge/venv"
+```
+
+A refusal means prepare a compatible source/environment pair using the above
+workflow, retain the previous pair, then select the prepared job in the
+operator-owned `~/.claude/self-update.restart-cmd`. Use explicit `bash` on
+Termux and budget the entire external command. Do not suppress `pip check`,
+retag installed wheels, or install into the live venv to make the gate green.
+A changed dependency fingerprint is deliberately refused even if current
+imports work: the next bootstrap would otherwise install after stopping.
+
+The existing updater records a refused external restart as a failed update
+(exit7) and retains its recovery snapshot. The old bridge may still be healthy;
+that does not make the candidate update successful. Check actual status and
+serving generation before deciding on recovery. The guard is a point-in-time
+compatibility check; it does not lock source/packages against other writers,
+preflight provider authentication, switch generations automatically or restore
+shared configuration. The child still performs its normal bootstrap checks.
+
 ## Receipts and recovery
 
 After validation under the token lock, each launch appends a private receipt

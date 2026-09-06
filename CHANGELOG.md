@@ -4,6 +4,10 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Refuse ordinary Termux restart before stopping the live bridge when its
+  Python API, dependency fingerprint or runtime checks require preparation
+  (#1577). Preserve updater failure reporting and recovery artifacts.
+
 - Run prepared-recovery rehearsals on Termux Python reporting `android`, with
   host-resolved tool paths and isolated child environments (#1574, #1527).
 
