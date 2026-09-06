@@ -61,9 +61,15 @@ def _firecrawl_key() -> str:
                 name, value = raw.split("=", 1)
                 if name.strip() == "FIRECRAWL_API_KEY":
                     return value.strip().strip("'\"")
-    except OSError:
+    except (OSError, UnicodeError):
         return ""
     return ""
+
+
+def _firecrawl_error(exc: Exception, key: str) -> str:
+    """Bounded diagnostics: never print exception URLs, bodies, or credentials."""
+    status = f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
+    return f"{status}; auth={'keyed' if key else 'keyless'}"
 
 
 def _print_results(query: str, rows: list[tuple[str, str, str, str]]) -> int:
@@ -154,7 +160,7 @@ def _search_firecrawl(query: str, limit: int) -> int:
             raw = resp.read(MAX_RESPONSE_BYTES)
         decoded = json.loads(raw.decode("utf-8", "replace"))
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        print(f"web-search: Firecrawl request failed ({type(exc).__name__})", file=sys.stderr)
+        print(f"web-search: Firecrawl request failed ({_firecrawl_error(exc, key)})", file=sys.stderr)
         return 69
     if not isinstance(decoded, dict):
         print("web-search: Firecrawl returned a non-object response", file=sys.stderr)

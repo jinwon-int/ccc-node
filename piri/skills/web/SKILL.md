@@ -45,8 +45,11 @@ python3 ~/.piri/agent/skills/web/web_fetch.py "https://example.com/page" [--max-
 
 - Sends a public HTTP(S) URL to Firecrawl scrape and returns bounded markdown,
   including JS-rendered pages.
-- Keyless requests are supported; `FIRECRAWL_API_KEY` raises rate limits when
-  already present in the process environment.
+- All three helpers resolve credentials identically: nonempty process
+  `FIRECRAWL_API_KEY`, then `~/.hermes/.env` `FIRECRAWL_API_KEY`, then keyless.
+  Keep `web_search.py` beside the fetch/developer helpers (shared resolver).
+- Failures report HTTP status and `auth=keyed` / `auth=keyless` without keys or
+  response bodies. A keyless 429 is NOT evidence that account credits are empty.
 - Never send private/Tailnet/localhost URLs, credential-bearing URLs, secrets,
   or authenticated content to Firecrawl.
 - Exit 69 = Firecrawl request failed; exit 70 = no extractable markdown.
