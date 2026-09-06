@@ -66,10 +66,31 @@ The running bridge also writes `runtime_generation` into its existing
 `health.json` during process initialization. This startup snapshot contains
 `source_dir`, `source_git`, `source_seal`, the actual `python_executable` and
 `python_prefix`, and the venv's last bootstrap `dependency_fingerprint`.
-Compare those values with the prelaunch record, together with the health
-snapshot's process PID, freshness and service state, to identify the generation
-that became available. An old, stale or different-PID health file is not
-confirmation of the candidate. Legacy health files may omit this field.
+Prepared `--restart` now pins the successful pre-stop validation JSON in its
+own process and uses `prepared_serving.py` to verify the candidate. Success
+requires matching source path/seal, dependency fingerprint, Python prefix and
+interpreter, and Git head when the validation observed one. The health PID
+must match the current bot PID, be alive rather than a zombie, differ from the
+old bot, and report available service with healthy Telegram and agent states.
+The process start and generation observation must be after the launch boundary;
+the health update must be fresh, ordered after those observations, and not in
+the future. Missing legacy generation metadata cannot confirm a prepared
+restart. Non-prepared restart behavior is unchanged.
+
+The read-only checker accepts the pinned validation report on stdin and emits
+`ccc.prepared-serving.v1` with `status=available` only for a matching snapshot.
+It reads bounded regular owner-controlled health data without following
+symlinks. It does not run package/native probes, import candidate application
+code, make network calls, install packages, or rewrite any state. On mismatch,
+restart keeps observing until its existing availability limit, then exits4 and
+leaves any candidate running for the documented explicit recovery procedure.
+Generic `--status` may still show available for a different generation; that
+alone is no longer prepared restart success.
+
+These are observations of owner-controlled files, not cryptographic or loaded
+code/package attestation. A matching snapshot does not prove lasting health,
+exclude concurrent external lifecycle commands, or replace a monitored
+production transition/rollback trial.
 
 The snapshot is captured once for each reporter and retained across heartbeat
 updates and stopped/degraded states. It describes files observed at startup;
