@@ -4,6 +4,8 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Bridge health now records startup source/interpreter/dependency provenance alongside the actual process and service state (#1527).
+
 - Add opt-in prepared-runtime selection with source sealing, validation before
   stop, no-install startup and private append-only launch references (#1527).
 

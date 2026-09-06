@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from telegram_bot.runtime_generation import capture_runtime_generation
 from telegram_bot.utils.config import config
 
 # Steady-state disk-write throttle. Must stay well under every consumer's
@@ -247,6 +248,10 @@ class RuntimeHealthReporter:
 
     def initialize_process(self) -> None:
         with self._lock:
+            # One startup observation; heartbeat writes and re-initialization
+            # must not relabel this process after an on-disk source change.
+            if "runtime_generation" not in self._state:
+                self._state["runtime_generation"] = capture_runtime_generation()
             self._refresh_runtime_context_locked()
             self._write_pid_locked()
             self._write_health_locked()
