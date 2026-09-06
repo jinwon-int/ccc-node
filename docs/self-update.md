@@ -151,10 +151,10 @@ replacement is two operator-owned files:
 
 ```sh
 cat > ~/.claude/self-update.restart-cmd <<'EOF'
-$HOME/ccc-node/bridge/start.sh --path "$HOME" --restart -d
+bash "$HOME/ccc-node/bridge/start.sh" --path "$HOME" --restart -d
 EOF
 cat > ~/.claude/self-update.health-cmd <<'EOF'
-pgrep -f telegram_bot >/dev/null
+bash "$HOME/ccc-node/bridge/start.sh" --path "$HOME" --status 2>/dev/null | grep -Fq "Bot status: available"
 EOF
 ```
 
@@ -166,6 +166,38 @@ and attempts one recovery restart when the runtime is down — the second daily
 slot can therefore recover an updated-but-down node. The cron line becomes a
 plain `ccc-self-update.sh run` with no shell chaining.
 
+### Budget the complete external command
+
+`CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS` bounds the entire external
+restart command (default 180 seconds, integer 1..900). It applies to both a
+changed-source restart and an up-to-date runtime recovery. Invalid values,
+including an explicitly empty value, exit 2 before acquiring the update lock,
+fetching or installing code, or restarting anything. `status` remains usable
+and shows the configured command and health budgets.
+
+For a prepared restart, account for pre-stop validation, old-process drain,
+launch and candidate readiness together. The existing probe budget (60s),
+stop grace (70s) and readiness wait (90s) can exceed 180s in combination.
+An operator can set a measured budget such as 300 seconds in the updater's
+invocation environment. Setting it only inside `self-update.restart-cmd`
+cannot change the parent updater's watchdog. This setting does not select a
+prepared runtime or implement a promotion/rollback controller.
+
+`CCC_SELF_UPDATE_RESTART_WAIT_SECONDS` is a **separate** budget: it covers the
+initial health probe on an up-to-date tick and, separately, health polling
+only after a successful restart command. Raising it does not extend the
+restart command. Each timed command may use one extra second to kill
+TERM-resistant descendants. Neither setting bounds setup or the entire tick;
+size any outer scheduler deadline for the complete procedure. Inner polling
+limits and filesystem/scheduler delays also require measurement, so 300s is
+an example rather than a guarantee for every prepared transition.
+
+A command timeout remains a restart failure (exit 7), with the existing audit,
+notification and any install recovery snapshot retained. A later successful
+health check cannot override it. The log records command budget, elapsed time
+and exit code; no command body is added to these timing fields. This snapshot
+still does not include a complete previous dependency environment.
+
 ## Knobs
 
 | Env | Default | Meaning |
@@ -176,6 +208,7 @@ plain `ccc-self-update.sh run` with no shell chaining.
 | `CCC_SELF_UPDATE_SYSTEMCTL` | `systemctl` | service manager command (tests inject a fake) |
 | `CCC_SELF_UPDATE_RESTART_CMD` | `~/.claude/self-update.restart-cmd` | external restart command for hosts where systemd cannot reach the bridge (Termux, user-scoped). Runs inside the audit/notify boundary (#971) |
 | `CCC_SELF_UPDATE_HEALTH_CMD` | `~/.claude/self-update.health-cmd` | runtime health probe (exit 0 = healthy); with a restart command configured, an up-to-date tick that finds the runtime down attempts one recovery restart |
+| `CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS` | `180` | complete external restart command budget (integer 1..900 seconds), shared by update and recovery; timeout remains a failure |
 | `CCC_SELF_UPDATE_RESTART_WAIT_SECONDS` | `60` | wall-time budget for the up-to-date health probe and, separately, post-restart polling (integer 1..86400 seconds); includes command execution and sleeps |
 | `CCC_SELF_UPDATE_HEALTH_FILE` | `~/.telegram_bot/health.json` | bridge health file the idle gate reads |
 | `CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS` | `90` | max age of `health.json` for its workload to count |

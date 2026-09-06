@@ -29,6 +29,7 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 # unset CODEX_HOME would let a FAILED-fixture restore delete the live file.
 unset CCC_SELF_UPDATE_BRANCH CCC_SELF_UPDATE_SERVICES
 unset CCC_SELF_UPDATE_RESTART_CMD CCC_SELF_UPDATE_HEALTH_CMD
+unset CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS
 unset CCC_SELF_UPDATE_RESTART_CMD_FILE CCC_SELF_UPDATE_HEALTH_CMD_FILE
 unset CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS
 unset CCC_SELF_UPDATE_BUSY_MAX_SECONDS CCC_SELF_UPDATE_MAX_DEFER_SECONDS
@@ -104,6 +105,21 @@ run_selfup() {
 out="$(run_selfup run)"; rc=$?
 ok "up-to-date exits 0" '[ "$rc" = 0 ] && grep -q "already up to date" <<<"$out"'
 ok "up-to-date does not run setup" '[ ! -f "$SETUP_MARKER" ]'
+
+# Reject bad restart budgets even with a held lock, before fetch/setup/actions.
+# A pending upstream commit proves invalid input cannot advance the checkout.
+echo budget > "$TMP/seed/budget.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm budget && git -C "$TMP/seed" push -q origin main
+budget_head="$(git -C "$REPO" rev-parse HEAD)"
+mkdir "$STATE/self-update.lock"
+for bad_budget in '' 0 -1 01 1.5 1s 901 1800 99999999999999999999 '1+2'; do
+  out="$(CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS="$bad_budget" run_selfup run --force 2>&1)"; rc=$?
+  ok "invalid restart command budget [$bad_budget] exits 2 before lock" '[ "$rc" = 2 ] && grep -q "CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS.*1..900" <<<"$out"'
+done
+ok "invalid restart budgets preserve checkout, setup and lock" '[ "$(git -C "$REPO" rev-parse HEAD)" = "$budget_head" ] && [ ! -f "$SETUP_MARKER" ] && [ -d "$STATE/self-update.lock" ]'
+out="$(CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS=0 run_selfup status 2>&1)"; rc=$?
+ok "status remains available for invalid restart budget" '[ "$rc" = 0 ] && grep -q "external restart command timeout: 0s" <<<"$out"'
+rmdir "$STATE/self-update.lock"
 
 # --- 2) new commit on origin: pull + setup + allowlisted restarts -------------
 echo change > "$TMP/seed/file.txt"
@@ -204,6 +220,59 @@ ok "same-SHA force audits the actual external restart" 'grep "^{" "$STATE/self-u
 printf '%s\n' 'exit 4' > "$CLAUDE/self-update.restart-cmd"
 out="$(run_selfup run --force 2>&1)"; rc=$?
 ok "same-SHA force preserves external restart failure" '[ "$rc" = 7 ]'
+
+# External command and subsequent health budgets are independent. Record
+# timeout argv and run the actual utility; cap only large fixture budgets so
+# reverse-validating the old hard-coded180 cannot hang the suite for3minutes.
+REAL_TIMEOUT="$(command -v timeout)"
+export CCC_TEST_TIMEOUT_CALLS="$TMP/timeout.calls" CCC_TEST_REAL_TIMEOUT="$REAL_TIMEOUT"
+write_exec_stub "$FAKEBIN/timeout" <<'STUB'
+printf '%s\n' "$2" >> "$CCC_TEST_TIMEOUT_CALLS"
+seconds="$2"
+[ "$seconds" -le 5 ] || seconds=5
+shift 2
+exec "$CCC_TEST_REAL_TIMEOUT" --kill-after=1 "$seconds" "$@"
+STUB
+printf '%s\n' 'exit 0' > "$CLAUDE/self-update.restart-cmd"
+printf '%s\n' 'exit 0' > "$CLAUDE/self-update.health-cmd"
+: > "$CCC_TEST_TIMEOUT_CALLS"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "default external restart deadline remains180; health stays separate" '[ "$rc" = 0 ] && [ "$(sed -n "1p" "$CCC_TEST_TIMEOUT_CALLS")" = 180 ] && [ "$(sed -n "2p" "$CCC_TEST_TIMEOUT_CALLS")" -le 3 ]'
+for budget in 300 900; do
+  : > "$CCC_TEST_TIMEOUT_CALLS"
+  out="$(CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS="$budget" run_selfup run --force 2>&1)"; rc=$?
+  ok "configured external restart budget $budget reaches watchdog" '[ "$rc" = 0 ] && [ "$(sed -n "1p" "$CCC_TEST_TIMEOUT_CALLS")" = "$budget" ] && [ "$(sed -n "2p" "$CCC_TEST_TIMEOUT_CALLS")" -le 3 ]'
+done
+
+# A real slower command succeeds inside its configured command budget; its
+# subsequent health probe still gets the independent three-second budget.
+printf '%s\n' 'sleep 2' > "$CLAUDE/self-update.restart-cmd"
+: > "$CCC_TEST_TIMEOUT_CALLS"
+out="$(CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS=4 run_selfup run --force 2>&1)"; rc=$?
+ok "slow successful restart uses its own budget" '[ "$rc" = 0 ] && [ "$(sed -n "1p" "$CCC_TEST_TIMEOUT_CALLS")" = 4 ]'
+
+# Both the command shell and its child ignore TERM. The watchdog must kill
+# this owned process group; a successful health probe cannot hide the failure.
+printf 'trap "" TERM; sleep 20 & child=$!; echo "$child" > "%s"; wait "$child"\n' "$TMP/restart-child.pid" > "$CLAUDE/self-update.restart-cmd"
+: > "$CCC_TEST_TIMEOUT_CALLS"
+out="$(CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS=1 run_selfup run --force 2>&1)"; rc=$?
+ok "TERM-resistant restart times out using configured budget" '[ "$rc" = 7 ] && [ "$(cat "$CCC_TEST_TIMEOUT_CALLS")" = 1 ]'
+ok "restart timeout retains artifacts and releases lock" '[ ! -d "$STATE/self-update.lock" ] && compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "restart timeout does not get masked by healthy probe" 'grep "^{" "$STATE/self-update.log" | tail -1 | grep -q "restart-failures"'
+child_state="$(ps -o stat= -p "$(cat "$TMP/restart-child.pid")" 2>/dev/null || true)"
+ok "TERM-resistant restart child is no longer executing" '[[ -z "$child_state" || "$child_state" = Z* ]]'
+ok "timing log records elapsed time and configured budget" 'grep -Eq "external-restart exit=[0-9]+ elapsed=[0-9]+s timeout=1s" "$STATE/self-update.log"'
+
+# The up-to-date recovery path uses exactly the same command budget. Initial
+# health fails; the restart creates its health marker; the second probe passes.
+: > "$CCC_TEST_TIMEOUT_CALLS"
+printf 'test -f "%s"\n' "$TMP/budget-recovered" > "$CLAUDE/self-update.health-cmd"
+printf 'touch "%s"\n' "$TMP/budget-recovered" > "$CLAUDE/self-update.restart-cmd"
+out="$(CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS=300 run_selfup run 2>&1)"; rc=$?
+ok "up-to-date recovery gets configured command budget" '[ "$rc" = 0 ] && [ "$(sed -n "2p" "$CCC_TEST_TIMEOUT_CALLS")" = 300 ] && [ -f "$TMP/budget-recovered" ]'
+ok "recovery budget preserves runtime-recovered audit" 'grep "^{" "$STATE/self-update.log" | tail -1 | grep -q "runtime-recovered"'
+rm -f "$FAKEBIN/timeout"
+unset CCC_TEST_TIMEOUT_CALLS CCC_TEST_REAL_TIMEOUT
 
 # A stuck health command must not hold the update lock indefinitely, even if
 # it ignores TERM. Its process group is killed within a one-second grace.

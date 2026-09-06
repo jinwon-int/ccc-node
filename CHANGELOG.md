@@ -4,6 +4,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Add a validated external restart command budget to self-update, preserving
+  timeout failures and recovery artifacts (#1562, #1527).
+
 - Prepared bridge restart now requires a fresh matching serving generation,
   rather than generic availability, before reporting success (#1559, #1527).
 
