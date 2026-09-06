@@ -132,6 +132,12 @@ class BuildResolutionTest(unittest.TestCase):
 
         receipt = json.loads(RECEIPT.read_text(encoding="utf-8"))
         receipt["evaluation"]["model_resolution"] = fragment
+        # The grafted fragment carries its own alias, so `evaluation.model` has
+        # to move with it. The canonical receipt is free to hand the launcher a
+        # fully-qualified id instead of an alias (TM-3322 does); inheriting that
+        # value here would make the verifier reject the graft on a mismatch that
+        # this test never meant to create.
+        receipt["evaluation"]["model"] = fragment["alias"]
         # The fragment is stamped now; a re-issued receipt is issued afterwards.
         receipt["issued_at"] = "2099-01-01T00:00:00Z"
         target = self.root / "receipt.json"

@@ -24,6 +24,36 @@ All notable changes to the Claude Code node harness. Dates are KST.
 - Add a validated external restart command budget to self-update, preserving
   timeout failures and recovery artifacts (#1562, #1527).
 
+- **auto-distill evaluation receipt re-issued as TM-3322 (#1561).** The fix
+  below moves `unwrap_claude_envelope`/`extract_json`, both canon-surface
+  members, so the receipt had to be re-issued against the new source
+  (`cbc585ce…`, surface `d812bf45…`). Gate PASS: TP 16 / FP 1 / FN 7 / TN 23
+  (precision 94%, recall 70%), recheck 5/12 over baseline 1, collateral 0.
+  The run was held on gwakga with **both** corpus-moving crons paused — the
+  dedup judgement greps the live wiki cache, and one evaluation (~35 min)
+  outlasts the 30-minute auto-distill cron *and* the `wiki-agent sync-cache`
+  cron at :10/:40, so an unpaused run cannot hold its corpus still. A new
+  corpus gate records the cache manifest before and after and fails the run if
+  any of the 579 documents moved; this run moved none. `evaluation.model` now
+  records the id actually handed to the launcher rather than an alias that was
+  never passed, and the receipt tests no longer assume the canonical receipt
+  uses a bare alias — an assumption that silently disarmed the alias-family
+  check the moment a fully-qualified id was pinned.
+
+- **auto-distill separates transport failures from model output (#1561).**
+  A Claude Code `--output-format json` envelope can carry `is_error: true`
+  with exit code 0 — the model was never reached (session limit, API error) —
+  and the human-readable sentence in `result` was handed downstream as if it
+  were the model's reply. It surfaced as `no_json`, indistinguishable from a
+  model that genuinely emitted malformed JSON, and was counted as one
+  successful request in usage accounting. `unwrap_claude_envelope()` now
+  reports such envelopes (and envelopes with no `modelUsage` at zero cost) as
+  `model_unavailable:<kind>` with no usage attached. Gate behaviour is
+  deliberately unchanged: each gate still branches on the same `err`, so this
+  only makes the failure distinguishable and countable. Measured on gwakga
+  2026-09-06 (#1547 r2): 28 of 47 envelopes were session-limit errors, and
+  the run still reported plausible metrics (26% recall; 67% on the valid 19).
+
 - Prepared bridge restart now requires a fresh matching serving generation,
   rather than generic availability, before reporting success (#1559, #1527).
 
