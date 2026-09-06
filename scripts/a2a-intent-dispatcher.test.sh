@@ -96,5 +96,8 @@ class DispatcherTest(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
-unittest.main()
+result = unittest.main(exit=False).result
+failed = len(result.failures) + len(result.errors)
+print(f"PASS={max(0, result.testsRun - failed)} FAIL={failed}")
+raise SystemExit(0 if result.wasSuccessful() else 1)
 PY
