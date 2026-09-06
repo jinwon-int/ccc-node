@@ -8,6 +8,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 - **Self-update forced recovery and health deadlines (#1523).** Same-SHA
   forced updates restart external runtimes; operator commands fail closed
   without timeout support, and health budgets include probe execution.
+- **A2A payload lifetime (#1524).** Dispatch unlinks its private temporary
+  payload before exec while preserving stdin bytes, PID, signals and exit
+  status. Invalid JSON fails before invoking a handler.
 - **SessionStart memory render is one Python process; setup's canonical-path
   rewrite is one call (#1484, #1504).** `load-memory.sh` drove the memory
   pipeline as four `memory_render.py` subcommands around bash parallel lanes

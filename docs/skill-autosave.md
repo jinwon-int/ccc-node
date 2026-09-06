@@ -790,3 +790,13 @@ python3 scripts/rescreen-rotation.py --cases CASES.json [--names a,b] \
   dispatching. Every result entry records the reviewer, broker, provider,
   model tier, rotation reason, and any skipped nodes — the assignment
   rationale is auditable, matching #2027 provenance.
+
+### Dispatcher payload lifetime (#1524)
+
+The intent dispatcher validates JSON and opens a read descriptor before removing
+its disposable payload path. It then execs the selected handler with the
+original bytes on stdin and closes the extra descriptor. Successful dispatch,
+handler failure and handler signals therefore retain no payload pathname.
+Missing handlers fail without dispatch; an unlink failure is reported and also
+prevents dispatch. The existing handler PID, stdout and exit-status contract is
+preserved. This affects review, revise and default routes alike.

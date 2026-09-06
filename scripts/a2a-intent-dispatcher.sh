@@ -37,13 +37,21 @@ trap 'rm -f "$tmp"' EXIT
 cat > "$tmp" 2>/dev/null || { echo "a2a-intent-dispatcher: stdin read failed" >&2; exit 1; }
 [ -s "$tmp" ] || { echo "a2a-intent-dispatcher: empty task" >&2; exit 1; }
 
-intent="$(jq -r '.intent // empty' "$tmp" 2>/dev/null)"
+intent="$(jq -r '.intent // empty' "$tmp" 2>/dev/null)" || { log "invalid task JSON"; exit 1; }
 log "routing intent=${intent:-<none>}"
+
+# exec replaces this shell without running its EXIT trap. Keep an open input
+# descriptor, unlink our disposable payload BEFORE the handler starts, then
+# close the extra descriptor as part of each exec redirection. stdin retains
+# the original bytes; PID, signals and handler exit status remain unchanged.
+exec 3< "$tmp" || { log "payload open failed"; exit 1; }
+rm -f -- "$tmp" || { log "payload cleanup failed"; exit 1; }
+trap - EXIT
 
 case "$intent" in
   skills-intake-review|skills_intake_review)
     [ -x "$INTAKE_REVIEW_HANDLER" ] || { echo "a2a-intent-dispatcher: review handler not executable: $INTAKE_REVIEW_HANDLER" >&2; exit 1; }
-    exec bash "$INTAKE_REVIEW_HANDLER" < "$tmp"
+    exec bash "$INTAKE_REVIEW_HANDLER" <&3 3<&-
     ;;
   skills-intake-revise|skills_intake_revise)
     # #1460: without this route the generic handler acked revise tasks and the
@@ -55,10 +63,10 @@ case "$intent" in
       log "revise handler not installed or not executable: $INTAKE_REVISE_HANDLER (revise-unsupported node)"
       exit 1
     fi
-    exec bash "$INTAKE_REVISE_HANDLER" < "$tmp"
+    exec bash "$INTAKE_REVISE_HANDLER" <&3 3<&-
     ;;
   *)
     # Intentional word split of an operator-owned command line (shellcheck-disable=SC2086)
-    exec $DEFAULT_TASK_HANDLER < "$tmp"
+    exec $DEFAULT_TASK_HANDLER <&3 3<&-
     ;;
 esac
