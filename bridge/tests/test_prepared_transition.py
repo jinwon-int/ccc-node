@@ -69,8 +69,11 @@ def test_validation_requires_both_ready_reports(tmp_path, reports):
     assert not (run / "01-validated.json").exists()
 
 
-@pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo", "directory", "public", "wrong_owner"])
-def test_unsafe_lease_metadata_is_rejected(tmp_path, kind):
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "hardlink_cli", "fifo", "directory", "public", "wrong_owner"])
+def test_unsafe_lease_metadata_is_rejected(tmp_path, kind, monkeypatch):
+    if kind == "hardlink_cli":
+        monkeypatch.delattr(os, "link", raising=False)
+        kind = "hardlink"
     run = begin(tmp_path)
     owner = run.parent / "active/owner.json"
     if kind == "public":
@@ -83,7 +86,15 @@ def test_unsafe_lease_metadata_is_rejected(tmp_path, kind):
         if kind == "symlink":
             owner.symlink_to(saved)
         elif kind == "hardlink":
-            os.link(saved, owner)
+            if hasattr(os, "link"):
+                os.link(saved, owner)
+            else:
+                # Android Python omits os.link; Termux's ln can still create
+                # the real fixture inode. Do not silently skip this invariant.
+                import subprocess
+                subprocess.run(["ln", "--", str(saved), str(owner)], check=True, capture_output=True)
+            assert owner.stat().st_ino == saved.stat().st_ino
+            assert owner.stat().st_nlink == 2
         elif kind == "fifo":
             os.mkfifo(owner)
         else:

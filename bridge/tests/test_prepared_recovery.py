@@ -26,7 +26,8 @@ from telegram_bot.prepared_runtime import source_seal
 from telegram_bot.prepared_serving import process_alive
 
 
-pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux process ownership rehearsal")
+pytestmark = pytest.mark.skipif(sys.platform not in ("linux", "android"),
+                                reason="Linux/Android process ownership rehearsal")
 BRIDGE = Path(__file__).resolve().parents[1]
 
 BOT = '''import fcntl, json, os, signal, socket, sys, time
@@ -100,24 +101,36 @@ class Rehearsal:
         self.bin = root / "bin"
         self.bin.mkdir()
         self.forbidden_install = root / "unexpected-install"
+        # Python 3.14 identifies Termux as android. Resolve the host tools
+        # before constructing the credential-free child environment: Termux's
+        # executables live under its private prefix, not the Linux FHS paths.
+        self.bash = shutil.which("bash")
+        self.shell = shutil.which("sh")
+        provider = shutil.which("true")
+        if not all((self.bash, self.shell, provider)):
+            raise RuntimeError("rehearsal requires bash, sh and true")
+        host_bins = dict.fromkeys(str(Path(tool).parent) for tool in (self.bash, self.shell, provider))
         # Explicit service/CLI stubs; ambient executables and state never select
         # a production manager, provider or platform wake-lock implementation.
         for name, body in {"systemctl": "exit 1", "termux-wake-lock": "exit 0"}.items():
             path = self.bin / name
-            path.write_text("#!/bin/sh\n" + body + "\n")
+            path.write_text(f"#!{self.shell}\n" + body + "\n")
             path.chmod(0o700)
         python = self.bin / "python3"
-        python.write_text("#!/bin/sh\ncase \" $* \" in\n"
+        python.write_text(f"#!{self.shell}\ncase \" $* \" in\n"
             "  *\" -m venv \"*|*\" -m pip install \"*) touch "
             + shlex.quote(str(self.forbidden_install)) + "; exit 99 ;;\nesac\nexec "
             + shlex.quote(sys.executable) + ' "$@"\n')
         python.chmod(0o700)
-        self.env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/local/bin:/usr/bin:/bin",
+        self.env = {"HOME": str(self.home), "PATH": os.pathsep.join((str(self.bin), *host_bins,
+                                                                 "/usr/local/bin", "/usr/bin", "/bin")),
                     "LANG": "C.UTF-8", "CCC_SYSTEMD_DIR": str(root / "no-units"),
                     "CCC_SYSTEMCTL": str(self.bin / "systemctl"),
                     "CCC_BRIDGE_RESTART_READY_TIMEOUT": "12", "CCC_BRIDGE_STOP_GRACE_SECONDS": "2"}
+        if sys.platform == "android" or "/com.termux/" in sys.base_prefix:
+            self.env["PREFIX"] = sys.base_prefix
         (self.data / ".env").write_text("TELEGRAM_BOT_TOKEN=123456:OFFLINE-REHEARSAL\n"
-            "CCC_AGENT_PROVIDER=codex\nCCC_CODEX_CLI_PATH=/bin/true\n")
+            f"CCC_AGENT_PROVIDER=codex\nCCC_CODEX_CLI_PATH={provider}\n")
         (self.data / ".env").chmod(0o600)
         self.generations = {}
         self.groups = []
@@ -136,7 +149,7 @@ class Rehearsal:
         runtime = work / "runtime"
         venv.EnvBuilder(with_pip=False).create(runtime)
         pip = runtime / "bin/pip"
-        pip.write_text("#!/bin/sh\ntouch " + shlex.quote(str(self.forbidden_install)) + "; exit 99\n")
+        pip.write_text(f"#!{self.shell}\ntouch " + shlex.quote(str(self.forbidden_install)) + "; exit 99\n")
         pip.chmod(0o700)
         packages = runtime / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
         shim = self.root / (label + " import")
@@ -155,7 +168,7 @@ class Rehearsal:
 
     def command(self, label: str, action="--restart", extra_args=(), timeout=45):
         source, work = self.generations[label]
-        command = ["bash", str(source / "start.sh"), "--path", str(self.project),
+        command = [self.bash, str(source / "start.sh"), "--path", str(self.project),
                    "--prepared-runtime", str(work), action, *extra_args]
         # Keep stdout in a file: a healthy detached bot must not hold a parent's
         # capture pipe open. Retain logs for pytest's assertion diagnostics.
@@ -307,3 +320,29 @@ def test_cleanup_reaps_private_probe_session_and_preserves_unrelated_sentinel(re
             if child.poll() is None:
                 child.kill()
             child.wait(timeout=3)
+
+
+def test_fixture_uses_nonstandard_host_tools_without_inheriting_credentials(tmp_path, monkeypatch):
+    host = tmp_path / "host-tools"
+    host.mkdir()
+    for name in ("bash", "sh", "true"):
+        resolved = shutil.which(name)
+        assert resolved
+        (host / name).symlink_to(resolved)
+    monkeypatch.setenv("PATH", str(host))
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-not-a-real-key")
+    root = tmp_path / "rehearsal"
+    r = Rehearsal(root)
+    try:
+        result = subprocess.run(["bash", "-c", "type -P true"], env=r.env,
+                                capture_output=True, text=True, timeout=5)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == str(host / "true")
+        # Exercise the generated interpreter wrapper, including its host shell.
+        probe = subprocess.run(["python3", "-c", "import os; assert 'OPENAI_API_KEY' not in os.environ"],
+                               env=r.env, capture_output=True, text=True, timeout=5)
+        assert probe.returncode == 0, probe.stderr
+        manager = subprocess.run(["systemctl"], env=r.env, capture_output=True, timeout=5)
+        assert manager.returncode == 1
+    finally:
+        r.close()
