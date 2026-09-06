@@ -223,9 +223,6 @@ else:
              'scan', '--json'],
             capture_output=True, text=True, timeout=30)
         scan = json.loads(proc.stdout) if (proc.returncode == 0 and proc.stdout) else None
-        import time
-        with open('/tmp/scan-dump-%s.json' % int(time.time() * 1000), 'w') as dfh:
-            dfh.write(proc.stdout or ('RC=%s ERR=%s' % (proc.returncode, proc.stderr[-300:])))
     except Exception:
         scan = None
     if scan is None:

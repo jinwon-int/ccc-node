@@ -8,6 +8,19 @@ All notable changes to the Claude Code node harness. Dates are KST.
   budget, avoids duplicate termination signals, and retains bookkeeping on
   failed stops (#1554, #1527).
 
+- **shellcheck warning ratchet retired (#1510).** The `SC_WARN_BASELINE`
+  manifest introduced with #1484 (91 scripts carrying pre-existing
+  warning-level findings) was burned down to empty over five batches and is
+  now removed from `scripts/validate-harness.sh` together with its
+  clean-entry ratchet check. Every tracked `*.sh` plus `SC_SCOPE_EXTRA` is
+  linted at `shellcheck --severity=warning` (`-e SC2155,SC1090,SC1091`); the
+  repo-wide error-level sweep stays as a backstop. `validate-harness.test.sh`
+  now proves, in a fixture repo, that one new warning-level finding in any
+  tracked script fails the static phase while a clean tree passes.
+  `scripts/ccc-security-audit.sh` no longer writes a `/tmp/scan-dump-*.json`
+  debug copy of the erasure-planner scan output on every run (leftover from
+  #1452, flagged in #1550).
+
 - Bridge health now records startup source/interpreter/dependency provenance alongside the actual process and service state (#1527).
 
 - Add opt-in prepared-runtime selection with source sealing, validation before
