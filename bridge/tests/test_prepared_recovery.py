@@ -174,17 +174,21 @@ class Rehearsal:
         return [json.loads(line) for line in (self.project / "events.jsonl").read_text().splitlines()]
 
     def owned_groups(self):
-        # Only signal process groups created by this fixture and still carrying
-        # its unique temporary path. Never use a global bot-name kill pattern.
+        # Validation probes start their own sessions. Recognize those leaders
+        # by the exact private interpreter, never just a matching path argument.
+        interpreters = {os.fsencode(work / "runtime/bin/python")
+                        for _, work in self.generations.values()}
         groups = set()
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit():
                 continue
             try:
-                if bytes(self.root) not in (entry / "cmdline").read_bytes():
+                command = (entry / "cmdline").read_bytes()
+                if bytes(self.root) not in command:
                     continue
-                group = os.getpgid(int(entry.name))
-                if group in self.groups:
+                pid = int(entry.name)
+                group = os.getpgid(pid)
+                if group in self.groups or (group == pid and command.split(b"\0", 1)[0] in interpreters):
                     groups.add(group)
             except (ProcessLookupError, FileNotFoundError, PermissionError):
                 pass
@@ -274,3 +278,27 @@ def test_explicit_recovery_restores_previous_source_and_environment(rehearsal, f
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in history)
     assert not r.forbidden_install.exists()
     assert all(not (source / "venv").exists() for source, _ in r.generations.values())
+
+
+def test_cleanup_reaps_private_probe_session_and_preserves_unrelated_sentinel(rehearsal):
+    r = rehearsal
+    python = r.generations["previous"][1] / "runtime/bin/python"
+    processes = []
+    try:
+        # Same session shape as prepared_runtime.probe(): this group is not in
+        # the fixture launcher's recorded groups, and survives its parent exit.
+        probe = subprocess.Popen([str(python), "-I", "-c", "import time; time.sleep(30)"],
+                                 start_new_session=True)
+        processes.append(probe)
+        sentinel = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(30)", str(r.root)],
+                                    start_new_session=True)
+        processes.append(sentinel)
+        r.close()
+        assert probe.wait(timeout=3) == -signal.SIGTERM
+        assert sentinel.poll() is None
+    finally:
+        # Parent-owned handles also make the regression safe on broken cleanup.
+        for child in processes:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=3)
