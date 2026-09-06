@@ -93,6 +93,11 @@ subsequent package reinstall is checked and repaired again; a missing
 Termux cryptography repair gate. Do not use those overrides to hide a broken
 startup dependency.
 
+For a new isolated runtime when pip attempts to compile maturin itself, use
+[Termux build preparation](../docs/termux-build-preparation.md). It prepares
+locked native packages with the existing distro backend, verifies a new venv,
+and can exercise a real forced reinstall before any service transition.
+
 ## Quick Start
 
 ```bash
