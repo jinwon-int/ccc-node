@@ -2,6 +2,7 @@
 import importlib.util
 import io
 import json
+import subprocess
 import sys
 import urllib.error
 from pathlib import Path
@@ -96,6 +97,27 @@ def test_unusable_stored_key_is_keyless(helpers, tmp_path, contents):
     folder.mkdir()
     (folder / ".env").write_bytes(contents)
     assert helpers["web_search"]._firecrawl_key() == ""
+
+
+def test_package_import_without_script_path_injection():
+    result = subprocess.run(
+        [sys.executable, "-c", "from piri.skills.web import web_fetch, web_developer"],
+        cwd=ROOT.parents[2], capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("name,code", [("web_search", 64), ("web_fetch", 64), ("web_developer", 2)])
+def test_installed_scripts_start_without_pythonpath(tmp_path, monkeypatch, name, code):
+    for script in ROOT.glob("*.py"):
+        (tmp_path / script.name).write_bytes(script.read_bytes())
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    result = subprocess.run(
+        [sys.executable, str(tmp_path / f"{name}.py")],
+        cwd=tmp_path, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == code, result.stderr
+    assert "ModuleNotFoundError" not in result.stderr
 
 
 def test_network_error_does_not_print_exception_details(helpers):

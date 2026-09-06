@@ -24,7 +24,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from web_search import _firecrawl_error, _firecrawl_key
+if __package__:
+    from .web_search import _firecrawl_error, _firecrawl_key
+else:
+    from web_search import _firecrawl_error, _firecrawl_key
 
 DEFAULT_API_URL = "https://api.firecrawl.dev"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
