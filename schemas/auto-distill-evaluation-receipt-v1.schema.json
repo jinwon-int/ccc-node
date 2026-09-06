@@ -55,6 +55,24 @@
         "completed_at": {"type": "string", "format": "date-time"},
         "provider": {"type": "string", "minLength": 1, "maxLength": 80},
         "model": {"type": "string", "minLength": 1, "maxLength": 80},
+        "model_resolution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["alias", "resolved_id", "resolved_by", "resolved_at"],
+          "properties": {
+            "alias": {"type": "string", "minLength": 1, "maxLength": 80},
+            "resolved_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,79}$",
+              "not": {"enum": ["haiku", "sonnet", "opus", "default"]}
+            },
+            "resolved_by": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:/@()+,-]{0,119}$"
+            },
+            "resolved_at": {"type": "string", "format": "date-time"}
+          }
+        },
         "corpus": {
           "type": "object",
           "additionalProperties": false,

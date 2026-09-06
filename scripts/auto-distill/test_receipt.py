@@ -166,6 +166,19 @@ class AutoDistillReceiptTest(unittest.TestCase):
             subject_properties["surface_members"]["const"],
         )
 
+    def test_schema_declares_model_resolution_as_optional(self) -> None:
+        # #1521: the schema and the verifier must agree on the optional object
+        # so a re-issued receipt carrying it is not rejected by either.
+        schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+        evaluation = schema["properties"]["evaluation"]
+        self.assertNotIn("model_resolution", evaluation["required"])
+        resolution = evaluation["properties"]["model_resolution"]
+        self.assertFalse(resolution["additionalProperties"])
+        self.assertEqual(
+            set(resolution["required"]), {"alias", "resolved_id", "resolved_by", "resolved_at"}
+        )
+        self.assertEqual(set(resolution["properties"]), set(MODEL_RESOLUTION))
+
     def test_describe_source_is_body_free_json(self) -> None:
         result = subprocess.run(
             ["python3", str(VERIFIER), "--source", str(SOURCE), "--json"],
