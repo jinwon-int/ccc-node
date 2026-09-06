@@ -5,6 +5,10 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- **Runtime readiness receipts (#1525, #1527).** A read-only observer checks
+  native imports, SDK, AES-GCM and installed dependency consistency with
+  bounded child-process waits. It emits platform/source/lock provenance and
+  timings while keeping unperformed lifecycle scenarios explicitly not-run.
 - **Self-update forced recovery and health deadlines (#1523).** Same-SHA
   forced updates restart external runtimes; operator commands fail closed
   without timeout support, and health budgets include probe execution.
