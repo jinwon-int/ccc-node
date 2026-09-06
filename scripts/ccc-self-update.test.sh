@@ -329,6 +329,7 @@ mkdir -p "$REPO/bridge"
 printf '%s\n' 'CLAUDE_PROCESS_TIMEOUT=3600' > "$REPO/bridge/.env"
 printf '%s\n' 'ccc-telegram-bridge.service' > "$CLAUDE/self-update.services"
 OLD_HEAD="$(git -C "$REPO" rev-parse HEAD)"
+printf '%s\n' "$OLD_HEAD" > "$STATE/self-update.installed-sha"
 : > "$TMP/systemctl.calls"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "invalid bridge runtime config aborts before restart" \
@@ -336,12 +337,51 @@ ok "invalid bridge runtime config aborts before restart" \
 ok "invalid bridge runtime config rolls repository back" \
   '[ "$(git -C "$REPO" rev-parse HEAD)" = "$OLD_HEAD" ] && grep -q "bridge-config-preflight-failed-rolled-back" "$STATE/self-update.log"'
 
+ok "preflight rollback preserves the previously installed SHA" \
+  '[ "$(cat "$STATE/self-update.installed-sha")" = "$OLD_HEAD" ]'
+
+# First deployment with no marker must not invent a completed installation
+# when preflight rolls the checkout and artifacts back.
+rm -f "$STATE/self-update.installed-sha"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "preflight rollback leaves an absent installed marker absent" \
+  '[ "$rc" = 6 ] && [ ! -e "$STATE/self-update.installed-sha" ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$OLD_HEAD" ]'
+
+# Reproduce a hand-pulled checkout after rollback. The old installed marker
+# must still trigger setup when HEAD already equals origin on the next tick.
+printf '%s\n' "$OLD_HEAD" > "$STATE/self-update.installed-sha"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "repeated preflight failure preserves the old installed generation" \
+  '[ "$rc" = 6 ] && [ "$(cat "$STATE/self-update.installed-sha")" = "$OLD_HEAD" ]'
+git -C "$REPO" merge -q --ff-only origin/main
+# --force must not take first-tick bootstrap adoption before its preflight.
+# HEAD already equals origin, so this reaches the distinct bootstrap branch.
+rm -f "$STATE/self-update.installed-sha"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "forced same-SHA preflight rollback preserves marker absence" \
+  '[ "$rc" = 6 ] && [ ! -e "$STATE/self-update.installed-sha" ] && [ ! -s "$TMP/systemctl.calls" ]'
+printf '%s\n' "$OLD_HEAD" > "$STATE/self-update.installed-sha"
+# shellcheck disable=SC2034  # marker_setup_count is read via eval inside ok()
+marker_setup_count="$(wc -l < "$SETUP_MARKER")"
+
 # Repair the node-local setting; the same target commit must now pass the gate.
 printf '%s\n' 'CLAUDE_PROCESS_TIMEOUT=3600' \
   'CCC_DELEGATED_TASK_STALL_SECONDS=1800' > "$REPO/bridge/.env"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "valid bridge runtime config permits allowlisted restart" \
   '[ "$rc" = 0 ] && grep -q "restart ccc-telegram-bridge.service" "$TMP/systemctl.calls"'
+
+ok "hand-pulled retry redeploys after preflight rollback" \
+  '[ "$(wc -l < "$SETUP_MARKER")" -eq "$((marker_setup_count + 1))" ]'
+ok "successful preflight commits the actual installed SHA" \
+  '[ "$(cat "$STATE/self-update.installed-sha")" = "$(git -C "$REPO" rev-parse HEAD)" ]'
+
+rm -f "$STATE/self-update.installed-sha"
+# shellcheck disable=SC2034  # marker_setup_count is read via eval inside ok()
+marker_setup_count="$(wc -l < "$SETUP_MARKER")"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "forced first deployment commits marker after successful preflight" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$SETUP_MARKER")" -eq "$((marker_setup_count + 1))" ] && [ "$(cat "$STATE/self-update.installed-sha")" = "$(git -C "$REPO" rev-parse HEAD)" ]'
 
 # A user-scoped bridge stays inside the same updater transaction: systemctl
 # receives --user for both restart and is-active, and the audit names the scope.
@@ -418,6 +458,8 @@ printf '%s\n' 'bad-unit' > "$CLAUDE/self-update.services"
 rm -f "$TMP/spool"/*.json
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "restart failure exits non-zero" '[ "$rc" = 7 ] && grep -q "failed to restart" <<<"$out"'
+ok "restart failure keeps the deployed installed SHA" \
+  '[ "$(cat "$STATE/self-update.installed-sha")" = "$(git -C "$REPO" rev-parse HEAD)" ]'
 ok "restart failure audit is explicit and names the degraded service" \
   'grep -q "\"result\":\"restart-failures\"" "$STATE/self-update.log" && grep -q "\"name\":\"bad-unit\",\"ok\":false" "$STATE/self-update.log"'
 ok "failure notification queued" 'jq -r .text "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | grep -q "재시작 실패"'

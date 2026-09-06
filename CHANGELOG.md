@@ -4,6 +4,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Commit the self-update installed SHA after bridge configuration preflight,
+  so a rolled-back update cannot hide a later required redeployment (#1568).
+
 - Preserve the token lock inode across shell, launchd and Python cleanup so
   a concurrent launcher cannot acquire a second lock on a recreated file
   (#1565, #1527).

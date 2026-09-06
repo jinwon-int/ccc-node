@@ -583,7 +583,9 @@ if [ "$CHANGED" = "false" ] && [ -n "$INSTALLED_SHA" ] && [ "$INSTALLED_SHA" != 
   log "install-drift installed=$INSTALLED_SHA checkout=$NEW_SHA reason=checkout-advanced-without-setup"
   OLD_SHA="$INSTALLED_SHA"
   CHANGED=true
-elif [ "$CHANGED" = "false" ] && [ -z "$INSTALLED_SHA" ]; then
+elif [ "$CHANGED" = "false" ] && [ -z "$INSTALLED_SHA" ] && [ "$FORCE" != "1" ]; then
+  # Only an ordinary no-change tick adopts HEAD. A forced first deployment
+  # must wait for setup and its config preflight before recording success.
   printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || log "warn installed-sha marker write failed path=$INSTALLED_SHA_FILE"
 fi
 
@@ -650,9 +652,6 @@ if ! (cd "$REPO" && bash setup.sh >>"$LOG" 2>&1); then
   say "self-update: setup failed and rollback was degraded; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
   exit 9
 fi
-# setup.sh deployed NEW_SHA: record it before restarts, so a later restart
-# failure retries restarts (existing path) rather than a full redeploy.
-printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || log "warn installed-sha marker write failed path=$INSTALLED_SHA_FILE"
 if bridge_service_allowlisted && ! bridge_runtime_config_preflight; then
   SETUP_OK=false
   REPO_ROLLBACK_OK=true
@@ -672,6 +671,11 @@ if bridge_service_allowlisted && ! bridge_runtime_config_preflight; then
   say "self-update: bridge runtime config preflight failed and rollback was degraded" >&2
   exit 9
 fi
+# Commit the installed generation only after setup AND its rollback-capable
+# config preflight succeed. Otherwise rollback leaves a rejected NEW_SHA in
+# the marker and a later hand-pulled checkout can incorrectly skip redeploy.
+# Keep this before restarts: a runtime failure does not undo installed assets.
+printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || log "warn installed-sha marker write failed path=$INSTALLED_SHA_FILE"
 # The recovery snapshot deliberately outlives setup and the runtime-config
 # preflight: a service that fails to come back is exactly when rollback
 # material is needed, and deleting it here left that path with nothing to
