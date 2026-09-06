@@ -1116,42 +1116,19 @@ acquire_token_lock() { # <pid>
 }
 
 cleanup_token_lock() {
-    if [ -z "$TOKEN_LOCK_FILE" ]; then
-        init_token_lock
-    fi
     [ -n "$TOKEN_LOCK_FILE" ] || return 0
-    rm -f "$TOKEN_LOCK_FILE"
-    rmdir "$TOKEN_LOCK_FILE.d" 2>/dev/null || true
+    # Keep the flock inode stable. If Python is unavailable, retain stale
+    # bookkeeping for the next claimant instead of splitting the lock domain.
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 -I -B "$SCRIPT_DIR/token_lock.py" --path "$TOKEN_LOCK_FILE" \
+        --expected-pid "${1:-$$}" --expected-pid "${2:-0}" --held-fd 8 \
+        >/dev/null 2>&1 || true
 }
 
 cleanup_token_lock_if_safe() {
-    local expected_pid_1="$1"
-    local expected_pid_2="$2"
-    local lock_pid
-
-    if [ -z "$TOKEN_LOCK_FILE" ]; then
-        init_token_lock
-    fi
-    [ -n "$TOKEN_LOCK_FILE" ] || return 0
-    [ -f "$TOKEN_LOCK_FILE" ] || return 0
-
-    lock_pid="$(cat "$TOKEN_LOCK_FILE" 2>/dev/null)"
-    if [ -z "$lock_pid" ]; then
-        cleanup_token_lock
-        return 0
-    fi
-
-    if [ -n "$expected_pid_1" ] && [ "$lock_pid" = "$expected_pid_1" ]; then
-        cleanup_token_lock
-        return 0
-    fi
-    if [ -n "$expected_pid_2" ] && [ "$lock_pid" = "$expected_pid_2" ]; then
-        cleanup_token_lock
-        return 0
-    fi
-    if ! kill -0 "$lock_pid" 2>/dev/null; then
-        cleanup_token_lock
-    fi
+    [ -n "$TOKEN_LOCK_FILE" ] || init_token_lock
+    # Eligibility and PID reads happen inside the kernel lock, not here.
+    cleanup_token_lock "$1" "$2"
 }
 
 # ── Atomic restart (--restart) ──

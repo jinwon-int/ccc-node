@@ -46,6 +46,8 @@ AES-GCM and `pip check`. A failed gate exits6 and leaves the old process alone.
 The child repeats validation after acquiring the existing token lock, then
 runs the selected venv without package installation. Foreground, detached
 restart and daemon-supervisor spawn paths preserve the explicit selection.
+Token cleanup now [retains the flock inode](service-control.md#token-lock-lifetime)
+so a concurrent claimant cannot bypass the lock by recreating its file.
 Existing duplicate-poller/process-tree guards remain in force; this change
 does not introduce a second Telegram poller. A source change after the
 pre-stop gate can still fail the post-stop gate: retention and recovery are

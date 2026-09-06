@@ -1,3 +1,4 @@
+import fcntl
 import importlib
 import json
 import os
@@ -102,7 +103,7 @@ class RuntimeHealthReporterTests(unittest.TestCase):
             reporter = module.RuntimeHealthReporter(project_root / ".telegram_bot")
             lock_file = project_root / ".telegram_bot" / "token.lock"
             lock_file.parent.mkdir(parents=True, exist_ok=True)
-            lock_file.write_text("lock\n", encoding="utf-8")
+            lock_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
             with patch.dict(
                 os.environ,
@@ -125,7 +126,8 @@ class RuntimeHealthReporterTests(unittest.TestCase):
             self.assertEqual(health["service"]["state"], "unavailable")
             self.assertEqual(health["service"]["reason"], "Stopped by signal")
             self.assertFalse(reporter.pid_file.exists())
-            self.assertFalse(lock_file.exists())
+            self.assertTrue(lock_file.exists())
+            self.assertEqual(lock_file.read_text(), "")
 
     def test_cleanup_preserves_pid_file_owned_by_another_process(self):
         """A dying instance must not delete the pid file of a concurrent
@@ -216,6 +218,26 @@ class RuntimeHealthReporterTests(unittest.TestCase):
                 reporter.pid_file.read_text(encoding="utf-8").strip(),
                 str(os.getpid()),
             )
+
+    def test_cleanup_keeps_the_locked_inode_for_other_contenders(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(project_root / ".telegram_bot")
+            lock_file = project_root / ".telegram_bot" / "token.lock"
+            lock_file.parent.mkdir(parents=True, exist_ok=True)
+            lock_file.write_text(f"{os.getpid()}\n")
+            inode = lock_file.stat().st_ino
+            with lock_file.open("r+") as holder:
+                fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with patch.dict(os.environ, {"BOT_TOKEN_LOCK_FILE": str(lock_file),
+                                             "BOT_OWNS_TOKEN_LOCK": "1"}):
+                    reporter.initialize_process()
+                    reporter.cleanup_runtime_files()
+                self.assertEqual(lock_file.stat().st_ino, inode)
+                with lock_file.open("a+") as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_cleanup_preserves_token_lock_owned_by_live_survivor(self):
         """A losing instance (BOT_OWNS_TOKEN_LOCK=1) must not delete a token

@@ -4,6 +4,10 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Preserve the token lock inode across shell, launchd and Python cleanup so
+  a concurrent launcher cannot acquire a second lock on a recreated file
+  (#1565, #1527).
+
 - Add a validated external restart command budget to self-update, preserving
   timeout failures and recovery artifacts (#1562, #1527).
 
