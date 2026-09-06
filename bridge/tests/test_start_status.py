@@ -167,10 +167,17 @@ class StartStatusTests(unittest.TestCase):
         fake_python.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         fake_python.chmod(0o755)
 
-    def _make_fake_launchctl(self, bin_dir: Path, log_file: Path) -> None:
+    def _make_fake_launchctl(
+        self, bin_dir: Path, log_file: Path, stop_pid: int | None = None
+    ) -> None:
         fake_launchctl = bin_dir / "launchctl"
+        stop = (
+            f'case "$1" in bootout|unload) kill {stop_pid} ;; esac\n'
+            if stop_pid is not None else ""
+        )
         fake_launchctl.write_text(
-            f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {str(log_file)!r}\nexit 0\n",
+            f"#!{shutil.which('sh')}\nprintf '%s\\n' \"$*\" >> {str(log_file)!r}\n"
+            + stop + "exit 0\n",
             encoding="utf-8",
         )
         fake_launchctl.chmod(0o755)
@@ -679,6 +686,7 @@ class StartStatusTests(unittest.TestCase):
 
             sleeper = subprocess.Popen(["sleep", "30"])
             try:
+                self._make_fake_launchctl(fake_bin, launchctl_log, sleeper.pid)
                 pid_file = project_root / ".telegram_bot" / "bot.pid"
                 pid_file.write_text(f"{sleeper.pid}\n", encoding="utf-8")
 
@@ -696,6 +704,45 @@ class StartStatusTests(unittest.TestCase):
             self.assertIn("Stopping launchd service", result.stdout)
             self.assertFalse(pid_file.exists())
             self.assertIn("bootout", launchctl_log.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(hasattr(os, "WNOWAIT"), "requires unreaped-child observation")
+    def test_stop_and_restart_accept_exited_unreaped_child(self):
+        for action, expected in (("--stop", 0), ("--restart", 2)):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as tmpdir:
+                project = self._prepare_project(tmpdir)
+                data = project / ".telegram_bot"
+                (data / ".env").write_text("TELEGRAM_BOT_TOKEN=123456:fixture\n")
+                fake_start = project / "start-fixture"
+                fake_start.write_text(f"#!{shutil.which('sh')}\nexit 1\n")
+                fake_start.chmod(0o700)
+                env = self._hermetic_env(os.environ.copy())
+                env.update(
+                    HOME=str(project / "home"),
+                    CCC_SYSTEMD_DIR=str(project / "no-systemd"),
+                    CCC_BRIDGE_STOP_GRACE_SECONDS="1",
+                    CCC_BRIDGE_RESTART_STOP_TIMEOUT="1",
+                    CCC_BRIDGE_RESTART_READY_TIMEOUT="5",
+                    CCC_BRIDGE_RESTART_SPAWN=str(fake_start),
+                )
+                child = subprocess.Popen(["sh", "-c", "exit 0"])
+                try:
+                    # Observe exit without reaping: kill -0 must still succeed.
+                    os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+                    os.kill(child.pid, 0)
+                    (data / "bot.pid").write_text(f"{child.pid}\n")
+                    result = subprocess.run(
+                        ["bash", str(self.start_script), "--path", str(project), action],
+                        env=env, capture_output=True, text=True, timeout=15,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stdout)
+                    self.assertNotIn("SIGKILL", result.stdout)
+                    self.assertFalse((data / "bot.pid").exists())
+                    if action == "--restart":
+                        # The failed fake start proves restart passed the old-PID
+                        # gate; it must not misclassify a zombie as stop-failed.
+                        self.assertIn("start-failed", result.stdout)
+                finally:
+                    child.wait(timeout=5)
 
     def test_stop_preserves_foreign_token_lock_when_bot_not_running(self):
         with tempfile.TemporaryDirectory() as tmpdir:

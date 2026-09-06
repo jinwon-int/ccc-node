@@ -571,72 +571,132 @@ do_status() {
     exit 0
 }
 
+# One wall-clock grace budget for all stop targets: the Python bridge drains
+# for45s, then tears down. Match systemd's70s allowance, not the old10s kill.
+# The override is useful for bounded recovery/testing; shorter values explicitly
+# shorten the drain allowance. Validate it before signalling any process.
+# A zombie has exited and cannot poll or retain open token-lock descriptors,
+# even though kill -0 succeeds until its parent reaps it. Unknown state remains
+# conservatively live. /proc avoids platform ps differences; macOS uses ps.
+_stop_process_state() {
+    if [ -r "/proc/$1/status" ]; then
+        awk '$1 == "State:" { print $2; exit }' "/proc/$1/status" 2>/dev/null
+    else
+        LC_ALL=C ps -o stat= -p "$1" 2>/dev/null | awk 'NR == 1 { print $1 }'
+    fi
+}
+
+stop_pid_alive() {
+    kill -0 "$1" 2>/dev/null || return 1
+    case "$(_stop_process_state "$1")" in Z*) return 1 ;; esac
+    return 0
+}
+
+stop_live_targets() {
+    local target
+    for target in "$@"; do
+        stop_pid_alive "$target" && printf '%s\n' "$target"
+    done
+    return 0
+}
+
 do_stop() {
-    local pid supervisor_pid upid
+    local pid supervisor_pid upid target known live deadline delegated
+    local grace="${CCC_BRIDGE_STOP_GRACE_SECONDS:-70}"
     local stopped_service=0
-    local unmanaged_stopped=0
+    local -a targets=() forwarded=()
+    if [[ ! "$grace" =~ ^[1-9][0-9]{0,3}$ ]] || [ "$grace" -gt 3600 ]; then
+        echo "❌ CCC_BRIDGE_STOP_GRACE_SECONDS must be an integer from1 to3600" >&2
+        exit 2
+    fi
     supervisor_pid="$(read_supervisor_pid)"
     pid="$(read_pid)"
+    # Snapshot before signalling: a supervisor forwards TERM during its EXIT
+    # cleanup. Remember its descendants before they can be reparented, so we
+    # never send a second TERM (which means force to the Python drain handler).
+    for target in "$supervisor_pid" "$pid" $(find_project_bot_pids); do
+        [ -n "$target" ] || continue
+        stop_pid_alive "$target" || continue
+        known=0
+        for upid in "${targets[@]}"; do
+            [ "$upid" = "$target" ] && known=1
+        done
+        [ "$known" -eq 1 ] && continue
+        targets+=("$target")
+        if [ -n "$supervisor_pid" ] && [ "$target" != "$supervisor_pid" ] \
+            && stop_pid_alive "$supervisor_pid" \
+            && [ "$(_parent_pid_of "$target")" = "$supervisor_pid" ]; then
+            forwarded+=("$target")
+        fi
+    done
 
     if [ -f "$PLIST_FILE" ]; then
         echo "🛑 Stopping launchd service: $PLIST_LABEL..."
-        launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || launchctl unload "$PLIST_FILE" 2>/dev/null || true
+        if ! launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null \
+            && ! launchctl unload "$PLIST_FILE" 2>/dev/null; then
+            echo "❌ Stop failed: launchd unload failed; retaining PID and token-lock files"
+            exit 1
+        fi
         stopped_service=1
         sleep 1
     fi
 
-    if [ -n "$supervisor_pid" ] && kill -0 "$supervisor_pid" 2>/dev/null; then
-        echo "🛑 Stopping daemon supervisor (PID: $supervisor_pid)..."
-        kill "$supervisor_pid"
-        for i in $(seq 1 10); do
-            kill -0 "$supervisor_pid" 2>/dev/null || break
-            sleep 1
+    deadline=$((SECONDS + grace))
+    for target in "${targets[@]}"; do
+        # Successful service unload already requests termination. Repeating it
+        # here could turn a still-running service drain into an explicit force.
+        [ "$stopped_service" -eq 1 ] && continue
+        delegated=0
+        for upid in "${forwarded[@]}"; do
+            [ "$upid" = "$target" ] && delegated=1
         done
-        if kill -0 "$supervisor_pid" 2>/dev/null; then
-            echo "⚠️  Supervisor not responding to SIGTERM, sending SIGKILL..."
-            kill -9 "$supervisor_pid" 2>/dev/null
-            sleep 0.5
+        [ "$delegated" -eq 1 ] && continue
+        if [ "$target" = "$supervisor_pid" ]; then
+            echo "🛑 Stopping daemon supervisor (PID: $target)..."
+        elif [ "$target" = "$pid" ]; then
+            echo "🛑 Stopping bot process (PID: $target)..."
+        else
+            echo "🛑 Stopping unmanaged bot process (PID: $target)..."
         fi
-    fi
-
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        echo "🛑 Stopping bot process (PID: $pid)..."
-        kill "$pid"
-        for i in $(seq 1 10); do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 1
-        done
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "⚠️  Bot process not responding to SIGTERM, sending SIGKILL..."
-            kill -9 "$pid" 2>/dev/null
-            sleep 0.5
-        fi
-    fi
-
-    # Also stop unmanaged instances for this project root (pid file lost or
-    # never written) — otherwise --stop reports "not running" while a live
-    # bot keeps holding the Telegram token.
-    for upid in $(find_project_bot_pids); do
-        [ -n "$pid" ] && [ "$upid" = "$pid" ] && continue
-        [ -n "$supervisor_pid" ] && [ "$upid" = "$supervisor_pid" ] && continue
-        echo "🛑 Stopping unmanaged bot process (PID: $upid)..."
-        kill "$upid" 2>/dev/null || true
-        for i in $(seq 1 10); do
-            kill -0 "$upid" 2>/dev/null || break
-            sleep 1
-        done
-        if kill -0 "$upid" 2>/dev/null; then
-            echo "⚠️  Unmanaged bot process not responding to SIGTERM, sending SIGKILL..."
-            kill -9 "$upid" 2>/dev/null
-            sleep 0.5
-        fi
-        unmanaged_stopped=1
+        kill "$target" 2>/dev/null || true
     done
+    live="$(stop_live_targets "${targets[@]}")"
+    while [ -n "$live" ] && [ "$SECONDS" -lt "$deadline" ]; do
+        sleep 1
+        live="$(stop_live_targets "${targets[@]}")"
+    done
+    if [ -n "$live" ]; then
+        echo "⚠️  Stop grace expired after ${grace}s; sending SIGKILL to remaining process(es): $live"
+        for target in $live; do
+            kill -9 "$target" 2>/dev/null || true
+        done
+        # SIGKILL delivery is asynchronous. Bound the final exit observation
+        # separately and retain bookkeeping if the kernel still reports a PID.
+        deadline=$((SECONDS + 2))
+        live="$(stop_live_targets "${targets[@]}")"
+        while [ -n "$live" ] && [ "$SECONDS" -lt "$deadline" ]; do
+            sleep 0.1
+            live="$(stop_live_targets "${targets[@]}")"
+        done
+        if [ -n "$live" ]; then
+            echo "❌ Stop failed: process refuses to exit (PID(s): $live); retaining PID and token-lock files"
+            exit 1
+        fi
+    fi
 
+    # Rescan before releasing bookkeeping: an unexpected newly discovered bot
+    # is not a license to spawn a replacement on top of it.
+    live="$(while IFS= read -r target; do
+        stop_live_targets "$target"
+    done < <(find_project_bot_pids))"
+    if [ -n "$live" ]; then
+        echo "❌ Stop failed: project process still running (PID(s): $live); retaining PID and token-lock files"
+        exit 1
+    fi
     cleanup_pid
     cleanup_supervisor_pid
     cleanup_token_lock_if_safe "$supervisor_pid" "$pid"
-    if [ "$stopped_service" -eq 1 ] || [ -n "$supervisor_pid" ] || [ -n "$pid" ] || [ "$unmanaged_stopped" -eq 1 ]; then
+    if [ "$stopped_service" -eq 1 ] || [ -n "$supervisor_pid" ] || [ -n "$pid" ] || [ "${#targets[@]}" -gt 0 ]; then
         echo "✅ Bot stopped"
     else
         echo "⚪ Bot is not running"
@@ -1127,9 +1187,11 @@ restart_status_snapshot() {
 restart_live_old_pids() {
     local pid
     for pid in "${RESTART_OLD_PID:-}" "${RESTART_OLD_SUPERVISOR_PID:-}"; do
-        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+        [ -n "$pid" ] && stop_pid_alive "$pid" && printf '%s\n' "$pid"
     done
-    find_project_bot_pids
+    while IFS= read -r pid; do
+        stop_live_targets "$pid"
+    done < <(find_project_bot_pids)
 }
 
 do_restart() {

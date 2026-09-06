@@ -113,6 +113,19 @@ is preserved. A second termination signal explicitly skips the remaining drain;
 an operator who needs an immediate hard stop can use systemd's `SIGKILL`
 facility, accepting loss of in-flight work.
 
+Unmanaged `start.sh --stop` and `--restart` also allow 70 seconds for all
+snapshotted bot/supervisor targets together. A daemon supervisor forwards the
+first TERM to its direct bot child; the outer stop driver does not repeat that
+signal. At the deadline it kills only remaining targets, then observes exit
+for at most two more seconds. A surviving or newly discovered project bot
+causes failure and keeps PID/token-lock bookkeeping; restart must not launch
+on top of it. This is a bounded drain, not a guarantee that work exceeding the
+45-second application window will finish. `CCC_BRIDGE_STOP_GRACE_SECONDS`
+accepts integer1–3600 to explicitly change the outer allowance; a value below70
+can interrupt drain/cleanup. Managed systemd restarts still belong to systemd.
+Unmanaged signalling targets the bot/supervisor, not an entire cgroup; the
+systemd descendant-cleanup guarantee does not extend to this path.
+
 `systemctl stop` uses the same bounded drain and still leaves the service
 stopped; `Restart=always` does not override an explicit systemd stop. A normal
 restart—including one issued through `ccc-service-control`—drains and then
