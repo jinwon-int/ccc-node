@@ -167,6 +167,7 @@ payload sess-fail "$TRANSCRIPT_FAIL" | \
   bash "$DISTILL" sessionend >/dev/null 2>&1
 wait_for '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ]'
 failed_job="$(find "$STATE/distill-pending" -maxdepth 1 -type f -name '*.json' | head -1)"
+# shellcheck disable=SC2034  # failed_id is read via eval inside ok()
 failed_id="$(basename "$failed_job" .json)"
 wait_for 'grep -q "pending retained reason=pipeline-failed job=$failed_id" "$STATE/distill.log" && [ -e "$failed_job.lock" ] && flock -n "$failed_job.lock" true 2>/dev/null'
 ok "failed extraction keeps one retryable pending job" \
@@ -183,6 +184,7 @@ ok "SessionStart schedules bounded pending recovery" \
 # One retryable pending job is on disk from the failure case above. Under kill
 # the launcher must spawn nothing and retain the job; under dry-run it proceeds.
 : > "$STATE/distill.log"
+# shellcheck disable=SC2034  # before_jobs is read via eval inside ok()
 before_jobs="$(find "$STATE/distill-pending" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d '[:space:]')"
 ok "precondition: a pending job exists to drain" '[ "$before_jobs" -ge 1 ]'
 HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_AUTONOMY=kill bash "$DRAIN" >/dev/null 2>&1
@@ -260,6 +262,7 @@ payload sess-nologin "$TRANSCRIPT_AUTH" | \
 wait_for 'grep -q "pending retained reason=pipeline-failed" "$STATE/distill.log" && [ -f "$STATE/distill.cooldown" ]'
 ok "nologin extract writes node cooldown" \
   'jq -e ".class == \"not_logged_in\"" "$STATE/distill.cooldown" >/dev/null'
+# shellcheck disable=SC2034  # auth_jobs is read via eval inside ok()
 auth_jobs="$(find "$STATE/distill-pending" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d '[:space:]')"
 ok "nologin keeps the pending job" '[ "$auth_jobs" -ge 1 ]'
 : > "$STATE/distill.log"
@@ -275,6 +278,7 @@ rm -f "$STATE/distill.cooldown" "$STATE/distill-last-error.json"
 printf '99.00 90.00 80.00 2/100 1234\n' > "$TMP/loadavg.hot"
 printf 'MemTotal: 3888888 kB\nMemAvailable: 102400 kB\nSwapTotal: 2097152 kB\nSwapFree: 2000000 kB\n' > "$TMP/meminfo.lowmem"
 printf 'MemTotal: 3888888 kB\nMemAvailable: 3000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 100 kB\n' > "$TMP/meminfo.swapfull"
+# shellcheck disable=SC2034  # gate_jobs is read via eval inside ok()
 gate_jobs="$(find "$STATE/distill-pending" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d '[:space:]')"
 
 : > "$STATE/distill.log"
@@ -335,6 +339,7 @@ ok "load-gate: healthy drain retains the failing job" \
 # Transcripts are append-only, so the older job's pinned hash can never match
 # again: retained, it burned a drain slot every SessionStart and (while its
 # snapshot still matched) paid a duplicate extraction over one conversation.
+# shellcheck disable=SC2034  # stale_gate_id is read via eval inside ok()
 stale_gate_id="$(basename "$gate_job" .json)"
 printf '{"type":"user","message":{"content":"gate turn 4"}}\n' >> "$TRANSCRIPT_GATE"
 : > "$STATE/distill.log"
@@ -354,9 +359,11 @@ ok "superseding enqueue leaves exactly one fresh job for the session" \
 # claimable at a stable scan position, starving valid jobs of drain slots.
 # Driven through the adapter directly so drain slot ordering cannot flake it.
 wait_for '[ -n "$fresh_gate_job" ] && [ -e "$fresh_gate_job.lock" ] && flock -n "$fresh_gate_job.lock" true 2>/dev/null'
+# shellcheck disable=SC2034  # fresh_gate_id is read via eval inside ok()
 fresh_gate_id="$(basename "$fresh_gate_job" .json)"
 printf '{"type":"user","message":{"content":"gate turn 5"}}\n' >> "$TRANSCRIPT_GATE"
 dead_rc=0
+# shellcheck disable=SC2034  # dead_err is read via eval inside ok()
 dead_err="$(HOME="$TMP/home" CCC_STATE_DIR="$STATE" \
   python3 "$HERE/pending_journal.py" run "$STATE/distill-pending" \
     "$fresh_gate_job" "$DISTILL" 2>&1 >/dev/null)" || dead_rc=$?

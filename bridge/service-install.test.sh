@@ -44,7 +44,9 @@ if [ "$(id -u)" = "0" ]; then
     WANTED="multi-user.target"
     DAEMON_RELOAD="daemon-reload"
 else
+    # shellcheck disable=SC2034  # WANTED is read via eval inside ok()
     WANTED="default.target"
+    # shellcheck disable=SC2034  # DAEMON_RELOAD is read via eval inside ok()
     DAEMON_RELOAD="--user daemon-reload"
 fi
 
@@ -78,7 +80,9 @@ ok "systemd install enabled --now the service" \
 # Identical canonical content is a true no-op: no inode replacement, reload,
 # enable, or restart.
 : > "$SC_CALLS"
+# shellcheck disable=SC2034  # unit_inode_before is read via eval inside ok()
 unit_inode_before="$(stat -c %i "$UNIT")"
+# shellcheck disable=SC2034  # unit_mtime_before is read via eval inside ok()
 unit_mtime_before="$(stat -c %Y "$UNIT")"
 run env HOME="$FH" CCC_SYSTEMD_DIR="$SD" CCC_SYSTEMCTL="$SC_STUB" \
     bash "$SSD" reconcile
@@ -94,6 +98,7 @@ ok "identical reconcile does not contact systemctl" '[ ! -s "$SC_CALLS" ]'
 sed -i 's/^Restart=always$/Restart=on-failure/' "$UNIT"
 mkdir -p "$UNIT.d"
 printf '[Service]\nEnvironment=CCC_LOCAL_OVERRIDE=true\n' > "$UNIT.d/override.conf"
+# shellcheck disable=SC2034  # dropin_before is read via eval inside ok()
 dropin_before="$(sha256sum "$UNIT.d/override.conf")"
 : > "$SC_CALLS"
 run env HOME="$FH" CCC_SYSTEMD_DIR="$SD" CCC_SYSTEMCTL="$SC_STUB" \
@@ -164,6 +169,7 @@ write_exec_stub "$ALWAYS_FAIL_STUB" <<SH
 echo "\$*" >> "$ALWAYS_FAIL_CALLS"
 exit 1
 SH
+# shellcheck disable=SC2034  # unit_before is read via eval inside ok()
 unit_before="$(sha256sum "$UNIT")"
 run env HOME="$FH" CCC_SYSTEMD_DIR="$SD" CCC_SYSTEMCTL="$ALWAYS_FAIL_STUB" \
     bash "$SSD" reconcile
@@ -176,6 +182,7 @@ ok "rollback reload failure is explicit and never restarts" \
 # Arbitrary legacy directives are not smuggled into the canonical main unit.
 # The bespoke unit is left for #831's explicit renderer-flag disposition.
 printf '%s\n' 'Environment=CCC_TELEGRAM_READABLE_RENDERER=true' >> "$UNIT"
+# shellcheck disable=SC2034  # bespoke_before is read via eval inside ok()
 bespoke_before="$(sha256sum "$UNIT")"
 : > "$SC_CALLS"
 run env HOME="$FH" CCC_SYSTEMD_DIR="$SD" CCC_SYSTEMCTL="$SC_STUB" \
@@ -196,8 +203,11 @@ cp "$UNIT" "$SYMLINK_TARGET"
 sed -i 's/^Restart=always$/Restart=on-failure/' "$SYMLINK_TARGET"
 SYMLINK_UNIT="$SYMLINK_SD/ccc-telegram-bridge.service"
 ln -s "$SYMLINK_TARGET" "$SYMLINK_UNIT"
+# shellcheck disable=SC2034  # symlink_inode_before is read via eval inside ok()
 symlink_inode_before="$(stat -c %i "$SYMLINK_UNIT")"
+# shellcheck disable=SC2034  # symlink_target_before is read via eval inside ok()
 symlink_target_before="$(readlink "$SYMLINK_UNIT")"
+# shellcheck disable=SC2034  # symlink_bytes_before is read via eval inside ok()
 symlink_bytes_before="$(sha256sum "$SYMLINK_TARGET")"
 : > "$SC_CALLS"
 run env HOME="$FH" CCC_SYSTEMD_DIR="$SYMLINK_SD" CCC_SYSTEMCTL="$SC_STUB" \
@@ -225,8 +235,11 @@ cp "$UNIT" "$HARDLINK_PEER"
 sed -i 's/^Restart=always$/Restart=on-failure/' "$HARDLINK_PEER"
 HARDLINK_UNIT="$HARDLINK_SD/ccc-telegram-bridge.service"
 ln "$HARDLINK_PEER" "$HARDLINK_UNIT"
+# shellcheck disable=SC2034  # hardlink_inode_before is read via eval inside ok()
 hardlink_inode_before="$(stat -c %i "$HARDLINK_UNIT")"
+# shellcheck disable=SC2034  # hardlink_count_before is read via eval inside ok()
 hardlink_count_before="$(stat -c %h "$HARDLINK_UNIT")"
+# shellcheck disable=SC2034  # hardlink_bytes_before is read via eval inside ok()
 hardlink_bytes_before="$(sha256sum "$HARDLINK_UNIT" | cut -d' ' -f1)"
 : > "$SC_CALLS"
 run env HOME="$FH" CCC_SYSTEMD_DIR="$HARDLINK_SD" CCC_SYSTEMCTL="$SC_STUB" \
@@ -396,6 +409,7 @@ ok "token-lock guard message intact" 'grep -q "already using the same Bot Token"
 rm -f "$DH/.telegram-bot-locks/$THASH.pid"
 
 # Full dispatch: start.sh pre-flight passes, subcommand writes the plist.
+# shellcheck disable=SC2034  # DPLIST is read via eval inside ok()
 DPLIST="$DH/Library/LaunchAgents/com.telegram-skill-bot.dproj.plist"
 run env HOME="$DH" CCC_LAUNCHCTL="$LC_STUB" bash "$START" --path "$DPROJ" --install
 okc "$RC" 0 "start.sh --install dispatch exits 0"
@@ -420,7 +434,9 @@ okc "$RC" 0 "relocate fixture installs"
 OTHER="$TMP/other-checkout"
 sed -i "s|^ExecStart=/bin/bash $HERE/start\.sh |ExecStart=/bin/bash $OTHER/bridge/start.sh |" "$RUNIT"
 sed -i "s|^WorkingDirectory=$REPO\$|WorkingDirectory=$OTHER|" "$RUNIT"
+# shellcheck disable=SC2034  # relocate_before is read via eval inside ok()
 relocate_before="$(sha256sum < "$RUNIT")"
+# shellcheck disable=SC2034  # relocate_inode_before is read via eval inside ok()
 relocate_inode_before="$(stat -c %i "$RUNIT")"
 : > "$SC_CALLS"
 run env HOME="$FH" CCC_SYSTEMD_DIR="$RSD" CCC_SYSTEMCTL="$SC_STUB" \
@@ -506,6 +522,7 @@ ok "seam-scoped run reports the seam path, not the live tree" \
 # A text guard on purpose: every functional case in this file drives them as
 # `bash "$SSD" ...` — precisely the form the callers lacked — so no functional
 # test here can observe a caller exec'ing on the shebang.
+# shellcheck disable=SC2034  # uninterpreted is read via eval inside ok()
 uninterpreted="$(grep -nE '(^|[[:space:]]|\()(exec[[:space:]]+)?"\$\{?(SCRIPT_DIR|SRC)\}?(/bridge)?/service-(systemd|launchd)\.sh"' \
   "$START" "$REPO/setup.sh" 2>/dev/null | grep -vE '(^|[[:space:]]|\()bash[[:space:]]+"' || true)"
 ok "no caller execs the service scripts on their shebang" '[ -z "$uninterpreted" ]'

@@ -97,37 +97,12 @@ PY_COMPILE_EXCLUDE=(bridge/)
 SC_SCOPE_EXTRA=(scripts/git-hooks/managed-checkout-guard)
 # Warning-level shellcheck baseline: tracked scripts that carry PRE-EXISTING
 # warning-severity findings and are therefore linted at error level only
-# (the repo-wide sweep in 3a). Snapshot 2026-09-05; the set is identical
-# under shellcheck 0.9.0 (CI, ubuntu-latest apt) and 0.11.0. Ratchet: an
-# entry that becomes clean FAILS the run until it is removed; a NEW script
-# is never added here — it is linted at warning level from its first commit.
-SC_WARN_BASELINE=(bridge/service-install.test.sh
-         claude/hooks/distill/pending-drain.test.sh
-         claude/hooks/distill/wiki-queue.test.sh
-         claude/hooks/lib/memory_render.test.sh
-         claude/hooks/lib/test-stub.test.sh
-         claude/hooks/memory-hooks.test.sh
-         claude/hooks/nunchi/assemble-fixtures.test.sh
-         claude/hooks/skill-review/autoinstall.test.sh
-         claude/hooks/skill-review/curator.test.sh
-         claude/hooks/skill-review/ownership-incremental.test.sh
-         piri/skills/web/web_tools.test.sh
-         scripts/ccc-codex-github-policy.test.sh
-         scripts/ccc-distill-fleet-matrix.test.sh
-         scripts/ccc-fleet-matrix.test.sh
-         scripts/ccc-fleet-skills-sync.test.sh
-         scripts/ccc-memory.test.sh
-         scripts/ccc-security-audit.test.sh
-         scripts/ccc-self-update.test.sh
-         scripts/ccc-skill-autosave.test.sh
-         scripts/ccc-skill-promotion.test.sh
-         scripts/ccc-skill-registry.test.sh
-         scripts/cost-ledger.test.sh
-         scripts/install-nunchi.test.sh
-         scripts/install-tunnel-audit-cron.test.sh
-         scripts/rescreen-rotation.test.sh
-         scripts/tunnel-audit-fleet.test.sh
-         scripts/tunnel-audit.test.sh)
+# (the repo-wide sweep in 3a). Snapshot 2026-09-05; burned down to empty on
+# 2026-09-06 (#1510 batches 1-5) — every tracked *.sh is now linted at
+# warning level. Ratchet: an entry that becomes clean FAILS the run until it
+# is removed; a NEW script is never added here — it is linted at warning
+# level from its first commit.
+SC_WARN_BASELINE=()
 # --- end manifests -----------------------------------------------------------
 
 # --- discovery (#1484) -------------------------------------------------------

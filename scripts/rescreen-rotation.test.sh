@@ -3,7 +3,6 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TOOL="$ROOT/scripts/rescreen-rotation.py"
-PROMOTER="$ROOT/scripts/ccc-skill-promotion.py"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$ROOT/claude/hooks/lib/test-stub.sh"
 ccc_test_reset_hook_env
@@ -131,8 +130,14 @@ printf '#!/usr/bin/env bash\n' > "$TMP/nexus/scripts/a2a-dispatch-round.mjs"; ch
 { printf '## Worker procedure\n'; printf 'Apply the rubric step. %.0s' $(seq 1 20); printf '\n## Receipt projection\n'; } > "$TMP/nexus/docs/skills-intake-review.md"
 
 # Determinism: two dry-runs over the same state produce identical assignment.
-out1="$(run_tool --dry-run --names "skill-a,skill-b,skill-c,skill-orphan")"; rc1=$?
-out2="$(run_tool --dry-run --names "skill-a,skill-b,skill-c,skill-orphan")"; rc2=$?
+# shellcheck disable=SC2034  # out1 is read via eval inside ok()
+out1="$(run_tool --dry-run --names "skill-a,skill-b,skill-c,skill-orphan")"
+# shellcheck disable=SC2034  # rc1 is read via eval inside ok()
+rc1=$?
+# shellcheck disable=SC2034  # out2 is read via eval inside ok()
+out2="$(run_tool --dry-run --names "skill-a,skill-b,skill-c,skill-orphan")"
+# shellcheck disable=SC2034  # rc2 is read via eval inside ok()
+rc2=$?
 ok "dry-run succeeds and is deterministic (#2028)" \
   '[ "$rc1" = 0 ] && [ "$rc2" = 0 ] && [ "$(jq -c .results <<<"$out1")" = "$(jq -c .results <<<"$out2")" ]'
 ok "pool excludes the recent-failure node with a recorded reason" \
@@ -152,7 +157,10 @@ ok "no-case candidate is skipped with a reason" \
   '[ "$(jq -r ".results[] | select(.name==\"skill-orphan\") | .reason" <<<"$out1")" = "no-case" ]'
 
 # Dispatch path: non-dry-run produces tasks via the stubbed dispatcher.
-out3="$(run_tool)"; rc3=$?
+# shellcheck disable=SC2034  # out3 is read via eval inside ok()
+out3="$(run_tool)"
+# shellcheck disable=SC2034  # rc3 is read via eval inside ok()
+rc3=$?
 ok "dispatch mode assigns tasks to every candidate (#2028)" \
   '[ "$rc3" = 0 ] && [ "$(jq -r "[.results[] | select(.task != null)] | length" <<<"$out3")" = 3 ]'
 ok "remote dispatch records the broker name (#2028)" \

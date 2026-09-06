@@ -36,6 +36,7 @@ ok "single-link regular stub can be replaced atomically" \
 if printf 'unsafe\n' | write_exec_stub "" 2>/dev/null; then
   empty_rc=0
 else
+  # shellcheck disable=SC2034  # empty_rc is read via eval inside ok()
   empty_rc=$?
 fi
 ok "empty destination is rejected before redirection" '[ "$empty_rc" -ne 0 ]'
@@ -43,6 +44,7 @@ ok "empty destination is rejected before redirection" '[ "$empty_rc" -ne 0 ]'
 if printf 'unsafe\n' | write_exec_stub "relative-stub" 2>/dev/null; then
   relative_rc=0
 else
+  # shellcheck disable=SC2034  # relative_rc is read via eval inside ok()
   relative_rc=$?
 fi
 ok "relative destination is rejected before redirection" \
@@ -51,6 +53,7 @@ ok "relative destination is rejected before redirection" \
 if printf 'unsafe\n' | write_exec_stub "$TMP/missing-parent/stub" 2>/dev/null; then
   missing_parent_rc=0
 else
+  # shellcheck disable=SC2034  # missing_parent_rc is read via eval inside ok()
   missing_parent_rc=$?
 fi
 ok "missing destination parent is rejected before redirection" \
@@ -59,6 +62,7 @@ ok "missing destination parent is rejected before redirection" \
 sentinel="$TMP/sentinel"
 printf 'keep\n' > "$sentinel"
 ln -s "$sentinel" "$TMP/bin/symlink-stub"
+# shellcheck disable=SC2034  # symlink_rc is read via eval inside ok()
 if write_exec_stub "$TMP/bin/symlink-stub" <<'SH' 2>/dev/null
 printf 'clobbered\n'
 SH
@@ -68,6 +72,7 @@ ok "symlink destination is rejected without touching its target" \
 
 printf 'hardlink-keep\n' > "$TMP/bin/hardlink-source"
 ln "$TMP/bin/hardlink-source" "$TMP/bin/hardlink-stub"
+# shellcheck disable=SC2034  # hardlink_rc is read via eval inside ok()
 if write_exec_stub "$TMP/bin/hardlink-stub" <<'SH' 2>/dev/null
 printf 'clobbered\n'
 SH
@@ -77,6 +82,7 @@ ok "multiply-linked destination is rejected without touching its peer" \
 
 mkdir -p "$TMP/real-parent"
 ln -s "$TMP/real-parent" "$TMP/link-parent"
+# shellcheck disable=SC2034  # parent_link_rc is read via eval inside ok()
 if write_exec_stub "$TMP/link-parent/stub" <<'SH' 2>/dev/null
 printf 'unsafe\n'
 SH
@@ -85,6 +91,7 @@ ok "symlink destination parent is rejected" \
   '[ "$parent_link_rc" -ne 0 ] && [ ! -e "$TMP/real-parent/stub" ]'
 
 mkdir -p "$OUTSIDE/bin"
+# shellcheck disable=SC2034  # outside_rc is read via eval inside ok()
 if write_exec_stub "$OUTSIDE/bin/stub" <<'SH' 2>/dev/null
 printf 'escaped\n'
 SH
@@ -129,6 +136,7 @@ audit_fail=0
 while IFS= read -r test_file; do
   if ! grep -q 'TMP="$(ccc_test_tmpdir' "$test_file"; then
     echo "unsafe TMP/bin fixture root: $test_file"
+    # shellcheck disable=SC2034  # audit_fail is read via eval inside ok()
     audit_fail=1
   fi
 done < <(grep -RIl '\$TMP/bin' --include='*.test.sh' "$ROOT/claude" "$ROOT/scripts")
@@ -175,6 +183,7 @@ while IFS= read -r test_file; do
   grep -q 'lib/test-stub.sh' "$test_file" || continue
   if ! grep -q '^ccc_test_reset_hook_env' "$test_file"; then
     echo "suite does not reset inherited hook env: $test_file"
+    # shellcheck disable=SC2034  # reset_audit_fail is read via eval inside ok()
     reset_audit_fail=1
   fi
 done < <(find "$ROOT/claude" "$ROOT/scripts" -name '*.test.sh')

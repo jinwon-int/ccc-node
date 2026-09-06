@@ -150,13 +150,17 @@ repo_hash="$(cd "$GRAD_CLAUDE/release-checklist" && find . -type f -exec sha256s
 printf 'release-checklist %s\n' "$repo_hash" > "$GRAD_HOME/.claude/state/repo-skills.manifest"
 jq -n '{manager:"ccc-node",name:"release-checklist"}' > "$GRAD_CODEX/release-checklist/.ccc-node-managed.json"
 rm -f "$GRAD_CODEX/release-checklist/.ccc-fleet-skill.json"
+# shellcheck disable=SC2034  # sha_before_claude is read via eval inside ok()
 sha_before_claude="$(sha256sum "$GRAD_CLAUDE/release-checklist/SKILL.md" | awk '{print $1}')"
+# shellcheck disable=SC2034  # sha_before_codex is read via eval inside ok()
 sha_before_codex="$(sha256sum "$GRAD_CODEX/release-checklist/SKILL.md" | awk '{print $1}')"
 
 out="$(env "${grad_env[@]}" python3 "$SYNC" apply --ref "$REF")"; rc=$?
 ok "sync after graduation skips both repo-managed targets without error" \
   '[ "$rc" = 0 ] && jq -e "(.changed == 0) and (.operations | all(.action == \"skip-repo-managed\"))" >/dev/null <<<"$out"'
+# shellcheck disable=SC2034  # sha_after_claude is read via eval inside ok()
 sha_after_claude="$(sha256sum "$GRAD_CLAUDE/release-checklist/SKILL.md" | awk '{print $1}')"
+# shellcheck disable=SC2034  # sha_after_codex is read via eval inside ok()
 sha_after_codex="$(sha256sum "$GRAD_CODEX/release-checklist/SKILL.md" | awk '{print $1}')"
 ok "repo-managed copies are byte-untouched by the skip" \
   '[ "$sha_after_claude" = "$sha_before_claude" ] && [ "$sha_after_codex" = "$sha_before_codex" ]'
@@ -344,6 +348,7 @@ ok "tampered-marker orphan is never deleted by apply" \
 #    three roots, audience-piri skills route to piri only, and non-Piri
 #    nodes plan zero piri operations.
 PIRI_HOME="$TMP/piri-home"
+# shellcheck disable=SC2034  # PIRI_ROOT is read via eval inside ok()
 PIRI_ROOT="$PIRI_HOME/.piri/agent/skills"
 PIRI_STATE="$PIRI_HOME/.claude/state/fleet-skills"
 mkdir -p "$PIRI_HOME/.claude/skills" "$PIRI_HOME/.claude/state" \
@@ -420,7 +425,10 @@ out="$(env "${piri_env[@]}" CCC_FLEET_SKILLS_REMOTE="$REMOTE2" python3 "$SYNC" p
 ok "audience-piri skill plans piri-only on a piri node" \
   '[ "$rc" = 0 ] && jq -e "(.operations | length) == 1 and .operations[0].provider == \"piri\" and .operations[0].action == \"install\"" >/dev/null <<<"$out"'
 
-out="$(env "${base_env[@]}" CCC_FLEET_SKILLS_REMOTE="$REMOTE2" python3 "$SYNC" plan --ref "$REF2B")"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${base_env[@]}" CCC_FLEET_SKILLS_REMOTE="$REMOTE2" python3 "$SYNC" plan --ref "$REF2B")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "audience-piri skill plans nothing on a non-piri node" \
   '[ "$rc" = 0 ] && jq -e "(.operations | length) == 0" >/dev/null <<<"$out"'
 

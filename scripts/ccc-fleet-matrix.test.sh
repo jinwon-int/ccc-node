@@ -34,7 +34,10 @@ PASS=12 FAIL=0
 {"ok":false,"risk":"위험"}
 EOF
 
-out="$(bash "$ROOT/scripts/ccc-security-audit-fleet-matrix.sh" --evidence "$TMP/security.txt" --node-list daegyo,gongyung --json)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(bash "$ROOT/scripts/ccc-security-audit-fleet-matrix.sh" --evidence "$TMP/security.txt" --node-list daegyo,gongyung --json)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "security matrix emits read-only JSON" '[ "$rc" = 0 ] && jq -e ".kind == \"ccc-security-audit-fleet-matrix\" and .mutations.permissionChange == false and .mutations.secretRead == false" <<<"$out" >/dev/null'
 ok "security matrix classifies normal and danger" 'jq -e ".nodes[] | select(.node == \"daegyo\" and .status == \"정상\")" <<<"$out" >/dev/null && jq -e ".nodes[] | select(.node == \"gongyung\" and .status == \"위험\")" <<<"$out" >/dev/null'
 
@@ -58,12 +61,14 @@ some bearer token=abc leaked
 {"result":"교정가능","fixable":true}
 EOF
 
+# shellcheck disable=SC2034  # sout is read via eval inside ok()
 sout="$(bash "$ROOT/scripts/ccc-security-audit-fleet-matrix.sh" --evidence "$TMP/drift.txt" --node-list a,b,c,d)"
 ok "security: JSON 'critical' → 위험" 'jq -e ".nodes[] | select(.node==\"a\" and .status==\"위험\" and .reason==\"security_audit_reported_failure\")" <<<"$sout" >/dev/null'
 ok "security: text 'critical' → 위험" 'jq -e ".nodes[] | select(.node==\"b\" and .status==\"위험\" and .reason==\"security_failures_present\")" <<<"$sout" >/dev/null'
 ok "security: secret word mention flagged (read-only)" 'jq -e ".nodes[] | select(.node==\"c\" and .secretWordOnlyMention==true)" <<<"$sout" >/dev/null'
 ok "security: fixable → 교정가능" 'jq -e ".nodes[] | select(.node==\"d\" and .status==\"교정가능\" and .reason==\"fixable_security_drift\")" <<<"$sout" >/dev/null'
 
+# shellcheck disable=SC2034  # dout is read via eval inside ok()
 dout="$(bash "$ROOT/scripts/ccc-doctor-fleet-matrix.sh" --evidence "$TMP/drift.txt" --node-list a,b,c,d)"
 ok "doctor: JSON body has version field (extractor)" 'jq -e ".nodes[] | select(.node==\"a\") | has(\"version\")" <<<"$dout" >/dev/null'
 ok "doctor: no secretWordOnlyMention field (domain-scoped)" 'jq -e "[.nodes[] | has(\"secretWordOnlyMention\")] | any | not" <<<"$dout" >/dev/null'
@@ -114,6 +119,7 @@ cat > "$TMP/real-shape.txt" <<'EOF'
 | 정상 | `settings.json` | valid JSON | none |
 EOF
 
+# shellcheck disable=SC2034  # rout is read via eval inside ok()
 rout="$(bash "$ROOT/scripts/ccc-doctor-fleet-matrix.sh" --evidence "$TMP/real-shape.txt" --node-list warned,fixable,clean)"
 ok "doctor: 경고 rows are not masked by the 정상 rows beside them" 'jq -e ".nodes[] | select(.node==\"warned\" and .status==\"경고\" and .reason==\"warnings_present\")" <<<"$rout" >/dev/null'
 ok "doctor: tally severity wins over row order (교정가능)" 'jq -e ".nodes[] | select(.node==\"fixable\" and .status==\"교정가능\" and .reason==\"fixable_drift\")" <<<"$rout" >/dev/null'
@@ -126,6 +132,7 @@ cat > "$TMP/no-tally.txt" <<'EOF'
 | 정상 | `settings.json` | valid JSON | none |
 | 경고 | `memory cache` | honcho=stale | run the memory check |
 EOF
+# shellcheck disable=SC2034  # nout is read via eval inside ok()
 nout="$(bash "$ROOT/scripts/ccc-doctor-fleet-matrix.sh" --evidence "$TMP/no-tally.txt" --node-list mixed)"
 ok "doctor: 경고 beats 정상 with no tally present" 'jq -e ".nodes[] | select(.node==\"mixed\" and .status==\"경고\")" <<<"$nout" >/dev/null'
 
@@ -135,6 +142,7 @@ cat > "$TMP/prose.txt" <<'EOF'
 security audit ok
 경고 handling is described in the runbook, see - 경고: section below
 EOF
+# shellcheck disable=SC2034  # pout is read via eval inside ok()
 pout="$(bash "$ROOT/scripts/ccc-security-audit-fleet-matrix.sh" --evidence "$TMP/prose.txt" --node-list prose)"
 ok "tally parser ignores non-numeric prose mentions" 'jq -e ".nodes[] | select(.node==\"prose\") | .status" <<<"$pout" >/dev/null'
 
