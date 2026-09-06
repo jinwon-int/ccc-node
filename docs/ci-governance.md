@@ -60,7 +60,10 @@ contributor has to know:
 Practical rules:
 
 - A new `*.test.sh` runs as soon as it is tracked (`git add`); there is nothing
-  to register. It must start with a shebang. If it must also pass under
+  to register. It must start with a shebang and emit a `PASS=<n> FAIL=<n>`
+  summary derived from the test results, plus a nonzero exit on failure. A
+  Python/unittest wrapper must provide this summary too; exit zero alone
+  does not satisfy the harness result contract. If it must also pass under
   umask 0002 (permission-contract suites, #770), put `# harness: umask-rerun`
   on its own line in the header comment block, before the first non-comment line.
 - A new `*.sh` is shellcheck-linted at warning level from its first commit.
