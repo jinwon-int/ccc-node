@@ -72,6 +72,7 @@ ok "reports the node identity from CCC_NODE" \
 p2="$TMP/projects2/-root"; mkdir -p "$p2"
 emit "$p2/a.jsonl" "$IN_DAY" m2 r2 kimi-coding/k3 \
   '{"input_tokens":1000,"output_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
+# shellcheck disable=SC2034  # json2 is read via eval inside ok()
 json2="$(CCC_NODE=testnode python3 "$LEDGER" --projects "$TMP/projects2" --date 2026-08-20 --dry-run 2>&1 | sed -n '/^{/,$p')"
 ok "an unpriced model records tokens but a null cost" \
   '[ "$(jq -r ".models[\"kimi-coding/k3\"].input_tokens" <<<"$json2")" = 1000 ] \
@@ -85,6 +86,7 @@ ok "totals refuse a partial sum when any model is unpriced" \
 p3="$TMP/projects3/-root"; mkdir -p "$p3"
 emit "$p3/a.jsonl" "$IN_DAY" m3 r3 claude-opus-5 \
   '{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"inference_geo":"us"}'
+# shellcheck disable=SC2034  # json3 is read via eval inside ok()
 json3="$(CCC_NODE=testnode python3 "$LEDGER" --projects "$TMP/projects3" --date 2026-08-20 --dry-run 2>&1 | sed -n '/^{/,$p')"
 ok "US data residency (1.1x) is refused rather than priced as global" \
   '[ "$(jq -r ".models[\"claude-opus-5\"].est_cost_usd" <<<"$json3")" = "null" ]'
@@ -92,7 +94,10 @@ ok "the refusal names the modifier" \
   'jq -e ".models[\"claude-opus-5\"].usage_modifiers | index(\"inference_geo=us\")" <<<"$json3" >/dev/null'
 
 # --- a node with no transcripts is a normal state, not a failure ----------
-out4="$(CCC_NODE=testnode python3 "$LEDGER" --projects "$TMP/does-not-exist" --codex-sessions "$TMP/also-missing" --piri-sessions "$TMP/also-missing" --date 2026-08-20 2>&1)"; rc4=$?
+# shellcheck disable=SC2034  # out4 is read via eval inside ok()
+out4="$(CCC_NODE=testnode python3 "$LEDGER" --projects "$TMP/does-not-exist" --codex-sessions "$TMP/also-missing" --piri-sessions "$TMP/also-missing" --date 2026-08-20 2>&1)"
+# shellcheck disable=SC2034  # rc4 is read via eval inside ok()
+rc4=$?
 ok "a node without transcripts exits 0 (daegyo/gongmyoung are legitimate)" '[ "$rc4" = 0 ]'
 ok "and says it skipped rather than writing a zero row" \
   'jq -e ".ok == true and .skipped == \"no-transcripts\"" <<<"$out4" >/dev/null'
@@ -109,6 +114,7 @@ ok "a different node appends its own row for the same day" \
 
 # --- node identity falls back to state/node.txt when CCC_NODE is unset -----
 mkdir -p "$TMP/state"; printf 'from-node-txt\n' > "$TMP/state/node.txt"
+# shellcheck disable=SC2034  # json5 is read via eval inside ok()
 json5="$(env -u CCC_NODE CCC_STATE_DIR="$TMP/state" python3 "$LEDGER" --projects "$TMP/projects" --date 2026-08-20 --dry-run 2>&1 | sed -n '/^{/,$p')"
 ok "node.txt is used when CCC_NODE is unset" \
   '[ "$(jq -r ".node" <<<"$json5")" = "from-node-txt" ]'
@@ -147,6 +153,7 @@ ok "entry carries CCC_STATE_DIR so node identity resolves under cron" \
   'grep -qF "CCC_STATE_DIR=" "$FAKE_CRON"'
 # shellcheck source=/dev/null
 . "$ROOT/scripts/lib/installer-gen-stamp.sh"
+# shellcheck disable=SC2034  # want_gen is read via eval inside ok()
 want_gen="$(ccc_installer_gen_stamp_auto "$INSTALLER")"
 ok "entry carries the gen stamp of the installer content" 'grep -qF "gen=$want_gen" "$FAKE_CRON"'
 ok "BEGIN/END markers stay unstamped (exact-match parsed)" \
@@ -165,6 +172,7 @@ ok "weekly line carries CCC_STATE_DIR and the gen stamp" \
 # Regression (#1264 defect class): the record argv must materialize --weekly,
 # or the first gen-drift self-update replay rebuilds the block with only the
 # daily line and the Monday rollup silently vanishes.
+# shellcheck disable=SC2034  # REC is read via eval inside ok()
 REC="$CCC_STATE_DIR/install-cost-ledger-cron.json"
 ok "--weekly is materialized in the install record" \
   'jq -e ".argv | index(\"--weekly\")" "$REC" >/dev/null 2>&1'
@@ -219,7 +227,10 @@ ok "record source flips to multi-provider-transcripts with several collectors" \
   '[ "$(jq -r ".source" <<<"$json")" = "multi-provider-transcripts" ]'
 
 # --- stage 2: --providers restricts collectors -------------------------------
-out="$(run --providers claude --dry-run 2>&1)"; rc=$?
+out="$(run --providers claude --dry-run 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+# shellcheck disable=SC2034  # json is read via eval inside ok()
 json="$(printf '%s' "$out" | sed -n '/^{/,$p')"
 ok "--providers claude excludes codex/piri collectors" \
   '[ "$(jq -r ".models | keys | length" <<<"$json")" = 1 ] && [ "$(jq -r ".source" <<<"$json")" = "claude-projects-transcripts" ]'

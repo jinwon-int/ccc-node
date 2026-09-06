@@ -66,7 +66,12 @@ seed context user "PROXY 직접 연결 채택 배경 정리"
 seed context node "FILLER-ONE 트래픽 메모"
 seed context node "FILLER-TWO 트래픽 메모"
 run_asm 8192 "PROXY"
-h="$(line_of "PROXY 직접 연결")"; f1="$(line_of "FILLER-ONE")"; f2="$(line_of "FILLER-TWO")"
+# shellcheck disable=SC2034  # h is read via eval inside ok()
+h="$(line_of "PROXY 직접 연결")"
+# shellcheck disable=SC2034  # f1 is read via eval inside ok()
+f1="$(line_of "FILLER-ONE")"
+# shellcheck disable=SC2034  # f2 is read via eval inside ok()
+f2="$(line_of "FILLER-TWO")"
 # tail order is recency (id DESC): FILLER-TWO ingested last, so it comes first
 ok "F-01 hint match (older) ranks above newer fillers" \
   '[ -n "$h" ] && [ -n "$f1" ] && [ -n "$f2" ] && [ "$h" -lt "$f2" ] && [ "$h" -lt "$f1" ] && [ "$f2" -lt "$f1" ]'
@@ -79,7 +84,10 @@ fixture_db f02
 seed context user "GATEWAY PROXY 전환 히스토리 정리"
 seed context node "PROXY 포트만 언급하는 메모"
 run_asm 8192 "GATEWAY PROXY"
-g="$(line_of "GATEWAY PROXY 전환")"; p="$(line_of "PROXY 포트만")"
+# shellcheck disable=SC2034  # g is read via eval inside ok()
+g="$(line_of "GATEWAY PROXY 전환")"
+# shellcheck disable=SC2034  # p is read via eval inside ok()
+p="$(line_of "PROXY 포트만")"
 ok "F-02 denser hint match ranks first among matches" \
   '[ -n "$g" ] && [ -n "$p" ] && [ "$g" -lt "$p" ]'
 
@@ -91,7 +99,11 @@ sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created
 seed fact user "FILLER-NEW 최신 사실"
 seed fact user "FILLER-OLD 오래된 사실"
 run_asm 300 ""
-c_new="$(line_of "CONSTRAINT-NEW")"; c_old="$(line_of "CONSTRAINT-OLD")"
+# shellcheck disable=SC2034  # c_new is read via eval inside ok()
+c_new="$(line_of "CONSTRAINT-NEW")"
+# shellcheck disable=SC2034  # c_old is read via eval inside ok()
+c_old="$(line_of "CONSTRAINT-OLD")"
+# shellcheck disable=SC2034  # f_new is read via eval inside ok()
 f_new="$(line_of "FILLER-NEW")"
 ok "F-03 constraints survive a tiny budget (G4)" \
   '[ -n "$c_new" ] && [ -n "$c_old" ]'
@@ -118,7 +130,12 @@ seed context user "SHORT-A 짧은 행"
 seed context node "LONG-B $(printf '여유行%.0s' $(seq 1 60)) 길어서 예산 초과"
 seed context user "SHORT-C 뒤의 짧은 행"
 run_asm 700 ""
-a="$(line_of "SHORT-A")"; b="$(line_of "LONG-B")"; c="$(line_of "SHORT-C")"
+# shellcheck disable=SC2034  # a is read via eval inside ok()
+a="$(line_of "SHORT-A")"
+# shellcheck disable=SC2034  # b is read via eval inside ok()
+b="$(line_of "LONG-B")"
+# shellcheck disable=SC2034  # c is read via eval inside ok()
+c="$(line_of "SHORT-C")"
 ok "F-05 over-budget long line is skipped" '[ -z "$b" ]'
 ok "F-05 later short line still fits (skip-then-fill)" '[ -n "$c" ]'
 # included rows keep recency order: SHORT-C (newest) ahead of SHORT-A
@@ -159,7 +176,10 @@ ok "F-09 static rows carry no ⟳ marker" \
 ok "F-09 live rows carry the inline ⟳ marker" \
   'grep -q "⟳ (.*/context) LIVE-ONE" <<<"$ASM" && grep -q "⟳ (.*/context) LIVE-TWO" <<<"$ASM"'
 ok "F-09 legend states the live-check count" 'grep -q "⟳ live-check 2건" <<<"$ASM"'
-legend="$(line_of "live-check 2건")"; first_live="$(line_of "LIVE-ONE")"
+# shellcheck disable=SC2034  # legend is read via eval inside ok()
+legend="$(line_of "live-check 2건")"
+# shellcheck disable=SC2034  # first_live is read via eval inside ok()
+first_live="$(line_of "LIVE-ONE")"
 ok "F-09 legend precedes the live rows" '[ -n "$legend" ] && [ -n "$first_live" ] && [ "$legend" -lt "$first_live" ]'
 
 # ---- F-10 hallways 1-hop: entity association reaches keyword-less facts -----
@@ -173,7 +193,12 @@ seed context node "vps7 호스트명 관련 사실"
 seed context node "gwakga 프록시 게이트웨이 사실"
 seed context node "UNRELATED-ROW 무관한 행"
 run_asm 8192 "gwakga 프록시"
-direct="$(line_of "gwakga 프록시 게이트웨이")"; hop="$(line_of "vps7 호스트명")"; unrel="$(line_of "UNRELATED-ROW")"
+# shellcheck disable=SC2034  # direct is read via eval inside ok()
+direct="$(line_of "gwakga 프록시 게이트웨이")"
+# shellcheck disable=SC2034  # hop is read via eval inside ok()
+hop="$(line_of "vps7 호스트명")"
+# shellcheck disable=SC2034  # unrel is read via eval inside ok()
+unrel="$(line_of "UNRELATED-ROW")"
 ok "F-10 hallway hop reaches the other endpoint's fact" '[ -n "$hop" ]'
 ok "F-10 two-term exact match outranks the hop (bm25 precision)" \
   '[ -n "$direct" ] && [ "$direct" -lt "$hop" ]'
@@ -208,12 +233,16 @@ for i in 1 2 3 4 5 6; do
   seed context node "바이트-행$i 한글 콘텐츠가 바이트를 빠르게 소모한다"
 done
 run_asm 400 ""
+# shellcheck disable=SC2034  # fact_bytes is read via eval inside ok()
 fact_bytes="$(grep -v "^## nunchi working memory" <<<"$ASM" | grep -v "^- ⚠" | grep -v "^- ⟳ live-check" | wc -c)"
 ok "F-13 fact block respects the byte budget (CJK)" '[ "$fact_bytes" -le 400 ]'
 ok "F-13 budget cut still emits the block header" 'grep -q "nunchi working memory" <<<"$ASM"'
+# shellcheck disable=SC2034  # rows_400 is read via eval inside ok()
 rows_400="$(grep -c "^- ⟳ (" <<<"$ASM")"
 run_asm 4000 ""
+# shellcheck disable=SC2034  # rows_4000 is read via eval inside ok()
 rows_4000="$(grep -c "^- ⟳ (" <<<"$ASM")"
+# shellcheck disable=SC2034  # total is read via eval inside ok()
 total="$(python3 "$NP" assemble --budget 4000 | wc -c)"
 ok "F-13 larger budget admits strictly more rows" '[ "$rows_4000" -gt "$rows_400" ]'
 ok "F-13 when content fits, total stays within the budget" '[ "$total" -le 4000 ]'

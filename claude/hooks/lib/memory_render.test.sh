@@ -17,10 +17,12 @@ ok "limit-bytes passes small input through byte-exact" '[ "$out" = "short text" 
 
 out="$(printf 'A%.0s' $(seq 1 500) | python3 "$MOD" limit-bytes 120)"
 ok "limit-bytes appends the truncation marker" 'grep -q "truncated by CCC memory budget" <<<"$out"'
+# shellcheck disable=SC2034  # n is read via eval inside ok()
 n="$(printf 'A%.0s' $(seq 1 500) | python3 "$MOD" limit-bytes 120 | wc -c)"
 ok "limit-bytes stays within the declared byte cap (marker included)" '[ "$n" -le 120 ]'
 
 # UTF-8 safety: cutting mid-multibyte-character must not emit broken bytes.
+# shellcheck disable=SC2034  # n_bad is read via eval inside ok()
 n_bad="$(printf '한%.0s' $(seq 1 200) | python3 "$MOD" limit-bytes 100 | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; echo $?)"
 ok "limit-bytes truncation keeps valid UTF-8" '[ "$n_bad" = 0 ]'
 
@@ -111,6 +113,7 @@ out="$(STALL_PID_FILE="$TMP/stall.pid" python3 "$MOD" run-memory-search-bounded 
 elapsed=$(( $(date +%s) - start ))
 ok "bounded runner enforces the deadline (exit 0, no output)" '[ "$rc" = 0 ] && [ -z "$out" ] && [ "$elapsed" -le 5 ]'
 sleep 0.2
+# shellcheck disable=SC2034  # stall_pid is read via eval inside ok()
 stall_pid="$(cat "$TMP/stall.pid" 2>/dev/null || true)"
 # Gone OR an unreaped zombie: in containers without a PID-1 reaper the killed
 # child stays Z (kill -0 still succeeds) even though killpg did its job.
@@ -128,7 +131,9 @@ printf 'via-explicit-interpreter'
 SH
 chmod +x "$TMP/badshebang-tool.sh"
 # the fixture really is unexec'able through its shebang on this host:
-"$TMP/badshebang-tool.sh" >/dev/null 2>&1; badshebang_rc=$?  # ccc:interpreter-ok: deliberate bad-shebang exec to pin the unspawnable-tool path (#1159)
+"$TMP/badshebang-tool.sh" >/dev/null 2>&1  # ccc:interpreter-ok: deliberate bad-shebang exec to pin the unspawnable-tool path (#1159)
+# shellcheck disable=SC2034  # badshebang_rc is read via eval inside ok()
+badshebang_rc=$?
 out="$(python3 "$MOD" run-memory-search-bounded "$TMP/badshebang-tool.sh" q 5 3 "")"; rc=$?
 ok "bounded runner runs a tool whose shebang does not resolve (#1159)" \
   '[ "$badshebang_rc" != 0 ] && [ "$rc" = 0 ] && [ "$out" = "via-explicit-interpreter" ]'
@@ -136,6 +141,7 @@ ok "bounded runner runs a tool whose shebang does not resolve (#1159)" \
 # #1159: when the spawn itself fails (no bash on PATH at all), the failure is
 # noted on stderr instead of vanishing into an empty result.
 mkdir -p "$TMP/empty-path"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(env PATH="$TMP/empty-path" "$(command -v python3)" "$MOD" run-memory-search-bounded "$TMP/fast-tool.sh" q 5 3 "" 2>"$TMP/spawn-err.txt")"; rc=$?
 ok "bounded runner notes an unspawnable interpreter on stderr (#1159)" \
   '[ "$rc" = 0 ] && [ -z "$out" ] && grep -q "cannot spawn tool" "$TMP/spawn-err.txt"'
@@ -155,6 +161,7 @@ meta="$(INJECTED='context alpha bravo charlie delta echo tail' python3 "$MOD" pi
   budget=12000,1000,3000,180,5,25,2000,500,0 alloc=3000 limit= \
   tool="$TMP/pipe-tool.sh" query=q state_dir="$TMP/state-p" timeout=3 \
   audience_scoped=0 wiki_enabled=1 dedup=1 render=1)"; rc=$?
+# shellcheck disable=SC2034  # expected is read via eval inside ok()
 expected="$(SEARCH_JSON="$(INJECTED='context alpha bravo charlie delta echo tail' SEARCH_JSON="$pj" python3 "$MOD" dedup-local-hot)" python3 "$MOD" render-local-hot)"
 ok "pipeline: exit 0 and budget line equals dynamic-budget output" \
   '[ "$rc" = 0 ] && [ "${meta%% search_local=*}" = "alloc=8500 limit=25" ]'
@@ -220,6 +227,7 @@ meta="$(python3 "$MOD" pipeline out="$pdir" alloc=3000 limit=5 tool="$TMP/lane-t
   shared_state_dir="$TMP/shared" shared_timeout=3 legacy_state_dir="$TMP/legacy" legacy_timeout=2 \
   audience_scoped=1 audience=private parallel=1 global_timeout=1 \
   wiki_enabled=1 dedup=0 render=0)"; rc=$?
+# shellcheck disable=SC2034  # elapsed is read via eval inside ok()
 elapsed=$(( $(date +%s) - start ))
 ok "pipeline: parallel audience lanes finish within the global budget, stalled lane dropped" \
   '[ "$rc" = 0 ] && [ "$elapsed" -le 3 ] && grep -q "search_parallel=" <<<"$meta" && ! grep -q "SHARED_HIT" "$pdir/local_hot"'
@@ -227,6 +235,7 @@ ok "pipeline: parallel audience lanes finish within the global budget, stalled l
 # (first) and drops the primary duplicate — the merge-local-hot contract.
 ok "pipeline: surviving lanes are merged with audience labels (recent lane first)" \
   'jq -e ".results | map(.snippet) == [\"PRIVATE_HIT distilled text\", \"LEGACY_HIT\"] and (.[0].memoryAudience == \"private\") and (.[1].memoryAudience == \"private-legacy\")" "$pdir/local_hot" >/dev/null'
+# shellcheck disable=SC2034  # meta is read via eval inside ok()
 meta="$(python3 "$MOD" pipeline out="$pdir" alloc=3000 limit=5 tool="$TMP/lane-tool.sh" query=q \
   state_dir="$TMP/private" timeout=3 recent_timeout=1 legacy_state_dir="$TMP/legacy" legacy_timeout=2 \
   audience_scoped=1 audience=private parallel=0 wiki_enabled=1 dedup=0 render=0)"
@@ -239,7 +248,9 @@ ok "pipeline: a missing out dir is refused (exit 2 -> shell fallback path)" '[ "
 # ---- dispatcher -------------------------------------------------------------
 python3 "$MOD" no-such-subcommand </dev/null >/dev/null 2>&1; rc=$?
 ok "dispatcher rejects unknown subcommands (exit 2 -> shell fallback path)" '[ "$rc" = 2 ]'
-python3 "$MOD" </dev/null >/dev/null 2>&1; rc=$?
+python3 "$MOD" </dev/null >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "dispatcher rejects missing subcommand" '[ "$rc" = 2 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"

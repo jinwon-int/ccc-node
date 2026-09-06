@@ -116,6 +116,7 @@ case "\$1" in
   funnel) printf 'https://node.tailnet.ts.net (Funnel on)\n|-- / proxy http://127.0.0.1:8888\n' ;;
 esac
 EOF
+# shellcheck disable=SC2034  # fun_out is read via eval inside ok()
 fun_out="$(bash "$AUDIT" 2>/dev/null)"
 ok "an entry tagged (Funnel on) is reported as funnel" 'jq -e ".tailscale.funnel.configured == true and .exposure.funnel_configured == true" <<<"$fun_out" >/dev/null'
 write_exec_stub "$TMP/bin/tailscale" <<EOF
@@ -133,6 +134,7 @@ ok "ufw active: default incoming + 3 normalised rules (comments stripped, whites
 ok "static-only ufw block is byte-identical to the pre-#1536 output (pinned)" '[ "$(jq -c ".firewall.ufw" <<<"$out")" = "{\"status\":\"active\",\"default_incoming\":\"deny\",\"rules\":[\"22/tcp (v6) on tailscale0 ALLOW IN Anywhere (v6)\",\"22/tcp on tailscale0 ALLOW IN Anywhere\",\"8123/tcp ALLOW IN 192.168.55.0/24\"],\"rules_hash\":\"a9e09f4302e92d0ce73887b9eae45fca5995a1039edb55c320de4bc70b0debf3\",\"cmd_status\":\"rc=0\"}" ]'
 ok "rules_hash is sha256 of the sorted rules joined by newline (unchanged algorithm)" '[ "$(jq -r ".firewall.ufw.rules_hash" <<<"$out")" = "$(printf "%s" "$(jq -r ".firewall.ufw.rules[]" <<<"$out")" | sha256sum | cut -d" " -f1)" ]'
 # Rule comment / column-spacing / order changes must not move the hash; a rule change must.
+# shellcheck disable=SC2034  # h0 is read via eval inside ok()
 h0="$(jq -r ".firewall.ufw.rules_hash" <<<"$out")"
 write_exec_stub "$TMP/bin/ufw" <<'EOF'
 cat <<'UFW'
@@ -146,6 +148,7 @@ To                         Action      From
 22/tcp (v6) on tailscale0  ALLOW IN    Anywhere (v6)
 UFW
 EOF
+# shellcheck disable=SC2034  # h1 is read via eval inside ok()
 h1="$(bash "$AUDIT" 2>/dev/null | jq -r ".firewall.ufw.rules_hash")"
 ok "ufw rules hash is stable across comment/order/spacing changes" '[ "$h0" = "$h1" ]'
 # Fail2Ban bans (#1536): "REJECT IN <ip>  # by Fail2Ban after N attempts …" come
@@ -185,6 +188,7 @@ To                         Action      From
 22/tcp (v6) on tailscale0  ALLOW IN    Anywhere (v6)
 UFW
 EOF
+# shellcheck disable=SC2034  # open_out is read via eval inside ok()
 open_out="$(bash "$AUDIT" 2>/dev/null)"
 ok "widened rule changes the hash; default allow clears firewall_default_deny" '[ "$(jq -r ".firewall.ufw.rules_hash" <<<"$open_out")" != "$h0" ] && jq -e ".firewall.ufw.default_incoming == \"allow\" and .exposure.firewall_default_deny == false" <<<"$open_out" >/dev/null'
 write_exec_stub "$TMP/bin/ufw" <<'EOF'
@@ -231,6 +235,7 @@ UFW
 EOF
 ok "stderr is empty" '[ ! -s "$TMP/err" ]'
 
+# shellcheck disable=SC2034  # md is read via eval inside ok()
 md="$(bash "$AUDIT" --markdown 2>/dev/null)"; rc=$?
 ok "markdown mode exits 0" '[ "$rc" = 0 ]'
 ok "markdown headline carries counts" 'grep -q "cloudflared units: 1 · reverse ssh: 1 · public tunnel units: 1 · public listeners: 2 · funnel: no · residue: 1" <<<"$md"'
@@ -252,7 +257,9 @@ EOF
 out="$(bash "$AUDIT" 2>/dev/null)"
 ok "tailscale panic classified as crashed" 'jq -e ".tailscale.serve.status == \"crashed\" and .tailscale.funnel.status == \"crashed\" and .exposure.funnel_configured == false" <<<"$out" >/dev/null'
 
-out="$(bash "$AUDIT" --bogus 2>&1)"; rc=$?
+out="$(bash "$AUDIT" --bogus 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "unknown flag exits 2" '[ "$rc" = 2 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"

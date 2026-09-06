@@ -163,12 +163,15 @@ for unsafe in 'file:///etc/passwd' 'http://127.0.0.1/private' 'https://user:secr
   ok "fetch rejects unsafe URL $unsafe" '[ "$rc" = 65 ]'
 done
 
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(FIRECRAWL_API_URL="http://127.0.0.1:$firecrawl_port" python3 "$DEVELOPER" "retry bug" --type issue --type pull_request --repo owner/repo 2>/dev/null)"
 ok "developer search returns the artifact and matched passage" 'grep -q "pull_request:owner/repo#42" <<<"$out" && grep -q "merged pull request fixed" <<<"$out"'
 ok "developer search marks passages as untrusted data" 'grep -qi "untrusted data" <<<"$out"'
 
 set +e
-python3 "$DEVELOPER" "retry bug" --type source_code >/dev/null 2>"$TMP/err"; rc=$?
+python3 "$DEVELOPER" "retry bug" --type source_code >/dev/null 2>"$TMP/err"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 set -e
 ok "developer search rejects unsupported artifact types" '[ "$rc" = 65 ]'
 

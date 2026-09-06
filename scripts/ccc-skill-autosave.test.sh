@@ -98,11 +98,15 @@ ok "notification counts pending drafts" 'jq -r ".text" "$SPOOL"/*SkillAutosave*.
 ok "notification has dedup key" 'jq -r ".dedup" "$SPOOL"/*SkillAutosave*.json 2>/dev/null | grep -q "SkillAutosave:1"'
 
 # --- 2) rerun without transcript growth: no re-draft, no duplicate notify ----
+# shellcheck disable=SC2034  # before_drafts is read via eval inside ok()
 before_drafts="$(find "$STATE/pending-skills" -name SKILL.md 2>/dev/null | wc -l | tr -d '[:space:]')"
+# shellcheck disable=SC2034  # before_spool is read via eval inside ok()
 before_spool="$(ls "$SPOOL" 2>/dev/null | wc -l | tr -d '[:space:]')"
 run_autosave
 sleep 1
+# shellcheck disable=SC2034  # after_drafts is read via eval inside ok()
 after_drafts="$(find "$STATE/pending-skills" -name SKILL.md 2>/dev/null | wc -l | tr -d '[:space:]')"
+# shellcheck disable=SC2034  # after_spool is read via eval inside ok()
 after_spool="$(ls "$SPOOL" 2>/dev/null | wc -l | tr -d '[:space:]')"
 ok "unchanged transcript not re-drafted" '[ "$after_drafts" = "$before_drafts" ]'
 ok "no duplicate notification for same pending count" '[ "$after_spool" = "$before_spool" ]'
@@ -119,7 +123,9 @@ out="$(CCC_STATE_DIR="$STATE" bash "$AUTOSAVE" status 2>&1)"
 ok "status reports pending count" 'printf "%s" "$out" | grep -q "pending skill drafts:"'
 
 # --- 5) auto mode (#355): sweep drives machine gate + unattended install -------
-STATE2="$TMP/state2"; SKILLS2="$TMP/skills2"; SPOOL2="$TMP/spool2"
+STATE2="$TMP/state2"; SPOOL2="$TMP/spool2"
+# shellcheck disable=SC2034  # SKILLS2 is read via eval inside ok()
+SKILLS2="$TMP/skills2"
 PROJECTS2="$TMP/projects2"
 make_transcript "$PROJECTS2/-root--work/bridge-sess-2.jsonl" 6
 mkdir -p "$STATE2"
@@ -182,7 +188,9 @@ run_autosave3() {
 # 7a) kill via env var
 rm -f "$TMP/scan3.touched"
 rm -f "$TMP/promotion3.touched"
-run_autosave3 env CCC_AUTONOMY=kill; rc=$?
+run_autosave3 env CCC_AUTONOMY=kill
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "autonomy=kill exits 0" '[ "$rc" = 0 ]'
 ok "autonomy=kill skips scan" '[ ! -f "$TMP/scan3.touched" ]'
 ok "autonomy=kill skips central promoter" '[ ! -f "$TMP/promotion3.touched" ]'
@@ -205,6 +213,7 @@ ok "autonomy=dry-run still runs the sweep (scan invoked)" '[ -f "$TMP/scan3.touc
 ok "autonomy=dry-run previews central promotion" 'grep -qx "run --dry-run" "$TMP/promotion3.touched"'
 
 # 7d) status surfaces the autonomy state
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(CCC_STATE_DIR="$STATE3" CCC_AUTONOMY=kill bash "$AUTOSAVE" status 2>&1)"
 ok "status reflects autonomy=kill" 'printf "%s" "$out" | grep -q "^autonomy: kill"'
 
@@ -232,8 +241,8 @@ mkdir -p "$STATE4" "$PROJECTS4"
 chmod 700 "$STATE4"
 
 # 8a) default OFF: the sessions tree is not even walked.
-run4() { # <extra env...>
-  env "$@" CCC_STATE_DIR="$STATE4" CLAUDE_PROJECTS_DIR="$PROJECTS4" CCC_PUSH_SPOOL="$SPOOL4" \
+run4() {
+  env CCC_STATE_DIR="$STATE4" CLAUDE_PROJECTS_DIR="$PROJECTS4" CCC_PUSH_SPOOL="$SPOOL4" \
     CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
     CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion4.touched" \
     CCC_SKILL_CODEX_NORMALIZE_CMD="$HERE/codex-rollout-normalize.py" \
@@ -248,12 +257,14 @@ ok "default off walks no sessions (no normalized tree)" '[ ! -d "$STATE4/codex-n
 # 8b) opt-in via state file: projection + dispatch + shared-state ledger.
 printf '1\n' > "$STATE4/skill-autosave.codex-drafting"
 run4
+# shellcheck disable=SC2034  # proj4 is read via eval inside ok()
 proj4="$STATE4/codex-normalized/-root-app/codexsess-1.jsonl"
 ok "opt-in projects the rollout into the branch-local tree" '[ -f "$proj4" ]'
 ok "projection lands in the Claude shape (Bash tool_use)" \
   'grep -q "\"type\": \"tool_use\", \"name\": \"Bash\"" "$proj4"'
 excluded_ledgered=0
 while IFS=$'\t' read -r key _rest; do
+  # shellcheck disable=SC2034  # excluded_ledgered is read via eval inside ok()
   [ "$key" = "rollout-2026-08-31T09-05-00-cccc-dddd" ] && excluded_ledgered=1
 done < "$STATE4/skill-autosave.codex-seen"
 ok "codex_exec session excluded and ledgered" \
@@ -262,14 +273,17 @@ ok "excluded session produced no normalized file" '[ ! -e "$STATE4/codex-normali
 ok "codex dispatch through real skill-review logged ok" 'grep -q "codex review ok session=rollout-2026-08-31T09-00-00-aaaa-bbbb" "$STATE4/skill-autosave.log"'
 drafted_ledgered=0
 while IFS=$'\t' read -r key _rest; do
+  # shellcheck disable=SC2034  # drafted_ledgered is read via eval inside ok()
   [ "$key" = "rollout-2026-08-31T09-00-00-aaaa-bbbb" ] && drafted_ledgered=1
 done < "$STATE4/skill-autosave.codex-seen"
 ok "codex sweep summary counted one draft" \
   '[ "$drafted_ledgered" = 1 ]'
 
 # 8c) rerun without growth: regrowth ledger prevents re-normalization/re-draft.
+# shellcheck disable=SC2034  # log_before is read via eval inside ok()
 log_before="$(grep -c "codex review ok" "$STATE4/skill-autosave.log")"
 run4
+# shellcheck disable=SC2034  # log_after is read via eval inside ok()
 log_after="$(grep -c "codex review ok" "$STATE4/skill-autosave.log")"
 ok "unchanged rollout not re-drafted" '[ "$log_after" = "$log_before" ]'
 
@@ -310,8 +324,8 @@ cat > "$PIRI_SESS/2026-09-05T09-00-00-1111-2222.jsonl" <<'EOF'
 {"type":"message","id":"a3","timestamp":"2026-09-05T09:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"백업 정상입니다"}]}}
 EOF
 
-run9() { # <extra env...>
-  env "$@" CCC_STATE_DIR="$STATE9" CLAUDE_PROJECTS_DIR="$PROJECTS9" CCC_PUSH_SPOOL="$SPOOL9" \
+run9() {
+  env CCC_STATE_DIR="$STATE9" CLAUDE_PROJECTS_DIR="$PROJECTS9" CCC_PUSH_SPOOL="$SPOOL9" \
     CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
     CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion9.touched" \
     CCC_SKILL_PIRI_NORMALIZE_CMD="$HERE/piri-session-normalize.py" \
@@ -331,6 +345,7 @@ ok "default off walks no piri sessions (no normalized tree)" '[ ! -d "$STATE9/pi
 # 9b) opt-in via state file: projection + dispatch + shared-state ledger.
 printf '1\n' > "$STATE9/skill-autosave.piri-drafting"
 run9
+# shellcheck disable=SC2034  # proj9 is read via eval inside ok()
 proj9="$STATE9/piri-normalized/-home-gongmyoung/pirisess-1.jsonl"
 ok "opt-in projects the piri session into the branch-local tree" '[ -f "$proj9" ]'
 ok "projection lands in the Claude shape (Bash tool_use)" \
@@ -339,13 +354,16 @@ ok "thinking noise is not projected" '! grep -q "noise" "$proj9"'
 ok "piri dispatch through real skill-review logged ok" 'grep -q "piri review ok session=2026-09-05T09-00-00-1111-2222" "$STATE9/skill-autosave.log"'
 piri_ledgered=0
 while IFS=$'\t' read -r key _rest; do
+  # shellcheck disable=SC2034  # piri_ledgered is read via eval inside ok()
   [ "$key" = "2026-09-05T09-00-00-1111-2222" ] && piri_ledgered=1
 done < "$STATE9/skill-autosave.piri-seen"
 ok "piri sweep summary counted one draft" '[ "$piri_ledgered" = 1 ]'
 
 # 9c) rerun without growth: regrowth ledger prevents re-normalization/re-draft.
+# shellcheck disable=SC2034  # log_before9 is read via eval inside ok()
 log_before9="$(grep -c "piri review ok" "$STATE9/skill-autosave.log")"
 run9
+# shellcheck disable=SC2034  # log_after9 is read via eval inside ok()
 log_after9="$(grep -c "piri review ok" "$STATE9/skill-autosave.log")"
 ok "unchanged piri session not re-drafted" '[ "$log_after9" = "$log_before9" ]'
 

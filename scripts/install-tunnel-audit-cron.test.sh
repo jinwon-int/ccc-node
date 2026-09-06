@@ -55,6 +55,7 @@ ok "installed line pins CCC_STATE_DIR for the wrapper" 'grep -qF "CCC_STATE_DIR=
 # generation stamp (#1081)
 # shellcheck source=/dev/null
 . "$ROOT/scripts/lib/installer-gen-stamp.sh"
+# shellcheck disable=SC2034  # want_gen is read via eval inside ok()
 want_gen="$(ccc_installer_gen_stamp_auto "$INSTALLER")"
 ok "installed line carries gen stamp" 'grep -qE "# ccc-node:tunnel-audit gen=h_[0-9a-f]{12}$" "$FAKE_CRON"'
 ok "gen stamp matches installer content" 'grep -qF "gen=$want_gen" "$FAKE_CRON"'
@@ -73,6 +74,7 @@ ok "custom schedule applied" 'grep -qF "3 * * * *" "$FAKE_CRON"'
 ok "wrapper path override applied" 'grep -qF "/opt/elsewhere/tunnel-audit-fleet.sh" "$FAKE_CRON"'
 
 # install record (#1081 phase 2)
+# shellcheck disable=SC2034  # REC is read via eval inside ok()
 REC="$CCC_CLAUDE_DIR/state/install-tunnel-audit-cron.json"
 ok "apply writes an install record" '[ -f "$REC" ]'
 ok "record carries schema/marker/gen" 'jq -e ".schema==\"ccc.install-record.v1\" and .marker==\"# ccc-node:tunnel-audit\" and .gen==\"$want_gen\"" "$REC" >/dev/null'
@@ -104,7 +106,10 @@ ok "no bare marker line survives migration" '[ "$(grep -cE "# ccc-node:tunnel-au
 
 # corrupt managed block fails closed (#1077)
 printf '%s\n' '# ccc-node:tunnel-audit:begin' '20 6 * * 1 dangling  # ccc-node:tunnel-audit gen=h_000000000000' > "$FAKE_CRON"
-out="$(bash "$INSTALLER" --apply 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(bash "$INSTALLER" --apply 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "corrupt managed block exits 4" '[ "$rc" = 4 ]'
 ok "corrupt managed block is reported" 'printf "%s" "$out" | grep -q "corrupt managed schedule block"'
 

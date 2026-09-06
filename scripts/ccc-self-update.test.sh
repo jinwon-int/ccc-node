@@ -191,7 +191,7 @@ git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm healthmask && git -C 
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "successful probe cannot mask failed external restart" '[ "$rc" = 7 ]'
 ok "masked restart retains recovery snapshot" 'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
-ok "masked restart audited as failure" 'grep '^{' "$STATE/self-update.log" | tail -1 | grep -q "restart-failures"'
+ok "masked restart audited as failure" 'grep "^{" "$STATE/self-update.log" | tail -1 | grep -q "restart-failures"'
 
 rm -rf "$STATE"/self-update-install-rollback.*
 
@@ -200,7 +200,7 @@ printf 'touch %s\n' "$TMP/forced-runtime" > "$CLAUDE/self-update.restart-cmd"
 printf 'test -f %s\n' "$TMP/forced-runtime" > "$CLAUDE/self-update.health-cmd"
 out="$(run_selfup run --force 2>&1)"; rc=$?
 ok "same-SHA force restarts the external runtime" '[ "$rc" = 0 ] && [ -f "$TMP/forced-runtime" ]'
-ok "same-SHA force audits the actual external restart" 'grep '^{' "$STATE/self-update.log" | tail -1 | jq -e ".changed == false and .services[0].scope == \"external\" and .services[0].ok" >/dev/null'
+ok "same-SHA force audits the actual external restart" 'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".changed == false and .services[0].scope == \"external\" and .services[0].ok" >/dev/null'
 printf '%s\n' 'exit 4' > "$CLAUDE/self-update.restart-cmd"
 out="$(run_selfup run --force 2>&1)"; rc=$?
 ok "same-SHA force preserves external restart failure" '[ "$rc" = 7 ]'
@@ -213,14 +213,15 @@ probe_started=$SECONDS
 out="$(run_selfup run --force 2>&1)"; rc=$?
 ok "post-restart health has a real deadline" '[ "$rc" = 7 ] && [ "$((SECONDS - probe_started))" -lt 12 ]'
 ok "timeout keeps recovery artifacts and releases the lock" '[ ! -d "$STATE/self-update.lock" ] && compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
-ok "timed-out health cannot report success" 'grep '^{' "$STATE/self-update.log" | tail -1 | grep -q "restart-failures"'
+ok "timed-out health cannot report success" 'grep "^{" "$STATE/self-update.log" | tail -1 | grep -q "restart-failures"'
 # With unchanged code the initial health probe is bounded too; its failure
 # takes the existing one-recovery-attempt path, with a bounded second probe.
 printf '%s\n' 'sleep 20' > "$CLAUDE/self-update.health-cmd"
+# shellcheck disable=SC2034  # probe_started is read via eval inside ok()
 probe_started=$SECONDS
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "up-to-date precheck and recovery health both have deadlines" '[ "$rc" = 7 ] && [ "$((SECONDS - probe_started))" -lt 12 ]'
-ok "unhealthy current runtime is audited honestly" 'grep '^{' "$STATE/self-update.log" | tail -1 | grep -q "runtime-down"'
+ok "unhealthy current runtime is audited honestly" 'grep "^{" "$STATE/self-update.log" | tail -1 | grep -q "runtime-down"'
 ok "TERM-resistant probe descendants were stopped" '[ ! -e "$TMP/late-health" ]'
 
 # An unavailable/unsupported timeout implementation must never lead to an
@@ -328,6 +329,7 @@ ok "snapshot chmod failure is fail-closed before setup" \
 rm -f "$FAKEBIN/chmod"
 
 ln -s "$TMP/missing-managed-target" "$CLAUDE/settings.json"
+# shellcheck disable=SC2034  # setup_count_before is read via eval inside ok()
 setup_count_before="$(wc -l < "$SETUP_MARKER")"
 out="$(run_selfup run --force 2>&1)"; rc=$?
 ok "managed artifact symlink is rejected before setup" \
@@ -365,8 +367,10 @@ printf '%s\n' '{"oldLocal":true}' > "$CLAUDE/settings.local.json"
 # ccc_codex_github_policy.py does (in place, no backup); rollback must put it
 # back byte-for-byte (#1131).
 printf '%s\n' 'sentinel = "KEEP-ME"' '' '[plugins."github@openai-curated-remote"]' 'enabled = true' > "$TMP/codex/config.toml"
+# shellcheck disable=SC2034  # CODEX_CFG_BEFORE is read via eval inside ok()
 CODEX_CFG_BEFORE="$(sha256sum "$TMP/codex/config.toml")"
 rm -f "$CLAUDE/headless.sh"
+# shellcheck disable=SC2034  # INSTALLED_BEFORE is read via eval inside ok()
 INSTALLED_BEFORE="$(sha256sum "$CLAUDE/hooks/installed-hook.sh")"
 cat > "$TMP/seed/setup.sh" <<'SH'
 #!/usr/bin/env bash
@@ -433,6 +437,7 @@ ok "artifact restore failure exits 9 and records degraded rollback" \
   '[ "$rc" = 9 ] && grep -q "setup-failed-rollback-degraded" "$STATE/self-update.log"'
 ok "degraded rollback retains validated private snapshot" \
   'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+# shellcheck disable=SC2034  # retained_snapshot is read via eval inside ok()
 retained_snapshot="$(compgen -G "$STATE/self-update-install-rollback.*" | head -1)"
 ok "retained recovery snapshot is owner-only" \
   '[ "$(stat -c %a "$retained_snapshot")" = 700 ] && [ "$(stat -c %a "$retained_snapshot/claude.tar.gz")" = 600 ] && [ "$(stat -c %a "$retained_snapshot/hermes.tar.gz")" = 600 ]'
@@ -596,6 +601,7 @@ rm -f "$TMP/spool"/*.json
 git -C "$REPO" checkout -q -b unpushed-work
 echo local-only > "$REPO/wip.txt"
 git -C "$REPO" add wip.txt && git -C "$REPO" commit -qm wip
+# shellcheck disable=SC2034  # wip_sha is read via eval inside ok()
 wip_sha="$(git -C "$REPO" rev-parse HEAD)"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "unpushed stray branch with clean tree recovers (rc 0)" '[ "$rc" = 0 ]'
@@ -745,6 +751,7 @@ ok "marker-absent tick adopts HEAD as installed" '[ "$(cat "$STATE/self-update.i
 echo drift > "$TMP/seed/drift.txt"
 git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm hand-pull && git -C "$TMP/seed" push -q origin main
 git -C "$REPO" pull -q --ff-only origin main
+# shellcheck disable=SC2034  # LAGGING is read via eval inside ok()
 LAGGING="$(cat "$STATE/self-update.installed-sha")"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "hand-pulled checkout exits 0" '[ "$rc" = 0 ]'
@@ -776,7 +783,10 @@ ok "foreign-owned checkout aborts (exit 4)" '[ "$rc" = 4 ] && grep -q "owned by 
 ok "foreign-owned checkout does not pull or run setup" '[ ! -f "$SETUP_MARKER" ] && [ "$(git -C "$REPO" rev-parse HEAD)" != "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
 ok "foreign-owned checkout logs owner-mismatch with uids" 'grep -q "abort reason=owner-mismatch .*owner=65534 euid=$(id -u)" "$STATE/self-update.log"'
 ok "foreign-owned checkout notifies" 'grep -rh "소유" "$TMP/spool" >/dev/null 2>&1'
-out="$(CCC_TEST_FAKE_REPO_OWNER=65534 CCC_SELF_UPDATE_ALLOW_OWNER_MISMATCH=1 run_selfup run 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_TEST_FAKE_REPO_OWNER=65534 CCC_SELF_UPDATE_ALLOW_OWNER_MISMATCH=1 run_selfup run 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "explicit override proceeds" '[ "$rc" = 0 ] && [ -f "$SETUP_MARKER" ]'
 rm -f "$FAKEBIN/stat"
 

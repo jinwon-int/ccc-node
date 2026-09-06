@@ -255,6 +255,7 @@ for refresh_case in missing error stale provider; do
       printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":1,"finished_at":2}' > "$optional_refresh_status"
       ;;
     provider)
+      # shellcheck disable=SC2034  # expected_reason is read via eval inside ok()
       expected_reason="refresh-provider"; case_ttl=21600
       printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"claude","state":"ok","exit_code":0,"started_at":180,"finished_at":190}' > "$optional_refresh_status"
       ;;
@@ -526,6 +527,7 @@ ok "memory check aggregates active and degraded write-back state" '[ "$rc" = 0 ]
   and .writeback_queue.wiki_status_counts == {}
 '\'' >/dev/null <<<"$out"'
 ok "memory check write-back JSON never exposes journal bodies or identities" '! grep -q "$secret_thread\|$secret_message\|$secret_output\|private-deadbeef\|private-feedface" <<<"$out"'
+# shellcheck disable=SC2034  # text_out is read via eval inside ok()
 text_out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" text 2>&1)"; rc=$?
 ok "memory check text reports one body-free write-back aggregate" '[ "$rc" = 0 ] && [ "$(grep -c "^- writeback:" <<<"$text_out")" = 1 ] && grep -q "status=degraded jobs=3 pending=2 invalid=3.*oldest=120s.*retries=13" <<<"$text_out" && ! grep -q "$secret_thread\|$secret_message\|$secret_output\|private-deadbeef\|private-feedface" <<<"$text_out"'
 
@@ -584,6 +586,7 @@ printf 'api_key: %s\n' "$secret_b" >> "$mem/MEMORY.md"
 printf 'https://x.test/?access_token=%s\n' "$secret_c" >> "$mem/MEMORY.md"
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild 2>&1)"; rc=$?
 ok "memory index rebuild succeeds" '[ "$rc" = 0 ] && jq -e ".ok == true and .documents >= 2 and .distill_indexed == false" >/dev/null <<<"$out"'
+# shellcheck disable=SC2034  # mode is read via eval inside ok()
 mode="$(python3 - <<PY
 import os, stat
 p='$state/memory-index.sqlite'
@@ -591,6 +594,7 @@ print(oct(stat.S_IMODE(os.stat(p).st_mode)) if os.path.exists(p) else 'missing')
 PY
 )"
 ok "memory index db is chmod 600" '[ "$mode" = "0o600" ]'
+# shellcheck disable=SC2034  # db_dump is read via eval inside ok()
 db_dump="$(python3 - <<PY
 import sqlite3
 con=sqlite3.connect('$state/memory-index.sqlite')
@@ -614,6 +618,7 @@ out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem
 ok "external SessionStart immediately hides stale valid distill-history rows" '[ "$rc" = 0 ] && ! grep -q "STALE_VALID_WIKI_DROP\|stale-valid.json" <<<"$out"'
 printf '%s\n' '{"wiki_candidates":[{"summary":"MALFORMED_HISTORY_WIKI_DROP"}]' > "$state/distill-history/malformed.json"
 CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DISTILL=1 CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-index.sh" update >/dev/null 2>&1
+# shellcheck disable=SC2034  # malformed_dump is read via eval inside ok()
 malformed_dump="$(python3 - <<PY
 import sqlite3
 con=sqlite3.connect('$state/memory-index.sqlite')
@@ -637,6 +642,7 @@ out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem
 ok "external memory explain reports zero Wiki budget and no stale Wiki result" '[ "$rc" = 0 ] && jq -e ".budgets.wiki == 0 and ([.search.results[] | select(.path | endswith(\"/wiki.txt\"))] | length == 0)" >/dev/null <<<"$out"'
 
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-index.sh" update 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # indexed_paths is read via eval inside ok()
 indexed_paths="$(python3 - <<PY
 import sqlite3
 con=sqlite3.connect('$state/memory-index.sqlite')
@@ -653,6 +659,7 @@ printf 'WIKI_QUEUE_DROP\n' > "$state/wiki-candidates.md"
 mkdir -p "$state/distill-history"
 printf '%s\n' '{"honcho":[{"text":"HONCHO_HISTORY_KEEP"}],"wiki_candidates":[{"summary":"WIKI_HISTORY_DROP"}]}' > "$state/distill-history/one.json"
 CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DISTILL=1 CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+# shellcheck disable=SC2034  # distill_dump is read via eval inside ok()
 distill_dump="$(python3 - <<PY
 import sqlite3
 con=sqlite3.connect('$state/memory-index.sqlite')
@@ -685,6 +692,7 @@ con.execute('INSERT INTO memory_fts(path,source,content) VALUES(?,?,?)', ('/tmp/
 con.commit(); con.close()
 PY
 out="$(CCC_STATE_DIR="$old_state" CCC_MEMORY_CACHE_DIR="$old_cache" CCC_MEMORY_DIR="$old_mem" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # old_marker_present is read via eval inside ok()
 old_marker_present="$(python3 - <<PY
 from pathlib import Path
 print('yes' if b'$old_marker' in Path('$old_state/memory-index.sqlite').read_bytes() else 'no')
@@ -714,6 +722,7 @@ cat > "$resume_json" <<'JSON'
 JSON
 out="$(CCC_STATE_DIR="$state" bash "$ROOT/claude/hooks/distill/resume-write.sh" < "$resume_json" 2>&1)"; rc=$?
 ok "resume-write creates fixed-schema resume pointer" '[ "$rc" = 0 ] && [ -f "$state/resume.md" ] && grep -q "다음 액션: 5대 노드 업그레이드 진행" "$state/resume.md"'
+# shellcheck disable=SC2034  # resume_before is read via eval inside ok()
 resume_before="$(cat "$state/resume.md")"
 cat > "$TMP/empty-resume.json" <<'JSON'
 {"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}
@@ -755,11 +764,14 @@ run_query_counted() { # [env...] — prints the query; git forks land in $QUERY_
 }
 query_key="${query_cwd//[!a-zA-Z0-9]/_}"
 rm -rf "$query_git_cache"; : > "$TMP/query-git-count"
+# shellcheck disable=SC2034  # q_cold is read via eval inside ok()
 q_cold="$(run_query_counted CCC_GIT_STATUS_CACHE_TTL=5)"
+# shellcheck disable=SC2034  # n_cold is read via eval inside ok()
 n_cold="$(wc -l < "$TMP/query-git-count")"
 ok "query: cold cache runs git and writes its own TSV row (ts, branch, paths)" \
   '[ "$n_cold" = 2 ] && grep -q "git_changed_paths: changed-memory-file.txt" <<<"$q_cold" && [ "$(cut -f2 "$query_git_cache/$query_key.query.tsv")" = "$(git -C "$query_cwd" branch --show-current)" ] && grep -q "changed-memory-file.txt" "$query_git_cache/$query_key.query.tsv"'
 : > "$TMP/query-git-count"
+# shellcheck disable=SC2034  # q_warm is read via eval inside ok()
 q_warm="$(run_query_counted CCC_GIT_STATUS_CACHE_TTL=5)"
 ok "query: a fresh own row answers with zero git forks and identical output" \
   '[ "$(wc -l < "$TMP/query-git-count")" = 0 ] && [ "$q_warm" = "$q_cold" ]'
@@ -767,16 +779,19 @@ ok "query: a fresh own row answers with zero git forks and identical output" \
 rm -rf "$query_git_cache"; mkdir -p "$query_git_cache"
 printf '%s\t%s\t%s\n' "$(date +%s)" "statusline-branch" "0" > "$query_git_cache/$query_key.tsv"
 : > "$TMP/query-git-count"
+# shellcheck disable=SC2034  # q_sl is read via eval inside ok()
 q_sl="$(run_query_counted CCC_GIT_STATUS_CACHE_TTL=5)"
 ok "query: a fresh statusline row with dirty=0 is reused (branch, no paths, no git)" \
   '[ "$(wc -l < "$TMP/query-git-count")" = 0 ] && grep -q "git_branch: statusline-branch" <<<"$q_sl" && ! grep -q "git_changed_paths" <<<"$q_sl"'
 printf '%s\t%s\t%s\n' "$(date +%s)" "statusline-branch" "1" > "$query_git_cache/$query_key.tsv"
 : > "$TMP/query-git-count"
+# shellcheck disable=SC2034  # q_dirty is read via eval inside ok()
 q_dirty="$(run_query_counted CCC_GIT_STATUS_CACHE_TTL=5)"
 ok "query: a dirty=1 statusline row cannot answer (may be untracked only) — git runs" \
   '[ "$(wc -l < "$TMP/query-git-count")" = 2 ] && grep -q "git_changed_paths: changed-memory-file.txt" <<<"$q_dirty" && ! grep -q "statusline-branch" <<<"$q_dirty"'
 printf '%s\t%s\t%s\n' "$(( $(date +%s) - 60 ))" "stale-branch" "old-path" > "$query_git_cache/$query_key.query.tsv"
 : > "$TMP/query-git-count"
+# shellcheck disable=SC2034  # q_stale is read via eval inside ok()
 q_stale="$(run_query_counted CCC_GIT_STATUS_CACHE_TTL=5)"
 ok "query: an expired own row is recomputed, not trusted" \
   '[ "$(wc -l < "$TMP/query-git-count")" = 2 ] && ! grep -q "stale-branch\|old-path" <<<"$q_stale"'
@@ -784,6 +799,7 @@ ok "query: cache write is atomic (no tmp leftovers)" \
   '[ "$(find "$query_git_cache" -name "*.tsv.*" | wc -l)" = 0 ]'
 # Bash-builtin file reads replaced four sed forks; the rendered fields must not move.
 printf 'line1\nline2\n' > "$query_state/current-prompt.txt"
+# shellcheck disable=SC2034  # q_files is read via eval inside ok()
 q_files="$(CCC_STATE_DIR="$query_state" CCC_WORKTREE="$query_cwd" CCC_GIT_STATUS_CACHE_DIR="$query_git_cache" bash "$ROOT/scripts/ccc-memory-query.sh" --mode local 2>/dev/null)"
 ok "query: node/task/prompt fields still come from the first line / first 40 lines" \
   'grep -q "^task: Implement issue 186" <<<"$q_files" && grep -q "prompt: line1 line2;" <<<"$q_files" && grep -q "node: query-node;" <<<"$q_files"'
@@ -907,6 +923,7 @@ printf '%s\n' \
   "{\"id\":\"ret-week\",\"kind\":\"observation\",\"text\":\"week scale note qgamma marker\",\"durability\":\"week-scale\",\"observed_at\":\"$OLD_TS\",\"review\":\"auto-local\"}" \
   "{\"id\":\"ret-unknown\",\"kind\":\"mystery-kind\",\"text\":\"unknown kind note qdelta marker\",\"durability\":\"volatile\",\"observed_at\":\"$OLD_TS\",\"review\":\"auto-local\"}" \
   > "$ret_facts"
+# shellcheck disable=SC2034  # ret_out is read via eval inside ok()
 ret_out="$(CCC_STATE_DIR="$ret_state" CCC_MEMORY_CACHE_DIR="$ret_cache" CCC_MEMORY_DIR="$ret_mem" CCC_MEMORY_FACTS_FILE="$ret_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild 2>/dev/null)"
 rq_has() {
   local out
@@ -1040,6 +1057,7 @@ bud_bullets() { # extra env assignments; prints count of rendered local bullets
 ok "dynamic budget reclaims slack -> local surfaces more than the default 5" '[ "$(bud_bullets)" -gt 5 ]'
 ok "dynamic budget OFF -> local stays at the default 5" '[ "$(bud_bullets CCC_MEMORY_DYNAMIC_BUDGET=0)" = 5 ]'
 ok "explicit CCC_MEMORY_SEARCH_LIMIT wins over dynamic" '[ "$(bud_bullets CCC_MEMORY_SEARCH_LIMIT=3)" = 3 ]'
+# shellcheck disable=SC2034  # bud_total is read via eval inside ok()
 bud_total="$(env CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" CCC_MEMORY_INDEX_DB="$bud_state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="editor Helix" bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext' | wc -c)"
 ok "dynamic budget keeps the whole injection within CCC_MEMORY_MAX_BYTES" '[ "$bud_total" -le 12000 ]'
 
@@ -1316,7 +1334,9 @@ install_hermes="$TMP/install-hermes"
 out="$(HOME="$install_home" CCC_CLAUDE_DIR="$install_claude" CCC_HERMES_DIR="$install_hermes" CCC_SYSTEMD_DIR="$TMP/install-systemd-seam" CCC_SYSTEMCTL=/bin/true bash "$ROOT/setup.sh" --no-backup >/dev/null 2>&1; echo rc=$?)"
 ok "setup installs memory helper tools beside hooks" 'grep -q "rc=0" <<<"$out" && [ -x "$install_claude/hooks/ccc-memory-index.sh" ] && [ -x "$install_claude/hooks/ccc-memory-search.sh" ] && [ -x "$install_claude/hooks/ccc-memory-query.sh" ] && [ -x "$install_claude/hooks/ccc-memory-explain.sh" ] && [ -x "$install_claude/hooks/ccc-wiki-triage.sh" ] && [ -x "$install_claude/hooks/ccc-memory-benchmark-export.sh" ]'
 ok "setup installs the shared detached-spawn helper" '[ -x "$install_claude/hooks/lib/spawn-detached.sh" ]'
-out="$(CCC_STATE_DIR="$TMP/install-eval-state" bash "$install_claude/hooks/ccc-memory-eval.sh" Honcho 2>&1)"; rc=$?
+out="$(CCC_STATE_DIR="$TMP/install-eval-state" bash "$install_claude/hooks/ccc-memory-eval.sh" Honcho 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "installed memory eval finds helper tools beside hooks" '[ "$rc" = 0 ] && jq -e ".ok == true" >/dev/null <<<"$out"'
 
 # Refresh guard: load-memory fires the detached refresh by default, and
@@ -1345,6 +1365,7 @@ gr_run() { # env-prefix args become extra assignments; -u clears the suite-wide 
 }
 rm -f "$gr_fifo"; mkfifo "$gr_fifo"
 gr_run PATH="$gr_setsid_bin:$PATH"
+# shellcheck disable=SC2034  # gr_default is read via eval inside ok()
 if read -t 5 _l <>"$gr_fifo"; then gr_default=fired; else gr_default=silent; fi
 ok "load-memory fires the background refresh by default" '[ "$gr_default" = fired ]'
 
@@ -1358,11 +1379,13 @@ for cmd in bash cat python3 jq date wc hostname dirname; do
 done
 rm -f "$gr_fifo"; mkfifo "$gr_fifo"
 gr_run PATH="$no_setsid_bin" CCC_LOCAL_MEMORY_ENABLED=0
+# shellcheck disable=SC2034  # gr_no_setsid is read via eval inside ok()
 if read -t 5 _l <>"$gr_fifo"; then gr_no_setsid=fired; else gr_no_setsid=silent; fi
 ok "load-memory refresh falls back when setsid is unavailable" '[ "$gr_no_setsid" = fired ]'
 
 rm -f "$gr_fifo"; mkfifo "$gr_fifo"
 gr_run CCC_MEMORY_NO_REFRESH=1
+# shellcheck disable=SC2034  # gr_guarded is read via eval inside ok()
 if read -t 2 _l <>"$gr_fifo"; then gr_guarded=fired; else gr_guarded=silent; fi
 ok "CCC_MEMORY_NO_REFRESH=1 suppresses the background refresh" '[ "$gr_guarded" = silent ]'
 
