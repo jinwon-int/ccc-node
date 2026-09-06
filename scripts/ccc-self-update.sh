@@ -157,33 +157,49 @@ resolve_health_cmd() {
   read_operator_cmd "$HEALTH_CMD_FILE"
 }
 
+# Commands run in timeout's process group; kill a TERM-resistant probe after
+# one additional second. Never fall back to an unbounded operator command.
+run_bounded_operator_cmd() { # <seconds> <command>
+  if ! command -v timeout >/dev/null 2>&1; then
+    log "operator-command unavailable=timeout"
+    return 125
+  fi
+  timeout --kill-after=1 "$1" bash -c "$2" >>"$LOG" 2>&1
+}
+
 # Run the operator's external restart command INSIDE the audit/notify boundary.
-# Outcome: restart must succeed, then health-cmd must pass (when configured,
-# up to RESTART_WAIT_SECONDS). A probe cannot erase a failed restart. Returns 0 = runtime back, 1 = still down.
+# Restart must succeed, then health-cmd must pass within a wall-time budget.
+# RESTART_WAIT_SECONDS includes probe execution and retry sleeps; timeout may
+# use one extra second to kill TERM-resistant descendants in its process group.
 run_external_restart() {
-  local rcmd hcmd rc waited
+  local rcmd hcmd rc deadline remaining pause started
   rcmd="$(resolve_restart_cmd)" || return 1
   hcmd="$(resolve_health_cmd || true)"
   log "external-restart begin"
-  if command -v timeout >/dev/null 2>&1; then
-    timeout 180 bash -c "$rcmd" >>"$LOG" 2>&1
-  else
-    bash -c "$rcmd" >>"$LOG" 2>&1
-  fi
+  run_bounded_operator_cmd 180 "$rcmd"
   rc=$?
   log "external-restart exit=$rc"
   [ "$rc" -eq 0 ] || return "$rc"
   if [ -n "$hcmd" ]; then
-    waited=0
-    until bash -c "$hcmd" >>"$LOG" 2>&1; do
-      waited=$((waited + 3))
-      [ "$waited" -ge "$RESTART_WAIT_SECONDS" ] && { log "external-restart health-timeout waited=${waited}s"; return 1; }
-      sleep 3
+    started=$SECONDS
+    deadline=$((started + RESTART_WAIT_SECONDS))
+    while :; do
+      remaining=$((deadline - SECONDS))
+      [ "$remaining" -gt 0 ] || break
+      if run_bounded_operator_cmd "$remaining" "$hcmd"; then
+        log "external-restart healthy waited=$((SECONDS - started))s"
+        return 0
+      fi
+      remaining=$((deadline - SECONDS))
+      [ "$remaining" -gt 0 ] || break
+      pause=3
+      [ "$remaining" -ge "$pause" ] || pause=$remaining
+      sleep "$pause"
     done
-    log "external-restart healthy waited=${waited}s"
-    return 0
+    log "external-restart health-timeout waited=$((SECONDS - started))s"
+    return 1
   fi
-  return "$rc"
+  return 0
 }
 
 snapshot_installed_artifacts() {
@@ -351,6 +367,13 @@ fi
 
 if [ "$MODE" != "run" ]; then
   say "usage: ccc-self-update.sh [run [--force]|status]" >&2
+  exit 2
+fi
+
+# Keep timeout/deadline arithmetic finite and reject zero (timeout disables
+# its deadline at zero). Status remains available for invalid configuration.
+if [[ ! "$RESTART_WAIT_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$RESTART_WAIT_SECONDS" -gt 86400 ]; then
+  say "self-update: CCC_SELF_UPDATE_RESTART_WAIT_SECONDS must be an integer in 1..86400" >&2
   exit 2
 fi
 
@@ -557,7 +580,7 @@ if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
   # verify runtime health and attempt ONE recovery restart — with the outcome
   # audited and notified, never discarded.
   if hcmd="$(resolve_health_cmd)" && resolve_restart_cmd >/dev/null 2>&1; then
-    if bash -c "$hcmd" >>"$LOG" 2>&1; then
+    if run_bounded_operator_cmd "$RESTART_WAIT_SECONDS" "$hcmd"; then
       log "done result=up-to-date sha=$NEW_SHA runtime=healthy"
       say "self-update: already up to date ($(git -C "$REPO" rev-parse --short HEAD))"
       exit 0
@@ -773,7 +796,7 @@ fi
 # recovery snapshot, notifies, and exits non-zero. Without a configured
 # command, report degraded (not ok) and exit non-zero so it cannot read as
 # success.
-if [ "$CHANGED" = "true" ] && [ "$RESTARTED" -eq 0 ]; then
+if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && [ "$RESTARTED" -eq 0 ]; then
   if resolve_restart_cmd >/dev/null 2>&1; then
     if run_external_restart; then
       RESTARTED=1

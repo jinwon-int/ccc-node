@@ -195,7 +195,50 @@ ok "masked restart audited as failure" 'grep '^{' "$STATE/self-update.log" | tai
 
 rm -rf "$STATE"/self-update-install-rollback.*
 
+# #1523: forcing unchanged source must also reapply external runtime state.
+printf 'touch %s\n' "$TMP/forced-runtime" > "$CLAUDE/self-update.restart-cmd"
+printf 'test -f %s\n' "$TMP/forced-runtime" > "$CLAUDE/self-update.health-cmd"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "same-SHA force restarts the external runtime" '[ "$rc" = 0 ] && [ -f "$TMP/forced-runtime" ]'
+ok "same-SHA force audits the actual external restart" 'grep '^{' "$STATE/self-update.log" | tail -1 | jq -e ".changed == false and .services[0].scope == \"external\" and .services[0].ok" >/dev/null'
+printf '%s\n' 'exit 4' > "$CLAUDE/self-update.restart-cmd"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "same-SHA force preserves external restart failure" '[ "$rc" = 7 ]'
+
+# A stuck health command must not hold the update lock indefinitely, even if
+# it ignores TERM. Its process group is killed within a one-second grace.
+printf '%s\n' 'exit 0' > "$CLAUDE/self-update.restart-cmd"
+printf 'trap "" TERM; sleep 20; touch %s\n' "$TMP/late-health" > "$CLAUDE/self-update.health-cmd"
+probe_started=$SECONDS
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "post-restart health has a real deadline" '[ "$rc" = 7 ] && [ "$((SECONDS - probe_started))" -lt 12 ]'
+ok "timeout keeps recovery artifacts and releases the lock" '[ ! -d "$STATE/self-update.lock" ] && compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "timed-out health cannot report success" 'grep '^{' "$STATE/self-update.log" | tail -1 | grep -q "restart-failures"'
+# With unchanged code the initial health probe is bounded too; its failure
+# takes the existing one-recovery-attempt path, with a bounded second probe.
+printf '%s\n' 'sleep 20' > "$CLAUDE/self-update.health-cmd"
+probe_started=$SECONDS
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "up-to-date precheck and recovery health both have deadlines" '[ "$rc" = 7 ] && [ "$((SECONDS - probe_started))" -lt 12 ]'
+ok "unhealthy current runtime is audited honestly" 'grep '^{' "$STATE/self-update.log" | tail -1 | grep -q "runtime-down"'
+ok "TERM-resistant probe descendants were stopped" '[ ! -e "$TMP/late-health" ]'
+
+# An unavailable/unsupported timeout implementation must never lead to an
+# unbounded fallback. An executable stub also exercises old timeout versions
+# that reject --kill-after, without changing the host PATH dependencies.
+printf '#!/bin/sh\nexit 125\n' > "$FAKEBIN/timeout"
+chmod +x "$FAKEBIN/timeout"
+printf 'touch %s\n' "$TMP/unbounded-fallback" > "$CLAUDE/self-update.restart-cmd"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "unusable timeout fails closed before operator command" '[ "$rc" = 7 ] && [ ! -e "$TMP/unbounded-fallback" ]'
+rm -f "$FAKEBIN/timeout"
+rm -f "$CLAUDE/self-update.restart-cmd" "$CLAUDE/self-update.health-cmd"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "force without any restart target is degraded" '[ "$rc" = 11 ]'
+rm -rf "$STATE"/self-update-install-rollback.*
+
 # cleanup: restore the allowlist and drop the external-cmd fixtures.
+
 rm -f "$CLAUDE/self-update.restart-cmd" "$CLAUDE/self-update.health-cmd"
 printf '%s\n' 'hermes-broker' 'a2a-worker' > "$CLAUDE/self-update.services"
 
