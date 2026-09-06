@@ -50,9 +50,15 @@ def test_timeout_kills_term_resistant_descendant(tmp_path):
     # cannot run later side effects and count as terminated here.
     stat = Path(f"/proc/{pid}/stat")
     deadline = time.monotonic() + 2
-    while stat.exists() and stat.read_text().split()[2] != "Z" and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        try:
+            state = stat.read_text().split()[2]
+        except (FileNotFoundError, ProcessLookupError):
+            return  # Reaped before or during the procfs read.
+        if state == "Z":
+            return
         time.sleep(0.02)
-    assert not stat.exists() or stat.read_text().split()[2] == "Z"
+    pytest.fail("descendant remained runnable after the probe timeout")
 
 
 def test_exhausted_budget_does_not_spawn(monkeypatch):
