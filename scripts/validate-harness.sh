@@ -733,9 +733,11 @@ else
 fi
 mapfile -t DEPLOYED < <(ccc_hook_tree_files "$ROOT")
 [ "${#DEPLOYED[@]}" -gt 0 ] || err "hook-tree walk found no deployable hooks under claude/hooks"
+# Consume the full inventory: grep -q may close early, making printf exit
+# with SIGPIPE and pipefail falsely report an existing hook as missing (#1548).
 for r in "${REFS[@]}"; do
   hook="${r#/root/.claude/hooks/}"  # relative form matches the walk's output (#1476)
-  if printf '%s\n' "${DEPLOYED[@]}" | grep -Fxq -- "$hook"; then
+  if printf '%s\n' "${DEPLOYED[@]}" | grep -Fx -- "$hook" >/dev/null; then
     say "  ok setup.sh installs $hook"
   else
     err "setup.sh does not install referenced hook: $hook (excluded from the hook-tree walk)"
@@ -748,7 +750,7 @@ done
 # an install that is missing the file.
 tree_parity_ok=1
 while IFS= read -r f; do
-  printf '%s\n' "${DEPLOYED[@]}" | grep -Fxq -- "$f" && continue
+  printf '%s\n' "${DEPLOYED[@]}" | grep -Fx -- "$f" >/dev/null && continue
   case "$f" in
     *.test.sh|lib/test-stub.sh|__pycache__/*|*/__pycache__/*|*.pyc|*.md|hooks.json|enforcement-overlay.json)
       : ;;  # documented exclusion

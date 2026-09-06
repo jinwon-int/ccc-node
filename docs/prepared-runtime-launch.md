@@ -60,6 +60,24 @@ previous generations. Their phase is `validated_before_launch`; **they do not
 claim that the process became available**. Use `--status` and the existing
 restart availability result to verify the serving process separately.
 
+The running bridge also writes `runtime_generation` into its existing
+`health.json` during process initialization. This startup snapshot contains
+`source_dir`, `source_git`, `source_seal`, the actual `python_executable` and
+`python_prefix`, and the venv's last bootstrap `dependency_fingerprint`.
+Compare those values with the prelaunch record, together with the health
+snapshot's process PID, freshness and service state, to identify the generation
+that became available. An old, stale or different-PID health file is not
+confirmation of the candidate. Legacy health files may omit this field.
+
+The snapshot is captured once for each reporter and retained across heartbeat
+updates and stopped/degraded states. It describes files observed at startup;
+it is neither a hash of loaded code nor a claim that later imports or installed
+packages stayed unchanged. Missing Git metadata is reported as null; missing,
+unreadable or malformed seal/fingerprint inputs produce categorical
+`collection_errors` without blocking health reporting. The dependency value
+is a bootstrap marker, not a fresh package integrity check. No credentials,
+`.env` contents, provider calls or installation are involved.
+
 If start or readiness fails after stop, inspect the existing restart exit
 reason and log. A candidate process may remain alive after the availability
 timeout. An operator can explicitly run the retained previous command with

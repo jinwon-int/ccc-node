@@ -71,7 +71,9 @@ def git_identity(bridge_dir: Path, timeout: float = 4.0) -> dict[str, object]:
         # changes; GIT_OPTIONAL_LOCKS=0 prevents writing that refresh to index.
         # Names/bodies from porcelain output are never included in receipts.
         return {"head": head, "tracked_changes": bool(result.stdout) if result.returncode == 0 else None}
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        # Git may emit undecodable path bytes when core.quotePath=false.
+        # Optional provenance must not abort observer or bridge startup.
         return {"head": None, "tracked_changes": None}
 
 
