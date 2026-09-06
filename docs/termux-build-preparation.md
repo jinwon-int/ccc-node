@@ -14,6 +14,19 @@ bootstrap and readiness checks. It never promotes the runtime or starts a
 service. Use a separate, trusted source checkout: the runtime's editable
 first-party package remains linked to that checkout, so keep it in place.
 
+## Validation status — experimental
+
+The 2026-09-06 clean pip/build-cache run used maturin 1.14.1 and API 24.
+Cryptography, jiter, rpds-py and pyromark built successfully, but the same
+LLVM pointer-tag crash occurred while linking pydantic-core's build script.
+The driver failed after 740 seconds and did not create a runtime or attempt
+reinstallation. Retained job artifacts occupied about 722 MiB, excluding the
+shared Cargo registry. Preparing the backend therefore removes one recursive
+build, but **does not yet provide a validated reliable clean-cache install**.
+Issue #1539 remains open for the compiler/linker failure. Do not promote this
+experimental workflow on the basis of its unit tests or earlier prepared-cache
+successes.
+
 ## Prerequisites and invocation
 
 Run with Termux's base Python, with consistent Android build metadata. The

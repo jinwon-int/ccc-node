@@ -4,9 +4,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
-- Add opt-in Termux build preparation using the existing distro maturin, pinned
+- Add experimental opt-in Termux build preparation using the existing distro maturin, pinned
   build tools, all five native runtime packages and a private pip/build cache
-  (#1539). New runtimes pass hash-locked bootstrap, readiness and optional real
+  (#1539). New runtimes must pass hash-locked bootstrap, readiness and optional real
   forced reinstall; phase deadlines, provenance and failure artifacts are kept.
 
 

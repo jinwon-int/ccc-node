@@ -140,7 +140,8 @@ class Runner:
                 except (subprocess.TimeoutExpired, KeyboardInterrupt, Cancelled) as exc:
                     stage["status"] = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "cancelled"
             finally:
-                if child is not None and child.poll() is None:
+                if child is not None and stage["status"] != "pass":
+                    # An exited leader can still have live same-group workers.
                     try:
                         os.killpg(child.pid, signal.SIGKILL)
                     except ProcessLookupError:

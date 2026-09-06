@@ -241,3 +241,49 @@ raise SystemExit(m.main(["--work-dir", {str(work)!r}]))
     assert json.loads((work / "receipt.json").read_text()) == report
     with pytest.raises(ProcessLookupError):
         os.kill(int(marker.read_text()), 0)  # The direct probe was reaped.
+
+
+def test_cancellation_kills_workers_after_group_leader_exits(tmp_path):
+    import signal
+    import subprocess
+
+    marker = tmp_path / "pids"
+    source = Path(prep.__file__).resolve().parent
+    probe = ("import os,subprocess,sys,time; from pathlib import Path; "
+             "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+             f"Path({str(marker)!r}).write_text(str(os.getpid())+' '+str(p.pid)); time.sleep(0.7)")
+    code = (f"import sys,signal; sys.path.insert(0,{str(source)!r}); import termux_prepare as m; "
+            f"r=m.Runner(m.Path({str(tmp_path)!r}),dict(m.os.environ),10); "
+            f"r.run('fixture',[sys.executable,'-c',{probe!r}])")
+    with subprocess.Popen([sys.executable, "-c", code], start_new_session=True,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as driver:
+        leader = worker = None
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert marker.exists()
+            leader, worker = map(int, marker.read_text().split())
+            os.kill(driver.pid, signal.SIGSTOP)
+            time.sleep(0.9)  # The leader exits while the driver cannot reap it.
+            os.kill(driver.pid, signal.SIGINT)
+            os.kill(driver.pid, signal.SIGCONT)
+            assert driver.wait(timeout=5) != 0
+            proc = Path(f"/proc/{worker}/stat")
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    if proc.read_text().split()[2] == "Z":
+                        return
+                except (FileNotFoundError, ProcessLookupError):
+                    return
+                time.sleep(0.01)
+            pytest.fail("worker survived cancellation after leader exit")
+        finally:
+            for group in (driver.pid, leader):
+                if group is not None:
+                    try:
+                        os.killpg(group, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            driver.wait()
