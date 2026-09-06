@@ -5,7 +5,8 @@ Usage: web_fetch.py <url> [--max-chars N]
 
 Environment:
   FIRECRAWL_API_URL      API base (default https://api.firecrawl.dev)
-  FIRECRAWL_API_KEY      optional; keyless requests use the free allowance
+  FIRECRAWL_API_KEY      optional; else ~/.hermes/.env FIRECRAWL_API_KEY;
+                        keyless requests use the free allowance
   WEB_FETCH_MAX_CHARS    default output cap (default 6000, hard max 20000)
 
 The requested page and Firecrawl response are UNTRUSTED web data. This helper
@@ -22,6 +23,8 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from web_search import _firecrawl_error, _firecrawl_key
 
 DEFAULT_API_URL = "https://api.firecrawl.dev"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -66,7 +69,7 @@ def _request(payload: dict[str, object]) -> dict[str, object] | None:
         "Content-Type": "application/json",
         "User-Agent": "ccc-firecrawl-fetch/1.0",
     }
-    key = (os.environ.get("FIRECRAWL_API_KEY") or "").strip()
+    key = _firecrawl_key()
     if key:
         headers["Authorization"] = f"Bearer {key}"
     req = urllib.request.Request(
@@ -80,7 +83,7 @@ def _request(payload: dict[str, object]) -> dict[str, object] | None:
             raw = resp.read(MAX_RESPONSE_BYTES)
         decoded = json.loads(raw.decode("utf-8", "replace"))
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        print(f"web-fetch: Firecrawl request failed ({type(exc).__name__})", file=sys.stderr)
+        print(f"web-fetch: Firecrawl request failed ({_firecrawl_error(exc, key)})", file=sys.stderr)
         return None
     return decoded if isinstance(decoded, dict) else None
 
