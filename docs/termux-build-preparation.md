@@ -14,18 +14,27 @@ bootstrap and readiness checks. It never promotes the runtime or starts a
 service. Use a separate, trusted source checkout: the runtime's editable
 first-party package remains linked to that checkout, so keep it in place.
 
-## Validation status — experimental
+## Android linker mitigation and validation boundary
 
-The 2026-09-06 clean pip/build-cache run used maturin 1.14.1 and API 24.
-Cryptography, jiter, rpds-py and pyromark built successfully, but the same
-LLVM pointer-tag crash occurred while linking pydantic-core's build script.
-The driver failed after 740 seconds and did not create a runtime or attempt
-reinstallation. Retained job artifacts occupied about 722 MiB, excluding the
-shared Cargo registry. Preparing the backend therefore removes one recursive
-build, but **does not yet provide a validated reliable clean-cache install**.
-Issue #1539 remains open for the compiler/linker failure. Do not promote this
-experimental workflow on the basis of its unit tests or earlier prepared-cache
-successes.
+The initial 2026-09-06 clean pip/build-cache run used maturin 1.14.1 and API24.
+Four native wheels built, but pydantic-core's build-script link hit the same
+LLVM pointer-tag crash. The driver failed after740seconds without creating a
+runtime. Preparing maturin alone did not resolve the native linker failure.
+
+The driver now sets job-local `RUSTFLAGS=-C link-arg=-Wl,--threads=1` and
+`LDFLAGS=-Wl,--threads=1`. Cargo's `--jobs` setting does not constrain LLD's
+internal threads. This serial-link mitigation follows the similar Android
+AArch64 failure reported in [LLVM#62165](https://github.com/llvm/llvm-project/issues/62165)
+and [Termux#15867](https://github.com/termux/termux-packages/issues/15867).
+The isolated pydantic-core rebuild passed in405seconds with the same wheel
+hash as the earlier successful artifact. That single-package result does not
+prove the underlying LLVM21.1.8 defect has been repaired or establish a fleet
+reliability guarantee. Full preparation/lifecycle evidence is tracked in
+[PR#1543](https://github.com/jinwon-int/ccc-node/pull/1543).
+
+The flags apply only to this job's compiler children, overriding ambient Rust
+and linker flags. The receipt records `linker_threads: 1` and the LLD binary's
+version/hash. The system compiler and serving environment are unchanged.
 
 ## Prerequisites and invocation
 
@@ -78,7 +87,8 @@ existing environment. The tool has no resume, cleanup or serving-venv mode.
 The builder uses `--system-site-packages` to access the distro backend; the
 runtime does not. This is reproducible preparation with recorded toolchain
 provenance, not a hermetic compiler distribution. Pip configuration and
-Python/Rust/Cargo environment overrides are removed from child processes.
+Python/Rust/Cargo environment overrides are removed from child processes;
+Rust and linker flags are replaced with the fixed serial-link profile.
 Operator network/proxy settings and the default Cargo configuration/registry
 remain applicable.
 

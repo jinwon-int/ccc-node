@@ -27,6 +27,9 @@ NATIVE = ("cryptography", "jiter", "pydantic-core", "rpds-py", "pyromark")
 BUILD_TOOLS = ("setuptools", "packaging", "cffi", "pycparser")
 MATURIN_VERSION = "1.14.1"
 MIN_FREE_BYTES = 2 * 1024**3
+# Cargo jobs do not constrain LLD's internal relocation-scanning threads.
+# Keep the Android workaround job-local; never change the system compiler.
+SERIAL_LINK_ARG = "-Wl,--threads=1"
 
 
 class PreparationError(Exception):
@@ -97,6 +100,7 @@ def build_environment(work: Path, api: int, jobs: int) -> dict[str, str]:
            if not key.startswith(("PIP_", "PYTHON", "CARGO_", "RUST", "CCC_DEPS_"))
            and key not in ("ANDROID_API_LEVEL", "VIRTUAL_ENV")}
     env.update(ANDROID_API_LEVEL=str(api), CARGO_BUILD_JOBS=str(jobs),
+               RUSTFLAGS=f"-C link-arg={SERIAL_LINK_ARG}", LDFLAGS=SERIAL_LINK_ARG,
                CARGO_TARGET_DIR=str(work / "cargo-target"),
                PIP_CACHE_DIR=str(work / "pip-cache"), PIP_CONFIG_FILE=os.devnull,
                PIP_NO_INPUT="1", PIP_DISABLE_PIP_VERSION_CHECK="1",
@@ -164,7 +168,7 @@ def provenance(runner: Runner) -> dict:
             "'python':sys.version.split()[0]}))")
     log = runner.run("backend-provenance", [sys.executable, "-I", "-B", "-c", code])
     result = json.loads(log.read_text())
-    for name in ("maturin", "rustc", "clang", "patchelf"):
+    for name in ("maturin", "rustc", "clang", "ld.lld", "patchelf"):
         binary = Path(sys.base_prefix) / "bin" / name
         output = runner.run(f"tool-{name}", [str(binary), "--version"])
         version = output.read_text().splitlines()[0]
@@ -259,7 +263,7 @@ def main(argv=None) -> int:
         for name in ("tmp", "pip-cache", "cargo-target", "wheelhouse"):
             (work / name).mkdir(mode=0o700)
         runner = Runner(work, build_environment(work, api, args.jobs), args.timeout_seconds)
-        report.update(android_api=api, jobs=args.jobs, work_dir=str(work),
+        report.update(android_api=api, jobs=args.jobs, linker_threads=1, work_dir=str(work),
                       cache_scope="new_private_pip_and_cargo_target; shared_default_cargo_registry",
                       stages=runner.stages)
         prepare(runner, Path(__file__).resolve().parent, report, args.verify_reinstall)

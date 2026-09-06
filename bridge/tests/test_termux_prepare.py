@@ -81,12 +81,15 @@ def test_workspace_rejects_symlink_ancestors_and_public_parent(tmp_path):
 
 
 def test_child_environment_removes_install_and_build_overrides(tmp_path, monkeypatch):
-    for key in ("PIP_NO_DEPS", "PIP_NO_VERIFY", "PIP_INDEX_URL", "PYTHONPATH", "RUSTFLAGS", "CARGO_TARGET_DIR", "CCC_DEPS_SMOKE_STRICT"):
+    for key in ("LDFLAGS", "CARGO_ENCODED_RUSTFLAGS", "PIP_NO_DEPS", "PIP_NO_VERIFY", "PIP_INDEX_URL", "PYTHONPATH", "RUSTFLAGS", "CARGO_TARGET_DIR", "CCC_DEPS_SMOKE_STRICT"):
         monkeypatch.setenv(key, "PRIVATE")
     env = prep.build_environment(tmp_path, 24, 1)
     assert "PRIVATE" not in json.dumps(env)
     assert env["ANDROID_API_LEVEL"] == "24"
     assert env["CARGO_BUILD_JOBS"] == "1"
+    assert env["RUSTFLAGS"] == "-C link-arg=-Wl,--threads=1"
+    assert env["LDFLAGS"] == "-Wl,--threads=1"
+    assert "CARGO_ENCODED_RUSTFLAGS" not in env
     assert env["PIP_CONFIG_FILE"] == os.devnull
     assert env["PIP_CACHE_DIR"] == str(tmp_path / "pip-cache")
 
