@@ -4,6 +4,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Add opt-in Termux build preparation using the existing distro maturin, pinned
+  build tools, all five native runtime packages and a private pip/build cache
+  (#1539). New runtimes pass hash-locked bootstrap, readiness and optional real
+  forced reinstall; phase deadlines, provenance and failure artifacts are kept.
+
+
 ### Changed
 - **Termux Python build API (#1532).** Dependency builds use the interpreter's
   API contract instead of the device OS SDK. Conflicting overrides fail before
