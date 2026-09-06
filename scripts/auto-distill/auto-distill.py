@@ -538,20 +538,37 @@ def extract(digest, model_cmd, timeout):
 
 
 def unwrap_claude_envelope(out):
-    """Claude Code `--output-format json` 봉투에서 (사용량, 실제 응답) 을 꺼낸다.
+    """Claude Code `--output-format json` 봉투에서 (사용량, 실제 응답, 전송실패) 를 꺼낸다.
 
     piri 는 사용량을 `PIRI_USAGE=` 줄로 내보내지만 claude 는 내보내지 않는다.
     그래서 claude 기반 노드에서는 비용이 0으로 보고됐다 (2026-08-22 실측).
     키 이름은 piri 쪽에 맞춰 정규화해 회계를 한 곳으로 모은다.
 
-    봉투가 아니면 (None, None) 을 돌려 호출부가 기존 경로를 쓰게 한다.
+    봉투가 아니면 (None, None, None) 을 돌려 호출부가 기존 경로를 쓰게 한다.
+
+    **전송 실패** (#1561): CLI 는 계정 한도·API 오류를 **종료코드 0** 으로 돌려주면서
+    `is_error: true` 를 세우고, 사람이 읽는 문장("You've hit your session limit …")을
+    `result` 에 담는다. 이 문장을 모델 응답으로 넘기면 하위에서 `no_json` 으로 보이는데,
+    그것은 "모델이 깨진 JSON 을 뱉었다"는 뜻이라 **모델에 도달조차 못한 경우와 구분이
+    불가능** 해진다. 2026-09-06 곽가 #1547 r2 실측: 봉투 47건 중 28건이 이 상태였고,
+    실행 지표는 그럴듯하게 나왔다(재현율 26% — 유효 19건만 보면 67%).
+
+    `modelUsage` 가 비고 비용이 0 인 봉투도 같은 부류다. 실제 모델 호출이 있었다면
+    캐시 생성분 때문에라도 비용이 0 이 아니다(위 `costUsd` 주석 참조).
+
+    전송 실패는 사유만 body-free 로 돌려주고, 사용량은 싣지 않는다 — 모델에 도달하지
+    못한 호출을 성공 호출로 계상하면 회계가 실행이 건강하다고 보고한다.
     """
     try:
         env = json.loads(out)
     except Exception:
-        return None, None
+        return None, None, None
     if not isinstance(env, dict) or "result" not in env or env.get("type") != "result":
-        return None, None
+        return None, None, None
+    if env.get("is_error"):
+        return None, None, "error_envelope"
+    if not (env.get("modelUsage") or {}) and not (env.get("total_cost_usd") or 0):
+        return None, None, "no_model_usage"
     u = env.get("usage") or {}
     inp = u.get("input_tokens", 0) or 0
     outp = u.get("output_tokens", 0) or 0
@@ -566,7 +583,7 @@ def unwrap_claude_envelope(out):
         "costUsd": env.get("total_cost_usd", 0) or 0,
         "models": sorted((env.get("modelUsage") or {}).keys()),
     }
-    return usage, str(env.get("result") or "")
+    return usage, str(env.get("result") or ""), None
 
 
 # 리졸브된 엔진 전용 환경(#1295): main 에서 resolve_model_command() 결과로
@@ -612,7 +629,11 @@ def extract_json(prompt, model_cmd, timeout):
     ).strip()
     # Claude Code `--output-format json` 봉투. piri 의 PIRI_USAGE 와 달리 사용량이
     # stdout JSON 안에 들어오므로 여기서 벗겨내지 않으면 비용이 0으로 보고된다.
-    env_usage, inner = unwrap_claude_envelope(out)
+    env_usage, inner, transport_failure = unwrap_claude_envelope(out)
+    if transport_failure:
+        # 모델에 도달하지 못했다. 모델 품질 문제(no_json/bad_json)와 섞이지 않게
+        # 전용 사유로 분리하고, 사용량은 싣지 않는다 (#1561).
+        return None, ("model_unavailable:%s" % transport_failure, {}, out[:4000])
     if inner is not None:
         usage, out = env_usage, inner
     s, e = out.find("{"), out.rfind("}")

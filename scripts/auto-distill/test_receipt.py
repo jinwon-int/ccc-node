@@ -18,6 +18,14 @@ SCHEMA = ROOT / "schemas/auto-distill-evaluation-receipt-v1.schema.json"
 # Fixture only: a plausible provider id shape used to mutate copies of the
 # canonical receipt. The canonical receipt itself records its own resolution
 # since the #1521 re-issue; `canonical_receipt()` reads the live values.
+#
+# The fixture pins a BARE ALIAS on purpose: the family check
+# ("alias=haiku must not resolve to a sonnet id") only engages when the alias is
+# a bare alias, so a fixture that inherited a fully-qualified id from the
+# canonical receipt would silently skip it. `with_model_resolution` therefore
+# rewrites `evaluation.model` to match the fixture alias instead of assuming the
+# canonical receipt still records one — a receipt is free to hand the launcher a
+# fully-qualified id (TM-3322 does), and that must not disarm these assertions.
 RESOLVED_ID = "claude-haiku-4-5-20251001"
 MODEL_RESOLUTION = {
     "alias": "haiku",
@@ -59,9 +67,19 @@ class AutoDistillReceiptTest(unittest.TestCase):
             check=False,
         )
 
-    def with_model_resolution(self, **overrides):
+    def with_model_resolution(self, *, sync_model: bool = True, **overrides):
+        """Attach the fixture resolution to a copy of the canonical receipt.
+
+        `sync_model` keeps `evaluation.model` equal to the fixture alias so the
+        copy is internally consistent whatever the canonical receipt records.
+        Pass `sync_model=False` to build the deliberate alias/model mismatch.
+        """
+
         def mutate(data) -> None:
-            data["evaluation"]["model_resolution"] = {**MODEL_RESOLUTION, **overrides}
+            resolution = {**MODEL_RESOLUTION, **overrides}
+            data["evaluation"]["model_resolution"] = resolution
+            if sync_model:
+                data["evaluation"]["model"] = resolution["alias"]
 
         return self.mutated_receipt(mutate)
 
@@ -144,7 +162,9 @@ class AutoDistillReceiptTest(unittest.TestCase):
         self.assertIn("does not belong to the alias family", result.stderr)
 
     def test_resolution_alias_must_match_evaluation_model(self) -> None:
-        temporary, receipt = self.with_model_resolution(alias="sonnet")
+        temporary, receipt = self.with_model_resolution(
+            alias="sonnet", sync_model=False
+        )
         with temporary:
             result = self.run_verifier(receipt=receipt)
         self.assertEqual(result.returncode, 3)
