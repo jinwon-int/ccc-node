@@ -158,6 +158,7 @@ ok "legacy create and incremental apply share one daily cap" \
 
 stage_patch mixed-draft routed-skill "2. Verify." "2. Verify safely." "$(printf 'e%.0s' {1..64})"
 touch "$PENDING/mixed-draft/SKILL.md"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "mixed legacy and v2 payload fails closed" \
   'jq -e ".blocked[0].reason == \"proposal mixed-payload\"" >/dev/null <<<"$out" && [ -d "$PENDING/mixed-draft" ]'

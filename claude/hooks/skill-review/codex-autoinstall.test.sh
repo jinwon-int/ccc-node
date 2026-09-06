@@ -199,6 +199,7 @@ ok "codex allows prose that only mentions Claude Code" '[ -f "$CODEX_SKILLS/code
 mkdir -p "$CODEX_SKILLS/user-made"
 printf -- '---\nname: user-made\ndescription: Operator-authored Codex skill that autosave must never overwrite ever.\n---\n\n# Hand\n' \
   > "$CODEX_SKILLS/user-made/SKILL.md"
+# shellcheck disable=SC2034  # before_sha is read via eval inside ok()
 before_sha="$(sha256sum "$CODEX_SKILLS/user-made/SKILL.md" | awk '{print $1}')"
 make_draft 20260101-000007-h-dup user-made "A different take on the same-named Codex skill with entirely different wording."
 run_codex env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
@@ -266,9 +267,12 @@ ok "codex symlinked skills dir installs nothing" '[ -z "$(ls -A "$SL_REAL" 2>/de
 out="$(run_codex bash "$AUTO" rollback codex-clean-one)"
 ok "codex rollback removes the skill" '[ ! -e "$CODEX_SKILLS/codex-clean-one" ]'
 ok "codex rollback archives, not deletes" 'ls -d "$STATE/skill-autosave-rollback/codex-clean-one."* >/dev/null 2>&1'
-run_codex bash "$AUTO" rollback user-made >/dev/null 2>&1; rc=$?
+run_codex bash "$AUTO" rollback user-made >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "codex rollback refuses user-authored skill" '[ "$rc" != 0 ] && [ -f "$CODEX_SKILLS/user-made/SKILL.md" ]'
 
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(run_codex bash "$AUTO" status)"
 ok "codex status reports provider" 'grep -q "^provider: codex" <<<"$out"'
 ok "codex status reports codex skills dir" 'grep -q "$CODEX_SKILLS" <<<"$out"'

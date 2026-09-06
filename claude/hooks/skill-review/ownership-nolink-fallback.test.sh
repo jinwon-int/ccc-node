@@ -93,6 +93,7 @@ ok "ledger records the create transaction" 'jq -s -e "[.[] | select(.event == \"
 make_skill nolink-two
 printf '{"schema_version":2}\n' > "$SKILLS/nolink-two/.autosave-meta.json"
 chmod 600 "$SKILLS/nolink-two/.autosave-meta.json"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(tool_nolink mark-created nolink-two)"
 ok "pre-existing marker still fails closed" 'jq -e ".ok == false" >/dev/null <<<"$out"'
 

@@ -55,6 +55,7 @@ ok "installed line loads login PATH via bash -lc" 'grep -qF "bash -lc" "$FAKE_CR
 # pinned at end of the entry line; inputs owned by ccc_installer_gen_inputs
 # shellcheck source=/dev/null
 . "$ROOT/scripts/lib/installer-gen-stamp.sh"
+# shellcheck disable=SC2034  # want_gen is read via eval inside ok()
 want_gen="$(ccc_installer_gen_stamp_auto "$INSTALLER")"
 ok "installed line carries gen stamp" 'grep -qE "# ccc-node:memory-refresh gen=h_[0-9a-f]{12}$" "$FAKE_CRON"'
 ok "gen stamp matches installer content" 'grep -qF "gen=$want_gen" "$FAKE_CRON"'
@@ -73,6 +74,7 @@ ok "custom schedule applied" 'grep -qF "17 * * * *" "$FAKE_CRON"'
 ok "old schedule removed" '! grep -qF "*/30 * * * *" "$FAKE_CRON"'
 
 # install record (#1081 phase 2): replay material for self-update
+# shellcheck disable=SC2034  # REC is read via eval inside ok()
 REC="$CCC_CLAUDE_DIR/state/install-memory-refresh-cron.json"
 ok "apply writes an install record" '[ -f "$REC" ]'
 ok "record carries schema/marker/gen" 'jq -e ".schema==\"ccc.install-record.v1\" and .marker==\"# ccc-node:memory-refresh\" and .gen==\"$want_gen\"" "$REC" >/dev/null'
@@ -101,7 +103,10 @@ ok "migration preserves unrelated lines" 'grep -qF "echo keepme2" "$FAKE_CRON"'
 
 # corrupt managed block fails closed (#1077: guard now covers this lane too)
 printf '%s\n' '# ccc-node:memory-refresh:begin' '*/30 * * * * dangling  # ccc-node:memory-refresh gen=h_000000000000' > "$FAKE_CRON"
-out="$(bash "$INSTALLER" --apply 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(bash "$INSTALLER" --apply 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "corrupt managed block exits 4" '[ "$rc" = 4 ]'
 ok "corrupt managed block is reported" 'printf "%s" "$out" | grep -q "corrupt managed schedule block"'
 

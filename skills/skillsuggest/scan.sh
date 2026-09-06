@@ -23,7 +23,7 @@ existing="$(ls -1 "$SKILLS_DIR" 2>/dev/null | tr '\n' ' ')"
 # (echo/grep/ls/cat/sed/heredoc bodies/cd targets...) is narration noise and is dropped.
 # Multi-line commands are collapsed to one line in jq so heredoc bodies aren't counted.
 shapes="$(
-  find "$PROJ" -name '*.jsonl' 2>/dev/null -print0 \
+  find "$PROJ" -name '*.jsonl' -print0 2>/dev/null \
     | xargs -0 -r cat 2>/dev/null \
     | jq -Rrc 'fromjson? | (.message.content[]? // empty)
                | select(.type=="tool_use" and .name=="Bash")

@@ -76,6 +76,7 @@ ok "empty input exits 0" '[ "$rc" = 0 ]'
 out="$(printf 'not json at all {{{' | bash "$LOCAL_FACTS" 2>&1)"; rc=$?
 ok "garbage input exits 0 with no crash" '[ "$rc" = 0 ]'
 NOHONCHO='{"session_id":"x","trigger":"manual","honcho":[]}'
+# shellcheck disable=SC2034  # before is read via eval inside ok()
 before="$(wc -l < "$FACTS")"
 out="$(printf '%s' "$NOHONCHO" | bash "$LOCAL_FACTS" 2>&1)"; rc=$?
 ok "empty honcho list writes nothing" '[ "$rc" = 0 ] && [ "$(wc -l < "$FACTS")" = "$before" ]'
@@ -115,6 +116,7 @@ if python3 -c "import sqlite3" 2>/dev/null; then
   CCC_STATE_DIR="$e2e" CCC_MEMORY_FACTS_FILE="$e2efacts" bash "$LOCAL_FACTS" <<<"$E2E_PAYLOAD" >/dev/null 2>&1
   CCC_STATE_DIR="$e2e" CCC_MEMORY_CACHE_DIR="$e2e/cache" CCC_MEMORY_DIR="$e2e/memories" \
     CCC_MEMORY_FACTS_FILE="$e2efacts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+  # shellcheck disable=SC2034  # out is read via eval inside ok()
   out="$(CCC_STATE_DIR="$e2e" CCC_MEMORY_INDEX_DB="$e2e/memory-index.sqlite" \
     bash "$ROOT/scripts/ccc-memory-search.sh" "current editor Helix" 2>&1)"; rc=$?
   ok "index+search recalls the distilled fact" '[ "$rc" = 0 ] && grep -qi "Helix" <<<"$out"'
@@ -127,19 +129,24 @@ combo="$TMP/combo"; mkdir -m 700 "$combo"
 printf '{"id":"old","text":"old retained fact"}\n' > "$combo/memory-facts.jsonl"
 printf '%s\n' '- 마지막 작업: old resume' > "$combo/resume.md"
 chmod 600 "$combo/memory-facts.jsonl" "$combo/resume.md"
+# shellcheck disable=SC2034  # combo_facts_before is read via eval inside ok()
 combo_facts_before="$(cat "$combo/memory-facts.jsonl")"
+# shellcheck disable=SC2034  # combo_resume_before is read via eval inside ok()
 combo_resume_before="$(cat "$combo/resume.md")"
 COMBO_PAYLOAD='{"session_id":"raw-session-must-not-enter-ledger","trigger":"sessionend","honcho":[
   {"kind":"fact","text":"new transactional fact","subject":"ccc"}
 ],"resume":{"last_activity":"new transactional resume","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
-out="$(CCC_STATE_DIR="$combo" python3 "$HERE/local-memory-commit.py" --mode both <<<"$COMBO_PAYLOAD" 2>&1)"; rc=$?
+CCC_STATE_DIR="$combo" python3 "$HERE/local-memory-commit.py" --mode both <<<"$COMBO_PAYLOAD" >/dev/null 2>&1
+rc=$?
 combo_action="$(tr -d '\n' < "$combo/memory-rollback/HEAD" 2>/dev/null)"
 ok "combined Claude local write commits facts and resume under one action" \
   '[ "$rc" = 0 ] && grep -q "new transactional fact" "$combo/memory-facts.jsonl" && grep -q "new transactional resume" "$combo/resume.md" && [ "${#combo_action}" = 32 ] && [ "$(jq -r "select(.event==\"commit\") | .action_id" "$combo/memory-rollback/ledger.jsonl" | wc -l)" = 1 ]'
 ok "Claude rollback metadata is owner-only and body-free" \
   '[ "$(stat -c %a "$combo/memory-rollback")" = 700 ] && [ "$(stat -c %a "$combo/memory-rollback/ledger.jsonl")" = 600 ] && ! grep -R "new transactional fact\\|new transactional resume\\|raw-session-must-not-enter-ledger" "$combo/memory-rollback/ledger.jsonl" "$combo/memory-rollback/actions/"*/manifest.json'
-out="$(python3 "$ROOT/bridge/memory/local_memory_transaction.py" rollback \
-  --state-dir "$combo" --action-id "$combo_action" 2>&1)"; rc=$?
+python3 "$ROOT/bridge/memory/local_memory_transaction.py" rollback \
+  --state-dir "$combo" --action-id "$combo_action" >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "Claude latest-head rollback restores both exact pre-images" \
   '[ "$rc" = 0 ] && [ "$(cat "$combo/memory-facts.jsonl")" = "$combo_facts_before" ] && [ "$(cat "$combo/resume.md")" = "$combo_resume_before" ]'
 
