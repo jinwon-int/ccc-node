@@ -255,9 +255,11 @@ ok "slow successful restart uses its own budget" '[ "$rc" = 0 ] && [ "$(sed -n "
 # this owned process group; a successful health probe cannot hide the failure.
 printf 'trap "" TERM; sleep 20 & child=$!; echo "$child" > "%s"; wait "$child"\n' "$TMP/restart-child.pid" > "$CLAUDE/self-update.restart-cmd"
 : > "$CCC_TEST_TIMEOUT_CALLS"
+snapshots_before="$(find "$STATE" -maxdepth 1 -type d -name 'self-update-install-rollback.*' | wc -l)"
 out="$(CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS=1 run_selfup run --force 2>&1)"; rc=$?
+snapshots_after="$(find "$STATE" -maxdepth 1 -type d -name 'self-update-install-rollback.*' | wc -l)"
 ok "TERM-resistant restart times out using configured budget" '[ "$rc" = 7 ] && [ "$(cat "$CCC_TEST_TIMEOUT_CALLS")" = 1 ]'
-ok "restart timeout retains artifacts and releases lock" '[ ! -d "$STATE/self-update.lock" ] && compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "restart timeout retains its new snapshot and releases lock" '[ ! -d "$STATE/self-update.lock" ] && [ "$snapshots_after" -eq "$((snapshots_before + 1))" ]'
 ok "restart timeout does not get masked by healthy probe" 'grep "^{" "$STATE/self-update.log" | tail -1 | grep -q "restart-failures"'
 child_state="$(ps -o stat= -p "$(cat "$TMP/restart-child.pid")" 2>/dev/null || true)"
 ok "TERM-resistant restart child is no longer executing" '[[ -z "$child_state" || "$child_state" = Z* ]]'
