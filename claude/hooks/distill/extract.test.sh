@@ -9,6 +9,7 @@ EXTRACT="$HERE/extract.sh"
 ccc_test_reset_hook_env
 pass=0; fail=0
 TMP="$(ccc_test_tmpdir)" || exit 1
+# shellcheck disable=SC2034  # fake_github_token is read via eval inside ok()
 fake_github_token="ghp_""12345678901234567890"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -148,7 +149,10 @@ run_extract() {
 TRANSCRIPT="$TMP/transcript.jsonl"
 make_transcript "$TRANSCRIPT"
 
-out=""; rc=99
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out=""
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=99
 run_extract "$TRANSCRIPT" valid
 ok "valid JSON exits 0" '[ "$rc" = 0 ]'
 ok "valid JSON is tagged with session metadata" 'jq -e ".session_id == \"sess-test\" and .trigger == \"manual\" and (.honcho|length)==1" <<<"$out" >/dev/null'

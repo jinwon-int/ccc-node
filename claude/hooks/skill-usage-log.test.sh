@@ -57,6 +57,7 @@ run_hook '{"tool_name":"Skill","tool_input":{"command":"skillsuggest"}}'
 ok "Skill command-style invocations resolve to the skill name" \
   'jq -e "select(.skill == \"skillsuggest\")" "$LEDGER" >/dev/null'
 
+# shellcheck disable=SC2034  # before is read via eval inside ok()
 before="$(wc -l < "$LEDGER")"
 rc=0
 printf 'not json at all\x00\x01' | bash "$HOOK" || rc=$?
@@ -71,17 +72,20 @@ ok "oversized stdin fails open with exit 0" \
 # Monthly report (#1347): counts per skill inside the window only.
 printf '{"ts":"2020-01-01T00:00:00Z","skill":"stale-one","tool":"Read"}\n' >> "$LEDGER"
 printf '{"ts":"%s","skill":"wiki-record","tool":"Read"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LEDGER"
+# shellcheck disable=SC2034  # report is read via eval inside ok()
 report="$(bash "$HOOK" report 30)"
 ok "report aggregates windowed counts newest-first" \
   'grep -qx "wiki-record 2" <<<"$report" && ! grep -q "stale-one" <<<"$report" && grep -qx "gh-pr-flow 1" <<<"$report"'
 
 old_home="$TMP/empty-home"
 mkdir -p "$old_home"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(HOME="$old_home" CCC_CLAUDE_DIR="$old_home/.claude" bash "$HOOK" report 30)"
 ok "report on a missing ledger is silent and fails open" \
   '[ "$out" = "" ]'
 
 rc=0
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
 CCC_CLAUDE_DIR="$TMP/never-created-$$" bash "$HOOK" '{"tool_name":"Read","tool_input":{"file_path":"/a/.claude/skills/x/SKILL.md"}}' </dev/null || rc=$?
 ok "unwritable state root still fails open" '[ "$rc" = 0 ]'
 

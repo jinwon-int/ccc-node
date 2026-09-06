@@ -93,7 +93,9 @@ ok "driver rejects missing required args with exit 2" '[ "$rc" = 2 ]'
 
 NOCRON=(--label demo --marker "$M" --begin "$B" --end "$E"
         --crontab "$TMP/no-such-crontab" --state-dir "$STATE" --self "$TMP/install-demo.sh" --gen h_dddddddddddd)
-(ccc_cron_installer_finish "${NOCRON[@]}" --apply 1 --remove 0 --schedule-desc x --body x) >/dev/null 2>&1; rc=$?
+(ccc_cron_installer_finish "${NOCRON[@]}" --apply 1 --remove 0 --schedule-desc x --body x) >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "driver exits 3 when the crontab command is absent" '[ "$rc" = 3 ]'
 
 # ---- ccc_cron_root_scope_warning (#1079 generalization) ---------------------
@@ -112,6 +114,7 @@ out="$(ccc_cron_root_scope_warning demo 1000 "$TMP/noroothome" "$TMP/home" 2>&1)
 ok "non-root never warns" '[ -z "$out" ]'
 
 mkdir -p "$TMP/emptyhome"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(ccc_cron_root_scope_warning demo 0 "$TMP/noroothome" "$TMP/emptyhome" 2>&1)"
 ok "root with no service-account harness anywhere stays silent" '[ -z "$out" ]'
 

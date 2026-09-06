@@ -83,12 +83,14 @@ ok "managed timezone block installed" \
 # Inputs are owned by ccc_installer_gen_inputs (#1077): installer + cron-common.
 # shellcheck source=/dev/null
 . "$HERE/lib/installer-gen-stamp.sh"
+# shellcheck disable=SC2034  # want_gen is read via eval inside ok()
 want_gen="$(ccc_installer_gen_stamp_auto "$SC")"
 ok "installed line carries gen stamp" 'grep -qE "# ccc-node:skill-autosave gen=h_[0-9a-f]{12}$" "$CRON_STORE"'
 ok "gen stamp matches installer content" 'grep -qF "gen=$want_gen" "$CRON_STORE"'
 ok "BEGIN/END block markers stay unstamped (exact-match parsed)" '! grep -qE "autosave-schedule:(begin|end) gen=" "$CRON_STORE"'
 
 # ---- install record (#1081 phase 2): replay material for self-update --------
+# shellcheck disable=SC2034  # REC is read via eval inside ok()
 REC="$CCC_STATE_DIR/install-skill-autosave-cron.json"
 ok "apply writes an install record" '[ -f "$REC" ]'
 ok "record carries schema/marker/gen" 'jq -e ".schema==\"ccc.install-record.v1\" and .marker==\"# ccc-node:skill-autosave\" and .gen==\"$want_gen\"" "$REC" >/dev/null'
@@ -168,6 +170,7 @@ ok "unresolved identity is reported" 'grep -q "no fleet identity resolved" "$OUT
 # equals the hostname (#1339): the crontab lines legitimately embed
 # /home/<user> paths that contain it.
 hn="$(hostname -s 2>/dev/null || echo __no_hostname__)"
+# shellcheck disable=SC2034  # guess is read via eval inside ok()
 guess="CCC_NODE=\"${hn}\""
 ok "unresolved identity never guesses the hostname" \
   '! grep -qF "$guess" "$CRON_STORE"'

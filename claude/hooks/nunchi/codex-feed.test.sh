@@ -42,6 +42,7 @@ with open(os.path.join(d, "rollout-2026-08-19-aa.jsonl"), "w") as fh:
     for line in lines:
         fh.write(json.dumps(line) + "\n")
 PY
+# shellcheck disable=SC2034  # rollout is read via eval inside ok()
 rollout="$SESSIONS/rollout-2026-08-19-aa.jsonl"
 
 # stale lane process from an "earlier tick": a fake codex carrying the lane tag
@@ -49,6 +50,7 @@ PATH="$TMP/bin:$PATH" CODEX_ARGV_FILE="$TMP/stale-argv" CODEX_PID_FILE="$TMP/sta
   setsid "$TMP/bin/codex" exec dummy-prompt "[nunchi-codex-feed-816]" >/dev/null 2>&1 &
 spawner=$!
 sleep 1
+# shellcheck disable=SC2034  # stale_pid is read via eval inside ok()
 stale_pid="$(tail -n 1 "$TMP/stale-pid" 2>/dev/null || true)"
 ok "stale lane fixture is alive before the feed runs" '[ -n "$stale_pid" ] && kill -0 "$stale_pid" 2>/dev/null'
 
@@ -58,6 +60,7 @@ CCC_STATE_DIR="$STATE" NUNCHI_HOME="$NUNCHI_HOME" CODEX_SESSIONS_DIR="$SESSIONS"
 NUNCHI_FEED_CODEX_TIMEOUT_SEC=2 NUNCHI_FEED_CODEX_KILL_GRACE_SEC=3 \
 CODEX_ARGV_FILE="$argv_file" CODEX_PID_FILE="$pid_file" \
   bash "$FEED" >/dev/null 2>&1
+# shellcheck disable=SC2034  # feed_rc is read via eval inside ok()
 feed_rc=$?
 
 ok "feed run completes despite a hanging codex" '[ "$feed_rc" = 0 ]'
@@ -85,11 +88,14 @@ write_exec_stub "$CL2/hooks/ccc-piri" <<'SH'
 printf '{"honcho":[]}\n'
 SH
 CCC_STATE_DIR="$STATE" NUNCHI_HOME="$PN2" PIR_SESSIONS_DIR="$PS2" CCC_CLAUDE_DIR="$CL2" \
-  PATH="$TMP/bin-nopiri:/usr/bin:/bin" bash "$PIRI_FEED" >"$TMP/pf2.out" 2>"$TMP/pf2.err"; pf_rc=$?
+  PATH="$TMP/bin-nopiri:/usr/bin:/bin" bash "$PIRI_FEED" >"$TMP/pf2.out" 2>"$TMP/pf2.err"
+# shellcheck disable=SC2034  # pf_rc is read via eval inside ok()
+pf_rc=$?
 ok "piri feed resolves the harness launcher when env and PATH are empty" '[ "$pf_rc" = 0 ] && ! grep -q "not runnable" "$TMP/pf2.err"'
 ok "resolved-launcher run writes a normal (unskipped) tick" 'jq -e ".schema == \"ccc.nunchi.ingest.v1\" and .feed == \"piri\" and (has(\"skipped\") | not)" "$PN2/ingest.status.json" >/dev/null'
 ok "piri feed carries the same tick writer" 'grep -q "ccc.nunchi.ingest.v1" "$ROOT/claude/hooks/nunchi/piri-feed.sh" && grep -q "\"feed\":\"%s\"" "$ROOT/claude/hooks/nunchi/piri-feed.sh"'
 ok "stale lane process is swept at feed start" '! kill -0 "$stale_pid" 2>/dev/null'
+# shellcheck disable=SC2034  # lane_pid is read via eval inside ok()
 lane_pid="$(tail -n 1 "$pid_file" 2>/dev/null || true)"
 ok "this run's codex exec is killed by the bounded timeout" '[ -n "$lane_pid" ] && ! kill -0 "$lane_pid" 2>/dev/null'
 ok "codex exec argv carries the lane tag" 'grep -q "nunchi-codex-feed-816" "$argv_file"'
