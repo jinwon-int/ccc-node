@@ -93,6 +93,7 @@ PROC="웹훅 재시도 절차는 지수 백오프를 따른다"
 
 # ---- 1. dry-run default: report only, queue never written -------------------
 reset_db
+# shellcheck disable=SC2034  # id1 is read via eval inside ok()
 id1="$(seed jingun procedure "$PROC" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
 out="$(run_wp 2>&1)"; rc=$?
 ok "dry-run is the default and exits 0" '[ "$rc" = 0 ]'
@@ -104,9 +105,13 @@ ok "dry-run audit marks the row a candidate without applied flag" \
 
 # ---- 2. roster gate: fleet nodes + approved services only -------------------
 reset_db
+# shellcheck disable=SC2034  # u1 is read via eval inside ok()
 u1="$(seed seo-jin-on procedure "유저 피어 관측은 교환 대상이 아니다" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
+# shellcheck disable=SC2034  # s1 is read via eval inside ok()
 s1="$(seed session:abc-123 procedure "세션 관측도 후보가 아니다" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
+# shellcheck disable=SC2034  # x1 is read via eval inside ok()
 x1="$(seed atlas procedure "비로스터 가상 노드" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
+# shellcheck disable=SC2034  # v1 is read via eval inside ok()
 v1="$(seed mempalace procedure "mempalace 스냅샷 재생성은 하루 1회" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
 run_wp >/dev/null 2>&1
 ok "user-peer observed is roster-rejected (unscoped privacy gate)" \
@@ -121,13 +126,21 @@ ok "service roster is overridable via env" \
 
 # ---- 3. kind gates (constraint excluded — owner decision point 2) -----------
 reset_db
+# shellcheck disable=SC2034  # k1 is read via eval inside ok()
 k1="$(seed jingun preference "선호: 간결한 보고" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
+# shellcheck disable=SC2034  # k2 is read via eval inside ok()
 k2="$(seed jingun constraint "제약: 노드 로컬 규칙" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
+# shellcheck disable=SC2034  # k3 is read via eval inside ok()
 k3="$(seed jingun observation "관찰: 시점 데이터" 2026-08-01T00:00:00+00:00 live-check "$REFS_OK" '')"
+# shellcheck disable=SC2034  # k4 is read via eval inside ok()
 k4="$(seed jingun context "맥락: 현재 진행 작업" 2026-08-01T00:00:00+00:00 live-check "$REFS_OK" '')"
+# shellcheck disable=SC2034  # k5 is read via eval inside ok()
 k5="$(seed jingun procedure "교환 가능한 절차 fact" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
+# shellcheck disable=SC2034  # k6 is read via eval inside ok()
 k6="$(seed jingun decision "A안을 채택했다" 2026-08-01T00:00:00+00:00 static "$REFS_OK" "벤치 결과가 근거")"
+# shellcheck disable=SC2034  # k7 is read via eval inside ok()
 k7="$(seed jingun decision "A안 단독 채택(사유 미기재)" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
+# shellcheck disable=SC2034  # k8 is read via eval inside ok()
 k8="$(seed jingun decision "본문에 근거: 벤치 차이" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
 run_wp >/dev/null 2>&1
 ok "preference/constraint/observation/context are kind-rejected" \
@@ -140,9 +153,13 @@ ok "decision with inline reason passes G5" 'grep -q "#$k8 | candidate" "$REPORT"
 
 # ---- 4. mutability gate: static only, stored must agree with derived --------
 reset_db
+# shellcheck disable=SC2034  # m1 is read via eval inside ok()
 m1="$(seed jingun fact "legacy fact kind" 2026-08-01T00:00:00+00:00 live-check "$REFS_OK" '')"
+# shellcheck disable=SC2034  # m2 is read via eval inside ok()
 m2="$(seed jingun decision "드리프트된 저장값" 2026-08-01T00:00:00+00:00 live-check "$REFS_OK" "근거 있음")"
+# shellcheck disable=SC2034  # m3 is read via eval inside ok()
 m3="$(seed jingun fact "저장 static 파생 live-check" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
+# shellcheck disable=SC2034  # m4 is read via eval inside ok()
 m4="$(seed jingun procedure "mutability 미기재 레거시" 2026-08-01T00:00:00+00:00 '' "$REFS_OK" '')"
 run_wp >/dev/null 2>&1
 ok "legacy fact kind dies at the mutability gate (retag is the migration path)" \
@@ -155,9 +172,13 @@ ok "missing mutability is rejected" 'grep -q "#$m4 | skip | mutability-not-stati
 
 # ---- 5. source_refs gate (P1-3 traceability) --------------------------------
 reset_db
+# shellcheck disable=SC2034  # r1 is read via eval inside ok()
 r1="$(seed jingun procedure "근거 없는 레거시 행" 2026-08-01T00:00:00+00:00 static '' '')"
+# shellcheck disable=SC2034  # r2 is read via eval inside ok()
 r2="$(seed jingun procedure "인용만 있는 행" 2026-08-01T00:00:00+00:00 static "$REFS_QUOTE" '')"
+# shellcheck disable=SC2034  # r3 is read via eval inside ok()
 r3="$(seed jingun procedure "파싱 불가 refs" 2026-08-01T00:00:00+00:00 static 'not-json' '')"
+# shellcheck disable=SC2034  # r4 is read via eval inside ok()
 r4="$(seed jingun procedure "세션+전사 refs 행" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
 run_wp >/dev/null 2>&1
 ok "missing source_refs is rejected (no review without backtrack)" \
@@ -170,7 +191,9 @@ ok "session+transcript refs make the row a candidate" \
 
 # ---- 5b. lifecycle gate: review flag / supersede link -----------------------
 reset_db
+# shellcheck disable=SC2034  # l1 is read via eval inside ok()
 l1="$(seed jingun procedure "검토 플래그가 열린 행" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '' 1 '')"
+# shellcheck disable=SC2034  # l2 is read via eval inside ok()
 l2="$(seed jingun procedure "supersede된 행" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '' 0 3)"
 run_wp >/dev/null 2>&1
 ok "review-flagged and superseded rows never surface as candidates" \
@@ -178,8 +201,11 @@ ok "review-flagged and superseded rows never surface as candidates" \
 
 # ---- 6. body screen: fail-closed exclusion, never a rewrite -----------------
 reset_db
+# shellcheck disable=SC2034  # b1 is read via eval inside ok()
 b1="$(seed jingun procedure "설정은 /root/.ssh/config에 있다" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
+# shellcheck disable=SC2034  # b2 is read via eval inside ok()
 b2="$(seed jingun procedure "배포 토큰은 ghp_Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9로 회전했다" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
+# shellcheck disable=SC2034  # b3 is read via eval inside ok()
 b3="$(seed jingun decision "A안 채택" 2026-08-01T00:00:00+00:00 static "$REFS_OK" "근거: sk-abcdefghijklmnopqrst키 형태의 자격증명 노출")"
 run_wp >/dev/null 2>&1
 ok "local path in fact body is screened out" \
@@ -195,12 +221,14 @@ ok "screened bodies never reach the audit" \
 reset_db
 LONG="mempalace 주간 스냅샷 재생성 절차는 토요일 새벽에 도는 것이 정본이다"
 cache_dir="$CCC_MEMORY_CACHE_DIR"; mkdir -p "$cache_dir"
+# shellcheck disable=SC2034  # d1 is read via eval inside ok()
 d1="$(seed mempalace procedure "$LONG" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
 printf '무관한 위키 내용입니다.\n%s\n' "$LONG" > "$cache_dir/wiki.txt"
 run_wp >/dev/null 2>&1
 ok "fact already documented in the wiki cache is skipped" \
   'grep -q "#$d1 | skip | wiki-cache-hit" "$REPORT"'
 SHORT="아주 짧은 사실"
+# shellcheck disable=SC2034  # d2 is read via eval inside ok()
 d2="$(seed mempalace procedure "$SHORT" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
 run_wp >/dev/null 2>&1
 ok "short facts never trigger the substring layer (too weak to be distinctive)" \
@@ -227,8 +255,10 @@ ok "seen-ledger id suppresses re-promotion permanently" \
 
 # ---- 8. APPLY: queue schema, numbering continuation, seen ledger, read-only --
 reset_db
+# shellcheck disable=SC2034  # a1 is read via eval inside ok()
 a1="$(seed jingun procedure "APPLY 대상 절차 하나" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
-a2="$(seed jingun decision "APPLY 대상 결정" 2026-08-01T00:00:00+00:00 static "$REFS_OK" "근거: 벤치 우위")"
+seed jingun decision "APPLY 대상 결정" 2026-08-01T00:00:00+00:00 static "$REFS_OK" "근거: 벤치 우위" >/dev/null
+# shellcheck disable=SC2034  # DBSUM_BEFORE is read via eval inside ok()
 DBSUM_BEFORE="$(sha256sum "$NUNCHI_DB" | cut -d' ' -f1)"
 printf '## [CAND-7] 2026-09-01 — 기존 distill 후보\n- status: pending\n- summary: 선행 항목\n' > "$QUEUE"
 out="$(run_wp NUNCHI_WIKI_PROMOTE_APPLY=1 2>&1)"; rc=$?
@@ -247,7 +277,7 @@ ok "facts.db is never mutated (read-only contract)" \
 
 # APPLY onto a NON-existent queue bootstraps the canonical wiki-queue header.
 rm -f "$QUEUE" "$SEEN"
-a3="$(seed seoseo procedure "헤더 부트스트랩용 절차" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
+seed seoseo procedure "헤더 부트스트랩용 절차" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '' >/dev/null
 run_wp NUNCHI_WIKI_PROMOTE_APPLY=1 >/dev/null 2>&1
 ok "APPLY onto a missing queue bootstraps the canonical wiki-queue header" \
   '[ "$(head -1 "$QUEUE")" = "# Wiki Candidates Queue (auto-generated by distill; review with \`/wiki-record\`)" ]'
@@ -266,6 +296,7 @@ for i in 1 2 3 4 5 6 7; do
   cids="$cids $cid"
 done
 out="$(run_wp NUNCHI_WIKI_PROMOTE_CAP=2 NUNCHI_WIKI_PROMOTE_APPLY=1 2>&1)"
+# shellcheck disable=SC2034  # first_two is read via eval inside ok()
 first_two="$(python3 - "$QUEUE" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
@@ -273,6 +304,7 @@ print(" ".join(re.findall(r"nunchi-p3-8 fact#(\d+) scope=", text)[:2]))
 PY
 )"
 ok "CAP truncates to the configured limit" 'grep -q "eligible candidates: 7 (cap 2, overflow 5)" "$REPORT"'
+# shellcheck disable=SC2034  # expected is read via eval inside ok()
 expected="$(echo $cids | cut -d' ' -f1-2)"
 ok "CAP keeps the OLDEST facts (created_at ASC — no starvation)" \
   '[ "$first_two" = "$expected" ]'
@@ -281,6 +313,7 @@ ok "overflow rows are recorded as cap-overflow skips" \
 
 # ---- 10. backpressure --------------------------------------------------------
 reset_db
+# shellcheck disable=SC2034  # bp is read via eval inside ok()
 bp="$(seed jingun procedure "역압 하에서도 후보는 된다" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
 python3 - <<'PY'
 import os
@@ -305,7 +338,8 @@ ok "at exactly the threshold (20 pending) the run proceeds" \
 # ---- 11. scoped fan-out: shared child only, private never opened -------------
 reset_db
 AUD="$TMP/aud"
-mkdir -m 700 -p "$AUD/shared/nunchi" "$AUD/private-b3362e2106be28b2f3221f38d9624b84/nunchi"
+mkdir -p "$AUD/shared" "$AUD/private-b3362e2106be28b2f3221f38d9624b84"
+mkdir -m 700 "$AUD/shared/nunchi" "$AUD/private-b3362e2106be28b2f3221f38d9624b84/nunchi"
 # mkdir -p applies -m ONLY to the final components: intermediate dirs follow
 # the umask, so on a 022 runner $AUD/shared would land 0755 and the canonical
 # scope gate would (correctly, per the judge-batch-identical contract)
@@ -316,6 +350,7 @@ NUNCHI_DB="$AUD/private-b3362e2106be28b2f3221f38d9624b84/nunchi/facts.db" python
 sh1="$(NUNCHI_DB="$AUD/shared/nunchi/facts.db" seed jingun procedure "shared 스코프의 플릿 절차" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
 NUNCHI_DB="$AUD/private-b3362e2106be28b2f3221f38d9624b84/nunchi/facts.db" \
   seed jingun procedure "id 확보용 더미" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '' >/dev/null
+# shellcheck disable=SC2034  # pv1 is read via eval inside ok()
 pv1="$(NUNCHI_DB="$AUD/private-b3362e2106be28b2f3221f38d9624b84/nunchi/facts.db" seed jingun procedure "private 스코프의 절차 — 절대 승격 금지" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
 out="$(env CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT="$AUD" \
   NUNCHI_WIKI_PROMOTE_APPLY=1 python3 "$WP" 2>&1)"; rc=$?
@@ -324,6 +359,7 @@ ok "shared-scope fact is queued with the shared scope tag" \
   "grep -q 'nunchi-p3-8 fact#$sh1 scope=shared' \"\$QUEUE\""
 ok "private-scope fact NEVER reaches the queue (physical boundary)" \
   '! grep -q "fact#$pv1" "$QUEUE"'
+# shellcheck disable=SC2034  # SHARED_AUDIT is read via eval inside ok()
 SHARED_AUDIT="$AUD/shared/nunchi/wiki-promote-audit.jsonl"
 ok "private scope never appears in the audit" \
   '! grep -q "private-" "$SHARED_AUDIT"'
@@ -331,13 +367,15 @@ ok "audit records the shared child run" 'grep -q "\"scope\": \"shared\"" "$SHARE
 
 # No shared child at all -> clean no-op.
 rm -rf "$AUD/shared"
-out="$(env CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT="$AUD" python3 "$WP" 2>&1)"; rc=$?
+out="$(env CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT="$AUD" python3 "$WP" 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "missing shared scope is a clean no-op" \
   '[ "$rc" = 0 ] && grep -q "no canonical shared scope" <<<"$out"'
 
 # ---- 12. flock + body-free audit ----------------------------------------------
 reset_db
-f1="$(seed dungae procedure "플록 대상 절차" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '')"
+seed dungae procedure "플록 대상 절차" 2026-08-01T00:00:00+00:00 static "$REFS_OK" '' >/dev/null
 python3 - <<'PY' &
 import fcntl, os, time
 fh = open(os.path.join(os.environ["NUNCHI_HOME"], ".wiki-promote.lock"), "w")
@@ -346,6 +384,7 @@ time.sleep(3)
 PY
 locker=$!
 sleep 0.5
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(run_wp NUNCHI_WIKI_PROMOTE_APPLY=1 2>&1)"
 wait "$locker"
 ok "locked run prints the skip message" 'grep -q "another run holds the lock" <<<"$out"'

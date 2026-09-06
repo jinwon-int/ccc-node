@@ -82,7 +82,10 @@ ok "batch CLI stops at the first failing file with exit 1 and names it" \
   '[ "$rc" = 1 ] && grep -Fq "$TMP/batch/bad" <<<"$out" && grep -Fxq "/root/ccc-node/one" "$TMP/batch/one" && grep -Fxq "/opt/ccc-node/four" "$TMP/batch/four"'
 out="$(printf '' | python3 "$LIB" --files-from - "/opt/ccc-node" "/root/ccc-node" 2>&1)"; rc=$?
 ok "batch CLI with no files is a no-op exit 0" '[ "$rc" = 0 ] && [ -z "$out" ]'
-out="$(printf '%s\0' "$TMP/batch/one" | python3 "$LIB" --files-from - "/opt/ccc-node" 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(printf '%s\0' "$TMP/batch/one" | python3 "$LIB" --files-from - "/opt/ccc-node" 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "batch CLI refuses an unpaired argument list" '[ "$rc" = 2 ] && grep -q "usage:" <<<"$out"'
 ok "setup.sh feeds the rewrite set through the batch CLI" \
   'grep -Fq "canonical_paths.py\" --files-from -" "$ROOT/setup.sh"'

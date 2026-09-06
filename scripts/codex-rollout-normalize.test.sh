@@ -44,6 +44,7 @@ EOF
 OUT="$TMP/out"
 summary="$(normalize "$FIX" "$OUT")"
 printf '%s' "$summary" > "$TMP/summary.json"
+# shellcheck disable=SC2034  # proj is read via eval inside ok()
 proj="$OUT/-root-projects-my-app/01a04842-bbf3.jsonl"
 
 ok "summary reports session identity and non-exclusion" \
@@ -65,6 +66,7 @@ ok "non-command function_call (wait) is discarded" '! grep -q "cell_id" "$proj"'
 
 # The whole point of the exact tool_use shape: scan.sh's extractor runs over
 # the normalized tree unchanged.
+# shellcheck disable=SC2034  # extracted is read via eval inside ok()
 extracted="$(find "$OUT" -name '*.jsonl' -print0 2>/dev/null | xargs -0 -r cat | jq -Rrc 'fromjson? | (.message.content[]? // empty) | select(.type=="tool_use" and .name=="Bash") | (.input.command | gsub("[\n\t]+";" "))' | wc -l | tr -d '[:space:]')"
 ok "scan.sh's Bash-shape extractor finds all 3 commands over the normalized tree" '[ "$extracted" = 3 ]'
 
@@ -91,6 +93,7 @@ cat > "$HEADLESS_FIX" <<'EOF'
 {"timestamp":"2026-08-28T12:05:39.078Z","type":"event_msg","payload":{"type":"agent_message","message":"backup completed with verification"}}
 EOF
 normalize "$HEADLESS_FIX" "$TMP/headless-out" --include-exec > /dev/null
+# shellcheck disable=SC2034  # hproj is read via eval inside ok()
 hproj="$TMP/headless-out/-srv-job/headless01.jsonl"
 ok "headless rollouts fall back to event_msg rows" \
   'grep -q "run the nightly backup job" "$hproj" && grep -q "backup completed with verification" "$hproj"'
@@ -118,6 +121,7 @@ normalize "$TMP/does-not-exist.jsonl" "$TMP/none-out" >/dev/null 2>&1
 rc=$?
 ok "a missing source exits 1" '[ "$rc" = 1 ]'
 python3 "$NORM" "$FIX" --out-dir "$TMP/x" --max-bytes 0 >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "a non-positive --max-bytes exits 2" '[ "$rc" = 2 ]'
 

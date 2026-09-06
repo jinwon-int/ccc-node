@@ -283,7 +283,9 @@ DEST="$TMP/install-dest-1460"
 bash "$INSTALLER" --dest "$DEST" >/dev/null 2>&1; rc=$?
 ok "installer copies dispatcher + review + revise handlers into dest (#1460)" \
   '[ "$rc" = 0 ] && [ -x "$DEST/skills-intake-revise-handler.sh" ] && [ -x "$DEST/skills-intake-review-handler.sh" ]'
-bash "$INSTALLER" --termux --dest "$TMP/termux-dest-1460" >/dev/null 2>&1; rc=$?
+bash "$INSTALLER" --termux --dest "$TMP/termux-dest-1460" >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "installer Termux profile ships the revise handler (#1460)" '[ "$rc" = 0 ] && [ -x "$TMP/termux-dest-1460/skills-intake-revise-handler.sh" ]'
 
 echo "PASS=$pass FAIL=$fail"

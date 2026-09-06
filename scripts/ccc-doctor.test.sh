@@ -291,6 +291,7 @@ chmod +x "$tar_hang/bin/tar"
 settings_before="$(cat "$tar_hang/home/.claude/settings.json")"
 hang_start="$(date +%s)"
 out="$(PATH="$tar_hang/bin:$PATH" CCC_DOCTOR_SUBPROCESS_TIMEOUT=0.3 CCC_DOCTOR_REPO_DIR="$tar_hang/repo" CCC_DOCTOR_CLAUDE_DIR="$tar_hang/home/.claude" bash "$DOCTOR" --fix --apply 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # hang_elapsed is read via eval inside ok()
 hang_elapsed=$(( $(date +%s) - hang_start ))
 settings_after="$(cat "$tar_hang/home/.claude/settings.json")"
 ok "hung backup tar is bounded and --fix --apply fails closed" \
@@ -345,8 +346,10 @@ esac
 exec /usr/bin/tar "$@"
 EOF
 chmod +x "$rollback_backup_fail/bin/tar"
+# shellcheck disable=SC2034  # settings_before is read via eval inside ok()
 settings_before="$(cat "$rollback_backup_fail/home/.claude/settings.json")"
 out="$(PATH="$rollback_backup_fail/bin:$PATH" CCC_DOCTOR_REPO_DIR="$rollback_backup_fail/repo" CCC_DOCTOR_CLAUDE_DIR="$rollback_backup_fail/home/.claude" bash "$DOCTOR" --rollback --apply 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # settings_after is read via eval inside ok()
 settings_after="$(cat "$rollback_backup_fail/home/.claude/settings.json")"
 ok "--rollback --apply refuses to overwrite settings when its recovery backup fails" \
   '[ "$rc" = 1 ] && grep -q "failed to create valid pre-rollback settings backup" <<<"$out" && [ "$settings_before" = "$settings_after" ]'
@@ -373,8 +376,10 @@ ok "file repair leaves no temp file behind" \
 ok "file repair keeps the repo hook mode" \
   '[ "$(stat -c %a "$files/home/.claude/hooks/statusline.sh")" = "$(stat -c %a "$ROOT/claude/hooks/statusline.sh")" ]'
 ok "file repair creates scoped backup tar" 'find "$files/home/.claude/backups" -name "ccc-doctor-files-*.tar.gz" | grep -q .'
+# shellcheck disable=SC2034  # backup_count_before is read via eval inside ok()
 backup_count_before="$(find "$files/home/.claude/backups" -name "ccc-doctor-files-*.tar.gz" | wc -l)"
 out="$(run_doctor "$files" --fix --apply --scope=files 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # backup_count_after is read via eval inside ok()
 backup_count_after="$(find "$files/home/.claude/backups" -name "ccc-doctor-files-*.tar.gz" | wc -l)"
 ok "file repair is idempotent" '[ "$rc" = 0 ] && [ "$backup_count_before" = "$backup_count_after" ] && grep -q "no repairs needed" <<<"$out"'
 
@@ -390,8 +395,10 @@ esac
 exec /usr/bin/tar "$@"
 EOF
 chmod +x "$file_backup_fail/bin/tar"
+# shellcheck disable=SC2034  # file_before is read via eval inside ok()
 file_before="$(cat "$file_backup_fail/home/.claude/output-styles/ccc-report.md")"
 out="$(PATH="$file_backup_fail/bin:$PATH" CCC_DOCTOR_REPO_DIR="$file_backup_fail/repo" CCC_DOCTOR_CLAUDE_DIR="$file_backup_fail/home/.claude" bash "$DOCTOR" --fix --apply --scope=files 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # file_after is read via eval inside ok()
 file_after="$(cat "$file_backup_fail/home/.claude/output-styles/ccc-report.md")"
 ok "file repair fails closed when its backup tar is invalid" \
   '[ "$rc" = 1 ] && grep -q "failed to create valid scoped file-repair backup" <<<"$out" && [ "$file_before" = "$file_after" ]'
@@ -433,18 +440,26 @@ ok "--fix --apply fails closed on manual settings" '[ "$rc" = 1 ] && grep -q "ma
 
 missing_settings="$(make_fixture missing-settings standalone)"
 rm -f "$missing_settings/home/.claude/settings.json"
+# shellcheck disable=SC2034  # before is read via eval inside ok()
 before="$(find "$missing_settings" -type f -printf '%P %s %T@\n' | sort)"
 out="$(run_doctor "$missing_settings" --fix --apply 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # after is read via eval inside ok()
 after="$(find "$missing_settings" -type f -printf '%P %s %T@\n' | sort)"
 ok "missing settings fails closed instead of claiming repairable" '[ "$rc" = 1 ] && grep -q "수동필요.*settings.json.*missing" <<<"$out" && grep -q "install mode cannot be inferred safely" <<<"$out" && [ "$before" = "$after" ]'
 
 # Keep every human-mode Codex failure probe paired with a JSON non-disclosure assertion.
 claude_default="$(make_fixture claude-default standalone)"
+# shellcheck disable=SC2034  # out_default is read via eval inside ok()
 out_default="$(env -u CCC_AGENT_PROVIDER \
   CCC_DOCTOR_REPO_DIR="$claude_default/repo" \
   CCC_DOCTOR_CLAUDE_DIR="$claude_default/home/.claude" \
-  bash "$DOCTOR")"; rc_default=$?
-out_claude="$(CCC_AGENT_PROVIDER=claude run_doctor "$claude_default")"; rc_claude=$?
+  bash "$DOCTOR")"
+# shellcheck disable=SC2034  # rc_default is read via eval inside ok()
+rc_default=$?
+# shellcheck disable=SC2034  # out_claude is read via eval inside ok()
+out_claude="$(CCC_AGENT_PROVIDER=claude run_doctor "$claude_default")"
+# shellcheck disable=SC2034  # rc_claude is read via eval inside ok()
+rc_claude=$?
 ok "explicit Claude provider preserves default behavior" '[ "$rc_default" = 0 ] && [ "$rc_claude" = 0 ] && [ "$out_default" = "$out_claude" ]'
 ok "Claude human output reports provider without a Codex probe" 'grep -q "provider.*claude" <<<"$out_claude" && grep -q "readiness.*not-applicable" <<<"$out_claude"'
 
@@ -474,7 +489,10 @@ export CODEX_HOME="$codex_auth/home/.codex"
 out="$(FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth")"; rc=$?
 ok "authenticated Codex readiness succeeds" '[ "$rc" = 0 ] && grep -q "provider.*codex" <<<"$out" && grep -q "readiness.*ready" <<<"$out" && grep -q "Codex login.*authenticated" <<<"$out"'
 ok "provisioned managed Codex skills report up to date" 'grep -q "정상.*managed Codex skills.*up to date" <<<"$out"'
-out_unprov="$(FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" CODEX_HOME="$TMP/codex-empty-home" run_doctor "$codex_auth")"; rc_unprov=$?
+# shellcheck disable=SC2034  # out_unprov is read via eval inside ok()
+out_unprov="$(FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" CODEX_HOME="$TMP/codex-empty-home" run_doctor "$codex_auth")"
+# shellcheck disable=SC2034  # rc_unprov is read via eval inside ok()
+rc_unprov=$?
 ok "unprovisioned managed Codex skills are correctable, not a blocker" '[ "$rc_unprov" = 1 ] && grep -q "교정가능.*managed Codex skills.*provision" <<<"$out_unprov" && grep -q "readiness.*ready" <<<"$out_unprov"'
 
 out="$(FAKE_CODEX_MODE=unauthenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" 2>&1)"; rc=$?
@@ -485,10 +503,15 @@ ok "unauthenticated Codex JSON redacts command output" '[ "$json_rc" = 1 ] && ! 
 
 out="$(FAKE_CODEX_MODE=malformed CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" 2>&1)"; rc=$?
 ok "malformed app-server probe fails closed" '[ "$rc" = 1 ] && grep -q "Codex app-server probe.*malformed output" <<<"$out" && ! grep -q "unexpected output" <<<"$out"'
-json_fail="$(FAKE_CODEX_MODE=malformed CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" --json 2>&1)"; json_rc=$?
+# shellcheck disable=SC2034  # json_fail is read via eval inside ok()
+json_fail="$(FAKE_CODEX_MODE=malformed CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" --json 2>&1)"
+# shellcheck disable=SC2034  # json_rc is read via eval inside ok()
+json_rc=$?
 ok "malformed app-server JSON does not disclose raw output" '[ "$json_rc" = 1 ] && ! grep -q "unexpected output" <<<"$json_fail"'
 
-json_out="$(FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" --json)"; rc=$?
+# shellcheck disable=SC2034  # json_out is read via eval inside ok()
+json_out="$(FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" --json)"
+rc=$?
 ok "Codex JSON output is valid and carries additive readiness fields" '[ "$rc" = 0 ] && jq -e '\''(.provider == "codex") and (.readiness == "ready") and (.mode == "standalone") and (.counts["수동필요"] == 0) and ([.rows[].item] | index("Codex login") != null)'\'' <<<"$json_out" >/dev/null'
 ok "Codex JSON output does not disclose executable path" '! grep -Fq "$codex_auth/bin/codex" <<<"$json_out"'
 
@@ -499,6 +522,7 @@ strict_json_ok=1
 for _ in 1 2 3 4 5; do
   FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" \
     run_doctor "$codex_auth" --json >"$TMP/strict.json" 2>/dev/null
+  # shellcheck disable=SC2034  # strict_json_ok is read via eval inside ok()
   python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/strict.json" || { strict_json_ok=0; break; }
 done
 ok "Codex --json stdout is strictly json.load-parseable across repeated runs (#404)" '[ "$strict_json_ok" = 1 ]'
@@ -608,8 +632,8 @@ results = {
 import json
 print(json.dumps(results, ensure_ascii=False))
 PY_EOF
-FAKE_HOME="$TMP/nodehome"; mkdir -p "$FAKE_HOME"
-nout="$(DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" FAKE_HOME="$FAKE_HOME" HOME="$FAKE_HOME" python3 "$TMP/nodetype.py" 2>"$TMP/nodetype.err")"
+nodehome="$TMP/nodehome"; mkdir -p "$nodehome"
+nout="$(DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" FAKE_HOME="$nodehome" HOME="$nodehome" python3 "$TMP/nodetype.py" 2>"$TMP/nodetype.err")"
 ok "termux boot script agreeing with runtime is 정상" '[ -n "$nout" ] && jq -e ".agree == \"정상\"" <<<"$nout" >/dev/null'
 ok "termux boot script pointing elsewhere is 수동필요 (same severity as a stale unit)" 'jq -e ".drift == \"수동필요\"" <<<"$nout" >/dev/null'
 ok "termux drift names both checkouts" 'jq -e ".drift_detail | contains(\"/opt/ccc-node\")" <<<"$nout" >/dev/null'
@@ -637,6 +661,7 @@ subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
 subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "x"], check=True)
 print(mod.Doctor(repo, repo / ".claude", "settings").harness_version())
 PY_EOF
+# shellcheck disable=SC2034  # vout is read via eval inside ok()
 vout="$(DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" VER_REPO="$TMP/verrepo" python3 "$TMP/version.py" 2>"$TMP/version.err")"
 ok "unrunnable version script falls through to git describe, not 'unknown'" '[ -n "$vout" ] && [ "$vout" != "unknown" ]'
 
@@ -684,6 +709,7 @@ print(json.dumps({
 }, ensure_ascii=False))
 PY_EOF
 SHEBANG_REPO="$TMP/shebangrepo"
+# shellcheck disable=SC2034  # sout is read via eval inside ok()
 sout="$(CCC_HONCHO_MEMORY_ENABLED=1 DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" SHEBANG_REPO="$SHEBANG_REPO" python3 "$TMP/shebang.py" 2>"$TMP/shebang.err")"
 ok "memory probe survives an unresolvable shebang (not 'diagnostic unavailable')" \
   '[ -n "$sout" ] && jq -e ".status != \"diagnostic unavailable\"" <<<"$sout" >/dev/null'
@@ -731,6 +757,7 @@ print(json.dumps({
     "unsafe": classify("ok", "ok", {"enabled": True, "root_status": "unsafe", "invalid_entries": 1, "scope_count": 0, "private_count": 0, "shared_count": 0}),
 }, ensure_ascii=False))
 PY_EOF
+# shellcheck disable=SC2034  # nout is read via eval inside ok()
 nout="$(DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" NUNCHI_REPO="$TMP/nunchi-repo" python3 "$TMP/nunchi-memory.py")"
 ok "doctor accepts a healthy new memory stack" 'jq -e '\''.healthy.klass == "정상"'\'' <<<"$nout" >/dev/null'
 ok "doctor warns when nunchi is degraded despite healthy Honcho" \
@@ -884,6 +911,7 @@ nc="$(run_nc piri "$scoped_cron" "$ok_json" "$nbin/mempalace" "" "$stale_ingest"
 ok "scoped fresh ingest tick beats a stale top-level ingest file (정상)" \
   'jq -e ".klass == \"정상\" and (.status | contains(\"scopes=1\") and (contains(\"ingest-tick-stale\") | not))" <<<"$nc" >/dev/null'
 printf '{"schema":"ccc.nunchi.ingest.v1","finished_at":%d,"sources":1,"ingested":0,"retired":0,"deferred":0,"feed":"piri"}' "$((now_s - 36000))" > "$nc_aud/private-x/nunchi/ingest.status.json"
+# shellcheck disable=SC2034  # nc is read via eval inside ok()
 nc="$(run_nc piri "$scoped_cron" "$ok_json" "$nbin/mempalace" "" "")"
 ok "genuinely stale scoped ingest tick is a 경고 (ingest-tick-stale)" \
   'jq -e ".klass == \"경고\" and (.status | contains(\"scopes=1\") and contains(\"ingest-tick-stale\"))" <<<"$nc" >/dev/null'
@@ -1018,6 +1046,7 @@ ok "unknown unmanaged marker is a 경고 with the label" \
 nolbrepo="$TMP/cron-drift-nolib"
 mkdir -p "$nolbrepo/scripts" "$nolbrepo/.claude"
 cp "$ROOT/scripts/install-memory-refresh-cron.sh" "$nolbrepo/scripts/"
+# shellcheck disable=SC2034  # cd_out is read via eval inside ok()
 cd_out="$(run_cd "*/30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=$gen_mr" "$nolbrepo")"
 ok "incomplete checkout (lib missing) is a 경고, not a silent pass" \
   'jq -e ".rows[] | select(.item == \"cron gen memory-refresh\" and .klass == \"경고\") | .status | contains(\"cannot recompute current stamp\")" <<<"$cd_out" >/dev/null'
@@ -1053,7 +1082,9 @@ out="$(run_doctor "$mt")"
 ok "node-local skills are not reported" '! grep -q "node-local-only" <<<"$out"'
 
 printf '# demo skill drifted\n' > "$mt/home/.claude/skills/demo/SKILL.md"
-out="$(run_doctor "$mt")"; rc=$?
+out="$(run_doctor "$mt")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "a drifted managed skill is caught" \
   '[ "$rc" != 0 ] && grep -q "교정가능.*skills/demo/SKILL.md.*drifted" <<<"$out"'
 # Repair must stay with setup.sh: doctor's --fix path refuses these paths, so
@@ -1080,6 +1111,7 @@ ok "node-agnostic agents are still watched" \
 
 mkdir -p "$mt/home/.claude/agents"
 printf '%s\n' worker > "$mt/home/.claude/a2a-role"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(run_doctor "$mt")"
 ok "the persisted worker marker opts the roster back in" \
   'grep -q "agents/a2a-demo.md.*missing" <<<"$out"'

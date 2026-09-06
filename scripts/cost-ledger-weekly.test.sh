@@ -62,7 +62,10 @@ ok "a later week appends after existing content with the next CAND id" \
   'grep -qE "^## \[CAND-8\] 2026-W35 — dungae" "$QUEUE" && grep -qF "earlier distill entry" "$QUEUE"'
 
 # --- empty / missing ledger -------------------------------------------------
-out="$(CCC_NODE=dungae python3 "$WEEKLY" --ledger "$TMP/missing.jsonl" --queue "$TMP/q2.md" --week-start 2026-08-10 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_NODE=dungae python3 "$WEEKLY" --ledger "$TMP/missing.jsonl" --queue "$TMP/q2.md" --week-start 2026-08-10 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "missing ledger exits 0 with no-ledger-rows (no empty entry written)" \
   '[ "$rc" = 0 ] && jq -e ".skipped == \"no-ledger-rows\"" <<<"$out" >/dev/null && [ ! -f "$TMP/q2.md" ]'
 
