@@ -53,9 +53,11 @@ class ClaudeDenyReasonTests(unittest.IsolatedAsyncioTestCase):
     """``_handle_permission_request`` names every deny decision point."""
 
     async def _request(self, session):
+        # Outside every #1555 auto-allow root (state dir, /tmp, ~/ccc-wt) so
+        # the request always reaches the handler route under test.
         return await session._handle_permission_request(
             "Write",
-            {"file_path": "/tmp/x", "content": _SECRET_MARKER},
+            {"file_path": "/srv/ccc-obs/x", "content": _SECRET_MARKER},
             SimpleNamespace(tool_use_id="approval-obs-1", title=None),
         )
 
@@ -180,3 +182,86 @@ class ApprovalRouteDenyTraceTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class ClaudeApprovalResolutionTests(unittest.IsolatedAsyncioTestCase):
+    """#1555: every handler decision is followed by an ``ApprovalResolvedEvent``.
+
+    The request event sets the turn's ``approval_pending`` lease; for a
+    delegated (sub-agent) tool call no later main-session frame arrives to
+    clear it, so the adapter must settle the lease itself.
+    """
+
+    async def _request(self, session, tool="Bash", tool_input=None):
+        return await session._handle_permission_request(
+            tool,
+            tool_input if tool_input is not None else {"command": f"echo {_SECRET_MARKER}"},
+            SimpleNamespace(tool_use_id="toolu_resolve_1", title=None),
+        )
+
+    def _drain(self, turn):
+        events = []
+        while not turn.queue.empty():
+            events.append(turn.queue.get_nowait())
+        return events
+
+    async def test_allow_enqueues_request_then_resolution(self) -> None:
+        ar = _agent_runtime()
+
+        async def allow(_request):
+            return ar.ApprovalDecision.ALLOW
+
+        session, turn = _session_with_turn(allow)
+        result = await self._request(session)
+        self.assertEqual(type(result).__name__, "PermissionResultAllow")
+        events = self._drain(turn)
+        self.assertEqual(
+            [type(event).__name__ for event in events],
+            ["ApprovalRequestEvent", "ApprovalResolvedEvent"],
+        )
+        request, resolved = events
+        self.assertEqual(resolved.request_id, request.request_id)
+        self.assertEqual(resolved.request_id, "toolu_resolve_1")
+        self.assertEqual(resolved.action, "Bash")
+        self.assertEqual(resolved.decision, ar.ApprovalDecision.ALLOW)
+        self.assertEqual(resolved.kind, "approval_resolved")
+        # Body-free: the resolution carries no arguments at all.
+        self.assertFalse(hasattr(resolved, "arguments"))
+
+    async def test_deny_enqueues_resolution_with_deny(self) -> None:
+        ar = _agent_runtime()
+
+        async def deny(_request):
+            return ar.ApprovalDecision.DENY
+
+        session, turn = _session_with_turn(deny)
+        await self._request(session, tool="Write", tool_input={"file_path": "/srv/ccc-obs/x"})
+        events = self._drain(turn)
+        self.assertEqual(
+            [type(event).__name__ for event in events],
+            ["ApprovalRequestEvent", "ApprovalResolvedEvent"],
+        )
+        self.assertEqual(events[1].decision, ar.ApprovalDecision.DENY)
+        self.assertEqual(events[1].action, "Write")
+
+    async def test_delegated_write_allowed_then_silence_keeps_no_pending_lease(self) -> None:
+        # End-to-end over the real turn state: request + resolution as the
+        # adapter enqueues them, observed by TurnEventState, leave no lease.
+        ar = _agent_runtime()
+        ts = importlib.import_module("telegram_bot.core.project_chat_turn_state")
+
+        async def allow(_request):
+            return ar.ApprovalDecision.ALLOW
+
+        session, turn = _session_with_turn(allow)
+        state = ts.TurnEventState()
+        state.observe(ar.DelegatedTaskLifecycleEvent(1, 0.0, "started"), observed_at=0.0)
+        await self._request(
+            session, tool="Write", tool_input={"file_path": "/srv/ccc-obs/lane.md"}
+        )
+        for index, event in enumerate(self._drain(turn)):
+            state.observe(event, observed_at=float(index + 1))
+        self.assertFalse(state.approval_pending)
+        self.assertIsNone(state.approval_pending_since)
+        state.observe(ar.DelegatedTaskLifecycleEvent(1, 3.0, "updated"), observed_at=3.0)
+        self.assertFalse(state.approval_pending)

@@ -9,6 +9,7 @@ from typing import TypeAlias
 from telegram_bot.core.agent_runtime import (
     AgentEvent,
     ApprovalRequestEvent,
+    ApprovalResolvedEvent,
     CompletionEvent,
     DelegatedTaskLifecycleEvent,
     ErrorEvent,
@@ -18,6 +19,7 @@ from telegram_bot.core.agent_runtime import (
     TextDeltaEvent,
     ToolCompletedEvent,
     ToolStartedEvent,
+    approval_target_kind,
 )
 from telegram_bot.core.heartbeat import tool_label
 
@@ -59,7 +61,9 @@ class DelegatedTaskLifecycleTransition:
     event: DelegatedTaskLifecycleEvent
 
 
-IgnoredEvent: TypeAlias = ReasoningDeltaEvent | ApprovalRequestEvent | CompletionEvent
+IgnoredEvent: TypeAlias = (
+    ReasoningDeltaEvent | ApprovalRequestEvent | ApprovalResolvedEvent | CompletionEvent
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +83,29 @@ TurnEventTransition: TypeAlias = (
 )
 
 
+def _approval_action_label(action: str) -> str:
+    """Body-free short name of an approval action.
+
+    Claude tool names pass through (``Bash``, ``Write``). Codex app-server
+    methods (``item/commandExecution/requestApproval``) collapse to their
+    item segment (``commandExecution``). Never includes arguments.
+    """
+
+    if action.startswith("item/"):
+        segments = action.split("/")
+        if len(segments) >= 3 and segments[1]:
+            return segments[1]
+    return action
+
+
+def approval_pending_label(action: str, arguments: object) -> str:
+    """``"<action> <target kind>"`` (or just the action) for stall notices (#1555)."""
+
+    kind = approval_target_kind(arguments)
+    label = _approval_action_label(action)
+    return f"{label} {kind}" if kind else label
+
+
 @dataclass(slots=True)
 class TurnEventState:
     """Own only the mutable event-routing facts for one turn.
@@ -89,6 +116,11 @@ class TurnEventState:
 
     approval_pending: bool = False
     approval_pending_since: float | None = None
+    # request_id -> body-free "<action> <target kind>" label of every approval
+    # request observed since the lease last cleared (#1555). Insertion order
+    # is the order the requests arrived, so the oldest outstanding one names
+    # the stall.
+    approval_pending_requests: dict[str, str] = field(default_factory=dict)
     admitted: bool = False
     attempt_recorded: bool = False
     terminal_error: ErrorEvent | None = None
@@ -115,6 +147,16 @@ class TurnEventState:
     def needs_attempt_recording(self) -> bool:
         return not self.attempt_recorded
 
+    @property
+    def approval_pending_label(self) -> str | None:
+        """Body-free ``"<action> <target kind>"`` of the oldest pending approval."""
+
+        if not self.approval_pending:
+            return None
+        for label in self.approval_pending_requests.values():
+            return label
+        return None
+
     def mark_admitted(self) -> None:
         """Observe admission after RequestLifecycle accepted the event."""
 
@@ -136,13 +178,28 @@ class TurnEventState:
         if isinstance(event, DelegatedTaskLifecycleEvent):
             return
         was_approval_pending = self.approval_pending
-        approval_pending = isinstance(event, ApprovalRequestEvent)
-        self.approval_pending = approval_pending
-        if approval_pending:
+        if isinstance(event, ApprovalRequestEvent):
+            self.approval_pending_requests[event.request_id] = approval_pending_label(
+                event.action, event.arguments
+            )
+            self.approval_pending = True
             if not was_approval_pending:
                 self.approval_pending_since = observed_at
-        else:
-            self.approval_pending_since = None
+            return
+        if isinstance(event, ApprovalResolvedEvent):
+            # #1555: the adapter settled one request. The lease stays only
+            # while another request observed since the last clear is still
+            # unresolved; a resolution for an already-cleared id is a no-op.
+            self.approval_pending_requests.pop(event.request_id, None)
+            self.approval_pending = bool(self.approval_pending_requests)
+            if not self.approval_pending:
+                self.approval_pending_since = None
+            return
+        # Any other provider-owned event proves the provider is not blocked on
+        # a decision: the lease and its ledger clear (pre-#1555 contract).
+        self.approval_pending = False
+        self.approval_pending_since = None
+        self.approval_pending_requests.clear()
 
     def _observe_delegated_lifecycle(
         self,
@@ -224,7 +281,7 @@ class TurnEventState:
             return self._observe_delegated_lifecycle(event, observed_at=observed_at)
         if isinstance(
             event,
-            (ReasoningDeltaEvent, ApprovalRequestEvent, CompletionEvent),
+            (ReasoningDeltaEvent, ApprovalRequestEvent, ApprovalResolvedEvent, CompletionEvent),
         ):
             return IgnoredTransition(event)
         raise TypeError(f"unsupported agent event: {type(event).__name__}")

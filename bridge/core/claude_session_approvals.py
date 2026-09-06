@@ -14,12 +14,22 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
-from .agent_runtime import ApprovalDecision, ApprovalRequestEvent, JsonValue
+from .agent_runtime import (
+    ApprovalDecision,
+    ApprovalRequestEvent,
+    ApprovalResolvedEvent,
+    JsonValue,
+    approval_target_kind,
+)
 from .state_contract import (
     ALLOW_REASON as _STATE_CONTRACT_ALLOW_REASON,
+    PATH_ALLOW_REASON as _STATE_PATH_ALLOW_REASON,
     contract_files as _state_contract_files,
+    path_allow_roots as _state_path_allow_roots,
     state_contract_allows as _state_contract_allows,
     state_contract_enabled as _state_contract_enabled,
+    state_path_allow_enabled as _state_path_allow_enabled,
+    state_path_allows as _state_path_allows,
 )
 
 if TYPE_CHECKING:
@@ -32,24 +42,12 @@ logger = logging.getLogger("telegram_bot.core.claude_runtime")
 _NO_ACTIVE_APPROVAL_ROUTE = (
     "No active turn accepts approval requests; start a new user turn and retry"
 )
-_APPROVAL_PATH_KEYS = ("path", "file_path", "filePath", "paths", "target", "targets")
 
 
 def _approval_target_kind(tool_input: object) -> str:
-    """Body-free shape hint for an approval request (#889 observability).
+    """Body-free shape hint; the shared helper lives in ``agent_runtime`` (#1555)."""
 
-    Returns only a kind label (``path``/``command``/empty) — never the value —
-    so the log can say *what category* of target was asked about without
-    exposing raw arguments, env, or file contents.
-    """
-
-    if not isinstance(tool_input, dict):
-        return ""
-    if any(isinstance(tool_input.get(k), str) and tool_input.get(k) for k in _APPROVAL_PATH_KEYS):
-        return "path"
-    if isinstance(tool_input.get("command"), str) and tool_input.get("command"):
-        return "command"
-    return ""
+    return approval_target_kind(tool_input)
 
 
 class ClaudeSessionApprovalMixin:
@@ -78,6 +76,31 @@ class ClaudeSessionApprovalMixin:
             enabled=True,
         )
 
+    def _state_path_allows(self, tool_name: str, tool_input: object) -> bool:
+        settings = getattr(self._runtime, "_settings", None)
+        if not _state_path_allow_enabled(settings):
+            return False
+        roots = _state_path_allow_roots(
+            settings,
+            extra_state_dirs=self._contract_state_dirs,
+            include_default=self._contract_include_default,
+        )
+        return _state_path_allows(
+            tool_name,
+            tool_input if isinstance(tool_input, Mapping) else None,
+            roots=roots,
+            enabled=True,
+        )
+
+    def _auto_allow_reason(self, tool_name: str, tool_input: object) -> str | None:
+        """Body-free reason code when a request needs no approval route, else None."""
+
+        if self._state_contract_allows(tool_name, tool_input):
+            return _STATE_CONTRACT_ALLOW_REASON
+        if self._state_path_allows(tool_name, tool_input):
+            return _STATE_PATH_ALLOW_REASON
+        return None
+
     async def _handle_permission_request(
         self,
         tool_name: str,
@@ -98,8 +121,12 @@ class ClaudeSessionApprovalMixin:
         # exactly the turns that need it. Narrow by construction: structured
         # write actions, absolute file_path, realpath-equal to a known
         # non-symlinked contract file, kill-switch CCC_STATE_CONTRACT_ALLOW.
-        # Anything else continues into the unchanged fail-closed flow.
-        if self._state_contract_allows(tool_name, tool_input):
+        # #1555 extends the same shape to files under the state dir(s), /tmp
+        # and ~/ccc-wt (reason=state-path-allow, kill-switch
+        # CCC_STATE_PATH_ALLOW). Anything else continues into the unchanged
+        # fail-closed flow.
+        auto_allow_reason = self._auto_allow_reason(tool_name, tool_input)
+        if auto_allow_reason is not None:
             active_for_log = self._active_turn
             logger.info(
                 "Approval request allowed provider=claude tool=%s target_kind=path "
@@ -107,7 +134,7 @@ class ClaudeSessionApprovalMixin:
                 tool_name,
                 getattr(context, "tool_use_id", None),
                 "none" if active_for_log is None or active_for_log.finished else "active",
-                _STATE_CONTRACT_ALLOW_REASON,
+                auto_allow_reason,
             )
             return PermissionResultAllow()
 
@@ -160,6 +187,13 @@ class ClaudeSessionApprovalMixin:
         outcome = "allowed" if decision is ApprovalDecision.ALLOW else "denied"
         if decision is not ApprovalDecision.ALLOW:
             deny_reason = deny_reason or "handler-deny"
+        # #1555: the request event above set the turn's approval_pending lease;
+        # settle it here. A delegated (sub-agent) tool call has its own frames
+        # filtered from the turn stream, so without this event nothing cleared
+        # the lease and the approval-stall guard released a healthy turn.
+        active.queue.put_nowait(
+            ApprovalResolvedEvent(request_id=request_id, action=tool_name, decision=decision)
+        )
         logger.info(
             "Approval request provider=claude tool=%s target_kind=%s "
             "request_id=%s turn=active outcome=%s reason=%s",
