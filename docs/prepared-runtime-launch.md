@@ -2,8 +2,9 @@
 
 `start.sh --prepared-runtime <job>` selects a completed Termux preparation job
 without creating a venv or running pip. This is the first launch integration
-for #1527. Promotion automation, managed-service templates, automatic source/environment
-rollback and production transition validation remain separate work. The
+for #1527. Explicit one-shot recovery is available as an opt-in below.
+Promotion policy, managed-service templates and production transition
+validation remain separate work. The
 unmanaged stop path now preserves the existing bounded application drain
 (see [service control](service-control.md#bridge-restart-drain)).
 
@@ -125,8 +126,80 @@ bash "$previous_source/bridge/start.sh" --path "$project" \
 For a legacy generation, retain and use its original source/venv command.
 Do not infer a safe legacy rollback merely from having a managed-asset backup;
 that backup may not contain the old venv. If recovery also fails, retain both
-environments and logs and report the failure. No automatic rollback or
-cleanup is performed by this integration.
+environments and logs and report the failure. Without the recovery options
+below, no automatic recovery is performed. Neither path cleans up generations.
+
+### Opt-in one-shot recovery
+
+When the currently healthy bridge is also a retained prepared generation,
+provide its explicit source **bridge directory** and preparation job:
+
+```bash
+bash "$candidate_source/bridge/start.sh" --path "$project" \
+  --prepared-runtime "$candidate_job" --restart -d \
+  --recovery-source "$previous_source/bridge" \
+  --recovery-runtime "$previous_job"
+```
+
+Both recovery options require prepared `--restart` and the default spawn
+command. They do not enable managed-service transitions. The controller
+validates both retained pairs and verifies that the current live, healthy
+process matches the previous pair before stopping anything. On a candidate
+start or readiness failure after a successful stop, it calls the previous
+pair's normal `--restart` once. That command stops any surviving candidate
+through the existing stop/token-lock path. Recovery succeeds only when fresh
+serving evidence matches the **previous report pinned before stop**. Recovery
+failure never triggers another automatic attempt.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Candidate generation became available. |
+| `1` | Stop failed; candidate and recovery were not launched. |
+| `2` | Invalid option combination (before transition). |
+| `3` / `5` | Service-manager / caller-process-tree refusal. |
+| `6` | Preparation, current-generation or lease precondition refused. |
+| `7` | Candidate failed; the previous generation was verified restored. |
+| `8` | Candidate failed and recovery was not verified successful. |
+| `9` | Transition evidence could not be persisted; inspect retained state. |
+
+Exit `7` is deliberately nonzero: a recovered service is still a failed
+candidate update. These additional outcomes apply only when recovery is
+selected; ordinary prepared restart retains its existing exit codes.
+
+Each attempt writes private, exclusive phase JSON files under
+`<project>/.telegram_bot/runtime-transitions/<attempt-id>/`. Intent identifies
+both source/runtime paths; validation records both pinned reports; terminal
+records distinguish the controller result from the underlying command result.
+Files are `0600` and attempt directories `0700`. The `active/` directory is an
+exclusive lease between cooperating recovery-option controllers. Completing
+a recorded attempt archives the lease inside that attempt. Generation files,
+launch receipts and transition evidence are retained without cleanup.
+
+Interruptions or failures before lease archival leave `active/` in place. A dead launcher
+PID does **not** authorize reclaim: its children may still be stopping or
+starting a bridge. There is no automatic resume or lease reclamation. Before
+an operator archives a stale `active/` directory to an unused private name,
+inspect the attempt and launcher/child processes, verify the actual serving
+source/runtime, and finish or stop any outstanding lifecycle operation. Keep
+the archived evidence with the attempt. Do not remove the lease simply to
+retry. A journal write failure can leave a partial record or a terminal record
+whose lease archival failed. If the rename succeeded but a following directory
+sync failed, the command still exits `9` with archived evidence, and `active/`
+may already be absent. No lifecycle work follows that archival boundary; a new
+controller may claim the lease, but must pass the full current-generation
+preflight again. Only the command's final exit reports successful completion.
+
+Direct legacy lifecycle commands do not participate in this lease. Coordinate
+all external lifecycle callers separately. Shared `.env` settings, credentials
+and service configuration are not restored; keep configuration compatible with
+both retained generations. This is an observation of retained owner-controlled
+artifacts, not an immutable-source or loaded-package attestation.
+
+Budget external watchdogs for **both** candidate and possible recovery
+validation, drains, launches and readiness waits. The self-updater's default
+180-second external command budget may be insufficient; explicitly measure
+and configure the linked restart command budget. The controller does not
+silently extend an outer deadline or resume after it is killed.
 
 ### Offline recovery rehearsal
 
@@ -154,7 +227,7 @@ This proves the retained-pair command path under injected fixture failures.
 The two venvs share the test host's installed SDK/native packages; this does not
 exercise two independently installed SDK versions, production Telegram polling,
 real workload drain, power loss, disk exhaustion or Termux. Those trials and
-automatic promotion/recovery remain separate #1527 acceptance work.
+automatic promotion policy remain separate #1527 acceptance work.
 
 The selector is supported for run/restart/status/stop. Install, uninstall,
 upgrade and service-template operations reject it, because those templates
