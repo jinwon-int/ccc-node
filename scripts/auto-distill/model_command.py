@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import shlex
@@ -60,6 +61,57 @@ CLAUDE_ARGS = (
     "WebFetch",
     "WebSearch",
 )
+# Launcher aliases the provider resolves server-side. A receipt must never
+# record one of these as the "resolved" model id (#1521, #1514 finding).
+BARE_MODEL_ALIASES = frozenset({"haiku", "sonnet", "opus", "default"})
+
+
+def claude_model_alias(argv: Sequence[str]) -> str | None:
+    """Return the ``--model`` value a Claude argv sends (alias or concrete id)."""
+
+    for index, arg in enumerate(argv):
+        if arg == "--model" and index + 1 < len(argv):
+            return argv[index + 1]
+        if arg.startswith("--model="):
+            return arg.partition("=")[2]
+    return None
+
+
+def _envelope_model_ids(payload: object) -> set[str]:
+    if not isinstance(payload, dict) or payload.get("type") != "result":
+        return set()
+    usage = payload.get("modelUsage")
+    if not isinstance(usage, dict):
+        return set()
+    return {key for key in usage if isinstance(key, str) and key.strip()}
+
+
+def resolved_model_ids(text: str) -> list[str]:
+    """Collect concrete model ids from Claude ``--output-format json`` envelopes.
+
+    ``claude --version`` prints only the CLI version and the CLI exposes no
+    offline alias table, so the only model-call-free source of the id an alias
+    resolved to is the ``modelUsage`` block of envelopes the evaluation already
+    produced (auto-distill.py reads the same block for cost accounting).
+    Accepts one envelope or a log with one JSON document per line; anything
+    that is not a result envelope is ignored. Never invokes a model.
+    """
+
+    ids: set[str] = set()
+    try:
+        ids |= _envelope_model_ids(json.loads(text))
+        return sorted(ids)
+    except ValueError:
+        pass
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            ids |= _envelope_model_ids(json.loads(stripped))
+        except ValueError:
+            continue
+    return sorted(ids)
 
 
 class ModelCommandError(RuntimeError):
