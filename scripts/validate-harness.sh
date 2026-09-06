@@ -10,8 +10,8 @@
 #   umask-0002 re-runs  suites whose leading comment block carries the exact
 #                       line `# harness: umask-rerun` (UMASK_MARKER)
 #   py_compile          every tracked *.py outside PY_COMPILE_EXCLUDE prefixes
-#   warning-level lint  every tracked *.sh plus SC_SCOPE_EXTRA minus the
-#                       SC_WARN_BASELINE ratchet (pre-existing findings only)
+#   warning-level lint  every tracked *.sh plus SC_SCOPE_EXTRA (no baseline:
+#                       the SC_WARN_BASELINE ratchet was burned down in #1510)
 # The manifests live in the "manifests (#1484)" block below; every entry is
 # guarded (stale entry = FAIL). `--dump-plan` prints the discovered plan as
 # `<kind><TAB><path>` lines and exits (equivalence/diff seam).
@@ -78,8 +78,8 @@ err() { printf 'FAIL: %s\n' "$*"; fail=1; }
 # --- manifests (#1484) -------------------------------------------------------
 # The ONLY hand-maintained inputs to what this script validates. Everything
 # else is discovered from `git ls-files` (block below). Each entry here is
-# guarded — a stale entry (file no longer tracked, baseline script now clean)
-# fails the run — so these cannot rot the way the old explicit lists did
+# guarded — a stale entry (file no longer tracked) fails the run — so these
+# cannot rot the way the old explicit lists did
 # (almost every commit to this file in the 30 days before #1484 was list
 # maintenance).
 # Tracked *.test.sh that must NOT run in the hook-test loop. None today: the
@@ -93,16 +93,12 @@ UMASK_MARKER='# harness: umask-rerun'
 # covered by its own pytest matrix (3.11 + 3.12), mypy and the wheel smoke.
 PY_COMPILE_EXCLUDE=(bridge/)
 # Tracked shell scripts without a .sh suffix that still get warning-level
-# lint (the `*.sh` discovery cannot see them).
+# lint (the `*.sh` discovery cannot see them). There is no warning-level
+# baseline any more: the SC_WARN_BASELINE ratchet (91 scripts with
+# pre-existing findings, snapshot 2026-09-05) was burned down to empty and
+# retired on 2026-09-06 (#1510), so every tracked script is linted at
+# warning level from its first commit.
 SC_SCOPE_EXTRA=(scripts/git-hooks/managed-checkout-guard)
-# Warning-level shellcheck baseline: tracked scripts that carry PRE-EXISTING
-# warning-severity findings and are therefore linted at error level only
-# (the repo-wide sweep in 3a). Snapshot 2026-09-05; burned down to empty on
-# 2026-09-06 (#1510 batches 1-5) — every tracked *.sh is now linted at
-# warning level. Ratchet: an entry that becomes clean FAILS the run until it
-# is removed; a NEW script is never added here — it is linted at warning
-# level from its first commit.
-SC_WARN_BASELINE=()
 # --- end manifests -----------------------------------------------------------
 
 # --- discovery (#1484) -------------------------------------------------------
@@ -176,14 +172,12 @@ discover_plan() {
     PY_COMPILE_FILES+=("$f")
   done < <(git ls-files -- '*.py')
   # 4) warning-level shellcheck scope: every tracked *.sh plus the suffix-less
-  #    extras, minus the baseline (which stays under the error-level sweep).
+  #    extras. Nothing is carved out (#1510 retired the baseline).
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    list_has "$f" "${SC_WARN_BASELINE[@]}" && continue
     SC_SCOPE+=("$f")
-  done < <(git ls-files -- '*.sh' "${SC_SCOPE_EXTRA[@]}")
-  tracked_guard SC_SCOPE_EXTRA "${SC_SCOPE_EXTRA[@]}"
-  tracked_guard SC_WARN_BASELINE "${SC_WARN_BASELINE[@]}"
+  done < <(git ls-files -- '*.sh' ${SC_SCOPE_EXTRA[@]+"${SC_SCOPE_EXTRA[@]}"})
+  tracked_guard SC_SCOPE_EXTRA ${SC_SCOPE_EXTRA[@]+"${SC_SCOPE_EXTRA[@]}"}
   [ "$plan_findings" -eq 0 ]
 }
 # --- end discovery -----------------------------------------------------------
@@ -347,9 +341,8 @@ for f in "${SH[@]}"; do
 done
 
 # 3) shellcheck — warning level (blocking) on SC_SCOPE: every tracked *.sh plus
-# SC_SCOPE_EXTRA minus the SC_WARN_BASELINE ratchet (discovered above, #1484).
-# Baseline scripts get the error-level sweep in 3a only, until they are
-# cleaned up and dropped from the baseline.
+# SC_SCOPE_EXTRA (discovered above, #1484). A new warning-level finding in ANY
+# tracked script fails the run; there is no baseline to hide behind (#1510).
 say "== shellcheck =="
 if command -v shellcheck >/dev/null 2>&1; then
   SC_PRESENT=()
@@ -367,26 +360,11 @@ if command -v shellcheck >/dev/null 2>&1; then
       if shellcheck --severity=warning -e SC2155,SC1090,SC1091 "$f"; then say "  ok $f"; else err "shellcheck: $f"; fi
     done
   fi
-  say "  ok warning-level scope: ${#SC_PRESENT[@]} script(s) (tracked *.sh + ${#SC_SCOPE_EXTRA[@]} extra - ${#SC_WARN_BASELINE[@]} baseline)"
-  # Baseline ratchet: an SC_WARN_BASELINE entry that no longer has any
-  # warning-level finding must leave the baseline (and thereby join
-  # SC_SCOPE), or the manifest would silently grow stale. Evaluated per
-  # file, exactly as a developer runs it: in a batch, shellcheck follows
-  # `source`d files that happen to be co-inputs and can hide a finding
-  # (e.g. SC2034 in distill/extract.sh disappears next to provider-guard.sh).
-  sc_base_n=0; sc_stale=0
-  for f in "${SC_WARN_BASELINE[@]}"; do
-    [ -f "$f" ] || continue
-    sc_base_n=$((sc_base_n + 1))
-    shellcheck --severity=warning -e SC2155,SC1090,SC1091 "$f" >/dev/null 2>&1 \
-      && { err "SC_WARN_BASELINE entry is clean at warning level — remove it: $f"; sc_stale=$((sc_stale + 1)); }
-  done
-  [ "$sc_stale" -eq 0 ] && say "  ok SC_WARN_BASELINE ratchet: $sc_base_n script(s) still carry pre-existing warning-level findings"
-  # 3a) Repo-wide error-severity sweep — every tracked script gets at least
-  # error-level lint, so a new script cannot escape shellcheck entirely
-  # (previously anything outside SC_SCOPE only got bash -n). SC_SCOPE keeps
-  # the stricter warning-level bar for reviewed scripts; this pass is
-  # currently clean repo-wide, so it only ever catches new real bugs.
+  say "  ok warning-level scope: ${#SC_PRESENT[@]} script(s) (every tracked *.sh + ${#SC_SCOPE_EXTRA[@]} extra, no baseline)"
+  # 3a) Repo-wide error-severity sweep — a backstop independent of the
+  # discovery above: every tracked *.sh gets at least error-level lint with
+  # NO exclusions, so a real bug cannot escape shellcheck even if the
+  # warning-level scope were ever narrowed again. Clean repo-wide today.
   if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     mapfile -t ALL_SH < <(git ls-files '*.sh')
     if [ "${#ALL_SH[@]}" -gt 0 ]; then
