@@ -15,8 +15,9 @@ VERIFIER = ROOT / "scripts/verify-auto-distill-receipt.py"
 SOURCE = ROOT / "scripts/auto-distill/auto-distill.py"
 RECEIPT = ROOT / "scripts/auto-distill/evaluation-receipt.json"
 SCHEMA = ROOT / "schemas/auto-distill-evaluation-receipt-v1.schema.json"
-# Fixture only: a plausible provider id shape. The canonical receipt (TM-3298)
-# predates #1521 and deliberately records no resolution.
+# Fixture only: a plausible provider id shape used to mutate copies of the
+# canonical receipt. The canonical receipt itself records its own resolution
+# since the #1521 re-issue; `canonical_receipt()` reads the live values.
 RESOLVED_ID = "claude-haiku-4-5-20251001"
 MODEL_RESOLUTION = {
     "alias": "haiku",
@@ -24,6 +25,14 @@ MODEL_RESOLUTION = {
     "resolved_by": "claude-json-modelUsage:eval.log",
     "resolved_at": "2026-09-05T13:01:16Z",
 }
+
+
+def canonical_receipt() -> dict:
+    return json.loads(RECEIPT.read_text(encoding="utf-8"))
+
+
+def without_model_resolution(data) -> None:
+    data["evaluation"].pop("model_resolution", None)
 
 
 class AutoDistillReceiptTest(unittest.TestCase):
@@ -65,23 +74,43 @@ class AutoDistillReceiptTest(unittest.TestCase):
         return temporary, target
 
     def test_canonical_receipt_validates_exact_source(self) -> None:
+        evaluation_id = canonical_receipt()["evaluation"]["id"]
         result = self.run_verifier()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("evaluation receipt ok: pipeline=6", result.stdout)
-        self.assertIn("evaluation=TM-3298", result.stdout)
+        self.assertIn(f"evaluation={evaluation_id}", result.stdout)
 
-    def test_canonical_receipt_predates_model_resolution_and_still_verifies(self) -> None:
-        # Backward compatibility (#1521): TM-3298 was issued without the
-        # optional model_resolution object and must keep verifying unchanged.
-        receipt = json.loads(RECEIPT.read_text(encoding="utf-8"))
-        self.assertNotIn("model_resolution", receipt["evaluation"])
-        result = self.run_verifier()
+    def test_canonical_receipt_records_resolved_model_id(self) -> None:
+        # #1521 re-issue: the canonical receipt pins the provider model id the
+        # launcher alias resolved to, and must verify under --require-model.
+        evaluation = canonical_receipt()["evaluation"]
+        resolution = evaluation["model_resolution"]
+        self.assertEqual(resolution["alias"], evaluation["model"])
+        self.assertNotIn(resolution["resolved_id"].lower(), {"haiku", "sonnet", "opus", "default"})
+        self.assertTrue(resolution["resolved_by"].startswith("claude-json-modelUsage:"))
+        for extra in ((), ("--require-model",)):
+            with self.subTest(extra=extra):
+                result = self.run_verifier(extra=extra)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"evaluation={evaluation['id']}", result.stdout)
+                self.assertTrue(
+                    result.stdout.rstrip().endswith(f" model={resolution['resolved_id']}"),
+                    result.stdout,
+                )
+
+    def test_receipt_without_model_resolution_still_verifies(self) -> None:
+        # Backward compatibility (#1521): receipts issued before the optional
+        # model_resolution object (TM-3298 shape) keep verifying unchanged.
+        temporary, receipt = self.mutated_receipt(without_model_resolution)
+        with temporary:
+            result = self.run_verifier(receipt=receipt)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("evaluation=TM-3298", result.stdout)
         self.assertTrue(result.stdout.rstrip().endswith(" model=unrecorded"), result.stdout)
 
     def test_require_model_rejects_receipt_without_resolution(self) -> None:
-        result = self.run_verifier(extra=("--require-model",))
+        temporary, receipt = self.mutated_receipt(without_model_resolution)
+        with temporary:
+            result = self.run_verifier(receipt=receipt, extra=("--require-model",))
         self.assertEqual(result.returncode, 3, result.stdout)
         self.assertIn("model_resolution is required", result.stderr)
 
@@ -91,7 +120,7 @@ class AutoDistillReceiptTest(unittest.TestCase):
             result = self.run_verifier(receipt=receipt)
             required = self.run_verifier(receipt=receipt, extra=("--require-model",))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("evaluation=TM-3298", result.stdout)
+        self.assertIn(f"evaluation={canonical_receipt()['evaluation']['id']}", result.stdout)
         self.assertTrue(result.stdout.rstrip().endswith(f" model={RESOLVED_ID}"), result.stdout)
         self.assertEqual(required.returncode, 0, required.stderr)
         self.assertIn(f"model={RESOLVED_ID}", required.stdout)
@@ -123,7 +152,7 @@ class AutoDistillReceiptTest(unittest.TestCase):
 
     def test_resolution_must_not_postdate_issuance(self) -> None:
         temporary, receipt = self.with_model_resolution(
-            resolved_at="2026-09-06T00:00:00+09:00"
+            resolved_at="2099-01-01T00:00:00+09:00"
         )
         with temporary:
             result = self.run_verifier(receipt=receipt)
