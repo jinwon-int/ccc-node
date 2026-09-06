@@ -18,8 +18,10 @@ import time
 
 if __package__:
     from .dependency_bootstrap import android_build_api
+    from .runtime_readiness import PROBES
 else:
     from dependency_bootstrap import android_build_api
+    from runtime_readiness import PROBES
 
 NATIVE = ("cryptography", "jiter", "pydantic-core", "rpds-py", "pyromark")
 BUILD_TOOLS = ("setuptools", "packaging", "cffi", "pycparser")
@@ -29,6 +31,14 @@ MIN_FREE_BYTES = 2 * 1024**3
 
 class PreparationError(Exception):
     """Categorical, body-free failure suitable for receipts."""
+
+
+class Cancelled(PreparationError):
+    """Catchable CLI termination; SIGKILL remains outside any cleanup contract."""
+
+
+def cancel(signum, frame):
+    raise Cancelled("cancelled")
 
 
 def private_write(path: Path, data: str) -> None:
@@ -115,19 +125,28 @@ class Runner:
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "wb") as stream:
             os.fchmod(stream.fileno(), 0o600)
-            with subprocess.Popen(argv, env=self.env, cwd=self.work,
-                                  stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
-                                  start_new_session=True) as child:
+            # Defer catchable cancellation across spawn so a signal cannot
+            # land after fork but before we have the child handle to reap.
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+            child = None
+            try:
+                child = subprocess.Popen(argv, env=self.env, cwd=self.work,
+                                         stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
+                                         start_new_session=True)
                 try:
-                    code = child.wait(timeout=remaining)
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                    code = child.wait(timeout=max(0.001, self.deadline - time.monotonic()))
                     stage.update(status="pass" if code == 0 else "fail", exit_code=code)
-                except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+                except (subprocess.TimeoutExpired, KeyboardInterrupt, Cancelled) as exc:
+                    stage["status"] = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "cancelled"
+            finally:
+                if child is not None and child.poll() is None:
                     try:
                         os.killpg(child.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                     child.wait()
-                    stage["status"] = "cancelled" if isinstance(exc, KeyboardInterrupt) else "timeout"
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         stage["duration_ms"] = round((time.monotonic() - started) * 1000)
         if stage["status"] != "pass":
             raise PreparationError(f"{name}_{stage['status']}")
@@ -164,7 +183,9 @@ def prepare(runner: Runner, source: Path, report: dict, reinstall: bool) -> None
     ):
         private_write(work / f"{name}.lock.txt", lock_subset(path, subset))
         report["lock_sha256"][name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    report["helper_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    report["source_sha256"] = {name: hashlib.sha256((source / name).read_bytes()).hexdigest()
+                               for name in ("termux_prepare.py", "dependency_bootstrap.py",
+                                            "runtime_readiness.py", "requirements.txt", "pyproject.toml")}
     base = [sys.executable, "-I", "-B", "-m", "venv"]
     runner.run("builder-venv", [*base, "--system-site-packages", str(work / "builder")])
     builder = str(work / "builder/bin/python")
@@ -184,7 +205,7 @@ def prepare(runner: Runner, source: Path, report: dict, reinstall: bool) -> None
                  "--project-env", str(work / "absent.env"), "--process-unlocked", "0"]
     report["scenarios"]["fresh_install"] = "in_progress"
     runner.run("fresh-install", bootstrap)
-    verify_runtime(runner, source, runtime, "fresh-readiness")
+    verify_runtime(runner, runtime, "fresh-readiness")
     report["scenarios"]["fresh_install"] = "pass"
     if reinstall:
         report["scenarios"]["reinstall"] = "in_progress"
@@ -192,16 +213,18 @@ def prepare(runner: Runner, source: Path, report: dict, reinstall: bool) -> None
                                       "--force-reinstall", "--require-hashes", "-r",
                                       str(source / "requirements.lock.txt")])
         runner.run("reinstall-reconcile", bootstrap)
-        verify_runtime(runner, source, runtime, "reinstall-readiness")
+        verify_runtime(runner, runtime, "reinstall-readiness")
         report["scenarios"]["reinstall"] = "pass"
 
 
-def verify_runtime(runner: Runner, source: Path, runtime: str, name: str) -> None:
-    # The observer manages its own probe groups. Give it less than the remaining
-    # outer budget so it can kill/reap them before our enclosing deadline.
-    budget = min(60, (runner.deadline - time.monotonic()) / 2)
-    runner.run(name, [runtime, "-B", str(source / "runtime_readiness.py"),
-                      "--bridge-dir", str(source), "--timeout-seconds", str(max(0.001, budget))])
+def verify_runtime(runner: Runner, runtime: str, name: str) -> None:
+    # Reuse canonical probes directly: nesting the observer CLI would create
+    # grandchild sessions outside this driver's cancellation/process group.
+    runner.run(f"{name}-identity", [runtime, "-I", "-B", "-c",
+               "import json; from telegram_bot.runtime_readiness import runtime_identity; "
+               "print(json.dumps(runtime_identity(), sort_keys=True))"])
+    for probe_name, args in PROBES:
+        runner.run(f"{name}-{probe_name}", [runtime, "-I", "-B", *args])
     runner.run(f"{name}-all-native", [runtime, "-I", "-B", "-c",
                "import cryptography.hazmat.bindings._rust,jiter,pydantic_core,rpds,pyromark,claude_agent_sdk"])
 
@@ -224,6 +247,7 @@ def main(argv=None) -> int:
               "scenarios": {name: "not_run" for name in
                             ("fresh_install", "reinstall", "rollback", "service_restart", "promotion")}}
     runner = None
+    previous_handler = signal.signal(signal.SIGTERM, cancel)
     try:
         api = android_build_api()
         if os.environ.get("ANDROID_API_LEVEL", str(api)) != str(api):
@@ -241,8 +265,12 @@ def main(argv=None) -> int:
         report["status"] = "ready"
     except PreparationError as exc:
         report["reason"] = str(exc)
+    except KeyboardInterrupt:
+        report["reason"] = "cancelled"
     except (OSError, ValueError, subprocess.SubprocessError):
         report["reason"] = "preflight_or_io_error"
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
     for scenario, status in report["scenarios"].items():
         if status == "in_progress":
             report["scenarios"][scenario] = "fail"

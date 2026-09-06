@@ -184,3 +184,60 @@ def test_failed_install_is_recorded_and_preserved(tmp_path, monkeypatch, capsys)
     assert report["scenarios"]["fresh_install"] == "fail"
     assert report["scenarios"]["promotion"] == "not_run"
     assert json.loads((work / "receipt.json").read_text()) == report
+
+
+@pytest.mark.parametrize("sig", [2, 15])
+def test_cli_cancellation_kills_probe_and_keeps_receipt(tmp_path, sig):
+    import signal
+    import subprocess
+
+    tmp_path.chmod(0o700)
+    work = tmp_path / "job"
+    marker = tmp_path / "probe.pid"
+    source = Path(prep.__file__).resolve()
+    # Run the real CLI lifecycle with a controlled readiness probe. This uses
+    # verify_runtime's actual Runner path, including its process group owner.
+    code = f'''
+import importlib.util, sys
+sys.path.insert(0, {str(source.parent)!r})
+spec = importlib.util.spec_from_file_location("preparation_fixture", {str(source)!r})
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+m.android_build_api = lambda: 24
+m.PROBES = (("blocked", ("-c", "import os,time; from pathlib import Path; Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(30)")),)
+def prepare(runner, source, report, reinstall):
+    report["scenarios"]["fresh_install"] = "in_progress"
+    original = runner.run
+    def run(name, argv):
+        if name.endswith("-identity"):
+            return
+        return original(name, argv)
+    runner.run = run
+    m.verify_runtime(runner, sys.executable, "fresh-readiness")
+m.prepare = prepare
+raise SystemExit(m.main(["--work-dir", {str(work)!r}]))
+'''
+    env = dict(os.environ)
+    env.pop("ANDROID_API_LEVEL", None)
+    with subprocess.Popen([sys.executable, "-c", code], env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, start_new_session=True) as driver:
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                if driver.poll() is not None:
+                    pytest.fail(driver.communicate()[1])
+                time.sleep(0.02)
+            assert marker.exists()
+            driver.send_signal(sig)
+            stdout, _ = driver.communicate(timeout=5)
+        finally:
+            if driver.poll() is None:
+                os.killpg(driver.pid, signal.SIGKILL)
+                driver.wait()
+    report = json.loads(stdout)
+    assert report["status"] == "error"
+    assert report["stages"][-1]["status"] == "cancelled"
+    assert report["scenarios"]["fresh_install"] == "fail"
+    assert json.loads((work / "receipt.json").read_text()) == report
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(marker.read_text()), 0)  # The direct probe was reaped.

@@ -73,7 +73,8 @@ remain applicable.
 
 One shared command deadline (maximum two hours) covers tool checks, builds,
 installation and verification. Timed-out commands and their process groups
-are killed and reaped. `--jobs` allows one or two Cargo jobs. A 2 GiB free-space
+are killed and reaped; SIGINT/SIGTERM also cancel the active group and retain
+a failure receipt. SIGKILL or power loss cannot provide a completed receipt. `--jobs` allows one or two Cargo jobs. A 2 GiB free-space
 preflight is a minimum check, **not a disk or memory quota**. Allow more space
 for failures and repeated runs. The job confines pip cache, Cargo target and
 temporary build files; Cargo's default shared registry remains outside it.
@@ -84,9 +85,10 @@ Stdout and `receipt.json` contain phase status, timing, source/tool/wheel
 hashes and actual lifecycle results. Logs and receipts are owner-only (0600)
 inside an owner-only directory (0700). Child output remains in private logs;
 inspect and redact it before sharing. A failed install is recorded as failed,
-not as a readiness success. The readiness observer's own lifecycle fields
-remain `not_run`; the preparation receipt reports the operations actually
-performed by this driver.
+not as a readiness success. The driver reuses the observer's four canonical
+probe commands directly, so it owns their process groups during cancellation.
+Runtime identity is saved separately in private phase logs; the preparation
+receipt reports the lifecycle operations actually performed by this driver.
 
 Keep the source checkout and all successful/failed job artifacts until a
 separate staging/promotion and recovery plan (#1527) is complete. Copying only
