@@ -109,6 +109,9 @@ class Rehearsal:
         provider = shutil.which("true")
         if not all((self.bash, self.shell, provider)):
             raise RuntimeError("rehearsal requires bash, sh and true")
+        self.shell = str(Path(self.shell).resolve())
+        if any(char.isspace() for char in self.shell):
+            raise RuntimeError("rehearsal shell interpreter path cannot contain whitespace")
         host_bins = dict.fromkeys(str(Path(tool).parent) for tool in (self.bash, self.shell, provider))
         # Explicit service/CLI stubs; ambient executables and state never select
         # a production manager, provider or platform wake-lock implementation.
@@ -323,7 +326,7 @@ def test_cleanup_reaps_private_probe_session_and_preserves_unrelated_sentinel(re
 
 
 def test_fixture_uses_nonstandard_host_tools_without_inheriting_credentials(tmp_path, monkeypatch):
-    host = tmp_path / "host-tools"
+    host = tmp_path / "host tools"
     host.mkdir()
     for name in ("bash", "sh", "true"):
         resolved = shutil.which(name)
@@ -339,10 +342,35 @@ def test_fixture_uses_nonstandard_host_tools_without_inheriting_credentials(tmp_
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == str(host / "true")
         # Exercise the generated interpreter wrapper, including its host shell.
-        probe = subprocess.run(["python3", "-c", "import os; assert 'OPENAI_API_KEY' not in os.environ"],
+        probe = subprocess.run([str(r.bin / "python3"), "-c", "import os; assert 'OPENAI_API_KEY' not in os.environ"],
                                env=r.env, capture_output=True, text=True, timeout=5)
         assert probe.returncode == 0, probe.stderr
-        manager = subprocess.run(["systemctl"], env=r.env, capture_output=True, timeout=5)
+        # Explicit execution fails safely on a broken shebang instead of PATH
+        # searching past our fixture and invoking a real host command.
+        assert shutil.which("systemctl", path=r.env["PATH"]) == str(r.bin / "systemctl")
+        manager = subprocess.run([str(r.bin / "systemctl")], env=r.env, capture_output=True, timeout=5)
         assert manager.returncode == 1
+        blocked = subprocess.run([str(r.bin / "python3"), "-m", "pip", "install", "--no-index",
+                                  "--disable-pip-version-check", "--no-deps", str(root / "missing.whl")],
+                                 env=r.env, capture_output=True, timeout=5)
+        assert blocked.returncode == 99
+        assert r.forbidden_install.exists()
     finally:
         r.close()
+
+
+def test_fixture_rejects_real_shell_path_with_whitespace(tmp_path, monkeypatch):
+    host = tmp_path / "real host tools"
+    host.mkdir()
+    for name in ("bash", "true"):
+        resolved = shutil.which(name)
+        assert resolved
+        (host / name).symlink_to(resolved)
+    shell = shutil.which("sh")
+    assert shell
+    shutil.copy2(shell, host / "sh")
+    monkeypatch.setenv("PATH", str(host))
+    root = tmp_path / "rehearsal"
+    with pytest.raises(RuntimeError, match="interpreter path cannot contain whitespace"):
+        Rehearsal(root)
+    assert list((root / "bin").iterdir()) == []

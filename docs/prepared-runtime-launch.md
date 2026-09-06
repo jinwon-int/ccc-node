@@ -236,11 +236,16 @@ native/SDK dependencies and pytest available. Keep the serving checkout and
 venv unchanged. The fixture resolves `bash`, `sh` and the harmless `true`
 provider command from the host tool directory, puts its own manager/wake-lock
 stubs first on the child PATH, and retains the Termux Python base prefix.
+Stub shebangs use the resolved shell executable; an executable whose actual
+path still contains whitespace is refused before writing the stubs.
 It does not inherit provider credentials or the serving HOME. Python 3.14's
 `sys.platform == "android"` is explicitly supported; a skipped test is not a
 successful device rehearsal. Where Android Python omits `os.link`, the journal
-fixture uses Termux's `ln` and verifies that both paths share the same inode
-with link count two; the hardlink rejection test is still executed.
+fixture tries Termux's `ln` and verifies that both paths share the same inode
+with link count two. If Android denies creation with a permission error, those
+hardlink cases are explicitly skipped: the journal's hardlink rejection was
+not exercised on that device. Other command errors fail. Both real hardlink
+paths remain covered on Linux CI.
 
 Pass a **new** private `--basetemp` directory to retain each run's source/venv
 copies, process logs and phase records for inspection. Pytest can delete an

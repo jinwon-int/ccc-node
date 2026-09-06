@@ -1,6 +1,7 @@
 """Transition lease and immutable phase records fail closed on unsafe evidence."""
 import json
 import os
+import sys
 
 import pytest
 
@@ -89,10 +90,17 @@ def test_unsafe_lease_metadata_is_rejected(tmp_path, kind, monkeypatch):
             if hasattr(os, "link"):
                 os.link(saved, owner)
             else:
-                # Android Python omits os.link; Termux's ln can still create
-                # the real fixture inode. Do not silently skip this invariant.
+                # Try the real host tool when Python omits os.link. Android
+                # may deny even same-directory links; report that capability
+                # limit explicitly instead of claiming the guard was tested.
                 import subprocess
-                subprocess.run(["ln", "--", str(saved), str(owner)], check=True, capture_output=True)
+                result = subprocess.run(["ln", "--", str(saved), str(owner)], capture_output=True,
+                                        text=True, env={**os.environ, "LC_ALL": "C"})
+                if (sys.platform == "android" and result.returncode == 1
+                        and result.stderr.rstrip().endswith((": Permission denied", ": Operation not permitted"))):
+                    assert not owner.exists()
+                    pytest.skip("Android denied hardlink creation; journal hardlink guard not exercised")
+                assert result.returncode == 0, result.stderr
             assert owner.stat().st_ino == saved.stat().st_ino
             assert owner.stat().st_nlink == 2
         elif kind == "fifo":
@@ -218,3 +226,17 @@ def test_post_archive_sync_failure_retains_evidence_but_may_release_lease(tmp_pa
     assert (run / "01-rejected.json").exists()
     assert not (run.parent / "active").exists()
     assert begin(tmp_path) != run
+
+
+@pytest.mark.parametrize("platform, error, skipped", [
+    ("android", "ln: Permission denied", True),
+    ("android", "ln: unrecognized option", False),
+    ("linux", "ln: Permission denied", False),
+])
+def test_hardlink_capability_refusal_does_not_mask_other_failures(tmp_path, monkeypatch, platform, error, skipped):
+    import subprocess
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 1, "", error))
+    with pytest.raises(pytest.skip.Exception if skipped else AssertionError):
+        test_unsafe_lease_metadata_is_rejected(tmp_path, "hardlink_cli", monkeypatch)
