@@ -65,7 +65,8 @@ run_case() {
     case "$CASE" in launchd*) touch "$PLIST_FILE" ;; esac
     RC=0
     # shellcheck disable=SC2034  # assertions evaluate RC via ok()
-    ( SECONDS=0; do_stop ) > "$STATE/output" 2>&1 || RC=$?
+    # Unset removes Bash's wall-clock specialness: only fake sleep advances it.
+    ( unset SECONDS; SECONDS=0; do_stop ) > "$STATE/output" 2>&1 || RC=$?
 }
 for mode in foreground daemon unmanaged; do
     run_case "$mode"
