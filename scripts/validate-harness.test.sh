@@ -316,6 +316,49 @@ ok "a referenced subdirectory hook missing from disk fails check 6" \
 ok "a referenced subdirectory hook missing from the walk fails check 6a" \
   'grep -Fq "ERR: setup.sh does not install referenced hook: sub/dir-hook.sh" <<<"$missing_out"'
 
+# --- #1548: membership checks must consume a large producer completely ------
+# Exercise the real reference and full-tree checks, with an inventory larger
+# than a pipe buffer. The physical tree stays small so this fixture is cheap.
+PARITY_SRC="$(sed -n '/^tree_parity_ok=1$/,/^\[ "$tree_parity_ok" = 1 \]/p' "$VALIDATE")"
+ok "full-tree parity block is present" '[ -n "$PARITY_SRC" ]'
+LARGE_FIX="$TMPD/large-hooks"
+mkdir -p "$LARGE_FIX/claude/hooks/lib"
+touch "$LARGE_FIX/claude/hooks/lib/autonomy-guard.sh" "$LARGE_FIX/claude/hooks/lib/absent.sh"
+touch "$LARGE_FIX/claude/hooks/lib/README.md"
+large_inventory_probe() {
+  (
+    cd "$LARGE_FIX" || exit 1
+    # shellcheck disable=SC2030,SC2031
+    ROOT="$LARGE_FIX"
+    err() { echo "ERR: $*"; }
+    say() { echo "SAY: $*"; }
+    ccc_hook_tree_files() {
+      local i
+      local -a names=(lib/autonomy-guard.sh)
+      for ((i=0; i<6000; i++)); do names+=("lib/long-fixture-hook-name-$i.sh"); done
+      names+=(lib/final.sh)
+      printf '%s\n' "${names[@]}"
+    }
+    REFS=(/root/.claude/hooks/lib/autonomy-guard.sh /root/.claude/hooks/lib/final.sh /root/.claude/hooks/lib/absent.sh)
+    eval "$INSTALL_SRC"
+    eval "$PARITY_SRC"
+  )
+}
+# shellcheck disable=SC2034 # consumed by eval assertions.
+large_out="$(large_inventory_probe)"
+ok "first member in large inventory is accepted by reference check" \
+  'grep -Fxq "SAY:   ok setup.sh installs lib/autonomy-guard.sh" <<<"$large_out"'
+ok "last member in large inventory is accepted by reference check" \
+  'grep -Fxq "SAY:   ok setup.sh installs lib/final.sh" <<<"$large_out"'
+ok "present physical hook is never reported missing by parity check" \
+  '! grep "^ERR:" <<<"$large_out" | grep -F autonomy-guard.sh >/dev/null'
+ok "absent reference is still rejected" \
+  'grep -Fq "ERR: setup.sh does not install referenced hook: lib/absent.sh" <<<"$large_out"'
+ok "undeployed physical hook is still rejected" \
+  'grep -Fq "ERR: claude/hooks/lib/absent.sh is not deployed" <<<"$large_out"'
+ok "documented README exclusion remains accepted" \
+  '! grep "^ERR:" <<<"$large_out" | grep -F README.md >/dev/null'
+
 # Deliberately NOT asserted here: that all 81 registered suites honour the
 # contract. Conformance is a property of a suite's *output*, and the source
 # spellings vary legitimately (`echo "----"; echo "PASS=..."` on one line,
