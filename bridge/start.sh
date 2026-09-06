@@ -10,6 +10,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
 PREPARED_RUNTIME=""
+RECOVERY_SOURCE=""
+RECOVERY_RUNTIME=""
+RECOVERY_REPORT=""
+TRANSITION_RUN=""
 REQ_FILE="$SCRIPT_DIR/requirements.txt"
 ENV_FILE="$SCRIPT_DIR/.env"
 
@@ -113,6 +117,11 @@ while [ $# -gt 0 ]; do
             PREPARED_RUNTIME="$2"
             shift 2
             ;;
+        --recovery-source|--recovery-runtime)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "$1 requires a directory" >&2; exit 2; }
+            if [ "$1" = --recovery-source ]; then RECOVERY_SOURCE="$2"; else RECOVERY_RUNTIME="$2"; fi
+            shift 2
+            ;;
         --debug)
             export BOT_DEBUG=1
             export LOG_LEVEL=DEBUG
@@ -188,6 +197,8 @@ Options:
   --path <dir>        Set project root directory (required for all actions)
   -d, --daemon        Run bot in background (default: foreground)
   --prepared-runtime <dir>  Use a sealed preparation job without installing dependencies
+  --recovery-source <dir>   Previous bridge source for one opt-in recovery attempt
+  --recovery-runtime <dir>  Previous preparation job (requires prepared --restart)
   --debug             Enable debug/verbose logging
   --status            Show whether the bot is running
   --stop              Stop the running bot
@@ -234,6 +245,16 @@ if [ -n "$PREPARED_RUNTIME" ]; then
     esac
     case "$PREPARED_RUNTIME" in /*) ;; *) PREPARED_RUNTIME="$PWD/$PREPARED_RUNTIME" ;; esac
     VENV_DIR="$PREPARED_RUNTIME/runtime"
+fi
+if [ -n "$RECOVERY_SOURCE$RECOVERY_RUNTIME" ]; then
+    if [ "$ACTION" != restart ] || [ -z "$PREPARED_RUNTIME" ] \
+        || [ -z "$RECOVERY_SOURCE" ] || [ -z "$RECOVERY_RUNTIME" ] \
+        || [ -n "${CCC_BRIDGE_RESTART_SPAWN:-}" ]; then
+        echo "Recovery requires prepared --restart, both previous directories, and the default spawn command" >&2
+        exit 2
+    fi
+    case "$RECOVERY_SOURCE" in /*) ;; *) RECOVERY_SOURCE="$PWD/$RECOVERY_SOURCE" ;; esac
+    case "$RECOVERY_RUNTIME" in /*) ;; *) RECOVERY_RUNTIME="$PWD/$RECOVERY_RUNTIME" ;; esac
 fi
 
 echo "🤖 Claude Telegram Bot Bridge"
@@ -1171,6 +1192,45 @@ restart_live_old_pids() {
     done < <(find_project_bot_pids)
 }
 
+transition_phase() { # <phase> [exit-code]; validated reports arrive on stdin
+    [ -n "$TRANSITION_RUN" ] || return 0
+    python3 -I -B "$SCRIPT_DIR/prepared_transition.py" advance --run "$TRANSITION_RUN" \
+        --phase "$1" --exit-code "${2:-0}" || {
+        echo "❌ Transition evidence failed; inspect retained attempt: $TRANSITION_RUN" >&2
+        exit 9
+    }
+}
+
+verify_previous_serving() { # <earliest-process-start>
+    local pid
+    pid="$(read_pid)"
+    [ -n "$pid" ] && stop_pid_alive "$pid" || return 1
+    printf '%s\n' "$RECOVERY_REPORT" | python3 -I -B "$SCRIPT_DIR/prepared_serving.py" \
+        --health-file "$HEALTH_FILE" --pid "$pid" --not-before "$1" \
+        --max-age "$HEALTH_STALE_SECONDS" || return 1
+    [ "$(read_pid)" = "$pid" ] && stop_pid_alive "$pid"
+}
+
+finish_prepared_restart_failure() { # Only after old stop completed and launch was attempted.
+    local candidate_rc="$1" recovery_rc=0 recovery_boundary
+    [ -n "$TRANSITION_RUN" ] || exit "$candidate_rc"
+    transition_phase candidate_failed "$candidate_rc"
+    echo "↩️  Candidate failed; attempting the explicitly retained previous source/runtime once."
+    recovery_boundary="$(date -u +%s)"
+    local recovery_args=(--path "$PROJECT_ROOT" --prepared-runtime "$RECOVERY_RUNTIME" --restart)
+    [ "$DAEMON_MODE" -eq 0 ] || recovery_args+=(--daemon)
+    bash "$RECOVERY_SOURCE/start.sh" "${recovery_args[@]}" || recovery_rc=$?
+    if [ "$recovery_rc" -eq 0 ] && verify_previous_serving "$recovery_boundary"; then
+        transition_phase recovered "$candidate_rc"
+        echo "⚠️  Candidate update failed; previous prepared generation restored. Evidence: $TRANSITION_RUN"
+        exit 7
+    fi
+    [ "$recovery_rc" -ne 0 ] || recovery_rc=4
+    transition_phase recovery_failed "$recovery_rc"
+    echo "❌ Candidate and recovery failed; retain both environments and inspect: $TRANSITION_RUN" >&2
+    exit 8
+}
+
 do_restart() {
     local stop_timeout="${CCC_BRIDGE_RESTART_STOP_TIMEOUT:-15}"
     # Was 45s; bumped to 90 after gongyung 2026-08-05: a self-update-triggered
@@ -1235,16 +1295,38 @@ do_restart() {
     # Pre-flight BEFORE touching the running bot: fail while the old instance
     # is still up rather than after the stop (the 2026-07-19 mode where the
     # bot stayed down because the start half could not resolve its token).
+    if [ -n "$RECOVERY_SOURCE" ]; then
+        TRANSITION_RUN="$(python3 -I -B "$SCRIPT_DIR/prepared_transition.py" begin \
+            --root "$BOT_DATA_DIR/runtime-transitions" --candidate-source "$SCRIPT_DIR" \
+            --candidate-runtime "$PREPARED_RUNTIME" --previous-source "$RECOVERY_SOURCE" \
+            --previous-runtime "$RECOVERY_RUNTIME" --launcher-pid "$$")" || exit 6
+        echo "📝 Prepared transition evidence: $TRANSITION_RUN"
+    fi
     merge_env_files
-    check_env
+    if [ -n "$TRANSITION_RUN" ]; then
+        if ! (check_env); then transition_phase rejected 6; exit 6; fi
+    else
+        check_env
+    fi
     if [ -n "$PREPARED_RUNTIME" ]; then
         # Pin the exact successful pre-stop identity; never replace it with a
         # later receipt or infer the selected generation from generic status.
         prepared_report="$(validate_prepared_runtime)" || {
             printf '%s\n' "$prepared_report"
+            transition_phase rejected 6
             exit 6
         }
         printf '%s\n' "$prepared_report"
+    fi
+    if [ -n "$TRANSITION_RUN" ]; then
+        if ! RECOVERY_REPORT="$("$RECOVERY_RUNTIME/runtime/bin/python" -I -B \
+            "$RECOVERY_SOURCE/prepared_runtime.py" --bridge-dir "$RECOVERY_SOURCE" \
+            --prepared-dir "$RECOVERY_RUNTIME")" || ! verify_previous_serving 1; then
+            echo "❌ Previous prepared pair is invalid or does not match the current healthy process." >&2
+            transition_phase rejected 6
+            exit 6
+        fi
+        printf '%s\n%s\n' "$prepared_report" "$RECOVERY_REPORT" | transition_phase validated || exit 9
     fi
 
     RESTART_OLD_PID="$(read_pid)"
@@ -1259,6 +1341,7 @@ do_restart() {
     # exits.
     if ! ( do_stop ); then
         echo "❌ Restart failed: stop-failed (--stop path exited nonzero)"
+        transition_phase stop_failed 1
         exit 1
     fi
 
@@ -1273,11 +1356,13 @@ do_restart() {
     if [ -n "$live" ]; then
         echo "❌ Restart failed: stop-failed — old process refuses to exit after ${stop_timeout}s (PID(s): $live)"
         echo "   Not starting a new instance on top of it."
+        transition_phase stop_failed 1
         exit 1
     fi
 
     # Start via the same code paths the plain flags use, pinned to THIS
     # checkout's start.sh (a wrong-checkout start.sh was a 2026-07-19 mode).
+    transition_phase launching
     launched_after="$(date -u +%s)"
     local spawn_args=("--path" "$PROJECT_ROOT")
     [ -n "$PREPARED_RUNTIME" ] && spawn_args+=("--prepared-runtime" "$PREPARED_RUNTIME")
@@ -1286,7 +1371,7 @@ do_restart() {
         # Same path as `start.sh --path <p> --daemon`.
         if ! "${spawn_launcher[@]}" "$spawn_cmd" "${spawn_args[@]}" --daemon; then
             echo "❌ Restart failed: start-failed (daemon start exited nonzero)"
-            exit 2
+            finish_prepared_restart_failure 2
         fi
     else
         # Same path as a plain foreground `start.sh --path <p>` run (its own
@@ -1324,7 +1409,7 @@ do_restart() {
         fi
         if [ -n "$spawn_pid" ] && ! kill -0 "$spawn_pid" 2>/dev/null && ! is_running; then
             echo "❌ Restart failed: start-failed (spawned process exited before becoming available; see $restart_log)"
-            exit 2
+            finish_prepared_restart_failure 2
         fi
         sleep 1
         waited=$((waited + 1))
@@ -1338,13 +1423,14 @@ do_restart() {
         echo "── last status ──"
         restart_status_snapshot
         echo "💡 The new process (if any) was left running — inspect with: $0 --path \"$PROJECT_ROOT\" --status"
-        exit 4
+        finish_prepared_restart_failure 4
     fi
 
     new_pid="$(read_pid)"
     echo "✅ Restart verified: bot available (old PID: ${RESTART_OLD_PID:-none} → new PID: ${new_pid:-unknown})"
     echo "── health ──"
     restart_status_snapshot
+    transition_phase candidate_available
     exit 0
 }
 

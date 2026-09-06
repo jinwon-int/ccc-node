@@ -4,6 +4,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Add opt-in prepared restart with one explicit retained source/runtime recovery
+  attempt, private transition evidence and distinct recovery outcomes (#1572, #1527).
+
 - Rehearse explicit prepared-generation recovery across two real source/venv
   pairs, including candidate and recovery failures with retained artifacts
   (#1570, #1527).

@@ -148,10 +148,10 @@ class Rehearsal:
         (work / "receipt.json").chmod(0o600)
         self.generations[label] = (source, work)
 
-    def command(self, label: str, action="--restart"):
+    def command(self, label: str, action="--restart", extra_args=(), timeout=45):
         source, work = self.generations[label]
         command = ["bash", str(source / "start.sh"), "--path", str(self.project),
-                   "--prepared-runtime", str(work), action]
+                   "--prepared-runtime", str(work), action, *extra_args]
         # Keep stdout in a file: a healthy detached bot must not hold a parent's
         # capture pipe open. Retain logs for pytest's assertion diagnostics.
         log = self.root / f"command-{len(self.groups)}.log"
@@ -160,7 +160,7 @@ class Rehearsal:
                                      stderr=subprocess.STDOUT, start_new_session=True)
             self.groups.append(child.pid)
             try:
-                rc = child.wait(timeout=45)
+                rc = child.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
