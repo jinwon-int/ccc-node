@@ -8,6 +8,7 @@ import json
 import os
 import stat
 import sys
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -856,12 +857,36 @@ async def test_session_guard_defers_codex_rss_recycle_until_all_turns_are_idle(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("publish_delay", [0.0, 0.3], ids=["normal", "slow-persistence"])
 async def test_stop_holds_session_guard_until_stale_interrupt_finishes(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    publish_delay: float,
 ) -> None:
+    process_globals = ProjectChatHandler.process_message.__globals__
+    real_publish = process_globals["publish_active_turn"]
+    publish_calls = []
+
+    def delayed_publish(*args, **kwargs):
+        # Keep the real offloaded write; model scheduling/storage latency above
+        # the former 0.2s completion deadline without blocking the event loop.
+        time.sleep(publish_delay)
+        publish_calls.append(True)
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setitem(process_globals, "publish_active_turn", delayed_publish)
     session = BlockingInterruptSession("reused")
     runtime = FakeRuntime()
     handler = _handler(tmp_path, runtime)
+    contended = asyncio.Event()
+
+    class ObservedLock(asyncio.Lock):
+        async def acquire(self):
+            if self.locked():
+                contended.set()
+            return await super().acquire()
+
+    handler._session_guard_lock = ObservedLock()
     key = (7, 70)
     handler._agent_session_registry.put_cached(
         key,
@@ -873,23 +898,41 @@ async def test_stop_holds_session_guard_until_stale_interrupt_finishes(
         started_at=1.0,
     )
 
+    # These are hang watchdogs, not a latency contract. The ordering assertion
+    # is gated by actual lock contention, never by elapsed time or sleep(0).
+    watchdog = 5.0
     stopping = asyncio.create_task(handler.stop(7, 70))
-    await asyncio.wait_for(session.interrupt_started.wait(), timeout=0.2)
-    replacement = asyncio.create_task(
-        handler.process_message("replacement", 7, 70)
-    )
-    await asyncio.sleep(0)
+    tasks = [stopping]
+    try:
+        await asyncio.wait_for(session.interrupt_started.wait(), timeout=watchdog)
+        replacement = asyncio.create_task(
+            handler.process_message("replacement", 7, 70)
+        )
+        tasks.append(replacement)
+        await asyncio.wait_for(contended.wait(), timeout=watchdog)
 
-    assert handler._agent_session_registry.active_handle_if_same(first) is not None
-    assert session.messages == []
+        assert not stopping.done()
+        assert not replacement.done()
+        assert handler._agent_session_registry.active_handle_if_same(first) is not None
+        assert session.messages == []
+        assert publish_calls == []
 
-    session.interrupt_release.set()
-    assert await asyncio.wait_for(stopping, timeout=0.2)
-    response = await asyncio.wait_for(replacement, timeout=0.2)
+        session.interrupt_release.set()
+        assert await asyncio.wait_for(stopping, timeout=watchdog)
+        response = await asyncio.wait_for(replacement, timeout=watchdog)
 
-    assert response.success
-    assert session.messages == ["replacement"]
-    assert session.interrupt_calls == 1
+        assert response.success
+        assert session.messages == ["replacement"]
+        assert session.interrupt_calls == 1
+        assert publish_calls == [True]
+    finally:
+        session.interrupt_release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), timeout=watchdog
+        )
 
 
 @pytest.mark.anyio
