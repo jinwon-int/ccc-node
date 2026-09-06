@@ -147,8 +147,25 @@ kill "$SELF_PARENT" 2>/dev/null || true
 wait "$SELF_PARENT" 2>/dev/null || true
 SELF_PARENT=""
 
+# ---- invalid prepared runtime must fail before stopping the old bot ---------
+new_project prepared-invalid "123456:TEST-prepared-invalid"
+OLD="$( ( sleep 300 >/dev/null 2>&1 & echo $! ) )"
+echo "$OLD" >> "$SPAWNED_PIDS"
+echo "$OLD" > "$BD/bot.pid"
+run env HOME="$HOMEDIR" CCC_SYSTEMD_DIR="$SD_EMPTY" CCC_SYSTEMCTL="$SC_OK" \
+    bash "$START" --path "$PROJ" --prepared-runtime "$TMP/missing-runtime" --restart
+okc "$RC" 6 "invalid prepared runtime fails before stop"
+ok "invalid preparation leaves previous process alive" 'kill -0 "$OLD" 2>/dev/null'
+ok "invalid preparation preserves PID" '[ "$(cat "$BD/bot.pid")" = "$OLD" ]'
+kill "$OLD" 2>/dev/null
+
 # ---- foreground restart: replaces the PID and verifies availability ---------
 new_project fg "123456:TEST-restart-fg"
+PREPARED="$TMP/prepared job"; mkdir -p "$PREPARED/runtime/bin"
+# Shell-plumbing fixture only: Python tests cover the real seal/probe checker.
+write_exec_stub "$PREPARED/runtime/bin/python" <<'SH'
+exit 0
+SH
 OLD="$( ( sleep 300 >/dev/null 2>&1 & echo $! ) )"
 echo "$OLD" >> "$SPAWNED_PIDS"
 echo "$OLD" > "$BD/bot.pid"
@@ -168,7 +185,7 @@ EOF
 run env HOME="$HOMEDIR" CCC_SYSTEMD_DIR="$SD_EMPTY" CCC_SYSTEMCTL="$SC_OK" \
     CCC_BRIDGE_RESTART_SPAWN="$FAKE_FG" \
     CCC_BRIDGE_RESTART_STOP_TIMEOUT=5 CCC_BRIDGE_RESTART_READY_TIMEOUT=15 \
-    bash "$START" --path "$PROJ" --restart
+    bash "$START" --path "$PROJ" --prepared-runtime "$PREPARED" --restart
 NEW="$(cat "$BD/bot.pid" 2>/dev/null)"
 [ -n "$NEW" ] && echo "$NEW" >> "$SPAWNED_PIDS"
 okc "$RC" 0 "foreground restart exits 0 on verified-available"
@@ -179,6 +196,7 @@ ok "restart reports the old PID" 'grep -q "old PID: $OLD" "$OUT"'
 ok "restart reports the new PID" 'grep -q "new PID: $NEW" "$OUT"'
 ok "restart prints the availability health summary" \
    'grep -q "Bot status: available" "$OUT" && grep -q "Restart verified" "$OUT"'
+ok "restart forwards prepared directory to child" 'grep -q -- "--prepared-runtime $PREPARED" "$CALLS"'
 ok "spawn used the project path" 'grep -q -- "--path $PROJ" "$CALLS"'
 ok "foreground spawn did not pass --daemon" '! grep -q -- "--daemon" "$CALLS"'
 kill "$NEW" 2>/dev/null

@@ -19,9 +19,11 @@ import time
 if __package__:
     from .dependency_bootstrap import android_build_api
     from .runtime_readiness import PROBES
+    from .prepared_runtime import source_seal
 else:
     from dependency_bootstrap import android_build_api
     from runtime_readiness import PROBES
+    from prepared_runtime import source_seal
 
 NATIVE = ("cryptography", "jiter", "pydantic-core", "rpds-py", "pyromark")
 BUILD_TOOLS = ("setuptools", "packaging", "cffi", "pycparser")
@@ -180,6 +182,7 @@ def provenance(runner: Runner) -> dict:
 
 def prepare(runner: Runner, source: Path, report: dict, reinstall: bool) -> None:
     work = runner.work
+    report["source_seal"] = source_seal(source)
     report["toolchain"] = provenance(runner)
     report["lock_sha256"] = {}
     for name, path, subset in (
@@ -220,6 +223,8 @@ def prepare(runner: Runner, source: Path, report: dict, reinstall: bool) -> None
         runner.run("reinstall-reconcile", bootstrap)
         verify_runtime(runner, runtime, "reinstall-readiness")
         report["scenarios"]["reinstall"] = "pass"
+    if source_seal(source) != report["source_seal"]:
+        raise PreparationError("source_changed_during_preparation")
 
 
 def verify_runtime(runner: Runner, runtime: str, name: str) -> None:

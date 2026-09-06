@@ -98,6 +98,10 @@ For a new isolated runtime when pip attempts to compile maturin itself, use
 locked native packages with the existing distro backend, verifies a new venv,
 and can exercise a real forced reinstall before any service transition.
 
+A sealed preparation job can be selected with `--prepared-runtime <job>`.
+See [prepared runtime launch and recovery](../docs/prepared-runtime-launch.md)
+for the pre-stop gate, retained environment paths and explicit recovery flow.
+
 ## Quick Start
 
 ```bash
