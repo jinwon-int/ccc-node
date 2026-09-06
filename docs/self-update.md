@@ -60,8 +60,9 @@ redeployment when an earlier installed marker exists. A successful preflight
 commits the new marker before installer reapply and service restart: failure
 in those later phases does not mean setup was rolled back. The marker does
 not attest runtime health or the bridge venv. A missing marker on an otherwise
-up-to-date first tick still adopts HEAD under the existing bootstrap policy;
-per-file doctor checks remain necessary for that case. Degraded rollback
+up-to-date, unforced first tick still adopts HEAD under the existing bootstrap
+policy. Per-file doctor checks remain necessary for that case. Forced first
+deployments commit only after setup and preflight. Degraded rollback
 continues to require inspection of its audit and retained recovery snapshot.
 
 `ccc-self-update.sh status` is the read-only inspection mode.

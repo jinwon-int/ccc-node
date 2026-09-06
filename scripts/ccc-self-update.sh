@@ -583,7 +583,9 @@ if [ "$CHANGED" = "false" ] && [ -n "$INSTALLED_SHA" ] && [ "$INSTALLED_SHA" != 
   log "install-drift installed=$INSTALLED_SHA checkout=$NEW_SHA reason=checkout-advanced-without-setup"
   OLD_SHA="$INSTALLED_SHA"
   CHANGED=true
-elif [ "$CHANGED" = "false" ] && [ -z "$INSTALLED_SHA" ]; then
+elif [ "$CHANGED" = "false" ] && [ -z "$INSTALLED_SHA" ] && [ "$FORCE" != "1" ]; then
+  # Only an ordinary no-change tick adopts HEAD. A forced first deployment
+  # must wait for setup and its config preflight before recording success.
   printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || log "warn installed-sha marker write failed path=$INSTALLED_SHA_FILE"
 fi
 
