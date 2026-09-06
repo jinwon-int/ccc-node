@@ -78,7 +78,8 @@ For read-only preflight using the same selected interpreter:
 
 ```bash
 "$source/bridge/venv/bin/python" -I -B "$source/bridge/restart_preflight.py" \
-  --bridge-dir "$source/bridge" --venv-dir "$source/bridge/venv"
+  --bridge-dir "$source/bridge" --venv-dir "$source/bridge/venv" \
+  --project-env "$project/.telegram_bot/.env"
 ```
 
 A refusal means prepare a compatible source/environment pair using the above
