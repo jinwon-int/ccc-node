@@ -119,3 +119,38 @@ These are already handled in this repo — just be aware of them:
   (JS→native transition — when/if resolved, this blocker disappears).
 - Same-device evidence: [gtbuchanan/claude-code-termux#20](https://github.com/gtbuchanan/claude-code-termux/issues/20),
   [AveryRPeterson/android-termux-claude#2](https://github.com/AveryRPeterson/android-termux-claude/issues/2).
+
+## Isolated native validation after dependency changes (#1525)
+
+Ubuntu/Python 3.14 CI is useful compatibility coverage, but is not Android
+linker evidence. On a Termux test device, record Android ABI, Python version,
+source SHA, dependency-lock hash, patchelf version and timestamp before testing.
+Use an owner-only disposable directory and a separate venv; never use the
+serving bridge venv or start another Telegram poller for this check.
+
+1. Install the hash-pinned runtime lock into the isolated venv using the same
+   bootstrap path and platform environment as the node. Preserve installation
+   failure diagnostics without raw environment variables or task bodies.
+2. Import `cryptography.exceptions`, `cryptography.hazmat.bindings._rust`,
+   `cryptography.hazmat.primitives.ciphers.aead.AESGCM` and `claude_agent_sdk`.
+   Perform an AES-GCM round trip with generated throwaway bytes. No model or
+   Telegram request is needed.
+3. If the libpython linkage defect recurs, call
+   `termux_native.ensure_termux_cryptography(python, venv, env, stdout)` from the
+   checked-out source. Use the actual isolated Python and venv paths; the
+   helper takes its own venv lock. Require a successful return and repeat the
+   imports/round trip in a fresh Python process.
+4. Reinstall the same pinned cryptography artifact into the isolated venv,
+   repeat bootstrap/repair and import checks, and verify that two concurrent
+   bootstraps serialize. Keep original extension hashes and owner-only repair
+   backups until evidence review finishes.
+5. Inject an invalid repair candidate only in the disposable fixture; verify
+   a nonzero result, preserved original bytes and an explicit recovery path.
+   Missing patchelf and a non-linker import error must fail closed.
+
+Report each step as pass/fail/not-run with the platform and versions; do not
+turn Linux mocks or a single import into a claim of Android rollout safety.
+#1522 supplied one-time real-device evidence. #1525 remains open until a device
+runner collects this evidence automatically and a separately scoped update
+recovery check passes. Environment staging and full dependency rollback are
+tracked in #1527; native binary repair alone does not provide that rollback.
