@@ -108,6 +108,21 @@ _PendingRequest = project_chat._PendingRequest
 _sys_modules_guard.finish()
 
 
+async def _wait_until(predicate, *, timeout: float = 5.0) -> None:
+    """Bounded poll for a condition that lands off the event loop (#1537).
+
+    Ledger writes are offloaded to a worker thread (#1479), so a single
+    ``asyncio.sleep(0)`` tick does not guarantee the write has landed on a
+    loaded runner. Same 5s completion cap as the #1516 waits.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() > deadline:
+            raise AssertionError("condition was not reached in time")
+        await asyncio.sleep(0.01)
+
+
 class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._orig_interval = project_chat.TYPING_INTERVAL
@@ -343,8 +358,14 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             req.task_id = await self.handler._ledger_create(1, 2)
             await self._start_loop(req)
             await asyncio.wait_for(self.status_event.wait(), timeout=5.0)
-            await asyncio.sleep(0)  # let the registration write land
-            records = self.handler._task_ledger.records()
+            led = self.handler._task_ledger
+            # The registration write runs in a worker thread after the status
+            # callback returns; poll until it lands instead of one loop tick.
+            await _wait_until(
+                lambda: len(led.records()) == 1
+                and led.records()[0].get("status_message_id") == 1234
+            )
+            records = led.records()
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["status_message_id"], 1234)
             self.assertEqual(records[0]["state"], "working")
