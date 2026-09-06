@@ -373,7 +373,7 @@ okc "$RC" 0 "launchd uninstall exits 0"
 ok "uninstall removed the plist" '[ ! -f "$PLIST" ]'
 ok "uninstall booted the service out" 'grep -q "bootout" "$LC_CALLS"'
 ok "uninstall removed the stale pid file" '[ ! -f "$LPROJ/.telegram_bot/bot.pid" ]'
-ok "uninstall cleared the stale token lock" '[ ! -f "$LOCK" ]'
+ok "uninstall clears the stale PID while preserving the token lock file" '[ -f "$LOCK" ] && [ ! -s "$LOCK" ]'
 run env HOME="$FH" CCC_LAUNCHCTL="$LC_STUB" bash "$SLD" uninstall --project-root "$LPROJ"
 okc "$RC" 0 "second launchd uninstall exits 0 (idempotent)"
 ok "second uninstall reports not installed" 'grep -q "not installed" "$OUT"'

@@ -125,37 +125,18 @@ cleanup_supervisor_pid() {
 }
 
 cleanup_token_lock() {
-    [ -n "$TOKEN_LOCK_FILE" ] && rm -f "$TOKEN_LOCK_FILE"
+    [ -n "$TOKEN_LOCK_FILE" ] || return 0
+    # Keep the flock inode stable. If Python is unavailable, retain stale
+    # bookkeeping for the next claimant instead of splitting the lock domain.
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 -I -B "$SCRIPT_DIR/token_lock.py" --path "$TOKEN_LOCK_FILE" \
+        --expected-pid "${1:-$$}" --expected-pid "${2:-0}" --held-fd 8 \
+        >/dev/null 2>&1 || true
 }
 
-# Same policy as start.sh cleanup_token_lock_if_safe, except the lock path is
-# handed in via CCC_BRIDGE_TOKEN_LOCK_FILE (start.sh derives it with
-# init_token_lock before dispatching). Without a lock path we skip cleanup.
 cleanup_token_lock_if_safe() {
-    local expected_pid_1="$1"
-    local expected_pid_2="$2"
-    local lock_pid
-
-    [ -n "$TOKEN_LOCK_FILE" ] || return 0
-    [ -f "$TOKEN_LOCK_FILE" ] || return 0
-
-    lock_pid="$(cat "$TOKEN_LOCK_FILE" 2>/dev/null)"
-    if [ -z "$lock_pid" ]; then
-        cleanup_token_lock
-        return 0
-    fi
-
-    if [ -n "$expected_pid_1" ] && [ "$lock_pid" = "$expected_pid_1" ]; then
-        cleanup_token_lock
-        return 0
-    fi
-    if [ -n "$expected_pid_2" ] && [ "$lock_pid" = "$expected_pid_2" ]; then
-        cleanup_token_lock
-        return 0
-    fi
-    if ! kill -0 "$lock_pid" 2>/dev/null; then
-        cleanup_token_lock
-    fi
+    # Eligibility and PID reads happen inside the kernel lock, not here.
+    cleanup_token_lock "$1" "$2"
 }
 
 do_install() {

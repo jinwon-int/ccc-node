@@ -263,8 +263,27 @@ ok "flock and python tiers are silent about the fallback" \
   '! grep -q "mkdir fallback" "$TMP/h-flock.out" "$TMP/h-python.out"'
 ok "mkdir tier leaves no reclaim token behind" '[ ! -e "$TOKEN_LOCK_FILE.d.reclaim" ]'
 ( cleanup_token_lock )
-ok "cleanup removes the pid file and the fallback claim dir" \
-  '[ ! -e "$TOKEN_LOCK_FILE" ] && [ ! -e "$TOKEN_LOCK_FILE.d" ]'
+ok "cleanup preserves the stable lock inode and clears stale PID metadata" \
+  '[ -f "$TOKEN_LOCK_FILE" ] && [ ! -s "$TOKEN_LOCK_FILE" ]'
+for lock_mode in flock python; do
+  case "$lock_mode" in
+    flock) unset CCC_FLOCK_CLI ;;
+    python) export CCC_FLOCK_CLI="$TMP/no-such-flock" ;;
+  esac
+  (
+    acquire_token_lock "$BASHPID" || exit 1
+    before_inode="$(python3 -c 'import os,sys;print(os.stat(sys.argv[1]).st_ino)' "$TOKEN_LOCK_FILE")"
+    cleanup_token_lock "$BASHPID" 0
+    after_inode="$(python3 -c 'import os,sys;print(os.stat(sys.argv[1]).st_ino)' "$TOKEN_LOCK_FILE")"
+    [ "$before_inode" = "$after_inode" ] && [ ! -s "$TOKEN_LOCK_FILE" ] || exit 2
+    # Drop the inherited descriptor in the contender; it needs a genuinely
+    # separate open description, like an unrelated launcher.
+    ( exec 8>&-; acquire_token_lock "$BASHPID" >/dev/null 2>&1 && exit 3; exit 0 )
+  )
+  # shellcheck disable=SC2034  # consumed via eval inside ok()
+  inode_rc=$?
+  ok "[$lock_mode] cleanup retains inode and excludes a second claimant" '[ "$inode_rc" = 0 ]'
+done
 unset CCC_FLOCK_CLI
 # Call-site pins: both run paths claim atomically BEFORE prepare_runtime, and
 # nothing else writes the pid into the lock file any more.

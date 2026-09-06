@@ -93,6 +93,30 @@ The wildcard does not grant arbitrary service control: the immutable wrapper
 accepts only `restart <exact-unit.service>` and rechecks the root-owned
 allowlist before invoking `/usr/bin/systemctl`.
 
+### Token lock lifetime
+
+The token PID file under `~/.telegram-bot-locks/` also carries the kernel
+`flock`. Cleanup retains that file and its inode; an empty file after shutdown
+is intentional. Unlinking it while any holder still has its descriptor open
+would let another launcher create a new inode and acquire a second lock.
+
+Shell stop/supervisor cleanup, launchd uninstall and Python health cleanup use
+`bridge/token_lock.py`. It reads PID metadata only under a nonblocking lock,
+reuses the inherited holder descriptor when appropriate, and clears an
+eligible PID in place with mode 0600. Closing the helper does not unlock the
+holder's descriptor. Busy locks and live foreign claims are preserved;
+symlinks, hardlinks, unsafe parents and malformed metadata are not changed.
+If Python or safe cleanup is unavailable, stale bookkeeping stays for the
+existing next-claim recovery path. The no-Python mkdir fallback is retained,
+but it is not the kernel-lock guarantee used by a running Python bridge.
+
+All cleanup writers must use this protocol. Older checkouts or external
+scripts that delete/replace token lock files can still split the lock inode;
+update those writers together before relying on this across a fleet
+transition. Do not remove active lock files during maintenance. This change
+protects cleanup versus acquisition; it does not serialize every lifecycle
+command or prove an end-to-end production single-poller transition.
+
 ### Bridge restart drain
 
 Canonical Linux bridge units use a bounded graceful-restart contract. On the
