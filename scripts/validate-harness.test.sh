@@ -134,7 +134,7 @@ disco_probe() { # <manifest assignments> -> ERR/RC/array dump of one discover_pl
   )
 }
 FIX_MANIFEST='HARNESS_EXCLUDE=(b/skip.test.sh); UMASK_MARKER="# harness: umask-rerun";
-  PY_COMPILE_EXCLUDE=(bridge/ vendor/); SC_SCOPE_EXTRA=(extra/hook); SC_WARN_BASELINE=(s2.sh)'
+  PY_COMPILE_EXCLUDE=(bridge/ vendor/); SC_SCOPE_EXTRA=(extra/hook)'
 # shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
 disco_out="$(disco_probe "$FIX_MANIFEST")"
 ok "suites = every tracked *.test.sh in index order minus HARNESS_EXCLUDE (untracked stays invisible)" \
@@ -147,26 +147,25 @@ ok "umask set = suites with the marker in the leading comment block only" \
 ok "py_compile = tracked *.py minus PY_COMPILE_EXCLUDE prefixes" \
   '[ "$(grep "^PY=" <<<"$disco_out" | tr "\n" " ")" = "PY=x.py " ]'
 # *.test.sh files are *.sh too, so suites are linted as well (as on main).
-ok "shellcheck scope = tracked *.sh + SC_SCOPE_EXTRA - SC_WARN_BASELINE" \
-  '[ "$(grep "^SC=" <<<"$disco_out" | tr "\n" " ")" = "SC=a/one.test.sh SC=a/two.test.sh SC=b/skip.test.sh SC=c/noshebang.test.sh SC=extra/hook SC=s1.sh " ]'
+# Nothing is carved out: the SC_WARN_BASELINE ratchet is retired (#1510).
+ok "shellcheck scope = every tracked *.sh + SC_SCOPE_EXTRA (no baseline)" \
+  '[ "$(grep "^SC=" <<<"$disco_out" | tr "\n" " ")" = "SC=a/one.test.sh SC=a/two.test.sh SC=b/skip.test.sh SC=c/noshebang.test.sh SC=extra/hook SC=s1.sh SC=s2.sh " ]'
 ok "no stale-manifest finding when every manifest entry is tracked" \
   '! grep -q "^ERR: stale" <<<"$disco_out"'
 
 # Stale manifest entries (file gone / never tracked) must fail, not rot.
 # shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
 stale_out="$(disco_probe 'HARNESS_EXCLUDE=(b/gone.test.sh); UMASK_MARKER="# harness: umask-rerun";
-  PY_COMPILE_EXCLUDE=(bridge/); SC_SCOPE_EXTRA=(extra/nope); SC_WARN_BASELINE=(s2.sh missing.sh)')"
+  PY_COMPILE_EXCLUDE=(bridge/); SC_SCOPE_EXTRA=(extra/nope extra/hook)')"
 ok "stale HARNESS_EXCLUDE entry is a finding" \
   'grep -Fxq "ERR: stale HARNESS_EXCLUDE entry (not tracked): b/gone.test.sh" <<<"$stale_out"'
-ok "stale SC_SCOPE_EXTRA entry is a finding" \
-  'grep -Fxq "ERR: stale SC_SCOPE_EXTRA entry (not tracked): extra/nope" <<<"$stale_out"'
-ok "stale SC_WARN_BASELINE entry is a finding; tracked entries are not" \
-  'grep -Fxq "ERR: stale SC_WARN_BASELINE entry (not tracked): missing.sh" <<<"$stale_out" && ! grep -Fq "not tracked): s2.sh" <<<"$stale_out"'
+ok "stale SC_SCOPE_EXTRA entry is a finding; tracked entries are not" \
+  'grep -Fxq "ERR: stale SC_SCOPE_EXTRA entry (not tracked): extra/nope" <<<"$stale_out" && ! grep -Fq "not tracked): extra/hook" <<<"$stale_out"'
 
 # The umask-0002 contract (#770) must never silently lose all coverage.
 # shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
 nomarker_out="$(disco_probe 'HARNESS_EXCLUDE=(); UMASK_MARKER="# harness: never-declared";
-  PY_COMPILE_EXCLUDE=(bridge/); SC_SCOPE_EXTRA=(); SC_WARN_BASELINE=(s2.sh)')"
+  PY_COMPILE_EXCLUDE=(bridge/); SC_SCOPE_EXTRA=()')"
 ok "an empty umask-rerun set is a finding" \
   'grep -q "^ERR: no suite declares .# harness: never-declared." <<<"$nomarker_out"'
 
@@ -204,6 +203,71 @@ ok "real repo: py_compile scope excludes bridge/ and is non-empty" \
   '[ "$(grep -c "^py_compile" <<<"$plan_out")" -gt 0 ] && ! grep -q "^py_compile${TAB}bridge/" <<<"$plan_out"'
 ok "real repo: warning-level shellcheck scope includes the suffix-less git hook" \
   'grep -Fxq "shellcheck-warning${TAB}scripts/git-hooks/managed-checkout-guard" <<<"$plan_out"'
+# #1510 retired the SC_WARN_BASELINE ratchet: the warning-level scope is the
+# whole tracked *.sh set plus the suffix-less extras, with nothing carved out.
+ok "real repo: warning-level shellcheck scope == every tracked *.sh + SC_SCOPE_EXTRA (no baseline)" \
+  'diff <(awk -F"\t" "\$1==\"shellcheck-warning\"{print \$2}" <<<"$plan_out") <(cd "$ROOT" && git ls-files -- "*.sh" scripts/git-hooks/managed-checkout-guard) >/dev/null'
+ok "the SC_WARN_BASELINE manifest and its ratchet are gone from validate-harness.sh" \
+  '! grep -q "SC_WARN_BASELINE=" "$VALIDATE" && ! grep -q "ratchet:" "$VALIDATE"'
+
+# --- #1510: a NEW warning in ANY tracked script fails the static phase --------
+# With the baseline retired there is no list a finding can hide in. Run the
+# real discovery + shellcheck blocks inside a fixture repo (same sandbox
+# pattern as the discovery tests above): a clean tree passes, and adding one
+# tracked script with a warning-level finding (SC2034, the very code the old
+# baseline was full of) turns the phase red while the error-level backstop
+# stays green — proving it is the warning-level bar that caught it.
+SC_SRC="$(sed -n '/^# 3) shellcheck — warning level/,/^# 3b) python syntax/p' "$VALIDATE")"
+ok "shellcheck block (check 3/3a) is present in validate-harness.sh" \
+  '[ -n "$SC_SRC" ] && grep -q "severity=warning" <<<"$SC_SRC" && grep -q "severity=error" <<<"$SC_SRC"'
+if command -v shellcheck >/dev/null 2>&1; then
+  SCFIX="$HOSTILE/shellcheck-fixture"
+  mkdir -p "$SCFIX"
+  printf '#!/usr/bin/env bash\n# harness: umask-rerun\nset -u\n' > "$SCFIX/a.test.sh"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "clean"\n' > "$SCFIX/clean.sh"
+  git -C "$SCFIX" init -q 2>/dev/null
+  git -C "$SCFIX" add -A 2>/dev/null
+  SC_MANIFEST='HARNESS_EXCLUDE=(); UMASK_MARKER="# harness: umask-rerun"; PY_COMPILE_EXCLUDE=(); SC_SCOPE_EXTRA=()'
+  sc_probe() { # <fixture-root> -> SAY/ERR lines of discovery + shellcheck, then FAIL=<0|1>
+    (
+      cd "$1" || exit 1
+      err() { echo "ERR: $*"; fail=1; }
+      say() { echo "SAY: $*"; }
+      fail=0
+      eval "$SC_MANIFEST"
+      eval "$DISCOVERY_SRC"
+      discover_plan
+      eval "$SC_SRC"
+      echo "FAIL=$fail"
+    )
+  }
+  # shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+  sc_clean_out="$(sc_probe "$SCFIX")"
+  ok "clean tree: warning-level shellcheck passes with every tracked script in scope" \
+    'grep -Fxq "FAIL=0" <<<"$sc_clean_out" && grep -Fxq "SAY:   ok clean.sh" <<<"$sc_clean_out" && grep -Fxq "SAY:   ok a.test.sh" <<<"$sc_clean_out"'
+  ok "clean tree: scope line reports every tracked script and no baseline" \
+    'grep -Fxq "SAY:   ok warning-level scope: 2 script(s) (every tracked *.sh + 0 extra, no baseline)" <<<"$sc_clean_out"'
+  # One new tracked script carrying a warning-level finding.
+  printf '#!/usr/bin/env bash\nunused_here=1\n' > "$SCFIX/warn.sh"
+  git -C "$SCFIX" add -A 2>/dev/null
+  # shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+  sc_warn_out="$(sc_probe "$SCFIX")"
+  ok "a new warning-level finding in a tracked script fails the phase" \
+    'grep -Fxq "FAIL=1" <<<"$sc_warn_out" && grep -Fxq "ERR: shellcheck: warn.sh" <<<"$sc_warn_out"'
+  ok "the failing script is named; the clean ones still report ok" \
+    'grep -Fxq "SAY:   ok clean.sh" <<<"$sc_warn_out" && ! grep -Fxq "SAY:   ok warn.sh" <<<"$sc_warn_out"'
+  ok "the error-level backstop alone would not have caught it (warning-level bar is load-bearing)" \
+    'grep -Fq "SAY:   ok repo-wide shellcheck (severity=error, 3 scripts)" <<<"$sc_warn_out"'
+  # An untracked script stays out of scope: discovery reads the index.
+  printf '#!/usr/bin/env bash\nalso_unused=1\n' > "$SCFIX/untracked.sh"
+  git -C "$SCFIX" rm -q --cached warn.sh 2>/dev/null; rm -f "$SCFIX/warn.sh"
+  # shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+  sc_untracked_out="$(sc_probe "$SCFIX")"
+  ok "an untracked script is not linted (index, not tree)" \
+    'grep -Fxq "FAIL=0" <<<"$sc_untracked_out" && ! grep -Fq "untracked.sh" <<<"$sc_untracked_out"'
+else
+  echo "SKIP: shellcheck absent — fail-on-new-warning fixture not exercised (CI installs shellcheck)"
+fi
 
 # --- suite summary-line contract ------------------------------------------
 # The harness echoes each suite's own `PASS=<n> FAIL=<n>` tally. A suite that

@@ -55,7 +55,7 @@ contributor has to know:
 | hook-test suites | every tracked `*.test.sh`, index (byte) order | `HARNESS_EXCLUDE` — suites deliberately not run (empty today) | no shebang = FAIL; stale exclude = FAIL; git missing = FAIL (fail closed) |
 | umask-0002 re-runs | suites whose leading comment block carries the exact line `# harness: umask-rerun` | the marker itself (`UMASK_MARKER`) | empty set = FAIL |
 | `py_compile` | every tracked `*.py` outside `PY_COMPILE_EXCLUDE` prefixes | `PY_COMPILE_EXCLUDE=(bridge/)` — bridge has its own pytest/mypy | empty scope = FAIL |
-| shellcheck (warning level) | every tracked `*.sh` plus `SC_SCOPE_EXTRA` (suffix-less scripts) minus `SC_WARN_BASELINE` | `SC_WARN_BASELINE` — scripts with pre-existing warning-level findings | stale entry = FAIL; entry that became clean = FAIL (ratchet: remove it) |
+| shellcheck (warning level) | every tracked `*.sh` plus `SC_SCOPE_EXTRA` (suffix-less scripts) — nothing carved out | `SC_SCOPE_EXTRA` only (the `SC_WARN_BASELINE` ratchet was burned down and retired in #1510) | stale entry = FAIL; any warning-level finding in any tracked script = FAIL |
 
 Practical rules:
 
@@ -66,10 +66,11 @@ Practical rules:
   does not satisfy the harness result contract. If it must also pass under
   umask 0002 (permission-contract suites, #770), put `# harness: umask-rerun`
   on its own line in the header comment block, before the first non-comment line.
-- A new `*.sh` is shellcheck-linted at warning level from its first commit.
-  Never add a new script to `SC_WARN_BASELINE`; fix the findings instead.
-  When you clean a baseline script, remove it from the baseline in the same
-  PR (the ratchet fails the run otherwise).
+- Every tracked `*.sh` is shellcheck-linted at warning level (with the
+  harness exclusions `SC2155,SC1090,SC1091`), a new one from its first
+  commit. There is no baseline to add a script to: fix the finding, or
+  justify a single-line `# shellcheck disable=SCxxxx` next to it. A
+  repo-wide error-level sweep with no exclusions runs as a backstop.
 - A new `*.py` outside `bridge/` is syntax-compiled automatically.
 - `bash scripts/validate-harness.sh --dump-plan` prints the discovered plan as
   `<kind><TAB><path>` lines (kinds: `suite`, `umask-rerun`, `py_compile`,
