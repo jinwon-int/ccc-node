@@ -51,8 +51,10 @@ c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,c
 c.commit()
 PY
 out="$(NUNCHI_DB="$OLD" python3 "$NP" init 2>&1)"
+# shellcheck disable=SC2034  # mig is read via eval inside ok()
 mig="$(NUNCHI_DB="$OLD" python3 -c "import sqlite3;print([r[1] for r in sqlite3.connect('$OLD').execute('PRAGMA table_info(facts_fts)')])")"
 ok "old DB migrated to 2-col FTS" 'grep -q "observed" <<<"$mig"'
+# shellcheck disable=SC2034  # migc is read via eval inside ok()
 migc="$(NUNCHI_DB="$OLD" python3 -c "import sqlite3;print([r[1] for r in sqlite3.connect('$OLD').execute('PRAGMA table_info(peer_facts)')])")"
 ok "old DB migrated with gate columns incl. because (G5)" \
   'grep -q "source_rank" <<<"$migc" && grep -q "review" <<<"$migc" && grep -q "because" <<<"$migc"'
@@ -103,6 +105,7 @@ print(json.dumps({
 PY
 )"
 printf '%s' "$SR_PAYLOAD" | python3 "$NP" ingest - >/dev/null
+# shellcheck disable=SC2034  # sr is read via eval inside ok()
 sr="$(python3 - "$NUNCHI_DB" "$TFILE" <<'PY'
 import json, sqlite3, sys
 row = sqlite3.connect(sys.argv[1]).execute(
@@ -127,6 +130,7 @@ out="$(python3 "$NP" refs "$FID" 2>&1)"; rc=$?
 ok "refs command renders the provenance chain" '[ "$rc" = 0 ] && grep -q "session: s12" <<<"$out" && grep -q "sha256_8" <<<"$out" && grep -q "wiki: TM-1332" <<<"$out"'
 # orphan payload: no session/transcript/citation → column stays NULL
 printf '{"distilled_at":"2026-07-31T00:00:00+00:00","honcho":[{"kind":"fact","subject":"node","text":"고아 세션 사실"}]}' | python3 "$NP" ingest - >/dev/null
+# shellcheck disable=SC2034  # nrefs is read via eval inside ok()
 nrefs="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT COUNT(*) FROM peer_facts WHERE source_refs IS NOT NULL AND fact='고아 세션 사실'\").fetchone()[0])")"
 ok "orphan payload keeps source_refs NULL" '[ "$nrefs" = "0" ]'
 # pre-#1264 DB: migration adds the column in place; refs says so
@@ -160,6 +164,7 @@ closed="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute
 ok "expired observation auto-closed on snapshot sweep" '[ "$closed" = 1 ]'
 
 # ---- 3e. mutability derivation + snapshot live-check group (#1264 P1-4) -----
+# shellcheck disable=SC2034  # mut_of is read via eval inside ok()
 mut_of="$(python3 - "$NP" <<'PY'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("nx", sys.argv[1])
@@ -184,6 +189,7 @@ ok "ingest stores derived mutability (decision=static, task-progress=volatile)" 
 # supersede successor inherits the derivation via kind
 SFID="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT id FROM peer_facts WHERE fact LIKE '%마이그레이션 진행 중%'\").fetchone()[0])")"
 python3 "$NP" supersede "$SFID" "워커 마이그레이션 2단계 진행 중" >/dev/null
+# shellcheck disable=SC2034  # sm is read via eval inside ok()
 sm="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT mutability FROM peer_facts WHERE fact LIKE '%2단계 진행 중%'\").fetchone()[0])")"
 ok "superseded successor derives mutability from inherited kind" '[ "$sm" = "volatile" ]'
 # pre-P1-4 DB: backfill classifies legacy rows on first open
@@ -203,6 +209,7 @@ nx = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nx)
 nx.db()  # open triggers migration + backfill
 PY
+# shellcheck disable=SC2034  # mm4 is read via eval inside ok()
 mm4="$(python3 - "$PRE4" <<'PY'
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
@@ -237,6 +244,7 @@ json.dump([
   "not-a-dict"
 ], open(sys.argv[1], "w"))
 PY
+# shellcheck disable=SC2034  # exp is read via eval inside ok()
 exp="$(NUNCHI_HALLWAYS_FILE="$HWFILE" python3 - "$NP" <<'PY'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("nx", sys.argv[1])
@@ -251,6 +259,7 @@ ok "1-hop expansion fires with co-occurrence ordering (alias-aware)" 'grep -q "g
 ok "other-endpoint direction works" 'grep -q "bt-q:peer-facts-only" <<<"$exp"'
 ok "no matching hallway expands to nothing" 'grep -q "nohit-q:" <<<"$exp" && ! grep -q "nohit-q:." <<<"$exp"'
 # self-entity in query never expands to itself (corpus/corpus edge + containment)
+# shellcheck disable=SC2034  # selfr is read via eval inside ok()
 selfr="$(NUNCHI_HALLWAYS_FILE="$HWFILE" python3 - "$NP" <<'PY'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("nx", sys.argv[1])
@@ -274,6 +283,7 @@ ok "malformed hallways file degrades silently" '[ "$rc" = 0 ]'
 # ---- 3f. taxonomy gate + retag (#1264 P1-5) ---------------------------------
 out="$(payload t1 measurement node "하네스 첫 구동 7/7 통과" | python3 "$NP" ingest - 2>&1)"
 ok "off-taxonomy kind kept but flagged (fail-safe, not dropped)" 'grep -q "ingested 1/1" <<<"$out" && grep -q "flagged_unknown_kind=1" <<<"$out"'
+# shellcheck disable=SC2034  # trev is read via eval inside ok()
 trev="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT review FROM peer_facts WHERE fact='하네스 첫 구동 7/7 통과'\").fetchone()[0])")"
 ok "off-taxonomy row enters review queue" '[ "$trev" = "1" ]'
 out="$(payload t2 procedure node "배포 전 스냅샷 백업 후 진행" | python3 "$NP" ingest - 2>&1)"
@@ -285,6 +295,7 @@ ok "legacy fact kind grandfathered (no mass-flag on rollout)" 'grep -q "ingested
 TID="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT id FROM peer_facts WHERE fact='하네스 첫 구동 7/7 통과'\").fetchone()[0])")"
 out="$(python3 "$NP" retag "$TID" observation 2>&1)"; rc=$?
 ok "retag retypes and recalculates mutability" '[ "$rc" = 0 ] && grep -q "kind → observation (mutability recalculated: live-check)" <<<"$out"'
+# shellcheck disable=SC2034  # mm is read via eval inside ok()
 mm="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT kind||'/'||mutability FROM peer_facts WHERE id=$TID\").fetchone()[0])")"
 ok "retagged row kind+mutability consistent" '[ "$mm" = "observation/live-check" ]'
 out="$(python3 "$NP" retag "$TID" philosophy 2>&1)"; rc=$?
@@ -305,18 +316,24 @@ c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,c
 c.commit()
 PY
 ASM="$(python3 "$NP" assemble --budget 8192 --hint "HINT-TARGET" 2>&1)"
+# shellcheck disable=SC2034  # nline is read via eval inside ok()
 nline="$(grep -n "HINT-TARGET 프록시" <<<"$ASM" | cut -d: -f1)"
+# shellcheck disable=SC2034  # f1line is read via eval inside ok()
 f1line="$(grep -n "FILLER-ONE" <<<"$ASM" | cut -d: -f1)"
 ok "hint-matched older fact ranks above newer fillers" '[ -n "$nline" ] && [ -n "$f1line" ] && [ "$nline" -lt "$f1line" ]'
 ok "constraints always included" 'grep -q "CONSTRAINT-RULE-7749" <<<"$ASM"'
 ok "observation kind excluded from assembly" '! grep -q "TEMP-OBS" <<<"$ASM"'
+# shellcheck disable=SC2034  # SMALL is read via eval inside ok()
 SMALL="$(python3 "$NP" assemble --budget 400 --hint "HINT-TARGET" 2>&1)"
 ok "tiny budget: constraints still present" 'grep -q "CONSTRAINT-RULE-7749" <<<"$SMALL"'
 ok "tiny budget: top-ranked fact survives the cut" 'grep -q "HINT-TARGET" <<<"$SMALL"'
+# shellcheck disable=SC2034  # total is read via eval inside ok()
 total="$(python3 "$NP" assemble --budget 8192 --hint "HINT-TARGET" | wc -c)"
 ok "output stays within the byte budget" '[ "$total" -le 8192 ]'
 NOHINT="$(python3 "$NP" assemble --budget 8192 2>&1)"
+# shellcheck disable=SC2034  # ft is read via eval inside ok()
 ft="$(grep -n "FILLER-TWO" <<<"$NOHINT" | cut -d: -f1)"
+# shellcheck disable=SC2034  # fo is read via eval inside ok()
 fo="$(grep -n "FILLER-ONE" <<<"$NOHINT" | cut -d: -f1)"
 ok "hint-less assembly falls back to pure recency (newest first)" '[ -n "$ft" ] && [ -n "$fo" ] && [ "$ft" -lt "$fo" ]'
 ok "live-check marker renders inline in assembly" 'grep -q "^- ⟳ (.*/context) FILLER-ONE" <<<"$ASM"'
@@ -372,16 +389,21 @@ ok "recall by Korean alias expands to slug" 'grep -q "코덱스 러너" <<<"$out
 # ---- 5. B2: correction auto-supersede --------------------------------------
 payload s3 fact user "메인 모델은 opus-5 이다" | python3 "$NP" ingest - >/dev/null
 payload s4 correction user "메인 모델은 opus-5 아니라 fable-5 이다" | python3 "$NP" ingest - >/dev/null
+# shellcheck disable=SC2034  # closed is read via eval inside ok()
 closed="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT COUNT(*) FROM peer_facts WHERE fact LIKE '%opus-5 이다' AND valid_to IS NOT NULL\").fetchone()[0])")"
+# shellcheck disable=SC2034  # link is read via eval inside ok()
 link="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT supersedes IS NOT NULL FROM peer_facts WHERE fact LIKE '%fable-5 이다'\").fetchone()[0])")"
 ok "correction closes best-overlap fact (B2)" '[ "$closed" = 1 ]'
 ok "correction row links supersedes (B2)" '[ "$link" = 1 ]'
+# shellcheck disable=SC2034  # before is read via eval inside ok()
 before="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute('SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NOT NULL').fetchone()[0])")"
 payload s5 correction user "완전히 무관한 주제의 정정 문장" | python3 "$NP" ingest - >/dev/null
+# shellcheck disable=SC2034  # after is read via eval inside ok()
 after="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute('SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NOT NULL').fetchone()[0])")"
 ok "unrelated correction closes nothing (conservative)" '[ "$before" = "$after" ]'
 payload s6 fact user "임계 테스트 전용 사실 알파" | python3 "$NP" ingest - >/dev/null
 NUNCHI_NO_AUTO_SUPERSEDE=1 payload s7 correction user "임계 테스트 전용 사실 알파 아님" | NUNCHI_NO_AUTO_SUPERSEDE=1 python3 "$NP" ingest - >/dev/null
+# shellcheck disable=SC2034  # alpha is read via eval inside ok()
 alpha="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT valid_to IS NULL FROM peer_facts WHERE fact LIKE '%사실 알파'\").fetchone()[0])")"
 ok "NUNCHI_NO_AUTO_SUPERSEDE=1 disables B2" '[ "$alpha" = 1 ]'
 
@@ -476,8 +498,11 @@ ok "bench no-op when mode=off" '[ "$rc" = 0 ] && [ -z "$out" ]'
 # expect for the 4-column reader, so bench.sh needs no change). Contract: every
 # row has exactly 6 columns, ids are unique, and the original q1-q7 queries are
 # preserved verbatim for series continuity.
+# shellcheck disable=SC2034  # rows is read via eval inside ok()
 rows="$(tail -n +2 "$HERE/bench-qset.tsv" | grep -c .)"
+# shellcheck disable=SC2034  # badcols is read via eval inside ok()
 badcols="$(awk -F'\t' 'NF!=6' "$HERE/bench-qset.tsv" | grep -c . || true)"
+# shellcheck disable=SC2034  # dupids is read via eval inside ok()
 dupids="$(tail -n +2 "$HERE/bench-qset.tsv" | cut -f1 | sort | uniq -d | grep -c . || true)"
 ok "bench qset has 48 rows of 6 tab-separated columns, unique ids" '[ "$rows" = 48 ] && [ "$badcols" = 0 ] && [ "$dupids" = 0 ]'
 printf 'on' > "$CCC_STATE_DIR/nunchi.mode"
@@ -649,9 +674,11 @@ c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,created
 c.commit()
 PY
 NUNCHI_DB="$MDB" python3 "$NP" init >/dev/null
+# shellcheck disable=SC2034  # cols is read via eval inside ok()
 cols="$(python3 -c "import sqlite3;print([r[1] for r in sqlite3.connect('$MDB').execute('PRAGMA table_info(peer_facts)')])")"
 ok "pre-gate DB gains source_rank/review in place" \
   'grep -q "source_rank" <<<"$cols" && grep -q "review" <<<"$cols"'
+# shellcheck disable=SC2034  # mrows is read via eval inside ok()
 mrows="$(python3 -c "import sqlite3;print(sqlite3.connect('$MDB').execute('SELECT COUNT(*) FROM peer_facts').fetchone()[0])")"
 ok "pre-gate rows survive migration" '[ "$mrows" = 1 ]'
 
@@ -813,10 +840,12 @@ ok "a weekly-limit quota text is unavailable, not an answer" \
 # Cross-file constant check (#1072 precedent): the Python matcher and bench.sh's
 # shell default must not drift — a pattern known to one and not the other
 # reintroduces exactly the silent failure both exist to catch.
+# shellcheck disable=SC2034  # py_re is read via eval inside ok()
 py_re="$(python3 -c "
 import sys; sys.path.insert(0, '$HERE')
 from nunchi import SYNTH_UNAVAILABLE_RE
 print(SYNTH_UNAVAILABLE_RE.pattern)")"
+# shellcheck disable=SC2034  # sh_re is read via eval inside ok()
 sh_re="$(sed -n 's/^INVALID_RE="\${NUNCHI_BENCH_INVALID_RE:-\(.*\)}"$/\1/p' "$HERE/bench.sh")"
 ok "bench.sh and nunchi.py share one unavailable-backend pattern" \
   '[ -n "$sh_re" ] && [ "$py_re" = "$sh_re" ]'
@@ -913,6 +942,7 @@ hdialectic
 out="$(hstatus)"
 ok "backend-status escalates to outage when every backend fails" \
   'grep -q "^state: outage" <<<"$out"'
+# shellcheck disable=SC2034  # snap is read via eval inside ok()
 snap="$(hsnapshot)"
 ok "snapshot escalates its wording for a full backend outage" \
   'grep -q "전멸" <<<"$snap"'
@@ -934,10 +964,12 @@ ok "backend-status clears back to ok once the primary is healthy again" \
 # a no-record phrasing known to one file and not the other silently rescores
 # retrieval quality — that is exactly how gwakga's q6 paraphrase was counted
 # as a success.
+# shellcheck disable=SC2034  # py_nr is read via eval inside ok()
 py_nr="$(python3 -c "
 import sys; sys.path.insert(0, '$HERE')
 from nunchi import NO_RECORD_RE
 print(NO_RECORD_RE.pattern)")"
+# shellcheck disable=SC2034  # sh_nr is read via eval inside ok()
 sh_nr="$(sed -n 's/^NO_RECORD_RE="\${NUNCHI_BENCH_NO_RECORD_RE:-\(.*\)}"$/\1/p' "$HERE/bench.sh")"
 ok "bench.sh and nunchi.py share one no-record pattern" \
   '[ -n "$sh_nr" ] && [ "$py_nr" = "$sh_nr" ]'
@@ -975,6 +1007,7 @@ row="$(python3 -c "import sqlite3;print(*sqlite3.connect('$NUNCHI_DB').execute(\
 ok "G5: structured because stored, not flagged" '[ "$row" = "0 디스크 상한 80% 정책 때문" ]'
 
 out="$(printf '%s' '{"session_id":"sg5-live","distilled_at":"2026-08-25T00:00:00+00:00","decision_reason_contract":"required-v1","honcho":[{"kind":"decision","subject":"node","text":"위험 때문에 라이브 전환을 보류했다"},{"kind":"decision","subject":"node","text":"파일럿을 이틀 유지하기로 결정","because":"유입률 표본이 아직 둘뿐이기 때문"}]}' | CCC_NODE=nosuk python3 "$NP" ingest - 2>&1)"
+# shellcheck disable=SC2034  # stored_inline is read via eval inside ok()
 stored_inline="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT count(*) FROM peer_facts WHERE fact LIKE '%라이브 전환%'\").fetchone()[0])")"
 ok "live reason contract rejects inline-only decision before storage" \
   'grep -q "ingested 1/2" <<<"$out" && grep -q "skipped_reasonless_decisions=1" <<<"$out" && [ "$stored_inline" = 0 ]'
@@ -1044,11 +1077,14 @@ PY
 out="$(python3 "$NP" merge "$M_B" --into "$M_A" 2>&1)"; rc=$?
 ok "#1336 merge closes the duplicate" '[ "$rc" = 0 ] && grep -q "merged into" <<<"$out"'
 row="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute('SELECT valid_to IS NOT NULL FROM peer_facts WHERE id=$M_B').fetchone()[0])")"
+# shellcheck disable=SC2034  # evdup is read via eval inside ok()
 evdup="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute('SELECT evidence FROM peer_facts WHERE id=$M_B').fetchone()[0])")"
 ok "#1336 dup row closed, history intact, merged-away marker kept" \
   '[ "$row" = 1 ] && [[ "$evdup" == *"ev-b"* ]] && [[ "$evdup" == *"merged-away:#$M_A"* ]]'
+# shellcheck disable=SC2034  # row is read via eval inside ok()
 row="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute('SELECT valid_to IS NOT NULL FROM peer_facts WHERE id=$M_A').fetchone()[0])")"
 ok "#1336 survivor stays open" '[ "$row" = 0 ]'
+# shellcheck disable=SC2034  # sur is read via eval inside ok()
 sur="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute('SELECT evidence FROM peer_facts WHERE id=$M_A').fetchone()[0])")"
 ok "#1336 survivor evidence carries the merged marker" '[[ "$sur" == *"merged:#$M_B"* ]]'
 out="$(python3 "$NP" merge "$M_B" --into "$M_A" 2>&1)"; rc=$?
@@ -1073,6 +1109,7 @@ cands = [('claude', ['claude']), ('codex', ['codex']), ('piri', ['piri'])]
 print(' '.join(n for n, _ in nunchi._apply_synth_order(cands)))
 ")"
 ok "unset NUNCHI_SYNTH_ORDER keeps default order" '[ "$order_out" = "claude codex piri" ]'
+# shellcheck disable=SC2034  # order_out is read via eval inside ok()
 order_out="$(NUNCHI_SYNTH_ORDER="ghost,p,PirI" python3 -c "
 import sys; sys.path.insert(0, '$HERE')
 import nunchi
@@ -1131,17 +1168,23 @@ ok "#1478 ingest waits out a short lock holder (busy timeout) and stores the fac
   '[ "$rc" = 0 ] && grep -q "ingested 1/1" <<<"$out"'
 # (b) snapshot.md atomicity: temp file replaced, no leftovers, content == stdout.
 out="$(cc python3 "$NP" snapshot --limit 5 2>/dev/null)"
+# shellcheck disable=SC2034  # leftovers is read via eval inside ok()
 leftovers="$(find "$cc_home" -name '*snapshot.md*' ! -name snapshot.md | wc -l)"
 ok "#1478 snapshot.md written atomically: no temp leftovers, non-empty" \
   '[ "$leftovers" = 0 ] && [ -s "$CSNAP" ]'
 ok "#1478 snapshot.md content equals printed snapshot (utf-8)" '[ "$(cat "$CSNAP")" = "$out" ]'
 # WAL opt-out: NUNCHI_SQLITE_JOURNAL=delete reverts the DB on an uncontended open.
 NUNCHI_SQLITE_JOURNAL=delete cc python3 "$NP" init >/dev/null
+# shellcheck disable=SC2034  # jm is read via eval inside ok()
 jm="$(python3 -c "import sqlite3;print(sqlite3.connect('$CDB').execute('PRAGMA journal_mode').fetchone()[0])")"
 ok "#1478 NUNCHI_SQLITE_JOURNAL=delete opts out of WAL" '[ "$jm" = "delete" ]'
-out="$(NUNCHI_SQLITE_JOURNAL=delete cc python3 "$NP" snapshot --limit 5 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(NUNCHI_SQLITE_JOURNAL=delete cc python3 "$NP" snapshot --limit 5 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "#1478 snapshot still works in rollback-journal mode" '[ "$rc" = 0 ] && grep -q "CC-CONSTRAINT" <<<"$out"'
 # (c) the session-scope predicate is served by idx_observed (EXPLAIN QUERY PLAN).
+# shellcheck disable=SC2034  # plan is read via eval inside ok()
 plan="$(cc python3 - "$HERE" "$CDB" <<'PY'
 import sqlite3, sys
 sys.path.insert(0, sys.argv[1])
@@ -1168,7 +1211,9 @@ nunchi._record_backend_outcome("claude", "codex" if int(sys.argv[2]) % 2 else "c
 PY
 done
 wait
+# shellcheck disable=SC2034  # bh_n is read via eval inside ok()
 bh_n="$(python3 -c "import json;print(len(json.load(open('$bh', encoding='utf-8'))['history']))")"
+# shellcheck disable=SC2034  # bh_left is read via eval inside ok()
 bh_left="$(find "$cc_home" -name '*backend-health.json.*' ! -name 'backend-health.json.lock' | wc -l)"
 ok "#1478 8 concurrent health appends all land (flock RMW)" '[ "$bh_n" = 8 ]'
 ok "#1478 health file replaced atomically: no temp leftovers" '[ "$bh_left" = 0 ]'

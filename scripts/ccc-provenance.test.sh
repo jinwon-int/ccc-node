@@ -95,7 +95,10 @@ ok "--upgrade fails when installed checkout identity cannot be derived" '[ "$rc"
 ok "missing post-update identity does not claim completion" '! grep -q "Upgrade complete" <<<"$out"'
 
 : > "$TMP/update.log"
-out="$(env "${COMMON_ENV[@]}" FAKE_UPDATE_RC=8 bash "$FIXTURE/bridge/start.sh" --path "$TMP/project" --upgrade 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${COMMON_ENV[@]}" FAKE_UPDATE_RC=8 bash "$FIXTURE/bridge/start.sh" --path "$TMP/project" --upgrade 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "--upgrade preserves canonical updater deferred exit" '[ "$rc" = 8 ]'
 ok "--upgrade failure does not claim completion" '! grep -q "Upgrade complete" <<<"$out"'
 

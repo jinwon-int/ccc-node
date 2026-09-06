@@ -3,7 +3,9 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LIB="$ROOT/scripts/lib/harness-paths.sh"
+# shellcheck disable=SC2034  # SETUP is read via eval inside ok()
 SETUP="$ROOT/setup.sh"
+# shellcheck disable=SC2034  # SELFUP is read via eval inside ok()
 SELFUP="$ROOT/scripts/ccc-self-update.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
@@ -32,6 +34,7 @@ ok "shared implementation stays portable" \
 if [ -r "$LIB" ]; then
   # shellcheck source=/dev/null
   . "$LIB"
+  # shellcheck disable=SC2034  # expected is read via eval inside ok()
   expected="settings.json hooks output-styles headless.sh agents commands skills CLAUDE.md memories"
   ok "managed paths have one canonical ordered definition" '[ "${CCC_MANAGED_PATHS[*]}" = "$expected" ]'
   # settings.local.json is the node-local approvals file and must NOT be managed (#454).

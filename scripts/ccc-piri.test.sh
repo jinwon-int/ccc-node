@@ -192,7 +192,9 @@ real_abs="$TMP/real-abs"
 chmod 0700 "$real_abs"
 : > "$order"; : > "$stub_log"
 set +e
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(printf 'stdin data' | PATH="$stubdir:$PATH" ORDER_FILE="$order" ARGV_FILE="$argv" CWD_FILE="$cwd_file" ENV_FILE="$env_file" MAT_RC=0 STATUS_RC=1 REAL_RC=23 CCC_PIRI_MEMORY_HOME="$piri_home" CCC_PIRI_MEMORY_MATERIALIZER_PATH="$mat" CCC_PIRI_REAL_CLI_PATH="$real_abs" "$LAUNCHER" --mode rpc 2>"$err")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 set -e
 ok "absolute-shebang real CLI still execs directly" \

@@ -51,8 +51,10 @@ ok "scoped root joined with audience name" 'grep -q "private-aud" <<<"$out"'
 ok "audience root target present with action" \
   'grep -qF "audience.state_root" <<<"$out" && grep -qF "delete-whole-root" <<<"$out" && grep -qF "\"present\": true" <<<"$out"'
 ok "unknown artifact surfaces as blocker" 'grep -qF "mystery-orphan" <<<"$out"'
+# shellcheck disable=SC2034  # before is read via eval inside ok()
 before="$(tree_sum)"
 run audience-erasure --audience private-aud >/dev/null 2>&1
+# shellcheck disable=SC2034  # after is read via eval inside ok()
 after="$(tree_sum)"
 ok "READ-ONLY: fixture tree byte-identical after runs" '[ "$before" = "$after" ]'
 
@@ -75,7 +77,9 @@ run bogus-request >/dev/null 2>&1; rc=$?
 ok "unknown request exits 3" '[ "$rc" = 3 ]'
 run audience-erasure >/dev/null 2>&1; rc=$?
 ok "audience-erasure without --audience exits 2" '[ "$rc" = 2 ]'
-run --inventory /dev/null node-decommission >/dev/null 2>&1; rc=$?
+run --inventory /dev/null node-decommission >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "schema-mismatched inventory rejected" '[ "$rc" = 2 ]'
 
 # --- 5) extra_paths + pattern classification (#873 step 4) -------------------
@@ -97,6 +101,7 @@ printf 'lock' > "$CCC_STATE_DIR/.local-memory-sink.lock"
 printf 'audit' > "$CCC_STATE_DIR/audit.jsonl"
 printf '150\n' > "$CCC_BOT_DATA_DIR/bot.pid"
 out="$(run scan --json)"
+# shellcheck disable=SC2034  # scan_unknowns is read via eval inside ok()
 scan_unknowns="$(python3 -c 'import json,sys; print("\n".join(u["path"] for u in json.load(sys.stdin)["unknown"]))' <<<"$out")"
 ok "locks classified via extra_paths" '! grep -qF ".judge.lock" <<<"$scan_unknowns"'
 ok "cron logs classified via extra_paths" '! grep -qF "cron.log" <<<"$scan_unknowns"'

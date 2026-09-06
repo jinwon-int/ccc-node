@@ -99,6 +99,7 @@ reset_db() {
 }
 
 # ---- 1. deterministic-first: no live sibling => cleared without a judge ----
+# shellcheck disable=SC2034  # id1 is read via eval inside ok()
 id1="$(seed dungae "사용자는 병렬 실행을 선호한다" "$OLD" 1 1 d1)"
 out="$(run_batch NUNCHI_JUDGE_APPLY=1)"
 ok "lonely flagged fact cleared deterministically (no judge call needed)" '[ "$(review_of "$id1")" = 0 ]'
@@ -112,7 +113,9 @@ cat >/dev/null
 printf '%s\n' '{"verdict":"clear","rationale":"duplicate restatement","supersede_proposal":null}'
 STUB
 chmod +x "$TMP/bin/claude"
+# shellcheck disable=SC2034  # id2 is read via eval inside ok()
 id2="$(seed dungae "머지는 항상 스쿼시로 한다" "$OLD" 1 1 d2)"
+# shellcheck disable=SC2034  # id3 is read via eval inside ok()
 id3="$(seed dungae "머지는 항상 스쿼시로 한다" "$OLD" 1 0 d3)"
 out="$(run_batch NUNCHI_JUDGE_APPLY=1)"
 ok "conflicting flagged fact cleared via judge verdict" '[ "$(review_of "$id2")" = 0 ]'
@@ -126,19 +129,22 @@ cat >/dev/null
 printf '%s\n' 'I cannot decide this.'
 STUB
 chmod +x "$TMP/bin/claude"
+# shellcheck disable=SC2034  # id4 is read via eval inside ok()
 id4="$(seed dungae "벤치는 월요일에 돌린다" "$OLD" 1 1 d4)"
-id5="$(seed dungae "벤치는 화요일에 돌린다" "$OLD" 1 0 d5)"
+seed dungae "벤치는 화요일에 돌린다" "$OLD" 1 0 d5 >/dev/null
 out="$(run_batch NUNCHI_JUDGE_APPLY=1)"
 ok "unparseable judge output keeps the fact flagged (fail-closed)" '[ "$(review_of "$id4")" = 1 ]'
 ok "human flag file raised" '[ -f "$CCC_STATE_DIR/nunchi-judge-human.flag" ]'
 ok "report lists the human-pending item" 'grep -q "human-pending" "$CCC_STATE_DIR/nunchi-review-report.md"'
 
 # ---- 4. freshness moat: items younger than 24h are inviolable --------------
+# shellcheck disable=SC2034  # id6 is read via eval inside ok()
 id6="$(seed dungae "신선한 플래그 항목" "$FRESH" 1 1 d6)"
 out="$(run_batch NUNCHI_JUDGE_APPLY=1)"
 ok "fresh flagged fact untouched" '[ "$(review_of "$id6")" = 1 ]'
 
 # ---- 5. dry-run mutates nothing --------------------------------------------
+# shellcheck disable=SC2034  # id7 is read via eval inside ok()
 id7="$(seed dungae "드라이런 대상" "$OLD" 1 1 d7)"
 out="$(run_batch)"
 ok "dry-run leaves every flag in place" '[ "$(review_of "$id7")" = 1 ]'
@@ -153,6 +159,7 @@ ok "CAP processes oldest first" 'grep -c "deterministic-clear" "$NUNCHI_HOME/jud
 
 # ---- 7. flock: a held lock skips the whole run ------------------------------
 reset_db
+# shellcheck disable=SC2034  # id8 is read via eval inside ok()
 id8="$(seed dungae "플록 대상" "$OLD" 1 1 d8)"
 python3 - <<'PY' &
 import fcntl, os, time
@@ -169,9 +176,11 @@ ok "locked run triaged nothing" '[ "$(review_of "$id8")" = 1 ]'
 
 # ---- 8. judge unavailable => deterministic works, conflict fail-closed -----
 reset_db
+# shellcheck disable=SC2034  # id9 is read via eval inside ok()
 id9="$(seed dungae "판단기 없음 단독 항목" "$OLD" 1 1 d9)"
+# shellcheck disable=SC2034  # id10 is read via eval inside ok()
 id10="$(seed dungae "판단기 없음 형제 갈등" "$OLD" 1 1 d10)"
-id11="$(seed dungae "판단기 없음 형제 갈등" "$OLD" 1 0 d11)"
+seed dungae "판단기 없음 형제 갈등" "$OLD" 1 0 d11 >/dev/null
 out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_CMD=definitely-not-a-real-cli)"
 ok "deterministic clear still applies without a judge CLI" '[ "$(review_of "$id9")" = 0 ]'
 ok "conflict with unavailable judge stays flagged" '[ "$(review_of "$id10")" = 1 ]'
@@ -186,8 +195,9 @@ printf '%s\n' '{"verdict":"clear","rationale":"wrapper result","supersede_propos
 STUB
 chmod +x "$TMP/bin/judge-wrapper"
 reset_db
+# shellcheck disable=SC2034  # id12 is read via eval inside ok()
 id12="$(seed dungae "래퍼 형제 갈등" "$OLD" 1 1 d12)"
-id13="$(seed dungae "래퍼 형제 갈등" "$OLD" 1 0 d13)"
+seed dungae "래퍼 형제 갈등" "$OLD" 1 0 d13 >/dev/null
 out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_CMD=judge-wrapper)"
 ok "custom command override retains Claude adapter semantics" \
   '[ "$(review_of "$id12")" = 0 ] && grep -q '\''"backend": "claude"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
@@ -215,8 +225,11 @@ ok "DB-less canonical scope skipped without error" '[ ! -f "$SCOPE_ROOT/private-
 # rule predates G5, and a reasonless decision has no such sibling, so without
 # this guard the batch would silently hide the missing reason from the owner.
 reset_db
+# shellcheck disable=SC2034  # idg1 is read via eval inside ok()
 idg1="$(seed_kind dungae decision "Honcho 유지안 기각으로 폐기 경로 확정" "$OLD" 1 1 dg1 "")"
+# shellcheck disable=SC2034  # idg2 is read via eval inside ok()
 idg2="$(seed_kind dungae decision "측정 비용 때문에 백업 자동화를 보류했다" "$OLD" 1 1 dg2 "")"
+# shellcheck disable=SC2034  # idg3 is read via eval inside ok()
 idg3="$(seed_kind dungae decision "로그 보관을 30일로 결정" "$OLD" 1 1 dg3 "디스크 상한 정책 때문")"
 NUNCHI_JUDGE_APPLY=1 run_batch
 ok "G5 reasonless decision stays flagged (never deterministic-clear)" '[ "$(review_of "$idg1")" = 1 ]'
@@ -227,9 +240,13 @@ ok "structured-because decision takes the normal deterministic path" '[ "$(revie
 
 # ---- 10. G3 batch pool mirrors ingest: cross-session siblings (#1255) ------
 reset_db
+# shellcheck disable=SC2034  # idx1 is read via eval inside ok()
 idx1="$(seed_kind session:aaa context "동일 결론이 여러 세션에서 재추출되었다" "$OLD" 1 1 dx1 "")"
+# shellcheck disable=SC2034  # idx2 is read via eval inside ok()
 idx2="$(seed_kind session:bbb context "동일 결론이 여러 세션에서 재추출되었다" "$OLD" 1 0 dx2 "")"
+# shellcheck disable=SC2034  # idx3 is read via eval inside ok()
 idx3="$(seed_kind session:ccc decision "동일 결론이 여러 세션에서 재추출되었다" "$OLD" 1 0 dx3 "다른 kind 대조")"
+# shellcheck disable=SC2034  # idx4 is read via eval inside ok()
 idx4="$(seed_kind session:ddd context "완전히 무관한 주제의 외로운 항목" "$OLD" 1 1 dx4 "")"
 out="$(run_batch NUNCHI_JUDGE_APPLY=1)"
 ok "cross-session same-kind sibling keeps the flag fail-closed" \
@@ -278,8 +295,9 @@ env | sort >"$env_file"
 STUB
 chmod +x "$TMP/bin/claude" "$TMP/bin/codex"
 export TELEGRAM_BOT_TOKEN="synthetic-must-not-cross"
+# shellcheck disable=SC2034  # idc1 is read via eval inside ok()
 idc1="$(seed dungae "Codex 폴백 형제 갈등" "$OLD" 1 1 dc1)"
-idc2="$(seed dungae "Codex 폴백 형제 갈등" "$OLD" 1 0 dc2)"
+seed dungae "Codex 폴백 형제 갈등" "$OLD" 1 0 dc2 >/dev/null
 out="$(run_batch NUNCHI_JUDGE_APPLY=1)"
 ok "auto mode falls back from failed Claude to Codex" '[ "$(review_of "$idc1")" = 0 ]'
 ok "Codex is the body-free audit winner" \
@@ -295,8 +313,9 @@ ok "winning Codex backend appears in the local report" \
 
 # A structurally invalid Codex response must not clear a flag, even in APPLY.
 reset_db
+# shellcheck disable=SC2034  # idc3 is read via eval inside ok()
 idc3="$(seed dungae "Codex 오류 형제 갈등" "$OLD" 1 1 dc3)"
-idc4="$(seed dungae "Codex 오류 형제 갈등" "$OLD" 1 0 dc4)"
+seed dungae "Codex 오류 형제 갈등" "$OLD" 1 0 dc4 >/dev/null
 printf '%s\n' bad >"$TMP/codex-mode"
 out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=codex)"
 ok "invalid Codex output fails closed to human" '[ "$(review_of "$idc3")" = 1 ]'
@@ -306,8 +325,9 @@ ok "invalid Codex failure class is sanitized in audit" \
 # Defense in depth: the local parser independently enforces the checked-in
 # schema instead of trusting an external CLI to reject extra fields.
 reset_db
+# shellcheck disable=SC2034  # idc5 is read via eval inside ok()
 idc5="$(seed dungae "Codex 스키마 형제 갈등" "$OLD" 1 1 dc5)"
-idc6="$(seed dungae "Codex 스키마 형제 갈등" "$OLD" 1 0 dc6)"
+seed dungae "Codex 스키마 형제 갈등" "$OLD" 1 0 dc6 >/dev/null
 printf '%s\n' extra >"$TMP/codex-mode"
 out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=codex)"
 ok "local parser rejects schema-extra Codex output fail-closed" '[ "$(review_of "$idc5")" = 1 ]'
@@ -315,9 +335,11 @@ ok "schema failure is body-free in audit" \
   'grep -q '\''"codex:schema-invalid"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "unexpected" "$NUNCHI_HOME/judge-audit.jsonl"'
 
 reset_db
+# shellcheck disable=SC2034  # idc7 is read via eval inside ok()
 idc7="$(seed dungae "Codex 길이 형제 갈등" "$OLD" 1 1 dc7)"
-idc8="$(seed dungae "Codex 길이 형제 갈등" "$OLD" 1 0 dc8)"
+seed dungae "Codex 길이 형제 갈등" "$OLD" 1 0 dc8 >/dev/null
 printf '%s\n' long >"$TMP/codex-mode"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=codex)"
 ok "local parser rejects overlong Codex rationale fail-closed" '[ "$(review_of "$idc7")" = 1 ]'
 ok "overlong output body is absent from audit" \
@@ -354,7 +376,9 @@ assert "Evidence-weight note" in m.build_judge_prompt(item_old, sibs), "prompt-n
 assert "Evidence-weight note" not in m.build_judge_prompt(item_fact, sibs), "prompt-clean"
 print("TTL-NOTE-OK")
 FIXTURE
-python3 "$TTLFIX" "$JB" >/dev/null 2>&1; rc=$?
+python3 "$TTLFIX" "$JB" >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "#1336 TTL-imminent observation evidence annotated in the judge prompt" '[ "$rc" = 0 ]'
 
 printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"

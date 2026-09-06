@@ -133,6 +133,7 @@ ok "manifest never carries fact text (queue content absent)" \
   '! grep -qF "머지 항목" "$MANIFEST" && ! grep -qF "대기 항목" "$MANIFEST"'
 
 # --- 7) read-only: inputs unchanged (only the manifest pair appears) ------------
+# shellcheck disable=SC2034  # BEFORE is read via eval inside ok()
 BEFORE="$(find "$CCC_BOT_DATA_DIR" "$T_HOME" -type f -exec md5sum {} + | sort | md5sum)"
 run node-decommission >/dev/null
 ok "writer leaves all inputs byte-identical" \
@@ -143,7 +144,9 @@ run bogus-request >/dev/null 2>&1; rc=$?
 ok "unknown request exits 4 (blocked)" '[ "$rc" = 4 ]'
 run audience-erasure >/dev/null 2>&1; rc=$?
 ok "audience-erasure without --audience exits 4" '[ "$rc" = 4 ]'
-run node-decommission --queue "$FIX/missing-queue.md" >/dev/null 2>&1; rc=$?
+run node-decommission --queue "$FIX/missing-queue.md" >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "unreadable --queue exits 4" '[ "$rc" = 4 ]'
 
 echo "----------------------------------------"
