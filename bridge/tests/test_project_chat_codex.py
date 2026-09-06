@@ -27,6 +27,7 @@ from telegram_bot.core.agent_runtime import (
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequestEvent,
+    ApprovalResolvedEvent,
     CompletionEvent,
     DelegatedTaskLifecycleEvent,
     ErrorEvent,
@@ -2493,7 +2494,8 @@ async def test_approval_stall_cleans_ui_rotates_lock_and_accepts_next_turn(
     )
 
     assert first.success is False
-    assert first.error == "Approval was not resolved within 0.05s"
+    # #1555: the stall names the outstanding request (body-free label).
+    assert first.error == "Approval was not resolved within 0.05s (pending: commandExecution command)"
     assert "Approval" in first.content
     assert "stalled turn was stopped" in first.content
     assert "Timed out after 5" not in first.content
@@ -2597,7 +2599,8 @@ async def test_codex_approval_pending_uses_distinct_stall_bound(
     response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=5)
 
     assert response.success is False
-    assert response.error == "Approval was not resolved within 0.05s"
+    assert response.error == "Approval was not resolved within 0.05s (pending: write_file path)"
+    assert "(pending: write_file path)" in response.content
     assert "stalled turn was stopped" in response.content
     assert stall.interrupt_calls == 1
     assert stall.closed is True
@@ -3096,4 +3099,110 @@ async def test_terminal_stall_survives_a_session_without_diagnostics(
 
     assert result.success is False
     assert "partial answer" in result.content
+    assert stalled == [1]
+
+
+class DelegatedResolvedApprovalSession(FakeSession):
+    """#1555 shape: a sub-agent tool call is approved, then only delegated work remains.
+
+    The adapter enqueues ``ApprovalResolvedEvent`` right after the handler
+    returns; no main-session frame ever follows because the sub-agent's own
+    frames are filtered from the turn stream.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.decisions: list[ApprovalDecision] = []
+        self.closed = False
+
+    def send_turn(
+        self,
+        message: str,
+        *,
+        approval_handler: ApprovalHandler = deny_approval,
+    ) -> AsyncIterator[AgentEvent]:
+        async def stream() -> AsyncIterator[AgentEvent]:
+            self.messages.append(message)
+            approval = ApprovalRequestEvent(
+                "toolu_01LGRg",
+                "Write",
+                {"file_path": "/x/lane-bridge-1555.md", "content": "checkpoint"},
+                "write a checkpoint",
+            )
+            try:
+                yield TextDeltaEvent("delegating")
+                yield DelegatedTaskLifecycleEvent(1, 0.0, "started")
+                yield approval
+                decision = await approval_handler(approval)
+                self.decisions.append(decision)
+                yield ApprovalResolvedEvent(approval.request_id, approval.action, decision)
+                yield DelegatedTaskLifecycleEvent(1, 0.01, "updated")
+                await asyncio.Event().wait()
+            finally:
+                self.closed = True
+
+        return stream()
+
+    async def interrupt(self) -> None:
+        self.interrupt_calls += 1
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.mark.anyio
+async def test_delegated_allowed_approval_does_not_trip_the_approval_stall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Reproduction of #1555: Write/Bash from a delegated task, logged
+    # outcome=allowed, then 120s later "Approval stall released agent turn".
+    # With the approval settled, only the delegated-task bound may end the turn.
+    session = DelegatedResolvedApprovalSession("thread-1")
+    handler, stalled = _stall_handler(tmp_path, FakeRuntime([session]), monkeypatch)
+    handler._config.approval_stall_seconds = 0.05
+    handler._config.terminal_stall_seconds = 0.05
+    handler._config.delegated_task_stall_seconds = 0.4
+    handler._process_timeout_seconds = 5.0
+
+    async def allow(*_args) -> ApprovalDecision:
+        return ApprovalDecision.ALLOW
+
+    response = await asyncio.wait_for(
+        handler.process_message("delegate and write", 7, 70, approval_callback=allow),
+        timeout=5,
+    )
+
+    assert session.decisions == [ApprovalDecision.ALLOW]
+    assert "Approval was not resolved" not in (response.error or "")
+    assert "Approval was not resolved" not in response.content
+    # The delegated bound (0.4s) is the only limit left to end the turn; the
+    # approval-stall metric never fires.
+    assert response.error == "Delegated work exceeded its maximum runtime"
+    assert session.interrupt_calls == 1
+    assert stalled == []
+
+
+@pytest.mark.anyio
+async def test_approval_stall_message_names_the_pending_claude_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stall = StallSession(
+        "thread-1",
+        pre_events=[
+            TextDeltaEvent("needs approval"),
+            ApprovalRequestEvent(
+                "toolu_01WR43", "Bash", {"command": "cat /etc/shadow"}, "run a command"
+            ),
+        ],
+    )
+    handler, stalled = _stall_handler(tmp_path, FakeRuntime([stall]), monkeypatch)
+    handler._config.approval_stall_seconds = 0.05
+    handler._process_timeout_seconds = 5.0
+
+    response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=5)
+
+    assert response.success is False
+    assert response.error == "Approval was not resolved within 0.05s (pending: Bash command)"
+    assert "(pending: Bash command)" in response.content
+    assert "shadow" not in response.content
     assert stalled == [1]

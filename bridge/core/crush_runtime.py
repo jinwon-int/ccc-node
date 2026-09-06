@@ -41,6 +41,7 @@ from .agent_runtime import (
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequestEvent,
+    ApprovalResolvedEvent,
     CompletionEvent,
     ErrorEvent,
     MessageCompletedEvent,
@@ -933,9 +934,16 @@ class CrushRuntime:
         )
         active.queue.put_nowait(request)
         try:
-            return await active.approval_handler(request)
+            decision = await active.approval_handler(request)
         except Exception:
-            return ApprovalDecision.DENY
+            decision = ApprovalDecision.DENY
+        # #1555: settle the turn's approval lease from the adapter.
+        active.queue.put_nowait(
+            ApprovalResolvedEvent(
+                request_id=request.request_id, action=request.action, decision=decision
+            )
+        )
+        return decision
 
 
 def _message_text(message: Mapping[str, Any]) -> str:

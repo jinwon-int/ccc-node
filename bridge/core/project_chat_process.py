@@ -1122,18 +1122,27 @@ class ProjectChatProcessMixin:
                         streaming_handler,
                         context="handling an approval-stall timeout",
                     )
+                    # #1555: name the request that was still outstanding —
+                    # body-free tool name + target kind, never the arguments —
+                    # so the operator can tell a Bash lane from a Write lane
+                    # without correlating bridge log lines.
+                    pending_label = turn_state.approval_pending_label
+                    pending_suffix = f" (pending: {pending_label})" if pending_label else ""
                     logger.warning(
                         "Approval stall released agent turn for user %s chat %s "
-                        "after %.1fs without a decision",
+                        "after %.1fs without a decision%s",
                         user_id,
                         chat_id,
                         approval_grace,
+                        pending_suffix,
                     )
                     try:
                         health_reporter.record_stalled_request()
                     except Exception:
                         pass
-                    message = f"Approval was not resolved within {approval_grace:g}s"
+                    message = (
+                        f"Approval was not resolved within {approval_grace:g}s{pending_suffix}"
+                    )
                     return ChatResponse(
                         content=(
                             f"⏰ {message}. The stalled turn was stopped; "

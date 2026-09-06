@@ -139,6 +139,52 @@ class ApprovalRequestEvent:
         )
 
 
+_APPROVAL_PATH_KEYS = ("path", "file_path", "filePath", "paths", "target", "targets")
+
+
+def approval_target_kind(arguments: object) -> str:
+    """Body-free shape hint for an approval request (#889 observability).
+
+    Returns only a kind label (``path``/``command``/empty) — never the value —
+    so a log line or stall notice can say *what category* of target was asked
+    about without exposing raw arguments, env, or file contents.
+    """
+
+    if not isinstance(arguments, Mapping):
+        return ""
+    if any(isinstance(arguments.get(k), str) and arguments.get(k) for k in _APPROVAL_PATH_KEYS):
+        return "path"
+    if isinstance(arguments.get("command"), str) and arguments.get("command"):
+        return "command"
+    return ""
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalResolvedEvent:
+    """The decision that settled one earlier :class:`ApprovalRequestEvent`.
+
+    Adapters enqueue it right after the approval handler returns (#1555).  A
+    request the bridge auto-allowed for a delegated (sub-agent) tool call used
+    to leave the turn's ``approval_pending`` lease set: the sub-agent's own
+    frames are filtered from the turn stream, so no later event cleared the
+    lease and the approval-stall guard released a healthy turn.  Carries the
+    request id, the action name, and the decision only — never arguments.
+    """
+
+    request_id: str
+    action: str
+    decision: ApprovalDecision
+    kind: Literal["approval_resolved"] = "approval_resolved"
+
+    def __post_init__(self) -> None:
+        if not self.request_id:
+            raise ValueError("approval request id must not be empty")
+        if not self.action:
+            raise ValueError("approval action must not be empty")
+        if not isinstance(self.decision, ApprovalDecision):
+            raise ValueError("approval decision must be an ApprovalDecision")
+
+
 @dataclass(frozen=True, slots=True)
 class DelegatedTaskLifecycleEvent:
     """Body-free snapshot of delegated work owned by the active provider turn.
@@ -223,6 +269,7 @@ AgentEvent: TypeAlias = (
     | ToolStartedEvent
     | ToolCompletedEvent
     | ApprovalRequestEvent
+    | ApprovalResolvedEvent
     | DelegatedTaskLifecycleEvent
     | CompletionEvent
     | ResultEvent
