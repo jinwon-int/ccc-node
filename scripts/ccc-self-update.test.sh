@@ -377,6 +377,7 @@ ok "successful preflight commits the actual installed SHA" \
   '[ "$(cat "$STATE/self-update.installed-sha")" = "$(git -C "$REPO" rev-parse HEAD)" ]'
 
 rm -f "$STATE/self-update.installed-sha"
+# shellcheck disable=SC2034  # marker_setup_count is read via eval inside ok()
 marker_setup_count="$(wc -l < "$SETUP_MARKER")"
 out="$(run_selfup run --force 2>&1)"; rc=$?
 ok "forced first deployment commits marker after successful preflight" \
