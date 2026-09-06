@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from telegram_bot.runtime_generation import capture_runtime_generation
+from telegram_bot.token_lock import clear_token_claim
 from telegram_bot.utils.config import config
 
 # Steady-state disk-write throttle. Must stay well under every consumer's
@@ -622,22 +623,10 @@ class RuntimeHealthReporter:
                 except FileNotFoundError:
                     pass
             if self._owns_token_lock and self._token_lock_file:
-                # Same survivor-safety as the pid file: only remove the token
-                # lock if it still records THIS process (or a now-dead pid). A
-                # losing instance that set BOT_OWNS_TOKEN_LOCK=1 must not delete
-                # a lock the survivor has since overwritten with its own pid.
-                lock_path = Path(self._token_lock_file)
-                try:
-                    lock_recorded = lock_path.read_text(encoding="utf-8").strip()
-                except (FileNotFoundError, OSError):
-                    lock_recorded = ""
-                if lock_recorded == str(os.getpid()) or not _pid_is_alive(
-                    lock_recorded
-                ):
-                    try:
-                        lock_path.unlink()
-                    except FileNotFoundError:
-                        pass
+                # Keep the inode carrying the inherited flock. The shared
+                # helper checks the PID while holding that same lock and
+                # preserves a daemon supervisor's or other live claim.
+                clear_token_claim(Path(self._token_lock_file), (os.getpid(),))
 
 
 class DeferredHealthReporter:
