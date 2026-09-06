@@ -4,6 +4,10 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Rehearse explicit prepared-generation recovery across two real source/venv
+  pairs, including candidate and recovery failures with retained artifacts
+  (#1570, #1527).
+
 - Commit the self-update installed SHA after bridge configuration preflight,
   so a rolled-back update cannot hide a later required redeployment (#1568).
 

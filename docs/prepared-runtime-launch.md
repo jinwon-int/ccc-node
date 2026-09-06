@@ -128,6 +128,34 @@ that backup may not contain the old venv. If recovery also fails, retain both
 environments and logs and report the failure. No automatic rollback or
 cleanup is performed by this integration.
 
+### Offline recovery rehearsal
+
+`bridge/tests/test_prepared_recovery.py` exercises the explicit recovery command
+on Linux with two copied source trees and two real Python venvs. The launchers,
+preparation/native/SDK checks, token locks, stop/restart path, generation capture
+and serving verifier are real. Only the bot entrypoint and a small per-venv
+dependency are fixtures. Existing test-environment packages are exposed read-only;
+the fixture blocks installation and makes no Telegram or provider requests.
+
+The scenarios cover candidate readiness timeout and process exit, an invalid
+retained environment refusing recovery before stop, a valid environment whose
+recovery process stays unavailable, and a subsequent successful explicit retry.
+Assertions verify the restored source seal, interpreter, venv and dependency
+fingerprint, the actual per-venv dependency value, retained preparation records,
+private append-only launch receipts and absence of overlapping fixture pollers.
+
+Run from `bridge/` in the normal bridge test environment:
+
+```bash
+python -m pytest tests/test_prepared_recovery.py -q
+```
+
+This proves the retained-pair command path under injected fixture failures.
+The two venvs share the test host's installed SDK/native packages; this does not
+exercise two independently installed SDK versions, production Telegram polling,
+real workload drain, power loss, disk exhaustion or Termux. Those trials and
+automatic promotion/recovery remain separate #1527 acceptance work.
+
 The selector is supported for run/restart/status/stop. Install, uninstall,
 upgrade and service-template operations reject it, because those templates
 do not yet persist a selected generation. Managed systemd/launchd restarts
