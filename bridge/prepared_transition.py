@@ -75,6 +75,9 @@ def begin(root: Path, candidate: dict, previous: dict, launcher_pid: int) -> Pat
     if not root.exists():
         root.mkdir(mode=0o700)
     private_directory(root)
+    # Persist the root's directory entry as well as its later contents. This
+    # also covers a prior attempt interrupted immediately after root creation.
+    sync_directory(root.parent)
     # mkdir is the claim. No PID-based automatic reclamation: a dead driver
     # may have left a live candidate or an incomplete stop/start operation.
     active = root / "active"
@@ -119,7 +122,9 @@ def advance(run: Path, phase: str, exit_code: int, reports: list[dict] | None = 
     write_record(run / f"{len(records):02d}-{phase}.json", record)
     if phase in TERMINAL:
         # Preserve the lease evidence instead of unlinking state. Interrupted
-        # writes/renames remain fail-closed and require operator inspection.
+        # writes/renames fail with evidence retained. A failure after rename
+        # may leave the lease released; still report evidence failure, never
+        # terminal success. No lifecycle action occurs after this boundary.
         released = run / "lease"
         if released.exists() or released.is_symlink():
             raise ValueError("lease_archive_exists")

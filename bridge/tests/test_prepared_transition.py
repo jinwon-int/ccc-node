@@ -161,3 +161,46 @@ def test_concurrent_drivers_cannot_both_claim(tmp_path):
             if child.poll() is None:
                 child.kill()
                 child.wait()
+
+
+def test_first_creation_syncs_parent_before_claim(tmp_path, monkeypatch):
+    synced = []
+    real = journal.sync_directory
+
+    def observe(path):
+        synced.append(path)
+        real(path)
+
+    monkeypatch.setattr(journal, "sync_directory", observe)
+    run = begin(tmp_path)
+    assert synced[0] == tmp_path
+    assert run.parent in synced[1:]
+
+
+def test_parent_sync_failure_refuses_before_claim(tmp_path, monkeypatch):
+    def fail_parent(path):
+        if path == tmp_path:
+            raise OSError("fixture parent sync failure")
+
+    monkeypatch.setattr(journal, "sync_directory", fail_parent)
+    with pytest.raises(OSError):
+        begin(tmp_path)
+    assert not (tmp_path / "transitions/active").exists()
+
+
+def test_post_archive_sync_failure_retains_evidence_but_may_release_lease(tmp_path, monkeypatch):
+    run = begin(tmp_path)
+    real = journal.sync_directory
+
+    def fail_after_archive(path):
+        if path == run and (run / "lease").exists():
+            raise OSError("fixture post-archive failure")
+        real(path)
+
+    monkeypatch.setattr(journal, "sync_directory", fail_after_archive)
+    with pytest.raises(OSError):
+        journal.advance(run, "rejected", 6)
+    assert (run / "lease/owner.json").exists()
+    assert (run / "01-rejected.json").exists()
+    assert not (run.parent / "active").exists()
+    assert begin(tmp_path) != run

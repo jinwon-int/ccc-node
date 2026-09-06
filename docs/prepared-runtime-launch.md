@@ -175,7 +175,7 @@ exclusive lease between cooperating recovery-option controllers. Completing
 a recorded attempt archives the lease inside that attempt. Generation files,
 launch receipts and transition evidence are retained without cleanup.
 
-Interrupted or incomplete attempts leave the lease in place. A dead launcher
+Interruptions or failures before lease archival leave `active/` in place. A dead launcher
 PID does **not** authorize reclaim: its children may still be stopping or
 starting a bridge. There is no automatic resume or lease reclamation. Before
 an operator archives a stale `active/` directory to an unused private name,
@@ -183,7 +183,11 @@ inspect the attempt and launcher/child processes, verify the actual serving
 source/runtime, and finish or stop any outstanding lifecycle operation. Keep
 the archived evidence with the attempt. Do not remove the lease simply to
 retry. A journal write failure can leave a partial record or a terminal record
-whose lease archival failed; only the command's final exit reports completion.
+whose lease archival failed. If the rename succeeded but a following directory
+sync failed, the command still exits `9` with archived evidence, and `active/`
+may already be absent. No lifecycle work follows that archival boundary; a new
+controller may claim the lease, but must pass the full current-generation
+preflight again. Only the command's final exit reports successful completion.
 
 Direct legacy lifecycle commands do not participate in this lease. Coordinate
 all external lifecycle callers separately. Shared `.env` settings, credentials
