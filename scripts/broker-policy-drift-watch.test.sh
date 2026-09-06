@@ -129,6 +129,5 @@ check_rc "working-tree edits do not cause false drift" 0 $?
 git -C "$REPO" checkout --quiet main
 git -C "$REPO" checkout --quiet -- docs/ops/broker-policy.json
 
-echo "----"
-echo "pass=$pass fail=$fail"
-[ "$fail" -eq 0 ] || exit 1
+echo "----"; echo "PASS=$pass FAIL=$fail"
+[ "$fail" = 0 ]
