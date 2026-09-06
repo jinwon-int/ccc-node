@@ -11,6 +11,10 @@ All notable changes to the Claude Code node harness. Dates are KST.
 - **A2A payload lifetime (#1524).** Dispatch unlinks its private temporary
   payload before exec while preserving stdin bytes, PID, signals and exit
   status. Invalid JSON fails before invoking a handler.
+- **Platform and governance evidence (#1525, #1526, #1528).** Bridge CI
+  adds Python 3.14 at the existing coverage floor. A read-only gh-backed
+  reporter compares desired checks with effective GitHub protection; Android
+  validation and the remaining improvement roadmap have explicit milestones.
 - **SessionStart memory render is one Python process; setup's canonical-path
   rewrite is one call (#1484, #1504).** `load-memory.sh` drove the memory
   pipeline as four `memory_render.py` subcommands around bash parallel lanes

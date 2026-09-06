@@ -262,3 +262,34 @@ the required-check list to the pre-change five-context backup. Keep
 `strict=true`, all review/admin settings, and ruleset `18203378` unchanged.
 The source rename must be reverted in a reviewed PR before retrying the live
 addition. Never disable branch protection to unblock a merge.
+
+## Read-only live drift report (#1526)
+
+After `gh auth status`, run:
+
+```bash
+python3 scripts/ccc_ci_check_drift.py --repo jinwon-int/ccc-node
+```
+
+The command issues GET requests through authenticated `gh` only. It reads
+legacy required status checks and the paginated **effective branch rules**
+endpoint, including applicable organization rules. It compares their union
+with the manifest's context/app bindings and strictness. Other protections
+(review counts, bypass actors, etc.) are explicitly outside the report's scope.
+Exit codes: 0 = exact match; 1 = missing/additional checks or strictness drift;
+2 = incomplete, malformed or unavailable evidence. Missing permission or a 404
+is an error, never evidence that no protection exists. Each live query has a
+30-second bound; no settings are modified and no unexpected check is removed.
+
+For saved readbacks, pass `--legacy-json required-status-checks.json
+--rules-json effective-branch-rules.json` instead of `--repo`. Both snapshots
+must come from the same branch; the tool cannot authenticate offline evidence.
+The JSON includes collection time, scope, missing/additional context/app pairs,
+and effective versus desired strictness. Schedule collection only in a trusted
+operator context that already has the necessary read permission.
+
+The bridge matrix additionally runs Python 3.14 at the same coverage floor.
+This compatibility job does not change the manifest or live branch protection;
+its required-check promotion and Android automation remain tracked in #1525.
+At the 2026-09-06 assessment the manifest's wheel-smoke addition remained
+unapplied in live settings (#1526). Use a fresh report for current status.
