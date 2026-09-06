@@ -1318,6 +1318,18 @@ do_restart() {
         }
         printf '%s\n' "$prepared_report"
     fi
+    # Ordinary Termux restarts used to discover incompatible installed wheels
+    # only after stopping a healthy bridge (#1577). Observe the selected venv;
+    # never install or repair packages underneath the running process.
+    if [ -z "$PREPARED_RUNTIME" ] && { [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]; }; then
+        if ! "$VENV_DIR/bin/python" -I -B "$SCRIPT_DIR/restart_preflight.py" \
+            --bridge-dir "$SCRIPT_DIR" --venv-dir "$VENV_DIR" --project-env "$ENV_FILE" \
+            "--process-unlocked=$DEPS_UNLOCKED_PROCESS"; then
+            echo "❌ Restart refused before stop: Termux runtime preparation required."
+            echo "   Prepare a compatible environment first; see docs/prepared-runtime-launch.md."
+            exit 6
+        fi
+    fi
     if [ -n "$TRANSITION_RUN" ]; then
         if ! RECOVERY_REPORT="$("$RECOVERY_RUNTIME/runtime/bin/python" -I -B \
             "$RECOVERY_SOURCE/prepared_runtime.py" --bridge-dir "$RECOVERY_SOURCE" \
