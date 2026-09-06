@@ -109,6 +109,9 @@ def test_fsync_failure_preserves_incomplete_lease(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         journal.advance(run, "rejected", 6)
     assert (run.parent / "active").exists()
+    # Even after the disk becomes writable again, the incomplete attempt owns
+    # the lease and a new controller must not reclaim it.
+    monkeypatch.undo()
     with pytest.raises(FileExistsError):
         begin(tmp_path)
 
