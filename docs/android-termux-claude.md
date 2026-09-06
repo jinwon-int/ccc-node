@@ -154,3 +154,56 @@ turn Linux mocks or a single import into a claim of Android rollout safety.
 runner collects this evidence automatically and a separately scoped update
 recovery check passes. Environment staging and full dependency rollback are
 tracked in #1527; native binary repair alone does not provide that rollback.
+
+### Machine-readable baseline receipt (#1525, #1527)
+
+Run the observer with the **environment being checked**, using an absolute
+script path so isolated Python mode does not require a package path override:
+
+```bash
+/path/to/target-venv/bin/python -I -B /path/to/ccc-node/bridge/runtime_readiness.py \
+  --bridge-dir /path/to/ccc-node/bridge --timeout-seconds 60
+```
+
+The standard-library observer runs native imports, SDK import, a throwaway
+AES-GCM round trip and `pip check`. It performs no pip install, native repair,
+model/provider request, Telegram polling or service action. Probe subprocesses
+ignore user-site/PYTHONPATH, disable bytecode writes and discard stdout/stderr.
+A shared deadline covers child-process waits; a timed-out probe process group
+is killed and reaped. Source file reads are size-bounded. Local filesystem and
+interpreter metadata calls are not a hard real-time or hostile-code sandbox.
+Use trusted source and an operator-controlled environment on a responsive
+local filesystem. POSIX group cleanup is required; unsupported platforms
+report `not_run`, not success.
+
+One JSON object on stdout uses `ccc.runtime-readiness.v1`. Exit 0 means the
+four checks passed, 1 means unready (including timeout/not-run), and 2 means
+identity collection failed. The receipt contains UTC time, elapsed/per-check
+milliseconds, interpreter/platform and selected installed package versions,
+source lock/requirements/pyproject hashes, observed checkout HEAD and tracked
+change flag, and the observer file's own hash. Git failure is represented by
+null HEAD/change information; an environment hint is not proof of Android.
+The tracked-change field excludes untracked files. An observer copied outside
+the checkout is identifiable by its own hash; the checkout HEAD does not claim
+that the observer is installed there.
+
+The lock hash describes desired inputs, not proof that all installed versions
+match that lock. `pip check` validates installed dependency constraints. Exit 0
+is a readiness observation, not a release gate: it does not authenticate a
+provider, prove serving readiness or freeze the environment against concurrent
+writers. Future staged activation must hold its own environment/switch lock
+and bind the tested environment to the activated one.
+
+`fresh_install`, `reinstall`, `rollback` and `service_restart` remain explicitly
+`not_run` in every receipt. Do not mark those #1525/#1527 acceptance criteria
+complete from this baseline alone. For performance baselines collect at least
+eight receipts per platform under comparable conditions; summarize native,
+SDK and pip-check timings separately. Import time is neither installation time
+nor observed bridge downtime. If persisting receipts, use an owner-only file:
+
+```bash
+(umask 077; /path/to/target-venv/bin/python -I -B \
+  /path/to/ccc-node/bridge/runtime_readiness.py > readiness.json)
+```
+
+Keep credentials, environment dumps and raw task bodies out of receipts.
