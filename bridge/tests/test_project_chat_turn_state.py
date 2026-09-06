@@ -7,7 +7,9 @@ import pytest
 from telegram_bot.core import project_chat_turn_state as turn_state_module
 from telegram_bot.core.agent_runtime import (
     AgentEvent,
+    ApprovalDecision,
     ApprovalRequestEvent,
+    ApprovalResolvedEvent,
     CompletionEvent,
     DelegatedTaskLifecycleEvent,
     ErrorEvent,
@@ -28,6 +30,7 @@ from telegram_bot.core.project_chat_turn_state import (
     ToolCompletedTransition,
     ToolStartedTransition,
     TurnEventState,
+    approval_pending_label,
 )
 
 
@@ -314,3 +317,88 @@ def test_unknown_runtime_event_fails_closed() -> None:
 
     with pytest.raises(TypeError, match="unsupported agent event"):
         state.observe(cast(AgentEvent, object()))
+
+
+# --- #1555: approval lease settles on the adapter's resolution event ---------
+
+
+def test_approval_resolved_clears_pending_lease_while_delegated_work_continues() -> None:
+    # A sub-agent Write: the request is observed, the bridge allows it, and
+    # the only later frames are delegated lifecycle observations (the
+    # sub-agent's own frames are filtered from the turn stream). Before #1555
+    # nothing cleared the lease, so the approval-stall guard fired at 120s.
+    state = TurnEventState()
+    state.observe(DelegatedTaskLifecycleEvent(1, 0.0, "started"), observed_at=5.0)
+    approval = ApprovalRequestEvent(
+        "toolu_01", "Write", {"file_path": "/x/lane.md", "content": "c"}, "write"
+    )
+    state.observe(approval, observed_at=10.0)
+    assert state.approval_pending is True
+    assert state.approval_pending_label == "Write path"
+
+    transition = state.observe(
+        ApprovalResolvedEvent("toolu_01", "Write", ApprovalDecision.ALLOW),
+        observed_at=10.5,
+    )
+    assert isinstance(transition, IgnoredTransition)
+    assert state.approval_pending is False
+    assert state.approval_pending_since is None
+    assert state.approval_pending_label is None
+    assert state.approval_pending_requests == {}
+
+    state.observe(DelegatedTaskLifecycleEvent(1, 6.0, "updated"), observed_at=11.0)
+    assert state.approval_pending is False
+
+
+def test_approval_lease_holds_until_every_outstanding_request_is_resolved() -> None:
+    state = TurnEventState()
+    state.observe(
+        ApprovalRequestEvent("r-1", "Bash", {"command": "true"}, "run"), observed_at=1.0
+    )
+    state.observe(
+        ApprovalRequestEvent("r-2", "Write", {"file_path": "/x"}, "write"), observed_at=2.0
+    )
+    assert state.approval_pending_label == "Bash command"
+    assert state.approval_pending_since == 1.0
+
+    state.observe(ApprovalResolvedEvent("r-1", "Bash", ApprovalDecision.ALLOW), observed_at=3.0)
+    assert state.approval_pending is True
+    assert state.approval_pending_since == 1.0
+    assert state.approval_pending_label == "Write path"
+
+    state.observe(ApprovalResolvedEvent("r-2", "Write", ApprovalDecision.DENY), observed_at=4.0)
+    assert state.approval_pending is False
+    assert state.approval_pending_since is None
+
+
+def test_approval_resolved_for_an_already_cleared_request_is_a_noop() -> None:
+    state = TurnEventState()
+    state.observe(
+        ApprovalRequestEvent("r-1", "Bash", {"command": "true"}, "run"), observed_at=1.0
+    )
+    # Pre-#1555 contract kept: any other provider-owned event clears the lease.
+    state.observe(TextDeltaEvent("continuing"), observed_at=2.0)
+    assert state.approval_pending is False
+    assert state.approval_pending_requests == {}
+
+    state.observe(ApprovalResolvedEvent("r-1", "Bash", ApprovalDecision.ALLOW), observed_at=3.0)
+    assert state.approval_pending is False
+    assert state.approval_pending_since is None
+
+
+def test_approval_pending_label_is_body_free_and_collapses_codex_methods() -> None:
+    assert (
+        approval_pending_label(
+            "item/commandExecution/requestApproval", {"command": "rm -rf /secret"}
+        )
+        == "commandExecution command"
+    )
+    assert approval_pending_label("Write", {"file_path": "/very/secret"}) == "Write path"
+    assert approval_pending_label("Agent", {"prompt": "x"}) == "Agent"
+    assert approval_pending_label("item/x", {}) == "item/x"
+    state = TurnEventState()
+    state.observe(
+        ApprovalRequestEvent("r", "Bash", {"command": "cat /etc/shadow"}, "run"),
+        observed_at=0.0,
+    )
+    assert "shadow" not in (state.approval_pending_label or "")
