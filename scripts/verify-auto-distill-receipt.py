@@ -40,6 +40,13 @@ SURFACE_MEMBERS = (
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _MD5_RE = re.compile(r"[0-9a-f]{32}")
 _EVALUATION_ID_RE = re.compile(r"TM-[0-9][0-9A-Za-z-]*")
+# Optional `evaluation.model_resolution` (#1521): `evaluation.model` stays the
+# launcher alias (`haiku`); this object pins the provider model id the alias
+# resolved to when the evaluation ran. Receipts issued before #1521 omit it.
+MODEL_RESOLUTION_KEYS = {"alias", "resolved_id", "resolved_by", "resolved_at"}
+BARE_MODEL_ALIASES = frozenset({"haiku", "sonnet", "opus", "default"})
+_MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,79}")
+_RESOLVED_BY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._:/@()+,-]{0,119}")
 
 
 class ReceiptError(ValueError):
@@ -65,11 +72,17 @@ def _expect_object(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
-def _expect_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
+def _expect_keys(
+    value: dict[str, Any],
+    expected: set[str],
+    label: str,
+    *,
+    optional: frozenset[str] = frozenset(),
+) -> None:
     actual = set(value)
-    if actual != expected:
-        missing = sorted(expected - actual)
-        extra = sorted(actual - expected)
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected - optional)
+    if missing or extra:
         raise ReceiptError(f"{label} keys mismatch: missing={missing} extra={extra}")
 
 
@@ -294,9 +307,46 @@ def _verify_gate_result(evaluation: dict[str, Any], cases: int) -> None:
         raise ReceiptError("evaluation is invalid because it kept every duplicate")
 
 
+def _verify_model_resolution(
+    evaluation: dict[str, Any], issued_at: datetime
+) -> str | None:
+    """Return the resolved provider model id, or None when unrecorded.
+
+    `evaluation.model` is the alias handed to the launcher (`--model haiku`).
+    Aliases drift silently between provider releases (#1514), so a receipt may
+    additionally pin the concrete id the alias resolved to. When present it
+    must be a real id (never a bare alias), belong to the alias family, and be
+    resolved no later than the receipt was issued.
+    """
+    if "model_resolution" not in evaluation:
+        return None
+    label = "evaluation.model_resolution"
+    resolution = _expect_object(evaluation["model_resolution"], label)
+    _expect_keys(resolution, MODEL_RESOLUTION_KEYS, label)
+    alias = resolution["alias"]
+    if alias != evaluation["model"]:
+        raise ReceiptError(f"{label}.alias does not match evaluation.model")
+    resolved_id = resolution["resolved_id"]
+    if not isinstance(resolved_id, str) or _MODEL_ID_RE.fullmatch(resolved_id) is None:
+        raise ReceiptError(f"{label}.resolved_id is invalid")
+    lowered = resolved_id.strip().lower()
+    if lowered in BARE_MODEL_ALIASES:
+        raise ReceiptError(f"{label}.resolved_id is a bare alias, not a provider model id")
+    family = alias.strip().lower()
+    if family in BARE_MODEL_ALIASES - {"default"} and family not in lowered:
+        raise ReceiptError(f"{label}.resolved_id does not belong to the alias family")
+    resolved_by = resolution["resolved_by"]
+    if not isinstance(resolved_by, str) or _RESOLVED_BY_RE.fullmatch(resolved_by) is None:
+        raise ReceiptError(f"{label}.resolved_by is invalid")
+    resolved_at = _timestamp(resolution["resolved_at"], f"{label}.resolved_at")
+    if issued_at < resolved_at:
+        raise ReceiptError("receipt was issued before the model id was resolved")
+    return resolved_id
+
+
 def _verify_evaluation(
     receipt: dict[str, Any], subject_sha256: str
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str | None]:
     evaluation = _expect_object(receipt["evaluation"], "evaluation")
     _expect_keys(
         evaluation,
@@ -315,6 +365,7 @@ def _verify_evaluation(
             "passed",
         },
         "evaluation",
+        optional=frozenset({"model_resolution"}),
     )
     if not isinstance(evaluation["id"], str) \
             or _EVALUATION_ID_RE.fullmatch(evaluation["id"]) is None:
@@ -334,14 +385,17 @@ def _verify_evaluation(
         value = evaluation[label]
         if not isinstance(value, str) or not value.strip() or len(value) > 80:
             raise ReceiptError(f"evaluation.{label} is invalid")
+    resolved_model = _verify_model_resolution(evaluation, issued_at)
     cases = _verify_corpus(evaluation)
     _verify_provenance(evaluation)
     _verify_recheck(evaluation)
     _verify_gate_result(evaluation, cases)
-    return evaluation
+    return evaluation, resolved_model
 
 
-def verify_receipt(source_path: Path, receipt_path: Path) -> dict[str, Any]:
+def verify_receipt(
+    source_path: Path, receipt_path: Path, *, require_model: bool = False
+) -> dict[str, Any]:
     description = describe_source(source_path)
     receipt = _load_receipt(receipt_path)
     _expect_keys(
@@ -355,11 +409,17 @@ def verify_receipt(source_path: Path, receipt_path: Path) -> dict[str, Any]:
     if pipeline < 1 or pipeline != description["pipeline"]:
         raise ReceiptError("receipt pipeline does not match managed source")
     subject_sha256 = _verify_subject(receipt, description)
-    evaluation = _verify_evaluation(receipt, subject_sha256)
+    evaluation, resolved_model = _verify_evaluation(receipt, subject_sha256)
+    if require_model and resolved_model is None:
+        raise ReceiptError(
+            "evaluation.model_resolution is required (--require-model) but unrecorded"
+        )
     return {
         **description,
         "evaluation_id": evaluation["id"],
         "completed_at": evaluation["completed_at"],
+        "model_alias": evaluation["model"],
+        "resolved_model": resolved_model,
     }
 
 
@@ -370,20 +430,28 @@ def main(argv: list[str] | None = None) -> int:
     action.add_argument("--receipt", type=Path)
     action.add_argument("--describe-source", action="store_true")
     action.add_argument("--json", action="store_true", dest="describe_json")
+    parser.add_argument(
+        "--require-model",
+        action="store_true",
+        help="fail unless the receipt records evaluation.model_resolution (#1521)",
+    )
     args = parser.parse_args(argv)
 
     try:
         if args.receipt is not None:
-            result = verify_receipt(args.source, args.receipt)
+            result = verify_receipt(
+                args.source, args.receipt, require_model=args.require_model
+            )
             print(
                 "evaluation receipt ok: pipeline=%d source_sha256=%s "
-                "surface_sha256=%s evaluation=%s completed_at=%s"
+                "surface_sha256=%s evaluation=%s completed_at=%s model=%s"
                 % (
                     result["pipeline"],
                     result["sha256"],
                     result["surface_sha256"],
                     result["evaluation_id"],
                     result["completed_at"],
+                    result["resolved_model"] or "unrecorded",
                 )
             )
         else:
