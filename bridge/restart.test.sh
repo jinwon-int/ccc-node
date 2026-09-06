@@ -162,10 +162,24 @@ kill "$OLD" 2>/dev/null
 # ---- foreground restart: replaces the PID and verifies availability ---------
 new_project fg "123456:TEST-restart-fg"
 PREPARED="$TMP/prepared job"; mkdir -p "$PREPARED/runtime/bin"
-# Shell-plumbing fixture only: Python tests cover the real seal/probe checker.
-write_exec_stub "$PREPARED/runtime/bin/python" <<'SH'
-exit 0
-SH
+# Candidate preflight is synthetic; serving verification runs the real stdlib
+# checker using the test host's Python, without provider or package operations.
+EXPECTED="$TMP/expected.json"
+python3 - "$HERE" "$PREPARED/runtime" "$EXPECTED" <<'PYFIX'
+import json, sys
+from pathlib import Path
+Path(sys.argv[3]).write_text(json.dumps(dict(schema="ccc.prepared-runtime.v1", status="ready",
+    source_dir=sys.argv[1], runtime_dir=sys.argv[2], dependency_fingerprint="b"*64,
+    source_seal={"sha256":"a"*64,"files":1,"bytes":1})))
+PYFIX
+REAL_PYTHON="$(command -v python3)"
+write_exec_stub "$PREPARED/runtime/bin/python" <<EOF
+case " \$* " in
+  *prepared_runtime.py*) cat "$EXPECTED" ;;
+  *prepared_serving.py*) exec "$REAL_PYTHON" "\$@" ;;
+  *) exit 98 ;;
+esac
+EOF
 OLD="$( ( sleep 300 >/dev/null 2>&1 & echo $! ) )"
 echo "$OLD" >> "$SPAWNED_PIDS"
 echo "$OLD" > "$BD/bot.pid"
@@ -174,12 +188,27 @@ FAKE_FG="$TMP/fake-start-fg"
 write_exec_stub "$FAKE_FG" <<EOF
 printf '%s\n' "\$*" >> "$CALLS"
 echo \$\$ > "$BD/bot.pid"
-cat > "$BD/health.json" <<HEOF
-{"updated_at": "\$(date -u +%Y-%m-%dT%H:%M:%SZ)",
- "service": {"state": "available", "reason": ""},
- "telegram": {"state": "healthy"},
- "agent": {"state": "healthy", "provider": "claude"}}
-HEOF
+"$REAL_PYTHON" - "$EXPECTED" "$BD/health.json" "\$\$" <<'PYFIX'
+import json, os, sys
+from datetime import datetime, timezone
+from pathlib import Path
+expected=json.loads(Path(sys.argv[1]).read_text())
+now=datetime.now(timezone.utc).isoformat()
+generation=dict(schema="ccc.runtime-generation.v1", observed_at=now,
+    source_dir=expected["source_dir"], source_seal=expected["source_seal"],
+    python_prefix=expected["runtime_dir"], python_executable=expected["runtime_dir"]+"/bin/python",
+    dependency_fingerprint=expected["dependency_fingerprint"], collection_errors=[])
+if os.environ.get("CCC_TEST_WRONG_GENERATION") == "1":
+    generation["python_prefix"]="/wrong/runtime"
+    generation["python_executable"]="/wrong/runtime/bin/python"
+    # Mutate the backing validation fixture too: the parent must use its pinned
+    # pre-stop report rather than reloading a conveniently matching identity.
+    expected["runtime_dir"]="/wrong/runtime"
+    Path(sys.argv[1]).write_text(json.dumps(expected))
+Path(sys.argv[2]).write_text(json.dumps(dict(schema_version=1, updated_at=now,
+    process={"pid":int(sys.argv[3]),"started_at":now}, runtime_generation=generation,
+    service={"state":"available"},telegram={"state":"healthy"},agent={"state":"healthy"})))
+PYFIX
 exec sleep 300
 EOF
 run env HOME="$HOMEDIR" CCC_SYSTEMD_DIR="$SD_EMPTY" CCC_SYSTEMCTL="$SC_OK" \
@@ -200,6 +229,21 @@ ok "restart forwards prepared directory to child" 'grep -q -- "--prepared-runtim
 ok "spawn used the project path" 'grep -q -- "--path $PROJ" "$CALLS"'
 ok "foreground spawn did not pass --daemon" '! grep -q -- "--daemon" "$CALLS"'
 kill "$NEW" 2>/dev/null
+
+# A fresh generic "available" status from a different generation must not
+# promote the prepared candidate, even if its backing receipt changes.
+run env HOME="$HOMEDIR" CCC_SYSTEMD_DIR="$SD_EMPTY" CCC_SYSTEMCTL="$SC_OK" \
+    CCC_BRIDGE_RESTART_SPAWN="$FAKE_FG" CCC_TEST_WRONG_GENERATION=1 \
+    CCC_BRIDGE_RESTART_STOP_TIMEOUT=5 CCC_BRIDGE_RESTART_READY_TIMEOUT=2 \
+    bash "$START" --path "$PROJ" --prepared-runtime "$PREPARED" --restart
+WRONG="$(cat "$BD/bot.pid" 2>/dev/null)"
+[ -n "$WRONG" ] && echo "$WRONG" >> "$SPAWNED_PIDS"
+okc "$RC" 4 "wrong prepared serving generation cannot pass restart"
+ok "wrong generation explains missing verification despite generic availability" \
+   'grep -q "Selected prepared generation was not verified" "$OUT" && grep -q "Bot status: available" "$OUT" && ! grep -q "Restart verified" "$OUT"'
+ok "failed generation observation leaves candidate for explicit recovery" \
+   '[ -n "$WRONG" ] && kill -0 "$WRONG" 2>/dev/null'
+kill "$WRONG" 2>/dev/null || true
 
 # ---- daemon restart (-d): dispatches --daemon through the spawn seam --------
 new_project dm "123456:TEST-restart-dm"
