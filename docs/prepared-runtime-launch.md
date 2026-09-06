@@ -2,8 +2,10 @@
 
 `start.sh --prepared-runtime <job>` selects a completed Termux preparation job
 without creating a venv or running pip. This is the first launch integration
-for #1527. Promotion automation, workload draining, managed-service templates,
-and automatic source/environment rollback remain separate work.
+for #1527. Promotion automation, managed-service templates, automatic source/environment
+rollback and production transition validation remain separate work. The
+unmanaged stop path now preserves the existing bounded application drain
+(see [service control](service-control.md#bridge-restart-drain)).
 
 ## Prepare, retain, then select
 

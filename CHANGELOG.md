@@ -4,6 +4,10 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Unmanaged bridge stop/restart now honors the bounded drain with one70s grace
+  budget, avoids duplicate termination signals, and retains bookkeeping on
+  failed stops (#1554, #1527).
+
 - Bridge health now records startup source/interpreter/dependency provenance alongside the actual process and service state (#1527).
 
 - Add opt-in prepared-runtime selection with source sealing, validation before
