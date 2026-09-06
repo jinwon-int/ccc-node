@@ -17,9 +17,12 @@ ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $
 read_pid() { [ "$CASE" = unmanaged ] || echo 101; }
 read_supervisor_pid() { [ "$CASE" != daemon ] || echo 100; }
 _parent_pid_of() { echo 100; }
+_stop_process_state() {
+    case "$CASE" in zombie) echo Z ;; unknown_state) return 1 ;; *) echo S ;; esac
+}
 find_project_bot_pids() {
     if [ "$CASE" = unmanaged ] && [ -f "$STATE/101" ]; then echo 101; fi
-    if [ "$CASE" = discovered ] && [ ! -f "$STATE/101" ]; then echo 102; fi
+    if [ "$CASE" = discovered ] && [ ! -f "$STATE/101" ]; then touch "$STATE/102"; echo 102; fi
 }
 launchctl() {
     [ "$CASE" != launchd_failure ] || return 1
@@ -79,6 +82,10 @@ run_case launchd
 ok 'launchd drain gets no repeated direct TERM' '[ "$RC" = 0 ] && [ "$(grep -c " TERM 101$" "$STATE/signals")" = 1 ] && [ -f "$STATE/work" ]'
 run_case launchd_failure
 ok 'failed service unload retains state without direct signalling' '[ "$RC" = 1 ] && [ ! -s "$STATE/signals" ] && [ ! -e "$STATE/cleaned" ]'
+run_case zombie
+ok 'zombie target is already stopped without signalling' '[ "$RC" = 0 ] && [ ! -s "$STATE/signals" ] && [ -f "$STATE/cleaned" ]'
+run_case unknown_state
+ok 'unknown process state retains live-process semantics' '[ "$RC" = 0 ] && [ -f "$STATE/work" ]'
 run_case timeout
 ok 'default70s grace precedes escalation' 'grep -q "^70 KILL 101$" "$STATE/signals"'
 ok 'successful escalation completes stop' '[ "$RC" = 0 ] && [ -f "$STATE/cleaned" ]'

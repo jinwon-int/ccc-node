@@ -575,10 +575,27 @@ do_status() {
 # for45s, then tears down. Match systemd's70s allowance, not the old10s kill.
 # The override is useful for bounded recovery/testing; shorter values explicitly
 # shorten the drain allowance. Validate it before signalling any process.
+# A zombie has exited and cannot poll or retain open token-lock descriptors,
+# even though kill -0 succeeds until its parent reaps it. Unknown state remains
+# conservatively live. /proc avoids platform ps differences; macOS uses ps.
+_stop_process_state() {
+    if [ -r "/proc/$1/status" ]; then
+        awk '$1 == "State:" { print $2; exit }' "/proc/$1/status" 2>/dev/null
+    else
+        LC_ALL=C ps -o stat= -p "$1" 2>/dev/null | awk 'NR == 1 { print $1 }'
+    fi
+}
+
+stop_pid_alive() {
+    kill -0 "$1" 2>/dev/null || return 1
+    case "$(_stop_process_state "$1")" in Z*) return 1 ;; esac
+    return 0
+}
+
 stop_live_targets() {
     local target
     for target in "$@"; do
-        kill -0 "$target" 2>/dev/null && printf '%s\n' "$target"
+        stop_pid_alive "$target" && printf '%s\n' "$target"
     done
     return 0
 }
@@ -599,7 +616,7 @@ do_stop() {
     # never send a second TERM (which means force to the Python drain handler).
     for target in "$supervisor_pid" "$pid" $(find_project_bot_pids); do
         [ -n "$target" ] || continue
-        kill -0 "$target" 2>/dev/null || continue
+        stop_pid_alive "$target" || continue
         known=0
         for upid in "${targets[@]}"; do
             [ "$upid" = "$target" ] && known=1
@@ -607,7 +624,7 @@ do_stop() {
         [ "$known" -eq 1 ] && continue
         targets+=("$target")
         if [ -n "$supervisor_pid" ] && [ "$target" != "$supervisor_pid" ] \
-            && kill -0 "$supervisor_pid" 2>/dev/null \
+            && stop_pid_alive "$supervisor_pid" \
             && [ "$(_parent_pid_of "$target")" = "$supervisor_pid" ]; then
             forwarded+=("$target")
         fi
@@ -634,7 +651,13 @@ do_stop() {
             [ "$upid" = "$target" ] && delegated=1
         done
         [ "$delegated" -eq 1 ] && continue
-        echo "🛑 Stopping bridge process (PID: $target, grace: ${grace}s)..."
+        if [ "$target" = "$supervisor_pid" ]; then
+            echo "🛑 Stopping daemon supervisor (PID: $target)..."
+        elif [ "$target" = "$pid" ]; then
+            echo "🛑 Stopping bot process (PID: $target)..."
+        else
+            echo "🛑 Stopping unmanaged bot process (PID: $target)..."
+        fi
         kill "$target" 2>/dev/null || true
     done
     live="$(stop_live_targets "${targets[@]}")"
@@ -663,7 +686,9 @@ do_stop() {
 
     # Rescan before releasing bookkeeping: an unexpected newly discovered bot
     # is not a license to spawn a replacement on top of it.
-    live="$(find_project_bot_pids)"
+    live="$(while IFS= read -r target; do
+        stop_live_targets "$target"
+    done < <(find_project_bot_pids))"
     if [ -n "$live" ]; then
         echo "❌ Stop failed: project process still running (PID(s): $live); retaining PID and token-lock files"
         exit 1
@@ -1162,9 +1187,11 @@ restart_status_snapshot() {
 restart_live_old_pids() {
     local pid
     for pid in "${RESTART_OLD_PID:-}" "${RESTART_OLD_SUPERVISOR_PID:-}"; do
-        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+        [ -n "$pid" ] && stop_pid_alive "$pid" && printf '%s\n' "$pid"
     done
-    find_project_bot_pids
+    while IFS= read -r pid; do
+        stop_live_targets "$pid"
+    done < <(find_project_bot_pids)
 }
 
 do_restart() {
