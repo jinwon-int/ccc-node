@@ -9,6 +9,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
+PREPARED_RUNTIME=""
 REQ_FILE="$SCRIPT_DIR/requirements.txt"
 ENV_FILE="$SCRIPT_DIR/.env"
 
@@ -32,6 +33,15 @@ sync_dependencies() {
         --venv-dir "$VENV_DIR" \
         --project-env "$ENV_FILE" \
         "--process-unlocked=$DEPS_UNLOCKED_PROCESS" || exit $?
+}
+
+validate_prepared_runtime() {
+    [ -n "$PREPARED_RUNTIME" ] || return 0
+    "$VENV_DIR/bin/python" -I -B "$SCRIPT_DIR/prepared_runtime.py" \
+        --bridge-dir "$SCRIPT_DIR" --prepared-dir "$PREPARED_RUNTIME" "$@" || {
+        echo "❌ Prepared runtime validation failed; no dependency install was attempted."
+        return 1
+    }
 }
 
 get_checkout_version() {
@@ -96,6 +106,11 @@ while [ $# -gt 0 ]; do
             # so a bare `--path` used to spin this loop forever with no output.
             [ "$#" -ge 2 ] || { echo "--path requires a value" >&2; exit 2; }
             export PROJECT_ROOT="$2"
+            shift 2
+            ;;
+        --prepared-runtime)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "--prepared-runtime requires a directory" >&2; exit 2; }
+            PREPARED_RUNTIME="$2"
             shift 2
             ;;
         --debug)
@@ -172,6 +187,7 @@ Options:
   -h, --help          Show this help message and exit
   --path <dir>        Set project root directory (required for all actions)
   -d, --daemon        Run bot in background (default: foreground)
+  --prepared-runtime <dir>  Use a sealed preparation job without installing dependencies
   --debug             Enable debug/verbose logging
   --status            Show whether the bot is running
   --stop              Stop the running bot
@@ -210,6 +226,15 @@ EOF
             ;;
     esac
 done
+
+if [ -n "$PREPARED_RUNTIME" ]; then
+    case "$ACTION" in
+        run|restart|status|stop) ;;
+        *) echo "--prepared-runtime is supported only for run/restart/status/stop" >&2; exit 2 ;;
+    esac
+    case "$PREPARED_RUNTIME" in /*) ;; *) PREPARED_RUNTIME="$PWD/$PREPARED_RUNTIME" ;; esac
+    VENV_DIR="$PREPARED_RUNTIME/runtime"
+fi
 
 echo "🤖 Claude Telegram Bot Bridge"
 echo "================================"
@@ -1172,6 +1197,7 @@ do_restart() {
     # bot stayed down because the start half could not resolve its token).
     merge_env_files
     check_env
+    validate_prepared_runtime || exit 6
 
     RESTART_OLD_PID="$(read_pid)"
     RESTART_OLD_SUPERVISOR_PID="$(read_supervisor_pid)"
@@ -1205,6 +1231,7 @@ do_restart() {
     # Start via the same code paths the plain flags use, pinned to THIS
     # checkout's start.sh (a wrong-checkout start.sh was a 2026-07-19 mode).
     local spawn_args=("--path" "$PROJECT_ROOT")
+    [ -n "$PREPARED_RUNTIME" ] && spawn_args+=("--prepared-runtime" "$PREPARED_RUNTIME")
     [ -n "$BOT_DEBUG" ] && spawn_args+=("--debug")
     if [ "$DAEMON_MODE" -eq 1 ]; then
         # Same path as `start.sh --path <p> --daemon`.
@@ -1424,8 +1451,12 @@ prepare_runtime() {
         exit 1
     fi
 
-    ensure_venv
-    sync_dependencies
+    if [ -n "$PREPARED_RUNTIME" ]; then
+        validate_prepared_runtime --record-dir "$BOT_DATA_DIR/runtime-history" --launcher-pid "$$" || exit 6
+    else
+        ensure_venv
+        sync_dependencies
+    fi
 
     echo "✅ Activating virtual environment"
     . "$VENV_DIR/bin/activate"
@@ -1620,6 +1651,7 @@ if [ "$DAEMON_MODE" -eq 1 ] && [ "$RUN_AS_DAEMON_SUPERVISOR" -eq 0 ]; then
     echo "🌙 Starting in daemon mode..."
     DAEMON_LOG="$LOGS_DIR/supervisor.log"
     SUPERVISOR_ARGS=("--path" "$PROJECT_ROOT" "--_daemon_supervisor")
+    [ -n "$PREPARED_RUNTIME" ] && SUPERVISOR_ARGS+=("--prepared-runtime" "$PREPARED_RUNTIME")
     [ -n "$BOT_DEBUG" ] && SUPERVISOR_ARGS+=("--debug")
     spawn_start_sh_detached "$DAEMON_LOG" "${SUPERVISOR_ARGS[@]}"
     SUPERVISOR_PID="$SPAWNED_PID"

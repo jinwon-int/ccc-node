@@ -4,6 +4,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Add opt-in prepared-runtime selection with source sealing, validation before
+  stop, no-install startup and private append-only launch references (#1527).
+
 - Add experimental opt-in Termux build preparation using the existing distro maturin, pinned
   build tools, all five native runtime packages and a private pip/build cache
   (#1539). New runtimes must pass hash-locked bootstrap, readiness and optional real
