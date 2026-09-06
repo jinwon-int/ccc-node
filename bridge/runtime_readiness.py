@@ -86,7 +86,7 @@ def runtime_identity() -> dict[str, object]:
     android = getattr(sys, "getandroidapilevel", None)
     return {"python": platform.python_version(), "implementation": platform.python_implementation(),
             "system": platform.system(), "machine": platform.machine(),
-            "android_api_level": android() if android else None,
+            "python_android_api_level": android() if android else None,
             "termux_environment_hint": bool(os.environ.get("TERMUX_VERSION") or
                                              "/com.termux/" in os.environ.get("PREFIX", "")),
             "executable": sys.executable, "prefix": sys.prefix, "base_prefix": sys.base_prefix,

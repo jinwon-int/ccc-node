@@ -11,7 +11,10 @@ from telegram_bot import runtime_readiness as readiness
 
 
 @pytest.fixture
-def source(tmp_path):
+def source(tmp_path, monkeypatch):
+    for key in tuple(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key)
     for name in ("requirements.lock.txt", "requirements.txt", "pyproject.toml"):
         (tmp_path / name).write_text("synthetic source\n")
     return tmp_path
@@ -148,3 +151,10 @@ def test_git_wait_is_capped_by_remaining_shared_budget(source, monkeypatch):
     monkeypatch.setattr(subprocess, "run", run)
     assert readiness.git_identity(source, 0.1)["head"] is None
     assert 0 < observed[0] <= 0.1
+
+
+def test_android_api_is_labeled_as_python_compatibility(monkeypatch):
+    monkeypatch.setattr(readiness.sys, "getandroidapilevel", lambda: 24, raising=False)
+    result = readiness.runtime_identity()
+    assert result["python_android_api_level"] == 24
+    assert "android_api_level" not in result

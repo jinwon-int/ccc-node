@@ -183,6 +183,8 @@ milliseconds, interpreter/platform and selected installed package versions,
 source lock/requirements/pyproject hashes, observed checkout HEAD and tracked
 change flag, and the observer file's own hash. Git failure is represented by
 null HEAD/change information; an environment hint is not proof of Android.
+`python_android_api_level` is Python's Android compatibility/build API, not
+the device OS SDK level (read the latter separately from Android properties).
 The tracked-change field excludes untracked files. An observer copied outside
 the checkout is identifiable by its own hash; the checkout HEAD does not claim
 that the observer is installed there.
