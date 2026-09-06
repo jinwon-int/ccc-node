@@ -95,7 +95,8 @@ ok "capped output carries the truncation marker" \
 out="$(printf '%s' "$long_text" | bash "$HOOK" unit-cap 4096 2>/dev/null)"; rc=$?
 ok "under-limit input is not truncated by the cap" \
   '[ "$rc" = 0 ] && [ "$out" = "$long_text" ]'
-out="$(printf '%s' "$long_text" | bash "$HOOK" unit-cap not-a-number 2>/dev/null)"; rc=$?
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
+{ out="$(printf '%s' "$long_text" | bash "$HOOK" unit-cap not-a-number 2>/dev/null)"; rc=$?; }
 ok "non-numeric cap argument means no cap" \
   '[ "$rc" = 0 ] && [ "$out" = "$long_text" ]'
 

@@ -242,7 +242,7 @@ PLIST
     fi
     # Wait for process to start (up to 5 seconds)
     echo "⏳ Waiting for bot to initialize..."
-    for i in $(seq 1 10); do
+    for _ in $(seq 1 10); do
         sleep 0.5
         if [ -f "$PID_FILE" ]; then
             pid="$(cat "$PID_FILE")"

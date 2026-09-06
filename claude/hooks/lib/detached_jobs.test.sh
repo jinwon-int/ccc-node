@@ -128,6 +128,7 @@ ok "acked job disappears from the block" '[ -z "$out" ]'
 # An ack is a partial record — {"unit":..,"acked":true} with no log. Merging it
 # over the original must keep the log path, or a later un-ack/re-read would have
 # lost the only pointer to the completion evidence.
+# shellcheck disable=SC2034  # merged is read via eval inside ok()
 merged="$(python3 - "$REG" <<'PY'
 import json, sys, os
 sys.path.insert(0, os.environ["HERE"])
@@ -204,6 +205,7 @@ ok "ack without --unit is a usage error" 'grep -q "rc=2" <<<"$out"'
 reg
 printf 'EXIT=0\n' > "$TMP/bare.log"
 python3 "$MOD" register --unit bare --log "$TMP/bare.log" --registry "$REG" >/dev/null
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(python3 "$MOD" "$REG" --max-bytes 1024)"
 ok "bare-path invocation sweeps like pending_promises.py" 'grep -q "완료됨" <<<"$out"'
 
