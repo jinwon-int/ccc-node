@@ -21,6 +21,20 @@ All notable changes to the Claude Code node harness. Dates are KST.
 - Add a validated external restart command budget to self-update, preserving
   timeout failures and recovery artifacts (#1562, #1527).
 
+- **auto-distill separates transport failures from model output (#1561).**
+  A Claude Code `--output-format json` envelope can carry `is_error: true`
+  with exit code 0 — the model was never reached (session limit, API error) —
+  and the human-readable sentence in `result` was handed downstream as if it
+  were the model's reply. It surfaced as `no_json`, indistinguishable from a
+  model that genuinely emitted malformed JSON, and was counted as one
+  successful request in usage accounting. `unwrap_claude_envelope()` now
+  reports such envelopes (and envelopes with no `modelUsage` at zero cost) as
+  `model_unavailable:<kind>` with no usage attached. Gate behaviour is
+  deliberately unchanged: each gate still branches on the same `err`, so this
+  only makes the failure distinguishable and countable. Measured on gwakga
+  2026-09-06 (#1547 r2): 28 of 47 envelopes were session-limit errors, and
+  the run still reported plausible metrics (26% recall; 67% on the valid 19).
+
 - Prepared bridge restart now requires a fresh matching serving generation,
   rather than generic availability, before reporting success (#1559, #1527).
 
