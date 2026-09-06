@@ -1,5 +1,6 @@
 """Running health binds source/interpreter evidence to the existing PID/state."""
 import json
+import os
 import subprocess
 
 import pytest
@@ -120,3 +121,29 @@ def test_incomplete_identity_does_not_prevent_health_reporting(runtime, tmp_path
     state = json.loads(reporter.health_file.read_text())
     assert state["service"]["state"] == "available"
     assert len(state["runtime_generation"]["collection_errors"]) == 2
+
+
+def test_non_utf8_git_status_cannot_abort_health_startup(runtime, tmp_path):
+    source, _ = runtime
+    repo = source.parent
+    def git(*args):
+        subprocess.run(["git", "-C", str(repo), *args], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    git("init", "-q")
+    git("config", "core.quotePath", "false")
+    filename = os.fsencode(source) + b"/odd-\xff.py"
+    with open(filename, "wb") as stream:
+        stream.write(b"# initial\n")
+    git("add", "bridge")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
+    with open(filename, "ab") as stream:
+        stream.write(b"# modified\n")
+    reporter = health.RuntimeHealthReporter(tmp_path / "project")
+    reporter.initialize_process()
+    reporter.record_telegram_ok()
+    reporter.record_agent_ok()
+    state = json.loads(reporter.health_file.read_text())
+    assert state["service"]["state"] == "available"
+    assert state["runtime_generation"]["source_git"] == {"head": None, "tracked_changes": None}
+    assert state["runtime_generation"]["source_seal"] is None
+    assert state["runtime_generation"]["dependency_fingerprint"] == "a" * 64
