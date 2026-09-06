@@ -127,6 +127,11 @@ EOF
 out="$(bash "$AUDIT" 2>/dev/null)"
 ok "exposure summary counts" 'jq -e ".exposure == {cloudflared_units:1, reverse_ssh_units:1, public_tunnel_units:1, public_listeners:2, funnel_configured:false, residue_files:1, firewall_default_deny:true}" <<<"$out" >/dev/null'
 ok "ufw active: default incoming + 3 normalised rules (comments stripped, whitespace collapsed)" 'jq -e ".firewall.ufw | .status == \"active\" and .default_incoming == \"deny\" and (.rules | length == 3) and (.rules | index([\"8123/tcp ALLOW IN 192.168.55.0/24\"]) != null) and (.rules_hash | length == 64)" <<<"$out" >/dev/null && ! jq -r ".firewall.ufw.rules[]" <<<"$out" | grep -q "home-assistant-lan"'
+# Pinned pre-#1536 output for the static-only fixture: the ufw block must stay
+# byte-identical (no dynamic_rules key, same sha256 of the sorted rules) so the
+# baselines accepted before #1536 keep comparing OK on nodes without bans.
+ok "static-only ufw block is byte-identical to the pre-#1536 output (pinned)" '[ "$(jq -c ".firewall.ufw" <<<"$out")" = "{\"status\":\"active\",\"default_incoming\":\"deny\",\"rules\":[\"22/tcp (v6) on tailscale0 ALLOW IN Anywhere (v6)\",\"22/tcp on tailscale0 ALLOW IN Anywhere\",\"8123/tcp ALLOW IN 192.168.55.0/24\"],\"rules_hash\":\"a9e09f4302e92d0ce73887b9eae45fca5995a1039edb55c320de4bc70b0debf3\",\"cmd_status\":\"rc=0\"}" ]'
+ok "rules_hash is sha256 of the sorted rules joined by newline (unchanged algorithm)" '[ "$(jq -r ".firewall.ufw.rules_hash" <<<"$out")" = "$(printf "%s" "$(jq -r ".firewall.ufw.rules[]" <<<"$out")" | sha256sum | cut -d" " -f1)" ]'
 # Rule comment / column-spacing / order changes must not move the hash; a rule change must.
 h0="$(jq -r ".firewall.ufw.rules_hash" <<<"$out")"
 write_exec_stub "$TMP/bin/ufw" <<'EOF'
@@ -143,6 +148,31 @@ UFW
 EOF
 h1="$(bash "$AUDIT" 2>/dev/null | jq -r ".firewall.ufw.rules_hash")"
 ok "ufw rules hash is stable across comment/order/spacing changes" '[ "$h0" = "$h1" ]'
+# Fail2Ban bans (#1536): "REJECT IN <ip>  # by Fail2Ban after N attempts …" come
+# and go on the ban schedule. They must not touch rules/rules_hash (so the
+# fleet baseline stays OK) but must stay visible under dynamic_rules. Comment
+# match is case-insensitive on "fail2ban" (covers "by Fail2Ban", "fail2ban-<jail>").
+write_exec_stub "$TMP/bin/ufw" <<'EOF'
+cat <<'UFW'
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), deny (routed)
+New profiles: skip
+
+To                         Action      From
+--                         ------      ----
+Anywhere                   REJECT IN   203.0.113.7                # by Fail2Ban after 5 attempts against sshd
+22/tcp on tailscale0       ALLOW IN    Anywhere                   # tailscale-ssh
+8123/tcp                   ALLOW IN    192.168.55.0/24            # home-assistant-lan
+Anywhere                   REJECT IN   198.51.100.9               # FAIL2BAN-recidive
+22/tcp (v6) on tailscale0  ALLOW IN    Anywhere (v6)              # tailscale-ssh
+UFW
+EOF
+out="$(bash "$AUDIT" 2>/dev/null)"
+ok "fail2ban bans leave rules and rules_hash identical to the static-only fixture" '[ "$(jq -r ".firewall.ufw.rules_hash" <<<"$out")" = "$h0" ] && jq -e ".firewall.ufw.rules | length == 3" <<<"$out" >/dev/null && ! jq -r ".firewall.ufw.rules[]" <<<"$out" | grep -q REJECT'
+ok "fail2ban bans are listed under dynamic_rules (sorted, comment stripped)" 'jq -e ".firewall.ufw.dynamic_rules == [\"Anywhere REJECT IN 198.51.100.9\", \"Anywhere REJECT IN 203.0.113.7\"]" <<<"$out" >/dev/null'
+ok "markdown ufw line carries the dynamic count only when bans exist" 'bash "$AUDIT" --markdown 2>/dev/null | grep -q "^- ufw: active · default incoming deny · 3 rules · hash a9e09f43 · dynamic 2 (fail2ban, excluded from hash)$"'
+ok "markdown lists dynamic rules separately" 'bash "$AUDIT" --markdown 2>/dev/null | grep -q "^- ufw (dynamic): \`Anywhere REJECT IN 203.0.113.7\`$"'
 write_exec_stub "$TMP/bin/ufw" <<'EOF'
 cat <<'UFW'
 Status: active
@@ -205,6 +235,7 @@ md="$(bash "$AUDIT" --markdown 2>/dev/null)"; rc=$?
 ok "markdown mode exits 0" '[ "$rc" = 0 ]'
 ok "markdown headline carries counts" 'grep -q "cloudflared units: 1 · reverse ssh: 1 · public tunnel units: 1 · public listeners: 2 · funnel: no · residue: 1" <<<"$md"'
 ok "markdown carries the ufw line and rules" 'grep -q "^- ufw: active · default incoming deny · 3 rules · hash" <<<"$md" && grep -q "8123/tcp ALLOW IN 192.168.55.0/24" <<<"$md"'
+ok "markdown ufw line is unchanged without bans (no dynamic suffix, pinned)" 'grep -q "^- ufw: active · default incoming deny · 3 rules · hash a9e09f43$" <<<"$md" && ! grep -q "dynamic" <<<"$md"'
 ok "markdown lists units and residue" 'grep -q "gwakga-broker-public-tunnel.service" <<<"$md" && grep -q "removed-20260626" <<<"$md"'
 ok "markdown never leaks the token" '! grep -q "SECRETVALUE123" <<<"$md"'
 

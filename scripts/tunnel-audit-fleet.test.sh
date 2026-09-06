@@ -84,6 +84,7 @@ fw() { # <status> <default> <hash>
 doc active "" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
 out="$(bash "$FLEET" 2>&1)"; rc=$?
 ok "firewall block appearing over an old baseline is NEW (re-accept needed)" '[ "$rc" = 1 ] && grep -q "^NEW alpha: .*ufw active default-in=deny rules=aaaaaaaa (1)" <<<"$out"'
+ok "firewall identity line is exactly the pre-#1536 rendering (pinned)" 'grep -qx "NEW alpha: ufw active default-in=deny rules=aaaaaaaa (1)" <<<"$out"'
 bash "$FLEET" --accept-baseline=alpha >/dev/null 2>&1
 out="$(bash "$FLEET" 2>&1)"; rc=$?
 ok "same firewall state after accept is OK" '[ "$rc" = 0 ] && grep -q "^OK alpha" <<<"$out"'
@@ -99,6 +100,32 @@ ok "ufw turning inactive is NEW" '[ "$rc" = 1 ] && grep -q "^NEW alpha: .*ufw in
 doc active "" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
 out="$(bash "$FLEET" 2>&1)"; rc=$?
 ok "restored firewall state is OK again" '[ "$rc" = 0 ] && grep -q "^OK alpha" <<<"$out"'
+
+# 6c) Fail2Ban dynamic bans (#1536): the collector keeps them out of rules /
+#     rules_hash and lists them under firewall.ufw.dynamic_rules. The fleet side
+#     never compares them — a ban appearing or expiring is OK — and surfaces
+#     the count on the verdict as "(ufw dynamic=n)" only when n>0, so a node
+#     without bans (or an old collector without the key) renders exactly as before.
+fwd() { # <dynamic-rules-json-array> on top of "fw active deny aaaaaaaa1111"
+  fw active deny aaaaaaaa1111 | jq --argjson d "$1" '.firewall.ufw.dynamic_rules = $d'
+}
+doc active "" false "[]" | fwd '["Anywhere REJECT IN 203.0.113.7"]' > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "fail2ban ban appearing over a static-only baseline is OK (not NEW/GONE), count shown" '[ "$rc" = 0 ] && grep -qx "OK alpha (ufw dynamic=1)" <<<"$out"'
+ok "baseline JSON is not rewritten by a non-accepting run" '! grep -q dynamic_rules "$TMP/state/tunnel-audit/baseline/alpha.json"'
+doc active "" false "[]" | fwd '[]' > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "empty dynamic_rules renders byte-identical to the absent key (no suffix)" '[ "$rc" = 0 ] && grep -qx "OK alpha" <<<"$out"'
+doc active "" false "[]" | fw active deny bbbbbbbb2222 | jq '.firewall.ufw.dynamic_rules = ["Anywhere REJECT IN 203.0.113.7","Anywhere REJECT IN 198.51.100.9"]' > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "real rule change with bans present is NEW on the static line; count stays a suffix" '[ "$rc" = 1 ] && grep -qx "NEW alpha: ufw active default-in=deny rules=bbbbbbbb (1) | GONE: ufw active default-in=deny rules=aaaaaaaa (1) (ufw dynamic=2)" <<<"$out"'
+bash "$FLEET" --accept-baseline=alpha >/dev/null 2>&1
+doc active "" false "[]" | fw active deny bbbbbbbb2222 > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "bans expiring after a baseline accepted while banned is OK, not GONE" '[ "$rc" = 0 ] && grep -qx "OK alpha" <<<"$out"'
+# restore alpha to the aaaaaaaa state for the sections below
+doc active "" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
+bash "$FLEET" --accept-baseline=alpha >/dev/null 2>&1
 
 # 7) unreachable node → UNREACHABLE, exit 1; other node still evaluated
 rm -f "$TMP/reply/beta"
