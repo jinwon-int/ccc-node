@@ -25,6 +25,7 @@ ok "missing registry prints nothing" '[ -z "$out" ]'
 
 w broken 'not json at all{{{'
 out="$(python3 "$MOD" "$TMP/broken.json")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "malformed registry prints nothing" '[ -z "$out" ]'
 ok "malformed registry still exits 0 (fail-open)" '[ "$rc" = 0 ]'
@@ -101,8 +102,10 @@ ok "row count is capped at 5 per section" '[ "$n" = 5 ]'
 ok "overflow is disclosed rather than silently dropped" 'grep -q "외 4건" <<<"$out"'
 
 # ---- byte cap ---------------------------------------------------------------
+# shellcheck disable=SC2034  # n is read via eval inside ok()
 n="$(python3 "$MOD" "$TMP/many.json" --max-bytes 80 | wc -c)"
 ok "--max-bytes caps the block (newline included)" '[ "$n" -le 81 ]'
+# shellcheck disable=SC2034  # bad is read via eval inside ok()
 bad="$(python3 "$MOD" "$TMP/many.json" --max-bytes 60 | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; echo $?)"
 ok "byte-capped output stays valid UTF-8" '[ "$bad" = 0 ]'
 

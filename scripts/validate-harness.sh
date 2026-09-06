@@ -102,28 +102,18 @@ SC_SCOPE_EXTRA=(scripts/git-hooks/managed-checkout-guard)
 # entry that becomes clean FAILS the run until it is removed; a NEW script
 # is never added here — it is linted at warning level from its first commit.
 SC_WARN_BASELINE=(bridge/service-install.test.sh
-         claude/hooks/distill/extract.test.sh
-         claude/hooks/distill/local-facts.test.sh
          claude/hooks/distill/pending-drain.test.sh
          claude/hooks/distill/wiki-queue.test.sh
          claude/hooks/lib/memory_render.test.sh
-         claude/hooks/lib/mtime-prune.test.sh
-         claude/hooks/lib/pending_promises.test.sh
          claude/hooks/lib/test-stub.test.sh
          claude/hooks/memory-hooks.test.sh
          claude/hooks/nunchi/assemble-fixtures.test.sh
-         claude/hooks/nunchi/codex-feed.test.sh
          claude/hooks/nunchi/judge-batch.test.sh
          claude/hooks/nunchi/nunchi.test.sh
          claude/hooks/nunchi/wiki-promote.test.sh
-         claude/hooks/skill-review/autoinstall-incremental.test.sh
          claude/hooks/skill-review/autoinstall.test.sh
-         claude/hooks/skill-review/codex-autoinstall.test.sh
          claude/hooks/skill-review/curator.test.sh
          claude/hooks/skill-review/ownership-incremental.test.sh
-         claude/hooks/skill-review/ownership-nolink-fallback.test.sh
-         claude/hooks/skill-review/ownership.test.sh
-         claude/hooks/skill-usage-log.test.sh
          piri/skills/web/web_tools.test.sh
          scripts/a2a-review-handler.test.sh
          scripts/a2a-termux-native-worker.test.sh
@@ -156,18 +146,12 @@ SC_WARN_BASELINE=(bridge/service-install.test.sh
          scripts/cost-ledger.test.sh
          scripts/gh-pr-flow-jinon86.test.sh
          scripts/harness-paths.test.sh
-         scripts/install-fleet-skills-sync-cron.test.sh
-         scripts/install-memory-refresh-cron.test.sh
          scripts/install-nunchi.test.sh
-         scripts/install-pr-status-poll-cron.test.sh
-         scripts/install-skill-autosave-cron.test.sh
          scripts/install-tunnel-audit-cron.test.sh
-         scripts/lib/installer-cron-common.test.sh
          scripts/rescreen-rotation.test.sh
          scripts/setup.test.sh
          scripts/tunnel-audit-fleet.test.sh
-         scripts/tunnel-audit.test.sh
-         skills/skillsuggest/scan.sh)
+         scripts/tunnel-audit.test.sh)
 # --- end manifests -----------------------------------------------------------
 
 # --- discovery (#1484) -------------------------------------------------------

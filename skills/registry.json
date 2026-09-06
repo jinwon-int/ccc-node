@@ -373,7 +373,7 @@
       "name": "skillsuggest",
       "source": "skills/skillsuggest",
       "status": "active",
-      "tree_sha256": "28ba67ef7ea74178a4fcbeaa2e25d36edb524dcf40a70c92c77951a37a170a70"
+      "tree_sha256": "1a4af16994aab81339f615d8a47c41f3b2a1c4734567630e8c6f72d20c8286c7"
     },
     {
       "audience": "shared",

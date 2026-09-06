@@ -138,13 +138,16 @@ ok "piri classification is autosave-managed" 'jq -e ".skills[0].classification =
 make_skill rollback-one
 tool mark-created rollback-one >/dev/null
 out="$(tool rollback-archive rollback-one)"
+# shellcheck disable=SC2034  # archive_path is read via eval inside ok()
 archive_path="$(jq -r '.archive_path' <<<"$out")"
 ok "rollback archive moves only eligible v2 install" '[ ! -e "$SKILLS/rollback-one" ] && [ -f "$archive_path/SKILL.md" ] && jq -e ".changed == true and .durable == true" >/dev/null <<<"$out"'
 ok "rollback archive has prepared and terminal audit phases" 'jq -s -e "[.[] | select(.event == \"rollback\" and .name == \"rollback-one\")] | group_by(.transaction_id) | any(map(.outcome) == [\"prepared\", \"archived\"])" "$STATE/skill-autosave-ownership.jsonl" >/dev/null'
 
 # Pin is an overlay: it blocks autonomous mutation without erasing ownership.
+# shellcheck disable=SC2034  # before is read via eval inside ok()
 before="$(find "$STATE" -printf '%P:%s:%T@\\n' | sort)"
 out="$(tool pin user-one --dry-run)"
+# shellcheck disable=SC2034  # after is read via eval inside ok()
 after="$(find "$STATE" -printf '%P:%s:%T@\\n' | sort)"
 ok "pin dry-run writes nothing" '[ "$before" = "$after" ] && jq -e ".reason == \"would-pin\"" >/dev/null <<<"$out"'
 out="$(tool pin user-one)"
@@ -542,6 +545,7 @@ for n in torn-one torn-two; do
   chmod 600 "$TORN_SKILLS/$n/SKILL.md"
 done
 tool_torn adopt torn-one >/dev/null
+# shellcheck disable=SC2034  # rows_before is read via eval inside ok()
 rows_before="$(wc -l < "$TORN_LEDGER")"
 printf '{"event":"adopt","name":"torn-cra' >> "$TORN_LEDGER"
 out="$(tool_torn automatic-usage 2>"$TMP/torn-stderr")"; rc=$?
@@ -576,7 +580,9 @@ ok "non-object JSON row still fails closed" '[ "$rc" = 2 ] && jq -e ".code == \"
 # A torn tail that cuts a multi-byte UTF-8 sequence is still just a torn tail.
 cp "$TMP/torn-ledger.bak" "$TORN_LEDGER"
 printf '{"name":"\xed\x95' >> "$TORN_LEDGER"
-out="$(tool_torn automatic-usage 2>/dev/null)"; rc=$?
+out="$(tool_torn automatic-usage 2>/dev/null)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "torn tail inside a multi-byte character is tolerated" '[ "$rc" = 0 ] && jq -e ".ownership_ledger_torn_tail == 1" >/dev/null <<<"$out"'
 
 echo "----"

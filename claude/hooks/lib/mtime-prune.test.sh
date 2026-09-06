@@ -29,6 +29,7 @@ mk "$D/working-state-3.md" 202601010003
 mk "$D/working-state-4.md" 202601010004
 mk "$D/working-state-5.md" 202601010005
 prune_keep_newest "$D" 'working-state-*.md' 2
+# shellcheck disable=SC2034  # remaining is read via eval inside ok()
 remaining="$(ls "$D" | sort | tr '\n' ' ')"
 ok "prune keeps exactly 2 newest" '[ "$(ls "$D" | wc -l | tr -d " ")" = 2 ]'
 ok "prune kept the 2 newest by mtime (4,5)" '[ "$remaining" = "working-state-4.md working-state-5.md " ]'
@@ -70,6 +71,7 @@ D4="$TMP/sel"; mkdir -p "$D4"
 mk "$D4/working-state-x.md" 202601010001
 mk "$D4/working-state-y.md" 202601010009
 mk "$D4/working-state-z.md" 202601010005
+# shellcheck disable=SC2034  # got is read via eval inside ok()
 got="$(newest_file "$D4" 'working-state-*.md')"
 ok "newest_file returns newest by mtime" '[ "$got" = "$D4/working-state-y.md" ]'
 ok "newest_file: empty when no match" '[ -z "$(newest_file "$D4" "nope-*.md")" ]'
