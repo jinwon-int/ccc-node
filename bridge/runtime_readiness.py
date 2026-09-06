@@ -45,6 +45,7 @@ def file_hash(path: Path) -> str:
 def git_identity(bridge_dir: Path, timeout: float = 4.0) -> dict[str, object]:
     # Ambient GIT_DIR/INDEX_FILE/etc. must not describe a different checkout.
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_OPTIONAL_LOCKS"] = "0"
     deadline = time.monotonic() + timeout
     try:
         remaining = deadline - time.monotonic()
@@ -61,7 +62,8 @@ def git_identity(bridge_dir: Path, timeout: float = 4.0) -> dict[str, object]:
         if remaining <= 0:
             return {"head": head, "tracked_changes": None}
         result = subprocess.run(
-            ["git", "-C", str(bridge_dir), "diff-index", "--quiet", "HEAD", "--"],
+            ["git", "-c", "diff.autoRefreshIndex=false", "-C", str(bridge_dir),
+             "diff", "--quiet", "HEAD", "--"],
             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=min(2, remaining), check=False,
         )

@@ -1,5 +1,6 @@
 """Readiness receipts never claim installation/rollback or expose probe output."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -97,8 +98,22 @@ def test_git_identity_ignores_ambient_repo(source, monkeypatch):
     monkeypatch.setenv("GIT_DIR", "/synthetic-invalid")
     value = readiness.git_identity(source)
     assert value["head"] and value["tracked_changes"] is False
-    (source / "requirements.txt").write_text("changed")
+    index = source / ".git/index"
+    before_index = index.read_bytes()
+    tracked = source / "requirements.txt"
+    stamp = tracked.stat().st_mtime_ns + 2_000_000_000
+    os.utime(tracked, ns=(stamp, stamp))
+    assert readiness.git_identity(source)["tracked_changes"] is False
+    assert index.read_bytes() == before_index
+    tracked.write_text("changed")
     assert readiness.git_identity(source)["tracked_changes"] is True
+    assert index.read_bytes() == before_index
+    # Also include staged content while preserving the newly staged index.
+    clean_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    subprocess.run(["git", "-C", str(source), "add", "requirements.txt"], env=clean_env, check=True)
+    staged_index = index.read_bytes()
+    assert readiness.git_identity(source)["tracked_changes"] is True
+    assert index.read_bytes() == staged_index
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "0", "-1", "301"])
