@@ -92,8 +92,9 @@ def test_journal_failure_cannot_report_success_or_skip_before_stop_gate(rehearsa
     before = r.events()
     wrapper = r.bin / "python3"
     script = wrapper.read_text()
-    wrapper.write_text(script.replace("#!/bin/sh\n", '#!/bin/sh\ncase " $* " in\n'
-        f'  *"prepared_transition.py advance "*" --phase {phase} "*) exit 99 ;;\nesac\n', 1))
+    shebang, body = script.split("\n", 1)
+    wrapper.write_text(shebang + '\ncase " $* " in\n'
+        f'  *"prepared_transition.py advance "*" --phase {phase} "*) exit 99 ;;\nesac\n' + body)
     rc, output = controlled(r)
     assert rc == 9, output
     root = r.data / "runtime-transitions"

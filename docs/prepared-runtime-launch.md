@@ -204,7 +204,7 @@ silently extend an outer deadline or resume after it is killed.
 ### Offline recovery rehearsal
 
 `bridge/tests/test_prepared_recovery.py` exercises the explicit recovery command
-on Linux with two copied source trees and two real Python venvs. The launchers,
+on Linux and Termux/Android with two copied source trees and two real Python venvs. The launchers,
 preparation/native/SDK checks, token locks, stop/restart path, generation capture
 and serving verifier are real. Only the bot entrypoint and a small per-venv
 dependency are fixtures. Existing test-environment packages are exposed read-only;
@@ -220,14 +220,46 @@ private append-only launch receipts and absence of overlapping fixture pollers.
 Run from `bridge/` in the normal bridge test environment:
 
 ```bash
-python -m pytest tests/test_prepared_recovery.py -q
+python -m pytest tests/test_prepared_recovery.py tests/test_prepared_transition_integration.py -q
 ```
 
 This proves the retained-pair command path under injected fixture failures.
 The two venvs share the test host's installed SDK/native packages; this does not
 exercise two independently installed SDK versions, production Telegram polling,
-real workload drain, power loss, disk exhaustion or Termux. Those trials and
+real workload drain, power loss or disk exhaustion. Those trials and
 automatic promotion policy remain separate #1527 acceptance work.
+
+### Running the rehearsal on Termux
+
+Use a separate source copy and a test Python environment with the bridge's
+native/SDK dependencies and pytest available. Keep the serving checkout and
+venv unchanged. The fixture resolves `bash`, `sh` and the harmless `true`
+provider command from the host tool directory, puts its own manager/wake-lock
+stubs first on the child PATH, and retains the Termux Python base prefix.
+Stub shebangs use the resolved shell executable; an executable whose actual
+path still contains whitespace is refused before writing the stubs.
+It does not inherit provider credentials or the serving HOME. Python 3.14's
+`sys.platform == "android"` is explicitly supported; a skipped test is not a
+successful device rehearsal. Where Android Python omits `os.link`, the journal
+fixture tries Termux's `ln` and verifies that both paths share the same inode
+with link count two. If Android denies creation with a permission error, those
+hardlink cases are explicitly skipped: the journal's hardlink rejection was
+not exercised on that device. Other command errors fail. Both real hardlink
+paths remain covered on Linux CI.
+
+Pass a **new** private `--basetemp` directory to retain each run's source/venv
+copies, process logs and phase records for inspection. Pytest can delete an
+existing `--basetemp` directory, so do not point it at a previous run or an
+operator directory. Rehearsal cleanup stops only fixture-owned process groups;
+it does not remove the source/environment evidence itself.
+
+The test entrypoint blocks network connections and uses an independent fixture
+poller lock. Actual launcher, preparation/native/SDK checks, source seals,
+token locks, stop/restart and serving verification still execute. A separately
+installed pytest tool directory can be used with read-only access to a retained
+validated API24 runtime; the fixture venvs must see that runtime's dependency
+site-packages. Test-tool installation and source transfer are preparation work,
+not an offline installation/upgrade claim for the running bridge.
 
 The selector is supported for run/restart/status/stop. Install, uninstall,
 upgrade and service-template operations reject it, because those templates

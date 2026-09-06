@@ -4,6 +4,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Run prepared-recovery rehearsals on Termux Python reporting `android`, with
+  host-resolved tool paths and isolated child environments (#1574, #1527).
+
 - Add opt-in prepared restart with one explicit retained source/runtime recovery
   attempt, private transition evidence and distinct recovery outcomes (#1572, #1527).
 
