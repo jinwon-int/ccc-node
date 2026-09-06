@@ -48,8 +48,8 @@ payload_other() {
     '{session_id:$sid, transcript_path:$tp, cwd:$cwd}'
 }
 
-out="$(payload_other sess-other "$TRANS_OTHER" "/root/.openclaw/workspace" \
-  | CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root" bash "$DISTILL" sessionend 2>&1)"; rc=$?
+payload_other sess-other "$TRANS_OTHER" "/root/.openclaw/workspace" \
+  | CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root" bash "$DISTILL" sessionend >/dev/null 2>&1; rc=$?
 ok "scope mismatch exits 0" '[ "$rc" = 0 ]'
 ok "scope mismatch logs cwd-out-of-scope" 'grep -q "skip reason=cwd-out-of-scope cwd=/root/.openclaw/workspace project=-root--openclaw-workspace" "$STATE/distill.log"'
 ok "scope mismatch does not spawn background" '! grep -q "spawned bg" "$STATE/distill.log"'
@@ -57,23 +57,23 @@ ok "scope mismatch does not spawn background" '! grep -q "spawned bg" "$STATE/di
 : > "$STATE/distill.log"
 TRANS_ALLOWED="$TMP/projects/-root--openclaw-workspace/sess-allowed.jsonl"
 make_transcript "$TRANS_ALLOWED" 2
-out="$(payload_other sess-allowed "$TRANS_ALLOWED" "/root/.openclaw/workspace" \
-  | CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend 2>&1)"; rc=$?
+payload_other sess-allowed "$TRANS_ALLOWED" "/root/.openclaw/workspace" \
+  | CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend >/dev/null 2>&1; rc=$?
 ok "scope exact cwd match exits 0" '[ "$rc" = 0 ]'
 ok "scope exact cwd match reaches turn-count gate" 'grep -q "skip reason=too-few-turns turns=2" "$STATE/distill.log" && ! grep -q "cwd-out-of-scope" "$STATE/distill.log"'
 
 : > "$STATE/distill.log"
 printf '%s\n' '-root--openclaw-workspace' > "$STATE/distill.scope"
-out="$(jq -nc --arg sid sess-encoded --arg tp "$TRANS_ALLOWED" '{session_id:$sid, transcript_path:$tp}' \
-  | CCC_STATE_DIR="$STATE" bash "$DISTILL" sessionend 2>&1)"; rc=$?
+jq -nc --arg sid sess-encoded --arg tp "$TRANS_ALLOWED" '{session_id:$sid, transcript_path:$tp}' \
+  | CCC_STATE_DIR="$STATE" bash "$DISTILL" sessionend >/dev/null 2>&1; rc=$?
 ok "encoded project scope file match exits 0" '[ "$rc" = 0 ]'
 ok "encoded project scope file match reaches turn-count gate" 'grep -q "source_cwd=encoded:-root--openclaw-workspace" "$STATE/distill.log" && grep -q "skip reason=too-few-turns turns=2" "$STATE/distill.log" && ! grep -q "cwd-out-of-scope" "$STATE/distill.log"'
 
 : > "$STATE/distill.log"
 TRANS_STRUCTURAL="$TMP/projects/-root--openclaw-workspace/sess-structural.jsonl"
 make_transcript "$TRANS_STRUCTURAL" 8 "queue-operation"
-out="$(payload_other sess-structural "$TRANS_STRUCTURAL" "/root/.openclaw/workspace" \
-  | CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend 2>&1)"; rc=$?
+payload_other sess-structural "$TRANS_STRUCTURAL" "/root/.openclaw/workspace" \
+  | CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend >/dev/null 2>&1; rc=$?
 ok "structural-only transcript exits 0" '[ "$rc" = 0 ]'
 ok "structural-only transcript is skipped by turn gate" 'grep -q "skip reason=too-few-turns turns=0" "$STATE/distill.log" && ! grep -q "spawned bg" "$STATE/distill.log"'
 
@@ -99,8 +99,8 @@ touch "$STATE/distill.dryrun"
 : > "$STATE/distill.log"
 TRANS_REAL="$TMP/projects/-root--openclaw-workspace/sess-real.jsonl"
 make_transcript "$TRANS_REAL" 3 "user"
-out="$(payload_other sess-real "$TRANS_REAL" "/root/.openclaw/workspace" \
-  | CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend 2>&1)"; rc=$?
+payload_other sess-real "$TRANS_REAL" "/root/.openclaw/workspace" \
+  | CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend >/dev/null 2>&1; rc=$?
 for _ in $(seq 1 25); do
   grep -q "dry-run skipping local/honcho/wiki writes" "$STATE/distill.log" && break
   sleep 0.1
@@ -118,8 +118,8 @@ export CLAUDE_STUB_COUNTER="$TMP/claude-counter"
 for r in 1 2 3 4; do
   TRANS_RING="$TMP/projects/-root--openclaw-workspace/sess-ring-$r.jsonl"
   make_transcript "$TRANS_RING" 3 "user"
-  out="$(payload_other "sess-ring-$r" "$TRANS_RING" "/root/.openclaw/workspace" \
-    | CCC_STATE_DIR="$STATE" CCC_DISTILL_HISTORY_KEEP=2 CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend 2>&1)"; rc=$?
+  payload_other "sess-ring-$r" "$TRANS_RING" "/root/.openclaw/workspace" \
+    | CCC_STATE_DIR="$STATE" CCC_DISTILL_HISTORY_KEEP=2 CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend >/dev/null 2>&1; rc=$?
   ok "ring run $r exits 0" '[ "$rc" = 0 ]'
   for _ in $(seq 1 25); do
     jq -e --arg sid "sess-ring-$r" '.session_id == $sid' "$STATE/distill-last.json" >/dev/null 2>&1 && break
@@ -167,7 +167,9 @@ ok "autonomy.kill file logs skip reason" 'grep -q "skipped reason=autonomy-kill"
 rm -f "$STATE_A/autonomy.kill"
 
 # 7c) dry-run forces DRYRUN=1 without a distill.dryrun file, and still proceeds
-run_a "CCC_AUTONOMY=dry-run"; rc=$?
+run_a "CCC_AUTONOMY=dry-run"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "autonomy=dry-run exits 0" '[ "$rc" = 0 ]'
 ok "autonomy=dry-run forces dryrun in start line" 'grep -q "start trigger=sessionend dryrun=1" "$STATE_A/distill.log"'
 ok "autonomy=dry-run still enqueues/spawns (not halted)" 'grep -qE "enqueued|enqueue dedup|spawned bg" "$STATE_A/distill.log"'

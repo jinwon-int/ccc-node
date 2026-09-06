@@ -102,15 +102,10 @@ SC_SCOPE_EXTRA=(scripts/git-hooks/managed-checkout-guard)
 # entry that becomes clean FAILS the run until it is removed; a NEW script
 # is never added here — it is linted at warning level from its first commit.
 SC_WARN_BASELINE=(bridge/service-install.test.sh
-         bridge/service-launchd.sh
-         claude/hooks/checkpoint.test.sh
-         claude/hooks/distill-scope.test.sh
          claude/hooks/distill/extract.test.sh
          claude/hooks/distill/local-facts.test.sh
          claude/hooks/distill/pending-drain.test.sh
          claude/hooks/distill/wiki-queue.test.sh
-         claude/hooks/lib/autonomy-guard.test.sh
-         claude/hooks/lib/detached_jobs.test.sh
          claude/hooks/lib/memory_render.test.sh
          claude/hooks/lib/mtime-prune.test.sh
          claude/hooks/lib/pending_promises.test.sh
@@ -120,12 +115,7 @@ SC_WARN_BASELINE=(bridge/service-install.test.sh
          claude/hooks/nunchi/codex-feed.test.sh
          claude/hooks/nunchi/judge-batch.test.sh
          claude/hooks/nunchi/nunchi.test.sh
-         claude/hooks/nunchi/sessionstart.test.sh
          claude/hooks/nunchi/wiki-promote.test.sh
-         claude/hooks/redact.test.sh
-         claude/hooks/refresh-memory-freshness.test.sh
-         claude/hooks/scan-injection.test.sh
-         claude/hooks/skill-review.test.sh
          claude/hooks/skill-review/autoinstall-incremental.test.sh
          claude/hooks/skill-review/autoinstall.test.sh
          claude/hooks/skill-review/codex-autoinstall.test.sh
@@ -156,9 +146,7 @@ SC_WARN_BASELINE=(bridge/service-install.test.sh
          scripts/ccc-pr-status-poll.test.sh
          scripts/ccc-provenance.test.sh
          scripts/ccc-security-audit.test.sh
-         scripts/ccc-self-update.sh
          scripts/ccc-self-update.test.sh
-         scripts/ccc-skill-autosave.sh
          scripts/ccc-skill-autosave.test.sh
          scripts/ccc-skill-promotion.test.sh
          scripts/ccc-skill-registry.test.sh
@@ -170,7 +158,6 @@ SC_WARN_BASELINE=(bridge/service-install.test.sh
          scripts/harness-paths.test.sh
          scripts/install-fleet-skills-sync-cron.test.sh
          scripts/install-memory-refresh-cron.test.sh
-         scripts/install-nunchi.sh
          scripts/install-nunchi.test.sh
          scripts/install-pr-status-poll-cron.test.sh
          scripts/install-skill-autosave-cron.test.sh
@@ -178,7 +165,6 @@ SC_WARN_BASELINE=(bridge/service-install.test.sh
          scripts/lib/installer-cron-common.test.sh
          scripts/rescreen-rotation.test.sh
          scripts/setup.test.sh
-         scripts/tunnel-audit-fleet.sh
          scripts/tunnel-audit-fleet.test.sh
          scripts/tunnel-audit.test.sh
          skills/skillsuggest/scan.sh)

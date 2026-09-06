@@ -174,8 +174,8 @@ else
     else
       log "review failed session=$sid (non-fatal)"
     fi
-  done < <(find "$PROJECTS_DIR" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" 2>/dev/null \
-             | xargs -r ls -t 2>/dev/null)
+  done < <(find "$PROJECTS_DIR" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" -print0 2>/dev/null \
+             | xargs -0 -r ls -t 2>/dev/null)
 
   # --- 2a) codex branch (#1353, opt-in) --------------------------------------
   # Codex sessions live in $CODEX_HOME/sessions/**/rollout-*.jsonl with a
@@ -270,8 +270,8 @@ else
       else
         log "codex review failed session=$sid (non-fatal)"
       fi
-    done < <(find "$codex_home/sessions" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" 2>/dev/null \
-               | xargs -r ls -t 2>/dev/null)
+    done < <(find "$codex_home/sessions" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" -print0 2>/dev/null \
+               | xargs -0 -r ls -t 2>/dev/null)
     log "codex sweep done drafted_sessions=$codex_drafted"
   fi
 
@@ -358,8 +358,8 @@ else
       else
         log "piri review failed session=$sid (non-fatal)"
       fi
-    done < <(find "$piri_home/sessions" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" 2>/dev/null \
-               | xargs -r ls -t 2>/dev/null)
+    done < <(find "$piri_home/sessions" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" -print0 2>/dev/null \
+               | xargs -0 -r ls -t 2>/dev/null)
     log "piri sweep done drafted_sessions=$piri_drafted"
   fi
 

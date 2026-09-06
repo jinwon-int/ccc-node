@@ -89,7 +89,7 @@ exec "$@"
 SH
 PATH="$TMP/bin:$PATH"
 
-out="$(payload sess-1 "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 bash "$REVIEW" sessionend 2>&1)"; rc=$?
+payload sess-1 "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 bash "$REVIEW" sessionend >/dev/null 2>&1; rc=$?
 ok "skill-review hook exits 0" '[ "$rc" = 0 ]'
 ok "skill-review uses the shared setsid spawn mode" 'grep -q "spawned bg pid=.* mode=setsid" "$STATE/skill-review.log"'
 for _ in $(seq 1 30); do
@@ -115,9 +115,9 @@ SPOOL_AUTO="$TMP/spool-auto"
 mkdir -p "$STATE_AUTO" "$SKILLS_AUTO"
 chmod 700 "$STATE_AUTO"
 chmod 700 "$SKILLS_AUTO"  # contract-compliant root under any umask (#770)
-out="$(payload sess-auto "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE_AUTO" CLAUDE_SKILLS_DIR="$SKILLS_AUTO" \
+payload sess-auto "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE_AUTO" CLAUDE_SKILLS_DIR="$SKILLS_AUTO" \
   CCC_PUSH_SPOOL="$SPOOL_AUTO" CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 \
-  bash "$REVIEW" sessionend 2>&1)"; rc=$?
+  bash "$REVIEW" sessionend >/dev/null 2>&1; rc=$?
 ok "auto-mode hook exits 0" '[ "$rc" = 0 ]'
 for _ in $(seq 1 40); do
   [ -f "$SKILLS_AUTO/deploy-checklist/SKILL.md" ] \
@@ -135,13 +135,13 @@ ok "auto mode writes no approval marker when nothing stays pending" '! grep -q "
 
 # Cooldown should skip a second hook-triggered run when enabled.
 : > "$STATE/skill-review.log"
-out="$(payload sess-1 "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_SKILL_REVIEW_COOLDOWN_SECONDS=9999 bash "$REVIEW" sessionend 2>&1)"; rc=$?
+payload sess-1 "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_SKILL_REVIEW_COOLDOWN_SECONDS=9999 bash "$REVIEW" sessionend >/dev/null 2>&1; rc=$?
 ok "cooldown run exits 0" '[ "$rc" = 0 ]'
 ok "cooldown skip logged" 'grep -q "skip reason=cooldown" "$STATE/skill-review.log"'
 
 # Recursion guard short-circuits before touching state.
 : > "$STATE/skill-review.log"
-out="$(CLAUDE_SKILL_REVIEW_INFLIGHT=1 CCC_SKILL_REVIEW_STATE_DIR="$STATE" bash "$REVIEW" sessionend <<<"$(payload sess-guard "$TRANS" "/root/work")" 2>&1)"; rc=$?
+CLAUDE_SKILL_REVIEW_INFLIGHT=1 CCC_SKILL_REVIEW_STATE_DIR="$STATE" bash "$REVIEW" sessionend <<<"$(payload sess-guard "$TRANS" "/root/work")" >/dev/null 2>&1; rc=$?
 ok "recursion guard exits 0" '[ "$rc" = 0 ]'
 ok "recursion guard logs nothing" '[ ! -s "$STATE/skill-review.log" ]'
 
@@ -150,10 +150,10 @@ STATE_DISABLED="$TMP/state-disabled"
 SNAPSHOT_DISABLED="$TMP/disabled-provider-env"
 mkdir -p "$STATE_DISABLED"
 : > "$STATE_DISABLED/skill-review.disabled"
-out="$(CLAUDE_SKILL_REVIEW_BG=1 CLAUDE_SKILL_REVIEW_INFLIGHT=1 \
+CLAUDE_SKILL_REVIEW_BG=1 CLAUDE_SKILL_REVIEW_INFLIGHT=1 \
   CLAUDE_SKILL_REVIEW_TRANSCRIPT="$TRANS" CLAUDE_SKILL_REVIEW_SESSION=sess-disabled \
   CLAUDE_ENV_SNAPSHOT="$SNAPSHOT_DISABLED" CCC_SKILL_REVIEW_STATE_DIR="$STATE_DISABLED" \
-  bash "$REVIEW" sessionend 2>&1)"; rc=$?
+  bash "$REVIEW" sessionend >/dev/null 2>&1; rc=$?
 ok "disabled background re-entry exits 0" '[ "$rc" = 0 ]'
 ok "disabled background re-entry never calls provider" '[ ! -e "$SNAPSHOT_DISABLED" ]'
 ok "disabled background re-entry is logged" 'grep -q "skip reason=disabled" "$STATE_DISABLED/skill-review.log"'
@@ -163,12 +163,14 @@ ok "disabled background re-entry is logged" 'grep -q "skip reason=disabled" "$ST
 SNAPSHOT_PROVIDER="$TMP/provider-env"
 SNAPSHOT_ARGS="$TMP/provider-args"
 SNAPSHOT_TOOL_ENV="$TMP/provider-tool-env"
-out="$(CLAUDE_SKILL_REVIEW_TRANSCRIPT="$TRANS" CLAUDE_SKILL_REVIEW_SESSION=sess-provider \
+CLAUDE_SKILL_REVIEW_TRANSCRIPT="$TRANS" CLAUDE_SKILL_REVIEW_SESSION=sess-provider \
   CLAUDE_SKILL_REVIEW_BG=1 CLAUDE_SKILL_REVIEW_INFLIGHT=1 CLAUDE_DISTILL_INFLIGHT=1 \
   CLAUDE_ENV_SNAPSHOT="$SNAPSHOT_PROVIDER" CLAUDE_ARGS_SNAPSHOT="$SNAPSHOT_ARGS" \
   CLAUDE_TOOL_ENV_SNAPSHOT="$SNAPSHOT_TOOL_ENV" \
   CCC_ALLOWED_TOOLS="Bash,Edit,Write" \
-  bash "$HERE/skill-review/extract.sh" 2>&1)"; rc=$?
+  bash "$HERE/skill-review/extract.sh" >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "provider environment probe exits 0" '[ "$rc" = 0 ]'
 ok "provider drops runner marker and keeps recursion guards" \
   '[ "$(cat "$SNAPSHOT_PROVIDER" 2>/dev/null)" = "unset|1|1" ]'

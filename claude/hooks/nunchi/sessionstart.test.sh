@@ -63,12 +63,15 @@ ok "opt-out restores legacy recency order (filler present)" 'grep -q "FILLER-HUG
 ok "opt-out truncates the constraint (the defect, honestly reproduced)" '! grep -q "CONSTRAINT-RULE-9001" <<<"$out"'
 
 # assembly failure (NUNCHI_DB is a directory → sqlite cannot open) falls back
-out="$(NUNCHI_DB="$TMP" bash "$HERE/sessionstart.sh" 2>/dev/null)"; rc=$?
+out="$(NUNCHI_DB="$TMP" bash "$HERE/sessionstart.sh" 2>/dev/null)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "assemble failure falls back to legacy head -c, rc 0" '[ "$rc" = 0 ] && grep -q "FILLER-HUGE" <<<"$out"'
 
 out="$(CCC_NUNCHI_MODE=off bash "$HERE/sessionstart.sh" 2>/dev/null)"
 ok "mode=off injects nothing" '[ -z "$out" ]'
 
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(CCC_NUNCHI_ASSEMBLE_BUDGET=200 bash "$HERE/sessionstart.sh" 2>/dev/null)"
 ok "tiny budget keeps the constraint and the hint match" 'grep -q "CONSTRAINT-RULE-9001" <<<"$out" && grep -q "HINTED-DECISION" <<<"$out"'
 

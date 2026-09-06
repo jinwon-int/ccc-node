@@ -78,10 +78,13 @@ ok "concurrent writers: bound is respected" \
 
 # ---- fail-open: unwritable dir never affects the caller ---------------------
 BAD="$TMP/bad"; : > "$BAD"   # a regular file where a dir is expected
-rc=0; CCC_STATE_DIR="$BAD/nope" ccc_autonomy_record distill kill x || rc=$?
+rc=0
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+CCC_STATE_DIR="$BAD/nope" ccc_autonomy_record distill kill x || rc=$?
 ok "record returns 0 even when dir unwritable" '[ "$rc" = 0 ]'
 
 # ---- no umask/env leak into caller -----------------------------------------
+# shellcheck disable=SC2034  # before is read via eval inside ok()
 before="$(umask)"
 ccc_autonomy_record distill kill leaktest
 ok "caller umask unchanged after record" '[ "$(umask)" = "$before" ]'
