@@ -51,6 +51,13 @@ does not introduce a second Telegram poller. A source change after the
 pre-stop gate can still fail the post-stop gate: retention and recovery are
 therefore required even after a successful preflight.
 
+When this command runs through the self-updater, its external command budget
+must include pre-stop validation, drain and readiness together. The default
+180s watchdog can be shorter than their combined duration; configure and
+measure the separate [restart command budget](self-update.md#budget-the-complete-external-command)
+in the updater environment before a transition. The post-restart health wait
+is a different limit.
+
 ## Receipts and recovery
 
 After validation under the token lock, each launch appends a private receipt

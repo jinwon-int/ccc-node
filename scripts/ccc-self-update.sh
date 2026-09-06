@@ -51,6 +51,8 @@
 #      CCC_SELF_UPDATE_AUTO_RECOVER (default 1; 0 restores the unconditional
 #      wrong-branch fail-closed abort, #1328),
 #      CCC_SELF_UPDATE_SYSTEMCTL (default systemctl; tests inject a fake),
+#      CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS (180; integer 1..900),
+#      CCC_SELF_UPDATE_RESTART_WAIT_SECONDS (60; separate health-probe budget),
 #      CCC_STATE_DIR, CCC_PUSH_SPOOL, CCC_NODE.
 # Idle gate: before touching anything the run defers (exit 8) while the telegram
 #      bridge is serving a request, so a restart cannot SIGTERM-kill an in-flight
@@ -79,6 +81,7 @@ REPO_FILE="$CLAUDE_DIR/self-update.repo"
 RESTART_CMD_FILE="${CCC_SELF_UPDATE_RESTART_CMD_FILE:-$CLAUDE_DIR/self-update.restart-cmd}"
 HEALTH_CMD_FILE="${CCC_SELF_UPDATE_HEALTH_CMD_FILE:-$CLAUDE_DIR/self-update.health-cmd}"
 RESTART_WAIT_SECONDS="${CCC_SELF_UPDATE_RESTART_WAIT_SECONDS:-60}"
+RESTART_COMMAND_TIMEOUT_SECONDS="${CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS-180}"
 BRANCH="${CCC_SELF_UPDATE_BRANCH:-main}"
 SYSTEMCTL="${CCC_SELF_UPDATE_SYSTEMCTL:-systemctl}"
 
@@ -175,10 +178,11 @@ run_external_restart() {
   local rcmd hcmd rc deadline remaining pause started
   rcmd="$(resolve_restart_cmd)" || return 1
   hcmd="$(resolve_health_cmd || true)"
-  log "external-restart begin"
-  run_bounded_operator_cmd 180 "$rcmd"
+  started=$SECONDS
+  log "external-restart begin timeout=${RESTART_COMMAND_TIMEOUT_SECONDS}s"
+  run_bounded_operator_cmd "$RESTART_COMMAND_TIMEOUT_SECONDS" "$rcmd"
   rc=$?
-  log "external-restart exit=$rc"
+  log "external-restart exit=$rc elapsed=$((SECONDS - started))s timeout=${RESTART_COMMAND_TIMEOUT_SECONDS}s"
   [ "$rc" -eq 0 ] || return "$rc"
   if [ -n "$hcmd" ]; then
     started=$SECONDS
@@ -360,6 +364,8 @@ if [ "$MODE" = "status" ]; then
   say "head: $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
   say "lock: $([ -d "$LOCK" ] && echo HELD || echo free)"
   say "services file: $SERVICES_FILE $([ -f "$SERVICES_FILE" ] && echo "($(grep -cv '^[[:space:]]*\(#\|$\)' "$SERVICES_FILE" 2>/dev/null || true) services)" || echo '(missing)')"
+  say "external restart command timeout: ${RESTART_COMMAND_TIMEOUT_SECONDS}s"
+  say "post-restart health budget: ${RESTART_WAIT_SECONDS}s"
   say "-- log (last 5) --"
   tail -5 "$LOG" 2>/dev/null
   exit 0
@@ -374,6 +380,14 @@ fi
 # its deadline at zero). Status remains available for invalid configuration.
 if [[ ! "$RESTART_WAIT_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$RESTART_WAIT_SECONDS" -gt 86400 ]; then
   say "self-update: CCC_SELF_UPDATE_RESTART_WAIT_SECONDS must be an integer in 1..86400" >&2
+  exit 2
+fi
+
+# A separate command budget covers preflight + drain + candidate readiness.
+# Cap at 15 minutes; never disable timeout or extend one restart past the
+# lock's 30-minute stale threshold. This is not a deadline for the whole tick.
+if [[ ! "$RESTART_COMMAND_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$RESTART_COMMAND_TIMEOUT_SECONDS" -gt 900 ]; then
+  say "self-update: CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS must be an integer in 1..900" >&2
   exit 2
 fi
 
