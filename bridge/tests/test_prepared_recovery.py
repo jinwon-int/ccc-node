@@ -54,6 +54,11 @@ try: fcntl.flock(poller, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError:
     event("overlap")
     raise SystemExit(91)
+# The production health reporter publishes the app PID in daemon mode, where
+# the shell records only its supervisor PID. Mirror that entrypoint duty after
+# acquiring the fixture poller lock; foreground launch already records our PID.
+fd = os.open(data / "bot.pid", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as stream: stream.write(str(os.getpid()) + "\\n")
 started = datetime.now(timezone.utc).isoformat()
 generation = capture_runtime_generation()
 event("start")
@@ -70,7 +75,7 @@ signal.signal(signal.SIGTERM, stop)
 try:
     while not stopping:
         health = dict(schema_version=1, updated_at=datetime.now(timezone.utc).isoformat(),
-            process=dict(pid=os.getpid(), started_at=started, mode="foreground"),
+            process=dict(pid=os.getpid(), started_at=started, mode=os.environ.get("BOT_PROCESS_MODE", "foreground")),
             runtime_generation=generation, service=dict(state="available" if mode == "ready" else "unavailable"),
             telegram=dict(state="healthy"), agent=dict(state="healthy", provider="codex"))
         temp = data / "health.tmp"
