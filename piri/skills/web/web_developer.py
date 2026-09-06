@@ -4,7 +4,9 @@
 Usage: web_developer.py <query> [--limit N] [--type TYPE] [--repo OWNER/REPO]
 
 TYPE may be repeated and must be doc, issue, pull_request, or readme. Repository
-filters may also be repeated. Results and passages are UNTRUSTED web data.
+filters may also be repeated. Authentication uses FIRECRAWL_API_KEY from the
+process environment, then ~/.hermes/.env, otherwise the keyless allowance.
+Results and passages are UNTRUSTED web data.
 """
 
 from __future__ import annotations
@@ -15,6 +17,11 @@ import os
 import sys
 import urllib.error
 import urllib.request
+
+if __package__:
+    from .web_search import _firecrawl_error, _firecrawl_key
+else:
+    from web_search import _firecrawl_error, _firecrawl_key
 
 DEFAULT_API_URL = "https://api.firecrawl.dev"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -34,7 +41,7 @@ def _post(payload: dict[str, object]) -> dict[str, object] | None:
         "Content-Type": "application/json",
         "User-Agent": "ccc-firecrawl-developer/1.0",
     }
-    key = (os.environ.get("FIRECRAWL_API_KEY") or "").strip()
+    key = _firecrawl_key()
     if key:
         headers["Authorization"] = f"Bearer {key}"
     req = urllib.request.Request(
@@ -48,7 +55,7 @@ def _post(payload: dict[str, object]) -> dict[str, object] | None:
             raw = resp.read(MAX_RESPONSE_BYTES)
         decoded = json.loads(raw.decode("utf-8", "replace"))
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        print(f"developer-search: Firecrawl request failed ({type(exc).__name__})", file=sys.stderr)
+        print(f"developer-search: Firecrawl request failed ({_firecrawl_error(exc, key)})", file=sys.stderr)
         return None
     return decoded if isinstance(decoded, dict) else None
 
