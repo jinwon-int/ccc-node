@@ -111,8 +111,9 @@ tree_sum() { find "$FIX/home" -type f -exec md5sum {} + | sort | md5sum; }
 seed_fixture
 write_inv
 DIGEST="$(make_plan)"
+# shellcheck disable=SC2034  # BEFORE is read via eval inside ok()
 BEFORE="$(tree_sum)"
-out="$(ERASURE_APPLY= python3 "$APPLY" node-decommission --inventory "$INV" \
+out="$(ERASURE_APPLY='' python3 "$APPLY" node-decommission --inventory "$INV" \
         --plan "$FIX/plan.json" --plan-digest "$DIGEST" --json)"; rc=$?
 ok "plan-only exits 0" '[ "$rc" = 0 ]'
 ok "plan-only names the mode and executable count" \
@@ -140,6 +141,7 @@ ok "wrong digest is blocked" '[ "$rc" = 4 ] && grep -q "does not match --plan-di
 ok "blocked run mutates nothing" '[ "$BEFORE" = "$(tree_sum)" ]'
 
 printf 'stray\n' > "$HOME_DIR/stray-orphan.bin"   # world drifts after planning
+# shellcheck disable=SC2034  # SUM_WITH_STRAY is read via eval inside ok()
 SUM_WITH_STRAY="$(tree_sum)"                       # drift-blocked runs change NOTHING else
 out="$(ERASURE_APPLY=1 python3 "$APPLY" node-decommission --inventory "$INV" \
         --plan "$FIX/plan.json" --plan-digest "$DIGEST")"; rc=$?
@@ -159,6 +161,7 @@ ok "non-delete actions are untouched" \
   '[ -f "$HOME_DIR/append-only.jsonl" ] && [ -f "$HOME_DIR/retained.md" ] && [ -f "$HOME_DIR/handoff.txt" ]'
 ok "dir target deferred to a later slice" \
   '[ -d "$HOME_DIR/cache-dir" ] && grep -qF "dir-target-needs-later-slice" <<<"$out"'
+# shellcheck disable=SC2034  # BACKUP is read via eval inside ok()
 BACKUP="$(grep -oE '"backup_dir": "[^"]+"' <<<"$out" | head -1 | cut -d'"' -f4)"
 ok "manifest recorded in owner-only backup dir" \
   '[ -n "$BACKUP" ] && [ -f "$BACKUP/manifest.json" ] && [ "$(stat -c %a "$BACKUP")" = 700 ]'
@@ -200,7 +203,9 @@ ok "blocked-by-backup run deletes nothing" '[ -f "$HOME_DIR/delete-me.log" ]'
 
 # --- 7) audience-erasure requires its key -------------------------------------
 python3 "$APPLY" audience-erasure --inventory "$INV" --plan "$FIX/plan.json" \
-  --plan-digest "$DIGEST" >/dev/null 2>&1; rc=$?
+  --plan-digest "$DIGEST" >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "audience-erasure without --audience exits 2" '[ "$rc" = 2 ]'
 
 echo "----------------------------------------"

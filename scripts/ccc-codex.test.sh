@@ -153,7 +153,9 @@ real_envs="$TMP/real-env-s"
 chmod 0700 "$real_envs"
 : > "$order"; : > "$stub_log"
 set +e
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(printf 'stdin data' | PATH="$stubdir:$PATH" ORDER_FILE="$order" ARGV_FILE="$argv" CWD_FILE="$cwd_file" MAT_RC=0 STATUS_RC=1 REAL_RC=23 CCC_CODEX_MEMORY_MATERIALIZER_PATH="$mat" CCC_CODEX_REAL_CLI_PATH="$real_envs" "$LAUNCHER" --alpha 2>"$err")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 set -e
 ok "env -S fixed args are honored ahead of the script path" \

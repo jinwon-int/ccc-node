@@ -46,6 +46,7 @@ exec /usr/bin/tar "$@"
 EOF
 chmod +x "$TMP/bin/tar"
 
+# shellcheck disable=SC2034  # settings_before is read via eval inside ok()
 settings_before="$(cat "$home/.claude/settings.json")"
 out="$(HOME="$home" PATH="$TMP/bin:$PATH" bash "$SETUP" 2>&1)"; rc=$?
 settings_after="$(cat "$home/.claude/settings.json")"
@@ -54,6 +55,7 @@ ok "setup fails closed when backup tar validation fails" '[ "$rc" = 1 ] && grep 
 ok "setup leaves existing settings untouched after failed backup validation" '[ "$settings_before" = "$settings_after" ]'
 
 out="$(HOME="$home" PATH="$TMP/bin:$PATH" bash "$SETUP" --no-backup 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # settings_after is read via eval inside ok()
 settings_after="$(cat "$home/.claude/settings.json")"
 ok "setup validates the private rollback snapshot before installing" \
   '[ "$rc" != 0 ] && [ "$settings_before" = "$settings_after" ]'
@@ -65,6 +67,7 @@ nonroot_wiki="$TMP/custom-wiki-agent/bin/wiki-agent"
 nonroot_bridge="$TMP/nonroot-workspace"
 out="$(HOME="$nonroot_home" CCC_CLAUDE_DIR="$nonroot_claude" CCC_HERMES_DIR="$nonroot_hermes" CCC_WIKI_AGENT_BIN="$nonroot_wiki" CCC_BRIDGE_DEFAULT_PATH="$nonroot_bridge" bash "$SETUP" --dry-run 2>&1)"; rc=$?
 ok "setup dry-run accepts explicit non-root path overrides" '[ "$rc" = 0 ] && grep -q "$nonroot_claude/CLAUDE.md" <<<"$out" && grep -q "CCC_HERMES_DIR=$nonroot_hermes" <<<"$out" && grep -q "$nonroot_wiki" <<<"$out" && grep -q -- "--path $nonroot_bridge" <<<"$out"'
+# shellcheck disable=SC2034  # escaped_hooks is read via eval inside ok()
 escaped_hooks="$(printf '%q' "$nonroot_claude/hooks")"
 ok "setup dry-run renders the shared argv plan with shell escaping" \
   'grep -Fq -- "[dry-run] mkdir -p $escaped_hooks" <<<"$out"'
@@ -101,6 +104,7 @@ HOME="$nonroot_home" CCC_SYSTEMD_DIR="$setup_sd" CCC_SYSTEMD_SCOPE=user \
   install --project-root "$setup_project" >/dev/null 2>&1
 setup_unit="$setup_sd/ccc-telegram-bridge.service"
 sed -i 's/^Restart=always$/Restart=on-failure/' "$setup_unit"
+# shellcheck disable=SC2034  # setup_unit_before is read via eval inside ok()
 setup_unit_before="$(sha256sum "$setup_unit")"
 : > "$setup_systemctl_calls"
 out="$(HOME="$nonroot_home" CCC_CLAUDE_DIR="$nonroot_claude" \
@@ -157,8 +161,11 @@ mkdir -p "$txn_claude/hooks" "$txn_hermes" "$TMP/fail-bin"
 printf '%s\n' '{"old":true}' > "$txn_claude/settings.json"
 printf '%s\n' 'old-hook' > "$txn_claude/hooks/old-local.sh"
 printf '%s\n' '{"oldLocal":true}' > "$txn_claude/settings.local.json"
+# shellcheck disable=SC2034  # settings_txn_before is read via eval inside ok()
 settings_txn_before="$(sha256sum "$txn_claude/settings.json")"
+# shellcheck disable=SC2034  # hook_txn_before is read via eval inside ok()
 hook_txn_before="$(sha256sum "$txn_claude/hooks/old-local.sh")"
+# shellcheck disable=SC2034  # local_txn_before is read via eval inside ok()
 local_txn_before="$(sha256sum "$txn_claude/settings.local.json")"
 cat > "$TMP/fail-bin/cp" <<'EOF'
 #!/usr/bin/env bash
@@ -189,6 +196,7 @@ if [ -f "$merge_filter" ]; then
   jq -s -f "$merge_filter" "$merge_base" "$merge_overlay" > "$merge_out" 2>/dev/null
   merge_rc=$?
 else
+  # shellcheck disable=SC2034  # merge_rc is read via eval inside ok()
   merge_rc=127
 fi
 ok "settings merge preserves both sides of a colliding hook event" \
@@ -200,6 +208,7 @@ printf '%s\n' '{"model":"base-without-hooks"}' > "$merge_base"
 printf '%s\n' '{"hooks":{"Stop":[{"hooks":[{"command":"overlay-stop"}]}]}}' > "$merge_overlay"
 missing_base_out="$TMP/merge-missing-base.json"
 jq -s -f "$merge_filter" "$merge_base" "$merge_overlay" > "$missing_base_out" 2>/dev/null
+# shellcheck disable=SC2034  # missing_base_rc is read via eval inside ok()
 missing_base_rc=$?
 ok "settings merge accepts a base without hooks" \
   '[ "$missing_base_rc" = 0 ] && jq -e '\''.model == "base-without-hooks" and (.hooks.Stop | length) == 1'\'' "$missing_base_out" >/dev/null'
@@ -208,6 +217,7 @@ printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"command":"base-start"}]}]}}
 printf '%s\n' '{"permissions":{"allow":[]}}' > "$merge_overlay"
 missing_overlay_out="$TMP/merge-missing-overlay.json"
 jq -s -f "$merge_filter" "$merge_base" "$merge_overlay" > "$missing_overlay_out" 2>/dev/null
+# shellcheck disable=SC2034  # missing_overlay_rc is read via eval inside ok()
 missing_overlay_rc=$?
 ok "settings merge accepts an overlay without hooks" \
   '[ "$missing_overlay_rc" = 0 ] && jq -e '\''(.hooks.SessionStart | length) == 1'\'' "$missing_overlay_out" >/dev/null'
@@ -215,6 +225,7 @@ ok "settings merge accepts an overlay without hooks" \
 printf '%s\n' '{"hooks":{"SessionStart":{}}}' > "$merge_base"
 printf '%s\n' '{"hooks":{"SessionStart":[]}}' > "$merge_overlay"
 jq -s -f "$merge_filter" "$merge_base" "$merge_overlay" > /dev/null 2>&1
+# shellcheck disable=SC2034  # invalid_hook_rc is read via eval inside ok()
 invalid_hook_rc=$?
 ok "settings merge rejects non-array hook event values" '[ "$invalid_hook_rc" != 0 ]'
 ok "setup uses the tracked collision-safe settings merge filter" \
@@ -227,6 +238,7 @@ rewrite_hermes="$TMP/rewrite-hermes"
 mkdir -p "$rewrite_claude"
 mkdir -p "$TMP/rewrite-home/.piri/agent"
 printf '%s\n' 'credential-note=/root/.claude/private' > "$rewrite_claude/.credentials.json"
+# shellcheck disable=SC2034  # credential_before is read via eval inside ok()
 credential_before="$(sha256sum "$rewrite_claude/.credentials.json")"
 out="$(HOME="$TMP/rewrite-home" CCC_CLAUDE_DIR="$rewrite_claude" CCC_HERMES_DIR="$rewrite_hermes" bash "$SETUP" --no-backup 2>&1)"; rc=$?
 ok "custom-path rewrite leaves node-local credentials untouched" \
@@ -237,6 +249,7 @@ ok "setup installs the opt-in central skill promoter executable" \
   '[ -x "$rewrite_claude/hooks/ccc-skill-promotion.py" ] && cmp -s "$ROOT/scripts/ccc-skill-promotion.py" "$rewrite_claude/hooks/ccc-skill-promotion.py"'
 ok "setup installs the exact-commit private skill sync executable" \
   '[ -x "$rewrite_claude/hooks/ccc-fleet-skills-sync.py" ] && cmp -s "$ROOT/scripts/ccc-fleet-skills-sync.py" "$rewrite_claude/hooks/ccc-fleet-skills-sync.py"'
+# shellcheck disable=SC2034  # rewrite_agent_cron is read via eval inside ok()
 rewrite_agent_cron="$rewrite_claude/state/agent-cron/tasks.json"
 ok "setup registers the self-update command task against the real agent-cron contract" \
   'jq -e --arg hook "$rewrite_claude/hooks/ccc-self-update.sh" '\''[.tasks[] | select(.id == "self-update" and .enabled == true and .notify == "telegram-owner-on-failure" and .successExitCodes == [0,8,11] and .payload.kind == "command" and .payload.argv == [$hook,"run"] and (.prompt | length > 0))] | length == 1'\'' "$rewrite_agent_cron" >/dev/null'
@@ -247,7 +260,9 @@ ok "setup registers the self-update command task against the real agent-cron con
 # but before service restart / audit record (silent half-apply, 9/12 fleet
 # nodes on 2026-08-07). The staged temp is created while the old inode is still
 # linked, so a rename-based install ALWAYS changes the destination inode.
+# shellcheck disable=SC2034  # selfupdate_ino_before is read via eval inside ok()
 selfupdate_ino_before="$(stat -c '%i' "$rewrite_claude/hooks/ccc-self-update.sh")"
+# shellcheck disable=SC2034  # hooktree_ino_before is read via eval inside ok()
 hooktree_ino_before="$(stat -c '%i' "$rewrite_claude/hooks/checkpoint.sh")"
 HOME="$TMP/rewrite-home" CCC_CLAUDE_DIR="$rewrite_claude" CCC_HERMES_DIR="$rewrite_hermes" \
   bash "$SETUP" --no-backup >/dev/null 2>&1
@@ -375,6 +390,7 @@ unit_run() { # unit_run <case-name> <snippet> — sandbox + extracted functions,
   local cdir="$TMP/unit/$1" snippet="$2"
   rm -rf "$cdir"; mkdir -p "$cdir/repo-skills" "$cdir/skills" "$cdir/state"
   ( set -uo pipefail
+    # shellcheck disable=SC2034  # DRY is read by the setup.sh functions sourced from $unit_functions below
     DRY=0
     run() { "$@"; }
     note() { printf '  - %s\n' "$*"; }
@@ -563,6 +579,7 @@ HOME="$disco_home" CCC_CLAUDE_DIR="$disco_claude" CCC_HERMES_DIR="$disco_home/.h
   bash "$SETUP" --no-backup >/dev/null 2>&1
 disco_skill="$disco_claude/skills/bridge-yield-continue/SKILL.md"
 printf '\nnode-local addendum (#1330 fixture)\n' >> "$disco_skill"
+# shellcheck disable=SC2034  # baseline is read via eval inside ok()
 baseline="$(awk '$1 == "bridge-yield-continue" { print $2 }' "$disco_claude/state/repo-skills.manifest")"
 out="$(HOME="$disco_home" CCC_CLAUDE_DIR="$disco_claude" CCC_HERMES_DIR="$disco_home/.hermes" \
   bash "$SETUP" --dry-run 2>&1)"
@@ -674,7 +691,10 @@ ok "installed local-memory transaction imports its colocated secure-fs helper" \
   'PYTHONDONTWRITEBYTECODE=1 PYTHONPATH= python3 "$rewrite_claude/hooks/ccc_local_memory_transaction.py" --help >/dev/null 2>&1'
 ok "source-checkout local-memory transaction imports canonical secure-fs directly" \
   'PYTHONDONTWRITEBYTECODE=1 PYTHONPATH= python3 -S "$ROOT/bridge/memory/local_memory_transaction.py" --help >/dev/null 2>&1'
-codex_dry_out="$(HOME="$nonroot_home" CCC_CLAUDE_DIR="$nonroot_claude" CCC_HERMES_DIR="$nonroot_hermes" CCC_WIKI_AGENT_BIN="$nonroot_wiki" CCC_BRIDGE_DEFAULT_PATH="$nonroot_bridge" bash "$SETUP" --dry-run 2>&1)"; codex_dry_rc=$?
+# shellcheck disable=SC2034  # codex_dry_out is read via eval inside ok()
+codex_dry_out="$(HOME="$nonroot_home" CCC_CLAUDE_DIR="$nonroot_claude" CCC_HERMES_DIR="$nonroot_hermes" CCC_WIKI_AGENT_BIN="$nonroot_wiki" CCC_BRIDGE_DEFAULT_PATH="$nonroot_bridge" bash "$SETUP" --dry-run 2>&1)"
+# shellcheck disable=SC2034  # codex_dry_rc is read via eval inside ok()
+codex_dry_rc=$?
 ok "setup non-root dry-run includes all Codex managed launch artifacts" \
   '[ "$codex_dry_rc" = 0 ] && grep -Fq "$nonroot_claude/hooks/ccc-codex" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc-piri" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_codex_memory.py" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_secure_fs.py" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_local_memory_transaction.py" <<<"$codex_dry_out"'
 
@@ -727,6 +747,7 @@ printf '%s\n' \
 chmod 600 "$policy_codex/config.toml"  # contract-compliant config under any umask (#772)
 HOME="$policy_home" CODEX_HOME="$policy_codex" CCC_CLAUDE_DIR="$policy_claude" \
   CCC_HERMES_DIR="$policy_hermes" bash "$SETUP" --no-backup >/dev/null 2>&1
+# shellcheck disable=SC2034  # policy_rc is read via eval inside ok()
 policy_rc=$?
 ok "setup honors CODEX_HOME while preserving unrelated Codex config" \
   '[ "$policy_rc" = 0 ] && grep -Fq '\''sentinel = "KEEP"'\'' "$policy_codex/config.toml" && grep -Fq '\''# preserve-this-comment'\'' "$policy_codex/config.toml" && grep -Fq '\''enabled = false # connector-first old state'\'' "$policy_codex/config.toml"'
@@ -753,6 +774,7 @@ mkdir -p "$codex_txn_codex"
 chmod 700 "$codex_txn_codex"
 printf '%s\n' 'sentinel = "RESTORE-ME"' '' '[plugins."github@openai-curated-remote"]' 'enabled = true' > "$codex_txn_codex/config.toml"
 chmod 600 "$codex_txn_codex/config.toml"
+# shellcheck disable=SC2034  # codex_txn_cfg_before is read via eval inside ok()
 codex_txn_cfg_before="$(sha256sum "$codex_txn_codex/config.toml")"
 out="$(HOME="$TMP/codex-txn-home" PATH="$TMP/fail-skills-bin:$PATH" \
   CCC_CLAUDE_DIR="$TMP/codex-txn-claude" CCC_HERMES_DIR="$TMP/codex-txn-hermes" CODEX_HOME="$codex_txn_codex" \
@@ -792,6 +814,7 @@ ok "root install wires no PreToolUse guard (TM-1306)" \
 
 # A node's accumulated/hand-added approvals must survive a re-run (the self-update path).
 printf '%s\n' '{"permissions":{"allow":["Bash(node-local-only:*)"]}}' > "$seed_claude/settings.local.json"
+# shellcheck disable=SC2034  # local_before is read via eval inside ok()
 local_before="$(sha256sum "$seed_claude/settings.local.json")"
 HOME="$seed_home" CCC_CLAUDE_DIR="$seed_claude" CCC_HERMES_DIR="$seed_hermes" \
   bash "$SETUP" --no-backup >/dev/null 2>&1
@@ -919,6 +942,7 @@ ok "plugin-mode install preserves the model pin too" \
 dm_claude="$TMP/dm-claude-1235"
 mkdir -p "$dm_claude"
 printf '{"model":"claude-opus-5"}\n' > "$dm_claude/settings.json"
+# shellcheck disable=SC2034  # dm_before is read via eval inside ok()
 dm_before="$(cat "$dm_claude/settings.json")"
 out="$(HOME="$TMP/dm-home-1235" CCC_CLAUDE_DIR="$dm_claude" CCC_HERMES_DIR="$TMP/dm-hermes-1235" \
   bash "$SETUP" --dry-run 2>&1)"
@@ -1084,8 +1108,11 @@ ok "owner guard resolves stat/id from a PREFIX-style dir and still aborts on mis
 # Outside the writable temp root the seam is ignored: the real system dirs are
 # used and the guard runs normally (same uid, so no abort and no skip note).
 mkdir -p "$TMP/elsewhere"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(HOME="$TMP/owner-guard-home" CCC_CLAUDE_DIR="$og_claude" CCC_HERMES_DIR="$TMP/owner-guard-hermes" \
-  TMPDIR="$TMP/elsewhere" CCC_SETUP_TEST_SYSBIN_DIRS="$TMP/no-such-bin" bash "$SETUP" --dry-run 2>&1)"; rc=$?
+  TMPDIR="$TMP/elsewhere" CCC_SETUP_TEST_SYSBIN_DIRS="$TMP/no-such-bin" bash "$SETUP" --dry-run 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "sysbin seam is refused when the install target is outside the temp root" \
   '[ "$rc" = 0 ] && ! grep -q "owner guard skipped" <<<"$out"'
 

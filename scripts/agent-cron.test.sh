@@ -260,8 +260,10 @@ mkdir -p "$(dirname "$RUN_STORE")"
 cat > "$RUN_STORE" <<'JSON'
 {"version":1,"tasks":[{"id":"runny","schedule":"* * * * *","prompt":"Summarize safely","enabled":true,"notify":"telegram-owner","allowedTools":["Read","Grep"],"permissionMode":"dontAsk","attachMemory":["MEMORY.md"],"attachSkills":["wiki-record"],"redactProfile":"owner","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60}]}
 JSON
+# shellcheck disable=SC2034  # before is read via eval inside ok()
 before="$(find "$TMP" -type f -printf '%P %s %T@\n' | sort)"
 out="$(CCC_AGENT_CRON_STORE="$RUN_STORE" CCC_HEADLESS_CMD="$TMP/fake-headless.sh" bash "$CMD" run runny --dry-run --json --at 2026-01-01T00:01:00Z)"; rc=$?
+# shellcheck disable=SC2034  # after is read via eval inside ok()
 after="$(find "$TMP" -type f -printf '%P %s %T@\n' | sort)"
 ok "run --dry-run emits deterministic execution plan JSON" '[ "$rc" = 0 ] && jq -e ".ok == true and .mode == \"run-dry-run-read-only\" and .taskId == \"runny\" and .due == true and .scheduledAt == \"2026-01-01T00:01:00Z\"" <<<"$out" >/dev/null'
 ok "run --dry-run includes headless and task policy" '[ "$rc" = 0 ] && jq -e ".headless.command == \"$TMP/fake-headless.sh\" and .headless.permissionMode == \"dontAsk\" and (.headless.allowedTools == [\"Read\",\"Grep\"]) and (.headless.attachMemory == [\"MEMORY.md\"]) and (.headless.attachSkills == [\"wiki-record\"])" <<<"$out" >/dev/null'
@@ -841,7 +843,10 @@ out="$(CCC_AGENT_CRON_STORE="$STORE" bash "$CMD" run no-such-task --dry-run --at
 ok "unknown task id (dry-run) exits 1" '[ "$rc" = 1 ]'
 ok "unknown task id (dry-run) does not traceback" '! grep -qE "Traceback|KeyError" <<<"$out"'
 
-out="$(CCC_AGENT_CRON_STORE="$STORE" bash "$CMD" run no-such-task --json --at 2026-01-01T00:02:00Z 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_AGENT_CRON_STORE="$STORE" bash "$CMD" run no-such-task --json --at 2026-01-01T00:02:00Z 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "unknown task id --json stays machine-readable" '[ "$rc" = 1 ] && jq -e ".ok == false and .error == \"task id not found\"" <<<"$out" >/dev/null'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"

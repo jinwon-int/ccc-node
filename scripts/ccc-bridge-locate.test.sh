@@ -25,6 +25,7 @@ mk_checkout() { # <dir> <branch>
 CO_A="$TMP/co-a"; mk_checkout "$CO_A" main
 CO_B="$TMP/co-b"; mk_checkout "$CO_B" feat/x
 echo dirty > "$CO_B/uncommitted.txt"   # 1 untracked file → dirty=1
+# shellcheck disable=SC2034  # HEAD_A is read via eval inside ok()
 HEAD_A="$(git -C "$CO_A" rev-parse --short HEAD)"
 # shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
 HEAD_B="$(git -C "$CO_B" rev-parse --short HEAD)"
@@ -49,6 +50,7 @@ EOF
 run() { # <ps-fixture> <args...> → stdout; rc in $RC
     local fixture="$1"; shift
     RC=0
+    # shellcheck disable=SC2034  # OUT is read via eval inside ok()
     OUT="$(CCC_BRIDGE_LOCATE_PS="cat $fixture" \
            CCC_BRIDGE_LOCATE_CANDIDATES="$CO_A:$CO_B:$TMP/co-nogit:$CO_A" \
            bash "$SUT" "$@")" || RC=$?

@@ -93,7 +93,10 @@ ok "state no longer tracks PR 10" 'jq -e ".\"acme/repo\" | has(\"10\") | not" "$
 
 # --- 6) invalid repo-line is skipped without aborting the run ----------------
 printf '%s\n' 'acme/repo bot' 'not-a-valid-line' > "$CLAUDE/pr-status-poll.repos"
-GH_FAKE_LIST_JSON="$TMP/list3.json" out="$(run_poll run 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+GH_FAKE_LIST_JSON="$TMP/list3.json" out="$(run_poll run 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "invalid line does not abort the run" '[ "$rc" = 0 ]'
 
 # --- 7) a NEUTRAL check conclusion counts as SUCCESS, not PENDING ------------

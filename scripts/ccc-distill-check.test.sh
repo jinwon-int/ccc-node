@@ -51,7 +51,10 @@ out="$(bash "$CHECK" --json 2>&1)"; rc=$?
 ok "disabled mode detected" '[ "$rc" = 0 ] && jq -e ".mode == \"OFF\"" <<<"$out" >/dev/null'
 rm -f "$TMP/state/distill.disabled"
 touch "$TMP/state/distill.dryrun"
-out="$(bash "$CHECK" 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(bash "$CHECK" 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "text output exits 0" '[ "$rc" = 0 ]'
 ok "text output shows dry-run" 'grep -q "mode:" <<<"$out" && grep -q "DRY-RUN" <<<"$out"'
 echo "----"; echo "PASS=$pass FAIL=$fail"

@@ -60,7 +60,10 @@ ok "triage redacts unlabelled tokens" '[ "$rc" = 0 ] && ! grep -q "$gh_tok" <<<"
 out="$(CCC_STATE_DIR="$state2" bash "$ROOT/scripts/ccc-wiki-triage.sh" show CAND-011)"; rc=$?
 ok "triage redacts the whole PEM block including its body" '[ "$rc" = 0 ] && ! grep -q "MIIEowIBAAKCAQEA" <<<"$out" && ! grep -q "BEGIN RSA PRIVATE KEY" <<<"$out" && jq -e ".candidate.redaction_applied == true" <<<"$out" >/dev/null'
 
-out="$(CCC_STATE_DIR="$state2" bash "$ROOT/scripts/ccc-wiki-triage.sh" show CAND-012)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_STATE_DIR="$state2" bash "$ROOT/scripts/ccc-wiki-triage.sh" show CAND-012)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "triage leaves ordinary prose intact" '[ "$rc" = 0 ] && grep -q "broker tunnel is documented" <<<"$out" && jq -e ".candidate.redaction_applied == false" <<<"$out" >/dev/null'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"

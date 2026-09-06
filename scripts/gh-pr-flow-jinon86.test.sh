@@ -110,7 +110,7 @@ run_wrapper() {
   CCC_JINON86_GH_CONFIG_DIR="$TMP/review-config" \
     bash "$WRAPPER" --repo jinwon-int/ccc-node --pr 948 \
       --expected-head "$HEAD_SHA" --ssh-target seoseo \
-      --operator-approved "$@"
+      --operator-approved
 }
 
 if CCC_JINON86_GH_CONFIG_DIR="$TMP/review-config" \

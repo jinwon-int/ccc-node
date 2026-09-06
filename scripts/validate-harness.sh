@@ -108,48 +108,24 @@ SC_WARN_BASELINE=(bridge/service-install.test.sh
          claude/hooks/lib/test-stub.test.sh
          claude/hooks/memory-hooks.test.sh
          claude/hooks/nunchi/assemble-fixtures.test.sh
-         claude/hooks/nunchi/judge-batch.test.sh
-         claude/hooks/nunchi/nunchi.test.sh
-         claude/hooks/nunchi/wiki-promote.test.sh
          claude/hooks/skill-review/autoinstall.test.sh
          claude/hooks/skill-review/curator.test.sh
          claude/hooks/skill-review/ownership-incremental.test.sh
          piri/skills/web/web_tools.test.sh
-         scripts/a2a-review-handler.test.sh
-         scripts/a2a-termux-native-worker.test.sh
-         scripts/agent-cron.test.sh
-         scripts/canonical-paths.test.sh
-         scripts/ccc-bridge-locate.test.sh
          scripts/ccc-codex-github-policy.test.sh
-         scripts/ccc-codex.test.sh
-         scripts/ccc-distill-check.test.sh
          scripts/ccc-distill-fleet-matrix.test.sh
-         scripts/ccc-doctor.test.sh
-         scripts/ccc-erasure-apply.test.sh
-         scripts/ccc-erasure-handoff.test.sh
-         scripts/ccc-erasure-planner.test.sh
          scripts/ccc-fleet-matrix.test.sh
          scripts/ccc-fleet-skills-sync.test.sh
-         scripts/ccc-live-backups-rotate.test.sh
          scripts/ccc-memory.test.sh
-         scripts/ccc-piri.test.sh
-         scripts/ccc-pr-status-poll.test.sh
-         scripts/ccc-provenance.test.sh
          scripts/ccc-security-audit.test.sh
          scripts/ccc-self-update.test.sh
          scripts/ccc-skill-autosave.test.sh
          scripts/ccc-skill-promotion.test.sh
          scripts/ccc-skill-registry.test.sh
-         scripts/ccc-wiki-triage.test.sh
-         scripts/codex-rollout-normalize.test.sh
-         scripts/cost-ledger-weekly.test.sh
          scripts/cost-ledger.test.sh
-         scripts/gh-pr-flow-jinon86.test.sh
-         scripts/harness-paths.test.sh
          scripts/install-nunchi.test.sh
          scripts/install-tunnel-audit-cron.test.sh
          scripts/rescreen-rotation.test.sh
-         scripts/setup.test.sh
          scripts/tunnel-audit-fleet.test.sh
          scripts/tunnel-audit.test.sh)
 # --- end manifests -----------------------------------------------------------

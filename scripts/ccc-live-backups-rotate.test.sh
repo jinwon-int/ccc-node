@@ -33,28 +33,28 @@ run_rotate() { # <extra-roots...>
 
 # --- 1) prunes to KEEP newest -------------------------------------------------
 mkbackups "$TMP/lb1" 8
-out="$(run_rotate "$TMP/lb1")"; rc=$?
+run_rotate "$TMP/lb1" >/dev/null; rc=$?
 ok "keeps the 5 newest backups" '[ "$rc" = 0 ] && [ "$(ls "$TMP/lb1" | wc -l)" = 5 ] && [ -d "$TMP/lb1/b008" ] && [ -d "$TMP/lb1/b004" ] && [ ! -d "$TMP/lb1/b003" ]'
 ok "writes a body-free log line" 'grep -qE "pruned=3 failed=0 keep=5" "$CCC_STATE_DIR/live-backups-rotate.log"'
 
 # --- 2) nothing to prune is a quiet success ------------------------------------
 mkbackups "$TMP/lb2" 3
-out="$(run_rotate "$TMP/lb2")"; rc=$?
+run_rotate "$TMP/lb2" >/dev/null; rc=$?
 ok "under-cap root prunes nothing" '[ "$rc" = 0 ] && [ "$(ls "$TMP/lb2" | wc -l)" = 3 ]'
 
 # --- 3) duplicate roots are processed once --------------------------------------
 mkbackups "$TMP/lb3" 7
-out="$(run_rotate "$TMP/lb3" "$TMP/lb3")"; rc=$?
+run_rotate "$TMP/lb3" "$TMP/lb3" >/dev/null; rc=$?
 ok "duplicate root entry is de-duplicated" '[ "$rc" = 0 ] && [ "$(ls "$TMP/lb3" | wc -l)" = 5 ] && [ "$(grep -c "pruned=" "$CCC_STATE_DIR/live-backups-rotate.log" 2>/dev/null)" = 3 ]'
 
 # --- 4) missing roots are skipped ------------------------------------------------
-out="$(run_rotate "$TMP/no-such-dir" "$TMP/lb2")"; rc=$?
+run_rotate "$TMP/no-such-dir" "$TMP/lb2" >/dev/null; rc=$?
 ok "missing roots are skipped without failure" '[ "$rc" = 0 ]'
 
 # --- 5) prune failure exits non-zero ----------------------------------------------
 mkbackups "$TMP/lb4" 7
 chmod 555 "$TMP/lb4"
-out="$(run_rotate "$TMP/lb4")"; rc=$?
+run_rotate "$TMP/lb4" >/dev/null; rc=$?
 chmod 755 "$TMP/lb4"
 if [ "$(id -u)" = 0 ]; then
   # root ignores directory write bits; simulate the failure with a read-only rm
@@ -65,7 +65,9 @@ fi
 
 # --- 6) never touches the root itself or non-children ----------------------------
 mkbackups "$TMP/lb5" 6
-out="$(run_rotate "$TMP/lb5" "$TMP/lb5/")"; rc=$?
+run_rotate "$TMP/lb5" "$TMP/lb5/" >/dev/null
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "trailing-slash duplicate and the root itself are untouched" '[ "$rc" = 0 ] && [ -d "$TMP/lb5" ] && [ "$(ls "$TMP/lb5" | wc -l)" = 5 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
