@@ -60,7 +60,9 @@ ok "missing scanner fails open with raw text" \
 ok "missing scanner stays quiet (expected branch, no alarm)" '! grep -qi "UNSCANNED" <<<"$out"'
 printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/failing-scanner"
 chmod +x "$TMP/failing-scanner"
-out="$(CCC_STATE_DIR="$scan_state" CCC_SCAN_INJECTION_BIN="$TMP/failing-scanner" bash "$CHECKPOINT" PostCompact 2>"$TMP/fail-scan.err")"; rc=$?
+out="$(CCC_STATE_DIR="$scan_state" CCC_SCAN_INJECTION_BIN="$TMP/failing-scanner" bash "$CHECKPOINT" PostCompact 2>"$TMP/fail-scan.err")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "failing scanner fails open with raw text" \
   '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | contains(\"progress note\")" <<<"$out" >/dev/null'
 ok "failing scanner is noted on stderr, not silent (#1160)" 'grep -qi "UNSCANNED" "$TMP/fail-scan.err"'
@@ -172,6 +174,7 @@ ok "fresh working-state has no STALE banner" '! grep -q "STALE" <<<"$ctx"'
 
 # CCC_CKPT_STALE_DAYS=0 disables the guard without touching the content.
 out="$(CCC_STATE_DIR="$stale_dir" CCC_CKPT_STALE_DAYS=0 bash "$CHECKPOINT" PostCompact 2>&1)"
+# shellcheck disable=SC2034  # ctx is read via eval inside ok()
 ctx="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")"
 ok "CCC_CKPT_STALE_DAYS=0 disables the stale banner" \
   '! grep -q "STALE" <<<"$ctx" && grep -q "ancient objective" <<<"$ctx"'

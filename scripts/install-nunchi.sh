@@ -538,7 +538,7 @@ detect_provider() {
   local root bridge_status=""
   root="$(cd "$(dirname "$0")/.." && pwd)"
   if [ -f "$root/bridge/start.sh" ]; then
-    bridge_status="$(HOME="$HOME" bash "$root/bridge/start.sh" --path "$HOME" --status 2>/dev/null || true)"
+    bridge_status="$(bash "$root/bridge/start.sh" --path "$HOME" --status 2>/dev/null || true)"
   fi
   if grep -q 'Piri: healthy' <<<"$bridge_status"; then printf 'piri'; return; fi
   if grep -q 'Codex: healthy' <<<"$bridge_status"; then printf 'codex'; return; fi

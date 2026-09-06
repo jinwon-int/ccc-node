@@ -61,7 +61,8 @@ ok "benign prompt is not audited" '[ ! -s "$CCC_AUDIT_LOG" ]'
 # 4) Robustness: empty and non-JSON stdin are silent successes
 out="$(printf '' | bash "$HOOK" 2>/dev/null)"; rc=$?
 ok "empty stdin exits 0 silently" '[ "$rc" = 0 ] && [ -z "$out" ]'
-out="$(printf 'not json at all' | bash "$HOOK" 2>/dev/null)"; rc=$?
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
+{ out="$(printf 'not json at all' | bash "$HOOK" 2>/dev/null)"; rc=$?; }
 ok "non-JSON stdin exits 0 silently" '[ "$rc" = 0 ] && [ -z "$out" ]'
 
 # 5) The hook never mutates or blocks: output (when present) is pure JSON context

@@ -255,7 +255,7 @@ PY
 restore_installed_artifacts() {
   local item failed=0
   for item in "${CCC_MANAGED_PATHS[@]}"; do
-    rm -rf -- "$CLAUDE_DIR/$item" || failed=1
+    rm -rf -- "${CLAUDE_DIR:?}/$item" || failed=1
   done
   mkdir -p "$CLAUDE_DIR" "$HERMES_ROOT" || failed=1
   tar -xzf "$CLAUDE_SNAPSHOT" -C "$CLAUDE_DIR" || failed=1

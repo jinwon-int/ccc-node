@@ -84,6 +84,7 @@ ok "first refresh calls the wiki prefetch" \
   '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ]'
 ok "first refresh records only hashes, never the query" \
   'jq -e ".status == \"ok\" and (.query_hash | length) == 64 and has(\"query\") == false" "$cache/.wiki.status.json" >/dev/null'
+# shellcheck disable=SC2034  # first_refreshed_at is read via eval inside ok()
 first_refreshed_at="$(jq -r '.refreshed_at' "$cache/.wiki.status.json")"
 # #1484: per-source status files are written tmp+mv (atomic, like meta.json) and
 # duration_ms comes from EPOCHREALTIME (no python3 fork) — still an integer.
@@ -130,7 +131,8 @@ out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"
 ok "no flock: a live lock dir keeps the run single-flight" \
   '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 6 ] && [ -d "$lockdir" ]'
 touch -d '-2 hours' "$lockdir"
-out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
+{ out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?; }
 ok "no flock: a stale lock dir from a dead holder is reclaimed" \
   '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 7 ] && [ ! -d "$lockdir" ]'
 
