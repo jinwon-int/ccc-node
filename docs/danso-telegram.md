@@ -38,6 +38,7 @@ CCC_DANSO_STATE_DIR=/var/lib/ccc-danso/gongmyoung
 CCC_DANSO_MODEL=gpt-6-astra
 CCC_DANSO_EFFORT=medium
 CCC_BRIDGE_MEMORY_MODE=off
+CCC_MEMORY_DISTILL_PROVIDER=off
 CCC_DANSO_TIMEOUT_SECONDS=300
 CCC_DANSO_PROVIDER_TIMEOUT_SECONDS=60
 CCC_DANSO_MAX_TURNS=32
@@ -73,12 +74,15 @@ bridge is a separate operational step; source development does not switch a node
   disabled for Danso so an unresolved journal cannot be abandoned silently.
 - `/stop` terminates and reaps the owned process group. Journals are retained.
   Native unresolved tool operations remain blocked; the bridge never repairs,
-  acknowledges, or automatically replays them.
+  acknowledges, or automatically replays them. If startup failed before creating
+  a journal, the saved ID is deliberately retained; the next attempt explains
+  that the journal is unavailable. Check the prior work, then use `/new`.
 - Completed runs record request and input/output token counters in the local
   usage meter. Cache input is included. Failed runs may have incurred unreported
   usage; counters are not a complete billing statement or account quota.
 - CCC memory routing/bootstrap/distill, asynchronous completion injection,
   external-wait routing, transcript browsing and `/revert` are unsupported.
+  Explicit cross-provider distill overrides also fail at startup.
   Non-off CCC memory modes fail at startup instead of silently using shared
   memory. Native Danso journal compaction remains enabled independently.
 - Danso always enforces its workspace bubblewrap sandbox; Codex approval and

@@ -20,6 +20,8 @@ def _configuration(settings: Settings) -> tuple[str, Path]:
     """Validate locally, without creating state or contacting any provider."""
     if settings.bridge_memory_mode != "off":
         raise ValueError("Danso requires CCC_BRIDGE_MEMORY_MODE=off; memory routing is unsupported")
+    if settings.memory_distill_provider not in {"auto", "off"}:
+        raise ValueError("Danso requires CCC_MEMORY_DISTILL_PROVIDER=auto or off; extraction is unsupported")
     if settings.danso_model != "gpt-6-astra":
         raise ValueError("Danso Telegram currently supports gpt-6-astra")
     if not settings.openai_api_key or not settings.openai_api_key.strip():
@@ -33,7 +35,9 @@ def _configuration(settings: Settings) -> tuple[str, Path]:
     if not cwd.is_dir() or cwd.resolve() != cwd:
         raise ValueError("Danso workspace must exist and contain no symlinks")
     protected = (Path(settings.bot_data_dir), Path(settings.session_store_path),
-                 Path(settings.project_root) / ".telegram_bot")
+                 Path(settings.project_root) / ".telegram_bot",
+                 Path(__file__).resolve().parents[1] / ".env",
+                 Path(os.environ.get("CCC_BOT_ENV_FILE", str(Path(__file__).resolve().parents[1] / ".env"))))
     if any(cwd.is_relative_to(p.resolve()) or p.resolve().is_relative_to(cwd) for p in protected):
         raise ValueError("Danso workspace must not expose bridge configuration or session storage")
     if root.resolve() != root or root.is_relative_to(cwd) or cwd.is_relative_to(root):
@@ -81,7 +85,12 @@ class DansoRuntime(WorkerRuntime):
         effort = request.effort or self.default_effort
         if effort not in ASTRA_EFFORTS:
             raise ValueError("unsupported Astra effort")
-        return await super().start_or_resume(replace(request, effort=effort))
+        try:
+            return await super().start_or_resume(replace(request, effort=effort))
+        except FileNotFoundError:
+            if not request.session_id:
+                raise ValueError("Danso workspace is unavailable.") from None
+            raise ValueError("Stored Danso journal is unavailable. Check previous work, then use /new; no automatic replay.") from None
 
 
 def build_danso_runtime(settings: Settings) -> DansoRuntime:

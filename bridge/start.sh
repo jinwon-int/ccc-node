@@ -1540,7 +1540,7 @@ load_optional_env() {
 
 maybe_setup_agent_cli() {
     local provider codex_cli piri_cli danso_cli
-    provider="$(read_env_with_fallback "CCC_AGENT_PROVIDER")"
+    provider="${CCC_AGENT_PROVIDER:-$(read_env_with_fallback "CCC_AGENT_PROVIDER")}"
     provider="${provider:-claude}"
 
     case "${provider,,}" in
@@ -1560,7 +1560,7 @@ maybe_setup_agent_cli() {
             return
             ;;
         danso)
-            danso_cli="$(read_env_with_fallback "CCC_DANSO_CLI_PATH")"
+            danso_cli="${CCC_DANSO_CLI_PATH:-$(read_env_with_fallback "CCC_DANSO_CLI_PATH")}"
             danso_cli="${danso_cli:-danso}"
             if ! command -v "$danso_cli" >/dev/null 2>&1; then
                 echo "❌ Error: Danso CLI unavailable; set CCC_DANSO_CLI_PATH"

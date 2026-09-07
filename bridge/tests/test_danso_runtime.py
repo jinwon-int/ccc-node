@@ -166,6 +166,7 @@ async def test_environment_is_explicit_and_model_options_are_accurate(configured
 
 @pytest.mark.parametrize('field,value',[
     ('bridge_memory_mode','curated'),('bridge_memory_mode','audience-scoped'),
+    ('memory_distill_provider','claude'),('memory_distill_provider','codex'),('memory_distill_provider','piri'),
     ('danso_model','wrong-model'),('openai_api_key',None),('danso_state_dir','relative'),
     ('danso_cli_path','/nonexistent/danso'),('process_timeout_seconds',1),
     ('danso_workspace',None),('danso_workspace','relative'),
@@ -299,3 +300,44 @@ def test_task_workspace_cannot_expose_bridge_control_or_credential_files(configu
     ok, reason = probe_danso_readiness(settings)
     assert not ok and "bridge configuration or session storage" in reason
     assert not Path(configured.danso_state_dir).exists()
+
+
+def test_health_writer_and_renderer_preserve_danso_identity(tmp_path):
+    from telegram_bot.utils.health import RuntimeHealthReporter
+    from telegram_bot.utils.health_render import render_status_lines
+    reporter = RuntimeHealthReporter(tmp_path, agent_provider="danso")
+    reporter.record_agent_ok()
+    state = json.loads((tmp_path / "health.json").read_text())
+    assert state["agent"]["provider"] == "danso"
+    assert reporter.snapshot()["agent"]["provider"] == "danso"
+    assert "Danso" in str(render_status_lines(tmp_path / "health.json", str(os.getpid()), 90, "danso"))
+
+
+@pytest.mark.anyio
+async def test_missing_journal_is_explicit_and_new_session_is_the_recovery(configured):
+    from telegram_bot.__main__ import build_context
+    context = build_context(configured)
+    context.session_manager.initialize()
+    binary = Path(configured.danso_cli_path)
+    normal = binary.read_text()
+    binary.write_text("#!/bin/sh\nexit 2\n")
+    failed = await context.project_chat.process_message("ok", 7, 9)
+    assert not failed.success
+    stored = await context.session_manager.get_session("7:9")
+    assert stored["session_id"] == failed.session_id
+    assert not list(context.agent_runtime.root.glob("*.jsonl"))
+    binary.write_text(normal)
+    resumed = await context.project_chat.process_message("ok", 7, 9, session_id=stored["session_id"])
+    assert not resumed.success and "use /new" in resumed.error
+    assert not (Path(configured.danso_workspace) / "argv.json").exists()
+    fresh = await context.project_chat.process_message("ok", 7, 9, new_session=True)
+    assert fresh.success and fresh.session_id != stored["session_id"]
+    await context.project_chat.close()
+
+
+def test_workspace_cannot_expose_package_or_redirected_bot_env(configured, monkeypatch):
+    import telegram_bot.core.danso_runtime as module
+    package = Path(module.__file__).resolve().parents[1]
+    assert not probe_danso_readiness(configured.model_copy(update={"danso_workspace": str(package)}))[0]
+    monkeypatch.setenv("CCC_BOT_ENV_FILE", str(Path(configured.danso_workspace) / "bot.env"))
+    assert not probe_danso_readiness(configured)[0]
