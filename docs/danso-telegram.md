@@ -12,8 +12,8 @@ occurs. Danso owns the runtime in both modes.
 
 Use Linux 5.3+ with procfs/pidfds, Bash and Python 3.11+. Bubblewrap is optional. Build a reviewed Danso checkout with
 `cargo build --locked --release` (tested CLI baseline: jinwon-int/danso
-`91439fc5e6c1d7457c6e932cdb7f84d085464c7b`, including the independently reviewed
-native `auth-adopt` and managed renewal feature). Install the executable at an
+`1d6ecbeb29fa8efb6bdb5f44f11db47236cd9c78`, including native `auth-adopt`, managed
+renewal and completed SSE output-item handling). Install the executable at an
 operator-controlled absolute path. ccc-node bundles the bounded subprocess
 adapter derived from Danso's `integrations/ccc_node.py`; the Danso
 Python repository does not need to be on `PYTHONPATH`.
