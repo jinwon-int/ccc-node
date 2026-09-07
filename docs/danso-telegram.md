@@ -3,16 +3,19 @@
 Set `CCC_AGENT_PROVIDER=danso` to route normal Telegram turns through the
 Danso CLI. This initial integration supports OpenAI Responses with
 `gpt-6-astra` and `low`, `medium`, `high`, `xhigh`, or `max` reasoning effort.
-The default is `medium`. It uses an explicit OpenAI API key; Codex subscription
-OAuth credentials are not accepted or discovered.
+The default is `medium`. Select `CCC_DANSO_AUTH_MODE=api-key` (default) for
+Platform Responses or `chatgpt` for an explicitly selected subscription auth
+file. No credential discovery or fallback between billing/authentication modes
+occurs. Danso owns the runtime in both modes.
 
 ## Prepare the runtime
 
 Use Linux 5.3+ with procfs/pidfds, Bash and Python 3.11+. Bubblewrap is optional. Build a reviewed Danso checkout with
 `cargo build --locked --release` (tested CLI baseline: jinwon-int/danso
-`8ebdd822ab46c6b23471c08f3d023adfd81d767f`). Install the executable at an
+`051536b02320f1d319b31c00fd653eecb47bc441` for read-only subscription credentials;
+managed renewal additionally requires the reviewed native `auth-adopt` feature). Install the executable at an
 operator-controlled absolute path. ccc-node bundles the bounded subprocess
-adapter derived from that revision's `integrations/ccc_node.py`; the Danso
+adapter derived from Danso's `integrations/ccc_node.py`; the Danso
 Python repository does not need to be on `PYTHONPATH`.
 
 Choose a dedicated task workspace with `CCC_DANSO_WORKSPACE`, separate from
@@ -51,6 +54,44 @@ Supply `OPENAI_API_KEY` through the existing private environment/configuration
 channel. This is also the existing Whisper key setting. An explicitly configured
 `DANSO_OPENAI_BASE_URL` changes only Danso's endpoint. Neither setting is inferred
 from Codex authentication or the Whisper endpoint setting.
+For subscription OAuth, configure these additional values instead:
+
+```dotenv
+CCC_DANSO_AUTH_MODE=chatgpt
+DANSO_CHATGPT_AUTH_FILE=/private/isolated-login/danso-auth.json
+# DANSO_CHATGPT_BASE_URL=https://chatgpt.com/backend-api/codex
+```
+
+Complete official Codex login in an isolated login home first. For managed
+renewal, stop every Codex consumer of that isolated home and use the reviewed
+native `danso auth-adopt --source /private/isolated-login/auth.json` command.
+Select its resulting `danso-auth.json` path explicitly. The bridge never adopts,
+reads token contents, repairs pending state, or refreshes credentials itself;
+Danso owns these operations. A read-only Codex auth.json may also be selected,
+but it requires explicit renewal/relogin when the access token expires.
+
+Auth paths must be absolute and symlink-free, with a current-user-owned0600
+single-link regular file up to64KiB in an owner-controlled0700 directory disjoint
+from the workspace. Readiness checks metadata only; native validation at each
+request remains authoritative. A managed store with an unresolved refresh marker
+or reappeared Codex auth.json fails readiness. Follow native recovery instructions
+and retain private artifacts; do not remove markers to force another exchange.
+
+Subscription subprocesses receive only PATH/HOME and the selected auth-file/base
+settings. OPENAI_API_KEY may still be configured independently for voice
+transcription, but neither it nor the Platform endpoint is passed to the
+subscription subprocess. Subscription access does not supply a Whisper API key.
+The endpoint is the fixed Codex service or an explicitly selected literal-loopback
+HTTP fixture. Never run fake fixtures with production tokens. Shell fallback
+merging preserves process-selected auth mode/file/base settings.
+
+API-key journals stay in `journals/`; subscription journals use
+`chatgpt-journals/`. Switching authentication mode does not migrate or replay
+history. Inspect previous work and start a new conversation with `/new` when
+changing modes; an old UUID missing in the selected journal root fails explicitly.
+Changing ccc-node runtime from Piri to Danso uses the normal provider alignment
+path, preserving the previous runtime's history.
+
 `CLAUDE_PROCESS_TIMEOUT` is the legacy name of the bridge-wide deadline; keep its
 normal default, or set it at least 10 seconds above the Danso deadline while
 preserving the bridge's other timeout invariants.

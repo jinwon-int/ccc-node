@@ -214,3 +214,25 @@ def test_real_startup_merge_preserves_runtime_and_backend_precedence(tmp_path):
         assert result.returncode == 0, result.stdout + result.stderr
         assert f'effective={expected}\n' in result.stdout
         assert 'Danso provider CLI is available' in result.stdout
+
+
+def test_runtime_subscription_selection_survives_fallback_merge(tmp_path):
+    project = tmp_path / "project.env"
+    project.write_text("")
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+    (global_dir / ".env").write_text("CCC_DANSO_AUTH_MODE=api-key\nDANSO_CHATGPT_AUTH_FILE=/wrong/auth.json\nDANSO_CHATGPT_BASE_URL=http://127.0.0.1:1/wrong\n")
+    program = '\n'.join([
+        'source "$START_SH" --path "$TEST_ROOT"',
+        'SCRIPT_DIR="$TEST_GLOBAL"; ENV_FILE="$TEST_PROJECT_ENV"',
+        'merge_env_files',
+        'printf "auth=%s file=%s base=%s\\n" "$CCC_DANSO_AUTH_MODE" "$DANSO_CHATGPT_AUTH_FILE" "$DANSO_CHATGPT_BASE_URL"',
+    ])
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CCC_START_SH_LIB_ONLY": "1",
+           "START_SH": str(START_SH), "TEST_ROOT": str(tmp_path), "TEST_GLOBAL": str(global_dir),
+           "TEST_PROJECT_ENV": str(project), "CCC_DANSO_AUTH_MODE": "chatgpt",
+           "DANSO_CHATGPT_AUTH_FILE": "/private/danso-auth.json",
+           "DANSO_CHATGPT_BASE_URL": "https://chatgpt.com/backend-api/codex"}
+    result = subprocess.run(["bash", "-c", program], env=env, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "auth=chatgpt file=/private/danso-auth.json base=https://chatgpt.com/backend-api/codex" in result.stdout

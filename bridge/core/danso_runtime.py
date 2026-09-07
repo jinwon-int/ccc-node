@@ -1,4 +1,4 @@
-"""Telegram composition for the Danso CLI with an explicit execution backend (OpenAI Responses API)."""
+"""Telegram composition for the Danso CLI with explicit execution and OpenAI authentication modes."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import stat
 from typing import Any
+from urllib.parse import urlsplit
 
 from telegram_bot.core.agent_runtime import ModelInfo, SessionRequest
 from telegram_bot.core.danso_worker import DansoRuntime as WorkerRuntime
@@ -23,6 +24,42 @@ def _validate_execution_backend(settings: Settings) -> None:
         raise ValueError("Danso requires bubblewrap; install bwrap")
 
 
+def _validate_authentication(settings: Settings, cwd: Path) -> None:
+    if settings.danso_auth_mode not in {"api-key", "chatgpt"}:
+        raise ValueError("unsupported Danso authentication mode")
+    if settings.danso_auth_mode == "api-key":
+        if settings.danso_chatgpt_auth_file:
+            raise ValueError("DANSO_CHATGPT_AUTH_FILE requires CCC_DANSO_AUTH_MODE=chatgpt")
+        if not settings.openai_api_key or not settings.openai_api_key.strip():
+            raise ValueError("Danso API-key mode requires OPENAI_API_KEY")
+        return
+    if not settings.danso_chatgpt_auth_file:
+        raise ValueError("Danso ChatGPT mode requires DANSO_CHATGPT_AUTH_FILE")
+    if settings.danso_chatgpt_base_url and settings.danso_chatgpt_base_url != "https://chatgpt.com/backend-api/codex":
+        base = urlsplit(settings.danso_chatgpt_base_url)
+        if (base.scheme != "http" or base.hostname not in {"127.0.0.1", "::1"}
+                or base.username is not None or base.password is not None or base.query or base.fragment):
+            raise ValueError("Danso ChatGPT endpoint must be the Codex service or literal-loopback fixture")
+        _ = base.port  # Reject malformed/out-of-range ports without contacting the endpoint.
+    auth = Path(settings.danso_chatgpt_auth_file)
+    if not auth.is_absolute() or auth.resolve() != auth:
+        raise ValueError("Danso auth path must be absolute and contain no symlinks")
+    if auth.parent.is_relative_to(cwd) or cwd.is_relative_to(auth.parent):
+        raise ValueError("Danso auth directory must be disjoint from the workspace")
+    metadata, parent = auth.lstat(), auth.parent.lstat()
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1
+            or metadata.st_size > 65536 or not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) != 0o700):
+        raise ValueError("Danso auth requires a private owner-controlled file and directory")
+    if auth.name == "danso-auth.json":
+        if os.path.lexists(auth.parent / ".danso-refresh-pending"):
+            raise ValueError("Danso credential refresh is unresolved; reauthenticate into a new isolated store")
+        if os.path.lexists(auth.parent / "auth.json"):
+            raise ValueError("Codex auth.json reappeared; resolve credential ownership")
+    # Metadata only; native validation remains authoritative at each dispatch.
+
+
 def _configuration(settings: Settings) -> tuple[str, Path]:
     """Validate locally, without creating state or contacting any provider."""
     if settings.bridge_memory_mode != "off":
@@ -31,8 +68,6 @@ def _configuration(settings: Settings) -> tuple[str, Path]:
         raise ValueError("Danso requires CCC_MEMORY_DISTILL_PROVIDER=auto or off; extraction is unsupported")
     if settings.danso_model != "gpt-6-astra":
         raise ValueError("Danso Telegram currently supports gpt-6-astra")
-    if not settings.openai_api_key or not settings.openai_api_key.strip():
-        raise ValueError("Danso requires OPENAI_API_KEY; Codex OAuth is not supported")
     if not settings.danso_state_dir or not Path(settings.danso_state_dir).is_absolute():
         raise ValueError("Danso requires an absolute CCC_DANSO_STATE_DIR outside the project")
     root = Path(settings.danso_state_dir)
@@ -47,6 +82,7 @@ def _configuration(settings: Settings) -> tuple[str, Path]:
                  Path(os.environ.get("CCC_BOT_ENV_FILE", str(Path(__file__).resolve().parents[1] / ".env"))))
     if any(cwd.is_relative_to(p.resolve()) or p.resolve().is_relative_to(cwd) for p in protected):
         raise ValueError("Danso workspace must not expose bridge configuration or session storage")
+    _validate_authentication(settings, cwd)
     if root.resolve() != root or root.is_relative_to(cwd) or cwd.is_relative_to(root):
         raise ValueError("Danso state must be disjoint from the project and contain no symlinks")
     if root.exists():
@@ -104,12 +140,19 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
     ensure_private_directory(root)
     private_home = root / "home"
     ensure_private_directory(private_home)
-    environment = {"PATH": os.defpath, "HOME": str(private_home),
-                   "OPENAI_API_KEY": settings.openai_api_key}
-    if settings.danso_base_url:
-        environment["DANSO_OPENAI_BASE_URL"] = settings.danso_base_url
-    return DansoRuntime(binary=binary, state_directory=root / "journals",
-                        provider="openai", model=settings.danso_model,
+    environment: dict[str, str | None] = {"PATH": os.defpath, "HOME": str(private_home)}
+    if settings.danso_auth_mode == "chatgpt":
+        environment["DANSO_CHATGPT_AUTH_FILE"] = settings.danso_chatgpt_auth_file
+        if settings.danso_chatgpt_base_url:
+            environment["DANSO_CHATGPT_BASE_URL"] = settings.danso_chatgpt_base_url
+        provider, journals = "openai-codex", "chatgpt-journals"
+    else:
+        environment["OPENAI_API_KEY"] = settings.openai_api_key
+        if settings.danso_base_url:
+            environment["DANSO_OPENAI_BASE_URL"] = settings.danso_base_url
+        provider, journals = "openai", "journals"
+    return DansoRuntime(binary=binary, state_directory=root / journals,
+                        provider=provider, model=settings.danso_model,
                         environment=environment, default_effort=settings.danso_effort,
                         sandbox=settings.danso_sandbox,
                         timeout_seconds=settings.danso_timeout_seconds,

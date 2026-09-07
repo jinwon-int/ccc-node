@@ -831,7 +831,7 @@ merge_env_files() {
     for key in $keys; do
         # Preserve explicit runtime/backend selection across fallback exports.
         case "$key" in
-            CCC_AGENT_PROVIDER|CCC_DANSO_CLI_PATH|CCC_DANSO_SANDBOX)
+            CCC_AGENT_PROVIDER|CCC_DANSO_CLI_PATH|CCC_DANSO_SANDBOX|CCC_DANSO_AUTH_MODE|DANSO_CHATGPT_AUTH_FILE|DANSO_CHATGPT_BASE_URL)
                 if [ "${!key+x}" = x ]; then
                     continue
                 fi

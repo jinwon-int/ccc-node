@@ -20,6 +20,7 @@ CAP = 1024 * 1024
 PROVIDERS = {
     'glm': ('ZAI_API_KEY', 'DANSO_GLM_BASE_URL'),
     'openai': ('OPENAI_API_KEY', 'DANSO_OPENAI_BASE_URL'),
+    'openai-codex': ('DANSO_CHATGPT_AUTH_FILE', 'DANSO_CHATGPT_BASE_URL'),
     'anthropic': ('ANTHROPIC_API_KEY', 'DANSO_ANTHROPIC_BASE_URL'),
 }
 EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
