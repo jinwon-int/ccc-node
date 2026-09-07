@@ -61,6 +61,14 @@ WORKING_STATE_POLICY_BLOCK = """## Working-state checkpoint policy
   at session start and after every compaction; clear it to an idle note when
   the task closes so a stale objective cannot steer a later session.
 """
+READ_ONLY_MEMORY_POLICY_BLOCK = """## Memory connection scope
+
+This is a read-only CCC reference snapshot for Danso. It is refreshed before
+each CLI invocation and retained through in-run compaction. Automatic memory
+extraction, write-back and checkpoint hooks are not connected. Do not infer
+that a fact mentioned in this snapshot is current or that this connection
+provides additional tools or authorization.
+"""
 SCHEMA_VERSION = "ccc.codex.memory.v1"
 METADATA_SCHEMA_VERSION = 1
 LOCK_NAME = ".ccc-codex-memory.lock"
@@ -416,7 +424,12 @@ def _snapshot_hash(snapshot: str) -> str:
     return hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
 
 
-def _render_block(snapshot: str, *, materialized_at: str) -> tuple[str, str]:
+def _expected_working_state_policy(options: MaterializeOptions) -> str:
+    return ("memory-read-only-v1" if options.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") == "danso"
+            else WORKING_STATE_POLICY_VERSION)
+
+
+def _render_block(snapshot: str, *, materialized_at: str, read_only: bool = False) -> tuple[str, str]:
     digest = _snapshot_hash(snapshot)
     block = (
         f"{BEGIN_MARKER}\n"
@@ -425,9 +438,9 @@ def _render_block(snapshot: str, *, materialized_at: str) -> tuple[str, str]:
         f"- snapshot-sha256: `{digest}`\n"
         f"- materialized-at: `{materialized_at}`\n\n"
         f"- github-policy: `{GITHUB_POLICY_VERSION}`\n"
-        f"- working-state-policy: `{WORKING_STATE_POLICY_VERSION}`\n\n"
+        f"- working-state-policy: `{'memory-read-only-v1' if read_only else WORKING_STATE_POLICY_VERSION}`\n\n"
         f"{GITHUB_POLICY_BLOCK}\n"
-        f"{WORKING_STATE_POLICY_BLOCK}\n"
+        f"{READ_ONLY_MEMORY_POLICY_BLOCK if read_only else WORKING_STATE_POLICY_BLOCK}\n"
         f"{SNAPSHOT_DELIMITER}{snapshot}\n"
         f"{END_MARKER}"
     )
@@ -546,7 +559,8 @@ def materialize_snapshot(snapshot: str, options: MaterializeOptions) -> Material
 
         bounded, truncated = _truncate_utf8(snapshot, options.memory_max_bytes)
         materialized_at = _secure_fs.utc_now_iso(timespec="auto")
-        block, digest = _render_block(bounded, materialized_at=materialized_at)
+        block, digest = _render_block(bounded, materialized_at=materialized_at,
+                                      read_only=options.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") == "danso")
         merged = _merge_block(existing_text, parsed, block)
         if len(merged.encode("utf-8")) > options.agents_budget_bytes:
             excess = len(merged.encode("utf-8")) - options.agents_budget_bytes
@@ -557,7 +571,8 @@ def materialize_snapshot(snapshot: str, options: MaterializeOptions) -> Material
             truncated = truncated or was_reduced
             if not bounded:
                 raise MaterializeError("codex_budget_exhausted")
-            block, digest = _render_block(bounded, materialized_at=materialized_at)
+            block, digest = _render_block(bounded, materialized_at=materialized_at,
+                                      read_only=options.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") == "danso")
             merged = _merge_block(existing_text, parsed, block)
             if len(merged.encode("utf-8")) > options.agents_budget_bytes:
                 raise MaterializeError("codex_budget_exhausted")
@@ -567,7 +582,7 @@ def materialize_snapshot(snapshot: str, options: MaterializeOptions) -> Material
             and parsed.snapshot is not None
             and parsed.snapshot_sha256 == digest
             and parsed.github_policy == GITHUB_POLICY_VERSION
-            and parsed.working_state_policy == WORKING_STATE_POLICY_VERSION
+            and parsed.working_state_policy == _expected_working_state_policy(options)
             and _snapshot_hash(parsed.snapshot) == digest
         )
         if existing_snapshot_matches:
@@ -668,7 +683,7 @@ def snapshot_status(options: MaterializeOptions) -> SnapshotStatus:
             or parsed.snapshot is None
             or parsed.snapshot_sha256 is None
             or parsed.github_policy != GITHUB_POLICY_VERSION
-            or parsed.working_state_policy != WORKING_STATE_POLICY_VERSION
+            or parsed.working_state_policy != _expected_working_state_policy(options)
         ):
             return SnapshotStatus(
                 status="missing",
@@ -1042,6 +1057,14 @@ def _audience_scoped_blocked(environ: Mapping[str, str] | None = None) -> bool:
     sqlite_home = Path(sqlite_raw).expanduser()
     if not root.is_absolute() or not codex_home.is_absolute() or not sqlite_home.is_absolute():
         return True
+    if provider == "danso":
+        expected = Path(os.path.abspath(root / scope / "danso" / "bootstrap"))
+        return (
+            Path(os.path.abspath(codex_home)) != expected
+            or Path(os.path.abspath(sqlite_home)) != expected
+            or env.get("CCC_DANSO_BOOTSTRAP_HOME") != str(expected)
+            or env.get("CCC_DANSO_BOOTSTRAP_CONTEXT_FILE") != str(expected / "AGENTS.md")
+        )
     if provider == "piri":
         bootstrap_raw = (env.get("CCC_PIRI_BOOTSTRAP_HOME") or "").strip()
         session_raw = (env.get("PIRI_CODING_AGENT_SESSION_DIR") or "").strip()

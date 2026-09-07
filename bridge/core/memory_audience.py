@@ -185,6 +185,18 @@ class MemoryAudience:
 
         return self.hook_environment(settings)
 
+    def danso_environment(self, settings: Any) -> dict[str, str]:
+        """Memory-only coordinates; never provider credentials or native HOME."""
+        env = self.hook_environment(settings)
+        home = self.scope_root / "danso" / "bootstrap"
+        env.update({
+            "CCC_DANSO_BOOTSTRAP_HOME": str(home),
+            "CCC_DANSO_BOOTSTRAP_CONTEXT_FILE": str(home / "AGENTS.md"),
+            "CCC_CODEX_MEMORY_MAX_BYTES": "24576",
+            "CCC_CODEX_AGENTS_BUDGET_BYTES": "32768",
+        })
+        return env
+
     def piri_environment(self, settings: Any) -> dict[str, str]:
         """Return the audience overlay for one Piri RPC process.
 
@@ -304,6 +316,23 @@ def audience_from_piri_environment(
     expected = audience.piri_environment(settings)
     if dict(environment) != expected:
         raise ValueError("Piri audience environment does not match the resolved route")
+    return audience
+
+
+def audience_from_danso_environment(
+    settings: Any, environment: Mapping[str, str] | None
+) -> MemoryAudience:
+    """Accept only the canonical Danso route, including all policy fields."""
+    if environment is None:
+        raise ValueError("Danso memory requires an audience route")
+    kind, scope = environment.get("CCC_MEMORY_AUDIENCE"), environment.get("CCC_MEMORY_SCOPE", "")
+    if not (kind == AUDIENCE_SHARED and scope == AUDIENCE_SHARED or
+            kind == AUDIENCE_PRIVATE and scope.startswith("private-") and
+            len(scope) == 40 and all(c in "0123456789abcdef" for c in scope[8:])):
+        raise ValueError("Invalid Danso memory audience")
+    audience = MemoryAudience(str(kind), scope, _audience_root(settings))
+    if dict(environment) != audience.danso_environment(settings):
+        raise ValueError("Danso memory environment does not match its audience")
     return audience
 
 

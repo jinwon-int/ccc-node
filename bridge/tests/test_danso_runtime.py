@@ -166,7 +166,7 @@ async def test_environment_is_explicit_and_model_options_are_accurate(configured
 
 
 @pytest.mark.parametrize('field,value',[
-    ('bridge_memory_mode','curated'),('bridge_memory_mode','audience-scoped'),
+    ('bridge_memory_mode','curated'),
     ('memory_distill_provider','claude'),('memory_distill_provider','codex'),('memory_distill_provider','piri'),
     ('danso_model','wrong-model'),('openai_api_key',None),('danso_state_dir','relative'),
     ('danso_cli_path','/nonexistent/danso'),('process_timeout_seconds',1),

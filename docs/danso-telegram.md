@@ -123,11 +123,11 @@ bridge is a separate operational step; source development does not switch a node
 - Completed runs record request and input/output token counters in the local
   usage meter. Cache input is included. Failed runs may have incurred unreported
   usage; counters are not a complete billing statement or account quota.
-- CCC memory routing/bootstrap/distill, asynchronous completion injection,
+- Automatic memory extraction/write-back, asynchronous completion injection,
   external-wait routing, transcript browsing and `/revert` are unsupported.
   Explicit cross-provider distill overrides also fail at startup.
-  Non-off CCC memory modes fail at startup instead of silently using shared
-  memory. Native Danso journal compaction remains enabled independently.
+  CCC memory reading is opt-in with audience-scoped routes (below); curated
+  mode fails at startup. Native journal compaction remains independent.
 - `CCC_DANSO_SANDBOX=host` is the default: tools run with current-user host
   filesystem/network permissions and native descendant supervision. Workspace
   path checks and cleared environments do not prevent Bash from accessing host
@@ -147,5 +147,37 @@ turn; it never converts or deletes another runtime's history.
 CLI, including Telegram composition, persisted resume, commands, counters,
 failures, cancellation and environment isolation. It does not call OpenAI.
 `bridge/tests/test_start_provider_cli.py` checks the shell startup gate.
-The capability matrix distinguishes buffered output and absent memory features
+The capability matrix distinguishes buffered output and limited memory features
 from supported conversation behavior.
+
+## CCC memory (read connection)
+
+With a native Danso build supporting `--system-context-file`, select
+`CCC_BRIDGE_MEMORY_MODE=audience-scoped` and keep
+`CCC_MEMORY_DISTILL_PROVIDER=off`. Use `CCC_TELEGRAM_SESSION_SCOPE=shared-groups`
+(or another non-shared-all scope). The configured
+`CCC_CODEX_MEMORY_MATERIALIZER_PATH` must point to this revision's CCC Python
+materializer; the historical setting name does not require a Codex CLI, API key,
+or a second model runtime. Existing CCC loader/hook installation is required.
+
+Before every native invocation the bridge refreshes a private bounded CCC
+snapshot under `<audience-root>/<opaque-scope>/danso/bootstrap/AGENTS.md`.
+It supplies only the path through `--system-context-file`; memory bodies do not
+enter argv, the user prompt, or bridge diagnostics. Native run-local context
+survives compaction. The next invocation refreshes again, including resume.
+A failed refresh aborts before dispatch; there is no stale-snapshot fallback.
+Private DMs retain the existing CCC private/legacy read policy; groups read
+only the shared route. Native HOME and OAuth credentials remain separate from
+materializer homes. Host execution still has the runtime user's permissions;
+audience routing is not a filesystem sandbox.
+
+Memory-enabled journals use separate `journals-audience/<opaque-scope>` or
+`chatgpt-journals-audience/<opaque-scope>` roots. Old unscoped journals and
+journals from another audience are never silently resumed. On first enabling
+memory, start a new Telegram conversation with `/new` after recording any
+unfinished work; retain the previous journal for recovery. Turning memory off
+also needs a new conversation rather than moving journals between namespaces.
+
+This connects reading of CCC memories and configured local caches. Automatic
+extraction, write-back, checkpoint hooks and search tools are not added. A model
+may quote supplied memory in its response; the snapshot is not a secret vault.
