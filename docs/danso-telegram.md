@@ -18,6 +18,11 @@ operator-controlled absolute path. ccc-node bundles the bounded subprocess
 adapter derived from Danso's `integrations/ccc_node.py`; the Danso
 Python repository does not need to be on `PYTHONPATH`.
 
+The CLI must also support `--progress-jsonl` (tested progress revision
+`ffc06d7b7191609314e04866190c4f22205298b5`; the original `dac88d49` baseline
+does not). Upgrade the CLI before enabling this bridge version; there is no
+silent fallback to an older buffered protocol.
+
 Choose a dedicated task workspace with `CCC_DANSO_WORKSPACE`, separate from
 the bridge configuration and session storage. Never use the bridge project root
 (or the whole login HOME) as the task workspace: its `.telegram_bot/.env` and
