@@ -1610,7 +1610,24 @@ class Doctor:
                 mem = None
             if isinstance(mem, dict):
                 wiki = (mem.get("wiki") or {}).get("status", "unknown")
-                honcho = (mem.get("honcho") or {}).get("status", "unknown")
+                # Honcho was retired fleet-wide on 2026-09-01 (TM-2029 phase 3)
+                # and 19158f8 removed its plumbing, including 48 lines of
+                # ccc-memory-check.sh — that commit added the contract test
+                # pinning `.honcho | not`, so the key is now permanently absent
+                # by design. It did not update this consumer, so the old
+                # `unknown` default kept failing the gate below: the row could
+                # not reach 정상 on any node no matter how healthy the cache
+                # was, and doctor exited 1 daily over a source that no longer
+                # exists — noise that buries real findings.
+                #
+                # An absent key means retired, so report `disabled`. A key that
+                # IS present still gates normally: if some node resurrects the
+                # source and reports it stale or failing, that stays 경고.
+                honcho_payload = mem.get("honcho")
+                if honcho_payload is None:
+                    honcho = "disabled"
+                else:
+                    honcho = (honcho_payload or {}).get("status", "unknown")
                 idx = (mem.get("local_index") or {}).get("exists", False)
                 nunchi_payload = mem.get("nunchi") or {}
                 nunchi = nunchi_payload.get("status", "unknown")

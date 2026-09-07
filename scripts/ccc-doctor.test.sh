@@ -716,6 +716,55 @@ ok "memory probe survives an unresolvable shebang (not 'diagnostic unavailable')
 ok "memory probe reports the real cache state through bash" \
   'jq -e ".status | contains(\"honcho=stale\") and contains(\"wiki=ok\")" <<<"$sout" >/dev/null'
 ok "a stale honcho cache is 경고, not a broken-probe 경고" 'jq -e ".klass == \"경고\"" <<<"$sout" >/dev/null'
+
+# An ABSENT honcho key means the source is retired, not sick. Honcho went out
+# fleet-wide on 2026-09-01 (TM-2029 phase 3) and 19158f8 stripped its plumbing
+# including 48 lines of ccc-memory-check.sh, adding the `.honcho | not` contract
+# in scripts/ccc-memory.test.sh — but it missed this consumer, so the "unknown"
+# default made this row permanently 경고 on every node and exited doctor 1 daily
+# over a source that no longer exists. The two cases must not collapse into one
+# another: absent -> 정상 / disabled, present-but-stale -> 경고.
+cat > "$TMP/honcho-absent.py" <<'PY_EOF'
+import json, os, sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(os.environ["DOCTOR_PY"]).resolve().parent))
+import ccc_doctor as mod
+
+repo = Path(os.environ["ABSENT_REPO"])
+claude = repo / ".claude"
+(repo / "scripts").mkdir(parents=True, exist_ok=True)
+claude.mkdir(parents=True, exist_ok=True)
+script = repo / "scripts/ccc-memory-check.sh"
+
+def classify(payload):
+    script.write_text("#!/usr/bin/env bash\nprintf '%s' '" + json.dumps(payload) + "'\n")
+    script.chmod(0o755)
+    d = mod.Doctor(repo, claude, "settings")
+    d.check_memory_cache()
+    row = [r for r in d.rows if r.item == "memory cache"][0]
+    return {"klass": row.klass, "status": row.status}
+
+healthy = {
+    "wiki": {"status": "ok"}, "local_index": {"exists": True},
+    "nunchi": {"status": "ok"}, "mempalace": {"status": "ok"},
+}
+print(json.dumps({
+    "absent": classify(healthy),
+    "stale": classify(dict(healthy, honcho={"status": "stale"})),
+    "ok": classify(dict(healthy, honcho={"status": "ok"})),
+}, ensure_ascii=False))
+PY_EOF
+ABSENT_REPO="$TMP/absentrepo"
+# shellcheck disable=SC2034  # aout is read via eval inside ok()
+aout="$(DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" ABSENT_REPO="$ABSENT_REPO" python3 "$TMP/honcho-absent.py" 2>"$TMP/absent.err")"
+ok "an absent honcho key does not hold the row at 경고 forever" \
+  '[ -n "$aout" ] && jq -e ".absent.klass == \"정상\"" <<<"$aout" >/dev/null'
+ok "absent honcho is reported as disabled (retired), not as unknown" \
+  'jq -e ".absent.status | contains(\"honcho=disabled\")" <<<"$aout" >/dev/null'
+ok "a present-but-stale honcho still gates the row" \
+  'jq -e ".stale.klass == \"경고\" and (.stale.status | contains(\"honcho=stale\"))" <<<"$aout" >/dev/null'
+ok "a present-and-ok honcho still passes" 'jq -e ".ok.klass == \"정상\"" <<<"$aout" >/dev/null'
 ok "version probe survives the same unresolvable shebang" 'jq -e ".version != \"unknown\"" <<<"$sout" >/dev/null'
 
 # #827: doctor must not call an enabled nunchi/Palace stack healthy merely
