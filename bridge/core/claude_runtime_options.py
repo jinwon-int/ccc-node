@@ -16,6 +16,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import SandboxSettings
 
 from telegram_bot.utils.memory_policy import MEMORY_MODE_AUDIENCE_SCOPED, MEMORY_MODE_OFF
+from telegram_bot.utils.orphan_reaper import BRIDGE_CHILD_ENV_VALUE, BRIDGE_CHILD_ENV_VAR
 
 from .agent_runtime import SessionRequest
 from .curated_memory import build_curated_memory_settings
@@ -112,6 +113,17 @@ class ClaudeRuntimeOptionsMixin:
                     **(dict(options.env) if options.env is not None else {}),
                     "CCC_BRIDGE_DISTILL_MANAGED": "1",
                 }
+        # Ownership marker for the orphan reaper. PPID==1 alone does not say a
+        # `node claude` process is *ours* — the node also runs claude under
+        # `setsid` from the distill/skill-review hooks, and an operator may have
+        # a detached session of their own. The reaper only signals processes
+        # carrying this marker, so it can never reach those. Set unconditionally
+        # (outside the settings guard) so every bridge-spawned child is
+        # attributable, and last so an execution profile cannot drop it.
+        options.env = {
+            **(dict(options.env) if options.env is not None else {}),
+            BRIDGE_CHILD_ENV_VAR: BRIDGE_CHILD_ENV_VALUE,
+        }
         return options
 
     def _apply_execution_profile(
