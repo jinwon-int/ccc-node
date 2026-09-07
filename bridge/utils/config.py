@@ -226,6 +226,7 @@ class Config(
         alias="CCC_PIRI_CLI_PATH",
         description="Piri launcher path used for headless RPC sessions.",
     )
+    danso_sandbox: Literal["host", "bubblewrap"] = Field(default="host", alias="CCC_DANSO_SANDBOX")
     danso_cli_path: str = Field(default="danso", alias="CCC_DANSO_CLI_PATH")
     danso_state_dir: Optional[str] = Field(default=None, alias="CCC_DANSO_STATE_DIR")
     danso_workspace: Optional[str] = Field(default=None, alias="CCC_DANSO_WORKSPACE")

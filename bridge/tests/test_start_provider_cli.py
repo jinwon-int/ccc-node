@@ -31,6 +31,9 @@ def _run(
     crush_cli: str = "crush",
     piri_cli: str = "piri",
     danso_cli: str = "danso",
+    sandbox: str = "host",
+    hide_bwrap: bool = False,
+    process_sandbox: str | None = None,
     process_provider: str | None = None,
     process_danso_cli: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -41,22 +44,27 @@ def _run(
             'CCC_AGENT_PROVIDER) printf "%s" "$TEST_PROVIDER" ;; '
             'CCC_CODEX_CLI_PATH) printf "%s" "$TEST_CODEX_CLI" ;; '
             'CCC_CRUSH_CLI_PATH) printf "%s" "$TEST_CRUSH_CLI" ;; '
+            'CCC_DANSO_SANDBOX) printf "%s" "$TEST_DANSO_SANDBOX" ;; '
             'CCC_DANSO_CLI_PATH) printf "%s" "$TEST_DANSO_CLI" ;; '
             'CCC_PIRI_CLI_PATH) printf "%s" "$TEST_PIRI_CLI" ;; esac; }',
             _function_source("maybe_setup_agent_cli"),
+            'command() { if [ "${1:-}" = "-v" ] && [ "${2:-}" = "bwrap" ]; then return 1; fi; builtin command "$@"; }' if hide_bwrap else ":",
             "maybe_setup_agent_cli",
         ]
     )
     env = {
-        **{k: v for k, v in os.environ.items() if k not in {"CCC_AGENT_PROVIDER", "CCC_DANSO_CLI_PATH"}},
+        **{k: v for k, v in os.environ.items() if k not in {"CCC_AGENT_PROVIDER", "CCC_DANSO_CLI_PATH", "CCC_DANSO_SANDBOX"}},
         "TEST_PROVIDER": provider,
         "TEST_CODEX_CLI": codex_cli,
         "TEST_CRUSH_CLI": crush_cli,
         "TEST_PIRI_CLI": piri_cli,
         "TEST_DANSO_CLI": danso_cli,
+        "TEST_DANSO_SANDBOX": sandbox,
         "CLAUDE_CLI_PATH": "",
         "PATH": f"{tmp_path}:/usr/bin:/bin",
     }
+    if process_sandbox is not None:
+        env["CCC_DANSO_SANDBOX"] = process_sandbox
     if process_provider is not None:
         env["CCC_AGENT_PROVIDER"] = process_provider
     if process_danso_cli is not None:
@@ -153,3 +161,14 @@ def test_exported_danso_provider_and_cli_override_file_settings(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Danso provider CLI is available" in result.stdout
     assert "Claude" not in result.stdout
+
+def test_danso_host_without_bwrap_and_explicit_backend_gate(tmp_path):
+    binary = tmp_path / "danso"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o700)
+    for sandbox, expected in (("host",0), ("bubblewrap",1), ("invalid",1)):
+        result = _run(tmp_path, provider="danso", danso_cli=str(binary), sandbox=sandbox, hide_bwrap=True)
+        assert result.returncode == expected, result.stdout + result.stderr
+    override = _run(tmp_path, provider="danso", danso_cli=str(binary), sandbox="bubblewrap",
+                    process_sandbox="host", hide_bwrap=True)
+    assert override.returncode == 0, override.stdout + override.stderr

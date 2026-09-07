@@ -1,4 +1,4 @@
-"""Telegram composition for the sandboxed Danso CLI (OpenAI Responses API)."""
+"""Telegram composition for the Danso CLI with an explicit execution backend (OpenAI Responses API)."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -14,6 +14,13 @@ from telegram_bot.utils.config import Settings
 from telegram_bot.utils.secure_fs import ensure_private_directory
 
 ASTRA_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _validate_execution_backend(settings: Settings) -> None:
+    if settings.danso_sandbox not in {"host", "bubblewrap"}:
+        raise ValueError("unsupported Danso execution backend")
+    if settings.danso_sandbox == "bubblewrap" and shutil.which("bwrap") is None:
+        raise ValueError("Danso requires bubblewrap; install bwrap")
 
 
 def _configuration(settings: Settings) -> tuple[str, Path]:
@@ -50,8 +57,7 @@ def _configuration(settings: Settings) -> tuple[str, Path]:
     binary = shutil.which(settings.danso_cli_path)
     if binary is None:
         raise ValueError("Danso executable unavailable; set CCC_DANSO_CLI_PATH")
-    if shutil.which("bwrap") is None:
-        raise ValueError("Danso requires bubblewrap; install bwrap")
+    _validate_execution_backend(settings)
     if settings.danso_timeout_seconds + 10 > settings.process_timeout_seconds:
         raise ValueError("CLAUDE_PROCESS_TIMEOUT must exceed CCC_DANSO_TIMEOUT_SECONDS by at least 10s")
     return str(Path(binary).resolve(strict=True)), root
@@ -105,6 +111,7 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
     return DansoRuntime(binary=binary, state_directory=root / "journals",
                         provider="openai", model=settings.danso_model,
                         environment=environment, default_effort=settings.danso_effort,
+                        sandbox=settings.danso_sandbox,
                         timeout_seconds=settings.danso_timeout_seconds,
                         provider_timeout_seconds=settings.danso_provider_timeout_seconds,
                         max_turns=settings.danso_max_turns,

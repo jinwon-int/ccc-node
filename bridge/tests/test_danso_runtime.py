@@ -86,6 +86,7 @@ async def test_telegram_turn_resume_default_effort_and_usage(configured):
     assert argv[argv.index('--reasoning-effort')+1] == 'medium'
     assert argv[argv.index('--provider')+1] == 'openai'
     assert '--unsafe-no-sandbox' not in argv
+    assert argv[argv.index('--sandbox') + 1] == 'host'
     assert '--compact-at-bytes' in argv
     handler._usage_meter.record.assert_called_once_with('danso','interactive',requests=2,input_tokens=14,output_tokens=3)
     journal = runtime.root/(response.session_id+'.jsonl')
@@ -185,7 +186,8 @@ def test_private_state_and_missing_bwrap_fail_closed(configured,monkeypatch):
     assert not (Path(configured.danso_workspace)/'journals').exists()
     other=configured.model_copy(update={'danso_state_dir':str(state.parent/'other')})
     monkeypatch.setattr('telegram_bot.core.danso_runtime.shutil.which',lambda name:None if name=='bwrap' else configured.danso_cli_path)
-    assert not probe_danso_readiness(other)[0]
+    assert probe_danso_readiness(other)[0]
+    assert not probe_danso_readiness(other.model_copy(update={"danso_sandbox":"bubblewrap"}))[0]
 
 
 @pytest.mark.anyio
@@ -362,3 +364,18 @@ async def test_bridge_ledgers_stay_outside_danso_task_workspace(configured):
     assert not (workspace / ".telegram_bot").exists()
     assert handler._usage_meter._path.exists()
     await handler.close()
+
+@pytest.mark.anyio
+async def test_explicit_bubblewrap_is_forwarded(configured):
+    runtime = build_danso_runtime(configured.model_copy(update={"danso_sandbox":"bubblewrap"}))
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    events = [event async for event in session.send_turn("hello")]
+    assert events
+    argv = json.loads((Path(configured.danso_workspace)/"argv.json").read_text())
+    assert argv[argv.index("--sandbox")+1] == "bubblewrap"
+
+
+def test_invalid_sandbox_rejected_before_state_creation(configured):
+    ok, _ = probe_danso_readiness(configured.model_copy(update={"danso_sandbox":"invalid"}))
+    assert not ok
+    assert not Path(configured.danso_state_dir).exists()

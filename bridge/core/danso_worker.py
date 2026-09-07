@@ -131,7 +131,7 @@ def _failure(stderr, code):
 class DansoRuntime:
     """One configured model; explicit credentials and private journal directory."""
     def __init__(self, *, binary, state_directory, provider, model, environment,
-                 timeout_seconds=300, provider_timeout_seconds=60, max_turns=16, compact_at_bytes=None):
+                 timeout_seconds=300, provider_timeout_seconds=60, max_turns=16, compact_at_bytes=None, sandbox="host"):
         if provider not in PROVIDERS or not model or not isinstance(model, str):
             raise ValueError('invalid provider/model')
         for value, maximum in ((timeout_seconds, 3600), (provider_timeout_seconds, 300), (max_turns, 128)):
@@ -140,6 +140,9 @@ class DansoRuntime:
         if compact_at_bytes is not None and (type(compact_at_bytes) is not int
                 or not 8192 <= compact_at_bytes <= 393216):
             raise ValueError('invalid compaction threshold')
+        if sandbox not in {"host", "bubblewrap"}:
+            raise ValueError("invalid execution backend")
+        self.sandbox = sandbox
         self.compact_at_bytes = compact_at_bytes
         self.binary = str(Path(binary).resolve(strict=True))
         root = Path(state_directory).absolute()
@@ -207,7 +210,7 @@ class DansoSession:
                 yield ErrorEvent(code='danso_input', message='Invalid worker input.')
                 return
             r = self.runtime
-            command = [r.binary, '--cwd', str(self.cwd), '--session', str(r.root / (self.session_id + '.jsonl')),
+            command = [r.binary, '--sandbox', r.sandbox, '--cwd', str(self.cwd), '--session', str(r.root / (self.session_id + '.jsonl')),
                        '--provider', r.provider, '--model', r.model, '--max-turns', str(r.max_turns),
                        '--timeout-seconds', str(r.timeout), '--provider-timeout-seconds', str(r.provider_timeout),
                        '-p']
