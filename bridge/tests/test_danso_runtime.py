@@ -506,7 +506,7 @@ async def test_danso_snapshot_routes_and_budget_gated_composition(configured):
     assert context.distill_snapshot_worker._runtime is context.agent_runtime
     root = context.agent_runtime.root
     scope = "private-" + "a" * 32
-    ident, _ = journal(root / scope)
+    ident, _ = journal(root / scope, cwd=Path(settings.danso_workspace))
     snapshot = await context.agent_runtime.read_session_snapshot(ident, bounds=TranscriptBounds(),
         memory_audience="private", memory_scope=scope)
     assert snapshot.byte_count > 0
@@ -518,3 +518,28 @@ async def test_danso_snapshot_routes_and_budget_gated_composition(configured):
             memory_audience="private", memory_scope="../escape")
     assert build_context(settings.model_copy(update={"usage_budget_tokens_danso":0})).distill_extraction_worker is None
     assert build_context(settings.model_copy(update={"memory_distill_provider":"off"})).distill_snapshot_worker is None
+
+
+def test_danso_extraction_requires_memory_route_and_separates_backlog(configured):
+    from telegram_bot.__main__ import build_context
+    from telegram_bot.memory.distill_journal import DistillJournal
+    from telegram_bot.memory.distill_types import DistillTrigger
+    old = DistillJournal(configured.bot_data_dir / "distill-journal")
+    old.initialize()
+    job = old.enqueue_once(provider="codex", thread_id="old-session", trigger=DistillTrigger.CHECKPOINT)
+    before = old.job_path(job.job_id).read_bytes()
+    settings = configured.model_copy(update={
+        "bridge_memory_mode":"audience-scoped", "memory_distill_provider":"danso",
+        "usage_budget_tokens_danso":500000,
+        "codex_memory_materializer_path":str(Path(__file__).resolve().parents[2] / "scripts/ccc_codex_memory.py"),
+    })
+    context = build_context(settings)
+    assert context.distill_journal.root == configured.bot_data_dir / "danso-distill-journal"
+    assert list(context.distill_journal.root.glob("*.json")) == []
+    assert old.job_path(job.job_id).read_bytes() == before
+    with pytest.raises(ValueError, match="audience-scoped"):
+        build_context(settings.model_copy(update={"bridge_memory_mode":"off"}))
+    disabled = build_context(settings.model_copy(update={"bridge_memory_mode":"off", "memory_distill_provider":"auto"}))
+    assert disabled.distill_snapshot_worker is None
+    assert disabled.distill_extraction_worker is None
+    assert old.job_path(job.job_id).read_bytes() == before

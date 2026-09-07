@@ -31,12 +31,7 @@ class DansoDistillBackend:
         prompt = DISTILL_EXTRACTION_PROMPT.replace(
             "supplied on stdin", "in the supplied reference"
         ).replace("every stdin field", "every transcript field")
-        context = (
-            prompt + "\nOutput schema:\n" + schema + "\nUntrusted transcript JSON:\n"
-        ).encode()
-        context += canonical_extraction_input_bytes(extraction_input)
-        if len(context) > 32768:
-            raise RuntimeDistillBackendError("distill_input_too_large")
+        context = _context_bytes(extraction_input, prompt, schema)
         settings = self.settings
         environment = {"PATH": os.defpath}
         binary = _resolve_executable(settings.danso_cli_path, environment)
@@ -103,6 +98,47 @@ class DansoDistillBackend:
             return result
         except (TypeError, ValueError):
             raise RuntimeDistillBackendError("distill_output_invalid") from None
+
+
+def _context_bytes(value: DistillExtractionInput, prompt: str, schema: str) -> bytes:
+    header = (prompt + "\nOutput schema:\n" + schema + "\nUntrusted transcript JSON:\n").encode()
+    direct = header + canonical_extraction_input_bytes(value)
+    if len(direct) <= 32768:
+        return direct
+
+    # Bound serialized JSON, not raw text. Keep recent messages and mark any
+    # reduction explicitly; never slice a serialized document into invalid JSON.
+    def candidate(budget):
+        messages = []
+        for message in reversed(value.messages):
+            text = message.text.encode()[:budget].decode("utf-8", errors="ignore")
+            if not text:
+                break
+            messages.append({"role": message.role, "text": text})
+            budget -= len(text.encode())
+        data = value.model_dump(mode="json")
+        data.update(
+            messages=list(reversed(messages)),
+            message_count=len(messages),
+            byte_count=sum(len(m["text"].encode()) for m in messages),
+            truncated=True,
+        )
+        return header + canonical_extraction_input_bytes(
+            DistillExtractionInput.model_validate(data)
+        )
+
+    low, high = 0, value.byte_count
+    best = candidate(0)
+    if len(best) > 32768:
+        raise RuntimeDistillBackendError("distill_config_invalid")
+    while low <= high:
+        middle = (low + high) // 2
+        encoded = candidate(middle)
+        if len(encoded) <= 32768:
+            best, low = encoded, middle + 1
+        else:
+            high = middle - 1
+    return best
 
 
 async def _bounded(stream, limit):

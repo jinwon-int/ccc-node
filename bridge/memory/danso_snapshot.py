@@ -61,7 +61,7 @@ def _read_locked(directory: Path, session_id: str):
     return payload, metadata
 
 
-def _validate_payload(payload, session_id):
+def _validate_payload(payload, cwd):
     if not payload.endswith(b"\n"):
         raise SnapshotUnavailableError("Danso journal is incomplete")
     try:
@@ -69,9 +69,13 @@ def _validate_payload(payload, session_id):
         if (
             rows[0].get("type") != "session"
             or rows[0].get("version") != 3
-            or rows[0].get("id") != session_id
+            or rows[0].get("cwd") != str(cwd)
         ):
             raise ValueError("Danso journal identity mismatch")
+        # Native header UUID is independent of the bridge filename UUID.
+        native_id = rows[0].get("id")
+        if not isinstance(native_id, str) or str(uuid.UUID(native_id)) != native_id:
+            raise ValueError("invalid native journal identity")
         calls, results, started, settled = set(), set(), set(), set()
         for row in rows[1:]:
             _recovery_row(row, calls, results, started, settled)
@@ -118,10 +122,10 @@ def _operation(data, calls, results, started, settled):
 
 
 def read_danso_snapshot(
-    directory: Path, session_id: str, *, bounds: TranscriptBounds
+    directory: Path, session_id: str, *, bounds: TranscriptBounds, cwd: Path
 ) -> CodexTranscriptSnapshot:
     payload, metadata = _read_locked(directory, session_id)
-    _validate_payload(payload, session_id)
+    _validate_payload(payload, cwd)
     captured = datetime.now(timezone.utc)
     messages, count, last, truncated = _collect_messages(
         payload, metadata=metadata, limits=bounds, captured=captured

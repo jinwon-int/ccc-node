@@ -200,7 +200,7 @@ CCC_USAGE_BUDGET_TOKENS_DANSO=1000000
 ```
 
 Completed-turn checkpoints, `/distill`, `/new`, provider changes and shutdown
-use the existing durable job queue. Age is checked at turn completion. A finite
+use a separate `danso-distill-journal` durable queue; prior Codex/Piri jobs stay untouched. Age is checked at turn completion. A finite
 usage-meter budget is required; zero budget leaves extraction off. Reservations
 conservatively charge serialized input/schema/output bounds, not subscription
 quota measurements. Interactive turns are not blocked by this autonomous budget.
@@ -208,6 +208,9 @@ quota measurements. Interactive turns are not blocked by this autonomous budget.
 Snapshots read only the exact audience's UUID journal under the native flock,
 reject missing/partial/unresolved journals, and retain a bounded recent text
 window (8192 bytes for extraction, within the native 16 MiB journal limit).
+JSON escaping is included in the native context limit; further reduction keeps
+recent messages and explicitly marks the input truncated. Native header UUIDs
+are independent of filenames; the reader checks the expected workspace too.
 Extraction runs the native CLI with one request, no tools, `max` reasoning effort,
 an empty temporary HOME/workspace, explicit selected authentication and a private
 reference file. It does not launch Codex or adopt/copy authentication. Strict

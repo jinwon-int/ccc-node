@@ -267,6 +267,10 @@ class TelegramBot(
                 )
             return None
         provider = str(session.get("provider", "claude")).strip().lower()
+        if self._active_provider() == "danso" and (
+            provider != "danso" or getattr(self._config, "bridge_memory_mode", "off") != "audience-scoped"
+        ):
+            return None
         thread_id = session.get("session_id")
         if provider not in {"claude", "codex", "piri", "danso"} or not isinstance(thread_id, str) or not thread_id:
             return None
