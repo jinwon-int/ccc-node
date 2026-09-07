@@ -12,8 +12,8 @@ occurs. Danso owns the runtime in both modes.
 
 Use Linux 5.3+ with procfs/pidfds, Bash and Python 3.11+. Bubblewrap is optional. Build a reviewed Danso checkout with
 `cargo build --locked --release` (tested CLI baseline: jinwon-int/danso
-`051536b02320f1d319b31c00fd653eecb47bc441` for read-only subscription credentials;
-managed renewal additionally requires the reviewed native `auth-adopt` feature). Install the executable at an
+`91439fc5e6c1d7457c6e932cdb7f84d085464c7b`, including the independently reviewed
+native `auth-adopt` and managed renewal feature). Install the executable at an
 operator-controlled absolute path. ccc-node bundles the bounded subprocess
 adapter derived from Danso's `integrations/ccc_node.py`; the Danso
 Python repository does not need to be on `PYTHONPATH`.
@@ -70,8 +70,8 @@ reads token contents, repairs pending state, or refreshes credentials itself;
 Danso owns these operations. A read-only Codex auth.json may also be selected,
 but it requires explicit renewal/relogin when the access token expires.
 
-Auth paths must be absolute and symlink-free, with a current-user-owned0600
-single-link regular file up to64KiB in an owner-controlled0700 directory disjoint
+Auth paths must be absolute and symlink-free, with a current-user-owned 0600
+single-link regular file up to 64 KiB in an owner-controlled 0700 directory disjoint
 from the workspace. Readiness checks metadata only; native validation at each
 request remains authoritative. A managed store with an unresolved refresh marker
 or reappeared Codex auth.json fails readiness. Follow native recovery instructions

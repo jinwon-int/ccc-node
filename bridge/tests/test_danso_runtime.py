@@ -424,7 +424,7 @@ def test_chatgpt_mode_does_not_forward_voice_key_or_platform_endpoint(chatgpt_co
     assert "PRIVATE_WHISPER_KEY" not in repr(runtime.environment)
 
 
-@pytest.mark.parametrize("mutation", ["relative", "missing", "file-mode", "parent-mode", "symlink",
+@pytest.mark.parametrize("mutation", ["relative", "missing", "file-mode", "parent-mode", "symlink", "symlink-loop",
                                      "hardlink", "oversize", "workspace", "pending", "codex-reappeared", "endpoint"])
 def test_chatgpt_metadata_preflight_fails_without_state_writes(chatgpt_configured, mutation, tmp_path):
     settings = chatgpt_configured
@@ -440,6 +440,10 @@ def test_chatgpt_metadata_preflight_fails_without_state_writes(chatgpt_configure
     elif mutation == "symlink":
         link = tmp_path / "auth-link"
         link.symlink_to(auth)
+        settings.danso_chatgpt_auth_file = str(link)
+    elif mutation == "symlink-loop":
+        link = tmp_path / "auth-loop"
+        link.symlink_to(link)
         settings.danso_chatgpt_auth_file = str(link)
     elif mutation == "hardlink":
         os.link(auth, auth.parent / "copy")

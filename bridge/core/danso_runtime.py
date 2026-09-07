@@ -42,7 +42,11 @@ def _validate_authentication(settings: Settings, cwd: Path) -> None:
             raise ValueError("Danso ChatGPT endpoint must be the Codex service or literal-loopback fixture")
         _ = base.port  # Reject malformed/out-of-range ports without contacting the endpoint.
     auth = Path(settings.danso_chatgpt_auth_file)
-    if not auth.is_absolute() or auth.resolve() != auth:
+    try:
+        resolved_auth = auth.resolve()
+    except RuntimeError:
+        raise ValueError("Danso auth path contains a symlink loop") from None
+    if not auth.is_absolute() or resolved_auth != auth:
         raise ValueError("Danso auth path must be absolute and contain no symlinks")
     if auth.parent.is_relative_to(cwd) or cwd.is_relative_to(auth.parent):
         raise ValueError("Danso auth directory must be disjoint from the workspace")

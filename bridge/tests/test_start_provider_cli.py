@@ -236,3 +236,23 @@ def test_runtime_subscription_selection_survives_fallback_merge(tmp_path):
     result = subprocess.run(["bash", "-c", program], env=env, text=True, capture_output=True, timeout=10)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "auth=chatgpt file=/private/danso-auth.json base=https://chatgpt.com/backend-api/codex" in result.stdout
+
+
+def test_runtime_platform_credentials_survive_fallback_merge(tmp_path):
+    project = tmp_path / "project.env"
+    project.write_text("")
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+    (global_dir / ".env").write_text("OPENAI_API_KEY=global-key\nDANSO_OPENAI_BASE_URL=https://global.example/v1\n")
+    program = '\n'.join([
+        'source "$START_SH" --path "$TEST_ROOT"',
+        'SCRIPT_DIR="$TEST_GLOBAL"; ENV_FILE="$TEST_PROJECT_ENV"',
+        'merge_env_files',
+        'test "$OPENAI_API_KEY" = process-key && test "$DANSO_OPENAI_BASE_URL" = https://process.example/v1',
+    ])
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CCC_START_SH_LIB_ONLY": "1",
+           "START_SH": str(START_SH), "TEST_ROOT": str(tmp_path), "TEST_GLOBAL": str(global_dir),
+           "TEST_PROJECT_ENV": str(project), "OPENAI_API_KEY": "process-key",
+           "DANSO_OPENAI_BASE_URL": "https://process.example/v1"}
+    result = subprocess.run(["bash", "-c", program], env=env, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr
