@@ -25,7 +25,7 @@ from telegram_bot.utils.secure_fs import (
     owner_only_regular_violation,
 )
 
-DistillProvider = Literal["claude", "codex", "piri"]
+DistillProvider = Literal["claude", "codex", "piri", "danso"]
 
 GLOBAL_DISABLED_CODE: Final = "distill_globally_disabled"
 COOLDOWN_ACTIVE_CODE: Final = "distill_provider_cooldown"
@@ -121,7 +121,7 @@ def global_distill_disabled(
 def classify_provider_failure(provider: str, stderr: bytes) -> str | None:
     """Map bounded private stderr to one body-free provider failure class."""
 
-    if provider not in {"claude", "codex", "piri"}:
+    if provider not in {"claude", "codex", "piri", "danso"}:
         raise ValueError("unsupported distill provider")
     if not isinstance(stderr, bytes):
         raise TypeError("stderr must be bytes")
@@ -214,7 +214,7 @@ class DistillGuard:
 
     @staticmethod
     def _validate_scope(provider: str, model: str) -> None:
-        if provider not in {"claude", "codex", "piri"}:
+        if provider not in {"claude", "codex", "piri", "danso"}:
             raise ValueError("unsupported distill provider")
         if not isinstance(model, str) or _MODEL_RE.fullmatch(model) is None:
             raise ValueError("invalid distill model")

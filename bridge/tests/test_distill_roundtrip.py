@@ -148,7 +148,23 @@ async def test_danso_saved_fact_reaches_actual_next_materializer_once(tmp_path, 
     from telegram_bot.core.danso_memory import prepare_memory_context
     journal = DistillJournal(tmp_path / "journal")
     journal.initialize()
-    job = await extracted_job(journal, provider="danso", wiki_enabled=False)
+    from test_distill_worker import snapshot_done_job, SuccessfulBackend
+    from test_distill_local_journal import PRIVATE_SCOPE
+    from telegram_bot.memory.distill_guard import DistillGuard
+    from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
+    from telegram_bot.memory.distill_types import DistillJobStatus
+    from telegram_bot.core.usage_meter import UsageMeter
+    job = snapshot_done_job(journal, provider="danso", memory_audience="private", memory_scope=PRIVATE_SCOPE)
+    backend = SuccessfulBackend()
+    meter = UsageMeter(tmp_path / "usage.json", budgets={"danso": 500000})
+    extractor = CodexDistillExtractionWorker(journal, backend, usage_meter=meter,
+        guard=DistillGuard(state_dir=tmp_path / "guard"), extractor_provider="danso",
+        model="gpt-5.6-luna", wiki_enabled=False)
+    job = await extractor.extract_once(job_id=job.job_id)
+    assert job.status is DistillJobStatus.EXTRACTION_DONE
+    assert job.extraction_attempts == 1 and len(backend.calls) == 1
+    repeated = await extractor.extract_once(job_id=job.job_id)
+    assert repeated.status is DistillJobStatus.EXTRACTION_DONE and len(backend.calls) == 1
     audience_root = tmp_path / "audiences"
     worker = CodexDistillLocalSinkWorker(journal, audience_root=audience_root,
         indexer_path=ROOT / "scripts" / "ccc-memory-index.sh")
