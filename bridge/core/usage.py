@@ -964,6 +964,8 @@ def _tokens(value: int | None) -> str:
 
 
 def _usage_title(snapshot: UsageSnapshot) -> str:
+    if snapshot.provider == "danso":
+        return "Danso"
     if snapshot.provider == "codex":
         return "Codex"
     if snapshot.provider == "piri":

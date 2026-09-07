@@ -24,6 +24,7 @@ _AGENT_PROVIDER_LABELS = {
     "codex": "Codex",
     "crush": "Crush",
     "piri": "Piri",
+    "danso": "Danso",
 }
 _KNOWN_AGENT_PROVIDERS = frozenset(_AGENT_PROVIDER_LABELS)
 

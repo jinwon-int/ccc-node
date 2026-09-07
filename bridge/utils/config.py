@@ -185,7 +185,7 @@ class Config(
         finally:
             _LOAD_EXPLICIT_VALUES_ONLY.reset(token)
 
-    agent_provider: Literal["claude", "codex", "crush", "piri"] = Field(
+    agent_provider: Literal["claude", "codex", "crush", "piri", "danso"] = Field(
         default="claude",
         alias="CCC_AGENT_PROVIDER",
         description="Agent provider used by ProjectChat.",
@@ -226,6 +226,21 @@ class Config(
         alias="CCC_PIRI_CLI_PATH",
         description="Piri launcher path used for headless RPC sessions.",
     )
+    danso_cli_path: str = Field(default="danso", alias="CCC_DANSO_CLI_PATH")
+    danso_state_dir: Optional[str] = Field(default=None, alias="CCC_DANSO_STATE_DIR")
+    danso_workspace: Optional[str] = Field(default=None, alias="CCC_DANSO_WORKSPACE")
+    danso_model: str = Field(default="gpt-6-astra", min_length=1, alias="CCC_DANSO_MODEL")
+    danso_effort: Literal["low", "medium", "high", "xhigh", "max"] = Field(
+        default="medium", alias="CCC_DANSO_EFFORT")
+    danso_base_url: Optional[str] = Field(default=None, alias="DANSO_OPENAI_BASE_URL")
+    danso_timeout_seconds: int = Field(default=300, ge=1, le=3600, alias="CCC_DANSO_TIMEOUT_SECONDS")
+    danso_provider_timeout_seconds: int = Field(default=60, ge=1, le=300,
+                                              alias="CCC_DANSO_PROVIDER_TIMEOUT_SECONDS")
+    danso_max_turns: int = Field(default=32, ge=1, le=128, alias="CCC_DANSO_MAX_TURNS")
+    danso_compact_at_bytes: int = Field(default=32768, ge=8192, le=393216,
+                                       alias="CCC_DANSO_COMPACT_AT_BYTES")
+    usage_budget_tokens_danso: int = Field(default=0, ge=0, alias="CCC_USAGE_BUDGET_TOKENS_DANSO")
+
     usage_meter_enabled: bool = Field(
         default=True,
         alias="CCC_USAGE_METER_ENABLED",

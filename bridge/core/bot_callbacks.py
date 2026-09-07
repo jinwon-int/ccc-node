@@ -182,7 +182,7 @@ class BotCallbackMixin:
             active_provider = self._active_provider()
             if (
                 callback_provider != active_provider
-                or active_provider not in {"codex", "piri"}
+                or active_provider not in {"codex", "piri", "danso"}
             ):
                 await query.edit_message_text(
                     f"❌ Provider mismatch: selected effort is {callback_provider or 'unknown'}, "
@@ -193,7 +193,7 @@ class BotCallbackMixin:
             session, _provider_switched = await self._switch_provider_if_needed(
                 session_key, user_id, chat.id
             )
-            provider_label = "Codex" if active_provider == "codex" else "Piri"
+            provider_label = active_provider.title()
             try:
                 models = tuple(await self._project_chat.list_runtime_models())
             except Exception:
@@ -237,6 +237,9 @@ class BotCallbackMixin:
             if active_provider == "piri" and not self._valid_piri_model_id(model_name):
                 await query.edit_message_text("❌ Invalid Piri model id.")
                 return
+            if active_provider == "danso" and model_name != self._config.danso_model:
+                await query.edit_message_text("❌ This model is not configured for Danso.")
+                return
             stored_provider = await self._session_provider(
                 session_key
             )
@@ -253,7 +256,7 @@ class BotCallbackMixin:
                 )
                 updates.update(session_id=None, new_session=True)
                 remove_fields.add("effort")
-            elif active_provider in {"codex", "piri", "crush"}:
+            elif active_provider in {"codex", "piri", "crush", "danso"}:
                 reset_note = await self._runtime_model_effort_reset_note(
                     session, model_name
                 )

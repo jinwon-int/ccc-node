@@ -56,7 +56,7 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 ## Prerequisites
 
 - **Python 3.11+**
-- **Provider CLI** — Claude CLI (default), or Codex CLI when `CCC_AGENT_PROVIDER=codex`
+- **Provider CLI** — install the selected provider CLI. For `CCC_AGENT_PROVIDER=danso`, follow the [Danso Telegram setup](../docs/danso-telegram.md) (Astra medium, OpenAI API key and bubblewrap).
 - **Codex authentication** — for Codex, complete the CLI login flow and pass `../scripts/ccc-doctor.sh` before starting the bridge
 - **Telegram Bot Token** — from [@BotFather](https://t.me/BotFather)
 - **ffmpeg** — required for audio format conversion
@@ -325,7 +325,7 @@ a provider turn or reads transcript/credential files.
 | `CCC_BRIDGE_RESTART_DELAY_SECONDS` | No | `5` | Delay (5–30s) before the external worker restarts the bridge |
 | `CCC_BRIDGE_EXECUTION_PROFILE` | No | `strict-project` | Execution boundary: `strict-project`, `owner-operator`, or `disabled` |
 | `CCC_BRIDGE_BASH_POLICY` | No | `auto-approve` | Bash approval UX; Codex default is unrestricted `never + dangerFullAccess` |
-| `CCC_AGENT_PROVIDER` | No | `claude` | Main runtime provider: `claude`, `codex`, `piri`, or `crush` |
+| `CCC_AGENT_PROVIDER` | No | `claude` | Main runtime provider: `claude`, `codex`, `piri`, `crush`, or [`danso`](../docs/danso-telegram.md) |
 | `CCC_CODEX_CLI_PATH` | Codex only | `~/.claude/hooks/ccc-codex` | Installed memory-bootstrap launcher used for direct/app-server runs |
 | `CCC_CODEX_REAL_CLI_PATH` | Codex only | `codex` | Underlying Codex binary invoked by the launcher |
 | `CCC_CODEX_MEMORY_MATERIALIZER_PATH` | Codex only | `~/.claude/hooks/ccc_codex_memory.py` | Body-free materialize/status command run at thread boundaries |

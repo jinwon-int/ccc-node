@@ -714,21 +714,36 @@ class Doctor:
                 "run scripts/ccc_codex_skills.py plan manually to inspect",
             )
 
+    def check_danso_readiness(self) -> None:
+        if self._bridge_provider_state == ("danso", "healthy"):
+            self.readiness = "ready"
+            self.add("정상", "Danso runtime", "bridge healthy; account access not probed", "none")
+        else:
+            self.readiness = "failed"
+            self.add("수동필요", "Danso runtime", "live readiness not proven",
+                     "inspect bridge status and Danso prerequisites")
+
+    def check_piri_readiness(self) -> None:
+        if self._bridge_provider_state == ("piri", "healthy"):
+            self.readiness = "ready"
+            self.add("정상", "Piri runtime", "healthy", "none")
+        else:
+            self.readiness = "failed"
+            self.add(
+                "수동필요",
+                "Piri runtime",
+                "live readiness not proven",
+                "inspect bridge status and Piri provider authentication",
+            )
+
     def check_provider_readiness(self) -> None:
         if self.provider == "claude":
             return
+        if self.provider == "danso":
+            self.check_danso_readiness()
+            return
         if self.provider == "piri":
-            if self._bridge_provider_state == ("piri", "healthy"):
-                self.readiness = "ready"
-                self.add("정상", "Piri runtime", "healthy", "none")
-            else:
-                self.readiness = "failed"
-                self.add(
-                    "수동필요",
-                    "Piri runtime",
-                    "live readiness not proven",
-                    "inspect bridge status and Piri provider authentication",
-                )
+            self.check_piri_readiness()
             return
         if self.provider != "codex":
             self.readiness = "failed"
@@ -736,7 +751,7 @@ class Doctor:
                 "수동필요",
                 "agent provider",
                 "unsupported provider",
-                "set CCC_AGENT_PROVIDER to claude, codex, or piri",
+                "set CCC_AGENT_PROVIDER to claude, codex, piri, or danso",
             )
             return
 
@@ -1100,6 +1115,7 @@ class Doctor:
             "Claude": "claude",
             "Codex": "codex",
             "Piri": "piri",
+            "Danso": "danso",
         }
         found: list[tuple[str, str]] = []
         for label, provider in labels.items():

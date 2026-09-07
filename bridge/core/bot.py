@@ -242,7 +242,7 @@ class TelegramBot(
 
     def _active_provider(self) -> str:
         provider = str(getattr(self._config, "agent_provider", "claude")).strip().lower()
-        if provider not in {"claude", "codex", "crush", "piri"}:
+        if provider not in {"claude", "codex", "crush", "piri", "danso"}:
             raise ValueError(f"Unsupported agent provider: {provider!r}")
         return provider
 
@@ -729,7 +729,7 @@ class TelegramBot(
             return None
         if session_key in self._runtime_active_sessions:
             return session_id
-        if self._active_provider() in {"codex", "piri"}:
+        if self._active_provider() in {"codex", "piri", "danso"}:
             self._runtime_active_sessions.add(session_key)
             return session_id
         if session_resume.resume_persisted_enabled() and session_resume.persisted_transcript_exists(

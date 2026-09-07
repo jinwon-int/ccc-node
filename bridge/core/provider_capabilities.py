@@ -23,7 +23,7 @@ from types import MappingProxyType
 # Must stay equal to session.manager.SessionManager.VALID_PROVIDERS; the
 # capability tests pin the equality so a new provider cannot land without a
 # declared capability row.
-SUPPORTED_PROVIDERS: tuple[str, ...] = ("claude", "codex", "crush", "piri")
+SUPPORTED_PROVIDERS: tuple[str, ...] = ("claude", "codex", "crush", "piri", "danso")
 
 _DEPENDENCY_PATTERN = re.compile(r"^#\d+$")
 
@@ -105,6 +105,7 @@ def _axis(
             "codex": codex,
             "crush": _CRUSH_STATUSES[key],
             "piri": piri,
+            "danso": _DANSO_STATUSES[key],
         },
     )
 
@@ -230,6 +231,33 @@ _CRUSH_STATUSES: Mapping[str, CapabilityStatus] = {
 
 RUNTIME_GROUP = "Runtime behavior"
 MEMORY_GROUP = "Memory parity"
+
+# Danso first Telegram integration: claims are intentionally bounded.
+_DANSO_STATUSES: Mapping[str, CapabilityStatus] = {
+    "runtime_adapter": _supported('Bounded Danso CLI subprocess mapped to native Telegram events; OpenAI Astra initially supported.'),
+    "session_resume": _supported('The current conversation resumes its exact private journal UUID, including after bridge restart; foreign journal selection is disabled.'),
+    "text_streaming": _degraded('Final text is buffered until the bounded subprocess exits; no incremental text or tool progress is available.'),
+    "reasoning_stream": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "message_boundaries": _supported('One validated final answer emits one message boundary.'),
+    "tool_event_stream": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "interactive_approvals": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "turn_interrupt": _supported('Interrupt and cancellation terminate and reap the owned subprocess group; journals are preserved.'),
+    "turn_serialization": _supported('Per-session asyncio lock plus native cross-process journal locking.'),
+    "session_browsing": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "model_discovery": _degraded('The configured Astra model and supported efforts are listed locally; account discovery is not implemented.'),
+    "usage_metering": _degraded('Successful turn counters are locally recorded; failed request usage and account quotas are not complete.'),
+    "terminal_stall_release": _supported('The CLI and adapter enforce finite deadlines and drain owned readers before emitting a terminal event.'),
+    "async_completion_delivery": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "external_wait": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "memory_session_resume": _degraded('Native journal history and checkpoint compaction resume; CCC memory routing remains unsupported.'),
+    "memory_read_bootstrap": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "memory_postcompact_reinject": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "memory_writeback_distill": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "memory_sink_local": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "memory_sink_wiki_candidate": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "memory_roundtrip": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "lifecycle_observability": _supported('Provider-neutral opt-in lifecycle observations are body-free, bounded, owner-only and fail-open. Final Telegram delivery is not inferred from runtime completion; no native tool progress events are available.'),
+}
 
 CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
     _axis(

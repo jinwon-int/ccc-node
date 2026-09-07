@@ -96,6 +96,19 @@ def _build_piri_runtime(settings: Settings) -> Any:
     )
 
 
+def _build_session_started_recorder(settings: Settings, manager: Any):
+    if settings.agent_provider != "danso":
+        return None
+    from telegram_bot.core.session_scope import storage_key
+
+    async def record(user_id: int, chat_id: int, ident: str) -> None:
+        key = storage_key(settings.telegram_session_scope, user_id, chat_id)
+        await manager.patch_session(
+            key, updates={"provider": "danso", "session_id": ident, "new_session": False})
+
+    return record
+
+
 def _build_distill_environment(
     settings: Settings,
     provider: str,
@@ -319,6 +332,10 @@ def build_context(
         )
     elif settings.agent_provider == "piri" and agent_runtime is None:
         agent_runtime = _build_piri_runtime(settings)
+    elif settings.agent_provider == "danso" and agent_runtime is None:
+        from telegram_bot.core.danso_runtime import build_danso_runtime
+
+        agent_runtime = build_danso_runtime(settings)
     telegram_port = telegram_port or Application.builder
     clock = clock or time
     bind_logs_dir(settings.logs_dir)
@@ -334,6 +351,7 @@ def build_context(
         settings=settings,
         agent_runtime=agent_runtime,
         clock=clock,
+        session_started_recorder=_build_session_started_recorder(settings, session_manager),
     )
     # Production distill extraction composition (#465 scheduling consumes
     # this): the worker is built only through the handler factory so its

@@ -366,6 +366,11 @@ class ProjectChatProcessMixin:
             approval_policy = None
             approvals_reviewer = None
             sandbox_policy = None
+        elif provider == "danso":
+            # Danso enforces its own workspace bubblewrap sandbox.
+            approval_policy = "never"
+            approvals_reviewer = None
+            sandbox_policy = None
         elif provider == "piri":
             # PiriRuntime is deliberately unrestricted: built-in tools execute
             # with the bridge user's OS permissions and never pause for a
@@ -415,6 +420,8 @@ class ProjectChatProcessMixin:
         # This does not hide the cause. The #846 warning is emitted for each
         # admission timeout, so a retried failure still leaves the first
         # attempt's provider, endpoint, exit code and stderr class in the log.
+        if provider == "danso":
+            return response  # Never replay a turn whose tool effects may be durable.
         retry_class = _admission_retry_class(response)
         if retry_class is None:
             return response
@@ -641,7 +648,8 @@ class ProjectChatProcessMixin:
             # here; Codex meters via the runtime's usage-recorder seam. The
             # meter write is fsync-backed, so it runs off the loop (#1479).
             await self._run_usage_write(
-                self.record_claude_adapter_result, transition.event, mode=usage_mode
+                (self.record_danso_result if getattr(self._config, "agent_provider", "claude") == "danso"
+                 else self.record_claude_adapter_result), transition.event, mode=usage_mode
             )
             return
         if isinstance(transition, DelegatedTaskLifecycleTransition):
@@ -789,7 +797,10 @@ class ProjectChatProcessMixin:
                                 )
                         session = await runtime.start_or_resume(
                             SessionRequest(
-                                working_directory=str(self.project_root),
+                                working_directory=str(
+                                    (getattr(self._config, "danso_workspace", None) or self.project_root)
+                                    if provider == "danso" else self.project_root
+                                ),
                                 session_id=None if new_session else session_id,
                                 model=model,
                                 effort=effort,
@@ -799,6 +810,11 @@ class ProjectChatProcessMixin:
                                 memory_environment=memory_environment,
                             )
                         )
+                        recorder = getattr(self, "_session_started_recorder", None)
+                        if recorder is not None:
+                            # Persist the identity before any tool can execute. A failed
+                            # write must abort this turn, never orphan an uncertain journal.
+                            await recorder(user_id, chat_id, session.session_id)
                         self._agent_session_attachments += 1
                         self._agent_session_registry.put_cached(
                             key,
@@ -921,6 +937,9 @@ class ProjectChatProcessMixin:
                     if admission_timeout_override is not None
                     else (getattr(self._config, "turn_admission_timeout_seconds", 0.0) or 0.0)
                 )
+                if getattr(self._config, "agent_provider", "claude") == "danso":
+                    admission_grace = 0.0  # Buffered output; subprocess owns the finite deadline.
+
                 approval_grace = float(
                     getattr(self._config, "approval_stall_seconds", 0.0) or 0.0
                 )

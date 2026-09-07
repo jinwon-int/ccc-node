@@ -98,7 +98,7 @@ def _validate_session_entry(key: Any, value: Any) -> None:
     provider = value.get("provider")
     if provider is not None and (
         not isinstance(provider, str)
-        or provider not in {"claude", "codex", "crush", "piri"}
+        or provider not in {"claude", "codex", "crush", "piri", "danso"}
     ):
         raise SessionStoreValidationError(
             f"session entry {key!r} has invalid provider: {provider!r}"
