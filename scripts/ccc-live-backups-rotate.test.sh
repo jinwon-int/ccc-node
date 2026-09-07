@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# rc is assigned then read via eval inside ok(); shellcheck cannot see that.
+# shellcheck disable=SC2034
 # Tests for ccc-live-backups-rotate.sh — hermetic via CCC_LIVE_BACKUPS_ROOTS.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -69,6 +71,26 @@ run_rotate "$TMP/lb5" "$TMP/lb5/" >/dev/null
 # shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "trailing-slash duplicate and the root itself are untouched" '[ "$rc" = 0 ] && [ -d "$TMP/lb5" ] && [ "$(ls "$TMP/lb5" | wc -l)" = 5 ]'
+
+# --- 7) KEEP=0 must not wipe the tree --------------------------------------------
+# `0` passes the digit validation, and `tail -n +1` would select every snapshot.
+# The floor keeps the newest one instead of leaving the operator with nothing.
+mkbackups "$TMP/lb6" 4
+CCC_LIVE_BACKUPS_KEEP=0 run_rotate "$TMP/lb6" >/dev/null; rc=$?
+ok "KEEP=0 is floored to 1 instead of pruning everything" \
+  '[ "$rc" = 0 ] && [ "$(ls "$TMP/lb6" | wc -l)" = 1 ] && [ -d "$TMP/lb6/b004" ]'
+ok "floored KEEP is what the log reports" 'grep -qE "pruned=3 failed=0 keep=1" "$CCC_STATE_DIR/live-backups-rotate.log"'
+
+# --- 8) an explicit KEEP is still honoured ----------------------------------------
+mkbackups "$TMP/lb7" 5
+CCC_LIVE_BACKUPS_KEEP=2 run_rotate "$TMP/lb7" >/dev/null; rc=$?
+ok "explicit KEEP=2 keeps the 2 newest" \
+  '[ "$rc" = 0 ] && [ "$(ls "$TMP/lb7" | wc -l)" = 2 ] && [ -d "$TMP/lb7/b005" ] && [ ! -d "$TMP/lb7/b003" ]'
+
+# --- 9) a non-numeric KEEP still falls back to the 5 default ------------------------
+mkbackups "$TMP/lb8" 7
+CCC_LIVE_BACKUPS_KEEP=abc run_rotate "$TMP/lb8" >/dev/null; rc=$?
+ok "non-numeric KEEP falls back to 5" '[ "$rc" = 0 ] && [ "$(ls "$TMP/lb8" | wc -l)" = 5 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

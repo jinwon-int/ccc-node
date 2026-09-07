@@ -52,6 +52,10 @@ Hermes and OpenClaw schedulers):
 
 - **Cron:** 5-field expression or `@hourly|@daily|@weekly|@monthly|@yearly`,
   matched in the task's `timezone` (IANA name, e.g. `Asia/Seoul`; default UTC).
+  Each field takes `*`, a value, a range, a comma list, and an optional `/S`
+  step — `0 9 * * 1-5` (weekdays 09:00), `*/30 9-17 * * *` (half-hourly during
+  business hours). Alphabetic names (`MON`, `JAN`) are not supported; use the
+  numeric equivalents, with day-of-week `0`/`7` both meaning Sunday.
 - **Interval:** `every <N>m|h|d` (min 1 minute, max 366 days). Free-running from
   `lastRunAt`; set `anchorAt` (ISO8601) to phase-anchor occurrences
   (e.g. anchor `..T00:15Z` + `every 1h` fires at :15). A never-run interval task

@@ -30,6 +30,48 @@ DEFAULT_DAYS = 7
 _MAX_MODELS_PER_TURN = 16
 _MAX_REPORT_MODELS = 8
 
+#: Block size for the backwards read in :meth:`CostLedger.aggregate`.
+_TAIL_BLOCK_BYTES = 65536
+
+#: How many consecutive out-of-window rows end the backwards scan.
+#: Rows are appended in clock order, so in principle the first old row is the
+#: window edge. But an NTP step backwards (or two bridge processes sharing one
+#: project ledger) can put a newer row behind an older timestamp, and stopping
+#: on that one row would silently undercount a money-adjacent report. Requiring
+#: a short run of old rows absorbs local disorder while keeping the scan
+#: proportional to the window rather than to the file.
+_WINDOW_EDGE_TOLERANCE_ROWS = 32
+
+
+def _iter_lines_newest_first(path: Path):
+    """Yield the file's non-empty lines from the end backwards, as bytes.
+
+    ``aggregate`` only ever wants a trailing time window, but the ledger is
+    append-only and deliberately retained for the life of the node (its
+    retention class is operator accounting), so a forward scan costs the whole
+    file on every ``/usage`` — growing without bound while the answer stays a
+    fixed 7 days. Reading backwards lets the caller stop at the window edge.
+
+    Blocks are read into memory one at a time and split on newlines; the first
+    element of each block is a possibly-truncated line, so it is carried into
+    the next (earlier) block rather than yielded.
+    """
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        carry = b""
+        while position > 0:
+            read_size = min(_TAIL_BLOCK_BYTES, position)
+            position -= read_size
+            handle.seek(position)
+            lines = (handle.read(read_size) + carry).split(b"\n")
+            carry = lines[0]
+            for line in reversed(lines[1:]):
+                if line.strip():
+                    yield line
+        if carry.strip():
+            yield carry
+
 
 @dataclass(frozen=True)
 class CostAggregate:
@@ -97,7 +139,7 @@ class CostLedger:
                 "ts": float(self._clock()),
                 "provider": provider,
                 "total_cost_usd": (
-                    round(float(total), 6) if total not in (None,) else None
+                    round(float(total), 6) if total is not None else None
                 ),
                 "models": rows,
             }
@@ -124,33 +166,41 @@ class CostLedger:
             return []
         acc: dict[str, dict[str, float]] = {}
         try:
-            with self._path.open("r", encoding="utf-8") as handle:
-                for raw in handle:
-                    try:
-                        record = json.loads(raw)
-                    except Exception:
-                        continue  # partial/corrupt trailing line
-                    if not isinstance(record, dict):
+            # Rows are appended in clock order, so walking backwards lets the
+            # scan stop near the window edge instead of reading the node's
+            # entire spend history for a 7-day answer.
+            consecutive_old = 0
+            for raw in _iter_lines_newest_first(self._path):
+                try:
+                    record = json.loads(raw)
+                except Exception:
+                    continue  # partial/corrupt line
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    timestamp = float(record.get("ts", 0))
+                except (TypeError, ValueError):
+                    continue
+                if timestamp < cutoff:
+                    consecutive_old += 1
+                    if consecutive_old >= _WINDOW_EDGE_TOLERANCE_ROWS:
+                        break  # past the window edge, not local disorder
+                    continue
+                consecutive_old = 0
+                for model_row in record.get("models", []) or []:
+                    if not isinstance(model_row, dict):
                         continue
+                    key = (model_row.get("model") or "unknown")[:80]
+                    bucket = acc.setdefault(
+                        key, {"cost_usd": 0.0, "in": 0, "out": 0, "turns": 0}
+                    )
                     try:
-                        if float(record.get("ts", 0)) < cutoff:
-                            continue
+                        bucket["cost_usd"] += float(model_row.get("cost_usd") or 0.0)
                     except (TypeError, ValueError):
-                        continue
-                    for model_row in record.get("models", []) or []:
-                        if not isinstance(model_row, dict):
-                            continue
-                        key = (model_row.get("model") or "unknown")[:80]
-                        bucket = acc.setdefault(
-                            key, {"cost_usd": 0.0, "in": 0, "out": 0, "turns": 0}
-                        )
-                        try:
-                            bucket["cost_usd"] += float(model_row.get("cost_usd") or 0.0)
-                        except (TypeError, ValueError):
-                            pass
-                        bucket["in"] += int(model_row.get("in") or 0)
-                        bucket["out"] += int(model_row.get("out") or 0)
-                        bucket["turns"] += 1
+                        pass
+                    bucket["in"] += int(model_row.get("in") or 0)
+                    bucket["out"] += int(model_row.get("out") or 0)
+                    bucket["turns"] += 1
         except Exception:
             return []
         aggregated = [
