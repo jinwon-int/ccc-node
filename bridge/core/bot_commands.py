@@ -700,6 +700,9 @@ class BotCommandMixin:
 
         if context.args:
             name = context.args[0]
+            if active_provider == "danso" and name != self._config.danso_model:
+                await message.reply_text("❌ Danso uses the model configured by the operator. Use /model to view it.")
+                return
             if active_provider == "piri" and not self._valid_piri_model_id(name):
                 reply = "❌ Invalid Piri model id. Use a provider-qualified model id."
                 await message.reply_text(reply)
@@ -717,7 +720,7 @@ class BotCommandMixin:
                 )
                 updates.update(session_id=None, new_session=True)
                 remove_fields.add("effort")
-            elif active_provider in {"codex", "piri", "crush"}:
+            elif active_provider in {"codex", "piri", "crush", "danso"}:
                 reset_note = await self._runtime_model_effort_reset_note(session, name)
                 if reset_note:
                     remove_fields.add("effort")
@@ -735,7 +738,7 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
 
-        if active_provider in {"codex", "piri", "crush"}:
+        if active_provider in {"codex", "piri", "crush", "danso"}:
             # crush declares model_discovery=supported (provider_capabilities);
             # leaving it out of this branch dropped crush nodes into the Claude
             # picker whose callbacks then always failed the provider check.
@@ -865,8 +868,8 @@ class BotCommandMixin:
         chat = self._require_chat(update)
         log_debug(user_id, "command", "/effort")
         active_provider = self._active_provider()
-        if active_provider not in {"codex", "piri"}:
-            reply = "⚠️ /effort is available only for Codex or Piri."
+        if active_provider not in {"codex", "piri", "danso"}:
+            reply = "⚠️ /effort is available for Codex, Piri, or Danso."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
@@ -875,7 +878,7 @@ class BotCommandMixin:
         session, _provider_switched = await self._switch_provider_if_needed(
             conversation_key, user_id, chat.id
         )
-        provider_label = "Codex" if active_provider == "codex" else "Piri"
+        provider_label = active_provider.title()
         try:
             models = tuple(await self._project_chat.list_runtime_models())
         except Exception:
@@ -1084,6 +1087,17 @@ class BotCommandMixin:
         await message.reply_text(reply)
         log_debug(user_id, "bot", reply)
 
+    async def _handle_danso_resume(self, *, message, conversation_key, args):
+        # Cross-conversation journal selection would cross the audience boundary.
+        session = await self._session_manager.get_session(conversation_key)
+        current = session.get("session_id")
+        if args and (len(args) != 1 or args[0] != current):
+            await message.reply_text("❌ Danso can resume only this conversation's current session. Use /new for a fresh session.")
+            return
+        reply = (f"ℹ️ Current Danso session auto-resumes: {current}" if current
+                 else "📭 No Danso session yet. Send a message to start one.")
+        await message.reply_text(reply)
+
     async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):
             return
@@ -1116,6 +1130,9 @@ class BotCommandMixin:
                 user_id=user_id,
                 message=message,
             )
+            return
+        if active_provider == "danso":
+            await self._handle_danso_resume(message=message, conversation_key=conversation_key, args=context.args or [])
             return
         if active_provider == "piri":
             await self._handle_piri_resume(
@@ -1291,9 +1308,9 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
 
-        if session["provider"] == "piri":
+        if session["provider"] in {"piri", "danso"}:
             reply = (
-                "ℹ️ Piri RPC does not expose bounded transcript history. "
+                f"ℹ️ {session['provider'].title()} does not expose bounded transcript history. "
                 "The current session still resumes by its exact id."
             )
             await message.reply_text(reply)
@@ -1378,8 +1395,8 @@ class BotCommandMixin:
         chat = self._require_chat(update)
         log_debug(user_id, "command", "/revert")
 
-        if self._active_provider() == "piri":
-            reply = "ℹ️ /revert is unavailable for Piri RPC sessions."
+        if self._active_provider() in {"piri", "danso"}:
+            reply = f"ℹ️ /revert is unavailable for {self._active_provider().title()} sessions."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
@@ -1434,9 +1451,9 @@ class BotCommandMixin:
         user_id = self._require_user(update).id
         chat_id = update.effective_chat.id if update.effective_chat else None
 
-        if self._active_provider() == "piri":
+        if self._active_provider() in {"piri", "danso"}:
             await query.edit_message_text(
-                "ℹ️ This transcript control is unavailable for Piri RPC sessions."
+                f"ℹ️ This transcript control is unavailable for {self._active_provider().title()} sessions."
             )
             return
 

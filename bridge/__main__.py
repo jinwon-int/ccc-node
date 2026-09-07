@@ -319,6 +319,10 @@ def build_context(
         )
     elif settings.agent_provider == "piri" and agent_runtime is None:
         agent_runtime = _build_piri_runtime(settings)
+    elif settings.agent_provider == "danso" and agent_runtime is None:
+        from telegram_bot.core.danso_runtime import build_danso_runtime
+
+        agent_runtime = build_danso_runtime(settings)
     telegram_port = telegram_port or Application.builder
     clock = clock or time
     bind_logs_dir(settings.logs_dir)

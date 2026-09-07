@@ -495,6 +495,8 @@ configured_agent_provider() {
     fi
     if [ "$(printf '%s' "$provider" | tr '[:upper:]' '[:lower:]')" = "codex" ]; then
         echo "codex"
+    elif [ "${provider,,}" = "danso" ]; then
+        echo "danso"
     else
         echo "claude"
     fi
@@ -503,6 +505,8 @@ configured_agent_provider() {
 configured_agent_label() {
     if [ "$(configured_agent_provider)" = "codex" ]; then
         echo "Codex"
+    elif [ "$(configured_agent_provider)" = "danso" ]; then
+        echo "Danso"
     else
         echo "Claude"
     fi
@@ -1535,7 +1539,7 @@ load_optional_env() {
 }
 
 maybe_setup_agent_cli() {
-    local provider codex_cli piri_cli
+    local provider codex_cli piri_cli danso_cli
     provider="$(read_env_with_fallback "CCC_AGENT_PROVIDER")"
     provider="${provider:-claude}"
 
@@ -1553,6 +1557,20 @@ maybe_setup_agent_cli() {
                 exit 1
             fi
             echo "✅ Codex provider CLI is available"
+            return
+            ;;
+        danso)
+            danso_cli="$(read_env_with_fallback "CCC_DANSO_CLI_PATH")"
+            danso_cli="${danso_cli:-danso}"
+            if ! command -v "$danso_cli" >/dev/null 2>&1; then
+                echo "❌ Error: Danso CLI unavailable; set CCC_DANSO_CLI_PATH"
+                exit 1
+            fi
+            if ! command -v bwrap >/dev/null 2>&1; then
+                echo "❌ Error: Danso requires bubblewrap"
+                exit 1
+            fi
+            echo "✅ Danso provider CLI is available"
             return
             ;;
         piri)
@@ -1588,7 +1606,7 @@ maybe_setup_agent_cli() {
             return
             ;;
         *)
-            echo "❌ Error: unsupported CCC_AGENT_PROVIDER (expected claude, codex, crush, or piri)"
+            echo "❌ Error: unsupported CCC_AGENT_PROVIDER (expected claude, codex, crush, piri, or danso)"
             exit 1
             ;;
     esac

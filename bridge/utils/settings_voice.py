@@ -28,6 +28,7 @@ class VoiceSettingsMixin:
         description=("Voice transcription provider. Supported values: whisper, volcengine"),
     )
     openai_api_key: Optional[str] = Field(
+        repr=False,
         default=None, description="OpenAI API key used for Whisper transcription"
     )
     openai_base_url: Optional[str] = Field(

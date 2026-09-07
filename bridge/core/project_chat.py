@@ -309,6 +309,7 @@ class ProjectChatHandler(
                         "claude": int(getattr(self._config, "usage_budget_tokens_claude", 0) or 0),
                         "codex": int(getattr(self._config, "usage_budget_tokens_codex", 0) or 0),
                         "piri": int(getattr(self._config, "usage_budget_tokens_piri", 0) or 0),
+                        "danso": int(getattr(self._config, "usage_budget_tokens_danso", 0) or 0),
                     },
                     warn_percent=int(getattr(self._config, "usage_budget_warn_percent", 80) or 80),
                     alert_sink=self._write_usage_alert_spool,
@@ -867,6 +868,24 @@ class ProjectChatHandler(
         except Exception:
             logger.exception("Runtime request metering failed; turn continues")
 
+    def record_danso_result(self, event: Any, mode: str = MODE_INTERACTIVE) -> None:
+        """Record validated completed-run counters; failed requests are not estimated."""
+        if self._usage_meter is None:
+            return
+        payload = getattr(event, "result", None)
+        usage = payload.get("usage") if isinstance(payload, Mapping) else None
+        if not isinstance(usage, Mapping):
+            return
+        keys = ("requests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens")
+        if any(type(usage.get(k)) is not int or not 0 <= usage[k] <= 10**12 for k in keys):
+            return
+        try:
+            self._usage_meter.record("danso", mode, requests=usage["requests"],
+                                     input_tokens=sum(usage[k] for k in ("inputTokens", "cacheReadTokens", "cacheWriteTokens")),
+                                     output_tokens=usage["outputTokens"])
+        except Exception:
+            logger.exception("Danso usage metering failed; turn continues")
+
     def record_claude_adapter_result(self, event: Any, mode: str = MODE_INTERACTIVE) -> None:
         """Meter Claude adapter-path tokens from the terminal ResultEvent (#388).
 
@@ -962,6 +981,8 @@ class ProjectChatHandler(
                 return self._fill_local_service_windows(
                     local_piri_environment_snapshot()
                 )
+            if provider == "danso":
+                return self._fill_local_service_windows(UsageSnapshot(provider="danso", service="Danso"))
             if provider != "claude":
                 return UsageSnapshot(provider=provider)
             # Claude adapter path (#584): ClaudeRuntime exposes no usage

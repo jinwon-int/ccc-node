@@ -74,7 +74,8 @@ def session_start_notice_text(
         display_model = "default"
     lines = [
         f"◐ CCC session started ({reason}). Conversation history is on a fresh {provider_label} stream.",
-        "Use /resume to browse and restore a previous session.",
+        ("Use /resume to view the current session or /new to start fresh." if provider == "danso"
+         else "Use /resume to browse and restore a previous session."),
         "",
         f"◆ Model: {display_model}",
         f"◆ Provider: {provider_label}",

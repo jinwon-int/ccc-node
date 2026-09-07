@@ -671,6 +671,10 @@ class BotLifecycleMixin:
 
     def _probe_agent_readiness(self) -> tuple[bool, str]:
         provider = str(getattr(self._config, "agent_provider", "claude")).lower()
+        if provider == "danso":
+            from telegram_bot.core.danso_runtime import probe_danso_readiness
+
+            return probe_danso_readiness(self._config)
         if provider == "codex":
             return self._probe_codex_readiness()
         if provider == "piri":
