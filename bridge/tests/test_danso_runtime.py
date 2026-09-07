@@ -341,3 +341,24 @@ def test_workspace_cannot_expose_package_or_redirected_bot_env(configured, monke
     assert not probe_danso_readiness(configured.model_copy(update={"danso_workspace": str(package)}))[0]
     monkeypatch.setenv("CCC_BOT_ENV_FILE", str(Path(configured.danso_workspace) / "bot.env"))
     assert not probe_danso_readiness(configured)[0]
+
+
+@pytest.mark.anyio
+async def test_bridge_ledgers_stay_outside_danso_task_workspace(configured):
+    from telegram_bot.__main__ import build_context
+    context = build_context(configured)
+    context.session_manager.initialize()
+    handler = context.project_chat
+    assert handler.project_root == Path(configured.project_root)
+    private = Path(configured.bot_data_dir)
+    assert handler._usage_meter._path.is_relative_to(private)
+    assert handler._cost_ledger._path.is_relative_to(private)
+    assert handler._async_completion_journal.root.is_relative_to(private)
+    response = await handler.process_message("ok", 7, 9)
+    assert response.success
+    workspace = Path(configured.danso_workspace)
+    args = json.loads((workspace / "argv.json").read_text())
+    assert args[args.index("--cwd") + 1] == str(workspace)
+    assert not (workspace / ".telegram_bot").exists()
+    assert handler._usage_meter._path.exists()
+    await handler.close()

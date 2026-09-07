@@ -797,7 +797,10 @@ class ProjectChatProcessMixin:
                                 )
                         session = await runtime.start_or_resume(
                             SessionRequest(
-                                working_directory=str(self.project_root),
+                                working_directory=str(
+                                    (getattr(self._config, "danso_workspace", None) or self.project_root)
+                                    if provider == "danso" else self.project_root
+                                ),
                                 session_id=None if new_session else session_id,
                                 model=model,
                                 effort=effort,

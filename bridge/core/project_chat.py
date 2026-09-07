@@ -160,8 +160,6 @@ class ProjectChatHandler(
             "project_root",
             os.environ.get("PROJECT_ROOT", Path.cwd()),
         )
-        if getattr(self._config, "agent_provider", "claude") == "danso":
-            root_value = getattr(self._config, "danso_workspace", None) or root_value
         self.project_root = Path(root_value).resolve()
         project_dir_name = claude_project_dir_name(self.project_root)
         self.conversations_dir = Path.home() / ".claude" / "projects" / project_dir_name
