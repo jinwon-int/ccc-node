@@ -343,4 +343,5 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
                         task_max_requests=settings.danso_task_max_requests,
                         task_max_tokens=settings.danso_task_max_tokens,
                         task_repeat_limit=settings.danso_task_repeat_limit,
-                        task_pause_after_stage=settings.danso_task_pause_after_stage)
+                        task_pause_after_stage=settings.danso_task_pause_after_stage,
+                        progress_jsonl=True)

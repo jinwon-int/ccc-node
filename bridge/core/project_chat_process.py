@@ -985,7 +985,7 @@ class ProjectChatProcessMixin:
                     else (getattr(self._config, "turn_admission_timeout_seconds", 0.0) or 0.0)
                 )
                 if getattr(self._config, "agent_provider", "claude") == "danso":
-                    admission_grace = 0.0  # Buffered output; subprocess owns the finite deadline.
+                    admission_grace = 0.0  # Tool progress may start late; subprocess owns the finite deadline.
 
                 approval_grace = float(
                     getattr(self._config, "approval_stall_seconds", 0.0) or 0.0

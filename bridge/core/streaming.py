@@ -76,6 +76,8 @@ class StreamingMessageHandler:
     @staticmethod
     def _format_tool_call(name: str, input: dict) -> str:
         """Format tool call for display in Telegram"""
+        if not input:
+            return f"🛠️ **{name}**\n"
         # Extract key arguments for summary
         if name == "Bash" and "command" in input:
             summary = input["command"]

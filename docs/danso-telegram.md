@@ -54,6 +54,8 @@ CLAUDE_PROCESS_TIMEOUT=21660
 CCC_DANSO_PROVIDER_TIMEOUT_SECONDS=180
 CCC_DANSO_MAX_TURNS=32
 CCC_DANSO_COMPACT_AT_BYTES=131072
+ENABLE_STREAMING=true
+ENABLE_STREAMING_TOOL_CALLS=true
 ```
 
 The provider request default is 180 seconds. Existing environments that pin
@@ -162,8 +164,10 @@ bridge is a separate operational step; source development does not switch a node
 - Messages run through the normal queue, typing/status and final reply paths.
   Ordinary final answers are buffered; long-task mode may update the heartbeat
   from bounded native checkpoint counters, without relaying prompt, tool,
-  path, or provider-response bodies. The finite subprocess deadline replaces
-  the first-event admission timeout for this provider.
+  path, or provider-response bodies. When streaming and tool-call display are
+  enabled, ordinary turns may also emit body-free tool-start/settlement notices
+  from native `--progress-jsonl` (tool name only). The finite subprocess deadline
+  replaces the first-event admission timeout for this provider.
 - `/model` shows the configured model. Arbitrary model changes are rejected.
   `/effort` selects a supported effort; `default` restores `CCC_DANSO_EFFORT`.
 - The conversation UUID is durably saved before the subprocess can execute;
