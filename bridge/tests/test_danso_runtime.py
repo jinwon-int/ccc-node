@@ -281,3 +281,9 @@ async def test_danso_does_not_abandon_journal_on_automatic_daily_reset(tmp_path)
     now = datetime.now(timezone.utc)
     await manager.set_last_user_message_at("7:9", now - timedelta(days=2))
     assert not await manager.should_start_new_session("7:9", now=now)
+
+
+def test_usage_fallback_never_labels_danso_as_claude():
+    from telegram_bot.core.usage import UsageSnapshot, render_usage
+    report = render_usage(UsageSnapshot(provider="danso"))
+    assert "Danso" in report and "Claude" not in report
