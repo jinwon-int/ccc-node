@@ -132,7 +132,7 @@ class CodexDistillExtractionWorker:
         lease_seconds: int = 300,
         max_attempts: int = 5,
         wiki_enabled: bool = True,
-        extractor_provider: Literal["claude", "codex", "piri"] = "codex",
+        extractor_provider: Literal["claude", "codex", "piri", "danso"] = "codex",
         model: str = "provider-default",
         clock: Callable[[], float] = time.monotonic,
         guard: DistillGuard | None = None,
@@ -144,7 +144,7 @@ class CodexDistillExtractionWorker:
             lease_seconds <= 0
             or max_attempts <= 0
             or type(wiki_enabled) is not bool
-            or extractor_provider not in {"claude", "codex", "piri"}
+            or extractor_provider not in {"claude", "codex", "piri", "danso"}
             or type(provider_cooldown_seconds) is not int
             or provider_cooldown_seconds <= 0
             or type(retry_backoff_base_seconds) is not int
@@ -353,7 +353,7 @@ class CodexDistillExtractionWorker:
                 snapshot,
                 trigger=claimed.trigger,
                 provider=cast(
-                    Literal["claude", "codex", "piri"], claimed.provider
+                    Literal["claude", "codex", "piri", "danso"], claimed.provider
                 ),
             )
         except (TypeError, ValueError):

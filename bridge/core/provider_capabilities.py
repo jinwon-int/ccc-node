@@ -252,10 +252,10 @@ _DANSO_STATUSES: Mapping[str, CapabilityStatus] = {
     "memory_session_resume": _degraded('Native journal history resumes within its exact audience namespace; enabling memory requires a new conversation.'),
     "memory_read_bootstrap": _supported('Opt-in audience-scoped CCC materialization refreshes before each native invocation; the explicit private system context requires an updated Danso binary.'),
     "memory_postcompact_reinject": _degraded('Native run-local system memory survives compaction and is refreshed on the next invocation; no mid-invocation refresh or checkpoint write hook.'),
-    "memory_writeback_distill": _unsupported('Not implemented by the initial Danso Telegram integration.'),
-    "memory_sink_local": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "memory_writeback_distill": _supported('Opt-in checkpoint/new/shutdown jobs use locked scoped snapshots and isolated tool-free native extraction under a finite autonomous budget.'),
+    "memory_sink_local": _supported('Validated Danso facts and resume context use the existing idempotent audience-bound local sink; no automatic Wiki publication.'),
     "memory_sink_wiki_candidate": _unsupported('Not implemented by the initial Danso Telegram integration.'),
-    "memory_roundtrip": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "memory_roundtrip": _supported('Hermetic saved-fact to next Danso materializer tests recall one fact once and exclude it from the shared route.'),
     "lifecycle_observability": _supported('Provider-neutral opt-in lifecycle observations are body-free, bounded, owner-only and fail-open. Final Telegram delivery is not inferred from runtime completion; no native tool progress events are available.'),
 }
 

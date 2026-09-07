@@ -483,3 +483,38 @@ async def test_auth_mode_change_does_not_reuse_or_convert_journal(chatgpt_config
     with pytest.raises(ValueError, match="unavailable"):
         await api_runtime.start_or_resume(SessionRequest(working_directory=settings.danso_workspace, session_id=session.session_id))
     assert journal.read_bytes() == original
+
+
+@pytest.mark.anyio
+async def test_danso_snapshot_routes_and_budget_gated_composition(configured):
+    from telegram_bot.__main__ import build_context
+    from test_danso_distill import journal
+    from telegram_bot.memory.distill_types import TranscriptBounds, SnapshotUnavailableError
+    from telegram_bot.memory.danso_backend import DansoDistillBackend
+    settings = configured.model_copy(update={
+        "bridge_memory_mode":"audience-scoped",
+        "codex_memory_materializer_path":str(Path(__file__).resolve().parents[2] / "scripts/ccc_codex_memory.py"),
+        "memory_distill_provider":"danso", "memory_distill_model":"gpt-5.6-luna",
+        "usage_budget_tokens_danso":500000,
+    })
+    context = build_context(settings)
+    worker = context.distill_extraction_worker
+    assert isinstance(worker._backend, DansoDistillBackend)
+    assert worker._usage_meter is context.project_chat.usage_meter
+    assert worker._extractor_provider == "danso"
+    assert worker._wiki_enabled is False
+    assert context.distill_snapshot_worker._runtime is context.agent_runtime
+    root = context.agent_runtime.root
+    scope = "private-" + "a" * 32
+    ident, _ = journal(root / scope)
+    snapshot = await context.agent_runtime.read_session_snapshot(ident, bounds=TranscriptBounds(),
+        memory_audience="private", memory_scope=scope)
+    assert snapshot.byte_count > 0
+    with pytest.raises(SnapshotUnavailableError):
+        await context.agent_runtime.read_session_snapshot(ident, bounds=TranscriptBounds(),
+            memory_audience="shared", memory_scope="shared")
+    with pytest.raises(ValueError):
+        await context.agent_runtime.read_session_snapshot(ident, bounds=TranscriptBounds(),
+            memory_audience="private", memory_scope="../escape")
+    assert build_context(settings.model_copy(update={"usage_budget_tokens_danso":0})).distill_extraction_worker is None
+    assert build_context(settings.model_copy(update={"memory_distill_provider":"off"})).distill_snapshot_worker is None

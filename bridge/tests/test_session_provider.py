@@ -1470,14 +1470,15 @@ async def test_checkpoint_turn_gate_enqueues_without_resetting_session(
     assert (await manager.get_session("7:9"))["session_id"] == "thread"
 
 
+@pytest.mark.parametrize("provider", ["piri", "danso"])
 @pytest.mark.anyio
 async def test_piri_checkpoint_turn_gate_enqueues_source_provider(
-    tmp_path: Path,
+    tmp_path: Path, provider: str,
 ) -> None:
     from telegram_bot.memory.distill_types import DistillTrigger
 
-    manager = make_manager(tmp_path, "piri")
-    bot = bare_bot(manager, provider="piri")
+    manager = make_manager(tmp_path, provider)
+    bot = bare_bot(manager, provider=provider)
     journal = RecordingDistillJournal()
     bot._distill_journal = journal
     enable_checkpoint(bot, turns=1)
@@ -1491,7 +1492,7 @@ async def test_piri_checkpoint_turn_gate_enqueues_source_provider(
         turn_marker="message-1",
     )
 
-    assert journal.calls[0]["provider"] == "piri"
+    assert journal.calls[0]["provider"] == provider
     assert journal.calls[0]["trigger"] is DistillTrigger.CHECKPOINT
 
 

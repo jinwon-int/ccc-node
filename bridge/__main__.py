@@ -376,6 +376,7 @@ def build_context(
         if distill_provider is not None
         else None
     )
+    extraction_wiki_enabled = wiki_enabled and distill_provider != "danso"
     distill_extraction_worker = None
     if _distill_extraction_authorized(settings, project_chat, distill_provider):
         from telegram_bot.memory.distill_guard import DistillGuard
@@ -389,10 +390,10 @@ def build_context(
             build_distill_backend(
                 settings,
                 provider=distill_provider,
-                wiki_enabled=wiki_enabled,
+                wiki_enabled=extraction_wiki_enabled,
                 codex_environment=distill_environment,
             ),
-            wiki_enabled=wiki_enabled,
+            wiki_enabled=extraction_wiki_enabled,
             extractor_provider=distill_provider,
             model=distill_model,
             guard=DistillGuard(),
@@ -410,7 +411,7 @@ def build_context(
     distill_snapshot_worker = None
     if (
         distill_provider is not None
-        and settings.agent_provider in {"claude", "codex", "piri"}
+        and settings.agent_provider in {"claude", "codex", "piri", "danso"}
     ):
         from telegram_bot.memory.codex_snapshot import CodexThreadSnapshotter
 

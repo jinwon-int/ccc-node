@@ -82,8 +82,8 @@ def _validate_memory(settings: Settings) -> None:
 def _configuration(settings: Settings) -> tuple[str, Path]:
     """Validate locally, without creating state or contacting any provider."""
     _validate_memory(settings)
-    if settings.memory_distill_provider not in {"auto", "off"}:
-        raise ValueError("Danso requires CCC_MEMORY_DISTILL_PROVIDER=auto or off; extraction is unsupported")
+    if settings.memory_distill_provider not in {"auto", "off", "danso"}:
+        raise ValueError("Danso requires CCC_MEMORY_DISTILL_PROVIDER=auto, off or danso")
     if settings.danso_model != "gpt-6-astra":
         raise ValueError("Danso Telegram currently supports gpt-6-astra")
     if not settings.danso_state_dir or not Path(settings.danso_state_dir).is_absolute():
@@ -137,6 +137,20 @@ class DansoRuntime(WorkerRuntime):
         self.default_effort = default_effort
         self.memory_settings = memory_settings
         self._worker_kwargs = kwargs
+
+    async def read_session_snapshot(self, session_id, *, bounds, memory_audience=None, memory_scope=None):
+        import asyncio
+        from dataclasses import replace
+        from telegram_bot.core.memory_audience import MemoryAudience
+        from telegram_bot.memory.danso_snapshot import read_danso_snapshot
+        if self.memory_settings is None or memory_audience is None or memory_scope is None:
+            raise ValueError("Danso extraction requires an explicit audience route")
+        root = shared_memory_audience(self.memory_settings).root
+        audience = MemoryAudience(memory_audience, memory_scope, root)
+        audience_from_danso_environment(self.memory_settings, audience.danso_environment(self.memory_settings))
+        # Reserve room for the strict schema and JSON escaping in native context.
+        bounds = replace(bounds, max_bytes=min(bounds.max_bytes, 8192), max_message_bytes=min(bounds.max_message_bytes, 4096))
+        return await asyncio.to_thread(read_danso_snapshot, self.root / audience.scope, session_id, bounds=bounds)
 
     async def list_models(self):
         return [ModelInfo(id=self.model, display_name=self.model, is_default=True,

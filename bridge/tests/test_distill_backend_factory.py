@@ -11,7 +11,7 @@ from telegram_bot.memory.distill_backend_factory import (
 from telegram_bot.memory.runtime_cli_backend import RuntimeCliDistillBackend
 
 
-@pytest.mark.parametrize("provider", ["claude", "codex", "piri"])
+@pytest.mark.parametrize("provider", ["claude", "codex", "piri", "danso"])
 def test_auto_follows_supported_main_runtime(provider: str) -> None:
     assert resolve_distill_provider(provider, "auto") == provider
 

@@ -10,7 +10,7 @@ from .codex_exec_backend import CodexExecDistillBackend
 from .distill_extraction import DistillBackend
 from .runtime_cli_backend import RuntimeCliDistillBackend
 
-DistillProvider = Literal["claude", "codex", "piri"]
+DistillProvider = Literal["claude", "codex", "piri", "danso"]
 
 
 def resolve_distill_provider(
@@ -26,10 +26,10 @@ def resolve_distill_provider(
     if configured == "auto":
         return (
             cast(DistillProvider, main)
-            if main in {"claude", "codex", "piri"}
+            if main in {"claude", "codex", "piri", "danso"}
             else None
         )
-    if configured not in {"claude", "codex", "piri"}:
+    if configured not in {"claude", "codex", "piri", "danso"}:
         raise ValueError("unsupported distill provider")
     return cast(DistillProvider, configured)
 
@@ -52,6 +52,9 @@ def build_distill_backend(
             model=model,
             timeout_seconds=timeout,
         )
+    if provider == "danso":
+        from .danso_backend import DansoDistillBackend
+        return DansoDistillBackend(settings, wiki_enabled=wiki_enabled, model=model, timeout_seconds=timeout)
     if provider == "claude":
         executable = (
             str(settings.claude_cli_path)
