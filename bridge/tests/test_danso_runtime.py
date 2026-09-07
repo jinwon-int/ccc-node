@@ -379,3 +379,107 @@ def test_invalid_sandbox_rejected_before_state_creation(configured):
     ok, _ = probe_danso_readiness(configured.model_copy(update={"danso_sandbox":"invalid"}))
     assert not ok
     assert not Path(configured.danso_state_dir).exists()
+
+
+@pytest.fixture
+def chatgpt_configured(configured, tmp_path):
+    auth_home = tmp_path / "isolated-auth"
+    auth_home.mkdir(mode=0o700)
+    auth_file = auth_home / "danso-auth.json"
+    # Readiness inspects metadata only; the fake CLI never reads these bytes.
+    auth_file.write_text("PRIVATE_AUTH_FILE_CONTENT")
+    auth_file.chmod(0o600)
+    configured.danso_auth_mode = "chatgpt"
+    configured.danso_chatgpt_auth_file = str(auth_file)
+    return configured
+
+
+@pytest.mark.anyio
+async def test_chatgpt_mode_selects_subscription_without_platform_key(chatgpt_configured):
+    settings = chatgpt_configured
+    settings.openai_api_key = None
+    settings.danso_chatgpt_base_url = "http://127.0.0.1:43210/codex"
+    assert probe_danso_readiness(settings) == (True, "")
+    runtime = build_danso_runtime(settings)
+    assert runtime.provider == "openai-codex"
+    assert runtime.root.name == "chatgpt-journals"
+    assert set(runtime.environment) == {"PATH", "HOME", "DANSO_CHATGPT_AUTH_FILE", "DANSO_CHATGPT_BASE_URL"}
+    session = await runtime.start_or_resume(SessionRequest(working_directory=settings.danso_workspace))
+    events = [e async for e in session.send_turn("ok")]
+    assert events[-1].kind == "completion"
+    argv = json.loads((Path(settings.danso_workspace) / "argv.json").read_text())
+    assert argv[argv.index("--provider") + 1] == "openai-codex"
+    assert argv[argv.index("--model") + 1] == "gpt-6-astra"
+    assert argv[argv.index("--reasoning-effort") + 1] == "medium"
+    assert "PRIVATE_AUTH_FILE_CONTENT" not in repr(events)
+
+
+def test_chatgpt_mode_does_not_forward_voice_key_or_platform_endpoint(chatgpt_configured):
+    settings = chatgpt_configured
+    settings.openai_api_key = "PRIVATE_WHISPER_KEY"
+    settings.danso_base_url = "https://unrelated.example/v1"
+    runtime = build_danso_runtime(settings)
+    assert "OPENAI_API_KEY" not in runtime.environment
+    assert "DANSO_OPENAI_BASE_URL" not in runtime.environment
+    assert "PRIVATE_WHISPER_KEY" not in repr(runtime.environment)
+
+
+@pytest.mark.parametrize("mutation", ["relative", "missing", "file-mode", "parent-mode", "symlink", "symlink-loop",
+                                     "hardlink", "oversize", "workspace", "pending", "codex-reappeared", "endpoint"])
+def test_chatgpt_metadata_preflight_fails_without_state_writes(chatgpt_configured, mutation, tmp_path):
+    settings = chatgpt_configured
+    auth = Path(settings.danso_chatgpt_auth_file)
+    if mutation == "relative":
+        settings.danso_chatgpt_auth_file = "relative.json"
+    elif mutation == "missing":
+        settings.danso_chatgpt_auth_file = str(auth.parent / "missing.json")
+    elif mutation == "file-mode":
+        auth.chmod(0o644)
+    elif mutation == "parent-mode":
+        auth.parent.chmod(0o755)
+    elif mutation == "symlink":
+        link = tmp_path / "auth-link"
+        link.symlink_to(auth)
+        settings.danso_chatgpt_auth_file = str(link)
+    elif mutation == "symlink-loop":
+        link = tmp_path / "auth-loop"
+        link.symlink_to(link)
+        settings.danso_chatgpt_auth_file = str(link)
+    elif mutation == "hardlink":
+        os.link(auth, auth.parent / "copy")
+    elif mutation == "oversize":
+        auth.write_bytes(b"x" * 65537)
+    elif mutation == "workspace":
+        settings.danso_workspace = str(auth.parent)
+    elif mutation == "pending":
+        (auth.parent / ".danso-refresh-pending").symlink_to("/missing")
+    elif mutation == "codex-reappeared":
+        (auth.parent / "auth.json").write_text("placeholder")
+    elif mutation == "endpoint":
+        settings.danso_chatgpt_base_url = "https://unrelated.example"
+    ready, message = probe_danso_readiness(settings)
+    assert not ready and message
+    assert "PRIVATE_AUTH_FILE_CONTENT" not in message
+    assert not Path(settings.danso_state_dir).exists()
+
+
+def test_chatgpt_auth_requires_explicit_mode(configured, tmp_path):
+    configured.danso_chatgpt_auth_file = str(tmp_path / "auth.json")
+    ready, message = probe_danso_readiness(configured)
+    assert not ready and "CCC_DANSO_AUTH_MODE=chatgpt" in message
+
+
+@pytest.mark.anyio
+async def test_auth_mode_change_does_not_reuse_or_convert_journal(chatgpt_configured):
+    settings = chatgpt_configured
+    oauth_runtime = build_danso_runtime(settings)
+    session = await oauth_runtime.start_or_resume(SessionRequest(working_directory=settings.danso_workspace))
+    assert [e async for e in session.send_turn("ok")][-1].kind == "completion"
+    journal = oauth_runtime.root / (session.session_id + ".jsonl")
+    original = journal.read_bytes()
+    settings.danso_auth_mode = "api-key"
+    settings.danso_chatgpt_auth_file = None
+    api_runtime = build_danso_runtime(settings)
+    with pytest.raises(ValueError, match="unavailable"):
+        await api_runtime.start_or_resume(SessionRequest(working_directory=settings.danso_workspace, session_id=session.session_id))
+    assert journal.read_bytes() == original
