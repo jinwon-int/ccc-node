@@ -105,3 +105,32 @@ def test_default_rss_limit_falls_back_to_fixed_default_when_undetectable(
         default_session_tree_rss_limit_mb(proc_root=tmp_path)
         == DEFAULT_SESSION_TREE_RSS_LIMIT_MB
     )
+
+
+def test_process_tree_rss_reads_status_only_for_the_subtree(tmp_path: Path) -> None:
+    """VmRSS is needed for descendants only; `status` must not be read for
+    every process on the host on each idle tick."""
+    _write_process(tmp_path, 10, 1, 1024)
+    _write_process(tmp_path, 11, 10, 2048)
+    for stranger in (90, 91, 92, 93):
+        _write_process(tmp_path, stranger, 1, 8192)
+    # An unreadable `status` outside the subtree must not affect the result.
+    tmp_path.joinpath("94").mkdir()
+    tmp_path.joinpath("94", "stat").write_text(
+        "94 (other) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", encoding="utf-8"
+    )
+
+    assert process_tree_rss_mb(10, proc_root=tmp_path) == 3.0
+
+
+def test_process_tree_rss_skips_a_descendant_whose_status_vanished(
+    tmp_path: Path,
+) -> None:
+    """A child that exits between the two passes contributes no RSS, but its
+    own children are still walked."""
+    _write_process(tmp_path, 10, 1, 1024)
+    _write_process(tmp_path, 11, 10, 2048)
+    _write_process(tmp_path, 12, 11, 1024)
+    tmp_path.joinpath("11", "status").unlink()
+
+    assert process_tree_rss_mb(10, proc_root=tmp_path) == 2.0
