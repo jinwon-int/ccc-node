@@ -17,6 +17,7 @@ from .distill_extraction import (
     validate_live_decision_reasons,
 )
 from .runtime_cli_backend import RuntimeDistillBackendError, _load_schema_text, _resolve_executable
+from .distill_guard import classify_provider_failure
 
 
 class DansoDistillBackend:
@@ -181,11 +182,12 @@ async def _run(command, environment, cwd, timeout):
                 asyncio.create_task(_bounded(process.stdout, 65536)),
                 asyncio.create_task(_bounded(process.stderr, 16384)),
             ]
-            output, _diagnostic = await asyncio.gather(*readers)
+            output, diagnostic = await asyncio.gather(*readers)
             await process.wait()
             if process.returncode:
                 raise RuntimeDistillBackendError(
-                    "distill_backend_failed", exit_status=process.returncode
+                    classify_provider_failure("danso", diagnostic) or "distill_backend_failed",
+                    exit_status=process.returncode,
                 )
             return output
     except TimeoutError:

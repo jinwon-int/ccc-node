@@ -263,3 +263,46 @@ def test_snapshot_native_header_uuid_is_independent(tmp_path):
     assert json.loads(path.read_text().splitlines()[0])["id"] != ident
     snapshot = read_danso_snapshot(path.parent, ident, bounds=TranscriptBounds(), cwd=Path("/fixture"))
     assert snapshot.thread_hash == hashlib.sha256(ident.encode()).hexdigest()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("diagnostic,code", [
+    ("HTTP 401 unauthorized", "distill_auth_unavailable"),
+    ("HTTP 429 too many requests", "distill_rate_limited"),
+    ("usage limit reached", "distill_quota_exhausted"),
+    ("unknown model", "distill_model_unavailable"),
+])
+async def test_native_failure_trips_guard_without_persisting_stderr(tmp_path, diagnostic, code):
+    from test_distill_worker import snapshot_done_job
+    from telegram_bot.memory.distill_journal import DistillJournal
+    from telegram_bot.memory.distill_guard import DistillGuard, COOLDOWN_ACTIVE_CODE
+    from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
+    from telegram_bot.memory.distill_types import DistillJobStatus
+    from telegram_bot.core.usage_meter import UsageMeter
+    marker = tmp_path / "calls"
+    script = tmp_path / "danso"
+    script.write_text(
+        "#!/usr/bin/python3\nimport sys,pathlib\n"
+        f"p=pathlib.Path({str(marker)!r});p.write_text(p.read_text()+'x' if p.exists() else 'x')\n"
+        f"print({(diagnostic+' PRIVATE_DIAGNOSTIC_FIXTURE')!r},file=sys.stderr)\nsys.exit(1)\n"
+    )
+    script.chmod(0o700)
+    settings = SimpleNamespace(danso_model="gpt-6-astra", danso_cli_path=str(script),
+        danso_auth_mode="api-key", openai_api_key="synthetic", danso_base_url="")
+    backend = DansoDistillBackend(settings, wiki_enabled=False, model="gpt-5.6-luna", timeout_seconds=5)
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    first = snapshot_done_job(journal, provider="danso", thread_id="first")
+    second = snapshot_done_job(journal, provider="danso", thread_id="second")
+    guard = DistillGuard(state_dir=tmp_path / "guard")
+    worker = CodexDistillExtractionWorker(journal, backend,
+        usage_meter=UsageMeter(tmp_path / "usage.json", budgets={"danso":500000}),
+        guard=guard, extractor_provider="danso", model="gpt-5.6-luna", wiki_enabled=False)
+    failed = await worker.extract_once(job_id=first.job_id)
+    deferred = await worker.extract_once(job_id=second.job_id)
+    assert failed.error_code == code
+    assert guard.decision("danso", "gpt-5.6-luna").code == COOLDOWN_ACTIVE_CODE
+    assert deferred.status is DistillJobStatus.SNAPSHOT_DONE and deferred.extraction_attempts == 0
+    assert marker.read_text() == "x"
+    for path in list(journal.root.glob("*.json")) + list(guard.cooldown_dir.glob("*.json")):
+        assert "PRIVATE_DIAGNOSTIC_FIXTURE" not in path.read_text()
