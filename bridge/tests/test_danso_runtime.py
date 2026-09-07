@@ -230,3 +230,53 @@ def test_application_composes_danso_without_other_provider(configured):
     bot = create_app(context)
     assert bot._active_provider() == "danso"
     assert bot._probe_agent_readiness() == (True, "")
+
+
+def test_health_renderer_names_danso():
+    from telegram_bot.utils.health_render import _agent_label
+    assert _agent_label("danso") == "Danso"
+
+
+@pytest.mark.anyio
+async def test_first_failed_turn_persists_identity_before_tools_and_restart(configured):
+    from telegram_bot.__main__ import build_context
+    context = build_context(configured)
+    context.session_manager.initialize()
+    response = await context.project_chat.process_message("fail", 7, 9)
+    assert not response.success
+    stored = await context.session_manager.get_session("7:9")
+    assert stored["session_id"] == response.session_id
+    assert stored["provider"] == "danso"
+    restarted = build_context(configured)
+    restarted.session_manager.initialize()
+    recovered = await restarted.session_manager.get_session("7:9")
+    assert recovered["session_id"] == response.session_id
+    response2 = await restarted.project_chat.process_message("ok", 7, 9, session_id=recovered["session_id"])
+    assert response2.session_id == response.session_id and response2.success
+    journal = context.agent_runtime.root / (response.session_id + ".jsonl")
+    assert journal.read_text() == "fixture turn\nfixture turn\n"
+    await context.project_chat.close()
+    await restarted.project_chat.close()
+
+
+@pytest.mark.anyio
+async def test_session_persistence_failure_prevents_process_launch(configured):
+    runtime = build_danso_runtime(configured)
+    recorder = AsyncMock(side_effect=OSError("synthetic storage failure"))
+    handler = ProjectChatHandler(settings=_settings(Path(configured.project_root), "danso"),
+                                 agent_runtime=runtime, session_started_recorder=recorder)
+    response = await handler.process_message("ok", 7, 9)
+    assert not response.success
+    recorder.assert_awaited_once()
+    assert not (Path(configured.project_root) / "argv.json").exists()
+    await handler.close()
+
+
+@pytest.mark.anyio
+async def test_danso_does_not_abandon_journal_on_automatic_daily_reset(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    manager = make_manager(tmp_path, "danso")
+    manager.settings.auto_new_session_after_hours = 24
+    now = datetime.now(timezone.utc)
+    await manager.set_last_user_message_at("7:9", now - timedelta(days=2))
+    assert not await manager.should_start_new_session("7:9", now=now)

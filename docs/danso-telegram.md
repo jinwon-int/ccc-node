@@ -58,9 +58,12 @@ bridge is a separate operational step; source development does not switch a node
   admission timeout for this provider.
 - `/model` shows the configured model. Arbitrary model changes are rejected.
   `/effort` selects a supported effort; `default` restores `CCC_DANSO_EFFORT`.
+- The conversation UUID is durably saved before the subprocess can execute;
+  failed persistence prevents launch. Failures retain that identity.
 - `/new` starts a new journal. Ordinary turns and bridge restarts resume the
   current conversation's exact UUID. `/resume` reports that UUID; it cannot
-  select another conversation's journal.
+  select another conversation's journal. Automatic time-based session resets are
+  disabled for Danso so an unresolved journal cannot be abandoned silently.
 - `/stop` terminates and reaps the owned process group. Journals are retained.
   Native unresolved tool operations remain blocked; the bridge never repairs,
   acknowledges, or automatically replays them.

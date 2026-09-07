@@ -196,6 +196,10 @@ class SessionManager:
     async def should_start_new_session(
         self, user_id: int, now: Optional[datetime] = None
     ) -> bool:
+        if self.active_provider() == "danso":
+            # A time-based reset could abandon an unresolved native tool journal.
+            # Only the explicit /new command may replace this identity.
+            return False
         interval = self._auto_new_session_interval()
         if interval is None:
             return False

@@ -38,6 +38,7 @@ def _agent_label(provider: str) -> str:
     return {
         "codex": "Codex",
         "piri": "Piri",
+        "danso": "Danso",
         "crush": "Crush",
     }.get(str(provider).strip().lower(), "Claude")
 

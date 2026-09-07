@@ -7,7 +7,7 @@ import os
 import time
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -148,11 +148,13 @@ class ProjectChatHandler(
         *,
         agent_runtime: Any = None,
         clock: Any = None,
+        session_started_recorder: Callable[[int, int, str], Awaitable[None]] | None = None,
     ):
         # ``settings=None`` is retained only for legacy unit-test adapters. The
         # production composition root always injects the validated Settings.
         compatibility_mode = settings is None
         self._config = config if compatibility_mode else settings
+        self._session_started_recorder = session_started_recorder
         root_value = getattr(
             self._config,
             "project_root",

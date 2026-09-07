@@ -807,6 +807,11 @@ class ProjectChatProcessMixin:
                                 memory_environment=memory_environment,
                             )
                         )
+                        recorder = getattr(self, "_session_started_recorder", None)
+                        if recorder is not None:
+                            # Persist the identity before any tool can execute. A failed
+                            # write must abort this turn, never orphan an uncertain journal.
+                            await recorder(user_id, chat_id, session.session_id)
                         self._agent_session_attachments += 1
                         self._agent_session_registry.put_cached(
                             key,

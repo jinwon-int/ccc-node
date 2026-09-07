@@ -58,6 +58,16 @@ class BridgeStatusVerdictTest(unittest.TestCase):
         self.assertEqual(doctor.rows[-1].item, "Piri runtime")
         self.assertEqual(doctor.rows[-1].klass, "정상")
 
+    def test_danso_status_and_readiness_require_matching_live_bridge(self) -> None:
+        self.assertEqual(Doctor.bridge_status_provider("Danso: healthy\n"), ("danso", "healthy"))
+        doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
+        doctor.provider = "danso"
+        for state, expected in ((("piri", "healthy"), "failed"), (("danso", "healthy"), "ready")):
+            doctor._bridge_provider_state = state
+            doctor.check_provider_readiness()
+            self.assertEqual(doctor.readiness, expected)
+            self.assertEqual(doctor.rows[-1].item, "Danso runtime")
+
     def test_distill_auto_follows_live_piri_runtime(self) -> None:
         doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
         doctor.provider = "piri"
