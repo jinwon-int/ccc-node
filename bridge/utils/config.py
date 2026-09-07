@@ -228,6 +228,7 @@ class Config(
     )
     danso_cli_path: str = Field(default="danso", alias="CCC_DANSO_CLI_PATH")
     danso_state_dir: Optional[str] = Field(default=None, alias="CCC_DANSO_STATE_DIR")
+    danso_workspace: Optional[str] = Field(default=None, alias="CCC_DANSO_WORKSPACE")
     danso_model: str = Field(default="gpt-6-astra", min_length=1, alias="CCC_DANSO_MODEL")
     danso_effort: Literal["low", "medium", "high", "xhigh", "max"] = Field(
         default="medium", alias="CCC_DANSO_EFFORT")

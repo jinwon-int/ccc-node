@@ -31,7 +31,9 @@ def configured(tmp_path, monkeypatch):
                         lambda name: "/usr/bin/bwrap" if name == "bwrap" else real_which(name))
     workspace = tmp_path / "workspace"
     workspace.mkdir(mode=0o700)
-    (workspace / ".telegram_bot").mkdir(mode=0o700)
+    bridge_root = tmp_path / "bridge"
+    bridge_root.mkdir(mode=0o700)
+    (bridge_root / ".telegram_bot").mkdir(mode=0o700)
     binary = tmp_path / "danso"
     binary.write_text('''#!/usr/bin/python3
 import json,os,sys,time
@@ -58,9 +60,10 @@ if message == 'fail':
 print('completed')
 ''')
     binary.chmod(0o700)
-    settings = Settings.load(project_root=workspace, bot_env_file=tmp_path/'absent', environ={
+    settings = Settings.load(project_root=bridge_root, bot_env_file=tmp_path/'absent', environ={
         'TELEGRAM_BOT_TOKEN': '123456:synthetic', 'ALLOWED_USER_IDS': '[7]',
         'CCC_AGENT_PROVIDER': 'danso', 'CCC_DANSO_CLI_PATH': str(binary),
+        'CCC_DANSO_WORKSPACE': str(workspace),
         'CCC_DANSO_STATE_DIR': str(tmp_path/'private'), 'OPENAI_API_KEY': 'fixture-key',
         'CCC_DANSO_TIMEOUT_SECONDS': '3',
     })
@@ -70,7 +73,7 @@ print('completed')
 @pytest.mark.anyio
 async def test_telegram_turn_resume_default_effort_and_usage(configured):
     runtime = build_danso_runtime(configured)
-    settings = _settings(Path(configured.project_root), 'danso')
+    settings = _settings(Path(configured.danso_workspace), 'danso')
     settings.turn_admission_timeout_seconds = .01
     settings.turn_admission_retries = 1
     handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
@@ -79,7 +82,7 @@ async def test_telegram_turn_resume_default_effort_and_usage(configured):
         approval_policy='untrusted', sandbox_policy={'type':'dangerFullAccess'})
     assert response.success, response.error
     assert 'completed' in response.content
-    argv = json.loads((Path(configured.project_root)/'argv.json').read_text())
+    argv = json.loads((Path(configured.danso_workspace)/'argv.json').read_text())
     assert argv[argv.index('--reasoning-effort')+1] == 'medium'
     assert argv[argv.index('--provider')+1] == 'openai'
     assert '--unsafe-no-sandbox' not in argv
@@ -88,7 +91,7 @@ async def test_telegram_turn_resume_default_effort_and_usage(configured):
     journal = runtime.root/(response.session_id+'.jsonl')
     before = journal.read_bytes()
     restarted = build_danso_runtime(configured)
-    session = await restarted.start_or_resume(SessionRequest(working_directory=str(configured.project_root),session_id=response.session_id,effort='high'))
+    session = await restarted.start_or_resume(SessionRequest(working_directory=str(configured.danso_workspace),session_id=response.session_id,effort='high'))
     events = [e async for e in session.send_turn('next')]
     assert events[-1].kind == 'completion'
     assert journal.read_bytes() == before + b'fixture turn\n'
@@ -100,7 +103,7 @@ async def test_telegram_turn_resume_default_effort_and_usage(configured):
 @pytest.mark.parametrize('message,code',[('fail','danso_provider'),('invalid','danso_adapter_error')])
 async def test_failure_is_terminal_private_and_never_retried(configured,message,code):
     runtime = build_danso_runtime(configured)
-    settings = _settings(Path(configured.project_root), 'danso')
+    settings = _settings(Path(configured.danso_workspace), 'danso')
     settings.turn_admission_retries = 2
     settings.turn_admission_retry_timeout_seconds = 1
     handler = ProjectChatHandler(settings=settings,agent_runtime=runtime)
@@ -110,7 +113,7 @@ async def test_failure_is_terminal_private_and_never_retried(configured,message,
     assert len(list(runtime.root.glob('*.jsonl'))) == 1
     assert next(runtime.root.glob('*.jsonl')).read_text() == 'fixture turn\n'
     # Also verify the adapter's native error mapping, not inferred text.
-    session = await runtime.start_or_resume(SessionRequest(working_directory=str(configured.project_root)))
+    session = await runtime.start_or_resume(SessionRequest(working_directory=str(configured.danso_workspace)))
     events = [e async for e in session.send_turn(message)]
     assert len(events) == 1 and events[0].code == code and not events[0].retryable
     await handler.close()
@@ -120,11 +123,11 @@ async def test_failure_is_terminal_private_and_never_retried(configured,message,
 @pytest.mark.parametrize('cancel',[False,True])
 async def test_interrupt_or_cancel_reaps_child_and_preserves_journal(configured,cancel):
     runtime = build_danso_runtime(configured)
-    session = await runtime.start_or_resume(SessionRequest(working_directory=str(configured.project_root)))
+    session = await runtime.start_or_resume(SessionRequest(working_directory=str(configured.danso_workspace)))
     async def collect():
         return [e async for e in session.send_turn('wait')]
     task=asyncio.create_task(collect())
-    marker=Path(configured.project_root)/'pid'
+    marker=Path(configured.danso_workspace)/'pid'
     for _ in range(200):
         if marker.exists():
             break
@@ -152,10 +155,10 @@ async def test_environment_is_explicit_and_model_options_are_accurate(configured
     assert models[0].id == 'gpt-6-astra'
     assert models[0].default_reasoning_effort == 'medium'
     assert 'none' not in models[0].supported_reasoning_efforts
-    request=SessionRequest(working_directory=str(configured.project_root))
+    request=SessionRequest(working_directory=str(configured.danso_workspace))
     session=await runtime.start_or_resume(request)
     assert [e async for e in session.send_turn('ok')][-1].kind == 'completion'
-    names=json.loads((Path(configured.project_root)/'environment.json').read_text())
+    names=json.loads((Path(configured.danso_workspace)/'environment.json').read_text())
     assert 'TELEGRAM_BOT_TOKEN' not in names
     assert set(runtime.environment) == {'PATH','HOME','OPENAI_API_KEY'}
     assert configured.openai_api_key not in repr(configured)
@@ -165,6 +168,7 @@ async def test_environment_is_explicit_and_model_options_are_accurate(configured
     ('bridge_memory_mode','curated'),('bridge_memory_mode','audience-scoped'),
     ('danso_model','wrong-model'),('openai_api_key',None),('danso_state_dir','relative'),
     ('danso_cli_path','/nonexistent/danso'),('process_timeout_seconds',1),
+    ('danso_workspace',None),('danso_workspace','relative'),
 ])
 def test_preflight_rejects_unsupported_configuration_without_writes(configured,field,value):
     settings=configured.model_copy(update={field:value})
@@ -175,9 +179,9 @@ def test_preflight_rejects_unsupported_configuration_without_writes(configured,f
 
 def test_private_state_and_missing_bwrap_fail_closed(configured,monkeypatch):
     state=Path(configured.danso_state_dir)
-    state.symlink_to(configured.project_root,target_is_directory=True)
+    state.symlink_to(configured.danso_workspace,target_is_directory=True)
     assert not probe_danso_readiness(configured)[0]
-    assert not (Path(configured.project_root)/'journals').exists()
+    assert not (Path(configured.danso_workspace)/'journals').exists()
     other=configured.model_copy(update={'danso_state_dir':str(state.parent/'other')})
     monkeypatch.setattr('telegram_bot.core.danso_runtime.shutil.which',lambda name:None if name=='bwrap' else configured.danso_cli_path)
     assert not probe_danso_readiness(other)[0]
@@ -188,8 +192,8 @@ def test_private_state_and_missing_bwrap_fail_closed(configured,monkeypatch):
 async def test_invalid_session_policy_or_missing_resume_never_launches(configured,kwargs):
     runtime=build_danso_runtime(configured)
     with pytest.raises((ValueError,OSError)):
-        await runtime.start_or_resume(SessionRequest(working_directory=str(configured.project_root),**kwargs))
-    assert not (Path(configured.project_root)/'argv.json').exists()
+        await runtime.start_or_resume(SessionRequest(working_directory=str(configured.danso_workspace),**kwargs))
+    assert not (Path(configured.danso_workspace)/'argv.json').exists()
 
 
 @pytest.mark.anyio
@@ -264,12 +268,12 @@ async def test_first_failed_turn_persists_identity_before_tools_and_restart(conf
 async def test_session_persistence_failure_prevents_process_launch(configured):
     runtime = build_danso_runtime(configured)
     recorder = AsyncMock(side_effect=OSError("synthetic storage failure"))
-    handler = ProjectChatHandler(settings=_settings(Path(configured.project_root), "danso"),
+    handler = ProjectChatHandler(settings=_settings(Path(configured.danso_workspace), "danso"),
                                  agent_runtime=runtime, session_started_recorder=recorder)
     response = await handler.process_message("ok", 7, 9)
     assert not response.success
     recorder.assert_awaited_once()
-    assert not (Path(configured.project_root) / "argv.json").exists()
+    assert not (Path(configured.danso_workspace) / "argv.json").exists()
     await handler.close()
 
 
@@ -287,3 +291,11 @@ def test_usage_fallback_never_labels_danso_as_claude():
     from telegram_bot.core.usage import UsageSnapshot, render_usage
     report = render_usage(UsageSnapshot(provider="danso"))
     assert "Danso" in report and "Claude" not in report
+
+
+@pytest.mark.parametrize("protected", ["project_root", "bot_data_dir"])
+def test_task_workspace_cannot_expose_bridge_control_or_credential_files(configured, protected):
+    settings = configured.model_copy(update={"danso_workspace": str(getattr(configured, protected))})
+    ok, reason = probe_danso_readiness(settings)
+    assert not ok and "bridge configuration or session storage" in reason
+    assert not Path(configured.danso_state_dir).exists()

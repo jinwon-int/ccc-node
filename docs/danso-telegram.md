@@ -15,7 +15,13 @@ operator-controlled absolute path. ccc-node bundles the bounded subprocess
 adapter derived from that revision's `integrations/ccc_node.py`; the Danso
 Python repository does not need to be on `PYTHONPATH`.
 
-Create an owner-only state directory **outside** the Telegram project workspace.
+Choose a dedicated task workspace with `CCC_DANSO_WORKSPACE`, separate from
+the bridge configuration and session storage. Never use the bridge project root
+(or the whole login HOME) as the task workspace: its `.telegram_bot/.env` and
+session pointers must not be exposed to coding tools. The bridge rejects these
+overlaps. Telegram tasks operate in this explicit workspace.
+
+Create an owner-only state directory **outside** the task workspace.
 For a bridge running as `gongmyoung` with project `/home/gongmyoung`, an example
 is `/var/lib/ccc-danso/gongmyoung`, owned by `gongmyoung`, mode `0700`.
 Do not put state under `/home/gongmyoung` in this example. Paths must not contain
@@ -27,6 +33,7 @@ In the bridge's private project `.telegram_bot/.env`, configure:
 ```dotenv
 CCC_AGENT_PROVIDER=danso
 CCC_DANSO_CLI_PATH=/opt/danso/target/release/danso
+CCC_DANSO_WORKSPACE=/home/gongmyoung/workspaces/danso
 CCC_DANSO_STATE_DIR=/var/lib/ccc-danso/gongmyoung
 CCC_DANSO_MODEL=gpt-6-astra
 CCC_DANSO_EFFORT=medium

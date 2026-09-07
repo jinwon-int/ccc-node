@@ -27,7 +27,15 @@ def _configuration(settings: Settings) -> tuple[str, Path]:
     if not settings.danso_state_dir or not Path(settings.danso_state_dir).is_absolute():
         raise ValueError("Danso requires an absolute CCC_DANSO_STATE_DIR outside the project")
     root = Path(settings.danso_state_dir)
-    cwd = Path(settings.project_root).resolve(strict=True)
+    if not settings.danso_workspace or not Path(settings.danso_workspace).is_absolute():
+        raise ValueError("Danso requires an absolute CCC_DANSO_WORKSPACE separate from bridge state")
+    cwd = Path(settings.danso_workspace)
+    if not cwd.is_dir() or cwd.resolve() != cwd:
+        raise ValueError("Danso workspace must exist and contain no symlinks")
+    protected = (Path(settings.bot_data_dir), Path(settings.session_store_path),
+                 Path(settings.project_root) / ".telegram_bot")
+    if any(cwd.is_relative_to(p.resolve()) or p.resolve().is_relative_to(cwd) for p in protected):
+        raise ValueError("Danso workspace must not expose bridge configuration or session storage")
     if root.resolve() != root or root.is_relative_to(cwd) or cwd.is_relative_to(root):
         raise ValueError("Danso state must be disjoint from the project and contain no symlinks")
     if root.exists():
