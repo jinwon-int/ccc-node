@@ -62,6 +62,27 @@ class ExpandFieldTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             lib.expand_field('*/0', 0, 59)
 
+    def test_range(self):
+        self.assertEqual(lib.expand_field('1-5', 0, 7), {1, 2, 3, 4, 5})
+
+    def test_range_with_step(self):
+        self.assertEqual(lib.expand_field('9-17/4', 0, 23), {9, 13, 17})
+
+    def test_range_mixed_with_list(self):
+        self.assertEqual(lib.expand_field('1-3,7', 0, 10), {1, 2, 3, 7})
+
+    def test_bare_value_with_step_runs_to_max(self):
+        # Vixie semantics: `N/S` counts up from N to the field maximum.
+        self.assertEqual(lib.expand_field('50/5', 0, 59), {50, 55})
+
+    def test_inverted_range_raises(self):
+        with self.assertRaises(ValueError):
+            lib.expand_field('5-1', 0, 7)
+
+    def test_range_out_of_bounds_raises(self):
+        with self.assertRaises(ValueError):
+            lib.expand_field('20-30', 0, 23)
+
 
 class ParseScheduleTest(unittest.TestCase):
     def test_shorthand_daily(self):
@@ -75,6 +96,33 @@ class ParseScheduleTest(unittest.TestCase):
         self.assertEqual(spec['minute'], {30})
         self.assertEqual(spec['hour'], {9})
         self.assertEqual(spec['dow'], {1})
+
+    def test_weekday_range(self):
+        # `0 9 * * 1-5` (weekdays at 09:00) is the most common cron shape and
+        # was rejected as an unsupported field before ranges were accepted.
+        spec = lib.parse_schedule('0 9 * * 1-5')
+        self.assertEqual(spec['dow'], {1, 2, 3, 4, 5})
+        self.assertFalse(spec['dow_any'])
+        self.assertTrue(spec['dom_any'])
+        self.assertTrue(lib.cron_matches(_dt(2026, 9, 4, 9, 0), spec))   # Friday
+        self.assertFalse(lib.cron_matches(_dt(2026, 9, 5, 9, 0), spec))  # Saturday
+
+    def test_business_hours_range_with_step(self):
+        spec = lib.parse_schedule('*/30 9-17 * * *')
+        self.assertEqual(spec['minute'], {0, 30})
+        self.assertEqual(spec['hour'], set(range(9, 18)))
+        self.assertTrue(lib.cron_matches(_dt(2026, 9, 4, 17, 30), spec))
+        self.assertFalse(lib.cron_matches(_dt(2026, 9, 4, 18, 30), spec))
+
+    def test_inverted_range_rejected(self):
+        with self.assertRaises(ValueError):
+            lib.parse_schedule('0 9 * * 5-1')
+
+    def test_named_day_still_rejected(self):
+        # Alphabetic names (MON/JAN) remain unsupported; the error must stay
+        # explicit rather than silently matching nothing.
+        with self.assertRaises(ValueError):
+            lib.parse_schedule('0 9 * * MON')
 
     def test_reboot_rejected(self):
         with self.assertRaises(ValueError):

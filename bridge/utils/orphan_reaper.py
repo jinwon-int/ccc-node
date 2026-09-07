@@ -7,8 +7,15 @@ PID 1 (init/Termux) rather than being cleanly terminated.  These orphans
 accumulate on resource-constrained devices (Android/Termux) and can never be
 reaped by the new bridge instance.
 
+Only processes the bridge itself started are eligible: each carries an
+ownership marker in its environment (``BRIDGE_CHILD_ENV_VAR``).  On a ccc-node
+host ``PPID=1`` by itself proves nothing — the distill and skill-review hooks
+launch ``claude -p`` under ``setsid`` precisely so it survives SSH teardown, and
+an operator may have a detached session running — so the marker, not the
+reparenting, is what establishes ownership.
+
 This module provides:
-- ``find_orphaned_claude_pids()``:  locate PPID=1 node-claude procs past an age threshold
+- ``find_orphaned_claude_pids()``:  locate PPID=1 bridge-spawned node-claude procs past an age threshold
 - ``sweep_orphaned_claude_processes()``: find + SIGTERM in one call, returns killed PIDs
 - ``start_periodic_reaper()``: asyncio long-running task for recurring sweeps
 
@@ -34,6 +41,17 @@ DEFAULT_MIN_AGE_SECONDS: int = 1800
 
 #: How often the periodic reaper wakes up and sweeps.
 DEFAULT_SWEEP_INTERVAL_SECONDS: int = 900  # 15 minutes
+
+#: Ownership marker injected into every claude subprocess the bridge spawns
+#: (see ``core/claude_runtime_options``).  ``PPID==1`` plus a ``node claude``
+#: cmdline is *not* an ownership signal on a ccc-node host: the distill and
+#: skill-review hooks launch ``claude -p`` under ``setsid`` (PPID 1 by design),
+#: agent-cron runs headless claude, and an operator may leave a detached
+#: session of their own.  Reaping is therefore restricted to processes carrying
+#: this marker in ``/proc/<pid>/environ``, so the sweep can only ever reach
+#: children this bridge started.
+BRIDGE_CHILD_ENV_VAR: str = "CCC_BRIDGE_CLAUDE_CHILD"
+BRIDGE_CHILD_ENV_VALUE: str = "1"
 
 
 # ── /proc helpers ─────────────────────────────────────────────────────────────
@@ -122,6 +140,25 @@ def _argv_of(pid: int) -> list[str]:
     ]
 
 
+def _is_bridge_spawned(pid: int) -> bool:
+    """True when ``pid``'s environment carries the bridge ownership marker.
+
+    Fails **closed**: an unreadable or marker-free environment means "not ours",
+    so a process the bridge cannot prove it started is never signalled.  This
+    also means claude children left behind by a bridge running an older build
+    (which set no marker) are not reaped — a one-time leftover, preferred over
+    reaching a process that belongs to someone else.
+    """
+    raw = _read_bytes(f"/proc/{pid}/environ")
+    if not raw:
+        return False
+    needle = f"{BRIDGE_CHILD_ENV_VAR}={BRIDGE_CHILD_ENV_VALUE}".encode()
+    # /proc/<pid>/environ is NUL-separated; compare whole entries so a variable
+    # merely *ending* in our name (or a value with our marker as a prefix)
+    # cannot pass.
+    return any(entry == needle for entry in raw.split(b"\x00"))
+
+
 def _is_node_claude(cmdline) -> bool:
     """
     Return True when the invocation looks like a ``node claude …`` process.
@@ -177,9 +214,12 @@ def _is_orphaned_claude_process(
     1. A ``node claude …`` process (cmdline check)
     2. Reparented to init (PPID == 1)
     3. At least ``min_age_seconds`` old
+    4. Spawned by this bridge (ownership marker in its environment)
 
-    All three conditions must hold.  Age guard prevents accidental kills of
-    freshly-spawned legitimate subprocesses in edge-case timing windows.
+    All four conditions must hold.  Age guard prevents accidental kills of
+    freshly-spawned legitimate subprocesses in edge-case timing windows; the
+    ownership marker keeps the sweep off claude processes belonging to the
+    node's other components or to the operator.
     """
     stat = _read_text(f"/proc/{pid}/stat")
     if stat is None:
@@ -197,7 +237,10 @@ def _is_orphaned_claude_process(
     if age < min_age_seconds:
         return False
 
-    return _is_node_claude(_argv_of(pid))
+    if not _is_node_claude(_argv_of(pid)):
+        return False
+
+    return _is_bridge_spawned(pid)
 
 
 def find_orphaned_claude_pids(
@@ -206,9 +249,22 @@ def find_orphaned_claude_pids(
     """
     Scan ``/proc`` and return PIDs of orphaned node-claude processes.
 
-    An orphan is a ``node claude`` process with PPID=1 that is at least
-    ``min_age_seconds`` old.  The current process is never included.
+    An orphan is a bridge-spawned ``node claude`` process with PPID=1 that is
+    at least ``min_age_seconds`` old.  The current process is never included.
+
+    Returns an empty list when the bridge itself is PID 1 (a container started
+    without an init): there every live child of ours also has PPID==1, so the
+    reparenting signal carries no information and a sweep would SIGTERM the
+    bridge's own running sessions once they passed the age threshold.
     """
+    own_pid = os.getpid()
+    if own_pid == 1:
+        logger.debug(
+            "Orphan reaper: bridge is PID 1; PPID==1 cannot distinguish an "
+            "orphan from a live child, skipping sweep"
+        )
+        return []
+
     try:
         entries = os.listdir("/proc")
     except OSError:
@@ -217,7 +273,6 @@ def find_orphaned_claude_pids(
 
     hz = _get_hz()
     uptime = _get_uptime_seconds()
-    own_pid = os.getpid()
     orphans: list[int] = []
 
     for entry in entries:

@@ -14,7 +14,12 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 OCCURRENCE_SCAN_LIMIT = 1000
-CRON_FIELD_RX = re.compile(r'^(\*|\*/[1-9][0-9]*|[0-9]+)(,(\*|\*/[1-9][0-9]*|[0-9]+))*$')
+# One comma-separated term: `*`, `N`, `N-M`, or any of those with a `/S` step.
+# Ranges (`1-5`, `9-17`, `9-17/2`) are standard cron and were previously
+# rejected outright, so the most common business-hours/weekday schedules could
+# not be expressed at all.
+_CRON_TERM = r'(?:\*|[0-9]+(?:-[0-9]+)?)(?:/[1-9][0-9]*)?'
+CRON_FIELD_RX = re.compile(rf'^{_CRON_TERM}(,{_CRON_TERM})*$')
 INTERVAL_RX = re.compile(r'^every\s+([1-9][0-9]*)\s*(m|h|d)$')
 INTERVAL_UNIT_SECONDS = {'m': 60, 'h': 3600, 'd': 86400}
 MAX_INTERVAL_SECONDS = 366 * 86400
@@ -57,20 +62,35 @@ def parse_dt(value, field='timestamp'):
 
 
 def expand_field(raw, min_v, max_v):
+    """Expand one cron field into the set of values it matches.
+
+    Supports `*`, `N`, `N-M`, and a `/S` step on any of those (`*/15`, `9-17/2`,
+    `5/10`). A bare `N/S` is read the same way Vixie cron does: from N to the
+    field maximum.
+    """
     vals = set()
     for part in raw.split(','):
-        if part == '*':
-            vals.update(range(min_v, max_v + 1))
-        elif part.startswith('*/'):
-            step = int(part[2:])
+        body, sep, step_raw = part.partition('/')
+        step = 1
+        if sep:
+            step = int(step_raw)
             if step <= 0:
                 raise ValueError('step must be positive')
-            vals.update(range(min_v, max_v + 1, step))
+        if body == '*':
+            low, high = min_v, max_v
+        elif '-' in body:
+            low_raw, _, high_raw = body.partition('-')
+            low, high = int(low_raw), int(high_raw)
+            if low > high:
+                raise ValueError(f'range {body} is inverted')
         else:
-            v = int(part)
-            if v < min_v or v > max_v:
-                raise ValueError(f'value {v} outside {min_v}-{max_v}')
-            vals.add(v)
+            low = int(body)
+            # `N/S` counts up from N to the field maximum; a bare `N` is a
+            # single value.
+            high = max_v if sep else low
+        if low < min_v or high > max_v:
+            raise ValueError(f'value {body} outside {min_v}-{max_v}')
+        vals.update(range(low, high + 1, step))
     return vals
 
 
@@ -95,6 +115,9 @@ def parse_schedule(expr, tz_name='UTC'):
 
     Supported forms:
     - 5-field cron / @shorthand  -> kind 'cron' (matched in the task timezone)
+      Each field takes `*`, `N`, `N-M`, a comma list of those, and an optional
+      `/S` step (`0 9 * * 1-5`, `*/30 9-17 * * *`). Alphabetic names (MON, JAN)
+      are not supported.
     - ``every <N>m|h|d``         -> kind 'interval' (fixed period)
     - ``at <ISO8601>`` or a bare ISO8601 timestamp -> kind 'once'
       (naive timestamps are anchored to the task timezone)

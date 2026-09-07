@@ -35,6 +35,27 @@ def _make_cmdline(parts: list[str]) -> bytes:
     return b"\x00".join(p.encode() for p in parts) + b"\x00"
 
 
+def _make_environ(pairs: dict[str, str]) -> bytes:
+    """Build a NUL-separated /proc/<pid>/environ blob."""
+    return b"".join(f"{k}={v}".encode() + b"\x00" for k, v in pairs.items())
+
+
+def _marked_environ() -> bytes:
+    """An environ carrying the bridge's ownership marker, plus ordinary noise."""
+    from telegram_bot.utils import orphan_reaper
+
+    return _make_environ(
+        {
+            "PATH": "/usr/bin",
+            orphan_reaper.BRIDGE_CHILD_ENV_VAR: orphan_reaper.BRIDGE_CHILD_ENV_VALUE,
+            "HOME": "/root",
+        }
+    )
+
+
+_MARKED_ENVIRON = _marked_environ()
+
+
 # ---------------------------------------------------------------------------
 # Unit tests for _parse_stat
 # ---------------------------------------------------------------------------
@@ -134,7 +155,7 @@ class TestIsOrphanedClaudeProcess(unittest.TestCase):
         self.mod = orphan_reaper
 
     def _call(self, pid=42, ppid=1, age_secs=7200, min_age=1800,
-              cmdline=None):
+              cmdline=None, environ=_MARKED_ENVIRON):
         hz = 100
         uptime = 100000.0
         starttime = int(uptime * hz) - int(age_secs * hz)
@@ -152,6 +173,8 @@ class TestIsOrphanedClaudeProcess(unittest.TestCase):
         def fake_read_bytes(path):
             if path == f"/proc/{pid}/cmdline":
                 return cmdline_bytes
+            if path == f"/proc/{pid}/environ":
+                return environ
             return None
 
         with (
@@ -171,6 +194,23 @@ class TestIsOrphanedClaudeProcess(unittest.TestCase):
 
     def test_not_node_claude(self):
         self.assertFalse(self._call(cmdline=["python3", "bot.py"]))
+
+    def test_unmarked_process_is_not_ours(self):
+        """A detached `claude -p` from the distill/skill-review hooks, or an
+        operator's own session, is PPID=1 node-claude but carries no marker."""
+        self.assertFalse(self._call(environ=_make_environ({"HOME": "/root"})))
+
+    def test_environ_unreadable_fails_closed(self):
+        self.assertFalse(self._call(environ=None))
+        self.assertFalse(self._call(environ=b""))
+
+    def test_marker_must_match_whole_entry(self):
+        # A variable merely ending in the marker name, or a value that only
+        # starts with the marker value, must not pass as ownership.
+        self.assertFalse(self._call(
+            environ=_make_environ({f"NOT_{self.mod.BRIDGE_CHILD_ENV_VAR}": "1"})))
+        self.assertFalse(self._call(
+            environ=_make_environ({self.mod.BRIDGE_CHILD_ENV_VAR: "10"})))
 
     def test_stat_unreadable(self):
         with (
@@ -217,6 +257,19 @@ class TestFindOrphanedClaudePids(unittest.TestCase):
         ):
             result = self.mod.find_orphaned_claude_pids()
         self.assertEqual(result, [])
+
+    def test_skips_sweep_when_bridge_is_pid_1(self):
+        """In a container started without an init, the bridge's own *live*
+        children have PPID==1, so reparenting says nothing and a sweep would
+        SIGTERM running sessions once they aged past the threshold."""
+        with (
+            patch("os.getpid", return_value=1),
+            patch("os.listdir", return_value=["1", "999"]) as listdir,
+            patch.object(self.mod, "_is_orphaned_claude_process", return_value=True),
+        ):
+            result = self.mod.find_orphaned_claude_pids()
+        self.assertEqual(result, [])
+        listdir.assert_not_called()
 
     def test_proc_listdir_error(self):
         with patch("os.listdir", side_effect=OSError("no /proc")):

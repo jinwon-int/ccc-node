@@ -21,6 +21,12 @@ KEEP="${CCC_LIVE_BACKUPS_KEEP:-5}"
 case "$KEEP" in
   ''|*[!0-9]*) KEEP=5 ;;
 esac
+# A zero KEEP passes the digit check above and makes the `tail -n +$((KEEP+1))`
+# window start at line 1 — i.e. it prunes *every* snapshot and still exits 0.
+# This script is a retention tool, never an eraser: an operator who sets 0
+# (meaning "don't rotate") must not lose the whole backup tree, so floor at 1.
+# Deleting all snapshots stays a deliberate, manual `rm`.
+[ "$KEEP" -ge 1 ] 2>/dev/null || KEEP=1
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 LOG="$STATE_DIR/live-backups-rotate.log"
 ROOTS="${CCC_LIVE_BACKUPS_ROOTS:-/root/ccc-node-live-backups ${HOME:-/root}/ccc-node-live-backups /home/*/ccc-node-live-backups}"

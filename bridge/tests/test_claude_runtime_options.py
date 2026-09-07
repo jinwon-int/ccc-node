@@ -30,6 +30,10 @@ from telegram_bot.core.web_mcp import (
     FIRECRAWL_SEARCH_TOOL,
     SEARXNG_SEARCH_TOOL,
 )
+from telegram_bot.utils.orphan_reaper import (
+    BRIDGE_CHILD_ENV_VALUE,
+    BRIDGE_CHILD_ENV_VAR,
+)
 
 
 async def _reject(_tool_name, _tool_input, _context):
@@ -266,8 +270,38 @@ def test_curated_web_mcp_replaces_native_web_tools(tmp_path: Path) -> None:
     assert options.env == {
         "FIRECRAWL_API_KEY": "fc-test-secret",
         "CCC_BRIDGE_DISTILL_MANAGED": "1",
+        BRIDGE_CHILD_ENV_VAR: BRIDGE_CHILD_ENV_VALUE,
     }
     assert "Curated web routing" in options.system_prompt
+
+
+# ---- orphan-reaper ownership marker ----------------------------------------
+# The reaper signals only claude processes carrying this marker. Losing it here
+# does not fail a turn — it silently makes the bridge's own orphans unreapable,
+# so the wiring is asserted directly.
+
+
+def test_build_options_marks_every_child_for_the_reaper(tmp_path: Path) -> None:
+    options = _build(ClaudeRuntime(settings=_settings(tmp_path)), tmp_path)
+    assert options.env[BRIDGE_CHILD_ENV_VAR] == BRIDGE_CHILD_ENV_VALUE
+
+
+def test_reaper_marker_survives_a_bare_runtime(tmp_path: Path) -> None:
+    # Without bound settings the execution-profile block is skipped entirely;
+    # the marker is set outside it so those children stay attributable too.
+    options = _build(ClaudeRuntime(), tmp_path)
+    assert options.env[BRIDGE_CHILD_ENV_VAR] == BRIDGE_CHILD_ENV_VALUE
+
+
+def test_reaper_marker_survives_curated_web_mcp_env_replacement(tmp_path: Path) -> None:
+    # The curated web-MCP branch assigns options.env wholesale; the marker is
+    # merged after it, so it must still be present.
+    runtime = ClaudeRuntime(
+        settings=_settings(tmp_path, bridge_web_mcp_mode="searxng-firecrawl")
+    )
+    options = _build(runtime, tmp_path)
+    assert options.env[BRIDGE_CHILD_ENV_VAR] == BRIDGE_CHILD_ENV_VALUE
+    assert options.env["FIRECRAWL_API_KEY"] == "fc-test-secret"
 
 
 # ---- CLI stderr capture (#846) --------------------------------------------
