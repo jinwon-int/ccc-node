@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# rc is assigned then read via eval inside ok(); shellcheck cannot see that.
+# shellcheck disable=SC2034
 # Tests for ccc-live-backups-rotate.sh — hermetic via CCC_LIVE_BACKUPS_ROOTS.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

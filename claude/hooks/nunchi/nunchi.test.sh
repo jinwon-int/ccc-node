@@ -389,6 +389,7 @@ ok "recall by Korean alias expands to slug" 'grep -q "코덱스 러너" <<<"$out
 # A quote in the query used to build an unbalanced FTS5 string literal
 # ('unterminated string'), silently dropping recall to the unranked LIKE
 # fallback. Assert the FTS path itself still accepts the query.
+# shellcheck disable=SC2034  # fts_rc is read via eval inside ok()
 fts_rc="$(python3 - "$NP" <<'PY'
 import importlib.util, sqlite3, sys
 spec = importlib.util.spec_from_file_location("nunchi", sys.argv[1])
@@ -411,6 +412,7 @@ ok "a quoted recall query stays on the ranked FTS path" '[ "$fts_rc" = ok ]'
 
 # The LIKE fallback interpolates the query into %…%; an unescaped `_` there
 # matched any character, so a literal-underscore query pulled in decoys.
+# shellcheck disable=SC2034  # like_rc is read via eval inside ok()
 like_rc="$(python3 - "$NP" <<'PY'
 import importlib.util, sqlite3, sys
 spec = importlib.util.spec_from_file_location("nunchi", sys.argv[1])
