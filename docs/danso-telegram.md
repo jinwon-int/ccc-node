@@ -12,7 +12,7 @@ occurs. Danso owns the runtime in both modes.
 
 Use Linux 5.3+ with procfs/pidfds, Bash and Python 3.11+. Bubblewrap is optional. Build a reviewed Danso checkout with
 `cargo build --locked --release` (tested CLI baseline: jinwon-int/danso
-`1d6ecbeb29fa8efb6bdb5f44f11db47236cd9c78`, including native `auth-adopt`, managed
+`aad826a4b011e815452ac99f9ab59d64a403134a`, including native `auth-adopt`, managed
 renewal and completed SSE output-item handling). Install the executable at an
 operator-controlled absolute path. ccc-node bundles the bounded subprocess
 adapter derived from Danso's `integrations/ccc_node.py`; the Danso
