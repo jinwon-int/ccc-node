@@ -53,7 +53,25 @@ cd "$REPO" || fail "cannot enter $REPO"
 
 # Refresh the canonical ref only. Never touches the working tree, so this is
 # safe to run while someone is mid-review on a branch or in a worktree.
-git fetch --quiet origin 2>/dev/null || fail "git fetch origin failed"
+#
+# The fetch is bounded and its stderr is kept. On T1, 2026-09-07, this line --
+# then `git fetch --quiet origin 2>/dev/null` -- failed twice in ~15 runs, once
+# taking 2.5 minutes, and a bare fetch was separately seen to hang past 120s.
+# The cause is still unknown: gh's credential helper answered in ~70ms, DNS/TLS
+# were clean under GIT_CURL_VERBOSE, and neither a cold-start (7 min idle) nor
+# 9 back-to-back runs reproduced it. What made it undiagnosable was this line
+# itself -- `2>/dev/null` threw away the one thing that would have named the
+# cause, leaving only "git fetch origin failed". Keep the stderr. Without a
+# timeout an unattended run can also hang indefinitely, holding a cron slot.
+FETCH_TIMEOUT="${BROKER_POLICY_FETCH_TIMEOUT:-120}"
+fetch_err="$(timeout "$FETCH_TIMEOUT" git fetch --quiet origin 2>&1)"
+fetch_rc=$?
+if [ "$fetch_rc" -ne 0 ]; then
+  if [ "$fetch_rc" -eq 124 ]; then
+    fail "git fetch origin timed out after ${FETCH_TIMEOUT}s (raise BROKER_POLICY_FETCH_TIMEOUT if this ref is genuinely slow)"
+  fi
+  fail "git fetch origin failed (rc=${fetch_rc}): ${fetch_err:-no stderr output}"
+fi
 
 tmp="$(mktemp -d)" || fail "cannot create temp dir"
 trap 'rm -rf "$tmp"' EXIT

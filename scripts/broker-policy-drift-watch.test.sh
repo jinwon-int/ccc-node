@@ -213,5 +213,52 @@ EOF
 chmod +x "$TMP/bin/node"
 run_watch; check_rc "unexpected detector exit is normalized to cannot-determine" 2 $?
 
+# ---- fetch diagnosability (2026-09-07 T1) ---------------------------------
+# The watch failed twice in ~15 T1 runs with the single line "git fetch origin
+# failed" and nothing else, because the fetch discarded its own stderr. The
+# cause is still unknown; these tests pin that the NEXT occurrence names it.
+restore_node() {
+  cat > "$TMP/bin/node" <<'EOF'
+#!/usr/bin/env bash
+live=""; canon=""
+while [ $# -gt 0 ]; do case "$1" in --live) live="$2"; shift 2;; --canonical) canon="$2"; shift 2;; *) shift;; esac; done
+[ -r "$live" ] || { echo "stub: cannot read live" >&2; exit 2; }
+[ -r "$canon" ] || { echo "stub: cannot read canonical" >&2; exit 2; }
+if diff -q "$live" "$canon" >/dev/null 2>&1; then echo "stub: in sync"; exit 0; fi
+echo "stub: drift"; exit 1
+EOF
+  chmod +x "$TMP/bin/node"
+}
+restore_node
+policy_doc enforce > "$LIVE"
+
+# 13. A failing fetch must fail closed AND carry git's own words. Point origin
+#     at a path that is not a repository.
+git -C "$REPO" remote set-url origin "$TMP/not-a-repo"
+run_watch; check_rc "unreachable origin fails closed" 2 $?
+if grep -q "rc=" "$TMP/out" && grep -qiE "repository|not found|does not appear" "$TMP/out"; then
+  ok "fetch failure reports git's stderr, not just 'failed'"
+else
+  bad "fetch failure reports git's stderr, not just 'failed'"
+fi
+git -C "$REPO" remote set-url origin "$ORIGIN"
+run_watch; check_rc "restored origin passes again" 0 $?
+
+# 14. An unattended fetch must be bounded. A bare `git fetch` was seen to hang
+#     past 120s on T1; without a timeout a cron run hangs indefinitely. Stub
+#     `timeout` to return its own 124 so the branch is exercised directly.
+cat > "$TMP/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+exit 124
+EOF
+chmod +x "$TMP/bin/timeout"
+run_watch; check_rc "hung fetch is bounded and fails closed" 2 $?
+if grep -q "timed out" "$TMP/out" && grep -q "BROKER_POLICY_FETCH_TIMEOUT" "$TMP/out"; then
+  ok "fetch timeout is named as a timeout and says how to raise it"
+else
+  bad "fetch timeout is named as a timeout and says how to raise it"
+fi
+rm -f "$TMP/bin/timeout"
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
