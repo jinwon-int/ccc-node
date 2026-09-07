@@ -27,6 +27,7 @@ from telegram_bot.memory.distill_guard import (
         ("codex", b"HTTP 429: too many requests", "distill_rate_limited"),
         ("piri", b"usage limit reached for this account", "distill_quota_exhausted"),
         ("piri", b"unknown model kimi-private", "distill_model_unavailable"),
+        ("danso", b"HTTP 401 unauthorized", "distill_auth_unavailable"),
     ],
 )
 def test_provider_failure_classification_is_shared_and_body_free(

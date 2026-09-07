@@ -1470,14 +1470,18 @@ async def test_checkpoint_turn_gate_enqueues_without_resetting_session(
     assert (await manager.get_session("7:9"))["session_id"] == "thread"
 
 
+@pytest.mark.parametrize("provider", ["piri", "danso"])
 @pytest.mark.anyio
 async def test_piri_checkpoint_turn_gate_enqueues_source_provider(
-    tmp_path: Path,
+    tmp_path: Path, provider: str,
 ) -> None:
     from telegram_bot.memory.distill_types import DistillTrigger
 
-    manager = make_manager(tmp_path, "piri")
-    bot = bare_bot(manager, provider="piri")
+    manager = make_manager(tmp_path, provider)
+    bot = bare_bot(manager, provider=provider)
+    if provider == "danso":
+        bot._config.bridge_memory_mode = "audience-scoped"
+        bot._config.bot_data_dir = tmp_path
     journal = RecordingDistillJournal()
     bot._distill_journal = journal
     enable_checkpoint(bot, turns=1)
@@ -1491,7 +1495,7 @@ async def test_piri_checkpoint_turn_gate_enqueues_source_provider(
         turn_marker="message-1",
     )
 
-    assert journal.calls[0]["provider"] == "piri"
+    assert journal.calls[0]["provider"] == provider
     assert journal.calls[0]["trigger"] is DistillTrigger.CHECKPOINT
 
 
@@ -2264,3 +2268,18 @@ async def test_routeless_distill_job_warns_once_about_unroutable_local_sink(
     # The job is still enqueued: wiki/honcho sinks remain unaffected.
     assert len(journal.calls) == 3
     assert journal.calls[0]["memory_audience"] is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("source,mode", [("codex","audience-scoped"), ("piri","audience-scoped"), ("danso","off")])
+async def test_danso_does_not_enqueue_foreign_or_unroutable_sessions(tmp_path, source, mode):
+    from telegram_bot.memory.distill_types import DistillTrigger
+    bot = bare_bot(make_manager(tmp_path, "danso"), provider="danso")
+    bot._config.bridge_memory_mode = mode
+    journal = RecordingDistillJournal()
+    bot._distill_journal = journal
+    result = await bot._enqueue_previous_codex_session(
+        {"provider":source, "session_id":"old-thread"}, DistillTrigger.PROVIDER_SWITCH,
+        user_id=7, chat_id=9,
+    )
+    assert result is None and journal.calls == []

@@ -346,7 +346,9 @@ def build_context(
     )
     store = SessionStore(settings.session_store_path)
     session_manager = SessionManager(store=store, settings=settings)
-    distill_journal = DistillJournal(settings.bot_data_dir / "distill-journal")
+    # Enabling Danso must not consume or mutate another provider's backlog.
+    journal_name = "danso-distill-journal" if settings.agent_provider == "danso" else "distill-journal"
+    distill_journal = DistillJournal(settings.bot_data_dir / journal_name)
     project_chat = ProjectChatHandler(
         settings=settings,
         agent_runtime=agent_runtime,
@@ -371,11 +373,14 @@ def build_context(
         settings.agent_provider,
         settings.memory_distill_provider,
     )
+    if settings.agent_provider == "danso" and settings.bridge_memory_mode != "audience-scoped":
+        distill_provider = None
     distill_environment = (
         _build_distill_environment(settings, distill_provider)
         if distill_provider is not None
         else None
     )
+    extraction_wiki_enabled = wiki_enabled and distill_provider != "danso"
     distill_extraction_worker = None
     if _distill_extraction_authorized(settings, project_chat, distill_provider):
         from telegram_bot.memory.distill_guard import DistillGuard
@@ -389,10 +394,10 @@ def build_context(
             build_distill_backend(
                 settings,
                 provider=distill_provider,
-                wiki_enabled=wiki_enabled,
+                wiki_enabled=extraction_wiki_enabled,
                 codex_environment=distill_environment,
             ),
-            wiki_enabled=wiki_enabled,
+            wiki_enabled=extraction_wiki_enabled,
             extractor_provider=distill_provider,
             model=distill_model,
             guard=DistillGuard(),
@@ -410,7 +415,7 @@ def build_context(
     distill_snapshot_worker = None
     if (
         distill_provider is not None
-        and settings.agent_provider in {"claude", "codex", "piri"}
+        and settings.agent_provider in {"claude", "codex", "piri", "danso"}
     ):
         from telegram_bot.memory.codex_snapshot import CodexThreadSnapshotter
 

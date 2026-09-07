@@ -182,6 +182,44 @@ memory, start a new Telegram conversation with `/new` after recording any
 unfinished work; retain the previous journal for recovery. Turning memory off
 also needs a new conversation rather than moving journals between namespaces.
 
-This connects reading of CCC memories and configured local caches. Automatic
-extraction, write-back, checkpoint hooks and search tools are not added. A model
+With extraction off, only CCC memory reading is active. Search tools are not added. A model
 may quote supplied memory in its response; the snapshot is not a secret vault.
+
+
+## Automatic extraction and local storage
+
+Requires native Danso supporting `--no-tools` (Danso PR #37) as well as the
+system-context flag. Keep audience-scoped memory and configure, for example:
+
+```dotenv
+CCC_MEMORY_DISTILL_PROVIDER=danso
+CCC_MEMORY_DISTILL_MODEL=gpt-5.6-luna
+CCC_MEMORY_DISTILL_CHECKPOINT_TURNS=4
+CCC_MEMORY_DISTILL_CHECKPOINT_AGE_SECONDS=1800
+CCC_USAGE_BUDGET_TOKENS_DANSO=1000000
+```
+
+Completed-turn checkpoints, `/distill`, `/new`, provider changes and shutdown
+use a separate `danso-distill-journal` durable queue; prior Codex/Piri jobs stay untouched. Age is checked at turn completion. A finite
+usage-meter budget is required; zero budget leaves extraction off. Reservations
+conservatively charge serialized input/schema/output bounds, not subscription
+quota measurements. Interactive turns are not blocked by this autonomous budget.
+
+Snapshots read only the exact audience's UUID journal under the native flock,
+reject missing/partial/unresolved journals, and retain a bounded recent text
+window (8192 bytes for extraction, within the native 16 MiB journal limit).
+JSON escaping is included in the native context limit; further reduction keeps
+recent messages and explicitly marks the input truncated. Native header UUIDs
+are independent of filenames; the reader checks the expected workspace too.
+Extraction runs the native CLI with one request, no tools, `max` reasoning effort,
+an empty temporary HOME/workspace, explicit selected authentication and a private
+reference file. It does not launch Codex or adopt/copy authentication. Strict
+schema, decision-reason and provenance checks precede any storage. Only generated
+scratch files are removed after owned subprocess cleanup.
+
+The existing local sink writes audience-scoped `memory-facts.jsonl` and
+`resume.md`, rebuilds the local index and deduplicates retries. A later materializer
+reads these facts; the node must have its normal CCC memory search helpers
+installed. Existing memory namespaces and journals do not move. New Danso jobs
+do not generate Wiki candidates or skill installation requests. This does not
+backfill old conversations or provide a new automatic Honcho ingestion path.

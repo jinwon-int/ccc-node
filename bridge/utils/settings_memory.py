@@ -171,7 +171,7 @@ class MemorySettingsMixin:
         alias="CCC_CODEX_DISTILL_TIMEOUT_SEC",
         description="Bounded timeout for one isolated Codex distill provider call.",
     )
-    memory_distill_provider: Literal["auto", "off", "claude", "codex", "piri"] = Field(
+    memory_distill_provider: Literal["auto", "off", "claude", "codex", "piri", "danso"] = Field(
         default="auto",
         alias="CCC_MEMORY_DISTILL_PROVIDER",
         description=(

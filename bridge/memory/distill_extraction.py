@@ -146,7 +146,7 @@ class ExtractionMessage(_StrictModel):
 
 class DistillExtractionInput(_StrictModel):
     schema_version: Literal[1]
-    provider: Literal["claude", "codex", "piri"]
+    provider: Literal["claude", "codex", "piri", "danso"]
     content_trust: Literal["untrusted"]
     source_thread_hash: str = Field(pattern=_SHA256_RE.pattern)
     trigger: DistillTrigger
@@ -185,7 +185,7 @@ class DistillExtractionInput(_StrictModel):
 
 
 class DistillProvenance(_StrictModel):
-    provider: Literal["claude", "codex", "piri"]
+    provider: Literal["claude", "codex", "piri", "danso"]
     source_thread_hash: str = Field(pattern=_SHA256_RE.pattern)
     trigger: DistillTrigger
     distilled_at: str = Field(json_schema_extra={"format": "date-time"})
@@ -419,7 +419,7 @@ def build_extraction_input(
     snapshot: CodexTranscriptSnapshot,
     *,
     trigger: DistillTrigger,
-    provider: Literal["claude", "codex", "piri"] = "codex",
+    provider: Literal["claude", "codex", "piri", "danso"] = "codex",
 ) -> DistillExtractionInput:
     """Normalize a bounded snapshot and redact credentials before provider use."""
     if not isinstance(snapshot, CodexTranscriptSnapshot):
