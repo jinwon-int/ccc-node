@@ -386,6 +386,49 @@ ok "recall by node slug hits node fact" 'grep -q "코덱스 러너" <<<"$out"'
 out="$(python3 "$NP" recall "육손 노드" 2>&1)"
 ok "recall by Korean alias expands to slug" 'grep -q "코덱스 러너" <<<"$out"'
 
+# A quote in the query used to build an unbalanced FTS5 string literal
+# ('unterminated string'), silently dropping recall to the unranked LIKE
+# fallback. Assert the FTS path itself still accepts the query.
+fts_rc="$(python3 - "$NP" <<'PY'
+import importlib.util, sqlite3, sys
+spec = importlib.util.spec_from_file_location("nunchi", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+c = sqlite3.connect(":memory:"); c.executescript(m.SCHEMA)
+c.execute(
+    "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,created_at)"
+    " VALUES (?,?,?,?,?,?)",
+    ("me", "nosuk", "note", 'he said hello to world',
+     "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+)
+c.commit()
+for q in ('said "hello', 'a"b', 'plain'):
+    built = " OR ".join(m._fts_phrase(w) for w in m._expand_query(q))
+    c.execute("SELECT rowid FROM facts_fts WHERE facts_fts MATCH ?", [built]).fetchall()
+print("ok")
+PY
+)"
+ok "a quoted recall query stays on the ranked FTS path" '[ "$fts_rc" = ok ]'
+
+# The LIKE fallback interpolates the query into %…%; an unescaped `_` there
+# matched any character, so a literal-underscore query pulled in decoys.
+like_rc="$(python3 - "$NP" <<'PY'
+import importlib.util, sqlite3, sys
+spec = importlib.util.spec_from_file_location("nunchi", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+c = sqlite3.connect(":memory:"); c.executescript(m.SCHEMA)
+for fact in ("literal a_b token", "decoy axb token"):
+    c.execute(
+        "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        ("me", "nosuk", "note", fact, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+    )
+c.commit()
+c.execute("DROP TABLE facts_fts")  # force the fallback branch
+print("ok" if [r[3] for r in m.search(c, "a_b")] == ["literal a_b token"] else "wildcard-leak")
+PY
+)"
+ok "LIKE fallback treats _ as a literal, not a wildcard" '[ "$like_rc" = ok ]'
+
 # ---- 5. B2: correction auto-supersede --------------------------------------
 payload s3 fact user "메인 모델은 opus-5 이다" | python3 "$NP" ingest - >/dev/null
 payload s4 correction user "메인 모델은 opus-5 아니라 fable-5 이다" | python3 "$NP" ingest - >/dev/null

@@ -950,6 +950,32 @@ def _hallway_expansions(query, max_terms=_HALLWAY_EXPANSION_MAX):
     return out
 
 
+def _fts_phrase(word):
+    """Wrap one token as an FTS5 string literal, escaping embedded quotes.
+
+    FTS5 ends a `"…"` string at the first unescaped `"`, so a token carrying a
+    quote character produced an unbalanced query ('unterminated string') and
+    dropped the whole recall to the unranked LIKE fallback. Doubling the quote
+    is the FTS5 escape, exactly as for SQL string literals.
+    """
+    return '"' + str(word).replace('"', '""') + '"'
+
+
+def _like_escape(value):
+    r"""Escape LIKE wildcards so a literal ``%``/``_``/``\`` matches itself.
+
+    The fallback path interpolates the raw query into ``%…%``; without this a
+    query containing ``_`` silently matched any character. Callers must pair
+    this with ``ESCAPE '\'``.
+    """
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
 def search(c, query, target=None, limit=10, include_history=False):
     where = "f.valid_to IS NULL" if not include_history else "1=1"
     args = []
@@ -957,7 +983,7 @@ def search(c, query, target=None, limit=10, include_history=False):
         where += " AND f.observed = ?"
         args.append(target)
     words = _expand_query(query) + _hallway_expansions(query)
-    q = " OR ".join(f'"{w}"' for w in words) or f'"{query}"'
+    q = " OR ".join(_fts_phrase(w) for w in words) or _fts_phrase(query)
     try:
         rows = c.execute(
             f"SELECT f.id,f.observed,f.kind,f.fact,f.valid_from,f.valid_to,f.because,bm25(facts_fts) r"
@@ -965,10 +991,11 @@ def search(c, query, target=None, limit=10, include_history=False):
             f" WHERE facts_fts MATCH ? AND {where}"
             f" ORDER BY r LIMIT ?", [q] + args + [limit]).fetchall()
     except sqlite3.OperationalError:
-        like = f"%{query}%"
+        like = f"%{_like_escape(query)}%"
         rows = c.execute(
             f"SELECT id,observed,kind,fact,valid_from,valid_to,because,0 FROM peer_facts f"
-            f" WHERE (fact LIKE ? OR observed LIKE ?) AND {where} ORDER BY id DESC LIMIT ?",
+            f" WHERE (fact LIKE ? ESCAPE '\\' OR observed LIKE ? ESCAPE '\\')"
+            f" AND {where} ORDER BY id DESC LIMIT ?",
             [like, like] + args + [limit]).fetchall()
     return rows
 
