@@ -32,7 +32,7 @@ Living operator docs stay at the top level of `docs/`; historical closeouts and 
 | [`continuation.md`](continuation.md) | Yield-and-continue agent contract for the continuation queue (#1113). |
 | [`crush-harness.md`](crush-harness.md) | Crush harness for Kimi-K3/GLM nodes (#923). |
 | [`github-transport.md`](github-transport.md) | GitHub transport policy (local git + gh CLI first). |
-| [`danso-telegram.md`](danso-telegram.md) | Select Danso as the sandboxed Telegram runtime with Astra medium. |
+| [`danso-telegram.md`](danso-telegram.md) | Select Danso with Astra medium and explicit host/bubblewrap execution. |
 | [`piri-runtime-contract.md`](piri-runtime-contract.md) | PiriRuntime provider contract. |
 | [`pr-status-poll.md`](pr-status-poll.md) | PR/issue status poll lane (#962). |
 | [`quality-baseline.md`](quality-baseline.md) | Bridge quality gates and measured coverage baseline (#348). |

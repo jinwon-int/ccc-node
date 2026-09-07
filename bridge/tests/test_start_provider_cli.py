@@ -172,3 +172,45 @@ def test_danso_host_without_bwrap_and_explicit_backend_gate(tmp_path):
     override = _run(tmp_path, provider="danso", danso_cli=str(binary), sandbox="bubblewrap",
                     process_sandbox="host", hide_bwrap=True)
     assert override.returncode == 0, override.stdout + override.stderr
+
+
+def test_real_startup_merge_preserves_runtime_and_backend_precedence(tmp_path):
+    cases = [("host", None, "bubblewrap", "host"),
+             ("bubblewrap", None, "host", "bubblewrap"),
+             (None, "host", "bubblewrap", "host"),
+             (None, "bubblewrap", "host", "bubblewrap"),
+             (None, None, "host", "host"),
+             (None, None, "bubblewrap", "bubblewrap")]
+    for index, (process, project, fallback, expected) in enumerate(cases):
+        root = tmp_path / str(index)
+        root.mkdir()
+        global_dir = root / "global"
+        global_dir.mkdir()
+        project_file = root / "project.env"
+        project_file.write_text(f"CCC_DANSO_SANDBOX={project}\n" if project else "")
+        (global_dir / ".env").write_text(
+            f"CCC_DANSO_SANDBOX={fallback}\nCCC_AGENT_PROVIDER=piri\nCCC_DANSO_CLI_PATH=/missing/fallback\n")
+        for name in ("danso", "bwrap"):
+            binary = root / name
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(0o700)
+        program = '\n'.join([
+            'source "$START_SH" --path "$TEST_ROOT"',
+            'SCRIPT_DIR="$TEST_GLOBAL"; ENV_FILE="$TEST_PROJECT_ENV"',
+            'merge_env_files',
+            'printf "effective=%s\\n" "${CCC_DANSO_SANDBOX:-$(read_env_with_fallback CCC_DANSO_SANDBOX)}"',
+            _function_source("maybe_setup_agent_cli"),
+            'maybe_setup_agent_cli',
+        ])
+        env = {'PATH': f'{root}:/usr/bin:/bin', 'HOME': str(root),
+               'CCC_START_SH_LIB_ONLY': '1', 'START_SH': str(START_SH),
+               'TEST_ROOT': str(root), 'TEST_GLOBAL': str(global_dir),
+               'TEST_PROJECT_ENV': str(project_file), 'CCC_AGENT_PROVIDER': 'danso',
+               'CCC_DANSO_CLI_PATH': str(root / 'danso')}
+        if process is not None:
+            env['CCC_DANSO_SANDBOX'] = process
+        result = subprocess.run(['bash', '-c', program], env=env, text=True,
+                                capture_output=True, timeout=10, check=False)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert f'effective={expected}\n' in result.stdout
+        assert 'Danso provider CLI is available' in result.stdout

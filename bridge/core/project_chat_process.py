@@ -367,7 +367,8 @@ class ProjectChatProcessMixin:
             approvals_reviewer = None
             sandbox_policy = None
         elif provider == "danso":
-            # Danso enforces its own workspace bubblewrap sandbox.
+            # Danso uses the configured host/bubblewrap backend, independently
+            # of Codex policies. Host mode has current-user OS permissions.
             approval_policy = "never"
             approvals_reviewer = None
             sandbox_policy = None

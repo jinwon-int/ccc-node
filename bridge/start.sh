@@ -829,6 +829,14 @@ merge_env_files() {
            sed -E 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*).*/\2/' | sort -u)
 
     for key in $keys; do
+        # Preserve explicit runtime/backend selection across fallback exports.
+        case "$key" in
+            CCC_AGENT_PROVIDER|CCC_DANSO_CLI_PATH|CCC_DANSO_SANDBOX)
+                if [ "${!key+x}" = x ]; then
+                    continue
+                fi
+                ;;
+        esac
         # Check if key exists in project .env
         project_value="$(read_env_value "$key" "$project_env")"
         if [ -z "$project_value" ]; then
