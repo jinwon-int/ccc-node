@@ -194,10 +194,14 @@ class DansoSession:
         self._active = False
         self._stop_task = None
         self._interrupted = False
+        self._bootstrap_task = None
 
     async def interrupt(self):
         if self._active:
             self._interrupted = True
+            if self._bootstrap_task is not None:
+                self._bootstrap_task.cancel()
+                await asyncio.gather(self._bootstrap_task, return_exceptions=True)
             if self._process is not None:
                 await self._terminate()
 
@@ -225,7 +229,9 @@ class DansoSession:
             self._stop_task = None
             try:
                 if r.system_context_loader is not None:
-                    context_file = await r.system_context_loader()
+                    self._bootstrap_task = asyncio.create_task(r.system_context_loader())
+                    context_file = await self._bootstrap_task
+                    self._bootstrap_task = None
                     command += ['--system-context-file', str(context_file)]
                 if self._interrupted:
                     events.append(ErrorEvent(code='danso_cancelled', message='Worker interrupted before dispatch.'))
@@ -233,6 +239,10 @@ class DansoSession:
                     command += ['--', message]
                     async for event in self._execute(command, readers):
                         events.append(event)
+            except asyncio.CancelledError:
+                if not self._interrupted or asyncio.current_task().cancelling():
+                    raise
+                events.append(ErrorEvent(code='danso_cancelled', message='Worker interrupted before dispatch.'))
             except asyncio.TimeoutError:
                 events.append(ErrorEvent(code='danso_timeout', message='Worker deadline exceeded; journal retained.'))
             except (OSError, ValueError):
@@ -287,4 +297,4 @@ class DansoSession:
             for task in readers:
                 task.cancel()
             await asyncio.gather(*readers, return_exceptions=True)
-            self._process, self._active = None, False
+            self._process, self._active, self._bootstrap_task = None, False, None

@@ -165,7 +165,11 @@ snapshot under `<audience-root>/<opaque-scope>/danso/bootstrap/AGENTS.md`.
 It supplies only the path through `--system-context-file`; memory bodies do not
 enter argv, the user prompt, or bridge diagnostics. Native run-local context
 survives compaction. The next invocation refreshes again, including resume.
-A failed refresh aborts before dispatch; there is no stale-snapshot fallback.
+A failed materialization aborts before dispatch; there is no stale-snapshot fallback.
+The loader receives a small explicit environment, without provider credentials.
+Global pending promises/detached jobs and background cache refresh are disabled;
+stale Nunchi snapshots are omitted instead of regenerated. Stop/cancellation
+terminates the owned materializer and its loaders before returning.
 Private DMs retain the existing CCC private/legacy read policy; groups read
 only the shared route. Native HOME and OAuth credentials remain separate from
 materializer homes. Host execution still has the runtime user's permissions;

@@ -829,6 +829,9 @@ def _nunchi_mode_enabled(options: MaterializeOptions) -> bool:
 def _resolve_loader(options: MaterializeOptions) -> Path:
     if options.loader_path is not None:
         return _validate_loader(options.loader_path)
+    repository_loader = Path(__file__).resolve().parents[1] / "claude" / "hooks" / "load-memory.sh"
+    if options.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") == "danso" and repository_loader.is_file():
+        return _validate_loader(repository_loader)
     candidates = (
         Path(__file__).resolve().parent / "load-memory.sh",
         options.claude_dir / "hooks" / "load-memory.sh",
@@ -851,6 +854,9 @@ def _resolve_nunchi_loader(options: MaterializeOptions) -> Path | None:
 
     if options.loader_path is not None or not _nunchi_mode_enabled(options):
         return None
+    repository_loader = Path(__file__).resolve().parents[1] / "claude" / "hooks" / "nunchi" / "codex-loader.py"
+    if options.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") == "danso" and repository_loader.is_file():
+        return _validate_loader(repository_loader)
     candidates = (
         Path(__file__).resolve().parent / "nunchi" / "codex-loader.py",
         options.claude_dir / "hooks" / "nunchi" / "codex-loader.py",
@@ -910,7 +916,8 @@ def _run_loader_bounded(
             stdin=stdin_file if stdin_file is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            # Danso's bridge owns this entire process group, including loaders.
+            start_new_session=environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") != "danso",
             bufsize=0,
         )
     except OSError:

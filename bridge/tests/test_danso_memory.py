@@ -1,6 +1,7 @@
 """Audience boundaries and real local materialization; no provider calls."""
 import asyncio
 import json
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -138,3 +139,83 @@ async def test_telegram_handler_resolves_private_memory_route(memory_settings):
         assert 'PRIVATE_SENTINEL' in path.read_text()
     finally:
         await handler.close()
+
+
+@pytest.mark.anyio
+async def test_canonical_loader_blocks_global_promises_and_detached_refresh(memory_settings, tmp_path, monkeypatch):
+    repo = Path(__file__).resolve().parents[2]
+    home = tmp_path / 'operator-home'
+    hooks = home / '.claude/hooks'
+    hooks.mkdir(parents=True, mode=0o700)
+    marker = tmp_path / 'unexpected-refresh'
+    (hooks / 'refresh-memory.sh').write_text(f'#!/bin/bash\necho ran > {marker}\n')
+    waits = home / '.telegram_bot/external-wait'
+    waits.mkdir(parents=True)
+    (waits / 'waits.json').write_text(json.dumps({'w1': {'wait_id':'w1', 'state':'monitoring',
+        'repo':'private/repo','pr_number':7,'summary':'PRIVATE_PROMISE_SENTINEL'}}))
+    settings = memory_settings.model_copy(update={'claude_settings_path':home/'.claude/settings.json'})
+    monkeypatch.setenv('CCC_CODEX_MEMORY_LOADER', str(repo/'claude/hooks/load-memory.sh'))
+    monkeypatch.setenv('CCC_EXTERNAL_WAIT_HOME', str(waits))
+    monkeypatch.setenv('CCC_MEMORY_INJECT_PENDING_PROMISES','1')
+    monkeypatch.setenv('CCC_MEMORY_NO_REFRESH','0')
+    shared = route(settings,'shared')
+    memory = Path(shared['CCC_MEMORY_DIR'])
+    memory.mkdir(parents=True, mode=0o700)
+    (memory/'MEMORY.md').write_text('SHARED_CANONICAL_SENTINEL')
+    session = await build_danso_runtime(settings).start_or_resume(request(settings,shared))
+    path = await session.runtime.system_context_loader()
+    text = path.read_text()
+    assert 'SHARED_CANONICAL_SENTINEL' in text
+    assert 'PRIVATE_PROMISE_SENTINEL' not in text and 'private/repo' not in text
+    await asyncio.sleep(.1)
+    assert not marker.exists()
+
+
+@pytest.mark.anyio
+async def test_loader_environment_does_not_inherit_credentials_or_native_home(memory_settings,tmp_path,monkeypatch):
+    captured = {}
+    async def materialize(path, command, timeout, *, environment):
+        captured.update(environment)
+        file = Path(environment['CCC_DANSO_BOOTSTRAP_CONTEXT_FILE'])
+        file.write_text('safe')
+        file.chmod(0o600)
+        return True
+    monkeypatch.setattr('telegram_bot.core.danso_memory._run_materializer_command',materialize)
+    for key in ('OPENAI_API_KEY','DANSO_CHATGPT_AUTH_FILE','TELEGRAM_BOT_TOKEN','CODEX_AUTH_TOKEN'):
+        monkeypatch.setenv(key,'PRIVATE_CREDENTIAL_SENTINEL')
+    monkeypatch.setenv('HOME',str(tmp_path/'native-home'))
+    session = await build_danso_runtime(memory_settings).start_or_resume(request(memory_settings,route(memory_settings)))
+    await session.runtime.system_context_loader()
+    assert 'PRIVATE_CREDENTIAL_SENTINEL' not in json.dumps(captured)
+    assert captured['HOME'] == str(Path(memory_settings.claude_settings_path).parent.parent)
+    assert captured['HOME'] != str(tmp_path/'native-home')
+    assert captured['CCC_MEMORY_NO_REFRESH'] == '1'
+    assert captured['CCC_MEMORY_INJECT_PENDING_PROMISES'] == '0'
+    assert captured['CCC_MEMORY_INJECT_DETACHED_JOBS'] == '0'
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('cancel',[False,True])
+async def test_interrupt_reaps_real_materializer_and_loader(memory_settings,tmp_path,monkeypatch,cancel):
+    pidfile=tmp_path/'loader-pid'
+    loader=tmp_path/'hanging.py'
+    loader.write_text(f"import os,time\nfrom pathlib import Path\nPath({str(pidfile)!r}).write_text(str(os.getpid()))\ntime.sleep(30)\n")
+    monkeypatch.setenv('CCC_CODEX_MEMORY_LOADER',str(loader))
+    session=await build_danso_runtime(memory_settings).start_or_resume(request(memory_settings,route(memory_settings)))
+    async def collect(): return [e async for e in session.send_turn('synthetic')]
+    task=asyncio.create_task(collect())
+    deadline=time.monotonic()+3
+    while not pidfile.exists() and time.monotonic()<deadline:
+        await asyncio.sleep(.01)
+    assert pidfile.exists()
+    pid=int(pidfile.read_text())
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task,2)
+    else:
+        await asyncio.wait_for(session.interrupt(),2)
+        assert (await asyncio.wait_for(task,2))[0].code == 'danso_cancelled'
+    status=Path(f'/proc/{pid}/stat')
+    assert not status.exists() or status.read_text().split()[2]=='Z'
+    assert not (Path(memory_settings.danso_workspace)/'argv.json').exists()

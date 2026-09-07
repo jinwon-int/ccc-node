@@ -15,6 +15,8 @@ CACHE="${CCC_MEMORY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
 HOOKDIR="${CCC_HOOK_DIR:-${HOME:-/root}/.claude/hooks}"
 MEMDIR="${CCC_MEMORY_DIR:-${HOME:-/root}/.claude/memories}"
 PROFILE="${CCC_MEMORY_PROFILE:-standard}"
+refresh_note="A background refresh runs each session for the next one"
+[ "${CCC_MEMORY_NO_REFRESH:-0}" != "1" ] || refresh_note="Background cache refresh is disabled"
 TTL="${CCC_MEMORY_CACHE_TTL_SEC:-21600}"
 MAX_TOTAL="${CCC_MEMORY_MAX_BYTES:-12000}"
 MAX_MEM="${CCC_BUILTIN_MEMORY_MAX_BYTES:-4000}"
@@ -681,7 +683,7 @@ ctx="# ${node_label} session memory (auto-injected: $EVENT)
 
 ${resume_block}${operational_note}
 ${audience_note}
-Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}. A background refresh runs each session for the next one.
+Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}. ${refresh_note}.
 
 ## Built-in MEMORY + USER
 ${mem:-(memory files unavailable)}
