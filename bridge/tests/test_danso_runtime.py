@@ -30,7 +30,8 @@ def configured(tmp_path, monkeypatch):
     monkeypatch.setattr("telegram_bot.core.danso_runtime.shutil.which",
                         lambda name: "/usr/bin/bwrap" if name == "bwrap" else real_which(name))
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    workspace.mkdir(mode=0o700)
+    (workspace / ".telegram_bot").mkdir(mode=0o700)
     binary = tmp_path / "danso"
     binary.write_text('''#!/usr/bin/python3
 import json,os,sys,time
