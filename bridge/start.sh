@@ -829,6 +829,14 @@ merge_env_files() {
            sed -E 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*).*/\2/' | sort -u)
 
     for key in $keys; do
+        # Preserve explicit runtime/backend selection across fallback exports.
+        case "$key" in
+            CCC_AGENT_PROVIDER|CCC_DANSO_CLI_PATH|CCC_DANSO_SANDBOX)
+                if [ "${!key+x}" = x ]; then
+                    continue
+                fi
+                ;;
+        esac
         # Check if key exists in project .env
         project_value="$(read_env_value "$key" "$project_env")"
         if [ -z "$project_value" ]; then
@@ -1539,7 +1547,7 @@ load_optional_env() {
 }
 
 maybe_setup_agent_cli() {
-    local provider codex_cli piri_cli danso_cli
+    local provider codex_cli piri_cli danso_cli danso_sandbox
     provider="${CCC_AGENT_PROVIDER:-$(read_env_with_fallback "CCC_AGENT_PROVIDER")}"
     provider="${provider:-claude}"
 
@@ -1566,10 +1574,18 @@ maybe_setup_agent_cli() {
                 echo "❌ Error: Danso CLI unavailable; set CCC_DANSO_CLI_PATH"
                 exit 1
             fi
-            if ! command -v bwrap >/dev/null 2>&1; then
-                echo "❌ Error: Danso requires bubblewrap"
-                exit 1
-            fi
+            danso_sandbox="${CCC_DANSO_SANDBOX:-$(read_env_with_fallback "CCC_DANSO_SANDBOX")}"
+            danso_sandbox="${danso_sandbox:-host}"
+            case "$danso_sandbox" in
+                host) ;;
+                bubblewrap)
+                    if ! command -v bwrap >/dev/null 2>&1; then
+                        echo "❌ Error: Danso bubblewrap mode requires bubblewrap"
+                        exit 1
+                    fi
+                    ;;
+                *) echo "❌ Error: unsupported CCC_DANSO_SANDBOX"; exit 1 ;;
+            esac
             echo "✅ Danso provider CLI is available"
             return
             ;;

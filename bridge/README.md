@@ -56,7 +56,7 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 ## Prerequisites
 
 - **Python 3.11+**
-- **Provider CLI** — install the selected provider CLI. For `CCC_AGENT_PROVIDER=danso`, follow the [Danso Telegram setup](../docs/danso-telegram.md) (Astra medium, OpenAI API key and bubblewrap).
+- **Provider CLI** — install the selected provider CLI. For `CCC_AGENT_PROVIDER=danso`, follow the [Danso Telegram setup](../docs/danso-telegram.md) (Astra medium, OpenAI API key; host execution by default, optional bubblewrap).
 - **Codex authentication** — for Codex, complete the CLI login flow and pass `../scripts/ccc-doctor.sh` before starting the bridge
 - **Telegram Bot Token** — from [@BotFather](https://t.me/BotFather)
 - **ffmpeg** — required for audio format conversion

@@ -1,16 +1,16 @@
 # Danso as the Telegram runtime
 
 Set `CCC_AGENT_PROVIDER=danso` to route normal Telegram turns through the
-sandboxed Danso CLI. This initial integration supports OpenAI Responses with
+Danso CLI. This initial integration supports OpenAI Responses with
 `gpt-6-astra` and `low`, `medium`, `high`, `xhigh`, or `max` reasoning effort.
 The default is `medium`. It uses an explicit OpenAI API key; Codex subscription
 OAuth credentials are not accepted or discovered.
 
 ## Prepare the runtime
 
-Use Linux, Python 3.11+, and bubblewrap. Build a reviewed Danso checkout with
+Use Linux 5.3+ with procfs/pidfds, Bash and Python 3.11+. Bubblewrap is optional. Build a reviewed Danso checkout with
 `cargo build --locked --release` (tested CLI baseline: jinwon-int/danso
-`dac88d49a3ee99afed94ad6f806f24dc5f26f76e`). Install the executable at an
+`8ebdd822ab46c6b23471c08f3d023adfd81d767f`). Install the executable at an
 operator-controlled absolute path. ccc-node bundles the bounded subprocess
 adapter derived from that revision's `integrations/ccc_node.py`; the Danso
 Python repository does not need to be on `PYTHONPATH`.
@@ -25,8 +25,9 @@ Create an owner-only state directory **outside** the task workspace.
 For a bridge running as `gongmyoung` with project `/home/gongmyoung`, an example
 is `/var/lib/ccc-danso/gongmyoung`, owned by `gongmyoung`, mode `0700`.
 Do not put state under `/home/gongmyoung` in this example. Paths must not contain
-symlinks. The bridge creates private `home/` and `journals/` children; the isolated
-HOME prevents importing another runtime's global instructions or credentials.
+symlinks. The bridge creates private `home/` and `journals/` children; the private
+HOME avoids automatic discovery of another runtime's global instructions. It is
+not a security boundary in host mode; Bash can read current-user host files.
 
 In the bridge's private project `.telegram_bot/.env`, configure:
 
@@ -35,6 +36,7 @@ CCC_AGENT_PROVIDER=danso
 CCC_DANSO_CLI_PATH=/opt/danso/target/release/danso
 CCC_DANSO_WORKSPACE=/home/gongmyoung/workspaces/danso
 CCC_DANSO_STATE_DIR=/var/lib/ccc-danso/gongmyoung
+CCC_DANSO_SANDBOX=host
 CCC_DANSO_MODEL=gpt-6-astra
 CCC_DANSO_EFFORT=medium
 CCC_BRIDGE_MEMORY_MODE=off
@@ -54,8 +56,8 @@ normal default, or set it at least 10 seconds above the Danso deadline while
 preserving the bridge's other timeout invariants.
 
 Readiness checks are local prerequisite checks, not proof of account access or
-kernel sandbox support. Run the reviewed CLI's real sandbox tests and a separately
-authorized provider canary before switching a live bot. Restarting a deployed
+kernel sandbox support. Run the reviewed CLI's tests for the chosen backend and an authorized
+provider canary before switching a live bot. Restarting a deployed
 bridge is a separate operational step; source development does not switch a node.
 
 ## Telegram behavior
@@ -85,9 +87,13 @@ bridge is a separate operational step; source development does not switch a node
   Explicit cross-provider distill overrides also fail at startup.
   Non-off CCC memory modes fail at startup instead of silently using shared
   memory. Native Danso journal compaction remains enabled independently.
-- Danso always enforces its workspace bubblewrap sandbox; Codex approval and
-  sandbox controls do not change it. No interactive tool approval UI exists.
-  The first version is a bounded coding runtime, not an unrestricted node operator.
+- `CCC_DANSO_SANDBOX=host` is the default: tools run with current-user host
+  filesystem/network permissions and native descendant supervision. Workspace
+  path checks and cleared environments do not prevent Bash from accessing host
+  credentials or services. `bubblewrap` explicitly selects the original isolation
+  boundary and requires the helper/user namespaces; failure never falls back.
+  The backend is passed explicitly to the CLI. Codex approval/sandbox controls
+  do not change it; no interactive tool approval UI exists.
 
 To roll back provider selection, restore the previous private configuration and
 restart through the normal node procedure. Leave Danso journals intact. Provider
