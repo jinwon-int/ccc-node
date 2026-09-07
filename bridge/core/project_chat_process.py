@@ -792,6 +792,8 @@ class ProjectChatProcessMixin:
                                 memory_environment = audience.claude_environment(
                                     self._config
                                 )
+                            elif provider == "danso":
+                                memory_environment = audience.danso_environment(self._config)
                             elif provider == "piri":
                                 memory_environment = audience.piri_environment(
                                     self._config

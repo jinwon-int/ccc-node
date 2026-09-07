@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 
 from telegram_bot.core.agent_runtime import ModelInfo, SessionRequest
 from telegram_bot.core.danso_worker import DansoRuntime as WorkerRuntime
+from telegram_bot.core.danso_memory import prepare_memory_context
+from telegram_bot.core.memory_audience import audience_from_danso_environment, shared_memory_audience
 from telegram_bot.utils.config import Settings
 from telegram_bot.utils.secure_fs import ensure_private_directory
 
@@ -64,10 +66,22 @@ def _validate_authentication(settings: Settings, cwd: Path) -> None:
     # Metadata only; native validation remains authoritative at each dispatch.
 
 
+def _validate_memory(settings: Settings) -> None:
+    if settings.bridge_memory_mode not in {"off", "audience-scoped"}:
+        raise ValueError("Danso memory requires off or audience-scoped mode")
+    if settings.bridge_memory_mode == "audience-scoped":
+        if not Path(settings.codex_memory_materializer_path).is_file():
+            raise ValueError("Danso memory materializer is unavailable")
+        audience_root = shared_memory_audience(settings).root
+        workspace = Path(settings.danso_workspace or "/")
+        if (audience_root.resolve() != audience_root or audience_root.is_relative_to(workspace)
+                or workspace.is_relative_to(audience_root)):
+            raise ValueError("Danso memory must be disjoint from workspace and contain no symlinks")
+
+
 def _configuration(settings: Settings) -> tuple[str, Path]:
     """Validate locally, without creating state or contacting any provider."""
-    if settings.bridge_memory_mode != "off":
-        raise ValueError("Danso requires CCC_BRIDGE_MEMORY_MODE=off; memory routing is unsupported")
+    _validate_memory(settings)
     if settings.memory_distill_provider not in {"auto", "off"}:
         raise ValueError("Danso requires CCC_MEMORY_DISTILL_PROVIDER=auto or off; extraction is unsupported")
     if settings.danso_model != "gpt-6-astra":
@@ -116,11 +130,13 @@ def probe_danso_readiness(settings: Settings) -> tuple[bool, str]:
 
 class DansoRuntime(WorkerRuntime):
     """One operator-selected Astra model with explicit default reasoning effort."""
-    def __init__(self, *, default_effort: str = "medium", **kwargs: Any):
+    def __init__(self, *, default_effort: str = "medium", memory_settings: Settings | None = None, **kwargs: Any):
         if default_effort not in ASTRA_EFFORTS:
             raise ValueError("unsupported Astra effort")
         super().__init__(**kwargs)
         self.default_effort = default_effort
+        self.memory_settings = memory_settings
+        self._worker_kwargs = kwargs
 
     async def list_models(self):
         return [ModelInfo(id=self.model, display_name=self.model, is_default=True,
@@ -132,6 +148,15 @@ class DansoRuntime(WorkerRuntime):
         if effort not in ASTRA_EFFORTS:
             raise ValueError("unsupported Astra effort")
         try:
+            if self.memory_settings is not None:
+                audience = audience_from_danso_environment(self.memory_settings, request.memory_environment)
+                async def load_context():
+                    return await prepare_memory_context(self.memory_settings, audience)
+                kwargs = dict(self._worker_kwargs)
+                kwargs.update(state_directory=self.root / audience.scope,
+                              system_context_loader=load_context)
+                worker = WorkerRuntime(**kwargs)
+                return await worker.start_or_resume(replace(request, effort=effort, memory_environment=None))
             return await super().start_or_resume(replace(request, effort=effort))
         except FileNotFoundError:
             if not request.session_id:
@@ -155,7 +180,10 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
         if settings.danso_base_url:
             environment["DANSO_OPENAI_BASE_URL"] = settings.danso_base_url
         provider, journals = "openai", "journals"
-    return DansoRuntime(binary=binary, state_directory=root / journals,
+    memory_settings = settings if settings.bridge_memory_mode == "audience-scoped" else None
+    if memory_settings is not None:
+        journals += "-audience"
+    return DansoRuntime(binary=binary, state_directory=root / journals, memory_settings=memory_settings,
                         provider=provider, model=settings.danso_model,
                         environment=environment, default_effort=settings.danso_effort,
                         sandbox=settings.danso_sandbox,

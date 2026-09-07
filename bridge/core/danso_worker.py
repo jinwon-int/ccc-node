@@ -132,7 +132,7 @@ def _failure(stderr, code):
 class DansoRuntime:
     """One configured model; explicit credentials and private journal directory."""
     def __init__(self, *, binary, state_directory, provider, model, environment,
-                 timeout_seconds=300, provider_timeout_seconds=60, max_turns=16, compact_at_bytes=None, sandbox="host"):
+                 timeout_seconds=300, provider_timeout_seconds=60, max_turns=16, compact_at_bytes=None, sandbox="host", system_context_loader=None):
         if provider not in PROVIDERS or not model or not isinstance(model, str):
             raise ValueError('invalid provider/model')
         for value, maximum in ((timeout_seconds, 3600), (provider_timeout_seconds, 300), (max_turns, 128)):
@@ -143,6 +143,7 @@ class DansoRuntime:
             raise ValueError('invalid compaction threshold')
         if sandbox not in {"host", "bubblewrap"}:
             raise ValueError("invalid execution backend")
+        self.system_context_loader = system_context_loader
         self.sandbox = sandbox
         self.compact_at_bytes = compact_at_bytes
         self.binary = str(Path(binary).resolve(strict=True))
@@ -193,10 +194,14 @@ class DansoSession:
         self._active = False
         self._stop_task = None
         self._interrupted = False
+        self._bootstrap_task = None
 
     async def interrupt(self):
         if self._active:
             self._interrupted = True
+            if self._bootstrap_task is not None:
+                self._bootstrap_task.cancel()
+                await asyncio.gather(self._bootstrap_task, return_exceptions=True)
             if self._process is not None:
                 await self._terminate()
 
@@ -219,39 +224,25 @@ class DansoSession:
                 command += ['--reasoning-effort', self.effort]
             if r.compact_at_bytes is not None:
                 command += ['--compact-at-bytes', str(r.compact_at_bytes)]
-            command += ['--', message]
             self._active, self._interrupted = True, False
             readers, events = [], []
             self._stop_task = None
             try:
-                spawn = asyncio.create_task(asyncio.create_subprocess_exec(
-                    *command, cwd=self.cwd, env=r.environment, stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True))
-                self._process, cancelled = await _wait_owned(spawn)
-                if cancelled:
-                    raise asyncio.CancelledError
+                if r.system_context_loader is not None:
+                    self._bootstrap_task = asyncio.create_task(r.system_context_loader())
+                    context_file = await self._bootstrap_task
+                    self._bootstrap_task = None
+                    command += ['--system-context-file', str(context_file)]
                 if self._interrupted:
-                    await self.interrupt()
-                readers = [asyncio.create_task(_read(self._process.stdout)),
-                           asyncio.create_task(_read(self._process.stderr))]
-                async with asyncio.timeout(r.timeout + 5):
-                    stdout, stderr = await asyncio.gather(*readers)
-                    code = await self._process.wait()
-                if self._interrupted:
-                    events.append(ErrorEvent(code='danso_cancelled', message='Worker interrupted; journal retained. No automatic replay.'))
-                elif code != 0:
-                    events.append(_failure(stderr, code))
+                    events.append(ErrorEvent(code='danso_cancelled', message='Worker interrupted before dispatch.'))
                 else:
-                    if any(line.startswith(b'DANSO_ERROR=') for line in stderr.splitlines()):
-                        raise ValueError('failure diagnostic on successful exit')
-                    text = stdout.decode('utf-8').strip()
-                    usage = _usage(stderr.decode('utf-8'))
-                    if not text:
-                        raise ValueError('empty result')
-                    events.append(TextDeltaEvent(text=text))
-                    events.append(MessageCompletedEvent())
-                    events.append(ResultEvent(result={'text': text, 'usage': usage}))
-                    events.append(CompletionEvent(stop_reason='stop'))
+                    command += ['--', message]
+                    async for event in self._execute(command, readers):
+                        events.append(event)
+            except asyncio.CancelledError:
+                if not self._interrupted or asyncio.current_task().cancelling():
+                    raise
+                events.append(ErrorEvent(code='danso_cancelled', message='Worker interrupted before dispatch.'))
             except asyncio.TimeoutError:
                 events.append(ErrorEvent(code='danso_timeout', message='Worker deadline exceeded; journal retained.'))
             except (OSError, ValueError):
@@ -264,6 +255,40 @@ class DansoSession:
             for event in events:
                 yield event
 
+    async def _execute(self, command, readers):
+        r = self.runtime
+        events = []
+        spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+            *command, cwd=self.cwd, env=r.environment, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True))
+        self._process, cancelled = await _wait_owned(spawn)
+        if cancelled:
+            raise asyncio.CancelledError
+        if self._interrupted:
+            await self.interrupt()
+        readers.extend([asyncio.create_task(_read(self._process.stdout)),
+                        asyncio.create_task(_read(self._process.stderr))])
+        async with asyncio.timeout(r.timeout + 5):
+            stdout, stderr = await asyncio.gather(*readers)
+            code = await self._process.wait()
+        if self._interrupted:
+            events.append(ErrorEvent(code='danso_cancelled', message='Worker interrupted; journal retained. No automatic replay.'))
+        elif code != 0:
+            events.append(_failure(stderr, code))
+        else:
+            if any(line.startswith(b'DANSO_ERROR=') for line in stderr.splitlines()):
+                raise ValueError('failure diagnostic on successful exit')
+            text = stdout.decode('utf-8').strip()
+            usage = _usage(stderr.decode('utf-8'))
+            if not text:
+                raise ValueError('empty result')
+            events.append(TextDeltaEvent(text=text))
+            events.append(MessageCompletedEvent())
+            events.append(ResultEvent(result={'text': text, 'usage': usage}))
+            events.append(CompletionEvent(stop_reason='stop'))
+        for event in events:
+            yield event
+
     async def _cleanup(self, readers):
         try:
             if self._process is not None:
@@ -272,4 +297,4 @@ class DansoSession:
             for task in readers:
                 task.cancel()
             await asyncio.gather(*readers, return_exceptions=True)
-            self._process, self._active = None, False
+            self._process, self._active, self._bootstrap_task = None, False, None
