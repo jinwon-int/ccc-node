@@ -7,4 +7,5 @@ paths = [
   'claude/hooks/distill/extract.test.sh',
   'claude/hooks/security-scan.test.sh',
   'scripts/ccc-security-audit.test.sh',
+  'bridge/tests/test_redaction.py',
 ]

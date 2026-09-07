@@ -3,7 +3,8 @@
 One canonical credential/secret pattern set for the whole bridge, promoted from
 the memory-distill extractor (the most complete set — it is the only one that
 covers the Telegram-bot-token shape and full ``BEGIN…END PRIVATE KEY`` blocks),
-plus the ``AKIA`` AWS-key shape. Prefer importing from here over redefining a
+plus the AWS access-key (``AKIA``/``ASIA``), Slack token/webhook, and Google
+``AIza`` API-key shapes. Prefer importing from here over redefining a
 per-module copy so redaction stays consistent everywhere.
 
 ``redact_credentials`` substitutes matches with a marker (for text that must be
@@ -34,7 +35,16 @@ CREDENTIAL_PATTERNS: Final = (
     re.compile(r"\bgh(?:p|o|u|s|r)_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\bAKIA[A-Z0-9]{16}\b"),
+    # AWS access-key ids. AKIA is the long-lived shape; ASIA is an STS
+    # temporary credential, which is just as sensitive while it lives and was
+    # not covered.
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    # Slack bot/user/app/refresh tokens (xoxb-, xoxp-, xoxa-, xoxe-, xoxr-,
+    # xoxs-) and the webhook URLs that carry an equivalent send capability.
+    re.compile(r"\bxox[abeprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/+_-]{10,}"),
+    # Google API keys — a fixed 39-character AIza… shape.
+    re.compile(r"\bAIza[A-Za-z0-9_-]{35}\b"),
     re.compile(
         r"\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
         r"secret|password)\s*[:=]\s*[^\s,;]{12,}",
