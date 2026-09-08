@@ -782,6 +782,8 @@ class TelegramBot(
         self.application.add_handler(CommandHandler("model", self._cmd_model))
         self.application.add_handler(CommandHandler("effort", self._cmd_effort))
         self.application.add_handler(CommandHandler("resume", self._cmd_resume))
+        self.application.add_handler(CommandHandler("task_resume", self._cmd_task_resume))
+        self.application.add_handler(CommandHandler("task_pause", self._cmd_task_pause))
         self.application.add_handler(CommandHandler("stop", self._cmd_stop))
         self.application.add_handler(CommandHandler("continue", self._cmd_continue))
         self.application.add_handler(CommandHandler("restart", self._cmd_restart))

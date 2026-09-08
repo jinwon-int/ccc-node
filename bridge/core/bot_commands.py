@@ -42,6 +42,7 @@ from telegram_bot.core.continuation import (
 from telegram_bot.core.agent_runtime import (
     JsonValue as AgentJsonValue,
 )
+from telegram_bot.core.danso_worker import TASK_RESUME_CONTROL
 from telegram_bot.core.project_chat_types import (
     AgentApprovalCallback,
     ChatResponse,
@@ -1186,6 +1187,135 @@ class BotCommandMixin:
         lines.append(f"\n{_esc_md2('Reply with a number to switch to that session:')}")
         reply = "\n".join(lines)
         await message.reply_text(reply, parse_mode="MarkdownV2")
+        log_debug(user_id, "bot", reply)
+
+    async def _cmd_task_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Explicitly resume a paused native Danso long task.
+
+        This is intentionally separate from generic ``/resume`` and from the
+        skill catch-all.  It accepts no user prompt or session id: the current
+        authorized conversation route and its stored journal are the only
+        resume target.
+        """
+        if not await self._check_access(update):
+            return
+        user_id = self._require_user(update).id
+        message = self._require_message(update)
+        chat = self._require_chat(update)
+        conversation_key = self._conversation_key(user_id, chat.id)
+        log_debug(user_id, "command", "/task_resume")
+
+        if context.args:
+            reply = "Usage: /task_resume"
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+        if self._active_provider() != "danso" or not getattr(
+            self._config, "danso_long_task_enabled", False
+        ):
+            reply = "❌ Danso long-task mode is disabled."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        active_task = self._tasks.active(conversation_key)
+        if active_task is not None and not active_task.done():
+            reply = "⏳ A task is already running in this conversation."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        session, switched = await self._switch_provider_if_needed(
+            conversation_key, user_id, chat.id
+        )
+        session_id = self._effective_session_id(conversation_key, session)  # type: ignore[attr-defined]
+        if switched or not session_id:
+            reply = (
+                "📭 No paused Danso long task is stored for this conversation. "
+                "Start one first, or use /new for a fresh session."
+            )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+        app = self._require_application()
+
+        async def run_task():
+            try:
+                await message.chat.send_action(action="typing")
+            except Exception:
+                pass
+            response = await self._project_chat.process_message(
+                user_message=TASK_RESUME_CONTROL,
+                user_id=user_id,
+                chat_id=chat.id,
+                session_id=session_id,
+                model=session.get("model"),
+                effort=session.get("effort"),
+                approval_policy=self._codex_approval_policy(),
+                approvals_reviewer=self._codex_approvals_reviewer(),
+                sandbox_policy=self._codex_sandbox_policy(),
+                resume_task=True,
+                approval_callback=self._codex_approval_callback,
+                typing_callback=lambda: message.chat.send_action(action="typing"),
+                status_callback=self._make_status_callback(app.bot, chat.id),
+                bot=app.bot,
+                notification_bot=app.bot,
+                interim_message_callback=self._make_interim_reply_callback(message),
+            )
+            # The native resume reads the existing journal in place.  Do not
+            # record the internal control message as a duplicate user prompt or
+            # enqueue a second checkpoint accounting turn.
+            await self._reply_smart(
+                message,
+                response.content,
+                parse_mode="Markdown",
+                force_options=response.has_options,
+                streamed=response.streamed,
+                user_id=user_id,
+            )
+
+        async def on_overflow():
+            reply = "⏳ Processing previous messages, please wait or send /stop to terminate."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+
+        await self._enqueue_user_task(conversation_key, run_task, on_overflow)
+
+    async def _cmd_task_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ask the active native long task to pause at a settled boundary."""
+        if not await self._check_access(update):
+            return
+        user_id = self._require_user(update).id
+        message = self._require_message(update)
+        chat = self._require_chat(update)
+        log_debug(user_id, "command", "/task_pause")
+
+        if context.args:
+            reply = "Usage: /task_pause"
+        elif self._active_provider() != "danso" or not getattr(
+            self._config, "danso_long_task_enabled", False
+        ):
+            reply = "❌ Danso long-task mode is disabled."
+        else:
+            request_pause = getattr(self._project_chat, "request_danso_task_pause", None)
+            status = (
+                await request_pause(user_id, chat.id)
+                if callable(request_pause)
+                else "unsupported"
+            )
+            reply = {
+                "requested": (
+                    "⏸ Graceful pause requested. Wait for the saved-checkpoint "
+                    "result, then use /task_resume."
+                ),
+                "not_active": "ℹ️ No active Danso long task is running.",
+                "not_ready": (
+                    "⏳ The native task is still starting or finishing; retry "
+                    "/task_pause after its checkpoint heartbeat."
+                ),
+                "unsupported": "❌ Explicit Danso long-task pause is unavailable.",
+            }.get(status, "❌ Explicit Danso long-task pause is unavailable.")
+        await message.reply_text(reply)
         log_debug(user_id, "bot", reply)
 
     async def _cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):

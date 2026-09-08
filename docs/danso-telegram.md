@@ -110,6 +110,20 @@ path, preserving the previous runtime's history.
 normal default, or set it at least 10 seconds above the Danso deadline while
 preserving the bridge's other timeout invariants.
 
+Long-task mode is opt-in. Set `CCC_DANSO_LONG_TASK_ENABLED=true` and configure
+the native limits (`CCC_DANSO_TASK_STAGE_REQUESTS`,
+`CCC_DANSO_TASK_MAX_REQUESTS`, `CCC_DANSO_TASK_MAX_TOKENS`, and
+`CCC_DANSO_TASK_REPEAT_LIMIT`) only with a native binary that exposes the full
+long-task CLI. The bridge rejects older binaries before a provider request. The
+native wall-clock limit is at most 21600 seconds; for the maximum, set
+`CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS=21600` and
+`CLAUDE_PROCESS_TIMEOUT=21660`. Provider requests keep the 180-second default.
+The defaults remain 1024 requests and 10,000,000 reported tokens; the native
+build may expose bounded upper limits of 2048 requests and 25,000,000 tokens.
+The native journal owns cumulative budgets, stages, repetition decisions, and
+resume eligibility. The bridge forwards these limits and consumes only bounded,
+body-free `DANSO_TASK` checkpoint records for the status heartbeat.
+
 Readiness checks are local prerequisite checks, not proof of account access or
 kernel sandbox support. Run the reviewed CLI's tests for the chosen backend and an authorized
 provider canary before switching a live bot. Restarting a deployed
@@ -118,9 +132,10 @@ bridge is a separate operational step; source development does not switch a node
 ## Telegram behavior
 
 - Messages run through the normal queue, typing/status and final reply paths.
-  The final answer is buffered; token-by-token and tool-progress streaming are
-  not available. The finite subprocess deadline replaces the first-event
-  admission timeout for this provider.
+  Ordinary final answers are buffered; long-task mode may update the heartbeat
+  from bounded native checkpoint counters, without relaying prompt, tool,
+  path, or provider-response bodies. The finite subprocess deadline replaces
+  the first-event admission timeout for this provider.
 - `/model` shows the configured model. Arbitrary model changes are rejected.
   `/effort` selects a supported effort; `default` restores `CCC_DANSO_EFFORT`.
 - The conversation UUID is durably saved before the subprocess can execute;
@@ -129,9 +144,18 @@ bridge is a separate operational step; source development does not switch a node
   current conversation's exact UUID. `/resume` reports that UUID; it cannot
   select another conversation's journal. Automatic time-based session resets are
   disabled for Danso so an unresolved journal cannot be abandoned silently.
+- With long-task mode enabled, `/task_resume` is the only explicit resume
+  command. It accepts no prompt or session id and uses the current authorized
+  conversation journal; it does not duplicate a user prompt. A normal message
+  never auto-resumes a pending native task.
+- `/task_pause` asks the active native parent to pause at its next settled
+  checkpoint after the bridge has observed the native-ready record. It never
+  signals the process group or launches a replacement process. `/stop` remains
+  the hard cancellation path.
 - `/stop` terminates and reaps the owned process group. Journals are retained.
-  Native unresolved tool operations remain blocked; the bridge never repairs,
-  acknowledges, or automatically replays them. If startup failed before creating
+  It is a hard cancellation and never automatically replays the task. Native
+  unresolved tool operations remain blocked; the bridge never repairs or
+  acknowledges them. If startup failed before creating
   a journal, the saved ID is deliberately retained; the next attempt explains
   that the journal is unavailable. Check the prior work, then use `/new`.
 - Completed runs record request and input/output token counters in the local

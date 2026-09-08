@@ -12,6 +12,7 @@ import pytest
 
 from telegram_bot.core.agent_runtime import SessionRequest
 from telegram_bot.core.danso_runtime import build_danso_runtime, probe_danso_readiness
+from telegram_bot.core.danso_worker import TASK_RESUME_CONTROL
 from telegram_bot.core.project_chat import ProjectChatHandler
 from telegram_bot.utils.config import Settings
 from test_project_chat_codex import _settings
@@ -39,6 +40,11 @@ def configured(tmp_path, monkeypatch):
 import json,os,sys,time
 from pathlib import Path
 args=sys.argv[1:]
+if '--help' in args:
+ print(' '.join(['--long-task','--resume-task','--task-stage-requests',
+                 '--task-max-requests','--task-max-tokens','--task-repeat-limit',
+                 '--task-pause-after-stage','--task-progress']))
+ raise SystemExit(0)
 root=Path(args[args.index('--cwd')+1])
 (root/'argv.json').write_text(json.dumps(args))
 (root/'environment.json').write_text(json.dumps(sorted(os.environ)))
@@ -46,6 +52,9 @@ journal=Path(args[args.index('--session')+1])
 fd=os.open(journal,os.O_APPEND|os.O_WRONLY|os.O_CREAT,0o600)
 with os.fdopen(fd,'a') as f:f.write('fixture turn\\n')
 message=args[-1]
+if '--task-progress' in args:
+ print('DANSO_TASK='+json.dumps({'version':1,'state':'checkpoint','stage':1,
+       'requests':2,'reported_tokens':17,'elapsed_seconds':1}),file=sys.stderr)
 if message == 'wait':
  (root/'pid').write_text(str(os.getpid()))
  time.sleep(30)
@@ -104,6 +113,8 @@ async def test_telegram_turn_resume_default_effort_and_usage(configured):
 async def test_compaction_default_and_explicit_override_reach_native_cli(configured, tmp_path):
     runtime = build_danso_runtime(configured)
     assert configured.danso_provider_timeout_seconds == 180
+    assert configured.danso_long_task_enabled is False
+    assert configured.danso_long_task_timeout_seconds == 21600
     assert runtime.provider_timeout == 180
     session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
     events = [event async for event in session.send_turn("ok")]
@@ -137,6 +148,196 @@ async def test_compaction_default_and_explicit_override_reach_native_cli(configu
     argv = json.loads((Path(overridden.danso_workspace) / "argv.json").read_text())
     assert argv[argv.index("--compact-at-bytes") + 1] == "32768"
     assert argv[argv.index("--provider-timeout-seconds") + 1] == "42"
+
+
+@pytest.mark.anyio
+async def test_long_task_profile_forwards_budgets_progress_and_explicit_resume(configured, tmp_path):
+    settings = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-long-task",
+        environ={
+            "TELEGRAM_BOT_TOKEN": "123456:synthetic",
+            "ALLOWED_USER_IDS": "[7]",
+            "CCC_AGENT_PROVIDER": "danso",
+            "CCC_DANSO_CLI_PATH": configured.danso_cli_path,
+            "CCC_DANSO_WORKSPACE": configured.danso_workspace,
+            "CCC_DANSO_STATE_DIR": str(tmp_path / "long-private"),
+            "OPENAI_API_KEY": "fixture-key",
+            "CCC_DANSO_LONG_TASK_ENABLED": "true",
+            "CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS": "21600",
+            "CCC_DANSO_TASK_PAUSE_AFTER_STAGE": "1",
+            "CLAUDE_PROCESS_TIMEOUT": "21660",
+        },
+    )
+    runtime = build_danso_runtime(settings)
+    assert settings.danso_provider_timeout_seconds == 180
+    assert runtime.timeout == 21600
+    session = await runtime.start_or_resume(SessionRequest(working_directory=settings.danso_workspace))
+    first = [event async for event in session.send_turn("long task")]
+    assert first[0].kind == "task_progress"
+    assert first[-1].kind == "completion"
+    argv = json.loads((Path(settings.danso_workspace) / "argv.json").read_text())
+    for flag, value in (
+        ("--task-stage-requests", "16"),
+        ("--task-max-requests", "1024"),
+        ("--task-max-tokens", "10000000"),
+        ("--task-repeat-limit", "3"),
+        ("--task-pause-after-stage", "1"),
+    ):
+        assert argv[argv.index(flag) + 1] == value
+    assert "--long-task" in argv and "--task-progress" in argv
+    assert "--resume-task" not in argv
+    before = (Path(runtime.root) / (session.session_id + ".jsonl")).read_bytes()
+
+    spoof = [event async for event in session.send_turn(TASK_RESUME_CONTROL)]
+    assert len(spoof) == 1 and spoof[0].code == "danso_input"
+    assert json.loads((Path(settings.danso_workspace) / "argv.json").read_text()) == argv
+
+    session.authorize_task_resume()
+    resumed = [event async for event in session.send_turn(TASK_RESUME_CONTROL)]
+    assert resumed[0].kind == "task_progress"
+    assert resumed[-1].kind == "completion"
+    resume_argv = json.loads((Path(settings.danso_workspace) / "argv.json").read_text())
+    assert "--resume-task" in resume_argv
+    assert "--" not in resume_argv
+    assert (Path(runtime.root) / (session.session_id + ".jsonl")).read_bytes() == before + b"fixture turn\n"
+
+    # Exercise the provider-neutral event router as well as the adapter: a
+    # checkpoint must refresh the heartbeat state without becoming answer text.
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    response = await handler.process_message("long task through handler", 7, 9)
+    assert response.success, response.error
+    assert response.content == "completed"
+    await handler.close()
+
+
+@pytest.mark.anyio
+async def test_reserved_resume_marker_never_dispatches_without_explicit_resume(configured):
+    runtime = build_danso_runtime(configured)
+    handler = ProjectChatHandler(settings=configured, agent_runtime=runtime)
+
+    response = await handler.process_message(TASK_RESUME_CONTROL, 7, 9)
+
+    assert not response.success
+    assert response.error == "danso_input"
+    assert not (Path(configured.danso_workspace) / "argv.json").exists()
+    await handler.close()
+
+
+@pytest.mark.anyio
+async def test_native_paused_checkpoint_is_explicit_resume_error(configured, tmp_path):
+    binary = Path(configured.danso_cli_path)
+    binary.write_text("""#!/usr/bin/python3
+import json, sys
+args = sys.argv[1:]
+if '--help' in args:
+    print(' '.join(['--long-task','--resume-task','--task-stage-requests',
+                    '--task-max-requests','--task-max-tokens','--task-repeat-limit',
+                    '--task-pause-after-stage','--task-progress']))
+    raise SystemExit(0)
+stage0 = args[-1] == 'stage0'
+code = 2 if stage0 else 3
+print('DANSO_TASK=' + json.dumps({'version': 1, 'state': 'paused',
+      'stage': 0 if stage0 else 2,
+      'requests': 0 if stage0 else (1024 if args[-1] == 'exhaust' else 8),
+      'reported_tokens': 100, 'elapsed_seconds': 1}), file=sys.stderr)
+print('DANSO_ERROR=' + json.dumps({'version': 1, 'category': 'request_budget',
+      'exit_code': code}), file=sys.stderr)
+raise SystemExit(code)
+""")
+    binary.chmod(0o700)
+    settings = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-paused",
+        environ={
+            "TELEGRAM_BOT_TOKEN": "123456:synthetic",
+            "ALLOWED_USER_IDS": "[7]",
+            "CCC_AGENT_PROVIDER": "danso",
+            "CCC_DANSO_CLI_PATH": configured.danso_cli_path,
+            "CCC_DANSO_WORKSPACE": configured.danso_workspace,
+            "CCC_DANSO_STATE_DIR": str(tmp_path / "paused-private"),
+            "OPENAI_API_KEY": "fixture-key",
+            "CCC_DANSO_LONG_TASK_ENABLED": "true",
+            "CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS": "3",
+            "CLAUDE_PROCESS_TIMEOUT": "13",
+            "CCC_DELEGATED_TASK_STALL_SECONDS": "10",
+        },
+    )
+    runtime = build_danso_runtime(settings)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=settings.danso_workspace))
+    events = [event async for event in session.send_turn("pause")]
+    assert [event.kind for event in events] == ["task_progress", "error"]
+    assert events[-1].code == "danso_task_paused"
+    assert "/task_resume" in events[-1].message
+    exhausted = [event async for event in session.send_turn("exhaust")]
+    assert exhausted[-1].code == "danso_task_paused"
+    assert "/task_resume" not in exhausted[-1].message
+    assert "remaining budget" in exhausted[-1].message
+    stage_zero = [event async for event in session.send_turn("stage0")]
+    assert stage_zero[-1].code == "danso_task_paused"
+    assert "/task_resume" in stage_zero[-1].message
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    response = await handler.process_message("pause through handler", 7, 9)
+    assert not response.success
+    assert response.content.startswith("⏸ Paused at a saved checkpoint.")
+    assert "/task_resume" in response.content
+    await handler.close()
+
+
+def test_long_task_preflight_requires_outer_deadline_and_new_cli(configured, tmp_path):
+    base = {
+        "TELEGRAM_BOT_TOKEN": "123456:synthetic",
+        "ALLOWED_USER_IDS": "[7]",
+        "CCC_AGENT_PROVIDER": "danso",
+        "CCC_DANSO_CLI_PATH": configured.danso_cli_path,
+        "CCC_DANSO_WORKSPACE": configured.danso_workspace,
+        "CCC_DANSO_STATE_DIR": str(tmp_path / "long-preflight"),
+        "OPENAI_API_KEY": "fixture-key",
+        "CCC_DANSO_LONG_TASK_ENABLED": "true",
+    }
+    settings = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-preflight",
+        environ={**base, "CLAUDE_PROCESS_TIMEOUT": "21600"},
+    )
+    ready, reason = probe_danso_readiness(settings)
+    assert not ready and "LONG_TASK_TIMEOUT_SECONDS" in reason
+    assert not Path(settings.danso_state_dir).exists()
+
+    old_binary = tmp_path / "old-danso"
+    old_binary.write_text("#!/bin/sh\nprintf '%s\\n' old-help\n")
+    old_binary.chmod(0o700)
+    old = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-old",
+        environ={**base, "CCC_DANSO_CLI_PATH": str(old_binary), "CLAUDE_PROCESS_TIMEOUT": "21660"},
+    )
+    ready, reason = probe_danso_readiness(old)
+    assert not ready and "long-task CLI" in reason
+
+    invalid_budget = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-invalid-budget",
+        environ={
+            **base,
+            "CLAUDE_PROCESS_TIMEOUT": "21660",
+            "CCC_DANSO_TASK_STAGE_REQUESTS": "17",
+            "CCC_DANSO_TASK_MAX_REQUESTS": "16",
+        },
+    )
+    ready, reason = probe_danso_readiness(invalid_budget)
+    assert not ready and "STAGE_REQUESTS" in reason
+
+    with pytest.raises(ValueError, match="CCC_DANSO_TASK_REPEAT_LIMIT"):
+        Settings.load(
+            project_root=configured.project_root,
+            bot_env_file=tmp_path / "absent-invalid-repeat",
+            environ={
+                **base,
+                "CLAUDE_PROCESS_TIMEOUT": "21660",
+                "CCC_DANSO_TASK_REPEAT_LIMIT": "1",
+            },
+        )
 
 
 def test_transport_metadata_is_strict_optional_and_body_free():
@@ -179,6 +380,29 @@ def test_transport_metadata_is_strict_optional_and_body_free():
     assert "phase=" not in event.message
 
 
+def test_task_progress_is_strict_bounded_and_body_free():
+    from telegram_bot.core.danso_worker import _task_progress
+
+    valid = (
+        'DANSO_TASK={"version":1,"state":"checkpoint","stage":2,'
+        '"requests":7,"reported_tokens":99,"elapsed_seconds":10}'
+    )
+    event = _task_progress(valid)
+    assert event is not None
+    assert (event.state, event.stage, event.requests, event.reported_tokens) == (
+        "checkpoint", 2, 7, 99
+    )
+    malformed = [
+        valid.replace('"state":"checkpoint"', '"state":"private"'),
+        valid.replace('"version":1', '"version":2'),
+        valid.replace('"stage":2', '"stage":true'),
+        valid.replace('"stage":2', '"stage":-1'),
+        valid.replace('"elapsed_seconds":10', '"elapsed_seconds":10,"extra":"secret"'),
+        valid.replace('"stage":2', '"stage":2,"stage":3'),
+    ]
+    assert all(_task_progress(item) is None for item in malformed)
+
+
 @pytest.mark.anyio
 async def test_transport_record_on_success_is_adapter_failure(configured):
     binary = Path(configured.danso_cli_path)
@@ -198,6 +422,221 @@ print('DANSO_TRANSPORT=' + json.dumps({'version': 1, 'phase': 'connect',
     events = [event async for event in session.send_turn("success-with-diagnostic")]
     assert [event.kind for event in events] == ["error"]
     assert events[0].code == "danso_adapter_error"
+
+
+@pytest.mark.anyio
+async def test_reader_overflow_terminates_owned_process_promptly(configured):
+    binary = Path(configured.danso_cli_path)
+    binary.write_text("""#!/usr/bin/python3
+import os, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+root = Path(args[args.index('--cwd') + 1])
+(root / 'pid').write_text(str(os.getpid()))
+os.write(1, b'x' * (1024 * 1024 + 1))
+time.sleep(30)
+""")
+    binary.chmod(0o700)
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    marker = Path(configured.danso_workspace) / "pid"
+    async def collect():
+        return [event async for event in session.send_turn("overflow")]
+
+    events = await asyncio.wait_for(collect(), timeout=2)
+    assert len(events) == 1 and events[0].code == "danso_adapter_error"
+    pid = int(marker.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, signal.SIGCONT)
+
+
+@pytest.mark.anyio
+async def test_oversized_reserved_progress_line_fails_closed(configured):
+    configured.danso_long_task_enabled = True
+    configured.danso_long_task_timeout_seconds = 3
+    configured.process_timeout_seconds = 13
+    binary = Path(configured.danso_cli_path)
+    binary.write_text("""#!/usr/bin/python3
+import os, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+if '--help' in args:
+    print(' '.join(['--long-task','--resume-task','--task-stage-requests',
+                    '--task-max-requests','--task-max-tokens','--task-repeat-limit',
+                    '--task-pause-after-stage','--task-progress']))
+    raise SystemExit(0)
+root = Path(args[args.index('--cwd') + 1])
+(root / 'pid').write_text(str(os.getpid()))
+os.write(2, b'DANSO_TASK=' + b'x' * (64 * 1024) + b'\\n')
+time.sleep(30)
+""")
+    binary.chmod(0o700)
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    events = [event async for event in session.send_turn("oversized progress")]
+    assert len(events) == 1 and events[0].code == "danso_adapter_error"
+    with pytest.raises(ProcessLookupError):
+        os.kill(int((Path(configured.danso_workspace) / "pid").read_text()), signal.SIGCONT)
+
+
+@pytest.mark.anyio
+async def test_reader_wait_set_excludes_closed_stdout(configured, monkeypatch):
+    binary = Path(configured.danso_cli_path)
+    binary.write_text("""#!/usr/bin/python3
+import json, os, sys, time
+args = sys.argv[1:]
+if '--help' in args:
+    print(' '.join(['--long-task','--resume-task','--task-stage-requests',
+                    '--task-max-requests','--task-max-tokens','--task-repeat-limit',
+                    '--task-pause-after-stage','--task-progress']))
+    raise SystemExit(0)
+print('completed', flush=True)
+os.close(1)
+time.sleep(.2)
+usage = {'requests': 1, 'inputTokens': 1, 'outputTokens': 0,
+         'cacheReadTokens': 0, 'cacheWriteTokens': 0, 'totalTokens': 1}
+for prefix in ('DANSO_USAGE', 'PIRI_USAGE'):
+    print(prefix + '=' + json.dumps(usage), file=sys.stderr, flush=True)
+""")
+    binary.chmod(0o700)
+    from telegram_bot.core import danso_worker
+
+    real_wait = danso_worker.asyncio.wait
+    observed = []
+
+    async def checked_wait(tasks, *args, **kwargs):
+        assert all(not task.done() for task in tasks)
+        observed.append(len(tasks))
+        return await real_wait(tasks, *args, **kwargs)
+
+    monkeypatch.setattr(danso_worker.asyncio, "wait", checked_wait)
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    events = [event async for event in session.send_turn("closed stdout")]
+    assert events[-1].kind == "completion"
+    assert observed
+
+
+@pytest.mark.anyio
+async def test_progress_survives_consumer_pause(configured, tmp_path):
+    binary = Path(configured.danso_cli_path)
+    binary.write_text("""#!/usr/bin/python3
+import json, sys, time
+args = sys.argv[1:]
+if '--help' in args:
+    print(' '.join(['--long-task','--resume-task','--task-stage-requests',
+                    '--task-max-requests','--task-max-tokens','--task-repeat-limit',
+                    '--task-pause-after-stage','--task-progress']))
+    raise SystemExit(0)
+if '--task-progress' in args:
+    for stage in (1, 2):
+        print('DANSO_TASK=' + json.dumps({'version': 1, 'state': 'checkpoint',
+              'stage': stage, 'requests': stage, 'reported_tokens': stage,
+              'elapsed_seconds': stage}), file=sys.stderr, flush=True)
+    time.sleep(1)
+print('completed')
+usage = {'requests': 1, 'inputTokens': 1, 'outputTokens': 0,
+         'cacheReadTokens': 0, 'cacheWriteTokens': 0, 'totalTokens': 1}
+for prefix in ('DANSO_USAGE', 'PIRI_USAGE'):
+    print(prefix + '=' + json.dumps(usage), file=sys.stderr)
+""")
+    binary.chmod(0o700)
+    settings = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-progress-pause",
+        environ={
+            "TELEGRAM_BOT_TOKEN": "123456:synthetic",
+            "ALLOWED_USER_IDS": "[7]",
+            "CCC_AGENT_PROVIDER": "danso",
+            "CCC_DANSO_CLI_PATH": configured.danso_cli_path,
+            "CCC_DANSO_WORKSPACE": configured.danso_workspace,
+            "CCC_DANSO_STATE_DIR": str(tmp_path / "progress-private"),
+            "OPENAI_API_KEY": "fixture-key",
+            "CCC_DANSO_LONG_TASK_ENABLED": "true",
+            "CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS": "3",
+            "CLAUDE_PROCESS_TIMEOUT": "13",
+            "CCC_DELEGATED_TASK_STALL_SECONDS": "10",
+        },
+    )
+    runtime = build_danso_runtime(settings)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=settings.danso_workspace))
+    stream = session.send_turn("progress pause")
+    first = await anext(stream)
+    assert first.kind == "task_progress" and first.stage == 1
+    await asyncio.sleep(.05)
+    second = await asyncio.wait_for(anext(stream), timeout=.5)
+    assert second.kind == "task_progress" and second.stage == 2
+    rest = [event async for event in stream]
+    assert rest[-1].kind == "completion"
+
+
+@pytest.mark.anyio
+async def test_task_pause_signals_native_parent_after_ready_checkpoint(configured, tmp_path):
+    binary = Path(configured.danso_cli_path)
+    binary.write_text("""#!/usr/bin/python3
+import json, signal, sys
+args = sys.argv[1:]
+if '--help' in args:
+    print(' '.join(['--long-task','--resume-task','--task-stage-requests',
+                    '--task-max-requests','--task-max-tokens','--task-repeat-limit',
+                    '--task-pause-after-stage','--task-progress']))
+    raise SystemExit(0)
+if '--task-progress' in args:
+    print('DANSO_TASK=' + json.dumps({'version': 1, 'state': 'checkpoint',
+          'stage': 0, 'requests': 0, 'reported_tokens': 0,
+          'elapsed_seconds': 0}), file=sys.stderr, flush=True)
+signal.pause()
+""")
+    binary.chmod(0o700)
+    settings = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-task-pause",
+        environ={
+            "TELEGRAM_BOT_TOKEN": "123456:synthetic",
+            "ALLOWED_USER_IDS": "[7]",
+            "CCC_AGENT_PROVIDER": "danso",
+            "CCC_DANSO_CLI_PATH": configured.danso_cli_path,
+            "CCC_DANSO_WORKSPACE": configured.danso_workspace,
+            "CCC_DANSO_STATE_DIR": str(tmp_path / "task-pause-private"),
+            "OPENAI_API_KEY": "fixture-key",
+            "CCC_DANSO_LONG_TASK_ENABLED": "true",
+            "CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS": "3",
+            "CLAUDE_PROCESS_TIMEOUT": "13",
+            "CCC_DELEGATED_TASK_STALL_SECONDS": "10",
+        },
+    )
+    runtime = build_danso_runtime(settings)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=settings.danso_workspace))
+    stream = session.send_turn("pause me")
+    first = await anext(stream)
+    assert first.kind == "task_progress" and first.stage == 0
+    assert session.request_task_pause()
+    async def collect():
+        return [event async for event in stream]
+
+    events = await asyncio.wait_for(collect(), timeout=2)
+    assert events and events[-1].kind == "error"
+
+
+@pytest.mark.anyio
+async def test_normal_mode_keeps_task_records_as_ordinary_stderr(configured):
+    binary = Path(configured.danso_cli_path)
+    binary.write_text("""#!/usr/bin/python3
+import json, sys
+print('completed')
+print('DANSO_TASK={\\"version\\":1,\\"state\\":\\"checkpoint\\",\\"stage\\":1,\\"requests\\":1,\\"reported_tokens\\":1,\\"elapsed_seconds\\":1}', file=sys.stderr)
+usage = {'requests': 1, 'inputTokens': 1, 'outputTokens': 0,
+         'cacheReadTokens': 0, 'cacheWriteTokens': 0, 'totalTokens': 1}
+for prefix in ('DANSO_USAGE', 'PIRI_USAGE'):
+    print(prefix + '=' + json.dumps(usage), file=sys.stderr)
+""")
+    binary.chmod(0o700)
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    events = [event async for event in session.send_turn("ordinary")]
+    assert [event.kind for event in events] == [
+        "text_delta", "message_completed", "result", "completion"
+    ]
 
 
 @pytest.mark.anyio
