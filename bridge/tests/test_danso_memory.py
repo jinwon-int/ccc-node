@@ -73,6 +73,22 @@ async def test_real_materializer_refresh_and_scoped_resume(memory_settings):
 
 
 @pytest.mark.anyio
+async def test_audience_runtime_preserves_tool_home_and_private_provider_home(memory_settings, tmp_path):
+    tool_home = tmp_path / 'audience-tool-home'
+    tool_home.mkdir(mode=0o700)
+    settings = memory_settings.model_copy(update={'danso_tool_home': str(tool_home)})
+    runtime = build_danso_runtime(settings)
+    session = await runtime.start_or_resume(request(settings, route(settings)))
+    events = [event async for event in session.send_turn('audience tool')]
+    assert events[-1].kind == 'completion'
+    argv = json.loads((Path(settings.danso_workspace) / 'argv.json').read_text())
+    assert argv[argv.index('--tool-home') + 1] == str(tool_home)
+    environment = json.loads((Path(settings.danso_workspace) / 'environment-values.json').read_text())
+    assert environment['HOME'] == runtime.environment['HOME']
+    assert environment['HOME'] != str(tool_home)
+
+
+@pytest.mark.anyio
 async def test_missing_tampered_route_rejected_before_journal_creation(memory_settings):
     runtime = build_danso_runtime(memory_settings)
     env = route(memory_settings)

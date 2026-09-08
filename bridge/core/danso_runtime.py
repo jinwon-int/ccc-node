@@ -29,6 +29,7 @@ LONG_TASK_FLAGS = (
     "--task-pause-after-stage",
     "--task-progress",
 )
+TOOL_HOME_FLAG = "--tool-home"
 
 
 def _validate_execution_backend(settings: Settings) -> None:
@@ -100,6 +101,12 @@ def _validate_long_task_binary(binary: str, cwd: Path) -> None:
     silently running a different workflow.
     """
 
+    if not _validate_cli_flags(binary, cwd, LONG_TASK_FLAGS):
+        raise ValueError("Danso executable does not expose the long-task CLI")
+
+
+def _validate_cli_flags(binary: str, cwd: Path, flags: tuple[str, ...]) -> bool:
+    """Check a local CLI surface without inheriting provider credentials."""
     try:
         completed = subprocess.run(
             [binary, "--help"],
@@ -112,12 +119,32 @@ def _validate_long_task_binary(binary: str, cwd: Path) -> None:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        raise ValueError("Danso executable does not expose the long-task CLI") from None
+        return False
     help_text = (completed.stdout + completed.stderr)[: 256 * 1024].decode(
         "utf-8", errors="replace"
     )
-    if completed.returncode != 0 or any(flag not in help_text for flag in LONG_TASK_FLAGS):
-        raise ValueError("Danso executable does not expose the long-task CLI")
+    return completed.returncode == 0 and all(flag in help_text for flag in flags)
+
+
+def _validate_tool_home_binary(binary: str, cwd: Path) -> None:
+    """Require the optional child-tool HOME flag only when it is configured."""
+    if not _validate_cli_flags(binary, cwd, (TOOL_HOME_FLAG,)):
+        raise ValueError("Danso executable does not expose --tool-home")
+
+
+def _validate_tool_home(settings: Settings) -> Path | None:
+    value = settings.danso_tool_home
+    if value is None:
+        return None
+    if settings.danso_sandbox != "host":
+        raise ValueError("CCC_DANSO_TOOL_HOME requires CCC_DANSO_SANDBOX=host")
+    raw = str(value)
+    path = Path(raw)
+    if not raw.strip() or not path.is_absolute():
+        raise ValueError("CCC_DANSO_TOOL_HOME must be an absolute path in host mode")
+    if "\x00" in raw or os.pathsep in raw:
+        raise ValueError("CCC_DANSO_TOOL_HOME contains an invalid PATH component")
+    return path
 
 
 def _configuration(settings: Settings) -> tuple[str, Path]:  # noqa: C901 -- provider prerequisites plus opt-in long-task profile
@@ -155,6 +182,7 @@ def _configuration(settings: Settings) -> tuple[str, Path]:  # noqa: C901 -- pro
     if binary is None:
         raise ValueError("Danso executable unavailable; set CCC_DANSO_CLI_PATH")
     _validate_execution_backend(settings)
+    tool_home = _validate_tool_home(settings)
     if settings.danso_long_task_enabled:
         if settings.danso_task_stage_requests > settings.danso_task_max_requests:
             raise ValueError("CCC_DANSO_TASK_STAGE_REQUESTS must not exceed CCC_DANSO_TASK_MAX_REQUESTS")
@@ -165,6 +193,8 @@ def _configuration(settings: Settings) -> tuple[str, Path]:  # noqa: C901 -- pro
         _validate_long_task_binary(binary, cwd)
     elif settings.danso_timeout_seconds + 10 > settings.process_timeout_seconds:
         raise ValueError("CLAUDE_PROCESS_TIMEOUT must exceed CCC_DANSO_TIMEOUT_SECONDS by at least 10s")
+    if tool_home is not None:
+        _validate_tool_home_binary(binary, cwd)
     return str(Path(binary).resolve(strict=True)), root
 
 
@@ -231,6 +261,7 @@ class DansoRuntime(WorkerRuntime):
 
 def build_danso_runtime(settings: Settings) -> DansoRuntime:
     binary, root = _configuration(settings)
+    tool_home = _validate_tool_home(settings)
     ensure_private_directory(root)
     private_home = root / "home"
     ensure_private_directory(private_home)
@@ -252,6 +283,7 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
                         provider=provider, model=settings.danso_model,
                         environment=environment, default_effort=settings.danso_effort,
                         sandbox=settings.danso_sandbox,
+                        tool_home=str(tool_home) if tool_home is not None else None,
                         timeout_seconds=(
                             settings.danso_long_task_timeout_seconds
                             if settings.danso_long_task_enabled

@@ -40,6 +40,9 @@ CCC_DANSO_CLI_PATH=/opt/danso/target/release/danso
 CCC_DANSO_WORKSPACE=/home/gongmyoung/workspaces/danso
 CCC_DANSO_STATE_DIR=/var/lib/ccc-danso/gongmyoung
 CCC_DANSO_SANDBOX=host
+# Optional host-only HOME for development tools such as a user Rust install.
+# The provider/context HOME remains the private state/home directory.
+# CCC_DANSO_TOOL_HOME=/home/gongmyoung
 CCC_DANSO_MODEL=gpt-6-astra
 CCC_DANSO_EFFORT=medium
 CCC_BRIDGE_MEMORY_MODE=off
@@ -63,6 +66,14 @@ tool schemas, so the default leaves room for the normal 32 KiB CCC memory
 snapshot and its request envelope. Existing installations with an explicit
 `32768` setting should migrate it to `131072`; explicit lower values remain
 valid overrides but can fail closed when the fixed context cannot fit.
+
+`CCC_DANSO_TOOL_HOME` is optional and host-only. When set, it must be an
+absolute path and the native CLI must expose `--tool-home`; readiness fails
+before a provider request for an older binary or a bubblewrap configuration.
+The flag changes `HOME` and `PATH` only for native development-tool children
+(including `<tool-home>/.cargo/bin`). The provider process and context
+discovery continue to use the bridge-created private `state/home`, preserving
+audience isolation. Leave this unset for ordinary host runs.
 
 Supply `OPENAI_API_KEY` through the existing private environment/configuration
 channel. This is also the existing Whisper key setting. An explicitly configured
