@@ -24,9 +24,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "bridge" / "pyproject.toml"
 CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
-# The measured baseline the floor must not fall below. Raising it (the ratchet)
-# is tracked in #348; this only guards against the gate being dropped/weakened.
-_MIN_FLOOR = 69
+# The floor this pin refuses to let `fail_under` fall below. It must track the
+# configured floor, not a historical one: while this sat at the original 69
+# baseline and bridge/pyproject.toml had already moved to 80, `fail_under` could
+# be walked back 80 -> 69 — an 11-point weakening of the only coverage gate —
+# with every test in this file still green. Raising the floor itself (the
+# ratchet) is tracked in #348; keep this value equal to the configured floor so
+# the regression pin has no slack.
+_MIN_FLOOR = 80
 
 
 class CoverageFloorGateTests(unittest.TestCase):
@@ -41,6 +46,19 @@ class CoverageFloorGateTests(unittest.TestCase):
             report["fail_under"],
             _MIN_FLOOR,
             "coverage floor weakened below the measured baseline",
+        )
+
+    def test_pin_has_no_slack_against_the_configured_floor(self):
+        # The failure this prevents is not "someone lowers the floor" but "the
+        # pin quietly stops tracking it". Once _MIN_FLOOR lags the configured
+        # value, the gap is exactly how far the floor can be walked back with
+        # this suite still green. Ratcheting the floor up must move the pin too.
+        report = self.cfg.get("tool", {}).get("coverage", {}).get("report", {})
+        self.assertEqual(
+            _MIN_FLOOR,
+            report.get("fail_under"),
+            "_MIN_FLOOR must equal bridge/pyproject.toml fail_under; any gap is "
+            "silent slack in the regression pin",
         )
 
     def test_branch_coverage_is_the_gated_metric(self):
