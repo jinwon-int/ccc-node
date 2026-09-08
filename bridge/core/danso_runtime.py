@@ -245,11 +245,21 @@ class DansoRuntime(WorkerRuntime):
         try:
             if self.memory_settings is not None:
                 audience = audience_from_danso_environment(self.memory_settings, request.memory_environment)
-                async def load_context():
-                    return await prepare_memory_context(self.memory_settings, audience)
+                from .danso_memory import native_memory_command_args, native_memory_enabled
+                loader = None
+                native_args: list[str] | None = None
+                if native_memory_enabled(self.memory_settings):
+                    # Native snapshot: danso assembles and injects its own
+                    # bounded memory; no materializer file, no loader task.
+                    native_args = native_memory_command_args(self.memory_settings, audience)
+                else:
+                    async def load_context():
+                        return await prepare_memory_context(self.memory_settings, audience)
+                    loader = load_context
                 kwargs = dict(self._worker_kwargs)
                 kwargs.update(state_directory=self.root / audience.scope,
-                              system_context_loader=load_context)
+                              system_context_loader=loader,
+                              native_memory_args=native_args)
                 worker = WorkerRuntime(**kwargs)
                 return await worker.start_or_resume(replace(request, effort=effort, memory_environment=None))
             return await super().start_or_resume(replace(request, effort=effort))
