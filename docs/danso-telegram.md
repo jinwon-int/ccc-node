@@ -45,10 +45,17 @@ CCC_DANSO_EFFORT=medium
 CCC_BRIDGE_MEMORY_MODE=off
 CCC_MEMORY_DISTILL_PROVIDER=off
 CCC_DANSO_TIMEOUT_SECONDS=300
-CCC_DANSO_PROVIDER_TIMEOUT_SECONDS=60
+CCC_DANSO_PROVIDER_TIMEOUT_SECONDS=180
 CCC_DANSO_MAX_TURNS=32
 CCC_DANSO_COMPACT_AT_BYTES=131072
 ```
+
+The provider request default is 180 seconds. Existing environments that pin
+`CCC_DANSO_PROVIDER_TIMEOUT_SECONDS=60` should update that explicit setting to
+`180` if they want the new default; other explicit values remain valid
+overrides in the supported 1..300 second range. Native HTTP failures may also
+carry an optional validated `DANSO_TRANSPORT` record with only the phase,
+elapsed milliseconds, and request byte count; malformed records are ignored.
 
 `CCC_DANSO_COMPACT_AT_BYTES` defaults to 131072 bytes (128 KiB). Native Danso
 measures the serialized request, including system context, JSON escaping and
