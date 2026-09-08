@@ -427,6 +427,11 @@ class BotCommandMixin:
         chat = self._require_chat(update)
         conversation_key = self._conversation_key(user_id, chat.id)
         log_debug(user_id, "command", "/new")
+        # Invalidate queued control closures before any cancellation or
+        # distillation await below can yield to another update.
+        bump_generation = getattr(self, "_bump_task_resume_generation", None)
+        if callable(bump_generation):
+            bump_generation(conversation_key)
 
         self._deny_codex_approvals(user_id, chat.id)
         self._invalidate_codex_approvals(user_id, chat.id)
@@ -1225,6 +1230,15 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
 
+        # Capture the binding epoch before the provider/audience alignment
+        # below can yield.  A concurrent /new must invalidate this closure
+        # even if alignment returns an old in-memory session snapshot.
+        get_generation = getattr(self, "_task_resume_generation", None)
+        resume_generation = (
+            get_generation(conversation_key)
+            if callable(get_generation)
+            else 0
+        )
         session, switched = await self._switch_provider_if_needed(
             conversation_key, user_id, chat.id
         )
@@ -1237,20 +1251,85 @@ class BotCommandMixin:
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
+        from telegram_bot.core.memory_audience import resolve_memory_audience
+
+        audience = resolve_memory_audience(
+            self._config, user_id=user_id, chat_id=chat.id
+        )
+        expected_route = None if audience is None else (audience.kind, audience.scope)
         app = self._require_application()
+        if callable(get_generation) and get_generation(conversation_key) != resume_generation:
+            reply = (
+                "❌ The saved Danso task changed before resume. "
+                "Use /task_resume again for the current conversation."
+            )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        async def current_binding():
+            current = await self._session_manager.get_session(conversation_key)
+            get_current_generation = getattr(self, "_task_resume_generation", None)
+            current_generation = (
+                get_current_generation(conversation_key)
+                if callable(get_current_generation)
+                else 0
+            )
+            current_audience = resolve_memory_audience(
+                self._config, user_id=user_id, chat_id=chat.id
+            )
+            current_route = (
+                None if current_audience is None
+                else (current_audience.kind, current_audience.scope)
+            )
+            if (
+                self._active_provider() != "danso"
+                or not getattr(self._config, "danso_long_task_enabled", False)
+                or current.get("provider") != "danso"
+                or current.get("session_id") != session_id
+                or current.get("new_session") is True
+                or current_route != expected_route
+                or current_generation != resume_generation
+            ):
+                return None
+            return current
+
+        async def reject_stale_resume():
+            reply = (
+                "❌ The saved Danso task changed before resume. "
+                "Use /task_resume again for the current conversation."
+            )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
 
         async def run_task():
+            # The command may have waited behind another task.  Re-read the
+            # durable binding at dispatch so /new, a provider switch, or a
+            # route change cannot send this queued closure into an old
+            # journal.  This check deliberately precedes typing and the
+            # provider call; a stale control message has no replay side effect.
+            current = await current_binding()
+            if current is None:
+                await reject_stale_resume()
+                return
             try:
                 await message.chat.send_action(action="typing")
             except Exception:
                 pass
+            # Typing yields to /new and provider commands.  Revalidate after
+            # that yield so the process call is still tied to the same
+            # generation and journal.
+            current = await current_binding()
+            if current is None:
+                await reject_stale_resume()
+                return
             response = await self._project_chat.process_message(
                 user_message=TASK_RESUME_CONTROL,
                 user_id=user_id,
                 chat_id=chat.id,
                 session_id=session_id,
-                model=session.get("model"),
-                effort=session.get("effort"),
+                model=current.get("model"),
+                effort=current.get("effort"),
                 approval_policy=self._codex_approval_policy(),
                 approvals_reviewer=self._codex_approvals_reviewer(),
                 sandbox_policy=self._codex_sandbox_policy(),

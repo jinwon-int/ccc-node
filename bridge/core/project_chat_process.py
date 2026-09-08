@@ -1364,6 +1364,7 @@ class ProjectChatProcessMixin:
                             success=False,
                             error=terminal_error.message,
                             session_id=session.session_id,
+                            failure_class="danso_task_paused",
                         )
                     return ChatResponse(
                         content=f"❌ Processing failed: {terminal_error.message}",

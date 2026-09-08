@@ -21,6 +21,7 @@ ASTRA_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 LONG_TASK_FLAGS = (
     "--long-task",
     "--resume-task",
+    "--task-status",
     "--task-stage-requests",
     "--task-max-requests",
     "--task-max-tokens",
@@ -256,6 +257,7 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
                             if settings.danso_long_task_enabled
                             else settings.danso_timeout_seconds
                         ),
+                        outer_timeout_seconds=settings.process_timeout_seconds,
                         provider_timeout_seconds=settings.danso_provider_timeout_seconds,
                         max_turns=settings.danso_max_turns,
                         compact_at_bytes=settings.danso_compact_at_bytes,
