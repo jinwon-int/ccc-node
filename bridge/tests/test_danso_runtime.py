@@ -44,7 +44,7 @@ if '--help' in args:
  print(' '.join(['--long-task','--resume-task','--task-stage-requests',
                  '--task-status',
                  '--task-max-requests','--task-max-tokens','--task-repeat-limit',
-                 '--task-pause-after-stage','--task-progress']))
+                 '--task-pause-after-stage','--task-progress','--tool-home']))
  raise SystemExit(0)
 if '--task-status' in args:
  session=Path(args[args.index('--session')+1])
@@ -58,6 +58,7 @@ if '--task-status' in args:
 root=Path(args[args.index('--cwd')+1])
 (root/'argv.json').write_text(json.dumps(args))
 (root/'environment.json').write_text(json.dumps(sorted(os.environ)))
+(root/'environment-values.json').write_text(json.dumps({key: os.environ.get(key) for key in ('HOME', 'PATH')}))
 journal=Path(args[args.index('--session')+1])
 fd=os.open(journal,os.O_APPEND|os.O_WRONLY|os.O_CREAT,0o600)
 with os.fdopen(fd,'a') as f:f.write('fixture turn\\n')
@@ -158,6 +159,53 @@ async def test_compaction_default_and_explicit_override_reach_native_cli(configu
     argv = json.loads((Path(overridden.danso_workspace) / "argv.json").read_text())
     assert argv[argv.index("--compact-at-bytes") + 1] == "32768"
     assert argv[argv.index("--provider-timeout-seconds") + 1] == "42"
+
+
+@pytest.mark.anyio
+async def test_optional_tool_home_reaches_native_child_without_replacing_provider_home(configured, tmp_path):
+    tool_home = tmp_path / "tool-home"
+    tool_home.mkdir(mode=0o700)
+    settings = configured.model_copy(update={"danso_tool_home": str(tool_home)})
+    runtime = build_danso_runtime(settings)
+    assert runtime.tool_home == str(tool_home)
+    assert runtime.environment["HOME"] == str(Path(settings.danso_state_dir) / "home")
+    session = await runtime.start_or_resume(SessionRequest(working_directory=settings.danso_workspace))
+    events = [event async for event in session.send_turn("tool-home")]
+    assert events[-1].kind == "completion"
+    argv = json.loads((Path(settings.danso_workspace) / "argv.json").read_text())
+    assert argv[argv.index("--tool-home") + 1] == str(tool_home)
+    environment = json.loads((Path(settings.danso_workspace) / "environment-values.json").read_text())
+    assert environment["HOME"] == runtime.environment["HOME"]
+    assert environment["HOME"] != str(tool_home)
+
+
+def test_tool_home_is_optional_host_only_and_probed_only_when_configured(configured, tmp_path):
+    assert configured.danso_tool_home is None
+    tool_home = tmp_path / "tool-home"
+    tool_home.mkdir(mode=0o700)
+    selected = configured.model_copy(update={"danso_tool_home": str(tool_home)})
+    assert probe_danso_readiness(selected) == (True, "")
+
+    relative = configured.model_copy(update={"danso_tool_home": "tool-home"})
+    ready, reason = probe_danso_readiness(relative)
+    assert not ready and "absolute" in reason
+
+    invalid_component = configured.model_copy(update={"danso_tool_home": "/tmp/tool:home"})
+    ready, reason = probe_danso_readiness(invalid_component)
+    assert not ready and "PATH component" in reason
+
+    bubblewrap = selected.model_copy(update={"danso_sandbox": "bubblewrap"})
+    ready, reason = probe_danso_readiness(bubblewrap)
+    assert not ready and "host" in reason
+
+    old_binary = tmp_path / "old-danso"
+    old_binary.write_text("#!/bin/sh\nprintf '%s\\n' old-help\n")
+    old_binary.chmod(0o700)
+    old_default = configured.model_copy(update={"danso_cli_path": str(old_binary)})
+    assert probe_danso_readiness(old_default) == (True, "")
+    old_selected = old_default.model_copy(update={"danso_tool_home": str(tool_home)})
+    ready, reason = probe_danso_readiness(old_selected)
+    assert not ready and "--tool-home" in reason
 
 
 @pytest.mark.anyio

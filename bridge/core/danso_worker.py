@@ -348,10 +348,11 @@ def _failure(stderr, code):
 
 class DansoRuntime:
     """One configured model; explicit credentials and private journal directory."""
-    def __init__(self, *, binary, state_directory, provider, model, environment,
+    def __init__(self, *, binary, state_directory, provider, model, environment,  # noqa: C901 -- bounded worker configuration validation
                  timeout_seconds=300, provider_timeout_seconds=180, max_turns=16,
                  compact_at_bytes=None, sandbox="host", system_context_loader=None,
                  outer_timeout_seconds=None,
+                 tool_home=None,
                  long_task=False, task_stage_requests=16, task_max_requests=1024,
                  task_max_tokens=10_000_000, task_repeat_limit=3,
                  task_pause_after_stage=None, native_memory_args=None):
@@ -382,11 +383,20 @@ class DansoRuntime:
             raise ValueError('invalid compaction threshold')
         if sandbox not in {"host", "bubblewrap"}:
             raise ValueError("invalid execution backend")
+        if tool_home is not None:
+            if sandbox != "host":
+                raise ValueError("tool HOME requires the host execution backend")
+            raw_tool_home = str(tool_home)
+            if not isinstance(tool_home, (str, Path)) or not Path(raw_tool_home).is_absolute():
+                raise ValueError("tool HOME must be an absolute path")
+            if "\x00" in raw_tool_home or os.pathsep in raw_tool_home:
+                raise ValueError("tool HOME contains an invalid PATH component")
         self.system_context_loader = system_context_loader
         # Flag-gated native memory (danso #52 §9): extra CLI flags injected
         # verbatim; when present the materializer context loader is skipped.
         self.native_memory_args = list(native_memory_args or [])
         self.sandbox = sandbox
+        self.tool_home = None if tool_home is None else str(tool_home)
         self.compact_at_bytes = compact_at_bytes
         self.binary = str(Path(binary).resolve(strict=True))
         root = Path(state_directory).absolute()
@@ -626,6 +636,8 @@ class DansoSession:
             command = [r.binary, '--sandbox', r.sandbox, '--cwd', str(self.cwd), '--session', str(r.root / (self.session_id + '.jsonl')),
                        '--provider', r.provider, '--model', r.model, '--max-turns', str(r.max_turns),
                        '--provider-timeout-seconds', str(r.provider_timeout), '-p']
+            if r.tool_home is not None:
+                command += ['--tool-home', r.tool_home]
             if not resume_task:
                 command += ['--timeout-seconds', str(r.timeout)]
             if r.long_task:

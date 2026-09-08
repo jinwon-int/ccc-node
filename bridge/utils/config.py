@@ -233,6 +233,14 @@ class Config(
     )
     danso_sandbox: Literal["host", "bubblewrap"] = Field(default="host", alias="CCC_DANSO_SANDBOX")
     danso_cli_path: str = Field(default="danso", alias="CCC_DANSO_CLI_PATH")
+    danso_tool_home: Optional[str] = Field(
+        default=None,
+        alias="CCC_DANSO_TOOL_HOME",
+        description=(
+            "Optional absolute host-only HOME for native development tools. "
+            "The provider/context HOME remains the private Danso state HOME."
+        ),
+    )
     danso_auth_mode: Literal["api-key", "chatgpt"] = Field(default="api-key", alias="CCC_DANSO_AUTH_MODE")
     danso_chatgpt_auth_file: Optional[str] = Field(default=None, alias="DANSO_CHATGPT_AUTH_FILE")
     danso_chatgpt_base_url: Optional[str] = Field(default=None, alias="DANSO_CHATGPT_BASE_URL")
