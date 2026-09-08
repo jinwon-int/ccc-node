@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -17,6 +18,17 @@ from telegram_bot.utils.config import Settings
 from telegram_bot.utils.secure_fs import ensure_private_directory
 
 ASTRA_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+LONG_TASK_FLAGS = (
+    "--long-task",
+    "--resume-task",
+    "--task-status",
+    "--task-stage-requests",
+    "--task-max-requests",
+    "--task-max-tokens",
+    "--task-repeat-limit",
+    "--task-pause-after-stage",
+    "--task-progress",
+)
 
 
 def _validate_execution_backend(settings: Settings) -> None:
@@ -79,7 +91,36 @@ def _validate_memory(settings: Settings) -> None:
             raise ValueError("Danso memory must be disjoint from workspace and contain no symlinks")
 
 
-def _configuration(settings: Settings) -> tuple[str, Path]:
+def _validate_long_task_binary(binary: str, cwd: Path) -> None:
+    """Require the complete long-task CLI surface before enabling the profile.
+
+    This is a local ``--help`` capability check only.  It deliberately passes a
+    scrubbed environment and never contacts a provider; an older Danso binary
+    must fail closed instead of receiving a partial set of task flags and
+    silently running a different workflow.
+    """
+
+    try:
+        completed = subprocess.run(
+            [binary, "--help"],
+            cwd=cwd,
+            env={"PATH": os.defpath, "HOME": str(Path.home())},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise ValueError("Danso executable does not expose the long-task CLI") from None
+    help_text = (completed.stdout + completed.stderr)[: 256 * 1024].decode(
+        "utf-8", errors="replace"
+    )
+    if completed.returncode != 0 or any(flag not in help_text for flag in LONG_TASK_FLAGS):
+        raise ValueError("Danso executable does not expose the long-task CLI")
+
+
+def _configuration(settings: Settings) -> tuple[str, Path]:  # noqa: C901 -- provider prerequisites plus opt-in long-task profile
     """Validate locally, without creating state or contacting any provider."""
     _validate_memory(settings)
     if settings.memory_distill_provider == "danso" and settings.bridge_memory_mode != "audience-scoped":
@@ -114,7 +155,15 @@ def _configuration(settings: Settings) -> tuple[str, Path]:
     if binary is None:
         raise ValueError("Danso executable unavailable; set CCC_DANSO_CLI_PATH")
     _validate_execution_backend(settings)
-    if settings.danso_timeout_seconds + 10 > settings.process_timeout_seconds:
+    if settings.danso_long_task_enabled:
+        if settings.danso_task_stage_requests > settings.danso_task_max_requests:
+            raise ValueError("CCC_DANSO_TASK_STAGE_REQUESTS must not exceed CCC_DANSO_TASK_MAX_REQUESTS")
+        if settings.danso_long_task_timeout_seconds + 10 > settings.process_timeout_seconds:
+            raise ValueError(
+                "CLAUDE_PROCESS_TIMEOUT must exceed CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS by at least 10s"
+            )
+        _validate_long_task_binary(binary, cwd)
+    elif settings.danso_timeout_seconds + 10 > settings.process_timeout_seconds:
         raise ValueError("CLAUDE_PROCESS_TIMEOUT must exceed CCC_DANSO_TIMEOUT_SECONDS by at least 10s")
     return str(Path(binary).resolve(strict=True)), root
 
@@ -203,7 +252,18 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
                         provider=provider, model=settings.danso_model,
                         environment=environment, default_effort=settings.danso_effort,
                         sandbox=settings.danso_sandbox,
-                        timeout_seconds=settings.danso_timeout_seconds,
+                        timeout_seconds=(
+                            settings.danso_long_task_timeout_seconds
+                            if settings.danso_long_task_enabled
+                            else settings.danso_timeout_seconds
+                        ),
+                        outer_timeout_seconds=settings.process_timeout_seconds,
                         provider_timeout_seconds=settings.danso_provider_timeout_seconds,
                         max_turns=settings.danso_max_turns,
-                        compact_at_bytes=settings.danso_compact_at_bytes)
+                        compact_at_bytes=settings.danso_compact_at_bytes,
+                        long_task=settings.danso_long_task_enabled,
+                        task_stage_requests=settings.danso_task_stage_requests,
+                        task_max_requests=settings.danso_task_max_requests,
+                        task_max_tokens=settings.danso_task_max_tokens,
+                        task_repeat_limit=settings.danso_task_repeat_limit,
+                        task_pause_after_stage=settings.danso_task_pause_after_stage)

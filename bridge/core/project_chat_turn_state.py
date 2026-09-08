@@ -16,6 +16,7 @@ from telegram_bot.core.agent_runtime import (
     MessageCompletedEvent,
     ReasoningDeltaEvent,
     ResultEvent,
+    TaskProgressEvent,
     TextDeltaEvent,
     ToolCompletedEvent,
     ToolStartedEvent,
@@ -62,7 +63,11 @@ class DelegatedTaskLifecycleTransition:
 
 
 IgnoredEvent: TypeAlias = (
-    ReasoningDeltaEvent | ApprovalRequestEvent | ApprovalResolvedEvent | CompletionEvent
+    ReasoningDeltaEvent
+    | ApprovalRequestEvent
+    | ApprovalResolvedEvent
+    | TaskProgressEvent
+    | CompletionEvent
 )
 
 
@@ -281,7 +286,13 @@ class TurnEventState:
             return self._observe_delegated_lifecycle(event, observed_at=observed_at)
         if isinstance(
             event,
-            (ReasoningDeltaEvent, ApprovalRequestEvent, ApprovalResolvedEvent, CompletionEvent),
+            (
+                ReasoningDeltaEvent,
+                ApprovalRequestEvent,
+                ApprovalResolvedEvent,
+                TaskProgressEvent,
+                CompletionEvent,
+            ),
         ):
             return IgnoredTransition(event)
         raise TypeError(f"unsupported agent event: {type(event).__name__}")

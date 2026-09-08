@@ -129,6 +129,9 @@ class TelegramBot(
         self._push_notifier = PushNotifier(settings)
         # Only sessions created/resumed in current runtime are auto-resumed.
         self._runtime_active_sessions: set[Any] = set()
+        # Monotonic conversation bindings invalidate queued control closures
+        # as soon as /new begins, before its cancellation/distill awaits.
+        self._task_resume_generations: dict[Any, int] = {}
         self._distill_checkpoint_progress: Dict[Any, _DistillCheckpointProgress] = {}
         self._distill_checkpoint_locks: Dict[Any, asyncio.Lock] = {}
         # Serialize first-use legacy seeding per destination. Telegram may
@@ -175,6 +178,17 @@ class TelegramBot(
         cfg = getattr(self, "_config", None)
         scope = getattr(cfg, "telegram_session_scope", "per-user-chat")
         return storage_key(scope, user_id, chat_id)
+
+    def _task_resume_generation(self, session_key: Any) -> int:
+        return getattr(self, "_task_resume_generations", {}).get(session_key, 0)
+
+    def _bump_task_resume_generation(self, session_key: Any) -> int:
+        generations = getattr(self, "_task_resume_generations", None)
+        if generations is None:
+            generations = self._task_resume_generations = {}
+        generation = generations.get(session_key, 0) + 1
+        generations[session_key] = generation
+        return generation
 
     async def _seed_scoped_session_from_legacy(
         self,
@@ -340,6 +354,9 @@ class TelegramBot(
         session["provider"] = provider
         if provider == active_provider:
             return session, False
+        # Invalidate queued provider control closures before the departing
+        # session's distill handoff yields.
+        self._bump_task_resume_generation(session_key)
         await self._enqueue_previous_codex_session(
             session,
             DistillTrigger.PROVIDER_SWITCH,
@@ -426,6 +443,7 @@ class TelegramBot(
         user_id: int | None = None,
         chat_id: int | None = None,
     ) -> None:
+        self._bump_task_resume_generation(session_key)
         await self._enqueue_previous_codex_session(
             session,
             DistillTrigger.AUTO_NEW,
@@ -457,7 +475,11 @@ class TelegramBot(
         request_text: str = "",
         turn_marker: str | None = None,
     ):
-        if getattr(response, "success", True) and response.session_id:
+        is_paused_task = (
+            self._active_provider() == "danso"
+            and getattr(response, "failure_class", None) == "danso_task_paused"
+        )
+        if (getattr(response, "success", True) or is_paused_task) and response.session_id:
             updates = {
                 "provider": self._active_provider(),
                 "session_id": response.session_id,
@@ -488,23 +510,24 @@ class TelegramBot(
                 remove_fields=remove_fields,
             )
             self._runtime_active_sessions.add(session_key)
-            try:
-                await self._record_codex_checkpoint(
-                    session_key,
-                    response,
-                    request_text=request_text,
-                    turn_marker=turn_marker,
-                    user_id=user_id,
-                    chat_id=chat_id,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                logger.warning(
-                    "%s checkpoint accounting failed error=%s",
-                    self._active_provider().title(),
-                    type(error).__name__,
-                )
+            if not is_paused_task:
+                try:
+                    await self._record_codex_checkpoint(
+                        session_key,
+                        response,
+                        request_text=request_text,
+                        turn_marker=turn_marker,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.warning(
+                        "%s checkpoint accounting failed error=%s",
+                        self._active_provider().title(),
+                        type(error).__name__,
+                    )
 
     def _distill_checkpoint_gates(self) -> tuple[int, int, int]:
         generic = (
@@ -782,6 +805,8 @@ class TelegramBot(
         self.application.add_handler(CommandHandler("model", self._cmd_model))
         self.application.add_handler(CommandHandler("effort", self._cmd_effort))
         self.application.add_handler(CommandHandler("resume", self._cmd_resume))
+        self.application.add_handler(CommandHandler("task_resume", self._cmd_task_resume))
+        self.application.add_handler(CommandHandler("task_pause", self._cmd_task_pause))
         self.application.add_handler(CommandHandler("stop", self._cmd_stop))
         self.application.add_handler(CommandHandler("continue", self._cmd_continue))
         self.application.add_handler(CommandHandler("restart", self._cmd_restart))

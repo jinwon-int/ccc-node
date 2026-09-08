@@ -17,7 +17,9 @@ from telegram_bot.core.agent_runtime import (
     ApprovalRequestEvent,
     JsonValue as AgentJsonValue,
     SessionRequest,
+    TaskProgressEvent,
 )
+from telegram_bot.core.danso_worker import TASK_RESUME_CONTROL
 from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core.agent_session_registry import ActiveToken
 from telegram_bot.core.external_wait import clear_active_turn, publish_active_turn
@@ -341,6 +343,7 @@ class ProjectChatProcessMixin:
         interim_message_callback: Optional[InterimMessageCallback] = None,
         sensitive_log_event: Optional[str] = None,
         usage_mode: str = MODE_INTERACTIVE,
+        resume_task: bool = False,
     ) -> ChatResponse:
         del message_id
         # The legacy permission seam (perm: buttons) belonged to the removed
@@ -355,7 +358,32 @@ class ProjectChatProcessMixin:
                 session_id=session_id,
             )
         self._require_runtime()
+        # The resume marker is an internal control envelope.  A Telegram
+        # message must never be allowed to reach another runtime (or a Danso
+        # worker before its authorization bit is armed) merely by copying the
+        # marker text.  The command route supplies both the exact marker and
+        # the trusted resume_task bit below.
+        if user_message == TASK_RESUME_CONTROL and not resume_task:
+            return ChatResponse(
+                content="❌ Invalid Danso task control.",
+                success=False,
+                error="danso_input",
+                session_id=session_id,
+            )
         provider = getattr(self._config, "agent_provider", "claude")
+        if resume_task and (
+            provider != "danso"
+            or not getattr(self._config, "danso_long_task_enabled", False)
+            or user_message != TASK_RESUME_CONTROL
+            or not session_id
+            or new_session
+        ):
+            return ChatResponse(
+                content="❌ Explicit Danso long-task resume is unavailable for this conversation.",
+                success=False,
+                error="danso_task_resume_unavailable",
+                session_id=session_id,
+            )
         if provider == "claude":
             # Claude adapter path (#584): the bot layer's approval/sandbox
             # knobs are Codex app-server policies (bot_access._codex_*) that
@@ -406,6 +434,7 @@ class ProjectChatProcessMixin:
             notification_bot=notification_bot,
             interim_message_callback=interim_message_callback,
             usage_mode=usage_mode,
+            resume_task=resume_task,
         )
 
         # One bounded second attempt when the provider never spoke. Retrying is
@@ -461,6 +490,7 @@ class ProjectChatProcessMixin:
             notification_bot=notification_bot,
             interim_message_callback=interim_message_callback,
             usage_mode=usage_mode,
+            resume_task=resume_task,
             admission_timeout_override=retry_grace,
         )
         if retried.success:
@@ -657,6 +687,18 @@ class ProjectChatProcessMixin:
             # Aggregate lifecycle state is consumed by the timeout selector and
             # health projection only. It is never rendered as assistant text.
             return
+        if isinstance(transition, IgnoredTransition) and isinstance(
+            transition.event, TaskProgressEvent
+        ):
+            # Keep the regular body-free heartbeat useful during a long native
+            # task without turning checkpoint metadata into assistant text.
+            transition_event = transition.event
+            request.current_tool_label = (
+                f"Danso task {transition_event.state} "
+                f"stage {transition_event.stage} "
+                f"({transition_event.requests} requests)"
+            )
+            return
         if isinstance(transition, (ErrorTransition, IgnoredTransition)):
             # Error payload is retained by TurnEventState for the outer response.
             # Reasoning remains private; approval/completion are already consumed.
@@ -683,6 +725,7 @@ class ProjectChatProcessMixin:
         notification_bot: Optional[Any] = None,
         usage_mode: str = MODE_INTERACTIVE,
         admission_timeout_override: Optional[float] = None,
+        resume_task: bool = False,
     ) -> ChatResponse:
         """Run one provider-neutral turn without changing the Claude SDK path.
 
@@ -732,6 +775,7 @@ class ProjectChatProcessMixin:
             progress_request = progress_handle.request
             session = None
             turn_token: ActiveToken | None = None
+            resume_authorized = False
             try:
                 # Session construction and the periodic resource guard share
                 # this short critical section. It prevents an idle-runtime
@@ -1064,6 +1108,17 @@ class ProjectChatProcessMixin:
                 abort_stalled_turn = getattr(session, "abort_stalled_turn", None)
                 if not callable(abort_stalled_turn):
                     abort_stalled_turn = None
+                if resume_task:
+                    authorize_resume = getattr(session, "authorize_task_resume", None)
+                    if not callable(authorize_resume):
+                        return ChatResponse(
+                            content="❌ Explicit Danso long-task resume is unavailable for this conversation.",
+                            success=False,
+                            error="danso_task_resume_unavailable",
+                            session_id=session.session_id,
+                        )
+                    authorize_resume()
+                    resume_authorized = True
                 turn_outcome = await asyncio.wait_for(
                     consume_turn_stream(
                         session.send_turn(
@@ -1303,6 +1358,14 @@ class ProjectChatProcessMixin:
                     )
                     if terminal_won:
                         await self._drop_agent_session(key, session)
+                    if terminal_error.code == "danso_task_paused":
+                        return ChatResponse(
+                            content=f"⏸ {terminal_error.message}",
+                            success=False,
+                            error=terminal_error.message,
+                            session_id=session.session_id,
+                            failure_class="danso_task_paused",
+                        )
                     return ChatResponse(
                         content=f"❌ Processing failed: {terminal_error.message}",
                         success=False,
@@ -1462,6 +1525,10 @@ class ProjectChatProcessMixin:
                     session_id=session.session_id if session is not None else session_id,
                 )
             finally:
+                if resume_authorized:
+                    clear_resume = getattr(session, "clear_task_resume_authorization", None)
+                    if callable(clear_resume):
+                        clear_resume()
                 try:
                     health_reporter.record_delegated_task_activity(
                         id(progress_request),

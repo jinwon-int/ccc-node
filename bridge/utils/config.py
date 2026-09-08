@@ -248,6 +248,62 @@ class Config(
     danso_max_turns: int = Field(default=32, ge=1, le=128, alias="CCC_DANSO_MAX_TURNS")
     danso_compact_at_bytes: int = Field(default=DEFAULT_DANSO_COMPACT_AT_BYTES, ge=8192, le=393216,
                                        alias="CCC_DANSO_COMPACT_AT_BYTES")
+    # Long-task mode is deliberately a separate opt-in profile.  The ordinary
+    # turn keeps its 300-second deadline and the existing provider timeout;
+    # these values are only forwarded when the explicit long-task switch is on.
+    danso_long_task_enabled: bool = Field(
+        default=False,
+        alias="CCC_DANSO_LONG_TASK_ENABLED",
+        description="Opt in to the native Danso long-task state machine; default off.",
+    )
+    danso_long_task_timeout_seconds: int = Field(
+        default=21600,
+        ge=1,
+        le=21600,
+        alias="CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS",
+        description=(
+            "Native long-task cumulative active-runtime limit, excluding operator pauses, "
+            "at most six hours."
+        ),
+    )
+    danso_task_stage_requests: int = Field(
+        default=16,
+        ge=1,
+        le=1024,
+        alias="CCC_DANSO_TASK_STAGE_REQUESTS",
+        description=(
+            "Target provider requests in one native long-task stage; safe-boundary "
+            "compaction may consume additional bounded requests."
+        ),
+    )
+    danso_task_max_requests: int = Field(
+        default=1024,
+        ge=1,
+        le=2048,
+        alias="CCC_DANSO_TASK_MAX_REQUESTS",
+        description="Cumulative provider-request budget for one native long task (up to 2048).",
+    )
+    danso_task_max_tokens: int = Field(
+        default=10_000_000,
+        ge=1,
+        le=25_000_000,
+        alias="CCC_DANSO_TASK_MAX_TOKENS",
+        description="Cumulative reported-token budget for one native long task (up to 25M).",
+    )
+    danso_task_repeat_limit: int = Field(
+        default=3,
+        ge=2,
+        le=8,
+        alias="CCC_DANSO_TASK_REPEAT_LIMIT",
+        description="Native long-task repeated identical tool-batch safety limit.",
+    )
+    danso_task_pause_after_stage: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=2048,
+        alias="CCC_DANSO_TASK_PAUSE_AFTER_STAGE",
+        description="Optional native pause point for staged long-task testing/resume.",
+    )
     usage_budget_tokens_danso: int = Field(default=0, ge=0, alias="CCC_USAGE_BUDGET_TOKENS_DANSO")
 
     usage_meter_enabled: bool = Field(

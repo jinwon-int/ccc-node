@@ -779,6 +779,29 @@ class ProjectChatStateMixin:
                 self._agent_session_registry.deactivate_if_same(handle.token)
             return bool(handles)
 
+    async def request_danso_task_pause(self, user_id: int, chat_id: int) -> str:
+        """Request a graceful pause from the exact active Danso session.
+
+        The worker validates that its native parent has emitted the bounded
+        ready checkpoint before sending SIGUSR1.  This method never targets a
+        process group and never starts a new process.
+        """
+        async with self._session_guard_lock:
+            key = self._stream_key(user_id, chat_id)
+            handles = self._agent_session_registry.active_handles_for_keys((key,))
+            if not handles:
+                return "not_active"
+            handle = self._agent_session_registry.active_handle_if_same(handles[0].token)
+            if handle is None:
+                return "not_active"
+            request_pause = getattr(handle.session, "request_task_pause", None)
+            if not callable(request_pause):
+                return "unsupported"
+            try:
+                return "requested" if request_pause() else "not_ready"
+            except (OSError, ProcessLookupError):
+                return "not_ready"
+
     async def cancel_user_streaming(self, user_id: int, chat_id: Optional[int] = None) -> bool:
         """Compatibility no-op retained for the bot layer (#584 slice C-2).
 

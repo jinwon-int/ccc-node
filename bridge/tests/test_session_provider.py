@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -217,6 +218,259 @@ async def test_resume_provider_mismatch_rejects_without_mutation(tmp_path: Path)
 
     assert await manager.store.get("7:9") == original
     assert "provider mismatch" in update.message.replies[0][0].lower()
+
+
+@pytest.mark.anyio
+async def test_task_resume_routes_current_danso_journal_without_prompt_duplication(
+    tmp_path: Path,
+) -> None:
+    from telegram_bot.core.danso_worker import TASK_RESUME_CONTROL
+
+    manager = make_manager(tmp_path, "danso")
+    await manager.store.set(
+        "7:9",
+        {"provider": "danso", "session_id": "danso-current", "new_session": False},
+    )
+    bot = bare_bot(manager, provider="danso")
+    bot._config.danso_long_task_enabled = True
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._tasks = SimpleNamespace(active=Mock(return_value=None))
+    bot._switch_provider_if_needed = AsyncMock(
+        return_value=({"session_id": "danso-current", "model": "gpt-6-astra", "effort": "high"}, False)
+    )
+    bot._effective_session_id = Mock(return_value="danso-current")
+    bot._require_application = Mock(return_value=SimpleNamespace(bot=SimpleNamespace()))
+    bot._codex_approval_policy = Mock(return_value="never")
+    bot._codex_approvals_reviewer = Mock(return_value=None)
+    bot._codex_sandbox_policy = Mock(return_value=None)
+    bot._codex_approval_callback = AsyncMock()
+    bot._make_status_callback = Mock(return_value=None)
+    bot._make_interim_reply_callback = Mock(return_value=None)
+    bot._reply_smart = AsyncMock()
+    process = AsyncMock(return_value=ChatResponse(content="resumed", success=True, session_id="danso-current"))
+    bot._project_chat = SimpleNamespace(process_message=process)
+
+    async def run_now(_key, run_task, _on_overflow):
+        await run_task()
+
+    bot._enqueue_user_task = run_now
+    update = make_update()
+    await bot._cmd_task_resume(update, SimpleNamespace(args=[]))
+
+    kwargs = process.await_args.kwargs
+    assert kwargs["user_message"] == TASK_RESUME_CONTROL
+    assert kwargs["resume_task"] is True
+    assert kwargs["session_id"] == "danso-current"
+    assert kwargs.get("new_session", False) is False
+    bot._reply_smart.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_paused_danso_binding_persists_audience_without_distill_checkpoint(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "danso")
+    bot = bare_bot(manager, provider="danso")
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._config.bridge_memory_audience_root = tmp_path / "audiences"
+    bot._config.bridge_memory_audience_key_path = tmp_path / "audience.key"
+    bot._config.bot_data_dir = tmp_path
+    bot._config.project_root = tmp_path
+    bot._record_codex_checkpoint = AsyncMock()
+
+    response = ChatResponse(
+        content="⏸ Paused at a saved checkpoint.",
+        success=False,
+        error="Paused at a saved checkpoint.",
+        session_id="danso-paused",
+        failure_class="danso_task_paused",
+    )
+    await bot._save_session_id("7:9", response, user_id=7, chat_id=7)
+
+    stored = await manager.get_session("7:9")
+    assert stored["provider"] == "danso"
+    assert stored["session_id"] == "danso-paused"
+    assert stored["distill_memory_audience"] == "private"
+    assert stored["distill_memory_scope"].startswith("private-")
+    bot._record_codex_checkpoint.assert_not_awaited()
+
+    aligned, switched = await bot._switch_provider_if_needed("7:9", 7, 7)
+    assert switched is False
+    assert aligned["session_id"] == "danso-paused"
+
+
+@pytest.mark.anyio
+async def test_queued_task_resume_rejects_binding_cleared_by_new(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "danso")
+    await manager.store.set(
+        "7:9",
+        {"provider": "danso", "session_id": "danso-old", "new_session": False},
+    )
+    bot = bare_bot(manager, provider="danso")
+    bot._config.danso_long_task_enabled = True
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._tasks = SimpleNamespace(active=Mock(return_value=None))
+    bot._switch_provider_if_needed = AsyncMock(
+        return_value=({"provider": "danso", "session_id": "danso-old"}, False)
+    )
+    bot._effective_session_id = Mock(return_value="danso-old")
+    bot._require_application = Mock(return_value=SimpleNamespace(bot=SimpleNamespace()))
+    bot._codex_approval_policy = Mock(return_value="never")
+    bot._codex_approvals_reviewer = Mock(return_value=None)
+    bot._codex_sandbox_policy = Mock(return_value=None)
+    bot._codex_approval_callback = AsyncMock()
+    bot._make_status_callback = Mock(return_value=None)
+    bot._make_interim_reply_callback = Mock(return_value=None)
+    bot._reply_smart = AsyncMock()
+    process = AsyncMock(return_value=ChatResponse(content="should not run"))
+    bot._project_chat = SimpleNamespace(process_message=process)
+    pending: dict[str, Any] = {}
+
+    async def hold(_key, run_task, _on_overflow):
+        pending["run"] = run_task
+
+    bot._enqueue_user_task = hold
+    update = make_update()
+    await bot._cmd_task_resume(update, SimpleNamespace(args=[]))
+    assert "run" in pending
+
+    await manager.patch_session(
+        "7:9", updates={"session_id": None, "new_session": True}
+    )
+    bot._bump_task_resume_generation("7:9")
+    await pending["run"]()
+
+    process.assert_not_awaited()
+    assert "changed before resume" in update.message.replies[-1][0]
+
+
+@pytest.mark.anyio
+async def test_queued_resume_is_invalidated_before_new_cleanup_awaits(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "danso")
+    await manager.store.set(
+        "7:9",
+        {"provider": "danso", "session_id": "danso-old", "new_session": False},
+    )
+    bot = bare_bot(manager, provider="danso")
+    bot._config.danso_long_task_enabled = True
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._tasks = SimpleNamespace(active=Mock(return_value=None))
+    bot._switch_provider_if_needed = AsyncMock(
+        return_value=({"provider": "danso", "session_id": "danso-old"}, False)
+    )
+    bot._effective_session_id = Mock(return_value="danso-old")
+    bot._require_application = Mock(return_value=SimpleNamespace(bot=SimpleNamespace()))
+    bot._codex_approval_policy = Mock(return_value="never")
+    bot._codex_approvals_reviewer = Mock(return_value=None)
+    bot._codex_sandbox_policy = Mock(return_value=None)
+    bot._codex_approval_callback = AsyncMock()
+    bot._make_status_callback = Mock(return_value=None)
+    bot._make_interim_reply_callback = Mock(return_value=None)
+    bot._reply_smart = AsyncMock()
+    process = AsyncMock(return_value=ChatResponse(content="should not run"))
+    bot._project_chat = SimpleNamespace(process_message=process)
+    pending: dict[str, Any] = {}
+
+    async def hold(_key, run_task, _on_overflow):
+        pending["run"] = run_task
+
+    bot._enqueue_user_task = hold
+    resume_update = make_update()
+    await bot._cmd_task_resume(resume_update, SimpleNamespace(args=[]))
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_distill(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+
+    bot._enqueue_previous_codex_session = blocked_distill
+    bot._cancel_user_voice_tasks = AsyncMock(return_value=0)
+    bot._cancel_user_streaming = AsyncMock()
+    bot._deny_codex_approvals = Mock(return_value=0)
+    bot._invalidate_codex_approvals = Mock()
+    new_update = make_update()
+    new_task = asyncio.create_task(bot._cmd_new(new_update, SimpleNamespace(args=[])))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    await pending["run"]()
+    process.assert_not_awaited()
+    assert "changed before resume" in resume_update.message.replies[-1][0]
+
+    release.set()
+    await new_task
+
+
+@pytest.mark.anyio
+async def test_resume_epoch_is_captured_before_provider_alignment_yields(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "danso")
+    await manager.store.set(
+        "7:9",
+        {"provider": "danso", "session_id": "danso-old", "new_session": False},
+    )
+    bot = bare_bot(manager, provider="danso")
+    bot._config.danso_long_task_enabled = True
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._tasks = SimpleNamespace(active=Mock(return_value=None))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_alignment(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return ({"provider": "danso", "session_id": "danso-old"}, False)
+
+    bot._switch_provider_if_needed = delayed_alignment
+    bot._effective_session_id = Mock(return_value="danso-old")
+    bot._require_application = Mock(return_value=SimpleNamespace(bot=SimpleNamespace()))
+    bot._enqueue_user_task = AsyncMock()
+    update = make_update()
+    resume = asyncio.create_task(bot._cmd_task_resume(update, SimpleNamespace(args=[])))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    bot._bump_task_resume_generation("7:9")
+    release.set()
+    await resume
+
+    bot._enqueue_user_task.assert_not_awaited()
+    assert "changed before resume" in update.message.replies[-1][0]
+
+
+@pytest.mark.anyio
+async def test_task_resume_rejects_while_current_task_is_active(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "danso")
+    bot = bare_bot(manager, provider="danso")
+    bot._config.danso_long_task_enabled = True
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._tasks = SimpleNamespace(active=Mock(return_value=asyncio.get_running_loop().create_future()))
+    bot._project_chat = SimpleNamespace(process_message=AsyncMock())
+    update = make_update()
+
+    await bot._cmd_task_resume(update, SimpleNamespace(args=[]))
+
+    assert "already running" in update.message.replies[0][0].lower()
+    bot._project_chat.process_message.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_task_pause_asks_only_the_active_danso_project_session(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "danso")
+    bot = bare_bot(manager, provider="danso")
+    bot._config.danso_long_task_enabled = True
+    bot._project_chat = SimpleNamespace(
+        request_danso_task_pause=AsyncMock(return_value="requested")
+    )
+    update = make_update()
+
+    await bot._cmd_task_pause(update, SimpleNamespace(args=[]))
+
+    bot._project_chat.request_danso_task_pause.assert_awaited_once_with(7, 9)
+    assert "graceful pause requested" in update.message.replies[0][0].lower()
 
 
 @pytest.mark.anyio
