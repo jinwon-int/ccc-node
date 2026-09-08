@@ -85,6 +85,17 @@ RESTART_COMMAND_TIMEOUT_SECONDS="${CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECON
 BRANCH="${CCC_SELF_UPDATE_BRANCH:-main}"
 SYSTEMCTL="${CCC_SELF_UPDATE_SYSTEMCTL:-systemctl}"
 
+# Commit-signature verification of the incoming tip (#1591).
+#   warn    — verify and report, but still apply (rollout default)
+#   enforce — verify and refuse to merge an unverified tip (fail-closed)
+#   off     — skip verification entirely (escape hatch)
+# The default is deliberately `warn` for the first fleet rollout: this script is
+# itself delivered by the mechanism it gates, so an enforce-by-default landing
+# would strand every node that cannot verify on the very commit that would fix
+# it. Flipping the default to `enforce` is a separate, evidence-gated change.
+SIGNATURE_MODE="${CCC_SELF_UPDATE_SIGNATURE_MODE:-warn}"
+SIGNATURE_KEYRING="${CCC_SELF_UPDATE_SIGNATURE_KEYRING:-}"
+
 SELF_UPDATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 HARNESS_PATHS_LIB="$SELF_UPDATE_DIR/lib/harness-paths.sh"
 if [ ! -r "$HARNESS_PATHS_LIB" ]; then
@@ -488,6 +499,51 @@ notify_stalled() { # <reason> <text> [log-detail]
   log "abort reason=$1 repo=$REPO${3:+ $3}"
   notify "$2 ~/.claude/state/self-update.log" "stalled-$1"
 }
+
+# Verify that <rev> carries a good signature from a pinned trusted key.
+#
+# The keyring is built in a private, throwaway GNUPGHOME from key material
+# vendored in the repo, so the result never depends on (and never mutates) the
+# node's own gpg keyring. Trust is pinned by full fingerprint: a GOODSIG alone
+# is not enough, because any key the keyring happens to hold would satisfy it.
+#
+# Prints one of: ok | bad-signature | no-gpg | no-keyring | unverified
+verify_commit_signature() { # <rev>
+  local rev="$1" keyring gnupghome raw rc=0
+  command -v gpg >/dev/null 2>&1 || { printf 'no-gpg'; return 1; }
+
+  keyring="$SIGNATURE_KEYRING"
+  [ -n "$keyring" ] || keyring="$SELF_UPDATE_DIR/trusted-keys/github-web-flow.gpg"
+  [ -r "$keyring" ] || { printf 'no-keyring'; return 1; }
+
+  gnupghome="$(mktemp -d 2>/dev/null)" || { printf 'no-gpg'; return 1; }
+  chmod 700 "$gnupghome" 2>/dev/null || :
+  raw="$(GNUPGHOME="$gnupghome" gpg --batch --quiet --import "$keyring" 2>/dev/null \
+    && GNUPGHOME="$gnupghome" git -C "$REPO" verify-commit --raw "$rev" 2>&1)" || rc=$?
+  rm -rf "$gnupghome" 2>/dev/null || :
+
+  case "$raw" in
+    *VALIDSIG*)
+      # Pin the fingerprint, not just "some good signature".
+      local fpr
+      fpr="$(printf '%s\n' "$raw" | sed -n 's/.*VALIDSIG \([A-F0-9]\{40\}\).*/\1/p' | head -1)"
+      if printf '%s\n' "$TRUSTED_SIGNING_FPRS" | grep -qxF "$fpr"; then
+        printf 'ok'; return 0
+      fi
+      printf 'unverified'; return 1 ;;
+    *BADSIG*) printf 'bad-signature'; return 1 ;;
+    *) [ "$rc" -eq 0 ] && { printf 'unverified'; return 1; }
+       printf 'unverified'; return 1 ;;
+  esac
+}
+
+# Full fingerprints permitted to sign the update tip. GitHub signs every
+# squash-merge performed through its UI/API with these keys, so a commit pushed
+# directly to the branch with a stolen deploy key does NOT carry one.
+# NOTE: this proves the commit was created through GitHub, not which human
+# authored it; branch protection and CODEOWNERS remain the author control.
+TRUSTED_SIGNING_FPRS="${CCC_SELF_UPDATE_TRUSTED_FPRS:-968479A1AFF927E37D1A566BB5690EEEBB952194
+5DE3E0509C47EA3CF04A42D34AEE18F83AFDEB23}"
 if [ ! -d "$REPO/.git" ]; then
   notify_stalled no-repo "self-update 정지: $REPO 에 git 저장소가 없습니다. 이 노드는 복구 전까지 갱신되지 않습니다."
   say "self-update: no git repo at $REPO (set CCC_SELF_UPDATE_REPO or $REPO_FILE)" >&2
@@ -558,6 +614,31 @@ if ! git -C "$REPO" fetch origin "$BRANCH" >/dev/null 2>&1; then
   exit 5
 fi
 rm -f "$FETCH_FAIL_FILE" 2>/dev/null || :
+
+# --- verify the incoming tip BEFORE it becomes HEAD (#1591) -------------------
+# Order matters: verifying after the merge would already have moved the working
+# checkout onto unverified code, and setup.sh runs from that checkout.
+if [ "$SIGNATURE_MODE" != "off" ]; then
+  INCOMING_SHA="$(git -C "$REPO" rev-parse "origin/$BRANCH" 2>/dev/null)"
+  if [ "$INCOMING_SHA" = "$OLD_SHA" ]; then
+    SIG_RESULT=ok   # nothing new to verify; HEAD is what we already run
+  else
+    SIG_RESULT="$(verify_commit_signature "origin/$BRANCH" || :)"
+  fi
+  if [ "$SIG_RESULT" = "ok" ]; then
+    log "signature ok rev=${INCOMING_SHA:-?} mode=$SIGNATURE_MODE"
+  elif [ "$SIGNATURE_MODE" = "enforce" ]; then
+    notify_stalled unverified-signature \
+      "self-update 정지: origin/$BRANCH 최신 커밋의 서명을 신뢰할 수 없습니다 ($SIG_RESULT). 이 노드는 복구 전까지 갱신되지 않습니다." \
+      "rev=${INCOMING_SHA:-?} result=$SIG_RESULT"
+    say "self-update: refusing unverified tip ${INCOMING_SHA:-?} ($SIG_RESULT); aborting (fail-closed)" >&2
+    exit 13
+  else
+    log "signature $SIG_RESULT rev=${INCOMING_SHA:-?} mode=$SIGNATURE_MODE proceeding"
+    say "self-update: WARNING unverified tip ${INCOMING_SHA:-?} ($SIG_RESULT); proceeding because mode=$SIGNATURE_MODE" >&2
+  fi
+fi
+
 if ! git -C "$REPO" merge --ff-only "origin/$BRANCH" >/dev/null 2>&1; then
   notify_stalled non-ff "self-update 정지: 로컬 브랜치가 origin/$BRANCH 와 분기했습니다 (non-ff). 이 노드는 복구 전까지 갱신되지 않습니다."
   say "self-update: local branch diverged from origin/$BRANCH (non-ff); aborting (fail-closed)" >&2
