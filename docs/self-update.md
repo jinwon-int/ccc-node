@@ -230,6 +230,9 @@ still does not include a complete previous dependency environment.
 | `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` | `3600` | cap total deferral so continuous load can't starve updates |
 | `CCC_SELF_UPDATE_REAPPLY` | `1` | set to `0` to skip installer cron re-apply; equivalent operator file: `~/.claude/self-update.no-reapply` |
 | `CCC_SELF_UPDATE_CRONTAB_CMD` | `crontab` | crontab binary (tests inject a stub) |
+| `CCC_SELF_UPDATE_SIGNATURE_MODE` | `warn` | tip signature policy: `warn` (verify + report, still apply), `enforce` (refuse an unverified tip, exit 13), `off` (skip) |
+| `CCC_SELF_UPDATE_SIGNATURE_KEYRING` | `scripts/trusted-keys/github-web-flow.gpg` | keyring holding the permitted signing keys |
+| `CCC_SELF_UPDATE_TRUSTED_FPRS` | GitHub web-flow fingerprints | newline-separated full fingerprints allowed to sign the tip |
 
 Exit codes: 0 ok/up-to-date · 3 lock held · 4 precondition failed · 5 fetch/ff
 failed · 6 setup/snapshot failed (repo and managed artifacts were verified
@@ -242,6 +245,9 @@ file missing/empty); running processes may still hold the old code, so this
 is reported as non-ok to surface silent drift rather than `result:"ok"`.
 12 installer re-apply failed — crontab was restored from the pre-reapply
 snapshot; the repo/harness stay at the new SHA (setup already succeeded).
+13 incoming tip signature could not be verified and
+`CCC_SELF_UPDATE_SIGNATURE_MODE=enforce` — nothing was merged, so the node
+stays on its current SHA (see "Tip signature verification" below).
 On exit 9, the validated private recovery snapshot is retained under
 `~/.claude/state/self-update-install-rollback.*/` (`0700` directory containing
 `0600` Claude and Hermes archives) for local operator
@@ -253,6 +259,35 @@ false success. Normal success and successful rollback remove it automatically.
 degraded and prints the retained private transaction directory. The outer
 self-update layer must still verify its own repository + Claude + Hermes
 rollback rather than treating that exit as a complete restore.
+
+### Tip signature verification (#1591)
+
+Before the ff-merge, the incoming `origin/$BRANCH` tip is checked for a good
+signature from a pinned key. Order is load-bearing: verifying after the merge
+would already have moved the checkout onto unverified code, and `setup.sh` runs
+*from that checkout* as root.
+
+The keyring is imported into a private throwaway `GNUPGHOME` built from key
+material vendored at `scripts/trusted-keys/github-web-flow.gpg`, so the verdict
+never depends on — and never mutates — the node's own gpg keyring. Trust is
+pinned by **full fingerprint**; a `GOODSIG` from some other key the keyring
+happens to hold is rejected. `gpg` missing, keyring missing, bad signature, and
+unpinned signer all resolve to "not verified" (never to a silent pass).
+
+**What this does and does not prove.** GitHub signs every squash-merge made
+through its UI/API, so a commit pushed straight to the branch with a stolen
+deploy key carries no such signature and is caught. It does *not* attest which
+human authored the change — branch protection, required checks and CODEOWNERS
+remain the author control. This closes the "stolen push credential" path, not
+the "compromised reviewer" path.
+
+**Why the default is `warn`, not `enforce`.** This script is delivered by the
+very mechanism it gates. Landing `enforce` as the default would strand any node
+that cannot verify — on the commit that would have fixed it, with no self-update
+path back. So the rollout is two-stage: ship `warn`, collect `signature ok`
+lines from `~/.claude/state/self-update.log` across the fleet, then flip the
+default in a separate change. Nodes can opt in early with
+`CCC_SELF_UPDATE_SIGNATURE_MODE=enforce`.
 
 ### Forced reapply and bounded operator commands (#1523)
 
