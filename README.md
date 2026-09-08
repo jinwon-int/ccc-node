@@ -6,28 +6,58 @@
 >
 > **Bridge provenance:** `bridge/` was vendored from a fork of [`terranc/claude-telegram-bot-bridge`](https://github.com/terranc/claude-telegram-bot-bridge), then intentionally developed here as part of `ccc-node`.
 
+## Prerequisites
+
+| Tool | Why |
+|---|---|
+| `bash` 4+ | setup and every harness script |
+| `git` | the node runs from a checkout and self-updates from it |
+| `jq` | required — setup merges `settings.json` with it |
+| `python3` 3.11+ | hooks, doctor, agent-cron (setup degrades without it; the harness does not) |
+| `gpg` | verifies the self-update commit signature ([`docs/self-update.md`](docs/self-update.md)) |
+
+The Telegram bridge additionally needs its own Python venv; `bridge/setup.sh`
+builds it (see [`bridge/README.md`](bridge/README.md)).
+
 ## Quickstart — new node path
 
 ```bash
 git clone https://github.com/jinwon-int/ccc-node.git
 cd ccc-node
+./setup.sh --help      # all flags, including the node-identity seeding below
 ./setup.sh --dry-run   # preview resolved paths and planned writes
 ./setup.sh             # install harness files/templates into ~/.claude and ~/.hermes
 # Root-run nodes: setup drops the bypassPermissions default (Claude Code refuses
 # it under root); run Claude as a non-root user to keep the no-prompt default.
 # setup also disables the OpenAI-curated GitHub plugin in ~/.codex/config.toml;
 # GitHub work uses the node-local authenticated gh CLI by default.
+```
 
-# Optional Telegram bridge:
+Seeding the node identity at install time is optional but saves hand-editing
+every `<PLACEHOLDER>` afterwards — freshly seeded `CLAUDE.md` / `MEMORY.md` /
+`USER.md` get substituted values (existing files are never touched):
+
+```bash
+./setup.sh --node soonwook --display 순욱 --slot VPS6 \
+           --fleet-role "Team2 worker" --lang Korean \
+           --user-name "Seo Jin On" --user-gh jinon86 --user-tz Asia/Seoul
+```
+
+Optional Telegram bridge — `setup.sh` first (it creates `bridge/.env` and
+prompts for the bot token), then start it. `--path` is the project root the
+bridge serves; use your own, not the `/root` of a root-run node:
+
+```bash
 cd bridge
-./start.sh --path /root -d
+./setup.sh
+./start.sh --path "$HOME" -d
 ```
 
 After setup:
 
-1. Fill placeholders in `~/.claude/CLAUDE.md` and template config files.
+1. Fill any remaining placeholders in `~/.claude/CLAUDE.md` and template config files.
 2. Provide node-local credentials through their normal tools (`claude` login, `gh auth login`, wiki-agent install). Do not commit secrets.
-3. Verify: `scripts/ccc-doctor.sh`, `scripts/validate-harness.sh`, and—if using the bridge—`bridge/start.sh --path /root --status`.
+3. Verify: `scripts/ccc-doctor.sh`, `scripts/validate-harness.sh`, and—if using the bridge—`bridge/start.sh --path "$HOME" --status`.
 4. Start a fresh Claude Code session and confirm memory injection/status line behavior.
 
 ## What you get
@@ -69,7 +99,15 @@ setup.sh                   Idempotent bootstrap; refuses to overwrite real node 
 
 ## Node profiles and path overrides
 
-`setup.sh` defaults to `$HOME/.claude` and `$HOME/.hermes`; non-root installs can override:
+Harness paths default to `$HOME/.claude` and `$HOME/.hermes` and can be
+overridden by environment variable.
+
+**Only the first five are read by `setup.sh` itself** — set those *before*
+running it. The rest are read at runtime by hooks and scripts, so exporting
+them ahead of `./setup.sh` has no effect; put them in the node's own
+environment instead.
+
+Read by `setup.sh` at install time:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -78,6 +116,11 @@ setup.sh                   Idempotent bootstrap; refuses to overwrite real node 
 | `CCC_WIKI_AGENT_BIN` | `$HOME/.wiki-agent/bin/wiki-agent` | Family Wiki reader/writer binary path |
 | `CCC_BRIDGE_DEFAULT_PATH` | `$HOME` | Suggested Telegram bridge workspace |
 | `CODEX_HOME` | `$HOME/.codex` | Codex config and managed-skill target; setup applies the GitHub CLI-first toggle and reconciles the explicit compatibility catalog |
+
+Read at runtime by hooks and scripts:
+
+| Variable | Default | Purpose |
+|---|---|---|
 | `CCC_STATE_DIR` | `$CCC_CLAUDE_DIR/state` | Local node state and memory index |
 | `CCC_MEMORY_PROFILE` | `standard` | Memory profile: `standard`, `hybrid`, or `max-perf` |
 | `CCC_MEMORY_CACHE_DIR` | `$CCC_CLAUDE_DIR/hooks/cache` | Wiki cache metadata |
@@ -104,6 +147,6 @@ Never store raw secrets in this repository. Node-local credentials stay outside 
 
 ## Contributing / support
 
-- Local checks: `bash scripts/validate-harness.sh`, `ruff check .`, `mypy`, and `cd bridge && python -m pytest -q`.
+- Local checks: `bash scripts/validate-harness.sh`, `ruff check .`, `mypy`, and `cd bridge && python -m pytest -q`. `validate-harness.sh` takes well over ten minutes — use `CCC_HARNESS_PHASE=static` or `CCC_HARNESS_SHARD=<i>/4` for a fast signal ([`CONTRIBUTING.md`](CONTRIBUTING.md)).
 - Contribution and release policy: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 - Historical roadmaps/closeouts are under [`docs/archive/`](docs/archive/); living operational docs stay at the top of `docs/`.
