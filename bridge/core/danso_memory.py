@@ -74,3 +74,32 @@ async def _run_materializer_command(path, command, timeout_seconds, *, environme
         _, cancelled = await _wait_owned(asyncio.create_task(cleanup()))
         if cancelled:
             raise asyncio.CancelledError
+
+
+def native_memory_enabled(settings: Settings) -> bool:
+    """Flag-gated native-memory switch (danso #52 §9 bridge transition).
+
+    Default is off: the audited materializer path keeps running until an
+    operator opts in per node. ``CCC_DANSO_NATIVE_MEMORY`` overrides the
+    settings attribute for canary testing.
+    """
+    override = os.environ.get("CCC_DANSO_NATIVE_MEMORY", "").strip().lower()
+    if override:
+        return override not in {"0", "false", "off", "no"}
+    return getattr(settings, "danso_native_memory", "off") == "native-read"
+
+
+def native_memory_command_args(settings: Settings, audience) -> list[str]:
+    """Danso CLI flags injecting the audience's native snapshot (§8).
+
+    The audience root doubles as the danso memory dir; the audience scope
+    (shared or private-<32 hex>) selects the tree below it. Returns no
+    credentials and never materializes a file — danso assembles the snapshot
+    itself. Callers must gate on :func:`native_memory_enabled`.
+    """
+    del settings  # the flag gate lives in native_memory_enabled
+    return [
+        "--memory", "read",
+        "--memory-dir", str(audience.root),
+        "--memory-scope", audience.scope,
+    ]
