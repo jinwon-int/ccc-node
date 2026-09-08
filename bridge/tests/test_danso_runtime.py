@@ -103,6 +103,8 @@ async def test_telegram_turn_resume_default_effort_and_usage(configured):
 @pytest.mark.anyio
 async def test_compaction_default_and_explicit_override_reach_native_cli(configured, tmp_path):
     runtime = build_danso_runtime(configured)
+    assert configured.danso_provider_timeout_seconds == 180
+    assert runtime.provider_timeout == 180
     session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
     events = [event async for event in session.send_turn("ok")]
     assert events[-1].kind == "completion"
@@ -122,15 +124,80 @@ async def test_compaction_default_and_explicit_override_reach_native_cli(configu
             "CCC_DANSO_STATE_DIR": str(tmp_path / "private-override"),
             "OPENAI_API_KEY": "fixture-key",
             "CCC_DANSO_TIMEOUT_SECONDS": "3",
+            "CCC_DANSO_PROVIDER_TIMEOUT_SECONDS": "42",
             "CCC_DANSO_COMPACT_AT_BYTES": "32768",
         },
     )
     runtime = build_danso_runtime(overridden)
+    assert overridden.danso_provider_timeout_seconds == 42
+    assert runtime.provider_timeout == 42
     session = await runtime.start_or_resume(SessionRequest(working_directory=overridden.danso_workspace))
     events = [event async for event in session.send_turn("ok")]
     assert events[-1].kind == "completion"
     argv = json.loads((Path(overridden.danso_workspace) / "argv.json").read_text())
     assert argv[argv.index("--compact-at-bytes") + 1] == "32768"
+    assert argv[argv.index("--provider-timeout-seconds") + 1] == "42"
+
+
+def test_transport_metadata_is_strict_optional_and_body_free():
+    from telegram_bot.core.danso_worker import _failure, _transport
+
+    record = json.dumps({
+        "version": 1, "phase": "response_body", "elapsed_ms": 180001,
+        "request_bytes": 30502,
+    }, separators=(",", ":"))
+    stderr = (
+        'DANSO_ERROR={"version":1,"category":"provider_timeout","exit_code":3}\n'
+        f"DANSO_TRANSPORT={record}\n"
+    ).encode()
+    event = _failure(stderr, 3)
+    assert event.code == "danso_provider_timeout"
+    assert "phase=response_body, elapsed_ms=180001, request_bytes=30502" in event.message
+    assert _transport(stderr.decode(), "provider_timeout", 2) is None
+
+    base = 'DANSO_ERROR={"version":1,"category":"provider","exit_code":3}\n'
+    records = [
+        '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"extra":"PRIVATE"}',
+        '{"version":1,"phase":"PRIVATE","elapsed_ms":1,"request_bytes":1}',
+        '{"version":1,"phase":"response_body","elapsed_ms":true,"request_bytes":1}',
+        '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":524289}',
+        '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"request_bytes":2}',
+        '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1',
+    ]
+    for item in records:
+        event = _failure((base + "DANSO_TRANSPORT=" + item + "\nPRIVATE_URL").encode(), 3)
+        assert event.code == "danso_provider"
+        assert "phase=" not in event.message
+        assert "PRIVATE" not in event.message
+
+    provider_exit_two = (
+        'DANSO_ERROR={"version":1,"category":"provider","exit_code":2}\n'
+        f"DANSO_TRANSPORT={record}\n"
+    ).encode()
+    event = _failure(provider_exit_two, 2)
+    assert event.code == "danso_provider"
+    assert "phase=" not in event.message
+
+
+@pytest.mark.anyio
+async def test_transport_record_on_success_is_adapter_failure(configured):
+    binary = Path(configured.danso_cli_path)
+    binary.write_text("""#!/usr/bin/python3
+import json, sys
+print('done')
+usage = {'requests': 1, 'inputTokens': 1, 'outputTokens': 0,
+         'cacheReadTokens': 0, 'cacheWriteTokens': 0, 'totalTokens': 1}
+for prefix in ('DANSO_USAGE', 'PIRI_USAGE'):
+    print(prefix + '=' + json.dumps(usage), file=sys.stderr)
+print('DANSO_TRANSPORT=' + json.dumps({'version': 1, 'phase': 'connect',
+      'elapsed_ms': 1, 'request_bytes': 1}), file=sys.stderr)
+""")
+    binary.chmod(0o700)
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    events = [event async for event in session.send_turn("success-with-diagnostic")]
+    assert [event.kind for event in events] == ["error"]
+    assert events[0].code == "danso_adapter_error"
 
 
 @pytest.mark.anyio

@@ -243,7 +243,7 @@ class Config(
         default="medium", alias="CCC_DANSO_EFFORT")
     danso_base_url: Optional[str] = Field(default=None, alias="DANSO_OPENAI_BASE_URL")
     danso_timeout_seconds: int = Field(default=300, ge=1, le=3600, alias="CCC_DANSO_TIMEOUT_SECONDS")
-    danso_provider_timeout_seconds: int = Field(default=60, ge=1, le=300,
+    danso_provider_timeout_seconds: int = Field(default=180, ge=1, le=300,
                                               alias="CCC_DANSO_PROVIDER_TIMEOUT_SECONDS")
     danso_max_turns: int = Field(default=32, ge=1, le=128, alias="CCC_DANSO_MAX_TURNS")
     danso_compact_at_bytes: int = Field(default=DEFAULT_DANSO_COMPACT_AT_BYTES, ge=8192, le=393216,
