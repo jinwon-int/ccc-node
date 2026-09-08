@@ -115,11 +115,15 @@ the native limits (`CCC_DANSO_TASK_STAGE_REQUESTS`,
 `CCC_DANSO_TASK_MAX_REQUESTS`, `CCC_DANSO_TASK_MAX_TOKENS`, and
 `CCC_DANSO_TASK_REPEAT_LIMIT`) only with a native binary that exposes the full
 long-task CLI. The bridge rejects older binaries before a provider request. The
-native wall-clock limit is at most 21600 seconds; for the maximum, set
+native cumulative active-runtime limit, excluding operator pauses, is at most
+21600 seconds; for the maximum, set
 `CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS=21600` and
 `CLAUDE_PROCESS_TIMEOUT=21660`. Provider requests keep the 180-second default.
-The defaults remain 1024 requests and 10,000,000 reported tokens; the native
-build may expose bounded upper limits of 2048 requests and 25,000,000 tokens.
+The stage request setting is a target: native safe-boundary compaction may
+consume additional bounded requests before it records the next checkpoint.
+The repeat setting limits repeated identical tool batches. The defaults remain
+1024 requests and 10,000,000 reported tokens; the native build may expose
+bounded upper limits of 2048 requests and 25,000,000 tokens.
 The native journal owns cumulative budgets, stages, repetition decisions, and
 resume eligibility. The bridge forwards these limits and consumes only bounded,
 body-free `DANSO_TASK` checkpoint records for the status heartbeat.

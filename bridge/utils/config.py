@@ -261,14 +261,20 @@ class Config(
         ge=1,
         le=21600,
         alias="CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS",
-        description="Native long-task wall-clock limit, at most six hours.",
+        description=(
+            "Native long-task cumulative active-runtime limit, excluding operator pauses, "
+            "at most six hours."
+        ),
     )
     danso_task_stage_requests: int = Field(
         default=16,
         ge=1,
         le=1024,
         alias="CCC_DANSO_TASK_STAGE_REQUESTS",
-        description="Maximum provider requests in one native long-task stage.",
+        description=(
+            "Target provider requests in one native long-task stage; safe-boundary "
+            "compaction may consume additional bounded requests."
+        ),
     )
     danso_task_max_requests: int = Field(
         default=1024,
@@ -289,7 +295,7 @@ class Config(
         ge=2,
         le=8,
         alias="CCC_DANSO_TASK_REPEAT_LIMIT",
-        description="Native long-task repeated-stage limit.",
+        description="Native long-task repeated identical tool-batch safety limit.",
     )
     danso_task_pause_after_stage: Optional[int] = Field(
         default=None,
