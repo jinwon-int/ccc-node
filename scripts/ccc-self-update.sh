@@ -620,22 +620,30 @@ rm -f "$FETCH_FAIL_FILE" 2>/dev/null || :
 # checkout onto unverified code, and setup.sh runs from that checkout.
 if [ "$SIGNATURE_MODE" != "off" ]; then
   INCOMING_SHA="$(git -C "$REPO" rev-parse "origin/$BRANCH" 2>/dev/null)"
-  if [ "$INCOMING_SHA" = "$OLD_SHA" ]; then
-    SIG_RESULT=ok   # nothing new to verify; HEAD is what we already run
-  else
-    SIG_RESULT="$(verify_commit_signature "origin/$BRANCH" || :)"
-  fi
+  # Verify on EVERY tick, including up-to-date ones (#1597). An up-to-date tick
+  # used to short-circuit to `ok` without running gpg at all, and logged a line
+  # indistinguishable from a real verification — so a node with no gpg produced
+  # the same "signature ok" as a node that actually verified. On this fleet most
+  # ticks are up-to-date (40 of 51 successful ticks on one node), which made the
+  # log useless as readiness evidence for flipping the default to `enforce`.
+  # Verifying anyway costs ~50ms and turns each daily tick into a capability
+  # probe: "can this node's gpg + keyring verify the current tip?".
+  if [ "$INCOMING_SHA" = "$OLD_SHA" ]; then SIG_CHANGED=no; else SIG_CHANGED=yes; fi
+  SIG_RESULT="$(verify_commit_signature "origin/$BRANCH" || :)"
   if [ "$SIG_RESULT" = "ok" ]; then
-    log "signature ok rev=${INCOMING_SHA:-?} mode=$SIGNATURE_MODE"
-  elif [ "$SIGNATURE_MODE" = "enforce" ]; then
+    log "signature ok rev=${INCOMING_SHA:-?} changed=$SIG_CHANGED mode=$SIGNATURE_MODE"
+  elif [ "$SIGNATURE_MODE" = "enforce" ] && [ "$SIG_CHANGED" = yes ]; then
+    # Enforce only against an actually-new tip. Refusing an up-to-date tick would
+    # protect nothing — that code is already checked out and running — while
+    # cutting the node off from the update that would fix it.
     notify_stalled unverified-signature \
       "self-update 정지: origin/$BRANCH 최신 커밋의 서명을 신뢰할 수 없습니다 ($SIG_RESULT). 이 노드는 복구 전까지 갱신되지 않습니다." \
       "rev=${INCOMING_SHA:-?} result=$SIG_RESULT"
     say "self-update: refusing unverified tip ${INCOMING_SHA:-?} ($SIG_RESULT); aborting (fail-closed)" >&2
     exit 13
   else
-    log "signature $SIG_RESULT rev=${INCOMING_SHA:-?} mode=$SIGNATURE_MODE proceeding"
-    say "self-update: WARNING unverified tip ${INCOMING_SHA:-?} ($SIG_RESULT); proceeding because mode=$SIGNATURE_MODE" >&2
+    log "signature $SIG_RESULT rev=${INCOMING_SHA:-?} changed=$SIG_CHANGED mode=$SIGNATURE_MODE proceeding"
+    say "self-update: WARNING unverified tip ${INCOMING_SHA:-?} ($SIG_RESULT, changed=$SIG_CHANGED); proceeding because mode=$SIGNATURE_MODE" >&2
   fi
 fi
 

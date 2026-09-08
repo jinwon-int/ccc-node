@@ -284,10 +284,37 @@ the "compromised reviewer" path.
 **Why the default is `warn`, not `enforce`.** This script is delivered by the
 very mechanism it gates. Landing `enforce` as the default would strand any node
 that cannot verify — on the commit that would have fixed it, with no self-update
-path back. So the rollout is two-stage: ship `warn`, collect `signature ok`
-lines from `~/.claude/state/self-update.log` across the fleet, then flip the
-default in a separate change. Nodes can opt in early with
+path back. So the rollout is two-stage: ship `warn`, collect evidence from
+`~/.claude/state/self-update.log` across the fleet, then flip the default in a
+separate change. Nodes can opt in early with
 `CCC_SELF_UPDATE_SIGNATURE_MODE=enforce`.
+
+**Every tick verifies, including up-to-date ones (#1597).** Verification is not
+skipped when the tip already equals HEAD, so each scheduled tick doubles as a
+capability probe — "can this node's gpg and keyring verify the current tip?" —
+and the log line records which case it was:
+
+```
+signature ok rev=<sha> changed=no  mode=warn     # probe: nothing to merge
+signature ok rev=<sha> changed=yes mode=warn     # a real incoming tip
+signature no-gpg rev=<sha> changed=no mode=warn proceeding
+```
+
+The `changed=` label exists because the two cases were previously
+indistinguishable: an up-to-date tick short-circuited to `ok` without running
+gpg at all and logged the same line as a real verification. On this fleet most
+ticks are up-to-date (40 of 51 successful ticks on one node), so the log was
+dominated by lines that a node without gpg would have produced identically —
+useless as readiness evidence, and actively misleading for the flip decision.
+
+**`enforce` refuses only an actually-new tip.** A failed probe on an up-to-date
+tick is logged and the tick proceeds: that code is already checked out and
+running, so refusing protects nothing while cutting the node off from the update
+that would fix it.
+
+Flip criteria: every node in the fleet logging non-`ok` **zero** times for seven
+consecutive days, plus at least one `changed=yes` success somewhere in the fleet
+so the real update path — not just the probe — is known to pass.
 
 ### Forced reapply and bounded operator commands (#1523)
 

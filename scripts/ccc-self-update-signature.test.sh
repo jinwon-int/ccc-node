@@ -183,6 +183,75 @@ class SignatureGateWiringTest(unittest.TestCase):
         self.assertIn('CCC_SELF_UPDATE_SIGNATURE_MODE:-warn', self.text)
 
 
+def extract_gate():
+    """Pull the signature gate block out of the script under test."""
+    text = SCRIPT.read_text()
+    start = text.index('if [ "$SIGNATURE_MODE" != "off" ]; then')
+    end = text.index('if ! git -C "$REPO" merge --ff-only', start)
+    return text[start:end]
+
+
+class SignatureGateBehaviourTest(unittest.TestCase):
+    """Run the real gate block with a stubbed verifier and a stubbed git.
+
+    Text assertions cannot tell whether an up-to-date tick actually calls the
+    verifier — the bug in #1597 was exactly that it did not, while logging a
+    line identical to a real verification. So execute the block and observe.
+    """
+
+    def run_gate(self, *, incoming, old, mode, verdict):
+        harness = '\n'.join([
+            'set -u',
+            f'SIGNATURE_MODE={_q(mode)}',
+            f'OLD_SHA={_q(old)}',
+            'REPO=/nonexistent',
+            'BRANCH=main',
+            'LOG_LINES=""',
+            'log() { printf "LOG:%s\\n" "$*"; }',
+            'say() { :; }',
+            'notify_stalled() { printf "STALLED:%s\\n" "$1"; }',
+            # Stub git rev-parse to hand back the incoming tip.
+            f'git() {{ printf "%s" {_q(incoming)}; }}',
+            # Stub the verifier so we can see whether it ran at all.
+            f'verify_commit_signature() {{ printf "CALLED\\n" >&2; printf "%s" {_q(verdict)}; '
+            f'[ {_q(verdict)} = ok ]; }}',
+            extract_gate(),
+        ])
+        proc = subprocess.run([BASH, '-c', harness], capture_output=True, text=True)
+        return proc
+
+    def test_up_to_date_tick_still_verifies(self):
+        # The core regression: no short-circuit on an unchanged tip.
+        p = self.run_gate(incoming='abc', old='abc', mode='warn', verdict='ok')
+        self.assertIn('CALLED', p.stderr)
+        self.assertIn('changed=no', p.stdout)
+        self.assertIn('signature ok', p.stdout)
+
+    def test_changed_tip_is_logged_as_changed(self):
+        p = self.run_gate(incoming='def', old='abc', mode='warn', verdict='ok')
+        self.assertIn('CALLED', p.stderr)
+        self.assertIn('changed=yes', p.stdout)
+
+    def test_enforce_aborts_only_when_the_tip_actually_changed(self):
+        p = self.run_gate(incoming='def', old='abc', mode='enforce', verdict='no-gpg')
+        self.assertIn('STALLED:unverified-signature', p.stdout)
+        self.assertEqual(p.returncode, 13)
+
+    def test_enforce_does_not_abort_an_up_to_date_tick(self):
+        # Refusing here would protect nothing (that code already runs) while
+        # cutting the node off from the update that would fix it.
+        p = self.run_gate(incoming='abc', old='abc', mode='enforce', verdict='no-gpg')
+        self.assertNotIn('STALLED', p.stdout)
+        self.assertNotEqual(p.returncode, 13)
+        self.assertIn('changed=no', p.stdout)
+        self.assertIn('no-gpg', p.stdout)
+
+    def test_off_mode_does_not_verify_at_all(self):
+        p = self.run_gate(incoming='def', old='abc', mode='off', verdict='ok')
+        self.assertNotIn('CALLED', p.stderr)
+        self.assertEqual(p.stdout, '')
+
+
 result = unittest.main(exit=False).result
 failed = len(result.failures) + len(result.errors)
 print(f"PASS={max(0, result.testsRun - failed)} FAIL={failed}")
