@@ -137,7 +137,12 @@ while [ $# -gt 0 ]; do
     --user-gh)      need_val "$1" "${2:-}"; OPT_USER_GH="$2"; shift ;;
     --user-tz)      need_val "$1" "${2:-}"; OPT_USER_TZ="$2"; shift ;;
     --user-context) need_val "$1" "${2:-}"; OPT_USER_CONTEXT="$2"; shift ;;
-    *) echo "Unknown flag: $1" >&2; exit 2 ;;
+    -h|--help)
+      # Print the header comment block rather than a second copy of the usage:
+      # a duplicated help text drifts from the flags it documents.
+      sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d; s/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "Unknown flag: $1" >&2; echo "Try './setup.sh --help'." >&2; exit 2 ;;
   esac
   shift
 done

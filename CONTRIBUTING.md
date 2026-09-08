@@ -96,6 +96,19 @@ mypy
 cd bridge && python -m pytest -q
 ```
 
+`validate-harness.sh` runs every tracked `*.test.sh` and takes **well over ten
+minutes** on a single machine — it streams `ok …` lines as it goes, so it is
+working, not hung. To get a faster signal, run one phase or one shard (CI runs
+the static phase plus four shards in parallel; see
+[`docs/ci-governance.md`](docs/ci-governance.md)):
+
+```bash
+CCC_HARNESS_PHASE=static bash scripts/validate-harness.sh    # fast, no suites
+CCC_HARNESS_PHASE=hook-tests CCC_HARNESS_SHARD=1/4 bash scripts/validate-harness.sh
+```
+
+The bridge suite is likewise ~6 minutes; it is hermetic and needs no network.
+
 The following actions remain separate approval gates and must not be bundled
 into ordinary contribution PRs: visibility changes, release/tag/package publish,
 production deploy/restart/reload, database mutation, provider/Telegram live
