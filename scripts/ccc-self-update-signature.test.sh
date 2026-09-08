@@ -161,6 +161,96 @@ class VendoredKeyringTest(unittest.TestCase):
                     if line.startswith('fpr:')}
             self.assertIn('968479A1AFF927E37D1A566BB5690EEEBB952194', fprs)
 
+    def test_setup_installs_the_keyring_beside_the_deployed_hook(self):
+        """The keyring must follow the hook to its DEPLOYED location (#1599).
+
+        This suite previously only proved the key exists in the repo. But the
+        hook runs from $CLAUDE_DIR/hooks and resolves the keyring relative to
+        itself, so the repo copy is irrelevant at runtime. setup.sh shipped the
+        script without the key, and every deployed node reported `no-keyring`
+        forever — verification could never go green, and `enforce` would have
+        stopped the entire fleet. Observed live on yukson before this fix.
+        """
+        setup = (SCRIPT.parent.parent / 'setup.sh').read_text()
+        hook_install = setup.index(
+            'atomic_install "$SRC/scripts/ccc-self-update.sh"')
+        key_install = setup.index(
+            'atomic_install "$SRC/scripts/trusted-keys/github-web-flow.gpg"')
+        # The destination must be under the hooks dir, next to the script.
+        self.assertIn(
+            '"$CLAUDE_DIR/hooks/trusted-keys/github-web-flow.gpg"',
+            setup[key_install:key_install + 400])
+        # atomic_install does not create directories.
+        self.assertIn('mkdir -p "$CLAUDE_DIR/hooks/trusted-keys"', setup)
+        self.assertLess(hook_install, key_install)
+
+
+@unittest.skipUnless(GPG, 'gpg is required')
+class DeployedKeyringResolutionTest(unittest.TestCase):
+    """Run the real setup.sh, then verify from the DEPLOYED layout (#1599).
+
+    The bug this guards was invisible to source-text and repo-path assertions:
+    everything looked right in the checkout while the deployed hook resolved a
+    keyring path that setup.sh never populated. So install for real into a
+    throwaway CLAUDE_DIR and ask the deployed copy to verify.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix='ccc-deploy-test-')
+        root = Path(cls._tmp.name)
+        cls.claude_dir = root / 'claude'
+        repo = SCRIPT.parent.parent
+        env = dict(os.environ,
+                   HOME=str(root / 'home'),
+                   CCC_CLAUDE_DIR=str(cls.claude_dir),
+                   CCC_HERMES_DIR=str(root / 'hermes'),
+                   # setup.sh refuses to bake an ephemeral HOME into the live
+                   # systemd tree (#885); route unit writes into the fixture.
+                   CCC_SYSTEMD_DIR=str(root / 'systemd'),
+                   CCC_SETUP_ALLOW_OWNER_MISMATCH='1')
+        (root / 'home').mkdir()
+        cls.proc = subprocess.run([BASH, str(repo / 'setup.sh')], env=env,
+                                  cwd=str(repo), capture_output=True, text=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_setup_succeeded(self):
+        self.assertEqual(self.proc.returncode, 0,
+                         f'setup.sh failed:\n{self.proc.stdout[-2000:]}\n'
+                         f'{self.proc.stderr[-2000:]}')
+
+    def test_keyring_lands_next_to_the_deployed_hook(self):
+        hook = self.claude_dir / 'hooks' / 'ccc-self-update.sh'
+        self.assertTrue(hook.is_file(), 'hook not deployed')
+        keyring = hook.parent / 'trusted-keys' / 'github-web-flow.gpg'
+        self.assertTrue(
+            keyring.is_file(),
+            'deployed hook resolves its keyring here and setup.sh must put it '
+            f'there: {keyring}')
+
+    def test_deployed_hook_resolves_its_default_keyring(self):
+        # The end-to-end assertion: no explicit keyring, default resolution
+        # only, against the repo's own signed HEAD.
+        repo = SCRIPT.parent.parent
+        hook = self.claude_dir / 'hooks' / 'ccc-self-update.sh'
+        harness = '\n'.join([
+            'set -u',
+            f'REPO={_q(str(repo))}',
+            f'SELF_UPDATE_DIR={_q(str(hook.parent))}',
+            'SIGNATURE_KEYRING=""',
+            'TRUSTED_SIGNING_FPRS="968479A1AFF927E37D1A566BB5690EEEBB952194\n'
+            '5DE3E0509C47EA3CF04A42D34AEE18F83AFDEB23"',
+            extract_function('verify_commit_signature'),
+            'verify_commit_signature HEAD',
+        ])
+        proc = subprocess.run([BASH, '-c', harness], capture_output=True, text=True)
+        self.assertNotEqual(
+            proc.stdout.strip(), 'no-keyring',
+            'deployed layout cannot find its keyring — the #1599 regression')
+
 
 class SignatureGateWiringTest(unittest.TestCase):
     """Pin the call-site contract, not just the helper."""
