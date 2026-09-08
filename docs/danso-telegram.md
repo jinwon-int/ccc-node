@@ -47,8 +47,15 @@ CCC_MEMORY_DISTILL_PROVIDER=off
 CCC_DANSO_TIMEOUT_SECONDS=300
 CCC_DANSO_PROVIDER_TIMEOUT_SECONDS=60
 CCC_DANSO_MAX_TURNS=32
-CCC_DANSO_COMPACT_AT_BYTES=32768
+CCC_DANSO_COMPACT_AT_BYTES=131072
 ```
+
+`CCC_DANSO_COMPACT_AT_BYTES` defaults to 131072 bytes (128 KiB). Native Danso
+measures the serialized request, including system context, JSON escaping and
+tool schemas, so the default leaves room for the normal 32 KiB CCC memory
+snapshot and its request envelope. Existing installations with an explicit
+`32768` setting should migrate it to `131072`; explicit lower values remain
+valid overrides but can fail closed when the fixed context cannot fit.
 
 Supply `OPENAI_API_KEY` through the existing private environment/configuration
 channel. This is also the existing Whisper key setting. An explicitly configured

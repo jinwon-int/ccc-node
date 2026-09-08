@@ -101,6 +101,39 @@ async def test_telegram_turn_resume_default_effort_and_usage(configured):
 
 
 @pytest.mark.anyio
+async def test_compaction_default_and_explicit_override_reach_native_cli(configured, tmp_path):
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    events = [event async for event in session.send_turn("ok")]
+    assert events[-1].kind == "completion"
+    argv = json.loads((Path(configured.danso_workspace) / "argv.json").read_text())
+    assert configured.danso_compact_at_bytes == 128 * 1024
+    assert argv[argv.index("--compact-at-bytes") + 1] == str(128 * 1024)
+
+    overridden = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-override",
+        environ={
+            "TELEGRAM_BOT_TOKEN": "123456:synthetic",
+            "ALLOWED_USER_IDS": "[7]",
+            "CCC_AGENT_PROVIDER": "danso",
+            "CCC_DANSO_CLI_PATH": configured.danso_cli_path,
+            "CCC_DANSO_WORKSPACE": configured.danso_workspace,
+            "CCC_DANSO_STATE_DIR": str(tmp_path / "private-override"),
+            "OPENAI_API_KEY": "fixture-key",
+            "CCC_DANSO_TIMEOUT_SECONDS": "3",
+            "CCC_DANSO_COMPACT_AT_BYTES": "32768",
+        },
+    )
+    runtime = build_danso_runtime(overridden)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=overridden.danso_workspace))
+    events = [event async for event in session.send_turn("ok")]
+    assert events[-1].kind == "completion"
+    argv = json.loads((Path(overridden.danso_workspace) / "argv.json").read_text())
+    assert argv[argv.index("--compact-at-bytes") + 1] == "32768"
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize('message,code',[('fail','danso_provider'),('invalid','danso_adapter_error')])
 async def test_failure_is_terminal_private_and_never_retried(configured,message,code):
     runtime = build_danso_runtime(configured)
