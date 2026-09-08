@@ -269,7 +269,16 @@ would already have moved the checkout onto unverified code, and `setup.sh` runs
 
 The keyring is imported into a private throwaway `GNUPGHOME` built from key
 material vendored at `scripts/trusted-keys/github-web-flow.gpg`, so the verdict
-never depends on — and never mutates — the node's own gpg keyring. Trust is
+never depends on — and never mutates — the node's own gpg keyring.
+
+**The keyring must be deployed, not just committed (#1599).** The hook resolves
+its keyring relative to *itself*, so on a node it reads
+`~/.claude/hooks/trusted-keys/github-web-flow.gpg`, not the repo copy;
+`setup.sh` installs it there. When the first version shipped without that
+install step, every deployed node logged `no-keyring` on every tick — fail-closed
+and correct as a verdict, but it meant verification could never go green and
+`enforce` would have stopped the whole fleet. If a node reports `no-keyring`,
+re-run `setup.sh` before looking anywhere else. Trust is
 pinned by **full fingerprint**; a `GOODSIG` from some other key the keyring
 happens to hold is rejected. `gpg` missing, keyring missing, bad signature, and
 unpinned signer all resolve to "not verified" (never to a silent pass).
