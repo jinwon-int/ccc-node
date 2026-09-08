@@ -354,7 +354,7 @@ class DansoRuntime:
                  outer_timeout_seconds=None,
                  long_task=False, task_stage_requests=16, task_max_requests=1024,
                  task_max_tokens=10_000_000, task_repeat_limit=3,
-                 task_pause_after_stage=None):
+                 task_pause_after_stage=None, native_memory_args=None):
         if provider not in PROVIDERS or not model or not isinstance(model, str):
             raise ValueError('invalid provider/model')
         if type(long_task) is not bool:
@@ -383,6 +383,9 @@ class DansoRuntime:
         if sandbox not in {"host", "bubblewrap"}:
             raise ValueError("invalid execution backend")
         self.system_context_loader = system_context_loader
+        # Flag-gated native memory (danso #52 §9): extra CLI flags injected
+        # verbatim; when present the materializer context loader is skipped.
+        self.native_memory_args = list(native_memory_args or [])
         self.sandbox = sandbox
         self.compact_at_bytes = compact_at_bytes
         self.binary = str(Path(binary).resolve(strict=True))
@@ -644,6 +647,8 @@ class DansoSession:
             if r.compact_at_bytes is not None:
                 command += ['--compact-at-bytes', str(r.compact_at_bytes)]
             try:
+                if r.native_memory_args:
+                    command += list(r.native_memory_args)
                 if r.system_context_loader is not None:
                     self._bootstrap_task = asyncio.create_task(r.system_context_loader())
                     context_file = await self._bootstrap_task
