@@ -183,5 +183,8 @@ class SignatureGateWiringTest(unittest.TestCase):
         self.assertIn('CCC_SELF_UPDATE_SIGNATURE_MODE:-warn', self.text)
 
 
-unittest.main(verbosity=2)
+result = unittest.main(exit=False).result
+failed = len(result.failures) + len(result.errors)
+print(f"PASS={max(0, result.testsRun - failed)} FAIL={failed}")
+raise SystemExit(0 if result.wasSuccessful() else 1)
 PY
