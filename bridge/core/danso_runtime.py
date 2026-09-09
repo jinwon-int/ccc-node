@@ -39,6 +39,14 @@ def _validate_execution_backend(settings: Settings) -> None:
         raise ValueError("Danso requires bubblewrap; install bwrap")
 
 
+def _validate_zai_authentication(settings: Settings) -> None:
+    """zai lane credentials: GLM key required, ChatGPT file is foreign."""
+    if settings.danso_chatgpt_auth_file:
+        raise ValueError("DANSO_CHATGPT_AUTH_FILE requires CCC_DANSO_AUTH_MODE=chatgpt")
+    if not settings.zai_api_key or not settings.zai_api_key.strip():
+        raise ValueError("Danso zai mode requires ZAI_API_KEY")
+
+
 def _validate_authentication(settings: Settings, cwd: Path) -> None:
     if settings.danso_auth_mode not in {"api-key", "chatgpt", "zai"}:
         raise ValueError("unsupported Danso authentication mode")
@@ -49,10 +57,7 @@ def _validate_authentication(settings: Settings, cwd: Path) -> None:
             raise ValueError("Danso API-key mode requires OPENAI_API_KEY")
         return
     if settings.danso_auth_mode == "zai":
-        if settings.danso_chatgpt_auth_file:
-            raise ValueError("DANSO_CHATGPT_AUTH_FILE requires CCC_DANSO_AUTH_MODE=chatgpt")
-        if not settings.zai_api_key or not settings.zai_api_key.strip():
-            raise ValueError("Danso zai mode requires ZAI_API_KEY")
+        _validate_zai_authentication(settings)
         return
     if not settings.danso_chatgpt_auth_file:
         raise ValueError("Danso ChatGPT mode requires DANSO_CHATGPT_AUTH_FILE")
