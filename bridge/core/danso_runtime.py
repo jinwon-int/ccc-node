@@ -47,14 +47,19 @@ def _validate_zai_authentication(settings: Settings) -> None:
         raise ValueError("Danso zai mode requires ZAI_API_KEY")
 
 
+def _validate_api_key_authentication(settings: Settings) -> None:
+    """api-key lane credentials: an OpenAI key is required."""
+    if settings.danso_chatgpt_auth_file:
+        raise ValueError("DANSO_CHATGPT_AUTH_FILE requires CCC_DANSO_AUTH_MODE=chatgpt")
+    if not settings.openai_api_key or not settings.openai_api_key.strip():
+        raise ValueError("Danso API-key mode requires OPENAI_API_KEY")
+
+
 def _validate_authentication(settings: Settings, cwd: Path) -> None:
     if settings.danso_auth_mode not in {"api-key", "chatgpt", "zai"}:
         raise ValueError("unsupported Danso authentication mode")
     if settings.danso_auth_mode == "api-key":
-        if settings.danso_chatgpt_auth_file:
-            raise ValueError("DANSO_CHATGPT_AUTH_FILE requires CCC_DANSO_AUTH_MODE=chatgpt")
-        if not settings.openai_api_key or not settings.openai_api_key.strip():
-            raise ValueError("Danso API-key mode requires OPENAI_API_KEY")
+        _validate_api_key_authentication(settings)
         return
     if settings.danso_auth_mode == "zai":
         _validate_zai_authentication(settings)
