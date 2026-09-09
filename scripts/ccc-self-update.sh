@@ -595,6 +595,18 @@ fi
 
 OLD_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
 
+# Managed installations can require an explicitly reconciled generation.
+# Check BEFORE fetch/merge: a stale marker is evidence of drift, never authority
+# to reset a serving checkout to some historical commit. Missing markers also
+# fail closed in this opt-in mode, including --force.
+INSTALLED_SHA_FILE="$STATE_DIR/self-update.installed-sha"
+INSTALLED_SHA="$(tr -d '[:space:]' 2>/dev/null < "$INSTALLED_SHA_FILE" || :)"
+if [ "${CCC_SELF_UPDATE_REQUIRE_MARKER_MATCH:-0}" = "1" ] && [ "$INSTALLED_SHA" != "$OLD_SHA" ]; then
+  log "abort reason=installed-marker-mismatch installed=${INSTALLED_SHA:-missing} checkout=$OLD_SHA"
+  say "self-update: installed marker does not match checkout; reconcile deployment before retrying" >&2
+  exit 4
+fi
+
 # ccc-side-effect: self_update.apply
 # --- fetch + ff-only merge ----------------------------------------------------
 # fetch failure is the one precondition that DOES self-heal (transient network),
@@ -662,15 +674,15 @@ CHANGED=false
 # checkout by hand, HEAD already equals origin, so the pre-#1422 tick said
 # "up-to-date" forever while ~/.claude/hooks stayed at the older commit.
 # The marker records the last SHA setup.sh installed; a lagging marker turns
-# an "up-to-date" tick into a normal redeploy (OLD_SHA = installed SHA so the
-# notification and rollback describe the real transition). A missing marker
+# an "up-to-date" tick into a normal redeploy. OLD_SHA remains the actual
+# pre-run checkout: artifact rollback restores the actual pre-run snapshot,
+# not artifacts from the historical installed marker. A missing marker
 # (first tick after this change) adopts HEAD silently — doctor's per-file
 # drift rows still cover that one-off case — instead of a fleet-wide redeploy.
 INSTALLED_SHA_FILE="$STATE_DIR/self-update.installed-sha"
-INSTALLED_SHA="$(tr -d '[:space:]' < "$INSTALLED_SHA_FILE" 2>/dev/null || :)"
+INSTALLED_SHA="$(tr -d '[:space:]' 2>/dev/null < "$INSTALLED_SHA_FILE" || :)"
 if [ "$CHANGED" = "false" ] && [ -n "$INSTALLED_SHA" ] && [ "$INSTALLED_SHA" != "$NEW_SHA" ]; then
   log "install-drift installed=$INSTALLED_SHA checkout=$NEW_SHA reason=checkout-advanced-without-setup"
-  OLD_SHA="$INSTALLED_SHA"
   CHANGED=true
 elif [ "$CHANGED" = "false" ] && [ -z "$INSTALLED_SHA" ] && [ "$FORCE" != "1" ]; then
   # Only an ordinary no-change tick adopts HEAD. A forced first deployment

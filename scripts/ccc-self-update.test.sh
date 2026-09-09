@@ -905,6 +905,27 @@ git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm hand-pull && git -C "
 git -C "$REPO" pull -q --ff-only origin main
 # shellcheck disable=SC2034  # LAGGING is read via eval inside ok()
 LAGGING="$(cat "$STATE/self-update.installed-sha")"
+# Opt-in managed deployments refuse drift before fetch, setup or restart.
+# shellcheck disable=SC2034
+DRIFT_HEAD="$(git -C "$REPO" rev-parse HEAD)"
+: > "$TMP/systemctl.calls"
+out="$(CCC_SELF_UPDATE_REQUIRE_MARKER_MATCH=1 run_selfup run --force 2>&1)"; rc=$?
+ok "strict marker mismatch fails closed even with force" '[ "$rc" = 4 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$DRIFT_HEAD" ] && [ ! -f "$SETUP_MARKER" ] && [ ! -s "$TMP/systemctl.calls" ]'
+rm -f "$STATE/self-update.installed-sha"
+out="$(CCC_SELF_UPDATE_REQUIRE_MARKER_MATCH=1 run_selfup run 2>&1)"; rc=$?
+ok "strict missing marker is not silently adopted" '[ "$rc" = 4 ] && [ ! -e "$STATE/self-update.installed-sha" ]'
+printf '%s\n' "$LAGGING" > "$STATE/self-update.installed-sha"
+# Reproduce setup failure after an independently advanced checkout. The marker
+# must not become the source rollback target; preserve the real pre-run source
+# and actual pre-run installed artifact snapshot, even with a stale marker.
+printf '%s\n' 'pre-run artifact' > "$CLAUDE/CLAUDE.md"
+printf '%s\n' 'ccc-telegram-bridge.service' > "$CLAUDE/self-update.services"
+printf '%s\n' 'CLAUDE_PROCESS_TIMEOUT=3600' > "$REPO/bridge/.env"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "drift preflight failure keeps actual pre-run checkout" '[ "$rc" = 6 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$DRIFT_HEAD" ]'
+ok "drift failure restores actual artifacts and preserves stale marker" 'grep -qx "pre-run artifact" "$CLAUDE/CLAUDE.md" && [ "$(cat "$STATE/self-update.installed-sha")" = "$LAGGING" ] && [ ! -s "$TMP/systemctl.calls" ]'
+rm -f "$REPO/bridge/.env"
+printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "hand-pulled checkout exits 0" '[ "$rc" = 0 ]'
 ok "hand-pulled checkout re-runs setup" '[ -f "$SETUP_MARKER" ] && grep -q "$(git -C "$REPO" rev-parse --short HEAD)" "$SETUP_MARKER"'
