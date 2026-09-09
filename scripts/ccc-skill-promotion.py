@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import shlex
 import stat
@@ -1903,18 +1904,44 @@ def _dispatch_target_worker(config: Config, author_node: str, secret: str) -> tu
 
     #2024: the primary broker is searched first (unchanged behavior), then
     each configured remote broker in order. Returns (node, remote_broker)
-    where remote_broker is None for the primary."""
+    where remote_broker is None for the primary.
+
+    2026-09-09: the reviewer is drawn at random from the eligible set instead
+    of taking ``sorted(...)[0]``. Lexicographic-first selection pinned every
+    round on one node, so a single broken reviewer silently stalled the whole
+    intake pipeline: `bangtong` (alphabetically first among T1 online workers)
+    ran the handler's default `claude` agent, which its node routes to a kimi
+    gateway, and every verdict died as `unrecognized_model` while the other
+    keyring workers were never given a round. Random draw spreads the load and
+    keeps one bad node from being a single point of failure. Broker-side
+    author disqualification is unchanged, and the candidate set is still
+    sorted first so the draw is over a stable, deduplicated sequence."""
     keyring_workers = _keyring_worker_ids(config)
     primary = _broker_online_worker_ids(config, secret)
     candidates = sorted(w for w in keyring_workers if w != author_node and w in primary)
     if candidates:
-        return candidates[0], None
+        return _pick_reviewer(candidates), None
     for rb in config.remote_brokers:
         online = _remote_online_worker_ids(config, rb)
         candidates = sorted(w for w in keyring_workers if w != author_node and w in online)
         if candidates:
-            return candidates[0], rb
+            return _pick_reviewer(candidates), rb
     raise PromotionError("dispatch_no_reviewer_online")
+
+
+def _pick_reviewer(candidates: list[str]) -> str:
+    """Draw one reviewer uniformly at random from a sorted candidate list.
+
+    ``CCC_SKILL_PROMOTION_REVIEWER_PIN`` forces a specific node when it is in
+    the candidate set — an operator escape hatch for reproducing a dispatch or
+    for pinning a round to a known-good reviewer during an incident. It never
+    widens the set, so it cannot bypass author disqualification or the
+    online/keyring intersection above.
+    """
+    pin = os.environ.get("CCC_SKILL_PROMOTION_REVIEWER_PIN", "").strip()
+    if pin and pin in candidates:
+        return pin
+    return random.SystemRandom().choice(candidates)
 
 
 def _keyring_worker_ids(config: Config) -> list[str]:

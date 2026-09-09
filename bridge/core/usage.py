@@ -309,6 +309,25 @@ def local_piri_environment_snapshot() -> UsageSnapshot:
     return UsageSnapshot(provider="piri", service=service, plan_type=service)
 
 
+def detect_danso_service(value: object = None) -> str | None:
+    """Return the backing service for the Danso lane, or ``None`` if unset.
+
+    Mirrors :func:`detect_piri_service`: the operator names the backing
+    service via ``CCC_USAGE_DANSO_SERVICE`` (e.g. ``Z.AI``) so the existing
+    5-hour/weekly quota windows render for the Danso lane. Unset, unknown,
+    or malformed values return ``None`` so rendering stays byte-identical.
+    """
+    raw = value if value is not None else os.environ.get("CCC_USAGE_DANSO_SERVICE")
+    text = _text(raw, maximum=40)
+    if not text:
+        return None
+    folded = text.casefold()
+    for service in _SERVICE_WINDOW_SPECS:
+        if service.casefold() == folded:
+            return service
+    return None
+
+
 def synthesize_service_windows(
     service: str | None,
     rolling: Mapping[str, int] | None,

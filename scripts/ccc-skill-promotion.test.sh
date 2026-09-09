@@ -1173,6 +1173,24 @@ assert reviewer == "t2reviewer" and rb is not None and rb["name"] == "t2", (revi
 reviewer2, rb2 = m._dispatch_target_worker(config, "t2reviewer", "s3cret-value")
 assert reviewer2 == "authorx" and rb2 is None, (reviewer2, rb2)
 
+# 2026-09-09: the reviewer is drawn at random, not lexicographically first.
+# Lexicographic-first pinned every round on one node, so one broken reviewer
+# stalled the whole intake lane. A single candidate is still deterministic.
+pool = ["aaa-first", "mmm-middle", "zzz-last"]
+assert m._pick_reviewer(["only-one"]) == "only-one"
+drawn = {m._pick_reviewer(pool) for _ in range(200)}
+assert drawn == set(pool), drawn
+assert m._pick_reviewer(pool) in pool
+
+# The operator pin forces a candidate, but never widens the eligible set:
+# a pin outside the candidate list is ignored and the draw stays in-bounds.
+os.environ["CCC_SKILL_PROMOTION_REVIEWER_PIN"] = "zzz-last"
+assert all(m._pick_reviewer(pool) == "zzz-last" for _ in range(10))
+os.environ["CCC_SKILL_PROMOTION_REVIEWER_PIN"] = "not-a-candidate"
+assert {m._pick_reviewer(pool) for _ in range(200)} == set(pool)
+del os.environ["CCC_SKILL_PROMOTION_REVIEWER_PIN"]
+print("RB-RANDOM-OK")
+
 # Row routing: 't2' row polls over ssh, legacy/primary row polls over curl.
 task = m._broker_task_on(config, {"broker": "t2"}, "rv-x", "s3cret-value")
 assert task.get("status") == "running", task
@@ -1189,6 +1207,8 @@ env "${base_env[@]}" CCC_SKILL_PROMOTION_REMOTE_BROKERS="$RB_JSON" PATH="$BIN:$P
   python3 "$RB_FIXTURE" "$PROMOTER" > "$RB_STATE/out" 2>&1; rc=$?
 ok "remote broker parse, reviewer fallthrough, and task routing (#2024)" \
   '[ "$rc" = 0 ] && grep -q "RB-PARSE-OK" "$RB_STATE/out" && grep -q "RB-ROUTING-OK" "$RB_STATE/out"'
+ok "reviewer is drawn at random over the eligible set, with an operator pin" \
+  '[ "$rc" = 0 ] && grep -q "RB-RANDOM-OK" "$RB_STATE/out"'
 
 # The mirrored reviewer actually lands in the dispatch manifest (no local
 # dispatch here — the routing unit above covers broker selection).

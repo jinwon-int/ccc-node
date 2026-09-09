@@ -1512,3 +1512,115 @@ def test_danso_extraction_requires_memory_route_and_separates_backlog(configured
     assert disabled.distill_snapshot_worker is None
     assert disabled.distill_extraction_worker is None
     assert old.job_path(job.job_id).read_bytes() == before
+
+
+def test_zai_auth_mode_requires_key(configured, tmp_path):
+    settings = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-zai-missing",
+        environ={
+            "TELEGRAM_BOT_TOKEN": "123456:synthetic",
+            "ALLOWED_USER_IDS": "[7]",
+            "CCC_AGENT_PROVIDER": "danso",
+            "CCC_DANSO_CLI_PATH": configured.danso_cli_path,
+            "CCC_DANSO_WORKSPACE": configured.danso_workspace,
+            "CCC_DANSO_STATE_DIR": str(tmp_path / "private-zai-missing"),
+            "CCC_DANSO_AUTH_MODE": "zai",
+        },
+    )
+    ok, detail = probe_danso_readiness(settings)
+    assert not ok
+    assert "ZAI_API_KEY" in detail
+
+
+def test_zai_auth_mode_rejects_chatgpt_auth_file(configured, tmp_path):
+    settings = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-zai-conflict",
+        environ={
+            "TELEGRAM_BOT_TOKEN": "123456:synthetic",
+            "ALLOWED_USER_IDS": "[7]",
+            "CCC_AGENT_PROVIDER": "danso",
+            "CCC_DANSO_CLI_PATH": configured.danso_cli_path,
+            "CCC_DANSO_WORKSPACE": configured.danso_workspace,
+            "CCC_DANSO_STATE_DIR": str(tmp_path / "private-zai-conflict"),
+            "CCC_DANSO_AUTH_MODE": "zai",
+            "ZAI_API_KEY": "fixture-zai-key",
+            "DANSO_CHATGPT_AUTH_FILE": "/synthetic/danso-auth.json",
+        },
+    )
+    ok, detail = probe_danso_readiness(settings)
+    assert not ok
+    assert "chatgpt" in detail
+
+
+@pytest.mark.anyio
+async def test_zai_auth_mode_routes_glm_with_mode_default_model_and_env(configured, tmp_path):
+    settings = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-zai",
+        environ={
+            "TELEGRAM_BOT_TOKEN": "123456:synthetic",
+            "ALLOWED_USER_IDS": "[7]",
+            "CCC_AGENT_PROVIDER": "danso",
+            "CCC_DANSO_CLI_PATH": configured.danso_cli_path,
+            "CCC_DANSO_WORKSPACE": configured.danso_workspace,
+            "CCC_DANSO_STATE_DIR": str(tmp_path / "private-zai"),
+            "CCC_DANSO_AUTH_MODE": "zai",
+            "ZAI_API_KEY": "fixture-zai-key",
+            "DANSO_GLM_ENDPOINT": "coding",
+            "CCC_DANSO_TIMEOUT_SECONDS": "3",
+        },
+    )
+    assert settings.danso_max_turns == 64
+    assert settings.danso_max_output_tokens == 16384
+    runtime = build_danso_runtime(settings)
+    assert runtime.provider == "glm"
+    # Issue #70: the zai default model follows the auth mode.
+    assert runtime.model == "glm-5.3-flash"
+    assert runtime.root.name == "glm-journals"
+    assert runtime.environment.get("ZAI_API_KEY") == "fixture-zai-key"
+    assert runtime.environment.get("DANSO_GLM_ENDPOINT") == "coding"
+    session = await runtime.start_or_resume(
+        SessionRequest(working_directory=settings.danso_workspace))
+    events = [event async for event in session.send_turn("ok")]
+    assert events[-1].kind == "completion"
+    argv = json.loads((Path(settings.danso_workspace) / "argv.json").read_text())
+    assert argv[argv.index("--provider") + 1] == "glm"
+    assert argv[argv.index("--model") + 1] == "glm-5.3-flash"
+    assert argv[argv.index("--max-output-tokens") + 1] == "16384"
+    child_env = json.loads(
+        (Path(settings.danso_workspace) / "environment.json").read_text())
+    assert "ZAI_API_KEY" in child_env
+    assert "DANSO_GLM_ENDPOINT" in child_env
+    assert "OPENAI_API_KEY" not in child_env
+
+
+@pytest.mark.anyio
+async def test_zai_explicit_model_and_output_cap_reach_native_cli(configured, tmp_path):
+    settings = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-zai-explicit",
+        environ={
+            "TELEGRAM_BOT_TOKEN": "123456:synthetic",
+            "ALLOWED_USER_IDS": "[7]",
+            "CCC_AGENT_PROVIDER": "danso",
+            "CCC_DANSO_CLI_PATH": configured.danso_cli_path,
+            "CCC_DANSO_WORKSPACE": configured.danso_workspace,
+            "CCC_DANSO_STATE_DIR": str(tmp_path / "private-zai-explicit"),
+            "CCC_DANSO_AUTH_MODE": "zai",
+            "ZAI_API_KEY": "fixture-zai-key",
+            "CCC_DANSO_MODEL": "glm-5.3",
+            "CCC_DANSO_MAX_OUTPUT_TOKENS": "8192",
+            "CCC_DANSO_TIMEOUT_SECONDS": "3",
+        },
+    )
+    runtime = build_danso_runtime(settings)
+    assert runtime.model == "glm-5.3", "an explicit CCC_DANSO_MODEL wins"
+    session = await runtime.start_or_resume(
+        SessionRequest(working_directory=settings.danso_workspace))
+    events = [event async for event in session.send_turn("ok")]
+    assert events[-1].kind == "completion"
+    argv = json.loads((Path(settings.danso_workspace) / "argv.json").read_text())
+    assert argv[argv.index("--model") + 1] == "glm-5.3"
+    assert argv[argv.index("--max-output-tokens") + 1] == "8192"
