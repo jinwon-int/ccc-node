@@ -65,6 +65,23 @@ policy. Per-file doctor checks remain necessary for that case. Forced first
 deployments commit only after setup and preflight. Degraded rollback
 continues to require inspection of its audit and retained recovery snapshot.
 
+### Reconciled-generation gate (opt-in)
+
+`CCC_SELF_UPDATE_REQUIRE_MARKER_MATCH=1` refuses a missing or mismatched
+installed-SHA marker with exit 4 before the normal fetch/merge, even with
+`run --force`. Default behavior is unchanged. This check follows the existing
+idle gate and branch recovery; it is not a read-only inspection guarantee.
+Reconcile source and installed artifacts using a verified deployment before
+retrying; merely rewriting the marker does not reconcile an installation.
+This option does not authorize root execution, bypass ownership guards, or
+provide an atomic request-drain/restart handoff.
+
+Rollback always restores the **actual pre-run checkout SHA** and the actual
+pre-run managed artifact snapshot. A lagging marker triggers redeployment
+under the default policy, but must never select a historical source rollback
+target. Source and artifact generations may already differ before the run;
+restoring that snapshot does not assert they match or restore a bridge venv.
+
 `ccc-self-update.sh status` is the read-only inspection mode.
 
 ## Why this preserves "separation of approval from execution"
