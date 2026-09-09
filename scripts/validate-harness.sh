@@ -491,6 +491,12 @@ else
   err "doctor self-update stall verdict tests failed"
   tail -10 "$TMP/doctor-selfupdate-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_promotion_backlog_test.py >"$TMP/doctor-promotion-backlog-test.out" 2>&1; then
+  say "  ok doctor skill-promotion backlog verdict tests"
+else
+  err "doctor skill-promotion backlog verdict tests failed"
+  tail -10 "$TMP/doctor-promotion-backlog-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_marker_registry_test.py >"$TMP/doctor-marker-registry-test.out" 2>&1; then
   say "  ok doctor cron marker registry covers every install-*-cron.sh"
 else
