@@ -241,7 +241,16 @@ class Config(
             "The provider/context HOME remains the private Danso state HOME."
         ),
     )
-    danso_auth_mode: Literal["api-key", "chatgpt"] = Field(default="api-key", alias="CCC_DANSO_AUTH_MODE")
+    danso_auth_mode: Literal["api-key", "chatgpt", "zai"] = Field(default="api-key", alias="CCC_DANSO_AUTH_MODE")
+    zai_api_key: Optional[str] = Field(
+        repr=False, default=None,
+        description="Z.AI API key for the Danso GLM provider (zai auth mode)")
+    danso_glm_base_url: Optional[str] = Field(
+        default=None, alias="DANSO_GLM_BASE_URL",
+        description="Explicit GLM API base; wins over DANSO_GLM_ENDPOINT but must not contradict it")
+    danso_glm_endpoint: Optional[Literal["general", "coding"]] = Field(
+        default=None, alias="DANSO_GLM_ENDPOINT",
+        description="GLM endpoint preset: general | coding (default general)")
     danso_chatgpt_auth_file: Optional[str] = Field(default=None, alias="DANSO_CHATGPT_AUTH_FILE")
     danso_chatgpt_base_url: Optional[str] = Field(default=None, alias="DANSO_CHATGPT_BASE_URL")
     danso_state_dir: Optional[str] = Field(default=None, alias="CCC_DANSO_STATE_DIR")
@@ -253,7 +262,9 @@ class Config(
     danso_timeout_seconds: int = Field(default=300, ge=1, le=3600, alias="CCC_DANSO_TIMEOUT_SECONDS")
     danso_provider_timeout_seconds: int = Field(default=180, ge=1, le=300,
                                               alias="CCC_DANSO_PROVIDER_TIMEOUT_SECONDS")
-    danso_max_turns: int = Field(default=32, ge=1, le=128, alias="CCC_DANSO_MAX_TURNS")
+    danso_max_turns: int = Field(default=64, ge=1, le=128, alias="CCC_DANSO_MAX_TURNS")
+    danso_max_output_tokens: int = Field(default=16384, ge=256, le=131072,
+                                         alias="CCC_DANSO_MAX_OUTPUT_TOKENS")
     danso_compact_at_bytes: int = Field(default=DEFAULT_DANSO_COMPACT_AT_BYTES, ge=8192, le=393216,
                                        alias="CCC_DANSO_COMPACT_AT_BYTES")
     # Long-task mode is deliberately a separate opt-in profile.  The ordinary
