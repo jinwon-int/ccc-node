@@ -113,6 +113,14 @@ ok "empty agent output is a handler failure" '[ "$rc" != 0 ]'
 make_task "$HEAD_OK"
 REVIEW_STUB_MODE=prose run_handler "$TMP/task.json" >/dev/null 2>&1; rc=$?
 ok "prose-only output (no verdict JSON) is a handler failure" '[ "$rc" != 0 ]'
+# #1619: an unparseable verdict must be diagnosable after the fact — the temp
+# dir holding the model output is gone by the time anyone reads the broker
+# error, so the excerpt has to travel with the failure (sogyo pr140).
+REVIEW_STUB_MODE=prose run_handler "$TMP/task.json" 2> "$TMP/prose.err" >/dev/null
+ok "unparseable verdict reports size, object count and an excerpt (#1619)" \
+  'grep -q "json_objects_found=0" "$TMP/prose.err" &&
+   grep -q "bytes=" "$TMP/prose.err" &&
+   grep -q "HANDLER_FAIL_HEAD: This candidate looks generally fine to me." "$TMP/prose.err"'
 
 # ─── dispatcher routing ──────────────────────────────────────────────────────
 printf '#!/usr/bin/env bash\necho REVIEW-HANDLER-CALLED\n' > "$BIN/review-stub"

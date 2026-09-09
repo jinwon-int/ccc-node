@@ -216,7 +216,23 @@ for cand in reversed(candidates):
         verdict_obj = obj
         break
 if verdict_obj is None:
-    print("HANDLER_FAIL: no parseable verdict JSON in model output", file=sys.stderr)
+    # Diagnostic parity with the agent-crash branch, which already logs 300
+    # chars of each stream. Without an excerpt this failure is a dead end: the
+    # broker records only "no parseable verdict JSON" and the model output is
+    # discarded with the temp dir, so nobody can tell a prose wrapper from a
+    # refusal, a truncation or a quota notice (sogyo/xai-grok-4.6, pr140,
+    # 2026-09-10 — undiagnosable after the fact). Report what we saw and how
+    # far the scan got, redaction-safe: head+tail only, no full transcript.
+    excerpt_head = " ".join(raw[:240].split())
+    excerpt_tail = " ".join(raw[-240:].split()) if len(raw) > 240 else ""
+    print(
+        "HANDLER_FAIL: no parseable verdict JSON in model output "
+        f"(bytes={len(raw)}, json_objects_found={len(candidates)})",
+        file=sys.stderr,
+    )
+    print(f"HANDLER_FAIL_HEAD: {excerpt_head}", file=sys.stderr)
+    if excerpt_tail:
+        print(f"HANDLER_FAIL_TAIL: {excerpt_tail}", file=sys.stderr)
     sys.exit(3)
 
 verdict = str(verdict_obj.get("verdict", "")).lower()
