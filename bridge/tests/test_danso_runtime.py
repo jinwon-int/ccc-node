@@ -587,7 +587,8 @@ def test_task_progress_is_strict_bounded_and_body_free():
 
 
 @pytest.mark.anyio
-async def test_transport_record_on_success_is_adapter_failure(configured):
+@pytest.mark.parametrize("prefix", ["DANSO_TRANSPORT=", "DANSO_PROVIDER="])
+async def test_transport_record_on_success_is_adapter_failure(configured, prefix):
     binary = Path(configured.danso_cli_path)
     binary.write_text("""#!/usr/bin/python3
 import json, sys
@@ -598,7 +599,7 @@ for prefix in ('DANSO_USAGE', 'PIRI_USAGE'):
     print(prefix + '=' + json.dumps(usage), file=sys.stderr)
 print('DANSO_TRANSPORT=' + json.dumps({'version': 1, 'phase': 'connect',
       'elapsed_ms': 1, 'request_bytes': 1}), file=sys.stderr)
-""")
+""".replace('DANSO_TRANSPORT=', prefix))
     binary.chmod(0o700)
     runtime = build_danso_runtime(configured)
     session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
