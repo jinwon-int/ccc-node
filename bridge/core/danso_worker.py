@@ -26,7 +26,7 @@ TASK_PROGRESS_CAP = 4096
 TASK_PROGRESS_LINE_CAP = 64 * 1024
 TASK_RESUME_CONTROL = "__CCC_DANSO_TASK_RESUME_V1__"
 PROVIDERS = {
-    'glm': ('ZAI_API_KEY', 'DANSO_GLM_BASE_URL'),
+    'glm': ('ZAI_API_KEY', 'DANSO_GLM_BASE_URL', 'DANSO_GLM_ENDPOINT'),
     'openai': ('OPENAI_API_KEY', 'DANSO_OPENAI_BASE_URL'),
     'openai-codex': ('DANSO_CHATGPT_AUTH_FILE', 'DANSO_CHATGPT_BASE_URL'),
     'anthropic': ('ANTHROPIC_API_KEY', 'DANSO_ANTHROPIC_BASE_URL'),
@@ -350,6 +350,7 @@ class DansoRuntime:
     """One configured model; explicit credentials and private journal directory."""
     def __init__(self, *, binary, state_directory, provider, model, environment,  # noqa: C901 -- bounded worker configuration validation
                  timeout_seconds=300, provider_timeout_seconds=180, max_turns=16,
+                 max_output_tokens=16384,
                  compact_at_bytes=None, sandbox="host", system_context_loader=None,
                  outer_timeout_seconds=None,
                  tool_home=None,
@@ -367,6 +368,7 @@ class DansoRuntime:
             raise ValueError('invalid outer timeout')
         timeout_maximum = 21600 if long_task else 3600
         for value, maximum in ((timeout_seconds, timeout_maximum), (provider_timeout_seconds, 300), (max_turns, 128),
+                               (max_output_tokens, 131072),
                                (task_stage_requests, 1024), (task_max_requests, 2048),
                                (task_max_tokens, 25_000_000), (task_repeat_limit, 8)):
             if type(value) is not int or not 1 <= value <= maximum:
@@ -412,6 +414,7 @@ class DansoRuntime:
         if not self.environment.get('HOME') or not self.environment.get(PROVIDERS[provider][0]):
             raise ValueError('explicit HOME and provider credential required')
         self.timeout, self.provider_timeout, self.max_turns = timeout_seconds, provider_timeout_seconds, max_turns
+        self.max_output_tokens = max_output_tokens
         self.outer_timeout = outer_timeout_seconds
         self.long_task = long_task
         self.task_stage_requests = task_stage_requests
@@ -635,6 +638,7 @@ class DansoSession:
                 resume_stage = status.stage
             command = [r.binary, '--sandbox', r.sandbox, '--cwd', str(self.cwd), '--session', str(r.root / (self.session_id + '.jsonl')),
                        '--provider', r.provider, '--model', r.model, '--max-turns', str(r.max_turns),
+                       '--max-output-tokens', str(r.max_output_tokens),
                        '--provider-timeout-seconds', str(r.provider_timeout), '-p']
             if r.tool_home is not None:
                 command += ['--tool-home', r.tool_home]
