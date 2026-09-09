@@ -293,7 +293,11 @@ ok "installer Termux profile ships the revise handler (#1460)" '[ "$rc" = 0 ] &&
 # publisher scaffolding, so a reviewer cannot read the trailing procedure /
 # verdict schema / bindings / machine-gate block as material the author
 # appended to their own skill (2026-09-10 false-positive reject).
-printf '#!/usr/bin/env bash\ncat > "$PROMPT_CAPTURE"\nprintf %s "{\\"verdict\\":\\"approve\\",\\"findings\\":[],\\"head_sha\\":\\"$REVIEW_STUB_HEAD\\",\\"rubric_version\\":\\"2026-08-28.2\\",\\"model\\":\\"stub-model\\"}"\n' > "$BIN/capture-agent"
+cat > "$BIN/capture-agent" <<'CAPSTUB'
+#!/usr/bin/env bash
+cat > "$PROMPT_CAPTURE"
+printf '{"verdict":"approve","findings":[],"head_sha":"%s","rubric_version":"2026-08-28.2","model":"stub-model"}' "$REVIEW_STUB_HEAD"
+CAPSTUB
 chmod +x "$BIN/capture-agent"
 CAPTURED="$TMP/captured-prompt.txt"
 TREE_SHA="c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2"
