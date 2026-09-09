@@ -100,7 +100,9 @@ FAILURE_CATEGORIES = {
     'compaction', 'request_budget', 'output', 'runtime', 'run_timeout', 'interrupted',
 }
 TRANSPORT_PHASES = {'connect', 'before_response_headers', 'response_body'}
-TRANSPORT_KEYS = {'version', 'phase', 'elapsed_ms', 'request_bytes'}
+# danso (#67 B) reports the bounded wire-retry attempt count: 1 on the first
+# try, more when bounded retries ran.
+TRANSPORT_KEYS = {'version', 'phase', 'elapsed_ms', 'request_bytes', 'attempts'}
 PROVIDER_REASONS = {
     'http_status', 'invalid_json', 'response_too_large', 'stream_ended',
     'invalid_stream', 'unsupported_stream_event', 'response_failed',
@@ -259,9 +261,12 @@ def _transport(text, category, code):
                 or type(diagnostic['elapsed_ms']) is not int
                 or not 0 <= diagnostic['elapsed_ms'] <= 2**64 - 1
                 or type(diagnostic['request_bytes']) is not int
-                or not 0 <= diagnostic['request_bytes'] <= 512 * 1024):
+                or not 0 <= diagnostic['request_bytes'] <= 512 * 1024
+                or type(diagnostic['attempts']) is not int
+                or not 1 <= diagnostic['attempts'] <= 2**64 - 1):
             raise ValueError('invalid transport diagnostic')
-        return (diagnostic['phase'], diagnostic['elapsed_ms'], diagnostic['request_bytes'])
+        return (diagnostic['phase'], diagnostic['elapsed_ms'], diagnostic['request_bytes'],
+                diagnostic['attempts'])
     except (ValueError, TypeError, RecursionError):
         return None
 
@@ -372,7 +377,8 @@ def _failure(stderr, code):
         pass
     transport = _transport(text, category, code)
     transport_detail = '' if transport is None else (
-        f', phase={transport[0]}, elapsed_ms={transport[1]}, request_bytes={transport[2]}')
+        f', phase={transport[0]}, elapsed_ms={transport[1]}, request_bytes={transport[2]}, '
+        f'attempts={transport[3]}')
     provider_detail = _provider_detail(text, category, code)
     label = 'timeout' if category == 'run_timeout' else category
     return ErrorEvent(code='danso_' + label, message=(
