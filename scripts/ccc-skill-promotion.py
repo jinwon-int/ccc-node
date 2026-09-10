@@ -2390,6 +2390,35 @@ def _task_result_output(task: dict[str, object]) -> dict[str, object] | None:
     return None
 
 
+def _malformed_verdict_reason(task: dict[str, object], expected_head: str) -> str:
+    """Why `_verdict_from_task` rejected this result (#1629).
+
+    `_verdict_from_task` collapses five distinct handler failures into one
+    `None`, so the ledger recorded `status: malformed` with nothing to act on
+    and the intake PR stayed silent — observed as five verdicts lost with no
+    trace. This names the failure without changing the gate: the caller still
+    withholds the verdict either way.
+
+    Returns a short stable code, never reviewer content — the result body may
+    carry arbitrary text and this string is written to a public PR comment.
+    """
+    output = _task_result_output(task)
+    if output is None:
+        return "no_result_output"
+    verdict = output.get("verdict")
+    if verdict not in {"approve", "revise", "reject"}:
+        return "verdict_value_invalid"
+    if not isinstance(output.get("findings"), list):
+        return "findings_not_a_list"
+    head_sha = output.get("head_sha")
+    if not isinstance(head_sha, str):
+        return "head_sha_missing"
+    if head_sha != expected_head:
+        # Bound to a different commit — the reviewer read a superseded tree.
+        return "head_sha_mismatch"
+    return "unknown"
+
+
 def _verdict_from_task(
     task: dict[str, object], expected_head: str
 ) -> tuple[str, list[dict[str, str]]] | None:
@@ -3302,6 +3331,10 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
         head = row.get("head_sha") if isinstance(row.get("head_sha"), str) else ""
         verdict_data = _verdict_from_task(task, head)
         if verdict_data is None:
+            # A malformed result is a handler failure, never a verdict — but it
+            # used to be recorded with no reason and no PR trace, so the intake
+            # PR sat with no verdict and nobody knew why (#1629).
+            reason = _malformed_verdict_reason(task, head)
             _append_ledger(
                 config,
                 {
@@ -3309,11 +3342,27 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
                     "kind": "a2a-verdict",
                     "task_id": dispatched,
                     "status": "malformed",
+                    "reason": reason,
                     "task_status": str(task.get("status", "")),
                     **({"broker_corrected": routing} if routing.startswith("corrected:") else {}),
                 },
             )
-            processed.append({"outcome": "verdict-malformed", "task_id": dispatched})
+            _comment_once(
+                config,
+                rows,
+                pr=_pr_number_from_url(str(row.get("pr_url", ""))) or "",
+                head=head,
+                marker=f"verdict-malformed:{dispatched}",
+                body=(
+                    f"Collect verdict gate: task `{dispatched}` returned a result that is not a "
+                    f"well-formed verdict bound to this head (`{reason}`). The verdict is "
+                    "withheld — this PR has no review outcome until a fresh review is "
+                    "dispatched. An operator should inspect the broker result for this task."
+                ),
+            )
+            processed.append(
+                {"outcome": "verdict-malformed", "task_id": dispatched, "reason": reason}
+            )
             continue
         verdict, findings = verdict_data
         _append_ledger(
