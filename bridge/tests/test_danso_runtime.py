@@ -528,7 +528,7 @@ def test_transport_metadata_is_strict_optional_and_body_free():
 
     record = json.dumps({
         "version": 1, "phase": "response_body", "elapsed_ms": 180001,
-        "request_bytes": 30502,
+        "request_bytes": 30502, "attempts": 2,
     }, separators=(",", ":"))
     stderr = (
         'DANSO_ERROR={"version":1,"category":"provider_timeout","exit_code":3}\n'
@@ -536,7 +536,8 @@ def test_transport_metadata_is_strict_optional_and_body_free():
     ).encode()
     event = _failure(stderr, 3)
     assert event.code == "danso_provider_timeout"
-    assert "phase=response_body, elapsed_ms=180001, request_bytes=30502" in event.message
+    assert ("phase=response_body, elapsed_ms=180001, request_bytes=30502, "
+            "attempts=2" in event.message)
     assert _transport(stderr.decode(), "provider_timeout", 2) is None
 
     base = 'DANSO_ERROR={"version":1,"category":"provider","exit_code":3}\n'
@@ -547,6 +548,11 @@ def test_transport_metadata_is_strict_optional_and_body_free():
         '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":524289}',
         '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"request_bytes":2}',
         '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1',
+        # The wire-retry attempt count is 1-based; zero and non-int refuse.
+        '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"attempts":0}',
+        '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"attempts":true}',
+        # A pre-attempts record (4 keys) is a stale schema: ignored, not fatal.
+        '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1}',
     ]
     for item in records:
         event = _failure((base + "DANSO_TRANSPORT=" + item + "\nPRIVATE_URL").encode(), 3)
@@ -598,7 +604,7 @@ usage = {'requests': 1, 'inputTokens': 1, 'outputTokens': 0,
 for prefix in ('DANSO_USAGE', 'PIRI_USAGE'):
     print(prefix + '=' + json.dumps(usage), file=sys.stderr)
 print('DANSO_TRANSPORT=' + json.dumps({'version': 1, 'phase': 'connect',
-      'elapsed_ms': 1, 'request_bytes': 1}), file=sys.stderr)
+      'elapsed_ms': 1, 'request_bytes': 1, 'attempts': 1}), file=sys.stderr)
 """.replace('DANSO_TRANSPORT=', prefix))
     binary.chmod(0o700)
     runtime = build_danso_runtime(configured)
