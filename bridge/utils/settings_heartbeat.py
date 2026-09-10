@@ -86,15 +86,13 @@ class HeartbeatSettingsMixin:
         default=300.0,
         alias="CCC_HEARTBEAT_STALL_SECONDS",
         description=(
-            "Delete the transient heartbeat message when no SDK event has arrived "
-            "for this many seconds. A request that stalls (e.g. a bridge restart "
-            "left it in flight, or the SDK stream hangs) never reaches the "
-            "terminal ResultMessage that normally removes the heartbeat, so the "
-            "growing '⏳ Working — Nm' line would otherwise linger as the last "
-            "chat message. It reappears automatically if SDK activity resumes. "
-            "Set 0 to disable. NOTE: a legitimately long single tool call emits "
-            "no intermediate SDK events while it runs, so if it exceeds this its "
-            "heartbeat is removed too — raise this when you run such tools."
+            "Show 'Waiting for progress' when no runtime event has arrived for "
+            "this many seconds. Keep updating elapsed time and the age of the "
+            "last report; suppress the ETA until events resume. Long tasks and "
+            "single tool calls can legitimately be silent, so inactivity does "
+            "not delete their heartbeat or terminate work. Terminal cleanup and "
+            "startup reconciliation still handle completed/interrupted requests. "
+            "Set 0 to disable the waiting indicator, not the heartbeat."
         ),
     )
     health_alerts_enabled: bool = Field(

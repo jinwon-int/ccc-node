@@ -173,6 +173,16 @@ bridge is a separate operational step; source development does not switch a node
   enabled, ordinary turns may also emit body-free tool-start/settlement notices
   from native `--progress-jsonl` (tool name only). The finite subprocess deadline
   replaces the first-event admission timeout for this provider.
+- Active requests keep their status message even when a long tool or a native
+  task stage produces no events. After `CCC_HEARTBEAT_STALL_SECONDS` (default
+  300), it shows `Waiting for progress`, total elapsed time, the age of the last
+  report, and the last known work label. This indicates missing progress
+  reports, not proof that the worker stopped. ETA is hidden until new events
+  arrive; the normal ETA is a historical estimate, not a completion percentage.
+  The status continues updating at the configured heartbeat interval (15s by
+  default). Setting the silence threshold to 0 disables the waiting indicator.
+  Completion, failure, cancellation, and startup reconciliation still own status
+  cleanup. This shared heartbeat behavior also applies to other providers.
 - `/model` shows the configured model. Arbitrary model changes are rejected.
   `/effort` selects a supported effort; `default` restores `CCC_DANSO_EFFORT`.
 - The conversation UUID is durably saved before the subprocess can execute;
