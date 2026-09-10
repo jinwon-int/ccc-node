@@ -19,6 +19,19 @@ dispatches. Downstream work belongs to `nclex-a2a-content-pipeline`.
 - A clone of the content repo; run commands from its root (`REPO="$PWD"`).
 - Toolchain matching CI: **Node 20**, **Python 3.12**. Record local versions —
   a version gap is a legitimate explanation for a local-only failure.
+
+  These two numbers are pinned from the content repo's gate workflow, which
+  lives in a different repository and moves without this file. Read them from
+  the workflow instead of trusting the line above, and record what you found
+  alongside the local versions:
+
+  ```bash
+  grep -n -A2 'setup-node\|setup-python' .github/workflows/gate.yml
+  node --version; python3 --version
+  ```
+
+  If the workflow disagrees with this file, the workflow wins — the point of
+  the check is to reproduce CI, not this document.
 - Network access: one gate step fetches quorum head SHAs from origin.
 
 ## Procedure
@@ -31,12 +44,19 @@ Never validate a PR by checking it out in the working tree.
 REPO="$PWD"
 WT="${TMPDIR:-/tmp}/nclex-preflight"
 mkdir -p "$WT"
+git fetch origin main            # baseline must be current
 for PR in <PR#> <PR#> …; do
   SHA="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"
+  git fetch --no-tags origin "$SHA"   # the head object is not local yet
   git worktree add --detach "$WT/pr-$PR" "$SHA"
 done
-git fetch origin main            # baseline must be current
 ```
+
+`gh pr view` returns the SHA from the API, not the object. Without the fetch,
+`git worktree add` fails with `fatal: invalid reference: <sha>` on any clone
+that does not already contain that commit — which is every shallow clone and
+every clone made after the PR was pushed. Reproduced 2026-09-10 on a fresh
+`--depth 1` clone: the add fails before the fetch and succeeds after it.
 
 Record for each PR: `headRefOid`, `baseRefName`, `mergeable`,
 `mergeStateStatus` (`gh pr view <PR#> --json number,title,headRefOid,baseRefName,mergeable,mergeStateStatus`).
