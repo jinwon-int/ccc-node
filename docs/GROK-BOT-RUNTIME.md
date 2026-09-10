@@ -1,10 +1,11 @@
 # Experimental fixed-conversation Grok runtime (#1632)
 
 `GrokRuntime` now implements the provider-neutral session/event seam against
-the [qualified transport](GROK-BOT-TRANSPORT.md). This is an isolated component;
-`CCC_AGENT_PROVIDER=grok` is **not yet registered or enabled**. Do not claim
-Telegram delivery, production rollout, approval integration or issue completion
-from the component tests.
+the [qualified transport](GROK-BOT-TRANSPORT.md). The opt-in
+[`CCC_AGENT_PROVIDER=grok` frontend](GROK-BOT-PROVIDER.md) now composes this runtime
+with explicit owner-DM admission. Registration is not operational activation:
+component/synthetic tests do not establish real Telegram delivery, rollout,
+approval integration or issue completion.
 
 ## Explicit identity and initialization
 
@@ -24,8 +25,8 @@ because the Bot's model is managed externally.
 The caller must enforce the actual authenticated owner/audience mapping and
 one configured journal for this Bot. Journal locking does not coordinate
 independently configured roots, other computers or another Grok app client.
-These constraints must be enforced in the future provider factories, not
-represented as optional UI advice.
+The restricted provider factory enforces its configured owner/Telegram Bot
+binding; it does not turn local journal locks into distributed host ownership.
 
 ## State and transitions
 
@@ -124,8 +125,8 @@ new send calls for those operations. This is hermetic host data, not a live
 Telegram crash test. Earlier live transport evidence and any live runtime probe
 are retained separately with exact source hashes and scope.
 
-Next, register the provider only when config, readiness, capability matrix,
-factories, fixed-owner routing, session reset/resume and rollout/rollback all
-agree. The current generic fallback to other-provider readiness must never
-handle a Grok configuration. An isolated allowlisted Telegram DM, with a
-dedicated token and one poller, remains required before closing #1632.
+The restricted provider registration, authenticated readiness and fixed-owner
+frontend are documented in GROK-BOT-PROVIDER.md. Generic session/reset/project
+construction and generic readiness reject Grok rather than routing to another
+provider. An isolated allowlisted real Telegram DM, with a dedicated token and
+one verified poller, remains required before closing #1632.

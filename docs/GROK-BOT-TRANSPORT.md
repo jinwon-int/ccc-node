@@ -74,6 +74,11 @@ policy or a claim that arbitrary production prompts are safe to run.
 
 ## Required before provider activation
 
+The journal/runtime and restricted frontend now implement the local boundaries
+below; see [GROK-BOT-RUNTIME.md](GROK-BOT-RUNTIME.md) and
+[GROK-BOT-PROVIDER.md](GROK-BOT-PROVIDER.md). Their hermetic qualification does
+not replace the final real-DM/single-poller acceptance.
+
 - A private, bounded, process-serialized journal that writes before sending,
   preserves immutable nonce/prompt/baseline, commits bound results before
   release, and reconciles crash/lost-response outcomes without fresh-nonce
