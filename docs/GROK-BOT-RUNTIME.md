@@ -55,6 +55,12 @@ is checked to detect name replacement. New revision content and directory
 publication are fsynced before the caller proceeds. Partial pending files are
 retained and deny subsequent opening.
 
+Atomic publication uses Linux libc `renameat2(RENAME_NOREPLACE)` through
+Python's standard `ctypes` module. A concurrently inserted revision is retained
+and the operation fails; there is no overwriting rename or link/unlink fallback.
+Missing libc/kernel support fails closed and can leave retained pending state.
+This local journal is Linux-specific; no new Python package is required.
+
 The limit is 97 revisions (initial + 32 three-stage operations), 256 KiB per
 revision, approximately 24.25 MiB maximum record payload. The runtime reserves
 three revision slots before a new attempt. It does not silently increase these

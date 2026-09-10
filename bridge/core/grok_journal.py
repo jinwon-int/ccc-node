@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import ctypes
 from dataclasses import asdict, dataclass
 import fcntl
 import hashlib
@@ -21,6 +22,22 @@ from telegram_bot.utils.secure_fs import _validate_storage_directory
 
 MAX_REVISIONS = 97  # initial binding + 32 attempted/accepted/complete operations
 MAX_RECORD = 256 * 1024
+
+
+def _install_noreplace(directory: int, source: str, target: str) -> None:
+    """Linux atomic no-replace publication; unsupported platforms fail closed.
+
+    A pre-rename exists check cannot retain a concurrently inserted revision.
+    link/unlink would expose a two-link intermediate state, violating the
+    single-link journal contract. Never fall back to overwriting rename.
+    """
+    function = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if function is None:
+        raise ProtocolError("grok_noreplace_unavailable")
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(directory, source.encode("ascii"), directory, target.encode("ascii"), 1) != 0:
+        raise OSError(ctypes.get_errno(), "grok_revision_install_failed")
 
 
 def canonical(value: Any) -> bytes:
@@ -301,8 +318,7 @@ class GrokClaim:
                 out.flush()
                 os.fsync(fd)
             self._check()
-            os.rename(temporary, f"{revision:04d}.json", src_dir_fd=self.directory,
-                      dst_dir_fd=self.directory)
+            _install_noreplace(self.directory, temporary, f"{revision:04d}.json")
             os.fsync(self.directory)
         finally:
             os.close(fd)  # incomplete pending files retained; next open denies

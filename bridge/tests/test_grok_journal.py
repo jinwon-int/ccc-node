@@ -185,6 +185,32 @@ with j.claim() as c:
             self.assertEqual(claim.load()[1], 1)
         self.assertEqual(len(list(saved.iterdir())), 3)
 
+    def test_atomic_revision_collision_retains_both_files(self):
+        real_fsync = os.fsync
+        inserted = False
+        collision = self.root / "0001.json"
+        def at_fsync(fd):
+            nonlocal inserted
+            if not inserted:
+                inserted = True
+                collision.write_bytes(b"generated concurrent writer; must retain")
+                collision.chmod(0o600)
+            real_fsync(fd)
+        with self.journal.claim() as claim, patch("telegram_bot.core.grok_journal.os.fsync", side_effect=at_fsync):
+            with self.assertRaises(FileExistsError):
+                claim.attempt("one", Baseline(None, ()))
+        self.assertEqual(collision.read_bytes(), b"generated concurrent writer; must retain")
+        self.assertEqual(len(list(self.root.glob("pending-*"))), 1)
+        with self.assertRaises(ProtocolError), self.journal.claim() as claim:
+            claim.load()
+
+    def test_no_overwrite_fallback_when_noreplace_unavailable(self):
+        with self.journal.claim() as claim, patch("telegram_bot.core.grok_journal._install_noreplace", side_effect=OSError("unavailable")):
+            with self.assertRaises(OSError):
+                claim.attempt("one", Baseline(None, ()))
+        self.assertFalse((self.root / "0001.json").exists())
+        self.assertEqual(len(list(self.root.glob("pending-*"))), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
