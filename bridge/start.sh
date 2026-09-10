@@ -497,6 +497,8 @@ configured_agent_provider() {
         echo "codex"
     elif [ "${provider,,}" = "danso" ]; then
         echo "danso"
+    elif [ "${provider,,}" = "grok" ]; then
+        echo "grok"
     else
         echo "claude"
     fi
@@ -507,6 +509,8 @@ configured_agent_label() {
         echo "Codex"
     elif [ "$(configured_agent_provider)" = "danso" ]; then
         echo "Danso"
+    elif [ "$(configured_agent_provider)" = "grok" ]; then
+        echo "Grok (restricted frontend; generic health unsupported)"
     else
         echo "Claude"
     fi

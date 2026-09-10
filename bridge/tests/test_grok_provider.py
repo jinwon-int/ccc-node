@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -38,6 +39,17 @@ def update(number, text="generated input", *, user=42, chat=42, kind="private", 
     message = Message(number, datetime.now(timezone.utc), Chat(chat, kind),
                       from_user=User(user, "synthetic", False), text=text, **kwargs)
     return Update(number, message=message)
+
+
+def terminate_on_send(host):
+    original = host.call
+    async def delayed(operation, arguments=None):
+        result = await original(operation, arguments)
+        if operation == "send":
+            asyncio.get_running_loop().call_soon(os.kill, os.getpid(), signal.SIGTERM)
+            await asyncio.Future()
+        return result
+    return delayed
 
 
 class GrokCompositionTests(unittest.TestCase):
@@ -115,11 +127,13 @@ class GrokCompositionTests(unittest.TestCase):
         self.assertNotIn("PRIVATE", rendered)
         self.assertNotIn("TOKEN", rendered)
 
-    def test_real_telegram_polling_dispatch_with_generated_api(self):
+    def polling_fixture(self, *, terminate=False):
         settings = configuration(self.root)
         route = configured_route(settings)
         route.journal.create()
         host = FakeGrokHost(route.journal.binding)
+        if terminate:
+            host.call = terminate_on_send(host)
         runtime = GrokRuntime(route.journal, host)
         sent, rpc, delivered = [], [], False
         bot = None
@@ -130,7 +144,7 @@ class GrokCompositionTests(unittest.TestCase):
                 return 1
 
             async def initialize(self):
-                pass
+                asyncio.get_running_loop().call_later(8, bot.request_shutdown)
 
             async def shutdown(self):
                 pass
@@ -155,7 +169,7 @@ class GrokCompositionTests(unittest.TestCase):
                 elif name == "sendMessage":
                     sent.append(request_data.parameters)
                     value = json.loads(update(2, "generated reply").message.to_json())
-                    bot.application.stop_running()
+                    asyncio.get_running_loop().call_soon(bot.request_shutdown)
                 else:
                     raise AssertionError("unexpected Telegram API")
                 return 200, json.dumps({"ok": True, "result": value}).encode()
@@ -163,24 +177,36 @@ class GrokCompositionTests(unittest.TestCase):
         def builder():
             return Application.builder().request(TelegramFixture()).get_updates_request(TelegramFixture())
         bot = create_app(build_context(settings, agent_runtime=runtime, telegram_port=builder))
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        # Bound the proof independently of message delivery; an empty/wrong
-        # route must fail the assertions rather than leaving tests polling.
-        loop.call_later(8, lambda: bot.application.stop_running())
-        try:
-            bot.run()
-        finally:
-            if not loop.is_closed():
-                loop.close()
-            asyncio.set_event_loop(None)
+        bot.run()  # owns its event loop, including on Python 3.14
         self.assertEqual(len(host.sends), 1)
-        self.assertEqual(len(sent), 1)
-        self.assertEqual(sent[0]["text"], "generated reply generated input")
-        self.assertEqual(sent[0]["chat_id"], 42)
+        if terminate:
+            self.assertEqual(sent, [])
+            with route.journal.claim() as claim:
+                self.assertEqual(claim.load()[0]["stage"], "attempted")
+        else:
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0]["text"], "generated reply generated input")
+            self.assertEqual(sent[0]["chat_id"], 42)
         self.assertLess(rpc.index("getWebhookInfo"), rpc.index("getUpdates"))
         self.assertFalse(bot.ready)
         self.assertIsNone(bot._poller)
+
+    def test_real_telegram_polling_dispatch_with_generated_api(self):
+        self.polling_fixture()
+
+    def test_real_process_sigterm_during_accepted_send_no_late_telegram_reply(self):
+        # Signal only our owned disposable child, never the test runner/node.
+        repo = Path(__file__).resolve().parents[2]
+        script = """from test_grok_provider import GrokCompositionTests
+c=GrokCompositionTests(); c.setUp()
+try: c.polling_fixture(terminate=True)
+finally: c.doCleanups()
+print('sigterm-retained-no-delivery')
+"""
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(repo / ".github/pythonpath"), str(Path(__file__).parent)))}
+        child = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(child.stdout.strip(), "sigterm-retained-no-delivery")
 
 
 class GrokTelegramTests(unittest.IsolatedAsyncioTestCase):
@@ -204,6 +230,11 @@ class GrokTelegramTests(unittest.IsolatedAsyncioTestCase):
 
     def state(self):
         return {p.name: p.read_bytes() for p in self.route.journal.root.iterdir()}
+
+    def fresh_bot(self):
+        bot = create_app(build_context(self.settings, agent_runtime=GrokRuntime(self.route.journal, self.host)))
+        self.addAsyncCleanup(bot.shutdown, self.app)
+        return bot
 
     async def test_owner_dm_actual_runtime_and_persisted_result_before_reply(self):
         async def reply(**kwargs):
@@ -233,6 +264,7 @@ class GrokTelegramTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_boot_identity_before_any_journal_or_bot_access(self):
         await self.bot.shutdown(self.app)
+        self.bot = self.fresh_bot()
         before, calls = self.state(), len(self.host.calls)
         self.port.get_me.return_value = User(999, "wrong", True)
         with patch.object(self.route.journal, "claim", side_effect=AssertionError("state opened")):
@@ -244,6 +276,7 @@ class GrokTelegramTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_or_corrupt_journal_denies_start_without_reset(self):
         await self.bot.shutdown(self.app)
+        self.bot = self.fresh_bot()
         foreign = configuration(self.root, CCC_GROK_JOURNAL_PATH=str(self.root / "missing"))
         bot = create_app(build_context(foreign))
         with self.assertRaises(Exception):
@@ -264,10 +297,55 @@ class GrokTelegramTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_existing_webhook_denied_before_journal_open(self):
         await self.bot.shutdown(self.app)
+        self.bot = self.fresh_bot()
         self.port.get_webhook_info.return_value = SimpleNamespace(url="https://fixture.invalid")
         with patch.object(self.bot.runtime.journal, "claim", side_effect=AssertionError("state opened")):
             with self.assertRaisesRegex(ProtocolError, "grok_existing_webhook_denied"):
                 await self.bot.initialize(self.app)
+
+    async def test_late_boot_after_shutdown_never_reopens_state_or_poller(self):
+        await self.bot.shutdown(self.app)
+        bot = self.fresh_bot()
+        before, calls = self.state(), len(self.host.calls)
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def late():
+            entered.set()
+            await release.wait()
+            return User(123456, "fixture", True)
+        self.port.get_me.side_effect = late
+        boot = asyncio.create_task(bot.initialize(self.app))
+        await entered.wait()
+        await bot.shutdown(self.app)
+        release.set()
+        with self.assertRaisesRegex(ProtocolError, "grok_startup_retired"):
+            await boot
+        self.assertFalse(bot.ready)
+        self.assertIsNone(bot._poller)
+        self.assertEqual(before, self.state())
+        self.assertEqual(calls, len(self.host.calls))
+        with self.assertRaises(ProtocolError):
+            await bot.initialize(self.app)
+
+    async def test_shutdown_fence_cancels_active_before_framework_drain(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = self.host.call
+        async def delayed(operation, args=None):
+            result = await original(operation, args)
+            if operation == "send":
+                entered.set()
+                await release.wait()
+            return result
+        self.host.call = delayed
+        turn = asyncio.create_task(self.bot.handle(update(1), self.context))
+        await entered.wait()
+        self.bot.request_shutdown()  # synchronous signal boundary
+        self.assertFalse(self.bot.ready)
+        release.set()
+        await self.bot.shutdown(self.app)
+        await asyncio.gather(turn, return_exceptions=True)
+        self.port.send_message.assert_not_awaited()
+        with self.route.journal.claim() as claim:
+            self.assertEqual(claim.load()[0]["stage"], "attempted")
 
     async def test_process_update_replay_and_restart_cached_exact_input(self):
         await self.bot.handle(update(1), self.context)

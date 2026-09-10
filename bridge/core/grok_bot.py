@@ -10,6 +10,7 @@ import asyncio
 from collections.abc import Mapping
 import hashlib
 import logging
+import signal
 import socket
 from typing import Any
 
@@ -50,6 +51,9 @@ class GrokTelegramBot:
         self.session: Any = None
         self.active: asyncio.Task[Any] | None = None
         self._generation = 0
+        self._closed = False
+        self._initializing = False
+        self._stop: asyncio.Event | None = None
         self._poller: socket.socket | None = None
         self._seen: set[int] = set()  # bounded process-only update replay guard
 
@@ -72,32 +76,54 @@ class GrokTelegramBot:
         self._poller = claim
 
     async def initialize(self, application: Any) -> None:
-        if self.ready or self._poller is not None:
+        if self._closed or self._initializing or self.ready or self._poller is not None:
             raise ProtocolError("grok_already_initialized")
-        # Application.initialize has performed getMe, but refresh explicitly
-        # at this boundary so fake/test ports must exercise the same check.
-        identity = await application.bot.get_me()
-        if identity.id != self.route.telegram_bot_id or identity.is_bot is not True:
-            raise ProtocolError("grok_telegram_identity_mismatch")
-        webhook = await application.bot.get_webhook_info()
-        if webhook.url:
-            raise ProtocolError("grok_existing_webhook_denied")
-        self._claim_poller()
+        self._initializing = True
+        generation = self._generation
         try:
+            # Recheck after every external wait: shutdown is terminal and a
+            # late startup must not reclaim a socket or access protected state.
+            identity = await application.bot.get_me()
+            self._boot_current(generation)
+            if identity.id != self.route.telegram_bot_id or identity.is_bot is not True:
+                raise ProtocolError("grok_telegram_identity_mismatch")
+            webhook = await application.bot.get_webhook_info()
+            self._boot_current(generation)
+            if webhook.url:
+                raise ProtocolError("grok_existing_webhook_denied")
+            self._claim_poller()
             binding = self.route.journal.binding
             self.session = await self.runtime.start_or_resume(
                 SessionRequest(binding.working_directory, session_id=binding.session_id))
-            check_idle(await self.runtime._call("health"), binding.agent_id)
+            self._boot_current(generation)
+            health = await self.runtime._call("health")
+            self._boot_current(generation)
+            check_idle(health, binding.agent_id)
             self.application = application
             self.ready = True
         except BaseException:
             await self.shutdown(application)
             raise
+        finally:
+            self._initializing = False
+
+    def _boot_current(self, generation: int) -> None:
+        if self._closed or generation != self._generation:
+            raise ProtocolError("grok_startup_retired")
+
+    def request_shutdown(self) -> None:
+        """Synchronous signal/control fence, before any framework drain awaits."""
+        self._closed = True
+        self.ready = False
+        self._generation += 1
+        if self.active is not None:
+            self.active.cancel()
+        if self._stop is not None:
+            self._stop.set()
 
     async def shutdown(self, application: Any) -> None:
         del application
-        self.ready = False
-        self._generation += 1
+        self.request_shutdown()
         if self.session is not None:
             await self.session.close()
         if self.active is not None and self.active is not asyncio.current_task():
@@ -204,6 +230,38 @@ class GrokTelegramBot:
         del update, context  # never log Update, token URL, exception or bodies
         logger.warning("Grok Telegram callback failed; no automatic replay")
 
+    async def _serve(self) -> None:
+        # Explicit lifecycle avoids run_polling's post_shutdown ordering:
+        # Application.stop waits for callbacks, so a late hook cannot cancel
+        # those callbacks before they publish results. Retire synchronously.
+        loop = asyncio.get_running_loop()
+        self._stop = asyncio.Event()
+        previous = {}
+        app = self.application
+        try:
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous[signum] = signal.getsignal(signum)
+                loop.add_signal_handler(signum, self.request_shutdown)
+            await app.initialize()
+            await self.initialize(app)
+            await app.start()
+            if not self._closed:
+                await app.updater.start_polling(allowed_updates=["message"], drop_pending_updates=False)
+            await self._stop.wait()
+        finally:
+            self.request_shutdown()
+            try:
+                await self.shutdown(app)
+                if app.updater.running:
+                    await app.updater.stop()
+                if app.running:
+                    await app.stop()
+                await app.shutdown()
+            finally:
+                for signum, handler in previous.items():
+                    loop.remove_signal_handler(signum)
+                    signal.signal(signum, handler)
+
     def run(self) -> None:
         # Updater/bootstrap exceptions can include HTTP URLs or message data;
         # apply before framework getMe/polling, including DEBUG deployments.
@@ -213,18 +271,14 @@ class GrokTelegramBot:
             handler.addFilter(log_filter)
         try:
             self.application = (self.builder().token(self.settings.telegram_bot_token)
-                                .concurrent_updates(8).post_init(self.initialize)
-                                .post_shutdown(self.shutdown).build())
+                                .concurrent_updates(8).build())
             self.application.add_handler(TypeHandler(Update, self.handle))
             self.application.add_error_handler(self.error)
-            self.application.run_polling(allowed_updates=["message"], drop_pending_updates=False)
+            asyncio.run(self._serve())
         except Exception:
             raise ProtocolError("grok_frontend_failed_state_retained") from None
         finally:
-            self.ready = False
-            self._generation += 1
-            # post_shutdown also runs on normal shutdown; this covers failures
-            # during framework initialization, before its shutdown callbacks.
+            self.request_shutdown()
             if self._poller is not None:
                 self._poller.close()
                 self._poller = None

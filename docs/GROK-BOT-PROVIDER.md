@@ -89,6 +89,14 @@ preview, in chunks of at most 2,000 Unicode code points. A stop/shutdown generat
 prevents later chunks from starting; a Telegram HTTP request already in flight
 may already have been delivered and cannot be recalled.
 
+The frontend owns the explicit PTB async startup/drain lifecycle and its event
+loop (including Python 3.14). SIGINT/SIGTERM immediately retire the route and
+cancel its active callback **before** updater/application shutdown waits. Closing
+a frontend is terminal: each external initialization wait rechecks its original
+generation, so late getMe/status/health replies cannot reopen state or a poller.
+The shell provider label names Grok, but generic shell health/status automation
+is not a qualified replacement for this dedicated Python entrypoint.
+
 ## Honest delivery and execution limits
 
 The runtime journal is **not** a Telegram exactly-once inbox/outbox. The bounded
