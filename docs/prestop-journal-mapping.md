@@ -3,7 +3,9 @@
 Status: source-only design draft, not an implemented or approved wire contract.
 Companions #1609 (in-memory admission), #1610 (durable contract) and #1611
 (peer/record policy) are unmerged proposals, not runtime dependencies. The
-bounded JSON helper from #1614 supplies syntax checking only. This document
+bounded JSON helper from #1614 supplies bounded decoding and representation-profile
+validation only, not versioned schema validation, contextual validation,
+authentication or authority. This document
 adds no codec, store, controller, endpoint or production caller; no #1608
 acceptance criterion is completed. Existing lifecycle defaults stay unchanged.
 
