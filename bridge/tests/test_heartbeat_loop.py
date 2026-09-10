@@ -270,25 +270,38 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Working", text)
             self.assertNotIn("ETA", text)
 
-    async def test_deletes_heartbeat_when_stream_stalls(self):
-        project_chat.config.heartbeat_stall_seconds = 0.05
+    async def test_silent_long_tool_keeps_editing_same_heartbeat_without_eta(self):
+        project_chat.config.heartbeat_stall_seconds = 300.0
         self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)
         req = self._make_request()
         req.heartbeat_message_id = 1234
-        now = asyncio.get_running_loop().time()
-        req.started_at = now - 10.0
-        req.last_event_at = now - 10.0  # silent far longer than the stall window
+        req.current_tool_label = "bash"
+        req.heartbeat_forecast_loaded = True
+        req.heartbeat_forecast_samples = [2000000, 2400000, 3000000]
+        # A fresh CI runner can have less than 301s of monotonic uptime.
+        # Use a complete synthetic timeline so prior events stay positive.
+        now = 10_000.0
+        req.started_at = now - 1200.0
+        req.last_event_at = now - 301.0
         await self.handler._maybe_update_heartbeat(req, now)
-        self.assertEqual(self.status_calls, [(None, 1234)])
-        self.assertIsNone(req.heartbeat_message_id)
+        await self.handler._maybe_update_heartbeat(req, now + 30.0)
+        self.assertEqual(req.heartbeat_message_id, 1234)
+        self.assertEqual(len(self.status_calls), 2)
+        self.assertIn("20m 00s", self.status_calls[0][0])
+        self.assertIn("20m 30s", self.status_calls[1][0])
+        for text, message_id in self.status_calls:
+            self.assertEqual(message_id, 1234)
+            self.assertIn("Waiting for progress", text)
+            self.assertIn("Last: bash", text)
+            self.assertNotIn("ETA", text)
 
-    async def test_failed_stall_cleanup_keeps_heartbeat_id_for_retry(self):
+    async def test_silent_update_failure_retries_without_deleting(self):
         project_chat.config.heartbeat_stall_seconds = 0.05
         self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)
 
         async def failing_status_callback(text, message_id=None):
             self.status_calls.append((text, message_id))
-            return message_id
+            raise OSError("offline fixture")
 
         req = self._make_request()
         req.status_callback = failing_status_callback
@@ -296,24 +309,71 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
         now = asyncio.get_running_loop().time()
         req.started_at = now - 10.0
         req.last_event_at = now - 10.0
-
         await self.handler._maybe_update_heartbeat(req, now)
         await self.handler._maybe_update_heartbeat(req, now + 1.0)
-
-        self.assertEqual(self.status_calls, [(None, 1234), (None, 1234)])
+        self.assertEqual(len(self.status_calls), 2)
+        self.assertTrue(all(text is not None for text, _ in self.status_calls))
         self.assertEqual(req.heartbeat_message_id, 1234)
 
-    async def test_stall_falls_back_to_started_at_when_no_event_yet(self):
+    async def test_no_first_event_recreates_previously_missing_heartbeat(self):
         project_chat.config.heartbeat_stall_seconds = 0.05
         self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)
         req = self._make_request()
-        req.heartbeat_message_id = 1234
         now = asyncio.get_running_loop().time()
         req.started_at = now - 10.0
-        req.last_event_at = 0.0  # the SDK never emitted a single event
+        req.last_event_at = 0.0
         await self.handler._maybe_update_heartbeat(req, now)
-        self.assertEqual(self.status_calls, [(None, 1234)])
-        self.assertIsNone(req.heartbeat_message_id)
+        self.assertIn("Waiting for progress", self.status_calls[0][0])
+        self.assertEqual(req.heartbeat_message_id, 1234)
+
+    async def test_fresh_event_restores_working_and_terminal_cleanup_still_deletes(self):
+        project_chat.config.heartbeat_stall_seconds = 0.05
+        self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)
+        req = self._make_request()
+        now = asyncio.get_running_loop().time()
+        req.started_at = now - 10.0
+        req.last_event_at = now - 10.0
+        await self.handler._maybe_update_heartbeat(req, now)
+        self.assertIn("Waiting for progress", self.status_calls[-1][0])
+        req.last_event_at = now + 1.0
+        await self.handler._maybe_update_heartbeat(req, now + 1.0)
+        self.assertIn("Working", self.status_calls[-1][0])
+        self.assertNotIn("No update", self.status_calls[-1][0])
+        req.future.set_result(None)
+        count = len(self.status_calls)
+        await self.handler._maybe_update_heartbeat(req, now + 2.0)
+        self.assertEqual(len(self.status_calls), count)
+        self.assertTrue(await self.handler._cleanup_heartbeat(req))
+        self.assertEqual(self.status_calls[-1], (None, 1234))
+
+    async def test_silent_and_active_conversations_keep_separate_status(self):
+        project_chat.config.heartbeat_stall_seconds = 300.0
+        self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)
+        quiet, active = self._make_request(), self._make_request()
+        quiet.chat_id, active.chat_id = 10, 20
+        quiet.heartbeat_message_id, active.heartbeat_message_id = 100, 200
+        # A fresh CI runner can have less than 301s of monotonic uptime.
+        # Use a complete synthetic timeline so prior events stay positive.
+        now = 10_000.0
+        quiet.started_at = active.started_at = now - 1200.0
+        quiet.last_event_at, active.last_event_at = now - 301.0, now
+        await asyncio.gather(self.handler._maybe_update_heartbeat(quiet, now),
+                             self.handler._maybe_update_heartbeat(active, now))
+        calls = {message_id: text for text, message_id in self.status_calls}
+        self.assertIn("Waiting for progress", calls[100])
+        self.assertIn("Working", calls[200])
+        quiet.future.set_result(None)
+        await self.handler._cleanup_heartbeat(quiet)
+        self.assertEqual(active.heartbeat_message_id, 200)
+
+    async def test_silence_indicator_can_be_disabled_without_removing_status(self):
+        project_chat.config.heartbeat_stall_seconds = 0.0
+        req = self._make_request()
+        now = asyncio.get_running_loop().time()
+        req.started_at = now - 1000.0
+        await self.handler._maybe_update_heartbeat(req, now)
+        self.assertIn("Working", self.status_calls[-1][0])
+        self.assertNotIn("No update", self.status_calls[-1][0])
 
     async def test_recent_activity_keeps_heartbeat(self):
         project_chat.config.heartbeat_stall_seconds = 100.0

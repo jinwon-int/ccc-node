@@ -1672,3 +1672,48 @@ def test_long_task_defaults_preserve_explicit_opt_out_and_timeout_overrides(conf
     assert not ready and "long-task" in reason
     assert probe_danso_readiness(load(CCC_DANSO_CLI_PATH=str(old_binary),
                                      CCC_DANSO_LONG_TASK_ENABLED="false")) == (True, "")
+
+
+@pytest.mark.anyio
+async def test_silent_native_long_task_retains_status_until_completion(configured, monkeypatch):
+    configured.danso_long_task_enabled = True
+    configured.danso_long_task_timeout_seconds = 5
+    binary = Path(configured.danso_cli_path)
+    binary.write_text(binary.read_text().replace(
+        "if message == 'slow':time.sleep(.1)",
+        "if message == 'slow':\n while not (root/'release').exists():time.sleep(.005)",
+    ))
+    for name, value in {
+        'heartbeat_enabled': True,
+        'heartbeat_threshold_seconds': .005,
+        'heartbeat_update_interval_seconds': .005,
+        'heartbeat_stall_seconds': .02,
+    }.items():
+        setattr(configured, name, value)
+    # Full-suite collection can replace the module registry with a sibling
+    # test stub. Patch the globals used by this imported handler, not a newly
+    # imported module object that may be a different instance.
+    monkeypatch.setitem(ProjectChatHandler._maybe_update_heartbeat.__globals__,
+                        "config", configured)
+    runtime = build_danso_runtime(configured)
+    handler = ProjectChatHandler(settings=configured, agent_runtime=runtime)
+    handler._typing_interval_seconds = .005
+    calls = []
+
+    async def status(text, message_id=None):
+        calls.append((text, message_id))
+        if text is not None and 'Waiting for progress' in text and 'stage 1' in text:
+            (Path(configured.danso_workspace) / 'release').touch()
+        return None if text is None else 1234
+
+    try:
+        response = await asyncio.wait_for(
+            handler.process_message('slow', 7, 9, status_callback=status), timeout=10,
+        )
+        assert response.success, response.error
+        assert any(text is not None and 'Waiting for progress' in text
+                   and 'stage 1' in text for text, _ in calls)
+        assert all(text is not None for text, _ in calls[:-1])
+        assert calls[-1] == (None, 1234)
+    finally:
+        await handler.close()

@@ -1323,19 +1323,17 @@ class ProjectChatHandler(
         if not req.status_callback or req.future.done() or req.lifecycle.is_terminal:
             return
 
-        # Stall guard: if the SDK stream has gone silent for too long the request
-        # is stuck (e.g. a bridge restart left it in flight, or the stream hung)
-        # and will never reach the terminal ResultMessage that deletes the
-        # heartbeat. Remove the dangling "⏳ Working — Nm" line rather than let it
-        # tick up forever as the last chat message. It reappears if activity
-        # resumes (last_event_at advances on the next SDK event).
+        # Silence is not a terminal state: native long tasks and individual
+        # tools can run for minutes between progress events. Keep the owned
+        # request visible, but mark its last report as stale instead of claiming
+        # fresh progress or an ETA. Finalization/startup reconciliation owns
+        # removal of completed or interrupted requests' status messages.
         stall_seconds = float(getattr(config, "heartbeat_stall_seconds", 0.0) or 0.0)
+        silent_seconds = None
         if stall_seconds > 0:
             last_event = req.last_event_at or req.started_at
             if last_event > 0 and now - last_event >= stall_seconds:
-                if req.heartbeat_message_id is not None:
-                    await self._cleanup_heartbeat(req)
-                return
+                silent_seconds = now - last_event
 
         threshold = float(getattr(config, "heartbeat_threshold_seconds", 15.0))
         interval = float(getattr(config, "heartbeat_update_interval_seconds", 15.0))
@@ -1349,7 +1347,8 @@ class ProjectChatHandler(
             return
 
         if (
-            getattr(config, "heartbeat_suppress_when_streaming_progress", True)
+            silent_seconds is None
+            and getattr(config, "heartbeat_suppress_when_streaming_progress", True)
             and req.streaming_handler
             and getattr(req.streaming_handler, "drafts", None)
             and has_recent_visible_progress(
@@ -1380,6 +1379,7 @@ class ProjectChatHandler(
             forecast_seconds=(forecast_remaining_ms / 1000.0)
             if forecast_remaining_ms is not None
             else None,
+            silent_seconds=silent_seconds,
         )
         try:
             previous_id = req.heartbeat_message_id
