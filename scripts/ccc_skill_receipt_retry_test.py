@@ -39,6 +39,10 @@ class ReceiptRetryTests(unittest.TestCase):
             promotion, "_broker_task_gated", return_value=(self.task, "claimed")))
         self.remote = self.enterContext(patch.object(
             promotion, "_receipt_already_posted", return_value=False, create=True))
+        # The retry path reaps receipts whose intake PR is gone (#1618); these
+        # fixtures are all live PRs, and the lookup must not reach the network.
+        self.pr_state = self.enterContext(patch.object(
+            promotion, "_pr_state", return_value="OPEN"))
         self.posted = []
         self.enterContext(patch.object(promotion, "_pr_comment", side_effect=self.post))
         self.fail_receipt = False
