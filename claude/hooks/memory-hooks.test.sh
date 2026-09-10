@@ -55,6 +55,22 @@ out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC
 ok "load-memory exits 0 with local caches only" '[ "$rc" = 0 ]'
 ok "load-memory injects bounded local sources" 'grep -q "Node memory: safe fact" <<<"$out" && grep -q "Cached wiki fact" <<<"$out" && grep -q "Local hot memory result" <<<"$out"'
 ok "load-memory does not require network credentials" '! grep -qi "token\|authorization\|Traceback" <<<"$out"'
+# Persona (assistant identity): the default fixture has no PERSONA.md, so the
+# rendered context must carry no persona section (byte-identical contract).
+ok "load-memory omits persona section without PERSONA.md" '! grep -q "## PERSONA (assistant identity)" <<<"$out"'
+
+persona_mem="$TMP/persona-mem"; mkdir -p "$persona_mem"
+cp "$mem/MEMORY.md" "$persona_mem/MEMORY.md"
+cp "$mem/USER.md" "$persona_mem/USER.md"
+printf 'Assistant identity: test persona marker\n' > "$persona_mem/PERSONA.md"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$persona_mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "load-memory injects persona section for non-empty PERSONA.md" '[ "$rc" = 0 ] && grep -q "## PERSONA (assistant identity)" <<<"$out" && grep -q "Assistant identity: test persona marker" <<<"$out"'
+ok "persona section precedes the built-in memory section" '[[ "$out" == *"## PERSONA (assistant identity)"*"## Built-in MEMORY + USER"* ]]'
+ok "persona injection keeps bounded local sources" 'grep -q "Node memory: safe fact" <<<"$out"'
+
+: > "$persona_mem/PERSONA.md"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$persona_mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "load-memory omits persona section for empty PERSONA.md" '[ "$rc" = 0 ] && ! grep -q "## PERSONA (assistant identity)" <<<"$out"'
 
 out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_USER_LABEL='External Owner' CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "wiki-disabled load-memory keeps non-Wiki sources and custom identity" '[ "$rc" = 0 ] && grep -q "Node memory: safe fact" <<<"$out" && grep -q "Local hot memory result" <<<"$out"' ok "wiki-disabled load-memory drops direct and stale-index Wiki content" '! grep -q "Cached wiki fact\|Stale wiki index hit\|## Family Wiki\|verify Wiki source" <<<"$out"'
