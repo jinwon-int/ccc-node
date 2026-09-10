@@ -27,7 +27,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -242,6 +242,24 @@ class Row:
     item: str
     status: str
     action: str
+
+
+def _iso_age_days(stamp: str) -> int | None:
+    """Whole days between a `YYYY-MM-DDTHH:MM:SSZ` stamp and now, or None.
+
+    Returns None rather than 0 for anything unparsable, so a malformed stamp
+    reads as "cannot tell" instead of "brand new" — the latter would silently
+    suppress a stale-condition warning.
+    """
+    match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z", stamp or "")
+    if match is None:
+        return None
+    try:
+        then = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return max(0, int((now - then).total_seconds() // 86400))
 
 
 class Doctor:
@@ -585,6 +603,7 @@ class Doctor:
         self.check_provider_readiness()
         self.check_distill_readiness()
         self.check_skill_promotion_backlog()
+        self.check_skill_promotion_revise_stall()
         self.check_self_update_stall()
         # Managed Codex skills are provider-native (#647): diagnose them only on
         # a Codex node. Claude-only asset findings above stay non-readiness
@@ -1515,6 +1534,86 @@ class Doctor:
             f"{age_days}d; verify this node is listed in the publisher's "
             "skill-promotion.collect-nodes, that its collect cron still runs, "
             "and that max_prs_per_run keeps up with the fleet's staging rate",
+        )
+
+    # A `revise` verdict normally dispatches a revision round back to the
+    # author node. When that node is not an online broker worker anywhere the
+    # dispatch is skipped and the findings are left "visible for human
+    # follow-up" — which in practice means a comment nobody re-reads. Field
+    # case: 14 PRs sat skipped for 12 days because the author node hosts a
+    # broker but runs no worker, and the only trace was one line per PR in a
+    # cron log on the publisher.
+    _REVISE_STALL_DAYS = 7
+
+    def check_skill_promotion_revise_stall(self) -> None:
+        """Report revision rounds the publisher has been skipping for too long.
+
+        Publisher-only: an ordinary node has no promotion ledger, and an
+        absent ledger is not drift. The skip itself is legitimate — this
+        check exists because nothing ages it, so a permanent condition
+        (an author node that will never be a worker) is indistinguishable
+        from a transient one (a worker that is briefly offline).
+        """
+        item = "skill-promotion revise stall"
+        state_dir = Path(
+            os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")
+        ).expanduser()
+        ledger = state_dir / "skill-promotion" / "ledger.jsonl"
+        if ledger.is_symlink() or not ledger.is_file():
+            self.add("정상", item, "ledger=absent", "none")
+            return
+        # Oldest still-skipped PR wins: a large but moving set is healthy,
+        # while one old entry means that author will never come back on its own.
+        oldest: str | None = None
+        prs: set[str] = set()
+        try:
+            with ledger.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line or "revise_author_offline" not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if row.get("kind") != "a2a-revise-comment":
+                        continue
+                    if "revise_author_offline" not in str(row.get("marker", "")):
+                        continue
+                    stamp = row.get("ts")
+                    if not isinstance(stamp, str):
+                        continue
+                    prs.add(str(row.get("pr", "?")))
+                    if oldest is None or stamp < oldest:
+                        oldest = stamp
+        except OSError:
+            self.add(
+                "수동필요",
+                item,
+                "ledger=unreadable",
+                f"inspect {ledger} permissions; revise stalls cannot be verified",
+            )
+            return
+
+        if not prs or oldest is None:
+            self.add("정상", item, "skipped=0", "none")
+            return
+        age_days = _iso_age_days(oldest)
+        if age_days is None:
+            self.add("정상", item, f"skipped={len(prs)}; oldest=unparsable", "none")
+            return
+        status = f"skipped_prs={len(prs)}; oldest={age_days}d"
+        if age_days < self._REVISE_STALL_DAYS:
+            self.add("정상", item, status, "none")
+            return
+        self.add(
+            "경고",
+            item,
+            status,
+            f"revision rounds have been skipped for {age_days}d because the "
+            "author node is not an online broker worker; confirm whether that "
+            "node is meant to run a worker at all — if it is not, these "
+            "findings need a different route than a broker revision round",
         )
 
     def check_self_update_stall(self) -> None:
