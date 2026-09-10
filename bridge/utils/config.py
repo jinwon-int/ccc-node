@@ -190,11 +190,16 @@ class Config(
         finally:
             _LOAD_EXPLICIT_VALUES_ONLY.reset(token)
 
-    agent_provider: Literal["claude", "codex", "crush", "piri", "danso"] = Field(
+    agent_provider: Literal["claude", "codex", "crush", "piri", "danso", "grok"] = Field(
         default="claude",
         alias="CCC_AGENT_PROVIDER",
         description="Agent provider used by ProjectChat.",
     )
+    grok_ssh_destination: Optional[str] = Field(default=None, alias="CCC_GROK_SSH_DESTINATION")
+    grok_bot_id: Optional[str] = Field(default=None, alias="CCC_GROK_BOT_ID")
+    grok_owner_id: Optional[int] = Field(default=None, gt=0, alias="CCC_GROK_OWNER_ID")
+    grok_telegram_bot_id: Optional[int] = Field(default=None, gt=0, alias="CCC_GROK_TELEGRAM_BOT_ID")
+    grok_journal_path: Optional[Path] = Field(default=None, alias="CCC_GROK_JOURNAL_PATH")
     codex_cli_path: str = Field(
         default_factory=lambda: str(Path.home() / ".claude" / "hooks" / "ccc-codex"),
         alias="CCC_CODEX_CLI_PATH",
