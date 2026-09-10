@@ -717,7 +717,18 @@ The intake review lane and its R2 revision round are broker-routed:
 - **Primary broker** — `CCC_SKILL_PROMOTION_BROKER_URL` (default
   `http://127.0.0.1:8787`) with `A2A_EDGE_SECRET` from the local environment.
   Reviewers are keyring workers minus the author, intersected with the
-  broker's online workers (unchanged behavior).
+  broker's online workers. One is then drawn **uniformly at random** from
+  that eligible set. Selection used to take the lexicographically first
+  candidate, which pinned every round on a single node — on 2026-09-09 that
+  node (`bangtong`) had no `REVIEW_AGENT_BIN`, so the handler's default
+  `claude` agent hit its kimi gateway, every verdict died as
+  `unrecognized_model`, and the intake lane stalled for four days while the
+  other keyring workers were never dispatched to. Random draw spreads the
+  load and removes the single point of failure. Set
+  `CCC_SKILL_PROMOTION_REVIEWER_PIN=<node>` to force one reviewer (useful to
+  reproduce a dispatch or to pin a round to a known-good node during an
+  incident); the pin is ignored unless the node is already eligible, so it
+  cannot bypass author disqualification or the online/keyring intersection.
 - **Remote brokers** — optional registry in
   `CCC_SKILL_PROMOTION_REMOTE_BROKERS` (JSON array). Each entry:
   `{"name", "ssh_host", "broker_url", "nexus_dir", "secret_cmd"}` where

@@ -41,6 +41,13 @@ class DansoDistillBackend:
             environment["DANSO_CHATGPT_AUTH_FILE"] = settings.danso_chatgpt_auth_file
             if settings.danso_chatgpt_base_url:
                 environment["DANSO_CHATGPT_BASE_URL"] = settings.danso_chatgpt_base_url
+        elif settings.danso_auth_mode == "zai":
+            provider = "glm"
+            environment["ZAI_API_KEY"] = settings.zai_api_key
+            if settings.danso_glm_base_url:
+                environment["DANSO_GLM_BASE_URL"] = settings.danso_glm_base_url
+            if settings.danso_glm_endpoint:
+                environment["DANSO_GLM_ENDPOINT"] = settings.danso_glm_endpoint
         else:
             provider = "openai"
             environment["OPENAI_API_KEY"] = settings.openai_api_key

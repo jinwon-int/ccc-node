@@ -34,6 +34,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -121,8 +122,46 @@ def _remote_workers_full(m, config, rb) -> dict[str, dict]:
     return {row["nodeId"]: row for row in payload.get("items", []) if isinstance(row, dict)}
 
 
+# A `task.failed` audit event has two very different causes, and the reviewer
+# exclusion only ever meant one of them.
+#
+#   1. The node broke — the handler crashed, a module was missing, the task was
+#      dead-lettered, the dispatcher never produced a parseable verdict. The
+#      node cannot be trusted with another case right now.
+#   2. The node did its job and returned a NEGATIVE verdict. The broker treats
+#      `revise`/`reject` as "not a pass", marks the task failed, and writes
+#      `task.failed` with the actor set to the reviewer.
+#
+# Case 2 is a healthy review, but the exclusion counted it as a node failure,
+# so a reviewer was benched for six hours precisely for reviewing well.
+# 2026-09-10: one 13-case batch produced five substantiated `revise` verdicts
+# and knocked bangtong, nosuk, yukson, daegyo and gongyung out of the pool —
+# the reviewer pool fell 9 → 5 and lost three of its five distinct models,
+# including the only `claude-opus-5` and the `gpt-5.6-luna` node whose false
+# positive this rescreen round existed to re-test.
+#
+# The broker distinguishes them in the audit note, so match on that: a note of
+# the form `task review verdict is "<x>" (requires "pass")` is a verdict, never
+# a node failure. Anything else — including an absent note — stays a failure,
+# so an unrecognised shape still fails closed toward exclusion.
+_VERDICT_FAILURE_NOTE = re.compile(
+    r'^\s*task review verdict is "[^"]*"\s*\(requires "pass"\)', re.IGNORECASE
+)
+
+
+def _is_verdict_failure(note: object) -> bool:
+    """True when a task.failed event records a negative REVIEW VERDICT rather
+    than a node/handler failure. Fails closed: anything unrecognised is a
+    failure, so a new broker note shape can never silently keep a broken node
+    in the pool."""
+    return isinstance(note, str) and bool(_VERDICT_FAILURE_NOTE.match(note))
+
+
 def _recent_failures(m, config, rb, secret: str, window_hours: int) -> dict[str, int]:
-    """task.failed audit counts per actor inside the exclusion window."""
+    """Node-failure `task.failed` counts per actor inside the exclusion window.
+
+    Negative review verdicts are excluded — they are the reviewer working, not
+    the reviewer failing."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
     if rb is None:
         completed = m._run(["curl", "-fsS", "-H", f"x-a2a-edge-secret: {secret}",
@@ -141,6 +180,8 @@ def _recent_failures(m, config, rb, secret: str, window_hours: int) -> dict[str,
         actor = event.get("actorId") if isinstance(event, dict) else None
         created = event.get("createdAt") if isinstance(event, dict) else None
         if not isinstance(actor, str) or not isinstance(created, str):
+            continue
+        if _is_verdict_failure(event.get("note")):
             continue
         try:
             when = datetime.fromisoformat(created.replace("Z", "+00:00"))

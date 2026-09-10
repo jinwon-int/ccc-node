@@ -39,9 +39,10 @@ case "\$url" in
     printf '{"items":[{"nodeId":"authorx","status":"online","implementationCapability":{"providerId":"anthropic","modelTier":"claude-sonnet-5"}},
       {"nodeId":"alpharev","status":"online","implementationCapability":{"providerId":"anthropic","modelTier":"claude-sonnet-5"}},
       {"nodeId":"betarev","status":"online","implementationCapability":{"providerId":"xai","modelTier":"grok-4.6"}},
-      {"nodeId":"failnode","status":"online"}]}'
+      {"nodeId":"failnode","status":"online"},
+      {"nodeId":"verdictnode","status":"online","implementationCapability":{"providerId":"zzz-verdict","modelTier":"gpt-5.6-luna"}}]}'
     ;;
-  */audit*) printf '{"items":[{"actorId":"failnode","action":"task.failed","createdAt":"%s"}]}' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;;
+  */audit*) printf '{"items":[{"actorId":"failnode","action":"task.failed","note":"handler exited with code 1","createdAt":"%s"},{"actorId":"verdictnode","action":"task.failed","note":"task review verdict is \\\\"fail\\\\" (requires \\\\"pass\\\\")","createdAt":"%s"}]}' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;;
   *) printf '{}\n' ;;
 esac
 STUB
@@ -86,7 +87,7 @@ jq -n --arg head "$HEAD_OK" '
 }' > "$TMP/cases.json"
 
 cat > "$TMP/keyring.json" <<'JSON'
-{"keys":{"worker:alpharev:g2:v1":{},"worker:betarev:g2:v1":{},"worker:t2rev:g2:v1":{},"worker:failnode:g2:v1":{}}}
+{"keys":{"worker:alpharev:g2:v1":{},"worker:betarev:g2:v1":{},"worker:t2rev:g2:v1":{},"worker:failnode:g2:v1":{},"worker:verdictnode:g2:v1":{}}}
 JSON
 
 KR_B64="$(base64 -w0 "$TMP/keyring.json")"
@@ -153,6 +154,18 @@ ok "author node never reviews its own candidate; failed node never chosen (#2028
 ok "remote-broker reviewer is used and recorded with broker+provider (#2028)" \
   '[ "$(jq -r "[.results[] | select(.reviewer==\"t2rev\") | .broker] | length" <<<"$out1")" != "0" ] \
      && [ "$(jq -r ".results[] | select(.reviewer==\"t2rev\") | .review_provider" <<<"$out1")" = "openai" ]'
+# A negative review verdict is the reviewer working, not the reviewer failing.
+# The broker writes `task.failed` for `revise`/`reject` with the reviewer as
+# actor; counting that as a node failure benched five good reviewers on
+# 2026-09-10 and cost the pool three of its five models.
+ok "negative review verdict does NOT exclude the reviewer (#1619 follow-up)" \
+  '[ "$(jq -r "[.exclusions[] | select(.node==\"verdictnode\")] | length" <<<"$out1")" = 0 ] \
+     && [ "$(jq -r "[.pool[] | select(.node==\"verdictnode\")] | length" <<<"$out1")" != 0 ]'
+# ...while a real handler failure still excludes, in the same audit payload.
+ok "real handler failure still excludes, alongside a verdict failure (#1619 follow-up)" \
+  '[ "$(jq -r "[.exclusions[] | select(.node==\"failnode\")] | length" <<<"$out1")" != 0 ] \
+     && [ "$(jq -r "[.pool[] | select(.node==\"failnode\")] | length" <<<"$out1")" = 0 ]'
+
 ok "no-case candidate is skipped with a reason" \
   '[ "$(jq -r ".results[] | select(.name==\"skill-orphan\") | .reason" <<<"$out1")" = "no-case" ]'
 

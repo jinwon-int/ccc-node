@@ -1173,6 +1173,24 @@ assert reviewer == "t2reviewer" and rb is not None and rb["name"] == "t2", (revi
 reviewer2, rb2 = m._dispatch_target_worker(config, "t2reviewer", "s3cret-value")
 assert reviewer2 == "authorx" and rb2 is None, (reviewer2, rb2)
 
+# 2026-09-09: the reviewer is drawn at random, not lexicographically first.
+# Lexicographic-first pinned every round on one node, so one broken reviewer
+# stalled the whole intake lane. A single candidate is still deterministic.
+pool = ["aaa-first", "mmm-middle", "zzz-last"]
+assert m._pick_reviewer(["only-one"]) == "only-one"
+drawn = {m._pick_reviewer(pool) for _ in range(200)}
+assert drawn == set(pool), drawn
+assert m._pick_reviewer(pool) in pool
+
+# The operator pin forces a candidate, but never widens the eligible set:
+# a pin outside the candidate list is ignored and the draw stays in-bounds.
+os.environ["CCC_SKILL_PROMOTION_REVIEWER_PIN"] = "zzz-last"
+assert all(m._pick_reviewer(pool) == "zzz-last" for _ in range(10))
+os.environ["CCC_SKILL_PROMOTION_REVIEWER_PIN"] = "not-a-candidate"
+assert {m._pick_reviewer(pool) for _ in range(200)} == set(pool)
+del os.environ["CCC_SKILL_PROMOTION_REVIEWER_PIN"]
+print("RB-RANDOM-OK")
+
 # Row routing: 't2' row polls over ssh, legacy/primary row polls over curl.
 task = m._broker_task_on(config, {"broker": "t2"}, "rv-x", "s3cret-value")
 assert task.get("status") == "running", task
@@ -1189,6 +1207,8 @@ env "${base_env[@]}" CCC_SKILL_PROMOTION_REMOTE_BROKERS="$RB_JSON" PATH="$BIN:$P
   python3 "$RB_FIXTURE" "$PROMOTER" > "$RB_STATE/out" 2>&1; rc=$?
 ok "remote broker parse, reviewer fallthrough, and task routing (#2024)" \
   '[ "$rc" = 0 ] && grep -q "RB-PARSE-OK" "$RB_STATE/out" && grep -q "RB-ROUTING-OK" "$RB_STATE/out"'
+ok "reviewer is drawn at random over the eligible set, with an operator pin" \
+  '[ "$rc" = 0 ] && grep -q "RB-RANDOM-OK" "$RB_STATE/out"'
 
 # The mirrored reviewer actually lands in the dispatch manifest (no local
 # dispatch here — the routing unit above covers broker selection).
@@ -1561,6 +1581,80 @@ env "${base_env[@]}" python3 "$RECEIPT_FIXTURE" "$PROMOTER" > "$TMP/receipt-out"
 rc=$?
 ok "signed receipt fence is projected at verdict consumption (#1470)" \
   '[ "$rc" = 0 ] && grep -q "RECEIPT-PROJECTION-OK" "$TMP/receipt-out"'
+
+# --- packet boundary contract (false-positive guard) -------------------------
+BOUNDARY_FIXTURE="$TMP/boundary-fixture.py"
+cat > "$BOUNDARY_FIXTURE" <<'FIXTURE'
+import importlib.util, json, os, sys, tempfile
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("csp_bnd", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["csp_bnd"] = m
+spec.loader.exec_module(m)
+
+iso_state = Path(tempfile.mkdtemp()) / "skill-promotion"
+iso_state.mkdir(parents=True)
+env = dict(os.environ)
+env["CCC_STATE_DIR"] = str(iso_state.parent)
+config = m._config(env)
+
+candidate = m.Candidate(
+    node="authornode", provider="claude", name="gate-skill",
+    skill_sha256="d" * 64, tree_sha256="c" * 64, source_dir=Path("/nonexistent"),
+    files=(m.SnapshotFile(
+        relative="SKILL.md",
+        content=b"---\nname: gate-skill\n---\nbody\n",
+        executable=False,
+    ),),
+    description="a gate skill",
+)
+manifest = m._build_dispatch_manifest(
+    config, candidate, pr_number="8", branch="skill-intake/authornode/gate-skill",
+    head="a" * 40, reviewer="reviewer1", broker_id="seoseo",
+    procedure="## Worker procedure\n" + ("x" * 300), inventory=[], now="20260910T000000Z",
+)
+lane = manifest["lanes"][0]
+payload = lane["payload"]
+
+# 1. The contract is present and names the candidate surface.
+contract = payload["packetContract"]
+assert contract["candidateContent"].startswith("payload.skillFiles[].content"), contract
+for field in ("payload.workerProcedure", "payload.verdictSchema", "payload.machineGate"):
+    assert field in contract["publisherGenerated"], contract
+assert "quote the exact offending substring" in contract["note"], contract
+
+# 2. Candidate content is the LAST key, so nothing trails it once flattened.
+assert list(payload)[-1] == "skillFiles", list(payload)
+
+# 3. The dispatch message states the boundary in words, not only structurally.
+assert "payload.packetContract" in lane["message"], lane["message"]
+assert "publisher-generated" in lane["message"], lane["message"]
+
+# 4. Regression: the scaffolding must not be reachable inside candidate content.
+blob = json.dumps(payload["skillFiles"])
+for token in ("verdict", "rubric", "reviewer", "machineGate", "workerProcedure"):
+    assert token not in blob, (token, blob)
+
+# 5. The revise lane carries the same contract and the same ordering.
+rev = m._build_revise_manifest(
+    config, pr_number="8", branch="skill-intake/authornode/gate-skill", head="a" * 40,
+    node="authornode", provider="claude", name="gate-skill", tree_sha256="c" * 64,
+    round_no=1, findings=[{"severity": "major", "area": "spec", "note": "n"}],
+    skill_files=[{"path": "SKILL.md", "content": "body"}],
+    procedure="## Worker procedure\n" + ("x" * 300), broker_id="seoseo",
+    now="20260910T000000Z",
+)
+rev_payload = rev["lanes"][0]["payload"]
+assert rev_payload["packetContract"] is payload["packetContract"], "contract must be shared"
+assert list(rev_payload)[-1] == "skillFiles", list(rev_payload)
+assert "payload.packetContract" in rev["lanes"][0]["message"], rev["lanes"][0]["message"]
+print("PACKET-BOUNDARY-OK")
+FIXTURE
+env "${base_env[@]}" python3 "$BOUNDARY_FIXTURE" "$PROMOTER" > "$TMP/boundary-out" 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "dispatch packets state the candidate/scaffolding boundary in words and put candidate content last" \
+  '[ "$rc" = 0 ] && grep -q "PACKET-BOUNDARY-OK" "$TMP/boundary-out"'
 
 echo "PASS=$pass FAIL=$fail"
 python3 "$HERE/ccc_skill_receipt_retry_test.py" || fail=$((fail+1))
