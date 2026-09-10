@@ -234,7 +234,7 @@ MEMORY_GROUP = "Memory parity"
 
 # Danso first Telegram integration: claims are intentionally bounded.
 _DANSO_STATUSES: Mapping[str, CapabilityStatus] = {
-    "runtime_adapter": _supported('Bounded Danso CLI subprocess mapped to native Telegram events; OpenAI Astra initially supported.'),
+    "runtime_adapter": _supported('Bounded Danso CLI subprocess mapped to native Telegram events. Provider lane is chosen by CCC_DANSO_AUTH_MODE: api-key→openai (gpt-6-astra), chatgpt→openai-codex, zai→glm (glm-5.3-flash default; danso #70).'),
     "session_resume": _supported('The current conversation resumes its exact private journal UUID, including after bridge restart; foreign journal selection is disabled.'),
     "text_streaming": _degraded('Final text is buffered until the bounded subprocess exits; no incremental text or tool progress is available.'),
     "reasoning_stream": _unsupported('Not implemented by the initial Danso Telegram integration.'),
@@ -244,18 +244,18 @@ _DANSO_STATUSES: Mapping[str, CapabilityStatus] = {
     "turn_interrupt": _supported('Interrupt and cancellation terminate and reap the owned subprocess group; journals are preserved.'),
     "turn_serialization": _supported('Per-session asyncio lock plus native cross-process journal locking.'),
     "session_browsing": _unsupported('Not implemented by the initial Danso Telegram integration.'),
-    "model_discovery": _degraded('The configured Astra model and supported efforts are listed locally; account discovery is not implemented.'),
+    "model_discovery": _degraded('The configured model and supported efforts are listed locally per auth mode (gpt-6-astra for api-key/chatgpt, glm-5.3-flash default for zai); account discovery is not implemented.'),
     "usage_metering": _degraded('Successful turn counters are locally recorded; failed request usage and account quotas are not complete.'),
     "terminal_stall_release": _supported('The CLI and adapter enforce finite deadlines and drain owned readers before emitting a terminal event.'),
     "async_completion_delivery": _unsupported('Not implemented by the initial Danso Telegram integration.'),
     "external_wait": _unsupported('Not implemented by the initial Danso Telegram integration.'),
-    "memory_session_resume": _degraded('Native journal history and checkpoint compaction resume; CCC memory routing remains unsupported.'),
-    "memory_read_bootstrap": _unsupported('Not implemented by the initial Danso Telegram integration.'),
-    "memory_postcompact_reinject": _unsupported('Not implemented by the initial Danso Telegram integration.'),
-    "memory_writeback_distill": _unsupported('Not implemented by the initial Danso Telegram integration.'),
-    "memory_sink_local": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "memory_session_resume": _degraded('Native journal history resumes within its exact audience namespace; enabling memory requires a new conversation.'),
+    "memory_read_bootstrap": _supported('Opt-in audience-scoped CCC materialization refreshes before each native invocation; the explicit private system context requires an updated Danso binary. Flag-gated native path (CCC_DANSO_NATIVE_MEMORY / danso_native_memory=native-read) skips the materializer and injects Danso\'s own bounded managed snapshot via --memory read (danso #52 M2, PRs #55/#58).'),
+    "memory_postcompact_reinject": _degraded('Native run-local system memory survives compaction and is refreshed on the next invocation. The runtime now exposes a per-request context-refresh hook (--memory-refresh per-request, danso #52 M2 PR #58) that re-assembles memory right after each compaction, but the bridge does not pass the flag yet, so mid-invocation refresh stays off in production.'),
+    "memory_writeback_distill": _supported('Opt-in checkpoint/new/shutdown jobs use locked scoped snapshots and isolated tool-free native extraction under a finite autonomous budget.'),
+    "memory_sink_local": _supported('Validated Danso facts and resume context use the existing idempotent audience-bound local sink; no automatic Wiki publication.'),
     "memory_sink_wiki_candidate": _unsupported('Not implemented by the initial Danso Telegram integration.'),
-    "memory_roundtrip": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "memory_roundtrip": _supported('Hermetic saved-fact to next Danso materializer tests recall one fact once and exclude it from the shared route.'),
     "lifecycle_observability": _supported('Provider-neutral opt-in lifecycle observations are body-free, bounded, owner-only and fail-open. Final Telegram delivery is not inferred from runtime completion; no native tool progress events are available.'),
 }
 

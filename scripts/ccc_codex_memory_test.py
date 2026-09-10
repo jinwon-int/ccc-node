@@ -910,6 +910,23 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.assertEqual(completed.stdout, "")
         self.assertEqual(completed.stderr, "")
 
+    def test_read_only_nunchi_uses_fresh_snapshot_without_regenerating_stale_data(self) -> None:
+        loader, env, base = self._prepare_nunchi_loader(snapshot="FRESH_READ_ONLY")
+        env["CCC_MEMORY_NO_REFRESH"] = "1"
+        marker = self.root / "readonly-regen-marker"
+        script = loader.parent / "nunchi.py"
+        script.write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n")
+        script.chmod(0o600)
+        fresh = self._run_nunchi_loader(loader, env)
+        self.assertIn("FRESH_READ_ONLY", fresh.stdout)
+        snapshot = Path(env["NUNCHI_SNAPSHOT"])
+        old = time.time() - 3600
+        os.utime(snapshot, (old, old))
+        stale = self._run_nunchi_loader(loader, env)
+        self.assertEqual(json.loads(stale.stdout), base)
+        self.assertEqual(snapshot.read_text(), "FRESH_READ_ONLY")
+        self.assertFalse(marker.exists())
+
     def test_nunchi_loader_stale_snapshot_regeneration_is_bounded(self) -> None:
         loader, env, base_document = self._prepare_nunchi_loader(snapshot="STALE")
         snapshot_path = Path(env["NUNCHI_SNAPSHOT"])

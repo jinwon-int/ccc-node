@@ -1047,3 +1047,27 @@ async def test_budget_equal_to_input_estimate_cannot_admit_output_overrun(
     assert backend.calls == []
     assert result.status is DistillJobStatus.SNAPSHOT_DONE
     assert meter.used_tokens("codex") == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("blocked_by", ["disabled", "cooldown", "budget"])
+async def test_danso_production_guards_defer_without_claim_or_dispatch(tmp_path, blocked_by):
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal, provider="danso")
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    guard = DistillGuard(state_dir=state)
+    if blocked_by == "disabled":
+        (state / "distill.disabled").touch(mode=0o600)
+    if blocked_by == "cooldown":
+        guard.trip("danso", "gpt-5.6-luna", error_code="distill_rate_limited", cooldown_seconds=600)
+        assert guard.decision("piri", "gpt-5.6-luna").allowed
+        assert guard.decision("danso", "other-model").allowed
+    backend = SuccessfulBackend()
+    meter = UsageMeter(tmp_path / "usage.json", budgets={"danso": 1 if blocked_by == "budget" else 500000})
+    worker = CodexDistillExtractionWorker(journal, backend, usage_meter=meter,
+        guard=guard, extractor_provider="danso", model="gpt-5.6-luna", wiki_enabled=False)
+    result = await worker.extract_once(job_id=job.job_id)
+    assert result.status is DistillJobStatus.SNAPSHOT_DONE
+    assert result.extraction_attempts == 0 and backend.calls == []

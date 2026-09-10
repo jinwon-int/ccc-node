@@ -137,7 +137,12 @@ while [ $# -gt 0 ]; do
     --user-gh)      need_val "$1" "${2:-}"; OPT_USER_GH="$2"; shift ;;
     --user-tz)      need_val "$1" "${2:-}"; OPT_USER_TZ="$2"; shift ;;
     --user-context) need_val "$1" "${2:-}"; OPT_USER_CONTEXT="$2"; shift ;;
-    *) echo "Unknown flag: $1" >&2; exit 2 ;;
+    -h|--help)
+      # Print the header comment block rather than a second copy of the usage:
+      # a duplicated help text drifts from the flags it documents.
+      sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d; s/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "Unknown flag: $1" >&2; echo "Try './setup.sh --help'." >&2; exit 2 ;;
   esac
   shift
 done
@@ -589,6 +594,15 @@ run atomic_install "$SRC/scripts/ccc-fleet-skills-sync.py" "$CLAUDE_DIR/hooks/cc
 # Self-update — the pre-approved node maintenance procedure (pull + setup +
 # restart of operator-allowlisted services only; see docs/self-update.md).
 run atomic_install "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
+# Trusted signing keys for the self-update tip check (#1599). The deployed hook
+# resolves its keyring relative to ITSELF ($SELF_UPDATE_DIR/trusted-keys/), i.e.
+# under $CLAUDE_DIR/hooks — not the repo's scripts/ directory. Without this the
+# key material never leaves the checkout and every node reports `no-keyring`
+# forever, which fails closed: verification could never go green and `enforce`
+# would stop the whole fleet. Public key material only; never a private key.
+run mkdir -p "$CLAUDE_DIR/hooks/trusted-keys"
+run atomic_install "$SRC/scripts/trusted-keys/github-web-flow.gpg" \
+  "$CLAUDE_DIR/hooks/trusted-keys/github-web-flow.gpg"
 # PR/issue status poll (ccc-node#962) — notices when a PR this node's bridge
 # identity opened changes state (CI done, closed, merged); scheduled
 # separately via scripts/install-pr-status-poll-cron.sh, tracks only the

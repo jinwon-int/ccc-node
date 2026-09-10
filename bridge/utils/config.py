@@ -68,6 +68,11 @@ CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 # scripts/ccc_doctor.py USAGE_BUDGET_TOKENS_DEFAULT; a test pins the two equal.
 USAGE_BUDGET_TOKENS_DEFAULT = 2_000_000
 
+# Native Danso measures the exact serialized request, including injected system
+# context and tool schemas. Keep enough headroom for the largest normal CCC
+# memory snapshot instead of making the default impossible before dispatch.
+DEFAULT_DANSO_COMPACT_AT_BYTES = 128 * 1024
+
 
 class Config(
     MemorySettingsMixin,
@@ -228,18 +233,95 @@ class Config(
     )
     danso_sandbox: Literal["host", "bubblewrap"] = Field(default="host", alias="CCC_DANSO_SANDBOX")
     danso_cli_path: str = Field(default="danso", alias="CCC_DANSO_CLI_PATH")
+    danso_tool_home: Optional[str] = Field(
+        default=None,
+        alias="CCC_DANSO_TOOL_HOME",
+        description=(
+            "Optional absolute host-only HOME for native development tools. "
+            "The provider/context HOME remains the private Danso state HOME."
+        ),
+    )
+    danso_auth_mode: Literal["api-key", "chatgpt", "zai"] = Field(default="api-key", alias="CCC_DANSO_AUTH_MODE")
+    zai_api_key: Optional[str] = Field(
+        repr=False, default=None,
+        description="Z.AI API key for the Danso GLM provider (zai auth mode)")
+    danso_glm_base_url: Optional[str] = Field(
+        default=None, alias="DANSO_GLM_BASE_URL",
+        description="Explicit GLM API base; wins over DANSO_GLM_ENDPOINT but must not contradict it")
+    danso_glm_endpoint: Optional[Literal["general", "coding"]] = Field(
+        default=None, alias="DANSO_GLM_ENDPOINT",
+        description="GLM endpoint preset: general | coding (default general)")
+    danso_chatgpt_auth_file: Optional[str] = Field(default=None, alias="DANSO_CHATGPT_AUTH_FILE")
+    danso_chatgpt_base_url: Optional[str] = Field(default=None, alias="DANSO_CHATGPT_BASE_URL")
     danso_state_dir: Optional[str] = Field(default=None, alias="CCC_DANSO_STATE_DIR")
     danso_workspace: Optional[str] = Field(default=None, alias="CCC_DANSO_WORKSPACE")
     danso_model: str = Field(default="gpt-6-astra", min_length=1, alias="CCC_DANSO_MODEL")
     danso_effort: Literal["low", "medium", "high", "xhigh", "max"] = Field(
         default="medium", alias="CCC_DANSO_EFFORT")
     danso_base_url: Optional[str] = Field(default=None, alias="DANSO_OPENAI_BASE_URL")
-    danso_timeout_seconds: int = Field(default=300, ge=1, le=3600, alias="CCC_DANSO_TIMEOUT_SECONDS")
-    danso_provider_timeout_seconds: int = Field(default=60, ge=1, le=300,
+    danso_timeout_seconds: int = Field(default=3600, ge=1, le=3600, alias="CCC_DANSO_TIMEOUT_SECONDS")
+    danso_provider_timeout_seconds: int = Field(default=180, ge=1, le=300,
                                               alias="CCC_DANSO_PROVIDER_TIMEOUT_SECONDS")
-    danso_max_turns: int = Field(default=32, ge=1, le=128, alias="CCC_DANSO_MAX_TURNS")
-    danso_compact_at_bytes: int = Field(default=32768, ge=8192, le=393216,
+    danso_max_turns: int = Field(default=64, ge=1, le=128, alias="CCC_DANSO_MAX_TURNS")
+    danso_max_output_tokens: int = Field(default=16384, ge=256, le=131072,
+                                         alias="CCC_DANSO_MAX_OUTPUT_TOKENS")
+    danso_compact_at_bytes: int = Field(default=DEFAULT_DANSO_COMPACT_AT_BYTES, ge=8192, le=393216,
                                        alias="CCC_DANSO_COMPACT_AT_BYTES")
+    # Long tasks are the default; operators can explicitly select ordinary mode.
+    # The ordinary-mode deadline remains separate from the cumulative task limit.
+    danso_long_task_enabled: bool = Field(
+        default=True,
+        alias="CCC_DANSO_LONG_TASK_ENABLED",
+        description="Use the native Danso long-task state machine; default on.",
+    )
+    danso_long_task_timeout_seconds: int = Field(
+        default=21600,
+        ge=1,
+        le=21600,
+        alias="CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS",
+        description=(
+            "Native long-task cumulative active-runtime limit, excluding operator pauses, "
+            "at most six hours."
+        ),
+    )
+    danso_task_stage_requests: int = Field(
+        default=16,
+        ge=1,
+        le=1024,
+        alias="CCC_DANSO_TASK_STAGE_REQUESTS",
+        description=(
+            "Target provider requests in one native long-task stage; safe-boundary "
+            "compaction may consume additional bounded requests."
+        ),
+    )
+    danso_task_max_requests: int = Field(
+        default=1024,
+        ge=1,
+        le=2048,
+        alias="CCC_DANSO_TASK_MAX_REQUESTS",
+        description="Cumulative provider-request budget for one native long task (up to 2048).",
+    )
+    danso_task_max_tokens: int = Field(
+        default=10_000_000,
+        ge=1,
+        le=25_000_000,
+        alias="CCC_DANSO_TASK_MAX_TOKENS",
+        description="Cumulative reported-token budget for one native long task (up to 25M).",
+    )
+    danso_task_repeat_limit: int = Field(
+        default=3,
+        ge=2,
+        le=8,
+        alias="CCC_DANSO_TASK_REPEAT_LIMIT",
+        description="Native long-task repeated identical tool-batch safety limit.",
+    )
+    danso_task_pause_after_stage: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=2048,
+        alias="CCC_DANSO_TASK_PAUSE_AFTER_STAGE",
+        description="Optional native pause point for staged long-task testing/resume.",
+    )
     usage_budget_tokens_danso: int = Field(default=0, ge=0, alias="CCC_USAGE_BUDGET_TOKENS_DANSO")
 
     usage_meter_enabled: bool = Field(

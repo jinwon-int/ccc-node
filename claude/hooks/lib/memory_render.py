@@ -231,7 +231,7 @@ def run_memory_search_bounded(tool, query, limit, raw_timeout, state_override, d
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             env=env,
-            start_new_session=True,
+            start_new_session=env.get("CCC_MEMORY_MATERIALIZER_PROVIDER") != "danso",
         )
     except OSError as exc:
         sys.stderr.write(

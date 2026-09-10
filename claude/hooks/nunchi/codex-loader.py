@@ -294,7 +294,7 @@ def _start_process(
             stdin=stdin_file if stdin_file is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            start_new_session=environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") != "danso",
             bufsize=0,
         )
     except OSError:
@@ -464,6 +464,8 @@ def _one_nunchi_context(
         maximum=24 * 60 * 60,
     )
     if time.time() - snapshot[1].st_mtime > max_age:
+        if nunchi_environ.get("CCC_MEMORY_NO_REFRESH") == "1":
+            return None
         script = _validate_managed_script(hook_dir / "nunchi.py")
         if script is None or not _regenerate_snapshot(
             script, effective_environ, deadline=deadline

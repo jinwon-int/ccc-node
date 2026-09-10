@@ -65,6 +65,23 @@ policy. Per-file doctor checks remain necessary for that case. Forced first
 deployments commit only after setup and preflight. Degraded rollback
 continues to require inspection of its audit and retained recovery snapshot.
 
+### Reconciled-generation gate (opt-in)
+
+`CCC_SELF_UPDATE_REQUIRE_MARKER_MATCH=1` refuses a missing or mismatched
+installed-SHA marker with exit 4 before the normal fetch/merge, even with
+`run --force`. Default behavior is unchanged. This check follows the existing
+idle gate and branch recovery; it is not a read-only inspection guarantee.
+Reconcile source and installed artifacts using a verified deployment before
+retrying; merely rewriting the marker does not reconcile an installation.
+This option does not authorize root execution, bypass ownership guards, or
+provide an atomic request-drain/restart handoff.
+
+Rollback always restores the **actual pre-run checkout SHA** and the actual
+pre-run managed artifact snapshot. A lagging marker triggers redeployment
+under the default policy, but must never select a historical source rollback
+target. Source and artifact generations may already differ before the run;
+restoring that snapshot does not assert they match or restore a bridge venv.
+
 `ccc-self-update.sh status` is the read-only inspection mode.
 
 ## Why this preserves "separation of approval from execution"
@@ -230,6 +247,9 @@ still does not include a complete previous dependency environment.
 | `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` | `3600` | cap total deferral so continuous load can't starve updates |
 | `CCC_SELF_UPDATE_REAPPLY` | `1` | set to `0` to skip installer cron re-apply; equivalent operator file: `~/.claude/self-update.no-reapply` |
 | `CCC_SELF_UPDATE_CRONTAB_CMD` | `crontab` | crontab binary (tests inject a stub) |
+| `CCC_SELF_UPDATE_SIGNATURE_MODE` | `warn` | tip signature policy: `warn` (verify + report, still apply), `enforce` (refuse an unverified tip, exit 13), `off` (skip) |
+| `CCC_SELF_UPDATE_SIGNATURE_KEYRING` | `scripts/trusted-keys/github-web-flow.gpg` | keyring holding the permitted signing keys |
+| `CCC_SELF_UPDATE_TRUSTED_FPRS` | GitHub web-flow fingerprints | newline-separated full fingerprints allowed to sign the tip |
 
 Exit codes: 0 ok/up-to-date · 3 lock held · 4 precondition failed · 5 fetch/ff
 failed · 6 setup/snapshot failed (repo and managed artifacts were verified
@@ -242,6 +262,9 @@ file missing/empty); running processes may still hold the old code, so this
 is reported as non-ok to surface silent drift rather than `result:"ok"`.
 12 installer re-apply failed — crontab was restored from the pre-reapply
 snapshot; the repo/harness stay at the new SHA (setup already succeeded).
+13 incoming tip signature could not be verified and
+`CCC_SELF_UPDATE_SIGNATURE_MODE=enforce` — nothing was merged, so the node
+stays on its current SHA (see "Tip signature verification" below).
 On exit 9, the validated private recovery snapshot is retained under
 `~/.claude/state/self-update-install-rollback.*/` (`0700` directory containing
 `0600` Claude and Hermes archives) for local operator
@@ -253,6 +276,71 @@ false success. Normal success and successful rollback remove it automatically.
 degraded and prints the retained private transaction directory. The outer
 self-update layer must still verify its own repository + Claude + Hermes
 rollback rather than treating that exit as a complete restore.
+
+### Tip signature verification (#1591)
+
+Before the ff-merge, the incoming `origin/$BRANCH` tip is checked for a good
+signature from a pinned key. Order is load-bearing: verifying after the merge
+would already have moved the checkout onto unverified code, and `setup.sh` runs
+*from that checkout* as root.
+
+The keyring is imported into a private throwaway `GNUPGHOME` built from key
+material vendored at `scripts/trusted-keys/github-web-flow.gpg`, so the verdict
+never depends on — and never mutates — the node's own gpg keyring.
+
+**The keyring must be deployed, not just committed (#1599).** The hook resolves
+its keyring relative to *itself*, so on a node it reads
+`~/.claude/hooks/trusted-keys/github-web-flow.gpg`, not the repo copy;
+`setup.sh` installs it there. When the first version shipped without that
+install step, every deployed node logged `no-keyring` on every tick — fail-closed
+and correct as a verdict, but it meant verification could never go green and
+`enforce` would have stopped the whole fleet. If a node reports `no-keyring`,
+re-run `setup.sh` before looking anywhere else. Trust is
+pinned by **full fingerprint**; a `GOODSIG` from some other key the keyring
+happens to hold is rejected. `gpg` missing, keyring missing, bad signature, and
+unpinned signer all resolve to "not verified" (never to a silent pass).
+
+**What this does and does not prove.** GitHub signs every squash-merge made
+through its UI/API, so a commit pushed straight to the branch with a stolen
+deploy key carries no such signature and is caught. It does *not* attest which
+human authored the change — branch protection, required checks and CODEOWNERS
+remain the author control. This closes the "stolen push credential" path, not
+the "compromised reviewer" path.
+
+**Why the default is `warn`, not `enforce`.** This script is delivered by the
+very mechanism it gates. Landing `enforce` as the default would strand any node
+that cannot verify — on the commit that would have fixed it, with no self-update
+path back. So the rollout is two-stage: ship `warn`, collect evidence from
+`~/.claude/state/self-update.log` across the fleet, then flip the default in a
+separate change. Nodes can opt in early with
+`CCC_SELF_UPDATE_SIGNATURE_MODE=enforce`.
+
+**Every tick verifies, including up-to-date ones (#1597).** Verification is not
+skipped when the tip already equals HEAD, so each scheduled tick doubles as a
+capability probe — "can this node's gpg and keyring verify the current tip?" —
+and the log line records which case it was:
+
+```
+signature ok rev=<sha> changed=no  mode=warn     # probe: nothing to merge
+signature ok rev=<sha> changed=yes mode=warn     # a real incoming tip
+signature no-gpg rev=<sha> changed=no mode=warn proceeding
+```
+
+The `changed=` label exists because the two cases were previously
+indistinguishable: an up-to-date tick short-circuited to `ok` without running
+gpg at all and logged the same line as a real verification. On this fleet most
+ticks are up-to-date (40 of 51 successful ticks on one node), so the log was
+dominated by lines that a node without gpg would have produced identically —
+useless as readiness evidence, and actively misleading for the flip decision.
+
+**`enforce` refuses only an actually-new tip.** A failed probe on an up-to-date
+tick is logged and the tick proceeds: that code is already checked out and
+running, so refusing protects nothing while cutting the node off from the update
+that would fix it.
+
+Flip criteria: every node in the fleet logging non-`ok` **zero** times for seven
+consecutive days, plus at least one `changed=yes` success somewhere in the fleet
+so the real update path — not just the probe — is known to pass.
 
 ### Forced reapply and bounded operator commands (#1523)
 

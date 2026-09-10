@@ -17,6 +17,7 @@ from claude_agent_sdk import (
     ResultMessage,
 )
 
+from telegram_bot.runtime_config_check import DEFAULT_PROCESS_TIMEOUT_SECONDS
 from telegram_bot.utils.config import config
 from telegram_bot.core.task_ledger import (
     TaskLedger,
@@ -38,6 +39,7 @@ from telegram_bot.core.usage import (
     SNAPSHOT_TTL_SECONDS,
     UsageSnapshot,
     delta_from_snapshots,
+    detect_danso_service,
     load_claude_status_snapshot,
     local_claude_environment_snapshot,
     local_piri_environment_snapshot,
@@ -282,7 +284,7 @@ class ProjectChatHandler(
         # Production always injects validated Settings. The fallback preserves
         # legacy lightweight test adapters that pass a partial namespace.
         self._process_timeout_seconds = int(
-            getattr(self._config, "process_timeout_seconds", 21600)
+            getattr(self._config, "process_timeout_seconds", DEFAULT_PROCESS_TIMEOUT_SECONDS)
         )
         self._typing_interval_seconds = TYPING_INTERVAL
         self._conversation_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
@@ -984,7 +986,14 @@ class ProjectChatHandler(
                     local_piri_environment_snapshot()
                 )
             if provider == "danso":
-                return self._fill_local_service_windows(UsageSnapshot(provider="danso", service="Danso"))
+                # Issue #70: the operator names the backing service so the
+                # Z.AI 5-hour/weekly windows render for the Danso lane.
+                service = detect_danso_service()
+                if service is None:
+                    return self._fill_local_service_windows(
+                        UsageSnapshot(provider="danso", service="Danso"))
+                return self._fill_local_service_windows(
+                    UsageSnapshot(provider="danso", service=service, plan_type=service))
             if provider != "claude":
                 return UsageSnapshot(provider=provider)
             # Claude adapter path (#584): ClaudeRuntime exposes no usage

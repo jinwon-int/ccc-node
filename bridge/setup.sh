@@ -284,7 +284,7 @@ write_env_file() {
         echo ""
         echo "# Logging and timeout"
         echo "# LOG_LEVEL=INFO"
-        echo "# CLAUDE_PROCESS_TIMEOUT=21600"
+        echo "# CLAUDE_PROCESS_TIMEOUT=21660"
         echo "# CCC_DELEGATED_TASK_STALL_SECONDS=7200"
         echo ""
         echo "# Streaming configuration"

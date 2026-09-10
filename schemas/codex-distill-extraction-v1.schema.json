@@ -12,7 +12,8 @@
           "enum": [
             "claude",
             "codex",
-            "piri"
+            "piri",
+            "danso"
           ],
           "title": "Provider",
           "type": "string"
