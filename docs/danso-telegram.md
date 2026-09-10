@@ -341,3 +341,16 @@ retry. These fields describe the observed failure, not its underlying cause;
 previous failures without this metadata cannot be diagnosed retroactively.
 Auth-store errors and other response-processing failures may still carry only
 the existing category.
+
+### Optional Z.AI limit details
+
+Updated native Danso may emit a separate `DANSO_HTTP` v1 record with exactly
+`version`, `provider` (`zai`), `http_status`, `provider_code`, and
+`retry_after_seconds`. The adapter requires a matching valid HTTP
+`DANSO_PROVIDER` record, a documented allowlisted integer code or null, and a
+0..86400 integer delay or null. Invalid/duplicate extensions are ignored without
+losing the primary HTTP diagnosis. Display uses `zai_code` and
+`retry_after_seconds`; provider prose is never relayed. Any such failure marker
+on successful exit remains a protocol error. Native retry/replay rules do not
+change. Upgrade the bridge before the native binary; previous binaries remain
+compatible but cannot supply the new detail.

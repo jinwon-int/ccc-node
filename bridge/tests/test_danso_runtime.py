@@ -595,7 +595,7 @@ def test_task_progress_is_strict_bounded_and_body_free():
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("prefix", ["DANSO_TRANSPORT=", "DANSO_PROVIDER="])
+@pytest.mark.parametrize("prefix", ["DANSO_TRANSPORT=", "DANSO_PROVIDER=", "DANSO_HTTP="])
 async def test_transport_record_on_success_is_adapter_failure(configured, prefix):
     binary = Path(configured.danso_cli_path)
     binary.write_text("""#!/usr/bin/python3
