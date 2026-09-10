@@ -113,6 +113,14 @@ ok "empty agent output is a handler failure" '[ "$rc" != 0 ]'
 make_task "$HEAD_OK"
 REVIEW_STUB_MODE=prose run_handler "$TMP/task.json" >/dev/null 2>&1; rc=$?
 ok "prose-only output (no verdict JSON) is a handler failure" '[ "$rc" != 0 ]'
+# #1619: an unparseable verdict must be diagnosable after the fact — the temp
+# dir holding the model output is gone by the time anyone reads the broker
+# error, so the excerpt has to travel with the failure (sogyo pr140).
+REVIEW_STUB_MODE=prose run_handler "$TMP/task.json" 2> "$TMP/prose.err" >/dev/null
+ok "unparseable verdict reports size, object count and an excerpt (#1619)" \
+  'grep -q "json_objects_found=0" "$TMP/prose.err" &&
+   grep -q "bytes=" "$TMP/prose.err" &&
+   grep -q "HANDLER_FAIL_HEAD: This candidate looks generally fine to me." "$TMP/prose.err"'
 
 # ─── dispatcher routing ──────────────────────────────────────────────────────
 printf '#!/usr/bin/env bash\necho REVIEW-HANDLER-CALLED\n' > "$BIN/review-stub"
@@ -287,6 +295,47 @@ bash "$INSTALLER" --termux --dest "$TMP/termux-dest-1460" >/dev/null 2>&1
 # shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "installer Termux profile ships the revise handler (#1460)" '[ "$rc" = 0 ] && [ -x "$TMP/termux-dest-1460/skills-intake-revise-handler.sh" ]'
+
+# ─── prompt packet boundary (#1619) ─────────────────────────────────────────
+# The candidate must be fenced and emitted LAST, after every piece of
+# publisher scaffolding, so a reviewer cannot read the trailing procedure /
+# verdict schema / bindings / machine-gate block as material the author
+# appended to their own skill (2026-09-10 false-positive reject).
+cat > "$BIN/capture-agent" <<'CAPSTUB'
+#!/usr/bin/env bash
+cat > "$PROMPT_CAPTURE"
+printf '{"verdict":"approve","findings":[],"head_sha":"%s","rubric_version":"2026-08-28.2","model":"stub-model"}' "$REVIEW_STUB_HEAD"
+CAPSTUB
+chmod +x "$BIN/capture-agent"
+CAPTURED="$TMP/captured-prompt.txt"
+TREE_SHA="c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2"
+FENCE="CANDIDATE-${TREE_SHA:0:16}"
+make_task "$HEAD_OK"
+REVIEW_AGENT_BIN="$BIN/capture-agent" REVIEW_AGENT_ARGS="" REVIEW_TIMEOUT_SEC=30 \
+  WORKER_ID=testnode REVIEW_STUB_HEAD="$HEAD_OK" PROMPT_CAPTURE="$CAPTURED" \
+  bash "$HANDLER" < "$TMP/task.json" >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "candidate is wrapped in a tree-hash-derived fence (#1619)" \
+  '[ "$rc" = 0 ] && grep -qxF "===== BEGIN $FENCE =====" "$CAPTURED" && grep -qxF "===== END $FENCE =====" "$CAPTURED"'
+ok "prompt states the packet boundary and the quote-or-drop rule (#1619)" \
+  'grep -q "PACKET BOUNDARY" "$CAPTURED" && grep -q "quote the exact offending substring" "$CAPTURED"'
+# Ordering: every scaffolding section must precede the candidate fence.
+boundary_order_ok() {
+  local begin_ln end_ln ln
+  begin_ln="$(grep -nxF "===== BEGIN $FENCE =====" "$CAPTURED" | head -1 | cut -d: -f1)"
+  end_ln="$(grep -nxF "===== END $FENCE =====" "$CAPTURED" | head -1 | cut -d: -f1)"
+  [ -n "$begin_ln" ] && [ -n "$end_ln" ] && [ "$end_ln" -gt "$begin_ln" ] || return 1
+  for section in "## Worker procedure" "## Verdict schema" "## Bindings" "## Machine gate results"; do
+    ln="$(grep -nF "$section" "$CAPTURED" | tail -1 | cut -d: -f1)"
+    [ -n "$ln" ] || return 1
+    [ "$ln" -lt "$begin_ln" ] || return 1
+  done
+  # Nothing but the closing fence may follow the candidate.
+  [ "$(sed -n "$((end_ln + 1)),\$p" "$CAPTURED" | tr -d '[:space:]' | wc -c)" -eq 0 ]
+}
+ok "all publisher scaffolding precedes the candidate fence, nothing trails it (#1619)" \
+  'boundary_order_ok'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
