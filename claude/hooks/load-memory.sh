@@ -311,6 +311,16 @@ else
   mem="$(cat "$MEMDIR/MEMORY.md" "$MEMDIR/USER.md" 2>/dev/null)"
   [ -z "$mem" ] && mem="$(cat "${HOME:-/root}/.hermes/memories/MEMORY.md" "${HOME:-/root}/.hermes/memories/USER.md" 2>/dev/null)"
 fi
+# Persona (assistant identity) — node-scoped, injected verbatim. Nodes
+# without a non-empty PERSONA.md keep byte-identical output (no section).
+persona="$(cat "$MEMDIR/PERSONA.md" 2>/dev/null)"
+persona_block=""
+if [ -n "$persona" ]; then
+  persona_block="## PERSONA (assistant identity)
+${persona}
+
+"
+fi
 wiki=""
 if ! is_disabled "$WIKI_ENABLED"; then
   wiki="$(cat "$CACHE/wiki.txt" 2>/dev/null)"
@@ -685,7 +695,7 @@ ${resume_block}${operational_note}
 ${audience_note}
 Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}. ${refresh_note}.
 
-## Built-in MEMORY + USER
+${persona_block}## Built-in MEMORY + USER
 ${mem:-(memory files unavailable)}
 ${ws_block}${promises_block}${detached_block}
 ## Local hot memory (task-conditioned cache search)
