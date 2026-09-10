@@ -40,8 +40,12 @@ attachments, remote shell operation, redirect or HTTP proxy is accepted.
 | acceptance | POST `/api/promptAcceptanceStatus` | account `host`, Bot ID, nonce |
 | send | POST `/api/sendPrompt` | Bot ID, nonce, bounded plain text |
 
-The HTTP timeout is 10 seconds; the whole local SSH exchange is bounded to
-20 seconds. stdout is capped at 1 MiB and stderr at 4 KiB. JSON rejects
+The HTTP timeout is 10 seconds; the local SSH exchange is bounded to
+20 seconds, with a separate maximum two-second process cleanup budget.
+The transport owns a dedicated local process group, terminates that group
+on failure/cancellation, and closes local pipes even if a helper escapes it.
+That does not terminate an escaped helper or interrupt the remote Bot.
+stdout is capped at 1 MiB and stderr at 4 KiB. JSON rejects
 duplicate keys, excessive structure, non-finite and oversized numeric values.
 Errors are categorical and contain no gateway error body. Each call makes at
 most one HTTP request. **It never retries a send.** An SSH failure can happen

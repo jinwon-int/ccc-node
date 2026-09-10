@@ -137,6 +137,7 @@ class SshTests(unittest.IsolatedAsyncioTestCase):
     async def run_child(self, code, operation="health", arguments=None):
         original = asyncio.create_subprocess_exec
         children = []
+        self.children = children
         async def spawn(*argv, **kwargs):
             self.assertEqual(argv[-1], "python3 -I -")
             self.assertIn("BatchMode=yes", argv)
@@ -228,6 +229,40 @@ class SshTests(unittest.IsolatedAsyncioTestCase):
                         os.kill(int(marker.read_text()), signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+    async def test_exited_parent_owned_or_escaped_pipe_cleanup(self):
+        for escaped in (False, True):
+            with self.subTest(escaped=escaped), tempfile.TemporaryDirectory() as root:
+                marker = Path(root) / "child"
+                code = ('import os,sys,time;sys.stdin.buffer.read();p=os.fork();'
+                        'os._exit(0) if p else None;'
+                        + ('os.setsid();' if escaped else '') +
+                        f'open({str(marker)!r},"w").write(str(os.getpid()));time.sleep(15)')
+                task = asyncio.create_task(self.run_child(code))
+                try:
+                    for _ in range(200):
+                        if (marker.exists() and marker.read_text() and self.children
+                                and self.children[0].returncode == 0):
+                            break
+                        await asyncio.sleep(0.01)
+                    self.assertTrue(marker.exists())
+                    process = self.children[0]
+                    self.assertEqual(process.returncode, 0)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, 4)
+                    transport = getattr(process, "_transport")
+                    self.assertTrue(transport.is_closing())
+                    for fd in (0, 1, 2):
+                        pipe = transport.get_pipe_transport(fd)
+                        if pipe:
+                            self.assertTrue(pipe.is_closing())
+                finally:
+                    if marker.exists() and marker.read_text():
+                        try:
+                            os.kill(int(marker.read_text()), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
 
 
 if __name__ == "__main__":

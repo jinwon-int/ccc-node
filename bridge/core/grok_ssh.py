@@ -70,6 +70,7 @@ class GrokSshTransport:
         assert process.stdin is not None and process.stdout is not None and process.stderr is not None
         stdout = asyncio.create_task(_read_bounded(process.stdout, MAX_WIRE))
         stderr = asyncio.create_task(_read_bounded(process.stderr, 4096))
+        settled = False
         try:
             async with asyncio.timeout(20):
                 process.stdin.write(source)
@@ -79,7 +80,9 @@ class GrokSshTransport:
                 code = await process.wait()
                 if code:
                     raise ProtocolError("ssh_gateway_failure")
-                return decode_wire(out)
+                decoded = decode_wire(out)
+                settled = True
+                return decoded
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -87,11 +90,16 @@ class GrokSshTransport:
         finally:
             # SSH/ProxyCommand children can inherit pipes. Killing only the
             # immediate child leaves Process.wait pending on their open pipes.
-            if process.returncode is None or not stdout.done() or not stderr.done():
+            if not settled:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                # A naturally exited parent can have returncode=0 while its
+                # descendants still hold pipes; cancelled readers are also
+                # done without EOF. Always close local pipes on an unsettled
+                # exchange, including an escaped helper we cannot terminate.
+                getattr(process, "_transport").close()
             for task in (stdout, stderr):
                 if not task.done():
                     task.cancel()
