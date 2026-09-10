@@ -249,6 +249,37 @@ def _provider_detail(text, category, code):
         return ''
 
 
+def _http_detail(text, category, code, provider_detail):
+    """Optional Z.AI metadata; cross-check the independently valid HTTP record."""
+    if category != 'provider' or code != 3 or not provider_detail.startswith(', reason=http_status, http_status='):
+        return ''
+    lines = [line[len('DANSO_HTTP='):] for line in text.splitlines() if line.startswith('DANSO_HTTP=')]
+    if len(lines) != 1:
+        return ''
+    try:
+        value = json.loads(lines[0], object_pairs_hook=_unique_object)
+        keys = {'version', 'provider', 'http_status', 'provider_code', 'retry_after_seconds'}
+        if (type(value) is not dict or set(value) != keys
+                or type(value['version']) is not int or value['version'] != 1
+                or value['provider'] != 'zai'
+                or type(value['http_status']) is not int
+                or provider_detail != f", reason=http_status, http_status={value['http_status']}"):
+            return ''
+        provider_code = value['provider_code']
+        delay = value['retry_after_seconds']
+        allowed = {1113, 1302, 1305, 1308, 1309, 1310, 1311, 1313, 1314, 1315, 1316, 1317, 1318, 1319, 1320, 1321}
+        if provider_code is not None and (type(provider_code) is not int or provider_code not in allowed):
+            return ''
+        if delay is not None and (type(delay) is not int or not 0 <= delay <= 86400):
+            return ''
+        result = '' if provider_code is None else f', zai_code={provider_code}'
+        if delay is not None:
+            result += f', retry_after_seconds={delay}'
+        return result
+    except (ValueError, TypeError, RecursionError):
+        return ''
+
+
 def _transport(text, category, code):
     """Return trusted native transport facts, or ignore the optional record."""
     if category not in {'provider', 'provider_timeout'}:
@@ -389,9 +420,10 @@ def _failure(stderr, code):
         f', phase={transport[0]}, elapsed_ms={transport[1]}, request_bytes={transport[2]}, '
         f'attempts={transport[3]}')
     provider_detail = _provider_detail(text, category, code)
+    http_detail = _http_detail(text, category, code, provider_detail)
     label = 'timeout' if category == 'run_timeout' else category
     return ErrorEvent(code='danso_' + label, message=(
-        f'Worker failed: category={category}, exit_code={code}{counts}{transport_detail}{provider_detail}. '
+        f'Worker failed: category={category}, exit_code={code}{counts}{transport_detail}{provider_detail}{http_detail}. '
         'Reported usage may omit failed requests; not a total attempt count. No automatic replay.'))
 
 
@@ -874,7 +906,7 @@ class DansoSession:
             events.append(failure)
         else:
             if any(line.startswith(prefix) for line in stderr.splitlines()
-                   for prefix in (b'DANSO_ERROR=', b'DANSO_TRANSPORT=', b'DANSO_PROVIDER=')):
+                   for prefix in (b'DANSO_ERROR=', b'DANSO_TRANSPORT=', b'DANSO_PROVIDER=', b'DANSO_HTTP=')):
                 raise ValueError('failure diagnostic on successful exit')
             text = (stdout.finish() if use_jsonl else stdout).decode('utf-8').strip()
             usage = _usage(stderr.decode('utf-8'))

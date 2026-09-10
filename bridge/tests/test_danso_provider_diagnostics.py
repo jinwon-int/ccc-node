@@ -77,3 +77,30 @@ class ProviderDiagnostics(unittest.TestCase):
                 message = self.failure('DANSO_PROVIDER=' + json.dumps(record)).message
                 self.assertNotIn('reason=', message)
                 self.assertNotIn('PRIVATE', message)
+
+    def test_zai_http_extension_requires_matching_primary(self):
+        primary = 'DANSO_PROVIDER=' + json.dumps({
+            'version': 1, 'reason': 'http_status', 'http_status': 429,
+            'output_tokens_max': None})
+        valid = {'version': 1, 'provider': 'zai', 'http_status': 429,
+                 'provider_code': 1305, 'retry_after_seconds': 120}
+        def message(value, prefix=primary):
+            return self.failure(prefix + '\nDANSO_HTTP=' + json.dumps(value)).message
+        self.assertIn('zai_code=1305, retry_after_seconds=120', message(valid))
+        self.assertNotIn('zai_code=', message(valid, ''))
+        bad = [{**valid, 'version': True}, {**valid, 'provider': 'PRIVATE'},
+               {**valid, 'http_status': 503}, {**valid, 'provider_code': True},
+               {**valid, 'provider_code': '1305'}, {**valid, 'provider_code': 9999},
+               {**valid, 'provider_code': 1312}, {**valid, 'retry_after_seconds': -1},
+               {**valid, 'retry_after_seconds': 86401}, {**valid, 'retry_after_seconds': True},
+               {**valid, 'extra': 'PRIVATE'}]
+        for value in bad:
+            with self.subTest(value=value):
+                result = message(value)
+                self.assertIn('http_status=429', result)
+                self.assertNotIn('zai_code=', result)
+                self.assertNotIn('PRIVATE', result)
+        duplicate = primary + '\n' + '\n'.join(['DANSO_HTTP=' + json.dumps(valid)] * 2)
+        self.assertNotIn('zai_code=', self.failure(duplicate).message)
+        for delay in (None, 0, 86400):
+            self.assertIn('zai_code=1305', message({**valid, 'retry_after_seconds': delay}))
