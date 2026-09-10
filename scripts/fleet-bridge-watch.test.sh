@@ -305,5 +305,49 @@ run_flaky "blip0" 0
 okc "$RC" 1 "retries disabled still fails on one blip"
 ok "retries disabled means exactly one attempt" '[ "$(grep -c "^blip0$" "$TMP/calls")" = 1 ] && grep -q "^UNREACHABLE blip0" "$OUT"'
 
+# Execute the remote body, not only canned SSH replies: a non-root SSH account
+# must inspect a root-owned Danso/CCC runtime with non-interactive sudo.
+mkdir -p "$TMP/probe-bin" "$TMP/probe-repo/scripts" "$TMP/probe-home"
+touch "$TMP/probe-repo/scripts/ccc-doctor.sh"
+chmod +x "$TMP/probe-repo/scripts/ccc-doctor.sh"
+cat > "$TMP/probe-bin/ps" <<EOF
+#!$(command -v sh)
+echo "0 $TMP/probe-repo/bridge/venv/bin/python -m telegram_bot --path $TMP/probe-home"
+EOF
+cat > "$TMP/probe-bin/id" <<EOF
+#!$(command -v sh)
+case "\$1" in -u) echo 1000 ;; -nu) echo root ;; *) exit 0 ;; esac
+EOF
+cat > "$TMP/probe-bin/sudo" <<EOF
+#!$(command -v sh)
+printf '%s\n' "\$*" >> "$TMP/sudo-calls"
+[ "\$*" != "" ] || exit 99
+[ "\${PROBE_DENIED:-0}" = 0 ] || exit 1
+case "\$*" in *--status) printf '%s\n' "Bot status: \${PROBE_STATUS:-available}" ;; *) exit "\${PROBE_DOCTOR:-0}" ;; esac
+EOF
+cat > "$TMP/probe-bin/su" <<EOF
+#!$(command -v sh)
+echo 'unexpected su' >> "$TMP/su-calls"
+exit 1
+EOF
+chmod +x "$TMP/probe-bin/"*
+# Simulate the historical account/home existing; root runtime must not inspect
+# or require its now-retired user-service/cron layout.
+sed "s#/home/gongmyoung#$TMP/probe-home#g" "$probe_body" > "$TMP/owner-probe.sh"
+PATH="$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 sh "$TMP/owner-probe.sh" > "$TMP/owner-out"
+ok "root-owned runtime is available through noninteractive sudo" 'grep -q "^AVAIL=yes$" "$TMP/owner-out"'
+ok "doctor runs as the actual runtime owner" 'grep -q "^DOCTOR=0$" "$TMP/owner-out" && grep -q -- "-n -H -u root -- env CCC_DOCTOR_CLAUDE_DIR=$TMP/probe-home/.claude timeout 60 bash" "$TMP/sudo-calls"'
+ok "status preserves runtime project path" 'grep -q -- "-n -H -u root -- bash $TMP/probe-repo/bridge/start.sh --path $TMP/probe-home --status" "$TMP/sudo-calls"'
+ok "root runtime does not require retired user service" 'grep -q "^DUALDOMAIN=-$" "$TMP/owner-out"'
+ok "unprivileged caller never attempts interactive su" '[ ! -e "$TMP/su-calls" ]'
+PATH="$TMP/probe-bin:$PATH" PROBE_STATUS=unavailable sh "$TMP/owner-probe.sh" > "$TMP/owner-out"
+ok "confirmed unavailable status remains down" 'grep -q "^AVAIL=no$" "$TMP/owner-out"'
+PATH="$TMP/probe-bin:$PATH" PROBE_DENIED=1 sh "$TMP/owner-probe.sh" > "$TMP/owner-out"
+ok "permission failure is unverified, not down" 'grep -q "^AVAIL=unverified$" "$TMP/owner-out"'
+reply beta /opt/ccc-node unverified /opt/ccc-node
+run beta
+okc "$RC" 1 "unverified inspection still alerts"
+ok "unverified has distinct failure classification" 'grep -q "^UNVERIFIED beta runtime=/opt/ccc-node$" "$OUT" && ! grep -q "^DOWN beta" "$OUT"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
