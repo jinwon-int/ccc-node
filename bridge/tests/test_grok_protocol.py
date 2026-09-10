@@ -49,6 +49,16 @@ class GrokProtocolTests(unittest.TestCase):
         self.page["entries"].pop(0)
         self.assertEqual(self.read().texts, ("synthetic answer",))
 
+    def test_empty_baseline_cannot_hide_a_truncated_foreign_prefix(self):
+        self.baseline = capture_baseline({"entries": []})
+        foreign = {**self.echo, "id": "foreign", "clientNonce": "foreign"}
+        full = [foreign, self.echo] + [{**self.reply, "id": f"answer-{i}"} for i in range(63)]
+        for page in [{"entries": full[-64:], "nextBeforeSeq": 2},
+                     {"entries": full[-64:]},
+                     {"entries": [self.echo, self.reply], "nextBeforeSeq": 1}]:
+            with self.subTest(count=len(page["entries"])), self.assertRaisesRegex(ProtocolError, "unanchored_range_not_complete"):
+                self.read(page)
+
     def test_wire_denies_duplicate_alias_invalid_utf8_nan_and_depth(self):
         for raw in [b'{"ok":true,"ok":false}', b'{"x":{"a":1,"a":2}}',
                     b'\xff', b'{"value":NaN}', b'{"value":Infinity}',

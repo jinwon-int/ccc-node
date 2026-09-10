@@ -205,6 +205,10 @@ def bound_reply(accepted: AcceptedPrompt, prompt: str, baseline: Baseline,
         if not found:
             raise ProtocolError("baseline_window_lost")
         rows = rows[found[0] + 1:]
+    elif len(rows) >= MAX_ENTRIES or page.get("nextBeforeSeq") is not None:
+        # With no pre-send anchor a full or paginated tail may have silently
+        # dropped a concurrent input before our echo. Do not infer completeness.
+        raise ProtocolError("unanchored_range_not_complete")
     echo = next((e for e in rows if e["id"] == accepted.echo_id), None)
     if (echo is None or echo.get("kind") != "message" or echo.get("role") != "user"
             or echo.get("clientNonce") != accepted.nonce or echo.get("content") != prompt
