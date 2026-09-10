@@ -134,6 +134,14 @@ PRICING: dict[str, dict[str, float | None]] = {
     #   https://docs.z.ai/guides/overview/pricing (2026-08-21)
     "glm-5.3": {"input": 1.4, "output": 4.4, "cache_read": 0.26,
                 "cache_write_5m": 0.0, "cache_write_1h": 0.0},
+    # GLM-5.3-Flash: input $0.15, cached input $0.03, output $0.50. Same
+    # Limited-time Free "Cached Input Storage" promo as GLM-5.3 — encoded 0.0
+    # with the promo note; re-read the page when the promotion ends. This is
+    # the default model of the bridge's danso zai lane (CCC_DANSO_AUTH_MODE=zai,
+    # danso #70).
+    #   https://docs.z.ai/guides/overview/pricing (2026-09-09)
+    "glm-5.3-flash": {"input": 0.15, "output": 0.50, "cache_read": 0.03,
+                      "cache_write_5m": 0.0, "cache_write_1h": 0.0},
 }
 
 # Usage-level modifiers the pricing page defines but this stage does not price.
