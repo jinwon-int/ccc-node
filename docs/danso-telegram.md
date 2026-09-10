@@ -18,6 +18,11 @@ operator-controlled absolute path. ccc-node bundles the bounded subprocess
 adapter derived from Danso's `integrations/ccc_node.py`; the Danso
 Python repository does not need to be on `PYTHONPATH`.
 
+The CLI must also support `--progress-jsonl` (tested progress revision
+`ffc06d7b7191609314e04866190c4f22205298b5`; the original `dac88d49` baseline
+does not). Upgrade the CLI before enabling this bridge version; there is no
+silent fallback to an older buffered protocol.
+
 Choose a dedicated task workspace with `CCC_DANSO_WORKSPACE`, separate from
 the bridge configuration and session storage. Never use the bridge project root
 (or the whole login HOME) as the task workspace: its `.telegram_bot/.env` and
@@ -47,10 +52,15 @@ CCC_DANSO_MODEL=gpt-6-astra
 CCC_DANSO_EFFORT=medium
 CCC_BRIDGE_MEMORY_MODE=off
 CCC_MEMORY_DISTILL_PROVIDER=off
-CCC_DANSO_TIMEOUT_SECONDS=300
+CCC_DANSO_TIMEOUT_SECONDS=3600
+CCC_DANSO_LONG_TASK_ENABLED=true
+CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS=21600
+CLAUDE_PROCESS_TIMEOUT=21660
 CCC_DANSO_PROVIDER_TIMEOUT_SECONDS=180
 CCC_DANSO_MAX_TURNS=32
 CCC_DANSO_COMPACT_AT_BYTES=131072
+ENABLE_STREAMING=true
+ENABLE_STREAMING_TOOL_CALLS=true
 ```
 
 The provider request default is 180 seconds. Existing environments that pin
@@ -121,15 +131,25 @@ path, preserving the previous runtime's history.
 normal default, or set it at least 10 seconds above the Danso deadline while
 preserving the bridge's other timeout invariants.
 
-Long-task mode is opt-in. Set `CCC_DANSO_LONG_TASK_ENABLED=true` and configure
+Long-task mode is enabled by default. Set `CCC_DANSO_LONG_TASK_ENABLED=false`
+to select ordinary mode with its one-hour default deadline. Configure
 the native limits (`CCC_DANSO_TASK_STAGE_REQUESTS`,
 `CCC_DANSO_TASK_MAX_REQUESTS`, `CCC_DANSO_TASK_MAX_TOKENS`, and
 `CCC_DANSO_TASK_REPEAT_LIMIT`) only with a native binary that exposes the full
 long-task CLI. The bridge rejects older binaries before a provider request. The
-native cumulative active-runtime limit, excluding operator pauses, is at most
+native cumulative active-runtime limit, excluding operator pauses, defaults to and is at most
 21600 seconds; for the maximum, set
 `CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS=21600` and
-`CLAUDE_PROCESS_TIMEOUT=21660`. Provider requests keep the 180-second default.
+`CLAUDE_PROCESS_TIMEOUT=21660` (also the bridge-wide default). Existing explicit
+settings remain authoritative within their selected mode.
+`CCC_DANSO_TIMEOUT_SECONDS` applies only when
+`CCC_DANSO_LONG_TASK_ENABLED=false`: an existing ordinary timeout such as 300
+seconds does not opt out of the new long-task default. To retain that ordinary
+deadline on upgrade, explicitly set the mode to false. A pinned outer deadline of 21600 must
+be raised to at least 21610 when using the six-hour task limit. Older binaries
+must be upgraded or explicitly use ordinary mode; capability checks still fail
+closed. This default change does not replay, repair, or migrate unresolved
+session journals. Provider requests keep the 180-second default.
 The stage request setting is a target: native safe-boundary compaction may
 consume additional bounded requests before it records the next checkpoint.
 The repeat setting limits repeated identical tool batches. The defaults remain
@@ -149,8 +169,10 @@ bridge is a separate operational step; source development does not switch a node
 - Messages run through the normal queue, typing/status and final reply paths.
   Ordinary final answers are buffered; long-task mode may update the heartbeat
   from bounded native checkpoint counters, without relaying prompt, tool,
-  path, or provider-response bodies. The finite subprocess deadline replaces
-  the first-event admission timeout for this provider.
+  path, or provider-response bodies. When streaming and tool-call display are
+  enabled, ordinary turns may also emit body-free tool-start/settlement notices
+  from native `--progress-jsonl` (tool name only). The finite subprocess deadline
+  replaces the first-event admission timeout for this provider.
 - `/model` shows the configured model. Arbitrary model changes are rejected.
   `/effort` selects a supported effort; `default` restores `CCC_DANSO_EFFORT`.
 - The conversation UUID is durably saved before the subprocess can execute;

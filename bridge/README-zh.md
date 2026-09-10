@@ -240,7 +240,7 @@ Claude:  ...
 | `CCC_BRIDGE_BASH_POLICY` | 否 | `auto-approve` | Bash 审批方式；Codex 默认值为不受限的 `never + dangerFullAccess` |
 | `CLAUDE_CLI_PATH` | 否 | *（自动检测）* | Claude CLI 绝对路径 |
 | `CLAUDE_SETTINGS_PATH` | 否 | `~/.claude/settings.json` | Claude Code settings 文件路径 |
-| `CLAUDE_PROCESS_TIMEOUT` | 否 | `21600` | 整个 SDK 轮次的超时时间（秒，默认 6 小时；进程启动时读取） |
+| `CLAUDE_PROCESS_TIMEOUT` | 否 | `21660` | 整个 SDK 轮次的超时时间（秒，默认 6 小时加 60 秒；进程启动时读取） |
 | `CCC_APPROVAL_STALL_SECONDS` | 否 | `120` | Provider 审批请求持续待定达到此实际时长后终止已接纳的轮次；`0` 禁用此保护 |
 | `AUTO_NEW_SESSION_AFTER_HOURS` | 否 | `24` | 空闲 N 小时后自动启动新会话；设为 `0`/`false`/`off` 禁用 |
 | `CCC_BRIDGE_SESSION_GUARD_ENABLED` | 否 | `true` | 限制常驻会话资源，绝不驱逐活动请求 |

@@ -236,10 +236,10 @@ MEMORY_GROUP = "Memory parity"
 _DANSO_STATUSES: Mapping[str, CapabilityStatus] = {
     "runtime_adapter": _supported('Bounded Danso CLI subprocess mapped to native Telegram events. Provider lane is chosen by CCC_DANSO_AUTH_MODE: api-key→openai (gpt-6-astra), chatgpt→openai-codex, zai→glm (glm-5.3-flash default; danso #70).'),
     "session_resume": _supported('The current conversation resumes its exact private journal UUID, including after bridge restart; foreign journal selection is disabled.'),
-    "text_streaming": _degraded('Final text is buffered until the bounded subprocess exits; no incremental text or tool progress is available.'),
+    "text_streaming": _degraded('Final text is buffered until successful exit; body-free tool progress arrives during execution, but text deltas are not incremental.'),
     "reasoning_stream": _unsupported('Not implemented by the initial Danso Telegram integration.'),
     "message_boundaries": _supported('One validated final answer emits one message boundary.'),
-    "tool_event_stream": _unsupported('Not implemented by the initial Danso Telegram integration.'),
+    "tool_event_stream": _degraded('Versioned body-free tool start/settlement events stream from the CLI; arguments and results are intentionally omitted. Requires a CLI supporting --progress-jsonl.'),
     "interactive_approvals": _unsupported('Not implemented by the initial Danso Telegram integration.'),
     "turn_interrupt": _supported('Interrupt and cancellation terminate and reap the owned subprocess group; journals are preserved.'),
     "turn_serialization": _supported('Per-session asyncio lock plus native cross-process journal locking.'),

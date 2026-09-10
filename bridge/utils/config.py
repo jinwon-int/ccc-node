@@ -259,7 +259,7 @@ class Config(
     danso_effort: Literal["low", "medium", "high", "xhigh", "max"] = Field(
         default="medium", alias="CCC_DANSO_EFFORT")
     danso_base_url: Optional[str] = Field(default=None, alias="DANSO_OPENAI_BASE_URL")
-    danso_timeout_seconds: int = Field(default=300, ge=1, le=3600, alias="CCC_DANSO_TIMEOUT_SECONDS")
+    danso_timeout_seconds: int = Field(default=3600, ge=1, le=3600, alias="CCC_DANSO_TIMEOUT_SECONDS")
     danso_provider_timeout_seconds: int = Field(default=180, ge=1, le=300,
                                               alias="CCC_DANSO_PROVIDER_TIMEOUT_SECONDS")
     danso_max_turns: int = Field(default=64, ge=1, le=128, alias="CCC_DANSO_MAX_TURNS")
@@ -267,13 +267,12 @@ class Config(
                                          alias="CCC_DANSO_MAX_OUTPUT_TOKENS")
     danso_compact_at_bytes: int = Field(default=DEFAULT_DANSO_COMPACT_AT_BYTES, ge=8192, le=393216,
                                        alias="CCC_DANSO_COMPACT_AT_BYTES")
-    # Long-task mode is deliberately a separate opt-in profile.  The ordinary
-    # turn keeps its 300-second deadline and the existing provider timeout;
-    # these values are only forwarded when the explicit long-task switch is on.
+    # Long tasks are the default; operators can explicitly select ordinary mode.
+    # The ordinary-mode deadline remains separate from the cumulative task limit.
     danso_long_task_enabled: bool = Field(
-        default=False,
+        default=True,
         alias="CCC_DANSO_LONG_TASK_ENABLED",
-        description="Opt in to the native Danso long-task state machine; default off.",
+        description="Use the native Danso long-task state machine; default on.",
     )
     danso_long_task_timeout_seconds: int = Field(
         default=21600,
