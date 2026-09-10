@@ -27,9 +27,23 @@ need to decide whether that means "healthy" or "broken".
    correctness signal, and must be described that way.
 
    *This is the step most often skipped, and skipping it makes every later step
-   meaningless.* A 2026-08-27 check was built assuming `verified` meant
-   "re-verified"; the convention actually said "last edited". The threshold work
-   downstream was calibrating the wrong quantity.
+   meaningless.* The failure mode: a check is built assuming a timestamp field
+   means "re-verified" when the convention actually says "last edited", so every
+   threshold downstream calibrates the wrong quantity. The two look identical in
+   the data and differ only in what writes them.
+
+   Make this checkable rather than taking it on faith. For whatever field you
+   are about to threshold, find the code that writes it and read what event it
+   records:
+
+   ```bash
+   grep -rn '<field-name>' <source-dir>     # every writer, not just the reader
+   git log -S'<field-name>' --oneline -5    # when and why the field was introduced
+   ```
+
+   If more than one code path writes the field, and they record different
+   events, the field has no single meaning and cannot be thresholded until that
+   is resolved.
 
 2. **Pull the corpus distribution.** For every item the check will watch,
    collect the metric. Report count, median, p90, and the **observed maximum**.
