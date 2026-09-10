@@ -35,12 +35,31 @@ gh pr view <n> --repo <owner>/<repo> \
 ```
 
 **`gh pr view` has no `baseRefOid` field** — it exposes `baseRefName` (the branch
-name) but not the base *commit* the PR is diffed against. Verified 2026-08-28:
-passing `baseRefOid` fails with `Unknown JSON field`. For the base SHA you must
-drop to the REST API:
+name) but not the base *commit* the PR is diffed against. For the base SHA drop
+to the REST API:
 
 ```bash
 gh api repos/<owner>/<repo>/pulls/<n> -q '.base.sha, .mergeable, .mergeable_state'
+```
+
+Re-verify rather than trusting the sentence above — the CLI's field list moves
+with its version:
+
+```bash
+gh pr view <n> --repo <owner>/<repo> --json baseRefOid   # expect: Unknown JSON field
+gh pr view <n> --repo <owner>/<repo> --json baseRefOid 2>&1 | grep -i base
+gh --version
+```
+
+Re-measured 2026-09-10 on `gh 2.46.0`: still `Unknown JSON field: "baseRefOid"`,
+and the available-field list offers only `baseRefName`.
+
+The field **does** exist on the GraphQL `PullRequest` object, so this is a CLI
+surface gap, not an API one. If you want the base SHA without REST:
+
+```bash
+gh api graphql -f query='query { repository(owner:"<owner>", name:"<repo>") {
+  pullRequest(number: <n>) { baseRefOid headRefOid } } }'
 ```
 
 Note the REST field is `mergeable_state` (snake_case, lowercase values like
