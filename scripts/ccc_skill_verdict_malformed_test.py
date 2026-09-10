@@ -117,7 +117,7 @@ class MalformedVisibilityTests(unittest.TestCase):
         return promotion._process_verdicts(self.config, dry_run=False)
 
     def records(self):
-        return [json.loads(l) for l in self.ledger.read_text().splitlines()]
+        return [json.loads(line) for line in self.ledger.read_text().splitlines()]
 
     def test_ledger_records_the_reason(self):
         self.collect()
