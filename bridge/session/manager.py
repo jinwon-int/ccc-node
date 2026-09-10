@@ -15,7 +15,7 @@ class SessionManager:
     LAST_USER_MESSAGE_AT_KEY = "last_user_message_at"
 
     def __init__(self, store: SessionStore, settings: "Settings"):
-        if settings.agent_provider == "grok":
+        if getattr(settings, "agent_provider", "claude") == "grok":
             raise ValueError("Grok requires its immutable owner-DM journal, not generic sessions")
         self.store = store
         self.settings = settings
