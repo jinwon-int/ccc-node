@@ -142,7 +142,7 @@
       "name": "bridge-yield-continue",
       "source": "skills/bridge-yield-continue",
       "status": "active",
-      "tree_sha256": "bdb62da7dba77e94c962a73e7e31b85c2a546a85bba3260d483c0d5b5053ca90"
+      "tree_sha256": "97585e600c07225a5a23efac38114151f1bff5ad3ba4723c31322c8ccdfbc8c8"
     },
     {
       "audience": "shared",
@@ -263,7 +263,7 @@
       "name": "github-merge-state-conflict-diagnosis",
       "source": "skills/github-merge-state-conflict-diagnosis",
       "status": "active",
-      "tree_sha256": "e6edcac6f27d8909e90d776d30375effb8bd675e693efe1f6d16d0b14fbe1e1c"
+      "tree_sha256": "a669be26699ff2d261e818a1643e92d8b40708c7afbfa46025528cc6f865ffc0"
     },
     {
       "audience": "claude",
@@ -384,7 +384,7 @@
       "name": "staleness-threshold-empirical-calibration",
       "source": "skills/staleness-threshold-empirical-calibration",
       "status": "active",
-      "tree_sha256": "ea810e2c6851fea1acbd7124203b7db716960ba9c89bbd67c2e72821c59b77de"
+      "tree_sha256": "253a5838d002e2216013c113a2145216d8b1984769c1a2f5cc5b529b5b35cfac"
     },
     {
       "audience": "shared",
