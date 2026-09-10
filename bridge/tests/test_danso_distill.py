@@ -306,3 +306,39 @@ async def test_native_failure_trips_guard_without_persisting_stderr(tmp_path, di
     assert marker.read_text() == "x"
     for path in list(journal.root.glob("*.json")) + list(guard.cooldown_dir.glob("*.json")):
         assert "PRIVATE_DIAGNOSTIC_FIXTURE" not in path.read_text()
+
+
+@pytest.mark.anyio
+async def test_zai_auth_mode_passes_only_glm_credentials(tmp_path, monkeypatch):
+    ident, _ = journal(tmp_path / "private")
+    snapshot = read_danso_snapshot(
+        tmp_path / "private", ident, bounds=TranscriptBounds(), cwd=Path("/fixture")
+    )
+    data = build_extraction_input(snapshot, provider="danso", trigger=DistillTrigger.CHECKPOINT)
+    captured = tmp_path / "environment.json"
+    script = tmp_path / "danso"
+    script.write_text(
+        "#!/usr/bin/python3\nimport os,sys,json,pathlib\n"
+        f"p=pathlib.Path({str(captured)!r})\n"
+        "p.write_text(json.dumps({k: os.environ.get(k) for k in "
+        "('ZAI_API_KEY','DANSO_GLM_BASE_URL','DANSO_GLM_ENDPOINT','OPENAI_API_KEY','TELEGRAM_BOT_TOKEN')}))\n"
+        f"print({json.dumps(output(data))!r})\n"
+    )
+    script.chmod(0o700)
+    settings = SimpleNamespace(
+        danso_model="glm-5.3-flash",
+        danso_cli_path=str(script),
+        danso_auth_mode="zai",
+        zai_api_key="synthetic-zai-key",
+        danso_glm_base_url="",
+        danso_glm_endpoint="coding",
+    )
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-not-forwarded")
+    backend = DansoDistillBackend(settings, wiki_enabled=False, model="provider-default", timeout_seconds=5)
+    result = await backend.extract(data)
+    assert result.provenance.provider == "danso"
+    child = json.loads(captured.read_text())
+    assert child["ZAI_API_KEY"] == "synthetic-zai-key"
+    assert child["DANSO_GLM_ENDPOINT"] == "coding"
+    assert child["OPENAI_API_KEY"] is None, "openai credentials must not leak into the zai lane"
+    assert child["TELEGRAM_BOT_TOKEN"] is None

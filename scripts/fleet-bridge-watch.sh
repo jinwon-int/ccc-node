@@ -96,6 +96,10 @@ echo "RUNTIME=$root"
 st=""
 if [ "$(id -u)" = "$runuid" ]; then
   st=$(bash "$root/bridge/start.sh" --path "${bpath:-$HOME}" --status 2>/dev/null)
+elif [ "$(id -u)" != 0 ]; then
+  # SSH may land on the unprivileged host account while Danso/CCC runs as root.
+  # Use only an already-authorized, non-interactive sudo path; never prompt.
+  st=$(sudo -n -H -u "$runuser" -- bash "$root/bridge/start.sh" --path "${bpath:-$HOME}" --status 2>/dev/null)
 else
   if [ -n "$bpath" ]; then
     st=$(su - "$runuser" -c "bash '$root/bridge/start.sh' --path '$bpath' --status" 2>/dev/null)
@@ -112,6 +116,9 @@ if printf '%s' "$st" | grep -q 'Bot status: available'; then
   echo "AVAIL=yes"
 elif printf '%s' "$st" | grep -q 'Bot status: degraded'; then
   echo "AVAIL=degraded"
+elif ! printf '%s' "$st" | grep -q 'Bot status: unavailable'; then
+  # A failed inspection is not evidence that the live process is down.
+  echo "AVAIL=unverified"
 else
   echo "AVAIL=no"
 fi
@@ -145,6 +152,8 @@ if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ -x "$root/scripts/ccc-doctor.sh" ]; t
   cdir="${bpath:-$HOME}/.claude"
   if [ "$(id -u)" = "$runuid" ]; then
     CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 "$root/scripts/ccc-doctor.sh" >/dev/null 2>&1
+  elif [ "$(id -u)" != 0 ]; then
+    sudo -n -H -u "$runuser" -- env CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 bash "$root/scripts/ccc-doctor.sh" >/dev/null 2>&1
   else
     su - "$runuser" -c "CCC_DOCTOR_CLAUDE_DIR='$cdir' timeout 60 '$root/scripts/ccc-doctor.sh'" >/dev/null 2>&1
   fi
@@ -160,7 +169,9 @@ fi
 # decoy ccc-node dirs trapping resolve_repo heuristics). These checks are
 # read-only; remediation is an operator decision. Single-domain nodes have no
 # gongmyoung account, so they emit DUALDOMAIN=- and cost nothing.
-if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && id gongmyoung >/dev/null 2>&1 && [ -d /home/gongmyoung ]; then
+# This historical user-service layout applies only while that user owns the
+# bridge. A root system-service runtime must not require its retired user unit.
+if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ "$runuser" = gongmyoung ] && id gongmyoung >/dev/null 2>&1 && [ -d /home/gongmyoung ]; then
   if [ "$(id -u)" != 0 ]; then
     # crontab/loginctl inspection needs root; say so instead of guessing.
     echo "DUALDOMAIN=skip(non-root)"
@@ -265,6 +276,9 @@ $PROBE"
     echo "DEGRADED $node runtime=$runtime"; fail=1; continue
   fi
 
+  if [ "$avail" = "unverified" ]; then
+    echo "UNVERIFIED $node runtime=$runtime"; fail=1; continue
+  fi
   if [ "$avail" != "yes" ]; then
     echo "DOWN $node"; fail=1; continue
   fi

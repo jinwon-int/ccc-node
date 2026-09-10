@@ -584,6 +584,7 @@ class Doctor:
         self.check_cron_drift()
         self.check_provider_readiness()
         self.check_distill_readiness()
+        self.check_skill_promotion_backlog()
         self.check_self_update_stall()
         # Managed Codex skills are provider-native (#647): diagnose them only on
         # a Codex node. Claude-only asset findings above stay non-readiness
@@ -1446,6 +1447,75 @@ class Doctor:
     # many non-terminal lines (per-service, per-installer), so the window has to
     # be generous enough to reach the previous terminal record.
     _SELF_UPDATE_LOG_TAIL_BYTES = 65536
+
+    # An envelope waits for the central publisher's next collect sweep, which
+    # opens a bounded number of intake PRs per run. Some queueing is normal;
+    # two weeks without a pickup is not — that is the interval over which a
+    # missing collect-nodes entry, a stopped collect cron, or a per-run PR cap
+    # too small for the fleet's staging rate all look identical from here.
+    _PROMOTION_BACKLOG_STALE_DAYS = 14
+
+    def check_skill_promotion_backlog(self) -> None:
+        """Report skill-promotion envelopes the central publisher never collected.
+
+        Ordinary nodes only stage envelopes into
+        `state/skill-promotion/outbox/`; a separately enabled publisher node
+        collects them over SSH and opens intake PRs. That split means a node
+        cannot observe its own promotion failure: staging keeps reporting `ok`
+        while the envelopes silently pile up because the publisher never picks
+        them up. Field precedent — a node stayed uncollected for ~30 days and
+        the gap was found only by reading the outbox by hand.
+
+        The verdict keys off the OLDEST envelope, not the count. A large but
+        moving queue is healthy; a small queue whose oldest entry predates the
+        threshold means pickup has stopped for this node.
+        """
+        item = "skill-promotion backlog"
+        state_dir = Path(
+            os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")
+        ).expanduser()
+        outbox = state_dir / "skill-promotion" / "outbox"
+        if outbox.is_symlink() or not outbox.is_dir():
+            # Promotion is opt-in; an absent outbox is not drift.
+            self.add("정상", item, "outbox=absent", "none")
+            return
+        try:
+            oldest: float | None = None
+            pending = 0
+            for entry in outbox.iterdir():
+                if entry.is_symlink() or not entry.is_file() or entry.suffix != ".json":
+                    continue
+                pending += 1
+                mtime = entry.stat().st_mtime
+                if oldest is None or mtime < oldest:
+                    oldest = mtime
+        except OSError:
+            self.add(
+                "수동필요",
+                item,
+                "outbox=unreadable",
+                f"inspect {outbox} permissions; promotion backlog cannot be verified",
+            )
+            return
+
+        if not pending or oldest is None:
+            self.add("정상", item, "pending=0", "none")
+            return
+
+        age_days = int((time.time() - oldest) // 86400)
+        status = f"pending={pending}; oldest={age_days}d"
+        if age_days < self._PROMOTION_BACKLOG_STALE_DAYS:
+            self.add("정상", item, status, "none")
+            return
+        self.add(
+            "경고",
+            item,
+            status,
+            "the central publisher has not collected this node for "
+            f"{age_days}d; verify this node is listed in the publisher's "
+            "skill-promotion.collect-nodes, that its collect cron still runs, "
+            "and that max_prs_per_run keeps up with the fleet's staging rate",
+        )
 
     def check_self_update_stall(self) -> None:
         """Report whether the last self-update attempt ended in a stall.

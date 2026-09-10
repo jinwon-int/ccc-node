@@ -39,14 +39,30 @@ def _validate_execution_backend(settings: Settings) -> None:
         raise ValueError("Danso requires bubblewrap; install bwrap")
 
 
+def _validate_zai_authentication(settings: Settings) -> None:
+    """zai lane credentials: GLM key required, ChatGPT file is foreign."""
+    if settings.danso_chatgpt_auth_file:
+        raise ValueError("DANSO_CHATGPT_AUTH_FILE requires CCC_DANSO_AUTH_MODE=chatgpt")
+    if not settings.zai_api_key or not settings.zai_api_key.strip():
+        raise ValueError("Danso zai mode requires ZAI_API_KEY")
+
+
+def _validate_api_key_authentication(settings: Settings) -> None:
+    """api-key lane credentials: an OpenAI key is required."""
+    if settings.danso_chatgpt_auth_file:
+        raise ValueError("DANSO_CHATGPT_AUTH_FILE requires CCC_DANSO_AUTH_MODE=chatgpt")
+    if not settings.openai_api_key or not settings.openai_api_key.strip():
+        raise ValueError("Danso API-key mode requires OPENAI_API_KEY")
+
+
 def _validate_authentication(settings: Settings, cwd: Path) -> None:
-    if settings.danso_auth_mode not in {"api-key", "chatgpt"}:
+    if settings.danso_auth_mode not in {"api-key", "chatgpt", "zai"}:
         raise ValueError("unsupported Danso authentication mode")
     if settings.danso_auth_mode == "api-key":
-        if settings.danso_chatgpt_auth_file:
-            raise ValueError("DANSO_CHATGPT_AUTH_FILE requires CCC_DANSO_AUTH_MODE=chatgpt")
-        if not settings.openai_api_key or not settings.openai_api_key.strip():
-            raise ValueError("Danso API-key mode requires OPENAI_API_KEY")
+        _validate_api_key_authentication(settings)
+        return
+    if settings.danso_auth_mode == "zai":
+        _validate_zai_authentication(settings)
         return
     if not settings.danso_chatgpt_auth_file:
         raise ValueError("Danso ChatGPT mode requires DANSO_CHATGPT_AUTH_FILE")
@@ -154,7 +170,13 @@ def _configuration(settings: Settings) -> tuple[str, Path]:  # noqa: C901 -- pro
         raise ValueError("Danso extraction requires audience-scoped memory")
     if settings.memory_distill_provider not in {"auto", "off", "danso"}:
         raise ValueError("Danso requires CCC_MEMORY_DISTILL_PROVIDER=auto, off or danso")
-    if settings.danso_model != "gpt-6-astra":
+    if settings.danso_auth_mode == "zai" and settings.danso_model == "gpt-6-astra":
+        # Issue #70: the zai default model follows the auth mode.
+        settings.danso_model = "glm-5.3-flash"
+    if settings.danso_auth_mode == "zai":
+        if not settings.danso_model.startswith("glm-"):
+            raise ValueError("Danso zai mode supports GLM models")
+    elif settings.danso_model != "gpt-6-astra":
         raise ValueError("Danso Telegram currently supports gpt-6-astra")
     if not settings.danso_state_dir or not Path(settings.danso_state_dir).is_absolute():
         raise ValueError("Danso requires an absolute CCC_DANSO_STATE_DIR outside the project")
@@ -281,16 +303,28 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
         if settings.danso_chatgpt_base_url:
             environment["DANSO_CHATGPT_BASE_URL"] = settings.danso_chatgpt_base_url
         provider, journals = "openai-codex", "chatgpt-journals"
+    elif settings.danso_auth_mode == "zai":
+        environment["ZAI_API_KEY"] = settings.zai_api_key
+        if settings.danso_glm_base_url:
+            environment["DANSO_GLM_BASE_URL"] = settings.danso_glm_base_url
+        if settings.danso_glm_endpoint:
+            environment["DANSO_GLM_ENDPOINT"] = settings.danso_glm_endpoint
+        provider, journals = "glm", "glm-journals"
     else:
         environment["OPENAI_API_KEY"] = settings.openai_api_key
         if settings.danso_base_url:
             environment["DANSO_OPENAI_BASE_URL"] = settings.danso_base_url
         provider, journals = "openai", "journals"
+    # Issue #70: the default model follows the auth mode. An explicitly
+    # configured CCC_DANSO_MODEL always wins.
+    model = settings.danso_model
+    if settings.danso_auth_mode == "zai" and model == "gpt-6-astra":
+        model = "glm-5.3-flash"
     memory_settings = settings if settings.bridge_memory_mode == "audience-scoped" else None
     if memory_settings is not None:
         journals += "-audience"
     return DansoRuntime(binary=binary, state_directory=root / journals, memory_settings=memory_settings,
-                        provider=provider, model=settings.danso_model,
+                        provider=provider, model=model,
                         environment=environment, default_effort=settings.danso_effort,
                         sandbox=settings.danso_sandbox,
                         tool_home=str(tool_home) if tool_home is not None else None,
@@ -302,6 +336,7 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
                         outer_timeout_seconds=settings.process_timeout_seconds,
                         provider_timeout_seconds=settings.danso_provider_timeout_seconds,
                         max_turns=settings.danso_max_turns,
+                        max_output_tokens=settings.danso_max_output_tokens,
                         compact_at_bytes=settings.danso_compact_at_bytes,
                         long_task=settings.danso_long_task_enabled,
                         task_stage_requests=settings.danso_task_stage_requests,
