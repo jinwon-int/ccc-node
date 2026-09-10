@@ -4,9 +4,11 @@ import json
 import os
 from pathlib import Path
 import stat
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -139,6 +141,7 @@ class SshTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(argv[-1], "python3 -I -")
             self.assertIn("BatchMode=yes", argv)
             self.assertIn("StrictHostKeyChecking=yes", argv)
+            self.assertIs(kwargs.get("start_new_session"), True)
             self.assertNotIn(SECRET, str(argv))
             p = await original(sys.executable, "-I", "-c", code, **kwargs)
             children.append(p)
@@ -174,6 +177,57 @@ class SshTests(unittest.IsolatedAsyncioTestCase):
         for dest in ("-oProxyCommand=id", "box@host;id", "box@host $(id)", "box@/tmp/socket", "root"):
             with self.subTest(dest=dest), self.assertRaises(ProtocolError):
                 GrokSshTransport(dest, AGENT)
+
+    async def test_cancel_inherited_descendant_pipes(self):
+        # The child lives in the caller-owned SSH process group and inherits
+        # both pipes. Old parent-only kill blocked until its 15-second exit.
+        with tempfile.TemporaryDirectory() as root:
+            marker = str(Path(root) / "child-started")
+            code = ('import os,sys,time;sys.stdin.buffer.read();p=os.fork();'
+                    f'open({marker!r},"w").write(str(os.getpid())) if p==0 else None;'
+                    'time.sleep(15)')
+            task = asyncio.create_task(self.run_child(code))
+            for _ in range(200):
+                if Path(marker).exists():
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(Path(marker).exists())
+            start = time.monotonic()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 4)
+            self.assertLess(time.monotonic() - start, 3)
+
+    async def test_spawn_error_categorical(self):
+        with patch("telegram_bot.core.grok_ssh.asyncio.create_subprocess_exec",
+                   side_effect=OSError(SECRET)), self.assertRaisesRegex(ProtocolError, "^ssh_launch_failure$"):
+            await GrokSshTransport("box@fixture.invalid", AGENT).call("health")
+
+    async def test_escaped_test_helper_bounds_local_pipe_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / "escaped-child"
+            code = ('import os,sys,time;sys.stdin.buffer.read();p=os.fork();'
+                    'os.setsid() if p==0 else None;'
+                    f'open({str(marker)!r},"w").write(str(os.getpid())) if p==0 else None;'
+                    'time.sleep(15)')
+            task = asyncio.create_task(self.run_child(code))
+            try:
+                for _ in range(200):
+                    if marker.exists() and marker.read_text():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(marker.exists())
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 4)
+            finally:
+                # This fixture deliberately escapes ownership; only its creator
+                # test knows its PID. Production never kills an unowned group.
+                if marker.exists() and marker.read_text():
+                    try:
+                        os.kill(int(marker.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
 
 if __name__ == "__main__":

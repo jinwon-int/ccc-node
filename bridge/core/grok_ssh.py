@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import re
+import signal
 from typing import Any
 
 from .grok_gateway import request_spec
@@ -55,13 +57,16 @@ class GrokSshTransport:
 
     async def call(self, operation: str, arguments: Any = None) -> Any:
         source = helper_source(operation, self.agent_id, {} if arguments is None else arguments)
-        process = await asyncio.create_subprocess_exec(
-            "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-            "-o", "StrictHostKeyChecking=yes", "-o", "ClearAllForwardings=yes",
-            self.destination, "python3 -I -",
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                "-o", "StrictHostKeyChecking=yes", "-o", "ClearAllForwardings=yes",
+                self.destination, "python3 -I -",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, start_new_session=True,
+            )
+        except OSError:
+            raise ProtocolError("ssh_launch_failure") from None
         assert process.stdin is not None and process.stdout is not None and process.stderr is not None
         stdout = asyncio.create_task(_read_bounded(process.stdout, MAX_WIRE))
         stderr = asyncio.create_task(_read_bounded(process.stderr, 4096))
@@ -80,10 +85,23 @@ class GrokSshTransport:
         except Exception:
             raise ProtocolError("ssh_outcome_unknown") from None
         finally:
-            if process.returncode is None:
-                process.kill()
-            await process.wait()
+            # SSH/ProxyCommand children can inherit pipes. Killing only the
+            # immediate child leaves Process.wait pending on their open pipes.
+            if process.returncode is None or not stdout.done() or not stderr.done():
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             for task in (stdout, stderr):
                 if not task.done():
                     task.cancel()
             await asyncio.gather(stdout, stderr, return_exceptions=True)
+            try:
+                async with asyncio.timeout(2):
+                    await process.wait()
+            except TimeoutError:
+                # asyncio exposes no public pipe-close on Process. CPython's
+                # subprocess transport closes local descriptors if a configured
+                # helper escaped the owned group. This does not kill that helper
+                # or remotely interrupt Grok. Qualified on CI Python3.11-3.14.
+                getattr(process, "_transport").close()
