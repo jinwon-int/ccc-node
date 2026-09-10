@@ -3110,6 +3110,70 @@ def _project_intake_receipt(config: Config, rows: list[dict[str, object]],
     return status
 
 
+# A receipt whose broker result never arrives has no terminal state of its
+# own: `pending` is recorded and retried again next run, forever (#1618). Two
+# conditions retire one:
+#
+#   `pr-closed` — the intake PR is closed or merged, so there is nothing left
+#                 to project a receipt onto. Definitive, so it is checked first.
+#   `expired`   — the first attempt is older than the window below. Wall-clock,
+#                 not attempt count, so shortening the collect cadence does not
+#                 shorten the grace period.
+#
+# Both are distinct from `unavailable` (the task carried no signed provenance):
+# these two mean the receipt was owed and never became deliverable.
+_RECEIPT_STALE_DAYS = 14
+_RECEIPT_TERMINAL_STATUSES = frozenset({"posted", "unavailable", "expired", "pr-closed"})
+
+
+def _receipt_first_attempt(rows: list[dict[str, object]], task_id: str) -> str | None:
+    """Timestamp of the earliest recorded receipt attempt for this task."""
+    for row in rows:
+        if row.get("kind") == "a2a-receipt" and row.get("task_id") == task_id:
+            ts = row.get("ts")
+            return ts if isinstance(ts, str) else None
+    return None
+
+
+def _receipt_is_stale(first_attempt: str | None, *, now: str | None = None) -> bool:
+    """True when the first attempt predates the grace window.
+
+    An unparsable or absent stamp is never stale: a receipt is only retired on
+    positive evidence that it has been owed too long.
+    """
+    if not first_attempt:
+        return False
+    stamp = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z", first_attempt)
+    current = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z", now or _utc_now())
+    if stamp is None or current is None:
+        return False
+    try:
+        then = datetime.strptime(stamp.group(1), "%Y-%m-%dT%H:%M:%S")
+        moment = datetime.strptime(current.group(1), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return False
+    return (moment - then).days >= _RECEIPT_STALE_DAYS
+
+
+def _pr_state(config: Config, pr_number: str) -> str | None:
+    """OPEN / CLOSED / MERGED for an intake PR, or None when it cannot be read.
+
+    Unreadable means "do not reap": a transient gh failure must never retire a
+    receipt that is still owed.
+    """
+    if not pr_number:
+        return None
+    try:
+        completed = _run(
+            ["gh", "pr", "view", pr_number, "--repo", config.repo, "--json", "state"]
+        )
+        value = json.loads(completed.stdout.decode("utf-8"))
+    except (PromotionError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    state = value.get("state") if isinstance(value, dict) else None
+    return state if isinstance(state, str) else None
+
+
 def _receipt_retries(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     """Backfill old consumed verdicts too; rotate failures behind untried work."""
     consumed = {r.get("task_id") for r in rows
@@ -3127,7 +3191,7 @@ def _receipt_retries(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         seen.add(task_id)
         key = (_pr_number_from_url(str(row.get("pr_url", ""))) or "",
                row.get("head_sha"), f"receipt:{task_id}")
-        if key in posted or attempted.get(task_id, (-1, ""))[1] in {"posted", "unavailable"}:
+        if key in posted or attempted.get(task_id, (-1, ""))[1] in _RECEIPT_TERMINAL_STATUSES:
             continue
         pending.append(row)
     return sorted(pending, key=lambda r: attempted.get(r.get("dispatched_task"), (-1, ""))[0])
@@ -3142,6 +3206,21 @@ def _retry_intake_receipts(config: Config, rows: list[dict[str, object]],
         dispatched = str(row["dispatched_task"])
         if dry_run:
             results.append({"outcome": "would-retry-receipt", "task_id": dispatched})
+            continue
+        # Retire before spending a broker round-trip on a receipt nobody can
+        # take delivery of any more (#1618).
+        retired = None
+        pr_number = _pr_number_from_url(str(row.get("pr_url", ""))) or ""
+        if _pr_state(config, pr_number) in {"CLOSED", "MERGED"}:
+            retired = "pr-closed"
+        elif _receipt_is_stale(_receipt_first_attempt(rows, dispatched)):
+            retired = "expired"
+        if retired is not None:
+            record = {"ts": _utc_now(), "kind": "a2a-receipt", "task_id": dispatched,
+                      "head_sha": row.get("head_sha"), "status": retired}
+            _append_ledger(config, record)
+            rows.append(record)
+            results.append({"outcome": f"receipt-{retired}", "task_id": dispatched})
             continue
         task, routing = _broker_task_gated(config, row, dispatched, os.environ.get("A2A_EDGE_SECRET", ""))
         status = "pending"
