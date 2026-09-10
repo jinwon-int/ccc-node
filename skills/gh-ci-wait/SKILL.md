@@ -28,8 +28,12 @@ python -m telegram_bot.core.external_wait_cli register \
 ```
 
 - Pin the **exact head SHA** you mean (`git rev-parse HEAD`, or
-  `gh pr view <n> --json headRefOid`). A newer push supersedes the wait —
-  it will never report stale CI as your result.
+  `gh pr view <n> --json headRefOid --jq .headRefOid`). A newer push supersedes
+  the wait — it will never report stale CI as your result.
+- **Never reconstruct the SHA from an abbreviated prefix you saw in output.**
+  Read the full 40 hex from the command above. A wait registered against an
+  invented SHA is accepted and then never fires, so the promise looks kept and
+  silently is not.
 - After **every push or PR head update**, re-read `headRefOid` and register a
   new wait for that SHA before promising another continuation. A wait is
   one-shot and exact-head-bound: the old `wait_id` never follows the new head,
@@ -40,6 +44,19 @@ python -m telegram_bot.core.external_wait_cli register \
 - Optional `--timeout-seconds` (default 6h).
 
 On success the CLI prints `{"ok": true, "wait_id": "..."}`.
+
+**Re-verify these before relying on them.** Every value above is pinned to the
+CLI's source, not to memory — the CLI is a separate component and may move:
+
+| Claim | Check |
+|---|---|
+| `--timeout-seconds` default 6h | `grep -n 'DEFAULT_TIMEOUT_SECONDS' bridge/core/external_wait_monitor.py` → `6 * 60 * 60` |
+| success shape `{"ok": true, "wait_id": ...}` | `grep -n '"wait_id": wait_id' bridge/core/external_wait_cli.py` (the `_emit` block) |
+| one-shot, exact-head-bound | `grep -n 'TERMINAL_SUPERSEDED\|head_sha' bridge/core/external_wait_cli.py` — a newer head finishes the old wait as superseded |
+| `route-unavailable` token | `grep -n 'route-unavailable' bridge/core/external_wait_cli.py` |
+
+If a check disagrees with this table, the CLI is authoritative — fix this file,
+do not work around it.
 
 ## After registering
 
@@ -64,7 +81,15 @@ Never claim auto-resume anyway. Either:
    when CI ends.
 
 `route-unavailable` means the bridge could not bind this conversation —
-do not retry blindly more than once.
+do not retry blindly more than once. Source:
+`grep -n 'route-unavailable' bridge/core/external_wait_cli.py` (emitted when
+`resolve_active_route` returns `None`, i.e. there is no single active route).
+
+When you fall back to a foreground watch, you own the tracking that the wait
+would have done for you. Re-read the PR's live state (`gh pr view <n> --json
+state,mergeStateStatus`) before any irreversible step — a long watch can end
+after the PR already moved, and acting on a stale in-head picture repeats work
+that is already done.
 
 ## Resuming a dropped promise at SessionStart
 
