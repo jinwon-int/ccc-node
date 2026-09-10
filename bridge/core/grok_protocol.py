@@ -88,6 +88,11 @@ def decode_wire(raw: bytes) -> Any:
         raise
     except (UnicodeError, ValueError, RecursionError):
         raise ProtocolError("invalid_json") from None
+    _check_structure(result)
+    return result
+
+
+def _check_structure(result: Any) -> None:
     pending = [(result, 0)]
     nodes = 0
     while pending:
@@ -99,7 +104,6 @@ def decode_wire(raw: bytes) -> Any:
             pending.extend((child, depth + 1) for child in value.values())
         elif isinstance(value, list):
             pending.extend((child, depth + 1) for child in value)
-    return result
 
 
 def check_host(status: Any) -> None:
