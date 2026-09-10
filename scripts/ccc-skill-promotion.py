@@ -15,6 +15,7 @@ import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -1353,15 +1354,30 @@ def _pending_envelopes(config: Config, *, limit: int) -> list[dict[str, object]]
         return []
     if not _path_components_safe(outbox, final_kind="dir", trust_root=config.home):
         raise PromotionError("outbox_path_unsafe")
-    rows: list[dict[str, object]] = []
+    # Serve the outbox oldest-first (#1617). The filename is the transport id,
+    # so the previous `sorted(glob)` was alphabetical by skill name: a name late
+    # in the alphabet sat behind every newer envelope forever. `created_at` is a
+    # fixed-width UTC stamp, so a lexicographic sort is chronological.
+    #
+    # Ordering reads only the cheap `created_at` field; full envelope validation
+    # still runs on the `limit` rows actually served, so one malformed envelope
+    # deeper in the queue cannot newly fail an otherwise healthy node. Envelopes
+    # with no usable stamp sort last for the same reason.
+    staged: list[tuple[int, str, str, dict[str, object]]] = []
     for path in sorted(outbox.glob("*.json")):
-        if len(rows) >= limit:
-            break
         if (sent / path.name).exists():
             continue
         value = _state_payload(path, trust_root=config.home)
+        created = value.get("created_at") if isinstance(value, dict) else None
+        if isinstance(created, str):
+            staged.append((0, created, path.name, value))
+        else:
+            staged.append((1, "", path.name, value))
+    staged.sort(key=lambda row: (row[0], row[1], row[2]))
+    rows: list[dict[str, object]] = []
+    for _, _, name, value in staged[:limit]:
         _, _, transport_id = _candidate_from_envelope(value)
-        if path.name != f"{transport_id}.json":
+        if name != f"{transport_id}.json":
             raise PromotionError("outbox_filename_mismatch")
         rows.append(value)
     return rows
@@ -3898,30 +3914,50 @@ def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:
 def _collect_envelopes(
     config: Config, errors: list[dict[str, str]]
 ) -> list[tuple[Candidate, str, str, str]]:
-    """Gather local + remote pending envelopes, de-duplicated by transport id."""
-    collected: list[tuple[Candidate, str, str, str]] = []
+    """Gather local + remote pending envelopes, de-duplicated by transport id.
+
+    Sources are interleaved round-robin (#1617). The caller publishes only the
+    first `max_prs` entries, so returning the sources concatenated in
+    `collect_nodes` order meant a node with a backlog deeper than the cap took
+    every slot on every run and permanently starved the nodes behind it —
+    observed as three nodes stuck at 79 uncollected envelopes for ~2 weeks,
+    with the tail nodes' envelopes fetched over SSH and then discarded unread.
+
+    Round-robin keeps `collect_nodes` order as the within-round tie-break, so
+    the local node still goes first and a single-source fleet is unaffected.
+    """
+    per_source: list[list[tuple[Candidate, str, str, str]]] = []
     seen: set[str] = set()
+    total = 0
 
-    def accept(value: object, source: str, expected_node: str | None) -> None:
-        candidate, created_at, transport_id = _candidate_from_envelope(value)
-        if expected_node is not None and candidate.node != expected_node:
-            raise PromotionError("remote_node_mismatch")
-        if transport_id in seen:
-            return
-        seen.add(transport_id)
-        collected.append((candidate, created_at, transport_id, source))
+    def gather(values: list[object], source: str, expected_node: str | None) -> None:
+        nonlocal total
+        rows: list[tuple[Candidate, str, str, str]] = []
+        # Registered before parsing so a mid-list failure keeps the rows already
+        # accepted from this source, matching the previous behaviour.
+        per_source.append(rows)
+        for value in values:
+            candidate, created_at, transport_id = _candidate_from_envelope(value)
+            if expected_node is not None and candidate.node != expected_node:
+                raise PromotionError("remote_node_mismatch")
+            if transport_id in seen:
+                continue
+            seen.add(transport_id)
+            rows.append((candidate, created_at, transport_id, source))
+            total += 1
 
-    for value in _pending_envelopes(config, limit=_MAX_CANDIDATES_PER_RUN):
-        accept(value, "local", config.node)
+    gather(_pending_envelopes(config, limit=_MAX_CANDIDATES_PER_RUN), "local", config.node)
     for node in config.collect_nodes:
-        if node == config.node or len(collected) >= _MAX_CANDIDATES_PER_RUN:
+        if node == config.node or total >= _MAX_CANDIDATES_PER_RUN:
             continue
         try:
-            remaining = min(config.max_prs, _MAX_CANDIDATES_PER_RUN - len(collected))
-            for value in _remote_envelopes(node, limit=remaining):
-                accept(value, node, node)
+            remaining = min(config.max_prs, _MAX_CANDIDATES_PER_RUN - total)
+            gather(_remote_envelopes(node, limit=remaining), node, node)
         except PromotionError as error:
             errors.append({"source": node, "code": error.code})
+    collected: list[tuple[Candidate, str, str, str]] = []
+    for round_ in itertools.zip_longest(*per_source):
+        collected.extend(row for row in round_ if row is not None)
     return collected
 
 
