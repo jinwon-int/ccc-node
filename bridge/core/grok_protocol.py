@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import uuid
 from typing import Any
 
@@ -68,10 +69,24 @@ def decode_wire(raw: bytes) -> Any:
     def bad_constant(_: str) -> None:
         raise ProtocolError("invalid_json")
 
+    def bounded_integer(value: str) -> int:
+        if len(value.lstrip("-")) > 20:
+            raise ProtocolError("json_number_limit")
+        return int(value)
+
+    def finite_float(value: str) -> float:
+        number = float(value)
+        if not math.isfinite(number):
+            raise ProtocolError("json_number_limit")
+        return number
+
     try:
         result = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs,
-                            parse_constant=bad_constant)
-    except (UnicodeError, json.JSONDecodeError, RecursionError):
+                            parse_constant=bad_constant, parse_int=bounded_integer,
+                            parse_float=finite_float)
+    except ProtocolError:
+        raise
+    except (UnicodeError, ValueError, RecursionError):
         raise ProtocolError("invalid_json") from None
     pending = [(result, 0)]
     nodes = 0
@@ -102,7 +117,8 @@ def check_idle(health: Any, agent_id: str) -> None:
     if (not isinstance(health, dict) or health.get("ok") is not True
             or health.get("isBusy") is not False
             or health.get("activeAgentId") != agent_id
-            or health.get("busyOnlyAwaitingApproval") is True):
+            or ("busyOnlyAwaitingApproval" in health
+                and health["busyOnlyAwaitingApproval"] is not False)):
         raise ProtocolError("host_not_idle_for_target")
 
 
@@ -209,7 +225,8 @@ def bound_reply(accepted: AcceptedPrompt, prompt: str, baseline: Baseline,
         message = entry.get("message")
         if (entry.get("kind") != "send-message" or not isinstance(message, dict)
                 or set(message) != {"type", "content"} or message.get("type") != "text"
-                or entry.get("author") is not None or entry.get("isStreaming") is True):
+                or entry.get("author") is not None
+                or ("isStreaming" in entry and entry["isStreaming"] is not False)):
             raise ProtocolError("unsupported_reply_record")
         text = _text(message.get("content"), MAX_REPLY, "invalid_reply_text")
         texts.append(text)

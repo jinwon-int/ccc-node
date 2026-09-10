@@ -1,6 +1,5 @@
 """Generated gateway fixtures; no live credentials, prompts or Bot identifiers."""
 import copy
-import json
 import unittest
 
 from telegram_bot.core.grok_protocol import (
@@ -152,6 +151,26 @@ class GrokProtocolTests(unittest.TestCase):
         self.page["entries"].append({**self.reply, "id": "answer-2"})
         with self.assertRaises(ProtocolError):
             self.read()
+
+    def test_malformed_optional_flags_never_release_text(self):
+        for value in [True, 1, 0, "true", "false", [], {}, None]:
+            case = copy.deepcopy(self.page)
+            case["entries"][-1]["isStreaming"] = value
+            with self.subTest(flag="isStreaming", kind=type(value).__name__), self.assertRaises(ProtocolError):
+                self.read(case)
+            with self.subTest(flag="busyOnlyAwaitingApproval", kind=type(value).__name__), self.assertRaises(ProtocolError):
+                self.read(health={**self.health, "busyOnlyAwaitingApproval": value})
+        self.reply["isStreaming"] = False
+        self.assertEqual(self.read(health={**self.health, "busyOnlyAwaitingApproval": False}).texts,
+                         ("synthetic answer",))
+
+    def test_json_numeric_overflow_is_bounded_and_body_free(self):
+        for raw in [b'{"n":' + b'9' * 5000 + b'}', b'{"n":1e999}', b'{"n":-1e999}']:
+            with self.subTest(size=len(raw)), self.assertRaises(ProtocolError) as error:
+                decode_wire(raw)
+            self.assertLess(len(str(error.exception)), 80)
+        self.assertEqual(decode_wire(b'{"n":9223372036854775807,"f":1.5}'),
+                         {"n": 9223372036854775807, "f": 1.5})
 
 
 if __name__ == "__main__":
