@@ -17,6 +17,7 @@ from claude_agent_sdk import (
     ResultMessage,
 )
 
+from telegram_bot.runtime_config_check import DEFAULT_PROCESS_TIMEOUT_SECONDS
 from telegram_bot.utils.config import config
 from telegram_bot.core.task_ledger import (
     TaskLedger,
@@ -283,7 +284,7 @@ class ProjectChatHandler(
         # Production always injects validated Settings. The fallback preserves
         # legacy lightweight test adapters that pass a partial namespace.
         self._process_timeout_seconds = int(
-            getattr(self._config, "process_timeout_seconds", 21600)
+            getattr(self._config, "process_timeout_seconds", DEFAULT_PROCESS_TIMEOUT_SECONDS)
         )
         self._typing_interval_seconds = TYPING_INTERVAL
         self._conversation_locks: Dict[Tuple[int, int], asyncio.Lock] = {}

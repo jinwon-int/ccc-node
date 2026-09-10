@@ -86,6 +86,7 @@ print('completed')
         'CCC_DANSO_WORKSPACE': str(workspace),
         'CCC_DANSO_STATE_DIR': str(tmp_path/'private'), 'OPENAI_API_KEY': 'fixture-key',
         'CCC_DANSO_TIMEOUT_SECONDS': '3',
+        'CCC_DANSO_LONG_TASK_ENABLED': 'false',
     })
     return settings
 
@@ -209,7 +210,7 @@ def test_tool_home_is_optional_host_only_and_probed_only_when_configured(configu
 
 
 @pytest.mark.anyio
-async def test_long_task_profile_forwards_budgets_progress_and_explicit_resume(configured, tmp_path):
+async def test_default_long_task_profile_forwards_budgets_progress_and_explicit_resume(configured, tmp_path):
     settings = Settings.load(
         project_root=configured.project_root,
         bot_env_file=tmp_path / "absent-long-task",
@@ -221,15 +222,16 @@ async def test_long_task_profile_forwards_budgets_progress_and_explicit_resume(c
             "CCC_DANSO_WORKSPACE": configured.danso_workspace,
             "CCC_DANSO_STATE_DIR": str(tmp_path / "long-private"),
             "OPENAI_API_KEY": "fixture-key",
-            "CCC_DANSO_LONG_TASK_ENABLED": "true",
-            "CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS": "21600",
             "CCC_DANSO_TASK_PAUSE_AFTER_STAGE": "1",
-            "CLAUDE_PROCESS_TIMEOUT": "21660",
         },
     )
     runtime = build_danso_runtime(settings)
     assert settings.danso_provider_timeout_seconds == 180
+    assert settings.danso_long_task_enabled is True
+    assert settings.danso_timeout_seconds == 3600
+    assert settings.process_timeout_seconds == 21660
     assert runtime.timeout == 21600
+    assert runtime.outer_timeout == 21660
     session = await runtime.start_or_resume(SessionRequest(working_directory=settings.danso_workspace))
     first = [event async for event in session.send_turn("long task")]
     assert first[0].kind == "task_progress"
@@ -1630,3 +1632,43 @@ async def test_zai_explicit_model_and_output_cap_reach_native_cli(configured, tm
     argv = json.loads((Path(settings.danso_workspace) / "argv.json").read_text())
     assert argv[argv.index("--model") + 1] == "glm-5.3"
     assert argv[argv.index("--max-output-tokens") + 1] == "8192"
+
+
+def test_long_task_defaults_preserve_explicit_opt_out_and_timeout_overrides(configured, tmp_path):
+    base = {
+        "TELEGRAM_BOT_TOKEN": "123456:synthetic", "ALLOWED_USER_IDS": "[7]",
+        "CCC_AGENT_PROVIDER": "danso", "CCC_DANSO_CLI_PATH": configured.danso_cli_path,
+        "CCC_DANSO_WORKSPACE": configured.danso_workspace,
+        "CCC_DANSO_STATE_DIR": str(tmp_path / "defaults-private"),
+        "OPENAI_API_KEY": "fixture-key",
+    }
+    def load(**overrides):
+        return Settings.load(project_root=configured.project_root,
+                             bot_env_file=tmp_path / "absent-defaults",
+                             environ={**base, **overrides})
+
+    # A pinned legacy outer deadline is not silently rewritten.
+    pinned = load(CLAUDE_PROCESS_TIMEOUT="21600")
+    assert pinned.process_timeout_seconds == 21600
+    ready, reason = probe_danso_readiness(pinned)
+    assert not ready and "at least 10s" in reason
+
+    # An ordinary-mode timeout alone does not opt out of default long tasks.
+    legacy_ordinary_limit = load(CCC_DANSO_TIMEOUT_SECONDS="300")
+    assert legacy_ordinary_limit.danso_timeout_seconds == 300
+    assert build_danso_runtime(legacy_ordinary_limit).timeout == 21600
+
+    ordinary = load(CCC_DANSO_LONG_TASK_ENABLED="false")
+    runtime = build_danso_runtime(ordinary)
+    assert runtime.long_task is False
+    assert runtime.timeout == 3600
+    explicit = load(CCC_DANSO_LONG_TASK_ENABLED="false", CCC_DANSO_TIMEOUT_SECONDS="300")
+    assert build_danso_runtime(explicit).timeout == 300
+
+    old_binary = tmp_path / "old-default-danso"
+    old_binary.write_text("#!/bin/sh\nprintf '%s\\n' old-help\n")
+    old_binary.chmod(0o700)
+    ready, reason = probe_danso_readiness(load(CCC_DANSO_CLI_PATH=str(old_binary)))
+    assert not ready and "long-task" in reason
+    assert probe_danso_readiness(load(CCC_DANSO_CLI_PATH=str(old_binary),
+                                     CCC_DANSO_LONG_TASK_ENABLED="false")) == (True, "")
