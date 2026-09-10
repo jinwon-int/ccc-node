@@ -337,5 +337,47 @@ boundary_order_ok() {
 ok "all publisher scaffolding precedes the candidate fence, nothing trails it (#1619)" \
   'boundary_order_ok'
 
+# ─── evidence self-verification (#1626) ─────────────────────────────────────
+# The rubric demands machine re-verifiable evidence for major/blocker
+# findings; nothing re-ran it. One 30-case round had 11 of 22 checked grep
+# entries fail to match the candidate. The handler holds the candidate text,
+# so it checks the quotes and reports the rate.
+cat > "$BIN/evidence-agent" <<'EVSTUB'
+#!/usr/bin/env bash
+cat >/dev/null
+cat <<JSON
+{"verdict":"revise",
+ "findings":[{"severity":"major","area":"safety","note":"n"}],
+ "evidence":[{"kind":"grep","detail":"grep -F 'stub skill body line' SKILL.md"},
+             {"kind":"grep","detail":"grep -F 'Do NOT|must NOT' SKILL.md"},
+             {"kind":"url","detail":"https://example.invalid/not-a-grep"}],
+ "head_sha":"$REVIEW_STUB_HEAD","rubric_version":"2026-08-28.2","model":"stub-model"}
+JSON
+EVSTUB
+chmod +x "$BIN/evidence-agent"
+jq -n --arg head "$HEAD_OK" \
+  '{id:"task-ev", intent:"skills_intake_review",
+    payload:{skillName:"stub-skill", rubricVersion:"2026-08-28.2",
+      provenance:{author_node:"authornode", head_sha:$head, source_tree_sha256:"c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2"},
+      workerProcedure:"## Worker procedure\nApply the rubric.",
+      verdictSchema:{verdict:"approve | revise | reject"},
+      skillFiles:[{path:"SKILL.md", content:"# stub skill\nstub skill body line\n"}],
+      inventorySnapshot:[]}}' > "$TMP/task-ev.json"
+REVIEW_AGENT_BIN="$BIN/evidence-agent" REVIEW_AGENT_ARGS="" REVIEW_TIMEOUT_SEC=30 \
+  WORKER_ID=testnode REVIEW_STUB_HEAD="$HEAD_OK" \
+  bash "$HANDLER" < "$TMP/task-ev.json" > "$TMP/out-ev.json" 2>/dev/null
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "grep evidence is re-verified against the candidate and counted (#1626)" \
+  '[ "$rc" = 0 ] && jq -e ".output.evidenceCheck.checked == 2
+     and .output.evidenceCheck.matched == 1
+     and (.output.evidenceCheck.unmatched | length) == 1
+     and (.output.evidenceCheck.unmatched[0] | test(\"must NOT\"))" >/dev/null "$TMP/out-ev.json"'
+ok "unverifiable evidence adds an info finding, never changes the verdict (#1626)" \
+  '[ "$(jq -r ".output.verdict" "$TMP/out-ev.json")" = revise ] \
+     && [ "$(jq -r "[.output.findings[] | select(.severity==\"info\" and .area==\"claims\")] | length" "$TMP/out-ev.json")" = 1 ]'
+ok "prompt states the verbatim-quoting rule for evidence (#1626)" \
+  'grep -q "EVIDENCE QUOTING" "$CAPTURED" && grep -q "VERBATIM between the fence" "$CAPTURED"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
