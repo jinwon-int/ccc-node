@@ -50,3 +50,30 @@ class ProviderDiagnostics(unittest.TestCase):
                                ('run_timeout', 124), ('UNKNOWN', 3)]:
             self.assertNotIn('reason=', self.failure(line, category, code).message)
         self.assertNotIn('reason=', self.failure('').message)
+
+    def test_current_native_schema_preserves_diagnostics(self):
+        for reason, status in [('http_status', 429), ('http_status', 401),
+                               ('http_status', 503), ('invalid_json', None)]:
+            record = {'version': 1, 'reason': reason, 'http_status': status,
+                      'output_tokens_max': None}
+            event = self.failure('DANSO_PROVIDER=' + json.dumps(record))
+            self.assertIn('reason=' + reason, event.message)
+            if status is not None:
+                self.assertIn('http_status=' + str(status), event.message)
+
+    def test_output_cap_is_bounded_and_reason_specific(self):
+        valid = {'version': 1, 'reason': 'max_tokens', 'http_status': None,
+                 'output_tokens_max': 8192}
+        event = self.failure('DANSO_PROVIDER=' + json.dumps(valid))
+        self.assertIn('reason=max_tokens, output_tokens_max=8192', event.message)
+        malformed = [{**valid, 'output_tokens_max': cap}
+                     for cap in (None, True, 0, -1, 2**32, 'PRIVATE', [])]
+        malformed += [{**valid, 'http_status': 429},
+                      {**valid, 'reason': 'invalid_json'},
+                      {**valid, 'extra': 'PRIVATE'},
+                      {k: v for k, v in valid.items() if k != 'output_tokens_max'}]
+        for record in malformed:
+            with self.subTest(record=record):
+                message = self.failure('DANSO_PROVIDER=' + json.dumps(record)).message
+                self.assertNotIn('reason=', message)
+                self.assertNotIn('PRIVATE', message)

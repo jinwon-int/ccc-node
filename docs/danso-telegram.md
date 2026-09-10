@@ -317,10 +317,15 @@ HTTP status and ChatGPT SSE failures may additionally emit:
 DANSO_PROVIDER={"version":1,"reason":"http_status","http_status":429}
 ```
 
-The exact keys are `version`, `reason`, and `http_status`. Reasons are the
+Legacy records have exactly `version`, `reason`, and `http_status`. Current
+native records additionally carry `output_tokens_max`: null for ordinary
+failures, or a positive uint32 for `reason=max_tokens` with null HTTP status.
+The adapter accepts both shapes, validates the cap, and displays it for output
+limit failures. Unknown keys and inconsistent reason/cap combinations remain
+invalid. Reasons are the
 closed native enum `http_status`, `invalid_json`, `response_too_large`,
 `stream_ended`, `invalid_stream`, `unsupported_stream_event`, `response_failed`,
-`response_incomplete`, and `response_error`. `http_status` is a non-2xx,
+`response_incomplete`, `response_error`, and `max_tokens`. `http_status` is a non-2xx,
 three-digit status accepted by reqwest (100..999), and is null for every other
 reason. No response body, remote error code/message, URL, or credential is
 copied into this record. `invalid_stream` includes malformed or inconsistent
