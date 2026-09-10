@@ -252,7 +252,7 @@
       "name": "github-incident-recovery-merge-retry",
       "source": "skills/github-incident-recovery-merge-retry",
       "status": "active",
-      "tree_sha256": "73cb2fae394b3f0df22424fa2c2c56a15607b4334ce3e3ea46e41209c06db0d3"
+      "tree_sha256": "fe7603346525d552d48cff35260ea8f7433bf570d8b4e77eff0159ba8b4c8af8"
     },
     {
       "audience": "claude",

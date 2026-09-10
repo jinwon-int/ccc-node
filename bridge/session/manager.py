@@ -9,11 +9,14 @@ if TYPE_CHECKING:
 
 class SessionManager:
     VALID_REPLY_MODES = {"text", "voice"}
-    VALID_PROVIDERS = {"claude", "codex", "crush", "piri", "danso"}
+    # Grok uses an explicit fixed-owner journal, not this mutable session store.
+    VALID_PROVIDERS = {"claude", "codex", "crush", "piri", "danso", "grok"}
     DEFAULT_REPLY_MODE = "text"
     LAST_USER_MESSAGE_AT_KEY = "last_user_message_at"
 
     def __init__(self, store: SessionStore, settings: "Settings"):
+        if getattr(settings, "agent_provider", "claude") == "grok":
+            raise ValueError("Grok requires its immutable owner-DM journal, not generic sessions")
         self.store = store
         self.settings = settings
 
