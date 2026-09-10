@@ -15,6 +15,20 @@ MAX_BYTES="${CCC_SKILL_REVIEW_MAX_BYTES:-60000}"
 MODEL="${CCC_SKILL_REVIEW_MODEL:-haiku}"
 TIMEOUT="${CCC_SKILL_REVIEW_TIMEOUT:-180}"
 
+# zai fallback config (node-local opt-in, added 2026-09-05). Fail-open: without
+# a 0600 regular env file the pipeline is identical to the haiku-only flow.
+# Set CCC_SKILL_REVIEW_ZAI_ENV=off (or point at another file) to control.
+ZAI_ENV_FILE="${CCC_SKILL_REVIEW_ZAI_ENV:-${HOME:-/root}/.claude/state/skill-review.zai.env}"
+if [ "${CCC_SKILL_REVIEW_ZAI_ENV:-}" != "off" ] && [ -f "$ZAI_ENV_FILE" ] && [ ! -L "$ZAI_ENV_FILE" ]; then
+  zai_perms="$(stat -c '%a' "$ZAI_ENV_FILE" 2>/dev/null || printf '?')"
+  if [ "$zai_perms" = "600" ]; then
+    # shellcheck disable=SC1090
+    . "$ZAI_ENV_FILE"
+  else
+    echo "zai fallback disabled: $ZAI_ENV_FILE perms $zai_perms (want 600)" >&2
+  fi
+fi
+
 [ -f "$TRANSCRIPT" ] || { echo "no transcript: $TRANSCRIPT" >&2; exit 1; }
 
 build_redacted() {
@@ -138,6 +152,44 @@ call_claude() {
     2>/dev/null
 }
 
+zai_fallback() {
+  # Last-resort provider (node-local opt-in): zai GLM over the
+  # Anthropic-compatible endpoint via direct curl. Independent of the claude
+  # CLI on purpose — a broken/quota-dead CLI must not take this path down too.
+  # The bearer token travels via curl config-on-stdin, never argv/process list.
+  local input="$1" payload body http curl_rc jq_rc
+  if [ -z "${CCC_ZAI_API_KEY:-}" ] || [ -z "${CCC_ZAI_BASE_URL:-}" ]; then
+    echo "zai fallback unavailable: env file not loaded" >&2
+    return 99
+  fi
+  payload="$(jq -cn \
+    --arg model "${CCC_ZAI_MODEL:-glm-5.3-flash}" \
+    --arg system "$STRICT" \
+    --arg input "$input" \
+    '{model:$model, max_tokens:4096, thinking:{type:"disabled"}, system:$system,
+      messages:[{role:"user", content:$input}]}')" || return 1
+  body="$(mktemp "${TMPDIR:-/tmp}/zai-extract.XXXXXX")" || return 1
+  http="$(curl -sS --max-time "$TIMEOUT" -o "$body" -w '%{http_code}' \
+    -H 'content-type: application/json' \
+    --config - "${CCC_ZAI_BASE_URL%/}/v1/messages" \
+    -d "$payload" <<CFG 2>/dev/null
+header = "Authorization: Bearer ${CCC_ZAI_API_KEY}"
+header = "anthropic-version: 2023-06-01"
+CFG
+)"
+  curl_rc=$?
+  case "${http:-}" in 2*) : ;; *) curl_rc=1 ;; esac
+  if [ "$curl_rc" -ne 0 ]; then
+    echo "zai fallback failed http=${http:-none}" >&2
+    rm -f "$body"
+    return 1
+  fi
+  jq -r '(.content // []) | map(select(.type == "text") | .text) | join("")' "$body" 2>/dev/null
+  jq_rc=$?
+  rm -f "$body"
+  return "$jq_rc"
+}
+
 build_input() {
   printf '%s\n\n--- existing skills ---\n%s\n\n--- transcript metadata ---\nsession=%s trigger=%s source_cwd=%s source_project=%s\n\n--- redacted transcript ---\n%s\n' \
     "$PROMPT" "$EXISTING" "$SESSION_ID" "$TRIGGER" "$SOURCE_CWD" "$SOURCE_PROJECT" "$REDACTED"
@@ -145,28 +197,50 @@ build_input() {
 
 try_parse() { printf '%s' "$1" | sed -E '/^[[:space:]]*```/d'; }
 
+valid_candidates() { printf '%s' "$1" | jq -e '.skill_candidates and (.skill_candidates | type == "array")' >/dev/null 2>&1; }
+
+emit() {
+  printf '%s' "$1" | jq -c \
+    --arg sid "$SESSION_ID" \
+    --arg trg "$TRIGGER" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg source_cwd "$SOURCE_CWD" \
+    --arg source_project "$SOURCE_PROJECT" \
+    '. + {session_id:$sid, trigger:$trg, reviewed_at:$ts, source_cwd:$source_cwd, source_project:$source_project}'
+}
+
 INPUT="$(build_input)"
+CLEAN=""
+
 RESULT="$(call_claude "$SYSTEM_CONSTRAINT" "$INPUT")"
 ec=$?
-if [ $ec -ne 0 ] || [ -z "$RESULT" ]; then
-  echo "claude -p attempt failed (ec=$ec) or empty" >&2
-  exit 1
-fi
-CLEAN="$(try_parse "$RESULT")"
-if ! printf '%s' "$CLEAN" | jq -e '.skill_candidates and (.skill_candidates | type == "array")' >/dev/null 2>&1; then
-  RESULT2="$(call_claude "$STRICT" "$INPUT")"
-  ec2=$?
-  if [ $ec2 -ne 0 ] || [ -z "$RESULT2" ]; then
-    echo "strict retry failed (ec=$ec2) or empty" >&2
-    exit 1
+if [ "$ec" -ne 0 ] || [ -z "$RESULT" ]; then
+  echo "claude -p attempt failed (ec=$ec) or empty; skipping strict retry" >&2
+else
+  CLEAN="$(try_parse "$RESULT")"
+  if ! valid_candidates "$CLEAN"; then
+    RESULT2="$(call_claude "$STRICT" "$INPUT")"
+    ec2=$?
+    if [ "$ec2" -ne 0 ] || [ -z "$RESULT2" ]; then
+      echo "strict retry failed (ec=$ec2) or empty" >&2
+      CLEAN=""
+    else
+      CLEAN="$(try_parse "$RESULT2")"
+    fi
   fi
-  CLEAN="$(try_parse "$RESULT2")"
 fi
 
-printf '%s' "$CLEAN" | jq -c \
-  --arg sid "$SESSION_ID" \
-  --arg trg "$TRIGGER" \
-  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --arg source_cwd "$SOURCE_CWD" \
-  --arg source_project "$SOURCE_PROJECT" \
-  '. + {session_id:$sid, trigger:$trg, reviewed_at:$ts, source_cwd:$source_cwd, source_project:$source_project}'
+if ! valid_candidates "$CLEAN"; then
+  echo "haiku path produced no valid JSON; trying zai fallback" >&2
+  ZAI_OUT="$(zai_fallback "$INPUT")"
+  zrc=$?
+  if [ "$zrc" -eq 0 ] && [ -n "$ZAI_OUT" ]; then
+    CLEAN="$(try_parse "$ZAI_OUT")"
+  fi
+fi
+
+if ! valid_candidates "$CLEAN"; then
+  echo "all extract attempts failed" >&2
+  exit 1
+fi
+emit "$CLEAN"
