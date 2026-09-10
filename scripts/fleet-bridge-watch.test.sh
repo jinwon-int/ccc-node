@@ -160,8 +160,8 @@ ok "skipped dual-domain still reports OK" 'grep -q "^OK noroot" "$OUT"'
 # The remote probe is a quoted heredoc — invisible to bash -n on the script
 # itself. Extract and parse it as POSIX sh so a probe typo cannot ship.
 probe_body="$TMP/probe-body.sh"
-sed -n '/PROBE <<.PROBE_EOF.$/,/^PROBE_EOF$/p' "$SC" | sed '1d;$d' > "$probe_body"
-ok "remote probe parses as POSIX sh" 'bash -n "$probe_body" && { ! command -v dash >/dev/null || dash -n "$probe_body"; }'
+sed -n "/^read .* PROBE <<'PROBE_EOF'/,/^PROBE_EOF$/p" "$SC" | sed '1d;$d' > "$probe_body"
+ok "remote probe parses as POSIX sh" '[ -s "$probe_body" ] && bash -n "$probe_body" && { ! command -v dash >/dev/null || dash -n "$probe_body"; }'
 
 # ---- non-canonical runtime root (#842) ------------------------------------
 # The seoseo 2026-08-01 shape, and the reason this check is separate from the
