@@ -134,7 +134,11 @@ native cumulative active-runtime limit, excluding operator pauses, defaults to a
 21600 seconds; for the maximum, set
 `CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS=21600` and
 `CLAUDE_PROCESS_TIMEOUT=21660` (also the bridge-wide default). Existing explicit
-environment values remain authoritative: a pinned outer deadline of 21600 must
+settings remain authoritative within their selected mode.
+`CCC_DANSO_TIMEOUT_SECONDS` applies only when
+`CCC_DANSO_LONG_TASK_ENABLED=false`: an existing ordinary timeout such as 300
+seconds does not opt out of the new long-task default. To retain that ordinary
+deadline on upgrade, explicitly set the mode to false. A pinned outer deadline of 21600 must
 be raised to at least 21610 when using the six-hour task limit. Older binaries
 must be upgraded or explicitly use ordinary mode; capability checks still fail
 closed. This default change does not replay, repair, or migrate unresolved

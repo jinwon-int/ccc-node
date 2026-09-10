@@ -1653,6 +1653,11 @@ def test_long_task_defaults_preserve_explicit_opt_out_and_timeout_overrides(conf
     ready, reason = probe_danso_readiness(pinned)
     assert not ready and "at least 10s" in reason
 
+    # An ordinary-mode timeout alone does not opt out of default long tasks.
+    legacy_ordinary_limit = load(CCC_DANSO_TIMEOUT_SECONDS="300")
+    assert legacy_ordinary_limit.danso_timeout_seconds == 300
+    assert build_danso_runtime(legacy_ordinary_limit).timeout == 21600
+
     ordinary = load(CCC_DANSO_LONG_TASK_ENABLED="false")
     runtime = build_danso_runtime(ordinary)
     assert runtime.long_task is False

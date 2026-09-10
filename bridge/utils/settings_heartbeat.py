@@ -154,7 +154,7 @@ class HeartbeatSettingsMixin:
             "stall notice, the turn is interrupted, and the conversation FIFO "
             "is released so queued messages proceed. Without it the request "
             "would hold the conversation until the full process timeout "
-            "(default 21600s). Set 0 to disable and fall back to the process "
+            "(default 21660s). Set 0 to disable and fall back to the process "
             "timeout only."
         ),
     )
