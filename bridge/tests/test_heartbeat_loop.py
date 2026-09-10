@@ -278,7 +278,9 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
         req.current_tool_label = "bash"
         req.heartbeat_forecast_loaded = True
         req.heartbeat_forecast_samples = [2000000, 2400000, 3000000]
-        now = asyncio.get_running_loop().time()
+        # A fresh CI runner can have less than 301s of monotonic uptime.
+        # Use a complete synthetic timeline so prior events stay positive.
+        now = 10_000.0
         req.started_at = now - 1200.0
         req.last_event_at = now - 301.0
         await self.handler._maybe_update_heartbeat(req, now)
@@ -350,7 +352,9 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
         quiet, active = self._make_request(), self._make_request()
         quiet.chat_id, active.chat_id = 10, 20
         quiet.heartbeat_message_id, active.heartbeat_message_id = 100, 200
-        now = asyncio.get_running_loop().time()
+        # A fresh CI runner can have less than 301s of monotonic uptime.
+        # Use a complete synthetic timeline so prior events stay positive.
+        now = 10_000.0
         quiet.started_at = active.started_at = now - 1200.0
         quiet.last_event_at, active.last_event_at = now - 301.0, now
         await asyncio.gather(self.handler._maybe_update_heartbeat(quiet, now),
