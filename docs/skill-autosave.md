@@ -710,6 +710,19 @@ default `${CODEX_HOME:-~/.codex}/skills`),
 `CCC_CODEX_SKILL_COLLECTOR` (Codex-only candidate collection, default true),
 `CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP` (default 1, range 1–10).
 
+Zai fallback (node-local opt-in): when the haiku path yields no valid JSON,
+`claude/hooks/skill-review/extract.sh` retries once against a zai GLM model
+(default `glm-5.3-flash`) over the zai Anthropic-compatible endpoint via a
+direct `curl` — independent of the claude CLI binary, so a broken or
+quota-dead CLI cannot take the fallback down with it. The fallback activates
+only when `~/.claude/state/skill-review.zai.env` (regular file, mode 0600,
+symlinks rejected) defines `CCC_ZAI_BASE_URL`, `CCC_ZAI_API_KEY`, and
+`CCC_ZAI_MODEL`; without that file the pipeline is unchanged.
+`CCC_SKILL_REVIEW_ZAI_ENV=off` disables the fallback outright, and the var
+also accepts an alternate env-file path. The bearer token is passed to curl
+via config-on-stdin (never argv/process list) and no credential value is
+logged.
+
 ## Dual-broker review dispatch (#2024)
 
 The intake review lane and its R2 revision round are broker-routed:
