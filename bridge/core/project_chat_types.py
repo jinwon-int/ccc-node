@@ -86,11 +86,9 @@ class _PendingRequest:
     started_at: float = 0.0
     heartbeat_last_update_at: float = 0.0
     heartbeat_message_id: Optional[int] = None
-    # Wall-clock of the last runtime event seen for this request. Drives
-    # heartbeat stall detection: when it goes silent for too long the request
-    # is stuck (bridge restart / hung stream) and its heartbeat is removed
-    # instead of ticking up forever. 0 until the first event; the stall check
-    # falls back to started_at.
+    # Monotonic time of the last runtime event. A silent request keeps its
+    # heartbeat with a waiting indicator; silence alone does not prove it is
+    # stuck or finished. 0 until the first event; fall back to started_at.
     last_event_at: float = 0.0
     # One in-memory lifecycle authority. TaskLedger and the legacy waiting set
     # are best-effort projections of this state (#346).
