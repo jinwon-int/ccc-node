@@ -83,8 +83,17 @@ def compose_heartbeat_text(
     elapsed_seconds: float,
     current_tool: Optional[str] = None,
     forecast_seconds: Optional[float] = None,
+    silent_seconds: Optional[float] = None,
 ) -> str:
     """Compose the Telegram heartbeat status line."""
+    if silent_seconds is not None:
+        parts = [
+            f"⏳ Waiting for progress — {format_duration(elapsed_seconds)}",
+            f"No update for {format_duration(silent_seconds)}",
+        ]
+        if current_tool:
+            parts.append(f"Last: {current_tool}")
+        return " | ".join(parts)
     parts = [f"⏳ Working — {format_duration(elapsed_seconds)}"]
     if current_tool:
         parts.append(current_tool)

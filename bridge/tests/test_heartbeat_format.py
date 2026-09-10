@@ -39,6 +39,17 @@ class HeartbeatFormatTests(unittest.TestCase):
             "⏳ Working — 1m 15s · ETA ~2m 00s",
         )
 
+    def test_silent_request_keeps_elapsed_and_last_known_work_without_eta(self):
+        self.assertEqual(
+            compose_heartbeat_text(elapsed_seconds=1244, current_tool="bash",
+                                   forecast_seconds=120, silent_seconds=301),
+            "⏳ Waiting for progress — 20m 44s | No update for 5m 01s | Last: bash",
+        )
+        self.assertEqual(
+            compose_heartbeat_text(elapsed_seconds=360, silent_seconds=360),
+            "⏳ Waiting for progress — 6m 00s | No update for 6m 00s",
+        )
+
     def test_update_gate_and_progress_suppression_helpers(self):
         self.assertFalse(
             should_update_heartbeat(
