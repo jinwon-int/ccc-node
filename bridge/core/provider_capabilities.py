@@ -23,7 +23,7 @@ from types import MappingProxyType
 # Must stay equal to session.manager.SessionManager.VALID_PROVIDERS; the
 # capability tests pin the equality so a new provider cannot land without a
 # declared capability row.
-SUPPORTED_PROVIDERS: tuple[str, ...] = ("claude", "codex", "crush", "piri", "danso")
+SUPPORTED_PROVIDERS: tuple[str, ...] = ("claude", "codex", "crush", "piri", "danso", "grok")
 
 _DEPENDENCY_PATTERN = re.compile(r"^#\d+$")
 
@@ -106,6 +106,7 @@ def _axis(
             "crush": _CRUSH_STATUSES[key],
             "piri": piri,
             "danso": _DANSO_STATUSES[key],
+            "grok": _GROK_STATUSES[key],
         },
     )
 
@@ -124,6 +125,32 @@ def _unsupported(reason: str, *dependencies: str) -> CapabilityStatus:
 
 def _unknown(reason: str, *dependencies: str) -> CapabilityStatus:
     return CapabilityStatus(CapabilityState.UNKNOWN, reason, tuple(dependencies))
+
+_GROK_STATUSES: Mapping[str, CapabilityStatus] = {
+    "runtime_adapter": _supported("GrokRuntime binds an explicitly attached existing Bot over bounded SSH RPC; a restricted owner-DM frontend consumes its AgentRuntime events."),
+    "session_resume": _degraded("Only the one configured journal/session resumes. No /new, browsing, resets or independent remote context. Missing/corrupt state denies."),
+    "text_streaming": _degraded("Text is buffered until an attributable result is durably committed; no incremental remote text."),
+    "reasoning_stream": _unsupported("Remote reasoning is not exposed."),
+    "message_boundaries": _supported("Validated final text emits explicit message boundaries and one terminal result."),
+    "tool_event_stream": _unsupported("Tool/approval transcript records deny output; this does not prevent remote tool effects."),
+    "interactive_approvals": _unsupported("Existing Bot host policy owns tools; no bridge approval or sandbox control."),
+    "turn_interrupt": _degraded("Local wait is cancelled and retired; the Bot-scoped remote interrupt is not invoked and remote outcome remains unknown."),
+    "turn_serialization": _degraded("One configured journal uses process flock and local poller exclusion. Other hosts/apps are not locked; transcript interference denies."),
+    "session_browsing": _unsupported("No arbitrary conversation selection or history browsing."),
+    "model_discovery": _unsupported("Existing Bot model/effort are externally configured; no model API or bridge override."),
+    "usage_metering": _unsupported("No qualified token, cost or account quota protocol."),
+    "terminal_stall_release": _supported("Bounded SSH exchanges and a finite turn deadline retire uncertain local work without automatic resend."),
+    "async_completion_delivery": _unsupported("No detached results, delivery ack or durable Telegram outbox in this restricted frontend."),
+    "external_wait": _unsupported("No autonomous continuations, external wait dispatch or spools are installed."),
+    "memory_session_resume": _degraded("Existing Bot context persists externally; local journal is not a complete remote context or independent session."),
+    "memory_read_bootstrap": _unsupported("No CCC memory injection or remote working-directory policy."),
+    "memory_postcompact_reinject": _unsupported("No qualified remote compaction or reinjection API."),
+    "memory_writeback_distill": _unsupported("No background extraction or prompt decoration."),
+    "memory_sink_local": _unsupported("No CCC memory writeback."),
+    "memory_sink_wiki_candidate": _unsupported("No Wiki memory publication."),
+    "memory_roundtrip": _unsupported("CCC memory roundtrip is not implemented."),
+    "lifecycle_observability": _degraded("Body-free failure categories and owner status only; generic CCC health/spool/task observers are not installed."),
+}
 
 # crush (issue #926) — the third provider column, kept as one explicit map so
 # every per-axis decision stays visible in one place. Conformance-covered axes

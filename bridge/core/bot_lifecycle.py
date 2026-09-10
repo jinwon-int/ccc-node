@@ -671,6 +671,8 @@ class BotLifecycleMixin:
 
     def _probe_agent_readiness(self) -> tuple[bool, str]:
         provider = str(getattr(self._config, "agent_provider", "claude")).lower()
+        if provider == "grok":
+            return False, "Grok requires its fixed-owner frontend and authenticated readiness gate"
         if provider == "danso":
             from telegram_bot.core.danso_runtime import probe_danso_readiness
 

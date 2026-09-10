@@ -84,6 +84,13 @@ def test_codex_provider_does_not_require_claude(tmp_path: Path) -> None:
     assert "claude command not found" not in result.stdout
 
 
+def test_grok_provider_needs_ssh_not_claude_cli(tmp_path: Path) -> None:
+    result = _run(tmp_path, provider="grok")
+    assert result.returncode == 0
+    assert "Grok SSH client available" in result.stdout
+    assert "claude command not found" not in result.stdout
+
+
 def test_codex_provider_fails_closed_when_cli_is_missing(tmp_path: Path) -> None:
     result = _run(tmp_path, provider="codex", codex_cli=str(tmp_path / "missing"))
 

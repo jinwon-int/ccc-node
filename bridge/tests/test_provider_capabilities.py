@@ -281,8 +281,12 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
         for provider in SUPPORTED_PROVIDERS:
             with self.subTest(provider=provider):
                 status = capability_status(provider, "lifecycle_observability")
-                self.assertIs(status.state, CapabilityState.SUPPORTED)
+                self.assertIs(status.state, CapabilityState.DEGRADED if provider == "grok" else CapabilityState.SUPPORTED)
                 self.assertEqual(status.dependencies, ())
+                if provider == "grok":
+                    self.assertIn("not installed", status.reason)
+                    self.assertIn("owner status", status.reason)
+                    continue  # restricted frontend deliberately has no generic observer
                 for boundary in ("opt-in", "body-free", "bounded", "owner-only", "fail-open"):
                     self.assertIn(boundary, status.reason)
                 self.assertIn("Final Telegram delivery", status.reason)

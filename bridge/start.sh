@@ -1552,6 +1552,14 @@ maybe_setup_agent_cli() {
     provider="${provider:-claude}"
 
     case "${provider,,}" in
+        grok)
+            if ! command -v ssh >/dev/null 2>&1; then
+                echo "❌ Error: Grok requires the local SSH client"
+                exit 1
+            fi
+            echo "✅ Grok SSH client available; explicit journal and authenticated startup checks still required"
+            return
+            ;;
         codex)
             codex_cli="$(read_env_with_fallback "CCC_CODEX_CLI_PATH")"
             codex_cli="${codex_cli:-codex}"
@@ -1622,7 +1630,7 @@ maybe_setup_agent_cli() {
             return
             ;;
         *)
-            echo "❌ Error: unsupported CCC_AGENT_PROVIDER (expected claude, codex, crush, piri, or danso)"
+            echo "❌ Error: unsupported CCC_AGENT_PROVIDER (expected claude, codex, crush, piri, danso, or grok)"
             exit 1
             ;;
     esac

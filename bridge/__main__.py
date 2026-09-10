@@ -224,6 +224,24 @@ def _build_skill_candidate_collector(
     )
 
 
+def _build_grok_context(settings: Settings, agent_runtime: Any, telegram_port: Any, clock: Any) -> AppContext:
+    from telegram.ext import Application
+    from telegram_bot.core.grok_provider import build_grok_runtime, configured_route
+
+    configured_route(settings)
+    # No generic resets, prompt decorators, distillation or task runners.
+    return AppContext(
+        settings=settings, session_store=None, session_manager=None,
+        distill_journal=None, skill_candidate_collector_worker=None,
+        distill_snapshot_worker=None, distill_extraction_worker=None,
+        distill_local_sink_worker=None, memory_promoter=None,
+        distill_wiki_sink_worker=None, project_chat=None,
+        agent_runtime=agent_runtime if agent_runtime is not None else build_grok_runtime(settings),
+        sdk_factory=None, telegram_port=telegram_port or Application.builder,
+        clock=clock or time,
+    )
+
+
 def build_context(
     settings: Settings,
     *,
@@ -234,6 +252,16 @@ def build_context(
 ) -> AppContext:
     """Compose dependencies without performing filesystem initialization."""
     bind_config(settings)
+    if settings.agent_provider == "grok":
+        return _build_grok_context(settings, agent_runtime, telegram_port, clock)
+    return _build_standard_context(settings, sdk_factory=sdk_factory, agent_runtime=agent_runtime,
+                                   telegram_port=telegram_port, clock=clock)
+
+
+def _build_standard_context(
+    settings: Settings, *, sdk_factory: Any = None, agent_runtime: Any = None,
+    telegram_port: Any = None, clock: Any = None,
+) -> AppContext:
     from telegram.ext import Application
     from telegram_bot.core.project_chat import ProjectChatHandler
     from telegram_bot.memory.distill_journal import DistillJournal
@@ -497,6 +525,10 @@ def build_context(
 
 def create_app(context: AppContext):
     """Create the Telegram adapter from an already-built application context."""
+    if context.settings.agent_provider == "grok":
+        from telegram_bot.core.grok_bot import GrokTelegramBot
+
+        return GrokTelegramBot(context.settings, context.agent_runtime, context.telegram_port)
     from telegram_bot.core.bot import TelegramBot
 
     return TelegramBot(

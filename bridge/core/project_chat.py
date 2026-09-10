@@ -156,6 +156,8 @@ class ProjectChatHandler(
         # production composition root always injects the validated Settings.
         compatibility_mode = settings is None
         self._config = config if compatibility_mode else settings
+        if getattr(self._config, "agent_provider", "claude") == "grok":
+            raise ValueError("Grok requires its fixed-owner frontend; generic project routing is disabled")
         self._session_started_recorder = session_started_recorder
         root_value = getattr(
             self._config,
