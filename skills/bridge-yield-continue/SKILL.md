@@ -21,3 +21,19 @@ description: Register a durable bridge baton for the next authorized work bundle
 Keep the prompt body-free and under 4,000 characters. Include no credentials, message bodies, or CI logs. Registration preserves the user's existing authorization; it never grants approval to merge, deploy, delete, or expand scope.
 
 User controls remain authoritative: `/stop` cancels queued and running batons; `/continue` re-arms a cap-held baton.
+
+## Re-verifying the CLI contract
+
+Step 4's success shape is the skill's whole mechanism — if it drifts, the baton
+silently stops being a baton. The CLI is a separate component, so check it
+rather than trusting this file:
+
+```bash
+grep -n '"continuation_id"' bridge/core/continuation_cli.py   # the `_emit` success block
+grep -n '"ok": False' bridge/core/continuation_cli.py         # failure shapes, incl. route/queue errors
+```
+
+Re-verified 2026-09-10: `continuation_cli.py` emits `{"ok": true,
+"continuation_id": ...}` on success and `{"ok": false, "code": ...}` on
+failure (`validation`, `queue-error`, and a route failure). If a check
+disagrees, the CLI is authoritative — fix this file.
