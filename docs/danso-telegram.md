@@ -47,7 +47,10 @@ CCC_DANSO_MODEL=gpt-6-astra
 CCC_DANSO_EFFORT=medium
 CCC_BRIDGE_MEMORY_MODE=off
 CCC_MEMORY_DISTILL_PROVIDER=off
-CCC_DANSO_TIMEOUT_SECONDS=300
+CCC_DANSO_TIMEOUT_SECONDS=3600
+CCC_DANSO_LONG_TASK_ENABLED=true
+CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS=21600
+CLAUDE_PROCESS_TIMEOUT=21660
 CCC_DANSO_PROVIDER_TIMEOUT_SECONDS=180
 CCC_DANSO_MAX_TURNS=32
 CCC_DANSO_COMPACT_AT_BYTES=131072
@@ -121,15 +124,21 @@ path, preserving the previous runtime's history.
 normal default, or set it at least 10 seconds above the Danso deadline while
 preserving the bridge's other timeout invariants.
 
-Long-task mode is opt-in. Set `CCC_DANSO_LONG_TASK_ENABLED=true` and configure
+Long-task mode is enabled by default. Set `CCC_DANSO_LONG_TASK_ENABLED=false`
+to select ordinary mode with its one-hour default deadline. Configure
 the native limits (`CCC_DANSO_TASK_STAGE_REQUESTS`,
 `CCC_DANSO_TASK_MAX_REQUESTS`, `CCC_DANSO_TASK_MAX_TOKENS`, and
 `CCC_DANSO_TASK_REPEAT_LIMIT`) only with a native binary that exposes the full
 long-task CLI. The bridge rejects older binaries before a provider request. The
-native cumulative active-runtime limit, excluding operator pauses, is at most
+native cumulative active-runtime limit, excluding operator pauses, defaults to and is at most
 21600 seconds; for the maximum, set
 `CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS=21600` and
-`CLAUDE_PROCESS_TIMEOUT=21660`. Provider requests keep the 180-second default.
+`CLAUDE_PROCESS_TIMEOUT=21660` (also the bridge-wide default). Existing explicit
+environment values remain authoritative: a pinned outer deadline of 21600 must
+be raised to at least 21610 when using the six-hour task limit. Older binaries
+must be upgraded or explicitly use ordinary mode; capability checks still fail
+closed. This default change does not replay, repair, or migrate unresolved
+session journals. Provider requests keep the 180-second default.
 The stage request setting is a target: native safe-boundary compaction may
 consume additional bounded requests before it records the next checkpoint.
 The repeat setting limits repeated identical tool batches. The defaults remain

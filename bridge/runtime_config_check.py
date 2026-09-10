@@ -20,7 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_PROCESS_TIMEOUT_SECONDS = 21600
+# Leave one minute for native six-hour tasks to report their terminal state.
+DEFAULT_PROCESS_TIMEOUT_SECONDS = 21660
 DEFAULT_DELEGATED_TASK_STALL_SECONDS = 7200.0
 
 # Claude Agent SDK stdout NDJSON reader buffer (bytes).
