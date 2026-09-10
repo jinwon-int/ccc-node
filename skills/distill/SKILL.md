@@ -83,7 +83,12 @@ wc -l ~/.claude/state/wiki-candidates.md
    - **`stats [days]`** — read-only aggregate over `distill.log` (default 7 days):
      ```bash
      set -uo pipefail
-     ARG="${ARGUMENTS:-stats}"
+     # `$ARGUMENTS` is substituted into this block by the slash-command
+     # template BEFORE the shell runs. It is not a shell variable — reading
+     # `${ARGUMENTS}` from the environment always yielded empty, so `days`
+     # was silently ignored and DAYS was pinned to 7 (#1630).
+     ARG="$ARGUMENTS"
+     [ -n "$ARG" ] || ARG="stats"
      DAYS="$(printf '%s' "$ARG" | sed -E 's/^stats[[:space:]]*//; s/^days=//')"
      case "$DAYS" in ''|*[!0-9]*) DAYS=7 ;; esac
      LOG="${CCC_STATE_DIR:-$HOME/.claude/state}/distill.log"
@@ -110,6 +115,7 @@ wc -l ~/.claude/state/wiki-candidates.md
          if (match($0, /trigger=[^ ]+/)) { trigger=substr($0, RSTART+8, RLENGTH-8) }
          if (match($0, /pid=[0-9]+/))    { pid=substr($0, RSTART+4, RLENGTH-4) }
          if (pid != "") pid_trigger[pid]=trigger
+         last_trigger=trigger   # scan-order "most recent start", used by `spawned bg`
          total[trigger]++
          next
        }
@@ -118,9 +124,11 @@ wc -l ~/.claude/state/wiki-candidates.md
          # log only the bg pid still resolve their trigger via the cache.
          if (match($0, /pid=[0-9]+/)) {
            bg=substr($0, RSTART+4, RLENGTH-4)
-           # Find the most recent start-trigger by scanning known parents.
-           for (p in pid_trigger) parent_trigger=pid_trigger[p]
-           pid_trigger[bg]=parent_trigger
+           # Use the trigger from the most recent `start` line, tracked in
+           # scan order. `for (p in pid_trigger)` was used here to mean "most
+           # recent", but awk array traversal order is unspecified, so it
+           # picked an arbitrary parent and mislabelled bg lines (#1630).
+           if (last_trigger != "") pid_trigger[bg]=last_trigger
          }
          next
        }
@@ -209,6 +217,21 @@ wc -l ~/.claude/state/wiki-candidates.md
 - Scope control: by default distill accepts every transcript visible to the node. To restrict a multi-tenant node, set `CCC_DISTILL_SCOPE_CWDS` to a comma/colon-separated allowlist of cwd paths, or write one cwd/project-encoded entry per line to `~/.claude/state/distill.scope`. Out-of-scope transcripts log `skip reason=cwd-out-of-scope` and do not extract, push, or queue.
 - Noise controls (issue #298): wiki-candidates are extracted only when reusable + new + settled (exclusion list in the extract prompt), capped at `CCC_DISTILL_MAX_WIKI_CANDS` (default 3) per session by wiki-queue, and deduped by topic for `CCC_DISTILL_SEEN_TTL_DAYS` (default 7). `/distill compact` cleans pre-existing duplicate backlog.
 - All outputs carry provenance: `source_cwd`/`source_project` in `distill-last.json`, Honcho metadata, and wiki-candidates entries.
-- DO NOT use `rm` on `distill.disabled` / `distill.dryrun` (guard blocks `rm` + system paths). Always `mv` to a timestamped archive name — same disable effect, no guard friction.
+- Re-enable by `mv`-ing `distill.disabled` / `distill.dryrun` to a timestamped archive name rather than deleting them, so the previous toggle state stays recoverable and the change is auditable. Choose `mv` for that reason — **not** to avoid the guard: if the guard blocks an action you believe is correct, stop and get approval instead of reaching for a verb it does not cover.
 - Manual fire from inside an active Claude Code session uses **this** session's transcript. If you want to distill some **other** session, set `CLAUDE_DISTILL_TRANSCRIPT=/path/to/other.jsonl` in env before firing.
 - All extract output is redacted before any external send. Even so, never paste raw secrets in the prompt that feeds the trans — the distiller will see them.
+
+## Re-verifying the pinned values
+
+Every default and flag named above lives in the hook scripts, not here. This
+file can drift from them silently, so check rather than trust it (#1630):
+
+| Pinned here | Check |
+|---|---|
+| `CCC_DISTILL_MAX_WIKI_CANDS` default 3 | `grep -rn 'CCC_DISTILL_MAX_WIKI_CANDS' claude/hooks/` |
+| `CCC_DISTILL_SEEN_TTL_DAYS` default 7 | `grep -rn 'CCC_DISTILL_SEEN_TTL_DAYS' claude/hooks/` |
+| `CCC_DISTILL_HOTNESS_THRESHOLD` default 3 | `grep -rn 'CCC_DISTILL_HOTNESS_THRESHOLD' claude/hooks/` |
+| `wiki-queue.sh --compact` exists | `grep -n -- '--compact' claude/hooks/distill/wiki-queue.sh` |
+| `CLAUDE_DISTILL_TIMEOUT` | `grep -n 'CLAUDE_DISTILL_TIMEOUT' claude/hooks/distill/extract.sh` — the **default is 90**; the `240` named above is a suggested raise on timeout, not the default |
+
+If a check disagrees, the hook script is authoritative — fix this file.

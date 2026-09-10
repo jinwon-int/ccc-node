@@ -186,7 +186,7 @@
       "name": "distill",
       "source": "skills/distill",
       "status": "active",
-      "tree_sha256": "2f61b0d55a1d382b5c58325e35d1f5916f330ffe551067318c9f53dee1cfdbfc"
+      "tree_sha256": "4838a38725ec74a70638839aeff6bf757067d29c54394c45ba7c96a2bad85433"
     },
     {
       "audience": "shared",
