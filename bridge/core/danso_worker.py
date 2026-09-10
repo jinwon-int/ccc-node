@@ -107,7 +107,7 @@ TRANSPORT_KEYS = {'version', 'phase', 'elapsed_ms', 'request_bytes', 'attempts'}
 PROVIDER_REASONS = {
     'http_status', 'invalid_json', 'response_too_large', 'stream_ended',
     'invalid_stream', 'unsupported_stream_event', 'response_failed',
-    'response_incomplete', 'response_error',
+    'response_incomplete', 'response_error', 'max_tokens',
 }
 PROVIDER_KEYS = {'version', 'reason', 'http_status'}
 TASK_PROGRESS_STATES = {'checkpoint', 'paused', 'completed', 'blocked'}
@@ -224,11 +224,19 @@ def _provider_detail(text, category, code):
         return ''
     try:
         value = json.loads(lines[0], object_pairs_hook=_unique_object)
-        if (type(value) is not dict or set(value) != PROVIDER_KEYS
+        if (type(value) is not dict or set(value) not in (PROVIDER_KEYS, PROVIDER_KEYS | {'output_tokens_max'})
                 or type(value['version']) is not int or value['version'] != 1
                 or type(value['reason']) is not str or value['reason'] not in PROVIDER_REASONS):
             return ''
         status = value['http_status']
+        cap = value.get('output_tokens_max')
+        if value['reason'] == 'max_tokens':
+            if (status is not None or type(cap) is not int
+                    or not 1 <= cap <= 2**32 - 1):
+                return ''
+            return f", reason=max_tokens, output_tokens_max={cap}"
+        if cap is not None:
+            return ''
         if value['reason'] == 'http_status':
             # reqwest StatusCode accepts all three-digit codes, including extensions.
             if type(status) is not int or not 100 <= status <= 999 or 200 <= status <= 299:
