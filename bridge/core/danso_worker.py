@@ -17,6 +17,7 @@ from telegram_bot.core.agent_runtime import (
     CompletionEvent, ErrorEvent, MessageCompletedEvent, ModelInfo,
     ResultEvent, TaskProgressEvent, TextDeltaEvent, deny_approval,
 )
+from telegram_bot.core.danso_progress import read_progress
 
 CAP = 1024 * 1024
 # A checkpoint may be emitted at stage start and after each request, with a
@@ -396,7 +397,8 @@ class DansoRuntime:
                  tool_home=None,
                  long_task=False, task_stage_requests=16, task_max_requests=1024,
                  task_max_tokens=10_000_000, task_repeat_limit=3,
-                 task_pause_after_stage=None, native_memory_args=None):
+                 task_pause_after_stage=None, native_memory_args=None,
+                 progress_jsonl=False):
         if provider not in PROVIDERS or not model or not isinstance(model, str):
             raise ValueError('invalid provider/model')
         if type(long_task) is not bool:
@@ -462,6 +464,9 @@ class DansoRuntime:
         self.task_max_tokens = task_max_tokens
         self.task_repeat_limit = task_repeat_limit
         self.task_pause_after_stage = task_pause_after_stage
+        if type(progress_jsonl) is not bool:
+            raise ValueError('invalid progress setting')
+        self.progress_jsonl = progress_jsonl
 
     async def list_models(self):
         return [ModelInfo(id=self.model, display_name=self.model, is_default=True,
@@ -679,7 +684,8 @@ class DansoSession:
             command = [r.binary, '--sandbox', r.sandbox, '--cwd', str(self.cwd), '--session', str(r.root / (self.session_id + '.jsonl')),
                        '--provider', r.provider, '--model', r.model, '--max-turns', str(r.max_turns),
                        '--max-output-tokens', str(r.max_output_tokens),
-                       '--provider-timeout-seconds', str(r.provider_timeout), '-p']
+                       '--provider-timeout-seconds', str(r.provider_timeout),
+                       '--progress-jsonl' if (r.progress_jsonl and not r.long_task) else '-p']
             if r.tool_home is not None:
                 command += ['--tool-home', r.tool_home]
             if not resume_task:
@@ -766,7 +772,10 @@ class DansoSession:
         if self._interrupted:
             await self.interrupt()
         progress_queue = asyncio.Queue()
-        stdout_task = asyncio.create_task(_read(self._process.stdout))
+        tool_queue = asyncio.Queue()
+        use_jsonl = r.progress_jsonl and not r.long_task
+        stdout_task = asyncio.create_task(
+            read_progress(self._process.stdout, tool_queue) if use_jsonl else _read(self._process.stdout))
         if r.long_task:
             stderr_task = asyncio.create_task(
                 _read_stderr(self._process.stderr, progress_queue, parse_progress=True))
@@ -792,6 +801,9 @@ class DansoSession:
                     if not stderr_done and stderr_task.done():
                         stderr = stderr_task.result()
                         stderr_done = True
+                    if use_jsonl:
+                        while not tool_queue.empty():
+                            yield tool_queue.get_nowait()
                     if progress_task is not None and progress_task.done():
                         item = progress_task.result()
                         if item is None:
@@ -856,7 +868,7 @@ class DansoSession:
             if any(line.startswith(prefix) for line in stderr.splitlines()
                    for prefix in (b'DANSO_ERROR=', b'DANSO_TRANSPORT=', b'DANSO_PROVIDER=')):
                 raise ValueError('failure diagnostic on successful exit')
-            text = stdout.decode('utf-8').strip()
+            text = (stdout.finish() if use_jsonl else stdout).decode('utf-8').strip()
             usage = _usage(stderr.decode('utf-8'))
             if not text:
                 raise ValueError('empty result')

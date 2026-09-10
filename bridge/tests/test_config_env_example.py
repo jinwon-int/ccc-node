@@ -56,5 +56,5 @@ def test_timeout_examples_preserve_the_runtime_invariant():
     setup = SETUP_PATH.read_text(encoding="utf-8")
 
     for source in (env_example, setup):
-        assert "CLAUDE_PROCESS_TIMEOUT=21600" in source
+        assert "CLAUDE_PROCESS_TIMEOUT=21660" in source
         assert "CCC_DELEGATED_TASK_STALL_SECONDS=7200" in source
