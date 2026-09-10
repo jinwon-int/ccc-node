@@ -880,8 +880,10 @@ out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
 ok "drop recommendation is recorded for the human sweep"   '[ "$rc" = 0 ] && jq -e ".revise.results[0].outcome == \"drop-recommended\"" >/dev/null <<<"$out" && jq -e "select(.kind==\"a2a-revise-result\" and .status==\"drop-recommended\") | .reason | startswith(\"Pins one outage\")" >/dev/null "$ledger"'
 ok "drop recommendation never closes or republishes"   'grep -q "Drop recommendation (auto-revision gate)" "$R2_GH_STATE/comments" && [ "$(jq -s "[.[] | select(.name==\"r2-drop\" and .kind==\"a2a-revise-result\" and .status==\"republished\")] | length" "$ledger")" = 0 ]'
 
-# Scenario: a malformed verdict is a handler failure — consumed once, no PR
-# comment, no revision dispatch.
+# Scenario: a malformed verdict is a handler failure — consumed once, no
+# revision dispatch, and (since #1629) exactly one diagnostic PR comment naming
+# the reason. The comment is not a verdict: it tells a reader why this PR has no
+# review outcome, which previously required grepping the collect log.
 printf '{"status":"queued"}\n' > "$CURL_STATE/review-task.json"
 write_skill r2-mal ""
 write_status r2-mal
@@ -899,7 +901,11 @@ PY
 before_comments="$(wc -l < "$R2_GH_STATE/comments" 2>/dev/null || echo 0)"
 out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
 ok "malformed verdict consumed as a handler failure"   '[ "$rc" = 0 ] && jq -e ".revise.verdicts[0].outcome == \"verdict-malformed\"" >/dev/null <<<"$out" && jq -e "select(.kind==\"a2a-verdict\" and .status==\"malformed\")" >/dev/null "$ledger"'
-ok "malformed verdict triggers no comment and no revision"   '[ "$(wc -l < "$R2_GH_STATE/comments")" = "$before_comments" ] && [ "$(jq -s "[.[] | select(.name==\"r2-mal\" and .kind==\"a2a-revise-dispatch\")] | length" "$ledger")" = 0 ]'
+ok "malformed verdict triggers no revision dispatch"   '[ "$(jq -s "[.[] | select(.name==\"r2-mal\" and .kind==\"a2a-revise-dispatch\")] | length" "$ledger")" = 0 ]'
+ok "malformed verdict records a specific reason (#1629)"   'jq -e "select(.kind==\"a2a-verdict\" and .status==\"malformed\") | .reason == \"verdict_value_invalid\"" >/dev/null "$ledger" && jq -e ".revise.verdicts[0].reason == \"verdict_value_invalid\"" >/dev/null <<<"$out"'
+ok "malformed verdict leaves exactly one diagnostic comment (#1629)"   'grep -c "Collect verdict gate" "$R2_GH_STATE/comments" | grep -qx 1 && grep -q "verdict_value_invalid" "$R2_GH_STATE/comments"'
+out="$(env "${r2_env[@]}" python3 "$PROMOTER" collect)"
+ok "malformed diagnostic comment is not repeated on later runs (#1629)"   '[ "$(grep -c "Collect verdict gate" "$R2_GH_STATE/comments")" = 1 ]'
 
 # Scenario: per-node daily cap bounds same-day revision cost.
 printf '{"status":"queued"}\n' > "$CURL_STATE/review-task.json"

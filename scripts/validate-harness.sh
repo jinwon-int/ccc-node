@@ -509,6 +509,12 @@ else
   err "skill-promotion receipt terminal-state tests failed (undeliverable receipts may retry forever)"
   tail -10 "$TMP/skill-receipt-terminal-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_skill_verdict_malformed_test.py >"$TMP/skill-verdict-malformed-test.out" 2>&1; then
+  say "  ok skill-promotion malformed verdict visibility tests (#1629)"
+else
+  err "skill-promotion malformed verdict visibility tests failed (lost verdicts may go untraceable)"
+  tail -10 "$TMP/skill-verdict-malformed-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_marker_registry_test.py >"$TMP/doctor-marker-registry-test.out" 2>&1; then
   say "  ok doctor cron marker registry covers every install-*-cron.sh"
 else
