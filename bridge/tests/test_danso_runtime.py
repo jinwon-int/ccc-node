@@ -1676,8 +1676,6 @@ def test_long_task_defaults_preserve_explicit_opt_out_and_timeout_overrides(conf
 
 @pytest.mark.anyio
 async def test_silent_native_long_task_retains_status_until_completion(configured, monkeypatch):
-    import telegram_bot.core.project_chat as project_chat
-
     configured.danso_long_task_enabled = True
     configured.danso_long_task_timeout_seconds = 5
     binary = Path(configured.danso_cli_path)
@@ -1691,7 +1689,12 @@ async def test_silent_native_long_task_retains_status_until_completion(configure
         'heartbeat_update_interval_seconds': .005,
         'heartbeat_stall_seconds': .02,
     }.items():
-        monkeypatch.setattr(project_chat.config, name, value)
+        setattr(configured, name, value)
+    # Full-suite collection can replace the module registry with a sibling
+    # test stub. Patch the globals used by this imported handler, not a newly
+    # imported module object that may be a different instance.
+    monkeypatch.setitem(ProjectChatHandler._maybe_update_heartbeat.__globals__,
+                        "config", configured)
     runtime = build_danso_runtime(configured)
     handler = ProjectChatHandler(settings=configured, agent_runtime=runtime)
     handler._typing_interval_seconds = .005
