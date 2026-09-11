@@ -1782,13 +1782,145 @@ ok "piri intake branch lands under intake/<node>/piri/" \
 ok "piri collection acknowledges and retains the envelope" \
   '[ -f "$STATE/skill-promotion/sent/$piri_transport.json" ] && [ ! -e "$STATE/skill-promotion/outbox/$piri_transport.json" ]'
 # The envelope's provider set stays authoritative: an unknown provider value is
-# still rejected at both layers.
+# still rejected at both layers (#1663 renamed the probe value — danso is now
+# a valid provider, so an actually-unknown lane must carry the rejection).
 # shellcheck disable=SC2034  # out is read via eval inside ok()
-out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_PROVIDERS=claude,danso python3 "$PROMOTER" status)"
+out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_PROVIDERS=claude,nolane python3 "$PROMOTER" status)"
 # shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "unknown provider value is still rejected" '[ "$rc" != 0 ]'
 
+# ─── #1663: danso provider root chain + staging + collection ─────────────
+# The #1685 collector stages drafts with provenance.provider=danso; the
+# promotion vocabulary must accept them end to end. The root chain mirrors
+# the #1659/#1662 contract: explicit CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR
+# wins, then DANSO_SKILLS_DIR, then $CCC_DANSO_STATE_DIR/home/.pi/agent/skills;
+# an unresolved chain omits the entry and selecting danso fails fast.
+DANSO_SKILLS="$HOME_DIR/.pi/agent/skills"
+mkdir -p "$DANSO_SKILLS"
+chmod 700 "$HOME_DIR/.pi" "$HOME_DIR/.pi/agent" "$DANSO_SKILLS"
+write_danso_skill() {
+  local name="$1"
+  local dir="$DANSO_SKILLS/$name" sha
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  printf -- '---\nname: %s\ndescription: Capture a reusable danso lane journal triage workflow safely.\n---\n\n# Procedure\n\n1. Inspect the danso journal tree.\n2. Run the bounded triage.\n3. Record the result.\n' \
+    "$name" > "$dir/SKILL.md"
+  chmod 600 "$dir/SKILL.md"
+  sha="$(sha256sum "$dir/SKILL.md" | awk '{print $1}')"
+  jq -nc --arg name "$name" --arg sha "$sha" \
+    '{schema_version:2,manager:"ccc-node-skill-autosave",ownership:"autosave-managed",
+      provider:"danso",name:$name,target_id:("target-"+$name),skill_sha256:$sha,
+      created_by:"ccc-node",provenance_revision:1,rollback_eligible:true}' \
+    > "$dir/.autosave-meta.json"
+  chmod 600 "$dir/.autosave-meta.json"
+}
+write_danso_status() {
+  local name="$1" sha
+  sha="$(sha256sum "$DANSO_SKILLS/$name/SKILL.md" | awk '{print $1}')"
+  jq -nc --arg name "$name" --arg sha "$sha" \
+    '{skills:[{autonomous_write_allowed:true,classification:"autosave-managed",
+      pinned:false,provider:"danso",name:$name,target_id:("target-"+$name),
+      skill_sha256:$sha,provenance_revision:1}]}' > "$STATUS_JSON"
+}
+write_danso_skill danso-journal-triage
+write_danso_status danso-journal-triage
+# Root-chain contract is config-level: asserted directly on _config by
+# scripts/ccc_skill_promotion_danso_test.py (explicit > DANSO_SKILLS_DIR >
+# state-dir chain, unresolved-chain omission, fail-closed selection without a
+# root, revise vocabulary). The staging/publish flow needs the full harness,
+# so it stays here.
+# The piri section above left its own stub state; carry a fresh bin dir and
+# reset the status file to the danso row before staging.
+DANSO_BIN="$TMP/bin-danso"
+mkdir -p "$DANSO_BIN"
+write_exec_stub "$DANSO_BIN/gh" <<'SH'
+set -eu
+mkdir -p "$GH_TEST_STATE"
+printf '%s\n' "$*" >> "$GH_TEST_STATE/calls"
+case "${1:-} ${2:-}" in
+  "auth status") exit 0 ;;
+  "repo view")
+    if [ "${GH_TEST_PRIVATE:-true}" = "true" ]; then
+      printf '{"isPrivate":true,"visibility":"PRIVATE"}\n'
+    else
+      printf '{"isPrivate":false,"visibility":"PUBLIC"}\n'
+    fi
+    ;;
+  "pr list")
+    head=""
+    previous=""
+    for argument in "$@"; do
+      [ "$previous" = "--head" ] && head="$argument"
+      previous="$argument"
+    done
+    key="$(printf '%s' "$head" | sha256sum | awk '{print $1}')"
+    if [ -f "$GH_TEST_STATE/created-$key" ]; then
+      printf '[{"url":"https://github.com/test/repo/pull/1","state":"OPEN","isDraft":true}]\n'
+    else
+      printf '[]\n'
+    fi
+    ;;
+  "pr create")
+    head=""
+    previous=""
+    for argument in "$@"; do
+      [ "$previous" = "--head" ] && head="$argument"
+      previous="$argument"
+    done
+    key="$(printf '%s' "$head" | sha256sum | awk '{print $1}')"
+    printf '%s\n' "$*" >> "$GH_TEST_STATE/create.args"
+    : > "$GH_TEST_STATE/created-$key"
+    printf 'https://github.com/test/repo/pull/1\n'
+    ;;
+  *) exit 9 ;;
+esac
+SH
+write_danso_status danso-journal-triage
+danso_stage_env=(
+  "${base_env[@]}"
+  "CCC_SKILL_PROMOTION_ENABLED=true"
+  "CCC_SKILL_PROMOTION_PROVIDERS=claude,danso"
+  "CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR=$DANSO_SKILLS"
+  "GH_TEST_STATE=$GH_STATE"
+  "PATH=$DANSO_BIN:$PATH"
+)
+out="$(env "${danso_stage_env[@]}" python3 "$PROMOTER" run --dry-run)"; rc=$?
+ok "danso provider reaches run --dry-run staging" \
+  '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"would-stage-private-outbox\" and .staged[0].provider == \"danso\" and .staged[0].name == \"danso-journal-triage\"" >/dev/null <<<"$out"'
+out="$(env "${danso_stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
+ok "danso envelope stages owner-only" \
+  '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"staged\" and .staged[0].provider == \"danso\"" >/dev/null <<<"$out"'
+# shellcheck disable=SC2034  # danso_transport is read via eval inside ok()
+danso_transport="$(env "${danso_stage_env[@]}" python3 "$PROMOTER" export --limit 1 | jq -r '.envelopes[0].transport_id')"
+ok "danso transport id carries the danso provider" 'grep -qF -- "-danso-danso-journal-triage-" <<<"$danso_transport"'
+# Publisher side: reuse the shared stub state; the danso lane must publish
+# exactly like the piri lane did.
+danso_publish_env=(
+  "${danso_stage_env[@]}"
+  "CCC_SKILL_PROMOTION_PUBLISHER=true"
+  "CCC_SKILL_PROMOTION_REMOTE=$REMOTE"
+  "GH_TEST_PRIVATE=true"
+)
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${danso_publish_env[@]}" python3 "$PROMOTER" collect)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+# shellcheck disable=SC2034  # danso_branch is read via eval inside ok()
+danso_branch="$(jq -r '.published[0].branch' <<<"$out")"
+# shellcheck disable=SC2034  # danso_candidate is read via eval inside ok()
+danso_candidate="danso-journal-triage-$(jq -r '.published[0].tree_sha256[0:12]' <<<"$out")"
+ok "publisher collects the danso envelope without provider rejection" \
+  '[ "$rc" = 0 ] && jq -e ".published[0].outcome == \"pr-opened\" and .published[0].provider == \"danso\"" >/dev/null <<<"$out"'
+ok "danso intake branch lands under intake/<node>/danso/" \
+  'git --git-dir="$REMOTE" show "$danso_branch:intake/testnode/danso/$danso_candidate/manifest.json" | jq -e ".provider == \"danso\"" >/dev/null'
+ok "danso collection acknowledges and retains the envelope" \
+  '[ -f "$STATE/skill-promotion/sent/$danso_transport.json" ] && [ ! -e "$STATE/skill-promotion/outbox/$danso_transport.json" ]'
+# The revise vocabulary accepts the danso lane the same way (parse-only
+# coverage lives in the danso python test; dispatch itself is exercised by the
+# shared/bridge/piri rows above).
+
 echo "PASS=$pass FAIL=$fail"
+python3 "$HERE/ccc_skill_promotion_danso_test.py" || fail=$((fail+1))
 python3 "$HERE/ccc_skill_receipt_retry_test.py" || fail=$((fail+1))
 [ "$fail" -eq 0 ]
