@@ -527,7 +527,13 @@ python3 "$SYNC" apply --ref <exact-commit-sha>
 The consumer authenticates read-only, rechecks that `jinwon-int/fleet-skills`
 is private, checks out exactly that commit, and independently validates the
 approved tree without executing repository-provided code. `shared` installs to
-both Claude and Codex; provider-specific audiences install only to that target.
+every root the node consumes (claude, codex, plus piri/danso when their roots
+resolve); provider-specific audiences install only to that target. The danso
+root follows the #1659 env contract — `CCC_FLEET_SKILLS_DANSO_DIR` >
+`DANSO_SKILLS_DIR` > `$CCC_DANSO_STATE_DIR/home/.pi/agent/skills` — and joins
+the plan only when the bridge-created `<state>/home` exists; apply creates the
+chain below it with 0700 modes and never creates `<state>/home` itself
+(#1664).
 Floating `main`/tags, symlinks, body limits, scanner failures, duplicate names,
 invalid approvals, and existing user-owned targets fail closed before any
 installation. Managed updates use an atomic replacement with retained local

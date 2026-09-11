@@ -432,5 +432,71 @@ rc=$?
 ok "audience-piri skill plans nothing on a non-piri node" \
   '[ "$rc" = 0 ] && jq -e "(.operations | length) == 0" >/dev/null <<<"$out"'
 
+# ─── Danso fourth provider (#1664) ──────────────────────────────────────
+#    The danso root resolves only from the env contract (DANSO_SKILLS_DIR >
+#    CCC_DANSO_STATE_DIR/home/.pi/agent/skills). The bridge-created <state>/home
+#    must exist for the node to plan danso operations; apply creates the chain
+#    below home with 0700 modes. Without the env contract the node plans zero
+#    danso operations.
+DANSO_SEED="$TMP/seed-danso"
+REMOTE_DANSO="$TMP/remote-danso.git"
+SKILL_DANSO="$DANSO_SEED/approved/danso/danso-only-tool"
+mkdir -p "$SKILL_DANSO"
+printf -- '---\nname: danso-only-tool\ndescription: A danso-audience skill for routing tests.\n---\n\n# Danso-only tool\n\n1. Do the danso thing.\n' \
+  > "$SKILL_DANSO/SKILL.md"
+jq -n '{schema_version:1,source_candidate_id:"danso-only-tool-000000000000",
+  source_tree_sha256:("0" * 64),approved_at:"2026-09-11T00:00:00Z"}' \
+  > "$SKILL_DANSO/approval.json"
+git -C "$DANSO_SEED" init -q -b main
+git -C "$DANSO_SEED" -c user.name=test -c user.email=test@example.invalid add .
+git -C "$DANSO_SEED" -c user.name=test -c user.email=test@example.invalid commit -qm seed-danso
+REF_DANSO="$(git -C "$DANSO_SEED" rev-parse HEAD)"
+git clone -q --bare "$DANSO_SEED" "$REMOTE_DANSO"
+
+DANSO_HOME="$TMP/danso-home"
+DANSO_STATE_DIR="$DANSO_HOME/danso-state"
+# shellcheck disable=SC2034  # DANSO_ROOT is read via eval inside ok()
+DANSO_ROOT="$DANSO_STATE_DIR/home/.pi/agent/skills"
+mkdir -p "$DANSO_HOME/.claude/skills" "$DANSO_HOME/.claude/state" "$DANSO_HOME/.codex/skills"
+chmod 700 "$DANSO_HOME" "$DANSO_HOME/.claude" "$DANSO_HOME/.claude/state" \
+  "$DANSO_HOME/.claude/skills" "$DANSO_HOME/.codex" "$DANSO_HOME/.codex/skills"
+danso_env=("HOME=$DANSO_HOME" \
+  "CCC_FLEET_SKILLS_STATE_DIR=$DANSO_HOME/.claude/state/fleet-skills" \
+  "CCC_FLEET_SKILLS_REPO=test/repo" \
+  "CCC_FLEET_SKILLS_REMOTE=$REMOTE_DANSO" \
+  "GH_SYNC_STATE=$GH_STATE" \
+  "PATH=$BIN:$PATH")
+
+# a) env contract without the bridge home: no danso operations at all.
+out="$(env "${danso_env[@]}" CCC_DANSO_STATE_DIR="$DANSO_STATE_DIR" python3 "$SYNC" plan --ref "$REF_DANSO")"; rc=$?
+ok "danso env without bridge home plans zero operations" \
+  '[ "$rc" = 0 ] && jq -e "(.operations | length) == 0" >/dev/null <<<"$out"'
+
+# b) bridge home exists (skills leaf missing): plan shows the danso install.
+mkdir -p "$DANSO_STATE_DIR" && mkdir -m 700 "$DANSO_STATE_DIR/home"
+out="$(env "${danso_env[@]}" CCC_DANSO_STATE_DIR="$DANSO_STATE_DIR" python3 "$SYNC" plan --ref "$REF_DANSO")"; rc=$?
+ok "danso node plans the danso-audience skill into the env root" \
+  '[ "$rc" = 0 ] && jq -e "(.operations | length) == 1 and .operations[0].provider == \"danso\" and .operations[0].action == \"install\"" >/dev/null <<<"$out"'
+
+# c) apply creates the chain below home with provenance.
+out="$(env "${danso_env[@]}" CCC_DANSO_STATE_DIR="$DANSO_STATE_DIR" python3 "$SYNC" apply --ref "$REF_DANSO")"; rc=$?
+ok "danso apply installs into <state>/home/.pi/agent/skills with provenance" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 1" >/dev/null <<<"$out" && cmp -s "$SKILL_DANSO/SKILL.md" "$DANSO_ROOT/danso-only-tool/SKILL.md" && jq -e ".provider == \"danso\"" "$DANSO_ROOT/danso-only-tool/.ccc-fleet-skill.json" >/dev/null'
+ok "created danso chain is private (0700 dirs)" \
+  '[ "$(stat -c %a "$DANSO_STATE_DIR/home")" = 700 ] && [ "$(stat -c %a "$DANSO_STATE_DIR/home/.pi")" = 700 ] && [ "$(stat -c %a "$DANSO_STATE_DIR/home/.pi/agent")" = 700 ]'
+
+# d) rerun converges to noops.
+out="$(env "${danso_env[@]}" CCC_DANSO_STATE_DIR="$DANSO_STATE_DIR" python3 "$SYNC" plan --ref "$REF_DANSO")"; rc=$?
+ok "danso rerun converges to noops" \
+  '[ "$rc" = 0 ] && jq -e ".operations | all(.action == \"noop\")" >/dev/null <<<"$out"'
+
+# e) no env contract at all: no danso operations even with an existing root.
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
+out="$(env "${danso_env[@]}" python3 "$SYNC" plan --ref "$REF_DANSO")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "no danso env contract plans zero operations" \
+  '[ "$rc" = 0 ] && jq -e "(.operations | length) == 0" >/dev/null <<<"$out"'
+
 echo "PASS=$pass FAIL=$fail"
-[ "$fail" -eq 0 ]
+[ "$fail" = 0 ]

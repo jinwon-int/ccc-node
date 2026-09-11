@@ -25,7 +25,7 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SUPPORT_DIRS = {"references", "scripts", "templates"}
-AUDIENCES = {"shared", "claude", "codex", "piri"}
+AUDIENCES = {"shared", "claude", "codex", "piri", "danso"}
 MAX_FILES = 16
 MAX_FILE_BYTES = 64 * 1024
 MAX_TOTAL_BYTES = 256 * 1024
@@ -66,6 +66,7 @@ class Config:
     claude_root: Path
     codex_root: Path
     piri_root: Path
+    danso_root: Path | None
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,26 @@ def config(args: argparse.Namespace) -> Config:
                 home / ".piri" / "agent" / "skills",
             )
         ).absolute(),
+        # #1664: danso consumes <state>/home/.pi/agent/skills (the HOME the
+        # bridge fixes for danso). Resolved only from the env contract —
+        # CCC_FLEET_SKILLS_DANSO_DIR > DANSO_SKILLS_DIR >
+        # CCC_DANSO_STATE_DIR/home/.pi/agent/skills; with none set the node
+        # plans no danso operations (no login-HOME guessing: the bridge state
+        # dir lives outside it). None also keeps plan/apply from creating any
+        # danso directory.
+        danso_root=(
+            Path(
+                os.environ.get("CCC_FLEET_SKILLS_DANSO_DIR")
+                or os.environ.get("DANSO_SKILLS_DIR")
+                or (os.environ["CCC_DANSO_STATE_DIR"] + "/home/.pi/agent/skills")
+            ).absolute()
+            if (
+                os.environ.get("CCC_FLEET_SKILLS_DANSO_DIR")
+                or os.environ.get("DANSO_SKILLS_DIR")
+                or os.environ.get("CCC_DANSO_STATE_DIR")
+            )
+            else None
+        ),
     )
 
 
@@ -600,6 +621,11 @@ def is_repo_managed(cfg: Config, provider: str, target: Path, name: str) -> bool
         return name in repo_managed_names(
             cfg, cfg.piri_root.parent / "state" / "repo-skills.manifest"
         )
+    if provider == "danso":
+        # #1664: setup.sh installs no repo skills into the danso root, so
+        # everything there is user- or fleet-owned; the sync layer is the only
+        # higher-precedence writer and never skips for the repo layer.
+        return False
     return repo_managed_marker(target) is not None
 
 
@@ -614,12 +640,43 @@ def provider_roots(cfg: Config) -> dict[str, Path]:
     roots = {"claude": cfg.claude_root, "codex": cfg.codex_root}
     if cfg.piri_root.is_dir() and not cfg.piri_root.is_symlink():
         roots["piri"] = cfg.piri_root
+    if cfg.danso_root is not None:
+        # #1664: danso joins once the bridge-made <state>/home exists — the
+        # skills leaf itself may still be missing; apply creates the chain
+        # below home with 0700 modes. Without the env contract (or without
+        # home) the node plans no danso operations at all.
+        danso_home = danso_home_of(cfg.danso_root)
+        if (
+            danso_home is not None
+            and danso_home.is_dir()
+            and not danso_home.is_symlink()
+        ):
+            roots["danso"] = cfg.danso_root
     return roots
+
+
+def danso_home_of(danso_root: Path) -> Path | None:
+    """The bridge-created <state>/home ancestor of the danso skills root."""
+    return next((parent for parent in danso_root.parents if parent.name == "home"), None)
+
+
+def _require_danso_home(danso_root: Path) -> None:
+    home = danso_home_of(danso_root)
+    if home is None or not home.is_dir() or home.is_symlink():
+        raise SyncError("skills_root_unsafe")
 
 
 def operations(cfg: Config, skills: list[ApprovedSkill], *, create_roots: bool) -> list[Operation]:
     roots = provider_roots(cfg)
     for root in roots.values():
+        if cfg.danso_root is not None and root == cfg.danso_root:
+            # #1664: <state>/home is the bridge's creation — require it
+            # (fail-closed); apply creates everything below it, while plan
+            # may still report rows for a not-yet-created skills leaf.
+            _require_danso_home(root)
+            if create_roots or root.is_dir():
+                safe_root(root, create=create_roots)
+            continue
         safe_root(root, create=create_roots)
     rows: list[Operation] = []
     for skill in skills:
@@ -659,11 +716,14 @@ def retirements(cfg: Config, skills: list[ApprovedSkill]) -> list[Retirement]:
     is itself drift: it keeps the directory and is reported, not fatal —
     reconcile never deletes on ambiguous ownership.
     """
-    planned: dict[str, set[str]] = {"claude": set(), "codex": set(), "piri": set()}
+    planned: dict[str, set[str]] = {provider: set() for provider in provider_roots(cfg)}
     for skill in skills:
         providers = tuple(provider_roots(cfg)) if skill.audience == "shared" else (skill.audience,)
         for provider in providers:
-            planned[provider].add(skill.name)
+            # setdefault: an audience whose root this node does not consume
+            # (e.g. approved/piri/ on a non-Piri node) still needs a planned
+            # entry so its orphans are never flagged for retirement here.
+            planned.setdefault(provider, set()).add(skill.name)
     roots = provider_roots(cfg)
     rows: list[Retirement] = []
     for provider, root in roots.items():
