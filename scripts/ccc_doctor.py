@@ -303,6 +303,25 @@ def _iso_age_days(stamp: str) -> int | None:
     return max(0, int((now - then).total_seconds() // 86400))
 
 
+# Feed script -> lane name, in the order install-nunchi.sh `status` tests them
+# (#1698 added danso). Kept as data next to the doctor's other cron parsing so
+# adding a lane is one line in both places rather than a new elif chain here.
+_NUNCHI_FEED_LANES: tuple[tuple[str, str], ...] = (
+    (r"codex-feed\.sh", "codex"),
+    (r"piri-feed\.sh", "piri"),
+    (r"danso-feed\.sh", "danso"),
+    (r"ingest-cron\.sh", "claude"),
+)
+
+
+def _configured_nunchi_lane(cron: str) -> str:
+    """Return the nunchi feed lane wired in the managed cron, or 'none'."""
+    for pattern, lane in _NUNCHI_FEED_LANES:
+        if re.search(pattern, cron):
+            return lane
+    return "none"
+
+
 class Doctor:
     def __init__(self, repo: Path, claude_dir: Path, scope: str):
         self.repo = repo
@@ -2022,15 +2041,7 @@ class Doctor:
         except Exception:
             cron = ""
 
-        configured = "none"
-        if re.search(r"codex-feed\.sh", cron):
-            configured = "codex"
-        elif re.search(r"piri-feed\.sh", cron):
-            configured = "piri"
-        elif re.search(r"danso-feed\.sh", cron):
-            configured = "danso"
-        elif re.search(r"ingest-cron\.sh", cron):
-            configured = "claude"
+        configured = _configured_nunchi_lane(cron)
 
         # Opt-in: no managed cron means nunchi collection is not wired — healthy.
         if configured == "none":
