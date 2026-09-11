@@ -269,12 +269,59 @@ snapshot_paths() { # <root> <archive> <path>...
   fi
 }
 
+# Where the private rollback snapshot lives. Normally the parent of
+# CLAUDE_DIR: outside the tree being replaced, on the same filesystem, private
+# to the installing account. That breaks on a node whose home is deliberately
+# not writable by the account that owns the harness — gongmyoung's home has
+# been `root:gongmyoung 0750` since the 2026-09-09 root transition, because the
+# memory ancestor-directory check requires a non-group-writable ancestor.
+# setup.sh could then not run there at all: as the harness owner it cannot
+# create the snapshot dir, and as root it is refused by the checkout-ownership
+# guard. Relaxing the home mode is not an option — it would break the check the
+# mode exists for. Fall back to CLAUDE_DIR, which is writable by definition
+# because we are about to install into it. Rollback only removes
+# CCC_MANAGED_PATHS entries, so a dot-prefixed snapshot dir there survives the
+# restore it is driving.
+#
+# Decided by attempting the create, not by testing the mode: `[ -w ]` is true
+# for root on a 0555 directory and on filesystems that only refuse the write at
+# write time, so a permission test would both miss real failures and mislead
+# whoever reads it.
+setup_txn_mkdir() { # <parent> -> prints the created dir, or fails
+  local parent="$1"
+  [ -n "$parent" ] || return 1
+  # Test seam: a colon-separated list of parents that must pretend to reject
+  # the create. The suite runs as root, for whom every directory is writable,
+  # so a mode-based fixture would exercise nothing.
+  local skip
+  if [ -n "${CCC_SETUP_TEST_TXN_PARENT_FAIL:-}" ]; then
+    while IFS= read -r skip; do
+      [ "$parent" = "$skip" ] && return 1
+    done <<< "${CCC_SETUP_TEST_TXN_PARENT_FAIL//:/$'\n'}"
+  fi
+  mkdir -p "$parent" 2>/dev/null || return 1
+  mktemp -d "$parent/.ccc-node-setup-rollback.XXXXXX" 2>/dev/null || return 1
+}
+
 begin_install_transaction() {
   [ "$DRY" = 1 ] && return 0
   local parent
   parent="$(dirname "$CLAUDE_DIR")"
-  mkdir -p "$parent"
-  SETUP_TXN_DIR="$(mktemp -d "$parent/.ccc-node-setup-rollback.XXXXXX")"
+  SETUP_TXN_DIR=""
+  if [ -n "${CCC_SETUP_TXN_ROOT:-}" ]; then
+    SETUP_TXN_DIR="$(setup_txn_mkdir "$CCC_SETUP_TXN_ROOT")" || SETUP_TXN_DIR=""
+  else
+    SETUP_TXN_DIR="$(setup_txn_mkdir "$parent")" || SETUP_TXN_DIR=""
+    if [ -z "$SETUP_TXN_DIR" ]; then
+      SETUP_TXN_DIR="$(setup_txn_mkdir "$CLAUDE_DIR")" || SETUP_TXN_DIR=""
+      [ -n "$SETUP_TXN_DIR" ] &&
+        note "rollback snapshot in $CLAUDE_DIR: $parent rejected the create"
+    fi
+  fi
+  if [ -z "$SETUP_TXN_DIR" ]; then
+    echo "ERROR: cannot create the rollback snapshot dir under $parent or $CLAUDE_DIR as uid $(id -u); set CCC_SETUP_TXN_ROOT to a writable path" >&2
+    exit 2
+  fi
   snapshot_paths "$CLAUDE_DIR" "$SETUP_TXN_DIR/claude.tar.gz" "${CCC_MANAGED_PATHS[@]}"
   tar -tzf "$SETUP_TXN_DIR/claude.tar.gz" >/dev/null
   ccc_snapshot_codex_policy_state "$CODEX_DIR" "$SETUP_TXN_DIR"
