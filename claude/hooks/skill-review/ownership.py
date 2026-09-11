@@ -53,6 +53,13 @@ except ImportError:
 
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+# #1656: single provider set — the CLI choices, the env auto-detect, and the
+# guard-proposal/receipt payload validation must not drift apart again (the
+# CLI accepted piri while proposal/receipt validation rejected it).
+_PROVIDERS = ("claude", "codex", "piri")
+# Providers that share the codex runtime-compat screen (autoinstall's
+# gate_codex_compat applies the same coupling rules to codex and piri).
+_NON_CLAUDE_PROVIDERS = ("codex", "piri")
 _ATTEMPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _AUTOSAVE_MARKER = ".autosave-meta.json"
 _MANAGED_MARKER = ".ccc-node-managed.json"
@@ -233,7 +240,7 @@ def _validate_name(name: str) -> None:
 
 def _provider_from_env() -> str:
     explicit = os.environ.get("CCC_SKILL_PROVIDER", "")
-    if explicit in {"claude", "codex", "piri"}:
+    if explicit in _PROVIDERS:
         return explicit
     home = Path(os.environ["HOME"]) if os.environ.get("HOME") else Path.home()
     if (
@@ -247,7 +254,7 @@ def _provider_from_env() -> str:
 
 def _build_context(args: argparse.Namespace) -> Context:
     provider = args.provider or _provider_from_env()
-    if provider not in {"claude", "codex", "piri"}:
+    if provider not in _PROVIDERS:
         raise ContractError("invalid_provider")
     home = Path(os.environ["HOME"]) if os.environ.get("HOME") else Path.home()
     claude_dir = Path(os.environ.get("CCC_CLAUDE_DIR", home / ".claude"))
@@ -1784,7 +1791,7 @@ def _validate_proposal_fields(proposal: dict[str, Any]) -> None:
         or not isinstance(proposal.get("operation"), str)
         or proposal.get("operation") not in _ALLOWED_OPERATIONS
         or not isinstance(proposal.get("provider"), str)
-        or proposal.get("provider") not in {"claude", "codex"}
+        or proposal.get("provider") not in _PROVIDERS
         or not isinstance(proposal.get("name"), str)
         or not _NAME_RE.fullmatch(proposal["name"])
         or not isinstance(proposal.get("target_id"), str)
@@ -1855,7 +1862,7 @@ def _validate_receipt_payload(receipt: dict[str, Any]) -> None:
         or not isinstance(receipt["operation"], str)
         or receipt["operation"] not in _ALLOWED_OPERATIONS
         or not isinstance(receipt["provider"], str)
-        or receipt["provider"] not in {"claude", "codex"}
+        or receipt["provider"] not in _PROVIDERS
         or not isinstance(receipt["name"], str)
         or not _NAME_RE.fullmatch(receipt["name"])
         or not isinstance(receipt["target_id"], str)
@@ -2240,7 +2247,10 @@ def _gate_incremental_content(value: str, context: Context) -> None:
         raise ContractError("incremental_content_secret")
     if _NODE_FACT_RE.search(value):
         raise ContractError("incremental_content_node_fact")
-    if context.provider == "codex" and _CODEX_INCOMPAT_RE.search(value):
+    if (
+        context.provider in _NON_CLAUDE_PROVIDERS
+        and _CODEX_INCOMPAT_RE.search(value)
+    ):
         raise ContractError("incremental_content_provider_incompatible")
 
 
@@ -3601,7 +3611,7 @@ def _command_apply_proposal(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--provider", choices=("claude", "codex", "piri"))
+    parser.add_argument("--provider", choices=_PROVIDERS)
     parser.add_argument("--skills-dir", type=Path)
     parser.add_argument("--state-dir", type=Path)
     subparsers = parser.add_subparsers(dest="command", required=True)
