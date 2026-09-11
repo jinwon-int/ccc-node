@@ -42,6 +42,9 @@ async def _reject(_tool_name, _tool_input, _context):
 
 def _settings(tmp_path: Path, **overrides) -> SimpleNamespace:
     values = dict(
+        # The repo under test — owner profiles inject the in-tree family MCP
+        # servers from this checkout (#1678).
+        project_root=Path(__file__).resolve().parents[2],
         execution_profile="strict-project",
         allowed_user_ids=[1],
         require_allowlist=True,

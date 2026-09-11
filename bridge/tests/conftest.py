@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from skill_lookup_fixtures import build_lookup_world
+
 import sys_modules_isolation
 
 BRIDGE_DIR = Path(__file__).resolve().parents[1]
@@ -149,3 +151,20 @@ def _restore_volatile_modules():
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = mod
+
+
+# ---------------------------------------------------------------------------
+# Skill lookup fixtures (#1678) — shared by test_skill_lookup.py and
+# test_family_skills_server.py.  The synthetic repo/installed roots give the
+# lookup a hermetic world: ambient CCC_* bridge variables are already stripped
+# around every test by this conftest, and the fixture pins only what the
+# lookup itself reads.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def lookup_env(tmp_path: Path, monkeypatch) -> dict[str, str]:
+    """Synthetic repo (registry + twin/retired sources) plus installed roots."""
+
+    env = build_lookup_world(tmp_path)
+    monkeypatch.setattr(os, "environ", {**os.environ, **env})
+    return env

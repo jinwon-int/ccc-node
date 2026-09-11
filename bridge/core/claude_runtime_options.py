@@ -20,6 +20,7 @@ from telegram_bot.utils.orphan_reaper import BRIDGE_CHILD_ENV_VALUE, BRIDGE_CHIL
 
 from .agent_runtime import SessionRequest
 from .curated_memory import build_curated_memory_settings
+from .family_mcp import build_family_mcp, merge_mcp_bundle
 from .memory_audience import audience_from_claude_environment
 from .tool_policy import (
     BASH_DISABLED,
@@ -140,24 +141,16 @@ class ClaudeRuntimeOptionsMixin:
 
         settings = self._settings
         permission_options = sdk_permission_options(self._bash_policy)
-        allowed_tools = list(permission_options["allowed_tools"])
-        disallowed_tools = list(permission_options["disallowed_tools"])
+        options.allowed_tools = list(permission_options["allowed_tools"])
+        options.disallowed_tools = list(permission_options["disallowed_tools"])
         options.hooks = {
             event: list(matchers) for event, matchers in permission_options["hooks"].items()
         }
         web_mcp = build_curated_web_mcp(settings)
         if web_mcp is not None:
-            allowed_tools = [
-                tool for tool in allowed_tools if tool not in web_mcp["disallowed_tools"]
-            ] + web_mcp["allowed_tools"]
-            disallowed_tools = list(
-                dict.fromkeys(disallowed_tools + web_mcp["disallowed_tools"])
-            )
-            options.mcp_servers = web_mcp["mcp_servers"]
-            options.env = dict(web_mcp["process_env"])
-            options.system_prompt = web_mcp["system_prompt"]
-        options.allowed_tools = allowed_tools
-        options.disallowed_tools = disallowed_tools
+            # Merge (never overwrite) so later family bundles compose with the
+            # curated web routing instead of replacing it (#1678).
+            merge_mcp_bundle(options, web_mcp)
         if self._execution_profile == EXECUTION_OWNER_OPERATOR:
             if self._claude_unrestricted:
                 # Opt-in Codex parity (owner-operator only): bypass permission
@@ -165,7 +158,7 @@ class ClaudeRuntimeOptionsMixin:
                 # context through the curated settings block.
                 options.permission_mode = "bypassPermissions"
                 options.setting_sources = []
-                self._apply_curated_memory(options, request)
+                audience_kind = self._apply_curated_memory(options, request)
             elif (
                 getattr(settings, "bridge_memory_mode", MEMORY_MODE_OFF)
                 == MEMORY_MODE_AUDIENCE_SCOPED
@@ -174,11 +167,20 @@ class ClaudeRuntimeOptionsMixin:
                 # host-settings convenience. Loading the global user/project
                 # settings chain here could re-register unscoped memory hooks.
                 options.setting_sources = []
-                self._apply_curated_memory(options, request)
+                audience_kind = self._apply_curated_memory(options, request)
             else:
                 # Owner-operated bridges intentionally retain host utility and
-                # the normal Claude Code settings/context chain.
+                # the normal Claude Code settings/context chain; user-scope MCP
+                # registrations stay natively visible, so nothing is injected.
                 options.setting_sources = ["user", "project", "local"]
+                audience_kind = None
+            if options.setting_sources == []:
+                # Owner profiles without a settings chain need the family
+                # servers injected explicitly; the server re-checks the node
+                # policy at call time (shared audiences get none) (#1678).
+                family = build_family_mcp(settings, audience_kind=audience_kind)
+                if family is not None:
+                    merge_mcp_bundle(options, family)
             return
         # Every non-owner profile suppresses filesystem settings. Even when
         # Bash is disallowed, user/project/local settings can register host
@@ -201,8 +203,13 @@ class ClaudeRuntimeOptionsMixin:
 
     def _apply_curated_memory(
         self, options: ClaudeAgentOptions, request: SessionRequest
-    ) -> None:
-        """Attach only the canonical memory route resolved for this request."""
+    ) -> str | None:
+        """Attach only the canonical memory route resolved for this request.
+
+        Returns the resolved audience kind (private/shared) or None when the
+        request is not audience-scoped, so MCP injection can apply the same
+        trust decision without re-deriving it.
+        """
 
         mode = getattr(self._settings, "bridge_memory_mode", MEMORY_MODE_OFF)
         audience = None
@@ -221,3 +228,4 @@ class ClaudeRuntimeOptionsMixin:
         )
         if curated_settings is not None:
             options.settings = curated_settings
+        return getattr(audience, "kind", None)

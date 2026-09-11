@@ -77,5 +77,47 @@ ok "linux: searxng via npx -y"      'grep -Eq "add searxng .* -- npx -y mcp-sear
 ok "linux: firecrawl via npx -y"    'grep -Eq "add firecrawl .* -- npx -y firecrawl-mcp" "$TMP/claude.log"'
 ok "linux: no node-cli launch"      '! grep -q -- "-- node " "$TMP/claude.log"'
 
+# family-skills + family-wiki (#1678). The absolute python3 path launches the
+# in-repo stdlib server; wiki registers only when wiki-agent is on PATH and
+# neither the external profile nor a wiki disable flag is set. The idempotent
+# add() removes first, so re-runs never duplicate.
+FAKE_WIKI="$BIN/wiki-agent"
+cat > "$FAKE_WIKI" <<EOF
+#!$BASH_BIN
+exit 0
+EOF
+chmod +x "$FAKE_WIKI"
+: > "$TMP/claude.log"
+env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" \
+  bash "$SUT" >/dev/null 2>&1 || true
+ok "family-skills registered with abs python3" \
+  'grep -Eq "add family-skills .* -- .*python3 .*family_skills_server.py" "$TMP/claude.log"'
+ok "family-wiki registered via wiki-agent" \
+  'grep -Eq "add family-wiki .* -- wiki-agent mcp-serve" "$TMP/claude.log"'
+ok "family-skills removed before add (idempotent)" \
+  'grep -q "remove family-skills -s user" "$TMP/claude.log"'
+
+: > "$TMP/claude.log"
+env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" CCC_WIKI_MEMORY_ENABLED=0 \
+  bash "$SUT" >/dev/null 2>&1 || true
+ok "family-wiki skipped when wiki disabled" \
+  '! grep -q "add family-wiki" "$TMP/claude.log"'
+ok "family-skills still registered when wiki disabled" \
+  'grep -q "add family-skills" "$TMP/claude.log"'
+
+: > "$TMP/claude.log"
+env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" CCC_NODE_ISOLATION_PROFILE=external \
+  bash "$SUT" >/dev/null 2>&1 || true
+ok "family-wiki skipped under external isolation" \
+  '! grep -q "add family-wiki" "$TMP/claude.log"'
+
+: > "$TMP/claude.log"
+mv "$FAKE_WIKI" "$FAKE_WIKI.bak"
+env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" \
+  bash "$SUT" >/dev/null 2>&1 || true
+mv "$FAKE_WIKI.bak" "$FAKE_WIKI"
+ok "family-wiki skipped without wiki-agent" \
+  '! grep -q "add family-wiki" "$TMP/claude.log"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
