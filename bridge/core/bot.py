@@ -15,6 +15,8 @@ from telegram import (
     Chat,
     CallbackQuery,
 )
+from telegram_bot.core.telegram_rich_text import RICH_MESSAGE
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -848,7 +850,7 @@ class TelegramBot(
         )
         self.application.add_handler(
             MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
+                (filters.TEXT | RICH_MESSAGE) & ~filters.COMMAND,
                 self._handle_followup_text_update,
             ),
             group=2,
