@@ -1832,10 +1832,12 @@ danso_stage_env=(
 out="$(env "${danso_stage_env[@]}" python3 "$PROMOTER" run --dry-run)"; rc=$?
 ok "danso provider reaches run --dry-run staging" \
   '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"would-stage-private-outbox\" and .staged[0].provider == \"danso\" and .staged[0].name == \"danso-log-triage\"" >/dev/null <<<"$out"'
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
 out="$(env "${danso_stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
 ok "danso envelope stages owner-only" \
   '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"staged\" and .staged[0].provider == \"danso\"" >/dev/null <<<"$out"'
 # The root is omitted entirely without the env contract: nothing stages, no crash.
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
 out="$(env "${danso_stage_env[@]}" CCC_SKILL_PROMOTION_PROVIDERS=claude,danso CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR= DANSO_SKILLS_DIR= CCC_DANSO_STATE_DIR= python3 "$PROMOTER" run --dry-run)"; rc=$?
 ok "danso without env contract stages nothing and does not crash" \
   '[ "$rc" = 0 ] && jq -e ".staged == []" >/dev/null <<<"$out"'
