@@ -121,7 +121,7 @@ route_draft_provider() { # <draft-dir>
   [ -f "$1/meta.json" ] && meta_provider="$(jq -r '.provider // empty' "$1/meta.json" 2>/dev/null)"
   case "$meta_provider" in
     ""|"${SKILL_PROVIDER:-}") return 0 ;;
-    claude|codex|piri) ;;
+    claude|codex|piri|danso) ;;
     *) ROUTE_ERROR='draft-provider-invalid'; return 1 ;;
   esac
   declare -f ccc_skills_dir >/dev/null 2>&1 || return 0
@@ -269,16 +269,18 @@ gate_node_specific() { # <skill.md> — hardcoded node facts stay human-reviewed
   return 0
 }
 
-gate_codex_compat() { # <skill.md> — non-Claude providers reject Claude-only couplings
+gate_codex_compat() { # <skill.md> — non-Claude providers reject runtime-only couplings
   # No-op for the Claude provider. On a Codex or Piri install target a draft
   # that hard-codes the Claude CLI, the ~/.claude tree, or CLAUDE_* env can't
   # run, so it stays human-reviewed (pending) instead of installing. Prose
   # that merely mentions "Claude Code" is untouched — only concrete path/CLI/env
   # couplings match, and the reason is a label only so markers/logs stay
   # redaction-safe. Reason labels keep the historical codex-incompat prefix.
+  # #1659: a Danso target screens Claude couplings AND codex couplings
+  # (codex exec, ~/.codex/, CODEX_*) — the danso runtime reads neither.
   local f="$1"
   case "${SKILL_PROVIDER:-claude}" in
-    codex|piri) ;;
+    codex|piri|danso) ;;
     *) return 0 ;;
   esac
   if grep -qE '(^|[^A-Za-z0-9_-])claude[[:space:]]+-p([[:space:]]|$)' "$f" 2>/dev/null; then
@@ -289,6 +291,17 @@ gate_codex_compat() { # <skill.md> — non-Claude providers reject Claude-only c
   fi
   if grep -qE 'CLAUDE_(SKILLS_DIR|PROJECTS_DIR|CLI_PATH|CONFIG|CODE)' "$f" 2>/dev/null; then
     printf 'codex-incompat claude-env'; return 1
+  fi
+  if [ "${SKILL_PROVIDER:-claude}" = danso ]; then
+    if grep -qE '(^|[^A-Za-z0-9_-])codex[[:space:]]+exec([[:space:]]|$)' "$f" 2>/dev/null; then
+      printf 'codex-incompat codex-cli'; return 1
+    fi
+    if grep -qE '(^|[^A-Za-z0-9_])(~|\$HOME|\$\{HOME[^}]*\})?/?\.codex/' "$f" 2>/dev/null; then
+      printf 'codex-incompat codex-home'; return 1
+    fi
+    if grep -qE 'CODEX_[A-Z0-9_]+' "$f" 2>/dev/null; then
+      printf 'codex-incompat codex-env'; return 1
+    fi
   fi
   return 0
 }

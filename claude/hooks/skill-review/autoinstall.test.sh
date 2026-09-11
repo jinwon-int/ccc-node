@@ -595,7 +595,8 @@ ok "summary reports single piri provider" 'jq -e ".provider == \"piri\" and .pro
 
 # An unsupported provider value fails closed.
 make_draft_in "$PENDING_ROUTE" 20260911-000004-route-bad route-bad-provider "Capture a recurring workflow with an invalid provider lane."
-jq '.provider = "danso"' "$PENDING_ROUTE/20260911-000004-route-bad/meta.json" > "$PENDING_ROUTE/.tmp" \
+# danso became a valid provider in #1659; an authorless value stays unsupported.
+jq '.provider = "gorani"' "$PENDING_ROUTE/20260911-000004-route-bad/meta.json" > "$PENDING_ROUTE/.tmp" \
   && mv "$PENDING_ROUTE/.tmp" "$PENDING_ROUTE/20260911-000004-route-bad/meta.json"
 chmod 600 "$PENDING_ROUTE/20260911-000004-route-bad/meta.json"
 # shellcheck disable=SC2034  # out is read via eval inside ok()
@@ -604,6 +605,58 @@ out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_ROUTE" CLAUDE_SKILLS_DIR="$SKILLS" PIR
 ok "unsupported meta provider fails closed as blocked" \
   'jq -e ".blocked[] | select(.id == \"20260911-000004-route-bad\" and .reason == \"draft-provider-invalid\")" >/dev/null <<<"$out"'
 ok "unsupported provider draft stays pending" '[ -d "$PENDING_ROUTE/20260911-000004-route-bad" ]'
+
+ok "unsupported meta provider fails closed as blocked" \
+  'jq -e ".blocked[] | select(.id == \"20260911-000004-route-bad\" and .reason == \"draft-provider-invalid\")" >/dev/null <<<"$out"'
+ok "unsupported provider draft stays pending" '[ -d "$PENDING_ROUTE/20260911-000004-route-bad" ]'
+
+# --- #1659: danso routing — env contract + fail-closed + codex-coupling screen
+DANSO_SKILLS="$TMP/danso-skills"
+STATE_DANSO="$TMP/state-danso"; PENDING_DANSO="$STATE_DANSO/pending-skills"
+mkdir -m 700 "$STATE_DANSO" "$PENDING_DANSO"
+make_draft_in "$PENDING_DANSO" 20260911-000101-danso-route danso-route-skill "Capture the danso lane recurring journal hygiene verification workflow."
+jq '.provider = "danso"' "$PENDING_DANSO/20260911-000101-danso-route/meta.json" > "$PENDING_DANSO/.tmp" \
+  && mv "$PENDING_DANSO/.tmp" "$PENDING_DANSO/20260911-000101-danso-route/meta.json"
+chmod 600 "$PENDING_DANSO/20260911-000101-danso-route/meta.json"
+printf 'auto\n' > "$STATE_DANSO/skill-autosave.mode"
+# a) no env at all: the danso lane fails closed and writes nothing.
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DANSO" CLAUDE_SKILLS_DIR="$SKILLS" \
+  CCC_PUSH_SPOOL="$TMP/spool-danso" CCC_NODE=testnode CCC_SKILL_AUTOSAVE_TRIGGER=danso0 bash "$AUTO" run)"
+ok "danso draft without env contract is blocked unsafe-skills-dir" \
+  'jq -e ".blocked[] | select(.id == \"20260911-000101-danso-route\" and .reason == \"unsafe-skills-dir\")" >/dev/null <<<"$out"'
+ok "fail-closed danso run writes nothing anywhere" \
+  '[ ! -e "$DANSO_SKILLS" ] && [ ! -e "$HOME/.pi/agent/skills" ] && [ ! -e "$SKILLS/danso-route-skill" ]'
+# b) DANSO_SKILLS_DIR set: installs into the explicit root.
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DANSO" CLAUDE_SKILLS_DIR="$SKILLS" DANSO_SKILLS_DIR="$DANSO_SKILLS" \
+  CCC_PUSH_SPOOL="$TMP/spool-danso" CCC_NODE=testnode CCC_SKILL_AUTOSAVE_TRIGGER=danso1 bash "$AUTO" run)"
+ok "danso draft installs into the explicit danso root" '[ -f "$DANSO_SKILLS/danso-route-skill/SKILL.md" ]'
+ok "danso marker records the routed provider" \
+  'jq -e ".provider == \"danso\" and .installed_by == \"autosave\"" "$DANSO_SKILLS/danso-route-skill/.autosave-meta.json" >/dev/null'
+ok "summary reports danso provider" 'jq -e ".providers == [\"danso\"] and .provider == \"danso\"" >/dev/null <<<"$out"'
+# c) CCC_DANSO_STATE_DIR fallback resolves <state>/home/.pi/agent/skills.
+DANSO_STATE_FIX="$TMP/danso-state"
+mkdir -p "$DANSO_STATE_FIX/home" && chmod 700 "$DANSO_STATE_FIX/home"
+make_draft_in "$PENDING_DANSO" 20260911-000102-danso-state danso-state-skill "Capture the danso state fallback recurring session index workflow."
+jq '.provider = "danso"' "$PENDING_DANSO/20260911-000102-danso-state/meta.json" > "$PENDING_DANSO/.tmp" \
+  && mv "$PENDING_DANSO/.tmp" "$PENDING_DANSO/20260911-000102-danso-state/meta.json"
+chmod 600 "$PENDING_DANSO/20260911-000102-danso-state/meta.json"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DANSO" CLAUDE_SKILLS_DIR="$SKILLS" CCC_DANSO_STATE_DIR="$DANSO_STATE_FIX" \
+  CCC_PUSH_SPOOL="$TMP/spool-danso" CCC_NODE=testnode CCC_SKILL_AUTOSAVE_TRIGGER=danso2 bash "$AUTO" run)"
+ok "CCC_DANSO_STATE_DIR fallback installs under home/.pi/agent/skills" \
+  '[ -f "$DANSO_STATE_FIX/home/.pi/agent/skills/danso-state-skill/SKILL.md" ]'
+# d) codex couplings are screened on danso targets.
+make_draft_in "$PENDING_DANSO" 20260911-000103-danso-codex danso-codex-coupled "Capture a recurring codex invocation procedure for the danso lane."
+printf '%s\n' 'run: codex exec --full-auto' >> "$PENDING_DANSO/20260911-000103-danso-codex/SKILL.md"
+jq '.provider = "danso"' "$PENDING_DANSO/20260911-000103-danso-codex/meta.json" > "$PENDING_DANSO/.tmp" \
+  && mv "$PENDING_DANSO/.tmp" "$PENDING_DANSO/20260911-000103-danso-codex/meta.json"
+chmod 600 "$PENDING_DANSO/20260911-000103-danso-codex/meta.json"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DANSO" CLAUDE_SKILLS_DIR="$SKILLS" DANSO_SKILLS_DIR="$DANSO_SKILLS" \
+  CCC_PUSH_SPOOL="$TMP/spool-danso" CCC_NODE=testnode CCC_SKILL_AUTOSAVE_TRIGGER=danso3 bash "$AUTO" run)"
+ok "codex-coupled danso draft stays pending with codex-incompat" \
+  'jq -e ".blocked[] | select(.id == \"20260911-000103-danso-codex\" and .reason == \"codex-incompat codex-cli\")" >/dev/null <<<"$out"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
