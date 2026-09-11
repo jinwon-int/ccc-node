@@ -73,12 +73,12 @@ def _initialize() -> dict:
     }
 
 
-def _call(message_id: int, arguments: Any) -> dict:
+def _call(message_id: int, arguments: Any, name: str = "node_status") -> dict:
     return {
         "jsonrpc": "2.0",
         "id": message_id,
         "method": "tools/call",
-        "params": {"name": "node_status", "arguments": arguments},
+        "params": {"name": name, "arguments": arguments},
     }
 
 
@@ -90,13 +90,43 @@ def test_roundtrip_lists_single_tool_and_calls_it(ops_env) -> None:
         _call(3, None),
     )
     assert responses[0]["result"]["serverInfo"]["name"] == "family-ops"
-    assert [tool["name"] for tool in responses[1]["result"]["tools"]] == ["node_status"]
+    assert [tool["name"] for tool in responses[1]["result"]["tools"]] == [
+        "task_status",
+        "node_status",
+    ]
     payload = json.loads(responses[2]["result"]["content"][0]["text"])
     assert responses[2]["result"]["isError"] is False
     assert payload["status"] == "ok"
     assert payload["sections"]["source"]["head"] == "abc1234"
     assert payload["sections"]["scheduler"]["summary"]["total"] == 1
     assert payload["observed_at"].endswith("Z")
+
+
+def test_task_status_tool_roundtrip(tmp_path: Path, ops_env) -> None:
+    """task_status returns the checkpoint/resume notes and wait promises."""
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "working-state.md").write_text(
+        "## Working State\n\n- 목표: fixture checkpoint", encoding="utf-8"
+    )
+    env = {
+        **ops_env,
+        "CCC_STATE_DIR": str(state_dir),
+        "CCC_TASK_STATUS_WAITS_CMD": "echo "
+            + json.dumps(
+                {"ok": True, "waits": [{"wait_id": "w1", "state": "pending", "repo": "r", "pr": 1, "head_sha": "a", "summary": "watch"}]}
+            ),
+    }
+    responses, stderr = _run_server(env, _call(9, None, name="task_status"))
+    payload = json.loads(responses[0]["result"]["content"][0]["text"])
+    assert responses[0]["result"]["isError"] is False
+    assert payload["status"] == "ok"
+    sections = payload["sections"]
+    assert sections["working_state"]["present"] is True
+    assert "fixture checkpoint" in sections["working_state"]["content"]
+    assert sections["waits"]["active"][0]["wait_id"] == "w1"
+    assert "family-ops: call task_status ok" in stderr
 
 
 def test_call_time_policy_denial(ops_env) -> None:
