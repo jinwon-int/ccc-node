@@ -71,6 +71,8 @@ class RecoverySnapshot:
     last_note: str
     settled_tools: int
     requests: int
+    unknown_usage_requests: int = 0
+    interruption_reason: str | None = None
 
     def render(self):
         states = {
@@ -78,12 +80,17 @@ class RecoverySnapshot:
             'failed': '요청 실패', 'pending_provider': '모델 요청 결과 미확인',
             'pending_tools': '도구 실행 결과 미확인', 'final_pending': '최종 응답 기록 미확인',
             'completed': '완료', 'not_long_task': '장기 작업 기록 없음',
+            'blocked': '도구 실행 기록 확인 필요',
         }
+        uncertainty = (f"중단된 모델 요청 {self.unknown_usage_requests}회의 토큰 사용량은 미확인입니다. "
+                       "이어가면 모델 요청 비용이 추가될 수 있습니다.\n"
+                       if self.unknown_usage_requests else '')
         return (
             f"마지막 작업: {self.task[:500] or '요청 요약 없음'}\n\n"
             f"마지막 에이전트 기록(완료 검증 아님):\n{self.last_note[:800] or '없음'}\n\n"
             f"완료 기록이 있는 도구: {self.settled_tools}개 · 모델 요청 기록: {self.requests}회\n"
             f"중단 상태: {states[self.state]}\n"
+            f"{uncertainty}"
             "남은 작업은 실제 결과를 확인해야 합니다. 이어서 진행할까요?"
         )
 
@@ -115,7 +122,9 @@ def _summarize(payload, status):
         elif row.get('customType') == 'danso.operation.v1':
             settled += row.get('data', {}).get('state') == 'settled'
     return RecoverySnapshot(hashlib.sha256(payload).hexdigest(), status.state,
-                            status.resume_allowed, task, note, settled, status.requests)
+                            status.resume_allowed, task, note, settled, status.requests,
+                            getattr(status, 'unknown_usage_requests', 0),
+                            getattr(status, 'interruption_reason', None))
 
 
 async def inspect_session(session):
