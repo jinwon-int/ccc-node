@@ -55,6 +55,19 @@ run_skill_review_bg() {
   export CLAUDE_SKILLS_DIR="${CLAUDE_SKILLS_DIR:-${HOME:-/root}/.claude/skills}"
   mkdir -p "$PENDING_DIR" 2>/dev/null
 
+  # #1654: record which provider branch staged this draft (claude|codex|piri)
+  # so downstream layers can route it — autoinstall per-draft install targets
+  # (#1655) and promotion staging read meta.json instead of guessing from the
+  # process environment. Provider resolution is the shared provider.sh contract.
+  local STAGE_PROVIDER="claude"
+  if [ -r "$HOOKDIR/skill-review/provider.sh" ]; then
+    # shellcheck source=claude/hooks/skill-review/provider.sh
+    . "$HOOKDIR/skill-review/provider.sh"
+    if declare -f ccc_skill_provider >/dev/null 2>&1; then
+      STAGE_PROVIDER="$(ccc_skill_provider)"
+    fi
+  fi
+
   local PIPE_PID OUT ec STASH count i staged item name skill_md id safe_id dest
   PIPE_PID="${BASHPID:-$$}"
   OUT="$(bash "$HOOKDIR/skill-review/extract.sh" 2>>"$LOG")"
@@ -101,7 +114,8 @@ run_skill_review_bg() {
       --arg source_project "$PROJECT_ENC" \
       --arg staged_at "$(ts)" \
       --arg skill_path "${CLAUDE_SKILLS_DIR%/}/$name/SKILL.md" \
-      'del(.skill_md) + {id:$id,status:"pending",session_id:$session,trigger:$trigger,source_cwd:$source_cwd,source_project:$source_project,staged_at:$staged_at,target_skill_path:$skill_path}' \
+      --arg provider "$STAGE_PROVIDER" \
+      'del(.skill_md) + {id:$id,status:"pending",session_id:$session,trigger:$trigger,source_cwd:$source_cwd,source_project:$source_project,staged_at:$staged_at,target_skill_path:$skill_path,provider:$provider}' \
       > "$dest/meta.json" 2>/dev/null || true
     jq -c --arg id "$safe_id" --arg name "$name" --arg session "$SESSION_ID" --arg trigger "$TRIGGER" --arg at "$(ts)" \
       '{id:$id,name:$name,status:"pending",session_id:$session,trigger:$trigger,staged_at:$at}' \
