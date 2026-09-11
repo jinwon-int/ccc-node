@@ -285,7 +285,15 @@ def private_dir(path: Path) -> None:
 
 def safe_root(path: Path, *, create: bool) -> None:
     if create:
-        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        # Pin umask while creating so EVERY chain component lands 0700 —
+        # Path.mkdir(parents=True) applies the explicit mode only to the leaf
+        # and leaves intermediates at 0o777 & ~umask (#1664; CI umask 022 made
+        # the danso .pi/agent hops group-traversable).
+        old_umask = os.umask(0o077)
+        try:
+            path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        finally:
+            os.umask(old_umask)
     if not path.is_dir() or path.is_symlink():
         raise SyncError("skills_root_unsafe")
     protected_walk(path, "skills_root_unsafe", create=False, private_final=False)
