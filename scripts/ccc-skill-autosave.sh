@@ -363,6 +363,103 @@ else
     log "piri sweep done drafted_sessions=$piri_drafted"
   fi
 
+  # --- 2c) danso branch (opt-in, #1660; mirrors the codex/piri branches) ------
+  # Danso session journals are Pi Session JSONL v3 compatible, so the same
+  # projector works; the journal tree (<CCC_DANSO_STATE_DIR>/{journals,
+  # chatgpt-journals, glm-journals}[-audience/<scope>]/<uuid>.jsonl) replaces
+  # piri's encoded-cwd layout, so --project-enc is derived from the journal
+  # root + audience scope. Locked journals (danso writes them exclusively) are
+  # deferred to a later sweep via the normalizer's shared-lock probe.
+  danso_drafted=0
+  danso_opt_in="${CCC_SKILL_DANSO_DRAFTING:-}"
+  if [ -z "$danso_opt_in" ] && [ -f "$STATE_DIR/skill-autosave.danso-drafting" ]; then
+    danso_opt_in=1
+  fi
+  danso_state="${CCC_DANSO_STATE_DIR:-}"
+  if [ "$danso_opt_in" != "1" ]; then
+    log "danso skipped reason=not-enabled"
+  elif [ -z "$danso_state" ]; then
+    log "danso skipped reason=no-state-dir"
+  else
+    danso_normalizer="${CCC_SKILL_DANSO_NORMALIZE_CMD:-}"
+    if [ -z "$danso_normalizer" ]; then
+      for _danso_norm in "$CLAUDE_DIR/hooks/piri-session-normalize.py" \
+                         "$AUTOSAVE_SELF_DIR/piri-session-normalize.py" \
+                         "$AUTOSAVE_SELF_DIR/../scripts/piri-session-normalize.py"; do
+        [ -f "$_danso_norm" ] && { danso_normalizer="$_danso_norm"; break; }
+      done
+      unset _danso_norm
+    fi
+    if [ ! -f "$danso_normalizer" ]; then
+      log "danso skipped reason=no-normalizer"
+    else
+      danso_tree="$STATE_DIR/danso-normalized"
+      danso_ledger="$STATE_DIR/skill-autosave.danso-seen"
+      mkdir -p "$danso_tree" 2>/dev/null
+      touch "$danso_ledger" 2>/dev/null
+      danso_record_ledger() {
+        local tmp="$danso_ledger.tmp.$$"
+        { awk -F'\t' -v s="$1" '$1!=s' "$danso_ledger" 2>/dev/null;
+          printf '%s\t%s\t%s\n' "$1" "$(ts)" "$2"; } > "$tmp" 2>/dev/null \
+          && mv "$tmp" "$danso_ledger" 2>/dev/null
+      }
+      while IFS= read -r journal; do
+        [ "$danso_drafted" -ge "$MAX_SESSIONS" ] && break
+        [ -f "$journal" ] || continue
+        jid="$(basename "$journal" .jsonl)"
+        size="$(wc -c < "$journal" 2>/dev/null | tr -d '[:space:]')"
+        case "$size" in ''|*[!0-9]*) size=0 ;; esac
+        last_size="$(awk -F'\t' -v s="$jid" '$1==s {sz=$3} END {print sz+0}' "$danso_ledger" 2>/dev/null)"
+        case "$last_size" in ''|*[!0-9]*) last_size=0 ;; esac
+        if [ "$last_size" -gt 0 ] && [ $((size - last_size)) -lt "$REGROWTH_BYTES" ]; then
+          continue
+        fi
+        rel="${journal#"$danso_state"/}"
+        project_enc="$(printf '%s' "${rel%/*}" | sed -E 's|[^A-Za-z0-9._]|-|g' | cut -c1-96)"
+        summary="$(python3 "$danso_normalizer" "$journal" --out-dir "$danso_tree" --lock --project-enc "$project_enc" 2>>"$LOG")" || {
+          log "danso normalize failed session=$jid (non-fatal)"
+          continue
+        }
+        locked="$(printf '%s' "$summary" | jq -r '.locked // false' 2>/dev/null)"
+        if [ "$locked" = "true" ]; then
+          log "danso journal locked session=$jid (deferred)"
+          continue
+        fi
+        empty="$(printf '%s' "$summary" | jq -r '.empty // false' 2>/dev/null)"
+        out_path="$(printf '%s' "$summary" | jq -r '.out_path // empty' 2>/dev/null)"
+        if [ "$empty" = "true" ] || [ -z "$out_path" ] || [ ! -f "$out_path" ]; then
+          danso_record_ledger "$jid" "$size"
+          log "danso empty projection session=$jid"
+          continue
+        fi
+        # Scoped branch env: provider.sh resolves the danso install target
+        # (DANSO_SKILLS_DIR / CCC_DANSO_STATE_DIR contract, #1659) from
+        # CCC_SKILL_PROVIDER; the shared CCC_SKILL_REVIEW_STATE_DIR keeps the
+        # pending queue and the autoinstall daily-cap ledger summed across all
+        # branches (codex #1353, piri #1652 precedent).
+        if jq -nc --arg sid "$jid" --arg tp "$out_path" \
+            '{session_id:$sid, transcript_path:$tp}' 2>/dev/null \
+            | env CCC_SKILL_PROVIDER=danso \
+                  CLAUDE_PROJECTS_DIR="$danso_tree" \
+                  CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" \
+                  bash "$REVIEW" manual >>"$LOG" 2>&1; then
+          danso_drafted=$((danso_drafted + 1))
+          danso_record_ledger "$jid" "$size"
+          log "danso review ok session=$jid size=$size"
+        else
+          log "danso review failed session=$jid (non-fatal)"
+        fi
+      done < <(
+        for _danso_root in "$danso_state/journals" "$danso_state/journals-audience" \
+                            "$danso_state/chatgpt-journals" "$danso_state/chatgpt-journals-audience" \
+                            "$danso_state/glm-journals" "$danso_state/glm-journals-audience"; do
+          find "$_danso_root" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" -print0 2>/dev/null
+        done | xargs -0 -r ls -t 2>/dev/null
+      )
+      log "danso sweep done drafted_sessions=$danso_drafted"
+    fi
+  fi
+
   # skill-review.sh stages drafts from a detached background pipeline; give it
   # a bounded window to settle so this run's notification (step 3) can already
   # count fresh drafts. A quiet pipeline (no reusable procedure found) simply
@@ -371,7 +468,7 @@ else
   case "$SETTLE" in ''|*[!0-9]*) SETTLE=90 ;; esac
   # #1652: the piri branch shares the same pending queue, so a piri-only run
   # must also settle before the notification counts fresh drafts.
-  if [ $((drafted + codex_drafted + piri_drafted)) -gt 0 ] && [ "$SETTLE" -gt 0 ]; then
+  if [ $((drafted + codex_drafted + piri_drafted + danso_drafted)) -gt 0 ] && [ "$SETTLE" -gt 0 ]; then
     waited=0
     while [ "$waited" -lt "$SETTLE" ]; do
       [ "$(pending_count)" != "$before" ] && break
@@ -379,7 +476,7 @@ else
     done
   fi
   after="$(pending_count)"
-  log "sweep done drafted_sessions=$drafted codex_drafted=$codex_drafted piri_drafted=$piri_drafted pending_before=$before pending_after=$after"
+  log "sweep done drafted_sessions=$drafted codex_drafted=$codex_drafted piri_drafted=$piri_drafted danso_drafted=$danso_drafted pending_before=$before pending_after=$after"
 fi
 
 # --- 2b) auto mode (#355): machine-gate + install passing drafts -------------

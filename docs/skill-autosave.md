@@ -180,6 +180,29 @@ Canary guidance: enable on the heaviest codex-using (hybrid) node first,
 observe 1–2 weeks of draft quality, cost, and zero codex_exec self-reference
 before rolling fleet-wide.
 
+## Danso journal drafting (#1660, opt-in)
+
+danso session journals are Pi Session JSONL v3 compatible, so the sweep's
+**danso branch** projects them with the same `piri-session-normalize.py` and
+pushes them through the same `skill-review.sh` pipeline with
+`CCC_SKILL_PROVIDER=danso`. Journals live under
+`<CCC_DANSO_STATE_DIR>/{journals,chatgpt-journals,glm-journals}[-audience/<scope>]/`;
+the normalized tree replaces the encoded-cwd layout with a project directory
+derived from the journal root + audience scope. The projector probes a shared
+non-blocking flock and defers journals the danso CLI is actively writing.
+
+**Opt in** with `CCC_SKILL_DANSO_DRAFTING=1` (or `1` in
+`<CCC_STATE_DIR>/skill-autosave.danso-drafting`), and provide
+`CCC_DANSO_STATE_DIR` in the sweep environment — the cron installer bakes both
+(#1655). Default off. Drafts carry `provider: danso` in `meta.json`, so
+autoinstall routes them into `<state>/home/.pi/agent/skills` (#1659) and the
+regrowth ledger `skill-autosave.danso-seen` prevents re-processing.
+
+Drafting LLM on danso nodes: set `CCC_SKILL_REVIEW_LLM_CMD` to the
+`danso-review-agent.sh` wrapper (#1665 — danso has no stdin prompt), e.g.
+`CCC_SKILL_REVIEW_LLM_CMD="danso-review-agent.sh --model glm-5.3-flash"` with
+`DANSO_GLM_*`/`DANSO_OPENAI_*`/`DANSO_CHATGPT_*` credentials in the worker env.
+
 ## Enable the daily sweep
 
 ```bash
