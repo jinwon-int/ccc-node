@@ -1134,7 +1134,7 @@ class TelegramBot(
                 reply_mode=next_reply_mode,
                 voice_input_preview=voice_input_preview,
             )
-            if not response.success and self._active_provider() == "danso":
+            if self._active_provider() == "danso" and not response.success:
                 await self._offer_danso_recovery(conversation_key, user_id, chat.id, force=True)
         except asyncio.CancelledError:
             # Task was cancelled by /stop command - silently exit
