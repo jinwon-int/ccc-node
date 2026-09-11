@@ -101,10 +101,13 @@ def _build_session_started_recorder(settings: Settings, manager: Any):
         return None
     from telegram_bot.core.session_scope import storage_key
 
-    async def record(user_id: int, chat_id: int, ident: str) -> None:
+    async def record(user_id: int, chat_id: int, ident: str, *, dispatch_guard=None) -> None:
         key = storage_key(settings.telegram_session_scope, user_id, chat_id)
-        await manager.patch_session(
-            key, updates={"provider": "danso", "session_id": ident, "new_session": False})
+        updates = {"provider": "danso", "session_id": ident, "new_session": False}
+        if dispatch_guard is None:
+            await manager.patch_session(key, updates=updates)
+        elif not await manager.patch_session_if(key, expected={}, updates=updates, guard=dispatch_guard):
+            raise ValueError("recovery dispatch expired before session persistence")
 
     return record
 

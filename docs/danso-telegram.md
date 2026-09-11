@@ -191,7 +191,7 @@ bridge is a separate operational step; source development does not switch a node
   current conversation's exact UUID. `/resume` reports that UUID; it cannot
   select another conversation's journal. Automatic time-based session resets are
   disabled for Danso so an unresolved journal cannot be abandoned silently.
-- With long-task mode enabled, `/task_resume` is the only explicit resume
+- With long-task mode enabled, `/task_resume` is an explicit resume
   command. It accepts no prompt or session id and uses the current authorized
   conversation journal; it does not duplicate a user prompt. A normal message
   never auto-resumes a pending native task.
@@ -354,3 +354,54 @@ losing the primary HTTP diagnosis. Display uses `zai_code` and
 on successful exit remains a protocol error. Native retry/replay rules do not
 change. Upgrade the bridge before the native binary; previous binaries remain
 compatible but cannot supply the new detail.
+
+
+## Restart and failure recovery confirmation (#1667)
+
+When long-task mode is enabled, startup inspects this conversation's saved
+Danso journal without provider credentials or a model request. A failed or
+unfinished task gets a bounded, credential-redacted summary and three buttons:
+
+- **이어서 진행 (Continue):** at a resumable ready/paused checkpoint, authorize
+  one native no-prompt resume. Otherwise preserve the old journal and start a
+  separate session with bounded historical excerpts and an instruction to
+  inspect actual results first, then do only remaining authorized work. The
+  excerpts are reference data, not proof of success or fresh instructions.
+  An incomplete goal must be clarified with the user rather than guessed.
+- **새 작업 시작 (New task):** reset only this conversation's session binding;
+  keep the original journal and wait for a new user message. No model call.
+- **상태만 확인 (Inspect):** reread the native state and show the summary.
+  No model call, journal mutation, replay, or acknowledgement of uncertain work.
+
+The same offer appears after a failed normal Danso turn (including a provider
+timeout or explicit pause). `/task_recover` requests a fresh offer on demand.
+Completed tasks and sessions without a long-task ledger do not trigger startup
+offers. An unreadable, malformed, or actively locked journal produces no advice;
+use `/task_recover` again after the active writer finishes. The current native
+`--task-status` contract is required; optional `DANSO_RECOVERY` from Danso #90
+also improves the fallback error message. Older binaries without that optional
+record keep the existing generic error and never authorize execution from text.
+
+Startup notification is capped at 100 stored rows, 10 sends, and 10 seconds;
+remaining or temporarily unreadable sessions can use `/task_recover`. Delivery
+is deduplicated by the unchanged journal fingerprint, with a retry after a
+failed send. A crash after delivery but before the marker commits can duplicate
+a notification, but cannot dispatch work. Shared-group/shared-all sentinel keys
+have no unambiguous owner recipient and are skipped at startup; an authorized
+user can request an offer from the actual chat with `/task_recover`.
+
+Choices bind the owner, chat, provider, memory audience, saved session, and a
+fingerprint obtained from matching locked reads around native validation.
+Queue-time revalidation and atomic one-shot claims reject stale/duplicate clicks.
+A new message, `/new`, or provider/audience switch invalidates old dispatches;
+identity persistence and native launch recheck the conversation generation.
+Only explicit Continue can dispatch work. Automatic checkpoint resume is not
+enabled by this feature, and the provider's existing bounded HTTP retry policy
+is unchanged. An uncertain tool effect is never silently marked settled.
+
+The summary labels the last agent note as unverified and counts durable tool
+completion records; it does not invent a completed/remaining checklist. Raw
+transcripts and provider response bodies are not copied into session state.
+Only the offer token, route/identity binding and content fingerprint are saved
+through the existing private, atomic session store. This is a source change;
+production rollout and restart are separate from merging it.
