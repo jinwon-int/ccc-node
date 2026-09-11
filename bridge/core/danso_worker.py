@@ -6,6 +6,7 @@ Telegram composition and configuration live in danso_runtime.py.
 import asyncio
 from dataclasses import dataclass
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -116,7 +117,7 @@ TASK_PROGRESS_KEYS = {
 }
 TASK_STATUS_STATES = {
     'ready', 'pending_provider', 'pending_tools', 'final_pending',
-    'paused', 'completed', 'failed', 'not_long_task',
+    'paused', 'completed', 'failed', 'not_long_task', 'blocked',
 }
 TASK_STATUS_KEYS = {
     'version', 'kind', 'state', 'session_id', 'stage', 'elapsed_ms',
@@ -142,11 +143,13 @@ class _TaskStatus:
     requests: int
     reported_tokens: int
     resume_allowed: bool
+    unknown_usage_requests: int = 0
+    interruption_reason: str | None = None
 
 
 def _task_status(data):  # noqa: C901 -- strict nested protocol validation
     """Parse the provider-free native status projection without relaying data."""
-    if (type(data) is not dict or set(data) != TASK_STATUS_KEYS
+    if (type(data) is not dict or set(data) not in (TASK_STATUS_KEYS, TASK_STATUS_KEYS | {'recovery'})
             or type(data.get('version')) is not int or data['version'] != 1
             or data.get('kind') != 'long_task_status'
             or type(data.get('session_id')) is not str
@@ -166,7 +169,7 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
     limits = data['limits']
     usage = data['usage']
     if (type(limits) is not dict or set(limits) != TASK_STATUS_LIMIT_KEYS
-            or type(usage) is not dict or set(usage) != TASK_STATUS_USAGE_KEYS):
+            or type(usage) is not dict or set(usage) != (TASK_STATUS_USAGE_KEYS | ({'unknown_usage_requests'} if 'recovery' in data else set()))):
         raise ValueError('invalid task status')
     values = {}
     for key, maximum in (
@@ -177,33 +180,59 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
         if type(value) is not int or not 1 <= value <= maximum:
             raise ValueError('invalid task status limits')
         values[key] = value
-    if values['stage_requests'] > values['max_requests']:
-        raise ValueError('invalid task status limits')
     usage_values = {}
     for key, maximum in (('requests', values['max_requests']),
-                         ('reported_tokens', values['max_tokens'])):
+                         ('reported_tokens', 2**64 - 1)):
         value = usage[key]
         if type(value) is not int or not 0 <= value <= maximum:
             raise ValueError('invalid task status usage')
         usage_values[key] = value
+    unknown = 0
+    reason = None
+    if 'recovery' in data:
+        recovery = data['recovery']
+        unknown = usage['unknown_usage_requests']
+        if (type(recovery) is not dict
+                or set(recovery) != {'interruption_reason', 'interrupted_requests',
+                                     'max_interrupted_requests', 'automatic_resume_allowed'}
+                or type(unknown) is not int or not 0 <= unknown <= 3
+                or unknown > usage_values['requests']
+                or type(recovery['interrupted_requests']) is not int
+                or recovery['interrupted_requests'] != unknown
+                or type(recovery['max_interrupted_requests']) is not int
+                or recovery['max_interrupted_requests'] != 3
+                or recovery['automatic_resume_allowed'] is not False):
+            raise ValueError('invalid task recovery assessment')
+        reason = recovery['interruption_reason']
+        if (reason is not None and (type(reason) is not str or reason not in
+                {'user_stop', 'signal_termination', 'run_deadline', 'unknown'})):
+            raise ValueError('invalid task interruption reason')
+        if (unknown == 0) != (reason is None) or (unknown == 3 and data['resume_allowed']):
+            raise ValueError('inconsistent task recovery assessment')
     pending = data['pending']
-    if pending is not None:
-        if type(pending) is not dict:
-            raise ValueError('invalid task status pending')
-        if set(pending) == {'kind'}:
-            if pending['kind'] != 'tools':
-                raise ValueError('invalid task status pending')
-        elif set(pending) == {'kind', 'sequence'}:
-            if (pending['kind'] != 'provider'
-                    or type(pending['sequence']) is not int
-                    or not 0 <= pending['sequence'] <= 2**64 - 1):
-                raise ValueError('invalid task status pending')
-        else:
-            raise ValueError('invalid task status pending')
+    state = data['state']
+    if state == 'pending_provider':
+        if (type(pending) is not dict or set(pending) != {'kind', 'sequence'}
+                or pending['kind'] != 'provider' or type(pending['sequence']) is not int
+                or pending['sequence'] != usage_values['requests'] + 1
+                or pending['sequence'] > values['max_requests']):
+            raise ValueError('inconsistent provider pending status')
+    elif state in {'pending_tools', 'blocked'}:
+        if pending != {'kind': 'tool' if state == 'blocked' else 'tools'}:
+            raise ValueError('inconsistent tool pending status')
+    elif pending is not None:
+        raise ValueError('unexpected pending task status')
+    if data['resume_allowed'] and (
+            data['state'] not in {'ready', 'paused'} or pending is not None
+            or data['elapsed_ms'] >= values['wall_seconds'] * 1000
+            or usage_values['requests'] >= values['max_requests']
+            or usage_values['reported_tokens'] >= values['max_tokens']):
+        raise ValueError('inconsistent task resume assessment')
     return _TaskStatus(
         session_id=data['session_id'],
         state=data['state'], stage=data['stage'], elapsed_ms=data['elapsed_ms'],
-        resume_allowed=data['resume_allowed'], **values, **usage_values,
+        resume_allowed=data['resume_allowed'], unknown_usage_requests=unknown,
+        interruption_reason=reason, **values, **usage_values,
     )
 
 
@@ -594,9 +623,27 @@ class DansoSession:
             self._stop_task = asyncio.create_task(_stop(self._process))
         await asyncio.shield(self._stop_task)
 
+    async def _status_journal_binding(self):
+        from telegram_bot.memory.danso_snapshot import _read_locked
+        from telegram_bot.memory.distill_types import SnapshotUnavailableError
+        try:
+            payload, metadata = await asyncio.to_thread(
+                _read_locked, self.runtime.root, self.session_id)
+            header = json.loads(payload.split(b'\n', 1)[0], object_pairs_hook=_unique_object)
+            if (not payload.endswith(b'\n') or type(header) is not dict
+                    or header.get('type') != 'session' or type(header.get('version')) is not int
+                    or header['version'] != 3 or header.get('cwd') != str(self.cwd)
+                    or type(header.get('id')) is not str
+                    or str(uuid.UUID(header['id'])) != header['id']):
+                raise ValueError('invalid task journal binding')
+            return header['id'], metadata.st_dev, metadata.st_ino, hashlib.sha256(payload).digest()
+        except (SnapshotUnavailableError, OSError, ValueError, UnicodeError, RecursionError) as exc:
+            raise ValueError('task journal binding unavailable') from exc
+
     async def _read_task_status(self):
         """Read the saved native task state without credentials or mutation."""
         r = self.runtime
+        binding = await self._status_journal_binding()
         journal = r.root / (self.session_id + '.jsonl')
         command = [r.binary, '--task-status', '--session', str(journal)]
         spawn = asyncio.create_task(asyncio.create_subprocess_exec(
@@ -637,8 +684,10 @@ class DansoSession:
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise ValueError('invalid task status') from exc
         status = _task_status(data)
-        if status.session_id != self.session_id:
+        if status.session_id != binding[0]:
             raise ValueError('task status session mismatch')
+        if await self._status_journal_binding() != binding:
+            raise ValueError('task journal changed during status inspection')
         return status
 
     async def send_turn(self, message, *, approval_handler=deny_approval):  # noqa: C901 -- subprocess lifecycle and terminal event mapping
@@ -671,7 +720,7 @@ class DansoSession:
             effective_max_requests = r.task_max_requests
             effective_max_tokens = r.task_max_tokens
             resume_stage = None
-            if resume_task:
+            if resume_task or (r.long_task and os.path.lexists(r.root / (self.session_id + '.jsonl'))):
                 status_task = asyncio.create_task(self._read_task_status())
                 self._bootstrap_task = status_task
                 try:
@@ -711,32 +760,42 @@ class DansoSession:
                     for event in events:
                         yield event
                     return
-                try:
-                    if status.state not in {'ready', 'paused'} or not status.resume_allowed:
-                        raise ValueError('task is not resumable')
-                    remaining = status.wall_seconds - (status.elapsed_ms / 1000)
-                    if remaining <= 0:
-                        raise ValueError('task has no remaining wall time')
-                    if (r.outer_timeout is not None
-                            and r.outer_timeout < remaining + 10):
-                        raise ValueError('outer deadline is too short for saved task')
-                except (OSError, asyncio.TimeoutError, ValueError):
+                if not resume_task and status.state not in {'completed', 'failed', 'not_long_task'}:
                     self._active = False
-                    events.append(ErrorEvent(
-                        code='danso_task_resume_unavailable',
-                        message=(
-                            'Saved Danso task cannot be resumed safely; its checkpoint '
-                            'or remaining deadline is unavailable.'
-                        ),
-                    ))
-                    for event in events:
-                        yield event
+                    yield ErrorEvent(
+                        code='danso_task_recovery_required',
+                        message=('Saved Danso task requires an explicit choice. Use /task_recover '
+                                 'to inspect it, /task_resume for an eligible checkpoint, '
+                                 'or /new for a new objective.'),
+                    )
                     return
-                effective_timeout = remaining
-                effective_wall = status.wall_seconds
-                effective_max_requests = status.max_requests
-                effective_max_tokens = status.max_tokens
-                resume_stage = status.stage
+                if resume_task:
+                    try:
+                        if status.state not in {'ready', 'paused'} or not status.resume_allowed:
+                            raise ValueError('task is not resumable')
+                        remaining = status.wall_seconds - (status.elapsed_ms / 1000)
+                        if remaining <= 0:
+                            raise ValueError('task has no remaining wall time')
+                        if (r.outer_timeout is not None
+                                and r.outer_timeout < remaining + 10):
+                            raise ValueError('outer deadline is too short for saved task')
+                    except (OSError, asyncio.TimeoutError, ValueError):
+                        self._active = False
+                        events.append(ErrorEvent(
+                            code='danso_task_resume_unavailable',
+                            message=(
+                                'Saved Danso task cannot be resumed safely; its checkpoint '
+                                'or remaining deadline is unavailable.'
+                            ),
+                        ))
+                        for event in events:
+                            yield event
+                        return
+                    effective_timeout = remaining
+                    effective_wall = status.wall_seconds
+                    effective_max_requests = status.max_requests
+                    effective_max_tokens = status.max_tokens
+                    resume_stage = status.stage
             command = [r.binary, '--sandbox', r.sandbox, '--cwd', str(self.cwd), '--session', str(r.root / (self.session_id + '.jsonl')),
                        '--provider', r.provider, '--model', r.model, '--max-turns', str(r.max_turns),
                        '--max-output-tokens', str(r.max_output_tokens),

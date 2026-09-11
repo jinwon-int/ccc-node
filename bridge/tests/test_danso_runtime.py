@@ -61,7 +61,10 @@ root=Path(args[args.index('--cwd')+1])
 (root/'environment-values.json').write_text(json.dumps({key: os.environ.get(key) for key in ('HOME', 'PATH')}))
 journal=Path(args[args.index('--session')+1])
 fd=os.open(journal,os.O_APPEND|os.O_WRONLY|os.O_CREAT,0o600)
-with os.fdopen(fd,'a') as f:f.write('fixture turn\\n')
+with os.fdopen(fd,'a') as f:
+ if journal.stat().st_size == 0:
+  f.write(json.dumps({'type':'session','version':3,'id':journal.stem,'cwd':str(root)})+'\\n')
+ f.write('fixture turn\\n')
 message=args[-1]
 if '--task-progress' in args:
  print('DANSO_TASK='+json.dumps({'version':1,'state':'checkpoint','stage':1,
@@ -295,6 +298,9 @@ if '--task-status' in args:
 root = Path(args[args.index('--cwd') + 1])
 (root / 'argv.json').write_text(json.dumps(args))
 fd = open(session, 'a')
+session.chmod(0o600)
+if session.stat().st_size == 0:
+    fd.write(json.dumps({'type':'session','version':3,'id':session.stem,'cwd':str(root)})+'\\n')
 fd.write('fixture turn\\n')
 fd.close()
 stage = 4 if '--resume-task' in args else 0
@@ -364,6 +370,9 @@ root = Path(args[args.index('--cwd') + 1])
 if '--resume-task' in args:
     (root / 'provider-dispatch').write_text('unexpected')
 fd = open(session, 'a')
+session.chmod(0o600)
+if session.stat().st_size == 0:
+    fd.write(json.dumps({'type':'session','version':3,'id':session.stem,'cwd':str(root)})+'\\n')
 fd.write('fixture turn\\n')
 fd.close()
 usage = {'requests': 1, 'inputTokens': 1, 'outputTokens': 0,
@@ -755,6 +764,9 @@ root = Path(args[args.index('--cwd') + 1])
 if '--resume-task' in args:
     (root / 'provider-dispatch').write_text('unexpected')
 fd = open(session, 'a')
+session.chmod(0o600)
+if session.stat().st_size == 0:
+    fd.write(json.dumps({'type':'session','version':3,'id':session.stem,'cwd':str(root)})+'\\n')
 fd.write('fixture turn\\n')
 fd.close()
 usage = {'requests': 1, 'inputTokens': 1, 'outputTokens': 0,
@@ -818,6 +830,9 @@ if '--task-status' in args:
     raise SystemExit(0)
 root = Path(args[args.index('--cwd') + 1])
 fd = open(session, 'a')
+session.chmod(0o600)
+if session.stat().st_size == 0:
+    fd.write(json.dumps({'type':'session','version':3,'id':session.stem,'cwd':str(root)})+'\\n')
 fd.write('fixture turn\\n')
 fd.close()
 usage = {'requests': 1, 'inputTokens': 1, 'outputTokens': 0,
@@ -871,6 +886,9 @@ root = Path(args[args.index('--cwd') + 1])
 if '--resume-task' in args:
     (root / 'provider-dispatch').write_text('unexpected')
 fd = open(session, 'a')
+session.chmod(0o600)
+if session.stat().st_size == 0:
+    fd.write(json.dumps({'type':'session','version':3,'id':session.stem,'cwd':str(root)})+'\\n')
 fd.write('fixture turn\\n')
 fd.close()
 usage = {'requests': 1, 'inputTokens': 1, 'outputTokens': 0,
@@ -1089,7 +1107,7 @@ async def test_failure_is_terminal_private_and_never_retried(configured,message,
     assert not response.success
     assert 'PRIVATE_PROVIDER_BODY' not in repr(response)
     assert len(list(runtime.root.glob('*.jsonl'))) == 1
-    assert next(runtime.root.glob('*.jsonl')).read_text() == 'fixture turn\n'
+    assert next(runtime.root.glob('*.jsonl')).read_text().endswith('fixture turn\n')
     # Also verify the adapter's native error mapping, not inferred text.
     session = await runtime.start_or_resume(SessionRequest(working_directory=str(configured.danso_workspace)))
     events = [e async for e in session.send_turn(message)]
@@ -1239,7 +1257,7 @@ async def test_first_failed_turn_persists_identity_before_tools_and_restart(conf
     response2 = await restarted.project_chat.process_message("ok", 7, 9, session_id=recovered["session_id"])
     assert response2.session_id == response.session_id and response2.success
     journal = context.agent_runtime.root / (response.session_id + ".jsonl")
-    assert journal.read_text() == "fixture turn\nfixture turn\n"
+    assert journal.read_text().endswith("fixture turn\nfixture turn\n")
     await context.project_chat.close()
     await restarted.project_chat.close()
 
@@ -1755,6 +1773,11 @@ async def test_recovery_status_uses_private_home_and_exact_session(configured, t
     monkeypatch.setenv('OPENAI_API_KEY', 'must-not-reach-status')
     runtime = build_danso_runtime(configured)
     session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    journal = runtime.root / (session.session_id + '.jsonl')
+    journal.write_text(json.dumps(dict(type='session', version=3, id=session.session_id,
+                                     cwd=str(session.cwd))) + '\n')
+    journal.chmod(0o600)
+    before = journal.read_bytes()
     if wrong_session:
         with pytest.raises(ValueError, match='task status session mismatch'):
             await session._read_task_status()
@@ -1766,4 +1789,170 @@ async def test_recovery_status_uses_private_home_and_exact_session(configured, t
     assert environment['HOME'] == str(Path(configured.danso_state_dir) / 'home')
     assert set(environment) <= {'HOME', 'PATH', 'LC_CTYPE'}
     assert not (Path(configured.danso_workspace) / 'argv.json').exists()
-    assert not (runtime.root / (session.session_id + '.jsonl')).exists()
+    assert journal.read_bytes() == before
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('state', ['pending_provider', 'pending_tools', 'final_pending', 'paused', 'ready'])
+async def test_existing_unfinished_task_is_preflighted_without_execution(configured, state):
+    configured.danso_long_task_enabled = True
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    journal = runtime.root / (session.session_id + '.jsonl')
+    journal.write_text('synthetic existing journal\n')
+    journal.chmod(0o600)
+    session._read_task_status = AsyncMock(return_value=SimpleNamespace(state=state))
+    before = journal.read_bytes()
+    events = [event async for event in session.send_turn('A different new objective')]
+    assert len(events) == 1 and events[0].code == 'danso_task_recovery_required'
+    session._read_task_status.assert_awaited_once()
+    assert journal.read_bytes() == before
+    assert not (Path(configured.danso_workspace) / 'argv.json').exists()
+    assert not session._active
+
+
+@pytest.mark.anyio
+async def test_existing_journal_with_invalid_assessment_never_executes(configured):
+    configured.danso_long_task_enabled = True
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    journal = runtime.root / (session.session_id + '.jsonl')
+    journal.write_text('synthetic torn journal')
+    journal.chmod(0o600)
+    session._read_task_status = AsyncMock(side_effect=ValueError('PRIVATE malformed assessment'))
+    events = [event async for event in session.send_turn('New objective')]
+    assert len(events) == 1 and events[0].code == 'danso_task_resume_unavailable'
+    assert 'PRIVATE' not in events[0].message
+    assert not (Path(configured.danso_workspace) / 'argv.json').exists()
+    assert not session._active
+
+
+def recovery_status():
+    return dict(version=1, kind='long_task_status', state='paused',
+                session_id='12345678-1234-1234-1234-123456789abc', stage=0, elapsed_ms=12,
+                limits=dict(wall_seconds=60, stage_requests=2, max_requests=10,
+                            max_tokens=1000, repeat_limit=3),
+                usage=dict(requests=1, reported_tokens=0, unknown_usage_requests=1),
+                pending=None, resume_allowed=True,
+                recovery=dict(interruption_reason='signal_termination', interrupted_requests=1,
+                              max_interrupted_requests=3, automatic_resume_allowed=False))
+
+
+def test_provider_interruption_status_and_legacy_are_supported():
+    from telegram_bot.core.danso_worker import _task_status
+    status = recovery_status()
+    parsed = _task_status(status)
+    assert parsed.unknown_usage_requests == 1 and parsed.resume_allowed
+    del status['recovery']
+    del status['usage']['unknown_usage_requests']
+    assert _task_status(status).unknown_usage_requests == 0
+
+
+@pytest.mark.parametrize('change', [
+    {'interrupted_requests': True}, {'automatic_resume_allowed': True},
+    {'max_interrupted_requests': 4}, {'interruption_reason': 'PRIVATE'},
+    {'interruption_reason': None}, {'extra': 'PRIVATE'},
+])
+def test_malformed_interruption_assessment_is_refused(change):
+    from telegram_bot.core.danso_worker import _task_status
+    status = recovery_status()
+    status['recovery'].update(change)
+    with pytest.raises(ValueError):
+        _task_status(status)
+
+
+def test_status_allows_soft_stage_target_and_terminal_token_overshoot():
+    from telegram_bot.core.danso_worker import _task_status
+    status = recovery_status()
+    status.update(state='failed', resume_allowed=False)
+    status['limits'].update(stage_requests=16, max_requests=1, max_tokens=10)
+    status['usage']['reported_tokens'] = 11
+    parsed = _task_status(status)
+    assert parsed.stage_requests == 16 and parsed.reported_tokens == 11
+
+
+@pytest.mark.anyio
+async def test_terminal_preflight_preserves_new_objective_dispatch(configured):
+    configured.danso_long_task_enabled = True
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    journal = runtime.root / (session.session_id + '.jsonl')
+    journal.write_text('synthetic terminal journal\n')
+    journal.chmod(0o600)
+    session._read_task_status = AsyncMock(return_value=SimpleNamespace(state='failed'))
+    events = [event async for event in session.send_turn('A genuinely new objective')]
+    assert events[-1].kind == 'completion'
+    argv = json.loads((Path(configured.danso_workspace) / 'argv.json').read_text())
+    assert argv[-1] == 'A genuinely new objective'
+    assert '--resume-task' not in argv
+
+
+def test_unresolved_tool_projection_is_inspectable_but_never_resumable():
+    from telegram_bot.core.danso_worker import _task_status
+    status = recovery_status()
+    status.update(state='blocked', pending={'kind': 'tool'}, resume_allowed=False)
+    parsed = _task_status(status)
+    assert parsed.state == 'blocked' and not parsed.resume_allowed
+    status['resume_allowed'] = True
+    with pytest.raises(ValueError):
+        _task_status(status)
+
+
+@pytest.mark.parametrize('state,pending', [
+    ('completed', {'kind': 'provider', 'sequence': 2}),
+    ('ready', {'kind': 'tools'}), ('paused', {'kind': 'tool'}),
+    ('failed', {'kind': 'tools'}), ('final_pending', {'kind': 'tools'}),
+    ('pending_provider', None), ('pending_tools', None),
+    ('pending_provider', {'kind': 'provider', 'sequence': 1}),
+])
+def test_contradictory_status_never_becomes_dispatch_authority(state, pending):
+    from telegram_bot.core.danso_worker import _task_status
+    status = recovery_status()
+    status.update(state=state, pending=pending, resume_allowed=False)
+    with pytest.raises(ValueError):
+        _task_status(status)
+
+
+def stored_header(session, native_id=None, cwd=None):
+    journal = session.runtime.root / (session.session_id + '.jsonl')
+    journal.write_text(json.dumps(dict(type='session', version=3,
+        id=native_id or session.session_id, cwd=cwd or str(session.cwd))) + '\n')
+    journal.chmod(0o600)
+    return journal
+
+
+@pytest.mark.anyio
+async def test_status_binds_native_header_uuid_not_bridge_filename(configured):
+    binary = Path(configured.danso_cli_path)
+    binary.write_text(binary.read_text().replace("'session_id':session.stem",
+        "'session_id':json.loads(session.read_text().splitlines()[0])['id']"))
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    native_id = '87654321-4321-4321-4321-cba987654321'
+    journal = stored_header(session, native_id)
+    before = journal.read_bytes()
+    status = await session._read_task_status()
+    assert status.session_id == native_id and status.session_id != session.session_id
+    assert status.resume_allowed and journal.read_bytes() == before
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('problem', ['contradictory', 'changed', 'cwd'])
+async def test_preflight_rejects_bad_binding_and_contradictory_terminal(configured, problem):
+    configured.danso_long_task_enabled = True
+    binary = Path(configured.danso_cli_path)
+    source = binary.read_text()
+    if problem == 'contradictory':
+        source = source.replace("'state':'paused'", "'state':'completed'").replace(
+            "'pending':None", "'pending':{'kind':'provider','sequence':3}").replace(
+            "'resume_allowed':True", "'resume_allowed':False")
+    elif problem == 'changed':
+        source = source.replace(" session=Path(args[args.index('--session')+1])\n",
+            " session=Path(args[args.index('--session')+1])\n"
+            " session.write_bytes(session.read_bytes()+b'changed\\n')\n")
+    binary.write_text(source)
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    stored_header(session, cwd='/wrong-audience-workspace' if problem == 'cwd' else None)
+    events = [event async for event in session.send_turn('must not dispatch')]
+    assert len(events) == 1 and events[0].code == 'danso_task_resume_unavailable'
+    assert not (Path(configured.danso_workspace) / 'argv.json').exists()
