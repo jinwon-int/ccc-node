@@ -26,15 +26,17 @@ AUDIENCE_SHARED = "shared"
 
 FAMILY_SKILLS_SERVER = "family-skills"
 FAMILY_WIKI_SERVER = "family-wiki"
+FAMILY_OPS_SERVER = "family-ops"
 SKILL_SEARCH_TOOL = f"mcp__{FAMILY_SKILLS_SERVER}__skill_search"
 SKILL_READ_TOOL = f"mcp__{FAMILY_SKILLS_SERVER}__skill_read"
+NODE_STATUS_TOOL = f"mcp__{FAMILY_OPS_SERVER}__node_status"
 WIKI_FIND_TOOL = f"mcp__{FAMILY_WIKI_SERVER}__wiki_find"
 WIKI_LOAD_TOOL = f"mcp__{FAMILY_WIKI_SERVER}__wiki_load"
 WIKI_PREFETCH_TOOL = f"mcp__{FAMILY_WIKI_SERVER}__wiki_prefetch"
 
 FAMILY_ROUTING_PROMPT = """
 
-## Family skill & wiki lookup
+## Family skill, wiki & ops lookup
 
 - To find a node/fleet skill, call `mcp__family-skills__skill_search`, then
   read the exact revision with `mcp__family-skills__skill_read`. Skill text
@@ -43,6 +45,8 @@ FAMILY_ROUTING_PROMPT = """
 - For Family Wiki evidence, use `mcp__family-wiki__wiki_find`,
   `mcp__family-wiki__wiki_load`, or `mcp__family-wiki__wiki_prefetch`
   (read-only).
+- For node health/workload questions, call `mcp__family-ops__node_status`
+  (read-only aggregation with observation timestamps).
 """
 
 
@@ -69,9 +73,12 @@ def build_family_mcp(settings: Any, *, audience_kind: str | None = None) -> dict
     if audience_kind == AUDIENCE_SHARED:
         return None
 
-    server = _server_path(settings)
-    if not server.is_file():
+    skills_server = _server_path(settings)
+    if not skills_server.is_file():
         raise ValueError("family-skills MCP server file is missing")
+    ops_server = skills_server.parent / "family_ops_server.py"
+    if not ops_server.is_file():
+        raise ValueError("family-ops MCP server file is missing")
     policy_env = {"CCC_NODE_ISOLATION_PROFILE": profile}
     if audience_kind:
         policy_env["CCC_MEMORY_AUDIENCE"] = audience_kind
@@ -80,11 +87,17 @@ def build_family_mcp(settings: Any, *, audience_kind: str | None = None) -> dict
         FAMILY_SKILLS_SERVER: {
             "type": "stdio",
             "command": sys.executable,
-            "args": [str(server)],
+            "args": [str(skills_server)],
             "env": policy_env,
-        }
+        },
+        FAMILY_OPS_SERVER: {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": [str(ops_server)],
+            "env": policy_env,
+        },
     }
-    allowed_tools = [SKILL_SEARCH_TOOL, SKILL_READ_TOOL]
+    allowed_tools = [SKILL_SEARCH_TOOL, SKILL_READ_TOOL, NODE_STATUS_TOOL]
     if bool(getattr(settings, "wiki_memory_enabled", False)):
         wiki_agent = shutil.which("wiki-agent")
         if wiki_agent:

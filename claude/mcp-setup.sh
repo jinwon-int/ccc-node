@@ -72,11 +72,13 @@ echo "==> Registering MCP servers (user scope)…"
 # server re-checks the node isolation/audience policy at every tools/call.
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY3="$(command -v python3)"
-if [ -n "$PY3" ] && [ -f "$REPO_ROOT/bridge/core/family_skills_server.py" ]; then
+if [ -n "$PY3" ] && [ -f "$REPO_ROOT/bridge/core/family_skills_server.py" ] && [ -f "$REPO_ROOT/bridge/core/family_ops_server.py" ]; then
   add family-skills -- "$PY3" "$REPO_ROOT/bridge/core/family_skills_server.py"
   echo "  - family-skills: $REPO_ROOT/bridge/core/family_skills_server.py"
+  add family-ops -- "$PY3" "$REPO_ROOT/bridge/core/family_ops_server.py"
+  echo "  - family-ops: $REPO_ROOT/bridge/core/family_ops_server.py"
 else
-  echo "  - family-skills: SKIPPED — python3 or server file missing"
+  echo "  - family-skills/family-ops: SKIPPED — python3 or server file missing"
 fi
 
 # family-wiki — the existing wiki-agent read-only server, reused verbatim
@@ -116,5 +118,5 @@ echo "==> Done. Verifying:"
 claude mcp list
 echo
 echo "Note: tool permissions for these servers (mcp__searxng__*, mcp__firecrawl__*,"
-echo "      mcp__context7__*, mcp__family-skills__*, mcp__family-wiki__*) are"
-echo "      pre-allowed in claude/settings.json."
+echo "      mcp__context7__*, mcp__family-skills__*, mcp__family-wiki__*,"
+echo "      mcp__family-ops__*) are pre-allowed in claude/settings.json."

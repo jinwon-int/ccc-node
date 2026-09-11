@@ -92,10 +92,14 @@ env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" \
   bash "$SUT" >/dev/null 2>&1 || true
 ok "family-skills registered with abs python3" \
   'grep -Eq "add family-skills .* -- .*python3 .*family_skills_server.py" "$TMP/claude.log"'
+ok "family-ops registered with abs python3" \
+  'grep -Eq "add family-ops .* -- .*python3 .*family_ops_server.py" "$TMP/claude.log"'
 ok "family-wiki registered via wiki-agent" \
   'grep -Eq "add family-wiki .* -- wiki-agent mcp-serve" "$TMP/claude.log"'
 ok "family-skills removed before add (idempotent)" \
   'grep -q "remove family-skills -s user" "$TMP/claude.log"'
+ok "family-ops removed before add (idempotent)" \
+  'grep -q "remove family-ops -s user" "$TMP/claude.log"'
 
 : > "$TMP/claude.log"
 env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" CCC_WIKI_MEMORY_ENABLED=0 \
@@ -104,6 +108,8 @@ ok "family-wiki skipped when wiki disabled" \
   '! grep -q "add family-wiki" "$TMP/claude.log"'
 ok "family-skills still registered when wiki disabled" \
   'grep -q "add family-skills" "$TMP/claude.log"'
+ok "family-ops still registered when wiki disabled" \
+  'grep -q "add family-ops" "$TMP/claude.log"'
 
 : > "$TMP/claude.log"
 env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" CCC_NODE_ISOLATION_PROFILE=external \
