@@ -515,6 +515,12 @@ else
   err "skill-promotion malformed verdict visibility tests failed (lost verdicts may go untraceable)"
   tail -10 "$TMP/skill-verdict-malformed-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_revise_stall_test.py >"$TMP/doctor-revise-stall-test.out" 2>&1; then
+  say "  ok doctor skill-promotion revise-stall verdict tests (#1628)"
+else
+  err "doctor skill-promotion revise-stall verdict tests failed"
+  tail -10 "$TMP/doctor-revise-stall-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_marker_registry_test.py >"$TMP/doctor-marker-registry-test.out" 2>&1; then
   say "  ok doctor cron marker registry covers every install-*-cron.sh"
 else
