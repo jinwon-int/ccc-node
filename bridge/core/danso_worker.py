@@ -741,7 +741,7 @@ class DansoSession:
                        '--provider', r.provider, '--model', r.model, '--max-turns', str(r.max_turns),
                        '--max-output-tokens', str(r.max_output_tokens),
                        '--provider-timeout-seconds', str(r.provider_timeout),
-                       '--progress-jsonl' if (r.progress_jsonl and not r.long_task) else '-p']
+                       '--progress-jsonl' if r.progress_jsonl else '-p']
             if r.tool_home is not None:
                 command += ['--tool-home', r.tool_home]
             if not resume_task:
@@ -780,19 +780,16 @@ class DansoSession:
                     else:
                         command += ['--', message]
                     async for event in self._execute(
-                        command, readers, resume_task=resume_task, dispatch_guard=dispatch_guard,
+                        command, readers, events, resume_task=resume_task, dispatch_guard=dispatch_guard,
                         resume_stage=resume_stage,
                         timeout_seconds=effective_timeout,
                         wall_seconds=effective_wall,
                         max_requests=effective_max_requests,
                         max_tokens=effective_max_tokens,
                     ):
-                        if isinstance(event, TaskProgressEvent):
-                            # Progress is consumed incrementally and never
-                            # retained alongside the final answer.
-                            yield event
-                        else:
-                            events.append(event)
+                        # Only nonterminal events are yielded by _execute;
+                        # final/error events stay buffered until cleanup.
+                        yield event
             except asyncio.CancelledError:
                 if not self._interrupted or asyncio.current_task().cancelling():
                     raise
@@ -809,19 +806,18 @@ class DansoSession:
             for event in events:
                 yield event
 
-    async def _execute(self, command, readers, *, resume_task=False,  # noqa: C901 -- bounded concurrent stdout/stderr/progress lifecycle
+    async def _execute(self, command, readers, events, *, resume_task=False,  # noqa: C901 -- bounded concurrent stdout/stderr/progress lifecycle
                        resume_stage=None,
                        timeout_seconds=None, wall_seconds=None,
                        max_requests=None, max_tokens=None, dispatch_guard=None):
         if dispatch_guard is not None and not dispatch_guard():
-            yield ErrorEvent(code='danso_recovery_stale', message='Recovery selection expired; use /task_recover.')
+            events.append(ErrorEvent(code='danso_recovery_stale', message='Recovery selection expired; use /task_recover.'))
             return
         r = self.runtime
         timeout_seconds = r.timeout if timeout_seconds is None else timeout_seconds
         wall_seconds = r.timeout if wall_seconds is None else wall_seconds
         max_requests = r.task_max_requests if max_requests is None else max_requests
         max_tokens = r.task_max_tokens if max_tokens is None else max_tokens
-        events = []
         spawn = asyncio.create_task(asyncio.create_subprocess_exec(
             *command, cwd=self.cwd, env=r.environment, stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True))
@@ -831,8 +827,8 @@ class DansoSession:
         if self._interrupted:
             await self.interrupt()
         progress_queue = asyncio.Queue()
-        tool_queue = asyncio.Queue()
-        use_jsonl = r.progress_jsonl and not r.long_task
+        tool_queue = asyncio.Queue(maxsize=128)
+        use_jsonl = r.progress_jsonl
         stdout_task = asyncio.create_task(
             read_progress(self._process.stdout, tool_queue) if use_jsonl else _read(self._process.stdout))
         if r.long_task:
@@ -844,6 +840,7 @@ class DansoSession:
             stderr_task = asyncio.create_task(_read(self._process.stderr))
         readers.extend([stdout_task, stderr_task])
         progress_task = (asyncio.create_task(progress_queue.get()) if r.long_task else None)
+        tool_task = asyncio.create_task(tool_queue.get()) if use_jsonl else None
         stdout = stderr = None
         stdout_done = stderr_done = False
         last_progress = None
@@ -860,9 +857,16 @@ class DansoSession:
                     if not stderr_done and stderr_task.done():
                         stderr = stderr_task.result()
                         stderr_done = True
-                    if use_jsonl:
-                        while not tool_queue.empty():
-                            yield tool_queue.get_nowait()
+                    if tool_task is not None and tool_task.done():
+                        item = tool_task.result()
+                        tool_task = (asyncio.create_task(tool_queue.get())
+                                     if not stdout_done or not tool_queue.empty() else None)
+                        yield item
+                        continue
+                    if stdout_done and tool_task is not None and tool_queue.empty():
+                        tool_task.cancel()
+                        await asyncio.gather(tool_task, return_exceptions=True)
+                        tool_task = None
                     if progress_task is not None and progress_task.done():
                         item = progress_task.result()
                         if item is None:
@@ -885,7 +889,7 @@ class DansoSession:
                             progress_task = asyncio.create_task(progress_queue.get())
                             yield item
                         continue
-                    wait_for = {task for task in (stdout_task, stderr_task, progress_task)
+                    wait_for = {task for task in (stdout_task, stderr_task, progress_task, tool_task)
                                 if task is not None and not task.done()}
                     if not wait_for:
                         break
@@ -899,6 +903,9 @@ class DansoSession:
                     stderr = stderr_task.result()
                 code = await self._process.wait()
         finally:
+            if tool_task is not None:
+                tool_task.cancel()
+                await asyncio.gather(tool_task, return_exceptions=True)
             if progress_task is not None and not progress_task.done():
                 progress_task.cancel()
             if progress_task is not None:
@@ -935,8 +942,6 @@ class DansoSession:
             events.append(MessageCompletedEvent())
             events.append(ResultEvent(result={'text': text, 'usage': usage}))
             events.append(CompletionEvent(stop_reason='stop'))
-        for event in events:
-            yield event
 
     async def _cleanup(self, readers):
         try:

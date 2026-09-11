@@ -1,10 +1,13 @@
-"""Bounded Danso JSONL progress decoding; never forwards transcript bodies."""
+"""Bounded Danso JSONL decoding; only assistant text and body-free tool events."""
 from __future__ import annotations
 
 import json
 import uuid
 
-from telegram_bot.core.agent_runtime import ToolCompletedEvent, ToolStartedEvent
+from telegram_bot.core.agent_runtime import (
+    MessageCompletedEvent, TextDeltaEvent, ToolCompletedEvent, ToolStartedEvent,
+)
+from telegram_bot.utils.redaction import redact_credentials
 
 LINE_CAP = 2 * 1024 * 1024
 STREAM_CAP = 32 * 1024 * 1024
@@ -18,6 +21,27 @@ def _object(pairs):
             raise ValueError('duplicate progress key')
         result[key] = value
     return result
+
+
+def _interim(message):
+    texts, calls = [], 0
+    for block in message['content']:
+        if not isinstance(block, dict):
+            raise ValueError('invalid interim block')
+        if block.get('type') == 'text':
+            if not isinstance(block.get('text'), str):
+                raise ValueError('invalid interim text')
+            texts.append(block['text'])
+        elif block.get('type') == 'toolCall':
+            if (not isinstance(block.get('id'), str) or not block['id']
+                    or not isinstance(block.get('name'), str) or not block['name']
+                    or not isinstance(block.get('arguments'), dict)):
+                raise ValueError('invalid interim tool call')
+            calls += 1
+    if not calls:
+        raise ValueError('interim response requires tool calls')
+    text = redact_credentials('\n'.join(texts)).strip()[:4096]
+    return [TextDeltaEvent(text=text), MessageCompletedEvent()] if text else None
 
 
 class ProgressDecoder:
@@ -47,19 +71,26 @@ class ProgressDecoder:
         if kind != 'message' or not isinstance(record.get('message'), dict):
             raise ValueError('invalid transcript frame')
         message = record['message']
-        if message.get('role') == 'assistant' and message.get('stopReason') == 'stop':
+        if message.get('role') == 'assistant' and message.get('stopReason') == 'toolUse':
             if self.active is not None or not isinstance(message.get('content'), list):
-                raise ValueError('invalid final response')
-            parts = []
-            for block in message['content']:
-                if not isinstance(block, dict):
-                    raise ValueError('invalid final block')
-                if block.get('type') == 'text':
-                    if not isinstance(block.get('text'), str):
-                        raise ValueError('invalid final text')
-                    parts.append(block['text'])
-            self.final = '\n'.join(parts).strip()
+                raise ValueError('invalid interim response')
+            return _interim(message)
+        if message.get('role') == 'assistant' and message.get('stopReason') == 'stop':
+            self._final_response(message)
         return None
+
+    def _final_response(self, message):
+        if self.active is not None or not isinstance(message.get('content'), list):
+            raise ValueError('invalid final response')
+        parts = []
+        for block in message['content']:
+            if not isinstance(block, dict):
+                raise ValueError('invalid final block')
+            if block.get('type') == 'text':
+                if not isinstance(block.get('text'), str):
+                    raise ValueError('invalid final text')
+                parts.append(block['text'])
+        self.final = '\n'.join(parts).strip()
 
     def _progress(self, record):
         phase = record.get('phase')
@@ -107,7 +138,8 @@ async def read_progress(stream, queue):
                 raise ValueError('progress line limit')
             event = decoder.feed(line)
             if event is not None:
-                await queue.put(event)
+                for item in event if isinstance(event, list) else [event]:
+                    await queue.put(item)
         if len(pending) > LINE_CAP:
             raise ValueError('progress line limit')
     if pending:

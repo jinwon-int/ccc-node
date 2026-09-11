@@ -274,6 +274,10 @@ class Config(
                                        alias="CCC_DANSO_COMPACT_AT_BYTES")
     # Long tasks are the default; operators can explicitly select ordinary mode.
     # The ordinary-mode deadline remains separate from the cumulative task limit.
+    danso_progress_enabled: bool = Field(
+        default=True,
+        description="Deliver completed Danso interim messages and tool progress when the CLI supports JSONL.",
+    )
     danso_long_task_enabled: bool = Field(
         default=True,
         alias="CCC_DANSO_LONG_TASK_ENABLED",
