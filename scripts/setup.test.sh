@@ -1118,5 +1118,53 @@ rc=$?
 ok "sysbin seam is refused when the install target is outside the temp root" \
   '[ "$rc" = 0 ] && ! grep -q "owner guard skipped" <<<"$out"'
 
+# --------------------------------------------------------------------------
+# Rollback snapshot dir when the parent of CLAUDE_DIR rejects the create
+# (#1677). gongmyoung's home is root:gongmyoung 0750 by design — the memory
+# ancestor-directory check requires a non-group-writable ancestor — so the
+# default snapshot location was unwritable for the account that owns the
+# harness, and setup.sh aborted before installing anything. The seam forces
+# that rejection: this suite runs as root, for whom every directory is
+# writable, so a mode-based fixture would silently test nothing.
+# --------------------------------------------------------------------------
+txn_home="$TMP/txn-home"; mkdir -p "$txn_home/.claude"
+out="$(HOME="$txn_home" CCC_CLAUDE_DIR="$txn_home/.claude" CCC_HERMES_DIR="$TMP/txn-hermes" \
+  CCC_SETUP_TEST_TXN_PARENT_FAIL="$txn_home" \
+  PATH="$REAL_PATH" bash "$SETUP" --no-backup 2>&1)"; rc=$?
+ok "setup installs when the CLAUDE_DIR parent rejects the snapshot dir" \
+  '[ "$rc" = 0 ] && [ -d "$txn_home/.claude/hooks" ]'
+ok "the fallback location is reported, not silent" \
+  'grep -q "rollback snapshot in $txn_home/.claude" <<<"$out"'
+ok "the fallback snapshot dir is cleaned up on success" \
+  '[ -z "$(find "$txn_home/.claude" -maxdepth 1 -name ".ccc-node-setup-rollback.*" -print -quit)" ]'
+
+# Both candidates rejected: a configuration error, not a crash or a silent
+# install without a rollback point.
+both_home="$TMP/txn-both"; mkdir -p "$both_home/.claude"
+out="$(HOME="$both_home" CCC_CLAUDE_DIR="$both_home/.claude" CCC_HERMES_DIR="$TMP/txn-both-hermes" \
+  CCC_SETUP_TEST_TXN_PARENT_FAIL="$both_home:$both_home/.claude" \
+  PATH="$REAL_PATH" bash "$SETUP" --no-backup 2>&1)"; rc=$?
+ok "no usable snapshot dir is a configuration error" \
+  '[ "$rc" = 2 ] && grep -q "cannot create the rollback snapshot dir" <<<"$out"'
+
+# An explicit override wins over both candidates.
+txn_root="$TMP/txn-explicit"; mkdir -p "$txn_root"
+override_home="$TMP/txn-override-home"; mkdir -p "$override_home/.claude"
+out="$(HOME="$override_home" CCC_CLAUDE_DIR="$override_home/.claude" \
+  CCC_HERMES_DIR="$TMP/txn-override-hermes" CCC_SETUP_TXN_ROOT="$txn_root" \
+  PATH="$REAL_PATH" bash "$SETUP" --no-backup 2>&1)"; rc=$?
+ok "CCC_SETUP_TXN_ROOT is honoured" '[ "$rc" = 0 ] && [ -d "$override_home/.claude/hooks" ]'
+
+# The default path is unchanged: a writable parent still hosts the snapshot,
+# so the other eleven nodes see no behaviour change.
+plain_home="$TMP/txn-plain"; mkdir -p "$plain_home/.claude"
+# shellcheck disable=SC2034  # out and rc are read via eval inside ok()
+out="$(HOME="$plain_home" CCC_CLAUDE_DIR="$plain_home/.claude" CCC_HERMES_DIR="$TMP/txn-plain-hermes" \
+  PATH="$REAL_PATH" bash "$SETUP" --no-backup 2>&1)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+rc=$?
+ok "a writable parent still installs normally and needs no fallback" \
+  '[ "$rc" = 0 ] && [ -d "$plain_home/.claude/hooks" ] && ! grep -q "rollback snapshot in" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
