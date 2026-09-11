@@ -35,6 +35,7 @@ from telegram.ext import (
 )
 from telegram_bot.core import ui
 from telegram_bot.core import paths as path_scope
+from telegram_bot.core.telegram_rich_text import RichTextError, inbound_message_text
 from telegram_bot.core.bot_shared import build_reply_context_prefix
 from telegram_bot.core.bot_ports import (
     EnqueueUserTaskFn,
@@ -143,13 +144,20 @@ class BotDeliveryMixin:
         if not await self._check_access(update):
             return
         message = self._require_message(update)
-        if not message.text:
+        try:
+            text = inbound_message_text(message)
+        except RichTextError:
+            await message.reply_text(
+                "이 리치 메시지에는 아직 읽을 수 없는 형식이 있거나 크기 제한을 넘었습니다. "
+                "일반 텍스트로 보내주세요. 일부만 처리하지 않았습니다."
+            )
+            return
+        if not text:
             return
 
         user_id = self._require_user(update).id
         chat = self._require_chat(update)
         conversation_key = self._conversation_key(user_id, chat.id)
-        text = message.text
         approval_result = await self._resolve_codex_approval_text(user_id, chat.id, text)
         if approval_result is not None:
             replies = {
