@@ -648,11 +648,17 @@ piri_tool() {
 make_skill piri-gate
 python3 "$TOOL" --provider piri --skills-dir "$SKILLS" --state-dir "$STATE" mark-created piri-gate >/dev/null
 make_patch piri-gate SKILL.md "1. Read." "1. Run: claude -p --model haiku." "$(printf 'd%.0s' {1..64})" "$TMP/piri-incompat.json" piri
-out="$(piri_tool validate-proposal --proposal "$TMP/piri-incompat.json")"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(piri_tool validate-proposal --proposal "$TMP/piri-incompat.json")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "piri patch with Claude-only coupling is rejected" \
   '[ "$rc" = 2 ] && jq -e ".code == \"incremental_content_provider_incompatible\"" >/dev/null <<<"$out"'
 make_patch piri-gate SKILL.md "1. Read." "1. Read twice." "$(printf 'e%.0s' {1..64})" "$TMP/piri-clean.json" piri
-out="$(piri_tool validate-proposal --proposal "$TMP/piri-clean.json")"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(piri_tool validate-proposal --proposal "$TMP/piri-clean.json")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "benign piri patch validates" \
   '[ "$rc" = 0 ] && jq -e ".ok == true" >/dev/null <<<"$out"'
 
