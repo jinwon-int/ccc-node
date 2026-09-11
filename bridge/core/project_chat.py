@@ -150,7 +150,7 @@ class ProjectChatHandler(
         *,
         agent_runtime: Any = None,
         clock: Any = None,
-        session_started_recorder: Callable[[int, int, str], Awaitable[None]] | None = None,
+        session_started_recorder: Callable[..., Awaitable[None]] | None = None,
     ):
         # ``settings=None`` is retained only for legacy unit-test adapters. The
         # production composition root always injects the validated Settings.
@@ -1062,6 +1062,18 @@ class ProjectChatHandler(
                 UsageSnapshot(provider=result.provider, windows=windows),
             )
         return result
+
+    async def inspect_danso_recovery(self, session_id, user_id, chat_id):
+        from telegram_bot.core.agent_runtime import SessionRequest
+        from telegram_bot.core.memory_audience import resolve_memory_audience
+        if getattr(self._config, "agent_provider", None) != "danso":
+            raise ValueError("Danso is not active")
+        audience = resolve_memory_audience(self._config, user_id=user_id, chat_id=chat_id)
+        request = SessionRequest(
+            working_directory=str(self._config.danso_workspace), session_id=session_id,
+            memory_environment=None if audience is None else audience.danso_environment(self._config),
+        )
+        return await self._agent_runtime.inspect_recovery(request)
 
     def _get_conversation_lock(self, user_id: int, chat_id: int) -> asyncio.Lock:
         key = self._stream_key(user_id, chat_id)

@@ -290,6 +290,9 @@ class BotLifecycleMixin:
         # message. Then drain any terminal ops left pending by failed cleanups.
         await self._reconcile_task_ledger(application)
         await self._recover_dead_session_notifications(application)
+        recover_danso = getattr(self, "_recover_danso_tasks", None)
+        if callable(recover_danso):
+            await recover_danso(application)
 
         # Conversation delivery seam for durable async completions (#646
         # slice 2). Inert until a runtime declares durable delivery; wiring
