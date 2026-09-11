@@ -351,6 +351,6 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
                         task_max_tokens=settings.danso_task_max_tokens,
                         task_repeat_limit=settings.danso_task_repeat_limit,
                         task_pause_after_stage=settings.danso_task_pause_after_stage,
-                        progress_jsonl=bool(
-                            settings.enable_streaming and settings.enable_streaming_tool_calls
-                        ))
+                        progress_jsonl=bool(settings.danso_progress_enabled and _validate_cli_flags(
+                            binary, Path(settings.danso_workspace), ("--progress-jsonl",),
+                        )))

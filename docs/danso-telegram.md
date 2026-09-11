@@ -167,12 +167,26 @@ bridge is a separate operational step; source development does not switch a node
 ## Telegram behavior
 
 - Messages run through the normal queue, typing/status and final reply paths.
-  Ordinary final answers are buffered; long-task mode may update the heartbeat
-  from bounded native checkpoint counters, without relaying prompt, tool,
-  path, or provider-response bodies. When streaming and tool-call display are
-  enabled, ordinary turns may also emit body-free tool-start/settlement notices
-  from native `--progress-jsonl` (tool name only). The finite subprocess deadline
-  replaces the first-event admission timeout for this provider.
+  `CCC_DANSO_PROGRESS_ENABLED=true` (default) selects `--progress-jsonl` when
+  the installed binary advertises it, for ordinary and long-task turns.
+  Completed assistant explanations accompanying tool calls are delivered as
+  separate interim bubbles, including when the draft streaming master switch
+  is off. The final answer is delivered once, after process cleanup and usage
+  validation. Older CLIs without the flag retain final-only output; setting
+  `CCC_DANSO_PROGRESS_ENABLED=false` explicitly selects that behavior.
+- Interim text is limited to 4096 characters per assistant message and credential
+  patterns are redacted before truncation. User messages, reasoning blocks, tool
+  arguments and tool-result bodies never become interim bubbles. Body-free tool
+  notifications still follow the existing display settings. JSONL framing keeps
+  its 2 MiB line and 32 MiB run limits; malformed output fails closed.
+- Native Rust progress guidance asks for concise updates in the user's language
+  alongside useful tool calls at the start and meaningful milestones. This is
+  completed-message delivery, not provider token streaming or a promise of a
+  fixed reporting interval. A slow provider request or tool is covered by the
+  existing status heartbeat; reporting adds no model request or replay.
+- Long-task checkpoint counters remain on stderr as `DANSO_TASK`; pause, resume,
+  cancellation and failure handling stay independent of assistant commentary.
+  The finite subprocess deadline replaces the first-event admission timeout.
 - Active requests keep their status message even when a long tool or a native
   task stage produces no events. After `CCC_HEARTBEAT_STALL_SECONDS` (default
   300), it shows `Waiting for progress`, total elapsed time, the age of the last

@@ -85,3 +85,64 @@ async def test_limits_and_partial_frames_fail_closed(monkeypatch):
     reader.feed_eof()
     with pytest.raises(ValueError):
         await p.read_progress(reader,asyncio.Queue())
+
+
+def interim_record(*blocks):
+    return {'type': 'message', 'message': {'role': 'assistant', 'stopReason': 'toolUse',
+            'content': list(blocks)}}
+
+
+def call_block():
+    return {'type': 'toolCall', 'id': 'call-1', 'name': 'bash', 'arguments': {'command': 'PRIVATE_COMMAND'}}
+
+
+def test_interim_only_forwards_bounded_redacted_assistant_text():
+    d = decoder()
+    value = interim_record({'type': 'thinking', 'thinking': 'PRIVATE_REASONING'},
+                           {'type': 'text', 'text': 'Checking api_key=' + 'x'*80}, call_block())
+    events = d.feed(json.dumps(value))
+    assert [event.kind for event in events] == ['text_delta', 'message_completed']
+    assert 'Checking' in events[0].text
+    assert 'x'*20 not in repr(events) and 'PRIVATE' not in repr(events)
+    assert d.feed(json.dumps(interim_record(call_block()))) is None
+    long = d.feed(json.dumps(interim_record({'type': 'text', 'text': 'a'*6000}, call_block())))
+    assert len(long[0].text) == 4096
+    assert d.final is None
+
+
+@pytest.mark.parametrize('blocks', [[], [{'type': 'text', 'text': 'not a tool response'}],
+    [None, call_block()], [{'type': 'text', 'text': 4}, call_block()],
+    [{**call_block(), 'arguments': 'PRIVATE'}], [{**call_block(), 'id': ''}],
+    [{**call_block(), 'name': None}]])
+def test_malformed_interim_is_not_delivered(blocks):
+    with pytest.raises(ValueError):
+        decoder().feed(json.dumps(interim_record(*blocks)))
+
+
+@pytest.mark.anyio
+async def test_fragmented_interim_frames_preserve_event_order_and_final_once():
+    queue = asyncio.Queue()
+    reader = asyncio.StreamReader()
+    task = asyncio.create_task(p.read_progress(reader, queue))
+    frames = [{'type': 'session', 'version': 3},
+              interim_record({'type': 'text', 'text': '검증 중'}, call_block()), frame(),
+              frame(phase='settled', success=True),
+              {'type': 'message', 'message': {'role': 'assistant', 'stopReason': 'stop',
+               'content': [{'type': 'text', 'text': 'done'}]}}]
+    wire = ('\n'.join(map(json.dumps, frames))+'\n').encode()
+    for byte in wire:
+        reader.feed_data(bytes([byte]))
+    reader.feed_eof()
+    d = await task
+    assert [queue.get_nowait().kind for _ in range(queue.qsize())] == [
+        'text_delta', 'message_completed', 'tool_started', 'tool_completed']
+    assert d.finish() == b'done'
+
+
+@pytest.mark.parametrize('pieces', [('api_key=123456', '789012'),
+    ('Bearer sk-proj-' + 'a'*8, 'b'*30), ('ghp_' + 'a'*10, 'b'*26)])
+def test_credentials_split_across_text_blocks_are_redacted(pieces):
+    events = decoder().feed(json.dumps(interim_record(
+        *[{'type': 'text', 'text': piece} for piece in pieces], call_block())))
+    assert events
+    assert pieces[1] not in events[0].text
