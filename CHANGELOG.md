@@ -4,6 +4,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Add `node_status` as one aggregated read-only call behind a JSON CLI
+  (`scripts/ccc-node-status.py`) and the new `family-ops` stdio MCP tool,
+  reusing ccc-bridge-locate, `bridge/start.sh --status` and agent-cron
+  status sources (#1694). Every section reports ok/unknown with latency,
+  partial failures stay node-scoped, optional ssh peer aggregation is
+  node-scoped fail-open, and the shared MCP stdio framing moves to
+  `bridge/core/mcp_stdio.py` for reuse by both family servers.
+
 - Add skill lookup as one common search/read implementation behind a JSON CLI
   (`scripts/ccc-skill-lookup.py`), a stdlib-only `family-skills` stdio MCP
   server, and explicit owner-profile bridge injection that reuses the existing

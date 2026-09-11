@@ -73,12 +73,13 @@ def _build(runtime: ClaudeRuntime, tmp_path: Path, memory_environment=None):
 
 
 def _install_server(tmp_path: Path) -> Path:
-    """A minimal stand-in server file at the real relative path."""
+    """Minimal stand-in server files at the real relative paths."""
 
-    server = tmp_path / "bridge" / "core" / "family_skills_server.py"
-    server.parent.mkdir(parents=True, exist_ok=True)
-    server.write_text("# fixture server\n", encoding="utf-8")
-    return server
+    core = tmp_path / "bridge" / "core"
+    core.mkdir(parents=True, exist_ok=True)
+    for name in ("family_skills_server.py", "family_ops_server.py"):
+        (core / name).write_text("# fixture server\n", encoding="utf-8")
+    return core / "family_skills_server.py"
 
 
 def test_builder_refuses_external_and_shared(tmp_path: Path) -> None:
@@ -92,10 +93,11 @@ def test_builder_builds_skills_server_and_gates_wiki(
 ) -> None:
     _install_server(tmp_path)
     bundle = build_family_mcp(_settings(tmp_path))
-    assert set(bundle["mcp_servers"]) == {SERVER_NAME}
+    assert set(bundle["mcp_servers"]) == {SERVER_NAME, "family-ops"}
     assert bundle["allowed_tools"] == [
         "mcp__family-skills__skill_search",
         "mcp__family-skills__skill_read",
+        "mcp__family-ops__node_status",
     ]
     server = bundle["mcp_servers"][SERVER_NAME]
     assert server["env"] == {"CCC_NODE_ISOLATION_PROFILE": "fleet"}
@@ -105,11 +107,11 @@ def test_builder_builds_skills_server_and_gates_wiki(
 
     monkeypatch.setattr(family_mcp.shutil, "which", lambda _: None)
     disabled = build_family_mcp(_settings(tmp_path, wiki_memory_enabled=True))
-    assert set(disabled["mcp_servers"]) == {SERVER_NAME}
+    assert set(disabled["mcp_servers"]) == {SERVER_NAME, "family-ops"}
 
     monkeypatch.setattr(family_mcp.shutil, "which", lambda _: "/usr/local/bin/wiki-agent")
     enabled = build_family_mcp(_settings(tmp_path, wiki_memory_enabled=True))
-    assert set(enabled["mcp_servers"]) == {SERVER_NAME, "family-wiki"}
+    assert set(enabled["mcp_servers"]) == {SERVER_NAME, "family-ops", "family-wiki"}
     assert enabled["mcp_servers"]["family-wiki"]["args"] == ["mcp-serve"]
     assert "mcp__family-wiki__wiki_find" in enabled["allowed_tools"]
 
@@ -153,10 +155,11 @@ def test_merge_combines_web_and_family_without_clobber(tmp_path: Path) -> None:
     )
     merge_mcp_bundle(options, web)
     merge_mcp_bundle(options, family)
-    assert set(options.mcp_servers) == {"firecrawl", SERVER_NAME}
+    assert set(options.mcp_servers) == {"firecrawl", SERVER_NAME, "family-ops"}
     assert options.allowed_tools[0] == "Bash"
     assert "mcp__firecrawl__firecrawl_search" in options.allowed_tools
     assert "mcp__family-skills__skill_search" in options.allowed_tools
+    assert "mcp__family-ops__node_status" in options.allowed_tools
     assert options.disallowed_tools == [
         "AskUserQuestion",
         "WebSearch",
@@ -166,14 +169,14 @@ def test_merge_combines_web_and_family_without_clobber(tmp_path: Path) -> None:
     ]
     assert options.env["FIRECRAWL_API_KEY"] == "fc-test"
     assert "Curated web routing" in options.system_prompt
-    assert "Family skill & wiki lookup" in options.system_prompt
+    assert "Family skill, wiki & ops lookup" in options.system_prompt
 
 
 def test_merge_fails_closed_on_server_name_collision(tmp_path: Path) -> None:
     _install_server(tmp_path)
     family = build_family_mcp(_settings(tmp_path))
     options = SimpleNamespace(
-        mcp_servers={SERVER_NAME: {"type": "stdio"}},
+        mcp_servers={"family-ops": {"type": "stdio"}},
         allowed_tools=[],
         disallowed_tools=[],
         env=None,
@@ -192,8 +195,9 @@ def test_owner_unrestricted_profile_injects_family_servers(
     runtime = _owner_runtime(tmp_path, claude_unrestricted=True)
     options = _build(runtime, tmp_path)
     assert options.setting_sources == []
-    assert set(options.mcp_servers) == {SERVER_NAME}
+    assert set(options.mcp_servers) == {SERVER_NAME, "family-ops"}
     assert "mcp__family-skills__skill_read" in options.allowed_tools
+    assert "mcp__family-ops__node_status" in options.allowed_tools
 
 
 def test_owner_audience_scoped_private_injects_shared_refused(
@@ -210,12 +214,13 @@ def test_owner_audience_scoped_private_injects_shared_refused(
     options = _build(
         ClaudeRuntime(settings=settings), tmp_path, private.claude_environment(settings)
     )
-    assert set(options.mcp_servers) == {SERVER_NAME}
+    assert SERVER_NAME in options.mcp_servers
     server = options.mcp_servers[SERVER_NAME]
     assert server["env"] == {
         "CCC_NODE_ISOLATION_PROFILE": "fleet",
         "CCC_MEMORY_AUDIENCE": "private",
     }
+    assert options.mcp_servers["family-ops"]["env"] == server["env"]
 
     shared = MemoryAudience("shared", "shared", settings.bot_data_dir / "memory-audiences")
     options = _build(
