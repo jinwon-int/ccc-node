@@ -189,6 +189,18 @@ schedule in the system timezone. An explicit `--schedule` or
 `CCC_SKILL_AUTOSAVE_CRON` value is interpreted as a raw host-local cron
 schedule.
 
+Provider lane (#1655): `--provider claude|codex|piri` bakes
+`CCC_SKILL_PROVIDER=…` into the cron line (default: inherit
+`$CCC_SKILL_PROVIDER`, else no provider and the sweep auto-detects as before).
+`--piri-drafting` / `--codex-drafting` bake `CCC_SKILL_PIRI_DRAFTING=1` /
+`CCC_SKILL_CODEX_DRAFTING=1`. piri is explicit-only, so a piri node schedules
+with `--provider piri --piri-drafting`; hand-editing the crontab is no longer
+needed and does not survive a reinstall. Downstream, drafts staged by each
+branch carry their provider in `meta.json`, and autoinstall routes every draft
+to its own install root (claude drafts → `~/.claude/skills`, piri drafts →
+`~/.piri/agent/skills`) within the same run — the autoinstall summary reports
+the routed providers.
+
 ## Telegram notification
 
 The sweep writes a short, redaction-safe summary file into the bridge push
@@ -336,6 +348,19 @@ chmod 600 ~/.claude/state/skill-promotion.enabled
 python3 ~/.claude/hooks/ccc-skill-promotion.py status
 python3 ~/.claude/hooks/ccc-skill-promotion.py run --dry-run
 ```
+
+Providers (#1653): staging scans the provider roots selected by
+`CCC_SKILL_PROMOTION_PROVIDERS` (default `claude,codex`; `piri` is now a valid
+entry). piri nodes opt in explicitly —
+`CCC_SKILL_PROMOTION_PROVIDERS=claude,piri` — and the piri root follows the
+shared path rule (`$PIRI_CODING_AGENT_DIR` or `~/.piri/agent`, plus `/skills`;
+override with `CCC_SKILL_PROMOTION_PIRI_SKILLS_DIR`). The publisher's envelope
+validation and the fleet-skills intake path accept the same provider set, so a
+staged piri candidate publishes as `intake/<node>/piri/<candidate-id>/`. The
+autorepair/revise LLM command defaults to `claude -p --disallowed-tools *`; on
+non-Claude nodes set `CCC_SKILL_REVIEW_LLM_CMD` to that node's neutral LLM
+command, otherwise autorepair fails (and the candidate blocks instead of
+repairing).
 
 `run` never calls GitHub or SSH. It writes a `0600` content-addressed envelope
 under `~/.claude/state/skill-promotion/outbox/`; `export` is a read-only SSH
@@ -704,11 +729,23 @@ each drafting run is an LLM call), `CCC_SKILL_AUTOSAVE_WINDOW_DAYS` (2),
 re-reviewed only after growing this much), `CCC_SKILL_AUTOSAVE_NOTIFY` (1),
 `CCC_SKILL_AUTOSAVE_SETTLE_SECONDS` (90), `CCC_SKILL_AUTOSAVE_MODE`
 (approve|auto, default approve), `CCC_SKILL_AUTOSAVE_DAILY_CAP` (3 — auto-mode
-installs per UTC day), `CCC_SKILL_PROVIDER` (claude|codex, default auto-detect —
-selects the install surface), `CODEX_SKILLS_DIR` (Codex install target override,
-default `${CODEX_HOME:-~/.codex}/skills`),
+installs per UTC day), `CCC_SKILL_PROVIDER` (claude|codex|piri, default
+auto-detect — selects the install surface), `CODEX_SKILLS_DIR` (Codex install
+target override, default `${CODEX_HOME:-~/.codex}/skills`),
 `CCC_CODEX_SKILL_COLLECTOR` (Codex-only candidate collection, default true),
 `CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP` (default 1, range 1–10).
+
+Neutral drafting LLM (#1654): `extract.sh` normally drafts through
+`claude -p --model haiku`. On nodes without the claude CLI (piri/codex lanes,
+non-Anthropic gateways), set `CCC_SKILL_REVIEW_LLM_CMD` to a shell-quoted
+command (the same variable the promotion autorepair path reads): extract
+shlex-splits it, feeds the prompt on stdin, and reads the strict-JSON response
+on stdout. One retry with a strict-JSON reminder follows a malformed response;
+the zai fallback below still applies when its env file exists. Unset keeps the
+historical claude-only flow byte-identical. The drafting prompt is
+runtime-neutral: it labels the category with the active provider and forbids
+`claude -p` / `~/.claude/` / `CLAUDE_*`-style couplings in draft bodies so
+drafts can pass the non-Claude compatibility screens.
 
 Zai fallback (node-local opt-in): when the haiku path yields no valid JSON,
 `claude/hooks/skill-review/extract.sh` retries once against a zai GLM model
