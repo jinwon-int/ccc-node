@@ -22,12 +22,38 @@ MAX_TOTAL="${CCC_MEMORY_MAX_BYTES:-12000}"
 MAX_MEM="${CCC_BUILTIN_MEMORY_MAX_BYTES:-4000}"
 MAX_WIKI="${CCC_WIKI_MAX_BYTES:-5000}"
 MAX_LOCAL="${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}"
-# Skill index (#1145): node skills are plain files the session cannot see, so
-# name-keyword searches miss them (gh-pr-flow sat undiscovered through three
-# round-trips while its description held the exact answer). Inject a bounded
-# name+description index so discovery starts from descriptions, not filenames.
+# Skill index (#1145): node skills were plain files the session could not see,
+# so name-keyword searches missed them (gh-pr-flow sat undiscovered through
+# three round-trips while its description held the exact answer). A bounded
+# name+description index made discovery start from descriptions, not filenames.
+#
+# Default flipped OFF in #1692. The premise no longer holds on either runtime:
+#
+#   Claude Code injects every skill's name AND description for the Skill tool.
+#   Verified in a headless `claude -p` session: the model listed skills with
+#   descriptions and no CCC index involved.
+#
+#   pi (piri) implements the Agent Skills standard natively and loads
+#   ~/.claude/skills when settings name it (packages/coding-agent/docs/skills.md,
+#   "Using Skills from Other Harnesses"). Verified on nosuk: `pi -p` listed
+#   skills that exist only under ~/.claude/skills.
+#
+# So this index duplicates what both runtimes already do -- and does it worse.
+# Names alone run 5,289 bytes on a 140-skill node against a 1,500 byte budget,
+# so descriptions are dropped wholesale and the names-only list is then cut
+# mid-word by the final cap. Roughly 40 of 140 skills survive, alphabetically.
+# The tail is structurally invisible, which is the failure #1081 set out to
+# prevent -- the degrade avoids a tail-drop, the cap after it does not.
+#
+# It is not merely wasted context. A pi session on nosuk answered a question
+# about its own skills with "스킬 인덱스가 ... truncated by CCC memory budget",
+# reporting uncertainty it would not have had without this block: pi had loaded
+# the skills, and the truncated list injected doubt about what it held.
+#
+# The code stays: flip CCC_SKILL_INDEX_ENABLED=1 to restore it on a node whose
+# runtime does not surface skills on its own.
 MAX_SKILLS="${CCC_SKILL_INDEX_MAX_BYTES:-1500}"
-SKILLS_ENABLED="${CCC_SKILL_INDEX_ENABLED:-1}"
+SKILLS_ENABLED="${CCC_SKILL_INDEX_ENABLED:-0}"
 SKILLS_DIR="${CCC_SKILLS_DIR:-${HOME:-/root}/.claude/skills}"
 MAX_RESUME="${CCC_RESUME_MAX_BYTES:-2000}"
 WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
