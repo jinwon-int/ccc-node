@@ -369,7 +369,9 @@ else
   # times out and the next scheduled run picks up whatever landed later.
   SETTLE="${CCC_SKILL_AUTOSAVE_SETTLE_SECONDS:-90}"
   case "$SETTLE" in ''|*[!0-9]*) SETTLE=90 ;; esac
-  if [ $((drafted + codex_drafted)) -gt 0 ] && [ "$SETTLE" -gt 0 ]; then
+  # #1652: the piri branch shares the same pending queue, so a piri-only run
+  # must also settle before the notification counts fresh drafts.
+  if [ $((drafted + codex_drafted + piri_drafted)) -gt 0 ] && [ "$SETTLE" -gt 0 ]; then
     waited=0
     while [ "$waited" -lt "$SETTLE" ]; do
       [ "$(pending_count)" != "$before" ] && break
@@ -377,7 +379,7 @@ else
     done
   fi
   after="$(pending_count)"
-  log "sweep done drafted_sessions=$drafted codex_drafted=$codex_drafted pending_before=$before pending_after=$after"
+  log "sweep done drafted_sessions=$drafted codex_drafted=$codex_drafted piri_drafted=$piri_drafted pending_before=$before pending_after=$after"
 fi
 
 # --- 2b) auto mode (#355): machine-gate + install passing drafts -------------

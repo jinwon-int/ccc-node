@@ -4,6 +4,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Offer a conversation-bound recovery summary and explicit Continue/New/Inspect
+  choices after interrupted Danso tasks or bridge restart (#1667). Preserve
+  original journals, validate choices at dispatch, and consume optional native
+  recovery diagnostics without automatically replaying work.
+
 - Refuse ordinary Termux restart before stopping the live bridge when its
   Python API, dependency fingerprint or runtime checks require preparation
   (#1577). Preserve updater failure reporting and recovery artifacts.

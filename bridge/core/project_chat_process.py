@@ -344,6 +344,7 @@ class ProjectChatProcessMixin:
         sensitive_log_event: Optional[str] = None,
         usage_mode: str = MODE_INTERACTIVE,
         resume_task: bool = False,
+        dispatch_guard: Callable[[], bool] | None = None,
     ) -> ChatResponse:
         del message_id
         # The legacy permission seam (perm: buttons) belonged to the removed
@@ -435,6 +436,7 @@ class ProjectChatProcessMixin:
             interim_message_callback=interim_message_callback,
             usage_mode=usage_mode,
             resume_task=resume_task,
+            dispatch_guard=dispatch_guard,
         )
 
         # One bounded second attempt when the provider never spoke. Retrying is
@@ -491,6 +493,7 @@ class ProjectChatProcessMixin:
             interim_message_callback=interim_message_callback,
             usage_mode=usage_mode,
             resume_task=resume_task,
+            dispatch_guard=dispatch_guard,
             admission_timeout_override=retry_grace,
         )
         if retried.success:
@@ -726,6 +729,7 @@ class ProjectChatProcessMixin:
         usage_mode: str = MODE_INTERACTIVE,
         admission_timeout_override: Optional[float] = None,
         resume_task: bool = False,
+        dispatch_guard: Callable[[], bool] | None = None,
     ) -> ChatResponse:
         """Run one provider-neutral turn without changing the Claude SDK path.
 
@@ -750,6 +754,8 @@ class ProjectChatProcessMixin:
             )
 
         async with self._conversation_turn(user_id, chat_id):
+            if dispatch_guard is not None and not dispatch_guard():
+                return ChatResponse(content="Recovery selection expired; use /task_recover.", success=False)
             loop = asyncio.get_running_loop()
             # Next-turn reclaim of route-bound async completions (#646 slice
             # 3): body-free notice under the conversation lock, before any
@@ -857,11 +863,16 @@ class ProjectChatProcessMixin:
                                 memory_environment=memory_environment,
                             )
                         )
+                        if dispatch_guard is not None and not dispatch_guard():
+                            return ChatResponse(content="Recovery selection expired; use /task_recover.", success=False)
                         recorder = getattr(self, "_session_started_recorder", None)
                         if recorder is not None:
                             # Persist the identity before any tool can execute. A failed
                             # write must abort this turn, never orphan an uncertain journal.
-                            await recorder(user_id, chat_id, session.session_id)
+                            if dispatch_guard is None:
+                                await recorder(user_id, chat_id, session.session_id)
+                            else:
+                                await recorder(user_id, chat_id, session.session_id, dispatch_guard=dispatch_guard)
                         self._agent_session_attachments += 1
                         self._agent_session_registry.put_cached(
                             key,
@@ -1108,6 +1119,11 @@ class ProjectChatProcessMixin:
                 abort_stalled_turn = getattr(session, "abort_stalled_turn", None)
                 if not callable(abort_stalled_turn):
                     abort_stalled_turn = None
+                if dispatch_guard is not None:
+                    setter = getattr(session, "set_dispatch_guard", None)
+                    if not callable(setter) or not dispatch_guard():
+                        return ChatResponse(content="Recovery selection expired or unsupported; use /task_recover.", success=False)
+                    setter(dispatch_guard)
                 if resume_task:
                     authorize_resume = getattr(session, "authorize_task_resume", None)
                     if not callable(authorize_resume):

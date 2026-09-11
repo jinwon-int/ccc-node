@@ -358,6 +358,9 @@ while IFS=$'\t' read -r key _rest; do
   [ "$key" = "2026-09-05T09-00-00-1111-2222" ] && piri_ledgered=1
 done < "$STATE9/skill-autosave.piri-seen"
 ok "piri sweep summary counted one draft" '[ "$piri_ledgered" = 1 ]'
+# #1652: the sweep summary must count piri drafts so the settle window (and the
+# notification step) sees a piri-only run as draft-bearing.
+ok "sweep summary logs piri_drafted" 'grep -q "sweep done drafted_sessions=0 codex_drafted=0 piri_drafted=1" "$STATE9/skill-autosave.log"'
 
 # 9c) rerun without growth: regrowth ledger prevents re-normalization/re-draft.
 # shellcheck disable=SC2034  # log_before9 is read via eval inside ok()

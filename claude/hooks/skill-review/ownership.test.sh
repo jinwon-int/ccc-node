@@ -133,6 +133,16 @@ ok "piri mark-created installs v2 provenance" 'jq -e ".ok == true and .changed =
 ok "piri marker records the piri provider" 'jq -e ".provider == \"piri\" and .ownership == \"autosave-managed\"" "$SKILLS/piri-owned-one/.autosave-meta.json" >/dev/null'
 out="$(tool_piri status piri-owned-one)"
 ok "piri classification is autosave-managed" 'jq -e ".skills[0].classification == \"autosave-managed\"" >/dev/null <<<"$out"'
+# #1656: the read-before-write contract accepts piri end to end — a piri
+# receipt authorizes a piri guard-proposal — while unsupported providers stay
+# rejected at the CLI boundary.
+read_json="$(tool_piri read-target piri-owned-one SKILL.md --attempt-id piri-review-1 --operation patch)"
+ok "piri read-target returns a piri receipt" 'jq -e ".receipt.provider == \"piri\" and .receipt.consumed == false" >/dev/null <<<"$read_json"'
+proposal_from_read "$read_json" "$TMP/piri-proposal.json"
+out="$(tool_piri guard-proposal --proposal "$TMP/piri-proposal.json")"; rc=$?
+ok "piri guard-proposal is authorized" '[ "$rc" = 0 ] && jq -e ".allowed == true and .code == \"authorized\"" >/dev/null <<<"$out"'
+out="$(python3 "$TOOL" --provider danso --skills-dir "$SKILLS" --state-dir "$STATE" status 2>&1)"; rc=$?
+ok "unsupported provider is refused by the CLI" '[ "$rc" != 0 ]'
 
 # V2 ccc-node rollback validation and archive rename share one ownership lock.
 make_skill rollback-one
