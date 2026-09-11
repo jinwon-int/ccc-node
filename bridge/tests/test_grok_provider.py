@@ -20,7 +20,8 @@ from telegram.request import BaseRequest
 from telegram_bot.__main__ import build_context, create_app
 from telegram_bot.core.grok_bot import GrokTelegramBot, _TransportLogFilter
 from telegram_bot.core.grok_protocol import ProtocolError
-from telegram_bot.core.grok_provider import configured_route
+from telegram_bot.core.grok_provider import build_grok_runtime, configured_route
+from telegram_bot.core.grok_ssh import GrokLocalTransport, GrokSshTransport
 from telegram_bot.core.grok_runtime import GrokRuntime
 from telegram_bot.utils.config import Settings
 from test_grok_runtime import AGENT, FakeGrokHost
@@ -70,6 +71,19 @@ class GrokCompositionTests(unittest.TestCase):
         self.assertIsNone(context.project_chat)
         self.assertIsNone(context.distill_journal)
         self.assertEqual(list(self.root.iterdir()), before)
+
+    def test_local_transport_is_selected_on_the_grok_computer(self):
+        settings = configuration(self.root)
+        with patch.dict(os.environ, {"CCC_GROK_TRANSPORT": "local"}, clear=False):
+            runtime = build_grok_runtime(settings)
+        self.assertIsInstance(runtime.transport, GrokLocalTransport)
+        self.assertEqual(runtime.transport.destination, "box@fixture.invalid")
+
+    def test_ssh_transport_remains_when_not_local(self):
+        settings = configuration(self.root)
+        with patch.dict(os.environ, {"CCC_GROK_TRANSPORT": "ssh"}, clear=False):
+            runtime = build_grok_runtime(settings)
+        self.assertIsInstance(runtime.transport, GrokSshTransport)
 
     def test_incomplete_or_wrong_owner_route_never_falls_back(self):
         cases = [{"grok_owner_id": None}, {"grok_telegram_bot_id": 654321},

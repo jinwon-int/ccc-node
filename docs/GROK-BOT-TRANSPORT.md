@@ -90,9 +90,10 @@ not replace the final real-DM/single-poller acceptance.
 - Qualified approval/tool handling. The observed interrupt API is Bot/session
   scoped, not a request-ID CAS; do not race an ownership read with a global
   interrupt or claim that local cancellation stopped remote work.
-- An isolated, allowlisted Telegram integration proof. Do not start a second
-  poller on an existing production token or switch Seoseo's live provider to
-  demonstrate this component.
+- An isolated, allowlisted Telegram integration proof. Canonical poller is on
+  the Grok computer (`CCC_GROK_TRANSPORT=local`). Do not start a second poller
+  on `@jinon_grok_bot`, including a Seoseo hop, or switch Seoseo's live main
+  bridge provider to demonstrate this component.
 
 Tests use generated data. Live synthetic probes verify nonce/echo/request/reply
 binding; an accepted same-nonce retry produced no extra transcript entry. Those

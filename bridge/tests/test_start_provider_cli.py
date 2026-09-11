@@ -36,6 +36,7 @@ def _run(
     process_sandbox: str | None = None,
     process_provider: str | None = None,
     process_danso_cli: str | None = None,
+    grok_transport: str = "",
 ) -> subprocess.CompletedProcess[str]:
     program = "\n".join(
         [
@@ -46,20 +47,22 @@ def _run(
             'CCC_CRUSH_CLI_PATH) printf "%s" "$TEST_CRUSH_CLI" ;; '
             'CCC_DANSO_SANDBOX) printf "%s" "$TEST_DANSO_SANDBOX" ;; '
             'CCC_DANSO_CLI_PATH) printf "%s" "$TEST_DANSO_CLI" ;; '
-            'CCC_PIRI_CLI_PATH) printf "%s" "$TEST_PIRI_CLI" ;; esac; }',
+            'CCC_PIRI_CLI_PATH) printf "%s" "$TEST_PIRI_CLI" ;; '
+            'CCC_GROK_TRANSPORT) printf "%s" "$TEST_GROK_TRANSPORT" ;; esac; }',
             _function_source("maybe_setup_agent_cli"),
             'command() { if [ "${1:-}" = "-v" ] && [ "${2:-}" = "bwrap" ]; then return 1; fi; builtin command "$@"; }' if hide_bwrap else ":",
             "maybe_setup_agent_cli",
         ]
     )
     env = {
-        **{k: v for k, v in os.environ.items() if k not in {"CCC_AGENT_PROVIDER", "CCC_DANSO_CLI_PATH", "CCC_DANSO_SANDBOX"}},
+        **{k: v for k, v in os.environ.items() if k not in {"CCC_AGENT_PROVIDER", "CCC_DANSO_CLI_PATH", "CCC_DANSO_SANDBOX", "CCC_GROK_TRANSPORT"}},
         "TEST_PROVIDER": provider,
         "TEST_CODEX_CLI": codex_cli,
         "TEST_CRUSH_CLI": crush_cli,
         "TEST_PIRI_CLI": piri_cli,
         "TEST_DANSO_CLI": danso_cli,
         "TEST_DANSO_SANDBOX": sandbox,
+        "TEST_GROK_TRANSPORT": grok_transport,
         "CLAUDE_CLI_PATH": "",
         "PATH": f"{tmp_path}:/usr/bin:/bin",
     }
@@ -84,11 +87,17 @@ def test_codex_provider_does_not_require_claude(tmp_path: Path) -> None:
     assert "claude command not found" not in result.stdout
 
 
-def test_grok_provider_needs_ssh_not_claude_cli(tmp_path: Path) -> None:
+def test_grok_provider_defaults_to_local_transport(tmp_path: Path) -> None:
     result = _run(tmp_path, provider="grok")
     assert result.returncode == 0
-    assert "Grok SSH client available" in result.stdout
+    assert "Grok local transport" in result.stdout
     assert "claude command not found" not in result.stdout
+
+
+def test_grok_ssh_transport_needs_ssh_client(tmp_path: Path) -> None:
+    result = _run(tmp_path, provider="grok", grok_transport="ssh")
+    assert result.returncode == 0
+    assert "Grok SSH client available" in result.stdout
 
 
 def test_codex_provider_fails_closed_when_cli_is_missing(tmp_path: Path) -> None:
