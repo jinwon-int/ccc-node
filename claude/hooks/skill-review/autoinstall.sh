@@ -103,6 +103,36 @@ ownership_cmd() {
     "$@"
 }
 
+# #1655: re-interpret the install target from a draft's meta.json provider
+# (recorded by skill-review.sh, #1654). A queued draft can then install into
+# its own provider root even when the sweep process itself runs as another
+# provider (claude-by-default hybrid nodes drafting from piri sessions).
+# Absent/unknown-provider drafts keep the process-level provider; a present
+# but unsupported provider value fails closed. On success the SKILL_PROVIDER
+# / SKILLS_DIR globals point at the draft's target — gate_codex_compat,
+# gate_dedup, ownership_cmd and the install destination all follow them.
+# NOTE: call directly, never in a command substitution — the routed globals
+# must mutate this shell, and a substitution would run the function in a
+# subshell and discard them. Failure reason lands in the ROUTE_ERROR global.
+ROUTE_ERROR=""
+route_draft_provider() { # <draft-dir>
+  ROUTE_ERROR=""
+  local meta_provider=""
+  [ -f "$1/meta.json" ] && meta_provider="$(jq -r '.provider // empty' "$1/meta.json" 2>/dev/null)"
+  case "$meta_provider" in
+    ""|"${SKILL_PROVIDER:-}") return 0 ;;
+    claude|codex|piri) ;;
+    *) ROUTE_ERROR='draft-provider-invalid'; return 1 ;;
+  esac
+  declare -f ccc_skills_dir >/dev/null 2>&1 || return 0
+  SKILL_PROVIDER="$meta_provider"
+  SKILLS_DIR="$(ccc_skills_dir "$SKILL_PROVIDER")"
+  if declare -f ccc_ensure_skills_dir >/dev/null 2>&1; then
+    ccc_ensure_skills_dir "$SKILLS_DIR" || { ROUTE_ERROR='unsafe-skills-dir'; return 1; }
+  fi
+  return 0
+}
+
 resolve_mode() {
   local m="${CCC_SKILL_AUTOSAVE_MODE:-}"
   if [ -z "$m" ] && [ -f "$MODE_FILE" ]; then
@@ -479,6 +509,8 @@ do_run() {
   fi
 
   local work dir id f name desc verdict rec sha sid dest proposal_file action apply_json apply_rc validation_json
+  local base_provider="$SKILL_PROVIDER" base_skills_dir="$SKILLS_DIR"
+  local -a draft_providers=()
   local -a installed=() blocked=() newly_blocked=() would_install=()
   local deferred=0 failed=0 today_used legacy_used incremental_used incremental_cap
   work="$(mktemp -d 2>/dev/null)" || work="$STATE_DIR/.autoinstall-work.$$"
@@ -539,6 +571,18 @@ do_run() {
   while IFS= read -r dir; do
     [ -d "$dir" ] || continue
     id="$(basename "$dir")"
+    # Per-draft provider routing (#1655): reset to the process-level provider,
+    # then re-route from this draft's meta.json. Gates/dedup/ownership/dest
+    # below all read the routed globals.
+    SKILL_PROVIDER="$base_provider"
+    SKILLS_DIR="$base_skills_dir"
+    if ! route_draft_provider "$dir"; then
+      record_block "$dir" "$id" "$ROUTE_ERROR"; continue
+    fi
+    case " ${draft_providers[*]:-} " in
+      *" $SKILL_PROVIDER "*) ;;
+      *) draft_providers+=("$SKILL_PROVIDER") ;;
+    esac
     proposal_file="$dir/proposal.json"
     f="$dir/SKILL.md"
     if [ -f "$proposal_file" ]; then
@@ -720,7 +764,10 @@ do_run() {
     --argjson failed "$failed" \
     --argjson pending "$(pending_count)" \
     --arg autonomy "$AUTONOMY_STATE" \
-    '{mode:"auto", autonomy:$autonomy, installed:$installed, blocked:$blocked,
+    --argjson providers "$(printf '%s\n' "${draft_providers[@]:-}" | jq -R . | jq -sc 'map(select(length>0)) | unique')" \
+    '{mode:"auto", autonomy:$autonomy, providers:$providers,
+      provider:(if ($providers | length) == 1 then $providers[0] else null end),
+      installed:$installed, blocked:$blocked,
       newly_blocked:$newly_blocked, would_install:$would_install,
       dry_run:($autonomy=="dry-run"), deferred:$deferred, failed:$failed, pending:$pending}')"
   printf '%s\n' "$summary"
@@ -900,6 +947,12 @@ do_apply() {
     echo "apply: invalid or missing draft id" >&2
     return 2
   }
+  # Per-draft provider routing (#1655): owner-approved installs follow the
+  # same meta.json provider as the unattended path.
+  if ! route_draft_provider "$dir"; then
+    jq -nc --arg code "$ROUTE_ERROR" '{ok:false,code:$code}'
+    return 2
+  fi
   proposal="$dir/proposal.json"
   if [ ! -f "$proposal" ] || [ -L "$proposal" ] || [ -e "$dir/SKILL.md" ]; then
     echo "apply: draft is not an isolated v2 proposal" >&2

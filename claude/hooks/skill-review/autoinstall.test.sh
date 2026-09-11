@@ -544,5 +544,66 @@ ok "source ref is not mistaken for a URL" '! grep -q "checks.go" <<<"$urls"'
 ok "relative doc path is not mistaken for a URL" '! grep -q "docs/notes.md" <<<"$urls"'
 ok "template placeholder URL is never condemned" '! url_missing "https://github.com/OWNER/REPO/pull/NUM.diff"'
 
+# --- #1655: per-draft provider routing ---------------------------------------
+# A draft carrying meta.json provider=piri (#1654) installs into the piri root
+# while an unmarked draft in the SAME queue keeps the process-level provider;
+# gates (codex-compat screen), the ownership marker and the summary all follow
+# the routed provider.
+PIRI_SKILLS="$TMP/piri-skills"
+mkdir -p "$PIRI_SKILLS"; chmod 700 "$PIRI_SKILLS"
+STATE_ROUTE="$TMP/state-route"; PENDING_ROUTE="$STATE_ROUTE/pending-skills"
+mkdir -m 700 "$STATE_ROUTE" "$PENDING_ROUTE"
+make_draft_in() { # <pending-dir> <id> <name> <description>
+  mkdir -p "$1/$2"
+  printf -- '---\nname: %s\ndescription: %s\n---\n\n# %s\n\n## When to Use\n- Recurring procedure.\n\n## Procedure\n1. Run the checked steps.\n\n## Safety\n- No secrets.\n\n## Verification\n- Output recorded.\n' \
+    "$3" "$4" "$3" > "$1/$2/SKILL.md"
+  jq -nc --arg id "$2" --arg name "$3" \
+    '{id:$id, name:$name, status:"pending", session_id:"sess-route"}' > "$1/$2/meta.json"
+}
+make_draft_in "$PENDING_ROUTE" 20260911-000001-route-piri route-piri-skill "Capture the piri lane recurring log rotation check workflow."
+jq '.provider = "piri"' "$PENDING_ROUTE/20260911-000001-route-piri/meta.json" > "$PENDING_ROUTE/.tmp" \
+  && mv "$PENDING_ROUTE/.tmp" "$PENDING_ROUTE/20260911-000001-route-piri/meta.json"
+chmod 600 "$PENDING_ROUTE/20260911-000001-route-piri/meta.json"
+make_draft_in "$PENDING_ROUTE" 20260911-000002-route-base route-base-skill "Capture the default lane recurring backup verification workflow."
+printf 'auto\n' > "$STATE_ROUTE/skill-autosave.mode"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_ROUTE" CLAUDE_SKILLS_DIR="$SKILLS" PIRI_SKILLS_DIR="$PIRI_SKILLS" \
+  CCC_PUSH_SPOOL="$TMP/spool-route" CCC_NODE=testnode CCC_SKILL_AUTOSAVE_TRIGGER=route bash "$AUTO" run)"
+ok "piri-routed draft installs into the piri root" '[ -f "$PIRI_SKILLS/route-piri-skill/SKILL.md" ]'
+ok "unmarked draft keeps the process-level root" '[ -f "$SKILLS/route-base-skill/SKILL.md" ]'
+ok "piri draft never lands in the default root" '[ ! -e "$SKILLS/route-piri-skill" ]'
+ok "piri marker records the routed provider" \
+  'jq -e ".provider == \"piri\" and .installed_by == \"autosave\"" "$PIRI_SKILLS/route-piri-skill/.autosave-meta.json" >/dev/null'
+ok "summary reports distinct routed providers" 'jq -e ".providers | sort == [\"claude\",\"piri\"]" >/dev/null <<<"$out"'
+ok "summary has no singular provider when the run is mixed" 'jq -e ".provider == null" >/dev/null <<<"$out"'
+ok "ledger records both installs" \
+  'jq -s -e "[.[] | select(.event==\"install\") | .name] | sort == [\"route-base-skill\",\"route-piri-skill\"]" "$STATE_ROUTE/skill-autosave-install.jsonl" >/dev/null'
+
+# A piri-routed draft with a Claude-only coupling stays pending (compat screen
+# follows the routed provider, not the process provider).
+make_draft_in "$PENDING_ROUTE" 20260911-000003-route-claude route-claude-coupled "Capture a recurring claude invocation procedure for review."
+printf '%s\n' 'run: claude -p --model haiku' >> "$PENDING_ROUTE/20260911-000003-route-claude/SKILL.md"
+jq '.provider = "piri"' "$PENDING_ROUTE/20260911-000003-route-claude/meta.json" > "$PENDING_ROUTE/.tmp" \
+  && mv "$PENDING_ROUTE/.tmp" "$PENDING_ROUTE/20260911-000003-route-claude/meta.json"
+chmod 600 "$PENDING_ROUTE/20260911-000003-route-claude/meta.json"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_ROUTE" CLAUDE_SKILLS_DIR="$SKILLS" PIRI_SKILLS_DIR="$PIRI_SKILLS" \
+  CCC_PUSH_SPOOL="$TMP/spool-route" CCC_NODE=testnode CCC_SKILL_AUTOSAVE_TRIGGER=route2 bash "$AUTO" run)"
+ok "coupled piri-routed draft stays pending with codex-incompat" \
+  'jq -e ".blocked[0].reason == \"codex-incompat claude-cli\"" >/dev/null <<<"$out"'
+ok "summary reports single piri provider" 'jq -e ".provider == \"piri\" and .providers == [\"piri\"]" >/dev/null <<<"$out"'
+
+# An unsupported provider value fails closed.
+make_draft_in "$PENDING_ROUTE" 20260911-000004-route-bad route-bad-provider "Capture a recurring workflow with an invalid provider lane."
+jq '.provider = "danso"' "$PENDING_ROUTE/20260911-000004-route-bad/meta.json" > "$PENDING_ROUTE/.tmp" \
+  && mv "$PENDING_ROUTE/.tmp" "$PENDING_ROUTE/20260911-000004-route-bad/meta.json"
+chmod 600 "$PENDING_ROUTE/20260911-000004-route-bad/meta.json"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_ROUTE" CLAUDE_SKILLS_DIR="$SKILLS" PIRI_SKILLS_DIR="$PIRI_SKILLS" \
+  CCC_PUSH_SPOOL="$TMP/spool-route" CCC_NODE=testnode CCC_SKILL_AUTOSAVE_TRIGGER=route3 bash "$AUTO" run)"
+ok "unsupported meta provider fails closed as blocked" \
+  'jq -e ".blocked[] | select(.id == \"20260911-000004-route-bad\" and .reason == \"draft-provider-invalid\")" >/dev/null <<<"$out"'
+ok "unsupported provider draft stays pending" '[ -d "$PENDING_ROUTE/20260911-000004-route-bad" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

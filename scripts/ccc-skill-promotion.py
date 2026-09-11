@@ -33,6 +33,10 @@ import ccc_secure_fs as _secure_fs
 
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+# #1653: single provider vocabulary — the CCC_SKILL_PROMOTION_PROVIDERS set,
+# the scanned provider roots, and the envelope validation must not drift apart
+# (piri was accepted by the installer but rejected here at every layer).
+_PROVIDERS = ("claude", "codex", "piri")
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ALLOWED_SUPPORT_DIRS = {"references", "scripts", "templates"}
@@ -305,7 +309,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         raise PromotionError("base_invalid")
     providers_raw = env.get("CCC_SKILL_PROMOTION_PROVIDERS", "claude,codex")
     providers = tuple(dict.fromkeys(part.strip() for part in providers_raw.split(",") if part.strip()))
-    if not providers or any(provider not in {"claude", "codex"} for provider in providers):
+    if not providers or any(provider not in _PROVIDERS for provider in providers):
         raise PromotionError("providers_invalid")
     enabled_raw = env.get("CCC_SKILL_PROMOTION_ENABLED")
     if enabled_raw is None:
@@ -385,6 +389,14 @@ def _config(environment: dict[str, str] | None = None) -> Config:
                 env.get(
                     "CCC_SKILL_PROMOTION_CODEX_SKILLS_DIR",
                     Path(env.get("CODEX_HOME", home / ".codex")) / "skills",
+                )
+            ).absolute(),
+            # Same path rule as provider.sh / ownership.py / sync (#1653):
+            # $PIRI_CODING_AGENT_DIR (default ~/.piri/agent) + /skills.
+            "piri": Path(
+                env.get(
+                    "CCC_SKILL_PROMOTION_PIRI_SKILLS_DIR",
+                    Path(env.get("PIRI_CODING_AGENT_DIR", home / ".piri" / "agent")) / "skills",
                 )
             ).absolute(),
         },
@@ -1220,7 +1232,7 @@ def _candidate_from_envelope(  # noqa: C901
     transport_id = value.get("transport_id")
     if not isinstance(node, str) or not _NAME_RE.fullmatch(node) or len(node) > 32:
         raise PromotionError("envelope_node_invalid")
-    if provider not in {"claude", "codex"}:
+    if provider not in _PROVIDERS:
         raise PromotionError("envelope_provider_invalid")
     if not isinstance(name, str) or not _NAME_RE.fullmatch(name) or len(name) > 80:
         raise PromotionError("envelope_name_invalid")
