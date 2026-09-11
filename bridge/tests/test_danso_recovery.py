@@ -247,3 +247,114 @@ async def test_audience_change_rejects_before_reading_another_route(tmp_path):
     await bot._handle_danso_recovery(update, data)
     handler.inspect_danso_recovery.assert_not_awaited()
     handler.process_message.assert_not_awaited()
+
+
+# ── #1690: opt: and /task_resume must offer recovery after a Danso failure ──
+
+def opt_update():
+    update = make_update(user_id=7, chat_id=9)
+    update.callback_query = SimpleNamespace(
+        id='cb-1', data='opt:yes', answer=AsyncMock(), edit_message_text=AsyncMock())
+    return update
+
+
+def danso_response(success):
+    return SimpleNamespace(success=success, content='done' if success else 'boom',
+                           has_options=False, streamed=False)
+
+
+def make_app():
+    return SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock(),
+                                               send_chat_action=AsyncMock()))
+
+
+async def setup_opt_bot(tmp_path, response):
+    bot, manager, handler = await setup_bot(tmp_path)
+    session = await manager.get_session('7:9')
+    handler.process_message = AsyncMock(return_value=response)
+    bot._maybe_capture_outside_approval = AsyncMock()
+    bot._switch_provider_if_needed = AsyncMock(return_value=(session, False))
+    bot._effective_session_id = lambda key, current: current.get('session_id')
+    bot.application = make_app()
+    return bot, manager, handler
+
+
+@pytest.mark.anyio
+async def test_opt_failure_offers_recovery_after_the_response_never_recalls(tmp_path):
+    bot, manager, handler = await setup_opt_bot(tmp_path, danso_response(False))
+    order = []
+    bot._send_smart = AsyncMock(side_effect=lambda *a, **k: order.append('send'))
+    handler.inspect_danso_recovery = AsyncMock(
+        side_effect=lambda *a, **k: (order.append('inspect'), snapshot('failed'))[1])
+    await bot._handle_callback(opt_update(), SimpleNamespace(application=bot.application))
+    handler.process_message.assert_awaited_once()
+    assert order == ['send', 'inspect'], 'failure reply must precede the offer'
+    assert OFFER in await manager.get_session('7:9')
+    bot.application.bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_opt_success_and_non_danso_failure_never_offer(tmp_path):
+    bot, manager, handler = await setup_opt_bot(tmp_path, danso_response(True))
+    await bot._handle_callback(opt_update(), SimpleNamespace(application=bot.application))
+    handler.process_message.assert_awaited_once()
+    assert OFFER not in await manager.get_session('7:9')
+    bot.application.bot.send_message.assert_not_awaited()
+
+    claude_manager = make_manager(tmp_path / 'claude', 'claude')
+    await claude_manager.patch_session('7:9', updates={'provider': 'claude', 'session_id': 'sid'})
+    claude_bot = bare_bot(claude_manager, provider='claude', project_chat=SimpleNamespace(
+        process_message=AsyncMock(return_value=danso_response(False)),
+        inspect_danso_recovery=AsyncMock(return_value=snapshot('failed'))))
+    claude_bot._config.danso_long_task_enabled = True
+    claude_bot._config.allowed_user_ids = [7]
+    claude_bot._config.bridge_memory_mode = 'off'
+    claude_bot.application = make_app()
+    claude_bot._save_session_id = AsyncMock()
+    claude_bot._send_smart = AsyncMock()
+    claude_bot._maybe_capture_outside_approval = AsyncMock()
+    claude_bot._effective_session_id = lambda key, current: current.get('session_id')
+    claude_bot._switch_provider_if_needed = AsyncMock(
+        return_value=(await claude_manager.get_session('7:9'), False))
+    claude_bot._enqueue_user_task = bot._enqueue_user_task
+    await claude_bot._handle_callback(opt_update(), SimpleNamespace(application=claude_bot.application))
+    claude_bot._project_chat.process_message.assert_awaited_once()
+    claude_bot._project_chat.inspect_danso_recovery.assert_not_awaited()
+    claude_bot.application.bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_task_resume_failure_offers_recovery_after_the_reply(tmp_path):
+    bot, manager, handler = await setup_bot(tmp_path)
+    handler.process_message = AsyncMock(return_value=danso_response(False))
+    bot._effective_session_id = lambda key, current: current.get('session_id')
+    bot._reply_smart = AsyncMock()
+    bot._tasks = SimpleNamespace(active=Mock(return_value=None))
+    bot._switch_provider_if_needed = AsyncMock(
+        return_value=(await manager.get_session('7:9'), False))
+    await bot._cmd_task_resume(make_update(user_id=7, chat_id=9), SimpleNamespace(args=[]))
+    handler.process_message.assert_awaited_once()
+    assert handler.process_message.await_args.kwargs.get('resume_task') is True
+    bot._reply_smart.assert_awaited_once()
+    assert OFFER in await manager.get_session('7:9')
+    bot.application.bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_task_resume_binding_change_mid_call_never_offers(tmp_path):
+    bot, manager, handler = await setup_bot(tmp_path)
+    bot._effective_session_id = lambda key, current: current.get('session_id')
+
+    async def failing_but_session_moves(**kwargs):
+        await manager.patch_session('7:9', updates={'new_session': True})
+        return danso_response(False)
+
+    handler.process_message = AsyncMock(side_effect=failing_but_session_moves)
+    bot._reply_smart = AsyncMock()
+    bot._tasks = SimpleNamespace(active=Mock(return_value=None))
+    bot._switch_provider_if_needed = AsyncMock(
+        return_value=(await manager.get_session('7:9'), False))
+    await bot._cmd_task_resume(make_update(user_id=7, chat_id=9), SimpleNamespace(args=[]))
+    bot._reply_smart.assert_awaited_once()
+    assert OFFER not in await manager.get_session('7:9')
+    bot.application.bot.send_message.assert_not_awaited()
