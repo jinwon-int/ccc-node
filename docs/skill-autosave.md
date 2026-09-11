@@ -189,6 +189,18 @@ schedule in the system timezone. An explicit `--schedule` or
 `CCC_SKILL_AUTOSAVE_CRON` value is interpreted as a raw host-local cron
 schedule.
 
+Provider lane (#1655): `--provider claude|codex|piri` bakes
+`CCC_SKILL_PROVIDER=…` into the cron line (default: inherit
+`$CCC_SKILL_PROVIDER`, else no provider and the sweep auto-detects as before).
+`--piri-drafting` / `--codex-drafting` bake `CCC_SKILL_PIRI_DRAFTING=1` /
+`CCC_SKILL_CODEX_DRAFTING=1`. piri is explicit-only, so a piri node schedules
+with `--provider piri --piri-drafting`; hand-editing the crontab is no longer
+needed and does not survive a reinstall. Downstream, drafts staged by each
+branch carry their provider in `meta.json`, and autoinstall routes every draft
+to its own install root (claude drafts → `~/.claude/skills`, piri drafts →
+`~/.piri/agent/skills`) within the same run — the autoinstall summary reports
+the routed providers.
+
 ## Telegram notification
 
 The sweep writes a short, redaction-safe summary file into the bridge push
