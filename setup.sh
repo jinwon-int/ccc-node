@@ -585,6 +585,10 @@ run atomic_install "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-s
 # Codex rollout projector for the autosave codex branch (#1353) — installs
 # beside the sweep it serves; opt-in via CCC_SKILL_CODEX_DRAFTING (default off).
 run atomic_install "$SRC/scripts/codex-rollout-normalize.py" "$CLAUDE_DIR/hooks/codex-rollout-normalize.py"
+# Piri session projector for the autosave piri branch (#1652) — same contract as
+# the codex projector above; opt-in via CCC_SKILL_PIRI_DRAFTING (default off).
+# Without it every opted-in sweep logs `piri skipped reason=no-normalizer`.
+run atomic_install "$SRC/scripts/piri-session-normalize.py" "$CLAUDE_DIR/hooks/piri-session-normalize.py"
 # Opt-in autosave skill intake boundary. Nodes stage owner-only outboxes; only
 # the separately enabled central publisher may open private draft intake PRs.
 run atomic_install "$SRC/scripts/ccc-skill-promotion.py" "$CLAUDE_DIR/hooks/ccc-skill-promotion.py"
@@ -665,6 +669,7 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/ccc-memory-benchmark-export.sh"
   "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
   "$CLAUDE_DIR/hooks/codex-rollout-normalize.py"
+  "$CLAUDE_DIR/hooks/piri-session-normalize.py"
   "$CLAUDE_DIR/hooks/ccc-skill-promotion.py"
   "$CLAUDE_DIR/hooks/ccc-fleet-skills-sync.py"
   "$CLAUDE_DIR/hooks/ccc-self-update.sh"

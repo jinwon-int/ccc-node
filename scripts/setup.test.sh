@@ -247,6 +247,8 @@ ok "setup installs the Codex common managed skill set with provenance" \
   '[ -f "$TMP/rewrite-home/.codex/skills/ccc-doctor/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-node-status/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-security-audit/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-agent-cron/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-self-update/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-wiki-record/SKILL.md" ] && jq -e ".manager == \"ccc-node\"" "$TMP/rewrite-home/.codex/skills/ccc-doctor/.ccc-node-managed.json" >/dev/null'
 ok "setup installs the opt-in central skill promoter executable" \
   '[ -x "$rewrite_claude/hooks/ccc-skill-promotion.py" ] && cmp -s "$ROOT/scripts/ccc-skill-promotion.py" "$rewrite_claude/hooks/ccc-skill-promotion.py"'
+ok "setup installs the piri session projector beside the sweep (#1652)" \
+  '[ -x "$rewrite_claude/hooks/piri-session-normalize.py" ] && cmp -s "$ROOT/scripts/piri-session-normalize.py" "$rewrite_claude/hooks/piri-session-normalize.py"'
 ok "setup installs the exact-commit private skill sync executable" \
   '[ -x "$rewrite_claude/hooks/ccc-fleet-skills-sync.py" ] && cmp -s "$ROOT/scripts/ccc-fleet-skills-sync.py" "$rewrite_claude/hooks/ccc-fleet-skills-sync.py"'
 # shellcheck disable=SC2034  # rewrite_agent_cron is read via eval inside ok()
