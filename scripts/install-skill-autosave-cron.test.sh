@@ -200,11 +200,7 @@ rm -f "$CRON_STORE"
 run bash "$SC" --apply
 ok "no provider anywhere omits the assignment" '! grep -qF "CCC_SKILL_PROVIDER" "$CRON_STORE"'
 
-run bash "$SC" --provider danso
-okc "$RC" 2 "invalid provider value exits 2"
-ok "invalid provider is reported" 'grep -q "invalid --provider" "$OUT"'
-
-run bash "$SC" --provider danso
+run bash "$SC" --provider bogus
 okc "$RC" 2 "invalid provider value exits 2"
 ok "invalid provider is reported" 'grep -q "invalid --provider" "$OUT"'
 
@@ -224,9 +220,64 @@ rm -f "$CRON_STORE"
 run bash "$SC" --apply
 ok "no promotion providers anywhere omits the assignment" \
   '! grep -qF "CCC_SKILL_PROMOTION_PROVIDERS" "$CRON_STORE"'
-run bash "$SC" --promotion-providers claude,danso
+run bash "$SC" --promotion-providers claude,bogus
 okc "$RC" 2 "invalid promotion provider member exits 2"
 ok "invalid promotion providers reported" 'grep -q "invalid --promotion-providers" "$OUT"'
+
+# --- #1657 follow-up: the danso lane is baked into the cron line ------------
+# danso is a full provider (#1657 owner decision B) whose install target fails
+# closed without DANSO_SKILLS_DIR/CCC_DANSO_STATE_DIR (#1659): the installer
+# must accept --provider danso, bake the state dir, and warn when it is absent.
+rm -f "$CRON_STORE"
+run bash "$SC" --apply --provider danso --danso-state-dir /var/lib/ccc-danso/gongmyoung --danso-drafting
+okc "$RC" 0 "--provider danso with state dir applies"
+ok "danso provider is baked into the entry" 'grep -qF "CCC_SKILL_PROVIDER=\"danso\"" "$CRON_STORE"'
+ok "danso state dir is baked into the entry" 'grep -qF "CCC_DANSO_STATE_DIR=\"/var/lib/ccc-danso/gongmyoung\"" "$CRON_STORE"'
+ok "danso drafting flag is baked" 'grep -qF "CCC_SKILL_DANSO_DRAFTING=1" "$CRON_STORE"'
+ok "danso lane bakes no absence warning" '! grep -q "danso lane without a state dir" "$OUT"'
+ok "record argv carries the danso options" \
+  'jq -e "[(.argv | index(\"--provider\")), (.argv | index(\"danso\")), (.argv | index(\"--danso-state-dir\")), (.argv | index(\"/var/lib/ccc-danso/gongmyoung\")), (.argv | index(\"--danso-drafting\"))] | all(. != null)" "$REC" >/dev/null'
+
+# provider=danso without any state dir must install (the sweep still refreshes
+# candidates) but warn loudly that the danso lane will fail closed (#1659).
+rm -f "$CRON_STORE"
+run env -u CCC_DANSO_STATE_DIR bash "$SC" --apply --provider danso
+okc "$RC" 0 "--provider danso without state dir still installs"
+ok "missing danso state dir warns at install time" 'grep -q "danso lane without a state dir" "$OUT"'
+ok "no state dir means no CCC_DANSO_STATE_DIR assignment" '! grep -qF "CCC_DANSO_STATE_DIR" "$CRON_STORE"'
+
+# CCC_DANSO_STATE_DIR is inherited when --danso-state-dir is unset.
+rm -f "$CRON_STORE"
+run env CCC_DANSO_STATE_DIR=/var/lib/ccc-danso/gongmyoung bash "$SC" --apply --provider danso
+ok "danso state dir is inherited from env" \
+  'grep -qF "CCC_DANSO_STATE_DIR=\"/var/lib/ccc-danso/gongmyoung\"" "$CRON_STORE"'
+
+# Relative or metacharacter-carrying paths are rejected: the value is baked
+# inside a double-quoted segment of the cron line, and anything else would
+# break or inject into the rendered entry.
+run bash "$SC" --danso-state-dir relative/path
+okc "$RC" 2 "relative --danso-state-dir exits 2"
+ok "relative danso state dir is reported" 'grep -q "invalid --danso-state-dir" "$OUT"'
+run bash "$SC" --danso-state-dir '/tmp/x"y'
+okc "$RC" 2 "double-quote --danso-state-dir exits 2"
+ok "double-quote danso state dir is reported" 'grep -q "invalid --danso-state-dir" "$OUT"'
+run bash "$SC" --danso-state-dir '/tmp/$y'
+okc "$RC" 2 "dollar --danso-state-dir exits 2"
+run env CCC_DANSO_STATE_DIR='not-absolute' bash "$SC" --apply
+okc "$RC" 0 "invalid inherited danso state dir does not block install"
+ok "invalid inherited danso state dir warns" 'grep -q "ignoring invalid inherited CCC_DANSO_STATE_DIR" "$OUT"'
+ok "invalid inherited danso state dir is omitted" '! grep -qF "CCC_DANSO_STATE_DIR" "$CRON_STORE"'
+
+# danso joins the promotion staging vocabulary.
+rm -f "$CRON_STORE"
+run bash "$SC" --apply --promotion-providers claude,danso
+okc "$RC" 0 "--promotion-providers with danso applies"
+ok "danso promotion providers baked into the entry" \
+  'grep -qF "CCC_SKILL_PROMOTION_PROVIDERS=\"claude,danso\"" "$CRON_STORE"'
+rm -f "$CRON_STORE"
+run env CCC_SKILL_PROMOTION_PROVIDERS=danso bash "$SC" --apply
+ok "danso promotion providers inherited from env" \
+  'grep -qF "CCC_SKILL_PROMOTION_PROVIDERS=\"danso\"" "$CRON_STORE"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
