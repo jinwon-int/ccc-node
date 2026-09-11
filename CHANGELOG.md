@@ -4,6 +4,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Add `task_status` as one read-only recovery call behind a JSON CLI
+  (`scripts/ccc-task-status.py`) and a second `family-ops` MCP tool: the
+  agent checkpoint (working-state), resume note, and external wait promises
+  (active pending / dropped) with bounded content, observation time, and
+  section-scoped unknown on partial failure (#1694 item 2).
+
+
 - Add `node_status` as one aggregated read-only call behind a JSON CLI
   (`scripts/ccc-node-status.py`) and the new `family-ops` stdio MCP tool,
   reusing ccc-bridge-locate, `bridge/start.sh --status` and agent-cron
