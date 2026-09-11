@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """``family-ops`` — read-only fleet/node operations MCP server (#1694).
 
-First tool: ``node_status`` — one call aggregating serving-checkout state,
+Tools: ``node_status`` — one call aggregating serving-checkout state,
 bridge service/transport health and scheduler occupancy for this node, or a
-peer node over ssh.  Shares the stdio scaffolding with ``family-skills``;
-stdlib-only, runs under any python3:
+peer node over ssh; ``task_status`` — checkpoint/resume/wait-promise
+recovery aggregation; ``pr_readiness`` — pre-merge lookup snapshot for one
+pull request via the node's authenticated gh.  Shares the stdio scaffolding
+with ``family-skills``; stdlib-only, runs under any python3:
 
     python3 <repo>/bridge/core/family_ops_server.py
 
@@ -34,6 +36,7 @@ try:
         tool_result,
     )
     from telegram_bot.core.node_status import NodeStatusError, node_status  # noqa: E402
+    from telegram_bot.core.pr_readiness import PrReadinessError, collect as collect_pr_readiness  # noqa: E402
     from telegram_bot.core.skill_lookup import policy_denial  # noqa: E402
     from telegram_bot.core.task_status import TaskStatusError, collect as collect_task_status  # noqa: E402
 except ImportError:  # pragma: no cover - worktree aliasing only
@@ -44,6 +47,7 @@ except ImportError:  # pragma: no cover - worktree aliasing only
         tool_result,
     )
     from node_status import NodeStatusError, node_status  # noqa: E402  # type: ignore[no-redef]
+    from pr_readiness import PrReadinessError, collect as collect_pr_readiness  # noqa: E402  # type: ignore[no-redef]
     from skill_lookup import policy_denial  # noqa: E402  # type: ignore[no-redef]
     from task_status import TaskStatusError, collect as collect_task_status  # noqa: E402  # type: ignore[no-redef]
 
@@ -70,7 +74,28 @@ _TASK_STATUS_SCHEMA = {
     "additionalProperties": False,
 }
 
+_PR_READINESS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "repo": {"type": "string", "description": "GitHub repository as OWNER/REPO."},
+        "pr": {"type": "integer", "description": "Pull request number."},
+    },
+    "required": ["repo", "pr"],
+    "additionalProperties": False,
+}
+
 _TOOLS = [
+    {
+        "name": "pr_readiness",
+        "description": (
+            "Read-only pre-merge PR readiness for one OWNER/REPO pull request: "
+            "head sha/mergeability, CI rollup counted with the gh-pr-flow relay "
+            "gate rule, latest reviews (non-author, head-matched approvals), and "
+            "unresolved review threads. Informational snapshot; never a "
+            "substitute for approvals or merge-time re-verification."
+        ),
+        "inputSchema": _PR_READINESS_SCHEMA,
+    },
     {
         "name": "task_status",
         "description": (
@@ -110,6 +135,19 @@ def _dispatch(name: str, arguments: Any) -> dict[str, Any]:
         except TaskStatusError as error:
             raise ToolError(error.code, str(error), **error.details) from error
         _diag(f"call task_status ok status={result.get('status')}")
+        return tool_result(result)
+    if name == "pr_readiness":
+        repo = arguments.get("repo")
+        pr = arguments.get("pr")
+        if not isinstance(repo, str) or not repo.strip():
+            raise ToolError("invalid_repo", "repo must be a non-empty OWNER/REPO string")
+        if isinstance(pr, bool) or not isinstance(pr, int):
+            raise ToolError("invalid_pr", "pr must be an integer")
+        try:
+            result = collect_pr_readiness(repo, pr)
+        except PrReadinessError as error:
+            raise ToolError(error.code, str(error), **error.details) from error
+        _diag(f"call pr_readiness ok repo={repo} pr={pr} status={result.get('status')}")
         return tool_result(result)
     if name != "node_status":
         raise ToolError("unknown_tool", f"unknown tool: {name}")
