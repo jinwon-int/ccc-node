@@ -231,7 +231,7 @@ class SkillCandidateInventoryBuilder:
         cls,
         environment: dict[str, str] | None = None,
         *,
-        provider: Literal["codex", "piri"] = "codex",
+        provider: Literal["codex", "piri", "danso"] = "codex",
     ) -> "SkillCandidateInventoryBuilder":
         env = dict(os.environ if environment is None else environment)
         home = Path(env.get("HOME", "/root"))
@@ -240,6 +240,15 @@ class SkillCandidateInventoryBuilder:
         if provider == "piri":
             piri_agent = Path(env.get("PIRI_CODING_AGENT_DIR", home / ".piri" / "agent"))
             skills_dir = Path(env.get("PIRI_SKILLS_DIR", piri_agent / "skills"))
+        elif provider == "danso":
+            # #1659/#1662 contract: explicit DANSO_SKILLS_DIR wins, then the
+            # bridge-fixed danso HOME. Unresolvable = inventory error (the
+            # caller fail-closes with skill_candidate_inventory_failed).
+            danso_state = env.get("CCC_DANSO_STATE_DIR", "")
+            danso_env = env.get("DANSO_SKILLS_DIR", "")
+            if not danso_env and not danso_state:
+                raise ValueError("danso skills dir unresolved")
+            skills_dir = Path(danso_env or f"{danso_state}/home/.pi/agent/skills")
         else:
             skills_dir = Path(env.get("CODEX_SKILLS_DIR", codex_home / "skills"))
         return cls(

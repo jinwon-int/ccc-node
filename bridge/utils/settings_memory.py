@@ -50,6 +50,16 @@ class MemorySettingsMixin:
             "false for an immediate node-local opt-out."
         ),
     )
+    danso_skill_collector_enabled: bool = Field(
+        default=True,
+        alias="CCC_DANSO_SKILL_COLLECTOR",
+        description=(
+            "On Danso nodes, drive the skill-candidate collector from distill "
+            "journal snapshots and stage pending drafts for the provider-aware "
+            "installer (mirrors CCC_CODEX_SKILL_COLLECTOR). Default on; set "
+            "false for an immediate node-local opt-out."
+        ),
+    )
     codex_skill_collector_max_jobs_per_sweep: int = Field(
         default=1,
         ge=1,
