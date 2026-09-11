@@ -99,6 +99,9 @@ hooks="$home/.claude/hooks/nunchi"
 state="$home/.claude/state"
 mkdir -p "$hooks" "$state" "$home/.nunchi"
 cp "$ROOT/claude/hooks/nunchi/ingest-cron.sh" "$hooks/ingest-cron.sh"
+# The shared tick writer (#1698). Every feed refuses to run without it rather
+# than ticking while ingesting nothing, so it is not optional in a fixture.
+cp "$ROOT/claude/hooks/nunchi/feed-common.sh" "$hooks/feed-common.sh"
 cp "$ADAPTER" "$hooks/bridge-journal.py"
 chmod 700 "$hooks/ingest-cron.sh"
 printf 'on' > "$state/nunchi.mode"

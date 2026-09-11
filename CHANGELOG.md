@@ -19,6 +19,21 @@ All notable changes to the Claude Code node harness. Dates are KST.
   (active pending / dropped) with bounded content, observation time, and
   section-scoped unknown on partial failure (#1694 item 2).
 
+- Give Danso-provider nodes a nunchi feed and make feed/provider drift visible
+  (#1698). `install-nunchi.sh` only knew the claude/codex/piri lanes, so a node
+  that moved to `CCC_AGENT_PROVIDER=danso` kept running its previous feed
+  against an input that never fills again — every tick reported `ingested: 0`,
+  exited 0 and looked healthy, leaving gongmyoung 6 days and soonwook 43 days
+  without a new fact. New `hooks/nunchi/danso-feed.sh` mirrors the bridge's
+  own `danso-distill-journal` through the existing `bridge-journal.py` adapter
+  at zero LLM cost (re-extracting the raw native journals would have needed
+  Danso credentials in cron), and reports an absent journal as
+  `skipped: distill-journal-missing` instead of a silent zero. All four lanes
+  now share one tick writer (`hooks/nunchi/feed-common.sh`) that records
+  `feed_provider` and `feed_provider_mismatch`, resolved at runtime rather than
+  pinned into cron so the drift can actually be observed; `ccc-doctor` reports
+  both as nunchi-collection findings, and installer auto-detection consults
+  `CCC_AGENT_PROVIDER` before probing the bridge.
 
 - Add `node_status` as one aggregated read-only call behind a JSON CLI
   (`scripts/ccc-node-status.py`) and the new `family-ops` stdio MCP tool,

@@ -93,7 +93,11 @@ CCC_STATE_DIR="$STATE" NUNCHI_HOME="$PN2" PIR_SESSIONS_DIR="$PS2" CCC_CLAUDE_DIR
 pf_rc=$?
 ok "piri feed resolves the harness launcher when env and PATH are empty" '[ "$pf_rc" = 0 ] && ! grep -q "not runnable" "$TMP/pf2.err"'
 ok "resolved-launcher run writes a normal (unskipped) tick" 'jq -e ".schema == \"ccc.nunchi.ingest.v1\" and .feed == \"piri\" and (has(\"skipped\") | not)" "$PN2/ingest.status.json" >/dev/null'
-ok "piri feed carries the same tick writer" 'grep -q "ccc.nunchi.ingest.v1" "$ROOT/claude/hooks/nunchi/piri-feed.sh" && grep -q "\"feed\":\"%s\"" "$ROOT/claude/hooks/nunchi/piri-feed.sh"'
+# Both feeds must emit the identical tick shape. Since #1698 that is structural
+# rather than a duplicated printf: one helper owns the schema and every lane
+# calls it, so the two can no longer drift apart the way the claude lane did
+# (it silently shipped without a `feed` key).
+ok "piri feed carries the same tick writer" 'grep -q "nunchi_write_status" "$ROOT/claude/hooks/nunchi/piri-feed.sh" && grep -q "nunchi_write_status" "$ROOT/claude/hooks/nunchi/codex-feed.sh" && grep -q "\"feed\":\"%s\"" "$ROOT/claude/hooks/nunchi/feed-common.sh"'
 ok "stale lane process is swept at feed start" '! kill -0 "$stale_pid" 2>/dev/null'
 # shellcheck disable=SC2034  # lane_pid is read via eval inside ok()
 lane_pid="$(tail -n 1 "$pid_file" 2>/dev/null || true)"

@@ -15,8 +15,8 @@ umask 077
 provider="${1:-}"
 target="${2:-}"
 case "$provider" in
-  claude|codex|piri) ;;
-  *) echo "usage: mempalace-refresh.sh <claude|codex|piri> <transcript-dir>" >&2; exit 2 ;;
+  claude|codex|piri|danso) ;;
+  *) echo "usage: mempalace-refresh.sh <claude|codex|piri|danso> <transcript-dir>" >&2; exit 2 ;;
 esac
 
 state_dir="${CCC_STATE_DIR:-$HOME/.claude/state}"
@@ -232,6 +232,12 @@ if [ "$provider" = codex ]; then
 elif [ "$provider" = piri ]; then
   "$timeout_cli" -k 30s "$timeout_sec" "$mp" mine "$target" --mode convos --wing piri
 else
+  # claude and danso both take the generic sweep. Danso journals are byte-for-byte
+  # the Pi v3 shape piri uses (bridge/memory/danso_snapshot.py delegates message
+  # extraction to piri_snapshot._collect_messages), but `mine --wing danso` is not
+  # a verified mempalace wing, and mining them as `piri` would misattribute every
+  # fact. Accepting the provider here is what keeps the hourly cron from failing
+  # `usage` on a Danso node (#1698); a real danso wing is separate work.
   "$timeout_cli" -k 30s "$timeout_sec" "$mp" sweep "$target"
 fi
 rc=$?

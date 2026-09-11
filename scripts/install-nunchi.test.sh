@@ -29,7 +29,7 @@ cron_store="$TMP/crontab"
 piri_sessions="$home/.piri/agent/sessions"
 mkdir -p "$hooks/nunchi" "$state" "$codex_home/sessions" "$piri_sessions" \
   "$home/.claude/projects" "$home/.local/bin" "$nunchi_home" "$fake_bin"
-cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,wiki-promote.py,judge-verdict.schema.json,codex-feed.sh,piri-feed.sh,ingest-cron.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
+cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,wiki-promote.py,judge-verdict.schema.json,codex-feed.sh,piri-feed.sh,danso-feed.sh,ingest-cron.sh,bridge-journal.py,feed-common.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
 cp "$ROOT/claude/hooks/scan-injection.sh" "$hooks/scan-injection.sh"
 # setup.sh installs bridge/utils/secure_fs.py verbatim as hooks/ccc_secure_fs.py;
 # nunchi.py/judge-batch.py/wiki-promote.py import it from the hooks root (#1508),
@@ -252,6 +252,44 @@ ok "Piri refresh uses the conversation miner attributed to the piri wing" \
 out="$(run_install 2>&1)"; rc=$?
 ok "non-scoped status keeps reading the node-global collection status file" \
   '[ "$rc" = 0 ] && grep -q "^collection: state=ok exit_code=0 finished_at=" <<<"$out"'
+
+# Danso lane (#1698). Before this, --danso did not exist and auto-detection
+# never consulted CCC_AGENT_PROVIDER, so a Danso node silently kept whichever
+# feed predated the switch — gongmyoung 6 days, soonwook 43 days at ingested:0.
+out="$(run_install --apply --danso 2>&1)"; rc=$?
+ok "--apply --danso installs the danso feed lane" \
+  '[ "$rc" = 0 ] && grep -q "danso-feed.sh" "$cron_store" && ! grep -q "piri-feed.sh\|codex-feed.sh\|ingest-cron.sh" "$cron_store"'
+ok "danso status reports the configured lane" \
+  'grep -q "^provider: configured=danso " <<<"$(run_install 2>&1)"'
+# CCC_DANSO_STATE_DIR is unset here, so the sweep dir is absent and the hourly
+# refresh is skipped rather than wired to a wrong tree.
+ok "danso apply skips the mempalace refresh without a declared state dir" \
+  '! grep -q "mempalace-refresh.sh danso" "$cron_store"'
+# mempalace-refresh must still ACCEPT danso, or a node that does declare a state
+# dir would fail `usage` every hour.
+CCC_TEST_MEMPALACE_CAPTURE="$TMP/danso-refresh.args" HOME="$home" \
+  PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" \
+  CCC_NUNCHI_MEMPALACE_CLI="$home/.local/bin/mempalace" \
+  bash "$hooks/nunchi/mempalace-refresh.sh" danso "$piri_sessions" >/dev/null 2>&1; rc=$?
+ok "danso refresh is accepted and takes the generic sweep (no verified wing)" \
+  '[ "$rc" = 0 ] && grep -qx "sweep $piri_sessions" "$TMP/danso-refresh.args"'
+
+# Auto-detection must honour the node's own declaration before probing.
+out="$(env "${common_env[@]}" CCC_AGENT_PROVIDER=danso \
+  bash "$ROOT/scripts/install-nunchi.sh" --apply 2>&1)"; rc=$?
+ok "auto-detection resolves the danso lane from CCC_AGENT_PROVIDER" \
+  '[ "$rc" = 0 ] && grep -q "danso-feed.sh" "$cron_store"'
+out="$(env "${common_env[@]}" CCC_AGENT_PROVIDER=piri \
+  bash "$ROOT/scripts/install-nunchi.sh" --apply 2>&1)"; rc=$?
+ok "re-applying after a provider switch moves the lane" \
+  '[ "$rc" = 0 ] && grep -q "piri-feed.sh" "$cron_store" && ! grep -q "danso-feed.sh" "$cron_store"'
+# A provider with no feed lane must not be mistaken for one; detection falls
+# through to the historical probes instead of inventing a grok-feed.sh.
+out="$(env "${common_env[@]}" CCC_AGENT_PROVIDER=grok \
+  bash "$ROOT/scripts/install-nunchi.sh" --apply 2>&1)"; rc=$?
+ok "a provider without a feed lane falls through to probing" \
+  '[ "$rc" = 0 ] && ! grep -q "grok" "$cron_store"'
+run_install --apply --piri >/dev/null 2>&1
 
 # Audience-scoped Piri collection: canonical opaque direct children only,
 # with one Nunchi store and one MemPalace HOME per audience.

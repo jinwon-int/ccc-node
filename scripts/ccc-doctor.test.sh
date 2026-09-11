@@ -930,6 +930,30 @@ ok "claude lane without ingest.status.json is a 경고 (ingest-status-missing)" 
 nc="$(run_nc claude "$claude_cron" "$ok_json" "$nbin/mempalace" "" "$stale_ingest")"
 ok "stale ingest tick on the claude lane is a 경고 (ingest-tick-stale)" \
   'jq -e ".klass == \"경고\" and (.status | contains(\"ingest-tick-stale\"))" <<<"$nc" >/dev/null'
+# #1698: a fresh tick is not proof of a working lane. After a provider switch
+# the OLD feed keeps running, exits 0 and ticks on schedule against an input
+# that never fills again — gongmyoung sat 6 days and soonwook 43 days at
+# ingested:0 while every check read 정상. The feeds now state the drift in their
+# own tick and the doctor must surface it, plus any skip reason.
+danso_cron='*/10 * * * * bash /h/.claude/hooks/nunchi/danso-feed.sh >> /log 2>&1 # nunchi:#816'
+nc="$(run_nc danso "$danso_cron" "" "$nbin/mempalace" "" "$fresh_ingest")"
+ok "the danso feed lane is recognised (configured=danso, match=ok)" \
+  'jq -e ".status | contains(\"configured=danso\") and contains(\"match=ok\")" <<<"$nc" >/dev/null'
+nc="$(run_nc danso "$danso_cron" "" "$nbin/mempalace")"
+ok "danso lane without ingest.status.json is a 경고 (ingest-status-missing)" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"ingest-status-missing\"))" <<<"$nc" >/dev/null'
+mismatch_ingest='{"schema":"ccc.nunchi.ingest.v1","finished_at":'"$nc_now"',"sources":9,"ingested":0,"retired":0,"deferred":0,"feed":"piri","feed_provider":"danso","feed_provider_mismatch":true}'
+nc="$(run_nc danso "$piri_cron" "$ok_json" "$nbin/mempalace" "" "$mismatch_ingest")"
+ok "a fresh tick that reports feed/provider drift is a 경고, not 정상" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"feed-provider-mismatch(feed=piri provider=danso)\"))" <<<"$nc" >/dev/null'
+skipped_ingest='{"schema":"ccc.nunchi.ingest.v1","finished_at":'"$nc_now"',"sources":0,"ingested":0,"retired":0,"deferred":0,"feed":"danso","skipped":"distill-journal-missing"}'
+nc="$(run_nc danso "$danso_cron" "$ok_json" "$nbin/mempalace" "" "$skipped_ingest")"
+ok "a lane that ticked but skipped its work reports the reason (경고)" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"ingest-skipped(distill-journal-missing)\"))" <<<"$nc" >/dev/null'
+nc="$(run_nc claude "$claude_cron" "$ok_json" "$nbin/mempalace" "" "$fresh_ingest")"
+ok "a tick with no drift or skip fields stays 정상" \
+  'jq -e ".klass == \"정상\" and (.status | contains(\"feed-provider-mismatch\") or contains(\"ingest-skipped\") | not)" <<<"$nc" >/dev/null'
+
 nc="$(CCC_NUNCHI_SWEEP_STALE_MIN=0 run_nc codex "$codex_cron" "$stale_json" "$nbin/mempalace")"
 ok "CCC_NUNCHI_SWEEP_STALE_MIN=0 disables the sweep age gate (정상)" \
   'jq -e ".klass == \"정상\" and (.status | contains(\"STALE\") | not)" <<<"$nc" >/dev/null'
