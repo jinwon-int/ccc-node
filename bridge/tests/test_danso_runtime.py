@@ -1736,3 +1736,34 @@ async def test_recovery_dispatch_guard_rechecked_after_native_preparation(config
     assert any(getattr(event, 'code', '') == 'danso_recovery_stale' for event in events)
     assert not (Path(configured.danso_workspace) / 'argv.json').exists()
     assert not (runtime.root / (session.session_id + '.jsonl')).exists()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('wrong_session', [False, True])
+async def test_recovery_status_uses_private_home_and_exact_session(configured, tmp_path, monkeypatch, wrong_session):
+    binary = Path(configured.danso_cli_path)
+    captured = tmp_path / 'status-environment.json'
+    source = binary.read_text().replace(
+        "if '--task-status' in args:\n",
+        "if '--task-status' in args:\n"
+        f" Path({str(captured)!r}).write_text(json.dumps(dict(os.environ)))\n",
+    )
+    if wrong_session:
+        source = source.replace("'session_id':session.stem", "'session_id':'00000000-0000-4000-8000-000000000001'")
+    binary.write_text(source)
+    monkeypatch.setenv('HOME', str(tmp_path / 'global-home'))
+    monkeypatch.setenv('OPENAI_API_KEY', 'must-not-reach-status')
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    if wrong_session:
+        with pytest.raises(ValueError, match='task status session mismatch'):
+            await session._read_task_status()
+    else:
+        status = await session._read_task_status()
+        assert status.session_id == session.session_id
+        assert status.resume_allowed
+    environment = json.loads(captured.read_text())
+    assert environment['HOME'] == str(Path(configured.danso_state_dir) / 'home')
+    assert set(environment) <= {'HOME', 'PATH', 'LC_CTYPE'}
+    assert not (Path(configured.danso_workspace) / 'argv.json').exists()
+    assert not (runtime.root / (session.session_id + '.jsonl')).exists()

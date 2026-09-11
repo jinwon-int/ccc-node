@@ -130,6 +130,7 @@ TASK_STATUS_USAGE_KEYS = {'requests', 'reported_tokens'}
 
 @dataclass(frozen=True)
 class _TaskStatus:
+    session_id: str
     state: str
     stage: int
     wall_seconds: int
@@ -200,6 +201,7 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
         else:
             raise ValueError('invalid task status pending')
     return _TaskStatus(
+        session_id=data['session_id'],
         state=data['state'], stage=data['stage'], elapsed_ms=data['elapsed_ms'],
         resume_allowed=data['resume_allowed'], **values, **usage_values,
     )
@@ -599,7 +601,7 @@ class DansoSession:
         command = [r.binary, '--task-status', '--session', str(journal)]
         spawn = asyncio.create_task(asyncio.create_subprocess_exec(
             *command, cwd=self.cwd,
-            env={'PATH': os.defpath, 'HOME': str(Path.home())},
+            env={'PATH': os.defpath, 'HOME': r.environment['HOME']},
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -634,7 +636,10 @@ class DansoSession:
             data = json.loads(stdout.decode('utf-8'), object_pairs_hook=_unique_object)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise ValueError('invalid task status') from exc
-        return _task_status(data)
+        status = _task_status(data)
+        if status.session_id != self.session_id:
+            raise ValueError('task status session mismatch')
+        return status
 
     async def send_turn(self, message, *, approval_handler=deny_approval):  # noqa: C901 -- subprocess lifecycle and terminal event mapping
         async with self._lock:
