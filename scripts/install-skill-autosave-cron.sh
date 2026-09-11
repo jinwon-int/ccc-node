@@ -46,6 +46,10 @@ OPT_NODE=""
 OPT_PROVIDER=""
 OPT_PIRI_DRAFTING=0
 OPT_CODEX_DRAFTING=0
+# #1653 follow-up: bake the promotion staging provider set so the scheduled
+# sweep stages piri (or any non-default) candidates without hand-edited
+# crontabs. Validated against the promoter's own _PROVIDERS vocabulary.
+OPT_PROMOTION_PROVIDERS=""
 
 # Shared installer libs (#1081, #1077): gen stamps + records, and the common
 # crontab install/remove driver.
@@ -181,10 +185,18 @@ Options:
   --piri-drafting  Bake CCC_SKILL_PIRI_DRAFTING=1 into the entry (opt-in piri
                    sweep branch; mirrors the codex flag below).
   --codex-drafting Bake CCC_SKILL_CODEX_DRAFTING=1 into the entry.
+  --promotion-providers LIST
+                   Bake CCC_SKILL_PROMOTION_PROVIDERS=LIST (comma-separated,
+                   each of claude|codex|piri) into the entry so scheduled
+                   promotion staging scans those provider roots. Defaults to
+                   \$CCC_SKILL_PROMOTION_PROVIDERS when set; otherwise omitted
+                   (the promoter default claude,codex applies). piri nodes
+                   wanting daily piri staging pass claude,piri.
 
 Env overrides: CCC_CLAUDE_DIR, CCC_STATE_DIR, CCC_SKILL_AUTOSAVE_CMD,
 CCC_SKILL_AUTOSAVE_CRON, CCC_SKILL_AUTOSAVE_CRON_LOG, CCC_CRONTAB_CMD,
-CCC_SKILL_PROVIDER (inherited as the baked provider when --provider is unset).
+CCC_SKILL_PROVIDER (inherited as the baked provider when --provider is unset),
+CCC_SKILL_PROMOTION_PROVIDERS (inherited when --promotion-providers is unset).
 CCC_SKILL_AUTOSAVE_LOCAL_TIMEZONE and CCC_SKILL_AUTOSAVE_LOCAL_UTC_OFFSET
 (+HHMM/-HHMM) are advanced deterministic overrides for image builds and
 tests; normal installs auto-detect both.
@@ -207,6 +219,20 @@ while [ $# -gt 0 ]; do
       shift ;;
     --piri-drafting) OPT_PIRI_DRAFTING=1 ;;
     --codex-drafting) OPT_CODEX_DRAFTING=1 ;;
+    --promotion-providers)
+      ccc_cron_need_val "$1" "${2:-}"
+      _pp_ok=1
+      IFS=',' read -ra _pp_parts <<<"$2"
+      for _pp in "${_pp_parts[@]}"; do
+        case "$_pp" in
+          claude|codex|piri) ;;
+          *) _pp_ok=0; break ;;
+        esac
+      done
+      [ "$_pp_ok" = 1 ] || { echo "invalid --promotion-providers '$2' (comma list of claude|codex|piri)" >&2; exit 2; }
+      unset _pp_ok _pp_parts _pp
+      OPT_PROMOTION_PROVIDERS="$2"
+      shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -241,6 +267,21 @@ fi
 [ -n "$CRON_PROVIDER" ] && CRON_ENV="$CRON_ENV CCC_SKILL_PROVIDER=\"$CRON_PROVIDER\""
 [ "$OPT_PIRI_DRAFTING" = 1 ] && CRON_ENV="$CRON_ENV CCC_SKILL_PIRI_DRAFTING=1"
 [ "$OPT_CODEX_DRAFTING" = 1 ] && CRON_ENV="$CRON_ENV CCC_SKILL_CODEX_DRAFTING=1"
+# --promotion-providers > inherited \$CCC_SKILL_PROMOTION_PROVIDERS > omitted
+CRON_PROMOTION_PROVIDERS="$OPT_PROMOTION_PROVIDERS"
+if [ -z "$CRON_PROMOTION_PROVIDERS" ] && [ -n "${CCC_SKILL_PROMOTION_PROVIDERS:-}" ]; then
+  _pp_inherit_ok=1
+  IFS=',' read -ra _pp_parts <<<"$CCC_SKILL_PROMOTION_PROVIDERS"
+  for _pp in "${_pp_parts[@]}"; do
+    case "$_pp" in
+      claude|codex|piri) ;;
+      *) _pp_inherit_ok=0; break ;;
+    esac
+  done
+  [ "$_pp_inherit_ok" = 1 ] && CRON_PROMOTION_PROVIDERS="$CCC_SKILL_PROMOTION_PROVIDERS"
+  unset _pp_inherit_ok _pp_parts _pp
+fi
+[ -n "$CRON_PROMOTION_PROVIDERS" ] && CRON_ENV="$CRON_ENV CCC_SKILL_PROMOTION_PROVIDERS=\"$CRON_PROMOTION_PROVIDERS\""
 CRON_LINE="$SCHEDULE bash -lc '$CRON_ENV \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
 
 # Install record (#1081 phase 2): replay must reproduce THIS entry, so the
@@ -251,6 +292,7 @@ record_argv=(--apply --schedule "$SCHEDULE")
 [ -n "$CRON_PROVIDER" ] && record_argv+=(--provider "$CRON_PROVIDER")
 [ "$OPT_PIRI_DRAFTING" = 1 ] && record_argv+=(--piri-drafting)
 [ "$OPT_CODEX_DRAFTING" = 1 ] && record_argv+=(--codex-drafting)
+[ -n "$CRON_PROMOTION_PROVIDERS" ] && record_argv+=(--promotion-providers "$CRON_PROMOTION_PROVIDERS")
 
 # The block body carries the CRON_TZ pin ahead of the entry line (cron has no
 # per-job inline timezone syntax; the pin keeps an unrelated earlier CRON_TZ

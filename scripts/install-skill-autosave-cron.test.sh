@@ -204,5 +204,29 @@ run bash "$SC" --provider danso
 okc "$RC" 2 "invalid provider value exits 2"
 ok "invalid provider is reported" 'grep -q "invalid --provider" "$OUT"'
 
+run bash "$SC" --provider danso
+okc "$RC" 2 "invalid provider value exits 2"
+ok "invalid provider is reported" 'grep -q "invalid --provider" "$OUT"'
+
+# --- #1653 follow-up: promotion provider set baked for scheduled staging ----
+rm -f "$CRON_STORE"
+run bash "$SC" --apply --promotion-providers claude,piri
+okc "$RC" 0 "--promotion-providers applies"
+ok "promotion providers baked into the entry" \
+  'grep -qF "CCC_SKILL_PROMOTION_PROVIDERS=\"claude,piri\"" "$CRON_STORE"'
+ok "record argv carries --promotion-providers" \
+  'jq -e "[(.argv | index(\"--promotion-providers\")), (.argv | index(\"claude,piri\"))] | all(. != null)" "$REC" >/dev/null'
+rm -f "$CRON_STORE"
+run env CCC_SKILL_PROMOTION_PROVIDERS=claude,piri bash "$SC" --apply
+ok "promotion providers inherited from env" \
+  'grep -qF "CCC_SKILL_PROMOTION_PROVIDERS=\"claude,piri\"" "$CRON_STORE"'
+rm -f "$CRON_STORE"
+run bash "$SC" --apply
+ok "no promotion providers anywhere omits the assignment" \
+  '! grep -qF "CCC_SKILL_PROMOTION_PROVIDERS" "$CRON_STORE"'
+run bash "$SC" --promotion-providers claude,danso
+okc "$RC" 2 "invalid promotion provider member exits 2"
+ok "invalid promotion providers reported" 'grep -q "invalid --promotion-providers" "$OUT"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

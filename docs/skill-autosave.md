@@ -203,7 +203,11 @@ Provider lane (#1655): `--provider claude|codex|piri` bakes
 `CCC_SKILL_PROVIDER=…` into the cron line (default: inherit
 `$CCC_SKILL_PROVIDER`, else no provider and the sweep auto-detects as before).
 `--piri-drafting` / `--codex-drafting` bake `CCC_SKILL_PIRI_DRAFTING=1` /
-`CCC_SKILL_CODEX_DRAFTING=1`. piri is explicit-only, so a piri node schedules
+`CCC_SKILL_CODEX_DRAFTING=1`, and `--promotion-providers claude,piri` bakes
+`CCC_SKILL_PROMOTION_PROVIDERS` so the scheduled sweep's promotion staging scans
+the same non-default provider roots (without it the promoter default
+`claude,codex` applies and piri candidates are drafted+installed but not
+staged). piri is explicit-only, so a piri node schedules
 with `--provider piri --piri-drafting`; hand-editing the crontab is no longer
 needed and does not survive a reinstall. Downstream, drafts staged by each
 branch carry their provider in `meta.json`, and autoinstall routes every draft
