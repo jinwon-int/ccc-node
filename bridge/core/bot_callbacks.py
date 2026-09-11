@@ -43,6 +43,10 @@ class BotCallbackMixin:
         if data is None:
             return
 
+        if data.startswith("drecover:"):
+            await self._handle_danso_recovery(update, data)
+            return
+
         if data.startswith("ca:"):
             await self._resolve_codex_approval(user_id, chat.id, data)
             return

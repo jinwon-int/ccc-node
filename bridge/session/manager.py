@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Mapping, Optional
+from typing import Callable, TYPE_CHECKING, Any, Dict, Iterable, Mapping, Optional
 
 from telegram_bot.session.store import SessionStore
 
@@ -136,6 +136,8 @@ class SessionManager:
         expected: Mapping[str, Any],
         updates: Optional[Mapping[str, Any]] = None,
         remove_fields: Iterable[str] = (),
+        absent_fields: Iterable[str] = (),
+        guard: Callable[[], bool] | None = None,
     ) -> bool:
         payload = dict(updates or {})
         if "provider" in payload:
@@ -147,6 +149,7 @@ class SessionManager:
             expected=expected,
             updates=payload,
             remove_fields=remove_fields,
+            absent_fields=absent_fields, guard=guard,
         )
 
     async def get_reply_mode(self, user_id: int) -> str:

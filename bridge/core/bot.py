@@ -72,10 +72,12 @@ from telegram_bot.core.bot_delivery import BotDeliveryMixin
 from telegram_bot.core.bot_voice import BotVoiceMixin
 from telegram_bot.core.bot_approvals import BotApprovalMixin
 from telegram_bot.core.bot_callbacks import BotCallbackMixin
+from telegram_bot.core.bot_danso_recovery import DansoRecoveryMixin
 from telegram_bot.core.bot_ports import BotConfigPort
 
 
 class TelegramBot(
+    DansoRecoveryMixin,
     BotFollowupQueueMixin,
     BotLifecycleMixin,
     BotStatusMixin,
@@ -808,6 +810,7 @@ class TelegramBot(
         self.application.add_handler(CommandHandler("effort", self._cmd_effort))
         self.application.add_handler(CommandHandler("resume", self._cmd_resume))
         self.application.add_handler(CommandHandler("task_resume", self._cmd_task_resume))
+        self.application.add_handler(CommandHandler("task_recover", self._cmd_task_recover))
         self.application.add_handler(CommandHandler("task_pause", self._cmd_task_pause))
         self.application.add_handler(CommandHandler("stop", self._cmd_stop))
         self.application.add_handler(CommandHandler("continue", self._cmd_continue))
@@ -1027,6 +1030,11 @@ class TelegramBot(
                 )
                 new_session = True
 
+            if self._active_provider() == "danso":
+                self._bump_task_resume_generation(conversation_key)
+                await self._session_manager.patch_session(
+                    conversation_key, remove_fields={"danso_recovery_offer"})
+
             await self._session_manager.set_last_user_message_at(conversation_key, message_timestamp)
 
             effective_sid = self._effective_session_id(conversation_key, current_session)
@@ -1126,6 +1134,8 @@ class TelegramBot(
                 reply_mode=next_reply_mode,
                 voice_input_preview=voice_input_preview,
             )
+            if not response.success and self._active_provider() == "danso":
+                await self._offer_danso_recovery(conversation_key, user_id, chat.id, force=True)
         except asyncio.CancelledError:
             # Task was cancelled by /stop command - silently exit
             # The /stop handler will send the user response

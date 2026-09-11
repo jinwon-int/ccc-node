@@ -1717,3 +1717,22 @@ async def test_silent_native_long_task_retains_status_until_completion(configure
         assert calls[-1] == (None, 1234)
     finally:
         await handler.close()
+
+
+@pytest.mark.anyio
+async def test_recovery_dispatch_guard_rechecked_after_native_preparation(configured):
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    allowed = True
+    session.set_dispatch_guard(lambda: allowed)
+
+    async def load_context():
+        nonlocal allowed
+        allowed = False
+        return None
+
+    session.runtime.system_context_loader = load_context
+    events = [event async for event in session.send_turn("Check actual results first")]
+    assert any(getattr(event, 'code', '') == 'danso_recovery_stale' for event in events)
+    assert not (Path(configured.danso_workspace) / 'argv.json').exists()
+    assert not (runtime.root / (session.session_id + '.jsonl')).exists()

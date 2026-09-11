@@ -421,10 +421,12 @@ def _failure(stderr, code):
         f'attempts={transport[3]}')
     provider_detail = _provider_detail(text, category, code)
     http_detail = _http_detail(text, category, code, provider_detail)
+    from telegram_bot.core.danso_recovery import recovery_detail
+    recovery = recovery_detail(text, category, code, _unique_object)
     label = 'timeout' if category == 'run_timeout' else category
     return ErrorEvent(code='danso_' + label, message=(
         f'Worker failed: category={category}, exit_code={code}{counts}{transport_detail}{provider_detail}{http_detail}. '
-        'Reported usage may omit failed requests; not a total attempt count. No automatic replay.'))
+        'Reported usage may omit failed requests; not a total attempt count. No automatic replay.' + recovery))
 
 
 class DansoRuntime:
@@ -543,9 +545,13 @@ class DansoSession:
         self._interrupted = False
         self._bootstrap_task = None
         self._resume_task_authorized = False
+        self._dispatch_guard = None
         self._task_progress_ready = False
         self._task_progress_seen = False
         self._task_pause_requested = False
+
+    def set_dispatch_guard(self, guard):
+        self._dispatch_guard = guard
 
     def authorize_task_resume(self):
         """Arm exactly one bridge-authorized no-prompt resume dispatch."""
@@ -632,6 +638,11 @@ class DansoSession:
 
     async def send_turn(self, message, *, approval_handler=deny_approval):  # noqa: C901 -- subprocess lifecycle and terminal event mapping
         async with self._lock:
+            dispatch_guard, self._dispatch_guard = self._dispatch_guard, None
+            if dispatch_guard is not None and not dispatch_guard():
+                self._resume_task_authorized = False
+                yield ErrorEvent(code='danso_recovery_stale', message='Recovery selection expired; use /task_recover.')
+                return
             if not isinstance(message, str) or not message.strip() or len(message.encode()) > 65536:
                 yield ErrorEvent(code='danso_input', message='Invalid worker input.')
                 return
@@ -764,7 +775,7 @@ class DansoSession:
                     else:
                         command += ['--', message]
                     async for event in self._execute(
-                        command, readers, resume_task=resume_task,
+                        command, readers, resume_task=resume_task, dispatch_guard=dispatch_guard,
                         resume_stage=resume_stage,
                         timeout_seconds=effective_timeout,
                         wall_seconds=effective_wall,
@@ -796,7 +807,10 @@ class DansoSession:
     async def _execute(self, command, readers, *, resume_task=False,  # noqa: C901 -- bounded concurrent stdout/stderr/progress lifecycle
                        resume_stage=None,
                        timeout_seconds=None, wall_seconds=None,
-                       max_requests=None, max_tokens=None):
+                       max_requests=None, max_tokens=None, dispatch_guard=None):
+        if dispatch_guard is not None and not dispatch_guard():
+            yield ErrorEvent(code='danso_recovery_stale', message='Recovery selection expired; use /task_recover.')
+            return
         r = self.runtime
         timeout_seconds = r.timeout if timeout_seconds is None else timeout_seconds
         wall_seconds = r.timeout if wall_seconds is None else wall_seconds
