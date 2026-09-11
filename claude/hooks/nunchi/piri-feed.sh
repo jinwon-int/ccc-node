@@ -17,6 +17,11 @@ MODE="${CCC_NUNCHI_MODE:-$(cat "$STATE/nunchi.mode" 2>/dev/null || echo off)}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 FM="$HERE/nunchi.py"
+# shellcheck source=claude/hooks/nunchi/feed-common.sh
+. "$HERE/feed-common.sh" 2>/dev/null || {
+  echo "${0##*/}: feed-common.sh missing beside this feed — the harness is only partially deployed; re-run setup.sh. Refusing to run rather than tick without ingesting (#1698)." >&2
+  exit 2
+}
 
 # In audience-scoped mode the cron entry is a body-free dispatcher. It visits
 # only canonical direct children of the configured opaque audience root and
@@ -144,7 +149,7 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
       # this the doctor ages the previous tick into ingest-tick-stale (gongyung
       # 2026-09-02) and the real cause (no launcher) stays invisible.
       _status="${CCC_NUNCHI_INGEST_STATUS:-$NUNCHI_HOME/ingest.status.json}"
-      printf '{"schema":"ccc.nunchi.ingest.v1","finished_at":%d,"sources":0,"ingested":0,"retired":0,"deferred":0,"feed":"piri","skipped":"cli-not-runnable"}\n' "$(date -u +%s)" > "$_status.$$" 2>/dev/null && mv -f "$_status.$$" "$_status" 2>/dev/null
+      nunchi_write_status "$_status" piri 0 0 0 0 '"skipped":"cli-not-runnable"'
       exit 0
     }
   }
@@ -250,18 +255,12 @@ PYEOF
   done < <(find "$PIR_SESSIONS_DIR" -type f -name "*.jsonl" \
     -printf '%T@ %p\0' 2>/dev/null | sort -z -n)
   python3 "$FM" snapshot --limit 25 >/dev/null 2>&1 || true
-  # Liveness tick shared with ingest-cron.sh (schema ccc.nunchi.ingest.v1):
+  # Liveness tick, written by the shared feed-common.sh helper (#1698):
   # ccc-doctor judges the ingest lane by this file's age, so a lane that runs
   # but never writes it looks stale forever once a node switches provider
   # (2026-09-02: five nodes flagged ingest-tick-stale after moving to the
   # piri/codex feeds — the claude-era file just aged out). sources = session
   # files considered this run, ingested = sessions processed.
   _status="${CCC_NUNCHI_INGEST_STATUS:-$NUNCHI_HOME/ingest.status.json}"
-  _tmp="$_status.$$"
-  if printf '{"schema":"ccc.nunchi.ingest.v1","finished_at":%d,"sources":%d,"ingested":%d,"retired":0,"deferred":0,"feed":"%s"}\n' \
-      "$(date -u +%s)" "${sources:-0}" "${n:-0}" "piri" > "$_tmp" 2>/dev/null; then
-    mv -f "$_tmp" "$_status" 2>/dev/null || rm -f "$_tmp"
-  else
-    rm -f "$_tmp" 2>/dev/null
-  fi
+  nunchi_write_status "$_status" piri "${sources:-0}" "${n:-0}" 0 0
 ) 9>"$LOCK"

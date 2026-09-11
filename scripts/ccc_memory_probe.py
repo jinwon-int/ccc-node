@@ -595,6 +595,7 @@ def managed_cron_environment(cron: str) -> tuple[dict[str, str], list[str]]:
             for script in (
                 "codex-feed.sh",
                 "piri-feed.sh",
+                "danso-feed.sh",
                 "ingest-cron.sh",
                 "mempalace-refresh.sh",
                 "bench.sh",
@@ -617,17 +618,22 @@ def inspect_managed_cron(
 ) -> tuple[str, int, list[tuple[str, str, dict[str, str]]], int, int]:
     commands = cron_commands(cron, managed_only=True)
     invocations = [command_invocation(command) for command in commands]
-    codex_feeds = sum(is_bash_script(command, "codex-feed.sh") for command in invocations)
-    claude_feeds = sum(is_bash_script(command, "ingest-cron.sh") for command in invocations)
-    piri_feeds = sum(is_bash_script(command, "piri-feed.sh") for command in invocations)
-    feed_count = codex_feeds + claude_feeds + piri_feeds
+    # One entry per installed lane (#1698 added danso). Exactly one lane with
+    # exactly one line names the kind; anything else is missing or mixed.
+    lane_counts = {
+        kind: sum(is_bash_script(command, script) for command in invocations)
+        for kind, script in (
+            ("codex", "codex-feed.sh"),
+            ("claude", "ingest-cron.sh"),
+            ("piri", "piri-feed.sh"),
+            ("danso", "danso-feed.sh"),
+        )
+    }
+    feed_count = sum(lane_counts.values())
+    present = [kind for kind, count in lane_counts.items() if count]
     feed_kind = (
-        "codex"
-        if codex_feeds == 1 and claude_feeds == 0 and piri_feeds == 0
-        else "claude"
-        if claude_feeds == 1 and codex_feeds == 0 and piri_feeds == 0
-        else "piri"
-        if piri_feeds == 1 and codex_feeds == 0 and claude_feeds == 0
+        present[0]
+        if len(present) == 1 and feed_count == 1
         else "missing"
         if feed_count == 0
         else "mixed"

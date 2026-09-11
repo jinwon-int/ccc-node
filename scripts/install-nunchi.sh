@@ -7,6 +7,7 @@
 #   install-nunchi.sh --apply --codex      # explicit Codex override
 #   install-nunchi.sh --apply --claude     # explicit Claude override
 #   install-nunchi.sh --apply --piri       # explicit Piri override
+#   install-nunchi.sh --apply --danso      # explicit Danso override (#1698)
 #   install-nunchi.sh --apply --piri --audience-scoped /absolute/audience/root
 #   install-nunchi.sh --apply --judge    # + daily review-queue judge batch (#1204)
 #   install-nunchi.sh --apply --judge-apply  # judge batch in APPLY mode — MUTATES
@@ -48,6 +49,7 @@ while [ $# -gt 0 ]; do
     --codex) PROVIDER="codex" ;;
     --claude) PROVIDER="claude" ;;
     --piri) PROVIDER="piri" ;;
+    --danso) PROVIDER="danso" ;;
     --audience-scoped)
       [ $# -ge 2 ] || { echo "--audience-scoped requires an absolute root" >&2; exit 2; }
       AUDIENCE_SCOPED=1; AUDIENCE_ROOT="$2"; shift ;;
@@ -69,7 +71,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 case "$PROVIDER" in
-  codex|claude|piri|auto) ;;
+  codex|claude|piri|danso|auto) ;;
   *) echo "invalid provider: $PROVIDER" >&2; exit 2 ;;
 esac
 
@@ -123,6 +125,15 @@ MEMPALACE_STATUS="${CCC_NUNCHI_MEMPALACE_STATUS:-$NUNCHI_DIR/mempalace-refresh.s
 MEMPALACE_TIMEOUT="${CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC:-3300}"
 MODE_FILE="$STATE/nunchi.mode"
 MARK="# nunchi:#816"
+# nunchi_runtime_provider (#1698). Prefer the installed hooks so the installer
+# agrees with the feeds actually on this node; fall back to the checkout when
+# setup.sh has not run yet. Absent on neither path, detect_provider degrades to
+# its historical probes.
+for _feed_lib in "$HOOKS/feed-common.sh" \
+  "$(cd "$(dirname "$0")/.." && pwd)/claude/hooks/nunchi/feed-common.sh"; do
+  # shellcheck source=claude/hooks/nunchi/feed-common.sh
+  [ -f "$_feed_lib" ] && { . "$_feed_lib"; break; }
+done
 TS="$(date +%Y%m%dT%H%M%S)"
 CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
 
@@ -340,6 +351,7 @@ status() {
   grep -q 'codex-feed.sh'  <<<"$cron" && configured="codex"
   grep -q 'ingest-cron.sh' <<<"$cron" && configured="claude"
   grep -q 'piri-feed.sh'   <<<"$cron" && configured="piri"
+  grep -q 'danso-feed.sh'  <<<"$cron" && configured="danso"
   mp_path="${CCC_NUNCHI_MEMPALACE_CLI:-$(command -v mempalace || true)}"
   [ -z "$mp_path" ] && [ -x "$HOME/.local/bin/mempalace" ] && mp_path="$HOME/.local/bin/mempalace"
   mp_ver="none"
@@ -535,7 +547,19 @@ PY
 
 detect_provider() {
   if [ "$PROVIDER" != "auto" ]; then printf '%s' "$PROVIDER"; return; fi
-  local root bridge_status=""
+  local root bridge_status="" runtime=""
+  # The node's own declaration wins over probing (#1698). Detection used to
+  # start at `bridge --status`, which reports no Danso lane, so a Danso node
+  # silently fell through to the `claude` fallback and installed a feed whose
+  # input never fills — gongmyoung and soonwook both froze that way. Only the
+  # providers that actually have a feed lane are honoured here; anything else
+  # (crush, grok, an unset value) falls through to the probes below.
+  if declare -F nunchi_runtime_provider >/dev/null 2>&1; then
+    runtime="$(nunchi_runtime_provider || true)"
+  fi
+  case "$runtime" in
+    claude|codex|piri|danso) printf '%s' "$runtime"; return ;;
+  esac
   root="$(cd "$(dirname "$0")/.." && pwd)"
   if [ -f "$root/bridge/start.sh" ]; then
     bridge_status="$(bash "$root/bridge/start.sh" --path "$HOME" --status 2>/dev/null || true)"
@@ -576,6 +600,7 @@ case "$ACTION" in
     feed="$HOOKS/ingest-cron.sh"
     [ "$resolved_provider" = "codex" ] && feed="$HOOKS/codex-feed.sh"
     [ "$resolved_provider" = "piri" ]  && feed="$HOOKS/piri-feed.sh"
+    [ "$resolved_provider" = "danso" ] && feed="$HOOKS/danso-feed.sh"
     # The Piri feed resolves its extractor CLI at RUNTIME from
     # CCC_PIRI_CLI_PATH/PATH; cron's bare PATH has no piri entry, which made
     # every feed tick a silent no-op on real nodes. Resolve a runnable CLI at
@@ -608,6 +633,11 @@ case "$ACTION" in
     default_sweep="$CLAUDE_DIR/projects"
     [ "$resolved_provider" = "codex" ] && default_sweep="$CODEX_HOME_DIR/sessions"
     [ "$resolved_provider" = "piri" ]  && default_sweep="$HOME/.piri/agent/sessions"
+    # Danso journals live under the operator-declared state dir; there is no
+    # conventional default (bridge/utils/config.py has none either). Unset means
+    # the sweep dir stays absent, refresh_ready stays 0, and the hourly cron is
+    # skipped with the existing message instead of being wired to a wrong tree.
+    [ "$resolved_provider" = "danso" ] && default_sweep="${CCC_DANSO_STATE_DIR:-}"
     [ "$resolved_provider" = "piri" ] && [ "$AUDIENCE_SCOPED" = 1 ] \
       && default_sweep="$AUDIENCE_ROOT"
     sweep_dir="${NUNCHI_SWEEP_DIR:-$default_sweep}"

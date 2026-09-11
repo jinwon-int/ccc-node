@@ -303,6 +303,25 @@ def _iso_age_days(stamp: str) -> int | None:
     return max(0, int((now - then).total_seconds() // 86400))
 
 
+# Feed script -> lane name, in the order install-nunchi.sh `status` tests them
+# (#1698 added danso). Kept as data next to the doctor's other cron parsing so
+# adding a lane is one line in both places rather than a new elif chain here.
+_NUNCHI_FEED_LANES: tuple[tuple[str, str], ...] = (
+    (r"codex-feed\.sh", "codex"),
+    (r"piri-feed\.sh", "piri"),
+    (r"danso-feed\.sh", "danso"),
+    (r"ingest-cron\.sh", "claude"),
+)
+
+
+def _configured_nunchi_lane(cron: str) -> str:
+    """Return the nunchi feed lane wired in the managed cron, or 'none'."""
+    for pattern, lane in _NUNCHI_FEED_LANES:
+        if re.search(pattern, cron):
+            return lane
+    return "none"
+
+
 class Doctor:
     def __init__(self, repo: Path, claude_dir: Path, scope: str):
         self.repo = repo
@@ -2022,13 +2041,7 @@ class Doctor:
         except Exception:
             cron = ""
 
-        configured = "none"
-        if re.search(r"codex-feed\.sh", cron):
-            configured = "codex"
-        elif re.search(r"piri-feed\.sh", cron):
-            configured = "piri"
-        elif re.search(r"ingest-cron\.sh", cron):
-            configured = "claude"
+        configured = _configured_nunchi_lane(cron)
 
         # Opt-in: no managed cron means nunchi collection is not wired — healthy.
         if configured == "none":
@@ -2170,8 +2183,11 @@ class Doctor:
         findings. Thresholds are env-tunable minutes
         (CCC_NUNCHI_SWEEP_STALE_MIN default 1560, CCC_NUNCHI_INGEST_STALE_MIN
         default 360); 0 disables that lane's age gate. The ingest status file
-        is only demanded on the claude lane — its managed ingest-cron writes
-        it; piri/codex feeders report through their own lanes (표기만).
+        is demanded on the claude and danso lanes — their managed mirrors
+        always write it; piri/codex feeders report through their own lanes
+        (표기만). The tick's own ``feed_provider_mismatch`` and ``skipped``
+        fields are surfaced too: a lane can tick on schedule and still be
+        ingesting nothing (#1698).
         """
 
         def _stale_min(env: str, default: int) -> int:
@@ -2200,17 +2216,38 @@ class Doctor:
         )
         ingest_tick = "none"
         ingest_finished: int | None = None
+        ingest_doc: dict = {}
         with contextlib.suppress(Exception):
-            ingest_finished = int(json.loads(ingest_file.read_text()).get("finished_at"))
+            loaded = json.loads(ingest_file.read_text())
+            if isinstance(loaded, dict):
+                ingest_doc = loaded
+        with contextlib.suppress(Exception):
+            ingest_finished = int(ingest_doc.get("finished_at"))
         if ingest_finished is not None:
             ingest_age = max(0, (now - ingest_finished) // 60)
             ingest_tick = f"age={ingest_age}min"
             if ingest_stale_min and ingest_age > ingest_stale_min:
                 stale.append(f"ingest-tick-stale({ingest_age}min>{ingest_stale_min}min)")
-        elif configured == "claude" and not scoped:
+        elif configured in ("claude", "danso") and not scoped:
             # Scoped lanes keep their feed artefacts under the audience root
-            # (#1202) — the top-level file is legitimately absent there.
+            # (#1202) — the top-level file is legitimately absent there. The
+            # danso lane is a mirror with no CLI to be missing, so like claude
+            # it always writes a tick; an absent file is a real finding.
             stale.append("ingest-status-missing")
+
+        # A fresh tick is not proof of a working lane. When the installed feed
+        # and the runtime provider disagree, the wrong lane runs, exits 0 and
+        # ticks on schedule while the fact DB stays frozen — invisible for 43
+        # days on soonwook (#1698). The feeds now say so in their own tick.
+        if ingest_doc.get("feed_provider_mismatch") is True:
+            stale.append(
+                "feed-provider-mismatch(feed={} provider={})".format(
+                    ingest_doc.get("feed") or "?", ingest_doc.get("feed_provider") or "?"
+                )
+            )
+        skipped = ingest_doc.get("skipped")
+        if isinstance(skipped, str) and skipped:
+            stale.append(f"ingest-skipped({skipped})")
 
         ticks = f"ingest:{ingest_tick} sweep:{sweep_tick}"
         if stale:

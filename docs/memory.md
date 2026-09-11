@@ -95,6 +95,45 @@ and the weekly bench cron; `--remove` rolls back. Like the Codex lane this
 costs one Piri run per new session file (the Claude lane reuses Session
 Distiller output at zero LLM cost).
 
+### Danso nunchi opt-in
+
+A Danso node runs `hooks/nunchi/danso-feed.sh`, wired by
+`scripts/install-nunchi.sh --apply --danso`. Unlike the Codex and Piri lanes it
+is a **mirror, not an extractor**, and costs no LLM call: on a Danso node the
+bridge already owns distill and lands the validated result in its own journal
+(`<bot-data-dir>/danso-distill-journal`, see `bridge/__main__.py`). Those job
+files use the same `DistillJournal` schema as every other provider, so
+`bridge-journal.py` adapts them unchanged. Re-extracting the raw native session
+journals under `CCC_DANSO_STATE_DIR` would instead need Danso credentials in
+cron and would pay again for an extraction that already happened.
+
+The consequence is worth stating plainly: this lane can only mirror what the
+bridge extracted. With the shipped default `CCC_MEMORY_DISTILL_PROVIDER=off`
+(see `docs/danso-telegram.md`) there is nothing to mirror. That is reported as
+`"skipped": "distill-journal-missing"` in the tick and a stderr line naming the
+fix — not as a silent `ingested: 0`. To actually collect facts, set
+`CCC_MEMORY_DISTILL_PROVIDER=danso` with a non-zero
+`CCC_USAGE_BUDGET_TOKENS_DANSO` and `CCC_BRIDGE_MEMORY_MODE=audience-scoped`.
+Point `CCC_BRIDGE_DISTILL_JOURNAL` at the journal directory when the bridge's
+`PROJECT_ROOT` is not `$HOME`. MemPalace has no verified `danso` wing, so the
+hourly refresh takes the generic `sweep` and is skipped entirely unless
+`CCC_DANSO_STATE_DIR` is set.
+
+### Feed/provider drift
+
+Every lane's `ingest.status.json` tick now carries `feed_provider` and, when the
+installed lane disagrees with the runtime `CCC_AGENT_PROVIDER`,
+`feed_provider_mismatch: true`. This closes the failure that motivated the Danso
+lane (#1698): after a provider switch the *old* feed keeps running, exits 0 and
+writes a fresh tick, so `ccc-doctor` saw a healthy lane while the fact DB had
+been frozen for 6 days (gongmyoung) and 43 days (soonwook). The provider is
+resolved at runtime — process env first, then the bridge's private `.env` —
+deliberately **not** pinned into the cron line, since a frozen copy would agree
+with the lane forever and could never report the drift. `ccc-doctor` surfaces
+both the mismatch and any `skipped` reason as nunchi-collection findings.
+`scripts/install-nunchi.sh` auto-detection also consults `CCC_AGENT_PROVIDER`
+before probing the bridge, so re-applying fixes the lane.
+
 When the bridge runs `CCC_BRIDGE_MEMORY_MODE=audience-scoped`, enable the
 collector with `scripts/install-nunchi.sh --apply --piri --audience-scoped
 <absolute-memory-audience-root>`. The feed and MemPalace jobs become bounded

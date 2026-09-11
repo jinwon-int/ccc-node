@@ -16,6 +16,11 @@ MODE="${CCC_NUNCHI_MODE:-$(cat "$STATE/nunchi.mode" 2>/dev/null || echo off)}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 FM="$HERE/nunchi.py"
 ADAPTER="$HERE/bridge-journal.py"
+# shellcheck source=claude/hooks/nunchi/feed-common.sh
+. "$HERE/feed-common.sh" 2>/dev/null || {
+  echo "${0##*/}: feed-common.sh missing beside this feed — the harness is only partially deployed; re-run setup.sh. Refusing to run rather than tick without ingesting (#1698)." >&2
+  exit 2
+}
 NUNCHI_HOME="${NUNCHI_HOME:-$HOME/.nunchi}"
 HIST="$STATE/distill-history"
 # The bridge writes its journal under the project root it serves, which is not
@@ -74,14 +79,7 @@ touch "$SEEN"
     echo "nunchi ingest: ingested=$ingested retired=$retired deferred=$deferred"
   fi
 
-  now="$(date -u +%s)"
-  tmp="$STATUS.$$"
-  if printf '{"schema":"ccc.nunchi.ingest.v1","finished_at":%d,"sources":%d,"ingested":%d,"retired":%d,"deferred":%d}\n' \
-      "$now" "$sources" "$ingested" "$retired" "$deferred" > "$tmp" 2>/dev/null; then
-    mv -f "$tmp" "$STATUS" 2>/dev/null || rm -f "$tmp"
-  else
-    rm -f "$tmp" 2>/dev/null
-  fi
+  nunchi_write_status "$STATUS" claude "$sources" "$ingested" "$retired" "$deferred"
 
   python3 "$FM" snapshot --limit 25 >/dev/null 2>&1 || true
 ) 9>"$LOCK"

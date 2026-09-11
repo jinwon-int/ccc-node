@@ -79,6 +79,7 @@ detect_provider() {
   cron="$("$crontab_cli" -l 2>/dev/null || true)"
   if grep -q 'codex-feed.sh' <<<"$cron"; then printf codex; return; fi
   if grep -q 'piri-feed.sh' <<<"$cron"; then printf piri; return; fi
+  if grep -q 'danso-feed.sh' <<<"$cron"; then printf danso; return; fi
   if grep -q 'ingest-cron.sh' <<<"$cron"; then printf claude; return; fi
   if [ -d "$HOME/.piri/agent/sessions" ] && [ ! -d "$HOME/.codex/sessions" ] && [ ! -d "$HOME/.claude/projects" ]; then
     printf piri
