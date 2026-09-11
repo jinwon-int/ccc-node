@@ -37,6 +37,16 @@ workers while their interactive lane stays Claude, so set
 `CCC_SKILL_PROVIDER=piri` in the collector/installer environment (cron line or
 systemd drop-in) for the piri install target to engage.
 
+**Danso is out of scope by design (#1657, decision A — reviewer only).** Danso
+nodes take no part in skill drafting, autoinstall, promotion staging, intake
+publishing, or fleet-skills sync: no provider resolution in
+`provider.sh`, no sweep branch, no collector configuration, no sync root. Their
+role in the pipeline is the a2a intake review lane only — a danso worker acts
+as `REVIEW_AGENT_BIN` when it satisfies the stdin-prompt / stdout-verdict-JSON
+contract of `scripts/skills-intake-review-handler.sh`. Promoting danso to a
+full provider (install paths, normalizer, collector backend, sync audience)
+remains a separate, explicitly approved track.
+
 The Codex install pipeline (gates, cap, ledger, rollback, concurrency-safe
 single-runner lock) is complete and covered by
 `claude/hooks/skill-review/codex-autoinstall.test.sh`.
