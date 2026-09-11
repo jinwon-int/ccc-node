@@ -135,3 +135,18 @@ def test_invalid_rich_replies_without_processing_or_approval():
         assert not bot.processed_texts
         bot._resolve_codex_approval_text.assert_not_awaited()
         reply.assert_awaited_once()
+
+
+@pytest.mark.parametrize("kind", [[], {}, 1, None])
+def test_malformed_discriminator_has_categorical_error(kind):
+    for block in [{"type": kind}, paragraph({"type": kind, "text": "x"})]:
+        with pytest.raises(RichTextError):
+            inbound_message_text(rich_update([block]).message)
+
+
+def test_official_custom_emoji_and_datetime_keep_visible_text():
+    update = rich_update([paragraph([
+        {"type": "custom_emoji", "custom_emoji_id": "123", "alternative_text": "🙂"},
+        " ", {"type": "date_time", "text": "오늘", "unix_time": 1, "date_time_format": "d"},
+    ])])
+    assert inbound_message_text(update.message) == "🙂 오늘"

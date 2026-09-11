@@ -67,7 +67,7 @@ _TEXT_WRAPPERS = frozenset({
     "bold", "italic", "underline", "strikethrough", "spoiler", "code", "marked",
     "subscript", "superscript", "text_mention", "custom_emoji", "url", "email_address",
     "phone_number", "bank_card_number", "mention", "hashtag", "cashtag", "bot_command",
-    "anchor", "anchor_link", "reference", "reference_link",
+    "anchor", "anchor_link", "reference", "reference_link", "date_time",
 })
 
 
@@ -79,6 +79,13 @@ def _text(value: Any) -> str:
     if not isinstance(value, dict):
         raise RichTextError("rich_invalid_text")
     kind = value.get("type")
+    if not isinstance(kind, str):
+        raise RichTextError("rich_invalid_text_type")
+    if kind == "custom_emoji":
+        alternative = value.get("alternative_text")
+        if not isinstance(alternative, str) or not alternative:
+            raise RichTextError("rich_invalid_emoji")
+        return alternative
     if kind == "mathematical_expression":
         expression = value.get("expression")
         if not isinstance(expression, str):
@@ -130,6 +137,8 @@ def _block(block: Any) -> str:
     if not isinstance(block, dict):
         raise RichTextError("rich_invalid_block")
     kind = block.get("type")
+    if not isinstance(kind, str):
+        raise RichTextError("rich_invalid_block_type")
     if kind in {"paragraph", "heading", "pre", "footer", "pullquote"}:
         text = _text(block.get("text"))
         return text + ("\n" + _text(block["credit"]) if "credit" in block else "")
