@@ -369,17 +369,28 @@ python3 ~/.claude/hooks/ccc-skill-promotion.py run --dry-run
 ```
 
 Providers (#1653): staging scans the provider roots selected by
-`CCC_SKILL_PROMOTION_PROVIDERS` (default `claude,codex`; `piri` is now a valid
-entry). piri nodes opt in explicitly —
+`CCC_SKILL_PROMOTION_PROVIDERS` (default `claude,codex`; `piri` and `danso`
+are valid entries). piri nodes opt in explicitly —
 `CCC_SKILL_PROMOTION_PROVIDERS=claude,piri` — and the piri root follows the
 shared path rule (`$PIRI_CODING_AGENT_DIR` or `~/.piri/agent`, plus `/skills`;
-override with `CCC_SKILL_PROMOTION_PIRI_SKILLS_DIR`). The publisher's envelope
+override with `CCC_SKILL_PROMOTION_PIRI_SKILLS_DIR`). danso (#1663) opts in
+the same explicit way, and its root resolves
+`CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR` → `DANSO_SKILLS_DIR` →
+`$CCC_DANSO_STATE_DIR/home/.pi/agent/skills` (#1659/#1662 contract); an
+unresolved chain simply omits the entry — a node that does not consume danso
+gets no invented root, and selecting `danso` there fails fast with
+`provider_root_unresolved`. The publisher's envelope
 validation and the fleet-skills intake path accept the same provider set, so a
-staged piri candidate publishes as `intake/<node>/piri/<candidate-id>/`. The
+staged piri candidate publishes as `intake/<node>/piri/<candidate-id>/` — and
+a staged danso candidate as `intake/<node>/danso/<candidate-id>/`. The
 autorepair/revise LLM command defaults to `claude -p --disallowed-tools *`; on
 non-Claude nodes set `CCC_SKILL_REVIEW_LLM_CMD` to that node's neutral LLM
 command, otherwise autorepair fails (and the candidate blocks instead of
-repairing).
+repairing). For a danso node the neutral command is a thin stdin-saving
+wrapper around the distill invocation (`danso --provider glm --model …
+--no-tools --max-turns 1 --sandbox host --cwd … --session …
+--system-context-file <packet> -p "…"`), since danso takes prompts only via
+`--system-context-file` (#1657).
 
 `run` never calls GitHub or SSH. It writes a `0600` content-addressed envelope
 under `~/.claude/state/skill-promotion/outbox/`; `export` is a read-only SSH

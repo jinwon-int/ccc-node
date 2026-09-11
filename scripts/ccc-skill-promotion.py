@@ -36,7 +36,10 @@ _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 # #1653: single provider vocabulary — the CCC_SKILL_PROMOTION_PROVIDERS set,
 # the scanned provider roots, and the envelope validation must not drift apart
 # (piri was accepted by the installer but rejected here at every layer).
-_PROVIDERS = ("claude", "codex", "piri")
+# #1663: danso joins the same way — the #1685 collector already stages drafts
+# with provenance.provider=danso, so rejecting the vocabulary here would
+# strand them between the pending queue and the intake pipeline.
+_PROVIDERS = ("claude", "codex", "piri", "danso")
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ALLOWED_SUPPORT_DIRS = {"references", "scripts", "templates"}
@@ -371,6 +374,44 @@ def _config(environment: dict[str, str] | None = None) -> Config:
     ):
         raise PromotionError("collector_nodes_invalid")
     tool_default = claude_dir / "hooks" / "skill-review" / "ownership.py"
+    provider_roots: dict[str, Path] = {
+        "claude": Path(
+            env.get("CCC_SKILL_PROMOTION_CLAUDE_SKILLS_DIR", claude_dir / "skills")
+        ).absolute(),
+        "codex": Path(
+            env.get(
+                "CCC_SKILL_PROMOTION_CODEX_SKILLS_DIR",
+                Path(env.get("CODEX_HOME", home / ".codex")) / "skills",
+            )
+        ).absolute(),
+        # Same path rule as provider.sh / ownership.py / sync (#1653):
+        # $PIRI_CODING_AGENT_DIR (default ~/.piri/agent) + /skills.
+        "piri": Path(
+            env.get(
+                "CCC_SKILL_PROMOTION_PIRI_SKILLS_DIR",
+                Path(env.get("PIRI_CODING_AGENT_DIR", home / ".piri" / "agent")) / "skills",
+            )
+        ).absolute(),
+    }
+    # #1663: danso rides along only when its install root resolves from the
+    # environment — the #1659/#1662 contract, same chain as the skill-candidate
+    # inventory: explicit CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR wins, then
+    # DANSO_SKILLS_DIR, then the bridge-fixed danso HOME. Unlike piri, whose
+    # default always resolves under $HOME, a bridge state dir cannot be
+    # guessed from the environment — so an unresolved chain omits the entry
+    # rather than inventing a root on a node that does not consume danso.
+    danso_raw = env.get("CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR") or env.get("DANSO_SKILLS_DIR")
+    if not danso_raw:
+        danso_state = env.get("CCC_DANSO_STATE_DIR", "")
+        if danso_state:
+            danso_raw = f"{danso_state}/home/.pi/agent/skills"
+    if danso_raw:
+        provider_roots["danso"] = Path(danso_raw).absolute()
+    # A provider selected for staging without a resolvable root is a config
+    # error, not an empty scan — fail before any command runs instead of
+    # KeyError-ing mid-discovery.
+    if any(provider not in provider_roots for provider in providers):
+        raise PromotionError("provider_root_unresolved")
     return Config(
         home=home,
         state_dir=state_dir,
@@ -381,25 +422,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         base=base,
         node=_safe_node(env.get("CCC_NODE") or env.get("HOSTNAME") or ""),
         providers=providers,
-        provider_roots={
-            "claude": Path(
-                env.get("CCC_SKILL_PROMOTION_CLAUDE_SKILLS_DIR", claude_dir / "skills")
-            ).absolute(),
-            "codex": Path(
-                env.get(
-                    "CCC_SKILL_PROMOTION_CODEX_SKILLS_DIR",
-                    Path(env.get("CODEX_HOME", home / ".codex")) / "skills",
-                )
-            ).absolute(),
-            # Same path rule as provider.sh / ownership.py / sync (#1653):
-            # $PIRI_CODING_AGENT_DIR (default ~/.piri/agent) + /skills.
-            "piri": Path(
-                env.get(
-                    "CCC_SKILL_PROMOTION_PIRI_SKILLS_DIR",
-                    Path(env.get("PIRI_CODING_AGENT_DIR", home / ".piri" / "agent")) / "skills",
-                )
-            ).absolute(),
-        },
+        provider_roots=provider_roots,
         max_prs=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN", 1, 1, 3),
         enabled=enabled,
         publisher_enabled=publisher_enabled,
@@ -701,6 +724,11 @@ def _scan_text(payload: bytes) -> None:
         raise PromotionError("runtime_specific_claude")
     if any(pattern.search(text) for pattern in _CODEX_COUPLINGS):
         raise PromotionError("runtime_specific_codex")
+    # #1663 review: danso gets no dedicated coupling patterns. Its install
+    # root lives under a bridge state dir outside $HOME, and a draft that
+    # embeds that absolute path is already rejected above by
+    # node_specific_home_path — there is nothing a danso-specific pattern
+    # would catch that the generic gates do not.
 
 
 # Security gates remain linear so each rejection precedes content export.
@@ -3017,9 +3045,11 @@ def _dispatch_intake_revise(
 # #1394: every provider lane observed on fleet-skills intake — the publisher's
 # own claude/codex targets plus the ccc-node harness trees (shared/bridge/piri
 # canon re-review). Order matters: claude/codex first so a skill name that
-# merely contains a harness marker never wins the transport-id scan. Records
-# outside this vocabulary stay revise_record_invalid.
-_REVISE_PROVIDER_VOCABULARY = ("claude", "codex", "shared", "bridge", "piri")
+# merely contains a harness marker never wins the transport-id scan. #1663:
+# danso joins at the end — its intake lane sends revise verdicts back through
+# the same publisher path. Records outside this vocabulary stay
+# revise_record_invalid.
+_REVISE_PROVIDER_VOCABULARY = ("claude", "codex", "shared", "bridge", "piri", "danso")
 
 
 # #1370: human-readable explanations for a consumed revise verdict whose R2
