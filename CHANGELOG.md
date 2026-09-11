@@ -7,6 +7,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 - Danso now delivers completed interim explanations during ordinary and long tasks,
   independent of draft streaming, and wakes progress consumers before CLI exit (#1673).
 
+- Make Grok Telegram **direct on the Grok computer** (`CCC_GROK_TRANSPORT=local`).
+  Seoseo SSH hop is retired. SSH transport remains non-production.
+
 - Offer a conversation-bound recovery summary and explicit Continue/New/Inspect
   choices after interrupted Danso tasks or bridge restart (#1667). Preserve
   original journals, validate choices at dispatch, and consume optional native

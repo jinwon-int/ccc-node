@@ -1,6 +1,7 @@
 """Explicit existing-Bot attachment; no filesystem or network work at composition."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -8,7 +9,7 @@ from typing import Any
 from .grok_journal import GrokBinding, GrokJournal
 from .grok_protocol import ProtocolError
 from .grok_runtime import GrokRuntime
-from .grok_ssh import GrokSshTransport
+from .grok_ssh import GrokLocalTransport, GrokSshTransport
 
 
 @dataclass(frozen=True)
@@ -46,4 +47,6 @@ def configured_route(settings: Any) -> GrokRoute:
 def build_grok_runtime(settings: Any) -> GrokRuntime:
     route = configured_route(settings)
     binding = route.journal.binding
-    return GrokRuntime(route.journal, GrokSshTransport(binding.destination, binding.agent_id))
+    mode = str(os.environ.get("CCC_GROK_TRANSPORT") or "").strip().lower()
+    transport = GrokLocalTransport if mode == "local" else GrokSshTransport
+    return GrokRuntime(route.journal, transport(binding.destination, binding.agent_id))

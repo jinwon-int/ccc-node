@@ -10,11 +10,13 @@ of the generic session/project frontend with Grok is rejected. The generic
 readiness probe also rejects Grok instead of falling through to Claude.
 
 This is a deliberately limited first slice, using the existing normalized
-AgentRuntime events and the qualified SSH transport and journal. No xAI model
-API, new SDK/runtime dependency or CCC installation on the Grok host is involved.
-The generated [capability matrix](provider-capability-matrix.md) records every
-unsupported/degraded axis. Runnable synthetic tests are not an operational
-Telegram acceptance or evidence that a provider was enabled on a fleet node.
+AgentRuntime events, the journal, and a transport to the Grok Bot computer.
+**Production Telegram for Grok is direct on that computer** (`cursor` /
+`box@cursor`): `CCC_GROK_TRANSPORT=local` runs the gateway helper on-host.
+A Seoseo SSH hop is retired and must not poll `@jinon_grok_bot`. No xAI model
+API is involved. The generated [capability matrix](provider-capability-matrix.md)
+records every unsupported/degraded axis. Runnable synthetic tests are not an
+operational Telegram acceptance.
 
 ## Explicit configuration and attachment
 
@@ -25,13 +27,14 @@ Git, screenshots or reports. In that configuration select:
 | Setting | Required value |
 | --- | --- |
 | `CCC_AGENT_PROVIDER` | `grok` |
-| `CCC_GROK_SSH_DESTINATION` | Explicit SSH account and trusted host |
+| `CCC_GROK_TRANSPORT` | `local` on the Grok computer (canonical). `ssh` is leftover/non-production. |
+| `CCC_GROK_SSH_DESTINATION` | Binding label (`box@cursor…`). Local transport does not open ssh(1). |
 | `CCC_GROK_BOT_ID` | Existing Grok Bot UUID |
 | `CCC_GROK_OWNER_ID` | One positive Telegram human user ID |
 | `CCC_GROK_TELEGRAM_BOT_ID` | Dedicated Telegram bot numeric ID |
 | `ALLOWED_USER_IDS` | Exactly the singleton owner ID list |
 | `CCC_REQUIRE_ALLOWLIST` | `true` |
-| `CCC_GROK_JOURNAL_PATH` | One explicit absolute private journal directory |
+| `CCC_GROK_JOURNAL_PATH` | One explicit absolute private journal directory on the Grok computer |
 
 The usual `TELEGRAM_BOT_TOKEN` stays in that project's private environment file.
 Its numeric prefix must match the selected Telegram bot; authenticated `getMe`
@@ -130,8 +133,10 @@ is private plaintext and has no witness for a valid whole-prefix rollback. See
    reset/file denial, restart, uncertainty, cancellation and journal tests.
 2. Identify the dedicated bot and its original token host/file location without
    copying the token. Confirm no webhook and inventory **all** possible pollers,
-   including other machines and destination aliases; the local socket is not
-   sufficient evidence. Do not reuse Seoseo's serving Telegram credentials.
+   including a retired Seoseo `ccc-grok-telegram.service` and destination aliases;
+   the local socket is not sufficient evidence. Do not reuse Seoseo's main
+   `@Jinon_openclaw_bot` credentials. Canonical poller: Grok computer
+   `/workspace/ccc-grok` with `CCC_GROK_TRANSPORT=local`.
 3. Preserve existing config, journal and service definitions privately. Explicitly
    attach the one journal, verify it with `inspect`, then run one isolated bridge.
    No unrelated provider/service is restarted. Keep the prior bridge stopped if
