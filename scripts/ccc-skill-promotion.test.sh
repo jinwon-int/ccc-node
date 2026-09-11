@@ -91,15 +91,24 @@ ok "disabled status is read-only and successful" \
 # A node-local run only plans/stages owner-only envelopes.
 write_skill release-checklist ""
 write_status release-checklist
-out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "dry-run plans local outbox staging, not a PR" \
   '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"would-stage-private-outbox\" and .staged[0].name == \"release-checklist\"" >/dev/null <<<"$out"'
 ok "dry-run creates no ledger or outbox" \
   '[ ! -e "$STATE/skill-promotion/ledger.jsonl" ] && [ ! -d "$STATE/skill-promotion/outbox" ]'
-out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true CCC_AUTONOMY=dry-run python3 "$PROMOTER" run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true CCC_AUTONOMY=dry-run python3 "$PROMOTER" run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "node staging honors fleet autonomy dry-run" \
   '[ "$rc" = 0 ] && jq -e ".mode == \"dry-run\" and .staged[0].outcome == \"would-stage-private-outbox\"" >/dev/null <<<"$out"'
-out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true CCC_AUTONOMY=kill python3 "$PROMOTER" run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true CCC_AUTONOMY=kill python3 "$PROMOTER" run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "node staging honors fleet autonomy kill" \
   '[ "$rc" = 0 ] && jq -e ".status == \"autonomy-kill\" and .staged == []" >/dev/null <<<"$out"'
 
@@ -164,7 +173,10 @@ stage_env=(
   "GH_TEST_STATE=$GH_STATE"
   "PATH=$BIN:$PATH"
 )
-out="$(env "${stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${stage_env[@]}" python3 "$PROMOTER" run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 # shellcheck disable=SC2034  # outbox_file is read via eval inside ok()
 outbox_file="$(find "$STATE/skill-promotion/outbox" -maxdepth 1 -type f -name '*.json' | head -1)"
 ok "live node run stages one owner-only envelope" \
@@ -291,10 +303,16 @@ ok "#1477: collect under a held promotion.lock reports locked (same shape as run
   '[ "$rc" = 0 ] && jq -e ".ok and .mode == \"collect\" and .status == \"locked\" and .publisher_enabled and .published == [] and .errors == []" >/dev/null <<<"$out"'
 ok "#1477: locked collect makes no GitHub call, no ack, no ledger row" \
   '[ ! -e "$LOCK_GH_STATE/calls" ] && [ -f "$STATE/skill-promotion/outbox/$lock_transport.json" ] && [ ! -e "$STATE/skill-promotion/sent/$lock_transport.json" ] && [ "$(grep -c . "$STATE/skill-promotion/ledger.jsonl")" = "$ledger_lines_locked" ]'
-out="$(env "${stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${stage_env[@]}" python3 "$PROMOTER" run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "#1477: run under a held promotion.lock still reports locked" \
   '[ "$rc" = 0 ] && jq -e ".ok and .mode == \"run\" and .status == \"locked\" and .staged == []" >/dev/null <<<"$out"'
-out="$(env "${lock_env[@]}" python3 "$PROMOTER" collect --dry-run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${lock_env[@]}" python3 "$PROMOTER" collect --dry-run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "#1477: collect --dry-run is read-only and skips the lock" \
   '[ "$rc" = 0 ] && jq -e ".mode == \"collect-dry-run\" and (.status // \"\") != \"locked\" and .published[0].outcome == \"would-open-private-intake-pr\" and .published[0].name == \"lock-check\"" >/dev/null <<<"$out"'
 ok "#1477: dry-run collect under the lock mutates nothing" \
@@ -315,26 +333,38 @@ ok "#1477: promotion.lock stays owner-only" \
 # Fresh scans continue to fail closed before any envelope is staged.
 write_skill leaky-skill '4. token=abcdefghijklmnop1234567890'
 write_status leaky-skill
-out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "credential-shaped content stays local and unstaged" \
   '[ "$rc" = 0 ] && jq -e ".staged == [] and .blocked[0].code == \"secret_credential-assignment\"" >/dev/null <<<"$out"'
 
 write_skill adopted-skill "" operator-adopt
 write_status adopted-skill
-out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "operator-adopted skill is excluded" \
   '[ "$rc" = 0 ] && jq -e ".blocked[0].code == \"autosave_marker_invalid\"" >/dev/null <<<"$out"'
 
 write_skill claude-local-skill '4. Inspect ~/.claude/state before continuing.'
 write_status claude-local-skill
-out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "runtime-coupled skill is excluded from automatic intake" \
   '[ "$rc" = 0 ] && jq -e ".blocked[0].code == \"runtime_specific_claude\"" >/dev/null <<<"$out"'
 
 write_skill linked-skill ""
 ln -s /etc/passwd "$CLAUDE_SKILLS/linked-skill/notes"
 write_status linked-skill
-out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "symlinked support content fails closed" \
   '[ "$rc" = 0 ] && jq -e ".blocked[0].code == \"source_symlink\"" >/dev/null <<<"$out"'
 
@@ -350,19 +380,28 @@ done
 
 write_skill identity-guard ""
 write_status identity-guard
-out="$(env -u CCC_NODE -u HOSTNAME "${no_node_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env -u CCC_NODE -u HOSTNAME "${no_node_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "no CCC_NODE/HOSTNAME: run fails closed instead of staging a placeholder" \
   '[ "$rc" != 0 ] && jq -e ".ok == false and .code == \"node_identity_unresolved\"" >/dev/null <<<"$out"'
 ok "no CCC_NODE/HOSTNAME: nothing is written to the outbox" \
   '[ ! -e "$STATE/skill-promotion/outbox" ] || [ -z "$(ls -A "$STATE/skill-promotion/outbox")" ]'
 
 # The guard must reject a name that sanitizes away, not just an unset variable.
-out="$(env "${no_node_env[@]}" CCC_NODE=' /// ' CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${no_node_env[@]}" CCC_NODE=' /// ' CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "CCC_NODE that sanitizes to empty also fails closed" \
   '[ "$rc" != 0 ] && jq -e ".code == \"node_identity_unresolved\"" >/dev/null <<<"$out"'
 
 # HOSTNAME alone still resolves — the guard rejects absence, not the fallback.
-out="$(env "${no_node_env[@]}" HOSTNAME=fallbacknode CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${no_node_env[@]}" HOSTNAME=fallbacknode CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "HOSTNAME alone still resolves an identity" \
   '[ "$rc" = 0 ] && jq -e ".staged[0].transport_id | startswith(\"fallbacknode-\")" >/dev/null <<<"$out"'
 
@@ -806,7 +845,10 @@ ok "R2 p1: review dispatch ledger row carries lineage fields" \
   'jq -e "select(.kind==\"a2a-dispatch\") | .node==\"testnode\" and .provider==\"claude\" and .name==\"r2-skill\" and .reviewer_node==\"reviewer1\"" >/dev/null "$ledger"'
 
 # Autonomy dry-run only polls — no verdict consumption, no comments.
-out="$(env "${r2_env[@]}" CCC_AUTONOMY=dry-run python3 "$PROMOTER" collect)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${r2_env[@]}" CCC_AUTONOMY=dry-run python3 "$PROMOTER" collect)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "R2: autonomy dry-run polls verdicts without consuming" \
   '[ "$rc" = 0 ] && jq -e ".mode == \"collect-dry-run\" and .revise.verdicts[0].outcome == \"would-poll-verdict\"" >/dev/null <<<"$out"'
 
@@ -1753,10 +1795,16 @@ piri_stage_env=(
   "GH_TEST_STATE=$GH_STATE"
   "PATH=$PIRI_BIN:$PATH"
 )
-out="$(env "${piri_stage_env[@]}" python3 "$PROMOTER" run --dry-run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${piri_stage_env[@]}" python3 "$PROMOTER" run --dry-run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "piri provider reaches run --dry-run staging" \
   '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"would-stage-private-outbox\" and .staged[0].provider == \"piri\" and .staged[0].name == \"piri-log-triage\"" >/dev/null <<<"$out"'
-out="$(env "${piri_stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${piri_stage_env[@]}" python3 "$PROMOTER" run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "piri envelope stages owner-only" \
   '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"staged\" and .staged[0].provider == \"piri\"" >/dev/null <<<"$out"'
 # shellcheck disable=SC2034  # piri_transport is read via eval inside ok()
@@ -1829,17 +1877,22 @@ danso_stage_env=(
   "GH_TEST_STATE=$GH_STATE"
   "PATH=$BIN:$PATH"
 )
-out="$(env "${danso_stage_env[@]}" python3 "$PROMOTER" run --dry-run)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${danso_stage_env[@]}" python3 "$PROMOTER" run --dry-run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "danso provider reaches run --dry-run staging" \
   '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"would-stage-private-outbox\" and .staged[0].provider == \"danso\" and .staged[0].name == \"danso-log-triage\"" >/dev/null <<<"$out"'
 # shellcheck disable=SC2034  # rc is read via eval inside ok()
-out="$(env "${danso_stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
+out="$(env "${danso_stage_env[@]}" python3 "$PROMOTER" run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "danso envelope stages owner-only" \
   '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"staged\" and .staged[0].provider == \"danso\"" >/dev/null <<<"$out"'
 # The root is omitted entirely without the env contract: nothing stages, no crash.
 # shellcheck disable=SC2034  # rc is read via eval inside ok()
 # shellcheck disable=SC2034  # out is read via eval inside ok()
-out="$(env "${danso_stage_env[@]}" CCC_SKILL_PROMOTION_PROVIDERS=claude,danso CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR= DANSO_SKILLS_DIR= CCC_DANSO_STATE_DIR= python3 "$PROMOTER" run --dry-run)")
+out="$(env "${danso_stage_env[@]}" CCC_SKILL_PROMOTION_PROVIDERS=claude,danso CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR= DANSO_SKILLS_DIR= CCC_DANSO_STATE_DIR= python3 "$PROMOTER" run --dry-run)"
 # shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "danso without env contract stages nothing and does not crash" \
