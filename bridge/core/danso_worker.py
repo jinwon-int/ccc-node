@@ -142,11 +142,13 @@ class _TaskStatus:
     requests: int
     reported_tokens: int
     resume_allowed: bool
+    unknown_usage_requests: int = 0
+    interruption_reason: str | None = None
 
 
 def _task_status(data):  # noqa: C901 -- strict nested protocol validation
     """Parse the provider-free native status projection without relaying data."""
-    if (type(data) is not dict or set(data) != TASK_STATUS_KEYS
+    if (type(data) is not dict or set(data) not in (TASK_STATUS_KEYS, TASK_STATUS_KEYS | {'recovery'})
             or type(data.get('version')) is not int or data['version'] != 1
             or data.get('kind') != 'long_task_status'
             or type(data.get('session_id')) is not str
@@ -166,7 +168,7 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
     limits = data['limits']
     usage = data['usage']
     if (type(limits) is not dict or set(limits) != TASK_STATUS_LIMIT_KEYS
-            or type(usage) is not dict or set(usage) != TASK_STATUS_USAGE_KEYS):
+            or type(usage) is not dict or set(usage) != (TASK_STATUS_USAGE_KEYS | ({'unknown_usage_requests'} if 'recovery' in data else set()))):
         raise ValueError('invalid task status')
     values = {}
     for key, maximum in (
@@ -186,6 +188,28 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
         if type(value) is not int or not 0 <= value <= maximum:
             raise ValueError('invalid task status usage')
         usage_values[key] = value
+    unknown = 0
+    reason = None
+    if 'recovery' in data:
+        recovery = data['recovery']
+        unknown = usage['unknown_usage_requests']
+        if (type(recovery) is not dict
+                or set(recovery) != {'interruption_reason', 'interrupted_requests',
+                                     'max_interrupted_requests', 'automatic_resume_allowed'}
+                or type(unknown) is not int or not 0 <= unknown <= 3
+                or unknown > usage_values['requests']
+                or type(recovery['interrupted_requests']) is not int
+                or recovery['interrupted_requests'] != unknown
+                or type(recovery['max_interrupted_requests']) is not int
+                or recovery['max_interrupted_requests'] != 3
+                or recovery['automatic_resume_allowed'] is not False):
+            raise ValueError('invalid task recovery assessment')
+        reason = recovery['interruption_reason']
+        if (reason is not None and (type(reason) is not str or reason not in
+                {'user_stop', 'signal_termination', 'run_deadline', 'unknown'})):
+            raise ValueError('invalid task interruption reason')
+        if (unknown == 0) != (reason is None) or (unknown == 3 and data['resume_allowed']):
+            raise ValueError('inconsistent task recovery assessment')
     pending = data['pending']
     if pending is not None:
         if type(pending) is not dict:
@@ -203,7 +227,8 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
     return _TaskStatus(
         session_id=data['session_id'],
         state=data['state'], stage=data['stage'], elapsed_ms=data['elapsed_ms'],
-        resume_allowed=data['resume_allowed'], **values, **usage_values,
+        resume_allowed=data['resume_allowed'], unknown_usage_requests=unknown,
+        interruption_reason=reason, **values, **usage_values,
     )
 
 
@@ -671,7 +696,7 @@ class DansoSession:
             effective_max_requests = r.task_max_requests
             effective_max_tokens = r.task_max_tokens
             resume_stage = None
-            if resume_task:
+            if resume_task or (r.long_task and os.path.lexists(r.root / (self.session_id + '.jsonl'))):
                 status_task = asyncio.create_task(self._read_task_status())
                 self._bootstrap_task = status_task
                 try:
@@ -711,32 +736,42 @@ class DansoSession:
                     for event in events:
                         yield event
                     return
-                try:
-                    if status.state not in {'ready', 'paused'} or not status.resume_allowed:
-                        raise ValueError('task is not resumable')
-                    remaining = status.wall_seconds - (status.elapsed_ms / 1000)
-                    if remaining <= 0:
-                        raise ValueError('task has no remaining wall time')
-                    if (r.outer_timeout is not None
-                            and r.outer_timeout < remaining + 10):
-                        raise ValueError('outer deadline is too short for saved task')
-                except (OSError, asyncio.TimeoutError, ValueError):
+                if not resume_task and status.state not in {'completed', 'failed', 'not_long_task'}:
                     self._active = False
-                    events.append(ErrorEvent(
-                        code='danso_task_resume_unavailable',
-                        message=(
-                            'Saved Danso task cannot be resumed safely; its checkpoint '
-                            'or remaining deadline is unavailable.'
-                        ),
-                    ))
-                    for event in events:
-                        yield event
+                    yield ErrorEvent(
+                        code='danso_task_recovery_required',
+                        message=('Saved Danso task requires an explicit choice. Use /task_recover '
+                                 'to inspect it, /task_resume for an eligible checkpoint, '
+                                 'or /new for a new objective.'),
+                    )
                     return
-                effective_timeout = remaining
-                effective_wall = status.wall_seconds
-                effective_max_requests = status.max_requests
-                effective_max_tokens = status.max_tokens
-                resume_stage = status.stage
+                if resume_task:
+                    try:
+                        if status.state not in {'ready', 'paused'} or not status.resume_allowed:
+                            raise ValueError('task is not resumable')
+                        remaining = status.wall_seconds - (status.elapsed_ms / 1000)
+                        if remaining <= 0:
+                            raise ValueError('task has no remaining wall time')
+                        if (r.outer_timeout is not None
+                                and r.outer_timeout < remaining + 10):
+                            raise ValueError('outer deadline is too short for saved task')
+                    except (OSError, asyncio.TimeoutError, ValueError):
+                        self._active = False
+                        events.append(ErrorEvent(
+                            code='danso_task_resume_unavailable',
+                            message=(
+                                'Saved Danso task cannot be resumed safely; its checkpoint '
+                                'or remaining deadline is unavailable.'
+                            ),
+                        ))
+                        for event in events:
+                            yield event
+                        return
+                    effective_timeout = remaining
+                    effective_wall = status.wall_seconds
+                    effective_max_requests = status.max_requests
+                    effective_max_tokens = status.max_tokens
+                    resume_stage = status.stage
             command = [r.binary, '--sandbox', r.sandbox, '--cwd', str(self.cwd), '--session', str(r.root / (self.session_id + '.jsonl')),
                        '--provider', r.provider, '--model', r.model, '--max-turns', str(r.max_turns),
                        '--max-output-tokens', str(r.max_output_tokens),

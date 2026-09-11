@@ -430,3 +430,21 @@ transcripts and provider response bodies are not copied into session state.
 Only the offer token, route/identity binding and content fingerprint are saved
 through the existing private, atomic session store. This is a source change;
 production rollout and restart are separate from merging it.
+
+### Provider interruption recovery (native Danso #99)
+
+With long-task mode enabled, an existing journal is assessed through the
+provider-free `--task-status` path before a normal turn is dispatched. Unfinished
+or invalid state returns recovery guidance without starting a model/tool worker;
+a new user message never becomes an implicit continuation of the saved objective.
+Completed/failed tasks and fresh sessions retain their existing behavior. Native
+runtime locking and full journal validation remain authoritative at dispatch.
+
+The adapter accepts both legacy status and the additive native recovery
+assessment. A durable provider-only cancellation can be explicitly resumed using
+`/task_resume` or the existing Continue choice; `/stop` never initiates a resume.
+The assessment preserves cumulative limits and exposes unknown token usage. The
+recovery summary explains that a repeated model request may add cost. Pending
+legacy/SIGKILL journals and uncertain tool effects remain blocked. Native and
+adapter changes must both be installed before relying on the new assessment;
+this source change does not migrate journals or deploy a node.

@@ -358,3 +358,10 @@ async def test_task_resume_binding_change_mid_call_never_offers(tmp_path):
     bot._reply_smart.assert_awaited_once()
     assert OFFER not in await manager.get_session('7:9')
     bot.application.bot.send_message.assert_not_awaited()
+
+
+def test_recovery_summary_discloses_unknown_usage_and_repeat_cost():
+    result = replace(snapshot('paused', True), unknown_usage_requests=1,
+                     interruption_reason='signal_termination')
+    assert '토큰 사용량은 미확인' in result.render()
+    assert '비용이 추가' in result.render()
