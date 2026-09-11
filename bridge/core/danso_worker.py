@@ -6,6 +6,7 @@ Telegram composition and configuration live in danso_runtime.py.
 import asyncio
 from dataclasses import dataclass
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -209,21 +210,18 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
         if (unknown == 0) != (reason is None) or (unknown == 3 and data['resume_allowed']):
             raise ValueError('inconsistent task recovery assessment')
     pending = data['pending']
-    if pending is not None:
-        if type(pending) is not dict:
-            raise ValueError('invalid task status pending')
-        if set(pending) == {'kind'}:
-            if pending['kind'] not in {'tool', 'tools'}:
-                raise ValueError('invalid task status pending')
-        elif set(pending) == {'kind', 'sequence'}:
-            if (pending['kind'] != 'provider'
-                    or type(pending['sequence']) is not int
-                    or not 0 <= pending['sequence'] <= 2**64 - 1):
-                raise ValueError('invalid task status pending')
-        else:
-            raise ValueError('invalid task status pending')
-    if data['state'] == 'blocked' and (pending != {'kind': 'tool'} or data['resume_allowed']):
-        raise ValueError('invalid blocked task status')
+    state = data['state']
+    if state == 'pending_provider':
+        if (type(pending) is not dict or set(pending) != {'kind', 'sequence'}
+                or pending['kind'] != 'provider' or type(pending['sequence']) is not int
+                or pending['sequence'] != usage_values['requests'] + 1
+                or pending['sequence'] > values['max_requests']):
+            raise ValueError('inconsistent provider pending status')
+    elif state in {'pending_tools', 'blocked'}:
+        if pending != {'kind': 'tool' if state == 'blocked' else 'tools'}:
+            raise ValueError('inconsistent tool pending status')
+    elif pending is not None:
+        raise ValueError('unexpected pending task status')
     if data['resume_allowed'] and (
             data['state'] not in {'ready', 'paused'} or pending is not None
             or data['elapsed_ms'] >= values['wall_seconds'] * 1000
@@ -625,9 +623,27 @@ class DansoSession:
             self._stop_task = asyncio.create_task(_stop(self._process))
         await asyncio.shield(self._stop_task)
 
+    async def _status_journal_binding(self):
+        from telegram_bot.memory.danso_snapshot import _read_locked
+        from telegram_bot.memory.distill_types import SnapshotUnavailableError
+        try:
+            payload, metadata = await asyncio.to_thread(
+                _read_locked, self.runtime.root, self.session_id)
+            header = json.loads(payload.split(b'\n', 1)[0], object_pairs_hook=_unique_object)
+            if (not payload.endswith(b'\n') or type(header) is not dict
+                    or header.get('type') != 'session' or type(header.get('version')) is not int
+                    or header['version'] != 3 or header.get('cwd') != str(self.cwd)
+                    or type(header.get('id')) is not str
+                    or str(uuid.UUID(header['id'])) != header['id']):
+                raise ValueError('invalid task journal binding')
+            return header['id'], metadata.st_dev, metadata.st_ino, hashlib.sha256(payload).digest()
+        except (SnapshotUnavailableError, OSError, ValueError, UnicodeError, RecursionError) as exc:
+            raise ValueError('task journal binding unavailable') from exc
+
     async def _read_task_status(self):
         """Read the saved native task state without credentials or mutation."""
         r = self.runtime
+        binding = await self._status_journal_binding()
         journal = r.root / (self.session_id + '.jsonl')
         command = [r.binary, '--task-status', '--session', str(journal)]
         spawn = asyncio.create_task(asyncio.create_subprocess_exec(
@@ -668,8 +684,10 @@ class DansoSession:
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise ValueError('invalid task status') from exc
         status = _task_status(data)
-        if status.session_id != self.session_id:
+        if status.session_id != binding[0]:
             raise ValueError('task status session mismatch')
+        if await self._status_journal_binding() != binding:
+            raise ValueError('task journal changed during status inspection')
         return status
 
     async def send_turn(self, message, *, approval_handler=deny_approval):  # noqa: C901 -- subprocess lifecycle and terminal event mapping

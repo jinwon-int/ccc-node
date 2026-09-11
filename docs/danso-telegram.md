@@ -448,3 +448,10 @@ recovery summary explains that a repeated model request may add cost. Pending
 legacy/SIGKILL journals and uncertain tool effects remain blocked. Native and
 adapter changes must both be installed before relying on the new assessment;
 this source change does not migrate journals or deploy a node.
+
+The bridge's session filename UUID and native journal-header UUID are independent.
+Status binding reads the selected owner-only journal under the native shared lock,
+checks its header UUID and workspace, and requires the same bytes and inode after
+native inspection. It never searches another filename/audience to make an ID fit.
+The parser rejects state/pending contradictions even when resume is false, so a
+claimed terminal state cannot hide a pending request and authorize a new turn.
