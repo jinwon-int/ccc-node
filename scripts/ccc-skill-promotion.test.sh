@@ -1662,6 +1662,133 @@ rc=$?
 ok "dispatch packets state the candidate/scaffolding boundary in words and put candidate content last" \
   '[ "$rc" = 0 ] && grep -q "PACKET-BOUNDARY-OK" "$TMP/boundary-out"'
 
+# ─── #1653: piri provider staging + collection ───────────────────────────
+# A piri autosave install (marker provider=piri in the piri root) reaches the
+# intake pipeline: run --dry-run stages it, run writes the envelope, and the
+# publisher collect accepts provider=piri without envelope_provider_invalid.
+PIRI_SKILLS="$HOME_DIR/.piri/agent/skills"
+mkdir -p "$PIRI_SKILLS"
+chmod 700 "$HOME_DIR/.piri" "$HOME_DIR/.piri/agent" "$PIRI_SKILLS"
+write_piri_skill() {
+  local name="$1"
+  local dir="$PIRI_SKILLS/$name" sha
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  printf -- '---\nname: %s\ndescription: Capture a reusable piri lane log triage workflow safely.\n---\n\n# Procedure\n\n1. Inspect the piri session tree.\n2. Run the bounded triage.\n3. Record the result.\n' \
+    "$name" > "$dir/SKILL.md"
+  chmod 600 "$dir/SKILL.md"
+  sha="$(sha256sum "$dir/SKILL.md" | awk '{print $1}')"
+  jq -nc --arg name "$name" --arg sha "$sha" \
+    '{schema_version:2,manager:"ccc-node-skill-autosave",ownership:"autosave-managed",
+      provider:"piri",name:$name,target_id:("target-"+$name),skill_sha256:$sha,
+      created_by:"ccc-node",provenance_revision:1,rollback_eligible:true}' \
+    > "$dir/.autosave-meta.json"
+  chmod 600 "$dir/.autosave-meta.json"
+}
+write_piri_status() {
+  local name="$1" sha
+  sha="$(sha256sum "$PIRI_SKILLS/$name/SKILL.md" | awk '{print $1}')"
+  jq -nc --arg name "$name" --arg sha "$sha" \
+    '{skills:[{autonomous_write_allowed:true,classification:"autosave-managed",
+      pinned:false,provider:"piri",name:$name,target_id:("target-"+$name),
+      skill_sha256:$sha,provenance_revision:1}]}' > "$STATUS_JSON"
+}
+write_piri_skill piri-log-triage
+write_piri_status piri-log-triage
+# The #2024 dual-broker section above rewrote $BIN/gh into the keyring stub
+# (which rejects `gh auth status`), so this section carries its own bin dir
+# with a fresh copy of the plain publisher stub.
+PIRI_BIN="$TMP/bin-piri"
+mkdir -p "$PIRI_BIN"
+write_exec_stub "$PIRI_BIN/gh" <<'SH'
+set -eu
+mkdir -p "$GH_TEST_STATE"
+printf '%s\n' "$*" >> "$GH_TEST_STATE/calls"
+case "${1:-} ${2:-}" in
+  "auth status") exit 0 ;;
+  "repo view")
+    if [ "${GH_TEST_PRIVATE:-true}" = "true" ]; then
+      printf '{"isPrivate":true,"visibility":"PRIVATE"}\n'
+    else
+      printf '{"isPrivate":false,"visibility":"PUBLIC"}\n'
+    fi
+    ;;
+  "pr list")
+    head=""
+    previous=""
+    for argument in "$@"; do
+      [ "$previous" = "--head" ] && head="$argument"
+      previous="$argument"
+    done
+    key="$(printf '%s' "$head" | sha256sum | awk '{print $1}')"
+    if [ -f "$GH_TEST_STATE/created-$key" ]; then
+      printf '[{"url":"https://github.com/test/repo/pull/1","state":"OPEN","isDraft":true}]\n'
+    else
+      printf '[]\n'
+    fi
+    ;;
+  "pr create")
+    head=""
+    previous=""
+    for argument in "$@"; do
+      [ "$previous" = "--head" ] && head="$argument"
+      previous="$argument"
+    done
+    key="$(printf '%s' "$head" | sha256sum | awk '{print $1}')"
+    printf '%s\n' "$*" >> "$GH_TEST_STATE/create.args"
+    : > "$GH_TEST_STATE/created-$key"
+    printf 'https://github.com/test/repo/pull/1\n'
+    ;;
+  *) exit 9 ;;
+esac
+SH
+# NOTE: keep the piri ownership row in place for both runs — the stub status
+# file is the discovery source, unlike a real ownership.py which filters rows
+# by the requested provider.
+piri_stage_env=(
+  "${base_env[@]}"
+  "CCC_SKILL_PROMOTION_ENABLED=true"
+  "CCC_SKILL_PROMOTION_PROVIDERS=claude,piri"
+  "CCC_SKILL_PROMOTION_PIRI_SKILLS_DIR=$PIRI_SKILLS"
+  "GH_TEST_STATE=$GH_STATE"
+  "PATH=$PIRI_BIN:$PATH"
+)
+out="$(env "${piri_stage_env[@]}" python3 "$PROMOTER" run --dry-run)"; rc=$?
+ok "piri provider reaches run --dry-run staging" \
+  '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"would-stage-private-outbox\" and .staged[0].provider == \"piri\" and .staged[0].name == \"piri-log-triage\"" >/dev/null <<<"$out"'
+out="$(env "${piri_stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
+ok "piri envelope stages owner-only" \
+  '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"staged\" and .staged[0].provider == \"piri\"" >/dev/null <<<"$out"'
+# shellcheck disable=SC2034  # piri_transport is read via eval inside ok()
+piri_transport="$(env "${piri_stage_env[@]}" python3 "$PROMOTER" export --limit 1 | jq -r '.envelopes[0].transport_id')"
+ok "piri transport id carries the piri provider" 'grep -qF -- "-piri-piri-log-triage-" <<<"$piri_transport"'
+# Publisher side: the shared stub state ($GH_STATE) is reused; branch/PR
+# assertions below read the collect output and the seed remote directly.
+piri_publish_env=(
+  "${piri_stage_env[@]}"
+  "CCC_SKILL_PROMOTION_PUBLISHER=true"
+  "CCC_SKILL_PROMOTION_REMOTE=$REMOTE"
+  "GH_TEST_PRIVATE=true"
+)
+out="$(env "${piri_publish_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+# shellcheck disable=SC2034  # piri_branch is read via eval inside ok()
+piri_branch="$(jq -r '.published[0].branch' <<<"$out")"
+# shellcheck disable=SC2034  # piri_candidate is read via eval inside ok()
+piri_candidate="piri-log-triage-$(jq -r '.published[0].tree_sha256[0:12]' <<<"$out")"
+ok "publisher collects the piri envelope without provider rejection" \
+  '[ "$rc" = 0 ] && jq -e ".published[0].outcome == \"pr-opened\" and .published[0].provider == \"piri\"" >/dev/null <<<"$out"'
+ok "piri intake branch lands under intake/<node>/piri/" \
+  'git --git-dir="$REMOTE" show "$piri_branch:intake/testnode/piri/$piri_candidate/manifest.json" | jq -e ".provider == \"piri\"" >/dev/null'
+ok "piri collection acknowledges and retains the envelope" \
+  '[ -f "$STATE/skill-promotion/sent/$piri_transport.json" ] && [ ! -e "$STATE/skill-promotion/outbox/$piri_transport.json" ]'
+# The envelope's provider set stays authoritative: an unknown provider value is
+# still rejected at both layers.
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_PROVIDERS=claude,danso python3 "$PROMOTER" status)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "unknown provider value is still rejected" '[ "$rc" != 0 ]'
+
 echo "PASS=$pass FAIL=$fail"
 python3 "$HERE/ccc_skill_receipt_retry_test.py" || fail=$((fail+1))
 [ "$fail" -eq 0 ]
