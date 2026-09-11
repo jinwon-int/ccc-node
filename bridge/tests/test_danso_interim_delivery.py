@@ -116,3 +116,44 @@ def test_progress_default_opt_out_and_legacy_capability(configured):
     assert build_danso_runtime(configured).progress_jsonl
     disabled = configured.model_copy(update={'danso_progress_enabled': False})
     assert not build_danso_runtime(disabled).progress_jsonl
+
+
+def test_documented_environment_opt_out(configured, tmp_path):
+    loaded = type(configured).load(project_root=configured.project_root,
+        bot_env_file=tmp_path/'absent-progress-env', environ={
+            'TELEGRAM_BOT_TOKEN': '123456:synthetic', 'ALLOWED_USER_IDS': '[7]',
+            'CCC_DANSO_PROGRESS_ENABLED': 'false',
+        })
+    assert not loaded.danso_progress_enabled
+
+
+@pytest.mark.anyio
+async def test_checkpoint_is_not_starved_by_continuous_stdout(configured):
+    from telegram_bot.core.agent_runtime import SessionRequest
+    binary = Path(configured.danso_cli_path)
+    body = '''def emit(record): print(json.dumps(record),flush=True)
+def checkpoint(stage):
+ print('DANSO_TASK='+json.dumps(dict(version=1,state='checkpoint',stage=stage,requests=stage,reported_tokens=stage,elapsed_seconds=stage)),file=sys.stderr,flush=True)
+emit(dict(type='session',version=3))
+checkpoint(0)
+for seq in range(1,201):
+ emit(dict(type='danso_progress',version=1,sequence=seq,phase='started',tool='bash'))
+ emit(dict(type='danso_progress',version=1,sequence=seq,phase='settled',tool='bash',success=True))
+ if seq==2: checkpoint(1)
+emit(dict(type='message',message=dict(role='assistant',stopReason='stop',content=[dict(type='text',text='done')])))
+usage=dict(requests=2,inputTokens=10,outputTokens=3,cacheReadTokens=4,cacheWriteTokens=0,totalTokens=17)
+for prefix in ('DANSO_USAGE','PIRI_USAGE'): print(prefix+'='+json.dumps(usage),file=sys.stderr,flush=True)
+'''
+    binary.write_text(SCRIPT[:SCRIPT.index('def emit')] + body)
+    runtime = build_danso_runtime(configured.model_copy(update={'danso_long_task_enabled': True}))
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    tools_seen, checkpoint_seen = 0, False
+    async for event in session.send_turn('continuous work'):
+        if event.kind in {'tool_started', 'tool_completed'}:
+            tools_seen += 1
+            await asyncio.sleep(.001)
+        if event.kind == 'task_progress' and event.stage == 1:
+            assert tools_seen < 50, 'checkpoint was buffered behind stdout'
+            checkpoint_seen = True
+    assert checkpoint_seen and tools_seen == 400
+    assert event.kind == 'completion'

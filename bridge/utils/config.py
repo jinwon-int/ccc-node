@@ -276,6 +276,7 @@ class Config(
     # The ordinary-mode deadline remains separate from the cumulative task limit.
     danso_progress_enabled: bool = Field(
         default=True,
+        alias="CCC_DANSO_PROGRESS_ENABLED",
         description="Deliver completed Danso interim messages and tool progress when the CLI supports JSONL.",
     )
     danso_long_task_enabled: bool = Field(

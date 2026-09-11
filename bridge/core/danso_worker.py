@@ -844,6 +844,7 @@ class DansoSession:
         stdout = stderr = None
         stdout_done = stderr_done = False
         last_progress = None
+        prefer_task_progress = True
         try:
             async with asyncio.timeout(timeout_seconds + 5):
                 while True:
@@ -857,13 +858,16 @@ class DansoSession:
                     if not stderr_done and stderr_task.done():
                         stderr = stderr_task.result()
                         stderr_done = True
-                    if tool_task is not None and tool_task.done():
+                    if (tool_task is not None and tool_task.done()
+                            and (not prefer_task_progress or progress_task is None or not progress_task.done())):
+                        prefer_task_progress = True
                         item = tool_task.result()
                         tool_task = (asyncio.create_task(tool_queue.get())
                                      if not stdout_done or not tool_queue.empty() else None)
                         yield item
                         continue
-                    if stdout_done and tool_task is not None and tool_queue.empty():
+                    if (stdout_done and tool_task is not None and not tool_task.done()
+                            and tool_queue.empty()):
                         tool_task.cancel()
                         await asyncio.gather(tool_task, return_exceptions=True)
                         tool_task = None
@@ -873,6 +877,7 @@ class DansoSession:
                             progress_task = None
                         else:
                             last_progress = item
+                            prefer_task_progress = False
                             if item.state == 'checkpoint' and not self._task_progress_seen:
                                 self._task_progress_seen = True
                                 # New tasks must prove native readiness with

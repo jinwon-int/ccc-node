@@ -137,3 +137,12 @@ async def test_fragmented_interim_frames_preserve_event_order_and_final_once():
     assert [queue.get_nowait().kind for _ in range(queue.qsize())] == [
         'text_delta', 'message_completed', 'tool_started', 'tool_completed']
     assert d.finish() == b'done'
+
+
+@pytest.mark.parametrize('pieces', [('api_key=123456', '789012'),
+    ('Bearer sk-proj-' + 'a'*8, 'b'*30), ('ghp_' + 'a'*10, 'b'*26)])
+def test_credentials_split_across_text_blocks_are_redacted(pieces):
+    events = decoder().feed(json.dumps(interim_record(
+        *[{'type': 'text', 'text': piece} for piece in pieces], call_block())))
+    assert events
+    assert pieces[1] not in events[0].text

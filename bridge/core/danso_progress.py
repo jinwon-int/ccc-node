@@ -40,7 +40,9 @@ def _interim(message):
             calls += 1
     if not calls:
         raise ValueError('interim response requires tool calls')
-    text = redact_credentials('\n'.join(texts)).strip()[:4096]
+    # Text blocks may split a credential at any byte boundary. Reassemble
+    # fragments before redaction; inserting separators could hide a match.
+    text = redact_credentials(''.join(texts)).strip()[:4096]
     return [TextDeltaEvent(text=text), MessageCompletedEvent()] if text else None
 
 
