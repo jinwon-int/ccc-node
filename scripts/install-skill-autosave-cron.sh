@@ -39,6 +39,13 @@ BLOCK_END="# ccc-node:autosave-schedule:end"
 APPLY=0
 REMOVE=0
 OPT_NODE=""
+# #1655: bake the provider lane into the cron line. piri (and codex) are
+# explicit-only/auto-detected providers, so a scheduled sweep that should draft
+# or install on a non-Claude lane needs the provider recorded in the entry —
+# hand-edited crontabs are overwritten by the next reinstall.
+OPT_PROVIDER=""
+OPT_PIRI_DRAFTING=0
+OPT_CODEX_DRAFTING=0
 
 # Shared installer libs (#1081, #1077): gen stamps + records, and the common
 # crontab install/remove driver.
@@ -164,9 +171,20 @@ Options:
                    the SSH alias it dialled, not the machine name. When it cannot
                    be resolved the entry installs without it and promotion stays
                    fail-closed (#1067).
+  --provider NAME  Bake CCC_SKILL_PROVIDER=NAME (claude|codex|piri) into the
+                   entry so the scheduled sweep resolves the provider lane
+                   explicitly (#1655). Defaults to \$CCC_SKILL_PROVIDER when set;
+                   otherwise the entry carries no provider and the sweep
+                   auto-detects as before. piri is explicit-only (#643), so piri
+                   nodes must pass --provider piri (or export
+                   CCC_SKILL_PROVIDER=piri) for the piri target to engage.
+  --piri-drafting  Bake CCC_SKILL_PIRI_DRAFTING=1 into the entry (opt-in piri
+                   sweep branch; mirrors the codex flag below).
+  --codex-drafting Bake CCC_SKILL_CODEX_DRAFTING=1 into the entry.
 
 Env overrides: CCC_CLAUDE_DIR, CCC_STATE_DIR, CCC_SKILL_AUTOSAVE_CMD,
-CCC_SKILL_AUTOSAVE_CRON, CCC_SKILL_AUTOSAVE_CRON_LOG, CCC_CRONTAB_CMD.
+CCC_SKILL_AUTOSAVE_CRON, CCC_SKILL_AUTOSAVE_CRON_LOG, CCC_CRONTAB_CMD,
+CCC_SKILL_PROVIDER (inherited as the baked provider when --provider is unset).
 CCC_SKILL_AUTOSAVE_LOCAL_TIMEZONE and CCC_SKILL_AUTOSAVE_LOCAL_UTC_OFFSET
 (+HHMM/-HHMM) are advanced deterministic overrides for image builds and
 tests; normal installs auto-detect both.
@@ -180,6 +198,15 @@ while [ $# -gt 0 ]; do
     --remove) REMOVE=1 ;;
     --schedule) ccc_cron_need_val "$1" "${2:-}"; SCHEDULE="$2"; shift ;;
     --node) ccc_cron_need_val "$1" "${2:-}"; OPT_NODE="$2"; shift ;;
+    --provider)
+      ccc_cron_need_val "$1" "${2:-}"
+      case "$2" in
+        claude|codex|piri) OPT_PROVIDER="$2" ;;
+        *) echo "invalid --provider '$2' (want claude|codex|piri)" >&2; exit 2 ;;
+      esac
+      shift ;;
+    --piri-drafting) OPT_PIRI_DRAFTING=1 ;;
+    --codex-drafting) OPT_CODEX_DRAFTING=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -191,24 +218,39 @@ if [ ! -f "$AUTOSAVE" ] && [ -f "$ROOT/scripts/ccc-skill-autosave.sh" ]; then
 fi
 
 FLEET_NODE="$(resolve_fleet_node)"
+# #1655: --provider > inherited \$CCC_SKILL_PROVIDER > none (auto-detect).
+CRON_PROVIDER="$OPT_PROVIDER"
+if [ -z "$CRON_PROVIDER" ] && [ -n "${CCC_SKILL_PROVIDER:-}" ]; then
+  case "$CCC_SKILL_PROVIDER" in
+    claude|codex|piri) CRON_PROVIDER="$CCC_SKILL_PROVIDER" ;;
+  esac
+fi
+CRON_ENV=""
 if [ -n "$FLEET_NODE" ]; then
-  CRON_LINE="$SCHEDULE bash -lc 'CCC_NODE=\"$FLEET_NODE\" CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
+  CRON_ENV="CCC_NODE=\"$FLEET_NODE\" CCC_CLAUDE_DIR=\"$CLAUDE_DIR\""
 else
+  CRON_ENV="CCC_CLAUDE_DIR=\"$CLAUDE_DIR\""
   # Install anyway: the entry also refreshes candidates, drafts skills and
   # queues owner notifications, and those work without a fleet identity. Only
   # skill-promotion staging needs it, and that is opt-in and already fail-closed
   # (#1068) — so warn where the operator can see it instead of blocking cron.
-  CRON_LINE="$SCHEDULE bash -lc 'CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
   echo "WARNING: no fleet identity resolved (--node, \$CCC_NODE, $STATE_DIR/node.txt)." >&2
   echo "         Installing without CCC_NODE; scheduled skill-promotion staging will" >&2
   echo "         refuse with node_identity_unresolved until one is provided (#1067)." >&2
 fi
+[ -n "$CRON_PROVIDER" ] && CRON_ENV="$CRON_ENV CCC_SKILL_PROVIDER=\"$CRON_PROVIDER\""
+[ "$OPT_PIRI_DRAFTING" = 1 ] && CRON_ENV="$CRON_ENV CCC_SKILL_PIRI_DRAFTING=1"
+[ "$OPT_CODEX_DRAFTING" = 1 ] && CRON_ENV="$CRON_ENV CCC_SKILL_CODEX_DRAFTING=1"
+CRON_LINE="$SCHEDULE bash -lc '$CRON_ENV \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
 
 # Install record (#1081 phase 2): replay must reproduce THIS entry, so the
 # resolved schedule and fleet identity are materialized into argv rather than
 # re-derived from the operator's environment.
 record_argv=(--apply --schedule "$SCHEDULE")
 [ -n "$FLEET_NODE" ] && record_argv+=(--node "$FLEET_NODE")
+[ -n "$CRON_PROVIDER" ] && record_argv+=(--provider "$CRON_PROVIDER")
+[ "$OPT_PIRI_DRAFTING" = 1 ] && record_argv+=(--piri-drafting)
+[ "$OPT_CODEX_DRAFTING" = 1 ] && record_argv+=(--codex-drafting)
 
 # The block body carries the CRON_TZ pin ahead of the entry line (cron has no
 # per-job inline timezone syntax; the pin keeps an unrelated earlier CRON_TZ

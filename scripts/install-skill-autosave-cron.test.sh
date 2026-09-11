@@ -175,5 +175,34 @@ guess="CCC_NODE=\"${hn}\""
 ok "unresolved identity never guesses the hostname" \
   '! grep -qF "$guess" "$CRON_STORE"'
 
+# --- #1655: provider lane is baked into the cron line -----------------------
+rm -f "$CRON_STORE"
+run bash "$SC" --apply --provider piri --piri-drafting
+okc "$RC" 0 "--provider piri --piri-drafting applies"
+ok "provider is baked into the entry" 'grep -qF "CCC_SKILL_PROVIDER=\"piri\"" "$CRON_STORE"'
+ok "piri drafting flag is baked" 'grep -qF "CCC_SKILL_PIRI_DRAFTING=1" "$CRON_STORE"'
+ok "codex drafting flag is absent unless asked" '! grep -qF "CCC_SKILL_CODEX_DRAFTING" "$CRON_STORE"'
+ok "record argv carries the provider options" \
+  'jq -e "[(.argv | index(\"--provider\")), (.argv | index(\"piri\")), (.argv | index(\"--piri-drafting\"))] | all(. != null)" "$REC" >/dev/null'
+
+rm -f "$CRON_STORE"
+run bash "$SC" --apply --provider codex --codex-drafting
+okc "$RC" 0 "--provider codex --codex-drafting applies"
+ok "codex provider and flag are baked" \
+  'grep -qF "CCC_SKILL_PROVIDER=\"codex\"" "$CRON_STORE" && grep -qF "CCC_SKILL_CODEX_DRAFTING=1" "$CRON_STORE"'
+
+# CCC_SKILL_PROVIDER is inherited when --provider is unset; no provider at all
+# keeps the entry provider-free (sweep auto-detects as before).
+rm -f "$CRON_STORE"
+run env CCC_SKILL_PROVIDER=piri bash "$SC" --apply
+ok "env provider is inherited into the entry" 'grep -qF "CCC_SKILL_PROVIDER=\"piri\"" "$CRON_STORE"'
+rm -f "$CRON_STORE"
+run bash "$SC" --apply
+ok "no provider anywhere omits the assignment" '! grep -qF "CCC_SKILL_PROVIDER" "$CRON_STORE"'
+
+run bash "$SC" --provider danso
+okc "$RC" 2 "invalid provider value exits 2"
+ok "invalid provider is reported" 'grep -q "invalid --provider" "$OUT"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
