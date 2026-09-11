@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from skill_lookup_fixtures import build_lookup_world
+
 import sys_modules_isolation
 
 BRIDGE_DIR = Path(__file__).resolve().parents[1]
@@ -158,11 +160,6 @@ def _restore_volatile_modules():
 # around every test by this conftest, and the fixture pins only what the
 # lookup itself reads.
 # ---------------------------------------------------------------------------
-
-import json as _json
-
-from skill_lookup_fixtures import build_lookup_world
-
 
 @pytest.fixture
 def lookup_env(tmp_path: Path, monkeypatch) -> dict[str, str]:
