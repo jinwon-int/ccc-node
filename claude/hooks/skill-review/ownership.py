@@ -53,13 +53,14 @@ except ImportError:
 
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-# #1656: single provider set — the CLI choices, the env auto-detect, and the
-# guard-proposal/receipt payload validation must not drift apart again (the
+# #1656/#1659: single provider set — the CLI choices, the env auto-detect, and
+# the guard-proposal/receipt payload validation must not drift apart again (the
 # CLI accepted piri while proposal/receipt validation rejected it).
-_PROVIDERS = ("claude", "codex", "piri")
+_PROVIDERS = ("claude", "codex", "piri", "danso")
 # Providers that share the codex runtime-compat screen (autoinstall's
-# gate_codex_compat applies the same coupling rules to codex and piri).
-_NON_CLAUDE_PROVIDERS = ("codex", "piri")
+# gate_codex_compat applies the same coupling rules to codex and piri; danso
+# joins in #1659 and additionally screens codex couplings there).
+_NON_CLAUDE_PROVIDERS = ("codex", "piri", "danso")
 _ATTEMPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _AUTOSAVE_MARKER = ".autosave-meta.json"
 _MANAGED_MARKER = ".ccc-node-managed.json"
@@ -266,6 +267,16 @@ def _build_context(args: argparse.Namespace) -> Context:
     elif provider == "piri":
         piri_agent = Path(os.environ.get("PIRI_CODING_AGENT_DIR", home / ".piri" / "agent"))
         skills_dir = Path(os.environ.get("PIRI_SKILLS_DIR", piri_agent / "skills"))
+    elif provider == "danso":
+        # #1659 contract, fail-closed: explicit DANSO_SKILLS_DIR wins, then the
+        # bridge-fixed danso HOME (<CCC_DANSO_STATE_DIR>/home). No login-HOME
+        # fallback — ~/.pi/agent/skills is the interactive root and is invisible
+        # to bridge danso sessions.
+        danso_state = os.environ.get("CCC_DANSO_STATE_DIR", "")
+        danso_env = os.environ.get("DANSO_SKILLS_DIR", "")
+        if not danso_env and not danso_state:
+            raise ContractError("provider_root_unresolved")
+        skills_dir = Path(danso_env or f"{danso_state}/home/.pi/agent/skills")
     else:
         skills_dir = Path(os.environ.get("CLAUDE_SKILLS_DIR", claude_dir / "skills"))
     # Node-global anchor, not CCC_STATE_DIR: the bridge scopes that per memory

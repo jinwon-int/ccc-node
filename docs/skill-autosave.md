@@ -12,40 +12,45 @@ rollback, Hermes-style. Three layers cooperate:
 | `/skillsuggest` skill | operator (terminal or Telegram) | approve mode: reviews pending drafts + ranked candidates and installs approved skills into `~/.claude/skills/`. auto mode: post-hoc review — list, audit and roll back auto-installed skills. |
 | `scripts/ccc-skill-promotion.py` | daily sweep, explicit opt-in | Every node rescans and stages owner-only local envelopes; only the central publisher collects over SSH and opens bounded **draft intake PRs** in private `jinwon-int/fleet-skills`. It never merges or publishes generated content to ccc-node. |
 
-## Provider support (Claude / Codex)
+## Provider support (Claude / Codex / Piri / Danso)
 
 The install/gate/ledger/rollback pipeline (`skill-review/autoinstall.sh`) is
 provider-neutral: it screens a `SKILL.md` and installs the passing draft into a
 skills directory. Only the **install target** and a **compatibility screen**
 differ per provider. `skill-review/provider.sh` resolves both.
 
-| Capability | Claude | Codex | Piri |
-|---|---|---|---|
-| Install target | `~/.claude/skills/<name>/` (`CLAUDE_SKILLS_DIR`) | `${CODEX_HOME:-~/.codex}/skills/<name>/` (`CODEX_SKILLS_DIR`) | `${PIRI_CODING_AGENT_DIR:-~/.piri/agent}/skills/<name>/` (`PIRI_SKILLS_DIR`) |
-| Machine gates (secret / node-fact / dedup / lint / claims) | ✅ identical | ✅ identical | ✅ identical |
-| Mode / daily cap / off-switch / ledger / rollback | ✅ identical | ✅ identical | ✅ identical |
-| Codex-compat screen (rejects `claude -p`, `~/.claude`, `CLAUDE_*`) | n/a | ✅ isolates Claude-only drafts as pending | ✅ same screen (shared non-Claude coupling rules) |
-| Secure install dir (0700, no-symlink leaf, fail-closed) | existing dir untouched | ✅ created owner-only | ✅ created owner-only |
-| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ✅ v2 create/patch/write_file/noop engine + real `codex exec` backend + Codex-only default-ON collector (`CCC_CODEX_SKILL_COLLECTOR=false` opts out) | ✅ same collector engine over Piri distill jobs via `RuntimeCliSkillCandidateBackend`, default-ON (`CCC_PIRI_SKILL_COLLECTOR=false` opts out) |
+| Capability | Claude | Codex | Piri | Danso |
+|---|---|---|---|---|
+| Install target | `~/.claude/skills/<name>/` (`CLAUDE_SKILLS_DIR`) | `${CODEX_HOME:-~/.codex}/skills/<name>/` (`CODEX_SKILLS_DIR`) | `${PIRI_CODING_AGENT_DIR:-~/.piri/agent}/skills/<name>/` (`PIRI_SKILLS_DIR`) | `${CCC_DANSO_STATE_DIR:-}/home/.pi/agent/skills/<name>/` or `DANSO_SKILLS_DIR` — unset = fail-closed (#1659) |
+| Machine gates (secret / node-fact / dedup / lint / claims) | ✅ identical | ✅ identical | ✅ identical | ✅ identical |
+| Mode / daily cap / off-switch / ledger / rollback | ✅ identical | ✅ identical | ✅ identical | ✅ identical |
+| Runtime-compat screen | n/a | ✅ isolates Claude-only drafts as pending | ✅ same screen (shared non-Claude coupling rules) | ✅ Claude couplings **and** codex couplings (`codex exec`, `~/.codex/`, `CODEX_*`) |
+| Secure install dir (0700, no-symlink leaf, fail-closed) | existing dir untouched | ✅ created owner-only | ✅ created owner-only | ✅ created owner-only |
+| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ✅ v2 create/patch/write_file/noop engine + real `codex exec` backend + Codex-only default-ON collector (`CCC_CODEX_SKILL_COLLECTOR=false` opts out) | ✅ same collector engine over Piri distill jobs via `RuntimeCliSkillCandidateBackend`, default-ON (`CCC_PIRI_SKILL_COLLECTOR=false` opts out) | ✅ danso journal drafting branch (opt-in `CCC_SKILL_DANSO_DRAFTING=1`, #1660) + `DansoSkillCandidateBackend` collector (#1662) |
 
-Select the provider explicitly with `CCC_SKILL_PROVIDER=claude|codex|piri`. When
-unset it auto-detects: a node with a Codex home but no `~/.claude` and no
+Select the provider explicitly with `CCC_SKILL_PROVIDER=claude|codex|piri|danso`.
+When unset it auto-detects: a node with a Codex home but no `~/.claude` and no
 `claude` binary resolves to `codex`; everything else stays `claude`
-(back-compatible — existing Claude nodes are unchanged). **Piri is
-explicit-only**: bridge nodes commonly carry a `~/.piri/agent` tree for A2A
-workers while their interactive lane stays Claude, so set
-`CCC_SKILL_PROVIDER=piri` in the collector/installer environment (cron line or
-systemd drop-in) for the piri install target to engage.
+(back-compatible — existing Claude nodes are unchanged). **Piri and danso are
+explicit-only**: bridge nodes commonly carry a `~/.piri/agent` tree or a danso
+state dir for A2A workers while their interactive lane stays Claude, so set
+`CCC_SKILL_PROVIDER=piri` (or `danso`) in the collector/installer environment
+(cron line or systemd drop-in) for those install targets to engage. The danso
+target resolves only from `DANSO_SKILLS_DIR` or `CCC_DANSO_STATE_DIR`
+(`<state>/home/.pi/agent/skills` — the HOME the bridge fixes for danso,
+`bridge/core/danso_runtime.py`); with neither set the danso lane fails closed
+instead of guessing the interactive `~/.pi/agent/skills` root, which bridge
+danso sessions never read (#1659).
 
-**Danso is out of scope by design (#1657, decision A — reviewer only).** Danso
-nodes take no part in skill drafting, autoinstall, promotion staging, intake
-publishing, or fleet-skills sync: no provider resolution in
-`provider.sh`, no sweep branch, no collector configuration, no sync root. Their
-role in the pipeline is the a2a intake review lane only — a danso worker acts
-as `REVIEW_AGENT_BIN` when it satisfies the stdin-prompt / stdout-verdict-JSON
-contract of `scripts/skills-intake-review-handler.sh`. Promoting danso to a
-full provider (install paths, normalizer, collector backend, sync audience)
-remains a separate, explicitly approved track.
+**Danso is a full provider as of #1657 (owner decision B).** Danso already
+reads Agent Skills from `$HOME/.pi/agent/skills`, and the bridge fixes danso's
+HOME to `<CCC_DANSO_STATE_DIR>/home`, so bridge danso consumes exactly
+`<state>/home/.pi/agent/skills` — the install target above. Its journal is
+Pi Session JSONL v3 compatible (the piri normalizer projects it), the distill
+danso backend is reused for skill-candidate collection, and the a2a review
+lane gains a danso reviewer wrapper (#1665). The one danso-side gap — no stdin
+prompt — is handled with `--system-context-file` wrappers, never by changing
+how verdict packets flow.
 
 The Codex install pipeline (gates, cap, ledger, rollback, concurrency-safe
 single-runner lock) is complete and covered by
