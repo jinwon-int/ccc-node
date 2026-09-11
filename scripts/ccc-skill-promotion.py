@@ -296,6 +296,24 @@ def _autonomy_state(env: dict[str, str], state_dir: Path, *, trust_root: Path | 
     return "active"
 
 
+def _danso_root(env: dict[str, str]) -> Path | None:
+    """#1663: the danso install root, or None when this node has none.
+
+    The #1659/#1662 contract, same chain as the skill-candidate inventory:
+    explicit CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR wins, then DANSO_SKILLS_DIR,
+    then the bridge-fixed danso HOME. Unlike piri, whose default always
+    resolves under $HOME, a bridge state dir cannot be guessed from the
+    environment — so an unresolved chain yields None rather than inventing a
+    root on a node that does not consume danso.
+    """
+    raw = env.get("CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR") or env.get("DANSO_SKILLS_DIR")
+    if not raw:
+        danso_state = env.get("CCC_DANSO_STATE_DIR", "")
+        if danso_state:
+            raw = f"{danso_state}/home/.pi/agent/skills"
+    return Path(raw).absolute() if raw else None
+
+
 def _config(environment: dict[str, str] | None = None) -> Config:
     env = dict(os.environ if environment is None else environment)
     home = (Path(env["HOME"]) if env.get("HOME") else Path.home()).absolute()
@@ -394,22 +412,12 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         ).absolute(),
     }
     # #1663: danso rides along only when its install root resolves from the
-    # environment — the #1659/#1662 contract, same chain as the skill-candidate
-    # inventory: explicit CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR wins, then
-    # DANSO_SKILLS_DIR, then the bridge-fixed danso HOME. Unlike piri, whose
-    # default always resolves under $HOME, a bridge state dir cannot be
-    # guessed from the environment — so an unresolved chain omits the entry
-    # rather than inventing a root on a node that does not consume danso.
-    danso_raw = env.get("CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR") or env.get("DANSO_SKILLS_DIR")
-    if not danso_raw:
-        danso_state = env.get("CCC_DANSO_STATE_DIR", "")
-        if danso_state:
-            danso_raw = f"{danso_state}/home/.pi/agent/skills"
-    if danso_raw:
-        provider_roots["danso"] = Path(danso_raw).absolute()
-    # A provider selected for staging without a resolvable root is a config
-    # error, not an empty scan — fail before any command runs instead of
-    # KeyError-ing mid-discovery.
+    # environment (see _danso_root); a provider selected without a resolvable
+    # root is a config error, not an empty scan — fail before any command runs
+    # instead of KeyError-ing mid-discovery.
+    danso_root = _danso_root(env)
+    if danso_root is not None:
+        provider_roots["danso"] = danso_root
     if any(provider not in provider_roots for provider in providers):
         raise PromotionError("provider_root_unresolved")
     return Config(
