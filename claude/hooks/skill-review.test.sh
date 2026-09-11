@@ -220,10 +220,12 @@ for _ in $(seq 1 30); do
   find "$STATE_PIRI/pending-skills" -name meta.json 2>/dev/null | grep -q . && break
   sleep 0.1
 done
+# shellcheck disable=SC2034  # read via eval inside ok()
 piri_meta="$(find "$STATE_PIRI/pending-skills" -name meta.json 2>/dev/null | head -1)"
 ok "piri branch meta records provider=piri" \
   '[ -n "$piri_meta" ] && jq -e ".provider == \"piri\"" >/dev/null "$piri_meta"'
 # Unset provider auto-detects claude on this fixture (HOME has ~/.claude, no codex home).
+# shellcheck disable=SC2034  # read via eval inside ok()
 claude_meta="$(find "$STATE/pending-skills" -name meta.json 2>/dev/null | head -1)"
 ok "default branch meta records provider=claude" \
   '[ -n "$claude_meta" ] && jq -e ".provider == \"claude\"" >/dev/null "$claude_meta"'
