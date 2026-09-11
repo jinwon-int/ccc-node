@@ -44,18 +44,18 @@ make_created_skill() {
   tool mark-created "$name" >/dev/null
 }
 
-make_patch() { # name relative old new id output
-  local name="$1" relative="$2" old="$3" new="$4" id="$5" output="$6"
+make_patch() { # name relative old new id output [provider]
+  local name="$1" relative="$2" old="$3" new="$4" id="$5" output="$6" provider="${7:-codex}"
   local sha
   sha="$(sha256sum "$SKILLS/$name/$relative" | awk '{print $1}')"
   jq -nc \
     --arg id "$id" --arg name "$name" --arg relative "$relative" \
-    --arg sha "$sha" --arg old "$old" --arg new "$new" \
+    --arg sha "$sha" --arg old "$old" --arg new "$new" --arg provider "$provider" \
     '{
       schema_version:2,
       proposal_id:$id,
       provenance:{
-        provider:"codex",
+        provider:$provider,
         source_thread_hash:("a"*64),
         trigger:"checkpoint",
         distilled_at:"2026-07-27T00:00:00Z"
@@ -637,6 +637,24 @@ out="$(tool automatic-usage --day 2099-01-01)"
 rc=$?
 ok "invalid cap-ledger transition fails closed" \
   '[ "$rc" = 2 ] && jq -e ".code == \"incremental_ledger_state_invalid\"" >/dev/null <<<"$out"'
+
+# --- #1656: piri runs the same incremental contract as codex ----------------
+# A benign piri patch validates end to end, and a Claude-only coupling in the
+# new content is rejected with the same screen codex gets (mirrors
+# autoinstall's gate_codex_compat).
+piri_tool() {
+  python3 "$TOOL" --provider piri --skills-dir "$SKILLS" --state-dir "$STATE" "$@"
+}
+make_skill piri-gate
+python3 "$TOOL" --provider piri --skills-dir "$SKILLS" --state-dir "$STATE" mark-created piri-gate >/dev/null
+make_patch piri-gate SKILL.md "1. Read." "1. Run: claude -p --model haiku." "$(printf 'd%.0s' {1..64})" "$TMP/piri-incompat.json" piri
+out="$(piri_tool validate-proposal --proposal "$TMP/piri-incompat.json")"; rc=$?
+ok "piri patch with Claude-only coupling is rejected" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"incremental_content_provider_incompatible\"" >/dev/null <<<"$out"'
+make_patch piri-gate SKILL.md "1. Read." "1. Read twice." "$(printf 'e%.0s' {1..64})" "$TMP/piri-clean.json" piri
+out="$(piri_tool validate-proposal --proposal "$TMP/piri-clean.json")"; rc=$?
+ok "benign piri patch validates" \
+  '[ "$rc" = 0 ] && jq -e ".ok == true" >/dev/null <<<"$out"'
 
 echo "----"
 echo "PASS=$pass FAIL=$fail"
