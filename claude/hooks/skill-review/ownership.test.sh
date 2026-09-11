@@ -135,14 +135,32 @@ out="$(tool_piri status piri-owned-one)"
 ok "piri classification is autosave-managed" 'jq -e ".skills[0].classification == \"autosave-managed\"" >/dev/null <<<"$out"'
 # #1656: the read-before-write contract accepts piri end to end — a piri
 # receipt authorizes a piri guard-proposal — while unsupported providers stay
-# rejected at the CLI boundary.
+# rejected at the CLI boundary. danso joined the supported set in #1659, so the
+# unsupported example below uses an authorless value.
 read_json="$(tool_piri read-target piri-owned-one SKILL.md --attempt-id piri-review-1 --operation patch)"
 ok "piri read-target returns a piri receipt" 'jq -e ".receipt.provider == \"piri\" and .receipt.consumed == false" >/dev/null <<<"$read_json"'
 proposal_from_read "$read_json" "$TMP/piri-proposal.json"
 out="$(tool_piri guard-proposal --proposal "$TMP/piri-proposal.json")"; rc=$?
 ok "piri guard-proposal is authorized" '[ "$rc" = 0 ] && jq -e ".allowed == true and .code == \"authorized\"" >/dev/null <<<"$out"'
-out="$(python3 "$TOOL" --provider danso --skills-dir "$SKILLS" --state-dir "$STATE" status 2>&1)"; rc=$?
+out="$(python3 "$TOOL" --provider gorani --skills-dir "$SKILLS" --state-dir "$STATE" status 2>&1)"; rc=$?
 ok "unsupported provider is refused by the CLI" '[ "$rc" != 0 ]'
+# #1659: danso joins the provider set — same provenance contract, env-based
+# root resolution, fail-closed without the env contract.
+make_skill danso-owned-one
+out="$(DANSO_SKILLS_DIR="$SKILLS" python3 "$TOOL" --provider danso --state-dir "$STATE" mark-created danso-owned-one)"
+ok "danso mark-created resolves DANSO_SKILLS_DIR" 'jq -e ".ok == true and .changed == true" >/dev/null <<<"$out"'
+ok "danso marker records the danso provider" \
+  'jq -e ".provider == \"danso\" and .ownership == \"autosave-managed\"" "$SKILLS/danso-owned-one/.autosave-meta.json" >/dev/null'
+env -u DANSO_SKILLS_DIR -u CCC_DANSO_STATE_DIR python3 "$TOOL" --provider danso --state-dir "$STATE" status danso-owned-one >/dev/null 2>&1; rc=$?
+ok "danso without env contract fails closed (provider_root_unresolved)" '[ "$rc" != 0 ]'
+out="$(env -u DANSO_SKILLS_DIR -u CCC_DANSO_STATE_DIR python3 "$TOOL" --provider danso --state-dir "$STATE" status danso-owned-one 2>&1)"
+ok "danso unresolved-root code is provider_root_unresolved" \
+  'jq -e ".code == \"provider_root_unresolved\"" >/dev/null <<<"$out"'
+read_json="$(DANSO_SKILLS_DIR="$SKILLS" python3 "$TOOL" --provider danso --state-dir "$STATE" read-target danso-owned-one SKILL.md --attempt-id danso-review-1 --operation patch)"
+ok "danso read-target returns a danso receipt" 'jq -e ".receipt.provider == \"danso\"" >/dev/null <<<"$read_json"'
+proposal_from_read "$read_json" "$TMP/danso-proposal.json"
+out="$(DANSO_SKILLS_DIR="$SKILLS" python3 "$TOOL" --provider danso --state-dir "$STATE" guard-proposal --proposal "$TMP/danso-proposal.json")"; rc=$?
+ok "danso guard-proposal is authorized" '[ "$rc" = 0 ] && jq -e ".allowed == true and .code == \"authorized\"" >/dev/null <<<"$out"'
 
 # V2 ccc-node rollback validation and archive rename share one ownership lock.
 make_skill rollback-one

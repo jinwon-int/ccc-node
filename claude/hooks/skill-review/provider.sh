@@ -10,26 +10,29 @@
 #
 # Source this file; it defines functions only and has no side effects.
 #
-#   CCC_SKILL_PROVIDER   claude | codex | piri   (explicit; wins over auto-detect)
+#   CCC_SKILL_PROVIDER   claude | codex | piri | danso   (explicit; wins over auto-detect)
 #   CLAUDE_SKILLS_DIR    Claude install target (default ~/.claude/skills)
 #   CODEX_SKILLS_DIR     Codex install target  (default $CODEX_HOME/skills)
 #   CODEX_HOME           Codex home            (default ~/.codex)
 #   PIRI_SKILLS_DIR      Piri install target   (default $PIRI_CODING_AGENT_DIR/skills)
 #   PIRI_CODING_AGENT_DIR Piri agent home      (default ~/.piri/agent)
+#   DANSO_SKILLS_DIR     Danso install target  (default $CCC_DANSO_STATE_DIR/home/.pi/agent/skills)
+#   CCC_DANSO_STATE_DIR  Danso bridge state dir (no login-HOME fallback: #1659)
 
-# ccc_skill_provider — echo the active provider, one of: claude | codex | piri.
+# ccc_skill_provider — echo the active provider, one of: claude | codex | piri | danso.
 #
 # Explicit CCC_SKILL_PROVIDER always wins. When unset we auto-detect: a node
 # with a Codex home but no Claude home/binary is a Codex node; everything else
-# defaults to claude (the historical, back-compatible behavior). Piri is
-# explicit-only: bridge nodes commonly carry a ~/.piri/agent tree for A2A
-# workers while their interactive lane stays Claude, so a home-dir probe can
-# never select piri on its own.
+# defaults to claude (the historical, back-compatible behavior). Piri and danso
+# are explicit-only: bridge nodes commonly carry a ~/.piri/agent tree or a
+# danso state dir for A2A workers while their interactive lane stays Claude, so
+# a home-dir probe can never select them on its own.
 ccc_skill_provider() {
   local p="${CCC_SKILL_PROVIDER:-}"
   case "$p" in
     codex) printf 'codex'; return 0 ;;
     piri) printf 'piri'; return 0 ;;
+    danso) printf 'danso'; return 0 ;;
     claude) printf 'claude'; return 0 ;;
   esac
   local home="${HOME:-/root}"
@@ -51,6 +54,19 @@ ccc_skills_dir() {
       ;;
     piri)
       printf '%s' "${PIRI_SKILLS_DIR:-${PIRI_CODING_AGENT_DIR:-$home/.piri/agent}/skills}"
+      ;;
+    danso)
+      # #1659 contract, fail-closed: explicit DANSO_SKILLS_DIR wins, then the
+      # bridge-fixed danso HOME (<CCC_DANSO_STATE_DIR>/home, danso_runtime.py).
+      # No login-HOME fallback — ~/.pi/agent/skills is the INTERACTIVE danso/pi
+      # root and is invisible to bridge sessions, so guessing it would point
+      # installs at a tree the bridge danso never reads. Empty output = no
+      # resolvable target; callers must treat that as a hard skip/failure.
+      if [ -n "${DANSO_SKILLS_DIR:-}" ]; then
+        printf '%s' "$DANSO_SKILLS_DIR"
+      elif [ -n "${CCC_DANSO_STATE_DIR:-}" ]; then
+        printf '%s' "${CCC_DANSO_STATE_DIR%/}/home/.pi/agent/skills"
+      fi
       ;;
     *)
       printf '%s' "${CLAUDE_SKILLS_DIR:-${CCC_CLAUDE_DIR:-$home/.claude}/skills}"
