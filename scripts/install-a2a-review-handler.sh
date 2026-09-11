@@ -18,6 +18,10 @@
 #   # agent/main alignment (optional; default is the claude CLI):
 #   REVIEW_AGENT_BIN=/opt/piri/pi-test.sh
 #   REVIEW_AGENT_ARGS="-p --no-tools --model xai/grok-4.6"
+#   # danso reviewer (#1665; the wrapper maps the stdin prompt contract onto
+#   # danso's --system-context-file, so no danso-side change is needed):
+#   REVIEW_AGENT_BIN=<dest>/danso-review-agent.sh
+#   REVIEW_AGENT_ARGS="--model glm-5.3-flash"
 #
 # then restart a2a-hermes-worker.service (or the Termux supervisor) and
 # confirm the worker re-registers with the broker.
@@ -47,7 +51,7 @@ mkdir -p "$DEST"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$DEST"
 installed=0
-for name in a2a-intent-dispatcher.sh skills-intake-review-handler.sh skills-intake-revise-handler.sh; do
+for name in a2a-intent-dispatcher.sh danso-review-agent.sh skills-intake-review-handler.sh skills-intake-revise-handler.sh; do
   src="$HERE/$name"
   [ -f "$src" ] || { echo "missing source: $src" >&2; exit 1; }
   dst="$DEST/$name"

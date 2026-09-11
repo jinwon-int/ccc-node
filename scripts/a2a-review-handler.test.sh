@@ -379,5 +379,61 @@ ok "unverifiable evidence adds an info finding, never changes the verdict (#1626
 ok "prompt states the verbatim-quoting rule for evidence (#1626)" \
   'grep -q "EVIDENCE QUOTING" "$CAPTURED" && grep -q "VERBATIM between the fence" "$CAPTURED"'
 
+# --- #1665: danso-review-agent.sh wrapper contract ---------------------------
+WRAPPER="$ROOT/scripts/danso-review-agent.sh"
+FAKE_DANSO="$BIN/fake-danso"
+DANSO_ARGV="$TMP/danso-argv.txt"
+DANSO_CTX_CAPTURE="$TMP/danso-ctx-capture.txt"
+cat > "$FAKE_DANSO" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" > "$DANSO_ARGV"
+ctx=""
+prev=""
+for a in "\$@"; do
+  [ "\$prev" = "--system-context-file" ] && ctx="\$a"
+  prev="\$a"
+done
+[ -n "\$ctx" ] && cp "\$ctx" "$DANSO_CTX_CAPTURE"
+printf '{"verdict":"approve","findings":[],"model":"danso-model"}'
+STUB
+chmod +x "$FAKE_DANSO"
+
+# a) stdin lands verbatim in the --system-context-file, not in argv.
+printf 'PACKET-CONTENTS-123' | DANSO_BIN="$FAKE_DANSO" bash "$WRAPPER" --model glm-5.3-flash > "$TMP/wrapper-out.json" 2>/dev/null
+rc=$?
+ok "wrapper spools stdin into --system-context-file" \
+  '[ "$rc" = 0 ] && grep -qF "PACKET-CONTENTS-123" "$DANSO_CTX_CAPTURE"'
+ok "wrapper emits the danso stdout verbatim" \
+  'jq -e ".verdict == \"approve\"" >/dev/null "$TMP/wrapper-out.json"'
+ok "wrapper maps --model onto the danso invocation" \
+  'grep -q -- "--model" "$DANSO_ARGV" && grep -q "glm-5.3-flash" "$DANSO_ARGV"'
+ok "wrapper runs danso isolated and tool-less" \
+  'grep -q -- "--no-tools" "$DANSO_ARGV" && grep -q -- "--max-turns" "$DANSO_ARGV" && grep -q -- "--sandbox" "$DANSO_ARGV"'
+ok "wrapper does not pass the packet as a positional prompt" \
+  '! grep -q "PACKET-CONTENTS" "$DANSO_ARGV"'
+
+# b) 300 KiB packet: the file channel avoids the argv size limit.
+{ printf 'X%.0s' $(seq 1 307200); } > "$TMP/big-packet.txt"
+DANSO_BIN="$FAKE_DANSO" bash "$WRAPPER" < "$TMP/big-packet.txt" > /dev/null 2>&1
+# shellcheck disable=SC2034  # rc is the contract assertion (exit 2 vs 0)
+rc=$?
+ok "300 KiB packet passes via the file channel" \
+  '[ "$rc" = 0 ] && [ "$(wc -c < "$DANSO_CTX_CAPTURE")" -gt 300000 ]'
+
+# c) over-cap stdin fails closed with exit 2.
+{ printf 'Y%.0s' $(seq 1 2200000); } | DANSO_BIN="$FAKE_DANSO" bash "$WRAPPER" >/dev/null 2>&1
+rc=$?
+ok "over-cap stdin exits 2" '[ "$rc" = 2 ]'
+
+# d) the handler composes a provenance-stamped TaskResult from wrapper output.
+make_task "$HEAD_OK"
+REVIEW_AGENT_BIN="$WRAPPER" REVIEW_AGENT_ARGS="--model glm-5.3-flash" REVIEW_TIMEOUT_SEC=30 WORKER_ID=testnode DANSO_BIN="$FAKE_DANSO" \
+  bash "$HANDLER" < "$TMP/task.json" > "$TMP/out-danso.json" 2>/dev/null
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "handler composes TaskResult from danso wrapper output" \
+  '[ "$rc" = 0 ] && jq -e ".output.verdict == \"approve\" and .output.reviewer_node == \"testnode\"" >/dev/null "$TMP/out-danso.json"'
+ok "handler records review_agent and review_model provenance" \
+  'jq -e ".output.review_agent == \"danso-review-agent.sh\" and .output.review_model == \"glm-5.3-flash\"" >/dev/null "$TMP/out-danso.json"'
+
 echo "PASS=$pass FAIL=$fail"
-[ "$fail" -eq 0 ]
