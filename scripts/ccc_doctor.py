@@ -244,6 +244,47 @@ class Row:
     action: str
 
 
+def _read_degraded_log(path: Path) -> tuple[int, str]:
+    """Count non-empty lines in a degraded log and return the last one (#1675).
+
+    A missing log is (0, "") -- not an error. Only an unreadable one raises,
+    so the caller can tell "nothing failed" from "cannot tell".
+    """
+    if path.is_symlink() or not path.is_file():
+        return 0, ""
+    count = 0
+    latest = ""
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if stripped:
+                count += 1
+                latest = stripped
+    return count, latest
+
+
+def _newest_ledger_stamp(path: Path) -> str | None:
+    """Newest `ts` in a JSONL ledger, or None when it holds no usable row.
+
+    Corrupt lines are skipped rather than fatal: one bad append must not blind
+    the check to every good record around it.
+    """
+    newest: str | None = None
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            stamp = row.get("ts")
+            if isinstance(stamp, str) and (newest is None or stamp > newest):
+                newest = stamp
+    return newest
+
+
 def _iso_age_days(stamp: str) -> int | None:
     """Whole days between a `YYYY-MM-DDTHH:MM:SSZ` stamp and now, or None.
 
@@ -1651,23 +1692,16 @@ class Doctor:
             return
 
         degraded_log = usage_dir / "degraded.log"
-        degraded_lines = 0
-        latest_reason = ""
-        if degraded_log.is_file() and not degraded_log.is_symlink():
-            try:
-                with degraded_log.open(encoding="utf-8", errors="replace") as handle:
-                    for line in handle:
-                        if line.strip():
-                            degraded_lines += 1
-                            latest_reason = line.strip()
-            except OSError:
-                self.add(
-                    "수동필요",
-                    item,
-                    "degraded_log=unreadable",
-                    f"inspect {degraded_log} permissions",
-                )
-                return
+        try:
+            degraded_lines, latest_reason = _read_degraded_log(degraded_log)
+        except OSError:
+            self.add(
+                "수동필요",
+                item,
+                "degraded_log=unreadable",
+                f"inspect {degraded_log} permissions",
+            )
+            return
         if degraded_lines:
             # A recording path is failing right now. Report it as a defect on
             # its own terms -- do not fold it into the staleness verdict, which
@@ -1692,20 +1726,8 @@ class Doctor:
                 "retirement evidence (#1648)",
             )
             return
-        newest: str | None = None
         try:
-            with ledger.open(encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    stamp = row.get("ts")
-                    if isinstance(stamp, str) and (newest is None or stamp > newest):
-                        newest = stamp
+            newest = _newest_ledger_stamp(ledger)
         except OSError:
             self.add(
                 "수동필요",
