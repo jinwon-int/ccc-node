@@ -15,6 +15,31 @@ MAX_BYTES="${CCC_SKILL_REVIEW_MAX_BYTES:-60000}"
 MODEL="${CCC_SKILL_REVIEW_MODEL:-haiku}"
 TIMEOUT="${CCC_SKILL_REVIEW_TIMEOUT:-180}"
 
+# #1654: provider-neutral drafting brain. When CCC_SKILL_REVIEW_LLM_CMD is set
+# (the same variable the promotion autorepair path already reads) it REPLACES
+# the claude CLI: shlex-split the command, feed the prompt on stdin, read the
+# JSON response on stdout. This lets piri/codex/non-Claude nodes draft without
+# any Anthropic tooling. Unset keeps the historical `claude -p` flow unchanged.
+LLM_CMD=()
+if [ -n "${CCC_SKILL_REVIEW_LLM_CMD:-}" ]; then
+  while IFS= read -r _llm_tok; do
+    [ -n "$_llm_tok" ] && LLM_CMD+=("$_llm_tok")
+  done < <(python3 -c 'import shlex, sys
+try:
+    tokens = shlex.split(sys.argv[1])
+except ValueError:
+    sys.exit(3)
+for token in tokens:
+    print(token)' "$CCC_SKILL_REVIEW_LLM_CMD" 2>/dev/null) || {
+    echo "invalid CCC_SKILL_REVIEW_LLM_CMD (shlex parse failed)" >&2
+    exit 2
+  }
+  if [ "${#LLM_CMD[@]}" -eq 0 ]; then
+    echo "empty CCC_SKILL_REVIEW_LLM_CMD" >&2
+    exit 2
+  fi
+fi
+
 # zai fallback config (node-local opt-in, added 2026-09-05). Fail-open: without
 # a 0600 regular env file the pipeline is identical to the haiku-only flow.
 # Set CCC_SKILL_REVIEW_ZAI_ENV=off (or point at another file) to control.
@@ -87,19 +112,20 @@ REDACTED="$(build_redacted "$MAX_TURNS" "$MAX_BYTES")"
 [ -z "$REDACTED" ] && { echo "empty transcript content" >&2; exit 1; }
 EXISTING="$(existing_skills | head -80)"
 
-PROMPT="$(cat <<'EOF'
-You are the Hermes-style skill self-improvement reviewer for a Claude Code node.
+PROVIDER="${CCC_SKILL_PROVIDER:-claude}"
+PROMPT="$(cat <<EOF
+You are the Hermes-style skill self-improvement reviewer for a coding agent node.
 You will receive a redacted session transcript and a list of existing skills.
 Return STRICT JSON only.
 
-Goal: propose reusable Claude Code skills worth staging for human approval.
+Goal: propose reusable skills worth staging for human approval.
 
 Schema:
 {
   "skill_candidates": [
     {
       "name": "lowercase-kebab-name",
-      "category": "claude",
+      "category": "$PROVIDER",
       "summary": "one sentence explaining what this captures",
       "reason": "why the session shows a reusable procedure",
       "evidence_excerpt": "<=200 chars from transcript, no secrets",
@@ -116,7 +142,8 @@ Criteria:
 - Keep proposed skills node-agnostic and public-safe. Mention credential locations/handling rules only, never values.
 - A valid SKILL.md starts with YAML frontmatter containing name and description. Description must be concise and routing-friendly.
 - The body should include: When to Use, Procedure, Safety, Verification.
-- Frame commands as Claude Code / ccc-node procedures. Use exact commands only if the transcript clearly showed them; otherwise describe the safe decision rule instead of inventing flags.
+- Frame commands as generic agent-CLI / ccc-node procedures. Use exact commands only if the transcript clearly showed them; otherwise describe the safe decision rule instead of inventing flags.
+- Do NOT hard-code a runtime coupling in the skill body: never write 'claude -p', 'codex exec', '~/.claude/', '~/.codex/', 'CLAUDE_*', or 'CODEX_*'. Refer to 'this node's agent CLI' or a neutral tool name so the draft installs on any provider.
 
 OUTPUT CONTRACT:
 - Your entire response is a single JSON object.
@@ -149,6 +176,15 @@ call_claude() {
     --no-session-persistence \
     --output-format text \
     --append-system-prompt "$sys" \
+    2>/dev/null
+}
+
+# #1654: neutral provider path — stdin prompt, stdout JSON. Same recursion/
+# tool hygiene as call_claude: the child only produces text.
+call_llm_cmd() {
+  local input="$1"
+  printf '%s' "$input" | env -u CLAUDE_SKILL_REVIEW_BG -u CCC_ALLOWED_TOOLS \
+    timeout "$TIMEOUT" "${LLM_CMD[@]}" \
     2>/dev/null
 }
 
@@ -212,20 +248,44 @@ emit() {
 INPUT="$(build_input)"
 CLEAN=""
 
-RESULT="$(call_claude "$SYSTEM_CONSTRAINT" "$INPUT")"
-ec=$?
-if [ "$ec" -ne 0 ] || [ -z "$RESULT" ]; then
-  echo "claude -p attempt failed (ec=$ec) or empty; skipping strict retry" >&2
-else
-  CLEAN="$(try_parse "$RESULT")"
+if [ "${#LLM_CMD[@]}" -gt 0 ]; then
+  # Provider-neutral path (#1654): the configured LLM command replaces the
+  # claude CLI entirely. One normal attempt, one retry with the strict reminder
+  # appended, then the shared zai last-resort below.
+  RESULT="$(call_llm_cmd "$INPUT")"
+  ec=$?
+  if [ "$ec" -ne 0 ] || [ -z "$RESULT" ]; then
+    echo "LLM cmd attempt failed (ec=$ec) or empty; retrying with strict reminder" >&2
+  else
+    CLEAN="$(try_parse "$RESULT")"
+  fi
   if ! valid_candidates "$CLEAN"; then
-    RESULT2="$(call_claude "$STRICT" "$INPUT")"
+    strict_input="$(printf '%s\n%s' "$INPUT" "$STRICT")"
+    RESULT2="$(call_llm_cmd "$strict_input")"
     ec2=$?
     if [ "$ec2" -ne 0 ] || [ -z "$RESULT2" ]; then
       echo "strict retry failed (ec=$ec2) or empty" >&2
       CLEAN=""
     else
       CLEAN="$(try_parse "$RESULT2")"
+    fi
+  fi
+else
+  RESULT="$(call_claude "$SYSTEM_CONSTRAINT" "$INPUT")"
+  ec=$?
+  if [ "$ec" -ne 0 ] || [ -z "$RESULT" ]; then
+    echo "claude -p attempt failed (ec=$ec) or empty; skipping strict retry" >&2
+  else
+    CLEAN="$(try_parse "$RESULT")"
+    if ! valid_candidates "$CLEAN"; then
+      RESULT2="$(call_claude "$STRICT" "$INPUT")"
+      ec2=$?
+      if [ "$ec2" -ne 0 ] || [ -z "$RESULT2" ]; then
+        echo "strict retry failed (ec=$ec2) or empty" >&2
+        CLEAN=""
+      else
+        CLEAN="$(try_parse "$RESULT2")"
+      fi
     fi
   fi
 fi
