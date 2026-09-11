@@ -4,7 +4,7 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Callable, Any, Dict, Iterable, Mapping, Optional
 
 from telegram_bot.utils import secure_fs
 
@@ -424,6 +424,8 @@ class SessionStore:
         expected: Mapping[str, Any],
         updates: Optional[Mapping[str, Any]] = None,
         remove_fields: Iterable[str] = (),
+        absent_fields: Iterable[str] = (),
+        guard: Callable[[], bool] | None = None,
     ) -> bool:
         """Compare and patch one session atomically under the per-store lock."""
         self._require_initialized()
@@ -431,9 +433,10 @@ class SessionStore:
         expected_copy = copy.deepcopy(dict(expected))
         update_copy = copy.deepcopy(dict(updates or {}))
         removals = tuple(remove_fields)
+        absent = tuple(absent_fields)
         async with self._lock:
             data = copy.deepcopy(self._local_data.get(key, {}))
-            if any(
+            if any(field in data for field in absent) or any(
                 field not in data or data[field] != value
                 for field, value in expected_copy.items()
             ):
@@ -441,7 +444,9 @@ class SessionStore:
             for field in removals:
                 data.pop(field, None)
             data.update(update_copy)
-            await asyncio.to_thread(
-                self._commit, key, lambda: self._local_data.__setitem__(key, data)
-            )
-            return True
+            def commit_if_current():
+                if guard is not None and not guard():
+                    return False
+                self._commit(key, lambda: self._local_data.__setitem__(key, data))
+                return True
+            return await asyncio.to_thread(commit_if_current)

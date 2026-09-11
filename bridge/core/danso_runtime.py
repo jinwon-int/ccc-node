@@ -255,6 +255,13 @@ class DansoRuntime(WorkerRuntime):
         bounds = replace(bounds, max_bytes=min(bounds.max_bytes, 8192), max_message_bytes=min(bounds.max_message_bytes, 4096))
         return await asyncio.to_thread(read_danso_snapshot, self.root / audience.scope, session_id, bounds=bounds, cwd=Path(self.memory_settings.danso_workspace))
 
+    async def inspect_recovery(self, request: SessionRequest):
+        from telegram_bot.core.danso_recovery import inspect_session
+        if not request.session_id:
+            raise ValueError("recovery requires an existing session")
+        session = await self.start_or_resume(request)
+        return await inspect_session(session)
+
     async def list_models(self):
         return [ModelInfo(id=self.model, display_name=self.model, is_default=True,
                           supported_reasoning_efforts=ASTRA_EFFORTS,
