@@ -50,6 +50,12 @@ OPT_CODEX_DRAFTING=0
 # sweep stages piri (or any non-default) candidates without hand-edited
 # crontabs. Validated against the promoter's own _PROVIDERS vocabulary.
 OPT_PROMOTION_PROVIDERS=""
+# #1657 owner-decision-B follow-up: danso is a full provider, but its install
+# target resolves ONLY from DANSO_SKILLS_DIR / CCC_DANSO_STATE_DIR (fail-closed,
+# #1659), so a scheduled sweep needs the state dir — and the drafting opt-in —
+# baked into the entry itself, exactly like the #1655 provider lane.
+OPT_DANSO_DRAFTING=0
+OPT_DANSO_STATE_DIR=""
 
 # Shared installer libs (#1081, #1077): gen stamps + records, and the common
 # crontab install/remove driver.
@@ -175,16 +181,30 @@ Options:
                    the SSH alias it dialled, not the machine name. When it cannot
                    be resolved the entry installs without it and promotion stays
                    fail-closed (#1067).
-  --provider NAME  Bake CCC_SKILL_PROVIDER=NAME (claude|codex|piri) into the
-                   entry so the scheduled sweep resolves the provider lane
+  --provider NAME  Bake CCC_SKILL_PROVIDER=NAME (claude|codex|piri|danso) into
+                   the entry so the scheduled sweep resolves the provider lane
                    explicitly (#1655). Defaults to \$CCC_SKILL_PROVIDER when set;
                    otherwise the entry carries no provider and the sweep
                    auto-detects as before. piri is explicit-only (#643), so piri
                    nodes must pass --provider piri (or export
                    CCC_SKILL_PROVIDER=piri) for the piri target to engage.
+                   danso nodes pass --provider danso together with
+                   --danso-state-dir: the danso install target fails closed
+                   when neither DANSO_SKILLS_DIR nor CCC_DANSO_STATE_DIR is
+                   set (#1659).
   --piri-drafting  Bake CCC_SKILL_PIRI_DRAFTING=1 into the entry (opt-in piri
                    sweep branch; mirrors the codex flag below).
   --codex-drafting Bake CCC_SKILL_CODEX_DRAFTING=1 into the entry.
+  --danso-drafting Bake CCC_SKILL_DANSO_DRAFTING=1 into the entry (opt-in
+                   danso journal drafting sweep branch, #1660).
+  --danso-state-dir PATH
+                   Bake CCC_DANSO_STATE_DIR=PATH into the entry so the
+                   scheduled sweep resolves the bridge-fixed danso HOME
+                   (<PATH>/home, #1659). Defaults to \$CCC_DANSO_STATE_DIR when
+                   set; otherwise omitted and the danso lane fails closed in
+                   the sweep. PATH must be absolute and must not contain a
+                   double quote, dollar, backtick, or backslash (it is baked
+                   inside a double-quoted segment of the cron line).
   --promotion-providers LIST
                    Bake CCC_SKILL_PROMOTION_PROVIDERS=LIST (comma-separated,
                    each of claude|codex|piri) into the entry so scheduled
@@ -196,7 +216,8 @@ Options:
 Env overrides: CCC_CLAUDE_DIR, CCC_STATE_DIR, CCC_SKILL_AUTOSAVE_CMD,
 CCC_SKILL_AUTOSAVE_CRON, CCC_SKILL_AUTOSAVE_CRON_LOG, CCC_CRONTAB_CMD,
 CCC_SKILL_PROVIDER (inherited as the baked provider when --provider is unset),
-CCC_SKILL_PROMOTION_PROVIDERS (inherited when --promotion-providers is unset).
+CCC_SKILL_PROMOTION_PROVIDERS (inherited when --promotion-providers is unset),
+CCC_DANSO_STATE_DIR (inherited when --danso-state-dir is unset).
 CCC_SKILL_AUTOSAVE_LOCAL_TIMEZONE and CCC_SKILL_AUTOSAVE_LOCAL_UTC_OFFSET
 (+HHMM/-HHMM) are advanced deterministic overrides for image builds and
 tests; normal installs auto-detect both.
@@ -213,19 +234,24 @@ while [ $# -gt 0 ]; do
     --provider)
       ccc_cron_need_val "$1" "${2:-}"
       case "$2" in
-        claude|codex|piri) OPT_PROVIDER="$2" ;;
-        *) echo "invalid --provider '$2' (want claude|codex|piri)" >&2; exit 2 ;;
+        claude|codex|piri|danso) OPT_PROVIDER="$2" ;;
+        *) echo "invalid --provider '$2' (want claude|codex|piri|danso)" >&2; exit 2 ;;
       esac
       shift ;;
     --piri-drafting) OPT_PIRI_DRAFTING=1 ;;
     --codex-drafting) OPT_CODEX_DRAFTING=1 ;;
+    --danso-drafting) OPT_DANSO_DRAFTING=1 ;;
+    --danso-state-dir)
+      ccc_cron_need_val "$1" "${2:-}"
+      OPT_DANSO_STATE_DIR="$2"
+      shift ;;
     --promotion-providers)
       ccc_cron_need_val "$1" "${2:-}"
       _pp_ok=1
       IFS=',' read -ra _pp_parts <<<"$2"
       for _pp in "${_pp_parts[@]}"; do
         case "$_pp" in
-          claude|codex|piri) ;;
+          claude|codex|piri|danso) ;;
           *) _pp_ok=0; break ;;
         esac
       done
@@ -267,6 +293,35 @@ fi
 [ -n "$CRON_PROVIDER" ] && CRON_ENV="$CRON_ENV CCC_SKILL_PROVIDER=\"$CRON_PROVIDER\""
 [ "$OPT_PIRI_DRAFTING" = 1 ] && CRON_ENV="$CRON_ENV CCC_SKILL_PIRI_DRAFTING=1"
 [ "$OPT_CODEX_DRAFTING" = 1 ] && CRON_ENV="$CRON_ENV CCC_SKILL_CODEX_DRAFTING=1"
+# --danso-state-dir > inherited \$CCC_DANSO_STATE_DIR > omitted. Without it the
+# scheduled danso lane fails closed (#1659), so say so at install time where
+# the operator can see it instead of letting the entry no-op the lane silently.
+danso_state_dir_ok() { # <path> — absolute and safe to bake inside double quotes
+  local path="$1"
+  [ -n "$path" ] || return 1
+  case "$path" in /*) ;; *) return 1 ;; esac
+  case "$path" in *'"'*|*'$'*|*'`'*|*'\'*) return 1 ;; esac
+  return 0
+}
+CRON_DANSO_STATE_DIR="$OPT_DANSO_STATE_DIR"
+if [ -n "$CRON_DANSO_STATE_DIR" ]; then
+  danso_state_dir_ok "$CRON_DANSO_STATE_DIR" || {
+    echo "invalid --danso-state-dir '$CRON_DANSO_STATE_DIR' (absolute path; no double quote, dollar, backtick, or backslash)" >&2
+    exit 2
+  }
+elif [ -n "${CCC_DANSO_STATE_DIR:-}" ]; then
+  if danso_state_dir_ok "$CCC_DANSO_STATE_DIR"; then
+    CRON_DANSO_STATE_DIR="$CCC_DANSO_STATE_DIR"
+  else
+    echo "WARNING: ignoring invalid inherited CCC_DANSO_STATE_DIR (absolute path; no double quote, dollar, backtick, or backslash)." >&2
+  fi
+fi
+if [ "$CRON_PROVIDER" = "danso" ] && [ -z "$CRON_DANSO_STATE_DIR" ]; then
+  echo "WARNING: danso lane without a state dir: the scheduled sweep will fail closed" >&2
+  echo "         (DANSO_SKILLS_DIR/CCC_DANSO_STATE_DIR unset, #1659). Pass --danso-state-dir." >&2
+fi
+[ -n "$CRON_DANSO_STATE_DIR" ] && CRON_ENV="$CRON_ENV CCC_DANSO_STATE_DIR=\"$CRON_DANSO_STATE_DIR\""
+[ "$OPT_DANSO_DRAFTING" = 1 ] && CRON_ENV="$CRON_ENV CCC_SKILL_DANSO_DRAFTING=1"
 # --promotion-providers > inherited \$CCC_SKILL_PROMOTION_PROVIDERS > omitted
 CRON_PROMOTION_PROVIDERS="$OPT_PROMOTION_PROVIDERS"
 if [ -z "$CRON_PROMOTION_PROVIDERS" ] && [ -n "${CCC_SKILL_PROMOTION_PROVIDERS:-}" ]; then
@@ -274,7 +329,7 @@ if [ -z "$CRON_PROMOTION_PROVIDERS" ] && [ -n "${CCC_SKILL_PROMOTION_PROVIDERS:-
   IFS=',' read -ra _pp_parts <<<"$CCC_SKILL_PROMOTION_PROVIDERS"
   for _pp in "${_pp_parts[@]}"; do
     case "$_pp" in
-      claude|codex|piri) ;;
+      claude|codex|piri|danso) ;;
       *) _pp_inherit_ok=0; break ;;
     esac
   done
@@ -292,6 +347,8 @@ record_argv=(--apply --schedule "$SCHEDULE")
 [ -n "$CRON_PROVIDER" ] && record_argv+=(--provider "$CRON_PROVIDER")
 [ "$OPT_PIRI_DRAFTING" = 1 ] && record_argv+=(--piri-drafting)
 [ "$OPT_CODEX_DRAFTING" = 1 ] && record_argv+=(--codex-drafting)
+[ "$OPT_DANSO_DRAFTING" = 1 ] && record_argv+=(--danso-drafting)
+[ -n "$CRON_DANSO_STATE_DIR" ] && record_argv+=(--danso-state-dir "$CRON_DANSO_STATE_DIR")
 [ -n "$CRON_PROMOTION_PROVIDERS" ] && record_argv+=(--promotion-providers "$CRON_PROMOTION_PROVIDERS")
 
 # The block body carries the CRON_TZ pin ahead of the entry line (cron has no

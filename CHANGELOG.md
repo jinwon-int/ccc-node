@@ -4,6 +4,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Extend the skill-autosave cron installer to the danso lane (#1657 owner
+  decision B): `--provider danso`, `--danso-drafting` (bakes
+  `CCC_SKILL_DANSO_DRAFTING=1`), and `--danso-state-dir` (bakes
+  `CCC_DANSO_STATE_DIR`, inherited from the environment when the flag is
+  unset, rejected when relative or carrying a double quote, dollar, backtick,
+  or backslash); `--promotion-providers` accepts danso as a member. A danso
+  provider entry without a resolvable state dir still installs but warns,
+  because the scheduled sweep fails closed without it (#1659).
+
 - Add `task_status` as one read-only recovery call behind a JSON CLI
   (`scripts/ccc-task-status.py`) and a second `family-ops` MCP tool: the
   agent checkpoint (working-state), resume note, and external wait promises

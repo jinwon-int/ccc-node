@@ -194,7 +194,9 @@ non-blocking flock and defers journals the danso CLI is actively writing.
 **Opt in** with `CCC_SKILL_DANSO_DRAFTING=1` (or `1` in
 `<CCC_STATE_DIR>/skill-autosave.danso-drafting`), and provide
 `CCC_DANSO_STATE_DIR` in the sweep environment — the cron installer bakes both
-(#1655). Default off. Drafts carry `provider: danso` in `meta.json`, so
+(`--danso-drafting` and `--danso-state-dir`; #1655 introduced the baking
+mechanism for piri, the #1657 owner-decision-B follow-up extended it to
+danso). Default off. Drafts carry `provider: danso` in `meta.json`, so
 autoinstall routes them into `<state>/home/.pi/agent/skills` (#1659) and the
 regrowth ledger `skill-autosave.danso-seen` prevents re-processing.
 
@@ -227,16 +229,21 @@ schedule in the system timezone. An explicit `--schedule` or
 `CCC_SKILL_AUTOSAVE_CRON` value is interpreted as a raw host-local cron
 schedule.
 
-Provider lane (#1655): `--provider claude|codex|piri` bakes
+Provider lane (#1655): `--provider claude|codex|piri|danso` bakes
 `CCC_SKILL_PROVIDER=…` into the cron line (default: inherit
 `$CCC_SKILL_PROVIDER`, else no provider and the sweep auto-detects as before).
-`--piri-drafting` / `--codex-drafting` bake `CCC_SKILL_PIRI_DRAFTING=1` /
-`CCC_SKILL_CODEX_DRAFTING=1`, and `--promotion-providers claude,piri` bakes
-`CCC_SKILL_PROMOTION_PROVIDERS` so the scheduled sweep's promotion staging scans
+`--piri-drafting` / `--codex-drafting` / `--danso-drafting` bake
+`CCC_SKILL_PIRI_DRAFTING=1` / `CCC_SKILL_CODEX_DRAFTING=1` /
+`CCC_SKILL_DANSO_DRAFTING=1`, and `--promotion-providers claude,piri` (danso
+accepted as a member) bakes `CCC_SKILL_PROMOTION_PROVIDERS` so the scheduled
+sweep's promotion staging scans
 the same non-default provider roots (without it the promoter default
-`claude,codex` applies and piri candidates are drafted+installed but not
+`claude,codex` applies and non-claude candidates are drafted+installed but not
 staged). piri is explicit-only, so a piri node schedules
-with `--provider piri --piri-drafting`; hand-editing the crontab is no longer
+with `--provider piri --piri-drafting`; a danso node schedules with
+`--provider danso --danso-state-dir <state>` (`--danso-state-dir` bakes
+`CCC_DANSO_STATE_DIR` — inheritable from the environment — without which the
+scheduled danso lane fails closed, #1659); hand-editing the crontab is no longer
 needed and does not survive a reinstall. Downstream, drafts staged by each
 branch carry their provider in `meta.json`, and autoinstall routes every draft
 to its own install root (claude drafts → `~/.claude/skills`, piri drafts →
