@@ -46,6 +46,17 @@ class DansoRecoveryMixin:
                 and self._task_resume_generation(key) == epoch
                 and self._danso_recovery_route(user_id, chat_id) == route)
 
+    async def _offer_danso_recovery_if_failed(self, response, key, user_id, chat_id) -> None:
+        """#1690: recovery buttons follow a failed Danso turn.
+
+        Called on every interactive input path (normal message, `opt:`
+        choice, `/task_resume`) right after the failure response is
+        delivered — never instead of it. Non-Danso and successful turns
+        offer nothing; `_offer_danso_recovery` revalidates the binding.
+        """
+        if self._danso_recovery_enabled() and not response.success:
+            await self._offer_danso_recovery(key, user_id, chat_id, force=True)
+
     async def _offer_danso_recovery(self, key, user_id, chat_id, *, force=False):
         if not self._danso_recovery_enabled() or not self._check_user_access(user_id):
             return False

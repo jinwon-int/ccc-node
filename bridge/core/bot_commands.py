@@ -1352,6 +1352,15 @@ class BotCommandMixin:
                 streamed=response.streamed,
                 user_id=user_id,
             )
+            # #1690: /task_resume bypassed the recovery offer that normal
+            # messages get — a failed native resume ended with the failure
+            # text and no continue/new-task buttons. The shared helper runs
+            # after the failure response is delivered and revalidates the
+            # binding; a stale queued run was already rejected by
+            # current_binding above, so it offers nothing.
+            await self._offer_danso_recovery_if_failed(
+                response, conversation_key, user_id, chat.id
+            )
 
         async def on_overflow():
             reply = "⏳ Processing previous messages, please wait or send /stop to terminate."

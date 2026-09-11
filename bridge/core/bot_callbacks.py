@@ -159,6 +159,15 @@ class BotCallbackMixin:
                         force_options=response.has_options,
                         streamed=response.streamed,
                     )
+                    # #1690: a Danso failure after an explicit numbered choice
+                    # used to leave the user without the recovery buttons —
+                    # only normal messages offered them. Same order as there:
+                    # deliver the failure response first, then the offer; the
+                    # shared helper revalidates provider/session/generation,
+                    # so a queued-after-/new run offers nothing.
+                    await self._offer_danso_recovery_if_failed(
+                        response, conversation_key, user_id, chat_id
+                    )
                 except Exception as e:
                     logger.error(f"Option reply failed: {e}", exc_info=True)
                     await app.bot.send_message(chat_id, f"❌ Processing failed: {e}")

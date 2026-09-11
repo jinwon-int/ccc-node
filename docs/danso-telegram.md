@@ -391,8 +391,15 @@ unfinished task gets a bounded, credential-redacted summary and three buttons:
 - **상태만 확인 (Inspect):** reread the native state and show the summary.
   No model call, journal mutation, replay, or acknowledgement of uncertain work.
 
-The same offer appears after a failed normal Danso turn (including a provider
-timeout or explicit pause). `/task_recover` requests a fresh offer on demand.
+The same offer appears after a failed Danso turn on every interactive input path —
+a normal message, a numbered `opt:` choice, and `/task_resume` (#1690) — including
+a provider timeout or explicit pause. Always after the failure text, never instead
+of it: the response the user answered to is delivered first. Utility commands that
+happen to call the model (`/skills`, `/command`) deliberately do not offer: they
+are one-shot lookups where a fresh retry is user-driven and a queued recovery
+offer would only add noise; this was reviewed when wiring the two paths above and
+the offer set stays closed until a path is observed to strand a failed long task.
+`/task_recover` requests a fresh offer on demand.
 Completed tasks and sessions without a long-task ledger do not trigger startup
 offers. An unreadable, malformed, or actively locked journal produces no advice;
 use `/task_recover` again after the active writer finishes. The current native
