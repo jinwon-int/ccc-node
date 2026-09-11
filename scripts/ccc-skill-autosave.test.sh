@@ -370,6 +370,74 @@ run9
 log_after9="$(grep -c "piri review ok" "$STATE9/skill-autosave.log")"
 ok "unchanged piri session not re-drafted" '[ "$log_after9" = "$log_before9" ]'
 
+# --- 10) danso drafting branch (opt-in, #1660; mirrors the piri branch) ------
+# Journal tree: <CCC_DANSO_STATE_DIR>/{journals,chatgpt-journals,glm-journals}
+# [-audience/<scope>]/<uuid>.jsonl. A Pi-v3-compatible fixture (plus the danso
+# custom operation row) is projected by the REAL piri-session-normalize.py and
+# dispatched through skill-review.sh with CCC_SKILL_PROVIDER=danso.
+DANSO_STATE_FIX="$TMP/danso-state-fixture"
+JROOT="$DANSO_STATE_FIX/journals-audience/private-b3362e2106be28b2f3221f38d9624b84"
+mkdir -p "$JROOT" && chmod 700 "$JROOT"
+cat > "$JROOT/1e0a9d2e-0000-4000-8000-000000000001.jsonl" <<'EOF'
+{"type":"session","version":3,"id":"dansosess-1","timestamp":"2026-09-11T08:00:00.000Z","cwd":"/home/gongmyoung"}
+{"type":"custom","customType":"danso.operation.v1","payload":{"op":"checkpoint"}}
+{"type":"message","id":"u1","timestamp":"2026-09-11T08:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"매일 백업 검증 절차를 밟아줘"}]}}
+{"type":"message","id":"a1","timestamp":"2026-09-11T08:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","text":"noise"}]}}
+{"type":"message","id":"a2","timestamp":"2026-09-11T08:00:03.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"ls -la /var/backups | head"}}]}}
+{"type":"message","id":"a3","timestamp":"2026-09-11T08:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"백업 정상입니다"}]}}
+{"type":"message","id":"a4","timestamp":"2026-09-11T08:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"검증 결과를 기록했습니다"}]}}
+EOF
+run10() {
+  env CCC_STATE_DIR="$STATE_DANSO" CLAUDE_PROJECTS_DIR="$PROJECTS_DANSO" CCC_PUSH_SPOOL="$SPOOL_DANSO" \
+    CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+    CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion10.touched" \
+    CCC_NODE=testnode CCC_DANSO_STATE_DIR="$DANSO_STATE_FIX" \
+    bash "$AUTOSAVE" run
+}
+STATE_DANSO="$TMP/state-danso10"; PROJECTS_DANSO="$TMP/projects10d"; SPOOL_DANSO="$TMP/spool10d"
+mkdir -p "$STATE_DANSO" "$PROJECTS_DANSO"
+chmod 700 "$STATE_DANSO"
+
+# 10a) default OFF.
+run10
+ok "danso branch default off logs not-enabled" 'grep -q "danso skipped reason=not-enabled" "$STATE_DANSO/skill-autosave.log"'
+ok "default off walks no danso journals (no normalized tree)" '[ ! -d "$STATE_DANSO/danso-normalized" ]'
+
+# 10b) opt-in via state file: projection + dispatch with provider=danso.
+printf '1\n' > "$STATE_DANSO/skill-autosave.danso-drafting"
+run10
+ok "opt-in projects the danso journal into the branch-local tree" \
+  '[ -f "$STATE_DANSO/danso-normalized/journals-audience-private-b3362e2106be28b2f3221f38d9624b84/dansosess-1.jsonl" ]'
+ok "danso custom operation rows are not projected" \
+  '! grep -q "danso.operation" "$STATE_DANSO/danso-normalized/journals-audience-private-b3362e2106be28b2f3221f38d9624b84/dansosess-1.jsonl"'
+ok "danso dispatch through real skill-review logged ok" \
+  'grep -q "danso review ok session=1e0a9d2e-0000-4000-8000-000000000001" "$STATE_DANSO/skill-autosave.log"'
+ok "sweep summary logs danso_drafted" \
+  'grep -q "sweep done drafted_sessions=0 codex_drafted=0 piri_drafted=0 danso_drafted=1" "$STATE_DANSO/skill-autosave.log"'
+# shellcheck disable=SC2034  # read via eval inside ok()
+danso_meta="$(find "$STATE_DANSO/pending-skills" -name meta.json 2>/dev/null | head -1)"
+ok "danso pending draft meta records provider=danso" \
+  '[ -n "$danso_meta" ] && jq -e ".provider == \"danso\"" >/dev/null "$danso_meta"'
+
+# 10c) no CCC_DANSO_STATE_DIR is a clean skip.
+rm -rf "$STATE_DANSO/danso-normalized" "$STATE_DANSO/skill-autosave.danso-seen"
+: > "$STATE_DANSO/skill-autosave.log"
+env CCC_STATE_DIR="$STATE_DANSO" CLAUDE_PROJECTS_DIR="$PROJECTS_DANSO" CCC_PUSH_SPOOL="$SPOOL_DANSO" \
+  CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+  CCC_SKILL_PROMOTION_CMD="$PROMOTER" CCC_NODE=testnode \
+  CCC_SKILL_DANSO_DRAFTING=1 bash "$AUTOSAVE" run
+ok "opt-in without CCC_DANSO_STATE_DIR logs no-state-dir" \
+  'grep -q "danso skipped reason=no-state-dir" "$STATE_DANSO/skill-autosave.log"'
+
+# 10d) regrowth ledger prevents re-drafting an unchanged journal.
+run10
+# shellcheck disable=SC2034  # read via eval inside ok()
+before10="$(grep -c "danso review ok" "$STATE_DANSO/skill-autosave.log")"
+run10
+# shellcheck disable=SC2034  # read via eval inside ok()
+after10="$(grep -c "danso review ok" "$STATE_DANSO/skill-autosave.log")"
+ok "unchanged danso journal not re-drafted" '[ "$after10" = "$before10" ]'
+
 # 9d) opt-in on a node without piri sessions is a clean no-op.
 STATE10="$TMP/state10"; mkdir -p "$STATE10"; chmod 700 "$STATE10"
 printf '1\n' > "$STATE10/skill-autosave.piri-drafting"
