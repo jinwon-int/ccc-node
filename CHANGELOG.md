@@ -4,6 +4,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Add skill lookup as one common search/read implementation behind a JSON CLI
+  (`scripts/ccc-skill-lookup.py`), a stdlib-only `family-skills` stdio MCP
+  server, and explicit owner-profile bridge injection that reuses the existing
+  `family-wiki` server without overwriting the curated web MCP (#1678).
+  Policy (external/shared contexts) is enforced from the process environment at
+  every call; repo reads verify the registry revision and report stale content
+  instead of serving drift.
+
 - Danso now delivers completed interim explanations during ordinary and long tasks,
   independent of draft streaming, and wakes progress consumers before CLI exit (#1673).
 

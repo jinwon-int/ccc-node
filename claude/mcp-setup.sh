@@ -66,6 +66,32 @@ add_stdio() {
 echo "==> Registering MCP servers (user scope)…"
 [ "$IS_TERMUX" = 1 ] && echo "  (Termux/Android detected: launching via 'node <cli>' — see #663)"
 
+# family-skills — local skill search/read MCP (#1678). stdlib-only server from
+# this checkout; launches with the absolute python3 path so no /usr/bin/env
+# shebang resolution is needed on any platform (Termux rule from #663). The
+# server re-checks the node isolation/audience policy at every tools/call.
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PY3="$(command -v python3)"
+if [ -n "$PY3" ] && [ -f "$REPO_ROOT/bridge/core/family_skills_server.py" ]; then
+  add family-skills -- "$PY3" "$REPO_ROOT/bridge/core/family_skills_server.py"
+  echo "  - family-skills: $REPO_ROOT/bridge/core/family_skills_server.py"
+else
+  echo "  - family-skills: SKIPPED — python3 or server file missing"
+fi
+
+# family-wiki — the existing wiki-agent read-only server, reused verbatim
+# (wiki_find / wiki_load / wiki_prefetch); never reimplemented here. Skipped
+# on externally isolated nodes or where wiki memory is disabled — the same
+# policy the bridge uses before injecting it (#1678).
+if [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ] || [ "${CCC_WIKI_MEMORY_ENABLED:-1}" = "0" ]; then
+  echo "  - family-wiki: SKIPPED (external isolation or wiki memory disabled)"
+elif command -v wiki-agent >/dev/null 2>&1; then
+  add family-wiki -- wiki-agent mcp-serve
+  echo "  - family-wiki: wiki-agent mcp-serve"
+else
+  echo "  - family-wiki: SKIPPED — wiki-agent not on PATH"
+fi
+
 # SearXNG — Seoyoon shared web search (Tailnet-only endpoint; needs `tailscale` up).
 # URL is shared infra, not a secret. Override SEARXNG_URL env before running to repoint.
 SEARXNG_URL="${SEARXNG_URL:-https://vps4.tail1546e7.ts.net:18443}"
@@ -90,4 +116,5 @@ echo "==> Done. Verifying:"
 claude mcp list
 echo
 echo "Note: tool permissions for these servers (mcp__searxng__*, mcp__firecrawl__*,"
-echo "      mcp__context7__*) are pre-allowed in claude/settings.json."
+echo "      mcp__context7__*, mcp__family-skills__*, mcp__family-wiki__*) are"
+echo "      pre-allowed in claude/settings.json."
