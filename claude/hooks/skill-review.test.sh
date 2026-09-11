@@ -177,5 +177,56 @@ ok "provider drops runner marker and keeps recursion guards" \
 ok "skill extractor denies built-in and MCP tools despite hostile inherited allowlist" \
   'argv_is_deny_all "$SNAPSHOT_ARGS" && [ "$(cat "$SNAPSHOT_TOOL_ENV")" = "<unset>" ] && ! grep -q "<Bash>\\|<Edit>\\|<Write>" "$SNAPSHOT_ARGS"'
 
+# --- #1654: provider-neutral drafting ---------------------------------------
+# A CCC_SKILL_REVIEW_LLM_CMD node drafts without any claude CLI on PATH, and
+# the prompt it receives is runtime-neutral with the provider-interpolated
+# category. The fake LLM tees its stdin so the prompt itself is assertable.
+LLM_SNAPSHOT="$TMP/llm-stdin.txt"
+LLM_ARGS_SNAPSHOT="$TMP/llm-args.txt"
+mkdir -p "$TMP/bin-llm"
+write_exec_stub "$TMP/bin-llm/fake-llm" <<SH
+cat > "$LLM_SNAPSHOT"
+printf '%s\\n' "\$@" > "$LLM_ARGS_SNAPSHOT"
+cat <<'JSON'
+{"skill_candidates":[{"name":"neutral-probe","category":"piri","summary":"Probe emitted by the neutral LLM command.","reason":"Synthetic fixture response.","evidence_excerpt":"fixture","skill_md":"---\nname: neutral-probe\ndescription: Probe skill emitted by the fake neutral LLM command fixture.\n---\n\n# Neutral Probe\n\n## When to Use\n- Never; this is a fixture.\n\n## Procedure\n1. Emit.\n\n## Safety\n- No secrets.\n\n## Verification\n- Fixture only.\n"}]}
+JSON
+SH
+chmod +x "$TMP/bin-llm/fake-llm"
+rm -f "$LLM_SNAPSHOT" "$LLM_ARGS_SNAPSHOT"
+STATE_LLM="$TMP/state-llm"
+mkdir -p "$STATE_LLM"; chmod 700 "$STATE_LLM"
+CLAUDE_SKILL_REVIEW_TRANSCRIPT="$TRANS" CLAUDE_SKILL_REVIEW_SESSION=sess-llm \
+  CLAUDE_SKILL_REVIEW_BG=1 CLAUDE_SKILL_REVIEW_INFLIGHT=1 \
+  CCC_SKILL_REVIEW_STATE_DIR="$STATE_LLM" CCC_SKILL_PROVIDER=piri \
+  CCC_SKILL_REVIEW_LLM_CMD="$TMP/bin-llm/fake-llm --flag value" \
+  PATH="${PATH#"$TMP/bin:"}" \
+  bash "$HERE/skill-review/extract.sh" >"$TMP/llm-out.json" 2>/dev/null
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "LLM_CMD drafts without claude on PATH" '[ "$rc" = 0 ] && jq -e ".skill_candidates[0].name == \"neutral-probe\"" >/dev/null <<<"$(cat "$TMP/llm-out.json")"'
+ok "LLM_CMD argv is shlex-split (flags reach the command)" \
+  'grep -qx -- "--flag" "$LLM_ARGS_SNAPSHOT" && grep -qx "value" "$LLM_ARGS_SNAPSHOT"'
+ok "prompt is provider-routed (category=piri)" 'grep -q '\''"category": "piri"'\'' "$LLM_SNAPSHOT"'
+ok "prompt drops the Claude-node framing" '! grep -q "Claude Code node" "$LLM_SNAPSHOT"'
+ok "prompt forbids runtime couplings in drafts" 'grep -q "never write" "$LLM_SNAPSHOT" && grep -q "agent CLI" "$LLM_SNAPSHOT"'
+
+# meta.json records the staging provider so autoinstall (#1655) and promotion
+# can route per-draft without guessing from the process environment.
+STATE_PIRI="$TMP/state-piri"
+mkdir -p "$STATE_PIRI"; chmod 700 "$STATE_PIRI"
+payload sess-piri "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE_PIRI" CLAUDE_SKILLS_DIR="$SKILLS" \
+  CCC_SKILL_PROVIDER=piri CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 bash "$REVIEW" sessionend >/dev/null 2>&1
+for _ in $(seq 1 30); do
+  find "$STATE_PIRI/pending-skills" -name meta.json 2>/dev/null | grep -q . && break
+  sleep 0.1
+done
+piri_meta="$(find "$STATE_PIRI/pending-skills" -name meta.json 2>/dev/null | head -1)"
+ok "piri branch meta records provider=piri" \
+  '[ -n "$piri_meta" ] && jq -e ".provider == \"piri\"" >/dev/null "$piri_meta"'
+# Unset provider auto-detects claude on this fixture (HOME has ~/.claude, no codex home).
+claude_meta="$(find "$STATE/pending-skills" -name meta.json 2>/dev/null | head -1)"
+ok "default branch meta records provider=claude" \
+  '[ -n "$claude_meta" ] && jq -e ".provider == \"claude\"" >/dev/null "$claude_meta"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

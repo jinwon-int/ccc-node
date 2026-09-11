@@ -704,11 +704,23 @@ each drafting run is an LLM call), `CCC_SKILL_AUTOSAVE_WINDOW_DAYS` (2),
 re-reviewed only after growing this much), `CCC_SKILL_AUTOSAVE_NOTIFY` (1),
 `CCC_SKILL_AUTOSAVE_SETTLE_SECONDS` (90), `CCC_SKILL_AUTOSAVE_MODE`
 (approve|auto, default approve), `CCC_SKILL_AUTOSAVE_DAILY_CAP` (3 — auto-mode
-installs per UTC day), `CCC_SKILL_PROVIDER` (claude|codex, default auto-detect —
-selects the install surface), `CODEX_SKILLS_DIR` (Codex install target override,
-default `${CODEX_HOME:-~/.codex}/skills`),
+installs per UTC day), `CCC_SKILL_PROVIDER` (claude|codex|piri, default
+auto-detect — selects the install surface), `CODEX_SKILLS_DIR` (Codex install
+target override, default `${CODEX_HOME:-~/.codex}/skills`),
 `CCC_CODEX_SKILL_COLLECTOR` (Codex-only candidate collection, default true),
 `CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP` (default 1, range 1–10).
+
+Neutral drafting LLM (#1654): `extract.sh` normally drafts through
+`claude -p --model haiku`. On nodes without the claude CLI (piri/codex lanes,
+non-Anthropic gateways), set `CCC_SKILL_REVIEW_LLM_CMD` to a shell-quoted
+command (the same variable the promotion autorepair path reads): extract
+shlex-splits it, feeds the prompt on stdin, and reads the strict-JSON response
+on stdout. One retry with a strict-JSON reminder follows a malformed response;
+the zai fallback below still applies when its env file exists. Unset keeps the
+historical claude-only flow byte-identical. The drafting prompt is
+runtime-neutral: it labels the category with the active provider and forbids
+`claude -p` / `~/.claude/` / `CLAUDE_*`-style couplings in draft bodies so
+drafts can pass the non-Claude compatibility screens.
 
 Zai fallback (node-local opt-in): when the haiku path yields no valid JSON,
 `claude/hooks/skill-review/extract.sh` retries once against a zai GLM model
