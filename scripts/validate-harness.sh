@@ -521,6 +521,12 @@ else
   err "doctor skill-promotion revise-stall verdict tests failed"
   tail -10 "$TMP/doctor-revise-stall-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_usage_telemetry_test.py >"$TMP/doctor-usage-telemetry-test.out" 2>&1; then
+  say "  ok doctor skill-usage telemetry verdict tests (#1675)"
+else
+  err "doctor skill-usage telemetry verdict tests failed (empty ledger may read as non-use)"
+  tail -10 "$TMP/doctor-usage-telemetry-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_marker_registry_test.py >"$TMP/doctor-marker-registry-test.out" 2>&1; then
   say "  ok doctor cron marker registry covers every install-*-cron.sh"
 else
