@@ -22,6 +22,7 @@ Scope and safety contract:
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import importlib.util
 import json
@@ -1701,6 +1702,26 @@ class _BumpLock:
                 os.close(descriptor)
 
 
+def _degrade_reason(error: Exception) -> str:
+    """A bounded, body-free code for why a fail-open bump did not record.
+
+    #1675: every failure used to collapse into a bare degraded=True, so a
+    broken telemetry path and a genuinely unused skill looked identical from
+    the outside -- which is exactly the distinction the retirement audit
+    (#1648) needs. This does NOT change the fail-open contract: the caller
+    still gets ok=True and is still never blocked.
+
+    Deliberately NOT str(error): an OSError's message carries the path it
+    failed on, and this value travels into telemetry output. ContractError
+    codes are already a closed vocabulary; OSError collapses to its errno
+    name. Both are safe to log.
+    """
+    if isinstance(error, ContractError):
+        return f"contract:{error.code}"
+    name = errno.errorcode.get(error.errno, "UNKNOWN") if error.errno else "UNKNOWN"
+    return f"os:{name}"
+
+
 def _command_bump(context, name: str, event: str) -> dict[str, Any]:
     """Fail-open telemetry increment; never blocks the foreground caller."""
     try:
@@ -1721,8 +1742,14 @@ def _command_bump(context, name: str, event: str) -> dict[str, Any]:
             record[f"last_{'viewed' if event == 'view' else 'used'}_at"] = _ts(now)
             _save_usage(context, usage)
         return {"ok": True, "command": "bump", "recorded": True}
-    except (ContractError, OSError):
-        return {"ok": True, "command": "bump", "recorded": False, "degraded": True}
+    except (ContractError, OSError) as error:
+        return {
+            "ok": True,
+            "command": "bump",
+            "recorded": False,
+            "degraded": True,
+            "reason": _degrade_reason(error),
+        }
 
 
 def _command_archive(context, name: str, dry_run: bool) -> dict[str, Any]:
