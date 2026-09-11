@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from telegram_bot.core import grok_gateway as gateway
 from telegram_bot.core.grok_protocol import MAX_WIRE, ProtocolError
-from telegram_bot.core.grok_ssh import GrokSshTransport, helper_source
+from telegram_bot.core.grok_ssh import GrokLocalTransport, GrokSshTransport, helper_source
 
 AGENT = "00000000-0000-4000-8000-000000000001"
 NONCE = "00000000-0000-4000-8000-000000000002"
@@ -203,6 +203,15 @@ class SshTests(unittest.IsolatedAsyncioTestCase):
         with patch("telegram_bot.core.grok_ssh.asyncio.create_subprocess_exec",
                    side_effect=OSError(SECRET)), self.assertRaisesRegex(ProtocolError, "^ssh_launch_failure$"):
             await GrokSshTransport("box@fixture.invalid", AGENT).call("health")
+
+    async def test_local_transport_spawn_error_categorical(self):
+        with patch("telegram_bot.core.grok_ssh.asyncio.create_subprocess_exec",
+                   side_effect=OSError(SECRET)), self.assertRaisesRegex(ProtocolError, "^ssh_launch_failure$"):
+            await GrokLocalTransport("box@fixture.invalid", AGENT).call("health")
+
+    def test_local_transport_keeps_binding_destination(self):
+        transport = GrokLocalTransport("box@fixture.invalid", AGENT)
+        self.assertEqual(transport.destination, "box@fixture.invalid")
 
     async def test_escaped_test_helper_bounds_local_pipe_cleanup(self):
         with tempfile.TemporaryDirectory() as root:

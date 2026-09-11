@@ -1557,8 +1557,15 @@ maybe_setup_agent_cli() {
 
     case "${provider,,}" in
         grok)
+            grok_transport="${CCC_GROK_TRANSPORT:-$(read_env_with_fallback "CCC_GROK_TRANSPORT")}"
+            grok_transport="${grok_transport:-local}"
+            if [ "${grok_transport,,}" = "local" ]; then
+                echo "✅ Grok local transport; poller runs on the Grok computer (no Seoseo hop)"
+                export CCC_GROK_TRANSPORT=local
+                return
+            fi
             if ! command -v ssh >/dev/null 2>&1; then
-                echo "❌ Error: Grok requires the local SSH client"
+                echo "❌ Error: Grok SSH transport requires the local SSH client"
                 exit 1
             fi
             echo "✅ Grok SSH client available; explicit journal and authenticated startup checks still required"

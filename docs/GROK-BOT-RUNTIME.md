@@ -99,7 +99,7 @@ the bridge's inbound and outbound delivery boundaries still need qualification.
 
 Each turn has a 180-second operation deadline; polling waits two seconds while
 the configured Bot is busy, but an approval-only or foreign/invalid state denies.
-The SSH transport retains its own 20-second exchange and two-second cleanup
+Local and SSH transports retain a 20-second exchange and two-second cleanup
 bounds. Unknown send outcomes and no-longer-visible transcript ranges are
 retained, not retried under a fresh nonce.
 

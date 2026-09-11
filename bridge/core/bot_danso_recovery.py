@@ -218,6 +218,7 @@ class DansoRecoveryMixin:
             sandbox_policy=self._codex_sandbox_policy(), approval_callback=self._codex_approval_callback,
             status_callback=self._make_status_callback(app.bot, chat_id),
             bot=app.bot, notification_bot=app.bot, sensitive_log_event='danso-recovery',
+            interim_message_callback=self._make_interim_send_callback(chat_id),
         )
         # Session identity was persisted by the guarded start recorder before
         # dispatch. Do not overwrite a later /new with a post-turn save.
