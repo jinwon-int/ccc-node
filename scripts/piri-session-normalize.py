@@ -51,6 +51,7 @@ input, 2 = usage error.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -189,12 +190,41 @@ def write_projection(rows: list[dict], out_path: str, max_out_bytes: int) -> tup
     return out_bytes, len(written), truncated
 
 
-def project_session(source: str, out_dir: str, max_out_bytes: int) -> dict:
+def project_session(source: str, out_dir: str, max_out_bytes: int, *, lock: bool = False,
+                    project_enc_override: str = "") -> dict:
     meta = scan_meta(source)
     records_in = sum(1 for _ in open(source, encoding="utf-8", errors="replace"))
 
+    # #1660: danso journals are flocked exclusively while the CLI writes; a
+    # shared non-blocking probe fails closed there so the sweep defers the
+    # session to a later run instead of projecting a partial transcript.
+    # Piri sessions are unlocked, so the probe is a no-op for them.
+    if lock:
+        descriptor = os.open(source, os.O_RDONLY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            return {
+                "session_id": meta["session_id"],
+                "project_enc": project_enc_override,
+                "records_in": records_in,
+                "records_out": 0,
+                "out_bytes": 0,
+                "truncated": False,
+                "excluded": False,
+                "empty": True,
+                "locked": True,
+                "source_size": os.path.getsize(source),
+            }
+        finally:
+            os.close(descriptor)
+
     rows = rows_from_session(source, meta)
-    project_enc = encode_project_dir(meta["cwd"]) if meta["cwd"] else "_unknown"
+    if project_enc_override:
+        project_enc = project_enc_override
+    else:
+        project_enc = encode_project_dir(meta["cwd"]) if meta["cwd"] else "_unknown"
     session_slug = meta["session_id"] or os.path.basename(source).removesuffix(".jsonl")
     out_path = os.path.join(out_dir, project_enc, f"{session_slug}.jsonl")
 
@@ -213,6 +243,7 @@ def project_session(source: str, out_dir: str, max_out_bytes: int) -> dict:
         "truncated": truncated,
         "excluded": False,
         "empty": records_out == 0,
+        "locked": False,
         "source_size": os.path.getsize(source),
     }
 
@@ -230,6 +261,16 @@ def main() -> int:
         "--max-bytes", type=int, default=MAX_OUT_BYTES_DEFAULT,
         help=f"projected output cap per session (default {MAX_OUT_BYTES_DEFAULT})",
     )
+    parser.add_argument(
+        "--project-enc", default="",
+        help="override the encoded project directory (danso journals carry no "
+        "encoded cwd; callers derive it from the journal root + audience scope)",
+    )
+    parser.add_argument(
+        "--lock", action="store_true",
+        help="probe a shared non-blocking flock and skip (empty + locked=true) "
+        "when the writer holds the journal",
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.source):
@@ -240,7 +281,11 @@ def main() -> int:
         return 2
 
     try:
-        summary = project_session(args.source, args.out_dir, args.max_bytes)
+        summary = project_session(
+            args.source, args.out_dir, args.max_bytes,
+            lock=args.lock,
+            project_enc_override="".join(c for c in args.project_enc if c not in "/"),
+        )
     except OSError as exc:
         print(f"unreadable source: {exc}", file=sys.stderr)
         return 1
