@@ -79,23 +79,21 @@ def _stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: bool = False
     if fail:
         body_lines.append("sys.exit(3)")
     else:
-        skill_md = chr(10).join(
-            [
-                "---",
-                "name: danso-release-check",
-                "description: Capture the recurring danso release verification checklist procedure.",
-                "---",
-                "",
-                "# danso-release-check",
-                "",
-                "## Procedure",
-                "1. Step.",
-                "2. Verify.",
-                "3. Record.",
-                "4. Confirm.",
-                "5. Done.",
-            ]
-        )
+        skill_md_lines = [
+            "---",
+            "name: danso-release-check",
+            "description: Capture the recurring danso release verification checklist procedure.",
+            "---",
+            "",
+            "# danso-release-check",
+            "",
+            "## Procedure",
+            "1. Step.",
+            "2. Verify.",
+            "3. Record.",
+            "4. Confirm.",
+            "5. Done.",
+        ]
         body_lines += [
             "ctx = ''",
             "prev = ''",
@@ -106,23 +104,7 @@ def _stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: bool = False
             "open(" + repr(str(capture)) + ", 'w').write(open(ctx).read())",
             "open(" + repr(str(argv_file)) + ", 'w').write(' '.join(argv))",
             "packet = json.loads(open(ctx).read().split('Untrusted transcript JSON:' + chr(10), 1)[1])",
-            "skill_md = chr(10).join(" + repr(
-                [
-                    "---",
-                    "name: danso-release-check",
-                    "description: Capture the recurring danso release verification checklist procedure.",
-                    "---",
-                    "",
-                    "# danso-release-check",
-                    "",
-                    "## Procedure",
-                    "1. Step.",
-                    "2. Verify.",
-                    "3. Record.",
-                    "4. Confirm.",
-                    "5. Done.",
-                ]
-            ) + ")",
+            "skill_md = " + repr(NL.join(skill_md_lines)),
             "json.dump({",
             "    'schema_version': 1,",
             "    'provenance': {",
