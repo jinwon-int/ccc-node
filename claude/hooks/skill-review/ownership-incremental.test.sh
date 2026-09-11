@@ -670,12 +670,16 @@ make_skill danso-gate
 DANSO_SKILLS_DIR="$SKILLS" python3 "$TOOL" --provider danso --skills-dir "$SKILLS" --state-dir "$STATE" mark-created danso-gate >/dev/null
 make_patch danso-gate SKILL.md "1. Read." "1. Run: claude -p --model haiku." "$(printf 'f%.0s' {1..64})" "$TMP/danso-incompat.json" danso
 # shellcheck disable=SC2034  # out is read via eval inside ok()
-out="$(danso_tool validate-proposal --proposal "$TMP/danso-incompat.json")"; rc=$?
+out="$(danso_tool validate-proposal --proposal "$TMP/danso-incompat.json")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "danso patch with Claude-only coupling is rejected" \
   '[ "$rc" = 2 ] && jq -e ".code == \"incremental_content_provider_incompatible\"" >/dev/null <<<"$out"'
 make_patch danso-gate SKILL.md "1. Read." "1. Read twice." "$(printf '1%.0s' {1..64})" "$TMP/danso-clean.json" danso
 # shellcheck disable=SC2034  # out is read via eval inside ok()
-out="$(danso_tool validate-proposal --proposal "$TMP/danso-clean.json")"; rc=$?
+out="$(danso_tool validate-proposal --proposal "$TMP/danso-clean.json")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "benign danso patch validates" \
   '[ "$rc" = 0 ] && jq -e ".ok == true" >/dev/null <<<"$out"'
 
