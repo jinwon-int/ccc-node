@@ -473,7 +473,7 @@ ok "danso env without bridge home plans zero operations" \
   '[ "$rc" = 0 ] && jq -e "(.operations | length) == 0" >/dev/null <<<"$out"'
 
 # b) bridge home exists (skills leaf missing): plan shows the danso install.
-mkdir -p "$DANSO_STATE_DIR" && mkdir -m 700 "$DANSO_STATE_DIR/home"
+mkdir -p "$DANSO_STATE_DIR" && chmod 700 "$DANSO_STATE_DIR" && mkdir -m 700 "$DANSO_STATE_DIR/home"
 out="$(env "${danso_env[@]}" CCC_DANSO_STATE_DIR="$DANSO_STATE_DIR" python3 "$SYNC" plan --ref "$REF_DANSO")"; rc=$?
 ok "danso node plans the danso-audience skill into the env root" \
   '[ "$rc" = 0 ] && jq -e "(.operations | length) == 1 and .operations[0].provider == \"danso\" and .operations[0].action == \"install\"" >/dev/null <<<"$out"'
