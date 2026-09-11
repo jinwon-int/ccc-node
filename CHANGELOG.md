@@ -4,6 +4,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Make Grok Telegram **direct on the Grok computer** (`CCC_GROK_TRANSPORT=local`).
+  Seoseo SSH hop is retired. SSH transport remains non-production.
+
 - Offer a conversation-bound recovery summary and explicit Continue/New/Inspect
   choices after interrupted Danso tasks or bridge restart (#1667). Preserve
   original journals, validate choices at dispatch, and consume optional native
