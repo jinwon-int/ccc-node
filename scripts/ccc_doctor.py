@@ -604,6 +604,7 @@ class Doctor:
         self.check_distill_readiness()
         self.check_skill_promotion_backlog()
         self.check_skill_promotion_revise_stall()
+        self.check_skill_usage_telemetry()
         self.check_self_update_stall()
         # Managed Codex skills are provider-native (#647): diagnose them only on
         # a Codex node. Claude-only asset findings above stay non-readiness
@@ -1614,6 +1615,123 @@ class Doctor:
             "author node is not an online broker worker; confirm whether that "
             "node is meant to run a worker at all — if it is not, these "
             "findings need a different route than a broker revision round",
+        )
+
+    _TELEMETRY_SILENT_DAYS = 14
+
+    def check_skill_usage_telemetry(self) -> None:
+        """Report a skill-usage ledger that is wired but has stopped growing.
+
+        #1675. The retirement audit (#1648) reads an empty ledger as "this
+        skill is unused". That inference is only sound when a recording path
+        is known to work, and until now nothing checked: `curator-bump.sh`
+        swallowed every failure and `_command_bump` collapsed all of them into
+        a bare degraded=True. A broken hook and an idle node produced the same
+        observable state.
+
+        Two facts are reported, never conflated:
+          * degraded entries exist -> a recording path is actively failing.
+            This is a defect and says nothing about usage.
+          * the hook is wired but the ledger has not grown in a long time ->
+            either genuinely idle or silently broken. Ageing it is the point;
+            a node that has not recorded in weeks is worth a look before its
+            zeros are used as retirement evidence.
+
+        An unwired node is 정상, not drift: `skill-usage-log.sh` only exists on
+        nodes that carry the Claude Code harness at all.
+        """
+        item = "skill-usage telemetry"
+        state_dir = Path(
+            os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")
+        ).expanduser()
+        usage_dir = state_dir / "skill-usage"
+        hook = self.claude_dir / "hooks" / "skill-usage-log.sh"
+        if hook.is_symlink() or not hook.is_file():
+            self.add("정상", item, "hook=absent", "none")
+            return
+
+        degraded_log = usage_dir / "degraded.log"
+        degraded_lines = 0
+        latest_reason = ""
+        if degraded_log.is_file() and not degraded_log.is_symlink():
+            try:
+                with degraded_log.open(encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        if line.strip():
+                            degraded_lines += 1
+                            latest_reason = line.strip()
+            except OSError:
+                self.add(
+                    "수동필요",
+                    item,
+                    "degraded_log=unreadable",
+                    f"inspect {degraded_log} permissions",
+                )
+                return
+        if degraded_lines:
+            # A recording path is failing right now. Report it as a defect on
+            # its own terms -- do not fold it into the staleness verdict, which
+            # answers a different question.
+            self.add(
+                "경고",
+                item,
+                f"degraded={degraded_lines}; latest={latest_reason[-60:]}",
+                "a skill-usage recording path is failing; ledger emptiness "
+                "cannot be read as non-use until this is resolved (#1675)",
+            )
+            return
+
+        ledger = usage_dir / "usage.jsonl"
+        if ledger.is_symlink() or not ledger.is_file():
+            self.add(
+                "경고",
+                item,
+                "hook=wired; ledger=absent",
+                "the hook is installed but has never recorded a skill load; "
+                "confirm a skill loads on this node before its zeros count as "
+                "retirement evidence (#1648)",
+            )
+            return
+        newest: str | None = None
+        try:
+            with ledger.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    stamp = row.get("ts")
+                    if isinstance(stamp, str) and (newest is None or stamp > newest):
+                        newest = stamp
+        except OSError:
+            self.add(
+                "수동필요",
+                item,
+                "ledger=unreadable",
+                f"inspect {ledger} permissions",
+            )
+            return
+        if newest is None:
+            self.add("경고", item, "ledger=empty", "ledger exists but holds no usable record")
+            return
+        age_days = _iso_age_days(newest)
+        if age_days is None:
+            self.add("정상", item, "newest=unparsable", "none")
+            return
+        status = f"newest={age_days}d"
+        if age_days < self._TELEMETRY_SILENT_DAYS:
+            self.add("정상", item, status, "none")
+            return
+        self.add(
+            "경고",
+            item,
+            status,
+            f"no skill load recorded in {age_days}d; this node is either idle "
+            "or its telemetry is silently broken — the two are what #1675 "
+            "exists to separate",
         )
 
     def check_self_update_stall(self) -> None:
