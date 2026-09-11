@@ -150,6 +150,7 @@ utils/chat_logger.py Per-session debug chat logging
 | `CCC_CODEX_DISTILL_MODEL` | Codex only | Isolated memory extractor model label (default: `provider-default`, preserving the Codex CLI default) |
 | `CCC_CODEX_DISTILL_TIMEOUT_SEC` | Codex only | Isolated extractor timeout in seconds, bounded to 1–600 (default: 120) |
 | `CCC_CODEX_SKILL_COLLECTOR` | Codex only | Stage skill candidates from distill snapshots (default: **true**). Set `false` for a node-local opt-out; installation still defaults to `approve` |
+| `CCC_DANSO_SKILL_COLLECTOR` | Danso only | Stage skill candidates from danso distill snapshots into the shared pending queue (default: **true**; #1662). Set `false` for a node-local opt-out. The installer targets `<CCC_DANSO_STATE_DIR>/home/.pi/agent/skills` via `DANSO_SKILLS_DIR`/`CCC_DANSO_STATE_DIR` (#1659) |
 | `CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP` | Codex only | Hard cap on provider attempts per collector sweep, bounded to 1–10 (default: 1) |
 | `CCC_USAGE_KIMI_5H_REQUEST_LIMIT` | No | Operator-configured Kimi Code 5-hour request limit (from the Kimi Code Console); when set, `/usage` shows `used/limit req · X% used / Y% left` for the synthesized `Kimi 5-hour` window (local estimate). Unset = count-only |
 | `CCC_USAGE_KIMI_WEEKLY_TOKEN_LIMIT` | No | Operator-configured Kimi Code weekly token limit (Console shows weekly % only; back-compute the limit once from the meter's 7-day totals). When set, `/usage` adds a `Kimi weekly` percent window (local estimate). Unset = weekly window hidden |

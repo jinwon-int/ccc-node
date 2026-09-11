@@ -173,7 +173,7 @@ def _build_skill_candidate_collector(
 
     collector_provider = (
         settings.agent_provider
-        if settings.agent_provider in {"codex", "piri"}
+        if settings.agent_provider in {"codex", "piri", "danso"}
         else None
     )
     if not (
@@ -199,6 +199,18 @@ def _build_skill_candidate_collector(
             model=settings.codex_distill_model,
             timeout_seconds=settings.codex_distill_timeout_seconds,
             audience_auth_mode=settings.codex_audience_auth_mode,
+        )
+    elif collector_provider == "danso":
+        from telegram_bot.memory.danso_backend import DansoSkillCandidateBackend
+        from telegram_bot.memory.distill_backend_factory import (
+            resolve_distill_model_timeout,
+        )
+
+        model, timeout = resolve_distill_model_timeout(settings, "danso")
+        backend = DansoSkillCandidateBackend(
+            settings,
+            model=model,
+            timeout_seconds=timeout,
         )
     else:
         from telegram_bot.memory.distill_backend_factory import (

@@ -320,7 +320,11 @@ The existing local sink writes audience-scoped `memory-facts.jsonl` and
 `resume.md`, rebuilds the local index and deduplicates retries. A later materializer
 reads these facts; the node must have its normal CCC memory search helpers
 installed. Existing memory namespaces and journals do not move. New Danso jobs
-do not generate Wiki candidates or skill installation requests. This does not
+do not generate Wiki candidates. Skill candidates ARE collected (#1662): the
+danso journal drives the same `SkillCandidateCollectorWorker` via
+`DansoSkillCandidateBackend` (default on, `CCC_DANSO_SKILL_COLLECTOR=false`
+opts out), staging pending drafts that the danso install lane installs into
+`<CCC_DANSO_STATE_DIR>/home/.pi/agent/skills` (#1659). This does not
 backfill old conversations or provide a new automatic Honcho ingestion path.
 
 ## Provider failure diagnostics

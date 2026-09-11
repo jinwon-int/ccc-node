@@ -82,7 +82,7 @@ class SkillCandidateCollectorWorker:
         provider: str = "codex",
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if provider not in {"codex", "piri"}:
+        if provider not in {"codex", "piri", "danso"}:
             raise ValueError("unsupported skill-candidate collector provider")
         self._provider = provider
         self._journal = journal
