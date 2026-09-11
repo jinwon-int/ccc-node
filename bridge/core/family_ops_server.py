@@ -35,6 +35,7 @@ try:
     )
     from telegram_bot.core.node_status import NodeStatusError, node_status  # noqa: E402
     from telegram_bot.core.skill_lookup import policy_denial  # noqa: E402
+    from telegram_bot.core.task_status import TaskStatusError, collect as collect_task_status  # noqa: E402
 except ImportError:  # pragma: no cover - worktree aliasing only
     from mcp_stdio import (  # noqa: E402  # type: ignore[no-redef]
         ToolError,
@@ -44,6 +45,7 @@ except ImportError:  # pragma: no cover - worktree aliasing only
     )
     from node_status import NodeStatusError, node_status  # noqa: E402  # type: ignore[no-redef]
     from skill_lookup import policy_denial  # noqa: E402  # type: ignore[no-redef]
+    from task_status import TaskStatusError, collect as collect_task_status  # noqa: E402  # type: ignore[no-redef]
 
 SERVER_NAME = "family-ops"
 SERVER_VERSION = "1.0.0"
@@ -62,7 +64,23 @@ _NODE_STATUS_SCHEMA = {
     "additionalProperties": False,
 }
 
+_TASK_STATUS_SCHEMA = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+
 _TOOLS = [
+    {
+        "name": "task_status",
+        "description": (
+            "Read-only task recovery status: the agent checkpoint "
+            "(working-state), resume note, and external wait promises "
+            "(active pending / dropped). Bounded content; observation time; "
+            "partial failures reported as unknown."
+        ),
+        "inputSchema": _TASK_STATUS_SCHEMA,
+    },
     {
         "name": "node_status",
         "description": (
@@ -80,14 +98,21 @@ def _dispatch(name: str, arguments: Any) -> dict[str, Any]:
     denial = policy_denial()
     if denial is not None:
         raise ToolError(
-            "policy_denied", "node status denied by node policy", reason=denial
+            "policy_denied", "family-ops denied by node policy", reason=denial
         )
-    if name != "node_status":
-        raise ToolError("unknown_tool", f"unknown tool: {name}")
     if arguments is None:
         arguments = {}
     if not isinstance(arguments, dict):
         raise ToolError("invalid_arguments", "arguments must be an object")
+    if name == "task_status":
+        try:
+            result = collect_task_status()
+        except TaskStatusError as error:
+            raise ToolError(error.code, str(error), **error.details) from error
+        _diag(f"call task_status ok status={result.get('status')}")
+        return tool_result(result)
+    if name != "node_status":
+        raise ToolError("unknown_tool", f"unknown tool: {name}")
     node = arguments.get("node")
     try:
         if node is None:
