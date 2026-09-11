@@ -369,17 +369,30 @@ ok "pipeline: render pipeline leaves no scratch directory behind (#1484)" \
 skills="$TMP/skills"; mkdir -p "$skills/gh-pr-flow" "$skills/no-frontmatter"
 printf -- '---\nname: gh-pr-flow\ndescription: Ship code through the PR-first flow including REVIEW_REQUIRED cross-account review\n---\nbody\n' > "$skills/gh-pr-flow/SKILL.md"
 printf 'no frontmatter here\n' > "$skills/no-frontmatter/SKILL.md"
-out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_SKILL_INDEX_ENABLED=1 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "skill index injects name and description from frontmatter" \
   '[ "$rc" = 0 ] && grep -q "Node skills index" <<<"$out" && grep -q "gh-pr-flow — Ship code through the PR-first flow" <<<"$out"'
 ok "skill without frontmatter is skipped, not misparsed" '! grep -q "no-frontmatter" <<<"$out"'
 big="$skills/zz-big"; mkdir -p "$big"
 printf -- '---\nname: zz-big\ndescription: %s\n---\n' "$(printf 'x%.0s' $(seq 1 3000))" > "$big/SKILL.md"
-out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_SKILL_INDEX_MAX_BYTES=200 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_SKILL_INDEX_ENABLED=1 CCC_SKILL_INDEX_MAX_BYTES=200 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "over-budget index degrades to a complete names-only list, no silent tail-drop" \
   '[ "$rc" = 0 ] && grep -q "names only" <<<"$out" && grep -q -- "- zz-big" <<<"$out" && grep -q -- "- gh-pr-flow" <<<"$out" && ! grep -q "$(printf "x%.0s" $(seq 1 500))" <<<"$out"'
 out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_SKILL_INDEX_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "skill index can be disabled" '[ "$rc" = 0 ] && ! grep -q "Node skills index" <<<"$out"'
+
+# #1692: the default is OFF. Both runtimes surface skills on their own -- Claude
+# Code injects name+description for the Skill tool, and pi implements the Agent
+# Skills standard and reads ~/.claude/skills when settings name it. Injecting a
+# budget-truncated copy duplicates that and, on a well-stocked node, hides the
+# alphabetical tail. Without this test the default flips back silently: every
+# other skill-index test above now passes CCC_SKILL_INDEX_ENABLED=1 explicitly,
+# so nothing else would notice.
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "skill index is off by default (#1692)" \
+  '[ "$rc" = 0 ] && ! grep -q "Node skills index" <<<"$out"'
+ok "default-off does not suppress the rest of the snapshot" \
+  '[ "$rc" = 0 ] && grep -q "MEMORY" <<<"$out"'
 
 # --- #1157: load-memory runs the scanner through bash, not its shebang -------
 # CCC_HOOK_DIR resolves only scan-injection.sh, so a fake scanner whose shebang
