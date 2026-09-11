@@ -80,6 +80,7 @@ class RecoverySnapshot:
             'failed': '요청 실패', 'pending_provider': '모델 요청 결과 미확인',
             'pending_tools': '도구 실행 결과 미확인', 'final_pending': '최종 응답 기록 미확인',
             'completed': '완료', 'not_long_task': '장기 작업 기록 없음',
+            'blocked': '도구 실행 기록 확인 필요',
         }
         uncertainty = (f"중단된 모델 요청 {self.unknown_usage_requests}회의 토큰 사용량은 미확인입니다. "
                        "이어가면 모델 요청 비용이 추가될 수 있습니다.\n"

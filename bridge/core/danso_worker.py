@@ -116,7 +116,7 @@ TASK_PROGRESS_KEYS = {
 }
 TASK_STATUS_STATES = {
     'ready', 'pending_provider', 'pending_tools', 'final_pending',
-    'paused', 'completed', 'failed', 'not_long_task',
+    'paused', 'completed', 'failed', 'not_long_task', 'blocked',
 }
 TASK_STATUS_KEYS = {
     'version', 'kind', 'state', 'session_id', 'stage', 'elapsed_ms',
@@ -179,11 +179,9 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
         if type(value) is not int or not 1 <= value <= maximum:
             raise ValueError('invalid task status limits')
         values[key] = value
-    if values['stage_requests'] > values['max_requests']:
-        raise ValueError('invalid task status limits')
     usage_values = {}
     for key, maximum in (('requests', values['max_requests']),
-                         ('reported_tokens', values['max_tokens'])):
+                         ('reported_tokens', 2**64 - 1)):
         value = usage[key]
         if type(value) is not int or not 0 <= value <= maximum:
             raise ValueError('invalid task status usage')
@@ -215,7 +213,7 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
         if type(pending) is not dict:
             raise ValueError('invalid task status pending')
         if set(pending) == {'kind'}:
-            if pending['kind'] != 'tools':
+            if pending['kind'] not in {'tool', 'tools'}:
                 raise ValueError('invalid task status pending')
         elif set(pending) == {'kind', 'sequence'}:
             if (pending['kind'] != 'provider'
@@ -224,6 +222,14 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
                 raise ValueError('invalid task status pending')
         else:
             raise ValueError('invalid task status pending')
+    if data['state'] == 'blocked' and (pending != {'kind': 'tool'} or data['resume_allowed']):
+        raise ValueError('invalid blocked task status')
+    if data['resume_allowed'] and (
+            data['state'] not in {'ready', 'paused'} or pending is not None
+            or data['elapsed_ms'] >= values['wall_seconds'] * 1000
+            or usage_values['requests'] >= values['max_requests']
+            or usage_values['reported_tokens'] >= values['max_tokens']):
+        raise ValueError('inconsistent task resume assessment')
     return _TaskStatus(
         session_id=data['session_id'],
         state=data['state'], stage=data['stage'], elapsed_ms=data['elapsed_ms'],

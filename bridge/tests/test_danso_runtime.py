@@ -1835,3 +1835,40 @@ def test_malformed_interruption_assessment_is_refused(change):
     status['recovery'].update(change)
     with pytest.raises(ValueError):
         _task_status(status)
+
+
+def test_status_allows_soft_stage_target_and_terminal_token_overshoot():
+    from telegram_bot.core.danso_worker import _task_status
+    status = recovery_status()
+    status.update(state='failed', resume_allowed=False)
+    status['limits'].update(stage_requests=16, max_requests=1, max_tokens=10)
+    status['usage']['reported_tokens'] = 11
+    parsed = _task_status(status)
+    assert parsed.stage_requests == 16 and parsed.reported_tokens == 11
+
+
+@pytest.mark.anyio
+async def test_terminal_preflight_preserves_new_objective_dispatch(configured):
+    configured.danso_long_task_enabled = True
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    journal = runtime.root / (session.session_id + '.jsonl')
+    journal.write_text('synthetic terminal journal\n')
+    journal.chmod(0o600)
+    session._read_task_status = AsyncMock(return_value=SimpleNamespace(state='failed'))
+    events = [event async for event in session.send_turn('A genuinely new objective')]
+    assert events[-1].kind == 'completion'
+    argv = json.loads((Path(configured.danso_workspace) / 'argv.json').read_text())
+    assert argv[-1] == 'A genuinely new objective'
+    assert '--resume-task' not in argv
+
+
+def test_unresolved_tool_projection_is_inspectable_but_never_resumable():
+    from telegram_bot.core.danso_worker import _task_status
+    status = recovery_status()
+    status.update(state='blocked', pending={'kind': 'tool'}, resume_allowed=False)
+    parsed = _task_status(status)
+    assert parsed.state == 'blocked' and not parsed.resume_allowed
+    status['resume_allowed'] = True
+    with pytest.raises(ValueError):
+        _task_status(status)

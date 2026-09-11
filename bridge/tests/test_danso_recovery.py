@@ -365,3 +365,10 @@ def test_recovery_summary_discloses_unknown_usage_and_repeat_cost():
                      interruption_reason='signal_termination')
     assert '토큰 사용량은 미확인' in result.render()
     assert '비용이 추가' in result.render()
+
+
+def test_unresolved_tool_summary_preserves_explicit_inspection_flow():
+    result = snapshot('blocked', False)
+    assert '도구 실행 기록 확인 필요' in result.render()
+    assert not result.resume_allowed
+    assert 'Do not replay' in result.continuation()
