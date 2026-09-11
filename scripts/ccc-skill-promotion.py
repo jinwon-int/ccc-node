@@ -36,7 +36,11 @@ _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 # #1653: single provider vocabulary — the CCC_SKILL_PROMOTION_PROVIDERS set,
 # the scanned provider roots, and the envelope validation must not drift apart
 # (piri was accepted by the installer but rejected here at every layer).
-_PROVIDERS = ("claude", "codex", "piri")
+_PROVIDERS = ("claude", "codex", "piri", "danso")
+# #1663: danso roots resolve only from the env contract (#1659) — explicit
+# DANSO_SKILLS_DIR wins, then the bridge-fixed HOME; with neither set the
+# danso entry is omitted from provider_roots and the provider is staged nowhere.
+_DANSO_ROOT_UNRESOLVED = object()
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ALLOWED_SUPPORT_DIRS = {"references", "scripts", "templates"}
@@ -82,6 +86,46 @@ _CODEX_COUPLINGS = (
     re.compile(r"(?:^|[^A-Za-z0-9_])(?:~|\$HOME|\$\{HOME[^}]*\})?/?\.codex/"),
     re.compile(r"\bCODEX_[A-Z0-9_]+\b"),
 )
+
+
+def _provider_roots(env: dict[str, str], home: Path, claude_dir: Path) -> dict[str, Path]:
+    """Resolve per-provider skills roots from the env (#1653/#1663).
+
+    danso follows the #1659 contract: CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR >
+    DANSO_SKILLS_DIR > $CCC_DANSO_STATE_DIR/home/.pi/agent/skills; with none set
+    the danso entry is omitted (the provider scans nowhere on this node).
+    """
+    roots: dict[str, Path] = {
+        "claude": Path(
+            env.get("CCC_SKILL_PROMOTION_CLAUDE_SKILLS_DIR", claude_dir / "skills")
+        ).absolute(),
+        "codex": Path(
+            env.get(
+                "CCC_SKILL_PROMOTION_CODEX_SKILLS_DIR",
+                Path(env.get("CODEX_HOME", home / ".codex")) / "skills",
+            )
+        ).absolute(),
+        # Same path rule as provider.sh / ownership.py / sync (#1653):
+        # $PIRI_CODING_AGENT_DIR (default ~/.piri/agent) + /skills.
+        "piri": Path(
+            env.get(
+                "CCC_SKILL_PROMOTION_PIRI_SKILLS_DIR",
+                Path(env.get("PIRI_CODING_AGENT_DIR", home / ".piri" / "agent")) / "skills",
+            )
+        ).absolute(),
+    }
+    danso_root = (
+        env.get("CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR")
+        or env.get("DANSO_SKILLS_DIR")
+        or (
+            str(Path(env["CCC_DANSO_STATE_DIR"]) / "home/.pi/agent/skills")
+            if env.get("CCC_DANSO_STATE_DIR")
+            else ""
+        )
+    )
+    if danso_root:
+        roots["danso"] = Path(danso_root).absolute()
+    return roots
 
 
 class PromotionError(RuntimeError):
@@ -381,25 +425,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         base=base,
         node=_safe_node(env.get("CCC_NODE") or env.get("HOSTNAME") or ""),
         providers=providers,
-        provider_roots={
-            "claude": Path(
-                env.get("CCC_SKILL_PROMOTION_CLAUDE_SKILLS_DIR", claude_dir / "skills")
-            ).absolute(),
-            "codex": Path(
-                env.get(
-                    "CCC_SKILL_PROMOTION_CODEX_SKILLS_DIR",
-                    Path(env.get("CODEX_HOME", home / ".codex")) / "skills",
-                )
-            ).absolute(),
-            # Same path rule as provider.sh / ownership.py / sync (#1653):
-            # $PIRI_CODING_AGENT_DIR (default ~/.piri/agent) + /skills.
-            "piri": Path(
-                env.get(
-                    "CCC_SKILL_PROMOTION_PIRI_SKILLS_DIR",
-                    Path(env.get("PIRI_CODING_AGENT_DIR", home / ".piri" / "agent")) / "skills",
-                )
-            ).absolute(),
-        },
+        provider_roots=_provider_roots(env, home, claude_dir),
         max_prs=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN", 1, 1, 3),
         enabled=enabled,
         publisher_enabled=publisher_enabled,
@@ -607,8 +633,10 @@ def _run(
 def _ownership_rows(config: Config, provider: str) -> list[dict[str, Any]]:
     if not _safe_tool(config.ownership_tool):
         raise PromotionError("ownership_tool_unsafe")
-    root = config.provider_roots[provider]
-    if not root.is_dir():
+    root = config.provider_roots.get(provider)
+    if root is None or not root.is_dir():
+        # e.g. danso without its env contract (#1663): nothing to scan and
+        # nothing to stage for that provider on this node.
         return []
     if not _path_components_safe(root, final_kind="dir", trust_root=config.home):
         raise PromotionError("skills_root_unsafe")
@@ -3019,7 +3047,7 @@ def _dispatch_intake_revise(
 # canon re-review). Order matters: claude/codex first so a skill name that
 # merely contains a harness marker never wins the transport-id scan. Records
 # outside this vocabulary stay revise_record_invalid.
-_REVISE_PROVIDER_VOCABULARY = ("claude", "codex", "shared", "bridge", "piri")
+_REVISE_PROVIDER_VOCABULARY = ("claude", "codex", "shared", "bridge", "piri", "danso")
 
 
 # #1370: human-readable explanations for a consumed revise verdict whose R2

@@ -1782,12 +1782,63 @@ ok "piri intake branch lands under intake/<node>/piri/" \
 ok "piri collection acknowledges and retains the envelope" \
   '[ -f "$STATE/skill-promotion/sent/$piri_transport.json" ] && [ ! -e "$STATE/skill-promotion/outbox/$piri_transport.json" ]'
 # The envelope's provider set stays authoritative: an unknown provider value is
-# still rejected at both layers.
+# still rejected at both layers (danso joined the set in #1663).
 # shellcheck disable=SC2034  # out is read via eval inside ok()
-out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_PROVIDERS=claude,danso python3 "$PROMOTER" status)"
+out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_PROVIDERS=claude,gorani python3 "$PROMOTER" status)"
 # shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "unknown provider value is still rejected" '[ "$rc" != 0 ]'
+
+# ─── #1663: danso provider staging + collection ─────────────────────────────
+# Mirrors the piri section: env-contract root (DANSO_SKILLS_DIR), marker
+# provider=danso, envelope staged, publisher opens intake/<node>/danso/…
+DANSO_SKILLS="$TMP/danso-skills"
+mkdir -p "$DANSO_SKILLS"
+chmod 700 "$DANSO_SKILLS"
+write_danso_skill() {
+  local name="$1"
+  local dir="$DANSO_SKILLS/$name" sha
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  printf -- '---\nname: %s\ndescription: Capture a reusable danso lane log triage workflow safely.\n---\n\n# Procedure\n\n1. Inspect the danso journal tree.\n2. Run the bounded triage.\n3. Record the result.\n' \
+    "$name" > "$dir/SKILL.md"
+  chmod 600 "$dir/SKILL.md"
+  sha="$(sha256sum "$dir/SKILL.md" | awk '{print $1}')"
+  jq -nc --arg name "$name" --arg sha "$sha" \
+    '{schema_version:2,manager:"ccc-node-skill-autosave",ownership:"autosave-managed",
+      provider:"danso",name:$name,target_id:("target-"+$name),skill_sha256:$sha,
+      created_by:"ccc-node",provenance_revision:1,rollback_eligible:true}' \
+    > "$dir/.autosave-meta.json"
+  chmod 600 "$dir/.autosave-meta.json"
+}
+write_danso_status() {
+  local name="$1" sha
+  sha="$(sha256sum "$DANSO_SKILLS/$name/SKILL.md" | awk '{print $1}')"
+  jq -nc --arg name "$name" --arg sha "$sha" \
+    '{skills:[{autonomous_write_allowed:true,classification:"autosave-managed",
+      pinned:false,provider:"danso",name:$name,target_id:("target-"+$name),
+      skill_sha256:$sha,provenance_revision:1}]}' > "$STATUS_JSON"
+}
+write_danso_skill danso-log-triage
+write_danso_status danso-log-triage
+danso_stage_env=(
+  "${base_env[@]}"
+  "CCC_SKILL_PROMOTION_ENABLED=true"
+  "CCC_SKILL_PROMOTION_PROVIDERS=claude,danso"
+  "CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR=$DANSO_SKILLS"
+  "GH_TEST_STATE=$GH_STATE"
+  "PATH=$BIN:$PATH"
+)
+out="$(env "${danso_stage_env[@]}" python3 "$PROMOTER" run --dry-run)"; rc=$?
+ok "danso provider reaches run --dry-run staging" \
+  '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"would-stage-private-outbox\" and .staged[0].provider == \"danso\" and .staged[0].name == \"danso-log-triage\"" >/dev/null <<<"$out"'
+out="$(env "${danso_stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
+ok "danso envelope stages owner-only" \
+  '[ "$rc" = 0 ] && jq -e ".staged[0].outcome == \"staged\" and .staged[0].provider == \"danso\"" >/dev/null <<<"$out"'
+# The root is omitted entirely without the env contract: nothing stages, no crash.
+out="$(env "${danso_stage_env[@]}" CCC_SKILL_PROMOTION_PROVIDERS=claude,danso CCC_SKILL_PROMOTION_DANSO_SKILLS_DIR= DANSO_SKILLS_DIR= CCC_DANSO_STATE_DIR= python3 "$PROMOTER" run --dry-run)"; rc=$?
+ok "danso without env contract stages nothing and does not crash" \
+  '[ "$rc" = 0 ] && jq -e ".staged == []" >/dev/null <<<"$out"'
 
 echo "PASS=$pass FAIL=$fail"
 python3 "$HERE/ccc_skill_receipt_retry_test.py" || fail=$((fail+1))
