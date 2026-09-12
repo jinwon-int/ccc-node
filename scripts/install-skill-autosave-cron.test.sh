@@ -268,6 +268,16 @@ okc "$RC" 0 "invalid inherited danso state dir does not block install"
 ok "invalid inherited danso state dir warns" 'grep -q "ignoring invalid inherited CCC_DANSO_STATE_DIR" "$OUT"'
 ok "invalid inherited danso state dir is omitted" '! grep -qF "CCC_DANSO_STATE_DIR" "$CRON_STORE"'
 
+# Both quote flavors and backslash are rejected (#1707 hardening parity): a
+# single quote would terminate the outer single-quoted `bash -lc` body, and a
+# backslash is an escape metachar inside the baked double-quoted segment.
+run bash "$SC" --apply --danso-state-dir "/tmp/it's"
+okc "$RC" 2 "single-quote --danso-state-dir exits 2"
+ok "single-quote danso state dir is reported" 'grep -q "invalid --danso-state-dir" "$OUT"'
+run bash "$SC" --apply --danso-state-dir '/tmp/a\b'
+okc "$RC" 2 "backslash --danso-state-dir exits 2"
+ok "backslash danso state dir is reported" 'grep -q "invalid --danso-state-dir" "$OUT"'
+
 # danso joins the promotion staging vocabulary.
 rm -f "$CRON_STORE"
 run bash "$SC" --apply --promotion-providers claude,danso
