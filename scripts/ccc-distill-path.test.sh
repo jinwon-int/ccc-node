@@ -106,4 +106,4 @@ cp "$ROOT/scripts/ccc-memory-check.sh" "$HOME/.claude/hooks/"
 printf '%s\n' "$fallback_repo" > "$HOME/.claude/self-update.repo"
 out="$(bash "$HOME/.claude/hooks/ccc-memory-check.sh" --json)"
 jq -e --arg path "$BOT_DATA_DIR/danso-distill-journal" '.journal_selection.path == $path' <<<"$out" >/dev/null
-printf 'PASS=%s FAIL=0 (plus counters, absence, installed layout)\n' "$pass"
+printf 'PASS=%s FAIL=0\n' "$pass"
