@@ -91,6 +91,7 @@ def test_roundtrip_lists_single_tool_and_calls_it(ops_env) -> None:
     )
     assert responses[0]["result"]["serverInfo"]["name"] == "family-ops"
     assert [tool["name"] for tool in responses[1]["result"]["tools"]] == [
+        "deployment_diff",
         "pr_readiness",
         "task_status",
         "node_status",
@@ -187,6 +188,61 @@ def test_pr_readiness_tool_roundtrip(tmp_path: Path, ops_env) -> None:
     invalid = json.loads(responses[1]["result"]["content"][0]["text"])
     assert responses[1]["result"]["isError"] is True
     assert invalid["error"]["code"] == "invalid_repo"
+
+
+def test_deployment_diff_tool_roundtrip(tmp_path: Path, ops_env) -> None:
+    """deployment_diff aggregates the fake locate/git/doctor sources."""
+
+    bin_dir = tmp_path / "deploy-collectors"
+    bin_dir.mkdir()
+    claude = tmp_path / "claude-home"
+    (claude / "state").mkdir(parents=True)
+    (claude / "state" / "self-update.installed-sha").write_text("ee" * 20 + "\n", encoding="utf-8")
+    locate = bin_dir / "locate.sh"
+    locate.write_text(
+        "#!/bin/sh\necho '{\"running\": true, \"bridges\": [{\"pid\": 7, \"checkout\": \"/opt/ccc-node\", \"head\": \"aa11bb33aa11bb33aa11bb33aa11bb33aa11bb33\", \"branch\": \"main\", \"dirty\": 0}]}'\n",
+        encoding="utf-8",
+    )
+    doctor = bin_dir / "doctor.sh"
+    doctor.write_text(
+        "#!/bin/sh\necho '{\"rows\": [{\"item\": \"hooks/foo.sh\", \"status\": \"drifted\"}]}'\n",
+        encoding="utf-8",
+    )
+    gitfake = bin_dir / "git.sh"
+    gitfake.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        '  "ls-remote origin") printf \'%s\\trefs/heads/main\\n\' "bb22cc44bb22cc44bb22cc44bb22cc44bb22cc44";;\n'
+        '  "rev-parse HEAD") echo "aa11bb33aa11bb33aa11bb33aa11bb33aa11bb33";;\n'
+        '  "fetch origin"*) exit 0;;\n'
+        '  "rev-list"*) echo 1;;\n'
+        '  "status --porcelain") :;;\n'
+        '  *) exit 0;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    for script in (locate, doctor, gitfake):
+        script.chmod(0o755)
+    env = {
+        **ops_env,
+        "CCC_CLAUDE_DIR": str(claude),
+        "CCC_DEPLOYMENT_DIFF_LOCATE": f"bash {locate}",
+        "CCC_DEPLOYMENT_DIFF_DOCTOR": f"bash {doctor}",
+        "CCC_DEPLOYMENT_DIFF_GIT": f"bash {gitfake}",
+        "CCC_DEPLOYMENT_DIFF_MARKER_FILE": str(claude / "state" / "self-update.installed-sha"),
+    }
+    responses, stderr = _run_server(env, _call(21, None, name="deployment_diff"))
+    payload = json.loads(responses[0]["result"]["content"][0]["text"])
+    assert responses[0]["result"]["isError"] is False
+    assert payload["status"] == "ok"
+    sections = payload["sections"]
+    assert sections["target"]["sha"].startswith("bb22cc44")
+    assert sections["history"]["behind"] == 1
+    assert sections["installed"]["doctor"]["drift_total"] == 1
+    assert "installed_drift:1" in payload["deployment"]["reasons"]
+    assert "checkout_behind:1" in payload["deployment"]["reasons"]
+    assert payload["deployment"]["informational_only"] is True
+    assert "family-ops: call deployment_diff ok" in stderr
 
 
 def test_call_time_policy_denial(ops_env) -> None:

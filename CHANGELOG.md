@@ -4,6 +4,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Add `deployment_diff` as one read-only pre-deployment snapshot behind a
+  JSON CLI (`scripts/ccc-deployment-diff.py`) and a fourth `family-ops` MCP
+  tool: serving checkout vs origin/main (ahead/behind/dirty), installed
+  marker + ccc-doctor drift rows, dependency file changes, latest setup
+  backup, and an informational restart-recommendation verdict (#1694
+  item 4). Reuses the self-update check/doctor sources; fetch follows the
+  check.sh read-only precedent and nothing pulls, installs, or restarts.
+
 - Add `pr_readiness` as one read-only pre-merge lookup behind a JSON CLI
   (`scripts/ccc-pr-readiness.py`) and a third `family-ops` MCP tool: head
   sha/mergeability, CI rollup counted with the same rule the gh-pr-flow
