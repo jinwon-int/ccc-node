@@ -73,7 +73,7 @@ def _build(runtime: ClaudeRuntime, tmp_path: Path, memory_environment=None):
 
 
 def _install_server(tmp_path: Path) -> Path:
-    """Minimal stand-in server files at the real relative paths."""
+    """Create stand-ins; workspace copies must never become launch targets."""
 
     core = tmp_path / "bridge" / "core"
     core.mkdir(parents=True, exist_ok=True)
@@ -82,8 +82,99 @@ def _install_server(tmp_path: Path) -> Path:
     return core / "family_skills_server.py"
 
 
-def test_builder_refuses_external_and_shared(tmp_path: Path) -> None:
+@pytest.fixture(autouse=True)
+def installed_servers(tmp_path: Path, monkeypatch) -> Path:
+    """Model an installed package separate from the user's workspace."""
+    installation = tmp_path / "installation"
+    skills = _install_server(installation)
+    for relative in (
+        "skills/registry.json", "scripts/ccc-bridge-locate.sh",
+        "bridge/start.sh", "scripts/agent-cron.sh",
+    ):
+        asset = installation / relative
+        asset.parent.mkdir(parents=True, exist_ok=True)
+        asset.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(family_mcp, "__file__", str(skills.with_name("family_mcp.py")))
+    return skills.parent
+
+
+def test_builder_uses_installation_without_workspace_servers(
+    tmp_path: Path, installed_servers: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    bundle = build_family_mcp(_settings(workspace))
+    for server, filename in (
+        (SERVER_NAME, "family_skills_server.py"),
+        ("family-ops", "family_ops_server.py"),
+    ):
+        assert bundle["mcp_servers"][server]["args"] == [str(installed_servers / filename)]
+    assert not (workspace / "bridge").exists()
+
+
+def test_builder_ignores_workspace_decoy_servers(
+    tmp_path: Path, installed_servers: Path
+) -> None:
+    decoy = _install_server(tmp_path / "workspace")
+    bundle = build_family_mcp(_settings(tmp_path / "workspace"))
+    assert bundle["mcp_servers"][SERVER_NAME]["args"] == [
+        str(installed_servers / "family_skills_server.py")
+    ]
+    assert bundle["mcp_servers"]["family-ops"]["args"] == [
+        str(installed_servers / "family_ops_server.py")
+    ]
+    assert str(decoy) not in bundle["mcp_servers"][SERVER_NAME]["args"]
+
+
+def test_builder_resolves_installed_module_symlink(
+    tmp_path: Path, installed_servers: Path, monkeypatch
+) -> None:
+    module = installed_servers / "family_mcp.py"
+    module.write_text("# installed module\n", encoding="utf-8")
+    alias = tmp_path / "module_alias.py"
+    alias.symlink_to(module)
+    monkeypatch.setattr(family_mcp, "__file__", str(alias))
+    bundle = build_family_mcp(_settings(tmp_path / "workspace"))
+    assert bundle["mcp_servers"][SERVER_NAME]["args"] == [
+        str(installed_servers / "family_skills_server.py")
+    ]
+
+
+@pytest.mark.parametrize("missing", [
+    "skills/registry.json", "scripts/ccc-bridge-locate.sh",
+    "bridge/start.sh", "scripts/agent-cron.sh",
+])
+def test_builder_rejects_missing_repository_assets(
+    tmp_path: Path, installed_servers: Path, missing: str
+) -> None:
+    asset = installed_servers.parents[1] / missing
+    asset.rename(asset.with_name(asset.name + ".backup"))
+    # Workspace assets cannot make an incomplete installation usable.
+    decoy = tmp_path / missing
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    decoy.write_text("{}\n", encoding="utf-8")
     _install_server(tmp_path)
+    with pytest.raises(ValueError, match="complete ccc-node source-checkout"):
+        build_family_mcp(_settings(tmp_path))
+
+
+def test_builder_rejects_standalone_wheel_layout(
+    tmp_path: Path, installed_servers: Path, monkeypatch
+) -> None:
+    wheel_core = tmp_path / "site-packages" / "telegram_bot" / "core"
+    wheel_core.mkdir(parents=True)
+    for name in ("family_skills_server.py", "family_ops_server.py"):
+        (wheel_core / name).write_text("# packaged server\n", encoding="utf-8")
+    monkeypatch.setattr(family_mcp, "__file__", str(wheel_core / "family_mcp.py"))
+    # Even a complete workspace checkout is not an executable fallback.
+    with pytest.raises(ValueError, match="standalone wheels"):
+        build_family_mcp(_settings(installed_servers.parents[1]))
+
+
+def test_builder_refuses_external_and_shared(tmp_path: Path, monkeypatch) -> None:
+    # Excluded audiences must not inspect even an absent installation.
+    monkeypatch.setattr(family_mcp, "__file__", str(tmp_path / "absent" / "family_mcp.py"))
     assert build_family_mcp(_settings(tmp_path, node_isolation_profile="external")) is None
     assert build_family_mcp(_settings(tmp_path), audience_kind="shared") is None
 
@@ -130,7 +221,17 @@ def test_builder_fails_closed_without_configuration(tmp_path: Path) -> None:
     del stripped.project_root
     with pytest.raises(ValueError, match="project settings"):
         build_family_mcp(stripped)
-    with pytest.raises(ValueError, match="server file is missing"):
+
+
+@pytest.mark.parametrize("missing", ["family_skills_server.py", "family_ops_server.py"])
+def test_builder_fails_closed_when_installed_server_missing(
+    tmp_path: Path, installed_servers: Path, missing: str
+) -> None:
+    # A workspace decoy must not rescue an incomplete installation.
+    _install_server(tmp_path)
+    (installed_servers / missing).rename(installed_servers / (missing + ".backup"))
+    server_name = "family-skills" if missing.startswith("family_skills") else "family-ops"
+    with pytest.raises(ValueError, match=server_name + " MCP server file is missing"):
         build_family_mcp(_settings(tmp_path))
 
 
@@ -191,7 +292,7 @@ def test_owner_unrestricted_profile_injects_family_servers(
 ) -> None:
     # Unrestricted parity is opt-in and root denied; force the non-root path.
     monkeypatch.setattr(claude_runtime, "running_as_root", lambda: False)
-    _install_server(tmp_path)
+    # Exercise the real failure condition: no servers in the workspace.
     runtime = _owner_runtime(tmp_path, claude_unrestricted=True)
     options = _build(runtime, tmp_path)
     assert options.setting_sources == []
@@ -203,7 +304,7 @@ def test_owner_unrestricted_profile_injects_family_servers(
 def test_owner_audience_scoped_private_injects_shared_refused(
     tmp_path: Path,
 ) -> None:
-    _install_server(tmp_path)
+    # Dungae's owner/audience-scoped route must work outside the checkout.
     settings = _settings(
         tmp_path,
         execution_profile="owner-operator",
