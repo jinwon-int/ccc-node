@@ -446,9 +446,19 @@ bounded by `CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP` (1).
   work remains, `settled` means all valid jobs are terminal-successful,
   `degraded` means a retry/failure or unsafe/malformed record was observed, and
   `missing`/`empty` distinguish an uninitialized queue from an initialized queue
-  with no jobs. The read-only diagnostic defaults to
-  `${BOT_DATA_DIR:-${PROJECT_ROOT:-$PWD}/.telegram_bot}/distill-journal`; tests or
-  operators may select another journal with `CCC_DISTILL_JOURNAL_DIR`.
+  with no jobs. Both memory and distill checks use the shared
+  `claude/hooks/lib/distill-journal.sh` selector under
+  `${BOT_DATA_DIR:-${PROJECT_ROOT:-$PWD}/.telegram_bot}`: `danso-distill-journal`
+  for Danso, `distill-journal` otherwise. Provider selection reads
+  `CCC_AGENT_PROVIDER` first, then the bridge `.env` (or `CCC_BRIDGE_ENV_FILE`)
+  without sourcing it, using the same resolver as nunchi feeds. Plain and
+  `export` assignments are supported; a known source checkout's `bridge/.env`
+  supplies the fallback (setup's `self-update.repo` identifies that checkout
+  for installed hooks). A nonempty
+  `CCC_DISTILL_JOURNAL_DIR` overrides that selection. Memory JSON exposes
+  `.journal_selection`; distill JSON exposes path, status and reason under
+  `.provider_neutral`. Missing and unsafe roots are reported explicitly;
+  diagnostics never initialize the queue.
   Its `.writeback_queue.accounting` aggregate reports accounted attempts,
   turn bytes, duration, conservative maximum-token estimates, and safe model
   counts without emitting transcript, extraction, route, or error bodies.

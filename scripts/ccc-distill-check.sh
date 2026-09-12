@@ -12,7 +12,7 @@ LAST="$STATE_DIR/distill-last.json"
 CKPT_DIR="$STATE_DIR/checkpoints"
 DISABLED="$STATE_DIR/distill.disabled"
 DRYRUN="$STATE_DIR/distill.dryrun"
-COMMON_JOURNAL="${CCC_DISTILL_JOURNAL_DIR:-${PROJECT_ROOT:-$PWD}/.telegram_bot/distill-journal}"
+
 COOLDOWN_DIR="$STATE_DIR/distill-provider-cooldowns"
 OUTPUT="${1:-text}"
 
@@ -26,6 +26,11 @@ for _cdc_lib in \
   if [ -n "$_cdc_lib" ] && [ -r "$_cdc_lib" ]; then . "$_cdc_lib"; break; fi
 done
 
+# shellcheck source=claude/hooks/lib/distill-journal.sh
+. "$CDC_SELF_DIR/../claude/hooks/lib/distill-journal.sh" || exit 1
+ccc_check_distill_journal || exit 1
+COMMON_JOURNAL="$CCC_CHECK_JOURNAL"
+
 # ---- toggle state -----------------------------------------------------------
 if   [ -f "$DISABLED" ]; then MODE="OFF"
 elif [ -f "$DRYRUN" ];   then MODE="DRY-RUN"
@@ -35,9 +40,9 @@ fi
 # ---- queue counts -----------------------------------------------------------
 # ---- provider-neutral journal/circuit counts (body-free) -------------------
 common_total=0; common_ready=0; common_retryable=0; common_done=0; common_terminal=0
-if [ -d "$COMMON_JOURNAL" ]; then
+if [ "$CCC_CHECK_JOURNAL_STATUS" = present ]; then
   for common_job in "$COMMON_JOURNAL"/*.json; do
-    [ -f "$common_job" ] || continue
+    [ -f "$common_job" ] && [ ! -L "$common_job" ] || continue
     common_total=$((common_total + 1))
     common_status="$(jq -r '.status // "unknown"' "$common_job" 2>/dev/null || printf 'invalid')"
     case "$common_status" in
@@ -111,6 +116,10 @@ if [ "$OUTPUT" = "--json" ]; then
     --argjson drain_failed "$drain_failed" \
     --argjson drain_drop "$drain_drop" \
     --arg common_journal "$COMMON_JOURNAL" \
+    --arg journal_status "$CCC_CHECK_JOURNAL_STATUS" \
+    --arg journal_reason "$CCC_CHECK_JOURNAL_REASON" \
+    --arg journal_source "$CCC_CHECK_JOURNAL_SOURCE" \
+    --arg journal_provider "$CCC_CHECK_JOURNAL_PROVIDER" \
     --argjson common_total "$common_total" \
     --argjson common_ready "$common_ready" \
     --argjson common_retryable "$common_retryable" \
@@ -121,7 +130,8 @@ if [ "$OUTPUT" = "--json" ]; then
       checkpoint:{dir:$ckpt_dir, snapshots:$ckpt_snapshots, last:$ckpt_last},
       triggers:{manual:$manual, sessionend:$sessionend, precompact:$precompact},
       drain:{ok:$drain_ok, failed:$drain_failed, dropped:$drain_drop},
-      provider_neutral:{journal:$common_journal, total:$common_total,
+      provider_neutral:{journal:$common_journal, journal_status:$journal_status,
+        reason:$journal_reason, source:$journal_source, provider:$journal_provider, total:$common_total,
         ready:$common_ready, retryable:$common_retryable, done:$common_done,
         terminal:$common_terminal, cooldown_files:$cooldown_files}}'
 else
@@ -129,6 +139,7 @@ else
   printf -- '- state dir:  `%s` (%s)\n' "$STATE_DIR" "$state_dir_ok"
   printf -- '- mode:       `%s`\n' "$MODE"
   printf -- '- last:       %s\n' "$last_summary"
+  printf -- '- journal:    `%s` (%s; %s)\n' "$COMMON_JOURNAL" "$CCC_CHECK_JOURNAL_STATUS" "$CCC_CHECK_JOURNAL_REASON"
   printf -- '- common:     %s jobs (ready: %s, retryable: %s, done: %s, terminal: %s, cooldown files: %s)\n' "$common_total" "$common_ready" "$common_retryable" "$common_done" "$common_terminal" "$cooldown_files"
   printf -- '- checkpoint: %s snapshots (last: %s)\n' "$checkpoint_snapshots" "$checkpoint_last"
   printf '\n## triggers (14d)\n\n'
