@@ -8,7 +8,8 @@ export HOME="$TMP/home" CCC_STATE_DIR="$TMP/state" BOT_DATA_DIR="$TMP/bot"
 export CCC_MEMORY_PROBE_PATH="$TMP/absent" CCC_CODEX_MEMORY_MATERIALIZER_PATH="$TMP/absent"
 unset CCC_DISTILL_JOURNAL_DIR CCC_AGENT_PROVIDER CCC_BRIDGE_ENV_FILE
 mkdir -p "$HOME" "$CCC_STATE_DIR" "$BOT_DATA_DIR/distill-journal" "$BOT_DATA_DIR/danso-distill-journal"
-printf '{"status":"snapshot_done"}\n' > "$BOT_DATA_DIR/danso-distill-journal/a.json"
+job_id="$(printf 'a%.0s' {1..64})"
+printf '{"job_id":"%s","status":"snapshot_done","provider":"danso","thread_hash":"%s","trigger":"checkpoint","attempts":1,"extraction_attempts":0,"local_sink_attempts":0,"created_at":"2026-09-12T00:00:00Z","updated_at":"2026-09-12T00:00:00Z"}\n' "$job_id" "$job_id" > "$BOT_DATA_DIR/danso-distill-journal/$job_id.json"
 pass=0
 check() {
   local expected="$1" script out path
@@ -27,6 +28,19 @@ export CCC_AGENT_PROVIDER=danso
 check "$BOT_DATA_DIR/danso-distill-journal"
 out="$(bash "$ROOT/scripts/ccc-distill-check.sh" --json)"
 jq -e '.provider_neutral.ready == 1' <<<"$out" >/dev/null
+out="$(bash "$ROOT/scripts/ccc-memory-check.sh" --json)"
+jq -e '.writeback_queue.jobs == 1 and .writeback_queue.pending_jobs == 1' <<<"$out" >/dev/null
+# Match the native journal provider contract, retaining unsupported rejection.
+for record_provider in claude codex piri danso unsupported; do
+  jq --arg p "$record_provider" '.provider=$p' "$BOT_DATA_DIR/danso-distill-journal/$job_id.json" > "$TMP/job.json"
+  cp "$TMP/job.json" "$BOT_DATA_DIR/danso-distill-journal/$job_id.json"
+  out="$(bash "$ROOT/scripts/ccc-memory-check.sh" --json)"
+  if [ "$record_provider" = unsupported ]; then
+    jq -e '.writeback_queue.jobs == 0 and .writeback_queue.invalid_records == 1' <<<"$out" >/dev/null
+  else
+    jq -e '.writeback_queue.jobs == 1 and .writeback_queue.pending_jobs == 1 and .writeback_queue.invalid_records == 0' <<<"$out" >/dev/null
+  fi
+done
 export CCC_AGENT_PROVIDER=codex
 check "$BOT_DATA_DIR/distill-journal"
 unset CCC_AGENT_PROVIDER

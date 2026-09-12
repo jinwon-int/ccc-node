@@ -75,7 +75,7 @@ WB_VALIDATE_JQ='
       | select(
           type == "object"
           and .job_id == $expected_id
-          and .provider == "codex"
+          and (.provider | oneof(["claude","codex","piri","danso"]))
           and (.thread_hash | type == "string" and test("^[0-9a-f]{64}$"))
           and (.trigger | oneof(["new_command","provider_switch","auto_new","explicit","shutdown","checkpoint"]))
           and (.status | oneof(["queued","running_snapshot","snapshot_done","retryable_failed","terminal_failed","running_extraction","extraction_retryable_failed","extraction_done","extraction_terminal_failed"]))
