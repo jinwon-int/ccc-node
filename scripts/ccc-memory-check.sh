@@ -308,7 +308,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODEX_MATERIALIZER="${CCC_CODEX_MEMORY_MATERIALIZER_PATH:-$SCRIPT_DIR/ccc_codex_memory.py}"
 MEMORY_PROBE="${CCC_MEMORY_PROBE_PATH:-$SCRIPT_DIR/ccc_memory_probe.py}"
 BOT_DATA_DIR="${BOT_DATA_DIR:-${PROJECT_ROOT:-$PWD}/.telegram_bot}"
-DISTILL_JOURNAL_DIR="${CCC_DISTILL_JOURNAL_DIR:-$BOT_DATA_DIR/distill-journal}"
+# Checkout and setup-installed hook layouts use the same managed helper.
+if [ -f "$SCRIPT_DIR/../claude/hooks/lib/distill-journal.sh" ]; then
+  # shellcheck source=claude/hooks/lib/distill-journal.sh
+  . "$SCRIPT_DIR/../claude/hooks/lib/distill-journal.sh" || exit 1
+else
+  # shellcheck source=claude/hooks/lib/distill-journal.sh
+  . "$SCRIPT_DIR/lib/distill-journal.sh" || exit 1
+fi
+ccc_check_distill_journal || exit 1
+DISTILL_JOURNAL_DIR="$CCC_CHECK_JOURNAL"
 codex_json='{"status":"unavailable","active_kind":null,"snapshot_sha256":null,"snapshot_bytes":0,"file_bytes":0,"metadata_status":"missing"}'
 if [ -x "$CODEX_MATERIALIZER" ] && [ -f "$CODEX_MATERIALIZER" ]; then
   candidate="$(python3 "$CODEX_MATERIALIZER" status --json 2>/dev/null || true)"
@@ -324,7 +333,11 @@ if [ -f "$MEMORY_PROBE" ]; then
     memory_probe_json="$candidate"
   fi
 fi
-writeback_json="$(writeback_queue_json "$DISTILL_JOURNAL_DIR")"
+if [ "$CCC_CHECK_JOURNAL_STATUS" = degraded ]; then
+  writeback_json="$(empty_writeback_json degraded 1)"
+else
+  writeback_json="$(writeback_queue_json "$DISTILL_JOURNAL_DIR")"
+fi
 
 wiki_enabled="${CCC_WIKI_MEMORY_ENABLED:-1}"
 if [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ]; then
@@ -347,6 +360,10 @@ if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
     --argjson codex "$codex_json" \
     --argjson nunchi "$(jq -c '.nunchi' <<<"$memory_probe_json")" \
     --argjson mempalace "$(jq -c '.mempalace' <<<"$memory_probe_json")" \
+    --arg journal_path "$DISTILL_JOURNAL_DIR" \
+    --arg journal_reason "$CCC_CHECK_JOURNAL_REASON" \
+    --arg journal_provider "$CCC_CHECK_JOURNAL_PROVIDER" \
+    --arg journal_source "$CCC_CHECK_JOURNAL_SOURCE" \
     --argjson writeback "$writeback_json" \
     --arg index_db "$index_db" \
     --argjson ttl "$TTL" \
@@ -359,6 +376,7 @@ if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
       codex:$codex,
       nunchi:$nunchi,
       mempalace:$mempalace,
+      journal_selection:{path:$journal_path, reason:$journal_reason, provider:$journal_provider, source:$journal_source},
       writeback_queue:$writeback}'
   exit 0
 fi
@@ -422,6 +440,7 @@ mapfile -t wb_f < <(jq -r '
   (try (.accounting.accounted_attempts) catch ""),
   (try (.accounting.estimated_max_tokens) catch ""),
   (try (.accounting.duration_ms) catch "")' <<<"$writeback_json")
+printf -- '- journal: `%s` (%s)\n' "$DISTILL_JOURNAL_DIR" "$CCC_CHECK_JOURNAL_REASON"
 printf -- '- writeback: status=%s jobs=%s pending=%s invalid=%s bytes=%s snapshot_bytes=%s oldest=%ss retries=%s accounted=%s estimated_max_tokens=%s duration_ms=%s\n' \
   "${wb_f[0]:-}" "${wb_f[1]:-}" "${wb_f[2]:-}" "${wb_f[3]:-}" "${wb_f[4]:-}" \
   "${wb_f[5]:-}" "${wb_f[6]:-}" "${wb_f[7]:-}" "${wb_f[8]:-}" "${wb_f[9]:-}" \
