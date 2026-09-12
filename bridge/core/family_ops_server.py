@@ -5,7 +5,9 @@ Tools: ``node_status`` — one call aggregating serving-checkout state,
 bridge service/transport health and scheduler occupancy for this node, or a
 peer node over ssh; ``task_status`` — checkpoint/resume/wait-promise
 recovery aggregation; ``pr_readiness`` — pre-merge lookup snapshot for one
-pull request via the node's authenticated gh.  Shares the stdio scaffolding
+pull request via the node's authenticated gh; ``deployment_diff`` —
+pre-deployment diff (checkout/target/installed/deps/recovery) reusing the
+self-update check and doctor sources.  Shares the stdio scaffolding
 with ``family-skills``; stdlib-only, runs under any python3:
 
     python3 <repo>/bridge/core/family_ops_server.py
@@ -35,6 +37,10 @@ try:
         run_tools_server,
         tool_result,
     )
+    from telegram_bot.core.deployment_diff import (  # noqa: E402
+        DeploymentDiffError,
+        collect as collect_deployment_diff,
+    )
     from telegram_bot.core.node_status import NodeStatusError, node_status  # noqa: E402
     from telegram_bot.core.pr_readiness import PrReadinessError, collect as collect_pr_readiness  # noqa: E402
     from telegram_bot.core.skill_lookup import policy_denial  # noqa: E402
@@ -45,6 +51,10 @@ except ImportError:  # pragma: no cover - worktree aliasing only
         handle_message as _shared_handle_message,
         run_tools_server,
         tool_result,
+    )
+    from deployment_diff import (  # noqa: E402  # type: ignore[no-redef]
+        DeploymentDiffError,
+        collect as collect_deployment_diff,
     )
     from node_status import NodeStatusError, node_status  # noqa: E402  # type: ignore[no-redef]
     from pr_readiness import PrReadinessError, collect as collect_pr_readiness  # noqa: E402  # type: ignore[no-redef]
@@ -84,7 +94,25 @@ _PR_READINESS_SCHEMA = {
     "additionalProperties": False,
 }
 
+_DEPLOYMENT_DIFF_SCHEMA = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+
 _TOOLS = [
+    {
+        "name": "deployment_diff",
+        "description": (
+            "Read-only pre-deployment diff: serving checkout vs origin/main "
+            "(ahead/behind/dirty), installed-harness marker and doctor drift "
+            "rows, dependency file changes, latest setup backup, and an "
+            "informational restart-recommendation verdict. Reuses the "
+            "self-update check/doctor sources; never pulls, installs, or "
+            "restarts anything."
+        ),
+        "inputSchema": _DEPLOYMENT_DIFF_SCHEMA,
+    },
     {
         "name": "pr_readiness",
         "description": (
@@ -119,6 +147,36 @@ _TOOLS = [
 ]
 
 
+def _dispatch_node_status(arguments: dict[str, Any]) -> dict[str, Any]:
+    node = arguments.get("node")
+    try:
+        if node is None:
+            result = node_status()
+        else:
+            if not isinstance(node, str):
+                raise NodeStatusError("invalid_node", "node must be a string")
+            result = node_status([node])
+    except NodeStatusError as error:
+        raise ToolError(error.code, str(error), **error.details) from error
+    _diag(f"call node_status ok node={node or 'local'} status={result.get('status')}")
+    return tool_result(result)
+
+
+def _dispatch_pr_readiness(arguments: dict[str, Any]) -> dict[str, Any]:
+    repo = arguments.get("repo")
+    pr = arguments.get("pr")
+    if not isinstance(repo, str) or not repo.strip():
+        raise ToolError("invalid_repo", "repo must be a non-empty OWNER/REPO string")
+    if isinstance(pr, bool) or not isinstance(pr, int):
+        raise ToolError("invalid_pr", "pr must be an integer")
+    try:
+        result = collect_pr_readiness(repo, pr)
+    except PrReadinessError as error:
+        raise ToolError(error.code, str(error), **error.details) from error
+    _diag(f"call pr_readiness ok repo={repo} pr={pr} status={result.get('status')}")
+    return tool_result(result)
+
+
 def _dispatch(name: str, arguments: Any) -> dict[str, Any]:
     denial = policy_denial()
     if denial is not None:
@@ -136,33 +194,18 @@ def _dispatch(name: str, arguments: Any) -> dict[str, Any]:
             raise ToolError(error.code, str(error), **error.details) from error
         _diag(f"call task_status ok status={result.get('status')}")
         return tool_result(result)
-    if name == "pr_readiness":
-        repo = arguments.get("repo")
-        pr = arguments.get("pr")
-        if not isinstance(repo, str) or not repo.strip():
-            raise ToolError("invalid_repo", "repo must be a non-empty OWNER/REPO string")
-        if isinstance(pr, bool) or not isinstance(pr, int):
-            raise ToolError("invalid_pr", "pr must be an integer")
+    if name == "deployment_diff":
         try:
-            result = collect_pr_readiness(repo, pr)
-        except PrReadinessError as error:
+            result = collect_deployment_diff()
+        except DeploymentDiffError as error:
             raise ToolError(error.code, str(error), **error.details) from error
-        _diag(f"call pr_readiness ok repo={repo} pr={pr} status={result.get('status')}")
+        _diag(f"call deployment_diff ok status={result.get('status')}")
         return tool_result(result)
+    if name == "pr_readiness":
+        return _dispatch_pr_readiness(arguments)
     if name != "node_status":
         raise ToolError("unknown_tool", f"unknown tool: {name}")
-    node = arguments.get("node")
-    try:
-        if node is None:
-            result = node_status()
-        else:
-            if not isinstance(node, str):
-                raise NodeStatusError("invalid_node", "node must be a string")
-            result = node_status([node])
-    except NodeStatusError as error:
-        raise ToolError(error.code, str(error), **error.details) from error
-    _diag(f"call node_status ok node={node or 'local'} status={result.get('status')}")
-    return tool_result(result)
+    return _dispatch_node_status(arguments)
 
 
 def _diag(line: str) -> None:
