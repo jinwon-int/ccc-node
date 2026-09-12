@@ -91,6 +91,7 @@ def test_roundtrip_lists_single_tool_and_calls_it(ops_env) -> None:
     )
     assert responses[0]["result"]["serverInfo"]["name"] == "family-ops"
     assert [tool["name"] for tool in responses[1]["result"]["tools"]] == [
+        "incident_find",
         "deployment_diff",
         "pr_readiness",
         "task_status",
@@ -243,6 +244,48 @@ def test_deployment_diff_tool_roundtrip(tmp_path: Path, ops_env) -> None:
     assert "checkout_behind:1" in payload["deployment"]["reasons"]
     assert payload["deployment"]["informational_only"] is True
     assert "family-ops: call deployment_diff ok" in stderr
+
+
+def test_incident_find_tool_roundtrip(tmp_path: Path, ops_env) -> None:
+    """incident_find combines the fake wiki + gh search fixtures."""
+
+    wiki_fake = tmp_path / "wiki-fake.sh"
+    wiki_fake.write_text(
+        "#!/bin/sh\necho '{\"abstained\": false, \"confidence\": 0.9, \"semantic\": {\"results\": [{\"path\": \"pages/incidents/i.md\", \"heading\": \"H\", \"snippet\": \"s\", \"score\": 0.8}]}, \"textMatches\": []}'\n",
+        encoding="utf-8",
+    )
+    gh_fake = tmp_path / "gh-fake.sh"
+    gh_fake.write_text(
+        "#!/bin/sh\n"
+        'case "$2" in\n'
+        '  issues) echo \'[{"title": "i", "url": "u", "state": "open"}]\';;\n'
+        '  prs) echo \'[{"title": "p", "url": "u", "state": "merged"}]\';;\n'
+        "  *) exit 1;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    wiki_fake.chmod(0o755)
+    gh_fake.chmod(0o755)
+    env = {
+        **ops_env,
+        "CCC_INCIDENT_FIND_WIKI": f"bash {wiki_fake}",
+        "CCC_INCIDENT_FIND_GH": f"bash {gh_fake}",
+    }
+    responses, stderr = _run_server(
+        env,
+        _call(31, {"query": "fence conflict", "repo": "jinwon-int/a2a-nexus"}, name="incident_find"),
+        _call(32, {}, name="incident_find"),
+    )
+    payload = json.loads(responses[0]["result"]["content"][0]["text"])
+    assert responses[0]["result"]["isError"] is False
+    assert payload["status"] == "ok"
+    assert payload["sections"]["wiki"]["results"][0]["path"] == "pages/incidents/i.md"
+    assert payload["sections"]["issues"]["count"] == 1
+    assert payload["results_are_candidates_only"] is True
+    assert "family-ops: call incident_find ok" in stderr
+    invalid = json.loads(responses[1]["result"]["content"][0]["text"])
+    assert responses[1]["result"]["isError"] is True
+    assert invalid["error"]["code"] == "invalid_query"
 
 
 def test_call_time_policy_denial(ops_env) -> None:

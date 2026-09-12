@@ -4,6 +4,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Add `incident_find` as one read-only evidence search behind a JSON CLI
+  (`scripts/ccc-incident-find.py`) and a fifth `family-ops` MCP tool: wiki
+  candidates via `wiki-agent find --json` (with abstention preserved) plus
+  optional GitHub issue/PR search on one repository (#1694 item 5, the
+  roadmap's final tool). Results are candidates only — reading the evidence
+  and any approval stay separate steps.
+
 - Add `deployment_diff` as one read-only pre-deployment snapshot behind a
   JSON CLI (`scripts/ccc-deployment-diff.py`) and a fourth `family-ops` MCP
   tool: serving checkout vs origin/main (ahead/behind/dirty), installed
