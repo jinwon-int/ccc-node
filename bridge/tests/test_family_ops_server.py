@@ -1,6 +1,6 @@
 """family-ops stdio MCP server tests (#1694): protocol roundtrip against a
 real subprocess with fake collectors, call-time policy denial, and the
-single-tool surface.
+tool surface.
 """
 
 from __future__ import annotations
@@ -91,6 +91,7 @@ def test_roundtrip_lists_single_tool_and_calls_it(ops_env) -> None:
     )
     assert responses[0]["result"]["serverInfo"]["name"] == "family-ops"
     assert [tool["name"] for tool in responses[1]["result"]["tools"]] == [
+        "pr_readiness",
         "task_status",
         "node_status",
     ]
@@ -100,6 +101,30 @@ def test_roundtrip_lists_single_tool_and_calls_it(ops_env) -> None:
     assert payload["sections"]["source"]["head"] == "abc1234"
     assert payload["sections"]["scheduler"]["summary"]["total"] == 1
     assert payload["observed_at"].endswith("Z")
+
+
+PR_VIEW_FIXTURE = json.dumps(
+    {
+        "number": 7,
+        "title": "feat: fixture",
+        "url": "https://github.com/example/repo/pull/7",
+        "author": {"login": "someone"},
+        "baseRefName": "main",
+        "state": "OPEN",
+        "isDraft": False,
+        "headRefName": "feat/x",
+        "headRefOid": "aa11bb33aa11bb33aa11bb33aa11bb33aa11bb33",
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "BLOCKED",
+        "reviewDecision": "REVIEW_REQUIRED",
+        "reviewRequests": [{"login": "reviewer"}],
+        "statusCheckRollup": [{"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "reviews": [],
+    }
+)
+THREADS_FIXTURE = json.dumps(
+    {"data": {"repository": {"pullRequest": {"reviewThreads": {"totalCount": 0, "nodes": []}}}}}
+)
 
 
 def test_task_status_tool_roundtrip(tmp_path: Path, ops_env) -> None:
@@ -127,6 +152,41 @@ def test_task_status_tool_roundtrip(tmp_path: Path, ops_env) -> None:
     assert "fixture checkpoint" in sections["working_state"]["content"]
     assert sections["waits"]["active"][0]["wait_id"] == "w1"
     assert "family-ops: call task_status ok" in stderr
+
+
+def test_pr_readiness_tool_roundtrip(tmp_path: Path, ops_env) -> None:
+    """pr_readiness aggregates the fake gh fixtures into one snapshot."""
+
+    fake_gh = tmp_path / "fake-gh.sh"
+    fake_gh.write_text(
+        "#!/bin/sh\n"
+        "if printf '%s ' \"$@\" | grep -q graphql; then\n"
+        f"  echo '{THREADS_FIXTURE}'\n"
+        "else\n"
+        f"  echo '{PR_VIEW_FIXTURE}'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    env = {**ops_env, "CCC_PR_READINESS_GH": f"bash {fake_gh}"}
+    responses, stderr = _run_server(
+        env,
+        _call(11, {"repo": "example/repo", "pr": 7}, name="pr_readiness"),
+        _call(12, {"pr": 7}, name="pr_readiness"),
+    )
+    payload = json.loads(responses[0]["result"]["content"][0]["text"])
+    assert responses[0]["result"]["isError"] is False
+    assert payload["status"] == "ok"
+    assert payload["repo"] == "example/repo"
+    assert payload["pr"] == 7
+    assert payload["sections"]["ci"]["verdict"] == "ok"
+    assert "review_decision:REVIEW_REQUIRED" in payload["readiness"]["reasons"]
+    assert "no_non_author_head_matched_approval" in payload["readiness"]["reasons"]
+    assert payload["readiness"]["informational_only"] is True
+    assert "family-ops: call pr_readiness ok repo=example/repo pr=7" in stderr
+    invalid = json.loads(responses[1]["result"]["content"][0]["text"])
+    assert responses[1]["result"]["isError"] is True
+    assert invalid["error"]["code"] == "invalid_repo"
 
 
 def test_call_time_policy_denial(ops_env) -> None:

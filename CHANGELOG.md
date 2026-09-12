@@ -4,6 +4,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Add `pr_readiness` as one read-only pre-merge lookup behind a JSON CLI
+  (`scripts/ccc-pr-readiness.py`) and a third `family-ops` MCP tool: head
+  sha/mergeability, CI rollup counted with the same rule the gh-pr-flow
+  relay approval gate uses, latest reviews (non-author, head-matched
+  approvals, changes requested), and unresolved review threads (#1694
+  item 3). Informational snapshot only — approvals and merge-time
+  re-verification keep their own rules.
+
 - Extend the skill-autosave cron installer to the danso lane (#1657 owner
   decision B): `--provider danso`, `--danso-drafting` (bakes
   `CCC_SKILL_DANSO_DRAFTING=1`), and `--danso-state-dir` (bakes
