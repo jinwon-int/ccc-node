@@ -54,8 +54,10 @@ def _server_path(settings: Any) -> Path:
     project_root = getattr(settings, "project_root", None)
     if not project_root:
         raise ValueError("family-skills MCP requires bound project settings")
-    repo_root = Path(project_root).expanduser().resolve()
-    return repo_root / "bridge" / "core" / "family_skills_server.py"
+    # project_root is the user's workspace, not the harness installation.
+    # Resolve the installed module (including editable-install symlinks) so a
+    # workspace cannot supply executable MCP servers under bridge/core/.
+    return Path(__file__).resolve().with_name("family_skills_server.py")
 
 
 def build_family_mcp(settings: Any, *, audience_kind: str | None = None) -> dict[str, Any] | None:

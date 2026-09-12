@@ -73,13 +73,64 @@ def _build(runtime: ClaudeRuntime, tmp_path: Path, memory_environment=None):
 
 
 def _install_server(tmp_path: Path) -> Path:
-    """Minimal stand-in server files at the real relative paths."""
+    """Create stand-ins; workspace copies must never become launch targets."""
 
     core = tmp_path / "bridge" / "core"
     core.mkdir(parents=True, exist_ok=True)
     for name in ("family_skills_server.py", "family_ops_server.py"):
         (core / name).write_text("# fixture server\n", encoding="utf-8")
     return core / "family_skills_server.py"
+
+
+@pytest.fixture(autouse=True)
+def installed_servers(tmp_path: Path, monkeypatch) -> Path:
+    """Model an installed package separate from the user's workspace."""
+    skills = _install_server(tmp_path / "installation")
+    monkeypatch.setattr(family_mcp, "__file__", str(skills.with_name("family_mcp.py")))
+    return skills.parent
+
+
+def test_builder_uses_installation_without_workspace_servers(
+    tmp_path: Path, installed_servers: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    bundle = build_family_mcp(_settings(workspace))
+    for server, filename in (
+        (SERVER_NAME, "family_skills_server.py"),
+        ("family-ops", "family_ops_server.py"),
+    ):
+        assert bundle["mcp_servers"][server]["args"] == [str(installed_servers / filename)]
+    assert not (workspace / "bridge").exists()
+
+
+def test_builder_ignores_workspace_decoy_servers(
+    tmp_path: Path, installed_servers: Path
+) -> None:
+    decoy = _install_server(tmp_path / "workspace")
+    bundle = build_family_mcp(_settings(tmp_path / "workspace"))
+    assert bundle["mcp_servers"][SERVER_NAME]["args"] == [
+        str(installed_servers / "family_skills_server.py")
+    ]
+    assert bundle["mcp_servers"]["family-ops"]["args"] == [
+        str(installed_servers / "family_ops_server.py")
+    ]
+    assert str(decoy) not in bundle["mcp_servers"][SERVER_NAME]["args"]
+
+
+def test_builder_resolves_installed_module_symlink(
+    tmp_path: Path, installed_servers: Path, monkeypatch
+) -> None:
+    module = installed_servers / "family_mcp.py"
+    module.write_text("# installed module\n", encoding="utf-8")
+    alias = tmp_path / "module_alias.py"
+    alias.symlink_to(module)
+    monkeypatch.setattr(family_mcp, "__file__", str(alias))
+    bundle = build_family_mcp(_settings(tmp_path / "workspace"))
+    assert bundle["mcp_servers"][SERVER_NAME]["args"] == [
+        str(installed_servers / "family_skills_server.py")
+    ]
 
 
 def test_builder_refuses_external_and_shared(tmp_path: Path) -> None:
@@ -130,7 +181,17 @@ def test_builder_fails_closed_without_configuration(tmp_path: Path) -> None:
     del stripped.project_root
     with pytest.raises(ValueError, match="project settings"):
         build_family_mcp(stripped)
-    with pytest.raises(ValueError, match="server file is missing"):
+
+
+@pytest.mark.parametrize("missing", ["family_skills_server.py", "family_ops_server.py"])
+def test_builder_fails_closed_when_installed_server_missing(
+    tmp_path: Path, installed_servers: Path, missing: str
+) -> None:
+    # A workspace decoy must not rescue an incomplete installation.
+    _install_server(tmp_path)
+    (installed_servers / missing).rename(installed_servers / (missing + ".backup"))
+    server_name = "family-skills" if missing.startswith("family_skills") else "family-ops"
+    with pytest.raises(ValueError, match=server_name + " MCP server file is missing"):
         build_family_mcp(_settings(tmp_path))
 
 

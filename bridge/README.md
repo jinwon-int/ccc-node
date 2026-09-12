@@ -53,6 +53,17 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 - Auto venv creation, 14-day log rotation, crash logging with exit codes
 - Dedicated polling HTTP client with proxy-aware HTTP/1.1 settings for better recovery after network changes
 
+### Family MCP installation paths
+
+For owner Claude sessions that suppress filesystem settings, the bridge injects
+`family-skills` and `family-ops` from the installed `core` package next to
+`family_mcp.py`. The `--path` / `project_root` directory is the user's workspace;
+it need not contain a ccc-node checkout. Workspace copies of the server files
+are never launch targets. Missing installed server files still fail closed;
+repair the installation rather than copying servers into the workspace or
+changing `--path` (which also changes session/data paths). External nodes and
+shared audiences remain excluded from this injection.
+
 ## Prerequisites
 
 - **Python 3.11+**
