@@ -114,5 +114,62 @@ rc=$?
 ok "corrupt managed block exits 4" '[ "$rc" = 4 ]'
 ok "corrupt managed block is reported" 'printf "%s" "$out" | grep -q "corrupt managed schedule block"'
 
+# --- #1705: --danso-state-dir baking, inheritance, validation, record argv ---
+
+# reset state: the corrupt-block test above leaves an unusable crontab
+: > "$FAKE_CRON"; rm -f "$REC"
+
+# explicit flag bakes CCC_DANSO_STATE_DIR into the entry
+bash "$INSTALLER" --apply --danso-state-dir /var/lib/ccc-danso/node >/dev/null 2>&1
+ok "danso flag installs single line" '[ "$(marker_count)" = 1 ]'
+ok "danso state dir baked into the entry" 'grep -qF "CCC_DANSO_STATE_DIR=\"/var/lib/ccc-danso/node\" CCC_CLAUDE_DIR" "$FAKE_CRON"'
+
+# record argv materializes the resolved danso state dir (#1081 replay)
+ok "record argv carries --danso-state-dir" 'jq -e ".argv == [\"--apply\",\"--schedule\",\"0 5 * * *\",\"--danso-state-dir\",\"/var/lib/ccc-danso/node\"]" "$REC" >/dev/null'
+
+# inheritance: flag unset but env set -> env value baked
+CCC_DANSO_STATE_DIR=/var/lib/ccc-danso/inherited bash "$INSTALLER" --apply >/dev/null 2>&1
+ok "inherited CCC_DANSO_STATE_DIR baked" 'grep -qF "CCC_DANSO_STATE_DIR=\"/var/lib/ccc-danso/inherited\"" "$FAKE_CRON"'
+ok "inherited case also lands in record argv" 'jq -e ".argv[-2:] == [\"--danso-state-dir\",\"/var/lib/ccc-danso/inherited\"]" "$REC" >/dev/null'
+
+# nothing set anywhere -> no danso env in the line, no argv entry
+bash "$INSTALLER" --apply >/dev/null 2>&1
+ok "no danso env when unset everywhere" '! grep -qF "CCC_DANSO_STATE_DIR=" "$FAKE_CRON"'
+ok "default argv has no danso entry" 'jq -e ".argv == [\"--apply\",\"--schedule\",\"0 5 * * *\"]" "$REC" >/dev/null'
+
+# invalid explicit flag fails closed (exit 2, crontab untouched)
+out="$(bash "$INSTALLER" --apply --danso-state-dir relative/path 2>&1)"; rc=$?
+ok "relative --danso-state-dir exits 2" '[ "$rc" = 2 ]'
+ok "relative --danso-state-dir reported" 'printf "%s" "$out" | grep -q "invalid --danso-state-dir"'
+ok "failed validation leaves crontab intact" '[ "$(marker_count)" = 1 ]'
+out="$(bash "$INSTALLER" --apply --danso-state-dir '/tmp/x$(pwd)' 2>&1)"; rc=$?
+ok "dollar in --danso-state-dir exits 2" '[ "$rc" = 2 ]'
+
+# invalid inherited value warns, installs, and omits the env
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_DANSO_STATE_DIR='bad $path' bash "$INSTALLER" --apply 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "invalid inherited env still exits 0" '[ "$rc" = 0 ]'
+ok "invalid inherited env warns" 'printf "%s" "$out" | grep -q "ignoring invalid inherited CCC_DANSO_STATE_DIR"'
+ok "invalid inherited env not baked" '! grep -qF "CCC_DANSO_STATE_DIR=" "$FAKE_CRON"'
+ok "install after warning stays single line" '[ "$(marker_count)" = 1 ]'
+
+# both quote flavors and backslash are rejected (single quote would break the
+# outer bash -lc single-quoted body; backslash is an escape metachar)
+bq="/tmp/it's/x"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(bash "$INSTALLER" --apply --danso-state-dir "$bq" 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "single quote in --danso-state-dir exits 2" '[ "$rc" = 2 ]'
+bs='/tmp/a\b'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(bash "$INSTALLER" --apply --danso-state-dir "$bs" 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "backslash in --danso-state-dir exits 2" '[ "$rc" = 2 ]'
+ok "metachar rejections leave crontab intact" '[ "$(marker_count)" = 1 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
