@@ -296,24 +296,28 @@ fi
 # --danso-state-dir > inherited \$CCC_DANSO_STATE_DIR > omitted. Without it the
 # scheduled danso lane fails closed (#1659), so say so at install time where
 # the operator can see it instead of letting the entry no-op the lane silently.
-danso_state_dir_ok() { # <path> — absolute and safe to bake inside double quotes
+danso_state_dir_ok() { # <path> — absolute and safe to bake inside the entry
   local path="$1"
   [ -n "$path" ] || return 1
   case "$path" in /*) ;; *) return 1 ;; esac
-  case "$path" in *'"'*|*'$'*|*'`'*|*'\'*) return 1 ;; esac
+  # The value lands inside the double-quoted env segment of a single-quoted
+  # `bash -lc` body, so both quote flavors and every expansion/escape metachar
+  # are rejected outright: a single quote would terminate the outer bash -lc
+  # quoting (metachar hardening follow-up to #1701, same shape as #1707).
+  case "$path" in *'"'*|*"'"*|*'$'*|*'`'*|*'\'*) return 1 ;; esac
   return 0
 }
 CRON_DANSO_STATE_DIR="$OPT_DANSO_STATE_DIR"
 if [ -n "$CRON_DANSO_STATE_DIR" ]; then
   danso_state_dir_ok "$CRON_DANSO_STATE_DIR" || {
-    echo "invalid --danso-state-dir '$CRON_DANSO_STATE_DIR' (absolute path; no double quote, dollar, backtick, or backslash)" >&2
+    echo "invalid --danso-state-dir '$CRON_DANSO_STATE_DIR' (absolute path; no quote, dollar, backtick, or backslash)" >&2
     exit 2
   }
 elif [ -n "${CCC_DANSO_STATE_DIR:-}" ]; then
   if danso_state_dir_ok "$CCC_DANSO_STATE_DIR"; then
     CRON_DANSO_STATE_DIR="$CCC_DANSO_STATE_DIR"
   else
-    echo "WARNING: ignoring invalid inherited CCC_DANSO_STATE_DIR (absolute path; no double quote, dollar, backtick, or backslash)." >&2
+    echo "WARNING: ignoring invalid inherited CCC_DANSO_STATE_DIR (absolute path; no quote, dollar, backtick, or backslash)." >&2
   fi
 fi
 if [ "$CRON_PROVIDER" = "danso" ] && [ -z "$CRON_DANSO_STATE_DIR" ]; then
