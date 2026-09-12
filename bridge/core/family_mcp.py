@@ -81,6 +81,23 @@ def build_family_mcp(settings: Any, *, audience_kind: str | None = None) -> dict
     ops_server = skills_server.parent / "family_ops_server.py"
     if not ops_server.is_file():
         raise ValueError("family-ops MCP server file is missing")
+    # The Python wheel does not ship the registry or shell collectors. Do not
+    # advertise usable tools just because its two server modules can start.
+    # Only inspect the installed module's tree, never the user's workspace.
+    repo_root = skills_server.parents[2]
+    assets = (
+        "skills/registry.json",
+        "scripts/ccc-bridge-locate.sh",
+        "bridge/start.sh",
+        "scripts/agent-cron.sh",
+    )
+    if skills_server.parent != repo_root / "bridge" / "core" or any(
+        not (repo_root / relative).is_file() for relative in assets
+    ):
+        raise ValueError(
+            "Family MCP requires a complete ccc-node source-checkout installation; "
+            "standalone wheels or missing repository assets are unsupported"
+        )
     policy_env = {"CCC_NODE_ISOLATION_PROFILE": profile}
     if audience_kind:
         policy_env["CCC_MEMORY_AUDIENCE"] = audience_kind

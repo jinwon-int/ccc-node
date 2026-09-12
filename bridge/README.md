@@ -61,8 +61,14 @@ For owner Claude sessions that suppress filesystem settings, the bridge injects
 it need not contain a ccc-node checkout. Workspace copies of the server files
 are never launch targets. Missing installed server files still fail closed;
 repair the installation rather than copying servers into the workspace or
-changing `--path` (which also changes session/data paths). External nodes and
-shared audiences remain excluded from this injection.
+changing `--path` (which also changes session/data paths). This injection
+requires a complete source-checkout installation (including editable installs):
+`skills/registry.json`, `scripts/ccc-bridge-locate.sh`, `bridge/start.sh`, and
+`scripts/agent-cron.sh` must accompany the installed source tree. Standalone
+wheels do not contain these repository assets and are rejected before tool
+injection, even when the workspace contains a checkout. Plain-owner sessions
+that retain host settings do not use this injection. External nodes and shared
+audiences remain excluded without checking installation files.
 
 ## Prerequisites
 

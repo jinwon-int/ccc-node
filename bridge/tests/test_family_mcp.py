@@ -85,7 +85,15 @@ def _install_server(tmp_path: Path) -> Path:
 @pytest.fixture(autouse=True)
 def installed_servers(tmp_path: Path, monkeypatch) -> Path:
     """Model an installed package separate from the user's workspace."""
-    skills = _install_server(tmp_path / "installation")
+    installation = tmp_path / "installation"
+    skills = _install_server(installation)
+    for relative in (
+        "skills/registry.json", "scripts/ccc-bridge-locate.sh",
+        "bridge/start.sh", "scripts/agent-cron.sh",
+    ):
+        asset = installation / relative
+        asset.parent.mkdir(parents=True, exist_ok=True)
+        asset.write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(family_mcp, "__file__", str(skills.with_name("family_mcp.py")))
     return skills.parent
 
@@ -133,8 +141,40 @@ def test_builder_resolves_installed_module_symlink(
     ]
 
 
-def test_builder_refuses_external_and_shared(tmp_path: Path) -> None:
+@pytest.mark.parametrize("missing", [
+    "skills/registry.json", "scripts/ccc-bridge-locate.sh",
+    "bridge/start.sh", "scripts/agent-cron.sh",
+])
+def test_builder_rejects_missing_repository_assets(
+    tmp_path: Path, installed_servers: Path, missing: str
+) -> None:
+    asset = installed_servers.parents[1] / missing
+    asset.rename(asset.with_name(asset.name + ".backup"))
+    # Workspace assets cannot make an incomplete installation usable.
+    decoy = tmp_path / missing
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    decoy.write_text("{}\n", encoding="utf-8")
     _install_server(tmp_path)
+    with pytest.raises(ValueError, match="complete ccc-node source-checkout"):
+        build_family_mcp(_settings(tmp_path))
+
+
+def test_builder_rejects_standalone_wheel_layout(
+    tmp_path: Path, installed_servers: Path, monkeypatch
+) -> None:
+    wheel_core = tmp_path / "site-packages" / "telegram_bot" / "core"
+    wheel_core.mkdir(parents=True)
+    for name in ("family_skills_server.py", "family_ops_server.py"):
+        (wheel_core / name).write_text("# packaged server\n", encoding="utf-8")
+    monkeypatch.setattr(family_mcp, "__file__", str(wheel_core / "family_mcp.py"))
+    # Even a complete workspace checkout is not an executable fallback.
+    with pytest.raises(ValueError, match="standalone wheels"):
+        build_family_mcp(_settings(installed_servers.parents[1]))
+
+
+def test_builder_refuses_external_and_shared(tmp_path: Path, monkeypatch) -> None:
+    # Excluded audiences must not inspect even an absent installation.
+    monkeypatch.setattr(family_mcp, "__file__", str(tmp_path / "absent" / "family_mcp.py"))
     assert build_family_mcp(_settings(tmp_path, node_isolation_profile="external")) is None
     assert build_family_mcp(_settings(tmp_path), audience_kind="shared") is None
 
