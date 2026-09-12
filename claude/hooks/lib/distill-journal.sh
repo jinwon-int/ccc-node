@@ -3,12 +3,22 @@
 # Shared read-only journal selection for the distill/memory diagnostics (#1703).
 # Installed with the hook tree; never source the bridge credential .env.
 ccc_check_distill_journal() {
-  local lib_dir provider
+  local lib_dir provider repo repo_file
   lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
   # shellcheck source=claude/hooks/nunchi/feed-common.sh
   . "$lib_dir/../nunchi/feed-common.sh" || return 1
   BOT_DATA_DIR="${BOT_DATA_DIR:-${PROJECT_ROOT:-$PWD}/.telegram_bot}"
-  provider="$(nunchi_runtime_provider)"
+  repo="$(cd "$lib_dir/../../.." && pwd)" || return 1
+  if [ ! -f "$repo/bridge/start.sh" ]; then
+    # setup records the source checkout for installed hooks. Read only its
+    # path; no code or environment file is evaluated.
+    repo_file="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}/self-update.repo"
+    repo=""
+    if [ -f "$repo_file" ] && [ ! -L "$repo_file" ]; then
+      IFS= read -r repo < "$repo_file" || :
+    fi
+  fi
+  provider="$(nunchi_runtime_provider "${repo:+$repo/bridge/.env}")"
   CCC_CHECK_JOURNAL_PROVIDER="$provider"
   CCC_CHECK_JOURNAL_SOURCE=provider_default
   if [ -n "${CCC_DISTILL_JOURNAL_DIR:-}" ]; then

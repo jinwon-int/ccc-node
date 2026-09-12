@@ -92,7 +92,7 @@ WB_VALIDATE_JQ='
             and length <= $job.extraction_attempts
             and all(.[];
               type == "object"
-              and (.model | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"))
+              and (.model | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$"))
               and (.snapshot_bytes | nnint)
               and .snapshot_bytes == ($job.snapshot.byte_count // 0)
               and (.duration_ms | nnint)

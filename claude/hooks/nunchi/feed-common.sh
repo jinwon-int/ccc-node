@@ -15,17 +15,23 @@
 # deliberately NOT pinned into the cron line at install time: a frozen copy
 # would agree with the lane forever and could never report the drift this
 # function exists to detect.
+# shellcheck disable=SC2120 # Optional fallback is used by external diagnostic callers.
 nunchi_runtime_provider() {
-  local value="${CCC_AGENT_PROVIDER:-}" env_file
+  local value="${CCC_AGENT_PROVIDER:-}" env_file candidate
   if [ -z "$value" ]; then
     env_file="${CCC_BRIDGE_ENV_FILE:-${BOT_DATA_DIR:-${PROJECT_ROOT:-$HOME}/.telegram_bot}/.env}"
-    if [ -f "$env_file" ] && [ ! -L "$env_file" ]; then
+    # Diagnostics may supply the known checkout bridge/.env as a fallback.
+    for candidate in "$env_file" "${1:-}"; do
+      [ -z "$value" ] || break
+      [ -n "$candidate" ] || continue
+      if [ -f "$candidate" ] && [ ! -L "$candidate" ]; then
       # Last assignment wins, mirroring dotenv. Quotes and inline comments are
       # stripped; the file is never sourced, so no credential is expanded.
-      value="$(sed -n 's/^[[:space:]]*CCC_AGENT_PROVIDER[[:space:]]*=[[:space:]]*//p' \
-        "$env_file" 2>/dev/null | tail -1 | sed -e 's/[[:space:]]*#.*$//' \
+      value="$(sed -En 's/^[[:space:]]*(export[[:space:]]+)?CCC_AGENT_PROVIDER[[:space:]]*=[[:space:]]*//p' \
+        "$candidate" 2>/dev/null | tail -1 | sed -e 's/[[:space:]]*#.*$//' \
         -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" | tr -d '[:space:]')"
-    fi
+      fi
+    done
   fi
   printf '%s' "$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
 }

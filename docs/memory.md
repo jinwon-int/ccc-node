@@ -451,7 +451,10 @@ bounded by `CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP` (1).
   `${BOT_DATA_DIR:-${PROJECT_ROOT:-$PWD}/.telegram_bot}`: `danso-distill-journal`
   for Danso, `distill-journal` otherwise. Provider selection reads
   `CCC_AGENT_PROVIDER` first, then the bridge `.env` (or `CCC_BRIDGE_ENV_FILE`)
-  without sourcing it, using the same resolver as nunchi feeds. A nonempty
+  without sourcing it, using the same resolver as nunchi feeds. Plain and
+  `export` assignments are supported; a known source checkout's `bridge/.env`
+  supplies the fallback (setup's `self-update.repo` identifies that checkout
+  for installed hooks). A nonempty
   `CCC_DISTILL_JOURNAL_DIR` overrides that selection. Memory JSON exposes
   `.journal_selection`; distill JSON exposes path, status and reason under
   `.provider_neutral`. Missing and unsafe roots are reported explicitly;
