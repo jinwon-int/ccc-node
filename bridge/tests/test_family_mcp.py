@@ -252,7 +252,7 @@ def test_owner_unrestricted_profile_injects_family_servers(
 ) -> None:
     # Unrestricted parity is opt-in and root denied; force the non-root path.
     monkeypatch.setattr(claude_runtime, "running_as_root", lambda: False)
-    _install_server(tmp_path)
+    # Exercise the real failure condition: no servers in the workspace.
     runtime = _owner_runtime(tmp_path, claude_unrestricted=True)
     options = _build(runtime, tmp_path)
     assert options.setting_sources == []
@@ -264,7 +264,7 @@ def test_owner_unrestricted_profile_injects_family_servers(
 def test_owner_audience_scoped_private_injects_shared_refused(
     tmp_path: Path,
 ) -> None:
-    _install_server(tmp_path)
+    # Dungae's owner/audience-scoped route must work outside the checkout.
     settings = _settings(
         tmp_path,
         execution_profile="owner-operator",
