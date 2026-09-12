@@ -7,7 +7,8 @@ peer node over ssh; ``task_status`` — checkpoint/resume/wait-promise
 recovery aggregation; ``pr_readiness`` — pre-merge lookup snapshot for one
 pull request via the node's authenticated gh; ``deployment_diff`` —
 pre-deployment diff (checkout/target/installed/deps/recovery) reusing the
-self-update check and doctor sources.  Shares the stdio scaffolding
+self-update check and doctor sources; ``incident_find`` — combined wiki +
+GitHub evidence search for one symptom query.  Shares the stdio scaffolding
 with ``family-skills``; stdlib-only, runs under any python3:
 
     python3 <repo>/bridge/core/family_ops_server.py
@@ -41,6 +42,10 @@ try:
         DeploymentDiffError,
         collect as collect_deployment_diff,
     )
+    from telegram_bot.core.incident_find import (  # noqa: E402
+        IncidentFindError,
+        collect as collect_incident_find,
+    )
     from telegram_bot.core.node_status import NodeStatusError, node_status  # noqa: E402
     from telegram_bot.core.pr_readiness import PrReadinessError, collect as collect_pr_readiness  # noqa: E402
     from telegram_bot.core.skill_lookup import policy_denial  # noqa: E402
@@ -55,6 +60,10 @@ except ImportError:  # pragma: no cover - worktree aliasing only
     from deployment_diff import (  # noqa: E402  # type: ignore[no-redef]
         DeploymentDiffError,
         collect as collect_deployment_diff,
+    )
+    from incident_find import (  # noqa: E402  # type: ignore[no-redef]
+        IncidentFindError,
+        collect as collect_incident_find,
     )
     from node_status import NodeStatusError, node_status  # noqa: E402  # type: ignore[no-redef]
     from pr_readiness import PrReadinessError, collect as collect_pr_readiness  # noqa: E402  # type: ignore[no-redef]
@@ -100,7 +109,33 @@ _DEPLOYMENT_DIFF_SCHEMA = {
     "additionalProperties": False,
 }
 
+_INCIDENT_FIND_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "Symptom/error keywords to search for.",
+        },
+        "repo": {
+            "type": "string",
+            "description": "Optional GitHub repository (OWNER/REPO) scope for issue/PR search.",
+        },
+    },
+    "required": ["query"],
+    "additionalProperties": False,
+}
+
 _TOOLS = [
+    {
+        "name": "incident_find",
+        "description": (
+            "Read-only incident evidence search for one symptom query: wiki "
+            "candidates via wiki-agent (incidents/logs/runbooks) plus optional "
+            "GitHub issue/PR search on one repository. Results are candidates "
+            "only — reading the evidence and any approval stay separate steps."
+        ),
+        "inputSchema": _INCIDENT_FIND_SCHEMA,
+    },
     {
         "name": "deployment_diff",
         "description": (
@@ -145,6 +180,21 @@ _TOOLS = [
         "inputSchema": _NODE_STATUS_SCHEMA,
     },
 ]
+
+
+def _dispatch_incident_find(arguments: dict[str, Any]) -> dict[str, Any]:
+    query = arguments.get("query")
+    repo = arguments.get("repo")
+    if not isinstance(query, str) or not query.strip():
+        raise ToolError("invalid_query", "query must be a non-empty string")
+    if repo is not None and (not isinstance(repo, str) or not repo.strip()):
+        raise ToolError("invalid_repo", "repo must be a non-empty OWNER/REPO string")
+    try:
+        result = collect_incident_find(query, repo)
+    except IncidentFindError as error:
+        raise ToolError(error.code, str(error), **error.details) from error
+    _diag(f"call incident_find ok status={result.get('status')}")
+    return tool_result(result)
 
 
 def _dispatch_node_status(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -201,6 +251,8 @@ def _dispatch(name: str, arguments: Any) -> dict[str, Any]:
             raise ToolError(error.code, str(error), **error.details) from error
         _diag(f"call deployment_diff ok status={result.get('status')}")
         return tool_result(result)
+    if name == "incident_find":
+        return _dispatch_incident_find(arguments)
     if name == "pr_readiness":
         return _dispatch_pr_readiness(arguments)
     if name != "node_status":
