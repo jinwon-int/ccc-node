@@ -553,6 +553,30 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
         assert result == {"blob": big_value}
         await client.close()
 
+    async def test_connection_error_is_exposed_and_first_rejection_is_logged(self) -> None:
+        # #1721: a poisoned transport must be observable (property) and audible
+        # (one WARNING), not a silent fast-fail on every request.
+        reader = asyncio.StreamReader()
+        writer = FakeWriter(reader)
+        client = CodexAppServerClient(reader=reader, writer=writer)
+        await client.start()
+        self.assertIsNone(client.connection_error)
+
+        reader.feed_eof()
+        for _ in range(20):
+            if client.connection_error is not None:
+                break
+            await asyncio.sleep(0)
+        self.assertIsInstance(client.connection_error, CodexConnectionClosedError)
+
+        with self.assertLogs("telegram_bot.core.codex_app_server", level="WARNING") as logs:
+            with self.assertRaises(CodexConnectionClosedError):
+                await client.request("model/list", {})
+            with self.assertRaises(CodexConnectionClosedError):
+                await client.request("model/list", {})
+        self.assertEqual(sum("transport is poisoned" in line for line in logs.output), 1)
+        await client.close()
+
     async def test_reader_survives_frame_larger_than_stream_limit(self) -> None:
         # #1718: a thread/resume response of 16.48 MiB (109-turn thread, seoseo
         # 2026-09-13) exceeded STDOUT_BUFFER_LIMIT and readline() raised

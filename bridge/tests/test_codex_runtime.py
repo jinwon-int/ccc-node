@@ -29,7 +29,7 @@ if TYPE_CHECKING:
         ToolCompletedEvent,
         ToolStartedEvent,
     )
-    from core.codex_app_server import CodexNotification, CodexServerRequest
+    from core.codex_app_server import CodexConnectionClosedError, CodexNotification, CodexServerRequest
     from core.codex_runtime import CodexRuntime, _run_codex_memory_bootstrap
     from core.usage import SNAPSHOT_TTL_SECONDS, UsageSnapshot
 else:
@@ -48,7 +48,7 @@ else:
         ToolCompletedEvent,
         ToolStartedEvent,
     )
-    from telegram_bot.core.codex_app_server import CodexNotification, CodexServerRequest
+    from telegram_bot.core.codex_app_server import CodexConnectionClosedError, CodexNotification, CodexServerRequest
     from telegram_bot.core.codex_runtime import CodexRuntime, _run_codex_memory_bootstrap
     from telegram_bot.core.usage import SNAPSHOT_TTL_SECONDS, UsageSnapshot
 
@@ -75,6 +75,9 @@ class FakeClient:
         self.thread_resume_result: Any = None
         self.thread_rollback_result: Any = None
         self.thread_rollback_error: BaseException | None = None
+        self.connection_error: Any = None
+        self.thread_start_errors: list[BaseException] = []
+        self.thread_resume_errors: list[BaseException] = []
         self.thread_turns_list_calls: list[dict[str, Any]] = []
         self.thread_turns_list_result: Any = {"data": []}
         self.thread_turns_list_error: BaseException | None = None
@@ -105,6 +108,8 @@ class FakeClient:
 
     async def thread_start(self, *, cwd: str, model: str | None = None) -> Any:
         self.thread_start_calls.append({"cwd": cwd, "model": model})
+        if self.thread_start_errors:
+            raise self.thread_start_errors.pop(0)
         return self.thread_start_result
 
     async def thread_resume(
@@ -120,6 +125,8 @@ class FakeClient:
         )
         if self.thread_resume_gate is not None:
             await self.thread_resume_gate.wait()
+        if self.thread_resume_errors:
+            raise self.thread_resume_errors.pop(0)
         if self.thread_resume_result is not None:
             return self.thread_resume_result
         return {"thread": {"id": thread_id}}
@@ -467,6 +474,66 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             client.thread_rollback_calls,
             [{"thread_id": "thread-damaged", "num_turns": 1}],
         )
+
+    async def test_poisoned_transport_is_recycled_before_the_next_session(self) -> None:
+        # #1721: the reader died after the last turn; the client is pinned with a
+        # connection error while its process is still alive. The next session
+        # start must swap the client instead of failing on it.
+        first = await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))
+        poisoned = self.clients[0]
+        poisoned.connection_error = CodexConnectionClosedError(
+            "app-server reader failed: Separator is not found, and chunk exceed the limit"
+        )
+
+        with self.assertLogs("telegram_bot.core.codex_runtime", level="WARNING") as logs:
+            resumed = await self.runtime.start_or_resume(
+                SessionRequest(working_directory="/workspace", session_id=first.session_id)
+            )
+
+        self.assertEqual(resumed.session_id, first.session_id)
+        self.assertEqual(len(self.clients), 2)
+        self.assertEqual(poisoned.close_calls, 1)
+        self.assertEqual(self.clients[1].start_calls, 1)
+        self.assertEqual(len(self.clients[1].thread_resume_calls), 1)
+        self.assertTrue(any("Recycled the Codex app-server" in line for line in logs.output))
+
+    async def test_connection_error_during_resume_recycles_and_retries_once(self) -> None:
+        first = await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))
+        dying = self.clients[0]
+        dying.thread_resume_errors = [CodexConnectionClosedError("app-server stdout reached EOF")]
+
+        resumed = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id=first.session_id)
+        )
+
+        self.assertEqual(resumed.session_id, first.session_id)
+        self.assertEqual(len(self.clients), 2)
+        self.assertEqual(dying.close_calls, 1)
+        self.assertEqual(len(self.clients[1].thread_resume_calls), 1)
+
+    async def test_second_connection_error_is_not_retried_again(self) -> None:
+        await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))
+        self.clients[0].thread_start_errors = [CodexConnectionClosedError("first")]
+
+        def failing_factory(handler: Any) -> FakeClient:
+            client = self.factory(handler)
+            client.thread_start_errors = [CodexConnectionClosedError("second")]
+            return client
+
+        self.runtime._client_factory = failing_factory
+        with self.assertRaises(CodexConnectionClosedError) as ctx:
+            await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))
+        self.assertEqual(str(ctx.exception), "second")
+        self.assertEqual(len(self.clients), 2)
+
+    async def test_non_connection_errors_do_not_recycle(self) -> None:
+        await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))
+        self.clients[0].thread_start_errors = [RuntimeError("model rejected")]
+
+        with self.assertRaises(RuntimeError):
+            await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))
+        self.assertEqual(len(self.clients), 1)
+        self.assertEqual(self.clients[0].close_calls, 0)
 
     async def test_lightweight_resume_judges_last_turn_from_turns_list(self) -> None:
         # #1720: excludeTurns resume returns no history; the orphan verdict comes
@@ -919,7 +986,7 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_list_is_bounded_and_read_exposes_only_visible_messages(self) -> None:
         from telegram_bot.core.agent_runtime import SessionHistoryMessage
         from telegram_bot.core.codex_app_server import (
-            CodexThread,
+    CodexThread,
             CodexThreadListPage,
             CodexThreadSummary,
         )

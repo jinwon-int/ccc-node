@@ -631,6 +631,67 @@ class CodexRuntime:
 
     async def start_or_resume(self, request: SessionRequest) -> CodexSession:
         await self._bootstrap_memory()
+        # #1721: a poisoned transport (reader died, process exited) used to fail
+        # every later request until an idle recycle or a bridge restart —
+        # seoseo 2026-09-13 11:43 KST failed a fresh thread_start in 0.8 s on
+        # the client the 11:42 reader crash had pinned. Heal before starting,
+        # and once more if the transport dies under this very call.
+        await self._heal_poisoned_transport(reason="before session start")
+        try:
+            return await self._start_or_resume_once(request)
+        except CodexConnectionClosedError as exc:
+            if not await self._heal_poisoned_transport(reason=str(exc), force=True):
+                raise
+            logger.warning(
+                "Codex app-server connection failed (%s); recycled the transport "
+                "and retrying the session start once",
+                exc,
+            )
+            return await self._start_or_resume_once(request)
+
+    async def _heal_poisoned_transport(self, *, reason: str, force: bool = False) -> bool:
+        """Replace a client whose transport recorded a fatal error (#1721).
+
+        Returns True when a fresh client is installed. A runtime with active
+        turns is left alone (``recycle`` refuses it as well): those turns fail
+        on their own terms and the next idle session start heals the
+        transport. ``force`` recycles even when the client does not expose a
+        pinned error (e.g. "client is not running" raised mid-call).
+        """
+
+        client = self._client
+        error = getattr(client, "connection_error", None)
+        if error is None and not force:
+            return False
+        detail = error or reason
+        if self._active_turns:
+            logger.warning(
+                "Codex app-server transport is poisoned (%s) but %d turn(s) are "
+                "active; deferring the recycle",
+                detail,
+                len(self._active_turns),
+            )
+            return False
+        if not self._started:
+            # start() failed on this client: nothing to drain, just swap it.
+            async with self._start_lock:
+                if self._closed or self._client is not client:
+                    return False
+                self._client = self._client_factory(self._handle_server_request)
+            logger.warning(
+                "Replaced a never-started Codex app-server client after a "
+                "connection error: %s",
+                detail,
+            )
+            return True
+        recycled = await self.recycle()
+        if recycled:
+            logger.warning(
+                "Recycled the Codex app-server after a connection error: %s", detail
+            )
+        return recycled
+
+    async def _start_or_resume_once(self, request: SessionRequest) -> CodexSession:
         await self._ensure_started()
         if request.session_id is None:
             result = await self._client.thread_start(

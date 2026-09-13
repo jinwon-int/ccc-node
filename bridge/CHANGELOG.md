@@ -1,5 +1,15 @@
 # Changelog
 
+- **A dead Codex app-server transport heals itself (#1721).** After the
+  reader loop or the process died, the client stayed pinned with a
+  connection error and every later message failed in under a second while
+  `/status` still said `Codex: healthy` (seoseo 2026-09-13 11:43 KST). The
+  runtime now recycles a poisoned client before the next session start,
+  retries once when the transport dies under the call itself (never while
+  turns are active), logs the first rejected request at WARNING, and reports
+  the failure to the agent health state — cleared on the next successful
+  session start.
+
 - **Codex `thread/resume` no longer downloads the whole thread (#1720).** The
   runtime resumes with `excludeTurns` and judges the orphaned-tool-call
   recovery from `thread/turns/list` (one turn, full items) — 1.6 KB + ≤ one
