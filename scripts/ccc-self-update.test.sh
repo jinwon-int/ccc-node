@@ -310,7 +310,10 @@ ok "timing log records elapsed time and configured budget" 'grep -Eq "external-r
 printf 'test -f "%s"\n' "$TMP/budget-recovered" > "$CLAUDE/self-update.health-cmd"
 printf 'touch "%s"\n' "$TMP/budget-recovered" > "$CLAUDE/self-update.restart-cmd"
 out="$(CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS=300 run_selfup run 2>&1)"; rc=$?
-ok "up-to-date recovery gets configured command budget" '[ "$rc" = 0 ] && [ "$(sed -n "2p" "$CCC_TEST_TIMEOUT_CALLS")" = 300 ] && [ -f "$TMP/budget-recovered" ]'
+# The pending-activation report (#1527) adds one bounded health probe before
+# the #971 recovery block re-probes, so assert the configured budget by value
+# instead of a fixed call position.
+ok "up-to-date recovery gets configured command budget" '[ "$rc" = 0 ] && [ "$(grep -cx 300 "$CCC_TEST_TIMEOUT_CALLS")" = 1 ] && [ -f "$TMP/budget-recovered" ]'
 ok "recovery budget preserves runtime-recovered audit" 'grep "^{" "$STATE/self-update.log" | tail -1 | grep -q "runtime-recovered"'
 rm -f "$FAKEBIN/timeout"
 unset CCC_TEST_TIMEOUT_CALLS CCC_TEST_REAL_TIMEOUT
@@ -508,6 +511,11 @@ ok "restart failure retains the recovery snapshot for rollback" \
 ok "restart failure names the retained snapshot to the operator" \
   'grep -q "recovery snapshot" <<<"$out"'
 rm -rf "$STATE"/self-update-install-rollback.*
+# Fixture-operator reconciliation: after a failed restart the updater keeps a
+# pending-activation record (#1527) and later unchanged ticks would honestly
+# refuse convergence until it is resolved. Simulate the operator resolving it
+# so later sections start from the steady state they were written against.
+rm -f "$STATE/self-update.pending-activation.json"
 
 # --- 4) setup.sh failure rolls back --------------------------------------------
 OLD_HEAD="$(git -C "$REPO" rev-parse HEAD)"
@@ -891,6 +899,10 @@ out="$(CCC_TEST_REAPPLY_FAIL=1 run_selfup run 2>&1)"; rc=$?
 ok "failed re-apply exits 12" '[ "$rc" = 12 ]'
 ok "failed re-apply restores the pre-reapply crontab" 'grep -qF "echo keepme" "$FAKE_CRON" && ! grep -qF "ccc-node:fake" "$FAKE_CRON"'
 ok "failed re-apply notifies" 'grep -rh "cron 재적용 실패" "$TMP/spool" >/dev/null 2>&1'
+# Fixture-operator reconciliation for the pending-activation evidence (#1527)
+# the aborted re-apply left behind: later sections test the reconciled
+# steady state, so resolve the record the way an operator would.
+rm -f "$STATE/self-update.pending-activation.json"
 
 # --- 9) installed-SHA marker (#1422) ------------------------------------------
 # 9a) marker absent on an up-to-date tick: adopt HEAD silently, no setup.
@@ -962,6 +974,146 @@ out="$(CCC_TEST_FAKE_REPO_OWNER=65534 CCC_SELF_UPDATE_ALLOW_OWNER_MISMATCH=1 run
 rc=$?
 ok "explicit override proceeds" '[ "$rc" = 0 ] && [ -f "$SETUP_MARKER" ]'
 rm -f "$FAKEBIN/stat"
+
+# --- 11) pending-activation evidence (#1527) -----------------------------------
+# The installed-SHA marker commits the INSTALLED generation before restarts, so
+# a failed activation (the issue's exit-6 restart-cmd refusal while the OLD
+# runtime keeps serving healthy) used to make the next ordinary unchanged tick
+# report "already up to date" from health alone. The pending-activation record
+# must turn that second tick into an explicit incomplete-activation report
+# (exit 14) — without retrying, replaying or restarting anything on its own.
+PENDING="$STATE/self-update.pending-activation.json"
+rm -f "$PENDING" "$PENDING".tmp.* "$TMP/spool"/*.json
+
+# 11a) the repro: restart fails on the changed tick, OLD runtime stays healthy.
+echo pending-one > "$TMP/seed/pending-one.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm pending-one && git -C "$TMP/seed" push -q origin main
+printf '%s\n' 'bad-unit' > "$CLAUDE/self-update.services"
+: > "$TMP/systemctl.calls"
+out="$(run_selfup run 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # pending_target is read via eval inside ok()
+pending_target="$(git -C "$REPO" rev-parse HEAD)"
+ok "failed activation exits 7" '[ "$rc" = 7 ]'
+ok "installed marker still advanced before the failed restarts (#1527 enabler)" \
+  '[ "$(cat "$STATE/self-update.installed-sha")" = "$pending_target" ]'
+ok "failed activation persists bounded attempt/target/outcome evidence" \
+  'jq -e --arg t "$pending_target" ".schema == \"ccc.self-update.activation.v1\" and .target_sha == \$t and .outcome == \"restart-failed\" and (.services | length) == 1 and (.updated_at | length) > 0" "$PENDING" >/dev/null'
+ok "pending record is owner-only" '[ "$(stat -c %a "$PENDING")" = 600 ]'
+ok "failed activation retains the recovery snapshot" 'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+rm -rf "$STATE"/self-update-install-rollback.*
+
+# The exact false-convergence shape: unchanged second tick, OLD runtime HEALTHY.
+printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
+printf 'exit 0\n' > "$CLAUDE/self-update.health-cmd"
+: > "$TMP/systemctl.calls"
+rm -f "$TMP/spool"/*.json
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "healthy-old second tick does not report convergence (exit 14)" '[ "$rc" = 14 ]'
+ok "healthy-old second tick is audited as activation-incomplete" \
+  'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"activation-incomplete\" and .changed == false" >/dev/null'
+ok "healthy-old second tick restarts and retries nothing" '[ ! -s "$TMP/systemctl.calls" ]'
+ok "healthy-old second tick keeps the pending record" '[ -f "$PENDING" ]'
+ok "healthy-old second tick notifies the owner" 'jq -r .text "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | grep -q "활성화"'
+ok "status reports the pending activation read-only" \
+  'run_selfup status | grep -q "pending activation: INCOMPLETE target=${pending_target:0:7}"'
+
+# 11b) exact serving generation (verified outcome) reconciles and clears.
+printf 'git -C %s rev-parse HEAD\n' "$REPO" > "$CLAUDE/self-update.serving-generation-cmd"
+rm -f "$TMP/spool"/*.json
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "exact serving generation reconciles the pending activation" '[ "$rc" = 0 ]'
+ok "reconciled tick clears the pending record" '[ ! -e "$PENDING" ]'
+ok "reconciled tick is audited" 'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"activation-reconciled\"" >/dev/null'
+ok "reconciled tick restarts nothing" '[ ! -s "$TMP/systemctl.calls" ]'
+
+# 11c) mismatched serving generation: still pending, still explicit, no restart.
+echo pending-two > "$TMP/seed/pending-two.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm pending-two && git -C "$TMP/seed" push -q origin main
+printf '%s\n' 'bad-unit' > "$CLAUDE/self-update.services"
+out="$(run_selfup run 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # pending_target is re-read via eval inside ok()
+pending_target="$(git -C "$REPO" rev-parse HEAD)"
+ok "second failed activation re-records evidence for the new target" \
+  '[ "$rc" = 7 ] && jq -e --arg t "$pending_target" ".target_sha == \$t and .outcome == \"restart-failed\"" "$PENDING" >/dev/null'
+rm -rf "$STATE"/self-update-install-rollback.*
+printf 'git -C %s rev-parse HEAD~1\n' "$REPO" > "$CLAUDE/self-update.serving-generation-cmd"
+printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
+: > "$TMP/systemctl.calls"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "mismatched serving generation stays incomplete (exit 14)" '[ "$rc" = 14 ]'
+ok "mismatch logs the actual serving identity" \
+  'grep -q "reason=serving-mismatch target=$pending_target serving=" "$STATE/self-update.log"'
+ok "mismatch keeps the pending record and restarts nothing" '[ -f "$PENDING" ] && [ ! -s "$TMP/systemctl.calls" ]'
+
+# 11d) matching identity but an unhealthy runtime: no automatic activation.
+printf 'git -C %s rev-parse HEAD\n' "$REPO" > "$CLAUDE/self-update.serving-generation-cmd"
+printf '%s\n' 'exit 1' > "$CLAUDE/self-update.health-cmd"
+: > "$TMP/systemctl.calls"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "matching generation with unhealthy runtime stays incomplete (exit 14)" '[ "$rc" = 14 ]'
+ok "unhealthy target never triggers an automatic restart" '[ ! -s "$TMP/systemctl.calls" ]'
+ok "unhealthy target keeps the pending record" '[ -f "$PENDING" ]'
+ok "unhealthy-target outcome is logged" 'grep -q "reason=target-unhealthy target=$pending_target serving=$pending_target" "$STATE/self-update.log"'
+rm -f "$CLAUDE/self-update.serving-generation-cmd" "$CLAUDE/self-update.health-cmd"
+
+# 11e) corrupted / unsafe record shapes fail closed and never auto-delete.
+mv "$PENDING" "$TMP/pending.bak"
+ln -s "$TMP/pending.bak" "$PENDING"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "symlinked pending record is rejected, not followed" \
+  '[ "$rc" = 14 ] && grep -q "pending-activation unsafe reason=not-regular-file" "$STATE/self-update.log"'
+ok "symlinked pending record is not auto-deleted" '[ -L "$PENDING" ]'
+rm -f "$PENDING" && mv "$TMP/pending.bak" "$PENDING"
+chmod 644 "$PENDING"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "group-readable pending record is rejected" \
+  '[ "$rc" = 14 ] && grep -q "unsafe reason=not-owner-only" "$STATE/self-update.log"'
+chmod 600 "$PENDING"
+printf '{"schema":"ccc.self-update.activation.v1","target_sha":"trunc' > "$PENDING"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "unparsable pending record is rejected" \
+  '[ "$rc" = 14 ] && grep -q "unsafe reason=unparsable" "$STATE/self-update.log"'
+
+# 11f) interrupted write: leftover temp naming the CURRENT target means the
+# previous tick may have died between install and restart — refuse convergence.
+rm -f "$PENDING"
+printf '{"schema":"ccc.self-update.activation.v1","target_sha":"%s","outcome":"pending"}' "$(git -C "$REPO" rev-parse HEAD)" > "$PENDING.tmp.424242"
+chmod 600 "$PENDING.tmp.424242"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "interrupted activation write refuses convergence" \
+  '[ "$rc" = 14 ] && grep -q "interrupted-write temp=" "$STATE/self-update.log"'
+# A stale temp naming an OLDER target is residue: the tick proceeds normally.
+rm -f "$PENDING.tmp.424242"
+printf '{"schema":"ccc.self-update.activation.v1","target_sha":"%s","outcome":"pending"}' "0000000000000000000000000000000000000000" > "$PENDING.tmp.424243"
+chmod 600 "$PENDING.tmp.424243"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "stale interrupted temp for an old target is ignored" '[ "$rc" = 0 ] && grep -q "already up to date" <<<"$out"'
+rm -f "$PENDING".tmp.*
+
+# 11g) source changes with NO restart target: degraded run (11) records the
+# evidence and the next unchanged tick reports it instead of "up to date".
+rm -f "$CLAUDE/self-update.services"
+echo pending-three > "$TMP/seed/pending-three.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm pending-three && git -C "$TMP/seed" push -q origin main
+out="$(run_selfup run 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # pending_target is re-read via eval inside ok()
+pending_target="$(git -C "$REPO" rev-parse HEAD)"
+ok "changed tick with no restart target exits 11 (degraded)" '[ "$rc" = 11 ]'
+ok "degraded run records activation evidence" \
+  'jq -e --arg t "$pending_target" ".target_sha == \$t and .outcome == \"degraded-no-restart-target\"" "$PENDING" >/dev/null'
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "unchanged tick after a degraded run stays incomplete (exit 14)" '[ "$rc" = 14 ]'
+
+# 11h) a later successful changed tick clears the record — the matching-
+# successful-activation case — and the steady state becomes quiet again.
+printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
+echo pending-four > "$TMP/seed/pending-four.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm pending-four && git -C "$TMP/seed" push -q origin main
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "successful changed tick clears the pending activation record" '[ "$rc" = 0 ] && [ ! -e "$PENDING" ]'
+ok "success leaves no interrupted-write residue" '! compgen -G "$PENDING.tmp.*" >/dev/null'
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "following tick is honestly up to date again" '[ "$rc" = 0 ] && grep -q "already up to date" <<<"$out"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
