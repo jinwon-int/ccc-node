@@ -783,9 +783,9 @@ class DansoSession:
                     self._active = False
                     yield ErrorEvent(
                         code='danso_task_recovery_required',
-                        message=('Saved Danso task requires an explicit choice. Use /task_recover '
-                                 'to inspect it, /task_resume for an eligible checkpoint, '
-                                 'or /new for a new objective.'),
+                        message=('저장된 작업이 있어 사용자 확인이 필요합니다. 자동으로 재개되지 않습니다. '
+                                 '먼저 /task_recover 를 보내 상태와 선택지를 확인해 주세요. '
+                                 '새 작업을 시작하려면 /new 를 보내 주세요.'),
                     )
                     return
                 if resume_task:
@@ -1009,9 +1009,13 @@ class DansoSession:
                 failure = ErrorEvent(
                     code='danso_task_paused',
                     message=(
-                        'Paused at a saved checkpoint. Use /task_resume to continue.'
+                        ('작업을 저장하고 멈췄습니다. 자동으로 재개되지 않습니다. '
+                         + ('계속하려면 “계속해”를, 방향을 바꾸려면 새 지시를 보내 주세요. '
+                            if r.task_followup else '')
+                         + '저장된 작업을 계속하려면 /task_resume 을 보내 주세요.')
                         if has_remaining_budget
-                        else 'Checkpoint saved; resume requires remaining budget.'
+                        else ('작업 기록은 저장했지만 남은 실행 한도가 없어 재개할 수 없습니다. '
+                              '/task_recover 로 상태를 확인하거나 /new 로 새 작업을 시작해 주세요.')
                     ),
                 )
             events.append(failure)

@@ -85,13 +85,22 @@ class RecoverySnapshot:
         uncertainty = (f"중단된 모델 요청 {self.unknown_usage_requests}회의 토큰 사용량은 미확인입니다. "
                        "이어가면 모델 요청 비용이 추가될 수 있습니다.\n"
                        if self.unknown_usage_requests else '')
+        instruction = (
+            "자동으로 재개되지 않습니다. 계속하려면 /task_resume 을 보내거나 "
+            "'이어서 진행'을 선택해 주세요. 새 작업을 원하면 /new 를 보내 주세요."
+            if self.resume_allowed else
+            "이 상태에서는 /task_resume 으로 재개할 수 없습니다. "
+            "이전 결과를 확인하며 이어가려면 '이어서 진행'을 선택하고, "
+            "새 작업을 원하면 /new 를 보내 주세요. 선택 전에는 실행하지 않습니다."
+        )
         return (
             f"마지막 작업: {self.task[:500] or '요청 요약 없음'}\n\n"
             f"마지막 에이전트 기록(완료 검증 아님):\n{self.last_note[:800] or '없음'}\n\n"
             f"완료 기록이 있는 도구: {self.settled_tools}개 · 모델 요청 기록: {self.requests}회\n"
             f"중단 상태: {states[self.state]}\n"
             f"{uncertainty}"
-            "남은 작업은 실제 결과를 확인해야 합니다. 이어서 진행할까요?"
+            "남은 작업은 실제 결과를 확인해야 합니다.\n\n"
+            f"{instruction}"
         )
 
     def continuation(self):

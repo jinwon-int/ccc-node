@@ -372,3 +372,16 @@ def test_unresolved_tool_summary_preserves_explicit_inspection_flow():
     assert '도구 실행 기록 확인 필요' in result.render()
     assert not result.resume_allowed
     assert 'Do not replay' in result.continuation()
+
+
+@pytest.mark.parametrize('state,allowed', [('ready', True), ('paused', True), ('pending_tools', False)])
+def test_recovery_summary_explicitly_requires_user_input(state, allowed):
+    snapshot = RecoverySnapshot('fingerprint', state, allowed, 'task', 'note', 0, 1)
+    text = snapshot.render()
+    assert '/new' in text
+    if allowed:
+        assert '자동으로 재개되지 않습니다' in text
+        assert '/task_resume 을 보내거나' in text
+    else:
+        assert '/task_resume 으로 재개할 수 없습니다' in text
+        assert '선택 전에는 실행하지 않습니다' in text
