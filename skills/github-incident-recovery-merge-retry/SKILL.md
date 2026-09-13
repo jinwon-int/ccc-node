@@ -1,193 +1,165 @@
 ---
 name: github-incident-recovery-merge-retry
-description: Recover a green, mergeable PR through a GitHub infrastructure outage — poll the githubstatus components API until Actions/Pull Requests recover, re-run only failed workflow jobs, then land the PR with an exact-head (SHA-pinned) squash merge that falls back from GraphQL to REST and retries on a fixed interval via a detached background watcher. Use when GitHub returns 5xx/timeouts on CI or merge writes while the PR itself has no code problem. Established during the 2026-08-17 GitHub incident (jinwon-int/nclex #210 campaign).
+description: Recover an authorized, reviewed pull request after GitHub transport or service failures. Verify checks and independent review on the exact head, distinguish queue admission from merge completion, and retry only classified transient failures within a fixed budget. Use when CI or merge operations fail because of GitHub infrastructure rather than a code or policy failure.
 ---
 
-## When to Use
-- GitHub Actions or PR/API components are degraded (5xx, timeouts) and workflow runs failed for infra reasons, not code
-- A merge attempt returns 503/transient errors while the PR is green, mergeable, and conflict-free
-- You need to land the PR without manual escalation, possibly across session boundaries
+## Preconditions
 
-## Preconditions (validate BEFORE registering any watcher)
-Failure must be **API-level, not data-level**. Run all three, then compare against the gate table — the commands alone decide nothing without their accepted outputs:
+Work within the user's existing authorization and the repository's normal
+protection rules. Never use an administrator override, disable checks, or use
+another transport to bypass a merge queue. Independent review must come from a
+reviewer other than the author; the person submitting the merge may be the author.
+
+Record the repository, PR number, PR node ID, intended base and full head SHA
+(`EXACT_HEAD`). Confirm the PR is OPEN and not a draft. Capture one consistent
+metadata snapshot, then re-read the head immediately before any write:
+
 ```bash
-gh pr view <n> --repo <owner>/<repo> --json mergeable,mergeStateStatus --jq '{mergeable,mergeStateStatus}'
-gh pr checks <n> --repo <owner>/<repo>
-EXACT_HEAD=$(gh pr view <n> --repo <owner>/<repo> --json headRefOid --jq .headRefOid)
+gh pr view <n> --repo <owner>/<repo> \
+  --json id,state,isDraft,baseRefName,headRefOid,author,mergeable,mergeStateStatus,reviewDecision,latestReviews,statusCheckRollup
 ```
 
-Gate table (`mergeable` here is the GraphQL tri-state, not the REST boolean):
+Proceed only when all these conditions hold:
 
-| Reading | Verdict |
-|---|---|
-| `mergeable: MERGEABLE` + `mergeStateStatus: CLEAN` | **Accept** — proceed |
-| `mergeable: MERGEABLE` + `mergeStateStatus: HAS_HOOKS` | Accept only if the pending hook/automation is expected |
-| `mergeable: CONFLICTING` | **Reject** — data-level; resolve the conflict manually |
-| `mergeStateStatus: DIRTY` | **Reject** — merge conflict |
-| `mergeStateStatus: BLOCKED` | **Reject** — missing required review/check; satisfy the gate manually |
-| `mergeStateStatus: UNSTABLE` | **Reject** — checks failing; go to step 2 |
-| `mergeStateStatus: BEHIND` | **Reject** — update the branch and let CI re-run |
-| `mergeable: UNKNOWN` | **No verdict yet** — mergeability is computed asynchronously, and this is common precisely during degradation. Wait 30–60 s and re-query, up to 3 times. If it still will not settle, use the local ground-truth procedure in `github-merge-state-conflict-diagnosis` §3 and record that evidence before proceeding |
+- The head still equals `EXACT_HEAD`; the base and scope match the reviewed change.
+- Required checks are present and passing for this head and the relevant event.
+  A missing/empty check list is not a pass. Check the base branch's effective
+  protection/rulesets when the expected check set is uncertain.
+- Required independent approval is current and bound to this head. Check the
+  latest effective review per reviewer, including its commit OID, author and
+  state; a login plus `APPROVED` alone does not establish a head binding. Require
+  the effective review decision to satisfy repository policy, with no unresolved
+  blocking review. A head change requires fresh validation and review evidence.
+- GitHub reports MERGEABLE and its protection gates permit the selected normal
+  merge path. UNKNOWN needs another read; CONFLICTING/DIRTY needs source repair;
+  BEHIND needs an appropriate base refresh and new CI; BLOCKED/UNSTABLE needs its
+  actual failing gate resolved. Do not treat an expected hook as a passed gate.
 
-Required checks must be green **on `EXACT_HEAD` itself** (step 2 filters runs by head SHA for this reason — a green run on an older commit of the same branch proves nothing about the pinned head).
-Capture `EXACT_HEAD` **once** and reuse it for every retry — SHA pinning makes the loop safe against concurrent pushes.
+Local `git merge-tree` can help diagnose a persistent UNKNOWN, but cannot replace
+GitHub checks, reviews, authorization or the server's merge decision.
 
-## Procedure
+## Recover CI first
 
-**1. Monitor GitHub status until recovery**
-Poll the components API every ~5 minutes until Actions and Pull Requests are both `operational`:
+Check GitHub's component status and the actual failed run logs. A green status
+page does not prove the particular request or run has recovered, and an outage
+can coexist with a code failure. Do not assume a universal REST/GraphQL failure
+ordering.
+
+Only rerun a run whose full `headSha` equals `EXACT_HEAD` and whose failure was
+classified as infrastructure-related. List candidates without rerunning them:
+
 ```bash
-curl -s https://www.githubstatus.com/api/v2/components.json \
-  | jq -r '.components[] | select(.name=="Actions" or .name=="Pull Requests") | "\(.name): \(.status)"'
-```
-Run as a detached watcher (bridge-safe-detached-run) if recovery is expected in hours; notify on recovery.
-
-**2. Re-run only failed workflow jobs on the pinned head**
-
-Filter by head SHA, not by branch alone — a branch selector also matches runs
-from earlier commits, so an unpinned rerun can resurrect stale failures unrelated
-to `EXACT_HEAD` (`headSha` is a valid `gh run list --json` field; re-verify with
-`gh run list --help` on your gh build):
-```bash
-gh run list --repo <owner>/<repo> --branch <branch> --json databaseId,conclusion,headSha \
+gh run list --repo <owner>/<repo> --branch <branch> \
+  --json databaseId,conclusion,headSha \
   --jq ".[] | select(.conclusion==\"failure\" and .headSha==\"$EXACT_HEAD\") | .databaseId"
-gh run rerun <run-id> --repo <owner>/<repo> --failed
 ```
-Never re-run the full suite during recovery; allow 1–2 min for CI infra to stabilize first.
 
-**3. Watch for completion**
-Poll every 30–60 s (`gh pr checks <n> --repo <owner>/<repo> --watch`). If the same workflow fails **twice** after recovery, stop — it is likely a code issue; diagnose instead of auto-retrying.
+For a verified candidate, `gh run rerun <run-id> --repo <owner>/<repo> --failed`
+retries failed jobs. Recheck the PR head before rerunning. If the same failure
+returns after infrastructure recovery, diagnose it instead of repeatedly
+rerunning. Use `gh-ci-wait` when handing off a promise to resume after CI;
+foreground checks alone do not create a durable wait.
 
-**4. Merge — queue-aware enqueue, or direct exact-head merge**
+## Submit through the repository's merge path
 
-"GraphQL fails first and recovers last during incidents" is a dated observation
-from the single 2026-08-17 incident (n=1), not an invariant — check
-`https://www.githubstatus.com/history` before leaning on the ordering. The
-fallback order itself is justified fail-safe regardless: both paths below fail
-closed on a moved head.
+For a required merge queue, use an enqueue request with the expected head. The
+variables below are the previously verified PR node ID and full SHA:
 
-**Merge queue first.** If the repository requires a merge queue, the watcher
-enqueues and verifies by readback instead of direct-merging:
 ```bash
-gh pr merge <n> --repo <owner>/<repo> --squash    # enqueues when a queue is required
+gh api graphql \
+  -f query='mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{id position}}}' \
+  -f id="$PR_ID" -f head="$EXACT_HEAD"
 ```
-- Record `EXACT_HEAD` as the expected head **at enqueue time** — that is the pin
-  the eventual queue merge must be judged against in step 6.
-- **Queue admission is not MERGED.** The PR stays `OPEN` after a successful
-  enqueue; never treat the enqueue result (or `--auto` enablement) as a landed
-  merge. Poll step 6 until `state == "MERGED"`.
-- **No `--delete-branch` for a queue merge**: the queue owns branch handling, and
-  deleting the head from the watcher side races it.
 
-**Direct merge (no queue)** — both branches must honour the exact-head pin:
+Queue admission leaves the PR OPEN. Poll its queue/check state and eventual
+merge result; a queue eviction is a failed attempt that needs diagnosis. Do not
+supply `--delete-branch`, call direct REST merge, or convert a queue outage into
+a bypass. A changed head invalidates the saved review target.
+
+Where no queue is required, use the normal pinned merge:
+
 ```bash
-gh pr merge <n> --repo <owner>/<repo> --squash --delete-branch \
-     --match-head-commit "$EXACT_HEAD" \
-|| gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge \
-     -f merge_method=squash -f sha="$EXACT_HEAD"
+gh pr merge <n> --repo <owner>/<repo> --squash \
+  --match-head-commit "$EXACT_HEAD"
 ```
 
-`--match-head-commit` is what makes the first branch honour the Safety
-section's exact-head guarantee. Without it the CLI path merges whatever the
-head happens to be, so a push that lands mid-recovery would be merged
-unreviewed while the REST fallback right beside it would correctly fail
-closed — the two branches must agree.
+A direct REST merge is an alternative only where direct merging is allowed and
+the original failure was classified as transient. Re-read state and all gates
+first; do not chain it unconditionally with `||`:
 
-**5. Retry loop for sustained outages (detached watcher)**
-Fixed 3-min interval, max ~2 h (40 attempts). Run via systemd transient unit so it survives bridge/session restarts.
-
-**Credential preflight before registering the unit.** The transient unit starts
-with only the environment you give it: a `gh` that authenticates from its own
-credential store (hosts.yml/keyring under `$HOME`) keeps working, while a `gh`
-that authenticates from a node env file starts with **no token** and burns all
-40 attempts on auth failures. Probe auth exactly as the unit will see it, and
-stop if it fails:
 ```bash
-gh auth status -h github.com   # with the same $HOME the unit inherits; must pass with no token in argv
+gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge \
+  -f merge_method=squash -f sha="$EXACT_HEAD"
 ```
-If auth comes from an env file, make the unit **source the resolved env file
-itself** as its first lines (`set -a; . /path/to/env; set +a`) — a file read,
-not a token on argv and not a copy. Never pass a token via `--setenv=`
-(`systemd-run` argv is visible to other local users) and never write a token to
-a new location.
 
-**Classification: only transport/5xx failures are retryable.** 401/403
-(auth/permission), 404, 405 (not mergeable), 409 (head moved) and 422
-(validation) are decisions — stop and classify with a state readback, do not
-spend the retry budget on them:
+A successful response, enablement of auto-merge, or an enqueue result is not the
+final evidence. Read back the actual merge as described below.
+
+## Bound retries and preserve uncertain outcomes
+
+Use a fixed overall deadline and attempt cap, for example 40 attempts spaced
+three minutes apart with a two-hour deadline. Each request needs its own shorter
+timeout; neither retrying nor re-authentication extends the overall budget.
+These are an example retry budget, not defaults enforced by this skill.
+
+Before each attempt, read back state and the head. If an earlier write may have
+succeeded, reconcile it first: inspect the actual merge or existing queue entry
+before issuing another write. CLOSED without a merge is terminal, not a reason
+to try another merge transport.
+
+Apply this classification to **reads as well as writes**:
+
+| Outcome | Action |
+| --- | --- |
+| Explicit connection timeout/reset, or HTTP 5xx | Reconcile any uncertain write; retry only within the remaining budget. |
+| 401/403 | Stop and resolve authentication/permission or the documented rate-limit condition; no blind retry. |
+| 404/405/409/422 | Stop and read back/classify not-found, mergeability, head drift, validation or already-completed state. |
+| 429 | Respect the documented retry condition and remaining budget only after explicit classification. |
+| Other HTTP status, GraphQL error, malformed output or unknown CLI failure | Stop and diagnose; do not label a catch-all branch transient. |
+| MERGED | Verify and record completion; do not retry a merge to prove it happened. |
+
+A detached watcher must implement these same checks, queue/direct separation and
+bounded request/deadline behavior. Do not use a generic shell loop that retries
+every failure or declares success solely from the last command's exit code.
+
+Before detaching, validate `gh auth status --hostname github.com` **inside the
+same execution context** the watcher will use: same UID, HOME, GH_CONFIG_DIR,
+PATH and secret-loading mechanism, with ambient GH_TOKEN/GITHUB_TOKEN absent
+unless intentionally provided there. An interactive auth check under inherited
+environment does not prove a future service can authenticate. Prefer the
+existing protected gh credential store or an existing managed service's
+protected secret loader. Do not copy tokens, place them in argv/`--setenv`, or
+source an untrusted file. Fail the preflight without starting retries when the
+watcher context cannot authenticate. Store diagnostic records in a protected,
+owner-only location; emit status codes and IDs without tokens, response bodies
+or credential-bearing URLs.
+
+## Verify completion
+
 ```bash
-systemd-run --collect --unit merge-retry-pr<n> \
-  --property=StandardOutput=append:/tmp/merge-retry-<n>.log \
-  --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
-  bash -c 'set -a; [ -f /path/to/env ] && . /path/to/env; set +a
-    for i in $(seq 1 40); do
-      ST="$(gh pr view <n> --repo <owner>/<repo> --json state 2>&1)" \
-        || { echo "READBACK FAIL attempt $i $(date -u +%FT%TZ)"; sleep 180; continue; }
-      case "$ST" in *"MERGED"*) echo "ALREADY MERGED attempt $i $(date -u +%FT%TZ)"; exit 0 ;; esac
-      OUT="$(gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=squash -f sha='"$EXACT_HEAD"' 2>&1)" \
-        && { echo "SUCCESS attempt $i $(date -u +%FT%TZ)"; exit 0; }
-      case "$OUT" in
-        *"HTTP 409"*) echo "STOP attempt $i: head moved (409) $(date -u +%FT%TZ)"; exit 2 ;;
-        *"HTTP 405"*) echo "STOP attempt $i: not mergeable (405) $(date -u +%FT%TZ)"; exit 3 ;;
-        *"HTTP 401"*|*"HTTP 403"*) echo "STOP attempt $i: auth/permission (401/403) $(date -u +%FT%TZ)"; exit 4 ;;
-        *"HTTP 404"*) echo "STOP attempt $i: PR not found (404) $(date -u +%FT%TZ)"; exit 5 ;;
-        *"HTTP 422"*) echo "STOP attempt $i: validation (422) $(date -u +%FT%TZ)"; exit 6 ;;
-      esac
-      echo "attempt $i retryable (transport/5xx) $(date -u +%FT%TZ)"; sleep 180
-    done; echo TIMEOUT; exit 1'
+gh pr view <n> --repo <owner>/<repo> \
+  --json state,mergedAt,mergeCommit,headRefOid \
+  --jq '{state,mergedAt,oid:.mergeCommit.oid,headRefOid}'
 ```
-The pre-attempt state readback also covers the lost-response case (a merge that
-succeeded but whose response was lost is detected as MERGED on the next pass
-instead of being retried to a false TIMEOUT) and prevents pointless merge writes
-to a PR that was closed or merged while the watcher slept. Status checks inside
-the loop use REST, not GraphQL. Stop on success, any decision-class failure, or
-timeout; alert at ~1.5 h.
 
-**Retry only what an outage causes.** 409 and 405 are decisions, not transport
-failures — retrying them for two hours only delays the alert. Measured against
-the live API on 2026-09-10:
+Require `state == "MERGED"`, a nonempty merge time and merge commit. Tie the
+merge to the reviewed head and the retained submission/queue evidence; a PR
+already merged by another actor is not proof this attempt merged its saved SHA.
+Fetch the intended base and verify the recorded merge commit is an ancestor.
 
-| Situation | Result |
-|---|---|
-| Already-merged PR, correct pinned SHA | **200** `{"merged": true}` — genuinely idempotent |
-| Already-merged PR, wrong SHA | **200** `{"merged": true}` — the SHA is not re-checked once merged |
-| Open PR, SHA no longer the head | **409** `Head branch was modified` |
+Branch cleanup is separate. Neither the direct REST call nor the enqueue above
+requests branch deletion; repository auto-delete settings or other actors may
+remove it. Read its actual state and apply only authorized cleanup. Branch
+presence/absence is not merge-success evidence. A working-state checkpoint
+preserves continuity; it is not proof of CI or merge completion.
 
-So the "idempotent" claim in Safety holds for the case that matters — a
-retry after a merge that already succeeded is a no-op — but it does not
-license retrying every failure. Re-measure before trusting this table; GitHub
-can change these responses.
+## Re-verify the tooling
 
-**6. Verify by readback — the readback is the merge-success evidence**
-```bash
-gh pr view <n> --repo <owner>/<repo> --json state,mergedAt,mergeCommit \
-  --jq '{state,mergedAt,oid:.mergeCommit.oid}'
-git ls-remote --heads origin <branch>
-```
-`merged` is **not** a valid `gh pr view --json` field (`Unknown JSON field:
-"merged"`; re-measured 2026-09-13 on gh 2.93.0 — re-verify on your build before
-depending on it). Success is `state == "MERGED"` plus `mergedAt`/`mergeCommit`
-readback. The branch expectation is conditional on which path landed the merge:
-- direct merge via the CLI branch (`--delete-branch`) → head branch gone,
-  `ls-remote` output empty
-- REST fallback → head branch **remains** (REST does not delete it); delete it
-  explicitly only if policy requires
-  (`gh api -X DELETE repos/<owner>/<repo>/git/refs/heads/<branch>`), otherwise
-  expect it non-empty — the unconditional empty-output assertion is a false
-  failure on this path
-- merge queue → do **not** touch the head branch from the watcher; the queue owns it
+Check `gh pr view --help`, `gh run list --help` and `gh pr merge --help` on the
+installed build, and inspect a read-only JSON response for the fields you use.
+The CLI uses `state`, `mergedAt` and `mergeCommit`; do not assume a `merged` JSON
+field. Validate command examples with temporary git repositories and mocked
+API/CLI responses, never by running real approval or merge writes as a test.
 
-Confirm the merge commit is on main and no orphaned/queued workflows remain.
-
-## Safety
-- **Exact-head SHA pinning**: extract once, reuse for all attempts; reject new pushes during recovery (a push invalidates the pinned SHA — the REST call then fails closed, which is correct).
-- **No bypass**: normal merge flow only; never force-push, never admin-bypass checks.
-- **Finite timeout**: always cap attempts (~2 h); never infinite retry.
-- **Idempotent where it counts**: retrying the merge call on an already-merged PR returns 200 `{"merged": true}`, so a retry after a merge that already landed is harmless. This is *not* a licence to retry every failure — only transport/5xx errors are retryable; 401/403 (auth/permission), 404, 405 (not mergeable), 409 (head moved) and 422 (validation) are decisions and must stop the loop with a state readback, not consume its budget. See the status table in step 5.
-- **Exact author/reviewer separation**: the actor running steps 4–6 must not be the PR author. Before registering any watcher, read back and confirm an independent reviewer approved this exact head:
-  `gh pr view <n> --repo <owner>/<repo> --json author,latestReviews --jq '{author:.author.login, reviews:[.latestReviews[]|{by:.author.login,state}]}'`
-  — the reviewer login must differ from the author login with state `APPROVED`. A moved head invalidates both the pin and any stale approval; exact-head pinning without reviewer separation only automates self-merging.
-- **Credentials**: prefer `gh`'s own credential store (hosts.yml/keyring under `$HOME`). Env-file auth is allowed only if the watcher unit sources the resolved env file itself (resolve the path on your node, don't assume) and the step-5 preflight proves the unit can authenticate; never inline tokens in scripts or logs, never pass them on argv or `--setenv=`, and never copy them to a new location.
-
-## Related Skills
-- bridge-safe-detached-run (watcher runtime), gh-ci-wait (CI wait registration), gh-pr-flow (overall PR lifecycle)
+Related skills: `gh-pr-flow`, `gh-ci-wait`,
+`github-merge-state-conflict-diagnosis`.
