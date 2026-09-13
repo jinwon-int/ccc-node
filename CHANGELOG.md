@@ -4,6 +4,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Enable the merge queue on `main`: `merge_group` triggers for `ci.yml` and
+  `codeql.yml` (required contexts re-report on the queue's
+  `gh-readonly-queue/main/<pr>-<sha>` group refs), the `merge_queue` rule on
+  ruleset `18203378` applied post-merge (squash, `ALLGREEN`, group 1–5), the
+  queue section in `docs/ci-governance.md`, and the enqueue flow in the
+  `gh-pr-flow` skill. Direct merge API calls on `main` are refused once the
+  rule is live; PRs land by enqueue with checks re-run on the group ref.
 - Add `incident_find` as one read-only evidence search behind a JSON CLI
   (`scripts/ccc-incident-find.py`) and a fifth `family-ops` MCP tool: wiki
   candidates via `wiki-agent find --json` (with abstention preserved) plus

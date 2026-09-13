@@ -172,7 +172,9 @@ fresh explicit user approval in the current conversation, in both directions.
    successful. The approval is commit-bound and the credential never leaves
    the relay node.
 
-6. With required review and checks green, squash-merge normally:
+6. With required review and checks green, squash-merge normally (on
+   `jinwon-int/ccc-node`, `main` runs a merge queue — see the merge-queue
+   subsection at the end of this step; enqueue instead of merging):
 
    ```bash
    gh pr merge <n> --repo <owner/repo> --squash --delete-branch
@@ -241,6 +243,27 @@ fresh explicit user approval in the current conversation, in both directions.
    Then wait for CI on the new head and re-run the relay approval: approvals
    are commit-bound to `--expected-head`, so the pre-refresh approval no
    longer counts.
+
+**Merge queue on `jinwon-int/ccc-node` (since 2026-09-13).** `main` has a
+`merge_queue` ruleset rule, so plain `gh pr merge` is refused ("the merge
+strategy for main is set by the merge queue") — including by the relay merge
+helper. Land by enqueueing instead; exact-head and independent-review rules
+are unchanged, and the queue re-runs every required check on a speculative
+`gh-readonly-queue/main/...` group ref before squash-landing:
+
+```bash
+pr_id="$(gh pr view <n> --repo jinwon-int/ccc-node --json id --jq .id)"
+gh api graphql \
+  -f query='mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){clientMutationId}}' \
+  -f id="$pr_id"
+# then poll until state MERGED (the queue evicts on failing group checks):
+gh pr view <n> --repo jinwon-int/ccc-node --json state,mergeStateStatus
+```
+
+Enqueue needs the head up to date and its checks green; a stale `BEHIND` head
+goes through the update-branch loop above first. If the group fails, the
+queue evicts the PR: push the fix, then get fresh exact-head approval for the
+new head before re-enqueueing, as with any other push.
 
 7. Verify and clean up:
 

@@ -2,6 +2,13 @@ name: harness-ci
 
 on:
   pull_request:
+  # merge_group: `main` runs a merge queue (ruleset 18203378, rule
+  # merge_queue — docs/ci-governance.md). A queued PR's required contexts are
+  # re-run on the speculative gh-readonly-queue/main/<pr>-<sha> group ref;
+  # without this trigger those contexts never report there and the queue
+  # would time out waiting. Keep the required-context names identical to the
+  # pull_request runs (.github/required-checks.json).
+  merge_group:
   push:
     branches: [main]
   # #1483: the deps-lock workflow pushes deps/lock-pair-<date> and opens its PR

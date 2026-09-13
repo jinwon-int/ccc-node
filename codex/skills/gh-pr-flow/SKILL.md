@@ -16,10 +16,22 @@ protection, or move a credential between nodes.
 2. Confirm the PR author and current actor. Request a different write-capable
    reviewer when approval is required.
 3. After approval, re-read the exact head, review decision, and checks. Squash
-   merge normally:
+   merge normally — except on `jinwon-int/ccc-node` `main`, which runs a merge
+   queue (see below):
 
    ```bash
    gh pr merge NUMBER --repo OWNER/REPO --squash --delete-branch
+   ```
+
+   **Merge queue on `ccc-node` `main` (since 2026-09-13):** direct merge is
+   refused ("the merge strategy for main is set by the merge queue"). Enqueue
+   instead, then poll until `state` is `MERGED` (the queue evicts on failing
+   group checks; a new head needs fresh approval before re-enqueueing):
+
+   ```bash
+   pr_id="$(gh pr view NUMBER --repo jinwon-int/ccc-node --json id --jq .id)"
+   gh api graphql -f query='mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){clientMutationId}}' -f id="$pr_id"
+   gh pr view NUMBER --repo jinwon-int/ccc-node --json state,mergeStateStatus
    ```
 
 4. Verify the merged commit and remote branch deletion before removing a local
