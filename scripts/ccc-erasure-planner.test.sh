@@ -121,6 +121,44 @@ ok "multi-file class emits per-path targets" \
 ok "bench pattern targets appear per path" \
   '[ "$(grep -cF "nunchi.bench_sheets" <<<"$out")" -ge 3 ]'
 
+# --- 6) codex-feed runtime lock registered (#1468, partial c-class fix) -----
+# codex-feed.sh (#816) flocks $NUNCHI_HOME/.codex-feed.lock on every tick, but
+# the nunchi.runtime_locks class never registered it, so a live lock surfaced
+# as an unknown-artifact blocker and would stall any apply. The class must
+# classify the exact lock via the env-anchored extra_path AND the default-home
+# fallback — literal paths only: a lookalike name keeps blocking, and the
+# planner still mutates nothing.
+printf 'lock' > "$NUNCHI_HOME/.codex-feed.lock"
+printf 'lock' > "$NUNCHI_HOME/codex-feed.lock"      # lookalike: no leading dot
+FIX2="$TMP/fix2"
+mkdir -p "$FIX2/home/.nunchi"
+printf 'lock' > "$FIX2/home/.nunchi/.codex-feed.lock"
+printf 'lock' > "$FIX2/home/.nunchi/codex-feed.lock" # lookalike under default home
+fix2_sum() { find "$FIX" "$FIX2" -type f -exec md5sum {} + | sort | md5sum; }
+# shellcheck disable=SC2034  # before2 is read via eval inside ok()
+before2="$(fix2_sum)"
+out="$(run scan --json)"
+# shellcheck disable=SC2034  # scan_unknowns is read via eval inside ok()
+scan_unknowns="$(python3 -c 'import json,sys; print("\n".join(u["path"] for u in json.load(sys.stdin)["unknown"]))' <<<"$out")"
+ok "codex-feed lock classified via env-anchored extra_path" \
+  '! grep -qFx "$NUNCHI_HOME/.codex-feed.lock" <<<"$scan_unknowns"'
+ok "codex-feed lock lookalike stays a blocker (no broad glob)" \
+  'grep -qFx "$NUNCHI_HOME/codex-feed.lock" <<<"$scan_unknowns"'
+out="$(run node-decommission --json)"
+ok "codex-feed lock is a per-path decommission target" \
+  'grep -qF "$NUNCHI_HOME/.codex-feed.lock" <<<"$out"'
+out="$(env -u NUNCHI_HOME HOME="$FIX2/home" python3 "$PLANNER" --inventory "$INV" scan --json)"
+# shellcheck disable=SC2034  # scan_unknowns is read via eval inside ok()
+scan_unknowns="$(python3 -c 'import json,sys; print("\n".join(u["path"] for u in json.load(sys.stdin)["unknown"]))' <<<"$out")"
+ok "codex-feed lock classified via default-home fallback (NUNCHI_HOME unset)" \
+  '! grep -qFx "$FIX2/home/.nunchi/.codex-feed.lock" <<<"$scan_unknowns"'
+ok "default-home lookalike stays a blocker" \
+  'grep -qFx "$FIX2/home/.nunchi/codex-feed.lock" <<<"$scan_unknowns"'
+# shellcheck disable=SC2034  # after2 is read via eval inside ok()
+after2="$(fix2_sum)"
+ok "READ-ONLY: fixture tree byte-identical after codex-feed lock scans" \
+  '[ "$before2" = "$after2" ]'
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

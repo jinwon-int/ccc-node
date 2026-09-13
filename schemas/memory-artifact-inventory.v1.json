@@ -284,6 +284,11 @@
           "path": "mempalace-refresh.lock"
         },
         {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": ".codex-feed.lock"
+        },
+        {
           "path": "~/.nunchi/.judge.lock"
         },
         {
@@ -294,6 +299,9 @@
         },
         {
           "path": "~/.nunchi/mempalace-refresh.lock"
+        },
+        {
+          "path": "~/.nunchi/.codex-feed.lock"
         }
       ],
       "retention": "runtime-scoped; content-free flock anchors",

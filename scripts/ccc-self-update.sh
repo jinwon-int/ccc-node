@@ -20,6 +20,11 @@
 #      0 = healthy. With both files present, an up-to-date tick that finds the
 #      runtime DOWN attempts one recovery restart — so the second daily slot
 #      can recover an updated-but-down node (#971).)
+#   ~/.claude/self-update.serving-generation-cmd (optional: one read-only
+#      command that prints existing bridge health JSON with the full frozen
+#      startup identity. It is the only supported way to reconcile a pending
+#      activation record on an unchanged tick; without it
+#      the serving identity is unknown and stays pending (#1527).)
 #   ~/.claude/self-update.no-reapply (optional: operator kill-switch; when this
 #      file exists, installer-managed cron is never rewritten. Env override:
 #      CCC_SELF_UPDATE_REAPPLY=0. Agent must not write the file.)
@@ -54,6 +59,9 @@
 #      CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS (180; integer 1..900),
 #      CCC_SELF_UPDATE_RESTART_WAIT_SECONDS (60; separate health-probe budget),
 #      CCC_STATE_DIR, CCC_PUSH_SPOOL, CCC_NODE.
+#      Pending-activation evaluation (#1527): CCC_SELF_UPDATE_SERVING_GENERATION_CMD
+#      (env override for the operator's serving-generation probe file) and
+#      CCC_SELF_UPDATE_SERVING_GEN_FILE (file-path override).
 # Idle gate: before touching anything the run defers (exit 8) while the telegram
 #      bridge is serving a request, so a restart cannot SIGTERM-kill an in-flight
 #      `claude` child (exit 143) mid-task. Reads the bridge's health.json.
@@ -66,7 +74,10 @@
 #      or external restart-cmd) or a recovery attempt failed; 8 = deferred
 #      (bridge busy); 11 = degraded (code updated but nothing restarted and no
 #      restart-cmd configured); 12 = installer re-apply failed (crontab was
-#      restored); other non-zero = aborted (reason logged).
+#      restored); 14 = activation incomplete (#1527): the installed generation
+#      was never verified active — a pending-activation record exists (or its
+#      bookkeeping failed) and the tick refuses to report convergence from
+#      health alone; other non-zero = aborted (reason logged).
 set -uo pipefail
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
@@ -169,6 +180,101 @@ resolve_restart_cmd() {
 resolve_health_cmd() {
   if [ -n "${CCC_SELF_UPDATE_HEALTH_CMD:-}" ]; then printf '%s' "$CCC_SELF_UPDATE_HEALTH_CMD"; return 0; fi
   read_operator_cmd "$HEALTH_CMD_FILE"
+}
+
+# --- pending-activation evidence (#1527) --------------------------------------
+# The installed-SHA marker commits the INSTALLED generation before restarts, so
+# a failed activation (e.g. a restart-cmd exiting 6 while the OLD runtime keeps
+# serving healthy) used to let the next unchanged tick report convergence from
+# "marker == HEAD" plus a passing health probe alone. The small pending-
+# activation record below persists the attempt (target generation, outcome,
+# bounded evidence) and is cleared ONLY on verified activation: every
+# allowlisted restart came back active, an external/recovery restart succeeded
+# with its health probe, or the operator-provided serving-generation probe
+# supplies existing health JSON with the full frozen startup identity.
+# Health alone or a live checkout HEAD probe never clears it. Completed
+# receipts remain on disk as outcome=activated to preserve durable evidence.
+PENDING_ACTIVATION_FILE="$STATE_DIR/self-update.pending-activation.json"
+SERVING_GEN_FILE="${CCC_SELF_UPDATE_SERVING_GEN_FILE:-$CLAUDE_DIR/self-update.serving-generation-cmd}"
+
+ACTIVATION_HELPER="$SELF_UPDATE_DIR/lib/self-update-activation.py"
+activation_state() { python3 "$ACTIVATION_HELPER" "$1" "$STATE_DIR" "${@:2}"; }
+write_pending_activation() {
+  if ! activation_state write "$NEW_SHA" "$OLD_SHA" "$1" "$2" "${3:-$INSTALL_SNAPSHOT_DIR}"; then
+    KEEP_INSTALL_SNAPSHOT=1
+    log "pending-activation persistence failed; recovery snapshot=$INSTALL_SNAPSHOT_DIR"
+    return 1
+  fi
+}
+clear_pending_activation() { activation_state clear "$NEW_SHA"; }
+load_pending_activation() {
+  local rec rc
+  PENDING_TARGET_SHA=""; PENDING_OUTCOME=""; PENDING_SERVICES='[]'
+  rec="$(activation_state load "${NEW_SHA:-}")"; rc=$?
+  if [ "$rc" != 0 ]; then
+    [ "$rc" = 1 ] || log "pending-activation unsafe reason=unsafe-or-interrupted"
+    return "$rc"
+  fi
+  PENDING_TARGET_SHA="$(printf '%s' "$rec" | jq -r .target_sha)"
+  PENDING_OUTCOME="$(printf '%s' "$rec" | jq -r .outcome)"
+  PENDING_SERVICES="$(printf '%s' "$rec" | jq -c .services)"
+}
+detect_interrupted_pending_write() { activation_state residue; }
+resolve_serving_generation() {
+  local cmd
+  if [ -n "${CCC_SELF_UPDATE_SERVING_GENERATION_CMD:-}" ]; then
+    cmd="$CCC_SELF_UPDATE_SERVING_GENERATION_CMD"
+  elif ! cmd="$(read_operator_cmd "$SERVING_GEN_FILE")"; then
+    return 1
+  fi
+  activation_state probe "$REPO" "$cmd" "$RESTART_WAIT_SECONDS"
+}
+serving_generation_matches() { [ "$1" = "$2" ] && [ "$2" = "$NEW_SHA" ]; }
+
+# Explicitly re-evaluate an incomplete activation on an unchanged tick. This
+# NEVER restarts anything by itself (a pending record must not trigger an
+# automatic retry or replay, and a healthy old runtime stays untouched) and
+# NEVER accepts health-only evidence as convergence. Returns:
+#   0 = reconciled against the exact serving generation and cleared
+#   2 = still incomplete — caller reports and exits 14
+#   3 = runtime is DOWN — caller defers to the existing #971 recovery policy
+report_pending_activation() {
+  local serving hcmd
+  if serving="$(resolve_serving_generation)"; then
+    if ! serving_generation_matches "$serving" "$PENDING_TARGET_SHA"; then
+      log "pending-activation result=incomplete reason=serving-mismatch target=$PENDING_TARGET_SHA serving=$serving outcome=${PENDING_OUTCOME:-unknown}"
+      audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
+      notify "self-update: ${PENDING_TARGET_SHA:0:7} 세대 활성화가 아직 완료되지 않았습니다 — 서빙 세대($(printf '%.7s' "$serving"))가 설치 목표와 다릅니다. 건강한 구버전 런타임을 임의로 재시작하지 않습니다; 확인 후 수동 개입이 필요합니다. 로그: ~/.claude/state/self-update.log" "pending-$PENDING_TARGET_SHA"
+      say "self-update: activation incomplete — serving ${serving:0:7} != installed target ${PENDING_TARGET_SHA:0:7}; not reporting up-to-date" >&2
+      return 2
+    fi
+    if hcmd="$(resolve_health_cmd)" && ! run_bounded_operator_cmd "$RESTART_WAIT_SECONDS" "$hcmd"; then
+      log "pending-activation result=unhealthy reason=target-unhealthy target=$PENDING_TARGET_SHA serving=$serving"
+      return 3
+    fi
+    if ! clear_pending_activation; then
+      KEEP_INSTALL_SNAPSHOT=1
+      log "pending-activation result=clear-failed target=$PENDING_TARGET_SHA"
+      audit "activation-clear-failed" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
+      say "self-update: activation verified (${PENDING_TARGET_SHA:0:7} serving) but the pending record could not be cleared; not reporting up-to-date — inspect $PENDING_ACTIVATION_FILE" >&2
+      return 2
+    fi
+    log "pending-activation result=reconciled target=$PENDING_TARGET_SHA serving=$serving"
+    audit "activation-reconciled" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
+    notify "self-update: 이전에 실패했던 ${PENDING_TARGET_SHA:0:7} 세대 활성화가 서빙 세대 일치로 확인됐습니다 — 보류 기록을 정리했습니다." "reconciled-$PENDING_TARGET_SHA"
+    say "self-update: pending activation reconciled — runtime verified serving ${PENDING_TARGET_SHA:0:7}"
+    return 0
+  fi
+  # Serving identity unknown: health alone never proves activation (#1527).
+  if hcmd="$(resolve_health_cmd)" && ! run_bounded_operator_cmd "$RESTART_WAIT_SECONDS" "$hcmd"; then
+    log "pending-activation result=unhealthy reason=identity-unknown target=$PENDING_TARGET_SHA outcome=${PENDING_OUTCOME:-unknown}"
+    return 3
+  fi
+  log "pending-activation result=incomplete reason=identity-unknown target=$PENDING_TARGET_SHA outcome=${PENDING_OUTCOME:-unknown}"
+  audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
+  notify "self-update: ${PENDING_TARGET_SHA:0:7} 세대 설치는 완료됐지만 활성화(재시작) 완료 증거가 없습니다(마지막 시도: ${PENDING_OUTCOME:-unknown}). 구버전 런타임이 건강해 보여도 수렴으로 보지 않습니다 — 서빙 세대 확인 또는 self-update.serving-generation-cmd 설정이 필요합니다. 로그: ~/.claude/state/self-update.log" "pending-$PENDING_TARGET_SHA"
+  say "self-update: activation incomplete — ${PENDING_TARGET_SHA:0:7} installed but never verified active (outcome=${PENDING_OUTCOME:-unknown}); not reporting up-to-date" >&2
+  return 2
 }
 
 # Commands run in timeout's process group; kill a TERM-resistant probe after
@@ -377,6 +483,13 @@ if [ "$MODE" = "status" ]; then
   say "services file: $SERVICES_FILE $([ -f "$SERVICES_FILE" ] && echo "($(grep -cv '^[[:space:]]*\(#\|$\)' "$SERVICES_FILE" 2>/dev/null || true) services)" || echo '(missing)')"
   say "external restart command timeout: ${RESTART_COMMAND_TIMEOUT_SECONDS}s"
   say "post-restart health budget: ${RESTART_WAIT_SECONDS}s"
+  pending_rc=0
+  load_pending_activation || pending_rc=$?
+  case "$pending_rc" in
+    0) say "pending activation: INCOMPLETE target=$(printf '%.7s' "$PENDING_TARGET_SHA") outcome=${PENDING_OUTCOME:-unknown}" ;;
+    2) say "pending activation: unreadable/unsafe ($PENDING_ACTIVATION_FILE)" ;;
+    *) say "pending activation: none" ;;
+  esac
   say "-- log (last 5) --"
   tail -5 "$LOG" 2>/dev/null
   exit 0
@@ -413,6 +526,16 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   fi
 fi
 trap cleanup EXIT
+
+# Unsafe or interrupted activation evidence blocks every run, including forced
+# and changed ticks, before repository recovery, fetch, setup or restart.
+ACTIVATION_PREFLIGHT=0
+activation_state load >/dev/null || ACTIVATION_PREFLIGHT=$?
+if [ "$ACTIVATION_PREFLIGHT" != 0 ] && [ "$ACTIVATION_PREFLIGHT" != 1 ]; then
+  log "pending-activation unsafe reason=unsafe-or-interrupted"
+  say "self-update: unsafe activation evidence; refusing mutations" >&2
+  exit 14
+fi
 
 # --- idle gate: never restart the bridge while it is serving a request --------
 # The bridge writes an in-flight workload snapshot to its health.json. Restarting
@@ -685,12 +808,53 @@ if [ "$CHANGED" = "false" ] && [ -n "$INSTALLED_SHA" ] && [ "$INSTALLED_SHA" != 
   log "install-drift installed=$INSTALLED_SHA checkout=$NEW_SHA reason=checkout-advanced-without-setup"
   CHANGED=true
 elif [ "$CHANGED" = "false" ] && [ -z "$INSTALLED_SHA" ] && [ "$FORCE" != "1" ]; then
-  # Only an ordinary no-change tick adopts HEAD. A forced first deployment
-  # must wait for setup and its config preflight before recording success.
+  # A failed first installation may be unable to create even its activation
+  # intent. Its retained recovery snapshot still proves this is not a clean
+  # legacy bootstrap. Never turn that failure into a successful HEAD adoption.
+  for recovery_evidence in "$STATE_DIR"/self-update-install-rollback.*; do
+    if [ -e "$recovery_evidence" ] || [ -L "$recovery_evidence" ]; then
+      log "pending-activation result=incomplete reason=markerless-recovery-evidence"
+      say "self-update: missing installed marker with recovery evidence; refusing to report up-to-date" >&2
+      exit 14
+    fi
+  done
+  # Only an ordinary no-change tick without recovery evidence adopts HEAD. A
+  # forced first deployment waits for setup and its config preflight.
   printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || log "warn installed-sha marker write failed path=$INSTALLED_SHA_FILE"
 fi
 
 if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
+  # Pending-activation evidence (#1527) outranks every up-to-date shortcut: an
+  # installed-but-unverified generation must be reported, never papered over by
+  # "marker == HEAD" plus a healthy OLD runtime. The report path itself never
+  # restarts or retries anything.
+  PENDING_STATE=0
+  PENDING_HEALTH_FAILED=0
+  load_pending_activation || PENDING_STATE=$?
+  if [ "$PENDING_STATE" = "2" ]; then
+    log "pending-activation result=unsafe refusing-up-to-date target=${PENDING_TARGET_SHA:-none}"
+    audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" false true "[]"
+    notify "self-update: 활성화 시도 기록(~/.claude/state/self-update.pending-activation.json)이 손상됐거나 안전하지 않습니다. 확인 전까지 이 노드를 최신 상태로 보고하지 않습니다. 로그: ~/.claude/state/self-update.log" "pending-unsafe"
+    say "self-update: pending-activation record is corrupt or unsafe; refusing to report up-to-date (inspect $PENDING_ACTIVATION_FILE)" >&2
+    exit 14
+  fi
+  if [ "$PENDING_STATE" = "0" ]; then
+    report_pending_activation
+    pending_report_rc=$?
+    if [ "$pending_report_rc" = "0" ]; then exit 0; fi
+    if [ "$pending_report_rc" = "2" ]; then exit 14; fi
+    # rc 3: the runtime is DOWN. That is the pre-existing #971 recovery shape
+    # (an updated-but-down node), not a healthy-old-runtime masquerade, so the
+    # default recovery policy below still applies. PENDING_HEALTH_FAILED keeps
+    # that path honest when no recovery restart target is configured.
+    PENDING_HEALTH_FAILED=1
+  fi
+  if detect_interrupted_pending_write; then
+    audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" false true "[]"
+    notify "self-update: 활성화 기록 저장이 중단된 흔적이 있습니다 — 마지막 갱신이 재시작 전에 끊겼을 수 있습니다. 서빙 세대 확인이 필요합니다. 로그: ~/.claude/state/self-update.log" "pending-interrupted-$NEW_SHA"
+    say "self-update: interrupted pending-activation write detected; refusing to report up-to-date" >&2
+    exit 14
+  fi
   # Second-slot runtime recovery (#971): code is current, but an earlier
   # chained restart may have failed and left the runtime down. When the
   # operator configured both a health probe and an external restart command,
@@ -705,15 +869,34 @@ if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
     SHORT_CUR="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
     log "runtime unhealthy at up-to-date tick; attempting recovery restart"
     if run_external_restart; then
+      # A verified successful restart IS activation of the installed
+      # generation: a pending record may finally be cleared (no-op if absent).
+      if ! clear_pending_activation; then
+        KEEP_INSTALL_SNAPSHOT=1
+        audit "activation-clear-failed" "$OLD_SHA" "$NEW_SHA" false true "[]"
+        notify "self-update ${SHORT_CUR}: 복구 재시작은 성공했지만 활성화 기록 정리에 실패했습니다. 보존된 활성화 기록과 복구 자료를 유지하고 운영자가 원인을 확인해 조정해야 합니다." "pending-clear-fail-$NEW_SHA"
+        say "self-update: recovery restart succeeded but the pending-activation record could not be cleared" >&2
+        exit 14
+      fi
       audit "runtime-recovered" "$OLD_SHA" "$NEW_SHA" "$CHANGED" true '[{"name":"external-restart","ok":true,"scope":"external"}]'
       notify "self-update ${SHORT_CUR}: 코드는 최신이나 런타임 다운 감지 — 외부 재시작으로 복구 완료. ~/.claude/state/self-update.log" "recovered-$NEW_SHA"
       say "self-update: code up to date but runtime was down; recovered via external restart"
       exit 0
     fi
+    if [ "$PENDING_STATE" = "0" ]; then
+      # Refine the retained evidence with the failed recovery attempt.
+      write_pending_activation "recovery-restart-failed" '[{"name":"external-restart","ok":false,"scope":"external"}]' "" || exit 14
+    fi
     audit "runtime-down" "$OLD_SHA" "$NEW_SHA" "$CHANGED" true '[{"name":"external-restart","ok":false,"scope":"external"}]'
     notify "self-update ${SHORT_CUR} 경고: 코드는 최신이나 런타임이 다운 상태이며 복구 재시작도 실패했습니다. 브리지가 남아있는지 즉시 확인 필요. ~/.claude/state/self-update.log" "runtime-down-$NEW_SHA"
     say "self-update: code up to date but runtime is DOWN and the recovery restart failed" >&2
     exit 7
+  fi
+  if [ "${PENDING_HEALTH_FAILED:-0}" = "1" ]; then
+    audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
+    notify "self-update: ${PENDING_TARGET_SHA:0:7} 세대 활성화가 확인되지 않은 상태에서 런타임이 건강하지 않고 복구 재시작 대상도 없습니다. 수동 확인 필요. 로그: ~/.claude/state/self-update.log" "pending-$PENDING_TARGET_SHA"
+    say "self-update: activation incomplete and runtime unhealthy with no recovery restart configured; not reporting up-to-date" >&2
+    exit 14
   fi
   log "done result=up-to-date sha=$NEW_SHA"
   say "self-update: already up to date ($(git -C "$REPO" rev-parse --short HEAD))"
@@ -776,7 +959,17 @@ fi
 # config preflight succeed. Otherwise rollback leaves a rejected NEW_SHA in
 # the marker and a later hand-pulled checkout can incorrectly skip redeploy.
 # Keep this before restarts: a runtime failure does not undo installed assets.
-printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || log "warn installed-sha marker write failed path=$INSTALLED_SHA_FILE"
+# Durable pending evidence precedes advancing the installed marker. On any
+# persistence uncertainty stop before restart and keep the recovery snapshot.
+if ! write_pending_activation "pending" '[]' "$INSTALL_SNAPSHOT_DIR"; then
+  say "self-update: activation evidence could not be persisted; recovery snapshot retained" >&2
+  exit 14
+fi
+if ! printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE"; then
+  KEEP_INSTALL_SNAPSHOT=1
+  say "self-update: installed marker publication failed; activation remains pending" >&2
+  exit 14
+fi
 # The recovery snapshot deliberately outlives setup and the runtime-config
 # preflight: a service that fails to come back is exactly when rollback
 # material is needed, and deleting it here left that path with nothing to
@@ -833,6 +1026,8 @@ else
     log "reapply begin installer=$installer old=$old_gen new=$current"
     if ! CCC_CRONTAB_CMD="$CRONTAB_CMD" bash "$REPO/$installer" "${rec_argv[@]}" >>"$LOG" 2>&1; then
       "$CRONTAB_CMD" "$CRONTAB_SNAP" >>"$LOG" 2>&1 || true
+      KEEP_INSTALL_SNAPSHOT=1
+      write_pending_activation "reapply-aborted" '[]' "$INSTALL_SNAPSHOT_DIR" || exit 14
       audit "reapply-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" '[]'
       notify "self-update $(git -C "$REPO" rev-parse --short HEAD): cron 재적용 실패 ($installer) — crontab 복원됨. ~/.claude/state/self-update.log" "reapply-fail-$NEW_SHA"
       say "self-update: installer re-apply failed ($installer); crontab restored" >&2
@@ -840,6 +1035,8 @@ else
     fi
     if ! "$CRONTAB_CMD" -l 2>/dev/null | grep -F "$marker" | grep -qF "gen=$current"; then
       "$CRONTAB_CMD" "$CRONTAB_SNAP" >>"$LOG" 2>&1 || true
+      KEEP_INSTALL_SNAPSHOT=1
+      write_pending_activation "reapply-verify-aborted" '[]' "$INSTALL_SNAPSHOT_DIR" || exit 14
       audit "reapply-verify-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" '[]'
       notify "self-update $(git -C "$REPO" rev-parse --short HEAD): cron 재적용 검증 실패 ($installer) — crontab 복원됨. ~/.claude/state/self-update.log" "reapply-verify-$NEW_SHA"
       say "self-update: installer re-apply did not stamp $marker with $current; crontab restored" >&2
@@ -901,6 +1098,7 @@ if [ "$FAILED" -gt 0 ]; then
   # previous code deleted it before the restarts ran, leaving nothing to
   # recover from.
   KEEP_INSTALL_SNAPSHOT=1
+  write_pending_activation "restart-failed" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
   audit "restart-failures" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
   log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=restart-failure"
   notify "self-update ${SHORT_NEW}: 서비스 ${FAILED}개 재시작 실패 (${RESTARTED}개 성공, 재시도 후). 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log 확인 필요." "fail-$NEW_SHA"
@@ -924,6 +1122,7 @@ if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && [ "$RESTARTED" -eq 0 ];
     else
       KEEP_INSTALL_SNAPSHOT=1
       SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c '. + [{"name":"external-restart","ok":false,"scope":"external"}]')"
+      write_pending_activation "external-restart-failed" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
       audit "restart-failures" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
       log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=external-restart-failure"
       notify "self-update ${SHORT_NEW}: 코드 갱신 후 외부 재시작 명령이 실패했습니다 — 브리지가 남아있는지 즉시 확인 필요. 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log" "fail-$NEW_SHA"
@@ -931,11 +1130,26 @@ if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && [ "$RESTARTED" -eq 0 ];
       exit 7
     fi
   else
+    KEEP_INSTALL_SNAPSHOT=1
+    write_pending_activation "degraded-no-restart-target" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
     audit "degraded-no-services" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
     notify "self-update ${SHORT_NEW}: 코드 갱신됐으나 재시작된 서비스 없음 (허용목록 누락/비어있음 의심). 실행 중 프로세스가 옛 코드일 수 있음 — self-update.services 확인 필요. ~/.claude/state/self-update.log" "degraded-$NEW_SHA"
     say "self-update: degraded — ${OLD_SHA:0:7} → ${SHORT_NEW}, services restarted: 0 (no allowlisted services; runtime may be stale)" >&2
     exit 11
   fi
+fi
+
+# Verified activation (#1527): every allowlisted restart came back active, or
+# the operator's external restart command and its health probe passed. The
+# attempt record was evidence until proven; only now may it be cleared. A
+# failed clear is fail-closed — the next unchanged tick would otherwise
+# re-report an activation that actually completed.
+if ! clear_pending_activation; then
+  KEEP_INSTALL_SNAPSHOT=1
+  audit "activation-clear-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
+  notify "self-update ${SHORT_NEW}: 활성화는 완료됐지만 시도 기록 정리에 실패했습니다. 보존된 활성화 기록과 복구 자료를 유지하고 운영자가 원인을 확인해 조정해야 합니다." "pending-clear-fail-$NEW_SHA"
+  say "self-update: activation completed but the pending-activation record could not be cleared; not reporting clean success" >&2
+  exit 14
 fi
 
 if ! rm -rf -- "$INSTALL_SNAPSHOT_DIR"; then

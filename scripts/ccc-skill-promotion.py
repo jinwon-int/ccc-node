@@ -127,6 +127,7 @@ class Config:
     # command that prints that broker's edge secret — the value itself never
     # leaves the remote host. Empty tuple = single-broker behavior (default).
     remote_brokers: tuple[dict[str, str], ...] = ()
+    revise_substitute_after_days: int = 0
 
 
 @dataclass(frozen=True)
@@ -444,6 +445,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         autorepair_enabled=autorepair_enabled,
         revise_enabled=revise_enabled,
         revise_round_limit=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_ROUNDS", 2, 1, 2),
+            revise_substitute_after_days=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_SUBSTITUTE_DAYS", 0, 0, 30),
         revise_daily_cap=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_DAILY_CAP", 3, 1, 8),
         # #1394: verdict/revise-result collect window. The old fixed cap of 8
         # polled newest-first (LIFO), so any backlog beyond 8 starved the oldest
@@ -2702,11 +2704,13 @@ def _build_revise_manifest(
     round_no: int,
     findings: list[dict[str, str]],
     skill_files: list[dict[str, str]],
+    reviser: str = "",
     procedure: str,
     broker_id: str,
     broker_url: str | None = None,
     now: str,
 ) -> dict[str, object]:
+    reviser = reviser or node
     task_id = f"{_REVISE_LANE}-pr{pr_number}-{node}-{now}"
     round_id = f"{_REVISE_LANE}-pr{pr_number}-r{round_no}-{head[:8]}-{now}"
     return {
@@ -2717,11 +2721,11 @@ def _build_revise_manifest(
         "lanes": [
             {
                 "id": task_id,
-                "target": {"id": node, "role": "publisher"},
+                "target": {"id": reviser, "role": "publisher"},
                 "intent": _REVISE_LANE,
                 "message": (
                     f"skills-intake-reviser procedure invoked: revise the fleet-skills intake "
-                    f"candidate {name} (intake PR #{pr_number}, author node {node}, revision "
+                    f"candidate {name} (intake PR #{pr_number}, author node {node}, reviser {reviser}, revision "
                     f"round {round_no}) per {_REVISE_SCHEMA}. Address the attached findings with a "
                     f"holistic edit and return ONLY the result JSON. Bind your output to "
                     f"skillName={name}, sourceTreeSha256={tree_sha256}. The candidate is "
@@ -2853,6 +2857,147 @@ def _revise_target_broker(config: Config, node: str, secret: str) -> dict[str, s
     raise PromotionError("revise_author_offline")
 
 
+def _revise_substitute_due(
+    config: Config, rows: list[dict[str, object]], node: str, name: str
+) -> bool:
+    """DOC-3366 B2 gate: a substitute may take the revise only after the
+    author-offline skip has aged past config.revise_substitute_after_days.
+    0 (default) keeps the skip exactly as before — no dispatch, and the
+    doctor stall warning remains the only signal."""
+    after = getattr(config, "revise_substitute_after_days", 0)
+    if not isinstance(after, int) or after <= 0:
+        return False
+    oldest: str | None = None
+    for item in rows:
+        if item.get("kind") != "a2a-revise-comment":
+            continue
+        if item.get("node") != node or item.get("name") != name:
+            continue
+        if "revise_author_offline" not in str(item.get("marker", "")):
+            continue
+        stamp = item.get("ts")
+        if isinstance(stamp, str) and (oldest is None or stamp < oldest):
+            oldest = stamp
+    if oldest is None:
+        return False
+    try:
+        skipped_at = datetime.strptime(
+            oldest[:15], "%Y%m%dT%H%M%S"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - skipped_at).days >= after
+
+
+def _revise_substitute_pick(
+    config: Config, secret: str, node: str, reviewer: str, candidate_key: str
+) -> str | None:
+    """Deterministic substitute pick among online keyring workers, excluding
+    the author (the revise is for their candidate) and the reviewer of record
+    (the reviser must not work off their own findings — policies/REVIEW.md).
+    Hash-of-key selection: re-runs pick the same worker, no operator whim."""
+    trusted = set(_keyring_worker_ids(config))
+    candidates: set[str] = set()
+    pools = [_broker_online_worker_ids(config, secret)]
+    pools.extend(_remote_online_worker_ids(config, rb) for rb in config.remote_brokers)
+    for pool in pools:
+        for worker in pool:
+            if worker not in trusted or worker in {node, reviewer}:
+                continue
+            candidates.add(worker)
+    if not candidates:
+        return None
+    ordered = sorted(candidates)
+    index = int(hashlib.sha256(candidate_key.encode()).hexdigest(), 16) % len(ordered)
+    return ordered[index]
+
+
+def _revise_substitute_for(
+    config: Config,
+    rows: list[dict[str, object]],
+    node: str,
+    name: str,
+    reviewer: str,
+    tree12: str,
+    secret: str,
+) -> str | None:
+    """The substitute for this lineage when B2 is due, else None. None covers
+    every stay-normal case: feature off, skip too fresh, no online candidate,
+    reviewer collision, or a substitute already used for this lineage."""
+    prior_substitute = any(
+        item.get("kind") == "a2a-revise-dispatch"
+        and item.get("node") == node
+        and item.get("name") == name
+        # Dispatch records persist a boolean, not the result summary's worker
+        # string. A malformed explicit marker also withholds another attempt;
+        # legacy author-only rows without this field remain compatible.
+        and "substitute" in item
+        and item["substitute"] is not False
+        for item in rows
+    )
+    if prior_substitute:
+        return None
+    if not _revise_substitute_due(config, rows, node, name):
+        return None
+    return _revise_substitute_pick(config, secret, node, reviewer, f"{node}:{name}:{tree12}")
+
+
+def _revise_broker_of_worker(
+    config: Config, worker: str, secret: str
+) -> dict[str, str] | None:
+    """Broker dict for the worker's homed broker; None = the primary broker."""
+    if worker in _broker_online_worker_ids(config, secret):
+        return None
+    for rb in config.remote_brokers:
+        if worker in _remote_online_worker_ids(config, rb):
+            return rb
+    return None
+
+
+def _resolve_revise_target(
+    config: Config,
+    row: dict[str, object],
+    rows: list[dict[str, object]],
+    node: str,
+    name: str,
+    reviewer: str,
+    tree12: str,
+    secret: str,
+) -> tuple[dict[str, str] | None, str, str, str, str | None]:
+    """Broker, broker ids and the reviser for the next revise round. Raises
+    revise_author_offline when the author is online nowhere and no substitute
+    is available (B2 off, skip too fresh, or the substitute already ran)."""
+    substitute: str | None = None
+    revise_rb: dict[str, str] | None = None
+    try:
+        revise_rb = _revise_target_broker(config, node, secret)
+    except PromotionError as error:
+        if error.code != "revise_author_offline":
+            raise
+        try:
+            substitute = _revise_substitute_for(
+                config, rows, node, name, reviewer, tree12, secret
+            )
+        except PromotionError:
+            raise
+        except Exception:
+            # The caller converts this typed failure to a structured skip.
+            # Never return a dict where it expects a five-tuple, or print an
+            # exception that may include broker/keyring response content.
+            raise PromotionError("revise_substitute_unavailable") from None
+        if substitute is None:
+            raise
+        revise_rb = _revise_broker_of_worker(config, substitute, secret)
+    if revise_rb is None:
+        broker_id = _broker_id(config, secret)
+        broker_url = config.broker_url
+    else:
+        broker_id = _remote_broker_id(config, revise_rb)
+        broker_url = revise_rb["broker_url"]
+    reviser = substitute or node
+    return revise_rb, broker_id, broker_url, reviser, substitute
+
+
 def _run_revise_round(
     config: Config,
     revise_rb: dict[str, str] | None,
@@ -2946,13 +3091,12 @@ def _dispatch_intake_revise(
     if not nexus_script.is_file():
         return {"outcome": "revise-skipped", "code": "revise_nexus_missing"}
     try:
-        revise_rb = _revise_target_broker(config, node, secret)
-        if revise_rb is None:
-            broker_id = _broker_id(config, secret)
-            broker_url = config.broker_url
-        else:
-            broker_id = _remote_broker_id(config, revise_rb)
-            broker_url = revise_rb["broker_url"]
+        revise_rb, broker_id, broker_url, reviser, substitute = _resolve_revise_target(
+            config, row, rows, node, name, reviewer, tree12, secret
+        )
+    except PromotionError as error:
+        return {"outcome": "revise-skipped", "code": error.code}
+    try:
         procedure = _worker_procedure_from_docs(
             config.a2a_nexus_dir, doc_name=_REVISE_DOC_NAME, end_marker=_REVISE_DOC_END
         )
@@ -2976,6 +3120,7 @@ def _dispatch_intake_revise(
             branch=branch,
             head=head,
             node=node,
+            reviser=reviser,
             provider=str(provider),
             name=name,
             tree_sha256=tree_sha256,
@@ -3014,7 +3159,8 @@ def _dispatch_intake_revise(
         "name": name,
         "tree_sha256": tree_sha256,
         "round": round_no,
-        "reviser_node": node,
+        "reviser_node": reviser,
+        "substitute": reviser != node,
         "broker_id": broker_id,
         "broker": revise_rb["name"] if revise_rb else "primary",
     }
@@ -3034,7 +3180,7 @@ def _dispatch_intake_revise(
                 str(row.get("dispatched_task", "")),
                 (
                     f"auto-revision round {round_no}/{config.revise_round_limit}: revision task "
-                    f"`{dispatched_task}` dispatched to author node `{node}`; the revised tree will "
+                    f"`{dispatched_task}` dispatched to reviser `{reviser}` (author node: {node}); the revised tree will "
                     "be re-gated and re-reviewed on a fresh intake PR"
                 ),
             ),
@@ -3047,6 +3193,8 @@ def _dispatch_intake_revise(
         "round": round_no,
         "task_id": task_id,
         "dispatched_task": dispatched_task,
+        "reviser": reviser,
+        **({"substitute": reviser} if reviser != node else {}),
     }
 
 

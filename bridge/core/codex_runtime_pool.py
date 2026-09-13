@@ -29,6 +29,7 @@ class _UsageRuntime(AgentRuntime, Protocol):
 RuntimeFactory = Callable[[Mapping[str, str]], _UsageRuntime]
 RouteEnvironmentFactory = Callable[[str, str], Mapping[str, str]]
 EnvironmentKey = tuple[tuple[str, str], ...]
+ResumeDiagnosticsObserver = Callable[[Mapping[str, object]], object]
 
 
 class CodexRuntimePool:
@@ -62,6 +63,7 @@ class CodexRuntimePool:
         # factory creates from now on, so the composition root can register
         # one observer without knowing the pool's lazily-built children.
         self._unowned_completion_listener: Callable[[str, str], object] | None = None
+        self._resume_diagnostics_observer: ResumeDiagnosticsObserver | None = None
 
     def set_unowned_completion_listener(
         self, listener: Callable[[str, str], object] | None
@@ -73,6 +75,17 @@ class CodexRuntimePool:
             setter = getattr(runtime, "set_unowned_completion_listener", None)
             if callable(setter):
                 setter(listener)
+
+    def set_resume_diagnostics_observer(
+        self, observer: ResumeDiagnosticsObserver | None
+    ) -> None:
+        """Mirror body-free resume diagnostics onto present/future children."""
+
+        self._resume_diagnostics_observer = observer
+        for runtime in self._runtimes.values():
+            setter = getattr(runtime, "set_resume_diagnostics_observer", None)
+            if callable(setter):
+                setter(observer)
 
     @staticmethod
     def _environment_key(environment: Mapping[str, str]) -> EnvironmentKey:
@@ -102,6 +115,11 @@ class CodexRuntimePool:
                     )
                     if callable(setter):
                         setter(listener)
+                observer = self._resume_diagnostics_observer
+                if observer is not None:
+                    setter = getattr(runtime, "set_resume_diagnostics_observer", None)
+                    if callable(setter):
+                        setter(observer)
                 self._runtimes[key] = runtime
             return runtime
 

@@ -110,8 +110,23 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
    commit status `a2a/receipts`를 exact-head에 투영. 확인:
    `gh api repos/<r>/commits/<head>/status`.
 3. `success: "signed receipts complete: N lane(s), N reviewer(s), exact-head"`
-   확인 후 **머지는 별도 사용자 승인** → gh-pr-flow(Direction B: jinon86
-   exact-head squash via the relay merge helper).
+   확인 후 **머지는 별도 사용자 승인**. main에 머지 큐가 활성돼 있어(ruleset
+   merge-queue-main, 2026-09-13) 승인 후 **enqueue로 착지**한다 — `gh pr merge
+   --squash`와 relay merge helper는 "The merge strategy for main is set by the
+   merge queue"로 거부된다:
+
+   ```bash
+   pr_id="$(gh pr view <n> --repo <owner>/<repo> --json id --jq .id)"
+   gh api graphql \
+     -f query='mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){clientMutationId}}' \
+     -f id="$pr_id"
+   gh pr view <n> --repo <owner>/<repo> --json state   # MERGED 폴링(실패 시 큐에서 축출)
+   ```
+
+   a2a/receipts는 group head에도 재투영된다(a2a-receipts.yml merge_group 분기,
+   #535) — 큐가 이를 기다린 뒤 squash 착지. exact-head 원칙 불변: 승인 시점 head ==
+   enqueue 시점 head(그 사이 푸시되면 재승인). 인프라 경로(.github 등)는 gate가
+   아니라 ruleset이 관리하며 실패 시 ruleset 삭제가 롤백이다.
 
 ## 안전 규칙
 
