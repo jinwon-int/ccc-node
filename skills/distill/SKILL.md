@@ -53,126 +53,25 @@ wc -l ~/.claude/state/wiki-candidates.md
 
 2. **Dispatch on `$ARGUMENTS`**:
 
-   - **`status`** — no mutation. Read & report:
+   - **`status`** — no mutation. Resolve the installed directory containing
+     this `SKILL.md` and set `DISTILL_SKILL_DIR` to that trusted path. The
+     script honors `CCC_STATE_DIR` and reports the last result/log lines and
+     queue totals (`pending/stale/hot`), without firing the distiller:
      ```bash
-     STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
-     QUEUE="$STATE/wiki-candidates.md"
-     SEEN="$STATE/wiki-candidates.seen"
-     jq -r '"trigger=\(.trigger) session=\(.session_id) at=\(.distilled_at) honcho=\(.honcho|length) wiki=\(.wiki_candidates|length)"' \
-       "$STATE/distill-last.json" 2>/dev/null
-     tail -5 "$STATE/distill.log" 2>/dev/null
-     CUTOFF="$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '0000-00-00T00:00:00Z')"
-     awk -v cutoff="$CUTOFF" '
-       function reset() { pending=0; distilled=""; hot=0; stale_marker=0 }
-       function flush() {
-         if (!seen) return
-         total++
-         if (pending) pending_n++
-         if (hot) hot_n++
-         if (pending && (stale_marker || (distilled != "" && distilled < cutoff))) stale_n++
-       }
-       BEGIN { reset() }
-       /^## \[CAND-[0-9]+\]/ { flush(); seen=1; reset(); if ($0 ~ /🔥 HOT/) hot=1; if ($0 ~ /\(stale: pending review\)/) stale_marker=1; next }
-       /^- status: pending/ { pending=1; next }
-       /^- distilled-at: / { distilled=$3; next }
-       END { flush(); printf "wiki-candidates total=%d pending=%d stale=%d hot=%d\n", total+0, pending_n+0, stale_n+0, hot_n+0 }
-     ' "$QUEUE" 2>/dev/null
-     awk -v th="${CCC_DISTILL_HOTNESS_THRESHOLD:-3}" 'NF >= 4 && $3 >= th {hot++} END { printf "seen-hot=%d threshold=%s\n", hot+0, th }' "$SEEN" 2>/dev/null
+     bash "$DISTILL_SKILL_DIR/scripts/distill-status.sh"
      ```
 
-   - **`stats [days]`** — read-only aggregate over `distill.log` (default 7 days):
+   - **`stats [days]`** — read-only aggregate over `distill.log` (default 7 days).
+     Parse the requested day count as decimal digits; use 7 for an absent or
+     malformed value. Pass the validated count as a separate literal argument
+     to the packaged script. Never insert raw `$ARGUMENTS` into shell source
+     or use `eval`. The example below requests 14 days:
      ```bash
-     set -uo pipefail
-     # `$ARGUMENTS` is substituted into this block by the slash-command
-     # template BEFORE the shell runs. It is not a shell variable — reading
-     # `${ARGUMENTS}` from the environment always yielded empty, so `days`
-     # was silently ignored and DAYS was pinned to 7 (#1630).
-     ARG="$ARGUMENTS"
-     [ -n "$ARG" ] || ARG="stats"
-     DAYS="$(printf '%s' "$ARG" | sed -E 's/^stats[[:space:]]*//; s/^days=//')"
-     case "$DAYS" in ''|*[!0-9]*) DAYS=7 ;; esac
-     LOG="${CCC_STATE_DIR:-$HOME/.claude/state}/distill.log"
-     CUTOFF="$(date -u -d "$DAYS days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '0000-00-00T00:00:00Z')"
-     printf '[distill stats — last %s days]\n' "$DAYS"
-     awk -v cutoff="$CUTOFF" '
-       # Resolve trigger for a log line:
-       #   1) inline `trigger=…` (preferred — current distill.sh emits it on every line)
-       #   2) PID lookup against the most recent `start trigger=X pid=Y` line for the same PID
-       #      (handles format drift between start/start-bg/done where PIDs differ but still
-       #       lets us correlate when one stage has it and another does not)
-       #   3) "unknown" (truly historical lines from older distill.sh versions)
-       function get_trigger(line,    p) {
-         if (match(line, /trigger=[^ ]+/)) return substr(line, RSTART+8, RLENGTH-8)
-         if (match(line, /pid=[0-9]+/)) {
-           p=substr(line, RSTART+4, RLENGTH-4)
-           if (p in pid_trigger) return pid_trigger[p]
-         }
-         return "unknown"
-       }
-       $1 < cutoff { next }
-       /start trigger=/ {
-         trigger="unknown"; pid=""
-         if (match($0, /trigger=[^ ]+/)) { trigger=substr($0, RSTART+8, RLENGTH-8) }
-         if (match($0, /pid=[0-9]+/))    { pid=substr($0, RSTART+4, RLENGTH-4) }
-         if (pid != "") pid_trigger[pid]=trigger
-         last_trigger=trigger   # scan-order "most recent start", used by `spawned bg`
-         total[trigger]++
-         next
-       }
-       /spawned bg pid=/ {
-         # Bridge parent (start) PID -> bg (worker) PID so downstream lines that
-         # log only the bg pid still resolve their trigger via the cache.
-         if (match($0, /pid=[0-9]+/)) {
-           bg=substr($0, RSTART+4, RLENGTH-4)
-           # Use the trigger from the most recent `start` line, tracked in
-           # scan order. `for (p in pid_trigger)` was used here to mean "most
-           # recent", but awk array traversal order is unspecified, so it
-           # picked an arbitrary parent and mislabelled bg lines (#1630).
-           if (last_trigger != "") pid_trigger[bg]=last_trigger
-         }
-         next
-       }
-       / done trigger=/ {
-         trigger=get_trigger($0); elapsed=""
-         if (match($0, /elapsed_s=[0-9]+/)) { elapsed=substr($0, RSTART+10, RLENGTH-10); elapsed_sum[trigger]+=elapsed; elapsed_n[trigger]++ }
-         done[trigger]++
-         next
-       }
-       /extract failed/ {
-         trigger=get_trigger($0); elapsed=""
-         if (match($0, /elapsed_s=[0-9]+/)) { elapsed=substr($0, RSTART+10, RLENGTH-10); elapsed_sum[trigger]+=elapsed; elapsed_n[trigger]++ }
-         failed[trigger]++
-         next
-       }
-       /dry-run skipping/ {
-         trigger=get_trigger($0); elapsed=""
-         if (match($0, /elapsed_s=[0-9]+/)) { elapsed=substr($0, RSTART+10, RLENGTH-10); elapsed_sum[trigger]+=elapsed; elapsed_n[trigger]++ }
-         dryrun[trigger]++
-         next
-       }
-       /skip reason=|skipped reason=/ {
-         trigger=get_trigger($0)
-         skip[trigger]++
-         next
-       }
-       END {
-         split("manual precompact sessionend unknown", order, " ")
-         for (i=1; i<=length(order); i++) {
-           t=order[i]
-           if ((total[t]+done[t]+failed[t]+dryrun[t]+skip[t]) == 0) continue
-           avg="-"
-           if (elapsed_n[t] > 0) avg=sprintf("%ds", elapsed_sum[t]/elapsed_n[t])
-           printf "%-10s %4d runs (%3d done / %3d failed / %3d dryrun / %3d skipped) avg=%s\n", t ":", total[t], done[t], failed[t], dryrun[t], skip[t], avg
-         }
-       }
-     ' "$LOG" 2>/dev/null
-     printf '\nHoncho push: %s ok / %s queued\n' \
-       "$(awk -v cutoff="$CUTOFF" '$1>=cutoff && /honcho push ok/ {n++} END{print n+0}' "$LOG" 2>/dev/null)" \
-       "$(awk -v cutoff="$CUTOFF" '$1>=cutoff && (/honcho-push non-zero|honcho push failed/) {n++} END{print n+0}' "$LOG" 2>/dev/null)"
-     printf 'Wiki queue:   %s candidates added / %s dedup-skipped\n' \
-       "$(awk -v cutoff="$CUTOFF" '$1>=cutoff && /wiki-queue session=/ {if (match($0,/added=[0-9]+/)) {n+=substr($0,RSTART+6,RLENGTH-6)}} END{print n+0}' "$LOG" 2>/dev/null)" \
-       "$(awk -v cutoff="$CUTOFF" '$1>=cutoff && /wiki-queue session=/ {if (match($0,/skipped\(dup\)=[0-9]+/)) {n+=substr($0,RSTART+13,RLENGTH-13)}} END{print n+0}' "$LOG" 2>/dev/null)"
+     bash "$DISTILL_SKILL_DIR/scripts/distill-stats.sh" stats 14
      ```
+     The helper also accepts `stats`, `stats days=14`, or `14` as positional
+     arguments. An environment variable named `ARGUMENTS` is not needed.
+     Functional fixtures live in `tests/test_distill_skill_parsing.py`.
 
    - **`dryrun`** — `touch ~/.claude/state/distill.dryrun`. Confirm.
 
