@@ -6,10 +6,9 @@ reaches ``SNAPSHOT_DONE``) and stages skill candidates through the idempotent
 ``SkillCandidateSink``. It never claims, advances, or mutates a distill job, so
 the memory-distill pipeline is unaffected whether or not this collector runs.
 
-Codex and Piri nodes compose this worker (one instance per provider, bound to
-that provider's journal jobs and install target). A node can opt out with
-``CCC_CODEX_SKILL_COLLECTOR=false`` / ``CCC_PIRI_SKILL_COLLECTOR=false``;
-Claude nodes never compose it.
+Codex, Piri, and Danso nodes compose this worker (one instance per provider,
+bound to that provider's journal jobs and install target). A node can opt out
+with its provider-specific collector setting; Claude nodes never compose it.
 """
 
 from __future__ import annotations
@@ -90,6 +89,12 @@ class SkillCandidateCollectorWorker:
         self._sink = sink
         self._usage_meter = usage_meter
         self._clock = clock
+
+    @property
+    def provider(self) -> str:
+        """Provider whose distill jobs this worker is configured to collect."""
+
+        return self._provider
 
     def should_collect(self, *, job_id: str) -> bool:
         """Cheap durable preflight used by the sweep before consuming its cap."""
