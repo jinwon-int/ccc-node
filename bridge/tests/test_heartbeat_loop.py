@@ -175,9 +175,53 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
         req = self._make_request()
         await self._start_loop(req)
         await asyncio.wait_for(self.status_event.wait(), timeout=5.0)
+        await _wait_until(lambda: req.heartbeat_message_id == 1234)
         self.assertEqual(req.heartbeat_message_id, 1234)
         self.assertIn("⏳ Working", self.status_calls[0][0])
         self.assertIn("Read: bridge/core/project_chat.py", self.status_calls[0][0])
+
+    async def test_cancelled_send_publishes_new_id_before_final_cleanup(self):
+        from telegram_bot.core.bot_status import BotStatusMixin
+        from telegram_bot.utils.heartbeat_store import drain_heartbeats, store_path_for
+
+        with tempfile.TemporaryDirectory() as directory:
+            accepted = asyncio.Event()
+            release = asyncio.Event()
+            live_ids = {10}
+
+            async def send_message(**kwargs):
+                live_ids.add(11)  # Telegram has accepted the new message.
+                accepted.set()
+                await release.wait()  # Response is still in flight.
+                return SimpleNamespace(message_id=11)
+
+            async def delete_message(*, chat_id, message_id):
+                live_ids.discard(message_id)
+
+            harness = BotStatusMixin()
+            harness._config = SimpleNamespace(
+                bot_data_dir=Path(directory), heartbeat_store_path=None,
+                heartbeat_delete_on_done=True,
+            )
+            req = self._make_request()
+            req.heartbeat_message_id = 10
+            req.status_callback = harness._make_status_callback(
+                SimpleNamespace(send_message=send_message, delete_message=delete_message), 2,
+            )
+            task = asyncio.create_task(self.handler._maybe_update_heartbeat(req, req.started_at + 10))
+            await asyncio.wait_for(accepted.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()  # Repeated cancellation must not cancel the owned send.
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+            self.assertEqual(req.heartbeat_message_id, 11)
+            self.assertTrue(await self.handler._cleanup_heartbeat(req))
+            self.assertEqual(live_ids, set())
+            self.assertEqual(drain_heartbeats(store_path_for(Path(directory))), [])
 
     async def test_does_not_send_when_disabled(self):
         project_chat.config.heartbeat_enabled = False

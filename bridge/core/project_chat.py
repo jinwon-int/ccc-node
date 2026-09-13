@@ -25,6 +25,7 @@ from telegram_bot.core.task_ledger import (
 )
 from telegram_bot.core.request_lifecycle import RequestPhase
 from telegram_bot.core.heartbeat import (
+    await_heartbeat_update,
     compose_heartbeat_text,
     has_recent_visible_progress,
     should_update_heartbeat,
@@ -1397,7 +1398,12 @@ class ProjectChatHandler(
         )
         try:
             previous_id = req.heartbeat_message_id
-            message_id = await req.status_callback(text, req.heartbeat_message_id)
+            # An accepted Telegram send must finish handing back its ID even
+            # when this request is cancelled. Publish ownership before passing
+            # cancellation on to finalization, which deletes that exact ID.
+            message_id, cancelled = await await_heartbeat_update(
+                req.status_callback(text, req.heartbeat_message_id)
+            )
             req.heartbeat_message_id = message_id
             req.heartbeat_last_update_at = now
             # Register the projection in the task ledger so a terminal
@@ -1408,6 +1414,8 @@ class ProjectChatHandler(
                     # Offload the (now fsync-backed) ledger write off the event
                     # loop so a heartbeat-path mutation never stalls delivery.
                     await self._run_ledger_write(led.set_status_message, req.task_id, message_id)
+            if cancelled:
+                raise asyncio.CancelledError
         except Exception as e:
             logger.warning(
                 "Heartbeat update failed for user %s chat %s: %s",

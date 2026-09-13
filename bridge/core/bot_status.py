@@ -32,7 +32,6 @@ class BotStatusMixin:
         """Build a fail-open replace/delete callback for task heartbeat messages."""
         store_path = self._heartbeat_store_path()
 
-        pending_delete: Optional[int] = None
         current_id: Optional[int] = None
         lock = asyncio.Lock()
 
@@ -46,16 +45,11 @@ class BotStatusMixin:
                 discard_heartbeat(store_path, chat_id, message_id)
 
         async def status_callback(text: Optional[str], message_id: Optional[int] = None) -> Optional[int]:
-            nonlocal pending_delete, current_id
+            nonlocal current_id
             async with lock:
                 message_id = current_id if current_id is not None else message_id
                 current_id = message_id
                 try:
-                    # Retry one stale predecessor before sending another status.
-                    # A Telegram delete failure must not grow a trail of messages.
-                    if pending_delete is not None:
-                        await delete_status(pending_delete)
-                        pending_delete = None
                     if text is None:
                         if message_id is not None:
                             if getattr(self._config, "heartbeat_delete_on_done", True):
@@ -64,9 +58,12 @@ class BotStatusMixin:
                                 discard_heartbeat(store_path, chat_id, message_id)
                         current_id = None
                         return None
-                    # Editing cannot move a Telegram message to the bottom. Send
-                    # its replacement silently before deleting the old status so
-                    # a failed send leaves the existing heartbeat visible.
+                    # Confirm deletion before replacement: the ledger owns one
+                    # status ID, including when cleanup needs a terminal retry.
+                    if message_id is not None:
+                        await delete_status(message_id)
+                        current_id = message_id = None
+                    # Telegram edits cannot move a status to the chat bottom.
                     sent = await bot.send_message(
                         chat_id=chat_id, text=text, disable_notification=True,
                     )
@@ -75,11 +72,7 @@ class BotStatusMixin:
                         return message_id
                     if store_path is not None:
                         record_heartbeat(store_path, chat_id, value)
-                    pending_delete = message_id if message_id != value else None
                     current_id = message_id = value
-                    if pending_delete is not None:
-                        await delete_status(pending_delete)
-                        pending_delete = None
                     return message_id
                 except Exception as exc:
                     logger.warning("Heartbeat status callback failed: %s", type(exc).__name__)
