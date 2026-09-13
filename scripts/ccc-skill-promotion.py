@@ -2896,20 +2896,20 @@ def _revise_substitute_pick(
     the author (the revise is for their candidate) and the reviewer of record
     (the reviser must not work off their own findings — policies/REVIEW.md).
     Hash-of-key selection: re-runs pick the same worker, no operator whim."""
-    candidates: list[str] = []
-    seen: set[str] = set()
+    trusted = set(_keyring_worker_ids(config))
+    candidates: set[str] = set()
     pools = [_broker_online_worker_ids(config, secret)]
     pools.extend(_remote_online_worker_ids(config, rb) for rb in config.remote_brokers)
     for pool in pools:
         for worker in pool:
-            if worker in seen or worker in {node, reviewer}:
+            if worker not in trusted or worker in {node, reviewer}:
                 continue
-            seen.add(worker)
-            candidates.append(worker)
+            candidates.add(worker)
     if not candidates:
         return None
-    index = int(hashlib.sha256(candidate_key.encode()).hexdigest(), 16) % len(candidates)
-    return candidates[index]
+    ordered = sorted(candidates)
+    index = int(hashlib.sha256(candidate_key.encode()).hexdigest(), 16) % len(ordered)
+    return ordered[index]
 
 
 def _revise_substitute_for(
@@ -2928,7 +2928,11 @@ def _revise_substitute_for(
         item.get("kind") == "a2a-revise-dispatch"
         and item.get("node") == node
         and item.get("name") == name
-        and isinstance(item.get("substitute"), str)
+        # Dispatch records persist a boolean, not the result summary's worker
+        # string. A malformed explicit marker also withholds another attempt;
+        # legacy author-only rows without this field remain compatible.
+        and "substitute" in item
+        and item["substitute"] is not False
         for item in rows
     )
     if prior_substitute:
@@ -2970,14 +2974,17 @@ def _resolve_revise_target(
     except PromotionError as error:
         if error.code != "revise_author_offline":
             raise
-        import traceback
         try:
             substitute = _revise_substitute_for(
                 config, rows, node, name, reviewer, tree12, secret
             )
+        except PromotionError:
+            raise
         except Exception:
-            traceback.print_exc()
-            return {"outcome": "revise-skipped", "code": "revise_author_offline"}
+            # The caller converts this typed failure to a structured skip.
+            # Never return a dict where it expects a five-tuple, or print an
+            # exception that may include broker/keyring response content.
+            raise PromotionError("revise_substitute_unavailable") from None
         if substitute is None:
             raise
         revise_rb = _revise_broker_of_worker(config, substitute, secret)
