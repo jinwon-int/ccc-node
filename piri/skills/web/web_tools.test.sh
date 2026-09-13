@@ -46,7 +46,18 @@ class Blocked(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 class Firecrawl(BaseHTTPRequestHandler):
+    # Counts scrape/search POSTs so a test can prove a rejected URL never
+    # reached the provider (issue #1630).
+    calls = 0
+
+    def do_GET(self):
+        body = json.dumps({"calls": Firecrawl.calls}).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body))); self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
+        Firecrawl.calls += 1
         length = int(self.headers.get("Content-Length", "0"))
         request = json.loads(self.rfile.read(length) or b"{}")
         if self.path == "/v2/scrape":
@@ -156,12 +167,36 @@ FIRECRAWL_API_URL="http://127.0.0.1:1" python3 "$FETCH" "https://example.org/pag
 set -e
 ok "fetch does not fall back to a direct request when Firecrawl is down" '[ "$rc" = 69 ] && grep -q "Firecrawl request failed" "$TMP/err"'
 
-for unsafe in 'file:///etc/passwd' 'http://127.0.0.1/private' 'https://user:secret@example.org/'; do
+# Issue #1630: internal names used to sail past the URL check because only
+# `localhost` and IP literals were screened. Validation is offline, so none of
+# these may produce a provider call — the counter below proves it.
+fc_calls() {
+  python3 - "$firecrawl_port" <<'PY'
+import json, sys, urllib.request
+with urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/calls", timeout=5) as resp:
+    print(json.load(resp)["calls"])
+PY
+}
+calls_before="$(fc_calls)"
+for unsafe in 'file:///etc/passwd' 'http://127.0.0.1/private' 'https://user:secret@example.org/' \
+  'https://intranet/' 'http://wiki:8080/page' 'https://node.tailnet.ts.net/x' \
+  'https://box.internal/' 'https://printer.local/' 'https://gateway.home.arpa/' \
+  'http://100.64.1.2/' 'http://169.254.169.254/latest/meta-data/' \
+  'http://[::ffff:127.0.0.1]/' 'https://exa mple.org/' 'http://0x7f.1/' \
+  'https://example.org:abc/' 'not-a-url'; do
   set +e
   FIRECRAWL_API_URL="http://127.0.0.1:$firecrawl_port" python3 "$FETCH" "$unsafe" >/dev/null 2>"$TMP/err2"; rc=$?
   set -e
   ok "fetch rejects unsafe URL $unsafe" '[ "$rc" = 65 ]'
+  ok "rejection for $unsafe stays bounded and quotes no input" \
+    '[ "$(wc -c < "$TMP/err2")" -lt 200 ] && ! grep -q "secret" "$TMP/err2"'
 done
+calls_after="$(fc_calls)"
+ok "rejected URLs never reach the provider" '[ "$calls_before" = "$calls_after" ]'
+
+# Public hosts that merely look private must still route.
+out="$(FIRECRAWL_API_URL="http://127.0.0.1:$firecrawl_port" python3 "$FETCH" "https://local.example.com/page" 2>/dev/null)"
+ok "fetch still routes a public lookalike host" 'grep -q "https://local.example.com/page" <<<"$out"'
 
 # shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(FIRECRAWL_API_URL="http://127.0.0.1:$firecrawl_port" python3 "$DEVELOPER" "retry bug" --type issue --type pull_request --repo owner/repo 2>/dev/null)"

@@ -12,6 +12,13 @@ Environment:
 The requested page and Firecrawl response are UNTRUSTED web data. This helper
 never falls back to a direct URL fetch: fleet routing requires known-URL reads
 to go through Firecrawl. HTTP(S) URLs only; 60s request timeout.
+
+Target URLs are validated offline before any request is made, so a rejected URL
+(exit 65) never reaches the provider. The check is syntactic: it refuses
+non-public host *names* (bare single-label hosts, special-use/private-use
+suffixes) and non-globally-routable IP literals. It does NOT resolve DNS, so it
+is not protection against DNS rebinding or a public name that resolves to an
+internal address.
 """
 
 from __future__ import annotations
@@ -33,6 +40,40 @@ DEFAULT_API_URL = "https://api.firecrawl.dev"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 TIMEOUT = 60
 
+# Host syntax limits (RFC 1035/1123). Validation is bounded by these: a host is
+# at most 253 chars and 127 labels, so the suffix scan below is linear and tiny.
+MAX_HOST_CHARS = 253
+MAX_LABEL_CHARS = 63
+LABEL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
+
+# Trailing label groups that never designate a public host: RFC 6761/8375
+# special-use names, the ICANN private-use TLDs, mDNS, Tor, and Tailscale
+# MagicDNS. Matched on whole-label boundaries, so public lookalikes such as
+# `local.example.com`, `thelocal.se`, or `ts.net.example.com` are unaffected.
+PRIVATE_HOST_SUFFIXES = frozenset(
+    {
+        "arpa",  # covers home.arpa, in-addr.arpa, ip6.arpa
+        "corp",
+        "home",
+        "home.arpa",
+        "internal",
+        "intranet",
+        "invalid",
+        "lan",
+        "local",
+        "localdomain",
+        "localhost",
+        "onion",
+        "private",
+        "test",
+        "ts.net",
+    }
+)
+
+# NAT64 well-known prefix: 64:ff9b::/96 embeds an IPv4 address in its low 32
+# bits, so `[64:ff9b::7f00:1]` is really 127.0.0.1 wearing a v6 costume.
+NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+
 
 def _endpoint(path: str) -> str:
     base = (os.environ.get("FIRECRAWL_API_URL") or DEFAULT_API_URL).strip().rstrip("/")
@@ -41,23 +82,27 @@ def _endpoint(path: str) -> str:
     return base + "/v2" + path
 
 
-def _public_url(value: str) -> bool:
-    try:
-        parsed = urllib.parse.urlsplit(value)
-    except ValueError:
-        return False
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
-        return False
-    if parsed.username is not None or parsed.password is not None:
-        return False
-    host = parsed.hostname.rstrip(".").lower()
-    if host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost"):
-        return False
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return True
-    return not (
+def _embedded_ipv4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """Return the IPv4 address an IPv6 literal wraps, for the translation formats."""
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if ip.sixtofour is not None:
+        return ip.sixtofour
+    if ip in NAT64_PREFIX:
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
+def _public_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Globally routable IP literals only, after unwrapping v4-in-v6 formats."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        inner = _embedded_ipv4(ip)
+        if inner is not None:
+            ip = inner
+    # is_global also rules out the carrier-grade NAT (100.64.0.0/10, where
+    # Tailscale nodes live), documentation, and benchmarking ranges that the
+    # individual category flags below miss.
+    return ip.is_global and not (
         ip.is_private
         or ip.is_loopback
         or ip.is_link_local
@@ -65,6 +110,81 @@ def _public_url(value: str) -> bool:
         or ip.is_reserved
         or ip.is_unspecified
     )
+
+
+def _valid_hostname(host: str) -> bool:
+    """RFC 1123 host syntax, bounded by the length limits above. No DNS lookup."""
+    if not host or len(host) > MAX_HOST_CHARS:
+        return False
+    labels = host.split(".")
+    for label in labels:
+        if not 1 <= len(label) <= MAX_LABEL_CHARS:
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+        if set(label) - LABEL_CHARS:
+            return False
+    tld = labels[-1]
+    # A public TLD is alphabetic or an A-label; an all-numeric final label means
+    # the host is an alternate-radix IP literal (`0x7f.1`), not a name.
+    return len(tld) >= 2 and (tld.isalpha() or tld.startswith("xn--"))
+
+
+def _private_namespace(host: str) -> bool:
+    """True when the name lives outside the public DNS namespace."""
+    labels = host.split(".")
+    # A bare single-label host (`intranet`, `router`) can only resolve through a
+    # local search domain, so it is never a public URL.
+    if len(labels) < 2:
+        return True
+    return any(".".join(labels[i:]) in PRIVATE_HOST_SUFFIXES for i in range(len(labels)))
+
+
+def _url_rejection(value: str) -> str | None:
+    """Return a fixed-vocabulary reason to refuse `value`, or None to allow it.
+
+    Reasons are constants, never derived from the input, so callers can print
+    one without echoing credentials or page content back into a log.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return "malformed-url"
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return "unsupported-scheme"
+    if parsed.username is not None or parsed.password is not None:
+        return "embedded-credentials"
+    try:
+        port = parsed.port
+    except ValueError:
+        return "invalid-port"
+    if port is not None and not 1 <= port <= 65535:
+        return "invalid-port"
+    if not parsed.hostname:
+        return "malformed-host"
+    host = parsed.hostname.lower()
+    if host.endswith("."):
+        host = host[:-1]  # one root dot only; `example.org..` stays malformed
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii").lower()
+        except (UnicodeError, ValueError):
+            return "malformed-host"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return None if _public_address(ip) else "non-public-address"
+    if not _valid_hostname(host):
+        return "malformed-host"
+    if _private_namespace(host):
+        return "non-public-host"
+    return None
+
+
+def _public_url(value: str) -> bool:
+    return _url_rejection(value) is None
 
 
 def _request(payload: dict[str, object]) -> dict[str, object] | None:
@@ -117,9 +237,14 @@ def main() -> int:
         print("usage: web_fetch.py <url> [--max-chars N]", file=sys.stderr)
         return 64
     url = args[0].strip()
-    if not _public_url(url):
+    # Validated before the request is built: a rejected URL never reaches the
+    # provider, and the reason is a constant so the URL (which may carry
+    # credentials) is never echoed.
+    reason = _url_rejection(url)
+    if reason is not None:
         print(
-            "web-fetch: only public http(s) URLs without embedded credentials are supported",
+            "web-fetch: only public http(s) URLs without embedded credentials are supported "
+            f"({reason})",
             file=sys.stderr,
         )
         return 65
