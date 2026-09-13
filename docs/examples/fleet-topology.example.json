@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "alias": "node-alpha",
+      "platform": "linux-systemd",
+      "roles": ["bridge-serving", "a2a-worker"],
+      "repoRoot": "/opt/ccc-node",
+      "endpoint": "https://node-alpha.tailnet-placeholder.invalid",
+      "keyRef": "worker:node-alpha:g1:v1",
+      "enabled": true
+    },
+    {
+      "alias": "node-beta",
+      "platform": "linux-systemd",
+      "roles": ["a2a-broker"],
+      "repoRoot": "/opt/ccc-node",
+      "enabled": true
+    },
+    {
+      "alias": "node-gamma",
+      "platform": "android-termux",
+      "roles": [],
+      "repoRoot": "/data/data/com.termux/files/home/ccc-node",
+      "enabled": false
+    }
+  ]
+}
