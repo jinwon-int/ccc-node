@@ -895,6 +895,105 @@ install_repo_files_into() { # install_repo_files_into <dest-dir> <manifest> <sou
     mv "$manifest.tmp" "$manifest"
   fi
 }
+# Piri's flat extension set owns only files whose bytes match our previous
+# manifest. Same-name user files and locally edited copies are preserved.
+# Tests never ship. Retired/replaced managed bytes are archived outside the
+# extension loader's directory; this does not broaden the generic installer.
+extension_path_is_safe() { # Reject symlinks in every existing path component.
+  local probe="$1"
+  while [ -n "$probe" ] && [ "$probe" != / ] && [ "$probe" != . ]; do
+    [ ! -L "$probe" ] || return 1
+    case "$probe" in */*) probe="${probe%/*}" ;; *) probe=. ;; esac
+  done
+}
+install_repo_extensions_into() { # <dest-dir> <manifest> <source-dir>
+  ( # Scope the directory lock descriptor to this installation only.
+  local dest_dir="$1" manifest="$2" source_dir="$3"
+  local source name hash extra target current_hash source_hash tmp archive_dir="" path
+  local -A previous=() recorded=() shipped=()
+  for path in "$dest_dir" "$manifest" "$source_dir"; do
+    extension_path_is_safe "$path" || { note "refusing unsafe extension path"; return 1; }
+  done
+  [ "$DRY" = 1 ] || mkdir -p "${manifest%/*}" || return 1
+  if [ -d "${manifest%/*}" ]; then
+    local extension_lock_fd
+    exec {extension_lock_fd}<"${manifest%/*}" || return 1
+    flock -n "$extension_lock_fd" || { note "extension installation already running"; return 1; }
+  fi
+  [ ! -e "$manifest" ] || [ -f "$manifest" ] || return 1
+  # Validate the entire old manifest before any install/archive mutation.
+  if [ -f "$manifest" ]; then
+    while read -r name hash extra || [ -n "$name" ]; do
+      [ -n "$name" ] || continue
+      if ! [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\.ts$ ]] \
+        || [[ "$name" == *.test.ts ]] || ! [[ "$hash" =~ ^[a-f0-9]{64}$ ]] \
+        || [ -n "$extra" ] || [ -n "${previous[$name]:-}" ]; then
+        note "refusing invalid extension manifest"; return 1
+      fi
+      previous[$name]="$hash"
+      target="$dest_dir/$name"
+      extension_path_is_safe "$target" || { note "refusing unsafe extension target"; return 1; }
+      [ ! -e "$target" ] || [ -f "$target" ] || return 1
+    done < "$manifest"
+  fi
+  for source in "$source_dir"/*.ts; do
+    [ -e "$source" ] || [ -L "$source" ] || continue
+    name="${source##*/}"
+    case "$name" in *.test.ts) continue ;; esac
+    [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\.ts$ ]] || return 1
+    extension_path_is_safe "$source" && [ -f "$source" ] || return 1
+    target="$dest_dir/$name"
+    extension_path_is_safe "$target" || { note "refusing unsafe extension target"; return 1; }
+    [ ! -e "$target" ] || [ -f "$target" ] || return 1
+    shipped[$name]=1
+  done
+  # No predictable temp file: manifest replacement is atomic and owner-only.
+  if [ "$DRY" != 1 ]; then
+    mkdir -p "$dest_dir" "${manifest%/*}" || return 1
+    tmp="$(mktemp "${manifest%/*}/.repo-extensions.XXXXXX")" || return 1
+    chmod 600 "$tmp" || return 1
+  fi
+  for name in "${!shipped[@]}"; do
+    source="$source_dir/$name"; target="$dest_dir/$name"
+    source_hash="$(repo_file_hash "$source")"
+    hash="${previous[$name]:-}"
+    if [ -f "$target" ]; then
+      current_hash="$(repo_file_hash "$target")"
+      if [ -z "$hash" ] || [ "$current_hash" != "$hash" ]; then
+        note "kept user-owned or modified extension $name"
+        [ -z "$hash" ] || recorded[$name]="$hash"
+        continue
+      fi
+      if [ "$current_hash" != "$source_hash" ] && [ "$DRY" != 1 ]; then
+        [ -n "$archive_dir" ] || archive_dir="$(mktemp -d "${manifest%/*}/retired-extensions.XXXXXX")" || return 1
+        atomic_install "$target" "$archive_dir/$name" && chmod 600 "$archive_dir/$name" || return 1
+      fi
+    fi
+    run atomic_install "$source" "$target" || return 1
+    recorded[$name]="$source_hash"
+  done
+  for name in "${!previous[@]}"; do
+    [ -z "${shipped[$name]:-}" ] || continue
+    target="$dest_dir/$name"; hash="${previous[$name]}"
+    [ -f "$target" ] || continue
+    if [ "$(repo_file_hash "$target")" != "$hash" ]; then
+      note "kept modified repo-removed extension $name"
+      recorded[$name]="$hash"
+    elif [ "$DRY" != 1 ]; then
+      [ -n "$archive_dir" ] || archive_dir="$(mktemp -d "${manifest%/*}/retired-extensions.XXXXXX")" || return 1
+      mv "$target" "$archive_dir/$name" && chmod 600 "$archive_dir/$name" || return 1
+      note "archived repo-removed extension $name"
+    fi
+  done
+  if [ "$DRY" = 1 ]; then
+    note "repo extensions: would record the installed set in $manifest"
+    return 0
+  fi
+  for name in "${!recorded[@]}"; do printf '%s %s\n' "$name" "${recorded[$name]}"; done \
+    | LC_ALL=C sort > "$tmp"
+  mv -f "$tmp" "$manifest"
+  )
+}
 install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <source-root>...
   local dest_root="$1" manifest="$2"; shift 2
   local root source name target stage retired current_hash recorded_hash repo_hash
@@ -1090,6 +1189,7 @@ CLAUDE_SKILLS_KEPT_NODE_MODIFIED=(${SKILLS_KEPT_NODE_MODIFIED[@]+"${SKILLS_KEPT_
 # Piri agent dir, so non-Piri nodes stay untouched.
 PIRI_AGENT_DIR="${PIRI_CODING_AGENT_DIR:-$HOME/.piri/agent}"
 if [ -d "$PIRI_AGENT_DIR" ]; then
+  install_repo_extensions_into "$PIRI_AGENT_DIR/extensions" "$PIRI_AGENT_DIR/state/repo-extensions.manifest" "$SRC/piri/extensions"
   run mkdir -p "$PIRI_AGENT_DIR/skills" "$PIRI_AGENT_DIR/state"
   install_repo_skills_into "$PIRI_AGENT_DIR/skills" "$PIRI_AGENT_DIR/state/repo-skills.manifest" "$SRC/piri/skills"
 fi
