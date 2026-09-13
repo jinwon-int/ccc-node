@@ -316,6 +316,30 @@ ok "atomic staging leaves no hidden temp files behind" \
   '[ -z "$(find "$rewrite_claude" -name ".*.??????" 2>/dev/null)" ]'
 ok "setup installs the Piri web skill when a Piri agent dir exists" \
   '[ -f "$TMP/rewrite-home/.piri/agent/skills/web/SKILL.md" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_search.py" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_fetch.py" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_developer.py" ] && cmp -s "$ROOT/piri/skills/web/web_search.py" "$TMP/rewrite-home/.piri/agent/skills/web/web_search.py"'
+# --- #1692: the piri skill-usage extension installs beside the skills --------
+ok "setup installs the skill-usage extension into the Piri agent dir" \
+  '[ -f "$TMP/rewrite-home/.piri/agent/extensions/skill-usage.ts" ]'
+ok "installed extension is byte-identical to the repo source" \
+  'cmp -s "$ROOT/piri/extensions/skill-usage.ts" "$TMP/rewrite-home/.piri/agent/extensions/skill-usage.ts"'
+ok "setup records the installed extension in its manifest" \
+  'grep -q "^skill-usage.ts " "$TMP/rewrite-home/.piri/agent/state/repo-extensions.manifest"'
+ok "setup never ships extension test harnesses" \
+  '[ ! -e "$TMP/rewrite-home/.piri/agent/extensions/skill-usage.test.ts" ]'
+ok "setup without a Piri agent dir installs no extensions" '[ ! -e "$TMP/home/.piri" ]'
+# --- #1692: explicit Piri root and same-name user ownership ------------------
+ext_home="$TMP/ext-home"; ext_claude="$TMP/ext-claude"; ext_hermes="$TMP/ext-hermes"
+ext_agent="$TMP/custom piri agent"; ext_dir="$ext_agent/extensions"
+mkdir -p "$ext_dir" "$ext_agent/state" "$ext_claude" "$ext_hermes"
+printf 'user-owned bytes\n' > "$ext_dir/user-local.ts"
+printf 'node-modified bytes\n' > "$ext_dir/skill-usage.ts"
+out="$(HOME="$ext_home" PIRI_CODING_AGENT_DIR="$ext_agent" CCC_CLAUDE_DIR="$ext_claude" CCC_HERMES_DIR="$ext_hermes" bash "$SETUP" --no-backup 2>&1)"; rc=$?
+ok "setup honors explicit Piri root with spaces" '[ "$rc" = 0 ] && [ -f "$ext_agent/state/repo-extensions.manifest" ]'
+ok "setup keeps node-owned extensions untouched" \
+  '[ "$(cat "$ext_dir/user-local.ts")" = "user-owned bytes" ]'
+ok "setup preserves a same-name user extension without manifest ownership" \
+  '[ "$(cat "$ext_dir/skill-usage.ts")" = "node-modified bytes" ]'
+ok "setup never records unowned files in the extension manifest" \
+  '[ ! -s "$ext_agent/state/repo-extensions.manifest" ]'
 # Repo skills install as refreshed copies from the claude + shared trees, with
 # a manifest-driven prune for skills the repo no longer ships. Real dirs only
 # — the managed-artifact guard refuses symlinks by design (harness_paths.py).
@@ -382,6 +406,8 @@ unit_functions="$(sed -n \
   -e '/^repo_file_hash()/,/^}/p' \
   -e '/^manifest_entry_hash()/,/^}/p' \
   -e '/^install_repo_files_into()/,/^}/p' \
+  -e '/^extension_path_is_safe()/,/^}/p' \
+  -e '/^install_repo_extensions_into()/,/^}/p' \
   -e '/^install_repo_skills_into()/,/^}/p' \
   -e '/^refresh_skill_manifest_hashes()/,/^}/p' \
   "$SETUP")"
@@ -508,6 +534,84 @@ out="$(unit_run refresh-plain '
 ')"
 ok "unit: refresh re-records ordinary installed copies" \
   'grep -q "skill-a $(tree_hash_of "$TMP/unit/refresh-plain/skills/skill-a")" "$(unit_manifest refresh-plain)"'
+
+# --- #1692: bounded extension installer ownership and path guards ------------
+# These fixtures exercise extracted real setup functions without any service.
+out="$(unit_run extensions '
+  mkdir -p extensions repo-ext
+  printf "repo v1" > repo-ext/skill-usage.ts
+  printf "test only" > repo-ext/skill-usage.test.ts
+  install_repo_extensions_into extensions state/repo-extensions.manifest repo-ext || exit 1
+  cp state/repo-extensions.manifest initial.manifest
+  printf "repo v2" > repo-ext/skill-usage.ts
+  install_repo_extensions_into extensions state/repo-extensions.manifest repo-ext || exit 1
+  cmp repo-ext/skill-usage.ts extensions/skill-usage.ts || exit 1
+  printf "node edits" > extensions/skill-usage.ts
+  cp state/repo-extensions.manifest baseline.manifest
+  install_repo_extensions_into extensions state/repo-extensions.manifest repo-ext || exit 1
+')"; rc=$?
+ok "unit(extensions): fresh install and tracked exact-digest update succeed" '[ "$rc" = 0 ]'
+ok "unit(extensions): archives replaced bytes outside loader directory" \
+  '[ "$(cat "$TMP/unit/extensions/state/"retired-extensions.*/skill-usage.ts)" = "repo v1" ]'
+ok "unit(extensions): preserves local edits and prior ownership digest" \
+  '[ "$(cat "$TMP/unit/extensions/extensions/skill-usage.ts")" = "node edits" ] && cmp -s "$TMP/unit/extensions/baseline.manifest" "$TMP/unit/extensions/state/repo-extensions.manifest"'
+ok "unit(extensions): excludes tests and keeps manifest/archives owner-only" \
+  '[ ! -e "$TMP/unit/extensions/extensions/skill-usage.test.ts" ] && [ "$(stat -c %a "$TMP/unit/extensions/state/repo-extensions.manifest")" = 600 ] && [ "$(stat -c %a "$TMP/unit/extensions/state/"retired-extensions.*/skill-usage.ts)" = 600 ]'
+
+out="$(unit_run extensions-retire '
+  mkdir -p extensions repo-ext
+  printf "retire" > extensions/old.ts
+  printf "local edit" > extensions/edited.ts
+  printf "old.ts %s\nedited.ts %s\n" "$(repo_file_hash extensions/old.ts)" "$(printf baseline | sha256sum | cut -d " " -f1)" > state/repo-extensions.manifest
+  install_repo_extensions_into extensions state/repo-extensions.manifest repo-ext
+')"; rc=$?
+ok "unit(extensions): archives only unmodified retired files" \
+  '[ "$rc" = 0 ] && [ ! -e "$TMP/unit/extensions-retire/extensions/old.ts" ] && [ "$(cat "$TMP/unit/extensions-retire/state/"retired-extensions.*/old.ts)" = retire ] && [ "$(cat "$TMP/unit/extensions-retire/extensions/edited.ts")" = "local edit" ]'
+
+out="$(unit_run extensions-traversal '
+  mkdir -p extensions repo-ext
+  printf "outside" > outside.ts
+  printf "repo" > repo-ext/new.ts
+  printf "../outside.ts %s\n" "$(repo_file_hash outside.ts)" > state/repo-extensions.manifest
+  install_repo_extensions_into extensions state/repo-extensions.manifest repo-ext
+')"; rc=$?
+ok "unit(extensions): rejects traversal before writes or archive" \
+  '[ "$rc" != 0 ] && [ "$(cat "$TMP/unit/extensions-traversal/outside.ts")" = outside ] && [ ! -e "$TMP/unit/extensions-traversal/extensions/new.ts" ]'
+
+for ext_case in manifest target parent source; do
+  out="$(unit_run "extensions-link-$ext_case" '
+    mkdir -p extensions repo-ext elsewhere
+    printf "repo" > repo-ext/new.ts
+    printf "sentinel" > elsewhere/sentinel
+    case '"$ext_case"' in
+      manifest) ln -s ../elsewhere/sentinel state/repo-extensions.manifest ;;
+      target) ln -s ../elsewhere/sentinel extensions/new.ts ;;
+      parent) rmdir extensions; ln -s elsewhere extensions ;;
+      source) rm repo-ext/new.ts; ln -s ../elsewhere/sentinel repo-ext/new.ts ;;
+    esac
+    install_repo_extensions_into extensions state/repo-extensions.manifest repo-ext
+  ')"; rc=$?
+  ok "unit(extensions): rejects $ext_case symlink" '[ "$rc" != 0 ] && [ "$(cat "$TMP/unit/extensions-link-'"$ext_case"'/elsewhere/sentinel")" = sentinel ]'
+done
+
+out="$(unit_run extensions-dry '
+  run() { [ "$DRY" = 1 ] || "$@"; }
+  mkdir -p extensions repo-ext
+  printf "repo" > repo-ext/new.ts
+  DRY=1 install_repo_extensions_into extensions state/repo-extensions.manifest repo-ext
+')"; rc=$?
+ok "unit(extensions): dry-run creates no installed file or manifest" \
+  '[ "$rc" = 0 ] && [ ! -e "$TMP/unit/extensions-dry/extensions/new.ts" ] && [ ! -e "$TMP/unit/extensions-dry/state/repo-extensions.manifest" ]'
+
+out="$(unit_run extensions-locked '
+  mkdir -p extensions repo-ext
+  printf "repo" > repo-ext/new.ts
+  exec 8<state
+  flock -n 8 || exit 2
+  install_repo_extensions_into extensions state/repo-extensions.manifest repo-ext
+')"; rc=$?
+ok "unit(extensions): concurrent install fails before manifest mutation" \
+  '[ "$rc" != 0 ] && [ ! -e "$TMP/unit/extensions-locked/extensions/new.ts" ] && [ ! -e "$TMP/unit/extensions-locked/state/repo-extensions.manifest" ]'
 
 # --- #1480: flat command/output-style sets share the manifest discipline ----
 # install_repo_files_into: atomic per-file install, prune only what a previous
