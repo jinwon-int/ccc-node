@@ -110,6 +110,9 @@ class _DistillWikiSinkWorker(Protocol):
 
 
 class _SkillCandidateCollectorWorker(Protocol):
+    @property
+    def provider(self) -> str: ...
+
     def should_collect(self, *, job_id: str) -> bool: ...
 
     async def collect_once(
@@ -1892,7 +1895,7 @@ class BotLifecycleMixin:
                 continue
 
     async def _skill_candidate_collector_loop(self, stop_event: asyncio.Event) -> None:
-        """Stage Codex skill candidates from distill snapshots (#667, #749).
+        """Stage provider-bound skill candidates from distill snapshots (#667, #749).
 
         Read-only against the distill journal: it only reads jobs that already
         carry a snapshot and stages via the idempotent sink. Never mutates a
@@ -1901,6 +1904,7 @@ class BotLifecycleMixin:
         """
 
         worker = self._skill_candidate_collector_worker
+        collector_provider = worker.provider
         interval = float(
             getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
         )
@@ -1921,7 +1925,7 @@ class BotLifecycleMixin:
                         break
                     if getattr(job, "snapshot", None) is None:
                         continue
-                    if getattr(job, "provider", None) != "codex":
+                    if getattr(job, "provider", None) != collector_provider:
                         continue
                     if not await asyncio.to_thread(
                         worker.should_collect, job_id=job.job_id
