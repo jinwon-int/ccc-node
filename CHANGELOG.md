@@ -10,6 +10,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   choice application into a shared body so callback and typed inputs keep
   identical claim/guard/dispatch discipline; button mode stays the default.
 
+- Fix `approve-via-relay.sh` false failure (`exit 65`) on repos whose branch
+  protection requires zero approving reviews (#1714): `reviewDecision` reads
+  `null` there even after a successful approval, so post-approval verification
+  now judges the recorded exact-head approving review and fails only on an
+  explicit `CHANGES_REQUESTED`. The helper is also idempotent per actor and
+  exact head: a re-run reuses an already-recorded exact-head approving review
+  instead of stacking a duplicate approval. Regression suites cover
+  `reviewDecision: null` success, missing-review failure, re-run
+  idempotency, and `CHANGES_REQUESTED`.
 - Enable the merge queue on `main`: `merge_group` triggers for `ci.yml` and
   `codeql.yml` (required contexts re-report on the queue's
   `gh-readonly-queue/main/<pr>-<sha>` group refs), the `merge_queue` rule on

@@ -76,7 +76,12 @@ CCC_EXPLICIT_USER_APPROVAL=1 \
 The helper maps each profile to a fixed actor, opposite author, and gh config.
 It verifies the root-owned credential boundary, repository write permission,
 author separation, requested-reviewer state, exact head, mergeability, and
-green checks before submitting a commit-bound approval. Compatibility wrappers
+green checks before submitting a commit-bound approval. The helper is
+idempotent per actor and exact head: a re-run reuses an already-recorded
+exact-head approving review instead of posting a duplicate, and success is
+judged from that recorded review — `reviewDecision` reads `null` on repos
+whose branch protection requires zero approving reviews (#1714), so only an
+explicit `CHANGES_REQUESTED` fails verification. Compatibility wrappers
 `approve-via-seoseo-ai.sh` and `approve-via-jinon86.sh` select their named
 profiles but cannot override them.
 
