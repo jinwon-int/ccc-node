@@ -170,7 +170,11 @@ fresh explicit user approval in the current conversation, in both directions.
    by `seoseo-ai` with `jinon86` requested, the head matches `--expected-head`
    exactly, the PR is mergeable, and every reported check on that head is
    successful. The approval is commit-bound and the credential never leaves
-   the relay node.
+   the relay node. The helper is idempotent per actor and exact head: a re-run
+   reuses an already-recorded exact-head approving review instead of posting a
+   duplicate, and success is judged from that recorded review — `reviewDecision`
+   reads `null` on repos whose branch protection requires zero approving
+   reviews (#1714), so only an explicit `CHANGES_REQUESTED` fails verification.
 
 6. With required review and checks green, squash-merge normally (on
    `jinwon-int/ccc-node`, `main` runs a merge queue — see the merge-queue

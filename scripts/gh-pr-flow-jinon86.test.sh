@@ -57,11 +57,19 @@ elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" author,baseRefName,state,isDraft
       headRefOid:$head,mergeable:"MERGEABLE",
       reviewRequests:[{login:$reviewer}],
       statusCheckRollup:[{status:"COMPLETED",conclusion:$conclusion}]}'
+elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" headRefOid,reviews "* ]]; then
+  jq -n --arg head "${MOCK_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+    --argjson reviews "${MOCK_BEFORE_REVIEWS:-[]}" \
+    '{headRefOid:$head,reviews:$reviews}'
 elif [ "$1" = "api" ] && [ "$2" = "--method" ]; then
-  : >"$MOCK_REVIEW_MARKER"
+  printf '%s\n' "$*" >>"$MOCK_REVIEW_MARKER"
 elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" headRefOid,reviewDecision,reviews "* ]]; then
   jq -n --arg head "${MOCK_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
-    '{headRefOid:$head,reviewDecision:"APPROVED",reviews:[{author:{login:"jinon86"},state:"APPROVED",commit:{oid:$head}}]}'
+    --arg decision "${MOCK_AFTER_DECISION-APPROVED}" \
+    --argjson reviews "${MOCK_AFTER_REVIEWS:-null}" \
+    '{headRefOid:$head,
+      reviewDecision:(if $decision == "" then null else $decision end),
+      reviews:($reviews // [{author:{login:"jinon86"},state:"APPROVED",commit:{oid:$head}}])}'
 else
   printf 'unexpected gh call: %s\n' "$*" >&2
   exit 92
@@ -155,6 +163,53 @@ if run_wrapper >"$TMP/success.out" \
   ok
 else
   bad "jinon86 compatibility wrapper failed exact-head approval"
+fi
+
+#1714 regression: GitHub reports reviewDecision null when branch protection
+# requires zero approving reviews, yet the recorded exact-head review is real.
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_AFTER_DECISION= run_helper >"$TMP/null-decision.out" \
+   && jq -e '.ok == true and .approved == true and .already_approved == false' \
+     "$TMP/null-decision.out" >/dev/null \
+   && [ "$(wc -l <"$MOCK_REVIEW_MARKER")" -eq 1 ]; then
+  ok
+else
+  bad "approval with reviewDecision null and a recorded exact-head review failed"
+fi
+
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_AFTER_DECISION= MOCK_AFTER_REVIEWS='[]' \
+   run_helper >"$TMP/null-no-reviews.out" 2>&1; then
+  bad "helper passed without a recorded exact-head approving review"
+elif grep -Fq "exact-head approving review was not recorded" "$TMP/null-no-reviews.out" \
+   && [ "$(wc -l <"$MOCK_REVIEW_MARKER")" -eq 1 ]; then
+  ok
+else
+  bad "helper failed for the wrong reason without a recorded exact-head review"
+fi
+
+#1714 regression: a re-run must reuse the already-recorded exact-head approval
+# instead of stacking a duplicate approving review.
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_BEFORE_REVIEWS="[{\"author\":{\"login\":\"jinon86\"},\"state\":\"APPROVED\",\"commit\":{\"oid\":\"$HEAD_SHA\"}}]" \
+   run_helper >"$TMP/idempotent.out" \
+   && jq -e '.ok == true and .approved == true and .already_approved == true' \
+     "$TMP/idempotent.out" >/dev/null \
+   && [ ! -s "$MOCK_REVIEW_MARKER" ]; then
+  ok
+else
+  bad "re-run posted a duplicate approval for an already-approved exact head"
+fi
+
+# An explicit CHANGES_REQUESTED on the target still fails the verification.
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_AFTER_DECISION="CHANGES_REQUESTED" \
+   run_helper >"$TMP/changes-requested.out" 2>&1; then
+  bad "helper ignored CHANGES_REQUESTED on the review target"
+elif grep -Fq "changes requested on the review target" "$TMP/changes-requested.out"; then
+  ok
+else
+  bad "helper failed for the wrong reason on CHANGES_REQUESTED"
 fi
 
 rm -f "$MOCK_SSH_MARKER" "$MOCK_REVIEW_MARKER"

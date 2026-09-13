@@ -135,8 +135,21 @@ pr_json="$(review_gh pr view "$pr" --repo "$repo" \
   || { echo "ERROR: PR head changed" >&2; exit 65; }
 [ "$(jq -r '.mergeable' <<<"$pr_json")" = "MERGEABLE" ] \
   || { echo "ERROR: PR is not mergeable" >&2; exit 65; }
+# A previous run may have recorded this exact approval and then failed its own
+# verification (#1714), so detect it up front: the recorded review makes the
+# actor's absence from reviewRequests acceptable and the POST below idempotent.
+before="$(review_gh pr view "$pr" --repo "$repo" \
+  --json headRefOid,reviews)"
+[ "$(jq -r '.headRefOid | ascii_downcase' <<<"$before")" = "$expected_head" ] \
+  || { echo "ERROR: PR head changed" >&2; exit 65; }
+already="$(jq --arg actor "$actor" --arg head "$expected_head" \
+  '[.reviews[]? | select(
+    .author.login == $actor and .state == "APPROVED" and
+    (((.commit.oid // "") | ascii_downcase) == $head)
+  )] | length' <<<"$before")"
 [ "$(jq -r --arg actor "$actor" \
   '([.reviewRequests[].login] | index($actor)) != null' <<<"$pr_json")" = "true" ] \
+  || [ "$already" -gt 0 ] \
   || { echo "ERROR: review actor is not a requested reviewer" >&2; exit 65; }
 
 check_count="$(jq '.statusCheckRollup | length' <<<"$pr_json")"
@@ -162,18 +175,28 @@ if [ "$dry_run" -eq 1 ]; then
   exit 0
 fi
 
-review_gh api --method POST "repos/$repo/pulls/$pr/reviews" \
-  -f event=APPROVE \
-  -f "commit_id=$expected_head" \
-  -f "body=Approved after exact-head validation and fresh operator authorization using the relay-held $actor credential." \
-  >/dev/null
+# Idempotence (#1714): never stack a second approving review for the same
+# actor on the same exact head.
+if [ "$already" -eq 0 ]; then
+  review_gh api --method POST "repos/$repo/pulls/$pr/reviews" \
+    -f event=APPROVE \
+    -f "commit_id=$expected_head" \
+    -f "body=Approved after exact-head validation and fresh operator authorization using the relay-held $actor credential." \
+    >/dev/null
+fi
 
 after="$(review_gh pr view "$pr" --repo "$repo" \
   --json headRefOid,reviewDecision,reviews)"
 [ "$(jq -r '.headRefOid | ascii_downcase' <<<"$after")" = "$expected_head" ] \
   || { echo "ERROR: PR head changed during review" >&2; exit 65; }
-[ "$(jq -r '.reviewDecision' <<<"$after")" = "APPROVED" ] \
-  || { echo "ERROR: GitHub did not record an approving review" >&2; exit 65; }
+# reviewDecision is null on repos whose branch protection requires zero
+# approving reviews (#1714), so only an explicit rejection fails here; the
+# recorded exact-head approving review below is the authoritative evidence.
+decision="$(jq -r '.reviewDecision' <<<"$after")"
+if [ "$decision" = "CHANGES_REQUESTED" ]; then
+  echo "ERROR: GitHub reports changes requested on the review target" >&2
+  exit 65
+fi
 recorded="$(jq --arg actor "$actor" --arg head "$expected_head" \
   '[.reviews[]? | select(
     .author.login == $actor and .state == "APPROVED" and
@@ -185,5 +208,6 @@ recorded="$(jq --arg actor "$actor" --arg head "$expected_head" \
 jq -n --arg repo "$repo" --argjson pr "$pr" --arg actor "$actor" \
   --arg author "$expected_author" --arg head "$expected_head" \
   --arg base "$default_branch" --argjson checks "$check_count" \
-  '{ok:true,approved:true,repo:$repo,pr:$pr,actor:$actor,author:$author,head:$head,base:$base,check_count:$checks}'
+  --argjson already "$already" \
+  '{ok:true,approved:true,already_approved:($already > 0),repo:$repo,pr:$pr,actor:$actor,author:$author,head:$head,base:$base,check_count:$checks}'
 REMOTE
