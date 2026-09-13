@@ -1548,7 +1548,7 @@ class ProjectChatProcessMixin:
                     session_id=session.session_id if session is not None else session_id,
                 )
             finally:
-                if followup_authorized:
+                if followup_authorized and session is not None:
                     session.clear_task_followup_authorization()
                 if resume_authorized:
                     clear_resume = getattr(session, "clear_task_resume_authorization", None)
