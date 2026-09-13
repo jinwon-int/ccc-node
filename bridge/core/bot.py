@@ -950,6 +950,11 @@ class TelegramBot(
         chat = self._require_chat(update)
         app = self._require_application()
         conversation_key = self._conversation_key(user_id, chat.id)
+        # Text-mode Danso recovery (#1718): a bare 1/2/3 answers a pending
+        # recovery offer instead of starting a new turn. Runs before the
+        # normal flow clears danso_recovery_offer on any input.
+        if await self._maybe_answer_danso_recovery_text(update, user_id, text):
+            return
         busy_probe = getattr(self._project_chat, "busy_for_seconds", None)
         if bool(getattr(self._config, "busy_notice_enabled", True)) and callable(
             busy_probe

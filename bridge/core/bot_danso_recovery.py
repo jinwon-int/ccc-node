@@ -1,4 +1,5 @@
 """Conversation-bound, explicit recovery choices; startup never dispatches work."""
+# mypy: disable-error-code="attr-defined"
 from __future__ import annotations
 
 import asyncio
@@ -23,6 +24,14 @@ def keyboard(token):
         [InlineKeyboardButton('상태만 확인', callback_data=f'drecover:{token}:view')],
     ])
 
+# #1718: recovery 제안의 텍스트 모드 — 동일한 세 선택을 콜백 버튼 대신
+# 번호 입력으로 답한다. 옵트인: CCC_TELEGRAM_DANSO_RECOVERY_TEXT.
+RECOVERY_TEXT_MENU = (
+    '\n\n번호로 답해 주세요: 1) 이어서 진행  2) 새 작업 시작  3) 상태만 확인'
+    '\n(/task_recover 로 이 메뉴를 다시 볼 수 있습니다)'
+)
+RECOVERY_TEXT_ACTIONS = {'1': 'continue', '2': 'new', '3': 'view'}
+
 
 def binding(current):
     fields = {'provider', 'session_id', 'new_session', OFFER}
@@ -31,10 +40,12 @@ def binding(current):
 
 
 class DansoRecoveryMixin:
-    # mypy: disable-error-code="attr-defined"
     def _danso_recovery_enabled(self):
         return (self._active_provider() == 'danso'
                 and bool(getattr(self._config, 'danso_long_task_enabled', False)))
+
+    def _danso_recovery_text_mode(self):
+        return bool(getattr(self._config, 'danso_recovery_text_mode', False))
 
     def _danso_recovery_route(self, user_id, chat_id):
         audience = resolve_memory_audience(self._config, user_id=user_id, chat_id=chat_id)
@@ -89,8 +100,12 @@ class DansoRecoveryMixin:
         if not saved:
             return False
         try:
+            offer_text = snapshot.render()
+            if self._danso_recovery_text_mode():
+                offer_text += RECOVERY_TEXT_MENU
             await self._require_application().bot.send_message(
-                chat_id=chat_id, text=snapshot.render(), reply_markup=keyboard(token),
+                chat_id=chat_id, text=offer_text,
+                reply_markup=None if self._danso_recovery_text_mode() else keyboard(token),
             )
         except Exception as error:
             logger.warning('Danso recovery delivery failed: %s', type(error).__name__)
@@ -155,6 +170,53 @@ class DansoRecoveryMixin:
             return None
         return current, offer, snapshot
 
+    async def _apply_danso_recovery_choice(
+        self, key, user_id, chat_id, token, action, epoch, route, report,
+    ) -> None:
+        """버튼 콜백과 타이핑 답변(#1718)의 공용 본문.
+
+        ``report(text, keyboard_token=None)``으로 진행 상황을 전달한다 — 콜백
+        경로는 쿼리 편집, 텍스트 경로는 일반 답장. 클레임·가드·디스패치
+        규율은 두 입력 경로에서 동일하다.
+        """
+
+        async def run():
+            try:
+                found = await self._recovery_choice_snapshot(key, user_id, chat_id, token, epoch, route)
+            except Exception:
+                found = None
+            if found is None:
+                await report('작업 상태가 바뀌었거나 만료된 선택입니다. /task_recover 로 다시 확인해 주세요.')
+                return
+            current, offer, snapshot = found
+            if action == 'view':
+                await report(snapshot.render(), keyboard_token=token)
+                return
+            # Claim exactly once, only after queue admission and a fresh read.
+            claimed = await self._session_manager.patch_session_if(
+                key, **binding(current), remove_fields={OFFER},
+                guard=lambda: self._danso_recovery_guard(key, user_id, chat_id, epoch, route),
+            )
+            if not claimed:
+                await report('이미 처리했거나 만료된 선택입니다.')
+                return
+            if not self._danso_recovery_guard(key, user_id, chat_id, epoch, route):
+                return
+            if action == 'new':
+                changed = await self._start_new_after_recovery(key, user_id, chat_id, route, offer)
+                await report(
+                    '새 작업을 입력해 주세요. 이전 작업 기록은 보존했습니다.' if changed
+                    else '작업 상태가 바뀌었습니다. /task_recover 로 다시 확인해 주세요.')
+                return
+            await report('선택을 확인했습니다. 저장된 상태에 맞춰 이어서 진행합니다.')
+            if not self._danso_recovery_guard(key, user_id, chat_id, epoch, route):
+                return
+            await self._continue_danso_recovery(key, user_id, chat_id, epoch, route, current, snapshot)
+
+        async def overflow():
+            await report('다른 작업을 처리 중입니다. /task_recover 로 다시 확인해 주세요.')
+        await self._enqueue_user_task(key, run, overflow)
+
     async def _handle_danso_recovery(self, update, data):
         query = self._require_callback_query(update)
         parts = data.split(':')
@@ -165,42 +227,42 @@ class DansoRecoveryMixin:
         key = self._conversation_key(user_id, chat_id)
         epoch, route = self._task_resume_generation(key), self._danso_recovery_route(user_id, chat_id)
 
-        async def run():
-            try:
-                found = await self._recovery_choice_snapshot(key, user_id, chat_id, token, epoch, route)
-            except Exception:
-                found = None
-            if found is None:
-                await query.edit_message_text('작업 상태가 바뀌었거나 만료된 버튼입니다. /task_recover 로 다시 확인해 주세요.')
-                return
-            current, offer, snapshot = found
-            if action == 'view':
-                await query.edit_message_text(snapshot.render(), reply_markup=keyboard(token))
-                return
-            # Claim exactly once, only after queue admission and a fresh read.
-            claimed = await self._session_manager.patch_session_if(
-                key, **binding(current), remove_fields={OFFER},
-                guard=lambda: self._danso_recovery_guard(key, user_id, chat_id, epoch, route),
-            )
-            if not claimed:
-                await query.edit_message_text('이미 처리했거나 만료된 선택입니다.')
-                return
-            if not self._danso_recovery_guard(key, user_id, chat_id, epoch, route):
-                return
-            if action == 'new':
-                changed = await self._start_new_after_recovery(key, user_id, chat_id, route, offer)
-                await query.edit_message_text(
-                    '새 작업을 입력해 주세요. 이전 작업 기록은 보존했습니다.' if changed
-                    else '작업 상태가 바뀌었습니다. /task_recover 로 다시 확인해 주세요.')
-                return
-            await query.edit_message_text('선택을 확인했습니다. 저장된 상태에 맞춰 이어서 진행합니다.')
-            if not self._danso_recovery_guard(key, user_id, chat_id, epoch, route):
-                return
-            await self._continue_danso_recovery(key, user_id, chat_id, epoch, route, current, snapshot)
+        async def report(text, keyboard_token=None):
+            await query.edit_message_text(
+                text, reply_markup=keyboard(keyboard_token) if keyboard_token else None)
 
-        async def overflow():
-            await query.edit_message_text('다른 작업을 처리 중입니다. /task_recover 로 다시 확인해 주세요.')
-        await self._enqueue_user_task(key, run, overflow)
+        await self._apply_danso_recovery_choice(
+            key, user_id, chat_id, token, action, epoch, route, report)
+
+    async def _maybe_answer_danso_recovery_text(self, update, user_id, text) -> bool:
+        """텍스트 모드(#1718): 대기 중 제안에 1/2/3 한 글자로 답한다.
+
+        옵트인: CCC_TELEGRAM_DANSO_RECOVERY_TEXT. 선택 숫자가 아니면 False를
+        반환하고 본래대로 일반 턴으로 흘러간다 — 이때 제안 무효화 규칙도
+        기존과 동일하게 유지되므로 아무것도 암묵적으로 답하지 않는다.
+        접근 검사는 호출부(_process_user_message_text) 게이트에서 이미
+        통과했고, 선택 클레임은 스냅샷 가드가 사용자/채팅/라우트 결합을
+        다시 검증한다(버튼 경로와 동일).
+        """
+        if not self._danso_recovery_text_mode():
+            return False
+        action = RECOVERY_TEXT_ACTIONS.get((text or '').strip())
+        if action is None:
+            return False
+        chat_id = self._require_chat(update).id
+        key = self._conversation_key(user_id, chat_id)
+        current = await self._session_manager.get_session(key)
+        offer = current.get(OFFER)
+        if not isinstance(offer, dict) or not offer.get('token'):
+            return False
+        epoch, route = self._task_resume_generation(key), self._danso_recovery_route(user_id, chat_id)
+
+        async def report(text, keyboard_token=None):
+            await self._require_message(update).reply_text(text)
+
+        await self._apply_danso_recovery_choice(
+            key, user_id, chat_id, offer['token'], action, epoch, route, report)
+        return True
 
     async def _start_new_after_recovery(self, key, user_id, chat_id, route, offer):
         epoch = self._bump_task_resume_generation(key)
