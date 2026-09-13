@@ -48,9 +48,8 @@ class BotStatusMixin:
         async def status_callback(text: Optional[str], message_id: Optional[int] = None) -> Optional[int]:
             nonlocal pending_delete, current_id
             async with lock:
-                if current_id is None:
-                    current_id = message_id
-                message_id = current_id
+                message_id = current_id if current_id is not None else message_id
+                current_id = message_id
                 try:
                     # Retry one stale predecessor before sending another status.
                     # A Telegram delete failure must not grow a trail of messages.
