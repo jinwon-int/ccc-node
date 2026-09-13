@@ -1332,7 +1332,11 @@ def test_codex_composition_injects_runtime_without_replacing_sdk_factory(tmp_pat
         },
         bot_env_file=tmp_path / "missing.env",
     )
-    runtime = FakeRuntime()
+    class ObservedRuntime(FakeRuntime):
+        def set_resume_diagnostics_observer(self, observer):
+            self.resume_observer = observer
+
+    runtime = ObservedRuntime()
     sdk_factory = object()
 
     context = build_context(
@@ -1345,6 +1349,13 @@ def test_codex_composition_injects_runtime_without_replacing_sdk_factory(tmp_pat
     assert context.agent_runtime is runtime
     assert context.project_chat._agent_runtime is runtime
     assert context.sdk_factory is sdk_factory
+
+    runtime.resume_observer({
+        "mode": "lightweight", "last_turn_item_count": 2,
+        "observed_result_method": "thread/turns/list", "observed_result_json_bytes": None,
+    })
+    from telegram_bot.utils.health import health_reporter
+    assert health_reporter.snapshot()["codex_resume"]["last_turn_item_count"] == 2
 
 
 def test_codex_audience_composition_uses_the_keyring_runtime_pool(tmp_path: Path) -> None:

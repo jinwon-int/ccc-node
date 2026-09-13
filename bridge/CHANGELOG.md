@@ -1,5 +1,19 @@
 # Changelog
 
+- **Codex resume diagnostics and the revised long-thread policy (#1722
+  follow-up).** The existing bounded resume path now publishes body-free
+  metadata to `health.json → codex_resume` and `start.sh --status`: whether the
+  latest observation used the lightweight path or the compatibility fallback,
+  and the observed item count for the last turn only. Result size remains
+  explicitly unobserved: the transport exposes no response-size scalar, and
+  serializing even one turn could copy large tool bodies. Before any resume
+  observation the mode and item count are explicitly unknown/not observed. The policy
+  does not infer thread totals from the one-turn page, use rollout bytes as a
+  resume-cost threshold, scan transcripts, or trigger compaction, rotation, or
+  reset. Read-only measurement showed compaction does not shrink the full
+  resume frame; deployment and old-server rollout decisions remain operator
+  work.
+
 - **A dead Codex app-server transport heals itself (#1721).** After the
   reader loop or the process died, the client stayed pinned with a
   connection error and every later message failed in under a second while

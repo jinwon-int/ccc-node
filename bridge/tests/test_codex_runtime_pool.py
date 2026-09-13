@@ -30,9 +30,13 @@ class _Runtime:
         self.closed = False
         self.recycle_calls = 0
         self.listener = None
+        self.resume_observer = None
 
     def set_unowned_completion_listener(self, listener) -> None:
         self.listener = listener
+
+    def set_resume_diagnostics_observer(self, observer) -> None:
+        self.resume_observer = observer
 
     async def start_or_resume(self, request: SessionRequest) -> _Session:
         self.requests.append(request)
@@ -263,3 +267,29 @@ async def test_pool_fans_unowned_completion_listener_out_to_children() -> None:
     pool.set_unowned_completion_listener(None)
     assert created[0].listener is None
     assert created[1].listener is None
+
+
+@pytest.mark.anyio
+async def test_pool_resume_observer_reaches_existing_and_future_runtimes() -> None:
+    created: list[_Runtime] = []
+
+    def factory(environment: Mapping[str, str]) -> _Runtime:
+        runtime = _Runtime(environment)
+        created.append(runtime)
+        return runtime
+
+    pool = CodexRuntimePool(shared_environment=_environment("shared"), runtime_factory=factory)
+    await pool.start_or_resume(SessionRequest(
+        working_directory="/workspace", session_id="shared-thread", memory_environment=_environment("shared")
+    ))
+    observed = []
+    pool.set_resume_diagnostics_observer(observed.append)
+    await pool.start_or_resume(SessionRequest(
+        working_directory="/workspace", session_id="private-thread", memory_environment=_environment("private")
+    ))
+    for runtime in created:
+        runtime.resume_observer({"mode": "lightweight"})
+    assert observed == [{"mode": "lightweight"}, {"mode": "lightweight"}]
+    pool.set_resume_diagnostics_observer(None)
+    assert all(runtime.resume_observer is None for runtime in created)
+    await pool.close()

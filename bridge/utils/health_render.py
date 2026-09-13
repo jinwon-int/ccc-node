@@ -169,6 +169,49 @@ def _turn_occupancy_line(
     return _line("Turn occupancy", "occupied", "; ".join(details))
 
 
+def _codex_resume_line(data: dict, *, unavailable_detail: str | None = None) -> str:
+    """Render only scalar Codex resume metadata; never a thread size claim."""
+
+    if unavailable_detail is not None:
+        return _line("Codex resume", "unknown", unavailable_detail)
+
+    section = data.get("codex_resume")
+    if not isinstance(section, dict):
+        return _line("Codex resume", "unknown", "not observed")
+
+    mode = section.get("mode")
+    if not isinstance(mode, str) or mode not in {"lightweight", "compatibility_fallback"}:
+        return _line("Codex resume", "unknown", "not observed")
+
+    display_mode = mode.replace("_", "-")
+    details: list[str] = []
+    item_count = section.get("last_turn_item_count")
+    if (
+        isinstance(item_count, int)
+        and not isinstance(item_count, bool)
+        and item_count >= 0
+    ):
+        # This is deliberately "last-turn" rather than "thread" or "total":
+        # the lightweight page is bounded to one turn.
+        details.append(f"last-turn items observed={item_count}")
+    else:
+        details.append("last-turn items not observed")
+
+    method = section.get("observed_result_method")
+    result_bytes = section.get("observed_result_json_bytes")
+    if (
+        isinstance(method, str)
+        and method in {"thread/resume", "thread/turns/list"}
+        and isinstance(result_bytes, int)
+        and not isinstance(result_bytes, bool)
+        and result_bytes >= 0
+    ):
+        details.append(f"{method} result JSON={result_bytes} bytes")
+    else:
+        details.append("result JSON size not observed")
+    return _line("Codex resume", display_mode, "; ".join(details))
+
+
 _WAKEUP_SKIP_COUNTER_NAMES = (
     "skipped_active",
     "skipped_locked",
@@ -307,7 +350,7 @@ def render_status_lines(
     reference = now or datetime.now(timezone.utc)
 
     if not health_path.exists():
-        return [
+        lines = [
             "🟡 Bot status: degraded",
             _line("Process", "alive", f"PID: {pid}"),
             _line("Service", "degraded", "health missing"),
@@ -316,11 +359,14 @@ def render_status_lines(
             _line("Telegram", "degraded", "health missing"),
             _line(configured_label, "degraded", "health missing"),
         ]
+        if str(configured_provider).strip().lower() == "codex":
+            lines.append(_codex_resume_line({}, unavailable_detail="health missing"))
+        return lines
 
     try:
         data = json.loads(health_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        return [
+        lines = [
             "🟡 Bot status: degraded",
             _line("Process", "alive", f"PID: {pid}"),
             _line("Service", "degraded", f"invalid health file: {exc}"),
@@ -329,6 +375,9 @@ def render_status_lines(
             _line("Telegram", "degraded", "health unreadable"),
             _line(configured_label, "degraded", "health unreadable"),
         ]
+        if str(configured_provider).strip().lower() == "codex":
+            lines.append(_codex_resume_line({}, unavailable_detail="health unreadable"))
+        return lines
 
     updated_at = _parse_iso(data.get("updated_at"))
     age_seconds = None
@@ -345,7 +394,7 @@ def render_status_lines(
         detail = "health stale"
         if age_seconds is not None:
             detail = f"health stale: last update {_format_age(age_seconds)} ago"
-        return [
+        lines = [
             "🟡 Bot status: degraded",
             _line("Process", "alive", f"PID: {pid}"),
             _line("Service", "degraded", detail),
@@ -354,6 +403,9 @@ def render_status_lines(
             _line("Telegram", "degraded", detail),
             _line(agent_label, "degraded", detail),
         ]
+        if provider == "codex":
+            lines.append(_codex_resume_line({}, unavailable_detail=detail))
+        return lines
 
     service_state = service.get("state") or "degraded"
     service_reason = service.get("reason") or ""
@@ -362,7 +414,7 @@ def render_status_lines(
     agent_state = agent.get("state") or "degraded"
     agent_reason = agent.get("last_error") or ""
 
-    return [
+    lines = [
         f"{_ICONS.get(service_state, '🟡')} Bot status: {service_state}",
         _line("Process", "alive", f"PID: {pid}"),
         _line("Service", service_state, service_reason),
@@ -387,6 +439,9 @@ def render_status_lines(
             agent_reason if agent_state != "healthy" else "",
         ),
     ]
+    if provider == "codex":
+        lines.append(_codex_resume_line(data))
+    return lines
 
 
 def main(argv: List[str]) -> int:
