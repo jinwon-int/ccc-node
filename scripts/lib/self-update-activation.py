@@ -128,8 +128,7 @@ def write(fd, target, previous, outcome, services, snapshot):
     )
     if old and old["target_sha"] == target and old["outcome"] != "activated":
         previous = old["previous_sha"]
-        if not snapshot:
-            snapshot = old["snapshot"]
+        snapshot = old["snapshot"]
     service_rows = json.loads(services)
     if not isinstance(service_rows, list):
         raise ValueError("invalid-services")
