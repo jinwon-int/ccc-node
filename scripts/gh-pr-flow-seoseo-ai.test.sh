@@ -178,7 +178,7 @@ fi
 #1714 regression: GitHub reports reviewDecision null when branch protection
 # requires zero approving reviews, yet the recorded exact-head review is real.
 rm -f "$MOCK_REVIEW_MARKER"
-if MOCK_AFTER_DECISION= run_helper >"$TMP/null-decision.out" \
+if MOCK_AFTER_DECISION="" run_helper >"$TMP/null-decision.out" \
    && jq -e '.ok == true and .approved == true and .already_approved == false' \
      "$TMP/null-decision.out" >/dev/null \
    && [ "$(wc -l <"$MOCK_REVIEW_MARKER")" -eq 1 ]; then
@@ -188,7 +188,7 @@ else
 fi
 
 rm -f "$MOCK_REVIEW_MARKER"
-if MOCK_AFTER_DECISION= MOCK_AFTER_REVIEWS='[]' \
+if MOCK_AFTER_DECISION="" MOCK_AFTER_REVIEWS='[]' \
    run_helper >"$TMP/null-no-reviews.out" 2>&1; then
   bad "helper passed without a recorded exact-head approving review"
 elif grep -Fq "exact-head approving review was not recorded" "$TMP/null-no-reviews.out" \
