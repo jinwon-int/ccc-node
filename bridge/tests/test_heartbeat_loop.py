@@ -223,6 +223,69 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(live_ids, set())
             self.assertEqual(drain_heartbeats(store_path_for(Path(directory))), [])
 
+    async def test_cancelled_ledger_projection_drains_before_failed_terminal_cleanup(self):
+        """A repeated cancel cannot leave terminal retry cleanup on the old ID."""
+        with tempfile.TemporaryDirectory() as directory:
+            project_chat.config.bot_data_dir = Path(directory)
+            self.addCleanup(delattr, project_chat.config, "bot_data_dir")
+            self.handler._task_ledger_cache = None
+            ledger = self.handler._task_ledger
+
+            req = self._make_request()
+            req.task_id = await self.handler._ledger_create(1, 2)
+            req.heartbeat_message_id = 10
+            ledger.set_status_message(req.task_id, 10)
+
+            terminal_delete_failed = True
+
+            async def status_callback(text, message_id=None):
+                if text is None:
+                    return message_id if terminal_delete_failed else None
+                return 11
+
+            req.status_callback = status_callback
+
+            entered = threading.Event()
+            release = threading.Event()
+            write_finished = threading.Event()
+            original_set_status_message = ledger.set_status_message
+
+            def delayed_set_status_message(task_id, message_id):
+                entered.set()
+                release.wait(timeout=5)
+                try:
+                    return original_set_status_message(task_id, message_id)
+                finally:
+                    write_finished.set()
+
+            ledger.set_status_message = delayed_set_status_message
+            task = asyncio.create_task(
+                self.handler._maybe_update_heartbeat(req, req.started_at + 10)
+            )
+            await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), timeout=1)
+
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()  # Repeated cancellation must not abandon the projection.
+            await asyncio.sleep(0)
+            stayed_inflight = not task.done()
+
+            release.set()
+            await asyncio.wait_for(asyncio.to_thread(write_finished.wait, 1), timeout=1)
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+
+            self.assertTrue(stayed_inflight)
+            self.assertEqual(req.heartbeat_message_id, 11)
+            self.assertEqual(ledger.records()[0]["status_message_id"], 11)
+
+            cleaned = await self.handler._cleanup_heartbeat(req)
+            self.assertFalse(cleaned)
+            await self.handler._ledger_finish(req, "completed", cleanup_done=cleaned)
+            ops = ledger.pending_terminal_ops()
+            self.assertEqual(len(ops), 1)
+            self.assertEqual(ops[0][1]["message_id"], 11)
+
     async def test_does_not_send_when_disabled(self):
         project_chat.config.heartbeat_enabled = False
         self.addCleanup(setattr, project_chat.config, "heartbeat_enabled", True)

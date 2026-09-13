@@ -1413,7 +1413,14 @@ class ProjectChatHandler(
                 if led and req.task_id:
                     # Offload the (now fsync-backed) ledger write off the event
                     # loop so a heartbeat-path mutation never stalls delivery.
-                    await self._run_ledger_write(led.set_status_message, req.task_id, message_id)
+                    # The projection owns the same message ID as the callback;
+                    # drain it before propagating cancellation as well. A
+                    # repeated cancel must not leave the ledger pointing at
+                    # the deleted predecessor.
+                    _, projection_cancelled = await await_heartbeat_update(
+                        self._run_ledger_write(led.set_status_message, req.task_id, message_id)
+                    )
+                    cancelled = cancelled or projection_cancelled
             if cancelled:
                 raise asyncio.CancelledError
         except Exception as e:
