@@ -1,7 +1,8 @@
 # Initial fleet inventory contract v1 (part of #1451 P0)
 
-Status: **documentation, schema and placeholder example only.** This change
-adds no reader, writer, installer, CLI argument, enforcement, or runtime wiring.
+Status: **documentation, schema, placeholder example and an offline read-only
+validator library.** There is still no writer, installer, CLI argument,
+enforcement, or runtime wiring, and no consumer has been selected or migrated.
 Existing node-local configuration has not been inventoried by this source-only
 change. This covers only the initial inventory portion of P0. Full P0 remains
 unchecked because relay, team, wiki and keyring-source routing are not modeled.
@@ -12,6 +13,8 @@ P1–P4 remain open; this contract does not establish deployment readiness.
 | Contract | `docs/fleet-topology-contract.md` |
 | JSON Schema | `schemas/fleet-topology.v1.schema.json` |
 | Synthetic example | `docs/examples/fleet-topology.example.json` |
+| Offline validator library | `scripts/ccc_fleet_topology.py` |
+| Validator fixtures | `scripts/ccc_fleet_topology_test.py` |
 
 ## Scope and format
 
@@ -31,8 +34,14 @@ JSON contracts. No parser dependency is added here.
 
 `bridge/core/prestop_json.py` supplies a useful bounded-syntax precedent and
 `scripts/agent_cron_schema.py` a schema-validation precedent. Neither is a
-topology reader. Reuse must be assessed with the first real consumer rather
-than claiming production validation exists now.
+topology reader, and neither is imported by `scripts/ccc_fleet_topology.py`:
+their *shapes* are followed so the validator stays stdlib-only and free of
+bridge packaging. `read_owner_only_bytes` in `bridge/utils/secure_fs.py` was
+assessed and rejected for this use — it resolves the whole path through the
+kernel, so intermediate symlinks and unsafe parent modes are never inspected,
+it defaults ownership to the effective uid, and it opens without `O_NONBLOCK`,
+so a FIFO in the descriptor's place would block. Reuse must be re-assessed with
+the first real consumer rather than claiming production validation exists now.
 
 Unknown keys are rejected at every object level with `additionalProperties:
 false`; platform and role values are closed enums. A consumer implements an
@@ -128,9 +137,11 @@ specify a protected absolute config root and app principal before that consumer
 can migrate. Supporting `android-termux` in inventory does not solve that
 provisioning gate; do not silently substitute a writable checkout or `$HOME`.
 
-## Required future read validation
+## Required read validation
 
-These requirements are contract obligations, **not implemented enforcement**.
+These requirements are contract obligations. `scripts/ccc_fleet_topology.py`
+implements all four layers as an offline library, but **no consumer calls it**,
+so nothing here is enforced at runtime yet.
 
 | Layer | Requirement |
 |---|---|
@@ -145,6 +156,53 @@ These requirements are contract obligations, **not implemented enforcement**.
 JSON Schema treats `1.0` as numerically equal to `1`; the separate syntax layer
 must reject that lexical form. Likewise duplicate keys disappear in ordinary
 JSON parsing and cannot be detected afterward by a schema validator.
+
+## The offline validator library
+
+`scripts/ccc_fleet_topology.py` is an importable stdlib-only module. It is
+deliberately **not** an installed CLI: there is no `__main__` block, no
+argument parser, no `setup.sh` manifest entry and no helper package. A
+repository-only offline validator needs none of those, and adding them would
+imply a node-local install this slice has not reviewed. If a later slice ships
+this as an installed CLI, `setup.sh`, `scripts/setup.test.sh` and any real
+helper package must be added to the manifest in that same change.
+
+The module reads and validates; it never selects a path, writes, repairs,
+publishes, imports a keyring, calls a provider, or opens a connection. Path
+selection stays with the trusted launcher described above: the caller passes an
+already-open directory descriptor for a root it asserts is trusted, plus a
+relative path below it. The module validates every component under that root on
+its own descriptor and cannot establish the root's own ancestry — that
+obligation is the caller's, and it is why the test fixtures use a private
+owner-only root instead of a shared `/tmp` ancestry.
+
+| Entry point | What it establishes |
+|---|---|
+| `trusted_root(path)` / `read_descriptor(...)` | Metadata layer: descriptor-bound traversal, `O_NOFOLLOW` parents and final open, `O_NONBLOCK` so a FIFO or device cannot block, exact `0600` without special bits, trusted file/parent owners, no group/other-writable parent, 16,384-byte cap, unchanged metadata across the read. |
+| `decode_descriptor(payload)` | Syntax layer: bounded strict UTF-8 without BOM, one object root, no trailing data, no duplicate keys, no floats or `NaN`/`Infinity`, bounded int64 integers, depth at most 8, no unpaired surrogates. |
+| `validate_structural(payload)` | Syntax + schema structure + content-independent semantics (alias uniqueness, `keyRef` alias binding, real URL/IP/DNS/port parsing). Makes **no** operational claim: `Report.operational_ready` is always false. |
+| `validate_operational(payload, context)` | Everything above plus the caller-trusted rules. |
+| `require_modeled_capability(name)` | Refuses relay selection, team membership, wiki mapping, keyring location and broker election outright, so they cannot be inferred from roles or array order. |
+
+`OperationalContext` makes the external obligations explicit rather than
+assumed. It carries the consumer's already-trusted local identity, its explicit
+alias subset, its own endpoint/transport policy and a resolver backed by a
+separately trusted keyring. A selected node with an endpoint and no transport
+policy, or with a `keyRef` and no keyring resolver, is **refused** — a `keyRef`
+is a reference and can never authorize itself. Reserved example destinations,
+including the checked-in `.invalid` placeholder, are accepted structurally and
+rejected operationally, which is exactly the separation between the two modes.
+Any endpoint whose parse would silently normalize to a different destination is
+refused rather than rewritten.
+
+Public findings are a stable reason code plus a field location such as
+`nodes[2].endpoint`. They never contain an alias, endpoint, repository path or
+unknown key name; unknown keys are reported against their parent object only.
+
+The schema stays the structural source of truth. The module implements only the
+draft-2020-12 keyword subset that schema uses and raises
+`schema_unsupported_keyword` on anything else, so a schema revision cannot
+quietly widen what passes.
 
 ## Handling and failure behavior
 
@@ -183,18 +241,30 @@ check-jsonschema --schemafile schemas/fleet-topology.v1.schema.json docs/example
 ajv validate --spec=draft2020 -s schemas/fleet-topology.v1.schema.json -d docs/examples/fleet-topology.example.json
 ```
 
-No validator dependency or executable is added. A future consumer must ship a
-complete validator and fixtures for metadata, syntax, structure and semantics.
-Missing validator capability means incomplete validation and blocks migration.
-A path-based `stat`/`namei` inspection cannot establish race-safe opening.
+No validator dependency or executable is added; the module above is stdlib-only
+and is not installed. A path-based `stat`/`namei` inspection cannot establish
+race-safe opening, which is why the metadata layer exists at all.
 
-Structural fixtures should cover the example, unknown keys, wrong types/enums,
-unsafe aliases/paths, URL credentials/query/control characters, duplicate roles, and trailing
-newlines in every patterned field. Separate fixtures must cover duplicate
-aliases, key-reference mismatch, URL/IP/port parsing, consumer transport policy,
-absent local identity, reserved
-example endpoints, and syntax-only failures. Do not describe a structural pass
-as a complete configuration or deployment check.
+`scripts/ccc_fleet_topology_test.py` supplies the fixtures, collected by
+`scripts/validate-harness.sh`:
+
+```bash
+python3 scripts/ccc_fleet_topology_test.py
+```
+
+They cover the example, unknown keys, wrong types/enums, unsafe aliases/paths,
+URL credentials/query/control characters, duplicate roles and trailing newlines
+in every patterned field, plus duplicate aliases, key-reference mismatch,
+URL/IP/port parsing, consumer transport policy, absent local identity, reserved
+example endpoints, syntax-only failures, and the metadata cases —
+symlinked file and parent, FIFO/socket/device without blocking, unsafe parent
+ownership and modes, non-`0600` and special-bit files, and the byte cap. Do not
+describe a structural pass as a complete configuration or deployment check.
+
+A consumer migration still needs more than this library: a reviewed transport
+policy, an actual keyring authorization source, and the routing decisions this
+inventory version does not model. Missing any of those means incomplete
+validation and blocks migration, whatever the validator reports.
 
 ## Per-consumer migration (P1+, not performed)
 
