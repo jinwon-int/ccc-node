@@ -986,7 +986,7 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_list_is_bounded_and_read_exposes_only_visible_messages(self) -> None:
         from telegram_bot.core.agent_runtime import SessionHistoryMessage
         from telegram_bot.core.codex_app_server import (
-    CodexThread,
+            CodexThread,
             CodexThreadListPage,
             CodexThreadSummary,
         )
