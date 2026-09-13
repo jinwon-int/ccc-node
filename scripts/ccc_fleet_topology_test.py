@@ -26,7 +26,9 @@ import socket
 import stat
 import sys
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -825,6 +827,150 @@ class DiagnosticContentTests(unittest.TestCase):
             text = self._all_text(report)
             self.assertNotIn("sentinel-descriptor-name", text)
             self.assertNotIn(str(root), text)
+
+
+class RecoveredBoundaryRegressionTests(unittest.TestCase):
+    _context = OperationalTests._context
+    _codes = OperationalTests._codes
+
+    def test_alternate_numeric_hosts_never_reach_consumer_policy(self) -> None:
+        for host in ("0xc0000201", "0x7f000001", "0x7f.0.0.1", "127.0x0.0.1",
+                     "0300.0.2.1", "3221225985", "192.513", "0x100000000", "0x",
+                     "0x7f.0x.0.1", "%30xc0000201"):
+            with self.subTest(host=host):
+                calls = []
+                report = topology.validate_operational(
+                    _payload(_document(_node(endpoint="http://" + host))),
+                    self._context(endpoint_policy=lambda facts: calls.append(facts) or True),
+                )
+                self.assertFalse(report.operational_ready)
+                self.assertIsNone(report.document)
+                self.assertEqual(calls, [])
+
+    def test_ipv4_mapped_documentation_addresses_are_reserved(self) -> None:
+        for literal in ("::ffff:c000:201", "::ffff:c633:6401", "::ffff:cb00:7101"):
+            with self.subTest(literal=literal):
+                endpoint = "http://[" + literal + "]"
+                self.assertTrue(topology.parse_endpoint(endpoint).reserved_example)
+                self.assertEqual(
+                    self._codes(_document(_node(endpoint=endpoint))),
+                    ("operational_endpoint_reserved_example",),
+                )
+
+    def test_canonical_loopback_and_real_dns_still_reach_policy(self) -> None:
+        for endpoint, kind in (("http://127.0.0.1", "ipv4"), ("http://[::1]", "ipv6"),
+                               ("http://[::ffff:7f00:1]", "ipv6"),
+                               ("https://0xc0000201.service.internal", "dns")):
+            with self.subTest(endpoint=endpoint):
+                calls = []
+                report = topology.validate_operational(
+                    _payload(_document(_node(endpoint=endpoint))),
+                    self._context(endpoint_policy=lambda facts: calls.append(facts) or True),
+                )
+                self.assertTrue(report.operational_ready)
+                self.assertEqual([facts.host_kind for facts in calls], [kind])
+
+    def test_callback_exceptions_become_content_free_findings(self) -> None:
+        for callback, code, field in (
+            ("endpoint_policy", "operational_endpoint_policy_failed", "endpoint"),
+            ("keyring_resolver", "operational_keyring_resolver_failed", "keyRef"),
+        ):
+            for error_type in (RuntimeError, OSError, ValueError):
+                with self.subTest(callback=callback, error_type=error_type):
+                    def broken(value):
+                        raise error_type("synthetic-private-callback-data:" + str(value))
+
+                    report = topology.validate_operational(
+                        _payload(_document()), self._context(**{callback: broken})
+                    )
+                    self.assertEqual(report.codes(), (code,))
+                    self.assertEqual(report.findings[0].location, "nodes[0]." + field)
+                    self.assertFalse(report.operational_ready)
+                    self.assertIsNone(report.document)
+                    self.assertNotIn("synthetic-private-callback-data", repr(report))
+                    self.assertNotIn("worker:fixture-node", repr(report))
+
+    def test_callbacks_do_not_swallow_process_termination(self) -> None:
+        for callback in ("endpoint_policy", "keyring_resolver"):
+            for error_type in (KeyboardInterrupt, SystemExit):
+                with self.subTest(callback=callback, error_type=error_type):
+                    def interrupted(value):
+                        raise error_type()
+
+                    with self.assertRaises(error_type):
+                        topology.validate_operational(
+                            _payload(_document()), self._context(**{callback: interrupted})
+                        )
+
+    def test_link_added_during_descriptor_read_is_refused(self) -> None:
+        with _fixture_root() as root:
+            target = _write_descriptor(root)
+            real_read = os.read
+            linked = False
+
+            def link_during_read(fd, limit):
+                nonlocal linked
+                if not linked:
+                    os.link(target, root / "second.json")
+                    linked = True
+                return real_read(fd, limit)
+
+            with patch.object(topology.os, "read", side_effect=link_during_read):
+                self.assertEqual(_read_code(root, "topology.json"), "descriptor_changed")
+            self.assertEqual(target.stat().st_nlink, 2)
+
+    def test_same_size_changed_content_with_restored_mtime_is_refused(self) -> None:
+        with _fixture_root() as root:
+            target = _write_descriptor(root)
+            before = target.stat()
+            real_read = os.read
+            changed = False
+
+            def change_during_read(fd, limit):
+                nonlocal changed
+                if not changed:
+                    # Some fixture filesystems share a timestamp tick for
+                    # creation and an immediate edit. Cross that tick so this
+                    # counterexample isolates ctime from restored mtime.
+                    time.sleep(0.02)
+                    target.write_bytes(target.read_bytes().replace(b"fixture-node", b"changed-node"))
+                    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    changed = True
+                return real_read(fd, limit)
+
+            with patch.object(topology.os, "read", side_effect=change_during_read):
+                self.assertEqual(_read_code(root, "topology.json"), "descriptor_changed")
+            self.assertEqual(target.stat().st_size, before.st_size)
+            self.assertEqual(target.stat().st_mtime_ns, before.st_mtime_ns)
+
+    def test_descriptor_policy_cannot_relax_mode_or_cap_before_open(self) -> None:
+        for overrides in ({"required_mode": 0o644}, {"required_mode": 384.0},
+                          {"max_bytes": 16385}, {"max_bytes": 0}, {"max_bytes": -1},
+                          {"max_bytes": True}, {"max_bytes": 16384.0}):
+            with self.subTest(overrides=overrides), _fixture_root() as root:
+                target = _write_descriptor(root)
+                target.chmod(0o644)
+                with topology.trusted_root(root) as root_fd:
+                    with patch.object(topology.os, "open", side_effect=AssertionError(
+                        "opened before policy validation"
+                    )) as opened, patch.object(topology.os, "read", side_effect=AssertionError(
+                        "read before policy validation"
+                    )) as read:
+                        report = topology.read_and_validate_structural(
+                            root_fd, "topology.json", _trust(**overrides)
+                        )
+                    self.assertEqual(report.codes(), ("descriptor_trust_policy_invalid",))
+                    self.assertIsNone(report.document)
+                    opened.assert_not_called()
+                    read.assert_not_called()
+
+    def test_caller_can_only_tighten_descriptor_byte_cap(self) -> None:
+        with _fixture_root() as root:
+            _write_descriptor(root, body=b"x" * 32)
+            self.assertEqual(_read(root, "topology.json", _trust(max_bytes=32)), b"x" * 32)
+            self.assertEqual(
+                _read_code(root, "topology.json", _trust(max_bytes=31)), "descriptor_too_large"
+            )
 
 
 class BoundaryTests(unittest.TestCase):

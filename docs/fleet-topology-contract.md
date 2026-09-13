@@ -184,6 +184,15 @@ owner-only root instead of a shared `/tmp` ancestry.
 | `validate_operational(payload, context)` | Everything above plus the caller-trusted rules. |
 | `require_modeled_capability(name)` | Refuses relay selection, team membership, wiki mapping, keyring location and broker election outright, so they cannot be inferred from roles or array order. |
 
+`DescriptorTrust` configures trusted ownership principals, not a weaker file
+format. Its mode must be integer `0600`; its byte cap may only tighten the
+fixed limit to an integer in `1..16384`. Invalid values produce
+`descriptor_trust_policy_invalid` before descriptor traversal or reading.
+The metadata comparison includes link count and change time as well as
+modification time, checking the metadata changed by a new hard link or an
+edit whose modification time was restored. This is a metadata check, not an
+authenticated content snapshot or a lock on an external writer.
+
 `OperationalContext` makes the external obligations explicit rather than
 assumed. It carries the consumer's already-trusted local identity, its explicit
 alias subset, its own endpoint/transport policy and a resolver backed by a
@@ -194,10 +203,19 @@ including the checked-in `.invalid` placeholder, are accepted structurally and
 rejected operationally, which is exactly the separation between the two modes.
 Any endpoint whose parse would silently normalize to a different destination is
 refused rather than rewritten.
+Noncanonical numeric IPv4 forms (including hexadecimal or mixed-base
+components) are refused rather than presented as DNS to the policy callback.
+IPv4-mapped IPv6 addresses inherit reserved-example classification from their
+embedded IPv4 address. These checks do not replace consumer transport policy
+or forbid its explicitly permitted canonical loopback tunnels.
 
 Public findings are a stable reason code plus a field location such as
 `nodes[2].endpoint`. They never contain an alias, endpoint, repository path or
 unknown key name; unknown keys are reported against their parent object only.
+Ordinary exceptions from the endpoint-policy and keyring-resolver callbacks
+become `operational_endpoint_policy_failed` and
+`operational_keyring_resolver_failed` findings, without exception messages or
+a partially accepted document. Process-termination exceptions still propagate.
 
 The schema stays the structural source of truth. The module implements only the
 draft-2020-12 keyword subset that schema uses and raises

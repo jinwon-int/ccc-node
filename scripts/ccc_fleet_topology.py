@@ -101,6 +101,7 @@ _RESERVED_NETWORKS = (
 _COMPONENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
 _DNS_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 _IPV4_SHAPE_RE = re.compile(r"^[0-9.]+$")
+_NUMERIC_IP_COMPONENT_RE = re.compile(r"(?:0x[0-9a-f]*|[0-9]+)")
 _PORT_RE = re.compile(r"^[1-9][0-9]{0,4}$")
 
 
@@ -136,6 +137,10 @@ class DescriptorTrust:
     to every directory traversed *below* the caller-trusted root. The
     descriptor cannot declare its own trusted owners, so these come from the
     caller, never from the file.
+
+    ``max_bytes`` may tighten the fixed v1 limit, never exceed it.
+    ``required_mode`` must remain exactly 0600. Invalid policies fail before
+    descriptor traversal; these fields cannot relax the format's guarantees.
     """
 
     file_uids: frozenset[int]
@@ -254,6 +259,7 @@ def read_descriptor(root_fd: int, relative_path: str, trust: DescriptorTrust) ->
     unchanged across the read.
     """
 
+    _check_descriptor_trust(trust)
     _require_descriptor_platform()
     components = _relative_components(relative_path)
     parent_uids = trust.parents()
@@ -267,6 +273,16 @@ def read_descriptor(root_fd: int, relative_path: str, trust: DescriptorTrust) ->
     finally:
         for fd in reversed(open_fds):
             os.close(fd)
+
+
+def _check_descriptor_trust(trust: DescriptorTrust) -> None:
+    if (
+        type(trust.required_mode) is not int
+        or trust.required_mode != REQUIRED_FILE_MODE
+        or type(trust.max_bytes) is not int
+        or not 1 <= trust.max_bytes <= MAX_DESCRIPTOR_BYTES
+    ):
+        raise TopologyError(Finding("descriptor_trust_policy_invalid", "descriptor"))
 
 
 def _require_descriptor_platform() -> None:
@@ -354,6 +370,8 @@ def _stat_signature(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_gid,
         metadata.st_size,
         metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        metadata.st_nlink,
     )
 
 
@@ -724,25 +742,29 @@ def _parse_port(text: str) -> int:
     return port
 
 
+def _parse_ipv6_host(netloc: str) -> tuple[str, str, int | None]:
+    end = netloc.find("]")
+    if end < 0:
+        raise _endpoint_error("endpoint_bracket")
+    literal = netloc[1:end]
+    rest = netloc[end + 1 :]
+    try:
+        address = ipaddress.IPv6Address(literal)
+    except ValueError:
+        raise _endpoint_error("endpoint_ip_invalid") from None
+    if str(address) != literal:
+        raise _endpoint_error("endpoint_not_normalized")
+    port = None
+    if rest:
+        if not rest.startswith(":"):
+            raise _endpoint_error("endpoint_bracket")
+        port = _parse_port(rest[1:])
+    return literal, "ipv6", port
+
+
 def _parse_host(netloc: str) -> tuple[str, str, int | None]:
     if netloc.startswith("["):
-        end = netloc.find("]")
-        if end < 0:
-            raise _endpoint_error("endpoint_bracket")
-        literal = netloc[1:end]
-        rest = netloc[end + 1 :]
-        try:
-            address = ipaddress.IPv6Address(literal)
-        except ValueError:
-            raise _endpoint_error("endpoint_ip_invalid") from None
-        if str(address) != literal:
-            raise _endpoint_error("endpoint_not_normalized")
-        port = None
-        if rest:
-            if not rest.startswith(":"):
-                raise _endpoint_error("endpoint_bracket")
-            port = _parse_port(rest[1:])
-        return literal, "ipv6", port
+        return _parse_ipv6_host(netloc)
     if "[" in netloc or "]" in netloc:
         raise _endpoint_error("endpoint_bracket")
     host, separator, port_text = netloc.partition(":")
@@ -757,6 +779,12 @@ def _parse_host(netloc: str) -> tuple[str, str, int | None]:
         if str(address4) != host:
             raise _endpoint_error("endpoint_not_normalized")
         return host, "ipv4", port
+    # Resolver/URL stacks may interpret inet-style hexadecimal, octal or
+    # shortened integer components as IPv4. They must not enter consumer
+    # policy disguised as DNS. Canonical dotted decimal was handled above;
+    # refuse other all-numeric spellings without DNS or normalization.
+    if all(_NUMERIC_IP_COMPONENT_RE.fullmatch(label) for label in host.split(".")):
+        raise _endpoint_error("endpoint_ip_invalid")
     if len(host) > MAX_HOSTNAME_CHARS:
         raise _endpoint_error("endpoint_host_too_long")
     for label in host.split("."):
@@ -774,6 +802,8 @@ def _reserved_example(host: str, host_kind: str) -> bool:
             return True
         return ".".join(labels[-2:]) in _RESERVED_DOMAINS
     address = ipaddress.ip_address(host)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
     return any(address in network for network in _RESERVED_NETWORKS)
 
 
@@ -910,7 +940,13 @@ def _operational_endpoint(
         # The consumer's transport/trust policy is an external obligation this
         # validator cannot supply, so the operation is refused, not approved.
         return [Finding("operational_transport_policy_required", field)]
-    if context.endpoint_policy(facts) is not True:
+    try:
+        permitted = context.endpoint_policy(facts)
+    except Exception:
+        # Callbacks can fail with private endpoint/keyring details in their
+        # exceptions. Only content-free findings cross this public boundary.
+        return [Finding("operational_endpoint_policy_failed", field)]
+    if permitted is not True:
         return [Finding("operational_endpoint_policy_rejected", field)]
     return []
 
@@ -931,7 +967,11 @@ def _operational_key_ref(
         # authorization live in a separately trusted keyring, and the
         # descriptor can never authorize its own reference.
         return [Finding("operational_keyring_authorization_required", field)]
-    if context.keyring_resolver(key_ref) is not True:
+    try:
+        authorized = context.keyring_resolver(key_ref)
+    except Exception:
+        return [Finding("operational_keyring_resolver_failed", field)]
+    if authorized is not True:
         return [Finding("operational_key_reference_unauthorized", field)]
     return []
 
