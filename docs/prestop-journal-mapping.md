@@ -1,13 +1,18 @@
 # Pre-stop identity and journal mapping proposal (#1608)
 
 Status: source-only design draft, not an implemented or approved wire contract.
-Companions #1609 (in-memory admission), #1610 (durable contract) and #1611
-(peer/record policy) are unmerged proposals, not runtime dependencies. The
-bounded JSON helper from #1614 supplies bounded decoding and representation-profile
-validation only, not versioned schema validation, contextual validation,
-authentication or authority. This document
+Companions #1609 (in-process admission), #1610 (durable contract), #1611
+(peer/record policy) and #1614 (bounded JSON helper) are merged on main as
+source-only foundations. Their merges add no runtime durability, schema
+authority or authentication: the admission module remains in-process, the
+bounded JSON helper supplies bounded decoding and representation-profile
+validation only (not versioned schema validation, contextual validation,
+authentication or authority), and no peer/record writer, endpoint or
+lifecycle caller exists. This document
 adds no codec, store, controller, endpoint or production caller; no #1608
 acceptance criterion is completed. Existing lifecycle defaults stay unchanged.
+The proposed follow-up phase/cancellation graph is `docs/prestop-phase-model.md`;
+it is likewise unimplemented and unapproved for runtime use.
 
 ## Verified baseline and scope
 
@@ -94,7 +99,9 @@ or upgrade a mutable receipt into consumed evidence. Legacy records remain legac
 
 This table does not define an executable phase enum. A follow-up must specify the
 full allowed graph, exact role-specific records, cancellation acknowledgements,
-and lease release conditions together. Do not add arbitrary payload dictionaries
+and lease release conditions together; the `docs/prestop-phase-model.md`
+proposal is that follow-up at the design level only and remains under review.
+Do not add arbitrary payload dictionaries
 or a partially permissive codec while these are unresolved.
 
 ### Recovery and reopening review cases

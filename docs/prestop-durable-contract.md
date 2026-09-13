@@ -2,8 +2,10 @@
 
 Status: proposed integration contract, documentation only. No production wiring,
 receipt implementation, authentication, restart or rollout is supplied here.
-PR #1609's in-process admission foundation remains independently reviewable;
-its Python evidence is not durable authority. No #1608 acceptance box is closed
+PR #1609's in-process admission foundation is merged as source-only groundwork;
+its Python evidence is not durable authority. The proposed phase/cancellation
+graph extending the order below is `docs/prestop-phase-model.md`; it is likewise
+unimplemented and unapproved. No #1608 acceptance box is closed
 by this document. Existing lifecycle defaults remain unchanged.
 
 ## Source-pinned inventory
@@ -57,6 +59,9 @@ No endpoint may be enabled until these are specified and independently tested.
 
 Names here describe required semantics, not a new parallel recovery engine.
 Map them to the existing transition journal/lease before writing a controller.
+The `docs/prestop-phase-model.md` proposal refines this order with explicit
+cancellation, consume/reply and release-uncertainty states; it is equally
+unimplemented design.
 
 | Phase | Required action before advancing | Crash or ambiguous result |
 | --- | --- | --- |
