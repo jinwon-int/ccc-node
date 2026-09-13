@@ -59,7 +59,7 @@ from telegram_bot.core.continuation import ContinuationQueue, default_queue_path
 from telegram_bot.core.continuation_monitor import ContinuationMonitor
 from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
 from telegram_bot.core.webhook_nudge import build_from_env as build_webhook_nudge_server
-from telegram_bot.core.turn_watchdog import TurnAgeWatchdog
+from telegram_bot.core.turn_watchdog import DEFAULT_NOTIFY_MINUTES, TurnAgeWatchdog
 from telegram_bot.core.codex_app_server import live_app_server_clients
 from telegram_bot.core.turn_stall import StallProbeMonitor
 from telegram_bot.core.usage_meter import MODE_AUTONOMOUS
@@ -110,6 +110,9 @@ class _DistillWikiSinkWorker(Protocol):
 
 
 class _SkillCandidateCollectorWorker(Protocol):
+    @property
+    def provider(self) -> str: ...
+
     def should_collect(self, *, job_id: str) -> bool: ...
 
     async def collect_once(
@@ -1472,13 +1475,13 @@ class BotLifecycleMixin:
         )
 
     def _build_turn_age_watchdog(self):
-        """Notify-only turn-age dashboard (#1111); None when off (the default).
+        """Notify-only turn-age dashboard (#1111); None when explicitly off.
 
         Never interrupts, pauses, or reroutes a turn — pure visibility. Ages
         come from the session registry's monotonic ``started_at`` stamps.
         """
         threshold_min = ExternalWaitMonitor.env_int(
-            "CCC_TURN_AGE_NOTIFY_MIN", default=0
+            "CCC_TURN_AGE_NOTIFY_MIN", default=DEFAULT_NOTIFY_MINUTES
         )
         if threshold_min <= 0:
             logger.info("Turn-age watchdog disabled (CCC_TURN_AGE_NOTIFY_MIN=0)")
@@ -1892,7 +1895,7 @@ class BotLifecycleMixin:
                 continue
 
     async def _skill_candidate_collector_loop(self, stop_event: asyncio.Event) -> None:
-        """Stage Codex skill candidates from distill snapshots (#667, #749).
+        """Stage provider-bound skill candidates from distill snapshots (#667, #749).
 
         Read-only against the distill journal: it only reads jobs that already
         carry a snapshot and stages via the idempotent sink. Never mutates a
@@ -1901,6 +1904,7 @@ class BotLifecycleMixin:
         """
 
         worker = self._skill_candidate_collector_worker
+        collector_provider = worker.provider
         interval = float(
             getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
         )
@@ -1921,7 +1925,7 @@ class BotLifecycleMixin:
                         break
                     if getattr(job, "snapshot", None) is None:
                         continue
-                    if getattr(job, "provider", None) != "codex":
+                    if getattr(job, "provider", None) != collector_provider:
                         continue
                     if not await asyncio.to_thread(
                         worker.should_collect, job_id=job.job_id

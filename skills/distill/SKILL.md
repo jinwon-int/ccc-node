@@ -90,6 +90,12 @@ wc -l ~/.claude/state/wiki-candidates.md
         ~/.claude/state/distill.disabled.off-$(date -u +%Y%m%d%H%M%S) 2>&1
      ```
 
+   - **`compact`** — run the queue maintenance command shown before
+     **Procedure** and report its before/after sizes and summary. It rewrites
+     the queue, retaining the newest PENDING entry per `title_hash` bucket,
+     and refreshes `.seen`; it has no dry-run flag. Run it when the operator
+     requests compact or authorizes maintenance that includes compaction.
+
    - **(empty) / `manual`** — fire & wait:
      ```bash
      bash ~/.claude/hooks/distill.sh manual
@@ -117,8 +123,10 @@ wc -l ~/.claude/state/wiki-candidates.md
 - Noise controls (issue #298): wiki-candidates are extracted only when reusable + new + settled (exclusion list in the extract prompt), capped at `CCC_DISTILL_MAX_WIKI_CANDS` (default 3) per session by wiki-queue, and deduped by topic for `CCC_DISTILL_SEEN_TTL_DAYS` (default 7). `/distill compact` cleans pre-existing duplicate backlog.
 - All outputs carry provenance: `source_cwd`/`source_project` in `distill-last.json`, Honcho metadata, and wiki-candidates entries.
 - Re-enable by `mv`-ing `distill.disabled` / `distill.dryrun` to a timestamped archive name rather than deleting them, so the previous toggle state stays recoverable and the change is auditable. Choose `mv` for that reason — **not** to avoid the guard: if the guard blocks an action you believe is correct, stop and get approval instead of reaching for a verb it does not cover.
-- Manual fire from inside an active Claude Code session uses **this** session's transcript. If you want to distill some **other** session, set `CLAUDE_DISTILL_TRANSCRIPT=/path/to/other.jsonl` in env before firing.
-- All extract output is redacted before any external send. Even so, never paste raw secrets in the prompt that feeds the trans — the distiller will see them.
+- The foreground entry in `claude/hooks/distill.sh` reads `transcript_path` and cwd/workspace metadata from hook JSON on stdin. When the path is absent or is not a file, it looks for the newest `*.jsonl` in the current `PWD`'s encoded project directory under `CLAUDE_PROJECTS_DIR` (default `~/.claude/projects`). An ordinary manual invocation with empty stdin uses that fallback; no match logs `skip reason=no-transcript`.
+- Before foreground extraction is enqueued, `scope_allows_project` checks the selected transcript's parent-directory name and supplied or derived cwd against `CCC_DISTILL_SCOPE_CWDS` and the state directory's `distill.scope`. Any matching cwd, project name, or encoded scope path permits it; a nonempty scope with no match logs `skip reason=cwd-out-of-scope`. This is a metadata-based scope filter, not filesystem access control or proof of transcript ownership.
+- `CLAUDE_DISTILL_TRANSCRIPT` is exported after foreground selection for the detached pipeline; it is not a foreground selection override. The internal background re-entry consumes exported pipeline inputs and does not repeat foreground selection. Do not invoke that internal entry as a way to select another session or bypass the scope filter.
+- All extract output is redacted before any external send. Even so, never paste raw secrets into prompt content that feeds the transcript extraction — the distiller will see them.
 
 ## Re-verifying the pinned values
 
@@ -131,6 +139,8 @@ file can drift from them silently, so check rather than trust it (#1630):
 | `CCC_DISTILL_SEEN_TTL_DAYS` default 7 | `grep -rn 'CCC_DISTILL_SEEN_TTL_DAYS' claude/hooks/` |
 | `CCC_DISTILL_HOTNESS_THRESHOLD` default 3 | `grep -rn 'CCC_DISTILL_HOTNESS_THRESHOLD' claude/hooks/` |
 | `wiki-queue.sh --compact` exists | `grep -n -- '--compact' claude/hooks/distill/wiki-queue.sh` |
+| Foreground selection does not read `CLAUDE_DISTILL_TRANSCRIPT` | `grep -n 'CLAUDE_DISTILL_TRANSCRIPT' claude/hooks/distill.sh` — export after foreground selection; detached-pipeline input is separate |
+| Foreground scope check and rejection | `grep -n 'scope_allows_project\|cwd-out-of-scope' claude/hooks/distill.sh` |
 | `CLAUDE_DISTILL_TIMEOUT` | `grep -n 'CLAUDE_DISTILL_TIMEOUT' claude/hooks/distill/extract.sh` — the **default is 90**; the `240` named above is a suggested raise on timeout, not the default |
 
 If a check disagrees, the hook script is authoritative — fix this file.
