@@ -1,4 +1,4 @@
-"""Turn-age watchdog: notify-only, once + cooldown, off by default (#1111)."""
+"""Turn-age watchdog: notify-only, once + cooldown (#1111)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from telegram_bot.core.turn_watchdog import TurnAgeWatchdog, turn_age_text
+from telegram_bot.core.turn_watchdog import (
+    DEFAULT_NOTIFY_MINUTES,
+    TurnAgeWatchdog,
+    turn_age_text,
+)
 
 
 @pytest.fixture
@@ -27,18 +31,31 @@ class Clock:
 
 
 class Recorder:
-    def __init__(self) -> None:
+    def __init__(self, outcomes: list[bool] | None = None) -> None:
         self.notifications: list[tuple[int, str]] = []
+        self.outcomes = list(outcomes or ())
 
     async def notify(self, chat_id: int, text: str) -> bool:
         self.notifications.append((chat_id, text))
-        return True
+        return self.outcomes.pop(0) if self.outcomes else True
 
 
 def test_turn_age_text_is_informational_and_names_stop() -> None:
     text = turn_age_text(47)
     assert "47" in text and "/stop" in text
-    assert "No action needed" in text  # visibility, not an instruction
+    assert "does not establish progress" in text
+    assert "still working" not in text
+    assert "No action needed" not in text
+
+
+def test_watchdog_default_threshold_is_thirty_minutes() -> None:
+    watchdog = TurnAgeWatchdog(
+        turns_provider=lambda: [],
+        notifier=Recorder().notify,
+    )
+
+    assert DEFAULT_NOTIFY_MINUTES == 30
+    assert watchdog._threshold == DEFAULT_NOTIFY_MINUTES * 60.0
 
 
 @pytest.mark.anyio
@@ -104,6 +121,25 @@ async def test_renotify_after_the_cooldown() -> None:
 
 
 @pytest.mark.anyio
+async def test_delivery_failure_does_not_start_the_cooldown() -> None:
+    clock = Clock()
+    recorder = Recorder([False, True])
+    turns = [(7, 70, clock.now - 31 * 60)]
+    watchdog = TurnAgeWatchdog(
+        turns_provider=lambda: turns,
+        notifier=recorder.notify,
+        clock=clock,
+        threshold_seconds=30 * 60,
+        renotify_seconds=30 * 60,
+    )
+
+    await watchdog._tick()
+    await watchdog._tick()
+
+    assert len(recorder.notifications) == 2
+
+
+@pytest.mark.anyio
 async def test_under_threshold_turns_are_left_alone() -> None:
     clock = Clock()
     recorder = Recorder()
@@ -138,25 +174,95 @@ async def test_an_ended_turn_is_forgotten_so_the_next_one_notifies_fresh() -> No
 
     state["turns"] = []  # turn finished (or /stop) before the cooldown ends
     await watchdog._tick()
+    assert watchdog._last_notified == {}
 
     state["turns"] = [(7, 70, clock.now - 31 * 60)]  # a new long turn starts
     await watchdog._tick()
     assert len(recorder.notifications) == 2
 
 
+@pytest.mark.anyio
+async def test_replacement_turn_does_not_inherit_cooldown_without_empty_tick() -> None:
+    clock = Clock(start=1_000.0)
+    recorder = Recorder()
+    state = {"turns": [(7, 70, 940.0)]}
+    watchdog = TurnAgeWatchdog(
+        turns_provider=lambda: state["turns"],
+        notifier=recorder.notify,
+        clock=clock,
+        threshold_seconds=60.0,
+        renotify_seconds=600.0,
+    )
+
+    await watchdog._tick()  # old turn crosses the threshold at t=1000
+    state["turns"] = [(7, 70, 1_001.0)]  # replaced before the next tick
+    clock.advance(62.0)
+    await watchdog._tick()  # replacement is 61s old at t=1062
+
+    assert len(recorder.notifications) == 2
+    assert set(watchdog._last_notified) == {(7, 70, 1_001.0)}
+
+
+@pytest.mark.anyio
+async def test_conversation_cooldowns_are_independent() -> None:
+    clock = Clock()
+    recorder = Recorder()
+    turns = [
+        (7, 70, clock.now - 31 * 60),
+        (8, 80, clock.now - 31 * 60),
+    ]
+    watchdog = TurnAgeWatchdog(
+        turns_provider=lambda: turns,
+        notifier=recorder.notify,
+        clock=clock,
+        threshold_seconds=30 * 60,
+        renotify_seconds=30 * 60,
+    )
+
+    await watchdog._tick()
+    await watchdog._tick()
+
+    assert [chat_id for chat_id, _text in recorder.notifications] == [70, 80]
+
+
 # ---------------------------------------------------------------------------
-# Lifecycle wiring: default off, missing registry fails safe (#1111)
+# Lifecycle wiring: default, explicit off, missing registry fails safe (#1111)
 # ---------------------------------------------------------------------------
 
 
-def test_lifecycle_watchdog_is_none_when_the_threshold_is_off(tmp_path: Path) -> None:
+def test_lifecycle_watchdog_is_none_when_the_threshold_is_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from telegram_bot.core import bot_lifecycle
 
+    monkeypatch.setenv("CCC_TURN_AGE_NOTIFY_MIN", "0")
     lifecycle = bot_lifecycle.BotLifecycleMixin()
     lifecycle._config = SimpleNamespace(  # type: ignore[assignment]
         bot_data_dir=tmp_path, project_root=str(tmp_path)
     )
     assert lifecycle._build_turn_age_watchdog() is None
+
+
+def test_lifecycle_watchdog_defaults_to_thirty_minutes_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telegram_bot.core import agent_session_registry, bot_lifecycle
+
+    monkeypatch.delenv("CCC_TURN_AGE_NOTIFY_MIN", raising=False)
+    monkeypatch.delenv("CCC_TURN_AGE_RENOTIFY_MIN", raising=False)
+    lifecycle = bot_lifecycle.BotLifecycleMixin()
+    lifecycle._config = SimpleNamespace(  # type: ignore[assignment]
+        bot_data_dir=tmp_path, project_root=str(tmp_path)
+    )
+    lifecycle._project_chat = SimpleNamespace(  # type: ignore[assignment]
+        _agent_session_registry=agent_session_registry.AgentSessionRegistry()
+    )
+
+    watchdog = lifecycle._build_turn_age_watchdog()
+
+    assert watchdog is not None
+    assert watchdog._threshold == DEFAULT_NOTIFY_MINUTES * 60.0
+    assert watchdog._renotify == 30 * 60.0
 
 
 def test_lifecycle_watchdog_is_none_without_a_registry(
@@ -178,7 +284,7 @@ def test_lifecycle_watchdog_builds_with_registry_and_flag(
 ) -> None:
     from telegram_bot.core import agent_session_registry, bot_lifecycle
 
-    monkeypatch.setenv("CCC_TURN_AGE_NOTIFY_MIN", "30")
+    monkeypatch.setenv("CCC_TURN_AGE_NOTIFY_MIN", "45")
     lifecycle = bot_lifecycle.BotLifecycleMixin()
     lifecycle._config = SimpleNamespace(  # type: ignore[assignment]
         bot_data_dir=tmp_path, project_root=str(tmp_path)
@@ -186,7 +292,50 @@ def test_lifecycle_watchdog_builds_with_registry_and_flag(
     lifecycle._project_chat = SimpleNamespace(  # type: ignore[assignment]
         _agent_session_registry=agent_session_registry.AgentSessionRegistry()
     )
-    assert lifecycle._build_turn_age_watchdog() is not None
+    watchdog = lifecycle._build_turn_age_watchdog()
+    assert watchdog is not None
+    assert watchdog._threshold == 45 * 60.0
+
+
+@pytest.mark.anyio
+async def test_registry_watchdog_is_provider_neutral_and_never_sends_turn_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telegram_bot.core import agent_session_registry, bot_lifecycle
+
+    clock = Clock()
+    registry = agent_session_registry.AgentSessionRegistry()
+    for index, provider in enumerate(("piri", "codex", "other"), start=1):
+        registry.register_active(
+            (index, 100 + index),
+            SimpleNamespace(provider=provider, prompt="synthetic prompt"),
+            started_at=clock.now - 31 * 60,
+        )
+
+    monkeypatch.setenv("CCC_TURN_AGE_NOTIFY_MIN", "30")
+    lifecycle = bot_lifecycle.BotLifecycleMixin()
+    lifecycle._config = SimpleNamespace(  # type: ignore[assignment]
+        bot_data_dir=tmp_path, project_root=str(tmp_path)
+    )
+    lifecycle._project_chat = SimpleNamespace(  # type: ignore[assignment]
+        _agent_session_registry=registry
+    )
+    watchdog = lifecycle._build_turn_age_watchdog()
+    assert watchdog is not None
+    watchdog._clock = clock
+    recorder = Recorder()
+    watchdog._notifier = recorder.notify
+
+    await watchdog._tick()
+
+    assert [chat_id for chat_id, _text in recorder.notifications] == [101, 102, 103]
+    assert all(
+        "synthetic prompt" not in text for _chat_id, text in recorder.notifications
+    )
+    assert all(
+        "does not establish progress" in text
+        for _chat_id, text in recorder.notifications
+    )
 
 
 def test_registry_exposes_active_turn_ages() -> None:
