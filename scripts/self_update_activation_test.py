@@ -209,7 +209,23 @@ def test_current_bridge_producer_supplies_frozen_full_head(state, monkeypatch):
     assert runtime_generation.capture_runtime_generation()["source_git"]["head"] == "c" * 40
 
 
-def test_real_health_wire_reconciles_and_preserves_old_generation(state, monkeypatch):
+@pytest.fixture
+def isolated_bridge_env(state, monkeypatch):
+    # This scripts/ suite does not load bridge/tests/conftest.py. Supply the
+    # real Config's import-time inputs without inheriting live node settings
+    # or reading either a real project .env or the package fallback .env.
+    for name in tuple(os.environ):
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("PATH", os.defpath)
+    monkeypatch.setenv("HOME", str(state / "home"))
+    monkeypatch.setenv("PROJECT_ROOT", str(state / "project"))
+    monkeypatch.setenv("CCC_BOT_ENV_FILE", str(state / "absent-bot.env"))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:fixture-token-no-network")
+
+
+def test_real_health_wire_reconciles_and_preserves_old_generation(
+    state, monkeypatch, isolated_bridge_env
+):
     import json
     import subprocess
     import sys
