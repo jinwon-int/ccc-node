@@ -19,11 +19,13 @@ description: Register a durable bridge baton for the next authorized work bundle
    it):
 
    ```text
-   Finish the sample-repo docs sweep, bundle 2 of 2. Starting state:
+   Finish the authorized docs sweep in /work/sample-repo, bundle 2 of 2.
+   Starting state:
    bundle 1 fixed guides/*.md and appended "guides done" to
    docs/sweep-status.md; reference/*.md is untouched. Scope: fix broken
-   anchors and heading levels in reference/*.md only — no code,
-   dependency, or config changes. Completion condition: every
+   anchors and heading levels in reference/*.md, and append the completion
+   record to docs/sweep-status.md. No other files are in scope.
+   Completion condition: every
    reference/ page renders without anchor warnings,
    docs/sweep-status.md records "bundle 2 done", and the turn ends with
    a one-line summary.
