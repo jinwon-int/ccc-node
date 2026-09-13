@@ -252,7 +252,7 @@
       "name": "github-incident-recovery-merge-retry",
       "source": "skills/github-incident-recovery-merge-retry",
       "status": "active",
-      "tree_sha256": "fe7603346525d552d48cff35260ea8f7433bf570d8b4e77eff0159ba8b4c8af8"
+      "tree_sha256": "8ffd1cdfb305d4d7bb466893ca34989b60cd24b069f1e61656eb7582b82193dd"
     },
     {
       "audience": "claude",
@@ -263,7 +263,7 @@
       "name": "github-merge-state-conflict-diagnosis",
       "source": "skills/github-merge-state-conflict-diagnosis",
       "status": "active",
-      "tree_sha256": "a669be26699ff2d261e818a1643e92d8b40708c7afbfa46025528cc6f865ffc0"
+      "tree_sha256": "bb6cd8aae2ae710c24dabd201ae383b039a0b13988536450b1a209c3bb0c7765"
     },
     {
       "audience": "claude",
