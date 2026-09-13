@@ -177,6 +177,7 @@ with urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/calls", timeout=5) 
     print(json.load(resp)["calls"])
 PY
 }
+# shellcheck disable=SC2034  # Read via eval in ok() below.
 calls_before="$(fc_calls)"
 for unsafe in 'file:///etc/passwd' 'http://127.0.0.1/private' 'https://user:secret@example.org/' \
   'https://intranet/' 'http://wiki:8080/page' 'https://node.tailnet.ts.net/x' \
@@ -191,6 +192,7 @@ for unsafe in 'file:///etc/passwd' 'http://127.0.0.1/private' 'https://user:secr
   ok "rejection for $unsafe stays bounded and quotes no input" \
     '[ "$(wc -c < "$TMP/err2")" -lt 200 ] && ! grep -q "secret" "$TMP/err2"'
 done
+# shellcheck disable=SC2034  # Read via eval in ok() below.
 calls_after="$(fc_calls)"
 ok "rejected URLs never reach the provider" '[ "$calls_before" = "$calls_after" ]'
 
