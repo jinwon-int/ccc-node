@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/jinwon-int/ccc-node/schemas/fleet-topology.v1.schema.json",
-  "title": "ccc-node fleet topology descriptor v1",
-  "description": "Node-local declarative description of the fleet a consumer may address. Data only: never sourced, evaluated, or interpolated into a shell string. Carries no secrets and no key material; keyRef is a reference resolved against the fleet keyring. Unknown keys are rejected at every level. Contract: docs/fleet-topology-contract.md. No consumer reads this file yet.",
+  "title": "ccc-node initial fleet inventory descriptor v1 (part of #1451 P0)",
+  "description": "Initial node-local fleet inventory data contract, only part of #1451 P0. Never sourced, evaluated or interpolated into shell source. References no key material. Structural validation is insufficient: URL parsing and existing consumer transport/trust policies remain required. Relay/team/wiki/keyring-source routing remains undefined. No consumer reads this file yet.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -66,15 +66,15 @@
           },
           "endpoint": {
             "type": "string",
-            "pattern": "^https://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\\.[a-z]{2,63}(:[1-9][0-9]{0,4})?/?(?![\\s\\S])",
-            "description": "Optional HTTPS endpoint for the node. Scheme must be https. DNS name only: the last label is alphabetic, so IP literals cannot be expressed. No userinfo, no query, no fragment, and no path beyond an optional single '/'. Port, when present, is range-checked by the consumer (semantic rule).",
+            "pattern": "^https?://[^\\s\\u0000-\\u001f\\u007f@?#]+(?![\\s\\S])",
+            "description": "Optional HTTP or HTTPS URL, at most 2048 characters. This pattern is only a coarse structural screen, not a URL parser or transport policy. A future consumer must parse/validate host or IP, port and path, reject userinfo/query/fragment and preserve its existing transport/trust policy. HTTP loopback tunnels are representable; neither scheme nor host implies authorization.",
             "maxLength": 2048
           },
           "keyRef": {
             "type": "string",
             "pattern": "^worker:[a-z0-9_-]{2,32}:g[0-9]{1,3}:v[0-9]{1,3}(?![\\s\\S])",
             "description": "Optional keyring identifier for this node's worker signing key, in the existing worker:<node>:g<generation>:v<version> form. A reference only: never a key, fingerprint, or any other material. Its <node> segment must equal this entry's alias (semantic rule).",
-            "maxLength": 48
+            "maxLength": 49
           },
           "enabled": {
             "type": "boolean",

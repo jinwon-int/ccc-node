@@ -1,9 +1,11 @@
-# Fleet topology contract v1 (#1451 P0)
+# Initial fleet inventory contract v1 (part of #1451 P0)
 
 Status: **documentation, schema and placeholder example only.** This change
 adds no reader, writer, installer, CLI argument, enforcement, or runtime wiring.
 Existing node-local configuration has not been inventoried by this source-only
-change. P1–P4 remain open; this contract does not establish deployment readiness.
+change. This covers only the initial inventory portion of P0. Full P0 remains
+unchecked because relay, team, wiki and keyring-source routing are not modeled.
+P1–P4 remain open; this contract does not establish deployment readiness.
 
 | Artifact | Path |
 |---|---|
@@ -48,7 +50,7 @@ readers reject them. Never silently downgrade or discard unknown data.
 | `platform` | yes | `linux-systemd` or `android-termux`. |
 | `roles` | yes | Unique entries from `bridge-serving`, `a2a-worker`, `a2a-broker`; an explicit empty array is allowed. |
 | `repoRoot` | yes | Absolute checkout path; components start with an alphanumeric or underscore, then use alphanumerics, underscore, dot, or hyphen. No trailing/repeated slash or dot-leading component; at most 4096 characters. |
-| `endpoint` | no | HTTPS DNS URL, at most 2048 characters; no IP literal, userinfo, query, fragment, or path beyond `/`. |
+| `endpoint` | no | HTTP or HTTPS URL, at most 2048 characters. A coarse pattern rejects raw whitespace/control characters, `@`, `?` and `#`; a real URL parser and consumer policy supply the remaining checks. |
 | `keyRef` | no | `worker:<node>:g<generation>:v<version>` keyring identifier, not key material; generation/version are 1–3 digits. |
 | `enabled` | yes | Boolean; absence never implies `true`. |
 
@@ -58,11 +60,14 @@ start with `-`, contain shell metacharacters, use `user@host`, or contain path
 separators. Eventual callers must still pass values as separate argv elements;
 validation is not permission to interpolate them into shell source.
 
-The endpoint profile is intentionally narrow. It cannot represent existing
-HTTP/loopback tunnel endpoints or non-root API paths. An affected consumer must
-resolve that compatibility requirement in a reviewed contract change before
-migration; it must not rewrite the URL, invent an HTTPS proxy, or fall back to
-an old endpoint. Optional means unavailable when absent, not guessed.
+The endpoint is configuration data, not a new transport policy. Both HTTP and
+HTTPS, DNS names, IPv4 addresses, bracketed IPv6 addresses, and non-root API paths
+can be represented. This preserves existing consumers such as trusted HTTP
+loopback tunnels without implying that HTTP is permitted for every destination.
+A future consumer must parse the URL and apply its existing transport, trust,
+host and path policy. It must not silently change schemes, invent a proxy,
+follow an unauthorized destination, or fall back to an old endpoint. Optional
+means unavailable when absent, not guessed.
 
 `keyRef` identifies an existing worker public-key entry. A consumer must check
 membership, validity, revocation and authorization against a separately trusted
@@ -77,9 +82,15 @@ acceptance is neither a secret scan nor an authorization decision.
 Before any value is consumed, the future validator must also enforce:
 
 1. Aliases are unique across nodes; `keyRef`'s node segment equals its alias.
-2. Endpoint ports are 1–65535, each DNS label is at most 63 characters, and the
-   hostname is at most 253 characters. Reserved example endpoints, including
-   `.invalid`, are rejected for operational use.
+2. Parse endpoints as absolute HTTP/HTTPS URLs with a nonempty host. Reject
+   userinfo, query, fragment, controls, invalid DNS/IP syntax, malformed brackets
+   or ports, and encoded authority delimiters. DNS labels are at most 63
+   characters and the hostname at most 253; validate IP literals with an IP
+   parser. Explicit ports are 1–65535. Validate the path and destination under
+   the existing consumer policy, without silently normalizing to a different
+   destination. Reserved example endpoints, including `.invalid`, are rejected
+   for operational use. Schema acceptance alone is not URL or transport-policy
+   validation.
 3. The consumer's trusted local identity appears in the inventory. Existing
    identity resolution must be reviewed per consumer; this document creates no
    common identity resolver or precedence bypass.
@@ -178,9 +189,10 @@ Missing validator capability means incomplete validation and blocks migration.
 A path-based `stat`/`namei` inspection cannot establish race-safe opening.
 
 Structural fixtures should cover the example, unknown keys, wrong types/enums,
-unsafe aliases/paths, URL credentials/query/IPs, duplicate roles, and trailing
+unsafe aliases/paths, URL credentials/query/control characters, duplicate roles, and trailing
 newlines in every patterned field. Separate fixtures must cover duplicate
-aliases, key-reference mismatch, port range, absent local identity, reserved
+aliases, key-reference mismatch, URL/IP/port parsing, consumer transport policy,
+absent local identity, reserved
 example endpoints, and syntax-only failures. Do not describe a structural pass
 as a complete configuration or deployment check.
 
