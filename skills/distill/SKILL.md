@@ -90,6 +90,18 @@ wc -l ~/.claude/state/wiki-candidates.md
         ~/.claude/state/distill.disabled.off-$(date -u +%Y%m%d%H%M%S) 2>&1
      ```
 
+   - **`compact`** — mutating queue maintenance, unlike every read-only branch
+     above. Run the queue's built-in compactor exactly as shown before
+     **Procedure** (`wc -l` before/after + `wiki-queue.sh --compact`) and
+     report the `kept=… dropped(dup)=… buckets=…` summary line with the
+     before/after queue sizes. The command has no dry-run flag: it rewrites
+     `~/.claude/state/wiki-candidates.md` in place, keeping the newest PENDING
+     entry per `title_hash` bucket, dropping the older duplicates and
+     refreshing `.seen` for the survivors. Deleting queue entries is that
+     mutation, so the explicit operator request for `compact` is its
+     authorization boundary — never run it speculatively or fold it into
+     another mode's dispatch.
+
    - **(empty) / `manual`** — fire & wait:
      ```bash
      bash ~/.claude/hooks/distill.sh manual
@@ -117,8 +129,8 @@ wc -l ~/.claude/state/wiki-candidates.md
 - Noise controls (issue #298): wiki-candidates are extracted only when reusable + new + settled (exclusion list in the extract prompt), capped at `CCC_DISTILL_MAX_WIKI_CANDS` (default 3) per session by wiki-queue, and deduped by topic for `CCC_DISTILL_SEEN_TTL_DAYS` (default 7). `/distill compact` cleans pre-existing duplicate backlog.
 - All outputs carry provenance: `source_cwd`/`source_project` in `distill-last.json`, Honcho metadata, and wiki-candidates entries.
 - Re-enable by `mv`-ing `distill.disabled` / `distill.dryrun` to a timestamped archive name rather than deleting them, so the previous toggle state stays recoverable and the change is auditable. Choose `mv` for that reason — **not** to avoid the guard: if the guard blocks an action you believe is correct, stop and get approval instead of reaching for a verb it does not cover.
-- Manual fire from inside an active Claude Code session uses **this** session's transcript. If you want to distill some **other** session, set `CLAUDE_DISTILL_TRANSCRIPT=/path/to/other.jsonl` in env before firing.
-- All extract output is redacted before any external send. Even so, never paste raw secrets in the prompt that feeds the trans — the distiller will see them.
+- Transcript selection is owned by `claude/hooks/distill.sh`; there is no environment override for it. PreCompact/SessionEnd fires pass a hook JSON payload and the script reads `transcript_path` from it; a `manual` fire reaches it with empty stdin, so the script falls back to the most-recent `*.jsonl` in the project-encoded directory for the current `PWD` under `CLAUDE_PROJECTS_DIR` (default `~/.claude/projects`), skipping with `skip reason=no-transcript` when none exists. `CLAUDE_DISTILL_TRANSCRIPT` is an *output* the script exports to its detached extract pipeline after selection, not an entry-selection input — pre-setting it before firing changes nothing. The scope gate then runs on the selected transcript on every entry path: when `CCC_DISTILL_SCOPE_CWDS` / `~/.claude/state/distill.scope` is configured, a transcript whose project dir or cwd is not allowlisted logs `skip reason=cwd-out-of-scope` (via `scope_allows_project`) before any extract, push, or queue write. No entry path distills a transcript outside the configured allowlist.
+- All extract output is redacted before any external send. Even so, never paste raw secrets into prompt content that feeds the transcript extraction — the distiller will see them.
 
 ## Re-verifying the pinned values
 
@@ -131,6 +143,8 @@ file can drift from them silently, so check rather than trust it (#1630):
 | `CCC_DISTILL_SEEN_TTL_DAYS` default 7 | `grep -rn 'CCC_DISTILL_SEEN_TTL_DAYS' claude/hooks/` |
 | `CCC_DISTILL_HOTNESS_THRESHOLD` default 3 | `grep -rn 'CCC_DISTILL_HOTNESS_THRESHOLD' claude/hooks/` |
 | `wiki-queue.sh --compact` exists | `grep -n -- '--compact' claude/hooks/distill/wiki-queue.sh` |
+| `CLAUDE_DISTILL_TRANSCRIPT` is export-only (no selection override) | `grep -n 'CLAUDE_DISTILL_TRANSCRIPT' claude/hooks/distill.sh` — a single `export` after selection, no read at entry |
+| Scope gate runs on every selected transcript | `grep -n 'scope_allows_project\|cwd-out-of-scope' claude/hooks/distill.sh` |
 | `CLAUDE_DISTILL_TIMEOUT` | `grep -n 'CLAUDE_DISTILL_TIMEOUT' claude/hooks/distill/extract.sh` — the **default is 90**; the `240` named above is a suggested raise on timeout, not the default |
 
 If a check disagrees, the hook script is authoritative — fix this file.
