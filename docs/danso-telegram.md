@@ -491,3 +491,9 @@ Deploy the bridge and native binary separately after approval. Either deployment
 order is compatible: old bridges do not use the new flag, and new bridges keep
 the existing guard when the binary lacks it. Both updates are required for the
 new conversational behavior. No existing journals are migrated or rewritten.
+
+Recovery and pause notices explicitly state when user input is required. A safe
+checkpoint asks for `/task_resume` (or the Continue choice); follow-up-capable
+workers also explain that a normal message can continue or redirect the task.
+Unresumable/exhausted state directs the user to inspect or start a new task,
+rather than presenting an unavailable resume command as an action.

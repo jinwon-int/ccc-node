@@ -462,18 +462,19 @@ raise SystemExit(code)
     events = [event async for event in session.send_turn("pause")]
     assert [event.kind for event in events] == ["task_progress", "error"]
     assert events[-1].code == "danso_task_paused"
+    assert "자동으로 재개되지 않습니다" in events[-1].message
     assert "/task_resume" in events[-1].message
     exhausted = [event async for event in session.send_turn("exhaust")]
     assert exhausted[-1].code == "danso_task_paused"
     assert "/task_resume" not in exhausted[-1].message
-    assert "remaining budget" in exhausted[-1].message
+    assert "남은 실행 한도" in exhausted[-1].message
     stage_zero = [event async for event in session.send_turn("stage0")]
     assert stage_zero[-1].code == "danso_task_paused"
     assert "/task_resume" in stage_zero[-1].message
     handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
     response = await handler.process_message("pause through handler", 7, 9)
     assert not response.success
-    assert response.content.startswith("⏸ Paused at a saved checkpoint.")
+    assert response.content.startswith("⏸ 작업을 저장하고 멈췄습니다.")
     assert "/task_resume" in response.content
     await handler.close()
 
