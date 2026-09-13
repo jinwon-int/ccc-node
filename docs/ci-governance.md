@@ -321,4 +321,6 @@ end-to-end on a throwaway repo with identical protection before activation
 Ops notes: update a stale PR before enqueueing (the queue builds on current
 `main`); a group whose checks fail evicts its PRs for the author to fix, and
 the new head re-enters after fresh exact-head approval. The enqueue flow
-lives in the `gh-pr-flow` skill.
+lives in the `gh-pr-flow` skill. Activation record: the `merge_queue` rule was
+applied to ruleset `18203378` on 2026-09-13 after #1715 merged; this file's
+own change was the first PR to land through the queue.
