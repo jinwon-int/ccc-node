@@ -1956,3 +1956,66 @@ async def test_preflight_rejects_bad_binding_and_contradictory_terminal(configur
     events = [event async for event in session.send_turn('must not dispatch')]
     assert len(events) == 1 and events[0].code == 'danso_task_resume_unavailable'
     assert not (Path(configured.danso_workspace) / 'argv.json').exists()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('state', ['ready', 'paused'])
+@pytest.mark.parametrize('mode', ['interactive', 'autonomous'])
+async def test_user_followup_preserves_prompt_and_saved_limits_but_background_cannot_resume(configured, state, mode):
+    configured.danso_long_task_enabled = True
+    binary = Path(configured.danso_cli_path)
+    binary.write_text(binary.read_text().replace("'--task-status',", "'--task-status','--task-followup',", 1)
+                      .replace("'state':'paused'", f"'state':{state!r}", 1))
+    runtime = build_danso_runtime(configured)
+    assert runtime.task_followup
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    journal = runtime.root / (session.session_id + '.jsonl')
+    journal.write_text(json.dumps(dict(type='session', version=3, id=session.session_id, cwd=str(session.cwd))) + '\n')
+    journal.chmod(0o600)
+    handler = ProjectChatHandler(settings=_settings(Path(configured.danso_workspace), 'danso'), agent_runtime=runtime)
+    text = '수정은 멈추고 현재 결과만 설명해 줘. --new-task'
+    response = await handler.process_message(text, 7, 9, session_id=session.session_id, usage_mode=mode)
+    argv_file = Path(configured.danso_workspace) / 'argv.json'
+    if mode == 'interactive':
+        assert response.success, response.content
+        args = json.loads(argv_file.read_text())
+        assert args[-3:] == ['--task-followup', '--', text]
+        assert '--resume-task' in args
+        assert args[args.index('--session') + 1] == str(journal)
+        for flag in ('--timeout-seconds', '--task-max-requests', '--task-max-tokens', '--task-pause-after-stage'):
+            assert flag not in args
+    else:
+        assert not response.success
+        assert not argv_file.exists()
+    await handler.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('state,allowed', [('pending_provider', False), ('pending_tools', False),
+                                         ('final_pending', False), ('blocked', False),
+                                         ('ready', False), ('paused', False)])
+async def test_followup_capability_never_bypasses_uncertainty_or_budgets(configured, state, allowed):
+    configured.danso_long_task_enabled = True
+    binary = Path(configured.danso_cli_path)
+    binary.write_text(binary.read_text().replace("'--task-status',", "'--task-status','--task-followup',", 1))
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    journal = runtime.root / (session.session_id + '.jsonl')
+    journal.write_text('unchanged synthetic journal\n')
+    journal.chmod(0o600)
+    session._read_task_status = AsyncMock(return_value=SimpleNamespace(state=state, resume_allowed=allowed))
+    session.authorize_task_followup()
+    events = [e async for e in session.send_turn('계속해')]
+    assert events[-1].code == 'danso_task_recovery_required'
+    assert not session._followup_task_authorized
+    assert journal.read_text() == 'unchanged synthetic journal\n'
+    assert not (Path(configured.danso_workspace) / 'argv.json').exists()
+
+
+@pytest.mark.anyio
+async def test_followup_authorization_is_one_shot_even_when_validation_rejects(configured):
+    runtime = build_danso_runtime(configured)
+    session = await runtime.start_or_resume(SessionRequest(working_directory=configured.danso_workspace))
+    session.authorize_task_followup()
+    assert [e async for e in session.send_turn('')][-1].code == 'danso_input'
+    assert not session._followup_task_authorized

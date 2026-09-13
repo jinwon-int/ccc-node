@@ -420,8 +420,9 @@ fingerprint obtained from matching locked reads around native validation.
 Queue-time revalidation and atomic one-shot claims reject stale/duplicate clicks.
 A new message, `/new`, or provider/audience switch invalidates old dispatches;
 identity persistence and native launch recheck the conversation generation.
-Only explicit Continue can dispatch work. Automatic checkpoint resume is not
-enabled by this feature, and the provider's existing bounded HTTP retry policy
+Recovery offers dispatch only after an explicit Continue selection. Separately,
+a new interactive user message can use the native follow-up path described below.
+Automatic checkpoint resume is not enabled, and the provider's bounded HTTP retry policy
 is unchanged. An uncertain tool effect is never silently marked settled.
 
 The summary labels the last agent note as unverified and counts durable tool
@@ -434,9 +435,12 @@ production rollout and restart are separate from merging it.
 ### Provider interruption recovery (native Danso #99)
 
 With long-task mode enabled, an existing journal is assessed through the
-provider-free `--task-status` path before a normal turn is dispatched. Unfinished
-or invalid state returns recovery guidance without starting a model/tool worker;
-a new user message never becomes an implicit continuation of the saved objective.
+provider-free `--task-status` path before a normal turn is dispatched. Uncertain, invalid or exhausted state returns recovery guidance without starting
+a model/tool worker. With a binary exposing `--task-followup`, a new interactive
+message at a resumable ready/paused checkpoint is appended to the same saved
+conversation and dispatched with `--resume-task --task-followup`. The user's
+latest instruction reaches the model; it is never replaced by a no-prompt resume.
+Older binaries retain the explicit recovery-choice behavior.
 Completed/failed tasks and fresh sessions retain their existing behavior. Native
 runtime locking and full journal validation remain authoritative at dispatch.
 
@@ -455,3 +459,35 @@ checks its header UUID and workspace, and requires the same bytes and inode afte
 native inspection. It never searches another filename/audience to make an ID fit.
 The parser rejects state/pending contradictions even when resume is false, so a
 claimed terminal state cannot hide a pending request and authorize a new turn.
+
+
+### Natural follow-up after an interrupted turn
+
+Piri sends the next message through `prompt`, Codex through `turn/start`, and
+Claude Code through `query`. Danso additionally keeps a durable long-task ledger.
+Previously the bridge refused every ordinary message while that ledger was
+unfinished, even when the native checkpoint was safe to resume. This produced
+`Saved Danso task requires an explicit choice` after a stop or restart.
+
+An updated native binary advertises `--task-followup` in `--help`. The bridge
+probes this locally at runtime construction. For a new interactive user message,
+a safe `ready`/`paused` checkpoint with `resume_allowed=true` now keeps the same
+session and appends the actual message before continuing. For example, both
+“계속해” and “수정은 멈추고 현재 결과만 설명해 줘” work without `/task_resume`.
+The native writer lock rechecks the journal before any append or dispatch.
+Cumulative elapsed runtime, limits, stage and unknown-usage accounting remain
+unchanged; sending a message cannot reset an exhausted budget. `/task_resume`
+retains its explicit no-prompt behavior. `/new` remains the way to select a fresh
+objective and budget.
+
+This is not a background recovery policy: autonomous/CI wakeups are not armed
+for follow-up, startup recovery inspection sends no model request, and no retry
+loop is added. Unsettled tool effects, unclassified pending providers, malformed
+journals and exhausted checkpoints still require inspection/new-session choices.
+A new user turn may incur another model request; unknown usage from an interrupted
+request remains reported instead of being silently zeroed.
+
+Deploy the bridge and native binary separately after approval. Either deployment
+order is compatible: old bridges do not use the new flag, and new bridges keep
+the existing guard when the binary lacks it. Both updates are required for the
+new conversational behavior. No existing journals are migrated or rewritten.

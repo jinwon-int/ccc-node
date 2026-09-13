@@ -346,6 +346,8 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
                         max_output_tokens=settings.danso_max_output_tokens,
                         compact_at_bytes=settings.danso_compact_at_bytes,
                         long_task=settings.danso_long_task_enabled,
+                        task_followup=bool(settings.danso_long_task_enabled and _validate_cli_flags(
+                            binary, Path(settings.danso_workspace), ("--task-followup",))),
                         task_stage_requests=settings.danso_task_stage_requests,
                         task_max_requests=settings.danso_task_max_requests,
                         task_max_tokens=settings.danso_task_max_tokens,

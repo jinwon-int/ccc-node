@@ -471,7 +471,7 @@ class DansoRuntime:
                  long_task=False, task_stage_requests=16, task_max_requests=1024,
                  task_max_tokens=10_000_000, task_repeat_limit=3,
                  task_pause_after_stage=None, native_memory_args=None,
-                 progress_jsonl=False):
+                 progress_jsonl=False, task_followup=False):
         if provider not in PROVIDERS or not model or not isinstance(model, str):
             raise ValueError('invalid provider/model')
         if type(long_task) is not bool:
@@ -531,6 +531,9 @@ class DansoRuntime:
         self.timeout, self.provider_timeout, self.max_turns = timeout_seconds, provider_timeout_seconds, max_turns
         self.max_output_tokens = max_output_tokens
         self.outer_timeout = outer_timeout_seconds
+        if type(task_followup) is not bool:
+            raise ValueError('invalid task followup setting')
+        self.task_followup = task_followup
         self.long_task = long_task
         self.task_stage_requests = task_stage_requests
         self.task_max_requests = task_max_requests
@@ -576,6 +579,7 @@ class DansoSession:
         self._interrupted = False
         self._bootstrap_task = None
         self._resume_task_authorized = False
+        self._followup_task_authorized = False
         self._dispatch_guard = None
         self._task_progress_ready = False
         self._task_progress_seen = False
@@ -587,6 +591,13 @@ class DansoSession:
     def authorize_task_resume(self):
         """Arm exactly one bridge-authorized no-prompt resume dispatch."""
         self._resume_task_authorized = True
+
+    def authorize_task_followup(self):
+        """Arm one interactive user message, never a background wake or retry."""
+        self._followup_task_authorized = True
+
+    def clear_task_followup_authorization(self):
+        self._followup_task_authorized = False
 
     def clear_task_resume_authorization(self):
         self._resume_task_authorized = False
@@ -692,6 +703,7 @@ class DansoSession:
 
     async def send_turn(self, message, *, approval_handler=deny_approval):  # noqa: C901 -- subprocess lifecycle and terminal event mapping
         async with self._lock:
+            followup_authorized, self._followup_task_authorized = self._followup_task_authorized, False
             dispatch_guard, self._dispatch_guard = self._dispatch_guard, None
             if dispatch_guard is not None and not dispatch_guard():
                 self._resume_task_authorized = False
@@ -720,6 +732,7 @@ class DansoSession:
             effective_max_requests = r.task_max_requests
             effective_max_tokens = r.task_max_tokens
             resume_stage = None
+            followup_task = False
             if resume_task or (r.long_task and os.path.lexists(r.root / (self.session_id + '.jsonl'))):
                 status_task = asyncio.create_task(self._read_task_status())
                 self._bootstrap_task = status_task
@@ -760,6 +773,12 @@ class DansoSession:
                     for event in events:
                         yield event
                     return
+                if (not resume_task and followup_authorized and r.task_followup
+                        and status.state in {'ready', 'paused'} and status.resume_allowed):
+                    # The new user message is preserved; no keyword guessing or
+                    # no-prompt replay. Native revalidates under its writer lock.
+                    followup_task = True
+                    resume_task = True
                 if not resume_task and status.state not in {'completed', 'failed', 'not_long_task'}:
                     self._active = False
                     yield ErrorEvent(
@@ -836,6 +855,8 @@ class DansoSession:
                 else:
                     if resume_task:
                         command += ['--resume-task']
+                        if followup_task:
+                            command += ['--task-followup', '--', message]
                     else:
                         command += ['--', message]
                     async for event in self._execute(
