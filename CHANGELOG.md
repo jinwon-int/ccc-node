@@ -4,6 +4,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Add text-mode Danso recovery offers (`CCC_TELEGRAM_DANSO_RECOVERY_TEXT`):
+  the failed-task offer renders as a numbered menu and the user answers by
+  typing 1/2/3 instead of tapping inline buttons. Refactors the recovery
+  choice application into a shared body so callback and typed inputs keep
+  identical claim/guard/dispatch discipline; button mode stays the default.
+
 - Enable the merge queue on `main`: `merge_group` triggers for `ci.yml` and
   `codeql.yml` (required contexts re-report on the queue's
   `gh-readonly-queue/main/<pr>-<sha>` group refs), the `merge_queue` rule on

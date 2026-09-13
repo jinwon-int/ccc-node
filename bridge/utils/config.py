@@ -1020,6 +1020,16 @@ class Config(
         ),
     )
 
+    danso_recovery_text_mode: bool = Field(
+        default=False,
+        alias="CCC_TELEGRAM_DANSO_RECOVERY_TEXT",
+        description=(
+            "Offer failed-Danso recovery as numbered text and answer by "
+            "typing 1/2/3 in the chat, instead of tap-to-select inline "
+            "keyboard buttons. Default OFF: the recovery offer uses buttons."
+        ),
+    )
+
     enable_entity_renderer: bool = Field(
         default=True,
         alias="CCC_TELEGRAM_ENTITY_RENDERER",
