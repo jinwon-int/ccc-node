@@ -782,6 +782,7 @@ class ProjectChatProcessMixin:
             session = None
             turn_token: ActiveToken | None = None
             resume_authorized = False
+            followup_authorized = False
             try:
                 # Session construction and the periodic resource guard share
                 # this short critical section. It prevents an idle-runtime
@@ -1135,6 +1136,12 @@ class ProjectChatProcessMixin:
                         )
                     authorize_resume()
                     resume_authorized = True
+                if (not resume_task and usage_mode == MODE_INTERACTIVE
+                        and getattr(self._config, "agent_provider", None) == "danso"):
+                    authorize_followup = getattr(session, "authorize_task_followup", None)
+                    if callable(authorize_followup):
+                        authorize_followup()
+                        followup_authorized = True
                 turn_outcome = await asyncio.wait_for(
                     consume_turn_stream(
                         session.send_turn(
@@ -1541,6 +1548,8 @@ class ProjectChatProcessMixin:
                     session_id=session.session_id if session is not None else session_id,
                 )
             finally:
+                if followup_authorized and session is not None:
+                    session.clear_task_followup_authorization()
                 if resume_authorized:
                     clear_resume = getattr(session, "clear_task_resume_authorization", None)
                     if callable(clear_resume):
