@@ -1331,7 +1331,7 @@ class ProjectChatHandler(
         return cleaned
 
     async def _maybe_update_heartbeat(self, req: _PendingRequest, now: float) -> None:
-        """Send or edit a fail-open long-running task heartbeat."""
+        """Refresh a fail-open long-running task heartbeat."""
         if not getattr(config, "heartbeat_enabled", True):
             return
         if not req.status_callback or req.future.done() or req.lifecycle.is_terminal:
