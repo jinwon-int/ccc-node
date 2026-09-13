@@ -5,6 +5,8 @@ runtime started serving that generation. Before advancing that marker, the
 updater durably writes `self-update.pending-activation.json` under its existing
 state lock. Failed persistence exits 14 before restart and preserves the install
 recovery snapshot. Failed activation retains pending evidence and the snapshot.
+A markerless unchanged tick cannot bootstrap an installed SHA while any recovery
+snapshot remains, even if persistence failed before the pending intent existed.
 
 A healthy old runtime on the next unchanged tick remains incomplete (14). Pending
 state does not itself schedule a restart or retry. The existing unhealthy-runtime
@@ -33,8 +35,10 @@ attestation, authentication completion, or a new activation/deployment authority
 State is owner-only mode 0600, bounded, and read without following symlinks.
 Writes use the shared secure-fs atomic writer with file and directory fsync and a
 transaction intent. Dangling links, hardlinks, unsafe modes, truncated JSON, intent
-files, and both old/new temp-name residues fail closed and are left for operator
-inspection. Completion durably replaces pending state with `outcome: activated`;
+files, and both old/new temp-name residues fail closed before source/install
+mutations on every run, including changed or forced ticks, and are left for
+operator inspection. Repeated failure of the same unresolved target preserves
+its original previous SHA, start time and recovery snapshot reference. Completion durably replaces pending state with `outcome: activated`;
 the bounded terminal receipt remains on disk so unlink failure cannot erase the
 only evidence. Do not use file existence alone as a pending-state check.
 An unsupported directory fsync is a persistence failure. Recovery snapshots are

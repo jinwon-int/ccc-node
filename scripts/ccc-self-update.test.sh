@@ -905,7 +905,10 @@ ok "failed re-apply notifies" 'grep -rh "cron 재적용 실패" "$TMP/spool" >/d
 rm -f "$STATE/self-update.pending-activation.json"
 
 # --- 9) installed-SHA marker (#1422) ------------------------------------------
-# 9a) marker absent on an up-to-date tick: adopt HEAD silently, no setup.
+# 9a) Clean legacy bootstrap has no unresolved recovery evidence. Explicit
+# fixture-operator reconciliation removes snapshots from prior failure cases.
+rm -rf "$STATE"/self-update-install-rollback.*
+# Marker absent on an up-to-date tick: adopt HEAD silently, no setup.
 rm -f "$STATE/install-fake-cron.json" "$STATE/self-update.installed-sha" "$SETUP_MARKER" "$TMP/systemctl.calls"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "marker-absent tick stays up-to-date" '[ "$rc" = 0 ] && grep -q "already up to date" <<<"$out" && [ ! -f "$SETUP_MARKER" ]'
@@ -1163,6 +1166,7 @@ git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm persistence-two && gi
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "installed marker failure leaves durable pending and no restart" \
   '[ "$rc" = 14 ] && jq -e ".outcome == \"pending\"" "$PENDING" >/dev/null && [ ! -s "$TMP/systemctl.calls" ]'
+# shellcheck disable=SC2034  # eval assertion below
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "healthy old next tick cannot hide installed marker failure" \
   '[ "$rc" = 14 ] && ! grep -q "already up to date" <<<"$out"'
@@ -1177,6 +1181,46 @@ rm "$PENDING"
 printf '{' > "$PENDING.tmp.999999"
 run_selfup run > "$TMP/truncated.out" 2>&1; rc=$?
 ok "truncated interrupted state refuses convergence" "[ \"$rc\" = 14 ]"
+
+
+# 11l) First install, no installed marker, and failure before even the durable
+# intent exists. The retained snapshot must outrank legacy marker bootstrap.
+rm "$PENDING.tmp.999999"
+rm -f "$PENDING" "$STATE/self-update.installed-sha"
+rm -rf "$STATE"/self-update-install-rollback.*
+echo markerless > "$TMP/seed/markerless"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm markerless && git -C "$TMP/seed" push -q origin main
+real_python="$(command -v python3)"
+cat > "$FAKEBIN/python3" <<SH
+#!/usr/bin/env bash
+if [[ "\$1" == */lib/self-update-activation.py ]] && [ "\$2" = write ]; then exit 2; fi
+exec "$real_python" "\$@"
+SH
+chmod +x "$FAKEBIN/python3"
+: > "$TMP/systemctl.calls"
+run_selfup run > "$TMP/markerless-first.out" 2>&1; rc=$?
+ok "markerless pending publication failure retains only recovery evidence" \
+  '[ "$rc" = 14 ] && [ ! -e "$STATE/self-update.installed-sha" ] && [ ! -e "$PENDING" ] && [ ! -e "$PENDING.intent" ] && compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+rm "$FAKEBIN/python3"
+run_selfup run > "$TMP/markerless-next.out" 2>&1; rc=$?
+ok "markerless healthy next tick refuses bootstrap and restart" \
+  '[ "$rc" = 14 ] && [ ! -e "$STATE/self-update.installed-sha" ] && [ ! -s "$TMP/systemctl.calls" ] && grep -q "missing installed marker with recovery evidence" "$TMP/markerless-next.out"'
+
+# 11m) Unsafe activation evidence is rejected before source/install mutations,
+# even with --force or an incoming changed target.
+printf '{' > "$PENDING.tmp.unsafe-force"
+rm -f "$SETUP_MARKER"
+: > "$TMP/systemctl.calls"
+run_selfup run --force > "$TMP/unsafe-force.out" 2>&1; rc=$?
+ok "unsafe forced tick cannot run setup or restart" \
+  '[ "$rc" = 14 ] && [ ! -e "$SETUP_MARKER" ] && [ ! -s "$TMP/systemctl.calls" ] && [ -f "$PENDING.tmp.unsafe-force" ]'
+# shellcheck disable=SC2034  # eval assertion below
+unsafe_head="$(git -C "$REPO" rev-parse HEAD)"
+echo unsafe-change > "$TMP/seed/unsafe-change"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm unsafe-change && git -C "$TMP/seed" push -q origin main
+run_selfup run > "$TMP/unsafe-change.out" 2>&1; rc=$?
+ok "unsafe changed tick cannot advance source or run setup" \
+  '[ "$rc" = 14 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$unsafe_head" ] && [ ! -e "$SETUP_MARKER" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

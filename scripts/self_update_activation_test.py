@@ -269,3 +269,14 @@ def test_real_health_wire_reconciles_and_preserves_old_generation(state, monkeyp
     pending["target_sha"] = git("rev-parse", "HEAD")
     with pytest.raises(ValueError, match="startup-generation-mismatch"):
         a.serving(pending, repo, later_health)
+
+
+def test_failed_same_target_recovery_preserves_original_provenance(state):
+    with a.directory(state) as fd:
+        write(fd)
+        original = a.load(fd)
+        a.write(fd, "a" * 40, "a" * 40, "recovery-restart-failed", "[]", "")
+        retry = a.load(fd)
+        assert retry["outcome"] == "recovery-restart-failed"
+        for key in ("target_sha", "previous_sha", "started_at", "snapshot"):
+            assert retry[key] == original[key]

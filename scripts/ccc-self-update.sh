@@ -21,9 +21,9 @@
 #      runtime DOWN attempts one recovery restart — so the second daily slot
 #      can recover an updated-but-down node (#971).)
 #   ~/.claude/self-update.serving-generation-cmd (optional: one read-only
-#      command that PRINTS the generation the runtime is actually serving, as
-#      the full or unambiguous short SHA. It is the only supported way to
-#      reconcile a pending activation record on an unchanged tick; without it
+#      command that prints existing bridge health JSON with the full frozen
+#      startup identity. It is the only supported way to reconcile a pending
+#      activation record on an unchanged tick; without it
 #      the serving identity is unknown and stays pending (#1527).)
 #   ~/.claude/self-update.no-reapply (optional: operator kill-switch; when this
 #      file exists, installer-managed cron is never rewritten. Env override:
@@ -527,6 +527,16 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 trap cleanup EXIT
 
+# Unsafe or interrupted activation evidence blocks every run, including forced
+# and changed ticks, before repository recovery, fetch, setup or restart.
+ACTIVATION_PREFLIGHT=0
+activation_state load >/dev/null || ACTIVATION_PREFLIGHT=$?
+if [ "$ACTIVATION_PREFLIGHT" != 0 ] && [ "$ACTIVATION_PREFLIGHT" != 1 ]; then
+  log "pending-activation unsafe reason=unsafe-or-interrupted"
+  say "self-update: unsafe activation evidence; refusing mutations" >&2
+  exit 14
+fi
+
 # --- idle gate: never restart the bridge while it is serving a request --------
 # The bridge writes an in-flight workload snapshot to its health.json. Restarting
 # it mid-request SIGTERM-kills the in-flight `claude` child (exit 143) and destroys
@@ -798,8 +808,18 @@ if [ "$CHANGED" = "false" ] && [ -n "$INSTALLED_SHA" ] && [ "$INSTALLED_SHA" != 
   log "install-drift installed=$INSTALLED_SHA checkout=$NEW_SHA reason=checkout-advanced-without-setup"
   CHANGED=true
 elif [ "$CHANGED" = "false" ] && [ -z "$INSTALLED_SHA" ] && [ "$FORCE" != "1" ]; then
-  # Only an ordinary no-change tick adopts HEAD. A forced first deployment
-  # must wait for setup and its config preflight before recording success.
+  # A failed first installation may be unable to create even its activation
+  # intent. Its retained recovery snapshot still proves this is not a clean
+  # legacy bootstrap. Never turn that failure into a successful HEAD adoption.
+  for recovery_evidence in "$STATE_DIR"/self-update-install-rollback.*; do
+    if [ -e "$recovery_evidence" ] || [ -L "$recovery_evidence" ]; then
+      log "pending-activation result=incomplete reason=markerless-recovery-evidence"
+      say "self-update: missing installed marker with recovery evidence; refusing to report up-to-date" >&2
+      exit 14
+    fi
+  done
+  # Only an ordinary no-change tick without recovery evidence adopts HEAD. A
+  # forced first deployment waits for setup and its config preflight.
   printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || log "warn installed-sha marker write failed path=$INSTALLED_SHA_FILE"
 fi
 
@@ -854,7 +874,7 @@ if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
       if ! clear_pending_activation; then
         KEEP_INSTALL_SNAPSHOT=1
         audit "activation-clear-failed" "$OLD_SHA" "$NEW_SHA" false true "[]"
-        notify "self-update ${SHORT_CUR}: 복구 재시작은 성공했지만 활성화 기록 정리에 실패했습니다. 확인 후 ~/.claude/state/self-update.pending-activation.json 을 삭제하세요." "pending-clear-fail-$NEW_SHA"
+        notify "self-update ${SHORT_CUR}: 복구 재시작은 성공했지만 활성화 기록 정리에 실패했습니다. 보존된 활성화 기록과 복구 자료를 유지하고 운영자가 원인을 확인해 조정해야 합니다." "pending-clear-fail-$NEW_SHA"
         say "self-update: recovery restart succeeded but the pending-activation record could not be cleared" >&2
         exit 14
       fi
@@ -865,7 +885,7 @@ if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
     fi
     if [ "$PENDING_STATE" = "0" ]; then
       # Refine the retained evidence with the failed recovery attempt.
-      write_pending_activation "recovery-restart-failed" '[{"name":"external-restart","ok":false,"scope":"external"}]' "" || :
+      write_pending_activation "recovery-restart-failed" '[{"name":"external-restart","ok":false,"scope":"external"}]' "" || exit 14
     fi
     audit "runtime-down" "$OLD_SHA" "$NEW_SHA" "$CHANGED" true '[{"name":"external-restart","ok":false,"scope":"external"}]'
     notify "self-update ${SHORT_CUR} 경고: 코드는 최신이나 런타임이 다운 상태이며 복구 재시작도 실패했습니다. 브리지가 남아있는지 즉시 확인 필요. ~/.claude/state/self-update.log" "runtime-down-$NEW_SHA"
@@ -1127,7 +1147,7 @@ fi
 if ! clear_pending_activation; then
   KEEP_INSTALL_SNAPSHOT=1
   audit "activation-clear-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
-  notify "self-update ${SHORT_NEW}: 활성화는 완료됐지만 시도 기록 정리에 실패했습니다. 확인 후 ~/.claude/state/self-update.pending-activation.json 을 삭제하세요." "pending-clear-fail-$NEW_SHA"
+  notify "self-update ${SHORT_NEW}: 활성화는 완료됐지만 시도 기록 정리에 실패했습니다. 보존된 활성화 기록과 복구 자료를 유지하고 운영자가 원인을 확인해 조정해야 합니다." "pending-clear-fail-$NEW_SHA"
   say "self-update: activation completed but the pending-activation record could not be cleared; not reporting clean success" >&2
   exit 14
 fi
