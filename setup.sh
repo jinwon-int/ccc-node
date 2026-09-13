@@ -600,6 +600,7 @@ done
 # the walk covers only the claude/hooks/ tree.
 run atomic_install "$SRC/scripts/lib/harness-paths.sh" "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
 run atomic_install "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.py"
+run atomic_install "$SRC/scripts/lib/self-update-activation.py" "$CLAUDE_DIR/hooks/lib/self-update-activation.py"
 # Codex launch boundary: the launcher and materializer are installed beside
 # load-memory.sh so every direct/app-server run reuses the same snapshot policy.
 run atomic_install "$SRC/scripts/ccc-codex" "$CLAUDE_DIR/hooks/ccc-codex"

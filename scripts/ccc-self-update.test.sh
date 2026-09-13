@@ -1017,12 +1017,28 @@ ok "healthy-old second tick notifies the owner" 'jq -r .text "$TMP/spool"/*SelfU
 ok "status reports the pending activation read-only" \
   'run_selfup status | grep -q "pending activation: INCOMPLETE target=${pending_target:0:7}"'
 
+# Capture a startup fixture once; probe reads this immutable identity instead of
+# relabeling an old process with the current checkout HEAD.
+freeze_serving_fixture() {
+  python3 - "$TMP/serving.json" "$REPO" "$1" "$$" <<'JSON'
+import datetime, json, sys
+now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+json.dump(dict(schema_version=1, updated_at=now, service=dict(state="available"),
+  telegram=dict(state="healthy"), agent=dict(state="healthy"),
+  process=dict(pid=int(sys.argv[4]), started_at=now),
+  runtime_generation=dict(schema="ccc.runtime-generation.v1", observed_at=now,
+    source_dir=sys.argv[2]+"/bridge", source_git=dict(head=sys.argv[3], tracked_changes=False),
+    collection_errors=[])), open(sys.argv[1], "w"))
+JSON
+  printf 'cat %q\n' "$TMP/serving.json" > "$CLAUDE/self-update.serving-generation-cmd"
+}
+
 # 11b) exact serving generation (verified outcome) reconciles and clears.
-printf 'git -C %s rev-parse HEAD\n' "$REPO" > "$CLAUDE/self-update.serving-generation-cmd"
+freeze_serving_fixture "$pending_target"
 rm -f "$TMP/spool"/*.json
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "exact serving generation reconciles the pending activation" '[ "$rc" = 0 ]'
-ok "reconciled tick clears the pending record" '[ ! -e "$PENDING" ]'
+ok "reconciled tick clears the pending record" 'jq -e ".outcome == \"activated\"" "$PENDING" >/dev/null'
 ok "reconciled tick is audited" 'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"activation-reconciled\"" >/dev/null'
 ok "reconciled tick restarts nothing" '[ ! -s "$TMP/systemctl.calls" ]'
 
@@ -1036,17 +1052,17 @@ pending_target="$(git -C "$REPO" rev-parse HEAD)"
 ok "second failed activation re-records evidence for the new target" \
   '[ "$rc" = 7 ] && jq -e --arg t "$pending_target" ".target_sha == \$t and .outcome == \"restart-failed\"" "$PENDING" >/dev/null'
 rm -rf "$STATE"/self-update-install-rollback.*
-printf 'git -C %s rev-parse HEAD~1\n' "$REPO" > "$CLAUDE/self-update.serving-generation-cmd"
+freeze_serving_fixture "$(git -C "$REPO" rev-parse HEAD~1)"
 printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
 : > "$TMP/systemctl.calls"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "mismatched serving generation stays incomplete (exit 14)" '[ "$rc" = 14 ]'
 ok "mismatch logs the actual serving identity" \
-  'grep -q "reason=serving-mismatch target=$pending_target serving=" "$STATE/self-update.log"'
+  'grep -q "reason=identity-unknown target=$pending_target" "$STATE/self-update.log"'
 ok "mismatch keeps the pending record and restarts nothing" '[ -f "$PENDING" ] && [ ! -s "$TMP/systemctl.calls" ]'
 
 # 11d) matching identity but an unhealthy runtime: no automatic activation.
-printf 'git -C %s rev-parse HEAD\n' "$REPO" > "$CLAUDE/self-update.serving-generation-cmd"
+freeze_serving_fixture "$pending_target"
 printf '%s\n' 'exit 1' > "$CLAUDE/self-update.health-cmd"
 : > "$TMP/systemctl.calls"
 out="$(run_selfup run 2>&1)"; rc=$?
@@ -1061,18 +1077,18 @@ mv "$PENDING" "$TMP/pending.bak"
 ln -s "$TMP/pending.bak" "$PENDING"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "symlinked pending record is rejected, not followed" \
-  '[ "$rc" = 14 ] && grep -q "pending-activation unsafe reason=not-regular-file" "$STATE/self-update.log"'
+  '[ "$rc" = 14 ] && grep -q "pending-activation unsafe reason=unsafe-or-interrupted" "$STATE/self-update.log"'
 ok "symlinked pending record is not auto-deleted" '[ -L "$PENDING" ]'
 rm -f "$PENDING" && mv "$TMP/pending.bak" "$PENDING"
 chmod 644 "$PENDING"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "group-readable pending record is rejected" \
-  '[ "$rc" = 14 ] && grep -q "unsafe reason=not-owner-only" "$STATE/self-update.log"'
+  '[ "$rc" = 14 ] && grep -q "unsafe reason=unsafe-or-interrupted" "$STATE/self-update.log"'
 chmod 600 "$PENDING"
 printf '{"schema":"ccc.self-update.activation.v1","target_sha":"trunc' > "$PENDING"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "unparsable pending record is rejected" \
-  '[ "$rc" = 14 ] && grep -q "unsafe reason=unparsable" "$STATE/self-update.log"'
+  '[ "$rc" = 14 ] && grep -q "unsafe reason=unsafe-or-interrupted" "$STATE/self-update.log"'
 
 # 11f) interrupted write: leftover temp naming the CURRENT target means the
 # previous tick may have died between install and restart — refuse convergence.
@@ -1081,13 +1097,13 @@ printf '{"schema":"ccc.self-update.activation.v1","target_sha":"%s","outcome":"p
 chmod 600 "$PENDING.tmp.424242"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "interrupted activation write refuses convergence" \
-  '[ "$rc" = 14 ] && grep -q "interrupted-write temp=" "$STATE/self-update.log"'
-# A stale temp naming an OLDER target is residue: the tick proceeds normally.
+  '[ "$rc" = 14 ] && grep -q "unsafe reason=unsafe-or-interrupted" "$STATE/self-update.log"'
+# Even old or truncated residue cannot prove where a previous write stopped.
 rm -f "$PENDING.tmp.424242"
 printf '{"schema":"ccc.self-update.activation.v1","target_sha":"%s","outcome":"pending"}' "0000000000000000000000000000000000000000" > "$PENDING.tmp.424243"
 chmod 600 "$PENDING.tmp.424243"
 out="$(run_selfup run 2>&1)"; rc=$?
-ok "stale interrupted temp for an old target is ignored" '[ "$rc" = 0 ] && grep -q "already up to date" <<<"$out"'
+ok "stale interrupted temp also refuses convergence" '[ "$rc" = 14 ]'
 rm -f "$PENDING".tmp.*
 
 # 11g) source changes with NO restart target: degraded run (11) records the
@@ -1110,10 +1126,57 @@ printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
 echo pending-four > "$TMP/seed/pending-four.txt"
 git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm pending-four && git -C "$TMP/seed" push -q origin main
 out="$(run_selfup run 2>&1)"; rc=$?
-ok "successful changed tick clears the pending activation record" '[ "$rc" = 0 ] && [ ! -e "$PENDING" ]'
+ok "successful changed tick clears the pending activation record" '[ "$rc" = 0 ] && jq -e ".outcome == \"activated\"" "$PENDING" >/dev/null'
 ok "success leaves no interrupted-write residue" '! compgen -G "$PENDING.tmp.*" >/dev/null'
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "following tick is honestly up to date again" '[ "$rc" = 0 ] && grep -q "already up to date" <<<"$out"'
+
+# 11i) Unsafe transaction names cannot overwrite a symlink target or let the
+# installed marker advance; the following healthy-old tick also fails closed.
+# shellcheck disable=SC2034  # eval assertion below
+old_installed="$(cat "$STATE/self-update.installed-sha")"
+printf KEEP > "$TMP/activation-sentinel"
+ln -s "$TMP/activation-sentinel" "$PENDING.intent"
+echo persistence-one > "$TMP/seed/persistence-one"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm persistence-one && git -C "$TMP/seed" push -q origin main
+: > "$TMP/systemctl.calls"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "pending publication failure stops before installed marker and restart" \
+  '[ "$rc" = 14 ] && [ "$(cat "$STATE/self-update.installed-sha")" = "$old_installed" ] && [ ! -s "$TMP/systemctl.calls" ]'
+ok "pending publication failure preserves sentinel and recovery snapshot" \
+  '[ "$(cat "$TMP/activation-sentinel")" = KEEP ] && compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+printf 'exit 0\n' > "$CLAUDE/self-update.health-cmd"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "healthy old next tick cannot hide pending publication failure" \
+  '[ "$rc" = 14 ] && ! grep -q "already up to date" <<<"$out" && [ ! -s "$TMP/systemctl.calls" ]'
+rm "$PENDING.intent"
+# Explicit fixture operator reconciliation only.
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "reconciled fixture can complete new installation" '[ "$rc" = 0 ]'
+
+# 11j) Actual installed-marker publication failure after durable pending state.
+rm "$STATE/self-update.installed-sha"
+mkdir "$STATE/self-update.installed-sha"
+echo persistence-two > "$TMP/seed/persistence-two"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm persistence-two && git -C "$TMP/seed" push -q origin main
+: > "$TMP/systemctl.calls"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "installed marker failure leaves durable pending and no restart" \
+  '[ "$rc" = 14 ] && jq -e ".outcome == \"pending\"" "$PENDING" >/dev/null && [ ! -s "$TMP/systemctl.calls" ]'
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "healthy old next tick cannot hide installed marker failure" \
+  '[ "$rc" = 14 ] && ! grep -q "already up to date" <<<"$out"'
+rmdir "$STATE/self-update.installed-sha"
+
+# 11k) Dangling final state and truncated temp are evidence, even without JSON.
+rm "$PENDING"
+ln -s "$TMP/no-such-activation" "$PENDING"
+run_selfup run > "$TMP/dangling.out" 2>&1; rc=$?
+ok "dangling pending final state refuses convergence and is retained" '[ "$rc" = 14 ] && [ -L "$PENDING" ]'
+rm "$PENDING"
+printf '{' > "$PENDING.tmp.999999"
+run_selfup run > "$TMP/truncated.out" 2>&1; rc=$?
+ok "truncated interrupted state refuses convergence" "[ \"$rc\" = 14 ]"
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

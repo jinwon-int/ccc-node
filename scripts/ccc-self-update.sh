@@ -191,137 +191,45 @@ resolve_health_cmd() {
 # bounded evidence) and is cleared ONLY on verified activation: every
 # allowlisted restart came back active, an external/recovery restart succeeded
 # with its health probe, or the operator-provided serving-generation probe
-# reports the exact target. Health alone never clears it.
+# supplies existing health JSON with the full frozen startup identity.
+# Health alone or a live checkout HEAD probe never clears it. Completed
+# receipts remain on disk as outcome=activated to preserve durable evidence.
 PENDING_ACTIVATION_FILE="$STATE_DIR/self-update.pending-activation.json"
 SERVING_GEN_FILE="${CCC_SELF_UPDATE_SERVING_GEN_FILE:-$CLAUDE_DIR/self-update.serving-generation-cmd}"
 
-pending_activation_tmp() { printf '%s.tmp.%s' "$PENDING_ACTIVATION_FILE" "$$"; }
-
-# Atomic owner-only write: temp file under umask 077, then rename inside
-# $STATE_DIR. A failed write leaves no record and never reports one; a leftover
-# temp is surfaced by detect_interrupted_pending_write, never silently ignored.
-write_pending_activation() { # <outcome> <services-json> <snapshot-or-empty>
-  local outcome="$1" services="$2" snapshot="${3:-}" tmp
-  tmp="$(pending_activation_tmp)"
-  if ! (umask 077; jq -nc \
-        --arg target "$NEW_SHA" --arg previous "$OLD_SHA" --arg ts "$(ts)" \
-        --arg outcome "$outcome" --argjson services "$services" --arg snapshot "$snapshot" \
-        '{schema:"ccc.self-update.activation.v1", target_sha:$target, previous_sha:$previous,
-          updated_at:$ts, outcome:$outcome, services:$services, snapshot:$snapshot}' \
-        >"$tmp" 2>/dev/null) || ! chmod 600 "$tmp" 2>/dev/null; then
-    rm -f -- "$tmp" 2>/dev/null || :
-    log "warn pending-activation write failed target=$NEW_SHA outcome=$outcome"
+ACTIVATION_HELPER="$SELF_UPDATE_DIR/lib/self-update-activation.py"
+activation_state() { python3 "$ACTIVATION_HELPER" "$1" "$STATE_DIR" "${@:2}"; }
+write_pending_activation() {
+  if ! activation_state write "$NEW_SHA" "$OLD_SHA" "$1" "$2" "${3:-$INSTALL_SNAPSHOT_DIR}"; then
+    KEEP_INSTALL_SNAPSHOT=1
+    log "pending-activation persistence failed; recovery snapshot=$INSTALL_SNAPSHOT_DIR"
     return 1
   fi
-  if ! mv -f -- "$tmp" "$PENDING_ACTIVATION_FILE" 2>/dev/null; then
-    rm -f -- "$tmp" 2>/dev/null || :
-    log "warn pending-activation commit failed target=$NEW_SHA outcome=$outcome"
-    return 1
-  fi
-  log "pending-activation recorded target=$NEW_SHA outcome=$outcome"
 }
-
-clear_pending_activation() {
-  local tmp
-  [ -e "$PENDING_ACTIVATION_FILE" ] || return 0
-  rm -f -- "$PENDING_ACTIVATION_FILE" 2>/dev/null || :
-  [ ! -e "$PENDING_ACTIVATION_FILE" ] || return 1
-  # Remove leftover interrupted-write temps so an already-cleared target cannot
-  # trip detect_interrupted_pending_write on later ticks.
-  for tmp in "$PENDING_ACTIVATION_FILE".tmp.*; do
-    [ -e "$tmp" ] || break
-    rm -f -- "$tmp" 2>/dev/null || log "warn pending-activation temp cleanup failed path=$tmp"
-  done
-  return 0
-}
-
-# Loads the record into PENDING_TARGET_SHA / PENDING_OUTCOME / PENDING_SERVICES.
-# Returns 0 = valid record present, 1 = none, 2 = present but unsafe or corrupt
-# (fail closed: the tick refuses to report up-to-date and never auto-deletes
-# the evidence — a symlink, hardlink, foreign owner, loose mode or unparsable
-# body means someone else touched the updater's activation state).
+clear_pending_activation() { activation_state clear "$NEW_SHA"; }
 load_pending_activation() {
+  local rec rc
   PENDING_TARGET_SHA=""; PENDING_OUTCOME=""; PENDING_SERVICES='[]'
-  [ -e "$PENDING_ACTIVATION_FILE" ] || return 1
-  local mode owner links rec
-  if [ -L "$PENDING_ACTIVATION_FILE" ] || [ ! -f "$PENDING_ACTIVATION_FILE" ]; then
-    log "pending-activation unsafe reason=not-regular-file"
-    return 2
+  rec="$(activation_state load "${NEW_SHA:-}")"; rc=$?
+  if [ "$rc" != 0 ]; then
+    [ "$rc" = 1 ] || log "pending-activation unsafe reason=unsafe-or-interrupted"
+    return "$rc"
   fi
-  mode="$(stat -c %A "$PENDING_ACTIVATION_FILE" 2>/dev/null)" || { log "pending-activation unsafe reason=stat-failed"; return 2; }
-  owner="$(stat -c %u "$PENDING_ACTIVATION_FILE" 2>/dev/null)" || owner=""
-  links="$(stat -c %h "$PENDING_ACTIVATION_FILE" 2>/dev/null)" || links=""
-  if [ "$mode" != "-rw-------" ] || [ -z "$owner" ] || [ "$owner" != "$(id -u)" ] || [ "$links" != "1" ]; then
-    log "pending-activation unsafe reason=not-owner-only mode=$mode owner=$owner links=$links"
-    return 2
-  fi
-  rec="$(head -c 4096 "$PENDING_ACTIVATION_FILE" 2>/dev/null)" || rec=""
-  [ -n "$rec" ] || { log "pending-activation unsafe reason=unreadable"; return 2; }
-  PENDING_TARGET_SHA="$(printf '%s' "$rec" | jq -r 'select(.schema=="ccc.self-update.activation.v1") | .target_sha // empty' 2>/dev/null)" || PENDING_TARGET_SHA=""
-  PENDING_OUTCOME="$(printf '%s' "$rec" | jq -r '.outcome // empty' 2>/dev/null)" || PENDING_OUTCOME=""
-  PENDING_SERVICES="$(printf '%s' "$rec" | jq -c '.services // []' 2>/dev/null)" || PENDING_SERVICES='[]'
-  printf '%s' "$PENDING_TARGET_SHA" | grep -qE '^[0-9a-f]{40}$' || {
-    log "pending-activation unsafe reason=unparsable"
-    return 2
-  }
-  return 0
+  PENDING_TARGET_SHA="$(printf '%s' "$rec" | jq -r .target_sha)"
+  PENDING_OUTCOME="$(printf '%s' "$rec" | jq -r .outcome)"
+  PENDING_SERVICES="$(printf '%s' "$rec" | jq -c .services)"
 }
-
-# An interrupted record write leaves its .tmp.<pid> behind. If that partial
-# record names the CURRENT target, the tick it belonged to may have died
-# anywhere between install and restart — activation is unknown, so the
-# unchanged tick must not claim convergence. Temps naming an older target are
-# stale residue and are ignored (a success-path clear removes them).
-detect_interrupted_pending_write() {
-  local f target
-  for f in "$PENDING_ACTIVATION_FILE".tmp.*; do
-    [ -f "$f" ] || continue
-    [ -L "$f" ] && continue
-    [ -s "$f" ] || continue
-    [ "$(stat -c %u "$f" 2>/dev/null)" = "$(id -u)" ] || continue
-    target="$(head -c 4096 "$f" 2>/dev/null | jq -r 'select(.schema=="ccc.self-update.activation.v1") | .target_sha // empty' 2>/dev/null)" || target=""
-    if [ "$target" = "$NEW_SHA" ]; then
-      log "pending-activation interrupted-write temp=$f target=$NEW_SHA"
-      return 0
-    fi
-  done
-  return 1
-}
-
-# stdout-capturing twin of run_bounded_operator_cmd for the identity probe.
-run_bounded_operator_cmd_capture() { # <seconds> <command>
-  if ! command -v timeout >/dev/null 2>&1; then
-    log "operator-command unavailable=timeout"
-    return 125
-  fi
-  timeout --kill-after=1 "$1" bash -c "$2" 2>>"$LOG"
-}
-
-# Optional operator probe: prints the generation the runtime is serving (full
-# or short SHA). Unconfigured, failing or garbled output = identity UNKNOWN.
+detect_interrupted_pending_write() { activation_state residue; }
 resolve_serving_generation() {
-  local cmd out
+  local cmd
   if [ -n "${CCC_SELF_UPDATE_SERVING_GENERATION_CMD:-}" ]; then
     cmd="$CCC_SELF_UPDATE_SERVING_GENERATION_CMD"
   elif ! cmd="$(read_operator_cmd "$SERVING_GEN_FILE")"; then
-    log "serving-generation probe result=unconfigured"
     return 1
   fi
-  out="$(run_bounded_operator_cmd_capture "$RESTART_WAIT_SECONDS" "$cmd")" || {
-    log "serving-generation probe result=failed"
-    return 1
-  }
-  out="$(printf '%s' "$out" | head -n1 | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
-  printf '%s' "$out" | grep -qE '^[0-9a-f]{7,64}$' || {
-    log "serving-generation probe result=unusable"
-    return 1
-  }
-  printf '%s' "$out"
+  activation_state probe "$REPO" "$cmd" "$RESTART_WAIT_SECONDS"
 }
-
-serving_generation_matches() { # <serving> <target> — exact, or unambiguous short prefix
-  [ "${#1}" -le "${#2}" ] && [ "${2:0:${#1}}" = "$1" ]
-}
+serving_generation_matches() { [ "$1" = "$2" ] && [ "$2" = "$NEW_SHA" ]; }
 
 # Explicitly re-evaluate an incomplete activation on an unchanged tick. This
 # NEVER restarts anything by itself (a pending record must not trigger an
@@ -345,6 +253,7 @@ report_pending_activation() {
       return 3
     fi
     if ! clear_pending_activation; then
+      KEEP_INSTALL_SNAPSHOT=1
       log "pending-activation result=clear-failed target=$PENDING_TARGET_SHA"
       audit "activation-clear-failed" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
       say "self-update: activation verified (${PENDING_TARGET_SHA:0:7} serving) but the pending record could not be cleared; not reporting up-to-date — inspect $PENDING_ACTIVATION_FILE" >&2
@@ -943,6 +852,7 @@ if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
       # A verified successful restart IS activation of the installed
       # generation: a pending record may finally be cleared (no-op if absent).
       if ! clear_pending_activation; then
+        KEEP_INSTALL_SNAPSHOT=1
         audit "activation-clear-failed" "$OLD_SHA" "$NEW_SHA" false true "[]"
         notify "self-update ${SHORT_CUR}: 복구 재시작은 성공했지만 활성화 기록 정리에 실패했습니다. 확인 후 ~/.claude/state/self-update.pending-activation.json 을 삭제하세요." "pending-clear-fail-$NEW_SHA"
         say "self-update: recovery restart succeeded but the pending-activation record could not be cleared" >&2
@@ -1029,13 +939,17 @@ fi
 # config preflight succeed. Otherwise rollback leaves a rejected NEW_SHA in
 # the marker and a later hand-pulled checkout can incorrectly skip redeploy.
 # Keep this before restarts: a runtime failure does not undo installed assets.
-printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || log "warn installed-sha marker write failed path=$INSTALLED_SHA_FILE"
-# Activation-evidence start (#1527): the generation is now installed but NOT
-# yet verified active. Cleared once every restart is verified; updated with the
-# outcome on failure. If the updater dies between here and there, the record
-# survives with outcome=pending and the next unchanged tick reports the
-# incomplete activation instead of claiming convergence.
-write_pending_activation "pending" '[]' "" || :  # best-effort: the tick's own exit code stays the failure signal
+# Durable pending evidence precedes advancing the installed marker. On any
+# persistence uncertainty stop before restart and keep the recovery snapshot.
+if ! write_pending_activation "pending" '[]' "$INSTALL_SNAPSHOT_DIR"; then
+  say "self-update: activation evidence could not be persisted; recovery snapshot retained" >&2
+  exit 14
+fi
+if ! printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE"; then
+  KEEP_INSTALL_SNAPSHOT=1
+  say "self-update: installed marker publication failed; activation remains pending" >&2
+  exit 14
+fi
 # The recovery snapshot deliberately outlives setup and the runtime-config
 # preflight: a service that fails to come back is exactly when rollback
 # material is needed, and deleting it here left that path with nothing to
@@ -1092,7 +1006,8 @@ else
     log "reapply begin installer=$installer old=$old_gen new=$current"
     if ! CCC_CRONTAB_CMD="$CRONTAB_CMD" bash "$REPO/$installer" "${rec_argv[@]}" >>"$LOG" 2>&1; then
       "$CRONTAB_CMD" "$CRONTAB_SNAP" >>"$LOG" 2>&1 || true
-      write_pending_activation "reapply-aborted" '[]' "" || :
+      KEEP_INSTALL_SNAPSHOT=1
+      write_pending_activation "reapply-aborted" '[]' "$INSTALL_SNAPSHOT_DIR" || exit 14
       audit "reapply-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" '[]'
       notify "self-update $(git -C "$REPO" rev-parse --short HEAD): cron 재적용 실패 ($installer) — crontab 복원됨. ~/.claude/state/self-update.log" "reapply-fail-$NEW_SHA"
       say "self-update: installer re-apply failed ($installer); crontab restored" >&2
@@ -1100,7 +1015,8 @@ else
     fi
     if ! "$CRONTAB_CMD" -l 2>/dev/null | grep -F "$marker" | grep -qF "gen=$current"; then
       "$CRONTAB_CMD" "$CRONTAB_SNAP" >>"$LOG" 2>&1 || true
-      write_pending_activation "reapply-verify-aborted" '[]' "" || :
+      KEEP_INSTALL_SNAPSHOT=1
+      write_pending_activation "reapply-verify-aborted" '[]' "$INSTALL_SNAPSHOT_DIR" || exit 14
       audit "reapply-verify-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" '[]'
       notify "self-update $(git -C "$REPO" rev-parse --short HEAD): cron 재적용 검증 실패 ($installer) — crontab 복원됨. ~/.claude/state/self-update.log" "reapply-verify-$NEW_SHA"
       say "self-update: installer re-apply did not stamp $marker with $current; crontab restored" >&2
@@ -1162,7 +1078,7 @@ if [ "$FAILED" -gt 0 ]; then
   # previous code deleted it before the restarts ran, leaving nothing to
   # recover from.
   KEEP_INSTALL_SNAPSHOT=1
-  write_pending_activation "restart-failed" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || :
+  write_pending_activation "restart-failed" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
   audit "restart-failures" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
   log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=restart-failure"
   notify "self-update ${SHORT_NEW}: 서비스 ${FAILED}개 재시작 실패 (${RESTARTED}개 성공, 재시도 후). 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log 확인 필요." "fail-$NEW_SHA"
@@ -1186,7 +1102,7 @@ if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && [ "$RESTARTED" -eq 0 ];
     else
       KEEP_INSTALL_SNAPSHOT=1
       SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c '. + [{"name":"external-restart","ok":false,"scope":"external"}]')"
-      write_pending_activation "external-restart-failed" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || :
+      write_pending_activation "external-restart-failed" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
       audit "restart-failures" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
       log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=external-restart-failure"
       notify "self-update ${SHORT_NEW}: 코드 갱신 후 외부 재시작 명령이 실패했습니다 — 브리지가 남아있는지 즉시 확인 필요. 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log" "fail-$NEW_SHA"
@@ -1194,7 +1110,8 @@ if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && [ "$RESTARTED" -eq 0 ];
       exit 7
     fi
   else
-    write_pending_activation "degraded-no-restart-target" "$SERVICES_JSON" "" || :
+    KEEP_INSTALL_SNAPSHOT=1
+    write_pending_activation "degraded-no-restart-target" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
     audit "degraded-no-services" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
     notify "self-update ${SHORT_NEW}: 코드 갱신됐으나 재시작된 서비스 없음 (허용목록 누락/비어있음 의심). 실행 중 프로세스가 옛 코드일 수 있음 — self-update.services 확인 필요. ~/.claude/state/self-update.log" "degraded-$NEW_SHA"
     say "self-update: degraded — ${OLD_SHA:0:7} → ${SHORT_NEW}, services restarted: 0 (no allowlisted services; runtime may be stale)" >&2
@@ -1208,6 +1125,7 @@ fi
 # failed clear is fail-closed — the next unchanged tick would otherwise
 # re-report an activation that actually completed.
 if ! clear_pending_activation; then
+  KEEP_INSTALL_SNAPSHOT=1
   audit "activation-clear-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
   notify "self-update ${SHORT_NEW}: 활성화는 완료됐지만 시도 기록 정리에 실패했습니다. 확인 후 ~/.claude/state/self-update.pending-activation.json 을 삭제하세요." "pending-clear-fail-$NEW_SHA"
   say "self-update: activation completed but the pending-activation record could not be cleared; not reporting clean success" >&2

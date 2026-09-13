@@ -667,6 +667,8 @@ ok "setup refuses a checkout path unsafe for slash-command embedding" \
   '[ "$rc" = 2 ] && grep -q "unsafe for installed slash commands" <<<"$out" && [ ! -e "$TMP/space-claude" ]'
 ok "setup deploys the shared path library beside installed self-update" \
   '[ -x "$rewrite_claude/hooks/lib/harness-paths.sh" ] && [ -x "$rewrite_claude/hooks/lib/harness_paths.py" ] && cmp -s "$ROOT/scripts/lib/harness-paths.sh" "$rewrite_claude/hooks/lib/harness-paths.sh" && cmp -s "$ROOT/scripts/lib/harness_paths.py" "$rewrite_claude/hooks/lib/harness_paths.py" && grep -Fq "lib/harness-paths.sh" "$rewrite_claude/hooks/ccc-self-update.sh"'
+ok "setup deploys the durable activation helper beside installed self-update" \
+  '[ -x "$rewrite_claude/hooks/lib/self-update-activation.py" ] && cmp -s "$ROOT/scripts/lib/self-update-activation.py" "$rewrite_claude/hooks/lib/self-update-activation.py"'
 # checkpoint.sh/distill.sh source lib/mtime-prune.sh behind an if-readable
 # guard; without deploying it, standalone-node pruning is a silent no-op.
 ok "setup deploys the mtime-prune library the pruning hooks source" \
