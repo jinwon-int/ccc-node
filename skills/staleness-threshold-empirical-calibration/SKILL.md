@@ -58,8 +58,20 @@ need to decide whether that means "healthy" or "broken".
 
 4. **Derive the number from the governing convention, not from the distribution.**
    Ask: what cadence does the policy, runbook, or schema imply? A quarterly
-   review cycle gives 90 days. A daily refresh lane with a 1-day freshness
-   bound gives ~7 days (a week of silence means the lane stopped).
+   review cycle gives 90 days. Be precise about what the convention actually
+   states: a convention that says only "refresh daily" states a cadence, not a
+   staleness bound — a 1-day freshness bound does **not** by itself translate
+   into a larger threshold such as ~7 days. That extra factor is a separate
+   rule and must be quoted, not assumed.
+
+   Worked example (synthetic, illustrative — not a real operating fact): if a
+   lane's written convention says "refresh daily; consider an item abandoned
+   after 7 consecutive days without a refresh", then N = 7 because the
+   convention states 7 consecutive missed refreshes — the number is quoted
+   from the governing document, not derived from the data. If the document
+   stops at "refresh daily", say the bound is undefined and propose one (for
+   example, a stated silence window or escalation count) rather than
+   multiplying the cadence to manufacture a number.
 
    **Do not** compute the threshold from the data — `max_observed × 1.2`,
    `p90`, and friends pick a number engineered to fire. That is inventing a

@@ -142,7 +142,7 @@
       "name": "bridge-yield-continue",
       "source": "skills/bridge-yield-continue",
       "status": "active",
-      "tree_sha256": "97585e600c07225a5a23efac38114151f1bff5ad3ba4723c31322c8ccdfbc8c8"
+      "tree_sha256": "4d896795068b527f3f44e7eefc2c05e0eba112d3b3f478e888d6a5aeddc5e8f1"
     },
     {
       "audience": "shared",
@@ -384,7 +384,7 @@
       "name": "staleness-threshold-empirical-calibration",
       "source": "skills/staleness-threshold-empirical-calibration",
       "status": "active",
-      "tree_sha256": "253a5838d002e2216013c113a2145216d8b1984769c1a2f5cc5b529b5b35cfac"
+      "tree_sha256": "ded0b7983567b5dfd19ec74620eb1e2e957a5e5e1549fbea6793a3a570660beb"
     },
     {
       "audience": "shared",
