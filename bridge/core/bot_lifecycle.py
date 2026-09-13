@@ -59,7 +59,7 @@ from telegram_bot.core.continuation import ContinuationQueue, default_queue_path
 from telegram_bot.core.continuation_monitor import ContinuationMonitor
 from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
 from telegram_bot.core.webhook_nudge import build_from_env as build_webhook_nudge_server
-from telegram_bot.core.turn_watchdog import TurnAgeWatchdog
+from telegram_bot.core.turn_watchdog import DEFAULT_NOTIFY_MINUTES, TurnAgeWatchdog
 from telegram_bot.core.codex_app_server import live_app_server_clients
 from telegram_bot.core.turn_stall import StallProbeMonitor
 from telegram_bot.core.usage_meter import MODE_AUTONOMOUS
@@ -1475,13 +1475,13 @@ class BotLifecycleMixin:
         )
 
     def _build_turn_age_watchdog(self):
-        """Notify-only turn-age dashboard (#1111); None when off (the default).
+        """Notify-only turn-age dashboard (#1111); None when explicitly off.
 
         Never interrupts, pauses, or reroutes a turn — pure visibility. Ages
         come from the session registry's monotonic ``started_at`` stamps.
         """
         threshold_min = ExternalWaitMonitor.env_int(
-            "CCC_TURN_AGE_NOTIFY_MIN", default=0
+            "CCC_TURN_AGE_NOTIFY_MIN", default=DEFAULT_NOTIFY_MINUTES
         )
         if threshold_min <= 0:
             logger.info("Turn-age watchdog disabled (CCC_TURN_AGE_NOTIFY_MIN=0)")
