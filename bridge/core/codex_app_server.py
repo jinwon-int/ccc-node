@@ -321,15 +321,57 @@ class CodexAppServerClient:
         *,
         cwd: str | None = None,
         model: str | None = None,
+        exclude_turns: bool = False,
     ) -> JsonValue:
-        """Resume an existing Codex thread."""
+        """Resume an existing Codex thread.
+
+        ``exclude_turns`` asks the app-server to omit ``thread.turns`` (#1720).
+        Without it the response carries the whole history in one frame —
+        16.48 MiB for a 109-turn thread on seoseo — although the runtime only
+        needs the last turn. codex >= 0.153 honours the flag (``turns`` comes
+        back empty); older app-servers ignore unknown params (measured on
+        0.149.1) and still answer with the full history, which callers must
+        treat as the legacy shape.
+        """
 
         params: JsonObject = {"threadId": thread_id}
         if cwd is not None:
             params["cwd"] = cwd
         if model is not None:
             params["model"] = model
+        if exclude_turns:
+            params["excludeTurns"] = True
         return await self.request("thread/resume", params)
+
+    async def thread_turns_list(
+        self,
+        thread_id: str,
+        *,
+        limit: int = 1,
+        sort_direction: str = "desc",
+        items_view: str = "full",
+    ) -> JsonValue:
+        """Page a thread's turns without loading the whole history (#1720).
+
+        ``items_view="full"`` is required for the orphaned tool-call check:
+        the default ``summary`` view drops tool-call items and their
+        ``status``. Older app-servers reject the method (0.149.1: "requires
+        experimentalApi capability"); callers fall back to the full resume.
+        """
+
+        if not 1 <= limit <= 100:
+            raise ValueError("thread turns list limit must be between 1 and 100")
+        if sort_direction not in {"asc", "desc"}:
+            raise ValueError("thread turns list sortDirection must be asc or desc")
+        if items_view not in {"notLoaded", "summary", "full"}:
+            raise ValueError("thread turns list itemsView must be notLoaded, summary or full")
+        params: JsonObject = {
+            "threadId": thread_id,
+            "limit": limit,
+            "sortDirection": sort_direction,
+            "itemsView": items_view,
+        }
+        return await self.request("thread/turns/list", params)
 
     async def thread_rollback(self, thread_id: str, *, num_turns: int) -> JsonValue:
         """Drop incomplete turns from the end of a Codex thread."""

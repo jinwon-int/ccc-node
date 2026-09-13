@@ -1,5 +1,13 @@
 # Changelog
 
+- **Codex `thread/resume` no longer downloads the whole thread (#1720).** The
+  runtime resumes with `excludeTurns` and judges the orphaned-tool-call
+  recovery from `thread/turns/list` (one turn, full items) — 1.6 KB + ≤ one
+  turn instead of a history frame that reached 16.48 MiB on seoseo (#1718).
+  App-servers that ignore `excludeTurns` (0.149.1) still return the history
+  and are judged as before; ones that reject `thread/turns/list` pin the
+  runtime to the full resume after a single fallback.
+
 - **JSONL frames larger than the stream buffer no longer kill the Codex/Piri
   connection (#1718).** `codex app-server` answers `thread/resume` with the
   whole thread in one frame; a 109-turn thread on seoseo measured 16.48 MiB,

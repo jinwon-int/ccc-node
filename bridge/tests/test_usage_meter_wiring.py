@@ -694,8 +694,19 @@ class CodexRuntimeRecorderTests(unittest.IsolatedAsyncioTestCase):
                 *,
                 cwd: str | None = None,
                 model: str | None = None,
+                exclude_turns: bool = False,
             ) -> dict:
                 return {"thread": {"id": thread_id}}
+
+            async def thread_turns_list(
+                self,
+                thread_id: str,
+                *,
+                limit: int = 1,
+                sort_direction: str = "desc",
+                items_view: str = "full",
+            ) -> dict:
+                return {"data": []}
 
             async def next_notification(self) -> CodexNotification:
                 await asyncio.Event().wait()
