@@ -297,6 +297,64 @@ class RuntimeHealthReporterTests(unittest.TestCase):
             self.assertEqual(health["claude"]["state"], "healthy")
             self.assertEqual(health["service"]["state"], "available")
 
+    def test_codex_resume_diagnostics_are_cached_scalar_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(
+                project_root / ".telegram_bot", agent_provider="codex"
+            )
+            reporter.initialize_process()
+
+            initial = reporter.snapshot()["codex_resume"]
+            self.assertEqual(initial["mode"], "unknown")
+            self.assertIsNone(initial["last_turn_item_count"])
+            self.assertIsNone(initial["observed_result_json_bytes"])
+
+            reporter.record_codex_resume_diagnostics(
+                {
+                    "mode": "lightweight",
+                    "last_turn_item_count": 4,
+                    "observed_result_method": "thread/turns/list",
+                    "observed_result_json_bytes": 321,
+                    "thread_id": "private-thread-id",
+                    "text": "private body",
+                }
+            )
+
+            health_text = reporter.health_file.read_text(encoding="utf-8")
+            diagnostics = json.loads(health_text)["codex_resume"]
+            self.assertEqual(diagnostics["mode"], "lightweight")
+            self.assertEqual(diagnostics["last_turn_item_count"], 4)
+            self.assertEqual(diagnostics["observed_result_method"], "thread/turns/list")
+            self.assertEqual(diagnostics["observed_result_json_bytes"], 321)
+            self.assertNotIn("private-thread-id", health_text)
+            self.assertNotIn("private body", health_text)
+
+            reporter.record_codex_resume_diagnostics(
+                {
+                    "mode": "invalid",
+                    "last_turn_item_count": -1,
+                    "observed_result_method": "thread/read",
+                    "observed_result_json_bytes": 999,
+                }
+            )
+            invalid = reporter.snapshot()["codex_resume"]
+            self.assertEqual(invalid["mode"], "unknown")
+            self.assertIsNone(invalid["last_turn_item_count"])
+            self.assertIsNone(invalid["observed_result_method"])
+            self.assertIsNone(invalid["observed_result_json_bytes"])
+
+    def test_codex_resume_rejects_unhashable_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            module = self._load_health_module(root)
+            reporter = module.RuntimeHealthReporter(root / ".telegram_bot", agent_provider="codex")
+            reporter.record_codex_resume_diagnostics({"mode": [], "observed_result_method": {}})
+            result = reporter.snapshot()["codex_resume"]
+            self.assertEqual(result["mode"], "unknown")
+            self.assertIsNone(result["observed_result_method"])
+
     def test_crush_provider_is_reported_as_itself(self):
         # #926 added the crush lane but health kept a two-way codex/claude
         # test, so a crush node reported provider=claude and an operator could

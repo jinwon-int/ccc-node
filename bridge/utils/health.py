@@ -27,6 +27,11 @@ _AGENT_PROVIDER_LABELS = {
     "danso": "Danso",
 }
 _KNOWN_AGENT_PROVIDERS = frozenset(_AGENT_PROVIDER_LABELS)
+_CODEX_RESUME_MODES = frozenset(
+    {"unknown", "lightweight", "compatibility_fallback"}
+)
+_CODEX_RESUME_METHODS = frozenset({"thread/resume", "thread/turns/list"})
+_CODEX_RESUME_MAX_SCALAR = (1 << 31) - 1
 
 
 def _utc_now_iso() -> str:
@@ -37,6 +42,16 @@ def _normalize_reason(value: Optional[str]) -> str:
     if not value:
         return ""
     return " ".join(str(value).split())[:500]
+
+
+def _unknown_codex_resume_diagnostics() -> dict[str, Any]:
+    return {
+        "mode": "unknown",
+        "last_turn_item_count": None,
+        "observed_result_method": None,
+        "observed_result_json_bytes": None,
+        "observed_at": None,
+    }
 
 
 def _pid_is_alive(pid_text: Optional[str]) -> bool:
@@ -176,6 +191,8 @@ class RuntimeHealthReporter:
                 "delegated_task_stalls": 0,
             },
         }
+        if self._agent_provider == "codex":
+            self._state["codex_resume"] = _unknown_codex_resume_diagnostics()
 
     @property
     def health_file(self) -> Path:
@@ -334,6 +351,53 @@ class RuntimeHealthReporter:
             self._state["agent"]["last_error"] = _normalize_reason(error)
             self._sync_legacy_agent_locked()
             self._recompute_service_locked()
+            self._write_health_locked()
+
+    def record_codex_resume_diagnostics(self, diagnostics: dict[str, Any]) -> None:
+        """Publish scalar metadata from an already-completed Codex resume.
+
+        The runtime passes a deliberately tiny projection. Validate it again at
+        the health boundary so a future adapter cannot accidentally persist
+        provider ids, text, or arbitrary payload fields in ``health.json``.
+        """
+
+        mode = diagnostics.get("mode") if isinstance(diagnostics, dict) else None
+        if not isinstance(mode, str) or mode not in _CODEX_RESUME_MODES:
+            mode = "unknown"
+
+        item_count = diagnostics.get("last_turn_item_count") if isinstance(diagnostics, dict) else None
+        if (
+            not isinstance(item_count, int)
+            or isinstance(item_count, bool)
+            or not 0 <= item_count <= _CODEX_RESUME_MAX_SCALAR
+        ):
+            item_count = None
+
+        method = diagnostics.get("observed_result_method") if isinstance(diagnostics, dict) else None
+        if not isinstance(method, str) or method not in _CODEX_RESUME_METHODS:
+            method = None
+
+        result_bytes = (
+            diagnostics.get("observed_result_json_bytes")
+            if isinstance(diagnostics, dict)
+            else None
+        )
+        if (
+            not isinstance(result_bytes, int)
+            or isinstance(result_bytes, bool)
+            or not 0 <= result_bytes <= _CODEX_RESUME_MAX_SCALAR
+            or method is None
+        ):
+            result_bytes = None
+
+        with self._lock:
+            self._state["codex_resume"] = {
+                "mode": mode,
+                "last_turn_item_count": item_count,
+                "observed_result_method": method,
+                "observed_result_json_bytes": result_bytes,
+                "observed_at": _utc_now_iso(),
+            }
             self._write_health_locked()
 
     # Compatibility names retained for shared runtime paths and external users.

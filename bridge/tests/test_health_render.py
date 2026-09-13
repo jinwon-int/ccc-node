@@ -602,6 +602,62 @@ class HealthRenderTests(unittest.TestCase):
         self.assertIn("   Telegram: unavailable (conn refused)", lines)
         self.assertIn("   Codex: healthy", lines)
 
+    def test_codex_resume_status_is_not_observed_until_runtime_reports_it(self):
+        data = self._fresh(
+            agent={"state": "healthy", "provider": "codex", "last_error": ""}
+        )
+        lines = self._render(self._write(data), provider="codex")
+
+        self.assertIn("   Codex resume: unknown (not observed)", lines)
+
+    def test_codex_resume_status_names_last_turn_and_observed_result_size(self):
+        data = self._fresh(
+            agent={"state": "healthy", "provider": "codex", "last_error": ""},
+            codex_resume={
+                "mode": "lightweight",
+                "last_turn_item_count": 7,
+                "observed_result_method": "thread/turns/list",
+                "observed_result_json_bytes": 1616,
+            },
+        )
+
+        lines = self._render(self._write(data), provider="codex")
+
+        resume_line = next(line for line in lines if "Codex resume:" in line)
+        self.assertIn("lightweight", resume_line)
+        self.assertIn("last-turn items observed=7", resume_line)
+        self.assertIn("thread/turns/list result JSON=1616 bytes", resume_line)
+        self.assertNotIn("total", resume_line)
+        self.assertNotIn("thread items", resume_line)
+
+    def test_codex_resume_status_uses_unknown_size_when_not_available(self):
+        data = self._fresh(
+            agent={"state": "healthy", "provider": "codex", "last_error": ""},
+            codex_resume={
+                "mode": "compatibility_fallback",
+                "last_turn_item_count": None,
+                "observed_result_method": None,
+                "observed_result_json_bytes": None,
+            },
+        )
+
+        lines = self._render(self._write(data), provider="codex")
+
+        self.assertIn(
+            "   Codex resume: compatibility-fallback (last-turn items not observed; "
+            "result JSON size not observed)",
+            lines,
+        )
+
+    def test_codex_resume_malformed_fields_do_not_crash_status(self):
+        for section in [
+            {"mode": []},
+            {"mode": "lightweight", "observed_result_method": {}, "observed_result_json_bytes": 3},
+        ]:
+            data = self._fresh(agent={"provider": "codex", "state": "healthy"}, codex_resume=section)
+            lines = self._render(self._write(data), provider="codex")
+            self.assertTrue(any("Codex resume:" in line for line in lines))
+
     def test_unavailable_icon(self):
         lines = self._render(self._write(self._fresh(service={"state": "unavailable"})))
         self.assertEqual(lines[0], "🔴 Bot status: unavailable")

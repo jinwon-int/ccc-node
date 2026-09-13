@@ -273,6 +273,13 @@ def build_context(
                                    telegram_port=telegram_port, clock=clock)
 
 
+def _bind_resume_diagnostics(agent_runtime: Any, health_reporter: Any) -> None:
+    """Attach the optional body-free resume observer without provider RPCs."""
+    setter = getattr(agent_runtime, "set_resume_diagnostics_observer", None)
+    if callable(setter):
+        setter(health_reporter.record_codex_resume_diagnostics)
+
+
 def _build_standard_context(
     settings: Settings, *, sdk_factory: Any = None, agent_runtime: Any = None,
     telegram_port: Any = None, clock: Any = None,
@@ -387,6 +394,7 @@ def _build_standard_context(
         settings.agent_provider,
         settings.dead_session_wakeup,
     )
+    _bind_resume_diagnostics(agent_runtime, health_reporter)
     store = SessionStore(settings.session_store_path)
     session_manager = SessionManager(store=store, settings=settings)
     # Enabling Danso must not consume or mutate another provider's backlog.
