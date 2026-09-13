@@ -202,6 +202,7 @@ class CodexAppServerClient:
         self._server_request_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
         self._connection_error: CodexConnectionClosedError | None = None
+        self._connection_error_rejections = 0
         self._initialize_result: JsonValue = None
         self._started = False
         # True for the duration of a _teardown_transport() call. _watch_process
@@ -269,10 +270,31 @@ class CodexAppServerClient:
             _LIVE_CLIENTS.add(self)
             return result
 
+    @property
+    def connection_error(self) -> CodexConnectionClosedError | None:
+        """The fatal transport error pinned on this client, if any (#1721).
+
+        Once set, every ``request()``/``start()`` fails immediately; only a
+        new client (runtime recycle) clears the condition. Exposed so the
+        runtime can heal proactively instead of failing every later turn.
+        """
+
+        return self._connection_error
+
     async def request(self, method: str, params: Mapping[str, JsonValue] | None = None) -> JsonValue:
         """Send one request and await its correlated response."""
 
         if self._connection_error is not None:
+            self._connection_error_rejections += 1
+            if self._connection_error_rejections == 1:
+                # Until #1721 a poisoned transport failed silently: nothing in
+                # the journal distinguished it from a healthy idle client.
+                logger.warning(
+                    "app-server request %s rejected: transport is poisoned (%s); "
+                    "the runtime must recycle this client",
+                    method,
+                    self._connection_error,
+                )
             raise self._connection_error
         if self._closed or self._reader_task is None:
             raise CodexConnectionClosedError("client is not running")

@@ -63,6 +63,7 @@ from telegram_bot.core.usage import claude_endpoint_host
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE
 from telegram_bot.core.sdk_text import TERMINAL_STALL_NOTICE
 from telegram_bot.utils.chat_logger import log_chat
+from telegram_bot.core.codex_app_server import CodexConnectionClosedError
 from telegram_bot.utils.health import health_reporter
 
 logger = logging.getLogger(__name__)
@@ -866,6 +867,11 @@ class ProjectChatProcessMixin:
                         )
                         if dispatch_guard is not None and not dispatch_guard():
                             return ChatResponse(content="Recovery selection expired; use /task_recover.", success=False)
+                        if getattr(self, "_agent_connection_error_reported", False):
+                            # #1721: the transport healed (recycle + successful
+                            # session start) — clear the degraded agent state.
+                            self._agent_connection_error_reported = False
+                            health_reporter.record_agent_ok()
                         recorder = getattr(self, "_session_started_recorder", None)
                         if recorder is not None:
                             # Persist the identity before any tool can execute. A failed
@@ -1541,6 +1547,14 @@ class ProjectChatProcessMixin:
                         streaming_handler, context="returning an agent error"
                     )
                 message = str(exc) or "Agent runtime failed"
+                if isinstance(exc, CodexConnectionClosedError):
+                    # #1721: a dead or poisoned app-server transport must show
+                    # up in /status instead of "Codex: healthy" (the liveness
+                    # probe only sees the process, which may still be running).
+                    health_reporter.record_agent_error(
+                        f"Codex app-server connection failed: {message}"
+                    )
+                    self._agent_connection_error_reported = True
                 return ChatResponse(
                     content=f"❌ Error: {message}",
                     success=False,
