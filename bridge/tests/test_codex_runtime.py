@@ -75,6 +75,9 @@ class FakeClient:
         self.thread_resume_result: Any = None
         self.thread_rollback_result: Any = None
         self.thread_rollback_error: BaseException | None = None
+        self.thread_turns_list_calls: list[dict[str, Any]] = []
+        self.thread_turns_list_result: Any = {"data": []}
+        self.thread_turns_list_error: BaseException | None = None
         self.thread_resume_gate: asyncio.Event | None = None
         self.notifications: asyncio.Queue[CodexNotification | BaseException] = asyncio.Queue()
         self.model_result: Any = {"data": []}
@@ -110,13 +113,36 @@ class FakeClient:
         *,
         cwd: str | None = None,
         model: str | None = None,
+        exclude_turns: bool = False,
     ) -> Any:
-        self.thread_resume_calls.append({"thread_id": thread_id, "cwd": cwd, "model": model})
+        self.thread_resume_calls.append(
+            {"thread_id": thread_id, "cwd": cwd, "model": model, "exclude_turns": exclude_turns}
+        )
         if self.thread_resume_gate is not None:
             await self.thread_resume_gate.wait()
         if self.thread_resume_result is not None:
             return self.thread_resume_result
         return {"thread": {"id": thread_id}}
+
+    async def thread_turns_list(
+        self,
+        thread_id: str,
+        *,
+        limit: int = 1,
+        sort_direction: str = "desc",
+        items_view: str = "full",
+    ) -> Any:
+        self.thread_turns_list_calls.append(
+            {
+                "thread_id": thread_id,
+                "limit": limit,
+                "sort_direction": sort_direction,
+                "items_view": items_view,
+            }
+        )
+        if self.thread_turns_list_error is not None:
+            raise self.thread_turns_list_error
+        return self.thread_turns_list_result
 
     async def thread_rollback(self, thread_id: str, *, num_turns: int) -> Any:
         self.thread_rollback_calls.append({"thread_id": thread_id, "num_turns": num_turns})
@@ -273,7 +299,7 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             client.thread_resume_calls,
-            [{"thread_id": "thread-old", "cwd": "/workspace/resume", "model": "codex-b"}],
+            [{"thread_id": "thread-old", "cwd": "/workspace/resume", "model": "codex-b", "exclude_turns": True}],
         )
         self.assertEqual(
             models,
@@ -345,6 +371,7 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "thread_id": "thread-new",
                     "cwd": "/workspace",
                     "model": None,
+                    "exclude_turns": True,
                 }
             ],
         )
@@ -440,6 +467,128 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             client.thread_rollback_calls,
             [{"thread_id": "thread-damaged", "num_turns": 1}],
         )
+
+    async def test_lightweight_resume_judges_last_turn_from_turns_list(self) -> None:
+        # #1720: excludeTurns resume returns no history; the orphan verdict comes
+        # from thread/turns/list (one turn, full items) and still triggers rollback.
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+        client.thread_resume_result = {
+            "thread": {"id": "thread-light", "status": {"type": "idle"}, "turns": []}
+        }
+        client.thread_turns_list_result = {
+            "data": [
+                {
+                    "id": "turn-interrupted",
+                    "status": "interrupted",
+                    "items": [
+                        {
+                            "id": "call-orphan",
+                            "type": "dynamicToolCall",
+                            "status": "inProgress",
+                            "contentItems": None,
+                            "success": None,
+                        }
+                    ],
+                }
+            ],
+            "nextCursor": None,
+        }
+        client.thread_rollback_result = {
+            "thread": {"id": "thread-light", "status": {"type": "idle"}, "turns": []}
+        }
+
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-light")
+        )
+
+        self.assertEqual(session.session_id, "thread-light")
+        self.assertEqual(
+            [call["exclude_turns"] for call in client.thread_resume_calls], [True]
+        )
+        self.assertEqual(
+            client.thread_turns_list_calls,
+            [
+                {
+                    "thread_id": "thread-light",
+                    "limit": 1,
+                    "sort_direction": "desc",
+                    "items_view": "full",
+                }
+            ],
+        )
+        self.assertEqual(
+            client.thread_rollback_calls, [{"thread_id": "thread-light", "num_turns": 1}]
+        )
+
+    async def test_lightweight_resume_keeps_completed_last_turn(self) -> None:
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+        client.thread_resume_result = {
+            "thread": {"id": "thread-light", "status": {"type": "idle"}, "turns": []}
+        }
+        client.thread_turns_list_result = {
+            "data": [{"id": "turn-done", "status": "completed", "items": []}]
+        }
+
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-light")
+        )
+
+        self.assertEqual(len(client.thread_turns_list_calls), 1)
+        self.assertEqual(client.thread_rollback_calls, [])
+
+    async def test_lightweight_resume_falls_back_when_turns_list_is_rejected(self) -> None:
+        # codex 0.149.1 answers "thread/turns/list requires experimentalApi
+        # capability": the runtime re-resumes with the full history, judges it
+        # as before, and pins itself to the full resume for later calls.
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+        client.thread_resume_result = {
+            "thread": {"id": "thread-old", "status": {"type": "idle"}, "turns": []}
+        }
+        client.thread_turns_list_error = RuntimeError(
+            "{'code': -32600, 'message': 'thread/turns/list requires experimentalApi capability'}"
+        )
+
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-old")
+        )
+        self.assertEqual(
+            [call["exclude_turns"] for call in client.thread_resume_calls], [True, False]
+        )
+        self.assertEqual(client.thread_rollback_calls, [])
+
+        # Pinned: the next resume goes straight to the full history.
+        client.thread_turns_list_calls.clear()
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-old")
+        )
+        self.assertEqual(
+            [call["exclude_turns"] for call in client.thread_resume_calls],
+            [True, False, False],
+        )
+        self.assertEqual(client.thread_turns_list_calls, [])
+
+    async def test_resume_with_legacy_history_shape_skips_turns_list(self) -> None:
+        # An app-server that ignores excludeTurns (0.149.1) still ships the turns:
+        # they are judged directly and thread/turns/list is never called.
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+        client.thread_resume_result = {
+            "thread": {
+                "id": "thread-legacy",
+                "status": {"type": "idle"},
+                "turns": [{"id": "turn-done", "status": "completed", "items": []}],
+            }
+        }
+
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-legacy")
+        )
+
+        self.assertEqual(client.thread_turns_list_calls, [])
+        self.assertEqual(client.thread_rollback_calls, [])
 
     async def test_resume_preserves_completed_or_active_dynamic_tool_calls(self) -> None:
         await self.runtime._ensure_started()

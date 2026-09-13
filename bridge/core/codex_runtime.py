@@ -42,6 +42,7 @@ from .agent_runtime import (
 from .async_completion_delivery import bounded_completion_text
 from .codex_app_server import (
     CodexAppServerClient,
+    CodexConnectionClosedError,
     CodexNotification,
     CodexServerRequest,
     CodexThread,
@@ -186,6 +187,16 @@ class AppServerClient(Protocol):
         *,
         cwd: str | None = None,
         model: str | None = None,
+        exclude_turns: bool = False,
+    ) -> JsonValue: ...
+
+    async def thread_turns_list(
+        self,
+        thread_id: str,
+        *,
+        limit: int = 1,
+        sort_direction: str = "desc",
+        items_view: str = "full",
     ) -> JsonValue: ...
 
     async def thread_rollback(self, thread_id: str, *, num_turns: int) -> JsonValue: ...
@@ -450,6 +461,8 @@ class CodexRuntime:
 
             self._client_factory = environment_client_factory
         self._client = self._client_factory(self._handle_server_request)
+        # #1720: lightweight resume until thread/turns/list proves unavailable.
+        self._resume_exclude_turns = True
         self._process_environment = bound_environment
         self._working_state_environment = select_working_state_environment(
             working_state_environment
@@ -632,14 +645,12 @@ class CodexRuntime:
             thread_id = request.session_id
             turn_lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
             async with turn_lock:
-                result = await self._client.thread_resume(
+                result, orphaned = await self._resume_thread(
                     thread_id,
                     cwd=request.working_directory,
                     model=request.model,
                 )
-                if self._thread_id(result) != thread_id:
-                    raise RuntimeError("Codex resume returned a different thread")
-                if self._has_orphaned_dynamic_tool_call(result):
+                if orphaned:
                     logger.warning(
                         "Recovering Codex thread by rolling back its last incomplete "
                         "dynamic-tool turn"
@@ -1650,17 +1661,74 @@ class CodexRuntime:
             raise RuntimeError("Codex thread response has invalid thread id")
         return thread_id
 
-    @staticmethod
-    def _has_orphaned_dynamic_tool_call(result: JsonValue) -> bool:
-        """Detect a persisted client-tool request that can no longer finish.
+    async def _resume_thread(
+        self,
+        thread_id: str,
+        *,
+        cwd: str,
+        model: str | None,
+    ) -> tuple[JsonValue, bool]:
+        """``thread/resume`` plus the orphaned-tool-call verdict for its last turn.
 
-        Codex exposes dynamic tool calls through the normalized thread view. If
-        the app-server is idle but the last incomplete turn still contains an
-        in-progress client tool with no output, resuming it would replay a
-        response item that can never be matched. Only this narrow terminal
-        shape is safe to prune; active and completed turns are preserved.
+        Lightweight path (#1720): resume with ``excludeTurns`` and judge the
+        last turn from ``thread/turns/list`` (one turn, full items) instead of
+        the whole history — the full frame grows without bound (16.48 MiB on
+        seoseo, 2026-09-13) while the verdict needs one turn. An app-server
+        that ignores ``excludeTurns`` still returns the history, which is
+        judged as before; one that rejects ``thread/turns/list`` pins the
+        runtime to the full resume so no further round-trips are wasted.
         """
 
+        client = self._client
+        if self._resume_exclude_turns:
+            result = await client.thread_resume(
+                thread_id, cwd=cwd, model=model, exclude_turns=True
+            )
+            self._require_resumed_thread(result, thread_id)
+            if self._thread_turns_present(result):
+                # Legacy shape: the server shipped the history anyway.
+                return result, self._has_orphaned_dynamic_tool_call(result)
+            if not self._thread_is_idle(result):
+                return result, False
+            try:
+                listing = await client.thread_turns_list(
+                    thread_id, limit=1, sort_direction="desc", items_view="full"
+                )
+            except asyncio.CancelledError:
+                raise
+            except CodexConnectionClosedError:
+                raise
+            except Exception as exc:
+                logger.info(
+                    "thread/turns/list unavailable on this app-server (%s); "
+                    "resuming with the full turn history from now on",
+                    exc,
+                )
+                self._resume_exclude_turns = False
+            else:
+                return result, self._turn_has_orphaned_dynamic_tool_call(
+                    self._last_listed_turn(listing)
+                )
+        result = await client.thread_resume(thread_id, cwd=cwd, model=model)
+        self._require_resumed_thread(result, thread_id)
+        return result, self._has_orphaned_dynamic_tool_call(result)
+
+    def _require_resumed_thread(self, result: JsonValue, thread_id: str) -> None:
+        if self._thread_id(result) != thread_id:
+            raise RuntimeError("Codex resume returned a different thread")
+
+    @staticmethod
+    def _thread_turns_present(result: JsonValue) -> bool:
+        if not isinstance(result, Mapping):
+            return False
+        thread = result.get("thread")
+        if not isinstance(thread, Mapping):
+            return False
+        turns = thread.get("turns")
+        return isinstance(turns, (list, tuple)) and len(turns) > 0
+
+    @staticmethod
+    def _thread_is_idle(result: JsonValue) -> bool:
         if not isinstance(result, Mapping):
             return False
         thread = result.get("thread")
@@ -1669,17 +1737,26 @@ class CodexRuntime:
         thread_status = thread.get("status")
         if isinstance(thread_status, Mapping):
             thread_status = thread_status.get("type")
-        if thread_status != "idle":
+        return thread_status == "idle"
+
+    @staticmethod
+    def _last_listed_turn(listing: JsonValue) -> JsonValue:
+        """First entry of a ``sortDirection=desc`` ``thread/turns/list`` page."""
+
+        if not isinstance(listing, Mapping):
+            return None
+        data = listing.get("data")
+        if not isinstance(data, (list, tuple)) or not data:
+            return None
+        return data[0]
+
+    @staticmethod
+    def _turn_has_orphaned_dynamic_tool_call(turn: JsonValue) -> bool:
+        if not isinstance(turn, Mapping):
             return False
-        turns = thread.get("turns")
-        if not isinstance(turns, (list, tuple)) or not turns:
+        if turn.get("status") not in {"inProgress", "interrupted", "failed"}:
             return False
-        last_turn = turns[-1]
-        if not isinstance(last_turn, Mapping):
-            return False
-        if last_turn.get("status") not in {"inProgress", "interrupted", "failed"}:
-            return False
-        items = last_turn.get("items")
+        items = turn.get("items")
         if not isinstance(items, (list, tuple)):
             return False
         orphan_types = {"dynamicToolCall", "customToolCall", "custom_tool_call"}
@@ -1691,6 +1768,29 @@ class CodexRuntime:
             and item.get("success") is not True
             for item in items
         )
+
+    @staticmethod
+    def _has_orphaned_dynamic_tool_call(result: JsonValue) -> bool:
+        """Detect a persisted client-tool request that can no longer finish.
+
+        Codex exposes dynamic tool calls through the normalized thread view. If
+        the app-server is idle but the last incomplete turn still contains an
+        in-progress client tool with no output, resuming it would replay a
+        response item that can never be matched. Only this narrow terminal
+        shape is safe to prune; active and completed turns are preserved.
+        Judges the full-history resume shape; the lightweight path applies the
+        same per-turn rule via ``_turn_has_orphaned_dynamic_tool_call``.
+        """
+
+        if not CodexRuntime._thread_is_idle(result):
+            return False
+        thread = cast(Mapping[str, JsonValue], result).get("thread")
+        if not isinstance(thread, Mapping):
+            return False
+        turns = thread.get("turns")
+        if not isinstance(turns, (list, tuple)) or not turns:
+            return False
+        return CodexRuntime._turn_has_orphaned_dynamic_tool_call(turns[-1])
 
     @staticmethod
     def _turn_id(result: JsonValue) -> str:
