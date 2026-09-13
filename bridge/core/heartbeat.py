@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import asyncio
+from typing import Any, Awaitable, Optional
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -127,3 +128,16 @@ def has_recent_visible_progress(
 ) -> bool:
     """Return True when streaming already showed user-visible progress recently."""
     return last_visible_progress_at > 0 and now - last_visible_progress_at < max(0.0, window_seconds)
+
+
+async def await_heartbeat_update(operation: Awaitable[Optional[int]]) -> tuple[Optional[int], bool]:
+    """Drain an owned Telegram operation before propagating caller cancellation."""
+    task = asyncio.ensure_future(operation)
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(task), cancelled
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancelled = True
