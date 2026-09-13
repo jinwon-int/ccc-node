@@ -235,6 +235,7 @@ def test_collect_accepts_piri_job_when_provider_piri(tmp_path: Path) -> None:
     result = asyncio.run(worker.collect_once(job_id=JOB_ID))
     assert result is not None and result.candidates_staged == 1
     assert backend.calls == 1
+    assert worker.provider == "piri"
     assert backend.seen_provenance.provider == "piri"
     drafts = list((tmp_path / "state" / "pending-skills").iterdir())
     assert len(drafts) == 1
@@ -522,8 +523,17 @@ def test_retry_directory_symlink_fails_closed_before_provider_call(
     assert backend.calls == 0
 
 
-def test_collector_loop_hard_bounds_provider_attempts_per_sweep() -> None:
+@pytest.mark.parametrize("provider", ("codex", "piri", "danso"))
+def test_collector_loop_filters_provider_and_bounds_attempts_per_sweep(
+    provider: str,
+) -> None:
     stop_event = asyncio.Event()
+    processed_job_id = "3" * 64
+    first_collect_job_id = "4" * 64
+    second_collect_job_id = "5" * 64
+    other_provider = next(
+        candidate for candidate in ("codex", "piri", "danso") if candidate != provider
+    )
 
     class _Journal:
         calls = 0
@@ -534,19 +544,28 @@ def test_collector_loop_hard_bounds_provider_attempts_per_sweep() -> None:
                 stop_event.set()
             return tuple(
                 SimpleNamespace(
-                    job_id=f"{index:x}" * 64,
-                    provider="codex",
-                    snapshot=object(),
+                    job_id=job_id,
+                    provider=job_provider,
+                    snapshot=snapshot,
                 )
-                for index in range(1, 6)
+                for job_id, job_provider, snapshot in (
+                    ("1" * 64, provider, None),
+                    ("2" * 64, other_provider, object()),
+                    (processed_job_id, provider, object()),
+                    (first_collect_job_id, provider, object()),
+                    (second_collect_job_id, provider, object()),
+                )
             )
 
     class _Worker:
         def __init__(self) -> None:
-            self.calls = []
+            self.provider = provider
+            self.preflight_ids: list[str] = []
+            self.calls: list[str] = []
 
         def should_collect(self, *, job_id: str) -> bool:
-            return True
+            self.preflight_ids.append(job_id)
+            return job_id != processed_job_id
 
         async def collect_once(self, *, job_id: str):
             self.calls.append(job_id)
@@ -568,4 +587,9 @@ def test_collector_loop_hard_bounds_provider_attempts_per_sweep() -> None:
     asyncio.run(
         BotLifecycleMixin._skill_candidate_collector_loop(lifecycle, stop_event)
     )
-    assert len(worker.calls) == 2
+    assert worker.preflight_ids == [
+        processed_job_id,
+        first_collect_job_id,
+        second_collect_job_id,
+    ]
+    assert worker.calls == [first_collect_job_id, second_collect_job_id]
