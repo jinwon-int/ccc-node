@@ -1,10 +1,13 @@
 # Pre-stop peer and record policy proposal (#1608)
 
 Status: review proposal, documentation only; not an approved deployment policy.
-Companion to PR #1610 (durable integration contract) and PR #1609 (in-memory
-admission foundation). Neither is assumed merged. This proposal supplies no
-endpoint, codec, writer, authentication implementation or lifecycle caller.
-No acceptance box in #1608 is closed. Existing defaults remain unchanged.
+Companion to the merged #1610 (durable integration contract), #1609 (in-process
+admission foundation) and #1614 (bounded JSON helper). Their merges implement
+none of this policy and supply no endpoint, codec, writer, authentication
+implementation or lifecycle caller. The proposed phase/cancellation graph that
+would consume these records is `docs/prestop-phase-model.md`, itself
+unimplemented and unapproved for runtime use. No acceptance box in #1608 is
+closed. Existing defaults remain unchanged.
 
 ## Threat boundary and decisions proposed for review
 
