@@ -297,3 +297,28 @@ This compatibility job does not change the manifest or live branch protection;
 its required-check promotion and Android automation remain tracked in #1525.
 At the 2026-09-06 assessment the manifest's wheel-smoke addition remained
 unapplied in live settings (#1526). Use a fresh report for current status.
+
+## Merge queue on `main` (live since 2026-09-13)
+
+`main` carries a `merge_queue` rule on ruleset `18203378` (the same ruleset
+that enforces deletion, non-fast-forward, and the pull-request rule). PRs
+merge by enqueueing (`enqueuePullRequest`); direct merge API calls are
+refused ("the merge strategy for main is set by the merge queue"). The queue
+re-runs every required context (see Desired checks above) on a speculative
+`gh-readonly-queue/main/<pr>-<sha>` group ref — the `merge_group` triggers in
+`ci.yml` and `codeql.yml` (added in the same change) make the GitHub Actions
+app report its contexts there, so the queue can gate on them exactly as it
+does on `pull_request` runs.
+
+Rule parameters: grouping strategy `ALLGREEN` (every PR in the group must
+pass its required checks), squash merge method, group size 1–5, no
+first-entry wait (`min_entries_to_merge_wait_minutes` 0), check timeout 60
+minutes. Legacy branch protection stays untouched — strict up-to-date
+checking remains enabled and was validated compatible with the queue
+end-to-end on a throwaway repo with identical protection before activation
+(2026-09-13; the queued merge landed as a squash commit with strict on).
+
+Ops notes: update a stale PR before enqueueing (the queue builds on current
+`main`); a group whose checks fail evicts its PRs for the author to fix, and
+the new head re-enters after fresh exact-head approval. The enqueue flow
+lives in the `gh-pr-flow` skill.

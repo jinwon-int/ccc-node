@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # merge_group: queued PRs must re-report the codeql-python required
+  # context on the queue's gh-readonly-queue/main/<pr>-<sha> group ref
+  # (see ci-governance.md; same rationale as the ci.yml merge_group trigger).
+  merge_group:
   workflow_dispatch:
   schedule:
     - cron: '33 3 * * 1'
