@@ -67,14 +67,24 @@ Note the REST field is `mergeable_state` (snake_case, lowercase values like
 `mergeStateStatus` (SCREAMING_CASE). They are the same signal in two spellings;
 do not mix them in one script.
 
+The same REST snippet hides a second type trap: REST `.mergeable` is a
+**boolean or null** (`true`/`false`, with `null` meaning not yet computed),
+while `gh pr view`/GraphQL `mergeable` is the tri-state
+**MERGEABLE/CONFLICTING/UNKNOWN**. The mapping is `true`≈MERGEABLE,
+`false`≈CONFLICTING, `null`≈UNKNOWN — so a script that compares REST output
+against `"UNKNOWN"` never matches, silently. Keep one spelling per script and
+convert explicitly at the boundary if both surfaces are needed.
+
 ### 2. Classify
 
 - **DIRTY + rollup `[]`** → conflict is blocking CI. Go to §4 (rebase).
 - **CLEAN + rollup `[]`** → CI not configured or the workflow filtered this
   event out. Inspect `.github/workflows/` triggers (`on.pull_request.paths`,
   `branches`, `types`) and whether the workflow is disabled. Note that a
-  required-but-never-run check is an enforcement issue — see
-  `github-required-check-enforcement-audit`.
+  required-but-never-run check is an enforcement issue no local procedure can
+  substitute for: confirm against the base branch's protection/rulesets that the
+  check really is required, then take the finding to the branch-protection
+  owner.
 - **BEHIND** → stale base. Go to §5.
 - **UNKNOWN** → go to §3.
 - **rollup populated** → CI is live; `gh pr checks <n> --repo <owner>/<repo>`.
@@ -92,23 +102,54 @@ done
 ```
 
 If it will not resolve, determine the truth locally — **without touching your
-worktree or index**:
+worktree or index**. Fetch the exact objects first; for a **fork /
+cross-repository PR** the head branch does not exist on `origin` under its
+branch name, so fetch GitHub's PR ref instead (`gh pr view <n> --repo
+<owner>/<repo> --json isCrossRepository,headRepositoryOwner,headRefName` tells
+you which case you are in; `gh pr checkout` would also fetch the PR but it
+mutates the worktree/index this section excludes — stay on bare fetch):
 
 ```bash
-git fetch origin <base> <pr-branch>
-git merge-tree --write-tree origin/<base> origin/<pr-branch> >/dev/null
-echo "exit=$?"   # 0 = merges cleanly, 1 = conflicts, >1 = error
+git fetch origin <base>                                  # same-repo PR: the base branch
+git fetch origin "refs/pull/<n>/head"                    # fork-safe: works for fork PRs and after the head branch is deleted
+git merge-tree --write-tree origin/<base> FETCH_HEAD >/dev/null
+echo "exit=$?"
+```
+
+Confirm you tested the exact reviewed head, not a stale fetch:
+
+```bash
+gh pr view <n> --repo <owner>/<repo> --json headRefOid --jq .headRefOid
+git rev-parse FETCH_HEAD    # must equal that head SHA; if it differs, re-fetch and re-run
 ```
 
 `git merge-tree --write-tree` (git ≥ 2.38) is the right tool: it computes the
 merge in the object database and reports conflicts without a checkout, so there
-is nothing to abort and no dirty state to clean up.
+is nothing to abort and no dirty state to clean up. Both pinned claims here
+carry their verification paths:
 
-If you must use the older form instead, pair it correctly:
+- **Version floor** — `--write-tree` needs git ≥ 2.38: check `git --version`;
+  on older git the flag is rejected outright.
+- **Exit codes** — re-measured 2026-09-13 on git 2.39.5 with throwaway bare
+  fixtures (clean / conflicting / bad-object / usage-error): clean → `0` with
+  the result tree oid on stdout; content conflict → `1` plus a conflicted-files
+  section and `CONFLICT (...)` lines; unresolvable object → also `1`,
+  distinguishable only by its stderr message; usage error → `129`. Non-zero
+  therefore means only "not clean" — classify conflict vs error from the output,
+  never from the exit code alone. Re-run the same three fixtures locally before
+  trusting these values on a different git build.
+
+The pre-2.38 form is the **old `git merge-tree`** — still worktree-free, but its
+exit status is *not* a conflict indicator:
 
 ```bash
-git merge --no-commit --no-ff origin/<base>; git merge --abort
+git merge-tree <base-tree> <commit1> <commit2>   # exits 0 even on conflict — read "changed in both"/markers from stdout instead
 ```
+
+Never substitute a real merge test (`git merge --no-commit --no-ff` +
+`git merge --abort`) here: it mutates HEAD, index, and worktree — exactly what
+this section promises not to touch — and `;`-chaining the abort discards the
+merge's exit status while risking a stranded half-merged worktree.
 
 Treat the local result as ground truth when the API says UNKNOWN — but record
 it as *local evidence*, not as a GitHub state.
@@ -175,4 +216,11 @@ proves nothing. `mergeCommit.oid` is the only reliable link.
 - For stale base: the REST `.base.sha` matches `git rev-parse origin/<base>` before merging.
 - For UNKNOWN: the local `merge-tree` exit code is recorded alongside the final API state.
 - Merge confirmed via `mergeCommit.oid`, not via a head-SHA grep.
-- Multi-session work: state written to `~/.claude/state/working-state.md` so the next session knows CI was unblocked.
+
+## Notes / Handoff
+
+- Multi-session work: state written to `~/.claude/state/working-state.md` so the
+  next session knows CI was unblocked. This is a fleet housekeeping convention,
+  **not** a verification item — persistence evidence (a note that you recorded
+  something) is distinct from merge-success evidence, which only ever comes from
+  the `state`/`mergedAt`/`mergeCommit` readback in §6.
