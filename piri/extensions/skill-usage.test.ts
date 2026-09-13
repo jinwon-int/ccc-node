@@ -140,7 +140,7 @@ async function groupUnit(): Promise<void> {
 	ok("isSkillDocumentPath: root skills dir", isSkillDocumentPath("/skills/web/SKILL.md"));
 	ok("isSkillDocumentPath: parented relative", isSkillDocumentPath("repo/skills/web/SKILL.md"));
 	ok("isSkillDocumentPath: bare relative accepted", isSkillDocumentPath("skills/web/SKILL.md"));
-	ok("isSkillDocumentPath: fragment accepted", isSkillDocumentPath("/a/skills/web/SKILL.md#L5"));
+	ok("isSkillDocumentPath: literal fragment filename rejected", !isSkillDocumentPath("/a/skills/web/SKILL.md#L5"));
 	ok("isSkillDocumentPath: other doc rejected", !isSkillDocumentPath("/a/skills/web/README.md"));
 	ok("isSkillDocumentPath: plural rejected", !isSkillDocumentPath("/a/skills/web/SKILLS.md"));
 	ok(
@@ -263,11 +263,16 @@ async function groupSemantics(cap: string): Promise<void> {
 	await sleep(300);
 	ok("non-skill read not captured", count() === 1, `lines=${count()}`);
 
-	// Fragment paths are accepted exactly like the logger accepts them.
-	await fire(handlers, "tool_call", readCall("call-4", "/home/x/.claude/skills/web/SKILL.md#L5"));
+	// Piri does not strip URL-style fragments from file paths. A successful
+	// read of this literal other filename is not a canonical SKILL.md read.
+	await fire(handlers, "tool_call", readCall("call-4", "/home/x/.claude/skills/web/SKILL.md#other-file"));
 	await fire(handlers, "tool_execution_end", readEnd("call-4", false));
+	await sleep(200);
+	ok("successful literal fragment filename is not skill evidence", count() === 1, `lines=${count()}`);
+	await fire(handlers, "tool_call", readCall("call-4-plain", "/home/x/.claude/skills/web/SKILL.md"));
+	await fire(handlers, "tool_execution_end", readEnd("call-4-plain", false));
 	await waitFor(count, (n) => n >= 2);
-	ok("fragment read captured", count() === 2, `lines=${count()}`);
+	ok("exact SKILL.md still counts after excluded other filename", count() === 2, `lines=${count()}`);
 
 	// Unicode and spaces survive the JSON round-trip.
 	const unicodePath = "/home/우주 노드/.claude/skills/gh-pr-flow/SKILL.md";

@@ -41,8 +41,8 @@ const MAX_PENDING_READS = 256;
 const MAX_LOGGER_CHILDREN = 4;
 let activeLoggerChildren = 0;
 const SKILL_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/;
-/** Matches exactly what skill-usage-log.sh accepts for the Read path. */
-const SKILL_DOC_PATH = /(?:^|\/)skills\/([a-z0-9][a-z0-9-]{0,63})\/SKILL\.md(?:#[^\r\n]*)?$/;
+/** Piri treats # literally: only the exact SKILL.md filename is evidence. */
+const SKILL_DOC_PATH = /(?:^|\/)skills\/([a-z0-9][a-z0-9-]{0,63})\/SKILL\.md$/;
 
 /** Result of one bounded logger invocation (test/observability only). */
 export interface EmitResult {

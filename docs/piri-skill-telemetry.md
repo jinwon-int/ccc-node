@@ -17,7 +17,9 @@ Piri emits `input` before skill expansion. Later handlers may transform or handl
 it, expansion may fail, and command availability alone does not establish runtime
 settings or execution success. A listed skill without an invocation produces no
 line. Failed, unpaired, duplicate completed, or malformed read results produce no
-line. In a no-tools session only explicit attempts can be observed. SDK paths
+line. Piri treats `#` as part of a filename: a successful read of
+`SKILL.md#other-file` is excluded; only the exact `SKILL.md` filename counts.
+In a no-tools session only explicit attempts can be observed. SDK paths
 that bypass these events are outside this coverage.
 
 The existing ledger contains only `ts`, `skill`, and `tool`. It cannot distinguish
