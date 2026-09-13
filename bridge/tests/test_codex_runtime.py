@@ -70,6 +70,7 @@ class FakeClient:
         self.close_gate: asyncio.Event | None = None
         self.thread_start_calls: list[dict[str, Any]] = []
         self.thread_resume_calls: list[dict[str, Any]] = []
+        self.thread_resume_results: list[Any] = []
         self.thread_rollback_calls: list[dict[str, Any]] = []
         self.thread_start_result: Any = {"thread": {"id": "thread-new"}}
         self.thread_resume_result: Any = None
@@ -127,6 +128,8 @@ class FakeClient:
             await self.thread_resume_gate.wait()
         if self.thread_resume_errors:
             raise self.thread_resume_errors.pop(0)
+        if self.thread_resume_results:
+            return self.thread_resume_results.pop(0)
         if self.thread_resume_result is not None:
             return self.thread_resume_result
         return {"thread": {"id": thread_id}}
@@ -604,6 +607,131 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(client.thread_turns_list_calls), 1)
         self.assertEqual(client.thread_rollback_calls, [])
+
+    async def test_resume_diagnostics_are_unknown_before_any_resume_rpc(self) -> None:
+        client = self.clients[0]
+
+        diagnostics = self.runtime.resume_diagnostics()
+
+        self.assertEqual(diagnostics.mode, "unknown")
+        self.assertIsNone(diagnostics.last_turn_item_count)
+        self.assertIsNone(diagnostics.observed_result_method)
+        self.assertIsNone(diagnostics.observed_result_json_bytes)
+        self.assertEqual(client.thread_resume_calls, [])
+        self.assertEqual(client.thread_turns_list_calls, [])
+
+    async def test_lightweight_resume_caches_last_turn_diagnostics_without_rpc(self) -> None:
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+        client.thread_resume_result = {
+            "thread": {"id": "thread-light", "status": {"type": "idle"}, "turns": []}
+        }
+        client.thread_turns_list_result = {
+            "data": [
+                {
+                    "id": "turn-private",
+                    "status": "completed",
+                    "items": [
+                        {"id": "item-private", "type": "agentMessage", "text": "secret body"},
+                        {"id": "item-private-2", "type": "toolCall", "arguments": "secret args"},
+                    ],
+                }
+            ]
+        }
+
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-light")
+        )
+
+        diagnostics = self.runtime.resume_diagnostics()
+        self.assertEqual(diagnostics.mode, "lightweight")
+        self.assertEqual(diagnostics.last_turn_item_count, 2)
+        self.assertEqual(diagnostics.observed_result_method, "thread/turns/list")
+        self.assertIsNone(diagnostics.observed_result_json_bytes)
+        self.assertNotIn("turn-private", repr(diagnostics))
+        self.assertNotIn("item-private", repr(diagnostics))
+        self.assertNotIn("secret body", repr(diagnostics))
+        self.assertNotIn("secret args", repr(diagnostics))
+
+        resume_calls = list(client.thread_resume_calls)
+        list_calls = list(client.thread_turns_list_calls)
+        self.assertEqual(self.runtime.resume_diagnostics(), diagnostics)
+        self.assertEqual(client.thread_resume_calls, resume_calls)
+        self.assertEqual(client.thread_turns_list_calls, list_calls)
+
+    async def test_resume_diagnostics_do_not_serialize_bodies_or_fail_with_observer(self) -> None:
+        class UnscannableBody(dict):
+            def items(self):
+                raise AssertionError("diagnostics scanned a provider body")
+
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+        client.thread_resume_result = {
+            "thread": {"id": "thread-light", "status": {"type": "idle"}, "turns": []}
+        }
+        client.thread_turns_list_result = {
+            "data": [{"id": "turn-private", "status": "completed", "items": [
+                UnscannableBody(type="agentMessage", text="private body")
+            ]}]
+        }
+        observations = []
+
+        def broken_observer(value):
+            observations.append(value)
+            raise RuntimeError("private observer exception")
+
+        self.runtime.set_resume_diagnostics_observer(broken_observer)
+        with self.assertLogs("telegram_bot.core.codex_runtime", level="WARNING") as logs:
+            session = await self.runtime.start_or_resume(
+                SessionRequest(working_directory="/workspace", session_id="thread-light")
+            )
+        self.assertEqual(session.session_id, "thread-light")
+        self.assertEqual(observations[0]["last_turn_item_count"], 1)
+        self.assertIsNone(observations[0]["observed_result_json_bytes"])
+        self.assertNotIn("private body", repr(observations))
+        self.assertNotIn("private observer exception", repr(logs.output))
+
+    async def test_resume_diagnostics_mark_old_server_compatibility_fallback(self) -> None:
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+        client.thread_resume_results = [
+            {
+                "thread": {"id": "thread-old", "status": {"type": "idle"}, "turns": []}
+            },
+            {
+                "thread": {
+                    "id": "thread-old",
+                    "status": {"type": "idle"},
+                    "turns": [
+                        {
+                            "id": "turn-private",
+                            "status": "completed",
+                            "items": [
+                                {"id": "item-private", "text": "secret body"},
+                                {"id": "item-private-2", "text": "secret body 2"},
+                                {"id": "item-private-3", "text": "secret body 3"},
+                            ],
+                        }
+                    ],
+                }
+            },
+        ]
+        client.thread_turns_list_error = RuntimeError("experimentalApi unavailable")
+
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-old")
+        )
+
+        diagnostics = self.runtime.resume_diagnostics()
+        self.assertEqual(diagnostics.mode, "compatibility_fallback")
+        self.assertEqual(diagnostics.last_turn_item_count, 3)
+        self.assertEqual(diagnostics.observed_result_method, "thread/resume")
+        self.assertIsNone(diagnostics.observed_result_json_bytes)
+        self.assertNotIn("thread-old", repr(diagnostics))
+        self.assertNotIn("secret body", repr(diagnostics))
+        self.assertEqual(
+            [call["exclude_turns"] for call in client.thread_resume_calls], [True, False]
+        )
 
     async def test_lightweight_resume_falls_back_when_turns_list_is_rejected(self) -> None:
         # codex 0.149.1 answers "thread/turns/list requires experimentalApi

@@ -44,6 +44,21 @@ KST day since 2026-09-02; `0` disables) cap only the provider's daily autonomous
 input+output tokens: interactive turns remain metered in `usage-meter.json`, but
 never consume that allowance or get rejected by it.
 
+Codex long-thread visibility is intentionally bounded. The resume path keeps
+using `excludeTurns` plus a one-turn `thread/turns/list` check when supported;
+an older app-server is reported as `compatibility_fallback` after the existing
+full-resume fallback. `health.json → codex_resume` and `--status` expose that
+mode for the latest process observation across its audience runtimes (not
+the current chat), an explicitly named `last-turn` item count (never a total thread count),
+and `observed_result_json_bytes` as unknown: no transport size scalar is
+available, and even one turn can contain large tool bodies, so diagnostics
+do not serialize them to compute a byte count. Missing observations remain
+unknown/not observed. Compaction does not shrink the full resume frame, and
+rollout file size is not a resume-cost threshold; operators should not expect this
+diagnostic to compact, rotate, reset, or scan a thread. Provider deployment,
+compatibility rollout, and any future operational threshold remain explicit
+follow-up decisions.
+
 Empty normal completions (#775) are classified, not disguised as `(No response)` success: when the provider's terminal payload preserved the final answer the turn recovers it once (`requests.empty_completion_recovered` in `health.json`), otherwise the request ledger fails with cause `empty-completion` and the user gets a typed retry prompt (`requests.empty_completion_failed`). Warning logs carry the provider class name and user/chat ids only — never answer bodies.
 
 External waits (#740): an agent's "I'll continue once CI finishes" is backed by a durable registry at `<bot_data_dir>/external-wait/waits.json` (owner-only, previous-good backup). The bridge monitor polls GitHub checks pinned to the registered exact head SHA, journals terminal transitions before waking, notifies the owning conversation, and resumes through a bridge-owned `external_event` turn (autonomous-metered). Operators inspect with `/waits` and cancel with `/cancelwait <wait_id>`; agents register via `python -m telegram_bot.core.external_wait_cli register` (see the `gh-ci-wait` skill). Kill-switches: `CCC_EXTERNAL_WAIT_ENABLED=0`, `CCC_EXTERNAL_WAIT_RESUME=0`, `CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP` (default 10/day). Records and logs stay body-free — no prompts, tokens, or check logs.

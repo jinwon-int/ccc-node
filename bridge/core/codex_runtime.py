@@ -236,6 +236,9 @@ class AppServerClient(Protocol):
 
 ClientFactory = Callable[[ServerRequestHandler], AppServerClient]
 UsageRecorder = Callable[[str, UsageSnapshot | None, UsageSnapshot], object]
+ResumeDiagnosticsMode = Literal["unknown", "lightweight", "compatibility_fallback"]
+ResumeDiagnosticsMethod = Literal["thread/resume", "thread/turns/list"]
+ResumeDiagnosticsObserver = Callable[[Mapping[str, JsonValue]], object]
 _CODEX_OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _RECENT_TERMINAL_TURN_LIMIT = 512
 # Mid-turn usage coalescing horizon: bounds both the worst-case metering loss
@@ -259,6 +262,33 @@ class AsyncCompletionDiagnostics:
     unowned_completed: int
     late_active_duplicates: int
     recent_terminal_turns: int
+
+
+@dataclass(frozen=True, slots=True)
+class CodexResumeDiagnostics:
+    """Body-free cache of the most recent bounded resume observation.
+
+    ``last_turn_item_count`` is deliberately named for the one turn returned
+    by ``thread/turns/list`` (or the last turn already present in a legacy
+    resume response). It is never a total thread item/turn count. The byte
+    field stays unknown: the transport does not expose a response-size scalar,
+    and re-serializing even one turn could scan arbitrarily large tool bodies.
+    """
+
+    mode: ResumeDiagnosticsMode = "unknown"
+    last_turn_item_count: int | None = None
+    observed_result_method: ResumeDiagnosticsMethod | None = None
+    observed_result_json_bytes: int | None = None
+
+    def as_mapping(self) -> dict[str, JsonValue]:
+        """Return only the bounded, non-sensitive health/status projection."""
+
+        return {
+            "mode": self.mode,
+            "last_turn_item_count": self.last_turn_item_count,
+            "observed_result_method": self.observed_result_method,
+            "observed_result_json_bytes": self.observed_result_json_bytes,
+        }
 
 
 @dataclass(slots=True)
@@ -463,6 +493,12 @@ class CodexRuntime:
         self._client = self._client_factory(self._handle_server_request)
         # #1720: lightweight resume until thread/turns/list proves unavailable.
         self._resume_exclude_turns = True
+        # The cache is populated only by an actual resume/list observation. It
+        # is intentionally process-local and contains no thread/turn ids or
+        # provider payload content, so health/status can reuse it without an
+        # extra RPC (especially not a full-history read).
+        self._resume_diagnostics = CodexResumeDiagnostics()
+        self._resume_diagnostics_observer: ResumeDiagnosticsObserver | None = None
         self._process_environment = bound_environment
         self._working_state_environment = select_working_state_environment(
             working_state_environment
@@ -553,6 +589,18 @@ class CodexRuntime:
             late_active_duplicates=self._ignored_late_active_duplicates,
             recent_terminal_turns=len(self._recent_terminal_turn_ids),
         )
+
+    def resume_diagnostics(self) -> CodexResumeDiagnostics:
+        """Return the cached resume observation without contacting Codex."""
+
+        return self._resume_diagnostics
+
+    def set_resume_diagnostics_observer(
+        self, observer: ResumeDiagnosticsObserver | None
+    ) -> None:
+        """Publish future resume observations to a body-free health adapter."""
+
+        self._resume_diagnostics_observer = observer
 
     def set_unowned_completion_listener(
         self, listener: Callable[[str, str], object] | None
@@ -1748,8 +1796,18 @@ class CodexRuntime:
             self._require_resumed_thread(result, thread_id)
             if self._thread_turns_present(result):
                 # Legacy shape: the server shipped the history anyway.
+                self._record_resume_observation(
+                    mode="compatibility_fallback",
+                    turn=self._last_resumed_turn(result),
+                    method="thread/resume",
+                )
                 return result, self._has_orphaned_dynamic_tool_call(result)
             if not self._thread_is_idle(result):
+                self._record_resume_observation(
+                    mode="lightweight",
+                    turn=None,
+                    method="thread/resume",
+                )
                 return result, False
             try:
                 listing = await client.thread_turns_list(
@@ -1767,11 +1825,21 @@ class CodexRuntime:
                 )
                 self._resume_exclude_turns = False
             else:
+                self._record_resume_observation(
+                    mode="lightweight",
+                    turn=self._last_listed_turn(listing),
+                    method="thread/turns/list",
+                )
                 return result, self._turn_has_orphaned_dynamic_tool_call(
                     self._last_listed_turn(listing)
                 )
         result = await client.thread_resume(thread_id, cwd=cwd, model=model)
         self._require_resumed_thread(result, thread_id)
+        self._record_resume_observation(
+            mode="compatibility_fallback",
+            turn=self._last_resumed_turn(result),
+            method="thread/resume",
+        )
         return result, self._has_orphaned_dynamic_tool_call(result)
 
     def _require_resumed_thread(self, result: JsonValue, thread_id: str) -> None:
@@ -1787,6 +1855,18 @@ class CodexRuntime:
             return False
         turns = thread.get("turns")
         return isinstance(turns, (list, tuple)) and len(turns) > 0
+
+    @staticmethod
+    def _last_resumed_turn(result: JsonValue) -> JsonValue:
+        if not isinstance(result, Mapping):
+            return None
+        thread = result.get("thread")
+        if not isinstance(thread, Mapping):
+            return None
+        turns = thread.get("turns")
+        if not isinstance(turns, (list, tuple)) or not turns:
+            return None
+        return turns[-1]
 
     @staticmethod
     def _thread_is_idle(result: JsonValue) -> bool:
@@ -1810,6 +1890,43 @@ class CodexRuntime:
         if not isinstance(data, (list, tuple)) or not data:
             return None
         return data[0]
+
+    @staticmethod
+    def _turn_item_count(turn: JsonValue) -> int | None:
+        if not isinstance(turn, Mapping):
+            return None
+        items = turn.get("items")
+        if not isinstance(items, (list, tuple)):
+            return None
+        return len(items)
+
+    def _record_resume_observation(
+        self,
+        *,
+        mode: ResumeDiagnosticsMode,
+        turn: JsonValue,
+        method: ResumeDiagnosticsMethod,
+    ) -> None:
+        """Cache and publish only scalar metadata from a completed RPC."""
+
+        diagnostics = CodexResumeDiagnostics(
+            mode=mode,
+            last_turn_item_count=self._turn_item_count(turn),
+            observed_result_method=method,
+            # No transport size scalar exists. One turn can contain enormous
+            # tool output, so do not scan/serialize its body for diagnostics.
+            observed_result_json_bytes=None,
+        )
+        self._resume_diagnostics = diagnostics
+        observer = self._resume_diagnostics_observer
+        if observer is None:
+            return
+        try:
+            observer(diagnostics.as_mapping())
+        except Exception:
+            # Health/status is an observer only; a disk or adapter failure must
+            # never change resume, orphan rollback, or identity behavior.
+            logger.warning("Codex resume diagnostics observer failed")
 
     @staticmethod
     def _turn_has_orphaned_dynamic_tool_call(turn: JsonValue) -> bool:
