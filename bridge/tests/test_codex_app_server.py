@@ -577,8 +577,13 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
             {"id": request["id"], "result": {"thread": {"id": "thread-big", "turns": turns}}}
         )
         result = await asyncio.wait_for(resume_task, timeout=5)
-        assert result["thread"]["id"] == "thread-big"
-        assert len(result["thread"]["turns"]) == 64
+        assert isinstance(result, dict)
+        thread = result["thread"]
+        assert isinstance(thread, dict)
+        assert thread["id"] == "thread-big"
+        resumed_turns = thread["turns"]
+        assert isinstance(resumed_turns, list)
+        assert len(resumed_turns) == 64
 
         # Connection is still healthy: a follow-up request round-trips.
         follow_up = asyncio.create_task(client.request("model/list", {}))
