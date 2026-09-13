@@ -531,6 +531,7 @@ def test_collector_loop_filters_provider_and_bounds_attempts_per_sweep(
     processed_job_id = "3" * 64
     first_collect_job_id = "4" * 64
     second_collect_job_id = "5" * 64
+    third_collect_job_id = "6" * 64
     other_provider = next(
         candidate for candidate in ("codex", "piri", "danso") if candidate != provider
     )
@@ -554,6 +555,7 @@ def test_collector_loop_filters_provider_and_bounds_attempts_per_sweep(
                     (processed_job_id, provider, object()),
                     (first_collect_job_id, provider, object()),
                     (second_collect_job_id, provider, object()),
+                    (third_collect_job_id, provider, object()),
                 )
             )
 
@@ -592,4 +594,5 @@ def test_collector_loop_filters_provider_and_bounds_attempts_per_sweep(
         first_collect_job_id,
         second_collect_job_id,
     ]
+    assert third_collect_job_id not in worker.preflight_ids
     assert worker.calls == [first_collect_job_id, second_collect_job_id]
