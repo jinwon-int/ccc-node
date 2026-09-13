@@ -51,6 +51,14 @@ _MAX_COMMAND_OUTPUT = 1024 * 1024
 # like the ownership ledger (8 MiB) so an unbounded file cannot stall a run.
 _MAX_LEDGER_BYTES = 8 * 1024 * 1024
 _MAX_CANDIDATES_PER_RUN = 64
+# #1647: cross-run collect rotation cursor. Owner-only JSON in the promotion
+# state dir; written only by a locked, non-dry collect (dry-run never writes
+# it, never acks). Missing state means "begin at the first source"; a present
+# but unreadable or invalid cursor fails closed instead of silently resetting
+# to the local-first order the cursor exists to break.
+_COLLECT_CURSOR_FILENAME = "collect-cursor.json"
+_COLLECT_CURSOR_SCHEMA = 1
+_MAX_COLLECT_CURSOR_BYTES = 4096
 _CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("gh-token", re.compile(r"(?:ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}", re.I)),
     ("api-key", re.compile(r"sk-[A-Za-z0-9_-]{20,}", re.I)),
@@ -4237,21 +4245,125 @@ def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:
         return _collect_unlocked(config, dry_run=False)
 
 
+def _collect_sources(config: Config) -> tuple[tuple[str, str], ...]:
+    """Every collect source as (label, expected node) in canonical order.
+
+    The local outbox is one source among the fleet's (#1647): it competes for
+    the same bounded admission budget as the SSH exporters instead of draining
+    the global cap ahead of them. Canonical order is local first, then
+    `collect_nodes` order; rotation (below) decides where a given run starts.
+    """
+    sources: list[tuple[str, str]] = [("local", config.node)]
+    for node in config.collect_nodes:
+        if node != config.node:
+            sources.append((node, node))
+    return tuple(sources)
+
+
+def _rotate_sources(
+    sources: tuple[tuple[str, str], ...], cursor_source: str | None
+) -> tuple[tuple[str, str], ...]:
+    """Start the round-robin after the source the previous collect rotated to.
+
+    The cursor stores source labels, not positions, so reordering, adding, or
+    removing a source can never leave the rotation pointing at the wrong node:
+    an unknown label (removed/renamed source, or no cursor yet) falls back to
+    the canonical local-first order and every valid source stays in the cycle.
+    """
+    if cursor_source is not None:
+        for index, (label, _) in enumerate(sources):
+            if label == cursor_source:
+                return (*sources[index + 1:], *sources[: index + 1])
+    return sources
+
+
+def _read_collect_cursor(config: Config) -> str | None:
+    """The source label the previous real collect rotated to, or None.
+
+    Missing state is explicit: the run begins at the canonical first source,
+    exactly like every pre-#1647 collect. A present but unsafe (mode/owner/
+    symlink) or invalid (undecodable, wrong schema, bad label) cursor fails
+    closed with a distinct code — silently resetting it would quietly restart
+    the local-first starvation this cursor exists to prevent.
+    """
+    path = config.promotion_state_dir / _COLLECT_CURSOR_FILENAME
+    if not path.exists():
+        return None
+    try:
+        payload, _ = _secure_fs.read_owner_only_bytes(
+            path,
+            max_bytes=_MAX_COLLECT_CURSOR_BYTES,
+            owner_id=os.geteuid(),
+            exact_mode=0o600,
+        )
+    except _secure_fs.SecureFsError:
+        raise PromotionError("collect_cursor_unsafe") from None
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise PromotionError("collect_cursor_invalid") from None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "last_source", "updated_at"}
+        or value.get("schema_version") != _COLLECT_CURSOR_SCHEMA
+    ):
+        raise PromotionError("collect_cursor_invalid")
+    last_source = value.get("last_source")
+    if not isinstance(last_source, str) or not _SAFE_COMPONENT_RE.fullmatch(last_source):
+        raise PromotionError("collect_cursor_invalid")
+    return last_source
+
+
+def _write_collect_cursor(config: Config, last_source: str) -> None:
+    """Atomically persist the rotation point (owner-only, 0600).
+
+    Called only while the promotion lock is held by a real (non-dry) collect,
+    so concurrent collects cannot interleave writes and a locked collect that
+    never ran advances nothing.
+    """
+    record = {
+        "schema_version": _COLLECT_CURSOR_SCHEMA,
+        "last_source": last_source,
+        "updated_at": _utc_now(),
+    }
+    try:
+        _secure_fs.atomic_write_bytes(
+            config.promotion_state_dir / _COLLECT_CURSOR_FILENAME,
+            (_secure_fs.json_line(record) + "\n").encode("utf-8"),
+            mode=0o600,
+        )
+    except _secure_fs.SecureFsError:
+        raise PromotionError("collect_cursor_unsafe") from None
+
+
 def _collect_envelopes(
-    config: Config, errors: list[dict[str, str]]
+    config: Config,
+    errors: list[dict[str, str]],
+    cursor_source: str | None = None,
 ) -> list[tuple[Candidate, str, str, str]]:
     """Gather local + remote pending envelopes, de-duplicated by transport id.
 
-    Sources are interleaved round-robin (#1617). The caller publishes only the
-    first `max_prs` entries, so returning the sources concatenated in
-    `collect_nodes` order meant a node with a backlog deeper than the cap took
-    every slot on every run and permanently starved the nodes behind it —
-    observed as three nodes stuck at 79 uncollected envelopes for ~2 weeks,
-    with the tail nodes' envelopes fetched over SSH and then discarded unread.
+    Admission is round-robin and bounded fairly by source (#1617, #1647). Each
+    source is fetched up front with an equal share of the global
+    `_MAX_CANDIDATES_PER_RUN` budget, and the run starts after the source the
+    previous collect rotated to (`cursor_source`), so:
 
-    Round-robin keeps `collect_nodes` order as the within-round tie-break, so
-    the local node still goes first and a single-source fleet is unaffected.
+    - a full local outbox can no longer spend the whole 64-envelope budget
+      before any SSH exporter is consulted, and the local outbox is bounded to
+      the same per-source share as every remote;
+    - repeated max_prs=1 runs still reach every local and remote source across
+      runs, instead of always beginning with the local queue;
+    - a remote that fails to export only loses its own share (reported in
+      `errors`) — the other sources are still fetched, and the failed one is
+      retried when the rotation comes back around.
+
+    `collect_nodes` order remains the within-round tie-break, a single-source
+    fleet keeps the exact pre-#1647 behavior (share = full budget), and the
+    per-remote fetch stays bounded by `max_prs` (1..3) so the exporter CLI's
+    `--limit 1..3` contract holds.
     """
+    sources = _rotate_sources(_collect_sources(config), cursor_source)
+    share = -(-_MAX_CANDIDATES_PER_RUN // len(sources))
     per_source: list[list[tuple[Candidate, str, str, str]]] = []
     seen: set[str] = set()
     total = 0
@@ -4272,15 +4384,23 @@ def _collect_envelopes(
             rows.append((candidate, created_at, transport_id, source))
             total += 1
 
-    gather(_pending_envelopes(config, limit=_MAX_CANDIDATES_PER_RUN), "local", config.node)
-    for node in config.collect_nodes:
-        if node == config.node or total >= _MAX_CANDIDATES_PER_RUN:
-            continue
-        try:
-            remaining = min(config.max_prs, _MAX_CANDIDATES_PER_RUN - total)
-            gather(_remote_envelopes(node, limit=remaining), node, node)
-        except PromotionError as error:
-            errors.append({"source": node, "code": error.code})
+    for label, expected_node in sources:
+        if total >= _MAX_CANDIDATES_PER_RUN:
+            break
+        remaining = min(share, _MAX_CANDIDATES_PER_RUN - total)
+        if label == "local":
+            # A broken local state dir still fails the collect outright, as
+            # before; remotes degrade to per-source errors.
+            gather(_pending_envelopes(config, limit=remaining), label, expected_node)
+        else:
+            try:
+                gather(
+                    _remote_envelopes(label, limit=min(remaining, config.max_prs)),
+                    label,
+                    expected_node,
+                )
+            except PromotionError as error:
+                errors.append({"source": label, "code": error.code})
     collected: list[tuple[Candidate, str, str, str]] = []
     for round_ in itertools.zip_longest(*per_source):
         collected.extend(row for row in round_ if row is not None)
@@ -4292,7 +4412,13 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
     _run(["gh", "auth", "status", "--hostname", "github.com"])
     _require_private_repo(config)
     errors: list[dict[str, str]] = []
-    collected = _collect_envelopes(config, errors)
+    # #1647: resume the source rotation where the previous real collect
+    # stopped. The cursor is read in dry-run too so the preview matches what a
+    # real run would admit; only the locked, real run below ever advances it —
+    # dry-run neither writes the cursor nor acks.
+    cursor_source = _read_collect_cursor(config)
+    start_source = _rotate_sources(_collect_sources(config), cursor_source)[0][0]
+    collected = _collect_envelopes(config, errors, cursor_source)
 
     published: list[dict[str, str]] = []
     opened = 0
@@ -4340,6 +4466,14 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
                 row["dispatch"] = _dispatch_intake_review(
                     config, candidate, outcome, transport_id=transport_id
                 )
+    if not dry_run and len(_collect_sources(config)) > 1:
+        # #1647: the cursor tracks admission rotation only. Publish and ACK
+        # outcomes above are reported verbatim in `published`/`errors` and
+        # never rewind it: an envelope that failed to publish stays pending
+        # (unacked) at its source's head and is retried when the rotation
+        # returns. A single-source fleet has nothing to rotate and writes
+        # nothing.
+        _write_collect_cursor(config, start_source)
     revise: dict[str, object] | None = None
     if config.revise_enabled:
         # Two ledger reads on purpose: _process_verdicts appends verdict,
