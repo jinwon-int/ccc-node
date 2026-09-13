@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeAlias, cast
 
+from telegram_bot.core.jsonl_frames import read_jsonl_frame
 from telegram_bot.core.turn_stall import orphan_tool_loop_tracker
 
 logger = logging.getLogger(__name__)
@@ -20,10 +21,12 @@ JsonRpcId: TypeAlias = int | str
 
 # asyncio's StreamReader defaults to a 64 KiB line buffer. ``codex app-server``
 # routinely emits single JSONL frames larger than that (e.g. big tool outputs or
-# thread listings), and ``StreamReader.readline`` raises ``ValueError`` once a
-# line exceeds the limit — which the reader loop turns into a fatal
-# ``CodexConnectionClosedError``. Raise the stdout buffer so oversized frames are
-# read whole instead of tearing down the connection.
+# thread listings); #403 raised the buffer to 16 MiB. That is no longer a
+# ceiling on frame size: the reader loop assembles frames through
+# ``read_jsonl_frame`` (#1718), so a ``thread/resume`` of a long thread — 16.48
+# MiB measured on seoseo 2026-09-13 — is read whole instead of tearing the
+# connection down. The limit now only bounds the per-read chunk; the fail-closed
+# per-frame ceiling is ``jsonl_frames.DEFAULT_MAX_FRAME_BYTES``.
 STDOUT_BUFFER_LIMIT = 16 * 1024 * 1024  # 16 MiB
 
 
@@ -669,7 +672,7 @@ class CodexAppServerClient:
     async def _read_stdout(self) -> None:  # noqa: C901 -- #348 baseline hotspot
         reader = cast(AsyncLineReader, self._reader)
         try:
-            while line := await reader.readline():
+            while line := await read_jsonl_frame(reader):
                 try:
                     message = json.loads(line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
@@ -731,6 +734,9 @@ class CodexAppServerClient:
             raise
         except Exception as exc:
             if not self._closed:
+                # Log it: until #1718 this surfaced only as a Telegram "❌ Error"
+                # text and left no trace in the journal or bot.log.
+                logger.error("app-server reader failed: %s", exc)
                 self._record_connection_error(
                     CodexConnectionClosedError(f"app-server reader failed: {exc}")
                 )
