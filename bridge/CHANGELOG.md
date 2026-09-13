@@ -1,5 +1,15 @@
 # Changelog
 
+- **JSONL frames larger than the stream buffer no longer kill the Codex/Piri
+  connection (#1718).** `codex app-server` answers `thread/resume` with the
+  whole thread in one frame; a 109-turn thread on seoseo measured 16.48 MiB,
+  past the 16 MiB `readline` limit from #403, so the reader loop died with
+  `Separator is not found, and chunk exceed the limit`, the client stayed
+  poisoned for every later request, and nothing was logged. Both transports
+  now read frames through `read_jsonl_frame`, which treats the stream limit
+  as a chunk size and only fails closed past a 512 MiB per-frame ceiling;
+  reader failures are logged at ERROR.
+
 - **Termux startup repairs cryptography libpython linkage.** Native extension
   and SDK imports now fail closed, including on dependency cache hits. Known
   Android link failures are repaired atomically with `patchelf`, retaining the

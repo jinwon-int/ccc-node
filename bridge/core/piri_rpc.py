@@ -10,6 +10,8 @@ import os
 import signal
 from typing import Any, TypeAlias, cast
 
+from telegram_bot.core.jsonl_frames import read_jsonl_frame
+
 
 JsonObject: TypeAlias = dict[str, Any]
 STDOUT_BUFFER_LIMIT = 16 * 1024 * 1024
@@ -227,7 +229,7 @@ class PiriRpcProcessClient:
         if process is None or process.stdout is None:
             return
         try:
-            while line := await process.stdout.readline():
+            while line := await read_jsonl_frame(process.stdout):
                 try:
                     decoded = json.loads(line)
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:

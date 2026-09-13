@@ -553,6 +553,41 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
         assert result == {"blob": big_value}
         await client.close()
 
+    async def test_reader_survives_frame_larger_than_stream_limit(self) -> None:
+        # #1718: a thread/resume response of 16.48 MiB (109-turn thread, seoseo
+        # 2026-09-13) exceeded STDOUT_BUFFER_LIMIT and readline() raised
+        # "Separator is not found, and chunk exceed the limit", poisoning the
+        # client for every later request. The frame reader must assemble it
+        # and the connection must stay usable afterwards. A 4 KiB stream limit
+        # reproduces the overrun without allocating 16 MiB in the test.
+        reader = asyncio.StreamReader(limit=4 * 1024)
+        writer = FakeWriter(reader)
+        client = CodexAppServerClient(reader=reader, writer=writer)
+        await client.start()
+
+        resume_task = asyncio.create_task(
+            client.thread_resume("thread-big", cwd="/work")
+        )
+        while writer.messages[-1].get("method") != "thread/resume":
+            await asyncio.sleep(0)
+        request = writer.messages[-1]
+
+        turns = [{"id": f"turn-{i}", "items": [{"text": "y" * 512}]} for i in range(64)]
+        writer.feed(
+            {"id": request["id"], "result": {"thread": {"id": "thread-big", "turns": turns}}}
+        )
+        result = await asyncio.wait_for(resume_task, timeout=5)
+        assert result["thread"]["id"] == "thread-big"
+        assert len(result["thread"]["turns"]) == 64
+
+        # Connection is still healthy: a follow-up request round-trips.
+        follow_up = asyncio.create_task(client.request("model/list", {}))
+        while writer.messages[-1].get("method") != "model/list":
+            await asyncio.sleep(0)
+        writer.feed({"id": writer.messages[-1]["id"], "result": {"ok": True}})
+        assert await asyncio.wait_for(follow_up, timeout=5) == {"ok": True}
+        await client.close()
+
 
     async def test_protocol_helpers_use_known_method_names_and_parameters(self) -> None:
         reader = asyncio.StreamReader()
