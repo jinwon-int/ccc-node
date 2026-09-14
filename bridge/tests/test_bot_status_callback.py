@@ -160,6 +160,23 @@ class StatusCallbackTests(unittest.TestCase):
         self.assertEqual(bot.edited, [(42, 555, "second")])
         self.assertEqual(bot.deleted, [(42, 555)])
 
+    def test_refresh_recovers_registry_after_initial_storage_outage(self):
+        for unchanged in [False, True]:
+            with self.subTest(unchanged=unchanged):
+                bot = _FakeBot(sent_message_id=555)
+                callback = StatusHarness(self.tmpdir)._make_status_callback(bot, chat_id=42)
+
+                async def scenario():
+                    with patch("telegram_bot.utils.heartbeat_store._write", side_effect=OSError):
+                        mid = await callback("first")
+                    if unchanged:
+                        bot._edit_error = telegram.error.BadRequest("Message is not modified")
+                    return await callback("next", mid)
+
+                self.assertEqual(asyncio.run(scenario()), 555)
+                self.assertEqual(len(bot.sent), 1)
+                self.assertEqual(self._store_refs(), [(42, 555)])
+
     def test_failed_delete_never_creates_a_second_cleanup_obligation(self):
         bot = _FakeBot(sent_message_id=555)
         callback = StatusHarness(self.tmpdir)._make_status_callback(bot, chat_id=42)

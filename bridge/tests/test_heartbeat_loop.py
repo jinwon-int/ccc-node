@@ -6,6 +6,7 @@ import threading
 import time
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -265,6 +266,35 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await self.handler._cleanup_heartbeat(req))
             self.assertEqual(live_ids, set())
             self.assertEqual(drain_heartbeats(store_path_for(Path(directory))), [])
+
+    async def test_unchanged_id_retries_failed_ledger_projection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project_chat.config.bot_data_dir = Path(directory)
+            self.addCleanup(delattr, project_chat.config, "bot_data_dir")
+            self.handler._task_ledger_cache = None
+            ledger = self.handler._task_ledger
+            req = self._make_request()
+            req.task_id = await self.handler._ledger_create(1, 2)
+
+            async def status_callback(text, message_id=None):
+                return 11
+
+            req.status_callback = status_callback
+            original = ledger.set_status_message
+            attempts = []
+
+            def flaky_set_status_message(task_id, message_id):
+                attempts.append(message_id)
+                if len(attempts) == 1:
+                    raise OSError("temporary storage failure")
+                return original(task_id, message_id)
+
+            with patch.object(ledger, "set_status_message", side_effect=flaky_set_status_message):
+                await self.handler._maybe_update_heartbeat(req, req.started_at + 10)
+                await self.handler._maybe_update_heartbeat(req, req.started_at + 20)
+            self.assertEqual(req.heartbeat_message_id, 11)
+            self.assertEqual(attempts, [11, 11])
+            self.assertEqual(ledger.records()[0]["status_message_id"], 11)
 
     async def test_cancelled_ledger_projection_drains_before_failed_terminal_cleanup(self):
         """A repeated cancel cannot leave terminal retry cleanup on the old ID."""

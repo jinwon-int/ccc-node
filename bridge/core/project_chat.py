@@ -1408,7 +1408,9 @@ class ProjectChatHandler(
             req.heartbeat_last_update_at = now
             # Register the projection in the task ledger so a terminal
             # transition (or a restart's reconciliation) can always clean it.
-            if message_id != previous_id:
+            # Stable IDs still need a retry after a transient projection error.
+            # Previously replacement sends changed the ID on every refresh.
+            if message_id is not None or message_id != previous_id:
                 led = self._task_ledger
                 if led and req.task_id:
                     # Offload the (now fsync-backed) ledger write off the event

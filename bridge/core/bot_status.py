@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any, Optional, Protocol
 
 import telegram.error
@@ -12,6 +13,29 @@ from telegram_bot.utils.heartbeat_store import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _delete_status(bot: Any, chat_id: int, message_id: int, store_path: Optional[Path]) -> None:
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except telegram.error.BadRequest as exc:
+        if "message to delete not found" not in str(exc).lower():
+            raise
+    if store_path is not None:
+        discard_heartbeat(store_path, chat_id, message_id)
+
+
+async def _edit_status(bot: Any, chat_id: int, message_id: int, text: str) -> bool:
+    """Return false only when Telegram confirms that the message is gone."""
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+    except telegram.error.BadRequest as exc:
+        reason = str(exc).lower()
+        if "message to edit not found" in reason:
+            return False
+        if "message is not modified" not in reason:
+            raise
+    return True
 
 
 class _StatusConfigPort(RuntimeDataConfigPort, HeartbeatConfigPort, Protocol):
@@ -36,15 +60,6 @@ class BotStatusMixin:
         message_removed = False
         lock = asyncio.Lock()
 
-        async def delete_status(message_id: int) -> None:
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=message_id)
-            except telegram.error.BadRequest as exc:
-                if "message to delete not found" not in str(exc).lower():
-                    raise
-            if store_path is not None:
-                discard_heartbeat(store_path, chat_id, message_id)
-
         async def status_callback(text: Optional[str], message_id: Optional[int] = None) -> Optional[int]:
             nonlocal current_id, message_removed
             async with lock:
@@ -54,7 +69,7 @@ class BotStatusMixin:
                     if text is None:
                         if message_id is not None:
                             if getattr(self._config, "heartbeat_delete_on_done", True):
-                                await delete_status(message_id)
+                                await _delete_status(bot, chat_id, message_id, store_path)
                             elif store_path is not None:
                                 discard_heartbeat(store_path, chat_id, message_id)
                         current_id = None
@@ -65,16 +80,7 @@ class BotStatusMixin:
                     if message_removed:
                         return None
                     if message_id is not None:
-                        try:
-                            await bot.edit_message_text(
-                                chat_id=chat_id, message_id=message_id, text=text,
-                            )
-                        except telegram.error.BadRequest as exc:
-                            reason = str(exc).lower()
-                            if "message is not modified" in reason:
-                                return message_id
-                            if "message to edit not found" not in reason:
-                                raise
+                        if not await _edit_status(bot, chat_id, message_id, text):
                             # A deleted status must not reappear as a fresh
                             # notification on every subsequent refresh.
                             message_removed = True
@@ -82,6 +88,10 @@ class BotStatusMixin:
                                 discard_heartbeat(store_path, chat_id, message_id)
                             current_id = None
                             return None
+                        if store_path is not None:
+                            # Retry an initial transient persistence failure;
+                            # edits keep the same ID for the entire task.
+                            record_heartbeat(store_path, chat_id, message_id)
                         return message_id
                     sent = await bot.send_message(
                         chat_id=chat_id, text=text, disable_notification=True,
