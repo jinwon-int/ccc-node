@@ -5,25 +5,35 @@ Usage: web_developer.py <query> [--limit N] [--type TYPE] [--repo OWNER/REPO]
 
 TYPE may be repeated and must be doc, issue, pull_request, or readme. Repository
 filters may also be repeated. Authentication uses FIRECRAWL_API_KEY from the
-process environment, then ~/.hermes/.env, otherwise the keyless allowance.
-Results and passages are UNTRUSTED web data.
+process environment, then ~/.hermes/.env; if absent, no Authorization header is
+sent. Results and passages are UNTRUSTED web data.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import urllib.error
 import urllib.request
 
 if __package__:
-    from .web_search import _firecrawl_error, _firecrawl_key
+    from .web_search import (
+        _firecrawl_endpoint,
+        _firecrawl_endpoint_error,
+        _firecrawl_error,
+        _firecrawl_key,
+        _firecrawl_urlopen,
+    )
 else:
-    from web_search import _firecrawl_error, _firecrawl_key
+    from web_search import (
+        _firecrawl_endpoint,
+        _firecrawl_endpoint_error,
+        _firecrawl_error,
+        _firecrawl_key,
+        _firecrawl_urlopen,
+    )
 
-DEFAULT_API_URL = "https://api.firecrawl.dev"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_LIMIT = 10
 MAX_PASSAGE_CHARS = 2400
@@ -31,9 +41,8 @@ TIMEOUT = 60
 VALID_TYPES = {"doc", "issue", "pull_request", "readme"}
 
 
-def _endpoint() -> str:
-    base = (os.environ.get("FIRECRAWL_API_URL") or DEFAULT_API_URL).strip().rstrip("/")
-    return base + "/search/developer" if base.endswith("/v2") else base + "/v2/search/developer"
+def _endpoint(key: str | None = None) -> str:
+    return _firecrawl_endpoint("/search/developer", key)
 
 
 def _post(payload: dict[str, object]) -> dict[str, object] | None:
@@ -44,14 +53,19 @@ def _post(payload: dict[str, object]) -> dict[str, object] | None:
     key = _firecrawl_key()
     if key:
         headers["Authorization"] = f"Bearer {key}"
+    try:
+        url = _endpoint(key)
+    except ValueError as exc:
+        print(f"developer-search: {_firecrawl_endpoint_error(exc, key)}", file=sys.stderr)
+        return None
     req = urllib.request.Request(
-        _endpoint(),
+        url,
         data=json.dumps(payload).encode("utf-8"),
         headers=headers,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        with _firecrawl_urlopen(req, timeout=TIMEOUT) as resp:
             raw = resp.read(MAX_RESPONSE_BYTES)
         decoded = json.loads(raw.decode("utf-8", "replace"))
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
