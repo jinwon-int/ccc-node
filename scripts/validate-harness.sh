@@ -539,6 +539,12 @@ else
   err "A2A Piri shared memory snapshot producer tests failed"
   tail -10 "$TMP/a2a-piri-memory-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_fleet_topology_test.py >"$TMP/fleet-topology-test.out" 2>&1; then
+  say "  ok fleet inventory descriptor offline validator tests (#1451)"
+else
+  err "fleet inventory descriptor offline validator tests failed"
+  tail -10 "$TMP/fleet-topology-test.out" 2>/dev/null
+fi
 fi # phase_static, inline python checks
 # A suite must not inherit the harness environment of the node it runs on
 # (#1064). The per-suite guard `ccc_test_reset_hook_env` (#1023) only reaches
