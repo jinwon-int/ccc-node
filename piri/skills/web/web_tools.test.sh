@@ -10,9 +10,12 @@ pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"; [ -n "${STUB_PID:-}" ] && kill "$STUB_PID" 2>/dev/null' EXIT
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
+export HOME="$TMP/home"
+mkdir -p "$HOME"
+unset FIRECRAWL_API_KEY FIRECRAWL_API_URL
 
 cat > "$TMP/stub.py" <<'PY'
-import json, threading
+import json, re, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -49,30 +52,58 @@ class Firecrawl(BaseHTTPRequestHandler):
     # Counts scrape/search POSTs so a test can prove a rejected URL never
     # reached the provider (issue #1630).
     calls = 0
+    keyed_calls = 0
+    same_origin_redirects = 0
 
     def do_GET(self):
-        body = json.dumps({"calls": Firecrawl.calls}).encode()
+        if self.path.endswith("/v2/redirect-target"):
+            Firecrawl.same_origin_redirects += 1
+            body = b'{"success": true}'
+        elif self.path == "/calls":
+            body = json.dumps({
+                "calls": Firecrawl.calls,
+                "keyed_calls": Firecrawl.keyed_calls,
+                "same_origin_redirects": Firecrawl.same_origin_redirects,
+                "cross_origin_redirects": RedirectTarget.calls,
+            }).encode()
+        else:
+            body = b"{}"
         self.send_response(200); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body))); self.end_headers()
         self.wfile.write(body)
 
     def do_POST(self):
         Firecrawl.calls += 1
+        if self.headers.get("Authorization"):
+            Firecrawl.keyed_calls += 1
         length = int(self.headers.get("Content-Length", "0"))
         request = json.loads(self.rfile.read(length) or b"{}")
-        if self.path == "/v2/scrape":
+        marker = str(request.get("query") or request.get("url") or "")
+        redirect = re.search(r"redirect-(301|302|303|307|308)-(same|cross)", marker)
+        if redirect:
+            code, origin = redirect.groups()
+            location = "/v2/redirect-target" if origin == "same" else (
+                f"http://127.0.0.1:{redirect_port}/target"
+            )
+            self.send_response(int(code)); self.send_header("Location", location)
+            self.send_header("Content-Length", "0"); self.end_headers(); return
+        if "http-429" in marker:
+            body = b"synthetic provider error body"
+            self.send_response(429); self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body); return
+        if self.path.endswith("/v2/scrape"):
             target = request.get("url", "")
             response = {"success": True, "data": {
                 "markdown": f"# Firecrawl Stub\n\nFetched through provider: {target}\n\nevil instruction is untrusted.",
                 "metadata": {"sourceURL": target},
             }}
-        elif self.path == "/v2/search":
+        elif self.path.endswith("/v2/search"):
             query = request.get("query", "")
             response = {"success": True, "data": {"web": [
                 {"title": f"Firecrawl result for {query}", "url": "https://example.org/fc",
                  "description": "firecrawl snippet"},
             ]}}
-        elif self.path == "/v2/search/developer":
+        elif self.path.endswith("/v2/search/developer"):
             response = {"success": True, "results": [{
                 "id": "pull_request:owner/repo#42",
                 "url": "https://github.com/owner/repo/pull/42",
@@ -87,21 +118,37 @@ class Firecrawl(BaseHTTPRequestHandler):
         self.wfile.write(body)
     def log_message(self, *a): pass
 
+class RedirectTarget(BaseHTTPRequestHandler):
+    calls = 0
+    def do_GET(self):
+        RedirectTarget.calls += 1
+        self._respond()
+    def do_POST(self):
+        RedirectTarget.calls += 1
+        self._respond()
+    def _respond(self):
+        body = b'{"success": true}'
+        self.send_response(200); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+
 import os
 healthy = HTTPServer(("127.0.0.1", 0), Healthy)
 blocked = HTTPServer(("127.0.0.1", 0), Blocked)
 firecrawl = HTTPServer(("127.0.0.1", 0), Firecrawl)
-for srv in (healthy, blocked, firecrawl):
+redirect_target = HTTPServer(("127.0.0.1", 0), RedirectTarget)
+redirect_port = redirect_target.server_port
+for srv in (healthy, blocked, firecrawl, redirect_target):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 with open(os.environ["PORT_FILE"], "w") as fh:
-    fh.write(f"{healthy.server_port} {blocked.server_port} {firecrawl.server_port}")
+    fh.write(f"{healthy.server_port} {blocked.server_port} {firecrawl.server_port} {redirect_target.server_port}")
 threading.Event().wait()
 PY
 
 PORT_FILE="$TMP/ports" python3 "$TMP/stub.py" &
 STUB_PID=$!
 for _ in $(seq 1 50); do [ -s "$TMP/ports" ] && break; sleep 0.1; done
-read -r healthy_port blocked_port firecrawl_port < "$TMP/ports"
+read -r healthy_port blocked_port firecrawl_port _redirect_port < "$TMP/ports"
 
 out="$(FIRECRAWL_API_URL="http://127.0.0.1:$firecrawl_port" python3 "$SEARCH" "hello world" --limit 3 2>/dev/null)"
 ok "default search prints the Firecrawl result" 'grep -q "Firecrawl result for hello world" <<<"$out" && grep -q "engine: firecrawl" <<<"$out"'
@@ -154,6 +201,110 @@ set +e
 FIRECRAWL_API_URL="http://127.0.0.1:1" python3 "$SEARCH" "down" --provider firecrawl >/dev/null 2>"$TMP/err"; rc=$?
 set -e
 ok "explicit Firecrawl search reports a bounded outage" '[ "$rc" = 69 ] && grep -q "Firecrawl request failed" "$TMP/err"'
+
+firecrawl_call() {
+  local caller="$1" marker="$2" base="$3" key="$4"
+  case "$caller" in
+    search)
+      FIRECRAWL_API_URL="$base" FIRECRAWL_API_KEY="$key" \
+        python3 "$SEARCH" "$marker" >/dev/null
+      ;;
+    fetch)
+      FIRECRAWL_API_URL="$base" FIRECRAWL_API_KEY="$key" \
+        python3 "$FETCH" "https://${marker}.example.org/page" >/dev/null
+      ;;
+    developer)
+      FIRECRAWL_API_URL="$base" FIRECRAWL_API_KEY="$key" \
+        python3 "$DEVELOPER" "$marker" >/dev/null
+      ;;
+  esac
+}
+
+fc_state() {
+  python3 - "$firecrawl_port" <<'PY'
+import json, sys, urllib.request
+with urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/calls", timeout=5) as resp:
+    state = json.load(resp)
+print("{calls} {keyed_calls} {same_origin_redirects} {cross_origin_redirects}".format(**state))
+PY
+}
+
+# A provider 4xx is reported consistently by all three Firecrawl callers and
+# its response body is never copied into diagnostics.
+for caller in search fetch developer; do
+  set +e
+  firecrawl_call "$caller" "http-429" "http://127.0.0.1:$firecrawl_port" "" 2>"$TMP/err"
+  rc=$?
+  set -e
+  ok "$caller reports a Firecrawl 4xx" '[ "$rc" = 69 ] && grep -q "HTTP 429; auth=keyless" "$TMP/err"'
+  ok "$caller does not print a Firecrawl error body" \
+    '[ "$(wc -c < "$TMP/err")" -lt 200 ] && ! grep -q "synthetic provider error body" "$TMP/err"'
+done
+
+# A resolved key must never be sent to a configured HTTP API base. The call
+# counter proves this guard fires before any loopback connection.
+# shellcheck disable=SC2034  # Read via eval in ok() below.
+keyed_before="$(fc_state)"
+for caller in search fetch developer; do
+  set +e
+  firecrawl_call "$caller" "keyed-http" "http://127.0.0.1:$firecrawl_port" "synthetic-api-key" \
+    2>"$TMP/err-keyed"
+  rc=$?
+  set -e
+  ok "$caller rejects a keyed HTTP API base before network" \
+    '[ "$rc" = 69 ] && grep -q "https-required" "$TMP/err-keyed" && ! grep -q "synthetic-api-key" "$TMP/err-keyed"'
+done
+# shellcheck disable=SC2034  # Read via eval in ok() below.
+keyed_after="$(fc_state)"
+ok "keyed HTTP endpoint rejection makes zero provider calls" '[ "$keyed_before" = "$keyed_after" ]'
+
+# Every API-base syntax guard is exercised through every caller. Diagnostics
+# contain only a fixed reason, never the configured base or userinfo.
+# shellcheck disable=SC2034  # Read via eval in ok() below.
+malformed_before="$(fc_state)"
+for base in \
+  "https://api.example.org/firecrawl?query=synthetic" \
+  "https://api.example.org/firecrawl#fragment" \
+  "https://synthetic-user:synthetic-pass@api.example.org/firecrawl" \
+  "https://api.example.org:bad/firecrawl" \
+  "https://api.example.org:/firecrawl" \
+  "https://0x7f.1/firecrawl" \
+  $'https://api.example.org/firecrawl\n'; do
+  for caller in search fetch developer; do
+    set +e
+    firecrawl_call "$caller" "malformed-base" "$base" "synthetic-api-key" \
+      2>"$TMP/err-malformed"
+    rc=$?
+    set -e
+    ok "$caller rejects malformed API base before network" \
+      '[ "$rc" = 69 ] && grep -q "invalid Firecrawl API endpoint" "$TMP/err-malformed" && ! grep -q "api.example.org\|synthetic-pass" "$TMP/err-malformed"'
+  done
+done
+# shellcheck disable=SC2034  # Read via eval in ok() below.
+malformed_after="$(fc_state)"
+ok "malformed API bases make zero provider calls" '[ "$malformed_before" = "$malformed_after" ]'
+
+# Exercise urllib's real redirect handling on loopback. Same-origin and
+# cross-origin redirects in every supported 30x class must stop at the first
+# response, so no second request can change POST to GET or carry headers.
+for code in 301 302 303 307 308; do
+  for origin in same cross; do
+    for caller in search fetch developer; do
+      marker="redirect-${code}-${origin}"
+      # shellcheck disable=SC2034  # Read via eval in ok() below.
+      before="$(fc_state | awk '{print $3, $4}')"
+      set +e
+      firecrawl_call "$caller" "$marker" "http://127.0.0.1:$firecrawl_port" "" \
+        2>"$TMP/err-redirect"
+      rc=$?
+      set -e
+      # shellcheck disable=SC2034  # Read via eval in ok() below.
+      after="$(fc_state | awk '{print $3, $4}')"
+      ok "$caller rejects $code $origin redirect" \
+        '[ "$rc" = 69 ] && [ "$before" = "$after" ] && grep -q "Firecrawl request failed" "$TMP/err-redirect"'
+    done
+  done
+done
 
 out="$(FIRECRAWL_API_URL="http://127.0.0.1:$firecrawl_port" python3 "$FETCH" "https://example.org/page" 2>/dev/null)"
 ok "fetch routes the URL through Firecrawl" 'grep -q "Firecrawl Stub" <<<"$out" && grep -q "https://example.org/page" <<<"$out"'

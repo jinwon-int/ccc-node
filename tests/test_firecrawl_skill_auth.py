@@ -1,10 +1,13 @@
-"""Offline regression tests: no real credentials, network, or account credits."""
+"""Offline regression tests: synthetic credentials and loopback only."""
 import importlib.util
 import io
 import json
 import subprocess
 import sys
+import threading
 import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
@@ -50,10 +53,13 @@ def test_all_requests_share_key_resolution(helpers, monkeypatch, tmp_path, name,
 
     def respond(req, **kwargs):
         requests.append(req)
-        return io.BytesIO(json.dumps({"success": True, "data": {}, "results": []}).encode())
+        response = {"success": True, "data": {}, "results": []}
+        if name == "web_search":
+            response["data"] = {"web": []}
+        return io.BytesIO(json.dumps(response).encode())
 
     module = helpers[name]
-    monkeypatch.setattr(module.urllib.request, "urlopen", respond)
+    monkeypatch.setattr(module, "_firecrawl_urlopen", respond)
     if name == "web_search":
         module._search_firecrawl("synthetic", 1)
     elif name == "web_fetch":
@@ -64,6 +70,139 @@ def test_all_requests_share_key_resolution(helpers, monkeypatch, tmp_path, name,
     assert requests[0].get_header("Authorization") == (
         f"Bearer {expected}" if expected else None
     )
+
+
+@pytest.mark.parametrize("name", ["web_search", "web_fetch", "web_developer"])
+@pytest.mark.parametrize(
+    "base,expected_prefix",
+    [
+        ("https://api.example.test/firecrawl", "https://api.example.test/firecrawl/v2"),
+        ("https://api.example.test/firecrawl/v2/", "https://api.example.test/firecrawl/v2"),
+        ("https://api.example.test/%ED%95%9C%EA%B8%80/v2", "https://api.example.test/%ED%95%9C%EA%B8%80/v2"),
+    ],
+)
+def test_keyed_https_selfhost_preserves_api_path_and_auth(
+    helpers, monkeypatch, name, base, expected_prefix
+):
+    monkeypatch.setenv("FIRECRAWL_API_URL", base)
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "synthetic-api-key")
+    requests = []
+
+    def respond(req, **kwargs):
+        requests.append(req)
+        response = {"success": True, "data": {}, "results": []}
+        if name == "web_search":
+            response["data"] = {"web": []}
+        return io.BytesIO(json.dumps(response).encode())
+
+    module = helpers[name]
+    monkeypatch.setattr(module, "_firecrawl_urlopen", respond)
+    if name == "web_search":
+        assert module._search_firecrawl("synthetic", 1) == 0
+        suffix = "/search"
+    elif name == "web_fetch":
+        assert module._request({}) is not None
+        suffix = "/scrape"
+    else:
+        assert module._post({}) is not None
+        suffix = "/search/developer"
+
+    assert len(requests) == 1
+    assert requests[0].full_url == expected_prefix + suffix
+    assert requests[0].get_header("Authorization") == "Bearer synthetic-api-key"
+
+
+@pytest.mark.parametrize("name", ["web_search", "web_fetch", "web_developer"])
+def test_keyed_http_api_base_is_rejected_before_network(helpers, monkeypatch, capsys, name):
+    base = "http://127.0.0.1:18080/firecrawl"
+    key = "synthetic-api-key"
+    monkeypatch.setenv("FIRECRAWL_API_URL", base)
+    monkeypatch.setenv("FIRECRAWL_API_KEY", key)
+    calls = []
+
+    def unexpected(req, **kwargs):
+        calls.append(req)
+        raise AssertionError("network must not be attempted")
+
+    module = helpers[name]
+    monkeypatch.setattr(module, "_firecrawl_urlopen", unexpected)
+    if name == "web_search":
+        assert module._search_firecrawl("synthetic", 1) == 69
+    elif name == "web_fetch":
+        assert module._request({}) is None
+    else:
+        assert module._post({}) is None
+    output = capsys.readouterr()
+    assert calls == []
+    assert "https-required" in output.err
+    assert key not in output.out + output.err
+    assert base not in output.out + output.err
+
+
+@pytest.mark.parametrize("name", ["web_search", "web_fetch", "web_developer"])
+@pytest.mark.parametrize(
+    "base",
+    [
+        "https://api.example.test/firecrawl?query=synthetic",
+        "https://api.example.test/firecrawl#fragment",
+        "https://synthetic-user:synthetic-pass@api.example.test/firecrawl",
+        "https://api.example.test:bad/firecrawl",
+        "https://api.example.test:/firecrawl",
+        "https://api.example.test/firecrawl\n",
+        "https://0x7f.1/firecrawl",
+    ],
+)
+def test_malformed_api_base_is_rejected_before_network(helpers, monkeypatch, capsys, name, base):
+    key = "synthetic-api-key"
+    monkeypatch.setenv("FIRECRAWL_API_URL", base)
+    monkeypatch.setenv("FIRECRAWL_API_KEY", key)
+    calls = []
+
+    def unexpected(req, **kwargs):
+        calls.append(req)
+        raise AssertionError("network must not be attempted")
+
+    module = helpers[name]
+    monkeypatch.setattr(module, "_firecrawl_urlopen", unexpected)
+    if name == "web_search":
+        assert module._search_firecrawl("synthetic", 1) == 69
+    elif name == "web_fetch":
+        assert module._request({}) is None
+    else:
+        assert module._post({}) is None
+    output = capsys.readouterr()
+    assert calls == []
+    assert "invalid Firecrawl API endpoint" in output.err
+    assert key not in output.out + output.err
+    assert base not in output.out + output.err
+
+
+@pytest.mark.parametrize("name", ["web_search", "web_fetch", "web_developer"])
+def test_keyless_explicit_http_api_base_is_allowed(helpers, monkeypatch, name):
+    monkeypatch.setenv("FIRECRAWL_API_URL", "http://127.0.0.1:18080/firecrawl")
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    requests = []
+
+    def respond(req, **kwargs):
+        requests.append(req)
+        response = {"success": True, "data": {}, "results": []}
+        if name == "web_search":
+            response["data"] = {"web": []}
+        return io.BytesIO(json.dumps(response).encode())
+
+    module = helpers[name]
+    monkeypatch.setattr(module, "_firecrawl_urlopen", respond)
+    if name == "web_search":
+        assert module._search_firecrawl("synthetic", 1) == 0
+        suffix = "/search"
+    elif name == "web_fetch":
+        assert module._request({}) is not None
+        suffix = "/scrape"
+    else:
+        assert module._post({}) is not None
+        suffix = "/search/developer"
+    assert requests[0].full_url == f"http://127.0.0.1:18080/firecrawl/v2{suffix}"
+    assert requests[0].get_header("Authorization") is None
 
 
 @pytest.mark.parametrize("name", ["web_search", "web_fetch", "web_developer"])
@@ -79,7 +218,7 @@ def test_http_error_is_diagnostic_but_never_leaks(helpers, monkeypatch, capsys, 
         )
 
     module = helpers[name]
-    monkeypatch.setattr(module.urllib.request, "urlopen", fail)
+    monkeypatch.setattr(module, "_firecrawl_urlopen", fail)
     if name == "web_search":
         assert module._search_firecrawl("synthetic", 1) == 69
     elif name == "web_fetch":
@@ -89,6 +228,99 @@ def test_http_error_is_diagnostic_but_never_leaks(helpers, monkeypatch, capsys, 
     output = capsys.readouterr()
     assert secret not in output.out + output.err
     assert f"HTTP 429; auth={'keyed' if keyed else 'keyless'}" in output.err
+
+
+class _RedirectHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path == "/target":
+            self.server.target_methods.append("POST")
+            self._respond(200, b'{"success": true}')
+            return
+        parts = self.path.split("/")
+        if len(parts) != 4 or parts[1] != "redirect":
+            self._respond(404, b"not found")
+            return
+        self.server.redirect_calls += 1
+        self.server.auth_headers.append(self.headers.get("Authorization"))
+        code = int(parts[2])
+        location = "/target" if parts[3] == "same" else self.server.cross_target
+        self.send_response(code)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == "/target":
+            self.server.target_methods.append("GET")
+        self._respond(200, b'{"success": true}')
+
+    def _respond(self, status, body):
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class _RedirectTargetHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.server.target_methods.append("POST")
+        self._respond()
+
+    def do_GET(self):
+        self.server.target_methods.append("GET")
+        self._respond()
+
+    def _respond(self):
+        body = b'{"success": true}'
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("origin", ["same", "cross"])
+def test_firecrawl_transport_rejects_redirects(helpers, code, origin):
+    origin_server = HTTPServer(("127.0.0.1", 0), _RedirectHandler)
+    target_server = HTTPServer(("127.0.0.1", 0), _RedirectTargetHandler)
+    origin_server.redirect_calls = 0
+    origin_server.target_methods = []
+    origin_server.auth_headers = []
+    target_server.target_methods = []
+    origin_server.cross_target = f"http://127.0.0.1:{target_server.server_port}/target"
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (origin_server, target_server)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{origin_server.server_port}/redirect/{code}/{origin}",
+            data=b"{}",
+            headers={"Authorization": "Bearer synthetic-api-key"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            helpers["web_search"]._firecrawl_urlopen(request, timeout=5)
+        assert failure.value.code == code
+        assert origin_server.redirect_calls == 1
+        assert origin_server.auth_headers == ["Bearer synthetic-api-key"]
+        assert origin_server.target_methods == []
+        assert target_server.target_methods == []
+    finally:
+        origin_server.shutdown()
+        target_server.shutdown()
+        origin_server.server_close()
+        target_server.server_close()
+        for thread in threads:
+            thread.join(timeout=5)
 
 
 @pytest.mark.parametrize("contents", [b"\xff", b"# comment\n", b"FIRECRAWL_API_KEY=\n"])
@@ -123,3 +355,100 @@ def test_installed_scripts_start_without_pythonpath(tmp_path, monkeypatch, name,
 def test_network_error_does_not_print_exception_details(helpers):
     error = urllib.error.URLError("fake-credential-in-url")
     assert helpers["web_search"]._firecrawl_error(error, "fake-key") == "URLError; auth=keyed"
+
+
+@pytest.fixture
+def cli_without_network(tmp_path, monkeypatch):
+    """Execute the real entry points while recording any attempted DNS/socket use."""
+    guard = tmp_path / "network-guard"
+    guard.mkdir()
+    marker = tmp_path / "network-attempted"
+    (guard / "sitecustomize.py").write_text(
+        "import os, socket\n"
+        "from pathlib import Path\n"
+        "def forbidden(*args, **kwargs):\n"
+        "    Path(os.environ['TEST_NETWORK_MARKER']).write_text('attempted')\n"
+        "    raise AssertionError('offline test forbids network')\n"
+        "socket.socket.connect = forbidden\n"
+        "socket.socket.connect_ex = forbidden\n"
+        "socket.getaddrinfo = forbidden\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(guard))
+    monkeypatch.setenv("TEST_NETWORK_MARKER", str(marker))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    monkeypatch.setenv("FIRECRAWL_API_URL", "https://127.0.0.1:18443/selfhost/v2")
+    arguments = {"web_search": ["synthetic", "--provider", "firecrawl"],
+                 "web_fetch": ["https://example.com"], "web_developer": ["synthetic"]}
+
+    def run(name):
+        result = subprocess.run([sys.executable, str(ROOT / f"{name}.py"), *arguments[name]],
+                                capture_output=True, text=True, timeout=5)
+        assert not marker.exists(), "invalid configuration must fail before network"
+        assert result.returncode == 69, result.stderr
+        assert "Traceback" not in result.stdout + result.stderr
+        return result.stdout + result.stderr
+    return run
+
+
+@pytest.mark.parametrize("name", ["web_search", "web_fetch", "web_developer"])
+@pytest.mark.parametrize("source", ["environment", "stored"])
+@pytest.mark.parametrize("key", ["synthetic-secret\tinvalid", "synthetic-secret-한글"])
+def test_cli_malformed_resolved_keys_are_bounded_before_network(
+    cli_without_network, monkeypatch, tmp_path, name, source, key
+):
+    if source == "environment":
+        monkeypatch.setenv("FIRECRAWL_API_KEY", key)
+    else:
+        stored(tmp_path, f'FIRECRAWL_API_KEY="{key}"\n')
+    output = cli_without_network(name)
+    assert "invalid-credential; auth=keyed" in output
+    assert "synthetic-secret" not in output
+    assert "한글" not in output
+
+
+@pytest.mark.parametrize("name", ["web_search", "web_fetch", "web_developer"])
+def test_cli_newline_key_cannot_escape_into_a_traceback(cli_without_network, monkeypatch, name):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "synthetic-newline-secret\nInjected: forbidden")
+    output = cli_without_network(name)
+    assert "invalid-credential; auth=keyed" in output
+    assert "synthetic-newline-secret" not in output
+    assert "Injected" not in output
+
+
+@pytest.mark.parametrize("name", ["web_search", "web_fetch", "web_developer"])
+@pytest.mark.parametrize("base", ["https://127.0.0.1:18443/selfhost/v2/한글", "https://한글.example/v2"])
+def test_cli_raw_unicode_api_base_fails_before_network(cli_without_network, monkeypatch, name, base):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "synthetic-valid-key")
+    monkeypatch.setenv("FIRECRAWL_API_URL", base)
+    output = cli_without_network(name)
+    assert "unsupported-url-encoding; auth=keyed" in output
+    assert "한글" not in output
+    assert "synthetic-valid-key" not in output
+    assert base not in output
+
+
+@pytest.mark.parametrize("name", ["web_search", "web_fetch", "web_developer"])
+@pytest.mark.parametrize("stage", ["construction", "transport"])
+def test_request_construction_and_encoding_errors_are_bounded(helpers, monkeypatch, capsys, name, stage):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "synthetic-valid-key")
+    module = helpers[name]
+    secret = "synthetic-exception-secret"
+    def fail(*args, **kwargs):
+        if stage == "construction":
+            raise ValueError(secret)
+        raise UnicodeEncodeError("ascii", secret + "한", len(secret), len(secret) + 1, "synthetic")
+    if stage == "construction":
+        monkeypatch.setattr(urllib.request, "Request", fail)
+    else:
+        monkeypatch.setattr(module, "_firecrawl_urlopen", fail)
+    if name == "web_search":
+        assert module._search_firecrawl("synthetic", 1) == 69
+    elif name == "web_fetch":
+        assert module._request({}) is None
+    else:
+        assert module._post({}) is None
+    output = capsys.readouterr()
+    assert "Firecrawl request failed" in output.err
+    assert secret not in output.out + output.err
+    assert "synthetic-valid-key" not in output.out + output.err

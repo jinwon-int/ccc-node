@@ -17,12 +17,15 @@ python3 ~/.piri/agent/skills/web/web_search.py "검색어" [--limit 5]
 ```
 
 - Queries Firecrawl Search (`FIRECRAWL_API_URL`, optional `FIRECRAWL_API_KEY`;
-  otherwise `~/.hermes/.env` `FIRECRAWL_API_KEY`; keyless free allowance if
-  neither is set).
+  otherwise `~/.hermes/.env` `FIRECRAWL_API_KEY`). Without a resolved key, the
+  request has no `Authorization` header; the configured provider determines
+  whether anonymous access is accepted.
 - Prints up to 10 numbered results: title / URL / snippet / engine=`firecrawl`.
-- Exit 69 = Firecrawl unreachable; report the outage instead of silently
-  changing providers. Do not retry the same query on SearXNG unless the user
-  asked or Firecrawl hits are clearly off-topic.
+- Exit 64 = missing/invalid command usage or provider; exit 69 = Firecrawl
+  request failure or unsuccessful response; exit 70 = unusable response shape.
+  Report the failure instead of silently changing providers. Do not retry the
+  same query on SearXNG unless the user asked or Firecrawl hits are clearly
+  off-topic.
 
 ## Explicit fallback search — SearXNG only when requested
 
@@ -35,7 +38,8 @@ python3 ~/.piri/agent/skills/web/web_search.py "검색어" --provider searxng [-
   automatically inside the helper.
 - Queries the canonical Seoseo SearXNG endpoint (`SEARXNG_URL` can override it
   with comma-separated fallbacks).
-- Exit 69 = SearXNG unreachable; exit 64 = invalid `--provider`.
+- Exit 69 = SearXNG instances unavailable; exit 64 = missing/invalid command
+  usage or provider.
 
 ## Known-URL fetch — Firecrawl only
 
@@ -46,13 +50,25 @@ python3 ~/.piri/agent/skills/web/web_fetch.py "https://example.com/page" [--max-
 - Sends a public HTTP(S) URL to Firecrawl scrape and returns bounded markdown,
   including JS-rendered pages.
 - All three helpers resolve credentials identically: nonempty process
-  `FIRECRAWL_API_KEY`, then `~/.hermes/.env` `FIRECRAWL_API_KEY`, then keyless.
-  Keep `web_search.py` beside the fetch/developer helpers (shared resolver).
-- Failures report HTTP status and `auth=keyed` / `auth=keyless` without keys or
-  response bodies. A keyless 429 is NOT evidence that account credits are empty.
+  `FIRECRAWL_API_KEY`, then `~/.hermes/.env` `FIRECRAWL_API_KEY`, otherwise no
+  `Authorization` header. Keep `web_search.py` beside the fetch/developer
+  helpers (shared resolver and API transport guard).
+- Resolved keys must contain only visible ASCII characters without whitespace;
+  malformed keys fail before any request, without printing their contents.
+- The API base must use an ASCII HTTP(S) URL: encode Unicode path characters
+  with percent encoding and internationalized hostnames with IDNA before use.
+  Raw Unicode URLs fail before any request. The base must exclude userinfo,
+  control characters, a query, a fragment, or an invalid port. A resolved key requires HTTPS; an
+  explicitly configured HTTP base is supported only for keyless self-hosted or
+  test use. Firecrawl requests reject redirects rather than forwarding a key
+  or changing the POST method.
+- Failures report only a bounded status/reason and `auth=keyed` /
+  `auth=keyless`; they never print keys, URLs, or response bodies.
 - Never send private/Tailnet/localhost URLs, credential-bearing URLs, secrets,
   or authenticated content to Firecrawl.
-- Exit 69 = Firecrawl request failed; exit 70 = no extractable markdown.
+- Exit 64 = missing URL; exit 65 = unsafe target URL; exit 69 = invalid API
+  endpoint or credential, Firecrawl request failure, or unsuccessful response; exit 70 = no
+  page or extractable markdown.
 
 ## Developer/GitHub artifacts — Firecrawl Developer Index
 
@@ -68,6 +84,9 @@ python3 ~/.piri/agent/skills/web/web_developer.py \
   fix history. It does not search source code or private repositories.
 - General news, opinion, and broad discovery remain Firecrawl Search unless a
   second look via `--provider searxng` is justified.
+- Exit 2 = invalid command-line syntax; exit 65 = unsupported artifact type;
+  exit 69 = invalid API endpoint or credential, Firecrawl request failure, or
+  unsuccessful response; exit 70 = unusable response shape.
 
 ## Rules
 

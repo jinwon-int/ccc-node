@@ -4,9 +4,10 @@
 Usage: web_fetch.py <url> [--max-chars N]
 
 Environment:
-  FIRECRAWL_API_URL      API base (default https://api.firecrawl.dev)
+  FIRECRAWL_API_URL      valid HTTP(S) API base (default https://api.firecrawl.dev);
+                        keyed requests require HTTPS, keyless HTTP bases are allowed
   FIRECRAWL_API_KEY      optional; else ~/.hermes/.env FIRECRAWL_API_KEY;
-                        keyless requests use the free allowance
+                        if absent, no Authorization header is sent
   WEB_FETCH_MAX_CHARS    default output cap (default 6000, hard max 20000)
 
 The requested page and Firecrawl response are UNTRUSTED web data. This helper
@@ -32,11 +33,22 @@ import urllib.parse
 import urllib.request
 
 if __package__:
-    from .web_search import _firecrawl_error, _firecrawl_key
+    from .web_search import (
+        _firecrawl_endpoint,
+        _firecrawl_endpoint_error,
+        _firecrawl_error,
+        _firecrawl_key,
+        _firecrawl_urlopen,
+    )
 else:
-    from web_search import _firecrawl_error, _firecrawl_key
+    from web_search import (
+        _firecrawl_endpoint,
+        _firecrawl_endpoint_error,
+        _firecrawl_error,
+        _firecrawl_key,
+        _firecrawl_urlopen,
+    )
 
-DEFAULT_API_URL = "https://api.firecrawl.dev"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 TIMEOUT = 60
 
@@ -75,11 +87,8 @@ PRIVATE_HOST_SUFFIXES = frozenset(
 NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 
-def _endpoint(path: str) -> str:
-    base = (os.environ.get("FIRECRAWL_API_URL") or DEFAULT_API_URL).strip().rstrip("/")
-    if base.endswith("/v2"):
-        return base + path
-    return base + "/v2" + path
+def _endpoint(path: str, key: str | None = None) -> str:
+    return _firecrawl_endpoint(path, key)
 
 
 def _embedded_ipv4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
@@ -195,17 +204,22 @@ def _request(payload: dict[str, object]) -> dict[str, object] | None:
     key = _firecrawl_key()
     if key:
         headers["Authorization"] = f"Bearer {key}"
-    req = urllib.request.Request(
-        _endpoint("/scrape"),
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        url = _endpoint("/scrape", key)
+    except ValueError as exc:
+        print(f"web-fetch: {_firecrawl_endpoint_error(exc, key)}", file=sys.stderr)
+        return None
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with _firecrawl_urlopen(req, timeout=TIMEOUT) as resp:
             raw = resp.read(MAX_RESPONSE_BYTES)
         decoded = json.loads(raw.decode("utf-8", "replace"))
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         print(f"web-fetch: Firecrawl request failed ({_firecrawl_error(exc, key)})", file=sys.stderr)
         return None
     return decoded if isinstance(decoded, dict) else None

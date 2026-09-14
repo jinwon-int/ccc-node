@@ -4,9 +4,10 @@
 Usage: web_search.py <query> [--limit N] [--provider firecrawl|searxng]
 
 Environment:
-  FIRECRAWL_API_URL  API base (default https://api.firecrawl.dev)
+  FIRECRAWL_API_URL  valid HTTP(S) API base (default https://api.firecrawl.dev);
+                     keyed requests require HTTPS, keyless HTTP bases are allowed
   FIRECRAWL_API_KEY  optional; else ~/.hermes/.env FIRECRAWL_API_KEY;
-                     keyless requests use the free allowance
+                     if absent, no Authorization header is sent
   SEARXNG_URL        comma-separated SearXNG base URLs for --provider searxng
                      (default: Seoseo's canonical Tailnet endpoint).
   WEB_SEARCH_LIMIT   default result count (default 5, hard max 10)
@@ -23,6 +24,7 @@ failure so the agent can fall back to reporting the outage.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import sys
@@ -38,6 +40,21 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 SEARXNG_TIMEOUT = 15
 FIRECRAWL_TIMEOUT = 60
 VALID_PROVIDERS = {"searxng", "firecrawl"}
+_API_ENDPOINT_REASONS = frozenset(
+    {
+        "malformed-url",
+        "unsupported-scheme",
+        "embedded-credentials",
+        "control-character",
+        "query-not-allowed",
+        "fragment-not-allowed",
+        "invalid-port",
+        "malformed-host",
+        "https-required",
+        "unsupported-url-encoding",
+        "invalid-credential",
+    }
+)
 
 
 def _usage() -> None:
@@ -70,6 +87,134 @@ def _firecrawl_error(exc: Exception, key: str) -> str:
     """Bounded diagnostics: never print exception URLs, bodies, or credentials."""
     status = f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
     return f"{status}; auth={'keyed' if key else 'keyless'}"
+
+
+def _firecrawl_endpoint_error(exc: Exception, key: str) -> str:
+    """Return a fixed-vocabulary API endpoint diagnostic."""
+    reason = exc.args[0] if exc.args and isinstance(exc.args[0], str) else "malformed-url"
+    if reason not in _API_ENDPOINT_REASONS:
+        reason = "malformed-url"
+    if reason == "invalid-credential":
+        return "invalid Firecrawl API key (invalid-credential; auth=keyed)"
+    return f"invalid Firecrawl API endpoint ({reason}; auth={'keyed' if key else 'keyless'})"
+
+
+def _api_hostname_is_valid(host: str) -> bool:
+    """Validate an API host without resolving it or applying public-host rules."""
+    if not host:
+        return False
+    if host.endswith("."):
+        host = host[:-1]
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    try:
+        host = host.encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        return False
+    if len(host) > 253:
+        return False
+    labels = host.split(".")
+    # Do not let libc's alternate-radix/single-number host parsing turn a
+    # hostname-looking API base into an ambiguous IP destination.
+    if (len(labels) == 1 and labels[0].isdigit()) or labels[-1].isdigit():
+        return False
+    for label in labels:
+        if not 1 <= len(label) <= 63:
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+        if any(char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in label):
+            return False
+    return True
+
+
+def _firecrawl_api_url_reason(value: str, key: str) -> str | None:
+    """Return a fixed reason for an unsafe API base, or None when it is valid."""
+    if not isinstance(value, str) or not value:
+        return "malformed-url"
+    if any(
+        char.isspace() or ord(char) < 0x20 or 0x7F <= ord(char) < 0xA0
+        for char in value
+    ):
+        return "control-character"
+    # urllib does not encode a raw Unicode request target or host for us.
+    # Callers may supply percent-encoded paths and ASCII/IDNA hostnames.
+    if not value.isascii():
+        return "unsupported-url-encoding"
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return "malformed-url"
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        return "unsupported-scheme"
+    if parsed.username is not None or parsed.password is not None:
+        return "embedded-credentials"
+    if "?" in value:
+        return "query-not-allowed"
+    if "#" in value:
+        return "fragment-not-allowed"
+    try:
+        port = parsed.port
+    except ValueError:
+        return "invalid-port"
+    if port is not None and not 1 <= port <= 65535:
+        return "invalid-port"
+    if parsed.netloc.endswith(":"):
+        return "invalid-port"
+    try:
+        host = parsed.hostname or ""
+    except ValueError:
+        return "malformed-host"
+    if not _api_hostname_is_valid(host):
+        return "malformed-host"
+    if key and scheme != "https":
+        return "https-required"
+    return None
+
+
+def _firecrawl_endpoint(path: str, key: str | None = None) -> str:
+    """Build a validated Firecrawl endpoint while preserving the existing /v2 rule."""
+    if key is None:
+        key = _firecrawl_key()
+    # Resolve precedence first, then validate the actual header value without
+    # logging it or allowing http.client to render it in an exception.
+    if key and any(not 0x21 <= ord(char) <= 0x7E for char in key):
+        raise ValueError("invalid-credential")
+    configured = os.environ.get("FIRECRAWL_API_URL") or DEFAULT_FIRECRAWL_URL
+    reason = _firecrawl_api_url_reason(configured, key)
+    if reason is not None:
+        raise ValueError(reason)
+    base = configured.rstrip("/")
+    if base.endswith("/v2"):
+        return base + path
+    return base + "/v2" + path
+
+
+class _FirecrawlNoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Turn every Firecrawl redirect into a bounded request failure."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            "Firecrawl redirects are disabled",
+            headers,
+            fp,
+        )
+
+
+_FIRECRAWL_OPENER = urllib.request.build_opener(_FirecrawlNoRedirectHandler())
+
+
+def _firecrawl_urlopen(req: urllib.request.Request, timeout: int):
+    """Open a Firecrawl request without following redirects."""
+    return _FIRECRAWL_OPENER.open(req, timeout=timeout)
 
 
 def _print_results(query: str, rows: list[tuple[str, str, str, str]]) -> int:
@@ -133,11 +278,8 @@ def _search_searxng(query: str, limit: int) -> int:
     return _print_results(query, rows)
 
 
-def _firecrawl_search_url() -> str:
-    base = (os.environ.get("FIRECRAWL_API_URL") or DEFAULT_FIRECRAWL_URL).strip().rstrip("/")
-    if base.endswith("/v2"):
-        return base + "/search"
-    return base + "/v2/search"
+def _firecrawl_search_url(key: str | None = None) -> str:
+    return _firecrawl_endpoint("/search", key)
 
 
 def _search_firecrawl(query: str, limit: int) -> int:
@@ -149,17 +291,17 @@ def _search_firecrawl(query: str, limit: int) -> int:
     if key:
         headers["Authorization"] = f"Bearer {key}"
     payload = {"query": query, "limit": limit, "sources": ["web"]}
-    req = urllib.request.Request(
-        _firecrawl_search_url(),
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=FIRECRAWL_TIMEOUT) as resp:
+        url = _firecrawl_search_url(key)
+    except ValueError as exc:
+        print(f"web-search: {_firecrawl_endpoint_error(exc, key)}", file=sys.stderr)
+        return 69
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+        with _firecrawl_urlopen(req, timeout=FIRECRAWL_TIMEOUT) as resp:
             raw = resp.read(MAX_RESPONSE_BYTES)
         decoded = json.loads(raw.decode("utf-8", "replace"))
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         print(f"web-search: Firecrawl request failed ({_firecrawl_error(exc, key)})", file=sys.stderr)
         return 69
     if not isinstance(decoded, dict):
