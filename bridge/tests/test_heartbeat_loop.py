@@ -187,7 +187,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             accepted = asyncio.Event()
             release = asyncio.Event()
-            live_ids = {10}
+            live_ids = set()
 
             async def send_message(**kwargs):
                 live_ids.add(11)  # Telegram has accepted the new message.
@@ -204,7 +204,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
                 heartbeat_delete_on_done=True,
             )
             req = self._make_request()
-            req.heartbeat_message_id = 10
+            req.heartbeat_message_id = None
             req.status_callback = harness._make_status_callback(
                 SimpleNamespace(send_message=send_message, delete_message=delete_message), 2,
             )
@@ -219,6 +219,49 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await asyncio.wait_for(task, timeout=1)
             self.assertEqual(req.heartbeat_message_id, 11)
+            self.assertTrue(await self.handler._cleanup_heartbeat(req))
+            self.assertEqual(live_ids, set())
+            self.assertEqual(drain_heartbeats(store_path_for(Path(directory))), [])
+
+    async def test_cancelled_edit_keeps_original_id_until_terminal_cleanup(self):
+        from telegram_bot.core.bot_status import BotStatusMixin
+        from telegram_bot.utils.heartbeat_store import drain_heartbeats, store_path_for
+
+        with tempfile.TemporaryDirectory() as directory:
+            accepted = asyncio.Event()
+            release = asyncio.Event()
+            live_ids = {10}
+
+            async def edit_message_text(**kwargs):
+                self.assertEqual(kwargs["message_id"], 10)
+                accepted.set()
+                await release.wait()  # Response is still in flight.
+                return True
+
+            async def delete_message(*, chat_id, message_id):
+                live_ids.discard(message_id)
+
+            harness = BotStatusMixin()
+            harness._config = SimpleNamespace(
+                bot_data_dir=Path(directory), heartbeat_store_path=None,
+                heartbeat_delete_on_done=True,
+            )
+            req = self._make_request()
+            req.heartbeat_message_id = 10
+            req.status_callback = harness._make_status_callback(
+                SimpleNamespace(edit_message_text=edit_message_text, delete_message=delete_message), 2,
+            )
+            task = asyncio.create_task(self.handler._maybe_update_heartbeat(req, req.started_at + 10))
+            await asyncio.wait_for(accepted.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()  # Repeated cancellation must not cancel the owned edit.
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+            self.assertEqual(req.heartbeat_message_id, 10)
             self.assertTrue(await self.handler._cleanup_heartbeat(req))
             self.assertEqual(live_ids, set())
             self.assertEqual(drain_heartbeats(store_path_for(Path(directory))), [])

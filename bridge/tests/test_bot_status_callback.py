@@ -3,7 +3,7 @@
 The callback is the bridge's only writer of "⏳ Working" status messages, and
 it must fail open: a Telegram error can never propagate into the request flow,
 and the heartbeat registry must reflect exactly which messages still exist so
-the startup sweep can delete frozen ones. Covers silent replacement, deletion, cancellation,
+the startup sweep can delete frozen ones. Covers send-once updates, deletion, cancellation,
 and retry paths against the real heartbeat store in a temp directory.
 """
 
@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import patch
 
 import telegram.error
 
@@ -97,7 +98,7 @@ class StatusCallbackTests(unittest.TestCase):
         self.assertEqual(asyncio.run(callback("⏳ Working")), 9)
         self.assertEqual(len(bot.sent), 1)
 
-    def test_update_replaces_message_after_intervening_chat_message(self):
+    def test_update_edits_original_after_intervening_chat_message(self):
         bot = _FakeBot(sent_message_id=555)
         callback = StatusHarness(self.tmpdir)._make_status_callback(bot, chat_id=42)
 
@@ -106,28 +107,58 @@ class StatusCallbackTests(unittest.TestCase):
             await bot.send_message(42, "User-visible progress")
             return await callback("⏳ Waiting for progress", old)
 
-        self.assertEqual(asyncio.run(scenario()), 557)
-        self.assertEqual(bot.sent[-1], (42, "⏳ Waiting for progress"))
-        self.assertEqual(bot.deleted, [(42, 555)])
-        self.assertEqual(bot.edited, [])
-        self.assertEqual(bot.silent, [True, False, True])
-        self.assertEqual(self._store_refs(), [(42, 557)])
+        self.assertEqual(asyncio.run(scenario()), 555)
+        self.assertEqual(bot.sent, [(42, "⏳ Working"), (42, "User-visible progress")])
+        self.assertEqual(bot.deleted, [])
+        self.assertEqual(bot.edited, [(42, 555, "⏳ Waiting for progress")])
+        self.assertEqual(bot.silent, [True, False])
+        self.assertEqual(self._store_refs(), [(42, 555)])
 
-    def test_failed_send_after_delete_can_recover_on_next_refresh(self):
+    def test_edit_transport_failure_retries_same_id_without_sending(self):
         bot = _FakeBot(sent_message_id=555)
         callback = StatusHarness(self.tmpdir)._make_status_callback(bot, chat_id=42)
 
         async def scenario():
             old = await callback("first")
-            bot._send_error = telegram.error.TelegramError("unavailable")
-            current = await callback("second", old)
-            self.assertIsNone(current)
-            bot._send_error = None
-            return await callback("third", current)
+            bot._edit_error = telegram.error.TimedOut("unavailable")
+            for _ in range(5):
+                self.assertEqual(await callback("second", old), 555)
+            bot._edit_error = None
+            return await callback("third", old)
 
-        self.assertEqual(asyncio.run(scenario()), 556)
+        self.assertEqual(asyncio.run(scenario()), 555)
+        self.assertEqual(bot.sent, [(42, "first")])
+        self.assertEqual(bot.edited, [(42, 555, "third")])
+        self.assertEqual(bot.deleted, [])
+        self.assertEqual(self._store_refs(), [(42, 555)])
+
+    def test_unchanged_edit_is_success_without_resend(self):
+        bot = _FakeBot(edit_error=telegram.error.BadRequest("Message is not modified"))
+        callback = StatusHarness(self.tmpdir)._make_status_callback(bot, chat_id=42)
+        self.assertEqual(asyncio.run(callback("same", 7)), 7)
+        self.assertEqual(bot.sent, [])
+        self.assertEqual(bot.deleted, [])
+
+    def test_edit_permission_error_never_falls_back_to_send(self):
+        bot = _FakeBot(edit_error=telegram.error.BadRequest("Message can't be edited"))
+        callback = StatusHarness(self.tmpdir)._make_status_callback(bot, chat_id=42)
+        self.assertEqual(asyncio.run(callback("update", 7)), 7)
+        self.assertEqual(bot.sent, [])
+
+    def test_record_failure_still_retains_id_for_edit_and_cleanup(self):
+        bot = _FakeBot(sent_message_id=555)
+        callback = StatusHarness(self.tmpdir)._make_status_callback(bot, chat_id=42)
+
+        async def scenario():
+            with patch("telegram_bot.core.bot_status.record_heartbeat", side_effect=OSError):
+                self.assertEqual(await callback("first"), 555)
+            self.assertEqual(await callback("second"), 555)
+            await callback(None)
+
+        asyncio.run(scenario())
+        self.assertEqual(bot.sent, [(42, "first")])
+        self.assertEqual(bot.edited, [(42, 555, "second")])
         self.assertEqual(bot.deleted, [(42, 555)])
-        self.assertEqual(self._store_refs(), [(42, 556)])
 
     def test_failed_delete_never_creates_a_second_cleanup_obligation(self):
         bot = _FakeBot(sent_message_id=555)
@@ -148,11 +179,38 @@ class StatusCallbackTests(unittest.TestCase):
         self.assertEqual(bot.deleted, [(42, 555)])
         self.assertEqual(self._store_refs(), [])
 
-    def test_already_deleted_message_does_not_block_refresh(self):
-        bot = _FakeBot(delete_error=telegram.error.BadRequest("Message to delete not found"))
+    def test_deleted_message_is_not_recreated_even_with_stale_caller_id(self):
+        bot = _FakeBot(sent_message_id=555)
         callback = StatusHarness(self.tmpdir)._make_status_callback(bot, chat_id=42)
-        self.assertEqual(asyncio.run(callback("update", 7)), 777)
-        self.assertEqual(self._store_refs(), [(42, 777)])
+
+        async def scenario():
+            old = await callback("first")
+            bot._edit_error = telegram.error.BadRequest("Message to edit not found")
+            self.assertIsNone(await callback("second", old))
+            for caller_id in [None, old, None]:
+                self.assertIsNone(await callback("third", caller_id))
+            await callback(None)
+
+        asyncio.run(scenario())
+        self.assertEqual(bot.sent, [(42, "first")])
+        self.assertEqual(self._store_refs(), [])
+
+    def test_edit_updates_do_not_cross_chat_or_task_boundaries(self):
+        bot = _FakeBot(sent_message_id=555)
+        harness = StatusHarness(self.tmpdir)
+        callbacks = [harness._make_status_callback(bot, chat_id=c) for c in [42, 43, 42]]
+
+        async def scenario():
+            ids = await asyncio.gather(*(cb("first") for cb in callbacks))
+            for _ in range(3):
+                self.assertEqual(await asyncio.gather(*(cb("next", mid) for cb, mid in zip(callbacks, ids))), ids)
+            await asyncio.gather(*(cb(None, mid) for cb, mid in zip(callbacks, ids)))
+
+        asyncio.run(scenario())
+        self.assertEqual(len(bot.sent), 3)
+        self.assertEqual({(c, m) for c, m, _ in bot.edited}, {(42, 555), (43, 556), (42, 557)})
+        self.assertEqual(len(bot.deleted), 3)
+        self.assertEqual(self._store_refs(), [])
 
     def test_delete_removes_message_and_registry_entry(self):
         bot = _FakeBot(sent_message_id=555)

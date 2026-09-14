@@ -193,11 +193,14 @@ bridge is a separate operational step; source development does not switch a node
   report, and the last known work label. This indicates missing progress
   reports, not proof that the worker stopped. ETA is hidden until new events
   arrive; the normal ETA is a historical estimate, not a completion percentage.
-  Each heartbeat refresh deletes the previous status, then sends a silent
-  replacement at the bottom of the chat; Telegram edits do not change message
-  order. Other messages can appear below it until the next heartbeat interval.
-  A failed deletion is retried before another status is sent. A failed send
-  leaves no known status until the next refresh. Cancellation waits for the
+  The first heartbeat is sent silently; later refreshes edit that same message
+  to avoid repeated new-message notifications (a silent send can still show a
+  banner). The first message can still notify according to the client settings.
+  Edits do not move the message or chat to the top: the status remains visible
+  in the conversation, but the chat-list preview may show a newer intervening
+  message. Edit failures retain the original ID and retry without resending;
+  an already-deleted status is not recreated during that task. A failed initial
+  send leaves no known status until the next refresh. Cancellation waits for the
   in-flight status operation to return its ID before final cleanup. Telegram
   does not provide an idempotency key: a transport failure after accepting a
   send but before returning its ID can still leave an unidentifiable message.

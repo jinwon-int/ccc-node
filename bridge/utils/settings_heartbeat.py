@@ -38,7 +38,7 @@ class HeartbeatSettingsMixin:
     heartbeat_update_interval_seconds: float = Field(
         default=15.0,
         alias="CCC_HEARTBEAT_UPDATE_INTERVAL_SECONDS",
-        description="Minimum seconds between silent heartbeat replacements at the bottom of the chat.",
+        description="Minimum seconds between edits of the existing heartbeat message.",
     )
     heartbeat_suppress_when_streaming_progress: bool = Field(
         default=True,

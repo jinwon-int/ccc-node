@@ -29,10 +29,11 @@ class BotStatusMixin:
         )
 
     def _make_status_callback(self, bot: Any, chat_id: int):
-        """Build a fail-open replace/delete callback for task heartbeat messages."""
+        """Build a fail-open send-once/edit/delete callback for task heartbeat messages."""
         store_path = self._heartbeat_store_path()
 
         current_id: Optional[int] = None
+        message_removed = False
         lock = asyncio.Lock()
 
         async def delete_status(message_id: int) -> None:
@@ -45,7 +46,7 @@ class BotStatusMixin:
                 discard_heartbeat(store_path, chat_id, message_id)
 
         async def status_callback(text: Optional[str], message_id: Optional[int] = None) -> Optional[int]:
-            nonlocal current_id
+            nonlocal current_id, message_removed
             async with lock:
                 message_id = current_id if current_id is not None else message_id
                 current_id = message_id
@@ -58,21 +59,41 @@ class BotStatusMixin:
                                 discard_heartbeat(store_path, chat_id, message_id)
                         current_id = None
                         return None
-                    # Confirm deletion before replacement: the ledger owns one
-                    # status ID, including when cleanup needs a terminal retry.
+                    # Silent sends can still produce a notification/banner.
+                    # Edit the original message, even after other chat messages;
+                    # keeping it at the bottom would require another send.
+                    if message_removed:
+                        return None
                     if message_id is not None:
-                        await delete_status(message_id)
-                        current_id = message_id = None
-                    # Telegram edits cannot move a status to the chat bottom.
+                        try:
+                            await bot.edit_message_text(
+                                chat_id=chat_id, message_id=message_id, text=text,
+                            )
+                        except telegram.error.BadRequest as exc:
+                            reason = str(exc).lower()
+                            if "message is not modified" in reason:
+                                return message_id
+                            if "message to edit not found" not in reason:
+                                raise
+                            # A deleted status must not reappear as a fresh
+                            # notification on every subsequent refresh.
+                            message_removed = True
+                            if store_path is not None:
+                                discard_heartbeat(store_path, chat_id, message_id)
+                            current_id = None
+                            return None
+                        return message_id
                     sent = await bot.send_message(
                         chat_id=chat_id, text=text, disable_notification=True,
                     )
                     value = getattr(sent, "message_id", None)
                     if type(value) is not int:
                         return message_id
+                    # Keep ownership even if recording the ID fails, so the
+                    # next refresh edits instead of sending a duplicate.
+                    current_id = message_id = value
                     if store_path is not None:
                         record_heartbeat(store_path, chat_id, value)
-                    current_id = message_id = value
                     return message_id
                 except Exception as exc:
                     logger.warning("Heartbeat status callback failed: %s", type(exc).__name__)

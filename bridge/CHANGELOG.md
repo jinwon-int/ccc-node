@@ -1,5 +1,12 @@
 # Changelog
 
+- **Heartbeat refreshes edit the original message.** Long-running status sends
+  one initial silent message, then updates its elapsed time, tool and ETA in
+  place to avoid repeated new-message banners. Edit failures never trigger a
+  replacement send; a deleted status stays deleted for that task. Completion
+  cleanup and final-answer delivery remain unchanged. Edits do not reorder
+  chats/messages, so intervening messages may become the chat-list preview.
+
 - **Codex resume diagnostics and the revised long-thread policy (#1722
   follow-up).** The existing bounded resume path now publishes body-free
   metadata to `health.json → codex_resume` and `start.sh --status`: whether the
