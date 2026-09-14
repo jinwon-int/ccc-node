@@ -4253,10 +4253,12 @@ def _collect_sources(config: Config) -> tuple[tuple[str, str], ...]:
     the global cap ahead of them. Canonical order is local first, then
     `collect_nodes` order; rotation (below) decides where a given run starts.
     """
+    # Colon is forbidden in node aliases, so this one escaped remote label
+    # cannot collide with either another alias or the synthetic local source.
     sources: list[tuple[str, str]] = [("local", config.node)]
     for node in config.collect_nodes:
         if node != config.node:
-            sources.append((node, node))
+            sources.append(("remote:local" if node == "local" else node, node))
     return tuple(sources)
 
 
@@ -4287,29 +4289,76 @@ def _read_collect_cursor(config: Config) -> str | None:
     the local-first starvation this cursor exists to prevent.
     """
     path = config.promotion_state_dir / _COLLECT_CURSOR_FILENAME
-    if not path.exists():
+    try:
+        linked = path.lstat()
+    except FileNotFoundError:
         return None
-    try:
-        payload, _ = _secure_fs.read_owner_only_bytes(
-            path,
-            max_bytes=_MAX_COLLECT_CURSOR_BYTES,
-            owner_id=os.geteuid(),
-            exact_mode=0o600,
-        )
-    except _secure_fs.SecureFsError:
+    except OSError:
         raise PromotionError("collect_cursor_unsafe") from None
+
+    def signature(metadata: os.stat_result) -> tuple[int, ...]:
+        if (
+            _secure_fs.owner_only_regular_violation(metadata, owner_id=os.geteuid())
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > _MAX_COLLECT_CURSOR_BYTES
+        ):
+            raise PromotionError("collect_cursor_unsafe")
+        return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid,
+                metadata.st_nlink, metadata.st_size, metadata.st_mtime_ns,
+                metadata.st_ctime_ns)
+
+    # Refuse special files before open; NONBLOCK also prevents a FIFO swapped
+    # in between lstat/open from holding the publisher lock indefinitely.
+    expected = signature(linked)
     try:
-        value = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+                             | getattr(os, "O_CLOEXEC", 0))
+        try:
+            if signature(os.fstat(descriptor)) != expected:
+                raise PromotionError("collect_cursor_unsafe")
+            chunks: list[bytes] = []
+            remaining = _MAX_COLLECT_CURSOR_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            if (len(payload) > _MAX_COLLECT_CURSOR_BYTES
+                    or signature(os.fstat(descriptor)) != expected
+                    or signature(path.lstat()) != expected):
+                raise PromotionError("collect_cursor_unsafe")
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise PromotionError("collect_cursor_unsafe") from None
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(payload.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise PromotionError("collect_cursor_invalid") from None
     if (
         not isinstance(value, dict)
         or set(value) != {"schema_version", "last_source", "updated_at"}
+        or type(value.get("schema_version")) is not int
         or value.get("schema_version") != _COLLECT_CURSOR_SCHEMA
+        or not isinstance(value.get("updated_at"), str)
+        or not 1 <= len(value["updated_at"]) <= 128
     ):
         raise PromotionError("collect_cursor_invalid")
     last_source = value.get("last_source")
-    if not isinstance(last_source, str) or not _SAFE_COMPONENT_RE.fullmatch(last_source):
+    if not isinstance(last_source, str) or (
+        last_source != "remote:local" and not _SAFE_COMPONENT_RE.fullmatch(last_source)
+    ):
         raise PromotionError("collect_cursor_invalid")
     return last_source
 
@@ -4321,19 +4370,24 @@ def _write_collect_cursor(config: Config, last_source: str) -> None:
     so concurrent collects cannot interleave writes and a locked collect that
     never ran advances nothing.
     """
+    # Recheck after publish/ACK work before replacing any existing entry.
+    # Cooperating state writers share promotion.lock in the private state dir.
+    _read_collect_cursor(config)
     record = {
         "schema_version": _COLLECT_CURSOR_SCHEMA,
         "last_source": last_source,
         "updated_at": _utc_now(),
     }
     try:
-        _secure_fs.atomic_write_bytes(
+        synced = _secure_fs.atomic_write_bytes(
             config.promotion_state_dir / _COLLECT_CURSOR_FILENAME,
             (_secure_fs.json_line(record) + "\n").encode("utf-8"),
             mode=0o600,
         )
-    except _secure_fs.SecureFsError:
-        raise PromotionError("collect_cursor_unsafe") from None
+        if not synced:
+            raise PromotionError("collect_cursor_write_failed")
+    except (OSError, _secure_fs.SecureFsError):
+        raise PromotionError("collect_cursor_write_failed") from None
 
 
 def _collect_envelopes(
@@ -4344,7 +4398,7 @@ def _collect_envelopes(
     """Gather local + remote pending envelopes, de-duplicated by transport id.
 
     Admission is round-robin and bounded fairly by source (#1617, #1647). Each
-    source is fetched up front with an equal share of the global
+    source is fetched up front with a reserved share of the global
     `_MAX_CANDIDATES_PER_RUN` budget, and the run starts after the source the
     previous collect rotated to (`cursor_source`), so:
 
@@ -4363,7 +4417,7 @@ def _collect_envelopes(
     `--limit 1..3` contract holds.
     """
     sources = _rotate_sources(_collect_sources(config), cursor_source)
-    share = -(-_MAX_CANDIDATES_PER_RUN // len(sources))
+    share, remainder = divmod(_MAX_CANDIDATES_PER_RUN, len(sources))
     per_source: list[list[tuple[Candidate, str, str, str]]] = []
     seen: set[str] = set()
     total = 0
@@ -4384,10 +4438,10 @@ def _collect_envelopes(
             rows.append((candidate, created_at, transport_id, source))
             total += 1
 
-    for label, expected_node in sources:
+    for index, (label, expected_node) in enumerate(sources):
         if total >= _MAX_CANDIDATES_PER_RUN:
             break
-        remaining = min(share, _MAX_CANDIDATES_PER_RUN - total)
+        remaining = min(share + (index < remainder), _MAX_CANDIDATES_PER_RUN - total)
         if label == "local":
             # A broken local state dir still fails the collect outright, as
             # before; remotes degrade to per-source errors.
@@ -4395,7 +4449,7 @@ def _collect_envelopes(
         else:
             try:
                 gather(
-                    _remote_envelopes(label, limit=min(remaining, config.max_prs)),
+                    _remote_envelopes(expected_node, limit=min(remaining, config.max_prs)),
                     label,
                     expected_node,
                 )
@@ -4456,7 +4510,7 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
                     if not _ack_local(config, transport_id):
                         raise PromotionError("local_ack_failed")
                 else:
-                    _remote_ack(source, transport_id)
+                    _remote_ack(candidate.node, transport_id)
                 _append_ledger(config, {"ts": _utc_now(), **row})
             except PromotionError as error:
                 errors.append(
@@ -4473,7 +4527,12 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
         # (unacked) at its source's head and is retried when the rotation
         # returns. A single-source fleet has nothing to rotate and writes
         # nothing.
-        _write_collect_cursor(config, start_source)
+        try:
+            _write_collect_cursor(config, start_source)
+        except PromotionError as error:
+            # Publication/ACK/ledger effects are already real. Preserve them;
+            # a failed sync can mean the cursor changed but is not durable.
+            errors.append({"source": "collect-cursor", "code": error.code})
     revise: dict[str, object] | None = None
     if config.revise_enabled:
         # Two ledger reads on purpose: _process_verdicts appends verdict,

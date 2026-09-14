@@ -263,6 +263,25 @@ class LocalBudgetFairnessTests(unittest.TestCase):
         self.assertEqual(len(rows), promotion._MAX_CANDIDATES_PER_RUN)
         self.assertEqual({row[3] for row in rows}, {"local"})
 
+    def test_maximum_fleet_reserves_admission_for_all_33_sources(self):
+        self.config.collect_nodes = tuple(f"node{i:02d}" for i in range(32))
+        self.remote = {
+            node: [envelope(node, f"skill-{i}", "2026-08-02T00:00:00Z")
+                   for i in range(3)]
+            for node in self.config.collect_nodes
+        }
+        for cursor in (None, "node00", "node31"):
+            with self.subTest(cursor=cursor):
+                self.remote_limits.clear()
+                errors = []
+                rows = promotion._collect_envelopes(self.config, errors, cursor)
+                self.assertEqual(errors, [])
+                self.assertEqual(set(self.remote_limits), set(self.config.collect_nodes))
+                self.assertEqual(len(rows), 64)
+                self.assertEqual(len({row[3] for row in rows[:33]}), 33)
+                self.assertTrue(all(1 <= limit <= 3
+                                    for limit in self.remote_limits.values()))
+
 
 class CollectRunRotationTests(unittest.TestCase):
     """#1647: cross-run rotation, cursor state, and outcome bookkeeping.
@@ -448,6 +467,152 @@ class CollectRunRotationTests(unittest.TestCase):
         with self.assertRaises(promotion.PromotionError) as caught:
             self.collect()
         self.assertEqual(caught.exception.code, "collect_cursor_unsafe")
+
+    def test_dangling_symlink_fails_closed_before_publish_or_ack(self):
+        self.stage_local("local-skill-a", "2026-08-01T00:00:00Z")
+        self.cursor_path.symlink_to(self.cursor_path.with_name("missing-target"))
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run), patch.object(promotion, "_publish") as publish:
+                with self.assertRaises(promotion.PromotionError) as caught:
+                    self.collect(dry_run=dry_run)
+                self.assertEqual(caught.exception.code, "collect_cursor_unsafe")
+                publish.assert_not_called()
+                self.assertEqual(self.acked, [])
+                self.assertEqual(self.ledger, [])
+                self.assertTrue(self.cursor_path.is_symlink())
+
+    def test_fifo_cursor_rejected_in_bounded_subprocess(self):
+        os.mkfifo(self.cursor_path, 0o600)
+        code = """
+import runpy, sys
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
+promotion = runpy.run_path(sys.argv[1])["promotion"]
+try:
+    promotion._read_collect_cursor(SimpleNamespace(promotion_state_dir=Path(sys.argv[2])))
+except promotion.PromotionError as error:
+    assert error.code == "collect_cursor_unsafe"
+else:
+    raise AssertionError("FIFO accepted")
+"""
+        result = subprocess.run([sys.executable, "-c", code, __file__,
+                                 str(self.config.promotion_state_dir)],
+                                capture_output=True, timeout=2)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_fifo_substitution_between_lstat_and_open_is_nonblocking(self):
+        self.write_cursor("deep")
+        original_open = os.open
+        def swapped(path, flags, *args, **kwargs):
+            if Path(path) == self.cursor_path:
+                self.assertTrue(flags & os.O_NONBLOCK)
+                self.cursor_path.rename(self.cursor_path.with_name("saved-cursor"))
+                os.mkfifo(self.cursor_path, 0o600)
+            return original_open(path, flags, *args, **kwargs)
+        with patch.object(promotion.os, "open", side_effect=swapped):
+            with self.assertRaises(promotion.PromotionError) as caught:
+                promotion._read_collect_cursor(self.config)
+        self.assertEqual(caught.exception.code, "collect_cursor_unsafe")
+
+    def test_hardlink_added_during_cursor_read_is_rejected(self):
+        self.write_cursor("deep")
+        original_read = os.read
+        linked = False
+        def changed(fd, count):
+            nonlocal linked
+            if not linked:
+                os.link(self.cursor_path, self.cursor_path.with_name("second-link"))
+                linked = True
+            return original_read(fd, count)
+        with patch.object(promotion.os, "read", side_effect=changed):
+            with self.assertRaises(promotion.PromotionError) as caught:
+                promotion._read_collect_cursor(self.config)
+        self.assertEqual(caught.exception.code, "collect_cursor_unsafe")
+
+    def test_cursor_schema_rejects_ambiguous_types_and_duplicate_keys(self):
+        valid = {"schema_version": 1, "last_source": "deep", "updated_at": "2026-09-01"}
+        invalid = [json.dumps({**valid, "schema_version": value}) for value in (True, 1.0)]
+        invalid += [json.dumps({**valid, "updated_at": value}) for value in (None, 3, {}, "")]
+        invalid.append('{"schema_version":1,"last_source":"local","last_source":"deep",'
+                       '"updated_at":"2026-09-01"}')
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                self.cursor_path.write_text(payload)
+                self.cursor_path.chmod(0o600)
+                with self.assertRaises(promotion.PromotionError) as caught:
+                    self.collect()
+                self.assertEqual(caught.exception.code, "collect_cursor_invalid")
+
+    def test_remote_alias_local_rotates_and_acks_the_remote_transport(self):
+        self.config.collect_nodes = ("local",)
+        self.remote = {"local": [envelope("local", "remote-skill", "2026-08-02T00:00:00Z")]}
+        self.stage_local("local-skill-a", "2026-08-01T00:00:00Z")
+        first = self.collect()
+        self.assertEqual(first["published"][0]["source"], "local")
+        with patch.object(promotion, "_ack_local") as local_ack:
+            second = self.collect()
+            local_ack.assert_not_called()
+        self.assertTrue(second["ok"])
+        self.assertEqual(second["published"][0]["source"], "remote:local")
+        self.assertEqual(second["published"][0]["node"], "local")
+        self.assertEqual(self.remote["local"], [])
+        self.assertEqual(self.read_cursor()["last_source"], "remote:local")
+        self.stage_local("local-skill-b", "2026-08-03T00:00:00Z")
+        self.assertEqual(self.collect()["published"][0]["source"], "local")
+
+    def assert_cursor_write_failure_preserves_outcomes(self, result):
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["errors"], [{"source": "collect-cursor",
+                                            "code": "collect_cursor_write_failed"}])
+        self.assertEqual(result["published"][0]["outcome"], "pr-opened")
+        self.assertEqual(len(self.acked), 1)
+        self.assertEqual(len(self.ledger), 1)
+
+    def test_cursor_temp_write_failure_preserves_completed_outcomes(self):
+        self.stage_local("local-skill-a", "2026-08-01T00:00:00Z")
+        with patch.object(tempfile, "mkstemp", side_effect=OSError("synthetic private path")):
+            result = self.collect()
+        self.assert_cursor_write_failure_preserves_outcomes(result)
+        self.assertFalse(self.cursor_path.exists())
+
+    def test_cursor_post_rename_sync_failure_preserves_completed_outcomes(self):
+        self.stage_local("local-skill-a", "2026-08-01T00:00:00Z")
+        original_fsync = os.fsync
+        def fail_directory_sync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("synthetic private path")
+            return original_fsync(fd)
+        with patch.object(os, "fsync", side_effect=fail_directory_sync):
+            result = self.collect()
+        self.assert_cursor_write_failure_preserves_outcomes(result)
+        self.assertEqual(self.read_cursor()["last_source"], "local")
+        self.assertEqual(stat.S_IMODE(self.cursor_path.stat().st_mode), 0o600)
+
+    def test_unconfirmed_directory_sync_is_not_reported_as_success(self):
+        import errno
+        self.stage_local("local-skill-a", "2026-08-01T00:00:00Z")
+        original_fsync = os.fsync
+        def unsupported_directory_sync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EINVAL, "unsupported directory sync")
+            return original_fsync(fd)
+        with patch.object(os, "fsync", side_effect=unsupported_directory_sync):
+            result = self.collect()
+        self.assert_cursor_write_failure_preserves_outcomes(result)
+
+    def test_unsafe_cursor_created_during_publish_is_not_overwritten(self):
+        def publish(config, candidate, *, created_at):
+            self.cursor_path.symlink_to(self.cursor_path.with_name("missing-target"))
+            return {"outcome": "pr-opened", "branch": "skill-intake/x"}
+        with patch.object(promotion, "_publish", side_effect=publish):
+            result = self.collect()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["errors"], [{"source": "collect-cursor",
+                                            "code": "collect_cursor_unsafe"}])
+        self.assertEqual(len(result["published"]), 1)
+        self.assertEqual(len(self.acked), 1)
+        self.assertTrue(self.cursor_path.is_symlink())
 
     def test_dry_run_neither_writes_cursor_nor_acks(self):
         self.stage_local("local-skill-a", "2026-08-01T00:00:00Z")

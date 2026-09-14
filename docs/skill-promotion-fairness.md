@@ -9,14 +9,20 @@ versus out of scope.
 A collect source is either the publisher's own local outbox (label `local`)
 or one SSH exporter node (label = node alias, from
 `CCC_SKILL_PROMOTION_COLLECT_NODES` / `skill-promotion.collect-nodes`).
+The valid remote alias `local` uses source/cursor label `remote:local` to
+distinguish it from the publisher outbox; SSH export and ACK still use the
+actual alias `local`. Colons are not allowed in node aliases, so this label
+cannot collide with another remote. Other labels remain unchanged.
 Within a round, `collect_nodes` order is the tie-break and the local outbox
 is the canonical first source.
 
 ## Within a run: bounded round-robin admission
 
 `_collect_envelopes` gathers from every source up front, interleaving the
-results round-robin. Each source gets an equal share of the global
-64-envelope admission budget (`_MAX_CANDIDATES_PER_RUN`), so:
+results round-robin. Each source gets `floor(64 / source_count)` slots,
+with one extra slot for the first `64 % source_count` sources in the rotated
+order. This reserves at least one slot for every supported source (up to
+32 remotes plus the publisher) without exceeding the global budget, so:
 
 - A full local outbox can never spend the whole budget before an SSH
   exporter is consulted (#1647). The local outbox is bounded to the same
@@ -62,9 +68,11 @@ record written atomically with the repository's safe-FS primitives:
 - Missing state is explicit and safe: the run begins at the canonical first
   source, exactly like pre-#1647 collects.
 - A present but unreadable or invalid cursor fails closed with a distinct
-  code (`collect_cursor_unsafe` for mode/owner/symlink violations,
+  code (`collect_cursor_unsafe` for mode/owner/symlink, special-file,
+  hardlink, changed-file or bounded-read violations,
   `collect_cursor_invalid` for undecodable content, wrong schema, or a
-  malformed label) instead of silently resetting to the local-first order
+  malformed label; schema version must be an integer, duplicate keys are
+  rejected, and the timestamp must be a nonempty bounded string) instead of silently resetting to the local-first order
   the cursor exists to break.
 
 ## What advances the rotation (and what does not)
@@ -81,6 +89,13 @@ rewind or wedge it:
 - A source whose SSH export fails is skipped for that run (its failure
   recorded) and retried next cycle; the rest of the fleet still publishes.
 - A single-source fleet has nothing to rotate and writes no cursor file.
+- Cursor persistence runs after publication and ACK bookkeeping. A write or
+  durability failure preserves all completed `published` rows and adds
+  `errors: [{"source":"collect-cursor","code":"collect_cursor_write_failed"}]`,
+  making `ok:false`. The cursor may already have changed if directory sync
+  failed after rename; the result does not claim that it stayed unchanged.
+  An unsafe entry discovered at the final recheck is left in place and
+  reported as `collect_cursor_unsafe` (invalid content as `collect_cursor_invalid`).
 
 ## Guarantees and non-goals
 
