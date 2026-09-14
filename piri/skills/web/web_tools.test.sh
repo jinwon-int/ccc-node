@@ -148,7 +148,7 @@ PY
 PORT_FILE="$TMP/ports" python3 "$TMP/stub.py" &
 STUB_PID=$!
 for _ in $(seq 1 50); do [ -s "$TMP/ports" ] && break; sleep 0.1; done
-read -r healthy_port blocked_port firecrawl_port redirect_port < "$TMP/ports"
+read -r healthy_port blocked_port firecrawl_port _redirect_port < "$TMP/ports"
 
 out="$(FIRECRAWL_API_URL="http://127.0.0.1:$firecrawl_port" python3 "$SEARCH" "hello world" --limit 3 2>/dev/null)"
 ok "default search prints the Firecrawl result" 'grep -q "Firecrawl result for hello world" <<<"$out" && grep -q "engine: firecrawl" <<<"$out"'
