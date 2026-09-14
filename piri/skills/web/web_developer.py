@@ -58,17 +58,17 @@ def _post(payload: dict[str, object]) -> dict[str, object] | None:
     except ValueError as exc:
         print(f"developer-search: {_firecrawl_endpoint_error(exc, key)}", file=sys.stderr)
         return None
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
     try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
         with _firecrawl_urlopen(req, timeout=TIMEOUT) as resp:
             raw = resp.read(MAX_RESPONSE_BYTES)
         decoded = json.loads(raw.decode("utf-8", "replace"))
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         print(f"developer-search: Firecrawl request failed ({_firecrawl_error(exc, key)})", file=sys.stderr)
         return None
     return decoded if isinstance(decoded, dict) else None

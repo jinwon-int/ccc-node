@@ -53,8 +53,12 @@ python3 ~/.piri/agent/skills/web/web_fetch.py "https://example.com/page" [--max-
   `FIRECRAWL_API_KEY`, then `~/.hermes/.env` `FIRECRAWL_API_KEY`, otherwise no
   `Authorization` header. Keep `web_search.py` beside the fetch/developer
   helpers (shared resolver and API transport guard).
-- The API base must be a valid HTTP(S) URL without userinfo, control characters,
-  a query, a fragment, or an invalid port. A resolved key requires HTTPS; an
+- Resolved keys must contain only visible ASCII characters without whitespace;
+  malformed keys fail before any request, without printing their contents.
+- The API base must use an ASCII HTTP(S) URL: encode Unicode path characters
+  with percent encoding and internationalized hostnames with IDNA before use.
+  Raw Unicode URLs fail before any request. The base must exclude userinfo,
+  control characters, a query, a fragment, or an invalid port. A resolved key requires HTTPS; an
   explicitly configured HTTP base is supported only for keyless self-hosted or
   test use. Firecrawl requests reject redirects rather than forwarding a key
   or changing the POST method.
@@ -63,7 +67,7 @@ python3 ~/.piri/agent/skills/web/web_fetch.py "https://example.com/page" [--max-
 - Never send private/Tailnet/localhost URLs, credential-bearing URLs, secrets,
   or authenticated content to Firecrawl.
 - Exit 64 = missing URL; exit 65 = unsafe target URL; exit 69 = invalid API
-  endpoint, Firecrawl request failure, or unsuccessful response; exit 70 = no
+  endpoint or credential, Firecrawl request failure, or unsuccessful response; exit 70 = no
   page or extractable markdown.
 
 ## Developer/GitHub artifacts — Firecrawl Developer Index
@@ -81,8 +85,8 @@ python3 ~/.piri/agent/skills/web/web_developer.py \
 - General news, opinion, and broad discovery remain Firecrawl Search unless a
   second look via `--provider searxng` is justified.
 - Exit 2 = invalid command-line syntax; exit 65 = unsupported artifact type;
-  exit 69 = invalid API endpoint, Firecrawl request failure, or unsuccessful
-  response; exit 70 = unusable response shape.
+  exit 69 = invalid API endpoint or credential, Firecrawl request failure, or
+  unsuccessful response; exit 70 = unusable response shape.
 
 ## Rules
 

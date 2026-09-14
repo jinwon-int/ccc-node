@@ -51,6 +51,8 @@ _API_ENDPOINT_REASONS = frozenset(
         "invalid-port",
         "malformed-host",
         "https-required",
+        "unsupported-url-encoding",
+        "invalid-credential",
     }
 )
 
@@ -92,6 +94,8 @@ def _firecrawl_endpoint_error(exc: Exception, key: str) -> str:
     reason = exc.args[0] if exc.args and isinstance(exc.args[0], str) else "malformed-url"
     if reason not in _API_ENDPOINT_REASONS:
         reason = "malformed-url"
+    if reason == "invalid-credential":
+        return "invalid Firecrawl API key (invalid-credential; auth=keyed)"
     return f"invalid Firecrawl API endpoint ({reason}; auth={'keyed' if key else 'keyless'})"
 
 
@@ -138,6 +142,10 @@ def _firecrawl_api_url_reason(value: str, key: str) -> str | None:
         for char in value
     ):
         return "control-character"
+    # urllib does not encode a raw Unicode request target or host for us.
+    # Callers may supply percent-encoded paths and ASCII/IDNA hostnames.
+    if not value.isascii():
+        return "unsupported-url-encoding"
     try:
         parsed = urllib.parse.urlsplit(value)
     except ValueError:
@@ -174,6 +182,10 @@ def _firecrawl_endpoint(path: str, key: str | None = None) -> str:
     """Build a validated Firecrawl endpoint while preserving the existing /v2 rule."""
     if key is None:
         key = _firecrawl_key()
+    # Resolve precedence first, then validate the actual header value without
+    # logging it or allowing http.client to render it in an exception.
+    if key and any(not 0x21 <= ord(char) <= 0x7E for char in key):
+        raise ValueError("invalid-credential")
     configured = os.environ.get("FIRECRAWL_API_URL") or DEFAULT_FIRECRAWL_URL
     reason = _firecrawl_api_url_reason(configured, key)
     if reason is not None:
@@ -284,12 +296,12 @@ def _search_firecrawl(query: str, limit: int) -> int:
     except ValueError as exc:
         print(f"web-search: {_firecrawl_endpoint_error(exc, key)}", file=sys.stderr)
         return 69
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
     try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
         with _firecrawl_urlopen(req, timeout=FIRECRAWL_TIMEOUT) as resp:
             raw = resp.read(MAX_RESPONSE_BYTES)
         decoded = json.loads(raw.decode("utf-8", "replace"))
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         print(f"web-search: Firecrawl request failed ({_firecrawl_error(exc, key)})", file=sys.stderr)
         return 69
     if not isinstance(decoded, dict):
