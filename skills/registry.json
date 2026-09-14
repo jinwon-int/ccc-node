@@ -246,24 +246,24 @@
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Recover a green, mergeable PR through a GitHub infrastructure outage — poll the githubstatus components API until Actions/Pull Requests recover, re-run only failed workflow jobs, then land the PR with an exact-head (SHA-pinned) squash merge that falls back from GraphQL to REST and retries on a fixed interval via a detached background watcher. Use when GitHub returns 5xx/timeouts on CI or merge writes while the PR itself has no code problem. Established during the 2026-08-17 GitHub incident (jinwon-int/nclex #210 campaign).",
+      "description": "Recover an authorized, reviewed pull request after GitHub transport or service failures. Verify checks and independent review on the exact head, distinguish queue admission from merge completion, and retry only classified transient failures within a fixed budget. Use when CI or merge operations fail because of GitHub infrastructure rather than a code or policy failure.",
       "files": 1,
       "managed": false,
       "name": "github-incident-recovery-merge-retry",
       "source": "skills/github-incident-recovery-merge-retry",
       "status": "active",
-      "tree_sha256": "fe7603346525d552d48cff35260ea8f7433bf570d8b4e77eff0159ba8b4c8af8"
+      "tree_sha256": "3a9a1f723158315293f85a0b093b92849c1bab839ec499847f73bf5ab7e0fbe5"
     },
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Diagnose a PR whose merge/CI state is untrustworthy — no checks appear at all (statusCheckRollup empty), mergeStateStatus is DIRTY/BEHIND/BLOCKED, or mergeable stays UNKNOWN — by reading the right field, testing conflicts locally without touching the worktree, and detecting a stale base whose green CI no longer proves anything. Use when CI is silent on a PR, when a gh-ci-wait poll times out with nothing queued, when mergeable will not resolve, or before trusting a green check on a PR whose base has moved.",
+      "description": "Diagnose missing PR checks, conflicting or stale branches, and unresolved GitHub mergeability. Compare CLI and API fields, test the exact PR objects without changing the user's checkout, and verify which revision CI actually tested. Use when checks never appear, mergeable remains UNKNOWN, or the base advances beneath a reviewed PR.",
       "files": 1,
       "managed": false,
       "name": "github-merge-state-conflict-diagnosis",
       "source": "skills/github-merge-state-conflict-diagnosis",
       "status": "active",
-      "tree_sha256": "a669be26699ff2d261e818a1643e92d8b40708c7afbfa46025528cc6f865ffc0"
+      "tree_sha256": "2a7f08a14fe9b3e88d7d3cb16cb6fe15d472c68856e89a05fac1eebd8c7b409b"
     },
     {
       "audience": "claude",
