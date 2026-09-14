@@ -243,6 +243,7 @@ done
 
 # A resolved key must never be sent to a configured HTTP API base. The call
 # counter proves this guard fires before any loopback connection.
+# shellcheck disable=SC2034  # Read via eval in ok() below.
 keyed_before="$(fc_state)"
 for caller in search fetch developer; do
   set +e
@@ -253,11 +254,13 @@ for caller in search fetch developer; do
   ok "$caller rejects a keyed HTTP API base before network" \
     '[ "$rc" = 69 ] && grep -q "https-required" "$TMP/err-keyed" && ! grep -q "synthetic-api-key" "$TMP/err-keyed"'
 done
+# shellcheck disable=SC2034  # Read via eval in ok() below.
 keyed_after="$(fc_state)"
 ok "keyed HTTP endpoint rejection makes zero provider calls" '[ "$keyed_before" = "$keyed_after" ]'
 
 # Every API-base syntax guard is exercised through every caller. Diagnostics
 # contain only a fixed reason, never the configured base or userinfo.
+# shellcheck disable=SC2034  # Read via eval in ok() below.
 malformed_before="$(fc_state)"
 for base in \
   "https://api.example.org/firecrawl?query=synthetic" \
@@ -277,6 +280,7 @@ for base in \
       '[ "$rc" = 69 ] && grep -q "invalid Firecrawl API endpoint" "$TMP/err-malformed" && ! grep -q "api.example.org\|synthetic-pass" "$TMP/err-malformed"'
   done
 done
+# shellcheck disable=SC2034  # Read via eval in ok() below.
 malformed_after="$(fc_state)"
 ok "malformed API bases make zero provider calls" '[ "$malformed_before" = "$malformed_after" ]'
 
@@ -287,12 +291,14 @@ for code in 301 302 303 307 308; do
   for origin in same cross; do
     for caller in search fetch developer; do
       marker="redirect-${code}-${origin}"
+      # shellcheck disable=SC2034  # Read via eval in ok() below.
       before="$(fc_state | awk '{print $3, $4}')"
       set +e
       firecrawl_call "$caller" "$marker" "http://127.0.0.1:$firecrawl_port" "" \
         2>"$TMP/err-redirect"
       rc=$?
       set -e
+      # shellcheck disable=SC2034  # Read via eval in ok() below.
       after="$(fc_state | awk '{print $3, $4}')"
       ok "$caller rejects $code $origin redirect" \
         '[ "$rc" = 69 ] && [ "$before" = "$after" ] && grep -q "Firecrawl request failed" "$TMP/err-redirect"'
