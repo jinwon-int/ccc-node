@@ -4279,6 +4279,15 @@ def _rotate_sources(
     return sources
 
 
+def _collect_cursor_unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+
 def _read_collect_cursor(config: Config) -> str | None:
     """The source label the previous real collect rotated to, or None.
 
@@ -4334,16 +4343,9 @@ def _read_collect_cursor(config: Config) -> str | None:
     except OSError:
         raise PromotionError("collect_cursor_unsafe") from None
 
-    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate key")
-            result[key] = value
-        return result
 
     try:
-        value = json.loads(payload.decode("utf-8"), object_pairs_hook=unique_object)
+        value = json.loads(payload.decode("utf-8"), object_pairs_hook=_collect_cursor_unique_object)
     except (UnicodeDecodeError, ValueError, RecursionError):
         raise PromotionError("collect_cursor_invalid") from None
     if (
