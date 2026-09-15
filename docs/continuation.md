@@ -46,8 +46,9 @@ python -m telegram_bot.core.continuation_cli register \
 
 ## 운영
 
-- `CCC_CONTINUATION_ENABLED`(기본 **off**)로 모니터를 켠다. 끄면 큐는
-  기록만 되고 자동 시작은 일어나지 않는다.
+- 모니터는 기본 켜짐이다(2026-09-15 플릿 기본값 전환). 노드별로 끄려면
+  브리지 유닛 환경에 `CCC_CONTINUATION_ENABLED=0`을 명시한다(opt-out). 꺼진
+  노드에서도 큐 기록은 되지만 자동 시작은 일어나지 않는다.
 - 이어하기 턴은 자율 토큰을 소비한다(usage-meter의 autonomous로 계량).
 - 사용자 확인: `/continue`(cap 해제), 조회는 CLI `list`, 취소는 CLI
   `cancel <continuation_id>` 또는 `/stop`.

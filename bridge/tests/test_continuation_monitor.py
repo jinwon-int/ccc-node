@@ -257,15 +257,29 @@ async def _session_of(session):
     return session
 
 
-def test_continuation_monitor_is_none_when_the_flag_is_off(tmp_path: Path) -> None:
+def test_continuation_monitor_opt_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from telegram_bot.core import bot_lifecycle
 
+    monkeypatch.setenv("CCC_CONTINUATION_ENABLED", "0")
     lifecycle = bot_lifecycle.BotLifecycleMixin()
     lifecycle._config = SimpleNamespace(  # type: ignore[assignment]
         bot_data_dir=tmp_path, project_root=str(tmp_path)
     )
-    # Default (unset) is off: no monitor, no queue writes, nothing happens.
+    # Explicit opt-out: no monitor, no queue writes, nothing happens.
     assert lifecycle._build_continuation_monitor() is None
+
+
+def test_continuation_monitor_default_is_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from telegram_bot.core import bot_lifecycle
+
+    monkeypatch.delenv("CCC_CONTINUATION_ENABLED", raising=False)
+    lifecycle = bot_lifecycle.BotLifecycleMixin()
+    lifecycle._config = SimpleNamespace(  # type: ignore[assignment]
+        bot_data_dir=tmp_path, project_root=str(tmp_path)
+    )
+    lifecycle.application = SimpleNamespace(bot=SimpleNamespace())
+    # Fleet default since 2026-09-15: unset builds the monitor.
+    assert lifecycle._build_continuation_monitor() is not None
 
 
 @pytest.mark.anyio

@@ -1456,13 +1456,18 @@ class Doctor:
         configured = self.bridge_unit_environment_value(
             "CCC_CONTINUATION_ENABLED"
         ) or os.environ.get("CCC_CONTINUATION_ENABLED")
-        enabled = configured is not None and configured.strip().lower() not in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }
-        configuration = "enabled" if enabled else "disabled (opt-in)"
+        if configured is None:
+            # Code default since 2026-09-15: the monitor is on unless opted out.
+            enabled = True
+            configuration = "enabled (default)"
+        else:
+            enabled = configured.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+            configuration = "enabled" if enabled else "disabled (opt-out)"
 
         try:
             metadata = state_dir.lstat()
