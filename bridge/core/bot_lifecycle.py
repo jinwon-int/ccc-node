@@ -18,6 +18,7 @@ from telegram.request import BaseRequest, HTTPXRequest
 
 from telegram_bot.core import crash_policy, media
 from telegram_bot.core import restart_handoff
+from telegram_bot.core.project_chat_types import InterimMessageCallback
 from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control
 from telegram_bot.core.bot_ports import (
     AccessControlConfigPort,
@@ -179,6 +180,7 @@ class _LifecycleConfigPort(
 
 
 class BotLifecycleMixin:
+    _make_interim_send_callback: Callable[[int], InterimMessageCallback]
     _config: _LifecycleConfigPort
     _session_manager: SessionManagerPort
     _project_chat: ProjectChatPort
@@ -1316,6 +1318,9 @@ class BotLifecycleMixin:
                     int(record["chat_id"]),
                     session_id=session_id,
                     notification_bot=application.bot,
+                    interim_message_callback=self._make_interim_send_callback(
+                        int(record["chat_id"])
+                    ),
                     usage_mode=MODE_AUTONOMOUS,
                 )
             except asyncio.CancelledError:
@@ -1326,6 +1331,11 @@ class BotLifecycleMixin:
                 )
                 return False
             content = str(getattr(response, "content", "") or "")
+            # A successful interim-only turn already reached the conversation.
+            # Do not mark it failed or resend its completed message.
+            if (getattr(response, "success", False)
+                    and getattr(response, "streamed", False) and not content.strip()):
+                return True
             if getattr(response, "success", False) and content.strip():
                 delivered, reason = await self._send_external_chunked(
                     int(record["chat_id"]), content
@@ -1446,6 +1456,9 @@ class BotLifecycleMixin:
                     chat_id,
                     session_id=session_id,
                     notification_bot=application.bot,
+                    interim_message_callback=self._make_interim_send_callback(
+                        int(record["chat_id"])
+                    ),
                     usage_mode=MODE_AUTONOMOUS,
                 )
             except asyncio.CancelledError:
@@ -1456,6 +1469,11 @@ class BotLifecycleMixin:
                 )
                 return False
             content = str(getattr(response, "content", "") or "")
+            # A successful interim-only turn already reached the conversation.
+            # Do not mark it failed or resend its completed message.
+            if (getattr(response, "success", False)
+                    and getattr(response, "streamed", False) and not content.strip()):
+                return True
             if getattr(response, "success", False) and content.strip():
                 delivered, reason = await self._send_external_chunked(chat_id, content)
                 if not delivered:
