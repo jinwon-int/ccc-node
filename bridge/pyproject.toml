@@ -29,6 +29,7 @@ dev = ["pytest", "pytest-cov"]
 package-dir = {"telegram_bot" = "."}
 packages = [
   "telegram_bot",
+  "telegram_bot.contracts",
   "telegram_bot.core",
   "telegram_bot.memory",
   "telegram_bot.session",

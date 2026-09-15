@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+import importlib
+import os
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
 from typing import TYPE_CHECKING, Any, cast
 import unittest
 
@@ -444,6 +451,139 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cast(ErrorEvent, error).message, "Custom error text")
 
         await runtime.close()
+
+
+_BRIDGE_DIR = Path(__file__).resolve().parents[1]
+_CONTRACTS_DIR = _BRIDGE_DIR / "contracts"
+
+
+def _declared_public_names(source_path: Path) -> frozenset[str]:
+    """Public module-level names *defined* in ``source_path``.
+
+    Read from the source rather than ``vars(module)`` so the imports the module
+    makes for its own use (``Mapping``, ``Protocol``, ``math``, ...) are not
+    mistaken for part of the contract, and so a newly added public name is
+    picked up here the moment it lands.
+    """
+
+    names: set[str] = set()
+    for node in ast.parse(source_path.read_text(encoding="utf-8")).body:
+        targets: list[str] = []
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            targets.append(node.name)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets.append(node.target.id)
+        elif isinstance(node, ast.Assign):
+            targets.extend(t.id for t in node.targets if isinstance(t, ast.Name))
+        names.update(name for name in targets if not name.startswith("_"))
+    return frozenset(names)
+
+
+class ContractsPackageBoundaryTests(unittest.TestCase):
+    """The #1756 relocation: shim identity, facade, and import hygiene."""
+
+    def test_core_shim_reexports_every_contract_name_with_identity_preserved(self) -> None:
+        """``core.agent_runtime`` must stay a shim, not a drifting second copy.
+
+        Identity — not just presence — is what keeps existing call sites
+        correct: ``isinstance`` against a re-declared dataclass would fail for
+        an instance built through the other import path.
+        """
+
+        contracts = importlib.import_module("telegram_bot.contracts.agent_runtime")
+        shim = importlib.import_module("telegram_bot.core.agent_runtime")
+        declared = _declared_public_names(_CONTRACTS_DIR / "agent_runtime.py")
+
+        self.assertNotEqual(declared, frozenset())
+        self.assertEqual(set(shim.__all__), set(declared))
+        self.assertEqual(len(shim.__all__), len(set(shim.__all__)))
+        for name in sorted(declared):
+            with self.subTest(name=name):
+                self.assertIs(getattr(shim, name), getattr(contracts, name))
+
+        # The shim must not have grown a definition of its own.
+        self.assertEqual(
+            _declared_public_names(_BRIDGE_DIR / "core" / "agent_runtime.py"), frozenset()
+        )
+
+    def test_core_shim_instances_satisfy_isinstance_through_either_path(self) -> None:
+        from telegram_bot.contracts.agent_runtime import TextDeltaEvent as ContractsTextDelta
+        from telegram_bot.core.agent_runtime import TextDeltaEvent as ShimTextDelta
+
+        self.assertIsInstance(ShimTextDelta(text="hi"), ContractsTextDelta)
+        self.assertIsInstance(ContractsTextDelta(text="hi"), ShimTextDelta)
+
+    def test_contracts_facade_exposes_the_agent_runtime_contract(self) -> None:
+        facade = importlib.import_module("telegram_bot.contracts")
+        contracts = importlib.import_module("telegram_bot.contracts.agent_runtime")
+        declared = _declared_public_names(_CONTRACTS_DIR / "agent_runtime.py")
+
+        self.assertEqual(set(facade.__all__), set(declared))
+        for name in sorted(declared):
+            with self.subTest(name=name):
+                self.assertIs(getattr(facade, name), getattr(contracts, name))
+
+        # CodexRuntime is a stable import path, deliberately not in the facade:
+        # importing it costs the whole Codex app-server stack (see README.md).
+        self.assertNotIn("CodexRuntime", facade.__all__)
+        from telegram_bot.contracts.codex_runtime import CodexRuntime as FromContracts
+        from telegram_bot.core.codex_runtime import CodexRuntime as FromCore
+
+        self.assertIs(FromContracts, FromCore)
+
+    def test_contracts_package_imports_without_telegram(self) -> None:
+        """The seam must not re-couple every adapter to the Telegram runtime.
+
+        Checked in a subprocess: this suite has already imported ``telegram``
+        long before the assertion would run in-process, so only a fresh
+        interpreter can observe what the contract imports actually pull in.
+        """
+
+        probe = textwrap.dedent(
+            """
+            import sys
+
+            import telegram_bot.contracts
+            import telegram_bot.contracts.agent_runtime
+            import telegram_bot.contracts.codex_runtime
+
+            leaked = sorted(
+                name
+                for name in sys.modules
+                if name == "telegram" or name.startswith("telegram.")
+            )
+            print(",".join(leaked))
+            """
+        )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+            env=env,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "", "contracts imported the telegram package")
+
+    def test_contracts_modules_declare_no_direct_telegram_imports(self) -> None:
+        """Static backstop for the subprocess probe, including unused imports."""
+
+        for source_path in sorted(_CONTRACTS_DIR.glob("*.py")):
+            imported: set[str] = set()
+            for node in ast.walk(ast.parse(source_path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Import):
+                    imported.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    imported.add(node.module)
+            offenders = sorted(
+                name for name in imported if name == "telegram" or name.startswith("telegram.")
+            )
+            with self.subTest(module=source_path.name):
+                self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":
