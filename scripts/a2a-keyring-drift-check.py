@@ -15,15 +15,21 @@ is parsed in memory to derive the public key and never stored/logged):
   registry   broker http-signature registries:
                T1 (seoseo) local file
                T2 (gwakga) via `ssh gwakga cat ...`
-  local      worker env JWK over fleet ssh (systemd workers; Termux workers
+  local      configured worker key ID and JWK over fleet ssh (systemd workers; Termux workers
              have no readable local key and rely on registry coverage)
 
 Per-worker status:
   match          keyring agrees with at least one verifying surface
   DRIFT:*        keyring disagrees with a verifying surface (exit 1)
+  retained-key   another local key ID is selected, with no registry for this ID
   unverifiable   no surface could compare against the keyring
   local-unreadable / unreachable / no-local-key   info rows for the local probe
   not-in-keyring registry identity absent from the keyring (info; e.g. canary)
+
+Local comparisons require an exact key-ID match, never just a worker name.
+Retained keys stay in the keyring for historical receipt verification. Missing
+or malformed local key IDs do not establish that any key is historical. This
+probe reads configured env, not the running process; it does not attest activation.
 
 Env overrides:
   CCC_KEYRING_REPO           repo with refs/a2a-public-keyring.json
@@ -42,6 +48,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -153,6 +160,76 @@ def env_worker_raw(env_text: str) -> bytes | None:
     return jwk_x_to_raw(jwk["x"])
 
 
+
+def env_worker_keyid(env_text: str, node: str) -> str | None:
+    values = re.findall(
+        r"^A2A_HTTP_SIGNATURE_WORKER_KEY_ID=(.*)$", env_text, re.MULTILINE
+    )
+    if len(values) != 1:
+        return None
+    value = values[0].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    if not re.fullmatch(r"worker:" + re.escape(node) + r":[A-Za-z0-9_.:-]+", value):
+        return None
+    return value
+
+
+def probe_worker(node: str, timeout: int) -> tuple[str, str | None, bytes | None]:
+    status, env_text = read_worker_env(node, timeout)
+    if status != "ok":
+        return status, None, None
+    keyid = env_worker_keyid(env_text or "", node)
+    if keyid is None:
+        return "local-keyid-unavailable", None, None
+    try:
+        raw = env_worker_raw(env_text or "")
+    except (ValueError, TypeError, KeyError):
+        raw = None
+    if raw is None or len(raw) != 32:
+        return "local-parse-failed", None, None
+    return "ok", keyid, raw
+
+
+def compare_key(
+    keyid: str,
+    keyring: dict[str, bytes],
+    registries: dict[str, dict[str, bytes]],
+    local: tuple[str, str | None, bytes | None] | None,
+) -> dict[str, object]:
+    node = keyid.split(":")[1]
+    row: dict[str, object] = {"worker": node, "keyid": keyid}
+    keyring_raw = keyring.get(keyid)
+    status, local_id, local_raw = local or ("not-probed", None, None)
+    if local_id:
+        row["local_keyid"] = local_id
+    if keyring_raw is None:
+        if status == "ok" and local_id == keyid:
+            row.update(status="DRIFT:active-not-in-keyring")
+        else:
+            row.update(status="not-in-keyring", note="registry-only identity (canary?)")
+        return row
+
+    surfaces = {label: fp(reg[keyid]) for label, reg in registries.items() if keyid in reg}
+    keyring_fp = fp(keyring_raw)
+    row.update(keyring=keyring_fp, registries=surfaces)
+    conflicts = [f"{label}:{value}" for label, value in surfaces.items() if value != keyring_fp]
+    if conflicts:
+        row.update(status=f"DRIFT:keyring-vs-{'/'.join(s.split(':')[0] for s in conflicts)}",
+                   conflicting=conflicts)
+    elif status == "ok" and local_id == keyid:
+        if local_raw == keyring_raw:
+            row["status"] = "match"
+        else:
+            row.update(status="DRIFT:keyring-vs-local", local=fp(local_raw))
+    elif surfaces:
+        row.update(status="match", local_probe=status if local_id is None else "different-keyid")
+    elif status == "ok":
+        row.update(status="retained-key", note="not selected by local worker; no registry entry")
+    else:
+        row.update(status="unverifiable", local_probe=status)
+    return row
+
 def main() -> int:
     repo = os.environ.get("CCC_KEYRING_REPO", DEFAULT_REPO)
     t1_path = os.environ.get("A2A_KEYRING_T1_REGISTRY", DEFAULT_T1)
@@ -176,60 +253,15 @@ def main() -> int:
     except Exception as error:  # noqa: BLE001
         errors.append(f"t2: {error}")
 
-    rows: list[dict[str, object]] = []
-    drift = 0
+    # Probe once per worker so every key version uses the same local snapshot.
+    local = {node: probe_worker(node, ssh_timeout) for node in dict.fromkeys(local_nodes)}
     all_ids = sorted(set(keyring)
                      | set(registries.get("t1", {}))
-                     | set(registries.get("t2", {})))
-
-    for keyid in all_ids:
-        node = keyid.split(":")[1]
-        keyring_raw = keyring.get(keyid)
-        row: dict[str, object] = {"worker": node, "keyid": keyid}
-
-        if keyring_raw is None:
-            row.update(status="not-in-keyring", note="registry-only identity (canary?)")
-            rows.append(row)
-            continue
-
-        surfaces: dict[str, str] = {}
-        for label, reg in registries.items():
-            raw = reg.get(keyid)
-            if raw is not None:
-                surfaces[label] = fp(raw)
-        keyring_fp = fp(keyring_raw)
-        row["keyring"] = keyring_fp
-        row["registries"] = surfaces
-
-        conflicts = [f"{s}:{f}" for s, f in surfaces.items() if f != keyring_fp]
-        if conflicts:
-            row.update(status=f"DRIFT:keyring-vs-{'/'.join(s.split(':')[0] for s in conflicts)}",
-                       conflicting=conflicts)
-            drift += 1
-            rows.append(row)
-            continue
-
-        if node in local_nodes:
-            status, env_text = read_worker_env(node, ssh_timeout)
-            if status == "ok":
-                local_raw = env_worker_raw(env_text or "")
-                if local_raw is None:
-                    row["status"] = "local-parse-failed"
-                elif fp(local_raw) == keyring_fp:
-                    row["status"] = "match"
-                else:
-                    row.update(status="DRIFT:keyring-vs-local", local=fp(local_raw))
-                    drift += 1
-            elif surfaces:
-                # registry already verifies the keyring; local probe is extra
-                row.update(status="match", local_probe=status)
-            else:
-                row.update(status="unverifiable", local_probe=status)
-        else:
-            row["status"] = "match" if surfaces else "unverifiable"
-            if not surfaces:
-                row["note"] = "no registry entry and no local probe"
-        rows.append(row)
+                     | set(registries.get("t2", {}))
+                     | {keyid for status, keyid, _ in local.values() if status == "ok" and keyid})
+    rows = [compare_key(keyid, keyring, registries, local.get(keyid.split(":")[1]))
+            for keyid in all_ids]
+    drift = sum(str(row["status"]).startswith("DRIFT:") for row in rows)
 
     print(json.dumps(
         {
@@ -240,7 +272,8 @@ def main() -> int:
             "rows": rows,
             "remedy": (
                 "DRIFT: re-sync refs/a2a-public-keyring.json to the key that the "
-                "worker actually signs with (broker registry / worker env — "
+                "worker config selects, matching the exact key ID; preserve historical entries "
+                "unless separately retired (broker registry / worker env — "
                 "fleet-skills#130 pattern), then re-run the a2a-receipts workflow "
                 "for affected PRs."
             ) if drift else "",
