@@ -42,9 +42,14 @@ fail() { echo "broker-policy-drift-watch: $*" >&2; exit 2; }
 # guessing.
 REPO="${A2A_NEXUS_REPO:-}"
 [ -n "$REPO" ] || fail "A2A_NEXUS_REPO is required (no default: the broker's checkout path differs per node).
-  Ask the running container which tree it was composed from:
-    docker inspect a2a-broker -f '{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}'
-  That prints <repo>/packages/broker; pass the <repo> part."
+  Ask the running container which tree it was composed from (the container
+  name differs per node too: T1 is a2a-broker, T2 is a2a-broker-vps7):
+    docker ps --filter name=a2a-broker --format '{{.Names}} {{.Label \"com.docker.compose.project.working_dir\"}}'
+  That prints <repo>/packages/broker; pass the <repo> part.
+  If this runs from agent-cron, put the value in the task argv, e.g.
+    [\"env\", \"A2A_NEXUS_REPO=<repo>\", \"bash\", \"<this script>\"]
+  (ccc-node#1754: the default was removed in #1578 but node task definitions
+  were not updated, so the watch failed closed daily for 9 days on T2)."
 
 [ -d "$REPO/.git" ] || fail "repo checkout not found: $REPO"
 [ -f "$LIVE" ] || fail "live policy document not found: $LIVE (is A2A_BROKER_POLICY_FILE wired on this node?)"
