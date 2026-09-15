@@ -174,7 +174,7 @@ jobs:
           mkdir -p "$TMPDIR"
           python -m pytest -q tests/test_owner_operator_contract.py
       - name: A2A keyring identity regression tests
-        run: python -m unittest discover -s tests -p test_a2a_keyring_drift_check.py
+        run: python -m pytest -q tests/test_a2a_keyring_drift_check.py
       - name: Distill skill parsing regressions
         run: python -m pytest -q tests/test_distill_skill_parsing.py
       - name: CI hardening regressions
