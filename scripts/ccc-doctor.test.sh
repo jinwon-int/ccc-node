@@ -189,6 +189,14 @@ out="$(CCC_CONTINUATION_ENABLED=true run_doctor "$ct")"; rc=$?
 ok "continuation reports an enabled owner-only state directory" \
   '[ "$rc" = 0 ] && grep -q "정상.*continuation state.*configured=enabled.*private-0700" <<<"$out"'
 
+# 2026-09-15 fleet default-on rollout: with no explicit env anywhere, the old
+# opt-in code reported "disabled (opt-in)"; the default-on code must classify
+# the same state as enabled — via the unit environment when present (nodes
+# running the bridge) or "enabled (default)" when no unit is involved (CI).
+out="$(run_doctor "$ct")"; rc=$?
+ok "continuation with unset env is not classified disabled" \
+  '[ "$rc" = 0 ] && grep -q "정상.*continuation state.*configured=enabled.*private-0700" <<<"$out"'
+
 # 2026-08-03 dungae regression: a legacy one-hour process timeout combined
 # with the new two-hour delegated-task default crash-looped the bridge, while
 # doctor called the status merely "readable" and offered no repair boundary.

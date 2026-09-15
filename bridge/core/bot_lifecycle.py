@@ -1396,7 +1396,11 @@ class BotLifecycleMixin:
         return await _once()
 
     def _build_continuation_monitor(self):
-        """Yield-and-continue loop for registered next bundles (#1113); None when off.
+        """Yield-and-continue loop for registered next bundles (#1113); None only
+
+        when explicitly opted out via CCC_CONTINUATION_ENABLED=0 (on by default
+
+        since the 2026-09-15 fleet rollout).
 
         The agent registers the next work bundle and ends its turn; this loop
         starts it as a fresh bridge-owned turn with an explicit external_event
@@ -1404,8 +1408,10 @@ class BotLifecycleMixin:
         marathon continues as a baton pass, and the result is delivered
         through the shared chunked path.
         """
-        if not ExternalWaitMonitor.env_flag("CCC_CONTINUATION_ENABLED", default=False):
-            logger.info("Continuation monitor disabled (CCC_CONTINUATION_ENABLED=0)")
+        if not ExternalWaitMonitor.env_flag("CCC_CONTINUATION_ENABLED", default=True):
+            logger.info(
+                "Continuation monitor disabled (CCC_CONTINUATION_ENABLED opt-out)"
+            )
             return None
 
         application = cast(Application, self.application)
