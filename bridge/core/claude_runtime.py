@@ -16,6 +16,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+import time
 from typing import Any, Protocol
 import uuid
 
@@ -65,6 +66,7 @@ from .tool_policy import (
     resolve_execution_profile,
     running_as_root,
 )
+from .turn_stall import register_turn_liveness, unregister_turn_liveness
 
 INTERRUPTED_ERROR_CODE = _TURN_INTERRUPTED_ERROR_CODE
 
@@ -172,6 +174,83 @@ class _ActiveTurn:
     completion_deferral_observed: bool = False
 
 
+class _LivenessSdkClient:
+    """SDK-client wrapper stamping inbound-frame activity (#1741).
+
+    Wraps the per-session ``SdkClient`` so every prompt write and every
+    frame the reader consumes timestamps the session for the provider-
+    agnostic turn-stall probe. Pure delegation otherwise: connect,
+    interrupt, disconnect, and iteration semantics are unchanged, and the
+    observation-only ``set_sdk_frame_observer`` seam stays owned by its
+    existing callers rather than being chained here.
+    """
+
+    def __init__(self, inner: SdkClient, session: ClaudeSession) -> None:
+        self._inner = inner
+        self._session = session
+
+    def _note_activity(self) -> None:
+        self._session._last_activity = time.monotonic()
+
+    async def connect(self) -> None:
+        await self._inner.connect()
+
+    async def query(self, prompt: str) -> None:
+        self._note_activity()
+        await self._inner.query(prompt)
+
+    def receive_messages(self) -> AsyncIterator[Message]:
+        return self._receive()
+
+    async def _receive(self) -> AsyncIterator[Message]:
+        async for message in self._inner.receive_messages():
+            self._note_activity()
+            yield message
+
+    async def interrupt(self) -> None:
+        await self._inner.interrupt()
+
+    async def disconnect(self) -> None:
+        await self._inner.disconnect()
+
+
+class ClaudeTurnLiveness:
+    """Turn-liveness source over a :class:`ClaudeRuntime`'s sessions (#1741).
+
+    Last activity is the session's last SDK frame or prompt write, stamped
+    by :class:`_LivenessSdkClient`. The engine verdict stays fail-closed:
+    the only locally confirmable death is the reader task ending while the
+    session is open (the CLI transport stream terminated — exactly the
+    silent-death shape the probe exists for). A running reader proves
+    nothing about the process, so it reports "unknown" — logged, never
+    auto-recovered on a guess.
+    """
+
+    def __init__(self, runtime: ClaudeRuntime) -> None:
+        self._runtime = runtime
+
+    def _session(self, session_id: str) -> ClaudeSession | None:
+        for session in tuple(self._runtime._sessions):
+            if session._session_id == session_id:
+                return session
+        return None
+
+    def last_activity(self, session_id: str) -> float | None:
+        session = self._session(session_id)
+        if session is None:
+            return None
+        return session._last_activity
+
+    def engine_verdict(self, session_id: str) -> str:
+        session = self._session(session_id)
+        if session is None or session._closed:
+            return "unknown"
+        reader = session._reader_task
+        if reader is not None and reader.done():
+            return "dead"
+        return "unknown"
+
+
 class ClaudeSession(
     ClaudeSessionLifecycleMixin,
     ClaudeSessionObserversMixin,
@@ -237,6 +316,10 @@ class ClaudeSession(
         # storage boundary; correctness must not depend on an eviction count.
         self._background_task_terminal_ids: set[str] = set()
         self._sdk_frame_observer: SdkFrameObserver | None = None
+        # Monotonic timestamp of the session's last SDK frame or prompt
+        # write — the provider-agnostic turn-stall probe's last-activity
+        # signal (#1741), stamped by the _LivenessSdkClient wrapper.
+        self._last_activity: float | None = None
 
     # -- AgentSession protocol ---------------------------------------------
 
@@ -295,6 +378,13 @@ class ClaudeRuntime(ClaudeSessionBrowserMixin, ClaudeRuntimeOptionsMixin):
         self._turn_owners: dict[str, ClaudeSession] = {}
         self._sessions: list[ClaudeSession] = []
         self._closed = False
+        # Provider-agnostic turn-stall coverage (#1741): register this
+        # runtime's liveness source so the stall probe can see Claude
+        # turns. The registry keeps one slot per provider; a newer runtime
+        # replaces this registration and the replaced turns read as "no
+        # signal" (fail-closed no-op).
+        self._turn_liveness = ClaudeTurnLiveness(self)
+        register_turn_liveness("claude", self._turn_liveness)
 
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -345,7 +435,7 @@ class ClaudeRuntime(ClaudeSessionBrowserMixin, ClaudeRuntimeOptionsMixin):
         if request.session_id is None:
             options.session_id = session_id
         client = self._sdk_client_factory(options)
-        await session._start(client, timeout_seconds=self._session_id_timeout_seconds)
+        await session._start(_LivenessSdkClient(client, session), timeout_seconds=self._session_id_timeout_seconds)
         self._sessions.append(session)
         return session
 
@@ -356,6 +446,7 @@ class ClaudeRuntime(ClaudeSessionBrowserMixin, ClaudeRuntimeOptionsMixin):
         if self._closed:
             return
         self._closed = True
+        unregister_turn_liveness("claude", self._turn_liveness)
         sessions = tuple(self._sessions)
         self._sessions.clear()
         for session in sessions:

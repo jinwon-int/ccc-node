@@ -1,19 +1,21 @@
 """Telegram composition for the Danso CLI with explicit execution and OpenAI authentication modes."""
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 import os
 from pathlib import Path
 import shutil
 import stat
 import subprocess
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
 
-from telegram_bot.core.agent_runtime import ModelInfo, SessionRequest
+from telegram_bot.core.agent_runtime import ModelInfo, SessionRequest, deny_approval
 from telegram_bot.core.danso_worker import DansoRuntime as WorkerRuntime
 from telegram_bot.core.danso_memory import prepare_memory_context
 from telegram_bot.core.memory_audience import audience_from_danso_environment, shared_memory_audience
+from telegram_bot.core.turn_stall import register_turn_liveness
 from telegram_bot.utils.config import Settings
 from telegram_bot.utils.secure_fs import ensure_private_directory
 
@@ -231,6 +233,98 @@ def probe_danso_readiness(settings: Settings) -> tuple[bool, str]:
     return True, ""
 
 
+class _DansoLivenessSession:
+    """Delegating session wrapper stamping turn-output activity (#1741).
+
+    Danso runs one subprocess per turn inside the worker; this wrapper does
+    not alter that flow — it only timestamps each normalized event the turn
+    yields so the provider-agnostic stall probe can tell whether the turn's
+    engine is still producing output. Everything else (dispatch guards,
+    task authorization, recovery inspection, interruption) delegates to the
+    inner worker session unchanged, and attribute writes are forwarded to
+    the inner session so patched state lands where the turn flow reads it.
+    """
+
+    _LOCAL_ATTRS = frozenset({"_inner", "_last_activity"})
+
+    def __init__(self, inner: Any) -> None:
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_last_activity", time.monotonic())
+
+    @property
+    def session_id(self) -> str:
+        return self._inner.session_id
+
+    @property
+    def last_activity_monotonic(self) -> float | None:
+        return self._last_activity
+
+    def send_turn(
+        self,
+        message: str,
+        *,
+        approval_handler: Any = deny_approval,
+    ) -> AsyncIterator[Any]:
+        inner_stream = self._inner.send_turn(message, approval_handler=approval_handler)
+
+        async def events() -> AsyncIterator[Any]:
+            async for event in inner_stream:
+                self._last_activity = time.monotonic()
+                yield event
+
+        return events()
+
+    def engine_verdict(self) -> str:
+        """Verdict for the turn's subprocess; ``None`` process is "unknown".
+
+        The worker keeps the live process handle on the session during a
+        turn and clears it at cleanup, so a live handle is an honest
+        "alive" and an exited handle the one confirmable "dead". Between
+        turns there is no engine to classify — fail closed to "unknown".
+        """
+        process = getattr(self._inner, "_process", None)
+        if process is None:
+            return "unknown"
+        return "alive" if process.returncode is None else "dead"
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Write-through: attribute injection (dispatch guards in tests, the
+        # bridge's patched hooks) must land on the inner session where the
+        # worker's turn flow actually reads it.
+        if name in _DansoLivenessSession._LOCAL_ATTRS:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._inner, name, value)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class DansoTurnLiveness:
+    """Turn-liveness source over this runtime's wrapped sessions (#1741).
+
+    Sessions enter the bounded map at ``start_or_resume``; an unknown
+    session id reports no signal and the stall probe fails closed.
+    """
+
+    _MAX_TRACKED_SESSIONS = 64
+
+    def __init__(self, runtime: DansoRuntime) -> None:
+        self._runtime = runtime
+
+    def last_activity(self, session_id: str) -> float | None:
+        wrapped = self._runtime._liveness_sessions.get(session_id)
+        if wrapped is None:
+            return None
+        return wrapped.last_activity_monotonic
+
+    def engine_verdict(self, session_id: str) -> str:
+        wrapped = self._runtime._liveness_sessions.get(session_id)
+        if wrapped is None:
+            return "unknown"
+        return wrapped.engine_verdict()
+
+
 class DansoRuntime(WorkerRuntime):
     """One operator-selected Astra model with explicit default reasoning effort."""
     def __init__(self, *, default_effort: str = "medium", memory_settings: Settings | None = None, **kwargs: Any):
@@ -240,6 +334,20 @@ class DansoRuntime(WorkerRuntime):
         self.default_effort = default_effort
         self.memory_settings = memory_settings
         self._worker_kwargs = kwargs
+        # Bounded map of liveness-wrapped sessions (#1741): newest wins per
+        # session id, oldest entries pruned so /new churn cannot grow it.
+        self._liveness_sessions: dict[str, _DansoLivenessSession] = {}
+        register_turn_liveness("danso", DansoTurnLiveness(self))
+
+    def _track_for_liveness(self, session: Any) -> Any:
+        if isinstance(session, _DansoLivenessSession):
+            return session
+        wrapped = _DansoLivenessSession(session)
+        self._liveness_sessions[session.session_id] = wrapped
+        while len(self._liveness_sessions) > DansoTurnLiveness._MAX_TRACKED_SESSIONS:
+            oldest = next(iter(self._liveness_sessions))
+            self._liveness_sessions.pop(oldest, None)
+        return wrapped
 
     async def read_session_snapshot(self, session_id, *, bounds, memory_audience=None, memory_scope=None):
         import asyncio
@@ -290,8 +398,10 @@ class DansoRuntime(WorkerRuntime):
                               system_context_loader=loader,
                               native_memory_args=native_args)
                 worker = WorkerRuntime(**kwargs)
-                return await worker.start_or_resume(replace(request, effort=effort, memory_environment=None))
-            return await super().start_or_resume(replace(request, effort=effort))
+                return self._track_for_liveness(
+                    await worker.start_or_resume(replace(request, effort=effort, memory_environment=None)))
+            return self._track_for_liveness(
+                await super().start_or_resume(replace(request, effort=effort)))
         except FileNotFoundError:
             if not request.session_id:
                 raise ValueError("Danso workspace is unavailable.") from None

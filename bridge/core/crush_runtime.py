@@ -57,6 +57,7 @@ from .agent_runtime import (
     ToolStartedEvent,
     deny_approval,
 )
+from .turn_stall import register_turn_liveness, unregister_turn_liveness
 
 logger = logging.getLogger(__name__)
 
@@ -449,6 +450,19 @@ class CrushServerClient:
     async def next_event(self) -> CrushEvent:
         return await self._queue.get()
 
+    def engine_verdict(self) -> str:
+        """#1741 stall-probe verdict for the spawned crush server process.
+
+        A running process is "alive", an exited one "dead" — the only
+        confirmed-dead signal the transport can give. A client that was
+        closed deliberately or never started cannot classify honestly and
+        reports "unknown" (the probe treats that as a fail-closed no-op).
+        """
+        proc = self._proc
+        if self._closed or proc is None:
+            return "unknown"
+        return "alive" if proc.poll() is None else "dead"
+
 
 def _free_port(host: str) -> int:
     import socket
@@ -482,6 +496,10 @@ class _ActiveTurn:
     run_id: str | None = None
     turn_ready: asyncio.Event = field(default_factory=asyncio.Event)
     finished: bool = False
+    # Monotonic timestamp of the turn's last inbound SSE event or prompt
+    # send — the provider-agnostic stall probe's last-activity signal
+    # (#1741). 0.0 reads as "no activity sample yet".
+    last_activity: float = 0.0
     # per-assistant-message streaming state, keyed by provider message id
     emitted_text: bool = False
     text_seen: dict[str, int] = field(default_factory=dict)
@@ -490,6 +508,9 @@ class _ActiveTurn:
     tools_seen: set[str] = field(default_factory=set)
     tools_completed: set[str] = field(default_factory=set)
     collected_text: list[str] = field(default_factory=list)
+
+    def note_activity(self) -> None:
+        self.last_activity = time.monotonic()
 
 
 class CrushSession:
@@ -523,6 +544,7 @@ class CrushSession:
                 try:
                     run_id = str(uuid.uuid4())
                     active.run_id = run_id
+                    active.note_activity()
                     client = await self._runtime._ensure_started()
                     await client.prompt_send(
                         self._workspace_id, self._session_id, message, run_id=run_id,
@@ -556,6 +578,38 @@ class CrushSession:
         if client is None:
             return
         await client.turn_cancel(self._workspace_id, self._session_id)
+
+
+class CrushTurnLiveness:
+    """Turn-liveness source over this runtime's active turns (#1741).
+
+    Last activity is the turn's last inbound SSE event (or its prompt
+    send), tracked by :class:`_ActiveTurn`. The engine verdict delegates
+    to the transport's ``engine_verdict`` when it has one (the spawned
+    ``crush server`` process); any other transport — scripted fakes,
+    alternative transports — reports "unknown", which the stall probe
+    reads as a fail-closed no-op rather than an alive verdict.
+    """
+
+    def __init__(self, runtime: CrushRuntime) -> None:
+        self._runtime = runtime
+
+    def last_activity(self, session_id: str) -> float | None:
+        active = self._runtime._active_turns.get(session_id)
+        if active is None or active.finished or active.last_activity <= 0.0:
+            return None
+        return active.last_activity
+
+    def engine_verdict(self, session_id: str) -> str:
+        del session_id  # the engine is one server process for all turns
+        getter = getattr(self._runtime._client, "engine_verdict", None)
+        if not callable(getter):
+            return "unknown"
+        try:
+            verdict = getter()
+        except Exception:
+            return "unknown"
+        return verdict if verdict in ("alive", "dead", "unknown") else "unknown"
 
 
 class CrushRuntime:
@@ -592,6 +646,13 @@ class CrushRuntime:
         self._turn_locks: dict[str, asyncio.Lock] = {}
         self._workspaces: dict[str, str] = {}  # cwd -> workspace_id
         self._closed = False
+        # Provider-agnostic turn-stall coverage (#1741): register this
+        # runtime's liveness source so the stall probe can see crush turns.
+        # The registry keeps one slot per provider, so a newer runtime
+        # replaces this registration; turns of a replaced runtime then read
+        # as "no signal" and stay fail-closed no-ops.
+        self._turn_liveness = CrushTurnLiveness(self)
+        register_turn_liveness("crush", self._turn_liveness)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -608,6 +669,7 @@ class CrushRuntime:
 
     async def close(self) -> None:
         self._closed = True
+        unregister_turn_liveness("crush", self._turn_liveness)
         for active in self._active_turns.values():
             if not active.finished:
                 active.queue.put_nowait(
@@ -765,6 +827,7 @@ class CrushRuntime:
         active = self._active_turns.get(event.session_id)
         if active is None or active.finished:
             return
+        active.note_activity()
         if event.payload.get("role") != "assistant":
             return
         message_id = str(event.payload.get("id") or "")
@@ -852,6 +915,7 @@ class CrushRuntime:
         active = self._active_turns.get(event.session_id)
         if active is None or active.finished:
             return
+        active.note_activity()
         payload = event.payload
         if payload.get("type") == "error" or payload.get("error"):
             message = payload.get("error") or payload.get("message") or "crush agent error"
@@ -920,6 +984,7 @@ class CrushRuntime:
         active = self._active_turns.get(event.session_id)
         if active is None or active.finished:
             return ApprovalDecision.DENY
+        active.note_activity()
         try:
             await asyncio.wait_for(active.turn_ready.wait(), timeout=5.0)
         except asyncio.TimeoutError:

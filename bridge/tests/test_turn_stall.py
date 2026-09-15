@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -212,6 +213,267 @@ async def test_reprobe_cooldown_prevents_repeat_recovery(tmp_path: Path) -> None
 def test_engine_dead_text_names_recovery_and_next_step() -> None:
     text = engine_dead_notification_text(11)
     assert "11" in text and "recovery" in text and "Re-issue" in text
+
+
+# --- provider-agnostic turn-liveness sources (#1741) -----------------------------
+
+
+class ScriptedSource:
+    """TurnLivenessSource double: scripted activity timestamps and verdicts."""
+
+    def __init__(
+        self,
+        activities: dict[str, float] | None = None,
+        verdicts: dict[str, str] | None = None,
+    ) -> None:
+        self.activities = activities or {}
+        self.verdicts = verdicts or {}
+        self.verdict_calls: list[str] = []
+
+    def last_activity(self, session_id: str) -> float | None:
+        return self.activities.get(session_id)
+
+    def engine_verdict(self, session_id: str) -> str:
+        self.verdict_calls.append(session_id)
+        return self.verdicts.get(session_id, "unknown")
+
+
+class ExplodingSource:
+    """A source whose every method raises — the probe must fail closed."""
+
+    def last_activity(self, session_id: str) -> float | None:
+        raise RuntimeError("synthetic liveness source failure")
+
+    def engine_verdict(self, session_id: str) -> str:
+        raise RuntimeError("synthetic liveness source failure")
+
+
+def _generic_monitor(
+    recorder: Recorder,
+    clock: Clock,
+    bindings: Sequence[tuple[str, object]],
+    *,
+    thread_id: str = "sess-provider-1",
+    stall_seconds: float = 600.0,
+) -> StallProbeMonitor:
+    return StallProbeMonitor(
+        turns_provider=lambda: [(7, 70, thread_id, 0.0)],
+        liveness_probe=lambda: "dead",  # must never be reached on the generic arm
+        recover=recorder.recover,
+        notifier=recorder.notify,
+        sessions_roots=[],  # no CODEX_HOME: the rollout fallback can never fire
+        stall_seconds=stall_seconds,
+        clock=clock,
+        wall_clock=Clock(0.0),
+        turn_liveness_sources=bindings,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.anyio
+async def test_generic_source_fresh_activity_never_probes(tmp_path: Path) -> None:
+    """Criterion 2: fresh adapter activity means no probe, no recovery."""
+    clock = Clock()
+    source = ScriptedSource(activities={"sess-provider-1": clock.now})
+    recorder = Recorder()
+    monitor = _generic_monitor(recorder, clock, [("fake-provider", source)])
+    clock.advance(60)  # activity is 60s old, far below the 600s stall
+
+    await monitor._tick()
+
+    assert recorder.recoveries == 0
+    assert recorder.notifications == []
+    assert source.verdict_calls == []  # the engine was never even asked
+
+
+@pytest.mark.anyio
+async def test_generic_source_stale_activity_with_dead_engine_recovers() -> None:
+    """Criterion 3: stale activity + confirmed-dead engine -> fail-closed recovery."""
+    clock = Clock()
+    started = clock.now
+    source = ScriptedSource(
+        activities={"sess-provider-1": started}, verdicts={"sess-provider-1": "dead"}
+    )
+    recorder = Recorder()
+    monitor = _generic_monitor(recorder, clock, [("fake-provider", source)])
+    clock.advance(700)  # activity is 700s stale, past the 600s stall
+
+    await monitor._tick()
+
+    assert recorder.recoveries == 1
+    assert len(recorder.notifications) == 1
+    chat_id, text = recorder.notifications[0]
+    assert chat_id == 70
+    assert "died silently" in text and "recovery" in text
+
+
+@pytest.mark.anyio
+async def test_generic_source_stale_but_alive_engine_is_a_no_op() -> None:
+    clock = Clock()
+    source = ScriptedSource(
+        activities={"sess-provider-1": clock.now}, verdicts={"sess-provider-1": "alive"}
+    )
+    recorder = Recorder()
+    monitor = _generic_monitor(recorder, clock, [("fake-provider", source)])
+    clock.advance(700)
+
+    await monitor._tick()
+
+    assert recorder.recoveries == 0
+    assert recorder.notifications == []  # alive-but-quiet stays untouched
+
+
+@pytest.mark.anyio
+async def test_generic_source_unknown_verdict_never_recovers() -> None:
+    """Ambiguous adapter verdicts only log — never recover on a guess."""
+    clock = Clock()
+    source = ScriptedSource(
+        activities={"sess-provider-1": clock.now},
+        verdicts={"sess-provider-1": "unknown"},
+    )
+    recorder = Recorder()
+    monitor = _generic_monitor(recorder, clock, [("fake-provider", source)])
+    clock.advance(700)
+
+    await monitor._tick()
+
+    assert recorder.recoveries == 0
+    assert recorder.notifications == []
+
+
+@pytest.mark.anyio
+async def test_runtime_without_registered_signal_stays_a_no_op() -> None:
+    """Criterion 4: no source knows the turn -> no-op, never synthetic alive."""
+    clock = Clock()
+    source = ScriptedSource()  # knows no session ids at all
+    probed = {"calls": 0}
+
+    def codex_probe() -> str:
+        probed["calls"] += 1
+        return "dead"
+
+    recorder = Recorder()
+    monitor = StallProbeMonitor(
+        turns_provider=lambda: [(7, 70, "sess-unknown", 0.0)],
+        liveness_probe=codex_probe,
+        recover=recorder.recover,
+        notifier=recorder.notify,
+        sessions_roots=[],  # and no rollout file exists either
+        stall_seconds=600.0,
+        clock=clock,
+        wall_clock=Clock(0.0),
+        turn_liveness_sources=[("fake-provider", source)],
+    )
+    clock.advance(700)
+
+    await monitor._tick()
+
+    assert recorder.recoveries == 0
+    assert recorder.notifications == []
+    assert probed["calls"] == 0  # fail-closed: not even a synthetic alive verdict
+
+
+@pytest.mark.anyio
+async def test_registry_backs_the_default_bindings_and_unregister_reverts() -> None:
+    """The lifecycle builder passes no explicit sources; the registry feeds them."""
+    from telegram_bot.core import turn_stall as turn_stall_module
+
+    clock = Clock()
+    source = ScriptedSource(
+        activities={"sess-provider-1": clock.now}, verdicts={"sess-provider-1": "dead"}
+    )
+    recorder = Recorder()
+
+    def registry_monitor() -> StallProbeMonitor:
+        # No explicit bindings: the monitor must consult the registry live.
+        return StallProbeMonitor(
+            turns_provider=lambda: [(7, 70, "sess-provider-1", 0.0)],
+            liveness_probe=lambda: "dead",
+            recover=recorder.recover,
+            notifier=recorder.notify,
+            sessions_roots=[],
+            stall_seconds=600.0,
+            clock=clock,
+            wall_clock=Clock(0.0),
+        )
+
+    monitor = registry_monitor()
+    turn_stall_module.register_turn_liveness("fake-provider", source)
+    try:
+        clock.advance(700)
+        await monitor._tick()
+        assert recorder.recoveries == 1
+
+        turn_stall_module.unregister_turn_liveness("fake-provider")
+        monitor_two = registry_monitor()
+        clock.advance(700)
+        await monitor_two._tick()
+        assert recorder.recoveries == 1  # unchanged: unregistered source is gone
+    finally:
+        turn_stall_module.unregister_turn_liveness("fake-provider")
+
+
+@pytest.mark.anyio
+async def test_scoped_unregister_keeps_a_newer_registration() -> None:
+    """Closing an older runtime must not revoke a newer runtime's slot."""
+    from telegram_bot.core import turn_stall as turn_stall_module
+
+    older, newer = ScriptedSource(), ScriptedSource()
+    turn_stall_module.register_turn_liveness("scoped", older)
+    turn_stall_module.register_turn_liveness("scoped", newer)
+    try:
+        turn_stall_module.unregister_turn_liveness("scoped", older)
+        binding = dict(turn_stall_module.registered_turn_liveness_sources())["scoped"]
+        assert binding is newer
+        turn_stall_module.unregister_turn_liveness("scoped", newer)
+        assert turn_stall_module.registered_turn_liveness_sources() == ()
+    finally:
+        turn_stall_module.unregister_turn_liveness("scoped")
+
+
+@pytest.mark.anyio
+async def test_failing_liveness_source_fails_closed_without_killing_the_tick() -> None:
+    clock = Clock()
+    healthy = ScriptedSource(
+        activities={"sess-provider-1": clock.now}, verdicts={"sess-provider-1": "dead"}
+    )
+    recorder = Recorder()
+    monitor = _generic_monitor(
+        recorder, clock, [("broken", ExplodingSource()), ("fake-provider", healthy)]
+    )
+    clock.advance(700)
+
+    await monitor._tick()  # must not raise
+
+    assert recorder.recoveries == 1  # the healthy source still answered
+
+
+@pytest.mark.anyio
+async def test_generic_arm_precedes_the_codex_rollout_fallback(tmp_path: Path) -> None:
+    """A tracked turn resolves generically even when a stale rollout exists."""
+    rollout = _make_rollout(tmp_path, "sess-provider-1")
+    clock = Clock()
+    wall = Clock(rollout.stat().st_mtime)
+    source = ScriptedSource(
+        activities={"sess-provider-1": clock.now}, verdicts={"sess-provider-1": "alive"}
+    )
+    recorder = Recorder()
+    monitor = StallProbeMonitor(
+        turns_provider=lambda: [(7, 70, "sess-provider-1", 0.0)],
+        liveness_probe=lambda: "dead",
+        recover=recorder.recover,
+        notifier=recorder.notify,
+        sessions_roots=[tmp_path],
+        stall_seconds=600.0,
+        clock=clock,
+        wall_clock=wall,
+        turn_liveness_sources=[("fake-provider", source)],
+    )
+    clock.advance(700)
+    wall.advance(700)  # the rollout is stale too — the generic arm must win
+
+    await monitor._tick()
+
+    assert recorder.recoveries == 0  # alive verdict honored, Codex probe ignored
 
 
 # --- lifecycle builder --------------------------------------------------------

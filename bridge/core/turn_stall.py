@@ -8,6 +8,15 @@ Both arms report or recover — neither limits work:
    exited). A quiet but alive turn is never touched, and an ambiguous
    liveness verdict only gets logged — never recovered on a guess
    (fail-closed, per the work-continuity guard).
+
+   Since #1741 the stall signal is provider-agnostic: a runtime adapter can
+   register a :class:`TurnLivenessSource` — "has this turn's underlying
+   process produced any new output/RPC activity in the last N minutes",
+   carried as a monotonic last-activity timestamp — and the probe consults
+   it before the Codex rollout-file fallback. A turn no source recognizes
+   still resolves through the Codex rollout contract exactly as before, so
+   a runtime without a registered liveness signal stays a fail-closed
+   no-op, never a synthetic alive verdict.
 2. **Orphan tool-call loop** — the app-server stderr drain counts
    ``Custom tool call output is missing`` occurrences (2026-08-14: 15s
    interval repeats for 13 minutes with no surfacing). The count is exported
@@ -18,10 +27,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Awaitable, Callable, Deque, List, Optional, Tuple
+from typing import Awaitable, Callable, Deque, List, Optional, Protocol, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +88,81 @@ LivenessProbe = Callable[[], str]  # "alive" | "dead" | "unknown"
 RecoverCallback = Callable[[], Awaitable[None]]
 NotifierCallback = Callable[[int, str], Awaitable[bool]]
 
+_LIVENESS_VERDICTS = frozenset({"alive", "dead", "unknown"})
+
+
+class TurnLivenessSource(Protocol):
+    """Provider-agnostic last-activity liveness for one runtime (#1741).
+
+    Answers, for one active turn, "has this turn's underlying process
+    produced any new output/RPC activity in the last N minutes?" via a
+    monotonic last-activity timestamp, plus an engine verdict consulted
+    only once the turn is already stale.
+
+    Implementations must fail closed: an untracked session id reports
+    ``None`` from :meth:`last_activity` (the probe then falls back to the
+    Codex rollout contract for that turn), anything that cannot honestly
+    classify the engine reports ``"unknown"`` from :meth:`engine_verdict`,
+    and only a confirmed-dead engine may report ``"dead"`` — never a
+    synthetic ``"alive"`` and never a recovery on a guess.
+    """
+
+    def last_activity(self, session_id: str) -> Optional[float]:
+        """Monotonic timestamp of the session's last output/RPC activity.
+
+        ``None`` when this source does not track ``session_id`` — no
+        registered signal for that turn, so the probe must fail closed.
+        """
+        ...
+
+    def engine_verdict(self, session_id: str) -> str:
+        """``"alive" | "dead" | "unknown"`` for the turn's engine process."""
+        ...
+
+
+TurnLivenessBinding = Tuple[str, TurnLivenessSource]
+
+# One slot per provider name: a later registration replaces the earlier one,
+# so a source can only ever answer for the runtime that registered it last.
+# Sources answer strictly from their own session records, and an untracked
+# session id reads as "no signal" — a stale registration degrades to the
+# fail-closed no-op, never to a false verdict.
+_TURN_LIVENESS_SOURCES: dict[str, TurnLivenessBinding] = {}
+_TURN_LIVENESS_LOCK = threading.Lock()
+
+
+def register_turn_liveness(provider: str, source: TurnLivenessSource) -> None:
+    """Register a runtime adapter's liveness source under its provider name."""
+    with _TURN_LIVENESS_LOCK:
+        _TURN_LIVENESS_SOURCES[provider] = (provider, source)
+
+
+def unregister_turn_liveness(
+    provider: str, source: TurnLivenessSource | None = None
+) -> None:
+    """Drop a provider's liveness registration (runtime closed).
+
+    With ``source`` given, only a registration whose source is that exact
+    object is removed, so closing an older runtime can never revoke a
+    newer runtime's registration; the slot then simply stays with the
+    newest owner.
+    """
+    with _TURN_LIVENESS_LOCK:
+        binding = _TURN_LIVENESS_SOURCES.get(provider)
+        if source is None or (binding is not None and binding[1] is source):
+            _TURN_LIVENESS_SOURCES.pop(provider, None)
+
+
+def registered_turn_liveness_sources() -> Tuple[TurnLivenessBinding, ...]:
+    """Snapshot of the currently registered per-provider liveness sources."""
+    with _TURN_LIVENESS_LOCK:
+        return tuple(_TURN_LIVENESS_SOURCES.values())
+
+
+def _normalize_verdict(verdict: object) -> str:
+    """Honor only the three known verdicts; anything else reads "unknown"."""
+    return verdict if verdict in _LIVENESS_VERDICTS else "unknown"
+
 
 def find_rollout(sessions_roots: List[Path], thread_id: str) -> Optional[Path]:
     """Newest rollout file for a codex thread across the given CODEX_HOMEs.
@@ -131,6 +216,7 @@ class StallProbeMonitor:
         wall_clock: Callable[[], float] = time.time,
         tick_seconds: float = DEFAULT_TICK_SECONDS,
         reprobe_seconds: float = DEFAULT_REPROBE_SECONDS,
+        turn_liveness_sources: Optional[Sequence[TurnLivenessBinding]] = None,
     ) -> None:
         self._turns_provider = turns_provider
         self._liveness_probe = liveness_probe
@@ -142,7 +228,51 @@ class StallProbeMonitor:
         self._wall_clock = wall_clock
         self._tick_seconds = float(tick_seconds)
         self._reprobe_seconds = float(reprobe_seconds)
+        # Explicit bindings win (tests, focused deployments); the default
+        # consults the process-wide registry so adapter-registered sources
+        # are picked up without touching the lifecycle builder.
+        self._turn_liveness_sources: Optional[Tuple[TurnLivenessBinding, ...]] = (
+            tuple(turn_liveness_sources) if turn_liveness_sources is not None else None
+        )
         self._probed: dict[Tuple[int, int], float] = {}
+
+    def _liveness_bindings(self) -> Tuple[TurnLivenessBinding, ...]:
+        if self._turn_liveness_sources is not None:
+            return self._turn_liveness_sources
+        return registered_turn_liveness_sources()
+
+    def _generic_activity(
+        self, session_id: str
+    ) -> Optional[Tuple[str, TurnLivenessSource, float]]:
+        """First registered source that tracks ``session_id``, with timestamp.
+
+        ``None`` when no source recognizes the turn — the caller then falls
+        back to the Codex rollout contract. A source that raises fails
+        closed: it is skipped rather than allowed to kill the whole tick.
+        """
+        for provider, source in self._liveness_bindings():
+            try:
+                last = source.last_activity(session_id)
+            except Exception:
+                logger.exception(
+                    "Turn liveness source %s failed on last_activity; skipping",
+                    provider,
+                )
+                continue
+            if last is not None:
+                return provider, source, float(last)
+        return None
+
+    def _generic_verdict(self, provider: str, source: TurnLivenessSource,
+                         session_id: str) -> str:
+        try:
+            return _normalize_verdict(source.engine_verdict(session_id))
+        except Exception:
+            logger.exception(
+                "Turn liveness source %s failed on engine_verdict; failing closed",
+                provider,
+            )
+            return "unknown"
 
     async def run(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
@@ -165,14 +295,26 @@ class StallProbeMonitor:
             last = self._probed.get(key)
             if last is not None and now - last < self._reprobe_seconds:
                 continue
-            rollout = find_rollout(self._sessions_roots, thread_id or "")
-            if rollout is None:
-                continue
-            silent_for = wall_now - rollout.stat().st_mtime
-            if silent_for < self._stall_seconds:
-                continue
+            session_id = thread_id or ""
+            generic = self._generic_activity(session_id)
+            if generic is not None:
+                # Provider-agnostic arm (#1741): the adapter tracks this
+                # turn's output/RPC activity on the monitor's clock.
+                provider, source, last_activity = generic
+                silent_for = now - last_activity
+                if silent_for < self._stall_seconds:
+                    continue
+                verdict = self._generic_verdict(provider, source, session_id)
+            else:
+                # Codex arm: the rollout-file contract, unchanged.
+                rollout = find_rollout(self._sessions_roots, session_id)
+                if rollout is None:
+                    continue
+                silent_for = wall_now - rollout.stat().st_mtime
+                if silent_for < self._stall_seconds:
+                    continue
+                verdict = self._liveness_probe()
             self._probed[key] = now
-            verdict = self._liveness_probe()
             if verdict == "alive":
                 # A genuinely long turn: by the continuity guard, nothing
                 # happens — not even a notification (that is PR-4's job).
@@ -220,7 +362,12 @@ __all__ = [
     "ORPHAN_LOOP_WINDOW_SECONDS",
     "OrphanLoopTracker",
     "StallProbeMonitor",
+    "TurnLivenessBinding",
+    "TurnLivenessSource",
     "engine_dead_notification_text",
     "find_rollout",
     "orphan_tool_loop_tracker",
+    "register_turn_liveness",
+    "registered_turn_liveness_sources",
+    "unregister_turn_liveness",
 ]
