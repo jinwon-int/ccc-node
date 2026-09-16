@@ -50,6 +50,11 @@ _MAX_COMMAND_OUTPUT = 1024 * 1024
 # #1477: ledger.jsonl is append-only and read whole on every collect; cap it
 # like the ownership ledger (8 MiB) so an unbounded file cannot stall a run.
 _MAX_LEDGER_BYTES = 8 * 1024 * 1024
+# #1770: how many findings a verdict keeps, and therefore how many its PR
+# comment renders. One constant for both on purpose — the comment used a
+# smaller, separate literal (8), so every review with more findings than that
+# silently lost the remainder to a broker record that does not outlive it.
+_MAX_VERDICT_FINDINGS = 16
 _MAX_CANDIDATES_PER_RUN = 64
 # #1647: cross-run collect rotation cursor. Owner-only JSON in the promotion
 # state dir; written only by a locked, non-dry collect (dry-run never writes
@@ -2554,7 +2559,7 @@ def _verdict_from_task(
             file=sys.stderr,
         )
     clean: list[dict[str, str]] = []
-    for finding in findings[:16]:
+    for finding in findings[:_MAX_VERDICT_FINDINGS]:
         if not isinstance(finding, dict):
             continue
         clean.append(
@@ -2570,6 +2575,18 @@ def _verdict_from_task(
 def _verdict_comment_body(
     verdict: str, findings: list[dict[str, str]], reviewer: str, dispatched: str, note: str
 ) -> str:
+    """The verdict comment — the only permanent human-readable copy of a
+    review's findings.
+
+    #1770: this rendered findings[:8] and sent the rest to "the broker record".
+    A verdict keeps up to _MAX_VERDICT_FINDINGS (16), the ledger verdict row
+    stored only a count, and broker task results do not live forever — so the
+    overflow of any review with more than eight findings became unrecoverable
+    once the broker dropped it, and the comment kept pointing at an empty
+    record. Five open intake PRs lost thirteen findings that way.
+
+    Rendering up to the same limit the verdict itself keeps means a comment can
+    no longer be less complete than the verdict behind it."""
     lines = [
         "## A2A intake review verdict (auto-recorded)",
         "",
@@ -2579,10 +2596,16 @@ def _verdict_comment_body(
         lines.append(f"- {note}")
     if findings:
         lines.extend(["", "Findings:"])
-        for index, finding in enumerate(findings[:8], 1):
+        for index, finding in enumerate(findings[:_MAX_VERDICT_FINDINGS], 1):
             lines.append(f"{index}. **{finding['severity']}/{finding['area']}** — {finding['note']}")
-        if len(findings) > 8:
-            lines.append(f"(+{len(findings) - 8} more findings in the broker record)")
+        if len(findings) > _MAX_VERDICT_FINDINGS:
+            # Unreachable while the two limits are the same constant, and kept
+            # honest for the day they diverge: name the publisher ledger, which
+            # is durable, rather than the broker, which is not.
+            lines.append(
+                f"(+{len(findings) - _MAX_VERDICT_FINDINGS} further findings omitted by the "
+                "comment limit — the publisher ledger holds the full set)"
+            )
     return "\n".join(lines)
 
 
@@ -3327,7 +3350,7 @@ def _record_deferred_revise(
     reviewer: str,
     outcome: dict[str, object],
 ) -> None:
-    """Persist everything a deferred revision round will need (#1767).
+    """Persist the findings of a revise verdict whose round did not run (#1767).
 
     A verdict is consumed exactly once. When the R2 dispatch skipped only
     because the author node happened to be offline at that moment, the
@@ -3336,13 +3359,22 @@ def _record_deferred_revise(
     revise was starved permanently, not delayed. Recording the findings plus
     the lineage keys makes the skip recoverable by _sweep_deferred_revises.
 
+    #1770: every skip code is recorded, not just the retryable one. A revision
+    round is the only consumer that reads findings back, so whenever one does
+    not run the ledger is where they have to survive — a canon-lane or
+    invalid-record skip loses them exactly as permanently as an author-offline
+    skip did, and the PR comment is a rendering, not a machine-readable copy.
+    Retryability is a separate question, decided by `_REVISE_DEFERRABLE_CODES`
+    in `_deferred_revise_due`; recording a row never implies it will be
+    retried.
+
     Best-effort and fail-safe like the dispatch itself: a ledger write failure
     must never turn a consumed verdict into an error. The PR comment posted by
     the caller still carries the findings for human follow-up."""
     if outcome.get("outcome") != "revise-skipped":
         return
     code = outcome.get("code")
-    if not isinstance(code, str) or code not in _REVISE_DEFERRABLE_CODES:
+    if not isinstance(code, str) or not code:
         return
     target = _revise_dispatch_target(row)
     if isinstance(target, str):
@@ -3383,11 +3415,20 @@ def _record_deferred_revise(
 def _deferred_revise_due(
     rows: list[dict[str, object]], now: datetime
 ) -> list[dict[str, object]]:
-    """Deferred revisions still worth retrying, oldest first (#1767): not yet
-    dispatched for that exact head, and not aged past the retry bound."""
+    """Deferred revisions still worth retrying, oldest first (#1767): recorded
+    under a retryable skip code, not yet dispatched for that exact head, and
+    not aged past the retry bound.
+
+    #1770: the rows now also preserve findings for skips that will never be
+    retried (canon lane, invalid record, transport failure), so retryability is
+    decided here by the code rather than by the row's existence. Waiting cannot
+    make a structural skip dispatchable, and retrying one every cycle would
+    spend the bounded budget on work that can only fail."""
     due: list[dict[str, object]] = []
     for item in rows:
         if item.get("kind") != "a2a-revise-deferred":
+            continue
+        if str(item.get("code", "")) not in _REVISE_DEFERRABLE_CODES:
             continue
         pr = item.get("pr")
         head = item.get("head_sha")
