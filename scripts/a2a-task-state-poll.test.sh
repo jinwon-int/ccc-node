@@ -191,6 +191,17 @@ class PollerTest(unittest.TestCase):
             served = [r["path"] for r in self.broker.requests]
         self.assertIn(f"/tasks/{encoded}", served)
 
+    def test_header_temp_file_is_cleaned_up_on_exit(self):
+        # #1760 shipped `trap cleanup EXIT: > "$hdrs_file"` — the glued
+        # redirect made the trap registration invalid, so the 0600 header
+        # file leaked into TMPDIR on every invocation while the redirect
+        # still kept the poller working. This guard pins the trap.
+        log = self.log_path()
+        self.broker.routes["/tasks/t-trap"] = body_succeeded_flat()
+        self.run_watch([("t-trap", log)])
+        leaks = [n for n in os.listdir(self.root) if n.startswith("a2a-poll-hdrs.")]
+        self.assertEqual(leaks, [])
+
     def test_secret_never_reaches_the_log(self):
         log = self.log_path()
         self.broker.routes["/tasks/t-sec"] = body_succeeded_flat()
