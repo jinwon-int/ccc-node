@@ -156,7 +156,8 @@ command -v python3 >/dev/null 2>&1 || { printf 'a2a-task-state-poll.sh: python3 
 # Secret → 0600 header file; the value never appears in argv or output.
 hdrs_file="$(mktemp "${TMPDIR:-/tmp}/a2a-poll-hdrs.XXXXXX")"
 cleanup() { rm -f "$hdrs_file" 2>/dev/null || :; }
-trap cleanup EXIT: > "$hdrs_file"
+trap cleanup EXIT
+: > "$hdrs_file"
 if [ -n "$secret_file" ]; then
   case "$secret_file" in
     *:*)
