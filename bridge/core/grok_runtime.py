@@ -6,6 +6,7 @@ Local interruption retires the handle and retains the remote unknown outcome.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, Protocol
 
@@ -18,6 +19,7 @@ from .grok_protocol import (
     AcceptedPrompt, Baseline, MAX_PROMPT, ProtocolError, _text, accepted_prompt,
     bound_reply, capture_baseline, check_host, check_idle,
 )
+from .turn_stall import register_turn_liveness
 
 
 class GrokTransport(Protocol):
@@ -27,11 +29,55 @@ class GrokTransport(Protocol):
     async def call(self, operation: str, arguments: Any = None) -> Any: ...
 
 
+class GrokTurnLiveness:
+    """Turn-liveness source over a :class:`GrokRuntime`'s session (#1741).
+
+    Last activity is the last completed host RPC (status/health/tail/send
+    all ride ``GrokRuntime._call``). The engine is a remote host Bot with
+    no locally observable process: no transport can prove it dead from
+    here, so the verdict fails closed to "unknown" unless the transport
+    itself exposes an honest ``engine_verdict`` — a hung Grok turn is
+    logged by the stall probe but never auto-recovered on a guess.
+    """
+
+    def __init__(self, runtime: GrokRuntime) -> None:
+        self._runtime = runtime
+
+    def _session(self, session_id: str) -> GrokSession | None:
+        session = self._runtime._session
+        if session is None or session.closed:
+            return None
+        if session.session_id != session_id:
+            return None
+        return session
+
+    def last_activity(self, session_id: str) -> float | None:
+        if self._session(session_id) is None:
+            return None
+        return self._runtime._last_activity
+
+    def engine_verdict(self, session_id: str) -> str:
+        if self._session(session_id) is None:
+            return "unknown"
+        getter = getattr(self._runtime.transport, "engine_verdict", None)
+        if not callable(getter):
+            return "unknown"
+        try:
+            verdict = getter()
+        except Exception:
+            return "unknown"
+        return verdict if verdict in ("alive", "dead", "unknown") else "unknown"
+
+
 class GrokRuntime:
     def __init__(self, journal: GrokJournal, transport: GrokTransport):
         self.journal, self.transport = journal, transport
         self._session: GrokSession | None = None
+        self._last_activity: float | None = None
         self._check_binding()
+        # Provider-agnostic turn-stall coverage (#1741): one registry slot
+        # per provider, so a newer GrokRuntime replaces this registration.
+        register_turn_liveness("grok", GrokTurnLiveness(self))
 
     def _check_binding(self) -> None:
         if (self.transport.destination != self.journal.binding.destination
@@ -62,6 +108,8 @@ class GrokRuntime:
         self._check_binding()
         result = await self.transport.call(operation, arguments)
         self._check_binding()
+        # A completed host RPC is the turn's last-activity signal (#1741).
+        self._last_activity = time.monotonic()
         if operation == "status":
             check_host(result)
         return result

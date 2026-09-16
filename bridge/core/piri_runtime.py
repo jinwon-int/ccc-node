@@ -31,6 +31,7 @@ from .agent_runtime import (
 )
 from .piri_rpc import PiriRpcProcessClient
 from .codex_runtime import _run_codex_memory_bootstrap
+from .turn_stall import register_turn_liveness, unregister_turn_liveness
 from .working_state_archive import (
     ArchiveEvent,
     archive_working_state,
@@ -104,6 +105,52 @@ class _MemoryRoute:
     session_directory: Path
     context_file: Path
     bootstrap_environment: Mapping[str, str]
+
+
+class PiriTurnLiveness:
+    """Turn-liveness source over a :class:`PiriRuntime`'s live sessions (#1741).
+
+    Last activity comes from the session's RPC client (monotonic timestamp
+    of the last frame exchanged with the Piri process); the engine verdict
+    from the same client's process state. Clients without the liveness
+    surface — scripted fakes, older transports — report "no signal"/
+    ``"unknown"``, which the stall probe reads as a fail-closed no-op.
+    """
+
+    def __init__(self, runtime: PiriRuntime) -> None:
+        self._runtime = runtime
+
+    def _session(self, session_id: str) -> PiriSession | None:
+        for session in tuple(self._runtime._sessions):
+            if session.session_id == session_id:
+                return session
+        return None
+
+    def last_activity(self, session_id: str) -> float | None:
+        session = self._session(session_id)
+        if session is None:
+            return None
+        getter = getattr(session._client, "last_activity_monotonic", None)
+        if not callable(getter):
+            return None
+        try:
+            value = getter()
+        except Exception:
+            return None
+        return float(value) if value is not None else None
+
+    def engine_verdict(self, session_id: str) -> str:
+        session = self._session(session_id)
+        if session is None:
+            return "unknown"
+        getter = getattr(session._client, "engine_verdict", None)
+        if not callable(getter):
+            return "unknown"
+        try:
+            verdict = getter()
+        except Exception:
+            return "unknown"
+        return verdict if verdict in ("alive", "dead", "unknown") else "unknown"
 
 
 class PiriSession:
@@ -366,6 +413,12 @@ class PiriRuntime:
         self._memory_environment_validator = memory_environment_validator
         self._route_environment_factory = route_environment_factory
         self._session_directories: dict[str, Path] = {}
+        # Provider-agnostic turn-stall coverage (#1741): register this
+        # runtime's liveness source so the stall probe can see Piri turns.
+        # The registry keeps one slot per provider; a newer registration
+        # replaces this one and the replaced turns read as "no signal".
+        self._turn_liveness = PiriTurnLiveness(self)
+        register_turn_liveness("piri", self._turn_liveness)
 
     async def start_or_resume(self, request: SessionRequest) -> PiriSession:
         _validate_full_access_request(request)
@@ -656,6 +709,7 @@ class PiriRuntime:
         return False
 
     async def close(self) -> None:
+        unregister_turn_liveness("piri", self._turn_liveness)
         sessions = tuple(self._sessions)
         self._sessions.clear()
         await asyncio.gather(*(session.close() for session in sessions), return_exceptions=True)

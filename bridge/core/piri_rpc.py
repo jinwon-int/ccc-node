@@ -8,6 +8,7 @@ from contextlib import suppress
 import json
 import os
 import signal
+import time
 from typing import Any, TypeAlias, cast
 
 from telegram_bot.core.jsonl_frames import read_jsonl_frame
@@ -75,6 +76,35 @@ class PiriRpcProcessClient:
         self._next_id = 1
         self._closed = False
         self._connection_error: PiriConnectionClosedError | None = None
+        # Monotonic timestamp of the last RPC frame written or read — the
+        # provider-agnostic turn-stall probe's last-activity signal (#1741).
+        self._last_activity: float | None = None
+
+    def _note_activity(self) -> None:
+        self._last_activity = time.monotonic()
+
+    def last_activity_monotonic(self) -> float | None:
+        """Monotonic time of the last RPC frame exchanged with the process.
+
+        ``None`` before the first frame — the stall probe reads that as "no
+        signal for this session" and fails closed rather than guessing.
+        """
+        return self._last_activity
+
+    def engine_verdict(self) -> str:
+        """#1741 stall-probe verdict for the underlying Piri process.
+
+        A live process is "alive"; a process that exited on its own while
+        the client is still open is the one confirmable death ("dead"). A
+        deliberately closed client or a never-started one cannot classify
+        honestly and reports "unknown" (a fail-closed no-op for the probe).
+        """
+        process = self._process
+        if self._closed or process is None:
+            return "unknown"
+        if process.returncode is not None:
+            return "dead"
+        return "alive"
 
     async def start(self) -> None:
         """Start the subprocess and its stdout/stderr drain tasks."""
@@ -223,6 +253,7 @@ class PiriRpcProcessClient:
                 await process.stdin.drain()
             except (BrokenPipeError, ConnectionResetError) as exc:
                 raise PiriConnectionClosedError("Piri RPC stdin closed") from exc
+        self._note_activity()
 
     async def _read_stdout(self) -> None:
         process = self._process
@@ -230,6 +261,7 @@ class PiriRpcProcessClient:
             return
         try:
             while line := await read_jsonl_frame(process.stdout):
+                self._note_activity()
                 try:
                     decoded = json.loads(line)
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
