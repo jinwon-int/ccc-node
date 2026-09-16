@@ -179,6 +179,17 @@ chmod 600 "$hdrs_file" 2>/dev/null || :
 
 poll_count=0
 poll_ok_count=0
+
+# Append one evidence line and force owner-only mode on the log. Append-only
+# means existing lines are never rewritten; tightening the mode is not a
+# content change. A log inherited from a wider-umask writer (the #1760 CI
+# failure) must not stay group/world-readable just because this process did
+# not create it.
+log_line() { # <log_path> <line>
+  printf '%s\n' "$2" >> "$1"
+  chmod 600 "$1" 2>/dev/null || :
+}
+
 for i in "${!tasks[@]}"; do
   task_id="${tasks[$i]}"
   log_path="${logs[$i]}"
@@ -191,14 +202,14 @@ import sys, urllib.parse
 base, task_id = sys.argv[1], sys.argv[2]
 print(base.rstrip("/") + "/tasks/" + urllib.parse.quote(task_id, safe=""))
 PY
-)" || { printf '%s state=fetch-failed\n' "$ts" >> "$log_path"; continue; }
+)" || { log_line "$log_path" "$ts state=fetch-failed"; continue; }
 
   body_file="$(mktemp "${TMPDIR:-/tmp}/a2a-poll-body.XXXXXX")"
   code="$(curl -sS --max-time "$http_timeout" --header @"$hdrs_file" \
                -o "$body_file" -w '%{http_code}' "$task_url" 2>/dev/null)"
   curl_rc=$?
   if [ "$curl_rc" -ne 0 ] || [ -z "$code" ]; then
-    printf '%s state=fetch-failed\n' "$ts" >> "$log_path"
+    log_line "$log_path" "$ts state=fetch-failed"
     rm -f "$body_file"
     continue
   fi
@@ -208,17 +219,17 @@ PY
       status="$(printf '%s\n' "$classified" | sed -n 's/^status=//p')"
       pr_url="$(printf '%s\n' "$classified" | sed -n 's/^pr_url=//p')"
       rm -f "$body_file"
-      printf '%s state=%s\n' "$ts" "${status:-unparseable}" >> "$log_path"
+      log_line "$log_path" "$ts state=${status:-unparseable}"
       case "$status" in
         succeeded|failed|canceled)
-          printf '%s pr=%s\n' "$ts" "${pr_url:-none-in-broker-result}" >> "$log_path"
+          log_line "$log_path" "$ts pr=${pr_url:-none-in-broker-result}"
           ;;
       esac
       poll_ok_count=$((poll_ok_count + 1))
       ;;
     *)
       # 4xx/5xx or an empty code: record the observable fact, never a guess.
-      printf '%s state=http-%s\n' "$ts" "${code:-none}" >> "$log_path"
+      log_line "$log_path" "$ts state=http-${code:-none}"
       rm -f "$body_file"
       ;;
   esac

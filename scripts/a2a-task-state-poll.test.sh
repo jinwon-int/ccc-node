@@ -207,9 +207,13 @@ class PollerTest(unittest.TestCase):
         self.assertEqual(secrets, {"test-secret-value-xyz"})
 
     def test_log_file_is_private_and_append_only(self):
+        # The poller must tighten a pre-existing log to 0600 (the #1760 CI
+        # failure: under umask 0022 the fixture log was 0644 and stayed that
+        # way), and must never rewrite the lines it inherited.
         log = self.log_path()
         with open(log, "w", encoding="utf-8") as fh:
             fh.write("2026-09-15T23:33:32+0900 state=running\n")
+        os.chmod(log, 0o644)  # simulate a wider-umask writer
         self.broker.routes["/tasks/t-app"] = body_succeeded_flat()
         self.run_watch([("t-app", log)])
         lines = self.lines(log)
@@ -272,6 +276,8 @@ class PollerTest(unittest.TestCase):
             {"status": "unparseable", "pr_url": "none-in-broker-result"})
 
 
-if __name__ == "__main__":
-    unittest.main()
+result = unittest.main(exit=False).result
+failed = len(result.failures) + len(result.errors)
+print(f"PASS={max(0, result.testsRun - failed)} FAIL={failed}")
+raise SystemExit(0 if result.wasSuccessful() else 1)
 PY
