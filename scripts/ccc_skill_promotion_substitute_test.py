@@ -45,7 +45,7 @@ def aged_row(node: str, name: str, ts: str | None = None) -> dict:
     now pinned to its producer by DeferralSchemaTests below."""
     ts = ts or iso(days_ago=14)
     return {"kind": "a2a-revise-deferred", "code": "revise_author_offline",
-            "node": node, "name": name, "ts": ts}
+            "node": node, "name": name, "ts": ts, "skipped_at": ts}
 
 
 def iso(*, days_ago: int) -> str:
@@ -117,9 +117,32 @@ class DeferralSchemaTests(unittest.TestCase):
 
     def test_recorded_deferral_satisfies_the_age_gate(self):
         """End to end: a real recorded row, aged, makes the gate fire."""
-        record = dict(self._recorded(), ts=iso(days_ago=14))
+        aged = iso(days_ago=14)
+        record = dict(self._recorded(), ts=aged, skipped_at=aged)
         cfg = config(7)
         self.assertTrue(promotion._revise_substitute_due(cfg, [record], "gwakga", "s1"))
+
+    def test_age_counts_the_skip_not_the_row(self):
+        """#1628: a deferral reconstructed today for an old skip is due now.
+
+        The drain that reopens verdicts consumed before #1768 writes rows whose
+        `ts` is today but whose `skipped_at` is when the author was actually
+        found offline — weeks earlier. Counting `ts` would restart every stalled
+        lineage's clock at zero and hide it behind the threshold all over again.
+        """
+        record = dict(self._recorded(), ts=iso(days_ago=0), skipped_at=iso(days_ago=18))
+        self.assertTrue(promotion._revise_substitute_due(config(7), [record], "gwakga", "s1"))
+
+    def test_fresh_skip_recorded_today_is_still_not_due(self):
+        """The converse: a genuinely fresh skip must not become due early."""
+        record = dict(self._recorded(), ts=iso(days_ago=0), skipped_at=iso(days_ago=0))
+        self.assertFalse(promotion._revise_substitute_due(config(7), [record], "gwakga", "s1"))
+
+    def test_rows_without_skipped_at_fall_back_to_ts(self):
+        """Deferrals written by #1768 predate the field and must still age."""
+        legacy = aged_row("gwakga", "s1")
+        legacy.pop("skipped_at")
+        self.assertTrue(promotion._revise_substitute_due(config(7), [legacy], "gwakga", "s1"))
 
     def test_fixture_keys_match_the_producer(self):
         """aged_row may not drift back into inventing a schema."""
@@ -161,6 +184,74 @@ class DeferralSchemaTests(unittest.TestCase):
                 config(7), [], {"dispatched_task": "t"}, [], "nosuk",
                 {"outcome": "revise-dispatched"})
         self.assertEqual(written, [])
+
+
+class ReviserExclusionTests(unittest.TestCase):
+    """#1628 B2: "author ∪ prior reviser disqualified" for review rounds.
+
+    A substitute revise republishes the revised tree as a fresh intake PR whose
+    author is still the original node. Reviewer selection disqualified only the
+    author, so the node that wrote the revision stayed eligible to review it —
+    self-review, which policies/REVIEW.md forbids and which the B2 design named
+    as a required exclusion that was never implemented.
+    """
+
+    ONLINE = ["node-author", "node-beta", "node-gamma"]
+
+    def _pick(self, rows: list[dict], online: list[str] | None = None) -> str:
+        with patch.multiple(
+            promotion,
+            _ledger_rows=lambda c: rows,
+            _keyring_worker_ids=lambda c: self.ONLINE,
+            _broker_online_worker_ids=lambda c, s: online or self.ONLINE,
+            _remote_online_worker_ids=lambda c, rb: [],
+        ):
+            cfg = types.SimpleNamespace(remote_brokers=(), broker_url="https://p.example")
+            reviewer, _ = promotion._dispatch_target_worker(
+                cfg, "node-author", "secret",
+                disqualified=promotion._lineage_revisers(cfg, "node-author", "sample"))
+            return reviewer
+
+    def _revise_row(self, **over) -> dict:
+        row = {"kind": "a2a-revise-dispatch", "node": "node-author", "name": "sample",
+               "reviser_node": "node-beta", "substitute": True}
+        row.update(over)
+        return row
+
+    def test_prior_substitute_reviser_cannot_review_its_own_revision(self):
+        for _ in range(20):
+            self.assertEqual(self._pick([self._revise_row()]), "node-gamma")
+
+    def test_author_only_revision_does_not_shrink_the_pool(self):
+        """A normal (non-substitute) revise is done by the author, already excluded."""
+        rows = [self._revise_row(reviser_node="node-author", substitute=False)]
+        self.assertIn(self._pick(rows), {"node-beta", "node-gamma"})
+
+    def test_exclusion_is_scoped_to_the_lineage(self):
+        rows = [self._revise_row(name="other-skill"), self._revise_row(node="node-other")]
+        self.assertIn(self._pick(rows), {"node-beta", "node-gamma"})
+
+    def test_every_prior_reviser_is_excluded_not_just_the_last(self):
+        rows = [self._revise_row(reviser_node="node-beta"),
+                self._revise_row(reviser_node="node-gamma")]
+        with self.assertRaises(promotion.PromotionError) as caught:
+            self._pick(rows)
+        self.assertEqual(caught.exception.code, "dispatch_no_reviewer_online")
+
+    def test_empty_pool_fails_closed_rather_than_self_reviewing(self):
+        rows = [self._revise_row(reviser_node="node-beta")]
+        with self.assertRaises(promotion.PromotionError) as caught:
+            self._pick(rows, online=["node-author", "node-beta"])
+        self.assertEqual(caught.exception.code, "dispatch_no_reviewer_online")
+
+    def test_malformed_reviser_values_are_ignored(self):
+        for bad in [None, "", 0, [], {}]:
+            with self.subTest(reviser=bad):
+                rows = [self._revise_row(reviser_node=bad)]
+                self.assertIn(self._pick(rows), {"node-beta", "node-gamma"})
+
+    def test_no_revise_history_keeps_prior_behaviour(self):
+        self.assertIn(self._pick([]), {"node-beta", "node-gamma"})
 
 
 class SubstitutePickTests(unittest.TestCase):
