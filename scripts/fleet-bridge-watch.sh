@@ -8,6 +8,12 @@
 #   1. availability — the bridge answers "Bot status: available". "degraded"
 #                     (alive, but start.sh has lost the bookkeeping that makes
 #                     it restartable) is reported as DEGRADED, not DOWN.
+#                     A node migrated to Danso (danso #118) answers through
+#                     `danso service status --json` instead; its exit code
+#                     carries the same three states plus an explicit
+#                     "could not determine". Such a node reports KIND=danso,
+#                     a RUNTIME that is a binary path rather than a checkout
+#                     root, and the GENERATION (sha256) of that binary.
 #   2. canonical    — the checkout it serves from is one the fleet installs at,
 #                     not a PR/issue work tree
 #   3. boot path    — the systemd unit that would restart the bridge points at
@@ -40,6 +46,10 @@
 #                    capped at 5; only UNREACHABLE is retried — a node that
 #                    answers, even DOWN, is judged on its single answer)
 #   CCC_FLEET_RETRY_DELAY seconds between attempts (default 10, capped at 120)
+#   CCC_FLEET_CANONICAL_DANSO_EXES space-separated glob list of binary paths a
+#                    Danso node may serve from. Empty by default, which means no
+#                    canonicality verdict is made for Danso nodes — see the
+#                    comment beside is_canonical_danso_exe.
 #   CCC_FLEET_PREPARED_ROOTS space-separated glob list of preparation roots under
 #                    which an activated prepared runtime (#1527) may serve;
 #                    see is_prepared_runtime
@@ -83,6 +93,24 @@ is_canonical_root() {
 # root is that job's own `source` sibling. Patterns, never resolved paths: the
 # judged paths are remote (see is_canonical_root).
 PREPARED_ROOTS="${CCC_FLEET_PREPARED_ROOTS:-/data/data/com.termux/files/home/.ccc-node/preparations /home/*/.ccc-node/preparations /root/.ccc-node/preparations}"
+
+# Binary paths a Danso node may legitimately serve from. Empty by default: the
+# fleet has no agreed install path yet, and a guessed list is the stale-table
+# defect described in the header. While it is empty no canonicality verdict is
+# made for Danso nodes — their generation is still reported, so an operator can
+# see what each node is running.
+CANON_DANSO_EXES="${CCC_FLEET_CANONICAL_DANSO_EXES:-}"
+
+is_canonical_danso_exe() {
+  _exe=$1 _hit=1
+  set -f
+  for _pat in $CANON_DANSO_EXES; do
+    # shellcheck disable=SC2254  # $_pat is a glob on purpose
+    case "$_exe" in $_pat) _hit=0; break ;; esac
+  done
+  set +f
+  return $_hit
+}
 is_prepared_runtime() {
   _root=$1 _job=$2 _hit=1
   [ -n "$_job" ] && [ "$_job" != "-" ] || return 1
@@ -103,7 +131,64 @@ read -r -d '' PROBE <<'PROBE_EOF' || true
 # uid, not user: the `user` column truncates names longer than 8 characters
 # ("gongmyoung" -> "gongmyo+"), and the truncated form is not a valid su target.
 line=$(ps -eo uid=,command= 2>/dev/null | grep 'telegram_bot' | grep -- '--path' | grep -v grep | head -1)
-if [ -z "$line" ]; then echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; echo "PREPARED=-"; exit 0; fi
+if [ -z "$line" ]; then
+  # No ccc bridge. Before calling the node down, look for a Danso resident
+  # service. On a migrated node the serving process is `<exe> service run
+  # --data-dir <d>`: it carries neither `telegram_bot` nor `--path`, so the
+  # match above cannot see it and the node would page DOWN while answering
+  # Telegram normally — the same false-DOWN class as #1761 (danso #118 4-a).
+  dline=$(ps -eo uid=,command= 2>/dev/null | grep -- 'service run' | grep 'danso' | grep -v grep | head -1)
+  if [ -n "$dline" ]; then
+    druid=$(printf '%s' "$dline" | awk '{print $1}')
+    druser=$(id -nu "$druid" 2>/dev/null || printf '%s' "$druid")
+    dexe=$(printf '%s' "$dline" | sed 's/^ *[0-9][0-9]* *//' | awk '{print $1}')
+    echo "KIND=danso"
+    # `--json`, not the text form: the text is a human rendering, while the JSON
+    # also carries the runtime generation. The EXIT CODE, not the printed state,
+    # is the availability signal — it is the same 0/1/2/3 contract the text's
+    # first line describes, and it cannot be garbled by locale or encoding.
+    if [ "$(id -u)" = "$druid" ]; then
+      dj=$("$dexe" service status --json 2>/dev/null); drc=$?
+    elif [ "$(id -u)" != 0 ]; then
+      dj=$(sudo -n -H -u "$druser" -- "$dexe" service status --json 2>/dev/null); drc=$?
+    else
+      dj=$(su - "$druser" -c "'$dexe' service status --json" 2>/dev/null); drc=$?
+    fi
+    case "$drc" in
+      0) echo "AVAIL=yes" ;;
+      1) echo "AVAIL=degraded" ;;
+      2) echo "AVAIL=no" ;;
+      # Exit 3 is danso's explicit "could not determine", and any other code is
+      # a failed inspection. Neither is evidence that the live process is down.
+      *) echo "AVAIL=unverified" ;;
+    esac
+    # The path the service is actually running from, and the digest of that
+    # image. "The unit restarted" is not evidence that a self-update replaced
+    # anything — a restart that re-execs the same image reports success while
+    # the generation is unchanged. The digest is the evidence.
+    dpath=$(printf '%s' "$dj" | sed -n 's/.*"exe_path":"\([^"]*\)".*/\1/p' | head -1)
+    dgen=$(printf '%s' "$dj" | sed -n 's/.*"binary_sha256":"\([^"]*\)".*/\1/p' | head -1)
+    echo "RUNTIME=${dpath:-$dexe}"
+    echo "GENERATION=${dgen:--}"
+    dunit_exe=""
+    for u in /etc/systemd/system/danso.service /root/.config/systemd/user/danso.service /home/*/.config/systemd/user/danso.service; do
+      [ -f "$u" ] || continue
+      dexec=$(grep -m1 '^ExecStart=' "$u" 2>/dev/null | sed 's/^ExecStart=//')
+      [ -n "$dexec" ] || continue
+      dunit_exe=$(printf '%s' "$dexec" | awk '{print $1}')
+      [ -n "$dunit_exe" ] && break
+    done
+    echo "UNIT=${dunit_exe:--}"
+    # Neither applies to a Danso node: ccc-doctor inspects a ccc checkout, and
+    # the dual-domain checks are about the gongmyoung bridge account.
+    echo "DOCTOR=-"
+    echo "DUALDOMAIN=-"
+    echo "PREPARED=-"
+    exit 0
+  fi
+  echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; echo "PREPARED=-"; exit 0
+fi
+echo "KIND=ccc"
 runuid=$(printf '%s' "$line" | awk '{print $1}')
 runuser=$(id -nu "$runuid" 2>/dev/null || printf '%s' "$runuid")
 cmd=$(printf '%s' "$line" | sed 's/^ *[0-9][0-9]* *//')
@@ -317,6 +402,10 @@ $PROBE"
 
   avail=$(printf '%s\n' "$out" | sed -n 's/^AVAIL=//p' | head -1)
   runtime=$(printf '%s\n' "$out" | sed -n 's/^RUNTIME=//p' | head -1)
+  # Absent on a node running an older probe, which is a ccc node by definition.
+  kind=$(printf '%s\n' "$out" | sed -n 's/^KIND=//p' | head -1)
+  [ -n "$kind" ] || kind=ccc
+  generation=$(printf '%s\n' "$out" | sed -n 's/^GENERATION=//p' | head -1)
   unit=$(printf '%s\n' "$out" | sed -n 's/^UNIT=//p' | head -1)
 
   # DEGRADED is still a failure — an unmanaged bridge cannot be restarted by
@@ -347,9 +436,25 @@ $PROBE"
   # root is that job's own source sibling — a job pointing at some other
   # checkout is exactly the shape the check exists to catch. The launch stays
   # visible in the OK line so an operator can tell it from a plain checkout.
+  #
+  # A Danso node's runtime is a BINARY path, not a checkout root, so the
+  # ccc-node glob list cannot judge it. Applying it anyway would report
+  # NONCANONICAL for every healthy Danso node — the cry-wolf failure the rest
+  # of this file exists to prevent.
+  #
+  # No substitute glob list is invented here. The equivalent question for a
+  # binary is "is this the generation we published?", and that answer belongs
+  # to the signed-release model (danso #119), not to a hardcoded path table —
+  # the "hardcoded table goes stale silently" defect named in the header. Until
+  # that exists, an operator may opt in with an explicit allowlist; the default
+  # is empty, so the check does not run rather than guessing an answer.
   prepared=$(printf '%s\n' "$out" | sed -n 's/^PREPARED=//p' | head -1)
   prepared_tag=""
-  if ! is_canonical_root "$runtime"; then
+  if [ "$kind" = danso ]; then
+    if [ -n "$CANON_DANSO_EXES" ] && ! is_canonical_danso_exe "$runtime"; then
+      echo "NONCANONICAL $node runtime=$runtime"; fail=1; continue
+    fi
+  elif ! is_canonical_root "$runtime"; then
     if is_prepared_runtime "$runtime" "$prepared"; then
       prep_dir=${prepared%/*}
       prepared_tag=", prepared:${prep_dir##*/}"
@@ -377,6 +482,14 @@ $PROBE"
     fail\ *) echo "DUALDOMAIN $node ${dual#fail }"; fail=1; continue ;;
   esac
 
-  echo "OK $node ($runtime$prepared_tag)"
+  # The generation is shown for Danso nodes because nothing else identifies
+  # which image is serving: two nodes at the same path can be running different
+  # binaries, and a restart that re-execs the same image looks identical to one
+  # that replaced it. Short form only — the full digest is in the probe output.
+  gen_tag=""
+  if [ "$kind" = danso ] && [ -n "$generation" ] && [ "$generation" != "-" ]; then
+    gen_tag=", generation:$(printf '%s' "$generation" | cut -c1-12)"
+  fi
+  echo "OK $node ($runtime$prepared_tag$gen_tag)"
 done
 exit $fail

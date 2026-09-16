@@ -432,5 +432,139 @@ ok "unready receipt withholds the job but keeps the root" \
 PATH="$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/plain-out"
 ok "plain worker still reports its own root" 'grep -q "^RUNTIME=$TMP/probe-repo$" "$TMP/plain-out" && grep -q "^PREPARED=-$" "$TMP/plain-out"'
 
+# ---- Danso nodes (danso #118 4-a) -----------------------------------------
+# A migrated node reports a binary path as its runtime, plus the generation of
+# that binary. The caller must not judge it with the ccc-node checkout globs.
+dreply() { # <node> <runtime-exe> <avail> <unit-exe> <generation>
+  printf 'KIND=danso\nRUNTIME=%s\nAVAIL=%s\nUNIT=%s\nGENERATION=%s\nPREPARED=-\n' \
+    "$2" "$3" "$4" "$5" > "$TMP/reply/$1"
+}
+
+GEN=aaaaaaaaaaaabbbbbbbbbbbbccccccccccccddddddddddddeeeeeeeeeeeeffff
+dreply delta /usr/local/bin/danso yes /usr/local/bin/danso "$GEN"
+run "delta"
+okc "$RC" 0 "a healthy danso node exits 0"
+ok "danso node is not judged by the ccc checkout globs" '! grep -q "^NONCANONICAL" "$OUT"'
+ok "danso OK line carries the generation" 'grep -q "^OK delta (/usr/local/bin/danso, generation:aaaaaaaaaaaa)" "$OUT"'
+
+# The same runtime under a ccc node WOULD be non-canonical: proves the branch
+# is what spares it, not that the check silently stopped working for everyone.
+reply epsilon /usr/local/bin/danso yes /usr/local/bin/danso
+run "epsilon"
+okc "$RC" 1 "the same path on a ccc node is still non-canonical"
+ok "ccc node still reports NONCANONICAL" 'grep -q "^NONCANONICAL epsilon" "$OUT"'
+
+# Opt-in allowlist: empty by default, enforced when set.
+dreply zeta /work/build/danso yes /work/build/danso "$GEN"
+run "zeta"
+okc "$RC" 0 "no danso allowlist means no canonicality verdict"
+CANON_SAVE="${CCC_FLEET_CANONICAL_DANSO_EXES:-}"
+OUT="$TMP/out"; RC=0
+CCC_FLEET_NODES="zeta" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ \
+  CCC_FLEET_RETRY_DELAY=0 CCC_FLEET_CANONICAL_DANSO_EXES="/usr/local/bin/danso" \
+  bash "$SC" >"$OUT" 2>&1 || RC=$?
+okc "$RC" 1 "an allowlist, once set, rejects an unlisted binary"
+ok "unlisted danso binary reported" 'grep -q "^NONCANONICAL zeta runtime=/work/build/danso" "$OUT"'
+export CCC_FLEET_CANONICAL_DANSO_EXES="$CANON_SAVE"
+
+# Availability states survive the danso path unchanged.
+dreply eta /usr/local/bin/danso degraded /usr/local/bin/danso "$GEN"
+run "eta"
+ok "danso degraded is DEGRADED, not DOWN" 'grep -q "^DEGRADED eta" "$OUT"'
+dreply theta /usr/local/bin/danso unverified /usr/local/bin/danso "$GEN"
+run "theta"
+ok "danso unverified is UNVERIFIED, not DOWN" 'grep -q "^UNVERIFIED theta" "$OUT"'
+
+# Boot path still compares: a unit pointing at a different binary is the same
+# "next reboot serves the wrong thing" failure as on a ccc node.
+dreply iota /usr/local/bin/danso yes /opt/danso/bin/danso "$GEN"
+run "iota"
+okc "$RC" 1 "a danso unit pointing elsewhere is reported"
+ok "danso bootpath mismatch reported" 'grep -q "^BOOTPATH iota unit=/opt/danso/bin/danso runtime=/usr/local/bin/danso" "$OUT"'
+
+# An older probe emits no KIND line; it must still be treated as a ccc node.
+reply kappa /opt/ccc-node yes /opt/ccc-node
+run "kappa"
+ok "a probe without KIND is still judged as ccc" 'grep -q "^OK kappa (/opt/ccc-node)" "$OUT"'
+
+# ---- Danso probe body ------------------------------------------------------
+# Stub ps so the probe sees a danso service and no ccc bridge, and stub the
+# danso binary so its exit code drives AVAIL. The uid matches the `id -u` stub
+# (1000) so the probe runs the binary directly: that is the path whose JSON
+# parsing and exit-code mapping are under test. The privileged routing is
+# exercised separately below — a stub that answers for the binary would prove
+# nothing about either.
+mkdir -p "$TMP/danso-bin"
+cat > "$TMP/danso-bin/ps" <<EOF
+#!$(command -v sh)
+echo "1000 $TMP/danso-bin/danso service run --data-dir $TMP/probe-home/.danso/telegram"
+EOF
+cat > "$TMP/danso-bin/danso" <<EOF
+#!$(command -v sh)
+printf '%s' '{"state":"available","pid":42,"runtime_generation":{"schema":"danso.runtime-generation.v1","binary_sha256":"$GEN","version":"0.1.0","exe_path":"/usr/local/bin/danso","observed_at":"2026-09-16T00:00:00Z"},"mutations":{}}'
+exit \${DANSO_RC:-0}
+EOF
+chmod +x "$TMP/danso-bin/"*
+PATH="$TMP/danso-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/danso-out"
+ok "danso service is seen, not reported DOWN" 'grep -q "^AVAIL=yes$" "$TMP/danso-out"'
+ok "probe marks the node kind"               'grep -q "^KIND=danso$" "$TMP/danso-out"'
+ok "runtime comes from the json exe_path"    'grep -q "^RUNTIME=/usr/local/bin/danso$" "$TMP/danso-out"'
+ok "generation is reported"                  "grep -q '^GENERATION=$GEN\$' \"\$TMP/danso-out\""
+ok "danso node reports no ccc doctor/dualdomain" \
+  'grep -q "^DOCTOR=-$" "$TMP/danso-out" && grep -q "^DUALDOMAIN=-$" "$TMP/danso-out"'
+
+for rc_case in "1 degraded" "2 no" "3 unverified"; do
+  set -- $rc_case
+  PATH="$TMP/danso-bin:$TMP/probe-bin:$PATH" DANSO_RC="$1" sh "$TMP/owner-probe.sh" > "$TMP/danso-out"
+  ok "danso exit $1 maps to AVAIL=$2" "grep -q '^AVAIL=$2\$' \"\$TMP/danso-out\""
+done
+# Any unexpected code is a failed inspection, never evidence of a down service.
+PATH="$TMP/danso-bin:$TMP/probe-bin:$PATH" DANSO_RC=77 sh "$TMP/owner-probe.sh" > "$TMP/danso-out"
+ok "an unknown danso exit code is unverified, not down" 'grep -q "^AVAIL=unverified$" "$TMP/danso-out"'
+
+# When the JSON carries no exe_path the process path is used rather than
+# reporting nothing: the node is serving and the operator needs to know from
+# where, even if the report was truncated.
+cat > "$TMP/danso-bin/danso" <<EOF
+#!$(command -v sh)
+printf '%s' '{"state":"available","mutations":{}}'
+EOF
+chmod +x "$TMP/danso-bin/danso"
+PATH="$TMP/danso-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/danso-out"
+ok "a json without a generation falls back to the process path" \
+  'grep -q "^RUNTIME=$TMP/danso-bin/danso$" "$TMP/danso-out" && grep -q "^GENERATION=-$" "$TMP/danso-out"'
+
+# Root-owned danso service reached from an unprivileged account: the probe must
+# use the same noninteractive sudo path the ccc branch uses, and never su.
+mkdir -p "$TMP/danso-root-bin"
+cat > "$TMP/danso-root-bin/ps" <<EOF
+#!$(command -v sh)
+echo "0 /usr/local/bin/danso service run --data-dir $TMP/probe-home/.danso/telegram"
+EOF
+cat > "$TMP/danso-root-bin/sudo" <<EOF
+#!$(command -v sh)
+printf '%s\n' "\$*" >> "$TMP/danso-sudo-calls"
+printf '%s' '{"state":"available","runtime_generation":{"binary_sha256":"$GEN","exe_path":"/usr/local/bin/danso"},"mutations":{}}'
+exit 0
+EOF
+chmod +x "$TMP/danso-root-bin/"*
+: > "$TMP/danso-sudo-calls"
+PATH="$TMP/danso-root-bin:$TMP/danso-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/danso-root-out"
+ok "root-owned danso service is reached through noninteractive sudo" \
+  'grep -q -- "-n -H -u root -- /usr/local/bin/danso service status --json" "$TMP/danso-sudo-calls"'
+ok "root-owned danso service is available" 'grep -q "^AVAIL=yes$" "$TMP/danso-root-out"'
+ok "no su fallback was taken" '[ ! -s "$TMP/su-calls" ] || ! grep -q danso "$TMP/su-calls"'
+
+# No ccc bridge and no danso service: still DOWN, as before.
+mkdir -p "$TMP/empty-bin"
+cat > "$TMP/empty-bin/ps" <<EOF
+#!$(command -v sh)
+exit 0
+EOF
+chmod +x "$TMP/empty-bin/ps"
+PATH="$TMP/empty-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/empty-out"
+ok "a node with neither runtime is still DOWN" \
+  'grep -q "^AVAIL=no$" "$TMP/empty-out" && grep -q "^RUNTIME=-$" "$TMP/empty-out" && ! grep -q "^KIND=danso$" "$TMP/empty-out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
