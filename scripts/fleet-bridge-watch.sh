@@ -40,6 +40,9 @@
 #                    capped at 5; only UNREACHABLE is retried — a node that
 #                    answers, even DOWN, is judged on its single answer)
 #   CCC_FLEET_RETRY_DELAY seconds between attempts (default 10, capped at 120)
+#   CCC_FLEET_PREPARED_ROOTS space-separated glob list of preparation roots under
+#                    which an activated prepared runtime (#1527) may serve;
+#                    see is_prepared_runtime
 set -u
 
 NODES="${CCC_FLEET_NODES:-seoseo dungae sogyo nosuk bangtong yukson soonwook gwakga jingun gongmyoung gongyung daegyo}"
@@ -72,20 +75,69 @@ is_canonical_root() {
   return $_hit
 }
 
+# Activated Termux prepared runtime (#1527, #1761). The self-update stages a
+# checkout of the target sha under `<prep>/source` and its venv under
+# `<prep>/job`, then hands the bridge to `start.sh --prepared-runtime <prep>/job`.
+# Accepted only when all three hold: the probe reported a completed job (its
+# receipt says ready), the job sits under a preparation root, and the serving
+# root is that job's own `source` sibling. Patterns, never resolved paths: the
+# judged paths are remote (see is_canonical_root).
+PREPARED_ROOTS="${CCC_FLEET_PREPARED_ROOTS:-/data/data/com.termux/files/home/.ccc-node/preparations /home/*/.ccc-node/preparations /root/.ccc-node/preparations}"
+is_prepared_runtime() {
+  _root=$1 _job=$2 _hit=1
+  [ -n "$_job" ] && [ "$_job" != "-" ] || return 1
+  case "$_job" in */job) ;; *) return 1 ;; esac
+  _prep=${_job%/job}
+  [ "$_root" = "$_prep/source" ] || return 1
+  set -f
+  for _pat in $PREPARED_ROOTS; do
+    # shellcheck disable=SC2254  # $_pat is a glob on purpose
+    case "$_prep" in $_pat/*) _hit=0; break ;; esac
+  done
+  set +f
+  return $_hit
+}
+
 # POSIX sh, runs on every node including Termux. Emits KEY=VALUE lines only.
 read -r -d '' PROBE <<'PROBE_EOF' || true
 # uid, not user: the `user` column truncates names longer than 8 characters
 # ("gongmyoung" -> "gongmyo+"), and the truncated form is not a valid su target.
 line=$(ps -eo uid=,command= 2>/dev/null | grep 'telegram_bot' | grep -- '--path' | grep -v grep | head -1)
-if [ -z "$line" ]; then echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; exit 0; fi
+if [ -z "$line" ]; then echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; echo "PREPARED=-"; exit 0; fi
 runuid=$(printf '%s' "$line" | awk '{print $1}')
 runuser=$(id -nu "$runuid" 2>/dev/null || printf '%s' "$runuid")
 cmd=$(printf '%s' "$line" | sed 's/^ *[0-9][0-9]* *//')
 root=""
 for tok in $cmd; do case "$tok" in */bridge/*) root=${tok%%/bridge/*}; break ;; esac; done
 bpath=$(printf '%s' "$cmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i+1); exit}}')
-[ -n "$root" ] || { echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; exit 0; }
+# Prepared runtime (docs/prepared-runtime-launch.md, #1527): the worker is
+# `<job>/runtime/bin/python -m telegram_bot`, so its command line carries no
+# `/bridge/` token and the root cannot be read from it. The supervisor that
+# spawned it names both halves — `<source>/bridge/start.sh --path <p>
+# --_daemon_supervisor --prepared-runtime <job>` — so read the root and the job
+# from there. On 2026-09-16 the missing root made this probe answer AVAIL=no
+# for daegyo while its bridge was answering Telegram (#1761). The supervisor
+# is consulted whenever it exists, so a prepared launch is reported even when
+# the worker line happens to carry a /bridge/ path.
+prepared=""
+sup=$(ps -eo uid=,command= 2>/dev/null | grep -- '--_daemon_supervisor' | grep -- '/bridge/start.sh' | grep -v grep | head -1)
+if [ -n "$sup" ]; then
+  supcmd=$(printf '%s' "$sup" | sed 's/^ *[0-9][0-9]* *//')
+  prepared=$(printf '%s' "$supcmd" | awk '{for(i=1;i<NF;i++) if($i=="--prepared-runtime") {print $(i+1); exit}}')
+  if [ -z "$root" ]; then
+    for tok in $supcmd; do case "$tok" in */bridge/*) root=${tok%%/bridge/*}; break ;; esac; done
+    [ -n "$bpath" ] || bpath=$(printf '%s' "$supcmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i+1); exit}}')
+  fi
+fi
+[ -n "$root" ] || { echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; echo "PREPARED=-"; exit 0; }
 echo "RUNTIME=$root"
+# The job is reported only when its receipt says the preparation completed;
+# an unfinished or absent receipt leaves the launch to the canonical-root check.
+if [ -n "$prepared" ] && grep -q '"status": *"ready"' "$prepared/receipt.json" 2>/dev/null; then
+  echo "PREPARED=$prepared"
+else
+  echo "PREPARED=-"
+fi
 
 # availability — run start.sh as the account that owns the process.
 # Name the interpreter (the #1160 defect class): shebang-exec'ing start.sh
@@ -287,8 +339,23 @@ $PROBE"
   # serving from a work tree is already running unreviewed code, whether or not
   # its unit agrees. Agreement on a wrong path is the worse state, not the
   # better one, because it is the state that survives a restart.
+  #
+  # A prepared runtime is the one sanctioned exception: the Termux self-update
+  # activates `<prep>/source` with the venv in `<prep>/job` (#1527), and that
+  # source is a fresh checkout of the target sha, not a work tree. It is
+  # accepted only when the supervisor named a completed job AND the serving
+  # root is that job's own source sibling — a job pointing at some other
+  # checkout is exactly the shape the check exists to catch. The launch stays
+  # visible in the OK line so an operator can tell it from a plain checkout.
+  prepared=$(printf '%s\n' "$out" | sed -n 's/^PREPARED=//p' | head -1)
+  prepared_tag=""
   if ! is_canonical_root "$runtime"; then
-    echo "NONCANONICAL $node runtime=$runtime"; fail=1; continue
+    if is_prepared_runtime "$runtime" "$prepared"; then
+      prep_dir=${prepared%/*}
+      prepared_tag=", prepared:${prep_dir##*/}"
+    else
+      echo "NONCANONICAL $node runtime=$runtime"; fail=1; continue
+    fi
   fi
 
   # A unit pointing elsewhere is silent while the bridge is up: the next reboot
@@ -310,6 +377,6 @@ $PROBE"
     fail\ *) echo "DUALDOMAIN $node ${dual#fail }"; fail=1; continue ;;
   esac
 
-  echo "OK $node ($runtime)"
+  echo "OK $node ($runtime$prepared_tag)"
 done
 exit $fail
