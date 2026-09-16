@@ -349,5 +349,88 @@ run beta
 okc "$RC" 1 "unverified inspection still alerts"
 ok "unverified has distinct failure classification" 'grep -q "^UNVERIFIED beta runtime=/opt/ccc-node$" "$OUT" && ! grep -q "^DOWN beta" "$OUT"'
 
+# ---- activated Termux prepared runtime (#1527, #1761) ----------------------
+# The daegyo 2026-09-16 shape: the self-update activated `<prep>/source` with
+# the venv in `<prep>/job`. The bridge answered Telegram, yet the watch paged
+# DOWN because the worker's interpreter path carries no /bridge/ token, and even
+# with the root known the source is not a canonical checkout root.
+reply_p() { # <node> <runtime> <avail> <unit> <prepared-job>
+  printf 'RUNTIME=%s\nAVAIL=%s\nUNIT=%s\nPREPARED=%s\n' "$2" "$3" "$4" "$5" > "$TMP/reply/$1"
+}
+TX=/data/data/com.termux/files/home
+reply_p dg "$TX/.ccc-node/preparations/self-update-4fd1575-20260916/source" yes - "$TX/.ccc-node/preparations/self-update-4fd1575-20260916/job"
+run "dg"
+okc "$RC" 0 "activated prepared runtime passes"
+ok "prepared launch is OK and names the job" \
+  'grep -q "^OK dg ($TX/.ccc-node/preparations/self-update-4fd1575-20260916/source, prepared:self-update-4fd1575-20260916)$" "$OUT"'
+ok "prepared launch is not NONCANONICAL" '! grep -q "^NONCANONICAL dg" "$OUT"'
+
+# The job must vouch for THIS root: a completed job next to some other serving
+# checkout is a work tree with a receipt nearby, not an activated runtime.
+reply_p dg /work/agent-codebench/ccc-node-pr833 yes - "$TX/.ccc-node/preparations/self-update-4fd1575-20260916/job"
+run "dg"
+okc "$RC" 1 "prepared job does not vouch for a foreign root"
+ok "foreign root with a job nearby is NONCANONICAL" 'grep -q "^NONCANONICAL dg runtime=/work/agent-codebench/ccc-node-pr833" "$OUT"'
+
+# A preparation source without a completed job (PREPARED=-) is a plain
+# non-canonical checkout: the probe withholds the job when the receipt is not
+# ready, and the caller must not infer readiness from the path alone.
+reply "dg" "$TX/.ccc-node/preparations/self-update-4fd1575-20260916/source" yes -
+run "dg"
+okc "$RC" 1 "preparation source without a ready job exits nonzero"
+ok "unready preparation is NONCANONICAL" 'grep -q "^NONCANONICAL dg runtime=$TX/.ccc-node/preparations/self-update-4fd1575-20260916/source" "$OUT"'
+
+# Preparation roots are a pattern list like the canonical roots.
+reply_p dg /srv/.ccc-node/preparations/self-update-x/source yes - /srv/.ccc-node/preparations/self-update-x/job
+run "dg"
+okc "$RC" 1 "unknown preparation root flagged by default"
+OUT="$TMP/out"; RC=0
+CCC_FLEET_NODES="dg" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ \
+  CCC_FLEET_PREPARED_ROOTS="/srv/.ccc-node/preparations" bash "$SC" >"$OUT" 2>&1 || RC=$?
+okc "$RC" 0 "CCC_FLEET_PREPARED_ROOTS override accepted"
+ok "overridden preparation root reports OK" 'grep -q "^OK dg (/srv/.ccc-node/preparations/self-update-x/source, prepared:self-update-x)$" "$OUT"'
+
+# Availability still outranks it: a down prepared bridge is DOWN.
+reply_p dg "$TX/.ccc-node/preparations/self-update-4fd1575-20260916/source" no - "$TX/.ccc-node/preparations/self-update-4fd1575-20260916/job"
+run "dg"
+ok "down prepared bridge is DOWN, not OK" 'grep -q "^DOWN dg" "$OUT" && ! grep -q "^OK dg" "$OUT"'
+
+# A canonical checkout is unaffected by the new line, and older probes that
+# emit no PREPARED line keep their verdict.
+reply_p alpha /opt/ccc-node yes /opt/ccc-node -
+run "alpha"
+okc "$RC" 0 "canonical root with PREPARED=- passes"
+ok "canonical root has no prepared tag" 'grep -q "^OK alpha (/opt/ccc-node)$" "$OUT"'
+
+# Execute the remote body against the daegyo process shape: the worker line
+# has no /bridge/ token; the supervisor names the source and the job.
+mkdir -p "$TMP/prep/source/bridge" "$TMP/prep/job/runtime/bin" "$TMP/prep-bin"
+printf '{"schema": "ccc.termux-preparation.v1", "status": "ready"}\n' > "$TMP/prep/job/receipt.json"
+cat > "$TMP/prep-bin/ps" <<EOF
+#!$(command -v sh)
+echo "0 bash $TMP/prep/source/bridge/start.sh --path $TMP/probe-home --_daemon_supervisor --prepared-runtime $TMP/prep/job"
+echo "0 $TMP/prep/job/runtime/bin/python -m telegram_bot --path $TMP/probe-home"
+EOF
+chmod +x "$TMP/prep-bin/ps"
+: > "$TMP/sudo-calls"
+PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
+ok "prepared worker resolves the root from its supervisor" 'grep -q "^RUNTIME=$TMP/prep/source$" "$TMP/prep-out"'
+ok "prepared worker is available, not DOWN"                'grep -q "^AVAIL=yes$" "$TMP/prep-out"'
+ok "probe reports the completed job"                       'grep -q "^PREPARED=$TMP/prep/job$" "$TMP/prep-out"'
+ok "status runs the serving source start.sh with the worker path" \
+  'grep -q -- "-n -H -u root -- bash $TMP/prep/source/bridge/start.sh --path $TMP/probe-home --status" "$TMP/sudo-calls"'
+
+# Receipt not ready: the root is still found (the bridge is up), the job is not
+# vouched for, and the caller then classifies the source as non-canonical.
+printf '{"schema": "ccc.termux-preparation.v1", "status": "failed"}\n' > "$TMP/prep/job/receipt.json"
+PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
+ok "unready receipt withholds the job but keeps the root" \
+  'grep -q "^PREPARED=-$" "$TMP/prep-out" && grep -q "^RUNTIME=$TMP/prep/source$" "$TMP/prep-out" && grep -q "^AVAIL=yes$" "$TMP/prep-out"'
+
+# A plain worker (interpreter under <root>/bridge/venv) still reads the root
+# from its own line and reports PREPARED=- when no supervisor names a job.
+PATH="$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/plain-out"
+ok "plain worker still reports its own root" 'grep -q "^RUNTIME=$TMP/probe-repo$" "$TMP/plain-out" && grep -q "^PREPARED=-$" "$TMP/plain-out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
