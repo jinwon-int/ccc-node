@@ -2006,12 +2006,48 @@ def _broker_task_gated(config: Config, row: dict[str, object], task_id: str, sec
     return None, "missing"
 
 
-def _dispatch_target_worker(config: Config, author_node: str, secret: str) -> tuple[str, dict[str, str] | None]:
+def _lineage_revisers(config: Config, node: str, name: str) -> set[str]:
+    """Nodes that have already revised this skill lineage as a substitute.
+
+    #1628 B2: a substitute revise hands the work to a node that is neither the
+    author nor that round's reviewer. The revised tree is then republished as a
+    fresh intake PR whose author is still the original node — so reviewer
+    selection, which disqualifies only the author, would happily draw the very
+    node that wrote the revision. It must not review its own work."""
+    revisers: set[str] = set()
+    for row in _ledger_rows(config):
+        if row.get("kind") != "a2a-revise-dispatch":
+            continue
+        if row.get("node") != node or row.get("name") != name:
+            continue
+        reviser = row.get("reviser_node")
+        if isinstance(reviser, str) and reviser and reviser != node:
+            revisers.add(reviser)
+    return revisers
+
+
+def _dispatch_target_worker(
+    config: Config,
+    author_node: str,
+    secret: str,
+    *,
+    disqualified: set[str] | None = None,
+) -> tuple[str, dict[str, str] | None]:
     """Pick a reviewer for the dispatch target broker: keyring workers minus
-    the author, intersected with that broker's online workers. A keyring
-    worker registered on the OTHER broker would 404 at task creation (#2011
-    rollout, 2026-08-29: daegyo is T2-homed while seoseo dispatches on T1).
-    The broker also enforces author disqualification independently.
+    the author and minus `disqualified`, intersected with that broker's online
+    workers. A keyring worker registered on the OTHER broker would 404 at task
+    creation (#2011 rollout, 2026-08-29: daegyo is T2-homed while seoseo
+    dispatches on T1). The broker also enforces author disqualification
+    independently.
+
+    #1628 B2: `disqualified` carries the lineage's prior substitute revisers.
+    The B2 design requires the review-round exclusion to widen from "author is
+    disqualified" to "author ∪ prior reviser is disqualified" — without it a
+    substitute revise is followed by a review round that can draw the reviser
+    itself, which is self-review and fails the author/reviewer separation in
+    policies/REVIEW.md. Excluding them can empty the pool, which raises
+    dispatch_no_reviewer_online: fail-closed, and strictly better than a
+    review nobody can trust.
 
     #2024: the primary broker is searched first (unchanged behavior), then
     each configured remote broker in order. Returns (node, remote_broker)
@@ -2027,14 +2063,15 @@ def _dispatch_target_worker(config: Config, author_node: str, secret: str) -> tu
     keeps one bad node from being a single point of failure. Broker-side
     author disqualification is unchanged, and the candidate set is still
     sorted first so the draw is over a stable, deduplicated sequence."""
+    blocked = {author_node} | (disqualified or set())
     keyring_workers = _keyring_worker_ids(config)
     primary = _broker_online_worker_ids(config, secret)
-    candidates = sorted(w for w in keyring_workers if w != author_node and w in primary)
+    candidates = sorted(w for w in keyring_workers if w not in blocked and w in primary)
     if candidates:
         return _pick_reviewer(candidates), None
     for rb in config.remote_brokers:
         online = _remote_online_worker_ids(config, rb)
-        candidates = sorted(w for w in keyring_workers if w != author_node and w in online)
+        candidates = sorted(w for w in keyring_workers if w not in blocked and w in online)
         if candidates:
             return _pick_reviewer(candidates), rb
     raise PromotionError("dispatch_no_reviewer_online")
@@ -2269,7 +2306,15 @@ def _dispatch_intake_review(  # noqa: C901
             doc_name="skills-intake-review.md",
             end_marker=_DISPATCH_DOC_END,
         )
-        reviewer, review_rb = _dispatch_target_worker(config, candidate.node, secret)
+        reviewer, review_rb = _dispatch_target_worker(
+            config,
+            candidate.node,
+            secret,
+            # #1628 B2: a republished tree keeps the original author, so the
+            # node that actually wrote the revision is invisible to author-only
+            # disqualification. Exclude it explicitly.
+            disqualified=_lineage_revisers(config, candidate.node, candidate.name),
+        )
         if review_rb is None:
             nexus_script = config.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"
             if not nexus_script.is_file():
@@ -2895,7 +2940,15 @@ def _revise_substitute_due(
     writes as {ts, kind, pr, head_sha, marker} — no node, no name. The
     node/name filter below therefore matched nothing and the gate was dead
     regardless of configuration. The deferral rows are the correct source:
-    they are written for exactly this skip and carry the lineage keys."""
+    they are written for exactly this skip and carry the lineage keys.
+
+    #1628: the age is read from `skipped_at`, not `ts`. They are the same
+    instant for a deferral recorded at skip time, but they measure different
+    things and diverge whenever a deferral is reconstructed for a skip that
+    already happened: `ts` is when this row was written (what the sweep's
+    retry ceiling counts), `skipped_at` is when the author was found offline
+    (what "the author has been away long enough" counts). Reading `ts` here
+    would restart an eighteen-day-old stall's clock at zero."""
     after = getattr(config, "revise_substitute_after_days", 0)
     if not isinstance(after, int) or after <= 0:
         return False
@@ -2907,7 +2960,7 @@ def _revise_substitute_due(
             continue
         if str(item.get("code", "")) != "revise_author_offline":
             continue
-        skipped_at = _parse_ledger_ts(item.get("ts"))
+        skipped_at = _parse_ledger_ts(item.get("skipped_at") or item.get("ts"))
         if skipped_at is not None and (oldest is None or skipped_at < oldest):
             oldest = skipped_at
     if oldest is None:
@@ -3302,8 +3355,14 @@ def _record_deferred_revise(
         for item in rows
     ):
         return
+    now = _utc_now()
     record: dict[str, object] = {
-        "ts": _utc_now(),
+        "ts": now,
+        # #1628: when the author was found offline, as distinct from when this
+        # row was written. Identical here, but a deferral reconstructed for an
+        # older skip carries the real instant, and the substitute age gate
+        # counts from it rather than restarting the stall clock at zero.
+        "skipped_at": now,
         "kind": "a2a-revise-deferred",
         "code": code,
         "dispatched_task": row.get("dispatched_task"),
