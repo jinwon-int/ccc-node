@@ -34,9 +34,25 @@ def config(substitute_days: int) -> types.SimpleNamespace:
 
 
 def aged_row(node: str, name: str, ts: str | None = None) -> dict:
-    ts = ts or (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y%m%dT%H%M%SZ")
-    return {"kind": "a2a-revise-comment", "node": node, "name": name,
-            "marker": "round-limit:revise_author_offline", "ts": ts}
+    """An author-offline deferral as _record_deferred_revise actually writes it.
+
+    #1767: this fixture used to fabricate a row shape production never
+    emitted — kind "a2a-revise-comment" with node/name keys (_comment_once
+    writes only ts/kind/pr/head_sha/marker) and a compact "%Y%m%dT%H%M%SZ"
+    stamp (_utc_now emits extended ISO). Both mismatches made the gate answer
+    "not due" for every real row while this suite stayed green, so the whole
+    B2 feature was dead in production and tested as working. The fixture is
+    now pinned to its producer by DeferralSchemaTests below."""
+    ts = ts or iso(days_ago=14)
+    return {"kind": "a2a-revise-deferred", "code": "revise_author_offline",
+            "node": node, "name": name, "ts": ts}
+
+
+def iso(*, days_ago: int) -> str:
+    """A timestamp in the exact format _utc_now writes to the ledger."""
+    return (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
 
 class SubstituteDueTests(unittest.TestCase):
@@ -58,7 +74,7 @@ class SubstituteDueTests(unittest.TestCase):
 
     def test_fresh_skip_is_not_due(self):
         cfg = config(7)
-        rows = [aged_row("gwakga", "s1", ts=(datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y%m%dT%H%M%SZ"))]
+        rows = [aged_row("gwakga", "s1", ts=iso(days_ago=1))]
         with patch.multiple(promotion, _keyring_worker_ids=lambda c: ["gwakga", "nosuk", "yukson"],
                             _broker_online_worker_ids=lambda c, s: [],
                             _remote_online_worker_ids=lambda c, rb: []):
@@ -66,11 +82,85 @@ class SubstituteDueTests(unittest.TestCase):
 
     def test_unrelated_rows_never_make_it_due(self):
         cfg = config(7)
-        rows = [aged_row("gwakga", "other-skill"), {"kind": "a2a-revise-comment", "ts": "20260901T000000Z"}]
+        rows = [aged_row("gwakga", "other-skill"),
+                {"kind": "a2a-revise-deferred", "code": "revise_author_offline",
+                 "ts": iso(days_ago=30)}]
         with patch.multiple(promotion, _keyring_worker_ids=lambda c: ["gwakga", "nosuk", "yukson"],
                             _broker_online_worker_ids=lambda c, s: [],
                             _remote_online_worker_ids=lambda c, rb: []):
             self.assertFalse(promotion._revise_substitute_due(cfg, rows, "gwakga", "s1"))
+
+
+class DeferralSchemaTests(unittest.TestCase):
+    """#1767: the gate and its fixtures must read the row production writes.
+
+    These are the tests whose absence let three independent defects ship as a
+    working feature: the gate read a key set no producer emitted, parsed a
+    timestamp format no producer emitted, and was never exercised end to end.
+    """
+
+    def _recorded(self) -> dict:
+        written: list[dict] = []
+        row = {"dispatched_task": "task-1"}
+        with patch.multiple(
+            promotion,
+            _revise_dispatch_target=lambda r: (
+                "gwakga", "s1", "abc123abc123", "42", "claude", "f" * 40, "https://x/42"),
+            _append_ledger=lambda c, record: written.append(record),
+            _utc_now=lambda: iso(days_ago=0),
+        ):
+            promotion._record_deferred_revise(
+                config(7), [], row, [{"title": "f"}], "nosuk",
+                {"outcome": "revise-skipped", "code": "revise_author_offline"})
+        self.assertEqual(len(written), 1)
+        return written[0]
+
+    def test_recorded_deferral_satisfies_the_age_gate(self):
+        """End to end: a real recorded row, aged, makes the gate fire."""
+        record = dict(self._recorded(), ts=iso(days_ago=14))
+        cfg = config(7)
+        self.assertTrue(promotion._revise_substitute_due(cfg, [record], "gwakga", "s1"))
+
+    def test_fixture_keys_match_the_producer(self):
+        """aged_row may not drift back into inventing a schema."""
+        produced = self._recorded()
+        fixture = aged_row("gwakga", "s1")
+        for key in fixture:
+            self.assertIn(key, produced, f"fixture key {key!r} is not written by production")
+        self.assertEqual(fixture["kind"], produced["kind"])
+        self.assertEqual(fixture["code"], produced["code"])
+
+    def test_comment_rows_can_never_satisfy_the_gate(self):
+        """The old source: _comment_once writes no node/name, so it cannot."""
+        comment = {"ts": iso(days_ago=0), "kind": "a2a-revise-comment", "pr": "42",
+                   "head_sha": "f" * 40, "marker": "revise-verdict:revise_author_offline"}
+        self.assertNotIn("node", comment)
+        aged = dict(comment, ts=iso(days_ago=99))
+        self.assertFalse(promotion._revise_substitute_due(config(7), [aged], "gwakga", "s1"))
+
+    def test_ledger_timestamp_format_is_parsed(self):
+        """_utc_now emits extended ISO; the compact form must still read."""
+        self.assertIsNotNone(promotion._parse_ledger_ts("2026-08-31T03:12:15Z"))
+        self.assertIsNotNone(promotion._parse_ledger_ts("20260831T031215Z"))
+        for bad in ["", None, "not-a-time", 17, "2026-13-45T99:99:99Z"]:
+            self.assertIsNone(promotion._parse_ledger_ts(bad), bad)
+
+    def test_structural_skips_are_not_deferred(self):
+        written: list[dict] = []
+        with patch.multiple(
+            promotion,
+            _revise_dispatch_target=lambda r: (
+                "gwakga", "s1", "abc123abc123", "42", "claude", "f" * 40, "https://x/42"),
+            _append_ledger=lambda c, record: written.append(record),
+        ):
+            for code in ["revise_canon_lane", "revise_record_invalid", "revise_round_failed"]:
+                promotion._record_deferred_revise(
+                    config(7), [], {"dispatched_task": "t"}, [], "nosuk",
+                    {"outcome": "revise-skipped", "code": code})
+            promotion._record_deferred_revise(
+                config(7), [], {"dispatched_task": "t"}, [], "nosuk",
+                {"outcome": "revise-dispatched"})
+        self.assertEqual(written, [])
 
 
 class SubstitutePickTests(unittest.TestCase):
