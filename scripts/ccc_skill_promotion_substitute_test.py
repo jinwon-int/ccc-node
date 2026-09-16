@@ -168,7 +168,9 @@ class DeferralSchemaTests(unittest.TestCase):
         for bad in ["", None, "not-a-time", 17, "2026-13-45T99:99:99Z"]:
             self.assertIsNone(promotion._parse_ledger_ts(bad), bad)
 
-    def test_structural_skips_are_not_deferred(self):
+    STRUCTURAL = ["revise_canon_lane", "revise_record_invalid", "revise_round_failed"]
+
+    def _record(self, outcome: dict) -> list[dict]:
         written: list[dict] = []
         with patch.multiple(
             promotion,
@@ -176,14 +178,40 @@ class DeferralSchemaTests(unittest.TestCase):
                 "gwakga", "s1", "abc123abc123", "42", "claude", "f" * 40, "https://x/42"),
             _append_ledger=lambda c, record: written.append(record),
         ):
-            for code in ["revise_canon_lane", "revise_record_invalid", "revise_round_failed"]:
-                promotion._record_deferred_revise(
-                    config(7), [], {"dispatched_task": "t"}, [], "nosuk",
-                    {"outcome": "revise-skipped", "code": code})
             promotion._record_deferred_revise(
-                config(7), [], {"dispatched_task": "t"}, [], "nosuk",
-                {"outcome": "revise-dispatched"})
-        self.assertEqual(written, [])
+                config(7), [], {"dispatched_task": "t"}, [{"note": "n"}], "nosuk", outcome)
+        return written
+
+    def test_structural_skips_preserve_their_findings(self):
+        """#1770: a round that will never run is exactly when findings die.
+
+        A revision round is the only consumer that reads findings back, so a
+        canon-lane or invalid-record skip loses them as permanently as an
+        author-offline skip did. Recording is about survival, not retry.
+        """
+        for code in self.STRUCTURAL:
+            with self.subTest(code=code):
+                written = self._record({"outcome": "revise-skipped", "code": code})
+                self.assertEqual(len(written), 1)
+                self.assertEqual(written[0]["code"], code)
+                self.assertEqual(written[0]["findings"], [{"note": "n"}])
+
+    def test_structural_skips_are_never_retried(self):
+        """Recorded is not retryable — the sweep must ignore every one."""
+        now = datetime.now(timezone.utc)
+        for code in self.STRUCTURAL:
+            with self.subTest(code=code):
+                row = self._record({"outcome": "revise-skipped", "code": code})[0]
+                self.assertEqual(promotion._deferred_revise_due([row], now), [])
+
+    def test_author_offline_skip_is_still_retried(self):
+        row = self._record(
+            {"outcome": "revise-skipped", "code": "revise_author_offline"})[0]
+        self.assertEqual(
+            promotion._deferred_revise_due([row], datetime.now(timezone.utc)), [row])
+
+    def test_successful_dispatch_records_nothing(self):
+        self.assertEqual(self._record({"outcome": "revise-dispatched"}), [])
 
 
 class ReviserExclusionTests(unittest.TestCase):

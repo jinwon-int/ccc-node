@@ -1923,6 +1923,7 @@ ok "danso collection acknowledges and retains the envelope" \
 echo "PASS=$pass FAIL=$fail"
 python3 "$HERE/ccc_skill_promotion_substitute_test.py" || fail=$((fail+1))
 python3 "$HERE/ccc_skill_promotion_deferred_revise_test.py" || fail=$((fail+1))
+python3 "$HERE/ccc_skill_verdict_findings_limit_test.py" || fail=$((fail+1))
 python3 "$HERE/ccc_skill_promotion_danso_test.py" || fail=$((fail+1))
 python3 "$HERE/ccc_skill_receipt_retry_test.py" || fail=$((fail+1))
 [ "$fail" -eq 0 ]
