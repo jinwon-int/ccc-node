@@ -2865,36 +2865,54 @@ def _revise_target_broker(config: Config, node: str, secret: str) -> dict[str, s
     raise PromotionError("revise_author_offline")
 
 
+def _parse_ledger_ts(stamp: object) -> datetime | None:
+    """Parse a ledger timestamp into an aware UTC datetime, or None.
+
+    #1767: ledger rows are stamped by _utc_now (= _secure_fs.utc_now_iso),
+    which emits extended ISO-8601 ("2026-08-31T03:12:15Z"). The DOC-3366 age
+    gate parsed them with the *compact* "%Y%m%dT%H%M%S" form, so every real
+    row raised ValueError and the gate silently answered "not due" — forever.
+    Both forms are accepted here so pre-existing compact rows still read."""
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    for text, fmt in ((stamp[:15], "%Y%m%dT%H%M%S"), (stamp[:19], "%Y-%m-%dT%H:%M:%S")):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
 def _revise_substitute_due(
     config: Config, rows: list[dict[str, object]], node: str, name: str
 ) -> bool:
     """DOC-3366 B2 gate: a substitute may take the revise only after the
     author-offline skip has aged past config.revise_substitute_after_days.
-    0 (default) keeps the skip exactly as before — no dispatch, and the
-    doctor stall warning remains the only signal."""
+    0 (default) keeps the skip exactly as before — no substitute dispatch, and
+    the author-node retry in _sweep_deferred_revises remains the only recovery.
+
+    #1767: the age was read from a2a-revise-comment rows, which _comment_once
+    writes as {ts, kind, pr, head_sha, marker} — no node, no name. The
+    node/name filter below therefore matched nothing and the gate was dead
+    regardless of configuration. The deferral rows are the correct source:
+    they are written for exactly this skip and carry the lineage keys."""
     after = getattr(config, "revise_substitute_after_days", 0)
     if not isinstance(after, int) or after <= 0:
         return False
-    oldest: str | None = None
+    oldest: datetime | None = None
     for item in rows:
-        if item.get("kind") != "a2a-revise-comment":
+        if item.get("kind") != "a2a-revise-deferred":
             continue
         if item.get("node") != node or item.get("name") != name:
             continue
-        if "revise_author_offline" not in str(item.get("marker", "")):
+        if str(item.get("code", "")) != "revise_author_offline":
             continue
-        stamp = item.get("ts")
-        if isinstance(stamp, str) and (oldest is None or stamp < oldest):
-            oldest = stamp
+        skipped_at = _parse_ledger_ts(item.get("ts"))
+        if skipped_at is not None and (oldest is None or skipped_at < oldest):
+            oldest = skipped_at
     if oldest is None:
         return False
-    try:
-        skipped_at = datetime.strptime(
-            oldest[:15], "%Y%m%dT%H%M%S"
-        ).replace(tzinfo=timezone.utc)
-    except ValueError:
-        return False
-    return (datetime.now(timezone.utc) - skipped_at).days >= after
+    return (datetime.now(timezone.utc) - oldest).days >= after
 
 
 def _revise_substitute_pick(
@@ -3216,6 +3234,18 @@ def _dispatch_intake_revise(
 _REVISE_PROVIDER_VOCABULARY = ("claude", "codex", "shared", "bridge", "piri", "danso")
 
 
+# #1767: skip codes whose cause is transient — the dispatch inputs stay valid
+# and an unchanged retry on a later collect can succeed. A structural skip
+# (canon lane, invalid record, round limit) never becomes dispatchable by
+# waiting, so it is not deferred and keeps its terminal behaviour.
+_REVISE_DEFERRABLE_CODES = frozenset({"revise_author_offline"})
+
+# Upper bound on how long a deferred revision keeps being retried. Past this
+# the intake PR is stale enough that a human should decide; the sweep stops
+# touching it rather than retrying against a long-dead node forever.
+_REVISE_DEFERRED_MAX_AGE_DAYS = 14
+
+
 # #1370: human-readable explanations for a consumed revise verdict whose R2
 # dispatch did not reach a revision round. The raw skip code stays in the text
 # (backticked) so operators can grep the PR for the exact reason.
@@ -3224,11 +3254,159 @@ _REVISE_SKIP_NOTES = {
     "revise_daily_cap": "revision dispatch deferred: the daily revision cap is reached — a later review cycle can dispatch it",
     "revise_already": "a revision for this PR head was already dispatched",
     "revise_nexus_missing": "revision dispatch unavailable: `a2a-dispatch-round.mjs` was not found in the nexus checkout",
-    "revise_author_offline": "revision dispatch skipped: the author node is not currently an online broker worker — the findings below stay visible for human follow-up",
+    "revise_author_offline": (
+        "revision dispatch deferred: the author node is not currently an online broker worker. "
+        "The findings below stay visible for human follow-up, and a later collect retries the "
+        f"round automatically for up to {_REVISE_DEFERRED_MAX_AGE_DAYS} days once the author "
+        "node is back online"
+    ),
     "revise_canon_lane": "revision dispatch skipped: canon harness lanes (skills maintained inside the ccc-node repo) are revised through ccc-node PRs, not broker revision rounds — the findings below stay visible for human follow-up",
     "revise_record_invalid": "revision dispatch skipped: the review-dispatch ledger record failed validation",
     "revise_round_failed": "revision dispatch failed (transport or handler error) — no automatic retry; human judgment continues on this PR",
 }
+
+
+def _record_deferred_revise(
+    config: Config,
+    rows: list[dict[str, object]],
+    row: dict[str, object],
+    findings: list[dict[str, str]],
+    reviewer: str,
+    outcome: dict[str, object],
+) -> None:
+    """Persist everything a deferred revision round will need (#1767).
+
+    A verdict is consumed exactly once. When the R2 dispatch skipped only
+    because the author node happened to be offline at that moment, the
+    reviewer's findings — the sole input a revision round needs — were
+    discarded with it, so no later cycle could ever dispatch the round: the
+    revise was starved permanently, not delayed. Recording the findings plus
+    the lineage keys makes the skip recoverable by _sweep_deferred_revises.
+
+    Best-effort and fail-safe like the dispatch itself: a ledger write failure
+    must never turn a consumed verdict into an error. The PR comment posted by
+    the caller still carries the findings for human follow-up."""
+    if outcome.get("outcome") != "revise-skipped":
+        return
+    code = outcome.get("code")
+    if not isinstance(code, str) or code not in _REVISE_DEFERRABLE_CODES:
+        return
+    target = _revise_dispatch_target(row)
+    if isinstance(target, str):
+        return
+    node, name, _tree12, pr, _provider, head, _pr_url = target
+    if any(
+        item.get("kind") == "a2a-revise-deferred"
+        and item.get("pr") == pr
+        and item.get("head_sha") == head
+        for item in rows
+    ):
+        return
+    record: dict[str, object] = {
+        "ts": _utc_now(),
+        "kind": "a2a-revise-deferred",
+        "code": code,
+        "dispatched_task": row.get("dispatched_task"),
+        "pr": pr,
+        "head_sha": head,
+        "node": node,
+        "name": name,
+        "reviewer_node": reviewer,
+        "findings": findings,
+    }
+    try:
+        _append_ledger(config, record)
+    except PromotionError:
+        return
+    rows.append(record)
+
+
+def _deferred_revise_due(
+    rows: list[dict[str, object]], now: datetime
+) -> list[dict[str, object]]:
+    """Deferred revisions still worth retrying, oldest first (#1767): not yet
+    dispatched for that exact head, and not aged past the retry bound."""
+    due: list[dict[str, object]] = []
+    for item in rows:
+        if item.get("kind") != "a2a-revise-deferred":
+            continue
+        pr = item.get("pr")
+        head = item.get("head_sha")
+        if not isinstance(pr, str) or not isinstance(head, str) or not pr or not head:
+            continue
+        if not isinstance(item.get("findings"), list):
+            continue
+        # The round may have been dispatched later by any path — the retry
+        # below would answer revise_already, but filtering here keeps the
+        # bounded per-cycle budget for rows that can still do work.
+        if _revise_dispatched(rows, pr, head):
+            continue
+        deferred_at = _parse_ledger_ts(item.get("ts"))
+        if deferred_at is None:
+            continue
+        if (now - deferred_at).days > _REVISE_DEFERRED_MAX_AGE_DAYS:
+            continue
+        due.append(item)
+    return due
+
+
+def _sweep_deferred_revises(config: Config, *, dry_run: bool) -> list[dict[str, object]]:
+    """Retry revision rounds whose dispatch was deferred by a transient skip.
+
+    #1767: _dispatch_intake_revise had exactly one call site — the moment a
+    verdict is consumed — and the author-offline skip is evaluated at that same
+    moment, when the skip is zero seconds old. Nothing re-entered the dispatch
+    path afterwards, so an author node that was merely offline during one
+    collect lost its revision round permanently. This is that missing
+    re-evaluation pass.
+
+    Bounded exactly like the verdict poll: oldest first, at most
+    collect_window per cycle. Every existing cap still applies unchanged
+    because the retry goes through _dispatch_intake_revise itself — round
+    limit, daily cap, already-dispatched, and broker-of-record gating."""
+    rows = _ledger_rows(config)
+    due = _deferred_revise_due(rows, datetime.now(timezone.utc))
+    swept: list[dict[str, object]] = []
+    for item in due[: config.collect_window]:
+        pr = str(item.get("pr"))
+        if dry_run:
+            swept.append({"outcome": "would-retry-deferred-revise", "pr": pr})
+            continue
+        origin = next(
+            (
+                candidate
+                for candidate in rows
+                if candidate.get("kind") == "a2a-dispatch"
+                and candidate.get("dispatched_task") == item.get("dispatched_task")
+            ),
+            None,
+        )
+        if origin is None:
+            swept.append(
+                {"outcome": "deferred-revise-skipped", "pr": pr, "code": "origin_row_missing"}
+            )
+            continue
+        findings = [
+            finding for finding in item["findings"] if isinstance(finding, dict)
+        ]
+        outcome = _dispatch_intake_revise(
+            config,
+            origin,
+            rows,
+            findings,
+            str(item.get("reviewer_node", "unknown")),
+            dry_run=False,
+        )
+        swept.append({"outcome": "deferred-revise-retry", "pr": pr, "result": outcome})
+    if len(due) > config.collect_window:
+        swept.append(
+            {
+                "outcome": "deferred-revise-window-overflow",
+                "deferred": len(due),
+                "window": config.collect_window,
+            }
+        )
+    return swept
 
 
 def _revise_outcome_note(outcome: dict[str, object]) -> str:
@@ -3603,6 +3781,18 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
             # collects from duplicating the same head+reason. A successful
             # dispatch already posted the comment (with the round note), so its
             # note is empty and nothing is added here.
+            # #1767: before the findings go out of scope with the consumed
+            # verdict, persist them if the skip was merely transient. Without
+            # this the author-offline skip is terminal — no later cycle can
+            # reconstruct the round's inputs.
+            _record_deferred_revise(
+                config,
+                rows,
+                row,
+                findings,
+                str(row.get("reviewer_node", "unknown")),
+                revise_outcome,
+            )
             revise_note = _revise_outcome_note(revise_outcome)
             if revise_note:
                 _comment_once(
@@ -4537,11 +4727,14 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
             errors.append({"source": "collect-cursor", "code": error.code})
     revise: dict[str, object] | None = None
     if config.revise_enabled:
-        # Two ledger reads on purpose: _process_verdicts appends verdict,
-        # comment, and a2a-revise-dispatch rows that _consume_revise_results
+        # Three ledger reads on purpose, in this order: _process_verdicts
+        # appends verdict, comment, deferral, and a2a-revise-dispatch rows;
+        # _sweep_deferred_revises (#1767) must then see those deferrals, and
+        # both append a2a-revise-dispatch rows that _consume_revise_results
         # must see in the same cycle (fresh revise tasks are polled at once).
         revise = {
             "verdicts": _process_verdicts(config, dry_run=dry_run),
+            "deferred": _sweep_deferred_revises(config, dry_run=dry_run),
             "results": _consume_revise_results(config, dry_run=dry_run),
         }
     return {
