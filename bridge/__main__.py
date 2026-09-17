@@ -405,6 +405,9 @@ def _build_standard_context(
         agent_runtime=agent_runtime,
         clock=clock,
         session_started_recorder=_build_session_started_recorder(settings, session_manager),
+        # The frontend name namespaces private memory audiences (#1780);
+        # "telegram" keeps the historical digest.
+        memory_route=settings.channel,
     )
     # Production distill extraction composition (#465 scheduling consumes
     # this): the worker is built only through the handler factory so its
@@ -547,11 +550,21 @@ def _build_standard_context(
 
 
 def create_app(context: AppContext):
-    """Create the Telegram adapter from an already-built application context."""
+    """Create the chat frontend from an already-built application context."""
     if context.settings.agent_provider == "grok":
         from telegram_bot.core.grok_bot import GrokTelegramBot
 
         return GrokTelegramBot(context.settings, context.agent_runtime, context.telegram_port)
+    if getattr(context.settings, "channel", "telegram") == "matrix":
+        # Same ProjectChatHandler, E2EE Matrix transport instead of Telegram (#1780).
+        from telegram_bot.core.matrix.bot import MatrixBot
+
+        return MatrixBot(
+            context.settings,
+            project_chat=context.project_chat,
+            session_manager=context.session_manager,
+            clock=context.clock,
+        )
     from telegram_bot.core.bot import TelegramBot
 
     return TelegramBot(

@@ -23,6 +23,10 @@ dependencies = [
 # Mirrors requirements-voice.txt. Keep the extra small because the TOS uploader
 # imports this optional native dependency lazily and many nodes do not need it.
 voice = ["tos"]
+# Mirrors requirements-matrix.txt (#1780). matrix-nio[e2e] links the native
+# libolm library, so only nodes that run the Matrix frontend install it; the
+# transport imports nio lazily and Telegram-only nodes never load it.
+matrix = ["matrix-nio[e2e]==0.25.2"]
 dev = ["pytest", "pytest-cov"]
 
 [tool.setuptools]

@@ -195,6 +195,29 @@ class Config(
         alias="CCC_AGENT_PROVIDER",
         description="Agent provider used by ProjectChat.",
     )
+    # Chat frontend (#1780). "telegram" is the historical bridge; "matrix"
+    # runs the same ProjectChatHandler behind the E2EE Matrix transport
+    # (family messenger). The channel name also namespaces private memory
+    # audiences (ProjectChatHandler.memory_route).
+    channel: Literal["telegram", "matrix"] = Field(
+        default="telegram",
+        alias="CCC_CHANNEL",
+        description="Chat frontend: Telegram bot (default) or the E2EE Matrix frontend.",
+    )
+    matrix_config_path: Optional[Path] = Field(
+        default=None,
+        alias="CCC_MATRIX_CONFIG_PATH",
+        description=(
+            "Private (0600) JSON config for the Matrix frontend: homeserver, bot account/"
+            "device/token, pickle key, state directory, owner, rooms and pinned devices."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_matrix_channel(self):
+        if self.channel == "matrix" and self.matrix_config_path is None:
+            raise ValueError("CCC_CHANNEL=matrix requires CCC_MATRIX_CONFIG_PATH.")
+        return self
     grok_ssh_destination: Optional[str] = Field(default=None, alias="CCC_GROK_SSH_DESTINATION")
     grok_bot_id: Optional[str] = Field(default=None, alias="CCC_GROK_BOT_ID")
     grok_owner_id: Optional[int] = Field(default=None, gt=0, alias="CCC_GROK_OWNER_ID")

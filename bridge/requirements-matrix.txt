@@ -1,0 +1,10 @@
+# Optional Matrix-frontend extra for the bridge (#1780).
+#
+# Only needed when CCC_CHANNEL=matrix (family messenger over an E2EE Matrix
+# homeserver). matrix-nio[e2e] links the native libolm library (python-olm),
+# so it stays out of the core requirements.txt and the hash lock — like the
+# voice extra — and is installed explicitly on the nodes that run it:
+#   pip install -r requirements-matrix.txt
+# The version mirrors family-messenger/requirements-matrix.txt, whose E2EE
+# transport this bridge frontend was ported from.
+matrix-nio[e2e]==0.25.2
