@@ -233,10 +233,33 @@ idg2="$(seed_kind dungae decision "측정 비용 때문에 백업 자동화를 �
 idg3="$(seed_kind dungae decision "로그 보관을 30일로 결정" "$OLD" 1 1 dg3 "디스크 상한 정책 때문")"
 NUNCHI_JUDGE_APPLY=1 run_batch
 ok "G5 reasonless decision stays flagged (never deterministic-clear)" '[ "$(review_of "$idg1")" = 1 ]'
-ok "G5 item classified g5-reasonless-decision in audit" 'grep -q "\"class\": \"g5-reasonless-decision\"" "$NUNCHI_HOME/judge-audit.jsonl"'
+ok "G5 backlog is audited as a deferred aggregate" 'grep -q "\"class\": \"g5-deferred-backlog\"" "$NUNCHI_HOME/judge-audit.jsonl"'
 ok "G5 audit points the owner at annotate" 'grep -q "annotate" "$NUNCHI_HOME/judge-audit.jsonl"'
+ok "G5 backlog is surfaced in the report" 'grep -q "g5-deferred" "$CCC_STATE_DIR/nunchi-review-report.md"'
 ok "inline-reason decision takes the normal deterministic path" '[ "$(review_of "$idg2")" = 0 ]'
 ok "structured-because decision takes the normal deterministic path" '[ "$(review_of "$idg3")" = 0 ]'
+
+# ---- 8b. G5 never occupies a CAP slot (head-of-line block) ----------------
+# Regression: fetch_queue was `ORDER BY id LIMIT CAP`, and a G5 verdict leaves
+# review=1, so the oldest G5 items were re-selected every run and the queue
+# behind them was never reached. Measured on yukson before the fix: the same
+# ten ids (#747..#994) re-triaged to `human` on eight consecutive days while
+# 613 judgeable facts behind them had never once been looked at.
+reset_db
+# Seed CAP g5 items FIRST so they own the lowest ids, then judgeable ones.
+for i in 1 2 3; do
+  seed_kind dungae decision "G5 선두 항목 $i 확정" "$OLD" 1 1 "hol-g5-$i" "" >/dev/null
+done
+# Deliberately unrelated to each other: a >=0.6 mutual overlap would send them
+# to the (stubbed-unavailable) judge and mask what this case is measuring.
+# shellcheck disable=SC2034  # read via eval inside ok()
+idh1="$(seed_kind dungae context "브리지 포트는 8791 이며 루프백에만 바인딩된다" "$OLD" 1 1 hol-ok-1 "")"
+# shellcheck disable=SC2034  # read via eval inside ok()
+idh2="$(seed_kind dungae preference "사용자는 번호형 선택지를 선호한다" "$OLD" 1 1 hol-ok-2 "")"
+out="$(NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_CAP=3 run_batch 2>&1)"
+ok "items behind the g5 head are reached despite CAP=3" '[ "$(review_of "$idh1")" = 0 ] && [ "$(review_of "$idh2")" = 0 ]'
+ok "run line states the deferred g5 count" 'printf "%s" "$out" | grep -q "3 g5-deferred"'
+ok "g5 items still stay flagged for the owner" '[ "$(flagged_count)" = 3 ]'
 
 # ---- 10. G3 batch pool mirrors ingest: cross-session siblings (#1255) ------
 reset_db
