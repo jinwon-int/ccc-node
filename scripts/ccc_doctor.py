@@ -664,6 +664,7 @@ class Doctor:
         self.check_distill_readiness()
         self.check_skill_promotion_backlog()
         self.check_skill_promotion_revise_stall()
+        self.check_skill_promotion_unpromoted()
         self.check_skill_usage_telemetry()
         self.check_self_update_stall()
         # Managed Codex skills are provider-native (#647): diagnose them only on
@@ -1680,6 +1681,97 @@ class Doctor:
             "author node is not an online broker worker; confirm whether that "
             "node is meant to run a worker at all — if it is not, these "
             "findings need a different route than a broker revision round",
+        )
+
+    # An `approve` verdict is where the automated pipeline ends: it projects
+    # the signed receipt, posts the verdict comment, and stops. Promotion
+    # itself — rebuilding a sanitized `approved/*` PR from main, and closing
+    # the intake PR — is hand work with no tooling behind it, and nothing
+    # ages an approved candidate nobody promoted. Field case: 34 approved
+    # candidates sat unpromoted, the oldest for weeks, and the count was only
+    # discovered by classifying open PRs by hand. Same threshold as the
+    # revise stall above: a promotion owed for a week is not in flight.
+    _UNPROMOTED_STALE_DAYS = 7
+
+    def check_skill_promotion_unpromoted(self) -> None:
+        """Report approved intake PRs nobody has promoted and closed.
+
+        Publisher-only, and ledger-only: `a2a-intake-state` rows are written
+        by the publisher's collect, which is the component that may talk to
+        GitHub. This check never does — the doctor stays offline.
+
+        The verdict keys off the OLDEST outstanding approval, not the count,
+        for the same reason as the backlog check: a large batch approved
+        today is healthy, while one old approval means the hand-off stopped.
+        """
+        item = "skill-promotion unpromoted"
+        state_dir = Path(
+            os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")
+        ).expanduser()
+        ledger = state_dir / "skill-promotion" / "ledger.jsonl"
+        if ledger.is_symlink() or not ledger.is_file():
+            self.add("정상", item, "ledger=absent", "none")
+            return
+        # Last row per PR wins: the state is re-polled until it goes terminal,
+        # so an earlier OPEN must never outvote the CLOSED that followed it.
+        latest: dict[str, tuple[str, str]] = {}
+        try:
+            with ledger.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line or "a2a-intake-state" not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if row.get("kind") != "a2a-intake-state":
+                        continue
+                    pr = row.get("pr")
+                    state = row.get("state")
+                    approved_at = row.get("approved_at")
+                    if not isinstance(pr, str) or not isinstance(state, str):
+                        continue
+                    if not isinstance(approved_at, str):
+                        continue
+                    latest[pr] = (state, approved_at)
+        except OSError:
+            self.add(
+                "수동필요",
+                item,
+                "ledger=unreadable",
+                f"inspect {ledger} permissions; unpromoted approvals cannot be verified",
+            )
+            return
+
+        outstanding = {
+            pr: approved_at
+            for pr, (state, approved_at) in latest.items()
+            if state == "OPEN"
+        }
+        if not outstanding:
+            self.add("정상", item, "unpromoted=0", "none")
+            return
+        ages = [age for age in (_iso_age_days(v) for v in outstanding.values())
+                if age is not None]
+        if not ages:
+            self.add(
+                "정상", item, f"unpromoted={len(outstanding)}; oldest=unparsable", "none"
+            )
+            return
+        age_days = max(ages)
+        status = f"unpromoted={len(outstanding)}; oldest={age_days}d"
+        if age_days < self._UNPROMOTED_STALE_DAYS:
+            self.add("정상", item, status, "none")
+            return
+        self.add(
+            "경고",
+            item,
+            status,
+            f"{len(outstanding)} intake PRs have carried an approve verdict for "
+            f"up to {age_days}d without being promoted; rebuild them as a "
+            "sanitized approved/* PR from current main, then close the intake "
+            "PRs (policies/REVIEW.md: no auto-close, no auto-merge)",
         )
 
     _TELEMETRY_SILENT_DAYS = 14
