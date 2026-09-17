@@ -81,19 +81,34 @@ never collide with a Telegram user's private scope.
 
 ## Running alongside the Telegram bridge (seoseo)
 
-The frontend is a second systemd service on the same node and project root.
-Both services share the provider CLI, memory materializer and working-state
-files; they do not share Telegram state. Cutover from the pilot bot:
+The frontend is a second systemd service on the same node and project root
+(`bridge/service-systemd-matrix.service.example`). `start.sh` assumes one
+instance per project root (pid file, health file, Telegram token lock), so
+the Matrix unit launches the package directly —
+`<venv>/bin/python -m telegram_bot --path /root` — with its own
+`BOT_DATA_DIR` (logs and the session store follow it), `CCC_CHANNEL=matrix`
+and `CCC_MATRIX_CONFIG_PATH`. It still reads the project `.env`
+(`<project>/.telegram_bot/.env`) for provider and memory keys, so both
+frontends run the same model, materializer and working-state files; they do
+not share Telegram state or sessions. `MatrixBot.run()` is the blocking entry
+`__main__` expects (access control + session store init, SIGTERM/SIGINT →
+orderly stop).
 
-1. Install the extra into the bridge venv; copy the pilot config to
-   `CCC_MATRIX_CONFIG_PATH` (0600) and point `state_directory` at the pilot's
-   state (same bot device, same crypto store — no new Matrix device).
+Cutover from the pilot bot:
+
+1. `<venv>/bin/pip install -r bridge/requirements-matrix.txt`; point
+   `CCC_MATRIX_CONFIG_PATH` at the pilot config (0600) with the pilot's
+   `state_directory` (same bot device, same crypto store — no new Matrix
+   device). Worker keys in that file are ignored.
 2. `systemctl stop family-matrix` (pilot) — one bot device must not run twice.
-3. Start `ccc-matrix-bridge` with `CCC_CHANNEL=matrix`; confirm health
-   `ready` in the state store and a reply in the owner's direct room.
+3. `systemctl enable --now ccc-matrix-bridge`; confirm health `ready` in the
+   state store (`meta.health`) and a reply in the owner's direct room.
 4. Family room: mention the bot from a family account; confirm the reply and
    that the disclosure notice was not re-posted.
-5. Disable the pilot unit; keep its backups.
+5. `systemctl disable family-matrix`; keep its backups.
+
+Rollback: stop `ccc-matrix-bridge`, start `family-matrix` — the pilot's
+config, state and crypto store are untouched by the frontend.
 
 ## Not yet
 
