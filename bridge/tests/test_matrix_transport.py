@@ -243,6 +243,16 @@ class FakeRunner:
     async def mode_uncertain(self, sink: Any) -> TurnResult:
         return TurnResult("", None, status="uncertain")
 
+    async def mode_error(self, sink: Any) -> TurnResult:
+        # MatrixBot reports ChatResponse(success=False) this way: the text is
+        # the user-facing failure notice and nothing is still running.
+        return TurnResult("❌ provider unavailable", "synthetic-session", status="error")
+
+    async def mode_streamed(self, sink: Any) -> TurnResult:
+        # The runner already delivered the answer through interim notices.
+        await sink.interim("streamed answer")
+        return TurnResult("streamed answer", "synthetic-session", streamed=True)
+
     async def mode_raise(self, sink: Any) -> TurnResult:
         raise RuntimeError("synthetic failure")
 
@@ -592,6 +602,60 @@ async def test_uncertain_result_and_turn_timeout_never_publish(tmp_path: Path) -
         assert h.runner.interrupted == 1
         assert [j["event_id"] for j in f.store.uncertain()] == ["$slow"]
         assert not any(r in ("late", "synthetic answer") for r in h.replies())
+
+
+@pytest.mark.anyio
+async def test_error_status_delivers_text_and_finishes(tmp_path: Path) -> None:
+    async with running(tmp_path, "error") as h:
+        f = h.f
+        req = request(f)
+        await f.input(req)
+        h.work()
+        await h.until(lambda: "❌ provider unavailable" in h.replies())
+        assert f.store.get_meta("last_turn")["outcome"] == "error"
+        assert not f.store.uncertain()  # no operator /ack needed for a reported failure
+        assert f.store.session(req.scope) == "synthetic-session"
+
+
+@pytest.mark.anyio
+async def test_streamed_result_is_not_echoed_again(tmp_path: Path) -> None:
+    async with running(tmp_path, "streamed") as h:
+        f = h.f
+        req = request(f)
+        await f.input(req)
+        h.work()
+        await h.until(lambda: f.store.session(req.scope) == "synthetic-session")
+        assert h.replies().count("streamed answer") == 1, "interim delivery must not be repeated as the final reply"
+        assert f.store.get_meta("last_turn")["outcome"] == "complete"
+
+
+@pytest.mark.anyio
+async def test_stop_alias_cancels_the_senders_running_turn(tmp_path: Path) -> None:
+    async with running(tmp_path, "cancel") as h:
+        f = h.f
+        await f.input(request(f))
+        work = h.work()
+        await h.until(lambda: bool(f.approvals))
+        await f.input(request(f, "$stop", "/stop"))
+        await h.until(lambda: bool(f.store.uncertain()))
+        assert h.runner.cancels == ["$request"]
+        assert f.store.get_meta("last_turn")["outcome"] == "cancelled"
+        assert not work.done()
+        # A stranger's room/scope cannot stop someone else's turn.
+        h.runner.mode = "slow"
+        assert request(f, "$evil", "/stop", sender="@stranger:test.invalid") is None
+
+
+def test_message_content_adds_formatted_body_only_for_markup() -> None:
+    from telegram_bot.core.matrix.transport import message_content
+
+    plain = message_content("작업을 시작했습니다. 취소 명령:\n/cancel abc")
+    assert plain == {"msgtype": "m.text", "body": "작업을 시작했습니다. 취소 명령:\n/cancel abc"}
+    rich = message_content("**done** — see `ls -la`\n<script>alert(1)</script>")
+    assert rich["format"] == "org.matrix.custom.html"
+    assert "<strong>done</strong>" in rich["formatted_body"] and "<code>ls -la</code>" in rich["formatted_body"]
+    assert "<script>" not in rich["formatted_body"]
+    assert rich["body"].startswith("**done**")
 
 
 @pytest.mark.anyio

@@ -50,6 +50,7 @@ IDS_FILENAME = "matrix-ids.json"
 DIRECT_ROOMS_FILENAME = "matrix-direct-rooms.json"
 SUPPORTED_COMMANDS = frozenset({"new", "model", "effort", "usage", "skills", "stop"})
 _STATUS_HANDLE = 1
+STATUS_MIN_INTERVAL_S = 60.0  # heartbeat notices become room messages on Matrix; throttle them
 _RUNTIME_MODEL_PROVIDERS = frozenset({"codex", "piri", "crush", "danso"})
 _EFFORT_PROVIDERS = frozenset({"codex", "piri", "danso"})
 _CLAUDE_MODELS: tuple[tuple[str, str], ...] = (
@@ -347,12 +348,22 @@ class MatrixBot:
     def _make_status_callback(
         self, sink: TurnSink
     ) -> Callable[[Optional[str], Optional[int]], Awaitable[Optional[int]]]:
+        # Telegram edits one status bubble in place; Matrix has no edit path in
+        # the durable outbox, so every status text would become a new room
+        # message. Forward only when the text changed AND the interval passed,
+        # so a long turn shows a few progress notices, not one every 4 s.
+        last: dict[str, Any] = {"text": None, "at": 0.0}
+
         async def status_callback(
             text: Optional[str], message_id: Optional[int] = None
         ) -> Optional[int]:
             del message_id
             if text is None:
                 return None  # delete: nothing to remove on Matrix
+            now = time.monotonic()
+            if text == last["text"] or now - last["at"] < STATUS_MIN_INTERVAL_S:
+                return _STATUS_HANDLE
+            last["text"], last["at"] = text, now
             try:
                 await sink.interim(text)
             except asyncio.CancelledError:

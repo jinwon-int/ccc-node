@@ -45,7 +45,6 @@ from telegram_bot.core.matrix.state import (
     SafetyStop,
     bounded_text,
     family_config,
-    parts,
     private_directory,
     saved_policy,
     turn_id,
@@ -70,7 +69,30 @@ TURN_JOIN_TIMEOUT_S = 30.0
 MAX_APPROVAL_TEXT_BYTES = 12_000
 MAX_PENDING_APPROVALS = 16
 MEGOLM = "m.megolm.v1.aes-sha2"
-CONTROL_PREFIXES = ("/approve", "/deny", "/cancel", "/ack")
+CONTROL_PREFIXES = ("/approve", "/deny", "/cancel", "/ack", "/stop")
+# TurnResult.status values that end a job with its text delivered. "error" is
+# what MatrixBot reports for a ChatResponse(success=False): the text is the
+# user-facing failure notice and nothing is left running, so it is not
+# "uncertain" (which needs an operator /ack).
+FINAL_STATUSES = frozenset({"complete", "error"})
+
+
+def message_content(text: str) -> dict[str, str]:
+    """``m.text`` content with a Matrix-HTML ``formatted_body`` when the text has markup.
+
+    Rendering happens at send time so every outgoing message (replies and
+    notices alike) goes through the same escaping renderer; plain text stays
+    a bare ``body``.
+    """
+
+    from telegram_bot.core.matrix.render import render_matrix_message
+
+    body, formatted = render_matrix_message(text)
+    content = {"msgtype": "m.text", "body": body}
+    if formatted:
+        content["format"] = "org.matrix.custom.html"
+        content["formatted_body"] = formatted
+    return content
 
 
 # --------------------------------------------------------------------------- #
@@ -510,7 +532,9 @@ class MatrixTransport:
         allowed = False
         if self.active is not None and self._turn_running() and self.active["scope"] == req.scope:
             tid = turn_id(self.active["event_id"])
-            if fields == ["/cancel", tid]:
+            # "/stop" is the Telegram-parity alias: no turn id needed when the
+            # sender's own scope is the one running.
+            if fields == ["/cancel", tid] or fields == ["/stop"]:
                 allowed = True
                 await self._cancel_active()
             elif (
@@ -629,7 +653,10 @@ class MatrixTransport:
                     await self.pin_devices()
                     if not await self.room_gate(job["room_id"]):
                         continue
-                    chunks = parts(job["reply"])
+                    # Fence-aware chunking (never splits a ``` block) at the pilot's 12 KB size.
+                    from telegram_bot.core.matrix.render import chunk_text
+
+                    chunks = chunk_text(job["reply"])
                     for i in range(self.store.delivered_parts(job["event_id"]), len(chunks)):
                         tx = hashlib.sha256((job["txn_id"] + ":" + str(i)).encode()).hexdigest()
                         await self.encrypted_send(job["room_id"], chunks[i], tx)
@@ -649,7 +676,7 @@ class MatrixTransport:
         if session is None or session.users_shared_with != expected:
             self.client.invalidate_outbound_session(room)
             raise ConnectionError("group-key-share-incomplete")
-        kind, content = self.client.encrypt(room, "m.room.message", {"msgtype": "m.text", "body": text})
+        kind, content = self.client.encrypt(room, "m.room.message", message_content(text))
         if kind != "m.room.encrypted":
             raise SafetyStop("plaintext-output-refused")
         result = await self.raw(
@@ -729,9 +756,12 @@ class MatrixTransport:
             async with asyncio.timeout(self.turn_timeout):
                 await asyncio.wait({turn})
             result = turn.result()
-            if isinstance(result, TurnResult) and result.status == "complete":
-                self.store.finish(job["event_id"], result.text, result.session_id)
-                outcome = "complete"
+            if isinstance(result, TurnResult) and result.status in FINAL_STATUSES:
+                # ``streamed`` means the runner already delivered the text
+                # (interim notices); finishing with an empty reply keeps the
+                # session id without echoing the answer a second time.
+                self.store.finish(job["event_id"], "" if result.streamed else result.text, result.session_id)
+                outcome = result.status
         except asyncio.CancelledError:
             outcome = "cancelled"
             current = asyncio.current_task()

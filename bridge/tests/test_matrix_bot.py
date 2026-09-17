@@ -585,6 +585,9 @@ async def test_typing_status_and_interim_adapters(tmp_path: Path, matrix_config:
     async def drive(kwargs: dict[str, Any]) -> None:
         await kwargs["typing_callback"]()
         seen["h1"] = await kwargs["status_callback"]("⏳ Working", None)
+        # Same text again and a different text inside the throttle window are
+        # both swallowed: heartbeats must not become a room message every 4 s.
+        seen["h1b"] = await kwargs["status_callback"]("⏳ Working", seen["h1"])
         seen["h2"] = await kwargs["status_callback"]("⏳ Still working", seen["h1"])
         seen["deleted"] = await kwargs["status_callback"](None, seen["h2"])
         await kwargs["interim_message_callback"]("first part")
@@ -592,9 +595,29 @@ async def test_typing_status_and_interim_adapters(tmp_path: Path, matrix_config:
     chat.on_process = drive
     await bot.run_turn(_job("go"), sink=sink, session_id=None, room_kind="direct")
     assert sink.typing_calls == 1
-    assert isinstance(seen["h1"], int) and seen["h1"] == seen["h2"]
+    assert isinstance(seen["h1"], int) and seen["h1"] == seen["h2"] == seen["h1b"]
     assert seen["deleted"] is None
-    assert sink.interims == ["⏳ Working", "⏳ Still working", "first part"]
+    assert sink.interims == ["⏳ Working", "first part"]
+
+
+@pytest.mark.anyio
+async def test_status_callback_forwards_new_text_after_interval(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telegram_bot.core.matrix import bot as bot_module
+
+    bot, chat, _manager = _bot(tmp_path)
+    sink = FakeSink()
+    monkeypatch.setattr(bot_module, "STATUS_MIN_INTERVAL_S", 0.0)
+
+    async def drive(kwargs: dict[str, Any]) -> None:
+        await kwargs["status_callback"]("⏳ Working", None)
+        await kwargs["status_callback"]("⏳ Working", None)  # identical text: still deduped
+        await kwargs["status_callback"]("🔧 Running tests", None)
+
+    chat.on_process = drive
+    await bot.run_turn(_job("go"), sink=sink, session_id=None, room_kind="direct")
+    assert sink.interims == ["⏳ Working", "🔧 Running tests"]
 
 
 @pytest.mark.anyio
