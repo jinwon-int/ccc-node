@@ -41,10 +41,50 @@ _EVIDENCE_ID_RE = re.compile(
     re.IGNORECASE,
 )
 _SAFE_WIKI_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_SAFE_WIKI_PATH_PATTERN = (
-    r"^(?:pages/log\.md|pages/(?:team|nodes)/[A-Za-z0-9][A-Za-z0-9._-]*/"
-    r"(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*\.md)$"
+
+# Approved Wiki areas, split by the shape the canonical structure gives them.
+# Owner areas are indexed by a name (pages/team/<name>/..., pages/nodes/<name>/...)
+# so a bare pages/team/NOTES.md is not a real target. Flat areas are shared
+# knowledge bases addressed directly (pages/runbooks/<topic>.md).
+#
+# The set is deliberately limited to the areas the operating docs name as
+# durable-knowledge targets. Areas that exist in the Wiki but are not distill
+# targets (a2a, current, notices, openclaw, reports, review, rules) and the
+# personal/business areas (contacts, family, hug) stay out; widening the set is
+# a separate, evidence-backed decision.
+_WIKI_OWNER_AREAS = ("nodes", "team")
+_WIKI_FLAT_AREAS = (
+    "archive",
+    "decisions",
+    "incidents",
+    "owners",
+    "runbooks",
+    "services",
 )
+
+_WIKI_SEGMENT_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+
+
+def _wiki_path_pattern() -> str:
+    """Build the path regex from the area tuples so the two cannot drift.
+
+    ``validate_suggested_path`` enforces the same areas and depths; deriving the
+    advertised JSON Schema pattern from the same constants keeps the contract we
+    publish to extractors identical to the one the parser applies.
+    """
+
+    segment = _WIKI_SEGMENT_PATTERN
+    trailing = rf"(?:{segment}/)*{segment}\.md"
+    owner = "|".join(_WIKI_OWNER_AREAS)
+    flat = "|".join(_WIKI_FLAT_AREAS)
+    return (
+        r"^(?:pages/log\.md"
+        rf"|pages/(?:{owner})/{segment}/{trailing}"
+        rf"|pages/(?:{flat})/{trailing})$"
+    )
+
+
+_SAFE_WIKI_PATH_PATTERN = _wiki_path_pattern()
 _DIRECTIVE_RE = re.compile(
     r"(?:<\s*/?\s*(?:system|developer)\s*>|"
     r"\b(?:ignore|disregard|forget|override)\s+(?:all\s+)?"
@@ -287,13 +327,19 @@ class WikiCandidate(_StrictModel):
         parts = path.parts
         if (
             path.is_absolute()
-            or len(parts) < 4
+            or len(parts) < 3
             or parts[0] != "pages"
-            or parts[1] not in {"team", "nodes"}
             or path.suffix != ".md"
             or any(part in {".", ".."} for part in parts)
             or any(not _SAFE_WIKI_SEGMENT_RE.fullmatch(part) for part in parts[2:])
         ):
+            raise ValueError("suggested_path is outside approved Wiki targets")
+        area = parts[1]
+        # Owner areas need their name segment; a flat area is addressed directly.
+        if area in _WIKI_OWNER_AREAS:
+            if len(parts) < 4:
+                raise ValueError("suggested_path is outside approved Wiki targets")
+        elif area not in _WIKI_FLAT_AREAS:
             raise ValueError("suggested_path is outside approved Wiki targets")
         return value
 

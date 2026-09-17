@@ -6,6 +6,7 @@ import asyncio
 from copy import deepcopy
 import json
 from pathlib import Path
+import re
 import socket
 import subprocess
 from typing import Any
@@ -334,6 +335,13 @@ def test_output_enforces_item_counts() -> None:
         "pages/nodes\\nosuk\\DECISIONS.md",
         "pages/log.md/child",
         "pages/team//DECISIONS.md",
+        # Wiki areas that exist but are not approved distill targets.
+        "pages/a2a/nexus.md",
+        "pages/hug/credit-policy.md",
+        "pages/review/findings.md",
+        # A flat area still needs a document, not just the directory.
+        "pages/runbooks",
+        "pages/decisions/notes.txt",
     ],
 )
 def test_wiki_candidate_path_is_restricted_to_approved_relative_targets(path: str) -> None:
@@ -351,6 +359,14 @@ def test_wiki_candidate_path_is_restricted_to_approved_relative_targets(path: st
         "pages/team/nosuk/DECISIONS.md",
         "pages/nodes/gongyung/RUNBOOK.md",
         "pages/team/a-b/topic_1.md",
+        # Flat shared-knowledge areas are addressed without an owner segment.
+        "pages/runbooks/gh-merge-502.md",
+        "pages/decisions/danso-signing-key.md",
+        "pages/incidents/bridge-approval-stall.md",
+        "pages/services/broker.md",
+        "pages/owners/jinon.md",
+        "pages/archive/retired-lane.md",
+        "pages/runbooks/github/merge-queue.md",
     ],
 )
 def test_wiki_candidate_path_accepts_only_documented_safe_families(path: str) -> None:
@@ -360,6 +376,79 @@ def test_wiki_candidate_path_accepts_only_documented_safe_families(path: str) ->
     parsed = parse_extraction_output(json.dumps(payload), wiki_enabled=True)
 
     assert parsed.wiki_candidates[0].suggested_path == path
+
+
+def test_wiki_path_regex_and_validator_agree_on_every_area() -> None:
+    """The advertised JSON Schema pattern and the parser must accept the same set.
+
+    The pattern is what extractors are told to satisfy; the validator is what
+    actually gates the payload. If they drift, a model either gets rejected for
+    obeying the published contract or slips a path past the schema. Both are
+    derived from the same area tuples, so this pins that derivation.
+    """
+
+    from telegram_bot.memory.distill_extraction import (
+        _SAFE_WIKI_PATH_PATTERN,
+        _WIKI_FLAT_AREAS,
+        _WIKI_OWNER_AREAS,
+        WikiCandidate,
+    )
+
+    pattern = re.compile(_SAFE_WIKI_PATH_PATTERN)
+    probes = ["pages/log.md", "pages/log.md/child", "pages/../etc/passwd.md"]
+    for area in _WIKI_OWNER_AREAS:
+        probes += [
+            f"pages/{area}/owner/topic.md",
+            f"pages/{area}/owner/nested/topic.md",
+            f"pages/{area}/topic.md",  # owner areas need their name segment
+            f"pages/{area}",
+        ]
+    for area in _WIKI_FLAT_AREAS:
+        probes += [
+            f"pages/{area}/topic.md",
+            f"pages/{area}/nested/topic.md",
+            f"pages/{area}",
+            f"pages/{area}/topic.txt",
+        ]
+    # Areas deliberately left out of the approved set.
+    probes += [
+        "pages/a2a/nexus.md",
+        "pages/hug/credit.md",
+        "pages/private/SECRETS.md",
+        "pages/review/findings.md",
+    ]
+
+    disagreements = []
+    for probe in probes:
+        by_pattern = pattern.fullmatch(probe) is not None
+        try:
+            WikiCandidate(
+                title="t",
+                suggested_path=probe,
+                summary="s",
+                evidence_excerpt="e",
+            )
+            by_validator = True
+        except ValueError:
+            by_validator = False
+        if by_pattern != by_validator:
+            disagreements.append((probe, by_pattern, by_validator))
+
+    assert not disagreements, f"pattern/validator drift: {disagreements}"
+
+
+def test_approved_wiki_areas_cover_the_flat_knowledge_bases() -> None:
+    """Regression pin for the areas that were unreachable before (#B).
+
+    Every wiki candidate the bridge had produced landed in team/nodes/log
+    because the contract allowed nothing else, so runbook- and decision-shaped
+    knowledge was filed under an owner instead of its own area.
+    """
+
+    from telegram_bot.memory.distill_extraction import _WIKI_FLAT_AREAS
+
+    for area in ("runbooks", "decisions", "incidents", "services"):
+        assert area in _WIKI_FLAT_AREAS
 
 
 def test_output_rejects_credential_like_text_in_every_durable_section() -> None:
