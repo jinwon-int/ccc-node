@@ -46,6 +46,12 @@ elif [ "$1" = "api" ] && [[ "$2" == repos/* ]] && [[ " $* " == *" .permissions.p
   printf '%s\n' "${MOCK_PUSH:-true}"
 elif [ "$1" = "api" ] && [[ "$2" == repos/* ]] && [[ " $* " == *" .default_branch "* ]]; then
   printf '%s\n' "${MOCK_DEFAULT_BRANCH:-main}"
+elif [ "$1" = "api" ] && [[ "$2" == repos/*/commits/* ]]; then
+  # When the head commit was created. An approval that predates it was given
+  # to different code and re-attributed by a force-push (#1765).
+  # `-`, not `:-`: an explicitly empty value must stay empty, or the case that
+  # sets it to "" silently gets the default and tests nothing.
+  printf '%s\n' "${MOCK_HEAD_COMMITTED_AT-2026-09-16T10:23:31Z}"
 elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" author,baseRefName,state,isDraft,headRefOid,mergeable,reviewRequests,statusCheckRollup "* ]]; then
   jq -n \
     --arg author "${MOCK_AUTHOR:-seoseo-ai}" \
@@ -189,9 +195,17 @@ else
 fi
 
 #1714 regression: a re-run must reuse the already-recorded exact-head approval
-# instead of stacking a duplicate approving review.
+# instead of stacking a duplicate approving review. A real review carries a
+# submission time, and this one postdates the commit it approved.
+AFTER_COMMIT="2026-09-16T10:30:00Z"
+BEFORE_COMMIT="2026-09-16T09:09:27Z"
+recorded_review() { # <submittedAt>
+  printf '[{"author":{"login":"jinon86"},"state":"APPROVED","commit":{"oid":"%s"},"submittedAt":"%s"}]' \
+    "$HEAD_SHA" "$1"
+}
+
 rm -f "$MOCK_REVIEW_MARKER"
-if MOCK_BEFORE_REVIEWS="[{\"author\":{\"login\":\"jinon86\"},\"state\":\"APPROVED\",\"commit\":{\"oid\":\"$HEAD_SHA\"}}]" \
+if MOCK_BEFORE_REVIEWS="$(recorded_review "$AFTER_COMMIT")" \
    run_helper >"$TMP/idempotent.out" \
    && jq -e '.ok == true and .approved == true and .already_approved == true' \
      "$TMP/idempotent.out" >/dev/null \
@@ -199,6 +213,46 @@ if MOCK_BEFORE_REVIEWS="[{\"author\":{\"login\":\"jinon86\"},\"state\":\"APPROVE
   ok
 else
   bad "re-run posted a duplicate approval for an already-approved exact head"
+fi
+
+#1765 regression: after a rebase and force-push GitHub re-attributes an
+# approval submitted against the *old* head to the new one. Matching on the
+# commit alone then reports `already_approved: true` and submits nothing,
+# turning "a head change requires re-review" into a no-op. Observed on
+# danso#126: approval at 09:09:27Z, the commit it claimed to approve created
+# 74 minutes later.
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_BEFORE_REVIEWS="$(recorded_review "$BEFORE_COMMIT")" \
+   run_helper >"$TMP/reattributed.out" \
+   && jq -e '.ok == true and .approved == true and .already_approved == false' \
+     "$TMP/reattributed.out" >/dev/null \
+   && [ "$(wc -l <"$MOCK_REVIEW_MARKER")" -eq 1 ]; then
+  ok
+else
+  bad "an approval that predates the head commit was accepted as already given"
+fi
+
+# A review with no submission time cannot be shown to postdate the commit, so
+# it is not evidence either.
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_BEFORE_REVIEWS="[{\"author\":{\"login\":\"jinon86\"},\"state\":\"APPROVED\",\"commit\":{\"oid\":\"$HEAD_SHA\"}}]" \
+   run_helper >"$TMP/no-timestamp.out" \
+   && jq -e '.already_approved == false' "$TMP/no-timestamp.out" >/dev/null \
+   && [ "$(wc -l <"$MOCK_REVIEW_MARKER")" -eq 1 ]; then
+  ok
+else
+  bad "a review without a submission time was accepted as already given"
+fi
+
+# The head commit's date has to be readable; guessing would defeat the check.
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_HEAD_COMMITTED_AT="" MOCK_BEFORE_REVIEWS="$(recorded_review "$AFTER_COMMIT")" \
+   run_helper >"$TMP/no-commit-date.out" 2>&1; then
+  bad "helper passed without being able to read the head commit date"
+elif grep -Fq "could not read the head commit's date" "$TMP/no-commit-date.out"; then
+  ok
+else
+  bad "helper failed for the wrong reason with no head commit date"
 fi
 
 # An explicit CHANGES_REQUESTED on the target still fails the verification.

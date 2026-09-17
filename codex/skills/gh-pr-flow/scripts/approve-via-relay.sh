@@ -138,14 +138,34 @@ pr_json="$(review_gh pr view "$pr" --repo "$repo" \
 # A previous run may have recorded this exact approval and then failed its own
 # verification (#1714), so detect it up front: the recorded review makes the
 # actor's absence from reviewRequests acceptable and the POST below idempotent.
+#
+# Matching on the commit alone is not enough. After a rebase and force-push,
+# GitHub re-attributes an approval submitted against the *old* head to the new
+# one, so `.commit.oid == $expected_head` becomes true for a review nobody gave
+# to this code. Observed on danso#126 (#1765): approval submitted 09:09:27Z,
+# the commit it claimed to approve created 74 minutes later at 10:23:31Z, and
+# a re-run reported `already_approved: true` without submitting anything —
+# turning "a head change requires re-review" into a no-op.
+#
+# So the approval must also *postdate* the commit. That keeps #1714's purpose
+# (a second run of the same invocation does not double-post) while a
+# re-attributed one no longer counts.
+head_committed_at="$(review_gh api "repos/$repo/commits/$expected_head" \
+  --jq '.commit.committer.date' 2>/dev/null)"
+[ -n "$head_committed_at" ] \
+  || { echo "ERROR: could not read the head commit's date" >&2; exit 65; }
+
 before="$(review_gh pr view "$pr" --repo "$repo" \
   --json headRefOid,reviews)"
 [ "$(jq -r '.headRefOid | ascii_downcase' <<<"$before")" = "$expected_head" ] \
   || { echo "ERROR: PR head changed" >&2; exit 65; }
 already="$(jq --arg actor "$actor" --arg head "$expected_head" \
+  --arg since "$head_committed_at" \
   '[.reviews[]? | select(
     .author.login == $actor and .state == "APPROVED" and
-    (((.commit.oid // "") | ascii_downcase) == $head)
+    (((.commit.oid // "") | ascii_downcase) == $head) and
+    (((.submittedAt // "") | fromdateiso8601? // -1)
+      >= ($since | fromdateiso8601))
   )] | length' <<<"$before")"
 [ "$(jq -r --arg actor "$actor" \
   '([.reviewRequests[].login] | index($actor)) != null' <<<"$pr_json")" = "true" ] \
