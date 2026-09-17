@@ -287,8 +287,17 @@ class MatrixBot:
         transport = self._build_transport(config)
         self._transport = transport
         self._project_chat.set_async_completion_sender(self.async_completion_sender)
+        initialize = bool(getattr(self._settings, "matrix_initialize", False))
         try:
-            await transport.open()
+            # First run of a NEW bot device (CCC_MATRIX_INITIALIZE=1): create the
+            # crypto store, upload keys, pin devices and gate rooms, then exit
+            # without serving. The pilot's `--initialize` had the same contract;
+            # a normal start refuses an empty store (explicit-new-device-
+            # initialization-required) so a lost store is never recreated silently.
+            await transport.open(initialize=initialize)
+            if initialize:
+                logger.info("Matrix frontend initialised a new bot device; start again without CCC_MATRIX_INITIALIZE")
+                return
             self._post_startup_banner(config, transport)
             await transport.run()
         finally:

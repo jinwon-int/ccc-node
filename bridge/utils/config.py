@@ -216,6 +216,14 @@ class Config(
             "device/token, pickle key, state directory, owner, rooms and pinned devices."
         ),
     )
+    matrix_initialize: bool = Field(
+        default=False,
+        alias="CCC_MATRIX_INITIALIZE",
+        description=(
+            "One-shot: create the Matrix bot device's crypto store, upload keys, pin devices "
+            "and gate rooms, then exit. Run once for a new bot account; never leave it set."
+        ),
+    )
     matrix_startup_banner: bool = Field(
         default=True,
         alias="CCC_MATRIX_STARTUP_BANNER",

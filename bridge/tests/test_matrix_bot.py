@@ -927,3 +927,30 @@ async def test_startup_banner_is_posted_to_direct_rooms_only(
     # Missing codex config just drops the model/effort parts.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nowhere"))
     assert bot.startup_banner().endswith(" · codex · abc1234")
+
+
+@pytest.mark.anyio
+async def test_initialize_flag_opens_the_store_once_and_does_not_serve(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, _chat, _manager = _bot(tmp_path, matrix_initialize=True, matrix_startup_banner=True)
+    opened: list[bool] = []
+
+    class InitTransport(FakeTransport):
+        async def open(self, initialize: bool = False) -> None:
+            opened.append(initialize)
+            self.events.append("open")
+
+    transports: list[FakeTransport] = []
+
+    def factory(config: Any, runner: Any) -> FakeTransport:
+        transport = InitTransport(config, runner, fail_run=True)  # run() must never be reached
+        transports.append(transport)
+        return transport
+
+    bot._transport_factory = factory
+    await bot.serve()
+    transport = transports[0]
+    assert opened == [True]
+    assert transport.events == ["open", "close"], "initialize exits before run() and posts no banner"
+    assert transport.notices == []
