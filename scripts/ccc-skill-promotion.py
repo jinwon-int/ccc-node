@@ -2986,12 +2986,18 @@ def _revise_substitute_due(
     if not isinstance(after, int) or after <= 0:
         return False
     oldest: datetime | None = None
+    # Same reason the sweep filters: an aged skip proves the author was away,
+    # not that the round is still owed. A lineage decided since then keeps its
+    # deferral row forever, and the age only grows.
+    resolved = _resolved_lineage_prs(rows)
     for item in rows:
         if item.get("kind") != "a2a-revise-deferred":
             continue
         if item.get("node") != node or item.get("name") != name:
             continue
         if str(item.get("code", "")) != "revise_author_offline":
+            continue
+        if str(item.get("pr", "")) in resolved:
             continue
         skipped_at = _parse_ledger_ts(item.get("skipped_at") or item.get("ts"))
         if skipped_at is not None and (oldest is None or skipped_at < oldest):
@@ -3435,10 +3441,18 @@ def _deferred_revise_due(
     make a structural skip dispatchable, and retrying one every cycle would
     spend the bounded budget on work that can only fail."""
     due: list[dict[str, object]] = []
+    # A deferral records that a revision round was owed at some past moment.
+    # It does not expire on its own, so a lineage decided by a later review
+    # round leaves one behind that still looks outstanding. Retrying it would
+    # push a new head onto an approved candidate, or revise a `reject` the
+    # owner is supposed to decide.
+    resolved = _resolved_lineage_prs(rows)
     for item in rows:
         if item.get("kind") != "a2a-revise-deferred":
             continue
         if str(item.get("code", "")) not in _REVISE_DEFERRABLE_CODES:
+            continue
+        if str(item.get("pr", "")) in resolved:
             continue
         pr = item.get("pr")
         head = item.get("head_sha")
@@ -3704,16 +3718,12 @@ _INTAKE_STATE_KIND = "a2a-intake-state"
 _INTAKE_TERMINAL_STATES = frozenset({"CLOSED", "MERGED"})
 
 
-def _approve_lineage_prs(rows: list[dict[str, object]]) -> dict[str, str]:
-    """PR number -> earliest `approve` verdict timestamp for that PR.
+def _pr_by_dispatched_task(rows: list[dict[str, object]]) -> dict[str, str]:
+    """`task_id` -> PR number, via the dispatch row that opened the round.
 
-    A verdict row carries no PR of its own: it is keyed by `task_id`, and only
-    the `a2a-dispatch` row that opened the round records `pr_url`. Joining
-    through that dispatch is exactly how `_process_verdicts` attributes a
-    verdict in the first place, so this cannot drift away from it.
-
-    Earliest wins: a lineage that was approved, revised and approved again is
-    still one promotion that has been owed since the first approval.
+    A verdict row carries no PR of its own; only the `a2a-dispatch` row records
+    `pr_url`. This is the same join `_process_verdicts` uses to attribute a
+    verdict in the first place, so nothing downstream can drift away from it.
     """
     pr_by_task: dict[str, str] = {}
     for row in rows:
@@ -3723,6 +3733,70 @@ def _approve_lineage_prs(rows: list[dict[str, object]]) -> dict[str, str]:
         found = re.search(r"/pull/(\d+)", str(row.get("pr_url") or ""))
         if isinstance(task, str) and found:
             pr_by_task[task] = found.group(1)
+    return pr_by_task
+
+
+# A lineage whose latest verdict is one of these has been decided. `revise` is
+# the only verdict that leaves work outstanding.
+_TERMINAL_VERDICTS = frozenset({"approve", "reject"})
+
+
+def _latest_verdicts_by_pr(rows: list[dict[str, object]]) -> dict[str, str]:
+    """PR number -> the most recent verdict recorded for that lineage.
+
+    Order matters and only the last one counts. A lineage is routinely
+    revised several times before it is approved, and #26 shows the reverse is
+    possible too: `approve` on 2026-08-30, then `revise` on 2026-09-03. Any
+    caller that asks "is this approved" by looking for the presence of an
+    approve verdict will answer yes for both, which is wrong for one of them.
+    """
+    latest: dict[str, tuple[str, str]] = {}
+    pr_by_task = _pr_by_dispatched_task(rows)
+    for row in rows:
+        if row.get("kind") != "a2a-verdict":
+            continue
+        verdict, task, stamp = row.get("verdict"), row.get("task_id"), row.get("ts")
+        if not isinstance(verdict, str) or not verdict:
+            continue
+        if not isinstance(task, str) or not isinstance(stamp, str):
+            continue
+        pr = pr_by_task.get(task)
+        if pr is None:
+            continue
+        if pr not in latest or stamp > latest[pr][0]:
+            latest[pr] = (stamp, verdict)
+    return {pr: verdict for pr, (_, verdict) in latest.items()}
+
+
+def _resolved_lineage_prs(rows: list[dict[str, object]]) -> set[str]:
+    """Lineages that are decided, so no revision round is owed on them.
+
+    Field case (2026-09-17): the deferral backfill recorded every historical
+    `revise_author_offline` skip without asking whether that lineage had since
+    been decided. Six of the sixteen the substitute gate then called due were
+    already settled — five `approve`, one `reject`. Dispatching a revise on an
+    approved lineage pushes a new head and invalidates the very verdict that
+    approved it; dispatching one on a `reject` bypasses the owner decision
+    `policies/REVIEW.md` reserves for it.
+    """
+    return {
+        pr
+        for pr, verdict in _latest_verdicts_by_pr(rows).items()
+        if verdict in _TERMINAL_VERDICTS
+    }
+
+
+def _approve_lineage_prs(rows: list[dict[str, object]]) -> dict[str, str]:
+    """Currently-approved PRs -> the EARLIEST `approve` timestamp for each.
+
+    Two different questions, deliberately answered by one map: eligibility is
+    the latest verdict (a lineage sent back to `revise` after an approve is
+    not approved now), while the age a promotion has been owed runs from the
+    first approve — re-approving after a revision round must not reset a clock
+    that has been running for weeks.
+    """
+    latest = _latest_verdicts_by_pr(rows)
+    pr_by_task = _pr_by_dispatched_task(rows)
     approved: dict[str, str] = {}
     for row in rows:
         if row.get("kind") != "a2a-verdict" or row.get("verdict") != "approve":
@@ -3731,7 +3805,9 @@ def _approve_lineage_prs(rows: list[dict[str, object]]) -> dict[str, str]:
         if not isinstance(task, str) or not isinstance(stamp, str):
             continue
         pr = pr_by_task.get(task)
-        if pr is not None and (pr not in approved or stamp < approved[pr]):
+        if pr is None or latest.get(pr) != "approve":
+            continue
+        if pr not in approved or stamp < approved[pr]:
             approved[pr] = stamp
     return approved
 
@@ -3957,6 +4033,286 @@ def _sweep_promoted_intakes(
             {"outcome": "intake-closed", "pr": pr, "approved_path": path}
         )
     return processed
+
+
+# `shared` installs a skill under every provider root this node consumes, a
+# narrower audience only under its own (ccc-fleet-skills-sync). It is also what
+# 62 of the 75 promotions so far chose, so it is the default — and because it
+# is the WIDER setting, a wrong default over-distributes rather than hiding a
+# skill, which the draft PR review catches before anything ships.
+_PROMOTE_DEFAULT_AUDIENCE = "shared"
+# Mirrors ccc-fleet-skills-sync.AUDIENCES — the set of `approved/<audience>`
+# roots the consumer side will install from.
+_AUDIENCES = frozenset({"shared", "claude", "codex", "piri", "danso"})
+
+# Two classes, both advisory. Neither blocks: the generator opens a draft and
+# the human decides, so over-flagging costs a glance and under-flagging ships
+# a node fact.
+#
+# Worker node aliases are the strict class — across all 75 promoted skills
+# they produce zero hits, so one is a real leak (2026-09-17: `gongyung` was
+# edited out of #165 by hand). Provider/audience names are deliberately NOT
+# here: `piri`, `danso`, `claude` and `codex` are legitimate vocabulary, and
+# including them flagged `piri-lane-routing-check` for saying "piri".
+#
+# Repo and product names are the soft class — 7 of 75 already-promoted skills
+# still contain one, mostly where the skill is genuinely about this fleet's
+# own tooling. Worth surfacing, not worth blocking.
+_PROMOTE_PRODUCT_RE = re.compile(
+    r"\bjinwon-int/[\w.-]+|\bHermes\b|\bccc-node\b|\ba2a-nexus\b", re.IGNORECASE
+)
+
+
+def _promote_identity_hits(
+    text: str, nodes: list[str]
+) -> list[dict[str, object]]:
+    """Fleet identities a promoted skill should have generalized away.
+
+    `policies/REVIEW.md` makes removing node/provider facts a promotion duty.
+    The existing intake gate (`ownership._NODE_FACT_RE`) does not cover this:
+    it matches paths, IPs, emails and URLs — infrastructure — and says nothing
+    about who the fleet is. That is why 4 of the 32 candidates promoted on
+    2026-09-17 still needed a hand edit after passing every automated gate.
+    """
+    hits: list[dict[str, object]] = []
+    for index, line in enumerate(text.splitlines(), 1):
+        if nodes:
+            node_re = re.compile(
+                r"\b(" + "|".join(re.escape(n) for n in nodes) + r")\b", re.IGNORECASE
+            )
+            for found in node_re.finditer(line):
+                hits.append(
+                    {"line": index, "kind": "node-name", "match": found.group(0)}
+                )
+        for found in _PROMOTE_PRODUCT_RE.finditer(line):
+            hits.append({"line": index, "kind": "product", "match": found.group(0)})
+    return hits
+
+
+def _promote_worker_nodes(config: Config) -> list[str]:
+    """Worker aliases to scan for, minus anything that is also an audience."""
+    names = {str(config.node)} | {str(n) for n in getattr(config, "collect_nodes", ())}
+    try:
+        names |= {str(w) for w in _keyring_worker_ids(config)}
+    except PromotionError:
+        # A keyring this pass cannot read narrows the scan; it must never
+        # abort a promotion the operator is going to review by hand anyway.
+        pass
+    return sorted(n for n in names if n and n not in _AUDIENCES)
+
+
+def _promotable(
+    config: Config, rows: list[dict[str, object]], promoted: dict[str, str]
+) -> list[dict[str, str]]:
+    """Approved lineages whose candidate tree is not yet under `approved/`."""
+    trees = _candidate_trees_by_pr(rows)
+    approved_at = _approve_lineage_prs(rows)
+    published: dict[str, dict[str, object]] = {}
+    for row in rows:
+        if row.get("kind") is not None:
+            continue
+        found = re.search(r"/pull/(\d+)", str(row.get("url") or ""))
+        if found and row.get("tree_sha256"):
+            published[found.group(1)] = row
+    out: list[dict[str, str]] = []
+    for pr in sorted(approved_at, key=int):
+        tree = trees.get(pr)
+        row = published.get(pr)
+        if tree is None or row is None or tree in promoted:
+            continue
+        name = str(row.get("name") or "")
+        branch = str(row.get("branch") or "")
+        node = str(row.get("node") or "")
+        provider = str(row.get("provider") or "")
+        if not (name and branch and node and provider):
+            continue
+        out.append({
+            "pr": pr, "tree_sha256": tree, "name": name, "branch": branch,
+            "node": node, "provider": provider, "approved_at": approved_at[pr],
+        })
+    return out
+
+
+def _promote_stage(
+    work: Path, item: dict[str, str], *, audience: str
+) -> tuple[Path, str]:
+    """Copy one candidate's skill tree into `approved/<audience>/<name>`.
+
+    The content is read from the intake branch rather than rebuilt: the
+    `approve` verdict is bound to that exact tree, and `approval.json` claims
+    the same hash, so anything else would promote something nobody reviewed.
+    """
+    candidate_id = f"{item['name']}-{item['tree_sha256'][:12]}"
+    source = f"intake/{item['node']}/{item['provider']}/{candidate_id}/skill"
+    _run(["git", "fetch", "--quiet", "--depth", "1", "origin", item["branch"]], cwd=work)
+    listed = _run(
+        ["git", "ls-tree", "-r", "--name-only", "FETCH_HEAD", "--", source], cwd=work
+    )
+    try:
+        paths = [p for p in listed.stdout.decode("utf-8").splitlines() if p.strip()]
+    except UnicodeDecodeError as error:
+        raise PromotionError("promote_source_unreadable") from error
+    if not paths:
+        raise PromotionError("promote_source_missing")
+    target = work / "approved" / audience / item["name"]
+    for prefix in sorted(_AUDIENCES):
+        if (work / "approved" / prefix / item["name"]).exists():
+            raise PromotionError("central_name_exists")
+    target.mkdir(parents=True)
+    primary = ""
+    for path in paths:
+        blob = _run(["git", "show", f"FETCH_HEAD:{path}"], cwd=work)
+        relative = path[len(source) + 1:]
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(blob.stdout)
+        if relative == "SKILL.md":
+            primary = blob.stdout.decode("utf-8", "replace")
+    (target / "approval.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source_candidate_id": candidate_id,
+                "source_tree_sha256": item["tree_sha256"],
+                "approved_at": item["approved_at"],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return target, primary
+
+
+def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
+    """Open ONE draft PR staging every approved-but-unpromoted candidate.
+
+    This is the mechanical half of promotion — branch from current `main`,
+    copy the reviewed tree, write `approval.json`, group the batch, cite the
+    intake PRs. Measured on the 32 promoted by hand on 2026-09-17, 28 needed
+    no edit at all beyond exactly this.
+
+    The two halves that are NOT mechanical stay with a human, and the draft
+    exists to hand them over rather than guess:
+
+    - audience. The verdict schema carries none and the provider does not
+      imply one (29 `claude`-provider candidates went to `shared`, 2 to
+      `claude`), so every entry is staged as `shared` and listed in the PR
+      body for correction.
+    - generalization. `_promote_identity_hits` annotates any surviving fleet
+      identity; the human edits those lines before marking the PR ready.
+
+    Never merges, never marks ready, never closes an intake PR — #1778's
+    autoclose does that later, and only once the content is provably merged.
+    """
+    rows = _ledger_rows(config)
+    promoted = _promoted_source_trees(config)
+    pending = _promotable(config, rows, promoted)[:limit]
+    if not pending:
+        return {"ok": True, "mode": "promote", "staged": [], "outcome": "nothing-to-promote"}
+    if dry_run:
+        return {
+            "ok": True,
+            "mode": "promote-dry-run",
+            "staged": [
+                {"outcome": "would-stage", "pr": item["pr"], "name": item["name"],
+                 "audience": _PROMOTE_DEFAULT_AUDIENCE}
+                for item in pending
+            ],
+        }
+    nodes = _promote_worker_nodes(config)
+    branch = f"promote/auto-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    staged: list[dict[str, object]] = []
+    errors: list[dict[str, str]] = []
+    with tempfile.TemporaryDirectory(
+        prefix="skill-promote-", dir=config.promotion_state_dir
+    ) as raw:
+        work = Path(raw) / "repo"
+        _run(["git", "clone", "--quiet", "--depth", "1", "--branch", config.base,
+              config.remote, str(work)])
+        _run(["git", "checkout", "-b", branch], cwd=work)
+        for item in pending:
+            try:
+                target, primary = _promote_stage(
+                    work, item, audience=_PROMOTE_DEFAULT_AUDIENCE
+                )
+            except PromotionError as error:
+                errors.append({"pr": item["pr"], "name": item["name"], "code": error.code})
+                continue
+            _run(["git", "add", str(target.relative_to(work))], cwd=work)
+            staged.append({
+                "pr": item["pr"], "name": item["name"], "node": item["node"],
+                "audience": _PROMOTE_DEFAULT_AUDIENCE,
+                "tree_sha256": item["tree_sha256"],
+                "identity_hits": _promote_identity_hits(primary, nodes),
+            })
+        if not staged:
+            return {"ok": not errors, "mode": "promote", "staged": [], "errors": errors,
+                    "outcome": "nothing-staged"}
+        _run(
+            ["git", "-c", f"user.name=ccc-node skill promoter ({config.node})",
+             "-c", "user.email=ccc-node-skill-promoter@users.noreply.github.com",
+             "commit", "--quiet", "-m",
+             f"promote: {len(staged)} approved intake candidates"],
+            cwd=work,
+        )
+        _run(["git", "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}"], cwd=work)
+    flagged = [row for row in staged if row["identity_hits"]]
+    lines = [
+        f"Stages {len(staged)} approved intake candidate(s) for promotion. "
+        "Generated by `ccc-skill-promotion.py promote`; opened as a draft because "
+        "two decisions are still yours.",
+        "",
+        "## 1. audience — every entry defaults to `shared`",
+        "",
+        "The verdict schema carries no audience and the provider does not imply one, "
+        "so nothing here is inferred. `shared` installs under every provider root; "
+        "move a directory to `approved/claude`, `approved/codex`, `approved/piri` or "
+        "`approved/danso` if the skill is provider-specific.",
+        "",
+        "| intake | skill | audience | source tree |",
+        "| --- | --- | --- | --- |",
+    ]
+    for row in staged:
+        lines.append(
+            f"| #{row['pr']} | `{row['name']}` | `{row['audience']}` | "
+            f"`{str(row['tree_sha256'])[:12]}…` |"
+        )
+    lines += ["", "## 2. generalization", ""]
+    if flagged:
+        lines.append(
+            "`policies/REVIEW.md` requires node/provider facts to be removed before "
+            "promotion. These lines still name the fleet — edit them, then mark ready:"
+        )
+        lines.append("")
+        for row in flagged:
+            lines.append(f"- `{row['name']}`")
+            for hit in row["identity_hits"]:  # type: ignore[union-attr]
+                lines.append(
+                    f"  - L{hit['line']} [{hit['kind']}] `{hit['match']}`"
+                )
+    else:
+        lines.append("No fleet identity found in any staged `SKILL.md`.")
+    lines += [
+        "",
+        "## Provenance",
+        "",
+        "Each tree is copied from its intake branch unchanged — the `approve` verdict "
+        "is bound to that exact tree and `approval.json` records the same hash, so the "
+        "promoted content is what was reviewed. Intake PRs are left open; "
+        "`CCC_SKILL_PROMOTION_AUTOCLOSE` closes them once this merges.",
+    ]
+    completed = _run(
+        ["gh", "pr", "create", "--repo", config.repo, "--base", config.base,
+         "--head", branch, "--draft", "--title",
+         f"promote: {len(staged)} approved intake candidates", "--body", "\n".join(lines)]
+    )
+    try:
+        url = completed.stdout.decode("utf-8").strip().splitlines()[-1]
+    except (UnicodeDecodeError, IndexError):
+        raise PromotionError("github_output_invalid") from None
+    return {"ok": not errors, "mode": "promote", "branch": branch, "url": url,
+            "staged": staged, "errors": errors}
 
 
 def _receipt_retries(rows: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -5143,6 +5499,17 @@ def _parser() -> argparse.ArgumentParser:
     ack_parser.add_argument("transport_id")
     collect_parser = subparsers.add_parser("collect")
     collect_parser.add_argument("--dry-run", action="store_true")
+    promote_parser = subparsers.add_parser(
+        "promote",
+        help=(
+            "stage approved-but-unpromoted candidates as one DRAFT approved/* PR "
+            "(never merges, never marks ready; audience defaults to shared)"
+        ),
+    )
+    promote_parser.add_argument("--dry-run", action="store_true")
+    # Operator-invoked, not cron: one draft PR per run, and a batch nobody can
+    # review in one sitting is worse than two batches.
+    promote_parser.add_argument("--limit", type=int, default=8, choices=range(1, 33))
     drop_parser = subparsers.add_parser(
         "drop-report",
         help=(
@@ -5174,6 +5541,8 @@ def main(argv: list[str] | None = None) -> int:
             result = _ack_result(config, args.transport_id)
         elif args.command == "drop-report":
             result = _drop_report(config, acks=args.ack)
+        elif args.command == "promote":
+            result = _promote(config, dry_run=args.dry_run, limit=args.limit)
         else:
             result = _collect(config, dry_run=args.dry_run)
     except PromotionError as error:
