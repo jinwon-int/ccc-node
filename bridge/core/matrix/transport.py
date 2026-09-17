@@ -48,6 +48,7 @@ from telegram_bot.core.matrix.state import (
     mention_aliases,
     private_directory,
     saved_policy,
+    scope_of,
     turn_id,
     upgrade_saved_policy,
 )
@@ -66,6 +67,11 @@ NOTICE_UNCERTAIN = (
 # throttled progress notices and accepts a bare "/stop", so the notice was
 # dropped (owner request 2026-09-18). "/cancel <turn id>" still works; the
 # turn id is visible in the uncertain/ack notice when it matters.
+
+NOTICE_UNDECRYPTABLE = (
+    "이 메시지의 암호 키를 받지 못해 읽을 수 없었습니다. 다시 보내 주세요. "
+    "(봇 기기가 만들어지기 전에 보낸 메시지는 복구할 수 없습니다.)"
+)
 
 NONCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,64}")
 TURN_TIMEOUT_S = 1200.0
@@ -251,6 +257,7 @@ class MatrixTransport:
         self.active: Mapping[str, Any] | None = None
         self.turn_task: asyncio.Task[TurnResult] | None = None
         self.approvals: dict[str, asyncio.Future[bool]] = {}
+        self.key_requests: list[Any] = []
         self.cancel_requested = False
         self.matrix_lock = asyncio.Lock()
         self.stopping = False
@@ -642,6 +649,7 @@ class MatrixTransport:
                     req = self.admit_event(room, event)
                     if req:
                         await self.input(req)
+            await self._request_room_keys()
             self.store.commit_sync(raw["next_batch"])
             await self._upload_keys_if_needed()
             self.store.set_meta("health", {"state": "ready", "updated": time.time()})
@@ -655,7 +663,13 @@ class MatrixTransport:
         if event.server_timestamp < self.c["not_before_ms"]:
             return None
         if isinstance(event, MegolmEvent):
-            raise SafetyStop("undecrypted-event")
+            # The pilot fail-closed here, which poisons the service forever
+            # when a message was encrypted before this device existed (jingun
+            # 2026-09-18: the owner wrote seconds after accepting the invite,
+            # before the bot device was initialised — that megolm session can
+            # never reach us). Skip it, ask for the key, tell the room once.
+            self._undecryptable(room, event)
+            return None
         if not isinstance(event, RoomMessageText):
             return None
         if not event.decrypted:
@@ -664,6 +678,29 @@ class MatrixTransport:
         if not event.verified or not pins or event.sender_key not in {v["curve25519"] for v in pins.values()}:
             raise SafetyStop("unverified-owner-event" if event.sender == self.c["owner"] else "unverified-family-event")
         return self.policy.admit(room, event.source, decrypted=event.decrypted, now_ms=int(time.time() * 1000))
+
+    def _undecryptable(self, room: str, event: Any) -> None:
+        """Record an undecryptable event, queue a key request and a one-time room notice."""
+        event_id = str(getattr(event, "event_id", "") or "")
+        seen = self.store.get_meta("undecryptable_events") or []
+        if event_id and event_id not in [e.get("event_id") for e in seen]:
+            seen.append({"event_id": event_id, "room": room, "ts": getattr(event, "server_timestamp", None),
+                         "updated": time.time()})
+            self.store.set_meta("undecryptable_events", seen[-50:])
+        self.key_requests.append(event)
+        if event_id:
+            req = Request(event_id, room, str(getattr(event, "sender", "")), "notice",
+                          scope_of(self.c["account"], room, str(getattr(event, "sender", ""))))
+            self.store.notice(req, "undecryptable", NOTICE_UNDECRYPTABLE)
+
+    async def _request_room_keys(self) -> None:
+        """Best-effort m.room_key_request for events we could not decrypt."""
+        pending, self.key_requests = self.key_requests, []
+        for event in pending:
+            try:
+                await self.client.request_room_key(event)
+            except Exception:
+                pass  # the sender may simply not have the session for us
 
     # -- output ---------------------------------------------------------------
 
