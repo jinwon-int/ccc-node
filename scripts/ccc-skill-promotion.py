@@ -3883,7 +3883,11 @@ def _sweep_promoted_intakes(
     Default OFF (`promote_autoclose_enabled`). A publisher that has not opted
     in behaves exactly as before.
     """
-    if not config.promote_autoclose_enabled:
+    # Read defensively, as the substitute gate does for its own threshold: a
+    # real Config always carries the field, but the suite builds partial
+    # SimpleNamespace configs and an absent flag must mean OFF, never a crash
+    # in the middle of a collect that has already published and dispatched.
+    if not getattr(config, "promote_autoclose_enabled", False):
         return []
     rows = _ledger_rows(config)
     open_prs = {
