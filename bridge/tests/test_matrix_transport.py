@@ -668,7 +668,7 @@ async def test_empty_result_completes_without_reply(tmp_path: Path) -> None:
         await h.until(lambda: f.store.session(req.scope) == "synthetic-session")
         assert f.store.get_meta("last_turn")["outcome"] == "complete"
         assert not f.store.uncertain()
-        assert all(r.startswith("작업을 시작했습니다") for r in h.replies())
+        assert h.replies() == [], "no started notice and no reply for an empty streamed result"
         row = f.store.db.execute("SELECT state FROM jobs WHERE event_id='$request'").fetchone()
         assert row["state"] == "done"
 

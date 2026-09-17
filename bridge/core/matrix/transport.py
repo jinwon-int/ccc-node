@@ -60,7 +60,11 @@ NOTICE_UNCERTAIN = (
     "작업이 중단되어 결과 확인이 필요합니다. 자동으로 다시 실행하지 않습니다.\n"
     "결과를 확인한 뒤 다음 명령으로 대기를 해제할 수 있습니다:\n/ack "
 )
-NOTICE_STARTED = "작업을 시작했습니다. 취소 명령:\n/cancel "
+# The pilot posted "작업을 시작했습니다. 취소 명령: /cancel <turn>" at every turn
+# start because it had no typing indicator. This frontend shows typing plus
+# throttled progress notices and accepts a bare "/stop", so the notice was
+# dropped (owner request 2026-09-18). "/cancel <turn id>" still works; the
+# turn id is visible in the uncertain/ack notice when it matters.
 
 NONCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,64}")
 TURN_TIMEOUT_S = 1200.0
@@ -734,7 +738,6 @@ class MatrixTransport:
 
     async def run_turn(self, job: Mapping[str, Any]) -> None:
         """Execute one claimed job; anything short of a confirmed result leaves it uncertain."""
-        tid = turn_id(job["event_id"])
         self.active = job
         self.approvals = {}
         self.cancel_requested = False
@@ -750,7 +753,6 @@ class MatrixTransport:
         )
         self.turn_task = turn
         try:
-            self.store.notice(self.as_request(job), "started", NOTICE_STARTED + tid)
             # asyncio.wait (not `await turn`) keeps timeout/shutdown cancellation
             # with this loop: a runner that swallows CancelledError cannot absorb it.
             async with asyncio.timeout(self.turn_timeout):
