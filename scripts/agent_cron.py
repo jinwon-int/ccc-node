@@ -1340,9 +1340,10 @@ def notification_base(task):
 # rest of each row contains untrusted node names, paths, and free-form details.
 # Keep the order fixed and counts capped so the title shape and length are
 # deterministic even if a future output cap is raised.
-_FLEET_DIAGNOSTIC_TOKENS = ('DOWN', 'UNREACHABLE', 'DRIFT', 'BOOTPATH')
+_FLEET_DIAGNOSTIC_TOKENS = ('DOWN', 'UNREACHABLE', 'DRIFT', 'BOOTPATH',
+                            'DUALDOMAIN', 'NONCANONICAL', 'DEGRADED', 'UNVERIFIED')
 _FLEET_DIAGNOSTIC_LINE = re.compile(
-    r'^(DOWN|UNREACHABLE|DRIFT|BOOTPATH)(?=[ \t]|$)', re.MULTILINE
+    r'^(?:' + '|'.join(_FLEET_DIAGNOSTIC_TOKENS) + r')(?=[ \t]|$)', re.MULTILINE
 )
 _FLEET_DIAGNOSTIC_COUNT_MAX = 999
 _VALID_TASK_ID = re.compile(r'^[A-Za-z0-9_.-]{1,96}$')
@@ -1360,7 +1361,7 @@ def fleet_diagnostic_title(task_id, status, stdout, stderr):
     counts = {token: 0 for token in _FLEET_DIAGNOSTIC_TOKENS}
     for output in (stdout, stderr):
         for match in _FLEET_DIAGNOSTIC_LINE.finditer(output or ''):
-            token = match.group(1)
+            token = match.group(0)
             counts[token] = min(
                 counts[token] + 1, _FLEET_DIAGNOSTIC_COUNT_MAX
             )

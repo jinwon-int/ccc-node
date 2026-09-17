@@ -592,6 +592,21 @@ assert "SECRET_LOOKING_VALUE" not in failed_lines[0]
 assert "ignored" not in failed_lines[0]
 assert "SECRET_LOOKING_VALUE" not in failed
 
+# Every watcher failure category is summarized without copying node details.
+for category in ('DUALDOMAIN', 'NONCANONICAL', 'DEGRADED', 'UNVERIFIED'):
+    result = module.build_owner_text(task_id, 'category', None, 'failed', {
+        'exitCode': 1, 'stdout': category + ' private-node /secret/path\n',
+        'stderr': category + ' second-node\n' + category + 'SUFFIX ignored\n'})
+    assert result.splitlines()[0] == (
+        'agent-cron fleet alert for task adapter-fleet-watch: ' + category + '=2')
+    assert 'private-node' not in result.splitlines()[0]
+combined = module.fleet_diagnostic_title(task_id, 'failed',
+    'DOWN phone1\nDOWN phone2\nDUALDOMAIN server details\n', '')
+assert combined.endswith('DOWN=2 DUALDOMAIN=1'), combined
+for category in module._FLEET_DIAGNOSTIC_TOKENS:
+    title = module.fleet_diagnostic_title(task_id, 'failed', (category + '\n') * 1001, '')
+    assert title.endswith(category + '=999'), title
+
 # All non-success states use the same alert classification, including timeout.
 timed_out = module.build_owner_text(
     "fleet-doctor-sweep", "run-timeout", "2026-01-01T00:00:00Z", "timeout",

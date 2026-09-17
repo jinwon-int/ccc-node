@@ -130,7 +130,7 @@ is_prepared_runtime() {
 read -r -d '' PROBE <<'PROBE_EOF' || true
 # uid, not user: the `user` column truncates names longer than 8 characters
 # ("gongmyoung" -> "gongmyo+"), and the truncated form is not a valid su target.
-line=$(ps -eo uid=,pid=,command= 2>/dev/null | grep 'telegram_bot' | grep -- '--path' | grep -v grep | head -1)
+line=$(ps -eo uid=,pid=,ppid=,command= 2>/dev/null | grep 'telegram_bot' | grep -- '--path' | grep -v grep | head -1)
 if [ -z "$line" ]; then
   # No ccc bridge. Before calling the node down, look for a Danso resident
   # service. On a migrated node the serving process is `<exe> service run
@@ -211,8 +211,9 @@ fi
 echo "KIND=ccc"
 runuid=$(printf '%s' "$line" | awk '{print $1}')
 runpid=$(printf '%s' "$line" | awk '{print $2}')
+runppid=$(printf '%s' "$line" | awk '{print $3}')
 runuser=$(id -nu "$runuid" 2>/dev/null || printf '%s' "$runuid")
-cmd=$(printf '%s' "$line" | sed 's/^ *[0-9][0-9]* *[0-9][0-9]* *//')
+cmd=$(printf '%s' "$line" | sed 's/^ *[0-9][0-9]* *[0-9][0-9]* *[0-9][0-9]* *//')
 root=""
 for tok in $cmd; do case "$tok" in */bridge/*) root=${tok%%/bridge/*}; break ;; esac; done
 bpath=$(printf '%s' "$cmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i+1); exit}}')
@@ -226,14 +227,23 @@ bpath=$(printf '%s' "$cmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i
 # is consulted whenever it exists, so a prepared launch is reported even when
 # the worker line happens to carry a /bridge/ path.
 prepared=""
-sup=$(ps -eo uid=,command= 2>/dev/null | grep -- '--_daemon_supervisor' | grep -- '/bridge/start.sh' | grep -v grep | head -1)
+worker_exe=$(printf '%s' "$cmd" | awk '{print $1}')
+# The source must come from THIS worker's parent, not the first supervisor on
+# the host. Bind owner, project, and selected interpreter before using it.
+sup=$(ps -eo uid=,pid=,command= 2>/dev/null | awk -v uid="$runuid" -v pid="$runppid" '$1 == uid && $2 == pid {print; exit}')
 if [ -n "$sup" ]; then
-  supcmd=$(printf '%s' "$sup" | sed 's/^ *[0-9][0-9]* *//')
-  prepared=$(printf '%s' "$supcmd" | awk '{for(i=1;i<NF;i++) if($i=="--prepared-runtime") {print $(i+1); exit}}')
-  if [ -z "$root" ]; then
-    for tok in $supcmd; do case "$tok" in */bridge/*) root=${tok%%/bridge/*}; break ;; esac; done
-    [ -n "$bpath" ] || bpath=$(printf '%s' "$supcmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i+1); exit}}')
-  fi
+  supcmd=$(printf '%s' "$sup" | sed 's/^ *[0-9][0-9]* *[0-9][0-9]* *//')
+  case " $supcmd " in
+    *' --_daemon_supervisor '*)
+      candidate=$(printf '%s' "$supcmd" | awk '{for(i=1;i<NF;i++) if($i=="--prepared-runtime") {print $(i+1); exit}}')
+      sup_path=$(printf '%s' "$supcmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i+1); exit}}')
+      if [ -n "$candidate" ] && [ "$sup_path" = "$bpath" ] && [ "$worker_exe" = "$candidate/runtime/bin/python" ]; then
+        prepared=$candidate
+        if [ -z "$root" ]; then
+          for tok in $supcmd; do case "$tok" in */bridge/start.sh) root=${tok%/bridge/start.sh}; break ;; esac; done
+        fi
+      fi ;;
+  esac
 fi
 # A visible worker with an unrecognized layout is a failed inspection, not
 # evidence of downtime. Keep absence and confirmed unavailable as AVAIL=no.
@@ -246,6 +256,22 @@ if [ -n "$prepared" ] && grep -q '"status": *"ready"' "$prepared/receipt.json" 2
 else
   echo "PREPARED=-"
 fi
+
+# Metadata code travels with the watcher: peers need not upgrade or install it.
+# No temporary remote files, receipt writes, or launches are performed.
+metadata() {
+  python3 - "$1" "$root" "$prepared" "$bpath" "$runuid" <<'METADATA_PY'
+__CCC_FLEET_METADATA_SOURCE__
+METADATA_PY
+}
+case "$root" in
+  */.ccc-node/checkouts/*)
+    if [ -n "$prepared" ] && [ "$(metadata checkout 2>/dev/null)" = verified ]; then
+      echo 'CHECKOUT=verified'
+    else
+      echo 'CHECKOUT=unverified'
+    fi ;;
+esac
 
 # availability — run start.sh as the account that owns the process.
 # Name the interpreter (the #1160 defect class): shebang-exec'ing start.sh
@@ -308,16 +334,28 @@ echo "UNIT=${unit_root:--}"
 # node (measured on dungae and daegyo, 2026-08-11). The fix belongs in the
 # doctor, which alone knows which of its checks are existence tests and which
 # are live probes.
-if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ -x "$root/scripts/ccc-doctor.sh" ]; then
+if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ]; then
   cdir="${bpath:-$HOME}/.claude"
-  if [ "$(id -u)" = "$runuid" ]; then
-    CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 "$root/scripts/ccc-doctor.sh" >/dev/null 2>&1
-  elif [ "$(id -u)" != 0 ]; then
-    sudo -n -H -u "$runuser" -- env CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 bash "$root/scripts/ccc-doctor.sh" >/dev/null 2>&1
-  else
-    su - "$runuser" -c "CCC_DOCTOR_CLAUDE_DIR='$cdir' timeout 60 '$root/scripts/ccc-doctor.sh'" >/dev/null 2>&1
+  doctor_root=$root
+  # A staged runtime is not necessarily where setup installed the harness.
+  # Require its operator-owned install reference; never search for a checkout
+  # that happens to pass. Missing/unsafe references remain an explicit alert.
+  if [ -n "$prepared" ]; then
+    doctor_root=$(metadata installed 2>/dev/null) || doctor_root=""
   fi
-  echo "DOCTOR=$?"
+  if [ -z "$doctor_root" ] || [ ! -f "$doctor_root/scripts/ccc-doctor.sh" ]; then
+    echo 'DOCTOR=unverified'
+  else
+    echo "DOCTOR_ROOT=$doctor_root"
+    if [ "$(id -u)" = "$runuid" ]; then
+      CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 bash "$doctor_root/scripts/ccc-doctor.sh" >/dev/null 2>&1
+    elif [ "$(id -u)" != 0 ]; then
+      sudo -n -H -u "$runuser" -- env CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 bash "$doctor_root/scripts/ccc-doctor.sh" >/dev/null 2>&1
+    else
+      su - "$runuser" -c "CCC_DOCTOR_CLAUDE_DIR='$cdir' timeout 60 bash '$doctor_root/scripts/ccc-doctor.sh'" >/dev/null 2>&1
+    fi
+    echo "DOCTOR=$?"
+  fi
 else
   echo "DOCTOR=-"
 fi
@@ -421,6 +459,12 @@ else
   echo "DUALDOMAIN=-"
 fi
 PROBE_EOF
+META_FILE="$(cd "$(dirname "$0")" && pwd)/fleet_watch_metadata.py"
+[ -r "$META_FILE" ] || { echo 'UNVERIFIED watcher metadata-source=missing'; exit 1; }
+META_SOURCE=$(cat "$META_FILE")
+PROBE="${PROBE%%__CCC_FLEET_METADATA_SOURCE__*}$META_SOURCE${PROBE#*__CCC_FLEET_METADATA_SOURCE__}"
+# Read-only seam used by tests to execute the exact transmitted probe.
+if [ "${1:-}" = --print-probe ]; then printf '%s\n' "$PROBE"; exit 0; fi
 
 # One unanswered probe is a transport blip, not a health signal: on 2026-07-31
 # and 2026-08-01 single SSH failures paged UNREACHABLE for nodes that were fine
@@ -478,7 +522,7 @@ $PROBE"
     echo "DEGRADED $node runtime=$runtime"; fail=1; continue
   fi
 
-  if [ "$avail" = "unverified" ]; then
+  if [ "$avail" != yes ] && [ "$avail" != no ]; then
     echo "UNVERIFIED $node runtime=$runtime"; fail=1; continue
   fi
   if [ "$avail" != "yes" ]; then
@@ -511,12 +555,17 @@ $PROBE"
   # is empty, so the check does not run rather than guessing an answer.
   prepared=$(printf '%s\n' "$out" | sed -n 's/^PREPARED=//p' | head -1)
   prepared_tag=""
+  checkout=$(printf '%s\n' "$out" | sed -n 's/^CHECKOUT=//p' | head -1)
   if [ "$kind" = danso ]; then
     if [ -n "$CANON_DANSO_EXES" ] && ! is_canonical_danso_exe "$runtime"; then
       echo "NONCANONICAL $node runtime=$runtime"; fail=1; continue
     fi
   elif ! is_canonical_root "$runtime"; then
-    if is_prepared_runtime "$runtime" "$prepared"; then
+    if [ "$checkout" = verified ]; then
+      prepared_tag=", verified-checkout:${prepared##*/}"
+    elif [ "$checkout" = unverified ]; then
+      echo "UNVERIFIED $node runtime=$runtime inspection=prepared-checkout"; fail=1; continue
+    elif is_prepared_runtime "$runtime" "$prepared"; then
       prep_dir=${prepared%/*}
       prepared_tag=", prepared:${prep_dir##*/}"
     else
@@ -531,6 +580,9 @@ $PROBE"
   fi
 
   doctor=$(printf '%s\n' "$out" | sed -n 's/^DOCTOR=//p' | head -1)
+  if [ "$doctor" = unverified ]; then
+    echo "UNVERIFIED $node runtime=$runtime inspection=harness-reference"; fail=1; continue
+  fi
   # doctor exits nonzero on 교정가능/수동필요 findings; 경고 does not count.
   if [ -n "$doctor" ] && [ "$doctor" != "-" ] && [ "$doctor" != "0" ]; then
     echo "DRIFT $node doctor_exit=$doctor runtime=$runtime"; fail=1; continue
