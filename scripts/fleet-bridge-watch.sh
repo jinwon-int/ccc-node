@@ -143,16 +143,36 @@ if [ -z "$line" ]; then
     druser=$(id -nu "$druid" 2>/dev/null || printf '%s' "$druid")
     dexe=$(printf '%s' "$dline" | sed 's/^ *[0-9][0-9]* *//' | awk '{print $1}')
     echo "KIND=danso"
+    # The state root, taken from the command line that is already in hand.
+    # `danso service status` resolves it from `--data-dir` or from
+    # DANSO_TELEGRAM_DATA_DIR, and this probe has neither: it starts a fresh
+    # process carrying the *watch's* own variables, and a unit's `Environment=`
+    # reaches only the service systemd itself started. Without this the
+    # status call answered about a directory that does not exist, exited 2, and
+    # a serving node reported AVAIL=no — measured on yukson 2026-09-17
+    # (danso #118), the same false-DOWN class as #1761.
+    ddir=$(printf '%s' "$dline" | sed -n 's/.*--data-dir[ =]\{1,\}\([^ ]*\).*/\1/p' | head -1)
     # `--json`, not the text form: the text is a human rendering, while the JSON
     # also carries the runtime generation. The EXIT CODE, not the printed state,
     # is the availability signal — it is the same 0/1/2/3 contract the text's
     # first line describes, and it cannot be garbled by locale or encoding.
-    if [ "$(id -u)" = "$druid" ]; then
-      dj=$("$dexe" service status --json 2>/dev/null); drc=$?
-    elif [ "$(id -u)" != 0 ]; then
-      dj=$(sudo -n -H -u "$druser" -- "$dexe" service status --json 2>/dev/null); drc=$?
+    if [ -n "$ddir" ]; then
+      set -- service status --data-dir "$ddir" --json
     else
-      dj=$(su - "$druser" -c "'$dexe' service status --json" 2>/dev/null); drc=$?
+      # A service started without the argument resolves the directory from the
+      # variables it inherited; ask the same way and let the exit code speak.
+      set -- service status --json
+    fi
+    if [ "$(id -u)" = "$druid" ]; then
+      dj=$("$dexe" "$@" 2>/dev/null); drc=$?
+    elif [ "$(id -u)" != 0 ]; then
+      dj=$(sudo -n -H -u "$druser" -- "$dexe" "$@" 2>/dev/null); drc=$?
+    else
+      if [ -n "$ddir" ]; then
+        dj=$(su - "$druser" -c "'$dexe' service status --data-dir '$ddir' --json" 2>/dev/null); drc=$?
+      else
+        dj=$(su - "$druser" -c "'$dexe' service status --json" 2>/dev/null); drc=$?
+      fi
     fi
     case "$drc" in
       0) echo "AVAIL=yes" ;;
