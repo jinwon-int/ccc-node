@@ -234,5 +234,148 @@ class LedgerSchemaPinTests(unittest.TestCase):
         self.assertEqual(_iso_age_days(self.written_row()["approved_at"]), 9)
 
 
+def publish_row(pr: str, tree: str, name: str = "s1", node: str = "gwakga") -> dict:
+    """A publish row exactly as _collect_unlocked appends it.
+
+    Pinned deliberately: it is the outcome dict plus a timestamp, so it has NO
+    `kind` key. `_candidate_trees_by_pr` matches on that absence, which only
+    stays correct while this fixture keeps mirroring the producer.
+    """
+    return {
+        "ts": iso(days_ago=40),
+        "outcome": "pr-opened",
+        "branch": f"skill-intake/{node}/{name}-claude-{tree[:12]}",
+        "draft": "true",
+        "name": name,
+        "node": node,
+        "provider": "claude",
+        "source": node,
+        "state": "OPEN",
+        "transport_id": f"{node}-claude-{name}-{tree[:12]}",
+        "tree_sha256": tree,
+        "url": f"https://github.com/jinwon-int/fleet-skills/pull/{pr}",
+    }
+
+
+def state_row(pr: str, state: str, approved_at: str) -> dict:
+    return {"ts": approved_at, "kind": "a2a-intake-state", "pr": pr,
+            "state": state, "approved_at": approved_at}
+
+
+TREE_A = "a" * 64
+TREE_B = "b" * 64
+
+
+class CandidateTreeJoinTests(unittest.TestCase):
+    def test_publish_row_supplies_the_tree_hash(self) -> None:
+        self.assertEqual(
+            promotion._candidate_trees_by_pr([publish_row("140", TREE_A)]),
+            {"140": TREE_A},
+        )
+
+    def test_kinded_rows_are_ignored(self) -> None:
+        """Only the kind-less publish row carries a candidate tree."""
+        row = dict(publish_row("140", TREE_A), kind="a2a-dispatch")
+        self.assertEqual(promotion._candidate_trees_by_pr([row]), {})
+
+    def test_short_hash_is_rejected(self) -> None:
+        self.assertEqual(
+            promotion._candidate_trees_by_pr([publish_row("140", "abc")]), {}
+        )
+
+
+class PromotedIntakeSweepTests(unittest.TestCase):
+    def sweep(self, rows, *, promoted=None, dry_run=False, enabled=True, window=32,
+              close_fails=False):
+        written: list[dict] = []
+        closed: list[str] = []
+
+        def fake_run(args, **kwargs):
+            if args[:3] == ["gh", "pr", "close"]:
+                if close_fails:
+                    raise promotion.PromotionError("close_denied")
+                closed.append(args[3])
+            return types.SimpleNamespace(stdout=b"{}")
+
+        cfg = types.SimpleNamespace(
+            node="seoseo", repo="jinwon-int/fleet-skills", collect_window=window,
+            promote_autoclose_enabled=enabled)
+        with patch.object(promotion, "_ledger_rows", return_value=rows),              patch.object(promotion, "_append_ledger",
+                          side_effect=lambda _c, row: written.append(row)),              patch.object(promotion, "_promoted_source_trees",
+                          return_value=promoted or {}),              patch.object(promotion, "_run", side_effect=fake_run):
+            out = promotion._sweep_promoted_intakes(cfg, dry_run=dry_run)
+        return out, written, closed
+
+    def ledger(self, pr="140", tree=TREE_A, state="OPEN"):
+        return (approved(pr, days_ago=9) + [publish_row(pr, tree),
+                state_row(pr, state, iso(days_ago=9))])
+
+    def test_disabled_by_default_does_nothing(self) -> None:
+        out, written, closed = self.sweep(
+            self.ledger(), promoted={TREE_A: "approved/shared/s1"}, enabled=False)
+        self.assertEqual((out, written, closed), ([], [], []))
+
+    def test_exact_tree_match_closes_the_intake(self) -> None:
+        out, written, closed = self.sweep(
+            self.ledger(), promoted={TREE_A: "approved/shared/s1"})
+        self.assertEqual(closed, ["140"])
+        self.assertEqual([r["outcome"] for r in out], ["intake-closed"])
+        kinds = [r["kind"] for r in written]
+        self.assertEqual(kinds, ["a2a-intake-promoted", "a2a-intake-state"])
+        self.assertEqual(written[1]["state"], "CLOSED")
+
+    def test_unpromoted_lineage_is_left_open(self) -> None:
+        """Approved but not yet promoted is the normal state, not a leftover."""
+        out, written, closed = self.sweep(self.ledger(), promoted={})
+        self.assertEqual(closed, [])
+        self.assertEqual(written, [])
+        self.assertEqual([r["outcome"] for r in out], ["awaiting-promotion"])
+
+    def test_a_different_tree_never_closes(self) -> None:
+        """Same name, different content must not be read as promoted."""
+        out, _, closed = self.sweep(
+            self.ledger(), promoted={TREE_B: "approved/shared/s1"})
+        self.assertEqual(closed, [])
+        self.assertEqual([r["outcome"] for r in out], ["awaiting-promotion"])
+
+    def test_lineage_without_an_approve_verdict_is_skipped(self) -> None:
+        """A revise or reject lineage is an owner decision point, not a leftover."""
+        rows = [dispatch_row("t", "140"), verdict_row("t", "reject", days_ago=9),
+                publish_row("140", TREE_A), state_row("140", "OPEN", iso(days_ago=9))]
+        out, _, closed = self.sweep(rows, promoted={TREE_A: "approved/shared/s1"})
+        self.assertEqual((out, closed), ([], []))
+
+    def test_already_closed_pr_is_skipped(self) -> None:
+        out, _, closed = self.sweep(
+            self.ledger(state="CLOSED"), promoted={TREE_A: "approved/shared/s1"})
+        self.assertEqual((out, closed), ([], []))
+
+    def test_dry_run_closes_nothing(self) -> None:
+        out, written, closed = self.sweep(
+            self.ledger(), promoted={TREE_A: "approved/shared/s1"}, dry_run=True)
+        self.assertEqual((written, closed), ([], []))
+        self.assertEqual([r["outcome"] for r in out], ["would-close-promoted-intake"])
+
+    def test_close_failure_writes_no_ledger_row(self) -> None:
+        """A refused close must not leave the ledger claiming it happened."""
+        out, written, closed = self.sweep(
+            self.ledger(), promoted={TREE_A: "approved/shared/s1"}, close_fails=True)
+        self.assertEqual(written, [])
+        self.assertEqual([r["outcome"] for r in out], ["close-failed"])
+
+    def test_window_bounds_the_closes(self) -> None:
+        rows: list[dict] = []
+        promoted = {}
+        for n in range(6):
+            tree = f"{n}" * 64
+            pr = str(100 + n)
+            rows += approved(pr, days_ago=9 + n, task=f"t{n}")
+            rows += [publish_row(pr, tree, name=f"s{n}"),
+                     state_row(pr, "OPEN", iso(days_ago=9 + n))]
+            promoted[tree] = f"approved/shared/s{n}"
+        out, _, closed = self.sweep(rows, promoted=promoted, window=2)
+        self.assertEqual(len(closed), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)

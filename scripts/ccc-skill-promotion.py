@@ -141,6 +141,9 @@ class Config:
     # leaves the remote host. Empty tuple = single-broker behavior (default).
     remote_brokers: tuple[dict[str, str], ...] = ()
     revise_substitute_after_days: int = 0
+    # Default OFF. This is the pipeline's first write to an intake PR's
+    # lifecycle rather than its contents, so it stays opt-in per publisher.
+    promote_autoclose_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -382,6 +385,12 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         trust_root=home,
         error_code="revise_invalid",
     )
+    promote_autoclose_enabled = _tri_state_enabled(
+        env.get("CCC_SKILL_PROMOTION_AUTOCLOSE"),
+        state_dir / "skill-promotion.autoclose",
+        trust_root=home,
+        error_code="autoclose_invalid",
+    )
     raw_llm_cmd = env.get("CCC_SKILL_REVIEW_LLM_CMD")
     if raw_llm_cmd is None:
         review_llm_cmd: tuple[str, ...] = ("claude", "-p", "--disallowed-tools", "*")
@@ -458,7 +467,8 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         autorepair_enabled=autorepair_enabled,
         revise_enabled=revise_enabled,
         revise_round_limit=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_ROUNDS", 2, 1, 2),
-            revise_substitute_after_days=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_SUBSTITUTE_DAYS", 0, 0, 30),
+        revise_substitute_after_days=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_SUBSTITUTE_DAYS", 0, 0, 30),
+        promote_autoclose_enabled=promote_autoclose_enabled,
         revise_daily_cap=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_DAILY_CAP", 3, 1, 8),
         # #1394: verdict/revise-result collect window. The old fixed cap of 8
         # polled newest-first (LIFO), so any backlog beyond 8 starved the oldest
@@ -3801,6 +3811,150 @@ def _sweep_intake_states(
     return processed
 
 
+_PROMOTED_KIND = "a2a-intake-promoted"
+
+
+def _candidate_trees_by_pr(rows: list[dict[str, object]]) -> dict[str, str]:
+    """PR number -> the published candidate's `tree_sha256`.
+
+    The publish row is the only ledger row that carries the candidate tree
+    hash, and it is written as the publish outcome dict plus a timestamp — so
+    it has no `kind` at all. Matching on the fields it does carry is therefore
+    deliberate, not a shortcut.
+    """
+    trees: dict[str, str] = {}
+    for row in rows:
+        if row.get("kind") is not None:
+            continue
+        tree = row.get("tree_sha256")
+        found = re.search(r"/pull/(\d+)", str(row.get("url") or ""))
+        if isinstance(tree, str) and len(tree) == 64 and found:
+            trees[found.group(1)] = tree
+    return trees
+
+
+def _promoted_source_trees(config: Config) -> dict[str, str]:
+    """`source_tree_sha256` -> `approved/<audience>/<name>` on current base.
+
+    One shallow clone instead of one contents API call per `approval.json`:
+    the tree already holds ~75 of them and gains one on every promotion. Same
+    clone shape `_publish` already uses, and it never writes to the remote.
+    """
+    promoted: dict[str, str] = {}
+    with tempfile.TemporaryDirectory(
+        prefix="skill-promoted-", dir=config.promotion_state_dir
+    ) as raw:
+        work = Path(raw) / "repo"
+        _run(
+            ["git", "clone", "--quiet", "--depth", "1", "--branch", config.base,
+             config.remote, str(work)]
+        )
+        for path in sorted(work.glob("approved/*/*/approval.json")):
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                # A malformed approval.json is someone else's bug to fix; it
+                # must not decide whether an unrelated intake PR stays open.
+                continue
+            source = document.get("source_tree_sha256")
+            if isinstance(source, str) and len(source) == 64:
+                promoted[source] = path.parent.relative_to(work).as_posix()
+    return promoted
+
+
+def _sweep_promoted_intakes(
+    config: Config, *, dry_run: bool
+) -> list[dict[str, object]]:
+    """Close intake PRs whose candidate is provably already under `approved/`.
+
+    The evidence is the same one a human uses by hand: the promoted
+    `approval.json` records `source_tree_sha256`, and an intake PR is closed
+    only when that hash equals the candidate tree this publisher actually
+    published for it. Equality of a 64-char content hash is the whole test —
+    no name matching, no title parsing, nothing an operator has to trust.
+
+    Scope is deliberately narrow. `policies/REVIEW.md` forbids auto-close for
+    a `reject` verdict, which "keeps the PR open for an owner decision"; this
+    pass only ever touches lineages that carry an `approve` verdict and whose
+    content is already merged, where the PR is not a decision point but a
+    leftover. 32 of them were closed by hand on 2026-09-17 with exactly this
+    check and no mismatches.
+
+    Default OFF (`promote_autoclose_enabled`). A publisher that has not opted
+    in behaves exactly as before.
+    """
+    if not config.promote_autoclose_enabled:
+        return []
+    rows = _ledger_rows(config)
+    open_prs = {
+        pr
+        for pr, row in _recorded_intake_states(rows).items()
+        if str(row.get("state", "")) == "OPEN"
+    }
+    approved_at = _approve_lineage_prs(rows)
+    trees = _candidate_trees_by_pr(rows)
+    pending = sorted(
+        (pr for pr in open_prs if pr in approved_at and pr in trees), key=int
+    )[: config.collect_window]
+    if not pending:
+        return []
+    if dry_run:
+        return [{"outcome": "would-close-promoted-intake", "pr": pr} for pr in pending]
+    promoted = _promoted_source_trees(config)
+    processed: list[dict[str, object]] = []
+    for pr in pending:
+        tree = trees[pr]
+        path = promoted.get(tree)
+        if path is None:
+            # Approved but not yet promoted — the normal state this pass must
+            # leave alone. `check_skill_promotion_unpromoted` is what ages it.
+            processed.append({"outcome": "awaiting-promotion", "pr": pr})
+            continue
+        body = (
+            "승격 완료로 종료합니다.\n\n"
+            f"- 이 후보는 `{path}`에 승격되었습니다.\n"
+            f"- `approval.json`의 `source_tree_sha256`(`{tree[:12]}…`)가 이 "
+            "intake 후보 트리와 정확히 일치함을 확인했습니다.\n"
+            "- `policies/REVIEW.md`의 no-auto-close는 `reject` verdict에 적용됩니다. "
+            "이 계보는 `approve` verdict이고 내용이 이미 머지되어 있어 그 범위가 "
+            "아닙니다.\n"
+            "- intake 브랜치는 검토 전용이므로 merge되지 않고 종료됩니다.\n"
+        )
+        try:
+            _run(["gh", "pr", "close", pr, "--repo", config.repo, "--comment", body])
+        except PromotionError as error:
+            processed.append(
+                {"outcome": "close-failed", "pr": pr, "code": error.code}
+            )
+            continue
+        _append_ledger(
+            config,
+            {
+                "ts": _utc_now(),
+                "kind": _PROMOTED_KIND,
+                "pr": pr,
+                "approved_path": path,
+                "tree_sha256": tree,
+            },
+        )
+        # The state is known first-hand now, so record it rather than waiting a
+        # cycle: terminal is sticky, and the doctor stops counting it at once.
+        _append_ledger(
+            config,
+            {
+                "ts": _utc_now(),
+                "kind": _INTAKE_STATE_KIND,
+                "pr": pr,
+                "state": "CLOSED",
+                "approved_at": approved_at[pr],
+            },
+        )
+        processed.append(
+            {"outcome": "intake-closed", "pr": pr, "approved_path": path}
+        )
+    return processed
+
+
 def _receipt_retries(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     """Backfill old consumed verdicts too; rotate failures behind untried work."""
     consumed = {r.get("task_id") for r in rows
@@ -4956,6 +5110,9 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
     # rounds switched off, and it must see any verdict rows the passes above
     # appended in this same cycle.
     intake_states = _sweep_intake_states(config, dry_run=dry_run)
+    # After the state pass, which is what tells this one which PRs are still
+    # open — and which it then supersedes first-hand for the ones it closes.
+    promoted_intakes = _sweep_promoted_intakes(config, dry_run=dry_run)
     return {
         "ok": not errors,
         "mode": "collect-dry-run" if dry_run else "collect",
@@ -4966,6 +5123,7 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
         "errors": errors,
         "revise": revise,
         "intake_states": intake_states,
+        "promoted_intakes": promoted_intakes,
     }
 
 
