@@ -346,6 +346,7 @@ class ProjectChatProcessMixin:
         usage_mode: str = MODE_INTERACTIVE,
         resume_task: bool = False,
         dispatch_guard: Callable[[], bool] | None = None,
+        streaming_sink: Optional[Any] = None,
     ) -> ChatResponse:
         del message_id
         # The legacy permission seam (perm: buttons) belonged to the removed
@@ -438,6 +439,7 @@ class ProjectChatProcessMixin:
             usage_mode=usage_mode,
             resume_task=resume_task,
             dispatch_guard=dispatch_guard,
+            streaming_sink=streaming_sink,
         )
 
         # One bounded second attempt when the provider never spoke. Retrying is
@@ -496,6 +498,7 @@ class ProjectChatProcessMixin:
             resume_task=resume_task,
             dispatch_guard=dispatch_guard,
             admission_timeout_override=retry_grace,
+            streaming_sink=streaming_sink,
         )
         if retried.success:
             logger.info(
@@ -731,6 +734,7 @@ class ProjectChatProcessMixin:
         admission_timeout_override: Optional[float] = None,
         resume_task: bool = False,
         dispatch_guard: Callable[[], bool] | None = None,
+        streaming_sink: Optional[Any] = None,
     ) -> ChatResponse:
         """Run one provider-neutral turn without changing the Claude SDK path.
 
@@ -747,7 +751,13 @@ class ProjectChatProcessMixin:
             # default (CCC_CRUSH_MODEL) unless the turn chose a model itself.
             model = getattr(self._config, "crush_model", None) or None
         streaming_handler = None
-        if bot and getattr(self._config, "enable_streaming", False):
+        if streaming_sink is not None:
+            # A frontend-provided sink (Matrix, tests) replaces the Telegram
+            # draft editor; the handler only ever calls the five-method contract.
+            from telegram_bot.core.streaming_sink import validate_streaming_sink
+
+            streaming_handler = validate_streaming_sink(streaming_sink)
+        elif bot and getattr(self._config, "enable_streaming", False):
             from telegram_bot.core.streaming import StreamingMessageHandler
 
             streaming_handler = StreamingMessageHandler(
@@ -834,6 +844,7 @@ class ProjectChatProcessMixin:
                             self._config,
                             user_id=user_id,
                             chat_id=chat_id,
+                            route=getattr(self, "_memory_route", "telegram"),
                         )
                         if audience is not None:
                             if provider == "codex":
