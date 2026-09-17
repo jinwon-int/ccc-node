@@ -13,7 +13,9 @@ after the reviewed fix is integrated into the normal checkout.
 
 - **Availability:** confirmed unavailable/absent is `DOWN`; an alive but
   unmanaged service is `DEGRADED`. An incomplete or failed inspection is
-  `UNVERIFIED`, not evidence of downtime.
+  `UNVERIFIED`, not evidence of downtime. A successful transport exit and final
+  completion marker are required before accepting a result; a truncated doctor
+  response cannot become `OK`.
 - **Runtime source:** read from the worker, or its parent supervisor. Prepared
   launches must bind worker UID, parent PID, project path and interpreter to
   that supervisor. Another project's supervisor cannot supply the source.
@@ -26,7 +28,9 @@ after the reviewed fix is integrated into the normal checkout.
   The existing sibling `preparations/<name>/{source,job}` layout stays supported.
 - **Installed harness:** for a prepared launch, use the owner-private
   `.claude/self-update.repo` recorded by setup and maintained by the operator.
-  Validate the reference and expected CCC files; do not search for a checkout
+  Validate the reference, expected CCC files, imported script tree and their
+  ancestor ownership/write permissions (root or the serving owner; Android
+  platform ancestors are treated separately); do not search for a checkout
   that happens to pass. Missing, unsafe or unusable references alert as
   `UNVERIFIED`. The reference selects the installation baseline, not the running
   runtime, and cannot authorize a noncanonical runtime.

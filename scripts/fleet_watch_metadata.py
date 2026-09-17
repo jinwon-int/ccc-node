@@ -35,7 +35,38 @@ def private_text(path: Path, uid: int) -> str:
     return value.decode('utf-8')
 
 
+def protected_path(path: Path, uid: int) -> None:
+    """Reject foreign replacement/write access, including ancestor replacement.
+
+    Root and the runtime owner are trusted. Android's fixed OS-owned app
+    ancestors are a platform boundary, not arbitrary UID-1000 trust on Linux.
+    Sticky shared temporary ancestors are safe only with protected children.
+    """
+    physical(path)
+    android = hasattr(sys, 'getandroidapilevel')
+    for item in (path, *path.parents):
+        info = item.stat()
+        is_dir = stat.S_ISDIR(info.st_mode)
+        platform_parent = android and str(item) in ('/data', '/data/data')
+        owners = {0, uid, 1000} if platform_parent else {0, uid}
+        if info.st_uid not in owners:
+            raise ValueError('foreign_path_owner')
+        writable = info.st_mode & 0o022
+        # Android assigns these app ancestors matching private app/system GIDs.
+        app_parent = android and str(item) == '/data/data/com.termux/files'
+        private_android_group = ((platform_parent or app_parent)
+                                 and info.st_gid == info.st_uid
+                                 and not info.st_mode & 0o002)
+        sticky_ancestor = (item != path and is_dir
+                           and info.st_uid == 0 and info.st_mode & stat.S_ISVTX)
+        if writable and not (private_android_group or sticky_ancestor):
+            raise ValueError('foreign_writable_path')
+        if not (is_dir or stat.S_ISREG(info.st_mode)):
+            raise ValueError('nonregular_path')
+
+
 def installed_root(project: Path, uid: int) -> Path:
+    protected_path(project / '.claude', uid)
     value = private_text(project / '.claude/self-update.repo', uid).strip()
     # Line-oriented shell output must never become executable syntax or extra
     # probe keys. Supported operator paths have no whitespace/metacharacters.
@@ -44,8 +75,16 @@ def installed_root(project: Path, uid: int) -> Path:
     root = physical(Path(value))
     for name in ('scripts/ccc-doctor.sh', 'claude/settings.base.json', 'bridge/start.sh'):
         path = physical(root / name)
+        protected_path(path, uid)
         if not path.is_file():
             raise ValueError('incomplete_install_reference')
+    # The wrapper imports Python modules/helpers from scripts. Protect those
+    # too, including cached/import-shadow files, before invoking the wrapper.
+    for path in (root / 'scripts').rglob('*'):
+        protected_path(path, uid)
+    checker = root / 'bridge/runtime_config_check.py'
+    if checker.exists():
+        protected_path(checker, uid)
     return root
 
 

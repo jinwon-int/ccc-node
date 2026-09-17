@@ -2,6 +2,9 @@
 """Adversarial fixtures for streamed metadata; no fleet access or launches."""
 import json
 import os
+import pwd
+import shutil
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -26,6 +29,8 @@ class MetadataTest(unittest.TestCase):
         self.ref.parent.mkdir(mode=0o700)
         self.ref.write_text(str(self.repo) + '\n')
         self.ref.chmod(0o600)
+        for directory in [self.home, self.repo, *self.repo.rglob('*')]:
+            directory.chmod(0o700 if directory.is_dir() else 0o600)
 
     def test_installed_reference_is_distinct_from_runtime(self):
         self.assertEqual(meta.installed_root(self.home, self.uid), self.repo)
@@ -76,6 +81,56 @@ class MetadataTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             meta.installed_root(self.home, self.uid)
 
+    def test_foreign_writable_install_or_reference_ancestor(self):
+        for path in (self.repo, self.repo / 'scripts', self.repo / 'scripts/ccc-doctor.sh',
+                     self.ref.parent, self.home):
+            old = path.stat().st_mode & 0o777
+            path.chmod(0o777)
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                meta.installed_root(self.home, self.uid)
+            path.chmod(old)
+
+    def test_import_helper_permissions(self):
+        helper = self.repo / 'scripts/ccc_secure_fs.py'
+        helper.write_text('# fixture')
+        helper.chmod(0o666)
+        with self.assertRaises(ValueError):
+            meta.installed_root(self.home, self.uid)
+
+    @unittest.skipUnless(os.getuid() == 0 and shutil.which('runuser'), 'requires root/runuser')
+    def test_actual_foreign_replacement_cannot_select_doctor(self):
+        # Separate shared-temp fixture so the unprivileged attacker can traverse.
+        nobody = pwd.getpwnam('nobody')
+        with tempfile.TemporaryDirectory(dir='/tmp') as tmp:
+            parent = Path(tmp)
+            parent.chmod(0o755)
+            root = parent / 'install'
+            root.mkdir(mode=0o755)
+            for name in ('scripts/ccc-doctor.sh', 'claude/settings.base.json', 'bridge/start.sh'):
+                p = root / name
+                p.parent.mkdir(mode=0o755, exist_ok=True)
+                p.write_text('exit 0\n')
+                p.chmod(0o644)
+            self.ref.write_text(str(root))
+            (root / 'scripts').chmod(0o777)
+            script = root / 'scripts/ccc-doctor.sh'
+            subprocess.run(['runuser', '-u', nobody.pw_name, '--', sys.executable, '-c',
+                'from pathlib import Path; import sys; p=Path(sys.argv[1]); p.unlink(); p.write_text("exit 0")',
+                str(script)], check=True)
+            self.assertEqual(script.stat().st_uid, nobody.pw_uid)
+            with self.assertRaises(ValueError):
+                meta.installed_root(self.home, self.uid)
+            # Fixing the directory alone must not bless the foreign-owned file.
+            (root / 'scripts').chmod(0o755)
+            with self.assertRaises(ValueError):
+                meta.installed_root(self.home, self.uid)
+
+    @unittest.skipUnless(os.getuid() == 0, 'requires chown')
+    def test_root_owned_protected_install_allowed_for_nonroot_owner(self):
+        owner = pwd.getpwnam('nobody').pw_uid
+        os.chown(self.ref, owner, -1)
+        self.assertEqual(meta.installed_root(self.home, owner), self.repo)
+
     def prepared(self):
         root = self.home / '.ccc-node/checkouts/staging'
         (root / 'bridge').mkdir(parents=True)
@@ -90,6 +145,8 @@ class MetadataTest(unittest.TestCase):
         self.job = self.home / '.ccc-node/preparations/fixture-api24'
         (self.job / 'runtime').mkdir(parents=True)
         self.job.chmod(0o700)
+        self.job.parent.chmod(0o700)
+        (self.job / 'runtime').chmod(0o700)
         seal = {'sha256': 'a' * 64, 'files': 1, 'bytes': 20}
         self.receipt = {'schema': 'ccc.termux-preparation.v1', 'status': 'ready',
                         'work_dir': str(self.job), 'source_seal': seal}

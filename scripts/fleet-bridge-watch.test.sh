@@ -28,6 +28,9 @@ for a in "\$@"; do case "\$a" in -o|-*) ;; sh|-s) ;; *) node="\$a" ;; esac; done
 f="$TMP/reply/\$node"
 [ -f "\$f" ] || exit 255
 cat "\$f"
+[ -f "\$f.incomplete" ] || echo PROBE_COMPLETE=1
+[ ! -f "\$f.rc" ] || exit "\$(cat "\$f.rc")"
+exit 0
 STUBEOF
 chmod +x "$STUB"
 mkdir -p "$TMP/reply"
@@ -262,6 +265,7 @@ if [ "\$left" -gt 0 ] 2>/dev/null; then printf '%s\n' \$((left - 1)) > "\$budget
 f="$TMP/reply/\$node"
 [ -f "\$f" ] || exit 255
 cat "\$f"
+echo PROBE_COMPLETE=1
 FLAKYEOF
 chmod +x "$FLAKY"
 mkdir -p "$TMP/flaky"
@@ -454,6 +458,8 @@ mkdir -p "$TMP/install-repo/scripts" "$TMP/install-repo/bridge" "$TMP/install-re
 touch "$TMP/install-repo/scripts/ccc-doctor.sh" "$TMP/install-repo/bridge/start.sh" "$TMP/install-repo/claude/settings.base.json"
 printf '%s\n' "$TMP/install-repo" > "$TMP/probe-home/.claude/self-update.repo"
 chmod 600 "$TMP/probe-home/.claude/self-update.repo"
+chmod go-w "$TMP" "$TMP/probe-home" "$TMP/probe-home/.claude"
+chmod -R go-w "$TMP/install-repo"
 # The simulated worker has UID0; use the actual owner for a portable fixture.
 # Root-less CI uses its own UID for the prepared worker and direct doctor stub.
 if [ "$(id -u)" = 0 ]; then
@@ -471,6 +477,27 @@ ok "unsafe installation record is unverified" 'grep -q "^DOCTOR=unverified$" "$T
 printf 'RUNTIME=/opt/ccc-node\n' > "$TMP/reply/partial"
 run partial
 ok "partial probe response stays UNVERIFIED" 'grep -q "^UNVERIFIED partial " "$OUT" && ! grep -q "^DOWN " "$OUT"'
+# Even a complete-looking availability response cannot mask transport failure.
+reply_d torn /opt/ccc-node yes /opt/ccc-node 0
+printf 'DUALDOMAIN=ok\n' >> "$TMP/reply/torn"
+printf '255\n' > "$TMP/reply/torn.rc"
+CCC_FLEET_DOCTOR=1 run torn
+ok "nonzero transport after availability stays UNVERIFIED" 'test "$RC" = 1 && grep -q "^UNVERIFIED torn inspection=incomplete-probe" "$OUT"'
+rm "$TMP/reply/torn.rc"
+for tail_fields in '' 'DOCTOR=0' 'DOCTOR=0\nDUALDOMAIN=ok'; do
+  reply torn /opt/ccc-node yes /opt/ccc-node
+  printf '%b\n' "$tail_fields" >> "$TMP/reply/torn"
+  touch "$TMP/reply/torn.incomplete"
+  CCC_FLEET_DOCTOR=1 run torn
+  ok "truncation before completion stays UNVERIFIED: $tail_fields" 'test "$RC" = 1 && grep -q "^UNVERIFIED torn inspection=incomplete-probe" "$OUT"'
+done
+rm "$TMP/reply/torn.incomplete"
+reply torn /opt/ccc-node yes /opt/ccc-node
+CCC_FLEET_DOCTOR=1 run torn
+ok "missing requested doctor fields stays UNVERIFIED even with marker" 'test "$RC" = 1 && grep -q "inspection=incomplete-doctor" "$OUT"'
+reply_dd torn /opt/ccc-node yes /opt/ccc-node 0 ok
+CCC_FLEET_DOCTOR=1 run torn
+ok "complete requested doctor inspection passes" 'test "$RC" = 0 && grep -q "^OK torn " "$OUT"'
 reply_d badref /opt/ccc-node yes /opt/ccc-node unverified
 run badref
 ok "unknown harness reference has explicit classification" 'grep -q "^UNVERIFIED badref .*inspection=harness-reference$" "$OUT"'

@@ -204,9 +204,10 @@ if [ -z "$line" ]; then
     echo "DOCTOR=-"
     echo "DUALDOMAIN=-"
     echo "PREPARED=-"
+    echo "PROBE_COMPLETE=1"
     exit 0
   fi
-  echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; echo "PREPARED=-"; exit 0
+  echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; echo "PREPARED=-"; echo "PROBE_COMPLETE=1"; exit 0
 fi
 echo "KIND=ccc"
 runuid=$(printf '%s' "$line" | awk '{print $1}')
@@ -247,7 +248,7 @@ if [ -n "$sup" ]; then
 fi
 # A visible worker with an unrecognized layout is a failed inspection, not
 # evidence of downtime. Keep absence and confirmed unavailable as AVAIL=no.
-[ -n "$root" ] || { echo "RUNTIME=-"; echo "AVAIL=unverified"; echo "UNIT=-"; echo "PREPARED=-"; exit 0; }
+[ -n "$root" ] || { echo "RUNTIME=-"; echo "AVAIL=unverified"; echo "UNIT=-"; echo "PREPARED=-"; echo "PROBE_COMPLETE=1"; exit 0; }
 echo "RUNTIME=$root"
 # The job is reported only when its receipt says the preparation completed;
 # an unfinished or absent receipt leaves the launch to the canonical-root check.
@@ -458,6 +459,7 @@ if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ "$runuser" = gongmyoung ] && id gongm
 else
   echo "DUALDOMAIN=-"
 fi
+echo "PROBE_COMPLETE=1"
 PROBE_EOF
 META_FILE="$(cd "$(dirname "$0")" && pwd)/fleet_watch_metadata.py"
 [ -r "$META_FILE" ] || { echo 'UNVERIFIED watcher metadata-source=missing'; exit 1; }
@@ -495,6 +497,7 @@ $PROBE"
     else
       out=$(printf '%s' "$payload" | timeout "$node_budget" "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$node" sh -s 2>/dev/null)
     fi
+    probe_rc=$?
     [ -n "$out" ] && break
     attempt=$((attempt + 1))
     [ "$attempt" -gt "$RETRIES" ] && break
@@ -505,9 +508,15 @@ $PROBE"
     echo "UNREACHABLE $node"; fail=1; continue
   fi
 
+  # Partial stdout does not prove the inspection finished. The probe is sent
+  # by this watcher, so there is no older remote protocol to fall back to.
+  if [ "$probe_rc" != 0 ] || [ "$(printf '%s\n' "$out" | tail -1)" != PROBE_COMPLETE=1 ]; then
+    echo "UNVERIFIED $node inspection=incomplete-probe"; fail=1; continue
+  fi
+
   avail=$(printf '%s\n' "$out" | sed -n 's/^AVAIL=//p' | head -1)
   runtime=$(printf '%s\n' "$out" | sed -n 's/^RUNTIME=//p' | head -1)
-  # Absent on a node running an older probe, which is a ccc node by definition.
+  # CCC is the default; Danso explicitly emits its kind.
   kind=$(printf '%s\n' "$out" | sed -n 's/^KIND=//p' | head -1)
   [ -n "$kind" ] || kind=ccc
   generation=$(printf '%s\n' "$out" | sed -n 's/^GENERATION=//p' | head -1)
@@ -582,6 +591,10 @@ $PROBE"
   doctor=$(printf '%s\n' "$out" | sed -n 's/^DOCTOR=//p' | head -1)
   if [ "$doctor" = unverified ]; then
     echo "UNVERIFIED $node runtime=$runtime inspection=harness-reference"; fail=1; continue
+  fi
+  dual=$(printf '%s\n' "$out" | sed -n 's/^DUALDOMAIN=//p' | head -1)
+  if [ "${CCC_FLEET_DOCTOR:-0}" = 1 ] && { [ -z "$doctor" ] || [ -z "$dual" ] || { [ "$kind" = ccc ] && [ "$doctor" = - ]; }; }; then
+    echo "UNVERIFIED $node runtime=$runtime inspection=incomplete-doctor"; fail=1; continue
   fi
   # doctor exits nonzero on 교정가능/수동필요 findings; 경고 does not count.
   if [ -n "$doctor" ] && [ "$doctor" != "-" ] && [ "$doctor" != "0" ]; then
