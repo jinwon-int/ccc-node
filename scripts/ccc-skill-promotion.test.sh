@@ -1510,6 +1510,99 @@ env "${base_env[@]}" python3 "$GATE_FIXTURE" "$PROMOTER" > "$TMP/gate-out" 2>&1;
 ok "broker routing gate: bor semantics, gated fetch resolutions, visible mismatch consumption" \
   '[ "$rc" = 0 ] && grep -q "GATE-UNIT-OK" "$TMP/gate-out" && grep -q "GATE-CONSUME-OK" "$TMP/gate-out"'
 
+# --- #1766: a secret-missing dispatch skip must be durable and greppable ----
+# The skip itself is correct — without A2A_EDGE_SECRET there is nothing to
+# dispatch with. What was wrong is that it left no trace anyone would find: the
+# intake PR opened, its review round never ran, and six PRs sat on a2a/receipts
+# FAILURE for days. This pins both records the fix adds, that they name the
+# actual cause (the caller ran collect without the publisher edge env loaded),
+# and that neither is mistaken for a real dispatch by the idempotency scan or
+# the doctor joins that key on kind == "a2a-dispatch".
+SECRET_FIXTURE="$TMP/secret-missing-fixture.py"
+cat > "$SECRET_FIXTURE" <<'FIXTURE'
+import importlib.util, json, os, sys, tempfile
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("csp_secret", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["csp_secret"] = m
+spec.loader.exec_module(m)
+
+iso_state = Path(tempfile.mkdtemp()) / "skill-promotion"
+iso_state.mkdir(parents=True)
+env = dict(os.environ)
+env["CCC_STATE_DIR"] = str(iso_state.parent)
+config = m._config(env)
+ledger = iso_state / "ledger.jsonl"
+
+candidate = m.Candidate(
+    node="testnode", provider="claude", name="edge-skill",
+    skill_sha256="a" * 64, tree_sha256="b" * 64,
+    source_dir=Path(tempfile.mkdtemp()), files=(), description="d",
+)
+outcome = {
+    "outcome": "pr-opened",
+    "url": "https://github.com/test/repo/pull/183",
+    "branch": "skill-intake/testnode/edge-skill-0123456789ab",
+}
+transport = "testnode-claude-edge-skill-0123456789ab"
+
+# The head lookup is the first step past the secret gate; stub it so the
+# "secret present" leg below cannot reach the network on any machine.
+m._branch_head_sha = lambda config, branch: (_ for _ in ()).throw(
+    m.PromotionError("dispatch_head_unavailable"))
+
+os.environ.pop("A2A_EDGE_SECRET", None)
+result = m._dispatch_intake_review(config, candidate, outcome, transport_id=transport)
+assert result["outcome"] == "dispatch-skipped", result
+assert result["code"] == "dispatch_secret_missing", result
+assert "edge env not loaded" in result["fix"], result
+
+rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+skipped = [r for r in rows if r.get("kind") == "a2a-dispatch-skipped"]
+assert len(skipped) == 1, rows
+row = skipped[0]
+assert row["code"] == "dispatch_secret_missing", row
+assert (row["pr"], row["node"], row["name"]) == ("183", "testnode", "edge-skill"), row
+assert row["transport_id"] == transport, row
+assert row["pr_url"] == outcome["url"] and row["branch"] == outcome["branch"], row
+# The record has to name the fix, not just the symptom: which env file, which
+# override, and that the loading is the caller's job.
+for phrase in ("edge env not loaded", "A2A_EDGE_SECRET", ".a2a-broker-edge.env",
+               "CCC_A2A_EDGE_ENV", "collect"):
+    assert phrase in row["fix"], (phrase, row["fix"])
+# A skip is not a dispatch: the idempotency scan in _dispatch_intake_review and
+# every ccc_doctor join match kind == "a2a-dispatch" exactly, and must not see
+# this row and conclude the review round already went out.
+assert not [r for r in rows if r.get("kind") == "a2a-dispatch"], rows
+assert ledger.stat().st_mode & 0o777 == 0o600, oct(ledger.stat().st_mode)
+print("SECRET-SKIP-OK")
+
+# Every run that skips appends: the timestamps are what show an operator how
+# many days the gap has been accumulating, which is the whole point.
+m._dispatch_intake_review(config, candidate, outcome, transport_id=transport)
+rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+assert len([r for r in rows if r.get("kind") == "a2a-dispatch-skipped"]) == 2, rows
+print("SECRET-SKIP-TRAIL-OK")
+
+# With the secret present the gate is passed and this record is never written —
+# the dispatch fails later, for its own reason, exactly as before.
+os.environ["A2A_EDGE_SECRET"] = "fixture-edge-secret-value"
+result = m._dispatch_intake_review(config, candidate, outcome, transport_id=transport)
+assert result["code"] == "dispatch_head_unavailable", result
+rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+assert len([r for r in rows if r.get("kind") == "a2a-dispatch-skipped"]) == 2, rows
+# Nothing this path records may carry the secret itself.
+assert "fixture-edge-secret-value" not in ledger.read_text(encoding="utf-8")
+print("SECRET-PRESENT-OK")
+FIXTURE
+env "${base_env[@]}" python3 "$SECRET_FIXTURE" "$PROMOTER" > "$TMP/secret-out" 2>&1; rc=$?
+ok "#1766: secret-missing dispatch skip is recorded durably and names the fix" \
+  '[ "$rc" = 0 ] && grep -q "SECRET-SKIP-OK" "$TMP/secret-out" && grep -q "SECRET-SKIP-TRAIL-OK" "$TMP/secret-out" && grep -q "SECRET-PRESENT-OK" "$TMP/secret-out"'
+ok "#1766: the skip is also warned on stderr, where the autosave log collects it" \
+  'grep -q "warn: dispatch_secret_missing" "$TMP/secret-out" && grep -q "intake PR #183" "$TMP/secret-out" && grep -q "edge env not loaded" "$TMP/secret-out"'
+ok "#1766: no secret value is ever printed" \
+  '! grep -q "fixture-edge-secret-value" "$TMP/secret-out"'
+
 # --- 2026-09-04 #1470: signed receipt projection at consumption -----------
 RECEIPT_FIXTURE="$TMP/receipt-fixture.py"
 cat > "$RECEIPT_FIXTURE" <<'FIXTURE'
