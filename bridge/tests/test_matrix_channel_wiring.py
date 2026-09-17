@@ -45,6 +45,26 @@ def test_unknown_channel_is_rejected(tmp_path: Path) -> None:
         _settings(tmp_path, CCC_CHANNEL="irc")
 
 
+def test_bot_data_dir_override_moves_logs_and_sessions_with_it(tmp_path: Path) -> None:
+    # A second frontend on the same project root gets its own pid/health/
+    # session files by overriding BOT_DATA_DIR alone (service unit example).
+    matrix = _settings(
+        tmp_path,
+        CCC_CHANNEL="matrix",
+        CCC_MATRIX_CONFIG_PATH=str(tmp_path / "m.json"),
+        BOT_DATA_DIR=str(tmp_path / ".ccc-matrix"),
+    )
+    assert matrix.bot_data_dir == tmp_path / ".ccc-matrix"
+    assert matrix.logs_dir == tmp_path / ".ccc-matrix" / "logs"
+    assert matrix.session_store_path == tmp_path / ".ccc-matrix" / "sessions.json"
+    # Explicit overrides still win, and the Telegram defaults are unchanged.
+    explicit = _settings(tmp_path, BOT_DATA_DIR=str(tmp_path / "d"), LOGS_DIR=str(tmp_path / "elsewhere"))
+    assert explicit.logs_dir == tmp_path / "elsewhere"
+    telegram = _settings(tmp_path)
+    assert telegram.bot_data_dir == tmp_path / ".telegram_bot"
+    assert telegram.session_store_path == tmp_path / ".telegram_bot" / "sessions.json"
+
+
 def test_build_context_routes_memory_by_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     telegram = build_context(_settings(tmp_path))
     assert telegram.project_chat._memory_route == "telegram"

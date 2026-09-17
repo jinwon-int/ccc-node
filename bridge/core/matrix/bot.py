@@ -31,6 +31,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import signal
 import time
 from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol
 
@@ -276,7 +277,7 @@ class MatrixBot:
 
         return MatrixTransport(dict(config), runner)
 
-    async def run(self) -> None:
+    async def serve(self) -> None:
         """Open the transport and serve until it returns; always closes it."""
 
         config = self.load_config()
@@ -289,6 +290,39 @@ class MatrixBot:
         finally:
             self._transport = None
             await transport.close()
+
+    def run(self) -> None:
+        """Blocking entry point with the same contract as ``TelegramBot.run()``.
+
+        ``__main__.main()`` calls ``bot.run()`` synchronously, so this owns the
+        event loop: access control and the session store are initialised the
+        way the Telegram lifecycle does, SIGTERM/SIGINT cancel the serving task
+        (the transport joins the running turn and marks it uncertain), and an
+        orderly stop exits cleanly for systemd.
+        """
+
+        from telegram_bot.core.bot_shared import enforce_access_control
+
+        enforce_access_control(self._settings)
+        initialize = getattr(self._session_manager, "initialize", None)
+        if callable(initialize):
+            initialize()
+
+        async def _main() -> None:
+            loop = asyncio.get_running_loop()
+            task = asyncio.current_task()
+            assert task is not None
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, task.cancel)
+                except (NotImplementedError, RuntimeError):  # pragma: no cover - non-POSIX loops
+                    pass
+            try:
+                await self.serve()
+            except asyncio.CancelledError:
+                logger.info("Matrix frontend stopped")
+
+        asyncio.run(_main())
 
     # -- outbound routing ----------------------------------------------------
 

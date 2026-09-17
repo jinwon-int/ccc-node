@@ -715,7 +715,7 @@ async def test_notification_bot_reverse_maps_chat_id_to_room(tmp_path: Path, mat
             await route.send_message(chat_id=42, text="nowhere")
 
     holder["body"] = body
-    await bot.run()
+    await bot.serve()
     assert holder["transport"].notices == [(DM_ROOM, "dm notice"), (FAMILY_ROOM, "family notice")]
 
 
@@ -733,7 +733,7 @@ async def test_async_completion_sender(tmp_path: Path, matrix_config: dict[str, 
         results.append(await chat.sender(user, 999, "unknown chat"))
 
     holder["body"] = body
-    await bot.run()
+    await bot.serve()
     assert results == [True, False]
     assert holder["transport"].notices == [(DM_ROOM, "done: PR merged")]
     # After the transport is closed there is no delivery path.
@@ -771,7 +771,7 @@ async def test_plain_transport_gets_plain_text(tmp_path: Path, matrix_config: di
         seen["result"] = await bot.run_turn(_job("go"), sink=sink, session_id=None, room_kind="direct")
 
     holder["body"] = body
-    await bot.run()
+    await bot.serve()
     assert seen["result"].text == "**bold**"
     assert seen["result"].streamed is False
     assert sink.interims == ["*part*"]
@@ -795,7 +795,7 @@ async def test_formatted_transport_gets_rendered_html(tmp_path: Path, matrix_con
         seen["result"] = await bot.run_turn(_job("go"), sink=sink, session_id=None, room_kind="direct")
 
     holder["body"] = body
-    await bot.run()
+    await bot.serve()
     transport = holder["transport"]
     assert transport.formatted == [
         (DM_ROOM, "*part*", "<p><em>part</em></p>"),
@@ -828,7 +828,7 @@ async def test_formatted_send_failure_falls_back_to_plain(tmp_path: Path, matrix
         seen["result"] = await bot.run_turn(_job("go"), sink=sink, session_id=None, room_kind="direct")
 
     holder["body"] = body
-    await bot.run()
+    await bot.serve()
     assert sink.interims == ["*part*"]
     assert seen["result"].streamed is False
     assert seen["result"].text == "**bold**"
@@ -847,7 +847,7 @@ async def test_run_lifecycle_with_transport_factory(tmp_path: Path, matrix_confi
         return FakeTransport(config, runner)
 
     bot._transport_factory = factory
-    await bot.run()
+    await bot.serve()
     (config, runner), = built
     assert config["owner"] == OWNER
     assert isinstance(runner, MatrixTurnRunner)
@@ -868,7 +868,7 @@ async def test_run_closes_transport_when_run_fails(tmp_path: Path, matrix_config
 
     bot._transport_factory = factory
     with pytest.raises(RuntimeError, match="sync loop died"):
-        await bot.run()
+        await bot.serve()
     assert transports[0].events == ["open", "run", "close"]
 
 
@@ -880,3 +880,22 @@ async def test_turn_runner_delegates_to_bot(tmp_path: Path, matrix_config: dict[
     assert result.text == "answer"
     assert chat.calls[0]["user_message"] == "via runner"
     assert await runner.cancel(_job("x")) is True
+
+
+def test_run_is_the_blocking_entry_main_expects(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    """``__main__.main()`` calls ``bot.run()`` synchronously; it must drive ``serve``."""
+
+    bot, chat, manager = _bot(tmp_path)
+    transports: list[FakeTransport] = []
+    initialised: list[bool] = []
+    manager.initialize = lambda: initialised.append(True)  # type: ignore[attr-defined]
+
+    async def script(transport: FakeTransport) -> None:
+        transports.append(transport)
+
+    bot._transport_factory = lambda config, runner: FakeTransport(config, runner, script=script)
+    result = bot.run()  # blocks until the fake transport's run() returns
+    assert result is None
+    assert initialised == [True]
+    assert transports and transports[0].events == ["open", "run", "close"]
+    assert chat.sender == bot.async_completion_sender
