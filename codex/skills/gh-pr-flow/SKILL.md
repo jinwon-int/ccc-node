@@ -23,16 +23,21 @@ protection, or move a credential between nodes.
    gh pr merge NUMBER --repo OWNER/REPO --squash --delete-branch
    ```
 
-   **Merge queue on `ccc-node` `main` (since 2026-09-13):** direct merge is
-   refused ("the merge strategy for main is set by the merge queue"). Enqueue
-   instead, then poll until `state` is `MERGED` (the queue evicts on failing
-   group checks; a new head needs fresh approval before re-enqueueing):
+   **Merge queue on `ccc-node` `main` (since 2026-09-13) and `fleet-skills`
+   `main` (since 2026-09-17):** direct merge is refused ("the merge strategy
+   for main is set by the merge queue"). Enqueue instead, then poll until
+   `state` is `MERGED` (the queue evicts on failing group checks; a new head
+   needs fresh approval before re-enqueueing):
 
    ```bash
-   pr_id="$(gh pr view NUMBER --repo jinwon-int/ccc-node --json id --jq .id)"
+   pr_id="$(gh pr view NUMBER --repo OWNER/REPO --json id --jq .id)"
    gh api graphql -f query='mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){clientMutationId}}' -f id="$pr_id"
-   gh pr view NUMBER --repo jinwon-int/ccc-node --json state,mergeStateStatus
+   gh pr view NUMBER --repo OWNER/REPO --json state,mergeStateStatus
    ```
+
+   Enabling a queue on a further repo has a prerequisite: every *required*
+   check's workflow must also trigger on `merge_group`, or the group never
+   reports and enqueued PRs wait forever.
 
 4. Verify the merged commit and remote branch deletion before removing a local
    squash-merged branch.
