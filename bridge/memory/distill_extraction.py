@@ -346,18 +346,42 @@ class ResumeState(_StrictModel):
             allow_empty=True,
         )
 
-    @field_validator("evidence")
+    @field_validator("evidence", mode="before")
     @classmethod
-    def validate_evidence(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        for item in value:
-            if (
-                not isinstance(item, str)
-                or len(item) > 128
-                or len(item.encode("utf-8")) > 128
-                or not _EVIDENCE_ID_RE.fullmatch(item)
-            ):
-                raise ValueError("resume.evidence contains an invalid evidence identifier")
-        return value
+    def drop_unusable_evidence(cls, value: object) -> object:
+        """Drop items that are not evidence identifiers; keep the payload.
+
+        This field is a list of linkable ids, and extractors intermittently put
+        a description there instead ("10 unit tests", "mutant 8/8 KILLED").
+        Such a string is not a pointer to anything, so there is nothing to
+        salvage from it -- but failing it used to fail the whole
+        ``DistillExtractionOutput``, discarding up to twelve honcho facts and
+        the entire resume state with it. Measured on yukson: after the wiki-path
+        fix, this field alone accounted for every remaining haiku rejection.
+
+        The item is dropped rather than repaired, and the published schema keeps
+        its strict ``pattern`` on purpose: extractors should still be told to
+        emit ids, and widening the shape to admit prose would turn a link list
+        into a free-text bag. Dropping never *admits* a value the strict
+        validator would have refused, so the accepted set is unchanged -- this
+        only moves the blast radius from the payload to the offending item.
+
+        The count bound is deliberately NOT enforced here. It is applied after
+        filtering, and it stays fatal: too many *valid* ids is the extractor
+        exceeding a published bound, and silently truncating those would lose
+        real evidence instead of unusable text.
+        """
+
+        if not isinstance(value, (list, tuple)):
+            return value
+        return tuple(
+            item
+            for item in value
+            if isinstance(item, str)
+            and len(item) <= 128
+            and len(item.encode("utf-8")) <= 128
+            and _EVIDENCE_ID_RE.fullmatch(item)
+        )
 
 
 class DistillExtractionOutput(_StrictModel):
