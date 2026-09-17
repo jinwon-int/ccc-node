@@ -111,7 +111,6 @@ SAFETY_STOP_REASONS: frozenset[str] = frozenset(
         "sdk-room-membership-changed",
         "timeline-gap-requires-backfill",
         "invalid-sync-response",
-        "undecrypted-event",
         "unverified-owner-event",
         "unverified-family-event",
         "plaintext-output-refused",

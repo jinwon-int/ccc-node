@@ -24,6 +24,7 @@ import pytest
 from telegram_bot.core.matrix import transport as t
 from telegram_bot.core.matrix.state import MatrixStore, SafetyStop, turn_id
 from telegram_bot.core.matrix.transport import (
+    NOTICE_UNDECRYPTABLE,
     FAMILY_NOTICE,
     NOTICE_ACKED,
     NOTICE_CONTROL_FORWARDED,
@@ -1386,10 +1387,18 @@ async def test_family_admission_pinned_verified_mentioned_humans_only(tmp_path: 
             f.admit_event(FAMILY, event(key="z" * 43))
         with pytest.raises(SafetyStop, match="unverified-family-event"):
             f.admit_event(FAMILY, event(sender=MOM))  # allowlisted but without any pinned device
+        # An undecryptable event never stops the service: it is recorded, a key
+        # request is queued and the room is told once (jingun 2026-09-18).
         megolm = h.nio.MegolmEvent()
-        megolm.sender, megolm.server_timestamp = DAD, h.now
-        with pytest.raises(SafetyStop, match="undecrypted-event"):
-            f.admit_event(FAMILY, megolm)
+        megolm.sender, megolm.server_timestamp, megolm.event_id = DAD, h.now, "$undecryptable"
+        assert f.admit_event(FAMILY, megolm) is None
+        assert f.admit_event(FAMILY, megolm) is None  # duplicate: still one record, one notice
+        assert [e["event_id"] for e in f.store.get_meta("undecryptable_events")] == ["$undecryptable"]
+        assert f.key_requests == [megolm, megolm]
+        assert sum(NOTICE_UNDECRYPTABLE == r for r in h.replies()) == 1
+        f.client = types.SimpleNamespace(request_room_key=AsyncMock(side_effect=[None, RuntimeError("no session")]), close=AsyncMock())
+        await f._request_room_keys()
+        assert f.client.request_room_key.await_count == 2 and f.key_requests == []
         assert f.admit_event(FAMILY, types.SimpleNamespace(sender=DAD, server_timestamp=h.now)) is None  # not text
         undecrypted = event()
         undecrypted.decrypted = False

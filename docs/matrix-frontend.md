@@ -135,8 +135,12 @@ second node starts with a direct room only.
    node pins; `keys/query` from the bot token), `not_before_ms` = now.
 5. **Extra + unit** — `pip install -r bridge/requirements-matrix.txt`
    (needs `libolm3`/`libolm-dev`), install
-   `bridge/service-systemd-matrix.service.example`.
-6. **Initialize once** — `CCC_MATRIX_INITIALIZE=1 BOT_DATA_DIR=… CCC_CHANNEL=matrix
+   `bridge/service-systemd-matrix.service.example`. If the node's Telegram
+   unit sets the provider through `Environment=` lines (Piri on jingun),
+   mirror them into a `ccc-matrix-bridge.service.d/provider.conf` drop-in
+   (recipe in the example file) — otherwise the Matrix frontend runs the
+   default provider.
+6. **Initialize once** (after the owner accepted the invite — a direct room must be exactly {owner, bot}) — `CCC_MATRIX_INITIALIZE=1 BOT_DATA_DIR=… CCC_CHANNEL=matrix
    CCC_MATRIX_CONFIG_PATH=… <venv>/bin/python -m telegram_bot --path <root>`:
    creates the crypto store, uploads keys, pins devices, gates the room, exits.
    A normal start refuses an empty store (`explicit-new-device-initialization-required`).
