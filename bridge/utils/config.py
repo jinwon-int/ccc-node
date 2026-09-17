@@ -168,7 +168,11 @@ class Config(
             if environment_name in merged:
                 values[field.alias or name] = merged[environment_name]
 
-        data_dir = root / ".telegram_bot"
+        # A second frontend on the same project root (CCC_CHANNEL=matrix) runs
+        # with its own BOT_DATA_DIR so pid/health/session files never collide
+        # with the Telegram bridge; logs and the session store follow it
+        # unless they are overridden explicitly.
+        data_dir = Path(values.get("bot_data_dir") or root / ".telegram_bot")
         home = Path(process_values.get("HOME", str(Path.home()))).expanduser()
         claude_root = Path(process_values.get("CCC_CLAUDE_DIR", str(home / ".claude"))).expanduser()
         values["project_root"] = root

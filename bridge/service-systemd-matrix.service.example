@@ -1,0 +1,38 @@
+# ccc-node Matrix frontend (family messenger) — systemd unit example (#1780).
+#
+# Runs the SAME ProjectChatHandler as the Telegram bridge behind the E2EE
+# Matrix transport, as a second service on the same node/project root.
+# Install: copy to /etc/systemd/system/ccc-matrix-bridge.service, adjust the
+# paths, `systemctl daemon-reload && systemctl enable --now ccc-matrix-bridge`.
+#
+# Prerequisites on the node:
+#   - bridge venv with the matrix extra: <venv>/bin/pip install -r bridge/requirements-matrix.txt
+#   - private 0600 config JSON (see docs/matrix-frontend.md); reuse the pilot
+#     bot's config + state_directory so no new Matrix device is created
+#   - the pilot service (family-matrix) stopped — one bot device runs once
+#
+# The unit reuses the Telegram bridge's project .env (<project>/.telegram_bot/.env)
+# for provider/memory keys; only the channel keys and the data directory differ.
+[Unit]
+Description=ccc-node Matrix frontend (family messenger, CCC_CHANNEL=matrix)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ccc-node/bridge
+Environment=HOME=/root
+Environment=PROJECT_ROOT=/root
+# Separate runtime data so pid/health/session files never collide with the Telegram bridge.
+Environment=BOT_DATA_DIR=/root/.ccc-matrix
+Environment=CCC_CHANNEL=matrix
+Environment=CCC_MATRIX_CONFIG_PATH=/etc/family-matrix/config.json
+ExecStart=/opt/ccc-node/bridge/venv/bin/python -m telegram_bot --path /root
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=70
+
+[Install]
+WantedBy=multi-user.target
