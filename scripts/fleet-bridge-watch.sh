@@ -130,7 +130,7 @@ is_prepared_runtime() {
 read -r -d '' PROBE <<'PROBE_EOF' || true
 # uid, not user: the `user` column truncates names longer than 8 characters
 # ("gongmyoung" -> "gongmyo+"), and the truncated form is not a valid su target.
-line=$(ps -eo uid=,command= 2>/dev/null | grep 'telegram_bot' | grep -- '--path' | grep -v grep | head -1)
+line=$(ps -eo uid=,pid=,command= 2>/dev/null | grep 'telegram_bot' | grep -- '--path' | grep -v grep | head -1)
 if [ -z "$line" ]; then
   # No ccc bridge. Before calling the node down, look for a Danso resident
   # service. On a migrated node the serving process is `<exe> service run
@@ -210,8 +210,9 @@ if [ -z "$line" ]; then
 fi
 echo "KIND=ccc"
 runuid=$(printf '%s' "$line" | awk '{print $1}')
+runpid=$(printf '%s' "$line" | awk '{print $2}')
 runuser=$(id -nu "$runuid" 2>/dev/null || printf '%s' "$runuid")
-cmd=$(printf '%s' "$line" | sed 's/^ *[0-9][0-9]* *//')
+cmd=$(printf '%s' "$line" | sed 's/^ *[0-9][0-9]* *[0-9][0-9]* *//')
 root=""
 for tok in $cmd; do case "$tok" in */bridge/*) root=${tok%%/bridge/*}; break ;; esac; done
 bpath=$(printf '%s' "$cmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i+1); exit}}')
@@ -234,7 +235,9 @@ if [ -n "$sup" ]; then
     [ -n "$bpath" ] || bpath=$(printf '%s' "$supcmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i+1); exit}}')
   fi
 fi
-[ -n "$root" ] || { echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; echo "PREPARED=-"; exit 0; }
+# A visible worker with an unrecognized layout is a failed inspection, not
+# evidence of downtime. Keep absence and confirmed unavailable as AVAIL=no.
+[ -n "$root" ] || { echo "RUNTIME=-"; echo "AVAIL=unverified"; echo "UNIT=-"; echo "PREPARED=-"; exit 0; }
 echo "RUNTIME=$root"
 # The job is reported only when its receipt says the preparation completed;
 # an unfinished or absent receipt leaves the launch to the canonical-root check.
@@ -326,8 +329,9 @@ fi
 # decoy ccc-node dirs trapping resolve_repo heuristics). These checks are
 # read-only; remediation is an operator decision. Single-domain nodes have no
 # gongmyoung account, so they emit DUALDOMAIN=- and cost nothing.
-# This historical user-service layout applies only while that user owns the
-# bridge. A root system-service runtime must not require its retired user unit.
+# Process ownership does not select the systemd manager. User=gongmyoung
+# can serve in a system unit; identify the selected worker's actual cgroup.
+# An unknown domain remains an explicit failed inspection, never a silent pass.
 if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ "$runuser" = gongmyoung ] && id gongmyoung >/dev/null 2>&1 && [ -d /home/gongmyoung ]; then
   if [ "$(id -u)" != 0 ]; then
     # crontab/loginctl inspection needs root; say so instead of guessing.
@@ -336,34 +340,68 @@ if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ "$runuser" = gongmyoung ] && id gongm
     dd_fail=""
     dd_add() { dd_fail="${dd_fail:+${dd_fail},}$1"; }
 
-    # 1. the gongmyoung crontab still carries self-update, wired to the user bus
+    # Select the manager from the worker, not an inactive leftover unit file.
+    dd_domain=unknown
+    case "$runpid" in
+      ''|*[!0-9]*) ;;
+      *)
+        if grep -q ':/system.slice/ccc-telegram-bridge\.service$' "/proc/$runpid/cgroup" 2>/dev/null; then
+          dd_domain=system
+        elif grep -q ':/user.slice/.*\/ccc-telegram-bridge\.service$' "/proc/$runpid/cgroup" 2>/dev/null; then
+          dd_domain=user
+        fi ;;
+    esac
+
+    # 1. Both layouts need the updater, but only a user unit needs a user bus.
     gcron=$(crontab -u gongmyoung -l 2>/dev/null || true)
     printf '%s\n' "$gcron" | grep -q 'ccc-self-update' || dd_add 'cron-self-update-missing'
-    printf '%s\n' "$gcron" | grep -q 'XDG_RUNTIME_DIR' \
-      && printf '%s\n' "$gcron" | grep -q 'DBUS_SESSION_BUS_ADDRESS' \
-      || dd_add 'cron-bus-env-missing'
+    if [ "$dd_domain" = user ]; then
+      printf '%s\n' "$gcron" | grep -q 'XDG_RUNTIME_DIR' \
+        && printf '%s\n' "$gcron" | grep -q 'DBUS_SESSION_BUS_ADDRESS' \
+        || dd_add 'cron-bus-env-missing'
+    fi
 
-    # 2. /opt/ccc-node is gongmyoung-owned, clean, on main, with no root-owned
-    #    git objects (a root-owned object is what flipped the 2026-08-05
-    #    self-update registration to the non-serving repo)
+    # 2. Check access as the updater account. Root-owned immutable objects and
+    # refs can be usable through directory permissions/ACLs. Conversely, a
+    # matching owner does not guarantee usable permissions. Do not write a
+    # canary, create an index lock, or interpret a failed git command as clean.
     repo=/opt/ccc-node
     [ -d "$repo/.git" ] || dd_add 'repo-missing'
     [ "$(stat -c %U "$repo" 2>/dev/null || echo ?)" = "gongmyoung" ] || dd_add 'repo-not-gongmyoung-owned'
-    [ -z "$(su - gongmyoung -c "git -C $repo status --porcelain" 2>/dev/null | head -1)" ] || dd_add 'repo-dirty'
+    if dd_status=$(su - gongmyoung -c "git -C $repo status --porcelain" 2>/dev/null); then
+      [ -z "$dd_status" ] || dd_add 'repo-dirty'
+    else
+      dd_add 'repo-status-unverified'
+    fi
     dd_branch=$(su - gongmyoung -c "git -C $repo rev-parse --abbrev-ref HEAD" 2>/dev/null || echo ?)
     [ "$dd_branch" = "main" ] || dd_add "repo-branch=$dd_branch"
-    [ -z "$(find "$repo/.git" -user root -print -quit 2>/dev/null)" ] || dd_add 'git-root-owned-objects'
+    # Atomic ref/index replacement needs writable directories; existing object
+    # files only need reads. Reflogs are appended, so their files need writes.
+    if dd_access=$(su - gongmyoung -c "cd '$repo' && find .git \( ! -readable -o \( -type d ! -writable \) -o \( -path '.git/logs/*' -type f ! -writable \) \) -print -quit" 2>/dev/null); then
+      [ -z "$dd_access" ] || dd_add 'git-access-denied'
+    else
+      dd_add 'git-access-unverified'
+    fi
 
-    # 3. the user unit and its manager are actually alive, and linger keeps
-    #    them that way across logout
-    uid_g=$(id -u gongmyoung 2>/dev/null || echo 1000)
-    dd_bus="XDG_RUNTIME_DIR=/run/user/$uid_g DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid_g/bus"
-    dd_unit=$(su - gongmyoung -c "env $dd_bus systemctl --user is-active ccc-telegram-bridge" 2>/dev/null || true)
-    [ "$dd_unit" = "active" ] || dd_add "user-unit=${dd_unit:-unknown}"
-    dd_mgr=$(systemctl is-active "user@$uid_g" 2>/dev/null || true)
-    [ "$dd_mgr" = "active" ] || dd_add "user-manager=${dd_mgr:-unknown}"
-    dd_linger=$(loginctl show-user gongmyoung 2>/dev/null | sed -n 's/^Linger=//p' | head -1)
-    [ "$dd_linger" = "yes" ] || dd_add "linger=${dd_linger:-unknown}"
+    # 3. Require the manager that actually owns the worker. A stale user unit
+    # must not page an active system service; neither may unknown ownership pass.
+    if [ "$dd_domain" = system ]; then
+      dd_unit=$(systemctl is-active ccc-telegram-bridge.service 2>/dev/null || true)
+      [ "$dd_unit" = active ] || dd_add "system-unit=${dd_unit:-unknown}"
+      dd_owner=$(systemctl show ccc-telegram-bridge.service -p User --value 2>/dev/null || true)
+      [ "$dd_owner" = "$runuser" ] || dd_add "system-unit-owner=${dd_owner:-unknown}"
+    elif [ "$dd_domain" = user ]; then
+      uid_g=$runuid
+      dd_bus="XDG_RUNTIME_DIR=/run/user/$uid_g DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid_g/bus"
+      dd_unit=$(su - gongmyoung -c "env $dd_bus systemctl --user is-active ccc-telegram-bridge" 2>/dev/null || true)
+      [ "$dd_unit" = "active" ] || dd_add "user-unit=${dd_unit:-unknown}"
+      dd_mgr=$(systemctl is-active "user@$uid_g" 2>/dev/null || true)
+      [ "$dd_mgr" = "active" ] || dd_add "user-manager=${dd_mgr:-unknown}"
+      dd_linger=$(loginctl show-user gongmyoung 2>/dev/null | sed -n 's/^Linger=//p' | head -1)
+      [ "$dd_linger" = "yes" ] || dd_add 'linger=unknown-or-disabled'
+    else
+      dd_add 'service-domain=unverified'
+    fi
 
     # 4. no decoy ccc-node checkouts under the gongmyoung home (real dirs only;
     #    symlinks/tarballs/docs are not serving candidates)

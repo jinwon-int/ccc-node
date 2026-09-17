@@ -312,7 +312,8 @@ touch "$TMP/probe-repo/scripts/ccc-doctor.sh"
 chmod +x "$TMP/probe-repo/scripts/ccc-doctor.sh"
 cat > "$TMP/probe-bin/ps" <<EOF
 #!$(command -v sh)
-echo "0 $TMP/probe-repo/bridge/venv/bin/python -m telegram_bot --path $TMP/probe-home"
+case "\$*" in *uid=,pid=*) printf '0 42 ' ;; *) printf '0 ' ;; esac
+echo "$TMP/probe-repo/bridge/venv/bin/python -m telegram_bot --path $TMP/probe-home"
 EOF
 cat > "$TMP/probe-bin/id" <<EOF
 #!$(command -v sh)
@@ -409,7 +410,8 @@ printf '{"schema": "ccc.termux-preparation.v1", "status": "ready"}\n' > "$TMP/pr
 cat > "$TMP/prep-bin/ps" <<EOF
 #!$(command -v sh)
 echo "0 bash $TMP/prep/source/bridge/start.sh --path $TMP/probe-home --_daemon_supervisor --prepared-runtime $TMP/prep/job"
-echo "0 $TMP/prep/job/runtime/bin/python -m telegram_bot --path $TMP/probe-home"
+case "\$*" in *uid=,pid=*) printf '0 42 ' ;; *) printf '0 ' ;; esac
+echo "$TMP/prep/job/runtime/bin/python -m telegram_bot --path $TMP/probe-home"
 EOF
 chmod +x "$TMP/prep-bin/ps"
 : > "$TMP/sudo-calls"
@@ -618,6 +620,99 @@ chmod +x "$TMP/empty-bin/ps"
 PATH="$TMP/empty-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/empty-out"
 ok "a node with neither runtime is still DOWN" \
   'grep -q "^AVAIL=no$" "$TMP/empty-out" && grep -q "^RUNTIME=-$" "$TMP/empty-out" && ! grep -q "^KIND=danso$" "$TMP/empty-out"'
+
+# ---- runtime owner is not the service manager ------------------------------
+# Execute the POSIX probe: a system service may use User=gongmyoung without
+# needing a user unit, user bus, or linger. Keep legacy user-service coverage.
+mkdir -p "$TMP/domain-bin" "$TMP/domain-repo/.git" "$TMP/domain-home" "$TMP/domain-proc/42"
+cat > "$TMP/domain-bin/ps" <<EOF
+#!$(command -v sh)
+case "\$*" in *uid=,pid=*) printf '1000 42 ' ;; *) printf '1000 ' ;; esac
+if [ "\${UNKNOWN_ROOT:-0}" = 1 ]; then
+  echo '/unrecognized/python -m telegram_bot --path $TMP/domain-home'
+else
+  echo '$TMP/domain-repo/bridge/venv/bin/python -m telegram_bot --path $TMP/domain-home'
+fi
+EOF
+cat > "$TMP/domain-bin/id" <<EOF
+#!$(command -v sh)
+case "\$1" in -nu) echo gongmyoung ;; -u) echo 0 ;; *) exit 0 ;; esac
+EOF
+cat > "$TMP/domain-bin/su" <<EOF
+#!$(command -v sh)
+printf '%s\n' "\$*" >> '$TMP/domain-calls'
+case "\$*" in *--status) echo 'Bot status: available' ;; *) sh -c "\$4" ;; esac
+EOF
+cat > "$TMP/domain-bin/crontab" <<EOF
+#!$(command -v sh)
+echo '0 0 * * * ccc-self-update'
+[ "\${USER_BUS:-0}" = 0 ] || echo 'XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus'
+EOF
+cat > "$TMP/domain-bin/systemctl" <<EOF
+#!$(command -v sh)
+printf '%s\n' "\$*" >> '$TMP/domain-calls'
+case "\$*" in
+  *show*User*) echo "\${UNIT_USER:-gongmyoung}" ;;
+  *is-active*) echo "\${UNIT_STATE:-active}"; [ "\${UNIT_STATE:-active}" = active ] ;;
+  *) exit 1 ;;
+esac
+EOF
+cat > "$TMP/domain-bin/loginctl" <<EOF
+#!$(command -v sh)
+echo 'Linger=yes'
+EOF
+cat > "$TMP/domain-bin/stat" <<EOF
+#!$(command -v sh)
+echo gongmyoung
+EOF
+cat > "$TMP/domain-bin/git" <<EOF
+#!$(command -v sh)
+case "\$*" in
+  *status*) [ "\${GIT_FAILURE:-0}" = 0 ] || exit 128 ;;
+  *rev-parse*) echo main ;;
+esac
+EOF
+cat > "$TMP/domain-bin/find" <<EOF
+#!$(command -v sh)
+case "\$*" in
+  *'-user root'*) echo '$TMP/domain-repo/.git/refs/root-owned-but-accessible' ;;
+  *) [ "\${GIT_DENIED:-0}" = 0 ] || echo '$TMP/domain-repo/.git/objects/unwritable' ;;
+esac
+[ "\${FIND_FAILURE:-0}" = 0 ] || exit 1
+EOF
+chmod +x "$TMP/domain-bin/"*
+sed -e "s#/home/gongmyoung#$TMP/domain-home#g" \
+    -e "s#/opt/ccc-node#$TMP/domain-repo#g" \
+    -e "s#/proc/#$TMP/domain-proc/#g" "$probe_body" > "$TMP/domain-probe.sh"
+domain_probe() {
+  : > "$TMP/domain-calls"
+  env PATH="$TMP/domain-bin:$PATH" CCC_FLEET_DOCTOR=1 "$@" sh "$TMP/domain-probe.sh" > "$TMP/domain-out"
+}
+printf '0::/system.slice/ccc-telegram-bridge.service\n' > "$TMP/domain-proc/42/cgroup"
+domain_probe
+ok "system service with user owner is coherent without user bus" 'grep -q "^DUALDOMAIN=ok$" "$TMP/domain-out"'
+ok "system service does not inspect user unit" '! grep -q -- "--user is-active" "$TMP/domain-calls"'
+ok "accessible root-owned git objects are not drift" '! grep -q "git-root-owned-objects" "$TMP/domain-out"'
+domain_probe UNIT_STATE=inactive
+ok "inactive system manager is reported distinctly" 'grep -q "system-unit=inactive" "$TMP/domain-out"'
+domain_probe UNIT_USER=root
+ok "system unit owner mismatch is still drift" 'grep -q "system-unit-owner=root" "$TMP/domain-out"'
+domain_probe GIT_DENIED=1
+ok "unwritable git directory is still drift" 'grep -q "git-access-denied" "$TMP/domain-out"'
+domain_probe FIND_FAILURE=1
+ok "git inspection error is not a clean tree" 'grep -q "git-access-unverified" "$TMP/domain-out"'
+domain_probe GIT_FAILURE=1
+ok "git status failure is not a clean tree" 'grep -q "repo-status-unverified" "$TMP/domain-out"'
+printf '0::/user.slice/user-1000.slice/user@1000.service/app.slice/ccc-telegram-bridge.service\n' > "$TMP/domain-proc/42/cgroup"
+domain_probe USER_BUS=1
+ok "legacy user service remains supported" 'grep -q "^DUALDOMAIN=ok$" "$TMP/domain-out"'
+domain_probe
+ok "legacy user service still requires user bus" 'grep -q "cron-bus-env-missing" "$TMP/domain-out"'
+printf '0::/system.slice/unrelated.service\n' > "$TMP/domain-proc/42/cgroup"
+domain_probe
+ok "unknown service domain is unverified" 'grep -q "service-domain=unverified" "$TMP/domain-out"'
+domain_probe UNKNOWN_ROOT=1
+ok "visible process with unknown root is not reported DOWN" 'grep -q "^AVAIL=unverified$" "$TMP/domain-out" && ! grep -q "^AVAIL=no$" "$TMP/domain-out"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
