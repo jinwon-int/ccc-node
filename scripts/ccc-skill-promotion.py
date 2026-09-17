@@ -3687,6 +3687,120 @@ def _pr_state(config: Config, pr_number: str) -> str | None:
     return state if isinstance(state, str) else None
 
 
+_INTAKE_STATE_KIND = "a2a-intake-state"
+# An intake PR is review-only: it is closed, never merged. Both GitHub
+# terminal states are recorded anyway so a hand-merged PR is not re-polled
+# forever on the strength of a state this pass did not expect.
+_INTAKE_TERMINAL_STATES = frozenset({"CLOSED", "MERGED"})
+
+
+def _approve_lineage_prs(rows: list[dict[str, object]]) -> dict[str, str]:
+    """PR number -> earliest `approve` verdict timestamp for that PR.
+
+    A verdict row carries no PR of its own: it is keyed by `task_id`, and only
+    the `a2a-dispatch` row that opened the round records `pr_url`. Joining
+    through that dispatch is exactly how `_process_verdicts` attributes a
+    verdict in the first place, so this cannot drift away from it.
+
+    Earliest wins: a lineage that was approved, revised and approved again is
+    still one promotion that has been owed since the first approval.
+    """
+    pr_by_task: dict[str, str] = {}
+    for row in rows:
+        if row.get("kind") != "a2a-dispatch":
+            continue
+        task = row.get("dispatched_task")
+        found = re.search(r"/pull/(\d+)", str(row.get("pr_url") or ""))
+        if isinstance(task, str) and found:
+            pr_by_task[task] = found.group(1)
+    approved: dict[str, str] = {}
+    for row in rows:
+        if row.get("kind") != "a2a-verdict" or row.get("verdict") != "approve":
+            continue
+        task, stamp = row.get("task_id"), row.get("ts")
+        if not isinstance(task, str) or not isinstance(stamp, str):
+            continue
+        pr = pr_by_task.get(task)
+        if pr is not None and (pr not in approved or stamp < approved[pr]):
+            approved[pr] = stamp
+    return approved
+
+
+def _recorded_intake_states(
+    rows: list[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    """PR number -> the last `a2a-intake-state` row written for it."""
+    latest: dict[str, dict[str, object]] = {}
+    for row in rows:
+        if row.get("kind") != _INTAKE_STATE_KIND:
+            continue
+        pr = row.get("pr")
+        if isinstance(pr, str):
+            latest[pr] = row
+    return latest
+
+
+def _sweep_intake_states(
+    config: Config, *, dry_run: bool
+) -> list[dict[str, object]]:
+    """Record whether an already-approved intake PR is still open.
+
+    Nothing downstream of an `approve` verdict is automated. The sanitized
+    `approved/*` PR is written by hand and the intake PR is closed by hand
+    (policies/REVIEW.md forbids auto-close), so the pipeline records the
+    verdict and stops. That makes "approved an hour ago" and "approved and
+    forgotten" the same observation from the ledger — 34 candidates piled up
+    that way before anyone counted them by hand.
+
+    `ccc_doctor` cannot close the gap by itself. It is offline by
+    construction (local git/bash, never `gh`); the publisher's fleet-skills
+    checkout is a `TemporaryDirectory` that does not outlive the run, so
+    there is no local `approved/` inventory to compare against; and the
+    receipt terminal status `pr-closed` is only ever reached for a receipt
+    that was still pending, so it is absent for almost every lineage. The
+    network read therefore belongs here, in collect, and the doctor reads the
+    row this writes.
+
+    Terminal is sticky: once CLOSED/MERGED is recorded the PR is never polled
+    again. An unreadable state writes nothing at all — a transient `gh`
+    failure must not mark a still-open PR terminal, nor reopen a closed one.
+    """
+    rows = _ledger_rows(config)
+    recorded = _recorded_intake_states(rows)
+    processed: list[dict[str, object]] = []
+    # Oldest approval first: the same FIFO reason as #1394. A window smaller
+    # than the backlog must drain the longest-owed promotions, not the newest.
+    for pr, approved_at in sorted(
+        _approve_lineage_prs(rows).items(), key=lambda item: item[1]
+    ):
+        if len(processed) >= config.collect_window:
+            break
+        previous = recorded.get(pr)
+        if previous is not None and str(previous.get("state", "")) in _INTAKE_TERMINAL_STATES:
+            continue
+        if dry_run:
+            processed.append({"outcome": "would-poll-intake-state", "pr": pr})
+            continue
+        state = _pr_state(config, pr)
+        if state is None:
+            processed.append({"outcome": "intake-state-unreadable", "pr": pr})
+            continue
+        _append_ledger(
+            config,
+            {
+                "ts": _utc_now(),
+                "kind": _INTAKE_STATE_KIND,
+                "pr": pr,
+                "state": state,
+                "approved_at": approved_at,
+            },
+        )
+        processed.append(
+            {"outcome": "intake-state-recorded", "pr": pr, "state": state}
+        )
+    return processed
+
+
 def _receipt_retries(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     """Backfill old consumed verdicts too; rotate failures behind untried work."""
     consumed = {r.get("task_id") for r in rows
@@ -4837,6 +4951,11 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
             "deferred": _sweep_deferred_revises(config, dry_run=dry_run),
             "results": _consume_revise_results(config, dry_run=dry_run),
         }
+    # Last, and outside `revise_enabled`: this pass observes what an approve
+    # verdict left behind, so it must still run on a publisher with revision
+    # rounds switched off, and it must see any verdict rows the passes above
+    # appended in this same cycle.
+    intake_states = _sweep_intake_states(config, dry_run=dry_run)
     return {
         "ok": not errors,
         "mode": "collect-dry-run" if dry_run else "collect",
@@ -4846,6 +4965,7 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
         "published": published,
         "errors": errors,
         "revise": revise,
+        "intake_states": intake_states,
     }
 
 

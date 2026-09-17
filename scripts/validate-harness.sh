@@ -521,6 +521,12 @@ else
   err "doctor skill-promotion revise-stall verdict tests failed"
   tail -10 "$TMP/doctor-revise-stall-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_unpromoted_test.py >"$TMP/doctor-unpromoted-test.out" 2>&1; then
+  say "  ok doctor skill-promotion unpromoted verdict tests (#1628)"
+else
+  err "doctor skill-promotion unpromoted verdict tests failed (approved candidates may stall unseen)"
+  tail -10 "$TMP/doctor-unpromoted-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_usage_telemetry_test.py >"$TMP/doctor-usage-telemetry-test.out" 2>&1; then
   say "  ok doctor skill-usage telemetry verdict tests (#1675)"
 else
