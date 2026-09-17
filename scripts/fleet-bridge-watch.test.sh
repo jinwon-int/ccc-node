@@ -551,9 +551,62 @@ chmod +x "$TMP/danso-root-bin/"*
 : > "$TMP/danso-sudo-calls"
 PATH="$TMP/danso-root-bin:$TMP/danso-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/danso-root-out"
 ok "root-owned danso service is reached through noninteractive sudo" \
-  'grep -q -- "-n -H -u root -- /usr/local/bin/danso service status --json" "$TMP/danso-sudo-calls"'
+  'grep -q -- "-n -H -u root -- /usr/local/bin/danso service status --data-dir $TMP/probe-home/.danso/telegram --json" "$TMP/danso-sudo-calls"'
 ok "root-owned danso service is available" 'grep -q "^AVAIL=yes$" "$TMP/danso-root-out"'
 ok "no su fallback was taken" '[ ! -s "$TMP/su-calls" ] || ! grep -q danso "$TMP/su-calls"'
+
+# The state root has to come from the command line the probe already has.
+# `danso service status` resolves it from `--data-dir` or the environment, and
+# this probe runs a fresh process with the *watch's* environment — the unit's
+# `Environment=` applies only to the service systemd itself started. A stub
+# that ignores its arguments cannot show this, so this one refuses to answer
+# without the directory, exactly as the real binary does.
+# Measured on yukson 2026-09-17 (danso #118): a serving node reported AVAIL=no.
+mkdir -p "$TMP/danso-strict-bin"
+cat > "$TMP/danso-strict-bin/ps" <<EOF
+#!$(command -v sh)
+echo "1000 $TMP/danso-strict-bin/danso service run --data-dir $TMP/probe-home/.danso/telegram"
+EOF
+cat > "$TMP/danso-strict-bin/danso" <<EOF
+#!$(command -v sh)
+want="$TMP/probe-home/.danso/telegram"
+got=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in --data-dir) got=\$2; shift 2 ;; *) shift ;; esac
+done
+if [ "\$got" != "\$want" ]; then
+  # What the real binary does when it resolves a state root nobody is serving.
+  printf '%s' '{"state":"unavailable","mutations":{}}'
+  exit 2
+fi
+printf '%s' '{"state":"available","runtime_generation":{"binary_sha256":"$GEN","exe_path":"/usr/local/bin/danso"},"mutations":{}}'
+exit 0
+EOF
+chmod +x "$TMP/danso-strict-bin/"*
+PATH="$TMP/danso-strict-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/danso-strict-out"
+ok "the probe passes the state root it read from the command line" \
+  'grep -q "^AVAIL=yes$" "$TMP/danso-strict-out"'
+ok "and the generation comes back with it" \
+  "grep -q '^GENERATION=$GEN\$' \"\$TMP/danso-strict-out\""
+
+# A service started without the argument resolves the directory from its own
+# environment; the probe must not invent one.
+mkdir -p "$TMP/danso-noarg-bin"
+cat > "$TMP/danso-noarg-bin/ps" <<EOF
+#!$(command -v sh)
+echo "1000 $TMP/danso-noarg-bin/danso service run"
+EOF
+cat > "$TMP/danso-noarg-bin/danso" <<EOF
+#!$(command -v sh)
+for a in "\$@"; do
+  [ "\$a" = "--data-dir" ] && { echo "unexpected --data-dir" >&2; exit 90; }
+done
+printf '%s' '{"state":"available","runtime_generation":{"binary_sha256":"$GEN","exe_path":"/usr/local/bin/danso"},"mutations":{}}'
+EOF
+chmod +x "$TMP/danso-noarg-bin/"*
+PATH="$TMP/danso-noarg-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/danso-noarg-out"
+ok "a service without --data-dir is asked without one" \
+  'grep -q "^AVAIL=yes$" "$TMP/danso-noarg-out"'
 
 # No ccc bridge and no danso service: still DOWN, as before.
 mkdir -p "$TMP/empty-bin"
