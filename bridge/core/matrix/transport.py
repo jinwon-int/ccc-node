@@ -45,6 +45,7 @@ from telegram_bot.core.matrix.state import (
     SafetyStop,
     bounded_text,
     family_config,
+    mention_aliases,
     private_directory,
     saved_policy,
     turn_id,
@@ -240,6 +241,7 @@ class MatrixTransport:
             frozenset([config["account"]]),
             {r: "mention" if r in self.family_rooms else "direct" for r in config["rooms"]},
             config["not_before_ms"],
+            aliases=mention_aliases(config),
         )
         self.blocked: set[str] = set(self.store.get_meta("room_gate_blocked") or ())
         self.room_members: dict[str, set[str]] = {}

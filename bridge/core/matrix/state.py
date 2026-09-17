@@ -80,6 +80,7 @@ SAFETY_STOP_REASONS: frozenset[str] = frozenset(
         "invalid-family-devices",
         "invalid-family-device-pin",
         "invalid-family-notice-text",
+        "invalid-mention-aliases",
         "saved-policy-changed",
         # state
         "pilot-storage-limit",
@@ -131,10 +132,36 @@ class QueueFull(RuntimeError):
 # --------------------------------------------------------------------------- #
 
 
+def handle_pattern(name: str) -> re.Pattern[str]:
+    """Whole-token ``@name`` in message text, case-insensitive."""
+    return re.compile(r"(?<![\w.@-])@" + re.escape(name) + r"(?![\w.:-])", re.IGNORECASE)
+
+
 def HANDLE_RE(account: str) -> re.Pattern[str]:  # name kept from the pilot
     """Whole-token @localpart of a Matrix account, case-insensitive (e.g. @fambot for @fambot:hs)."""
-    localpart = account[1:].split(":", 1)[0]
-    return re.compile(r"(?<![\w.@-])@" + re.escape(localpart) + r"(?![\w.:-])", re.IGNORECASE)
+    return handle_pattern(account[1:].split(":", 1)[0])
+
+
+ALIAS_PATTERN = re.compile(r"[a-z0-9._=-]{1,64}")
+MAX_MENTION_ALIASES = 8
+
+
+def mention_aliases(config: Mapping[str, Any]) -> frozenset[str]:
+    """Optional ``mention_aliases``: extra typed handles (e.g. ``@seoseo``) that address the bot.
+
+    Aliases only widen the family-room *mention* gate; sender/room admission
+    is unchanged. Matrix user ids cannot be renamed, so this is how a bot
+    account keeps its id while the family calls it by its display name.
+    """
+    raw = config.get("mention_aliases", [])
+    if (
+        not isinstance(raw, list)
+        or len(raw) > MAX_MENTION_ALIASES
+        or any(not isinstance(a, str) or not ALIAS_PATTERN.fullmatch(a) for a in raw)
+        or len(set(raw)) != len(raw)
+    ):
+        raise SafetyStop("invalid-mention-aliases")
+    return frozenset(raw)
 
 
 def identifier(value: Any, prefix: str) -> bool:
@@ -177,11 +204,13 @@ class Policy:
     bots: frozenset[str]
     rooms: Mapping[str, str]
     not_before_ms: int
+    aliases: frozenset[str] = frozenset()  # extra typed handles that address the bot
 
     def __post_init__(self) -> None:
         users = frozenset(self.users)
         bots = frozenset(self.bots)
         rooms = dict(self.rooms)
+        aliases = frozenset(self.aliases)
         invalid = (
             not identifier(self.account, "@")
             or not users
@@ -195,12 +224,14 @@ class Policy:
             )
             or type(self.not_before_ms) is not int
             or self.not_before_ms < 0
+            or any(not isinstance(a, str) or not ALIAS_PATTERN.fullmatch(a) for a in aliases)
         )
         if invalid:
             raise ValueError("invalid route policy")
         object.__setattr__(self, "users", users)
         object.__setattr__(self, "bots", bots)
         object.__setattr__(self, "rooms", MappingProxyType(rooms))
+        object.__setattr__(self, "aliases", aliases)
 
     def admit(self, room_id: str, event: Any, *, decrypted: bool, now_ms: int) -> Request | None:
         """Reject plaintext, edits, bots, old events and unaddressed group messages."""
@@ -246,7 +277,9 @@ class Policy:
             ids = mentions.get("user_ids", [])
             if isinstance(ids, list) and self.account in ids:
                 return True
-        return bool(HANDLE_RE(self.account).search(body))
+        if HANDLE_RE(self.account).search(body):
+            return True
+        return any(handle_pattern(alias).search(body) for alias in self.aliases)
 
 
 # --------------------------------------------------------------------------- #
