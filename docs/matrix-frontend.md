@@ -113,6 +113,36 @@ Cutover from the pilot bot:
 Rollback: stop `ccc-matrix-bridge`, start `family-matrix` — the pilot's
 config, state and crypto store are untouched by the frontend.
 
+## Provisioning a bot account for another node (e.g. `@jingun` on jingun)
+
+Every node gets its own Matrix account, device and private room with the
+owner; nodes never share a token or crypto store. Family rooms admit exactly
+one bot (the room gate mutes a family room that contains a second bot), so a
+second node starts with a direct room only.
+
+1. **Account** — on the homeserver admin room: `!admin users create-user
+   <localpart>`; capture the generated password into a 0600 file, never into
+   a transcript. Set a display name (`PUT /profile/<id>/displayname`).
+2. **Login on the node** — `POST /_matrix/client/v3/login` (password login)
+   from the node itself → `device_id` + `access_token`; write them with a fresh
+   random `pickle_key` (≥24 chars) into `CCC_MATRIX_CONFIG_PATH` (0600).
+   `state_directory` is a new private directory (e.g. `/var/lib/ccc-matrix`).
+3. **Room** — the bot creates an encrypted private room and invites the owner
+   (`createRoom` with `preset: private_chat`, `m.room.encryption`
+   `m.megolm.v1.aes-sha2`, `invite: [owner]`); the owner accepts in the app.
+   Put the room id in `rooms` (not in `family_rooms`).
+4. **Pins** — `devices` = the owner's current device keys (same set the other
+   node pins; `keys/query` from the bot token), `not_before_ms` = now.
+5. **Extra + unit** — `pip install -r bridge/requirements-matrix.txt`
+   (needs `libolm3`/`libolm-dev`), install
+   `bridge/service-systemd-matrix.service.example`.
+6. **Initialize once** — `CCC_MATRIX_INITIALIZE=1 BOT_DATA_DIR=… CCC_CHANNEL=matrix
+   CCC_MATRIX_CONFIG_PATH=… <venv>/bin/python -m telegram_bot --path <root>`:
+   creates the crypto store, uploads keys, pins devices, gates the room, exits.
+   A normal start refuses an empty store (`explicit-new-device-initialization-required`).
+7. `systemctl enable --now ccc-matrix-bridge`; expect the startup banner in
+   the direct room.
+
 ## Not yet
 
 - Image/file input (Telegram folds images into the prompt; Matrix media is

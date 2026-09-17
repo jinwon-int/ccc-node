@@ -225,6 +225,7 @@ class FakeTransport:
         self.fail_run = fail_run
         self.events: list[str] = []
         self.notices: list[tuple[str, str]] = []
+        self.notice_keys: list[str | None] = []
         self.kinds: dict[str, str] = {DM_ROOM: "direct", FAMILY_ROOM: "family"}
 
     async def open(self, initialize: bool = False) -> None:
@@ -240,8 +241,9 @@ class FakeTransport:
     async def close(self) -> None:
         self.events.append("close")
 
-    def enqueue_notice(self, room_id: str, text: str) -> None:
+    def enqueue_notice(self, room_id: str, text: str, *, key: str | None = None) -> None:
         self.notices.append((room_id, text))
+        self.notice_keys.append(key)
 
     def room_kind(self, room_id: str) -> str:
         return self.kinds.get(room_id, "family")
@@ -927,3 +929,51 @@ async def test_startup_banner_is_posted_to_direct_rooms_only(
     # Missing codex config just drops the model/effort parts.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nowhere"))
     assert bot.startup_banner().endswith(" · codex · abc1234")
+
+
+@pytest.mark.anyio
+async def test_initialize_flag_opens_the_store_once_and_does_not_serve(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, _chat, _manager = _bot(tmp_path, matrix_initialize=True, matrix_startup_banner=True)
+    opened: list[bool] = []
+
+    class InitTransport(FakeTransport):
+        async def open(self, initialize: bool = False) -> None:
+            opened.append(initialize)
+            self.events.append("open")
+
+    transports: list[FakeTransport] = []
+
+    def factory(config: Any, runner: Any) -> FakeTransport:
+        transport = InitTransport(config, runner, fail_run=True)  # run() must never be reached
+        transports.append(transport)
+        return transport
+
+    bot._transport_factory = factory
+    await bot.serve()
+    transport = transports[0]
+    assert opened == [True]
+    assert transport.events == ["open", "close"], "initialize exits before run() and posts no banner"
+    assert transport.notices == []
+
+
+@pytest.mark.anyio
+async def test_startup_banner_key_is_stable_across_restarts(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash-looping unit must not queue one banner per restart: same key within the hour."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nowhere"))
+    bot, _chat, _manager = _bot(tmp_path, matrix_startup_banner=True)
+    monkeypatch.setattr(type(bot), "_bridge_revision", staticmethod(lambda: "abc1234"))
+    keys: list[str | None] = []
+    for _ in range(2):
+        holder = await _attach(bot)
+
+        async def body(transport: FakeTransport) -> None:
+            return None
+
+        holder["body"] = body
+        await bot.serve()
+        keys.extend(holder["transport"].notice_keys)
+    assert len(keys) == 2 and keys[0] == keys[1] and keys[0].startswith("startup-")

@@ -1343,10 +1343,19 @@ async def test_initial_snapshot_sync_is_not_a_timeline_gap(tmp_path: Path) -> No
         assert f.client.next_batch is None
         job = f.store.claim()
         assert job is not None and (job["event_id"], job["room_id"]) == ("$family", FAMILY)
-        f.store.stage_sync({**limited, "next_batch": "s2"})
+        # limited=true with a short batch is Tuwunel noise (display-name change,
+        # 2026-09-18): every event since the token is present, so carry on.
+        soft = {"next_batch": "s1b", "rooms": {"join": {FAMILY: {"timeline": {"events": [{}], "limited": True}}}}}
+        f.store.stage_sync(soft)
+        await f.process_pending()
+        assert f.store.token() == "s1b"
+        assert f.store.get_meta("sync_limited_soft")["events"] == 1
+        # A batch filled to the requested limit is a real gap: fail closed.
+        gap = {"next_batch": "s2", "rooms": {"join": {FAMILY: {"timeline": {"events": [{}] * 100, "limited": True}}}}}
+        f.store.stage_sync(gap)
         with pytest.raises(SafetyStop, match="timeline-gap-requires-backfill"):
             await f.process_pending()  # incremental sync with a gap
-        assert f.store.token() == "s1"  # gap is never committed
+        assert f.store.token() == "s1b"  # gap is never committed
         f.store.set_meta("pending_sync", {"next_batch": "s2", "rooms": {"join": {FAMILY: {"timeline": {"events": [], "limited": False}}}}})
         setattr(h.nio, "SyncResponse", type("ErrorResponse", (), {"from_dict": classmethod(lambda cls, raw: cls())}))
         with pytest.raises(SafetyStop, match="invalid-sync-response"):

@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
@@ -287,8 +288,17 @@ class MatrixBot:
         transport = self._build_transport(config)
         self._transport = transport
         self._project_chat.set_async_completion_sender(self.async_completion_sender)
+        initialize = bool(getattr(self._settings, "matrix_initialize", False))
         try:
-            await transport.open()
+            # First run of a NEW bot device (CCC_MATRIX_INITIALIZE=1): create the
+            # crypto store, upload keys, pin devices and gate rooms, then exit
+            # without serving. The pilot's `--initialize` had the same contract;
+            # a normal start refuses an empty store (explicit-new-device-
+            # initialization-required) so a lost store is never recreated silently.
+            await transport.open(initialize=initialize)
+            if initialize:
+                logger.info("Matrix frontend initialised a new bot device; start again without CCC_MATRIX_INITIALIZE")
+                return
             self._post_startup_banner(config, transport)
             await transport.run()
         finally:
@@ -350,9 +360,16 @@ class MatrixBot:
         if not direct_rooms:
             return
         text = self.startup_banner()
+        # Idempotent per hour and per text: a crash-looping unit (Restart=always)
+        # must not queue one banner per restart (nine piled up on 2026-09-18).
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+        key = f"startup-{digest}-{int(time.time() // 3600)}"
         for room in direct_rooms:
             try:
-                transport.enqueue_notice(room, text)
+                try:
+                    transport.enqueue_notice(room, text, key=key)
+                except TypeError:  # transport without the key parameter
+                    transport.enqueue_notice(room, text)
             except Exception:
                 logger.warning("startup banner not queued for %s", room, exc_info=True)
 

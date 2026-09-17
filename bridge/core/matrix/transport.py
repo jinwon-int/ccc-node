@@ -74,6 +74,7 @@ TURN_JOIN_TIMEOUT_S = 30.0
 MAX_APPROVAL_TEXT_BYTES = 12_000
 MAX_PENDING_APPROVALS = 16
 MEGOLM = "m.megolm.v1.aes-sha2"
+SYNC_TIMELINE_LIMIT = 100  # /sync filter timeline.limit; a batch this full is a real gap
 CONTROL_PREFIXES = ("/approve", "/deny", "/cancel", "/ack", "/stop")
 # TurnResult.status values that end a job with its text delivered. "error" is
 # what MatrixBot reports for a ChatResponse(success=False): the text is the
@@ -482,11 +483,13 @@ class MatrixTransport:
     def room_kind(self, room_id: str) -> str:
         return "family" if room_id in self.family_rooms else "direct"
 
-    def enqueue_notice(self, room_id: str, text: str) -> str:
+    def enqueue_notice(self, room_id: str, text: str, *, key: str | None = None) -> str:
         """Queue unsolicited output (async completion, reminders) for an allowed room.
 
         Delivered by :meth:`send` with the same chunking, pinning and room
-        gate as a reply; a muted room keeps it until the gate reopens.
+        gate as a reply; a muted room keeps it until the gate reopens. A
+        caller-supplied ``key`` makes the notice idempotent (same key + same
+        text → queued once), e.g. the startup banner across restarts.
         """
         if room_id not in self.c["rooms"]:
             raise ValueError("room-not-allowed")
@@ -498,7 +501,7 @@ class MatrixTransport:
             "notice",
             hashlib.sha256(json.dumps([self.c["account"], room_id, "unsolicited-notice"]).encode()).hexdigest(),
         )
-        return self.store.notice(req, unique_key("unsolicited"), text)
+        return self.store.notice(req, key or unique_key("unsolicited"), text)
 
     # -- input ----------------------------------------------------------------
 
@@ -608,8 +611,22 @@ class MatrixTransport:
             # every room joined since "never", and open() already primed state.
             if self.store.token() is not None:
                 for room, info in raw.get("rooms", {}).get("join", {}).items():
-                    if room in self.c["rooms"] and info.get("timeline", {}).get("limited"):
+                    timeline = info.get("timeline", {}) if room in self.c["rooms"] else {}
+                    if not timeline.get("limited"):
+                        continue
+                    events = timeline.get("events") or []
+                    if len(events) >= SYNC_TIMELINE_LIMIT:
                         raise SafetyStop("timeline-gap-requires-backfill")
+                    # Tuwunel marks `limited` on a batch that is nowhere near the
+                    # requested limit (seen 2026-09-18 04:42 KST: one m.room.member
+                    # event per room after a display-name change) — every event
+                    # since the saved token is present, so nothing was skipped.
+                    # A real gap fills the timeline up to the limit (114 events on
+                    # 2026-09-17). Record it and carry on instead of fail-closing.
+                    self.store.set_meta(
+                        "sync_limited_soft",
+                        {"room": room, "events": len(events), "updated": time.time()},
+                    )
             await self.pin_devices()
             response = SyncResponse.from_dict(raw)
             if type(response).__name__ != "SyncResponse":
