@@ -80,6 +80,7 @@ def _settings(tmp_path: Path, **overrides: Any) -> SimpleNamespace:
         danso_model="gpt-6-astra",
         bridge_memory_mode="off",
         auto_new_session_after_hours=None,
+        matrix_startup_banner=False,  # lifecycle tests assert exact notice lists
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -899,3 +900,30 @@ def test_run_is_the_blocking_entry_main_expects(tmp_path: Path, matrix_config: d
     assert initialised == [True]
     assert transports and transports[0].events == ["open", "run", "close"]
     assert chat.sender == bot.async_completion_sender
+
+
+@pytest.mark.anyio
+async def test_startup_banner_is_posted_to_direct_rooms_only(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    bot, _chat, _manager = _bot(tmp_path, matrix_startup_banner=True)
+    monkeypatch.setattr(type(bot), "_bridge_revision", staticmethod(lambda: "abc1234"))
+    holder = await _attach(bot)
+
+    async def body(transport: FakeTransport) -> None:
+        return None
+
+    holder["body"] = body
+    await bot.serve()
+    notices = holder["transport"].notices
+    assert [room for room, _ in notices] == [DM_ROOM], "family rooms never get the banner"
+    text = notices[0][1]
+    assert text.startswith("🟢 ") and "ccc-node Matrix 프론트엔드 기동" in text
+    assert " · codex · gpt-6-astra · high · abc1234" in text
+    # Missing codex config just drops the model/effort parts.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nowhere"))
+    assert bot.startup_banner().endswith(" · codex · abc1234")

@@ -33,6 +33,7 @@ from telegram_bot.core.matrix.state import (
     Store,
     bounded_text,
     family_config,
+    mention_aliases,
     load_config,
     operator_name,
     parts,
@@ -638,3 +639,33 @@ def test_every_raised_safety_stop_reason_is_listed() -> None:
     assert {"invalid-family_rooms", "invalid-family_users", "matrix-http-"} <= SAFETY_STOP_REASONS
     for legacy in ("worker-cleanup-unconfirmed", "invalid-worker-command", "invalid-remote-mode"):
         assert legacy not in SAFETY_STOP_REASONS
+
+
+def test_mention_aliases_widen_the_typed_handle_gate_only() -> None:
+    # Matrix ids cannot be renamed: the bot stays @bot but the family calls it "@seoseo".
+    p = policy(aliases={"seoseo"})
+    for body, expected in [
+        ("@seoseo 오늘 일정", True),
+        ("(@SEOSEO)", True),
+        ("@seoseox 안녕", False),
+        ("mail@seoseo.com", False),
+        ("seoseo 안녕", False),
+        ("@" + BOT[1:].split(":")[0] + " 안녕", True),
+    ]:
+        e = event()
+        e["content"]["body"] = body
+        assert (p.admit(GROUP, e, decrypted=True, now_ms=NOW) is not None) is expected, body
+    # Direct rooms never needed a mention and still do not.
+    e = event()
+    e["content"]["body"] = "그냥 질문"
+    assert p.admit(ROOM, e, decrypted=True, now_ms=NOW) is not None
+    with pytest.raises(ValueError):
+        policy(aliases={"Bad Alias"})
+
+
+def test_mention_aliases_config_validation() -> None:
+    assert mention_aliases({}) == frozenset()
+    assert mention_aliases({"mention_aliases": ["seoseo", "bot-2"]}) == {"seoseo", "bot-2"}
+    for bad in ("seoseo", ["Seoseo"], ["a b"], [""], ["x"] * 9, ["dup", "dup"], [1]):
+        with pytest.raises(SafetyStop, match="invalid-mention-aliases"):
+            mention_aliases({"mention_aliases": bad})

@@ -30,9 +30,12 @@ import json
 import logging
 import os
 from pathlib import Path
+import platform
 import re
 import signal
+import subprocess
 import time
+import tomllib
 from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol
 
 from telegram_bot.core import session_resume, tool_policy
@@ -286,10 +289,72 @@ class MatrixBot:
         self._project_chat.set_async_completion_sender(self.async_completion_sender)
         try:
             await transport.open()
+            self._post_startup_banner(config, transport)
             await transport.run()
         finally:
             self._transport = None
             await transport.close()
+
+    def startup_banner(self) -> str:
+        """One-line "frontend is up" notice: node · provider · model · effort · rev.
+
+        Mirrors what the owner is used to seeing when the Telegram-side agent
+        starts a session (owner request 2026-09-18). Everything is best-effort
+        and read-only; unknown parts are simply omitted.
+        """
+
+        provider = str(getattr(self._settings, "agent_provider", "") or "")
+        model, effort = self._configured_model_and_effort(provider)
+        parts = [f"🟢 {platform.node()} ccc-node Matrix 프론트엔드 기동"]
+        for value in (provider, model, effort, self._bridge_revision()):
+            if value:
+                parts.append(value)
+        return " · ".join(parts)
+
+    def _configured_model_and_effort(self, provider: str) -> tuple[str | None, str | None]:
+        if provider == "codex":
+            # Codex takes its default model/effort from ~/.codex/config.toml.
+            home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+            try:
+                with open(home / "config.toml", "rb") as fh:
+                    data = tomllib.load(fh)
+            except (OSError, ValueError):
+                return None, None
+            model = data.get("model")
+            effort = data.get("model_reasoning_effort")
+            return (str(model) if model else None, str(effort) if effort else None)
+        model = getattr(self._settings, f"{provider}_model", None) if provider else None
+        return (str(model) if model else None, None)
+
+    @staticmethod
+    def _bridge_revision() -> str | None:
+        try:
+            out = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(Path(__file__).resolve().parents[2]),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        rev = out.stdout.strip()
+        return rev if out.returncode == 0 and rev else None
+
+    def _post_startup_banner(self, config: Mapping[str, Any], transport: Any) -> None:
+        if not getattr(self._settings, "matrix_startup_banner", True):
+            return
+        family = set(config.get("family_rooms") or ())
+        direct_rooms = [room for room in (config.get("rooms") or ()) if room not in family]
+        if not direct_rooms:
+            return
+        text = self.startup_banner()
+        for room in direct_rooms:
+            try:
+                transport.enqueue_notice(room, text)
+            except Exception:
+                logger.warning("startup banner not queued for %s", room, exc_info=True)
 
     def run(self) -> None:
         """Blocking entry point with the same contract as ``TelegramBot.run()``.

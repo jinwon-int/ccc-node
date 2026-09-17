@@ -216,6 +216,14 @@ class Config(
             "device/token, pickle key, state directory, owner, rooms and pinned devices."
         ),
     )
+    matrix_startup_banner: bool = Field(
+        default=True,
+        alias="CCC_MATRIX_STARTUP_BANNER",
+        description=(
+            "Post a one-line startup notice (node · provider · model · effort · rev) to the "
+            "owner's direct rooms when the Matrix frontend starts."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_matrix_channel(self):

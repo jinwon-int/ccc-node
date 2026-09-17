@@ -56,13 +56,16 @@ service overrides two keys in its unit):
   "family_rooms": ["!FAMILY_ROOM:matrix.example.invalid"],
   "family_users": ["@dad:matrix.example.invalid"],
   "family_devices": {"@dad:matrix.example.invalid": {"DAD_DEVICE": {"ed25519": "…", "curve25519": "…"}}},
-  "not_before_ms": 1788825600000
+  "not_before_ms": 1788825600000,
+  "mention_aliases": ["seoseo"]
 }
 ```
 
 Room policy is unchanged from the pilot: a direct room is exactly
 `{owner, bot}`; a family room admits only the allowlisted family users and
-answers only when addressed (`m.mentions` or a typed `@localpart`). Owner
+answers only when addressed (`m.mentions`, a typed `@localpart`, or a typed
+`@<alias>` from `mention_aliases` — Matrix ids cannot be renamed, so a bot
+that is *displayed* as "seoseo" is reachable as `@seoseo` this way). Owner
 and family devices are pinned; any change to the owner device *set* or a
 pinned device *key* stops the service fail-closed (`owner-device-set-changed`,
 `owner-device-key-changed`) until an operator re-pins — see
