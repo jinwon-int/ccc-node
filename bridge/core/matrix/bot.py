@@ -385,6 +385,10 @@ class MatrixBot:
 
         from telegram_bot.core.bot_shared import enforce_access_control
 
+        # The transport refuses a crypto store with group/other-readable files
+        # (unsafe-crypto-store); nio creates its SQLite store with the process
+        # umask, which systemd leaves at 022. The pilot set this in main().
+        os.umask(0o077)
         enforce_access_control(self._settings)
         initialize = getattr(self._session_manager, "initialize", None)
         if callable(initialize):
