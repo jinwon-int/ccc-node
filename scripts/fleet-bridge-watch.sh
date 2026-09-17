@@ -130,7 +130,7 @@ is_prepared_runtime() {
 read -r -d '' PROBE <<'PROBE_EOF' || true
 # uid, not user: the `user` column truncates names longer than 8 characters
 # ("gongmyoung" -> "gongmyo+"), and the truncated form is not a valid su target.
-line=$(ps -eo uid=,command= 2>/dev/null | grep 'telegram_bot' | grep -- '--path' | grep -v grep | head -1)
+line=$(ps -eo uid=,pid=,ppid=,command= 2>/dev/null | grep 'telegram_bot' | grep -- '--path' | grep -v grep | head -1)
 if [ -z "$line" ]; then
   # No ccc bridge. Before calling the node down, look for a Danso resident
   # service. On a migrated node the serving process is `<exe> service run
@@ -204,14 +204,17 @@ if [ -z "$line" ]; then
     echo "DOCTOR=-"
     echo "DUALDOMAIN=-"
     echo "PREPARED=-"
+    echo "PROBE_COMPLETE=1"
     exit 0
   fi
-  echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; echo "PREPARED=-"; exit 0
+  echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; echo "PREPARED=-"; echo "PROBE_COMPLETE=1"; exit 0
 fi
 echo "KIND=ccc"
 runuid=$(printf '%s' "$line" | awk '{print $1}')
+runpid=$(printf '%s' "$line" | awk '{print $2}')
+runppid=$(printf '%s' "$line" | awk '{print $3}')
 runuser=$(id -nu "$runuid" 2>/dev/null || printf '%s' "$runuid")
-cmd=$(printf '%s' "$line" | sed 's/^ *[0-9][0-9]* *//')
+cmd=$(printf '%s' "$line" | sed 's/^ *[0-9][0-9]* *[0-9][0-9]* *[0-9][0-9]* *//')
 root=""
 for tok in $cmd; do case "$tok" in */bridge/*) root=${tok%%/bridge/*}; break ;; esac; done
 bpath=$(printf '%s' "$cmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i+1); exit}}')
@@ -225,16 +228,27 @@ bpath=$(printf '%s' "$cmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i
 # is consulted whenever it exists, so a prepared launch is reported even when
 # the worker line happens to carry a /bridge/ path.
 prepared=""
-sup=$(ps -eo uid=,command= 2>/dev/null | grep -- '--_daemon_supervisor' | grep -- '/bridge/start.sh' | grep -v grep | head -1)
+worker_exe=$(printf '%s' "$cmd" | awk '{print $1}')
+# The source must come from THIS worker's parent, not the first supervisor on
+# the host. Bind owner, project, and selected interpreter before using it.
+sup=$(ps -eo uid=,pid=,command= 2>/dev/null | awk -v uid="$runuid" -v pid="$runppid" '$1 == uid && $2 == pid {print; exit}')
 if [ -n "$sup" ]; then
-  supcmd=$(printf '%s' "$sup" | sed 's/^ *[0-9][0-9]* *//')
-  prepared=$(printf '%s' "$supcmd" | awk '{for(i=1;i<NF;i++) if($i=="--prepared-runtime") {print $(i+1); exit}}')
-  if [ -z "$root" ]; then
-    for tok in $supcmd; do case "$tok" in */bridge/*) root=${tok%%/bridge/*}; break ;; esac; done
-    [ -n "$bpath" ] || bpath=$(printf '%s' "$supcmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i+1); exit}}')
-  fi
+  supcmd=$(printf '%s' "$sup" | sed 's/^ *[0-9][0-9]* *[0-9][0-9]* *//')
+  case " $supcmd " in
+    *' --_daemon_supervisor '*)
+      candidate=$(printf '%s' "$supcmd" | awk '{for(i=1;i<NF;i++) if($i=="--prepared-runtime") {print $(i+1); exit}}')
+      sup_path=$(printf '%s' "$supcmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i+1); exit}}')
+      if [ -n "$candidate" ] && [ "$sup_path" = "$bpath" ] && [ "$worker_exe" = "$candidate/runtime/bin/python" ]; then
+        prepared=$candidate
+        if [ -z "$root" ]; then
+          for tok in $supcmd; do case "$tok" in */bridge/start.sh) root=${tok%/bridge/start.sh}; break ;; esac; done
+        fi
+      fi ;;
+  esac
 fi
-[ -n "$root" ] || { echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; echo "PREPARED=-"; exit 0; }
+# A visible worker with an unrecognized layout is a failed inspection, not
+# evidence of downtime. Keep absence and confirmed unavailable as AVAIL=no.
+[ -n "$root" ] || { echo "RUNTIME=-"; echo "AVAIL=unverified"; echo "UNIT=-"; echo "PREPARED=-"; echo "PROBE_COMPLETE=1"; exit 0; }
 echo "RUNTIME=$root"
 # The job is reported only when its receipt says the preparation completed;
 # an unfinished or absent receipt leaves the launch to the canonical-root check.
@@ -243,6 +257,22 @@ if [ -n "$prepared" ] && grep -q '"status": *"ready"' "$prepared/receipt.json" 2
 else
   echo "PREPARED=-"
 fi
+
+# Metadata code travels with the watcher: peers need not upgrade or install it.
+# No temporary remote files, receipt writes, or launches are performed.
+metadata() {
+  python3 - "$1" "$root" "$prepared" "$bpath" "$runuid" <<'METADATA_PY'
+__CCC_FLEET_METADATA_SOURCE__
+METADATA_PY
+}
+case "$root" in
+  */.ccc-node/checkouts/*)
+    if [ -n "$prepared" ] && [ "$(metadata checkout 2>/dev/null)" = verified ]; then
+      echo 'CHECKOUT=verified'
+    else
+      echo 'CHECKOUT=unverified'
+    fi ;;
+esac
 
 # availability — run start.sh as the account that owns the process.
 # Name the interpreter (the #1160 defect class): shebang-exec'ing start.sh
@@ -305,16 +335,28 @@ echo "UNIT=${unit_root:--}"
 # node (measured on dungae and daegyo, 2026-08-11). The fix belongs in the
 # doctor, which alone knows which of its checks are existence tests and which
 # are live probes.
-if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ -x "$root/scripts/ccc-doctor.sh" ]; then
+if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ]; then
   cdir="${bpath:-$HOME}/.claude"
-  if [ "$(id -u)" = "$runuid" ]; then
-    CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 "$root/scripts/ccc-doctor.sh" >/dev/null 2>&1
-  elif [ "$(id -u)" != 0 ]; then
-    sudo -n -H -u "$runuser" -- env CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 bash "$root/scripts/ccc-doctor.sh" >/dev/null 2>&1
-  else
-    su - "$runuser" -c "CCC_DOCTOR_CLAUDE_DIR='$cdir' timeout 60 '$root/scripts/ccc-doctor.sh'" >/dev/null 2>&1
+  doctor_root=$root
+  # A staged runtime is not necessarily where setup installed the harness.
+  # Require its operator-owned install reference; never search for a checkout
+  # that happens to pass. Missing/unsafe references remain an explicit alert.
+  if [ -n "$prepared" ]; then
+    doctor_root=$(metadata installed 2>/dev/null) || doctor_root=""
   fi
-  echo "DOCTOR=$?"
+  if [ -z "$doctor_root" ] || [ ! -f "$doctor_root/scripts/ccc-doctor.sh" ]; then
+    echo 'DOCTOR=unverified'
+  else
+    echo "DOCTOR_ROOT=$doctor_root"
+    if [ "$(id -u)" = "$runuid" ]; then
+      CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 bash "$doctor_root/scripts/ccc-doctor.sh" >/dev/null 2>&1
+    elif [ "$(id -u)" != 0 ]; then
+      sudo -n -H -u "$runuser" -- env CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 bash "$doctor_root/scripts/ccc-doctor.sh" >/dev/null 2>&1
+    else
+      su - "$runuser" -c "CCC_DOCTOR_CLAUDE_DIR='$cdir' timeout 60 bash '$doctor_root/scripts/ccc-doctor.sh'" >/dev/null 2>&1
+    fi
+    echo "DOCTOR=$?"
+  fi
 else
   echo "DOCTOR=-"
 fi
@@ -326,8 +368,9 @@ fi
 # decoy ccc-node dirs trapping resolve_repo heuristics). These checks are
 # read-only; remediation is an operator decision. Single-domain nodes have no
 # gongmyoung account, so they emit DUALDOMAIN=- and cost nothing.
-# This historical user-service layout applies only while that user owns the
-# bridge. A root system-service runtime must not require its retired user unit.
+# Process ownership does not select the systemd manager. User=gongmyoung
+# can serve in a system unit; identify the selected worker's actual cgroup.
+# An unknown domain remains an explicit failed inspection, never a silent pass.
 if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ "$runuser" = gongmyoung ] && id gongmyoung >/dev/null 2>&1 && [ -d /home/gongmyoung ]; then
   if [ "$(id -u)" != 0 ]; then
     # crontab/loginctl inspection needs root; say so instead of guessing.
@@ -336,34 +379,71 @@ if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ "$runuser" = gongmyoung ] && id gongm
     dd_fail=""
     dd_add() { dd_fail="${dd_fail:+${dd_fail},}$1"; }
 
-    # 1. the gongmyoung crontab still carries self-update, wired to the user bus
+    # Select the manager from the worker, not an inactive leftover unit file.
+    dd_domain=unknown
+    case "$runpid" in
+      ''|*[!0-9]*) ;;
+      *)
+        if grep -q ':/system.slice/ccc-telegram-bridge\.service$' "/proc/$runpid/cgroup" 2>/dev/null; then
+          dd_domain=system
+        elif grep -q ':/user.slice/.*\/ccc-telegram-bridge\.service$' "/proc/$runpid/cgroup" 2>/dev/null; then
+          dd_domain=user
+        fi ;;
+    esac
+
+    # 1. Both layouts need the updater, but only a user unit needs a user bus.
     gcron=$(crontab -u gongmyoung -l 2>/dev/null || true)
     printf '%s\n' "$gcron" | grep -q 'ccc-self-update' || dd_add 'cron-self-update-missing'
-    printf '%s\n' "$gcron" | grep -q 'XDG_RUNTIME_DIR' \
-      && printf '%s\n' "$gcron" | grep -q 'DBUS_SESSION_BUS_ADDRESS' \
-      || dd_add 'cron-bus-env-missing'
+    if [ "$dd_domain" = user ]; then
+      printf '%s\n' "$gcron" | grep -q 'XDG_RUNTIME_DIR' \
+        && printf '%s\n' "$gcron" | grep -q 'DBUS_SESSION_BUS_ADDRESS' \
+        || dd_add 'cron-bus-env-missing'
+    fi
 
-    # 2. /opt/ccc-node is gongmyoung-owned, clean, on main, with no root-owned
-    #    git objects (a root-owned object is what flipped the 2026-08-05
-    #    self-update registration to the non-serving repo)
+    # 2. Check access as the updater account. Root-owned immutable objects and
+    # refs can be usable through directory permissions/ACLs. Conversely, a
+    # matching owner does not guarantee usable permissions. Do not write a
+    # canary, create an index lock, or interpret a failed git command as clean.
     repo=/opt/ccc-node
     [ -d "$repo/.git" ] || dd_add 'repo-missing'
     [ "$(stat -c %U "$repo" 2>/dev/null || echo ?)" = "gongmyoung" ] || dd_add 'repo-not-gongmyoung-owned'
-    [ -z "$(su - gongmyoung -c "git -C $repo status --porcelain" 2>/dev/null | head -1)" ] || dd_add 'repo-dirty'
+    if dd_status=$(su - gongmyoung -c "git -C $repo status --porcelain" 2>/dev/null); then
+      [ -z "$dd_status" ] || dd_add 'repo-dirty'
+    else
+      dd_add 'repo-status-unverified'
+    fi
     dd_branch=$(su - gongmyoung -c "git -C $repo rev-parse --abbrev-ref HEAD" 2>/dev/null || echo ?)
     [ "$dd_branch" = "main" ] || dd_add "repo-branch=$dd_branch"
-    [ -z "$(find "$repo/.git" -user root -print -quit 2>/dev/null)" ] || dd_add 'git-root-owned-objects'
+    # Atomic ref/index replacement needs writable directories; existing object
+    # files only need reads. Reflogs and FETCH_HEAD are opened for in-place
+    # writes, so those existing files also need write permission.
+    if dd_access=$(su - gongmyoung -c "cd '$repo' && find .git \( ! -readable -o \( -type d ! -writable \) -o \( \( -path '.git/logs/*' -o -path '.git/FETCH_HEAD' \) -type f ! -writable \) \) -print -quit" 2>/dev/null); then
+      [ -z "$dd_access" ] || dd_add 'git-access-denied'
+    else
+      dd_add 'git-access-unverified'
+    fi
 
-    # 3. the user unit and its manager are actually alive, and linger keeps
-    #    them that way across logout
-    uid_g=$(id -u gongmyoung 2>/dev/null || echo 1000)
-    dd_bus="XDG_RUNTIME_DIR=/run/user/$uid_g DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid_g/bus"
-    dd_unit=$(su - gongmyoung -c "env $dd_bus systemctl --user is-active ccc-telegram-bridge" 2>/dev/null || true)
-    [ "$dd_unit" = "active" ] || dd_add "user-unit=${dd_unit:-unknown}"
-    dd_mgr=$(systemctl is-active "user@$uid_g" 2>/dev/null || true)
-    [ "$dd_mgr" = "active" ] || dd_add "user-manager=${dd_mgr:-unknown}"
-    dd_linger=$(loginctl show-user gongmyoung 2>/dev/null | sed -n 's/^Linger=//p' | head -1)
-    [ "$dd_linger" = "yes" ] || dd_add "linger=${dd_linger:-unknown}"
+    # 3. Require the manager that actually owns the worker. A stale user unit
+    # must not page an active system service; neither may unknown ownership pass.
+    if [ "$dd_domain" = system ]; then
+      dd_unit=$(systemctl is-active ccc-telegram-bridge.service 2>/dev/null || true)
+      [ "$dd_unit" = active ] || dd_add "system-unit=${dd_unit:-unknown}"
+      dd_owner=$(systemctl show ccc-telegram-bridge.service -p User --value 2>/dev/null || true)
+      dd_owner_uid=""
+      [ -z "$dd_owner" ] || dd_owner_uid=$(id -u "$dd_owner" 2>/dev/null || true)
+      [ "$dd_owner_uid" = "$runuid" ] || dd_add "system-unit-owner=${dd_owner:-unknown}"
+    elif [ "$dd_domain" = user ]; then
+      uid_g=$runuid
+      dd_bus="XDG_RUNTIME_DIR=/run/user/$uid_g DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid_g/bus"
+      dd_unit=$(su - gongmyoung -c "env $dd_bus systemctl --user is-active ccc-telegram-bridge" 2>/dev/null || true)
+      [ "$dd_unit" = "active" ] || dd_add "user-unit=${dd_unit:-unknown}"
+      dd_mgr=$(systemctl is-active "user@$uid_g" 2>/dev/null || true)
+      [ "$dd_mgr" = "active" ] || dd_add "user-manager=${dd_mgr:-unknown}"
+      dd_linger=$(loginctl show-user gongmyoung 2>/dev/null | sed -n 's/^Linger=//p' | head -1)
+      [ "$dd_linger" = "yes" ] || dd_add 'linger=unknown-or-disabled'
+    else
+      dd_add 'service-domain=unverified'
+    fi
 
     # 4. no decoy ccc-node checkouts under the gongmyoung home (real dirs only;
     #    symlinks/tarballs/docs are not serving candidates)
@@ -379,7 +459,14 @@ if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ "$runuser" = gongmyoung ] && id gongm
 else
   echo "DUALDOMAIN=-"
 fi
+echo "PROBE_COMPLETE=1"
 PROBE_EOF
+META_FILE="$(cd "$(dirname "$0")" && pwd)/fleet_watch_metadata.py"
+[ -r "$META_FILE" ] || { echo 'UNVERIFIED watcher metadata-source=missing'; exit 1; }
+META_SOURCE=$(cat "$META_FILE")
+PROBE="${PROBE%%__CCC_FLEET_METADATA_SOURCE__*}$META_SOURCE${PROBE#*__CCC_FLEET_METADATA_SOURCE__}"
+# Read-only seam used by tests to execute the exact transmitted probe.
+if [ "${1:-}" = --print-probe ]; then printf '%s\n' "$PROBE"; exit 0; fi
 
 # One unanswered probe is a transport blip, not a health signal: on 2026-07-31
 # and 2026-08-01 single SSH failures paged UNREACHABLE for nodes that were fine
@@ -410,6 +497,7 @@ $PROBE"
     else
       out=$(printf '%s' "$payload" | timeout "$node_budget" "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$node" sh -s 2>/dev/null)
     fi
+    probe_rc=$?
     [ -n "$out" ] && break
     attempt=$((attempt + 1))
     [ "$attempt" -gt "$RETRIES" ] && break
@@ -420,9 +508,15 @@ $PROBE"
     echo "UNREACHABLE $node"; fail=1; continue
   fi
 
+  # Partial stdout does not prove the inspection finished. The probe is sent
+  # by this watcher, so there is no older remote protocol to fall back to.
+  if [ "$probe_rc" != 0 ] || [ "$(printf '%s\n' "$out" | tail -1)" != PROBE_COMPLETE=1 ]; then
+    echo "UNVERIFIED $node inspection=incomplete-probe"; fail=1; continue
+  fi
+
   avail=$(printf '%s\n' "$out" | sed -n 's/^AVAIL=//p' | head -1)
   runtime=$(printf '%s\n' "$out" | sed -n 's/^RUNTIME=//p' | head -1)
-  # Absent on a node running an older probe, which is a ccc node by definition.
+  # CCC is the default; Danso explicitly emits its kind.
   kind=$(printf '%s\n' "$out" | sed -n 's/^KIND=//p' | head -1)
   [ -n "$kind" ] || kind=ccc
   generation=$(printf '%s\n' "$out" | sed -n 's/^GENERATION=//p' | head -1)
@@ -437,7 +531,7 @@ $PROBE"
     echo "DEGRADED $node runtime=$runtime"; fail=1; continue
   fi
 
-  if [ "$avail" = "unverified" ]; then
+  if [ "$avail" != yes ] && [ "$avail" != no ]; then
     echo "UNVERIFIED $node runtime=$runtime"; fail=1; continue
   fi
   if [ "$avail" != "yes" ]; then
@@ -470,12 +564,17 @@ $PROBE"
   # is empty, so the check does not run rather than guessing an answer.
   prepared=$(printf '%s\n' "$out" | sed -n 's/^PREPARED=//p' | head -1)
   prepared_tag=""
+  checkout=$(printf '%s\n' "$out" | sed -n 's/^CHECKOUT=//p' | head -1)
   if [ "$kind" = danso ]; then
     if [ -n "$CANON_DANSO_EXES" ] && ! is_canonical_danso_exe "$runtime"; then
       echo "NONCANONICAL $node runtime=$runtime"; fail=1; continue
     fi
   elif ! is_canonical_root "$runtime"; then
-    if is_prepared_runtime "$runtime" "$prepared"; then
+    if [ "$checkout" = verified ]; then
+      prepared_tag=", verified-checkout:${prepared##*/}"
+    elif [ "$checkout" = unverified ]; then
+      echo "UNVERIFIED $node runtime=$runtime inspection=prepared-checkout"; fail=1; continue
+    elif is_prepared_runtime "$runtime" "$prepared"; then
       prep_dir=${prepared%/*}
       prepared_tag=", prepared:${prep_dir##*/}"
     else
@@ -490,6 +589,13 @@ $PROBE"
   fi
 
   doctor=$(printf '%s\n' "$out" | sed -n 's/^DOCTOR=//p' | head -1)
+  if [ "$doctor" = unverified ]; then
+    echo "UNVERIFIED $node runtime=$runtime inspection=harness-reference"; fail=1; continue
+  fi
+  dual=$(printf '%s\n' "$out" | sed -n 's/^DUALDOMAIN=//p' | head -1)
+  if [ "${CCC_FLEET_DOCTOR:-0}" = 1 ] && { [ -z "$doctor" ] || [ -z "$dual" ] || { [ "$kind" = ccc ] && [ "$doctor" = - ]; }; }; then
+    echo "UNVERIFIED $node runtime=$runtime inspection=incomplete-doctor"; fail=1; continue
+  fi
   # doctor exits nonzero on 교정가능/수동필요 findings; 경고 does not count.
   if [ -n "$doctor" ] && [ "$doctor" != "-" ] && [ "$doctor" != "0" ]; then
     echo "DRIFT $node doctor_exit=$doctor runtime=$runtime"; fail=1; continue

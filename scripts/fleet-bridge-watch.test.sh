@@ -28,6 +28,9 @@ for a in "\$@"; do case "\$a" in -o|-*) ;; sh|-s) ;; *) node="\$a" ;; esac; done
 f="$TMP/reply/\$node"
 [ -f "\$f" ] || exit 255
 cat "\$f"
+[ -f "\$f.incomplete" ] || echo PROBE_COMPLETE=1
+[ ! -f "\$f.rc" ] || exit "\$(cat "\$f.rc")"
+exit 0
 STUBEOF
 chmod +x "$STUB"
 mkdir -p "$TMP/reply"
@@ -160,7 +163,7 @@ ok "skipped dual-domain still reports OK" 'grep -q "^OK noroot" "$OUT"'
 # The remote probe is a quoted heredoc — invisible to bash -n on the script
 # itself. Extract and parse it as POSIX sh so a probe typo cannot ship.
 probe_body="$TMP/probe-body.sh"
-sed -n "/^read .* PROBE <<'PROBE_EOF'/,/^PROBE_EOF$/p" "$SC" | sed '1d;$d' > "$probe_body"
+bash "$SC" --print-probe > "$probe_body"
 ok "remote probe parses as POSIX sh" '[ -s "$probe_body" ] && bash -n "$probe_body" && { ! command -v dash >/dev/null || dash -n "$probe_body"; }'
 
 # ---- non-canonical runtime root (#842) ------------------------------------
@@ -262,6 +265,7 @@ if [ "\$left" -gt 0 ] 2>/dev/null; then printf '%s\n' \$((left - 1)) > "\$budget
 f="$TMP/reply/\$node"
 [ -f "\$f" ] || exit 255
 cat "\$f"
+echo PROBE_COMPLETE=1
 FLAKYEOF
 chmod +x "$FLAKY"
 mkdir -p "$TMP/flaky"
@@ -312,7 +316,8 @@ touch "$TMP/probe-repo/scripts/ccc-doctor.sh"
 chmod +x "$TMP/probe-repo/scripts/ccc-doctor.sh"
 cat > "$TMP/probe-bin/ps" <<EOF
 #!$(command -v sh)
-echo "0 $TMP/probe-repo/bridge/venv/bin/python -m telegram_bot --path $TMP/probe-home"
+case "\$*" in *uid=,pid=,ppid=*) printf '0 42 41 ' ;; *uid=,pid=*) printf '0 42 ' ;; *) printf '0 ' ;; esac
+echo "$TMP/probe-repo/bridge/venv/bin/python -m telegram_bot --path $TMP/probe-home"
 EOF
 cat > "$TMP/probe-bin/id" <<EOF
 #!$(command -v sh)
@@ -408,8 +413,9 @@ mkdir -p "$TMP/prep/source/bridge" "$TMP/prep/job/runtime/bin" "$TMP/prep-bin"
 printf '{"schema": "ccc.termux-preparation.v1", "status": "ready"}\n' > "$TMP/prep/job/receipt.json"
 cat > "$TMP/prep-bin/ps" <<EOF
 #!$(command -v sh)
-echo "0 bash $TMP/prep/source/bridge/start.sh --path $TMP/probe-home --_daemon_supervisor --prepared-runtime $TMP/prep/job"
-echo "0 $TMP/prep/job/runtime/bin/python -m telegram_bot --path $TMP/probe-home"
+echo "0 41 bash $TMP/prep/source/bridge/start.sh --path $TMP/probe-home --_daemon_supervisor --prepared-runtime $TMP/prep/job"
+case "\$*" in *uid=,pid=,ppid=*) printf '0 42 41 ' ;; *uid=,pid=*) printf '0 42 ' ;; *) printf '0 ' ;; esac
+echo "$TMP/prep/job/runtime/bin/python -m telegram_bot --path $TMP/probe-home"
 EOF
 chmod +x "$TMP/prep-bin/ps"
 : > "$TMP/sudo-calls"
@@ -431,6 +437,76 @@ ok "unready receipt withholds the job but keeps the root" \
 # from its own line and reports PREPARED=- when no supervisor names a job.
 PATH="$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/plain-out"
 ok "plain worker still reports its own root" 'grep -q "^RUNTIME=$TMP/probe-repo$" "$TMP/plain-out" && grep -q "^PREPARED=-$" "$TMP/plain-out"'
+
+# A foreign supervisor must never lend its source/job to this worker.
+cp "$TMP/prep-bin/ps" "$TMP/prep-ps.original"
+for wrong in owner parent project interpreter; do
+  case "$wrong" in
+    owner) sed 's/0 41 bash/7 41 bash/' "$TMP/prep-ps.original" > "$TMP/prep-bin/ps" ;;
+    parent) sed 's/0 41 bash/0 99 bash/' "$TMP/prep-ps.original" > "$TMP/prep-bin/ps" ;;
+    project) sed "s#--path $TMP/probe-home --_daemon_supervisor#--path $TMP/foreign --_daemon_supervisor#" "$TMP/prep-ps.original" > "$TMP/prep-bin/ps" ;;
+    interpreter) sed "s#$TMP/prep/job/runtime/bin/python#$TMP/foreign/runtime/bin/python#" "$TMP/prep-ps.original" > "$TMP/prep-bin/ps" ;;
+  esac
+  PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
+  ok "prepared parent binding rejects mismatched $wrong" 'grep -q "^AVAIL=unverified$" "$TMP/prep-out" && grep -q "^RUNTIME=-$" "$TMP/prep-out"'
+done
+cp "$TMP/prep-ps.original" "$TMP/prep-bin/ps"
+printf '{"schema":"ccc.termux-preparation.v1","status":"ready"}\n' > "$TMP/prep/job/receipt.json"
+PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
+ok "missing installation reference does not inspect an arbitrary source" 'grep -q "^DOCTOR=unverified$" "$TMP/prep-out"'
+mkdir -p "$TMP/install-repo/scripts" "$TMP/install-repo/bridge" "$TMP/install-repo/claude" "$TMP/probe-home/.claude"
+touch "$TMP/install-repo/scripts/ccc-doctor.sh" "$TMP/install-repo/bridge/start.sh" "$TMP/install-repo/claude/settings.base.json"
+printf '%s\n' "$TMP/install-repo" > "$TMP/probe-home/.claude/self-update.repo"
+chmod 600 "$TMP/probe-home/.claude/self-update.repo"
+chmod go-w "$TMP" "$TMP/probe-home" "$TMP/probe-home/.claude"
+chmod -R go-w "$TMP/install-repo"
+# The simulated worker has UID0; use the actual owner for a portable fixture.
+# Root-less CI uses its own UID for the prepared worker and direct doctor stub.
+if [ "$(id -u)" = 0 ]; then
+  : > "$TMP/sudo-calls"
+  PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
+  ok "prepared runtime doctor follows the installed harness reference" 'grep -q "^DOCTOR_ROOT=$TMP/install-repo$" "$TMP/prep-out" && grep -q "^DOCTOR=0$" "$TMP/prep-out" && grep -q "$TMP/install-repo/scripts/ccc-doctor.sh" "$TMP/sudo-calls"'
+else
+  echo 'SKIP: root-owned prepared probe routing fixture (metadata/reference tests run on all users)'
+fi
+chmod 644 "$TMP/probe-home/.claude/self-update.repo"
+PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
+ok "unsafe installation record is unverified" 'grep -q "^DOCTOR=unverified$" "$TMP/prep-out"'
+
+# Interrupted/malformed inspection output cannot be interpreted as DOWN.
+printf 'RUNTIME=/opt/ccc-node\n' > "$TMP/reply/partial"
+run partial
+ok "partial probe response stays UNVERIFIED" 'grep -q "^UNVERIFIED partial " "$OUT" && ! grep -q "^DOWN " "$OUT"'
+# Even a complete-looking availability response cannot mask transport failure.
+reply_d torn /opt/ccc-node yes /opt/ccc-node 0
+printf 'DUALDOMAIN=ok\n' >> "$TMP/reply/torn"
+printf '255\n' > "$TMP/reply/torn.rc"
+CCC_FLEET_DOCTOR=1 run torn
+ok "nonzero transport after availability stays UNVERIFIED" 'test "$RC" = 1 && grep -q "^UNVERIFIED torn inspection=incomplete-probe" "$OUT"'
+rm "$TMP/reply/torn.rc"
+for tail_fields in '' 'DOCTOR=0' 'DOCTOR=0\nDUALDOMAIN=ok'; do
+  reply torn /opt/ccc-node yes /opt/ccc-node
+  printf '%b\n' "$tail_fields" >> "$TMP/reply/torn"
+  touch "$TMP/reply/torn.incomplete"
+  CCC_FLEET_DOCTOR=1 run torn
+  ok "truncation before completion stays UNVERIFIED: $tail_fields" 'test "$RC" = 1 && grep -q "^UNVERIFIED torn inspection=incomplete-probe" "$OUT"'
+done
+rm "$TMP/reply/torn.incomplete"
+reply torn /opt/ccc-node yes /opt/ccc-node
+CCC_FLEET_DOCTOR=1 run torn
+ok "missing requested doctor fields stays UNVERIFIED even with marker" 'test "$RC" = 1 && grep -q "inspection=incomplete-doctor" "$OUT"'
+reply_dd torn /opt/ccc-node yes /opt/ccc-node 0 ok
+CCC_FLEET_DOCTOR=1 run torn
+ok "complete requested doctor inspection passes" 'test "$RC" = 0 && grep -q "^OK torn " "$OUT"'
+reply_d badref /opt/ccc-node yes /opt/ccc-node unverified
+run badref
+ok "unknown harness reference has explicit classification" 'grep -q "^UNVERIFIED badref .*inspection=harness-reference$" "$OUT"'
+printf 'RUNTIME=%s\nAVAIL=yes\nUNIT=-\nPREPARED=%s\nCHECKOUT=verified\n' "$TX/.ccc-node/checkouts/12345678" "$TX/.ccc-node/preparations/example" > "$TMP/reply/checkout"
+run checkout
+ok "proof-backed separate checkout layout is accepted" 'grep -q "^OK checkout .*verified-checkout:example)" "$OUT"'
+sed -i 's/CHECKOUT=verified/CHECKOUT=unverified/' "$TMP/reply/checkout"
+run checkout
+ok "unverified separate checkout is never promoted" 'grep -q "^UNVERIFIED checkout .*inspection=prepared-checkout$" "$OUT"'
 
 # ---- Danso nodes (danso #118 4-a) -----------------------------------------
 # A migrated node reports a binary path as its runtime, plus the generation of
@@ -618,6 +694,116 @@ chmod +x "$TMP/empty-bin/ps"
 PATH="$TMP/empty-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/empty-out"
 ok "a node with neither runtime is still DOWN" \
   'grep -q "^AVAIL=no$" "$TMP/empty-out" && grep -q "^RUNTIME=-$" "$TMP/empty-out" && ! grep -q "^KIND=danso$" "$TMP/empty-out"'
+
+# ---- runtime owner is not the service manager ------------------------------
+# Execute the POSIX probe: a system service may use User=gongmyoung without
+# needing a user unit, user bus, or linger. Keep legacy user-service coverage.
+mkdir -p "$TMP/domain-bin" "$TMP/domain-repo/.git" "$TMP/domain-home" "$TMP/domain-proc/42"
+cat > "$TMP/domain-bin/ps" <<EOF
+#!$(command -v sh)
+case "\$*" in *uid=,pid=,ppid=*) printf '1000 42 41 ' ;; *uid=,pid=*) printf '1000 42 ' ;; *) printf '1000 ' ;; esac
+if [ "\${UNKNOWN_ROOT:-0}" = 1 ]; then
+  echo '/unrecognized/python -m telegram_bot --path $TMP/domain-home'
+else
+  echo '$TMP/domain-repo/bridge/venv/bin/python -m telegram_bot --path $TMP/domain-home'
+fi
+EOF
+cat > "$TMP/domain-bin/id" <<EOF
+#!$(command -v sh)
+case "\$1" in
+ -nu) echo gongmyoung ;;
+ -u) case "\${2:-}" in gongmyoung|1000) echo 1000 ;; *) echo 0 ;; esac ;;
+ *) exit 0 ;;
+esac
+EOF
+cat > "$TMP/domain-bin/su" <<EOF
+#!$(command -v sh)
+printf '%s\n' "\$*" >> '$TMP/domain-calls'
+case "\$*" in *--status) echo 'Bot status: available' ;; *) sh -c "\$4" ;; esac
+EOF
+cat > "$TMP/domain-bin/crontab" <<EOF
+#!$(command -v sh)
+echo '0 0 * * * ccc-self-update'
+[ "\${USER_BUS:-0}" = 0 ] || echo 'XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus'
+EOF
+cat > "$TMP/domain-bin/systemctl" <<EOF
+#!$(command -v sh)
+printf '%s\n' "\$*" >> '$TMP/domain-calls'
+case "\$*" in
+  *show*User*) echo "\${UNIT_USER:-gongmyoung}" ;;
+  *is-active*) echo "\${UNIT_STATE:-active}"; [ "\${UNIT_STATE:-active}" = active ] ;;
+  *) exit 1 ;;
+esac
+EOF
+cat > "$TMP/domain-bin/loginctl" <<EOF
+#!$(command -v sh)
+echo 'Linger=yes'
+EOF
+cat > "$TMP/domain-bin/stat" <<EOF
+#!$(command -v sh)
+echo gongmyoung
+EOF
+cat > "$TMP/domain-bin/git" <<EOF
+#!$(command -v sh)
+case "\$*" in
+  *status*) [ "\${GIT_FAILURE:-0}" = 0 ] || exit 128 ;;
+  *rev-parse*) echo main ;;
+esac
+EOF
+cat > "$TMP/domain-bin/find" <<EOF
+#!$(command -v sh)
+case "\$*" in
+  *'-user root'*) echo '$TMP/domain-repo/.git/refs/root-owned-but-accessible' ;;
+  *)
+     if [ "\${FETCH_DENIED:-0}" = 1 ]; then
+       case "\$*" in *".git/FETCH_HEAD"*) echo '$TMP/domain-repo/.git/FETCH_HEAD' ;; esac
+     fi
+     [ "\${GIT_DENIED:-0}" = 0 ] || echo '$TMP/domain-repo/.git/objects/unwritable' ;;
+esac
+[ "\${FIND_FAILURE:-0}" = 0 ] || exit 1
+EOF
+chmod +x "$TMP/domain-bin/"*
+sed -e "s#/home/gongmyoung#$TMP/domain-home#g" \
+    -e "s#/opt/ccc-node#$TMP/domain-repo#g" \
+    -e "s#/proc/#$TMP/domain-proc/#g" "$probe_body" > "$TMP/domain-probe.sh"
+domain_probe() {
+  : > "$TMP/domain-calls"
+  env PATH="$TMP/domain-bin:$PATH" CCC_FLEET_DOCTOR=1 "$@" sh "$TMP/domain-probe.sh" > "$TMP/domain-out"
+}
+printf '0::/system.slice/ccc-telegram-bridge.service\n' > "$TMP/domain-proc/42/cgroup"
+domain_probe
+ok "system service with user owner is coherent without user bus" 'grep -q "^DUALDOMAIN=ok$" "$TMP/domain-out"'
+ok "system service does not inspect user unit" '! grep -q -- "--user is-active" "$TMP/domain-calls"'
+ok "accessible root-owned git objects are not drift" '! grep -q "git-root-owned-objects" "$TMP/domain-out"'
+domain_probe UNIT_STATE=inactive
+ok "inactive system manager is reported distinctly" 'grep -q "system-unit=inactive" "$TMP/domain-out"'
+domain_probe UNIT_USER=root
+ok "system unit owner mismatch is still drift" 'grep -q "system-unit-owner=root" "$TMP/domain-out"'
+domain_probe UNIT_USER=1000
+ok "numeric systemd User resolves to the runtime UID" 'grep -q "^DUALDOMAIN=ok$" "$TMP/domain-out"'
+domain_probe FETCH_DENIED=1
+ok "unwritable existing FETCH_HEAD is still drift" 'grep -q "git-access-denied" "$TMP/domain-out"'
+domain_probe GIT_DENIED=1
+ok "unwritable git directory is still drift" 'grep -q "git-access-denied" "$TMP/domain-out"'
+domain_probe FIND_FAILURE=1
+ok "git inspection error is not a clean tree" 'grep -q "git-access-unverified" "$TMP/domain-out"'
+domain_probe GIT_FAILURE=1
+ok "git status failure is not a clean tree" 'grep -q "repo-status-unverified" "$TMP/domain-out"'
+printf '0::/user.slice/user-1000.slice/user@1000.service/app.slice/ccc-telegram-bridge.service\n' > "$TMP/domain-proc/42/cgroup"
+domain_probe USER_BUS=1
+ok "legacy user service remains supported" 'grep -q "^DUALDOMAIN=ok$" "$TMP/domain-out"'
+domain_probe
+ok "legacy user service still requires user bus" 'grep -q "cron-bus-env-missing" "$TMP/domain-out"'
+printf '0::/system.slice/unrelated.service\n' > "$TMP/domain-proc/42/cgroup"
+domain_probe
+ok "unknown service domain is unverified" 'grep -q "service-domain=unverified" "$TMP/domain-out"'
+domain_probe UNKNOWN_ROOT=1
+ok "visible process with unknown root is not reported DOWN" 'grep -q "^AVAIL=unverified$" "$TMP/domain-out" && ! grep -q "^AVAIL=no$" "$TMP/domain-out"'
+
+python3 "$ROOT/scripts/fleet_watch_metadata_test.py"
+okc "$?" 0 "strict metadata and actual Git provenance regressions"
+python3 "$ROOT/scripts/fleet_watch_permissions_test.py"
+okc "$?" 0 "actual unprivileged Git permission regressions"
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
