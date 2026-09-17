@@ -177,8 +177,9 @@ fresh explicit user approval in the current conversation, in both directions.
    reviews (#1714), so only an explicit `CHANGES_REQUESTED` fails verification.
 
 6. With required review and checks green, squash-merge normally (on
-   `jinwon-int/ccc-node`, `main` runs a merge queue — see the merge-queue
-   subsection at the end of this step; enqueue instead of merging):
+   `jinwon-int/ccc-node` and `jinwon-int/fleet-skills`, `main` runs a merge
+   queue — see the merge-queue subsection at the end of this step; enqueue
+   instead of merging):
 
    ```bash
    gh pr merge <n> --repo <owner/repo> --squash --delete-branch
@@ -248,7 +249,8 @@ fresh explicit user approval in the current conversation, in both directions.
    are commit-bound to `--expected-head`, so the pre-refresh approval no
    longer counts.
 
-**Merge queue on `jinwon-int/ccc-node` (since 2026-09-13).** `main` has a
+**Merge queues: `jinwon-int/ccc-node` `main` (since 2026-09-13) and
+`jinwon-int/fleet-skills` `main` (since 2026-09-17).** Both have a
 `merge_queue` ruleset rule, so plain `gh pr merge` is refused ("the merge
 strategy for main is set by the merge queue") — including by the relay merge
 helper. Land by enqueueing instead; exact-head and independent-review rules
@@ -256,18 +258,41 @@ are unchanged, and the queue re-runs every required check on a speculative
 `gh-readonly-queue/main/...` group ref before squash-landing:
 
 ```bash
-pr_id="$(gh pr view <n> --repo jinwon-int/ccc-node --json id --jq .id)"
+pr_id="$(gh pr view <n> --repo <owner/repo> --json id --jq .id)"
 gh api graphql \
   -f query='mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){clientMutationId}}' \
   -f id="$pr_id"
 # then poll until state MERGED (the queue evicts on failing group checks):
-gh pr view <n> --repo jinwon-int/ccc-node --json state,mergeStateStatus
+gh pr view <n> --repo <owner/repo> --json state,mergeStateStatus
 ```
 
 Enqueue needs the head up to date and its checks green; a stale `BEHIND` head
 goes through the update-branch loop above first. If the group fails, the
 queue evicts the PR: push the fix, then get fresh exact-head approval for the
 new head before re-enqueueing, as with any other push.
+
+Do not assume a repo without a queue is simply slower to merge. `main` on
+both repos also requires strict (up-to-date) status checks, and that pairing
+without a queue is what makes a batch land serially: the first merge puts
+every sibling PR `BEHIND`, and each one then needs `update-branch` plus a
+full CI round trip. Promotion batches #232-#235 cost four such cycles by hand
+on 2026-09-16 before the fleet-skills queue existed.
+
+**Before enabling a queue on another repo, check the workflow triggers.** The
+queue reports against the `merge_group` event, so a required check whose
+workflow only lists `pull_request` (and `push`) never reports inside a group
+and every enqueued PR waits forever. fleet-skills needed
+[#236](https://github.com/jinwon-int/fleet-skills/pull/236) to add
+`merge_group:` to `validate.yml` — which owns the required `skills` and
+`merge-boundary` contexts — before the queue could be turned on. A check that
+is not in the required set (fleet-skills `receipts`) does not gate the queue
+and needs no trigger change.
+
+Enabling is a ruleset operation, not branch protection: GraphQL
+`updateBranchProtectionRule` rejects `requiresMergeQueue`
+(`argumentNotAccepted`). Add a ruleset carrying only the `merge_queue` rule
+and leave classic protection (required checks, approval count,
+`enforce_admins`) untouched — rollback is deleting that one ruleset.
 
 7. Verify and clean up:
 
