@@ -136,7 +136,7 @@ Schema:
     "awaiting_user": false,
     "open_question": "<unanswered user-facing question / approval request, or empty string>",
     "next_step": "<one safest next step, or empty string>",
-    "evidence": ["<PR/issue/commit/run id if present>"]
+    "evidence": ["<linkable ids ONLY — \"issue #123\", \"pr #45\", \"commit 61768fc\", \"run 987\", a bare 7-64 hex sha, or \"#123\". A description like \"10 unit tests\" is not an id; use [] when none are named>"]
   }
 }
 

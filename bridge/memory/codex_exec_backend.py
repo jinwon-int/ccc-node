@@ -42,7 +42,11 @@ DISTILL_EXTRACTION_PROMPT: Final = (
     "For every kind=decision fact, set its because field to a reason supported "
     "by the transcript in one sentence. If the transcript does not contain the "
     "reason, omit that decision; never invent a because value. A decision without "
-    "its reason is not durable memory."
+    "its reason is not durable memory. "
+    "resume.evidence holds linkable identifiers only -- 'issue #123', 'pr #45', "
+    "'commit 61768fc', 'run 987', a bare 7-64 character hex sha, or '#123'. "
+    "Describing what happened ('10 unit tests', '8/8 mutations killed') is not an "
+    "identifier; leave the list empty when the transcript names none."
 )
 
 _DEFAULT_SCHEMA = (
