@@ -376,8 +376,9 @@ if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ "$runuser" = gongmyoung ] && id gongm
     dd_branch=$(su - gongmyoung -c "git -C $repo rev-parse --abbrev-ref HEAD" 2>/dev/null || echo ?)
     [ "$dd_branch" = "main" ] || dd_add "repo-branch=$dd_branch"
     # Atomic ref/index replacement needs writable directories; existing object
-    # files only need reads. Reflogs are appended, so their files need writes.
-    if dd_access=$(su - gongmyoung -c "cd '$repo' && find .git \( ! -readable -o \( -type d ! -writable \) -o \( -path '.git/logs/*' -type f ! -writable \) \) -print -quit" 2>/dev/null); then
+    # files only need reads. Reflogs and FETCH_HEAD are opened for in-place
+    # writes, so those existing files also need write permission.
+    if dd_access=$(su - gongmyoung -c "cd '$repo' && find .git \( ! -readable -o \( -type d ! -writable \) -o \( \( -path '.git/logs/*' -o -path '.git/FETCH_HEAD' \) -type f ! -writable \) \) -print -quit" 2>/dev/null); then
       [ -z "$dd_access" ] || dd_add 'git-access-denied'
     else
       dd_add 'git-access-unverified'
@@ -389,7 +390,9 @@ if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ "$runuser" = gongmyoung ] && id gongm
       dd_unit=$(systemctl is-active ccc-telegram-bridge.service 2>/dev/null || true)
       [ "$dd_unit" = active ] || dd_add "system-unit=${dd_unit:-unknown}"
       dd_owner=$(systemctl show ccc-telegram-bridge.service -p User --value 2>/dev/null || true)
-      [ "$dd_owner" = "$runuser" ] || dd_add "system-unit-owner=${dd_owner:-unknown}"
+      dd_owner_uid=""
+      [ -z "$dd_owner" ] || dd_owner_uid=$(id -u "$dd_owner" 2>/dev/null || true)
+      [ "$dd_owner_uid" = "$runuid" ] || dd_add "system-unit-owner=${dd_owner:-unknown}"
     elif [ "$dd_domain" = user ]; then
       uid_g=$runuid
       dd_bus="XDG_RUNTIME_DIR=/run/user/$uid_g DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid_g/bus"

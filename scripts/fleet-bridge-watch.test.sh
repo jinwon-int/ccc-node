@@ -636,7 +636,11 @@ fi
 EOF
 cat > "$TMP/domain-bin/id" <<EOF
 #!$(command -v sh)
-case "\$1" in -nu) echo gongmyoung ;; -u) echo 0 ;; *) exit 0 ;; esac
+case "\$1" in
+ -nu) echo gongmyoung ;;
+ -u) case "\${2:-}" in gongmyoung|1000) echo 1000 ;; *) echo 0 ;; esac ;;
+ *) exit 0 ;;
+esac
 EOF
 cat > "$TMP/domain-bin/su" <<EOF
 #!$(command -v sh)
@@ -676,7 +680,11 @@ cat > "$TMP/domain-bin/find" <<EOF
 #!$(command -v sh)
 case "\$*" in
   *'-user root'*) echo '$TMP/domain-repo/.git/refs/root-owned-but-accessible' ;;
-  *) [ "\${GIT_DENIED:-0}" = 0 ] || echo '$TMP/domain-repo/.git/objects/unwritable' ;;
+  *)
+     if [ "\${FETCH_DENIED:-0}" = 1 ]; then
+       case "\$*" in *".git/FETCH_HEAD"*) echo '$TMP/domain-repo/.git/FETCH_HEAD' ;; esac
+     fi
+     [ "\${GIT_DENIED:-0}" = 0 ] || echo '$TMP/domain-repo/.git/objects/unwritable' ;;
 esac
 [ "\${FIND_FAILURE:-0}" = 0 ] || exit 1
 EOF
@@ -697,6 +705,10 @@ domain_probe UNIT_STATE=inactive
 ok "inactive system manager is reported distinctly" 'grep -q "system-unit=inactive" "$TMP/domain-out"'
 domain_probe UNIT_USER=root
 ok "system unit owner mismatch is still drift" 'grep -q "system-unit-owner=root" "$TMP/domain-out"'
+domain_probe UNIT_USER=1000
+ok "numeric systemd User resolves to the runtime UID" 'grep -q "^DUALDOMAIN=ok$" "$TMP/domain-out"'
+domain_probe FETCH_DENIED=1
+ok "unwritable existing FETCH_HEAD is still drift" 'grep -q "git-access-denied" "$TMP/domain-out"'
 domain_probe GIT_DENIED=1
 ok "unwritable git directory is still drift" 'grep -q "git-access-denied" "$TMP/domain-out"'
 domain_probe FIND_FAILURE=1
