@@ -125,7 +125,7 @@ Schema:
   "wiki_candidates": [
     {
       "title": "<short Korean title>",
-      "suggested_path": "<e.g. pages/team/dungae/DECISIONS.md or pages/nodes/dungae/RUNBOOK.md or pages/log.md>",
+      "suggested_path": "<the area the knowledge belongs to: pages/runbooks/<topic>.md, pages/decisions/<topic>.md, pages/incidents/<topic>.md, pages/services/<topic>.md, pages/owners/<name>.md, pages/team/<name>/<topic>.md, pages/nodes/<name>/<topic>.md, or pages/log.md>",
       "summary": "<2-4 sentence Korean summary of the durable operational fact / decision / runbook step>",
       "evidence_excerpt": "<<= 200 chars verbatim Korean quote from the transcript>"
     }
