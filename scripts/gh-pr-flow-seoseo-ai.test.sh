@@ -45,6 +45,9 @@ elif [ "$1" = "api" ] && [[ "$2" == repos/* ]] && [[ " $* " == *" .permissions.p
   printf '%s\n' "${MOCK_PUSH:-true}"
 elif [ "$1" = "api" ] && [[ "$2" == repos/* ]] && [[ " $* " == *" .default_branch "* ]]; then
   printf '%s\n' "${MOCK_DEFAULT_BRANCH:-main}"
+elif [ "$1" = "api" ] && [[ "$2" == repos/*/commits/* ]]; then
+  # When the head commit was created; an approval must postdate it (#1765).
+  printf '%s\n' "${MOCK_HEAD_COMMITTED_AT-2026-09-16T10:23:31Z}"
 elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" author,baseRefName,state,isDraft,headRefOid,mergeable,reviewRequests,statusCheckRollup "* ]]; then
   jq -n \
     --arg author "${MOCK_AUTHOR:-jinon86}" \
@@ -201,7 +204,7 @@ fi
 #1714 regression: a re-run must reuse the already-recorded exact-head approval
 # instead of stacking a duplicate approving review.
 rm -f "$MOCK_REVIEW_MARKER"
-if MOCK_BEFORE_REVIEWS="[{\"author\":{\"login\":\"seoseo-ai\"},\"state\":\"APPROVED\",\"commit\":{\"oid\":\"$HEAD_SHA\"}}]" \
+if MOCK_BEFORE_REVIEWS="[{\"author\":{\"login\":\"seoseo-ai\"},\"state\":\"APPROVED\",\"commit\":{\"oid\":\"$HEAD_SHA\"},\"submittedAt\":\"2026-09-16T10:30:00Z\"}]" \
    run_helper >"$TMP/idempotent.out" \
    && jq -e '.ok == true and .approved == true and .already_approved == true' \
      "$TMP/idempotent.out" >/dev/null \
