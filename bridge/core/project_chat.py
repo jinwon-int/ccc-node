@@ -152,11 +152,17 @@ class ProjectChatHandler(
         agent_runtime: Any = None,
         clock: Any = None,
         session_started_recorder: Callable[..., Awaitable[None]] | None = None,
+        memory_route: str = "telegram",
     ):
         # ``settings=None`` is retained only for legacy unit-test adapters. The
         # production composition root always injects the validated Settings.
         compatibility_mode = settings is None
         self._config = config if compatibility_mode else settings
+        # Frontend route name that namespaces private memory audiences
+        # (#1780). Telegram keeps its historical digest; a Matrix frontend
+        # passes "matrix" so an int-mapped Matrix user can never share a
+        # Telegram user's private memory scope.
+        self._memory_route = memory_route
         if getattr(self._config, "agent_provider", "claude") == "grok":
             raise ValueError("Grok requires its fixed-owner frontend; generic project routing is disabled")
         self._session_started_recorder = session_started_recorder
@@ -1069,7 +1075,9 @@ class ProjectChatHandler(
         from telegram_bot.core.memory_audience import resolve_memory_audience
         if getattr(self._config, "agent_provider", None) != "danso":
             raise ValueError("Danso is not active")
-        audience = resolve_memory_audience(self._config, user_id=user_id, chat_id=chat_id)
+        audience = resolve_memory_audience(
+            self._config, user_id=user_id, chat_id=chat_id, route=self._memory_route
+        )
         request = SessionRequest(
             working_directory=str(self._config.danso_workspace), session_id=session_id,
             memory_environment=None if audience is None else audience.danso_environment(self._config),

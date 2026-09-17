@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import stat
 from collections.abc import Mapping
@@ -400,15 +401,27 @@ def load_or_create_audience_key(settings: Any) -> bytes:
         return value
 
 
+MEMORY_ROUTE_TELEGRAM = "telegram"
+_ROUTE_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
+
+
 def resolve_memory_audience(
-    settings: Any, *, user_id: int, chat_id: int | None
+    settings: Any, *, user_id: int, chat_id: int | None, route: str = MEMORY_ROUTE_TELEGRAM
 ) -> MemoryAudience | None:
-    """Resolve one route, returning ``None`` unless the safe mode is enabled."""
+    """Resolve one route, returning ``None`` unless the safe mode is enabled.
+
+    ``route`` names the frontend (``"telegram"`` default keeps the historical
+    private-audience digest byte-identical; a Matrix frontend passes
+    ``"matrix"``). Private scopes are namespaced per route so two frontends
+    that both map users onto ints can never collide on the same digest.
+    """
 
     if getattr(settings, "bridge_memory_mode", "off") != MEMORY_MODE_AUDIENCE_SCOPED:
         return None
     if chat_id is None:
-        raise ValueError("audience-scoped memory requires a Telegram chat id")
+        raise ValueError("audience-scoped memory requires a chat id")
+    if not isinstance(route, str) or not _ROUTE_NAME.fullmatch(route):
+        raise ValueError("memory route must be a short lowercase name")
     assert_memory_scope_safe(
         MEMORY_MODE_AUDIENCE_SCOPED,
         getattr(settings, "telegram_session_scope", "per-user-chat"),
@@ -421,7 +434,7 @@ def resolve_memory_audience(
     key = load_or_create_audience_key(settings)
     digest = hmac.new(
         key,
-        f"telegram-dm-user\0{user_id}".encode(),
+        f"{route}-dm-user\0{user_id}".encode(),
         hashlib.sha256,
     ).hexdigest()[:32]
     return MemoryAudience(AUDIENCE_PRIVATE, f"private-{digest}", root)
