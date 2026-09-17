@@ -15,14 +15,22 @@ two can never drift.
 Guard rails (issue #1204 contract):
 - daily cadence via install-nunchi.sh cron (managed marker; an unmanaged cron
   trips doctor cron-drift), flock against concurrent runs
-- CAP items per run (default 10, oldest first)
+- CAP *judgeable* items per run (default 10, oldest first)
 - items younger than MIN_AGE_HOURS (default 24) are inviolable
 - the only automatic mutation is `review=0` (the `review <id> --clear`
   equivalent); supersede appears in the report as proposal text only
 - G5 (#1264): a reasonless decision is never deterministic-cleared — it has
   no live sibling by construction, so the deterministic pass would hide the
-  missing reason. Class g5-reasonless-decision, always verdict=human, and
-  the audit points the owner at `annotate <id> --because`.
+  missing reason. It is owner-actionable only (`annotate <id> --because`), so
+  it is also held out of the CAP entirely: a verdict run can neither clear nor
+  advance it, and with a plain `ORDER BY id LIMIT CAP` the oldest ones were
+  re-selected every run while the queue behind them was never reached
+  (measured on yukson: the same ten ids re-triaged for eight straight days
+  with 613 judgeable facts stuck behind them). The backlog is reported and
+  audited once per run as `g5-deferred-backlog`, not once per item per run.
+  The hold-out is derived from `nunchi._g5_reasonless_decision`, never from a
+  second copy of the rule in SQL, and clears itself the moment the owner
+  supplies the reason.
 - judge failure / unparseable verdict is fail-closed (human-approval)
 - NUNCHI_JUDGE_APPLY=1 to mutate; default is dry-run
 - before an apply run mutates: DB backup to ~/.nunchi/backup/; per-item
@@ -83,6 +91,9 @@ JUDGE_TIMEOUT = ccc_secure_fs.bounded_int_env(os.environ, "NUNCHI_JUDGE_TIMEOUT_
 MAX_SCOPES = ccc_secure_fs.bounded_int_env(os.environ, "CCC_NUNCHI_MAX_SCOPES_PER_RUN", 64, 1, 64, clamp=True)
 
 VERDICTS = ("clear", "conflict", "human")
+# Bound on the g5 ids echoed into the report/audit. The backlog count is exact;
+# the id list is a sample so a 141-item backlog cannot bloat either artifact.
+_DEFERRED_SAMPLE = 10
 _CODEX_ENV_NAMES = (
     "HOME",
     "CODEX_HOME",
@@ -176,14 +187,39 @@ def fan_out_scopes():
 # ---------------------------------------------------------------------------
 
 def fetch_queue(conn):
-    """Oldest-first flagged facts older than the freshness moat."""
+    """Oldest-first judgeable facts older than the freshness moat.
+
+    G5 (#1264) items are counted but never occupy a CAP slot. A reasonless
+    decision is owner-actionable only (`annotate <id> --because`), so a verdict
+    run can neither clear nor advance it — and with a plain
+    ``ORDER BY id LIMIT CAP`` the oldest ones are re-selected every run, so the
+    queue behind them is never reached. Measured on yukson: the same ten ids
+    (#747..#994) were re-triaged to `human` on eight consecutive days while 613
+    judgeable facts behind them had never once been looked at.
+
+    The G5 test stays in ``nunchi._g5_reasonless_decision``. It also accepts a
+    reason carried inline in the fact text, so it is deliberately not
+    re-expressed as a SQL predicate here: a second copy of the rule would drift
+    from the canonical one and re-hide the gap it exists to surface.
+
+    Returns ``(queue, deferred_ids)`` — the queue is capped, the deferred count
+    is a full scan so the report can state the real backlog.
+    """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=MIN_AGE_HOURS)).isoformat(timespec="seconds")
-    return conn.execute(
+    cursor = conn.execute(
         "SELECT id, observed, kind, fact, source_rank, created_at, because FROM peer_facts"
         " WHERE valid_to IS NULL AND review=1 AND created_at <= ?"
-        " ORDER BY id LIMIT ?",
-        (cutoff, CAP),
-    ).fetchall()
+        " ORDER BY id",
+        (cutoff,),
+    )
+    queue = []
+    deferred = []
+    for row in cursor:
+        if nunchi._g5_reasonless_decision(row[2], row[3], row[6]):
+            deferred.append(row[0])
+        elif len(queue) < CAP:
+            queue.append(row)
+    return queue, deferred
 
 
 def live_conflict(conn, fact_id, observed, text, kind=None):
@@ -593,14 +629,15 @@ def apply_decisions(conn, decisions):
     return clears, applied, backup
 
 
-def build_report(stamp, decisions, clears, humans, applied, backup):
+def build_report(stamp, decisions, clears, humans, applied, backup, deferred=()):
     mode = "APPLY" if APPLY else "dry-run"
     lines = [
         f"# nunchi judge-batch report — {stamp}",
         "",
         f"- mode: **{mode}** (NUNCHI_JUDGE_APPLY={'1' if APPLY else 'unset'})",
         f"- db: `{DB}`",
-        f"- queue processed: {len(decisions)} (CAP {CAP}, freshness moat {MIN_AGE_HOURS}h)",
+        f"- queue processed: {len(decisions)} (CAP {CAP}, freshness moat {MIN_AGE_HOURS}h)"
+        + (f" · g5-deferred: {len(deferred)}" if deferred else ""),
         f"- deterministic clear: {sum(1 for d in decisions if d['class'] == 'deterministic-clear')}",
         f"- judge: {sum(1 for d in decisions if d['class'] == 'judge')}"
         f" (clear {sum(1 for d in decisions if d['class'] == 'judge' and d['verdict'] == 'clear')})",
@@ -631,6 +668,21 @@ def build_report(stamp, decisions, clears, humans, applied, backup):
             lines.append(f"- #{d['id']} ({d['class']}): {d['rationale']}")
             if d["supersede_proposal"]:
                 lines.append(f"  - supersede proposal (apply manually): {d['supersede_proposal']}")
+    if deferred:
+        sample = list(deferred)[:_DEFERRED_SAMPLE]
+        lines += [
+            "",
+            "## g5-deferred (owner-actionable, held out of the CAP)",
+            "",
+            f"- reasonless decisions: **{len(deferred)}** (G5, #1264)",
+            "- a verdict run can neither clear nor advance these; only the owner can:",
+            "",
+            "```",
+        ]
+        lines += [f"nunchi.py annotate {fid} --because <reason>" for fid in sample]
+        if len(deferred) > len(sample):
+            lines.append(f"# ... and {len(deferred) - len(sample)} more")
+        lines.append("```")
     return "\n".join(lines) + "\n"
 
 
@@ -646,10 +698,24 @@ def run_single_db():
             print("judge-batch: another run holds the lock — skipping")
             return 0
         conn = sqlite3.connect(DB)
-        decisions = triage_queue(conn, fetch_queue(conn))
+        queue, deferred = fetch_queue(conn)
+        decisions = triage_queue(conn, queue)
         clears, applied, backup = apply_decisions(conn, decisions)
         humans = [d for d in decisions if d["verdict"] != "clear"]
         stamp = now()
+        if deferred:
+            # One aggregate line per run, not one row per item per run. The old
+            # per-item audit wrote the same ten g5 rows daily (210 of 270 rows
+            # in the measured log) and still left the backlog unstated.
+            audit({
+                "ts": stamp, "db": DB, "class": "g5-deferred-backlog",
+                "verdict": "human", "applied": False,
+                "count": len(deferred),
+                "ids": deferred[:_DEFERRED_SAMPLE],
+                "rationale": ("reasonless decisions held out of the CAP (G5, #1264) —"
+                              " owner backfill: nunchi.py annotate <id> --because <reason>"),
+                "supersede_proposal": None, "backend": None, "attempts": [],
+            })
         for d in decisions:
             audit({
                 "ts": stamp, "db": DB, "id": d["id"], "class": d["class"],
@@ -657,12 +723,16 @@ def run_single_db():
                 "rationale": d["rationale"], "supersede_proposal": d["supersede_proposal"],
                 "backend": d.get("backend"), "attempts": d.get("attempts", []),
             })
-        write_report(build_report(stamp, decisions, clears, humans, applied, backup), humans)
+        write_report(
+            build_report(stamp, decisions, clears, humans, applied, backup, deferred),
+            humans,
+        )
         conn.close()
         mode = "APPLY" if APPLY else "dry-run"
         print(f"judge-batch ({mode}): {len(decisions)} triaged,"
               f" {len(clears)} clear, {len(humans)} human-pending"
-              + (f", {applied} applied" if APPLY else ""))
+              + (f", {applied} applied" if APPLY else "")
+              + (f", {len(deferred)} g5-deferred" if deferred else ""))
         return 0
 
 
