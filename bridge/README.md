@@ -343,6 +343,8 @@ a provider turn or reads transcript/credential files.
 | `CCC_BRIDGE_EXECUTION_PROFILE` | No | `strict-project` | Execution boundary: `strict-project`, `owner-operator`, or `disabled` |
 | `CCC_BRIDGE_BASH_POLICY` | No | `auto-approve` | Bash approval UX; Codex default is unrestricted `never + dangerFullAccess` |
 | `CCC_AGENT_PROVIDER` | No | `claude` | Main runtime provider: `claude`, `codex`, `piri`, `crush`, or [`danso`](../docs/danso-telegram.md) |
+| `CCC_CHANNEL` | No | `telegram` | Chat frontend: `telegram` (this bridge) or `matrix` — the same ProjectChatHandler behind the E2EE Matrix transport (family messenger, #1780). `matrix` needs `pip install -r requirements-matrix.txt` |
+| `CCC_MATRIX_CONFIG_PATH` | Matrix only | — | Private (0600) JSON: homeserver, bot account/device/token, pickle key, state directory, owner, rooms, pinned devices. Required when `CCC_CHANNEL=matrix` |
 | `CCC_CODEX_CLI_PATH` | Codex only | `~/.claude/hooks/ccc-codex` | Installed memory-bootstrap launcher used for direct/app-server runs |
 | `CCC_CODEX_REAL_CLI_PATH` | Codex only | `codex` | Underlying Codex binary invoked by the launcher |
 | `CCC_CODEX_MEMORY_MATERIALIZER_PATH` | Codex only | `~/.claude/hooks/ccc_codex_memory.py` | Body-free materialize/status command run at thread boundaries |
