@@ -59,9 +59,15 @@ service overrides two keys in its unit):
   "not_before_ms": 1788825600000,
   "mention_aliases": ["seoseo"],
   "wake_words": ["서서", "서서야"],
+  "turn_timeout_minutes": 360,
   "identities": {"@owner:matrix.example.invalid": {"master": "43_BASE64_CHARACTERS"}}
 }
 ```
+
+`turn_timeout_minutes` (optional, default 20, allowed 5–360) caps one
+running turn; a timed-out turn still resolves uncertain exactly as
+before — only the ceiling moves. Set it to 360 (6 h) for genuinely long
+work (owner request 2026-09-18).
 
 Room policy is unchanged from the pilot: a direct room is exactly
 `{owner, bot}`; a family room admits only the allowlisted family users and
