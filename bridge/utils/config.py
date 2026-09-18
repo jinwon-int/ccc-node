@@ -329,8 +329,11 @@ class Config(
             "at most six hours."
         ),
     )
+    # 2026-09-18 operator decision: long tasks run unattended by default, so
+    # the full-run budgets default to their safety ceilings; the env keys may
+    # still lower them per task.
     danso_task_stage_requests: int = Field(
-        default=16,
+        default=1024,
         ge=1,
         le=1024,
         alias="CCC_DANSO_TASK_STAGE_REQUESTS",
@@ -340,14 +343,14 @@ class Config(
         ),
     )
     danso_task_max_requests: int = Field(
-        default=1024,
+        default=2048,
         ge=1,
         le=2048,
         alias="CCC_DANSO_TASK_MAX_REQUESTS",
         description="Cumulative provider-request budget for one native long task (up to 2048).",
     )
     danso_task_max_tokens: int = Field(
-        default=10_000_000,
+        default=25_000_000,
         ge=1,
         le=25_000_000,
         alias="CCC_DANSO_TASK_MAX_TOKENS",
