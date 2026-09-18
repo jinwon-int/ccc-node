@@ -13,7 +13,7 @@ Turn outcomes:
 * ``TurnResult(status="complete")`` — :meth:`MatrixStore.finish` records the
   reply (an empty reply completes the job without an outbox delivery).
 * anything else — a ``TurnResult(status="uncertain")``, a runner exception,
-  the 20-minute turn timeout, or a ``/cancel`` — ends the job with a short
+  the configured turn timeout, or a ``/cancel`` — ends the job with a short
   notice ("중단했습니다 / 시간 제한 / 오류 … 다시 보내 주세요") and the loop
   keeps serving, exactly like the Telegram bridge. Nothing is re-run.
 * a turn interrupted by a service stop/restart is left *uncertain* by the
@@ -57,6 +57,7 @@ from telegram_bot.core.matrix.state import (
     saved_policy,
     scope_of,
     turn_id,
+    turn_timeout_minutes,
     upgrade_saved_policy,
     wake_words,
 )
@@ -73,7 +74,7 @@ NOTICE_UNCERTAIN = (
 )  # legacy text kept for the operator unblock audit; no longer posted to rooms
 NOTICE_RESTARTED = "⏳ 답변 중에 서비스가 재시작되어 마지막 답변이 끊겼습니다. 메시지를 다시 보내 주세요."
 NOTICE_CANCELLED = "⏹ 요청대로 작업을 중단했습니다."
-NOTICE_TIMEOUT = "⏳ 시간 제한(20분)을 넘겨 작업을 중단했습니다. 요청을 나눠서 다시 보내 주세요."
+NOTICE_TIMEOUT = "⏳ 시간 제한({minutes}분)을 넘겨 작업을 중단했습니다. 요청을 나눠서 다시 보내 주세요."
 NOTICE_TURN_ERROR = "❌ 처리 중 오류가 나서 답변을 만들지 못했습니다. 잠시 후 다시 보내 주세요."
 # The pilot posted "작업을 시작했습니다. 취소 명령: /cancel <turn>" at every turn
 # start because it had no typing indicator. This frontend shows typing plus
@@ -92,7 +93,6 @@ NOTICE_UNTRUSTED_DEVICE = (
 )
 
 NONCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,64}")
-TURN_TIMEOUT_S = 1200.0
 APPROVAL_TIMEOUT_S = 120.0
 TURN_JOIN_TIMEOUT_S = 30.0
 MAX_APPROVAL_TEXT_BYTES = 12_000
@@ -275,12 +275,15 @@ class MatrixTransport:
         runner: TurnRunner,
         *,
         approval_timeout: float = APPROVAL_TIMEOUT_S,
-        turn_timeout: float = TURN_TIMEOUT_S,
+        turn_timeout: float | None = None,
     ) -> None:
         self.c = config
         self.runner = runner
         self.approval_timeout = approval_timeout
-        self.turn_timeout = turn_timeout
+        # Config ceiling (default 20 min, up to 6 h); explicit tests still win.
+        self.turn_timeout = (
+            turn_timeout if turn_timeout is not None else turn_timeout_minutes(config) * 60.0
+        )
         # Family settings are a trust boundary; reject them before opening state.
         self.family_rooms, self.family_users, self.family_devices = family_config(config)
         # Trust model per user (#149): a user with a pinned cross-signing
@@ -1020,7 +1023,7 @@ class MatrixTransport:
         if outcome == "cancelled":
             text = NOTICE_CANCELLED
         elif outcome == "timeout":
-            text = NOTICE_TIMEOUT
+            text = NOTICE_TIMEOUT.format(minutes=round(self.turn_timeout / 60))
         else:  # runner exception or an explicit uncertain result
             text = NOTICE_TURN_ERROR
         self.store.resolve_uncertain(job["event_id"], text)

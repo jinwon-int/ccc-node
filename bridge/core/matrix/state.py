@@ -82,6 +82,7 @@ SAFETY_STOP_REASONS: frozenset[str] = frozenset(
         "invalid-family-notice-text",
         "invalid-mention-aliases",
         "invalid-wake-words",
+        "invalid-turn-timeout",
         "invalid-identities",
         "owner-identity-changed",
         "family-identity-changed",
@@ -212,6 +213,24 @@ def wake_words(config: Mapping[str, Any]) -> frozenset[str]:
     ):
         raise SafetyStop("invalid-wake-words")
     return frozenset(raw)
+
+
+def turn_timeout_minutes(config: Mapping[str, Any]) -> float:
+    """Optional ``turn_timeout_minutes``: per-turn ceiling in minutes.
+
+    Defaults to 20 (the historical hardcoded value); 5..360 keeps a runaway
+    turn bounded while allowing genuinely long work (6 h) on request
+    (owner request 2026-09-18). A timed-out turn still resolves uncertain
+    exactly as before — only the ceiling moves.
+    """
+    raw = config.get("turn_timeout_minutes", 20)
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, (int, float))
+        or not 5 <= raw <= 360
+    ):
+        raise SafetyStop("invalid-turn-timeout")
+    return float(raw)
 
 
 def identifier(value: Any, prefix: str) -> bool:
