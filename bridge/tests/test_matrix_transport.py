@@ -24,10 +24,13 @@ import pytest
 from telegram_bot.core.matrix import transport as t
 from telegram_bot.core.matrix.state import MatrixStore, SafetyStop, turn_id
 from telegram_bot.core.matrix.transport import (
+    NOTICE_CANCELLED,
+    NOTICE_RESTARTED,
+    NOTICE_TIMEOUT,
+    NOTICE_TURN_ERROR,
     NOTICE_UNDECRYPTABLE,
     NOTICE_UNTRUSTED_DEVICE,
     FAMILY_NOTICE,
-    NOTICE_ACKED,
     NOTICE_CONTROL_FORWARDED,
     NOTICE_INVALID_CONTROL,
     NOTICE_QUEUE_FULL,
@@ -525,7 +528,7 @@ async def test_oversized_or_flooded_approvals_are_refused_without_prompt(tmp_pat
 
 
 @pytest.mark.anyio
-async def test_cancel_uncertainty_requires_explicit_same_scope_ack(tmp_path: Path) -> None:
+async def test_cancel_ends_with_a_notice_and_work_continues_without_ack(tmp_path: Path) -> None:
     async with running(tmp_path, "cancel") as h:
         f = h.f
         await f.input(request(f))
@@ -533,23 +536,21 @@ async def test_cancel_uncertainty_requires_explicit_same_scope_ack(tmp_path: Pat
         await h.until(lambda: bool(f.approvals))
         tid = turn_id("$request")
         await f.input(request(f, "$cancel", "/cancel " + tid))
-        await h.until(lambda: bool(f.store.uncertain()))
+        await h.until(lambda: f.store.get_meta("last_turn") is not None and f.store.get_meta("last_turn")["outcome"] == "cancelled")
         assert h.runner.cancels == ["$request"]
         assert f.store.session(request(f).scope) is None
-        assert f.store.get_meta("last_turn")["outcome"] == "cancelled"
-        await h.until(lambda: any("/ack " + tid in r for r in h.replies()))
+        assert not f.store.uncertain(), "a user cancel is closed immediately, no /ack gate"
         assert not work.done()  # a user cancel never stops the service
-        assert f.store.claim() is None
-        await f.input(request(f, "$ack", "/ack " + tid))
-        assert not f.store.uncertain()
-        assert NOTICE_ACKED in h.replies()
-        assert f.store.claim() is None
-        # Work resumes after the acknowledgement (once the scope's replies are out).
+        assert NOTICE_CANCELLED in h.drain()
+        assert not any("/ack" in r for r in h.replies())
+        # The next message in the same scope is served right away.
         h.runner.mode = "complete"
-        h.drain()
         await f.input(request(f, "$next"))
         await h.until(lambda: f.store.session(request(f).scope) == "synthetic-session")
         assert [c["event_id"] for c in h.runner.calls] == ["$request", "$next"]
+        # /ack is still accepted as a courtesy no-op.
+        await f.input(request(f, "$ack", "/ack " + tid))
+        assert not f.store.uncertain()
 
 
 @pytest.mark.anyio
@@ -561,48 +562,47 @@ async def test_cancel_still_cancels_when_runner_cancel_raises(tmp_path: Path) ->
         await h.until(lambda: bool(f.approvals))
         tid = turn_id("$request")
         await f.input(request(f, "$cancel", "/cancel " + tid))
-        await h.until(lambda: bool(f.store.uncertain()))
+        await h.until(lambda: f.store.get_meta("last_turn") is not None and f.store.get_meta("last_turn")["outcome"] == "cancelled")
         assert h.runner.cancels == ["$request"]
         assert NOTICE_CONTROL_FORWARDED in h.replies()
+        assert not f.store.uncertain() and NOTICE_CANCELLED in h.replies()
 
 
 @pytest.mark.anyio
-async def test_runner_failure_leaves_uncertain_and_pauses_all_work_until_ack(tmp_path: Path) -> None:
+async def test_runner_failure_posts_an_error_notice_and_the_next_job_runs(tmp_path: Path) -> None:
     async with running(tmp_path, "raise") as h:
         f = h.f
         await f.input(request(f))
         await f.input(request(f, "$second"))
         work = h.work()
-        await h.until(lambda: bool(f.store.uncertain()))
-        await asyncio.sleep(0.3)
-        assert not work.done()
-        assert [c["event_id"] for c in h.runner.calls] == ["$request"]  # nothing else claimed
-        assert f.store.get_meta("last_turn")["outcome"] == "error:RuntimeError"
+        await h.until(lambda: f.store.get_meta("last_turn") is not None and f.store.get_meta("last_turn")["outcome"] == "error:RuntimeError")
         assert "synthetic failure" not in json.dumps(f.store.get_meta("last_turn"))
+        assert not f.store.uncertain()
+        assert not work.done()
         h.runner.mode = "complete"
-        await f.input(request(f, "$ack", "/ack " + turn_id("$request")))
+        # The error notice must be delivered before the scope continues (outbox ordering).
         await asyncio.sleep(0.3)
-        assert len(h.runner.calls) == 1  # the acknowledged reply must be delivered before the scope continues
-        h.drain()
+        assert len(h.runner.calls) == 1
+        assert NOTICE_TURN_ERROR in h.drain()
         await h.until(lambda: len(h.runner.calls) == 2)
         assert h.runner.calls[1]["event_id"] == "$second"
 
 
 @pytest.mark.anyio
-async def test_uncertain_result_and_turn_timeout_never_publish(tmp_path: Path) -> None:
+async def test_uncertain_result_and_turn_timeout_never_publish_the_answer(tmp_path: Path) -> None:
     async with running(tmp_path, "uncertain", turn_timeout=0.1) as h:
         f = h.f
         await f.input(request(f))
         h.work()
-        await h.until(lambda: bool(f.store.uncertain()))
-        assert f.store.get_meta("last_turn")["outcome"] == "uncertain"
-        await f.input(request(f, "$ack", "/ack " + turn_id("$request")))
-        h.drain()
+        await h.until(lambda: f.store.get_meta("last_turn") is not None and f.store.get_meta("last_turn")["outcome"] == "uncertain")
+        assert not f.store.uncertain()
+        assert NOTICE_TURN_ERROR in h.drain()
         h.runner.mode = "slow"
         await f.input(request(f, "$slow"))
         await h.until(lambda: f.store.get_meta("last_turn")["outcome"] == "timeout")
         assert h.runner.interrupted == 1
-        assert [j["event_id"] for j in f.store.uncertain()] == ["$slow"]
+        await h.until(lambda: NOTICE_TIMEOUT in h.replies())
+        assert not f.store.uncertain()
         assert not any(r in ("late", "synthetic answer") for r in h.replies())
 
 
@@ -639,9 +639,9 @@ async def test_stop_alias_cancels_the_senders_running_turn(tmp_path: Path) -> No
         work = h.work()
         await h.until(lambda: bool(f.approvals))
         await f.input(request(f, "$stop", "/stop"))
-        await h.until(lambda: bool(f.store.uncertain()))
+        await h.until(lambda: f.store.get_meta("last_turn") is not None and f.store.get_meta("last_turn")["outcome"] == "cancelled")
         assert h.runner.cancels == ["$request"]
-        assert f.store.get_meta("last_turn")["outcome"] == "cancelled"
+        assert not f.store.uncertain() and NOTICE_CANCELLED in h.replies()
         assert not work.done()
         # A stranger's room/scope cannot stop someone else's turn.
         h.runner.mode = "slow"
@@ -738,8 +738,21 @@ async def test_service_stop_during_turn_propagates_and_marks_uncertain(tmp_path:
         await asyncio.gather(work, return_exceptions=True)
         assert work.cancelled()
         assert h.runner.interrupted == 1
-        assert f.store.uncertain()
+        assert f.store.uncertain(), "a service stop leaves the turn for the next process"
         assert f.active is None and f.turn_task is None
+        # The next process closes it with the restart notice and serves new work at once.
+        await f.close()
+        f2 = MatrixTransport(config(tmp_path), FakeRunner("complete"))
+        try:
+            task = asyncio.create_task(f2.work())
+            async with asyncio.timeout(5):
+                while NOTICE_RESTARTED not in [j["reply"] for j in f2.store.outbox()]:
+                    await asyncio.sleep(0.01)
+            assert not f2.store.uncertain()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        finally:
+            await f2.close()
 
 
 @pytest.mark.anyio
@@ -768,7 +781,7 @@ async def test_join_gives_up_on_a_runner_that_ignores_cancellation(tmp_path: Pat
             h.work()
             await h.until(lambda: f.store.get_meta("turn_join_timeout") is not None)
         assert f.store.get_meta("last_turn")["outcome"] == "timeout"
-        assert f.store.uncertain()
+        assert not f.store.uncertain() and NOTICE_TIMEOUT in h.replies()
 
 
 @pytest.mark.anyio
