@@ -45,6 +45,11 @@ from telegram_bot.core.matrix.render import chunk_text, render_matrix_message
 from telegram_bot.core.matrix_ids import MatrixIdMap
 from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core.project_chat_types import ChatResponse
+from telegram_bot.core.push_notifier import (
+    _DEDUP_WINDOW_SECONDS,
+    _SENT_RETENTION_SECONDS,
+    PushNotifier,
+)
 from telegram_bot.core.session_scope import storage_key
 from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE
@@ -180,6 +185,130 @@ class _NotificationRoute:
             raise RuntimeError(f"no Matrix route for chat_id {chat_id}")
 
 
+class MatrixSpoolNotifier:
+    """Polls the channel-neutral push spool and delivers records to the owner room.
+
+    Record handling mirrors core.push_notifier (Telegram) byte for byte — same
+    spool dir default, sent/ archive, dedup window and rate limit, and the
+    same record format via ``PushNotifier._format``. The enabling flag is
+    per-service (``CCC_PUSH_ENABLED``): on a node running both frontends
+    exactly one process may consume the spool, or every notice is delivered
+    twice. Records have no Matrix room of their own, so they land in the
+    owner's direct room, falling back to the family room.
+    """
+
+    def __init__(self, settings: Any, transport: Any) -> None:
+        # ``transport`` is a MatrixTransport; imported lazily in _build_transport
+        # (bot/transport import cycle), so the annotation stays Any here.
+        self._transport = transport
+        self.enabled: bool = bool(getattr(settings, "push_enabled", False))
+        self.spool_dir = Path(
+            getattr(settings, "push_spool_dir", None)
+            or (Path.home() / ".claude" / "state" / "telegram-spool")
+        )
+        self.interval: float = float(getattr(settings, "push_poll_interval", 3.0))
+        self.max_per_minute: int = int(getattr(settings, "push_max_per_minute", 10))
+        self._recent: dict[str, float] = {}
+        self._sent_times: list[float] = []
+
+    def _owner_room(self) -> Optional[str]:
+        rooms = self._transport.policy.rooms
+        direct = [r for r, mode in rooms.items() if mode == "direct"]
+        if direct:
+            return direct[0]
+        family = [r for r, mode in rooms.items() if mode == "mention"]
+        return family[0] if family else None
+
+    async def run(self) -> None:
+        if not self.enabled:
+            logger.info("Matrix spool notifier disabled (push_enabled is false)")
+            return
+        room = self._owner_room()
+        if room is None:
+            logger.warning(
+                "Matrix spool notifier enabled but no direct/family room is configured; not sending"
+            )
+            return
+        sent_dir = self.spool_dir / "sent"
+        try:
+            self.spool_dir.mkdir(parents=True, exist_ok=True)
+            sent_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("Matrix spool notifier cannot create spool dir %s: %s", self.spool_dir, e)
+            return
+        self._prune_sent(sent_dir)
+        logger.info("Matrix spool notifier active → room %s, spool %s", room, self.spool_dir)
+        while True:
+            try:
+                await self._drain(room, sent_dir)
+            except Exception:
+                logger.warning("Matrix spool drain error (continuing)", exc_info=True)
+            await asyncio.sleep(self.interval)
+
+    async def _drain(self, room: str, sent_dir: Path) -> None:
+        for p in sorted(self.spool_dir.glob("*.json")):
+            if not p.is_file():
+                continue
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                self._archive(p, sent_dir)  # malformed → don't retry forever
+                continue
+            text = (data.get("text") or "").strip()
+            if not text:
+                self._archive(p, sent_dir)
+                continue
+            now = time.time()
+            key = data.get("dedup") or text
+            if key in self._recent and now - self._recent[key] < _DEDUP_WINDOW_SECONDS:
+                self._archive(p, sent_dir)
+                continue
+            self._sent_times = [t for t in self._sent_times if now - t < 60]
+            self._recent = {
+                k: t for k, t in self._recent.items() if now - t < _DEDUP_WINDOW_SECONDS
+            }
+            if len(self._sent_times) >= self.max_per_minute:
+                logger.warning("Matrix spool rate limit reached (%d/min); deferring", self.max_per_minute)
+                return
+            try:
+                self._transport.enqueue_notice(room, PushNotifier._format(data))
+            except ValueError as e:
+                # A room this process may never write (not-allowed/too long)
+                # stays failing forever — archive instead of looping on it.
+                logger.warning("Matrix spool record undeliverable, archived: %s", e)
+                self._archive(p, sent_dir)
+                continue
+            except Exception:
+                logger.warning("Matrix spool send failed (will retry next cycle)", exc_info=True)
+                return  # keep file; stop this cycle to preserve order
+            self._recent[key] = now
+            self._sent_times.append(now)
+            self._archive(p, sent_dir)
+
+    @staticmethod
+    def _archive(p: Path, sent_dir: Path) -> None:
+        try:
+            p.rename(sent_dir / p.name)
+        except OSError:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _prune_sent(sent_dir: Path) -> None:
+        cutoff = time.time() - _SENT_RETENTION_SECONDS
+        try:
+            for p in sent_dir.glob("*.json"):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
 class MatrixBot:
     """Matrix frontend: ``TurnRunner`` over ``ProjectChatHandler``."""
 
@@ -304,7 +433,15 @@ class MatrixBot:
                 logger.info("Matrix frontend initialised a new bot device; start again without CCC_MATRIX_INITIALIZE")
                 return
             self._post_startup_banner(config, transport)
-            await transport.run()
+            notifier = MatrixSpoolNotifier(self._settings, transport)
+            if not notifier.enabled:
+                await transport.run()
+            else:
+                # Same TaskGroup semantics as transport.run(): a leg that dies
+                # stops the service so systemd restarts it whole.
+                async with asyncio.TaskGroup() as group:
+                    group.create_task(transport.run())
+                    group.create_task(notifier.run())
         finally:
             self._transport = None
             await transport.close()

@@ -64,6 +64,16 @@ service overrides two keys in its unit):
 }
 ```
 
+The frontend also consumes the channel-neutral push spool
+(`CCC_PUSH_SPOOL`, default `~/.claude/state/telegram-spool`) when
+`CCC_PUSH_ENABLED` is set for the **matrix service** — self-update,
+fleet-alert and agent-cron records are delivered to the owner's direct
+room (fallback: family room) with the same dedup/rate/archive semantics
+as the Telegram notifier. On a node running both frontends, set the
+override on each unit (`Environment=CCC_PUSH_ENABLED=true` on the matrix
+unit, `=false` on the telegram unit) so exactly one process consumes the
+spool; real environment beats the shared `.env`.
+
 `turn_timeout_minutes` (optional, default 360 — 6 h —, allowed 5–360) caps one
 running turn; a timed-out turn still resolves uncertain exactly as
 before — only the ceiling moves. Set it to 360 (6 h) for genuinely long
