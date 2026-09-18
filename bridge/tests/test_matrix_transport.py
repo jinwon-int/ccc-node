@@ -25,6 +25,7 @@ from telegram_bot.core.matrix import transport as t
 from telegram_bot.core.matrix.state import MatrixStore, SafetyStop, turn_id
 from telegram_bot.core.matrix.transport import (
     NOTICE_UNDECRYPTABLE,
+    NOTICE_UNTRUSTED_DEVICE,
     FAMILY_NOTICE,
     NOTICE_ACKED,
     NOTICE_CONTROL_FORWARDED,
@@ -1417,3 +1418,105 @@ async def test_family_admission_pinned_verified_mentioned_humans_only(tmp_path: 
         assert f.expected_recipients(direct) == {(h.owner, "OWNER")}
         f.room_members[FAMILY] = h.healthy_members()
         assert f.expected_recipients(FAMILY) == {(h.owner, "OWNER"), (DAD, "DAD1")}
+
+
+def _cross_signing_raw(account: str, owner: str, master: str, ssk: str, devices: dict[str, tuple[str, str, bool]]) -> dict[str, Any]:
+    """keys/query payload: devices -> (ed25519, curve25519, signed_by_ssk)."""
+    bot_keys = {"keys": {"ed25519:BOT": "agent-ed", "curve25519:BOT": "agent-cu"}}
+    device_keys = {
+        d: {"keys": {"ed25519:" + d: ed, "curve25519:" + d: cu},
+            "signatures": {owner: {"ed25519:" + ssk: "sig-ok" if signed else "sig-bad"}}}
+        for d, (ed, cu, signed) in devices.items()
+    }
+    return {
+        "device_keys": {account: {"BOT": bot_keys}, owner: device_keys},
+        "master_keys": {owner: {"keys": {"ed25519:" + master: master}}},
+        "self_signing_keys": {owner: {"keys": {"ed25519:" + ssk: ssk}, "signatures": {owner: {"ed25519:" + master: "sig-ok"}}}},
+    }
+
+
+@pytest.fixture(autouse=True)
+def _drop_fake_nio_module() -> Any:
+    had = sys.modules.get("nio")
+    yield
+    if had is None:
+        sys.modules.pop("nio", None)
+    else:
+        sys.modules["nio"] = had
+
+
+def _fake_verify_json(json: Any, user_key: str, user_id: str, device_id: str) -> bool:
+    return (json.get("signatures") or {}).get(user_id, {}).get("ed25519:" + device_id) == "sig-ok"
+
+
+@pytest.mark.anyio
+async def test_cross_signed_identity_trusts_signed_devices_without_pins(tmp_path: Path) -> None:
+    master, ssk = "M" * 43, "S" * 43
+    base = config(tmp_path)
+    cfg = {**base, "devices": {}, "identities": {base["owner"]: {"master": master}}}
+    async with running(tmp_path, cfg=cfg) as h:
+        f = h.f
+        owner = f.c["owner"]
+        assert f.pins == {} and f.trusted == {}
+        sys.modules["nio"] = fake_nio()
+        identity = {"ed25519": "agent-ed", "curve25519": "agent-cu"}
+        store = {"NEW": pinned_device("a", "b"), "OLD": pinned_device("c", "d")}
+        client_mock(f, devices={owner: store}, identity=identity)
+        f.client.olm.verify_json = Mock(side_effect=_fake_verify_json)
+        raw = _cross_signing_raw(f.c["account"], owner, master, ssk, {"NEW": ("a" * 43, "b" * 43, True), "OLD": ("c" * 43, "d" * 43, False)})
+        f.raw = AsyncMock(return_value=raw)
+        await f.pin_devices()
+        assert f.trusted[owner] == {"NEW": "b" * 43}
+        assert [c.args[0] for c in f.client.verify_device.call_args_list] == [store["NEW"]]
+        assert [c.args[0] for c in f.client.blacklist_device.call_args_list] == [store["OLD"]]
+        assert f.store.get_meta("trusted_devices")[owner]["devices"] == ["NEW"]
+        # A login/logout only changes the trusted set; it never stops the service.
+        raw2 = _cross_signing_raw(f.c["account"], owner, master, ssk, {"NEW": ("a" * 43, "b" * 43, True), "N2": ("e" * 43, "f" * 43, True)})
+        client_mock(f, devices={owner: {"NEW": store["NEW"], "N2": pinned_device("e", "f")}}, identity=identity)
+        f.client.olm.verify_json = Mock(side_effect=_fake_verify_json)
+        f.raw = AsyncMock(return_value=raw2)
+        await f.pin_devices()
+        assert set(f.trusted[owner]) == {"NEW", "N2"}
+        assert f.expected_recipients(f.c["rooms"][0]) == {(owner, "NEW"), (owner, "N2")}
+        # The published ed25519 must match the stored device key even when signed.
+        raw3 = _cross_signing_raw(f.c["account"], owner, master, ssk, {"NEW": ("x" * 43, "b" * 43, True)})
+        client_mock(f, devices={owner: {"NEW": store["NEW"]}}, identity=identity)
+        f.client.olm.verify_json = Mock(side_effect=_fake_verify_json)
+        f.raw = AsyncMock(return_value=raw3)
+        await f.pin_devices()
+        assert f.trusted[owner] == {}
+        # Only an identity change (account reset) or a broken chain stops the service.
+        for payload, reason in (
+            ({**raw, "master_keys": {owner: {"keys": {"ed25519:" + "Z" * 43: "Z" * 43}}}}, "owner-identity-changed"),
+            ({**raw, "master_keys": {}}, "cross-signing-missing"),
+            ({**raw, "self_signing_keys": {owner: {"keys": {"ed25519:" + ssk: ssk}, "signatures": {owner: {"ed25519:" + master: "sig-bad"}}}}}, "cross-signing-invalid"),
+        ):
+            f.raw = AsyncMock(return_value=payload)
+            with pytest.raises(SafetyStop, match=reason):
+                await f.pin_devices()
+
+
+@pytest.mark.anyio
+async def test_cross_signed_mode_ignores_untrusted_sender_devices_with_one_notice(tmp_path: Path) -> None:
+    master = "M" * 43
+    base = config(tmp_path)
+    cfg = {**base, "devices": {}, "identities": {base["owner"]: {"master": master}}}
+    nio = fake_nio()
+    async with running(tmp_path, cfg=cfg) as h:
+        f = h.f
+        owner, room = f.c["owner"], f.c["rooms"][0]
+        sys.modules["nio"] = nio
+        f.trusted[owner] = {"NEW": "b" * 43}
+        f.c["not_before_ms"] = h_now = int(time.time() * 1000) - 1000
+
+        def message(event_id: str, key: str, verified: bool = True) -> Any:
+            source = {"type": "m.room.message", "event_id": event_id, "sender": owner, "origin_server_ts": h_now + 500,
+                      "content": {"msgtype": "m.text", "body": "hi"}}
+            return nio.RoomMessageText(sender=owner, source=source, verified=verified, sender_key=key, ts=h_now + 500)
+
+        assert f.admit_event(room, message("$ok", "b" * 43)) is not None
+        assert f.admit_event(room, message("$bad1", "d" * 43)) is None
+        assert f.admit_event(room, message("$bad2", "d" * 43)) is None  # same device: no second notice
+        assert f.admit_event(room, message("$bad3", "b" * 43, verified=False)) is None
+        assert sum(NOTICE_UNTRUSTED_DEVICE == r for r in h.replies()) == 2  # one per untrusted device key
+        assert set(f.store.get_meta("untrusted_senders")) == {f"{owner}:{'d' * 43}", f"{owner}:{'b' * 43}"}
