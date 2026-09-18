@@ -114,12 +114,15 @@ never collide with a Telegram user's private scope.
 ## Running alongside the Telegram bridge (seoseo)
 
 The frontend is a second systemd service on the same node and project root
-(`bridge/service-systemd-matrix.service.example`). `start.sh` assumes one
-instance per project root (pid file, health file, Telegram token lock), so
-the Matrix unit launches the package directly —
-`<venv>/bin/python -m telegram_bot --path /root` — with its own
-`BOT_DATA_DIR` (logs and the session store follow it), `CCC_CHANNEL=matrix`
-and `CCC_MATRIX_CONFIG_PATH`. It still reads the project `.env`
+(`bridge/service-systemd-matrix.service.example`). The Matrix unit launches
+the package directly — `<venv>/bin/python -m telegram_bot --path /root` —
+with its own `BOT_DATA_DIR` (logs and the session store follow it),
+`CCC_CHANNEL=matrix` and `CCC_MATRIX_CONFIG_PATH`. `start.sh` still owns the
+Telegram unit (pid file, health file, token lock under `.telegram_bot`). Its
+process oracle (`find_project_bot_pids`) matches `--path` **and**
+`CCC_CHANNEL`, so a healthy Matrix frontend is not "already running" for
+Telegram start/`--stop`/`reap_competing_pollers` (jingun 2026-09-18 crash
+loop). It still reads the project `.env`
 (`<project>/.telegram_bot/.env`) for provider and memory keys, so both
 frontends run the same model, materializer and working-state files; they do
 not share Telegram state or sessions. `MatrixBot.run()` is the blocking entry

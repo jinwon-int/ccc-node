@@ -363,11 +363,45 @@ _ps_argv_is_project_bot() {
     esac
 }
 
+# Channel this start.sh invocation owns. Unset/empty/unknown collapse to
+# telegram — the historical default, and the systemd Telegram unit does not
+# set CCC_CHANNEL. Matrix frontends set CCC_CHANNEL=matrix and a separate
+# BOT_DATA_DIR; they share --path but are a different service.
+_this_bridge_channel() {
+    case "${CCC_CHANNEL:-telegram}" in
+        matrix) printf '%s\n' matrix ;;
+        *) printf '%s\n' telegram ;;
+    esac
+}
+
+# Read CCC_CHANNEL from a NUL-delimited environ file (/proc/<pid>/environ or
+# a test fixture). Missing file, empty file, or unset/unknown value => telegram.
+_environ_bridge_channel() {
+    local file="$1" arg
+    while IFS= read -r -d '' arg; do
+        case "$arg" in
+            CCC_CHANNEL=matrix) printf '%s\n' matrix; return 0 ;;
+            CCC_CHANNEL=*) printf '%s\n' telegram; return 0 ;;
+        esac
+    done 2>/dev/null < "$file"
+    printf '%s\n' telegram
+}
+
+_environ_is_this_channel() {
+    [ "$(_environ_bridge_channel "$1")" = "$(_this_bridge_channel)" ]
+}
+
 # PIDs of `python -m telegram_bot --path $PROJECT_ROOT` processes for THIS
-# project root, regardless of pid-file state. Covers unmanaged instances whose
-# pid file was lost (pid-file race between concurrent instances) or never
-# written — the same fallback the fleet watchdogs already use, so --status /
-# --stop and the watchdogs agree on what "running" means.
+# project root AND this CCC_CHANNEL, regardless of pid-file state. Covers
+# unmanaged instances whose pid file was lost (pid-file race between concurrent
+# instances) or never written — the same fallback the fleet watchdogs already
+# use, so --status / --stop and the watchdogs agree on what "running" means.
+#
+# A Matrix frontend on the same --path is a different service (own data dir,
+# own token, CCC_CHANNEL=matrix). Counting it as "already running" blocks the
+# Telegram unit from starting, and --stop/reap_competing_pollers would kill it
+# (jingun 2026-09-18: Telegram systemd crash-looped with "Bot is already
+# running" while Matrix was healthy).
 #
 # pgrep -f gathers candidates by a metacharacter-free literal prefix; the exact
 # owner is then confirmed against /proc/<pid>/cmdline (NUL-delimited), because
@@ -378,7 +412,11 @@ find_project_bot_pids() {
     while IFS= read -r pid; do
         [ -n "$pid" ] || continue
         if [ -r "/proc/$pid/cmdline" ]; then
-            _cmdline_is_project_bot "/proc/$pid/cmdline" && printf '%s\n' "$pid"
+            _cmdline_is_project_bot "/proc/$pid/cmdline" || continue
+            if [ -r "/proc/$pid/environ" ]; then
+                _environ_is_this_channel "/proc/$pid/environ" || continue
+            fi
+            printf '%s\n' "$pid"
         else
             _ps_argv_is_project_bot "$pid" && printf '%s\n' "$pid"
         fi
@@ -448,14 +486,16 @@ restart_caller_bridge_ancestor() {
     return 1
 }
 
-# Terminate competing project-bot pollers for this PROJECT_ROOT — other
-# `python -m telegram_bot --path $PROJECT_ROOT` processes that are NOT the pid
-# passed in "$1" (the still-live current child, if any) and NOT the supervisor
-# itself. The daemon supervisor calls this before an auto-restart: a crash
-# caused by a Telegram getUpdates 409 Conflict means a stray/second poller
-# still holds the token, so without clearing it the relaunch 409s again and the
-# supervisor burns the rapid-crash budget and gives up, leaving the bot down.
-# No-op when no competitor exists (the common case for an ordinary crash).
+# Terminate competing project-bot pollers for this PROJECT_ROOT and channel —
+# other `python -m telegram_bot --path $PROJECT_ROOT` processes on the same
+# CCC_CHANNEL that are NOT the pid passed in "$1" (the still-live current child,
+# if any) and NOT the supervisor itself. A Matrix frontend on the same path is
+# a different channel and must not be reaped. The daemon supervisor calls this
+# before an auto-restart: a crash caused by a Telegram getUpdates 409 Conflict
+# means a stray/second poller still holds the token, so without clearing it the
+# relaunch 409s again and the supervisor burns the rapid-crash budget and gives
+# up, leaving the bot down. No-op when no competitor exists (the common case
+# for an ordinary crash).
 reap_competing_pollers() {
     local keep="${1:-}" pid self_sup
     self_sup="$(read_supervisor_pid 2>/dev/null || true)"

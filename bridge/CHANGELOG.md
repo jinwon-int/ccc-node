@@ -1,5 +1,13 @@
 # Changelog
 
+- **Telegram `start.sh` no longer treats a Matrix frontend as itself.**
+  `find_project_bot_pids` matched any `python -m telegram_bot --path $PROJECT_ROOT`,
+  so a second systemd unit on the same project root (`CCC_CHANNEL=matrix`, own
+  `BOT_DATA_DIR`) made the Telegram unit crash-loop with "Bot is already running"
+  and would have been killed by `--stop` / `reap_competing_pollers` (jingun
+  2026-09-18). The oracle now also requires the process `CCC_CHANNEL` to match
+  this invocation (unset/empty => telegram).
+
 - **Codex resume diagnostics and the revised long-thread policy (#1722
   follow-up).** The existing bounded resume path now publishes body-free
   metadata to `health.json → codex_resume` and `start.sh --status`: whether the
