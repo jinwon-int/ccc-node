@@ -59,12 +59,12 @@ ok "wrong-typed alerts prints nothing" '[ -z "$out" ]'
 # by mutation: removing the `except` in main() left an output-only suite green.
 # These run after the fixtures exist so they exercise malformed CONTENT, not
 # just a missing file.
-python3 "$MOD" "$TMP/does-not-exist.json" >/dev/null 2>&1; rc=$?
-ok "missing cache exits 0 (fail-open, not a crash)" '[ "$rc" = 0 ]'
-python3 "$MOD" "$TMP/broken.json" >/dev/null 2>&1; rc=$?
-ok "unparseable cache exits 0" '[ "$rc" = 0 ]'
-python3 "$MOD" "$TMP/wrongshape.json" >/dev/null 2>&1; rc=$?
-ok "wrong-typed alerts exits 0" '[ "$rc" = 0 ]'
+python3 "$MOD" "$TMP/does-not-exist.json" >/dev/null 2>&1
+ok "missing cache exits 0 (fail-open, not a crash)" "[ $? = 0 ]"
+python3 "$MOD" "$TMP/broken.json" >/dev/null 2>&1
+ok "unparseable cache exits 0" "[ $? = 0 ]"
+python3 "$MOD" "$TMP/wrongshape.json" >/dev/null 2>&1
+ok "wrong-typed alerts exits 0" "[ $? = 0 ]"
 
 w norows '{"alerts": [{"repo": "x/y"}]}'
 out="$(python3 "$MOD" "$TMP/norows.json")"
@@ -123,6 +123,7 @@ ok "row count is bounded" '[ "$(printf "%s" "$out" | grep -c "^- x/y#")" = 6 ]'
 ok "hidden rows are counted, not dropped silently" 'printf "%s" "$out" | grep -q "외 3건"'
 ok "oldest alert sorts first" 'printf "%s" "$out" | grep -m1 "^- x/y#" | grep -q "x/y#8"'
 
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(python3 "$MOD" "$TMP/many.json" --max-bytes 80)"
 ok "--max-bytes truncates" '[ "$(printf "%s" "$out" | wc -c)" -le 100 ]'
 ok "--max-bytes marks the truncation" 'printf "%s" "$out" | grep -q "truncated"'
