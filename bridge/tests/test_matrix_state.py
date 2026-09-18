@@ -344,6 +344,35 @@ class TestStore:
         for p in directory.iterdir():
             assert p.stat().st_mode & 0o777 == 0o600
 
+    @pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="Linux path descriptors")
+    def test_traversable_unreadable_ancestors_and_readable_leaf(self, tmp_path: Path) -> None:
+        directory = tmp_path / "state"
+        real_open = os.open
+
+        def android_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            # Model Android's EACCES for directory reads outside the app root.
+            if flags & os.O_DIRECTORY and str(path) != "state" and not flags & os.O_PATH:
+                raise PermissionError("ancestor permits traversal only")
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(m.os, "open", side_effect=android_open):
+            fd = m.private_directory(directory)
+            try:
+                assert os.listdir(fd) == []  # O_PATH must never escape as the leaf fd.
+                child = m.private_file(fd, "probe")
+                os.close(child)
+                assert os.listdir(fd) == ["probe"]
+            finally:
+                os.close(fd)
+
+    def test_private_directory_without_path_descriptors(self, tmp_path: Path) -> None:
+        with patch.object(m.os, "O_PATH", os.O_RDONLY, create=True):
+            fd = m.private_directory(tmp_path / "state")
+            try:
+                assert os.listdir(fd) == []
+            finally:
+                os.close(fd)
+
     def test_symlink_ancestor_directory_database_lock_and_journal_rejected(self, tmp_path: Path) -> None:
         real = tmp_path / "real"
         real.mkdir(mode=0o700)
