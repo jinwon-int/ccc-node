@@ -329,3 +329,57 @@ async def test_runtime_backend_also_classifies_provider_failure_written_to_stdou
 
     assert caught.value.code == "distill_quota_exhausted"
     assert "PRIVATE_BODY" not in repr(caught.value)
+
+
+def _backend(provider: str, model: str, env: dict[str, str]) -> RuntimeCliDistillBackend:
+    return RuntimeCliDistillBackend(
+        provider,  # type: ignore[arg-type]
+        executable="claude",
+        model=model,
+        environment=env,
+    )
+
+
+def test_effective_model_reports_the_inherited_claude_selector() -> None:
+    """`provider-default` is a sentinel, so the receipt must not repeat it.
+
+    Measured on yukson: the bridge's distill lane inherited
+    ANTHROPIC_MODEL=claude-opus-5 from its systemd unit while every journal
+    entry read "provider-default", so which model ran could only be recovered
+    from the unit file and live process argv.
+    """
+
+    backend = _backend("claude", "provider-default", {"ANTHROPIC_MODEL": "claude-opus-5"})
+
+    assert backend.effective_model == "claude-opus-5"
+
+
+def test_effective_model_prefers_an_explicit_model_over_the_environment() -> None:
+    backend = _backend("claude", "haiku", {"ANTHROPIC_MODEL": "claude-opus-5"})
+
+    assert backend.effective_model == "haiku"
+
+
+def test_effective_model_keeps_the_sentinel_for_piri() -> None:
+    """Piri's model is pinned by the launcher's own args, unseen by the bridge.
+
+    Reporting the Claude variable there would be a guess, and a wrong receipt
+    is worse than one that admits it does not know.
+    """
+
+    backend = _backend("piri", "provider-default", {"ANTHROPIC_MODEL": "claude-opus-5"})
+
+    assert backend.effective_model == "provider-default"
+
+
+@pytest.mark.parametrize("inherited", ["", "   ", "bad model name", "-leading-dash", "x" * 200])
+def test_effective_model_falls_back_to_the_sentinel_for_unusable_values(inherited: str) -> None:
+    backend = _backend("claude", "provider-default", {"ANTHROPIC_MODEL": inherited})
+
+    assert backend.effective_model == "provider-default"
+
+
+def test_effective_model_keeps_the_sentinel_when_nothing_is_inherited() -> None:
+    backend = _backend("claude", "provider-default", {"PATH": "/usr/bin"})
+
+    assert backend.effective_model == "provider-default"
