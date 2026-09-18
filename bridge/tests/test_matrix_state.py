@@ -33,6 +33,7 @@ from telegram_bot.core.matrix.state import (
     Store,
     bounded_text,
     family_config,
+    identities,
     mention_aliases,
     load_config,
     operator_name,
@@ -615,7 +616,7 @@ class TestConfig:
     def test_saved_policy_upgrade_drops_worker_keys(self, tmp_path: Path) -> None:
         c = config(tmp_path)
         current = saved_policy(c)
-        assert set(current) == {"owner", "rooms", "devices", "not_before_ms", "family_rooms", "family_users", "family_devices"}
+        assert set(current) == {"owner", "rooms", "devices", "not_before_ms", "family_rooms", "family_users", "family_devices", "identities"}
         pilot = {k: c[k] for k in ("owner", "rooms", "devices", "not_before_ms")}
         pilot["worker_argv"] = ["/usr/bin/python3", "/opt/worker.py"]
         pilot["worker_argv_family"] = None
@@ -669,3 +670,24 @@ def test_mention_aliases_config_validation() -> None:
     for bad in ("seoseo", ["Seoseo"], ["a b"], [""], ["x"] * 9, ["dup", "dup"], [1]):
         with pytest.raises(SafetyStop, match="invalid-mention-aliases"):
             mention_aliases({"mention_aliases": bad})
+
+
+def test_identities_replace_owner_pins_and_join_the_saved_policy(tmp_path: Path) -> None:
+    c = config(tmp_path)
+    master = "M" * 43
+    with_identity = {**c, "devices": {}, "identities": {c["owner"]: {"master": master}}}
+    assert identities(with_identity) == {c["owner"]: master}
+    validate_config(dict(with_identity))  # empty device pins are fine once the owner has an identity
+    with pytest.raises(SafetyStop, match="pin-owner-devices"):
+        validate_config({**c, "devices": {}})  # no identity: pins still required
+    policy = saved_policy(with_identity)
+    assert policy["identities"] == {c["owner"]: master} and policy["devices"] == {}
+    old = {k: v for k, v in policy.items() if k != "identities"}
+    assert upgrade_saved_policy(old) == {**policy, "identities": {}}  # pre-#149 policies upgrade to "no identities"
+    for bad in ({"@stranger:test.invalid": {"master": master}}, {c["owner"]: {"master": "short"}},
+                {c["owner"]: "M" * 43}, "not-a-dict", {c["owner"]: {}}):
+        with pytest.raises(SafetyStop, match="invalid-identities"):
+            identities({**c, "identities": bad})
+    family = {**c, "family_rooms": [c["rooms"][0]], "family_users": [OWNER2 := "@dad:test.invalid"],
+              "identities": {OWNER2: {"master": "D" * 43}}}
+    assert identities(family) == {OWNER2: "D" * 43}

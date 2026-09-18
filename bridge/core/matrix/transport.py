@@ -24,6 +24,7 @@ Turn outcomes:
 from __future__ import annotations
 
 import asyncio
+import copy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -45,6 +46,7 @@ from telegram_bot.core.matrix.state import (
     SafetyStop,
     bounded_text,
     family_config,
+    identities,
     mention_aliases,
     private_directory,
     saved_policy,
@@ -71,6 +73,11 @@ NOTICE_UNCERTAIN = (
 NOTICE_UNDECRYPTABLE = (
     "이 메시지의 암호 키를 받지 못해 읽을 수 없었습니다. 다시 보내 주세요. "
     "(봇 기기가 만들어지기 전에 보낸 메시지는 복구할 수 없습니다.)"
+)
+
+NOTICE_UNTRUSTED_DEVICE = (
+    "검증되지 않은 기기에서 보낸 메시지는 처리하지 않습니다. "
+    "그 기기에서 기기 검증(이모지 비교)을 마친 뒤 다시 보내 주세요."
 )
 
 NONCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,64}")
@@ -230,7 +237,17 @@ class MatrixTransport:
         self.turn_timeout = turn_timeout
         # Family settings are a trust boundary; reject them before opening state.
         self.family_rooms, self.family_users, self.family_devices = family_config(config)
-        self.pins: dict[str, dict[str, dict[str, str]]] = {config["owner"]: config["devices"], **self.family_devices}
+        # Trust model per user (#149): a user with a pinned cross-signing
+        # identity trusts every self-signed device; anyone else keeps the
+        # pinned device set. ``trusted`` (user -> device -> curve25519) is the
+        # single table every send/admit decision reads; pin_devices fills it.
+        self.identities = identities(config)
+        self.pins: dict[str, dict[str, dict[str, str]]] = {
+            user: pins
+            for user, pins in {config["owner"]: config["devices"], **self.family_devices}.items()
+            if user not in self.identities and pins
+        }
+        self.trusted: dict[str, dict[str, str]] = {user: {d: k["curve25519"] for d, k in pins.items()} for user, pins in self.pins.items()}
         self.senders = frozenset([config["owner"]]) | self.family_users
         self.family_allowed = self.senders | frozenset([config["account"]])
         self.store = MatrixStore(config["state_directory"], config["account"])
@@ -388,7 +405,7 @@ class MatrixTransport:
             raise SafetyStop("device-query-failed")
         await self.client.receive_response(response)
         devices = raw.get("device_keys", {}).get(self.c["owner"], {})
-        if set(devices) != set(self.c["devices"]):
+        if self.c["owner"] in self.pins and set(devices) != set(self.c["devices"]):
             raise SafetyStop("owner-device-set-changed")
         own = raw.get("device_keys", {}).get(self.c["account"], {})
         if set(own) != {self.c["device_id"]}:
@@ -396,15 +413,19 @@ class MatrixTransport:
         for kind, key in self.client.olm.account.identity_keys.items():
             if own[self.c["device_id"]].get("keys", {}).get(kind + ":" + self.c["device_id"]) != key:
                 raise SafetyStop("published-agent-key-changed")
-        for device, pin in self.c["devices"].items():
+        for device, pin in self.pins.get(self.c["owner"], {}).items():
             stored = self.client.device_store[self.c["owner"]][device]
             if stored.ed25519 != pin["ed25519"] or stored.curve25519 != pin["curve25519"]:
                 raise SafetyStop("owner-device-key-changed")
             self.client.verify_device(stored)
+        for user in sorted(self.identities):
+            self._trust_cross_signed(user, raw)
         # Family devices are pinned per user. Each user keeps the strict pin
         # check, while extra unpinned family devices stay merely untrusted and
         # are handled by exclude_unpinned_devices at session-share time.
         for user, pins in sorted(self.family_devices.items()):
+            if user in self.identities:
+                continue
             for device, pin in pins.items():
                 stored = self.client.device_store[user].get(device)
                 if stored is None:
@@ -412,6 +433,46 @@ class MatrixTransport:
                 if stored.ed25519 != pin["ed25519"] or stored.curve25519 != pin["curve25519"]:
                     raise SafetyStop("pinned-device-key-changed")
                 self.client.verify_device(stored)
+
+    def _trust_cross_signed(self, user: str, raw: Mapping[str, Any]) -> None:
+        """Trust exactly the devices ``user``'s self-signing key has signed (#149).
+
+        The pinned value is the master key. The self-signing key must be
+        signed by it and every device by the self-signing key (ed25519 over
+        canonical JSON, via nio's ``verify_json``). Unsigned devices are
+        blacklisted for key sharing but never stop the service; a changed
+        master key (account reset) does.
+        """
+        master_obj = raw.get("master_keys", {}).get(user)
+        ssk_obj = raw.get("self_signing_keys", {}).get(user)
+        if not isinstance(master_obj, dict) or not isinstance(ssk_obj, dict):
+            raise SafetyStop("cross-signing-missing")
+        master = next(iter((master_obj.get("keys") or {}).values()), None)
+        if master != self.identities[user]:
+            raise SafetyStop("owner-identity-changed" if user == self.c["owner"] else "family-identity-changed")
+        if not self.client.olm.verify_json(copy.deepcopy(ssk_obj), master, user, master):
+            raise SafetyStop("cross-signing-invalid")
+        ssk = next(iter((ssk_obj.get("keys") or {}).values()), None)
+        if not isinstance(ssk, str):
+            raise SafetyStop("cross-signing-invalid")
+        trusted: dict[str, str] = {}
+        store = self.client.device_store[user] if user in self.client.device_store else {}
+        for device, obj in (raw.get("device_keys", {}).get(user) or {}).items():
+            stored = store.get(device)
+            if stored is None or not isinstance(obj, dict):
+                continue
+            published = (obj.get("keys") or {}).get("ed25519:" + device)
+            if published == stored.ed25519 and self.client.olm.verify_json(copy.deepcopy(obj), ssk, user, ssk):
+                self.client.verify_device(stored)
+                trusted[device] = stored.curve25519
+            else:
+                self.client.blacklist_device(stored)
+        previous = self.trusted.get(user)
+        self.trusted[user] = trusted
+        if previous is None or set(previous) != set(trusted):
+            record = self.store.get_meta("trusted_devices") or {}
+            record[user] = {"devices": sorted(trusted), "updated": time.time()}
+            self.store.set_meta("trusted_devices", record)
 
     async def room_gate(self, room: str) -> bool:
         from nio import JoinedMembersResponse
@@ -674,10 +735,28 @@ class MatrixTransport:
             return None
         if not event.decrypted:
             return None  # No plaintext task execution.
-        pins = self.pins.get(event.sender)
-        if not event.verified or not pins or event.sender_key not in {v["curve25519"] for v in pins.values()}:
+        trusted = self.trusted.get(event.sender, {})
+        if not event.verified or event.sender_key not in set(trusted.values()):
+            if event.sender in self.identities:
+                # Cross-signing mode: an unverified device is the owner's own
+                # problem to fix (verify it in the app); never stop the service.
+                self._untrusted_sender(room, event)
+                return None
             raise SafetyStop("unverified-owner-event" if event.sender == self.c["owner"] else "unverified-family-event")
         return self.policy.admit(room, event.source, decrypted=event.decrypted, now_ms=int(time.time() * 1000))
+
+    def _untrusted_sender(self, room: str, event: Any) -> None:
+        """Ignore a message from an unsigned device; tell the room once per device."""
+        key = str(getattr(event, "sender_key", "") or "")
+        seen = self.store.get_meta("untrusted_senders") or {}
+        marker = f"{event.sender}:{key}"
+        if marker in seen:
+            return
+        seen[marker] = {"room": room, "updated": time.time()}
+        self.store.set_meta("untrusted_senders", dict(list(seen.items())[-50:]))
+        req = Request(str(getattr(event, "event_id", "") or "$untrusted-" + hashlib.sha256(marker.encode()).hexdigest()[:24]),
+                      room, event.sender, "notice", scope_of(self.c["account"], room, event.sender))
+        self.store.notice(req, "untrusted-device", NOTICE_UNTRUSTED_DEVICE)
 
     def _undecryptable(self, room: str, event: Any) -> None:
         """Record an undecryptable event, queue a key request and a one-time room notice."""
@@ -753,7 +832,7 @@ class MatrixTransport:
             (user, device)
             for user in members
             if user != self.c["account"]
-            for device in self.pins.get(user, {})
+            for device in self.trusted.get(user, {})
         }
 
     def exclude_unpinned_devices(self, room: str) -> None:
@@ -763,7 +842,7 @@ class MatrixTransport:
         for user in self.room_members.get(room, ()):
             if user == self.c["account"]:
                 continue
-            missing = sorted(d for d in self.client.device_store[user] if d not in self.pins.get(user, {}))
+            missing = sorted(d for d in self.client.device_store[user] if d not in self.trusted.get(user, {}))
             if missing:
                 unpinned[user] = missing
         if unpinned:

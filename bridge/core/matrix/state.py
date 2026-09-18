@@ -81,6 +81,11 @@ SAFETY_STOP_REASONS: frozenset[str] = frozenset(
         "invalid-family-device-pin",
         "invalid-family-notice-text",
         "invalid-mention-aliases",
+        "invalid-identities",
+        "owner-identity-changed",
+        "family-identity-changed",
+        "cross-signing-missing",
+        "cross-signing-invalid",
         "saved-policy-changed",
         # state
         "pilot-storage-limit",
@@ -390,6 +395,34 @@ def _valid_homeserver(config: Mapping[str, Any]) -> bool:
     )
 
 
+def identities(config: Mapping[str, Any]) -> dict[str, str]:
+    """Optional ``identities``: ``{user_id: {"master": <ed25519 master key>}}`` (#149).
+
+    A user listed here is trusted by **cross-signing** instead of a pinned
+    device set: the master key is the only pinned value, and every device the
+    user's self-signing key has signed is trusted automatically. Logging in,
+    logging out or deleting a device therefore never stops the service; only
+    a changed master key (account reset) does. Users without an identity keep
+    the pinned-device rule.
+    """
+    raw = config.get("identities", {})
+    if not isinstance(raw, dict) or len(raw) > 13:
+        raise SafetyStop("invalid-identities")
+    allowed = {config.get("owner")} | set(config.get("family_users") or [])
+    cleaned: dict[str, str] = {}
+    for user, entry in raw.items():
+        if (
+            not isinstance(user, str)
+            or user not in allowed
+            or not isinstance(entry, dict)
+            or not isinstance(entry.get("master"), str)
+            or not KEY_PATTERN.fullmatch(entry["master"])
+        ):
+            raise SafetyStop("invalid-identities")
+        cleaned[user] = entry["master"]
+    return cleaned
+
+
 def _validate_device_pins(pins: Any, *, missing: str, bad_device: str, bad_key: str) -> None:
     if not isinstance(pins, dict) or not 1 <= len(pins) <= 10:
         raise SafetyStop(missing)
@@ -433,12 +466,14 @@ def validate_config(c: Any) -> dict[str, Any]:
         {r: "direct" for r in c["rooms"]},
         c["not_before_ms"],
     )
-    _validate_device_pins(
-        c["devices"],
-        missing="pin-owner-devices",
-        bad_device="invalid-device-pin",
-        bad_key="invalid-key-pin",
-    )
+    owner_identity = c["owner"] in identities(c)
+    if not (owner_identity and c["devices"] == {}):
+        _validate_device_pins(
+            c["devices"],
+            missing="pin-owner-devices",
+            bad_device="invalid-device-pin",
+            bad_key="invalid-key-pin",
+        )
     return c
 
 
@@ -501,6 +536,7 @@ def saved_policy(config: Mapping[str, Any]) -> dict[str, Any]:
     policy["family_rooms"] = sorted(family_rooms)
     policy["family_users"] = sorted(family_users)
     policy["family_devices"] = family_devices
+    policy["identities"] = identities(config)
     return policy
 
 
@@ -515,6 +551,7 @@ def upgrade_saved_policy(old: Mapping[str, Any]) -> dict[str, Any]:
     upgraded.setdefault("family_rooms", [])
     upgraded.setdefault("family_users", [])
     upgraded.setdefault("family_devices", {})
+    upgraded.setdefault("identities", {})
     return upgraded
 
 

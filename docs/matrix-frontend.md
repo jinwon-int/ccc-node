@@ -57,7 +57,8 @@ service overrides two keys in its unit):
   "family_users": ["@dad:matrix.example.invalid"],
   "family_devices": {"@dad:matrix.example.invalid": {"DAD_DEVICE": {"ed25519": "…", "curve25519": "…"}}},
   "not_before_ms": 1788825600000,
-  "mention_aliases": ["seoseo"]
+  "mention_aliases": ["seoseo"],
+  "identities": {"@owner:matrix.example.invalid": {"master": "43_BASE64_CHARACTERS"}}
 }
 ```
 
@@ -65,11 +66,30 @@ Room policy is unchanged from the pilot: a direct room is exactly
 `{owner, bot}`; a family room admits only the allowlisted family users and
 answers only when addressed (`m.mentions`, a typed `@localpart`, or a typed
 `@<alias>` from `mention_aliases` — Matrix ids cannot be renamed, so a bot
-that is *displayed* as "seoseo" is reachable as `@seoseo` this way). Owner
-and family devices are pinned; any change to the owner device *set* or a
-pinned device *key* stops the service fail-closed (`owner-device-set-changed`,
-`owner-device-key-changed`) until an operator re-pins — see
-family-messenger #149 for the cross-signing-trust replacement.
+that is *displayed* as "seoseo" is reachable as `@seoseo` this way).
+
+### Device trust: cross-signing identity (preferred) or pinned devices
+
+`"identities": {"@owner:hs": {"master": "<ed25519 master key>"}}` pins the
+user's **cross-signing master key** instead of a device list
+(family-messenger #149). On every `keys/query` the transport checks that the
+master key is unchanged, that the self-signing key is signed by it, and
+trusts exactly the devices the self-signing key has signed (nio
+`verify_json` over canonical JSON). Logging in, logging out, deleting a
+device or verifying a new one in the app therefore never stops the service;
+unsigned devices are blacklisted for key sharing and a message sent from
+one is ignored with a one-time notice ("기기 검증을 마친 뒤 다시 보내
+주세요"). Only a changed master key (account reset) stops the service
+(`owner-identity-changed`; `cross-signing-missing` / `cross-signing-invalid`
+for a broken chain). With an identity, `devices` may be `{}`.
+
+Users without an identity keep the pinned-device rule (`devices`,
+`family_devices`): any change to the device *set* or a pinned *key* stops the
+service (`owner-device-set-changed`, `owner-device-key-changed`) until an
+operator re-pins. Migration: read the master key from `keys/query`
+(`master_keys[user].keys`), set `identities`, set `devices` to `{}`, and
+update the saved policy (`meta.policy`: `devices`, `identities`) in the
+state store before restarting — the policy comparison is fail-closed.
 
 ## Identity mapping
 
