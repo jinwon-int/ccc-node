@@ -81,6 +81,7 @@ SAFETY_STOP_REASONS: frozenset[str] = frozenset(
         "invalid-family-device-pin",
         "invalid-family-notice-text",
         "invalid-mention-aliases",
+        "invalid-wake-words",
         "invalid-identities",
         "owner-identity-changed",
         "family-identity-changed",
@@ -146,8 +147,15 @@ def HANDLE_RE(account: str) -> re.Pattern[str]:  # name kept from the pilot
     return handle_pattern(account[1:].split(":", 1)[0])
 
 
+def wake_word_pattern(word: str) -> re.Pattern[str]:
+    """Whole-token bare ``word`` (no leading @) in message text, case-insensitive."""
+    return re.compile(r"(?<!\w)" + re.escape(word) + r"(?!\w)", re.IGNORECASE)
+
+
 ALIAS_PATTERN = re.compile(r"[a-z0-9._=-]{1,64}")
 MAX_MENTION_ALIASES = 8
+WAKE_WORD_PATTERN = re.compile(r"[0-9A-Za-z가-힣]{1,64}")
+MAX_WAKE_WORDS = 8
 
 
 def mention_aliases(config: Mapping[str, Any]) -> frozenset[str]:
@@ -165,6 +173,25 @@ def mention_aliases(config: Mapping[str, Any]) -> frozenset[str]:
         or len(set(raw)) != len(raw)
     ):
         raise SafetyStop("invalid-mention-aliases")
+    return frozenset(raw)
+
+
+def wake_words(config: Mapping[str, Any]) -> frozenset[str]:
+    """Optional ``wake_words``: bare nickname tokens (e.g. 서서, 서서야) that address the bot.
+
+    Like ``mention_aliases`` this only widens the family-room *mention* gate;
+    sender and room admission are unchanged. Wake words match as whole tokens
+    **without** a leading ``@`` — Korean nicknames have no romanized handle,
+    so this is how a family calls the bot by name (owner request 2026-09-18).
+    """
+    raw = config.get("wake_words", [])
+    if (
+        not isinstance(raw, list)
+        or len(raw) > MAX_WAKE_WORDS
+        or any(not isinstance(w, str) or not WAKE_WORD_PATTERN.fullmatch(w) for w in raw)
+        or len(set(raw)) != len(raw)
+    ):
+        raise SafetyStop("invalid-wake-words")
     return frozenset(raw)
 
 
@@ -208,13 +235,15 @@ class Policy:
     bots: frozenset[str]
     rooms: Mapping[str, str]
     not_before_ms: int
-    aliases: frozenset[str] = frozenset()  # extra typed handles that address the bot
+    aliases: frozenset[str] = frozenset()  # extra typed @handles that address the bot
+    wake_words: frozenset[str] = frozenset()  # extra bare nickname tokens that address the bot
 
     def __post_init__(self) -> None:
         users = frozenset(self.users)
         bots = frozenset(self.bots)
         rooms = dict(self.rooms)
         aliases = frozenset(self.aliases)
+        wake = frozenset(self.wake_words)
         invalid = (
             not identifier(self.account, "@")
             or not users
@@ -229,6 +258,7 @@ class Policy:
             or type(self.not_before_ms) is not int
             or self.not_before_ms < 0
             or any(not isinstance(a, str) or not ALIAS_PATTERN.fullmatch(a) for a in aliases)
+            or any(not isinstance(w, str) or not WAKE_WORD_PATTERN.fullmatch(w) for w in wake)
         )
         if invalid:
             raise ValueError("invalid route policy")
@@ -236,6 +266,7 @@ class Policy:
         object.__setattr__(self, "bots", bots)
         object.__setattr__(self, "rooms", MappingProxyType(rooms))
         object.__setattr__(self, "aliases", aliases)
+        object.__setattr__(self, "wake_words", wake)
 
     def admit(self, room_id: str, event: Any, *, decrypted: bool, now_ms: int) -> Request | None:
         """Reject plaintext, edits, bots, old events and unaddressed group messages."""
@@ -283,7 +314,9 @@ class Policy:
                 return True
         if HANDLE_RE(self.account).search(body):
             return True
-        return any(handle_pattern(alias).search(body) for alias in self.aliases)
+        if any(handle_pattern(alias).search(body) for alias in self.aliases):
+            return True
+        return any(wake_word_pattern(word).search(body) for word in self.wake_words)
 
 
 # --------------------------------------------------------------------------- #

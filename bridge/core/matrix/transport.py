@@ -53,6 +53,7 @@ from telegram_bot.core.matrix.state import (
     scope_of,
     turn_id,
     upgrade_saved_policy,
+    wake_words,
 )
 
 FAMILY_NOTICE = "이 AI는 이 방을 읽을 수 있으며 답변에 필요한 내용이 제공업체에 전달될 수 있습니다."
@@ -266,6 +267,7 @@ class MatrixTransport:
             {r: "mention" if r in self.family_rooms else "direct" for r in config["rooms"]},
             config["not_before_ms"],
             aliases=mention_aliases(config),
+            wake_words=wake_words(config),
         )
         self.blocked: set[str] = set(self.store.get_meta("room_gate_blocked") or ())
         self.room_members: dict[str, set[str]] = {}
