@@ -4,6 +4,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- Disable the piri usage-budget cap by fleet default (`CCC_USAGE_BUDGET_TOKENS_PIRI`
+  default 2,000,000 → 0): piri meters request counts rather than normalized
+  tokens, and its legitimate daily autonomous volume saturated the shared
+  default (daily warn alerts; enforce clipped normal operation at 1,995,793
+  tokens on nosuk, 2026-09-17). The #388 meter treats `budget<=0` as
+  allowed-and-metered, so metering stays on — only the cap is gone. The doctor
+  now resolves the piri budget through `USAGE_BUDGET_TOKENS_PIRI_DEFAULT` (0)
+  and reports an unset piri budget as an informational policy state instead of
+  the finite-budget warning, which remains for explicitly zeroed budgets and
+  disabled metering. Metering/alert behavior for claude/codex/danso unchanged.
+
 - Add text-mode Danso recovery offers (`CCC_TELEGRAM_DANSO_RECOVERY_TEXT`):
   the failed-task offer renders as a numbered menu and the user answers by
   typing 1/2/3 instead of tapping inline buttons. Refactors the recovery

@@ -209,8 +209,10 @@ class MemorySettingsMixin:
         alias="CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED",
         description=(
             "Explicit escape hatch for provider-neutral autonomous extraction "
-            "without a finite provider budget. False fails closed when the "
-            "effective provider budget is zero or usage metering is disabled."
+            "without a finite provider budget. False keeps the doctor's "
+            "finite-budget expectation when usage metering is disabled or the "
+            "budget is explicitly zeroed; piri's fleet default 0 (2026-09-18) "
+            "is policy, not an opt-out, and is reported as informational."
         ),
     )
     memory_distill_max_attempts: int = Field(
