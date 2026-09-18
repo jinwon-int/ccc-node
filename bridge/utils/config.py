@@ -417,16 +417,24 @@ class Config(
         ),
     )
     usage_budget_tokens_piri: int = Field(
-        # Same fleet default as Claude/Codex; Piri meters request counts, so the
-        # allowance is effectively a request-side guard until token usage is
-        # normalized.
-        default=USAGE_BUDGET_TOKENS_DEFAULT,
+        # Fleet default since 2026-09-18: 0 (cap disabled, metering stays on).
+        # Piri meters request counts rather than normalized token usage, and its
+        # legitimate daily autonomous volume saturated the shared 2M default
+        # (nosuk: a warn alert every day; enforce clipped normal operation at
+        # 1,995,793/2,000,000 on 2026-09-17). Owner-approved fleet policy:
+        # the #388 meter treats budget<=0 as allowed-and-metered, so this
+        # removes only the cap, never the metering. Mirrored by
+        # scripts/ccc_doctor.py USAGE_BUDGET_TOKENS_PIRI_DEFAULT; a test pins
+        # the two equal. Unlike Claude/Codex, an unset env is a deliberate
+        # policy zero, so the doctor must not read it as an operator opt-out.
+        default=0,
         ge=0,
         alias="CCC_USAGE_BUDGET_TOKENS_PIRI",
         description=(
             "Daily Piri autonomous token budget for the local usage meter. "
             "Piri currently reports request counts but not normalized token usage; "
-            "0 disables the budget."
+            "0 disables the budget. Fleet default 0 since 2026-09-18 (cap "
+            "disabled, metering on); set a finite value to re-enable a cap."
         ),
     )
     usage_budget_warn_percent: int = Field(

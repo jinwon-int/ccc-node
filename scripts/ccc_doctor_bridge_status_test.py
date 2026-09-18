@@ -223,6 +223,47 @@ class BridgeStatusVerdictTest(unittest.TestCase):
         self.assertEqual(doctor.distill_readiness, "blocked")
         self.assertIn("fail-closed", doctor.rows[-1].status)
 
+    def test_piri_unset_budget_is_fleet_policy_not_fail_closed(self) -> None:
+        """Piri's fleet default is 0 (2026-09-18): metered but uncapped — not blocked, no 경고."""
+
+        with TemporaryDirectory() as temp:
+            # Hermetic executable stub, exactly like the drop-in test above.
+            executable = Path(temp) / "piri"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
+            doctor.provider = "piri"
+            doctor._bridge_provider_state = ("piri", "healthy")
+            with patch.dict(
+                "os.environ",
+                {"CCC_MEMORY_DISTILL_PROVIDER": "auto"},
+                clear=True,
+            ), patch.object(
+                doctor, "bridge_systemd_units", return_value=[]
+            ), patch(
+                "ccc_doctor.shutil.which", return_value=str(executable)
+            ):
+                doctor.check_distill_readiness()
+
+        self.assertNotEqual(doctor.distill_readiness, "blocked")
+        self.assertNotIn("fail-closed", doctor.rows[-1].status)
+
+    def test_piri_explicit_zero_budget_still_warns(self) -> None:
+        """An operator-set CCC_USAGE_BUDGET_TOKENS_PIRI=0 keeps the fail-close nudge."""
+
+        doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
+        doctor.provider = "piri"
+        doctor._bridge_provider_state = ("piri", "healthy")
+        with patch.dict(
+            "os.environ",
+            {"CCC_MEMORY_DISTILL_PROVIDER": "auto", "CCC_USAGE_BUDGET_TOKENS_PIRI": "0"},
+            clear=True,
+        ), patch.object(doctor, "bridge_systemd_units", return_value=[]):
+            doctor.check_distill_readiness()
+
+        self.assertEqual(doctor.distill_readiness, "blocked")
+        self.assertIn("fail-closed", doctor.rows[-1].status)
+
     def test_piri_launcher_fallback_when_no_unit_exposes_the_path(self) -> None:
         """Termux: no unit, no env — the harness launcher hooks/ccc-piri counts as the executable."""
 

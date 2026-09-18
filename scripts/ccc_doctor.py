@@ -86,6 +86,15 @@ VALID_SCOPES = {"settings", "files", "hooks", "output-styles", "all"}
 # this allowance, so doctor must judge the same number instead of "0".
 USAGE_BUDGET_TOKENS_DEFAULT = 2_000_000
 
+# Piri's fleet default since 2026-09-18 is 0: the cap is disabled by owner
+# decision (request-count metering saturated the shared 2M default), while
+# metering stays on. The #388 meter treats budget<=0 as allowed-and-metered,
+# so an UNSET piri budget is policy, not an operator opt-out — the doctor
+# must not read it as the explicit-zero fail-close. Mirrors
+# bridge/utils/config.py usage_budget_tokens_piri (pinned equal by the same
+# test); an explicit CCC_USAGE_BUDGET_TOKENS_PIRI=0 keeps the 경고.
+USAGE_BUDGET_TOKENS_PIRI_DEFAULT = 0
+
 CRON_MARKER_INSTALLERS = (
     ("memory-refresh", "# ccc-node:memory-refresh", "scripts/install-memory-refresh-cron.sh",
      "run scripts/install-memory-refresh-cron.sh --apply"),
@@ -943,6 +952,34 @@ class Doctor:
                 piri_path = str(launcher)
         return piri_path
 
+    def _resolve_distill_budget(self, budget_name: str, effective: str) -> tuple[int, str | None]:
+        """Resolve the effective provider's daily budget and whether it was explicit.
+
+        Returns ``(budget, explicit_raw)``. ``explicit_raw`` carries the env or
+        trusted-unit value when an operator set one, else ``None`` — the fleet
+        default applies and, for piri, that default is a policy zero.
+        """
+        explicit_raw: str | None = None
+        try:
+            # Fleet sweeps and systemd-run transient units run doctor from a
+            # clean login shell, while the live bridge can receive its budget
+            # from the unit's drop-ins (#1318). Resolve the budget through the
+            # same trusted unit fallback as CCC_PIRI_CLI_PATH below: only a
+            # unit whose ExecStart matches this checkout's bridge root is
+            # consulted, so a stale twin checkout cannot leak its budget in.
+            explicit_raw = os.environ.get(budget_name) or self.bridge_unit_environment_value(
+                budget_name
+            )
+            default_budget = (
+                USAGE_BUDGET_TOKENS_PIRI_DEFAULT
+                if effective == "piri"
+                else USAGE_BUDGET_TOKENS_DEFAULT
+            )
+            budget = int(explicit_raw or str(default_budget) or 0)
+        except ValueError:
+            budget = 0
+        return budget, explicit_raw
+
     def check_distill_readiness(self) -> None:
         """Report extractor readiness separately without making a provider call."""
 
@@ -1023,22 +1060,8 @@ class Doctor:
             "off",
         }
         budget_name = f"CCC_USAGE_BUDGET_TOKENS_{effective.upper()}"
-        try:
-            # Fleet sweeps and systemd-run transient units run doctor from a
-            # clean login shell, while the live bridge can receive its budget
-            # from the unit's drop-ins (#1318). Resolve the budget through the
-            # same trusted unit fallback as CCC_PIRI_CLI_PATH below: only a
-            # unit whose ExecStart matches this checkout's bridge root is
-            # consulted, so a stale twin checkout cannot leak its budget in.
-            budget_raw = (
-                os.environ.get(budget_name)
-                or self.bridge_unit_environment_value(budget_name)
-                or str(USAGE_BUDGET_TOKENS_DEFAULT)
-            )
-            budget = int(budget_raw or 0)
-        except ValueError:
-            budget = 0
-        if not allow_unbounded and (not meter_enabled or budget <= 0):
+        budget, explicit_raw = self._resolve_distill_budget(budget_name, effective)
+        if not allow_unbounded and not meter_enabled:
             self.distill_readiness = "blocked"
             self.add(
                 "경고",
@@ -1047,6 +1070,28 @@ class Doctor:
                 f"enable usage metering and set a finite {budget_name}; explicit unbounded opt-in is not recommended",
             )
             return
+        if not allow_unbounded and budget <= 0:
+            if explicit_raw:
+                # Operator (env or trusted unit drop-in) explicitly zeroed the
+                # budget — keep the finite-budget governance nudge.
+                self.distill_readiness = "blocked"
+                self.add(
+                    "경고",
+                    "distill extractor",
+                    f"configured={configured}; effective={effective}; autonomous spend fail-closed",
+                    f"enable usage metering and set a finite {budget_name}; explicit unbounded opt-in is not recommended",
+                )
+                return
+            # Implicit zero — only possible for piri, whose fleet default is 0
+            # since 2026-09-18 (metered but uncapped by policy). Not a
+            # fail-close at runtime (#388: budget<=0 allows metered spend), so
+            # record the state and keep probing the extractor itself.
+            self.add(
+                "정상",
+                "distill extractor",
+                f"configured={configured}; effective={effective}; budget disabled (fleet default) — autonomous spend metered, uncapped",
+                f"set a finite {budget_name} to re-enable a daily cap",
+            )
         piri_path = self._piri_launcher_path(effective)
         configured_paths = {
             "claude": os.environ.get("CLAUDE_CLI_PATH", "claude"),
