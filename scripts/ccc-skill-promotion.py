@@ -3030,6 +3030,42 @@ def _revise_substitute_pick(
     return ordered[index]
 
 
+def _revise_substitute_used(
+    rows: list[dict[str, object]], node: str, name: str
+) -> bool:
+    """Whether a substitute has already taken a revise round on this lineage."""
+    return any(
+        item.get("kind") == "a2a-revise-dispatch"
+        and item.get("node") == node
+        and item.get("name") == name
+        # Dispatch records persist a boolean, not the result summary's worker
+        # string. A malformed explicit marker also withholds another attempt;
+        # legacy author-only rows without this field remain compatible.
+        and "substitute" in item
+        and item["substitute"] is not False
+        for item in rows
+    )
+
+
+def _revise_substitute_eligible(
+    config: Config, rows: list[dict[str, object]], node: str, name: str
+) -> bool:
+    """Whether B2 would hand this lineage to a substitute if the author were
+    offline right now — the ledger-only half of the decision.
+
+    Deliberately excludes `_revise_substitute_pick`, which needs a broker
+    round trip and a keyring secret. What is left is a pure function of the
+    ledger and the configured threshold, so a dry run can answer it without
+    contacting a broker. Read it as eligibility, never as the final reviser:
+    `_resolve_revise_target` tries the author first and keeps the round there
+    whenever the author is online, and even an eligible lineage stays with the
+    author when no candidate is online or the only candidate is the reviewer.
+    """
+    if _revise_substitute_used(rows, node, name):
+        return False
+    return _revise_substitute_due(config, rows, node, name)
+
+
 def _revise_substitute_for(
     config: Config,
     rows: list[dict[str, object]],
@@ -3042,20 +3078,7 @@ def _revise_substitute_for(
     """The substitute for this lineage when B2 is due, else None. None covers
     every stay-normal case: feature off, skip too fresh, no online candidate,
     reviewer collision, or a substitute already used for this lineage."""
-    prior_substitute = any(
-        item.get("kind") == "a2a-revise-dispatch"
-        and item.get("node") == node
-        and item.get("name") == name
-        # Dispatch records persist a boolean, not the result summary's worker
-        # string. A malformed explicit marker also withholds another attempt;
-        # legacy author-only rows without this field remain compatible.
-        and "substitute" in item
-        and item["substitute"] is not False
-        for item in rows
-    )
-    if prior_substitute:
-        return None
-    if not _revise_substitute_due(config, rows, node, name):
+    if not _revise_substitute_eligible(config, rows, node, name):
         return None
     return _revise_substitute_pick(config, secret, node, reviewer, f"{node}:{name}:{tree12}")
 
@@ -3494,7 +3517,22 @@ def _sweep_deferred_revises(config: Config, *, dry_run: bool) -> list[dict[str, 
     for item in due[: config.collect_window]:
         pr = str(item.get("pr"))
         if dry_run:
-            swept.append({"outcome": "would-retry-deferred-revise", "pr": pr})
+            # #1628 B2: the substitute decision lives inside
+            # _dispatch_intake_revise, which this branch returns before ever
+            # reaching. A dry run therefore reported every due lineage as a
+            # plain author retry no matter how the threshold was configured —
+            # the one command meant to preview a collect omitted exactly the
+            # path worth previewing, and reading that silence as "the gate is
+            # off" is a mistake this field exists to prevent.
+            swept.append(
+                {
+                    "outcome": "would-retry-deferred-revise",
+                    "pr": pr,
+                    "substitute_eligible": _revise_substitute_eligible(
+                        config, rows, str(item.get("node")), str(item.get("name"))
+                    ),
+                }
+            )
             continue
         origin = next(
             (

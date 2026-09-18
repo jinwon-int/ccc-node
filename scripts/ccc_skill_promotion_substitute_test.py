@@ -434,5 +434,118 @@ class SubstituteGuardRegressionTests(unittest.TestCase):
                 self.assertEqual(captured.getvalue(), "")
 
 
+class DryRunSubstituteVisibilityTests(unittest.TestCase):
+    """A dry run must answer the substitute question it used to omit.
+
+    #1628 field case (2026-09-18): `collect --dry-run` returned from
+    _sweep_deferred_revises before _dispatch_intake_revise, where the whole B2
+    decision lives, so its output was identical whether the threshold was 0 or
+    7. Previewing the first night the gate was armed produced no substitute
+    rows at all, which reads as "the gate will not fire" and is wrong. These
+    tests pin the preview to the same predicate the live path uses, so the two
+    cannot drift apart again.
+    """
+
+    @staticmethod
+    def sweep_config(substitute_days: int) -> types.SimpleNamespace:
+        cfg = config(substitute_days)
+        cfg.collect_window = 8
+        return cfg
+
+    @staticmethod
+    def offline_fleet():
+        return patch.multiple(
+            promotion,
+            _keyring_worker_ids=lambda *_: ["gwakga", "nosuk", "yukson"],
+            _broker_online_worker_ids=lambda *_: [],
+            _remote_online_worker_ids=lambda *_: [],
+        )
+
+    def sweep(self, cfg, rows, due):
+        with self.offline_fleet(), \
+             patch.object(promotion, "_ledger_rows", return_value=rows), \
+             patch.object(promotion, "_deferred_revise_due", return_value=due), \
+             patch.object(promotion, "_dispatch_intake_revise") as dispatch:
+            swept = promotion._sweep_deferred_revises(cfg, dry_run=True)
+        return swept, dispatch
+
+    def test_armed_threshold_is_visible_in_the_preview(self):
+        rows = [aged_row("gwakga", "s1")]
+        due = [{"pr": "75", "node": "gwakga", "name": "s1"}]
+        swept, _ = self.sweep(self.sweep_config(7), rows, due)
+        self.assertEqual(swept[0]["outcome"], "would-retry-deferred-revise")
+        self.assertEqual(swept[0]["pr"], "75")
+        self.assertIs(swept[0]["substitute_eligible"], True)
+
+    def test_disarmed_threshold_reports_false_not_silence(self):
+        """S=0 must say so explicitly. The old output was indistinguishable
+        from S=7, which is exactly how the preview misled a reader."""
+        rows = [aged_row("gwakga", "s1")]
+        due = [{"pr": "75", "node": "gwakga", "name": "s1"}]
+        swept, _ = self.sweep(self.sweep_config(0), rows, due)
+        self.assertIs(swept[0]["substitute_eligible"], False)
+
+    def test_fresh_skip_is_not_eligible_under_an_armed_threshold(self):
+        rows = [aged_row("gwakga", "s1", ts=iso(days_ago=1))]
+        due = [{"pr": "196", "node": "gwakga", "name": "s1"}]
+        swept, _ = self.sweep(self.sweep_config(7), rows, due)
+        self.assertIs(swept[0]["substitute_eligible"], False)
+
+    def test_preview_reports_per_lineage_not_per_run(self):
+        rows = [aged_row("gwakga", "old"), aged_row("gwakga", "new", ts=iso(days_ago=1))]
+        due = [{"pr": "75", "node": "gwakga", "name": "old"},
+               {"pr": "196", "node": "gwakga", "name": "new"}]
+        swept, _ = self.sweep(self.sweep_config(7), rows, due)
+        self.assertEqual({item["pr"]: item["substitute_eligible"] for item in swept},
+                         {"75": True, "196": False})
+
+    def test_preview_dispatches_nothing(self):
+        rows = [aged_row("gwakga", "s1")]
+        due = [{"pr": "75", "node": "gwakga", "name": "s1"}]
+        _, dispatch = self.sweep(self.sweep_config(7), rows, due)
+        dispatch.assert_not_called()
+
+    def test_prior_substitute_is_ineligible_in_preview_and_live_path(self):
+        rows = [aged_row("gwakga", "s1"),
+                {"kind": "a2a-revise-dispatch", "node": "gwakga", "name": "s1",
+                 "substitute": True}]
+        due = [{"pr": "75", "node": "gwakga", "name": "s1"}]
+        swept, _ = self.sweep(self.sweep_config(7), rows, due)
+        self.assertIs(swept[0]["substitute_eligible"], False)
+        with self.offline_fleet(), \
+             patch.object(promotion, "_revise_substitute_pick", return_value="nosuk") as pick:
+            self.assertIsNone(promotion._revise_substitute_for(
+                self.sweep_config(7), rows, "gwakga", "s1", "yukson", "tree", "synthetic"))
+            pick.assert_not_called()
+
+    def test_preview_and_live_path_never_disagree(self):
+        """The anti-drift pin: wherever the preview says ineligible, the live
+        path must refuse to pick, and wherever it says eligible, the live path
+        must reach the pick. Any future edit that changes one and not the
+        other fails here."""
+        cases = [
+            ("aged", [aged_row("gwakga", "s1")], 7),
+            ("fresh", [aged_row("gwakga", "s1", ts=iso(days_ago=1))], 7),
+            ("feature-off", [aged_row("gwakga", "s1")], 0),
+            ("already-substituted",
+             [aged_row("gwakga", "s1"),
+              {"kind": "a2a-revise-dispatch", "node": "gwakga", "name": "s1",
+               "substitute": True}], 7),
+        ]
+        for label, rows, days in cases:
+            with self.subTest(case=label):
+                cfg = self.sweep_config(days)
+                due = [{"pr": "75", "node": "gwakga", "name": "s1"}]
+                swept, _ = self.sweep(cfg, rows, due)
+                eligible = swept[0]["substitute_eligible"]
+                with self.offline_fleet(), \
+                     patch.object(promotion, "_revise_substitute_pick",
+                                  return_value="nosuk") as pick:
+                    picked = promotion._revise_substitute_for(
+                        cfg, rows, "gwakga", "s1", "yukson", "tree", "synthetic")
+                self.assertEqual(eligible, pick.called)
+                self.assertEqual(eligible, picked is not None)
+
+
 if __name__ == "__main__":
     unittest.main()
