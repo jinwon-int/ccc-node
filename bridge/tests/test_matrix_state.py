@@ -706,7 +706,7 @@ def test_wake_words_answer_bare_nicknames() -> None:
 
 
 def test_turn_timeout_minutes_config_validation() -> None:
-    assert turn_timeout_minutes({}) == 20.0
+    assert turn_timeout_minutes({}) == 360.0
     assert turn_timeout_minutes({"turn_timeout_minutes": 360}) == 360.0
     assert turn_timeout_minutes({"turn_timeout_minutes": 7.5}) == 7.5
     for bad in (True, 4, 361, "x", None):
