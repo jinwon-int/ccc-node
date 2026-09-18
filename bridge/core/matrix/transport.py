@@ -456,7 +456,12 @@ class MatrixTransport:
         if not isinstance(ssk, str):
             raise SafetyStop("cross-signing-invalid")
         trusted: dict[str, str] = {}
-        store = self.client.device_store[user] if user in self.client.device_store else {}
+        # nio's DeviceStore iterates devices, not user ids, so `user in store`
+        # is always False; __getitem__ returns the (possibly empty) per-user map.
+        try:
+            store = self.client.device_store[user]
+        except KeyError:
+            store = {}
         for device, obj in (raw.get("device_keys", {}).get(user) or {}).items():
             stored = store.get(device)
             if stored is None or not isinstance(obj, dict):

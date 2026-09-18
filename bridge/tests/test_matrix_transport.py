@@ -1462,6 +1462,20 @@ async def test_cross_signed_identity_trusts_signed_devices_without_pins(tmp_path
         identity = {"ed25519": "agent-ed", "curve25519": "agent-cu"}
         store = {"NEW": pinned_device("a", "b"), "OLD": pinned_device("c", "d")}
         client_mock(f, devices={owner: store}, identity=identity)
+
+        class NioLikeDeviceStore:
+            """nio.crypto.DeviceStore: __getitem__(user) -> dict, __iter__ over devices (never user ids)."""
+
+            def __init__(self, users: dict[str, dict[str, Any]]) -> None:
+                self._users = users
+
+            def __getitem__(self, user: str) -> dict[str, Any]:
+                return self._users.setdefault(user, {})
+
+            def __iter__(self) -> Any:
+                return iter(d for devices in self._users.values() for d in devices.values())
+
+        f.client.device_store = NioLikeDeviceStore({owner: dict(store)})
         f.client.olm.verify_json = Mock(side_effect=_fake_verify_json)
         raw = _cross_signing_raw(f.c["account"], owner, master, ssk, {"NEW": ("a" * 43, "b" * 43, True), "OLD": ("c" * 43, "d" * 43, False)})
         f.raw = AsyncMock(return_value=raw)
