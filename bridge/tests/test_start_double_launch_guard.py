@@ -44,8 +44,13 @@ class DoubleLaunchGuardTests(unittest.TestCase):
         self._dirs.append(d)
         return str(Path(d).resolve())
 
-    def _decoy(self, path_arg: str) -> subprocess.Popen:
+    def _decoy(self, path_arg: str, *, channel=None) -> subprocess.Popen:
         # /proc/<pid>/cmdline == python3 -c <sleep> -m telegram_bot --path <path_arg>
+        env = dict(os.environ)
+        if channel is None:
+            env.pop("CCC_CHANNEL", None)
+        else:
+            env["CCC_CHANNEL"] = channel
         p = subprocess.Popen(
             [
                 sys.executable,
@@ -55,7 +60,8 @@ class DoubleLaunchGuardTests(unittest.TestCase):
                 "telegram_bot",
                 "--path",
                 path_arg,
-            ]
+            ],
+            env=env,
         )
         self._procs.append(p)
         return p
@@ -64,6 +70,7 @@ class DoubleLaunchGuardTests(unittest.TestCase):
         env = dict(os.environ)
         env.pop("PROJECT_ROOT", None)
         env.pop("CCC_AGENT_PROVIDER", None)
+        env.pop("CCC_CHANNEL", None)
         r = subprocess.run(
             ["bash", str(self.start_script), project_root, "--status"],
             cwd=self.repo_root,
@@ -122,6 +129,7 @@ class DoubleLaunchGuardTests(unittest.TestCase):
         env = dict(os.environ)
         env.pop("PROJECT_ROOT", None)
         env.pop("CCC_AGENT_PROVIDER", None)
+        env.pop("CCC_CHANNEL", None)
         return subprocess.run(
             ["bash", str(self.start_script), project_root, "--_reap-competing-pollers"],
             cwd=self.repo_root,
@@ -167,6 +175,25 @@ class DoubleLaunchGuardTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         time.sleep(0.5)
         self.assertIsNone(keep.poll(), "unrelated project poller was killed")
+
+    def test_matrix_channel_on_same_path_is_not_this_bot(self):
+        # Same --path, CCC_CHANNEL=matrix: Telegram start.sh must not report it
+        # as unmanaged (jingun 2026-09-18: "already running" crash loop).
+        root = self._mkdir("ccc-channel-")
+        matrix = self._decoy(root, channel="matrix")
+        time.sleep(0.5)
+        self.assertNotIn(str(matrix.pid), self._unmanaged_pids(root))
+        self.assertIsNone(matrix.poll(), "matrix decoy died unexpectedly")
+
+    def test_reap_leaves_matrix_channel_on_same_path(self):
+        root = self._mkdir("ccc-channel-reap-")
+        matrix = self._decoy(root, channel="matrix")
+        time.sleep(0.5)
+        r = self._reap(root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        time.sleep(0.5)
+        self.assertIsNone(matrix.poll(), "matrix frontend on same path was reaped")
+        self.assertNotIn("Clearing competing bot poller", r.stdout)
 
 
 if __name__ == "__main__":
