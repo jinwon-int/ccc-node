@@ -58,6 +58,7 @@ service overrides two keys in its unit):
   "family_devices": {"@dad:matrix.example.invalid": {"DAD_DEVICE": {"ed25519": "…", "curve25519": "…"}}},
   "not_before_ms": 1788825600000,
   "mention_aliases": ["seoseo"],
+  "wake_words": ["서서", "서서야"],
   "identities": {"@owner:matrix.example.invalid": {"master": "43_BASE64_CHARACTERS"}}
 }
 ```
@@ -67,6 +68,14 @@ Room policy is unchanged from the pilot: a direct room is exactly
 answers only when addressed (`m.mentions`, a typed `@localpart`, or a typed
 `@<alias>` from `mention_aliases` — Matrix ids cannot be renamed, so a bot
 that is *displayed* as "seoseo" is reachable as `@seoseo` this way).
+
+`wake_words` (optional, up to 8, `[0-9A-Za-z가-힣]{1,64}`) widens the same
+gate to **bare** whole-token nicknames without a leading `@` — for Korean
+display names that have no typed handle (the family calls the bot "서서" or
+"서서야"). Matching is whole-token only, so a wake word never fires inside a
+longer word ("서서" does not match "서서히"); a token glued to another word
+without a space ("서서야뭐해") does not match either. Aliases only widen the
+mention gate — sender and room admission are unchanged.
 
 ### Device trust: cross-signing identity (preferred) or pinned devices
 

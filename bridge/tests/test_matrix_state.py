@@ -42,6 +42,7 @@ from telegram_bot.core.matrix.state import (
     turn_id,
     upgrade_saved_policy,
     validate_config,
+    wake_words,
 )
 
 BOT = "@agent:example.test"
@@ -670,6 +671,46 @@ def test_mention_aliases_config_validation() -> None:
     for bad in ("seoseo", ["Seoseo"], ["a b"], [""], ["x"] * 9, ["dup", "dup"], [1]):
         with pytest.raises(SafetyStop, match="invalid-mention-aliases"):
             mention_aliases({"mention_aliases": bad})
+
+
+def test_wake_words_answer_bare_nicknames() -> None:
+    # Korean nicknames have no @handle: the family calls the bot "서서" / "서서야".
+    p = policy(wake_words={"서서", "서서야"})
+    for body, expected in [
+        ("서서야 오늘 일정", True),
+        ("서서 오늘 일정", True),
+        ("서서, 그건 좀 아니지", True),
+        ("야 서서!", True),
+        ("서서", True),
+        ("오늘 서서히 풀리네", False),  # "서서" glued inside another word
+        ("우리서서 별로야", False),
+        ("@서서야 안녕", True),  # a typed @handle still counts
+    ]:
+        e = event()
+        e["content"]["body"] = body
+        assert (p.admit(GROUP, e, decrypted=True, now_ms=NOW) is not None) is expected, body
+    # Direct rooms remain unconditioned.
+    e = event()
+    e["content"]["body"] = "멘션 없는 대화"
+    assert p.admit(ROOM, e, decrypted=True, now_ms=NOW) is not None
+    with pytest.raises(ValueError):
+        policy(wake_words={"Bad Word"})
+
+
+def test_wake_words_config_validation() -> None:
+    assert wake_words({}) == frozenset()
+    assert wake_words({"wake_words": ["서서", "서서야"]}) == {"서서", "서서야"}
+    for bad in ("서서", ["Seo seo"], ["서서-야"], [""], ["x"] * 9, ["dup", "dup"], [1]):
+        with pytest.raises(SafetyStop, match="invalid-wake-words"):
+            wake_words({"wake_words": bad})
+
+
+def test_aliases_and_wake_words_stack() -> None:
+    p = policy(aliases={"seoseo"}, wake_words={"서서"})
+    for body in ("@seoseo 안녕", "서서 안녕"):
+        e = event()
+        e["content"]["body"] = body
+        assert p.admit(GROUP, e, decrypted=True, now_ms=NOW) is not None, body
 
 
 def test_identities_replace_owner_pins_and_join_the_saved_policy(tmp_path: Path) -> None:
