@@ -55,7 +55,7 @@ IDS_FILENAME = "matrix-ids.json"
 DIRECT_ROOMS_FILENAME = "matrix-direct-rooms.json"
 SUPPORTED_COMMANDS = frozenset({"new", "model", "effort", "usage", "skills", "stop"})
 _STATUS_HANDLE = 1
-STATUS_MIN_INTERVAL_S = 60.0  # heartbeat notices become room messages on Matrix; throttle them
+STATUS_MIN_INTERVAL_S = 60.0  # status bubble edits on Matrix; throttle refreshes
 _RUNTIME_MODEL_PROVIDERS = frozenset({"codex", "piri", "crush", "danso"})
 _EFFORT_PROVIDERS = frozenset({"codex", "piri", "danso"})
 _CLAUDE_MODELS: tuple[tuple[str, str], ...] = (
@@ -85,6 +85,10 @@ class TurnSink(Protocol):
     async def typing(self) -> None: ...
 
     async def interim(self, text: str) -> None: ...
+
+    async def status(self, text: Optional[str]) -> None:
+        """Progress bubble: created once per turn, edited in place, redacted when done."""
+        ...
 
     async def approval(self, description: str, arguments: Any) -> bool: ...
 
@@ -468,10 +472,10 @@ class MatrixBot:
     def _make_status_callback(
         self, sink: TurnSink
     ) -> Callable[[Optional[str], Optional[int]], Awaitable[Optional[int]]]:
-        # Telegram edits one status bubble in place; Matrix has no edit path in
-        # the durable outbox, so every status text would become a new room
-        # message. Forward only when the text changed AND the interval passed,
-        # so a long turn shows a few progress notices, not one every 4 s.
+        # Telegram edits one status bubble in place; Matrix now matches via
+        # sink.status (create once, then m.replace edits, redact on None).
+        # Forward only when the text changed AND the interval passed, so a
+        # long turn refreshes one bubble, not a stream of room messages.
         last: dict[str, Any] = {"text": None, "at": 0.0}
 
         async def status_callback(
@@ -479,13 +483,19 @@ class MatrixBot:
         ) -> Optional[int]:
             del message_id
             if text is None:
-                return None  # delete: nothing to remove on Matrix
+                try:
+                    await sink.status(None)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("Matrix status redact failed", exc_info=True)
+                return None
             now = time.monotonic()
             if text == last["text"] or now - last["at"] < STATUS_MIN_INTERVAL_S:
                 return _STATUS_HANDLE
             last["text"], last["at"] = text, now
             try:
-                await sink.interim(text)
+                await sink.status(text)
             except asyncio.CancelledError:
                 raise
             except Exception:

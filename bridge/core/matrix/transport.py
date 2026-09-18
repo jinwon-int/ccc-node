@@ -140,6 +140,10 @@ class TurnSink(Protocol):
         """Durable progress notice, delivered by the outbox like any reply."""
         ...
 
+    async def status(self, text: str | None) -> None:
+        """Progress bubble: created once per turn, edited in place, redacted when done."""
+        ...
+
     async def approval(self, description: str, arguments: Any) -> bool:
         """Ask the room; True only when ``/approve <turn> <nonce>`` arrives in time."""
         ...
@@ -178,6 +182,7 @@ class _RoomSink:
         self.job = job
         self.request = transport.as_request(job)
         self.tid = turn_id(job["event_id"])
+        self._bubble: str | None = None  # this turn's progress message event id
 
     def _active(self) -> bool:
         return self.transport.active is self.job
@@ -200,6 +205,36 @@ class _RoomSink:
         if not self._active() or not isinstance(text, str) or not text.strip():
             return
         self.transport.store.notice(self.request, unique_key("interim"), text)
+
+    async def status(self, text: str | None) -> None:
+        """One progress bubble per turn: created, then edited in place (m.replace).
+
+        Telegram edits its status bubble; Matrix now matches instead of posting
+        a new room message per update. ``None`` redacts the bubble when the
+        answer replaces it. Cosmetic only: like typing, this is a direct send
+        outside the durable outbox, so a crash may leave a stale bubble behind.
+        """
+        if not self._active():
+            return
+        transport = self.transport
+        if text is None:
+            bubble, self._bubble = self._bubble, None
+            if bubble is None:
+                return
+            try:
+                await transport.redact(self.request.room_id, bubble, "status-" + self.tid)
+            except Exception:
+                pass  # cosmetic cleanup; the answer itself went through the outbox
+            return
+        if not isinstance(text, str) or not text.strip():
+            return
+        bounded_text(text, MAX_REPLY_BYTES)
+        async with transport.matrix_lock:
+            txn = hashlib.sha256(("status-" + self.tid + ":" + str(time.time_ns())).encode()).hexdigest()
+            if self._bubble is None:
+                self._bubble = await transport.encrypted_send(self.request.room_id, text, txn)
+            else:
+                await transport.encrypted_edit(self.request.room_id, text, self._bubble, txn)
 
     async def approval(self, description: str, arguments: Any) -> bool:
         transport = self.transport
@@ -819,7 +854,7 @@ class MatrixTransport:
                     self.store.delivered(job["event_id"])
             await asyncio.sleep(0.25)
 
-    async def encrypted_send(self, room: str, text: str, txn: str) -> None:
+    async def _encrypted_raw(self, room: str, kind: str, content: Mapping[str, Any], txn: str) -> str:
         # nio 0.25.2 room_send ignores incomplete key sharing. Confirm every
         # pinned recipient before encrypting, and avoid its implicit queries.
         if self.client.olm.should_share_group_session(room):
@@ -831,15 +866,37 @@ class MatrixTransport:
         if session is None or session.users_shared_with != expected:
             self.client.invalidate_outbound_session(room)
             raise ConnectionError("group-key-share-incomplete")
-        kind, content = self.client.encrypt(room, "m.room.message", message_content(text))
-        if kind != "m.room.encrypted":
+        out_kind, encrypted = self.client.encrypt(room, kind, content)
+        if out_kind != "m.room.encrypted":
             raise SafetyStop("plaintext-output-refused")
         result = await self.raw(
             "PUT",
             "/_matrix/client/v3/rooms/" + quote(room, safe="") + "/send/m.room.encrypted/" + txn,
-            data=content,
+            data=encrypted,
         )
-        bounded_text(result.get("event_id"), 255)
+        event_id = result.get("event_id")
+        bounded_text(event_id, 255)
+        return event_id
+
+    async def encrypted_send(self, room: str, text: str, txn: str) -> str:
+        return await self._encrypted_raw(room, "m.room.message", message_content(text), txn)
+
+    async def encrypted_edit(self, room: str, text: str, replaces: str, txn: str) -> str:
+        """m.replace edit of ``replaces``; the bubble keeps its original event id."""
+        new_content = message_content(text)
+        content: dict[str, Any] = dict(new_content)
+        content["body"] = "* " + text
+        content["m.new_content"] = new_content
+        content["m.relates_to"] = {"rel_type": "m.replace", "event_id": replaces}
+        return await self._encrypted_raw(room, "m.room.message", content, txn)
+
+    async def redact(self, room: str, event_id: str, tag: str) -> None:
+        txn = hashlib.sha256(("redact-" + tag).encode()).hexdigest()
+        await self.raw(
+            "PUT",
+            "/_matrix/client/v3/rooms/" + quote(room, safe="") + "/redact/" + quote(event_id, safe="") + "/" + txn,
+            {},
+        )
 
     def expected_recipients(self, room: str) -> set[tuple[str, str]]:
         """Pinned devices of every room member; direct rooms keep owner-only pins."""
