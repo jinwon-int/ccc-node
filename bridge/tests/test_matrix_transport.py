@@ -708,6 +708,48 @@ async def test_sink_typing_is_best_effort_and_interim_is_durable(tmp_path: Path)
 
 
 @pytest.mark.anyio
+async def test_status_bubble_edits_in_place_and_redacts(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        client_mock(f)
+        f.client.olm.outbound_group_sessions = {room: types.SimpleNamespace(users_shared_with={(f.c["owner"], "OWNER")})}
+        sends: list[str] = []
+        calls: list[tuple[str, str]] = []
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            calls.append((method, path))
+            if "/send/m.room.encrypted/" in path:
+                sends.append(path.rsplit("/", 1)[1])
+                return {"event_id": f"$bubble{len(sends) - 1}"}
+            assert "/redact/" in path
+            return {}
+
+        f.raw = raw
+        job = {"event_id": "$request", "room_id": room, "sender": f.c["owner"], "body": "x", "scope": "scope"}
+        sink = t._RoomSink(f, job)
+        f.active = job
+        from telegram_bot.core.matrix.transport import message_content
+
+        await sink.status("⏳ Working — 1s")
+        await sink.status("⏳ Working — 1m 23s")
+        assert len(sends) == 2, "one bubble + one edit, not a second room message"
+        first, edit = f.client.encrypt.call_args_list[0].args[2], f.client.encrypt.call_args_list[1].args[2]
+        assert first == message_content("⏳ Working — 1s")
+        assert edit["m.relates_to"] == {"rel_type": "m.replace", "event_id": "$bubble0"}
+        assert edit["m.new_content"]["body"] == "⏳ Working — 1m 23s"
+        await sink.status(None)  # turn answered: the bubble is redacted
+        assert "/redact/" in calls[-1][1] and len(sends) == 2
+        # After redaction (or a None) the next status opens a fresh bubble;
+        # an inactive turn stays inert.
+        await sink.status("⏳ Working — 2m")
+        assert sends[-1] != sends[0] and len(sends) == 3
+        f.active = None
+        await sink.status("⏳ inert")
+        assert len(sends) == 3
+
+
+@pytest.mark.anyio
 async def test_turn_carries_admitted_context_and_replays_execute_once(tmp_path: Path) -> None:
     async with running(tmp_path) as h:
         f = h.f

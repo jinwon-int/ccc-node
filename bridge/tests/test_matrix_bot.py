@@ -201,6 +201,7 @@ class FakeSink:
     def __init__(self, approve: Any = True) -> None:
         self.typing_calls = 0
         self.interims: list[str] = []
+        self.statuses: list[str | None] = []
         self.approvals: list[tuple[str, Any]] = []
         self.approve = approve
 
@@ -209,6 +210,9 @@ class FakeSink:
 
     async def interim(self, text: str) -> None:
         self.interims.append(text)
+
+    async def status(self, text: str | None) -> None:
+        self.statuses.append(text)
 
     async def approval(self, description: str, arguments: Any) -> bool:
         self.approvals.append((description, arguments))
@@ -600,7 +604,8 @@ async def test_typing_status_and_interim_adapters(tmp_path: Path, matrix_config:
     assert sink.typing_calls == 1
     assert isinstance(seen["h1"], int) and seen["h1"] == seen["h2"] == seen["h1b"]
     assert seen["deleted"] is None
-    assert sink.interims == ["⏳ Working", "first part"]
+    assert sink.statuses == ["⏳ Working", None]  # same-window texts swallowed; None redacts
+    assert sink.interims == ["first part"]
 
 
 @pytest.mark.anyio
@@ -620,7 +625,7 @@ async def test_status_callback_forwards_new_text_after_interval(
 
     chat.on_process = drive
     await bot.run_turn(_job("go"), sink=sink, session_id=None, room_kind="direct")
-    assert sink.interims == ["⏳ Working", "🔧 Running tests"]
+    assert sink.statuses == ["⏳ Working", "🔧 Running tests"]
 
 
 @pytest.mark.anyio
@@ -628,7 +633,7 @@ async def test_status_callback_is_fail_open(tmp_path: Path, matrix_config: dict[
     bot, chat, _manager = _bot(tmp_path)
 
     class BrokenSink(FakeSink):
-        async def interim(self, text: str) -> None:
+        async def status(self, text: str | None) -> None:
             raise RuntimeError("room gone")
 
     seen: dict[str, Any] = {}
