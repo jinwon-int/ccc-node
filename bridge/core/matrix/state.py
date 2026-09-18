@@ -218,12 +218,12 @@ def wake_words(config: Mapping[str, Any]) -> frozenset[str]:
 def turn_timeout_minutes(config: Mapping[str, Any]) -> float:
     """Optional ``turn_timeout_minutes``: per-turn ceiling in minutes.
 
-    Defaults to 20 (the historical hardcoded value); 5..360 keeps a runaway
-    turn bounded while allowing genuinely long work (6 h) on request
-    (owner request 2026-09-18). A timed-out turn still resolves uncertain
-    exactly as before — only the ceiling moves.
+    Defaults to 360 (6 h) — fleet default since 2026-09-18; long agent work
+    is normal in family rooms and the ceiling only exists to bound a truly
+    runaway turn. 5..360; a timed-out turn still resolves uncertain exactly
+    as before — only the ceiling moves.
     """
-    raw = config.get("turn_timeout_minutes", 20)
+    raw = config.get("turn_timeout_minutes", 360)
     if (
         isinstance(raw, bool)
         or not isinstance(raw, (int, float))

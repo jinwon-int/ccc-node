@@ -64,7 +64,7 @@ service overrides two keys in its unit):
 }
 ```
 
-`turn_timeout_minutes` (optional, default 20, allowed 5–360) caps one
+`turn_timeout_minutes` (optional, default 360 — 6 h —, allowed 5–360) caps one
 running turn; a timed-out turn still resolves uncertain exactly as
 before — only the ceiling moves. Set it to 360 (6 h) for genuinely long
 work (owner request 2026-09-18).

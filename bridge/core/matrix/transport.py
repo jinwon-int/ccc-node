@@ -75,6 +75,14 @@ NOTICE_UNCERTAIN = (
 NOTICE_RESTARTED = "⏳ 답변 중에 서비스가 재시작되어 마지막 답변이 끊겼습니다. 메시지를 다시 보내 주세요."
 NOTICE_CANCELLED = "⏹ 요청대로 작업을 중단했습니다."
 NOTICE_TIMEOUT = "⏳ 시간 제한({minutes}분)을 넘겨 작업을 중단했습니다. 요청을 나눠서 다시 보내 주세요."
+
+
+def _timeout_label(turn_timeout: float) -> str:
+    """Render the ceiling for the interrupted-turn notice (6시간, not 360분)."""
+    minutes = round(turn_timeout / 60)
+    if minutes >= 60 and minutes % 60 == 0:
+        return f"{minutes // 60}시간"
+    return f"{minutes}분"
 NOTICE_TURN_ERROR = "❌ 처리 중 오류가 나서 답변을 만들지 못했습니다. 잠시 후 다시 보내 주세요."
 # The pilot posted "작업을 시작했습니다. 취소 명령: /cancel <turn>" at every turn
 # start because it had no typing indicator. This frontend shows typing plus
@@ -1023,7 +1031,7 @@ class MatrixTransport:
         if outcome == "cancelled":
             text = NOTICE_CANCELLED
         elif outcome == "timeout":
-            text = NOTICE_TIMEOUT.format(minutes=round(self.turn_timeout / 60))
+            text = NOTICE_TIMEOUT.format(minutes=_timeout_label(self.turn_timeout))
         else:  # runner exception or an explicit uncertain result
             text = NOTICE_TURN_ERROR
         self.store.resolve_uncertain(job["event_id"], text)
