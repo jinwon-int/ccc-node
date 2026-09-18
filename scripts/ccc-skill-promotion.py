@@ -2925,6 +2925,24 @@ def _revise_dispatch_target(
     if parsed is None or pr is None:
         return "revise_record_invalid"
     node, name, tree12 = parsed
+    # #1628 (2026-09-18): the row already records the lineage keys the
+    # candidate was staged under. Re-deriving them from the transport id
+    # invents a second answer to a question the row has answered, and on
+    # `gwakga-claude-bash-provider-capability-gate-claude-b2fac765d7c9` the
+    # two disagree: `-claude-` appears twice, so the split takes the first
+    # marker and hands back `bash-provider-capability-gate-claude` while the
+    # row says `bash-provider-capability-gate`. The deferral written from the
+    # parse then keys a lineage no other row shares, and everything keyed on
+    # (node, name) — the round limit, the already-dispatched check, the B2
+    # prior-substitute guard — searches under a name that finds no history.
+    #
+    # Prefer the row; keep the parse for the pre-R2 rows that carry only a
+    # transport id (6 of 316 on the live publisher ledger). tree12 still comes
+    # from the parse either way: the fixed 12-char suffix is unambiguous even
+    # when the name is not.
+    row_node, row_name = row.get("node"), row.get("name")
+    if isinstance(row_node, str) and row_node and isinstance(row_name, str) and row_name:
+        node, name = row_node, row_name
     if node == "ccc-node":
         return "revise_canon_lane"
     return node, name, tree12, pr, provider, head, pr_url
