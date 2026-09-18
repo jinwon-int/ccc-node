@@ -192,6 +192,7 @@ class _RoomSink:
         self.request = transport.as_request(job)
         self.tid = turn_id(job["event_id"])
         self._bubble: str | None = None  # this turn's progress message event id
+        self._bubble_tail: str | None = None  # latest event representing the bubble (bubble or its last edit)
 
     def _active(self) -> bool:
         return self.transport.active is self.job
@@ -216,22 +217,28 @@ class _RoomSink:
         self.transport.store.notice(self.request, unique_key("interim"), text)
 
     async def status(self, text: str | None) -> None:
-        """One progress bubble per turn: created, then edited in place (m.replace).
+        """One progress bubble per turn: created, then refreshed at the room's bottom.
 
-        Telegram edits its status bubble; Matrix now matches instead of posting
-        a new room message per update. ``None`` redacts the bubble when the
-        answer replaces it. Cosmetic only: like typing, this is a direct send
-        outside the durable outbox, so a crash may leave a stale bubble behind.
+        Telegram edits its status bubble; Matrix edits too (m.replace), but an
+        edit keeps the original timeline position — once any other event lands
+        after the bubble it would stay buried. So: while the bubble is still
+        the newest event in the room, refresh via edit; when it has been
+        buried, redact and repost at the bottom (owner request 2026-09-18).
+        ``None`` redacts the bubble when the answer replaces it. Cosmetic
+        only: like typing, this is a direct send outside the durable outbox,
+        so a crash may leave a stale bubble behind.
         """
         if not self._active():
             return
         transport = self.transport
+        room = self.request.room_id
         if text is None:
             bubble, self._bubble = self._bubble, None
+            self._bubble_tail = None
             if bubble is None:
                 return
             try:
-                await transport.redact(self.request.room_id, bubble, "status-" + self.tid)
+                await transport.redact(room, bubble, "status-" + self.tid)
             except Exception:
                 pass  # cosmetic cleanup; the answer itself went through the outbox
             return
@@ -240,10 +247,24 @@ class _RoomSink:
         bounded_text(text, MAX_REPLY_BYTES)
         async with transport.matrix_lock:
             txn = hashlib.sha256(("status-" + self.tid + ":" + str(time.time_ns())).encode()).hexdigest()
+            latest = transport.last_room_event.get(room)
             if self._bubble is None:
-                self._bubble = await transport.encrypted_send(self.request.room_id, text, txn)
+                self._bubble = await transport.encrypted_send(room, text, txn)
+                self._bubble_tail = self._bubble
+                transport.last_room_event[room] = self._bubble
+            elif latest in (self._bubble, self._bubble_tail):
+                # Still the newest event: an edit is enough (no new event id churn).
+                self._bubble_tail = await transport.encrypted_edit(room, text, self._bubble, txn)
+                transport.last_room_event[room] = self._bubble_tail
             else:
-                await transport.encrypted_edit(self.request.room_id, text, self._bubble, txn)
+                # Buried by later events: redact and repost at the bottom.
+                try:
+                    await transport.redact(room, self._bubble, "status-" + self.tid + "-move")
+                except Exception:
+                    pass  # the repost below still lands; a redact failure is cosmetic
+                self._bubble = await transport.encrypted_send(room, text, txn)
+                self._bubble_tail = self._bubble
+                transport.last_room_event[room] = self._bubble
 
     async def approval(self, description: str, arguments: Any) -> bool:
         transport = self.transport
@@ -305,6 +326,7 @@ class MatrixTransport:
             if user not in self.identities and pins
         }
         self.trusted: dict[str, dict[str, str]] = {user: {d: k["curve25519"] for d, k in pins.items()} for user, pins in self.pins.items()}
+        self.last_room_event: dict[str, str] = {}  # newest event id seen per room (drives status-bubble placement)
         self.senders = frozenset([config["owner"]]) | self.family_users
         self.family_allowed = self.senders | frozenset([config["account"]])
         self.store = MatrixStore(config["state_directory"], config["account"])
@@ -782,6 +804,9 @@ class MatrixTransport:
                 if room not in self.c["rooms"]:
                     continue
                 for event in info.timeline.events:
+                    event_id = getattr(event, "event_id", None)
+                    if isinstance(event_id, str) and event_id:
+                        self.last_room_event[room] = event_id
                     req = self.admit_event(room, event)
                     if req:
                         await self.input(req)
