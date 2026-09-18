@@ -147,9 +147,28 @@ def HANDLE_RE(account: str) -> re.Pattern[str]:  # name kept from the pilot
     return handle_pattern(account[1:].split(":", 1)[0])
 
 
+# Korean particles (longest first) that may be glued to a wake word without a
+# space — "서서야뭐해" is 서서 + 야 + rest. A trailing character that is Hangul
+# but not one of these particles still blocks the match, so "서서히" stays inert.
+WAKE_JOSA = (
+    "에게서", "한테서", "부터", "까지", "에서", "에게", "한테", "이랑", "처럼", "만큼",
+    "보다", "조차", "라도", "으로", "님", "은", "는", "이", "가", "을",
+    "를", "와", "과", "도", "만", "랑", "에", "게", "로", "야", "아", "여",
+)
+
+
 def wake_word_pattern(word: str) -> re.Pattern[str]:
-    """Whole-token bare ``word`` (no leading @) in message text, case-insensitive."""
-    return re.compile(r"(?<!\w)" + re.escape(word) + r"(?!\w)", re.IGNORECASE)
+    """Whole-token bare ``word`` (no leading @) in message text, case-insensitive.
+
+    Matches the word alone (followed by a space, punctuation, or end), or the
+    word glued to a Korean particle with the rest unconstrained — no-space
+    typing like "서서야뭐해" still addresses the bot.
+    """
+    josa = "|".join(WAKE_JOSA)
+    return re.compile(
+        r"(?<!\w)" + re.escape(word) + r"(?:(?![가-힣])|(?:" + josa + r"))",
+        re.IGNORECASE,
+    )
 
 
 ALIAS_PATTERN = re.compile(r"[a-z0-9._=-]{1,64}")
