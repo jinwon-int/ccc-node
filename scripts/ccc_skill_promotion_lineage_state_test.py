@@ -196,5 +196,105 @@ class SubstituteGateFilterTests(unittest.TestCase):
             promotion._revise_substitute_due(self.config(0), rows, "gwakga", "s1"))
 
 
+class VerdictAttributionTests(unittest.TestCase):
+    """A verdict nobody can place on a PR used to vanish without a trace.
+
+    Field case, 2026-09-18. Attribution joined verdicts to PRs through the
+    `a2a-dispatch` row alone and dropped whatever it could not place. Five
+    `approve` verdicts on the publisher were invisible that way — #51 #54 #55
+    #61 #66, whose early-round dispatch rows are absent from the ledger
+    entirely. All five happened to be redundant, because a later round for the
+    same PR recorded its own approve and did join. That is luck, not a
+    guarantee: had a dropped verdict been a lineage's LATEST, the lineage
+    would read as undecided and every protection #1779 added would look right
+    past it, because those protections ask exactly this map.
+
+    Both lane ids carry the PR they were opened for, and this file builds
+    them, so the id is a sound second route. It stays strictly a fallback:
+    where a dispatch row exists its `pr_url` decides, because the id is the
+    weaker evidence of the two.
+    """
+
+    @staticmethod
+    def orphan_verdict(task: str, verdict: str, *, days_ago: int) -> dict:
+        """A verdict whose dispatch row never made it into the ledger."""
+        return verdict_row(task, verdict, days_ago=days_ago)
+
+    def test_dispatch_row_stays_authoritative(self) -> None:
+        """Where the two disagree the pr_url wins — the id is never an
+        override, only a fallback."""
+        task = "skills_intake_review-pr999-gwakga-r0"
+        rows = [dispatch_row(task, "78"), verdict_row(task, "approve", days_ago=3)]
+        self.assertEqual(promotion._latest_verdicts_by_pr(rows), {"78": "approve"})
+
+    def test_orphan_verdict_is_recovered_from_its_task_id(self) -> None:
+        rows = [self.orphan_verdict(
+            "skills_intake_review-pr51-ccc-node-20260829T115641Z08",
+            "approve", days_ago=17)]
+        self.assertEqual(promotion._latest_verdicts_by_pr(rows), {"51": "approve"})
+
+    def test_recovered_verdict_protects_the_lineage(self) -> None:
+        """The point of recovering it at all."""
+        rows = [self.orphan_verdict(
+            "skills_intake_review-pr51-ccc-node-20260829T115641Z08",
+            "approve", days_ago=17)]
+        self.assertEqual(promotion._resolved_lineage_prs(rows), {"51"})
+
+    def test_a_recovered_latest_verdict_can_decide_a_lineage(self) -> None:
+        """The failure the drop was hiding: an orphan that is the newest
+        verdict must settle the lineage, not be skipped."""
+        rows = history("81", ("revise", 17)) + [self.orphan_verdict(
+            "skills_intake_review-pr81-gwakga-20260910T133542Z03",
+            "approve", days_ago=7)]
+        self.assertEqual(promotion._latest_verdicts_by_pr(rows), {"81": "approve"})
+        self.assertEqual(promotion._resolved_lineage_prs(rows), {"81"})
+
+    def test_a_recovered_verdict_can_also_reopen_a_lineage(self) -> None:
+        """Recovery is not a shortcut to 'resolved'. An orphan `revise` newer
+        than a mapped `approve` leaves the round owed, exactly as #26 does."""
+        rows = history("26", ("approve", 18)) + [self.orphan_verdict(
+            "skills_intake_review-pr26-gwakga-20260903T010101Z01",
+            "revise", days_ago=14)]
+        self.assertEqual(promotion._latest_verdicts_by_pr(rows), {"26": "revise"})
+        self.assertEqual(promotion._resolved_lineage_prs(rows), set())
+
+    def test_approve_age_uses_the_same_attribution(self) -> None:
+        """#1776 split eligibility from age. Both must read one join, or a PR
+        is eligible by one and ageless by the other."""
+        rows = [self.orphan_verdict(
+            "skills_intake_review-pr51-ccc-node-20260829T115641Z08",
+            "approve", days_ago=17)]
+        self.assertEqual(set(promotion._approve_lineage_prs(rows)), {"51"})
+
+    def test_unplaceable_verdict_is_reported_not_swallowed(self) -> None:
+        rows = [self.orphan_verdict("malformed-task-without-a-pr", "approve", days_ago=2)]
+        self.assertEqual(promotion._latest_verdicts_by_pr(rows), {})
+        self.assertEqual(promotion._unattributable_verdicts(rows),
+                         ["malformed-task-without-a-pr"])
+
+    def test_placeable_verdicts_are_not_reported(self) -> None:
+        rows = history("81", ("approve", 7)) + [self.orphan_verdict(
+            "skills_intake_review-pr51-ccc-node-20260829T115641Z08",
+            "approve", days_ago=17)]
+        self.assertEqual(promotion._unattributable_verdicts(rows), [])
+
+    def test_report_is_ordered_and_covers_every_orphan(self) -> None:
+        rows = [self.orphan_verdict("no-pr-here-b", "approve", days_ago=1),
+                self.orphan_verdict("no-pr-here-a", "revise", days_ago=9)]
+        self.assertEqual(promotion._unattributable_verdicts(rows),
+                         ["no-pr-here-a", "no-pr-here-b"])
+
+    def test_digits_are_required_and_bounded_by_the_separators(self) -> None:
+        for task, expected in [
+            ("skills_intake_revise-pr143-gwakga-20260910T000000Z", {"143": "approve"}),
+            ("skills_intake_review-pr7-gwakga-x", {"7": "approve"}),
+            ("skills_intake_review-prXY-gwakga-x", {}),
+            ("skills_intake_review-pr-gwakga-x", {}),
+        ]:
+            with self.subTest(task=task):
+                rows = [self.orphan_verdict(task, "approve", days_ago=2)]
+                self.assertEqual(promotion._latest_verdicts_by_pr(rows), expected)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)
