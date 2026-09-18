@@ -367,7 +367,11 @@ def private_directory(path: Path | str) -> int:
     path = Path(path)
     if not path.is_absolute() or ".." in path.parts:
         raise ValueError("state directory must be an absolute path without traversal")
-    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    # Android permits traversal of / and /data but denies directory reads.
+    # Pin ancestors without reading them; the leaf must remain readable for
+    # crypto-store enumeration. O_DIRECTORY | O_NOFOLLOW still rejects links.
+    ancestor_access = getattr(os, "O_PATH", os.O_RDONLY)
+    fd = os.open("/", (ancestor_access if len(path.parts) > 1 else os.O_RDONLY) | os.O_DIRECTORY)
     try:
         for i, part in enumerate(path.parts[1:]):
             if i == len(path.parts) - 2:
@@ -375,7 +379,8 @@ def private_directory(path: Path | str) -> int:
                     os.mkdir(part, 0o700, dir_fd=fd)
                 except FileExistsError:
                     pass
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            access = os.O_RDONLY if i == len(path.parts) - 2 else ancestor_access
+            next_fd = os.open(part, access | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = next_fd
         st = os.fstat(fd)
