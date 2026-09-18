@@ -15,7 +15,7 @@ changed versus the family-messenger pilot bot ("fambot"):
 | brain | one Codex process per turn, JSON port | `ProjectChatHandler` in-process (as Telegram) |
 | session | `session_id` per room, cold start each turn | warm `AgentSession` per room |
 | progress | "작업을 시작했습니다" only | typing + interim/status notices |
-| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` |
+| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) |
 | output | plain `m.text` | plain `body` + Matrix HTML `formatted_body` |
 | E2EE / trust / room gate | fleet_matrix | same code, ported (fail-closed reasons unchanged) |
 

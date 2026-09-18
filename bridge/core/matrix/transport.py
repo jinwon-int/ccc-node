@@ -13,10 +13,15 @@ Turn outcomes:
 * ``TurnResult(status="complete")`` — :meth:`MatrixStore.finish` records the
   reply (an empty reply completes the job without an outbox delivery).
 * anything else — a ``TurnResult(status="uncertain")``, a runner exception,
-  the 20-minute turn timeout, or a ``/cancel`` — leaves the job *uncertain*.
-  Uncertain work is never re-run; the room receives an ``/ack <turn id>``
-  notice and the work loop waits for that acknowledgement (or an operator
-  :meth:`MatrixStore.unblock`) before claiming anything else.
+  the 20-minute turn timeout, or a ``/cancel`` — ends the job with a short
+  notice ("중단했습니다 / 시간 제한 / 오류 … 다시 보내 주세요") and the loop
+  keeps serving, exactly like the Telegram bridge. Nothing is re-run.
+* a turn interrupted by a service stop/restart is left *uncertain* by the
+  dying process and resolved on the next start with a "재시작으로 끊겼습니다,
+  다시 보내 주세요" notice (Telegram's RESTART_INTERRUPT_NOTICE) — no
+  ``/ack`` gate any more (owner 2026-09-18: the pilot's acknowledgement step
+  was unusable in practice). ``/ack`` stays accepted as a no-op courtesy and
+  :meth:`MatrixStore.unblock` remains for operators.
 
 ``nio`` and ``aiohttp`` are imported lazily inside the methods that use them.
 """
@@ -64,7 +69,11 @@ NOTICE_INVALID_CONTROL = "현재 이 대화방에서 처리할 수 있는 제어
 NOTICE_UNCERTAIN = (
     "작업이 중단되어 결과 확인이 필요합니다. 자동으로 다시 실행하지 않습니다.\n"
     "결과를 확인한 뒤 다음 명령으로 대기를 해제할 수 있습니다:\n/ack "
-)
+)  # legacy text kept for the operator unblock audit; no longer posted to rooms
+NOTICE_RESTARTED = "⏳ 답변 중에 서비스가 재시작되어 마지막 답변이 끊겼습니다. 메시지를 다시 보내 주세요."
+NOTICE_CANCELLED = "⏹ 요청대로 작업을 중단했습니다."
+NOTICE_TIMEOUT = "⏳ 시간 제한(20분)을 넘겨 작업을 중단했습니다. 요청을 나눠서 다시 보내 주세요."
+NOTICE_TURN_ERROR = "❌ 처리 중 오류가 나서 답변을 만들지 못했습니다. 잠시 후 다시 보내 주세요."
 # The pilot posted "작업을 시작했습니다. 취소 명령: /cancel <turn>" at every turn
 # start because it had no typing indicator. This frontend shows typing plus
 # throttled progress notices and accepts a bare "/stop", so the notice was
@@ -865,13 +874,11 @@ class MatrixTransport:
 
     async def work(self) -> None:
         while True:
-            # Do not overlap unknown prior execution after a restart.
-            uncertain = self.store.uncertain()
-            if uncertain:
-                for job in uncertain:
-                    self.store.notice(self.as_request(job), "uncertain", NOTICE_UNCERTAIN + turn_id(job["event_id"]))
-                await asyncio.sleep(0.25)
-                continue
+            # Work left uncertain by a previous process (store open converts
+            # crashed 'running' rows) was interrupted by a stop/restart: tell
+            # the room once and move on, like the Telegram bridge does.
+            for job in self.store.uncertain():
+                self.store.resolve_uncertain(job["event_id"], NOTICE_RESTARTED)
             job = self.store.claim()
             if not job:
                 await asyncio.sleep(0.25)
@@ -894,6 +901,7 @@ class MatrixTransport:
             )
         )
         self.turn_task = turn
+        shutting_down = False
         try:
             # asyncio.wait (not `await turn`) keeps timeout/shutdown cancellation
             # with this loop: a runner that swallows CancelledError cannot absorb it.
@@ -910,8 +918,9 @@ class MatrixTransport:
             outcome = "cancelled"
             current = asyncio.current_task()
             if current is not None and current.cancelling():
+                shutting_down = True
                 raise  # The service is stopping; the join below still runs.
-            # Only the runner task was cancelled (/cancel): stay uncertain, keep serving.
+            # Only the runner task was cancelled (/cancel or /stop): keep serving.
         except Exception as exc:
             outcome = "timeout" if isinstance(exc, TimeoutError) else "error:" + type(exc).__name__
         finally:
@@ -920,6 +929,11 @@ class MatrixTransport:
             finally:
                 # Runs even when the join itself is cancelled again.
                 self.store.uncertain_job(job["event_id"])  # no-op once finished
+                if not shutting_down:
+                    # Telegram parity: an interrupted turn ends with a short
+                    # notice and the next message is served normally. A stop/
+                    # restart leaves it uncertain for the next process to notice.
+                    self._close_interrupted(job, outcome)
                 for future in self.approvals.values():
                     if not future.done():
                         future.set_result(False)
@@ -929,6 +943,17 @@ class MatrixTransport:
                 self.store.set_meta(
                     "last_turn", {"event_id": job["event_id"], "outcome": outcome, "updated": time.time()}
                 )
+
+    def _close_interrupted(self, job: Mapping[str, Any], outcome: str) -> None:
+        if not any(j["event_id"] == job["event_id"] for j in self.store.uncertain()):
+            return  # finished normally
+        if outcome == "cancelled":
+            text = NOTICE_CANCELLED
+        elif outcome == "timeout":
+            text = NOTICE_TIMEOUT
+        else:  # runner exception or an explicit uncertain result
+            text = NOTICE_TURN_ERROR
+        self.store.resolve_uncertain(job["event_id"], text)
 
     async def _join(self, turn: asyncio.Task[TurnResult]) -> None:
         """Stop the runner task and wait for it, surviving repeated cancels like the pilot's cleanup join."""
