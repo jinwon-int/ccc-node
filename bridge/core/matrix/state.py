@@ -758,6 +758,19 @@ class Store:
             if next_token is not None:
                 self.db.execute("INSERT OR REPLACE INTO meta VALUES ('sync_token',?)", (next_token,))
 
+    def job_exists(self, event_id: str) -> bool:
+        return self.db.execute("SELECT 1 FROM jobs WHERE event_id=?", (event_id,)).fetchone() is not None
+
+    def pending_before(self, event_id: str) -> int:
+        """Real (non-notice) undelivered jobs of the same scope queued earlier."""
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM jobs q WHERE q.scope=(SELECT scope FROM jobs WHERE event_id=?) "
+            "AND q.state!='done' AND q.seq<(SELECT seq FROM jobs WHERE event_id=?) "
+            "AND q.event_id NOT LIKE '$notice-%'",
+            (event_id, event_id),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     def claim(self) -> dict[str, Any] | None:
         with self.db:
             row = self.db.execute(

@@ -63,6 +63,7 @@ from telegram_bot.core.matrix.state import (
 
 FAMILY_NOTICE = "이 AI는 이 방을 읽을 수 있으며 답변에 필요한 내용이 제공업체에 전달될 수 있습니다."
 NOTICE_QUEUE_FULL = "대기 중인 요청이 많습니다. 잠시 후 다시 요청해 주세요."
+NOTICE_QUEUED = "⏳ 이 메시지는 대기 순번 {position}번에 저장되었으며 도착 순서대로 처리됩니다."
 NOTICE_ACKED = "이전 작업의 결과 확인을 완료한 것으로 기록했습니다. 자동 재실행은 하지 않습니다."
 NOTICE_CONTROL_FORWARDED = "요청을 전달했습니다. 실제 처리 결과는 이어지는 안내를 확인해 주세요."
 NOTICE_INVALID_CONTROL = "현재 이 대화방에서 처리할 수 있는 제어 요청이 아닙니다. 작업 번호와 승인 번호를 확인해 주세요."
@@ -630,6 +631,7 @@ class MatrixTransport:
         if req.body.startswith(CONTROL_PREFIXES):
             await self.control(req)
             return
+        fresh = not self.store.job_exists(req.event_id)
         try:
             self.store.accept_batch([req], None)
         except QueueFull:
@@ -637,6 +639,17 @@ class MatrixTransport:
             # later syncs from carrying cancellation/approval controls.
             if not self.store.seen_control(req):
                 self.store.notice(req, "queue-full", NOTICE_QUEUE_FULL)
+            return
+        if fresh:
+            # Telegram tells a sender whose turn is still running where their
+            # message landed in the queue; family rooms get the same notice.
+            ahead = self.store.pending_before(req.event_id)
+            if ahead:
+                self.store.notice(
+                    req,
+                    "queued-" + req.event_id,
+                    NOTICE_QUEUED.format(position=ahead + 1),
+                )
 
     def _turn_running(self) -> bool:
         return self.active is not None and self.turn_task is not None and not self.turn_task.done()
