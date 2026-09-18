@@ -38,6 +38,8 @@ python3 ~/.piri/agent/skills/web/web_search.py "검색어" --provider searxng [-
   automatically inside the helper.
 - Queries the canonical Seoseo SearXNG endpoint (`SEARXNG_URL` can override it
   with comma-separated fallbacks).
+- Endpoint value field-verified on 2026-09-18; ownership and failover runbook
+  are maintained in the Family Wiki (`pages/services/searxng.md`).
 - Exit 69 = SearXNG instances unavailable; exit 64 = missing/invalid command
   usage or provider.
 
@@ -78,6 +80,11 @@ python3 ~/.piri/agent/skills/web/web_developer.py \
   [--repo owner/repo]
 ```
 
+- Endpoint contract field-verified on 2026-09-18 against the published API:
+  `POST /v2/search/developer` with request keys `query`, `k`, repeatable
+  `types` (`doc`, `issue`, `pull_request`, `readme`), and `repos`; each result
+  carries `title` / `url` / `passages[].text` (~2400-character cap). Source:
+  https://docs.firecrawl.dev/api-reference/endpoint/developer-search
 - Searches public documentation, repository READMEs, issues, and merged pull
   requests and includes matched passages.
 - Prefer this route for library/API behavior, error messages, known bugs, and

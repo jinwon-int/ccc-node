@@ -32,6 +32,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# Canonical Seoseo SearXNG endpoint, field-verified 2026-09-18. Endpoint
+# ownership/failover is documented in the Family Wiki
+# (pages/services/searxng.md); SEARXNG_URL overrides this default at runtime.
 DEFAULT_SEARXNG_URL = "https://vps4.tail1546e7.ts.net:18443"
 DEFAULT_FIRECRAWL_URL = "https://api.firecrawl.dev"
 MAX_LIMIT = 10
