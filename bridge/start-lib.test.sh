@@ -120,14 +120,18 @@ mk_environ() { # <name> <KEY=val...>
   for a in "$@"; do printf '%s\0' "$a" >> "$f"; done
   printf '%s' "$f"
 }
+# shellcheck disable=SC2034  # consumed via eval in ok()
 this_ch="$(_this_bridge_channel)"
 ok "unset CCC_CHANNEL is telegram" '[ "$this_ch" = telegram ]'
+# shellcheck disable=SC2034  # consumed via eval in ok()
 empty_env="$(mk_environ empty)"
 ok "empty environ file is telegram" '[ "$(_environ_bridge_channel "$empty_env")" = telegram ]'
+# shellcheck disable=SC2034  # consumed via eval in ok()
 matrix_env="$(mk_environ matrix CCC_CHANNEL=matrix HOME=/root)"
 ok "reads CCC_CHANNEL=matrix from environ" '[ "$(_environ_bridge_channel "$matrix_env")" = matrix ]'
 ok "telegram invocation does not match matrix environ" \
   '! _environ_is_this_channel "$matrix_env"'
+# shellcheck disable=SC2034  # consumed via eval in ok()
 tele_env="$(mk_environ tele CCC_CHANNEL=telegram)"
 ok "explicit CCC_CHANNEL=telegram matches default invocation" \
   '_environ_is_this_channel "$tele_env"'
