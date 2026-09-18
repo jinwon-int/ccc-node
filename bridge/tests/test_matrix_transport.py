@@ -756,6 +756,7 @@ async def test_status_bubble_edits_in_place_and_redacts(tmp_path: Path) -> None:
         client_mock(f)
         f.client.olm.outbound_group_sessions = {room: types.SimpleNamespace(users_shared_with={(f.c["owner"], "OWNER")})}
         sends: list[str] = []
+        redacts: list[str] = []
         calls: list[tuple[str, str]] = []
 
         async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
@@ -764,6 +765,7 @@ async def test_status_bubble_edits_in_place_and_redacts(tmp_path: Path) -> None:
                 sends.append(path.rsplit("/", 1)[1])
                 return {"event_id": f"$bubble{len(sends) - 1}"}
             assert "/redact/" in path
+            redacts.append(path)
             return {}
 
         f.raw = raw
@@ -773,21 +775,29 @@ async def test_status_bubble_edits_in_place_and_redacts(tmp_path: Path) -> None:
         from telegram_bot.core.matrix.transport import message_content
 
         await sink.status("⏳ Working — 1s")
+        assert f.last_room_event[room] == "$bubble0"  # our own send counts as the newest event
         await sink.status("⏳ Working — 1m 23s")
-        assert len(sends) == 2, "one bubble + one edit, not a second room message"
+        assert len(sends) == 2 and not redacts, "still newest: edit in place, no redact"
         first, edit = f.client.encrypt.call_args_list[0].args[2], f.client.encrypt.call_args_list[1].args[2]
         assert first == message_content("⏳ Working — 1s")
         assert edit["m.relates_to"] == {"rel_type": "m.replace", "event_id": "$bubble0"}
         assert edit["m.new_content"]["body"] == "⏳ Working — 1m 23s"
-        await sink.status(None)  # turn answered: the bubble is redacted
-        assert "/redact/" in calls[-1][1] and len(sends) == 2
-        # After redaction (or a None) the next status opens a fresh bubble;
-        # an inactive turn stays inert.
+        # A family member speaks after the bubble: it is buried now.
+        f.last_room_event[room] = "$family-msg"
         await sink.status("⏳ Working — 2m")
-        assert sends[-1] != sends[0] and len(sends) == 3
+        assert len(sends) == 3 and len(redacts) == 1, "buried bubble: redact + repost at the bottom"
+        assert sink._bubble == "$bubble2"
+        # The reposted bubble is newest again: back to edit-in-place.
+        await sink.status("⏳ Working — 3m")
+        assert len(sends) == 4 and len(redacts) == 1
+        repost_edit = f.client.encrypt.call_args_list[-1].args[2]
+        assert repost_edit["m.relates_to"] == {"rel_type": "m.replace", "event_id": "$bubble2"}
+        await sink.status(None)  # turn answered: the bubble is redacted
+        assert len(redacts) == 2 and "/redact/" in calls[-1][1] and len(sends) == 4
+        # An inactive turn stays inert.
         f.active = None
         await sink.status("⏳ inert")
-        assert len(sends) == 3
+        assert len(sends) == 4 and len(redacts) == 2
 
 
 @pytest.mark.anyio
