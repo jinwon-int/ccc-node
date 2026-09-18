@@ -51,7 +51,11 @@ Check if the following are installed:
 
 If missing, provide installation instructions in the user's language:
 - Python: https://www.python.org/downloads/ or `brew install python@3.11`
-- Claude CLI: `npm install -g @anthropic-ai/claude-code` or `brew install anthropics/claude/claude`
+  (the bridge pins `requires-python = ">=3.11"` in `bridge/pyproject.toml`)
+- Claude CLI: `npm install -g @anthropic-ai/claude-code`
+  (https://docs.npmjs.com/cli/commands/npm-install) or
+  `brew install anthropics/claude/claude`; setup guide:
+  https://code.claude.com/docs/en/setup
 
 ### Step 3: Get Telegram Bot Token
 
