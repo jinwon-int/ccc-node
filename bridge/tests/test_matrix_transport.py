@@ -661,6 +661,35 @@ def test_message_content_adds_formatted_body_only_for_markup() -> None:
 
 
 @pytest.mark.anyio
+async def test_second_message_while_busy_gets_a_queue_position_notice(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        req = request(f)
+        await f.input(req)
+        assert h.replies() == [], "first message has nothing to queue behind"
+
+        second = request(f, event="$second", body="두 번째 질문")
+        await f.input(second)
+        queued = [r for r in h.replies() if "대기 순번" in r]
+        assert queued == ["⏳ 이 메시지는 대기 순번 2번에 저장되었으며 도착 순서대로 처리됩니다."]
+        # A sync replay of the same event must not re-notice.
+        await f.input(second)
+        assert [r for r in h.replies() if "대기 순번" in r] == queued
+
+        # Same scope is strictly FIFO: $second runs only after $request's
+        # answer has been delivered. Interleave work and delivery like the
+        # real send loop would.
+        h.work()
+        await h.until(lambda: f.store.db.execute("SELECT state FROM jobs WHERE event_id='$request'").fetchone()[0] == "ready")
+        h.drain()
+        await h.until(lambda: f.store.db.execute("SELECT state FROM jobs WHERE event_id='$second'").fetchone()[0] == "ready")
+        h.drain()
+        third = request(f, event="$third", body="세 번째 질문")
+        await f.input(third)
+        assert [r for r in h.replies() if "대기 순번" in r] == []
+
+
+@pytest.mark.anyio
 async def test_empty_result_completes_without_reply(tmp_path: Path) -> None:
     async with running(tmp_path, "empty") as h:
         f = h.f
