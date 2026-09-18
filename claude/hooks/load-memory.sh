@@ -98,6 +98,8 @@ EXTERNAL_WAIT_HOME="${CCC_EXTERNAL_WAIT_HOME:-${HOME:-/root}/.telegram_bot/exter
 # EXIT marker at SessionStart needs no surviving process at all.
 DETACHED_JOBS_INJECT="${CCC_MEMORY_INJECT_DETACHED_JOBS:-1}"
 MAX_DETACHED_JOBS="${CCC_DETACHED_JOBS_MAX_BYTES:-1024}"
+FLEET_ALERTS_INJECT="${CCC_MEMORY_INJECT_FLEET_ALERTS:-1}"
+MAX_FLEET_ALERTS="${CCC_FLEET_ALERTS_MAX_BYTES:-1024}"
 DETACHED_JOBS_REGISTRY="${CCC_DETACHED_JOBS_REGISTRY:-$STATE_DIR/detached-jobs.jsonl}"
 WS_FILE="${CCC_WORKING_STATE:-$STATE_DIR/working-state.md}"
 LEGACY_WS_FILE="${CCC_MEMORY_LEGACY_WORKING_STATE:-$LEGACY_STATE_DIR/working-state.md}"
@@ -116,6 +118,7 @@ MEMORY_RENDER_PY="$LOAD_MEMORY_LIB_DIR/lib/memory_render.py"
 PENDING_PROMISES_PY="$LOAD_MEMORY_LIB_DIR/lib/pending_promises.py"
 # Detached-job completion sweep (#1258); same stdlib-only, fail-open contract.
 DETACHED_JOBS_PY="$LOAD_MEMORY_LIB_DIR/lib/detached_jobs.py"
+FLEET_ALERTS_PY="$LOAD_MEMORY_LIB_DIR/lib/fleet_alerts.py"
 
 # Stage timing instrumentation (#897 step 1): EPOCHREALTIME marks around the
 # expensive stages, appended as ONE body-free JSON line per run to
@@ -647,6 +650,29 @@ ${detached}
   fi
 fi
 
+# Unread fleet alerts. Sits with the promises and detached blocks because it is
+# the same kind of thing: a durable record that nothing else re-reads.
+#
+# The case that motivated it: wiki-log-rotate's alarm (#5069) fired correctly
+# for four days — a comment on every failure, all from `github-actions`, none
+# from a person — while pages/log.md grew past its lint limit and every node's
+# wiki PR started conflicting on the stale routing files. The signal was never
+# missing; the channel was. Fail-open, and silent unless an alert has gone
+# unanswered by a human.
+alerts_block=""
+if ! is_disabled "$FLEET_ALERTS_INJECT" && [ -r "$FLEET_ALERTS_PY" ]; then
+  # Path passed explicitly, as with the promises/detached renderers: it keeps
+  # the cache location one decision in this loader rather than two.
+  alerts="$(python3 "$FLEET_ALERTS_PY" \
+    "$CACHE/fleet-alerts.json" --max-bytes "$MAX_FLEET_ALERTS" 2>/dev/null)" || alerts=""
+  if [ -n "$alerts" ]; then
+    alerts_block="
+## 🚨 응답 없는 플릿 경보 (캐시 기준 — 봇만 말한 경보)
+${alerts}
+"
+  fi
+fi
+
 operational_note="Operational facts are mutable — live-check the node before asserting or changing anything."
 audience_note=""
 if ! is_disabled "$AUDIENCE_SCOPED"; then
@@ -723,7 +749,7 @@ Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}. ${refre
 
 ${persona_block}## Built-in MEMORY + USER
 ${mem:-(memory files unavailable)}
-${ws_block}${promises_block}${detached_block}
+${ws_block}${promises_block}${detached_block}${alerts_block}
 ## Local hot memory (task-conditioned cache search)
 ${local_hot:-(local hot memory disabled or no hits)}
 ${skills_block}${wiki_block}"
