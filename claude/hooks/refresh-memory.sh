@@ -218,10 +218,61 @@ if ! is_disabled "$AUDIENCE_SCOPED" \
     timeout 30 "$index_script" update >/dev/null 2>&1 || true
 fi
 
+# Fleet alert issues, for the SessionStart block that `lib/fleet_alerts.py`
+# renders. Collected here rather than on the hook path for the same reason the
+# Wiki prefetch is: a `gh` call in front of session start puts GitHub's
+# availability in front of every session on every node.
+#
+# `last_human_comment_at` is the field that matters. wiki-log-rotate's alarm
+# (#5069) fired correctly for four days and collected a comment on every
+# failure — all of them from `github-actions`, none from a person — while
+# pages/log.md grew past its lint limit. An alert with a human voice on it is
+# being handled; one with only bots is that case again.
+alerts_status="skipped"; alerts_error=""
+if ! is_disabled "${CCC_FLEET_ALERTS_COLLECT:-1}" && command -v gh >/dev/null 2>&1; then
+  alerts_repos="${CCC_FLEET_ALERT_REPOS:-jinwon-int/seoyoon-family-wiki jinwon-int/ccc-node}"
+  alerts_query="${CCC_FLEET_ALERT_QUERY:-🚨 in:title}"
+  alerts_tmp="$CACHE/fleet-alerts.json.tmp.$$"
+  if printf '%s' "$alerts_repos" | tr ' ' '\n' | grep -qvE '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+    alerts_status="error"; alerts_error="CCC_FLEET_ALERT_REPOS holds an unsafe repo name"
+  else
+    alerts_ok=1
+    : > "$alerts_tmp.rows"
+    for repo in $alerts_repos; do
+      # `comments` carries each comment's author, so the human/bot split is
+      # decided from the listing and no issue body is ever read.
+      if ! timeout "${CCC_FLEET_ALERTS_TIMEOUT_SEC:-25}" gh issue list \
+          --repo "$repo" --state open --search "$alerts_query" --limit 20 \
+          --json number,title,createdAt,state,comments \
+          --jq ".[] | {repo:\"$repo\", number, title, state,
+                createdAt,
+                bot_comments: ([.comments[]? | select((.author.login // \"\") | test(\"\\\\[bot\\\\]$|^github-actions$\"))] | length),
+                last_human_comment_at: ([.comments[]? | select(((.author.login // \"\") | test(\"\\\\[bot\\\\]$|^github-actions$\")) | not) | .createdAt] | max)}" \
+          >> "$alerts_tmp.rows" 2>/dev/null; then
+        alerts_ok=0
+      fi
+    done
+    if [ "$alerts_ok" = 1 ] \
+      && jq -s '{generated_at:(now|todate), alerts: map({repo, number, title, state,
+                   created_at: .createdAt, bot_comments, last_human_comment_at})}' \
+           "$alerts_tmp.rows" > "$alerts_tmp" 2>/dev/null \
+      && mv -f "$alerts_tmp" "$CACHE/fleet-alerts.json" 2>/dev/null; then
+      alerts_status="ok"
+    else
+      # Leave the previous cache in place: a stale alert list is strictly
+      # better than dropping a still-unread alert on a transient gh failure.
+      alerts_status="error"; alerts_error="gh issue list or cache write failed"
+    fi
+    rm -f "$alerts_tmp" "$alerts_tmp.rows"
+  fi
+fi
+record_status fleet_alerts "$alerts_status" 0 0 "$alerts_error"
+
 # Merge per-source statuses into one meta document.
 jq -s '{generated_at:(now|todate), sources: map({(.source): del(.source)}) | add}' \
   "$CACHE/.wiki.status.json" \
   "$CACHE/.fact_consolidate.status.json" "$CACHE/.local_index.status.json" \
+  "$CACHE/.fleet_alerts.status.json" \
   > "$CACHE/meta.json.tmp" 2>/dev/null && mv "$CACHE/meta.json.tmp" "$CACHE/meta.json"
 
 now_iso > "$CACHE/.last-refresh"
