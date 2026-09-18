@@ -111,6 +111,35 @@ ok "a vanished cmdline is silent (no stderr leak from the read)" '[ -z "$absent_
 f="$(mk_cmdline module_only python3 -m telegram_bot)"
 ok "does NOT match the module with no --path at all" '! _cmdline_is_project_bot "$f"'
 
+# --- channel: Matrix on the same --path is a different service ---------------
+mk_environ() { # <name> <KEY=val...>
+  local name="$1"; shift
+  local f="$TMP/environ.$name"
+  : > "$f"
+  local a
+  for a in "$@"; do printf '%s\0' "$a" >> "$f"; done
+  printf '%s' "$f"
+}
+# shellcheck disable=SC2034  # consumed via eval in ok()
+this_ch="$(_this_bridge_channel)"
+ok "unset CCC_CHANNEL is telegram" '[ "$this_ch" = telegram ]'
+# shellcheck disable=SC2034  # consumed via eval in ok()
+empty_env="$(mk_environ empty)"
+ok "empty environ file is telegram" '[ "$(_environ_bridge_channel "$empty_env")" = telegram ]'
+# shellcheck disable=SC2034  # consumed via eval in ok()
+matrix_env="$(mk_environ matrix CCC_CHANNEL=matrix HOME=/root)"
+ok "reads CCC_CHANNEL=matrix from environ" '[ "$(_environ_bridge_channel "$matrix_env")" = matrix ]'
+ok "telegram invocation does not match matrix environ" \
+  '! _environ_is_this_channel "$matrix_env"'
+# shellcheck disable=SC2034  # consumed via eval in ok()
+tele_env="$(mk_environ tele CCC_CHANNEL=telegram)"
+ok "explicit CCC_CHANNEL=telegram matches default invocation" \
+  '_environ_is_this_channel "$tele_env"'
+ok "matrix invocation matches matrix environ" \
+  '( CCC_CHANNEL=matrix; _environ_is_this_channel "$matrix_env" )'
+ok "matrix invocation does not match telegram environ" \
+  '( CCC_CHANNEL=matrix; ! _environ_is_this_channel "$tele_env" )'
+
 # --- metacharacter paths: matching is literal, never a pattern ---------------
 # pgrep gathers candidates by a metacharacter-free literal prefix precisely
 # because a raw root inside an ERE mis-judged these (#446); confirm the exact

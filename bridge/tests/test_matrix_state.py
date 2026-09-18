@@ -40,6 +40,7 @@ from telegram_bot.core.matrix.state import (
     parts,
     saved_policy,
     turn_id,
+    turn_timeout_minutes,
     upgrade_saved_policy,
     validate_config,
     wake_words,
@@ -702,6 +703,15 @@ def test_wake_words_answer_bare_nicknames() -> None:
     assert p.admit(ROOM, e, decrypted=True, now_ms=NOW) is not None
     with pytest.raises(ValueError):
         policy(wake_words={"Bad Word"})
+
+
+def test_turn_timeout_minutes_config_validation() -> None:
+    assert turn_timeout_minutes({}) == 20.0
+    assert turn_timeout_minutes({"turn_timeout_minutes": 360}) == 360.0
+    assert turn_timeout_minutes({"turn_timeout_minutes": 7.5}) == 7.5
+    for bad in (True, 4, 361, "x", None):
+        with pytest.raises(SafetyStop, match="invalid-turn-timeout"):
+            turn_timeout_minutes({"turn_timeout_minutes": bad})
 
 
 def test_wake_words_config_validation() -> None:

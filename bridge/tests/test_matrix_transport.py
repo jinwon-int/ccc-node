@@ -400,6 +400,18 @@ class TestConstruction:
         f = MatrixTransport(c, FakeRunner())
         f.store.close()
 
+    def test_turn_timeout_comes_from_config(self, tmp_path: Path) -> None:
+        f = MatrixTransport(config(tmp_path), FakeRunner())
+        assert f.turn_timeout == 1200.0  # historical default stays the default
+        f.store.close()
+        six_hours = MatrixTransport({**config(tmp_path), "turn_timeout_minutes": 360}, FakeRunner())
+        assert six_hours.turn_timeout == 21600.0
+        six_hours.store.close()
+        with pytest.raises(SafetyStop, match="invalid-turn-timeout"):
+            MatrixTransport({**config(tmp_path), "turn_timeout_minutes": 400}, FakeRunner())
+        f = MatrixTransport(config(tmp_path), FakeRunner())  # refusal happened before state opened
+        f.store.close()
+
     def test_family_config_is_rejected_before_state_opens(self, tmp_path: Path) -> None:
         base = family_config(tmp_path)
         with pytest.raises(SafetyStop, match="invalid-family-users"):
@@ -601,7 +613,7 @@ async def test_uncertain_result_and_turn_timeout_never_publish_the_answer(tmp_pa
         await f.input(request(f, "$slow"))
         await h.until(lambda: f.store.get_meta("last_turn")["outcome"] == "timeout")
         assert h.runner.interrupted == 1
-        await h.until(lambda: NOTICE_TIMEOUT in h.replies())
+        await h.until(lambda: NOTICE_TIMEOUT.format(minutes=round(f.turn_timeout / 60)) in h.replies())
         assert not f.store.uncertain()
         assert not any(r in ("late", "synthetic answer") for r in h.replies())
 
@@ -852,7 +864,10 @@ async def test_join_gives_up_on_a_runner_that_ignores_cancellation(tmp_path: Pat
             h.work()
             await h.until(lambda: f.store.get_meta("turn_join_timeout") is not None)
         assert f.store.get_meta("last_turn")["outcome"] == "timeout"
-        assert not f.store.uncertain() and NOTICE_TIMEOUT in h.replies()
+        assert (
+            not f.store.uncertain()
+            and NOTICE_TIMEOUT.format(minutes=round(f.turn_timeout / 60)) in h.replies()
+        )
 
 
 @pytest.mark.anyio
