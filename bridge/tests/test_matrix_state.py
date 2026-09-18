@@ -682,7 +682,14 @@ def test_wake_words_answer_bare_nicknames() -> None:
         ("서서, 그건 좀 아니지", True),
         ("야 서서!", True),
         ("서서", True),
+        ("서서야뭐해", True),  # no-space typing: wake word + particle + rest
+        ("서서는이제그만", True),
+        ("서서랑놀자", True),
+        ("서서님안녕", True),
+        ("서서를봐줘", True),
+        ("서서에게말해", True),
         ("오늘 서서히 풀리네", False),  # "서서" glued inside another word
+        ("서서울가자", False),  # 울 is not a particle
         ("우리서서 별로야", False),
         ("@서서야 안녕", True),  # a typed @handle still counts
     ]:
