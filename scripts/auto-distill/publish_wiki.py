@@ -55,9 +55,23 @@ TOKEN_RE = re.compile(
     r"|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}"
     r"|\bsk-[A-Za-z0-9_-]{32,}"
     r"|\bAKIA[0-9A-Z]{16}\b"
+    # 아래 10개는 auto-distill 의 _TOKEN_RE 에만 있고 여기엔 없어서 게이트가
+    # 놓치고 있었다. auto-distill.py:37 이 정렬을 약속하지만 코드로
+    # 강제된 적이 없어 벌어진 드리프트다. test_redact.py 가 이제 고정한다.
+    r"|\bAIza[0-9A-Za-z_-]{30,}"
     r"|\bxox[baprs]-[0-9A-Za-z-]{20,}"
+    r"|\b[0-9]{8,10}:[A-Za-z0-9_-]{30,}"
+    r"|tskey-[a-z]+-[A-Za-z0-9]{10,}"
+    r"|glpat-[A-Za-z0-9_-]{20,}"
+    r"|\bhf_[A-Za-z0-9]{30,}"
+    r"|\bnpm_[A-Za-z0-9]{36}\b"
+    r"|\bdop_v1_[a-f0-9]{64}\b"
+    r"|\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"
+    r"|AGE-SECRET-KEY-1[A-Z0-9]{20,}"
+    r"|hooks\.slack\.com/services/[A-Za-z0-9/_+-]{20,}"
     r"|\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\."
     r"|[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@"
+    r"|\b(?:apikey|api_key|token|secret|key)_[A-Za-z0-9]{32,}"
     r"|\b01[016789][-. ]?[0-9]{3,4}[-. ]?[0-9]{4}\b)"
 )
 ASSIGN_RE = re.compile(
