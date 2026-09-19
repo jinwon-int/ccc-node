@@ -4,6 +4,26 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **auto-distill: masker/gate secret-pattern parity, and two holes both copies
+  shared (#1840).** #1841 could only fix the publish gate — `auto-distill.py` is
+  pinned by its exact-source receipt. This adds the masker half: the
+  `<multi-word>_<32+>` prefixed shape (`apikey_…`, which `_ASSIGN_RE` missed
+  because it requires a `:`/`=` separator), a negative lookahead so
+  `1758240000:<sha40>` watermark prose is no longer masked as a Telegram bot
+  token (it was corrupting verbatim evidence quotes), and ASCII-only lookarounds
+  in place of every `\b` — `\b` is Unicode-aware, so a token glued to a Korean
+  particle (`AKIA…이다`, `키는ghp_…였다`) escaped both copies, which is the normal
+  case in a Korean corpus rather than the exotic one. Also `npm_{36}` → `{36,}`
+  (a 37-char token was missed outright) and `dop_v1_[a-f0-9]` →
+  `[A-Fa-f0-9]`. The two pattern copies are now byte-identical, so
+  `test_redact.py` pins them by parsing top-level alternatives and both declared
+  difference sets are empty.
+  Receipt re-issued as **TM-3447** (source `1086999d…`, surface `9894a32b…`
+  unchanged): TP 14 / FP 1 / FN 9 / TN 23, recheck 6/12 over baseline 1,
+  collateral 0 — **numerically identical to TM-3446**, confirming the change is
+  canon-dedup-neutral. Frozen `WIKI_AGENT_HOME` snapshot, crontab untouched;
+  corpus gate VALID (aggregate identical before/after).
+
 - **auto-distill: transport failures no longer spend the dead-letter budget
   (#1831).** Failures where the model was never reached (`model_unavailable:*`,
   limit/overload stderr on a non-zero exit, `model_spawn_error`) count against

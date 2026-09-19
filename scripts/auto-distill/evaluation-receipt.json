@@ -3,7 +3,7 @@
  "pipeline": 6,
  "subject": {
   "path": "scripts/auto-distill/auto-distill.py",
-  "sha256": "29c3c4c263f797b6cffaad45cceefa170e18c7941fefafd4c6105fb1bc279a31",
+  "sha256": "1086999d4ced5db6c4ae18fc8200b67ef1614f3e133232a39065cf895fe19f33",
   "surface_schema": "ccc.auto-distill.canon-surface.v1",
   "surface_sha256": "9894a32ba4d262512a8f44eb4f00a10486adcb7b01d7131816b646f85ebadc28",
   "surface_members": [
@@ -28,16 +28,16 @@
   ]
  },
  "evaluation": {
-  "id": "TM-3446",
-  "evaluated_source_sha256": "29c3c4c263f797b6cffaad45cceefa170e18c7941fefafd4c6105fb1bc279a31",
-  "completed_at": "2026-09-19T08:26:12Z",
+  "id": "TM-3447",
+  "evaluated_source_sha256": "1086999d4ced5db6c4ae18fc8200b67ef1614f3e133232a39065cf895fe19f33",
+  "completed_at": "2026-09-19T14:05:17Z",
   "provider": "claude-code-oauth",
   "model": "claude-haiku-4-5-20251001",
   "model_resolution": {
    "alias": "claude-haiku-4-5-20251001",
    "resolved_id": "claude-haiku-4-5-20251001",
    "resolved_by": "claude-json-modelUsage:envelopes (47/47 calls)",
-   "resolved_at": "2026-09-19T08:26:12Z"
+   "resolved_at": "2026-09-19T14:05:17Z"
   },
   "corpus": {
    "sample": "sample-v4.json",
@@ -49,13 +49,13 @@
    "cases": 47
   },
   "harness": {
-   "eval_canon_sha256": "66af41f639d891dfcc763502af99fa44e91f5c519aeb43a276a83c578abf0355",
+   "eval_canon_sha256": "f401aaa01360e0b727b86c2806e398158a6a86b2015a692cd06aea7e6ec1a69d",
    "recheck_addr_sha256": "698599263790d4826416b6a6474d2a572d6791178488773990ecc433d011df5e"
   },
   "artifacts": {
-   "eval_log_sha256": "44bdc1147408c05f41ffb118e7ccb7e920383f0e15d538390e7378f32271348c",
-   "eval_result_sha256": "6b974d1c1f7adf6f9b17b2af5d1bacc5fd86cb18bd614f5684312a517c8f3232",
-   "recheck_log_sha256": "7b9a4406938f29e177da9b479fdedead2b4c6aa7afe9c1eab72c19da034e551c"
+   "eval_log_sha256": "04eb98119bf92736b0da38340b6c24595a263687834368ca725d19deef1fc986",
+   "eval_result_sha256": "99a794f852dab0975f3b3bb8d1af0c110e8d7323a47488bbde28025409d891a5",
+   "recheck_log_sha256": "045da7284f4c761b50de76addb03c9c25f4e4d9c32c1094c0330f59a7b10e782"
   },
   "recheck": {
    "baseline_duplicates": 1,
@@ -72,5 +72,5 @@
   "collateral_damage": 0,
   "passed": true
  },
- "issued_at": "2026-09-19T19:12:35+09:00"
+ "issued_at": "2026-09-19T23:06:50+09:00"
 }
