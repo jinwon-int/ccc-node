@@ -939,6 +939,11 @@ ok "index summary reports body-free retention diagnostics" 'jq -e ".retention.gu
 CCC_STATE_DIR="$ret_state" CCC_MEMORY_CACHE_DIR="$ret_cache" CCC_MEMORY_DIR="$ret_mem" CCC_MEMORY_FACTS_FILE="$ret_facts" \
   CCC_MEMORY_RETENTION_POLICY="$TMP/does-not-exist.json" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
 ok "missing policy file fails open (guard kind still kept via defaults)" 'rq_has "qalpha"'
+# #1837: the fact-kind enum was unified to one 9-kind union across the four
+# extractor/parser declarations. The retention table must name every one of
+# them, or a legitimately-produced kind is reported as unknown_kinds forever.
+ok "retention policy table covers the unified 9-kind fact enum" \
+  'jq -e '\''[.kinds | keys[]] as $k | ["preference","decision","observation","context","constraint","task-progress","procedure","fact","correction"] | all(. as $need | $k | index($need) != null)'\'' >/dev/null "$ROOT/scripts/memory-retention-policy.json"'
 
 # #871 valid-time semantics: observed_at and valid_from/valid_until are
 # different axes. Boundary rule: valid_from inclusive, valid_until exclusive.

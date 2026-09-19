@@ -167,6 +167,21 @@ ok "valid JSON carries transcript_path for the G2 quote gate" \
 ok "transcript input is redacted before claude" '! grep -q "$fake_github_token\|Bearer abcdefghijklmnopqrstuvwxyz123456" "$TMP/input-valid.txt" && grep -q "REDACTED" "$TMP/input-valid.txt"'
 # #1264: the Claude-lane extraction prompt must require `because` on decisions
 ok "extract prompt requires because on decisions (G5 contract)" 'grep -q "because" "$TMP/input-valid.txt"'
+# #1837: the four kind enums (this prompt, the codex/piri feed prompts, and the
+# bridge HonchoFact Literal) drifted apart, so live facts landed outside the
+# prompt's own enum and nunchi flagged them for human review. The unified
+# 9-kind union is pinned here: dropping one kind from the prompt must fail.
+prompt_declares_kind() {
+  local kind="$1"
+  grep -q "\"$kind\"" "$TMP/input-valid.txt" && grep -q "^      $kind *= " "$TMP/input-valid.txt"
+}
+for expected_kind in preference decision observation context constraint \
+  task-progress procedure fact correction; do
+  ok "extract prompt declares kind=$expected_kind with a one-line meaning" \
+    "prompt_declares_kind $expected_kind"
+done
+ok "extract prompt keeps decision and task-progress distinguishable" \
+  'grep -q "task-progress = a progress or completion report on work; NOT a decision." "$TMP/input-valid.txt"'
 ok "hostile inherited allowlist cannot enable tools" \
   'argv_is_deny_all "$TMP/args-valid.txt" 1 && tool_env_is_unset "$TMP/tool-env-valid.txt" 1 && ! grep -q "<Bash>\\|<Edit>\\|<Write>" "$TMP/args-valid.txt"'
 

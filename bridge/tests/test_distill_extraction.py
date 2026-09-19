@@ -761,12 +761,26 @@ def test_distill_backend_protocol_is_provider_neutral_and_runtime_checkable() ->
 
 @pytest.mark.parametrize(
     "kind",
-    ["preference", "decision", "observation", "context", "task-progress", "procedure", "constraint"],
+    [
+        "preference",
+        "decision",
+        "observation",
+        "context",
+        "constraint",
+        "task-progress",
+        "procedure",
+        "fact",
+        "correction",
+    ],
 )
 def test_honcho_fact_kind_covers_retention_classes_and_schema_stays_in_sync(kind: str) -> None:
     # #871: the extraction contract must express the retention-relevant kinds
     # (task-progress ages fast; procedure/constraint must not), and the
     # checked-in JSON schema must accept exactly the same set as the parser.
+    # #1837: fact/correction were live in the stores but outside this enum, so
+    # the set below is the whole unified 9-kind union. Pinning it here is what
+    # makes a future narrowing of the Literal go RED instead of silently
+    # re-opening the drift.
     payload = valid_output()
     payload["honcho"][0]["kind"] = kind
     parsed = parse_extraction_output(json.dumps(payload), wiki_enabled=True)
