@@ -3226,16 +3226,17 @@ async def test_approval_stall_message_names_the_pending_claude_tool(
 async def test_skill_advice_reaches_common_provider_turn_only(
     tmp_path: Path, monkeypatch, provider: str, route: str, sensitive: str | None,
 ) -> None:
-    from telegram_bot.core import project_chat_process as process
     observed = []
     async def advise(message, **kwargs):
         observed.append((message, kwargs))
         return "advisory\n" + message
-    monkeypatch.setattr(process, "advise_turn", advise)
     session = FakeSession("advice-test")
     handler = ProjectChatHandler(settings=_settings(tmp_path, provider=provider),
                                  agent_runtime=FakeRuntime([session]), memory_route=route)
     handler._task_ledger_cache = False
+    # Collection-time SDK stubs can reload modules; patch the globals actually
+    # bound to this handler instead of a newer sys.modules generation.
+    monkeypatch.setitem(handler._process_agent_message.__func__.__globals__, "advise_turn", advise)
     response = await handler.process_message("Find public documentation", user_id=7, chat_id=7,
                                              sensitive_log_event=sensitive)
     assert response.success and session.messages == ["advisory\nFind public documentation"]
