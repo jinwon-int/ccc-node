@@ -247,7 +247,23 @@ class HonchoFact(_StrictModel):
     # #871: task-progress/procedure/constraint join the original four kinds so
     # distilled facts can carry the retention class the fact actually has
     # (task-progress ages fast; procedure/constraint must not).
-    kind: Literal["preference", "decision", "observation", "context", "task-progress", "procedure", "constraint"]
+    # #1837 follow-up: fact/correction join them too, unifying the four
+    # independently-drifted kind enums (this model, distill/extract.sh, and the
+    # codex/piri feed prompts) on one 9-kind union. It is a widening, so every
+    # already-stored fact stays valid and no migration is needed; the taxonomy
+    # meanings live in the extractor prompts (decision needs a why,
+    # task-progress is a report, correction fixes an earlier statement).
+    kind: Literal[
+        "preference",
+        "decision",
+        "observation",
+        "context",
+        "constraint",
+        "task-progress",
+        "procedure",
+        "fact",
+        "correction",
+    ]
     text: str = Field(min_length=1, max_length=4096)
     subject: Literal["user", "session", "node"]
     # #1264: a decision's reason. Required-but-nullable in the generated
