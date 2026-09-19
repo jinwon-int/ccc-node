@@ -530,6 +530,36 @@ terminate the broker task as failed without a preserved result
 (a2a-nexus#2016), so only approve verdicts reach the publisher until that gap
 closes.
 
+### Intake auto-drain (publisher opt-in)
+
+By default `collect` still only opens draft intake PRs and records A2A
+verdicts. Four owner-only `0600` flag files on the publisher, all default
+OFF, drain the backlog without changing nodes that have not opted in:
+
+```bash
+# After an A2A `approve` + verified receipt, open one draft approved/* PR
+# from current main (same as `ccc-skill-promotion.py promote`).
+printf 'true\n' > ~/.claude/state/skill-promotion.auto-promote
+# Mark-ready + squash-merge that PR when CI is green and the batch has no
+# fleet-identity hits. Identity-hit batches stay draft for a human.
+printf 'true\n' > ~/.claude/state/skill-promotion.auto-merge
+# Close an intake PR whose candidate tree is already under approved/
+# (hash equality only). Existing flag.
+printf 'true\n' > ~/.claude/state/skill-promotion.autoclose
+# Close an older OPEN intake PR when a newer tree for the same
+# (node, name, provider) lineage has been published. Never closes `reject`.
+printf 'true\n' > ~/.claude/state/skill-promotion.supersede-autoclose
+chmod 600 ~/.claude/state/skill-promotion.auto-promote \
+  ~/.claude/state/skill-promotion.auto-merge \
+  ~/.claude/state/skill-promotion.autoclose \
+  ~/.claude/state/skill-promotion.supersede-autoclose
+```
+
+Env equivalents: `CCC_SKILL_PROMOTION_AUTO_PROMOTE`,
+`CCC_SKILL_PROMOTION_AUTO_MERGE`, `CCC_SKILL_PROMOTION_AUTOCLOSE`,
+`CCC_SKILL_PROMOTION_SUPERSEDE_AUTOCLOSE`. A `reject` verdict remains an
+owner decision and is never auto-closed.
+
 ### Installing approved private skills
 
 Setup installs the consumer beside the autosave hooks, but does not run it.

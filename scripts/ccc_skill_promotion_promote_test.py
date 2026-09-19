@@ -165,6 +165,13 @@ class PromotableTests(unittest.TestCase):
         out = promotion._promotable(self.cfg(), rows, {})
         self.assertEqual({r["pr"] for r in out}, {"140", "99"})
 
+    def test_closed_intake_is_not_promotable(self) -> None:
+        rows = lineage("140", TREE_A) + [{
+            "kind": "a2a-intake-state", "pr": "140", "state": "CLOSED",
+            "ts": iso(days_ago=1),
+        }]
+        self.assertEqual(promotion._promotable(self.cfg(), rows, {}), [])
+
 
 class PromoteFlowTests(unittest.TestCase):
     def run_promote(self, rows, *, promoted=None, dry_run=False, limit=8):
@@ -189,6 +196,7 @@ class PromoteFlowTests(unittest.TestCase):
                           side_effect=lambda work, item, *, audience: (
                               work / "approved" / audience / item["name"],
                               "on gwakga")), \
+             patch.object(promotion, "_append_ledger", lambda *_a, **_k: None), \
              patch.object(promotion, "_run", side_effect=fake_run):
             out = promotion._promote(cfg, dry_run=dry_run, limit=limit)
         return out, calls

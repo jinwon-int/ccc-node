@@ -4,6 +4,19 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **skill-promotion: opt-in auto-drain of the intake backlog.** Three
+  publisher flags, all default OFF, so a node that has not opted in is
+  byte-identical to today. `skill-promotion.supersede-autoclose` (env
+  `CCC_SKILL_PROMOTION_SUPERSEDE_AUTOCLOSE`) closes an older OPEN intake PR
+  when a newer tree for the same `(node, name, provider)` lineage has been
+  published — the 19 duplicate-name pile-ups. `reject` latest-verdicts stay
+  open (policies/REVIEW.md). `skill-promotion.auto-promote` runs the existing
+  `promote` command from `collect` (draft `approved/*` PR, audience `shared`).
+  `skill-promotion.auto-merge` mark-readies and squash-merges that PR only
+  when the batch recorded no identity hits and CI is green; identity-hit
+  batches stay draft. Never `--admin`. The existing `autoclose` flag still
+  closes intake PRs only after the matching tree is on `approved/`.
+
 - **web-routing: from Claude-only MCP routing to a cross-harness skill
   (#1630 follow-up).** `skills/web-routing` pointed exclusively at the
   Firecrawl/SearXNG MCP tools (`mcp__firecrawl__*`, `mcp__searxng__*`), so on
