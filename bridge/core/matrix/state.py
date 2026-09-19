@@ -81,6 +81,13 @@ SAFETY_STOP_REASONS: frozenset[str] = frozenset(
         "invalid-family-device-pin",
         "invalid-family-notice-text",
         "invalid-mention-aliases",
+        "invalid-wake-words",
+        "invalid-turn-timeout",
+        "invalid-identities",
+        "owner-identity-changed",
+        "family-identity-changed",
+        "cross-signing-missing",
+        "cross-signing-invalid",
         "saved-policy-changed",
         # state
         "pilot-storage-limit",
@@ -111,7 +118,6 @@ SAFETY_STOP_REASONS: frozenset[str] = frozenset(
         "sdk-room-membership-changed",
         "timeline-gap-requires-backfill",
         "invalid-sync-response",
-        "undecrypted-event",
         "unverified-owner-event",
         "unverified-family-event",
         "plaintext-output-refused",
@@ -142,8 +148,34 @@ def HANDLE_RE(account: str) -> re.Pattern[str]:  # name kept from the pilot
     return handle_pattern(account[1:].split(":", 1)[0])
 
 
+# Korean particles (longest first) that may be glued to a wake word without a
+# space — "서서야뭐해" is 서서 + 야 + rest. A trailing character that is Hangul
+# but not one of these particles still blocks the match, so "서서히" stays inert.
+WAKE_JOSA = (
+    "에게서", "한테서", "부터", "까지", "에서", "에게", "한테", "이랑", "처럼", "만큼",
+    "보다", "조차", "라도", "으로", "님", "은", "는", "이", "가", "을",
+    "를", "와", "과", "도", "만", "랑", "에", "게", "로", "야", "아", "여",
+)
+
+
+def wake_word_pattern(word: str) -> re.Pattern[str]:
+    """Whole-token bare ``word`` (no leading @) in message text, case-insensitive.
+
+    Matches the word alone (followed by a space, punctuation, or end), or the
+    word glued to a Korean particle with the rest unconstrained — no-space
+    typing like "서서야뭐해" still addresses the bot.
+    """
+    josa = "|".join(WAKE_JOSA)
+    return re.compile(
+        r"(?<!\w)" + re.escape(word) + r"(?:(?![가-힣])|(?:" + josa + r"))",
+        re.IGNORECASE,
+    )
+
+
 ALIAS_PATTERN = re.compile(r"[a-z0-9._=-]{1,64}")
 MAX_MENTION_ALIASES = 8
+WAKE_WORD_PATTERN = re.compile(r"[0-9A-Za-z가-힣]{1,64}")
+MAX_WAKE_WORDS = 8
 
 
 def mention_aliases(config: Mapping[str, Any]) -> frozenset[str]:
@@ -162,6 +194,43 @@ def mention_aliases(config: Mapping[str, Any]) -> frozenset[str]:
     ):
         raise SafetyStop("invalid-mention-aliases")
     return frozenset(raw)
+
+
+def wake_words(config: Mapping[str, Any]) -> frozenset[str]:
+    """Optional ``wake_words``: bare nickname tokens (e.g. 서서, 서서야) that address the bot.
+
+    Like ``mention_aliases`` this only widens the family-room *mention* gate;
+    sender and room admission are unchanged. Wake words match as whole tokens
+    **without** a leading ``@`` — Korean nicknames have no romanized handle,
+    so this is how a family calls the bot by name (owner request 2026-09-18).
+    """
+    raw = config.get("wake_words", [])
+    if (
+        not isinstance(raw, list)
+        or len(raw) > MAX_WAKE_WORDS
+        or any(not isinstance(w, str) or not WAKE_WORD_PATTERN.fullmatch(w) for w in raw)
+        or len(set(raw)) != len(raw)
+    ):
+        raise SafetyStop("invalid-wake-words")
+    return frozenset(raw)
+
+
+def turn_timeout_minutes(config: Mapping[str, Any]) -> float:
+    """Optional ``turn_timeout_minutes``: per-turn ceiling in minutes.
+
+    Defaults to 360 (6 h) — fleet default since 2026-09-18; long agent work
+    is normal in family rooms and the ceiling only exists to bound a truly
+    runaway turn. 5..360; a timed-out turn still resolves uncertain exactly
+    as before — only the ceiling moves.
+    """
+    raw = config.get("turn_timeout_minutes", 360)
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, (int, float))
+        or not 5 <= raw <= 360
+    ):
+        raise SafetyStop("invalid-turn-timeout")
+    return float(raw)
 
 
 def identifier(value: Any, prefix: str) -> bool:
@@ -204,13 +273,15 @@ class Policy:
     bots: frozenset[str]
     rooms: Mapping[str, str]
     not_before_ms: int
-    aliases: frozenset[str] = frozenset()  # extra typed handles that address the bot
+    aliases: frozenset[str] = frozenset()  # extra typed @handles that address the bot
+    wake_words: frozenset[str] = frozenset()  # extra bare nickname tokens that address the bot
 
     def __post_init__(self) -> None:
         users = frozenset(self.users)
         bots = frozenset(self.bots)
         rooms = dict(self.rooms)
         aliases = frozenset(self.aliases)
+        wake = frozenset(self.wake_words)
         invalid = (
             not identifier(self.account, "@")
             or not users
@@ -225,6 +296,7 @@ class Policy:
             or type(self.not_before_ms) is not int
             or self.not_before_ms < 0
             or any(not isinstance(a, str) or not ALIAS_PATTERN.fullmatch(a) for a in aliases)
+            or any(not isinstance(w, str) or not WAKE_WORD_PATTERN.fullmatch(w) for w in wake)
         )
         if invalid:
             raise ValueError("invalid route policy")
@@ -232,6 +304,7 @@ class Policy:
         object.__setattr__(self, "bots", bots)
         object.__setattr__(self, "rooms", MappingProxyType(rooms))
         object.__setattr__(self, "aliases", aliases)
+        object.__setattr__(self, "wake_words", wake)
 
     def admit(self, room_id: str, event: Any, *, decrypted: bool, now_ms: int) -> Request | None:
         """Reject plaintext, edits, bots, old events and unaddressed group messages."""
@@ -279,7 +352,9 @@ class Policy:
                 return True
         if HANDLE_RE(self.account).search(body):
             return True
-        return any(handle_pattern(alias).search(body) for alias in self.aliases)
+        if any(handle_pattern(alias).search(body) for alias in self.aliases):
+            return True
+        return any(wake_word_pattern(word).search(body) for word in self.wake_words)
 
 
 # --------------------------------------------------------------------------- #
@@ -292,7 +367,11 @@ def private_directory(path: Path | str) -> int:
     path = Path(path)
     if not path.is_absolute() or ".." in path.parts:
         raise ValueError("state directory must be an absolute path without traversal")
-    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    # Android permits traversal of / and /data but denies directory reads.
+    # Pin ancestors without reading them; the leaf must remain readable for
+    # crypto-store enumeration. O_DIRECTORY | O_NOFOLLOW still rejects links.
+    ancestor_access = getattr(os, "O_PATH", os.O_RDONLY)
+    fd = os.open("/", (ancestor_access if len(path.parts) > 1 else os.O_RDONLY) | os.O_DIRECTORY)
     try:
         for i, part in enumerate(path.parts[1:]):
             if i == len(path.parts) - 2:
@@ -300,7 +379,8 @@ def private_directory(path: Path | str) -> int:
                     os.mkdir(part, 0o700, dir_fd=fd)
                 except FileExistsError:
                     pass
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            access = os.O_RDONLY if i == len(path.parts) - 2 else ancestor_access
+            next_fd = os.open(part, access | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = next_fd
         st = os.fstat(fd)
@@ -391,6 +471,34 @@ def _valid_homeserver(config: Mapping[str, Any]) -> bool:
     )
 
 
+def identities(config: Mapping[str, Any]) -> dict[str, str]:
+    """Optional ``identities``: ``{user_id: {"master": <ed25519 master key>}}`` (#149).
+
+    A user listed here is trusted by **cross-signing** instead of a pinned
+    device set: the master key is the only pinned value, and every device the
+    user's self-signing key has signed is trusted automatically. Logging in,
+    logging out or deleting a device therefore never stops the service; only
+    a changed master key (account reset) does. Users without an identity keep
+    the pinned-device rule.
+    """
+    raw = config.get("identities", {})
+    if not isinstance(raw, dict) or len(raw) > 13:
+        raise SafetyStop("invalid-identities")
+    allowed = {config.get("owner")} | set(config.get("family_users") or [])
+    cleaned: dict[str, str] = {}
+    for user, entry in raw.items():
+        if (
+            not isinstance(user, str)
+            or user not in allowed
+            or not isinstance(entry, dict)
+            or not isinstance(entry.get("master"), str)
+            or not KEY_PATTERN.fullmatch(entry["master"])
+        ):
+            raise SafetyStop("invalid-identities")
+        cleaned[user] = entry["master"]
+    return cleaned
+
+
 def _validate_device_pins(pins: Any, *, missing: str, bad_device: str, bad_key: str) -> None:
     if not isinstance(pins, dict) or not 1 <= len(pins) <= 10:
         raise SafetyStop(missing)
@@ -434,12 +542,14 @@ def validate_config(c: Any) -> dict[str, Any]:
         {r: "direct" for r in c["rooms"]},
         c["not_before_ms"],
     )
-    _validate_device_pins(
-        c["devices"],
-        missing="pin-owner-devices",
-        bad_device="invalid-device-pin",
-        bad_key="invalid-key-pin",
-    )
+    owner_identity = c["owner"] in identities(c)
+    if not (owner_identity and c["devices"] == {}):
+        _validate_device_pins(
+            c["devices"],
+            missing="pin-owner-devices",
+            bad_device="invalid-device-pin",
+            bad_key="invalid-key-pin",
+        )
     return c
 
 
@@ -502,6 +612,7 @@ def saved_policy(config: Mapping[str, Any]) -> dict[str, Any]:
     policy["family_rooms"] = sorted(family_rooms)
     policy["family_users"] = sorted(family_users)
     policy["family_devices"] = family_devices
+    policy["identities"] = identities(config)
     return policy
 
 
@@ -516,6 +627,7 @@ def upgrade_saved_policy(old: Mapping[str, Any]) -> dict[str, Any]:
     upgraded.setdefault("family_rooms", [])
     upgraded.setdefault("family_users", [])
     upgraded.setdefault("family_devices", {})
+    upgraded.setdefault("identities", {})
     return upgraded
 
 
@@ -688,6 +800,19 @@ class Store:
                 )
             if next_token is not None:
                 self.db.execute("INSERT OR REPLACE INTO meta VALUES ('sync_token',?)", (next_token,))
+
+    def job_exists(self, event_id: str) -> bool:
+        return self.db.execute("SELECT 1 FROM jobs WHERE event_id=?", (event_id,)).fetchone() is not None
+
+    def pending_before(self, event_id: str) -> int:
+        """Real (non-notice) undelivered jobs of the same scope queued earlier."""
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM jobs q WHERE q.scope=(SELECT scope FROM jobs WHERE event_id=?) "
+            "AND q.state!='done' AND q.seq<(SELECT seq FROM jobs WHERE event_id=?) "
+            "AND q.event_id NOT LIKE '$notice-%'",
+            (event_id, event_id),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def claim(self) -> dict[str, Any] | None:
         with self.db:

@@ -10,10 +10,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import time
 import types
 from types import SimpleNamespace
 from typing import Any
 
+import anyio
 import pytest
 
 from telegram_bot.contracts.agent_runtime import ModelInfo
@@ -201,6 +203,7 @@ class FakeSink:
     def __init__(self, approve: Any = True) -> None:
         self.typing_calls = 0
         self.interims: list[str] = []
+        self.statuses: list[str | None] = []
         self.approvals: list[tuple[str, Any]] = []
         self.approve = approve
 
@@ -209,6 +212,9 @@ class FakeSink:
 
     async def interim(self, text: str) -> None:
         self.interims.append(text)
+
+    async def status(self, text: str | None) -> None:
+        self.statuses.append(text)
 
     async def approval(self, description: str, arguments: Any) -> bool:
         self.approvals.append((description, arguments))
@@ -225,6 +231,7 @@ class FakeTransport:
         self.fail_run = fail_run
         self.events: list[str] = []
         self.notices: list[tuple[str, str]] = []
+        self.notice_keys: list[str | None] = []
         self.kinds: dict[str, str] = {DM_ROOM: "direct", FAMILY_ROOM: "family"}
 
     async def open(self, initialize: bool = False) -> None:
@@ -240,8 +247,9 @@ class FakeTransport:
     async def close(self) -> None:
         self.events.append("close")
 
-    def enqueue_notice(self, room_id: str, text: str) -> None:
+    def enqueue_notice(self, room_id: str, text: str, *, key: str | None = None) -> None:
         self.notices.append((room_id, text))
+        self.notice_keys.append(key)
 
     def room_kind(self, room_id: str) -> str:
         return self.kinds.get(room_id, "family")
@@ -598,7 +606,8 @@ async def test_typing_status_and_interim_adapters(tmp_path: Path, matrix_config:
     assert sink.typing_calls == 1
     assert isinstance(seen["h1"], int) and seen["h1"] == seen["h2"] == seen["h1b"]
     assert seen["deleted"] is None
-    assert sink.interims == ["⏳ Working", "first part"]
+    assert sink.statuses == ["⏳ Working", None]  # same-window texts swallowed; None redacts
+    assert sink.interims == ["first part"]
 
 
 @pytest.mark.anyio
@@ -618,7 +627,7 @@ async def test_status_callback_forwards_new_text_after_interval(
 
     chat.on_process = drive
     await bot.run_turn(_job("go"), sink=sink, session_id=None, room_kind="direct")
-    assert sink.interims == ["⏳ Working", "🔧 Running tests"]
+    assert sink.statuses == ["⏳ Working", "🔧 Running tests"]
 
 
 @pytest.mark.anyio
@@ -626,7 +635,7 @@ async def test_status_callback_is_fail_open(tmp_path: Path, matrix_config: dict[
     bot, chat, _manager = _bot(tmp_path)
 
     class BrokenSink(FakeSink):
-        async def interim(self, text: str) -> None:
+        async def status(self, text: str | None) -> None:
             raise RuntimeError("room gone")
 
     seen: dict[str, Any] = {}
@@ -927,3 +936,177 @@ async def test_startup_banner_is_posted_to_direct_rooms_only(
     # Missing codex config just drops the model/effort parts.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nowhere"))
     assert bot.startup_banner().endswith(" · codex · abc1234")
+
+
+@pytest.mark.anyio
+async def test_initialize_flag_opens_the_store_once_and_does_not_serve(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, _chat, _manager = _bot(tmp_path, matrix_initialize=True, matrix_startup_banner=True)
+    opened: list[bool] = []
+
+    class InitTransport(FakeTransport):
+        async def open(self, initialize: bool = False) -> None:
+            opened.append(initialize)
+            self.events.append("open")
+
+    transports: list[FakeTransport] = []
+
+    def factory(config: Any, runner: Any) -> FakeTransport:
+        transport = InitTransport(config, runner, fail_run=True)  # run() must never be reached
+        transports.append(transport)
+        return transport
+
+    bot._transport_factory = factory
+    await bot.serve()
+    transport = transports[0]
+    assert opened == [True]
+    assert transport.events == ["open", "close"], "initialize exits before run() and posts no banner"
+    assert transport.notices == []
+
+
+@pytest.mark.anyio
+async def test_startup_banner_key_is_stable_across_restarts(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash-looping unit must not queue one banner per restart: same key within the hour."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nowhere"))
+    bot, _chat, _manager = _bot(tmp_path, matrix_startup_banner=True)
+    monkeypatch.setattr(type(bot), "_bridge_revision", staticmethod(lambda: "abc1234"))
+    keys: list[str | None] = []
+    for _ in range(2):
+        holder = await _attach(bot)
+
+        async def body(transport: FakeTransport) -> None:
+            return None
+
+        holder["body"] = body
+        await bot.serve()
+        keys.extend(holder["transport"].notice_keys)
+    assert len(keys) == 2 and keys[0] == keys[1] and keys[0].startswith("startup-")
+
+
+# --- turn-age watchdog wiring (#1825) ----------------------------------------
+
+
+@pytest.mark.anyio
+async def test_turn_age_watchdog_notifies_the_room_through_the_matrix_sender(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale Matrix turn produces an age notice (#1825).
+
+    Telegram gets this from BotLifecycleMixin, which MatrixBot does not inherit,
+    so before this wiring a Matrix turn that went quiet emitted no signal at all.
+    """
+
+    monkeypatch.setenv("CCC_TURN_AGE_NOTIFY_MIN", "30")
+    bot, chat, _manager = _bot(tmp_path)
+    holder = await _attach(bot)
+    user = bot.ids.user_id(OWNER)
+    # One turn, registered 45 monotonic minutes ago. The stamp is frozen here
+    # rather than recomputed per call: the watchdog reads its clock *before*
+    # the provider, so a live `time.monotonic()` inside the lambda would make
+    # the turn look a second younger than intended and round down to 44.
+    started = time.monotonic() - 45 * 60.0
+    chat._agent_session_registry = SimpleNamespace(
+        active_turn_ages=lambda: (((user, user), started),)
+    )
+
+    async def body(transport: FakeTransport) -> None:
+        # One real turn first: that is what registers the chat_id -> room
+        # mapping the notice path resolves against.
+        await bot.run_turn(_job("hi"), sink=FakeSink(), session_id=None, room_kind="direct")
+        watchdog = bot._build_turn_age_watchdog()
+        assert watchdog is not None
+        await watchdog._tick()
+
+    holder["body"] = body
+    await bot.serve()
+    assert len(holder["transport"].notices) == 1
+    room, text = holder["transport"].notices[0]
+    assert room == DM_ROOM
+    assert "45 min" in text
+
+
+@pytest.mark.anyio
+async def test_turn_age_watchdog_is_disabled_by_zero_and_without_a_registry(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bot, chat, _manager = _bot(tmp_path)
+    chat._agent_session_registry = SimpleNamespace(active_turn_ages=tuple)
+
+    monkeypatch.setenv("CCC_TURN_AGE_NOTIFY_MIN", "0")
+    assert bot._build_turn_age_watchdog() is None
+
+    monkeypatch.setenv("CCC_TURN_AGE_NOTIFY_MIN", "30")
+    assert bot._build_turn_age_watchdog() is not None
+    # A handler without the registry seam must degrade, not crash the frontend.
+    del chat._agent_session_registry
+    assert bot._build_turn_age_watchdog() is None
+
+
+@pytest.mark.anyio
+async def test_serve_actually_launches_the_turn_age_watchdog(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """serve() must run the watchdog, not merely be able to build one (#1825).
+
+    Driving ``_tick()`` by hand proves the builder and the delivery seam but
+    still passes if serve() never launches the leg — this test fails when the
+    ``group.create_task(watchdog.run(...))`` wiring is removed.
+    """
+
+    monkeypatch.setenv("CCC_TURN_AGE_NOTIFY_MIN", "30")
+    bot, chat, _manager = _bot(tmp_path)
+    holder = await _attach(bot)
+    user = bot.ids.user_id(OWNER)
+    started = time.monotonic() - 45 * 60.0
+    chat._agent_session_registry = SimpleNamespace(
+        active_turn_ages=lambda: (((user, user), started),)
+    )
+
+    build = bot._build_turn_age_watchdog
+
+    def fast_watchdog() -> Any:
+        watchdog = build()
+        if watchdog is not None:
+            watchdog._tick_seconds = 0.01  # keep the test off the 60s cadence
+        return watchdog
+
+    bot._build_turn_age_watchdog = fast_watchdog  # type: ignore[method-assign]
+
+    async def body(transport: FakeTransport) -> None:
+        # Registers the chat_id -> room mapping; until it exists the notice
+        # cannot be delivered and the watchdog keeps retrying.
+        await bot.run_turn(_job("hi"), sink=FakeSink(), session_id=None, room_kind="direct")
+        with anyio.fail_after(5):
+            while not transport.notices:
+                await anyio.sleep(0.01)
+
+    holder["body"] = body
+    await bot.serve()
+    assert holder["transport"].notices
+    assert "Turn has been active" in holder["transport"].notices[0][1]
+
+
+@pytest.mark.anyio
+async def test_serve_stops_the_watchdog_when_the_transport_returns(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """serve() must terminate even though the watchdog loops forever (#1825).
+
+    A TaskGroup only cancels siblings when a leg *raises*, so a transport that
+    returns cleanly would hang the group on the watchdog without the stop event.
+    """
+
+    monkeypatch.setenv("CCC_TURN_AGE_NOTIFY_MIN", "30")
+    bot, chat, _manager = _bot(tmp_path)
+    holder = await _attach(bot)
+    chat._agent_session_registry = SimpleNamespace(active_turn_ages=tuple)
+
+    async def body(transport: FakeTransport) -> None:
+        return  # transport.run() returns normally
+
+    holder["body"] = body
+    with anyio.fail_after(5):
+        await bot.serve()

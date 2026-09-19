@@ -1,0 +1,4 @@
+interface:
+  display_name: "TypeSafe AI"
+  short_description: "System One typed judgments (Jev) as code primitives"
+  default_prompt: "Use $typesafe-ai to design typed System One (Jev) judgments for this feature and read the live TypeSafe docs for the matching API contract."

@@ -13,6 +13,15 @@
 #
 # The unit reuses the Telegram bridge's project .env (<project>/.telegram_bot/.env)
 # for provider/memory keys; only the channel keys and the data directory differ.
+# If the Telegram unit carries provider/memory settings as Environment= lines
+# (CCC_AGENT_PROVIDER, CCC_PIRI_*, CCC_BRIDGE_MEMORY_*, usage limits ...), mirror
+# them into a drop-in so both frontends run the same agent, e.g.
+#   mkdir -p /etc/systemd/system/ccc-matrix-bridge.service.d
+#   { echo '[Service]'; systemctl cat ccc-telegram-bridge | grep '^Environment=' \
+#       | grep -vE '^Environment=(HOME|PATH|BOT_DATA_DIR|CCC_CHANNEL|CCC_MATRIX_)'; } \
+#     > /etc/systemd/system/ccc-matrix-bridge.service.d/provider.conf
+# (jingun 2026-09-18: without it the Matrix frontend started with the default
+# provider while Telegram ran Piri.)
 [Unit]
 Description=ccc-node Matrix frontend (family messenger, CCC_CHANNEL=matrix)
 After=network-online.target

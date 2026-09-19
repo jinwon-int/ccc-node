@@ -125,7 +125,7 @@ Schema:
   "wiki_candidates": [
     {
       "title": "<short Korean title>",
-      "suggested_path": "<e.g. pages/team/dungae/DECISIONS.md or pages/nodes/dungae/RUNBOOK.md or pages/log.md>",
+      "suggested_path": "<the area the knowledge belongs to: pages/runbooks/<topic>.md, pages/decisions/<topic>.md, pages/incidents/<topic>.md, pages/services/<topic>.md, pages/owners/<name>.md, pages/team/<name>/<topic>.md, pages/nodes/<name>/<topic>.md, or pages/log.md>",
       "summary": "<2-4 sentence Korean summary of the durable operational fact / decision / runbook step>",
       "evidence_excerpt": "<<= 200 chars verbatim Korean quote from the transcript>"
     }
@@ -136,7 +136,7 @@ Schema:
     "awaiting_user": false,
     "open_question": "<unanswered user-facing question / approval request, or empty string>",
     "next_step": "<one safest next step, or empty string>",
-    "evidence": ["<PR/issue/commit/run id if present>"]
+    "evidence": ["<linkable ids ONLY — \"issue #123\", \"pr #45\", \"commit 61768fc\", \"run 987\", a bare 7-64 hex sha, or \"#123\". A description like \"10 unit tests\" is not an id; use [] when none are named>"]
   }
 }
 

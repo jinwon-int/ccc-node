@@ -478,6 +478,39 @@ class RuntimeCliDistillBackend:
         self._temp_root = Path(temp_root) if temp_root is not None else None
         self._schema_path = Path(schema_path)
 
+    @property
+    def effective_model(self) -> str:
+        """The model selector the extraction process actually receives.
+
+        ``provider-default`` is a sentinel, not a model: it means "pass no
+        ``--model`` and let the runtime decide". Recording that sentinel in the
+        accounting receipt leaves a reader unable to tell which model ran --
+        measured on yukson, where the bridge's distill lane inherited
+        ``ANTHROPIC_MODEL=claude-opus-5`` from its systemd unit and every
+        journal entry still read ``provider-default``. Reconstructing it meant
+        reading the unit file and the live process argv.
+
+        For the Claude lane the governing value is `ANTHROPIC_MODEL` in the
+        environment handed to the child, so report that instead of the
+        sentinel. This is the selector the process was given, NOT a
+        provider-confirmed identity -- the runtime's own config could still
+        override it, so treat it as "what we asked for".
+
+        The Piri lane keeps the sentinel on purpose: its model is pinned by the
+        per-node launcher's own arguments, which the bridge never sees (the
+        same reason `CCC_USAGE_PIRI_SERVICE` has to be stated by the operator).
+        Guessing there would be worse than saying "unspecified".
+        """
+
+        if self._model != _PROVIDER_DEFAULT_MODEL:
+            return self._model
+        if self.provider != "claude":
+            return self._model
+        inherited = str(self._environment.get("ANTHROPIC_MODEL") or "").strip()
+        if not inherited or _MODEL_RE.fullmatch(inherited) is None:
+            return self._model
+        return inherited
+
     async def extract(self, extraction_input: DistillExtractionInput) -> DistillExtractionOutput:
         if not isinstance(extraction_input, DistillExtractionInput):
             raise RuntimeDistillBackendError("distill_input_invalid")

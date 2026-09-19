@@ -238,3 +238,47 @@ def test_chunk_unclosed_fence_is_closed_at_the_end() -> None:
     chunks = chunk_text("```\n" + "\n".join(["z" * 30] * 6), limit=100)
     assert all(_fences(c) == 2 for c in chunks)
     assert chunks[-1].endswith("\n```")
+
+
+# --- chunk_text byte budgeting (#1828) ------------------------------------------
+
+
+def _b(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def test_chunk_limit_counts_utf8_bytes_not_characters() -> None:
+    # 12,000 Korean characters are 36,000 bytes. Budgeting in characters used to
+    # emit this as ONE event, overrunning the homeserver's 65,536-byte PDU limit
+    # once body + formatted_body were both attached.
+    text = "가" * 12_000
+    chunks = chunk_text(text)
+    assert len(chunks) > 1
+    assert all(_b(c) <= 12_000 for c in chunks)
+    # ASCII is unaffected: one byte per character, so the old bound still holds.
+    assert chunk_text("a" * 12_000) == ["a" * 12_000]
+
+
+def test_chunk_byte_limit_is_respected_for_mixed_width_text() -> None:
+    text = "\n\n".join(["한국어 문단입니다. " * 30, "ascii paragraph " * 40] * 12)
+    chunks = chunk_text(text, limit=2_000)
+    assert all(_b(c) <= 2_000 for c in chunks)
+
+
+def test_chunk_hard_cut_never_splits_a_multibyte_character() -> None:
+    for char in ("가", "漢", "🙂", "é"):
+        chunks = chunk_text(char * 4_001, limit=64)
+        assert all(_b(c) <= 64 for c in chunks)
+        # A split code point would decode to U+FFFD (or fail outright).
+        assert all("�" not in c for c in chunks)
+        # Nothing is dropped and nothing is duplicated.
+        assert "".join(chunks) == char * 4_001
+
+
+def test_chunk_multibyte_fence_body_stays_balanced_within_byte_limit() -> None:
+    # The fence opener is always ASCII (_FENCE_OPEN_RE only accepts ASCII
+    # language tags), but the fenced body is not: the close-fence reserve has to
+    # be measured against a byte budget or a Korean code block overruns it.
+    chunks = chunk_text("```python\n" + "# 한글 주석 라인\n" * 200 + "```", limit=200)
+    assert all(_b(c) <= 200 for c in chunks)
+    assert all(_fences(c) == 2 for c in chunks)

@@ -79,6 +79,17 @@
       "tree_sha256": "d646913cd5a5d019ee8e6f342702fbd29e59dca54d72cf20dff3459ff49fec6f"
     },
     {
+      "audience": "codex",
+      "classification": null,
+      "description": "Build AI-powered software with TypeSafe: small units of AI intelligence you can use like programming primitives. Its System One models, including Jev, turn natural language and application state into typed judgments and probabilities that code can combine. Use when a feature needs programmable common sense, when brainstorming what AI could make possible in an app, or when an LLM prompt-and-parse step could become a structured decision. Applications include routing, ranking, extraction, verification, and interactive experiences; these are starting points, not the limits. Read live docs and cookbooks to find useful patterns and discover new combinations.",
+      "files": 3,
+      "managed": true,
+      "name": "typesafe-ai",
+      "source": "codex/skills/typesafe-ai",
+      "status": "active",
+      "tree_sha256": "fc459b52c43f204101ce413fe594010ed9071bccd3baf5993d9a12529f4dcd12"
+    },
+    {
       "audience": "piri",
       "classification": null,
       "description": "Search the public web through Firecrawl Search (default) or explicit fleet SearXNG, fetch/read known public URLs through Firecrawl scrape, and search Firecrawl Developer Index for public documentation, README, issue, and merged-PR evidence. Use for current external facts and developer research. NOT for Family Wiki content or private/internal URLs.",
@@ -87,7 +98,7 @@
       "name": "web",
       "source": "piri/skills/web",
       "status": "active",
-      "tree_sha256": "6892e4b51dcd0f1bea35403ef84d3bc0ede01215e5a7ae44f44a7ccb102f1817"
+      "tree_sha256": "d740bf8fccd3957e75707ffa5c1a4928ac23d9a748a00500237d25a19fb2123d"
     },
     {
       "audience": "claude",

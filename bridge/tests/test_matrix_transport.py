@@ -24,8 +24,13 @@ import pytest
 from telegram_bot.core.matrix import transport as t
 from telegram_bot.core.matrix.state import MatrixStore, SafetyStop, turn_id
 from telegram_bot.core.matrix.transport import (
+    NOTICE_CANCELLED,
+    NOTICE_RESTARTED,
+    NOTICE_TIMEOUT,
+    NOTICE_TURN_ERROR,
+    NOTICE_UNDECRYPTABLE,
+    NOTICE_UNTRUSTED_DEVICE,
     FAMILY_NOTICE,
-    NOTICE_ACKED,
     NOTICE_CONTROL_FORWARDED,
     NOTICE_INVALID_CONTROL,
     NOTICE_QUEUE_FULL,
@@ -395,6 +400,18 @@ class TestConstruction:
         f = MatrixTransport(c, FakeRunner())
         f.store.close()
 
+    def test_turn_timeout_comes_from_config(self, tmp_path: Path) -> None:
+        f = MatrixTransport(config(tmp_path), FakeRunner())
+        assert f.turn_timeout == 21600.0  # fleet default: 6 h
+        f.store.close()
+        six_hours = MatrixTransport({**config(tmp_path), "turn_timeout_minutes": 360}, FakeRunner())
+        assert six_hours.turn_timeout == 21600.0
+        six_hours.store.close()
+        with pytest.raises(SafetyStop, match="invalid-turn-timeout"):
+            MatrixTransport({**config(tmp_path), "turn_timeout_minutes": 400}, FakeRunner())
+        f = MatrixTransport(config(tmp_path), FakeRunner())  # refusal happened before state opened
+        f.store.close()
+
     def test_family_config_is_rejected_before_state_opens(self, tmp_path: Path) -> None:
         base = family_config(tmp_path)
         with pytest.raises(SafetyStop, match="invalid-family-users"):
@@ -523,7 +540,7 @@ async def test_oversized_or_flooded_approvals_are_refused_without_prompt(tmp_pat
 
 
 @pytest.mark.anyio
-async def test_cancel_uncertainty_requires_explicit_same_scope_ack(tmp_path: Path) -> None:
+async def test_cancel_ends_with_a_notice_and_work_continues_without_ack(tmp_path: Path) -> None:
     async with running(tmp_path, "cancel") as h:
         f = h.f
         await f.input(request(f))
@@ -531,23 +548,21 @@ async def test_cancel_uncertainty_requires_explicit_same_scope_ack(tmp_path: Pat
         await h.until(lambda: bool(f.approvals))
         tid = turn_id("$request")
         await f.input(request(f, "$cancel", "/cancel " + tid))
-        await h.until(lambda: bool(f.store.uncertain()))
+        await h.until(lambda: f.store.get_meta("last_turn") is not None and f.store.get_meta("last_turn")["outcome"] == "cancelled")
         assert h.runner.cancels == ["$request"]
         assert f.store.session(request(f).scope) is None
-        assert f.store.get_meta("last_turn")["outcome"] == "cancelled"
-        await h.until(lambda: any("/ack " + tid in r for r in h.replies()))
+        assert not f.store.uncertain(), "a user cancel is closed immediately, no /ack gate"
         assert not work.done()  # a user cancel never stops the service
-        assert f.store.claim() is None
-        await f.input(request(f, "$ack", "/ack " + tid))
-        assert not f.store.uncertain()
-        assert NOTICE_ACKED in h.replies()
-        assert f.store.claim() is None
-        # Work resumes after the acknowledgement (once the scope's replies are out).
+        assert NOTICE_CANCELLED in h.drain()
+        assert not any("/ack" in r for r in h.replies())
+        # The next message in the same scope is served right away.
         h.runner.mode = "complete"
-        h.drain()
         await f.input(request(f, "$next"))
         await h.until(lambda: f.store.session(request(f).scope) == "synthetic-session")
         assert [c["event_id"] for c in h.runner.calls] == ["$request", "$next"]
+        # /ack is still accepted as a courtesy no-op.
+        await f.input(request(f, "$ack", "/ack " + tid))
+        assert not f.store.uncertain()
 
 
 @pytest.mark.anyio
@@ -559,48 +574,47 @@ async def test_cancel_still_cancels_when_runner_cancel_raises(tmp_path: Path) ->
         await h.until(lambda: bool(f.approvals))
         tid = turn_id("$request")
         await f.input(request(f, "$cancel", "/cancel " + tid))
-        await h.until(lambda: bool(f.store.uncertain()))
+        await h.until(lambda: f.store.get_meta("last_turn") is not None and f.store.get_meta("last_turn")["outcome"] == "cancelled")
         assert h.runner.cancels == ["$request"]
         assert NOTICE_CONTROL_FORWARDED in h.replies()
+        assert not f.store.uncertain() and NOTICE_CANCELLED in h.replies()
 
 
 @pytest.mark.anyio
-async def test_runner_failure_leaves_uncertain_and_pauses_all_work_until_ack(tmp_path: Path) -> None:
+async def test_runner_failure_posts_an_error_notice_and_the_next_job_runs(tmp_path: Path) -> None:
     async with running(tmp_path, "raise") as h:
         f = h.f
         await f.input(request(f))
         await f.input(request(f, "$second"))
         work = h.work()
-        await h.until(lambda: bool(f.store.uncertain()))
-        await asyncio.sleep(0.3)
-        assert not work.done()
-        assert [c["event_id"] for c in h.runner.calls] == ["$request"]  # nothing else claimed
-        assert f.store.get_meta("last_turn")["outcome"] == "error:RuntimeError"
+        await h.until(lambda: f.store.get_meta("last_turn") is not None and f.store.get_meta("last_turn")["outcome"] == "error:RuntimeError")
         assert "synthetic failure" not in json.dumps(f.store.get_meta("last_turn"))
+        assert not f.store.uncertain()
+        assert not work.done()
         h.runner.mode = "complete"
-        await f.input(request(f, "$ack", "/ack " + turn_id("$request")))
+        # The error notice must be delivered before the scope continues (outbox ordering).
         await asyncio.sleep(0.3)
-        assert len(h.runner.calls) == 1  # the acknowledged reply must be delivered before the scope continues
-        h.drain()
+        assert len(h.runner.calls) == 1
+        assert NOTICE_TURN_ERROR in h.drain()
         await h.until(lambda: len(h.runner.calls) == 2)
         assert h.runner.calls[1]["event_id"] == "$second"
 
 
 @pytest.mark.anyio
-async def test_uncertain_result_and_turn_timeout_never_publish(tmp_path: Path) -> None:
+async def test_uncertain_result_and_turn_timeout_never_publish_the_answer(tmp_path: Path) -> None:
     async with running(tmp_path, "uncertain", turn_timeout=0.1) as h:
         f = h.f
         await f.input(request(f))
         h.work()
-        await h.until(lambda: bool(f.store.uncertain()))
-        assert f.store.get_meta("last_turn")["outcome"] == "uncertain"
-        await f.input(request(f, "$ack", "/ack " + turn_id("$request")))
-        h.drain()
+        await h.until(lambda: f.store.get_meta("last_turn") is not None and f.store.get_meta("last_turn")["outcome"] == "uncertain")
+        assert not f.store.uncertain()
+        assert NOTICE_TURN_ERROR in h.drain()
         h.runner.mode = "slow"
         await f.input(request(f, "$slow"))
         await h.until(lambda: f.store.get_meta("last_turn")["outcome"] == "timeout")
         assert h.runner.interrupted == 1
-        assert [j["event_id"] for j in f.store.uncertain()] == ["$slow"]
+        await h.until(lambda: NOTICE_TIMEOUT.format(minutes=t._timeout_label(f.turn_timeout)) in h.replies())
+        assert not f.store.uncertain()
         assert not any(r in ("late", "synthetic answer") for r in h.replies())
 
 
@@ -637,9 +651,9 @@ async def test_stop_alias_cancels_the_senders_running_turn(tmp_path: Path) -> No
         work = h.work()
         await h.until(lambda: bool(f.approvals))
         await f.input(request(f, "$stop", "/stop"))
-        await h.until(lambda: bool(f.store.uncertain()))
+        await h.until(lambda: f.store.get_meta("last_turn") is not None and f.store.get_meta("last_turn")["outcome"] == "cancelled")
         assert h.runner.cancels == ["$request"]
-        assert f.store.get_meta("last_turn")["outcome"] == "cancelled"
+        assert not f.store.uncertain() and NOTICE_CANCELLED in h.replies()
         assert not work.done()
         # A stranger's room/scope cannot stop someone else's turn.
         h.runner.mode = "slow"
@@ -656,6 +670,35 @@ def test_message_content_adds_formatted_body_only_for_markup() -> None:
     assert "<strong>done</strong>" in rich["formatted_body"] and "<code>ls -la</code>" in rich["formatted_body"]
     assert "<script>" not in rich["formatted_body"]
     assert rich["body"].startswith("**done**")
+
+
+@pytest.mark.anyio
+async def test_second_message_while_busy_gets_a_queue_position_notice(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        req = request(f)
+        await f.input(req)
+        assert h.replies() == [], "first message has nothing to queue behind"
+
+        second = request(f, event="$second", body="두 번째 질문")
+        await f.input(second)
+        queued = [r for r in h.replies() if "대기 순번" in r]
+        assert queued == ["⏳ 이 메시지는 대기 순번 2번에 저장되었으며 도착 순서대로 처리됩니다."]
+        # A sync replay of the same event must not re-notice.
+        await f.input(second)
+        assert [r for r in h.replies() if "대기 순번" in r] == queued
+
+        # Same scope is strictly FIFO: $second runs only after $request's
+        # answer has been delivered. Interleave work and delivery like the
+        # real send loop would.
+        h.work()
+        await h.until(lambda: f.store.db.execute("SELECT state FROM jobs WHERE event_id='$request'").fetchone()[0] == "ready")
+        h.drain()
+        await h.until(lambda: f.store.db.execute("SELECT state FROM jobs WHERE event_id='$second'").fetchone()[0] == "ready")
+        h.drain()
+        third = request(f, event="$third", body="세 번째 질문")
+        await f.input(third)
+        assert [r for r in h.replies() if "대기 순번" in r] == []
 
 
 @pytest.mark.anyio
@@ -706,6 +749,58 @@ async def test_sink_typing_is_best_effort_and_interim_is_durable(tmp_path: Path)
 
 
 @pytest.mark.anyio
+async def test_status_bubble_edits_in_place_and_redacts(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        client_mock(f)
+        f.client.olm.outbound_group_sessions = {room: types.SimpleNamespace(users_shared_with={(f.c["owner"], "OWNER")})}
+        sends: list[str] = []
+        redacts: list[str] = []
+        calls: list[tuple[str, str]] = []
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            calls.append((method, path))
+            if "/send/m.room.encrypted/" in path:
+                sends.append(path.rsplit("/", 1)[1])
+                return {"event_id": f"$bubble{len(sends) - 1}"}
+            assert "/redact/" in path
+            redacts.append(path)
+            return {}
+
+        f.raw = raw
+        job = {"event_id": "$request", "room_id": room, "sender": f.c["owner"], "body": "x", "scope": "scope"}
+        sink = t._RoomSink(f, job)
+        f.active = job
+        from telegram_bot.core.matrix.transport import message_content
+
+        await sink.status("⏳ Working — 1s")
+        assert f.last_room_event[room] == "$bubble0"  # our own send counts as the newest event
+        await sink.status("⏳ Working — 1m 23s")
+        assert len(sends) == 2 and not redacts, "still newest: edit in place, no redact"
+        first, edit = f.client.encrypt.call_args_list[0].args[2], f.client.encrypt.call_args_list[1].args[2]
+        assert first == message_content("⏳ Working — 1s")
+        assert edit["m.relates_to"] == {"rel_type": "m.replace", "event_id": "$bubble0"}
+        assert edit["m.new_content"]["body"] == "⏳ Working — 1m 23s"
+        # A family member speaks after the bubble: it is buried now.
+        f.last_room_event[room] = "$family-msg"
+        await sink.status("⏳ Working — 2m")
+        assert len(sends) == 3 and len(redacts) == 1, "buried bubble: redact + repost at the bottom"
+        assert sink._bubble == "$bubble2"
+        # The reposted bubble is newest again: back to edit-in-place.
+        await sink.status("⏳ Working — 3m")
+        assert len(sends) == 4 and len(redacts) == 1
+        repost_edit = f.client.encrypt.call_args_list[-1].args[2]
+        assert repost_edit["m.relates_to"] == {"rel_type": "m.replace", "event_id": "$bubble2"}
+        await sink.status(None)  # turn answered: the bubble is redacted
+        assert len(redacts) == 2 and "/redact/" in calls[-1][1] and len(sends) == 4
+        # An inactive turn stays inert.
+        f.active = None
+        await sink.status("⏳ inert")
+        assert len(sends) == 4 and len(redacts) == 2
+
+
+@pytest.mark.anyio
 async def test_turn_carries_admitted_context_and_replays_execute_once(tmp_path: Path) -> None:
     async with running(tmp_path) as h:
         f = h.f
@@ -736,8 +831,21 @@ async def test_service_stop_during_turn_propagates_and_marks_uncertain(tmp_path:
         await asyncio.gather(work, return_exceptions=True)
         assert work.cancelled()
         assert h.runner.interrupted == 1
-        assert f.store.uncertain()
+        assert f.store.uncertain(), "a service stop leaves the turn for the next process"
         assert f.active is None and f.turn_task is None
+        # The next process closes it with the restart notice and serves new work at once.
+        await f.close()
+        f2 = MatrixTransport(config(tmp_path), FakeRunner("complete"))
+        try:
+            task = asyncio.create_task(f2.work())
+            async with asyncio.timeout(5):
+                while NOTICE_RESTARTED not in [j["reply"] for j in f2.store.outbox()]:
+                    await asyncio.sleep(0.01)
+            assert not f2.store.uncertain()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        finally:
+            await f2.close()
 
 
 @pytest.mark.anyio
@@ -766,7 +874,10 @@ async def test_join_gives_up_on_a_runner_that_ignores_cancellation(tmp_path: Pat
             h.work()
             await h.until(lambda: f.store.get_meta("turn_join_timeout") is not None)
         assert f.store.get_meta("last_turn")["outcome"] == "timeout"
-        assert f.store.uncertain()
+        assert (
+            not f.store.uncertain()
+            and NOTICE_TIMEOUT.format(minutes=t._timeout_label(f.turn_timeout)) in h.replies()
+        )
 
 
 @pytest.mark.anyio
@@ -1343,10 +1454,19 @@ async def test_initial_snapshot_sync_is_not_a_timeline_gap(tmp_path: Path) -> No
         assert f.client.next_batch is None
         job = f.store.claim()
         assert job is not None and (job["event_id"], job["room_id"]) == ("$family", FAMILY)
-        f.store.stage_sync({**limited, "next_batch": "s2"})
+        # limited=true with a short batch is Tuwunel noise (display-name change,
+        # 2026-09-18): every event since the token is present, so carry on.
+        soft = {"next_batch": "s1b", "rooms": {"join": {FAMILY: {"timeline": {"events": [{}], "limited": True}}}}}
+        f.store.stage_sync(soft)
+        await f.process_pending()
+        assert f.store.token() == "s1b"
+        assert f.store.get_meta("sync_limited_soft")["events"] == 1
+        # A batch filled to the requested limit is a real gap: fail closed.
+        gap = {"next_batch": "s2", "rooms": {"join": {FAMILY: {"timeline": {"events": [{}] * 100, "limited": True}}}}}
+        f.store.stage_sync(gap)
         with pytest.raises(SafetyStop, match="timeline-gap-requires-backfill"):
             await f.process_pending()  # incremental sync with a gap
-        assert f.store.token() == "s1"  # gap is never committed
+        assert f.store.token() == "s1b"  # gap is never committed
         f.store.set_meta("pending_sync", {"next_batch": "s2", "rooms": {"join": {FAMILY: {"timeline": {"events": [], "limited": False}}}}})
         setattr(h.nio, "SyncResponse", type("ErrorResponse", (), {"from_dict": classmethod(lambda cls, raw: cls())}))
         with pytest.raises(SafetyStop, match="invalid-sync-response"):
@@ -1377,10 +1497,18 @@ async def test_family_admission_pinned_verified_mentioned_humans_only(tmp_path: 
             f.admit_event(FAMILY, event(key="z" * 43))
         with pytest.raises(SafetyStop, match="unverified-family-event"):
             f.admit_event(FAMILY, event(sender=MOM))  # allowlisted but without any pinned device
+        # An undecryptable event never stops the service: it is recorded, a key
+        # request is queued and the room is told once (jingun 2026-09-18).
         megolm = h.nio.MegolmEvent()
-        megolm.sender, megolm.server_timestamp = DAD, h.now
-        with pytest.raises(SafetyStop, match="undecrypted-event"):
-            f.admit_event(FAMILY, megolm)
+        megolm.sender, megolm.server_timestamp, megolm.event_id = DAD, h.now, "$undecryptable"
+        assert f.admit_event(FAMILY, megolm) is None
+        assert f.admit_event(FAMILY, megolm) is None  # duplicate: still one record, one notice
+        assert [e["event_id"] for e in f.store.get_meta("undecryptable_events")] == ["$undecryptable"]
+        assert f.key_requests == [megolm, megolm]
+        assert sum(NOTICE_UNDECRYPTABLE == r for r in h.replies()) == 1
+        f.client = types.SimpleNamespace(request_room_key=AsyncMock(side_effect=[None, RuntimeError("no session")]), close=AsyncMock())
+        await f._request_room_keys()
+        assert f.client.request_room_key.await_count == 2 and f.key_requests == []
         assert f.admit_event(FAMILY, types.SimpleNamespace(sender=DAD, server_timestamp=h.now)) is None  # not text
         undecrypted = event()
         undecrypted.decrypted = False
@@ -1399,3 +1527,119 @@ async def test_family_admission_pinned_verified_mentioned_humans_only(tmp_path: 
         assert f.expected_recipients(direct) == {(h.owner, "OWNER")}
         f.room_members[FAMILY] = h.healthy_members()
         assert f.expected_recipients(FAMILY) == {(h.owner, "OWNER"), (DAD, "DAD1")}
+
+
+def _cross_signing_raw(account: str, owner: str, master: str, ssk: str, devices: dict[str, tuple[str, str, bool]]) -> dict[str, Any]:
+    """keys/query payload: devices -> (ed25519, curve25519, signed_by_ssk)."""
+    bot_keys = {"keys": {"ed25519:BOT": "agent-ed", "curve25519:BOT": "agent-cu"}}
+    device_keys = {
+        d: {"keys": {"ed25519:" + d: ed, "curve25519:" + d: cu},
+            "signatures": {owner: {"ed25519:" + ssk: "sig-ok" if signed else "sig-bad"}}}
+        for d, (ed, cu, signed) in devices.items()
+    }
+    return {
+        "device_keys": {account: {"BOT": bot_keys}, owner: device_keys},
+        "master_keys": {owner: {"keys": {"ed25519:" + master: master}}},
+        "self_signing_keys": {owner: {"keys": {"ed25519:" + ssk: ssk}, "signatures": {owner: {"ed25519:" + master: "sig-ok"}}}},
+    }
+
+
+@pytest.fixture(autouse=True)
+def _drop_fake_nio_module() -> Any:
+    had = sys.modules.get("nio")
+    yield
+    if had is None:
+        sys.modules.pop("nio", None)
+    else:
+        sys.modules["nio"] = had
+
+
+def _fake_verify_json(json: Any, user_key: str, user_id: str, device_id: str) -> bool:
+    return (json.get("signatures") or {}).get(user_id, {}).get("ed25519:" + device_id) == "sig-ok"
+
+
+@pytest.mark.anyio
+async def test_cross_signed_identity_trusts_signed_devices_without_pins(tmp_path: Path) -> None:
+    master, ssk = "M" * 43, "S" * 43
+    base = config(tmp_path)
+    cfg = {**base, "devices": {}, "identities": {base["owner"]: {"master": master}}}
+    async with running(tmp_path, cfg=cfg) as h:
+        f = h.f
+        owner = f.c["owner"]
+        assert f.pins == {} and f.trusted == {}
+        sys.modules["nio"] = fake_nio()
+        identity = {"ed25519": "agent-ed", "curve25519": "agent-cu"}
+        store = {"NEW": pinned_device("a", "b"), "OLD": pinned_device("c", "d")}
+        client_mock(f, devices={owner: store}, identity=identity)
+
+        class NioLikeDeviceStore:
+            """nio.crypto.DeviceStore: __getitem__(user) -> dict, __iter__ over devices (never user ids)."""
+
+            def __init__(self, users: dict[str, dict[str, Any]]) -> None:
+                self._users = users
+
+            def __getitem__(self, user: str) -> dict[str, Any]:
+                return self._users.setdefault(user, {})
+
+            def __iter__(self) -> Any:
+                return iter(d for devices in self._users.values() for d in devices.values())
+
+        f.client.device_store = NioLikeDeviceStore({owner: dict(store)})
+        f.client.olm.verify_json = Mock(side_effect=_fake_verify_json)
+        raw = _cross_signing_raw(f.c["account"], owner, master, ssk, {"NEW": ("a" * 43, "b" * 43, True), "OLD": ("c" * 43, "d" * 43, False)})
+        f.raw = AsyncMock(return_value=raw)
+        await f.pin_devices()
+        assert f.trusted[owner] == {"NEW": "b" * 43}
+        assert [c.args[0] for c in f.client.verify_device.call_args_list] == [store["NEW"]]
+        assert [c.args[0] for c in f.client.blacklist_device.call_args_list] == [store["OLD"]]
+        assert f.store.get_meta("trusted_devices")[owner]["devices"] == ["NEW"]
+        # A login/logout only changes the trusted set; it never stops the service.
+        raw2 = _cross_signing_raw(f.c["account"], owner, master, ssk, {"NEW": ("a" * 43, "b" * 43, True), "N2": ("e" * 43, "f" * 43, True)})
+        client_mock(f, devices={owner: {"NEW": store["NEW"], "N2": pinned_device("e", "f")}}, identity=identity)
+        f.client.olm.verify_json = Mock(side_effect=_fake_verify_json)
+        f.raw = AsyncMock(return_value=raw2)
+        await f.pin_devices()
+        assert set(f.trusted[owner]) == {"NEW", "N2"}
+        assert f.expected_recipients(f.c["rooms"][0]) == {(owner, "NEW"), (owner, "N2")}
+        # The published ed25519 must match the stored device key even when signed.
+        raw3 = _cross_signing_raw(f.c["account"], owner, master, ssk, {"NEW": ("x" * 43, "b" * 43, True)})
+        client_mock(f, devices={owner: {"NEW": store["NEW"]}}, identity=identity)
+        f.client.olm.verify_json = Mock(side_effect=_fake_verify_json)
+        f.raw = AsyncMock(return_value=raw3)
+        await f.pin_devices()
+        assert f.trusted[owner] == {}
+        # Only an identity change (account reset) or a broken chain stops the service.
+        for payload, reason in (
+            ({**raw, "master_keys": {owner: {"keys": {"ed25519:" + "Z" * 43: "Z" * 43}}}}, "owner-identity-changed"),
+            ({**raw, "master_keys": {}}, "cross-signing-missing"),
+            ({**raw, "self_signing_keys": {owner: {"keys": {"ed25519:" + ssk: ssk}, "signatures": {owner: {"ed25519:" + master: "sig-bad"}}}}}, "cross-signing-invalid"),
+        ):
+            f.raw = AsyncMock(return_value=payload)
+            with pytest.raises(SafetyStop, match=reason):
+                await f.pin_devices()
+
+
+@pytest.mark.anyio
+async def test_cross_signed_mode_ignores_untrusted_sender_devices_with_one_notice(tmp_path: Path) -> None:
+    master = "M" * 43
+    base = config(tmp_path)
+    cfg = {**base, "devices": {}, "identities": {base["owner"]: {"master": master}}}
+    nio = fake_nio()
+    async with running(tmp_path, cfg=cfg) as h:
+        f = h.f
+        owner, room = f.c["owner"], f.c["rooms"][0]
+        sys.modules["nio"] = nio
+        f.trusted[owner] = {"NEW": "b" * 43}
+        f.c["not_before_ms"] = h_now = int(time.time() * 1000) - 1000
+
+        def message(event_id: str, key: str, verified: bool = True) -> Any:
+            source = {"type": "m.room.message", "event_id": event_id, "sender": owner, "origin_server_ts": h_now + 500,
+                      "content": {"msgtype": "m.text", "body": "hi"}}
+            return nio.RoomMessageText(sender=owner, source=source, verified=verified, sender_key=key, ts=h_now + 500)
+
+        assert f.admit_event(room, message("$ok", "b" * 43)) is not None
+        assert f.admit_event(room, message("$bad1", "d" * 43)) is None
+        assert f.admit_event(room, message("$bad2", "d" * 43)) is None  # same device: no second notice
+        assert f.admit_event(room, message("$bad3", "b" * 43, verified=False)) is None
+        assert sum(NOTICE_UNTRUSTED_DEVICE == r for r in h.replies()) == 2  # one per untrusted device key
+        assert set(f.store.get_meta("untrusted_senders")) == {f"{owner}:{'d' * 43}", f"{owner}:{'b' * 43}"}

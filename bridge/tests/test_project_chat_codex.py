@@ -3217,3 +3217,27 @@ async def test_approval_stall_message_names_the_pending_claude_tool(
     assert "(pending: Bash command)" in response.content
     assert "shadow" not in response.content
     assert stalled == [1]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("provider", ["codex", "claude", "piri", "danso"])
+@pytest.mark.parametrize("route", ["telegram", "matrix"])
+@pytest.mark.parametrize("sensitive", [None, "inbound_document"])
+async def test_skill_advice_reaches_common_provider_turn_only(
+    tmp_path: Path, monkeypatch, provider: str, route: str, sensitive: str | None,
+) -> None:
+    observed = []
+    async def advise(message, **kwargs):
+        observed.append((message, kwargs))
+        return "advisory\n" + message
+    session = FakeSession("advice-test")
+    handler = ProjectChatHandler(settings=_settings(tmp_path, provider=provider),
+                                 agent_runtime=FakeRuntime([session]), memory_route=route)
+    handler._task_ledger_cache = False
+    # Collection-time SDK stubs can reload modules; patch the globals actually
+    # bound to this handler instead of a newer sys.modules generation.
+    monkeypatch.setitem(handler._process_agent_message.__func__.__globals__, "advise_turn", advise)
+    response = await handler.process_message("Find public documentation", user_id=7, chat_id=7,
+                                             sensitive_log_event=sensitive)
+    assert response.success and session.messages == ["advisory\nFind public documentation"]
+    assert len(observed) == 1 and observed[0][1]["interactive"] is (sensitive is None)

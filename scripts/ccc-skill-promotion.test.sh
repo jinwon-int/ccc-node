@@ -1325,6 +1325,40 @@ regular = {
 got = m._revise_dispatch_target(regular)
 assert got == ("testnode", "r2-skill", tree, "1", "claude", head, regular["pr_url"]), got
 
+# #1628: the row's own lineage keys beat a re-parse of the transport id.
+# Real ledger row, PR #78: "-claude-" occurs twice, so the split stops at the
+# first marker and returns "bash-provider-capability-gate-claude" while the
+# row says "bash-provider-capability-gate". A deferral written from the parse
+# keys a lineage no other row shares, and the round limit, already-dispatched
+# check and B2 prior-substitute guard all search under a name with no history.
+doubled = {
+    "transport_id": "gwakga-claude-bash-provider-capability-gate-claude-b2fac765d7c9",
+    "head_sha": head, "pr_url": "https://github.com/test/repo/pull/78",
+    "provider": "claude", "node": "gwakga", "name": "bash-provider-capability-gate",
+}
+got = m._revise_dispatch_target(doubled)
+assert got == ("gwakga", "bash-provider-capability-gate", "b2fac765d7c9", "78",
+               "claude", head, doubled["pr_url"]), got
+assert m._split_transport_id(doubled["transport_id"], "claude")[1] \
+    == "bash-provider-capability-gate-claude", "fixture no longer reproduces the split"
+
+# Pre-R2 rows carry no node/name, so the parse stays the fallback (6 of 316
+# dispatch rows on the live publisher ledger).
+assert m._revise_dispatch_target(regular) \
+    == ("testnode", "r2-skill", tree, "1", "claude", head, regular["pr_url"])
+
+# A blank or non-string field is not an answer; fall back rather than key a
+# lineage on "".
+for empty in ("", None, 0, []):
+    partial = dict(regular, node=empty, name=empty)
+    assert m._revise_dispatch_target(partial) \
+        == ("testnode", "r2-skill", tree, "1", "claude", head, regular["pr_url"]), empty
+
+# The canon-lane guard reads the resolved node, so it still fires when the
+# fields — not the transport id — are what name the repo.
+canon_by_field = dict(regular, node="ccc-node", name="r2-skill")
+assert m._revise_dispatch_target(canon_by_field) == "revise_canon_lane", canon_by_field
+
 # Genuinely unknown providers stay revise_record_invalid.
 bad = {
     "transport_id": "testnode-bogus-skill-0123456789ab",

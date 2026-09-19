@@ -13,10 +13,15 @@ Turn outcomes:
 * ``TurnResult(status="complete")`` — :meth:`MatrixStore.finish` records the
   reply (an empty reply completes the job without an outbox delivery).
 * anything else — a ``TurnResult(status="uncertain")``, a runner exception,
-  the 20-minute turn timeout, or a ``/cancel`` — leaves the job *uncertain*.
-  Uncertain work is never re-run; the room receives an ``/ack <turn id>``
-  notice and the work loop waits for that acknowledgement (or an operator
-  :meth:`MatrixStore.unblock`) before claiming anything else.
+  the configured turn timeout, or a ``/cancel`` — ends the job with a short
+  notice ("중단했습니다 / 시간 제한 / 오류 … 다시 보내 주세요") and the loop
+  keeps serving, exactly like the Telegram bridge. Nothing is re-run.
+* a turn interrupted by a service stop/restart is left *uncertain* by the
+  dying process and resolved on the next start with a "재시작으로 끊겼습니다,
+  다시 보내 주세요" notice (Telegram's RESTART_INTERRUPT_NOTICE) — no
+  ``/ack`` gate any more (owner 2026-09-18: the pilot's acknowledgement step
+  was unusable in practice). ``/ack`` stays accepted as a no-op courtesy and
+  :meth:`MatrixStore.unblock` remains for operators.
 
 ``nio`` and ``aiohttp`` are imported lazily inside the methods that use them.
 """
@@ -24,6 +29,7 @@ Turn outcomes:
 from __future__ import annotations
 
 import asyncio
+import copy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -45,35 +51,62 @@ from telegram_bot.core.matrix.state import (
     SafetyStop,
     bounded_text,
     family_config,
+    identities,
     mention_aliases,
     private_directory,
     saved_policy,
+    scope_of,
     turn_id,
+    turn_timeout_minutes,
     upgrade_saved_policy,
+    wake_words,
 )
 
 FAMILY_NOTICE = "이 AI는 이 방을 읽을 수 있으며 답변에 필요한 내용이 제공업체에 전달될 수 있습니다."
 NOTICE_QUEUE_FULL = "대기 중인 요청이 많습니다. 잠시 후 다시 요청해 주세요."
+NOTICE_QUEUED = "⏳ 이 메시지는 대기 순번 {position}번에 저장되었으며 도착 순서대로 처리됩니다."
 NOTICE_ACKED = "이전 작업의 결과 확인을 완료한 것으로 기록했습니다. 자동 재실행은 하지 않습니다."
 NOTICE_CONTROL_FORWARDED = "요청을 전달했습니다. 실제 처리 결과는 이어지는 안내를 확인해 주세요."
 NOTICE_INVALID_CONTROL = "현재 이 대화방에서 처리할 수 있는 제어 요청이 아닙니다. 작업 번호와 승인 번호를 확인해 주세요."
 NOTICE_UNCERTAIN = (
     "작업이 중단되어 결과 확인이 필요합니다. 자동으로 다시 실행하지 않습니다.\n"
     "결과를 확인한 뒤 다음 명령으로 대기를 해제할 수 있습니다:\n/ack "
-)
+)  # legacy text kept for the operator unblock audit; no longer posted to rooms
+NOTICE_RESTARTED = "⏳ 답변 중에 서비스가 재시작되어 마지막 답변이 끊겼습니다. 메시지를 다시 보내 주세요."
+NOTICE_CANCELLED = "⏹ 요청대로 작업을 중단했습니다."
+NOTICE_TIMEOUT = "⏳ 시간 제한({minutes}분)을 넘겨 작업을 중단했습니다. 요청을 나눠서 다시 보내 주세요."
+
+
+def _timeout_label(turn_timeout: float) -> str:
+    """Render the ceiling for the interrupted-turn notice (6시간, not 360분)."""
+    minutes = round(turn_timeout / 60)
+    if minutes >= 60 and minutes % 60 == 0:
+        return f"{minutes // 60}시간"
+    return f"{minutes}분"
+NOTICE_TURN_ERROR = "❌ 처리 중 오류가 나서 답변을 만들지 못했습니다. 잠시 후 다시 보내 주세요."
 # The pilot posted "작업을 시작했습니다. 취소 명령: /cancel <turn>" at every turn
 # start because it had no typing indicator. This frontend shows typing plus
 # throttled progress notices and accepts a bare "/stop", so the notice was
 # dropped (owner request 2026-09-18). "/cancel <turn id>" still works; the
 # turn id is visible in the uncertain/ack notice when it matters.
 
+NOTICE_UNDECRYPTABLE = (
+    "이 메시지의 암호 키를 받지 못해 읽을 수 없었습니다. 다시 보내 주세요. "
+    "(봇 기기가 만들어지기 전에 보낸 메시지는 복구할 수 없습니다.)"
+)
+
+NOTICE_UNTRUSTED_DEVICE = (
+    "검증되지 않은 기기에서 보낸 메시지는 처리하지 않습니다. "
+    "그 기기에서 기기 검증(이모지 비교)을 마친 뒤 다시 보내 주세요."
+)
+
 NONCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,64}")
-TURN_TIMEOUT_S = 1200.0
 APPROVAL_TIMEOUT_S = 120.0
 TURN_JOIN_TIMEOUT_S = 30.0
 MAX_APPROVAL_TEXT_BYTES = 12_000
 MAX_PENDING_APPROVALS = 16
 MEGOLM = "m.megolm.v1.aes-sha2"
+SYNC_TIMELINE_LIMIT = 100  # /sync filter timeline.limit; a batch this full is a real gap
 CONTROL_PREFIXES = ("/approve", "/deny", "/cancel", "/ack", "/stop")
 # TurnResult.status values that end a job with its text delivered. "error" is
 # what MatrixBot reports for a ChatResponse(success=False): the text is the
@@ -116,6 +149,10 @@ class TurnSink(Protocol):
         """Durable progress notice, delivered by the outbox like any reply."""
         ...
 
+    async def status(self, text: str | None) -> None:
+        """Progress bubble: created once per turn, edited in place, redacted when done."""
+        ...
+
     async def approval(self, description: str, arguments: Any) -> bool:
         """Ask the room; True only when ``/approve <turn> <nonce>`` arrives in time."""
         ...
@@ -154,6 +191,8 @@ class _RoomSink:
         self.job = job
         self.request = transport.as_request(job)
         self.tid = turn_id(job["event_id"])
+        self._bubble: str | None = None  # this turn's progress message event id
+        self._bubble_tail: str | None = None  # latest event representing the bubble (bubble or its last edit)
 
     def _active(self) -> bool:
         return self.transport.active is self.job
@@ -176,6 +215,56 @@ class _RoomSink:
         if not self._active() or not isinstance(text, str) or not text.strip():
             return
         self.transport.store.notice(self.request, unique_key("interim"), text)
+
+    async def status(self, text: str | None) -> None:
+        """One progress bubble per turn: created, then refreshed at the room's bottom.
+
+        Telegram edits its status bubble; Matrix edits too (m.replace), but an
+        edit keeps the original timeline position — once any other event lands
+        after the bubble it would stay buried. So: while the bubble is still
+        the newest event in the room, refresh via edit; when it has been
+        buried, redact and repost at the bottom (owner request 2026-09-18).
+        ``None`` redacts the bubble when the answer replaces it. Cosmetic
+        only: like typing, this is a direct send outside the durable outbox,
+        so a crash may leave a stale bubble behind.
+        """
+        if not self._active():
+            return
+        transport = self.transport
+        room = self.request.room_id
+        if text is None:
+            bubble, self._bubble = self._bubble, None
+            self._bubble_tail = None
+            if bubble is None:
+                return
+            try:
+                await transport.redact(room, bubble, "status-" + self.tid)
+            except Exception:
+                pass  # cosmetic cleanup; the answer itself went through the outbox
+            return
+        if not isinstance(text, str) or not text.strip():
+            return
+        bounded_text(text, MAX_REPLY_BYTES)
+        async with transport.matrix_lock:
+            txn = hashlib.sha256(("status-" + self.tid + ":" + str(time.time_ns())).encode()).hexdigest()
+            latest = transport.last_room_event.get(room)
+            if self._bubble is None:
+                self._bubble = await transport.encrypted_send(room, text, txn)
+                self._bubble_tail = self._bubble
+                transport.last_room_event[room] = self._bubble
+            elif latest in (self._bubble, self._bubble_tail):
+                # Still the newest event: an edit is enough (no new event id churn).
+                self._bubble_tail = await transport.encrypted_edit(room, text, self._bubble, txn)
+                transport.last_room_event[room] = self._bubble_tail
+            else:
+                # Buried by later events: redact and repost at the bottom.
+                try:
+                    await transport.redact(room, self._bubble, "status-" + self.tid + "-move")
+                except Exception:
+                    pass  # the repost below still lands; a redact failure is cosmetic
+                self._bubble = await transport.encrypted_send(room, text, txn)
+                self._bubble_tail = self._bubble
+                transport.last_room_event[room] = self._bubble
 
     async def approval(self, description: str, arguments: Any) -> bool:
         transport = self.transport
@@ -215,15 +304,29 @@ class MatrixTransport:
         runner: TurnRunner,
         *,
         approval_timeout: float = APPROVAL_TIMEOUT_S,
-        turn_timeout: float = TURN_TIMEOUT_S,
+        turn_timeout: float | None = None,
     ) -> None:
         self.c = config
         self.runner = runner
         self.approval_timeout = approval_timeout
-        self.turn_timeout = turn_timeout
+        # Config ceiling (default 20 min, up to 6 h); explicit tests still win.
+        self.turn_timeout = (
+            turn_timeout if turn_timeout is not None else turn_timeout_minutes(config) * 60.0
+        )
         # Family settings are a trust boundary; reject them before opening state.
         self.family_rooms, self.family_users, self.family_devices = family_config(config)
-        self.pins: dict[str, dict[str, dict[str, str]]] = {config["owner"]: config["devices"], **self.family_devices}
+        # Trust model per user (#149): a user with a pinned cross-signing
+        # identity trusts every self-signed device; anyone else keeps the
+        # pinned device set. ``trusted`` (user -> device -> curve25519) is the
+        # single table every send/admit decision reads; pin_devices fills it.
+        self.identities = identities(config)
+        self.pins: dict[str, dict[str, dict[str, str]]] = {
+            user: pins
+            for user, pins in {config["owner"]: config["devices"], **self.family_devices}.items()
+            if user not in self.identities and pins
+        }
+        self.trusted: dict[str, dict[str, str]] = {user: {d: k["curve25519"] for d, k in pins.items()} for user, pins in self.pins.items()}
+        self.last_room_event: dict[str, str] = {}  # newest event id seen per room (drives status-bubble placement)
         self.senders = frozenset([config["owner"]]) | self.family_users
         self.family_allowed = self.senders | frozenset([config["account"]])
         self.store = MatrixStore(config["state_directory"], config["account"])
@@ -242,6 +345,7 @@ class MatrixTransport:
             {r: "mention" if r in self.family_rooms else "direct" for r in config["rooms"]},
             config["not_before_ms"],
             aliases=mention_aliases(config),
+            wake_words=wake_words(config),
         )
         self.blocked: set[str] = set(self.store.get_meta("room_gate_blocked") or ())
         self.room_members: dict[str, set[str]] = {}
@@ -250,6 +354,7 @@ class MatrixTransport:
         self.active: Mapping[str, Any] | None = None
         self.turn_task: asyncio.Task[TurnResult] | None = None
         self.approvals: dict[str, asyncio.Future[bool]] = {}
+        self.key_requests: list[Any] = []
         self.cancel_requested = False
         self.matrix_lock = asyncio.Lock()
         self.stopping = False
@@ -380,7 +485,7 @@ class MatrixTransport:
             raise SafetyStop("device-query-failed")
         await self.client.receive_response(response)
         devices = raw.get("device_keys", {}).get(self.c["owner"], {})
-        if set(devices) != set(self.c["devices"]):
+        if self.c["owner"] in self.pins and set(devices) != set(self.c["devices"]):
             raise SafetyStop("owner-device-set-changed")
         own = raw.get("device_keys", {}).get(self.c["account"], {})
         if set(own) != {self.c["device_id"]}:
@@ -388,15 +493,19 @@ class MatrixTransport:
         for kind, key in self.client.olm.account.identity_keys.items():
             if own[self.c["device_id"]].get("keys", {}).get(kind + ":" + self.c["device_id"]) != key:
                 raise SafetyStop("published-agent-key-changed")
-        for device, pin in self.c["devices"].items():
+        for device, pin in self.pins.get(self.c["owner"], {}).items():
             stored = self.client.device_store[self.c["owner"]][device]
             if stored.ed25519 != pin["ed25519"] or stored.curve25519 != pin["curve25519"]:
                 raise SafetyStop("owner-device-key-changed")
             self.client.verify_device(stored)
+        for user in sorted(self.identities):
+            self._trust_cross_signed(user, raw)
         # Family devices are pinned per user. Each user keeps the strict pin
         # check, while extra unpinned family devices stay merely untrusted and
         # are handled by exclude_unpinned_devices at session-share time.
         for user, pins in sorted(self.family_devices.items()):
+            if user in self.identities:
+                continue
             for device, pin in pins.items():
                 stored = self.client.device_store[user].get(device)
                 if stored is None:
@@ -404,6 +513,51 @@ class MatrixTransport:
                 if stored.ed25519 != pin["ed25519"] or stored.curve25519 != pin["curve25519"]:
                     raise SafetyStop("pinned-device-key-changed")
                 self.client.verify_device(stored)
+
+    def _trust_cross_signed(self, user: str, raw: Mapping[str, Any]) -> None:
+        """Trust exactly the devices ``user``'s self-signing key has signed (#149).
+
+        The pinned value is the master key. The self-signing key must be
+        signed by it and every device by the self-signing key (ed25519 over
+        canonical JSON, via nio's ``verify_json``). Unsigned devices are
+        blacklisted for key sharing but never stop the service; a changed
+        master key (account reset) does.
+        """
+        master_obj = raw.get("master_keys", {}).get(user)
+        ssk_obj = raw.get("self_signing_keys", {}).get(user)
+        if not isinstance(master_obj, dict) or not isinstance(ssk_obj, dict):
+            raise SafetyStop("cross-signing-missing")
+        master = next(iter((master_obj.get("keys") or {}).values()), None)
+        if master != self.identities[user]:
+            raise SafetyStop("owner-identity-changed" if user == self.c["owner"] else "family-identity-changed")
+        if not self.client.olm.verify_json(copy.deepcopy(ssk_obj), master, user, master):
+            raise SafetyStop("cross-signing-invalid")
+        ssk = next(iter((ssk_obj.get("keys") or {}).values()), None)
+        if not isinstance(ssk, str):
+            raise SafetyStop("cross-signing-invalid")
+        trusted: dict[str, str] = {}
+        # nio's DeviceStore iterates devices, not user ids, so `user in store`
+        # is always False; __getitem__ returns the (possibly empty) per-user map.
+        try:
+            store = self.client.device_store[user]
+        except KeyError:
+            store = {}
+        for device, obj in (raw.get("device_keys", {}).get(user) or {}).items():
+            stored = store.get(device)
+            if stored is None or not isinstance(obj, dict):
+                continue
+            published = (obj.get("keys") or {}).get("ed25519:" + device)
+            if published == stored.ed25519 and self.client.olm.verify_json(copy.deepcopy(obj), ssk, user, ssk):
+                self.client.verify_device(stored)
+                trusted[device] = stored.curve25519
+            else:
+                self.client.blacklist_device(stored)
+        previous = self.trusted.get(user)
+        self.trusted[user] = trusted
+        if previous is None or set(previous) != set(trusted):
+            record = self.store.get_meta("trusted_devices") or {}
+            record[user] = {"devices": sorted(trusted), "updated": time.time()}
+            self.store.set_meta("trusted_devices", record)
 
     async def room_gate(self, room: str) -> bool:
         from nio import JoinedMembersResponse
@@ -482,11 +636,13 @@ class MatrixTransport:
     def room_kind(self, room_id: str) -> str:
         return "family" if room_id in self.family_rooms else "direct"
 
-    def enqueue_notice(self, room_id: str, text: str) -> str:
+    def enqueue_notice(self, room_id: str, text: str, *, key: str | None = None) -> str:
         """Queue unsolicited output (async completion, reminders) for an allowed room.
 
         Delivered by :meth:`send` with the same chunking, pinning and room
-        gate as a reply; a muted room keeps it until the gate reopens.
+        gate as a reply; a muted room keeps it until the gate reopens. A
+        caller-supplied ``key`` makes the notice idempotent (same key + same
+        text → queued once), e.g. the startup banner across restarts.
         """
         if room_id not in self.c["rooms"]:
             raise ValueError("room-not-allowed")
@@ -498,7 +654,7 @@ class MatrixTransport:
             "notice",
             hashlib.sha256(json.dumps([self.c["account"], room_id, "unsolicited-notice"]).encode()).hexdigest(),
         )
-        return self.store.notice(req, unique_key("unsolicited"), text)
+        return self.store.notice(req, key or unique_key("unsolicited"), text)
 
     # -- input ----------------------------------------------------------------
 
@@ -508,6 +664,7 @@ class MatrixTransport:
         if req.body.startswith(CONTROL_PREFIXES):
             await self.control(req)
             return
+        fresh = not self.store.job_exists(req.event_id)
         try:
             self.store.accept_batch([req], None)
         except QueueFull:
@@ -515,6 +672,17 @@ class MatrixTransport:
             # later syncs from carrying cancellation/approval controls.
             if not self.store.seen_control(req):
                 self.store.notice(req, "queue-full", NOTICE_QUEUE_FULL)
+            return
+        if fresh:
+            # Telegram tells a sender whose turn is still running where their
+            # message landed in the queue; family rooms get the same notice.
+            ahead = self.store.pending_before(req.event_id)
+            if ahead:
+                self.store.notice(
+                    req,
+                    "queued-" + req.event_id,
+                    NOTICE_QUEUED.format(position=ahead + 1),
+                )
 
     def _turn_running(self) -> bool:
         return self.active is not None and self.turn_task is not None and not self.turn_task.done()
@@ -608,8 +776,22 @@ class MatrixTransport:
             # every room joined since "never", and open() already primed state.
             if self.store.token() is not None:
                 for room, info in raw.get("rooms", {}).get("join", {}).items():
-                    if room in self.c["rooms"] and info.get("timeline", {}).get("limited"):
+                    timeline = info.get("timeline", {}) if room in self.c["rooms"] else {}
+                    if not timeline.get("limited"):
+                        continue
+                    events = timeline.get("events") or []
+                    if len(events) >= SYNC_TIMELINE_LIMIT:
                         raise SafetyStop("timeline-gap-requires-backfill")
+                    # Tuwunel marks `limited` on a batch that is nowhere near the
+                    # requested limit (seen 2026-09-18 04:42 KST: one m.room.member
+                    # event per room after a display-name change) — every event
+                    # since the saved token is present, so nothing was skipped.
+                    # A real gap fills the timeline up to the limit (114 events on
+                    # 2026-09-17). Record it and carry on instead of fail-closing.
+                    self.store.set_meta(
+                        "sync_limited_soft",
+                        {"room": room, "events": len(events), "updated": time.time()},
+                    )
             await self.pin_devices()
             response = SyncResponse.from_dict(raw)
             if type(response).__name__ != "SyncResponse":
@@ -622,9 +804,13 @@ class MatrixTransport:
                 if room not in self.c["rooms"]:
                     continue
                 for event in info.timeline.events:
+                    event_id = getattr(event, "event_id", None)
+                    if isinstance(event_id, str) and event_id:
+                        self.last_room_event[room] = event_id
                     req = self.admit_event(room, event)
                     if req:
                         await self.input(req)
+            await self._request_room_keys()
             self.store.commit_sync(raw["next_batch"])
             await self._upload_keys_if_needed()
             self.store.set_meta("health", {"state": "ready", "updated": time.time()})
@@ -638,15 +824,62 @@ class MatrixTransport:
         if event.server_timestamp < self.c["not_before_ms"]:
             return None
         if isinstance(event, MegolmEvent):
-            raise SafetyStop("undecrypted-event")
+            # The pilot fail-closed here, which poisons the service forever
+            # when a message was encrypted before this device existed (jingun
+            # 2026-09-18: the owner wrote seconds after accepting the invite,
+            # before the bot device was initialised — that megolm session can
+            # never reach us). Skip it, ask for the key, tell the room once.
+            self._undecryptable(room, event)
+            return None
         if not isinstance(event, RoomMessageText):
             return None
         if not event.decrypted:
             return None  # No plaintext task execution.
-        pins = self.pins.get(event.sender)
-        if not event.verified or not pins or event.sender_key not in {v["curve25519"] for v in pins.values()}:
+        trusted = self.trusted.get(event.sender, {})
+        if not event.verified or event.sender_key not in set(trusted.values()):
+            if event.sender in self.identities:
+                # Cross-signing mode: an unverified device is the owner's own
+                # problem to fix (verify it in the app); never stop the service.
+                self._untrusted_sender(room, event)
+                return None
             raise SafetyStop("unverified-owner-event" if event.sender == self.c["owner"] else "unverified-family-event")
         return self.policy.admit(room, event.source, decrypted=event.decrypted, now_ms=int(time.time() * 1000))
+
+    def _untrusted_sender(self, room: str, event: Any) -> None:
+        """Ignore a message from an unsigned device; tell the room once per device."""
+        key = str(getattr(event, "sender_key", "") or "")
+        seen = self.store.get_meta("untrusted_senders") or {}
+        marker = f"{event.sender}:{key}"
+        if marker in seen:
+            return
+        seen[marker] = {"room": room, "updated": time.time()}
+        self.store.set_meta("untrusted_senders", dict(list(seen.items())[-50:]))
+        req = Request(str(getattr(event, "event_id", "") or "$untrusted-" + hashlib.sha256(marker.encode()).hexdigest()[:24]),
+                      room, event.sender, "notice", scope_of(self.c["account"], room, event.sender))
+        self.store.notice(req, "untrusted-device", NOTICE_UNTRUSTED_DEVICE)
+
+    def _undecryptable(self, room: str, event: Any) -> None:
+        """Record an undecryptable event, queue a key request and a one-time room notice."""
+        event_id = str(getattr(event, "event_id", "") or "")
+        seen = self.store.get_meta("undecryptable_events") or []
+        if event_id and event_id not in [e.get("event_id") for e in seen]:
+            seen.append({"event_id": event_id, "room": room, "ts": getattr(event, "server_timestamp", None),
+                         "updated": time.time()})
+            self.store.set_meta("undecryptable_events", seen[-50:])
+        self.key_requests.append(event)
+        if event_id:
+            req = Request(event_id, room, str(getattr(event, "sender", "")), "notice",
+                          scope_of(self.c["account"], room, str(getattr(event, "sender", ""))))
+            self.store.notice(req, "undecryptable", NOTICE_UNDECRYPTABLE)
+
+    async def _request_room_keys(self) -> None:
+        """Best-effort m.room_key_request for events we could not decrypt."""
+        pending, self.key_requests = self.key_requests, []
+        for event in pending:
+            try:
+                await self.client.request_room_key(event)
+            except Exception:
+                pass  # the sender may simply not have the session for us
 
     # -- output ---------------------------------------------------------------
 
@@ -670,7 +903,7 @@ class MatrixTransport:
                     self.store.delivered(job["event_id"])
             await asyncio.sleep(0.25)
 
-    async def encrypted_send(self, room: str, text: str, txn: str) -> None:
+    async def _encrypted_raw(self, room: str, kind: str, content: Mapping[str, Any], txn: str) -> str:
         # nio 0.25.2 room_send ignores incomplete key sharing. Confirm every
         # pinned recipient before encrypting, and avoid its implicit queries.
         if self.client.olm.should_share_group_session(room):
@@ -682,15 +915,37 @@ class MatrixTransport:
         if session is None or session.users_shared_with != expected:
             self.client.invalidate_outbound_session(room)
             raise ConnectionError("group-key-share-incomplete")
-        kind, content = self.client.encrypt(room, "m.room.message", message_content(text))
-        if kind != "m.room.encrypted":
+        out_kind, encrypted = self.client.encrypt(room, kind, content)
+        if out_kind != "m.room.encrypted":
             raise SafetyStop("plaintext-output-refused")
         result = await self.raw(
             "PUT",
             "/_matrix/client/v3/rooms/" + quote(room, safe="") + "/send/m.room.encrypted/" + txn,
-            data=content,
+            data=encrypted,
         )
-        bounded_text(result.get("event_id"), 255)
+        event_id = result.get("event_id")
+        bounded_text(event_id, 255)
+        return event_id
+
+    async def encrypted_send(self, room: str, text: str, txn: str) -> str:
+        return await self._encrypted_raw(room, "m.room.message", message_content(text), txn)
+
+    async def encrypted_edit(self, room: str, text: str, replaces: str, txn: str) -> str:
+        """m.replace edit of ``replaces``; the bubble keeps its original event id."""
+        new_content = message_content(text)
+        content: dict[str, Any] = dict(new_content)
+        content["body"] = "* " + text
+        content["m.new_content"] = new_content
+        content["m.relates_to"] = {"rel_type": "m.replace", "event_id": replaces}
+        return await self._encrypted_raw(room, "m.room.message", content, txn)
+
+    async def redact(self, room: str, event_id: str, tag: str) -> None:
+        txn = hashlib.sha256(("redact-" + tag).encode()).hexdigest()
+        await self.raw(
+            "PUT",
+            "/_matrix/client/v3/rooms/" + quote(room, safe="") + "/redact/" + quote(event_id, safe="") + "/" + txn,
+            {},
+        )
 
     def expected_recipients(self, room: str) -> set[tuple[str, str]]:
         """Pinned devices of every room member; direct rooms keep owner-only pins."""
@@ -699,7 +954,7 @@ class MatrixTransport:
             (user, device)
             for user in members
             if user != self.c["account"]
-            for device in self.pins.get(user, {})
+            for device in self.trusted.get(user, {})
         }
 
     def exclude_unpinned_devices(self, room: str) -> None:
@@ -709,7 +964,7 @@ class MatrixTransport:
         for user in self.room_members.get(room, ()):
             if user == self.c["account"]:
                 continue
-            missing = sorted(d for d in self.client.device_store[user] if d not in self.pins.get(user, {}))
+            missing = sorted(d for d in self.client.device_store[user] if d not in self.trusted.get(user, {}))
             if missing:
                 unpinned[user] = missing
         if unpinned:
@@ -725,13 +980,11 @@ class MatrixTransport:
 
     async def work(self) -> None:
         while True:
-            # Do not overlap unknown prior execution after a restart.
-            uncertain = self.store.uncertain()
-            if uncertain:
-                for job in uncertain:
-                    self.store.notice(self.as_request(job), "uncertain", NOTICE_UNCERTAIN + turn_id(job["event_id"]))
-                await asyncio.sleep(0.25)
-                continue
+            # Work left uncertain by a previous process (store open converts
+            # crashed 'running' rows) was interrupted by a stop/restart: tell
+            # the room once and move on, like the Telegram bridge does.
+            for job in self.store.uncertain():
+                self.store.resolve_uncertain(job["event_id"], NOTICE_RESTARTED)
             job = self.store.claim()
             if not job:
                 await asyncio.sleep(0.25)
@@ -754,6 +1007,7 @@ class MatrixTransport:
             )
         )
         self.turn_task = turn
+        shutting_down = False
         try:
             # asyncio.wait (not `await turn`) keeps timeout/shutdown cancellation
             # with this loop: a runner that swallows CancelledError cannot absorb it.
@@ -770,8 +1024,9 @@ class MatrixTransport:
             outcome = "cancelled"
             current = asyncio.current_task()
             if current is not None and current.cancelling():
+                shutting_down = True
                 raise  # The service is stopping; the join below still runs.
-            # Only the runner task was cancelled (/cancel): stay uncertain, keep serving.
+            # Only the runner task was cancelled (/cancel or /stop): keep serving.
         except Exception as exc:
             outcome = "timeout" if isinstance(exc, TimeoutError) else "error:" + type(exc).__name__
         finally:
@@ -780,6 +1035,11 @@ class MatrixTransport:
             finally:
                 # Runs even when the join itself is cancelled again.
                 self.store.uncertain_job(job["event_id"])  # no-op once finished
+                if not shutting_down:
+                    # Telegram parity: an interrupted turn ends with a short
+                    # notice and the next message is served normally. A stop/
+                    # restart leaves it uncertain for the next process to notice.
+                    self._close_interrupted(job, outcome)
                 for future in self.approvals.values():
                     if not future.done():
                         future.set_result(False)
@@ -789,6 +1049,17 @@ class MatrixTransport:
                 self.store.set_meta(
                     "last_turn", {"event_id": job["event_id"], "outcome": outcome, "updated": time.time()}
                 )
+
+    def _close_interrupted(self, job: Mapping[str, Any], outcome: str) -> None:
+        if not any(j["event_id"] == job["event_id"] for j in self.store.uncertain()):
+            return  # finished normally
+        if outcome == "cancelled":
+            text = NOTICE_CANCELLED
+        elif outcome == "timeout":
+            text = NOTICE_TIMEOUT.format(minutes=_timeout_label(self.turn_timeout))
+        else:  # runner exception or an explicit uncertain result
+            text = NOTICE_TURN_ERROR
+        self.store.resolve_uncertain(job["event_id"], text)
 
     async def _join(self, turn: asyncio.Task[TurnResult]) -> None:
         """Stop the runner task and wait for it, surviving repeated cancels like the pilot's cleanup join."""

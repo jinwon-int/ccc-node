@@ -1071,3 +1071,69 @@ async def test_danso_production_guards_defer_without_claim_or_dispatch(tmp_path,
     result = await worker.extract_once(job_id=job.job_id)
     assert result.status is DistillJobStatus.SNAPSHOT_DONE
     assert result.extraction_attempts == 0 and backend.calls == []
+
+
+@pytest.mark.anyio
+async def test_accounting_records_the_model_the_backend_actually_received(
+    tmp_path: Path,
+) -> None:
+    """The receipt has to name a model, not the `provider-default` sentinel.
+
+    Measured on yukson: the bridge distill lane ran on claude-opus-5 inherited
+    from its systemd unit, and every journal entry read "provider-default" --
+    so the model that did the work could only be recovered by reading the unit
+    file and the live process argv.
+    """
+
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal)
+
+    class Backend:
+        effective_model = "claude-opus-5"
+
+        async def extract(self, extraction_input: DistillExtractionInput) -> Any:
+            del extraction_input
+            raise CodexDistillBackendError("codex_distill_output_invalid")
+
+    result = await CodexDistillExtractionWorker(
+        journal,
+        Backend(),
+        owner_token="extract-worker",
+        usage_meter=None,
+    ).extract_once(job_id=job.job_id)
+
+    assert result.extraction_accounting[0].model == "claude-opus-5"
+
+
+@pytest.mark.parametrize("reported", [None, "", 17, "bad model name", "x" * 200])
+@pytest.mark.anyio
+async def test_accounting_falls_back_to_the_configured_label_on_an_unusable_report(
+    tmp_path: Path,
+    reported: Any,
+) -> None:
+    """An enrichment must never make the receipt worse than it already was.
+
+    A backend that cannot resolve its model, or reports something unusable,
+    leaves the configured label in place rather than an invented value.
+    """
+
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal)
+
+    class Backend:
+        effective_model = reported
+
+        async def extract(self, extraction_input: DistillExtractionInput) -> Any:
+            del extraction_input
+            raise CodexDistillBackendError("codex_distill_output_invalid")
+
+    result = await CodexDistillExtractionWorker(
+        journal,
+        Backend(),
+        owner_token="extract-worker",
+        usage_meter=None,
+    ).extract_once(job_id=job.job_id)
+
+    assert result.extraction_accounting[0].model == "provider-default"
