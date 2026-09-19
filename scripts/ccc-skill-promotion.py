@@ -2322,10 +2322,13 @@ def _record_dispatch_secret_missing(
         _append_ledger(config, record)
     except PromotionError:
         pass
+    # Do not interpolate _DISPATCH_SECRET_MISSING_FIX here: that string names
+    # the env var, and CodeQL treats stderr as clear-text secret logging even
+    # though the secret itself is absent. The ledger row still carries `fix`.
     print(
         f"warn: dispatch_secret_missing — intake PR #{pr_number} ({candidate.node}/"
         f"{candidate.name}) opened but its A2A review round was NOT dispatched. "
-        f"{_DISPATCH_SECRET_MISSING_FIX}",
+        "edge env not loaded; source the publisher edge env file before collect.",
         file=sys.stderr,
     )
     return {
