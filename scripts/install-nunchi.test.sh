@@ -161,6 +161,22 @@ out="$(CCC_NUNCHI_JUDGE_PROVIDER=bogus run_install --apply --codex --judge 2>&1)
 ok "invalid provider value is a hard error (exit 2), cron untouched" \
   '[ "$rc" = 2 ] && ! grep -q "NUNCHI_JUDGE_PROVIDER=bogus" "$cron_store"'
 
+# --- Judge confidence gate passthrough: the gate only matters in apply mode
+# (dry-run never mutates), but the env must survive strip_cron/replay exactly
+# like the provider stamp, and a non-numeric or out-of-range value must be a
+# hard installer error rather than a silently gate-less apply cron.
+out="$(CCC_NUNCHI_JUDGE_PROVIDER=typesafe CCC_NUNCHI_JUDGE_MIN_CONFIDENCE=0.5 run_install --apply --codex --judge-apply 2>&1)"; rc=$?
+ok "MIN_CONFIDENCE=0.5 lands alongside APPLY + provider in the judge cron line" \
+  '[ "$rc" = 0 ] && grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY=1.*NUNCHI_JUDGE_PROVIDER=typesafe.*NUNCHI_JUDGE_MIN_CONFIDENCE=0.5\|NUNCHI_JUDGE_PROVIDER=typesafe.*NUNCHI_JUDGE_MIN_CONFIDENCE=0.5.*NUNCHI_JUDGE_APPLY=1\|NUNCHI_JUDGE_MIN_CONFIDENCE=0.5.*NUNCHI_JUDGE_PROVIDER=typesafe.*NUNCHI_JUDGE_APPLY=1"'
+ok "replay with the same env keeps exactly one gate-stamped judge line" \
+  'CCC_NUNCHI_JUDGE_PROVIDER=typesafe CCC_NUNCHI_JUDGE_MIN_CONFIDENCE=0.5 run_install --apply --codex --judge-apply >/dev/null 2>&1 && [ "$(grep -c "NUNCHI_JUDGE_MIN_CONFIDENCE=0.5.*judge-batch.py\|judge-batch.py.*NUNCHI_JUDGE_MIN_CONFIDENCE=0.5" "$cron_store")" = 1 ]'
+for bad in 0 1.5 abc -0.5; do
+  out="$(CCC_NUNCHI_JUDGE_MIN_CONFIDENCE=$bad run_install --apply --codex --judge 2>&1)"; rc=$?
+  # shellcheck disable=SC2034  # rc/out are read via eval inside ok()
+  ok "MIN_CONFIDENCE=$bad is a hard error (exit 2), cron untouched" \
+    '[ "$rc" = 2 ] && ! grep -q "NUNCHI_JUDGE_MIN_CONFIDENCE=$bad " "$cron_store"'
+done
+
 # --- APPLY mode (#1264): dry-run is the default and apply is opt-in per node.
 # The flag exists so an approved apply pilot SURVIVES a re-apply — before it,
 # the only way to enable apply was hand-editing the managed cron line, which
