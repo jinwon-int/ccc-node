@@ -960,7 +960,7 @@ def build_report(stamp, decisions, clears, humans, applied, backup, deferred=(),
     ]
     if MIN_CONFIDENCE > 0.0:
         lines.append(
-            f"- confidence gate: clears need >= {MIN_CONFIDENCE:.2f}"
+            f"- confidence gate: clears need >= {MIN_CONFIDENCE:.3f}"
             f" (NUNCHI_JUDGE_MIN_CONFIDENCE) · held: {len(held)}"
             " · backends that report no confidence are unaffected")
     if APPLY:
@@ -980,9 +980,14 @@ def build_report(stamp, decisions, clears, humans, applied, backup, deferred=(),
     if held:
         lines += ["", "## low-confidence (verdict withheld by the gate)", ""]
         for d in held:
+            # 3 decimals here (the table keeps 2): at 2 the held value and the
+            # threshold can round to the same text, printing "0.98 < 0.98" —
+            # a line that reads as false and sends the reader hunting a bug.
+            conf = d.get("confidence")
+            shown = f"{conf:.3f}" if isinstance(conf, (int, float)) else _confidence_cell(d)
             lines.append(
-                f"- #{d['id']}: {d['verdict']} at confidence {_confidence_cell(d)}"
-                f" < {MIN_CONFIDENCE:.2f} — flag left up, not applied")
+                f"- #{d['id']}: {d['verdict']} at confidence {shown}"
+                f" < {MIN_CONFIDENCE:.3f} — flag left up, not applied")
     if humans:
         lines += ["", "## human-pending", ""]
         for d in humans:
