@@ -4,6 +4,32 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **web-routing: from Claude-only MCP routing to a cross-harness skill
+  (#1630 follow-up).** `skills/web-routing` pointed exclusively at the
+  Firecrawl/SearXNG MCP tools (`mcp__firecrawl__*`, `mcp__searxng__*`), so on
+  any lane without those servers registered the skill was inert — including the
+  Codex managed copy provisioned from this source (catalog audience `shared`).
+  The three reviewed stdlib helpers from the Piri-lane `web` skill
+  (web_search/web_fetch/web_developer) and their hermetic suite (116 PASS) are
+  now bundled under `skills/web-routing/scripts/`, and SKILL.md was rewritten
+  around `<skill-root>`-relative invocations (the #1844 convention), so the
+  same routing — Firecrawl search / scrape / Developer Index with SearXNG as an
+  explicit-only fallback — holds on Claude, Codex, and Danso via the shell
+  tool. MCP tools are demoted to an equivalent transport where registered.
+  This also resolves the fleet-skills#59 major/triggering finding: the
+  `agents/openai.yaml` default prompt advertised SearXNG as the general-search
+  default, contradicting the skill's own Firecrawl-first policy.
+  `docs/codex-managed-skills.md` managed-set wording corrected to match.
+  Verified: `web_tools.test.sh` 116 PASS at the bundled location,
+  `ccc_codex_skills.py validate` ok (156 assets), `ccc_codex_skills_test.py`
+  OK, skill-registry update+validate ok (38 skills), ruff clean,
+  `validate-harness.sh` static phase green. Helper bodies are byte-identical
+  to `piri/skills/web` except web_search.py's SearXNG default: the canon may
+  not embed node identifiers (#1446 — the old default leaked the Tailnet
+  hostname), so this copy requires `SEARXNG_URL` (exit 64 with a pointer to
+  the Family Wiki searxng page when unset) where the Piri lane keeps its
+  lane-local default.
+
 - **auto-distill: the prefixed-secret pattern stopped at the first underscore
   (#1840).** A real issued key is multi-segment — `apikey_<36hex>_<64hex>` — and
   the body class `[A-Za-z0-9]{32,}` excluded `_`, so only the first segment was
