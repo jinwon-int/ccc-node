@@ -542,6 +542,7 @@ env CCC_STATE_DIR="$STATE11C" CLAUDE_PROJECTS_DIR="$TMP/projects11" \
   PROMOTION_TOUCH="$TMP/promotion11.touched" PROMOTION_SECRET_TOUCH="$TMP/promotion11.secret" \
   CCC_A2A_EDGE_ENV="$BROKEN_ENV" CLAUDE_SKILLS_DIR="$TMP/skills11" \
   CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode bash "$AUTOSAVE" run
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "#1766: a malformed edge env file is non-fatal" '[ "$rc" = 0 ]'
 ok "#1766: a malformed edge env file still runs collect" \
