@@ -48,40 +48,16 @@ STATUS_RE = re.compile(
 )
 PIPELINE_RE = re.compile(r"\*\*파이프라인\*\*: `v[0-9]+`")
 CONFLICT_RE = re.compile(r"(?m)^(?:<{7}(?: |$)|={7}$|>{7}(?: |$)|\|{7}(?: |$))")
+# 마스킹기(auto-distill.py:_TOKEN_RE)와 **동일**하다. test_redact.py 가 두 패턴을
+# 파싱해 대조하며, 선언된 차이(GATE_ONLY / GATE_NARROWED)가 이제 비어 있다.
+# 경계는 ASCII 전용 lookaround 다 — `\b` 는 한글도 단어문자로 보아 조사에
+# 밀착한 토큰을 놓친다.
+_B = r"(?<![A-Za-z0-9_])"
+_E = r"(?![A-Za-z0-9_])"
 TOKEN_RE = re.compile(
-    r"(-----BEGIN [A-Z ]*PRIVATE KEY-----"
-    r"|github"
-    r"_pat_[A-Za-z0-9_]{20,}"
-    r"|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}"
-    r"|\bsk-[A-Za-z0-9_-]{32,}"
-    r"|\bAKIA[0-9A-Z]{16}\b"
-    # 아래 10개는 auto-distill 의 _TOKEN_RE 에만 있고 여기엔 없어서 게이트가
-    # 놓치고 있었다. auto-distill.py:37 이 정렬을 약속하지만 코드로
-    # 강제된 적이 없어 벌어진 드리프트다. test_redact.py 가 이제 고정한다.
-    r"|\bAIza[0-9A-Za-z_-]{30,}"
-    r"|\bxox[baprs]-[0-9A-Za-z-]{20,}"
-    # 텔레그램 봇토큰. 마스킹기는 본문을 제한하지 않지만 게이트는 **순수 소문자
-    # hex 본문을 제외**한다. 게이트는 fail-closed 이고 이미 발행된 AUTO.md 에도
-    # 돌므로(:285), `1758240000:<sha40>` 같은 평범한 watermark 산문이 11노드
-    # 전체 발행을 영구 차단한다. 봇토큰은 대소문자·밑줄이 섞이고 SHA 는 순수
-    # 소문자 hex 라서 이 lookahead 로 갈린다.
-    r"|\b[0-9]{8,10}:(?![a-f0-9]{30,}(?![A-Za-z0-9_-]))[A-Za-z0-9_-]{30,}"
-    r"|tskey-[a-z]+-[A-Za-z0-9]{10,}"
-    r"|glpat-[A-Za-z0-9_-]{20,}"
-    r"|\bhf_[A-Za-z0-9]{30,}"
-    r"|\bnpm_[A-Za-z0-9]{36}\b"
-    r"|\bdop_v1_[a-f0-9]{64}\b"
-    r"|\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"
-    r"|AGE-SECRET-KEY-1[A-Z0-9]{20,}"
-    r"|hooks\.slack\.com/services/[A-Za-z0-9/_+-]{20,}"
-    r"|\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\."
-    r"|[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@"
-    # `<단어>_<긴 값>` 접두 형태. 접두어는 **다단어만** 받는다 — bare `key_`/
-    # `token_`/`secret_` 는 `key_<md5>` 같은 캐시 키와 충돌하고, 게이트가
-    # fail-closed 라 오탐이 발행 중단으로 직결된다.
-    r"|\b(?:apikey|api_key|apitoken|api_token|secret_key|access_token)_[A-Za-z0-9]{32,}"
-    r"|\b01[016789][-. ]?[0-9]{3,4}[-. ]?[0-9]{4}\b)"
+    '(-----BEGIN [A-Z ]*PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{20,}|(?<![A-Za-z0-9_])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}|(?<![A-Za-z0-9_])sk-[A-Za-z0-9_-]{32,}|(?<![A-Za-z0-9_])AKIA[0-9A-Z]{16}(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])AIza[0-9A-Za-z_-]{30,}|(?<![A-Za-z0-9_])xox[baprs]-[0-9A-Za-z-]{20,}|(?<![A-Za-z0-9_])[0-9]{8,10}:(?![a-f0-9]{30,}(?![A-Za-z0-9_-]))[A-Za-z0-9_-]{30,}|tskey-[a-z]+-[A-Za-z0-9]{10,}|glpat-[A-Za-z0-9_-]{20,}|(?<![A-Za-z0-9_])hf_[A-Za-z0-9]{30,}|(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{36,}|(?<![A-Za-z0-9_])dop_v1_[A-Fa-f0-9]{64,}|(?<![A-Za-z0-9_])SG\\.[A-Za-z0-9_-]{16,}\\.[A-Za-z0-9_-]{16,}|AGE-SECRET-KEY-1[A-Z0-9]{20,}|hooks\\.slack\\.com/services/[A-Za-z0-9/_+-]{20,}|(?<![A-Za-z0-9_])eyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.|[a-z][a-z0-9+.-]*://[^/\\s:@]+:[^/\\s@]+@|(?<![A-Za-z0-9_])(?:apikey|api_key|apitoken|api_token|secret_key|access_token)_[A-Za-z0-9]{32,}|(?<![A-Za-z0-9_])01[016789][-. ]?[0-9]{3,4}[-. ]?[0-9]{4}(?![A-Za-z0-9_]))'
 )
+
 ASSIGN_RE = re.compile(
     r"(?:password|passwd|api[_-]?key|secret|access[_-]?token|client[_-]?secret|bearer)"
     r"\s*[:=]\s*[\"']?[A-Za-z0-9_+/=.-]{16,}",

@@ -95,17 +95,12 @@ def split_alternatives(pattern: str) -> list[str]:
 # docs/auto-distill.md:84-86: auto-distill.py 는 주석 한 줄만 바뀌어도 새
 # exact-source 평가와 검토된 영수증이 필요하고, 영수증은 로컬 생성 우회 토큰이
 # 아니다. 그래서 게이트 ⊃ 마스킹기 상태가 일시적으로 생긴다.
-GATE_ONLY = {
-    r"\b(?:apikey|api_key|apitoken|api_token|secret_key|access_token)_[A-Za-z0-9]{32,}",
-}
+GATE_ONLY: set[str] = set()
 
 # 게이트가 마스킹기보다 **좁은** 대안 — {마스킹기 형태: 게이트 형태}.
 # 게이트는 fail-closed 이고 이미 발행된 문서에도 돌기 때문에, 오탐 비용이
 # 마스킹기(값을 가릴 뿐)보다 비대칭적으로 크다.
-GATE_NARROWED = {
-    r"\b[0-9]{8,10}:[A-Za-z0-9_-]{30,}":
-        r"\b[0-9]{8,10}:(?![a-f0-9]{30,}(?![A-Za-z0-9_-]))[A-Za-z0-9_-]{30,}",
-}
+GATE_NARROWED: dict[str, str] = {}
 
 SECRET_SAMPLES = [
     ("pem", "-----BEGIN RSA PRIVATE KEY-----"),
@@ -131,7 +126,7 @@ SECRET_SAMPLES = [
 
 # 다단어 접두 형태. 구독 서비스 키가 흔히 이 모양이고, _ASSIGN_RE 는
 # `api_key:` 처럼 구분자를 요구하므로 접두사로 붙은 경우를 놓친다.
-# 게이트에는 들어갔고 마스킹기는 영수증 대기 중이다 (GATE_ONLY 참조).
+# 이제 마스킹기·게이트 양쪽에 있다.
 PREFIXED_SAMPLES = [
     ("prefixed_apikey", "apikey_" + "1" * 40),
     ("prefixed_api_key", "api_key_" + "2" * 40),
@@ -169,7 +164,9 @@ BENIGN_SAMPLES = [
     ("secret_bare", "secret_" + "8" * 40),
 ]
 
-# **선재 결함** — 게이트는 좁혀서 통과하지만 마스킹기는 아직 과잉 마스킹한다.
+# 과잉 마스킹이 고쳐졌으므로 이제 양쪽 모두 통과해야 한다. 남겨 두는 이유는
+# 회귀 방지다 — `1758240000:<sha>` 는 운영 산문의 평범한 모양이다.
+# (이전 주석) **선재 결함** — 게이트는 좁혀서 통과하지만 마스킹기는 과잉 마스킹했다.
 # `1758240000:<sha>` 는 이 저장소 운영 산문(watermark·커서·상태 덤프)의 평범한
 # 모양인데 텔레그램 봇토큰 대안에 걸린다. 인용문이 축자라서 증거가 훼손된다 —
 # 길이만 보는 패턴을 반대한 것과 같은 종류의 피해다.
@@ -246,46 +243,23 @@ class RedactSecretsTest(unittest.TestCase):
         self.assertNotIn("Z" * 32, out)
         self.assertIn("api_key", out)
 
-    def test_masker_overmasks_epoch_sha_today(self):
-        """선재 결함 기록 — 마스킹기가 정당한 watermark 산문을 가린다.
+    def test_epoch_sha_survives_masking(self):
+        """운영 산문 `1758240000:<sha>` 가 살아남는다 (과잉 마스킹 회귀 방지)."""
+        for name, value in MASKER_OVERMASKS:
+            with self.subTest(sample=name):
+                self.assertIn(
+                    value,
+                    AUTO_DISTILL.redact("앞 %s 뒤" % value),
+                    "%s 가 다시 과잉 마스킹된다 — 증거 인용이 훼손된다" % name,
+                )
 
-        통과가 곧 "결함이 아직 있다" 는 뜻이다. 영수증 재발급 회차에서 고치면
-        여기가 실패하며, 그때 이 테스트를 지우고 표본을 BENIGN_SAMPLES 로
-        옮기라는 신호가 된다.
-        """
-        still_broken = [
-            name
-            for name, value in MASKER_OVERMASKS
-            if value not in AUTO_DISTILL.redact("앞 %s 뒤" % value)
-        ]
-        self.assertEqual(
-            still_broken,
-            [name for name, _ in MASKER_OVERMASKS],
-            "마스킹기 과잉 마스킹이 고쳐졌다 — 표본을 BENIGN_SAMPLES 로 옮겨라",
-        )
-
-    def test_prefixed_shapes_not_masked_yet(self):
-        """알려진 간극 — 게이트는 잡지만 마스킹기는 아직 못 잡는다.
-
-        expectedFailure 대신 명시적 assert 를 쓴다. expectedFailure 는 (a) 첫
-        표본에서 단락되어 일부만 메워져도 초록으로 남고, (b) 예외를 삼켜 마스킹기가
-        아예 깨져도 통과한다 — 리뷰에서 둘 다 실증됐다.
-
-        마스킹 패치가 들어오면 여기가 실패하며, 그때 이 테스트를 지우고
-        PREFIXED_SAMPLES 를 SECRET_SAMPLES 로 합치고 GATE_ONLY 를 비우라는
-        신호가 된다.
-        """
-        still_open = [
-            name
-            for name, value in PREFIXED_SAMPLES
-            if value in AUTO_DISTILL.redact("앞 %s 뒤" % value)
-        ]
-        self.assertEqual(
-            still_open,
-            [name for name, _ in PREFIXED_SAMPLES],
-            "마스킹기의 접두-형태 간극이 부분적으로 메워졌다 — 영수증 재발급이 "
-            "끝났으면 이 테스트를 제거하고 GATE_ONLY 를 비워라",
-        )
+    def test_prefixed_shapes_are_masked(self):
+        for name, value in PREFIXED_SAMPLES:
+            with self.subTest(sample=name):
+                self.assertNotIn(
+                    value, AUTO_DISTILL.redact("앞 %s 뒤" % value),
+                    "%s 가 마스킹되지 않았다" % name,
+                )
 
 
 class PublishWikiGateTest(unittest.TestCase):
@@ -333,12 +307,11 @@ class PublishWikiGateTest(unittest.TestCase):
 
 
 class HangulAdjacencyTest(unittest.TestCase):
-    """`\\b` 는 유니코드 인식이라 한글도 단어문자다. 조사가 붙은 토큰은 경계가 없다.
+    """한글 조사에 밀착한 토큰도 마스킹된다.
 
-    한국어 코퍼스에서 토큰이 조사에 밀착하는 건 예외가 아니라 정상이다. 이 클래스는
-    **현재 동작을 기록**한다 — 통과가 곧 "이 구멍이 있다" 는 뜻이고, 마스킹기·게이트
-    양쪽에 공통이다. 수정하려면 `\\b` 대신 lookaround 로 바꿔야 하고 그건 마스킹기
-    변경이므로 영수증 재발급 대상이다.
+    이전에는 `\\b` 를 써서 전부 빠져나갔다 — `\\b` 는 유니코드 인식이라 한글도
+    단어문자이고, 한국어 코퍼스에서 조사 밀착은 예외가 아니라 정상이다.
+    지금은 ASCII 전용 lookaround(`_B`/`_E`)를 쓴다.
     """
 
     HANGUL_GLUED = [
@@ -346,26 +319,28 @@ class HangulAdjacencyTest(unittest.TestCase):
         ("ghp_leading", "키는ghp_" + "B" * 36 + "였다"),
         ("hf_leading", "허깅페이스hf_" + "I" * 34),
         ("npm_trailing", "npm_" + "J" * 36 + "였다"),
+        ("npm_37chars", "npm_" + "J" * 37),
+        ("dop_uppercase_hex", "dop_v1_" + "A" * 64),
     ]
 
-    def test_hangul_glued_tokens_currently_escape(self):
-        escaped = [
-            name
-            for name, value in self.HANGUL_GLUED
-            if value in AUTO_DISTILL.redact(value)
-        ]
-        self.assertEqual(
-            escaped,
-            [name for name, _ in self.HANGUL_GLUED],
-            "한글 밀착 구멍이 일부 메워졌다 — 의도된 변경이면 이 목록을 줄여라",
-        )
-
-    def test_ascii_separated_equivalents_are_caught(self):
-        """같은 값이 공백으로 떨어지면 잡힌다 — 즉 원인은 값이 아니라 경계다."""
+    def test_hangul_glued_tokens_are_masked(self):
         for name, value in self.HANGUL_GLUED:
-            bare = re.sub(r"[가-힣]+", "", value)
             with self.subTest(sample=name):
-                self.assertNotIn(bare, AUTO_DISTILL.redact("앞 %s 뒤" % bare))
+                self.assertNotIn(
+                    value, AUTO_DISTILL.redact(value),
+                    "%s 가 한글 인접 때문에 빠져나갔다" % name,
+                )
+
+    def test_gate_also_catches_hangul_glued(self):
+        for name, value in self.HANGUL_GLUED:
+            with self.subTest(sample=name):
+                self.assertTrue(TOKEN_RE.search(value), "게이트가 %s 를 놓쳤다" % name)
+
+    def test_hangul_prose_survives(self):
+        for text in ("머지 완료했고 CI 는 14/14 통과했다",
+                     "커밋 5952c979847985cc95731394514c855fb809e499 를 확인했다"):
+            with self.subTest(text=text[:20]):
+                self.assertEqual(AUTO_DISTILL.redact(text), text)
 
 
 if __name__ == "__main__":
