@@ -60,8 +60,17 @@ cat > "$PROMOTER" <<'PY'
 import os
 from pathlib import Path
 import sys
+args = " ".join(sys.argv[1:])
 with Path(os.environ["PROMOTION_TOUCH"]).open("a", encoding="utf-8") as handle:
-    handle.write(" ".join(sys.argv[1:]) + "\n")
+    handle.write(args + "\n")
+# #1766: record whether the publisher edge secret reached this child — the
+# presence flag only, never the value, so a leak in the fixture cannot become a
+# leak in the suite output.
+secret_touch = os.environ.get("PROMOTION_SECRET_TOUCH")
+if secret_touch:
+    state = "present" if os.environ.get("A2A_EDGE_SECRET") else "absent"
+    with Path(secret_touch).open("a", encoding="utf-8") as handle:
+        handle.write(args + " secret=" + state + "\n")
 print('{"ok":true}')
 PY
 chmod +x "$PROMOTER"
@@ -448,6 +457,98 @@ env CCC_STATE_DIR="$STATE10" CLAUDE_PROJECTS_DIR="$TMP/projects10" CCC_PUSH_SPOO
   PIRI_CODING_AGENT_DIR="$TMP/no-piri-home" CLAUDE_SKILLS_DIR="$TMP/skills10" \
   CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode bash "$AUTOSAVE" run
 ok "missing piri sessions tree is a clean skip" 'grep -q "piri skipped reason=no-sessions-tree" "$STATE10/skill-autosave.log"'
+
+# --- 11) #1766: block 2d loads the publisher edge env before `collect` --------
+# The intake review round is dispatched by `collect` and needs A2A_EDGE_SECRET.
+# The autosave cron never sourced the edge env file, so every intake PR opened
+# and then stalled on a2a/receipts FAILURE with a silent dispatch_secret_missing
+# (fleet-skills #183 #205 #212 #217 #221 #225). These cases pin the three halves
+# of the fix: the secret reaches the collect child, it reaches nothing else, and
+# a node without an edge env file still sweeps successfully.
+STATE11="$TMP/state11"; mkdir -p "$STATE11"; chmod 700 "$STATE11"
+EDGE_ENV_FILE="$TMP/edge.env"
+# `export`-style, like the real publisher file; the value is a fixture-only
+# sentinel so the leak assertions below can grep for it.
+printf 'export A2A_EDGE_SECRET=edge-secret-fixture-1766\n' > "$EDGE_ENV_FILE"
+chmod 600 "$EDGE_ENV_FILE"
+
+run11() { # $1 = CCC_A2A_EDGE_ENV value (may point at a missing file)
+  env CCC_STATE_DIR="$STATE11" CLAUDE_PROJECTS_DIR="$TMP/projects11" \
+    CCC_PUSH_SPOOL="$TMP/spool11" CCC_SKILL_REVIEW_CMD="$REVIEW" \
+    CCC_SKILL_SCAN_CMD="$SCAN" SCAN_TOUCH="$TMP/scan11.touched" \
+    CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion11.touched" \
+    PROMOTION_SECRET_TOUCH="$TMP/promotion11.secret" CCC_A2A_EDGE_ENV="$1" \
+    CLAUDE_SKILLS_DIR="$TMP/skills11" CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 \
+    CCC_NODE=testnode bash "$AUTOSAVE" run
+}
+
+# 11a) edge env file present: the collect child sees the secret.
+run11 "$EDGE_ENV_FILE"; rc=$?
+ok "#1766: sweep with an edge env file still exits 0" '[ "$rc" = 0 ]'
+ok "#1766: collect child sees A2A_EDGE_SECRET" \
+  'grep -qx "collect secret=present" "$TMP/promotion11.secret"'
+ok "#1766: staging child is left alone (only collect dispatches)" \
+  'grep -qx "run secret=absent" "$TMP/promotion11.secret"'
+ok "#1766: edge-env state is logged without the secret value" \
+  'grep -q "promotion-collect edge-env=loaded" "$STATE11/skill-autosave.log"'
+ok "#1766: the secret value never reaches the autosave log" \
+  '! grep -q "edge-secret-fixture-1766" "$STATE11/skill-autosave.log"'
+ok "#1766: the secret value never reaches the notification spool" \
+  '! grep -rq "edge-secret-fixture-1766" "$TMP/spool11" 2>/dev/null'
+# shellcheck disable=SC2034  # read via eval inside ok()
+status11="$(CCC_STATE_DIR="$STATE11" CCC_A2A_EDGE_ENV="$EDGE_ENV_FILE" bash "$AUTOSAVE" status 2>&1)"
+ok "#1766: status reports the edge env as present, never its value" \
+  'printf "%s" "$status11" | grep -q "^a2a edge env: present" && ! printf "%s" "$status11" | grep -q "edge-secret-fixture-1766"'
+# shellcheck disable=SC2034  # read via eval inside ok()
+status11b="$(CCC_STATE_DIR="$STATE11" CCC_A2A_EDGE_ENV="$TMP/no-such-edge.env" bash "$AUTOSAVE" status 2>&1)"
+ok "#1766: status reports a missing edge env as absent" \
+  'printf "%s" "$status11b" | grep -q "^a2a edge env: absent"'
+
+# 11b) autonomy dry-run keeps the preview lane and still loads the env.
+: > "$TMP/promotion11.secret"
+env CCC_AUTONOMY=dry-run CCC_STATE_DIR="$STATE11" CLAUDE_PROJECTS_DIR="$TMP/projects11" \
+  CCC_PUSH_SPOOL="$TMP/spool11" CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+  SCAN_TOUCH="$TMP/scan11.touched" CCC_SKILL_PROMOTION_CMD="$PROMOTER" \
+  PROMOTION_TOUCH="$TMP/promotion11.touched" PROMOTION_SECRET_TOUCH="$TMP/promotion11.secret" \
+  CCC_A2A_EDGE_ENV="$EDGE_ENV_FILE" CLAUDE_SKILLS_DIR="$TMP/skills11" \
+  CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode bash "$AUTOSAVE" run
+ok "#1766: dry-run collect keeps --dry-run and still loads the edge env" \
+  'grep -qx "collect --dry-run secret=present" "$TMP/promotion11.secret"'
+
+# 11c) absent edge env file: non-fatal, collect still runs, nothing pretends.
+STATE11B="$TMP/state11b"; mkdir -p "$STATE11B"; chmod 700 "$STATE11B"
+: > "$TMP/promotion11.secret"
+env CCC_STATE_DIR="$STATE11B" CLAUDE_PROJECTS_DIR="$TMP/projects11" \
+  CCC_PUSH_SPOOL="$TMP/spool11" CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+  SCAN_TOUCH="$TMP/scan11.touched" CCC_SKILL_PROMOTION_CMD="$PROMOTER" \
+  PROMOTION_TOUCH="$TMP/promotion11.touched" PROMOTION_SECRET_TOUCH="$TMP/promotion11.secret" \
+  CCC_A2A_EDGE_ENV="$TMP/no-such-edge.env" CLAUDE_SKILLS_DIR="$TMP/skills11" \
+  CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode bash "$AUTOSAVE" run
+rc=$?
+ok "#1766: a missing edge env file is non-fatal" '[ "$rc" = 0 ]'
+ok "#1766: collect still runs without an edge env file" \
+  'grep -qx "collect secret=absent" "$TMP/promotion11.secret"'
+ok "#1766: the absent edge env is logged as such" \
+  'grep -q "promotion-collect edge-env=absent" "$STATE11B/skill-autosave.log"'
+
+# 11d) an unreadable/broken edge env file must not break the sweep or leak.
+BROKEN_ENV="$TMP/broken-edge.env"
+printf 'echo leaked-edge-secret-1766\nthis is ( not ) valid shell\n' > "$BROKEN_ENV"
+STATE11C="$TMP/state11c"; mkdir -p "$STATE11C"; chmod 700 "$STATE11C"
+: > "$TMP/promotion11.secret"
+env CCC_STATE_DIR="$STATE11C" CLAUDE_PROJECTS_DIR="$TMP/projects11" \
+  CCC_PUSH_SPOOL="$TMP/spool11" CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+  SCAN_TOUCH="$TMP/scan11.touched" CCC_SKILL_PROMOTION_CMD="$PROMOTER" \
+  PROMOTION_TOUCH="$TMP/promotion11.touched" PROMOTION_SECRET_TOUCH="$TMP/promotion11.secret" \
+  CCC_A2A_EDGE_ENV="$BROKEN_ENV" CLAUDE_SKILLS_DIR="$TMP/skills11" \
+  CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode bash "$AUTOSAVE" run
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "#1766: a malformed edge env file is non-fatal" '[ "$rc" = 0 ]'
+ok "#1766: a malformed edge env file still runs collect" \
+  'grep -qx "collect secret=absent" "$TMP/promotion11.secret"'
+ok "#1766: edge env output never reaches the summary or the log" \
+  '! grep -rq "leaked-edge-secret-1766" "$STATE11C" 2>/dev/null'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

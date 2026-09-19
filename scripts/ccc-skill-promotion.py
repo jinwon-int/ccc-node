@@ -2270,6 +2270,74 @@ def _inventory_snapshot(config: Config, *, limit: int = 64) -> list[dict[str, st
     return snapshot
 
 
+# #1766: `dispatch_secret_missing` is never a property of the candidate, the
+# PR or the broker — it always means the process that ran `collect` did not
+# have the publisher edge env loaded. That skip used to be silent: the intake
+# PR opened, its review round never dispatched, and the PR sat on a2a/receipts
+# FAILURE for days (fleet-skills #183 #205 #212 #217 #221 #225) because the
+# only trace was one code inside a truncated summary line. Name the cause and
+# the fix in the record itself so the wiring gap is greppable the first day.
+_DISPATCH_SECRET_MISSING_FIX = (
+    "edge env not loaded: A2A_EDGE_SECRET is absent from the environment of the process "
+    "that ran `ccc-skill-promotion.py collect`. Source the publisher edge env file "
+    "(default ~/.a2a-broker-edge.env, override CCC_A2A_EDGE_ENV) before collect — "
+    "scripts/ccc-skill-autosave.sh block 2d does this; a hand-rolled cron may not."
+)
+
+
+def _record_dispatch_secret_missing(
+    config: Config,
+    candidate: Candidate,
+    *,
+    transport_id: str,
+    pr_number: str,
+    branch: str,
+    url: str,
+) -> dict[str, object]:
+    """Make a secret-missing dispatch skip durable and grep-visible (#1766).
+
+    Two channels on purpose, both existing ones: the ledger (durable, survives
+    the run, joins to the PR the way every other dispatch row does) and stderr
+    (the autosave sweep appends the collect child's stderr to
+    skill-autosave.log, so the gap shows up where an operator already looks).
+    Neither carries the secret — only the fact that it was absent.
+
+    Fail-safe like its caller: a ledger that cannot be written must not turn a
+    skipped dispatch into a failed collect, so the skip is still returned.
+    """
+    record = {
+        "ts": _utc_now(),
+        "kind": "a2a-dispatch-skipped",
+        "code": "dispatch_secret_missing",
+        "transport_id": transport_id,
+        "node": candidate.node,
+        "provider": candidate.provider,
+        "name": candidate.name,
+        "pr": pr_number,
+        "pr_url": url,
+        "branch": branch,
+        "fix": _DISPATCH_SECRET_MISSING_FIX,
+    }
+    try:
+        _append_ledger(config, record)
+    except PromotionError:
+        pass
+    # Do not interpolate _DISPATCH_SECRET_MISSING_FIX here: that string names
+    # the env var, and CodeQL treats stderr as clear-text secret logging even
+    # though the secret itself is absent. The ledger row still carries `fix`.
+    print(
+        f"warn: dispatch_secret_missing — intake PR #{pr_number} ({candidate.node}/"
+        f"{candidate.name}) opened but its A2A review round was NOT dispatched. "
+        "edge env not loaded; source the publisher edge env file before collect.",
+        file=sys.stderr,
+    )
+    return {
+        "outcome": "dispatch-skipped",
+        "code": "dispatch_secret_missing",
+        "fix": _DISPATCH_SECRET_MISSING_FIX,
+    }
+
+
 def _dispatch_intake_review(  # noqa: C901
     config: Config,
     candidate: Candidate,
@@ -2291,7 +2359,14 @@ def _dispatch_intake_review(  # noqa: C901
     pr_number = pr_match.group(1)
     secret = os.environ.get("A2A_EDGE_SECRET", "")
     if not secret:
-        return {"outcome": "dispatch-skipped", "code": "dispatch_secret_missing"}
+        return _record_dispatch_secret_missing(
+            config,
+            candidate,
+            transport_id=transport_id,
+            pr_number=pr_number,
+            branch=branch,
+            url=url,
+        )
     try:
         head = _branch_head_sha(config, branch)
     except PromotionError as error:

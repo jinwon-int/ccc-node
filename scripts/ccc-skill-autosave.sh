@@ -41,6 +41,10 @@ SCAN="${CCC_SKILL_SCAN_CMD:-$CLAUDE_DIR/skills/skillsuggest/scan.sh}"
 AUTOINSTALL="${CCC_SKILL_AUTOINSTALL_CMD:-$CLAUDE_DIR/hooks/skill-review/autoinstall.sh}"
 CURATOR="${CCC_SKILL_CURATOR_CMD:-$CLAUDE_DIR/hooks/skill-review/curator.py}"
 PROMOTER="${CCC_SKILL_PROMOTION_CMD:-$CLAUDE_DIR/hooks/ccc-skill-promotion.py}"
+# Publisher edge env (#1766): the env file that exports A2A_EDGE_SECRET for the
+# intake review dispatch in block 2d. HOME-relative default — no node-specific
+# absolute path lives in this repo — and only the publisher actually has one.
+EDGE_ENV="${CCC_A2A_EDGE_ENV:-${HOME:-/root}/.a2a-broker-edge.env}"
 
 # Fleet-wide autonomy guard (#386): a single kill-switch/dry-run above every
 # no-approval write. The installed layout keeps the lib under the claude tree;
@@ -87,6 +91,28 @@ resolve_mode() {
   case "$m" in auto) printf 'auto' ;; *) printf 'approve' ;; esac
 }
 
+# Run the central promoter with the publisher edge env loaded (#1766). Sourced
+# inside a subshell so A2A_EDGE_SECRET reaches exactly the child that dispatches
+# the intake review round and nothing else — not this script's environment, not
+# any other step, never a log line. The file's own output is discarded and a
+# malformed file is swallowed: a broken env file must not fail the sweep, and
+# nothing it prints may reach the log. `set -a` covers both `KEY=value` and
+# `export KEY=value` files; `set +u` keeps one that reads an unset variable from
+# aborting the subshell under this script's `set -u`.
+collect_with_edge_env() {
+  (
+    if [ -f "$EDGE_ENV" ]; then
+      set +u
+      set -a
+      # shellcheck disable=SC1090
+      . "$EDGE_ENV" >/dev/null 2>&1 || :
+      set +a
+      set -u
+    fi
+    python3 "$PROMOTER" "$@" 2>>"$LOG"
+  )
+}
+
 MODE="${1:-run}"
 
 if [ "$MODE" = "status" ]; then
@@ -95,6 +121,9 @@ if [ "$MODE" = "status" ]; then
   echo "autonomy: $(declare -f ccc_autonomy_state >/dev/null 2>&1 && ccc_autonomy_state || echo active) (kill = skip whole sweep, dry-run = draft/report only)"
   echo "curator: ${CCC_SKILL_CURATOR_ENABLED:-false} (enabled=true lets the sweep run the deterministic stale/archive lifecycle; first auto run only seeds the interval timer)"
   echo "pending skill drafts: $(pending_count)"
+  # Presence only, never the value (#1766): absent on a publisher is exactly the
+  # wiring gap that stalled six intake PRs, so it has to be visible at a glance.
+  echo "a2a edge env: $([ -f "$EDGE_ENV" ] && echo present || echo absent) ($EDGE_ENV — exports A2A_EDGE_SECRET for the 2d intake review dispatch; publisher only)"
   echo "candidates report: $(ls -la "$STATE_DIR/skill-candidates.md" 2>/dev/null || echo none)"
   echo "-- ledger (last 5) --";      tail -5 "$LEDGER" 2>/dev/null
   echo "-- autosave installs (last 5) --"; tail -5 "$STATE_DIR/skill-autosave-install.jsonl" 2>/dev/null
@@ -532,9 +561,17 @@ if [ -f "$PROMOTER" ] && command -v python3 >/dev/null 2>&1; then
     || log "promotion-stage failed (non-fatal)"
   collect_args="collect"
   [ "$AUTONOMY_STATE" = "dry-run" ] && collect_args="collect --dry-run"
-  summary="$(python3 "$PROMOTER" $collect_args 2>>"$LOG")" \
-    && log "promotion-collect $(printf '%s' "$summary" | head -c 500)" \
-    || log "promotion-collect failed (non-fatal)"
+  # #1766: only `collect` dispatches the A2A intake review round, and that needs
+  # A2A_EDGE_SECRET. The dedicated intake cron sources the publisher edge env
+  # first; this sweep did not, so the promoter's dispatch silently returned
+  # dispatch_secret_missing — the intake PR opened and then sat on a2a/receipts
+  # FAILURE forever. Load the env for the collect child only (staging never
+  # dispatches). Absent file stays non-fatal: an ordinary node has none and
+  # reports publisher_enabled=false anyway.
+  if [ -f "$EDGE_ENV" ]; then edge_state=loaded; else edge_state=absent; fi
+  summary="$(collect_with_edge_env $collect_args)" \
+    && log "promotion-collect edge-env=$edge_state $(printf '%s' "$summary" | head -c 500)" \
+    || log "promotion-collect failed (non-fatal) edge-env=$edge_state"
 else
   log "promotion skipped reason=missing-runtime"
 fi
