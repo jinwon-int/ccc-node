@@ -75,7 +75,12 @@ _TOKEN_RE = re.compile(
     # bare `key_`/`token_`/`secret_` 는 `key_<md5>` 같은 캐시 키와 충돌한다.
     # 길이 하한과 접두어 앵커는 둘 다 필수다: 길이만 보는 포괄 패턴
     # (`[A-Za-z0-9]{40,}`)은 실데이터 716k자에서 165건 적중했고 전부 커밋 SHA 였다.
-    + r"|" + _B + r"(?:apikey|api_key|apitoken|api_token|secret_key|access_token)_[A-Za-z0-9]{32,}"
+    #
+    # 본문에 `_` 를 허용한다. 실제 발급 키가 `apikey_<36hex>_<64hex>` 처럼
+    # 밑줄로 나뉜 다구간이라, 본문을 `[A-Za-z0-9]` 로만 두면 첫 구간에서 멈춰
+    # **뒤 64자가 그대로 남았다**(관측: 108자 중 43자만 마스킹). 첫 글자만
+    # `_` 를 빼서 `apikey__…` 같은 빈 구간을 배제한다.
+    + r"|" + _B + r"(?:apikey|api_key|apitoken|api_token|secret_key|access_token)_[A-Za-z0-9][A-Za-z0-9_]{31,}"
     + r"|" + _B + r"01[016789][-. ]?[0-9]{3,4}[-. ]?[0-9]{4}" + _E + r")")
 _ASSIGN_RE = re.compile(
     r"((?:password|passwd|api[_-]?key|secret|access[_-]?token|client[_-]?secret|bearer)"

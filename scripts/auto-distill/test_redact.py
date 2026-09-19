@@ -129,6 +129,10 @@ SECRET_SAMPLES = [
 # 이제 마스킹기·게이트 양쪽에 있다.
 PREFIXED_SAMPLES = [
     ("prefixed_apikey", "apikey_" + "1" * 40),
+    # 실제 발급 키는 밑줄로 나뉜 **다구간**이다. 단일 구간 표본만 두었더니
+    # 본문이 첫 구간에서 멈춰 뒤 64자가 새는 것을 테스트가 놓쳤다.
+    ("prefixed_two_segment", "apikey_" + "a" * 36 + "_" + "b" * 64),
+    ("prefixed_three_segment", "api_key_" + "c" * 20 + "_" + "d" * 20 + "_" + "e" * 20),
     ("prefixed_api_key", "api_key_" + "2" * 40),
     ("prefixed_apitoken", "apitoken_" + "3" * 40),
     ("prefixed_api_token", "api_token_" + "4" * 40),
@@ -156,6 +160,7 @@ BENIGN_SAMPLES = [
     ("plain_korean", "머지 완료했고 CI 는 14/14 통과했다"),
     ("path", "/root/work/ccc-node/scripts/auto-distill/auto-distill.py:1235"),
     ("short_prefixed", "apikey_abc123"),
+    ("snake_case_identifier", "my_apikey_handler_for_testing_stuff"),
     # 경계 탐침 — {32,} 하한이 실제로 지켜지는지. 31자는 미달, 32자는 적중.
     ("boundary_31", "apikey_" + "7" * 31),
     # 게이트 오탐 실측분 — 이들이 적중하면 11노드 발행이 영구 차단된다.
