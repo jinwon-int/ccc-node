@@ -29,9 +29,12 @@ export CCC_STATE_DIR="$TMP/state"
 unset CCC_NUNCHI_AUDIENCE_SCOPED CCC_NUNCHI_AUDIENCE_ROOT CCC_NUNCHI_SCOPED_CHILD
 # The Jev backend's availability is a key, not a PATH entry. An inherited real
 # key would make the typesafe cases reach api.typesafe.ai for real — network and
-# cost in a suite whose whole contract is neither. Unset for the whole run; the
-# fixtures put a synthetic key in their own process environment only.
+# cost in a suite whose whole contract is neither. Unset the env var AND point
+# the ~/.secrets/typesafe-api-key file fallback (bridge-shared key file) at a
+# nonexistent path for the whole run; the fixtures put a synthetic key in their
+# own process environment only.
 unset TYPESAFE_API_KEY NUNCHI_JUDGE_MIN_CONFIDENCE
+export TYPESAFE_API_KEY_FILE="$TMP/no-such-key-file"
 
 # Default judge stubs: unavailable. Both names are always shadowed so auto
 # fallback can never escape to a real host CLI/provider during the suite.
@@ -592,6 +595,74 @@ ok "typesafe without TYPESAFE_API_KEY exits cleanly (key-based availability, no 
 ok "typesafe without a key fails closed to human" '[ "$(review_of "$idt1")" = 1 ]'
 ok "typesafe without a key is recorded as judge-unavailable" \
   'grep -q "judge-unavailable" "$NUNCHI_HOME/judge-audit.jsonl"'
+
+# ---- 12b. typesafe key-file fallback (bridge ~/.secrets/typesafe-api-key) ---
+# Same file the bridge jev-skill-advice feature reads, same safety contract
+# (owned regular file, no group/other bits, O_NOFOLLOW leaf, private parent).
+# An unsafe shape must degrade to "no key" — never raise, never log content.
+KEYFIX="$TMP/key-fixture.py"
+cat > "$KEYFIX" <<'FIXTURE'
+import importlib.util, os, sys, tempfile
+spec = importlib.util.spec_from_file_location("jb_key", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["jb_key"] = m
+spec.loader.exec_module(m)
+
+home = tempfile.mkdtemp()
+# Point expanduser at the fixture home FIRST — the runner's real ~/.secrets
+# must never be reachable from this test.
+os.environ["HOME"] = home
+secrets = os.path.join(home, ".secrets")
+os.makedirs(secrets)
+keypath = os.path.join(secrets, "typesafe-api-key")
+os.chmod(secrets, 0o700)
+os.environ.pop("TYPESAFE_API_KEY", None)
+os.environ.pop("TYPESAFE_API_KEY_FILE", None)
+
+assert m.typesafe_key() == "", "no file -> empty"
+
+with open(keypath, "w") as fh:
+    fh.write("file-secret-abc\n")
+os.chmod(keypath, 0o600)
+assert m.typesafe_key() == "file-secret-abc", "safe file -> key"
+
+os.environ["TYPESAFE_API_KEY"] = "env-secret"
+assert m.typesafe_key() == "env-secret", "env precedence over file"
+del os.environ["TYPESAFE_API_KEY"]
+
+os.chmod(keypath, 0o640)
+assert m.typesafe_key() == "", "group-readable file -> empty"
+os.chmod(keypath, 0o600)
+
+os.rename(keypath, keypath + ".real")
+os.symlink(keypath + ".real", keypath)
+assert m.typesafe_key() == "", "leaf symlink -> empty"
+os.rename(keypath + ".real", keypath)
+
+os.chmod(secrets, 0o777)
+assert m.typesafe_key() == "", "group/other-writable parent -> empty"
+os.chmod(secrets, 0o700)
+
+with open(keypath, "w") as fh:
+    fh.write("bad\nkey")
+assert m.typesafe_key() == "", "control char content -> empty"
+alt = os.path.join(home, "alt-key")
+with open(alt, "w") as fh:
+    fh.write("alt-secret")
+os.chmod(alt, 0o600)
+os.environ["TYPESAFE_API_KEY_FILE"] = alt
+assert m.typesafe_key() == "alt-secret", "explicit TYPESAFE_API_KEY_FILE override"
+os.chmod(alt, 0o644)
+assert m.typesafe_key() == "", "unsafe override file -> empty"
+del os.environ["TYPESAFE_API_KEY_FILE"]
+print("KEY-OK")
+FIXTURE
+key_out="$(python3 "$KEYFIX" "$JB" 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "typesafe key resolves from owner-only ~/.secrets file; unsafe shapes degrade to empty" \
+  '[ "$rc" = 0 ] && [ "$key_out" = "KEY-OK" ]'
+[ "$rc" = 0 ] || printf '%s\n' "$key_out"
 
 # ---- 13. NUNCHI_JUDGE_MIN_CONFIDENCE gate ---------------------------------
 # The gate only ever holds a decision that CARRIES a confidence. haiku/codex

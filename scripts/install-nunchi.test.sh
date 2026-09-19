@@ -147,6 +147,20 @@ ok "a deliberate re-apply without --judge removes the judge cron" \
 ok "opting out also drops --judge from the install record" \
   'jq -e ".argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
 
+# --- Judge provider passthrough: NUNCHI_JUDGE_PROVIDER lands in the managed
+# cron line so strip_cron/replay cannot silently revert the opted-in backend,
+# and an invalid value is a hard installer error (not a fail-closed cron).
+out="$(CCC_NUNCHI_JUDGE_PROVIDER=typesafe run_install --apply --codex --judge 2>&1)"; rc=$?
+ok "CCC_NUNCHI_JUDGE_PROVIDER=typesafe lands in the judge cron line" \
+  '[ "$rc" = 0 ] && grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_PROVIDER=typesafe"'
+ok "provider passthrough is reported by the installer" \
+  'grep -q "provider typesafe" <<<"$out"'
+ok "replay with the same env keeps exactly one provider-stamped judge line" \
+  'CCC_NUNCHI_JUDGE_PROVIDER=typesafe run_install --apply --codex --judge >/dev/null 2>&1 && [ "$(grep -c "NUNCHI_JUDGE_PROVIDER=typesafe.*judge-batch.py\|judge-batch.py.*NUNCHI_JUDGE_PROVIDER=typesafe" "$cron_store")" = 1 ]'
+out="$(CCC_NUNCHI_JUDGE_PROVIDER=bogus run_install --apply --codex --judge 2>&1)"; rc=$?
+ok "invalid provider value is a hard error (exit 2), cron untouched" \
+  '[ "$rc" = 2 ] && ! grep -q "NUNCHI_JUDGE_PROVIDER=bogus" "$cron_store"'
+
 # --- APPLY mode (#1264): dry-run is the default and apply is opt-in per node.
 # The flag exists so an approved apply pilot SURVIVES a re-apply — before it,
 # the only way to enable apply was hand-editing the managed cron line, which
