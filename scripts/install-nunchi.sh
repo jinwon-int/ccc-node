@@ -45,6 +45,18 @@ case "$JUDGE_PROVIDER" in
   ""|auto|claude|codex|typesafe) ;;
   *) echo "CCC_NUNCHI_JUDGE_PROVIDER='$JUDGE_PROVIDER' invalid (auto|claude|codex|typesafe)" >&2; exit 2 ;;
 esac
+# Confidence gate for apply-mode verdicts (judge-batch reads it at runtime).
+# 0.0 = gate off (the default); a stamped value must be a sane float in (0,1].
+JUDGE_MIN_CONFIDENCE="${CCC_NUNCHI_JUDGE_MIN_CONFIDENCE:-}"
+if [ -n "$JUDGE_MIN_CONFIDENCE" ]; then
+  case "$JUDGE_MIN_CONFIDENCE" in
+    (*[!0-9.]*|""|[.]*|*[!0-9.]|*[!0-9.]*.*[!0-9.]*)
+      : # fall through to the numeric check below
+      ;;
+  esac
+  python3 -c "import sys; sys.exit(0 if 0 < float(sys.argv[1]) <= 1 else 1)" "$JUDGE_MIN_CONFIDENCE" 2>/dev/null \
+    || { echo "CCC_NUNCHI_JUDGE_MIN_CONFIDENCE='$JUDGE_MIN_CONFIDENCE' invalid (0 < v <= 1)" >&2; exit 2; }
+fi
 WIKI_PROMOTE="${CCC_NUNCHI_WIKI_PROMOTE:-0}"
 WIKI_PROMOTE_APPLY="${CCC_NUNCHI_WIKI_PROMOTE_APPLY:-0}"
 AUDIENCE_SCOPED="${CCC_NUNCHI_AUDIENCE_SCOPED:-0}"
@@ -699,7 +711,9 @@ case "$ACTION" in
       if [ "$JUDGE_APPLY" = 1 ]; then judge_apply_env="NUNCHI_JUDGE_APPLY=1 "; fi
       judge_provider_env=""
       if [ -n "$JUDGE_PROVIDER" ] && [ "$JUDGE_PROVIDER" != auto ]; then judge_provider_env="NUNCHI_JUDGE_PROVIDER=$JUDGE_PROVIDER "; fi
-      append_cron_line "41 4 * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${judge_apply_env}${judge_provider_env}${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$python3_bin") $(cron_quote "$HOOKS/judge-batch.py") >> $(cron_quote "$NUNCHI_DIR/judge.cron.log") 2>&1 $MARK gen=$GEN"
+      judge_gate_env=""
+      if [ -n "$JUDGE_MIN_CONFIDENCE" ]; then judge_gate_env="NUNCHI_JUDGE_MIN_CONFIDENCE=$JUDGE_MIN_CONFIDENCE "; fi
+      append_cron_line "41 4 * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${judge_apply_env}${judge_provider_env}${judge_gate_env}${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$python3_bin") $(cron_quote "$HOOKS/judge-batch.py") >> $(cron_quote "$NUNCHI_DIR/judge.cron.log") 2>&1 $MARK gen=$GEN"
       if [ "$JUDGE_APPLY" = 1 ]; then
         echo "daily judge-batch cron added (04:41, APPLY — mutates the fact store${judge_provider_env:+, provider $JUDGE_PROVIDER})"
       else
