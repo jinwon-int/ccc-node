@@ -41,6 +41,7 @@ from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol
 
 from telegram_bot.core import session_resume, tool_policy
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
+from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor
 from telegram_bot.core.matrix.render import chunk_text, render_matrix_message
 from telegram_bot.core.matrix_ids import MatrixIdMap
 from telegram_bot.core.memory_audience import resolve_memory_audience
@@ -51,6 +52,7 @@ from telegram_bot.core.push_notifier import (
     PushNotifier,
 )
 from telegram_bot.core.session_scope import storage_key
+from telegram_bot.core.turn_watchdog import DEFAULT_NOTIFY_MINUTES, TurnAgeWatchdog
 from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE
 
@@ -434,17 +436,37 @@ class MatrixBot:
                 return
             self._post_startup_banner(config, transport)
             notifier = MatrixSpoolNotifier(self._settings, transport)
-            if not notifier.enabled:
+            watchdog = self._build_turn_age_watchdog()
+            if not notifier.enabled and watchdog is None:
                 await transport.run()
             else:
                 # Same TaskGroup semantics as transport.run(): a leg that dies
                 # stops the service so systemd restarts it whole.
+                stop = asyncio.Event()
                 async with asyncio.TaskGroup() as group:
-                    group.create_task(transport.run())
-                    group.create_task(notifier.run())
+                    # The watchdog loops until its stop event is set, and a
+                    # TaskGroup only cancels siblings when a leg raises — a
+                    # transport that returns *cleanly* would otherwise leave the
+                    # group waiting on the watchdog forever. Setting the event
+                    # from the transport leg's finally keeps shutdown finite on
+                    # both paths.
+                    group.create_task(self._run_until_stop(transport.run(), stop))
+                    if notifier.enabled:
+                        group.create_task(notifier.run())
+                    if watchdog is not None:
+                        group.create_task(watchdog.run(stop), name="matrix-turn-age-watchdog")
         finally:
             self._transport = None
             await transport.close()
+
+    @staticmethod
+    async def _run_until_stop(leg: Awaitable[None], stop: asyncio.Event) -> None:
+        """Await the serving leg, then release every stop-event-driven sibling."""
+
+        try:
+            await leg
+        finally:
+            stop.set()
 
     def startup_banner(self) -> str:
         """One-line "frontend is up" notice: node · provider · model · effort · rev.
@@ -580,6 +602,57 @@ class MatrixBot:
         except Exception:
             logger.exception("Matrix async completion delivery failed for chat %s", chat_id)
             return False
+
+    async def _notify_chat(self, chat_id: int, text: str) -> bool:
+        """``(chat_id, text) -> delivered`` seam the background monitors need (#1825).
+
+        Every monitor in ``core/`` takes exactly this callable, and
+        ``async_completion_sender`` already is one modulo the unused ``user_id``.
+        Going through it rather than ``_deliver_notice`` matters: the raw
+        enqueue raises on an unknown room or oversized text, and a monitor
+        expects ``False``, not an exception.
+        """
+
+        return await self.async_completion_sender(0, chat_id, text)
+
+    def _build_turn_age_watchdog(self) -> TurnAgeWatchdog | None:
+        """Notify-only turn-age dashboard (#1111) for the Matrix frontend (#1825).
+
+        Telegram gets this from ``BotLifecycleMixin``, which ``MatrixBot`` does
+        not inherit, so a Matrix turn that lost its terminal frame produced no
+        signal at all — the operator had to ask whether anything was running.
+        The watchdog never interrupts, pauses, or reroutes a turn; it only
+        reports age. ``None`` when explicitly disabled or when the handler
+        exposes no session registry to read ages from.
+        """
+
+        threshold_min = ExternalWaitMonitor.env_int(
+            "CCC_TURN_AGE_NOTIFY_MIN", default=DEFAULT_NOTIFY_MINUTES
+        )
+        if threshold_min <= 0:
+            logger.info("Matrix turn-age watchdog disabled (CCC_TURN_AGE_NOTIFY_MIN=0)")
+            return None
+        registry = getattr(self._project_chat, "_agent_session_registry", None)
+        if registry is None:
+            logger.warning(
+                "Matrix turn-age watchdog unavailable: no session registry on project chat"
+            )
+            return None
+        renotify_min = ExternalWaitMonitor.env_int("CCC_TURN_AGE_RENOTIFY_MIN", default=30)
+
+        def turns_provider() -> list[tuple[int, int, float]]:
+            return [
+                (int(key[0]), int(key[1]), float(started))
+                for key, started in registry.active_turn_ages()
+                if len(key) >= 2
+            ]
+
+        return TurnAgeWatchdog(
+            turns_provider=turns_provider,
+            notifier=self._notify_chat,
+            threshold_seconds=threshold_min * 60.0,
+            renotify_seconds=renotify_min * 60.0,
+        )
 
     def _notification_bot(self) -> _NotificationRoute:
         return _NotificationRoute(self._deliver_notice)

@@ -62,6 +62,7 @@ from telegram_bot.core.request_lifecycle import (
 from telegram_bot.core.usage import claude_endpoint_host
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE
 from telegram_bot.core.sdk_text import TERMINAL_STALL_NOTICE
+from telegram_bot.core.skill_advice import advise_turn
 from telegram_bot.utils.chat_logger import log_chat
 from telegram_bot.core.codex_app_server import CodexConnectionClosedError
 from telegram_bot.utils.health import health_reporter
@@ -437,6 +438,7 @@ class ProjectChatProcessMixin:
             notification_bot=notification_bot,
             interim_message_callback=interim_message_callback,
             usage_mode=usage_mode,
+            skill_advice_allowed=sensitive_log_event is None,
             resume_task=resume_task,
             dispatch_guard=dispatch_guard,
             streaming_sink=streaming_sink,
@@ -732,6 +734,7 @@ class ProjectChatProcessMixin:
         notification_bot: Optional[Any] = None,
         usage_mode: str = MODE_INTERACTIVE,
         admission_timeout_override: Optional[float] = None,
+        skill_advice_allowed: bool = True,
         resume_task: bool = False,
         dispatch_guard: Callable[[], bool] | None = None,
         streaming_sink: Optional[Any] = None,
@@ -1159,10 +1162,16 @@ class ProjectChatProcessMixin:
                     if callable(authorize_followup):
                         authorize_followup()
                         followup_authorized = True
+                turn_message = await advise_turn(
+                    user_message, settings=self._config, user_id=user_id, chat_id=chat_id,
+                    interactive=(skill_advice_allowed and usage_mode == MODE_INTERACTIVE and not resume_task
+                                 and dispatch_guard is None
+                                 and admission_timeout_override is None),
+                )
                 turn_outcome = await asyncio.wait_for(
                     consume_turn_stream(
                         session.send_turn(
-                            user_message,
+                            turn_message,
                             approval_handler=handle_approval,
                         ).__aiter__(),
                         state=turn_state,
