@@ -9,7 +9,9 @@ Two pure helpers with no Matrix client dependency:
   markup at all so the transport can send a bare ``m.text``.
 * :func:`chunk_text` splits long text on paragraph/line boundaries without
   ever cutting through a fenced code block (the fence is closed at the end of
-  one chunk and reopened at the start of the next).
+  one chunk and reopened at the start of the next). Its limit is measured in
+  **UTF-8 bytes**, because what bounds a Matrix event is a byte size and not a
+  character count (#1828).
 
 Safety model: every character of user/agent text is HTML-escaped *before* any
 tag is inserted, tags are only ever emitted from fixed literals in this
@@ -41,7 +43,39 @@ _PLACEHOLDER = "\x00{}\x00"
 _PLACEHOLDER_RE = re.compile("\x00(\\d+)\x00")
 
 _MIN_CHUNK_LIMIT = 64
-_FENCE_CLOSE_COST = 4  # "\n```"
+_FENCE_CLOSE_COST = 4  # "\n```" — ASCII, so its byte cost equals its length
+
+
+def _w(text: str) -> int:
+    """UTF-8 byte width of ``text``.
+
+    ``chunk_text`` budgets in bytes, not characters: a Matrix event is bounded
+    by the homeserver's PDU byte limit, and one Korean/CJK character costs
+    three bytes. Sizing in characters let a 12,000-character Korean answer
+    build a ~36 KB ``body`` (plus a comparable ``formatted_body`` in the same
+    event), which overruns the 65,536-byte limit and used to surface as an
+    unretryable 413 (#1828).
+    """
+
+    return len(text.encode("utf-8"))
+
+
+def _head_within(text: str, budget: int) -> str:
+    """Longest prefix of ``text`` that fits ``budget`` bytes, never splitting a character.
+
+    Decoding with ``errors="ignore"`` drops a trailing partial sequence, so the
+    prefix is always whole characters. Callers resume from ``text[len(head):]``,
+    which re-includes the character that was cut in half — nothing is lost.
+    At least one character is always returned so a hard cut cannot stall.
+    """
+
+    if budget <= 0 or not text:
+        return text[:1]
+    raw = text.encode("utf-8")
+    if len(raw) <= budget:
+        return text
+    head = raw[:budget].decode("utf-8", errors="ignore")
+    return head or text[:1]
 
 
 class _Inline:
@@ -171,13 +205,18 @@ def _fence_state(line: str, in_fence: bool) -> tuple[bool, bool, bool]:
 
 
 def chunk_text(text: str, limit: int = 12_000) -> list[str]:  # noqa: C901
-    """Split ``text`` into pieces of at most ``limit`` characters.
+    """Split ``text`` into pieces of at most ``limit`` **UTF-8 bytes**.
 
     Preference order for a cut: the last blank line outside a fence, then a
     line boundary, then (only for a single oversized line) a hard cut. A
     fenced block that spans a cut is closed with ````` ``` ````` at the end of
     the chunk and reopened with its original opener line at the start of the
     next one, so every chunk renders as balanced markdown on its own.
+
+    The limit counts bytes rather than characters (#1828). For ASCII the two
+    agree, so existing behaviour is unchanged; for Korean/CJK a chunk is now
+    bounded by what the homeserver actually measures. A hard cut never splits a
+    character — see :func:`_head_within`.
     """
 
     if limit < _MIN_CHUNK_LIMIT:
@@ -185,7 +224,7 @@ def chunk_text(text: str, limit: int = 12_000) -> list[str]:  # noqa: C901
     text = str(text or "")
     if not text:
         return []
-    if len(text) <= limit:
+    if _w(text) <= limit:
         return [text]
 
     chunks: list[str] = []
@@ -210,10 +249,10 @@ def chunk_text(text: str, limit: int = 12_000) -> list[str]:  # noqa: C901
         opens, closes, fence_after = _fence_state(line, in_fence)
         reserve = _FENCE_CLOSE_COST if fence_after else 0
         sep = 1 if current else 0
-        new_len = current_len + sep + len(line)
+        new_len = current_len + sep + _w(line)
         if new_len + reserve <= limit:
             if opens:
-                opener = line if len(line) <= 40 else "```"
+                opener = line if _w(line) <= 40 else "```"
             current.append(line)
             current_len = new_len
             in_fence = fence_after
@@ -243,11 +282,12 @@ def chunk_text(text: str, limit: int = 12_000) -> list[str]:  # noqa: C901
         # A single line that cannot fit even in a fresh chunk: hard cut.
         cap = limit - current_len - sep - reserve
         if in_fence and current == [opener]:
-            cap = limit - len(opener) - 1 - _FENCE_CLOSE_COST
+            cap = limit - _w(opener) - 1 - _FENCE_CLOSE_COST
         cap = max(cap, 1)
-        current.append(line[:cap])
-        current_len += sep + cap
-        queue.appendleft(line[cap:])
+        piece = _head_within(line, cap)
+        current.append(piece)
+        current_len += sep + _w(piece)
+        queue.appendleft(line[len(piece):])
         if in_fence:
             emit(current + ["```"])
             reopen = opener
