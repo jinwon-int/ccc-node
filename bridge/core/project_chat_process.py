@@ -438,6 +438,7 @@ class ProjectChatProcessMixin:
             notification_bot=notification_bot,
             interim_message_callback=interim_message_callback,
             usage_mode=usage_mode,
+            skill_advice_allowed=sensitive_log_event is None,
             resume_task=resume_task,
             dispatch_guard=dispatch_guard,
             streaming_sink=streaming_sink,
@@ -733,6 +734,7 @@ class ProjectChatProcessMixin:
         notification_bot: Optional[Any] = None,
         usage_mode: str = MODE_INTERACTIVE,
         admission_timeout_override: Optional[float] = None,
+        skill_advice_allowed: bool = True,
         resume_task: bool = False,
         dispatch_guard: Callable[[], bool] | None = None,
         streaming_sink: Optional[Any] = None,
@@ -1162,7 +1164,7 @@ class ProjectChatProcessMixin:
                         followup_authorized = True
                 turn_message = await advise_turn(
                     user_message, settings=self._config, user_id=user_id, chat_id=chat_id,
-                    interactive=(usage_mode == MODE_INTERACTIVE and not resume_task
+                    interactive=(skill_advice_allowed and usage_mode == MODE_INTERACTIVE and not resume_task
                                  and dispatch_guard is None
                                  and admission_timeout_override is None),
                 )

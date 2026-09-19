@@ -54,7 +54,8 @@ local skill contents, attachment contents read from disk, or tool output is
 collected by this feature. This still sends eligible user text to an additional
 external provider. Control/slash/explicit skill invocations, short context-only
 approvals/continuations, external event envelopes, group conversations and
-recognizable attachment/credential/code-block text are skipped. These textual
+sensitive-log turns (including inbound documents), and recognizable
+attachment/credential/code-block text are skipped. These textual
 filters are conservative heuristics, **not** a comprehensive DLP classifier;
 sensitive text should not be submitted on enabled conversations.
 

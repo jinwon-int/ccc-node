@@ -3222,8 +3222,9 @@ async def test_approval_stall_message_names_the_pending_claude_tool(
 @pytest.mark.anyio
 @pytest.mark.parametrize("provider", ["codex", "claude", "piri", "danso"])
 @pytest.mark.parametrize("route", ["telegram", "matrix"])
+@pytest.mark.parametrize("sensitive", [None, "inbound_document"])
 async def test_skill_advice_reaches_common_provider_turn_only(
-    tmp_path: Path, monkeypatch, provider: str, route: str,
+    tmp_path: Path, monkeypatch, provider: str, route: str, sensitive: str | None,
 ) -> None:
     from telegram_bot.core import project_chat_process as process
     observed = []
@@ -3235,6 +3236,7 @@ async def test_skill_advice_reaches_common_provider_turn_only(
     handler = ProjectChatHandler(settings=_settings(tmp_path, provider=provider),
                                  agent_runtime=FakeRuntime([session]), memory_route=route)
     handler._task_ledger_cache = False
-    response = await handler.process_message("Find public documentation", user_id=7, chat_id=7)
+    response = await handler.process_message("Find public documentation", user_id=7, chat_id=7,
+                                             sensitive_log_event=sensitive)
     assert response.success and session.messages == ["advisory\nFind public documentation"]
-    assert len(observed) == 1 and observed[0][1]["interactive"] is True
+    assert len(observed) == 1 and observed[0][1]["interactive"] is (sensitive is None)

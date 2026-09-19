@@ -13,7 +13,7 @@ import stat
 import time
 from typing import Any
 
-from telegram_bot.core.skill_command import _validated_skill_file
+from telegram_bot.core.skill_command import EXPLICIT_SKILL_PREFIX, _validated_skill_file
 
 logger = logging.getLogger(__name__)
 MODEL = "jev-1.13.0"
@@ -179,7 +179,8 @@ async def advise_turn(
         or not 9 <= len(message) <= 4000
         or message.lstrip().startswith(("/", "<", "["))
         or _SKIP.search(message)
-        or _CONTEXT_ONLY.search(message)
+        or message.lstrip().startswith(EXPLICIT_SKILL_PREFIX)
+        or _CONTEXT_ONLY.search(message.lstrip())
         or re.search(r"(?:^|\s)[$/][A-Za-z][\w-]*", message)
         or any(name in message for name in SKILLS)
     ):

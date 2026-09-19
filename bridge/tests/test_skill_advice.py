@@ -281,3 +281,27 @@ def test_http_transport_is_fixed_bounded_no_redirect(monkeypatch):
     )
     with pytest.raises(ValueError, match="oversized_response"):
         asyncio.run(m._infer({}, "synthetic"))
+
+
+def test_expanded_explicit_skill_excluded(setup):
+    from telegram_bot.core.skill_command import expand_audience_scoped_skill_command
+
+    path = setup.home / ".claude/skills/custom-review/SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("---\nname: custom-review\n---\nPerform the local task.")
+    config = SimpleNamespace(
+        agent_provider="claude",
+        execution_profile="owner-operator",
+        bridge_memory_mode="audience-scoped",
+        project_root=setup.home,
+    )
+    expanded = expand_audience_scoped_skill_command(config, "/custom-review Inspect public docs")
+    assert expanded.startswith("The bridge resolved")
+    assert run(setup, expanded) == expanded
+    assert not setup.calls
+
+
+def test_whitespace_context_only_excluded(setup):
+    message = "  continue with the previous request"
+    assert run(setup, message) == message
+    assert not setup.calls
