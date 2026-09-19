@@ -83,6 +83,30 @@ fresh explicit user approval in the current conversation, in both directions.
 
    - Old approvals, memory, environment state, or approval for another PR do
      not count. If approval is absent or ambiguous, stop and ask.
+   - **Pushing to someone else's PR can delete the only remaining approver.**
+     `jinwon-int/ccc-node` `main` sets `require_last_push_approval: true`, so
+     the account that pushed last cannot approve that PR. Push a review fix to
+     a `jinon86`-authored PR as `seoseo-ai` and both paths close: `seoseo-ai`
+     is now the last pusher, `jinon86` is the author. Nothing can approve it,
+     and `enforce_admins: true` means no bypass. Read the rule and count who is
+     left *before* pushing:
+
+     ```bash
+     gh api repos/<owner>/<repo>/branches/main/protection \
+       --jq '.required_pull_request_reviews.require_last_push_approval'
+     ```
+
+     Prefer a review comment, or carry the fix in your own PR. A one-line push
+     is still fine when the PR is already blocked for another reason (failing
+     required checks, draft) — there is no approval to lose yet.
+   - **Force-pushing the offending commit away does not undo it.** GitHub keys
+     this rule to the *pusher*, not the commits: rewinding the branch to the
+     author's own SHA still records you as the last pusher and the enqueue is
+     refused with the same message. Verified 2026-09-19 on #1802.
+     The ways out are (a) the original author pushes anything, even an empty
+     commit, or (b) reopen the work as a PR you author, so the other account
+     can review it. Keep the original commits (and their author metadata)
+     when you do (b), and say in both PRs why the number changed.
    - **One narrow exception, and it is not this one.** Some repos deny
      infrastructure paths (`scripts/`, `.github/`) at a required check on every
      branch and deliberately leave `enforce_admins` false, documenting the admin
@@ -344,6 +368,9 @@ permission is unavailable, report it rather than moving a credential.
 - Never push directly to `main`; always use a branch and PR.
 - The PR author cannot approve their own PR. Keep author and reviewer identities
   independent.
+- Under `require_last_push_approval`, whoever pushed last cannot approve either.
+  Author and last pusher are two separate disqualifications, and on a two-account
+  repo pushing to the other account's PR can leave nobody eligible. See step 5.
 - Only merge with green required checks and a mergeable state. Report failed or
   pending checks instead of forcing the merge.
 - Never read, print, copy, persist, export, or re-login with the relay's gh

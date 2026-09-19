@@ -42,7 +42,10 @@ Legacy health snapshots without these additive counters remain readable. The
 `CCC_USAGE_BUDGET_TOKENS_*` settings (fleet default 2,000,000 per provider per
 KST day since 2026-09-02; `0` disables) cap only the provider's daily autonomous
 input+output tokens: interactive turns remain metered in `usage-meter.json`, but
-never consume that allowance or get rejected by it.
+never consume that allowance or get rejected by it. Piri is the exception since
+2026-09-18: its fleet default is `0` (request-count metering saturated the shared
+default), so piri autonomous spend is metered but uncapped unless a node sets a
+finite value.
 
 Codex long-thread visibility is intentionally bounded. The resume path keeps
 using `excludeTurns` plus a one-turn `thread/turns/list` check when supported;

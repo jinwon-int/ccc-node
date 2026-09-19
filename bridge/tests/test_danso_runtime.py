@@ -241,9 +241,9 @@ async def test_default_long_task_profile_forwards_budgets_progress_and_explicit_
     assert first[-1].kind == "completion"
     argv = json.loads((Path(settings.danso_workspace) / "argv.json").read_text())
     for flag, value in (
-        ("--task-stage-requests", "16"),
-        ("--task-max-requests", "1024"),
-        ("--task-max-tokens", "10000000"),
+        ("--task-stage-requests", "1024"),
+        ("--task-max-requests", "2048"),
+        ("--task-max-tokens", "25000000"),
         ("--task-repeat-limit", "3"),
         ("--task-pause-after-stage", "1"),
     ):
@@ -453,6 +453,9 @@ raise SystemExit(code)
             "OPENAI_API_KEY": "fixture-key",
             "CCC_DANSO_LONG_TASK_ENABLED": "true",
             "CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS": "3",
+            # Pin the budget so the stub's requests=1024 "exhaust" turn still
+            # reads as budget exhaustion regardless of repo defaults.
+            "CCC_DANSO_TASK_MAX_REQUESTS": "1024",
             "CLAUDE_PROCESS_TIMEOUT": "13",
             "CCC_DELEGATED_TASK_STALL_SECONDS": "10",
         },

@@ -3,9 +3,9 @@
  "pipeline": 6,
  "subject": {
   "path": "scripts/auto-distill/auto-distill.py",
-  "sha256": "cbc585ceb80d978af246834016b59af9ebb0b067586549df579209bceabd5e86",
+  "sha256": "29c3c4c263f797b6cffaad45cceefa170e18c7941fefafd4c6105fb1bc279a31",
   "surface_schema": "ccc.auto-distill.canon-surface.v1",
-  "surface_sha256": "d812bf45a4677e1ff0e1fbb445a3b590c72d327d0340e63a2915074b3c25e158",
+  "surface_sha256": "9894a32ba4d262512a8f44eb4f00a10486adcb7b01d7131816b646f85ebadc28",
   "surface_members": [
    "assign:PIPELINE",
    "assign:CANON_PROMPT",
@@ -28,16 +28,16 @@
   ]
  },
  "evaluation": {
-  "id": "TM-3322",
-  "evaluated_source_sha256": "cbc585ceb80d978af246834016b59af9ebb0b067586549df579209bceabd5e86",
-  "completed_at": "2026-09-06T14:17:18Z",
+  "id": "TM-3446",
+  "evaluated_source_sha256": "29c3c4c263f797b6cffaad45cceefa170e18c7941fefafd4c6105fb1bc279a31",
+  "completed_at": "2026-09-19T08:26:12Z",
   "provider": "claude-code-oauth",
   "model": "claude-haiku-4-5-20251001",
   "model_resolution": {
    "alias": "claude-haiku-4-5-20251001",
    "resolved_id": "claude-haiku-4-5-20251001",
    "resolved_by": "claude-json-modelUsage:envelopes (47/47 calls)",
-   "resolved_at": "2026-09-06T14:17:18Z"
+   "resolved_at": "2026-09-19T08:26:12Z"
   },
   "corpus": {
    "sample": "sample-v4.json",
@@ -49,28 +49,28 @@
    "cases": 47
   },
   "harness": {
-   "eval_canon_sha256": "9ac9a625f3e053d7262e5d00bca4996770c0360232077dd3c7685c4185254912",
-   "recheck_addr_sha256": "fa548ba555112c802eff7afd999ea4d1c7186239d15b43a61bea530726d3bf9d"
+   "eval_canon_sha256": "66af41f639d891dfcc763502af99fa44e91f5c519aeb43a276a83c578abf0355",
+   "recheck_addr_sha256": "698599263790d4826416b6a6474d2a572d6791178488773990ecc433d011df5e"
   },
   "artifacts": {
-   "eval_log_sha256": "9fcd5ad6b5fde309baf477b4c9563baad71683b522a753249c88206bda2e3001",
-   "eval_result_sha256": "c80575ecdc51a5a66e5ecaf5dc71c026ee836fdf7563c557aa999ff49989abb9",
-   "recheck_log_sha256": "be894010043f8d8c187e81587a47aa717f71eb6466b54aa651ea85adefda2df4"
+   "eval_log_sha256": "44bdc1147408c05f41ffb118e7ccb7e920383f0e15d538390e7378f32271348c",
+   "eval_result_sha256": "6b974d1c1f7adf6f9b17b2af5d1bacc5fd86cb18bd614f5684312a517c8f3232",
+   "recheck_log_sha256": "7b9a4406938f29e177da9b479fdedead2b4c6aa7afe9c1eab72c19da034e551c"
   },
   "recheck": {
    "baseline_duplicates": 1,
-   "duplicates": 5,
+   "duplicates": 6,
    "cases": 12,
    "suspect": 0
   },
   "confusion": {
-   "tp": 16,
+   "tp": 14,
    "fp": 1,
-   "fn": 7,
+   "fn": 9,
    "tn": 23
   },
   "collateral_damage": 0,
   "passed": true
  },
- "issued_at": "2026-09-06T23:18:09+09:00"
+ "issued_at": "2026-09-19T19:12:35+09:00"
 }

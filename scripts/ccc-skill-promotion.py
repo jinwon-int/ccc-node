@@ -2997,6 +2997,24 @@ def _revise_dispatch_target(
     if parsed is None or pr is None:
         return "revise_record_invalid"
     node, name, tree12 = parsed
+    # #1628 (2026-09-18): the row already records the lineage keys the
+    # candidate was staged under. Re-deriving them from the transport id
+    # invents a second answer to a question the row has answered, and on
+    # `gwakga-claude-bash-provider-capability-gate-claude-b2fac765d7c9` the
+    # two disagree: `-claude-` appears twice, so the split takes the first
+    # marker and hands back `bash-provider-capability-gate-claude` while the
+    # row says `bash-provider-capability-gate`. The deferral written from the
+    # parse then keys a lineage no other row shares, and everything keyed on
+    # (node, name) — the round limit, the already-dispatched check, the B2
+    # prior-substitute guard — searches under a name that finds no history.
+    #
+    # Prefer the row; keep the parse for the pre-R2 rows that carry only a
+    # transport id (6 of 316 on the live publisher ledger). tree12 still comes
+    # from the parse either way: the fixed 12-char suffix is unambiguous even
+    # when the name is not.
+    row_node, row_name = row.get("node"), row.get("name")
+    if isinstance(row_node, str) and row_node and isinstance(row_name, str) and row_name:
+        node, name = row_node, row_name
     if node == "ccc-node":
         return "revise_canon_lane"
     return node, name, tree12, pr, provider, head, pr_url
@@ -3102,6 +3120,42 @@ def _revise_substitute_pick(
     return ordered[index]
 
 
+def _revise_substitute_used(
+    rows: list[dict[str, object]], node: str, name: str
+) -> bool:
+    """Whether a substitute has already taken a revise round on this lineage."""
+    return any(
+        item.get("kind") == "a2a-revise-dispatch"
+        and item.get("node") == node
+        and item.get("name") == name
+        # Dispatch records persist a boolean, not the result summary's worker
+        # string. A malformed explicit marker also withholds another attempt;
+        # legacy author-only rows without this field remain compatible.
+        and "substitute" in item
+        and item["substitute"] is not False
+        for item in rows
+    )
+
+
+def _revise_substitute_eligible(
+    config: Config, rows: list[dict[str, object]], node: str, name: str
+) -> bool:
+    """Whether B2 would hand this lineage to a substitute if the author were
+    offline right now — the ledger-only half of the decision.
+
+    Deliberately excludes `_revise_substitute_pick`, which needs a broker
+    round trip and a keyring secret. What is left is a pure function of the
+    ledger and the configured threshold, so a dry run can answer it without
+    contacting a broker. Read it as eligibility, never as the final reviser:
+    `_resolve_revise_target` tries the author first and keeps the round there
+    whenever the author is online, and even an eligible lineage stays with the
+    author when no candidate is online or the only candidate is the reviewer.
+    """
+    if _revise_substitute_used(rows, node, name):
+        return False
+    return _revise_substitute_due(config, rows, node, name)
+
+
 def _revise_substitute_for(
     config: Config,
     rows: list[dict[str, object]],
@@ -3114,20 +3168,7 @@ def _revise_substitute_for(
     """The substitute for this lineage when B2 is due, else None. None covers
     every stay-normal case: feature off, skip too fresh, no online candidate,
     reviewer collision, or a substitute already used for this lineage."""
-    prior_substitute = any(
-        item.get("kind") == "a2a-revise-dispatch"
-        and item.get("node") == node
-        and item.get("name") == name
-        # Dispatch records persist a boolean, not the result summary's worker
-        # string. A malformed explicit marker also withholds another attempt;
-        # legacy author-only rows without this field remain compatible.
-        and "substitute" in item
-        and item["substitute"] is not False
-        for item in rows
-    )
-    if prior_substitute:
-        return None
-    if not _revise_substitute_due(config, rows, node, name):
+    if not _revise_substitute_eligible(config, rows, node, name):
         return None
     return _revise_substitute_pick(config, secret, node, reviewer, f"{node}:{name}:{tree12}")
 
@@ -3566,7 +3607,22 @@ def _sweep_deferred_revises(config: Config, *, dry_run: bool) -> list[dict[str, 
     for item in due[: config.collect_window]:
         pr = str(item.get("pr"))
         if dry_run:
-            swept.append({"outcome": "would-retry-deferred-revise", "pr": pr})
+            # #1628 B2: the substitute decision lives inside
+            # _dispatch_intake_revise, which this branch returns before ever
+            # reaching. A dry run therefore reported every due lineage as a
+            # plain author retry no matter how the threshold was configured —
+            # the one command meant to preview a collect omitted exactly the
+            # path worth previewing, and reading that silence as "the gate is
+            # off" is a mistake this field exists to prevent.
+            swept.append(
+                {
+                    "outcome": "would-retry-deferred-revise",
+                    "pr": pr,
+                    "substitute_eligible": _revise_substitute_eligible(
+                        config, rows, str(item.get("node")), str(item.get("name"))
+                    ),
+                }
+            )
             continue
         origin = next(
             (
@@ -3813,6 +3869,59 @@ def _pr_by_dispatched_task(rows: list[dict[str, object]]) -> dict[str, str]:
 _TERMINAL_VERDICTS = frozenset({"approve", "reject"})
 
 
+# Both lane ids this file builds embed the PR number the round was opened
+# for — `_INTAKE_LANE-pr{n}-{node}-{stamp}` and `_REVISE_LANE-pr{n}-...`. The
+# broker may append its own disambiguating suffix to the id it returns, but
+# the prefix is ours, so this is a local contract rather than a broker one.
+_TASK_ID_PR = re.compile(r"-pr(\d+)-")
+
+
+def _verdict_pr(task: str, pr_by_task: dict[str, str]) -> str | None:
+    """PR for a verdict's task: the dispatch row first, the task id second.
+
+    #1628 (2026-09-18): attribution used the dispatch join alone and dropped
+    any verdict it could not place. Five `approve` verdicts on the publisher
+    were invisible that way — their early-round `a2a-dispatch` rows are not in
+    the ledger at all, so `_resolved_lineage_prs` could not see them. A
+    dropped verdict is not a neutral omission: if the one dropped is a
+    lineage's LATEST verdict, that lineage reads as undecided and the revise
+    paths #1779 taught to skip decided lineages start owing it a round again.
+
+    The dispatch row's `pr_url` stays authoritative and is never overridden —
+    the task id is consulted only when the join comes up empty. On the live
+    publisher ledger the two agree on every row where both are available
+    (315/315 verdict tasks, 316/316 dispatch tasks, no disagreement and no
+    parse failure), which is what makes the fallback safe to trust rather
+    than a second guess at the same question.
+    """
+    mapped = pr_by_task.get(task)
+    if mapped is not None:
+        return mapped
+    found = _TASK_ID_PR.search(task)
+    return found.group(1) if found else None
+
+
+def _unattributable_verdicts(rows: list[dict[str, object]]) -> list[str]:
+    """Verdict task ids that neither route can place on a PR, newest last.
+
+    Fail loud rather than silently: a verdict nothing can attribute leaves a
+    lineage looking undecided, and that is the precondition for dispatching a
+    revise onto an approved or rejected lineage. Reported so the condition is
+    visible in a collect instead of only reachable by hand.
+    """
+    pr_by_task = _pr_by_dispatched_task(rows)
+    orphans: list[tuple[str, str]] = []
+    for row in rows:
+        if row.get("kind") != "a2a-verdict":
+            continue
+        task, stamp = row.get("task_id"), row.get("ts")
+        if not isinstance(task, str) or not task:
+            continue
+        if _verdict_pr(task, pr_by_task) is None:
+            orphans.append((str(stamp or ""), task))
+    return [task for _, task in sorted(orphans)]
+
+
 def _latest_verdicts_by_pr(rows: list[dict[str, object]]) -> dict[str, str]:
     """PR number -> the most recent verdict recorded for that lineage.
 
@@ -3832,7 +3941,7 @@ def _latest_verdicts_by_pr(rows: list[dict[str, object]]) -> dict[str, str]:
             continue
         if not isinstance(task, str) or not isinstance(stamp, str):
             continue
-        pr = pr_by_task.get(task)
+        pr = _verdict_pr(task, pr_by_task)
         if pr is None:
             continue
         if pr not in latest or stamp > latest[pr][0]:
@@ -3876,7 +3985,10 @@ def _approve_lineage_prs(rows: list[dict[str, object]]) -> dict[str, str]:
         task, stamp = row.get("task_id"), row.get("ts")
         if not isinstance(task, str) or not isinstance(stamp, str):
             continue
-        pr = pr_by_task.get(task)
+        # Same attribution as the eligibility map above, deliberately: reading
+        # the two questions off different joins is how a PR ends up eligible
+        # by one and ageless by the other.
+        pr = _verdict_pr(task, pr_by_task)
         if pr is None or latest.get(pr) != "approve":
             continue
         if pr not in approved or stamp < approved[pr]:
@@ -5537,6 +5649,13 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
             "deferred": _sweep_deferred_revises(config, dry_run=dry_run),
             "results": _consume_revise_results(config, dry_run=dry_run),
         }
+        # #1628: read after the passes above, so verdicts appended in this
+        # cycle are included. Present only when non-empty — an unattributable
+        # verdict is an anomaly worth seeing in the output, not a routine
+        # gauge that trains the reader to ignore it.
+        unattributable = _unattributable_verdicts(_ledger_rows(config))
+        if unattributable:
+            revise["unattributable_verdicts"] = unattributable
     # Last, and outside `revise_enabled`: this pass observes what an approve
     # verdict left behind, so it must still run on a publisher with revision
     # rounds switched off, and it must see any verdict rows the passes above

@@ -121,5 +121,25 @@ prompt_of() { awk "/^PROMPT_PREFIX='/{f=1;next} f && /^'/{exit} f{print}" "$1"; 
 ok "feed prompt blocks stay byte-identical across lanes" \
   '[ "$(prompt_of "$FEED")" = "$(prompt_of "$PIRI_FEED")" ]'
 
+# #1837: the feed prompts, distill/extract.sh, and the bridge HonchoFact model
+# each declared a different kind enum, so live facts (fact/task-progress/
+# procedure/correction) fell outside the prompt that produced them and nunchi
+# flagged them for human review. Pin the unified 9-kind union in BOTH lanes:
+# dropping one kind from either prompt must fail here, not drift silently.
+feed_declares_kind() {
+  local file="$1" kind="$2"
+  prompt_of "$file" | grep -q "[\"|]${kind}[\"|]" || return 1
+  prompt_of "$file" | grep -q "^  $kind="
+}
+for expected_kind in preference decision observation context constraint \
+  task-progress procedure fact correction; do
+  ok "codex lane prompt declares kind=$expected_kind with a one-line meaning" \
+    "feed_declares_kind \"\$FEED\" $expected_kind"
+  ok "piri lane prompt declares kind=$expected_kind with a one-line meaning" \
+    "feed_declares_kind \"\$PIRI_FEED\" $expected_kind"
+done
+ok "both feed prompts keep task-progress separated from decision" \
+  'grep -q "task-progress=진행/완료 보고. 결정이 아니다." "$FEED" && grep -q "task-progress=진행/완료 보고. 결정이 아니다." "$PIRI_FEED"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -69,9 +69,11 @@
             "decision",
             "observation",
             "context",
+            "constraint",
             "task-progress",
             "procedure",
-            "constraint"
+            "fact",
+            "correction"
           ],
           "title": "Kind",
           "type": "string"
@@ -161,7 +163,7 @@
           "type": "string"
         },
         "suggested_path": {
-          "pattern": "^(?:pages/log\\.md|pages/(?:team|nodes)/[A-Za-z0-9][A-Za-z0-9._-]*/(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*\\.md)$",
+          "pattern": "^(?:pages/log\\.md|pages/(?:nodes|team)/[A-Za-z0-9][A-Za-z0-9._-]*/(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*\\.md|pages/(?:archive|decisions|incidents|owners|runbooks|services)/(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*\\.md)$",
           "title": "Suggested Path",
           "type": "string"
         },

@@ -4,6 +4,34 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **auto-distill: transport failures no longer spend the dead-letter budget
+  (#1831).** Failures where the model was never reached (`model_unavailable:*`,
+  limit/overload stderr on a non-zero exit, `model_spawn_error`) count against
+  a separate bounded `TRANSPORT_FAIL_BUDGET` (48 ≈ 24h at `*/30`) instead of the
+  3-attempt quality budget, so an account-limit outage no longer parks finished
+  sessions forever after ~1.5h. Two consecutive transport failures open a
+  per-run circuit (`transport_circuit_open`); `--revive-dead-letters [--only]`
+  is the one-shot operator recovery for already-parked sessions.
+  Receipt re-issued as **TM-3446** (source `29c3c4c2…`, surface `9894a32b…`):
+  TP 14 / FP 1 / FN 9 / TN 23 (precision 93%, recall 61%), recheck 6/12 over
+  baseline 1, collateral 0. The run read a **frozen `WIKI_AGENT_HOME`
+  snapshot** instead of pausing crons: pausing the two TM-3321 crons was not
+  enough (a third path, the hourly `semantic-refresh`, plus any
+  `wiki-agent load/grep/log-tail` re-syncs the cache), and the first attempt
+  was invalidated by 4 moved files. Corpus gate VALID on the snapshot while the
+  live cache moved during the run.
+
+- Disable the piri usage-budget cap by fleet default (`CCC_USAGE_BUDGET_TOKENS_PIRI`
+  default 2,000,000 → 0): piri meters request counts rather than normalized
+  tokens, and its legitimate daily autonomous volume saturated the shared
+  default (daily warn alerts; enforce clipped normal operation at 1,995,793
+  tokens on nosuk, 2026-09-17). The #388 meter treats `budget<=0` as
+  allowed-and-metered, so metering stays on — only the cap is gone. The doctor
+  now resolves the piri budget through `USAGE_BUDGET_TOKENS_PIRI_DEFAULT` (0)
+  and reports an unset piri budget as an informational policy state instead of
+  the finite-budget warning, which remains for explicitly zeroed budgets and
+  disabled metering. Metering/alert behavior for claude/codex/danso unchanged.
+
 - Add text-mode Danso recovery offers (`CCC_TELEGRAM_DANSO_RECOVERY_TEXT`):
   the failed-task offer renders as a numbered menu and the user answers by
   typing 1/2/3 instead of tapping inline buttons. Refactors the recovery

@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 
+EXPLICIT_SKILL_PREFIX = "The bridge resolved the operator's command as an explicitly invoked "
+
 _SKILL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _MAX_SKILL_BYTES = 128 * 1024
 
@@ -149,8 +151,8 @@ def expand_audience_scoped_skill_command(config: Any, slash_command: str) -> str
             continue
         skill_dir = skill_file.parent
         return (
-            "The bridge resolved the operator's command as an explicitly invoked "
-            "local skill. Use the Read tool to read the SKILL.md file completely "
+            EXPLICIT_SKILL_PREFIX
+            + "local skill. Use the Read tool to read the SKILL.md file completely "
             "before acting, follow its instructions for this turn, and resolve its "
             "relative references from the skill directory. Do not reinterpret the "
             "original slash command as a Claude Code built-in.\n"

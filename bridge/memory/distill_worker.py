@@ -186,11 +186,36 @@ class CodexDistillExtractionWorker:
             else 0
         )
         return DistillExtractionAccounting(
-            model=self._model,
+            model=self._accounted_model(),
             snapshot_bytes=snapshot_bytes,
             duration_ms=duration_ms,
             estimated_max_tokens=estimated_max_tokens,
         )
+
+    def _accounted_model(self) -> str:
+        """Prefer the backend's view of what the extraction process was given.
+
+        The worker only knows the configured label, and when that label is the
+        ``provider-default`` sentinel the receipt becomes unreadable: it cannot
+        distinguish a Haiku run from an Opus one. A backend that knows the
+        selector it actually passes down (see
+        ``RuntimeCliDistillBackend.effective_model``) reports it here.
+
+        Read via ``getattr`` rather than widening the ``DistillBackend``
+        protocol: this is an optional enrichment, and a backend that genuinely
+        cannot resolve its model must keep the sentinel rather than be forced
+        to invent one. An unusable value falls back to the configured label, so
+        the receipt is never worse than before.
+        """
+
+        reported = getattr(self._backend, "effective_model", None)
+        if not isinstance(reported, str):
+            return self._model
+        try:
+            DistillExtractionAccounting(reported, 0, 0, 0)
+        except ValueError:
+            return self._model
+        return reported
 
     async def _fail(
         self,

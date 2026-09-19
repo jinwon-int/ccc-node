@@ -26,22 +26,33 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import platform
 import re
 import signal
+import subprocess
 import time
+import tomllib
 from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol
 
 from telegram_bot.core import session_resume, tool_policy
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
+from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor
 from telegram_bot.core.matrix.render import chunk_text, render_matrix_message
 from telegram_bot.core.matrix_ids import MatrixIdMap
 from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core.project_chat_types import ChatResponse
+from telegram_bot.core.push_notifier import (
+    _DEDUP_WINDOW_SECONDS,
+    _SENT_RETENTION_SECONDS,
+    PushNotifier,
+)
 from telegram_bot.core.session_scope import storage_key
+from telegram_bot.core.turn_watchdog import DEFAULT_NOTIFY_MINUTES, TurnAgeWatchdog
 from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE
 
@@ -51,7 +62,7 @@ IDS_FILENAME = "matrix-ids.json"
 DIRECT_ROOMS_FILENAME = "matrix-direct-rooms.json"
 SUPPORTED_COMMANDS = frozenset({"new", "model", "effort", "usage", "skills", "stop"})
 _STATUS_HANDLE = 1
-STATUS_MIN_INTERVAL_S = 60.0  # heartbeat notices become room messages on Matrix; throttle them
+STATUS_MIN_INTERVAL_S = 60.0  # status bubble edits on Matrix; throttle refreshes
 _RUNTIME_MODEL_PROVIDERS = frozenset({"codex", "piri", "crush", "danso"})
 _EFFORT_PROVIDERS = frozenset({"codex", "piri", "danso"})
 _CLAUDE_MODELS: tuple[tuple[str, str], ...] = (
@@ -81,6 +92,10 @@ class TurnSink(Protocol):
     async def typing(self) -> None: ...
 
     async def interim(self, text: str) -> None: ...
+
+    async def status(self, text: Optional[str]) -> None:
+        """Progress bubble: created once per turn, edited in place, redacted when done."""
+        ...
 
     async def approval(self, description: str, arguments: Any) -> bool: ...
 
@@ -170,6 +185,130 @@ class _NotificationRoute:
     async def send_message(self, chat_id: int, text: str, **_ignored: Any) -> None:
         if not self._deliver(int(chat_id), str(text)):
             raise RuntimeError(f"no Matrix route for chat_id {chat_id}")
+
+
+class MatrixSpoolNotifier:
+    """Polls the channel-neutral push spool and delivers records to the owner room.
+
+    Record handling mirrors core.push_notifier (Telegram) byte for byte — same
+    spool dir default, sent/ archive, dedup window and rate limit, and the
+    same record format via ``PushNotifier._format``. The enabling flag is
+    per-service (``CCC_PUSH_ENABLED``): on a node running both frontends
+    exactly one process may consume the spool, or every notice is delivered
+    twice. Records have no Matrix room of their own, so they land in the
+    owner's direct room, falling back to the family room.
+    """
+
+    def __init__(self, settings: Any, transport: Any) -> None:
+        # ``transport`` is a MatrixTransport; imported lazily in _build_transport
+        # (bot/transport import cycle), so the annotation stays Any here.
+        self._transport = transport
+        self.enabled: bool = bool(getattr(settings, "push_enabled", False))
+        self.spool_dir = Path(
+            getattr(settings, "push_spool_dir", None)
+            or (Path.home() / ".claude" / "state" / "telegram-spool")
+        )
+        self.interval: float = float(getattr(settings, "push_poll_interval", 3.0))
+        self.max_per_minute: int = int(getattr(settings, "push_max_per_minute", 10))
+        self._recent: dict[str, float] = {}
+        self._sent_times: list[float] = []
+
+    def _owner_room(self) -> Optional[str]:
+        rooms = self._transport.policy.rooms
+        direct = [r for r, mode in rooms.items() if mode == "direct"]
+        if direct:
+            return direct[0]
+        family = [r for r, mode in rooms.items() if mode == "mention"]
+        return family[0] if family else None
+
+    async def run(self) -> None:
+        if not self.enabled:
+            logger.info("Matrix spool notifier disabled (push_enabled is false)")
+            return
+        room = self._owner_room()
+        if room is None:
+            logger.warning(
+                "Matrix spool notifier enabled but no direct/family room is configured; not sending"
+            )
+            return
+        sent_dir = self.spool_dir / "sent"
+        try:
+            self.spool_dir.mkdir(parents=True, exist_ok=True)
+            sent_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("Matrix spool notifier cannot create spool dir %s: %s", self.spool_dir, e)
+            return
+        self._prune_sent(sent_dir)
+        logger.info("Matrix spool notifier active → room %s, spool %s", room, self.spool_dir)
+        while True:
+            try:
+                await self._drain(room, sent_dir)
+            except Exception:
+                logger.warning("Matrix spool drain error (continuing)", exc_info=True)
+            await asyncio.sleep(self.interval)
+
+    async def _drain(self, room: str, sent_dir: Path) -> None:
+        for p in sorted(self.spool_dir.glob("*.json")):
+            if not p.is_file():
+                continue
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                self._archive(p, sent_dir)  # malformed → don't retry forever
+                continue
+            text = (data.get("text") or "").strip()
+            if not text:
+                self._archive(p, sent_dir)
+                continue
+            now = time.time()
+            key = data.get("dedup") or text
+            if key in self._recent and now - self._recent[key] < _DEDUP_WINDOW_SECONDS:
+                self._archive(p, sent_dir)
+                continue
+            self._sent_times = [t for t in self._sent_times if now - t < 60]
+            self._recent = {
+                k: t for k, t in self._recent.items() if now - t < _DEDUP_WINDOW_SECONDS
+            }
+            if len(self._sent_times) >= self.max_per_minute:
+                logger.warning("Matrix spool rate limit reached (%d/min); deferring", self.max_per_minute)
+                return
+            try:
+                self._transport.enqueue_notice(room, PushNotifier._format(data))
+            except ValueError as e:
+                # A room this process may never write (not-allowed/too long)
+                # stays failing forever — archive instead of looping on it.
+                logger.warning("Matrix spool record undeliverable, archived: %s", e)
+                self._archive(p, sent_dir)
+                continue
+            except Exception:
+                logger.warning("Matrix spool send failed (will retry next cycle)", exc_info=True)
+                return  # keep file; stop this cycle to preserve order
+            self._recent[key] = now
+            self._sent_times.append(now)
+            self._archive(p, sent_dir)
+
+    @staticmethod
+    def _archive(p: Path, sent_dir: Path) -> None:
+        try:
+            p.rename(sent_dir / p.name)
+        except OSError:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _prune_sent(sent_dir: Path) -> None:
+        cutoff = time.time() - _SENT_RETENTION_SECONDS
+        try:
+            for p in sent_dir.glob("*.json"):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
 
 class MatrixBot:
@@ -284,12 +423,118 @@ class MatrixBot:
         transport = self._build_transport(config)
         self._transport = transport
         self._project_chat.set_async_completion_sender(self.async_completion_sender)
+        initialize = bool(getattr(self._settings, "matrix_initialize", False))
         try:
-            await transport.open()
-            await transport.run()
+            # First run of a NEW bot device (CCC_MATRIX_INITIALIZE=1): create the
+            # crypto store, upload keys, pin devices and gate rooms, then exit
+            # without serving. The pilot's `--initialize` had the same contract;
+            # a normal start refuses an empty store (explicit-new-device-
+            # initialization-required) so a lost store is never recreated silently.
+            await transport.open(initialize=initialize)
+            if initialize:
+                logger.info("Matrix frontend initialised a new bot device; start again without CCC_MATRIX_INITIALIZE")
+                return
+            self._post_startup_banner(config, transport)
+            notifier = MatrixSpoolNotifier(self._settings, transport)
+            watchdog = self._build_turn_age_watchdog()
+            if not notifier.enabled and watchdog is None:
+                await transport.run()
+            else:
+                # Same TaskGroup semantics as transport.run(): a leg that dies
+                # stops the service so systemd restarts it whole.
+                stop = asyncio.Event()
+                async with asyncio.TaskGroup() as group:
+                    # The watchdog loops until its stop event is set, and a
+                    # TaskGroup only cancels siblings when a leg raises — a
+                    # transport that returns *cleanly* would otherwise leave the
+                    # group waiting on the watchdog forever. Setting the event
+                    # from the transport leg's finally keeps shutdown finite on
+                    # both paths.
+                    group.create_task(self._run_until_stop(transport.run(), stop))
+                    if notifier.enabled:
+                        group.create_task(notifier.run())
+                    if watchdog is not None:
+                        group.create_task(watchdog.run(stop), name="matrix-turn-age-watchdog")
         finally:
             self._transport = None
             await transport.close()
+
+    @staticmethod
+    async def _run_until_stop(leg: Awaitable[None], stop: asyncio.Event) -> None:
+        """Await the serving leg, then release every stop-event-driven sibling."""
+
+        try:
+            await leg
+        finally:
+            stop.set()
+
+    def startup_banner(self) -> str:
+        """One-line "frontend is up" notice: node · provider · model · effort · rev.
+
+        Mirrors what the owner is used to seeing when the Telegram-side agent
+        starts a session (owner request 2026-09-18). Everything is best-effort
+        and read-only; unknown parts are simply omitted.
+        """
+
+        provider = str(getattr(self._settings, "agent_provider", "") or "")
+        model, effort = self._configured_model_and_effort(provider)
+        parts = [f"🟢 {platform.node()} ccc-node Matrix 프론트엔드 기동"]
+        for value in (provider, model, effort, self._bridge_revision()):
+            if value:
+                parts.append(value)
+        return " · ".join(parts)
+
+    def _configured_model_and_effort(self, provider: str) -> tuple[str | None, str | None]:
+        if provider == "codex":
+            # Codex takes its default model/effort from ~/.codex/config.toml.
+            home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+            try:
+                with open(home / "config.toml", "rb") as fh:
+                    data = tomllib.load(fh)
+            except (OSError, ValueError):
+                return None, None
+            model = data.get("model")
+            effort = data.get("model_reasoning_effort")
+            return (str(model) if model else None, str(effort) if effort else None)
+        model = getattr(self._settings, f"{provider}_model", None) if provider else None
+        return (str(model) if model else None, None)
+
+    @staticmethod
+    def _bridge_revision() -> str | None:
+        try:
+            out = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(Path(__file__).resolve().parents[2]),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        rev = out.stdout.strip()
+        return rev if out.returncode == 0 and rev else None
+
+    def _post_startup_banner(self, config: Mapping[str, Any], transport: Any) -> None:
+        if not getattr(self._settings, "matrix_startup_banner", True):
+            return
+        family = set(config.get("family_rooms") or ())
+        direct_rooms = [room for room in (config.get("rooms") or ()) if room not in family]
+        if not direct_rooms:
+            return
+        text = self.startup_banner()
+        # Idempotent per hour and per text: a crash-looping unit (Restart=always)
+        # must not queue one banner per restart (nine piled up on 2026-09-18).
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+        key = f"startup-{digest}-{int(time.time() // 3600)}"
+        for room in direct_rooms:
+            try:
+                try:
+                    transport.enqueue_notice(room, text, key=key)
+                except TypeError:  # transport without the key parameter
+                    transport.enqueue_notice(room, text)
+            except Exception:
+                logger.warning("startup banner not queued for %s", room, exc_info=True)
 
     def run(self) -> None:
         """Blocking entry point with the same contract as ``TelegramBot.run()``.
@@ -303,6 +548,10 @@ class MatrixBot:
 
         from telegram_bot.core.bot_shared import enforce_access_control
 
+        # The transport refuses a crypto store with group/other-readable files
+        # (unsafe-crypto-store); nio creates its SQLite store with the process
+        # umask, which systemd leaves at 022. The pilot set this in main().
+        os.umask(0o077)
         enforce_access_control(self._settings)
         initialize = getattr(self._session_manager, "initialize", None)
         if callable(initialize):
@@ -354,6 +603,57 @@ class MatrixBot:
             logger.exception("Matrix async completion delivery failed for chat %s", chat_id)
             return False
 
+    async def _notify_chat(self, chat_id: int, text: str) -> bool:
+        """``(chat_id, text) -> delivered`` seam the background monitors need (#1825).
+
+        Every monitor in ``core/`` takes exactly this callable, and
+        ``async_completion_sender`` already is one modulo the unused ``user_id``.
+        Going through it rather than ``_deliver_notice`` matters: the raw
+        enqueue raises on an unknown room or oversized text, and a monitor
+        expects ``False``, not an exception.
+        """
+
+        return await self.async_completion_sender(0, chat_id, text)
+
+    def _build_turn_age_watchdog(self) -> TurnAgeWatchdog | None:
+        """Notify-only turn-age dashboard (#1111) for the Matrix frontend (#1825).
+
+        Telegram gets this from ``BotLifecycleMixin``, which ``MatrixBot`` does
+        not inherit, so a Matrix turn that lost its terminal frame produced no
+        signal at all — the operator had to ask whether anything was running.
+        The watchdog never interrupts, pauses, or reroutes a turn; it only
+        reports age. ``None`` when explicitly disabled or when the handler
+        exposes no session registry to read ages from.
+        """
+
+        threshold_min = ExternalWaitMonitor.env_int(
+            "CCC_TURN_AGE_NOTIFY_MIN", default=DEFAULT_NOTIFY_MINUTES
+        )
+        if threshold_min <= 0:
+            logger.info("Matrix turn-age watchdog disabled (CCC_TURN_AGE_NOTIFY_MIN=0)")
+            return None
+        registry = getattr(self._project_chat, "_agent_session_registry", None)
+        if registry is None:
+            logger.warning(
+                "Matrix turn-age watchdog unavailable: no session registry on project chat"
+            )
+            return None
+        renotify_min = ExternalWaitMonitor.env_int("CCC_TURN_AGE_RENOTIFY_MIN", default=30)
+
+        def turns_provider() -> list[tuple[int, int, float]]:
+            return [
+                (int(key[0]), int(key[1]), float(started))
+                for key, started in registry.active_turn_ages()
+                if len(key) >= 2
+            ]
+
+        return TurnAgeWatchdog(
+            turns_provider=turns_provider,
+            notifier=self._notify_chat,
+            threshold_seconds=threshold_min * 60.0,
+            renotify_seconds=renotify_min * 60.0,
+        )
+
     def _notification_bot(self) -> _NotificationRoute:
         return _NotificationRoute(self._deliver_notice)
 
@@ -382,10 +682,10 @@ class MatrixBot:
     def _make_status_callback(
         self, sink: TurnSink
     ) -> Callable[[Optional[str], Optional[int]], Awaitable[Optional[int]]]:
-        # Telegram edits one status bubble in place; Matrix has no edit path in
-        # the durable outbox, so every status text would become a new room
-        # message. Forward only when the text changed AND the interval passed,
-        # so a long turn shows a few progress notices, not one every 4 s.
+        # Telegram edits one status bubble in place; Matrix now matches via
+        # sink.status (create once, then m.replace edits, redact on None).
+        # Forward only when the text changed AND the interval passed, so a
+        # long turn refreshes one bubble, not a stream of room messages.
         last: dict[str, Any] = {"text": None, "at": 0.0}
 
         async def status_callback(
@@ -393,13 +693,19 @@ class MatrixBot:
         ) -> Optional[int]:
             del message_id
             if text is None:
-                return None  # delete: nothing to remove on Matrix
+                try:
+                    await sink.status(None)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("Matrix status redact failed", exc_info=True)
+                return None
             now = time.monotonic()
             if text == last["text"] or now - last["at"] < STATUS_MIN_INTERVAL_S:
                 return _STATUS_HANDLE
             last["text"], last["at"] = text, now
             try:
-                await sink.interim(text)
+                await sink.status(text)
             except asyncio.CancelledError:
                 raise
             except Exception:

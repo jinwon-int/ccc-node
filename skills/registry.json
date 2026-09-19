@@ -76,7 +76,18 @@
       "name": "gh-pr-flow",
       "source": "codex/skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "d646913cd5a5d019ee8e6f342702fbd29e59dca54d72cf20dff3459ff49fec6f"
+      "tree_sha256": "6af79393a2fc5e6fd9cc612737418d71fff8968182985c55ba2d8ce77579fe72"
+    },
+    {
+      "audience": "codex",
+      "classification": null,
+      "description": "Build AI-powered software with TypeSafe: small units of AI intelligence you can use like programming primitives. Its System One models, including Jev, turn natural language and application state into typed judgments and probabilities that code can combine. Use when a feature needs programmable common sense, when brainstorming what AI could make possible in an app, or when an LLM prompt-and-parse step could become a structured decision. Applications include routing, ranking, extraction, verification, and interactive experiences; these are starting points, not the limits. Read live docs and cookbooks to find useful patterns and discover new combinations.",
+      "files": 3,
+      "managed": true,
+      "name": "typesafe-ai",
+      "source": "codex/skills/typesafe-ai",
+      "status": "active",
+      "tree_sha256": "fc459b52c43f204101ce413fe594010ed9071bccd3baf5993d9a12529f4dcd12"
     },
     {
       "audience": "piri",
@@ -87,7 +98,7 @@
       "name": "web",
       "source": "piri/skills/web",
       "status": "active",
-      "tree_sha256": "6892e4b51dcd0f1bea35403ef84d3bc0ede01215e5a7ae44f44a7ccb102f1817"
+      "tree_sha256": "0fd6258a8fc918b6fca9cfd60f674dddd6530eaeae65435b4cc45a27eba6ea39"
     },
     {
       "audience": "claude",
@@ -230,7 +241,7 @@
       "name": "gh-pr-flow",
       "source": "skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "6f0ef742a8bc86195a14d53e42ec97d4e7a5862b3943858753de570a39177b65"
+      "tree_sha256": "205990a29ae9edf75ca1b315b73e675fb430d384c61ad8d48de728492bae1870"
     },
     {
       "audience": "claude",

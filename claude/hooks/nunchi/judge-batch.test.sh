@@ -27,6 +27,11 @@ export NUNCHI_DB="$TMP/nunchi-home/facts.db"
 export NUNCHI_HOME="$TMP/nunchi-home"
 export CCC_STATE_DIR="$TMP/state"
 unset CCC_NUNCHI_AUDIENCE_SCOPED CCC_NUNCHI_AUDIENCE_ROOT CCC_NUNCHI_SCOPED_CHILD
+# The Jev backend's availability is a key, not a PATH entry. An inherited real
+# key would make the typesafe cases reach api.typesafe.ai for real — network and
+# cost in a suite whose whole contract is neither. Unset for the whole run; the
+# fixtures put a synthetic key in their own process environment only.
+unset TYPESAFE_API_KEY NUNCHI_JUDGE_MIN_CONFIDENCE
 
 # Default judge stubs: unavailable. Both names are always shadowed so auto
 # fallback can never escape to a real host CLI/provider during the suite.
@@ -233,10 +238,33 @@ idg2="$(seed_kind dungae decision "측정 비용 때문에 백업 자동화를 �
 idg3="$(seed_kind dungae decision "로그 보관을 30일로 결정" "$OLD" 1 1 dg3 "디스크 상한 정책 때문")"
 NUNCHI_JUDGE_APPLY=1 run_batch
 ok "G5 reasonless decision stays flagged (never deterministic-clear)" '[ "$(review_of "$idg1")" = 1 ]'
-ok "G5 item classified g5-reasonless-decision in audit" 'grep -q "\"class\": \"g5-reasonless-decision\"" "$NUNCHI_HOME/judge-audit.jsonl"'
+ok "G5 backlog is audited as a deferred aggregate" 'grep -q "\"class\": \"g5-deferred-backlog\"" "$NUNCHI_HOME/judge-audit.jsonl"'
 ok "G5 audit points the owner at annotate" 'grep -q "annotate" "$NUNCHI_HOME/judge-audit.jsonl"'
+ok "G5 backlog is surfaced in the report" 'grep -q "g5-deferred" "$CCC_STATE_DIR/nunchi-review-report.md"'
 ok "inline-reason decision takes the normal deterministic path" '[ "$(review_of "$idg2")" = 0 ]'
 ok "structured-because decision takes the normal deterministic path" '[ "$(review_of "$idg3")" = 0 ]'
+
+# ---- 8b. G5 never occupies a CAP slot (head-of-line block) ----------------
+# Regression: fetch_queue was `ORDER BY id LIMIT CAP`, and a G5 verdict leaves
+# review=1, so the oldest G5 items were re-selected every run and the queue
+# behind them was never reached. Measured on yukson before the fix: the same
+# ten ids (#747..#994) re-triaged to `human` on eight consecutive days while
+# 613 judgeable facts behind them had never once been looked at.
+reset_db
+# Seed CAP g5 items FIRST so they own the lowest ids, then judgeable ones.
+for i in 1 2 3; do
+  seed_kind dungae decision "G5 선두 항목 $i 확정" "$OLD" 1 1 "hol-g5-$i" "" >/dev/null
+done
+# Deliberately unrelated to each other: a >=0.6 mutual overlap would send them
+# to the (stubbed-unavailable) judge and mask what this case is measuring.
+# shellcheck disable=SC2034  # read via eval inside ok()
+idh1="$(seed_kind dungae context "브리지 포트는 8791 이며 루프백에만 바인딩된다" "$OLD" 1 1 hol-ok-1 "")"
+# shellcheck disable=SC2034  # read via eval inside ok()
+idh2="$(seed_kind dungae preference "사용자는 번호형 선택지를 선호한다" "$OLD" 1 1 hol-ok-2 "")"
+out="$(NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_CAP=3 run_batch 2>&1)"
+ok "items behind the g5 head are reached despite CAP=3" '[ "$(review_of "$idh1")" = 0 ] && [ "$(review_of "$idh2")" = 0 ]'
+ok "run line states the deferred g5 count" 'printf "%s" "$out" | grep -q "3 g5-deferred"'
+ok "g5 items still stay flagged for the owner" '[ "$(flagged_count)" = 3 ]'
 
 # ---- 10. G3 batch pool mirrors ingest: cross-session siblings (#1255) ------
 reset_db
@@ -380,6 +408,332 @@ python3 "$TTLFIX" "$JB" >/dev/null 2>&1
 # shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "#1336 TTL-imminent observation evidence annotated in the judge prompt" '[ "$rc" = 0 ]'
+
+# ---- 12. TypeSafe Jev backend: a typed verdict, nothing parsed from text ---
+# The transport is stubbed at urlopen (the endpoint is pinned in code on
+# purpose, so there is no URL env var to redirect at a local server): the
+# fixture asserts the exact wire contract AND that the bearer key never leaves
+# the Authorization header — not into the payload, the decision, or a failure
+# class that later lands in the audit log.
+JEVFIX="$TMP/jev-fixture.py"
+cat > "$JEVFIX" <<'FIXTURE'
+import importlib.util, io, json, os, sys, urllib.error
+spec = importlib.util.spec_from_file_location("jb_jev", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["jb_jev"] = m
+spec.loader.exec_module(m)
+
+KEY = "synthetic-jev-key-must-not-leak"
+os.environ["TYPESAFE_API_KEY"] = KEY
+m.JUDGE_PROVIDER = "typesafe"
+
+item = (41, "dungae", "fact", "머지는 항상 스쿼시로 한다", 1,
+        "2026-08-19T00:00:00+00:00", "")
+sibs = [(42, "머지는 언제나 스쿼시로 한다")]
+captured = {}
+
+
+class _Resp:
+    def __init__(self, body):
+        self._body = body
+
+    def read(self, size=-1):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def stub(body):
+    payload = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+
+    def _open(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["method"] = request.get_method()
+        captured["headers"] = {k.lower(): v for k, v in request.header_items()}
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return _Resp(payload)
+
+    m.urllib.request.urlopen = _open
+
+
+CLEAR = {"answers": {
+    "verdict": {"choice": "clear", "confidence": 0.93,
+                "probabilities": {"clear": 0.93, "conflict": 0.05, "human": 0.02}},
+    "contradicts": {"noul": 0.05}}}
+stub(CLEAR)
+decision, failure = m._typesafe_judge(item, sibs)
+assert failure is None, failure
+assert decision["verdict"] == "clear", decision
+assert decision["confidence"] == 0.93, decision
+assert decision["supersede_proposal"] is None, decision
+assert decision["rationale"] == "jev: clear p=0.93 conf=0.93 contradicts=0.05", \
+    decision["rationale"]
+
+# wire contract
+assert captured["url"] == "https://api.typesafe.ai/v1/systemone", captured["url"]
+assert captured["method"] == "POST", captured["method"]
+assert captured["headers"]["authorization"] == "Bearer " + KEY, "auth-header"
+assert captured["headers"]["content-type"] == "application/json", "content-type"
+assert captured["timeout"] == m.JUDGE_TIMEOUT, "timeout"
+body = captured["body"]
+assert body["model"] == "jev-latest", body["model"]
+assert set(body["questions"]) == {"verdict", "contradicts"}, body["questions"]
+assert body["questions"]["verdict"]["type"] == "choice", "verdict-type"
+assert set(body["questions"]["verdict"]["criteria"]) == {"clear", "conflict", "human"}, "criteria"
+assert body["questions"]["contradicts"]["type"] == "noul", "noul-type"
+assert body["questions"]["verdict"]["instructions"], "verdict-instructions"
+assert body["questions"]["contradicts"]["instructions"], "contradicts-instructions"
+# the state is the judged material only — the rubric lives in the questions
+assert "머지는 항상 스쿼시로 한다" in body["state"], "state-fact"
+assert "#42" in body["state"], "state-sibling"
+assert "Decide one verdict" not in body["state"], "state-rubric-leak"
+assert "JSON" not in body["state"], "state-json-contract-leak"
+# key redaction: header only, nowhere else
+assert KEY not in json.dumps(body, ensure_ascii=False), "key-in-payload"
+assert KEY not in json.dumps(decision, ensure_ascii=False), "key-in-decision"
+
+# a missing `contradicts` degrades the rationale, it does not fail the verdict
+stub({"answers": {"verdict": {"choice": "clear", "confidence": 0.8}}})
+decision, failure = m._typesafe_judge(item, sibs)
+assert failure is None and decision["rationale"] == "jev: clear p=n/a conf=0.80 contradicts=n/a", \
+    decision
+
+# conflict: Jev chooses, it does not write — the proposal stays a human's
+stub({"answers": {
+    "verdict": {"choice": "conflict", "confidence": 0.62,
+                "probabilities": {"clear": 0.20, "conflict": 0.62, "human": 0.18}},
+    "contradicts": {"noul": 0.88}}})
+decision, failure = m._typesafe_judge(item, sibs)
+assert failure is None, failure
+assert decision["verdict"] == "conflict", decision
+assert decision["supersede_proposal"] is None, decision
+assert "사람이 작성" in decision["rationale"], decision["rationale"]
+assert len(decision["rationale"]) <= 200, len(decision["rationale"])
+
+# judge_item integration: backend attribution + confidence reach the decision
+stub(CLEAR)
+routed = m.judge_item(item, sibs)
+assert routed["backend"] == "typesafe", routed
+assert routed["confidence"] == 0.93, routed
+assert routed["verdict"] == "clear", routed
+assert m.judge_available() is True, "available-with-key"
+
+# no key => the candidate drops out; no crash, fail-closed to human
+for absent in ("", "   "):
+    os.environ["TYPESAFE_API_KEY"] = absent
+    assert m.judge_candidates() == [("typesafe", "")], m.judge_candidates()
+    assert m.judge_available() is False, "available-without-key:" + repr(absent)
+    assert m._typesafe_judge(item, sibs) == (None, "no-key"), "no-key"
+    unavailable = m.judge_item(item, sibs)
+    assert unavailable["verdict"] == "human", unavailable
+    assert unavailable["backend"] is None, unavailable
+    assert unavailable["confidence"] is None, unavailable
+    assert unavailable["attempts"] == ["typesafe:unavailable"], unavailable
+del os.environ["TYPESAFE_API_KEY"]
+assert m.judge_available() is False, "available-when-unset"
+os.environ["TYPESAFE_API_KEY"] = KEY
+
+
+# a provider error must not smuggle the key into a failure class
+def raising(request, timeout=None):
+    raise urllib.error.HTTPError(
+        m.TYPESAFE_URL + "?leak=" + KEY, 401, "Unauthorized " + KEY, {},
+        io.BytesIO(b"denied " + KEY.encode()))
+
+
+m.urllib.request.urlopen = raising
+assert m._typesafe_judge(item, sibs) == (None, "http-401"), "http-failure-class"
+failed = m.judge_item(item, sibs)
+assert failed["verdict"] == "human" and failed["attempts"] == ["typesafe:http-401"], failed
+assert KEY not in json.dumps(failed, ensure_ascii=False), "key-in-attempts"
+
+# malformed / out-of-rubric answers are fail-closed, never guessed
+for payload, expected in (
+        ({"answers": {"verdict": {"choice": "clear"}}}, "confidence-missing"),
+        ({"answers": {"verdict": {"choice": "clear", "confidence": 1.5}}}, "confidence-missing"),
+        ({"answers": {"verdict": {"choice": "clear", "confidence": "high"}}}, "confidence-missing"),
+        ({"answers": {"verdict": {"choice": "rm -rf", "confidence": 0.99}}}, "verdict-outside-rubric"),
+        ({"answers": {"verdict": "clear"}}, "schema-invalid"),
+        ({"answers": []}, "schema-invalid"),
+        (b"not json at all", "response-unparseable"),
+        (b"", "empty"),
+):
+    stub(payload)
+    result, failure = m._typesafe_judge(item, sibs)
+    assert result is None and failure == expected, (expected, failure)
+
+# a confident-zero answer is a real answer (and the gate's job, not the parser's)
+stub({"answers": {"verdict": {"choice": "clear", "confidence": 0.0}}})
+decision, failure = m._typesafe_judge(item, sibs)
+assert failure is None and decision["confidence"] == 0.0, decision
+print("JEV-OK")
+FIXTURE
+jev_out="$(python3 "$JEVFIX" "$JB" 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "Jev backend turns a typed HTTP answer into verdict+confidence (no text parsing)" \
+  '[ "$rc" = 0 ] && [ "$jev_out" = "JEV-OK" ]'
+[ "$rc" = 0 ] || printf '%s\n' "$jev_out"
+
+# End-to-end: provider=typesafe with no key must degrade, not crash.
+reset_db
+# shellcheck disable=SC2034  # idt1 is read via eval inside ok()
+idt1="$(seed dungae "Jev 키 없음 형제 갈등" "$OLD" 1 1 dt1)"
+seed dungae "Jev 키 없음 형제 갈등" "$OLD" 1 0 dt2 >/dev/null
+run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=typesafe >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "typesafe without TYPESAFE_API_KEY exits cleanly (key-based availability, no crash)" '[ "$rc" = 0 ]'
+ok "typesafe without a key fails closed to human" '[ "$(review_of "$idt1")" = 1 ]'
+ok "typesafe without a key is recorded as judge-unavailable" \
+  'grep -q "judge-unavailable" "$NUNCHI_HOME/judge-audit.jsonl"'
+
+# ---- 13. NUNCHI_JUDGE_MIN_CONFIDENCE gate ---------------------------------
+# The gate only ever holds a decision that CARRIES a confidence. haiku/codex
+# report none, so a threshold must leave their clears exactly as they were —
+# that regression (a threshold silently freezing every CLI-backed clear) is what
+# the `confidence is None` case below pins down.
+GATEFIX="$TMP/gate-fixture.py"
+cat > "$GATEFIX" <<'FIXTURE'
+import importlib.util, json, sqlite3, sys
+spec = importlib.util.spec_from_file_location("jb_gate", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["jb_gate"] = m
+spec.loader.exec_module(m)
+
+low_id, high_id, none_id, guard_id = (int(a) for a in sys.argv[2:6])
+expected = float(sys.argv[6])
+
+
+def clear_decision(fact_id, backend, confidence):
+    return {"id": fact_id, "class": "judge", "verdict": "clear",
+            "rationale": "fixture", "supersede_proposal": None,
+            "backend": backend, "attempts": [], "confidence": confidence}
+
+
+low = clear_decision(low_id, "typesafe", 0.5)     # typed, under any real gate
+high = clear_decision(high_id, "typesafe", 0.95)  # typed, over it
+blind = clear_decision(none_id, "claude", None)   # free-text backend, no number
+# Every mutation happens before the first assert on purpose: an early
+# AssertionError must not be able to hide what the apply path did to the DB,
+# because the shell-side review flag checks are the load-bearing assertions.
+conn = sqlite3.connect(m.DB)
+clears, applied, backup, held = m.apply_decisions(conn, [low, high, blind])
+# defense in depth: the mutation itself refuses a gated decision
+guard_gate = m.apply_clear(conn, guard_id, {"confidence": 0.1})
+conn.commit()
+guard_review = conn.execute(
+    "SELECT review FROM peer_facts WHERE id=?", (guard_id,)).fetchone()[0]
+conn.close()
+report = m.build_report("ts", [low, high, blind], clears, [], applied, backup, (), held)
+print(json.dumps({"applied": applied, "held": [d["id"] for d in held]}))
+assert m.MIN_CONFIDENCE == expected, (m.MIN_CONFIDENCE, expected)
+assert m.APPLY is True, "fixture needs APPLY"
+if expected > 0.0:
+    assert guard_gate is False, "apply_clear-gate"
+    assert guard_review == 1, "apply_clear-gate-mutated"
+    assert [d["id"] for d in held] == [low_id], held
+    assert low["class"] == "low-confidence", low
+    assert low["applied"] is False, low
+    assert high["class"] == "judge" and blind["class"] == "judge", (high, blind)
+    assert applied == 2, applied
+    assert "confidence gate" in report, "report-gate-line"
+    assert "low-confidence" in report, "report-held-section"
+else:
+    # positive control for the same call: with no gate it really does clear
+    assert guard_gate is True, "apply_clear-no-gate"
+    assert guard_review == 0, "apply_clear-no-gate-unmutated"
+    assert held == [], held
+    assert applied == 3, applied
+    assert low["class"] == "judge", low
+    assert "confidence gate" not in report, "report-gate-line-when-off"
+assert "| conf |" in report, "report-conf-column"
+FIXTURE
+
+reset_db
+idg_low="$(seed dungae "저신뢰 판정 대상" "$OLD" 1 1 cf1)"
+idg_high="$(seed dungae "고신뢰 판정 대상" "$OLD" 1 1 cf2)"
+idg_none="$(seed dungae "무신뢰 백엔드 대상" "$OLD" 1 1 cf3)"
+idg_guard="$(seed dungae "직접 호출 방어 대상" "$OLD" 1 1 cf3g)"
+gate_out="$(env NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_MIN_CONFIDENCE=0.9 \
+  python3 "$GATEFIX" "$JB" "$idg_low" "$idg_high" "$idg_none" "$idg_guard" 0.9 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "gate fixture ran (threshold 0.9 parsed from the environment)" '[ "$rc" = 0 ]'
+[ "$rc" = 0 ] || printf '%s\n' "$gate_out"
+ok "confidence 0.5 clear under a 0.9 gate is not applied" '[ "$(review_of "$idg_low")" = 1 ]'
+ok "gated clear is reclassified low-confidence" 'printf "%s" "$gate_out" | grep -q "\"held\": \[$idg_low\]"'
+ok "confidence 0.95 clear passes the same gate" '[ "$(review_of "$idg_high")" = 0 ]'
+# THE regression guard: haiku/codex return no confidence at all. If a missing
+# confidence were treated as 0.0, setting any threshold would silently stop
+# every CLI-backed clear in the fleet.
+ok "confidence-less (haiku/codex) clear still applies under a 0.9 gate" \
+  '[ "$(review_of "$idg_none")" = 0 ]'
+ok "apply_clear itself refuses a gated decision (defense in depth)" \
+  '[ "$(review_of "$idg_guard")" = 1 ]'
+
+reset_db
+idg2_low="$(seed dungae "기본값 저신뢰 대상" "$OLD" 1 1 cf4)"
+idg2_high="$(seed dungae "기본값 고신뢰 대상" "$OLD" 1 1 cf5)"
+idg2_none="$(seed dungae "기본값 무신뢰 대상" "$OLD" 1 1 cf6)"
+idg2_guard="$(seed dungae "기본값 직접 호출 대상" "$OLD" 1 1 cf6g)"
+gate_out="$(env NUNCHI_JUDGE_APPLY=1 \
+  python3 "$GATEFIX" "$JB" "$idg2_low" "$idg2_high" "$idg2_none" "$idg2_guard" 0.0 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "default (no NUNCHI_JUDGE_MIN_CONFIDENCE) keeps the pre-gate behavior" \
+  '[ "$rc" = 0 ] && [ "$(review_of "$idg2_low")" = 0 ] && [ "$(review_of "$idg2_high")" = 0 ] && [ "$(review_of "$idg2_none")" = 0 ]'
+[ "$rc" = 0 ] || printf '%s\n' "$gate_out"
+
+# Out-of-range / unparseable thresholds are bounded, never crash the batch.
+BOUNDFIX="$TMP/bound-fixture.py"
+cat > "$BOUNDFIX" <<'FIXTURE'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("jb_bound", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["jb_bound"] = m
+spec.loader.exec_module(m)
+b = m.bounded_float_env
+for raw, want in (("0.5", 0.5), ("2", 1.0), ("-3", 0.0), ("junk", 0.0),
+                  ("nan", 0.0), ("", 0.0)):
+    got = b({"K": raw}, "K", 0.0, 0.0, 1.0, clamp=True)
+    assert got == want, (raw, got, want)
+assert b({}, "K", 0.0, 0.0, 1.0, clamp=True) == 0.0, "unset"
+# a gate of 0.0 is a constant False, whatever the decision carries
+m.MIN_CONFIDENCE = 0.0
+for confidence in (None, 0.0, 0.5, "junk"):
+    assert m.confidence_below_gate({"confidence": confidence}) is False, confidence
+m.MIN_CONFIDENCE = 0.5
+assert m.confidence_below_gate({"confidence": None}) is False, "none-passes"
+assert m.confidence_below_gate({}) is False, "absent-passes"
+assert m.confidence_below_gate({"confidence": 0.5}) is False, "at-threshold-passes"
+assert m.confidence_below_gate({"confidence": 0.49}) is True, "below-holds"
+# present but unusable is fail-closed, the same direction as a bad verdict
+assert m.confidence_below_gate({"confidence": "high"}) is True, "garbage-holds"
+assert m.confidence_below_gate({"confidence": float("nan")}) is True, "nan-holds"
+print("BOUND-OK")
+FIXTURE
+bound_out="$(python3 "$BOUNDFIX" "$JB" 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "confidence threshold is bounded to [0,1] and a 0.0 gate is inert" \
+  '[ "$rc" = 0 ] && [ "$bound_out" = "BOUND-OK" ]'
+[ "$rc" = 0 ] || printf '%s\n' "$bound_out"
+
+# A normal (CLI-backend) run still audits/reports exactly as before, plus a
+# null confidence column.
+reset_db
+seed dungae "기본 감사 확인 항목" "$OLD" 1 1 cn1 >/dev/null
+run_batch NUNCHI_JUDGE_APPLY=1 >/dev/null
+ok "audit records a null confidence for backends that report none" \
+  'grep -q "\"confidence\": null" "$NUNCHI_HOME/judge-audit.jsonl"'
+ok "no gate line in the report when the gate is unset" \
+  '! grep -q "confidence gate" "$CCC_STATE_DIR/nunchi-review-report.md"'
 
 printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

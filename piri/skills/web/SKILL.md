@@ -5,15 +5,19 @@ description: Search the public web through Firecrawl Search (default) or explici
 
 # web — Firecrawl search + fetch/developer evidence
 
-Three stdlib-only helpers live in this skill directory. Run them with the bash
-tool. Keep the routes distinct: general search stays on Firecrawl Search;
+Three stdlib-only helpers live in this skill directory (next to this
+SKILL.md). Run them with the bash tool; the commands below reference them
+relative to the skill root (`<skill-root>` = the directory containing this
+SKILL.md), so they hold for any install layout — do not hardcode an install
+prefix. `~/.piri/agent/skills/web` is where `setup.sh` installs this skill and
+is still a live path, but it is not the only layout. Keep the routes distinct: general search stays on Firecrawl Search;
 known-URL reads and developer artifact retrieval use Firecrawl scrape / Developer
 Index. Fleet SearXNG is an explicit opt-in only — never a silent fallback.
 
 ## General web search — Firecrawl Search default
 
 ```bash
-python3 ~/.piri/agent/skills/web/web_search.py "검색어" [--limit 5]
+python3 <skill-root>/web_search.py "검색어" [--limit 5]
 ```
 
 - Queries Firecrawl Search (`FIRECRAWL_API_URL`, optional `FIRECRAWL_API_KEY`;
@@ -30,7 +34,7 @@ python3 ~/.piri/agent/skills/web/web_search.py "검색어" [--limit 5]
 ## Explicit fallback search — SearXNG only when requested
 
 ```bash
-python3 ~/.piri/agent/skills/web/web_search.py "검색어" --provider searxng [--limit 5]
+python3 <skill-root>/web_search.py "검색어" --provider searxng [--limit 5]
 ```
 
 - Use this for Korean/Naver-oriented lookup, Tailnet-local privacy, or when
@@ -38,13 +42,15 @@ python3 ~/.piri/agent/skills/web/web_search.py "검색어" --provider searxng [-
   automatically inside the helper.
 - Queries the canonical Seoseo SearXNG endpoint (`SEARXNG_URL` can override it
   with comma-separated fallbacks).
+- Endpoint value field-verified on 2026-09-18; ownership and failover runbook
+  are maintained in the Family Wiki (`pages/services/searxng.md`).
 - Exit 69 = SearXNG instances unavailable; exit 64 = missing/invalid command
   usage or provider.
 
 ## Known-URL fetch — Firecrawl only
 
 ```bash
-python3 ~/.piri/agent/skills/web/web_fetch.py "https://example.com/page" [--max-chars 6000]
+python3 <skill-root>/web_fetch.py "https://example.com/page" [--max-chars 6000]
 ```
 
 - Sends a public HTTP(S) URL to Firecrawl scrape and returns bounded markdown,
@@ -73,11 +79,16 @@ python3 ~/.piri/agent/skills/web/web_fetch.py "https://example.com/page" [--max-
 ## Developer/GitHub artifacts — Firecrawl Developer Index
 
 ```bash
-python3 ~/.piri/agent/skills/web/web_developer.py \
+python3 <skill-root>/web_developer.py \
   "how was this bug fixed?" [--limit 5] [--type issue] [--type pull_request] \
   [--repo owner/repo]
 ```
 
+- Endpoint contract field-verified on 2026-09-18 against the published API:
+  `POST /v2/search/developer` with request keys `query`, `k`, repeatable
+  `types` (`doc`, `issue`, `pull_request`, `readme`), and `repos`; each result
+  carries `title` / `url` / `passages[].text` (~2400-character cap). Source:
+  https://docs.firecrawl.dev/api-reference/endpoint/developer-search
 - Searches public documentation, repository READMEs, issues, and merged pull
   requests and includes matched passages.
 - Prefer this route for library/API behavior, error messages, known bugs, and

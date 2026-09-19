@@ -14,7 +14,17 @@ protection, or move a credential between nodes.
 1. Record the PR's full `headRefOid`. Require an open, non-draft PR against the
    intended base, a mergeable state, and no pending or failed required checks.
 2. Confirm the PR author and current actor. Request a different write-capable
-   reviewer when approval is required.
+   reviewer when approval is required. Under `require_last_push_approval`
+   (`jinwon-int/ccc-node` `main`) the last pusher is disqualified too, so
+   pushing a fix to the other account's PR can leave nobody able to approve it
+   — and force-pushing that commit away does not help, because the rule keys on
+   the pusher, not the commits. Prefer a review comment, or carry the fix in a
+   PR you author. Check before pushing:
+
+   ```bash
+   gh api repos/<owner>/<repo>/branches/main/protection \
+     --jq '.required_pull_request_reviews.require_last_push_approval'
+   ```
 3. After approval, re-read the exact head, review decision, and checks. Squash
    merge normally — except on `jinwon-int/ccc-node` `main`, which runs a merge
    queue (see below):

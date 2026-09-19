@@ -37,8 +37,18 @@ mkdir -p "$NUNCHI_HOME"
 touch "$SEEN"
 
 PROMPT_PREFIX='다음은 AI 에이전트 작업 세션의 대화 발췌이다. 다음 세션에서도 알아야 할 사실만 추출해 strict JSON으로 답하라.
-형식: {"honcho":[{"kind":"preference|decision|fact|context|correction","text":"<한 문장 한국어 사실>","subject":"user|session|node","because":"<kind=decision이면 결정 이유 한 문장 — 필수, 아니면 생략>"}]}
+형식: {"honcho":[{"kind":"preference|decision|observation|context|constraint|task-progress|procedure|fact|correction","text":"<한 문장 한국어 사실>","subject":"user|session|node","because":"<kind=decision이면 결정 이유 한 문장 — 필수, 아니면 생략>"}]}
 기준: user=사용자 선호/지시 방식, session=진행 중 작업 맥락/다음 액션, node=이 노드 사실. 잡담/디버깅만 있으면 {"honcho":[]}.
+kind 정의 — 가장 좁게 맞는 하나만 고르고 애매한 것을 decision으로 흘리지 마라:
+  preference=일하는 방식에 대한 사용자의 지속적 선호.
+  decision=실제로 내려져 확정된 선택. because 필수.
+  task-progress=진행/완료 보고. 결정이 아니다.
+  correction=이전 진술이 틀렸음을 바로잡는 정정.
+  procedure=반복 사용 가능한 여러 단계의 절차/방법.
+  fact=지금 관찰된 사실 진술.
+  observation=사용자/세션의 행동에 대한 관계적 관찰.
+  context=다음 세션이 이어받아야 할 진행 중 배경.
+  constraint=사용자가 말한 상시 금지/필수 규칙.
 decision: 확정된 결정. 반드시 대화에 실제로 나온 이유를 because에 적어라. 대화에 이유가 없으면 decision으로 출력하지 말고 생략하며, 이유를 추측하거나 지어내지 마라.
 JSON 객체 하나만 출력. 설명/마크다운 금지.
 

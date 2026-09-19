@@ -33,13 +33,17 @@ from telegram_bot.core.matrix.state import (
     Store,
     bounded_text,
     family_config,
+    identities,
+    mention_aliases,
     load_config,
     operator_name,
     parts,
     saved_policy,
     turn_id,
+    turn_timeout_minutes,
     upgrade_saved_policy,
     validate_config,
+    wake_words,
 )
 
 BOT = "@agent:example.test"
@@ -340,6 +344,35 @@ class TestStore:
         for p in directory.iterdir():
             assert p.stat().st_mode & 0o777 == 0o600
 
+    @pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="Linux path descriptors")
+    def test_traversable_unreadable_ancestors_and_readable_leaf(self, tmp_path: Path) -> None:
+        directory = tmp_path / "state"
+        real_open = os.open
+
+        def android_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            # Model Android's EACCES for directory reads outside the app root.
+            if flags & os.O_DIRECTORY and str(path) != "state" and not flags & os.O_PATH:
+                raise PermissionError("ancestor permits traversal only")
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(m.os, "open", side_effect=android_open):
+            fd = m.private_directory(directory)
+            try:
+                assert os.listdir(fd) == []  # O_PATH must never escape as the leaf fd.
+                child = m.private_file(fd, "probe")
+                os.close(child)
+                assert os.listdir(fd) == ["probe"]
+            finally:
+                os.close(fd)
+
+    def test_private_directory_without_path_descriptors(self, tmp_path: Path) -> None:
+        with patch.object(m.os, "O_PATH", os.O_RDONLY, create=True):
+            fd = m.private_directory(tmp_path / "state")
+            try:
+                assert os.listdir(fd) == []
+            finally:
+                os.close(fd)
+
     def test_symlink_ancestor_directory_database_lock_and_journal_rejected(self, tmp_path: Path) -> None:
         real = tmp_path / "real"
         real.mkdir(mode=0o700)
@@ -614,7 +647,7 @@ class TestConfig:
     def test_saved_policy_upgrade_drops_worker_keys(self, tmp_path: Path) -> None:
         c = config(tmp_path)
         current = saved_policy(c)
-        assert set(current) == {"owner", "rooms", "devices", "not_before_ms", "family_rooms", "family_users", "family_devices"}
+        assert set(current) == {"owner", "rooms", "devices", "not_before_ms", "family_rooms", "family_users", "family_devices", "identities"}
         pilot = {k: c[k] for k in ("owner", "rooms", "devices", "not_before_ms")}
         pilot["worker_argv"] = ["/usr/bin/python3", "/opt/worker.py"]
         pilot["worker_argv_family"] = None
@@ -638,3 +671,110 @@ def test_every_raised_safety_stop_reason_is_listed() -> None:
     assert {"invalid-family_rooms", "invalid-family_users", "matrix-http-"} <= SAFETY_STOP_REASONS
     for legacy in ("worker-cleanup-unconfirmed", "invalid-worker-command", "invalid-remote-mode"):
         assert legacy not in SAFETY_STOP_REASONS
+
+
+def test_mention_aliases_widen_the_typed_handle_gate_only() -> None:
+    # Matrix ids cannot be renamed: the bot stays @bot but the family calls it "@seoseo".
+    p = policy(aliases={"seoseo"})
+    for body, expected in [
+        ("@seoseo 오늘 일정", True),
+        ("(@SEOSEO)", True),
+        ("@seoseox 안녕", False),
+        ("mail@seoseo.com", False),
+        ("seoseo 안녕", False),
+        ("@" + BOT[1:].split(":")[0] + " 안녕", True),
+    ]:
+        e = event()
+        e["content"]["body"] = body
+        assert (p.admit(GROUP, e, decrypted=True, now_ms=NOW) is not None) is expected, body
+    # Direct rooms never needed a mention and still do not.
+    e = event()
+    e["content"]["body"] = "그냥 질문"
+    assert p.admit(ROOM, e, decrypted=True, now_ms=NOW) is not None
+    with pytest.raises(ValueError):
+        policy(aliases={"Bad Alias"})
+
+
+def test_mention_aliases_config_validation() -> None:
+    assert mention_aliases({}) == frozenset()
+    assert mention_aliases({"mention_aliases": ["seoseo", "bot-2"]}) == {"seoseo", "bot-2"}
+    for bad in ("seoseo", ["Seoseo"], ["a b"], [""], ["x"] * 9, ["dup", "dup"], [1]):
+        with pytest.raises(SafetyStop, match="invalid-mention-aliases"):
+            mention_aliases({"mention_aliases": bad})
+
+
+def test_wake_words_answer_bare_nicknames() -> None:
+    # Korean nicknames have no @handle: the family calls the bot "서서" / "서서야".
+    p = policy(wake_words={"서서", "서서야"})
+    for body, expected in [
+        ("서서야 오늘 일정", True),
+        ("서서 오늘 일정", True),
+        ("서서, 그건 좀 아니지", True),
+        ("야 서서!", True),
+        ("서서", True),
+        ("서서야뭐해", True),  # no-space typing: wake word + particle + rest
+        ("서서는이제그만", True),
+        ("서서랑놀자", True),
+        ("서서님안녕", True),
+        ("서서를봐줘", True),
+        ("서서에게말해", True),
+        ("오늘 서서히 풀리네", False),  # "서서" glued inside another word
+        ("서서울가자", False),  # 울 is not a particle
+        ("우리서서 별로야", False),
+        ("@서서야 안녕", True),  # a typed @handle still counts
+    ]:
+        e = event()
+        e["content"]["body"] = body
+        assert (p.admit(GROUP, e, decrypted=True, now_ms=NOW) is not None) is expected, body
+    # Direct rooms remain unconditioned.
+    e = event()
+    e["content"]["body"] = "멘션 없는 대화"
+    assert p.admit(ROOM, e, decrypted=True, now_ms=NOW) is not None
+    with pytest.raises(ValueError):
+        policy(wake_words={"Bad Word"})
+
+
+def test_turn_timeout_minutes_config_validation() -> None:
+    assert turn_timeout_minutes({}) == 360.0
+    assert turn_timeout_minutes({"turn_timeout_minutes": 360}) == 360.0
+    assert turn_timeout_minutes({"turn_timeout_minutes": 7.5}) == 7.5
+    for bad in (True, 4, 361, "x", None):
+        with pytest.raises(SafetyStop, match="invalid-turn-timeout"):
+            turn_timeout_minutes({"turn_timeout_minutes": bad})
+
+
+def test_wake_words_config_validation() -> None:
+    assert wake_words({}) == frozenset()
+    assert wake_words({"wake_words": ["서서", "서서야"]}) == {"서서", "서서야"}
+    for bad in ("서서", ["Seo seo"], ["서서-야"], [""], ["x"] * 9, ["dup", "dup"], [1]):
+        with pytest.raises(SafetyStop, match="invalid-wake-words"):
+            wake_words({"wake_words": bad})
+
+
+def test_aliases_and_wake_words_stack() -> None:
+    p = policy(aliases={"seoseo"}, wake_words={"서서"})
+    for body in ("@seoseo 안녕", "서서 안녕"):
+        e = event()
+        e["content"]["body"] = body
+        assert p.admit(GROUP, e, decrypted=True, now_ms=NOW) is not None, body
+
+
+def test_identities_replace_owner_pins_and_join_the_saved_policy(tmp_path: Path) -> None:
+    c = config(tmp_path)
+    master = "M" * 43
+    with_identity = {**c, "devices": {}, "identities": {c["owner"]: {"master": master}}}
+    assert identities(with_identity) == {c["owner"]: master}
+    validate_config(dict(with_identity))  # empty device pins are fine once the owner has an identity
+    with pytest.raises(SafetyStop, match="pin-owner-devices"):
+        validate_config({**c, "devices": {}})  # no identity: pins still required
+    policy = saved_policy(with_identity)
+    assert policy["identities"] == {c["owner"]: master} and policy["devices"] == {}
+    old = {k: v for k, v in policy.items() if k != "identities"}
+    assert upgrade_saved_policy(old) == {**policy, "identities": {}}  # pre-#149 policies upgrade to "no identities"
+    for bad in ({"@stranger:test.invalid": {"master": master}}, {c["owner"]: {"master": "short"}},
+                {c["owner"]: "M" * 43}, "not-a-dict", {c["owner"]: {}}):
+        with pytest.raises(SafetyStop, match="invalid-identities"):
+            identities({**c, "identities": bad})
+    family = {**c, "family_rooms": [c["rooms"][0]], "family_users": [OWNER2 := "@dad:test.invalid"],
+              "identities": {OWNER2: {"master": "D" * 43}}}
+    assert identities(family) == {OWNER2: "D" * 43}
