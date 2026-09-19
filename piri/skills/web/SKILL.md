@@ -8,8 +8,9 @@ description: Search the public web through Firecrawl Search (default) or explici
 Three stdlib-only helpers live in this skill directory (next to this
 SKILL.md). Run them with the bash tool; the commands below reference them
 relative to the skill root (`<skill-root>` = the directory containing this
-SKILL.md), so they hold for any install layout — do not assume the legacy
-`~/.piri` personal-install prefix. Keep the routes distinct: general search stays on Firecrawl Search;
+SKILL.md), so they hold for any install layout — do not hardcode an install
+prefix. `~/.piri/agent/skills/web` is where `setup.sh` installs this skill and
+is still a live path, but it is not the only layout. Keep the routes distinct: general search stays on Firecrawl Search;
 known-URL reads and developer artifact retrieval use Firecrawl scrape / Developer
 Index. Fleet SearXNG is an explicit opt-in only — never a silent fallback.
 

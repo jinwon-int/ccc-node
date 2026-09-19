@@ -87,7 +87,7 @@
       "name": "web",
       "source": "piri/skills/web",
       "status": "active",
-      "tree_sha256": "dc6df9988cca4d7891200a39c0308e4b975085db6680233871780bc5a2e2a53a"
+      "tree_sha256": "0fd6258a8fc918b6fca9cfd60f674dddd6530eaeae65435b4cc45a27eba6ea39"
     },
     {
       "audience": "claude",
