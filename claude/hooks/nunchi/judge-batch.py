@@ -35,7 +35,10 @@ Guard rails (issue #1204 contract):
 - NUNCHI_JUDGE_APPLY=1 to mutate; default is dry-run
 - NUNCHI_JUDGE_PROVIDER=typesafe swaps the free-text JSON contract for a typed
   decision (TypeSafe Jev): the backend returns a chosen verdict plus a
-  calibrated confidence, so nothing is parsed out of prose. Measured against 21
+  calibrated confidence, so nothing is parsed out of prose. The bearer key
+  comes from TYPESAFE_API_KEY or, when unset, the owner-only key file
+  ~/.secrets/typesafe-api-key (same file and safety checks as the bridge
+  jev-skill-advice feature) so the cron line never carries a raw secret. Measured against 21
   production verdicts (18 with a surviving sibling): 16/18 agreement, and both
   disagreements came back at confidence 0.15 / 0.33 — i.e. the backend was
   honestly unsure exactly where it was wrong. NUNCHI_JUDGE_MIN_CONFIDENCE
@@ -400,9 +403,54 @@ def judge_candidates():
     return [(provider, provider) for provider in providers]
 
 
+def _private_key_file(path, limit=4096):
+    """Read one owned, private regular file without following its leaf symlink.
+
+    Same contract as bridge/core/skill_advice.py `_private_bytes`: parent not a
+    symlink and not group/other-writable, leaf opened O_NOFOLLOW, must be a
+    regular file owned by the euid with no group/other permission bits, size
+    bounded. Returns None on any violation — a missecured file behaves exactly
+    like a missing key (fail-closed degrade), never an exception.
+    """
+    try:
+        parent = os.path.dirname(path) or "."
+        pst = os.stat(parent)
+        if os.path.islink(parent) or pst.st_mode & 0o022:
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077
+                or not 0 < info.st_size <= limit
+            ):
+                return None
+            data = stream.read(limit + 1)
+        if len(data) > limit:
+            return None
+        text = data.decode("ascii", errors="replace").strip()
+        if not text or any(ord(c) < 33 or ord(c) > 126 for c in text):
+            return None
+        return text
+    except OSError:
+        return None
+
+
 def typesafe_key():
-    """The Jev bearer key, or "" when unset. Never logged, audited or reported."""
-    return os.environ.get("TYPESAFE_API_KEY", "").strip()
+    """The Jev bearer key, or "" when unset. Never logged, audited or reported.
+
+    Resolution order: TYPESAFE_API_KEY env, then the owner-only key file
+    ~/.secrets/typesafe-api-key (TYPESAFE_API_KEY_FILE overrides the path).
+    """
+    key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    if key:
+        return key
+    path = os.environ.get("TYPESAFE_API_KEY_FILE") or os.path.expanduser(
+        "~/.secrets/typesafe-api-key"
+    )
+    return _private_key_file(path) or ""
 
 
 def candidate_available(provider, command):

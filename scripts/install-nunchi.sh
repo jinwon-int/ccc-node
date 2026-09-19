@@ -37,6 +37,14 @@ PROVIDER="${CCC_NUNCHI_PROVIDER:-auto}"
 TARGET_USER="${CCC_NUNCHI_TARGET_USER:-}"
 JUDGE="${CCC_NUNCHI_JUDGE:-0}"
 JUDGE_APPLY="${CCC_NUNCHI_JUDGE_APPLY:-0}"
+# Opt-in judge backend passthrough (#1204 contract: `typesafe`/Jev is opt-in
+# only and never part of `auto`). Validated here so a typo cannot silently
+# produce a cron line the batch would reject into fail-closed human mode.
+JUDGE_PROVIDER="${CCC_NUNCHI_JUDGE_PROVIDER:-}"
+case "$JUDGE_PROVIDER" in
+  ""|auto|claude|codex|typesafe) ;;
+  *) echo "CCC_NUNCHI_JUDGE_PROVIDER='$JUDGE_PROVIDER' invalid (auto|claude|codex|typesafe)" >&2; exit 2 ;;
+esac
 WIKI_PROMOTE="${CCC_NUNCHI_WIKI_PROMOTE:-0}"
 WIKI_PROMOTE_APPLY="${CCC_NUNCHI_WIKI_PROMOTE_APPLY:-0}"
 AUDIENCE_SCOPED="${CCC_NUNCHI_AUDIENCE_SCOPED:-0}"
@@ -689,11 +697,13 @@ case "$ACTION" in
       # missing --judge install-record entry.
       judge_apply_env=""
       if [ "$JUDGE_APPLY" = 1 ]; then judge_apply_env="NUNCHI_JUDGE_APPLY=1 "; fi
-      append_cron_line "41 4 * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${judge_apply_env}${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$python3_bin") $(cron_quote "$HOOKS/judge-batch.py") >> $(cron_quote "$NUNCHI_DIR/judge.cron.log") 2>&1 $MARK gen=$GEN"
+      judge_provider_env=""
+      if [ -n "$JUDGE_PROVIDER" ] && [ "$JUDGE_PROVIDER" != auto ]; then judge_provider_env="NUNCHI_JUDGE_PROVIDER=$JUDGE_PROVIDER "; fi
+      append_cron_line "41 4 * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${judge_apply_env}${judge_provider_env}${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$python3_bin") $(cron_quote "$HOOKS/judge-batch.py") >> $(cron_quote "$NUNCHI_DIR/judge.cron.log") 2>&1 $MARK gen=$GEN"
       if [ "$JUDGE_APPLY" = 1 ]; then
-        echo "daily judge-batch cron added (04:41, APPLY — mutates the fact store)"
+        echo "daily judge-batch cron added (04:41, APPLY — mutates the fact store${judge_provider_env:+, provider $JUDGE_PROVIDER})"
       else
-        echo "daily judge-batch cron added (04:41, dry-run)"
+        echo "daily judge-batch cron added (04:41, dry-run${judge_provider_env:+, provider $JUDGE_PROVIDER})"
       fi
     fi
     if [ "$WIKI_PROMOTE" = 1 ]; then
