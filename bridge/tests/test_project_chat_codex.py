@@ -3217,3 +3217,24 @@ async def test_approval_stall_message_names_the_pending_claude_tool(
     assert "(pending: Bash command)" in response.content
     assert "shadow" not in response.content
     assert stalled == [1]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("provider", ["codex", "claude", "piri", "danso"])
+@pytest.mark.parametrize("route", ["telegram", "matrix"])
+async def test_skill_advice_reaches_common_provider_turn_only(
+    tmp_path: Path, monkeypatch, provider: str, route: str,
+) -> None:
+    from telegram_bot.core import project_chat_process as process
+    observed = []
+    async def advise(message, **kwargs):
+        observed.append((message, kwargs))
+        return "advisory\n" + message
+    monkeypatch.setattr(process, "advise_turn", advise)
+    session = FakeSession("advice-test")
+    handler = ProjectChatHandler(settings=_settings(tmp_path, provider=provider),
+                                 agent_runtime=FakeRuntime([session]), memory_route=route)
+    handler._task_ledger_cache = False
+    response = await handler.process_message("Find public documentation", user_id=7, chat_id=7)
+    assert response.success and session.messages == ["advisory\nFind public documentation"]
+    assert len(observed) == 1 and observed[0][1]["interactive"] is True

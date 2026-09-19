@@ -62,6 +62,7 @@ from telegram_bot.core.request_lifecycle import (
 from telegram_bot.core.usage import claude_endpoint_host
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE
 from telegram_bot.core.sdk_text import TERMINAL_STALL_NOTICE
+from telegram_bot.core.skill_advice import advise_turn
 from telegram_bot.utils.chat_logger import log_chat
 from telegram_bot.core.codex_app_server import CodexConnectionClosedError
 from telegram_bot.utils.health import health_reporter
@@ -1159,10 +1160,16 @@ class ProjectChatProcessMixin:
                     if callable(authorize_followup):
                         authorize_followup()
                         followup_authorized = True
+                turn_message = await advise_turn(
+                    user_message, settings=self._config, user_id=user_id, chat_id=chat_id,
+                    interactive=(usage_mode == MODE_INTERACTIVE and not resume_task
+                                 and dispatch_guard is None
+                                 and admission_timeout_override is None),
+                )
                 turn_outcome = await asyncio.wait_for(
                     consume_turn_stream(
                         session.send_turn(
-                            user_message,
+                            turn_message,
                             approval_handler=handle_approval,
                         ).__aiter__(),
                         state=turn_state,
