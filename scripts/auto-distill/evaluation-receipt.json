@@ -3,7 +3,7 @@
  "pipeline": 6,
  "subject": {
   "path": "scripts/auto-distill/auto-distill.py",
-  "sha256": "1086999d4ced5db6c4ae18fc8200b67ef1614f3e133232a39065cf895fe19f33",
+  "sha256": "124e89be288c7bd90508030aa920f12b37386b5b1210f91de6e50f8313a4b85a",
   "surface_schema": "ccc.auto-distill.canon-surface.v1",
   "surface_sha256": "9894a32ba4d262512a8f44eb4f00a10486adcb7b01d7131816b646f85ebadc28",
   "surface_members": [
@@ -28,16 +28,16 @@
   ]
  },
  "evaluation": {
-  "id": "TM-3447",
-  "evaluated_source_sha256": "1086999d4ced5db6c4ae18fc8200b67ef1614f3e133232a39065cf895fe19f33",
-  "completed_at": "2026-09-19T14:05:17Z",
+  "id": "TM-3448",
+  "evaluated_source_sha256": "124e89be288c7bd90508030aa920f12b37386b5b1210f91de6e50f8313a4b85a",
+  "completed_at": "2026-09-19T14:56:58Z",
   "provider": "claude-code-oauth",
   "model": "claude-haiku-4-5-20251001",
   "model_resolution": {
    "alias": "claude-haiku-4-5-20251001",
    "resolved_id": "claude-haiku-4-5-20251001",
    "resolved_by": "claude-json-modelUsage:envelopes (47/47 calls)",
-   "resolved_at": "2026-09-19T14:05:17Z"
+   "resolved_at": "2026-09-19T14:56:58Z"
   },
   "corpus": {
    "sample": "sample-v4.json",
@@ -53,24 +53,24 @@
    "recheck_addr_sha256": "698599263790d4826416b6a6474d2a572d6791178488773990ecc433d011df5e"
   },
   "artifacts": {
-   "eval_log_sha256": "04eb98119bf92736b0da38340b6c24595a263687834368ca725d19deef1fc986",
-   "eval_result_sha256": "99a794f852dab0975f3b3bb8d1af0c110e8d7323a47488bbde28025409d891a5",
-   "recheck_log_sha256": "045da7284f4c761b50de76addb03c9c25f4e4d9c32c1094c0330f59a7b10e782"
+   "eval_log_sha256": "fb3fa8616d0f770bfa58ebf94b9abf4b3b3bd485f90e54868d7e444c4555b0eb",
+   "eval_result_sha256": "2ad41722f04f43d52ad25b96ca41eb1a0f047bfed5e934745377c391a0306452",
+   "recheck_log_sha256": "48eec24b369c7a1799e1c39f38bbc781be4fd9e24ac773f941ec4c77398a6dfc"
   },
   "recheck": {
    "baseline_duplicates": 1,
-   "duplicates": 6,
+   "duplicates": 4,
    "cases": 12,
    "suspect": 0
   },
   "confusion": {
-   "tp": 14,
-   "fp": 1,
-   "fn": 9,
-   "tn": 23
+   "tp": 15,
+   "fp": 2,
+   "fn": 8,
+   "tn": 22
   },
   "collateral_damage": 0,
   "passed": true
  },
- "issued_at": "2026-09-19T23:06:50+09:00"
+ "issued_at": "2026-09-19T23:58:09+09:00"
 }

@@ -4,6 +4,18 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **auto-distill: the prefixed-secret pattern stopped at the first underscore
+  (#1840).** A real issued key is multi-segment — `apikey_<36hex>_<64hex>` — and
+  the body class `[A-Za-z0-9]{32,}` excluded `_`, so only the first segment was
+  masked and the trailing 64 characters survived (43 of 108 masked, observed
+  against a live key right after #1848 landed). The body now allows `_` after the
+  first character. The single-segment test fixtures (`"1" * 40`) are what hid it;
+  two- and three-segment fixtures and a `snake_case` false-positive probe were
+  added. Verified 0 false positives over the same benign corpus.
+  Receipt re-issued as **TM-3448** (source `124e89be…`, surface `9894a32b…`
+  unchanged): TP 15 / FP 2 / FN 8 / TN 22 (precision 88%, recall 65%), recheck
+  4/12 over baseline 1, collateral 0.
+
 - **auto-distill: masker/gate secret-pattern parity, and two holes both copies
   shared (#1840).** #1841 could only fix the publish gate — `auto-distill.py` is
   pinned by its exact-source receipt. This adds the masker half: the
