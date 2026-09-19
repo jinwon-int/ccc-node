@@ -34,27 +34,49 @@ from model_command import (
 # AUTO.md 에 싣는 인용문은 세션 원문 축자다. 세션에는 명령 출력이 그대로 들어 있어
 # 토큰·키가 섞일 수 있다. wiki-pr-gate 가 막아 주긴 하지만 **게이트가 막는 시점엔
 # 이미 로컬 커밋과 push 된 브랜치에 값이 들어가 있다.** 그러므로 렌더 시점에
-# 마스킹한다. 패턴은 wiki-pr-gate 의 TOKEN_RE / ASSIGN_RE 와 정렬한다.
+# 마스킹한다. 패턴은 wiki-pr-gate 의 TOKEN_RE / ASSIGN_RE 와 정렬한다 —
+# 이제 scripts/auto-distill/test_redact.py 가 두 복사본을 파싱해 대조하므로
+# 선언되지 않은 차이는 CI 가 막는다.
+#
+# 경계에 `\b` 를 쓰지 않는다. `\b` 는 유니코드 인식이라 한글도 단어문자이고,
+# 한국어 코퍼스에서 토큰이 조사에 밀착하는 건 예외가 아니라 정상이다
+# (`AKIA…이다`, `키는ghp_…였다` 가 전부 빠져나갔다). ASCII 전용 lookaround 는
+# ASCII 문맥에서 `\b` 와 동일하게 동작하면서 한글 인접을 막지 않는다.
+_B = r"(?<![A-Za-z0-9_])"      # 앞 경계
+_E = r"(?![A-Za-z0-9_])"       # 뒤 경계
 _TOKEN_RE = re.compile(
     r"(-----BEGIN [A-Z ]*PRIVATE KEY-----"
     r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}"
-    r"|\bsk-[A-Za-z0-9_-]{32,}"
-    r"|\bAKIA[0-9A-Z]{16}\b"
-    r"|\bAIza[0-9A-Za-z_-]{30,}"
-    r"|\bxox[baprs]-[0-9A-Za-z-]{20,}"
-    r"|\b[0-9]{8,10}:[A-Za-z0-9_-]{30,}"
+    + r"|" + _B + r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}"
+    + r"|" + _B + r"sk-[A-Za-z0-9_-]{32,}"
+    + r"|" + _B + r"AKIA[0-9A-Z]{16}" + _E
+    + r"|" + _B + r"AIza[0-9A-Za-z_-]{30,}"
+    + r"|" + _B + r"xox[baprs]-[0-9A-Za-z-]{20,}"
+    # 텔레그램 봇토큰. **순수 소문자 hex 본문을 제외**한다. `1758240000:<sha40>` 은
+    # 이 저장소 운영 산문(watermark·커서·상태 덤프)의 평범한 모양인데 여기에
+    # 걸려 정당한 증거 인용이 훼손됐다. 봇토큰은 대소문자·밑줄이 섞이고 SHA 는
+    # 순수 소문자 hex 라서 이 lookahead 로 갈린다.
+    + r"|" + _B + r"[0-9]{8,10}:(?![a-f0-9]{30,}(?![A-Za-z0-9_-]))[A-Za-z0-9_-]{30,}"
     r"|tskey-[a-z]+-[A-Za-z0-9]{10,}"
     r"|glpat-[A-Za-z0-9_-]{20,}"
-    r"|\bhf_[A-Za-z0-9]{30,}"
-    r"|\bnpm_[A-Za-z0-9]{36}\b"
-    r"|\bdop_v1_[a-f0-9]{64}\b"
-    r"|\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"
+    + r"|" + _B + r"hf_[A-Za-z0-9]{30,}"
+    # npm 토큰은 36자가 표준이지만 하한만 두어 더 긴 것도 잡는다. 이전의
+    # `{36}` + 뒤 경계는 37자짜리를 통째로 놓쳤다.
+    + r"|" + _B + r"npm_[A-Za-z0-9]{36,}"
+    # dop_v1_ 는 대문자 hex 도 받는다. 소문자만 보던 이전 형태는 대문자를 놓쳤다.
+    + r"|" + _B + r"dop_v1_[A-Fa-f0-9]{64,}"
+    + r"|" + _B + r"SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"
     r"|AGE-SECRET-KEY-1[A-Z0-9]{20,}"
     r"|hooks\.slack\.com/services/[A-Za-z0-9/_+-]{20,}"
-    r"|\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\."
+    + r"|" + _B + r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\."
     r"|[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@"
-    r"|\b01[016789][-. ]?[0-9]{3,4}[-. ]?[0-9]{4}\b)")
+    # `<다단어>_<32자↑>` 접두 형태. 구독 서비스 키가 흔히 이 모양이고 _ASSIGN_RE 는
+    # `api_key:` 처럼 구분자를 요구하므로 놓쳤다. 접두어는 다단어만 받는다 —
+    # bare `key_`/`token_`/`secret_` 는 `key_<md5>` 같은 캐시 키와 충돌한다.
+    # 길이 하한과 접두어 앵커는 둘 다 필수다: 길이만 보는 포괄 패턴
+    # (`[A-Za-z0-9]{40,}`)은 실데이터 716k자에서 165건 적중했고 전부 커밋 SHA 였다.
+    + r"|" + _B + r"(?:apikey|api_key|apitoken|api_token|secret_key|access_token)_[A-Za-z0-9]{32,}"
+    + r"|" + _B + r"01[016789][-. ]?[0-9]{3,4}[-. ]?[0-9]{4}" + _E + r")")
 _ASSIGN_RE = re.compile(
     r"((?:password|passwd|api[_-]?key|secret|access[_-]?token|client[_-]?secret|bearer)"
     r"\s*[:=]\s*[\"']?)([A-Za-z0-9_+/=.-]{16,})", re.I)
