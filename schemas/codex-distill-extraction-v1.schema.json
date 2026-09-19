@@ -69,9 +69,11 @@
             "decision",
             "observation",
             "context",
+            "constraint",
             "task-progress",
             "procedure",
-            "constraint"
+            "fact",
+            "correction"
           ],
           "title": "Kind",
           "type": "string"

@@ -111,8 +111,12 @@ def _load_retention_policy():
 
 RETENTION = _load_retention_policy()
 RETENTION_STATS = {"dropped": 0, "guarded": 0, "unknown_kinds": 0}
+# The literal set below is the fail-open floor: it must still cover the
+# unified 9-kind fact enum (#1837) when the policy file is missing/malformed,
+# otherwise a known kind would be miscounted as unknown_kinds in diagnostics.
 _KNOWN_KINDS = set(_RETENTION_DEFAULTS["kinds"]) | {
-    "task-progress", "observation", "preference", "context", "fact", "unstructured",
+    "task-progress", "observation", "preference", "context", "fact", "correction",
+    "unstructured",
 } | set((RETENTION.get("kinds") or {}).keys())
 
 

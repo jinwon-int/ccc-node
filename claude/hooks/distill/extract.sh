@@ -114,7 +114,7 @@ Schema:
 {
   "honcho": [
     {
-      "kind": "preference" | "decision" | "observation" | "context" | "constraint",
+      "kind": "preference" | "decision" | "observation" | "context" | "constraint" | "task-progress" | "procedure" | "fact" | "correction",
       "text": "<one-sentence Korean fact about the user, relationship, or in-flight work>",
       "subject": "user" | "session" | "node",
       "source": "user-stated" | "measured" | "inferred",
@@ -147,6 +147,18 @@ honcho criteria (working/relational memory; volatile OK):
   - PRESERVE VERBATIM inside `text`: numbers, issue/PR ids (#NNN), commit SHAs,
     file paths, and model/version strings — copy them exactly, never round or
     paraphrase (summary drift kills specifics first).
+  - kind glossary — pick the NARROWEST kind that fits; `decision` is not the
+    default bucket (#1837: 30% of the judge queue was completion reports,
+    corrections, and proposals tagged `decision`, i.e. "decisions" with no why):
+      preference    = the user's standing taste for how work should be done.
+      decision      = a choice actually made and settled; `because` REQUIRED.
+      task-progress = a progress or completion report on work; NOT a decision.
+      correction    = a statement that fixes an earlier, now-wrong statement.
+      procedure     = a reusable multi-step method / how-to worth repeating.
+      fact          = an observed statement of what is true right now.
+      observation   = a relational read of the user or the session's behavior.
+      context       = in-flight background the next session needs to resume.
+      constraint    = a standing prohibition/must the user stated.
   - kind=decision MUST set `because` to its one-sentence reason. A decision
     without its why gets blindly re-litigated or blindly obeyed later — both
     are failure modes (weekly bench q7 measured a decision whose reason only
