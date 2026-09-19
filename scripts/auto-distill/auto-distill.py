@@ -115,6 +115,22 @@ def resolve_node():
 
 CAP_PER_RUN = 5         # 회당 세션 상한
 EXTRACT_FAIL_BUDGET = 3  # 같은 파일 스냅샷의 연속 추출 실패 상한 (#1297)
+# 모델에 도달하지 못한 실패(계정 한도·API 오류·CLI 기동 실패)는 세션 탓이 아니다.
+# 품질 예산(3)에 섞으면 한도 장애 1.5h 만에 종료 세션이 영구 dead-letter 된다(#1831).
+# 별도 예산으로 센다: */30 크론 기준 48회 ≈ 24h. 결정적 전송 오류(예: 세션 고유의
+# prompt-too-long 봉투)가 무한 재시도되지 않도록 상한은 둔다.
+TRANSPORT_FAIL_BUDGET = 48
+# 한 회차에서 연속 전송 실패가 이만큼이면 회차를 즉시 멈춘다 — 장애 중에 남은
+# 세션마다 실패를 기록하고 호출을 낭비하지 않는다(#1831 제안 3, #1250 과 같은 발상).
+TRANSPORT_BREAKER = 2
+# 0 이 아닌 종료코드라도 stderr 가 한도·전송 장애를 말하면 전송 실패로 본다.
+# 보수적으로 좁게 잡는다 — 애매하면 기존대로 품질 예산(model_exit_N)에 남는다.
+TRANSPORT_STDERR_RE = re.compile(
+    r"(usage|session|rate|weekly)[ _-]?limit|hit your .{0,40}limit|overloaded"
+    r"|credit balance|\b(429|529)\b|ECONNRE(SET|FUSED)|ETIMEDOUT|ENOTFOUND"
+    r"|EAI_AGAIN|network error|connection (error|refused|reset)",
+    re.I,
+)
 
 
 def utc_ts():
@@ -431,6 +447,12 @@ def extract_failure_state(entry):
     return failure if isinstance(failure, dict) else {}
 
 
+def is_transport_failure(error):
+    """True when the model was never reached (#1561/#1831) — not the session's fault."""
+    reason = extract_failure_reason(error)
+    return reason in ("model_unavailable", "model_spawn_error")
+
+
 def dead_letter_holds(entry, snapshot_size):
     """A dead letter stays parked until its append-only source grows."""
     failure = extract_failure_state(entry)
@@ -445,24 +467,43 @@ def dead_letter_holds(entry, snapshot_size):
 
 def record_extract_failure(
         entry, *, path, snapshot_size, snapshot_mtime, error,
-        budget=EXTRACT_FAIL_BUDGET):
-    """Return updated retry state while preserving the last success cursor."""
+        budget=EXTRACT_FAIL_BUDGET, transport_budget=TRANSPORT_FAIL_BUDGET):
+    """Return updated retry state while preserving the last success cursor.
+
+    Quality failures (no_json/bad_json/model_exit_N/timeout) spend `attempts`
+    against `budget`. Transport failures (the model was never reached, #1831)
+    spend `transport_attempts` against the much larger `transport_budget` and
+    leave the quality count untouched, so an account-limit outage no longer
+    parks finished sessions forever after three cron ticks.
+    """
     current = dict(entry) if isinstance(entry, dict) else {}
     previous = extract_failure_state(current)
     previous_size = previous.get("snapshot_size")
-    previous_attempts = previous.get("attempts")
     same_snapshot = type(previous_size) is int and previous_size == snapshot_size
-    if type(previous_attempts) is not int or previous_attempts < 0:
-        previous_attempts = 0
-    attempts = previous_attempts + 1 if same_snapshot else 1
+
+    def _count(name):
+        value = previous.get(name) if same_snapshot else 0
+        return value if type(value) is int and value >= 0 else 0
+
+    attempts = _count("attempts")
+    transport_attempts = _count("transport_attempts")
+    transport = is_transport_failure(error)
+    if transport:
+        transport_attempts += 1
+    else:
+        attempts += 1
     limit = max(1, int(budget))
+    transport_limit = max(1, int(transport_budget))
     failure = {
         "attempts": attempts,
         "budget": limit,
+        "transport_attempts": transport_attempts,
+        "transport_budget": transport_limit,
+        "transport": transport,
         "reason": extract_failure_reason(error),
         "snapshot_size": int(snapshot_size),
         "snapshot_mtime": float(snapshot_mtime),
-        "dead_lettered": attempts >= limit,
+        "dead_lettered": attempts >= limit or transport_attempts >= transport_limit,
     }
     # `mtime` and `lines` remain the last *successful* cursor. Advancing either
     # on failure would silently discard the unextracted increment.
@@ -615,6 +656,9 @@ def extract_json(prompt, model_cmd, timeout):
         # the engine_selected audit event.
         return None, ("model_spawn_error:%s" % type(exc).__name__, {}, "")
     if p.returncode != 0:
+        if TRANSPORT_STDERR_RE.search((p.stderr or "") + "\n" + (p.stdout or "")[-2000:]):
+            # 한도·전송 장애로 비정상 종료 — 모델 품질 실패와 섞지 않는다(#1831).
+            return None, ("model_unavailable:exit_%d" % p.returncode, {}, "")
         return None, ("model_exit_%d: %s" % (p.returncode, p.stderr.strip()[:200]), {}, "")
     out = p.stdout
     usage = {}
@@ -1308,6 +1352,9 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     ap.add_argument("--out", default=os.path.join(HOME, ".hermes/logs/auto-distill-dryrun.jsonl"))
     ap.add_argument("--save-raw", action="store_true", help="dry-run 진단용: 모델 원출력 일부 저장")
     ap.add_argument("--only", default=None, help="이 문자열이 포함된 세션만 처리")
+    ap.add_argument("--revive-dead-letters", action="store_true",
+                    help="운영자 1회성 복구: 보류(dead-letter) 세션의 실패 상태를 지우고 "
+                         "다시 추출한다. --only 로 범위를 좁힐 수 있다 (#1831)")
     ap.add_argument("--source", default="auto", choices=["auto", "piri", "claude"],
                     help="세션 소스. auto = 실재하는 소스 전부")
     ap.add_argument("--render-out", default=None,
@@ -1453,7 +1500,11 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
         prev = wm.get(key, {})
         failure = extract_failure_state(prev)
         held = dead_letter_holds(prev, snapshot.st_size)
-        if held:
+        revive = (
+            held and args.revive_dead_letters
+            and (not args.only or args.only in os.path.basename(f))
+        )
+        if held and not revive:
             if not args.only or args.only in os.path.basename(f):
                 dead_letters.append({
                     "session": os.path.basename(f)[:24],
@@ -1463,7 +1514,7 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
                 })
             continue
         failed_size = failure.get("snapshot_size")
-        reactivated = (
+        reactivated = revive or (
             failure.get("dead_lettered") is True
             and type(failed_size) is int
             and snapshot.st_size > failed_size
@@ -1477,6 +1528,19 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
             log_audit({"event": "skip", "session": os.path.basename(f)[:24],
                        "reason": "self_call"})
             continue
+        if revive and not args.dry_run:
+            # 운영자 1회성 복구(#1831): 실패 상태를 지우고 새 예산으로 다시 시도한다.
+            # 성공 커서(lines/mtime)는 그대로라 미추출 증가분을 다시 읽는다.
+            log_audit({
+                "event": "dead_letter_revived",
+                "session": os.path.basename(f)[:24],
+                "reason": failure.get("reason", "extract_fail"),
+                "attempts": failure.get("attempts", EXTRACT_FAIL_BUDGET),
+            })
+            revived = dict(prev)
+            revived.pop("extract_failure", None)
+            wm[key] = revived
+            reactivated = False
         todo.append((f, key, prev.get("lines", 0), reactivated))
     if args.only:
         todo = [t for t in todo if args.only in os.path.basename(t[0])]
@@ -1493,7 +1557,8 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     render_path = args.render_out or os.path.join(HOME, ".hermes/logs/auto-%s.md" % args.node)
     rendered_add = rendered_dup = 0
     results = []
-    for f, key, since, reactivated in todo:
+    transport_streak = 0
+    for index, (f, key, since, reactivated) in enumerate(todo):
         t0 = time.time()
         digest, ids, total = digest_session(f, since)
         name = os.path.basename(f)[:24]
@@ -1536,6 +1601,8 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
                        "reason": failure["reason"],
                        "attempt": failure["attempts"],
                        "budget": failure["budget"],
+                       "transport": failure["transport"],
+                       "transport_attempt": failure["transport_attempts"],
                        "sec": round(dt, 1), "usage": usage,
                        "dry_run": args.dry_run})
             if not args.dry_run:
@@ -1555,7 +1622,22 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
                         "budget": failure["budget"],
                         "snapshot_size": failure["snapshot_size"],
                     })
+            if failure["transport"]:
+                transport_streak += 1
+                if transport_streak >= TRANSPORT_BREAKER:
+                    remaining = len(todo) - index - 1
+                    print("전송 실패 %d건 연속 — 회로 차단, 남은 %d개 세션은 다음 회차로"
+                          % (transport_streak, remaining))
+                    log_audit({"event": "transport_circuit_open",
+                               "streak": transport_streak,
+                               "remaining": remaining,
+                               "reason": failure["reason"],
+                               "dry_run": args.dry_run})
+                    break
+            else:
+                transport_streak = 0
             continue
+        transport_streak = 0
         items = data.get("items", []) if isinstance(data, dict) else []
         kept, dropped = verify(items, ids)
         n_struct = len(kept)
