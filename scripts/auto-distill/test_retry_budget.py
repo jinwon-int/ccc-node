@@ -75,6 +75,49 @@ class RetryStateTest(unittest.TestCase):
         self.assertFalse(failure["dead_lettered"])
         self.assertEqual(failure["reason"], "model_exit_1")
 
+    def test_transport_failures_do_not_spend_quality_budget(self):
+        """#1831: account-limit outages must not park finished sessions."""
+        entry = {"lines": 5, "mtime": 1.0}
+        for expected in range(1, 11):
+            entry, failure = AUTO_DISTILL.record_extract_failure(
+                entry, path="/s", snapshot_size=500, snapshot_mtime=2.0,
+                error="model_unavailable:error_envelope",
+            )
+            self.assertEqual(failure["transport_attempts"], expected)
+        self.assertEqual(failure["attempts"], 0)
+        self.assertTrue(failure["transport"])
+        self.assertFalse(failure["dead_lettered"])
+        self.assertFalse(AUTO_DISTILL.dead_letter_holds(entry, 500))
+        # A later quality failure still counts from the preserved quality count.
+        entry, failure = AUTO_DISTILL.record_extract_failure(
+            entry, path="/s", snapshot_size=500, snapshot_mtime=2.0, error="no_json",
+        )
+        self.assertEqual((failure["attempts"], failure["transport_attempts"]), (1, 10))
+        self.assertFalse(failure["transport"])
+
+    def test_transport_budget_is_bounded(self):
+        entry = {}
+        for _ in range(4):
+            entry, failure = AUTO_DISTILL.record_extract_failure(
+                entry, path="/s", snapshot_size=1, snapshot_mtime=1.0,
+                error="model_spawn_error:FileNotFoundError", transport_budget=4,
+            )
+        self.assertTrue(failure["dead_lettered"])
+        self.assertEqual(failure["reason"], "model_spawn_error")
+
+    def test_transport_classifier(self):
+        yes = ("model_unavailable:no_model_usage", "model_unavailable:exit_1",
+               "model_spawn_error:OSError")
+        no = ("no_json", "bad_json", "timeout", "model_exit_1: boom", "")
+        for error in yes:
+            self.assertTrue(AUTO_DISTILL.is_transport_failure(error), error)
+        for error in no:
+            self.assertFalse(AUTO_DISTILL.is_transport_failure(error), error)
+        rx = AUTO_DISTILL.TRANSPORT_STDERR_RE
+        self.assertTrue(rx.search("You've hit your session limit · resets 5pm"))
+        self.assertTrue(rx.search("API Error: 529 Overloaded"))
+        self.assertFalse(rx.search("Traceback: KeyError 'items'"))
+
     def test_malformed_watermark_never_parks_a_session(self):
         self.assertFalse(AUTO_DISTILL.dead_letter_holds(None, 10))
         self.assertFalse(AUTO_DISTILL.dead_letter_holds(
@@ -190,6 +233,76 @@ class RetryBudgetIntegrationTest(unittest.TestCase):
         audit = self.audit.read_text(encoding="utf-8")
         self.assertNotIn("error", audit)
         self.assertNotIn("private stderr", audit)
+
+    ERROR_ENVELOPE = (
+        'printf "called\\n" >> "$COUNT_FILE"\n'
+        'printf \'{"type":"result","is_error":true,"result":"You have hit your session limit"}\\n\'\n'
+    )
+
+    def test_error_envelope_four_runs_never_dead_letters(self):
+        """#1831 acceptance: 4 consecutive runs of is_error envelopes."""
+        session = self.session("limit-session.jsonl", "limit")
+        model = self.model("envelope-model", self.ERROR_ENVELOPE)
+        key = hashlib.sha256(str(session).encode()).hexdigest()[:16]
+        for _ in range(4):
+            result = self.run_distill(model)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        failure = self.watermark()[key]["extract_failure"]
+        self.assertEqual(failure["reason"], "model_unavailable")
+        self.assertEqual(failure["attempts"], 0)
+        self.assertEqual(failure["transport_attempts"], 4)
+        self.assertFalse(failure["dead_lettered"])
+        self.assertEqual(len(self.calls.read_text().splitlines()), 4)
+        events = [row["event"] for row in self.audit_rows()]
+        self.assertNotIn("dead_letter", events)
+
+    def test_limit_stderr_nonzero_exit_is_transport(self):
+        session = self.session("exit-limit.jsonl", "exitlim")
+        model = self.model(
+            "exit-limit-model",
+            'echo "Claude usage limit reached" >&2\nexit 1\n',
+        )
+        key = hashlib.sha256(str(session).encode()).hexdigest()[:16]
+        for _ in range(3):
+            self.assertEqual(self.run_distill(model).returncode, 0)
+        failure = self.watermark()[key]["extract_failure"]
+        self.assertEqual(failure["reason"], "model_unavailable")
+        self.assertFalse(failure["dead_lettered"])
+
+    def test_consecutive_transport_failures_open_the_circuit(self):
+        for index in range(4):
+            path = self.session("breaker-%d.jsonl" % index, "brk%d" % index)
+            now = time.time() - index
+            os.utime(path, (now, now))
+        model = self.model("breaker-model", self.ERROR_ENVELOPE)
+        result = self.run_distill(model, "--cap", "10")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Two calls, then the run stops; the other two sessions carry no failure.
+        self.assertEqual(len(self.calls.read_text().splitlines()),
+                         AUTO_DISTILL.TRANSPORT_BREAKER)
+        failed = [v for v in self.watermark().values() if "extract_failure" in v]
+        self.assertEqual(len(failed), AUTO_DISTILL.TRANSPORT_BREAKER)
+        rows = [r for r in self.audit_rows() if r["event"] == "transport_circuit_open"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["remaining"], 4 - AUTO_DISTILL.TRANSPORT_BREAKER)
+
+    def test_revive_dead_letters_retries_parked_session_once(self):
+        session = self.session("revive.jsonl", "revive")
+        failing = self.model("revive-fail", 'printf "called\\n" >> "$COUNT_FILE"\nexit 1\n')
+        key = hashlib.sha256(str(session).encode()).hexdigest()[:16]
+        for _ in range(3):
+            self.run_distill(failing)
+        self.assertTrue(self.watermark()[key]["extract_failure"]["dead_lettered"])
+        ok = self.model("revive-ok", 'printf \'{"items":[]}\\n\'\n')
+        # Without the flag the session stays parked.
+        self.assertIn("state=held", self.run_distill(ok).stdout)
+        result = self.run_distill(ok, "--revive-dead-letters")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.watermark()[key]
+        self.assertNotIn("extract_failure", entry)
+        self.assertEqual(entry["lines"], 1)
+        events = [row["event"] for row in self.audit_rows()]
+        self.assertEqual(events.count("dead_letter_revived"), 1)
 
     def test_parked_session_does_not_consume_the_cap(self):
         dead = self.session("newest-dead.jsonl", "dead")
