@@ -137,6 +137,25 @@ class ClientTest(unittest.TestCase):
         self.assertFalse(client_mod._is_retryable(302))
         self.assertFalse(client_mod._is_retryable(301))
 
+    def test_choice_probability_reads_the_map_not_a_scalar(self):
+        """The live API returns `probabilities` (a map), never `probability`.
+
+        The ledger's probability column feeds calibration, so a consumer that
+        follows the old docstring writes nulls and never notices.
+        """
+        from jevlib import choice_probability
+
+        live_shape = {
+            "type": "choice",
+            "choice": "transient_retry",
+            "confidence": 0.99,
+            "probabilities": {"transient_retry": 1.0, "permanent_quota": 0.0},
+        }
+        self.assertEqual(choice_probability(live_shape), 1.0)
+        self.assertIsNone(choice_probability({"choice": "x", "probabilities": {}}))
+        self.assertIsNone(choice_probability({"type": "noul", "noul": 0.1}))
+        self.assertIsNone(choice_probability(None))
+
     def test_choice_wrapper_missing_answer(self):
         client = JevClient(key="k", transport=lambda b: (200, b'{"answers":{}}'))
         with self.assertRaises(JevAPIError):

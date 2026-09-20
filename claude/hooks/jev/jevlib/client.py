@@ -1,8 +1,12 @@
 """Jev transport — key resolution, retrying POST, typed failures.
 
-Request/response shape (faithful to the shadow scripts):
+Request/response shape, verified against the live API 2026-09-20:
   POST {state, model, questions:{qid:{type,instructions,criteria}}}
-  ->   {answers:{qid:{choice, probability, confidence, ...}}}
+  ->   {answers:{qid:{type:"choice", choice, probabilities:{label:p}, confidence}}}
+       {answers:{qid:{type:"noul",   noul}}}
+
+Note `probabilities` — a map over the labels, not a scalar `probability`. Use
+``choice_probability()`` to get the chosen label's value for the ledger.
 """
 
 import json
@@ -66,6 +70,23 @@ def _opener():
             _NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context())
         )
     return _OPENER
+
+
+def choice_probability(answer):
+    """Scalar probability of the chosen label, or None.
+
+    A choice answer carries `probabilities` — a map over every label — not a
+    scalar. The ledger's `probability` column wants the chosen label's value,
+    and calibration (ladder step 5) is measured from that column, so deriving it
+    per consumer is how the column silently ends up full of nulls.
+    """
+    if not isinstance(answer, dict):
+        return None
+    probs = answer.get("probabilities")
+    if not isinstance(probs, dict):
+        return None
+    value = probs.get(answer.get("choice"))
+    return value if isinstance(value, (int, float)) else None
 
 
 def _is_retryable(status):

@@ -41,18 +41,22 @@ Secrets never enter the ledger: state payloads are sanitized recursively
 import sys
 sys.path.insert(0, str(REPO_ROOT / "claude" / "hooks" / "jev"))
 
-from jevlib import DecisionLedger, JevClient
+from jevlib import DecisionLedger, JevClient, choice_probability
 
 client = JevClient()  # key resolved from env/key files
 answer, meta = client.choice(
     state, "next_action",
     {"type": "choice", "instructions": "...", "criteria": {...}})
-# answer = {"choice": "descend", "probability": 0.8, "confidence": 0.73}
+# answer = {"type": "choice", "choice": "descend",
+#           "probabilities": {"descend": 0.8, "retreat": 0.2}, "confidence": 0.73}
+# NOTE: `probabilities` is a map, not a scalar. Use choice_probability(answer)
+# for the ledger's `probability` column — calibration is measured from it.
 
 ledger = DecisionLedger("/var/lib/mygate/decisions.jsonl")
 rid = ledger.append(domain="mygate", session_id=s, decision_point="x",
                     state=state, primitive="choice", question_id="next_action",
                     decision=answer["choice"], confidence=answer["confidence"],
+                    probability=choice_probability(answer),
                     gate_action="observe")
 # later, when the real-world result is known:
 ledger.set_outcome(rid, {"survived": True})
