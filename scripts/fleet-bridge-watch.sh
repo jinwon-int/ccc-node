@@ -130,7 +130,38 @@ is_prepared_runtime() {
 read -r -d '' PROBE <<'PROBE_EOF' || true
 # uid, not user: the `user` column truncates names longer than 8 characters
 # ("gongmyoung" -> "gongmyo+"), and the truncated form is not a valid su target.
-line=$(ps -eo uid=,pid=,ppid=,command= 2>/dev/null | grep 'telegram_bot' | grep -- '--path' | grep -v grep | head -1)
+#
+# The filter matches more than the Telegram bridge: ccc-matrix-bridge.service
+# runs the same `telegram_bot` module with the same `--path`. `ps` lists by
+# ascending pid, so a bare `head -1` hands whichever bridge happened to start
+# first — on 2026-09-20 that was the Matrix bridge on 3 of 4 dual-bridge nodes
+# (gongmyoung, gwakga, jingun), which is why gongmyoung paged
+# `service-domain=unverified` every day while its Telegram bridge was healthy
+# (#1860). Select on the same evidence the domain check below reads — the
+# cgroup — so selection and verdict can no longer disagree.
+_bridge_candidates=$(ps -eo uid=,pid=,ppid=,command= 2>/dev/null | grep 'telegram_bot' | grep -- '--path' | grep -v grep)
+line=""
+if [ -n "$_bridge_candidates" ]; then
+  _saved_ifs=$IFS
+  IFS='
+'
+  for _cand in $_bridge_candidates; do
+    IFS=$_saved_ifs
+    _cand_pid=$(printf '%s' "$_cand" | awk '{print $2}')
+    case "$_cand_pid" in ''|*[!0-9]*) IFS='
+'; continue ;; esac
+    case "$(head -1 "/proc/$_cand_pid/cgroup" 2>/dev/null)" in
+      */ccc-telegram-bridge.service) line=$_cand; break ;;
+    esac
+    IFS='
+'
+  done
+  IFS=$_saved_ifs
+  # No cgroup named the unit: a container, a Termux/Android node with no
+  # systemd, or an unreadable /proc. Fall back to the historical first match
+  # rather than paging a healthy node as DOWN.
+  [ -n "$line" ] || line=$(printf '%s\n' "$_bridge_candidates" | head -1)
+fi
 if [ -z "$line" ]; then
   # No ccc bridge. Before calling the node down, look for a Danso resident
   # service. On a migrated node the serving process is `<exe> service run
