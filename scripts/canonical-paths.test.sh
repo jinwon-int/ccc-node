@@ -62,9 +62,10 @@ ok "CLI refuses an unpaired argument list" \
   '[ "$rc" = 2 ] && grep -q "usage:" <<<"$out" && grep -Fxq "x" "$TMP/g"'
 
 # --files-from - (#1484): setup.sh feeds its whole rewrite set through ONE
-# interpreter. Same per-file transform; the first failure stops the run with
+# interpreter. Same per-file transform; genuine failures stop the run with
 # exit 1 (later files untouched), which is what the old per-file loop did under
-# setup.sh's `set -e`.
+# setup.sh's `set -e`. Binary (non-UTF-8) files are skipped, not failures: one
+# stray .pyc under an installed tree must not abort a whole install batch.
 mkdir -p "$TMP/batch"
 printf '/opt/ccc-node/one\n' > "$TMP/batch/one"
 printf 'plain\n' > "$TMP/batch/two"
@@ -73,13 +74,23 @@ out="$(printf '%s\0' "$TMP/batch/one" "$TMP/batch/two" "$TMP/batch/three" \
   | python3 "$LIB" --files-from - "/opt/ccc-node" "/root/ccc-node" "/root/.claude" "/home/n/.claude" 2>&1)"; rc=$?
 ok "batch CLI rewrites every NUL-separated file in one process" \
   '[ "$rc" = 0 ] && [ -z "$out" ] && grep -Fxq "/root/ccc-node/one" "$TMP/batch/one" && grep -Fxq "plain" "$TMP/batch/two" && grep -Fxq "/home/n/.claude/three" "$TMP/batch/three"'
-printf '/opt/ccc-node/one\n' > "$TMP/batch/one"
-printf '\xff\xfe binary /opt/ccc-node\n' > "$TMP/batch/bad"
+printf '\xff\xfe binary /opt/ccc-node\n' > "$TMP/batch/bad.orig"
+cp "$TMP/batch/bad.orig" "$TMP/batch/bad"
 printf '/opt/ccc-node/four\n' > "$TMP/batch/four"
+printf '/opt/ccc-node/one\n' > "$TMP/batch/one"
 out="$(printf '%s\0' "$TMP/batch/one" "$TMP/batch/bad" "$TMP/batch/four" \
   | python3 "$LIB" --files-from - "/opt/ccc-node" "/root/ccc-node" 2>&1)"; rc=$?
-ok "batch CLI stops at the first failing file with exit 1 and names it" \
-  '[ "$rc" = 1 ] && grep -Fq "$TMP/batch/bad" <<<"$out" && grep -Fxq "/root/ccc-node/one" "$TMP/batch/one" && grep -Fxq "/opt/ccc-node/four" "$TMP/batch/four"'
+ok "batch CLI skips binary files and keeps rewriting the rest" \
+  '[ "$rc" = 0 ] && [ -z "$out" ] && cmp -s "$TMP/batch/bad" "$TMP/batch/bad.orig" && grep -Fxq "/root/ccc-node/one" "$TMP/batch/one" && grep -Fxq "/root/ccc-node/four" "$TMP/batch/four"'
+ok "rewrite_file reports False and leaves a binary file byte-identical" \
+  'py "assert m.rewrite_file('"'"'$TMP/batch/bad'"'"', {'"'"'/opt/ccc-node'"'"': '"'"'/root/ccc-node'"'"'}) is False" && cmp -s "$TMP/batch/bad" "$TMP/batch/bad.orig"'
+printf '/opt/ccc-node/one\n' > "$TMP/batch/one"
+printf '/opt/ccc-node/four\n' > "$TMP/batch/four"
+mkdir -p "$TMP/batch/dir"
+out="$(printf '%s\0' "$TMP/batch/one" "$TMP/batch/dir" "$TMP/batch/four" \
+  | python3 "$LIB" --files-from - "/opt/ccc-node" "/root/ccc-node" 2>&1)"; rc=$?
+ok "batch CLI still fail-stops on a genuine error with exit 1 and names it" \
+  '[ "$rc" = 1 ] && grep -Fq "$TMP/batch/dir" <<<"$out" && grep -Fxq "/root/ccc-node/one" "$TMP/batch/one" && grep -Fxq "/opt/ccc-node/four" "$TMP/batch/four"'
 out="$(printf '' | python3 "$LIB" --files-from - "/opt/ccc-node" "/root/ccc-node" 2>&1)"; rc=$?
 ok "batch CLI with no files is a no-op exit 0" '[ "$rc" = 0 ] && [ -z "$out" ]'
 # shellcheck disable=SC2034  # out is read via eval inside ok()
