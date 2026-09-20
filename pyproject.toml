@@ -23,6 +23,7 @@ max-complexity = 15
 "bridge/tests/test_duration_log.py" = ["E402"]
 "bridge/tests/test_heartbeat_format.py" = ["E402"]
 "scripts/agent_cron.py" = ["E402"]
+"tests/test_jevlib.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.11"
