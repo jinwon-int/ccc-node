@@ -273,11 +273,22 @@ fresh explicit user approval in the current conversation, in both directions.
    are commit-bound to `--expected-head`, so the pre-refresh approval no
    longer counts.
 
-**Merge queues: `jinwon-int/ccc-node` `main` (since 2026-09-13) and
-`jinwon-int/fleet-skills` `main` (since 2026-09-17).** Both have a
-`merge_queue` ruleset rule, so plain `gh pr merge` is refused ("the merge
-strategy for main is set by the merge queue") — including by the relay merge
-helper. Land by enqueueing instead; exact-head and independent-review rules
+**Merge queues: `jinwon-int/ccc-node` `main` (since 2026-09-13),
+`jinwon-int/fleet-skills` `main` (since 2026-09-17), and `jinwon-int/piri`
+`main` (observed 2026-09-21).** Each has a `merge_queue` ruleset rule, so plain
+`gh pr merge` is refused ("the merge strategy for main is set by the merge
+queue") — including by the relay merge helper. Do not treat this list as
+closed: it is a per-repo ruleset that anyone can enable, and `piri` was found
+only when `gh pr merge --squash --delete-branch` failed mid-batch. Confirm
+before merging rather than after:
+
+```bash
+gh api repos/<owner>/<repo>/rulesets --jq '.[].id' | while read -r id; do
+  gh api repos/<owner>/<repo>/rulesets/"$id" --jq '[.name,([.rules[].type]|join(","))]|join(" | ")'
+done
+```
+
+Land by enqueueing instead; exact-head and independent-review rules
 are unchanged, and the queue re-runs every required check on a speculative
 `gh-readonly-queue/main/...` group ref before squash-landing:
 
@@ -294,6 +305,27 @@ Enqueue needs the head up to date and its checks green; a stale `BEHIND` head
 goes through the update-branch loop above first. If the group fails, the
 queue evicts the PR: push the fix, then get fresh exact-head approval for the
 new head before re-enqueueing, as with any other push.
+
+**A queue merge does not clean up the head branch, and `--delete-branch`
+cannot be used to make it.** `gh pr merge -d` is refused outright on a queued
+repo, so cleanup falls entirely to the repo's own `delete_branch_on_merge`
+setting — which is off on `ccc-node`:
+
+```
+ccc-node  delete_branch_on_merge=false     piri  true     fleet-skills  true
+```
+
+So every queue merge on `ccc-node` leaves its head branch behind (the repo
+carries 95 remote heads as of 2026-09-21), while the same flow on `piri`
+self-cleans and looks like the queue handled it. Do not generalise from one
+repo. A direct `gh pr merge --squash --delete-branch` deletes regardless of
+the setting, which is why this only bites on queued repos. Verify and delete
+explicitly, per step 7:
+
+```bash
+git ls-remote --heads https://github.com/<owner>/<repo> <branch> | grep -q . \
+  && gh api -X DELETE repos/<owner>/<repo>/git/refs/heads/<branch>
+```
 
 Do not assume a repo without a queue is simply slower to merge. `main` on
 both repos also requires strict (up-to-date) status checks, and that pairing

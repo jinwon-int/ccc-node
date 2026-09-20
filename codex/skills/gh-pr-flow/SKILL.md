@@ -33,11 +33,20 @@ protection, or move a credential between nodes.
    gh pr merge NUMBER --repo OWNER/REPO --squash --delete-branch
    ```
 
-   **Merge queue on `ccc-node` `main` (since 2026-09-13) and `fleet-skills`
-   `main` (since 2026-09-17):** direct merge is refused ("the merge strategy
-   for main is set by the merge queue"). Enqueue instead, then poll until
-   `state` is `MERGED` (the queue evicts on failing group checks; a new head
-   needs fresh approval before re-enqueueing):
+   **Merge queue on `ccc-node` `main` (since 2026-09-13), `fleet-skills` `main`
+   (since 2026-09-17), and `piri` `main` (observed 2026-09-21):** direct merge
+   is refused ("the merge strategy for main is set by the merge queue").
+   Treat the list as open — it is a per-repo ruleset, and `piri` surfaced only
+   when a merge failed mid-batch. Check first:
+
+   ```bash
+   gh api repos/OWNER/REPO/rulesets --jq '.[].id' | while read -r id; do
+     gh api repos/OWNER/REPO/rulesets/"$id" --jq '[.rules[].type]|join(",")'
+   done
+   ```
+
+   Enqueue instead, then poll until `state` is `MERGED` (the queue evicts on
+   failing group checks; a new head needs fresh approval before re-enqueueing):
 
    ```bash
    pr_id="$(gh pr view NUMBER --repo OWNER/REPO --json id --jq .id)"
@@ -51,6 +60,18 @@ protection, or move a credential between nodes.
 
 4. Verify the merged commit and remote branch deletion before removing a local
    squash-merged branch.
+
+   A queue merge does **not** clean up the head branch, and `gh pr merge -d` is
+   refused on a queued repo, so cleanup falls entirely to the repo's
+   `delete_branch_on_merge` — off on `ccc-node`, on for `piri`/`fleet-skills`.
+   The same flow therefore self-cleans on one repo and leaks branches on
+   another; `ccc-node` carries 95 remote heads as of 2026-09-21. Check and
+   delete explicitly:
+
+   ```bash
+   git ls-remote --heads https://github.com/OWNER/REPO BRANCH | grep -q . \
+     && gh api -X DELETE repos/OWNER/REPO/git/refs/heads/BRANCH
+   ```
 
 Under strict up-to-date protection, merging one PR flips its siblings to
 `BEHIND`. Refresh via REST (older `gh` builds lack `gh pr update-branch`):
