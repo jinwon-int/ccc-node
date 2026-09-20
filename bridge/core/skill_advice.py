@@ -127,7 +127,7 @@ def _number(value: Any) -> bool:
     return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1
 
 
-def _validate(data: Any, options: dict[str, str]) -> tuple[str, int, int]:
+def _validate(data: Any, options: dict[str, str]) -> tuple[str, float, float, int, int]:
     if not isinstance(data, dict) or data.get("model") != MODEL:
         raise ValueError("model_mismatch")
     answers = data.get("answers")
@@ -156,9 +156,10 @@ def _validate(data: Any, options: dict[str, str]) -> tuple[str, int, int]:
     # Conservative abstention heuristic, NOT a calibrated probability of correctness.
     p = probabilities[choice]
     runner_up = max(v for k, v in probabilities.items() if k != choice)
-    if p < 0.65 or p - runner_up < 0.20:
+    confidence, margin = float(answer["confidence"]), p - runner_up
+    if p < 0.65 or margin < 0.20:
         choice = "defer"
-    return choice, usage["input_tokens"], usage["output_tokens"]
+    return choice, confidence, margin, usage["input_tokens"], usage["output_tokens"]
 
 
 async def advise_turn(
@@ -186,7 +187,9 @@ async def advise_turn(
     ):
         return message
     started = time.monotonic()
-    status, choice, input_tokens, output_tokens = "unavailable", "none", 0, 0
+    status, choice, confidence, margin, input_tokens, output_tokens = (
+        "unavailable", "none", 0.0, 0.0, 0, 0
+    )
     enabled = False
     try:
         data_dir = getattr(settings, "bot_data_dir", None)
@@ -217,7 +220,7 @@ async def advise_turn(
         result = await asyncio.wait_for(
             _infer(_request(message, options), key), timeout=DEADLINE_SECONDS
         )
-        choice, input_tokens, output_tokens = _validate(result, options)
+        choice, confidence, margin, input_tokens, output_tokens = _validate(result, options)
         status = "abstain"
         if choice not in installed:
             return message
@@ -242,11 +245,14 @@ async def advise_turn(
         # No IDs, request/response bodies, filesystem paths, key or exception text.
         if enabled:
             logger.info(
-                "skill_advice status=%s model=%s skill=%s elapsed_ms=%d input_tokens=%d output_tokens=%d",
+                "skill_advice status=%s model=%s skill=%s elapsed_ms=%d"
+                " confidence=%.3f margin=%.3f input_tokens=%d output_tokens=%d",
                 status,
                 MODEL,
                 choice,
                 int((time.monotonic() - started) * 1000),
+                confidence,
+                margin,
                 input_tokens,
                 output_tokens,
             )
