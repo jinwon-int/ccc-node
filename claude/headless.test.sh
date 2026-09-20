@@ -88,5 +88,8 @@ out="$(CCC_CLAUDE_BIN="$FAKE_OK" bash "$RUNNER" 'probe' 2>/dev/null)"
 rcok=$?
 ok "successful run still prints the result text" '[ "$rcok" = 0 ] && [ "$out" = "done" ]'
 
-echo "claude/headless.test.sh: pass=$pass fail=$fail"
-[ "$fail" -eq 0 ]
+# validate-harness.sh 는 이 형식의 요약 줄을 스위트 성공의 증거로 읽는다.
+# 소문자로 내면 테스트가 전부 통과해도 "no 'PASS=<n> FAIL=<n>' summary line"
+# 으로 실패한다.
+echo "PASS=$pass FAIL=$fail"
+[ "$fail" = 0 ]
