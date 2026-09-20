@@ -69,11 +69,23 @@ def rewrite_text(text: str, pairs: dict[str, str]) -> str:
 
 
 def rewrite_file(path: str | Path, pairs: dict[str, str]) -> bool:
-    """Rewrite an installed file in place. True when its content changed."""
+    """Rewrite an installed file in place. True when its content changed.
+
+    Files that are not UTF-8 text (e.g. ``__pycache__`` *.pyc picked up by the
+    install-time file walk) are skipped unchanged: the transform is a text
+    substitution and has nothing to rewrite in a non-UTF-8 file, and one stray
+    .pyc must not abort the whole ``--files-from -`` batch. This matches the
+    diagnosis side, where doctor falls back to a byte-exact comparison for
+    non-UTF-8 files. Genuine errors (unreadable path, directory, failed write)
+    still propagate — the batch CLI fail-stops on them with exit 1.
+    """
     if not pairs:
         return False
     target = Path(path)
-    original = target.read_text(encoding="utf-8")
+    try:
+        original = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return False
     updated = rewrite_text(original, pairs)
     if updated == original:
         return False
@@ -99,7 +111,8 @@ def main(argv: list[str]) -> int:
     # processed in order and the first failure stops the run with exit 1 and
     # the offending path on stderr — the same observable outcome as the old
     # per-file loop under setup.sh's `set -e`: later files untouched, install
-    # aborted (and rolled back) at that point.
+    # aborted (and rolled back) at that point. Non-UTF-8 files are skipped by
+    # rewrite_file and are not failures.
     if argv[:2] == ["--files-from", "-"]:
         rest = argv[2:]
         if len(rest) < 2 or len(rest) % 2 == 1:
