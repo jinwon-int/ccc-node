@@ -31,6 +31,8 @@ import re
 import tempfile
 from datetime import datetime, timezone
 
+from .redact import redact_text
+
 SCHEMA = "jev.decision.v1"
 _REDACT_NAME = re.compile(r"key|secret|token|password", re.IGNORECASE)
 
@@ -41,7 +43,12 @@ def state_hash(state):
 
 
 def sanitize(obj):
-    """Strip any dict entries whose key looks secret-bearing, recursively."""
+    """Strip secrets recursively — by dict key name *and* by value shape.
+
+    Key-name stripping alone is not enough: a consumer whose state is free text
+    (vendor error prose, fetched page content, a log line) carries credentials
+    inside string values, where no key name marks them.
+    """
     if isinstance(obj, dict):
         return {
             k: ("<redacted>" if _REDACT_NAME.search(str(k)) else sanitize(v))
@@ -49,6 +56,8 @@ def sanitize(obj):
         }
     if isinstance(obj, list):
         return [sanitize(v) for v in obj]
+    if isinstance(obj, str):
+        return redact_text(obj)
     return obj
 
 
