@@ -32,8 +32,12 @@ ok "failed run labels the stdout capture" 'printf "%s" "$err" | grep -q "ccc-hea
 ok "failed run keeps the error body off stdout" '[ -z "$(CCC_CLAUDE_BIN="$FAKE_FAIL" bash "$RUNNER" "probe" 2>/dev/null)" ]'
 
 # 캡 적용: 큰 stdout 은 잘려야 한다(스풀/런히스토리 범람 방지).
-# 표식은 러너 자신의 메시지에 없는 글자여야 한다 — 'x' 는 "exited" 에 들어 있어
-# 세면 1 이 더 잡힌다(이 테스트가 처음 그렇게 틀렸다).
+#
+# 길이는 **표식 문자를 세지 말고** 라벨 줄 뒤의 본문을 잘라서 잰다. 전체 stderr
+# 에서 글자를 세면 러너 자신의 메시지와 경로가 같이 잡혀 틀린다 — 'x' 는
+# "exited" 에 들어 있고(이 테스트가 처음 그렇게 틀렸다), 'Z' 는 mktemp 경로에
+# 섞여 들어온다(실측 200회 중 28회). 후자는 로컬에서는 통과하고 CI 에서만
+# 깨지는 flaky 로 나타났다.
 FAKE_BIG="$TMP/claude-big"
 cat > "$FAKE_BIG" <<'SH'
 #!/usr/bin/env bash
@@ -43,9 +47,11 @@ SH
 chmod +x "$FAKE_BIG"
 # shellcheck disable=SC2034 # consumed through eval in ok()
 errbig="$(CCC_HEADLESS_FAIL_STDOUT_BYTES=64 CCC_CLAUDE_BIN="$FAKE_BIG" bash "$RUNNER" 'probe' 2>&1 >/dev/null)"
+# 라벨 줄 다음부터가 캡처 본문이다.
 # shellcheck disable=SC2034 # consumed through eval in ok()
-zs="$(printf '%s' "$errbig" | tr -cd 'Z' | wc -c)"
-ok "stdout capture honours the byte cap" '[ "$zs" = 64 ]'
+bigbody="$(printf '%s' "$errbig" | sed -n '/^ccc-headless: stdout (first/,$p' | tail -n +2)"
+ok "stdout capture honours the byte cap" '[ "${#bigbody}" = 64 ]'
+ok "stdout capture body is exactly the payload head" '[ "$bigbody" = "$(head -c 64 /dev/zero | tr "\0" "Z")" ]'
 ok "stdout capture reports the full size" 'printf "%s" "$errbig" | grep -q "of 5000B"'
 
 # 0 은 캡처를 끈다 — 민감 출력이 우려되는 호출자용 탈출구.
