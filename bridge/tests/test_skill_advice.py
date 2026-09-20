@@ -84,6 +84,7 @@ def test_advice_preserves_original_and_only_installed_options(setup, caplog):
     assert set(request["questions"]) == {"skill"}
     assert set(request["questions"]["skill"]["criteria"]) == {"web-routing", "no_skill", "defer"}
     assert "status=recommended" in caplog.text
+    assert "confidence=0.980" in caplog.text and "margin=1.000" in caplog.text
     assert (
         key not in caplog.text and MESSAGE not in caplog.text and str(setup.home) not in caplog.text
     )
@@ -184,7 +185,7 @@ def test_unsafe_or_disabled_local_inputs_fail_open(setup, kind):
         "no_skill",
     ],
 )
-def test_invalid_or_uncertain_responses_never_inject(setup, monkeypatch, kind):
+def test_invalid_or_uncertain_responses_never_inject(setup, monkeypatch, kind, caplog):
     async def infer(payload, key):
         result = response(payload["questions"]["skill"]["criteria"])
         answer = result["answers"]["skill"]
@@ -209,7 +210,10 @@ def test_invalid_or_uncertain_responses_never_inject(setup, monkeypatch, kind):
         return result
 
     monkeypatch.setattr(m, "_infer", infer)
-    assert run(setup) == MESSAGE
+    with caplog.at_level(logging.INFO):
+        assert run(setup) == MESSAGE
+    if kind in {"low", "margin"}:
+        assert "status=abstain" in caplog.text and "margin=0.100" in caplog.text
 
 
 def test_error_timeout_and_cancellation(setup, monkeypatch, caplog):
