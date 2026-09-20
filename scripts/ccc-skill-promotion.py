@@ -5953,19 +5953,11 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
         unattributable = _unattributable_verdicts(_ledger_rows(config))
         if unattributable:
             revise["unattributable_verdicts"] = unattributable
-    # Last, and outside `revise_enabled`: this pass observes what an approve
+    # Last, and outside `revise_enabled`: drain observes what an approve
     # verdict left behind, so it must still run on a publisher with revision
     # rounds switched off, and it must see any verdict rows the passes above
     # appended in this same cycle.
-    intake_states = _sweep_intake_states(config, dry_run=dry_run)
-    # After the state pass, which is what tells this one which PRs are still
-    # open — and which it then supersedes first-hand for the ones it closes.
-    promoted_intakes = _sweep_promoted_intakes(config, dry_run=dry_run)
-    superseded_intakes = _sweep_superseded_intakes(config, dry_run=dry_run)
-    auto_promote: dict[str, object] | None = None
-    if getattr(config, "auto_promote_enabled", False):
-        auto_promote = _promote(config, dry_run=dry_run, limit=8)
-    promote_merges = _sweep_promote_merge(config, dry_run=dry_run)
+    drain = _collect_drain(config, dry_run=dry_run)
     return {
         "ok": not errors,
         "mode": "collect-dry-run" if dry_run else "collect",
@@ -5975,11 +5967,24 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
         "published": published,
         "errors": errors,
         "revise": revise,
+        **drain,
+    }
+
+
+def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
+    """Intake-state / autoclose / supersede / auto-promote / auto-merge."""
+    intake_states = _sweep_intake_states(config, dry_run=dry_run)
+    promoted_intakes = _sweep_promoted_intakes(config, dry_run=dry_run)
+    superseded_intakes = _sweep_superseded_intakes(config, dry_run=dry_run)
+    auto_promote: dict[str, object] | None = None
+    if getattr(config, "auto_promote_enabled", False):
+        auto_promote = _promote(config, dry_run=dry_run, limit=8)
+    return {
         "intake_states": intake_states,
         "promoted_intakes": promoted_intakes,
         "superseded_intakes": superseded_intakes,
         "auto_promote": auto_promote,
-        "promote_merges": promote_merges,
+        "promote_merges": _sweep_promote_merge(config, dry_run=dry_run),
     }
 
 
