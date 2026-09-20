@@ -7,6 +7,7 @@ Request/response shape (faithful to the shadow scripts):
 
 import json
 import os
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -40,6 +41,31 @@ class _Retryable(Exception):
         super().__init__(f"http {status}")
         self.status = status
         self.retry_after = retry_after
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect — the request carries a bearer token.
+
+    urllib re-sends headers on a redirect, so a 30x pointing off-host would
+    hand the API key to whatever answered. Returning None here makes urllib
+    raise the original HTTPError instead of following it; a 3xx is not
+    retryable, so the call fails fast and loudly rather than leaking.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = None
+
+
+def _opener():
+    global _OPENER
+    if _OPENER is None:
+        _OPENER = urllib.request.build_opener(
+            _NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context())
+        )
+    return _OPENER
 
 
 def _is_retryable(status):
@@ -155,7 +181,7 @@ class JevClient:
                             "Content-Type": "application/json",
                         },
                     )
-                    with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    with _opener().open(req, timeout=self.timeout) as resp:
                         status, payload = resp.status, resp.read()
                 data = json.loads(payload.decode())
                 answers = data.get("answers")

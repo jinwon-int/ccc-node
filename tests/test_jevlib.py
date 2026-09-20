@@ -114,6 +114,29 @@ class ClientTest(unittest.TestCase):
         self.assertIsNone(client_mod._retry_after_seconds({}))
         self.assertIsNone(client_mod._retry_after_seconds(None))
 
+    def test_opener_refuses_to_follow_redirects(self):
+        """A 30x must not carry the bearer token to another host.
+
+        urllib re-sends headers when it follows a redirect, so the default
+        opener would hand the API key to whoever answered the redirect.
+        """
+        from jevlib import client as client_mod
+
+        handler = client_mod._NoRedirect()
+        self.assertIsNone(
+            handler.redirect_request(
+                None, None, 302, "Found", {}, "https://evil.example.com/v1/systemone"
+            )
+        )
+        opener = client_mod._opener()
+        self.assertTrue(
+            any(isinstance(h, client_mod._NoRedirect) for h in opener.handlers),
+            "the shared opener must install the no-redirect handler",
+        )
+        # a redirect surfaces as a non-retryable status, so it fails fast
+        self.assertFalse(client_mod._is_retryable(302))
+        self.assertFalse(client_mod._is_retryable(301))
+
     def test_choice_wrapper_missing_answer(self):
         client = JevClient(key="k", transport=lambda b: (200, b'{"answers":{}}'))
         with self.assertRaises(JevAPIError):
