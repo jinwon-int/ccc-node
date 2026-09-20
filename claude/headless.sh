@@ -22,6 +22,8 @@
 #   CCC_HEADLESS_TIMEOUT wall-clock cap in seconds (default: 1500; 0 disables).
 #                       Guards against a run that never returns (e.g. an unbounded
 #                       polling loop in generated Bash). Exit 124 on timeout.
+#   CCC_HEADLESS_FAIL_STDOUT_BYTES  on a failed run, how many bytes of the captured
+#                       stdout to echo to stderr for diagnosis (default: 2000; 0 disables).
 set -uo pipefail
 
 PROMPT="${1:-}"
@@ -58,15 +60,36 @@ else
 fi
 rc=$?
 
+# 실패 경로에서 stdout 을 버리면 진단 근거가 통째로 사라진다. `claude
+# --output-format json` 은 오류 본문도 stdout 으로 내는데, 그 stdout 은 위에서
+# $RESP 에 담겨 있고 stderr 는 비어 있는 경우가 많다. 실제로 agent-cron 의
+# prompt 태스크 4건(2026-09-11~18)이 "claude exited 1" 한 줄만 남기고 실패해
+# 사후 규명이 불가능했다. 그래서 실패 시 stdout 앞부분을 stderr 로 함께 낸다.
+emit_failure_context() {
+  cat "$ERRF" >&2
+  local cap="${CCC_HEADLESS_FAIL_STDOUT_BYTES:-2000}"
+  case "$cap" in
+    ''|*[!0-9]*) cap=2000 ;;
+  esac
+  [ "$cap" -eq 0 ] && return 0
+  if [ -n "$RESP" ]; then
+    echo "ccc-headless: stdout (first ${cap}B of $(printf '%s' "$RESP" | wc -c)B):" >&2
+    printf '%s' "$RESP" | head -c "$cap" >&2
+    echo >&2
+  else
+    echo "ccc-headless: stdout was empty" >&2
+  fi
+}
+
 if [ "$rc" -eq 124 ]; then
   echo "ccc-headless: $BIN exceeded CCC_HEADLESS_TIMEOUT=${TMO}s and was killed" >&2
-  cat "$ERRF" >&2
+  emit_failure_context
   exit 124
 fi
 
 if [ "$rc" -ne 0 ]; then
   echo "ccc-headless: $BIN exited $rc" >&2
-  cat "$ERRF" >&2
+  emit_failure_context
   exit "$rc"
 fi
 
