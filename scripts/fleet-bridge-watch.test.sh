@@ -166,6 +166,61 @@ probe_body="$TMP/probe-body.sh"
 bash "$SC" --print-probe > "$probe_body"
 ok "remote probe parses as POSIX sh" '[ -s "$probe_body" ] && bash -n "$probe_body" && { ! command -v dash >/dev/null || dash -n "$probe_body"; }'
 
+# ---- bridge selection with a second telegram_bot process (#1860) -----------
+# ccc-matrix-bridge runs the same module with the same --path, so the probe's
+# filter matches both. `ps` lists by ascending pid: before the cgroup-based
+# selection, a Matrix bridge that started first won `head -1` and the probe
+# inspected the wrong process. Verified live on 2026-09-20: 3 of 4 dual-bridge
+# nodes were in that state, and gongmyoung paged service-domain=unverified
+# daily while its Telegram bridge was healthy.
+#
+# Run the transmitted probe against a stubbed ps and a fake /proc. The two
+# fakes serve from different roots, so the emitted RUNTIME names which process
+# was chosen.
+sel="$TMP/sel"; mkdir -p "$sel/bin" "$sel/proc/100" "$sel/proc/200"
+# Same technique the dual-domain cases below use: rewrite the probe's /proc/
+# reads to a fake tree. The production code keeps a literal path.
+sed -e "s#/proc/#$sel/proc/#g" "$probe_body" > "$sel/probe.sh"
+cat > "$sel/bin/ps" <<'PSEOF'
+#!/bin/sh
+cat <<'PS'
+ 1000 100 1 /opt/matrix-tree/bridge/venv/bin/python -m telegram_bot --path /home/x
+ 1000 200 1 /opt/ccc-node/bridge/venv/bin/python -m telegram_bot --path /home/x
+PS
+PSEOF
+chmod +x "$sel/bin/ps"
+printf '0::/user.slice/user-1000.slice/user@1000.service/app.slice/ccc-matrix-bridge.service\n' > "$sel/proc/100/cgroup"
+printf '0::/system.slice/ccc-telegram-bridge.service\n' > "$sel/proc/200/cgroup"
+sel_out="$sel/out"
+PATH="$sel/bin:$PATH" sh "$sel/probe.sh" > "$sel_out" 2>&1
+ok "probe selects the telegram bridge, not the lower-pid matrix bridge" \
+  'grep -q "^RUNTIME=/opt/ccc-node$" "$sel_out"'
+ok "probe does not report the matrix bridge runtime" \
+  '! grep -q "^RUNTIME=/opt/matrix-tree$" "$sel_out"'
+ok "probe still completes with a second bridge present" \
+  'tail -1 "$sel_out" | grep -q "^PROBE_COMPLETE=1$"'
+
+# No cgroup names the unit (container, Termux/Android, unreadable /proc): keep
+# the historical first match rather than paging a healthy node as DOWN.
+printf '0::/\n' > "$sel/proc/100/cgroup"
+printf '0::/\n' > "$sel/proc/200/cgroup"
+PATH="$sel/bin:$PATH" sh "$sel/probe.sh" > "$sel_out" 2>&1
+ok "falls back to the first match when no cgroup names the unit" \
+  'grep -q "^RUNTIME=/opt/matrix-tree$" "$sel_out"'
+ok "fallback still completes" 'tail -1 "$sel_out" | grep -q "^PROBE_COMPLETE=1$"'
+
+# A single bridge must be unaffected by the new selection path.
+cat > "$sel/bin/ps" <<'PSEOF'
+#!/bin/sh
+cat <<'PS'
+ 1000 200 1 /opt/ccc-node/bridge/venv/bin/python -m telegram_bot --path /home/x
+PS
+PSEOF
+chmod +x "$sel/bin/ps"
+printf '0::/system.slice/ccc-telegram-bridge.service\n' > "$sel/proc/200/cgroup"
+PATH="$sel/bin:$PATH" sh "$sel/probe.sh" > "$sel_out" 2>&1
+ok "single bridge is selected as before" 'grep -q "^RUNTIME=/opt/ccc-node$" "$sel_out"'
+
 # ---- non-canonical runtime root (#842) ------------------------------------
 # The seoseo 2026-08-01 shape, and the reason this check is separate from the
 # boot-path comparison: unit and runtime AGREE, on a PR worktree. Every
