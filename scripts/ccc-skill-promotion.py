@@ -144,6 +144,15 @@ class Config:
     # Default OFF. This is the pipeline's first write to an intake PR's
     # lifecycle rather than its contents, so it stays opt-in per publisher.
     promote_autoclose_enabled: bool = False
+    # Default OFF. Close an older intake PR when a newer tree for the same
+    # (node, name, provider) lineage has been published. Reject lineages stay
+    # open (policies/REVIEW.md).
+    supersede_autoclose_enabled: bool = False
+    # Default OFF. collect() may run `promote` (draft approved/* PR).
+    auto_promote_enabled: bool = False
+    # Default OFF. collect() may mark-ready + squash-merge a mechanical
+    # promote PR (no identity hits, CI green). Identity-hit batches stay draft.
+    auto_merge_promote_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -391,6 +400,24 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         trust_root=home,
         error_code="autoclose_invalid",
     )
+    supersede_autoclose_enabled = _tri_state_enabled(
+        env.get("CCC_SKILL_PROMOTION_SUPERSEDE_AUTOCLOSE"),
+        state_dir / "skill-promotion.supersede-autoclose",
+        trust_root=home,
+        error_code="supersede_autoclose_invalid",
+    )
+    auto_promote_enabled = _tri_state_enabled(
+        env.get("CCC_SKILL_PROMOTION_AUTO_PROMOTE"),
+        state_dir / "skill-promotion.auto-promote",
+        trust_root=home,
+        error_code="auto_promote_invalid",
+    )
+    auto_merge_promote_enabled = _tri_state_enabled(
+        env.get("CCC_SKILL_PROMOTION_AUTO_MERGE"),
+        state_dir / "skill-promotion.auto-merge",
+        trust_root=home,
+        error_code="auto_merge_invalid",
+    )
     raw_llm_cmd = env.get("CCC_SKILL_REVIEW_LLM_CMD")
     if raw_llm_cmd is None:
         review_llm_cmd: tuple[str, ...] = ("claude", "-p", "--disallowed-tools", "*")
@@ -469,6 +496,9 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         revise_round_limit=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_ROUNDS", 2, 1, 2),
         revise_substitute_after_days=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_SUBSTITUTE_DAYS", 0, 0, 30),
         promote_autoclose_enabled=promote_autoclose_enabled,
+        supersede_autoclose_enabled=supersede_autoclose_enabled,
+        auto_promote_enabled=auto_promote_enabled,
+        auto_merge_promote_enabled=auto_merge_promote_enabled,
         revise_daily_cap=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_DAILY_CAP", 3, 1, 8),
         # #1394: verdict/revise-result collect window. The old fixed cap of 8
         # polled newest-first (LIFO), so any backlog beyond 8 starved the oldest
@@ -1547,6 +1577,10 @@ def _status(config: Config) -> dict[str, object]:
         "revise_enabled": config.revise_enabled,
         "revise_round_limit": config.revise_round_limit,
         "revise_daily_cap": config.revise_daily_cap,
+        "promote_autoclose_enabled": config.promote_autoclose_enabled,
+        "supersede_autoclose_enabled": config.supersede_autoclose_enabled,
+        "auto_promote_enabled": config.auto_promote_enabled,
+        "auto_merge_promote_enabled": config.auto_merge_promote_enabled,
         "candidates": [
             {
                 "node": item.node,
@@ -4018,12 +4052,12 @@ def _sweep_intake_states(
 ) -> list[dict[str, object]]:
     """Record whether an already-approved intake PR is still open.
 
-    Nothing downstream of an `approve` verdict is automated. The sanitized
-    `approved/*` PR is written by hand and the intake PR is closed by hand
-    (policies/REVIEW.md forbids auto-close), so the pipeline records the
-    verdict and stops. That makes "approved an hour ago" and "approved and
-    forgotten" the same observation from the ledger — 34 candidates piled up
-    that way before anyone counted them by hand.
+    By default nothing downstream of an `approve` verdict is automated — the
+    pipeline records the verdict and stops. Opt-in publisher flags
+    (`auto-promote`, `auto-merge`, `autoclose`, `supersede-autoclose`) change
+    that. Without them, "approved an hour ago" and "approved and forgotten"
+    are the same observation from the ledger — 34 candidates piled up that
+    way before anyone counted them by hand.
 
     `ccc_doctor` cannot close the gap by itself. It is offline by
     construction (local git/bash, never `gh`); the publisher's fleet-skills
@@ -4222,6 +4256,237 @@ def _sweep_promoted_intakes(
     return processed
 
 
+_SUPERSEDED_KIND = "a2a-intake-superseded"
+_PROMOTE_PR_KIND = "a2a-promote-pr"
+
+
+def _publish_lineage_groups(
+    rows: list[dict[str, object]],
+) -> dict[tuple[str, str, str], list[dict[str, str]]]:
+    """(node, name, provider) -> published intake PRs with 64-char trees."""
+    groups: dict[tuple[str, str, str], dict[str, dict[str, str]]] = {}
+    for row in rows:
+        if row.get("kind") is not None:
+            continue
+        node, name, provider = row.get("node"), row.get("name"), row.get("provider")
+        tree = row.get("tree_sha256")
+        pr = _pr_number_from_url(str(row.get("url") or ""))
+        if not (
+            isinstance(node, str) and node
+            and isinstance(name, str) and name
+            and isinstance(provider, str) and provider
+            and isinstance(tree, str) and len(tree) == 64
+            and pr
+        ):
+            continue
+        key = (node, name, provider)
+        item = {"pr": pr, "tree": tree, "ts": str(row.get("ts") or "")}
+        bucket = groups.setdefault(key, {})
+        previous = bucket.get(pr)
+        if previous is None or item["ts"] >= previous["ts"]:
+            bucket[pr] = item
+    return {key: list(bucket.values()) for key, bucket in groups.items()}
+
+
+def _reject_lineage_prs(rows: list[dict[str, object]]) -> set[str]:
+    """PRs whose *latest* verdict is reject — owner decision, never auto-close."""
+    return {pr for pr, verdict in _latest_verdicts_by_pr(rows).items() if verdict == "reject"}
+
+
+def _sweep_superseded_intakes(
+    config: Config, *, dry_run: bool
+) -> list[dict[str, object]]:
+    """Close older intake PRs when a newer tree for the same lineage exists.
+
+    Evidence is the publisher ledger, not title parsing: two kind-less publish
+    rows share (node, name, provider) and different `tree_sha256` values. The
+    highest PR number is kept; older OPEN PRs close. A `reject` latest verdict
+    is an owner decision point (policies/REVIEW.md) and is never closed here.
+
+    Default OFF (`supersede_autoclose_enabled`).
+    """
+    if not getattr(config, "supersede_autoclose_enabled", False):
+        return []
+    rows = _ledger_rows(config)
+    recorded = _recorded_intake_states(rows)
+    rejected = _reject_lineage_prs(rows)
+    pending: list[tuple[str, str, str]] = []  # old_pr, new_pr, old_tree
+    for _key, items in _publish_lineage_groups(rows).items():
+        if len(items) < 2:
+            continue
+        ordered = sorted(items, key=lambda item: int(item["pr"]))
+        newest = ordered[-1]
+        for old in ordered[:-1]:
+            state = str(recorded.get(old["pr"], {}).get("state") or "OPEN")
+            if state in _INTAKE_TERMINAL_STATES:
+                continue
+            if old["pr"] in rejected:
+                continue
+            pending.append((old["pr"], newest["pr"], old["tree"]))
+    pending = pending[: config.collect_window]
+    if not pending:
+        return []
+    if dry_run:
+        return [
+            {"outcome": "would-close-superseded-intake", "pr": old, "superseded_by": new}
+            for old, new, _tree in pending
+        ]
+    processed: list[dict[str, object]] = []
+    for old, new, tree in pending:
+        body = (
+            "신규 후보가 게시되어 종료합니다.\n\n"
+            f"- 같은 계보 `{old}` → `{new}` (새 tree가 다른 intake PR).\n"
+            f"- 이 PR 후보 tree `{tree[:12]}…` 은 더 이상 최신이 아닙니다.\n"
+            "- `policies/REVIEW.md`의 no-auto-close는 `reject` verdict에 적용됩니다. "
+            "이 계보는 reject가 아닙니다.\n"
+            "- intake 브랜치는 검토 전용이므로 merge되지 않고 종료됩니다.\n"
+        )
+        try:
+            _run(["gh", "pr", "close", old, "--repo", config.repo, "--comment", body])
+        except PromotionError as error:
+            processed.append({"outcome": "close-failed", "pr": old, "code": error.code})
+            continue
+        _append_ledger(
+            config,
+            {
+                "ts": _utc_now(),
+                "kind": _SUPERSEDED_KIND,
+                "pr": old,
+                "superseded_by": new,
+                "tree_sha256": tree,
+            },
+        )
+        _append_ledger(
+            config,
+            {
+                "ts": _utc_now(),
+                "kind": _INTAKE_STATE_KIND,
+                "pr": old,
+                "state": "CLOSED",
+            },
+        )
+        processed.append(
+            {"outcome": "intake-superseded-closed", "pr": old, "superseded_by": new}
+        )
+    return processed
+
+
+def _latest_promote_prs(rows: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    """PR number -> last `a2a-promote-pr` row (state is sticky via last write)."""
+    latest: dict[str, dict[str, object]] = {}
+    for row in rows:
+        if row.get("kind") != _PROMOTE_PR_KIND:
+            continue
+        pr = str(row.get("pr") or "")
+        if pr:
+            latest[pr] = row
+    return latest
+
+
+def _checks_green(rollup: object) -> bool | None:
+    """True if every reported check succeeded; None if still running; False on fail."""
+    if not isinstance(rollup, list) or not rollup:
+        return None
+    pending = False
+    for item in rollup:
+        if not isinstance(item, dict):
+            continue
+        conclusion = str(item.get("conclusion") or "")
+        status = str(item.get("status") or "")
+        if conclusion in {"FAILURE", "CANCELLED", "TIMED_OUT", "STARTUP_FAILURE"}:
+            return False
+        if conclusion not in {"SUCCESS", "NEUTRAL", "SKIPPED"} or status in {
+            "QUEUED", "IN_PROGRESS", "PENDING",
+        }:
+            pending = True
+    if pending:
+        return None
+    return True
+
+
+def _sweep_promote_merge(
+    config: Config, *, dry_run: bool
+) -> list[dict[str, object]]:
+    """Mark-ready and squash-merge mechanical promote PRs this publisher opened.
+
+    Skips any batch that recorded identity hits — those stay draft for a human.
+    Does not wait for CI: pending checks return `waiting-checks` and retry next
+    collect. Never uses `--admin`.
+
+    Default OFF (`auto_merge_promote_enabled`).
+    """
+    if not getattr(config, "auto_merge_promote_enabled", False):
+        return []
+    rows = _ledger_rows(config)
+    pending = [
+        row for row in _latest_promote_prs(rows).values()
+        if str(row.get("state") or "OPEN") == "OPEN"
+    ][: config.collect_window]
+    if not pending:
+        return []
+    if dry_run:
+        return [
+            {"outcome": "would-merge-promote-pr", "pr": row.get("pr")}
+            for row in pending if not row.get("identity_hits")
+        ] + [
+            {"outcome": "would-hold-identity-hits", "pr": row.get("pr")}
+            for row in pending if row.get("identity_hits")
+        ]
+    processed: list[dict[str, object]] = []
+    for row in pending:
+        pr = str(row.get("pr") or "")
+        if not pr:
+            continue
+        if row.get("identity_hits"):
+            processed.append({"outcome": "needs-human-identity", "pr": pr})
+            continue
+        try:
+            viewed = _run([
+                "gh", "pr", "view", pr, "--repo", config.repo,
+                "--json", "isDraft,mergeable,mergeStateStatus,statusCheckRollup,state",
+            ])
+            payload = json.loads(viewed.stdout.decode("utf-8"))
+        except (PromotionError, UnicodeDecodeError, json.JSONDecodeError):
+            processed.append({"outcome": "promote-pr-unreadable", "pr": pr})
+            continue
+        if str(payload.get("state") or "") in {"MERGED", "CLOSED"}:
+            _append_ledger(
+                config,
+                {"ts": _utc_now(), "kind": _PROMOTE_PR_KIND, "pr": pr,
+                 "state": str(payload.get("state")), "url": row.get("url")},
+            )
+            processed.append({"outcome": "promote-pr-already-terminal", "pr": pr})
+            continue
+        if payload.get("isDraft") is True:
+            try:
+                _run(["gh", "pr", "ready", pr, "--repo", config.repo])
+            except PromotionError as error:
+                processed.append({"outcome": "ready-failed", "pr": pr, "code": error.code})
+                continue
+        green = _checks_green(payload.get("statusCheckRollup"))
+        if green is False:
+            processed.append({"outcome": "promote-pr-checks-failed", "pr": pr})
+            continue
+        if green is None or str(payload.get("mergeable")) not in {"MERGEABLE"}:
+            processed.append({"outcome": "waiting-checks", "pr": pr})
+            continue
+        try:
+            _run([
+                "gh", "pr", "merge", pr, "--repo", config.repo,
+                "--squash", "--delete-branch",
+            ])
+        except PromotionError as error:
+            processed.append({"outcome": "merge-failed", "pr": pr, "code": error.code})
+            continue
+        _append_ledger(
+            config,
+            {"ts": _utc_now(), "kind": _PROMOTE_PR_KIND, "pr": pr,
+             "state": "MERGED", "url": row.get("url")},
+        )
+        processed.append({"outcome": "promote-pr-merged", "pr": pr})
+    return processed
+
+
 # `shared` installs a skill under every provider root this node consumes, a
 # narrower audience only under its own (ccc-fleet-skills-sync). It is also what
 # 62 of the 75 promotions so far chose, so it is the default — and because it
@@ -4294,6 +4559,7 @@ def _promotable(
     """Approved lineages whose candidate tree is not yet under `approved/`."""
     trees = _candidate_trees_by_pr(rows)
     approved_at = _approve_lineage_prs(rows)
+    recorded = _recorded_intake_states(rows)
     published: dict[str, dict[str, object]] = {}
     for row in rows:
         if row.get("kind") is not None:
@@ -4306,6 +4572,8 @@ def _promotable(
         tree = trees.get(pr)
         row = published.get(pr)
         if tree is None or row is None or tree in promoted:
+            continue
+        if str(recorded.get(pr, {}).get("state") or "OPEN") in _INTAKE_TERMINAL_STATES:
             continue
         name = str(row.get("name") or "")
         branch = str(row.get("branch") or "")
@@ -4498,6 +4766,23 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
         url = completed.stdout.decode("utf-8").strip().splitlines()[-1]
     except (UnicodeDecodeError, IndexError):
         raise PromotionError("github_output_invalid") from None
+    pr_number = _pr_number_from_url(url) or ""
+    _append_ledger(
+        config,
+        {
+            "ts": _utc_now(),
+            "kind": _PROMOTE_PR_KIND,
+            "pr": pr_number,
+            "url": url,
+            "branch": branch,
+            "state": "OPEN",
+            "identity_hits": [
+                {"name": row["name"], "hits": row["identity_hits"]}
+                for row in flagged
+            ],
+            "staged_prs": [str(row["pr"]) for row in staged],
+        },
+    )
     return {"ok": not errors, "mode": "promote", "branch": branch, "url": url,
             "staged": staged, "errors": errors}
 
@@ -4990,6 +5275,15 @@ def _republish_revised_candidate(
         except PromotionError:
             pass
     new_pr = _pr_number_from_url(str(outcome.get("url", ""))) or "(pending)"
+    if getattr(config, "supersede_autoclose_enabled", False):
+        close_note = (
+            "- this PR is superseded; opt-in auto-close will end it this cycle "
+            "(same lineage, newer tree)"
+        )
+    else:
+        close_note = (
+            "- this PR is superseded and left open for the human to close (no auto-close)"
+        )
     _comment_once(
         config,
         rows,
@@ -5001,7 +5295,7 @@ def _republish_revised_candidate(
             f"- revision task `{task_id}` produced a new tree `{new_tree[:12]}`\n"
             f"- fresh intake PR: {new_pr} — machine gates re-ran and an independent re-review was "
             "dispatched\n"
-            "- this PR is superseded and left open for the human to close (no auto-close)"
+            f"{close_note}"
         ),
     )
     return {
@@ -5659,14 +5953,11 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
         unattributable = _unattributable_verdicts(_ledger_rows(config))
         if unattributable:
             revise["unattributable_verdicts"] = unattributable
-    # Last, and outside `revise_enabled`: this pass observes what an approve
+    # Last, and outside `revise_enabled`: drain observes what an approve
     # verdict left behind, so it must still run on a publisher with revision
     # rounds switched off, and it must see any verdict rows the passes above
     # appended in this same cycle.
-    intake_states = _sweep_intake_states(config, dry_run=dry_run)
-    # After the state pass, which is what tells this one which PRs are still
-    # open — and which it then supersedes first-hand for the ones it closes.
-    promoted_intakes = _sweep_promoted_intakes(config, dry_run=dry_run)
+    drain = _collect_drain(config, dry_run=dry_run)
     return {
         "ok": not errors,
         "mode": "collect-dry-run" if dry_run else "collect",
@@ -5676,8 +5967,24 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
         "published": published,
         "errors": errors,
         "revise": revise,
+        **drain,
+    }
+
+
+def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
+    """Intake-state / autoclose / supersede / auto-promote / auto-merge."""
+    intake_states = _sweep_intake_states(config, dry_run=dry_run)
+    promoted_intakes = _sweep_promoted_intakes(config, dry_run=dry_run)
+    superseded_intakes = _sweep_superseded_intakes(config, dry_run=dry_run)
+    auto_promote: dict[str, object] | None = None
+    if getattr(config, "auto_promote_enabled", False):
+        auto_promote = _promote(config, dry_run=dry_run, limit=8)
+    return {
         "intake_states": intake_states,
         "promoted_intakes": promoted_intakes,
+        "superseded_intakes": superseded_intakes,
+        "auto_promote": auto_promote,
+        "promote_merges": _sweep_promote_merge(config, dry_run=dry_run),
     }
 
 
