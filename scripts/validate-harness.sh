@@ -440,6 +440,14 @@ if python3 scripts/ccc-skill-registry.py validate --repo-root . >"$TMP/skill-reg
 else
   err "skill registry validation failed"
   tail -10 "$TMP/skill-registry.out" 2>/dev/null
+  # The validator reports the symptom as a bare error code. `registry_stale`
+  # just means a skill was edited without regenerating the derived artifact,
+  # which is a one-command fix — but nothing in the output said so, and the
+  # same omission also reds bridge-tests, so it reads like several failures.
+  if grep -q registry_stale "$TMP/skill-registry.out" 2>/dev/null; then
+    printf '  fix: python3 scripts/ccc-skill-registry.py update --repo-root . && git add skills/registry.json\n'
+    printf '       (the artifact is derived, never hand-edited — docs/skill-registry.md)\n'
+  fi
 fi
 if bash scripts/canon-node-name-scan.sh >"$TMP/canon-scan.out" 2>&1; then
   say "  ok Canon node-name scan — public-safe skill jurisdiction (#1446)"
