@@ -102,7 +102,7 @@ def _termux_metadata_state(metadata: Path) -> tuple[str, str | None]:
     container = doc.get("container")
     if (
         doc.get("enabled") is not True
-        or doc.get("version") != "3.6.0"
+        or doc.get("version") != "3.10.0"
         or doc.get("state") != "ready"
         or doc.get("provider") not in {"codex", "claude", "piri"}
         or type(doc.get("updated_at")) is not int

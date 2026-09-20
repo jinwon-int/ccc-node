@@ -253,9 +253,11 @@ scripts/install-termux-mempalace.sh --apply --codex
 scripts/install-termux-mempalace.sh --status --json
 ```
 
-The installer creates `ccc-mempalace` from Debian 12, pins MemPalace 3.6.0,
+The installer creates `ccc-mempalace` from Debian 12, pins MemPalace 3.10.0,
 uses `sqlite_exact` with CPU MiniLM and one embedding thread, and installs an
-argv-preserving `~/.local/bin/mempalace` wrapper. It refuses an empty or
+argv-preserving `~/.local/bin/mempalace` wrapper. A managed container whose
+venv is already on that pin may catch up a dependency lock that differs only
+in the `mempalace==` line; any other lock or version drift still fails closed. It refuses an empty or
 ambiguous transcript source and performs an initial provider-aware refresh
 before declaring the installation ready. A failed refresh rolls live wiring
 back to Termux's `peer_facts-only` behavior while preserving the container for

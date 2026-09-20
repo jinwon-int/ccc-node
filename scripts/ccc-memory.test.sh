@@ -215,7 +215,7 @@ termux_db="$termux_base/palace/sqlite_exact.sqlite3"
 mkdir -p "$termux_base/palace" "$(dirname "$termux_meta")"
 chmod 700 "$termux_base" "$(dirname "$termux_meta")"
 printf '%s\n' 'ccc-node #867 managed container' > "$termux_base/.ccc-node-managed"
-printf '%s\n' '{"schema":"ccc.termux-mempalace.install.v1","enabled":true,"provider":"codex","source":"/redacted","state":"ready","container":"ccc-mempalace","version":"3.6.0","updated_at":190}' > "$termux_meta"
+printf '%s\n' '{"schema":"ccc.termux-mempalace.install.v1","enabled":true,"provider":"codex","source":"/redacted","state":"ready","container":"ccc-mempalace","version":"3.10.0","updated_at":190}' > "$termux_meta"
 chmod 600 "$termux_base/.ccc-node-managed" "$termux_meta"
 python3 - "$termux_db" <<'PY'
 import sqlite3, sys
