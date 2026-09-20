@@ -61,16 +61,100 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(meta["attempts"], 3)
 
     def test_4xx_no_retry(self):
+        for status in (401, 422, 404):
+            calls = {"n": 0}
+
+            def bad(body, _s=status):
+                calls["n"] += 1
+                return _s, b"denied"
+
+            client = JevClient(key="k", transport=bad, retries=3, sleeper=lambda s: None)
+            with self.assertRaises(JevAPIError):
+                client.ask({}, {"q1": {}})
+            self.assertEqual(calls["n"], 1, f"status {status} must not be retried")
+
+    def test_429_is_retried_then_succeeds(self):
+        """Rate limit is the one retryable 4xx — a batch replay depends on it."""
         calls = {"n": 0}
 
-        def bad(body):
+        def throttled(body):
             calls["n"] += 1
-            return 401, b"denied"
+            if calls["n"] < 3:
+                return 429, b"slow down"
+            return ok_transport(body)
 
-        client = JevClient(key="k", transport=bad, retries=3, sleeper=lambda s: None)
+        client = JevClient(key="k", transport=throttled, retries=3, sleeper=lambda s: None)
+        _, meta = client.ask({}, {"q1": {}})
+        self.assertEqual(meta["attempts"], 3)
+
+    def test_429_exhausts_retries_and_raises(self):
+        calls = {"n": 0}
+
+        def throttled(body):
+            calls["n"] += 1
+            return 429, b"slow down"
+
+        client = JevClient(key="k", transport=throttled, retries=3, sleeper=lambda s: None)
         with self.assertRaises(JevAPIError):
             client.ask({}, {"q1": {}})
-        self.assertEqual(calls["n"], 1)
+        self.assertEqual(calls["n"], 3)
+
+    def test_retry_after_header_is_honoured_and_capped(self):
+        from jevlib import client as client_mod
+
+        self.assertEqual(client_mod._retry_after_seconds({"Retry-After": "2"}), 2.0)
+        self.assertEqual(
+            client_mod._retry_after_seconds({"Retry-After": "9999"}),
+            client_mod.MAX_RETRY_AFTER,
+        )
+        # HTTP-date form is unparsed on purpose — fall back to our own backoff
+        self.assertIsNone(
+            client_mod._retry_after_seconds({"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
+        )
+        self.assertIsNone(client_mod._retry_after_seconds({}))
+        self.assertIsNone(client_mod._retry_after_seconds(None))
+
+    def test_opener_refuses_to_follow_redirects(self):
+        """A 30x must not carry the bearer token to another host.
+
+        urllib re-sends headers when it follows a redirect, so the default
+        opener would hand the API key to whoever answered the redirect.
+        """
+        from jevlib import client as client_mod
+
+        handler = client_mod._NoRedirect()
+        self.assertIsNone(
+            handler.redirect_request(
+                None, None, 302, "Found", {}, "https://evil.example.com/v1/systemone"
+            )
+        )
+        opener = client_mod._opener()
+        self.assertTrue(
+            any(isinstance(h, client_mod._NoRedirect) for h in opener.handlers),
+            "the shared opener must install the no-redirect handler",
+        )
+        # a redirect surfaces as a non-retryable status, so it fails fast
+        self.assertFalse(client_mod._is_retryable(302))
+        self.assertFalse(client_mod._is_retryable(301))
+
+    def test_choice_probability_reads_the_map_not_a_scalar(self):
+        """The live API returns `probabilities` (a map), never `probability`.
+
+        The ledger's probability column feeds calibration, so a consumer that
+        follows the old docstring writes nulls and never notices.
+        """
+        from jevlib import choice_probability
+
+        live_shape = {
+            "type": "choice",
+            "choice": "transient_retry",
+            "confidence": 0.99,
+            "probabilities": {"transient_retry": 1.0, "permanent_quota": 0.0},
+        }
+        self.assertEqual(choice_probability(live_shape), 1.0)
+        self.assertIsNone(choice_probability({"choice": "x", "probabilities": {}}))
+        self.assertIsNone(choice_probability({"type": "noul", "noul": 0.1}))
+        self.assertIsNone(choice_probability(None))
 
     def test_choice_wrapper_missing_answer(self):
         client = JevClient(key="k", transport=lambda b: (200, b'{"answers":{}}'))
@@ -125,6 +209,54 @@ class LedgerTest(unittest.TestCase):
         out = ledger_mod.sanitize({"x": [{"token": "t", "ok": 1}], "y": {"PASSWORD": "p"}})
         self.assertEqual(
             out, {"x": [{"token": "<redacted>", "ok": 1}], "y": {"PASSWORD": "<redacted>"}}
+        )
+
+    def test_sanitize_masks_secrets_inside_string_values(self):
+        """The key-name pass cannot see a credential sitting in free text.
+
+        Consumers whose state is error prose or fetched content (piri retry
+        classification, content screening) hit this on the first provider that
+        echoes the request URL back in its error message.
+        """
+        from jevlib import ledger as ledger_mod
+
+        leak = "401 from https://user:hunter2hunter2@api.vendor.com/v1 (req 7)"
+        out = ledger_mod.sanitize({"error_text": leak, "attempt": 2})
+        self.assertNotIn("hunter2hunter2", out["error_text"])
+        self.assertIn("[REDACTED-SECRET]", out["error_text"])
+        self.assertEqual(out["attempt"], 2)
+        # non-secret text is untouched, and nesting still works
+        nested = ledger_mod.sanitize({"a": [{"msg": "plain text", "t": "ghp_" + "A" * 24}]})
+        self.assertEqual(nested["a"][0]["msg"], "plain text")
+        self.assertNotIn("AAAA", nested["a"][0]["t"])
+
+    def test_redactor_has_not_drifted_from_the_canonical_masker(self):
+        """jevlib copies auto-distill's patterns; this fails if they diverge.
+
+        The copy exists so a distill-side import error can never break a gate.
+        The cost of copying is drift, so pin it: improve one, sync the other.
+
+        Compared as source text, not by import: auto-distill.py is a script with
+        module-level imports of its own siblings and cannot be imported here,
+        which is precisely why jevlib does not depend on it.
+        """
+        canonical_src = (
+            REPO_ROOT / "scripts" / "auto-distill" / "auto-distill.py"
+        ).read_text()
+        copy_src = (
+            REPO_ROOT / "claude" / "hooks" / "jev" / "jevlib" / "redact.py"
+        ).read_text()
+
+        start = canonical_src.index("_B = r")
+        end = canonical_src.index("re.I)", canonical_src.index("_ASSIGN_RE")) + len("re.I)")
+        block = canonical_src[start:end]
+
+        self.assertGreater(len(block), 500, "canonical masker block not located")
+        self.assertIn(
+            block,
+            copy_src,
+            "jevlib/redact.py has drifted from scripts/auto-distill/auto-distill.py — "
+            "the masker was improved on one side only. Re-copy lines _B..._ASSIGN_RE.",
         )
 
 
