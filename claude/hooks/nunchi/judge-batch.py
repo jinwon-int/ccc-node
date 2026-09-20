@@ -987,11 +987,18 @@ def _confidence_cell(decision):
 
 def build_report(stamp, decisions, clears, humans, applied, backup, deferred=(), held=()):
     mode = "APPLY" if APPLY else "dry-run"
+    # The scoped fan-out re-runs this script per canonical scope and every child
+    # inherits the same CCC_STATE_DIR, so each scope's run overwrites the same
+    # REPORT file. The scope line is what makes the surviving report
+    # attributable; triaged/held give it a fixed per-scope rollup header.
+    scope = os.environ.get("CCC_NUNCHI_AUDIENCE_SCOPE", "")
     lines = [
         f"# nunchi judge-batch report — {stamp}",
         "",
         f"- mode: **{mode}** (NUNCHI_JUDGE_APPLY={'1' if APPLY else 'unset'})",
         f"- db: `{DB}`",
+        f"- scope: {scope or 'unset'} (CCC_NUNCHI_AUDIENCE_SCOPE)",
+        f"- triaged: {len(decisions)} · held: {len(held)}",
         f"- queue processed: {len(decisions)} (CAP {CAP}, freshness moat {MIN_AGE_HOURS}h)"
         + (f" · g5-deferred: {len(deferred)}" if deferred else ""),
         f"- deterministic clear: {sum(1 for d in decisions if d['class'] == 'deterministic-clear')}",
@@ -1109,7 +1116,8 @@ def run_single_db():
         )
         conn.close()
         mode = "APPLY" if APPLY else "dry-run"
-        print(f"judge-batch ({mode}): {len(decisions)} triaged,"
+        scope = os.environ.get("CCC_NUNCHI_AUDIENCE_SCOPE", "")
+        print(f"judge-batch ({mode}) [{scope or 'unset'}]: {len(decisions)} triaged,"
               f" {len(clears)} clear, {len(humans)} human-pending"
               + (f", {applied} applied" if APPLY else "")
               + (f", {len(held)} low-confidence" if held else "")
