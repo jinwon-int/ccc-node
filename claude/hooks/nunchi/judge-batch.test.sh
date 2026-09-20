@@ -26,7 +26,8 @@ mkdir -p "$TMP/nunchi-home" "$TMP/state" "$TMP/bin"
 export NUNCHI_DB="$TMP/nunchi-home/facts.db"
 export NUNCHI_HOME="$TMP/nunchi-home"
 export CCC_STATE_DIR="$TMP/state"
-unset CCC_NUNCHI_AUDIENCE_SCOPED CCC_NUNCHI_AUDIENCE_ROOT CCC_NUNCHI_SCOPED_CHILD
+unset CCC_NUNCHI_AUDIENCE_SCOPED CCC_NUNCHI_AUDIENCE_ROOT CCC_NUNCHI_SCOPED_CHILD \
+      CCC_NUNCHI_AUDIENCE_SCOPE
 # The Jev backend's availability is a key, not a PATH entry. An inherited real
 # key would make the typesafe cases reach api.typesafe.ai for real — network and
 # cost in a suite whose whole contract is neither. Unset the env var AND point
@@ -111,6 +112,8 @@ reset_db() {
 id1="$(seed dungae "사용자는 병렬 실행을 선호한다" "$OLD" 1 1 d1)"
 out="$(run_batch NUNCHI_JUDGE_APPLY=1)"
 ok "lonely flagged fact cleared deterministically (no judge call needed)" '[ "$(review_of "$id1")" = 0 ]'
+ok "stdout carries the scope tag (unset outside fan-out)" \
+  'printf "%s" "$out" | grep -q "^judge-batch (APPLY) \[unset\]:"'
 ok "audit recorded the deterministic class" 'grep -q "\"class\": \"deterministic-clear\"" "$NUNCHI_HOME/judge-audit.jsonl"'
 ok "apply created a pre-mutation backup" 'ls "$NUNCHI_HOME"/backup/facts-prejudge-*.db >/dev/null 2>&1'
 
@@ -216,7 +219,8 @@ GOOD_PRIV="private-0123456789abcdef0123456789abcdef"
 mkdir -p "$SCOPE_ROOT/shared/nunchi" "$SCOPE_ROOT/$GOOD_PRIV/nunchi" \
          "$SCOPE_ROOT/not-a-scope/nunchi" "$SCOPE_ROOT/private-ffffffffffffffffffffffffffffffff"
 for d in shared "$GOOD_PRIV"; do
-  ( unset CCC_NUNCHI_AUDIENCE_SCOPED CCC_NUNCHI_AUDIENCE_ROOT CCC_NUNCHI_SCOPED_CHILD
+  ( unset CCC_NUNCHI_AUDIENCE_SCOPED CCC_NUNCHI_AUDIENCE_ROOT CCC_NUNCHI_SCOPED_CHILD \
+         CCC_NUNCHI_AUDIENCE_SCOPE
     NUNCHI_DB="$SCOPE_ROOT/$d/nunchi/facts.db" NUNCHI_HOME="$SCOPE_ROOT/$d/nunchi" \
     NUNCHI_SNAPSHOT="$SCOPE_ROOT/$d/nunchi/snapshot.md" python3 "$NP" init >/dev/null )
 done
@@ -227,6 +231,16 @@ ok "scoped fan-out exits 0" '[ "$?" = 0 ]'
 ok "shared scope triaged (audit written)" '[ -f "$SCOPE_ROOT/shared/nunchi/judge-audit.jsonl" ] || [ ! -f "$SCOPE_ROOT/not-a-scope/nunchi/judge-audit.jsonl" ]'
 ok "non-canonical scope dir never touched" '[ ! -f "$SCOPE_ROOT/not-a-scope/nunchi/judge-audit.jsonl" ]'
 ok "DB-less canonical scope skipped without error" '[ ! -f "$SCOPE_ROOT/private-ffffffffffffffffffffffffffffffff/nunchi/judge-audit.jsonl" ]'
+# Children inherit the same CCC_STATE_DIR, so each scope overwrites the same
+# report file; sorted order makes `shared` the last writer, so the surviving
+# report must be attributed to shared — and stdout must tag every scope.
+ok "report header names the scope that wrote it (fan-out overwrite)" \
+  'grep -q "^- scope: shared " "$CCC_STATE_DIR/nunchi-review-report.md"'
+ok "report header carries triaged/held counters" \
+  'grep -q "^- triaged: 0 .* held: 0" "$CCC_STATE_DIR/nunchi-review-report.md"'
+ok "stdout tags the shared scope" 'printf "%s" "$out" | grep -q "judge-batch (dry-run) \[shared\]:"'
+ok "stdout tags the private scope" \
+  'printf "%s" "$out" | grep -q "judge-batch (dry-run) \[private-0123456789abcdef0123456789abcdef\]:"'
 
 # ---- 8. G5: a reasonless decision is never deterministic-cleared (#1264) ---
 # The deterministic pass clears anything without a live >=0.6 sibling — that
@@ -715,6 +729,8 @@ if expected > 0.0:
     assert applied == 2, applied
     assert "confidence gate" in report, "report-gate-line"
     assert "low-confidence" in report, "report-held-section"
+    assert "triaged: 3" in report, "report-triaged-counter"
+    assert "held: 1" in report, "report-held-counter"
 else:
     # positive control for the same call: with no gate it really does clear
     assert guard_gate is True, "apply_clear-no-gate"
@@ -723,7 +739,9 @@ else:
     assert applied == 3, applied
     assert low["class"] == "judge", low
     assert "confidence gate" not in report, "report-gate-line-when-off"
+    assert "held: 0" in report, "report-held-counter-when-off"
 assert "| conf |" in report, "report-conf-column"
+assert "- scope: unset " in report, "report-scope-line-unset-fallback"
 FIXTURE
 
 reset_db
