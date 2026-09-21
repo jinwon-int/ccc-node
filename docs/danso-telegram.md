@@ -58,7 +58,8 @@ CCC_DANSO_LONG_TASK_TIMEOUT_SECONDS=21600
 CLAUDE_PROCESS_TIMEOUT=21660
 CCC_DANSO_PROVIDER_TIMEOUT_SECONDS=180
 CCC_DANSO_MAX_TURNS=32
-CCC_DANSO_COMPACT_AT_BYTES=131072
+# CCC_DANSO_COMPACT_AT_BYTES=393216   # unset = native provider/model default
+CCC_DANSO_PROVIDER_STREAM=true
 ENABLE_STREAMING=true
 ENABLE_STREAMING_TOOL_CALLS=true
 ```
@@ -70,12 +71,23 @@ overrides in the supported 1..300 second range. Native HTTP failures may also
 carry an optional validated `DANSO_TRANSPORT` record with only the phase,
 elapsed milliseconds, and request byte count; malformed records are ignored.
 
-`CCC_DANSO_COMPACT_AT_BYTES` defaults to 131072 bytes (128 KiB). Native Danso
-measures the serialized request, including system context, JSON escaping and
-tool schemas, so the default leaves room for the normal 32 KiB CCC memory
-snapshot and its request envelope. Existing installations with an explicit
-`32768` setting should migrate it to `131072`; explicit lower values remain
-valid overrides but can fail closed when the fixed context cannot fit.
+`CCC_DANSO_COMPACT_AT_BYTES` is unset by default (#1913): the bridge omits
+`--compact-at-bytes` and native Danso derives the threshold from the selected
+provider/model request budget (`floor(context_tokens × 70%) × bytes_per_token
+− 32 KiB`; 527,232 bytes for `glm-5.3-flash`, see danso `docs/providers.md`).
+The former 128 KiB default forced compaction at roughly 32k tokens on a
+200k-token model, so long turns spent most of their requests re-summarising
+and re-reading files. An explicit value (8192..393216) still wins; native Danso
+measures the serialized request including system context, JSON escaping and
+tool schemas, so keep any override above the 32 KiB CCC memory snapshot and its
+request envelope. Installations that pinned `131072` should drop the setting.
+
+`CCC_DANSO_PROVIDER_STREAM=true` forwards `DANSO_PROVIDER_STREAM=1` to the
+native child so provider responses stream (danso #109 opt-in; default off).
+Without it a long generation sends no bytes until it finishes, which the
+`CCC_DANSO_PROVIDER_TIMEOUT_SECONDS` header deadline (bounded retries, each
+re-sending the full request) and the `CCC_TERMINAL_STALL_SECONDS` silence probe
+both read as a dead turn.
 
 `CCC_DANSO_TOOL_HOME` is optional and host-only. When set, it must be an
 absolute path and the native CLI must expose `--tool-home`; readiness fails

@@ -33,6 +33,9 @@ PROVIDERS = {
     'openai-codex': ('DANSO_CHATGPT_AUTH_FILE', 'DANSO_CHATGPT_BASE_URL'),
     'anthropic': ('ANTHROPIC_API_KEY', 'DANSO_ANTHROPIC_BASE_URL'),
 }
+# Provider-neutral native runtime switches the bridge may forward (#1913).
+# danso #109: DANSO_PROVIDER_STREAM=1 opts the adapters into SSE.
+RUNTIME_ENV = ('DANSO_PROVIDER_STREAM',)
 EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
 
 
@@ -524,7 +527,7 @@ class DansoRuntime:
         if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o700:
             raise ValueError('state directory must be private and owner-controlled')
         self.root, self.provider, self.model = root, provider, model
-        names = ('PATH', 'HOME', *PROVIDERS[provider])
+        names = ('PATH', 'HOME', *RUNTIME_ENV, *PROVIDERS[provider])
         self.environment = {k: environment[k] for k in names if k in environment}
         if not self.environment.get('HOME') or not self.environment.get(PROVIDERS[provider][0]):
             raise ValueError('explicit HOME and provider credential required')

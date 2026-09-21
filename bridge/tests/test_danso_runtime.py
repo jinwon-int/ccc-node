@@ -111,7 +111,7 @@ async def test_telegram_turn_resume_default_effort_and_usage(configured):
     assert argv[argv.index('--provider')+1] == 'openai'
     assert '--unsafe-no-sandbox' not in argv
     assert argv[argv.index('--sandbox') + 1] == 'host'
-    assert '--compact-at-bytes' in argv
+    assert '--compact-at-bytes' not in argv  # #1913: native provider/model default
     handler._usage_meter.record.assert_called_once_with('danso','interactive',requests=2,input_tokens=14,output_tokens=3)
     journal = runtime.root/(response.session_id+'.jsonl')
     before = journal.read_bytes()
@@ -135,8 +135,12 @@ async def test_compaction_default_and_explicit_override_reach_native_cli(configu
     events = [event async for event in session.send_turn("ok")]
     assert events[-1].kind == "completion"
     argv = json.loads((Path(configured.danso_workspace) / "argv.json").read_text())
-    assert configured.danso_compact_at_bytes == 128 * 1024
-    assert argv[argv.index("--compact-at-bytes") + 1] == str(128 * 1024)
+    # #1913: no CCC default is forwarded; Danso derives the threshold per provider/model.
+    assert configured.danso_compact_at_bytes is None
+    assert "--compact-at-bytes" not in argv
+    assert configured.danso_provider_stream is False
+    child_env = json.loads((Path(configured.danso_workspace) / "environment.json").read_text())
+    assert "DANSO_PROVIDER_STREAM" not in child_env
 
     overridden = Settings.load(
         project_root=configured.project_root,
@@ -1624,6 +1628,41 @@ async def test_zai_auth_mode_routes_glm_with_mode_default_model_and_env(configur
     assert "ZAI_API_KEY" in child_env
     assert "DANSO_GLM_ENDPOINT" in child_env
     assert "OPENAI_API_KEY" not in child_env
+    assert "DANSO_PROVIDER_STREAM" not in child_env
+
+
+@pytest.mark.anyio
+async def test_provider_stream_opt_in_reaches_native_child_env(configured, tmp_path):
+    # #1913: CCC_DANSO_PROVIDER_STREAM forwards danso #109's SSE opt-in; the
+    # child environment stays an explicit allowlist otherwise.
+    settings = Settings.load(
+        project_root=configured.project_root,
+        bot_env_file=tmp_path / "absent-stream",
+        environ={
+            "TELEGRAM_BOT_TOKEN": "123456:synthetic",
+            "ALLOWED_USER_IDS": "[7]",
+            "CCC_AGENT_PROVIDER": "danso",
+            "CCC_DANSO_CLI_PATH": configured.danso_cli_path,
+            "CCC_DANSO_WORKSPACE": configured.danso_workspace,
+            "CCC_DANSO_STATE_DIR": str(tmp_path / "private-stream"),
+            "CCC_DANSO_AUTH_MODE": "zai",
+            "ZAI_API_KEY": "fixture-zai-key",
+            "CCC_DANSO_PROVIDER_STREAM": "true",
+            "CCC_DANSO_TIMEOUT_SECONDS": "3",
+        },
+    )
+    assert settings.danso_provider_stream is True
+    runtime = build_danso_runtime(settings)
+    assert runtime.environment.get("DANSO_PROVIDER_STREAM") == "1"
+    session = await runtime.start_or_resume(
+        SessionRequest(working_directory=settings.danso_workspace))
+    events = [event async for event in session.send_turn("ok")]
+    assert events[-1].kind == "completion"
+    child_env = json.loads(
+        (Path(settings.danso_workspace) / "environment.json").read_text())
+    assert "DANSO_PROVIDER_STREAM" in child_env
+    assert "ZAI_API_KEY" in child_env
+    assert "TELEGRAM_BOT_TOKEN" not in child_env
 
 
 @pytest.mark.anyio
