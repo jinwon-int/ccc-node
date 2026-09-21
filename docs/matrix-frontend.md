@@ -15,7 +15,7 @@ changed versus the family-messenger pilot bot ("fambot"):
 | brain | one Codex process per turn, JSON port | `ProjectChatHandler` in-process (as Telegram) |
 | session | `session_id` per room, cold start each turn | warm `AgentSession` per room |
 | progress | "작업을 시작했습니다" only | typing + interim/status notices |
-| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) |
+| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) + `/history /resume` (#1895 PR-B) |
 | output | plain `m.text` | plain `body` + Matrix HTML `formatted_body` |
 | E2EE / trust / room gate | fleet_matrix | same code, ported (fail-closed reasons unchanged) |
 
@@ -240,3 +240,15 @@ workload (`workload.turn_occupancy`, `active_requests`, `waiting_for_turn`).
 Before this, the shared handler only recorded *turn* events, so an idle frontend
 left the file frozen at its last turn and fleet freshness checks could not tell
 idle from dead (observed 2026-09-21 on two nodes, stale since 09-19).
+
+## /history and /resume (#1895 PR-B)
+
+Same provider rules as Telegram, plain text: `/history` shows the last five
+transcript messages for Claude (`get_recent_messages`) and Codex/Crush
+(`read_runtime_session`); Piri and Danso resume by exact id and expose no
+bounded history. `/resume` lists Codex/Crush runtime threads or Claude
+sessions and stores a `resume_list`; the next **digit** reply switches to that
+entry (provider mismatch and out-of-range are refused), any other reply clears
+the list and is served normally. Claude browsing stays locked while private
+memory is `audience-scoped` (`/new` instead); Danso reports the current
+auto-resuming session; Piri accepts `/resume <session-id>`.
