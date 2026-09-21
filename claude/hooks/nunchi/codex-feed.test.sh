@@ -103,7 +103,7 @@ ok "stale lane process is swept at feed start" '! kill -0 "$stale_pid" 2>/dev/nu
 lane_pid="$(tail -n 1 "$pid_file" 2>/dev/null || true)"
 ok "this run's codex exec is killed by the bounded timeout" '[ -n "$lane_pid" ] && ! kill -0 "$lane_pid" 2>/dev/null'
 ok "codex exec argv carries the lane tag" 'grep -q "nunchi-codex-feed-816" "$argv_file"'
-ok "processed rollout is marked seen despite the non-JSON response" 'grep -qxF "$rollout" "$NUNCHI_HOME/codex-seen"'
+ok "failed extraction is not marked stored" '! grep -qxF "$rollout" "$NUNCHI_HOME/codex-seen" && jq -e ".status == \"failed\"" "$NUNCHI_HOME/codex-receipts.jsonl" >/dev/null'
 ok "stdin was detached (fake codex did not inherit the test stdin)" '[ "$(wc -l < "$pid_file")" -ge 1 ]'
 
 kill "$spawner" 2>/dev/null || true

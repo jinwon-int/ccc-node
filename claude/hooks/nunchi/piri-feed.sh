@@ -17,6 +17,7 @@ MODE="${CCC_NUNCHI_MODE:-$(cat "$STATE/nunchi.mode" 2>/dev/null || echo off)}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 FM="$HERE/nunchi.py"
+RECEIPTS="$HERE/feed-receipt.py"
 # shellcheck source=claude/hooks/nunchi/feed-common.sh
 . "$HERE/feed-common.sh" 2>/dev/null || {
   echo "${0##*/}: feed-common.sh missing beside this feed — the harness is only partially deployed; re-run setup.sh. Refusing to run rather than tick without ingesting (#1698)." >&2
@@ -96,6 +97,7 @@ fi
 
 NUNCHI_HOME="${NUNCHI_HOME:-$HOME/.nunchi}"
 SEEN="$NUNCHI_HOME/piri-seen"
+RECEIPT_FILE="$NUNCHI_HOME/piri-receipts.jsonl"
 LOCK="$NUNCHI_HOME/.piri-feed.lock"
 # PIRI_CODING_AGENT_SESSION_DIR is already the direct session directory. The
 # global default is <agent-dir>/sessions and may contain cwd subdirectories.
@@ -163,7 +165,7 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
       exit 0
     }
   }
-  n=0
+  n=0 failed=0 visited=0
   sources=$(find "$PIR_SESSIONS_DIR" -type f -name "*.jsonl" 2>/dev/null | wc -l | tr -d " ")
   visited=0
   # oldest-first so backfill is chronological; NUL delimiters preserve safe
@@ -171,7 +173,10 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
   # independently rejected by the bounded reader below.
   while IFS= read -r -d '' record; do
     f="${record#* }"
-    grep -qxF "$f" "$SEEN" && continue
+    token=$(python3 "$RECEIPTS" due "$RECEIPT_FILE" "$f" "$SEEN")
+    due_rc=$?
+    [ "$due_rc" = 3 ] && continue
+    [ "$due_rc" = 0 ] || { failed=$((failed+1)); continue; }
     [ "$visited" -ge "$MAX_FILES_PER_RUN" ] && break
     visited=$((visited+1))
     convo=$(python3 - "$f" "$PIR_SESSIONS_DIR" <<'PYEOF'
@@ -179,19 +184,19 @@ import json, os, stat, sys
 path = os.path.abspath(sys.argv[1])
 root = os.path.abspath(sys.argv[2])
 if os.path.commonpath((path, root)) != root:
-    raise SystemExit(0)
+    raise SystemExit(2)
 flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 try:
     fd = os.open(path, flags)
 except OSError:
-    raise SystemExit(0)
+    raise SystemExit(2)
 meta = os.fstat(fd)
 if not (stat.S_ISREG(meta.st_mode) and meta.st_nlink == 1
         and meta.st_uid == os.geteuid()
         and not stat.S_IMODE(meta.st_mode) & 0o077
         and meta.st_size <= 16 * 1024 * 1024):
     os.close(fd)
-    raise SystemExit(0)
+    raise SystemExit(2)
 out = []
 with os.fdopen(fd, encoding="utf-8", errors="replace") as handle:
   for ln in handle:
@@ -224,12 +229,21 @@ text = "\n".join(out[-60:])          # last 60 messages
 print(text[:40000])                   # byte cap
 PYEOF
 )
-    [ ${#convo} -gt 200 ] || { echo "$f" >> "$SEEN"; continue; }
+    read_rc=$?
+    if [ "$read_rc" != 0 ]; then
+      python3 "$RECEIPTS" failed "$RECEIPT_FILE" "$f" "$token" >/dev/null
+      failed=$((failed+1)); continue
+    fi
+    [ ${#convo} -gt 200 ] || { python3 "$RECEIPTS" stored "$RECEIPT_FILE" "$f" "$token" >/dev/null; continue; }
     # One non-interactive Piri print-mode run. PIRI_CODING_AGENT_SESSION_DIR
     # keeps the extractor's own session out of the scanned tree.
     resp=$(timeout 300 env PIRI_CODING_AGENT_SESSION_DIR="$EXTRACTOR_SESSION_DIR" \
-      "$PIR_CLI" --mode text --print "${PROMPT_PREFIX}${convo}" 2>/dev/null || true)
-    [ -n "$resp" ] || { echo "$f" >> "$SEEN"; continue; }
+      "$PIR_CLI" --mode text --print "${PROMPT_PREFIX}${convo}" 2>/dev/null)
+    extract_rc=$?
+    if [ "$extract_rc" != 0 ] || [ -z "$resp" ]; then
+      python3 "$RECEIPTS" failed "$RECEIPT_FILE" "$f" "$token" >/dev/null
+      failed=$((failed+1)); continue
+    fi
     # The model may wrap JSON in prose; tolerate a leading fence/trailing text.
     NUNCHI_PY="$FM" python3 - "$resp" "$f" <<'PYEOF'
 import json, sys, os, re, subprocess
@@ -239,13 +253,13 @@ raw, path = sys.argv[1], sys.argv[2]
 # trailing blank line or model commentary around the object).
 m = re.search(r"\{.*\}", raw, re.S)
 if not m:
-    sys.exit(0)
+    sys.exit(2)
 try:
     d = json.loads(m.group(0))
-    items = d.get("honcho", [])
-    assert isinstance(items, list)
+    items = d["honcho"]
+    assert isinstance(items, list) and all(isinstance(x, dict) and isinstance(x.get("text"), str) and x["text"].strip() for x in items)
 except Exception:
-    sys.exit(0)  # not strict JSON → mark seen (caller) to avoid burning calls
+    sys.exit(2)  # failed extraction remains retryable
 sid = os.path.basename(path)
 # Piri session files are <timestamp>_<uuid>.jsonl; keep the uuid as the id.
 sid = re.sub(r".*_", "", sid.replace(".jsonl", ""))
@@ -258,10 +272,20 @@ payload = {"session_id": f"piri:{sid}",
            "honcho": items}
 r = subprocess.run(["python3", os.environ["NUNCHI_PY"], "ingest", "-"],
                    input=json.dumps(payload), capture_output=True, text=True)
-print(r.stdout.strip() or r.stderr.strip())
+print("nunchi-feed: ingest " + ("ok" if r.returncode == 0 else "failed"))
+sys.exit(r.returncode)
 PYEOF
-    echo "$f" >> "$SEEN"
-    n=$((n+1))
+    ingest_rc=$?
+    if [ "$ingest_rc" = 0 ]; then
+      if python3 "$RECEIPTS" stored "$RECEIPT_FILE" "$f" "$token" >/dev/null; then
+        n=$((n+1))
+      else
+        failed=$((failed+1))
+      fi
+    else
+      python3 "$RECEIPTS" failed "$RECEIPT_FILE" "$f" "$token" >/dev/null
+      failed=$((failed+1))
+    fi
   done < <(find "$PIR_SESSIONS_DIR" -type f -name "*.jsonl" \
     -printf '%T@ %p\0' 2>/dev/null | sort -z -n)
   python3 "$FM" snapshot --limit 25 >/dev/null 2>&1 || true
@@ -272,5 +296,5 @@ PYEOF
   # piri/codex feeds — the claude-era file just aged out). sources = session
   # files considered this run, ingested = sessions processed.
   _status="${CCC_NUNCHI_INGEST_STATUS:-$NUNCHI_HOME/ingest.status.json}"
-  nunchi_write_status "$_status" piri "${sources:-0}" "${n:-0}" 0 0
+  nunchi_write_status "$_status" piri "${sources:-0}" "${n:-0}" 0 "${failed:-0}"
 ) 9>"$LOCK"
