@@ -135,6 +135,13 @@ RELATIVE_DURATION = re.compile(
 
 ISSUE_REFERENCE = re.compile(r"(?:#|/(?:issues|pull)/)(\d{1,7})\b")
 
+# Inline code is quotation, not a booking. ccc-node#1873 reproduced another
+# issue's deadline row as `| 배포 검증 종료 | **2026-09-12 06:00 KST** |` and
+# was reported at high confidence for it. The keyword test therefore ignores
+# code spans; the dates are still read from the full paragraph so a real
+# booking that formats only its timestamp as code keeps its deadline.
+INLINE_CODE = re.compile(r"`[^`\n]*`")
+
 
 @dataclass(frozen=True)
 class Hit:
@@ -283,7 +290,7 @@ def collect_hits(issue: dict[str, Any]) -> tuple[list[Hit], list[str]]:
         # so only comments contribute a header signal.
         header = text[:SETTLED_HEADER_CHARS] if posted is not None else ""
         for paragraph in _iter_paragraphs(text):
-            if not DEADLINE_KEYWORD.search(paragraph):
+            if not DEADLINE_KEYWORD.search(INLINE_CODE.sub("", paragraph)):
                 continue
             dates = _dates_in(paragraph)
             if not dates:

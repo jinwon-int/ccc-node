@@ -218,6 +218,21 @@ class ExpiredModeTests(unittest.TestCase):
         )
         self.assertIsNone(scanner.judge_issue(issue, NOW, "expired"))
 
+    def test_quoted_booking_in_inline_code_is_not_a_deadline(self) -> None:
+        # ccc-node#1873 quoted #1648's booking row inside backticks.
+        issue = _issue(
+            number=1873,
+            body="- 예약 코멘트 표: `| 배포 검증 종료 | **2026-09-12 06:00 KST** |`",
+        )
+        self.assertIsNone(scanner.judge_issue(issue, NOW, "expired"))
+
+    def test_timestamp_alone_in_inline_code_still_counts(self) -> None:
+        issue = _issue(body="검증 종료 예정: `2026-09-17 07:32 KST`")
+        finding = scanner.judge_issue(issue, NOW, "expired")
+        assert finding is not None
+        self.assertEqual(finding.deadline, dt.datetime(2026, 9, 17, 7, 32))
+        self.assertEqual(finding.confidence, "high")
+
     def test_english_deadline_word_still_counts(self) -> None:
         issue = _issue(body="Deadline: 2026-09-17 07:32 KST, judged by gwakga.")
         finding = scanner.judge_issue(issue, NOW, "expired")
