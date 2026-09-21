@@ -179,6 +179,27 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(result["initialized"], 1)
         self.assertEqual(result["unavailable_databases"], 1)
 
+    def test_large_growing_session_reads_recent_tail_only(self):
+        reader = module("session-tail")
+        p = self.file("large.jsonl", "")
+        with p.open("wb") as f:
+            f.seek(70 * 1024 * 1024)
+            f.write(
+                b"\n"
+                + json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "user_message",
+                            "message": "Recent memory after a long session",
+                        },
+                    }
+                ).encode()
+                + b"\n"
+            )
+        self.assertIn("Recent memory", reader.read("codex", p, self.p))
+        self.assertEqual(self.receipt("due", self.home / "receipts", p), 0)
+
     def source(self):
         c = sqlite3.connect(self.home / "facts.db")
         c.execute(

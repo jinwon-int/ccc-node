@@ -179,56 +179,7 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
     [ "$due_rc" = 0 ] || { failed=$((failed+1)); continue; }
     [ "$visited" -ge "$MAX_FILES_PER_RUN" ] && break
     visited=$((visited+1))
-    convo=$(python3 - "$f" "$PIR_SESSIONS_DIR" <<'PYEOF'
-import json, os, stat, sys
-path = os.path.abspath(sys.argv[1])
-root = os.path.abspath(sys.argv[2])
-if os.path.commonpath((path, root)) != root:
-    raise SystemExit(2)
-flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-try:
-    fd = os.open(path, flags)
-except OSError:
-    raise SystemExit(2)
-meta = os.fstat(fd)
-if not (stat.S_ISREG(meta.st_mode) and meta.st_nlink == 1
-        and meta.st_uid == os.geteuid()
-        and not stat.S_IMODE(meta.st_mode) & 0o077
-        and meta.st_size <= 16 * 1024 * 1024):
-    os.close(fd)
-    raise SystemExit(2)
-out = []
-with os.fdopen(fd, encoding="utf-8", errors="replace") as handle:
-  for ln in handle:
-    try:
-        d = json.loads(ln)
-    except Exception:
-        continue
-    if d.get("type") != "message":
-        continue
-    m = d.get("message", {})
-    role = m.get("role")
-    content = m.get("content")
-    # Piri content is either a string or a list of {type: text|...} blocks.
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        text = " ".join(
-            b.get("text", "")
-            for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
-        )
-    else:
-        text = ""
-    if role == "user":
-        out.append("USER: " + text[:800])
-    elif role == "assistant":
-        out.append("AGENT: " + text[:800])
-    # toolResult and other roles carry no user/agent voice — skip.
-text = "\n".join(out[-60:])          # last 60 messages
-print(text[:40000])                   # byte cap
-PYEOF
-)
+    convo=$(python3 "$HERE/session-tail.py" piri "$f" "$PIR_SESSIONS_DIR")
     read_rc=$?
     if [ "$read_rc" != 0 ]; then
       python3 "$RECEIPTS" failed "$RECEIPT_FILE" "$f" "$token" >/dev/null

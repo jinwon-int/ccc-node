@@ -82,29 +82,7 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
     [ "$due_rc" = 0 ] || { failed=$((failed+1)); continue; }
     [ "$visited" -ge "$MAX_FILES_PER_RUN" ] && break
     visited=$((visited+1))
-    convo=$(python3 - "$f" <<'PYEOF'
-import json, sys, os, stat
-from collections import deque
-fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW)
-st=os.fstat(fd)
-if not stat.S_ISREG(st.st_mode) or st.st_nlink!=1 or st.st_uid!=os.geteuid() or st.st_size>64*1024*1024:
-    os.close(fd);raise SystemExit(2)
-out = deque(maxlen=60)
-for ln in os.fdopen(fd):
-    try: d = json.loads(ln)
-    except: continue
-    if d.get("type") != "event_msg": continue
-    p = d.get("payload", {})
-    if "nunchi-codex-feed-816" in str(p.get("message", "")): raise SystemExit(0)
-    t = p.get("type")
-    if t == "user_message":
-        out.append("USER: " + str(p.get("message", ""))[:800])
-    elif t == "agent_message":
-        out.append("AGENT: " + str(p.get("message", ""))[:800])
-text = "\n".join(list(out)[-60:])          # last 60 messages
-print(text[:40000])                   # byte cap
-PYEOF
-)
+    convo=$(python3 "$HERE/session-tail.py" codex "$f" "$SESSIONS_DIR")
     read_rc=$?
     if [ "$read_rc" != 0 ]; then
       python3 "$RECEIPTS" failed "$RECEIPT_FILE" "$f" "$token" >/dev/null

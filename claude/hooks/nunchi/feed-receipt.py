@@ -40,8 +40,6 @@ def fingerprint(path):
     st = p.stat()
     if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.geteuid():
         raise ValueError("unsafe_source")
-    if st.st_size > 64 * 1024 * 1024:
-        raise ValueError("oversize_source")
     key = hashlib.sha256(os.fsencode(str(p.absolute()))).hexdigest()
     return key, f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}", st.st_mtime
 
