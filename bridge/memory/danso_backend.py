@@ -112,7 +112,7 @@ class DansoDistillBackend:
             payload = await _run(command, environment, cwd, self.timeout)
         try:
             result = validate_live_decision_reasons(
-                parse_extraction_output(payload, wiki_enabled=self.wiki_enabled)
+                parse_extraction_output(_strip_markdown_fence(payload), wiki_enabled=self.wiki_enabled)
             )
             if (
                 result.provenance.provider != extraction_input.provider

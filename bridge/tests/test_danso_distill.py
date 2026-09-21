@@ -131,7 +131,8 @@ def output(data):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("escaped", [False, True])
-async def test_extractor_uses_only_explicit_auth_and_tool_free_private_input(tmp_path, monkeypatch, escaped):
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_extractor_uses_only_explicit_auth_and_tool_free_private_input(tmp_path, monkeypatch, escaped, fenced):
     ident, _ = journal(tmp_path / "private")
     snapshot = read_danso_snapshot(
         tmp_path / "private", ident, bounds=TranscriptBounds(), cwd=Path("/fixture")
@@ -158,7 +159,7 @@ async def test_extractor_uses_only_explicit_auth_and_tool_free_private_input(tmp
         'assert os.environ["DANSO_CHATGPT_AUTH_FILE"]=="/synthetic/danso-auth.json"\n'
         "assert not list(pathlib.Path.cwd().iterdir())\n"
         f"pathlib.Path({str(marker)!r}).write_text(str(p.parent))\n"
-        f"print({json.dumps(output(data))!r})\n"
+        f"print({(chr(96)*3+'json\n'+json.dumps(output(data))+'\n'+chr(96)*3 if fenced else json.dumps(output(data)))!r})\n"
     )
     script.chmod(0o700)
     settings = SimpleNamespace(
