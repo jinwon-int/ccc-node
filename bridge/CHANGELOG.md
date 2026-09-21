@@ -1,5 +1,11 @@
 # Changelog
 
+- **Telegram heartbeat defaults match Matrix (60s).** First `⏳ Working` and
+  silent replacements used 15s; Matrix status bubbles already throttle at 60s
+  (`STATUS_MIN_INTERVAL_S`). Defaults for `CCC_HEARTBEAT_THRESHOLD_SECONDS` and
+  `CCC_HEARTBEAT_UPDATE_INTERVAL_SECONDS` are now 60. Explicit env still wins.
+  Streaming-progress suppression and delete-on-done are unchanged.
+
 - **Telegram `start.sh` no longer treats a Matrix frontend as itself.**
   `find_project_bot_pids` matched any `python -m telegram_bot --path $PROJECT_ROOT`,
   so a second systemd unit on the same project root (`CCC_CHANNEL=matrix`, own

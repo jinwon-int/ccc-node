@@ -1358,8 +1358,8 @@ class ProjectChatHandler(
             if last_event > 0 and now - last_event >= stall_seconds:
                 silent_seconds = now - last_event
 
-        threshold = float(getattr(config, "heartbeat_threshold_seconds", 15.0))
-        interval = float(getattr(config, "heartbeat_update_interval_seconds", 15.0))
+        threshold = float(getattr(config, "heartbeat_threshold_seconds", 60.0))
+        interval = float(getattr(config, "heartbeat_update_interval_seconds", 60.0))
         if not should_update_heartbeat(
             now=now,
             started_at=req.started_at,

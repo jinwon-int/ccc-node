@@ -31,14 +31,14 @@ class HeartbeatSettingsMixin:
         description="Enable fail-open long-running task heartbeat messages.",
     )
     heartbeat_threshold_seconds: float = Field(
-        default=15.0,
+        default=60.0,
         alias="CCC_HEARTBEAT_THRESHOLD_SECONDS",
-        description="Seconds before sending the first long-running task heartbeat.",
+        description="Seconds before sending the first long-running task heartbeat. Matches Matrix status throttle.",
     )
     heartbeat_update_interval_seconds: float = Field(
-        default=15.0,
+        default=60.0,
         alias="CCC_HEARTBEAT_UPDATE_INTERVAL_SECONDS",
-        description="Minimum seconds between silent heartbeat replacements at the bottom of the chat.",
+        description="Minimum seconds between silent heartbeat replacements at the bottom of the chat. Matches Matrix status throttle.",
     )
     heartbeat_suppress_when_streaming_progress: bool = Field(
         default=True,

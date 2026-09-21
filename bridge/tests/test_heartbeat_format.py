@@ -8,6 +8,10 @@ telegram_bot_pkg = types.ModuleType("telegram_bot")
 telegram_bot_pkg.__path__ = [str(BRIDGE_DIR)]
 sys.modules.setdefault("telegram_bot", telegram_bot_pkg)
 
+telegram_bot_utils = types.ModuleType("telegram_bot.utils")
+telegram_bot_utils.__path__ = [str(BRIDGE_DIR / "utils")]
+sys.modules.setdefault("telegram_bot.utils", telegram_bot_utils)
+
 from telegram_bot.core.heartbeat import (
     compose_heartbeat_text,
     format_duration,
@@ -15,6 +19,7 @@ from telegram_bot.core.heartbeat import (
     should_update_heartbeat,
     tool_label,
 )
+from telegram_bot.utils.settings_heartbeat import HeartbeatSettingsMixin
 
 
 class HeartbeatFormatTests(unittest.TestCase):
@@ -80,6 +85,14 @@ class HeartbeatFormatTests(unittest.TestCase):
         )
         self.assertTrue(has_recent_visible_progress(now=20, last_visible_progress_at=10, window_seconds=15))
         self.assertFalse(has_recent_visible_progress(now=30, last_visible_progress_at=10, window_seconds=15))
+
+    def test_telegram_heartbeat_defaults_match_matrix_throttle(self):
+        threshold = HeartbeatSettingsMixin.__dict__["heartbeat_threshold_seconds"]
+        interval = HeartbeatSettingsMixin.__dict__["heartbeat_update_interval_seconds"]
+        self.assertEqual(threshold.default, 60.0)
+        self.assertEqual(interval.default, 60.0)
+        self.assertEqual(threshold.alias, "CCC_HEARTBEAT_THRESHOLD_SECONDS")
+        self.assertEqual(interval.alias, "CCC_HEARTBEAT_UPDATE_INTERVAL_SECONDS")
 
 
 if __name__ == "__main__":
