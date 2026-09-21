@@ -4,6 +4,21 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **skill-review: degraded-telemetry lines carry the skill name, and the
+  wrapper's state path is private at every component.** The two
+  `note_degraded` call sites that know which skill degraded
+  (`wrapper:curator_nonzero`, `wrapper:curator_*` reason relay) now append an
+  optional third field, so the retirement audit (#1648) can attribute a
+  degrade to a skill instead of an anonymous line; nameless lines keep the
+  original two-field format, so existing parsers stay compatible either way.
+  The name bypasses `ownership._validate_name`, so it is sanitized before
+  logging: CR/LF folded to spaces (one line per degrade) and capped at 64
+  bytes. First-touch creation of the state path now uses a `umask 077`
+  subshell — `mkdir -p -m 700` modes the leaf alone and a world-readable
+  `state` intermediate would poison every later recording bump into a
+  permanent `contract:unsafe_state_directory` fail-open. Verified: new
+  hermetic suite `curator-bump.test.sh` 17 PASS (restricted-PATH jq/python3
+  loss, curator nonzero, overlong names, size cap, component modes #1866).
 - **memory: pin Termux MemPalace to 3.10.0.** The PRoot installer, managed
   lock, and memory probe still required 3.6.0 after the fleet package moved
   to 3.10.0, so `--apply` fail-closed on version drift and `ccc-memory-check`
