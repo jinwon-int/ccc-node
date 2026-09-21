@@ -258,9 +258,11 @@ def fetch_queue(conn):
 
     Returns ``(queue, deferred_ids, duplicates)`` — the queue is capped, the
     deferred count is a full scan so the report can state the real backlog.
-    ``duplicates`` (#1891) are ``(id, sibling_id, ratio)`` for flagged items
-    whose best open sibling overlaps >= DUP_THRESHOLD: merge candidates for the
-    owner, held out of the CAP for the same reason G5 items are.
+    ``duplicates`` (#1891/#1898) are ``(id, sibling_id, ratio, dup_id,
+    survivor_id)`` for flagged items whose best open sibling overlaps >=
+    DUP_THRESHOLD AND one side's tokens contain the other's: merge candidates
+    for the owner, held out of the CAP for the same reason G5 items are.
+    De-duplicated: one proposal per (dup, survivor), and one per dup id.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=MIN_AGE_HOURS)).isoformat(timespec="seconds")
     cursor = conn.execute(
@@ -272,14 +274,29 @@ def fetch_queue(conn):
     queue = []
     deferred = []
     duplicates = []
+    seen_pairs = set()
+    seen_dups = set()
     for row in cursor:
         if nunchi._g5_reasonless_decision(row[2], row[3], row[6]):
             deferred.append(row[0])
             continue
-        dup = duplicate_candidate(live_conflict(conn, row[0], row[1], row[3], row[2]))
+        dup = duplicate_candidate(row[3], live_conflict(conn, row[0], row[1], row[3], row[2]))
         if dup is not None:
-            duplicates.append((row[0], dup[0], dup[1]))
-        elif len(queue) < CAP:
+            sid, ratio, direction = dup
+            if direction == "fold_sibling":
+                dup_id, survivor = sid, row[0]
+            elif direction == "fold_item":
+                dup_id, survivor = row[0], sid
+            else:  # equal sets: the newer folds into the older
+                dup_id, survivor = (row[0], sid) if row[0] > sid else (sid, row[0])
+            # two flagged rows that name each other yield one proposal, and a
+            # dup id can only fold once (the first, oldest-first, wins).
+            if (dup_id, survivor) not in seen_pairs and dup_id not in seen_dups:
+                seen_pairs.add((dup_id, survivor))
+                seen_dups.add(dup_id)
+                duplicates.append((row[0], sid, ratio, dup_id, survivor))
+            continue  # held out of the CAP either way (the pair is already proposed)
+        if len(queue) < CAP:
             queue.append(row)
     return queue, deferred, duplicates
 
@@ -318,24 +335,50 @@ def live_conflict(conn, fact_id, observed, text, kind=None):
     return hits
 
 
-def duplicate_candidate(siblings):
-    """#1891 — the near-identical sibling, or None.
+_EDGE_PUNCT = re.compile(r"^[\W_]+|[\W_]+$")
 
-    Returns ``(sibling_id, ratio)`` for the highest-overlap sibling when that
-    overlap reaches DUP_THRESHOLD. The caller holds such an item out of the
-    judge CAP exactly like a G5 decision: it is owner-actionable (merge), and
-    re-judging it every run would starve the queue behind it (#1788).
+
+def _norm_tokens(text):
+    """Whitespace tokens with edge punctuation stripped — "필수." and "필수"
+    are the same word for containment purposes (#1898), even though the G3
+    ratio, which must stay identical to nunchi.py's, still sees them apart."""
+    return {t for t in (_EDGE_PUNCT.sub("", w) for w in str(text).split()) if len(t) > 1}
+
+
+def duplicate_candidate(text, siblings):
+    """#1891/#1898 — the near-identical sibling and which side survives, or None.
+
+    Returns ``(sibling_id, ratio, direction)`` with ``direction`` one of
+    ``"fold_item"`` (the flagged item folds into the sibling) or
+    ``"fold_sibling"`` (the sibling folds into the flagged item). The G3 ratio
+    is min-normalised, so 1.00 means "the smaller token set is contained in
+    the larger" — a subset/superset pair, NOT identical text. Folding the
+    superset into the subset loses information, so the survivor is always the
+    superset (measured 2026-09-21: 11 of 22 first-round proposals pointed the
+    wrong way). Equal sets: the newer folds into the older. Pairs above the
+    threshold where neither side contains the other are NOT proposed — they
+    stay in the CAP queue for the judge, as before #1891.
     """
     if not siblings or DUP_THRESHOLD >= 1.0:  # 1.0 = class disabled, every pair judged
         return None
-    sid, _fact, ratio = max(siblings, key=lambda h: h[2])
-    return (sid, ratio) if ratio >= DUP_THRESHOLD else None
+    sid, sfact, ratio = max(siblings, key=lambda h: h[2])
+    if ratio < DUP_THRESHOLD:
+        return None
+    mine, theirs = _norm_tokens(text), _norm_tokens(sfact)
+    if not mine or not theirs:
+        return None
+    if mine == theirs:
+        return (sid, ratio, "tie")
+    if mine <= theirs:
+        return (sid, ratio, "fold_item")
+    if theirs <= mine:
+        return (sid, ratio, "fold_sibling")
+    return None
 
 
-def merge_proposal(fid, sid):
-    """The command the owner runs; the newer row folds into the older one so
-    the surviving id is the one earlier references already point at."""
-    dup, survivor = (fid, sid) if fid > sid else (sid, fid)
+def merge_proposal(dup, survivor):
+    """The command the owner runs. Direction is decided by containment in
+    duplicate_candidate/fetch_queue (#1898); this only formats it."""
     return f"nunchi.py merge {dup} --into {survivor}"
 
 
@@ -1115,11 +1158,11 @@ def build_report(stamp, decisions, clears, humans, applied, backup, deferred=(),
             "## g3-duplicate (merge candidates, held out of the CAP)",
             "",
             f"- near-identical open siblings (overlap >= {DUP_THRESHOLD:.2f}): **{len(duplicates)}** (#1891)",
-            "- a clear would leave two open copies; fold the newer into the older, then clear the survivor's flag:",
+            "- a clear would leave two open copies; the subset folds into the superset (#1898), then clear the survivor's flag:",
             "",
             "```",
         ]
-        lines += [f"{merge_proposal(fid, sid)}  # overlap {ratio:.2f}" for fid, sid, ratio in sample]
+        lines += [f"{merge_proposal(d, sv)}  # overlap {ratio:.2f}" for _fid, _sid, ratio, d, sv in sample]
         if len(duplicates) > len(sample):
             lines.append(f"# ... and {len(duplicates) - len(sample)} more")
         lines.append("```")
@@ -1164,8 +1207,8 @@ def run_single_db():
                 "ts": stamp, "db": DB, "class": "g3-duplicate-backlog",
                 "verdict": "human", "applied": False,
                 "count": len(duplicates),
-                "ids": [fid for fid, _sid, _r in duplicates[:_DEFERRED_SAMPLE]],
-                "proposals": [merge_proposal(fid, sid) for fid, sid, _r in duplicates[:_DEFERRED_SAMPLE]],
+                "ids": [fid for fid, _sid, _r, _d, _s in duplicates[:_DEFERRED_SAMPLE]],
+                "proposals": [merge_proposal(d, sv) for _f, _sid, _r, d, sv in duplicates[:_DEFERRED_SAMPLE]],
                 "rationale": (f"near-identical open sibling (overlap >= {DUP_THRESHOLD:.2f}) —"
                               " merge candidates held out of the CAP (#1891)"),
                 "supersede_proposal": None, "backend": None, "attempts": [],
