@@ -442,6 +442,23 @@ unchanged journal that was already offered") deliberately does not apply to an
 automatic resume — it suppresses a repeated menu, not a different action. With
 the opt-in off, the restart still shows no duplicate menu.
 
+Two native `--task-status` fields are easy to misread next to this feature:
+
+- `recovery.automatic_resume_allowed` is a **constant `false`** — a contract
+  declaration that native Danso never resumes on its own (`long_task.rs`,
+  `docs/architecture.md`: "No automatic resume exists"), not a per-task verdict.
+  The adapter reads it only as a compatibility guard (`danso_worker.py` requires
+  `false`, else the assessment is rejected). The bridge's automatic resume does
+  not contradict it: the restart scan *issues* the same explicit `--resume-task`
+  a user choice would. Per-task resumability is `resume_allowed` alone.
+- `recovery.interrupted_requests` counts provider requests cut off mid-flight
+  (SIGTERM/SIGHUP `signal_termination`, SIGINT `user_stop`, deadlines). Each
+  costs one of `max_interrupted_requests` (3); at three the journal can never
+  be resumed. A forced bridge restart while a request is in flight spends one
+  (soonwook's journal reached 1/3 on 2026-09-21). A cooperative pause
+  (`/task_pause` / SIGUSR1) settles first and spends none. **Pause before you
+  restart** when `workload.turn_occupancy.state` is `occupied` (#1881).
+
 Completed tasks and sessions without a long-task ledger do not trigger startup
 offers. An unreadable, malformed, or actively locked journal produces no advice;
 use `/task_recover` again after the active writer finishes. The current native
