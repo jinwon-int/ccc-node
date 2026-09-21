@@ -36,6 +36,11 @@ unset CCC_NUNCHI_AUDIENCE_SCOPED CCC_NUNCHI_AUDIENCE_ROOT CCC_NUNCHI_SCOPED_CHIL
 # own process environment only.
 unset TYPESAFE_API_KEY NUNCHI_JUDGE_MIN_CONFIDENCE
 export TYPESAFE_API_KEY_FILE="$TMP/no-such-key-file"
+# #1891: the legacy sections below seed IDENTICAL sibling pairs to drive the
+# judge path. With the g3-duplicate class on (default threshold 0.85) such a
+# pair is a merge candidate and never reaches a judge, so the class is
+# disabled here (1.0) and exercised explicitly in section 14.
+export NUNCHI_G3_DUP_THRESHOLD=1.0
 
 # Default judge stubs: unavailable. Both names are always shadowed so auto
 # fallback can never escape to a real host CLI/provider during the suite.
@@ -301,6 +306,49 @@ ok "same-text different-kind item is not a conflict candidate" '[ "$(review_of "
 ok "lonely cross-session item still clears deterministically" '[ "$(review_of "$idx4")" = 0 ]'
 ok "cross-session conflict entered judge while only the lonely item auto-cleared" \
   '[ "$(grep -c '\''"class": "judge"'\'' "$NUNCHI_HOME/judge-audit.jsonl")" = 1 ] && [ "$(grep -c '\''"class": "deterministic-clear"'\'' "$NUNCHI_HOME/judge-audit.jsonl")" = 1 ]'
+
+# ---- 14. #1891 g3-duplicate: near-identical siblings are merge candidates ----
+reset_db
+cat >"$TMP/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+echo called >>"$JUDGE_CALLS"
+printf '%s\n' '{"verdict":"clear","rationale":"duplicate restatement","supersede_proposal":null}'
+STUB
+chmod +x "$TMP/bin/claude"
+export JUDGE_CALLS="$TMP/judge-calls"; : >"$JUDGE_CALLS"
+# identical pair: flagged newcomer + older open sibling
+# shellcheck disable=SC2034
+idd1="$(seed dungae "배포 전 스모크는 항상 스테이징에서 먼저 돌린다" "$OLD" 1 0 dd1)"
+# shellcheck disable=SC2034
+idd2="$(seed dungae "배포 전 스모크는 항상 스테이징에서 먼저 돌린다" "$OLD" 1 1 dd2)"
+# partial pair (~0.67): flagged newcomer must still reach the judge
+# shellcheck disable=SC2034
+idp1="$(seed dungae "롤백은 태그 기준으로 수행하고 로그를 남긴다" "$OLD" 1 0 dp1)"
+# shellcheck disable=SC2034
+idp2="$(seed dungae "롤백은 태그 기준으로 수행하고 오너에게 보고한다" "$OLD" 1 1 dp2)"
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_G3_DUP_THRESHOLD=0.85)"
+ok "identical pair is held out of the CAP as a g3-duplicate (no judge call for it)" \
+  '[ "$(grep -c called "$JUDGE_CALLS")" = 1 ]'
+ok "g3-duplicate flag is NOT cleared even under APPLY (owner merges instead)" '[ "$(review_of "$idd2")" = 1 ]'
+ok "g3-duplicate is audited once as an aggregate with a merge proposal" \
+  'grep -q "\"class\": \"g3-duplicate-backlog\"" "$NUNCHI_HOME/judge-audit.jsonl" && grep -q "nunchi.py merge $idd2 --into $idd1" "$NUNCHI_HOME/judge-audit.jsonl"'
+ok "report lists the merge command (newer folds into older)" \
+  'grep -q "nunchi.py merge $idd2 --into $idd1" "$CCC_STATE_DIR/nunchi-review-report.md"'
+ok "run line states the g3-duplicate count" 'printf "%s" "$out" | grep -q "1 g3-duplicate"'
+ok "partial-overlap pair still goes to the judge and clears" '[ "$(review_of "$idp2")" = 0 ]'
+# threshold 1.0 disables the class: the identical pair is judged like before
+reset_db
+: >"$JUDGE_CALLS"
+# shellcheck disable=SC2034
+ide1="$(seed dungae "머지 전 CI 그린을 확인한다" "$OLD" 1 0 de1)"
+# shellcheck disable=SC2034
+ide2="$(seed dungae "머지 전 CI 그린을 확인한다" "$OLD" 1 1 de2)"
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_G3_DUP_THRESHOLD=1.0)"
+ok "threshold 1.0 disables g3-duplicate (identical pair judged)" \
+  '[ "$(grep -c called "$JUDGE_CALLS")" = 1 ] && [ "$(review_of "$ide2")" = 0 ] && ! grep -q "g3-duplicate" "$CCC_STATE_DIR/nunchi-review-report.md"'
+ok "default threshold is 0.85 when the knob is unset" \
+  '[ "$(env -u NUNCHI_G3_DUP_THRESHOLD python3 -c "import importlib.util,sys;sys.argv=[\"x\"];spec=importlib.util.spec_from_file_location(\"jb\",\"$JB\");m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);print(m.DUP_THRESHOLD)")" = 0.85 ]'
 
 # ---- 11. Codex adapter: isolated strict-output fallback (#1278) ------------
 reset_db
