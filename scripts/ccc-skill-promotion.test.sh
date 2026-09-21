@@ -1207,6 +1207,10 @@ assert isinstance(task2, dict)
 ssh_calls = open(os.environ["RB_STATE"] + "/ssh-calls").read()
 assert "s3cret-value" not in ssh_calls, "edge secret leaked into ssh argv"
 assert "/remote/edge-secret" in ssh_calls
+# #1884: the local curl branch is just as exposed via /proc/<pid>/cmdline.
+curl_calls = open(os.environ["RB_STATE"] + "/curl-calls").read()
+assert "/tasks/rv-y" in curl_calls, curl_calls
+assert "s3cret-value" not in curl_calls, "edge secret leaked into curl argv"
 print("RB-ROUTING-OK")
 FIXTURE
 env "${base_env[@]}" CCC_SKILL_PROMOTION_REMOTE_BROKERS="$RB_JSON" PATH="$BIN:$PATH" RB_STATE="$RB_STATE" \
@@ -1215,6 +1219,31 @@ ok "remote broker parse, reviewer fallthrough, and task routing (#2024)" \
   '[ "$rc" = 0 ] && grep -q "RB-PARSE-OK" "$RB_STATE/out" && grep -q "RB-ROUTING-OK" "$RB_STATE/out"'
 ok "reviewer is drawn at random over the eligible set, with an operator pin" \
   '[ "$rc" = 0 ] && grep -q "RB-RANDOM-OK" "$RB_STATE/out"'
+
+# ─── #1884: the edge secret rides a 0600 header file, never curl argv ──────
+EDGE_FIXTURE="$TMP/edge-header-fixture.py"
+cat > "$EDGE_FIXTURE" <<'FIXTURE'
+import importlib.util, os, stat, sys
+spec = importlib.util.spec_from_file_location("csp_edge", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["csp_edge"] = m
+spec.loader.exec_module(m)
+
+with m._edge_secret_header("s3cret-value") as header_argv:
+    assert header_argv[0] == "--header", header_argv
+    assert header_argv[1].startswith("@"), header_argv
+    header_path = header_argv[1][1:]
+    # The argv carries only the file path — the /proc/<pid>/cmdline surface.
+    assert "s3cret-value" not in " ".join(header_argv), header_argv
+    assert stat.S_IMODE(os.stat(header_path).st_mode) == 0o600, oct(os.stat(header_path).st_mode)
+    with open(header_path, encoding="utf-8") as stream:
+        assert stream.read() == "x-a2a-edge-secret: s3cret-value\n"
+assert not os.path.exists(header_path), "header file survives the request block"
+print("EDGE-HEADER-OK")
+FIXTURE
+env "${base_env[@]}" python3 "$EDGE_FIXTURE" "$PROMOTER" > "$TMP/edge-out" 2>&1; rc=$?
+ok "#1884: edge secret travels via a 0600 header file, gone after the request" \
+  '[ "$rc" = 0 ] && grep -q "EDGE-HEADER-OK" "$TMP/edge-out"'
 
 # The mirrored reviewer actually lands in the dispatch manifest (no local
 # dispatch here — the routing unit above covers broker selection).

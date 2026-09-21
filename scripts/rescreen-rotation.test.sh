@@ -31,6 +31,8 @@ chmod 700 "$BIN" "$TMP/home" "$TMP/home/.claude" "$TMP/home/.claude/state" "$TMP
 cat > "$BIN/curl" <<STUB
 #!/usr/bin/env bash
 set -eu
+# $* is the argv — exactly what a /proc/<pid>/cmdline reader would see.
+printf '%s\n' "\$*" >> "\${CURL_LOG:-/dev/null}"
 url=""
 for argument in "\$@"; do case "\$argument" in http*) url="\$argument";; esac; done
 case "\$url" in
@@ -113,7 +115,7 @@ STUB
 chmod +x "$BIN/gh"
 
 run_tool() { # $1 extra args...; outputs summary JSON
-  env "${BASE_ENV[@]}" PATH="$BIN:$PATH" A2A_EDGE_SECRET=test-secret TMP="$TMP" HEAD_OK="$HEAD_OK" \
+  env "${BASE_ENV[@]}" PATH="$BIN:$PATH" A2A_EDGE_SECRET=test-secret TMP="$TMP" HEAD_OK="$HEAD_OK" CURL_LOG="$TMP/curl-calls.log" \
     CCC_SKILL_PROMOTION_REMOTE_BROKERS='[{"name":"t2","ssh_host":"t2stub","broker_url":"http://127.0.0.1:8787","nexus_dir":"/n","secret_cmd":"echo remote-secret"}]' \
     python3 "$TOOL" --cases "$TMP/cases.json" "$@"
 }
@@ -145,6 +147,12 @@ ok "pool excludes the recent-failure node with a recorded reason" \
   '[ "$(jq -r ".exclusions[] | select(.node==\"failnode\") | .reason" <<<"$out1" | grep -c "task.failed")" != "0" ]'
 ok "pool records provider/model per reviewer (#2028)" \
   '[ "$(jq -r ".pool[] | select(.node==\"betarev\") | .provider" <<<"$out1")" = "xai" ]'
+# #1884: the edge secret must be absent from curl argv (/proc/<pid>/cmdline);
+# the stub log records exactly the argv each request ran with.
+ok "edge secret is absent from curl argv (#1884)" \
+  '[ -s "$TMP/curl-calls.log" ] && ! grep -q "test-secret" "$TMP/curl-calls.log"'
+ok "curl authenticates via --header @0600file, not an inline -H (#1884)" \
+  'grep -q -- "--header @" "$TMP/curl-calls.log" && ! grep -q -- " -H " "$TMP/curl-calls.log"'
 
 # Author exclusion: skill-a author (authorx) must not review its own skill,
 # and the recent-failure node is never chosen.
