@@ -67,10 +67,15 @@ KST = dt.timezone(dt.timedelta(hours=9))
 EXIT_NOT_CONFIGURED = 3
 
 # Paragraph must mention a timed test before a date in it counts as a deadline.
+#
+# "deadline" must stand alone: as part of an identifier or path it is this
+# scanner's own name (`timed_test_deadline_scan.py`,
+# `timed-test-deadline-scan.repos`), and any issue that quotes the command
+# next to a timestamp — ccc-node#1873 did — became a high-confidence finding.
 DEADLINE_KEYWORD = re.compile(
     r"(종료\s*(일시|시각|예정|시점)"
     r"|관측\s*종료|테스트\s*종료|검증\s*종료|예정\s*종료"
-    r"|deadline|observation\s+window|planned\s+end)",
+    r"|(?<![\w./-])deadline(?![\w./-])|observation\s+window|planned\s+end)",
     re.IGNORECASE,
 )
 

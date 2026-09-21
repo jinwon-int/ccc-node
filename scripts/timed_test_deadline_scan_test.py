@@ -205,6 +205,25 @@ class ExpiredModeTests(unittest.TestCase):
         issue = _issue(body="2026-09-01 에 리팩터링을 시작했다.")
         self.assertIsNone(scanner.judge_issue(issue, NOW, "expired"))
 
+    def test_scanner_file_name_is_not_a_deadline_keyword(self) -> None:
+        # ccc-node#1873 quoted the scan command next to its run time and the
+        # "deadline" inside timed_test_deadline_scan.py matched the English
+        # keyword, making the precision issue itself a high-confidence finding.
+        issue = _issue(
+            number=1873,
+            body=(
+                "실행: 2026-09-21 11:06 KST, `python3 scripts/timed_test_deadline_scan.py "
+                "--repos-file ~/.claude/timed-test-deadline-scan.repos --mode expired` (22초)"
+            ),
+        )
+        self.assertIsNone(scanner.judge_issue(issue, NOW, "expired"))
+
+    def test_english_deadline_word_still_counts(self) -> None:
+        issue = _issue(body="Deadline: 2026-09-17 07:32 KST, judged by gwakga.")
+        finding = scanner.judge_issue(issue, NOW, "expired")
+        assert finding is not None
+        self.assertEqual(finding.confidence, "high")
+
     def test_latest_deadline_wins_when_a_window_was_extended(self) -> None:
         issue = _issue(
             comments=[
