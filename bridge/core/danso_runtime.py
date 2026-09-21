@@ -432,6 +432,9 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
         if settings.danso_base_url:
             environment["DANSO_OPENAI_BASE_URL"] = settings.danso_base_url
         provider, journals = "openai", "journals"
+    if settings.danso_provider_stream:
+        # danso #109: provider SSE is opt-in via the child's environment (#1913).
+        environment["DANSO_PROVIDER_STREAM"] = "1"
     # Issue #70: the default model follows the auth mode. An explicitly
     # configured CCC_DANSO_MODEL always wins.
     model = settings.danso_model
