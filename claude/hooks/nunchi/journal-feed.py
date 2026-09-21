@@ -36,10 +36,11 @@ def run(home, bot):
     try:
         try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError: return {'skipped':'locked'}
-        receipt=home/'journal-receipts.jsonl';seen=failed=unrouted=0
+        receipt=home/'journal-receipts.jsonl';seen=failed=unrouted=budgeted=0
         files=sorted(list((bot/'distill-journal').glob('*.json'))+list((bot/'danso-distill-journal').glob('*.json')),key=lambda p:p.name)
         for path in files:
-            if seen+failed>=20:break
+            if budgeted>=20:break
+            fp=None
             try:
                 key,fp,_=r.fingerprint(path)
                 import contextlib,io
@@ -47,6 +48,7 @@ def run(home, bot):
                     due=r.main(['due',str(receipt),str(path)])
                 if due==3:continue
                 if due!=0:raise ValueError('receipt_failed')
+                budgeted+=1
                 with os.fdopen(r.private_open(path,os.O_RDONLY)) as f:
                     if os.fstat(f.fileno()).st_size>2*1024*1024:raise ValueError('oversize_job')
                     job=json.load(f)
@@ -66,15 +68,12 @@ def run(home, bot):
                 subprocess.run(['python3',str(HERE/'nunchi.py'),'snapshot','--limit','25'],env=env,capture_output=True,timeout=30,check=True)
                 if r.main(['stored',str(receipt),str(path),fp])!=0:raise ValueError('changed_job')
                 seen+=1
-            except ValueError as e:
-                if str(e)=='unrouted':unrouted+=1
-                else:
-                    failed+=1
-                    if 'fp' in locals():r.main(['failed',str(receipt),str(path),fp])
-            except (OSError,KeyError,TypeError,subprocess.SubprocessError):
-                failed+=1
-                try:r.main(['failed',str(receipt),str(path),fp])
-                except (OSError,ValueError):pass
+            except (OSError,ValueError,KeyError,TypeError,subprocess.SubprocessError) as e:
+                if isinstance(e,ValueError) and str(e)=='unrouted':unrouted+=1
+                else:failed+=1
+                if fp is not None:
+                    try:r.main(['failed',str(receipt),str(path),fp])
+                    except (OSError,ValueError,TypeError):pass
         status={'schema':'ccc.nunchi.journal-feed.v1','finished_at':int(time.time()),'mirrored_jobs':seen,'failed':failed,'unrouted':unrouted}
         # Atomic status replacement with a unique owned scratch file.
         import tempfile

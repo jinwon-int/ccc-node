@@ -54,6 +54,7 @@ class Pipeline(unittest.TestCase):
   jobs=self.bot/'distill-journal';jobs.mkdir(mode=0o700)
   for i in range(20):
    f=jobs/f'{i:02}.json';f.write_text('{bad');f.chmod(0o600)
+  (jobs/'yy.json').symlink_to(self.file('outside','{}'))
   p=jobs/'zz.json';p.write_text(json.dumps({'memory_audience':'private','memory_scope':scope,'status':'extraction_done','thread_id':'fixture','updated_at':'2026-09-22T00:00:00Z','extraction_output':{'honcho':[]}}));p.chmod(0o600)
   self.assertEqual(j.run(self.home,self.bot)['failed'],20)
   self.assertEqual(j.run(self.home,self.bot)['mirrored_jobs'],1)
