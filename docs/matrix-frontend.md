@@ -223,3 +223,15 @@ evidence-first continue) through a few channel ports:
   provider turn outside the transport's single-turn discipline, so
   `CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME` has no effect on Matrix until the
   transport gains a self-job seam (#1895 PR-A2). Answer `1` after a restart.
+
+## health.json for the Matrix frontend
+
+The Matrix unit writes `<BOT_DATA_DIR>/health.json` and `bot.pid` like the
+Telegram bridge: bound to its own data dir at startup, `service`/`agent` marked
+on start and stop, and a 10 s tick that records transport liveness (the
+`telegram` block means the Matrix sync transport in this file) plus the in-flight
+workload (`workload.turn_occupancy`, `active_requests`, `waiting_for_turn`).
+Before this, the shared handler only recorded *turn* events, so an idle frontend
+left the file frozen at its last turn and fleet freshness checks could not tell
+idle from dead (observed 2026-09-21 on two nodes, stale since 09-19).
+

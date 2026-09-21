@@ -60,6 +60,7 @@ from telegram_bot.core.session_scope import storage_key
 from telegram_bot.core.turn_watchdog import DEFAULT_NOTIFY_MINUTES, TurnAgeWatchdog
 from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE
+from telegram_bot.utils.health import health_reporter
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ SUPPORTED_COMMANDS = frozenset(
 )
 _STATUS_HANDLE = 1
 STATUS_MIN_INTERVAL_S = 15.0  # match Telegram CCC_HEARTBEAT_* defaults
+_HEALTH_INTERVAL_S = 10.0  # match bot_lifecycle._WORKLOAD_INTERVAL
 _RUNTIME_MODEL_PROVIDERS = frozenset({"codex", "piri", "crush", "danso"})
 _EFFORT_PROVIDERS = frozenset({"codex", "piri", "danso"})
 _CLAUDE_MODELS: tuple[tuple[str, str], ...] = (
@@ -481,29 +483,35 @@ class MatrixBot(DansoRecoveryMixin):
                 logger.info("Matrix frontend initialised a new bot device; start again without CCC_MATRIX_INITIALIZE")
                 return
             self._post_startup_banner(config, transport)
+            self._start_health_reporting()
             await self._startup_danso_recovery_scan()
             notifier = MatrixSpoolNotifier(self._settings, transport)
             watchdog = self._build_turn_age_watchdog()
-            if not notifier.enabled and watchdog is None:
-                await transport.run()
-            else:
-                # Same TaskGroup semantics as transport.run(): a leg that dies
-                # stops the service so systemd restarts it whole.
-                stop = asyncio.Event()
+            # Same TaskGroup semantics as transport.run(): a leg that dies
+            # stops the service so systemd restarts it whole.
+            stop = asyncio.Event()
+            try:
                 async with asyncio.TaskGroup() as group:
-                    # The watchdog loops until its stop event is set, and a
-                    # TaskGroup only cancels siblings when a leg raises — a
+                    # The watchdog/health loops run until the stop event is set,
+                    # and a TaskGroup only cancels siblings when a leg raises — a
                     # transport that returns *cleanly* would otherwise leave the
-                    # group waiting on the watchdog forever. Setting the event
-                    # from the transport leg's finally keeps shutdown finite on
-                    # both paths.
+                    # group waiting forever. Setting the event from the transport
+                    # leg's finally keeps shutdown finite on both paths.
                     group.create_task(self._run_until_stop(transport.run(), stop))
+                    group.create_task(self._health_reporter_loop(stop), name="matrix-health-reporter")
                     if notifier.enabled:
                         group.create_task(notifier.run())
                     if watchdog is not None:
                         group.create_task(watchdog.run(stop), name="matrix-turn-age-watchdog")
+            except BaseExceptionGroup as failure:
+                # A single failing leg (normally the transport) surfaces as itself,
+                # as it did when the transport was awaited directly.
+                if len(failure.exceptions) == 1:
+                    raise failure.exceptions[0] from None
+                raise
         finally:
             self._transport = None
+            self._stop_health_reporting()
             await transport.close()
 
     @staticmethod
@@ -514,6 +522,60 @@ class MatrixBot(DansoRecoveryMixin):
             await leg
         finally:
             stop.set()
+
+    # -- health.json (#1895 follow-up) ----------------------------------------
+    #
+    # The Telegram bridge writes ``<bot_data_dir>/health.json`` from its
+    # lifecycle (startup marks, a 10s workload tick, per-turn agent marks). The
+    # shared handler only records *turn* events, so an idle Matrix frontend left
+    # ``health.json`` frozen at its last turn (observed 2026-09-21: two nodes
+    # stale since 09-19) and fleet freshness checks could not tell "idle" from
+    # "dead". Bind the reporter to *this* frontend's data dir and run the same
+    # tick. In a Matrix data dir the ``telegram`` block means the Matrix sync
+    # transport; ``bot.pid`` is this process.
+
+    def _start_health_reporting(self) -> None:
+        try:
+            health_reporter.bind(self._data_dir(), agent_provider=self._active_provider())
+            health_reporter.initialize_process()
+            health_reporter.mark_starting("matrix frontend syncing")
+            # Telegram marks the agent healthy once its provider probe passes at
+            # startup; the Matrix frontend shares that runtime and start-up gate.
+            health_reporter.record_agent_ok()
+        except Exception:
+            logger.warning("Matrix health reporter start failed", exc_info=True)
+
+    def _stop_health_reporting(self) -> None:
+        try:
+            health_reporter.mark_unavailable("matrix frontend stopped")
+        except Exception:
+            logger.debug("Matrix health reporter stop mark failed", exc_info=True)
+
+    def _workload_snapshot(self, now: float) -> tuple[int, float, int]:
+        snapshot = getattr(self._project_chat, "workload_snapshot", None)
+        if callable(snapshot):
+            count, oldest = snapshot(now)
+        else:
+            count, oldest = (1, 0.0) if getattr(self._transport, "active", None) else (0, 0.0)
+        waiting = getattr(self._project_chat, "waiting_for_turn_snapshot", None)
+        return int(count), float(oldest), int(waiting()) if callable(waiting) else 0
+
+    async def _health_reporter_loop(self, stop: asyncio.Event) -> None:
+        """Publish transport liveness and in-flight workload every ``_HEALTH_INTERVAL_S``."""
+
+        while not stop.is_set():
+            try:
+                count, oldest, waiting = self._workload_snapshot(asyncio.get_running_loop().time())
+                health_reporter.record_telegram_ok()
+                health_reporter.record_workload(count, oldest, waiting_for_turn=waiting)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Matrix health tick failed: %s", type(exc).__name__)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=_HEALTH_INTERVAL_S)
+            except asyncio.TimeoutError:
+                continue
 
     def startup_banner(self) -> str:
         """One-line "frontend is up" notice: node · provider · model · effort · rev.
