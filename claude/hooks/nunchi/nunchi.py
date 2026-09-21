@@ -331,6 +331,30 @@ def _tokens(text):
     return {w for w in str(text).split() if len(w) > 1}
 
 
+# Issue / PR numbers as written in fleet prose: "#1941", "PR #1941", "PR#1941",
+# "이슈 #1504". Only the number is kept; the prefix is decoration.
+_IDENT = re.compile(r"#\s?(\d{1,7})\b")
+
+
+def _identifiers(text):
+    return set(_IDENT.findall(str(text or "")))
+
+
+def _different_work(old_text, new_text):
+    """#1890 — both sentences name issue/PR numbers and share none.
+
+    Shared by the live G1 (_update_supersede) and the retro G1 (review_stale)
+    so the two paths cannot drift apart again: a completion about PR #1942
+    must never close the in-flight fact about PR #1941, whatever the token
+    overlap of a shared approval-phrase template says.
+    """
+    new_ids = _identifiers(new_text)
+    if not new_ids:
+        return False
+    old_ids = _identifiers(old_text)
+    return bool(old_ids) and new_ids.isdisjoint(old_ids)
+
+
 # Mutable operational-state patterns (#1010). Commit SHAs, systemd status
 # counters/phrases, and "back to normal" claims are live-check targets
 # (CLAUDE.md), not durable memory: they age into wrong values and re-fire
@@ -528,7 +552,14 @@ _SOURCE_RANK = {"user-stated": 3, "measured": 2, "inferred": 1}
 # G5 (#1264) — an inline reason marker makes a decision self-contained even
 # without the structured `because` field (the Claude lane historically embeds
 # the reason in the sentence; both forms satisfy the gate).
-_REASON_INLINE = re.compile(r"때문|근거|이유|덕분|위해|목적")
+#
+# #1892: the causal endings "~(으)므로" and "~라서" carry the reason too —
+# measured on yukson 2026-09-21, 56 of 511 G5-backlog decisions used "~므로"
+# and every sampled one stated a real reason. Sequence markers ("→", "~해서")
+# are deliberately NOT here: they mark order, not cause, and because a G5
+# false "has reason" can never be auto-cleared it would hide the gap forever.
+# "위한" joins "위해" (same purpose marker, different inflection).
+_REASON_INLINE = re.compile(r"때문|근거|이유|덕분|위해|위한|목적|(?:으)?므로|라서")
 _DECISION_REASON_CONTRACT = "required-v1"
 
 
@@ -607,6 +638,9 @@ def _update_supersede(c, pool, observed, text, new_rank):
         if not _PROGRESS.search(fact) or (old_rank or 1) > new_rank:
             continue
         if not old:
+            continue
+        # #1890 (measured: yukson #968 "PR #1941" closed by #1010 "PR #1942").
+        if _different_work(fact, text):
             continue
         ratio = len(new & old) / min(len(new), len(old))
         if ratio > best_ratio:
@@ -1716,6 +1750,8 @@ def review_stale(do_close):
             old = _tokens(fact)
             for nfid, _o2, nfact, nrank in facts[i + 1:]:
                 if not _DONE.search(nfact) or (nrank or 1) < (rank or 1):
+                    continue
+                if _different_work(fact, nfact):  # #1890, same guard as live G1
                     continue
                 newt = _tokens(nfact)
                 if old and newt and len(old & newt) / min(len(old), len(newt)) >= 0.4:

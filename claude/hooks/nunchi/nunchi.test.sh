@@ -585,6 +585,39 @@ gpayload s90c observation session "PR #12 배포 완료" | NUNCHI_DB="$GDB" pyth
 ok "G1 matches across session peers" \
   'gq "SELECT valid_to IS NOT NULL FROM peer_facts WHERE fact LIKE \"%배포 승인 대기%\"" | grep -q "(1,)"'
 
+# G1 identifier guard (#1890): a completion that names a DIFFERENT PR/issue
+# number must not close the in-flight fact even when the shared approval-phrase
+# template pushes token overlap past 0.4 (measured: #968 "PR #1941" closed by
+# #1010 "PR #1942" on yukson, 2026-09-21).
+gpayload s90d context session "PR #1941 CI 결과 대기 중 — 승인 문구 '승인: PR #1941 교차계정 리뷰+머지'" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+gpayload s90e observation session "PR #1942 머지 완료 — 승인 문구 '승인: PR #1942 교차계정 리뷰+머지'" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G1 does not close a fact that names a different PR number" \
+  'gq "SELECT valid_to FROM peer_facts WHERE fact LIKE \"%PR #1941 CI 결과 대기%\"" | grep -q "(None,)"'
+ok "G1 leaves no supersedes link when identifiers disagree" \
+  'gq "SELECT supersedes FROM peer_facts WHERE fact LIKE \"%PR #1942 머지 완료%\"" | grep -q "(None,)"'
+# ...while a matching identifier still closes (the guard only blocks disjoint sets)
+gpayload s90f context session "PR #77 리뷰 진행 중, 승인 대기" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+gpayload s90g observation session "PR #77 머지 완료, 승인 확인" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G1 still closes when the PR numbers match" \
+  'gq "SELECT valid_to IS NOT NULL FROM peer_facts WHERE fact LIKE \"%PR #77 리뷰 진행%\"" | grep -q "(1,)"'
+
+# G5 connectives (#1892): Korean causal endings that carry the reason inline
+# (measured on yukson 2026-09-21: 56 of 511 G5-backlog decisions use "~므로",
+# every sampled one a real reason). Sequence markers ("→", "~해서") stay out —
+# they mark order, not cause, and a false "has reason" would hide the gap forever.
+gpayload s93 decision user "PR #1043은 저자가 seoseo-ai이므로 Direction B로 리뷰한다" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G5 accepts ~므로 as an inline reason" \
+  'gq "SELECT review FROM peer_facts WHERE fact LIKE \"%seoseo-ai이므로%\"" | grep -q "(0,)"'
+gpayload s93 decision user "H1과 H2는 clock 요구가 전부 달라서 병렬로 진행하기로 한다" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G5 accepts ~라서 as an inline reason" \
+  'gq "SELECT review FROM peer_facts WHERE fact LIKE \"%전부 달라서%\"" | grep -q "(0,)"'
+gpayload s93 decision user "PR #1044 리뷰 담당은 nosuk로 한다" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G5 still flags a decision with no reason in either channel" \
+  'gq "SELECT review FROM peer_facts WHERE fact LIKE \"%리뷰 담당은 nosuk로%\"" | grep -q "(1,)"'
+gpayload s93 decision user "설정 파일을 수정해서 배포 순서를 A로 한다" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G5 does not treat the sequence ending ~해서 as a reason" \
+  'gq "SELECT review FROM peer_facts WHERE fact LIKE \"%수정해서 배포 순서%\"" | grep -q "(1,)"'
+
 # G2: verified quote earns the claimed rank; unverifiable claim demotes + review
 TR="$TMP/gate-transcript.jsonl"
 printf '{"type":"user","message":{"content":"등애는 절대 원격 삭제 금지라고 했다"}}\n' > "$TR"
@@ -699,6 +732,12 @@ ok "review-stale lists the retro candidate without closing" \
 NUNCHI_DB="$GDB" python3 "$NP" review-stale --close >/dev/null
 ok "review-stale --close closes the stale fact" \
   'gq "SELECT valid_to FROM peer_facts WHERE fact LIKE \"%분석 실행 중%\"" | grep -qv "(None,)"'
+# retro G1 shares the #1890 identifier guard: the earlier PR #1941 in-flight
+# fact (left open by the live guard above) must not become a stale candidate
+# because of the PR #1942 completion.
+out="$(NUNCHI_DB="$GDB" python3 "$NP" review-stale)"
+ok "review-stale does not pair facts about different PR numbers" \
+  '! grep -q "PR #1941" <<<"$out" && gq "SELECT valid_to FROM peer_facts WHERE fact LIKE \"%PR #1941 CI 결과 대기%\"" | grep -q "(None,)"'
 
 # metrics: body-free counters present
 out="$(NUNCHI_DB="$GDB" python3 "$NP" metrics)"
