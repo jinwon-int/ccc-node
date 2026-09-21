@@ -30,6 +30,22 @@ def sent_texts(bot):
     return [c.kwargs['text'] for c in bot.application.bot.send_message.await_args_list]
 
 
+def is_menu_kwargs(kwargs):
+    """Recovery choice menu: numbered text (default) or inline buttons."""
+    if kwargs.get('reply_markup') is not None:
+        return True
+    return '번호로 답해' in (kwargs.get('text') or '')
+
+
+def assert_last_is_menu(bot):
+    assert is_menu_kwargs(bot.application.bot.send_message.await_args.kwargs)
+
+
+def assert_no_menu_sends(bot):
+    assert all(not is_menu_kwargs(c.kwargs)
+               for c in bot.application.bot.send_message.await_args_list)
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize('state', ['paused', 'ready'])
 async def test_restart_auto_resumes_resumable_task_through_explicit_path(tmp_path, state):
@@ -49,7 +65,7 @@ async def test_restart_auto_resumes_resumable_task_through_explicit_path(tmp_pat
     # the user gets the menu instead.
     await bot._recover_danso_tasks(bot.application)
     handler.process_message.assert_awaited_once()
-    assert bot.application.bot.send_message.await_args.kwargs['reply_markup'] is not None
+    assert_last_is_menu(bot)
     assert (await manager.get_session('7:9'))[OFFER]['token']
 
 
@@ -63,7 +79,7 @@ async def test_restart_keeps_menu_for_every_non_resumable_state(tmp_path, state,
     await bot._recover_danso_tasks(bot.application)
     handler.process_message.assert_not_awaited()
     assert bot.application.bot.send_message.await_count == 1
-    assert bot.application.bot.send_message.await_args.kwargs['reply_markup'] is not None
+    assert_last_is_menu(bot)
     assert (await manager.get_session('7:9'))[OFFER]['token']
 
 
@@ -72,7 +88,7 @@ async def test_opt_in_off_keeps_menu_even_when_resumable(tmp_path):
     bot, manager, handler = await auto_bot(tmp_path, 'paused', True, enabled=False)
     await bot._recover_danso_tasks(bot.application)
     handler.process_message.assert_not_awaited()
-    assert bot.application.bot.send_message.await_args.kwargs['reply_markup'] is not None
+    assert_last_is_menu(bot)
 
 
 @pytest.mark.anyio
@@ -81,7 +97,7 @@ async def test_task_recover_and_post_failure_offers_never_auto_resume(tmp_path):
     assert await bot._offer_danso_recovery('7:9', 7, 9, force=True)  # /task_recover path
     await bot._offer_danso_recovery_if_failed(SimpleNamespace(success=False), '7:9', 7, 9)
     handler.process_message.assert_not_awaited()
-    assert all(c.kwargs['reply_markup'] is not None
+    assert all(is_menu_kwargs(c.kwargs)
                for c in bot.application.bot.send_message.await_args_list)
 
 
@@ -92,7 +108,7 @@ async def test_failed_auto_resume_falls_back_to_menu_without_looping(tmp_path):
     await bot._recover_danso_tasks(bot.application)
     handler.process_message.assert_awaited_once()
     last = bot.application.bot.send_message.await_args.kwargs
-    assert last['reply_markup'] is not None  # post-failure offer is a menu, not another resume
+    assert is_menu_kwargs(last)  # post-failure offer is a menu, not another resume
     assert (await manager.get_session('7:9'))[OFFER]['token']
 
 
@@ -136,7 +152,7 @@ async def test_stale_lock_failure_retries_once_after_delay_then_succeeds(tmp_pat
     assert handler.inspect_danso_recovery.await_count >= 2  # re-inspected before retrying
     texts = sent_texts(bot)
     assert AUTO_RESUME_RETRY_NOTICE.format(delay=7) in texts
-    assert all(c.kwargs.get('reply_markup') is None for c in bot.application.bot.send_message.await_args_list)
+    assert_no_menu_sends(bot)
     bot._send_smart.assert_awaited_once_with(9, 'done')  # first failure text is not delivered
     assert OFFER not in await manager.get_session('7:9')
 
@@ -148,7 +164,7 @@ async def test_second_failure_gets_menu_and_never_a_third_attempt(tmp_path, monk
     handler.process_message.side_effect = [session_failure(), session_failure()]
     await bot._recover_danso_tasks(bot.application)
     assert handler.process_message.await_count == 2
-    assert bot.application.bot.send_message.await_args.kwargs['reply_markup'] is not None
+    assert_last_is_menu(bot)
     assert (await manager.get_session('7:9'))[OFFER]['token']
 
 
@@ -176,7 +192,7 @@ async def test_no_retry_when_code_delay_or_journal_disqualify(tmp_path, monkeypa
     await bot._recover_danso_tasks(bot.application)
     assert handler.process_message.await_count == 1
     assert (slept == []) == (why in {'other_code', 'delay_zero'})
-    assert bot.application.bot.send_message.await_args.kwargs['reply_markup'] is not None  # menu fallback
+    assert_last_is_menu(bot)  # menu fallback
 
 
 @pytest.mark.anyio
@@ -208,7 +224,7 @@ async def test_restart_auto_resumes_even_when_menu_was_offered_before_restart(tm
     handler.process_message.assert_awaited_once()
     assert handler.process_message.call_args.kwargs['resume_task'] is True
     assert OFFER not in await manager.get_session('7:9')
-    assert all(c.kwargs.get('reply_markup') is None for c in bot.application.bot.send_message.await_args_list)
+    assert_no_menu_sends(bot)
 
 
 @pytest.mark.anyio
