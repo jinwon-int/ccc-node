@@ -242,6 +242,27 @@ class TestStore:
         with pytest.raises(ValueError, match="closed"):
             s.token()
 
+    def test_self_job_is_an_ordinary_idempotent_queued_job(self, tmp_path: Path) -> None:
+        with Store(tmp_path / "state", BOT) as s:
+            event = s.self_job(ROOM, OWNER, '{"kind":"x"}', key="k1")
+            assert event.startswith("$self-") and len(event) == len("$self-") + 40
+            assert s.self_job(ROOM, OWNER, '{"kind":"x"}', key="k1") == event  # same key+body: no-op
+            with pytest.raises(SafetyStop, match="self-job-identity-conflict"):
+                s.self_job(ROOM, OWNER, '{"kind":"y"}', key="k1")
+            with pytest.raises(ValueError, match="invalid self-job route"):
+                s.self_job("not-a-room", OWNER, "{}", key="k2")
+            # Same scope as the owner's own messages: strictly serialised with them
+            # in queue order (the self-job was queued first here).
+            s.accept_batch([request("$msg")], "token")
+            job = s.claim()
+            assert job is not None and job["event_id"] == event and job["sender"] == OWNER
+            assert job["scope"] == request("$msg").scope
+            assert s.claim() is None  # the owner's message waits behind it
+            s.finish(event, "", None)
+            following = s.claim()
+            assert following is not None and following["event_id"] == "$msg"
+            s.finish("$msg", "", None)
+
     def test_crash_during_execution_is_uncertain_and_blocks_only_same_scope(self, tmp_path: Path) -> None:
         directory = tmp_path / "state"
         with Store(directory, BOT) as s:

@@ -424,6 +424,21 @@ class TestConstruction:
         assert f.room_kind(base["rooms"][0]) == "direct"
         f.store.close()
 
+    def test_enqueue_self_job_runs_in_the_owner_scope_of_an_allowed_room(self, tmp_path: Path) -> None:
+        f = MatrixTransport(config(tmp_path), FakeRunner())
+        room = f.c["rooms"][0]
+        with pytest.raises(ValueError, match="room-not-allowed"):
+            f.enqueue_self_job("!other:test.invalid", '{"kind":"x"}', key="k")
+        event = f.enqueue_self_job(room, '{"kind":"x"}', key="k")
+        assert event.startswith("$self-")
+        assert f.enqueue_self_job(room, '{"kind":"x"}', key="k") == event  # idempotent per key
+        job = f.store.claim()
+        assert job is not None and job["event_id"] == event
+        assert job["sender"] == f.c["owner"] and job["room_id"] == room
+        assert f.room_kind(room) == "direct"
+        f.store.finish(event, "", None)
+        f.store.close()
+
     def test_enqueue_notice_targets_allowed_rooms_with_unique_keys(self, tmp_path: Path) -> None:
         f = MatrixTransport(config(tmp_path), FakeRunner())
         room = f.c["rooms"][0]

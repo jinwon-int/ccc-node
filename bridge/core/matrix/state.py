@@ -97,6 +97,7 @@ SAFETY_STOP_REASONS: frozenset[str] = frozenset(
         "sync-identity-mismatch",
         "control-identity-conflict",
         "notice-identity-conflict",
+        "self-job-identity-conflict",
         # transport
         "matrix-http-",  # prefix; the HTTP status is appended
         "matrix-response-too-large",
@@ -859,6 +860,40 @@ class Store:
             ).rowcount
             if changed != 1:
                 raise ValueError("only a pending reply can be acknowledged")
+
+    def self_job(self, room_id: str, sender: str, body: str, *, key: str) -> str:
+        """Queue work the frontend gives *itself* on behalf of ``sender`` (#1895 PR-A2).
+
+        A self-job is an ordinary queued job — same scope serialisation, caps,
+        claim/finish/uncertain lifecycle and room sink — whose event id is
+        ``$self-…`` so the runner can tell it from a Matrix message. Idempotent
+        on ``key``: re-queuing the same key with the same body is a no-op, a
+        different body is an identity conflict.
+        """
+        bounded_text(body, MAX_TEXT_BYTES)
+        if not identifier(sender, "@") or not identifier(room_id, "!"):
+            raise ValueError("invalid self-job route")
+        event = "$self-" + hashlib.sha256(json.dumps([self.account, room_id, sender, key]).encode()).hexdigest()[:40]
+        scope = scope_of(self.account, room_id, sender)
+        digest = hashlib.sha256(json.dumps([room_id, sender, body]).encode()).hexdigest()
+        txn = hashlib.sha256(json.dumps([self.account, event, "reply-v1"]).encode()).hexdigest()
+        with self.db:
+            old = self.db.execute("SELECT digest FROM jobs WHERE event_id=?", (event,)).fetchone()
+            if old:
+                if old[0] != digest:
+                    raise SafetyStop("self-job-identity-conflict")
+                return event
+            count, scoped = self.db.execute(
+                "SELECT count(*), coalesce(sum(scope=?),0) FROM jobs WHERE state!='done'", (scope,)
+            ).fetchone()
+            if count >= self.total_cap or scoped >= self.scope_cap:
+                raise QueueFull("inbox capacity reached")
+            self.db.execute(
+                "INSERT INTO jobs(event_id,room_id,sender,scope,body,digest,state,txn_id) "
+                "VALUES (?,?,?,?,?,?,'queued',?)",
+                (event, room_id, sender, scope, body, digest, txn),
+            )
+        return event
 
     def uncertain(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.execute("SELECT * FROM jobs WHERE state='uncertain' ORDER BY seq")]
