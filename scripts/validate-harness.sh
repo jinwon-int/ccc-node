@@ -607,6 +607,20 @@ suite_summary() { # <output-file> <suite> [label]
   else err "no 'PASS=<n> FAIL=<n>' summary line: $2${3:+ $3}"; fi
 }
 
+# #1903: a failing suite used to get only `tail -5`, which showed the end of
+# its output — for suites that print their `PASS=<n> FAIL=<n>` tally and then
+# run python files (ccc-skill-promotion.test.sh runs nine after its tally),
+# that window showed the LAST python file's `OK` and buried the real failure
+# above it. On failure, surface every assertion/summary marker with line
+# numbers plus a wider tail, so a CI log shows WHICH case failed without a
+# local rerun.
+suite_failure_detail() { # <output-file>
+  local hits
+  hits="$(grep -nE '^(FAIL:|ERROR:|FAILED|Traceback|PASS=[0-9]+ FAIL=[0-9]+$)' "$1" | head -30 || true)"
+  [ -n "$hits" ] && printf '%s\n' "$hits"
+  tail -20 "$1"
+}
+
 # Umask-0002 variant (#770): the ownership contract fail-closes on
 # group/other-writable skill dirs, so the umask-sensitive suites must also
 # pass on nodes whose default umask is 0002. CI runs 0022 — run these twice.
@@ -698,10 +712,10 @@ for ((i = 0; i < ${#HOOK_RUNS[@]}; i++)); do
   case "${HOOK_RUNS[i]}" in
     *$'\t'umask0002)
       if ( umask 0002; run_suite "$t" ) >"$TMP/htest.out" 2>&1; then suite_summary "$TMP/htest.out" "$t" "(umask 0002)";
-      else err "test failed (umask 0002): $t"; tail -5 "$TMP/htest.out"; fi ;;
+      else err "test failed (umask 0002): $t"; suite_failure_detail "$TMP/htest.out"; fi ;;
     *)
       if run_suite "$t" >"$TMP/htest.out" 2>&1; then suite_summary "$TMP/htest.out" "$t";
-      else err "test failed: $t"; tail -5 "$TMP/htest.out"; fi ;;
+      else err "test failed: $t"; suite_failure_detail "$TMP/htest.out"; fi ;;
   esac
 done
 fi # phase_hook_tests
