@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 IDS_FILENAME = "matrix-ids.json"
 DIRECT_ROOMS_FILENAME = "matrix-direct-rooms.json"
 SUPPORTED_COMMANDS = frozenset(
-    {"new", "model", "effort", "usage", "skills", "stop", "task_pause", "task_resume", "task_recover"}
+    {"new", "model", "effort", "usage", "skills", "stop", "task_pause", "task_resume", "task_recover", "history", "resume"}
 )
 _STATUS_HANDLE = 1
 SELF_JOB_PREFIX = "$self-"
@@ -908,6 +908,9 @@ class MatrixBot(DansoRecoveryMixin):
                 return _turn_result(text, None)
             if await self._answer_danso_recovery_choice(body, user_id=user_id, chat_id=chat_id):
                 return _turn_result("", None, streamed=True)
+            chosen = await self._select_resume_choice(body, user_id=user_id, chat_id=chat_id)
+            if chosen is not None:
+                return _turn_result(chosen, None)
             return await self._run_message(body, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
         finally:
             self._active_sink = None
@@ -951,6 +954,10 @@ class MatrixBot(DansoRecoveryMixin):
             return await self._cmd_task_pause(args, user_id=user_id, chat_id=chat_id)
         if command == "task_recover":
             return await self._cmd_task_recover(user_id=user_id, chat_id=chat_id)
+        if command == "history":
+            return await self._cmd_history(user_id=user_id, chat_id=chat_id)
+        if command == "resume":
+            return await self._cmd_resume(args, user_id=user_id, chat_id=chat_id)
         raise ValueError(f"unsupported command: {command}")
 
     # -- conversation/session plumbing (mirrors bot.py) ----------------------
@@ -1276,6 +1283,184 @@ class MatrixBot(DansoRecoveryMixin):
             raise
         except Exception:
             logger.exception("Matrix startup Danso recovery scan failed; /task_recover remains available")
+
+    # -- /history and /resume (#1895 PR-B) ------------------------------------
+    #
+    # Ports of bot_commands._cmd_history / _cmd_resume and the digit reply in
+    # bot_delivery: same provider rules (Claude browsing is locked under
+    # audience-scoped memory; Piri/Danso resume by exact id only; Codex/Crush
+    # browse runtime threads), plain-text output, no Telegram markup.
+
+    def _claude_scoped_transcript_controls_disabled(self) -> bool:
+        return (
+            self._active_provider() == "claude"
+            and getattr(self._settings, "bridge_memory_mode", "off") == "audience-scoped"
+        )
+
+    async def _cmd_history(self, *, user_id: int, chat_id: int) -> str:
+        key = self._conversation_key(user_id, chat_id)
+        session = await self._session_manager.get_session(key)
+        session_id = self._effective_session_id(key, session)
+        provider = str(session.get("provider") or self._active_provider())
+        if not session_id:
+            return "📭 No active session. Start a conversation first."
+        if provider in {"piri", "danso"}:
+            return (
+                f"ℹ️ {provider.title()} does not expose bounded transcript history. "
+                "The current session still resumes by its exact id."
+            )
+        if provider in {"codex", "crush"}:
+            try:
+                history = await self._project_chat.read_runtime_session(session_id, limit=5)
+            except Exception:
+                logger.warning("%s history browsing failed", provider.title())
+                return f"⚠️ {provider.title()} history is unavailable for this session."
+            messages = [
+                {"role": item.role, "content": item.content, "timestamp": item.timestamp or ""}
+                for item in history.messages
+            ]
+        else:
+            messages = await asyncio.to_thread(self._project_chat.get_recent_messages, session_id, limit=5)
+        if not messages:
+            return "📭 No history available for this session."
+        lines = ["📜 Recent History (last 5 messages)", f"Provider: {provider}", ""]
+        for msg in messages:
+            role, content, timestamp = str(msg["role"]), str(msg["content"]), str(msg.get("timestamp") or "")
+            emoji, label = ("🧑", "User") if role == "user" else ("🤖", "Assistant")
+            try:
+                ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts = timestamp[:19]
+            if len(content) > 500:
+                content = content[:500] + "..."
+            lines.extend([f"{emoji} {label} [{ts}]", content, ""])
+        reply = "\n".join(lines).strip()
+        return reply if len(reply) <= 4000 else reply[:3997] + "..."
+
+    async def _cmd_resume(self, args: list[str], *, user_id: int, chat_id: int) -> str:
+        key = self._conversation_key(user_id, chat_id)
+        provider = self._active_provider()
+        if self._claude_scoped_transcript_controls_disabled():
+            await self._session_manager.patch_session(key, remove_fields={"resume_list"})
+            return (
+                "🔒 Claude session browsing is disabled while private memory is audience-scoped. "
+                "Use /new to start a fresh session."
+            )
+        session = await self._session_manager.get_session(key)
+        stored = str(session.get("provider") or provider)
+        if stored != provider:
+            return f"❌ Provider mismatch: this session is {stored}, but the active provider is {provider}. Use /new first."
+        if provider == "danso":
+            current = session.get("session_id")
+            if args and (len(args) != 1 or args[0] != current):
+                return "❌ Danso can resume only this conversation's current session. Use /new for a fresh session."
+            return (f"ℹ️ Current Danso session auto-resumes: {current}" if current
+                    else "📭 No Danso session yet. Send a message to start one.")
+        if provider == "piri":
+            return await self._resume_piri(args, key=key, session=session)
+        if provider in {"codex", "crush"}:
+            return await self._resume_runtime_list(key=key, provider=provider)
+        sessions = await asyncio.to_thread(self._project_chat.list_sessions, limit=10)
+        if not sessions:
+            return "📭 No session history found."
+        await self._session_manager.patch_session(
+            key, updates={"resume_list": [[sid, msg, "claude"] for sid, msg, _ in sessions]}
+        )
+        lines = ["📋 Session History", ""]
+        for index, (sid, msg, mtime) in enumerate(sessions, 1):
+            text = re.sub(r"https?://\S+", "", str(msg).replace("\n", " ")).strip()
+            lines.append(f"{index}. {text} [claude]")
+            lines.append(self._relative_time(float(mtime)))
+            lines.append("")
+        lines.append("Reply with a number to switch to that session:")
+        return "\n".join(lines).strip()
+
+    async def _resume_piri(self, args: list[str], *, key: Any, session: Mapping[str, Any]) -> str:
+        if len(args) > 1:
+            return "Usage: /resume <piri-session-id>"
+        if args:
+            requested = args[0].strip()
+            if len(requested) > 128 or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", requested) is None:
+                return "❌ Invalid Piri session id."
+            await self._session_manager.patch_session(
+                key, updates={"provider": "piri", "session_id": requested, "new_session": False},
+                remove_fields={"resume_list"},
+            )
+            self._runtime_active_sessions.add(key)
+            return f"✅ Piri session selected: {requested}"
+        current = session.get("session_id")
+        if isinstance(current, str) and current:
+            return f"ℹ️ Current Piri session auto-resumes: {current}\nTo select another session, use /resume <piri-session-id>."
+        return "Usage: /resume <piri-session-id>"
+
+    async def _resume_runtime_list(self, *, key: Any, provider: str) -> str:
+        label = provider.title()
+        try:
+            items = await self._project_chat.list_runtime_sessions(limit=10)
+        except Exception:
+            logger.warning("%s session browsing failed", label)
+            return f"⚠️ {label} session history is unavailable."
+        if not items:
+            return f"📭 No {label} session history found."
+        resume_list: list[list[str]] = []
+        lines = ["📋 Session History", ""]
+        for index, item in enumerate(items, 1):
+            title = item.title or item.preview or item.id
+            title = " ".join(re.sub(r"https?://\S+", "", str(title)).split())[:120] or item.id
+            resume_list.append([item.id, title, provider])
+            details = " · ".join(" ".join(str(v).split())[:80] for v in (item.model, item.cwd) if v)
+            lines.append(f"{index}. {title} [{provider + ' · ' + details if details else provider}]")
+        lines.append("")
+        lines.append("Reply with a number to switch to that session:")
+        await self._session_manager.patch_session(key, updates={"resume_list": resume_list})
+        return "\n".join(lines)
+
+    def _relative_time(self, mtime: float) -> str:
+        delta = int(float(self._clock.time()) - mtime)
+        if delta < 60:
+            return f"{delta} seconds ago"
+        if delta < 3600:
+            return f"{delta // 60} minutes ago"
+        if delta < 86400:
+            return f"{delta // 3600} hours ago"
+        return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+
+    async def _select_resume_choice(self, body: str, *, user_id: int, chat_id: int) -> str | None:
+        """A digit reply after ``/resume`` switches sessions; anything else is untouched."""
+
+        key = self._conversation_key(user_id, chat_id)
+        session = await self._session_manager.get_session(key)
+        resume_list = session.get("resume_list")
+        if resume_list and self._claude_scoped_transcript_controls_disabled():
+            await self._session_manager.patch_session(key, remove_fields={"resume_list"})
+            return None
+        if not resume_list:
+            return None
+        text = body.strip()
+        if not text.isdigit():
+            await self._session_manager.patch_session(key, remove_fields={"resume_list"})
+            return None
+        index = int(text) - 1
+        if not 0 <= index < len(resume_list):
+            return "❌ Invalid number, please try again."
+        entry = resume_list[index]
+        sid, label = str(entry[0]), str(entry[1])
+        provider = str(entry[2]) if len(entry) > 2 else "claude"
+        active = self._active_provider()
+        if provider != active:
+            return f"❌ Provider mismatch: selected session is {provider}, but the active provider is {active}."
+        await self._session_manager.patch_session(
+            key, updates={"provider": provider, "session_id": sid, "new_session": False},
+            remove_fields={"resume_list"},
+        )
+        self._runtime_active_sessions.add(key)
+        reply = f"✅ Switched to session: {label}"
+        if provider == "claude":
+            reader = getattr(self._project_chat, "get_session_last_assistant_message", None)
+            last = await asyncio.to_thread(reader, sid) if callable(reader) else None
+            if last:
+                reply += f"\n\n📋 {last}"
+        return reply
 
     async def _cmd_task_pause(self, args: list[str], *, user_id: int, chat_id: int) -> str:
         if args:
