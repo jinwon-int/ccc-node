@@ -422,6 +422,18 @@ next scan shows the menu instead of resuming again, and a failed automatic
 resume is followed by the ordinary menu, never by another automatic resume. If
 the notice cannot be delivered nothing is resumed.
 
+One exception, from the 2026-09-21 soonwook deployment (#1880): the forced
+teardown of the previous bridge can leave the native journal lock in place for
+a moment, so the very first automatic resume is refused with the
+provider-normalized `danso_session` code before any model request. When that
+exact code comes back, the journal re-inspects as byte-identical (same
+fingerprint) and still `ready`/`paused` + `resume_allowed`, the bridge posts a
+body-free notice, waits `CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME_RETRY_DELAY_SECONDS`
+(default 10, 0 disables, max 60) and re-issues the identical explicit-resume
+dispatch **once**. Any other failure code, a changed journal, a lost binding, or
+a second failure falls through to the ordinary menu. User-chosen continues never
+retry.
+
 Completed tasks and sessions without a long-task ledger do not trigger startup
 offers. An unreadable, malformed, or actively locked journal produces no advice;
 use `/task_recover` again after the active writer finishes. The current native

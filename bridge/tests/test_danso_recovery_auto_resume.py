@@ -1,11 +1,14 @@
 """Restart-only auto-resume (owner decision 2026-09-21): ready/paused +
 resume_allowed dispatches the explicit resume path; everything else keeps the menu."""
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from telegram_bot.core.bot_danso_recovery import AUTO_RESUME_NOTICE, OFFER
+from telegram_bot.core.bot_danso_recovery import (
+    AUTO_RESUME_NOTICE, AUTO_RESUME_RETRY_NOTICE, OFFER)
+from test_danso_recovery import snapshot
 from telegram_bot.core.danso_worker import TASK_RESUME_CONTROL
 from test_danso_recovery import setup_bot
 
@@ -99,3 +102,90 @@ async def test_notice_delivery_failure_never_resumes_silently(tmp_path):
     bot.application.bot.send_message = AsyncMock(side_effect=RuntimeError('synthetic'))
     await bot._recover_danso_tasks(bot.application)
     handler.process_message.assert_not_awaited()
+
+
+# ---- #1880: delayed single retry after a stale-lock (`danso_session`) refusal
+
+def session_failure(code='danso_session'):
+    return SimpleNamespace(success=False, content='❌ Processing failed: Worker failed: category=session',
+                           session_id='sid', failure_code=code)
+
+
+def no_sleep(bot, monkeypatch):
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+    monkeypatch.setattr('telegram_bot.core.bot_danso_recovery.asyncio.sleep', fake_sleep)
+    return slept
+
+
+@pytest.mark.anyio
+async def test_stale_lock_failure_retries_once_after_delay_then_succeeds(tmp_path, monkeypatch):
+    bot, manager, handler = await auto_bot(tmp_path, 'paused', True)
+    bot._config.danso_recovery_auto_resume_retry_delay_seconds = 7
+    slept = no_sleep(bot, monkeypatch)
+    handler.process_message.side_effect = [session_failure(), SimpleNamespace(success=True, content='done', session_id='sid')]
+    await bot._recover_danso_tasks(bot.application)
+    assert handler.process_message.await_count == 2
+    first, second = [c.kwargs for c in handler.process_message.await_args_list]
+    keys = ('user_message', 'session_id', 'resume_task', 'new_session', 'user_id', 'chat_id')
+    assert {k: first[k] for k in keys} == {k: second[k] for k in keys}  # identical explicit-resume dispatch
+    assert first['resume_task'] is True and first['session_id'] == 'sid'
+    assert slept == [7]
+    assert handler.inspect_danso_recovery.await_count >= 2  # re-inspected before retrying
+    texts = sent_texts(bot)
+    assert AUTO_RESUME_RETRY_NOTICE.format(delay=7) in texts
+    assert all(c.kwargs.get('reply_markup') is None for c in bot.application.bot.send_message.await_args_list)
+    bot._send_smart.assert_awaited_once_with(9, 'done')  # first failure text is not delivered
+    assert OFFER not in await manager.get_session('7:9')
+
+
+@pytest.mark.anyio
+async def test_second_failure_gets_menu_and_never_a_third_attempt(tmp_path, monkeypatch):
+    bot, manager, handler = await auto_bot(tmp_path, 'paused', True)
+    no_sleep(bot, monkeypatch)
+    handler.process_message.side_effect = [session_failure(), session_failure()]
+    await bot._recover_danso_tasks(bot.application)
+    assert handler.process_message.await_count == 2
+    assert bot.application.bot.send_message.await_args.kwargs['reply_markup'] is not None
+    assert (await manager.get_session('7:9'))[OFFER]['token']
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('why', ['other_code', 'delay_zero', 'journal_changed', 'no_longer_resumable'])
+async def test_no_retry_when_code_delay_or_journal_disqualify(tmp_path, monkeypatch, why):
+    bot, manager, handler = await auto_bot(tmp_path, 'paused', True)
+    slept = no_sleep(bot, monkeypatch)
+    failure = session_failure('danso_failed' if why == 'other_code' else 'danso_session')
+    handler.process_message.side_effect = [failure, SimpleNamespace(success=True, content='done', session_id='sid')]
+    if why == 'delay_zero':
+        bot._config.danso_recovery_auto_resume_retry_delay_seconds = 0
+    if why in {'journal_changed', 'no_longer_resumable'}:
+        # Offer + choice snapshot see the resumable journal; the pre-retry
+        # re-inspection (third read onward) sees it changed.
+        first = snapshot('paused', True)
+        changed = (replace(first, fingerprint='b' * 64) if why == 'journal_changed'
+                   else snapshot('pending_provider', False))
+        reads = []
+
+        async def inspect(*a, **k):
+            reads.append(1)
+            return first if len(reads) <= 2 else changed
+        handler.inspect_danso_recovery = AsyncMock(side_effect=inspect)
+    await bot._recover_danso_tasks(bot.application)
+    assert handler.process_message.await_count == 1
+    assert (slept == []) == (why in {'other_code', 'delay_zero'})
+    assert bot.application.bot.send_message.await_args.kwargs['reply_markup'] is not None  # menu fallback
+
+
+@pytest.mark.anyio
+async def test_user_chosen_continue_never_retries(tmp_path, monkeypatch):
+    from test_danso_recovery import callback
+    bot, manager, handler = await auto_bot(tmp_path, 'paused', True, enabled=False)
+    slept = no_sleep(bot, monkeypatch)
+    handler.process_message.side_effect = [session_failure(), session_failure()]
+    assert await bot._offer_danso_recovery('7:9', 7, 9)
+    update, data = callback((await manager.get_session('7:9'))[OFFER]['token'])
+    await bot._handle_danso_recovery(update, data)
+    assert handler.process_message.await_count == 1 and slept == []
