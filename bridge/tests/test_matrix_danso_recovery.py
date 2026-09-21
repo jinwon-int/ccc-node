@@ -8,6 +8,8 @@ restart scan that *offers* but never dispatches.
 from __future__ import annotations
 
 from pathlib import Path
+import sys
+import types
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -31,10 +33,31 @@ def anyio_backend() -> str:
 
 
 @pytest.fixture
-def matrix_config(_shared_matrix_config: dict[str, Any]) -> dict[str, Any]:
-    """Re-expose test_matrix_bot's fixture under its own name (pytest keys on the attribute name)."""
+def matrix_config(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Same shape as test_matrix_bot's fixture; defined here because pytest keys fixtures on the attribute name."""
 
-    return _shared_matrix_config
+    config = {
+        "homeserver": "https://matrix.example.org",
+        "account": "@bridge:example.org",
+        "device_id": "DEV",
+        "owner": OWNER,
+        "rooms": [DM_ROOM],
+        "family_rooms": [],
+        "family_users": [KID, OWNER],
+        "not_before_ms": 0,
+        "loaded_from": [],
+    }
+    module = types.ModuleType("telegram_bot.core.matrix.state")
+
+    def load_config(path: Path) -> dict[str, Any]:
+        config["loaded_from"].append(Path(path))
+        return dict(config)
+
+    module.load_config = load_config  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "telegram_bot.core.matrix.state", module)
+    return config
+
+
 
 
 class RecoveryProjectChat(FakeProjectChat):
