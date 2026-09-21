@@ -1,5 +1,9 @@
 # Changelog
 
+- **Matrix status throttle matches Telegram (15s).** `STATUS_MIN_INTERVAL_S`
+  was 60s, so `⏳ Working` on Matrix lagged Telegram's 15s heartbeat. Both
+  channels now refresh at 15s. Streaming-progress suppression is unchanged.
+
 - **Telegram `start.sh` no longer treats a Matrix frontend as itself.**
   `find_project_bot_pids` matched any `python -m telegram_bot --path $PROJECT_ROOT`,
   so a second systemd unit on the same project root (`CCC_CHANNEL=matrix`, own
