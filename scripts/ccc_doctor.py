@@ -119,6 +119,15 @@ CRON_MARKER_INSTALLERS = (
      "run scripts/install-t2-starvation-observe-cron.sh --apply (seoseo hub only)"),
     ("nunchi", "# nunchi:#816", "scripts/install-nunchi.sh",
      "run scripts/install-nunchi.sh --apply with the node's original provider/audience flags"),
+    # timed-test-deadline-scan (#1870) reports timed tests whose KST end
+    # datetime passed with no verdict. Registered in the same commit that adds
+    # the installer, unlike cost-ledger (#1398) and t2-starvation-observe
+    # (#1421), which both surfaced as unknown unmanaged markers on a fleet
+    # sweep before anyone noticed they were missing here.
+    ("timed-test-deadline-scan", "# ccc-node:timed-test-deadline-scan",
+     "scripts/install-timed-test-deadline-scan-cron.sh",
+     "run scripts/install-timed-test-deadline-scan-cron.sh --apply "
+     "(needs ~/.claude/timed-test-deadline-scan.repos; the scan exits 3 until it exists)"),
 )
 # Managed markers that carry no generation stamp by design: the installers'
 # block guards are exact-match parsed by the shared block awk (#1077).
@@ -137,6 +146,8 @@ CRON_AUX_MARKERS = (
     "# ccc-node:tunnel-audit:end",
     "# ccc-node:t2-starvation-observe:begin",
     "# ccc-node:t2-starvation-observe:end",
+    "# ccc-node:timed-test-deadline-scan:begin",
+    "# ccc-node:timed-test-deadline-scan:end",
 )
 # Hand-installed markers the repo documents but no installer renders: the
 # self-update and live-backups schedule lines are operator-placed by design
