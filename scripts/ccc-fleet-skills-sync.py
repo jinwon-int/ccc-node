@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -107,10 +107,23 @@ class Retirement:
     current: str
 
 
-# Actions that must never reach apply_operations: noop (already exact) and
+# Actions that must never reach apply_operations: noop (already exact),
 # skip-repo-managed (a repo-managed installation owns the target — the higher
-# precedence layer, #1344).
-SKIP_ACTIONS = frozenset({"noop", "skip-repo-managed"})
+# precedence layer, #1344) and skip-user-owned (a marker-less directory that is
+# neither the repo's nor the autosave layer's holds the name; the fleet layer
+# never overwrites it, and — unlike the pre-adoption fail-closed run — it no
+# longer blocks every other approved skill on the node).
+SKIP_ACTIONS = frozenset({"noop", "skip-repo-managed", "skip-user-owned"})
+# The autosave layer's provenance marker (skill-review/ownership.py). Fleet
+# approval outranks autosave ownership (#1344: repo-managed > fleet-approved >
+# autosave-owned > user-owned), so a marker-less target carrying this file is
+# the node's own promoted draft and gets adopted rather than refused. Field
+# case: three nodes failed their daily apply for 17 days straight because the
+# very skills they had authored came back approved under the same name.
+AUTOSAVE_MARKER = ".autosave-meta.json"
+# Every apply leaves this receipt (owner-only) so ccc_doctor can surface a
+# failing cron — previously the only trace was a one-line JSON in the cron log.
+LAST_RUN_NAME = "last-run.json"
 # Retirement reconcile (#92): unmodified orphans are pruned, drifted orphans
 # are kept and reported — setup.sh's #1330 prune philosophy, fleet edition.
 RETIRE_PRUNE = "retire"
@@ -637,6 +650,39 @@ def is_repo_managed(cfg: Config, provider: str, target: Path, name: str) -> bool
     return repo_managed_marker(target) is not None
 
 
+def autosave_owned(path: Path) -> bool:
+    """Whether a marker-less target is the autosave layer's copy of the skill.
+
+    Fail-safe in the *skip* direction: anything unreadable, symlinked,
+    foreign-owned or malformed counts as NOT autosave-owned, which routes the
+    target to ``skip-user-owned`` (never overwritten). Only a regular,
+    euid-owned marker naming this very skill with the autosave manager and
+    ownership strings qualifies for adoption.
+    """
+    marker_path = path / AUTOSAVE_MARKER
+    try:
+        metadata = marker_path.lstat()
+    except OSError:
+        return False
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_size > 16 * 1024
+    ):
+        return False
+    try:
+        value = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(value, dict)
+        and value.get("manager") == "ccc-node-skill-autosave"
+        and value.get("ownership") == "autosave-managed"
+        and value.get("name") == path.name
+    )
+
+
 def provider_roots(cfg: Config) -> dict[str, Path]:
     """Install roots this node consumes, keyed by provider.
 
@@ -702,7 +748,20 @@ def operations(cfg: Config, skills: list[ApprovedSkill], *, create_roots: bool) 
                     if is_repo_managed(cfg, provider, target, skill.name):
                         rows.append(Operation(provider, skill, target, "skip-repo-managed"))
                         continue
-                    raise SyncError("target_user_owned")
+                    # Marker-less but provably ours to take over: either the
+                    # autosave layer's draft of this very skill (fleet approval
+                    # outranks it, #1344) or a byte-identical copy that only
+                    # lacks provenance. Adoption goes through the normal
+                    # backup-and-replace install, so the prior bytes stay in
+                    # backups/<commit>/ like any update.
+                    if autosave_owned(target) or installed_matches(target, skill):
+                        rows.append(Operation(provider, skill, target, "adopt"))
+                        continue
+                    # A genuinely user-owned directory holds the name. Skip
+                    # this one skill and keep going: refusing the whole run
+                    # here meant zero approved skills landed on the node.
+                    rows.append(Operation(provider, skill, target, "skip-user-owned"))
+                    continue
                 wanted = marker(cfg, provider, skill)
                 action = "noop" if current == wanted and installed_matches(target, skill) else "update"
             else:
@@ -895,6 +954,9 @@ def execute(cfg: Config, *, apply: bool) -> dict[str, object]:
         "repo": cfg.repo,
         "commit": cfg.ref,
         "changed": changed,
+        "skipped_user_owned": sorted(
+            f"{row.provider}:{row.skill.name}" for row in rows if row.action == "skip-user-owned"
+        ),
         "operations": [
             {
                 "provider": row.provider,
@@ -927,14 +989,67 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def record_last_run(cfg: Config, result: dict[str, object]) -> None:
+    """Leave an owner-only receipt of this apply for ccc_doctor (best effort).
+
+    Never raises and never changes the exit code: the receipt is diagnostic
+    only. ``consecutive_failures`` counts failed applies since the last
+    success so doctor can tell a transient hiccup from a cron that has been
+    failing for weeks. Only ``apply`` is recorded — a human's ``plan`` must
+    not reset or extend the cron's streak.
+    """
+    try:
+        if cfg.state_dir.is_symlink() or not cfg.state_dir.is_dir():
+            return
+        path = cfg.state_dir / LAST_RUN_NAME
+        streak = 0
+        try:
+            if path.is_file() and not path.is_symlink() and path.stat().st_size <= 16 * 1024:
+                previous = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(previous, dict):
+                    streak = max(0, int(previous.get("consecutive_failures") or 0))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            streak = 0
+        ok = result.get("ok") is True
+        skipped = result.get("skipped_user_owned")
+        payload = {
+            "schema_version": 1,
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ok": ok,
+            "mode": "apply",
+            "commit": cfg.ref,
+            "code": None if ok else str(result.get("code") or "unknown"),
+            "changed": result.get("changed") if ok else None,
+            "skipped_user_owned": list(skipped)[:64] if isinstance(skipped, list) else [],
+            "consecutive_failures": 0 if ok else streak + 1,
+        }
+        descriptor, raw = tempfile.mkstemp(prefix=".last-run-", dir=cfg.state_dir)
+        temporary = Path(raw)
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.write(descriptor, (json_line(payload) + "\n").encode())
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+    except (OSError, TypeError, ValueError):
+        return
+
+
 def main(argv: list[str] | None = None) -> int:
+    cfg: Config | None = None
+    apply = False
     try:
         args = parser().parse_args(argv)
-        result = execute(config(args), apply=args.command == "apply")
+        apply = args.command == "apply"
+        cfg = config(args)
+        result = execute(cfg, apply=apply)
     except SyncError as error:
         result = {"ok": False, "code": error.code}
     except (OSError, TypeError, ValueError, RecursionError):
         result = {"ok": False, "code": "internal_error"}
+    if cfg is not None and apply:
+        record_last_run(cfg, result)
     print(json_line(result))
     return 0 if result.get("ok") else 2
 
