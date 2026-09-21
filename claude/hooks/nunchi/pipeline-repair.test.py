@@ -179,6 +179,66 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(result["initialized"], 1)
         self.assertEqual(result["unavailable_databases"], 1)
 
+    def test_codex_native_messages_and_legacy_dedup(self):
+        reader = module("session-tail")
+        p = self.p / "native.jsonl"
+        rows = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Remember the deployment choice"}],
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Remember the deployment choice"},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "Fixed nunchi-codex-feed-816 today"}
+                    ],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "HIDDEN INSTRUCTION"}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {"type": "function_call_output", "output": "SECRET TOOL OUTPUT"},
+            },
+        ]
+        p.write_text("\n".join(json.dumps(x) for x in rows))
+        text = reader.read("codex", p, self.p)
+        self.assertEqual(text.count("Remember the deployment choice"), 1)
+        self.assertIn("Fixed nunchi-codex-feed-816 today", text)
+        self.assertNotIn("HIDDEN", text)
+        self.assertNotIn("SECRET", text)
+        rows.append(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Extract facts [nunchi-codex-feed-816]"}
+                    ],
+                },
+            }
+        )
+        p.write_text("\n".join(json.dumps(x) for x in rows))
+        self.assertEqual(reader.read("codex", p, self.p), "")
+
     def test_large_growing_session_reads_recent_tail_only(self):
         reader = module("session-tail")
         p = self.file("large.jsonl", "")

@@ -7,6 +7,8 @@
 # No-op unless nunchi is enabled (state/nunchi.mode=on or CCC_NUNCHI_MODE=on).
 set -uo pipefail
 umask 077
+# Reconsider receipts written by the event-only reader.
+export NUNCHI_FEED_READER_VERSION=2
 
 STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
 MODE="${CCC_NUNCHI_MODE:-$(cat "$STATE/nunchi.mode" 2>/dev/null || echo off)}"

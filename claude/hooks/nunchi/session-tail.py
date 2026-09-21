@@ -33,9 +33,30 @@ def read_tail(provider, path, root):
     return raw
 
 
+def text_blocks(content, allowed):
+    if isinstance(content, str):
+        return content
+    return " ".join(
+        b.get("text", "")
+        for b in (content or [])
+        if isinstance(b, dict) and b.get("type") in allowed and isinstance(b.get("text"), str)
+    )
+
+
+def codex_message(d):
+    item = d.get("payload") or {}
+    if d.get("type") == "response_item" and item.get("type") == "message":
+        role = {"user": "USER", "assistant": "AGENT"}.get(item.get("role"))
+        return role, text_blocks(item.get("content"), {"input_text", "output_text"}), True
+    if d.get("type") == "event_msg":
+        role = {"user_message": "USER", "agent_message": "AGENT"}.get(item.get("type"))
+        return role, item.get("message", ""), False
+    return None, "", False
+
+
 def read(provider, path, root):
     raw = read_tail(provider, path, root)
-    messages = []
+    messages, legacy = [], []
     for line in raw.splitlines():
         try:
             d = json.loads(line)
@@ -43,34 +64,28 @@ def read(provider, path, root):
             continue
         if not isinstance(d, dict):
             continue
+        modern = True
         if provider == "codex":
-            if d.get("type") != "event_msg":
-                continue
-            item = d.get("payload") or {}
-            role = {"user_message": "USER", "agent_message": "AGENT"}.get(item.get("type"))
-            text = item.get("message", "")
-            if "nunchi-codex-feed-816" in str(text):
+            role, text, modern = codex_message(d)
+            if (
+                role == "USER"
+                and isinstance(text, str)
+                and text.rstrip().endswith("[nunchi-codex-feed-816]")
+            ):
                 return ""
         elif provider == "piri":
             if d.get("type") != "message":
                 continue
             item = d.get("message") or {}
             role = {"user": "USER", "assistant": "AGENT"}.get(item.get("role"))
-            content = item.get("content")
-            text = (
-                content
-                if isinstance(content, str)
-                else " ".join(
-                    b.get("text", "")
-                    for b in (content or [])
-                    if isinstance(b, dict) and b.get("type") == "text"
-                )
-            )
+            text = text_blocks(item.get("content"), {"text"})
         else:
             raise ValueError("provider")
         if role and isinstance(text, str):
-            messages.append(role + ": " + text[:800])
-    return "\n".join(messages[-60:])[:40000]
+            (messages if modern else legacy).append(role + ": " + text[:800])
+    # Older Codex duplicates messages as event_msg; prefer the native message
+    # representation when present, never tool results or hidden reasoning.
+    return "\n".join((messages or legacy)[-60:])[:40000]
 
 
 if __name__ == "__main__":
