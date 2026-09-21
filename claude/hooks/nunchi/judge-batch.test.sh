@@ -350,6 +350,41 @@ ok "threshold 1.0 disables g3-duplicate (identical pair judged)" \
 ok "default threshold is 0.85 when the knob is unset" \
   '[ "$(env -u NUNCHI_G3_DUP_THRESHOLD python3 -c "import importlib.util,sys;sys.argv=[\"x\"];spec=importlib.util.spec_from_file_location(\"jb\",\"$JB\");m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);print(m.DUP_THRESHOLD)")" = 0.85 ]'
 
+# ---- 15. #1898 merge direction = superset survivor; partial overlap is judged -
+reset_db
+: >"$JUDGE_CALLS"
+# (a) the NEWER row is the superset: the older subset must fold into the newer
+# shellcheck disable=SC2034
+ids1="$(seed dungae "H2 구현 시 create() 무인자 규칙 준수" "$OLD" 1 0 ds1)"
+# shellcheck disable=SC2034
+ids2="$(seed dungae "H2 구현 시 create() 무인자 규칙 준수 fault level-trigger lock_timeout 실측 증명" "$OLD" 1 1 ds2)"
+# (b) punctuation-only difference ("필수." vs "필수", a 2-char token so the len>1
+#     filter keeps it) is a duplicate only because containment strips edge punctuation
+# shellcheck disable=SC2034
+idq1="$(seed dungae "H2 lock_timeout을 세 번째 DB 핸들로 진짜 SQLITE_BUSY 실측 증명 필수." "$OLD" 1 0 dq1)"
+# shellcheck disable=SC2034
+idq2="$(seed dungae "H2 lock_timeout을 세 번째 DB 핸들로 진짜 SQLITE_BUSY 실측 증명 필수" "$OLD" 1 1 dq2)"
+# (c) high overlap (6/7 = 0.857) but neither side contains the other: judged, not proposed
+# shellcheck disable=SC2034
+idn1="$(seed dungae "알파 베타 감마 델타 엡실론 제타 에타" "$OLD" 1 0 dn1)"
+# shellcheck disable=SC2034
+idn2="$(seed dungae "알파 베타 감마 델타 엡실론 제타 세타" "$OLD" 1 1 dn2)"
+# (d) two flagged identical rows point at each other: exactly one proposal
+# shellcheck disable=SC2034
+idm1="$(seed dungae "머지 큐 사용 레포는 브랜치를 수동 삭제한다" "$OLD" 1 1 dm1)"
+# shellcheck disable=SC2034
+idm2="$(seed dungae "머지 큐 사용 레포는 브랜치를 수동 삭제한다" "$OLD" 1 1 dm2)"
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_G3_DUP_THRESHOLD=0.85)"
+ok "superset newer row survives: older subset folds into it" \
+  'grep -q "nunchi.py merge $ids1 --into $ids2" "$CCC_STATE_DIR/nunchi-review-report.md"'
+ok "punctuation-only difference is a duplicate (newer folds into older)" \
+  'grep -q "nunchi.py merge $idq2 --into $idq1" "$CCC_STATE_DIR/nunchi-review-report.md"'
+ok "high-overlap pair without containment is judged, not proposed" \
+  '[ "$(review_of "$idn2")" = 0 ] && ! grep -q "merge $idn2 " "$CCC_STATE_DIR/nunchi-review-report.md" && ! grep -q "merge $idn1 " "$CCC_STATE_DIR/nunchi-review-report.md"'
+ok "mutual identical rows yield exactly one proposal" \
+  '[ "$(grep -c "nunchi.py merge $idm2 --into $idm1" "$CCC_STATE_DIR/nunchi-review-report.md")" = 1 ] && ! grep -q "merge $idm1 " "$CCC_STATE_DIR/nunchi-review-report.md"'
+ok "run line counts the deduplicated proposals" 'printf "%s" "$out" | grep -q "3 g3-duplicate"'
+
 # ---- 11. Codex adapter: isolated strict-output fallback (#1278) ------------
 reset_db
 cat >"$TMP/bin/claude" <<'STUB'
