@@ -114,6 +114,46 @@ def test_input_skip_never_calls_vendor(setup, message):
 
 
 @pytest.mark.parametrize(
+    "message",
+    [
+        "서울특별시 강남구 역삼동 채무자 주소 확인해줘",
+        "경기 성남시 분당구 정자동 임차인 현황 정리",
+        "강남구 테헤란로 152 보증사고 접수 건 조회",
+        "101동 1203호 세입자 이사 일정 확인",
+        "임차인: 홍길동 보증사고 접수",
+        "채무자 연락처 010-1234-5678 확인해줘",
+        "사무실 02-1234-5678 로 회신 부탁",
+        "주민번호 900101-1234567 조회 요청",
+        "계좌 110-123-456789 입금 확인",
+        "someone@example.com 로 결과 보내줘",
+        "성명: 홍길동 생년월일 조회",
+        "아내가 부탁한 일정 정리해줘",
+        "딸이 보낸 파일 정리해줘",
+        "장모님 병원 예약 확인해줘",
+        "my wife asked me to check this document",
+    ],
+)
+def test_personal_context_never_calls_vendor(setup, message):
+    assert run(setup, message) == message
+    assert not setup.calls
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "HUG 대위변제 후 구상권 소멸시효 기산점 관련 법령 조사해줘",
+        "딸린 파일 목록 정리해줘",
+        "2026-09-22 배포 결과 정리해줘",
+        "보증사고 통계 공개 자료 검색해줘",
+    ],
+)
+def test_non_personal_domain_text_still_eligible(setup, message):
+    run(setup, message)
+    assert len(setup.calls) == 1
+    assert setup.calls[0][0]["state"] == {"request": message}
+
+
+@pytest.mark.parametrize(
     "kwargs", [{"chat_id": 70}, {"user_id": 8, "chat_id": 8}, {"interactive": False}]
 )
 def test_scope(setup, kwargs):

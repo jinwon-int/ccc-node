@@ -55,9 +55,14 @@ collected by this feature. This still sends eligible user text to an additional
 external provider. Control/slash/explicit skill invocations, short context-only
 approvals/continuations, external event envelopes, group conversations and
 sensitive-log turns (including inbound documents), and recognizable
-attachment/credential/code-block text are skipped. These textual
-filters are conservative heuristics, **not** a comprehensive DLP classifier;
-sensitive text should not be submitted on enabled conversations.
+attachment/credential/code-block text are skipped. Personal-context text is
+also skipped: Korean postal addresses (region + district, road name + number,
+building/unit), resident-registration, phone and account-like numbers, e-mail
+addresses, labeled identity or counterparty fields (`성명:`, `주소:`, `채무자:`,
+`임차인:` …) and close-family references. Domain questions without such
+identifiers (for example HUG legal/regulatory research) remain eligible. These
+textual filters are conservative heuristics, **not** a comprehensive DLP
+classifier; sensitive text should not be submitted on enabled conversations.
 
 A request has one attempt, no ambient proxies, no redirects, a fixed model and
 origin, a 32 KiB response cap and a two-second inference deadline. Timeouts,
