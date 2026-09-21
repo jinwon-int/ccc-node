@@ -219,10 +219,16 @@ evidence-first continue) through a few channel ports:
   one — inside the served turn, with that room's typing/status/interim
   callbacks. Other senders' digits are ordinary messages.
 - A failed Danso turn is followed by the offer, after the failure text.
-- The restart scan **offers only**. An automatic resume would dispatch a
-  provider turn outside the transport's single-turn discipline, so
-  `CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME` has no effect on Matrix until the
-  transport gains a self-job seam (#1895 PR-A2). Answer `1` after a restart.
+- The restart scan never dispatches by itself. With
+  `CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME=true` an eligible journal
+  (`ready`/`paused`, `resume_allowed`, not yet auto-resumed at this
+  fingerprint) is handed to the transport as a **self-job** (`$self-…` event
+  in the owner's scope, idempotent per fingerprint); it then runs as a normal
+  turn — claim, room sink, finish — and inside that turn the shared automatic
+  path posts the notice, claims the offer once and issues the explicit resume,
+  with the same stale-lock retry as Telegram (#1888). Off, or ineligible, the
+  scan just offers the menu; answer `1`.
+
 
 ## health.json for the Matrix frontend
 
@@ -234,4 +240,3 @@ workload (`workload.turn_occupancy`, `active_requests`, `waiting_for_turn`).
 Before this, the shared handler only recorded *turn* events, so an idle frontend
 left the file frozen at its last turn and fleet freshness checks could not tell
 idle from dead (observed 2026-09-21 on two nodes, stale since 09-19).
-
