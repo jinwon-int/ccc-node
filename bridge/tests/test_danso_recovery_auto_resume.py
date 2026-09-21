@@ -189,3 +189,33 @@ async def test_user_chosen_continue_never_retries(tmp_path, monkeypatch):
     update, data = callback((await manager.get_session('7:9'))[OFFER]['token'])
     await bot._handle_danso_recovery(update, data)
     assert handler.process_message.await_count == 1 and slept == []
+
+
+# ---- pause → restart: a menu already offered for this journal must not block the automatic resume
+
+@pytest.mark.anyio
+async def test_restart_auto_resumes_even_when_menu_was_offered_before_restart(tmp_path):
+    bot, manager, handler = await auto_bot(tmp_path, 'paused', True)
+    # The cooperative pause ended the previous turn with danso_task_paused and
+    # the bridge offered the menu right away (same journal fingerprint, NOTIFIED set).
+    await bot._offer_danso_recovery_if_failed(SimpleNamespace(success=False), '7:9', 7, 9)
+    before = await manager.get_session('7:9')
+    assert before[OFFER]['fingerprint'] == snapshot('paused', True).fingerprint
+    assert before['danso_recovery_notified'] == snapshot('paused', True).fingerprint
+    handler.process_message.assert_not_awaited()
+    bot.application.bot.send_message.reset_mock()
+    await bot._recover_danso_tasks(bot.application)  # restart scan
+    handler.process_message.assert_awaited_once()
+    assert handler.process_message.call_args.kwargs['resume_task'] is True
+    assert OFFER not in await manager.get_session('7:9')
+    assert all(c.kwargs.get('reply_markup') is None for c in bot.application.bot.send_message.await_args_list)
+
+
+@pytest.mark.anyio
+async def test_restart_with_pending_menu_and_auto_off_still_deduplicates(tmp_path):
+    bot, manager, handler = await auto_bot(tmp_path, 'paused', True, enabled=False)
+    await bot._offer_danso_recovery_if_failed(SimpleNamespace(success=False), '7:9', 7, 9)
+    bot.application.bot.send_message.reset_mock()
+    await bot._recover_danso_tasks(bot.application)
+    handler.process_message.assert_not_awaited()
+    bot.application.bot.send_message.assert_not_awaited()  # no duplicate menu

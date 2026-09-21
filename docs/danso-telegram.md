@@ -434,6 +434,14 @@ dispatch **once**. Any other failure code, a changed journal, a lost binding, or
 a second failure falls through to the ordinary menu. User-chosen continues never
 retry.
 
+The intended operator flow is therefore *pause → restart → automatic resume*:
+`/task_pause` (or SIGUSR1) ends the turn with `danso_task_paused`, which offers
+the menu immediately; the restart scan then resumes that same journal without
+waiting for an answer. The menu-deduplication rule ("do not re-offer an
+unchanged journal that was already offered") deliberately does not apply to an
+automatic resume — it suppresses a repeated menu, not a different action. With
+the opt-in off, the restart still shows no duplicate menu.
+
 Completed tasks and sessions without a long-task ledger do not trigger startup
 offers. An unreadable, malformed, or actively locked journal produces no advice;
 use `/task_recover` again after the active writer finishes. The current native

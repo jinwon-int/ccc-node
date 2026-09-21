@@ -114,7 +114,17 @@ class DansoRecoveryMixin:
             return False
         if snapshot.state in {'completed', 'not_long_task'}:
             return False
-        if (not force and current.get(NOTIFIED) == snapshot.fingerprint
+        # One automatic attempt per journal fingerprint: if the resume left the
+        # journal byte-identical (immediate crash, restart loop), the next scan
+        # falls back to the menu instead of resuming again.
+        auto_eligible = (auto and self._danso_recovery_auto_resume()
+                         and snapshot.state in AUTO_RESUME_STATES and snapshot.resume_allowed
+                         and current.get(AUTO_RESUMED) != snapshot.fingerprint)
+        # The menu for this exact journal may already be pending from before the
+        # restart (a cooperative pause ends its turn with `danso_task_paused`,
+        # which offers immediately). That dedup must not swallow an automatic
+        # resume: it suppresses a repeated *menu*, not a different action.
+        if (not force and not auto_eligible and current.get(NOTIFIED) == snapshot.fingerprint
                 and isinstance(current.get(OFFER), dict)
                 and current[OFFER].get('fingerprint') == snapshot.fingerprint):
             return False
@@ -129,12 +139,7 @@ class DansoRecoveryMixin:
         )
         if not saved:
             return False
-        # One automatic attempt per journal fingerprint: if the resume left the
-        # journal byte-identical (immediate crash, restart loop), the next scan
-        # falls back to the menu instead of resuming again.
-        if (auto and self._danso_recovery_auto_resume()
-                and snapshot.state in AUTO_RESUME_STATES and snapshot.resume_allowed
-                and current.get(AUTO_RESUMED) != snapshot.fingerprint):
+        if auto_eligible:
             return await self._auto_resume_danso_recovery(
                 key, user_id, chat_id, token, epoch, route, snapshot, offer)
         try:
