@@ -15,7 +15,7 @@ changed versus the family-messenger pilot bot ("fambot"):
 | brain | one Codex process per turn, JSON port | `ProjectChatHandler` in-process (as Telegram) |
 | session | `session_id` per room, cold start each turn | warm `AgentSession` per room |
 | progress | "작업을 시작했습니다" only | typing + interim/status notices |
-| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) |
+| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) |
 | output | plain `m.text` | plain `body` + Matrix HTML `formatted_body` |
 | E2EE / trust / room gate | fleet_matrix | same code, ported (fail-closed reasons unchanged) |
 
@@ -202,3 +202,24 @@ second node starts with a direct room only.
 - Draft edits (`m.replace`) for streamed text — interim notices only.
 - Approval buttons: approvals are `/approve <turn> <nonce>` replies in the
   room, exactly as the pilot.
+
+## Danso long tasks and recovery (#1895 PR-A)
+
+With `CCC_AGENT_PROVIDER=danso` and `CCC_DANSO_LONG_TASK_ENABLED=true` the
+Matrix frontend reuses the Telegram recovery discipline
+(`bot_danso_recovery.DansoRecoveryMixin`: one-shot claim, binding guard,
+evidence-first continue) through a few channel ports:
+
+- `/task_pause` asks the exact active native task to pause at a settled
+  boundary; `/task_resume` re-issues the explicit no-prompt resume for the
+  stored journal; `/task_recover` posts the recovery summary on demand.
+- Offers are always the numbered **text** menu (`1` continue / `2` new /
+  `3` status) delivered through the outbox; Matrix has no inline keyboards.
+  Only the owner sees offers, and only the owner's typed `1`/`2`/`3` answers
+  one — inside the served turn, with that room's typing/status/interim
+  callbacks. Other senders' digits are ordinary messages.
+- A failed Danso turn is followed by the offer, after the failure text.
+- The restart scan **offers only**. An automatic resume would dispatch a
+  provider turn outside the transport's single-turn discipline, so
+  `CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME` has no effect on Matrix until the
+  transport gains a self-job seam (#1895 PR-A2). Answer `1` after a restart.

@@ -41,6 +41,11 @@ from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol
 
 from telegram_bot.core import session_resume, tool_policy
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
+from telegram_bot.core.bot_danso_recovery import (
+    OFFER,
+    RECOVERY_TEXT_ACTIONS,
+    DansoRecoveryMixin,
+)
 from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor
 from telegram_bot.core.matrix.render import chunk_text, render_matrix_message
 from telegram_bot.core.matrix_ids import MatrixIdMap
@@ -60,7 +65,9 @@ logger = logging.getLogger(__name__)
 
 IDS_FILENAME = "matrix-ids.json"
 DIRECT_ROOMS_FILENAME = "matrix-direct-rooms.json"
-SUPPORTED_COMMANDS = frozenset({"new", "model", "effort", "usage", "skills", "stop"})
+SUPPORTED_COMMANDS = frozenset(
+    {"new", "model", "effort", "usage", "skills", "stop", "task_pause", "task_resume", "task_recover"}
+)
 _STATUS_HANDLE = 1
 STATUS_MIN_INTERVAL_S = 15.0  # match Telegram CCC_HEARTBEAT_* defaults
 _RUNTIME_MODEL_PROVIDERS = frozenset({"codex", "piri", "crush", "danso"})
@@ -311,7 +318,41 @@ class MatrixSpoolNotifier:
             pass
 
 
-class MatrixBot:
+class _NullSink:
+    """Sink for dispatches that happen outside a served turn (no room bubble)."""
+
+    async def typing(self) -> None:
+        return None
+
+    async def interim(self, text: str) -> None:
+        del text
+
+    async def status(self, text: Optional[str]) -> None:
+        del text
+
+    async def approval(self, description: str, arguments: Any) -> bool:
+        del description, arguments
+        return False
+
+
+class _NoticeBotPort:
+    """``application.bot.send_message`` shape the recovery mixin expects, over the outbox."""
+
+    def __init__(self, bot: "MatrixBot") -> None:
+        self._bot = bot
+
+    async def send_message(self, *, chat_id: int, text: str, reply_markup: Any = None) -> None:
+        del reply_markup  # Matrix offers are numbered text menus, never keyboards
+        if not self._bot._deliver_notice(int(chat_id), str(text)):
+            raise RuntimeError("no Matrix room is known for this chat")
+
+
+class _NoticeApp:
+    def __init__(self, bot: "MatrixBot") -> None:
+        self.bot = _NoticeBotPort(bot)
+
+
+class MatrixBot(DansoRecoveryMixin):
     """Matrix frontend: ``TurnRunner`` over ``ProjectChatHandler``."""
 
     def __init__(
@@ -328,6 +369,11 @@ class MatrixBot:
         self._session_manager = session_manager
         self._clock = clock or time
         self._transport_factory = transport_factory
+        # Danso recovery (#1895 PR-A): per-conversation resume epoch (mirrors
+        # bot.py) and the sink of the turn currently being served, so a typed
+        # recovery choice can dispatch with the same room callbacks.
+        self._task_resume_generations: dict[Any, int] = {}
+        self._active_sink: Any = None
         self._config: Mapping[str, Any] | None = None
         self._ids: MatrixIdMap | None = None
         self._direct_rooms: _DirectRoomMap | None = None
@@ -435,6 +481,7 @@ class MatrixBot:
                 logger.info("Matrix frontend initialised a new bot device; start again without CCC_MATRIX_INITIALIZE")
                 return
             self._post_startup_banner(config, transport)
+            await self._startup_danso_recovery_scan()
             notifier = MatrixSpoolNotifier(self._settings, transport)
             watchdog = self._build_turn_age_watchdog()
             if not notifier.enabled and watchdog is None:
@@ -783,13 +830,21 @@ class MatrixBot:
         del session_id  # the session manager is the resume authority (see report)
         user_id, chat_id, room_id = self._job_identity(job, room_kind)
         body = str(job.get("body") or "")
-        command, args = self._parse_command(body)
-        if command == "skills":
-            return await self._cmd_skills(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
-        if command is not None:
-            text = await self._run_command(command, args, user_id=user_id, chat_id=chat_id)
-            return _turn_result(text, None)
-        return await self._run_message(body, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
+        self._active_sink = sink
+        try:
+            command, args = self._parse_command(body)
+            if command == "skills":
+                return await self._cmd_skills(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
+            if command == "task_resume":
+                return await self._cmd_task_resume(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
+            if command is not None:
+                text = await self._run_command(command, args, user_id=user_id, chat_id=chat_id)
+                return _turn_result(text, None)
+            if await self._answer_danso_recovery_choice(body, user_id=user_id, chat_id=chat_id):
+                return _turn_result("", None, streamed=True)
+            return await self._run_message(body, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
+        finally:
+            self._active_sink = None
 
     async def cancel(self, job: Mapping[str, Any]) -> bool:
         """``TurnRunner.cancel``: same handler path as ``/stop``."""
@@ -826,6 +881,10 @@ class MatrixBot:
             return await self._cmd_usage(user_id=user_id, chat_id=chat_id)
         if command == "stop":
             return await self._cmd_stop(user_id=user_id, chat_id=chat_id)
+        if command == "task_pause":
+            return await self._cmd_task_pause(args, user_id=user_id, chat_id=chat_id)
+        if command == "task_recover":
+            return await self._cmd_task_recover(user_id=user_id, chat_id=chat_id)
         raise ValueError(f"unsupported command: {command}")
 
     # -- conversation/session plumbing (mirrors bot.py) ----------------------
@@ -923,6 +982,39 @@ class MatrixBot:
     ) -> Any:
         key = self._conversation_key(user_id, chat_id)
         session, session_id, new_session = await self._resolve_turn_session(key)
+        response = await self._dispatch_turn(
+            body, key=key, user_id=user_id, chat_id=chat_id, session=session,
+            session_id=session_id, new_session=new_session, sink=sink,
+        )
+        # #1895: like the Telegram path, a failed Danso turn is followed by the
+        # recovery menu — after the failure text, never instead of it.
+        result = await self._finish(response, room_id)
+        await self._offer_danso_recovery_if_failed(response, key, user_id, chat_id)
+        return result
+
+    async def _dispatch_turn(
+        self,
+        body: str,
+        *,
+        key: Any,
+        user_id: int,
+        chat_id: int,
+        session: Mapping[str, Any],
+        session_id: str | None,
+        new_session: bool,
+        sink: TurnSink | None = None,
+        resume_task: bool = False,
+        dispatch_guard: Callable[[], bool] | None = None,
+    ) -> ChatResponse:
+        """One ``process_message`` call with this room's callbacks; persists the session."""
+
+        sink = sink or self._active_sink or _NullSink()
+        room_id = self.room_for_chat(chat_id) or ""
+        extra: dict[str, Any] = {}
+        if resume_task:
+            extra["resume_task"] = True
+        if dispatch_guard is not None:
+            extra["dispatch_guard"] = dispatch_guard
         response = await self._project_chat.process_message(
             user_message=body,
             user_id=user_id,
@@ -940,9 +1032,193 @@ class MatrixBot:
             notification_bot=self._notification_bot(),
             interim_message_callback=self._make_interim_callback(sink, room_id),
             usage_mode=MODE_INTERACTIVE,
+            **extra,
         )
         await self._save_session_id(key, response, user_id=user_id, chat_id=chat_id)
-        return await self._finish(response, room_id)
+        return response
+
+    # -- Danso long-task commands and recovery (#1895 PR-A) ------------------
+    #
+    # ``DansoRecoveryMixin`` is the Telegram implementation of the recovery
+    # offer/choice discipline (one-shot claim, binding guard, evidence-first
+    # continue). Matrix reuses it verbatim and supplies the few channel ports
+    # it needs. Differences that are deliberate:
+    # * offers are always the numbered text menu (Matrix has no inline
+    #   keyboards) and only the owner may see or answer them;
+    # * ``self._config`` is the Matrix JSON here, so every mixin method that
+    #   reads bridge settings through it is overridden to use ``self._settings``;
+    # * the restart scan only *offers* — an automatic resume would dispatch a
+    #   provider turn outside the transport's single-turn discipline, so it
+    #   waits for a transport self-job seam (#1895 PR-A2).
+
+    def _danso_recovery_enabled(self) -> bool:
+        return self._active_provider() == "danso" and bool(
+            getattr(self._settings, "danso_long_task_enabled", False)
+        )
+
+    def _danso_recovery_text_mode(self) -> bool:
+        return True
+
+    def _danso_recovery_auto_resume(self) -> bool:
+        return False
+
+    def _danso_recovery_auto_resume_retry_delay(self) -> int:
+        return 0
+
+    def _danso_recovery_route(self, user_id: int, chat_id: int) -> Any:
+        audience = resolve_memory_audience(
+            self._settings, user_id=user_id, chat_id=chat_id, route=self._memory_route()
+        )
+        return None if audience is None else [audience.kind, audience.scope]
+
+    def _memory_route(self) -> str:
+        return str(getattr(self._project_chat, "_memory_route", "matrix") or "matrix")
+
+    def _check_user_access(self, user_id: int) -> bool:
+        owner = self._owner_int()
+        return owner is not None and int(user_id) == owner
+
+    def _task_resume_generation(self, session_key: Any) -> int:
+        return self._task_resume_generations.get(session_key, 0)
+
+    def _bump_task_resume_generation(self, session_key: Any) -> int:
+        generation = self._task_resume_generations.get(session_key, 0) + 1
+        self._task_resume_generations[session_key] = generation
+        return generation
+
+    async def _enqueue_user_task(self, user_id: Any, run_task: Any, on_overflow: Any) -> bool:
+        # The transport already serialises one turn per room; a typed choice
+        # is answered inside that turn, so there is no second queue to join.
+        del user_id, on_overflow
+        await run_task()
+        return True
+
+    def _require_application(self) -> Any:
+        return _NoticeApp(self)
+
+    async def _send_smart(self, chat_id: int, text: str) -> None:
+        text = str(text or "")
+        if not text.strip():
+            return
+        room = self.room_for_chat(int(chat_id))
+        if room is not None and await self._send_formatted(room, text):
+            return
+        if not self._deliver_notice(int(chat_id), text):
+            logger.warning("Matrix recovery reply undeliverable for chat %s (no room)", chat_id)
+
+    async def _continue_danso_recovery(
+        self, key: Any, user_id: int, chat_id: int, epoch: int, route: Any,
+        current: Mapping[str, Any], snapshot: Any, *, auto: bool = False,
+    ) -> None:
+        del auto  # never automatic on Matrix in PR-A (see class comment)
+        from telegram_bot.core.danso_worker import TASK_RESUME_CONTROL
+
+        safe_resume = bool(snapshot.resume_allowed)
+        prompt = TASK_RESUME_CONTROL if safe_resume else snapshot.continuation()
+
+        def guard() -> bool:
+            return self._danso_recovery_guard(key, user_id, chat_id, epoch, route)
+
+        response = await self._dispatch_turn(
+            prompt, key=key, user_id=user_id, chat_id=chat_id, session=current,
+            session_id=current["session_id"] if safe_resume else None,
+            new_session=not safe_resume, resume_task=safe_resume, dispatch_guard=guard,
+        )
+        await self._send_smart(chat_id, response.content)
+        if not response.success:
+            await self._offer_danso_recovery(key, user_id, chat_id, force=True)
+
+    async def _answer_danso_recovery_choice(self, body: str, *, user_id: int, chat_id: int) -> bool:
+        """A typed ``1``/``2``/``3`` from the owner answers a pending offer (Telegram #1718)."""
+
+        action = RECOVERY_TEXT_ACTIONS.get(body.strip())
+        if action is None or not self._danso_recovery_enabled() or not self._check_user_access(user_id):
+            return False
+        key = self._conversation_key(user_id, chat_id)
+        current = await self._session_manager.get_session(key)
+        offer = current.get(OFFER)
+        if not isinstance(offer, dict) or not offer.get("token"):
+            return False
+        epoch, route = self._task_resume_generation(key), self._danso_recovery_route(user_id, chat_id)
+
+        async def report(text: str, keyboard_token: Any = None) -> None:
+            del keyboard_token  # text menus only
+            await self._send_smart(chat_id, text)
+
+        await self._apply_danso_recovery_choice(key, user_id, chat_id, offer["token"], action, epoch, route, report)
+        return True
+
+    async def _startup_danso_recovery_scan(self) -> None:
+        """Offer (never dispatch) recovery for stored Danso tasks after a restart."""
+
+        if not self._danso_recovery_enabled():
+            return
+        try:
+            await self._recover_danso_tasks(None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Matrix startup Danso recovery scan failed; /task_recover remains available")
+
+    async def _cmd_task_pause(self, args: list[str], *, user_id: int, chat_id: int) -> str:
+        if args:
+            return "Usage: /task_pause"
+        if not self._danso_recovery_enabled():
+            return "❌ Danso long-task mode is disabled."
+        request_pause = getattr(self._project_chat, "request_danso_task_pause", None)
+        status = await request_pause(user_id, chat_id) if callable(request_pause) else "unsupported"
+        return {
+            "requested": (
+                "⏸ Graceful pause requested. Wait for the saved-checkpoint result, then use /task_resume."
+            ),
+            "not_active": "ℹ️ No active Danso long task is running.",
+            "not_ready": (
+                "⏳ The native task is still starting or finishing; retry /task_pause after its checkpoint heartbeat."
+            ),
+            "unsupported": "❌ Explicit Danso long-task pause is unavailable.",
+        }.get(status, "❌ Explicit Danso long-task pause is unavailable.")
+
+    async def _cmd_task_recover(self, *, user_id: int, chat_id: int) -> str:
+        if not self._danso_recovery_enabled():
+            return "❌ Danso long-task mode is disabled."
+        shown = await self._offer_danso_recovery(self._conversation_key(user_id, chat_id), user_id, chat_id, force=True)
+        if shown:
+            return ""
+        return "현재 복구할 작업이 없거나 실행 중이라 기록을 읽을 수 없습니다. 잠시 후 다시 확인해 주세요."
+
+    async def _cmd_task_resume(self, *, user_id: int, chat_id: int, room_id: str, sink: TurnSink) -> Any:
+        """``/task_resume``: explicit no-prompt resume of the stored Danso journal."""
+
+        from telegram_bot.core.danso_worker import TASK_RESUME_CONTROL
+
+        if not self._danso_recovery_enabled():
+            return _turn_result("❌ Danso long-task mode is disabled.", None)
+        if not self._check_user_access(user_id):
+            return _turn_result("❌ Only the owner may resume a stored task.", None)
+        key = self._conversation_key(user_id, chat_id)
+        generation = self._task_resume_generation(key)
+        session, session_id, new_session = await self._resolve_turn_session(key)
+        if new_session or not session_id or session.get("provider", "claude") != "danso":
+            return _turn_result(
+                "📭 No paused Danso long task is stored for this conversation. "
+                "Start one first, or use /new for a fresh session.",
+                None,
+            )
+        route = self._danso_recovery_route(user_id, chat_id)
+
+        def guard() -> bool:
+            return (
+                self._task_resume_generation(key) == generation
+                and self._danso_recovery_route(user_id, chat_id) == route
+            )
+
+        response = await self._dispatch_turn(
+            TASK_RESUME_CONTROL, key=key, user_id=user_id, chat_id=chat_id, session=session,
+            session_id=session_id, new_session=False, resume_task=True, dispatch_guard=guard, sink=sink,
+        )
+        result = await self._finish(response, room_id)
+        await self._offer_danso_recovery_if_failed(response, key, user_id, chat_id)
+        return result
 
     def _codex_approval_policy(self) -> str:
         policy = self._bash_policy()
