@@ -541,6 +541,18 @@ class StreamingDefaultConfigTests(unittest.TestCase):
             module = self._load_with_env(td, CCC_TELEGRAM_OPTION_BUTTONS="true")
             self.assertTrue(module.config.enable_option_buttons)
 
+    def test_danso_recovery_text_mode_on_by_default(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(td)
+            self.assertTrue(module.config.danso_recovery_text_mode)
+
+    def test_danso_recovery_text_mode_can_be_disabled(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(
+                td, CCC_TELEGRAM_DANSO_RECOVERY_TEXT="false"
+            )
+            self.assertFalse(module.config.danso_recovery_text_mode)
+
 
 if __name__ == "__main__":
     unittest.main()

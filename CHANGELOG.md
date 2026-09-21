@@ -4,6 +4,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **Danso recovery offers default to typed 1/2/3 instead of tap buttons.**
+  `CCC_TELEGRAM_DANSO_RECOVERY_TEXT` Field default and the mixin getattr
+  fallback both flip false → true, matching the gongmyoung/soonwook drop-in
+  that already ran text mode in production. Unset env now renders the numbered
+  menu with no inline keyboard; `CCC_TELEGRAM_DANSO_RECOVERY_TEXT=false` keeps
+  the old buttons. Claim/guard/dispatch discipline is unchanged. Auto-resume
+  remains opt-in. Docs: `docs/danso-telegram.md`, `bridge/CLAUDE.md`,
+  `bridge/.env.example`.
+
 - **skill-review: degraded-telemetry lines carry the skill name, and the
   wrapper's state path is private at every component.** The two
   `note_degraded` call sites that know which skill degraded
