@@ -505,6 +505,12 @@ else
   err "doctor skill-promotion backlog verdict tests failed"
   tail -10 "$TMP/doctor-promotion-backlog-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_fleet_sync_test.py >"$TMP/doctor-fleet-sync-test.out" 2>&1; then
+  say "  ok doctor fleet-skills sync verdict tests"
+else
+  err "doctor fleet-skills sync verdict tests failed"
+  tail -10 "$TMP/doctor-fleet-sync-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_skill_promotion_fairness_test.py >"$TMP/skill-promotion-fairness-test.out" 2>&1; then
   say "  ok skill-promotion collect fairness tests (#1617)"
 else
