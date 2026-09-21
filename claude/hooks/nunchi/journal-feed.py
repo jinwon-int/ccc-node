@@ -42,8 +42,11 @@ def run(home, bot):
             if seen+failed>=20:break
             try:
                 key,fp,_=r.fingerprint(path)
-                prev=r.latest(receipt,key)
-                if prev and prev.get('fingerprint')==fp and prev.get('status')=='stored':continue
+                import contextlib,io
+                with contextlib.redirect_stdout(io.StringIO()):
+                    due=r.main(['due',str(receipt),str(path)])
+                if due==3:continue
+                if due!=0:raise ValueError('receipt_failed')
                 with os.fdopen(r.private_open(path,os.O_RDONLY)) as f:
                     if os.fstat(f.fileno()).st_size>2*1024*1024:raise ValueError('oversize_job')
                     job=json.load(f)
@@ -65,8 +68,13 @@ def run(home, bot):
                 seen+=1
             except ValueError as e:
                 if str(e)=='unrouted':unrouted+=1
-                else:failed+=1
-            except (OSError,KeyError,TypeError,subprocess.SubprocessError):failed+=1
+                else:
+                    failed+=1
+                    if 'fp' in locals():r.main(['failed',str(receipt),str(path),fp])
+            except (OSError,KeyError,TypeError,subprocess.SubprocessError):
+                failed+=1
+                try:r.main(['failed',str(receipt),str(path),fp])
+                except (OSError,ValueError):pass
         status={'schema':'ccc.nunchi.journal-feed.v1','finished_at':int(time.time()),'mirrored_jobs':seen,'failed':failed,'unrouted':unrouted}
         # Atomic status replacement with a unique owned scratch file.
         import tempfile

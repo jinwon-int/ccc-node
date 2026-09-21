@@ -43,10 +43,27 @@ class Pipeline(unittest.TestCase):
   db=target/'facts.db';db.write_text('bad');db.chmod(0o600)
   jobs=self.bot/'distill-journal';jobs.mkdir(mode=0o700)
   p=jobs/'job.json';p.write_text(json.dumps({'memory_audience':'private','memory_scope':scope,'status':'extraction_done','thread_id':'fixture','updated_at':'2026-09-22T00:00:00Z','extraction_output':{'honcho':[{'kind':'preference','text':'The user prefers concise technical summaries.','subject':'user'}]}}));p.chmod(0o600)
-  result=j.run(self.home,self.bot);self.assertEqual(result['failed'],1);self.assertFalse((self.home/'journal-receipts.jsonl').exists())
+  result=j.run(self.home,self.bot);self.assertEqual(result['failed'],1);self.assertEqual(json.loads((self.home/'journal-receipts.jsonl').read_text())['status'],'failed')
+  (self.home/'journal-receipts.jsonl').unlink()
   db.unlink();result=j.run(self.home,self.bot);self.assertEqual(result['mirrored_jobs'],1)
   c=sqlite3.connect(db);self.assertEqual(c.execute('select count(*) from peer_facts').fetchone()[0],1);c.close()
   self.assertEqual(j.run(self.home,self.bot)['mirrored_jobs'],0)
+ def test_bad_jobs_do_not_starve_later_valid_job(self):
+  scope='private-'+'a'*32;target=self.bot/'memory-audiences'/scope
+  target.mkdir(mode=0o700,parents=True)
+  jobs=self.bot/'distill-journal';jobs.mkdir(mode=0o700)
+  for i in range(20):
+   f=jobs/f'{i:02}.json';f.write_text('{bad');f.chmod(0o600)
+  p=jobs/'zz.json';p.write_text(json.dumps({'memory_audience':'private','memory_scope':scope,'status':'extraction_done','thread_id':'fixture','updated_at':'2026-09-22T00:00:00Z','extraction_output':{'honcho':[]}}));p.chmod(0o600)
+  self.assertEqual(j.run(self.home,self.bot)['failed'],20)
+  self.assertEqual(j.run(self.home,self.bot)['mirrored_jobs'],1)
+ def test_corrupt_global_db_does_not_block_private_review(self):
+  (self.home/'facts.db').write_text('bad')
+  scope=self.bot/'memory-audiences'/('private-'+'a'*32)/'nunchi';scope.mkdir(parents=True,mode=0o700)
+  c=sqlite3.connect(scope/'facts.db');c.execute('create table peer_facts(id integer primary key,kind text,fact text,valid_to text)');c.close()
+  key=self.file('key','dummy')
+  result=v.run(self.home,self.bot,key)
+  self.assertEqual(result['initialized'],1);self.assertEqual(result['unavailable_databases'],1)
  def source(self):
   c=sqlite3.connect(self.home/'facts.db');c.execute('create table peer_facts(id integer primary key,kind text,fact text,valid_to text)');c.commit();c.close();(self.home/'facts.db').chmod(0o600)
   return self.home/'facts.db'
@@ -71,6 +88,8 @@ class Pipeline(unittest.TestCase):
   self.assertIsNone(v.sanitize('HUG legal case details in a Codex session must be retained.'))
   self.assertIsNone(v.sanitize('My family prefers to use Codex to manage medical records.'))
   self.assertIsNone(v.sanitize('Personal preferences without an operational reference.'))
+  self.assertIsNone(v.sanitize('SSH authorization uses ghp_1234567890abcdefghijklmnop for service account alice.'))
+  self.assertIsNone(v.sanitize('Codex formatted Alice Smith’s divorce settlement for review.'))
   s=v.sanitize('nosuk CI deploy to https://example.com/private and 100.2.3.4 completed.')
   self.assertNotIn('example.com',s);self.assertNotIn('nosuk',s);self.assertNotIn('100.2',s)
   probs={k:1/10 for k in v.KINDS};raw={'model':v.MODEL,'answers':{'kind':{'type':'choice','choice':'fact','confidence':.9,'probabilities':probs}}}

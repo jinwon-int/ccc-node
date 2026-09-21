@@ -17,12 +17,21 @@ DENY=re.compile(r'가족|아내|남편|자녀|아이|딸|아들|주민|생년|�
 TECH=re.compile(r'\b(?:ccc|nunchi|jev|codex|claude|piri|danso|git|github|PR|CI|API|SQLite|JSON|systemd|cron|Docker|pytest|SSH)\b|배포|브리지|회귀.?테스트|수집기|스키마',re.I)
 NAMES=re.compile(r'서서|노숙|진군|등애|순욱|방통|공명|곽가|육손|소교|대교|공융|서진온|\b(?:seoseo|nosuk|jingun|dungae|soonwook|bangtong|gongmyoung|gwakga|yukson|sogyo|daegyo|gongyung|seo-jin-on|jinwon-int|jinon86)\b',re.I)
 
+# Closed vocabulary: unfamiliar names, free-form identifiers or credentials
+# stay local. Deliberately favors privacy over coverage. Expand by review.
+SAFE_WORDS=set("""the a an and or but if then after before during when while with without to from of for in on at by is are was were be been being has have had not no only one all any this that these those it its user agent node service worker server client memory classification review collector extraction storage pipeline schema journal snapshot database sqlite json api ci pr git github codex claude piri danso nunchi jev docker ssh cron systemd pytest test tests regression unit integration passed failed completed successfully successfully deployed deployment deploy patch fix fixed error errors request response timeout retry retries budget limit enabled disabled enable disable changed unchanged private shared scope scoped route routing authentication authorization permission permissions denied allow allowed log logs code commit branch merge merged checked verify verified needs requires must should cannot can will would uses use used prefers concise technical summaries reports report decision progress task context fact observation constraint correction preference procedure reference number tokens output input provider model readonly read write saved stored duplicate deduplication backup restore restored review required pending running stopped healthy unhealthy unavailable available version build update updated upgrade rollback restart restarted status""".split())
+SAFE_WORDS.update("""사용자는 사용자가 에이전트 노드 서버 서비스 작업 기억 분류 검토 수집 추출 저장 파이프라인 스키마 저널 스냅샷 데이터베이스 회귀 테스트 테스트가 테스트를 통과했다 통과했습니다 완료했다 완료했습니다 성공했다 성공했습니다 실패했다 실패했습니다 배포 배포했다 배포했습니다 패치 수정 수정했다 수정했습니다 오류 요청 응답 시간초과 재시도 예산 제한 활성화 비활성화 변경 변경했다 변경했습니다 유지한다 유지합니다 비공개 공유 영역 경로 인증 권한 거부 허용 로그 코드 커밋 브랜치 병합 병합했다 병합했습니다 확인 확인했다 확인했습니다 검증 필요하다 필요합니다 필수 금지 사용한다 사용합니다 선호한다 선호합니다 간결한 기술 요약 보고 결정 진행 상황 배경 사실 관찰 제약 정정 선호 절차 읽기 쓰기 저장했다 저장했습니다 중복 백업 복구 복구했다 복구했습니다 대기 실행 중지 정상 비정상 사용가능 버전 빌드 업데이트 롤백 재시작 상태 후 전 동안 먼저 다음 및 또는 다만 이유 때문에 때문에만 해야 한다 했다고 않았다 않는다 아닌""".split())
+
+def safe_vocabulary(text):
+    words=re.findall(r"[\w-]+",text.casefold())
+    return bool(words) and all(w in SAFE_WORDS for w in words)
+
 def sanitize(text):
     if not isinstance(text,str) or not 20<=len(text)<=1200 or DENY.search(text) or not TECH.search(text):return None
     text=re.sub(r'https?://\S+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|(?:\d{1,3}\.){3}\d{1,3}|(?:/[^\s,;]+)+|\b[A-Fa-f0-9]{16,}\b','[reference]',text)
     text=re.sub(r'\b\d[\d:./_-]{3,}\b','[number]',text)
     text=NAMES.sub('[node]',text)
-    return text
+    return text if safe_vocabulary(text) else None
 
 def validate(raw):
     if raw.get('model')!=MODEL:raise ValueError('model')
@@ -55,7 +64,7 @@ def run(home,bot,keypath,call=request):
         c.executescript('CREATE TABLE IF NOT EXISTS cursors(path TEXT PRIMARY KEY, inode TEXT NOT NULL, last_id INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS reviews(path TEXT,id INTEGER, fingerprint TEXT, day TEXT,status TEXT,kind TEXT,choice TEXT,confidence REAL,model TEXT,PRIMARY KEY(path,id,fingerprint));')
         question=json.loads((HERE/'jev-kind-question.json').read_text())
         paths=[home/'facts.db']+sorted((bot/'memory-audiences').glob('*/nunchi/facts.db'))
-        used=0;initialized=0;skipped=0
+        used=0;initialized=0;skipped=0;unavailable=0
         key=None
         for db in paths:
             if not db.exists():continue
@@ -94,8 +103,10 @@ def run(home,bot,keypath,call=request):
                         c.execute('update reviews set status=? where path=? and id=? and fingerprint=?',('failed',str(db),fid,fp));c.commit()
                         return {'attempts':used,'failed':1,'filtered':skipped}
                     c.commit()
+            except sqlite3.DatabaseError:
+                unavailable+=1
             finally:source.close()
-        return {'attempts':used,'initialized':initialized,'filtered':skipped}
+        return {'attempts':used,'initialized':initialized,'filtered':skipped,'unavailable_databases':unavailable}
     finally:
         if 'c' in locals():c.close()
         os.close(lock)
