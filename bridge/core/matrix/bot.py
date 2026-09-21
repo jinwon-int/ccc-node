@@ -70,6 +70,8 @@ SUPPORTED_COMMANDS = frozenset(
     {"new", "model", "effort", "usage", "skills", "stop", "task_pause", "task_resume", "task_recover"}
 )
 _STATUS_HANDLE = 1
+SELF_JOB_PREFIX = "$self-"
+SELF_JOB_DANSO_AUTO_RESUME = "danso-auto-resume"
 STATUS_MIN_INTERVAL_S = 15.0  # match Telegram CCC_HEARTBEAT_* defaults
 _HEALTH_INTERVAL_S = 10.0  # match bot_lifecycle._WORKLOAD_INTERVAL
 _RUNTIME_MODEL_PROVIDERS = frozenset({"codex", "piri", "crush", "danso"})
@@ -894,6 +896,8 @@ class MatrixBot(DansoRecoveryMixin):
         body = str(job.get("body") or "")
         self._active_sink = sink
         try:
+            if str(job.get("event_id") or "").startswith(SELF_JOB_PREFIX):
+                return await self._run_self_job(body, user_id=user_id, chat_id=chat_id)
             command, args = self._parse_command(body)
             if command == "skills":
                 return await self._cmd_skills(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
@@ -1109,9 +1113,9 @@ class MatrixBot(DansoRecoveryMixin):
     #   keyboards) and only the owner may see or answer them;
     # * ``self._config`` is the Matrix JSON here, so every mixin method that
     #   reads bridge settings through it is overridden to use ``self._settings``;
-    # * the restart scan only *offers* — an automatic resume would dispatch a
-    #   provider turn outside the transport's single-turn discipline, so it
-    #   waits for a transport self-job seam (#1895 PR-A2).
+    # * the restart scan never dispatches by itself: an eligible automatic
+    #   resume becomes a transport *self-job* (PR-A2) that runs as a normal
+    #   turn, with this room's sink, under the single-turn discipline.
 
     def _danso_recovery_enabled(self) -> bool:
         return self._active_provider() == "danso" and bool(
@@ -1122,10 +1126,55 @@ class MatrixBot(DansoRecoveryMixin):
         return True
 
     def _danso_recovery_auto_resume(self) -> bool:
-        return False
+        return bool(getattr(self._settings, "danso_recovery_auto_resume", False))
 
     def _danso_recovery_auto_resume_retry_delay(self) -> int:
-        return 0
+        try:
+            delay = int(getattr(self._settings, "danso_recovery_auto_resume_retry_delay_seconds", 10))
+        except (TypeError, ValueError):
+            return 0
+        return min(max(delay, 0), 60)
+
+    async def _auto_resume_danso_recovery(
+        self, key: Any, user_id: int, chat_id: int, token: str, epoch: int, route: Any, snapshot: Any, offer: Any
+    ) -> bool:
+        """Outside a served turn (restart scan) hand the resume to the transport as a
+        self-job; inside one (that self-job running) do the mixin's automatic resume
+        with this room's sink. (#1895 PR-A2)"""
+
+        if self._active_sink is not None:
+            return await super()._auto_resume_danso_recovery(key, user_id, chat_id, token, epoch, route, snapshot, offer)
+        transport = self._transport
+        room = self.room_for_chat(int(chat_id))
+        enqueue = getattr(transport, "enqueue_self_job", None)
+        if transport is None or room is None or not callable(enqueue):
+            logger.info("Matrix auto-resume deferred: no transport/room for chat %s", chat_id)
+            return False
+        body = json.dumps({"kind": SELF_JOB_DANSO_AUTO_RESUME, "v": 1})
+        try:
+            enqueue(room, body, key=f"{SELF_JOB_DANSO_AUTO_RESUME}:{snapshot.fingerprint[:16]}")
+        except Exception as error:
+            logger.warning("Matrix auto-resume self-job enqueue failed: %s", type(error).__name__)
+            return False
+        # The offer stays pending (no NOTIFIED mark): the self-job re-inspects
+        # the journal inside its turn and only then claims it.
+        return True
+
+    async def _run_self_job(self, body: str, *, user_id: int, chat_id: int) -> Any:
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            payload = None
+        kind = payload.get("kind") if isinstance(payload, dict) else None
+        if kind != SELF_JOB_DANSO_AUTO_RESUME or not self._check_user_access(user_id):
+            logger.warning("Matrix self-job ignored: kind=%s", kind)
+            return _turn_result("", None, streamed=True)
+        key = self._conversation_key(user_id, chat_id)
+        # Re-runs the full eligibility check; with the sink set the mixin's
+        # automatic path claims the offer and dispatches. Anything no longer
+        # eligible falls back to the ordinary menu.
+        await self._offer_danso_recovery(key, user_id, chat_id, auto=True)
+        return _turn_result("", None, streamed=True)
 
     def _danso_recovery_route(self, user_id: int, chat_id: int) -> Any:
         audience = resolve_memory_audience(
@@ -1172,7 +1221,6 @@ class MatrixBot(DansoRecoveryMixin):
         self, key: Any, user_id: int, chat_id: int, epoch: int, route: Any,
         current: Mapping[str, Any], snapshot: Any, *, auto: bool = False,
     ) -> None:
-        del auto  # never automatic on Matrix in PR-A (see class comment)
         from telegram_bot.core.danso_worker import TASK_RESUME_CONTROL
 
         safe_resume = bool(snapshot.resume_allowed)
@@ -1181,11 +1229,17 @@ class MatrixBot(DansoRecoveryMixin):
         def guard() -> bool:
             return self._danso_recovery_guard(key, user_id, chat_id, epoch, route)
 
-        response = await self._dispatch_turn(
-            prompt, key=key, user_id=user_id, chat_id=chat_id, session=current,
-            session_id=current["session_id"] if safe_resume else None,
-            new_session=not safe_resume, resume_task=safe_resume, dispatch_guard=guard,
-        )
+        async def dispatch() -> ChatResponse:
+            return await self._dispatch_turn(
+                prompt, key=key, user_id=user_id, chat_id=chat_id, session=current,
+                session_id=current["session_id"] if safe_resume else None,
+                new_session=not safe_resume, resume_task=safe_resume, dispatch_guard=guard,
+            )
+
+        response = await dispatch()
+        if auto and safe_resume and await self._auto_resume_retry_allowed(
+                key, user_id, chat_id, epoch, route, current, snapshot, response):
+            response = await dispatch()  # #1888 stale-lock retry, same rules as Telegram
         await self._send_smart(chat_id, response.content)
         if not response.success:
             await self._offer_danso_recovery(key, user_id, chat_id, force=True)
@@ -1211,7 +1265,8 @@ class MatrixBot(DansoRecoveryMixin):
         return True
 
     async def _startup_danso_recovery_scan(self) -> None:
-        """Offer (never dispatch) recovery for stored Danso tasks after a restart."""
+        """Offer recovery for stored Danso tasks after a restart; eligible automatic
+        resumes are queued as transport self-jobs, never dispatched here."""
 
         if not self._danso_recovery_enabled():
             return

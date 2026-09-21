@@ -656,6 +656,18 @@ class MatrixTransport:
         )
         return self.store.notice(req, key or unique_key("unsolicited"), text)
 
+    def enqueue_self_job(self, room_id: str, body: str, *, key: str) -> str:
+        """Queue a turn the frontend runs for the owner in ``room_id`` (#1895 PR-A2).
+
+        Only the configured owner's scope and an allowed room: the job then
+        goes through the normal claim → runner.run(sink) → finish path, so the
+        work happens inside the transport's single-turn discipline instead of
+        beside it. Idempotent per ``key``.
+        """
+        if room_id not in self.c["rooms"]:
+            raise ValueError("room-not-allowed")
+        return self.store.self_job(room_id, self.c["owner"], body, key=key)
+
     # -- input ----------------------------------------------------------------
 
     async def input(self, req: Request) -> None:

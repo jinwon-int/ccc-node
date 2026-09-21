@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from telegram_bot.core.bot_danso_recovery import OFFER, RECOVERY_TEXT_MENU
+from telegram_bot.core.bot_danso_recovery import AUTO_RESUME_NOTICE, OFFER, RECOVERY_TEXT_MENU
 from telegram_bot.core.danso_worker import TASK_RESUME_CONTROL
 from telegram_bot.core.matrix.bot import MatrixBot
 from telegram_bot.core.project_chat_types import ChatResponse
@@ -227,3 +227,115 @@ async def test_claude_provider_never_scans_or_offers(tmp_path: Path, matrix_conf
     chat.response = ChatResponse(content="❌ failed", success=False, session_id="s2")
     await _turn(bot, "hi")
     assert transport.notices == []
+
+
+# ---- PR-A2: restart automatic resume runs as a transport self-job
+
+class SelfJobTransport(FormattedTransport):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.self_jobs: list[tuple[str, str, str]] = []
+
+    def enqueue_self_job(self, room_id: str, body: str, *, key: str) -> str:
+        self.self_jobs.append((room_id, body, key))
+        return "$self-" + key
+
+
+async def _auto_bot(tmp_path: Path, **kw: Any):
+    bot, chat, manager, _transport = await _danso_bot(tmp_path, **kw)
+    bot._settings.danso_recovery_auto_resume = True
+    transport = SelfJobTransport({}, bot.runner)
+    bot._transport = transport
+    return bot, chat, manager, transport
+
+
+async def _run_self_job(bot: MatrixBot, transport: SelfJobTransport) -> Any:
+    room, body, key = transport.self_jobs[-1]
+    job = _job(body, room=room, event_id="$self-" + key)
+    return await bot.runner.run(job, sink=FakeSink(), session_id=None, room_kind="direct")
+
+
+@pytest.mark.anyio
+async def test_restart_scan_queues_a_self_job_instead_of_dispatching(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    bot, chat, manager, transport = await _auto_bot(tmp_path)
+    await bot._startup_danso_recovery_scan()
+    assert chat.calls == [] and transport.notices == []  # no dispatch, no menu
+    assert len(transport.self_jobs) == 1
+    room, body, key = transport.self_jobs[0]
+    assert room == DM_ROOM and key.startswith("danso-auto-resume:")
+    assert '"kind": "danso-auto-resume"' in body
+    session = await _session(bot, manager)
+    assert session[OFFER]["token"] and "danso_recovery_notified" not in session
+    await bot._startup_danso_recovery_scan()  # idempotent key while the job is pending
+    assert transport.self_jobs[1][2] == key and chat.calls == []
+
+
+@pytest.mark.anyio
+async def test_self_job_turn_performs_the_automatic_resume_with_the_room_sink(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    bot, chat, manager, transport = await _auto_bot(tmp_path)
+    await bot._startup_danso_recovery_scan()
+    chat.response = ChatResponse(content="resumed", session_id="sid")
+    result = await _run_self_job(bot, transport)
+    assert result.streamed is True
+    assert len(chat.calls) == 1
+    call = chat.calls[0]
+    assert call["user_message"] == TASK_RESUME_CONTROL and call["resume_task"] is True and call["session_id"] == "sid"
+    assert call["dispatch_guard"]()
+    session = await _session(bot, manager)
+    assert session["danso_recovery_auto_resumed"] == snapshot("paused", True).fingerprint
+    assert OFFER not in session
+    assert any(AUTO_RESUME_NOTICE.split("{")[0] in text for _room, text in transport.notices)
+    assert any("resumed" in body for _r, body, _h in transport.formatted)
+    # Unchanged journal after the attempt: the next scan offers the menu, never a second self-job.
+    await bot._startup_danso_recovery_scan()
+    assert len(transport.self_jobs) == 1
+    assert any(RECOVERY_TEXT_MENU in text for _room, text in transport.notices)
+
+
+@pytest.mark.anyio
+async def test_self_job_retries_once_after_a_stale_lock_refusal(tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    bot, chat, manager, transport = await _auto_bot(tmp_path)
+    bot._settings.danso_recovery_auto_resume_retry_delay_seconds = 5
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+    monkeypatch.setattr("telegram_bot.core.bot_danso_recovery.asyncio.sleep", fake_sleep)
+    await bot._startup_danso_recovery_scan()
+    failure = ChatResponse(content="❌ Processing failed: session", success=False, session_id="sid", failure_code="danso_session")
+    responses = iter([failure, ChatResponse(content="continued", session_id="sid")])
+
+    async def process_message(**kwargs: Any) -> ChatResponse:
+        chat.calls.append(kwargs)
+        return next(responses)
+    chat.process_message = process_message  # type: ignore[method-assign]
+    await _run_self_job(bot, transport)
+    assert len(chat.calls) == 2 and slept == [5]
+    assert any("continued" in body for _r, body, _h in transport.formatted)
+    assert OFFER not in await _session(bot, manager)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("why", ["not_resumable", "opt_in_off"])
+async def test_scan_offers_menu_when_auto_resume_is_not_eligible(tmp_path: Path, matrix_config: dict[str, Any], why: str) -> None:
+    kw = {"state": "pending_provider", "allowed": False} if why == "not_resumable" else {}
+    bot, chat, manager, transport = await _auto_bot(tmp_path, **kw)
+    if why == "opt_in_off":
+        bot._settings.danso_recovery_auto_resume = False
+    await bot._startup_danso_recovery_scan()
+    assert transport.self_jobs == [] and chat.calls == []
+    assert len(transport.notices) == 1 and RECOVERY_TEXT_MENU in transport.notices[0][1]
+
+
+@pytest.mark.anyio
+async def test_foreign_or_malformed_self_jobs_never_dispatch(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    bot, chat, manager, transport = await _auto_bot(tmp_path)
+    await bot._startup_danso_recovery_scan()
+    room, body, key = transport.self_jobs[0]
+    kid_job = _job(body, room=room, sender=KID, event_id="$self-" + key)
+    result = await bot.runner.run(kid_job, sink=FakeSink(), session_id=None, room_kind="direct")
+    assert result.streamed is True and chat.calls == []
+    bad = _job('{"kind":"something-else"}', room=room, event_id="$self-other")
+    await bot.runner.run(bad, sink=FakeSink(), session_id=None, room_kind="direct")
+    assert chat.calls == []
+    assert (await _session(bot, manager))[OFFER]["token"]  # owner's offer still pending
