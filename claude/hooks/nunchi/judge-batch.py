@@ -127,6 +127,15 @@ def bounded_float_env(env, key, default, minimum, maximum, clamp=False):
 # existed. Only a decision that *carries* a confidence can ever be held.
 MIN_CONFIDENCE = bounded_float_env(
     os.environ, "NUNCHI_JUDGE_MIN_CONFIDENCE", 0.0, 0.0, 1.0, clamp=True)
+# #1891 — G3 flags are overwhelmingly drifted duplicates, not contradictions
+# (yukson shadow 2026-09-21: of 141 flagged pairs an independent judge called
+# 140 "same" and 1 "contradicts"). A pair this close is a MERGE candidate for
+# the owner (`nunchi.py merge <dup> --into <survivor>`), not a verdict for a
+# model: clearing the flag would leave two open copies, and a model "clear" on
+# a near-identical pair spends a call to say what the overlap already says.
+# Floor 0.6 = the G3 gate itself; 1.0 disables the class (every pair judged).
+DUP_THRESHOLD = bounded_float_env(
+    os.environ, "NUNCHI_G3_DUP_THRESHOLD", 0.85, 0.6, 1.0, clamp=True)
 
 VERDICTS = ("clear", "conflict", "human")
 PROVIDERS = ("claude", "codex", "typesafe")
@@ -247,8 +256,11 @@ def fetch_queue(conn):
     re-expressed as a SQL predicate here: a second copy of the rule would drift
     from the canonical one and re-hide the gap it exists to surface.
 
-    Returns ``(queue, deferred_ids)`` — the queue is capped, the deferred count
-    is a full scan so the report can state the real backlog.
+    Returns ``(queue, deferred_ids, duplicates)`` — the queue is capped, the
+    deferred count is a full scan so the report can state the real backlog.
+    ``duplicates`` (#1891) are ``(id, sibling_id, ratio)`` for flagged items
+    whose best open sibling overlaps >= DUP_THRESHOLD: merge candidates for the
+    owner, held out of the CAP for the same reason G5 items are.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=MIN_AGE_HOURS)).isoformat(timespec="seconds")
     cursor = conn.execute(
@@ -259,12 +271,17 @@ def fetch_queue(conn):
     )
     queue = []
     deferred = []
+    duplicates = []
     for row in cursor:
         if nunchi._g5_reasonless_decision(row[2], row[3], row[6]):
             deferred.append(row[0])
+            continue
+        dup = duplicate_candidate(live_conflict(conn, row[0], row[1], row[3], row[2]))
+        if dup is not None:
+            duplicates.append((row[0], dup[0], dup[1]))
         elif len(queue) < CAP:
             queue.append(row)
-    return queue, deferred
+    return queue, deferred, duplicates
 
 
 def live_conflict(conn, fact_id, observed, text, kind=None):
@@ -293,9 +310,33 @@ def live_conflict(conn, fact_id, observed, text, kind=None):
             f" WHERE {where} AND valid_to IS NULL AND id != ?",
             params + (fact_id,)).fetchall():
         old = nunchi._tokens(fact)
-        if old and len(new & old) / min(len(new), len(old)) >= 0.6:
-            hits.append((fid, fact))
+        if not old:
+            continue
+        ratio = len(new & old) / min(len(new), len(old))
+        if ratio >= 0.6:
+            hits.append((fid, fact, ratio))
     return hits
+
+
+def duplicate_candidate(siblings):
+    """#1891 — the near-identical sibling, or None.
+
+    Returns ``(sibling_id, ratio)`` for the highest-overlap sibling when that
+    overlap reaches DUP_THRESHOLD. The caller holds such an item out of the
+    judge CAP exactly like a G5 decision: it is owner-actionable (merge), and
+    re-judging it every run would starve the queue behind it (#1788).
+    """
+    if not siblings or DUP_THRESHOLD >= 1.0:  # 1.0 = class disabled, every pair judged
+        return None
+    sid, _fact, ratio = max(siblings, key=lambda h: h[2])
+    return (sid, ratio) if ratio >= DUP_THRESHOLD else None
+
+
+def merge_proposal(fid, sid):
+    """The command the owner runs; the newer row folds into the older one so
+    the surviving id is the one earlier references already point at."""
+    dup, survivor = (fid, sid) if fid > sid else (sid, fid)
+    return f"nunchi.py merge {dup} --into {survivor}"
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +382,9 @@ def build_judge_state(item, siblings):
     two backends can never judge subtly different material.
     """
     fid, observed, kind, text, rank, created, _because = item
-    sib_lines = "\n".join(f"- #{sid}: {sfact}" for sid, sfact in siblings[:5])
+    # (id, fact[, ratio]) — live_conflict adds the ratio (#1891); older callers and
+    # fixtures still pass pairs, and the prompt never shows the number anyway.
+    sib_lines = "\n".join(f"- #{sib[0]}: {sib[1]}" for sib in siblings[:5])
     ttl_note = observation_ttl_note(created) if kind == "observation" else ""
     ttl_line = (
         f"\nEvidence-weight note: {ttl_note} — treat this evidence as aging,"
@@ -985,7 +1028,7 @@ def _confidence_cell(decision):
     return "—" if confidence is None else f"{float(confidence):.2f}"
 
 
-def build_report(stamp, decisions, clears, humans, applied, backup, deferred=(), held=()):
+def build_report(stamp, decisions, clears, humans, applied, backup, deferred=(), held=(), duplicates=()):
     mode = "APPLY" if APPLY else "dry-run"
     # The scoped fan-out re-runs this script per canonical scope and every child
     # inherits the same CCC_STATE_DIR, so each scope's run overwrites the same
@@ -1000,7 +1043,8 @@ def build_report(stamp, decisions, clears, humans, applied, backup, deferred=(),
         f"- scope: {scope or 'unset'} (CCC_NUNCHI_AUDIENCE_SCOPE)",
         f"- triaged: {len(decisions)} · held: {len(held)}",
         f"- queue processed: {len(decisions)} (CAP {CAP}, freshness moat {MIN_AGE_HOURS}h)"
-        + (f" · g5-deferred: {len(deferred)}" if deferred else ""),
+        + (f" · g5-deferred: {len(deferred)}" if deferred else "")
+        + (f" · g3-duplicate: {len(duplicates)}" if duplicates else ""),
         f"- deterministic clear: {sum(1 for d in decisions if d['class'] == 'deterministic-clear')}",
         f"- judge: {sum(1 for d in decisions if d['class'] == 'judge')}"
         f" (clear {sum(1 for d in decisions if d['class'] == 'judge' and d['verdict'] == 'clear')})",
@@ -1064,6 +1108,21 @@ def build_report(stamp, decisions, clears, humans, applied, backup, deferred=(),
         if len(deferred) > len(sample):
             lines.append(f"# ... and {len(deferred) - len(sample)} more")
         lines.append("```")
+    if duplicates:
+        sample = list(duplicates)[:_DEFERRED_SAMPLE]
+        lines += [
+            "",
+            "## g3-duplicate (merge candidates, held out of the CAP)",
+            "",
+            f"- near-identical open siblings (overlap >= {DUP_THRESHOLD:.2f}): **{len(duplicates)}** (#1891)",
+            "- a clear would leave two open copies; fold the newer into the older, then clear the survivor's flag:",
+            "",
+            "```",
+        ]
+        lines += [f"{merge_proposal(fid, sid)}  # overlap {ratio:.2f}" for fid, sid, ratio in sample]
+        if len(duplicates) > len(sample):
+            lines.append(f"# ... and {len(duplicates) - len(sample)} more")
+        lines.append("```")
     return "\n".join(lines) + "\n"
 
 
@@ -1079,7 +1138,7 @@ def run_single_db():
             print("judge-batch: another run holds the lock — skipping")
             return 0
         conn = sqlite3.connect(DB)
-        queue, deferred = fetch_queue(conn)
+        queue, deferred, duplicates = fetch_queue(conn)
         decisions = triage_queue(conn, queue)
         clears, applied, backup, held = apply_decisions(conn, decisions)
         humans = [d for d in decisions if d["verdict"] != "clear"]
@@ -1098,6 +1157,20 @@ def run_single_db():
                 "supersede_proposal": None, "backend": None, "attempts": [],
                 "confidence": None,
             })
+        if duplicates:
+            # #1891 — one aggregate line per run (the G5 pattern): the owner
+            # action is a merge, so nothing here is a verdict to re-record daily.
+            audit({
+                "ts": stamp, "db": DB, "class": "g3-duplicate-backlog",
+                "verdict": "human", "applied": False,
+                "count": len(duplicates),
+                "ids": [fid for fid, _sid, _r in duplicates[:_DEFERRED_SAMPLE]],
+                "proposals": [merge_proposal(fid, sid) for fid, sid, _r in duplicates[:_DEFERRED_SAMPLE]],
+                "rationale": (f"near-identical open sibling (overlap >= {DUP_THRESHOLD:.2f}) —"
+                              " merge candidates held out of the CAP (#1891)"),
+                "supersede_proposal": None, "backend": None, "attempts": [],
+                "confidence": None,
+            })
         for d in decisions:
             audit({
                 "ts": stamp, "db": DB, "id": d["id"], "class": d["class"],
@@ -1111,7 +1184,7 @@ def run_single_db():
             })
         write_report(
             build_report(stamp, decisions, clears, humans, applied, backup,
-                         deferred, held),
+                         deferred, held, duplicates=duplicates),
             humans,
         )
         conn.close()
@@ -1121,7 +1194,8 @@ def run_single_db():
               f" {len(clears)} clear, {len(humans)} human-pending"
               + (f", {applied} applied" if APPLY else "")
               + (f", {len(held)} low-confidence" if held else "")
-              + (f", {len(deferred)} g5-deferred" if deferred else ""))
+              + (f", {len(deferred)} g5-deferred" if deferred else "")
+              + (f", {len(duplicates)} g3-duplicate" if duplicates else ""))
         return 0
 
 
