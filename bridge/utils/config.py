@@ -1096,6 +1096,20 @@ class Config(
             "decision 2026-09-21)."
         ),
     )
+    danso_recovery_auto_resume_retry_delay_seconds: int = Field(
+        default=10,
+        ge=0,
+        le=60,
+        alias="CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME_RETRY_DELAY_SECONDS",
+        description=(
+            "Restart-only auto-resume (#1880): when the automatic resume fails "
+            "with the provider-normalized `danso_session` code (typically a "
+            "stale journal lock left by the forced teardown) and the journal "
+            "is still byte-identical and resumable, wait this many seconds and "
+            "retry exactly once before falling back to the menu. 0 disables "
+            "the retry. Never applies to user-chosen continues."
+        ),
+    )
 
     enable_entity_renderer: bool = Field(
         default=True,

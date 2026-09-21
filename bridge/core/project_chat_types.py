@@ -62,6 +62,11 @@ class ChatResponse:
     # would make a log string load-bearing (#846). `coalesced-turn` is typed
     # for diagnostics but excluded from the retry set (#1128).
     failure_class: Optional[str] = None
+    # Provider-normalized terminal error code (e.g. `danso_session`), set only
+    # when a provider-terminal ErrorEvent ended the turn. Diagnostics and the
+    # restart-only auto-resume retry (#1880) read it; it never drives the
+    # generic bounded retry above.
+    failure_code: Optional[str] = None
 
 
 @dataclass

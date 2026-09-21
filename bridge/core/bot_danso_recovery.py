@@ -38,6 +38,10 @@ RECOVERY_TEXT_ACTIONS = {'1': 'continue', '2': 'new', '3': 'view'}
 # CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME. 불확실/실패/예산 소진, 실패 후 제안,
 # /task_recover 는 그대로 메뉴다.
 AUTO_RESUME_STATES = {'ready', 'paused'}
+AUTO_RESUME_RETRY_CODE = 'danso_session'  # provider-normalized code of a stale-lock refusal
+AUTO_RESUME_RETRY_NOTICE = (
+    '자동 재개가 세션 오류로 바로 실패했습니다(모델 요청 없음). 저널이 그대로라 {delay}초 후 1회만 다시 시도합니다.'
+)
 AUTO_RESUME_NOTICE = (
     '재시작 후 저장된 작업이 재개 가능한 상태({state})로 확인되어 자동으로 이어서 진행합니다 '
     '(CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME). 멈추려면 /stop, 새 작업은 /new.\n'
@@ -61,6 +65,13 @@ class DansoRecoveryMixin:
 
     def _danso_recovery_auto_resume(self):
         return bool(getattr(self._config, 'danso_recovery_auto_resume', False))
+
+    def _danso_recovery_auto_resume_retry_delay(self):
+        try:
+            delay = int(getattr(self._config, 'danso_recovery_auto_resume_retry_delay_seconds', 10))
+        except (TypeError, ValueError):
+            return 0
+        return min(max(delay, 0), 60)
 
     def _danso_recovery_route(self, user_id, chat_id):
         audience = resolve_memory_audience(self._config, user_id=user_id, chat_id=chat_id)
@@ -164,7 +175,7 @@ class DansoRecoveryMixin:
             await bot.send_message(chat_id=chat_id, text=text,
                                    reply_markup=keyboard(keyboard_token) if keyboard_token else None)
         await self._apply_danso_recovery_choice(
-            key, user_id, chat_id, token, 'continue', epoch, route, report)
+            key, user_id, chat_id, token, 'continue', epoch, route, report, auto=True)
         return True
 
     async def _recover_danso_tasks(self, application):
@@ -222,7 +233,7 @@ class DansoRecoveryMixin:
         return current, offer, snapshot
 
     async def _apply_danso_recovery_choice(
-        self, key, user_id, chat_id, token, action, epoch, route, report,
+        self, key, user_id, chat_id, token, action, epoch, route, report, *, auto=False,
     ) -> None:
         """버튼 콜백과 타이핑 답변(#1718)의 공용 본문.
 
@@ -262,7 +273,8 @@ class DansoRecoveryMixin:
             await report('선택을 확인했습니다. 저장된 상태에 맞춰 이어서 진행합니다.')
             if not self._danso_recovery_guard(key, user_id, chat_id, epoch, route):
                 return
-            await self._continue_danso_recovery(key, user_id, chat_id, epoch, route, current, snapshot)
+            await self._continue_danso_recovery(
+                key, user_id, chat_id, epoch, route, current, snapshot, auto=auto)
 
         async def overflow():
             await report('다른 작업을 처리 중입니다. /task_recover 로 다시 확인해 주세요.')
@@ -326,26 +338,64 @@ class DansoRecoveryMixin:
             self._runtime_active_sessions.discard(key)
         return changed
 
-    async def _continue_danso_recovery(self, key, user_id, chat_id, epoch, route, current, snapshot):
+    async def _continue_danso_recovery(self, key, user_id, chat_id, epoch, route, current, snapshot, *, auto=False):
         app = self._require_application()
         safe_resume = snapshot.resume_allowed
         prompt = TASK_RESUME_CONTROL if safe_resume else snapshot.continuation()
         def guard():
             return self._danso_recovery_guard(key, user_id, chat_id, epoch, route)
-        response = await self._project_chat.process_message(
-            user_message=prompt, user_id=user_id, chat_id=chat_id,
-            session_id=current['session_id'] if safe_resume else None,
-            new_session=not safe_resume, resume_task=safe_resume, dispatch_guard=guard,
-            model=current.get('model'), effort=current.get('effort'),
-            approval_policy=self._codex_approval_policy(),
-            approvals_reviewer=self._codex_approvals_reviewer(),
-            sandbox_policy=self._codex_sandbox_policy(), approval_callback=self._codex_approval_callback,
-            status_callback=self._make_status_callback(app.bot, chat_id),
-            bot=app.bot, notification_bot=app.bot, sensitive_log_event='danso-recovery',
-            interim_message_callback=self._make_interim_send_callback(chat_id),
-        )
+
+        async def dispatch():
+            return await self._project_chat.process_message(
+                user_message=prompt, user_id=user_id, chat_id=chat_id,
+                session_id=current['session_id'] if safe_resume else None,
+                new_session=not safe_resume, resume_task=safe_resume, dispatch_guard=guard,
+                model=current.get('model'), effort=current.get('effort'),
+                approval_policy=self._codex_approval_policy(),
+                approvals_reviewer=self._codex_approvals_reviewer(),
+                sandbox_policy=self._codex_sandbox_policy(), approval_callback=self._codex_approval_callback,
+                status_callback=self._make_status_callback(app.bot, chat_id),
+                bot=app.bot, notification_bot=app.bot, sensitive_log_event='danso-recovery',
+                interim_message_callback=self._make_interim_send_callback(chat_id),
+            )
+        response = await dispatch()
+        if auto and safe_resume and await self._auto_resume_retry_allowed(
+                key, user_id, chat_id, epoch, route, current, snapshot, response):
+            # #1880: the forced teardown can leave a stale journal lock for a
+            # moment, so the very first resume after restart is refused with a
+            # session error before any model request. The journal is unchanged
+            # (same fingerprint, still resumable), so one delayed retry of the
+            # identical explicit-resume dispatch is safe; a second failure gets
+            # the ordinary menu like any other failed automatic resume.
+            response = await dispatch()
         # Session identity was persisted by the guarded start recorder before
         # dispatch. Do not overwrite a later /new with a post-turn save.
         await self._send_smart(chat_id, response.content)
         if not response.success:
             await self._offer_danso_recovery(key, user_id, chat_id, force=True)
+
+    async def _auto_resume_retry_allowed(self, key, user_id, chat_id, epoch, route, current, snapshot, response):
+        delay = self._danso_recovery_auto_resume_retry_delay()
+        if (delay <= 0 or response.success
+                or getattr(response, 'failure_code', None) != AUTO_RESUME_RETRY_CODE):
+            return False
+        try:
+            await self._require_application().bot.send_message(
+                chat_id=chat_id, text=AUTO_RESUME_RETRY_NOTICE.format(delay=delay))
+        except Exception as error:
+            logger.warning('Danso auto-resume retry notice failed: %s', type(error).__name__)
+            return False
+        await asyncio.sleep(delay)
+        if not self._danso_recovery_guard(key, user_id, chat_id, epoch, route):
+            return False
+        live = await self._session_manager.get_session(key)
+        if live.get('session_id') != current.get('session_id') or live.get('new_session'):
+            return False
+        try:
+            again = await self._project_chat.inspect_danso_recovery(current['session_id'], user_id, chat_id)
+        except Exception as error:
+            logger.info('Danso auto-resume retry inspection unavailable: %s', type(error).__name__)
+            return False
+        # Byte-identical journal proves the failed attempt recorded nothing.
+        return (again.fingerprint == snapshot.fingerprint and again.state in AUTO_RESUME_STATES
+                and again.resume_allowed)

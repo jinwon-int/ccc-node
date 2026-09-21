@@ -1414,6 +1414,7 @@ class ProjectChatProcessMixin:
                             error=terminal_error.message,
                             session_id=session.session_id,
                             failure_class="danso_task_paused",
+                            failure_code=terminal_error.code,
                         )
                     return ChatResponse(
                         content=f"❌ Processing failed: {terminal_error.message}",
@@ -1423,6 +1424,7 @@ class ProjectChatProcessMixin:
                         # The error itself was not part of the assistant draft.
                         # Always deliver it even when interim text was streamed.
                         streamed=False,
+                        failure_code=terminal_error.code,
                     )
                 if not content and not streamed:
                     # #775: a successful terminal result without user-visible
