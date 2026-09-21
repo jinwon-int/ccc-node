@@ -29,9 +29,15 @@ Two modes:
     absolute datetime anywhere in the paragraph. These violate the rule at
     write time, so they can never be judged on schedule.
 
-Input is either a JSONL dump (one issue object per line, ``--input``) or a
-live ``gh`` query (``--repo``). The JSONL path keeps the scanner testable and
-lets an operator re-run a judgement against a frozen snapshot.
+Input is a JSONL dump (one issue object per line, ``--input``), a live ``gh``
+query (``--repo``), or an operator-owned allowlist file (``--repos-file``).
+The JSONL path keeps the scanner testable and lets an operator re-run a
+judgement against a frozen snapshot; the allowlist is what the cron installer
+wires up, so adding a repository never requires re-running the installer.
+
+Exit codes: 0 clean, 1 findings exist (with ``--exit-nonzero-on-findings``),
+3 not configured. The third one matters — a scheduled scan whose repo list is
+missing or empty must not report a reassuring "0건".
 
 CI does not count as a timed test (owner, 2026-09-11): runs finish in minutes
 and GitHub shows the result, so ``gh-ci-wait`` covers them instead. This
@@ -55,6 +61,10 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
 KST = dt.timezone(dt.timedelta(hours=9))
+
+# Reserved so a scheduled run can tell "nothing to report" (0) apart from
+# "nobody told me what to scan" (3). --exit-nonzero-on-findings owns 1.
+EXIT_NOT_CONFIGURED = 3
 
 # Paragraph must mention a timed test before a date in it counts as a deadline.
 DEADLINE_KEYWORD = re.compile(
@@ -388,6 +398,44 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return issues
 
 
+class NotConfigured(RuntimeError):
+    """The repo list exists in form but selects nothing to scan.
+
+    Kept distinct from "scanned and found nothing" on purpose. This scanner
+    exists because a failure that looks like success stayed invisible for nine
+    days; an unconfigured scanner reporting a clean "0건" would be exactly that
+    bug wearing this tool's face. Callers map it to its own exit code.
+    """
+
+
+REPO_NAME = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+
+def load_repos_file(path: Path) -> list[str]:
+    """Read an operator-owned ``owner/name`` per line allowlist.
+
+    ``#`` comments and blank lines are ignored, and any trailing fields on a
+    line are tolerated so the format can grow without breaking older installs.
+    A malformed entry is a hard error rather than a skip — silently scanning a
+    shorter list than the operator wrote is the failure mode this tool exists
+    to catch.
+    """
+    if not path.exists():
+        raise NotConfigured(f"repo list not found: {path}")
+    repos: list[str] = []
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name = line.split()[0]
+        if not REPO_NAME.match(name):
+            raise ValueError(f"{path}:{lineno}: not an owner/name repo: {name!r}")
+        repos.append(name)
+    if not repos:
+        raise NotConfigured(f"repo list is empty: {path}")
+    return repos
+
+
 def fetch_via_gh(repo: str, limit: int) -> list[dict[str, Any]]:
     """Pull open issues with comments through the gh CLI."""
     fields = "number,title,url,body,comments,createdAt,updatedAt"
@@ -434,6 +482,12 @@ def build_parser() -> argparse.ArgumentParser:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--input", type=Path, help="JSONL dump of issues (one object per line)")
     source.add_argument("--repo", action="append", help="owner/name; repeatable")
+    source.add_argument(
+        "--repos-file",
+        type=Path,
+        help="operator-owned allowlist, one owner/name per line (# comments ok). "
+        "A missing or empty file exits 3 (not configured), never a clean 0 findings.",
+    )
     parser.add_argument(
         "--mode",
         choices=("expired", "relative"),
@@ -468,8 +522,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.input:
         issues = load_jsonl(args.input)
     else:
+        if args.repos_file:
+            try:
+                repos = load_repos_file(args.repos_file)
+            except NotConfigured as exc:
+                print(f"not configured: {exc}", file=sys.stderr)
+                return EXIT_NOT_CONFIGURED
+            except (ValueError, OSError) as exc:
+                # A broken list is not "nothing to do" either; fail loudly
+                # rather than scanning a silently shortened set.
+                print(f"repo list unusable: {exc}", file=sys.stderr)
+                return 2
+        else:
+            repos = list(args.repo or [])
         issues = []
-        for repo in args.repo or []:
+        for repo in repos:
             issues.extend(fetch_via_gh(repo, args.limit))
 
     findings = scan(issues, now, args.mode, args.min_confidence)
