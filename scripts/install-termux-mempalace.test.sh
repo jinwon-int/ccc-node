@@ -30,7 +30,7 @@ printf '%s\0' "$@" >> "${CCC_TEST_PROOT_LOG:?}"
 printf '\n' >> "${CCC_TEST_PROOT_LOG:?}"
 if [ "${1:-}" = install ]; then
   root="${CCC_TEST_CONTAINER_ROOT:?}"
-  mkdir -p "$root/opt/ccc-mempalace/venv/bin" "$root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.6.0.dist-info"
+  mkdir -p "$root/opt/ccc-mempalace/venv/bin" "$root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.10.0.dist-info"
   cat > "$root/opt/ccc-mempalace/venv/bin/mempalace" <<'EOF'
 #!/bin/sh
 exit 0
@@ -46,7 +46,7 @@ if [ "${1:-}" = login ] && [ -f "${CCC_TEST_CONTAINER_ROOT:?}/opt/ccc-mempalace/
   chmod 600 "${CCC_TEST_CONTAINER_ROOT:?}/opt/ccc-mempalace/requirements.lock"
 fi
 case " $* " in
-  *" /opt/ccc-mempalace/venv/bin/mempalace --version "*) echo 'mempalace 3.6.0' ;;
+  *" /opt/ccc-mempalace/venv/bin/mempalace --version "*) echo 'mempalace 3.10.0' ;;
 esac
 exit 0
 SH
@@ -202,6 +202,54 @@ out="$(env "${common_env[@]}" HOME="$drift_home" \
   bash "$ROOT/scripts/install-termux-mempalace.sh" --apply --codex 2>&1)"; rc=$?
 ok "dependency drift in a managed container is not mutated in place" \
   '[ "$rc" = 2 ] && grep -q "dependency lock drift" <<<"$out" && grep -qx "unexpected dependency set" "$drift_root/opt/ccc-mempalace/requirements.lock"'
+
+version_out="$(env "${common_env[@]}" CCC_TERMUX_MEMPALACE_VERSION=3.6.0 \
+  bash "$ROOT/scripts/install-termux-mempalace.sh" --status --codex 2>&1)"; rc=$?
+ok "an unsupported MemPalace version pin fails closed" \
+  '[ "$rc" = 2 ] && grep -q "unsupported MemPalace version: 3.6.0" <<<"$version_out"'
+
+catchup_home="$TMP/catchup-home"
+catchup_root="$TMP/catchup-root"
+mkdir -p "$catchup_home/.codex/sessions" \
+  "$catchup_home/.claude/hooks/nunchi" \
+  "$catchup_root/opt/ccc-mempalace/venv/bin" \
+  "$catchup_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.10.0.dist-info"
+chmod 700 "$catchup_root/opt/ccc-mempalace"
+printf '{}\n' > "$catchup_home/.codex/sessions/a.jsonl"
+printf '%s\n' 'ccc-node #867 managed container' > "$catchup_root/opt/ccc-mempalace/.ccc-node-managed"
+cp "$home/.claude/hooks/nunchi/mempalace-refresh.sh" \
+  "$catchup_home/.claude/hooks/nunchi/mempalace-refresh.sh"
+cat > "$catchup_root/opt/ccc-mempalace/venv/bin/mempalace" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod 700 "$catchup_root/opt/ccc-mempalace/venv/bin/mempalace"
+sed 's/^mempalace==3.10.0$/mempalace==3.6.0/' \
+  "$ROOT/scripts/termux-mempalace-requirements.txt" \
+  > "$catchup_root/opt/ccc-mempalace/requirements.lock"
+chmod 600 "$catchup_root/opt/ccc-mempalace/.ccc-node-managed" \
+  "$catchup_root/opt/ccc-mempalace/requirements.lock"
+out="$(env "${common_env[@]}" HOME="$catchup_home" \
+  CCC_TERMUX_MEMPALACE_CONTAINER_ROOT="$catchup_root" \
+  bash "$ROOT/scripts/install-termux-mempalace.sh" --apply --codex 2>&1)"; rc=$?
+ok "a managed venv already on the pin may catch up a mempalace-only lock delta" \
+  '[ "$rc" = 0 ] && cmp -s "$ROOT/scripts/termux-mempalace-requirements.txt" "$catchup_root/opt/ccc-mempalace/requirements.lock"'
+
+stale_home="$TMP/stale-lock-home"
+stale_root="$TMP/stale-lock-root"
+mkdir -p "$stale_home/.codex/sessions" \
+  "$stale_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.10.0.dist-info"
+chmod 700 "$stale_root/opt/ccc-mempalace"
+printf '{}\n' > "$stale_home/.codex/sessions/a.jsonl"
+printf '%s\n' 'ccc-node #867 managed container' > "$stale_root/opt/ccc-mempalace/.ccc-node-managed"
+printf '%s\n' 'unexpected dependency set' > "$stale_root/opt/ccc-mempalace/requirements.lock"
+chmod 600 "$stale_root/opt/ccc-mempalace/.ccc-node-managed" \
+  "$stale_root/opt/ccc-mempalace/requirements.lock"
+out="$(env "${common_env[@]}" HOME="$stale_home" \
+  CCC_TERMUX_MEMPALACE_CONTAINER_ROOT="$stale_root" \
+  bash "$ROOT/scripts/install-termux-mempalace.sh" --apply --codex 2>&1)"; rc=$?
+ok "matching dist-info does not overwrite an unrelated drifted lock" \
+  '[ "$rc" = 2 ] && grep -q "dependency lock drift" <<<"$out" && grep -qx "unexpected dependency set" "$stale_root/opt/ccc-mempalace/requirements.lock"'
 
 unmanaged="$TMP/unmanaged-home"
 mkdir -p "$unmanaged/.codex/sessions" "$unmanaged/.local/bin"

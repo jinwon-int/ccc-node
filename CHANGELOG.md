@@ -4,6 +4,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **memory: pin Termux MemPalace to 3.10.0.** The PRoot installer, managed
+  lock, and memory probe still required 3.6.0 after the fleet package moved
+  to 3.10.0, so `--apply` fail-closed on version drift and `ccc-memory-check`
+  treated live Termux metadata as invalid. The supported pin is now 3.10.0
+  (`chromadb==1.5.9` unchanged; #1864). A managed container whose venv is
+  already on 3.10.0 may catch up a lock that differs only in the
+  `mempalace==` pin; any other lock drift still fails closed. Verified:
+  `install-termux-mempalace.test.sh` 17→20 PASS, reverse-validated
+  unsupported-version and lock catch-up.
+
 - **skill-promotion: opt-in auto-drain of the intake backlog.** Three
   publisher flags, all default OFF, so a node that has not opted in is
   byte-identical to today. `skill-promotion.supersede-autoclose` (env
