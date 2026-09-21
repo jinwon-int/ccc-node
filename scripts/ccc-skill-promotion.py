@@ -689,6 +689,36 @@ def _run(
         raise PromotionError("command_failed")
     return completed
 
+@contextlib.contextmanager
+def _edge_secret_header(secret: str) -> Iterator[list[str]]:
+    """Yield curl argv carrying the edge secret via a 0600 temp header file.
+
+    #1884: the value must never appear in curl argv — while a request is in
+    flight any local user can read `/proc/<pid>/cmdline`. The header goes to
+    a `mktemp` file (created 0600, unlinked when the request block exits) and
+    curl receives `--header @file`, matching the a2a-task-state-poll.sh
+    precedent. Exception messages stay fixed codes; the value never reaches
+    logs or errors.
+    """
+    try:
+        descriptor, raw_path = tempfile.mkstemp(prefix="ccc-edge-header.")
+    except OSError:
+        raise PromotionError("edge_header_write_failed") from None
+    header_path = Path(raw_path)
+    try:
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(f"x-a2a-edge-secret: {secret}\n")
+            os.chmod(header_path, 0o600)
+        except OSError:
+            raise PromotionError("edge_header_write_failed") from None
+        yield ["--header", f"@{header_path}"]
+    finally:
+        try:
+            header_path.unlink()
+        except OSError:
+            pass
+
 
 def _ownership_rows(config: Config, provider: str) -> list[dict[str, Any]]:
     if not _safe_tool(config.ownership_tool):
@@ -1814,9 +1844,10 @@ def _worker_procedure_from_docs(nexus_dir: Path, *, doc_name: str, end_marker: s
 
 def _broker_id(config: Config, secret: str) -> str:
     try:
-        completed = _run(
-            ["curl", "-fsS", "-H", f"x-a2a-edge-secret: {secret}", f"{config.broker_url}/health"]
-        )
+        with _edge_secret_header(secret) as header_argv:
+            completed = _run(
+                ["curl", "-fsS", *header_argv, f"{config.broker_url}/health"]
+            )
         health = json.loads(completed.stdout.decode("utf-8"))
     except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise PromotionError("dispatch_broker_unreachable") from error
@@ -1828,9 +1859,10 @@ def _broker_id(config: Config, secret: str) -> str:
 
 def _broker_online_worker_ids(config: Config, secret: str) -> set[str]:
     try:
-        completed = _run(
-            ["curl", "-fsS", "-H", f"x-a2a-edge-secret: {secret}", f"{config.broker_url}/workers"]
-        )
+        with _edge_secret_header(secret) as header_argv:
+            completed = _run(
+                ["curl", "-fsS", *header_argv, f"{config.broker_url}/workers"]
+            )
         payload = json.loads(completed.stdout.decode("utf-8"))
     except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise PromotionError("dispatch_broker_unreachable") from error
@@ -2584,13 +2616,14 @@ def _pr_comment(config: Config, pr_number: str, body: str) -> None:
 
 def _broker_task(config: Config, task_id: str, secret: str) -> dict[str, object]:
     try:
-        completed = _run(
-            [
-                "curl", "-fsS", "--max-time", "30",
-                "-H", f"x-a2a-edge-secret: {secret}",
-                f"{config.broker_url}/tasks/{task_id}",
-            ],
-        )
+        with _edge_secret_header(secret) as header_argv:
+            completed = _run(
+                [
+                    "curl", "-fsS", "--max-time", "30",
+                    *header_argv,
+                    f"{config.broker_url}/tasks/{task_id}",
+                ],
+            )
         payload = json.loads(completed.stdout.decode("utf-8"))
     except (PromotionError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise PromotionError("revise_broker_unreachable") from error

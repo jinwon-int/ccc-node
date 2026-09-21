@@ -4,6 +4,22 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **security: the A2A edge secret no longer travels in curl argv on local
+  broker calls.** The five local broker curls in `rescreen-rotation.py`
+  (`/workers?include=stale_read_path`, `/audit?action=task.failed`) and
+  `ccc-skill-promotion.py` (`/health`, `/workers`, `/tasks/<id>`) embedded
+  the secret in `-H "x-a2a-edge-secret: <value>"`, readable from
+  `/proc/<pid>/cmdline` by any local user while the request was in flight
+  (#1884). All five now share a contextmanager that writes the header to a
+  `mktemp` file (created 0600) and passes it as `curl --header @file`,
+  unlinked when the request block exits — the `a2a-task-state-poll.sh`
+  precedent. Remote SSH branches keep `$S` substitution; the value never
+  reaches logs, exceptions, or test fixtures. Verified: new `EDGE-HEADER`
+  unit test (argv carries only the temp path, mode 0600, exact header
+  content, file removed after the with-block); rescreen-rotation and
+  skill-promotion suites assert the secret value is absent from the
+  recorded curl argv.
+
 - **Danso recovery offers default to typed 1/2/3 instead of tap buttons.**
   `CCC_TELEGRAM_DANSO_RECOVERY_TEXT` Field default and the mixin getattr
   fallback both flip false → true, matching the gongmyoung/soonwook drop-in
