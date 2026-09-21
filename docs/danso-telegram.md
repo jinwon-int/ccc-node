@@ -386,7 +386,11 @@ compatible but cannot supply the new detail.
 
 When long-task mode is enabled, startup inspects this conversation's saved
 Danso journal without provider credentials or a model request. A failed or
-unfinished task gets a bounded, credential-redacted summary and three buttons:
+unfinished task gets a bounded, credential-redacted summary and three choices.
+The default is a numbered text menu answered by typing `1` / `2` / `3` in the
+chat (`CCC_TELEGRAM_DANSO_RECOVERY_TEXT`, default **true**; gongmyoung and
+soonwook already ran this way). Set the flag to `false` to restore tap-to-select
+inline buttons:
 
 - **이어서 진행 (Continue):** at a resumable ready/paused checkpoint, authorize
   one native no-prompt resume. Otherwise preserve the old journal and start a

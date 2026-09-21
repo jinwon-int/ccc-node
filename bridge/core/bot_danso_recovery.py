@@ -26,7 +26,8 @@ def keyboard(token):
     ])
 
 # #1718: recovery 제안의 텍스트 모드 — 동일한 세 선택을 콜백 버튼 대신
-# 번호 입력으로 답한다. 옵트인: CCC_TELEGRAM_DANSO_RECOVERY_TEXT.
+# 번호 입력으로 답한다. 기본 ON. 버튼으로 되돌리려면
+# CCC_TELEGRAM_DANSO_RECOVERY_TEXT=false.
 RECOVERY_TEXT_MENU = (
     '\n\n번호로 답해 주세요: 1) 이어서 진행  2) 새 작업 시작  3) 상태만 확인'
     '\n(/task_recover 로 이 메뉴를 다시 볼 수 있습니다)'
@@ -61,7 +62,7 @@ class DansoRecoveryMixin:
                 and bool(getattr(self._config, 'danso_long_task_enabled', False)))
 
     def _danso_recovery_text_mode(self):
-        return bool(getattr(self._config, 'danso_recovery_text_mode', False))
+        return bool(getattr(self._config, 'danso_recovery_text_mode', True))
 
     def _danso_recovery_auto_resume(self):
         return bool(getattr(self._config, 'danso_recovery_auto_resume', False))
@@ -305,9 +306,10 @@ class DansoRecoveryMixin:
     async def _maybe_answer_danso_recovery_text(self, update, user_id, text) -> bool:
         """텍스트 모드(#1718): 대기 중 제안에 1/2/3 한 글자로 답한다.
 
-        옵트인: CCC_TELEGRAM_DANSO_RECOVERY_TEXT. 선택 숫자가 아니면 False를
-        반환하고 본래대로 일반 턴으로 흘러간다 — 이때 제안 무효화 규칙도
-        기존과 동일하게 유지되므로 아무것도 암묵적으로 답하지 않는다.
+        기본 ON. 버튼으로 되돌리려면 CCC_TELEGRAM_DANSO_RECOVERY_TEXT=false.
+        선택 숫자가 아니면 False를 반환하고 본래대로 일반 턴으로 흘러간다 —
+        이때 제안 무효화 규칙도 기존과 동일하게 유지되므로 아무것도
+        암묵적으로 답하지 않는다.
         접근 검사는 호출부(_process_user_message_text) 게이트에서 이미
         통과했고, 선택 클레임은 스냅샷 가드가 사용자/채팅/라우트 결합을
         다시 검증한다(버튼 경로와 동일).

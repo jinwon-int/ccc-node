@@ -1084,12 +1084,13 @@ class Config(
     )
 
     danso_recovery_text_mode: bool = Field(
-        default=False,
+        default=True,
         alias="CCC_TELEGRAM_DANSO_RECOVERY_TEXT",
         description=(
             "Offer failed-Danso recovery as numbered text and answer by "
             "typing 1/2/3 in the chat, instead of tap-to-select inline "
-            "keyboard buttons. Default OFF: the recovery offer uses buttons."
+            "keyboard buttons. Default ON (fleet: gongmyoung/soonwook). Set "
+            "CCC_TELEGRAM_DANSO_RECOVERY_TEXT=false to restore buttons."
         ),
     )
     danso_recovery_auto_resume: bool = Field(
