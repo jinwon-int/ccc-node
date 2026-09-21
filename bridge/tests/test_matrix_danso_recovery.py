@@ -20,7 +20,6 @@ from telegram_bot.core.matrix.bot import MatrixBot
 from telegram_bot.core.project_chat_types import ChatResponse
 from test_danso_recovery import snapshot
 from test_matrix_bot import DM_ROOM, KID, OWNER, FakeProjectChat, FakeSink, FormattedTransport, _job, _settings
-from test_matrix_bot import matrix_config as _matrix_config_fixture  # noqa: F401 - registers the fixture
 from test_session_provider import make_manager
 
 pytestmark = pytest.mark.anyio
@@ -29,6 +28,13 @@ pytestmark = pytest.mark.anyio
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture
+def matrix_config(_shared_matrix_config: dict[str, Any]) -> dict[str, Any]:
+    """Re-expose test_matrix_bot's fixture under its own name (pytest keys on the attribute name)."""
+
+    return _shared_matrix_config
 
 
 class RecoveryProjectChat(FakeProjectChat):
