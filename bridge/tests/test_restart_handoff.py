@@ -270,10 +270,48 @@ def test_config_restricts_restart_unit_family() -> None:
         CCC_BRIDGE_RESTART_UNIT="ccc-telegram-bridge-nosuk.service",
     )
     assert config.restart_handoff == "systemd"
+    assert config.restart_service_unit == "ccc-telegram-bridge-nosuk.service"
     with pytest.raises(ValueError, match="CCC_BRIDGE_RESTART_UNIT"):
         Config(
             telegram_bot_token="token",
             CCC_BRIDGE_RESTART_UNIT="ssh.service",
+        )
+
+
+def test_config_restart_unit_defaults_follow_channel(tmp_path: Path) -> None:
+    telegram = Config(telegram_bot_token="token")
+    assert telegram.restart_service_unit == "ccc-telegram-bridge.service"
+
+    matrix = Config(
+        telegram_bot_token="token",
+        CCC_CHANNEL="matrix",
+        CCC_MATRIX_CONFIG_PATH=str(tmp_path / "matrix.json"),
+    )
+    assert matrix.restart_service_unit == "ccc-matrix-bridge.service"
+
+
+def test_config_matrix_channel_accepts_own_unit(tmp_path: Path) -> None:
+    config = Config(
+        telegram_bot_token="token",
+        CCC_CHANNEL="matrix",
+        CCC_MATRIX_CONFIG_PATH=str(tmp_path / "matrix.json"),
+        CCC_BRIDGE_RESTART_UNIT="ccc-matrix-bridge-dungae.service",
+    )
+    assert config.restart_service_unit == "ccc-matrix-bridge-dungae.service"
+
+
+def test_config_rejects_cross_channel_restart_unit(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="CCC_BRIDGE_RESTART_UNIT"):
+        Config(
+            telegram_bot_token="token",
+            CCC_CHANNEL="matrix",
+            CCC_MATRIX_CONFIG_PATH=str(tmp_path / "matrix.json"),
+            CCC_BRIDGE_RESTART_UNIT="ccc-telegram-bridge.service",
+        )
+    with pytest.raises(ValueError, match="CCC_BRIDGE_RESTART_UNIT"):
+        Config(
+            telegram_bot_token="token",
+            CCC_BRIDGE_RESTART_UNIT="ccc-matrix-bridge.service",
         )
 
 

@@ -338,7 +338,7 @@ a provider turn or reads transcript/credential files.
 | `ALLOWED_USER_IDS` | No | *(allow all)* | Comma-separated user ID whitelist; `owner-operator` requires exactly one owner |
 | `CCC_REQUIRE_ALLOWLIST` | No | `true` | Refuse startup when the allowlist is empty; must stay true for `owner-operator` |
 | `CCC_BRIDGE_RESTART_HANDOFF` | No | `off` | Set `systemd` to enable sole-owner DM `/restart` through an external transient unit |
-| `CCC_BRIDGE_RESTART_UNIT` | No | `ccc-telegram-bridge.service` | Exact `ccc-telegram-bridge*.service` target allowlist |
+| `CCC_BRIDGE_RESTART_UNIT` | No | `ccc-<channel>-bridge.service` | Exact `ccc-<channel>-bridge*.service` target allowlist; must match `CCC_CHANNEL`, cross-channel units are rejected |
 | `CCC_BRIDGE_RESTART_DELAY_SECONDS` | No | `5` | Delay (5–30s) before the external worker restarts the bridge |
 | `CCC_BRIDGE_EXECUTION_PROFILE` | No | `strict-project` | Execution boundary: `strict-project`, `owner-operator`, or `disabled` |
 | `CCC_BRIDGE_BASH_POLICY` | No | `auto-approve` | Bash approval UX; Codex default is unrestricted `never + dangerFullAccess` |

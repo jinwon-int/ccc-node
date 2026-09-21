@@ -94,8 +94,10 @@ utils/chat_logger.py Per-session debug chat logging
 - **Priority stop command**: `/stop` has priority handling - it bypasses the message queue limit and immediately cancels the currently executing task via `asyncio.Task.cancel()`. This allows users to interrupt runaway executions even when the queue is full.
 - **Safe self-restart command**: opt-in `/restart` is accepted only from a
   private chat with the sole allowlisted owner. A delayed `systemd-run`
-  transient worker outside the target cgroup restarts only an allowlisted
-  `ccc-telegram-bridge*.service`, verifies a replacement MainPID plus fresh
+  transient worker outside the target cgroup restarts only the channel's own
+  `ccc-<channel>-bridge*.service` unit — the default derives from
+  `CCC_CHANNEL`, and an explicit `CCC_BRIDGE_RESTART_UNIT` must stay inside
+  the same channel family — verifies a replacement MainPID plus fresh
   available health, and leaves a private body-free receipt for the new bridge.
   Raw in-tree `start.sh --restart` remains blocked with exit 5.
 - **Priority revert command**: `/revert` also has priority handling - bypasses message queue limit, cancels active operations (streaming, voice transcription), and allows users to restore conversation state even during execution.
@@ -118,7 +120,7 @@ utils/chat_logger.py Per-session debug chat logging
 | `ALLOWED_USER_IDS` | No | Comma-separated user IDs; `owner-operator` requires exactly one |
 | `CCC_REQUIRE_ALLOWLIST` | No | Fail-closed allowlist guard (default: true; required for `owner-operator`) |
 | `CCC_BRIDGE_RESTART_HANDOFF` | No | Set `systemd` to enable sole-owner private `/restart` (default: `off`) |
-| `CCC_BRIDGE_RESTART_UNIT` | No | Exact allowlisted `ccc-telegram-bridge*.service` target |
+| `CCC_BRIDGE_RESTART_UNIT` | No | Exact allowlisted `ccc-<channel>-bridge*.service` target; defaults to the channel's own unit |
 | `CCC_BRIDGE_EXECUTION_PROFILE` | No | `strict-project` (default), `owner-operator`, or `disabled` execution boundary |
 | `CCC_BRIDGE_BASH_POLICY` | No | `auto-approve` (default), `auto-review`, `approve-each`, or `disabled`; Codex auto-approve is unrestricted `never + dangerFullAccess` |
 | `CCC_BRIDGE_CLAUDE_UNRESTRICTED` | No | Opt-in Codex parity for the Claude path (default **false**, `owner-operator` only — ignored on every other profile). True runs Claude with `permission_mode=bypassPermissions`, no OS sandbox, and no host settings chain, so the node's host hooks/settings are **not** loaded — matching Codex's `never + dangerFullAccess`. Memory context is preserved. Default keeps the node's normal governed path (host settings + audit trail); set per node and reversible. **Ignored under root** (Claude Code refuses `bypassPermissions` with root/sudo) — the flag degrades to the governed path with a logged warning; run the bridge non-root to use it |
