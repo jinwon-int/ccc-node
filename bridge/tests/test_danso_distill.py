@@ -146,6 +146,9 @@ async def test_extractor_uses_only_explicit_auth_and_tool_free_private_input(tmp
         data = DistillExtractionInput.model_validate(value)
     script = tmp_path / "danso"
     marker = tmp_path / "capture.json"
+    rendered = json.dumps(output(data))
+    if fenced:
+        rendered = "```json\n" + rendered + "\n```"
     script.write_text(
         "#!/usr/bin/python3\nimport os,sys,json,pathlib\na=sys.argv\n"
         'p=pathlib.Path(a[a.index("--system-context-file")+1])\n'
@@ -159,7 +162,7 @@ async def test_extractor_uses_only_explicit_auth_and_tool_free_private_input(tmp
         'assert os.environ["DANSO_CHATGPT_AUTH_FILE"]=="/synthetic/danso-auth.json"\n'
         "assert not list(pathlib.Path.cwd().iterdir())\n"
         f"pathlib.Path({str(marker)!r}).write_text(str(p.parent))\n"
-        f"print({(chr(96)*3+'json\n'+json.dumps(output(data))+'\n'+chr(96)*3 if fenced else json.dumps(output(data)))!r})\n"
+        f"print({rendered!r})\n"
     )
     script.chmod(0o700)
     settings = SimpleNamespace(
