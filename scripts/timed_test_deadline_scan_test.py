@@ -240,6 +240,72 @@ class RelativeModeTests(unittest.TestCase):
         self.assertIsNone(scanner.judge_issue(issue, NOW, "relative"))
 
 
+class ReposFileTests(unittest.TestCase):
+    """An unconfigured scheduled scan must never look like a clean scan.
+
+    This tool exists because a silent failure passed for success for nine
+    days. A cron job whose repo list vanished reporting "0건" would be that
+    same bug, so every unconfigured shape gets its own exit code.
+    """
+
+    def _write(self, directory: str, text: str) -> Path:
+        path = Path(directory) / "scan.repos"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_repos_are_parsed_with_comments_and_blanks_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(
+                directory,
+                "# fleet repos\n\njinwon-int/ccc-node\n"
+                "jinwon-int/a2a-nexus  # trailing note\n\n",
+            )
+            self.assertEqual(
+                scanner.load_repos_file(path),
+                ["jinwon-int/ccc-node", "jinwon-int/a2a-nexus"],
+            )
+
+    def test_missing_file_is_not_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(scanner.NotConfigured):
+                scanner.load_repos_file(Path(directory) / "absent.repos")
+
+    def test_empty_file_is_not_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "")
+            with self.assertRaises(scanner.NotConfigured):
+                scanner.load_repos_file(path)
+
+    def test_comment_only_file_is_not_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "# TODO: list repos here\n\n")
+            with self.assertRaises(scanner.NotConfigured):
+                scanner.load_repos_file(path)
+
+    def test_malformed_entry_raises_instead_of_being_skipped(self) -> None:
+        # Skipping would scan a shorter list than the operator wrote — the
+        # exact class of quiet shortfall this scanner hunts.
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "jinwon-int/ccc-node\nnot-a-repo\n")
+            with self.assertRaises(ValueError):
+                scanner.load_repos_file(path)
+
+    def test_cli_exits_3_when_not_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "# nothing yet\n")
+            code = scanner.main(["--repos-file", str(path), "--now", "2026-09-21T01:52"])
+        self.assertEqual(code, scanner.EXIT_NOT_CONFIGURED)
+
+    def test_cli_exits_2_on_unusable_list(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "garbage\n")
+            code = scanner.main(["--repos-file", str(path), "--now", "2026-09-21T01:52"])
+        self.assertEqual(code, 2)
+
+    def test_not_configured_code_is_distinct_from_findings_code(self) -> None:
+        self.assertNotIn(scanner.EXIT_NOT_CONFIGURED, (0, 1))
+
+
 class CliTests(unittest.TestCase):
     def test_jsonl_input_round_trips_through_main(self) -> None:
         issue = _issue(
