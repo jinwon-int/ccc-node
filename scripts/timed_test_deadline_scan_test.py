@@ -140,6 +140,20 @@ class VerdictDetectionTests(unittest.TestCase):
         body = "## 관측 종료 판정 (2026-09-18) — **종료(정착)** 권고"
         self.assertIsNotNone(scanner.VERDICT.search(body[: scanner.VERDICT_HEADER_CHARS]))
 
+    def test_completion_report_heading_is_a_verdict(self) -> None:
+        # ccc-node#1648 was judged with this heading on 2026-09-12 08:22 KST
+        # and was still reported at high confidence on the first production
+        # run (#1873): none of the original tokens appear in it.
+        body = "## ✅ 배포 검증 완료 — 실제 종료 일시·결과 갱신 (soonwook 세션)"
+        self.assertIsNotNone(scanner.VERDICT.search(body[: scanner.VERDICT_HEADER_CHARS]))
+
+    def test_bare_completion_progress_heading_is_not_a_verdict(self) -> None:
+        # Recall guard for the #1873 widening: an ordinary post-deadline
+        # progress update must not clear the issue. Bare "완료"/"✅" once hid
+        # three real findings and stay excluded.
+        body = "## ✅ yukson piri skills 연결 완료 — 8/8 전 노드"
+        self.assertIsNone(scanner.VERDICT.search(body[: scanner.VERDICT_HEADER_CHARS]))
+
 
 class ExpiredModeTests(unittest.TestCase):
     def test_expired_without_verdict_is_reported(self) -> None:
@@ -191,6 +205,40 @@ class ExpiredModeTests(unittest.TestCase):
         issue = _issue(body="2026-09-01 에 리팩터링을 시작했다.")
         self.assertIsNone(scanner.judge_issue(issue, NOW, "expired"))
 
+    def test_scanner_file_name_is_not_a_deadline_keyword(self) -> None:
+        # ccc-node#1873 quoted the scan command next to its run time and the
+        # "deadline" inside timed_test_deadline_scan.py matched the English
+        # keyword, making the precision issue itself a high-confidence finding.
+        issue = _issue(
+            number=1873,
+            body=(
+                "실행: 2026-09-21 11:06 KST, `python3 scripts/timed_test_deadline_scan.py "
+                "--repos-file ~/.claude/timed-test-deadline-scan.repos --mode expired` (22초)"
+            ),
+        )
+        self.assertIsNone(scanner.judge_issue(issue, NOW, "expired"))
+
+    def test_quoted_booking_in_inline_code_is_not_a_deadline(self) -> None:
+        # ccc-node#1873 quoted #1648's booking row inside backticks.
+        issue = _issue(
+            number=1873,
+            body="- 예약 코멘트 표: `| 배포 검증 종료 | **2026-09-12 06:00 KST** |`",
+        )
+        self.assertIsNone(scanner.judge_issue(issue, NOW, "expired"))
+
+    def test_timestamp_alone_in_inline_code_still_counts(self) -> None:
+        issue = _issue(body="검증 종료 예정: `2026-09-17 07:32 KST`")
+        finding = scanner.judge_issue(issue, NOW, "expired")
+        assert finding is not None
+        self.assertEqual(finding.deadline, dt.datetime(2026, 9, 17, 7, 32))
+        self.assertEqual(finding.confidence, "high")
+
+    def test_english_deadline_word_still_counts(self) -> None:
+        issue = _issue(body="Deadline: 2026-09-17 07:32 KST, judged by gwakga.")
+        finding = scanner.judge_issue(issue, NOW, "expired")
+        assert finding is not None
+        self.assertEqual(finding.confidence, "high")
+
     def test_latest_deadline_wins_when_a_window_was_extended(self) -> None:
         issue = _issue(
             comments=[
@@ -218,6 +266,52 @@ class ExpiredModeTests(unittest.TestCase):
         self.assertEqual(len(scanner.scan(issues, NOW, "expired", "low")), 2)
         strong = scanner.scan(issues, NOW, "expired", "high")
         self.assertEqual([f.number for f in strong], [1527])
+
+    def test_completion_report_after_deadline_clears_the_issue(self) -> None:
+        # ccc-node#1648 end to end: booking table, then the completion report
+        # two hours after the window closed. Before #1873 this was a daily
+        # high-confidence finding.
+        issue = _issue(
+            number=1648,
+            comments=[
+                _comment("| 배포 검증 종료 | **2026-09-12 06:00 KST** |", "2026-09-11T00:00:00Z"),
+                _comment(
+                    "## ✅ 배포 검증 완료 — 실제 종료 일시·결과 갱신 (soonwook 세션)\n\n"
+                    "| 배포 검증 종료 | 2026-09-12 06:00 KST | **2026-09-12 08:22 KST** |",
+                    "2026-09-11T23:22:58Z",
+                ),
+            ],
+        )
+        self.assertIsNone(scanner.judge_issue(issue, NOW, "expired"))
+
+    def test_bare_date_rule_citation_is_demoted(self) -> None:
+        # ccc-node#1870 (the scanner's own tracking issue) cites the owner
+        # rule by date and got itself reported at high confidence with a
+        # 23:59 deadline nobody wrote. Still surfaced, but as low confidence.
+        issue = _issue(
+            number=1870,
+            body="오너 규칙(2026-09-11)은 미래에 종료되는 테스트에 **종료 일시를 KST 절대시각으로** 적도록 요구한다.",
+        )
+        finding = scanner.judge_issue(issue, NOW, "expired")
+        assert finding is not None
+        self.assertEqual(finding.confidence, "low")
+        self.assertEqual(finding.weak_reason, "date-only")
+        self.assertEqual(finding.deadline, dt.datetime(2026, 9, 11, 23, 59))
+        self.assertEqual(scanner.scan([issue], NOW, "expired", "high"), [])
+
+    def test_explicit_datetime_outranks_a_later_bare_date(self) -> None:
+        # A real booking with a time must not be displaced by a later bare
+        # date citation in the same issue.
+        issue = _issue(
+            comments=[
+                _comment("검증 종료 예정: 2026-09-17 07:32 KST", "2026-09-16T00:00:00Z"),
+                _comment("참고: 종료 일시 규칙은 2026-09-18 개정본을 따른다.", "2026-09-16T01:00:00Z"),
+            ]
+        )
+        finding = scanner.judge_issue(issue, NOW, "expired")
+        assert finding is not None
+        self.assertEqual(finding.deadline, dt.datetime(2026, 9, 17, 7, 32))
+        self.assertEqual(finding.confidence, "high")
 
 
 class RelativeModeTests(unittest.TestCase):
