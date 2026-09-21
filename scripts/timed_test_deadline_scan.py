@@ -92,8 +92,16 @@ DEADLINE_DATE = re.compile(
 #
 # "close/closed" is absent on purpose: `fail-closed` is everywhere in this
 # fleet's prose and matched a2a-nexus#1597 straight out of the results.
+#
+# The qualified completions ("검증 완료", "실제 종료", "결과 갱신") were added
+# after the first production run (#1873): ccc-node#1648 was judged with the
+# heading "## ✅ 배포 검증 완료 — 실제 종료 일시·결과 갱신" and kept being
+# reported at high confidence. Bare "완료" and "✅" stay out — both lead
+# ordinary progress updates ("yukson 연결 완료") that say nothing about the
+# test — and the whole regex still only sees the heading window.
 VERDICT = re.compile(
-    r"(판정|결과\s*보고|종료\s*보고|합격|불합격|연장|재관측)",
+    r"(판정|결과\s*보고|종료\s*보고|합격|불합격|연장|재관측"
+    r"|실제\s*종료|결과\s*갱신|(검증|관측|테스트|카나리)\s*완료)",
     re.IGNORECASE,
 )
 
@@ -276,11 +284,18 @@ def collect_hits(issue: dict[str, Any]) -> tuple[list[Hit], list[str]]:
             if not dates:
                 continue
             reason = classify_false_positive(paragraph, number, header)
-            if reason:
-                dropped.append(f"{reason}: {paragraph[:90]}")
             # A paragraph may render the same instant twice (KST and UTC).
             # Keep the latest, which is the KST rendering when both appear.
             deadline, explicit = max(dates, key=lambda item: item[0])
+            # The owner rule asks for an absolute KST *datetime*. A bare date
+            # next to a deadline keyword is more often a citation than a
+            # booking — "오너 규칙(2026-09-11)은 … 종료 일시를 …" got the
+            # scanner's own tracking issue (ccc-node#1870) reported at high
+            # confidence on its first production run (#1873). Demote, keep.
+            if reason is None and not explicit:
+                reason = "date-only"
+            if reason:
+                dropped.append(f"{reason}: {paragraph[:90]}")
             hits.append(
                 Hit(
                     deadline=deadline,
