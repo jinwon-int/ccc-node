@@ -710,9 +710,12 @@ class Config(
         description="Owner-only external bridge restart handoff; disabled by default.",
     )
     restart_service_unit: str = Field(
-        default="ccc-telegram-bridge.service",
+        default="",
         alias="CCC_BRIDGE_RESTART_UNIT",
-        description="Exact allowlisted systemd bridge unit used by /restart.",
+        description=(
+            "Exact allowlisted systemd bridge unit used by /restart. Empty resolves "
+            "to ccc-<channel>-bridge.service for the configured channel (#1827)."
+        ),
     )
     restart_delay_seconds: int = Field(
         default=5,
@@ -889,17 +892,23 @@ class Config(
             "CCC_REQUIRE_ALLOWLIST must be a boolean: true/false, yes/no, on/off, or 1/0"
         )
 
-    @field_validator("restart_service_unit")
-    @classmethod
-    def validate_restart_service_unit(cls, v):
-        value = str(v).strip()
+    @model_validator(mode="after")
+    def validate_restart_service_unit(self):
+        """Constrain /restart's unit to the configured channel's bridge family (#1827)."""
+        value = str(self.restart_service_unit).strip()
+        if not value:
+            # Unset: default to this channel's own bridge unit. The historical
+            # telegram-only default pointed Matrix nodes at a foreign service.
+            value = f"ccc-{self.channel}-bridge.service"
         if not re.fullmatch(
-            r"ccc-telegram-bridge(?:-[A-Za-z0-9_.@:-]+)?\.service", value
+            rf"ccc-{self.channel}-bridge(?:-[A-Za-z0-9_.@:-]+)?\.service", value
         ):
             raise ValueError(
-                "CCC_BRIDGE_RESTART_UNIT must name a ccc-telegram-bridge*.service unit"
+                "CCC_BRIDGE_RESTART_UNIT must name a "
+                f"ccc-{self.channel}-bridge*.service unit (channel: {self.channel})"
             )
-        return value
+        self.restart_service_unit = value
+        return self
 
     @field_validator("push_notify_allowed_chats", mode="before")
     @classmethod
