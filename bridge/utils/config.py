@@ -1083,6 +1083,19 @@ class Config(
             "keyboard buttons. Default OFF: the recovery offer uses buttons."
         ),
     )
+    danso_recovery_auto_resume: bool = Field(
+        default=False,
+        alias="CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME",
+        description=(
+            "On bridge restart only: when the native task journal validates as "
+            "ready/paused with resume_allowed=true, resume it through the "
+            "existing explicit /task_resume path without waiting for the "
+            "recovery menu, after posting a body-free notice. Uncertain "
+            "(pending_*), failed, budget-exhausted states, post-failure offers "
+            "and /task_recover still show the menu. Default OFF (owner "
+            "decision 2026-09-21)."
+        ),
+    )
 
     enable_entity_renderer: bool = Field(
         default=True,

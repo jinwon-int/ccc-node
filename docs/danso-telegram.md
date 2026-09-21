@@ -408,6 +408,20 @@ are one-shot lookups where a fresh retry is user-driven and a queued recovery
 offer would only add noise; this was reviewed when wiring the two paths above and
 the offer set stays closed until a path is observed to strand a failed long task.
 `/task_recover` requests a fresh offer on demand.
+
+Restart-only automatic resume (opt-in `CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME`,
+owner decision 2026-09-21): when the startup scan validates a journal as
+`ready`/`paused` with `resume_allowed=true`, the bridge posts a body-free notice
+and takes the same one-shot "continue" path a user choice takes — the explicit
+`/task_resume` control, no prompt appended, same claim/guard/queue discipline.
+It never applies to uncertain (`pending_*`), `failed`, `blocked` or
+budget-exhausted journals, to the post-failure offer, or to `/task_recover`;
+those keep the menu. One automatic attempt per journal fingerprint: if the
+resume leaves the journal byte-identical (immediate crash, restart loop) the
+next scan shows the menu instead of resuming again, and a failed automatic
+resume is followed by the ordinary menu, never by another automatic resume. If
+the notice cannot be delivered nothing is resumed.
+
 Completed tasks and sessions without a long-task ledger do not trigger startup
 offers. An unreadable, malformed, or actively locked journal produces no advice;
 use `/task_recover` again after the active writer finishes. The current native

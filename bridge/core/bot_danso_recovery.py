@@ -15,6 +15,7 @@ from telegram_bot.core.memory_audience import resolve_memory_audience
 logger = logging.getLogger(__name__)
 OFFER = 'danso_recovery_offer'
 NOTIFIED = 'danso_recovery_notified'
+AUTO_RESUMED = 'danso_recovery_auto_resumed'  # journal fingerprint already auto-resumed once
 
 
 def keyboard(token):
@@ -32,6 +33,17 @@ RECOVERY_TEXT_MENU = (
 )
 RECOVERY_TEXT_ACTIONS = {'1': 'continue', '2': 'new', '3': 'view'}
 
+# 오너 결정 2026-09-21: 재시작 스캔에서만, 저널이 ready/paused + resume_allowed=true로
+# 검증될 때 메뉴 대신 기존 명시적 재개 경로를 자동으로 태운다. 옵트인:
+# CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME. 불확실/실패/예산 소진, 실패 후 제안,
+# /task_recover 는 그대로 메뉴다.
+AUTO_RESUME_STATES = {'ready', 'paused'}
+AUTO_RESUME_NOTICE = (
+    '재시작 후 저장된 작업이 재개 가능한 상태({state})로 확인되어 자동으로 이어서 진행합니다 '
+    '(CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME). 멈추려면 /stop, 새 작업은 /new.\n'
+    '마지막 작업: {task}'
+)
+
 
 def binding(current):
     fields = {'provider', 'session_id', 'new_session', OFFER}
@@ -46,6 +58,9 @@ class DansoRecoveryMixin:
 
     def _danso_recovery_text_mode(self):
         return bool(getattr(self._config, 'danso_recovery_text_mode', False))
+
+    def _danso_recovery_auto_resume(self):
+        return bool(getattr(self._config, 'danso_recovery_auto_resume', False))
 
     def _danso_recovery_route(self, user_id, chat_id):
         audience = resolve_memory_audience(self._config, user_id=user_id, chat_id=chat_id)
@@ -68,7 +83,11 @@ class DansoRecoveryMixin:
         if self._danso_recovery_enabled() and not response.success:
             await self._offer_danso_recovery(key, user_id, chat_id, force=True)
 
-    async def _offer_danso_recovery(self, key, user_id, chat_id, *, force=False):
+    async def _offer_danso_recovery(self, key, user_id, chat_id, *, force=False, auto=False):
+        """``auto`` is set only by the restart scan. With the opt-in on and a
+        ready/paused + resume_allowed snapshot it claims the offer through the
+        same one-shot 'continue' path a user choice takes; no other state or
+        entry point ever dispatches without an explicit choice."""
         if not self._danso_recovery_enabled() or not self._check_user_access(user_id):
             return False
         current = await self._session_manager.get_session(key)
@@ -99,6 +118,14 @@ class DansoRecoveryMixin:
         )
         if not saved:
             return False
+        # One automatic attempt per journal fingerprint: if the resume left the
+        # journal byte-identical (immediate crash, restart loop), the next scan
+        # falls back to the menu instead of resuming again.
+        if (auto and self._danso_recovery_auto_resume()
+                and snapshot.state in AUTO_RESUME_STATES and snapshot.resume_allowed
+                and current.get(AUTO_RESUMED) != snapshot.fingerprint):
+            return await self._auto_resume_danso_recovery(
+                key, user_id, chat_id, token, epoch, route, snapshot, offer)
         try:
             offer_text = snapshot.render()
             if self._danso_recovery_text_mode():
@@ -114,6 +141,30 @@ class DansoRecoveryMixin:
             key, expected={OFFER: offer, 'session_id': sid, 'provider': 'danso'},
             updates={NOTIFIED: snapshot.fingerprint},
         )
+        return True
+
+    async def _auto_resume_danso_recovery(self, key, user_id, chat_id, token, epoch, route, snapshot, offer):
+        bot = self._require_application().bot
+        marked = await self._session_manager.patch_session_if(
+            key, expected={OFFER: offer, 'session_id': offer['session_id'], 'provider': 'danso'},
+            updates={AUTO_RESUMED: snapshot.fingerprint},
+            guard=lambda: self._danso_recovery_guard(key, user_id, chat_id, epoch, route),
+        )
+        if not marked:
+            return False
+        try:
+            await bot.send_message(chat_id=chat_id, text=AUTO_RESUME_NOTICE.format(
+                state=snapshot.state, task=(snapshot.task[:500] or '요청 요약 없음')))
+        except Exception as error:
+            # Never resume silently: without the notice fall back to the menu next scan.
+            logger.warning('Danso auto-resume notice failed: %s', type(error).__name__)
+            return False
+
+        async def report(text, keyboard_token=None):
+            await bot.send_message(chat_id=chat_id, text=text,
+                                   reply_markup=keyboard(keyboard_token) if keyboard_token else None)
+        await self._apply_danso_recovery_choice(
+            key, user_id, chat_id, token, 'continue', epoch, route, report)
         return True
 
     async def _recover_danso_tasks(self, application):
@@ -136,7 +187,7 @@ class DansoRecoveryMixin:
                 # guessed chat. /task_recover remains available in that chat.
                 if user_id <= 0 or chat_id == 0 or key != self._conversation_key(user_id, chat_id):
                     continue
-                sent += await self._offer_danso_recovery(key, user_id, chat_id)
+                sent += await self._offer_danso_recovery(key, user_id, chat_id, auto=True)
             except Exception as error:
                 logger.info('Danso startup recovery skipped: %s', type(error).__name__)
             if sent >= 10:
