@@ -5230,6 +5230,108 @@ def _consume_revise_results(config: Config, *, dry_run: bool) -> list[dict[str, 
     return results
 
 
+def _publish_row(
+    outcome: dict[str, str],
+    *,
+    source: str,
+    node: str,
+    provider: str,
+    name: str,
+    tree: str,
+    transport_id: str,
+) -> dict[str, object]:
+    """The kind-less publish row every lineage consumer keys off.
+
+    `_candidate_trees_by_pr`, `_publish_lineage_groups`, `_promotable`,
+    `_sweep_promoted_intakes` and the intake-state sweep all recognise a
+    published candidate by exactly this row: no `kind`, a `url`, a 64-char
+    `tree_sha256`. `_collect` has always written it after the ACK; the
+    auto-revision gate republished revised trees through the same `_publish`
+    but never wrote it. Field case (2026-09-11 → 09-21): 33 republished intake
+    PRs were invisible to auto-promote, the supersede sweep closed nothing
+    (`superseded_intakes=[]` every cycle), and the old PRs stayed open beside
+    their replacements — the backlog's quiet engine.
+    """
+    return {
+        "ts": _utc_now(),
+        **outcome,
+        "source": source,
+        "node": node,
+        "provider": provider,
+        "name": name,
+        "tree_sha256": tree,
+        "transport_id": transport_id,
+    }
+
+
+_REPUBLISH_SOURCE = "revise"
+_REPUBLISH_BACKFILL_SOURCE = "revise-backfill"
+
+
+def _republished_without_publish_row(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Publish rows to backfill for republished trees the ledger never recorded.
+
+    Evidence is the `a2a-revise-result status=republished` row itself, which
+    carries the new PR url, branch, tree and transport id. A url that already
+    has a kind-less publish row is skipped, so the backfill is idempotent and
+    a ledger written by the fixed republish path yields nothing.
+    """
+    published = {
+        row.get("url")
+        for row in rows
+        if row.get("kind") is None and isinstance(row.get("url"), str)
+    }
+    out: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for row in rows:
+        if row.get("kind") != "a2a-revise-result" or row.get("status") != "republished":
+            continue
+        url = row.get("new_pr_url")
+        tree = row.get("new_tree_sha256")
+        branch = row.get("new_branch")
+        transport_id = row.get("new_transport_id")
+        node, provider, name = row.get("node"), row.get("provider"), row.get("name")
+        if not (
+            isinstance(url, str) and url.startswith("https://github.com/")
+            and _pr_number_from_url(url)
+            and isinstance(tree, str) and len(tree) == 64
+            and all(isinstance(v, str) and v for v in (branch, transport_id, node, provider, name))
+        ):
+            continue
+        if url in published or url in seen:
+            continue
+        seen.add(url)
+        out.append(
+            _publish_row(
+                {"outcome": "pr-opened", "branch": str(branch), "url": url},
+                source=_REPUBLISH_BACKFILL_SOURCE,
+                node=str(node), provider=str(provider), name=str(name),
+                tree=tree, transport_id=str(transport_id),
+            )
+        )
+    return out
+
+
+def _backfill_republished(config: Config, *, dry_run: bool) -> dict[str, object]:
+    """Operator command: record the publish rows the republish path omitted.
+
+    One-off after deploying the fix; safe to rerun (idempotent). Read-only
+    under --dry-run.
+    """
+    pending = _republished_without_publish_row(_ledger_rows(config))
+    listed = [
+        {"pr": _pr_number_from_url(str(row["url"])), "node": row["node"], "name": row["name"]}
+        for row in pending
+    ]
+    if dry_run:
+        return {"ok": True, "mode": "backfill-republished-dry-run", "would_record": listed}
+    for row in pending:
+        _append_ledger(config, row)
+    return {"ok": True, "mode": "backfill-republished", "recorded": listed}
+
+
 def _republish_revised_candidate(
     config: Config,
     rows: list[dict[str, object]],
@@ -5285,6 +5387,20 @@ def _republish_revised_candidate(
         )
         return {"outcome": "republish-failed", "task_id": task_id, "code": error.code}
     new_tree = candidate.tree_sha256
+    if outcome["outcome"] in {"pr-opened", "existing-pr"}:
+        # The same kind-less publish row `_collect` writes: without it the
+        # republished PR has no candidate tree in the ledger and every
+        # lineage consumer (auto-promote, supersede, promoted-intake sweep)
+        # treats it as never published.
+        _append_ledger(
+            config,
+            _publish_row(
+                outcome,
+                source=_REPUBLISH_SOURCE,
+                node=node, provider=provider, name=name,
+                tree=new_tree, transport_id=_transport_id(candidate),
+            ),
+        )
     record = {
         "ts": _utc_now(),
         "kind": "a2a-revise-result",
@@ -6044,6 +6160,14 @@ def _parser() -> argparse.ArgumentParser:
     # Operator-invoked, not cron: one draft PR per run, and a batch nobody can
     # review in one sitting is worse than two batches.
     promote_parser.add_argument("--limit", type=int, default=8, choices=range(1, 33))
+    backfill_parser = subparsers.add_parser(
+        "backfill-republished",
+        help=(
+            "record the kind-less publish row for republished (auto-revised) intake "
+            "PRs the ledger never recorded (one-off after the fix; idempotent)"
+        ),
+    )
+    backfill_parser.add_argument("--dry-run", action="store_true")
     drop_parser = subparsers.add_parser(
         "drop-report",
         help=(
@@ -6077,6 +6201,8 @@ def main(argv: list[str] | None = None) -> int:
             result = _drop_report(config, acks=args.ack)
         elif args.command == "promote":
             result = _promote(config, dry_run=args.dry_run, limit=args.limit)
+        elif args.command == "backfill-republished":
+            result = _backfill_republished(config, dry_run=args.dry_run)
         else:
             result = _collect(config, dry_run=args.dry_run)
     except PromotionError as error:
