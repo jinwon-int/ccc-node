@@ -630,6 +630,12 @@ async def test_status_callback_forwards_new_text_after_interval(
     assert sink.statuses == ["⏳ Working", "🔧 Running tests"]
 
 
+def test_status_min_interval_matches_telegram_heartbeat() -> None:
+    from telegram_bot.core.matrix import bot as bot_module
+
+    assert bot_module.STATUS_MIN_INTERVAL_S == 15.0
+
+
 @pytest.mark.anyio
 async def test_status_callback_is_fail_open(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
     bot, chat, _manager = _bot(tmp_path)
