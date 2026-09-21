@@ -156,6 +156,7 @@ async def test_extractor_uses_only_explicit_auth_and_tool_free_private_input(tmp
         "assert len(p.read_bytes()) <= 32768\n"
         f"assert json.loads(p.read_text().split('Untrusted transcript JSON:\\n',1)[1])['truncated'] is {escaped!r}\n"
         'assert "Remember my preference" in p.read_text()\n'
+        'assert "Wiki output is disabled for this run. Return wiki_candidates as [] exactly." in p.read_text()\n'
         'assert "Remember my preference" not in " ".join(a)\n'
         'assert "--no-tools" in a and a[a.index("--max-turns")+1]=="1"\n'
         'assert "TELEGRAM_BOT_TOKEN" not in os.environ\n'

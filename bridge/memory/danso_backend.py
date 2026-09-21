@@ -49,6 +49,8 @@ class DansoDistillBackend:
         prompt = DISTILL_EXTRACTION_PROMPT.replace(
             "supplied on stdin", "in the supplied reference"
         ).replace("every stdin field", "every transcript field")
+        if not self.wiki_enabled:
+            prompt += "\nWiki output is disabled for this run. Return wiki_candidates as [] exactly.\n"
         context = _context_bytes(extraction_input, prompt, schema)
         settings = self.settings
         environment = {"PATH": os.defpath}
