@@ -353,4 +353,8 @@ class Pipeline(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    result = unittest.main(exit=False).result
+    failed = len(result.failures) + len(result.errors)
+    passed = result.testsRun - failed - len(result.skipped)
+    print(f"PASS={passed} FAIL={failed}")
+    raise SystemExit(0 if result.wasSuccessful() else 1)
