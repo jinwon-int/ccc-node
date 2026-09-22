@@ -25,6 +25,14 @@ from .turn_stall import register_turn_liveness
 logger = logging.getLogger(__name__)
 
 
+def _record_status(outcome: Any) -> str | None:
+    """The acceptance record's ``status`` string, or None; never the record body."""
+    if not isinstance(outcome, dict) or not isinstance(outcome.get("record"), dict):
+        return None
+    status = outcome["record"].get("status")
+    return status if isinstance(status, str) else None
+
+
 class GrokTransport(Protocol):
     destination: str
     agent_id: str
@@ -239,7 +247,12 @@ class GrokSession:
             try:
                 return accepted_prompt(outcome, binding.agent_id, nonce, message)
             except ProtocolError as exc:
-                if str(exc) != "acceptance_uncertain" or time.monotonic() >= deadline:
+                # Transient: record not visible yet, or visible with the host's
+                # ``pending`` status (GrokBotSendStatus.PENDING on f7045c4)
+                # before it flips to ``accepted``. Rejected/mismatched is final.
+                transient = str(exc) == "acceptance_uncertain" or (
+                    str(exc) == "acceptance_not_accepted" and _record_status(outcome) == "pending")
+                if not transient or time.monotonic() >= deadline:
                     raise
             await asyncio.sleep(self.ACCEPTANCE_POLL_SECONDS)
 
@@ -271,8 +284,13 @@ class GrokSession:
                 if not self._interrupted:
                     raise
                 yield ErrorEvent("grok_interrupted_outcome_unknown", "Local wait cancelled; remote outcome retained, not stopped.")
-            except Exception:
+            except Exception as exc:
                 self.closed = True
+                # Categorical ProtocolError codes carry no body; other types
+                # reveal only their class name. Without this line the failing
+                # gate could only be found by reproducing the turn by hand.
+                logger.warning("Grok operation denied or uncertain (%s); intent retained",
+                               exc if isinstance(exc, ProtocolError) else type(exc).__name__)
                 yield ErrorEvent("grok_outcome_unknown", "Grok operation denied or uncertain; retained intent requires reconciliation.")
             finally:
                 self._task = None
