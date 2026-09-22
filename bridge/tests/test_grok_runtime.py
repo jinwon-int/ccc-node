@@ -32,6 +32,7 @@ class FakeGrokHost:
         self.version = HOST_VERSION
         self.blank_digest = False
         self.acceptance_lag = 0  # acceptance lookups that still report not-found after a send
+        self.reply_delay_tails = 0  # tail reads that return the echo but no reply yet (host stays idle)
         self.after_reply = []  # extra rows appended after each reply (foreign input / events)
 
     async def call(self, operation, arguments=None):
@@ -41,7 +42,11 @@ class FakeGrokHost:
         if operation == "health":
             return {"ok": True, "isBusy": self.busy, "activeAgentId": self.agent_id, "busyOnlyAwaitingApproval": self.approval}
         if operation == "tail":
-            return {"entries": json.loads(json.dumps(self.rows[-64:]))}
+            rows = self.rows[-64:]
+            if self.reply_delay_tails > 0 and self.sends:
+                self.reply_delay_tails -= 1
+                rows = [r for r in rows if not (r.get("kind") == "send-message" and r.get("requestId") == "request-" + str(len(self.sends)))]
+            return {"entries": json.loads(json.dumps(rows))}
         if operation == "send":
             self.before_send()
             nonce, prompt = arguments["nonce"], arguments["prompt"]
@@ -139,6 +144,16 @@ class GrokRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[2].result, {"text": "generated reply one"})
         self.assertEqual(self.state()["stage"], "complete")
         self.assertEqual(len(self.host.sends), 1)
+
+    async def test_reply_generated_after_idle_health_is_awaited_not_uncertain(self):
+        self.host.reply_delay_tails = 3  # host says idle while the Bot is still writing
+        with patch.object(GrokSession, "POLL_SECONDS", 0.01):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-2:], ["result", "completion"])
+        self.assertEqual(events[-2].result, {"text": "generated reply one"})
+        self.assertEqual(self.state()["stage"], "complete")
+        self.assertEqual(len(self.host.sends), 1)
+        self.assertGreaterEqual(self.host.calls.count("tail"), 4)
 
     async def test_acceptance_persistence_lag_is_polled_not_uncertain(self):
         self.host.acceptance_lag = 3

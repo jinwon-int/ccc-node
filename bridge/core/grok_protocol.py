@@ -263,7 +263,11 @@ def bound_reply(accepted: AcceptedPrompt, prompt: str, baseline: Baseline,
         # dropped a concurrent input before our echo. Do not infer completeness.
         raise ProtocolError("unanchored_range_not_complete")
     echo = next((e for e in rows if e["id"] == accepted.echo_id), None)
-    if (echo is None or echo.get("kind") != "message" or echo.get("role") != "user"
+    if echo is None:
+        # Accepted but the echo has not surfaced in the tail yet (host
+        # f7045c4 persists asynchronously): pending, not a mismatch.
+        raise ProtocolError("reply_pending")
+    if (echo.get("kind") != "message" or echo.get("role") != "user"
             or echo.get("clientNonce") != accepted.nonce or echo.get("content") != prompt
             or echo.get("isStreaming") is not False):
         raise ProtocolError("echo_binding_mismatch")
@@ -289,6 +293,8 @@ def bound_reply(accepted: AcceptedPrompt, prompt: str, baseline: Baseline,
         # First slice accepts only visible text send-message records. Tool,
         # approval and unknown records need separately qualified handling.
         message = entry.get("message")
+        if entry.get("kind") == "send-message" and entry.get("isStreaming") is True:
+            raise ProtocolError("reply_pending")  # still being generated
         if (entry.get("kind") != "send-message" or not isinstance(message, dict)
                 or set(message) != {"type", "content"} or message.get("type") != "text"
                 or entry.get("author") is not None
@@ -297,6 +303,11 @@ def bound_reply(accepted: AcceptedPrompt, prompt: str, baseline: Baseline,
         text = _text(message.get("content"), MAX_REPLY, "invalid_reply_text")
         texts.append(text)
         ids.append(entry["id"])
-    if not texts or sum(len(t.encode("utf-8")) for t in texts) > MAX_REPLY:
-        raise ProtocolError("reply_unavailable_or_oversize")
+    if not texts:
+        # Echo is there but no visible output yet. Host f7045c4 reports
+        # ``isBusy: false`` while the Bot is still generating, so the caller
+        # keeps polling the tail within the turn deadline.
+        raise ProtocolError("reply_pending")
+    if sum(len(t.encode("utf-8")) for t in texts) > MAX_REPLY:
+        raise ProtocolError("reply_oversize")
     return BoundReply(request_id, tuple(ids), tuple(texts))
