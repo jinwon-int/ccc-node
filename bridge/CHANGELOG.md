@@ -1,5 +1,13 @@
 # Changelog
 
+- **Grok acceptance lookup tolerates persistence lag.** Host `f7045c4` writes
+  the send-acceptance record asynchronously, so the lookup issued right after
+  `send` could still be `not-found` (observed 2026-09-22: record stamped 328 ms
+  before the bridge gave up) and every turn ended as "uncertain" with the
+  journal at `attempted`. `GrokSession` now polls the acceptance for up to
+  `ACCEPTANCE_SECONDS` (15 s, every 0.5 s) before treating it as uncertain; a
+  rejected/mismatched record still fails at once and the nonce is never resent.
+
 - **Grok host f7045c4 tolerance.** The Grok host that self-updated on
   2026-09-22 reports `inputDigest: ""` in `promptAcceptanceStatus` (still
   enforcing the digest at send time) and interleaves `kind: "event"` rows in
