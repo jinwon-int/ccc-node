@@ -11,7 +11,7 @@ from telegram_bot.core.agent_runtime import SessionRequest
 from runtime_conformance import assert_turn_stream_contract
 from telegram_bot.core.grok_journal import GrokBinding, GrokJournal
 from telegram_bot.core.grok_protocol import HOST_VERSION, ProtocolError, prompt_digest
-from telegram_bot.core.grok_runtime import GrokRuntime
+from telegram_bot.core.grok_runtime import GrokRuntime, GrokSession
 
 AGENT = "00000000-0000-4000-8000-000000000001"
 
@@ -31,6 +31,7 @@ class FakeGrokHost:
         self.tamper = False
         self.version = HOST_VERSION
         self.blank_digest = False
+        self.acceptance_lag = 0  # acceptance lookups that still report not-found after a send
         self.after_reply = []  # extra rows appended after each reply (foreign input / events)
 
     async def call(self, operation, arguments=None):
@@ -63,6 +64,9 @@ class FakeGrokHost:
                 raise OSError("synthetic secret body must not escape")
             return {"accepted": True}
         if operation == "acceptance":
+            if self.acceptance_lag > 0 and arguments["nonce"] in self.acceptances:
+                self.acceptance_lag -= 1
+                return {"outcome": "not-found"}
             return self.acceptances.get(arguments["nonce"], {"outcome": "not-found"})
         raise AssertionError("unqualified RPC")
 
@@ -134,6 +138,23 @@ class GrokRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.kinds(events), ["text_delta", "message_completed", "result", "completion"])
         self.assertEqual(events[2].result, {"text": "generated reply one"})
         self.assertEqual(self.state()["stage"], "complete")
+        self.assertEqual(len(self.host.sends), 1)
+
+    async def test_acceptance_persistence_lag_is_polled_not_uncertain(self):
+        self.host.acceptance_lag = 3
+        with patch.object(GrokSession, "ACCEPTANCE_POLL_SECONDS", 0.01):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-2:], ["result", "completion"])
+        self.assertEqual(self.state()["stage"], "complete")
+        self.assertEqual(len(self.host.sends), 1)
+        self.assertGreaterEqual(self.host.calls.count("acceptance"), 4)
+
+    async def test_acceptance_never_visible_stays_uncertain_without_resend(self):
+        self.host.acceptance_lag = 10_000
+        with patch.object(GrokSession, "ACCEPTANCE_SECONDS", 0.05), patch.object(GrokSession, "ACCEPTANCE_POLL_SECONDS", 0.01):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-1], "error")
+        self.assertEqual(self.state()["stage"], "attempted")
         self.assertEqual(len(self.host.sends), 1)
 
     async def test_lost_send_reply_reopen_reconciles_without_send(self):

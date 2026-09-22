@@ -127,6 +127,12 @@ class GrokRuntime:
 class GrokSession:
     POLL_SECONDS = 2.0
     TURN_SECONDS = 180.0
+    # Host f7045c4 persists the acceptance record asynchronously: a lookup
+    # right after ``send`` can still be ``not-found`` (observed 2026-09-22,
+    # record stamped 328 ms before the bridge gave up). Poll briefly before
+    # treating the operation as uncertain; a rejection is final immediately.
+    ACCEPTANCE_SECONDS = 15.0
+    ACCEPTANCE_POLL_SECONDS = 0.5
 
     def __init__(self, runtime: GrokRuntime):
         self.runtime = runtime
@@ -179,8 +185,7 @@ class GrokSession:
                 elif current["prompt"] != message:
                     raise ProtocolError("grok_pending_input_mismatch")
                 if current["stage"] == "attempted":
-                    accepted = accepted_prompt(await runtime._call("acceptance", {"nonce": current["nonce"]}),
-                                               binding.agent_id, current["nonce"], message)
+                    accepted = await self._await_acceptance(current["nonce"], message)
                     current = claim.accept(current, accepted)
                 accepted = AcceptedPrompt(**current["accepted"])
                 baseline_value = current["baseline"]
@@ -200,6 +205,25 @@ class GrokSession:
                     health = await runtime._call("health")
                     result = bound_reply(accepted, message, baseline, page, health)
                     return claim.complete(current, result)
+
+    async def _await_acceptance(self, nonce: str, message: str) -> AcceptedPrompt:
+        """Look up the acceptance record for ``nonce``, tolerating a short persistence lag.
+
+        Only ``acceptance_uncertain`` (record not yet visible) is retried, and
+        only until ``ACCEPTANCE_SECONDS``; a rejected or mismatched record
+        raises at once. The nonce is never resent.
+        """
+        runtime = self.runtime
+        binding = runtime.journal.binding
+        deadline = time.monotonic() + self.ACCEPTANCE_SECONDS
+        while True:
+            outcome = await runtime._call("acceptance", {"nonce": nonce})
+            try:
+                return accepted_prompt(outcome, binding.agent_id, nonce, message)
+            except ProtocolError as exc:
+                if str(exc) != "acceptance_uncertain" or time.monotonic() >= deadline:
+                    raise
+            await asyncio.sleep(self.ACCEPTANCE_POLL_SECONDS)
 
     async def send_turn(self, message: str, *, approval_handler: ApprovalHandler = deny_approval) -> AsyncIterator[AgentEvent]:
         del approval_handler  # unsupported; no decision is sent to the host
