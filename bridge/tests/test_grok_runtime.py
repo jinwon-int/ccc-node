@@ -30,6 +30,8 @@ class FakeGrokHost:
         self.before_send = lambda: None
         self.tamper = False
         self.version = HOST_VERSION
+        self.blank_digest = False
+        self.after_reply = []  # extra rows appended after each reply (foreign input / events)
 
     async def call(self, operation, arguments=None):
         self.calls.append(operation)
@@ -51,9 +53,11 @@ class FakeGrokHost:
                 {"id": "reply-" + nonce, "requestId": request if not self.tamper else "foreign",
                  "kind": "send-message", "message": {"type": "text", "content": "generated reply " + prompt}},
             ])
+            self.rows.extend(self.after_reply)
             self.acceptances[nonce] = {"outcome": "found", "record": {
                 "accountSlot": "host", "agentId": self.agent_id, "clientNonce": nonce,
-                "inputDigest": prompt_digest(self.agent_id, nonce, prompt), "status": "accepted", "echoEntryId": echo}}
+                "inputDigest": "" if self.blank_digest else prompt_digest(self.agent_id, nonce, prompt),
+                "status": "accepted", "echoEntryId": echo}}
             self.started.set()
             if self.fail_after_send:
                 raise OSError("synthetic secret body must not escape")
@@ -116,6 +120,21 @@ class GrokRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.host.version = "not-hex"
         with self.assertRaisesRegex(ProtocolError, "unqualified_host_version"):
             await GrokRuntime(self.journal, self.host, qualified_hosts=None).start_or_resume(self.request)
+
+    async def test_host_f7045c4_blank_digest_events_and_later_owner_input_still_complete(self):
+        self.host.blank_digest = True
+        self.host.after_reply = [
+            {"id": "event-" + "c" * 64, "kind": "event", "timestampMs": 1, "event": {"type": "automation-changed"}},
+            {"id": "owner-app", "requestId": "app-run", "kind": "message", "role": "user",
+             "content": "typed in the Grok app", "clientNonce": "app-nonce", "isStreaming": False},
+            {"id": "owner-app-reply", "requestId": "app-run", "kind": "send-message",
+             "message": {"type": "text", "content": "app reply"}},
+        ]
+        events = await self.collect("one")
+        self.assertEqual(self.kinds(events), ["text_delta", "message_completed", "result", "completion"])
+        self.assertEqual(events[2].result, {"text": "generated reply one"})
+        self.assertEqual(self.state()["stage"], "complete")
+        self.assertEqual(len(self.host.sends), 1)
 
     async def test_lost_send_reply_reopen_reconciles_without_send(self):
         self.host.fail_after_send = True

@@ -1,5 +1,16 @@
 # Changelog
 
+- **Grok host f7045c4 tolerance.** The Grok host that self-updated on
+  2026-09-22 reports `inputDigest: ""` in `promptAcceptanceStatus` (still
+  enforcing the digest at send time) and interleaves `kind: "event"` rows in
+  the transcript tail; both made every turn end as "uncertain" with the
+  journal stuck at `attempted`. `accepted_prompt` now accepts a blank reported
+  digest (the echo entry's content/nonce binding stays the local proof; a
+  present-but-different digest is still a mismatch), `bound_reply` ignores
+  event rows, and a foreign input that arrives after our run already replied
+  (the owner talking to the Bot in another client) ends the bound range
+  instead of retiring the reply.
+
 - **Grok on Matrix (owner direct room).** `CCC_AGENT_PROVIDER=grok` with
   `CCC_CHANNEL=matrix` now selects `core/grok_matrix_bot.py` (`GrokMatrixBot`)
   instead of always building the Telegram frontend: the same restricted Grok
