@@ -1,6 +1,7 @@
 """Hermetic real GrokRuntime binding; generated host protocol and private state."""
 import asyncio
 from dataclasses import asdict, replace
+import time
 import json
 from pathlib import Path
 import tempfile
@@ -35,7 +36,14 @@ class FakeGrokHost:
         self.reply_delay_tails = 0  # tail reads that return the echo but no reply yet (host stays idle)
         self.send_response = {"accepted": True}
         self.acceptance_pending = 0  # lookups that report status "pending" before "accepted"
+        self.extra_replies = 0  # further reply rows the Bot writes, one per later tail read
+        self.stamp_rows = False  # add timestampMs so the settle window engages
         self.after_reply = []  # extra rows appended after each reply (foreign input / events)
+
+    def _stamp(self, row):
+        if self.stamp_rows:
+            row["timestampMs"] = int(time.time() * 1000)
+        return row
 
     async def call(self, operation, arguments=None):
         self.calls.append(operation)
@@ -44,6 +52,11 @@ class FakeGrokHost:
         if operation == "health":
             return {"ok": True, "isBusy": self.busy, "activeAgentId": self.agent_id, "busyOnlyAwaitingApproval": self.approval}
         if operation == "tail":
+            if self.extra_replies > 0 and self.sends:
+                self.extra_replies -= 1
+                self.rows.append(self._stamp({
+                    "id": "extra-" + str(self.extra_replies), "requestId": "request-" + str(len(self.sends)),
+                    "kind": "send-message", "message": {"type": "text", "content": "continued " + str(self.extra_replies)}}))
             rows = self.rows[-64:]
             if self.reply_delay_tails > 0 and self.sends:
                 self.reply_delay_tails -= 1
@@ -56,10 +69,10 @@ class FakeGrokHost:
             request = "request-" + str(len(self.sends))
             echo = "echo-" + nonce
             self.rows.extend([
-                {"id": echo, "requestId": request, "kind": "message", "role": "user",
-                 "content": prompt, "clientNonce": nonce, "isStreaming": False},
-                {"id": "reply-" + nonce, "requestId": request if not self.tamper else "foreign",
-                 "kind": "send-message", "message": {"type": "text", "content": "generated reply " + prompt}},
+                self._stamp({"id": echo, "requestId": request, "kind": "message", "role": "user",
+                             "content": prompt, "clientNonce": nonce, "isStreaming": False}),
+                self._stamp({"id": "reply-" + nonce, "requestId": request if not self.tamper else "foreign",
+                             "kind": "send-message", "message": {"type": "text", "content": "generated reply " + prompt}}),
             ])
             self.rows.extend(self.after_reply)
             self.acceptances[nonce] = {"outcome": "found", "record": {
@@ -178,6 +191,42 @@ class GrokRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state()["stage"], "complete")
         self.assertEqual(len(self.host.sends), 1)
         self.assertGreaterEqual(self.host.calls.count("tail"), 4)
+
+    async def test_multi_row_reply_is_settled_before_completion(self):
+        self.host.stamp_rows = True
+        self.host.extra_replies = 2  # the Bot keeps writing after the first row
+        with patch.object(GrokSession, "POLL_SECONDS", 0.01), patch.object(GrokSession, "REPLY_SETTLE_SECONDS", 0.05):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events), ["text_delta", "message_completed"] * 3 + ["result", "completion"])
+        self.assertEqual(events[-2].result["text"], "generated reply one\ncontinued 1\ncontinued 0")
+        state = self.state()
+        self.assertEqual(state["stage"], "complete")
+        self.assertEqual(len(state["reply"]["texts"]), 3)
+        self.assertEqual(len(self.host.sends), 1)
+
+    async def test_unstamped_or_old_range_is_delivered_without_waiting(self):
+        # No timestamps (and, in production, a range older than the window):
+        # nothing to wait for, so the reply is returned on the first read.
+        with patch.object(GrokSession, "POLL_SECONDS", 30.0), patch.object(GrokSession, "REPLY_SETTLE_SECONDS", 30.0):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-2:], ["result", "completion"])
+        self.assertEqual(self.host.calls.count("tail"), 2)  # baseline + the validated read
+
+    async def test_settle_failure_keeps_the_validated_reply(self):
+        self.host.stamp_rows = True
+        original, seen = self.host.call, {"tail": 0}
+        async def breaking(operation, arguments=None):
+            if operation == "tail":
+                seen["tail"] += 1
+                if seen["tail"] > 2:  # baseline + validated read, then a bad page
+                    return {"entries": [{"id": "unanchored", "kind": "message"}]}
+            return await original(operation, arguments)
+        self.host.call = breaking
+        with patch.object(GrokSession, "POLL_SECONDS", 0.01), patch.object(GrokSession, "REPLY_SETTLE_SECONDS", 0.05):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-2:], ["result", "completion"])
+        self.assertEqual(events[-2].result, {"text": "generated reply one"})
+        self.assertEqual(self.state()["stage"], "complete")
 
     async def test_acceptance_pending_status_is_polled_until_accepted(self):
         self.host.acceptance_pending = 3
