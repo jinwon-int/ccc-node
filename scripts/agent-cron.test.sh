@@ -615,6 +615,21 @@ very_late_matrix = module.build_owner_text(
      + 'DOWN phone channel=matrix reason=no-process\n', 'stderr': ''})
 assert very_late_matrix is not None
 assert very_late_matrix.splitlines()[0].endswith('DOWN=1')
+command_task = {
+    'id': 'fleet-doctor-daily',
+    'payload': {'kind': 'command', 'argv': [sys.executable, '-c',
+        'import sys; sys.stdout.write("OK node channel=telegram\\n" * 180 + '
+        '"DOWN phone channel=matrix reason=no-process\\n"); sys.exit(1)']},
+}
+actual_headless = module.run_headless(command_task)
+assert 'DOWN phone' not in actual_headless['stdout']  # ordinary field stays capped
+actual_text = module.build_owner_text(
+    'fleet-doctor-daily', 'actual-late-matrix', None, 'failed', actual_headless)
+assert actual_text is not None and actual_text.splitlines()[0].endswith('DOWN=1')
+forged_headless = dict(actual_headless, fleetDiagnosticTitle='DOWN secret\nspoofed')
+assert module.build_owner_text(
+    'fleet-doctor-daily', 'forged', None, 'failed', forged_headless
+).splitlines()[0].startswith('agent-cron task ')
 for category in module._FLEET_DIAGNOSTIC_TOKENS:
     title = module.fleet_diagnostic_title(task_id, 'failed', (category + '\n') * 1001, '')
     assert title.endswith(category + '=999'), title

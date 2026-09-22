@@ -1175,11 +1175,22 @@ def run_headless(task):
                     'stderr': f"command timed out after {payload['timeoutSec']}s",
                     'timedOut': True}
         cap = payload['outputMaxBytes']
+        captured_stdout = _cap_bytes(proc.stdout, cap)
+        captured_stderr = _cap_bytes(proc.stderr, cap)
+        # Keep only the fixed-token fleet title from the full captured output.
+        # The ordinary headless fields stay at their existing 4000-char cap.
+        safe_stdout = redact_for_owner(captured_stdout, len(captured_stdout) + 1024)
+        safe_stderr = redact_for_owner(captured_stderr, len(captured_stderr) + 1024)
+        diagnostic_title = (
+            fleet_diagnostic_title(task.get('id'), 'failed', safe_stdout, safe_stderr)
+            if safe_stdout is not None and safe_stderr is not None else None
+        )
         return {
             **meta,
             'exitCode': proc.returncode,
-            'stdout': short_text(_cap_bytes(proc.stdout, cap)),
-            'stderr': short_text(_cap_bytes(proc.stderr, cap)),
+            'stdout': short_text(captured_stdout),
+            'stderr': short_text(captured_stderr),
+            'fleetDiagnosticTitle': diagnostic_title,
         }
     cmd = shlex.split(meta['command'])
     if not cmd:
@@ -1375,6 +1386,28 @@ def fleet_diagnostic_title(task_id, status, stdout, stderr):
     return f"agent-cron fleet alert for task {task_id}: {' '.join(signals)}"
 
 
+def safe_fleet_diagnostic_title(task_id, candidate):
+    """Accept a precomputed title only when it contains fixed category counts."""
+    if not isinstance(candidate, str) or _VALID_TASK_ID.fullmatch(str(task_id or '')) is None:
+        return None
+    prefix = f'agent-cron fleet alert for task {task_id}: '
+    if not candidate.startswith(prefix):
+        return None
+    fields = candidate[len(prefix):].split(' ')
+    positions = []
+    for field in fields:
+        name, sep, count = field.partition('=')
+        if (not sep or name not in _FLEET_DIAGNOSTIC_TOKENS
+                or not count.isdigit() or len(count) > 3):
+            return None
+        if not 1 <= int(count) <= _FLEET_DIAGNOSTIC_COUNT_MAX:
+            return None
+        positions.append(_FLEET_DIAGNOSTIC_TOKENS.index(name))
+    if not positions or positions != sorted(set(positions)):
+        return None
+    return candidate
+
+
 def build_owner_text(task_id, run_id, scheduled_at, status, headless):
     raw_stdout = (headless or {}).get('stdout', '')
     raw_stderr = (headless or {}).get('stderr', '')
@@ -1386,7 +1419,9 @@ def build_owner_text(task_id, run_id, scheduled_at, status, headless):
     stderr = redact_for_owner(raw_stderr, 900)
     if None in (title_stdout, title_stderr, stdout, stderr):
         return None
-    title = fleet_diagnostic_title(task_id, status, title_stdout, title_stderr)
+    title = (safe_fleet_diagnostic_title(
+        task_id, (headless or {}).get('fleetDiagnosticTitle')) if status != 'success' else None)
+    title = title or fleet_diagnostic_title(task_id, status, title_stdout, title_stderr)
     stdout = stdout.strip()
     stderr = stderr.strip()
     lines = [
