@@ -1,5 +1,15 @@
 # Changelog
 
+- **Grok send response settled by the acceptance record.** On host `f7045c4`
+  `sendPrompt` no longer answers `{"accepted": true}` although the prompt is
+  accepted and run, so every fresh turn ended as `grok_send_uncertain` right
+  after the send (journal stuck at `attempted`; all of 2026-09-22's apparent
+  successes were cached replays). The runtime now treats an unconfirmed send
+  response as "consult the durable acceptance record" (already polled with a
+  bounded window) instead of failing at once; no resend, no fresh nonce. The
+  Telegram/Matrix Grok frontends now log the categorical ProtocolError code
+  with the retained-state warning so the next drift is diagnosable from the log.
+
 - **Grok reply is awaited when the host reports idle too early.** Host
   `f7045c4` keeps `health.isBusy: false` while the Bot is still writing, so the
   bridge read the tail right after acceptance, found the echo but no output,

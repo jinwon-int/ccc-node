@@ -323,10 +323,13 @@ class GrokMatrixBot:
             if self.session is not None:
                 await self.session.close()
             raise
-        except Exception:
+        except Exception as exc:
             if self.session is not None:
                 await self.session.close()
-            logger.warning("Grok turn denied, uncertain, or delivery failed; state retained")
+            # ProtocolError codes are categorical and body-free; other types
+            # reveal only their class name.
+            logger.warning("Grok turn denied, uncertain, or delivery failed; state retained (%s)",
+                           exc if isinstance(exc, ProtocolError) else type(exc).__name__)
             return _turn_result(UNCERTAIN)
         finally:
             self.active = None

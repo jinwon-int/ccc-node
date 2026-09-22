@@ -33,6 +33,7 @@ class FakeGrokHost:
         self.blank_digest = False
         self.acceptance_lag = 0  # acceptance lookups that still report not-found after a send
         self.reply_delay_tails = 0  # tail reads that return the echo but no reply yet (host stays idle)
+        self.send_response = {"accepted": True}
         self.after_reply = []  # extra rows appended after each reply (foreign input / events)
 
     async def call(self, operation, arguments=None):
@@ -67,7 +68,7 @@ class FakeGrokHost:
             self.started.set()
             if self.fail_after_send:
                 raise OSError("synthetic secret body must not escape")
-            return {"accepted": True}
+            return json.loads(json.dumps(self.send_response))
         if operation == "acceptance":
             if self.acceptance_lag > 0 and arguments["nonce"] in self.acceptances:
                 self.acceptance_lag -= 1
@@ -143,6 +144,24 @@ class GrokRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.kinds(events), ["text_delta", "message_completed", "result", "completion"])
         self.assertEqual(events[2].result, {"text": "generated reply one"})
         self.assertEqual(self.state()["stage"], "complete")
+        self.assertEqual(len(self.host.sends), 1)
+
+    async def test_unconfirmed_send_response_is_settled_by_acceptance_record(self):
+        for response in ({}, {"ok": True}, {"accepted": False}):
+            with self.subTest(response=response):
+                self.host.send_response = response
+                events = await self.collect("prompt-" + str(len(self.host.sends)))
+                self.assertEqual(self.kinds(events)[-2:], ["result", "completion"])
+                self.assertEqual(self.state()["stage"], "complete")
+        self.assertEqual(len(self.host.sends), 3)
+
+    async def test_unconfirmed_send_without_acceptance_record_stays_attempted(self):
+        self.host.send_response = {}
+        self.host.acceptance_lag = 10_000
+        with patch.object(GrokSession, "ACCEPTANCE_SECONDS", 0.05), patch.object(GrokSession, "ACCEPTANCE_POLL_SECONDS", 0.01):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-1], "error")
+        self.assertEqual(self.state()["stage"], "attempted")
         self.assertEqual(len(self.host.sends), 1)
 
     async def test_reply_generated_after_idle_health_is_awaited_not_uncertain(self):

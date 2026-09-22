@@ -218,10 +218,13 @@ class GrokTelegramBot:
             if self.session is not None:
                 await self.session.close()
             raise
-        except Exception:
+        except Exception as exc:
             if self.session is not None:
                 await self.session.close()
-            logger.warning("Grok turn denied, uncertain, or delivery failed; state retained")
+            # ProtocolError codes are categorical and body-free; other types
+            # reveal only their class name.
+            logger.warning("Grok turn denied, uncertain, or delivery failed; state retained (%s)",
+                           exc if isinstance(exc, ProtocolError) else type(exc).__name__)
             await self._reply(context, "요청 또는 전달 결과를 확정할 수 없습니다. 기록은 보존했습니다. 다시 입력하면 기록과 대조하며, 불확실한 전송은 자동 재전송하지 않습니다.", generation)
         finally:
             self.active = None
