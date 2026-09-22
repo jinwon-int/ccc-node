@@ -6,6 +6,7 @@ Local interruption retires the handle and retains the remote unknown outcome.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, Protocol
@@ -16,10 +17,20 @@ from .agent_runtime import (
 )
 from .grok_journal import GrokJournal
 from .grok_protocol import (
-    AcceptedPrompt, Baseline, MAX_PROMPT, ProtocolError, _text, accepted_prompt,
-    bound_reply, capture_baseline, check_host, check_idle,
+    AcceptedPrompt, Baseline, BoundReply, HOST_VERSION, MAX_PROMPT, ProtocolError, _text,
+    accepted_prompt, bound_reply, capture_baseline, check_host, check_idle,
 )
 from .turn_stall import register_turn_liveness
+
+logger = logging.getLogger(__name__)
+
+
+def _record_status(outcome: Any) -> str | None:
+    """The acceptance record's ``status`` string, or None; never the record body."""
+    if not isinstance(outcome, dict) or not isinstance(outcome.get("record"), dict):
+        return None
+    status = outcome["record"].get("status")
+    return status if isinstance(status, str) else None
 
 
 class GrokTransport(Protocol):
@@ -70,8 +81,17 @@ class GrokTurnLiveness:
 
 
 class GrokRuntime:
-    def __init__(self, journal: GrokJournal, transport: GrokTransport):
+    def __init__(
+        self,
+        journal: GrokJournal,
+        transport: GrokTransport,
+        *,
+        qualified_hosts: frozenset[str] | None = frozenset({HOST_VERSION}),
+    ):
         self.journal, self.transport = journal, transport
+        # Accepted host ids for ``status`` (None = capability-only); the id
+        # the host actually reports is recorded on every journal revision.
+        self.qualified_hosts = qualified_hosts
         self._session: GrokSession | None = None
         self._last_activity: float | None = None
         self._check_binding()
@@ -111,13 +131,27 @@ class GrokRuntime:
         # A completed host RPC is the turn's last-activity signal (#1741).
         self._last_activity = time.monotonic()
         if operation == "status":
-            check_host(result)
+            self.journal.host_version = check_host(result, self.qualified_hosts)
         return result
 
 
 class GrokSession:
     POLL_SECONDS = 2.0
     TURN_SECONDS = 180.0
+    # Host f7045c4 persists the acceptance record asynchronously: a lookup
+    # right after ``send`` can still be ``not-found`` (observed 2026-09-22,
+    # record stamped 328 ms before the bridge gave up). Poll briefly before
+    # treating the operation as uncertain; a rejection is final immediately.
+    ACCEPTANCE_SECONDS = 15.0
+    ACCEPTANCE_POLL_SECONDS = 0.5
+    # The Bot answers in several transcript rows ("내일 일정 알려줄게" first, the
+    # list 4-8 s later in 2026-09-22 observations) and host f7045c4 publishes no
+    # end-of-run marker: reply rows carry no `isStreaming` and `health.isBusy`
+    # never leaves false. Returning on the first row delivered a truncated
+    # answer, so a validated range whose newest row is younger than this is
+    # held until the transcript stays unchanged for that long. A range that is
+    # already older (reconciliation, replay) is returned at once.
+    REPLY_SETTLE_SECONDS = 10.0
 
     def __init__(self, runtime: GrokRuntime):
         self.runtime = runtime
@@ -166,12 +200,16 @@ class GrokSession:
                     # send. Reopening only queries this nonce; never resends.
                     reply = await runtime._call("send", {"nonce": current["nonce"], "prompt": message})
                     if not isinstance(reply, dict) or reply.get("accepted") is not True:
-                        raise ProtocolError("grok_send_uncertain")
+                        # Host f7045c4 no longer answers ``{"accepted": true}`` on
+                        # the proxied path although it accepts and runs the
+                        # prompt. The durable acceptance record below is the
+                        # authority; never resend, never invent a nonce.
+                        logger.warning("Grok send response unconfirmed (keys=%s); consulting acceptance record",
+                                       sorted(reply) if isinstance(reply, dict) else type(reply).__name__)
                 elif current["prompt"] != message:
                     raise ProtocolError("grok_pending_input_mismatch")
                 if current["stage"] == "attempted":
-                    accepted = accepted_prompt(await runtime._call("acceptance", {"nonce": current["nonce"]}),
-                                               binding.agent_id, current["nonce"], message)
+                    accepted = await self._await_acceptance(current["nonce"], message)
                     current = claim.accept(current, accepted)
                 accepted = AcceptedPrompt(**current["accepted"])
                 baseline_value = current["baseline"]
@@ -189,8 +227,85 @@ class GrokSession:
                     # Recheck after the transcript fetch; this is observation,
                     # not distributed CAS. Interference denies the full range.
                     health = await runtime._call("health")
-                    result = bound_reply(accepted, message, baseline, page, health)
+                    try:
+                        result = bound_reply(accepted, message, baseline, page, health)
+                    except ProtocolError as exc:
+                        if str(exc) != "reply_pending":
+                            raise
+                        # Host f7045c4 keeps ``isBusy: false`` while the Bot is
+                        # still writing; the echo (or a streaming row) is in
+                        # the tail but no complete text yet. Wait, bounded by
+                        # the surrounding TURN_SECONDS timeout.
+                        await asyncio.sleep(self.POLL_SECONDS)
+                        continue
+                    result = await self._settled_reply(accepted, message, baseline, result, page)
                     return claim.complete(current, result)
+
+    def _range_age_seconds(self, page: Any, entry_ids: tuple[str, ...]) -> float | None:
+        """Seconds since the newest row of ``entry_ids``, or None when unusable.
+
+        The transcript and this process share the Bot computer's clock, but a
+        missing, negative or absurd stamp is treated as "no basis to wait" so
+        settling can never hang on a malformed page.
+        """
+        stamps: list[int] = []
+        for entry in page.get("entries", []) if isinstance(page, dict) else []:
+            if not isinstance(entry, dict) or entry.get("id") not in entry_ids:
+                continue
+            stamp = entry.get("timestampMs")
+            if type(stamp) is int:
+                stamps.append(stamp)
+        if not stamps:
+            return None
+        age = time.time() - max(stamps) / 1000.0
+        return age if 0.0 <= age <= 86_400.0 else None
+
+    async def _settled_reply(self, accepted: AcceptedPrompt, message: str, baseline: Baseline,
+                             result: BoundReply, page: Any) -> BoundReply:
+        """Hold a freshly written reply until this run stops adding rows.
+
+        The host has no end-of-run marker, so completeness is judged by
+        quiescence of the bound range. Any validation failure during the wait
+        keeps the range already validated: settling must never lose a
+        confirmed answer. The surrounding TURN_SECONDS timeout bounds it.
+        """
+        runtime = self.runtime
+        while True:
+            age = self._range_age_seconds(page, result.entry_ids)
+            if age is None or age >= self.REPLY_SETTLE_SECONDS:
+                return result
+            await asyncio.sleep(self.POLL_SECONDS)
+            try:
+                page = await runtime._call("tail")
+                health = await runtime._call("health")
+                result = bound_reply(accepted, message, baseline, page, health)
+            except ProtocolError as exc:
+                logger.warning("Grok reply settle stopped early (%s); delivering the validated range", exc)
+                return result
+
+    async def _await_acceptance(self, nonce: str, message: str) -> AcceptedPrompt:
+        """Look up the acceptance record for ``nonce``, tolerating a short persistence lag.
+
+        Only ``acceptance_uncertain`` (record not yet visible) is retried, and
+        only until ``ACCEPTANCE_SECONDS``; a rejected or mismatched record
+        raises at once. The nonce is never resent.
+        """
+        runtime = self.runtime
+        binding = runtime.journal.binding
+        deadline = time.monotonic() + self.ACCEPTANCE_SECONDS
+        while True:
+            outcome = await runtime._call("acceptance", {"nonce": nonce})
+            try:
+                return accepted_prompt(outcome, binding.agent_id, nonce, message)
+            except ProtocolError as exc:
+                # Transient: record not visible yet, or visible with the host's
+                # ``pending`` status (GrokBotSendStatus.PENDING on f7045c4)
+                # before it flips to ``accepted``. Rejected/mismatched is final.
+                transient = str(exc) == "acceptance_uncertain" or (
+                    str(exc) == "acceptance_not_accepted" and _record_status(outcome) == "pending")
+                if not transient or time.monotonic() >= deadline:
+                    raise
+            await asyncio.sleep(self.ACCEPTANCE_POLL_SECONDS)
 
     async def send_turn(self, message: str, *, approval_handler: ApprovalHandler = deny_approval) -> AsyncIterator[AgentEvent]:
         del approval_handler  # unsupported; no decision is sent to the host
@@ -220,8 +335,13 @@ class GrokSession:
                 if not self._interrupted:
                     raise
                 yield ErrorEvent("grok_interrupted_outcome_unknown", "Local wait cancelled; remote outcome retained, not stopped.")
-            except Exception:
+            except Exception as exc:
                 self.closed = True
+                # Categorical ProtocolError codes carry no body; other types
+                # reveal only their class name. Without this line the failing
+                # gate could only be found by reproducing the turn by hand.
+                logger.warning("Grok operation denied or uncertain (%s); intent retained",
+                               exc if isinstance(exc, ProtocolError) else type(exc).__name__)
                 yield ErrorEvent("grok_outcome_unknown", "Grok operation denied or uncertain; retained intent requires reconciliation.")
             finally:
                 self._task = None

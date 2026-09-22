@@ -106,8 +106,9 @@ def _load_promoter() -> tuple[object, pathlib.Path]:
 
 
 def _local_workers_full(m, config, secret: str) -> dict[str, dict]:
-    completed = m._run(["curl", "-fsS", "-H", f"x-a2a-edge-secret: {secret}",
-                        f"{config.broker_url}/workers?include=stale_read_path&limit=100"])
+    with m._edge_secret_header(secret) as header_argv:
+        completed = m._run(["curl", "-fsS", *header_argv,
+                            f"{config.broker_url}/workers?include=stale_read_path&limit=100"])
     payload = json.loads(completed.stdout.decode("utf-8"))
     return {row["nodeId"]: row for row in payload.get("items", []) if isinstance(row, dict)}
 
@@ -164,8 +165,9 @@ def _recent_failures(m, config, rb, secret: str, window_hours: int) -> dict[str,
     the reviewer failing."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
     if rb is None:
-        completed = m._run(["curl", "-fsS", "-H", f"x-a2a-edge-secret: {secret}",
-                            f"{config.broker_url}/audit?action=task.failed&limit=200"])
+        with m._edge_secret_header(secret) as header_argv:
+            completed = m._run(["curl", "-fsS", *header_argv,
+                                f"{config.broker_url}/audit?action=task.failed&limit=200"])
         raw = completed.stdout.decode("utf-8")
     else:
         script = (

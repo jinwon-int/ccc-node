@@ -142,4 +142,7 @@ ok "both feed prompts keep task-progress separated from decision" \
   'grep -q "task-progress=진행/완료 보고. 결정이 아니다." "$FEED" && grep -q "task-progress=진행/완료 보고. 결정이 아니다." "$PIRI_FEED"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
-[ "$fail" = 0 ]
+[ "$fail" = 0 ] || exit 1
+
+# Native Codex formats and growing-file receipts need behavioral regressions.
+python3 "$ROOT/claude/hooks/nunchi/codex-feed-regression.py" || exit 1

@@ -227,6 +227,15 @@ remains disabled; enabling it is a separate governance decision.
 A required check with a started runner and failing test/tool step is a product
 or test failure. Fix the source; do not merge.
 
+Known-flaky suites are the bounded exception recorded here until root-caused.
+When `validate-harness-shard` fails on `scripts/ccc-skill-promotion.test.sh`
+while main and a local rerun are green (#1903), the harness prints the failing
+assertion/summary lines from the suite output (`suite_failure_detail`), so the
+failing-case evidence must be attached to the tracking issue before the failed
+job is rerun once (`gh run rerun --failed`). A second red on the same SHA is
+not rerun again; it blocks merge until a source fix lands. This rerun right is
+operator-initiated only — no automatic rerun is installed for it.
+
 A run cancelled while jobs have no runner assignment, no `started_at`, and no
 executed steps is an **unassigned infrastructure failure**. Preserve the run
 URL and job readback, rerun the same SHA once with GitHub's rerun operation,

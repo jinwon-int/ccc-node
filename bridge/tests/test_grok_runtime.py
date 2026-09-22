@@ -1,6 +1,7 @@
 """Hermetic real GrokRuntime binding; generated host protocol and private state."""
 import asyncio
 from dataclasses import asdict, replace
+import time
 import json
 from pathlib import Path
 import tempfile
@@ -11,7 +12,7 @@ from telegram_bot.core.agent_runtime import SessionRequest
 from runtime_conformance import assert_turn_stream_contract
 from telegram_bot.core.grok_journal import GrokBinding, GrokJournal
 from telegram_bot.core.grok_protocol import HOST_VERSION, ProtocolError, prompt_digest
-from telegram_bot.core.grok_runtime import GrokRuntime
+from telegram_bot.core.grok_runtime import GrokRuntime, GrokSession
 
 AGENT = "00000000-0000-4000-8000-000000000001"
 
@@ -29,15 +30,38 @@ class FakeGrokHost:
         self.started = asyncio.Event()
         self.before_send = lambda: None
         self.tamper = False
+        self.version = HOST_VERSION
+        self.blank_digest = False
+        self.acceptance_lag = 0  # acceptance lookups that still report not-found after a send
+        self.reply_delay_tails = 0  # tail reads that return the echo but no reply yet (host stays idle)
+        self.send_response = {"accepted": True}
+        self.acceptance_pending = 0  # lookups that report status "pending" before "accepted"
+        self.extra_replies = 0  # further reply rows the Bot writes, one per later tail read
+        self.stamp_rows = False  # add timestampMs so the settle window engages
+        self.after_reply = []  # extra rows appended after each reply (foreign input / events)
+
+    def _stamp(self, row):
+        if self.stamp_rows:
+            row["timestampMs"] = int(time.time() * 1000)
+        return row
 
     async def call(self, operation, arguments=None):
         self.calls.append(operation)
         if operation == "status":
-            return {"hostVersion": HOST_VERSION, "capabilities": ["orderedReplicasV1", "sendAcceptanceV1"], "isBusy": self.busy}
+            return {"hostVersion": self.version, "capabilities": ["orderedReplicasV1", "sendAcceptanceV1"], "isBusy": self.busy}
         if operation == "health":
             return {"ok": True, "isBusy": self.busy, "activeAgentId": self.agent_id, "busyOnlyAwaitingApproval": self.approval}
         if operation == "tail":
-            return {"entries": json.loads(json.dumps(self.rows[-64:]))}
+            if self.extra_replies > 0 and self.sends:
+                self.extra_replies -= 1
+                self.rows.append(self._stamp({
+                    "id": "extra-" + str(self.extra_replies), "requestId": "request-" + str(len(self.sends)),
+                    "kind": "send-message", "message": {"type": "text", "content": "continued " + str(self.extra_replies)}}))
+            rows = self.rows[-64:]
+            if self.reply_delay_tails > 0 and self.sends:
+                self.reply_delay_tails -= 1
+                rows = [r for r in rows if not (r.get("kind") == "send-message" and r.get("requestId") == "request-" + str(len(self.sends)))]
+            return {"entries": json.loads(json.dumps(rows))}
         if operation == "send":
             self.before_send()
             nonce, prompt = arguments["nonce"], arguments["prompt"]
@@ -45,19 +69,28 @@ class FakeGrokHost:
             request = "request-" + str(len(self.sends))
             echo = "echo-" + nonce
             self.rows.extend([
-                {"id": echo, "requestId": request, "kind": "message", "role": "user",
-                 "content": prompt, "clientNonce": nonce, "isStreaming": False},
-                {"id": "reply-" + nonce, "requestId": request if not self.tamper else "foreign",
-                 "kind": "send-message", "message": {"type": "text", "content": "generated reply " + prompt}},
+                self._stamp({"id": echo, "requestId": request, "kind": "message", "role": "user",
+                             "content": prompt, "clientNonce": nonce, "isStreaming": False}),
+                self._stamp({"id": "reply-" + nonce, "requestId": request if not self.tamper else "foreign",
+                             "kind": "send-message", "message": {"type": "text", "content": "generated reply " + prompt}}),
             ])
+            self.rows.extend(self.after_reply)
             self.acceptances[nonce] = {"outcome": "found", "record": {
                 "accountSlot": "host", "agentId": self.agent_id, "clientNonce": nonce,
-                "inputDigest": prompt_digest(self.agent_id, nonce, prompt), "status": "accepted", "echoEntryId": echo}}
+                "inputDigest": "" if self.blank_digest else prompt_digest(self.agent_id, nonce, prompt),
+                "status": "accepted", "echoEntryId": echo}}
             self.started.set()
             if self.fail_after_send:
                 raise OSError("synthetic secret body must not escape")
-            return {"accepted": True}
+            return json.loads(json.dumps(self.send_response))
         if operation == "acceptance":
+            if self.acceptance_lag > 0 and arguments["nonce"] in self.acceptances:
+                self.acceptance_lag -= 1
+                return {"outcome": "not-found"}
+            if self.acceptance_pending > 0 and arguments["nonce"] in self.acceptances:
+                self.acceptance_pending -= 1
+                record = dict(self.acceptances[arguments["nonce"]]["record"], status="pending", echoEntryId=None)
+                return {"outcome": "found", "record": record}
             return self.acceptances.get(arguments["nonce"], {"outcome": "not-found"})
         raise AssertionError("unqualified RPC")
 
@@ -95,6 +128,143 @@ class GrokRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.kinds(events), ["text_delta", "message_completed", "result", "completion"])
         assert_turn_stream_contract(events)
         self.assertEqual(events[-2].result["text"], "generated reply one")
+        self.assertEqual(len(self.host.sends), 1)
+
+    async def test_host_version_policy_pin_list_any_and_journal_continuity(self):
+        self.host.version = "0123abc"
+        with self.assertRaisesRegex(ProtocolError, "unqualified_host_version"):
+            await GrokRuntime(self.journal, self.host).start_or_resume(self.request)
+        listed = GrokRuntime(self.journal, self.host, qualified_hosts=frozenset({"0123abc"}))
+        session = await listed.start_or_resume(self.request)
+        self.assertEqual(self.journal.host_version, "0123abc")
+        await self.collect("one", session=session)
+        self.assertEqual(json.loads((self.root / "0001.json").read_text())["host_version"], "0123abc")
+        self.assertEqual(json.loads((self.root / "0000.json").read_text())["host_version"], HOST_VERSION)
+        self.host.version = "fedcba9"  # idle-auto-update: history written under other ids still loads
+        anyhost = GrokRuntime(self.journal, self.host, qualified_hosts=None)
+        session = await anyhost.start_or_resume(self.request)
+        await self.collect("two", session=session)
+        self.assertEqual(json.loads((self.root / "0004.json").read_text())["host_version"], "fedcba9")
+        self.host.version = "not-hex"
+        with self.assertRaisesRegex(ProtocolError, "unqualified_host_version"):
+            await GrokRuntime(self.journal, self.host, qualified_hosts=None).start_or_resume(self.request)
+
+    async def test_host_f7045c4_blank_digest_events_and_later_owner_input_still_complete(self):
+        self.host.blank_digest = True
+        self.host.after_reply = [
+            {"id": "event-" + "c" * 64, "kind": "event", "timestampMs": 1, "event": {"type": "automation-changed"}},
+            {"id": "owner-app", "requestId": "app-run", "kind": "message", "role": "user",
+             "content": "typed in the Grok app", "clientNonce": "app-nonce", "isStreaming": False},
+            {"id": "owner-app-reply", "requestId": "app-run", "kind": "send-message",
+             "message": {"type": "text", "content": "app reply"}},
+        ]
+        events = await self.collect("one")
+        self.assertEqual(self.kinds(events), ["text_delta", "message_completed", "result", "completion"])
+        self.assertEqual(events[2].result, {"text": "generated reply one"})
+        self.assertEqual(self.state()["stage"], "complete")
+        self.assertEqual(len(self.host.sends), 1)
+
+    async def test_unconfirmed_send_response_is_settled_by_acceptance_record(self):
+        for response in ({}, {"ok": True}, {"accepted": False}):
+            with self.subTest(response=response):
+                self.host.send_response = response
+                events = await self.collect("prompt-" + str(len(self.host.sends)))
+                self.assertEqual(self.kinds(events)[-2:], ["result", "completion"])
+                self.assertEqual(self.state()["stage"], "complete")
+        self.assertEqual(len(self.host.sends), 3)
+
+    async def test_unconfirmed_send_without_acceptance_record_stays_attempted(self):
+        self.host.send_response = {}
+        self.host.acceptance_lag = 10_000
+        with patch.object(GrokSession, "ACCEPTANCE_SECONDS", 0.05), patch.object(GrokSession, "ACCEPTANCE_POLL_SECONDS", 0.01):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-1], "error")
+        self.assertEqual(self.state()["stage"], "attempted")
+        self.assertEqual(len(self.host.sends), 1)
+
+    async def test_reply_generated_after_idle_health_is_awaited_not_uncertain(self):
+        self.host.reply_delay_tails = 3  # host says idle while the Bot is still writing
+        with patch.object(GrokSession, "POLL_SECONDS", 0.01):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-2:], ["result", "completion"])
+        self.assertEqual(events[-2].result, {"text": "generated reply one"})
+        self.assertEqual(self.state()["stage"], "complete")
+        self.assertEqual(len(self.host.sends), 1)
+        self.assertGreaterEqual(self.host.calls.count("tail"), 4)
+
+    async def test_multi_row_reply_is_settled_before_completion(self):
+        self.host.stamp_rows = True
+        self.host.extra_replies = 2  # the Bot keeps writing after the first row
+        with patch.object(GrokSession, "POLL_SECONDS", 0.01), patch.object(GrokSession, "REPLY_SETTLE_SECONDS", 0.05):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events), ["text_delta", "message_completed"] * 3 + ["result", "completion"])
+        self.assertEqual(events[-2].result["text"], "generated reply one\ncontinued 1\ncontinued 0")
+        state = self.state()
+        self.assertEqual(state["stage"], "complete")
+        self.assertEqual(len(state["reply"]["texts"]), 3)
+        self.assertEqual(len(self.host.sends), 1)
+
+    async def test_unstamped_or_old_range_is_delivered_without_waiting(self):
+        # No timestamps (and, in production, a range older than the window):
+        # nothing to wait for, so the reply is returned on the first read.
+        with patch.object(GrokSession, "POLL_SECONDS", 30.0), patch.object(GrokSession, "REPLY_SETTLE_SECONDS", 30.0):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-2:], ["result", "completion"])
+        self.assertEqual(self.host.calls.count("tail"), 2)  # baseline + the validated read
+
+    async def test_settle_failure_keeps_the_validated_reply(self):
+        self.host.stamp_rows = True
+        original, seen = self.host.call, {"tail": 0}
+        async def breaking(operation, arguments=None):
+            if operation == "tail":
+                seen["tail"] += 1
+                if seen["tail"] > 2:  # baseline + validated read, then a bad page
+                    return {"entries": [{"id": "unanchored", "kind": "message"}]}
+            return await original(operation, arguments)
+        self.host.call = breaking
+        with patch.object(GrokSession, "POLL_SECONDS", 0.01), patch.object(GrokSession, "REPLY_SETTLE_SECONDS", 0.05):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-2:], ["result", "completion"])
+        self.assertEqual(events[-2].result, {"text": "generated reply one"})
+        self.assertEqual(self.state()["stage"], "complete")
+
+    async def test_acceptance_pending_status_is_polled_until_accepted(self):
+        self.host.acceptance_pending = 3
+        with patch.object(GrokSession, "ACCEPTANCE_POLL_SECONDS", 0.01):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-2:], ["result", "completion"])
+        self.assertEqual(self.state()["stage"], "complete")
+        self.assertEqual(len(self.host.sends), 1)
+
+    async def test_acceptance_rejected_status_fails_at_once(self):
+        original = self.host.call
+        async def rejecting(operation, arguments=None):
+            result = await original(operation, arguments)
+            if operation == "acceptance" and result.get("outcome") == "found":
+                result["record"] = dict(result["record"], status="rejected")
+            return result
+        self.host.call = rejecting
+        with patch.object(GrokSession, "ACCEPTANCE_SECONDS", 5.0), patch.object(GrokSession, "ACCEPTANCE_POLL_SECONDS", 0.01):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-1], "error")
+        self.assertEqual(self.state()["stage"], "attempted")
+        self.assertLessEqual(self.host.calls.count("acceptance"), 2)
+
+    async def test_acceptance_persistence_lag_is_polled_not_uncertain(self):
+        self.host.acceptance_lag = 3
+        with patch.object(GrokSession, "ACCEPTANCE_POLL_SECONDS", 0.01):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-2:], ["result", "completion"])
+        self.assertEqual(self.state()["stage"], "complete")
+        self.assertEqual(len(self.host.sends), 1)
+        self.assertGreaterEqual(self.host.calls.count("acceptance"), 4)
+
+    async def test_acceptance_never_visible_stays_uncertain_without_resend(self):
+        self.host.acceptance_lag = 10_000
+        with patch.object(GrokSession, "ACCEPTANCE_SECONDS", 0.05), patch.object(GrokSession, "ACCEPTANCE_POLL_SECONDS", 0.01):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-1], "error")
+        self.assertEqual(self.state()["stage"], "attempted")
         self.assertEqual(len(self.host.sends), 1)
 
     async def test_lost_send_reply_reopen_reconciles_without_send(self):

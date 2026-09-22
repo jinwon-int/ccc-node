@@ -14,7 +14,7 @@ changed versus the family-messenger pilot bot ("fambot"):
 |---|---|---|
 | brain | one Codex process per turn, JSON port | `ProjectChatHandler` in-process (as Telegram) |
 | session | `session_id` per room, cold start each turn | warm `AgentSession` per room |
-| progress | "작업을 시작했습니다" only | typing + interim/status notices |
+| progress | "작업을 시작했습니다" only | typing + interim/status notices + the Telegram session-start banner (`◐ CCC session started (<reason>)…`) whenever a turn opens a fresh provider stream |
 | commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) + `/history /resume` (#1895 PR-B) |
 | output | plain `m.text` | plain `body` + Matrix HTML `formatted_body` |
 | E2EE / trust / room gate | fleet_matrix | same code, ported (fail-closed reasons unchanged) |
@@ -229,6 +229,35 @@ evidence-first continue) through a few channel ports:
   with the same stale-lock retry as Telegram (#1888). Off, or ineligible, the
   scan just offers the menu; answer `1`.
 
+## Grok (`CCC_AGENT_PROVIDER=grok`) — owner direct room only
+
+With the Grok provider, `CCC_CHANNEL=matrix` selects `core/grok_matrix_bot.py`
+(`GrokMatrixBot`) instead of `MatrixBot`: the same restricted contract as the
+Grok Telegram frontend ([GROK-BOT-PROVIDER.md](GROK-BOT-PROVIDER.md)) — text
+only, one turn at a time, no `/new`/model/effort/approvals/history/files, the
+persisted Grok journal as the only session authority — served through the
+unchanged E2EE transport, room gate and event admission.
+
+- **Direct room only.** The Grok journal binds exactly one owner conversation.
+  A config with `family_rooms` or `family_users` is refused before the
+  transport opens (`grok_matrix_direct_room_only`); a message from any other
+  sender, room kind or unlisted room gets a static denial and never reaches
+  the journal or the Bot.
+- **Startup gates after the device authenticated:** single local Grok
+  frontend (the same abstract socket as the Telegram frontend — Telegram and
+  Matrix cannot serve the same Bot at once), persisted journal
+  (`start_or_resume`), qualified host version, idle Bot. A failed gate closes
+  the transport and exits; nothing is reset.
+- `/status` describes the attachment; `/stop` and `/cancel <turn>` are the
+  transport's controls and only cancel local waiting (the Bot's remote tools
+  are not stopped). `CCC_MATRIX_INITIALIZE=1` provisions the bot device and
+  exits without opening the journal, as for `MatrixBot`.
+- The route still needs the Telegram identity keys (`TELEGRAM_BOT_TOKEN`,
+  `CCC_GROK_TELEGRAM_BOT_ID`, `CCC_GROK_OWNER_ID`): they are the journal's
+  immutable binding label, not a Telegram connection. No `getMe`/webhook
+  check runs; the Matrix login and pinned owner devices are the identity gate.
+- No streaming, typing/status bubbles, health.json tick or spool notifier:
+  the reply is delivered by the outbox once the journal has committed it.
 
 ## health.json for the Matrix frontend
 
@@ -252,3 +281,27 @@ entry (provider mismatch and out-of-range are refused), any other reply clears
 the list and is served normally. Claude browsing stays locked while private
 memory is `audience-scoped` (`/new` instead); Danso reports the current
 auto-resuming session; Piri accepts `/resume <session-id>`.
+
+## Automatic memory writeback
+
+Matrix and Telegram share `MemoryDistillMixin`: `/new`, provider changes,
+automatic session expiry, opted-in completed-turn checkpoints and bounded
+shutdown all enqueue the departing/current session in the channel's durable
+`distill-journal`. Matrix also accepts `/distill` for an explicit queued save.
+Matrix queues the departing session before `/model` changes its provider,
+`/resume` selects another session, or `/skills` starts a new one. Successful
+`/skills` responses participate in the same opted-in checkpoint policy.
+The same snapshot, budget-gated extraction, audience-local sink and local Wiki
+candidate workers run while the Matrix transport serves. Closing the transport
+cancels its background workers and queues only bounded shutdown receipts; it
+does not wait for an AI extraction. Private Matrix audiences retain the
+`matrix` namespace; family rooms use the existing shared policy.
+
+The current policy still applies: checkpoint thresholds default to zero; set
+`CCC_MEMORY_DISTILL_CHECKPOINT_TURNS`, `_BYTES` or `_AGE_SECONDS` to opt in.
+Extraction requires the configured provider budget. Local audience writeback
+requires `CCC_BRIDGE_MEMORY_MODE=audience-scoped`; this change neither enables
+it nor merges private memory stores. In unscoped Codex deployments, the existing
+nunchi Codex feed independently collects the common Codex transcript tree.
+`off` for `CCC_MEMORY_DISTILL_PROVIDER` or the global `distill.disabled` marker
+prevents new bridge jobs. Wiki candidates remain local pending-review records.

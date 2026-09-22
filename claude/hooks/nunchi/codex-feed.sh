@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # nunchi codex-feed extractor (#816) — Codex-provider nodes without Claude
-# distill. Extracts user/agent messages from NEW codex rollout jsonl files,
+# distill. Extracts user/agent messages from new or growing rollout jsonl files,
 # asks codex exec for distill-style facts, and ingests them into the nunchi
-# peer_facts DB. Idempotent via seen-file; bounded per run. Runs from cron.
+# peer_facts DB. Idempotent via fingerprint receipts; bounded per run. Runs from cron.
 # NOTE: unlike ingest-cron.sh this costs one codex exec call per new file.
 # No-op unless nunchi is enabled (state/nunchi.mode=on or CCC_NUNCHI_MODE=on).
 set -uo pipefail
@@ -43,7 +43,11 @@ CODEX_KILL_GRACE="${NUNCHI_FEED_CODEX_KILL_GRACE_SEC:-15}"
 # bridge's honcho extraction uses near-identical prompt text).
 LANE_TAG="nunchi-codex-feed-816"
 mkdir -p "$NUNCHI_HOME"
-touch "$SEEN"
+# Hold an owner-private no-follow lock for the complete read/modify/write run.
+# --locked is only the internal child; cron invokes this script without args.
+if [ "${1:-}" != --locked ]; then
+  exec python3 "$RECEIPTS" run-locked "$LOCK" bash "$0" --locked
+fi
 
 PROMPT_PREFIX='다음은 AI 에이전트 작업 세션의 대화 발췌이다. 다음 세션에서도 알아야 할 사실만 추출해 strict JSON으로 답하라.
 형식: {"honcho":[{"kind":"preference|decision|observation|context|constraint|task-progress|procedure|fact|correction","text":"<한 문장 한국어 사실>","subject":"user|session|node","because":"<kind=decision이면 결정 이유 한 문장 — 필수, 아니면 생략>"}]}
@@ -65,7 +69,6 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
 '
 
 (
-  flock -n 9 || exit 0
   # Stale-lane sweep: under this lock, any codex exec still carrying the lane
   # tag belongs to an earlier tick (this run has spawned none yet). Kill it so
   # a suspended tick cannot accumulate orphans across cron ticks.
@@ -143,4 +146,4 @@ PYEOF
   # files considered this run, ingested = sessions processed.
   _status="${CCC_NUNCHI_INGEST_STATUS:-$NUNCHI_HOME/ingest.status.json}"
   nunchi_write_status "$_status" codex "${sources:-0}" "${n:-0}" 0 "${failed:-0}"
-) 9>"$LOCK"
+)

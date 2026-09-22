@@ -6,8 +6,7 @@ import os
 import signal
 import shutil
 import subprocess
-import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path as FilePath
 from typing import Any, Callable, Optional, Protocol, cast
 
@@ -71,6 +70,8 @@ from telegram_bot.utils.orphan_reaper import (
     run_periodic_reaper,
     sweep_orphaned_claude_processes,
 )
+
+from telegram_bot.core.memory_distill import MemoryDistillMixin
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +180,7 @@ class _LifecycleConfigPort(
     """Config slices this mixin reads (#1509): paths / token / CLI paths, tool policy, heartbeat store."""
 
 
-class BotLifecycleMixin:
+class BotLifecycleMixin(MemoryDistillMixin):
     _make_interim_send_callback: Callable[[int], InterimMessageCallback]
     _config: _LifecycleConfigPort
     _session_manager: SessionManagerPort
@@ -1693,230 +1694,6 @@ class BotLifecycleMixin:
 
         logger.info("Dead-session wakeup enabled")
         return wakeup_tick
-
-    async def _distill_sweep_jobs(
-        self, interval: float, *, recover: bool = True
-    ) -> tuple["DistillJob", ...]:
-        """One shared journal scan per poll cluster for the pipeline loops.
-
-        The six distill loops poll on the same interval and wake as a cluster,
-        so each tick used to pay eleven full journal reads (five recoveries
-        plus six listings), every record re-validated with its snapshot
-        payload. Within a fraction of the interval one physical
-        recover+prune+list result now serves all of them. Listings were
-        always advisory — each worker's claim_* call is the serialization
-        point and re-reads under the journal lock — so a shared snapshot
-        changes no claim semantics. ``recover=False`` preserves the skill
-        collector's read-only contract when it has to scan on a cache miss.
-        """
-        lock = getattr(self, "_distill_sweep_lock", None)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._distill_sweep_lock = lock
-        journal = self._distill_journal
-        # Short enough that every real tick rescans (and per-loop tests with
-        # millisecond intervals stay per-tick fresh), long enough to fold one
-        # wake cluster into one scan.
-        ttl = max(0.0, min(30.0, float(interval) * 0.5))
-        async with lock:
-            cache = getattr(self, "_distill_sweep_cache", None)
-            now = time.monotonic()
-            if (
-                cache is not None
-                and cache[0] is journal
-                and now - cache[1] < ttl
-            ):
-                return cache[2]
-            if recover:
-                await asyncio.to_thread(journal.recover_stale_running)
-            prune = getattr(journal, "prune_terminal_jobs", None)
-            retention = float(
-                getattr(
-                    self._config,
-                    "distill_job_retention_seconds",
-                    14 * 24 * 3600.0,
-                )
-                or 0.0
-            )
-            if recover and prune is not None and retention > 0:
-                try:
-                    pruned = await asyncio.to_thread(
-                        prune, older_than_seconds=retention
-                    )
-                except Exception:
-                    logger.warning(
-                        "Distill journal prune failed; continuing", exc_info=True
-                    )
-                else:
-                    if pruned:
-                        logger.info(
-                            "Distill journal pruned %d fully-terminal job(s)",
-                            len(pruned),
-                        )
-            jobs = await asyncio.to_thread(journal.list_jobs)
-            self._distill_sweep_cache = (journal, now, jobs)
-            return jobs
-
-    async def _distill_extraction_loop(self, stop_event: asyncio.Event) -> None:
-        """Drive the budget-gated distill worker over ready snapshot jobs.
-
-        This is the production scheduler for the retained worker (#388): each
-        sweep runs every ready (snapshot_done) job through extract_once, whose
-        prospective reservation gate defers capped work before any provider
-        call. Trigger policy that *creates* jobs remains #465's phase, so on
-        nodes without queued jobs each sweep is a no-op. Fail-open: sweep
-        errors are logged and never end the loop or the bridge.
-        """
-
-        from telegram_bot.memory.distill_types import DistillJobStatus
-
-        worker = self._distill_extraction_worker
-        interval = float(
-            getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
-        )
-        max_jobs_per_sweep = max(
-            1,
-            int(
-                getattr(
-                    self._config,
-                    "memory_distill_max_jobs_per_sweep",
-                    1,
-                )
-                or 1
-            ),
-        )
-        while not stop_event.is_set():
-            try:
-                jobs = await self._distill_sweep_jobs(interval)
-                attempted = 0
-                for job in jobs:
-                    if stop_event.is_set():
-                        break
-                    # Ready set: fresh snapshots AND transiently failed
-                    # extractions — claim_extraction accepts both, and the
-                    # worker's max-attempts gate bounds the retries.
-                    if job.status not in (
-                        DistillJobStatus.SNAPSHOT_DONE,
-                        DistillJobStatus.EXTRACTION_RETRYABLE_FAILED,
-                    ):
-                        continue
-                    retry_after_raw = getattr(job, "extraction_retry_after", None)
-                    if retry_after_raw is not None:
-                        retry_after = datetime.fromisoformat(
-                            retry_after_raw.replace("Z", "+00:00")
-                        )
-                        if retry_after > datetime.now(timezone.utc):
-                            continue
-                    await worker.extract_once(job_id=job.job_id)
-                    attempted += 1
-                    if attempted >= max_jobs_per_sweep:
-                        break
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Distill extraction sweep failed; continuing", exc_info=True
-                )
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            except (TimeoutError, asyncio.TimeoutError):
-                continue
-
-    async def _distill_snapshot_loop(self, stop_event: asyncio.Event) -> None:
-        """Recover queued/stale snapshot jobs through their bound Codex route."""
-
-        from telegram_bot.memory.distill_types import DistillJobStatus
-
-        worker = self._distill_snapshot_worker
-        interval = float(
-            getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
-        )
-        while not stop_event.is_set():
-            try:
-                jobs = await self._distill_sweep_jobs(interval)
-                for job in jobs:
-                    if stop_event.is_set():
-                        break
-                    if job.status not in (
-                        DistillJobStatus.QUEUED,
-                        DistillJobStatus.RETRYABLE_FAILED,
-                    ):
-                        continue
-                    await worker.snapshot_once(job_id=job.job_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Distill snapshot sweep failed; continuing", exc_info=True
-                )
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            except (TimeoutError, asyncio.TimeoutError):
-                continue
-
-    async def _distill_local_sink_loop(self, stop_event: asyncio.Event) -> None:
-        """Drive independently leased local write-back without re-extraction."""
-
-        from telegram_bot.memory.distill_types import DistillLocalSinkStatus
-
-        worker = self._distill_local_sink_worker
-        interval = float(
-            getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
-        )
-        while not stop_event.is_set():
-            try:
-                jobs = await self._distill_sweep_jobs(interval)
-                for job in jobs:
-                    if stop_event.is_set():
-                        break
-                    if job.local_sink_status not in (
-                        DistillLocalSinkStatus.PENDING,
-                        DistillLocalSinkStatus.RETRYABLE_FAILED,
-                    ):
-                        continue
-                    await worker.write_once(job_id=job.job_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Distill local-sink sweep failed; continuing", exc_info=True
-                )
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            except (TimeoutError, asyncio.TimeoutError):
-                continue
-
-    async def _distill_wiki_sink_loop(self, stop_event: asyncio.Event) -> None:
-        """Drive the local human-review queue without any Wiki write or PR."""
-
-        from telegram_bot.memory.distill_types import DistillWikiSinkStatus
-
-        worker = self._distill_wiki_sink_worker
-        interval = float(
-            getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
-        )
-        while not stop_event.is_set():
-            try:
-                jobs = await self._distill_sweep_jobs(interval)
-                for job in jobs:
-                    if stop_event.is_set():
-                        break
-                    if job.wiki_sink_status not in (
-                        DistillWikiSinkStatus.PENDING,
-                        DistillWikiSinkStatus.RETRYABLE_FAILED,
-                    ):
-                        continue
-                    await worker.write_once(job_id=job.job_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Distill Wiki-sink sweep failed; continuing", exc_info=True
-                )
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            except (TimeoutError, asyncio.TimeoutError):
-                continue
 
     async def _skill_candidate_collector_loop(self, stop_event: asyncio.Event) -> None:
         """Stage provider-bound skill candidates from distill snapshots (#667, #749).

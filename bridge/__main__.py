@@ -552,6 +552,12 @@ def _build_standard_context(
 def create_app(context: AppContext):
     """Create the chat frontend from an already-built application context."""
     if context.settings.agent_provider == "grok":
+        if getattr(context.settings, "channel", "telegram") == "matrix":
+            # Same restricted Grok contract (owner only, text only, one turn),
+            # served through the E2EE Matrix transport in the owner's direct room.
+            from telegram_bot.core.grok_matrix_bot import GrokMatrixBot
+
+            return GrokMatrixBot(context.settings, context.agent_runtime)
         from telegram_bot.core.grok_bot import GrokTelegramBot
 
         return GrokTelegramBot(context.settings, context.agent_runtime, context.telegram_port)
@@ -564,6 +570,11 @@ def create_app(context: AppContext):
             project_chat=context.project_chat,
             session_manager=context.session_manager,
             clock=context.clock,
+            distill_journal=context.distill_journal,
+            distill_snapshot_worker=context.distill_snapshot_worker,
+            distill_extraction_worker=context.distill_extraction_worker,
+            distill_local_sink_worker=context.distill_local_sink_worker,
+            distill_wiki_sink_worker=context.distill_wiki_sink_worker,
         )
     from telegram_bot.core.bot import TelegramBot
 

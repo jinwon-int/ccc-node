@@ -1,9 +1,16 @@
-"""Bounded Grok Bot gateway validation, qualified against host 5c534e9.
+"""Bounded Grok Bot gateway validation, qualified against host 79a3c3e (baseline; f7045c4 observed).
 
 This is the existing Bot protocol, not the xAI model API. Acceptance is not
 completion. A caller must durably retain the nonce, prompt and pre-send
 baseline, and must not resend an uncertain operation under a fresh nonce.
 No response/error body is ever included in a ProtocolError.
+
+The Grok host (``sand-host`` behind the loopback gateway) replaces itself
+while idle (``idle-auto-update``), several times a week in practice. The
+baseline pin therefore only names the build the contract was qualified
+against; deployments widen it with ``CCC_GROK_HOST_VERSIONS`` (a list of
+additional ids, or ``any`` to rely on the capability contract alone) — see
+:func:`qualified_hosts`.
 """
 from __future__ import annotations
 
@@ -14,7 +21,8 @@ import math
 import uuid
 from typing import Any
 
-HOST_VERSION = "5c534e9"
+HOST_VERSION = "79a3c3e"
+HOST_ANY = "any"  # CCC_GROK_HOST_VERSIONS value: capability-qualified, no id pin
 MAX_WIRE = 1024 * 1024
 MAX_PROMPT = 32768
 MAX_ENTRIES = 64
@@ -106,8 +114,43 @@ def _check_structure(result: Any) -> None:
             pending.extend((child, depth + 1) for child in value)
 
 
-def check_host(status: Any) -> None:
-    if not isinstance(status, dict) or status.get("hostVersion") != HOST_VERSION:
+def host_id(value: Any) -> str:
+    """A host build id as the gateway reports it: 7-40 lowercase hex characters."""
+    value = _text(value, 40, "unqualified_host_version")
+    if len(value) < 7 or any(c not in "0123456789abcdef" for c in value):
+        raise ProtocolError("unqualified_host_version")
+    return value
+
+
+def qualified_hosts(spec: Any) -> frozenset[str] | None:
+    """Parse ``CCC_GROK_HOST_VERSIONS`` into the accepted host id set.
+
+    Unset/blank keeps the baseline pin; ``any`` returns ``None`` (accept every
+    well-formed id whose capabilities satisfy the contract); otherwise a
+    comma-separated list of ids, always including the baseline.
+    """
+    if spec is None or not str(spec).strip():
+        return frozenset({HOST_VERSION})
+    text = str(spec).strip().lower()
+    if text == HOST_ANY:
+        return None
+    ids = {host_id(part.strip()) for part in text.split(",") if part.strip()}
+    if not ids:
+        raise ProtocolError("invalid_host_version_list")
+    return frozenset(ids | {HOST_VERSION})
+
+
+def check_host(status: Any, qualified: frozenset[str] | None = frozenset({HOST_VERSION})) -> str:
+    """Validate a gateway ``status`` and return the host id it reports.
+
+    ``qualified`` is the accepted id set (default: the baseline pin) or
+    ``None`` for capability-only qualification. The capability contract is
+    checked in every mode.
+    """
+    if not isinstance(status, dict):
+        raise ProtocolError("unqualified_host_version")
+    version = host_id(status.get("hostVersion"))
+    if qualified is not None and version not in qualified:
         raise ProtocolError("unqualified_host_version")
     caps = status.get("capabilities")
     if (not isinstance(caps, list) or len(caps) > 64
@@ -115,6 +158,7 @@ def check_host(status: Any) -> None:
             or not {"orderedReplicasV1", "sendAcceptanceV1"}.issubset(caps)
             or type(status.get("isBusy")) is not bool):
         raise ProtocolError("host_capability_mismatch")
+    return version
 
 
 def check_idle(health: Any, agent_id: str) -> None:
@@ -175,9 +219,14 @@ def accepted_prompt(value: Any, agent_id: str, nonce: str, prompt: str) -> Accep
     if not isinstance(value, dict) or value.get("outcome") != "found":
         raise ProtocolError("acceptance_uncertain")
     record = value.get("record")
+    # Host f7045c4 (2026-09-22) stopped echoing the digest in the acceptance
+    # record (``inputDigest: ""``) while still enforcing it at send time; the
+    # echo entry's content/nonce binding in :func:`bound_reply` remains the
+    # local proof. A present-but-different digest is still a mismatch.
+    reported = record.get("inputDigest") if isinstance(record, dict) else None
     if (not isinstance(record, dict) or record.get("accountSlot") != "host"
             or record.get("agentId") != agent_id or record.get("clientNonce") != nonce
-            or record.get("inputDigest") != digest):
+            or not isinstance(reported, str) or (reported != "" and reported != digest)):
         raise ProtocolError("acceptance_binding_mismatch")
     if record.get("status") != "accepted":
         raise ProtocolError("acceptance_not_accepted")
@@ -189,6 +238,37 @@ class BoundReply:
     request_id: str
     entry_ids: tuple[str, ...]
     texts: tuple[str, ...]
+
+
+def _reply_rows(rows: list[dict[str, Any]], request_id: str) -> tuple[list[str], list[str]]:
+    """Collect our run's visible text rows after the echo; see :func:`bound_reply`."""
+    texts: list[str] = []
+    ids: list[str] = []
+    for entry in rows:
+        if entry.get("kind") == "event":
+            # Host-side automation/system events (f7045c4: ``automation-changed``)
+            # carry no requestId and are not conversation output.
+            continue
+        if entry.get("requestId") != request_id:
+            if texts:
+                # Our run already produced visible output; a later foreign
+                # input (the owner talking to the Bot in another client) ends
+                # the bound range instead of retiring a completed reply.
+                break
+            raise ProtocolError("interleaved_run")
+        # First slice accepts only visible text send-message records. Tool,
+        # approval and unknown records need separately qualified handling.
+        message = entry.get("message")
+        if entry.get("kind") == "send-message" and entry.get("isStreaming") is True:
+            raise ProtocolError("reply_pending")  # still being generated
+        if (entry.get("kind") != "send-message" or not isinstance(message, dict)
+                or set(message) != {"type", "content"} or message.get("type") != "text"
+                or entry.get("author") is not None
+                or ("isStreaming" in entry and entry["isStreaming"] is not False)):
+            raise ProtocolError("unsupported_reply_record")
+        texts.append(_text(message.get("content"), MAX_REPLY, "invalid_reply_text"))
+        ids.append(entry["id"])
+    return ids, texts
 
 
 def bound_reply(accepted: AcceptedPrompt, prompt: str, baseline: Baseline,
@@ -214,7 +294,11 @@ def bound_reply(accepted: AcceptedPrompt, prompt: str, baseline: Baseline,
         # dropped a concurrent input before our echo. Do not infer completeness.
         raise ProtocolError("unanchored_range_not_complete")
     echo = next((e for e in rows if e["id"] == accepted.echo_id), None)
-    if (echo is None or echo.get("kind") != "message" or echo.get("role") != "user"
+    if echo is None:
+        # Accepted but the echo has not surfaced in the tail yet (host
+        # f7045c4 persists asynchronously): pending, not a mismatch.
+        raise ProtocolError("reply_pending")
+    if (echo.get("kind") != "message" or echo.get("role") != "user"
             or echo.get("clientNonce") != accepted.nonce or echo.get("content") != prompt
             or echo.get("isStreaming") is not False):
         raise ProtocolError("echo_binding_mismatch")
@@ -223,22 +307,12 @@ def bound_reply(accepted: AcceptedPrompt, prompt: str, baseline: Baseline,
         raise ProtocolError("reused_request_id")
     if not rows or rows[0]["id"] != accepted.echo_id:
         raise ProtocolError("interleaved_input")
-    texts: list[str] = []
-    ids: list[str] = []
-    for entry in rows[1:]:
-        if entry.get("requestId") != request_id:
-            raise ProtocolError("interleaved_run")
-        # First slice accepts only visible text send-message records. Tool,
-        # approval and unknown records need separately qualified handling.
-        message = entry.get("message")
-        if (entry.get("kind") != "send-message" or not isinstance(message, dict)
-                or set(message) != {"type", "content"} or message.get("type") != "text"
-                or entry.get("author") is not None
-                or ("isStreaming" in entry and entry["isStreaming"] is not False)):
-            raise ProtocolError("unsupported_reply_record")
-        text = _text(message.get("content"), MAX_REPLY, "invalid_reply_text")
-        texts.append(text)
-        ids.append(entry["id"])
-    if not texts or sum(len(t.encode("utf-8")) for t in texts) > MAX_REPLY:
-        raise ProtocolError("reply_unavailable_or_oversize")
+    ids, texts = _reply_rows(rows[1:], request_id)
+    if not texts:
+        # Echo is there but no visible output yet. Host f7045c4 reports
+        # ``isBusy: false`` while the Bot is still generating, so the caller
+        # keeps polling the tail within the turn deadline.
+        raise ProtocolError("reply_pending")
+    if sum(len(t.encode("utf-8")) for t in texts) > MAX_REPLY:
+        raise ProtocolError("reply_oversize")
     return BoundReply(request_id, tuple(ids), tuple(texts))

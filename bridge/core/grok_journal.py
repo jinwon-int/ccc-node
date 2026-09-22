@@ -15,7 +15,7 @@ import uuid
 
 from .grok_protocol import (
     AcceptedPrompt, Baseline, BoundReply, HOST_VERSION, MAX_REPLY, ProtocolError,
-    _text, identifier, prompt_digest, decode_wire,
+    _text, host_id, identifier, prompt_digest, decode_wire,
 )
 from .grok_ssh import GrokSshTransport
 from telegram_bot.utils.secure_fs import _validate_storage_directory
@@ -38,6 +38,14 @@ def _install_noreplace(directory: int, source: str, target: str) -> None:
     function.restype = ctypes.c_int
     if function(directory, source.encode("ascii"), directory, target.encode("ascii"), 1) != 0:
         raise OSError(ctypes.get_errno(), "grok_revision_install_failed")
+
+
+def _host_record(value: Any) -> bool:
+    try:
+        host_id(value)
+    except ProtocolError:
+        return False
+    return True
 
 
 def canonical(value: Any) -> bytes:
@@ -147,6 +155,10 @@ class GrokJournal:
     def __init__(self, root: Path, binding: GrokBinding):
         self.root = Path(os.path.abspath(root))
         self.binding = binding
+        # Host build id recorded on new revisions: the runtime sets it from the
+        # last qualified ``status``; history is not tied to one id (the host
+        # self-updates while idle), only to well-formed ids.
+        self.host_version = HOST_VERSION
 
     def create(self) -> None:
         _validate_storage_directory(self.root.parent)
@@ -272,7 +284,7 @@ class GrokClaim:
                     or set(value) != {"schema", "revision", "previous", "binding", "host_version", "operation"}
                     or type(value["schema"]) is not int or value["schema"] != 1
                     or type(value["revision"]) is not int or value["revision"] != number
-                    or value["previous"] != previous or value["host_version"] != HOST_VERSION
+                    or value["previous"] != previous or not _host_record(value["host_version"])
                     or value["binding"] != asdict(self.journal.binding) or canonical(value) != raw):
                 raise ProtocolError("grok_history_invalid")
             new = value["operation"]
@@ -303,7 +315,7 @@ class GrokClaim:
             _operation(operation, self.journal.binding)
             _transition(old, operation)
         value = {"schema": 1, "revision": revision, "previous": previous,
-                 "binding": asdict(self.journal.binding), "host_version": HOST_VERSION,
+                 "binding": asdict(self.journal.binding), "host_version": self.journal.host_version,
                  "operation": operation}
         raw = canonical(value)
         if len(raw) > MAX_RECORD:

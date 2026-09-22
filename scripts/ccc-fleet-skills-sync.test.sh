@@ -106,8 +106,86 @@ out="$(env "${base_env[@]}" HOME="$CONFLICT_HOME" \
   CCC_FLEET_SKILLS_CLAUDE_DIR="$CONFLICT_CLAUDE" \
   CCC_FLEET_SKILLS_CODEX_DIR="$CONFLICT_CODEX" \
   python3 "$SYNC" apply --ref "$REF")"; rc=$?
-ok "user-owned target conflict blocks the entire apply" \
-  '[ "$rc" = 2 ] && jq -e ".code == \"target_user_owned\"" >/dev/null <<<"$out" && [ ! -e "$CONFLICT_CODEX/release-checklist" ]'
+ok "user-owned target is skipped per skill and no longer blocks the rest of the apply" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 1 and .skipped_user_owned == [\"claude:release-checklist\"] and (.operations | any(.provider == \"claude\" and .action == \"skip-user-owned\")) and (.operations | any(.provider == \"codex\" and .action == \"install\"))" >/dev/null <<<"$out" && [ -f "$CONFLICT_CODEX/release-checklist/.ccc-fleet-skill.json" ]'
+ok "skipped user-owned directory is byte-untouched and never gains a fleet marker" \
+  '[ "$(cat "$CONFLICT_CLAUDE/release-checklist/notes")" = "user owned" ] && [ ! -e "$CONFLICT_CLAUDE/release-checklist/SKILL.md" ] && [ ! -e "$CONFLICT_CLAUDE/release-checklist/.ccc-fleet-skill.json" ]'
+ok "apply receipt records the skip for doctor" \
+  '[ "$(stat -c %a "$CONFLICT_HOME/.claude/state/fleet-skills/last-run.json")" = 600 ] && jq -e --arg ref "$REF" ".ok == true and .mode == \"apply\" and .commit == \$ref and .consecutive_failures == 0 and .skipped_user_owned == [\"claude:release-checklist\"]" "$CONFLICT_HOME/.claude/state/fleet-skills/last-run.json" >/dev/null'
+
+# Adoption (#1344 precedence: fleet-approved > autosave-owned). A marker-less
+# target that is the autosave layer's own draft of the approved skill — the
+# authoring node's copy coming back approved — is replaced, with the prior
+# bytes kept in backups/, instead of refusing the run. A byte-identical
+# marker-less copy is adopted the same way (it only lacks provenance).
+ADOPT_HOME="$TMP/adopt-home"
+ADOPT_CLAUDE="$ADOPT_HOME/.claude/skills"
+ADOPT_CODEX="$ADOPT_HOME/.codex/skills"
+ADOPT_STATE="$ADOPT_HOME/.claude/state/fleet-skills"
+mkdir -p "$ADOPT_CLAUDE/release-checklist" "$ADOPT_CODEX/release-checklist" "$ADOPT_HOME/.claude/state"
+chmod 700 "$ADOPT_HOME" "$ADOPT_HOME/.claude" "$ADOPT_HOME/.claude/state" "$ADOPT_HOME/.codex" \
+  "$ADOPT_CLAUDE" "$ADOPT_CODEX" "$ADOPT_CLAUDE/release-checklist" "$ADOPT_CODEX/release-checklist"
+printf -- '---\nname: release-checklist\ndescription: the autosave draft, pre-review wording\n---\n\ndraft body\n' > "$ADOPT_CLAUDE/release-checklist/SKILL.md"
+jq -n '{schema_version:2,manager:"ccc-node-skill-autosave",ownership:"autosave-managed",name:"release-checklist",provider:"claude",created_by:"ccc-node"}' > "$ADOPT_CLAUDE/release-checklist/.autosave-meta.json"
+chmod 600 "$ADOPT_CLAUDE/release-checklist/.autosave-meta.json"
+# The installed tree is SKILL.md (+ support dirs) only — approval.json stays in
+# the repo — so a hand copy of just SKILL.md is the byte-identical case.
+cp "$SKILL/SKILL.md" "$ADOPT_CODEX/release-checklist/SKILL.md"
+adopt_env=("${base_env[@]}" HOME="$ADOPT_HOME" \
+  CCC_FLEET_SKILLS_STATE_DIR="$ADOPT_STATE" \
+  CCC_FLEET_SKILLS_CLAUDE_DIR="$ADOPT_CLAUDE" \
+  CCC_FLEET_SKILLS_CODEX_DIR="$ADOPT_CODEX")
+out="$(env "${adopt_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
+ok "autosave-owned and byte-identical marker-less targets plan as adopt" \
+  '[ "$rc" = 0 ] && jq -e "(.operations | length) == 2 and (.operations | all(.action == \"adopt\")) and .skipped_user_owned == []" >/dev/null <<<"$out"'
+ok "plan never adopts on its own" \
+  '[ ! -e "$ADOPT_CLAUDE/release-checklist/.ccc-fleet-skill.json" ] && grep -q "draft body" "$ADOPT_CLAUDE/release-checklist/SKILL.md"'
+out="$(env "${adopt_env[@]}" python3 "$SYNC" apply --ref "$REF")"; rc=$?
+ok "apply adopts both: approved bytes, fleet marker, autosave marker gone" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 2" >/dev/null <<<"$out" && cmp -s "$SKILL/SKILL.md" "$ADOPT_CLAUDE/release-checklist/SKILL.md" && [ ! -e "$ADOPT_CLAUDE/release-checklist/.autosave-meta.json" ] && jq -e --arg ref "$REF" ".commit == \$ref and .provider == \"claude\"" "$ADOPT_CLAUDE/release-checklist/.ccc-fleet-skill.json" >/dev/null && jq -e ".provider == \"codex\"" "$ADOPT_CODEX/release-checklist/.ccc-fleet-skill.json" >/dev/null'
+ok "adoption keeps the prior autosave bytes in backups/<commit>/" \
+  'grep -q "draft body" "$ADOPT_STATE/backups/$REF/claude-release-checklist/SKILL.md"'
+out="$(env "${adopt_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
+ok "adopted targets converge to noops" \
+  '[ "$rc" = 0 ] && jq -e ".operations | all(.action == \"noop\")" >/dev/null <<<"$out"'
+
+# A tampered or foreign autosave marker is not adoption evidence: the
+# fail-safe direction is skip-user-owned, never overwrite.
+TAMPER_HOME="$TMP/tamper-home"
+TAMPER_CLAUDE="$TAMPER_HOME/.claude/skills"
+TAMPER_CODEX="$TAMPER_HOME/.codex/skills"
+mkdir -p "$TAMPER_CLAUDE/release-checklist" "$TAMPER_CODEX" "$TAMPER_HOME/.claude/state"
+chmod 700 "$TAMPER_HOME" "$TAMPER_HOME/.claude" "$TAMPER_HOME/.claude/state" "$TAMPER_HOME/.codex" \
+  "$TAMPER_CLAUDE" "$TAMPER_CODEX" "$TAMPER_CLAUDE/release-checklist"
+printf 'hand written\n' > "$TAMPER_CLAUDE/release-checklist/SKILL.md"
+jq -n '{schema_version:2,manager:"ccc-node-skill-autosave",ownership:"autosave-managed",name:"some-other-skill"}' > "$TAMPER_CLAUDE/release-checklist/.autosave-meta.json"
+out="$(env "${base_env[@]}" HOME="$TAMPER_HOME" \
+  CCC_FLEET_SKILLS_STATE_DIR="$TAMPER_HOME/.claude/state/fleet-skills" \
+  CCC_FLEET_SKILLS_CLAUDE_DIR="$TAMPER_CLAUDE" \
+  CCC_FLEET_SKILLS_CODEX_DIR="$TAMPER_CODEX" \
+  python3 "$SYNC" apply --ref "$REF")"; rc=$?
+ok "autosave marker naming another skill is skipped, not adopted" \
+  '[ "$rc" = 0 ] && jq -e ".skipped_user_owned == [\"claude:release-checklist\"]" >/dev/null <<<"$out" && [ "$(cat "$TAMPER_CLAUDE/release-checklist/SKILL.md")" = "hand written" ]'
+
+# Failed applies leave a streak in the receipt; a later success resets it.
+STREAK_HOME="$TMP/streak-home"
+mkdir -p "$STREAK_HOME/.claude/skills" "$STREAK_HOME/.codex/skills" "$STREAK_HOME/.claude/state"
+chmod 700 "$STREAK_HOME" "$STREAK_HOME/.claude" "$STREAK_HOME/.claude/state" "$STREAK_HOME/.claude/skills" \
+  "$STREAK_HOME/.codex" "$STREAK_HOME/.codex/skills"
+streak_env=("${base_env[@]}" HOME="$STREAK_HOME" \
+  CCC_FLEET_SKILLS_STATE_DIR="$STREAK_HOME/.claude/state/fleet-skills" \
+  CCC_FLEET_SKILLS_CLAUDE_DIR="$STREAK_HOME/.claude/skills" \
+  CCC_FLEET_SKILLS_CODEX_DIR="$STREAK_HOME/.codex/skills")
+env "${streak_env[@]}" GH_SYNC_PRIVATE=false python3 "$SYNC" apply --ref "$REF" >/dev/null 2>&1
+env "${streak_env[@]}" GH_SYNC_PRIVATE=false python3 "$SYNC" apply --ref "$REF" >/dev/null 2>&1
+ok "two failed applies record ok=false with a streak of 2 and the failure code" \
+  'jq -e ".ok == false and .code == \"target_repo_not_private\" and .consecutive_failures == 2 and .changed == null" "$STREAK_HOME/.claude/state/fleet-skills/last-run.json" >/dev/null'
+env "${streak_env[@]}" GH_SYNC_PRIVATE=false python3 "$SYNC" plan --ref "$REF" >/dev/null 2>&1
+ok "a failed plan does not extend the apply streak" \
+  'jq -e ".consecutive_failures == 2" "$STREAK_HOME/.claude/state/fleet-skills/last-run.json" >/dev/null'
+env "${streak_env[@]}" python3 "$SYNC" apply --ref "$REF" >/dev/null 2>&1
+ok "a successful apply resets the streak" \
+  'jq -e ".ok == true and .code == null and .consecutive_failures == 0 and .changed == 2" "$STREAK_HOME/.claude/state/fleet-skills/last-run.json" >/dev/null'
 
 out="$(env "${base_env[@]}" GH_SYNC_PRIVATE=false python3 "$SYNC" plan --ref "$REF")"; rc=$?
 ok "public repository is refused before clone or install" \
@@ -375,7 +453,8 @@ out="$(env "${piri_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
 ok "piri rerun converges to noops" \
   '[ "$rc" = 0 ] && jq -e ".operations | all(.action == \"noop\")" >/dev/null <<<"$out"'
 
-# Piri user-owned (markerless) target fails closed like claude/codex.
+# Piri user-owned (markerless) target is skipped per skill like claude/codex;
+# the other two provider copies still land.
 PIRI2_HOME="$TMP/piri-conflict-home"
 mkdir -p "$PIRI2_HOME/.claude/skills" "$PIRI2_HOME/.claude/state" \
   "$PIRI2_HOME/.codex/skills" "$PIRI2_HOME/.piri/agent/skills/release-checklist"
@@ -387,8 +466,8 @@ printf 'user owned\n' > "$PIRI2_HOME/.piri/agent/skills/release-checklist/notes"
 out="$(env "${piri_env[@]}" HOME="$PIRI2_HOME" \
   CCC_FLEET_SKILLS_STATE_DIR="$PIRI2_HOME/.claude/state/fleet-skills" \
   python3 "$SYNC" apply --ref "$REF")"; rc=$?
-ok "piri user-owned target blocks the entire apply" \
-  '[ "$rc" = 2 ] && jq -e ".code == \"target_user_owned\"" >/dev/null <<<"$out" && [ ! -e "$PIRI2_HOME/.claude/skills/release-checklist" ]'
+ok "piri user-owned target is skipped while claude/codex copies install" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 2 and .skipped_user_owned == [\"piri:release-checklist\"]" >/dev/null <<<"$out" && [ -f "$PIRI2_HOME/.claude/skills/release-checklist/.ccc-fleet-skill.json" ] && [ "$(cat "$PIRI2_HOME/.piri/agent/skills/release-checklist/notes")" = "user owned" ]'
 
 # Piri repo-managed ownership comes from the piri setup manifest.
 PIRI3_HOME="$TMP/piri-grad-home"

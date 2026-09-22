@@ -4,7 +4,7 @@ import unittest
 
 from telegram_bot.core.grok_protocol import (
     HOST_VERSION, MAX_WIRE, ProtocolError, accepted_prompt, bound_reply,
-    capture_baseline, check_host, check_idle, decode_wire, prompt_digest,
+    capture_baseline, check_host, check_idle, decode_wire, prompt_digest, qualified_hosts,
 )
 
 AGENT = "00000000-0000-4000-8000-000000000001"
@@ -67,10 +67,31 @@ class GrokProtocolTests(unittest.TestCase):
                 decode_wire(raw)
         self.assertEqual(decode_wire(b'{"ok":true}'), {"ok": True})
 
+    def test_host_version_policy_list_and_capability_only(self):
+        valid = {"hostVersion": "0123abc", "isBusy": False,
+                 "capabilities": ["sendAcceptanceV1", "orderedReplicasV1"]}
+        with self.assertRaisesRegex(ProtocolError, "unqualified_host_version"):
+            check_host(valid)  # baseline pin is the default
+        self.assertEqual(check_host(valid, frozenset({"0123abc"})), "0123abc")
+        self.assertEqual(check_host(valid, None), "0123abc")
+        for bad in ("different", "ABCDEF0", "abc", "a" * 41, None, 7):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ProtocolError, "unqualified_host_version"):
+                check_host({**valid, "hostVersion": bad}, None)
+        with self.assertRaisesRegex(ProtocolError, "host_capability_mismatch"):
+            check_host({**valid, "capabilities": ["orderedReplicasV1"]}, None)
+        self.assertEqual(qualified_hosts(None), frozenset({HOST_VERSION}))
+        self.assertEqual(qualified_hosts("  "), frozenset({HOST_VERSION}))
+        self.assertIsNone(qualified_hosts("any"))
+        self.assertIsNone(qualified_hosts(" ANY "))
+        self.assertEqual(qualified_hosts("0123abc, FEDCBA9"), frozenset({HOST_VERSION, "0123abc", "fedcba9"}))
+        for bad in ("bad!", "0123abc,,zz", ","):
+            with self.subTest(bad=bad), self.assertRaises(ProtocolError):
+                qualified_hosts(bad)
+
     def test_pinned_capabilities_and_idle(self):
         valid = {"hostVersion": HOST_VERSION, "isBusy": False,
                  "capabilities": ["sendAcceptanceV1", "orderedReplicasV1", "voiceSettingsV1"]}
-        check_host(valid)
+        self.assertEqual(check_host(valid), HOST_VERSION)
         for key, value in [("hostVersion", "different"), ("capabilities", []),
                            ("capabilities", [None]), ("isBusy", 0)]:
             with self.subTest(key=key, value=value), self.assertRaises(ProtocolError):
@@ -131,6 +152,48 @@ class GrokProtocolTests(unittest.TestCase):
             case["entries"][-1]["requestId"] = value
             with self.assertRaises(ProtocolError):
                 self.read(case)
+
+    def test_foreign_input_after_completed_reply_ends_range_and_events_are_ignored(self):
+        # Host f7045c4: the owner talks to the same Bot in another client after
+        # our run replied, and automation events sit in the tail without a
+        # requestId. Neither retires a reply that already exists.
+        later = {**self.echo, "id": "later", "clientNonce": "other", "content": "later", "requestId": "later-run"}
+        later_reply = {**self.reply, "id": "later-answer", "requestId": "later-run"}
+        event = {"id": "event-" + "a" * 64, "kind": "event", "timestampMs": 1,
+                 "event": {"type": "automation-changed", "action": "created"}}
+        result = self.read({"entries": [self.old, self.echo, event, self.reply, later, event | {"id": "event-" + "b" * 64}, later_reply]})
+        self.assertEqual(result.texts, ("synthetic answer",))
+        self.assertEqual(result.entry_ids, ("answer",))
+        with self.assertRaisesRegex(ProtocolError, "interleaved_run"):
+            self.read({"entries": [self.old, self.echo, event, later, self.reply]})
+
+    def test_reply_pending_until_output_exists_and_oversize_is_distinct(self):
+        with self.assertRaisesRegex(ProtocolError, "reply_pending"):
+            self.read({"entries": [self.old]})  # echo not surfaced yet
+        with self.assertRaisesRegex(ProtocolError, "reply_pending"):
+            self.read({"entries": [self.old, self.echo]})  # echo, no output yet
+        streaming = copy.deepcopy(self.reply)
+        streaming["isStreaming"] = True
+        with self.assertRaisesRegex(ProtocolError, "reply_pending"):
+            self.read({"entries": [self.old, self.echo, streaming]})
+        big = copy.deepcopy(self.reply)
+        big["message"]["content"] = "x" * 40000
+        big2 = copy.deepcopy(big)
+        big2["id"] = "answer-2"
+        with self.assertRaisesRegex(ProtocolError, "reply_oversize"):
+            self.read({"entries": [self.old, self.echo, big, big2]})
+
+    def test_acceptance_without_reported_digest_is_bound_by_echo(self):
+        blank = copy.deepcopy(self.acceptance)
+        blank["record"]["inputDigest"] = ""
+        accepted = accepted_prompt(blank, AGENT, NONCE, PROMPT)
+        self.assertEqual(accepted.digest, prompt_digest(AGENT, NONCE, PROMPT))
+        self.assertEqual(self.read().texts, ("synthetic answer",))
+        for bad in (None, 7, "0" * 64):
+            case = copy.deepcopy(self.acceptance)
+            case["record"]["inputDigest"] = bad
+            with self.subTest(bad=bad), self.assertRaisesRegex(ProtocolError, "acceptance_binding_mismatch"):
+                accepted_prompt(case, AGENT, NONCE, PROMPT)
 
     def test_echo_substitution_and_streaming_denied(self):
         for key, value in [("clientNonce", AGENT), ("content", "secret-not-for-error"),

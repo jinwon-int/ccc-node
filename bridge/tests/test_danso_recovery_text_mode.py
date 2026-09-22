@@ -25,7 +25,6 @@ async def text_bot(tmp_path):
             success=True, content='done', session_id='new-sid')))
     bot = bare_bot(manager, provider='danso', project_chat=handler)
     bot._config.danso_long_task_enabled = True
-    bot._config.danso_recovery_text_mode = True
     bot._config.allowed_user_ids = [7]
     bot._config.bridge_memory_mode = 'off'
     bot.application = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
@@ -52,7 +51,7 @@ async def test_offer_appends_numbered_menu_without_keyboard(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_default_mode_keeps_keyboard_and_no_menu(tmp_path):
+async def test_explicit_false_keeps_keyboard_and_no_menu(tmp_path):
     bot, manager, handler = await text_bot(tmp_path)
     bot._config.danso_recovery_text_mode = False
     assert await bot._offer_danso_recovery('7:9', 7, 9)

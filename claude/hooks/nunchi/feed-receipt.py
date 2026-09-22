@@ -7,6 +7,8 @@ with NUNCHI_FEED_REPLAY_DAYS. Failed fingerprints retry up to three times with
 backoff, then remain explicitly held until their source changes.
 """
 
+import fcntl
+import subprocess
 import hashlib
 import json
 import os
@@ -24,12 +26,15 @@ def private_open(path, flags):
         if part.is_symlink():
             raise ValueError("symlink_parent")
     fd = os.open(path, flags | os.O_NOFOLLOW, 0o600)
-    st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.geteuid():
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.geteuid():
+            raise ValueError("unsafe_receipt")
+        os.fchmod(fd, 0o600)
+        return fd
+    except BaseException:
         os.close(fd)
-        raise ValueError("unsafe_receipt")
-    os.fchmod(fd, 0o600)
-    return fd
+        raise
 
 
 def fingerprint(path):
@@ -59,12 +64,24 @@ def latest(path, key):
                 row = json.loads(line)
             except ValueError:
                 raise ValueError("invalid_receipt") from None
+            if not isinstance(row, dict):
+                raise ValueError("invalid_receipt")
             if row.get("key") == key:
                 found = row
         return found
 
 
 def main(args):
+    if args and args[0] == "run-locked":
+        fd = private_open(args[1], os.O_RDWR | os.O_CREAT)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return 0
+            return subprocess.call(args[2:], pass_fds=(fd,))
+        finally:
+            os.close(fd)
     action, receipt, source, *rest = args
     key, current, modified = fingerprint(source)
     previous = latest(receipt, key)

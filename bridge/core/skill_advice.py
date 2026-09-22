@@ -42,6 +42,29 @@ _SKIP = re.compile(
     r"Local document path:|<attachments?\b|```",
     re.IGNORECASE,
 )
+# Personal-context heuristics for the vendor data boundary: Korean postal
+# addresses, resident-registration / phone / account-like numbers, e-mail
+# addresses, labeled counterparties or identity fields, and close-family
+# references. A hit only withholds the optional hint; legal or regulatory
+# questions without identifiers still qualify. Conservative, not a DLP claim.
+_PERSONAL = re.compile(
+    r"(?<!\d)\d{6}\s?-\s?[1-8]\d{6}(?!\d)"
+    r"|(?<!\d)(?:\+82|0)1[016789][\s.-]?\d{3,4}[\s.-]?\d{4}(?!\d)"
+    r"|(?<!\d)0(?:2|[3-6]\d)[\s.-]?\d{3,4}[\s.-]?\d{4}(?!\d)"
+    r"|[\w.+-]+@[\w-]+\.[\w.-]+"
+    r"|(?<!\d)\d{2,6}-\d{2,6}-\d{5,7}(?!\d)"
+    r"|(?:서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)"
+    r"(?:특별시|광역시|특별자치시|특별자치도|도)?\s*[가-힣]{1,6}(?:시|군|구)(?=\s|$|[가-힣\d])"
+    r"|[가-힣]+(?:시|군|구)\s+[가-힣\d]+(?:대로|로|길)\s?\d{1,4}"
+    r"|(?<!\d)\d{1,4}동\s?\d{1,4}호"
+    r"|(?:채무자|세입자|임차인|임대인|보증인|피보험자|소유자|고객|성명|이름|주소|생년월일|연락처|"
+    r"주민(?:등록)?번호|계좌(?:번호)?)\s*[:：]"
+    r"|(?:엄마|아빠|어머니|아버지|아내|와이프|남편|장모님?|장인어른|시어머니|시아버지|처남|처제|"
+    r"처형|매형|형수|올케|며느리|사위|아들|딸|손자|손녀|우리\s?애들?)"
+    r"(?=[이가은는을를의과와도께한랑]|[\s.,!?]|$)"
+    r"|\bmy (?:wife|husband|son|daughter|mom|mother|dad|father|kids?)\b",
+    re.IGNORECASE,
+)
 _CONTEXT_ONLY = re.compile(
     r"^(?:승인|진행|계속|좋아|그래|응|네|다음|이어서|해줘|하자|"
     r"그거|그렇게|위 내용|아까|same|continue|approved?|yes|ok|do it)"
@@ -180,6 +203,7 @@ async def advise_turn(
         or not 9 <= len(message) <= 4000
         or message.lstrip().startswith(("/", "<", "["))
         or _SKIP.search(message)
+        or _PERSONAL.search(message)
         or message.lstrip().startswith(EXPLICIT_SKILL_PREFIX)
         or _CONTEXT_ONLY.search(message.lstrip())
         or re.search(r"(?:^|\s)[$/][A-Za-z][\w-]*", message)

@@ -71,7 +71,13 @@ USAGE_BUDGET_TOKENS_DEFAULT = 2_000_000
 # Native Danso measures the exact serialized request, including injected system
 # context and tool schemas. Keep enough headroom for the largest normal CCC
 # memory snapshot instead of making the default impossible before dispatch.
-DEFAULT_DANSO_COMPACT_AT_BYTES = 128 * 1024
+#
+# No default is forwarded any more (#1913): when the flag is omitted, Danso
+# derives the threshold from the selected provider/model request budget
+# (`floor(context_tokens * 70%) * bytes_per_token - 32 KiB`; glm-5.3-flash is
+# 527,232). The former 128 KiB default forced compaction at roughly 32k tokens
+# on a 200k-token model, so long turns spent most of their requests
+# re-summarising and re-reading. An explicit override still wins.
 
 
 class Config(
@@ -243,6 +249,14 @@ class Config(
     grok_owner_id: Optional[int] = Field(default=None, gt=0, alias="CCC_GROK_OWNER_ID")
     grok_telegram_bot_id: Optional[int] = Field(default=None, gt=0, alias="CCC_GROK_TELEGRAM_BOT_ID")
     grok_journal_path: Optional[Path] = Field(default=None, alias="CCC_GROK_JOURNAL_PATH")
+    grok_host_versions: Optional[str] = Field(
+        default=None,
+        alias="CCC_GROK_HOST_VERSIONS",
+        description=(
+            "Accepted Grok host build ids beyond the baseline pin: a comma-separated list, "
+            "or 'any' to qualify by the capability contract alone (the host self-updates while idle)."
+        ),
+    )
     codex_cli_path: str = Field(
         default_factory=lambda: str(Path.home() / ".claude" / "hooks" / "ccc-codex"),
         alias="CCC_CODEX_CLI_PATH",
@@ -313,8 +327,16 @@ class Config(
     danso_max_turns: int = Field(default=64, ge=1, le=128, alias="CCC_DANSO_MAX_TURNS")
     danso_max_output_tokens: int = Field(default=16384, ge=256, le=131072,
                                          alias="CCC_DANSO_MAX_OUTPUT_TOKENS")
-    danso_compact_at_bytes: int = Field(default=DEFAULT_DANSO_COMPACT_AT_BYTES, ge=8192, le=393216,
-                                       alias="CCC_DANSO_COMPACT_AT_BYTES")
+    danso_compact_at_bytes: Optional[int] = Field(
+        default=None, ge=8192, le=393216, alias="CCC_DANSO_COMPACT_AT_BYTES",
+        description="Explicit native compaction threshold in serialized bytes; unset lets Danso "
+                    "use its provider/model default (#1913).")
+    danso_provider_stream: bool = Field(
+        default=False, alias="CCC_DANSO_PROVIDER_STREAM",
+        description="Forward DANSO_PROVIDER_STREAM=1 so the native provider adapters use SSE "
+                    "(danso #109 opt-in). Without it a long generation sends no bytes until it "
+                    "finishes, which the header timeout and the terminal-stall probe both read as "
+                    "a dead turn (#1913).")
     # Long tasks are the default; operators can explicitly select ordinary mode.
     # The ordinary-mode deadline remains separate from the cumulative task limit.
     danso_progress_enabled: bool = Field(
@@ -1084,12 +1106,13 @@ class Config(
     )
 
     danso_recovery_text_mode: bool = Field(
-        default=False,
+        default=True,
         alias="CCC_TELEGRAM_DANSO_RECOVERY_TEXT",
         description=(
             "Offer failed-Danso recovery as numbered text and answer by "
             "typing 1/2/3 in the chat, instead of tap-to-select inline "
-            "keyboard buttons. Default OFF: the recovery offer uses buttons."
+            "keyboard buttons. Default ON (fleet: gongmyoung/soonwook). Set "
+            "CCC_TELEGRAM_DANSO_RECOVERY_TEXT=false to restore buttons."
         ),
     )
     danso_recovery_auto_resume: bool = Field(

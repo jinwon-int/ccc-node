@@ -1,5 +1,94 @@
 # Changelog
 
+- **Grok multi-row replies are delivered whole.** The Bot answers in several
+  transcript rows ("내일 일정 알려줄게", then the list 4-8 s later) and host
+  `f7045c4` publishes no end-of-run marker — reply rows carry no `isStreaming`
+  and `health.isBusy` never leaves false — so the bridge returned the first row
+  and the owner saw a truncated answer. A validated range whose newest row is
+  younger than `REPLY_SETTLE_SECONDS` (10 s) is now held until the run stops
+  adding rows; an already-older range (reconciliation, replay) is returned at
+  once, and any validation failure while settling delivers the range already
+  validated.
+
+- **Matrix frontend posts the session-start banner.** The Telegram bridge
+  replies with `◐ CCC session started (<reason>) … ◆ Model / ◆ Provider /
+  ◆ Context / ◆ Previous session` whenever a turn opens a fresh provider
+  stream (bridge restart without a resumable transcript, `/new`, automatic
+  reset). The Matrix frontend ran the same session decisions silently, so a
+  room could not tell a resumed conversation from a fresh one. `MatrixBot`
+  now posts the identical `turn_notices.session_start_notice_text` banner
+  through the room's interim path before the turn runs, naming the
+  not-resumed previous session on an automatic reset. Delivery is best
+  effort — a failed notice is logged and the turn still runs.
+
+- **Grok acceptance `pending` is transient.** Host `f7045c4` reports
+  `GrokBotSendStatus.PENDING` (`status: "pending"`) right after a send before
+  the record flips to `accepted`; `accepted_prompt` treated it as
+  `acceptance_not_accepted` and the turn ended "uncertain" at once. The bounded
+  acceptance poll now also waits through `pending` (rejected/mismatched stays
+  final). `GrokSession.send_turn` logs the categorical ProtocolError code before
+  yielding the generic `grok_outcome_unknown` error event.
+
+- **Grok send response settled by the acceptance record.** On host `f7045c4`
+  `sendPrompt` no longer answers `{"accepted": true}` although the prompt is
+  accepted and run, so every fresh turn ended as `grok_send_uncertain` right
+  after the send (journal stuck at `attempted`; all of 2026-09-22's apparent
+  successes were cached replays). The runtime now treats an unconfirmed send
+  response as "consult the durable acceptance record" (already polled with a
+  bounded window) instead of failing at once; no resend, no fresh nonce. The
+  Telegram/Matrix Grok frontends now log the categorical ProtocolError code
+  with the retained-state warning so the next drift is diagnosable from the log.
+
+- **Grok reply is awaited when the host reports idle too early.** Host
+  `f7045c4` keeps `health.isBusy: false` while the Bot is still writing, so the
+  bridge read the tail right after acceptance, found the echo but no output,
+  and ended the turn as "uncertain" (2026-09-22 17:43: accepted :41, reply
+  :50/:57, bridge gave up :42). `bound_reply` now raises `reply_pending` when the
+  echo is missing, has no visible output yet, or a reply row is still
+  streaming (oversize is the separate `reply_oversize`), and `GrokSession`
+  keeps polling the tail on `reply_pending` within the existing 180 s turn
+  deadline. No resend, no change to retained-state semantics.
+
+- **Grok acceptance lookup tolerates persistence lag.** Host `f7045c4` writes
+  the send-acceptance record asynchronously, so the lookup issued right after
+  `send` could still be `not-found` (observed 2026-09-22: record stamped 328 ms
+  before the bridge gave up) and every turn ended as "uncertain" with the
+  journal at `attempted`. `GrokSession` now polls the acceptance for up to
+  `ACCEPTANCE_SECONDS` (15 s, every 0.5 s) before treating it as uncertain; a
+  rejected/mismatched record still fails at once and the nonce is never resent.
+
+- **Grok host f7045c4 tolerance.** The Grok host that self-updated on
+  2026-09-22 reports `inputDigest: ""` in `promptAcceptanceStatus` (still
+  enforcing the digest at send time) and interleaves `kind: "event"` rows in
+  the transcript tail; both made every turn end as "uncertain" with the
+  journal stuck at `attempted`. `accepted_prompt` now accepts a blank reported
+  digest (the echo entry's content/nonce binding stays the local proof; a
+  present-but-different digest is still a mismatch), `bound_reply` ignores
+  event rows, and a foreign input that arrives after our run already replied
+  (the owner talking to the Bot in another client) ends the bound range
+  instead of retiring the reply.
+
+- **Grok on Matrix (owner direct room).** `CCC_AGENT_PROVIDER=grok` with
+  `CCC_CHANNEL=matrix` now selects `core/grok_matrix_bot.py` (`GrokMatrixBot`)
+  instead of always building the Telegram frontend: the same restricted Grok
+  contract (owner only, text only, one committed turn, persisted journal)
+  served as the `TurnRunner` of the unchanged E2EE Matrix transport. Family
+  rooms/users are refused before the transport opens; the Grok startup gates
+  (single local frontend, journal, host version, idle Bot) run after the
+  device authenticated. Telegram and Matrix cannot serve the same Bot at once.
+
+- **Grok host version policy: baseline `79a3c3e` + `CCC_GROK_HOST_VERSIONS`.**
+  The Grok host (`sand-host` behind `127.0.0.1:1340`) replaces itself while
+  idle several times a week, and the fixed `HOST_VERSION` pin plus the
+  journal's per-revision `host_version` equality check killed the frontend
+  (`unqualified_host_version`) and invalidated the whole journal
+  (`grok_history_invalid`) at every update (grok-bot 2026-09-22). The baseline
+  pin moves to `79a3c3e`; `CCC_GROK_HOST_VERSIONS` widens it (comma list of
+  ids, or `any` for capability-only qualification — `orderedReplicasV1` and
+  `sendAcceptanceV1` are still required in every mode). The journal now
+  records the id the host actually reported on each revision and only
+  rejects malformed ids, so a host update no longer retires the history.
+
 - **Matrix status throttle matches Telegram (15s).** `STATUS_MIN_INTERVAL_S`
   was 60s, so `⏳ Working` on Matrix lagged Telegram's 15s heartbeat. Both
   channels now refresh at 15s. Streaming-progress suppression is unchanged.

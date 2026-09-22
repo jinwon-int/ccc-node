@@ -35,6 +35,7 @@ Git, screenshots or reports. In that configuration select:
 | `ALLOWED_USER_IDS` | Exactly the singleton owner ID list |
 | `CCC_REQUIRE_ALLOWLIST` | `true` |
 | `CCC_GROK_JOURNAL_PATH` | One explicit absolute private journal directory on the Grok computer |
+| `CCC_GROK_HOST_VERSIONS` | Optional. Extra qualified host build ids (comma list) or `any` (capability-only) — the host self-updates while idle; unset keeps the baseline pin only |
 
 The usual `TELEGRAM_BOT_TOKEN` stays in that project's private environment file.
 Its numeric prefix must match the selected Telegram bot; authenticated `getMe`
@@ -99,6 +100,30 @@ a frontend is terminal: each external initialization wait rechecks its original
 generation, so late getMe/status/health replies cannot reopen state or a poller.
 The shell provider label names Grok, but generic shell health/status automation
 is not a qualified replacement for this dedicated Python entrypoint.
+
+## Matrix frontend (`CCC_CHANNEL=matrix`)
+
+`create_app` selects `core/grok_matrix_bot.py` (`GrokMatrixBot`) when the Grok
+provider runs with `CCC_CHANNEL=matrix`. It is the same restricted frontend
+over the E2EE Matrix transport of [matrix-frontend.md](matrix-frontend.md): the
+transport's event admission and room gate replace the Telegram update checks,
+the journal/runtime and every limit above are unchanged, and the reply is
+delivered by the transport outbox only after the journal committed it.
+
+- Only the configured owner in a listed **direct** room is admitted; a config
+  with `family_rooms`/`family_users` is refused before the transport opens.
+  Other senders, rooms and self-jobs receive a static denial without any
+  journal or Bot access.
+- The Grok startup gates (single local frontend socket, `start_or_resume`,
+  host version, idle Bot) run after the Matrix device authenticated; there is
+  no `getMe`/webhook step. Telegram identity keys remain the journal's binding
+  label, so one existing journal serves either channel — never both at once.
+- `/status` is static; `/stop` (and `/cancel <turn>`) cancel local waiting via
+  the transport controls; every other command, files and media are refused.
+- Run it as the `python -m telegram_bot --path <root>` process with
+  `CCC_CHANNEL=matrix`, `CCC_MATRIX_CONFIG_PATH` and its own `BOT_DATA_DIR`
+  (no `start.sh` lifecycle, no health tick). Provision the bot device once
+  with `CCC_MATRIX_INITIALIZE=1`.
 
 ## Honest delivery and execution limits
 

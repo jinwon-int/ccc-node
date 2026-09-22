@@ -92,7 +92,7 @@ repo-managed  (setup.sh install / codex provisioner; provenance:
 
 | Tool | Behavior under the contract |
 |---|---|
-| `ccc-fleet-skills-sync.py` | target carries repo ownership (manifest entry for the claude root, `.ccc-node-managed.json` for the codex root) → reports `skip-repo-managed`, installs nothing. A fleet marker-less target without repo ownership stays `target_user_owned` (fail-closed). |
+| `ccc-fleet-skills-sync.py` | target carries repo ownership (manifest entry for the claude root, `.ccc-node-managed.json` for the codex root) → reports `skip-repo-managed`, installs nothing. A fleet marker-less target that is the autosave layer's own draft (`.autosave-meta.json` naming the skill) or a byte-identical copy → `adopt` (backup-and-replace, prior bytes kept in `backups/<commit>/`). Any other marker-less target → `skip-user-owned` for that one skill; the rest of the apply proceeds and the skip is listed in `skipped_user_owned` and the `state/fleet-skills/last-run.json` receipt for doctor. |
 | `setup.sh` (`install_repo_skills_into`) | a fleet-installed copy of a repo skill is absorbed: repo bytes replace it, the fleet marker disappears, and the absorption is logged. |
 | autosave installer | already refuses to overwrite non-autosave directories (dedup gate). |
 

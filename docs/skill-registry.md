@@ -103,8 +103,11 @@ repo-managed (setup.sh manifest / .ccc-node-managed.json)
 
 `ccc-fleet-skills-sync.py` reports `skip-repo-managed` for targets the repo
 layer owns (claude root: manifest membership; codex root: provisioner
-marker) instead of failing, and setup absorbs fleet-installed copies of repo
-skills with a log line. The full contract, the graduation checklist, and the
+marker) instead of failing, `adopt`s a marker-less autosave-owned or
+byte-identical copy (fleet-approved outranks autosave-owned, backup kept),
+and `skip-user-owned`s any other marker-less directory per skill instead of
+refusing the whole run. Setup absorbs fleet-installed copies of repo skills
+with a log line. The full contract, the graduation checklist, and the
 fleet-skills retirement procedure live in
 [`skill-graduation.md`](skill-graduation.md).
 

@@ -5,9 +5,19 @@ It addresses the existing persistent Grok Bot host, not the xAI model API.
 No Telegram poller, live provider selection, gateway settings or vendor files
 are changed by this component.
 
-The qualified host version is `5c534e9`, with `orderedReplicasV1` and
-`sendAcceptanceV1`. A different version fails validation until its contracts
-are qualified. The public API reference is the MIT-licensed
+The baseline qualified host version is `79a3c3e`, with `orderedReplicasV1` and
+`sendAcceptanceV1`. Host `f7045c4` (observed 2026-09-22) additionally (a) reports
+`inputDigest: ""` in `promptAcceptanceStatus` while still enforcing the digest at
+send time — the echo entry's content/nonce binding stays the local proof — and
+(b) interleaves `kind: "event"` rows (automation events, no `requestId`) in the
+transcript tail, which the reply binding ignores; a foreign input that arrives
+*after* our run already replied ends the bound range instead of retiring it. The host replaces itself while idle (`idle-auto-update`,
+several builds a week), so a deployment widens the pin with
+`CCC_GROK_HOST_VERSIONS` — a comma-separated list of additional build ids, or
+`any` to qualify by the capability contract alone; the two capabilities above
+are required in every mode, and a malformed id always fails. Without the
+setting, a different version fails validation until its contracts are
+qualified. The public API reference is the MIT-licensed
 [`grokbot-sdk`](https://github.com/Adam91holt/grokbot-sdk/tree/c14347fa82d167b9a5984ec1baff56b2f074485a)
 at that pinned revision. Actual authenticated host observations verify the
 acceptance digest and transcript/request association; no upstream application

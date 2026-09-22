@@ -471,3 +471,23 @@ bounded by `CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP` (1).
 - `scripts/ccc-memory-index.sh` — local index rebuild/update.
 - `scripts/ccc-memory-query.sh` / `scripts/ccc-memory-search.sh` — query/explain recall behavior.
 - `scripts/ccc-memory-eval.sh` — no-network smoke/golden/scenario checks.
+
+### Codex feed receipts and transcript compatibility
+
+The nunchi Codex cron feed reads native `response_item` user/assistant text
+messages, with legacy `event_msg` fallback, excluding tool output and reasoning.
+It reads at most a 4 MiB tail and extracts at most 60 messages/40,000 characters.
+Extractor sessions are ephemeral and historical feed prompts are excluded.
+
+`codex-receipts.jsonl` records the source fingerprint only after successful
+extraction and ingest (or a successfully read short/empty source). An unchanged
+stored file is skipped; appended or replaced files are eligible again. Failures
+retry after ten minutes, at most three times per unchanged fingerprint. Source
+changes during extraction are not acknowledged. The per-run limit defaults to
+three and is capped at twenty. Old `codex-seen` is preserved as historical
+evidence: recently modified files are reconsidered for seven days by default;
+`NUNCHI_FEED_REPLAY_DAYS` controls that bounded migration window. Older history
+is not automatically replayed. Receipts and locks reject symlinks and use 0600.
+
+The Codex-only compatibility/receipt helpers were selected from the broader
+PR #1912; this does not adopt its Piri, Danso, journal mirror or Jev review changes.

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .grok_journal import GrokBinding, GrokJournal
-from .grok_protocol import ProtocolError
+from .grok_protocol import ProtocolError, qualified_hosts
 from .grok_runtime import GrokRuntime
 from .grok_ssh import GrokLocalTransport, GrokSshTransport
 
@@ -49,4 +49,5 @@ def build_grok_runtime(settings: Any) -> GrokRuntime:
     binding = route.journal.binding
     mode = str(os.environ.get("CCC_GROK_TRANSPORT") or "").strip().lower()
     transport = GrokLocalTransport if mode == "local" else GrokSshTransport
-    return GrokRuntime(route.journal, transport(binding.destination, binding.agent_id))
+    hosts = qualified_hosts(getattr(settings, "grok_host_versions", None))
+    return GrokRuntime(route.journal, transport(binding.destination, binding.agent_id), qualified_hosts=hosts)

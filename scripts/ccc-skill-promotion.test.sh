@@ -1207,6 +1207,10 @@ assert isinstance(task2, dict)
 ssh_calls = open(os.environ["RB_STATE"] + "/ssh-calls").read()
 assert "s3cret-value" not in ssh_calls, "edge secret leaked into ssh argv"
 assert "/remote/edge-secret" in ssh_calls
+# #1884: the local curl branch is just as exposed via /proc/<pid>/cmdline.
+curl_calls = open(os.environ["RB_STATE"] + "/curl-calls").read()
+assert "/tasks/rv-y" in curl_calls, curl_calls
+assert "s3cret-value" not in curl_calls, "edge secret leaked into curl argv"
 print("RB-ROUTING-OK")
 FIXTURE
 env "${base_env[@]}" CCC_SKILL_PROMOTION_REMOTE_BROKERS="$RB_JSON" PATH="$BIN:$PATH" RB_STATE="$RB_STATE" \
@@ -1215,6 +1219,63 @@ ok "remote broker parse, reviewer fallthrough, and task routing (#2024)" \
   '[ "$rc" = 0 ] && grep -q "RB-PARSE-OK" "$RB_STATE/out" && grep -q "RB-ROUTING-OK" "$RB_STATE/out"'
 ok "reviewer is drawn at random over the eligible set, with an operator pin" \
   '[ "$rc" = 0 ] && grep -q "RB-RANDOM-OK" "$RB_STATE/out"'
+
+# ---- #2024 follow-up: remote scripts shlex-quote every interpolated value --
+QUOTING_FIXTURE="$TMP/rb-quoting-fixture.py"
+cat > "$QUOTING_FIXTURE" <<'FIXTURE'
+import importlib.util, shlex, sys
+spec = importlib.util.spec_from_file_location("csp_q", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["csp_q"] = m
+spec.loader.exec_module(m)
+
+# Hostile operator config: space, $ and backtick must stay literal bytes of
+# one argument in the generated remote shell snippet, never live syntax.
+rb = {"name": "t2", "ssh_host": "h", "broker_url": "http://127.0.0.1:8787",
+      "nexus_dir": "/re mote/ne$xus", "secret_cmd": "cat /remote/edge-secret"}
+probe = m._remote_probe_script(rb, rb["broker_url"] + "/tasks/ta`sk x")
+assert probe.startswith("S=$(cat /remote/edge-secret) || exit 75\n"), probe
+curl_line = [ln for ln in probe.splitlines() if ln.startswith("curl ")][0]
+assert shlex.split(curl_line)[-1] == "http://127.0.0.1:8787/tasks/ta`sk x", curl_line
+dispatch = m._remote_dispatch_script(rb, "/tmp/dm r$1.json")
+assert "cd '/re mote/ne$xus'" in dispatch, dispatch
+assert "--manifest '/tmp/dm r$1.json'" in dispatch, dispatch
+assert "rm -f '/tmp/dm r$1.json'" in dispatch, dispatch
+# Benign values stay unquoted - the generated script only changes when needed.
+benign = dict(rb, nexus_dir="/remote/nexus")
+plain = m._remote_dispatch_script(benign, "/tmp/dispatch-manifest-r1.json")
+assert "cd /remote/nexus\n" in plain, plain
+assert "--manifest /tmp/dispatch-manifest-r1.json" in plain, plain
+print("RB-QUOTING-OK")
+FIXTURE
+python3 "$QUOTING_FIXTURE" "$PROMOTER" > "$RB_STATE/quoting-out" 2>&1; rc=$?
+ok "remote scripts shlex-quote every interpolated path/url (#2024 follow-up)" \
+  '[ "$rc" = 0 ] && grep -q "RB-QUOTING-OK" "$RB_STATE/quoting-out"'
+
+# ─── #1884: the edge secret rides a 0600 header file, never curl argv ──────
+EDGE_FIXTURE="$TMP/edge-header-fixture.py"
+cat > "$EDGE_FIXTURE" <<'FIXTURE'
+import importlib.util, os, stat, sys
+spec = importlib.util.spec_from_file_location("csp_edge", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["csp_edge"] = m
+spec.loader.exec_module(m)
+
+with m._edge_secret_header("s3cret-value") as header_argv:
+    assert header_argv[0] == "--header", header_argv
+    assert header_argv[1].startswith("@"), header_argv
+    header_path = header_argv[1][1:]
+    # The argv carries only the file path — the /proc/<pid>/cmdline surface.
+    assert "s3cret-value" not in " ".join(header_argv), header_argv
+    assert stat.S_IMODE(os.stat(header_path).st_mode) == 0o600, oct(os.stat(header_path).st_mode)
+    with open(header_path, encoding="utf-8") as stream:
+        assert stream.read() == "x-a2a-edge-secret: s3cret-value\n"
+assert not os.path.exists(header_path), "header file survives the request block"
+print("EDGE-HEADER-OK")
+FIXTURE
+env "${base_env[@]}" python3 "$EDGE_FIXTURE" "$PROMOTER" > "$TMP/edge-out" 2>&1; rc=$?
+ok "#1884: edge secret travels via a 0600 header file, gone after the request" \
+  '[ "$rc" = 0 ] && grep -q "EDGE-HEADER-OK" "$TMP/edge-out"'
 
 # The mirrored reviewer actually lands in the dispatch manifest (no local
 # dispatch here — the routing unit above covers broker selection).

@@ -683,6 +683,7 @@ class Doctor:
         self.check_provider_readiness()
         self.check_distill_readiness()
         self.check_skill_promotion_backlog()
+        self.check_fleet_skills_sync()
         self.check_skill_promotion_revise_stall()
         self.check_skill_promotion_unpromoted()
         self.check_skill_usage_telemetry()
@@ -1657,6 +1658,82 @@ class Doctor:
             f"{age_days}d; verify this node is listed in the publisher's "
             "skill-promotion.collect-nodes, that its collect cron still runs, "
             "and that max_prs_per_run keeps up with the fleet's staging rate",
+        )
+
+    # The daily fleet-skills apply used to leave its verdict only as one JSON
+    # line in the cron log. Field case: three nodes failed every apply for 17
+    # days (`target_user_owned`) and nobody noticed — doctor only checked that
+    # the cron line existed. A single failure is a transient (GitHub, clone);
+    # a streak means approved skills have stopped landing on this node.
+    _FLEET_SYNC_FAIL_STREAK = 3
+
+    def check_fleet_skills_sync(self) -> None:
+        """Report a fleet-skills apply that keeps failing, or skipped names.
+
+        Reads the owner-only `state/fleet-skills/last-run.json` receipt that
+        `ccc-fleet-skills-sync.py apply` writes on every run (ok or not).
+        Absent receipt is not drift: the sync is opt-in and older installs
+        never wrote one. Both findings are `경고` — neither is repairable by
+        `--fix`, and neither should block a node's readiness.
+        """
+        item = "fleet-skills sync"
+        state_dir = Path(
+            os.environ.get("CCC_FLEET_SKILLS_STATE_DIR")
+            or (self.claude_dir / "state" / "fleet-skills")
+        ).expanduser()
+        receipt = state_dir / "last-run.json"
+        if receipt.is_symlink() or not receipt.is_file():
+            self.add("정상", item, "last-run=absent", "none")
+            return
+        try:
+            if receipt.stat().st_size > 16 * 1024:
+                raise ValueError("receipt too large")
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("receipt not an object")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            self.add(
+                "수동필요",
+                item,
+                "last-run=unreadable",
+                f"inspect {receipt}; the fleet-skills apply verdict cannot be verified",
+            )
+            return
+        commit = str(payload.get("commit") or "")[:12]
+        if payload.get("ok") is True:
+            skipped = payload.get("skipped_user_owned")
+            names = [str(name) for name in skipped] if isinstance(skipped, list) else []
+            status = f"ok; commit={commit or '?'}; skipped_user_owned={len(names)}"
+            if not names:
+                self.add("정상", item, status, "none")
+                return
+            shown = ", ".join(names[:5]) + (" …" if len(names) > 5 else "")
+            self.add(
+                "경고",
+                item,
+                status,
+                f"approved skills not installed because a user-owned directory holds "
+                f"the name ({shown}); rename or remove the local copy, or re-stage it "
+                "through autosave so the fleet layer can adopt it",
+            )
+            return
+        try:
+            streak = max(0, int(payload.get("consecutive_failures") or 0))
+        except (TypeError, ValueError):
+            streak = 0
+        code = str(payload.get("code") or "unknown")
+        status = f"failed; code={code}; streak={streak}; commit={commit or '?'}"
+        if streak < self._FLEET_SYNC_FAIL_STREAK:
+            self.add("정상", item, status, "none")
+            return
+        self.add(
+            "경고",
+            item,
+            status,
+            f"the daily fleet-skills apply has failed {streak} runs in a row ({code}); "
+            "approved skills stop landing on this node until it succeeds — run "
+            "`python3 ~/.claude/hooks/ccc-fleet-skills-sync.py plan --ref <fleet-skills main sha>` "
+            "and read the code",
         )
 
     # A `revise` verdict normally dispatches a revision round back to the
