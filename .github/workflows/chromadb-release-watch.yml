@@ -1,0 +1,110 @@
+name: chromadb-release-watch
+
+# #1864 decision ① (owner, 2026-09-21): keep chromadb==1.5.9 pinned in
+# scripts/termux-mempalace-requirements.txt until a chromadb >1.5.9 release
+# appears on PyPI or the 2026-12-21 KST re-review, because mempalace 3.10.0
+# hard-requires chromadb<2,>=1.5.4 and the open Dependabot alerts (#4
+# GHSA-36p7-vc44-83pf critical, #3/#2 high, #1 critical) all point at that
+# pin. Dependabot's pip block covers only /bridge and /.github and its pip
+# VERSION updates are disabled (open-pull-requests-limit: 0), so
+# scripts/termux-mempalace-requirements.txt is not watched at all; this
+# workflow is the watcher. When a strictly
+# greater version ships, it leaves ONE deduplicated comment on #1864 asking
+# for the manual pin-bump PR — the bump itself stays manual, because a 2.x
+# release would NOT satisfy mempalace's <2 constraint and needs discussion
+# before any pin change.
+#
+# No checkout and no third-party actions: the job is curl + python3 + gh only.
+# Manual run: gh workflow run chromadb-release-watch.yml
+
+on:
+  schedule:
+    # Daily 21:00 UTC (06:00 KST) — before the workday.
+    - cron: '0 21 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A queued second run would just repeat the same PyPI read; keep the latest.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    name: watch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write # one deduplicated trigger comment on #1864
+    env:
+      PIN: '1.5.9' # chromadb pin in scripts/termux-mempalace-requirements.txt
+      ISSUE_NUMBER: '1864'
+      MARKER: '<!-- chromadb-release-watch -->'
+    steps:
+      - name: Compare PyPI latest against the pin
+        id: check
+        run: |
+          set -euo pipefail
+          payload="$(curl -fsSL --retry 3 --retry-delay 5 https://pypi.org/pypi/chromadb/json)"
+          latest="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])' <<<"$payload")"
+          newer="$(PIN="$PIN" LATEST="$latest" python3 -c '
+          import os
+          try:
+              from packaging.version import Version
+              key = Version
+          except Exception:
+              def key(version):
+                  parts = []
+                  for chunk in version.split("."):
+                      digits = ""
+                      for ch in chunk:
+                          if not ch.isdigit():
+                              break
+                          digits += ch
+                      parts.append((int(digits or "0"), chunk))
+                  return tuple(parts)
+          print("yes" if key(os.environ["LATEST"]) > key(os.environ["PIN"]) else "no")
+          ')"
+          {
+            echo "latest=${latest}"
+            echo "newer=${newer}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo '## chromadb release watch'
+            echo
+            echo "- PyPI latest: \`${latest}\`"
+            echo "- Pinned: \`${PIN}\` (scripts/termux-mempalace-requirements.txt)"
+            echo "- Newer than pin: \`${newer}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on the tracking issue when released
+        if: steps.check.outputs.newer == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.check.outputs.latest }} # env indirection: never splice outputs into the script
+        run: |
+          set -euo pipefail
+          latest="$LATEST"
+          if gh api "repos/${{ github.repository }}/issues/${ISSUE_NUMBER}/comments" --paginate \
+              --jq '.[].body' | grep -qF "$MARKER"; then
+            echo "trigger comment already on #${ISSUE_NUMBER}; nothing to do"
+            exit 0
+          fi
+          comment="$(mktemp)"
+          {
+            echo "$MARKER"
+            echo
+            echo "## chromadb > ${PIN} PyPI 출시 감지 — 핀 갱신 트리거 발동"
+            echo
+            echo "- PyPI latest: \`${latest}\` (핀: \`${PIN}\`, scripts/termux-mempalace-requirements.txt)"
+            echo "- #1864 의사결정 ①(2026-09-21) 대기 조건 중 'chromadb >1.5.9 출시' 충족."
+            echo "- 요청: 핀 갱신 수동 PR — dependabot pip가 scripts/를 감시하지 않아 자동 PR이 열리지 않음."
+            echo "  - bump 전 확인: mempalace 3.10.0 제약 \`chromadb<2,>=1.5.4\` 충족 여부(2.x는 미충족 — 별도 논의 필요), Dependabot alerts(#4 GHSA-36p7-vc44-83pf 등) 해소 여부."
+            echo "- 이 코멘트는 위 마커 기준으로 1회만 게시됨. 재알림이 필요하면 마커를 지운 뒤 \`gh workflow run chromadb-release-watch.yml\`."
+            echo
+            echo "@jinon86"
+          } > "$comment"
+          gh issue comment "$ISSUE_NUMBER" -R "${{ github.repository }}" --body-file "$comment"
