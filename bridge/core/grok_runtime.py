@@ -17,8 +17,8 @@ from .agent_runtime import (
 )
 from .grok_journal import GrokJournal
 from .grok_protocol import (
-    AcceptedPrompt, Baseline, HOST_VERSION, MAX_PROMPT, ProtocolError, _text, accepted_prompt,
-    bound_reply, capture_baseline, check_host, check_idle,
+    AcceptedPrompt, Baseline, BoundReply, HOST_VERSION, MAX_PROMPT, ProtocolError, _text,
+    accepted_prompt, bound_reply, capture_baseline, check_host, check_idle,
 )
 from .turn_stall import register_turn_liveness
 
@@ -144,6 +144,14 @@ class GrokSession:
     # treating the operation as uncertain; a rejection is final immediately.
     ACCEPTANCE_SECONDS = 15.0
     ACCEPTANCE_POLL_SECONDS = 0.5
+    # The Bot answers in several transcript rows ("내일 일정 알려줄게" first, the
+    # list 4-8 s later in 2026-09-22 observations) and host f7045c4 publishes no
+    # end-of-run marker: reply rows carry no `isStreaming` and `health.isBusy`
+    # never leaves false. Returning on the first row delivered a truncated
+    # answer, so a validated range whose newest row is younger than this is
+    # held until the transcript stays unchanged for that long. A range that is
+    # already older (reconciliation, replay) is returned at once.
+    REPLY_SETTLE_SECONDS = 10.0
 
     def __init__(self, runtime: GrokRuntime):
         self.runtime = runtime
@@ -230,7 +238,46 @@ class GrokSession:
                         # the surrounding TURN_SECONDS timeout.
                         await asyncio.sleep(self.POLL_SECONDS)
                         continue
+                    result = await self._settled_reply(accepted, message, baseline, result, page)
                     return claim.complete(current, result)
+
+    def _range_age_seconds(self, page: Any, entry_ids: tuple[str, ...]) -> float | None:
+        """Seconds since the newest row of ``entry_ids``, or None when unusable.
+
+        The transcript and this process share the Bot computer's clock, but a
+        missing, negative or absurd stamp is treated as "no basis to wait" so
+        settling can never hang on a malformed page.
+        """
+        stamps = [e.get("timestampMs") for e in page.get("entries", [])
+                  if isinstance(e, dict) and e.get("id") in entry_ids]
+        stamps = [s for s in stamps if type(s) is int]
+        if not stamps:
+            return None
+        age = time.time() - max(stamps) / 1000.0
+        return age if 0.0 <= age <= 86_400.0 else None
+
+    async def _settled_reply(self, accepted: AcceptedPrompt, message: str, baseline: Baseline,
+                             result: BoundReply, page: Any) -> BoundReply:
+        """Hold a freshly written reply until this run stops adding rows.
+
+        The host has no end-of-run marker, so completeness is judged by
+        quiescence of the bound range. Any validation failure during the wait
+        keeps the range already validated: settling must never lose a
+        confirmed answer. The surrounding TURN_SECONDS timeout bounds it.
+        """
+        runtime = self.runtime
+        while True:
+            age = self._range_age_seconds(page, result.entry_ids)
+            if age is None or age >= self.REPLY_SETTLE_SECONDS:
+                return result
+            await asyncio.sleep(self.POLL_SECONDS)
+            try:
+                page = await runtime._call("tail")
+                health = await runtime._call("health")
+                result = bound_reply(accepted, message, baseline, page, health)
+            except ProtocolError as exc:
+                logger.warning("Grok reply settle stopped early (%s); delivering the validated range", exc)
+                return result
 
     async def _await_acceptance(self, nonce: str, message: str) -> AcceptedPrompt:
         """Look up the acceptance record for ``nonce``, tolerating a short persistence lag.
