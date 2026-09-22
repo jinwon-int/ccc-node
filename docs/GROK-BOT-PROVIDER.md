@@ -35,6 +35,7 @@ Git, screenshots or reports. In that configuration select:
 | `ALLOWED_USER_IDS` | Exactly the singleton owner ID list |
 | `CCC_REQUIRE_ALLOWLIST` | `true` |
 | `CCC_GROK_JOURNAL_PATH` | One explicit absolute private journal directory on the Grok computer |
+| `CCC_GROK_HOST_VERSIONS` | Optional. Extra qualified host build ids (comma list) or `any` (capability-only) — the host self-updates while idle; unset keeps the baseline pin only |
 
 The usual `TELEGRAM_BOT_TOKEN` stays in that project's private environment file.
 Its numeric prefix must match the selected Telegram bot; authenticated `getMe`

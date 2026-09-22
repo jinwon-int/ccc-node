@@ -29,11 +29,12 @@ class FakeGrokHost:
         self.started = asyncio.Event()
         self.before_send = lambda: None
         self.tamper = False
+        self.version = HOST_VERSION
 
     async def call(self, operation, arguments=None):
         self.calls.append(operation)
         if operation == "status":
-            return {"hostVersion": HOST_VERSION, "capabilities": ["orderedReplicasV1", "sendAcceptanceV1"], "isBusy": self.busy}
+            return {"hostVersion": self.version, "capabilities": ["orderedReplicasV1", "sendAcceptanceV1"], "isBusy": self.busy}
         if operation == "health":
             return {"ok": True, "isBusy": self.busy, "activeAgentId": self.agent_id, "busyOnlyAwaitingApproval": self.approval}
         if operation == "tail":
@@ -96,6 +97,25 @@ class GrokRuntimeTests(unittest.IsolatedAsyncioTestCase):
         assert_turn_stream_contract(events)
         self.assertEqual(events[-2].result["text"], "generated reply one")
         self.assertEqual(len(self.host.sends), 1)
+
+    async def test_host_version_policy_pin_list_any_and_journal_continuity(self):
+        self.host.version = "0123abc"
+        with self.assertRaisesRegex(ProtocolError, "unqualified_host_version"):
+            await GrokRuntime(self.journal, self.host).start_or_resume(self.request)
+        listed = GrokRuntime(self.journal, self.host, qualified_hosts=frozenset({"0123abc"}))
+        session = await listed.start_or_resume(self.request)
+        self.assertEqual(self.journal.host_version, "0123abc")
+        await self.collect("one", session=session)
+        self.assertEqual(json.loads((self.root / "0001.json").read_text())["host_version"], "0123abc")
+        self.assertEqual(json.loads((self.root / "0000.json").read_text())["host_version"], HOST_VERSION)
+        self.host.version = "fedcba9"  # idle-auto-update: history written under other ids still loads
+        anyhost = GrokRuntime(self.journal, self.host, qualified_hosts=None)
+        session = await anyhost.start_or_resume(self.request)
+        await self.collect("two", session=session)
+        self.assertEqual(json.loads((self.root / "0004.json").read_text())["host_version"], "fedcba9")
+        self.host.version = "not-hex"
+        with self.assertRaisesRegex(ProtocolError, "unqualified_host_version"):
+            await GrokRuntime(self.journal, self.host, qualified_hosts=None).start_or_resume(self.request)
 
     async def test_lost_send_reply_reopen_reconciles_without_send(self):
         self.host.fail_after_send = True

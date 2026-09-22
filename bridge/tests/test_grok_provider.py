@@ -19,7 +19,7 @@ from telegram.request import BaseRequest
 
 from telegram_bot.__main__ import build_context, create_app
 from telegram_bot.core.grok_bot import GrokTelegramBot, _TransportLogFilter
-from telegram_bot.core.grok_protocol import ProtocolError
+from telegram_bot.core.grok_protocol import HOST_VERSION, ProtocolError
 from telegram_bot.core.grok_provider import build_grok_runtime, configured_route
 from telegram_bot.core.grok_ssh import GrokLocalTransport, GrokSshTransport
 from telegram_bot.core.grok_runtime import GrokRuntime
@@ -78,6 +78,14 @@ class GrokCompositionTests(unittest.TestCase):
             runtime = build_grok_runtime(settings)
         self.assertIsInstance(runtime.transport, GrokLocalTransport)
         self.assertEqual(runtime.transport.destination, "box@fixture.invalid")
+
+    def test_host_version_policy_from_settings(self):
+        self.assertEqual(build_grok_runtime(configuration(self.root)).qualified_hosts, frozenset({HOST_VERSION}))
+        listed = build_grok_runtime(configuration(self.root, CCC_GROK_HOST_VERSIONS="0123abc,fedcba9"))
+        self.assertEqual(listed.qualified_hosts, frozenset({HOST_VERSION, "0123abc", "fedcba9"}))
+        self.assertIsNone(build_grok_runtime(configuration(self.root, CCC_GROK_HOST_VERSIONS="any")).qualified_hosts)
+        with self.assertRaises(ProtocolError):
+            build_grok_runtime(configuration(self.root, CCC_GROK_HOST_VERSIONS="bad!"))
 
     def test_ssh_transport_remains_when_not_local(self):
         settings = configuration(self.root)
