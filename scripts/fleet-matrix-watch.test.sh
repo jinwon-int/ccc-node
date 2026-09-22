@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Hermetic transport and alert contract for the Matrix fleet watch.
 set -euo pipefail
+pass=0
+assert() {
+  "$@"
+  pass=$((pass + 1))
+}
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP_BASE="${TMPDIR:-$(dirname "$ROOT")}"
 mkdir -p "$TMP_BASE"
@@ -27,9 +32,9 @@ out=$(REPLY_DIR="$TMP/reply" CALLS_FILE="$TMP/calls" CCC_FLEET_NODES='alpha beta
   bash "$ROOT/scripts/fleet-matrix-watch.sh")
 rc=$?
 set -e
-[ "$rc" = 1 ]
-grep -qx 'OK alpha channel=matrix reason=available' <<< "$out"
-grep -qx 'DOWN beta channel=matrix reason=no-process' <<< "$out"
+assert test "$rc" = 1
+assert grep -qx 'OK alpha channel=matrix reason=available' <<< "$out"
+assert grep -qx 'DOWN beta channel=matrix reason=no-process' <<< "$out"
 
 set +e
 out=$(REPLY_DIR="$TMP/reply" CALLS_FILE="$TMP/calls" CCC_FLEET_NODES='gamma' CCC_FLEET_SSH="$TMP/ssh" \
@@ -37,8 +42,8 @@ out=$(REPLY_DIR="$TMP/reply" CALLS_FILE="$TMP/calls" CCC_FLEET_NODES='gamma' CCC
   bash "$ROOT/scripts/fleet-matrix-watch.sh")
 rc=$?
 set -e
-[ "$rc" = 1 ]
-grep -qx 'UNREACHABLE gamma channel=matrix' <<< "$out"
-[ "$(grep -c '^gamma$' "$TMP/calls")" = 2 ]
-python3 -m unittest "$ROOT/scripts/fleet_matrix_probe_test.py"
-echo 'fleet-matrix-watch tests passed'
+assert test "$rc" = 1
+assert grep -qx 'UNREACHABLE gamma channel=matrix' <<< "$out"
+assert test "$(grep -c '^gamma$' "$TMP/calls")" = 2
+assert python3 -m unittest "$ROOT/scripts/fleet_matrix_probe_test.py"
+printf 'PASS=%s FAIL=0\n' "$pass"
