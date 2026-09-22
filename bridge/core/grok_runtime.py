@@ -6,6 +6,7 @@ Local interruption retires the handle and retains the remote unknown outcome.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, Protocol
@@ -20,6 +21,8 @@ from .grok_protocol import (
     bound_reply, capture_baseline, check_host, check_idle,
 )
 from .turn_stall import register_turn_liveness
+
+logger = logging.getLogger(__name__)
 
 
 class GrokTransport(Protocol):
@@ -181,7 +184,12 @@ class GrokSession:
                     # send. Reopening only queries this nonce; never resends.
                     reply = await runtime._call("send", {"nonce": current["nonce"], "prompt": message})
                     if not isinstance(reply, dict) or reply.get("accepted") is not True:
-                        raise ProtocolError("grok_send_uncertain")
+                        # Host f7045c4 no longer answers ``{"accepted": true}`` on
+                        # the proxied path although it accepts and runs the
+                        # prompt. The durable acceptance record below is the
+                        # authority; never resend, never invent a nonce.
+                        logger.warning("Grok send response unconfirmed (keys=%s); consulting acceptance record",
+                                       sorted(reply) if isinstance(reply, dict) else type(reply).__name__)
                 elif current["prompt"] != message:
                     raise ProtocolError("grok_pending_input_mismatch")
                 if current["stage"] == "attempted":
