@@ -229,6 +229,35 @@ evidence-first continue) through a few channel ports:
   with the same stale-lock retry as Telegram (#1888). Off, or ineligible, the
   scan just offers the menu; answer `1`.
 
+## Grok (`CCC_AGENT_PROVIDER=grok`) — owner direct room only
+
+With the Grok provider, `CCC_CHANNEL=matrix` selects `core/grok_matrix_bot.py`
+(`GrokMatrixBot`) instead of `MatrixBot`: the same restricted contract as the
+Grok Telegram frontend ([GROK-BOT-PROVIDER.md](GROK-BOT-PROVIDER.md)) — text
+only, one turn at a time, no `/new`/model/effort/approvals/history/files, the
+persisted Grok journal as the only session authority — served through the
+unchanged E2EE transport, room gate and event admission.
+
+- **Direct room only.** The Grok journal binds exactly one owner conversation.
+  A config with `family_rooms` or `family_users` is refused before the
+  transport opens (`grok_matrix_direct_room_only`); a message from any other
+  sender, room kind or unlisted room gets a static denial and never reaches
+  the journal or the Bot.
+- **Startup gates after the device authenticated:** single local Grok
+  frontend (the same abstract socket as the Telegram frontend — Telegram and
+  Matrix cannot serve the same Bot at once), persisted journal
+  (`start_or_resume`), qualified host version, idle Bot. A failed gate closes
+  the transport and exits; nothing is reset.
+- `/status` describes the attachment; `/stop` and `/cancel <turn>` are the
+  transport's controls and only cancel local waiting (the Bot's remote tools
+  are not stopped). `CCC_MATRIX_INITIALIZE=1` provisions the bot device and
+  exits without opening the journal, as for `MatrixBot`.
+- The route still needs the Telegram identity keys (`TELEGRAM_BOT_TOKEN`,
+  `CCC_GROK_TELEGRAM_BOT_ID`, `CCC_GROK_OWNER_ID`): they are the journal's
+  immutable binding label, not a Telegram connection. No `getMe`/webhook
+  check runs; the Matrix login and pinned owner devices are the identity gate.
+- No streaming, typing/status bubbles, health.json tick or spool notifier:
+  the reply is delivered by the outbox once the journal has committed it.
 
 ## health.json for the Matrix frontend
 

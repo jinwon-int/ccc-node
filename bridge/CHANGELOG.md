@@ -1,5 +1,14 @@
 # Changelog
 
+- **Grok on Matrix (owner direct room).** `CCC_AGENT_PROVIDER=grok` with
+  `CCC_CHANNEL=matrix` now selects `core/grok_matrix_bot.py` (`GrokMatrixBot`)
+  instead of always building the Telegram frontend: the same restricted Grok
+  contract (owner only, text only, one committed turn, persisted journal)
+  served as the `TurnRunner` of the unchanged E2EE Matrix transport. Family
+  rooms/users are refused before the transport opens; the Grok startup gates
+  (single local frontend, journal, host version, idle Bot) run after the
+  device authenticated. Telegram and Matrix cannot serve the same Bot at once.
+
 - **Grok host version policy: baseline `79a3c3e` + `CCC_GROK_HOST_VERSIONS`.**
   The Grok host (`sand-host` behind `127.0.0.1:1340`) replaces itself while
   idle several times a week, and the fixed `HOST_VERSION` pin plus the
