@@ -76,8 +76,8 @@ def test_create_app_selects_matrix_bot(tmp_path: Path, monkeypatch: pytest.Monke
     created: dict[str, object] = {}
 
     class FakeMatrixBot:
-        def __init__(self, settings, *, project_chat, session_manager, clock=None):
-            created.update(settings=settings, project_chat=project_chat, session_manager=session_manager, clock=clock)
+        def __init__(self, settings, *, project_chat, session_manager, clock=None, **workers):
+            created.update(settings=settings, project_chat=project_chat, session_manager=session_manager, clock=clock, **workers)
 
     module = types.ModuleType("telegram_bot.core.matrix.bot")
     module.MatrixBot = FakeMatrixBot  # type: ignore[attr-defined]
@@ -91,6 +91,8 @@ def test_create_app_selects_matrix_bot(tmp_path: Path, monkeypatch: pytest.Monke
     assert isinstance(bot, FakeMatrixBot)
     assert created["project_chat"] is context.project_chat
     assert created["session_manager"] is context.session_manager
+    for field in ("distill_journal", "distill_snapshot_worker", "distill_extraction_worker", "distill_local_sink_worker", "distill_wiki_sink_worker"):
+        assert created[field] is getattr(context, field)
 
     # Telegram stays the default frontend.
     telegram_bot = create_app(build_context(_settings(tmp_path)))
