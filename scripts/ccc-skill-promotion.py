@@ -1884,6 +1884,33 @@ def _remote_ssh_capture(config: Config, rb: dict[str, str], remote_script: str, 
     return completed.stdout
 
 
+def _remote_probe_script(rb: dict[str, str], url: str) -> str:
+    """SSH snippet that sources the edge secret remotely (secret_cmd prints it
+    on the broker host — the value never transits this node) and curls one
+    broker endpoint with it. Every interpolated value except secret_cmd (raw
+    remote shell by design) is shlex.quoted, so operator-configured bytes like
+    spaces, quotes, $ or backticks stay one literal curl argument instead of
+    live remote-shell syntax (#2024 follow-up)."""
+    return (
+        'S=$(' + rb["secret_cmd"] + ') || exit 75\n'
+        'curl -fsS -H "x-a2a-edge-secret: $S" ' + shlex.quote(url) + '\n'
+    )
+
+
+def _remote_dispatch_script(rb: dict[str, str], remote_manifest: str) -> str:
+    """SSH snippet that runs the dispatcher inside rb["nexus_dir"] against the
+    broker's own loopback. Paths are shlex.quoted for the same reason as
+    _remote_probe_script; the manifest is copied over — never the secret."""
+    return (
+        'set -eu\n'
+        'S=$(' + rb["secret_cmd"] + ')\n'
+        '[ -n "$S" ]\n'
+        'cd ' + shlex.quote(rb["nexus_dir"]) + '\n'
+        'A2A_EDGE_SECRET="$S" node scripts/a2a-dispatch-round.mjs --manifest ' + shlex.quote(remote_manifest) + ' --verify --json\n'
+        'rm -f ' + shlex.quote(remote_manifest) + '\n'
+    )
+
+
 def _remote_online_worker_ids(config: Config, rb: dict[str, str]) -> set[str]:
     """Online worker ids on a remote broker. Uses the stale-inclusive read
     path and filters on the projected status, because older brokers return an
@@ -1893,8 +1920,7 @@ def _remote_online_worker_ids(config: Config, rb: dict[str, str]) -> set[str]:
             _remote_ssh_capture(
                 config,
                 rb,
-                'S=$(' + rb["secret_cmd"] + ') || exit 75\n'
-                'curl -fsS -H "x-a2a-edge-secret: $S" "' + rb["broker_url"] + '/workers?include=stale_read_path&limit=100"\n',
+                _remote_probe_script(rb, rb["broker_url"] + "/workers?include=stale_read_path&limit=100"),
             ).decode("utf-8")
         )
     except (PromotionError, UnicodeDecodeError, json.JSONDecodeError):
@@ -1914,8 +1940,7 @@ def _remote_broker_id(config: Config, rb: dict[str, str]) -> str:
         _remote_ssh_capture(
             config,
             rb,
-            'S=$(' + rb["secret_cmd"] + ') || exit 75\n'
-            'curl -fsS -H "x-a2a-edge-secret: $S" "' + rb["broker_url"] + '/health"\n',
+            _remote_probe_script(rb, rb["broker_url"] + "/health"),
         ).decode("utf-8")
     )
     broker_id = payload.get("brokerId") if isinstance(payload, dict) else None
@@ -1929,8 +1954,7 @@ def _remote_broker_task(config: Config, rb: dict[str, str], task_id: str) -> dic
         _remote_ssh_capture(
             config,
             rb,
-            'S=$(' + rb["secret_cmd"] + ') || exit 75\n'
-            'curl -fsS -H "x-a2a-edge-secret: $S" "' + rb["broker_url"] + '/tasks/' + task_id + '"\n',
+            _remote_probe_script(rb, rb["broker_url"] + "/tasks/" + task_id),
         ).decode("utf-8")
     )
     if not isinstance(payload, dict):
@@ -1954,14 +1978,7 @@ def _remote_dispatch_round(config: Config, rb: dict[str, str], manifest: dict[st
             os.unlink(local_manifest)
         except OSError:
             pass
-    script = (
-        'set -eu\n'
-        'S=$(' + rb["secret_cmd"] + ')\n'
-        '[ -n "$S" ]\n'
-        'cd ' + json.dumps(rb["nexus_dir"]) + '\n'
-        'A2A_EDGE_SECRET="$S" node scripts/a2a-dispatch-round.mjs --manifest ' + json.dumps(remote_manifest) + ' --verify --json\n'
-        'rm -f ' + json.dumps(remote_manifest) + '\n'
-    )
+    script = _remote_dispatch_script(rb, remote_manifest)
     try:
         stdout = _remote_ssh_capture(config, rb, script, timeout=300)
         result = json.loads(stdout.decode("utf-8"))
