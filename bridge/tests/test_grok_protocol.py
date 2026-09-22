@@ -4,7 +4,7 @@ import unittest
 
 from telegram_bot.core.grok_protocol import (
     HOST_VERSION, MAX_WIRE, ProtocolError, accepted_prompt, bound_reply,
-    capture_baseline, check_host, check_idle, decode_wire, prompt_digest,
+    capture_baseline, check_host, check_idle, decode_wire, prompt_digest, qualified_hosts,
 )
 
 AGENT = "00000000-0000-4000-8000-000000000001"
@@ -67,10 +67,31 @@ class GrokProtocolTests(unittest.TestCase):
                 decode_wire(raw)
         self.assertEqual(decode_wire(b'{"ok":true}'), {"ok": True})
 
+    def test_host_version_policy_list_and_capability_only(self):
+        valid = {"hostVersion": "0123abc", "isBusy": False,
+                 "capabilities": ["sendAcceptanceV1", "orderedReplicasV1"]}
+        with self.assertRaisesRegex(ProtocolError, "unqualified_host_version"):
+            check_host(valid)  # baseline pin is the default
+        self.assertEqual(check_host(valid, frozenset({"0123abc"})), "0123abc")
+        self.assertEqual(check_host(valid, None), "0123abc")
+        for bad in ("different", "ABCDEF0", "abc", "a" * 41, None, 7):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ProtocolError, "unqualified_host_version"):
+                check_host({**valid, "hostVersion": bad}, None)
+        with self.assertRaisesRegex(ProtocolError, "host_capability_mismatch"):
+            check_host({**valid, "capabilities": ["orderedReplicasV1"]}, None)
+        self.assertEqual(qualified_hosts(None), frozenset({HOST_VERSION}))
+        self.assertEqual(qualified_hosts("  "), frozenset({HOST_VERSION}))
+        self.assertIsNone(qualified_hosts("any"))
+        self.assertIsNone(qualified_hosts(" ANY "))
+        self.assertEqual(qualified_hosts("0123abc, FEDCBA9"), frozenset({HOST_VERSION, "0123abc", "fedcba9"}))
+        for bad in ("bad!", "0123abc,,zz", ","):
+            with self.subTest(bad=bad), self.assertRaises(ProtocolError):
+                qualified_hosts(bad)
+
     def test_pinned_capabilities_and_idle(self):
         valid = {"hostVersion": HOST_VERSION, "isBusy": False,
                  "capabilities": ["sendAcceptanceV1", "orderedReplicasV1", "voiceSettingsV1"]}
-        check_host(valid)
+        self.assertEqual(check_host(valid), HOST_VERSION)
         for key, value in [("hostVersion", "different"), ("capabilities", []),
                            ("capabilities", [None]), ("isBusy", 0)]:
             with self.subTest(key=key, value=value), self.assertRaises(ProtocolError):

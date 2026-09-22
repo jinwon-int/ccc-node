@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from telegram_bot.core.grok_journal import GrokBinding, GrokJournal, canonical
-from telegram_bot.core.grok_protocol import AcceptedPrompt, Baseline, BoundReply, ProtocolError
+from telegram_bot.core.grok_protocol import HOST_VERSION, AcceptedPrompt, Baseline, BoundReply, ProtocolError
 
 AGENT = "00000000-0000-4000-8000-000000000001"
 
@@ -113,6 +113,23 @@ class JournalTests(unittest.TestCase):
         path.write_bytes(original)
         with self.journal.claim() as claim:
             self.assertEqual(claim.load()[1], 4)
+
+    def test_host_version_change_between_revisions_is_recorded_not_rejected(self):
+        with self.journal.claim() as claim:
+            self.operation(claim)
+        self.journal.host_version = "0123abc"  # the runtime sets this from a qualified status
+        with self.journal.claim() as claim:
+            self.operation(claim)
+        with self.journal.claim() as claim:
+            self.assertEqual(claim.load()[1], 7)
+        recorded = [json.loads((self.root / f"{n:04d}.json").read_text())["host_version"] for n in range(7)]
+        self.assertEqual(recorded, [HOST_VERSION] * 4 + ["0123abc"] * 3)
+        tampered = self.root / "0005.json"
+        value = json.loads(tampered.read_text())
+        value["host_version"] = "not-a-host-id"
+        tampered.write_bytes(canonical(value))
+        with self.assertRaises(ProtocolError), self.journal.claim() as claim:
+            claim.load()
 
     def test_transition_and_exact_intent_changes_denied(self):
         with self.journal.claim() as claim:

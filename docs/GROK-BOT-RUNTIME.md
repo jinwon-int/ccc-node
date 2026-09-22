@@ -31,7 +31,10 @@ binding; it does not turn local journal locks into distributed host ownership.
 ## State and transitions
 
 The private directory contains an immutable lock name and numbered canonical
-JSON revisions. Initial revision 0 binds schema 1, host version and identity.
+JSON revisions. Initial revision 0 binds schema 1 and identity; every revision
+records the host build id the runtime last qualified (`status`), which may
+change between revisions as the host self-updates — only a malformed id
+invalidates history.
 Each revision contains the SHA-256 of the previous raw revision plus the
 current operation. All revisions remain available; there is no pruning,
 reset, stale-claim requeue, deletion of unknown state or recovery import.

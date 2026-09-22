@@ -16,7 +16,7 @@ from .agent_runtime import (
 )
 from .grok_journal import GrokJournal
 from .grok_protocol import (
-    AcceptedPrompt, Baseline, MAX_PROMPT, ProtocolError, _text, accepted_prompt,
+    AcceptedPrompt, Baseline, HOST_VERSION, MAX_PROMPT, ProtocolError, _text, accepted_prompt,
     bound_reply, capture_baseline, check_host, check_idle,
 )
 from .turn_stall import register_turn_liveness
@@ -70,8 +70,17 @@ class GrokTurnLiveness:
 
 
 class GrokRuntime:
-    def __init__(self, journal: GrokJournal, transport: GrokTransport):
+    def __init__(
+        self,
+        journal: GrokJournal,
+        transport: GrokTransport,
+        *,
+        qualified_hosts: frozenset[str] | None = frozenset({HOST_VERSION}),
+    ):
         self.journal, self.transport = journal, transport
+        # Accepted host ids for ``status`` (None = capability-only); the id
+        # the host actually reports is recorded on every journal revision.
+        self.qualified_hosts = qualified_hosts
         self._session: GrokSession | None = None
         self._last_activity: float | None = None
         self._check_binding()
@@ -111,7 +120,7 @@ class GrokRuntime:
         # A completed host RPC is the turn's last-activity signal (#1741).
         self._last_activity = time.monotonic()
         if operation == "status":
-            check_host(result)
+            self.journal.host_version = check_host(result, self.qualified_hosts)
         return result
 
 

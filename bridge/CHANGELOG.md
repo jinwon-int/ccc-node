@@ -1,5 +1,17 @@
 # Changelog
 
+- **Grok host version policy: baseline `79a3c3e` + `CCC_GROK_HOST_VERSIONS`.**
+  The Grok host (`sand-host` behind `127.0.0.1:1340`) replaces itself while
+  idle several times a week, and the fixed `HOST_VERSION` pin plus the
+  journal's per-revision `host_version` equality check killed the frontend
+  (`unqualified_host_version`) and invalidated the whole journal
+  (`grok_history_invalid`) at every update (grok-bot 2026-09-22). The baseline
+  pin moves to `79a3c3e`; `CCC_GROK_HOST_VERSIONS` widens it (comma list of
+  ids, or `any` for capability-only qualification — `orderedReplicasV1` and
+  `sendAcceptanceV1` are still required in every mode). The journal now
+  records the id the host actually reported on each revision and only
+  rejects malformed ids, so a host update no longer retires the history.
+
 - **Matrix status throttle matches Telegram (15s).** `STATUS_MIN_INTERVAL_S`
   was 60s, so `⏳ Working` on Matrix lagged Telegram's 15s heartbeat. Both
   channels now refresh at 15s. Streaming-progress suppression is unchanged.

@@ -249,6 +249,14 @@ class Config(
     grok_owner_id: Optional[int] = Field(default=None, gt=0, alias="CCC_GROK_OWNER_ID")
     grok_telegram_bot_id: Optional[int] = Field(default=None, gt=0, alias="CCC_GROK_TELEGRAM_BOT_ID")
     grok_journal_path: Optional[Path] = Field(default=None, alias="CCC_GROK_JOURNAL_PATH")
+    grok_host_versions: Optional[str] = Field(
+        default=None,
+        alias="CCC_GROK_HOST_VERSIONS",
+        description=(
+            "Accepted Grok host build ids beyond the baseline pin: a comma-separated list, "
+            "or 'any' to qualify by the capability contract alone (the host self-updates while idle)."
+        ),
+    )
     codex_cli_path: str = Field(
         default_factory=lambda: str(Path.home() / ".claude" / "hooks" / "ccc-codex"),
         alias="CCC_CODEX_CLI_PATH",

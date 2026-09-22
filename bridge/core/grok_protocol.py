@@ -1,9 +1,16 @@
-"""Bounded Grok Bot gateway validation, qualified against host 5c534e9.
+"""Bounded Grok Bot gateway validation, qualified against host 79a3c3e (baseline).
 
 This is the existing Bot protocol, not the xAI model API. Acceptance is not
 completion. A caller must durably retain the nonce, prompt and pre-send
 baseline, and must not resend an uncertain operation under a fresh nonce.
 No response/error body is ever included in a ProtocolError.
+
+The Grok host (``sand-host`` behind the loopback gateway) replaces itself
+while idle (``idle-auto-update``), several times a week in practice. The
+baseline pin therefore only names the build the contract was qualified
+against; deployments widen it with ``CCC_GROK_HOST_VERSIONS`` (a list of
+additional ids, or ``any`` to rely on the capability contract alone) — see
+:func:`qualified_hosts`.
 """
 from __future__ import annotations
 
@@ -14,7 +21,8 @@ import math
 import uuid
 from typing import Any
 
-HOST_VERSION = "5c534e9"
+HOST_VERSION = "79a3c3e"
+HOST_ANY = "any"  # CCC_GROK_HOST_VERSIONS value: capability-qualified, no id pin
 MAX_WIRE = 1024 * 1024
 MAX_PROMPT = 32768
 MAX_ENTRIES = 64
@@ -106,8 +114,43 @@ def _check_structure(result: Any) -> None:
             pending.extend((child, depth + 1) for child in value)
 
 
-def check_host(status: Any) -> None:
-    if not isinstance(status, dict) or status.get("hostVersion") != HOST_VERSION:
+def host_id(value: Any) -> str:
+    """A host build id as the gateway reports it: 7-40 lowercase hex characters."""
+    value = _text(value, 40, "unqualified_host_version")
+    if len(value) < 7 or any(c not in "0123456789abcdef" for c in value):
+        raise ProtocolError("unqualified_host_version")
+    return value
+
+
+def qualified_hosts(spec: Any) -> frozenset[str] | None:
+    """Parse ``CCC_GROK_HOST_VERSIONS`` into the accepted host id set.
+
+    Unset/blank keeps the baseline pin; ``any`` returns ``None`` (accept every
+    well-formed id whose capabilities satisfy the contract); otherwise a
+    comma-separated list of ids, always including the baseline.
+    """
+    if spec is None or not str(spec).strip():
+        return frozenset({HOST_VERSION})
+    text = str(spec).strip().lower()
+    if text == HOST_ANY:
+        return None
+    ids = {host_id(part.strip()) for part in text.split(",") if part.strip()}
+    if not ids:
+        raise ProtocolError("invalid_host_version_list")
+    return frozenset(ids | {HOST_VERSION})
+
+
+def check_host(status: Any, qualified: frozenset[str] | None = frozenset({HOST_VERSION})) -> str:
+    """Validate a gateway ``status`` and return the host id it reports.
+
+    ``qualified`` is the accepted id set (default: the baseline pin) or
+    ``None`` for capability-only qualification. The capability contract is
+    checked in every mode.
+    """
+    if not isinstance(status, dict):
+        raise ProtocolError("unqualified_host_version")
+    version = host_id(status.get("hostVersion"))
+    if qualified is not None and version not in qualified:
         raise ProtocolError("unqualified_host_version")
     caps = status.get("capabilities")
     if (not isinstance(caps, list) or len(caps) > 64
@@ -115,6 +158,7 @@ def check_host(status: Any) -> None:
             or not {"orderedReplicasV1", "sendAcceptanceV1"}.issubset(caps)
             or type(status.get("isBusy")) is not bool):
         raise ProtocolError("host_capability_mismatch")
+    return version
 
 
 def check_idle(health: Any, agent_id: str) -> None:
