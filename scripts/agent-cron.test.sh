@@ -609,6 +609,12 @@ late_matrix = module.build_owner_text(
      + 'DOWN phone channel=matrix reason=no-process\n', 'stderr': ''})
 assert late_matrix is not None
 assert late_matrix.splitlines()[0].endswith('DOWN=1'), late_matrix.splitlines()[0]
+very_late_matrix = module.build_owner_text(
+    'fleet-doctor-daily', 'run-very-late-matrix', None, 'failed',
+    {'exitCode': 1, 'stdout': 'OK node channel=telegram\n' * 180
+     + 'DOWN phone channel=matrix reason=no-process\n', 'stderr': ''})
+assert very_late_matrix is not None
+assert very_late_matrix.splitlines()[0].endswith('DOWN=1')
 for category in module._FLEET_DIAGNOSTIC_TOKENS:
     title = module.fleet_diagnostic_title(task_id, 'failed', (category + '\n') * 1001, '')
     assert title.endswith(category + '=999'), title

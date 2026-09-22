@@ -1380,8 +1380,8 @@ def build_owner_text(task_id, run_id, scheduled_at, status, headless):
     raw_stderr = (headless or {}).get('stderr', '')
     # A fleet watch can emit two channel rows per node. Classify all captured
     # rows before shortening the notification body, or late failures vanish.
-    title_stdout = redact_for_owner(raw_stdout, 4000)
-    title_stderr = redact_for_owner(raw_stderr, 4000)
+    title_stdout = redact_for_owner(raw_stdout, len(str(raw_stdout)) + 1024)
+    title_stderr = redact_for_owner(raw_stderr, len(str(raw_stderr)) + 1024)
     stdout = redact_for_owner(raw_stdout, 900)
     stderr = redact_for_owner(raw_stderr, 900)
     if None in (title_stdout, title_stderr, stdout, stderr):

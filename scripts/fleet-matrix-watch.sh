@@ -7,12 +7,15 @@ PROBE="$ROOT/scripts/fleet_matrix_probe.py"
 NODES="${CCC_FLEET_NODES:-seoseo dungae sogyo nosuk bangtong yukson soonwook gwakga jingun gongmyoung gongyung daegyo}"
 SSH_BIN="${CCC_FLEET_SSH:-ssh}"
 SELF="${CCC_FLEET_SELF:-$(hostname -s 2>/dev/null || echo _none_)}"
-RETRIES="${CCC_FLEET_RETRIES:-2}"
-RETRY_DELAY="${CCC_FLEET_RETRY_DELAY:-10}"
-case "$RETRIES" in ''|*[!0-9]*) RETRIES=2 ;; esac
-case "$RETRY_DELAY" in ''|*[!0-9]*) RETRY_DELAY=10 ;; esac
-[ "$RETRIES" -le 5 ] || RETRIES=5
-[ "$RETRY_DELAY" -le 120 ] || RETRY_DELAY=120
+# Keep the extra channel's worst-case time bounded: 12 nodes ×
+# (2 × 10s attempts + 2s delay) = 264s. The scheduled combined sweep has a
+# 1200s deadline and still needs time for the Telegram doctor probes.
+RETRIES="${CCC_FLEET_MATRIX_RETRIES:-1}"
+RETRY_DELAY="${CCC_FLEET_MATRIX_RETRY_DELAY:-2}"
+case "$RETRIES" in ''|*[!0-9]*) RETRIES=1 ;; esac
+case "$RETRY_DELAY" in ''|*[!0-9]*) RETRY_DELAY=2 ;; esac
+[ "$RETRIES" -le 1 ] || RETRIES=1
+[ "$RETRY_DELAY" -le 2 ] || RETRY_DELAY=2
 
 fail=0
 for node in $NODES; do
@@ -21,7 +24,7 @@ for node in $NODES; do
     if [ "$node" = "$SELF" ]; then
       out=$(python3 "$PROBE" 2>/dev/null); rc=$?
     else
-      out=$(timeout 30 "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$node" python3 - < "$PROBE" 2>/dev/null); rc=$?
+      out=$(timeout 10 "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$node" python3 - < "$PROBE" 2>/dev/null); rc=$?
     fi
     [ -n "$out" ] && break
     attempt=$((attempt + 1))

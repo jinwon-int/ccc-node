@@ -127,17 +127,17 @@ def probe(proc_root: Path, *, now: float | None = None, max_age: int = 120) -> t
         started = datetime.fromisoformat(process["started_at"].replace("Z", "+00:00")).timestamp()
     except (KeyError, AttributeError, ValueError):
         return "UNVERIFIED", "health-started"
-    if stale:
-        return _db_health(env, observed, max_age, started)
+    db_status, db_reason = _db_health(env, observed, max_age, started)
     service = data.get("service")
     state = service.get("state") if isinstance(service, dict) else None
-    if state == "available":
-        return "OK", "available"
-    if state == "degraded":
+    # The reporter ticks while Matrix transport is retrying. Its process and
+    # agent health can say available even as meta.health says network-retry.
+    # Recent transport state is therefore required for every OK verdict.
+    if not stale and state == "degraded":
         return "DEGRADED", "health-degraded"
-    if state == "unavailable":
+    if not stale and state == "unavailable":
         return "DOWN", "health-unavailable"
-    return _db_health(env, observed, max_age, started)
+    return db_status, db_reason
 
 
 def main() -> None:

@@ -69,7 +69,8 @@ class MatrixProbeTest(unittest.TestCase):
         self.process(100, channel="telegram")
         self.process(200, channel="matrix")
         self.health(200)
-        self.assertEqual(probe.probe(self.proc, now=self.now), ("OK", "available"))
+        self.db_health()
+        self.assertEqual(probe.probe(self.proc, now=self.now), ("OK", "db-ready"))
 
     def test_missing_matrix_is_down_even_when_telegram_runs(self) -> None:
         self.process(100, channel="telegram")
@@ -110,6 +111,14 @@ class MatrixProbeTest(unittest.TestCase):
         self.process(200, channel="matrix")
         self.health(200, state="degraded")
         self.assertEqual(probe.probe(self.proc, now=self.now), ("DEGRADED", "health-degraded"))
+
+    def test_fresh_process_health_cannot_mask_transport_retry(self) -> None:
+        self.process(200, channel="matrix")
+        self.health(200, state="available")
+        self.db_health("network-retry")
+        self.assertEqual(
+            probe.probe(self.proc, now=self.now), ("DEGRADED", "db-network-retry")
+        )
 
     def test_cgroup_identifies_matrix_when_channel_env_unreadable(self) -> None:
         self.process(200, channel="telegram", cgroup="/system.slice/ccc-matrix-bridge.service")
