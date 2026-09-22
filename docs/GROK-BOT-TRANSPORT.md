@@ -5,7 +5,7 @@ It addresses the existing persistent Grok Bot host, not the xAI model API.
 No Telegram poller, live provider selection, gateway settings or vendor files
 are changed by this component.
 
-The qualified host version is `5c534e9`, with `orderedReplicasV1` and
+The qualified host version is `79a3c3e` (previously `5c534e9`), with `orderedReplicasV1` and
 `sendAcceptanceV1`. A different version fails validation until its contracts
 are qualified. The public API reference is the MIT-licensed
 [`grokbot-sdk`](https://github.com/Adam91holt/grokbot-sdk/tree/c14347fa82d167b9a5984ec1baff56b2f074485a)

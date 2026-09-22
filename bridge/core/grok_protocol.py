@@ -1,4 +1,4 @@
-"""Bounded Grok Bot gateway validation, qualified against host 5c534e9.
+"""Bounded Grok Bot gateway validation, qualified against host 79a3c3e.
 
 This is the existing Bot protocol, not the xAI model API. Acceptance is not
 completion. A caller must durably retain the nonce, prompt and pre-send
@@ -14,7 +14,7 @@ import math
 import uuid
 from typing import Any
 
-HOST_VERSION = "5c534e9"
+HOST_VERSION = "79a3c3e"
 MAX_WIRE = 1024 * 1024
 MAX_PROMPT = 32768
 MAX_ENTRIES = 64
