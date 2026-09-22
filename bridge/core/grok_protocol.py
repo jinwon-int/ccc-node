@@ -1,4 +1,4 @@
-"""Bounded Grok Bot gateway validation, qualified against host 79a3c3e (baseline).
+"""Bounded Grok Bot gateway validation, qualified against host 79a3c3e (baseline; f7045c4 observed).
 
 This is the existing Bot protocol, not the xAI model API. Acceptance is not
 completion. A caller must durably retain the nonce, prompt and pre-send
@@ -219,9 +219,14 @@ def accepted_prompt(value: Any, agent_id: str, nonce: str, prompt: str) -> Accep
     if not isinstance(value, dict) or value.get("outcome") != "found":
         raise ProtocolError("acceptance_uncertain")
     record = value.get("record")
+    # Host f7045c4 (2026-09-22) stopped echoing the digest in the acceptance
+    # record (``inputDigest: ""``) while still enforcing it at send time; the
+    # echo entry's content/nonce binding in :func:`bound_reply` remains the
+    # local proof. A present-but-different digest is still a mismatch.
+    reported = record.get("inputDigest") if isinstance(record, dict) else None
     if (not isinstance(record, dict) or record.get("accountSlot") != "host"
             or record.get("agentId") != agent_id or record.get("clientNonce") != nonce
-            or record.get("inputDigest") != digest):
+            or not isinstance(reported, str) or (reported != "" and reported != digest)):
         raise ProtocolError("acceptance_binding_mismatch")
     if record.get("status") != "accepted":
         raise ProtocolError("acceptance_not_accepted")
@@ -270,7 +275,16 @@ def bound_reply(accepted: AcceptedPrompt, prompt: str, baseline: Baseline,
     texts: list[str] = []
     ids: list[str] = []
     for entry in rows[1:]:
+        if entry.get("kind") == "event":
+            # Host-side automation/system events (f7045c4: ``automation-changed``)
+            # carry no requestId and are not conversation output.
+            continue
         if entry.get("requestId") != request_id:
+            if texts:
+                # Our run already produced visible output; a later foreign
+                # input (the owner talking to the Bot in another client) ends
+                # the bound range instead of retiring a completed reply.
+                break
             raise ProtocolError("interleaved_run")
         # First slice accepts only visible text send-message records. Tool,
         # approval and unknown records need separately qualified handling.

@@ -153,6 +153,32 @@ class GrokProtocolTests(unittest.TestCase):
             with self.assertRaises(ProtocolError):
                 self.read(case)
 
+    def test_foreign_input_after_completed_reply_ends_range_and_events_are_ignored(self):
+        # Host f7045c4: the owner talks to the same Bot in another client after
+        # our run replied, and automation events sit in the tail without a
+        # requestId. Neither retires a reply that already exists.
+        later = {**self.echo, "id": "later", "clientNonce": "other", "content": "later", "requestId": "later-run"}
+        later_reply = {**self.reply, "id": "later-answer", "requestId": "later-run"}
+        event = {"id": "event-" + "a" * 64, "kind": "event", "timestampMs": 1,
+                 "event": {"type": "automation-changed", "action": "created"}}
+        result = self.read({"entries": [self.old, self.echo, event, self.reply, later, event | {"id": "event-" + "b" * 64}, later_reply]})
+        self.assertEqual(result.texts, ("synthetic answer",))
+        self.assertEqual(result.entry_ids, ("answer",))
+        with self.assertRaisesRegex(ProtocolError, "interleaved_run"):
+            self.read({"entries": [self.old, self.echo, event, later, self.reply]})
+
+    def test_acceptance_without_reported_digest_is_bound_by_echo(self):
+        blank = copy.deepcopy(self.acceptance)
+        blank["record"]["inputDigest"] = ""
+        accepted = accepted_prompt(blank, AGENT, NONCE, PROMPT)
+        self.assertEqual(accepted.digest, prompt_digest(AGENT, NONCE, PROMPT))
+        self.assertEqual(self.read().texts, ("synthetic answer",))
+        for bad in (None, 7, "0" * 64):
+            case = copy.deepcopy(self.acceptance)
+            case["record"]["inputDigest"] = bad
+            with self.subTest(bad=bad), self.assertRaisesRegex(ProtocolError, "acceptance_binding_mismatch"):
+                accepted_prompt(case, AGENT, NONCE, PROMPT)
+
     def test_echo_substitution_and_streaming_denied(self):
         for key, value in [("clientNonce", AGENT), ("content", "secret-not-for-error"),
                            ("role", "assistant"), ("kind", "other"),

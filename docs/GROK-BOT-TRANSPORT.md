@@ -6,7 +6,12 @@ No Telegram poller, live provider selection, gateway settings or vendor files
 are changed by this component.
 
 The baseline qualified host version is `79a3c3e`, with `orderedReplicasV1` and
-`sendAcceptanceV1`. The host replaces itself while idle (`idle-auto-update`,
+`sendAcceptanceV1`. Host `f7045c4` (observed 2026-09-22) additionally (a) reports
+`inputDigest: ""` in `promptAcceptanceStatus` while still enforcing the digest at
+send time — the echo entry's content/nonce binding stays the local proof — and
+(b) interleaves `kind: "event"` rows (automation events, no `requestId`) in the
+transcript tail, which the reply binding ignores; a foreign input that arrives
+*after* our run already replied ends the bound range instead of retiring it. The host replaces itself while idle (`idle-auto-update`,
 several builds a week), so a deployment widens the pin with
 `CCC_GROK_HOST_VERSIONS` — a comma-separated list of additional build ids, or
 `any` to qualify by the capability contract alone; the two capabilities above
