@@ -203,7 +203,17 @@ class GrokSession:
                     # Recheck after the transcript fetch; this is observation,
                     # not distributed CAS. Interference denies the full range.
                     health = await runtime._call("health")
-                    result = bound_reply(accepted, message, baseline, page, health)
+                    try:
+                        result = bound_reply(accepted, message, baseline, page, health)
+                    except ProtocolError as exc:
+                        if str(exc) != "reply_pending":
+                            raise
+                        # Host f7045c4 keeps ``isBusy: false`` while the Bot is
+                        # still writing; the echo (or a streaming row) is in
+                        # the tail but no complete text yet. Wait, bounded by
+                        # the surrounding TURN_SECONDS timeout.
+                        await asyncio.sleep(self.POLL_SECONDS)
+                        continue
                     return claim.complete(current, result)
 
     async def _await_acceptance(self, nonce: str, message: str) -> AcceptedPrompt:

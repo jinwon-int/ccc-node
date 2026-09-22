@@ -167,6 +167,22 @@ class GrokProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolError, "interleaved_run"):
             self.read({"entries": [self.old, self.echo, event, later, self.reply]})
 
+    def test_reply_pending_until_output_exists_and_oversize_is_distinct(self):
+        with self.assertRaisesRegex(ProtocolError, "reply_pending"):
+            self.read({"entries": [self.old]})  # echo not surfaced yet
+        with self.assertRaisesRegex(ProtocolError, "reply_pending"):
+            self.read({"entries": [self.old, self.echo]})  # echo, no output yet
+        streaming = copy.deepcopy(self.reply)
+        streaming["isStreaming"] = True
+        with self.assertRaisesRegex(ProtocolError, "reply_pending"):
+            self.read({"entries": [self.old, self.echo, streaming]})
+        big = copy.deepcopy(self.reply)
+        big["message"]["content"] = "x" * 40000
+        big2 = copy.deepcopy(big)
+        big2["id"] = "answer-2"
+        with self.assertRaisesRegex(ProtocolError, "reply_oversize"):
+            self.read({"entries": [self.old, self.echo, big, big2]})
+
     def test_acceptance_without_reported_digest_is_bound_by_echo(self):
         blank = copy.deepcopy(self.acceptance)
         blank["record"]["inputDigest"] = ""

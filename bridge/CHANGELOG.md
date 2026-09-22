@@ -1,5 +1,15 @@
 # Changelog
 
+- **Grok reply is awaited when the host reports idle too early.** Host
+  `f7045c4` keeps `health.isBusy: false` while the Bot is still writing, so the
+  bridge read the tail right after acceptance, found the echo but no output,
+  and ended the turn as "uncertain" (2026-09-22 17:43: accepted :41, reply
+  :50/:57, bridge gave up :42). `bound_reply` now raises `reply_pending` when the
+  echo is missing, has no visible output yet, or a reply row is still
+  streaming (oversize is the separate `reply_oversize`), and `GrokSession`
+  keeps polling the tail on `reply_pending` within the existing 180 s turn
+  deadline. No resend, no change to retained-state semantics.
+
 - **Grok acceptance lookup tolerates persistence lag.** Host `f7045c4` writes
   the send-acceptance record asynchronously, so the lookup issued right after
   `send` could still be `not-found` (observed 2026-09-22: record stamped 328 ms
