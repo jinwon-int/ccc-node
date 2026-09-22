@@ -281,3 +281,24 @@ entry (provider mismatch and out-of-range are refused), any other reply clears
 the list and is served normally. Claude browsing stays locked while private
 memory is `audience-scoped` (`/new` instead); Danso reports the current
 auto-resuming session; Piri accepts `/resume <session-id>`.
+
+## Automatic memory writeback
+
+Matrix and Telegram share `MemoryDistillMixin`: `/new`, provider changes,
+automatic session expiry, opted-in completed-turn checkpoints and bounded
+shutdown all enqueue the departing/current session in the channel's durable
+`distill-journal`. Matrix also accepts `/distill` for an explicit queued save.
+The same snapshot, budget-gated extraction, audience-local sink and local Wiki
+candidate workers run while the Matrix transport serves. Closing the transport
+cancels its background workers and queues only bounded shutdown receipts; it
+does not wait for an AI extraction. Private Matrix audiences retain the
+`matrix` namespace; family rooms use the existing shared policy.
+
+The current policy still applies: checkpoint thresholds default to zero; set
+`CCC_MEMORY_DISTILL_CHECKPOINT_TURNS`, `_BYTES` or `_AGE_SECONDS` to opt in.
+Extraction requires the configured provider budget. Local audience writeback
+requires `CCC_BRIDGE_MEMORY_MODE=audience-scoped`; this change neither enables
+it nor merges private memory stores. In unscoped Codex deployments, the existing
+nunchi Codex feed independently collects the common Codex transcript tree.
+`off` for `CCC_MEMORY_DISTILL_PROVIDER` or the global `distill.disabled` marker
+prevents new bridge jobs. Wiki candidates remain local pending-review records.
