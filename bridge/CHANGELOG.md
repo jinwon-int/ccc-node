@@ -1,5 +1,16 @@
 # Changelog
 
+- **Matrix frontend posts the session-start banner.** The Telegram bridge
+  replies with `◐ CCC session started (<reason>) … ◆ Model / ◆ Provider /
+  ◆ Context / ◆ Previous session` whenever a turn opens a fresh provider
+  stream (bridge restart without a resumable transcript, `/new`, automatic
+  reset). The Matrix frontend ran the same session decisions silently, so a
+  room could not tell a resumed conversation from a fresh one. `MatrixBot`
+  now posts the identical `turn_notices.session_start_notice_text` banner
+  through the room's interim path before the turn runs, naming the
+  not-resumed previous session on an automatic reset. Delivery is best
+  effort — a failed notice is logged and the turn still runs.
+
 - **Grok acceptance `pending` is transient.** Host `f7045c4` reports
   `GrokBotSendStatus.PENDING` (`status: "pending"`) right after a send before
   the record flips to `accepted`; `accepted_prompt` treated it as

@@ -276,6 +276,12 @@ def _bot(tmp_path: Path, **overrides: Any) -> tuple[MatrixBot, FakeProjectChat, 
     return bot, chat, manager
 
 
+def _resume_existing_session(bot: MatrixBot, manager: FakeSessionManager, session_id: str = "s-0") -> None:
+    """Seed a resumable session for the owner's DM so no session-start banner is posted."""
+
+    manager.rows[bot.ids.user_id(OWNER)] = {"provider": manager.provider, "session_id": session_id}
+
+
 async def _attach(bot: MatrixBot, transport_cls: type[FakeTransport] = FakeTransport) -> FakeTransport:
     """Run the lifecycle with a transport whose ``run`` hands control back to the test."""
 
@@ -418,6 +424,117 @@ async def test_auto_new_session_resets_the_row(tmp_path: Path, matrix_config: di
     await bot.run_turn(_job("x"), sink=FakeSink(), session_id=None, room_kind="direct")
     assert chat.calls[0]["new_session"] is True
     assert chat.calls[0]["session_id"] is None
+
+
+# --- session-start banner (parity with the Telegram bridge) ------------------
+
+
+@pytest.mark.anyio
+async def test_fresh_stream_posts_session_start_notice_before_the_turn(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CCC_MODEL_LABEL", raising=False)
+    bot, chat, manager = _bot(tmp_path)
+    user = bot.ids.user_id(OWNER)
+    manager.rows[user] = {"provider": "codex", "model": "gpt-5"}
+    sink = FakeSink()
+    seen: dict[str, Any] = {}
+
+    async def drive(kwargs: dict[str, Any]) -> None:
+        seen["interims_at_dispatch"] = list(sink.interims)
+
+    chat.on_process = drive
+    await bot.run_turn(_job("hello"), sink=sink, session_id=None, room_kind="direct")
+    assert len(sink.interims) == 1
+    notice = sink.interims[0]
+    assert notice.startswith(
+        "◐ CCC session started (no active session). Conversation history is on a fresh Codex stream."
+    )
+    assert "Use /resume to browse and restore a previous session." in notice
+    assert "◆ Model: gpt-5" in notice
+    assert "◆ Provider: Codex" in notice
+    assert "◆ Context: new stream" in notice
+    assert "Previous session" not in notice
+    # The banner is posted before the turn runs, as on Telegram.
+    assert seen["interims_at_dispatch"] == [notice]
+
+
+@pytest.mark.anyio
+async def test_auto_reset_notice_names_the_previous_session(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    bot, chat, manager = _bot(tmp_path)
+    user = bot.ids.user_id(OWNER)
+    manager.rows[user] = {"provider": "codex", "session_id": "5d346a06-aaaa-bbbb"}
+    manager.auto_new = True
+    sink = FakeSink()
+    await bot.run_turn(_job("x"), sink=sink, session_id=None, room_kind="direct")
+    assert len(sink.interims) == 1
+    assert "◐ CCC session started (automatic reset)." in sink.interims[0]
+    assert "◆ Previous session: 5d346a06… (not resumed)" in sink.interims[0]
+    assert chat.calls[0]["session_id"] is None and chat.calls[0]["new_session"] is True
+
+
+@pytest.mark.anyio
+async def test_new_requested_notice(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    bot, _chat, manager = _bot(tmp_path)
+    user = bot.ids.user_id(OWNER)
+    manager.rows[user] = {"provider": "codex", "new_session": True}
+    sink = FakeSink()
+    await bot.run_turn(_job("one"), sink=sink, session_id=None, room_kind="direct")
+    assert len(sink.interims) == 1
+    assert "◐ CCC session started (/new requested)." in sink.interims[0]
+
+
+@pytest.mark.anyio
+async def test_resumed_session_posts_no_session_start_notice(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    bot, chat, manager = _bot(tmp_path)
+    user = bot.ids.user_id(OWNER)
+    manager.rows[user] = {"provider": "codex", "session_id": "s-9"}
+    sink = FakeSink()
+    await bot.run_turn(_job("hi"), sink=sink, session_id=None, room_kind="direct")
+    assert chat.calls[0]["session_id"] == "s-9"
+    assert sink.interims == []
+    # The follow-up turn on the persisted session stays silent too.
+    await bot.run_turn(_job("again"), sink=sink, session_id=None, room_kind="direct")
+    assert sink.interims == []
+
+
+@pytest.mark.anyio
+async def test_session_start_notice_uses_the_formatted_room_path(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, chat, _manager = _bot(tmp_path)
+    holder = await _attach(bot, FormattedTransport)
+    chat.response = ChatResponse(content="ok", session_id="s-1")
+    sink = FakeSink()
+
+    async def body(transport: FakeTransport) -> None:
+        await bot.run_turn(_job("go"), sink=sink, session_id=None, room_kind="direct")
+
+    holder["body"] = body
+    await bot.serve()
+    transport = holder["transport"]
+    room, plain, formatted = transport.formatted[0]
+    assert room == DM_ROOM
+    assert plain.startswith("◐ CCC session started (no active session).")
+    assert "◆ Context: new stream" in plain
+    assert formatted is None  # plain banner: no markdown, so no HTML formatted_body
+    assert transport.formatted[-1] == (DM_ROOM, "ok", None)
+    assert sink.interims == []  # delivered through the transport, not the plain sink
+
+
+@pytest.mark.anyio
+async def test_session_start_notice_delivery_failure_does_not_block_the_turn(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, chat, _manager = _bot(tmp_path)
+
+    class BrokenSink(FakeSink):
+        async def interim(self, text: str) -> None:
+            raise RuntimeError("room gone")
+
+    result = await bot.run_turn(_job("go"), sink=BrokenSink(), session_id=None, room_kind="direct")
+    assert chat.calls and chat.calls[0]["user_message"] == "go"
+    assert result.text == "answer"
 
 
 @pytest.mark.anyio
@@ -587,7 +704,8 @@ def _event() -> ApprovalRequestEvent:
 
 @pytest.mark.anyio
 async def test_typing_status_and_interim_adapters(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
-    bot, chat, _manager = _bot(tmp_path)
+    bot, chat, manager = _bot(tmp_path)
+    _resume_existing_session(bot, manager)  # no session-start banner: exact interim list below
     sink = FakeSink()
     seen: dict[str, Any] = {}
 
@@ -772,7 +890,8 @@ async def test_streamed_response_passes_through(tmp_path: Path, matrix_config: d
 
 @pytest.mark.anyio
 async def test_plain_transport_gets_plain_text(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
-    bot, chat, _manager = _bot(tmp_path)
+    bot, chat, manager = _bot(tmp_path)
+    _resume_existing_session(bot, manager)
     holder = await _attach(bot)
     chat.response = ChatResponse(content="**bold**", session_id="s-1")
     sink = FakeSink()
@@ -795,7 +914,8 @@ async def test_plain_transport_gets_plain_text(tmp_path: Path, matrix_config: di
 
 @pytest.mark.anyio
 async def test_formatted_transport_gets_rendered_html(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
-    bot, chat, _manager = _bot(tmp_path)
+    bot, chat, manager = _bot(tmp_path)
+    _resume_existing_session(bot, manager)
     holder = await _attach(bot, FormattedTransport)
     chat.response = ChatResponse(content="**bold** <x>", session_id="s-1")
     sink = FakeSink()
@@ -829,7 +949,8 @@ async def test_formatted_send_failure_falls_back_to_plain(tmp_path: Path, matrix
         async def send_formatted(self, room_id: str, body: str, formatted_body: str | None) -> None:
             raise RuntimeError("encrypt failed")
 
-    bot, chat, _manager = _bot(tmp_path)
+    bot, chat, manager = _bot(tmp_path)
+    _resume_existing_session(bot, manager)
     holder = await _attach(bot, Flaky)
     chat.response = ChatResponse(content="**bold**", session_id="s-1")
     sink = FakeSink()

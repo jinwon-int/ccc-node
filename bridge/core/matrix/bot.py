@@ -59,6 +59,7 @@ from telegram_bot.core.push_notifier import (
     PushNotifier,
 )
 from telegram_bot.core.session_scope import storage_key
+from telegram_bot.core.turn_notices import session_start_notice_text, session_start_reason
 from telegram_bot.core.turn_watchdog import DEFAULT_NOTIFY_MINUTES, TurnAgeWatchdog
 from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE
@@ -1024,8 +1025,15 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return str(session_id)
         return None
 
-    async def _resolve_turn_session(self, key: Any, *, user_id: int, chat_id: int) -> tuple[dict[str, Any], str | None, bool]:
-        """Return ``(session, session_id, new_session)`` the way the Telegram path does."""
+    async def _resolve_turn_session(
+        self, key: Any, *, user_id: int, chat_id: int
+    ) -> tuple[dict[str, Any], str | None, bool, str | None, bool]:
+        """Return ``(session, session_id, new_session, stale_session_id, auto_new_session)``.
+
+        Same decisions as the Telegram path (``bot.py``). ``stale_session_id`` is
+        the persisted id *before* an automatic reset clears it, so the
+        session-start banner can name the session that was not resumed.
+        """
 
         previous = await self._session_manager.get_session(key)
         if previous.get("provider", "claude") != self._active_provider():
@@ -1033,6 +1041,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                 previous, DistillTrigger.PROVIDER_SWITCH, user_id=user_id, chat_id=chat_id,
             )
         session, _switched = await self._session_manager.align_active_provider(key)
+        stale_session_id = session.get("session_id") or None
         new_session = False
         if session.get("new_session"):
             new_session = bool(
@@ -1042,7 +1051,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             )
             session["new_session"] = False
         now = self._now()
-        if await self._session_manager.should_start_new_session(key, now=now):
+        auto_new_session = bool(await self._session_manager.should_start_new_session(key, now=now))
+        if auto_new_session:
             await self._enqueue_previous_codex_session(
                 session, DistillTrigger.AUTO_NEW, user_id=user_id, chat_id=chat_id,
             )
@@ -1053,7 +1063,50 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             self._runtime_active_sessions.discard(key)
             new_session = True
         await self._session_manager.set_last_user_message_at(key, now)
-        return session, self._effective_session_id(key, session), new_session
+        return (
+            session,
+            self._effective_session_id(key, session),
+            new_session,
+            stale_session_id,
+            auto_new_session,
+        )
+
+    async def _post_session_start_notice(
+        self,
+        *,
+        session: Mapping[str, Any],
+        new_session: bool,
+        auto_new_session: bool,
+        stale_session_id: str | None,
+        room_id: str,
+        sink: TurnSink,
+    ) -> None:
+        """Post the same session-start banner the Telegram bridge sends.
+
+        Telegram replies with ``session_start_notice_text`` whenever a turn
+        starts on a fresh provider stream (bridge restart without a resumable
+        transcript, ``/new``, automatic reset). The Matrix frontend never did,
+        so a room could not tell a resumed conversation from a fresh one. Best
+        effort: a delivery failure is logged and the turn still runs.
+        """
+
+        provider = str(session.get("provider") or self._active_provider())
+        notice = session_start_notice_text(
+            reason=session_start_reason(
+                new_session=new_session,
+                auto_new_session=auto_new_session,
+                stale_session_id=stale_session_id,
+            ),
+            model=session.get("model"),
+            provider=provider,
+            previous_session_id=stale_session_id,
+        )
+        try:
+            await self._make_interim_callback(sink, room_id)(notice)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Matrix session-start notice delivery failed", exc_info=True)
 
     async def _save_session_id(
         self, key: Any, response: ChatResponse, *, user_id: int, chat_id: int
@@ -1091,7 +1144,18 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         self, body: str, *, user_id: int, chat_id: int, room_id: str, sink: TurnSink, turn_marker: str | None = None
     ) -> Any:
         key = self._conversation_key(user_id, chat_id)
-        session, session_id, new_session = await self._resolve_turn_session(key, user_id=user_id, chat_id=chat_id)
+        session, session_id, new_session, stale_session_id, auto_new_session = (
+            await self._resolve_turn_session(key, user_id=user_id, chat_id=chat_id)
+        )
+        if session_id is None:
+            await self._post_session_start_notice(
+                session=session,
+                new_session=new_session,
+                auto_new_session=auto_new_session,
+                stale_session_id=stale_session_id,
+                room_id=room_id,
+                sink=sink,
+            )
         response = await self._dispatch_turn(
             body, key=key, user_id=user_id, chat_id=chat_id, session=session,
             session_id=session_id, new_session=new_session, sink=sink, turn_marker=turn_marker,
@@ -1552,7 +1616,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return _turn_result("❌ Only the owner may resume a stored task.", None)
         key = self._conversation_key(user_id, chat_id)
         generation = self._task_resume_generation(key)
-        session, session_id, new_session = await self._resolve_turn_session(key, user_id=user_id, chat_id=chat_id)
+        session, session_id, new_session, _stale, _auto = await self._resolve_turn_session(
+            key, user_id=user_id, chat_id=chat_id
+        )
         if new_session or not session_id or session.get("provider", "claude") != "danso":
             return _turn_result(
                 "📭 No paused Danso long task is stored for this conversation. "
