@@ -160,3 +160,48 @@ async def test_explicit_distill_is_queued_once_per_completed_turn(tmp_path, matr
         result = await bot.run_turn(_job("/distill"), sink=FakeSink(), session_id=None, room_kind="direct")
         assert "queued" in result.text
     assert [job.trigger for job in journal.list_jobs()] == [DistillTrigger.EXPLICIT]
+
+
+@pytest.mark.anyio
+async def test_model_provider_change_queues_previous_thread_before_reset(tmp_path, matrix_config):
+    bot, _, manager, journal = wired_bot(tmp_path, bridge_memory_mode="audience-scoped")
+    user_id, chat_id, _ = bot._job_identity(_job("/model gpt-5"), "direct")
+    key = bot._conversation_key(user_id, chat_id)
+    manager.rows[key] = {"provider": "claude", "session_id": "previous-claude"}
+    await bot.run_turn(_job("/model gpt-5"), sink=FakeSink(), session_id=None, room_kind="direct")
+    (job,) = journal.list_jobs()
+    assert (job.thread_id, job.provider, job.trigger) == ("previous-claude", "claude", DistillTrigger.PROVIDER_SWITCH)
+    assert job.memory_scope == resolve_memory_audience(bot._settings, user_id=user_id, chat_id=chat_id, route="matrix").scope
+    assert manager._row(key)["session_id"] is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("provider,command", [("codex", "1"), ("piri", "/resume selected")])
+async def test_resume_queues_departing_thread_only_when_selection_changes(tmp_path, matrix_config, provider, command):
+    bot, _, manager, journal = wired_bot(tmp_path, agent_provider=provider)
+    user_id, chat_id, _ = bot._job_identity(_job(command), "direct")
+    key = bot._conversation_key(user_id, chat_id)
+    manager.rows[key] = {"provider": provider, "session_id": "previous", "resume_list": [["selected", "selected", provider]]}
+    await bot.run_turn(_job(command), sink=FakeSink(), session_id=None, room_kind="direct")
+    assert manager._row(key)["session_id"] == "selected"
+    (job,) = journal.list_jobs()
+    assert job.thread_id == "previous" and job.trigger is DistillTrigger.EXPLICIT
+    manager._row(key)["resume_list"] = [["selected", "selected", provider]]
+    await bot.run_turn(_job(command), sink=FakeSink(), session_id=None, room_kind="direct")
+    assert len(journal.list_jobs()) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("success", [True, False])
+async def test_skills_preserves_previous_thread_and_checkpoints_only_success(tmp_path, matrix_config, success):
+    bot, chat, manager, journal = wired_bot(tmp_path, memory_distill_checkpoint_turns=1)
+    user_id, chat_id, _ = bot._job_identity(_job("/skills"), "direct")
+    key = bot._conversation_key(user_id, chat_id)
+    manager.rows[key] = {"provider": "codex", "session_id": "previous"}
+    chat.response.success = success
+    await bot.run_turn(_job("/skills", event_id="$skills"), sink=FakeSink(), session_id=None, room_kind="direct")
+    expected = {("previous", DistillTrigger.NEW_COMMAND)}
+    if success:
+        expected.add(("s-new", DistillTrigger.CHECKPOINT))
+    assert {(job.thread_id, job.trigger) for job in journal.list_jobs()} == expected
+    assert manager._row(key)["session_id"] == ("s-new" if success else "previous")

@@ -288,6 +288,9 @@ Matrix and Telegram share `MemoryDistillMixin`: `/new`, provider changes,
 automatic session expiry, opted-in completed-turn checkpoints and bounded
 shutdown all enqueue the departing/current session in the channel's durable
 `distill-journal`. Matrix also accepts `/distill` for an explicit queued save.
+Matrix queues the departing session before `/model` changes its provider,
+`/resume` selects another session, or `/skills` starts a new one. Successful
+`/skills` responses participate in the same opted-in checkpoint policy.
 The same snapshot, budget-gated extraction, audience-local sink and local Wiki
 candidate workers run while the Matrix transport serves. Closing the transport
 cancels its background workers and queues only bounded shutdown receipts; it

@@ -927,7 +927,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                 return await self._run_self_job(body, user_id=user_id, chat_id=chat_id)
             command, args = self._parse_command(body)
             if command == "skills":
-                return await self._cmd_skills(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
+                return await self._cmd_skills(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink, turn_marker=str(job.get("event_id") or ""))
             if command == "task_resume":
                 return await self._cmd_task_resume(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
             if command is not None:
@@ -1400,7 +1400,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return (f"ℹ️ Current Danso session auto-resumes: {current}" if current
                     else "📭 No Danso session yet. Send a message to start one.")
         if provider == "piri":
-            return await self._resume_piri(args, key=key, session=session)
+            return await self._resume_piri(args, key=key, session=session, user_id=user_id, chat_id=chat_id)
         if provider in {"codex", "crush"}:
             return await self._resume_runtime_list(key=key, provider=provider)
         sessions = await asyncio.to_thread(self._project_chat.list_sessions, limit=10)
@@ -1418,13 +1418,18 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         lines.append("Reply with a number to switch to that session:")
         return "\n".join(lines).strip()
 
-    async def _resume_piri(self, args: list[str], *, key: Any, session: Mapping[str, Any]) -> str:
+    async def _resume_piri(self, args: list[str], *, key: Any, session: Mapping[str, Any], user_id: int, chat_id: int) -> str:
         if len(args) > 1:
             return "Usage: /resume <piri-session-id>"
         if args:
             requested = args[0].strip()
             if len(requested) > 128 or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", requested) is None:
                 return "❌ Invalid Piri session id."
+            if requested != session.get("session_id"):
+                await self._enqueue_previous_codex_session(
+                    dict(session), DistillTrigger.EXPLICIT, user_id=user_id, chat_id=chat_id,
+                    discriminator=self._shutdown_distill_discriminator(dict(session)),
+                )
             await self._session_manager.patch_session(
                 key, updates={"provider": "piri", "session_id": requested, "new_session": False},
                 remove_fields={"resume_list"},
@@ -1492,6 +1497,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         active = self._active_provider()
         if provider != active:
             return f"❌ Provider mismatch: selected session is {provider}, but the active provider is {active}."
+        if sid != session.get("session_id"):
+            await self._enqueue_previous_codex_session(
+                session, DistillTrigger.EXPLICIT, user_id=user_id, chat_id=chat_id,
+                discriminator=self._shutdown_distill_discriminator(session),
+            )
         await self._session_manager.patch_session(
             key, updates={"provider": provider, "session_id": sid, "new_session": False},
             remove_fields={"resume_list"},
@@ -1689,8 +1699,12 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                 reply = f"{reply}\n\n{cost_text}"
         return reply
 
-    async def _cmd_skills(self, *, user_id: int, chat_id: int, room_id: str, sink: TurnSink) -> Any:
+    async def _cmd_skills(self, *, user_id: int, chat_id: int, room_id: str, sink: TurnSink, turn_marker: str | None = None) -> Any:
         key = self._conversation_key(user_id, chat_id)
+        session = await self._session_manager.get_session(key)
+        await self._enqueue_previous_codex_session(
+            session, DistillTrigger.NEW_COMMAND, user_id=user_id, chat_id=chat_id,
+        )
         response = await self._project_chat.process_message(
             user_message=_SKILLS_PROMPT,
             user_id=user_id,
@@ -1707,6 +1721,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             usage_mode=MODE_INTERACTIVE,
         )
         await self._save_session_id(key, response, user_id=user_id, chat_id=chat_id)
+        if getattr(response, "success", True):
+            await self._record_codex_checkpoint(
+                key, response, request_text=_SKILLS_PROMPT, turn_marker=turn_marker,
+                user_id=user_id, chat_id=chat_id,
+            )
         return await self._finish(response, room_id)
 
     @staticmethod
@@ -1742,7 +1761,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         session = await self._session_manager.get_session(key)
         provider = self._active_provider()
         if args:
-            return await self._select_model(key, session, args[0])
+            return await self._select_model(key, session, args[0], user_id=user_id, chat_id=chat_id)
         if provider in _RUNTIME_MODEL_PROVIDERS:
             return await self._list_runtime_models_text(session)
         current = self._get_real_model(session)
@@ -1754,7 +1773,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             lines.append(f"• {name} — {label}" + (" (current)" if name == current else ""))
         return "\n".join(lines)
 
-    async def _select_model(self, key: Any, session: Mapping[str, Any], name: str) -> str:
+    async def _select_model(self, key: Any, session: Mapping[str, Any], name: str, *, user_id: int, chat_id: int) -> str:
         provider = self._active_provider()
         if provider == "danso" and name != getattr(self._settings, "danso_model", None):
             return "❌ Danso uses the model configured by the operator. Use /model to view it."
@@ -1764,6 +1783,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         remove: set[str] = set()
         reset_note = None
         if session.get("provider") != provider:
+            await self._enqueue_previous_codex_session(
+                dict(session), DistillTrigger.PROVIDER_SWITCH, user_id=user_id, chat_id=chat_id,
+            )
             updates.update(session_id=None, new_session=True)
             remove.add("effort")
         elif provider in _RUNTIME_MODEL_PROVIDERS:

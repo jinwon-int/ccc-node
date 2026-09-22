@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # nunchi codex-feed extractor (#816) — Codex-provider nodes without Claude
-# distill. Extracts user/agent messages from NEW codex rollout jsonl files,
+# distill. Extracts user/agent messages from new or growing rollout jsonl files,
 # asks codex exec for distill-style facts, and ingests them into the nunchi
-# peer_facts DB. Idempotent via seen-file; bounded per run. Runs from cron.
+# peer_facts DB. Idempotent via fingerprint receipts; bounded per run. Runs from cron.
 # NOTE: unlike ingest-cron.sh this costs one codex exec call per new file.
 # No-op unless nunchi is enabled (state/nunchi.mode=on or CCC_NUNCHI_MODE=on).
 set -uo pipefail
-umask 077
 umask 077
 # Reconsider receipts written by the event-only reader.
 export NUNCHI_FEED_READER_VERSION=2

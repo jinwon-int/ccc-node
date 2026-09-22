@@ -97,6 +97,22 @@ print(json.dumps({'honcho':[{'kind':'fact','text':'A synthetic fact','subject':'
         self.assertEqual(self.stored(), 2)
         self.assertEqual(stat.S_IMODE((self.home / 'codex-receipts.jsonl').stat().st_mode), 0o600)
 
+    def test_malformed_records_do_not_discard_valid_conversation(self):
+        bad = [None, [], {'type': 'event_msg', 'payload': 'bad-shape'},
+               {'type': 'response_item', 'payload': ['bad']},
+               {'type': 'response_item', 'payload': {'type': 'message', 'role': []}},
+               {'type': 'event_msg', 'payload': {'type': [], 'message': 'bad'}},
+               {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user', 'content': 42}},
+               {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
+                'content': [{'type': [], 'text': 'bad'}]}}]
+        good = 'Valid durable conversation ' * 20
+        self.source.write_text('\n'.join(json.dumps(row) for row in [message(good), *bad, message('valid answer', 'assistant')]))
+        self.assertEqual(reader.read('codex', self.source, self.sessions), 'USER: ' + good + '\nAGENT: valid answer')
+        self.run_feed()
+        self.assertEqual(self.stored(), 1)
+        row = json.loads((self.home / 'codex-receipts.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(row['status'], 'stored')
+
     def test_legacy_seen_does_not_hide_recent_native_transcript(self):
         (self.home / 'codex-seen').write_text(str(self.source) + '\n')
         self.run_feed()

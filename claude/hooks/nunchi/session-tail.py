@@ -36,20 +36,25 @@ def read_tail(provider, path, root):
 def text_blocks(content, allowed):
     if isinstance(content, str):
         return content
+    if not isinstance(content, list):
+        return ""
     return " ".join(
         b.get("text", "")
         for b in (content or [])
-        if isinstance(b, dict) and b.get("type") in allowed and isinstance(b.get("text"), str)
+        if isinstance(b, dict) and isinstance(b.get("type"), str)
+        and b["type"] in allowed and isinstance(b.get("text"), str)
     )
 
 
 def codex_message(d):
     item = d.get("payload") or {}
+    if not isinstance(item, dict):
+        return None, "", False
     if d.get("type") == "response_item" and item.get("type") == "message":
-        role = {"user": "USER", "assistant": "AGENT"}.get(item.get("role"))
+        role = {"user": "USER", "assistant": "AGENT"}.get(str(item.get("role")))
         return role, text_blocks(item.get("content"), {"input_text", "output_text"}), True
     if d.get("type") == "event_msg":
-        role = {"user_message": "USER", "agent_message": "AGENT"}.get(item.get("type"))
+        role = {"user_message": "USER", "agent_message": "AGENT"}.get(str(item.get("type")))
         return role, item.get("message", ""), False
     return None, "", False
 
@@ -77,11 +82,13 @@ def read(provider, path, root):
             if d.get("type") != "message":
                 continue
             item = d.get("message") or {}
-            role = {"user": "USER", "assistant": "AGENT"}.get(item.get("role"))
+            if not isinstance(item, dict):
+                continue
+            role = {"user": "USER", "assistant": "AGENT"}.get(str(item.get("role")))
             text = text_blocks(item.get("content"), {"text"})
         else:
             raise ValueError("provider")
-        if role and isinstance(text, str):
+        if role and isinstance(text, str) and text.strip():
             (messages if modern else legacy).append(role + ": " + text[:800])
     # Older Codex duplicates messages as event_msg; prefer the native message
     # representation when present, never tool results or hidden reasoning.
