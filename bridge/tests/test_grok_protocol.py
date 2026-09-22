@@ -172,11 +172,14 @@ class GrokProtocolTests(unittest.TestCase):
             self.read({"entries": [self.old]})  # echo not surfaced yet
         with self.assertRaisesRegex(ProtocolError, "reply_pending"):
             self.read({"entries": [self.old, self.echo]})  # echo, no output yet
-        streaming = copy.deepcopy(self.reply); streaming["isStreaming"] = True
+        streaming = copy.deepcopy(self.reply)
+        streaming["isStreaming"] = True
         with self.assertRaisesRegex(ProtocolError, "reply_pending"):
             self.read({"entries": [self.old, self.echo, streaming]})
-        big = copy.deepcopy(self.reply); big["message"]["content"] = "x" * 40000
-        big2 = copy.deepcopy(big); big2["id"] = "answer-2"
+        big = copy.deepcopy(self.reply)
+        big["message"]["content"] = "x" * 40000
+        big2 = copy.deepcopy(big)
+        big2["id"] = "answer-2"
         with self.assertRaisesRegex(ProtocolError, "reply_oversize"):
             self.read({"entries": [self.old, self.echo, big, big2]})
 

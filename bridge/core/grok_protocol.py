@@ -240,6 +240,37 @@ class BoundReply:
     texts: tuple[str, ...]
 
 
+def _reply_rows(rows: list[dict[str, Any]], request_id: str) -> tuple[list[str], list[str]]:
+    """Collect our run's visible text rows after the echo; see :func:`bound_reply`."""
+    texts: list[str] = []
+    ids: list[str] = []
+    for entry in rows:
+        if entry.get("kind") == "event":
+            # Host-side automation/system events (f7045c4: ``automation-changed``)
+            # carry no requestId and are not conversation output.
+            continue
+        if entry.get("requestId") != request_id:
+            if texts:
+                # Our run already produced visible output; a later foreign
+                # input (the owner talking to the Bot in another client) ends
+                # the bound range instead of retiring a completed reply.
+                break
+            raise ProtocolError("interleaved_run")
+        # First slice accepts only visible text send-message records. Tool,
+        # approval and unknown records need separately qualified handling.
+        message = entry.get("message")
+        if entry.get("kind") == "send-message" and entry.get("isStreaming") is True:
+            raise ProtocolError("reply_pending")  # still being generated
+        if (entry.get("kind") != "send-message" or not isinstance(message, dict)
+                or set(message) != {"type", "content"} or message.get("type") != "text"
+                or entry.get("author") is not None
+                or ("isStreaming" in entry and entry["isStreaming"] is not False)):
+            raise ProtocolError("unsupported_reply_record")
+        texts.append(_text(message.get("content"), MAX_REPLY, "invalid_reply_text"))
+        ids.append(entry["id"])
+    return ids, texts
+
+
 def bound_reply(accepted: AcceptedPrompt, prompt: str, baseline: Baseline,
                 page: Any, health: Any) -> BoundReply:
     """Validate a complete, bounded post-baseline range and an idle observation.
@@ -276,33 +307,7 @@ def bound_reply(accepted: AcceptedPrompt, prompt: str, baseline: Baseline,
         raise ProtocolError("reused_request_id")
     if not rows or rows[0]["id"] != accepted.echo_id:
         raise ProtocolError("interleaved_input")
-    texts: list[str] = []
-    ids: list[str] = []
-    for entry in rows[1:]:
-        if entry.get("kind") == "event":
-            # Host-side automation/system events (f7045c4: ``automation-changed``)
-            # carry no requestId and are not conversation output.
-            continue
-        if entry.get("requestId") != request_id:
-            if texts:
-                # Our run already produced visible output; a later foreign
-                # input (the owner talking to the Bot in another client) ends
-                # the bound range instead of retiring a completed reply.
-                break
-            raise ProtocolError("interleaved_run")
-        # First slice accepts only visible text send-message records. Tool,
-        # approval and unknown records need separately qualified handling.
-        message = entry.get("message")
-        if entry.get("kind") == "send-message" and entry.get("isStreaming") is True:
-            raise ProtocolError("reply_pending")  # still being generated
-        if (entry.get("kind") != "send-message" or not isinstance(message, dict)
-                or set(message) != {"type", "content"} or message.get("type") != "text"
-                or entry.get("author") is not None
-                or ("isStreaming" in entry and entry["isStreaming"] is not False)):
-            raise ProtocolError("unsupported_reply_record")
-        text = _text(message.get("content"), MAX_REPLY, "invalid_reply_text")
-        texts.append(text)
-        ids.append(entry["id"])
+    ids, texts = _reply_rows(rows[1:], request_id)
     if not texts:
         # Echo is there but no visible output yet. Host f7045c4 reports
         # ``isBusy: false`` while the Bot is still generating, so the caller
