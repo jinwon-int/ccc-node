@@ -34,6 +34,7 @@ class FakeGrokHost:
         self.acceptance_lag = 0  # acceptance lookups that still report not-found after a send
         self.reply_delay_tails = 0  # tail reads that return the echo but no reply yet (host stays idle)
         self.send_response = {"accepted": True}
+        self.acceptance_pending = 0  # lookups that report status "pending" before "accepted"
         self.after_reply = []  # extra rows appended after each reply (foreign input / events)
 
     async def call(self, operation, arguments=None):
@@ -73,6 +74,10 @@ class FakeGrokHost:
             if self.acceptance_lag > 0 and arguments["nonce"] in self.acceptances:
                 self.acceptance_lag -= 1
                 return {"outcome": "not-found"}
+            if self.acceptance_pending > 0 and arguments["nonce"] in self.acceptances:
+                self.acceptance_pending -= 1
+                record = dict(self.acceptances[arguments["nonce"]]["record"], status="pending", echoEntryId=None)
+                return {"outcome": "found", "record": record}
             return self.acceptances.get(arguments["nonce"], {"outcome": "not-found"})
         raise AssertionError("unqualified RPC")
 
@@ -173,6 +178,28 @@ class GrokRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state()["stage"], "complete")
         self.assertEqual(len(self.host.sends), 1)
         self.assertGreaterEqual(self.host.calls.count("tail"), 4)
+
+    async def test_acceptance_pending_status_is_polled_until_accepted(self):
+        self.host.acceptance_pending = 3
+        with patch.object(GrokSession, "ACCEPTANCE_POLL_SECONDS", 0.01):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-2:], ["result", "completion"])
+        self.assertEqual(self.state()["stage"], "complete")
+        self.assertEqual(len(self.host.sends), 1)
+
+    async def test_acceptance_rejected_status_fails_at_once(self):
+        original = self.host.call
+        async def rejecting(operation, arguments=None):
+            result = await original(operation, arguments)
+            if operation == "acceptance" and result.get("outcome") == "found":
+                result["record"] = dict(result["record"], status="rejected")
+            return result
+        self.host.call = rejecting
+        with patch.object(GrokSession, "ACCEPTANCE_SECONDS", 5.0), patch.object(GrokSession, "ACCEPTANCE_POLL_SECONDS", 0.01):
+            events = await self.collect("one")
+        self.assertEqual(self.kinds(events)[-1], "error")
+        self.assertEqual(self.state()["stage"], "attempted")
+        self.assertLessEqual(self.host.calls.count("acceptance"), 2)
 
     async def test_acceptance_persistence_lag_is_polled_not_uncertain(self):
         self.host.acceptance_lag = 3

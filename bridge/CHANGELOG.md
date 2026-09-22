@@ -1,5 +1,13 @@
 # Changelog
 
+- **Grok acceptance `pending` is transient.** Host `f7045c4` reports
+  `GrokBotSendStatus.PENDING` (`status: "pending"`) right after a send before
+  the record flips to `accepted`; `accepted_prompt` treated it as
+  `acceptance_not_accepted` and the turn ended "uncertain" at once. The bounded
+  acceptance poll now also waits through `pending` (rejected/mismatched stays
+  final). `GrokSession.send_turn` logs the categorical ProtocolError code before
+  yielding the generic `grok_outcome_unknown` error event.
+
 - **Grok send response settled by the acceptance record.** On host `f7045c4`
   `sendPrompt` no longer answers `{"accepted": true}` although the prompt is
   accepted and run, so every fresh turn ended as `grok_send_uncertain` right
