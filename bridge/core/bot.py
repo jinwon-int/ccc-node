@@ -1,10 +1,8 @@
 # ruff: noqa: E402
 import asyncio
-import hashlib
 import logging
 import re
 import time
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, cast
 from datetime import datetime, timezone
 
@@ -40,7 +38,8 @@ from telegram_bot.core.turn_notices import (
     session_start_reason,
 )
 from telegram_bot.core.session_scope import legacy_storage_keys, storage_key
-from telegram_bot.memory.distill_types import DistillJob, DistillTrigger
+from telegram_bot.memory.distill_types import DistillTrigger
+from telegram_bot.core.memory_distill import _DistillCheckpointProgress
 from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.transcription import (
     VolcengineFileFastTranscriber,
@@ -53,14 +52,6 @@ logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 
-@dataclass(slots=True)
-class _DistillCheckpointProgress:
-    thread_id: str
-    started_at: float
-    turns: int = 0
-    byte_count: int = 0
-    last_turn_marker: str | None = None
-    pending_discriminator: str | None = None
 
 
 from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control  # noqa: F401
@@ -168,8 +159,6 @@ class TelegramBot(
     _STALE_AUDIO_SECONDS = 24 * 60 * 60
     _WATCHDOG_INTERVAL = 60
     _NETWORK_FAILURE_THRESHOLD = 300  # 5 min of consecutive failures → force exit
-    _SHUTDOWN_DISTILL_MAX_SESSIONS = 128
-    _SHUTDOWN_DISTILL_TIMEOUT_SECONDS = 2.0
 
 
     def _conversation_key(self, user_id: int, chat_id: Optional[int] = None) -> Any:
@@ -263,84 +252,6 @@ class TelegramBot(
         if provider not in {"claude", "codex", "crush", "piri", "danso"}:
             raise ValueError(f"Unsupported agent provider: {provider!r}")
         return provider
-
-    async def _enqueue_previous_codex_session(
-        self,
-        session: dict[str, Any],
-        trigger: DistillTrigger,
-        *,
-        user_id: int | None = None,
-        chat_id: int | None = None,
-        discriminator: str | None = None,
-    ) -> DistillJob | None:
-        if getattr(self._config, "memory_distill_provider", "auto") == "off":
-            return None
-        from telegram_bot.memory.distill_guard import global_distill_disabled
-
-        if global_distill_disabled():
-            if not getattr(self, "_distill_global_disabled_warned", False):
-                self._distill_global_disabled_warned = True
-                logger.warning(
-                    "Distill enqueue skipped: global disable marker is present"
-                )
-            return None
-        provider = str(session.get("provider", "claude")).strip().lower()
-        if self._active_provider() == "danso" and (
-            provider != "danso" or getattr(self._config, "bridge_memory_mode", "off") != "audience-scoped"
-        ):
-            return None
-        thread_id = session.get("session_id")
-        if provider not in {"claude", "codex", "piri", "danso"} or not isinstance(thread_id, str) or not thread_id:
-            return None
-        journal = getattr(self, "_distill_journal", None)
-        if journal is None:
-            return None
-        memory_audience = None
-        memory_scope = None
-        if user_id is not None and chat_id is not None:
-            from telegram_bot.core.memory_audience import resolve_memory_audience
-
-            audience = resolve_memory_audience(
-                self._config,
-                user_id=user_id,
-                chat_id=chat_id,
-            )
-            if audience is not None:
-                memory_audience = audience.kind
-                memory_scope = audience.scope
-        else:
-            stored_audience = session.get("distill_memory_audience")
-            stored_scope = session.get("distill_memory_scope")
-            if isinstance(stored_audience, str) and isinstance(stored_scope, str):
-                memory_audience = stored_audience
-                memory_scope = stored_scope
-        if memory_audience is None and not getattr(
-            self, "_local_sink_unroutable_warned", False
-        ):
-            # The journal marks a routeless job UNROUTABLE with no error_code and
-            # no log line, so a node whose memory mode yields no audience loses the
-            # local lane (resume.md, memory facts) silently. The wiki sink is
-            # unaffected. Warn once per process so the gap is observable.
-            self._local_sink_unroutable_warned = True
-            logger.warning(
-                "distill local sink unroutable: bridge_memory_mode=%r resolves no memory "
-                "audience, so resume.md and local memory facts will not be written "
-                "(wiki sink unaffected)",
-                getattr(self._config, "bridge_memory_mode", None),
-            )
-        enqueue_kwargs = {
-            "provider": provider,
-            "thread_id": thread_id,
-            "trigger": trigger,
-            "memory_audience": memory_audience,
-            "memory_scope": memory_scope,
-        }
-        if discriminator is not None:
-            enqueue_kwargs["discriminator"] = discriminator
-        return await asyncio.to_thread(
-            journal.enqueue_once,
-            **enqueue_kwargs,
-        )
 
     async def _align_active_provider(
         self,
@@ -532,217 +443,6 @@ class TelegramBot(
                         self._active_provider().title(),
                         type(error).__name__,
                     )
-
-    def _distill_checkpoint_gates(self) -> tuple[int, int, int]:
-        generic = (
-            int(getattr(self._config, "memory_distill_checkpoint_turns", 0) or 0),
-            int(getattr(self._config, "memory_distill_checkpoint_bytes", 0) or 0),
-            int(getattr(self._config, "memory_distill_checkpoint_age_seconds", 0) or 0),
-        )
-        if any(generic):
-            return generic
-        return (
-            int(getattr(self._config, "codex_distill_checkpoint_turns", 0) or 0),
-            int(getattr(self._config, "codex_distill_checkpoint_bytes", 0) or 0),
-            int(getattr(self._config, "codex_distill_checkpoint_age_seconds", 0) or 0),
-        )
-
-    @staticmethod
-    def _distill_checkpoint_reached(
-        progress: _DistillCheckpointProgress,
-        gates: tuple[int, int, int],
-        *,
-        now: float,
-    ) -> bool:
-        turn_gate, byte_gate, age_gate = gates
-        elapsed = max(0.0, now - progress.started_at)
-        return (
-            (turn_gate > 0 and progress.turns >= turn_gate)
-            or (byte_gate > 0 and progress.byte_count >= byte_gate)
-            or (age_gate > 0 and elapsed >= age_gate)
-        )
-
-    @staticmethod
-    def _update_distill_checkpoint_progress(
-        progress_by_key: Dict[Any, _DistillCheckpointProgress],
-        session_key: Any,
-        *,
-        thread_id: str,
-        marker_hash: str,
-        turn_bytes: int,
-        now: float,
-    ) -> _DistillCheckpointProgress:
-        progress = progress_by_key.get(session_key)
-        if progress is None or progress.thread_id != thread_id:
-            progress = _DistillCheckpointProgress(thread_id, now)
-            progress_by_key[session_key] = progress
-        if progress.last_turn_marker != marker_hash:
-            progress.turns += 1
-            progress.byte_count += turn_bytes
-            progress.last_turn_marker = marker_hash
-        return progress
-
-    async def _record_codex_checkpoint(
-        self,
-        session_key: Any,
-        response: ChatResponse,
-        *,
-        request_text: str,
-        turn_marker: str | None,
-        user_id: int | None,
-        chat_id: int | None,
-    ) -> None:
-        """Count completed turns and durably enqueue the first reached gate."""
-        active_provider = self._active_provider()
-        if active_provider not in {"claude", "codex", "piri", "danso"}:
-            return
-        if getattr(self, "_distill_journal", None) is None:
-            return
-        gates = self._distill_checkpoint_gates()
-        if all(gate <= 0 for gate in gates):
-            return
-        thread_id = response.session_id
-        if not isinstance(thread_id, str) or not thread_id:
-            return
-
-        marker = turn_marker
-        if not isinstance(marker, str) or not marker:
-            content = response.content if isinstance(response.content, str) else ""
-            marker = hashlib.sha256(
-                f"{request_text}\0{content}".encode("utf-8")
-            ).hexdigest()
-        marker_hash = hashlib.sha256(marker.encode("utf-8")).hexdigest()
-
-        progress_by_key = getattr(self, "_distill_checkpoint_progress", None)
-        if progress_by_key is None:
-            progress_by_key = self._distill_checkpoint_progress = {}
-        locks = getattr(self, "_distill_checkpoint_locks", None)
-        if locks is None:
-            locks = self._distill_checkpoint_locks = {}
-        lock = locks.setdefault(session_key, asyncio.Lock())
-
-        async with lock:
-            now = float(self._clock.time())
-            response_text = (
-                response.content if isinstance(response.content, str) else ""
-            )
-            progress = self._update_distill_checkpoint_progress(
-                progress_by_key,
-                session_key,
-                thread_id=thread_id,
-                marker_hash=marker_hash,
-                turn_bytes=(
-                    len(request_text.encode("utf-8"))
-                    + len(response_text.encode("utf-8"))
-                ),
-                now=now,
-            )
-
-            if progress.pending_discriminator is None:
-                if not self._distill_checkpoint_reached(
-                    progress,
-                    gates,
-                    now=now,
-                ):
-                    return
-                digest = hashlib.sha256(
-                    f"{thread_id}\0{marker_hash}".encode("utf-8")
-                ).hexdigest()
-                progress.pending_discriminator = f"checkpoint-turn-v1-{digest}"
-
-            try:
-                session = await self._session_manager.get_session(session_key)
-                if (
-                    session.get("provider") != active_provider
-                    or session.get("session_id") != thread_id
-                ):
-                    progress_by_key.pop(session_key, None)
-                    return
-                job = await self._enqueue_previous_codex_session(
-                    session,
-                    DistillTrigger.CHECKPOINT,
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    discriminator=progress.pending_discriminator,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                logger.warning(
-                    "%s checkpoint journal enqueue failed error=%s",
-                    active_provider.title(),
-                    type(error).__name__,
-                )
-                return
-
-            if job is not None:
-                progress_by_key[session_key] = _DistillCheckpointProgress(
-                    thread_id=thread_id,
-                    started_at=now,
-                    last_turn_marker=marker_hash,
-                )
-
-    @staticmethod
-    def _shutdown_distill_discriminator(session: dict[str, Any]) -> str:
-        marker = session.get("last_user_message_at")
-        thread_id = session.get("session_id")
-        digest = hashlib.sha256(
-            f"{thread_id}\0{marker or 'unknown-turn'}".encode("utf-8")
-        ).hexdigest()
-        return f"shutdown-turn-v1-{digest}"
-
-    async def _enqueue_shutdown_distills(
-        self,
-        *,
-        timeout_seconds: float | None = None,
-    ) -> None:
-        """Bound shutdown work to durable journal writes; never call a provider."""
-        if getattr(self, "_distill_journal", None) is None:
-            return
-
-        active_keys = sorted(
-            tuple(getattr(self, "_runtime_active_sessions", ())),
-            key=str,
-        )
-        limit = self._SHUTDOWN_DISTILL_MAX_SESSIONS
-        selected_keys = active_keys[:limit]
-        if len(active_keys) > limit:
-            logger.warning(
-                "Memory shutdown distill queue capped at %d active sessions",
-                limit,
-            )
-
-        async def enqueue_selected() -> None:
-            for session_key in selected_keys:
-                try:
-                    session = await self._session_manager.get_session(session_key)
-                    if session.get("provider") != self._active_provider():
-                        continue
-                    await self._enqueue_previous_codex_session(
-                        session,
-                        DistillTrigger.SHUTDOWN,
-                        discriminator=self._shutdown_distill_discriminator(session),
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    logger.warning(
-                        "Memory shutdown distill queue entry failed error=%s",
-                        type(error).__name__,
-                    )
-
-        timeout = (
-            self._SHUTDOWN_DISTILL_TIMEOUT_SECONDS
-            if timeout_seconds is None
-            else timeout_seconds
-        )
-        try:
-            await asyncio.wait_for(enqueue_selected(), timeout=timeout)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Memory shutdown distill queue timed out after %.2fs",
-                timeout,
-            )
 
     def _effective_session_id(self, session_key: Any, session: dict) -> Optional[str]:
         """Return a session_id that is safe to auto-resume.

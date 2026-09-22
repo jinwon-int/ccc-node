@@ -570,6 +570,11 @@ def create_app(context: AppContext):
             project_chat=context.project_chat,
             session_manager=context.session_manager,
             clock=context.clock,
+            distill_journal=context.distill_journal,
+            distill_snapshot_worker=context.distill_snapshot_worker,
+            distill_extraction_worker=context.distill_extraction_worker,
+            distill_local_sink_worker=context.distill_local_sink_worker,
+            distill_wiki_sink_worker=context.distill_wiki_sink_worker,
         )
     from telegram_bot.core.bot import TelegramBot
 

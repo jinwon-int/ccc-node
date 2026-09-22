@@ -37,9 +37,11 @@ import signal
 import subprocess
 import time
 import tomllib
-from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol
+from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol, Sequence
 
 from telegram_bot.core import session_resume, tool_policy
+from telegram_bot.core.memory_distill import MemoryDistillMixin
+from telegram_bot.memory.distill_types import DistillTrigger
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
 from telegram_bot.core.bot_danso_recovery import (
     OFFER,
@@ -67,7 +69,7 @@ logger = logging.getLogger(__name__)
 IDS_FILENAME = "matrix-ids.json"
 DIRECT_ROOMS_FILENAME = "matrix-direct-rooms.json"
 SUPPORTED_COMMANDS = frozenset(
-    {"new", "model", "effort", "usage", "skills", "stop", "task_pause", "task_resume", "task_recover", "history", "resume"}
+    {"new", "distill", "model", "effort", "usage", "skills", "stop", "task_pause", "task_resume", "task_recover", "history", "resume"}
 )
 _STATUS_HANDLE = 1
 SELF_JOB_PREFIX = "$self-"
@@ -356,7 +358,7 @@ class _NoticeApp:
         self.bot = _NoticeBotPort(bot)
 
 
-class MatrixBot(DansoRecoveryMixin):
+class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
     """Matrix frontend: ``TurnRunner`` over ``ProjectChatHandler``."""
 
     def __init__(
@@ -365,9 +367,19 @@ class MatrixBot(DansoRecoveryMixin):
         *,
         project_chat: Any,
         session_manager: Any,
+        distill_journal: Any = None,
+        distill_snapshot_worker: Any = None,
+        distill_extraction_worker: Any = None,
+        distill_local_sink_worker: Any = None,
+        distill_wiki_sink_worker: Any = None,
         clock: Any = None,
         transport_factory: TransportFactory | None = None,
     ) -> None:
+        self._distill_journal = distill_journal
+        self._distill_snapshot_worker = distill_snapshot_worker
+        self._distill_extraction_worker = distill_extraction_worker
+        self._distill_local_sink_worker = distill_local_sink_worker
+        self._distill_wiki_sink_worker = distill_wiki_sink_worker
         self._settings = settings
         self._project_chat = project_chat
         self._session_manager = session_manager
@@ -484,6 +496,9 @@ class MatrixBot(DansoRecoveryMixin):
             if initialize:
                 logger.info("Matrix frontend initialised a new bot device; start again without CCC_MATRIX_INITIALIZE")
                 return
+            if self._distill_journal is not None:
+                self._distill_journal.validate_path()
+                self._distill_journal.initialize()
             self._post_startup_banner(config, transport)
             self._start_health_reporting()
             await self._startup_danso_recovery_scan()
@@ -499,7 +514,13 @@ class MatrixBot(DansoRecoveryMixin):
                     # transport that returns *cleanly* would otherwise leave the
                     # group waiting forever. Setting the event from the transport
                     # leg's finally keeps shutdown finite on both paths.
-                    group.create_task(self._run_until_stop(transport.run(), stop))
+                    memory_tasks = []
+                    if self._distill_journal is not None:
+                        for stage in ("snapshot", "extraction", "local_sink", "wiki_sink"):
+                            if getattr(self, f"_distill_{stage}_worker") is not None:
+                                loop = getattr(self, f"_distill_{stage}_loop")
+                                memory_tasks.append(group.create_task(loop(stop), name=f"matrix-distill-{stage}"))
+                    group.create_task(self._run_until_stop(transport.run(), stop, memory_tasks))
                     group.create_task(self._health_reporter_loop(stop), name="matrix-health-reporter")
                     if notifier.enabled:
                         group.create_task(notifier.run())
@@ -512,18 +533,24 @@ class MatrixBot(DansoRecoveryMixin):
                     raise failure.exceptions[0] from None
                 raise
         finally:
+            if not initialize:
+                await self._enqueue_shutdown_distills()
             self._transport = None
             self._stop_health_reporting()
             await transport.close()
 
     @staticmethod
-    async def _run_until_stop(leg: Awaitable[None], stop: asyncio.Event) -> None:
+    async def _run_until_stop(
+        leg: Awaitable[None], stop: asyncio.Event, memory_tasks: Sequence[asyncio.Task] = (),
+    ) -> None:
         """Await the serving leg, then release every stop-event-driven sibling."""
 
         try:
             await leg
         finally:
             stop.set()
+            for task in memory_tasks:
+                task.cancel()
 
     # -- health.json (#1895 follow-up) ----------------------------------------
     #
@@ -900,7 +927,7 @@ class MatrixBot(DansoRecoveryMixin):
                 return await self._run_self_job(body, user_id=user_id, chat_id=chat_id)
             command, args = self._parse_command(body)
             if command == "skills":
-                return await self._cmd_skills(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
+                return await self._cmd_skills(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink, turn_marker=str(job.get("event_id") or ""))
             if command == "task_resume":
                 return await self._cmd_task_resume(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
             if command is not None:
@@ -911,7 +938,7 @@ class MatrixBot(DansoRecoveryMixin):
             chosen = await self._select_resume_choice(body, user_id=user_id, chat_id=chat_id)
             if chosen is not None:
                 return _turn_result(chosen, None)
-            return await self._run_message(body, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
+            return await self._run_message(body, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink, turn_marker=str(job.get("event_id") or ""))
         finally:
             self._active_sink = None
 
@@ -942,6 +969,8 @@ class MatrixBot(DansoRecoveryMixin):
     async def _run_command(self, command: str, args: list[str], *, user_id: int, chat_id: int) -> str:
         if command == "new":
             return await self._cmd_new(user_id=user_id, chat_id=chat_id)
+        if command == "distill":
+            return await self._cmd_distill(user_id=user_id, chat_id=chat_id)
         if command == "model":
             return await self._cmd_model(args, user_id=user_id, chat_id=chat_id)
         if command == "effort":
@@ -995,9 +1024,14 @@ class MatrixBot(DansoRecoveryMixin):
             return str(session_id)
         return None
 
-    async def _resolve_turn_session(self, key: Any) -> tuple[dict[str, Any], str | None, bool]:
+    async def _resolve_turn_session(self, key: Any, *, user_id: int, chat_id: int) -> tuple[dict[str, Any], str | None, bool]:
         """Return ``(session, session_id, new_session)`` the way the Telegram path does."""
 
+        previous = await self._session_manager.get_session(key)
+        if previous.get("provider", "claude") != self._active_provider():
+            await self._enqueue_previous_codex_session(
+                previous, DistillTrigger.PROVIDER_SWITCH, user_id=user_id, chat_id=chat_id,
+            )
         session, _switched = await self._session_manager.align_active_provider(key)
         new_session = False
         if session.get("new_session"):
@@ -1009,6 +1043,9 @@ class MatrixBot(DansoRecoveryMixin):
             session["new_session"] = False
         now = self._now()
         if await self._session_manager.should_start_new_session(key, now=now):
+            await self._enqueue_previous_codex_session(
+                session, DistillTrigger.AUTO_NEW, user_id=user_id, chat_id=chat_id,
+            )
             await self._session_manager.patch_session(
                 key, updates={"session_id": None, "new_session": False}
             )
@@ -1031,7 +1068,7 @@ class MatrixBot(DansoRecoveryMixin):
             self._settings,
             user_id=user_id,
             chat_id=chat_id,
-            route=getattr(self._project_chat, "_memory_route", "telegram"),
+            route=self._memory_route(),
         )
         if audience is None:
             remove.update({"distill_memory_audience", "distill_memory_scope"})
@@ -1051,13 +1088,13 @@ class MatrixBot(DansoRecoveryMixin):
         return _turn_result(content, response.session_id, streamed=streamed, status=status)
 
     async def _run_message(
-        self, body: str, *, user_id: int, chat_id: int, room_id: str, sink: TurnSink
+        self, body: str, *, user_id: int, chat_id: int, room_id: str, sink: TurnSink, turn_marker: str | None = None
     ) -> Any:
         key = self._conversation_key(user_id, chat_id)
-        session, session_id, new_session = await self._resolve_turn_session(key)
+        session, session_id, new_session = await self._resolve_turn_session(key, user_id=user_id, chat_id=chat_id)
         response = await self._dispatch_turn(
             body, key=key, user_id=user_id, chat_id=chat_id, session=session,
-            session_id=session_id, new_session=new_session, sink=sink,
+            session_id=session_id, new_session=new_session, sink=sink, turn_marker=turn_marker,
         )
         # #1895: like the Telegram path, a failed Danso turn is followed by the
         # recovery menu — after the failure text, never instead of it.
@@ -1077,6 +1114,7 @@ class MatrixBot(DansoRecoveryMixin):
         new_session: bool,
         sink: TurnSink | None = None,
         resume_task: bool = False,
+        turn_marker: str | None = None,
         dispatch_guard: Callable[[], bool] | None = None,
     ) -> ChatResponse:
         """One ``process_message`` call with this room's callbacks; persists the session."""
@@ -1108,6 +1146,11 @@ class MatrixBot(DansoRecoveryMixin):
             **extra,
         )
         await self._save_session_id(key, response, user_id=user_id, chat_id=chat_id)
+        if getattr(response, "success", True):
+            await self._record_codex_checkpoint(
+                key, response, request_text=body, turn_marker=turn_marker,
+                user_id=user_id, chat_id=chat_id,
+            )
         return response
 
     # -- Danso long-task commands and recovery (#1895 PR-A) ------------------
@@ -1357,7 +1400,7 @@ class MatrixBot(DansoRecoveryMixin):
             return (f"ℹ️ Current Danso session auto-resumes: {current}" if current
                     else "📭 No Danso session yet. Send a message to start one.")
         if provider == "piri":
-            return await self._resume_piri(args, key=key, session=session)
+            return await self._resume_piri(args, key=key, session=session, user_id=user_id, chat_id=chat_id)
         if provider in {"codex", "crush"}:
             return await self._resume_runtime_list(key=key, provider=provider)
         sessions = await asyncio.to_thread(self._project_chat.list_sessions, limit=10)
@@ -1375,13 +1418,18 @@ class MatrixBot(DansoRecoveryMixin):
         lines.append("Reply with a number to switch to that session:")
         return "\n".join(lines).strip()
 
-    async def _resume_piri(self, args: list[str], *, key: Any, session: Mapping[str, Any]) -> str:
+    async def _resume_piri(self, args: list[str], *, key: Any, session: Mapping[str, Any], user_id: int, chat_id: int) -> str:
         if len(args) > 1:
             return "Usage: /resume <piri-session-id>"
         if args:
             requested = args[0].strip()
             if len(requested) > 128 or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", requested) is None:
                 return "❌ Invalid Piri session id."
+            if requested != session.get("session_id"):
+                await self._enqueue_previous_codex_session(
+                    dict(session), DistillTrigger.EXPLICIT, user_id=user_id, chat_id=chat_id,
+                    discriminator=self._shutdown_distill_discriminator(dict(session)),
+                )
             await self._session_manager.patch_session(
                 key, updates={"provider": "piri", "session_id": requested, "new_session": False},
                 remove_fields={"resume_list"},
@@ -1449,6 +1497,11 @@ class MatrixBot(DansoRecoveryMixin):
         active = self._active_provider()
         if provider != active:
             return f"❌ Provider mismatch: selected session is {provider}, but the active provider is {active}."
+        if sid != session.get("session_id"):
+            await self._enqueue_previous_codex_session(
+                session, DistillTrigger.EXPLICIT, user_id=user_id, chat_id=chat_id,
+                discriminator=self._shutdown_distill_discriminator(session),
+            )
         await self._session_manager.patch_session(
             key, updates={"provider": provider, "session_id": sid, "new_session": False},
             remove_fields={"resume_list"},
@@ -1499,7 +1552,7 @@ class MatrixBot(DansoRecoveryMixin):
             return _turn_result("❌ Only the owner may resume a stored task.", None)
         key = self._conversation_key(user_id, chat_id)
         generation = self._task_resume_generation(key)
-        session, session_id, new_session = await self._resolve_turn_session(key)
+        session, session_id, new_session = await self._resolve_turn_session(key, user_id=user_id, chat_id=chat_id)
         if new_session or not session_id or session.get("provider", "claude") != "danso":
             return _turn_result(
                 "📭 No paused Danso long task is stored for this conversation. "
@@ -1579,12 +1632,28 @@ class MatrixBot(DansoRecoveryMixin):
             return model
         return self._claude_settings_model("sonnet") or "sonnet"
 
+    async def _cmd_distill(self, *, user_id: int, chat_id: int) -> str:
+        key = self._conversation_key(user_id, chat_id)
+        session = await self._session_manager.get_session(key)
+        if session.get("provider") != self._active_provider() or not session.get("session_id"):
+            return "ℹ️ No active session to save."
+        # Same turn-local idempotence as shutdown; explicit is a separate trigger.
+        job = await self._enqueue_previous_codex_session(
+            session, DistillTrigger.EXPLICIT, user_id=user_id, chat_id=chat_id,
+            discriminator=self._shutdown_distill_discriminator(session),
+        )
+        return ("✅ Memory save queued. Processing follows the configured memory policy and budget."
+                if job is not None else "ℹ️ Memory saving is disabled or unavailable.")
+
     async def _cmd_new(self, *, user_id: int, chat_id: int) -> str:
         key = self._conversation_key(user_id, chat_id)
         # Telegram cancels the conversation's asyncio task here; the Matrix
         # transport owns its task, so interrupt through the handler instead.
         await self._cancel_turn(user_id, chat_id)
         session = await self._session_manager.get_session(key)
+        await self._enqueue_previous_codex_session(
+            session, DistillTrigger.NEW_COMMAND, user_id=user_id, chat_id=chat_id,
+        )
         provider = self._active_provider()
         provider_changed = session.get("provider") != provider
         updates: dict[str, Any] = {"provider": provider, "session_id": None, "new_session": True}
@@ -1630,8 +1699,12 @@ class MatrixBot(DansoRecoveryMixin):
                 reply = f"{reply}\n\n{cost_text}"
         return reply
 
-    async def _cmd_skills(self, *, user_id: int, chat_id: int, room_id: str, sink: TurnSink) -> Any:
+    async def _cmd_skills(self, *, user_id: int, chat_id: int, room_id: str, sink: TurnSink, turn_marker: str | None = None) -> Any:
         key = self._conversation_key(user_id, chat_id)
+        session = await self._session_manager.get_session(key)
+        await self._enqueue_previous_codex_session(
+            session, DistillTrigger.NEW_COMMAND, user_id=user_id, chat_id=chat_id,
+        )
         response = await self._project_chat.process_message(
             user_message=_SKILLS_PROMPT,
             user_id=user_id,
@@ -1648,6 +1721,11 @@ class MatrixBot(DansoRecoveryMixin):
             usage_mode=MODE_INTERACTIVE,
         )
         await self._save_session_id(key, response, user_id=user_id, chat_id=chat_id)
+        if getattr(response, "success", True):
+            await self._record_codex_checkpoint(
+                key, response, request_text=_SKILLS_PROMPT, turn_marker=turn_marker,
+                user_id=user_id, chat_id=chat_id,
+            )
         return await self._finish(response, room_id)
 
     @staticmethod
@@ -1683,7 +1761,7 @@ class MatrixBot(DansoRecoveryMixin):
         session = await self._session_manager.get_session(key)
         provider = self._active_provider()
         if args:
-            return await self._select_model(key, session, args[0])
+            return await self._select_model(key, session, args[0], user_id=user_id, chat_id=chat_id)
         if provider in _RUNTIME_MODEL_PROVIDERS:
             return await self._list_runtime_models_text(session)
         current = self._get_real_model(session)
@@ -1695,7 +1773,7 @@ class MatrixBot(DansoRecoveryMixin):
             lines.append(f"• {name} — {label}" + (" (current)" if name == current else ""))
         return "\n".join(lines)
 
-    async def _select_model(self, key: Any, session: Mapping[str, Any], name: str) -> str:
+    async def _select_model(self, key: Any, session: Mapping[str, Any], name: str, *, user_id: int, chat_id: int) -> str:
         provider = self._active_provider()
         if provider == "danso" and name != getattr(self._settings, "danso_model", None):
             return "❌ Danso uses the model configured by the operator. Use /model to view it."
@@ -1705,6 +1783,9 @@ class MatrixBot(DansoRecoveryMixin):
         remove: set[str] = set()
         reset_note = None
         if session.get("provider") != provider:
+            await self._enqueue_previous_codex_session(
+                dict(session), DistillTrigger.PROVIDER_SWITCH, user_id=user_id, chat_id=chat_id,
+            )
             updates.update(session_id=None, new_session=True)
             remove.add("effort")
         elif provider in _RUNTIME_MODEL_PROVIDERS:
@@ -1764,6 +1845,11 @@ class MatrixBot(DansoRecoveryMixin):
         if provider not in _EFFORT_PROVIDERS:
             return "⚠️ /effort is available for Codex, Piri, or Danso."
         key = self._conversation_key(user_id, chat_id)
+        previous = await self._session_manager.get_session(key)
+        if previous.get("provider", "claude") != self._active_provider():
+            await self._enqueue_previous_codex_session(
+                previous, DistillTrigger.PROVIDER_SWITCH, user_id=user_id, chat_id=chat_id,
+            )
         session, _switched = await self._session_manager.align_active_provider(key)
         label = provider.title()
         try:
