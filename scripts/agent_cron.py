@@ -1376,11 +1376,17 @@ def fleet_diagnostic_title(task_id, status, stdout, stderr):
 
 
 def build_owner_text(task_id, run_id, scheduled_at, status, headless):
-    stdout = redact_for_owner((headless or {}).get('stdout', ''), 900)
-    stderr = redact_for_owner((headless or {}).get('stderr', ''), 900)
-    if stdout is None or stderr is None:
+    raw_stdout = (headless or {}).get('stdout', '')
+    raw_stderr = (headless or {}).get('stderr', '')
+    # A fleet watch can emit two channel rows per node. Classify all captured
+    # rows before shortening the notification body, or late failures vanish.
+    title_stdout = redact_for_owner(raw_stdout, 4000)
+    title_stderr = redact_for_owner(raw_stderr, 4000)
+    stdout = redact_for_owner(raw_stdout, 900)
+    stderr = redact_for_owner(raw_stderr, 900)
+    if None in (title_stdout, title_stderr, stdout, stderr):
         return None
-    title = fleet_diagnostic_title(task_id, status, stdout, stderr)
+    title = fleet_diagnostic_title(task_id, status, title_stdout, title_stderr)
     stdout = stdout.strip()
     stderr = stderr.strip()
     lines = [

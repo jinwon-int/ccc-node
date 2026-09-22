@@ -53,6 +53,8 @@
 #   CCC_FLEET_PREPARED_ROOTS space-separated glob list of preparation roots under
 #                    which an activated prepared runtime (#1527) may serve;
 #                    see is_prepared_runtime
+#   CCC_FLEET_MATRIX set to 0 to skip the separate Matrix process and health
+#                    check. Enabled by default during the channel transition.
 set -u
 
 NODES="${CCC_FLEET_NODES:-seoseo dungae sogyo nosuk bangtong yukson soonwook gwakga jingun gongmyoung gongyung daegyo}"
@@ -143,6 +145,7 @@ _bridge_candidates=$(ps -eo uid=,pid=,ppid=,command= 2>/dev/null | grep 'telegra
 line=""
 if [ -n "$_bridge_candidates" ]; then
   _saved_ifs=$IFS
+  _first_telegram=""
   IFS='
 '
   for _cand in $_bridge_candidates; do
@@ -150,17 +153,24 @@ if [ -n "$_bridge_candidates" ]; then
     _cand_pid=$(printf '%s' "$_cand" | awk '{print $2}')
     case "$_cand_pid" in ''|*[!0-9]*) IFS='
 '; continue ;; esac
-    case "$(head -1 "/proc/$_cand_pid/cgroup" 2>/dev/null)" in
+    _cand_cgroup=$(head -1 "/proc/$_cand_pid/cgroup" 2>/dev/null)
+    # Termux has no systemd cgroup. Its Matrix frontend uses the same module;
+    # exclude it by the process's exact channel setting before the fallback.
+    case "$_cand_cgroup" in */ccc-matrix-bridge.service) continue ;; esac
+    if { tr '\0' '\n' < "/proc/$_cand_pid/environ"; } 2>/dev/null |
+       grep -qx 'CCC_CHANNEL=matrix'; then
+      continue
+    fi
+    [ -n "$_first_telegram" ] || _first_telegram=$_cand
+    case "$_cand_cgroup" in
       */ccc-telegram-bridge.service) line=$_cand; break ;;
     esac
     IFS='
 '
   done
   IFS=$_saved_ifs
-  # No cgroup named the unit: a container, a Termux/Android node with no
-  # systemd, or an unreadable /proc. Fall back to the historical first match
-  # rather than paging a healthy node as DOWN.
-  [ -n "$line" ] || line=$(printf '%s\n' "$_bridge_candidates" | head -1)
+  # No cgroup named the unit: fall back only among non-Matrix candidates.
+  [ -n "$line" ] || line=$_first_telegram
 fi
 if [ -z "$line" ]; then
   # No ccc bridge. Before calling the node down, look for a Danso resident
@@ -514,6 +524,9 @@ case "$RETRY_DELAY" in ''|*[!0-9]*) RETRY_DELAY=10 ;; esac
 [ "$RETRY_DELAY" -le 120 ] || RETRY_DELAY=120
 
 fail=0
+if [ "${CCC_FLEET_MATRIX:-1}" = 1 ]; then
+  bash "$(dirname "$0")/fleet-matrix-watch.sh" || fail=1
+fi
 for node in $NODES; do
   # The flag is prepended to the piped script rather than passed as an ssh
   # argument: the remote command stays exactly `sh -s`, so nothing downstream

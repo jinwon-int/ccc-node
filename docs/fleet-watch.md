@@ -3,9 +3,13 @@
 Run `bash scripts/fleet-bridge-watch.sh` from the installed ccc-node checkout.
 Set `CCC_FLEET_DOCTOR=1` to inspect installed harness drift as well. The command
 only inspects state; it does not restart a bridge or run scheduled tasks.
+During the Telegram-to-Matrix transition, it checks both channels by default.
+Set `CCC_FLEET_MATRIX=0` only for a Telegram-only diagnostic run.
 
-The script streams `scripts/fleet_watch_metadata.py` with its probe. Keep these
-two files together. A copied script without its helper reports `UNVERIFIED`.
+The script streams `scripts/fleet_watch_metadata.py` with its Telegram probe
+and runs `scripts/fleet-matrix-watch.sh`, which streams
+`scripts/fleet_matrix_probe.py`. Keep these files together. A copied script
+without its helper reports `UNVERIFIED`.
 Do not leave a scheduled task pointing at an old one-file emergency snapshot
 after the reviewed fix is integrated into the normal checkout.
 
@@ -16,6 +20,13 @@ after the reviewed fix is integrated into the normal checkout.
   `UNVERIFIED`, not evidence of downtime. A successful transport exit and final
   completion marker are required before accepting a result; a truncated doctor
   response cannot become `OK`.
+- **Matrix availability:** identify the Matrix process by its exact
+  `CCC_CHANNEL=matrix` environment or systemd cgroup. Check its private
+  `BOT_DATA_DIR/health.json` only when it is fresh and names that PID. An older
+  Matrix frontend may leave this file at `starting`; then check the recent
+  `meta.health` sync state in the read-only SQLite store named by its config.
+  Missing, stale or ambiguous evidence is `UNVERIFIED`. Matrix rows carry
+  `channel=matrix`; Telegram rows retain their existing format.
 - **Runtime source:** read from the worker, or its parent supervisor. Prepared
   launches must bind worker UID, parent PID, project path and interpreter to
   that supervisor. Another project's supervisor cannot supply the source.
@@ -46,8 +57,9 @@ after the reviewed fix is integrated into the normal checkout.
 
 The scheduled command's title counts every watcher category (`DOWN`,
 `UNREACHABLE`, `DRIFT`, `BOOTPATH`, `DUALDOMAIN`, `NONCANONICAL`, `DEGRADED`,
-`UNVERIFIED`). Only fixed category names and bounded counts enter the title;
-node details remain in the redacted body.
+`UNVERIFIED`) across both channels. Only fixed category names and bounded
+counts enter the title; node details remain in the redacted body. The title
+uses all captured rows even when the body is shortened for delivery.
 
 ## Updating an existing schedule
 

@@ -4,6 +4,7 @@
 # The stub answers as a node would, so the caller's classification (OK / DOWN /
 # BOOTPATH / UNREACHABLE) and its exit contract are exercised without a fleet.
 set -uo pipefail
+export CCC_FLEET_MATRIX=0
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SC="$ROOT/scripts/fleet-bridge-watch.sh"
 pass=0; fail=0
@@ -42,7 +43,7 @@ reply() { # <node> <runtime> <avail> <unit>
 run() { # <nodes>
   OUT="$TMP/out"; RC=0
   CCC_FLEET_NODES="$1" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ \
-    CCC_FLEET_RETRY_DELAY=0 \
+    CCC_FLEET_RETRY_DELAY=0 CCC_FLEET_MATRIX=0 \
     bash "$SC" >"$OUT" 2>&1 || RC=$?
 }
 
@@ -191,6 +192,8 @@ PSEOF
 chmod +x "$sel/bin/ps"
 printf '0::/user.slice/user-1000.slice/user@1000.service/app.slice/ccc-matrix-bridge.service\n' > "$sel/proc/100/cgroup"
 printf '0::/system.slice/ccc-telegram-bridge.service\n' > "$sel/proc/200/cgroup"
+printf 'CCC_CHANNEL=matrix\0BOT_DATA_DIR=/home/x/.ccc-matrix\0' > "$sel/proc/100/environ"
+printf 'CCC_CHANNEL=telegram\0' > "$sel/proc/200/environ"
 sel_out="$sel/out"
 PATH="$sel/bin:$PATH" sh "$sel/probe.sh" > "$sel_out" 2>&1
 ok "probe selects the telegram bridge, not the lower-pid matrix bridge" \
@@ -200,13 +203,13 @@ ok "probe does not report the matrix bridge runtime" \
 ok "probe still completes with a second bridge present" \
   'tail -1 "$sel_out" | grep -q "^PROBE_COMPLETE=1$"'
 
-# No cgroup names the unit (container, Termux/Android, unreadable /proc): keep
-# the historical first match rather than paging a healthy node as DOWN.
+# No cgroup names the unit (Termux/Android): the Matrix process must still be
+# excluded by its channel env, even if it has the lower PID.
 printf '0::/\n' > "$sel/proc/100/cgroup"
 printf '0::/\n' > "$sel/proc/200/cgroup"
 PATH="$sel/bin:$PATH" sh "$sel/probe.sh" > "$sel_out" 2>&1
-ok "falls back to the first match when no cgroup names the unit" \
-  'grep -q "^RUNTIME=/opt/matrix-tree$" "$sel_out"'
+ok "Termux fallback excludes the Matrix process" \
+  'grep -q "^RUNTIME=/opt/ccc-node$" "$sel_out"'
 ok "fallback still completes" 'tail -1 "$sel_out" | grep -q "^PROBE_COMPLETE=1$"'
 
 # A single bridge must be unaffected by the new selection path.
@@ -300,8 +303,6 @@ ok "no hardcoded node->path table" \
 # piri false positive this would have fixed is tracked separately, doctor-side.
 ok "doctor call does not inject bridge CLI paths" \
   '! grep -q "env \$cli_env" "$SC"'
-ok "probe does not read the serving process environ" \
-  '! grep -q "environ" "$SC"'
 
 # ---- transport retry (#972) ------------------------------------------------
 # Flaky stub: fails while $TMP/flaky/<node> holds a positive counter, then

@@ -603,6 +603,12 @@ for category in ('DUALDOMAIN', 'NONCANONICAL', 'DEGRADED', 'UNVERIFIED'):
 combined = module.fleet_diagnostic_title(task_id, 'failed',
     'DOWN phone1\nDOWN phone2\nDUALDOMAIN server details\n', '')
 assert combined.endswith('DOWN=2 DUALDOMAIN=1'), combined
+late_matrix = module.build_owner_text(
+    'fleet-doctor-daily', 'run-late-matrix', None, 'failed',
+    {'exitCode': 1, 'stdout': 'OK node channel=telegram\n' * 45
+     + 'DOWN phone channel=matrix reason=no-process\n', 'stderr': ''})
+assert late_matrix is not None
+assert late_matrix.splitlines()[0].endswith('DOWN=1'), late_matrix.splitlines()[0]
 for category in module._FLEET_DIAGNOSTIC_TOKENS:
     title = module.fleet_diagnostic_title(task_id, 'failed', (category + '\n') * 1001, '')
     assert title.endswith(category + '=999'), title
