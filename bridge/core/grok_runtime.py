@@ -248,9 +248,13 @@ class GrokSession:
         missing, negative or absurd stamp is treated as "no basis to wait" so
         settling can never hang on a malformed page.
         """
-        stamps = [e.get("timestampMs") for e in page.get("entries", [])
-                  if isinstance(e, dict) and e.get("id") in entry_ids]
-        stamps = [s for s in stamps if type(s) is int]
+        stamps: list[int] = []
+        for entry in page.get("entries", []) if isinstance(page, dict) else []:
+            if not isinstance(entry, dict) or entry.get("id") not in entry_ids:
+                continue
+            stamp = entry.get("timestampMs")
+            if type(stamp) is int:
+                stamps.append(stamp)
         if not stamps:
             return None
         age = time.time() - max(stamps) / 1000.0
