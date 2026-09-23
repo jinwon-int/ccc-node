@@ -286,15 +286,18 @@ def _load_hook_module(path: pathlib.Path):
 def _broker_online_workers(broker_url: str, edge_env_file: str) -> tuple[list[str], str | None]:
     """Query broker online worker ids (GET /workers with edge-secret header).
 
-    The secret is sourced by bash from the edge env file and passed straight to
-    curl — it never enters this process's Python data, so there is no sensitive
-    dataflow through this module (CodeQL py/clear-text-logging eliminated by
-    construction, not by suppression).
+    The secret is sourced by bash from the edge env file and fed to curl
+    through its --config stdin, so it never enters this process's Python data
+    and never appears in any process argv (the old inline -H expanded the
+    value into curl's cmdline, readable from /proc/<pid>/cmdline while the
+    request was in flight — #1917). curl-config escaping keeps quotes and
+    backslashes inside the header value literal.
     Returns (sorted ids, error).
     """
-    script = ('EDGE_ENV="$1"; BROKER_URL="$2"; '
-              '. "$EDGE_ENV"; '
-              'curl -fsS -H "x-a2a-edge-secret: $A2A_EDGE_SECRET" "$BROKER_URL/workers"')
+    script = (
+        'EDGE_ENV="$1"; BROKER_URL="$2"; . "$EDGE_ENV"; '
+        'S=${S//\\\\/\\\\\\\\}; S=${S//\\"/\\\\\\"}; '
+        'printf \'header = "x-a2a-edge-secret: %s"\\nurl = "%s/workers"\\n\' "$S" "$BROKER_URL" | curl -fsS --config -')
     try:
         proc = subprocess.run(
             ["bash", "-c", script, "_", edge_env_file, broker_url],
@@ -381,10 +384,15 @@ def _remote_ssh_capture(rb: dict[str, str], remote_script: str, *, timeout: int 
 def _remote_broker_online_workers(rb: dict[str, str]) -> tuple[set[str], str | None]:
     """Online worker ids on a remote broker, stale-inclusive read filtered on
     projected status (older brokers return an empty default list for fresh
-    registrations) — same discipline as the promotion publisher."""
+    registrations) — same discipline as the promotion publisher. The secret is
+    captured remotely and fed to curl through its --config stdin, so it never
+    appears in any process argv on the broker host (#1917); curl-config
+    escaping keeps quotes and backslashes inside the header value literal."""
     script = (
         'S=$(' + rb["secret_cmd"] + ') || exit 75\n'
-        'curl -fsS -H "x-a2a-edge-secret: $S" "' + rb["broker_url"] + '/workers?include=stale_read_path&limit=100"\n'
+        'S=${S//\\\\/\\\\\\\\}; S=${S//\\"/\\\\\\"}\n'
+        'printf \'header = "x-a2a-edge-secret: %s"\\nurl = "%s/workers?include=stale_read_path&limit=100"\\n\' '
+        '"$S" "' + rb["broker_url"] + '" | curl -fsS --config -\n'
     )
     stdout, error = _remote_ssh_capture(rb, script)
     if error:
