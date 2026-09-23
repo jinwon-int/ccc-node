@@ -746,13 +746,13 @@ async def test_sink_typing_is_best_effort_and_interim_is_durable(tmp_path: Path)
         await f.input(req)
         h.work()
         await h.until(lambda: f.store.session(req.scope) is not None)
-        assert calls == [
-            (
-                "PUT",
-                "/_matrix/client/v3/rooms/" + quote(req.room_id, safe="") + "/typing/" + quote(f.c["account"], safe=""),
-                {"typing": True, "timeout": 8000},
-            )
-        ]
+        typing = (
+            "PUT",
+            "/_matrix/client/v3/rooms/" + quote(req.room_id, safe="") + "/typing/" + quote(f.c["account"], safe=""),
+            {"typing": True, "timeout": 8000},
+        )
+        # One on admission (Telegram parity: typing before the turn starts), one from the turn.
+        assert calls == [typing, typing]
         assert "진행 중입니다" in h.replies()
         assert h.replies().count("진행 중입니다") == 1
         # An inert sink (turn finished) does nothing.
@@ -760,7 +760,60 @@ async def test_sink_typing_is_best_effort_and_interim_is_durable(tmp_path: Path)
         await sink.typing()
         await sink.interim("늦은 안내")
         assert await sink.approval("late", None) is False
-        assert len(calls) == 1 and "늦은 안내" not in h.replies()
+        assert len(calls) == 2 and "늦은 안내" not in h.replies()
+
+
+# --------------------------------------------------------------------------- #
+# Latency: typing on admission, event wakeups, per-turn timing
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_typing_is_sent_on_admission_before_any_turn_runs(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        calls: list[tuple[str, str]] = []
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            calls.append((method, path))
+            return {}
+
+        f.raw = raw
+        req = request(f)
+        await f.input(req)  # no work() task: nothing claims the job
+        await h.until(lambda: bool(calls))
+        assert calls == [("PUT", "/_matrix/client/v3/rooms/" + quote(req.room_id, safe="") + "/typing/" + quote(f.c["account"], safe=""))]
+        assert "typing" in f.turn_timing[req.event_id]
+        await f.input(req)  # sync replay of the same event
+        await f.input(request(f, "$ctl", "/stop"))  # controls never type
+        await asyncio.sleep(0.05)
+        assert len(calls) == 1
+
+
+@pytest.mark.anyio
+async def test_wakeups_bypass_the_idle_poll_and_turn_timing_is_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(t, "IDLE_POLL_S", 30.0)  # only a wakeup can make this test finish in time
+    async with running(tmp_path) as h:
+        f = h.f
+        f.pin_devices = AsyncMock()  # type: ignore[method-assign]
+        f.room_gate = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        f.encrypted_send = AsyncMock(return_value="$sent")  # type: ignore[method-assign]
+        h.work()
+        h.start(f.send())
+        await asyncio.sleep(0.05)  # both loops are parked on their wake events
+        req = request(f)
+        with patch.object(t.logger, "info") as info:
+            await f.input(req)
+            await h.until(lambda: bool(f.store.get_meta("turn_timings")))
+        f.encrypted_send.assert_awaited()
+        assert f.encrypted_send.await_args.args[1] == "synthetic answer"
+        [summary] = f.store.get_meta("turn_timings")
+        assert summary["turn"] == turn_id(req.event_id)
+        for key in ("admitted_to_claimed_s", "claimed_to_done_s", "done_to_delivered_s"):
+            assert 0 <= summary[key] < 5, key
+        assert "synthetic" not in json.dumps(summary), "timing records are body-free"
+        assert info.call_args.args[0] == "Matrix turn timing %s"
+        assert f.turn_timing == {}
 
 
 @pytest.mark.anyio
