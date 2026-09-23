@@ -9,6 +9,26 @@ Use local `git` and authenticated `gh` for GitHub reads and writes. Never push
 directly to `main`, approve your own PR, use `--admin` merely to bypass
 protection, or move a credential between nodes.
 
+## Issue claim before implementing
+
+Before creating a branch (or dispatching an A2A patch lane) for a GitHub issue,
+apply the fleet issue-claim rule (Family Wiki DOC-3508,
+`pages/rules/github-issue-claim`). Parallel sessions share one GitHub account,
+so the account name is not an identity.
+
+- Read the issue first. An open PR that references it, or an issue-claim or A2A
+  `Start` comment from the last 3 hours, means the issue is already taken: do
+  not start. Coordinate on that PR or issue, pick other work, or ask the owner.
+- Otherwise post a claim comment before any code change, with a machine-readable
+  first line and a one-line human summary:
+  `<!-- issue-claim:v1 node=<node> session=<session-or-task-id> state=active -->`
+  followed by `claim: <node> (<session>) — scope: <one line> — PR ETA: <KST>`.
+- Filing an issue is not a claim. Opening the PR supersedes the claim; when
+  abandoning, post `state=released`. A claim with no PR or update for 3 hours
+  has expired; take it over with `state=takeover prev=<previous session>`.
+- To replace a claimed issue or open PR with a broader one, comment on it
+  first with the reason. Never silently open and merge a replacement.
+
 ## Normal flow
 
 1. Record the PR's full `headRefOid`. Require an open, non-draft PR against the
