@@ -36,6 +36,8 @@ unset CCC_SELF_UPDATE_BUSY_MAX_SECONDS CCC_SELF_UPDATE_MAX_DEFER_SECONDS
 unset CCC_SELF_UPDATE_REAPPLY CCC_SELF_UPDATE_CRONTAB_CMD
 unset CODEX_HOME
 export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
+# Same for the Matrix frontend's health file (never the node's real ~/.ccc-matrix).
+export CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$TMP/no-such-matrix-health.json"
 
 # Fixture: origin repo with a stub setup.sh, plus a node-side clone.
 ORIGIN="$TMP/origin.git"
@@ -662,6 +664,26 @@ echo "$(( $(date +%s) - 7200 ))" > "$STATE/self-update.deferred-since"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "deferral cap exceeded proceeds despite busy" '[ "$rc" = 0 ]'
 ok "deferral marker cleared after proceeding" '[ ! -f "$STATE/self-update.deferred-since" ]'
+
+# Matrix frontend: its health file gates only when ccc-matrix-bridge is allowlisted.
+MHFILE="$TMP/matrix-health.json"
+export CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$MHFILE"
+mk_health "$(now_iso)" 0 0
+printf '{"updated_at":"%s","workload":{"active_requests":1,"oldest_request_age_seconds":30}}' "$(now_iso)" > "$MHFILE"
+clr_defer; rm -f "$CLAUDE/self-update.services"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "busy matrix ignored when its unit is not allowlisted" '[ "$rc" = 0 ]'
+clr_defer; printf '%s\n' 'system:ccc-matrix-bridge.service' > "$CLAUDE/self-update.services"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "busy matrix defers when ccc-matrix-bridge is allowlisted" '[ "$rc" = 8 ] && grep -q "bridge busy (matrix active=1" <<<"$out"'
+clr_defer; printf '%s\n' 'ccc-matrix-bridge' > "$CLAUDE/self-update.services"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "bare allowlisted unit name also gates on matrix" '[ "$rc" = 8 ]'
+clr_defer; printf '{"updated_at":"%s","workload":{"active_requests":0,"oldest_request_age_seconds":0}}' "$(now_iso)" > "$MHFILE"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "idle matrix proceeds when allowlisted" '[ "$rc" = 0 ]'
+clr_defer; rm -f "$MHFILE" "$CLAUDE/self-update.services"
+export CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$TMP/no-such-matrix-health.json"
 
 # Back to the hermetic nonexistent health file (never the node's real one).
 rm -f "$HFILE"; export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
