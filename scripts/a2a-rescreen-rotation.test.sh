@@ -291,6 +291,62 @@ print(json.dumps({"count": len(brokers), "error": error}))
 EOF
 ok "T10 unreadable env file degrades to primary-only" "$ASSERT $FIX/reg-broken.json 'd[\"count\"] == 0 and d[\"error\"] == \"env-file-unreadable\"'"
 
+# ---- T11: #1917 — probe edge secret rides curl --config stdin, never argv --
+
+RB1917="$TMP/rb1917"
+RB_BIN="$TMP/rb1917-bin"
+mkdir -p "$RB1917" "$RB_BIN"
+# Hostile operator secret: quote, backslash and space must survive the whole
+# probe path as literal bytes of one header value (#1917 regression fixture).
+printf '%s\n' 'abc"def\ghi jkl' > "$RB1917/remote-secret"
+printf "A2A_EDGE_SECRET='%s'\n" 'abc"def\ghi jkl' > "$RB1917/edge.env"
+
+cat > "$RB_BIN/curl" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$RB1917/curl-argv"
+cat >> "$RB1917/curl-stdin"
+printf '{"items":[{"nodeId":"alpha","status":"online"},{"nodeId":"stale-one","status":"stale"}]}'
+STUB
+cat > "$RB_BIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$RB1917_DIR/ssh-argv"
+eval "$6"
+STUB
+chmod +x "$RB_BIN/curl" "$RB_BIN/ssh"
+
+PATH="$RB_BIN:$PATH" RB1917_DIR="$RB1917" python3 - "$TOOL" "$RB1917" > "$FIX/t11.json" <<'EOF'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("rot", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+d = sys.argv[2]
+rb = {"name": "t2", "ssh_host": "stub", "broker_url": "http://127.0.0.1:8787",
+      "nexus_dir": "/remote/nexus", "secret_cmd": "cat " + d + "/remote-secret"}
+p_ids, p_err = mod._broker_online_workers("http://127.0.0.1:8787", d + "/edge.env")
+r_ids, r_err = mod._remote_broker_online_workers(rb)
+argv = open(d + "/curl-argv", encoding="utf-8").read()
+stdin_txt = open(d + "/curl-stdin", encoding="utf-8").read()
+ssh = open(d + "/ssh-argv", encoding="utf-8").read()
+secret = 'abc"def\\ghi jkl'
+escaped = 'abc\\"def\\\\ghi jkl'
+print(json.dumps({
+    "primary_ids": p_ids, "primary_err": p_err,
+    "remote_ids": sorted(r_ids), "remote_err": r_err,
+    "argv_lines": argv.splitlines(),
+    "argv_secret": secret in argv,
+    "stdin_header_ok": ('header = "x-a2a-edge-secret: ' + escaped + '"\n') in stdin_txt,
+    "ssh_secret": secret in ssh,
+}))
+EOF
+ok "T11 primary+remote probes resolve workers over the hostile secret" \
+  "$ASSERT $FIX/t11.json 'd[\"primary_ids\"] == [\"alpha\", \"stale-one\"] and d[\"primary_err\"] is None and d[\"remote_ids\"] == [\"alpha\"] and d[\"remote_err\"] is None'"
+ok "T11 curl argv is secret-free on both paths (#1917)" \
+  "$ASSERT $FIX/t11.json 'all(a == \"-fsS --config -\" for a in d[\"argv_lines\"]) and not d[\"argv_secret\"]'"
+ok "T11 curl stdin carries the escaped hostile header byte-exact" \
+  "$ASSERT $FIX/t11.json 'd[\"stdin_header_ok\"]'"
+ok "T11 remote script transit never embeds the secret value" \
+  "$ASSERT $FIX/t11.json 'not d[\"ssh_secret\"]'"
+
 # ---- summary ----------------------------------------------------------------
 
 echo "PASS=$pass FAIL=$fail"
