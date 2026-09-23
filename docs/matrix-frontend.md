@@ -93,6 +93,16 @@ longer word ("서서" does not match "서서히"); a token glued to another word
 without a space ("서서야뭐해") does not match either. Aliases only widen the
 mention gate — sender and room admission are unchanged.
 
+**Replies carry their parent (#1943).** When someone uses the client's reply
+feature, the agent receives the replied-to message as a quoted
+`[Reply context: …]` excerpt (≤2000 chars) above the reply text. The parent
+comes from a bounded in-memory cache of recent trusted texts (the bot's own
+answers included) or is fetched and decrypted on demand; only encrypted
+parents from the bot or a trusted device of an allowed sender are quoted.
+A missing, plaintext, untrusted or undecryptable parent simply leaves the
+reply as-is. `/command` and bare-number replies are never rewritten. A reply
+in a family room still needs a mention, exactly like any other message.
+
 ### Device trust: cross-signing identity (preferred) or pinned devices
 
 `"identities": {"@owner:hs": {"master": "<ed25519 master key>"}}` pins the

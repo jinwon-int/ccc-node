@@ -29,8 +29,9 @@ Turn outcomes:
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -44,6 +45,7 @@ from urllib.parse import quote
 
 from telegram_bot.core.matrix.state import (
     MAX_REPLY_BYTES,
+    MAX_TEXT_BYTES,
     MatrixStore,
     Policy,
     QueueFull,
@@ -54,6 +56,7 @@ from telegram_bot.core.matrix.state import (
     identities,
     mention_aliases,
     private_directory,
+    reply_context_body,
     saved_policy,
     scope_of,
     turn_id,
@@ -108,6 +111,7 @@ MAX_PENDING_APPROVALS = 16
 MEGOLM = "m.megolm.v1.aes-sha2"
 SYNC_TIMELINE_LIMIT = 100  # /sync filter timeline.limit; a batch this full is a real gap
 CONTROL_PREFIXES = ("/approve", "/deny", "/cancel", "/ack", "/stop")
+RECENT_TEXT_CAP = 512  # recent trusted room texts kept to resolve reply parents (#1943)
 # TurnResult.status values that end a job with its text delivered. "error" is
 # what MatrixBot reports for a ChatResponse(success=False): the text is the
 # user-facing failure notice and nothing is left running, so it is not
@@ -327,6 +331,9 @@ class MatrixTransport:
         }
         self.trusted: dict[str, dict[str, str]] = {user: {d: k["curve25519"] for d, k in pins.items()} for user, pins in self.pins.items()}
         self.last_room_event: dict[str, str] = {}  # newest event id seen per room (drives status-bubble placement)
+        # event id -> (room, sender, text) of recent trusted decrypted texts,
+        # our own sent chunks included; resolves reply parents without a fetch.
+        self.recent_text: OrderedDict[str, tuple[str, str, str]] = OrderedDict()
         self.senders = frozenset([config["owner"]]) | self.family_users
         self.family_allowed = self.senders | frozenset([config["account"]])
         self.store = MatrixStore(config["state_directory"], config["account"])
@@ -676,6 +683,12 @@ class MatrixTransport:
         if req.body.startswith(CONTROL_PREFIXES):
             await self.control(req)
             return
+        if req.reply_to is not None:
+            if self.store.job_exists(req.event_id):
+                # A replayed sync: the job was stored with its reply context
+                # already; re-resolving could change the body (identity conflict).
+                return
+            req = await self.with_reply_context(req)
         fresh = not self.store.job_exists(req.event_id)
         try:
             self.store.accept_batch([req], None)
@@ -819,6 +832,8 @@ class MatrixTransport:
                     event_id = getattr(event, "event_id", None)
                     if isinstance(event_id, str) and event_id:
                         self.last_room_event[room] = event_id
+                        if self._trusted_text(event):
+                            self._remember_text(event_id, room, event.sender, event.body)
                     req = self.admit_event(room, event)
                     if req:
                         await self.input(req)
@@ -884,6 +899,80 @@ class MatrixTransport:
                           scope_of(self.c["account"], room, str(getattr(event, "sender", ""))))
             self.store.notice(req, "undecryptable", NOTICE_UNDECRYPTABLE)
 
+    # -- reply context (#1943) ------------------------------------------------
+
+    def _trusted_text(self, event: Any) -> bool:
+        """A decrypted text from our own device or an allowed sender's trusted device."""
+        from nio import RoomMessageText
+
+        if not isinstance(event, RoomMessageText) or not event.decrypted or not event.verified:
+            return False
+        if not isinstance(getattr(event, "body", None), str):
+            return False
+        if event.sender == self.c["account"]:
+            return True
+        return event.sender in self.senders and event.sender_key in set(self.trusted.get(event.sender, {}).values())
+
+    def _remember_text(self, event_id: Any, room: str, sender: str, body: str) -> None:
+        if not isinstance(event_id, str) or not event_id or not body.strip():
+            return
+        self.recent_text[event_id] = (room, sender, body)
+        self.recent_text.move_to_end(event_id)
+        while len(self.recent_text) > RECENT_TEXT_CAP:
+            self.recent_text.popitem(last=False)
+
+    async def _fetch_parent(self, room: str, event_id: str) -> tuple[str, str] | None:
+        """Fetch and decrypt a reply parent; ``None`` on any failure (best-effort)."""
+        try:
+            from nio import Event, MegolmEvent
+
+            raw = await self.raw(
+                "GET",
+                "/_matrix/client/v3/rooms/" + quote(room, safe="") + "/event/" + quote(event_id, safe=""),
+            )
+            if not isinstance(raw, dict) or raw.get("event_id") != event_id or raw.get("type") != "m.room.encrypted":
+                return None  # plaintext parents are never trusted as context
+            encrypted = Event.parse_encrypted_event(raw)
+            if not isinstance(encrypted, MegolmEvent):
+                return None
+            encrypted.room_id = room
+            event = self.client.decrypt_event(encrypted)
+            if not self._trusted_text(event):
+                return None
+            self._remember_text(event_id, room, event.sender, event.body)
+            return event.sender, event.body
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - context is optional; never stop the service for it
+            self.store.set_meta("reply_context_miss", {"room": room, "updated": time.time()})
+            return None
+
+    async def with_reply_context(self, req: Request) -> Request:
+        """Prefix a reply's body with the message it answers; unchanged on any miss.
+
+        ``/command`` and bare-number replies (``2`` answering a numbered menu:
+        Danso recovery, ``/resume`` pick) stay verbatim so the bot still parses them.
+        """
+        text = req.body.strip()
+        if req.reply_to is None or text.startswith("/") or text.isdigit():
+            return req
+        cached = self.recent_text.get(req.reply_to)
+        if cached is not None and cached[0] == req.room_id:
+            parent: tuple[str, str] | None = (cached[1], cached[2])
+        else:
+            parent = await self._fetch_parent(req.room_id, req.reply_to)
+        if parent is None:
+            return req
+        body = reply_context_body(
+            req.body,
+            parent_sender=parent[0],
+            parent_body=parent[1],
+            account=self.c["account"],
+            sender=req.sender,
+            limit_bytes=MAX_TEXT_BYTES,
+        )
+        return replace(req, body=body)
+
     async def _request_room_keys(self) -> None:
         """Best-effort m.room_key_request for events we could not decrypt."""
         pending, self.key_requests = self.key_requests, []
@@ -910,7 +999,8 @@ class MatrixTransport:
                     chunks = chunk_text(job["reply"])
                     for i in range(self.store.delivered_parts(job["event_id"]), len(chunks)):
                         tx = hashlib.sha256((job["txn_id"] + ":" + str(i)).encode()).hexdigest()
-                        await self.encrypted_send(job["room_id"], chunks[i], tx)
+                        sent = await self.encrypted_send(job["room_id"], chunks[i], tx)
+                        self._remember_text(sent, job["room_id"], self.c["account"], chunks[i])
                         self.store.mark_part(job["event_id"], i + 1)
                     self.store.delivered(job["event_id"])
             await asyncio.sleep(0.25)

@@ -265,6 +265,71 @@ class Request:
     sender: str
     body: str
     scope: str
+    reply_to: str | None = None  # m.in_reply_to parent event id (#1943)
+
+
+REPLY_CONTEXT_MAX_CHARS = 2000
+
+
+def reply_target(content: Mapping[str, Any]) -> str | None:
+    """The ``m.in_reply_to`` parent event id of a plain (non-``rel_type``) reply."""
+    relation = content.get("m.relates_to")
+    if not isinstance(relation, dict) or "rel_type" in relation:
+        return None
+    parent = relation.get("m.in_reply_to")
+    event_id = parent.get("event_id") if isinstance(parent, dict) else None
+    return event_id if identifier(event_id, "$") else None
+
+
+def strip_reply_fallback(body: str) -> str:
+    """Drop a legacy ``> <@user> quoted`` reply fallback prefix (Matrix spec §rich replies).
+
+    Returns ``body`` unchanged when there is no fallback or nothing would remain.
+    """
+    lines = body.split("\n")
+    if not lines or not lines[0].startswith("> <"):
+        return body
+    index = 0
+    while index < len(lines) and lines[index].startswith(">"):
+        index += 1
+    if index < len(lines) and not lines[index].strip():
+        index += 1
+    rest = "\n".join(lines[index:])
+    return rest if rest.strip() else body
+
+
+def reply_context_body(
+    body: str,
+    *,
+    parent_sender: str,
+    parent_body: str,
+    account: str,
+    sender: str,
+    limit_bytes: int,
+) -> str:
+    """Prefix ``body`` with a quoted excerpt of the message it replies to.
+
+    The excerpt is capped at :data:`REPLY_CONTEXT_MAX_CHARS` and shrunk until
+    the whole text fits ``limit_bytes``; if even an empty excerpt cannot fit,
+    the reply is returned unchanged.
+    """
+    if parent_sender == account:
+        who = "your (the assistant's) earlier message"
+    elif parent_sender == sender:
+        who = "their own earlier message"
+    else:
+        who = "an earlier message from " + parent_sender
+    excerpt = strip_reply_fallback(parent_body).strip()
+    budget = REPLY_CONTEXT_MAX_CHARS
+    while True:
+        cut = excerpt if len(excerpt) <= budget else excerpt[:budget].rstrip() + " …(truncated)"
+        quoted = "\n".join("> " + line for line in cut.split("\n"))
+        text = f"[Reply context: the user is replying to {who}]\n{quoted}\n\n{body}"
+        if len(text.encode("utf-8")) <= limit_bytes:
+            return text
+        if budget == 0:
+            return body
+        budget //= 2
 
 
 @dataclass(frozen=True)
@@ -334,9 +399,14 @@ class Policy:
             body = bounded_text(content.get("body"), MAX_TEXT_BYTES)
         except ValueError:
             return None
+        # The mention gate still sees the original body (fallback included),
+        # so replies are admitted exactly as before (#1943).
         if self.rooms[room_id] == "mention" and not self.addressed(content, body):
             return None
-        return Request(event["event_id"], room_id, sender, body, scope_of(self.account, room_id, sender))
+        parent = reply_target(content)
+        if parent is not None:
+            body = strip_reply_fallback(body)
+        return Request(event["event_id"], room_id, sender, body, scope_of(self.account, room_id, sender), parent)
 
     def addressed(self, content: Mapping[str, Any], body: str) -> bool:
         """Family-room gate: spec'd m.mentions, or a typed @localpart handle in the body.
