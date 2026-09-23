@@ -34,6 +34,7 @@ import copy
 from dataclasses import dataclass, replace
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -64,6 +65,8 @@ from telegram_bot.core.matrix.state import (
     upgrade_saved_policy,
     wake_words,
 )
+
+logger = logging.getLogger(__name__)
 
 FAMILY_NOTICE = "이 AI는 이 방을 읽을 수 있으며 답변에 필요한 내용이 제공업체에 전달될 수 있습니다."
 NOTICE_QUEUE_FULL = "대기 중인 요청이 많습니다. 잠시 후 다시 요청해 주세요."
@@ -112,6 +115,11 @@ MEGOLM = "m.megolm.v1.aes-sha2"
 SYNC_TIMELINE_LIMIT = 100  # /sync filter timeline.limit; a batch this full is a real gap
 CONTROL_PREFIXES = ("/approve", "/deny", "/cancel", "/ack", "/stop")
 RECENT_TEXT_CAP = 512  # recent trusted room texts kept to resolve reply parents (#1943)
+# work()/send() wake on an event as soon as a job or reply is stored; this
+# poll is only the fallback for writers that do not signal (other processes).
+IDLE_POLL_S = 0.25
+TURN_TIMING_CAP = 64  # in-flight per-turn latency records kept in memory
+TURN_TIMINGS_KEPT = 50  # finished records kept in meta.turn_timings
 # TurnResult.status values that end a job with its text delivered. "error" is
 # what MatrixBot reports for a ChatResponse(success=False): the text is the
 # user-facing failure notice and nothing is left running, so it is not
@@ -204,21 +212,17 @@ class _RoomSink:
     async def typing(self) -> None:
         if not self._active():
             return
-        path = (
-            "/_matrix/client/v3/rooms/"
-            + quote(self.request.room_id, safe="")
-            + "/typing/"
-            + quote(self.transport.c["account"], safe="")
-        )
         try:
-            await self.transport.raw("PUT", path, {"typing": True, "timeout": 8000})
+            await self.transport.send_typing(self.request.room_id)
         except Exception:
-            pass
+            return
+        self.transport.mark(self.job["event_id"], "typing")
 
     async def interim(self, text: str) -> None:
         if not self._active() or not isinstance(text, str) or not text.strip():
             return
         self.transport.store.notice(self.request, unique_key("interim"), text)
+        self.transport.wake()
 
     async def status(self, text: str | None) -> None:
         """One progress bubble per turn: created, then refreshed at the room's bottom.
@@ -365,6 +369,14 @@ class MatrixTransport:
         self.cancel_requested = False
         self.matrix_lock = asyncio.Lock()
         self.stopping = False
+        self.work_wake = asyncio.Event()
+        self.send_wake = asyncio.Event()
+        self.background: set[asyncio.Task[Any]] = set()
+        # Per-turn latency stages (wall-clock seconds), keyed by event id;
+        # body-free. ``_batch`` carries the sync batch being processed.
+        self.turn_timing: OrderedDict[str, dict[str, float]] = OrderedDict()
+        self._batch: dict[str, float] = {}
+        self._origin_ms: int | None = None
 
     # -- HTTP -----------------------------------------------------------------
 
@@ -387,6 +399,91 @@ class MatrixTransport:
                 if len(body) > 4_194_304:
                     raise SafetyStop("matrix-response-too-large")
             return json.loads(body)
+
+    async def send_typing(self, room: str) -> None:
+        """PUT the bot's typing indicator (8 s) in ``room``; raises on failure."""
+        path = "/_matrix/client/v3/rooms/" + quote(room, safe="") + "/typing/" + quote(self.c["account"], safe="")
+        await self.raw("PUT", path, {"typing": True, "timeout": 8000})
+
+    # -- wakeups and latency record ---------------------------------------------
+
+    def wake(self) -> None:
+        """A job or an outbox row was stored: let work()/send() look now."""
+        self.work_wake.set()
+        self.send_wake.set()
+
+    async def _idle(self, event: asyncio.Event) -> None:
+        # Cleared only after the wait: a set() that races the caller's store
+        # read makes this return at once, and the caller reads the store again.
+        # asyncio.timeout, not wait_for: 3.11's wait_for can swallow a
+        # cancellation that races the inner wait, hanging service shutdown.
+        try:
+            async with asyncio.timeout(IDLE_POLL_S):
+                await event.wait()
+        except TimeoutError:
+            pass
+        event.clear()
+
+    def _spawn(self, coro: Any) -> None:
+        task = asyncio.get_running_loop().create_task(coro)
+        self.background.add(task)
+        task.add_done_callback(self.background.discard)
+
+    async def _early_typing(self, room: str, event_id: str) -> None:
+        """Typing right after admission, like Telegram's send_action on receipt."""
+        try:
+            await self.send_typing(room)
+        except Exception:
+            return  # cosmetic; the turn's own typing loop follows
+        self.mark(event_id, "typing")
+
+    def mark(self, event_id: str, stage: str) -> None:
+        """Record the first time ``stage`` happened for a tracked turn."""
+        record = self.turn_timing.get(event_id)
+        if record is not None:
+            record.setdefault(stage, time.time())
+
+    def _track(self, event_id: str) -> None:
+        now = time.time()
+        record: dict[str, float] = {"admitted": now}
+        if self._origin_ms is not None:
+            record["origin"] = self._origin_ms / 1000.0
+        if self._batch:
+            record.update(self._batch)
+        self.turn_timing[event_id] = record
+        while len(self.turn_timing) > TURN_TIMING_CAP:
+            self.turn_timing.popitem(last=False)
+
+    def _finish_timing(self, event_id: str) -> None:
+        """Log and keep one body-free latency summary for a finished turn."""
+        record = self.turn_timing.pop(event_id, None)
+        if record is None:
+            return
+
+        def span(start: str, end: str) -> float | None:
+            if start in record and end in record:
+                return round(record[end] - record[start], 3)
+            return None
+
+        end = "delivered" if "delivered" in record else "done"
+        summary: dict[str, Any] = {
+            "turn": turn_id(event_id),
+            "at": round(record.get(end, time.time()), 3),
+            # origin is the homeserver clock; the other stages are ours.
+            "server_to_received_s": span("origin", "received"),
+            "gate_s": record.get("gate_s"),
+            "received_to_admitted_s": span("received", "admitted"),
+            "admitted_to_claimed_s": span("admitted", "claimed"),
+            "admitted_to_typing_s": span("admitted", "typing"),
+            "admitted_to_first_sent_s": span("admitted", "first_sent"),
+            "claimed_to_done_s": span("claimed", "done"),
+            "done_to_delivered_s": span("done", "delivered"),
+            "server_to_" + end + "_s": span("origin", end),
+        }
+        summary = {k: v for k, v in summary.items() if v is not None}
+        logger.info("Matrix turn timing %s", json.dumps(summary, sort_keys=True))
+        kept = self.store.get_meta("turn_timings") or []
+        self.store.set_meta("turn_timings", (kept + [summary])[-TURN_TIMINGS_KEPT:])
 
     # -- startup --------------------------------------------------------------
 
@@ -661,7 +758,9 @@ class MatrixTransport:
             "notice",
             hashlib.sha256(json.dumps([self.c["account"], room_id, "unsolicited-notice"]).encode()).hexdigest(),
         )
-        return self.store.notice(req, key or unique_key("unsolicited"), text)
+        event_id = self.store.notice(req, key or unique_key("unsolicited"), text)
+        self.wake()
+        return event_id
 
     def enqueue_self_job(self, room_id: str, body: str, *, key: str) -> str:
         """Queue a turn the frontend runs for the owner in ``room_id`` (#1895 PR-A2).
@@ -673,7 +772,9 @@ class MatrixTransport:
         """
         if room_id not in self.c["rooms"]:
             raise ValueError("room-not-allowed")
-        return self.store.self_job(room_id, self.c["owner"], body, key=key)
+        event_id = self.store.self_job(room_id, self.c["owner"], body, key=key)
+        self.wake()
+        return event_id
 
     # -- input ----------------------------------------------------------------
 
@@ -697,8 +798,12 @@ class MatrixTransport:
             # later syncs from carrying cancellation/approval controls.
             if not self.store.seen_control(req):
                 self.store.notice(req, "queue-full", NOTICE_QUEUE_FULL)
+            self.wake()
             return
         if fresh:
+            self._track(req.event_id)
+            self.wake()  # start the turn now, not after the rest of the batch
+            self._spawn(self._early_typing(req.room_id, req.event_id))
             # Telegram tells a sender whose turn is still running where their
             # message landed in the queue; family rooms get the same notice.
             ahead = self.store.pending_before(req.event_id)
@@ -748,8 +853,10 @@ class MatrixTransport:
                     future.set_result(fields[0] == "/approve")
             if allowed:
                 self.store.notice(req, "control", NOTICE_CONTROL_FORWARDED)
+                self.wake()
                 return
         self.store.notice(req, "invalid-control", NOTICE_INVALID_CONTROL)
+        self.wake()
 
     async def _cancel_active(self) -> None:
         job, task = self.active, self.turn_task
@@ -786,6 +893,7 @@ class MatrixTransport:
                 if token:
                     params["since"] = token
                 raw = await self.raw("GET", "/_matrix/client/v3/sync", params=params)
+                self._batch = {"received": time.time()}
                 self.store.stage_sync(raw)
             await self.process_pending()
 
@@ -817,6 +925,7 @@ class MatrixTransport:
                         "sync_limited_soft",
                         {"room": room, "events": len(events), "updated": time.time()},
                     )
+            gate_started = time.monotonic()
             await self.pin_devices()
             response = SyncResponse.from_dict(raw)
             if type(response).__name__ != "SyncResponse":
@@ -825,6 +934,7 @@ class MatrixTransport:
             await self.client.receive_response(response)
             for room in self.c["rooms"]:
                 await self.room_gate(room)
+            self._batch = {**self._batch, "gate_s": round(time.monotonic() - gate_started, 3)}
             for room, info in response.rooms.join.items():
                 if room not in self.c["rooms"]:
                     continue
@@ -836,7 +946,13 @@ class MatrixTransport:
                             self._remember_text(event_id, room, event.sender, event.body)
                     req = self.admit_event(room, event)
                     if req:
-                        await self.input(req)
+                        self._origin_ms = getattr(event, "server_timestamp", None)
+                        try:
+                            await self.input(req)
+                        finally:
+                            self._origin_ms = None
+            self._batch = {}
+            self.wake()  # notices queued while admitting the batch
             await self._request_room_keys()
             self.store.commit_sync(raw["next_batch"])
             await self._upload_keys_if_needed()
@@ -1003,7 +1119,10 @@ class MatrixTransport:
                         self._remember_text(sent, job["room_id"], self.c["account"], chunks[i])
                         self.store.mark_part(job["event_id"], i + 1)
                     self.store.delivered(job["event_id"])
-            await asyncio.sleep(0.25)
+                    if "done" in self.turn_timing.get(job["event_id"], {}):
+                        self.mark(job["event_id"], "delivered")
+                        self._finish_timing(job["event_id"])
+            await self._idle(self.send_wake)
 
     async def _encrypted_raw(self, room: str, kind: str, content: Mapping[str, Any], txn: str) -> str:
         # nio 0.25.2 room_send ignores incomplete key sharing. Confirm every
@@ -1027,6 +1146,9 @@ class MatrixTransport:
         )
         event_id = result.get("event_id")
         bounded_text(event_id, 255)
+        active = self.active
+        if active is not None and active.get("room_id") == room:
+            self.mark(active["event_id"], "first_sent")
         return event_id
 
     async def encrypted_send(self, room: str, text: str, txn: str) -> str:
@@ -1089,8 +1211,9 @@ class MatrixTransport:
                 self.store.resolve_uncertain(job["event_id"], NOTICE_RESTARTED)
             job = self.store.claim()
             if not job:
-                await asyncio.sleep(0.25)
+                await self._idle(self.work_wake)
                 continue
+            self.mark(job["event_id"], "claimed")
             await self.run_turn(job)
 
     async def run_turn(self, job: Mapping[str, Any]) -> None:
@@ -1151,6 +1274,10 @@ class MatrixTransport:
                 self.store.set_meta(
                     "last_turn", {"event_id": job["event_id"], "outcome": outcome, "updated": time.time()}
                 )
+                self.mark(job["event_id"], "done")
+                if not any(row["event_id"] == job["event_id"] for row in self.store.outbox()):
+                    self._finish_timing(job["event_id"])  # else when send() delivers the reply
+                self.wake()  # the reply or closing notice is in the outbox now
 
     def _close_interrupted(self, job: Mapping[str, Any], outcome: str) -> None:
         if not any(j["event_id"] == job["event_id"] for j in self.store.uncertain()):
@@ -1204,6 +1331,10 @@ class MatrixTransport:
             group.create_task(self.work())
 
     async def close(self) -> None:
+        for task in list(self.background):
+            task.cancel()
+        if self.background:
+            await asyncio.gather(*self.background, return_exceptions=True)
         if self.client:
             await self.client.close()
         if self.http:
