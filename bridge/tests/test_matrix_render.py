@@ -130,6 +130,26 @@ def test_headings_lists_quotes_and_paragraph_breaks() -> None:
     )
 
 
+def test_ordered_list_keeps_numbering_across_nested_bullets() -> None:
+    _body, formatted = render_matrix_message("1. A\n   - a\n   - b\n2. B")
+    assert formatted == "<ol><li>A<ul><li>a</li><li>b</li></ul></li><li>B</li></ol>"
+
+
+def test_ordered_list_survives_a_single_blank_line() -> None:
+    _body, formatted = render_matrix_message("1. first\n\n2. second")
+    assert formatted == "<ol><li>first</li><li>second</li></ol>"
+
+
+def test_ordered_list_absorbs_indented_continuation() -> None:
+    _body, formatted = render_matrix_message("1. item\n   continued\n2. next")
+    assert formatted == "<ol><li>item<br>continued</li><li>next</li></ol>"
+
+
+def test_ordered_list_keeps_its_start_number() -> None:
+    _body, formatted = render_matrix_message("3. third\n4. fourth")
+    assert formatted == '<ol start="3"><li>third</li><li>fourth</li></ol>'
+
+
 def test_fenced_code_block_with_language_and_escaping() -> None:
     text = "before\n```python\nif a < b:\n    print('<x>')\n```\nafter"
     _body, formatted = render_matrix_message(text)
