@@ -131,7 +131,8 @@ def output(data):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("escaped", [False, True])
-async def test_extractor_uses_only_explicit_auth_and_tool_free_private_input(tmp_path, monkeypatch, escaped):
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_extractor_uses_only_explicit_auth_and_tool_free_private_input(tmp_path, monkeypatch, escaped, fenced):
     ident, _ = journal(tmp_path / "private")
     snapshot = read_danso_snapshot(
         tmp_path / "private", ident, bounds=TranscriptBounds(), cwd=Path("/fixture")
@@ -145,6 +146,9 @@ async def test_extractor_uses_only_explicit_auth_and_tool_free_private_input(tmp
         data = DistillExtractionInput.model_validate(value)
     script = tmp_path / "danso"
     marker = tmp_path / "capture.json"
+    rendered = json.dumps(output(data))
+    if fenced:
+        rendered = "```json\n" + rendered + "\n```"
     script.write_text(
         "#!/usr/bin/python3\nimport os,sys,json,pathlib\na=sys.argv\n"
         'p=pathlib.Path(a[a.index("--system-context-file")+1])\n'
@@ -152,13 +156,14 @@ async def test_extractor_uses_only_explicit_auth_and_tool_free_private_input(tmp
         "assert len(p.read_bytes()) <= 32768\n"
         f"assert json.loads(p.read_text().split('Untrusted transcript JSON:\\n',1)[1])['truncated'] is {escaped!r}\n"
         'assert "Remember my preference" in p.read_text()\n'
+        'assert "Wiki output is disabled for this run. Return wiki_candidates as [] exactly." in p.read_text()\n'
         'assert "Remember my preference" not in " ".join(a)\n'
         'assert "--no-tools" in a and a[a.index("--max-turns")+1]=="1"\n'
         'assert "TELEGRAM_BOT_TOKEN" not in os.environ\n'
         'assert os.environ["DANSO_CHATGPT_AUTH_FILE"]=="/synthetic/danso-auth.json"\n'
         "assert not list(pathlib.Path.cwd().iterdir())\n"
         f"pathlib.Path({str(marker)!r}).write_text(str(p.parent))\n"
-        f"print({json.dumps(output(data))!r})\n"
+        f"print({rendered!r})\n"
     )
     script.chmod(0o700)
     settings = SimpleNamespace(
