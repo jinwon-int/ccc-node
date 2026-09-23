@@ -1658,3 +1658,241 @@ async def test_cross_signed_mode_ignores_untrusted_sender_devices_with_one_notic
         assert f.admit_event(room, message("$bad3", "b" * 43, verified=False)) is None
         assert sum(NOTICE_UNTRUSTED_DEVICE == r for r in h.replies()) == 2  # one per untrusted device key
         assert set(f.store.get_meta("untrusted_senders")) == {f"{owner}:{'d' * 43}", f"{owner}:{'b' * 43}"}
+
+
+# --------------------------------------------------------------------------- #
+# Reply context (#1943)
+# --------------------------------------------------------------------------- #
+
+from telegram_bot.core.matrix.state import (  # noqa: E402
+    MAX_TEXT_BYTES,
+    REPLY_CONTEXT_MAX_CHARS,
+    reply_context_body,
+    reply_target,
+    strip_reply_fallback,
+)
+
+
+def reply_event(
+    event: str = "$reply",
+    body: str = "이거 다시 설명해줘",
+    parent: str = "$parent",
+    sender: str | None = None,
+    now: int | None = None,
+    **content: Any,
+) -> dict[str, Any]:
+    stamp = now if now is not None else int(time.time() * 1000)
+    return dict(
+        type="m.room.message",
+        event_id=event,
+        sender=sender or "@owner:test.invalid",
+        origin_server_ts=stamp,
+        content={"msgtype": "m.text", "body": body, "m.relates_to": {"m.in_reply_to": {"event_id": parent}}, **content},
+    )
+
+
+def test_reply_target_only_for_plain_replies() -> None:
+    assert reply_target({"m.relates_to": {"m.in_reply_to": {"event_id": "$p"}}}) == "$p"
+    assert reply_target({"m.relates_to": {"rel_type": "m.thread", "m.in_reply_to": {"event_id": "$p"}}}) is None
+    assert reply_target({"m.relates_to": {"m.in_reply_to": {"event_id": "not-an-id"}}}) is None
+    assert reply_target({"m.relates_to": {"m.in_reply_to": "$p"}}) is None
+    assert reply_target({"body": "x"}) is None
+
+
+def test_strip_reply_fallback() -> None:
+    legacy = "> <@bot:test.invalid> 첫 줄\n> 둘째 줄\n\n진짜 답글"
+    assert strip_reply_fallback(legacy) == "진짜 답글"
+    assert strip_reply_fallback("> 인용만 한 평범한 글") == "> 인용만 한 평범한 글"  # not a fallback
+    assert strip_reply_fallback("> <@bot:test.invalid> only quote") == "> <@bot:test.invalid> only quote"
+    assert strip_reply_fallback("평범한 답글") == "평범한 답글"
+
+
+def test_reply_context_body_labels_truncates_and_fits() -> None:
+    kw = dict(account="@bot:test.invalid", sender="@owner:test.invalid", limit_bytes=MAX_TEXT_BYTES)
+    mine = reply_context_body("왜?", parent_sender="@bot:test.invalid", parent_body="줄1\n줄2", **kw)
+    assert mine == "[Reply context: the user is replying to your (the assistant's) earlier message]\n> 줄1\n> 줄2\n\n왜?"
+    own = reply_context_body("왜?", parent_sender="@owner:test.invalid", parent_body="x", **kw)
+    assert "their own earlier message" in own
+    other = reply_context_body("왜?", parent_sender=DAD, parent_body="x", **kw)
+    assert "an earlier message from " + DAD in other
+    long = reply_context_body("왜?", parent_sender=DAD, parent_body="가" * 5000, **kw)
+    assert long.count("가") == REPLY_CONTEXT_MAX_CHARS and "…(truncated)" in long
+    assert len(long.encode()) <= MAX_TEXT_BYTES
+    tight = reply_context_body("왜?", parent_sender=DAD, parent_body="가" * 5000, **{**kw, "limit_bytes": 400})
+    assert len(tight.encode()) <= 400 and tight.endswith("\n\n왜?")
+    body = "나" * 5000
+    assert reply_context_body(body, parent_sender=DAD, parent_body="x", **{**kw, "limit_bytes": 15_000}) == body
+
+
+def test_policy_admit_records_parent_and_strips_fallback(tmp_path: Path) -> None:
+    f = MatrixTransport(family_config(tmp_path), FakeRunner("complete"))
+    try:
+        now = int(time.time() * 1000)
+        req = f.policy.admit(f.c["rooms"][0], reply_event(now=now), decrypted=True, now_ms=now)
+        assert req is not None and req.reply_to == "$parent" and req.body == "이거 다시 설명해줘"
+        legacy = reply_event(now=now, body="> <@bot:test.invalid> 예전 답\n\n그래서?")
+        req = f.policy.admit(f.c["rooms"][0], legacy, decrypted=True, now_ms=now)
+        assert req is not None and req.body == "그래서?"
+        # Family admission is unchanged: a reply still needs a mention (the
+        # fallback's full "@bot:server" mxid never counted as a typed handle).
+        fallback = "> <@bot:test.invalid> 예전 답\n\n그래서?"
+        family = reply_event(sender=DAD, now=now, body=fallback)
+        assert f.policy.admit(FAMILY, family, decrypted=True, now_ms=now) is None
+        mentioned = reply_event(sender=DAD, now=now, body=fallback, **{"m.mentions": {"user_ids": ["@bot:test.invalid"]}})
+        req = f.policy.admit(FAMILY, mentioned, decrypted=True, now_ms=now)
+        assert req is not None and req.reply_to == "$parent" and req.body == "그래서?"
+    finally:
+        f.store.close()
+
+
+def _admit_reply(f: MatrixTransport, **kw: Any) -> Any:
+    now = int(time.time() * 1000)
+    return f.policy.admit(f.c["rooms"][0], reply_event(now=now, **kw), decrypted=True, now_ms=now)
+
+
+@pytest.mark.anyio
+async def test_reply_to_cached_bot_message_carries_parent_text(tmp_path: Path) -> None:
+    async with family(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        f._remember_text("$parent", room, h.account, "지난번 답변 내용")
+        await f.input(_admit_reply(f))
+        job = f.store.claim()
+        assert job is not None and job["event_id"] == "$reply"
+        assert job["body"] == (
+            "[Reply context: the user is replying to your (the assistant's) earlier message]\n"
+            "> 지난번 답변 내용\n\n이거 다시 설명해줘"
+        )
+
+
+@pytest.mark.anyio
+async def test_reply_parent_is_fetched_and_decrypted_on_cache_miss(tmp_path: Path) -> None:
+    async with family(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        client_mock(f)
+
+        class Event:
+            @staticmethod
+            def parse_encrypted_event(raw: Any) -> Any:
+                megolm = h.nio.MegolmEvent()
+                megolm.raw = raw  # type: ignore[attr-defined]
+                return megolm
+
+        setattr(h.nio, "Event", Event)
+        decrypted = h.nio.RoomMessageText(sender=h.owner, body="어제 보낸 질문", sender_key="b" * 43)
+        f.client.decrypt_event = Mock(return_value=decrypted)
+        calls: list[str] = []
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            calls.append(path)
+            return {"event_id": "$parent", "type": "m.room.encrypted", "content": {}}
+
+        f.raw = raw
+        await f.input(_admit_reply(f))
+        assert calls == ["/_matrix/client/v3/rooms/" + quote(room, safe="") + "/event/" + quote("$parent", safe="")]
+        assert f.client.decrypt_event.call_args.args[0].room_id == room
+        job = f.store.claim()
+        assert job is not None and job["body"].startswith("[Reply context: the user is replying to their own earlier message]\n> 어제 보낸 질문")
+        assert f.recent_text["$parent"] == (room, h.owner, "어제 보낸 질문")
+
+
+@pytest.mark.anyio
+async def test_reply_context_fails_open_and_rejects_untrusted_or_plaintext_parents(tmp_path: Path) -> None:
+    async with family(tmp_path) as h:
+        f = h.f
+        client_mock(f)
+
+        async def missing(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            raise SafetyStop("matrix-http-404")
+
+        f.raw = missing
+        await f.input(_admit_reply(f, event="$r1"))
+        job = f.store.claim()
+        assert job is not None and job["body"] == "이거 다시 설명해줘"
+        assert f.store.get_meta("reply_context_miss")["room"] == f.c["rooms"][0]
+        f.store.finish(job["event_id"], "ok")
+        h.drain()
+
+        async def plaintext(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            return {"event_id": "$parent", "type": "m.room.message", "content": {"msgtype": "m.text", "body": "평문"}}
+
+        f.raw = plaintext
+        await f.input(_admit_reply(f, event="$r2"))
+        job = f.store.claim()
+        assert job is not None and job["body"] == "이거 다시 설명해줘"
+        f.store.finish(job["event_id"], "ok")
+        h.drain()
+
+        # A parent from an unpinned device (or a stranger) is never quoted.
+        setattr(h.nio, "Event", types.SimpleNamespace(parse_encrypted_event=lambda raw: h.nio.MegolmEvent()))
+        f.client.decrypt_event = Mock(return_value=h.nio.RoomMessageText(sender=DAD, body="위조", sender_key="z" * 43))
+
+        async def encrypted(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            return {"event_id": "$parent", "type": "m.room.encrypted", "content": {}}
+
+        f.raw = encrypted
+        await f.input(_admit_reply(f, event="$r3"))
+        job = f.store.claim()
+        assert job is not None and job["body"] == "이거 다시 설명해줘"
+        assert "$parent" not in f.recent_text
+
+
+@pytest.mark.anyio
+async def test_reply_replay_and_command_replies_stay_stable(tmp_path: Path) -> None:
+    async with family(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        f._remember_text("$parent", room, h.account, "원문")
+        req = _admit_reply(f)
+        await f.input(req)
+        # Replayed sync after the cache changed: no re-enrichment, no identity conflict.
+        f.recent_text.clear()
+        f.raw = AsyncMock(side_effect=AssertionError("replay must not fetch"))
+        await f.input(req)
+        job = f.store.claim()
+        assert job is not None and "> 원문" in job["body"]
+        f.store.finish(job["event_id"], "ok")
+        h.drain()
+        # A /command sent as a reply stays verbatim so the bot still parses it.
+        f._remember_text("$parent", room, h.account, "원문")
+        await f.input(_admit_reply(f, event="$cmd", body="/new"))
+        job = f.store.claim()
+        assert job is not None and job["body"] == "/new"
+        f.store.finish(job["event_id"], "ok")
+        h.drain()
+        # So does a bare number answering a numbered menu (Danso recovery, /resume).
+        await f.input(_admit_reply(f, event="$pick", body=" 2 "))
+        job = f.store.claim()
+        assert job is not None and job["body"] == " 2 "
+
+
+@pytest.mark.anyio
+async def test_sent_chunks_and_trusted_sync_texts_are_remembered(tmp_path: Path) -> None:
+    async with family(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        # Sync side: only trusted decrypted texts enter the cache.
+        good = h.nio.RoomMessageText(sender=DAD, body="가족 메시지", sender_key="c" * 43)
+        bad = h.nio.RoomMessageText(sender=DAD, body="미검증", sender_key="z" * 43)
+        mine = h.nio.RoomMessageText(sender=h.account, body="봇 메시지")
+        assert f._trusted_text(good) and not f._trusted_text(bad) and f._trusted_text(mine)
+        assert not f._trusted_text(h.nio.RoomMessageText(sender=DAD, body="x", sender_key="c" * 43, verified=False))
+        # Send side: every delivered chunk is remembered under its event id.
+        client_mock(f)
+        f.client.olm.outbound_group_sessions = {room: types.SimpleNamespace(users_shared_with={(h.owner, "OWNER")})}
+        f.pin_devices = AsyncMock()
+        f.room_gate = AsyncMock(return_value=True)
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            return {"event_id": "$sent-" + path.rsplit("/", 1)[1][:8]}
+
+        f.raw = raw
+        f.enqueue_notice(room, "보낸 답변")
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
+            h.start(f.retry(f.send))
+            await h.until(lambda: not f.store.outbox())
+        assert [v for v in f.recent_text.values()] == [(room, h.account, "보낸 답변")]
+        for i in range(t.RECENT_TEXT_CAP + 5):
+            f._remember_text(f"$e{i}", room, DAD, "x")
+        assert len(f.recent_text) == t.RECENT_TEXT_CAP

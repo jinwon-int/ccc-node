@@ -4,6 +4,23 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **bridge/matrix: replies carry the message they answer.** When a user
+  uses the Matrix reply feature (`m.relates_to.m.in_reply_to`), the agent
+  used to see only the reply text — Element X no longer sends the legacy
+  quote fallback — so "이거 다시 설명해줘" had no referent (#1943). The
+  transport now resolves the parent (bounded in-memory cache of recent
+  trusted texts, the bot's own sent chunks included; else
+  `GET /rooms/{room}/event/{id}` + megolm decrypt) and prefixes the job body
+  with a `[Reply context: …]` header plus a quoted excerpt (≤2000 chars,
+  kept within `MAX_TEXT_BYTES`). Only encrypted parents from the bot or an
+  allowed sender's trusted device are quoted; plaintext/untrusted parents
+  and any fetch/decrypt failure fall back to the plain reply (fail-open,
+  never a SafetyStop; `reply_context_miss` meta records the miss). A legacy
+  `> <@user>` fallback is stripped from the body; the family mention gate
+  still reads the original body, so admission is unchanged. `/command` and
+  bare-number replies (numbered menus) stay verbatim, and a replayed sync
+  never re-enriches a stored job (digest stays stable).
+
 - **security: the A2A edge secret no longer travels in curl argv on local
   broker calls.** The five local broker curls in `rescreen-rotation.py`
   (`/workers?include=stale_read_path`, `/audit?action=task.failed`) and
