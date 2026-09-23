@@ -4,6 +4,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **self-update: a regular-file `self-update.lock` no longer stalls the node
+  silently.** The lock is a `mkdir` directory, but an external script that
+  opened the same path with `O_CREAT` + `flock` left a regular file behind and
+  every later tick exited 3 with no log line while `status` said `free` —
+  11 fleet nodes stopped updating on 2026-09-22 (#1945). A foreign file is now
+  probed with a non-blocking `flock` (fallback: 30-minute mtime) and removed
+  when nobody holds it; a held one or a symlink still fails closed. Every
+  lock-held abort is logged as `abort reason=lock-held kind=…`, and `status`
+  shows `FOREIGN-FILE (held|stale)`. The docs now state the lock contract for
+  external serializers (`mkdir`/`rmdir` only).
+
 - **bridge/matrix: replies carry the message they answer.** When a user
   uses the Matrix reply feature (`m.relates_to.m.in_reply_to`), the agent
   used to see only the reply text — Element X no longer sends the legacy

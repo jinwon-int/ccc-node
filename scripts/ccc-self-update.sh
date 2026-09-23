@@ -58,7 +58,8 @@
 #      CCC_SELF_UPDATE_SYSTEMCTL (default systemctl; tests inject a fake),
 #      CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS (180; integer 1..900),
 #      CCC_SELF_UPDATE_RESTART_WAIT_SECONDS (60; separate health-probe budget),
-#      CCC_STATE_DIR, CCC_PUSH_SPOOL, CCC_NODE.
+#      CCC_STATE_DIR, CCC_PUSH_SPOOL, CCC_NODE,
+#      CCC_SELF_UPDATE_FLOCK (flock(1) probe for a foreign regular-file lock, #1945).
 #      Pending-activation evaluation (#1527): CCC_SELF_UPDATE_SERVING_GENERATION_CMD
 #      (env override for the operator's serving-generation probe file) and
 #      CCC_SELF_UPDATE_SERVING_GEN_FILE (file-path override).
@@ -127,6 +128,70 @@ KEEP_INSTALL_SNAPSHOT=0
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s %s\n' "$(ts)" "$*" 2>/dev/null >> "$LOG" || :; }
 say() { printf '%s\n' "$*"; }
+
+# --- lock inspection (#1945) --------------------------------------------------
+# The lock contract is a DIRECTORY created with mkdir. An external serializer
+# that instead opens the same path with O_CREAT + flock leaves a regular FILE
+# behind, and every later mkdir fails with EEXIST forever — on 2026-09-22 that
+# silently stalled self-update on 11 fleet nodes (no log line, status said
+# "free", and the rmdir-only stale branch could never clear it).
+LOCK_FLOCK_CMD="${CCC_SELF_UPDATE_FLOCK:-flock}"
+
+lock_kind() { # -> absent | dir | foreign-file | other
+  if [ -L "$LOCK" ]; then echo other
+  elif [ -d "$LOCK" ]; then echo dir
+  elif [ -f "$LOCK" ]; then echo foreign-file
+  elif [ -e "$LOCK" ]; then echo other
+  else echo absent
+  fi
+}
+
+# True when a regular-file lock is provably abandoned. With flock(1) available
+# the file is stale only if a non-blocking flock succeeds (nobody holds it);
+# conflict or any error is treated as held (fail-closed). Without flock(1) fall
+# back to the same 30-minute mtime rule the directory lock uses.
+foreign_lock_stale() {
+  if command -v "$LOCK_FLOCK_CMD" >/dev/null 2>&1; then
+    "$LOCK_FLOCK_CMD" -n -E 75 "$LOCK" true 2>/dev/null
+    return $?
+  fi
+  [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]
+}
+
+lock_status() {
+  case "$(lock_kind)" in
+    dir) echo HELD ;;
+    foreign-file)
+      if foreign_lock_stale; then echo "FOREIGN-FILE (stale; next run removes it)"
+      else echo "FOREIGN-FILE (held by another process)"; fi ;;
+    other) echo "BLOCKED (unexpected file type at $LOCK)" ;;
+    *) echo free ;;
+  esac
+}
+
+acquire_lock() {
+  mkdir "$LOCK" 2>/dev/null && return 0
+  local kind
+  kind="$(lock_kind)"
+  case "$kind" in
+    dir)
+      # Stale after 30 minutes.
+      if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
+        rmdir "$LOCK" 2>/dev/null
+        mkdir "$LOCK" 2>/dev/null && return 0
+      fi
+      ;;
+    foreign-file)
+      if foreign_lock_stale; then
+        log "lock foreign-file stale; removing mtime=$(date -u -r "$LOCK" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '?') size=$(wc -c < "$LOCK" 2>/dev/null | tr -d ' ')"
+        rm -f -- "$LOCK" 2>/dev/null && mkdir "$LOCK" 2>/dev/null && return 0
+      fi
+      ;;
+  esac
+  log "abort reason=lock-held kind=$kind"
+  say "self-update: lock held ($kind); aborting" >&2
+  return 1
+}
 
 resolve_repo() {
   if [ -n "${CCC_SELF_UPDATE_REPO:-}" ]; then printf '%s' "$CCC_SELF_UPDATE_REPO"; return; fi
@@ -479,7 +544,7 @@ if [ "$MODE" = "status" ]; then
   REPO="$(resolve_repo)"
   say "repo: $REPO (branch $BRANCH)"
   say "head: $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
-  say "lock: $([ -d "$LOCK" ] && echo HELD || echo free)"
+  say "lock: $(lock_status)"
   say "services file: $SERVICES_FILE $([ -f "$SERVICES_FILE" ] && echo "($(grep -cv '^[[:space:]]*\(#\|$\)' "$SERVICES_FILE" 2>/dev/null || true) services)" || echo '(missing)')"
   say "external restart command timeout: ${RESTART_COMMAND_TIMEOUT_SECONDS}s"
   say "post-restart health budget: ${RESTART_WAIT_SECONDS}s"
@@ -515,16 +580,8 @@ if [[ ! "$RESTART_COMMAND_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$RESTAR
   exit 2
 fi
 
-# --- lock (stale after 30 minutes) -------------------------------------------
-if ! mkdir "$LOCK" 2>/dev/null; then
-  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
-    rmdir "$LOCK" 2>/dev/null
-    mkdir "$LOCK" 2>/dev/null || { say "self-update: lock held; aborting" >&2; exit 3; }
-  else
-    say "self-update: lock held; aborting" >&2
-    exit 3
-  fi
-fi
+# --- lock (stale after 30 minutes; foreign regular file recovered, #1945) ------
+acquire_lock || exit 3
 trap cleanup EXIT
 
 # Unsafe or interrupted activation evidence blocks every run, including forced

@@ -1222,5 +1222,62 @@ run_selfup run > "$TMP/unsafe-change.out" 2>&1; rc=$?
 ok "unsafe changed tick cannot advance source or run setup" \
   '[ "$rc" = 14 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$unsafe_head" ] && [ ! -e "$SETUP_MARKER" ]'
 
+# --- foreign regular-file lock (#1945) ----------------------------------------
+# An external serializer that opens self-update.lock with O_CREAT + flock
+# leaves a regular file; mkdir then fails forever. These cases sit at the end
+# so the later exit of each run (whatever the fixture state) is irrelevant —
+# they assert only lock acquisition (rc != 3), the audit line, and cleanup.
+LOCKP="$STATE/self-update.lock"
+rm -rf -- "$LOCKP"
+out="$(run_selfup status 2>&1)"
+ok "status reports free with no lock" 'grep -q "^lock: free$" <<<"$out"'
+
+# Directory lock held: abort is now logged, not silent.
+mkdir "$LOCKP"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "held dir lock exits 3 and logs kind=dir" \
+  '[ "$rc" = 3 ] && grep -q "lock held (dir)" <<<"$out" && grep -q "abort reason=lock-held kind=dir" "$STATE/self-update.log"'
+rmdir "$LOCKP"
+
+if command -v flock >/dev/null 2>&1; then
+  # Foreign file actively flocked by another process: fail closed, keep it.
+  : > "$LOCKP"
+  # exec so the holder PID *is* the fd owner: killing it releases the flock
+  # (a plain `flock FILE sleep` leaves the inherited fd alive in the orphan).
+  ( exec 9<>"$LOCKP"; flock 9; exec sleep 30 ) &
+  holder=$!
+  for _ in $(seq 1 50); do flock -n "$LOCKP" true 2>/dev/null || break; sleep 0.1; done
+  out="$(run_selfup status 2>&1)"
+  ok "status reports a held foreign-file lock" 'grep -q "^lock: FOREIGN-FILE (held" <<<"$out"'
+  out="$(run_selfup run 2>&1)"; rc=$?
+  ok "held foreign-file lock exits 3, is logged and kept" \
+    '[ "$rc" = 3 ] && grep -q "lock held (foreign-file)" <<<"$out" && grep -q "abort reason=lock-held kind=foreign-file" "$STATE/self-update.log" && [ -f "$LOCKP" ]'
+  kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+
+  # Same file, nobody holds it: stale — reported, removed, lock acquired.
+  # shellcheck disable=SC2034  # out is read via eval inside ok()
+  out="$(run_selfup status 2>&1)"
+  ok "status reports a stale foreign-file lock" 'grep -q "^lock: FOREIGN-FILE (stale" <<<"$out"'
+  run_selfup run >/dev/null 2>&1; rc=$?
+  ok "stale foreign-file lock is recovered and logged" \
+    '[ "$rc" != 3 ] && grep -q "lock foreign-file stale; removing" "$STATE/self-update.log" && [ ! -e "$LOCKP" ]'
+fi
+
+# Without flock(1): a fresh foreign file is held, an old one is stale (30 min).
+: > "$LOCKP"
+CCC_SELF_UPDATE_FLOCK="$TMP/no-such-flock" run_selfup run >/dev/null 2>&1; rc=$?
+ok "no-flock fallback keeps a fresh foreign file" '[ "$rc" = 3 ] && [ -f "$LOCKP" ]'
+touch -d '2 hours ago' "$LOCKP"
+: > "$STATE/self-update.log"
+CCC_SELF_UPDATE_FLOCK="$TMP/no-such-flock" run_selfup run >/dev/null 2>&1; rc=$?
+ok "no-flock fallback recovers an old foreign file" \
+  '[ "$rc" != 3 ] && grep -q "lock foreign-file stale; removing" "$STATE/self-update.log" && [ ! -e "$LOCKP" ]'
+
+# A symlink at the lock path is never removed.
+ln -s "$TMP/elsewhere" "$LOCKP"
+run_selfup run >/dev/null 2>&1; rc=$?
+ok "symlink at lock path fails closed and survives" '[ "$rc" = 3 ] && [ -L "$LOCKP" ] && grep -q "kind=other" "$STATE/self-update.log"'
+rm -f -- "$LOCKP"
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
