@@ -28,8 +28,8 @@ import re
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}```[ \t]*([A-Za-z0-9_+#.-]{0,32})[ \t]*$")
 _FENCE_CLOSE_RE = re.compile(r"^ {0,3}```[ \t]*$")
 _HEADING_RE = re.compile(r"^(#{1,3})[ \t]+(.*\S)[ \t]*$")
-_UL_RE = re.compile(r"^ {0,3}[-*][ \t]+(.*)$")
-_OL_RE = re.compile(r"^ {0,3}\d{1,9}[.)][ \t]+(.*)$")
+_UL_RE = re.compile(r"^ {0,3}[-*][ \t]+(?P<text>.*)$")
+_OL_RE = re.compile(r"^ {0,3}(?P<num>\d{1,9})[.)][ \t]+(?P<text>.*)$")
 _QUOTE_RE = re.compile(r"^ {0,3}>[ \t]?(.*)$")
 
 _CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
@@ -152,11 +152,8 @@ def _render_blocks(lines: list[str], inline: _Inline) -> list[str]:  # noqa: C90
         for tag, pattern in (("ul", _UL_RE), ("ol", _OL_RE)):
             if pattern.match(line):
                 inline.markup = True
-                items: list[str] = []
-                while i < n and (m := pattern.match(lines[i])):
-                    items.append(f"<li>{inline.render(m.group(1))}</li>")
-                    i += 1
-                out.append(f"<{tag}>{''.join(items)}</{tag}>")
+                rendered, i = _render_list(lines, i, tag, pattern, inline)
+                out.append(rendered)
                 break
         else:
             para: list[str] = []
@@ -165,6 +162,67 @@ def _render_blocks(lines: list[str], inline: _Inline) -> list[str]:  # noqa: C90
                 i += 1
             out.append(f"<p>{'<br>'.join(para)}</p>")
     return out
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _is_continuation(line: str, item_indent: int) -> bool:
+    """A non-blank line indented 2+ spaces past its item that starts no other block."""
+
+    return bool(
+        line.strip()
+        and _indent(line) >= item_indent + 2
+        and not _FENCE_OPEN_RE.match(line)
+        and not _QUOTE_RE.match(line)
+    )
+
+
+def _render_list(
+    lines: list[str], i: int, tag: str, pattern: re.Pattern[str], inline: _Inline
+) -> tuple[str, int]:
+    """Render the list starting at ``lines[i]``; return ``(html, next_index)``.
+
+    Lines indented 2+ spaces past an item belong to it: bullets become a nested
+    ``<ul>``, anything else is appended with ``<br>``. A single blank line
+    between two items of the same list does not end the list (#1937).
+    """
+
+    n = len(lines)
+    items: list[str] = []
+    start = 1
+    while i < n and (m := pattern.match(lines[i])):
+        if not items and tag == "ol":
+            start = int(m.group("num"))
+        item_indent = _indent(lines[i])
+        parts = [inline.render(m.group("text"))]
+        nested: list[str] = []
+        i += 1
+        while i < n and _is_continuation(lines[i], item_indent):
+            sub = _UL_RE.match(lines[i].lstrip(" "))
+            if sub:
+                nested.append(f"<li>{inline.render(sub.group('text'))}</li>")
+            else:
+                if nested:
+                    parts.append(f"<ul>{''.join(nested)}</ul>")
+                    nested = []
+                else:
+                    parts.append("<br>")
+                parts.append(inline.render(lines[i].strip()))
+            i += 1
+        if nested:
+            parts.append(f"<ul>{''.join(nested)}</ul>")
+        items.append(f"<li>{''.join(parts)}</li>")
+        if (
+            i + 1 < n
+            and not lines[i].strip()
+            and pattern.match(lines[i + 1])
+            and _indent(lines[i + 1]) < item_indent + 2
+        ):
+            i += 1
+    attr = f' start="{start}"' if tag == "ol" and start != 1 else ""
+    return f"<{tag}{attr}>{''.join(items)}</{tag}>", i
 
 
 def _is_block_start(line: str) -> bool:
