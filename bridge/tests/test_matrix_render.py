@@ -130,6 +130,45 @@ def test_headings_lists_quotes_and_paragraph_breaks() -> None:
     )
 
 
+# --- #1937: ordered-list numbering survives interruptions ---------------------
+
+
+def test_ol_split_by_indented_sub_bullets_keeps_numbers() -> None:
+    _body, formatted = render_matrix_message("1. A\n   - a\n   - b\n2. B\n")
+    # The sub-bullets are absorbed into item A, so B continues the SAME <ol>
+    # and its number renders naturally — no restart, no start attr needed.
+    assert formatted == "<ol><li>A<ul><li>a</li><li>b</li></ul></li><li>B</li></ol>"
+
+
+def test_ol_split_by_blank_line_keeps_numbers() -> None:
+    _body, formatted = render_matrix_message("1. first\n\n2. second\n")
+    assert formatted == '<ol><li>first</li></ol><ol start="2"><li>second</li></ol>'
+
+
+def test_ol_split_by_continuation_line_keeps_numbers() -> None:
+    _body, formatted = render_matrix_message("1. first item\n   trailing detail\n2. second\n")
+    # The continuation is absorbed into item 1, so item 2 stays in the same
+    # list and renders as 2.
+    assert formatted == "<ol><li>first item<br>trailing detail</li><li>second</li></ol>"
+
+
+def test_ol_start_preserves_written_numbers() -> None:
+    _body, formatted = render_matrix_message("3. third\n4. fourth\n")
+    assert formatted == '<ol start="3"><li>third</li><li>fourth</li></ol>'
+
+
+def test_consecutive_ol_stays_plain() -> None:
+    _body, formatted = render_matrix_message("1. one\n2. two\n")
+    assert formatted == "<ol><li>one</li><li>two</li></ol>"
+
+
+def test_ul_item_absorbs_indented_sub_bullets_and_continuation() -> None:
+    _body, formatted = render_matrix_message("- top\n  - sub\n  more words\nnext para\n")
+    assert formatted == (
+        "<ul><li>top<ul><li>sub</li></ul><br>more words</li></ul><p>next para</p>"
+    )
+
+
 def test_fenced_code_block_with_language_and_escaping() -> None:
     text = "before\n```python\nif a < b:\n    print('<x>')\n```\nafter"
     _body, formatted = render_matrix_message(text)

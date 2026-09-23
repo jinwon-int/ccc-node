@@ -29,7 +29,9 @@ _FENCE_OPEN_RE = re.compile(r"^ {0,3}```[ \t]*([A-Za-z0-9_+#.-]{0,32})[ \t]*$")
 _FENCE_CLOSE_RE = re.compile(r"^ {0,3}```[ \t]*$")
 _HEADING_RE = re.compile(r"^(#{1,3})[ \t]+(.*\S)[ \t]*$")
 _UL_RE = re.compile(r"^ {0,3}[-*][ \t]+(.*)$")
-_OL_RE = re.compile(r"^ {0,3}\d{1,9}[.)][ \t]+(.*)$")
+_OL_RE = re.compile(r"^ {0,3}(\d{1,9})[.)][ \t]+(.*)$")  # group 1 = written number (#1937)
+_SUB_UL_RE = re.compile(r"^\s+[-*][ \t]+(.*)$")  # bullet indented under a list item
+_INDENTED_RE = re.compile(r"^\s+\S")  # any indented continuation under a list item
 _QUOTE_RE = re.compile(r"^ {0,3}>[ \t]?(.*)$")
 
 _CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
@@ -110,6 +112,30 @@ class _Inline:
         return _PLACEHOLDER_RE.sub(lambda m: stash[int(m.group(1))], text)
 
 
+def _render_list_item(fragments: list[tuple[str, str]]) -> str:
+    """One <li> from an item's fragments: the item text, indented continuation
+    lines (<br>-joined), and consecutive indented sub-bullets (nested <ul>)."""
+    parts: list[str] = []
+    in_sub = False
+    for kind, rendered in fragments:
+        if kind == "sub":
+            if not in_sub:
+                parts.append("<ul>")
+                in_sub = True
+            parts.append(f"<li>{rendered}</li>")
+            continue
+        if in_sub:
+            parts.append("</ul>")
+            in_sub = False
+        if kind == "cont":
+            parts.append(f"<br>{rendered}")
+        else:
+            parts.append(rendered)
+    if in_sub:
+        parts.append("</ul>")
+    return "<li>" + "".join(parts) + "</li>"
+
+
 def _render_blocks(lines: list[str], inline: _Inline) -> list[str]:  # noqa: C901
     """Block-level pass; each branch is one markdown construct."""
 
@@ -149,21 +175,42 @@ def _render_blocks(lines: list[str], inline: _Inline) -> list[str]:  # noqa: C90
                 i += 1
             out.append(f"<blockquote>{'<br>'.join(quoted)}</blockquote>")
             continue
-        for tag, pattern in (("ul", _UL_RE), ("ol", _OL_RE)):
-            if pattern.match(line):
-                inline.markup = True
-                items: list[str] = []
-                while i < n and (m := pattern.match(lines[i])):
-                    items.append(f"<li>{inline.render(m.group(1))}</li>")
-                    i += 1
-                out.append(f"<{tag}>{''.join(items)}</{tag}>")
-                break
-        else:
-            para: list[str] = []
-            while i < n and lines[i].strip() and not _is_block_start(lines[i]):
-                para.append(inline.render(lines[i]))
+        ol_match = _OL_RE.match(line)
+        ul_match = None if ol_match else _UL_RE.match(line)
+        if ol_match or ul_match:
+            inline.markup = True
+            pattern = _OL_RE if ol_match else _UL_RE
+            item_group = 2 if ol_match else 1
+            # #1937: a list interrupted by sub-bullets, continuations or blank
+            # lines restarts as a new <ol>; carry the first written number in
+            # start="N" so options render 1, 2 instead of 1, 1.
+            start_attr = ""
+            if ol_match and (first := int(ol_match.group(1))) != 1:
+                start_attr = f' start="{first}"'
+            items = []
+            while i < n and (m := pattern.match(lines[i])):
+                fragments: list[tuple[str, str]] = [("item", inline.render(m.group(item_group)))]
                 i += 1
-            out.append(f"<p>{'<br>'.join(para)}</p>")
+                while i < n and lines[i].strip():
+                    sub = _SUB_UL_RE.match(lines[i])
+                    if sub:
+                        fragments.append(("sub", inline.render(sub.group(1))))
+                    elif _INDENTED_RE.match(lines[i]):
+                        fragments.append(("cont", inline.render(lines[i].strip())))
+                    else:
+                        break
+                    i += 1
+                items.append(_render_list_item(fragments))
+            if ol_match:
+                out.append(f"<ol{start_attr}>{''.join(items)}</ol>")
+            else:
+                out.append(f"<ul>{''.join(items)}</ul>")
+            continue
+        para: list[str] = []
+        while i < n and lines[i].strip() and not _is_block_start(lines[i]):
+            para.append(inline.render(lines[i]))
+            i += 1
+        out.append(f"<p>{'<br>'.join(para)}</p>")
     return out
 
 
