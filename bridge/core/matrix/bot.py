@@ -48,7 +48,8 @@ from telegram_bot.core.bot_danso_recovery import (
     RECOVERY_TEXT_ACTIONS,
     DansoRecoveryMixin,
 )
-from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor
+from telegram_bot.core.external_wait import ExternalWaitRegistry, default_registry_path
+from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
 from telegram_bot.core.matrix.render import chunk_text, render_matrix_message
 from telegram_bot.core.matrix_ids import MatrixIdMap
 from telegram_bot.core.memory_audience import resolve_memory_audience
@@ -75,6 +76,7 @@ SUPPORTED_COMMANDS = frozenset(
 _STATUS_HANDLE = 1
 SELF_JOB_PREFIX = "$self-"
 SELF_JOB_DANSO_AUTO_RESUME = "danso-auto-resume"
+SELF_JOB_EXTERNAL_WAIT_RESUME = "external-wait-resume"
 STATUS_MIN_INTERVAL_S = 15.0  # match Telegram CCC_HEARTBEAT_* defaults
 _HEALTH_INTERVAL_S = 10.0  # match bot_lifecycle._WORKLOAD_INTERVAL
 _RUNTIME_MODEL_PROVIDERS = frozenset({"codex", "piri", "crush", "danso"})
@@ -505,6 +507,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             await self._startup_danso_recovery_scan()
             notifier = MatrixSpoolNotifier(self._settings, transport)
             watchdog = self._build_turn_age_watchdog()
+            external_wait = self._build_external_wait_monitor()
             # Same TaskGroup semantics as transport.run(): a leg that dies
             # stops the service so systemd restarts it whole.
             stop = asyncio.Event()
@@ -527,6 +530,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                         group.create_task(notifier.run())
                     if watchdog is not None:
                         group.create_task(watchdog.run(stop), name="matrix-turn-age-watchdog")
+                    if external_wait is not None:
+                        group.create_task(external_wait.run(stop), name="matrix-external-wait-monitor")
             except BaseExceptionGroup as failure:
                 # A single failing leg (normally the transport) surfaces as itself,
                 # as it did when the transport was awaited directly.
@@ -793,6 +798,88 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             renotify_seconds=renotify_min * 60.0,
         )
 
+    def _build_external_wait_monitor(self) -> ExternalWaitMonitor | None:
+        """Durable external-wait watch loop for the Matrix frontend (#1934).
+
+        Telegram builds this in ``BotLifecycleMixin``, which ``MatrixBot``
+        does not inherit — so a Matrix ``gh-ci-wait`` registration answered
+        ``ok`` and wrote the record while nothing ever polled it: the CI
+        result and the promised continuation never arrived (#1934). Same
+        contract as Telegram: the shared ``ExternalWaitMonitor`` polls this
+        frontend's own registry (``bot_data_dir/external-wait`` — the home
+        the agent-side CLI resolves through ``CCC_EXTERNAL_WAIT_HOME``),
+        notifications ride :meth:`_notify_chat`, and the continuation is a
+        **self-job** turn in the waiting room (the #1895 mechanism), never a
+        detached process call. ``None`` when explicitly disabled.
+        """
+
+        if not ExternalWaitMonitor.env_flag("CCC_EXTERNAL_WAIT_ENABLED", default=True):
+            logger.info("Matrix external-wait monitor disabled (CCC_EXTERNAL_WAIT_ENABLED=0)")
+            return None
+        registry = ExternalWaitRegistry(default_registry_path(self._data_dir() / "external-wait"))
+        return ExternalWaitMonitor(
+            registry,
+            transport=GhCliTransport(),
+            notifier=self._notify_chat,
+            resumer=self._enqueue_external_wait_resume,
+            session_lookup=self._external_wait_session_lookup,
+            resume_enabled=ExternalWaitMonitor.env_flag(
+                "CCC_EXTERNAL_WAIT_RESUME", default=True
+            ),
+            resume_daily_cap=ExternalWaitMonitor.env_int(
+                "CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP", default=10
+            ),
+        )
+
+    async def _external_wait_session_lookup(self, user_id: int, chat_id: int) -> str | None:
+        """Current canonical session id for the conversation, or ``None``.
+
+        The monitor skips a registered continuation whose session has moved
+        on (``/new``, provider switch) so a stale promise is never injected
+        into a new session (#740); Matrix resolves through the same session
+        manager and conversation key the ordinary turn path uses.
+        """
+
+        try:
+            session = await self._session_manager.get_session(
+                self._conversation_key(int(user_id), int(chat_id))
+            )
+            return (session or {}).get("session_id")
+        except Exception:
+            return None
+
+    async def _enqueue_external_wait_resume(self, record: Mapping[str, Any], prompt: str) -> bool:
+        """Resumer seam: hand the continuation to the room as a self-job (#1934).
+
+        Enqueuing is the resume: the durable ``$self-…`` job runs the prompt
+        as an ordinary turn (claim, room sink, finish) and is idempotent per
+        ``wait_id``, so a restart drains it instead of re-deciding it.
+        """
+
+        transport = self._transport
+        room = self.room_for_chat(int(record.get("chat_id") or 0))
+        enqueue = getattr(transport, "enqueue_self_job", None)
+        if transport is None or room is None or not callable(enqueue):
+            logger.info(
+                "Matrix external-wait resume deferred: no transport/room for chat %s",
+                record.get("chat_id"),
+            )
+            return False
+        body = json.dumps(
+            {
+                "kind": SELF_JOB_EXTERNAL_WAIT_RESUME,
+                "v": 1,
+                "wait_id": str(record.get("wait_id") or ""),
+                "prompt": prompt,
+            }
+        )
+        try:
+            enqueue(room, body, key=f"{SELF_JOB_EXTERNAL_WAIT_RESUME}:{record.get('wait_id') or 'none'}")
+        except Exception as error:
+            logger.warning("Matrix external-wait self-job enqueue failed: %s", type(error).__name__)
+            return False
+        return True
+
     def _notification_bot(self) -> _NotificationRoute:
         return _NotificationRoute(self._deliver_notice)
 
@@ -925,7 +1012,14 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         self._active_sink = sink
         try:
             if str(job.get("event_id") or "").startswith(SELF_JOB_PREFIX):
-                return await self._run_self_job(body, user_id=user_id, chat_id=chat_id)
+                return await self._run_self_job(
+                    body,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    sink=sink,
+                    room_id=room_id,
+                    turn_marker=str(job.get("event_id") or ""),
+                )
             command, args = self._parse_command(body)
             if command == "skills":
                 return await self._cmd_skills(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink, turn_marker=str(job.get("event_id") or ""))
@@ -1274,15 +1368,36 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         # the journal inside its turn and only then claims it.
         return True
 
-    async def _run_self_job(self, body: str, *, user_id: int, chat_id: int) -> Any:
+    async def _run_self_job(
+        self,
+        body: str,
+        *,
+        user_id: int,
+        chat_id: int,
+        sink: TurnSink,
+        room_id: str,
+        turn_marker: str | None = None,
+    ) -> Any:
         try:
             payload = json.loads(body)
         except ValueError:
             payload = None
         kind = payload.get("kind") if isinstance(payload, dict) else None
-        if kind != SELF_JOB_DANSO_AUTO_RESUME or not self._check_user_access(user_id):
+        if kind not in (SELF_JOB_DANSO_AUTO_RESUME, SELF_JOB_EXTERNAL_WAIT_RESUME) or not self._check_user_access(user_id):
             logger.warning("Matrix self-job ignored: kind=%s", kind)
             return _turn_result("", None, streamed=True)
+        if kind == SELF_JOB_EXTERNAL_WAIT_RESUME:
+            # External-wait continuation (#1934): the resume prompt runs as an
+            # ordinary turn in the waiting room — session resolution, room
+            # sink, finish — so the promised follow-up reads like the answer
+            # it replaced, not like a detached system notice.
+            prompt = str(payload.get("prompt") or "")
+            if not prompt.strip():
+                logger.warning("Matrix external-wait self-job has no prompt; ignored")
+                return _turn_result("", None, streamed=True)
+            return await self._run_message(
+                prompt, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink, turn_marker=turn_marker
+            )
         key = self._conversation_key(user_id, chat_id)
         # Re-runs the full eligibility check; with the sink set the mixin's
         # automatic path claims the offer and dispatches. Anything no longer
