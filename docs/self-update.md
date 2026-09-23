@@ -13,7 +13,7 @@ rather than composing the steps ad hoc.
 `~/.claude/hooks/ccc-self-update.sh run` (installed by setup.sh):
 
 1. lock; resolve the repo (`CCC_SELF_UPDATE_REPO` > `~/.claude/self-update.repo`
-   > script location > `~/ccc-node`)
+   > script location > `~/ccc-node`). See *Lock contract* below.
 2. fail-closed preconditions: clean working tree, on the expected branch
    (`CCC_SELF_UPDATE_BRANCH`, default `main`); Claude/Hermes/state/repository
    paths must be absolute, normalized, non-root, non-overlapping, and free of
@@ -114,6 +114,34 @@ From then on, "이 노드 업데이트하고 재시작해줘" over Telegram (or 
 A2A fleet rollout) resolves to the guarded, audited
 `~/.claude/hooks/ccc-self-update.sh run` — no `CCC_ALLOW_GATED` needed and no
 per-restart approval friction.
+
+## Lock contract
+
+The lock is the **directory** `$STATE_DIR/self-update.lock` (default
+`~/.claude/state/self-update.lock`), taken with `mkdir` and released with
+`rmdir`. A directory older than 30 minutes is treated as stale and replaced.
+
+An external script that wants to serialize with the updater must follow the
+same contract — `mkdir` the directory before its work and `rmdir` it after.
+**Never create a file at that path.** Opening it with `O_CREAT` + `flock`
+leaves a regular file behind, and before #1945 every later `mkdir` failed
+forever: on 2026-09-22 an ad-hoc repair script did exactly that and silently
+stalled self-update on 11 fleet nodes (no log line, `status` said `free`).
+
+Since #1945 the updater recovers from that shape instead of stalling:
+
+- a regular file at the lock path is a *foreign* lock. If `flock(1)` is
+  available and a non-blocking `flock` on it succeeds (nobody holds it), the
+  file is stale: the run logs `lock foreign-file stale; removing mtime=… size=…`,
+  removes it and takes the directory lock. If someone holds it (or the probe
+  errors) the run aborts, fail-closed. Without `flock(1)` the 30-minute mtime
+  rule applies (`CCC_SELF_UPDATE_FLOCK` overrides the binary).
+- a symlink or any other file type is never removed (`kind=other`).
+- every `lock held` abort (exit 3) now writes
+  `abort reason=lock-held kind=<dir|foreign-file|other|absent>` to
+  `self-update.log`, so a stalled node is visible in the log.
+- `status` reports `HELD`, `FOREIGN-FILE (held by another process)`,
+  `FOREIGN-FILE (stale; next run removes it)`, `BLOCKED (…)` or `free`.
 
 ## External bridge restart and health commands
 
@@ -247,6 +275,7 @@ still does not include a complete previous dependency environment.
 | `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` | `3600` | cap total deferral so continuous load can't starve updates |
 | `CCC_SELF_UPDATE_REAPPLY` | `1` | set to `0` to skip installer cron re-apply; equivalent operator file: `~/.claude/self-update.no-reapply` |
 | `CCC_SELF_UPDATE_CRONTAB_CMD` | `crontab` | crontab binary (tests inject a stub) |
+| `CCC_SELF_UPDATE_FLOCK` | `flock` | flock(1) binary used to probe a foreign regular-file lock; missing → 30-minute mtime rule (#1945) |
 | `CCC_SELF_UPDATE_SIGNATURE_MODE` | `warn` | tip signature policy: `warn` (verify + report, still apply), `enforce` (refuse an unverified tip, exit 13), `off` (skip) |
 | `CCC_SELF_UPDATE_SIGNATURE_KEYRING` | `scripts/trusted-keys/github-web-flow.gpg` | keyring holding the permitted signing keys |
 | `CCC_SELF_UPDATE_TRUSTED_FPRS` | GitHub web-flow fingerprints | newline-separated full fingerprints allowed to sign the tip |
