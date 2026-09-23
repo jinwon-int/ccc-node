@@ -229,6 +229,32 @@ evidence-first continue) through a few channel ports:
   with the same stale-lock retry as Telegram (#1888). Off, or ineligible, the
   scan just offers the menu; answer `1`.
 
+## External waits — CI promises from a Matrix room are watched (#1934)
+
+`gh-ci-wait` registrations made from a Matrix conversation are polled, not
+just recorded. Previously the CLI answered `ok` and wrote the record while
+nothing ever read it (`ExternalWaitMonitor` was Telegram-only), so the CI
+rollup and the promised continuation silently never arrived. The Matrix
+frontend now runs the shared `ExternalWaitMonitor` in its serve loop:
+
+- **Registry** — this frontend's own home, `BOT_DATA_DIR/external-wait/` —
+  exactly the directory the agent-side CLI resolves through
+  `CCC_EXTERNAL_WAIT_HOME`; Telegram and Matrix registries stay separate.
+- **Notifications** ride the room notice path, so the CI rollup lands in the
+  conversation that registered the wait.
+- **Continuation** is a durable **self-job** (`$self-…` turn in the waiting
+  room, idempotent per `wait_id`, same mechanism as Danso auto-resume
+  above): the resumed turn resolves the ordinary session, streams through
+  the room sink and finishes like any answer. A restart drains the pending
+  self-job instead of losing the wake.
+- A wait whose session has moved on (`/new`, provider switch) is notified
+  only — the stale promise is never injected into a new session (#740).
+
+Flags: `CCC_EXTERNAL_WAIT_ENABLED` (default on), `CCC_EXTERNAL_WAIT_RESUME`
+(default on), `CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP` (default 10 continuations
+per day; beyond the cap the rollup is still delivered, only the
+auto-continuation is skipped).
+
 ## Grok (`CCC_AGENT_PROVIDER=grok`) — owner direct room only
 
 With the Grok provider, `CCC_CHANNEL=matrix` selects `core/grok_matrix_bot.py`
