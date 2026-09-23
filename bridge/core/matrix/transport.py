@@ -80,6 +80,55 @@ NOTICE_CANCELLED = "⏹ 요청대로 작업을 중단했습니다."
 NOTICE_TIMEOUT = "⏳ 시간 제한({minutes}분)을 넘겨 작업을 중단했습니다. 요청을 나눠서 다시 보내 주세요."
 
 
+# nio's DefaultStore keeps device trust in three plaintext files next to the
+# crypto database, one key per line.
+TRUST_FILE_SUFFIXES = (".trusted_devices", ".blacklisted_devices", ".ignored_devices")
+
+
+def compact_trust_files(crypto: Path) -> dict[str, int]:
+    """Drop duplicate lines from nio's trust files; return removed counts per file.
+
+    nio 0.25's file ``KeyStore.add`` appends without a duplicate check, reports
+    a change every time and rewrites the whole file, while ``remove`` deletes
+    only the first copy. ``pin_devices`` used to verify every trusted device on
+    every sync batch and every send, so the files grew without bound (sogyo
+    2026-09-24: 199,250 lines for 7 devices, 0.2 s of blocking I/O per call)
+    and every call invalidated the room's megolm session. The first copy of
+    each line is kept, which preserves what nio loads: membership is the same
+    set and ``get_key`` already returned the first match.
+    """
+    removed: dict[str, int] = {}
+    for path in sorted(crypto.iterdir()):
+        if not path.name.endswith(TRUST_FILE_SUFFIXES) or path.is_symlink() or not path.is_file():
+            continue
+        lines = path.read_text().splitlines()
+        seen: set[str] = set()
+        kept: list[str] = []
+        for line in lines:
+            key = line.strip()
+            if key and not key.startswith("#"):
+                if key in seen:
+                    continue
+                seen.add(key)
+            kept.append(line)
+        if len(kept) == len(lines):
+            continue
+        tmp = path.with_name("." + path.name + ".compact")
+        tmp.unlink(missing_ok=True)  # leftover of a crash mid-compaction
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "w") as out:
+                out.write("".join(line + "\n" for line in kept))
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        removed[path.name] = len(lines) - len(kept)
+    return removed
+
+
 def _timeout_label(turn_timeout: float) -> str:
     """Render the ceiling for the interrupted-turn notice (6시간, not 360분)."""
     minutes = round(turn_timeout / 60)
@@ -422,6 +471,11 @@ class MatrixTransport:
         self.store.storage_gate()
         crypto = root / "crypto"
         old = self._check_crypto_store(crypto, initialize)
+        # Before nio loads the store: shrink trust files bloated by the old
+        # verify-on-every-sync loop (see compact_trust_files).
+        compacted = compact_trust_files(crypto)
+        if compacted:
+            self.store.set_meta("trust_store_compacted", {"removed": compacted, "updated": time.time()})
         self.http = aiohttp.ClientSession(
             headers={"Authorization": "Bearer " + self.c["access_token"]},
             timeout=aiohttp.ClientTimeout(total=40),
@@ -504,7 +558,7 @@ class MatrixTransport:
             stored = self.client.device_store[self.c["owner"]][device]
             if stored.ed25519 != pin["ed25519"] or stored.curve25519 != pin["curve25519"]:
                 raise SafetyStop("owner-device-key-changed")
-            self.client.verify_device(stored)
+            self._verify(stored)
         for user in sorted(self.identities):
             self._trust_cross_signed(user, raw)
         # Family devices are pinned per user. Each user keeps the strict pin
@@ -519,7 +573,24 @@ class MatrixTransport:
                     raise SafetyStop("pinned-device-missing")
                 if stored.ed25519 != pin["ed25519"] or stored.curve25519 != pin["curve25519"]:
                     raise SafetyStop("pinned-device-key-changed")
-                self.client.verify_device(stored)
+                self._verify(stored)
+
+    def _verify(self, device: Any) -> None:
+        """Mark ``device`` verified only when it is not already.
+
+        nio's ``verify_device``/``blacklist_device`` report a change on every
+        call with the default file trust store, and a reported change drops
+        the outbound megolm session of every room the user is in — so an
+        unconditional call on each sync forced a fresh room-key share before
+        every message and grew the trust files (see compact_trust_files).
+        """
+        if not getattr(device, "verified", False):
+            self.client.verify_device(device)
+
+    def _blacklist(self, device: Any) -> None:
+        """Blacklist ``device`` only when it is not already (see :meth:`_verify`)."""
+        if not getattr(device, "blacklisted", False):
+            self.client.blacklist_device(device)
 
     def _trust_cross_signed(self, user: str, raw: Mapping[str, Any]) -> None:
         """Trust exactly the devices ``user``'s self-signing key has signed (#149).
@@ -555,10 +626,10 @@ class MatrixTransport:
                 continue
             published = (obj.get("keys") or {}).get("ed25519:" + device)
             if published == stored.ed25519 and self.client.olm.verify_json(copy.deepcopy(obj), ssk, user, ssk):
-                self.client.verify_device(stored)
+                self._verify(stored)
                 trusted[device] = stored.curve25519
             else:
-                self.client.blacklist_device(stored)
+                self._blacklist(stored)
         previous = self.trusted.get(user)
         self.trusted[user] = trusted
         if previous is None or set(previous) != set(trusted):
@@ -1076,7 +1147,7 @@ class MatrixTransport:
                 self.store.set_meta("family_room_devices", warnings)
         for user, devices in unpinned.items():
             for device in devices:
-                self.client.blacklist_device(self.client.device_store[user][device])
+                self._blacklist(self.client.device_store[user][device])
 
     # -- turns ----------------------------------------------------------------
 

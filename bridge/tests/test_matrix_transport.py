@@ -1896,3 +1896,60 @@ async def test_sent_chunks_and_trusted_sync_texts_are_remembered(tmp_path: Path)
         for i in range(t.RECENT_TEXT_CAP + 5):
             f._remember_text(f"$e{i}", room, DAD, "x")
         assert len(f.recent_text) == t.RECENT_TEXT_CAP
+
+
+# --------------------------------------------------------------------------- #
+# Trust-store churn (nio file KeyStore reports a change on every call)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_pin_devices_leaves_devices_already_in_the_wanted_trust_state(tmp_path: Path) -> None:
+    async with family(tmp_path) as h:
+        f = h.f
+        identity = {"ed25519": "agent-ed", "curve25519": "agent-cu"}
+        owner = pinned_device("a", "b")
+        owner.verified = True  # restored from the trust file: nothing to change
+        dad = pinned_device("c")
+        dad.verified = False
+        devices = {h.owner: {"OWNER": owner}, DAD: {"DAD1": dad, "DAD2": pinned_device("e")}, MOM: {"MOM1": pinned_device("f")}}
+        bot_keys = {"keys": {"ed25519:BOT": "agent-ed", "curve25519:BOT": "agent-cu"}}
+        everyone: dict[str, dict[str, Any]] = {h.owner: {"OWNER": {}}, DAD: {"DAD1": {}, "DAD2": {}}, MOM: {"MOM1": {}}}
+        client_mock(f, devices=devices, identity=identity)
+        h.route_raw(("keys", ""), {"device_keys": {h.account: {"BOT": bot_keys}, **everyone}})
+        await f.pin_devices()
+        assert [call.args[0] for call in f.client.verify_device.call_args_list] == [dad]
+
+        blocked = pinned_device("x")
+        blocked.blacklisted = True
+        fresh = pinned_device("y")
+        fresh.blacklisted = False
+        f._blacklist(blocked)
+        f._blacklist(fresh)
+        assert [call.args[0] for call in f.client.blacklist_device.call_args_list] == [fresh]
+
+
+def test_compact_trust_files_keeps_first_copies_only(tmp_path: Path) -> None:
+    crypto = tmp_path / "crypto"
+    crypto.mkdir(mode=0o700)
+    a = "@o:test.invalid A matrix-ed25519 keyA"
+    b = "@o:test.invalid B matrix-ed25519 keyB"
+    trusted = crypto / "@bot:test.invalid_BOT.trusted_devices"
+    trusted.write_text("\n".join([a, b, a, a, b, a]) + "\n")
+    blacklisted = crypto / "@bot:test.invalid_BOT.blacklisted_devices"
+    blacklisted.write_text(b + "\n")
+    database = crypto / "@bot:test.invalid_BOT.db"
+    database.write_bytes(b"\x00dup\n\x00dup\n")
+    for path in (trusted, blacklisted, database):
+        path.chmod(0o600)
+    (crypto / ("." + trusted.name + ".compact")).write_text("stale")
+
+    removed = t.compact_trust_files(crypto)
+
+    assert removed == {trusted.name: 4}
+    assert trusted.read_text() == a + "\n" + b + "\n"
+    assert oct(trusted.stat().st_mode & 0o777) == oct(0o600)
+    assert blacklisted.read_text() == b + "\n"
+    assert database.read_bytes() == b"\x00dup\n\x00dup\n", "only trust files are touched"
+    assert sorted(p.name for p in crypto.iterdir()) == sorted([trusted.name, blacklisted.name, database.name])
+    assert t.compact_trust_files(crypto) == {}
