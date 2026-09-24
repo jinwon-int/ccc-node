@@ -212,6 +212,9 @@ class GrokMatrixLifecycleTests(unittest.IsolatedAsyncioTestCase):
             seen["status"] = (await self.turn(bot, "/status")).text
             seen["commands"] = {await self.turn(bot, c) for c in ("/new", "/model other", "/resume x", "/command rm", "")}
             seen["large"] = (await self.turn(bot, "x" * (MAX_PROMPT + 1))).text
+            # #1795: a Matrix photo/file job (caption or placeholder body) stays text-only for Grok.
+            photo = {**job("이 사진 설명해줘"), "attachment": '{"kind":"image"}'}
+            seen["attachment"] = (await bot.runner.run(photo, sink=None, session_id=None, room_kind="direct")).text
             seen["untouched"] = (self.state() == before, len(self.host.calls) == calls)
 
         with stub_state(matrix_config()):
@@ -223,6 +226,7 @@ class GrokMatrixLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen["status"], STATUS_TEXT)
         self.assertEqual({r.text for r in seen["commands"]}, {TEXT_ONLY})
         self.assertEqual(seen["large"], TOO_LARGE)
+        self.assertEqual(seen["attachment"], TEXT_ONLY)
         self.assertEqual(seen["untouched"], (True, True))
         self.assertEqual(self.host.sends, [])
 

@@ -308,8 +308,8 @@ class GrokMatrixBot:
         generation = self._generation
         if body in {"/start", "/status"}:
             return _turn_result(STATUS_TEXT)
-        if not isinstance(body, str) or not body or body.startswith("/"):
-            return _turn_result(TEXT_ONLY)
+        if job.get("attachment") or not isinstance(body, str) or not body or body.startswith("/"):
+            return _turn_result(TEXT_ONLY)  # #1795: Grok stays text-only; no attachment reaches it
         if len(body.encode("utf-8")) > MAX_PROMPT:
             return _turn_result(TOO_LARGE)
         if self.active is not None:

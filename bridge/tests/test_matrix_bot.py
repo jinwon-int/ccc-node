@@ -1237,3 +1237,137 @@ async def test_serve_stops_the_watchdog_when_the_transport_returns(
     holder["body"] = body
     with anyio.fail_after(5):
         await bot.serve()
+
+
+# --- media input (#1795) -----------------------------------------------------
+
+
+def _encrypted(data: bytes) -> tuple[bytes, dict[str, Any]]:
+    import base64
+    import hashlib
+    import os
+
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    key, iv = os.urandom(32), os.urandom(8) + b"\x00" * 8
+    encryptor = Cipher(algorithms.AES(key), modes.CTR(iv)).encryptor()
+    ciphertext = encryptor.update(data) + encryptor.finalize()
+
+    def b64(raw: bytes, urlsafe: bool = False) -> str:
+        return (base64.urlsafe_b64encode if urlsafe else base64.b64encode)(raw).decode().rstrip("=")
+
+    return ciphertext, {
+        "url": "mxc://example.org/Media1",
+        "key": {"kty": "oct", "alg": "A256CTR", "ext": True, "k": b64(key, True), "key_ops": ["encrypt", "decrypt"]},
+        "iv": b64(iv),
+        "hashes": {"sha256": b64(hashlib.sha256(ciphertext).digest())},
+        "v": "v2",
+    }
+
+
+class _MediaTransport:
+    def __init__(self, ciphertext: bytes) -> None:
+        self.ciphertext = ciphertext
+        self.downloads = 0
+
+    async def download_media(self, mxc: str, *, max_bytes: int) -> bytes:
+        self.downloads += 1
+        return self.ciphertext
+
+    def room_kind(self, room: str) -> str:
+        return "direct"
+
+
+def _media_job(content: dict[str, Any], *, event_id: str = "$m1") -> dict[str, Any]:
+    from telegram_bot.core.matrix.attachments import (
+        ATTACHMENT_PLACEHOLDER,
+        encode_attachment,
+        media_attachment,
+        media_caption,
+    )
+
+    attachment = media_attachment(content)
+    assert attachment is not None
+    job = _job(media_caption(content) or ATTACHMENT_PLACEHOLDER, event_id=event_id)
+    job["attachment"] = encode_attachment(attachment)
+    return job
+
+
+@pytest.mark.anyio
+async def test_matrix_photo_runs_with_the_telegram_image_prompt_and_is_deleted(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, chat, manager = _bot(tmp_path, max_document_size_mb=10, image_context_guard=False)
+    _resume_existing_session(bot, manager)
+    ciphertext, file = _encrypted(b"\x89PNG fake image")
+    bot._transport = _MediaTransport(ciphertext)
+    seen: dict[str, Any] = {}
+
+    async def on_process(kwargs: dict[str, Any]) -> None:
+        path = Path(kwargs["user_message"].split("Local image path: ", 1)[1].split("\n", 1)[0])
+        seen["bytes"], seen["mode"] = path.read_bytes(), path.stat().st_mode & 0o777
+
+    chat.on_process = on_process
+    content = {"msgtype": "m.image", "body": "IMG.png", "info": {"mimetype": "image/png"}, "file": file}
+    result = await bot.run_turn(_media_job(content), sink=FakeSink(), session_id=None, room_kind="direct")
+    prompt = chat.calls[0]["user_message"]
+    assert prompt.startswith("The user sent an inbound Matrix image.")
+    assert "Telegram" not in prompt and ".png" in prompt
+    assert "Please describe what is in the image" in prompt  # caption-less default instruction
+    assert seen == {"bytes": b"\x89PNG fake image", "mode": 0o600}
+    assert result.text == "answer"
+    assert list((tmp_path / "data" / "matrix-media").iterdir()) == []  # no residue after the turn
+
+
+@pytest.mark.anyio
+async def test_matrix_file_caption_is_an_instruction_not_a_command(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    bot, chat, manager = _bot(tmp_path, max_document_size_mb=10, image_context_guard=False)
+    _resume_existing_session(bot, manager)
+    ciphertext, file = _encrypted(b"%PDF-1.7 fake")
+    bot._transport = _MediaTransport(ciphertext)
+    content = {"msgtype": "m.file", "body": "/new", "filename": "report.pdf",
+               "info": {"mimetype": "application/pdf"}, "file": file}
+    await bot.run_turn(_media_job(content), sink=FakeSink(), session_id=None, room_kind="direct")
+    prompt = chat.calls[0]["user_message"]
+    assert prompt.startswith("The user sent an inbound Matrix document.")
+    assert '"report.pdf"' in prompt and "MIME type: application/pdf" in prompt
+    assert "Caption / user instruction: /new" in prompt
+    assert f"File size: {len(b'%PDF-1.7 fake')} bytes" in prompt
+
+
+@pytest.mark.anyio
+async def test_matrix_attachment_failures_answer_once_without_running_the_agent(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    from telegram_bot.core.matrix.bot import ATTACHMENT_FAILED
+
+    bot, chat, _manager = _bot(tmp_path, max_document_size_mb=1, image_context_guard=False)
+    ciphertext, file = _encrypted(b"payload")
+    bot._transport = _MediaTransport(ciphertext + b"tampered")
+    photo = {"msgtype": "m.image", "body": "IMG.jpg", "info": {"mimetype": "image/jpeg"}, "file": file}
+    result = await bot.run_turn(_media_job(photo), sink=FakeSink(), session_id=None, room_kind="direct")
+    assert result.text == ATTACHMENT_FAILED["integrity"]
+    big = {**photo, "info": {"mimetype": "image/jpeg", "size": 1_000_001}}
+    result = await bot.run_turn(_media_job(big), sink=FakeSink(), session_id=None, room_kind="direct")
+    assert result.text == ATTACHMENT_FAILED["oversize"]
+    corrupt = {**_job("(attachment)"), "attachment": "{not json"}
+    result = await bot.run_turn(corrupt, sink=FakeSink(), session_id=None, room_kind="direct")
+    assert result.text == ATTACHMENT_FAILED["invalid"]
+    assert chat.calls == []
+
+
+@pytest.mark.anyio
+async def test_matrix_attachment_is_deleted_when_the_turn_fails(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    bot, chat, manager = _bot(tmp_path, max_document_size_mb=10, image_context_guard=False)
+    _resume_existing_session(bot, manager)
+    ciphertext, file = _encrypted(b"jpeg")
+    bot._transport = _MediaTransport(ciphertext)
+
+    async def boom(kwargs: dict[str, Any]) -> None:
+        raise RuntimeError("provider failed")
+
+    chat.on_process = boom
+    photo = {"msgtype": "m.image", "body": "IMG.jpg", "info": {"mimetype": "image/jpeg"}, "file": file}
+    with pytest.raises(RuntimeError, match="provider failed"):
+        await bot.run_turn(_media_job(photo), sink=FakeSink(), session_id=None, room_kind="direct")
+    assert list((tmp_path / "data" / "matrix-media").iterdir()) == []

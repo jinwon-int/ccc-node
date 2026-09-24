@@ -2006,3 +2006,65 @@ def test_compact_trust_files_keeps_first_copies_only(tmp_path: Path) -> None:
     assert database.read_bytes() == b"\x00dup\n\x00dup\n", "only trust files are touched"
     assert sorted(p.name for p in crypto.iterdir()) == sorted([trusted.name, blacklisted.name, database.name])
     assert t.compact_trust_files(crypto) == {}
+
+
+# --------------------------------------------------------------------------- #
+# Media input (#1795)
+# --------------------------------------------------------------------------- #
+
+
+def _media_file() -> dict[str, Any]:
+    return {
+        "url": "mxc://test.invalid/Media1",
+        "key": {"kty": "oct", "alg": "A256CTR", "ext": True, "k": "A" * 43, "key_ops": ["encrypt", "decrypt"]},
+        "iv": "B" * 22,
+        "hashes": {"sha256": "C" * 43},
+        "v": "v2",
+    }
+
+
+def _with_media_classes(nio: Any) -> tuple[type, type]:
+    base = nio.RoomMessageText
+    encrypted = type("RoomEncryptedMedia", (base,), {})
+    plaintext = type("RoomMessageMedia", (base,), {})
+    nio.RoomEncryptedMedia, nio.RoomMessageMedia = encrypted, plaintext
+    return encrypted, plaintext
+
+
+@pytest.mark.anyio
+async def test_media_admission_mirrors_text_rules_without_new_stop_paths(tmp_path: Path) -> None:
+    async with family(tmp_path) as h:
+        f = h.f
+        encrypted, plaintext = _with_media_classes(h.nio)
+        direct = f.c["rooms"][0]
+
+        def photo(sender: str, key: str, *, verified: bool = True, content: Any = None, cls: type = encrypted,
+                  decrypted: bool = True, event_id: str = "$photo") -> Any:
+            source = {"type": "m.room.message", "event_id": event_id, "sender": sender, "origin_server_ts": h.now,
+                      "content": content or {"msgtype": "m.image", "body": "IMG.jpg", "file": _media_file(),
+                                             "info": {"mimetype": "image/jpeg"}}}
+            return cls(sender=sender, source=source, verified=verified, decrypted=decrypted, sender_key=key, ts=h.now)
+
+        req = f.admit_event(direct, photo(h.owner, "b" * 43))
+        assert req is not None and req.attachment is not None and req.body == "(attachment)"
+        # An unverified owner device never stops the service for media (text still does).
+        assert f.admit_event(direct, photo(h.owner, "b" * 43, verified=False)) is None
+        assert f.store.get_meta("media_ignored")["reason"] == "untrusted-device"
+        # Plaintext media (url, no EncryptedFile) is refused and recorded, never run.
+        plain = {"msgtype": "m.image", "body": "IMG.jpg", "url": "mxc://test.invalid/Plain"}
+        assert f.admit_event(direct, photo(h.owner, "b" * 43, cls=plaintext, decrypted=False, content=plain)) is None
+        assert f.store.get_meta("media_ignored")["reason"] == "plaintext-attachment-refused"
+        assert "Plain" not in json.dumps(f.store.get_meta("media_ignored"))  # body-free record
+        # Family room: a caption-less photo is ignored; an addressed caption is admitted.
+        assert f.admit_event(FAMILY, photo(DAD, "c" * 43)) is None
+        assert f.store.get_meta("media_ignored")["reason"] == "not-admitted"
+        addressed = {"msgtype": "m.image", "body": "@bot 이거 봐줘", "filename": "a.jpg", "file": _media_file()}
+        family_req = f.admit_event(FAMILY, photo(DAD, "c" * 43, content=addressed, event_id="$fam"))
+        assert family_req is not None and family_req.body == "@bot 이거 봐줘"
+        assert f.admit_event(FAMILY, photo(DAD, "z" * 43, content=addressed)) is None  # unpinned device: ignored
+        # A caption that looks like a control command is still an attachment job.
+        command = {"msgtype": "m.image", "body": "/stop", "filename": "a.jpg", "file": _media_file()}
+        stop_photo = f.admit_event(direct, photo(h.owner, "b" * 43, content=command, event_id="$stopphoto"))
+        assert stop_photo is not None
+        await f.input(stop_photo)
+        assert f.store.job_exists("$stopphoto")

@@ -205,10 +205,51 @@ second node starts with a direct room only.
 7. `systemctl enable --now ccc-matrix-bridge`; expect the startup banner in
    the direct room.
 
+## Photos and files (#1795)
+
+Encrypted `m.image` / `m.file` / `m.video` / `m.audio` events are admitted
+under the text rules — decrypted, from an allowed sender's pinned/verified
+device, inside the 24 h window, not an edit — and reach the agent with the
+same prompt contract as Telegram (a local path in the prompt):
+
+- **Admission** — direct rooms accept a photo with or without a caption; a
+  family room needs an explicit address in the caption (`@handle`, alias,
+  wake word) or an `m.mentions` pill, so a caption-less photo there is
+  ignored. Per Matrix v1.10 the `body` is a caption only when `filename` is
+  present and differs from it. Plaintext media (a bare `url`, no
+  `EncryptedFile`) is refused. An unverified device is ignored (with the
+  existing cross-signing notice) — media never adds a `SafetyStop` path. A
+  media event the transport sees but does not admit is logged body-free as
+  `matrix media ignored reason=… kind=…` and kept in meta `media_ignored`;
+  an event nio cannot parse at all (e.g. a malformed `file`, which nio turns
+  into a `BadEvent`) is dropped before admission, as before.
+- **Queue** — the job keeps the caption as its body (`(attachment)` when there
+  is none) plus the `EncryptedFile` in the `jobs.attachment` column (added by
+  an idempotent migration); the caption stays the job body, so a long caption
+  is not bounded by the attachment JSON cap. The column — it holds the
+  decryption key — is cleared as soon as the turn has a result or is left
+  uncertain, including a turn left `running` by a crash (cleared when the
+  store reopens). A caption
+  that looks like `/stop` is still an attachment turn, never a control.
+- **Staging** — the runner downloads the ciphertext from the authenticated
+  `/_matrix/client/v1/media/download/{server}/{id}` (no redirects), verifies
+  the SHA-256, AES-256-CTR decrypts it (`cryptography`), and writes it to
+  `<BOT_DATA_DIR>/matrix-media/document_<hex>.<ext>` (0700 dir, 0600
+  `O_EXCL` file — the Telegram document helpers). Limits reuse the Telegram
+  settings: images use `CCC_TELEGRAM_MAX_IMAGE_BYTES` /
+  `CCC_TELEGRAM_MAX_IMAGE_PIXELS` when `CCC_BRIDGE_IMAGE_CONTEXT_GUARD` is on,
+  everything else `CCC_MAX_DOCUMENT_SIZE_MB`; the declared size is checked
+  before downloading. The file is deleted when the turn ends (also on
+  failure); a file left by a killed process is swept (older than 1 h) on the
+  next attachment.
+- **Prompt** — images use `build_image_prompt(..., channel="Matrix")`, other
+  media `build_document_prompt(..., channel="Matrix")`; the Telegram wording is
+  unchanged. A download/integrity/size failure answers the room once and does
+  not run the agent. The Grok frontend stays text-only.
+
 ## Not yet
 
-- Image/file input (Telegram folds images into the prompt; Matrix media is
-  E2EE and needs the attachment path from family-messenger).
+- Voice transcription for `m.audio` (handled as a file today).
 - Draft edits (`m.replace`) for streamed text — interim notices only.
 - Approval buttons: approvals are `/approve <turn> <nonce>` replies in the
   room, exactly as the pilot.
