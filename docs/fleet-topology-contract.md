@@ -296,8 +296,14 @@ validation and blocks migration, whatever the validator reports.
 Each migration is a separately reviewed opt-in change. Before opt-in, legacy
 behavior stays unchanged. Migrated code must have no hardcoded fallback; any
 retained legacy branch must be explicit and separately tested. Delete it only
-after a reviewed rollout and rollback checkpoint. P2 bridge wiring, P3 narrative
-cleanup and P4 repository-wide scan enforcement are not included here.
+after a reviewed rollout and rollback checkpoint. P2 bridge wiring and P3
+narrative cleanup are not included here. P4 repository-wide scan enforcement
+is a ratchet, not a zero rule: `scripts/canon-node-name-scan.sh --repo-wide`
+compares per-file node-name hit counts against the committed
+`scripts/canon-node-name-baseline.txt` (validate-harness static phase). New
+files and higher counts fail; a lower count fails until the baseline is
+regenerated with `--update-baseline`, so every migration above locks its
+progress in. The baseline is generated, never hand-edited.
 
 ## Node-local preparation and rollback plan
 
