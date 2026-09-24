@@ -337,6 +337,33 @@ class _TurnSessionSlot:
     turn_token: Any = None
 
 
+class _TurnCallbacks:
+    """The per-turn callbacks handed to consume_turn_stream (#896 PR2).
+
+    Built by ``_make_turn_callbacks``. ``approval_stall_won`` replaces the
+    ``nonlocal`` the inline ``interrupt_turn`` closure wrote: it records
+    whether the approval-stall path claimed the request's terminal phase, and
+    the caller reads it once the stream has ended.
+    """
+
+    __slots__ = (
+        "handle_approval",
+        "deliver_pending_interim",
+        "apply_agent_event",
+        "interrupt_turn",
+        "approval_stall_won",
+    )
+
+    handle_approval: Callable[[ApprovalRequestEvent], Awaitable[ApprovalDecision]]
+    deliver_pending_interim: Callable[[], Awaitable[None]]
+    apply_agent_event: Callable[[AgentEvent, float], Awaitable[TurnEventDirective]]
+    interrupt_turn: Callable[[TurnStreamOutcome], Awaitable[None]]
+    approval_stall_won: bool
+
+    def __init__(self) -> None:
+        self.approval_stall_won = False
+
+
 class ProjectChatProcessMixin:
     def _external_wait_home(self) -> Path:
         """Durable home for external-wait registry/route files (#740)."""
@@ -933,6 +960,332 @@ class ProjectChatProcessMixin:
             )
         return None
 
+    def _make_approval_handler(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        generation: int,
+        turn_token: Any,
+        progress_request: Any,
+        approval_callback: Optional[AgentApprovalCallback],
+        active_approval_callbacks: set[asyncio.Task[Any]],
+    ) -> Callable[[ApprovalRequestEvent], Awaitable[ApprovalDecision]]:
+        """Turn approval handler (#896 PR2: the inline closure, moved verbatim)."""
+        async def handle_approval(
+            event: ApprovalRequestEvent,
+        ) -> ApprovalDecision:
+            # #1045: every deny names its decision point (body-free).
+            def _deny(reason: str) -> ApprovalDecision:
+                _log_approval_route_deny(
+                    reason=reason,
+                    event=event,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    generation=generation,
+                )
+                return ApprovalDecision.DENY
+
+            if approval_callback is None:
+                return _deny("no-approval-callback")
+            if not self.is_agent_approval_active(user_id, chat_id, generation):
+                return _deny("approval-inactive")
+            # Some runtimes resolve the approval before yielding its
+            # normalized event. The request is provider-admitted at
+            # that boundary even though consume_agent_events has not
+            # observed the event yet.
+            if progress_request.lifecycle.admit():
+                self._agent_session_registry.admit_if_same(turn_token)
+                await self._project_request_phase(progress_request)
+            approval_lease = progress_request.lifecycle.begin_approval()
+            if approval_lease is None:
+                return _deny("lifecycle-refused")
+            callback_task = asyncio.current_task()
+            if callback_task is not None:
+                active_approval_callbacks.add(callback_task)
+            await self._project_request_phase(progress_request)
+            try:
+                try:
+                    decision = await approval_callback(chat_id, user_id, event, generation)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Provider-neutral approval callback failed")
+                    return _deny("callback-exception")
+            finally:
+                if progress_request.lifecycle.end_approval(approval_lease):
+                    await self._project_request_phase(progress_request)
+                if callback_task is not None:
+                    active_approval_callbacks.discard(callback_task)
+            if decision is ApprovalDecision.ALLOW:
+                if self.is_agent_approval_active(user_id, chat_id, generation):
+                    return ApprovalDecision.ALLOW
+                return _deny("approval-inactive-after-allow")
+            return _deny("callback-deny")
+
+        return handle_approval
+
+    def _make_interim_deliverer(
+        self,
+        *,
+        output: TurnOutputBuffer,
+        streaming_handler: Optional[Any],
+        interim_message_callback: Optional[InterimMessageCallback],
+    ) -> Callable[[], Awaitable[None]]:
+        """Pending-interim delivery (#896 PR2: the inline closure, moved verbatim)."""
+        async def deliver_pending_interim() -> None:
+            """Deliver a completed message only after more turn work appears."""
+            content = output.pending_interim
+            if content is None:
+                return
+            delivered = False
+            if streaming_handler is not None:
+                delivered = await streaming_handler.finalize_segment()
+            elif interim_message_callback is not None:
+                try:
+                    await interim_message_callback(content)
+                    delivered = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Interim assistant message delivery failed; "
+                        "retaining it for final delivery"
+                    )
+            output.resolve_pending_interim(delivered=delivered)
+
+        return deliver_pending_interim
+
+    def _make_event_applier(
+        self,
+        *,
+        turn_token: Any,
+        session: Any,
+        progress_request: Any,
+        output: TurnOutputBuffer,
+        turn_state: TurnEventState,
+        streaming_handler: Optional[Any],
+        deliver_pending_interim: Callable[[], Awaitable[None]],
+        usage_mode: str,
+    ) -> Callable[[AgentEvent, float], Awaitable[TurnEventDirective]]:
+        """Per-event transition applier (#896 PR2: the inline closure, moved verbatim)."""
+        async def apply_agent_event(
+            event: AgentEvent,
+            now: float,
+        ) -> TurnEventDirective:
+            if not turn_state.admitted:
+                request_admitted = progress_request.lifecycle.admit()
+                if (
+                    not request_admitted
+                    and progress_request.lifecycle.phase
+                    not in {
+                        RequestPhase.WORKING,
+                        RequestPhase.INPUT_REQUIRED,
+                    }
+                ):
+                    logger.warning(
+                        "Discarding runtime event after request "
+                        "admission was already closed"
+                    )
+                    return TurnEventDirective.STOP
+                turn_state.mark_admitted()
+                self._agent_session_registry.admit_if_same(turn_token)
+                if request_admitted:
+                    await self._project_request_phase(progress_request)
+            progress_request.last_event_at = now
+            if turn_state.needs_attempt_recording:
+                # Claude adapter-path spend boundary (#388): ClaudeRuntime
+                # has no turn-attempt seam, so the first accepted event
+                # meters the request. Codex meters at its own boundary.
+                # Offloaded fsync-backed meter write (#1479).
+                await self._run_usage_write(
+                    self.record_claude_adapter_attempt, mode=usage_mode
+                )
+                turn_state.mark_attempt_recorded()
+            # Opt-in lifecycle audit (#645): fail-open tap, never blocks
+            # the turn. No-op on a default node.
+            _observer = getattr(self, "_lifecycle_observer", None)
+            if _observer is not None:
+                _observer.observe(event, session_id=session.session_id)
+            transition = turn_state.observe(event, observed_at=now)
+            if isinstance(transition, DelegatedTaskLifecycleTransition):
+                try:
+                    health_reporter.record_delegated_task_activity(
+                        id(progress_request),
+                        turn_state.delegated_tasks_active,
+                    )
+                except Exception:
+                    pass
+            await self._apply_turn_event_transition(
+                transition,
+                now=now,
+                request=progress_request,
+                output=output,
+                streaming_handler=streaming_handler,
+                deliver_pending_interim=deliver_pending_interim,
+                usage_mode=usage_mode,
+            )
+            if (
+                turn_state.delegated_tasks_active > 0
+                and output.has_text
+                and not turn_state.terminal_stall_deferral_recorded
+            ):
+                turn_state.terminal_stall_deferral_recorded = True
+                try:
+                    health_reporter.record_terminal_stall_deferred_for_tasks()
+                except Exception:
+                    pass
+            return TurnEventDirective.CONTINUE
+
+        return apply_agent_event
+
+    def _make_turn_interrupter(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        session: Any,
+        progress_request: Any,
+        turn_state: TurnEventState,
+        callbacks: "_TurnCallbacks",
+        active_approval_callbacks: set[asyncio.Task[Any]],
+    ) -> Callable[[TurnStreamOutcome], Awaitable[None]]:
+        """Stall/interrupt path (#896 PR2: the inline closure, moved verbatim).
+
+        The inline closure wrote ``nonlocal approval_stall_won``; it now writes
+        ``callbacks.approval_stall_won``. Its own ``callbacks = tuple(...)``
+        local was renamed ``pending`` so it cannot shadow that object.
+        """
+        async def interrupt_turn(outcome: TurnStreamOutcome) -> None:
+            if turn_state.approval_pending:
+                if outcome is TurnStreamOutcome.APPROVAL_STALL:
+                    callbacks.approval_stall_won = _claim_request_terminal(
+                        progress_request,
+                        RequestPhase.TIMEOUT,
+                        cause="approval-stall",
+                    )
+                    if not callbacks.approval_stall_won:
+                        # A concurrent /stop (or another terminal owner)
+                        # already won. Let that path own the session/UI
+                        # side effects and keep this request silent.
+                        raise asyncio.CancelledError
+                self.invalidate_agent_approvals(user_id, chat_id)
+                pending = tuple(active_approval_callbacks)
+                for callback in pending:
+                    callback.cancel()
+                if pending:
+                    await asyncio.gather(
+                        *(asyncio.shield(callback) for callback in pending),
+                        return_exceptions=True,
+                    )
+            await self._interrupt_agent_session(session)
+
+        return interrupt_turn
+
+    def _make_turn_callbacks(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        generation: int,
+        turn_token: Any,
+        session: Any,
+        progress_request: Any,
+        output: TurnOutputBuffer,
+        turn_state: TurnEventState,
+        streaming_handler: Optional[Any],
+        approval_callback: Optional[AgentApprovalCallback],
+        interim_message_callback: Optional[InterimMessageCallback],
+        usage_mode: str,
+    ) -> "_TurnCallbacks":
+        """Build the four per-turn callbacks consume_turn_stream drives (#896 PR2).
+
+        Pure move of the closures that used to be defined inline in
+        ``_process_agent_message``: each still closes over the same names, now
+        bound once as factory parameters after the session and the active-turn
+        token exist. ``active_approval_callbacks`` is shared between the
+        approval handler and the interrupter exactly as before, and the one
+        ``nonlocal`` (``approval_stall_won``) became an attribute on the
+        returned object so the caller can read it once the stream has ended.
+        One factory per closure keeps each under the CC 15 gate.
+        """
+        callbacks = _TurnCallbacks()
+        active_approval_callbacks: set[asyncio.Task[Any]] = set()
+        callbacks.handle_approval = self._make_approval_handler(
+            user_id=user_id,
+            chat_id=chat_id,
+            generation=generation,
+            turn_token=turn_token,
+            progress_request=progress_request,
+            approval_callback=approval_callback,
+            active_approval_callbacks=active_approval_callbacks,
+        )
+        callbacks.deliver_pending_interim = self._make_interim_deliverer(
+            output=output,
+            streaming_handler=streaming_handler,
+            interim_message_callback=interim_message_callback,
+        )
+        callbacks.apply_agent_event = self._make_event_applier(
+            turn_token=turn_token,
+            session=session,
+            progress_request=progress_request,
+            output=output,
+            turn_state=turn_state,
+            streaming_handler=streaming_handler,
+            deliver_pending_interim=callbacks.deliver_pending_interim,
+            usage_mode=usage_mode,
+        )
+        callbacks.interrupt_turn = self._make_turn_interrupter(
+            user_id=user_id,
+            chat_id=chat_id,
+            session=session,
+            progress_request=progress_request,
+            turn_state=turn_state,
+            callbacks=callbacks,
+            active_approval_callbacks=active_approval_callbacks,
+        )
+        return callbacks
+
+    async def _run_turn_stream(
+        self,
+        *,
+        session: Any,
+        turn_message: str,
+        callbacks: "_TurnCallbacks",
+        turn_state: TurnEventState,
+        output: TurnOutputBuffer,
+        abort_stalled_turn: Any,
+        admission_grace: float,
+        approval_grace: float,
+        stall_grace: float,
+        delegated_stall_grace: float,
+    ) -> TurnStreamOutcome:
+        """Send the turn and consume its stream under the whole-turn timeout (#896 PR2).
+
+        Deliberately no ``try`` here: ``asyncio.TimeoutError`` from
+        ``wait_for`` and every other exception keep propagating to the
+        caller's ``except`` clauses in their original order.
+        """
+        return await asyncio.wait_for(
+            consume_turn_stream(
+                session.send_turn(
+                    turn_message,
+                    approval_handler=callbacks.handle_approval,
+                ).__aiter__(),
+                state=turn_state,
+                has_text=lambda: output.has_text,
+                on_event=callbacks.apply_agent_event,
+                interrupt=callbacks.interrupt_turn,
+                abort_stalled_turn=abort_stalled_turn,
+                admission_timeout_seconds=admission_grace,
+                approval_stall_seconds=approval_grace,
+                terminal_stall_seconds=stall_grace,
+                delegated_task_stall_seconds=delegated_stall_grace,
+                interrupt_timeout_seconds=self._agent_interrupt_timeout_seconds,
+            ),
+            timeout=self._process_timeout_seconds,
+        )
+
     async def _process_agent_message(  # noqa: C901 -- #348 baseline hotspot
         self,
         *,
@@ -1059,60 +1412,20 @@ class ProjectChatProcessMixin:
                 generation = turn_token.generation
                 output = TurnOutputBuffer()
                 turn_state = TurnEventState()
-                active_approval_callbacks: set[asyncio.Task[Any]] = set()
-                approval_stall_won = False
-
-                async def handle_approval(
-                    event: ApprovalRequestEvent,
-                ) -> ApprovalDecision:
-                    # #1045: every deny names its decision point (body-free).
-                    def _deny(reason: str) -> ApprovalDecision:
-                        _log_approval_route_deny(
-                            reason=reason,
-                            event=event,
-                            user_id=user_id,
-                            chat_id=chat_id,
-                            generation=generation,
-                        )
-                        return ApprovalDecision.DENY
-
-                    if approval_callback is None:
-                        return _deny("no-approval-callback")
-                    if not self.is_agent_approval_active(user_id, chat_id, generation):
-                        return _deny("approval-inactive")
-                    # Some runtimes resolve the approval before yielding its
-                    # normalized event. The request is provider-admitted at
-                    # that boundary even though consume_agent_events has not
-                    # observed the event yet.
-                    if progress_request.lifecycle.admit():
-                        self._agent_session_registry.admit_if_same(turn_token)
-                        await self._project_request_phase(progress_request)
-                    approval_lease = progress_request.lifecycle.begin_approval()
-                    if approval_lease is None:
-                        return _deny("lifecycle-refused")
-                    callback_task = asyncio.current_task()
-                    if callback_task is not None:
-                        active_approval_callbacks.add(callback_task)
-                    await self._project_request_phase(progress_request)
-                    try:
-                        try:
-                            decision = await approval_callback(chat_id, user_id, event, generation)
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            logger.exception("Provider-neutral approval callback failed")
-                            return _deny("callback-exception")
-                    finally:
-                        if progress_request.lifecycle.end_approval(approval_lease):
-                            await self._project_request_phase(progress_request)
-                        if callback_task is not None:
-                            active_approval_callbacks.discard(callback_task)
-                    if decision is ApprovalDecision.ALLOW:
-                        if self.is_agent_approval_active(user_id, chat_id, generation):
-                            return ApprovalDecision.ALLOW
-                        return _deny("approval-inactive-after-allow")
-                    return _deny("callback-deny")
-
+                callbacks = self._make_turn_callbacks(
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    generation=generation,
+                    turn_token=turn_token,
+                    session=session,
+                    progress_request=progress_request,
+                    output=output,
+                    turn_state=turn_state,
+                    streaming_handler=streaming_handler,
+                    approval_callback=approval_callback,
+                    interim_message_callback=interim_message_callback,
+                    usage_mode=usage_mode,
+                )
                 stall_grace = float(getattr(self._config, "terminal_stall_seconds", 0.0) or 0.0)
                 delegated_stall_grace = float(
                     getattr(self._config, "delegated_task_stall_seconds", 7200.0)
@@ -1128,120 +1441,6 @@ class ProjectChatProcessMixin:
                 approval_grace = float(
                     getattr(self._config, "approval_stall_seconds", 0.0) or 0.0
                 )
-
-                async def deliver_pending_interim() -> None:
-                    """Deliver a completed message only after more turn work appears."""
-                    content = output.pending_interim
-                    if content is None:
-                        return
-                    delivered = False
-                    if streaming_handler is not None:
-                        delivered = await streaming_handler.finalize_segment()
-                    elif interim_message_callback is not None:
-                        try:
-                            await interim_message_callback(content)
-                            delivered = True
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            logger.exception(
-                                "Interim assistant message delivery failed; "
-                                "retaining it for final delivery"
-                            )
-                    output.resolve_pending_interim(delivered=delivered)
-
-                async def apply_agent_event(
-                    event: AgentEvent,
-                    now: float,
-                ) -> TurnEventDirective:
-                    if not turn_state.admitted:
-                        request_admitted = progress_request.lifecycle.admit()
-                        if (
-                            not request_admitted
-                            and progress_request.lifecycle.phase
-                            not in {
-                                RequestPhase.WORKING,
-                                RequestPhase.INPUT_REQUIRED,
-                            }
-                        ):
-                            logger.warning(
-                                "Discarding runtime event after request "
-                                "admission was already closed"
-                            )
-                            return TurnEventDirective.STOP
-                        turn_state.mark_admitted()
-                        self._agent_session_registry.admit_if_same(turn_token)
-                        if request_admitted:
-                            await self._project_request_phase(progress_request)
-                    progress_request.last_event_at = now
-                    if turn_state.needs_attempt_recording:
-                        # Claude adapter-path spend boundary (#388): ClaudeRuntime
-                        # has no turn-attempt seam, so the first accepted event
-                        # meters the request. Codex meters at its own boundary.
-                        # Offloaded fsync-backed meter write (#1479).
-                        await self._run_usage_write(
-                            self.record_claude_adapter_attempt, mode=usage_mode
-                        )
-                        turn_state.mark_attempt_recorded()
-                    # Opt-in lifecycle audit (#645): fail-open tap, never blocks
-                    # the turn. No-op on a default node.
-                    _observer = getattr(self, "_lifecycle_observer", None)
-                    if _observer is not None:
-                        _observer.observe(event, session_id=session.session_id)
-                    transition = turn_state.observe(event, observed_at=now)
-                    if isinstance(transition, DelegatedTaskLifecycleTransition):
-                        try:
-                            health_reporter.record_delegated_task_activity(
-                                id(progress_request),
-                                turn_state.delegated_tasks_active,
-                            )
-                        except Exception:
-                            pass
-                    await self._apply_turn_event_transition(
-                        transition,
-                        now=now,
-                        request=progress_request,
-                        output=output,
-                        streaming_handler=streaming_handler,
-                        deliver_pending_interim=deliver_pending_interim,
-                        usage_mode=usage_mode,
-                    )
-                    if (
-                        turn_state.delegated_tasks_active > 0
-                        and output.has_text
-                        and not turn_state.terminal_stall_deferral_recorded
-                    ):
-                        turn_state.terminal_stall_deferral_recorded = True
-                        try:
-                            health_reporter.record_terminal_stall_deferred_for_tasks()
-                        except Exception:
-                            pass
-                    return TurnEventDirective.CONTINUE
-
-                async def interrupt_turn(outcome: TurnStreamOutcome) -> None:
-                    nonlocal approval_stall_won
-                    if turn_state.approval_pending:
-                        if outcome is TurnStreamOutcome.APPROVAL_STALL:
-                            approval_stall_won = _claim_request_terminal(
-                                progress_request,
-                                RequestPhase.TIMEOUT,
-                                cause="approval-stall",
-                            )
-                            if not approval_stall_won:
-                                # A concurrent /stop (or another terminal owner)
-                                # already won. Let that path own the session/UI
-                                # side effects and keep this request silent.
-                                raise asyncio.CancelledError
-                        self.invalidate_agent_approvals(user_id, chat_id)
-                        callbacks = tuple(active_approval_callbacks)
-                        for callback in callbacks:
-                            callback.cancel()
-                        if callbacks:
-                            await asyncio.gather(
-                                *(asyncio.shield(callback) for callback in callbacks),
-                                return_exceptions=True,
-                            )
-                    await self._interrupt_agent_session(session)
 
                 abort_stalled_turn = getattr(session, "abort_stalled_turn", None)
                 if not callable(abort_stalled_turn):
@@ -1274,24 +1473,17 @@ class ProjectChatProcessMixin:
                                  and dispatch_guard is None
                                  and admission_timeout_override is None),
                 )
-                turn_outcome = await asyncio.wait_for(
-                    consume_turn_stream(
-                        session.send_turn(
-                            turn_message,
-                            approval_handler=handle_approval,
-                        ).__aiter__(),
-                        state=turn_state,
-                        has_text=lambda: output.has_text,
-                        on_event=apply_agent_event,
-                        interrupt=interrupt_turn,
-                        abort_stalled_turn=abort_stalled_turn,
-                        admission_timeout_seconds=admission_grace,
-                        approval_stall_seconds=approval_grace,
-                        terminal_stall_seconds=stall_grace,
-                        delegated_task_stall_seconds=delegated_stall_grace,
-                        interrupt_timeout_seconds=self._agent_interrupt_timeout_seconds,
-                    ),
-                    timeout=self._process_timeout_seconds,
+                turn_outcome = await self._run_turn_stream(
+                    session=session,
+                    turn_message=turn_message,
+                    callbacks=callbacks,
+                    turn_state=turn_state,
+                    output=output,
+                    abort_stalled_turn=abort_stalled_turn,
+                    admission_grace=admission_grace,
+                    approval_grace=approval_grace,
+                    stall_grace=stall_grace,
+                    delegated_stall_grace=delegated_stall_grace,
                 )
 
                 if turn_outcome is TurnStreamOutcome.ADMISSION_TIMEOUT:
@@ -1345,7 +1537,7 @@ class ProjectChatProcessMixin:
                     )
 
                 if turn_outcome is TurnStreamOutcome.APPROVAL_STALL:
-                    if not approval_stall_won:
+                    if not callbacks.approval_stall_won:
                         # Defensive: the approval timeout claims lifecycle
                         # authority in interrupt_turn before any abort effects.
                         raise asyncio.CancelledError
