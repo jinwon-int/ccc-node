@@ -351,7 +351,7 @@ Flags: `CCC_EXTERNAL_WAIT_ENABLED` (default on), `CCC_EXTERNAL_WAIT_RESUME`
 per day; beyond the cap the rollup is still delivered, only the
 auto-continuation is skipped).
 
-## Grok (`CCC_AGENT_PROVIDER=grok`) — owner direct room only
+## Grok (`CCC_AGENT_PROVIDER=grok`) — owner direct room, opt-in family rooms
 
 With the Grok provider, `CCC_CHANNEL=matrix` selects `core/grok_matrix_bot.py`
 (`GrokMatrixBot`) instead of `MatrixBot`: the same restricted contract as the
@@ -360,11 +360,24 @@ only, one turn at a time, no `/new`/model/effort/approvals/history/files, the
 persisted Grok journal as the only session authority — served through the
 unchanged E2EE transport, room gate and event admission.
 
-- **Direct room only.** The Grok journal binds exactly one owner conversation.
-  A config with `family_rooms` or `family_users` is refused before the
-  transport opens (`grok_matrix_direct_room_only`); a message from any other
-  sender, room kind or unlisted room gets a static denial and never reaches
-  the journal or the Bot.
+- **Direct room by default.** The Grok journal binds exactly one owner
+  conversation. A config with `family_rooms` or `family_users` is refused
+  before the transport opens (`grok_matrix_direct_room_only`) unless
+  `CCC_GROK_MATRIX_FAMILY_ROOMS=1`; a message from any other sender, room
+  kind or unlisted room gets a static denial and never reaches the journal or
+  the Bot.
+- **Family rooms (opt-in, `CCC_GROK_MATRIX_FAMILY_ROOMS=1`).** The listed
+  `family_rooms` are served to the owner and the allowlisted `family_users`
+  through the unchanged family gate: pinned `family_devices`/`identities`, and
+  the bot must be addressed (`m.mentions`, a typed `@grok`, or a typed
+  `@<alias>` from `mention_aliases`). What does not change: **every admitted
+  family prompt enters the owner's one Grok conversation** (the family shares
+  the owner's context and the exchange is visible in the owner's Grok app),
+  one turn at a time across all rooms (`BUSY` otherwise), text only, and the
+  reply is committed to the journal before the outbox posts it to the room it
+  came from. The startup banner is still posted to the owner's direct rooms
+  only. A family room admits exactly one bot (room gate), so the Grok bot must
+  be that room's only bot.
 - **Startup gates after the device authenticated:** single local Grok
   frontend (the same abstract socket as the Telegram frontend — Telegram and
   Matrix cannot serve the same Bot at once), persisted journal

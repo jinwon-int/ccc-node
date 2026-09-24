@@ -171,6 +171,54 @@ class GrokMatrixLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.transport)
         self.assertEqual(self.host.calls, [])
 
+    async def test_family_rooms_admit_allowlisted_senders_when_opted_in(self):
+        seen = {}
+        settings = matrix_configuration(self.root, CCC_GROK_MATRIX_FAMILY_ROOMS="1")
+
+        async def script(transport):
+            bot = transport.runner._bot
+            before, calls = self.state(), len(self.host.calls)
+            seen["stranger"] = (await self.turn(bot, "hi", sender="@x:example.org", room=FAMILY_ROOM)).text
+            seen["kid_dm"] = (await self.turn(bot, "hi", sender=KID)).text
+            seen["unlisted"] = (await self.turn(bot, "hi", sender=KID, room="!other:example.org")).text
+            seen["denied_untouched"] = (self.state() == before, len(self.host.calls) == calls)
+            seen["kid"] = (await self.turn(bot, "kid input", sender=KID, room=FAMILY_ROOM, event_id="$k1")).text
+            seen["owner_family"] = (await self.turn(bot, "owner input", room=FAMILY_ROOM, event_id="$o1")).text
+            seen["owner_dm"] = (await self.turn(bot, "dm input", event_id="$d1")).text
+            with self.route.journal.claim() as claim:
+                seen["stage"] = claim.load()[0]["stage"]
+
+        with stub_state(matrix_config(family_rooms=[FAMILY_ROOM], family_users=[KID])):
+            bot = self.bot(settings=settings, script=script)
+            await bot.serve()
+        self.assertEqual(seen["stranger"], NOT_ADMITTED)
+        self.assertEqual(seen["kid_dm"], NOT_ADMITTED)
+        self.assertEqual(seen["unlisted"], NOT_ADMITTED)
+        self.assertEqual(seen["denied_untouched"], (True, True))
+        self.assertEqual(seen["kid"], "generated reply kid input")
+        self.assertEqual(seen["owner_family"], "generated reply owner input")
+        self.assertEqual(seen["owner_dm"], "generated reply dm input")
+        self.assertEqual(seen["stage"], "complete")
+        # One owner conversation: every admitted prompt is sent to the same Bot.
+        self.assertEqual([s["prompt"] for s in self.host.sends], ["kid input", "owner input", "dm input"])
+        # The startup banner still goes to the owner's direct rooms only.
+        self.assertEqual([n[0] for n in self.transport.notices], [DM_ROOM])
+
+    async def test_family_flag_without_family_config_stays_direct_only(self):
+        seen = {}
+        settings = matrix_configuration(self.root, CCC_GROK_MATRIX_FAMILY_ROOMS="1")
+
+        async def script(transport):
+            bot = transport.runner._bot
+            seen["family"] = (await self.turn(bot, "hi", room=FAMILY_ROOM)).text
+            seen["owner_dm"] = (await self.turn(bot, "dm input")).text
+
+        with stub_state(matrix_config()):
+            await self.bot(settings=settings, script=script).serve()
+        self.assertEqual(seen["family"], NOT_ADMITTED)
+        self.assertEqual(seen["owner_dm"], "generated reply dm input")
+        self.assertEqual(len(self.host.sends), 1)
+
     async def test_attach_after_open_then_owner_turn_commits_before_reply(self):
         seen = {}
 
