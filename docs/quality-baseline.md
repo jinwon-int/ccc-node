@@ -66,6 +66,16 @@ SDK path, #584 slice C-2): `project_chat.py::_create_user_stream`,
 `project_chat_process.py::process_message` (rewritten below the threshold),
 `project_chat_reader.py::_reader_loop` (module deleted).
 
+Being retired (#896, 2026-09-24 design comment):
+`project_chat_process.py::_process_agent_message` is split by pure moves into
+same-module helpers, one PR per cut so each is independently revertable.
+ruff-mccabe CC with the marker stripped: 100 before the series → 86 after
+PR1 (#1974, `_build_streaming_handler` / `_acquire_turn_session`) → 51 after
+PR2 (#1975, `_make_turn_callbacks` factories / `_run_turn_stream`) → 28 after
+PR3 (`_resolve_turn_outcome` / `_finish_completed_turn`). The marker stays
+until the remaining `except`/`finally` tail (H6/H7, PR4) brings it under 15;
+every new helper is under the threshold and carries no marker.
+
 ## Mypy scope
 
 All `bridge/core` modules and the typed agent-cron domain modules are checked. The `TelegramBot` mixin modules

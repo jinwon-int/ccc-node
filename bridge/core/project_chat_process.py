@@ -1286,6 +1286,391 @@ class ProjectChatProcessMixin:
             timeout=self._process_timeout_seconds,
         )
 
+    async def _resolve_turn_outcome(
+        self,
+        *,
+        turn_outcome: TurnStreamOutcome,
+        key: str,
+        session: Any,
+        model: Optional[str],
+        loop: asyncio.AbstractEventLoop,
+        progress_request: Any,
+        streaming_handler: Any,
+        output: TurnOutputBuffer,
+        turn_state: TurnEventState,
+        callbacks: "_TurnCallbacks",
+        user_id: int,
+        chat_id: int,
+        admission_grace: float,
+        approval_grace: float,
+        stall_grace: float,
+        delegated_stall_grace: float,
+    ) -> Optional[ChatResponse]:
+        """Turn a stalled ``TurnStreamOutcome`` into its user-facing reply (#896 PR3).
+
+        Pure move of the four stall branches (admission timeout, approval
+        stall, terminal stall, delegated-task stall). Returns ``None`` for
+        ``COMPLETED`` so the caller continues with ``_finish_completed_turn``.
+        The approval-stall defence still *raises* ``CancelledError``: it is
+        awaited inside the caller's ``try``, so the caller's
+        ``except asyncio.CancelledError`` receives it exactly as before.
+        Diagnostics are read before ``_drop_agent_session`` in every branch
+        (#846) — keep the statement order.
+        """
+        if turn_outcome is TurnStreamOutcome.ADMISSION_TIMEOUT:
+            # Collected before the session is dropped: closing the
+            # client tears down the SDK transport and takes the exit
+            # code with it.
+            diagnostics = _admission_diagnostics(
+                session,
+                provider=getattr(self._config, "agent_provider", "claude"),
+                model=model,
+                elapsed=_elapsed_since(loop, progress_request),
+                grace=admission_grace,
+            )
+            terminal_won = _claim_request_terminal(
+                progress_request,
+                RequestPhase.TIMEOUT,
+                cause="admission-timeout",
+            )
+            if terminal_won:
+                await self._drop_agent_session(key, session)
+            logger.warning(
+                "Turn admission timed out for user %s chat %s before the "
+                "runtime produced its first event "
+                "(provider=%s model=%s endpoint=%s elapsed=%ss grace=%gs "
+                "exit_code=%s stderr_class=%s stderr_lines=%s)",
+                user_id,
+                chat_id,
+                diagnostics["provider"],
+                diagnostics["model"],
+                diagnostics["endpoint"],
+                diagnostics["elapsed"],
+                admission_grace,
+                diagnostics["exit_code"],
+                diagnostics["stderr_class"],
+                diagnostics["stderr_lines"],
+            )
+            try:
+                health_reporter.record_stalled_request()
+            except Exception:
+                pass
+            message = f"Agent turn did not start within {admission_grace:g}s"
+            return ChatResponse(
+                content=f"⏰ {message}. Please retry your request.",
+                success=False,
+                error=message,
+                failure_class=(
+                    "admission-timeout/"
+                    f"{diagnostics['stderr_class'] or 'silent'}"
+                ),
+                session_id=session.session_id,
+            )
+
+        if turn_outcome is TurnStreamOutcome.APPROVAL_STALL:
+            if not callbacks.approval_stall_won:
+                # Defensive: the approval timeout claims lifecycle
+                # authority in interrupt_turn before any abort effects.
+                raise asyncio.CancelledError
+            await self._drop_agent_session(key, session)
+            await self._cancel_agent_streaming(
+                streaming_handler,
+                context="handling an approval-stall timeout",
+            )
+            # #1555: name the request that was still outstanding —
+            # body-free tool name + target kind, never the arguments —
+            # so the operator can tell a Bash lane from a Write lane
+            # without correlating bridge log lines.
+            pending_label = turn_state.approval_pending_label
+            pending_suffix = f" (pending: {pending_label})" if pending_label else ""
+            logger.warning(
+                "Approval stall released agent turn for user %s chat %s "
+                "after %.1fs without a decision%s",
+                user_id,
+                chat_id,
+                approval_grace,
+                pending_suffix,
+            )
+            try:
+                health_reporter.record_stalled_request()
+            except Exception:
+                pass
+            message = (
+                f"Approval was not resolved within {approval_grace:g}s{pending_suffix}"
+            )
+            return ChatResponse(
+                content=(
+                    f"⏰ {message}. The stalled turn was stopped; "
+                    "please retry your request."
+                ),
+                success=False,
+                error=message,
+                session_id=session.session_id,
+            )
+
+        if turn_outcome is TurnStreamOutcome.TERMINAL_STALL:
+            # Diagnostics are read before the session is dropped —
+            # closing the client clears the SDK transport and the exit
+            # code with it (same ordering as ADMISSION_TIMEOUT, #846).
+            stall_diagnostics = _admission_diagnostics(
+                session,
+                provider=getattr(self._config, "agent_provider", "claude"),
+                model=model,
+                elapsed=_elapsed_since(loop, progress_request),
+                grace=stall_grace,
+            )
+            stall_ages = _stall_ages(loop, progress_request)
+            terminal_won = _claim_request_terminal(
+                progress_request,
+                RequestPhase.INTERRUPTED,
+                cause="terminal-stall",
+            )
+            if terminal_won:
+                await self._drop_agent_session(key, session)
+            final_streamed = False
+            if streaming_handler:
+                final_streamed = await streaming_handler.finalize_all()
+            logger.warning(
+                "Terminal-event stall released agent turn for user %s chat %s "
+                "after silence following answer text "
+                "(provider=%s model=%s endpoint=%s elapsed=%ss grace=%gs "
+                "silence=%ss last_text_age=%ss last_tool_age=%ss "
+                "exit_code=%s stderr_class=%s stderr_lines=%s)",
+                user_id,
+                chat_id,
+                stall_diagnostics["provider"],
+                stall_diagnostics["model"],
+                stall_diagnostics["endpoint"],
+                stall_diagnostics["elapsed"],
+                stall_grace,
+                stall_ages["silence"],
+                stall_ages["last_text_age"],
+                stall_ages["last_tool_age"],
+                stall_diagnostics["exit_code"],
+                stall_diagnostics["stderr_class"],
+                stall_diagnostics["stderr_lines"],
+            )
+            try:
+                health_reporter.record_stalled_request()
+            except Exception:
+                pass
+            content = output.render(self._clean_response)
+            streamed = final_streamed
+            if not content and output.interim_delivered:
+                streamed = True
+            content = content or "(No response)"
+            message = "Agent stopped before terminal completion"
+            return ChatResponse(
+                content=f"{content}\n\n{TERMINAL_STALL_NOTICE}",
+                success=False,
+                error=message,
+                session_id=session.session_id,
+                streamed=streamed,
+            )
+
+        if turn_outcome is TurnStreamOutcome.DELEGATED_TASK_STALL:
+            terminal_won = _claim_request_terminal(
+                progress_request,
+                RequestPhase.INTERRUPTED,
+                cause="delegated-task-stall",
+            )
+            if terminal_won:
+                await self._drop_agent_session(key, session)
+            await self._cancel_agent_streaming(
+                streaming_handler,
+                context="handling a delegated-task stall",
+            )
+            logger.warning(
+                "Delegated-task stall released agent turn for user %s chat %s "
+                "after oldest task exceeded %gs (active_count=%d)",
+                user_id,
+                chat_id,
+                delegated_stall_grace,
+                turn_state.delegated_tasks_active,
+            )
+            try:
+                health_reporter.record_delegated_task_stall()
+            except Exception:
+                pass
+            content = output.render(self._clean_response) or "(No response)"
+            message = "Delegated work exceeded its maximum runtime"
+            return ChatResponse(
+                content=(
+                    f"{content}\n\n⏰ {message}; the turn was stopped "
+                    "and the conversation queue was released."
+                ),
+                success=False,
+                error=message,
+                session_id=session.session_id,
+            )
+        return None
+
+    async def _finish_completed_turn(
+        self,
+        *,
+        key: str,
+        session: Any,
+        runtime: Any,
+        progress_request: Any,
+        streaming_handler: Any,
+        output: TurnOutputBuffer,
+        turn_state: TurnEventState,
+        user_id: int,
+        chat_id: int,
+    ) -> ChatResponse:
+        """Build the reply for a ``COMPLETED`` stream (#896 PR3).
+
+        Pure move: finalize streaming, surface a provider-terminal error as
+        a typed failure, and classify an empty completion as recovered /
+        coalesced / retryable (#775, #1128) before claiming
+        ``RequestPhase.COMPLETED``.
+        """
+        final_streamed = False
+        if streaming_handler:
+            final_streamed = await streaming_handler.finalize_all()
+        content = output.render(self._clean_response)
+        streamed = final_streamed
+        if not content and output.interim_delivered:
+            streamed = True
+        terminal_error = turn_state.terminal_error
+        if terminal_error is not None:
+            # The user sees "❌ Processing failed: ..." but nothing
+            # reached the log, so a provider-terminal failure left no
+            # server-side trace at all. Measured on dungae
+            # (2026-08-04): a crush turn died with `tool_use` and
+            # bot.log / error_*.log were both silent, which cost a
+            # full diagnosis round. Log the normalized fields —
+            # ErrorEvent carries `code` and `retryable`, neither of
+            # which the user-facing string shows. Body-free: the
+            # message is provider-normalized, no chat content.
+            logger.error(
+                "Turn failed: provider=%s code=%s retryable=%s message=%s",
+                getattr(self._config, "agent_provider", "claude"),
+                terminal_error.code,
+                terminal_error.retryable,
+                terminal_error.message,
+            )
+            terminal_won = _claim_request_terminal(
+                progress_request,
+                RequestPhase.FAILED,
+                cause="runtime-error",
+            )
+            if terminal_won:
+                await self._drop_agent_session(key, session)
+            if terminal_error.code == "danso_task_paused":
+                return ChatResponse(
+                    content=f"⏸ {terminal_error.message}",
+                    success=False,
+                    error=terminal_error.message,
+                    session_id=session.session_id,
+                    failure_class="danso_task_paused",
+                    failure_code=terminal_error.code,
+                )
+            return ChatResponse(
+                content=f"❌ Processing failed: {terminal_error.message}",
+                success=False,
+                error=terminal_error.message,
+                session_id=session.session_id,
+                # The error itself was not part of the assistant draft.
+                # Always deliver it even when interim text was streamed.
+                streamed=False,
+                failure_code=terminal_error.code,
+            )
+        if not content and not streamed:
+            # #775: a successful terminal result without user-visible
+            # text must not masquerade as a "(No response)" success.
+            # When the provider's terminal payload preserved the final
+            # answer (no visible event carried it), deliver that text
+            # once; otherwise classify the turn as a typed failure.
+            recovered = self._clean_response(turn_state.terminal_result_text or "")
+            provider_label = type(runtime).__name__
+            if recovered:
+                logger.warning(
+                    "Empty normal completion for user %s chat %s recovered "
+                    "from the terminal result payload: provider=%s "
+                    "cause=no-visible-text-events",
+                    user_id,
+                    chat_id,
+                    provider_label,
+                )
+                try:
+                    health_reporter.record_empty_completion(recovered=True)
+                except Exception:
+                    pass
+                content = recovered
+            else:
+                # #1128: two messages sent within about a second reach
+                # the provider as a single turn, so exactly one request
+                # carries the answer and the rest end with no visible
+                # text. A follower queued behind this turn is the only
+                # in-process evidence of that; the queue lives inside
+                # the CLI, so the alternative would be parsing its
+                # transcript and coupling the bridge to that format.
+                followers = self._conversation_followers(key)
+                coalesced = followers > 0
+                cause = "coalesced-turn" if coalesced else "empty-completion"
+                _claim_request_terminal(
+                    progress_request,
+                    RequestPhase.FAILED,
+                    cause=cause,
+                )
+                logger.warning(
+                    "Empty normal completion for user %s chat %s: "
+                    "provider=%s finished successfully without "
+                    "user-visible text (session kept) cause=%s "
+                    "followers=%s",
+                    user_id,
+                    chat_id,
+                    provider_label,
+                    cause,
+                    followers,
+                )
+                try:
+                    health_reporter.record_empty_completion(
+                        recovered=False, coalesced=coalesced
+                    )
+                except Exception:
+                    pass
+                if coalesced:
+                    # Not a failure: the turn ran, and its answer is
+                    # already on its way under the follower. Telling
+                    # the user to retry would queue yet another
+                    # message and reproduce the same split.
+                    message = "Handled together with your other message"
+                    return ChatResponse(
+                        content=f"⏳ {message}; the answer arrives with that one.",
+                        success=False,
+                        error="coalesced_turn",
+                        session_id=session.session_id,
+                        # Typed for diagnostics; deliberately NOT in
+                        # the retry set — the follower carries the
+                        # answer and a resend would duplicate the
+                        # question (#1128).
+                        failure_class="coalesced-turn",
+                    )
+                message = "Agent finished without a visible answer"
+                return ChatResponse(
+                    content=f"❌ {message}. Please retry your request.",
+                    success=False,
+                    error=message,
+                    session_id=session.session_id,
+                    # Lets process_message's bounded retry take one
+                    # more shot instead of pushing the retry onto
+                    # the user (gwakga 2026-08-18 14:44).
+                    failure_class=_EMPTY_COMPLETION_MARKER,
+                )
+        _claim_request_terminal(
+            progress_request,
+            RequestPhase.COMPLETED,
+            cause="normal-completion",
+        )
+        return ChatResponse(
+            content=content,
+            success=True,
+            session_id=session.session_id,
+            streamed=streamed,
+        )
+
     async def _process_agent_message(  # noqa: C901 -- #348 baseline hotspot
         self,
         *,
@@ -1486,337 +1871,36 @@ class ProjectChatProcessMixin:
                     delegated_stall_grace=delegated_stall_grace,
                 )
 
-                if turn_outcome is TurnStreamOutcome.ADMISSION_TIMEOUT:
-                    # Collected before the session is dropped: closing the
-                    # client tears down the SDK transport and takes the exit
-                    # code with it.
-                    diagnostics = _admission_diagnostics(
-                        session,
-                        provider=getattr(self._config, "agent_provider", "claude"),
-                        model=model,
-                        elapsed=_elapsed_since(loop, progress_request),
-                        grace=admission_grace,
-                    )
-                    terminal_won = _claim_request_terminal(
-                        progress_request,
-                        RequestPhase.TIMEOUT,
-                        cause="admission-timeout",
-                    )
-                    if terminal_won:
-                        await self._drop_agent_session(key, session)
-                    logger.warning(
-                        "Turn admission timed out for user %s chat %s before the "
-                        "runtime produced its first event "
-                        "(provider=%s model=%s endpoint=%s elapsed=%ss grace=%gs "
-                        "exit_code=%s stderr_class=%s stderr_lines=%s)",
-                        user_id,
-                        chat_id,
-                        diagnostics["provider"],
-                        diagnostics["model"],
-                        diagnostics["endpoint"],
-                        diagnostics["elapsed"],
-                        admission_grace,
-                        diagnostics["exit_code"],
-                        diagnostics["stderr_class"],
-                        diagnostics["stderr_lines"],
-                    )
-                    try:
-                        health_reporter.record_stalled_request()
-                    except Exception:
-                        pass
-                    message = f"Agent turn did not start within {admission_grace:g}s"
-                    return ChatResponse(
-                        content=f"⏰ {message}. Please retry your request.",
-                        success=False,
-                        error=message,
-                        failure_class=(
-                            "admission-timeout/"
-                            f"{diagnostics['stderr_class'] or 'silent'}"
-                        ),
-                        session_id=session.session_id,
-                    )
-
-                if turn_outcome is TurnStreamOutcome.APPROVAL_STALL:
-                    if not callbacks.approval_stall_won:
-                        # Defensive: the approval timeout claims lifecycle
-                        # authority in interrupt_turn before any abort effects.
-                        raise asyncio.CancelledError
-                    await self._drop_agent_session(key, session)
-                    await self._cancel_agent_streaming(
-                        streaming_handler,
-                        context="handling an approval-stall timeout",
-                    )
-                    # #1555: name the request that was still outstanding —
-                    # body-free tool name + target kind, never the arguments —
-                    # so the operator can tell a Bash lane from a Write lane
-                    # without correlating bridge log lines.
-                    pending_label = turn_state.approval_pending_label
-                    pending_suffix = f" (pending: {pending_label})" if pending_label else ""
-                    logger.warning(
-                        "Approval stall released agent turn for user %s chat %s "
-                        "after %.1fs without a decision%s",
-                        user_id,
-                        chat_id,
-                        approval_grace,
-                        pending_suffix,
-                    )
-                    try:
-                        health_reporter.record_stalled_request()
-                    except Exception:
-                        pass
-                    message = (
-                        f"Approval was not resolved within {approval_grace:g}s{pending_suffix}"
-                    )
-                    return ChatResponse(
-                        content=(
-                            f"⏰ {message}. The stalled turn was stopped; "
-                            "please retry your request."
-                        ),
-                        success=False,
-                        error=message,
-                        session_id=session.session_id,
-                    )
-
-                if turn_outcome is TurnStreamOutcome.TERMINAL_STALL:
-                    # Diagnostics are read before the session is dropped —
-                    # closing the client clears the SDK transport and the exit
-                    # code with it (same ordering as ADMISSION_TIMEOUT, #846).
-                    stall_diagnostics = _admission_diagnostics(
-                        session,
-                        provider=getattr(self._config, "agent_provider", "claude"),
-                        model=model,
-                        elapsed=_elapsed_since(loop, progress_request),
-                        grace=stall_grace,
-                    )
-                    stall_ages = _stall_ages(loop, progress_request)
-                    terminal_won = _claim_request_terminal(
-                        progress_request,
-                        RequestPhase.INTERRUPTED,
-                        cause="terminal-stall",
-                    )
-                    if terminal_won:
-                        await self._drop_agent_session(key, session)
-                    final_streamed = False
-                    if streaming_handler:
-                        final_streamed = await streaming_handler.finalize_all()
-                    logger.warning(
-                        "Terminal-event stall released agent turn for user %s chat %s "
-                        "after silence following answer text "
-                        "(provider=%s model=%s endpoint=%s elapsed=%ss grace=%gs "
-                        "silence=%ss last_text_age=%ss last_tool_age=%ss "
-                        "exit_code=%s stderr_class=%s stderr_lines=%s)",
-                        user_id,
-                        chat_id,
-                        stall_diagnostics["provider"],
-                        stall_diagnostics["model"],
-                        stall_diagnostics["endpoint"],
-                        stall_diagnostics["elapsed"],
-                        stall_grace,
-                        stall_ages["silence"],
-                        stall_ages["last_text_age"],
-                        stall_ages["last_tool_age"],
-                        stall_diagnostics["exit_code"],
-                        stall_diagnostics["stderr_class"],
-                        stall_diagnostics["stderr_lines"],
-                    )
-                    try:
-                        health_reporter.record_stalled_request()
-                    except Exception:
-                        pass
-                    content = output.render(self._clean_response)
-                    streamed = final_streamed
-                    if not content and output.interim_delivered:
-                        streamed = True
-                    content = content or "(No response)"
-                    message = "Agent stopped before terminal completion"
-                    return ChatResponse(
-                        content=f"{content}\n\n{TERMINAL_STALL_NOTICE}",
-                        success=False,
-                        error=message,
-                        session_id=session.session_id,
-                        streamed=streamed,
-                    )
-
-                if turn_outcome is TurnStreamOutcome.DELEGATED_TASK_STALL:
-                    terminal_won = _claim_request_terminal(
-                        progress_request,
-                        RequestPhase.INTERRUPTED,
-                        cause="delegated-task-stall",
-                    )
-                    if terminal_won:
-                        await self._drop_agent_session(key, session)
-                    await self._cancel_agent_streaming(
-                        streaming_handler,
-                        context="handling a delegated-task stall",
-                    )
-                    logger.warning(
-                        "Delegated-task stall released agent turn for user %s chat %s "
-                        "after oldest task exceeded %gs (active_count=%d)",
-                        user_id,
-                        chat_id,
-                        delegated_stall_grace,
-                        turn_state.delegated_tasks_active,
-                    )
-                    try:
-                        health_reporter.record_delegated_task_stall()
-                    except Exception:
-                        pass
-                    content = output.render(self._clean_response) or "(No response)"
-                    message = "Delegated work exceeded its maximum runtime"
-                    return ChatResponse(
-                        content=(
-                            f"{content}\n\n⏰ {message}; the turn was stopped "
-                            "and the conversation queue was released."
-                        ),
-                        success=False,
-                        error=message,
-                        session_id=session.session_id,
-                    )
-
-                final_streamed = False
-                if streaming_handler:
-                    final_streamed = await streaming_handler.finalize_all()
-                content = output.render(self._clean_response)
-                streamed = final_streamed
-                if not content and output.interim_delivered:
-                    streamed = True
-                terminal_error = turn_state.terminal_error
-                if terminal_error is not None:
-                    # The user sees "❌ Processing failed: ..." but nothing
-                    # reached the log, so a provider-terminal failure left no
-                    # server-side trace at all. Measured on dungae
-                    # (2026-08-04): a crush turn died with `tool_use` and
-                    # bot.log / error_*.log were both silent, which cost a
-                    # full diagnosis round. Log the normalized fields —
-                    # ErrorEvent carries `code` and `retryable`, neither of
-                    # which the user-facing string shows. Body-free: the
-                    # message is provider-normalized, no chat content.
-                    logger.error(
-                        "Turn failed: provider=%s code=%s retryable=%s message=%s",
-                        getattr(self._config, "agent_provider", "claude"),
-                        terminal_error.code,
-                        terminal_error.retryable,
-                        terminal_error.message,
-                    )
-                    terminal_won = _claim_request_terminal(
-                        progress_request,
-                        RequestPhase.FAILED,
-                        cause="runtime-error",
-                    )
-                    if terminal_won:
-                        await self._drop_agent_session(key, session)
-                    if terminal_error.code == "danso_task_paused":
-                        return ChatResponse(
-                            content=f"⏸ {terminal_error.message}",
-                            success=False,
-                            error=terminal_error.message,
-                            session_id=session.session_id,
-                            failure_class="danso_task_paused",
-                            failure_code=terminal_error.code,
-                        )
-                    return ChatResponse(
-                        content=f"❌ Processing failed: {terminal_error.message}",
-                        success=False,
-                        error=terminal_error.message,
-                        session_id=session.session_id,
-                        # The error itself was not part of the assistant draft.
-                        # Always deliver it even when interim text was streamed.
-                        streamed=False,
-                        failure_code=terminal_error.code,
-                    )
-                if not content and not streamed:
-                    # #775: a successful terminal result without user-visible
-                    # text must not masquerade as a "(No response)" success.
-                    # When the provider's terminal payload preserved the final
-                    # answer (no visible event carried it), deliver that text
-                    # once; otherwise classify the turn as a typed failure.
-                    recovered = self._clean_response(turn_state.terminal_result_text or "")
-                    provider_label = type(runtime).__name__
-                    if recovered:
-                        logger.warning(
-                            "Empty normal completion for user %s chat %s recovered "
-                            "from the terminal result payload: provider=%s "
-                            "cause=no-visible-text-events",
-                            user_id,
-                            chat_id,
-                            provider_label,
-                        )
-                        try:
-                            health_reporter.record_empty_completion(recovered=True)
-                        except Exception:
-                            pass
-                        content = recovered
-                    else:
-                        # #1128: two messages sent within about a second reach
-                        # the provider as a single turn, so exactly one request
-                        # carries the answer and the rest end with no visible
-                        # text. A follower queued behind this turn is the only
-                        # in-process evidence of that; the queue lives inside
-                        # the CLI, so the alternative would be parsing its
-                        # transcript and coupling the bridge to that format.
-                        followers = self._conversation_followers(key)
-                        coalesced = followers > 0
-                        cause = "coalesced-turn" if coalesced else "empty-completion"
-                        _claim_request_terminal(
-                            progress_request,
-                            RequestPhase.FAILED,
-                            cause=cause,
-                        )
-                        logger.warning(
-                            "Empty normal completion for user %s chat %s: "
-                            "provider=%s finished successfully without "
-                            "user-visible text (session kept) cause=%s "
-                            "followers=%s",
-                            user_id,
-                            chat_id,
-                            provider_label,
-                            cause,
-                            followers,
-                        )
-                        try:
-                            health_reporter.record_empty_completion(
-                                recovered=False, coalesced=coalesced
-                            )
-                        except Exception:
-                            pass
-                        if coalesced:
-                            # Not a failure: the turn ran, and its answer is
-                            # already on its way under the follower. Telling
-                            # the user to retry would queue yet another
-                            # message and reproduce the same split.
-                            message = "Handled together with your other message"
-                            return ChatResponse(
-                                content=f"⏳ {message}; the answer arrives with that one.",
-                                success=False,
-                                error="coalesced_turn",
-                                session_id=session.session_id,
-                                # Typed for diagnostics; deliberately NOT in
-                                # the retry set — the follower carries the
-                                # answer and a resend would duplicate the
-                                # question (#1128).
-                                failure_class="coalesced-turn",
-                            )
-                        message = "Agent finished without a visible answer"
-                        return ChatResponse(
-                            content=f"❌ {message}. Please retry your request.",
-                            success=False,
-                            error=message,
-                            session_id=session.session_id,
-                            # Lets process_message's bounded retry take one
-                            # more shot instead of pushing the retry onto
-                            # the user (gwakga 2026-08-18 14:44).
-                            failure_class=_EMPTY_COMPLETION_MARKER,
-                        )
-                _claim_request_terminal(
-                    progress_request,
-                    RequestPhase.COMPLETED,
-                    cause="normal-completion",
+                stall_response = await self._resolve_turn_outcome(
+                    turn_outcome=turn_outcome,
+                    key=key,
+                    session=session,
+                    model=model,
+                    loop=loop,
+                    progress_request=progress_request,
+                    streaming_handler=streaming_handler,
+                    output=output,
+                    turn_state=turn_state,
+                    callbacks=callbacks,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    admission_grace=admission_grace,
+                    approval_grace=approval_grace,
+                    stall_grace=stall_grace,
+                    delegated_stall_grace=delegated_stall_grace,
                 )
-                return ChatResponse(
-                    content=content,
-                    success=True,
-                    session_id=session.session_id,
-                    streamed=streamed,
+                if stall_response is not None:
+                    return stall_response
+                return await self._finish_completed_turn(
+                    key=key,
+                    session=session,
+                    runtime=runtime,
+                    progress_request=progress_request,
+                    streaming_handler=streaming_handler,
+                    output=output,
+                    turn_state=turn_state,
+                    user_id=user_id,
+                    chat_id=chat_id,
                 )
             except TimeoutError:
                 terminal_won = _claim_request_terminal(
