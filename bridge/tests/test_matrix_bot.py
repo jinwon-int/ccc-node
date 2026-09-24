@@ -370,7 +370,7 @@ async def test_direct_room_reports_sender_int_as_chat_id(tmp_path: Path, matrix_
 
 @pytest.mark.anyio
 async def test_family_room_reports_room_int_shared_by_senders(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
-    bot, chat, _manager = _bot(tmp_path)
+    bot, chat, _manager = _bot(tmp_path, execution_profile="strict-project")  # owner-operator refuses the kid (#1955)
     await bot.run_turn(_job("a", sender=OWNER, room=FAMILY_ROOM), sink=FakeSink(), session_id=None, room_kind="family")
     await bot.run_turn(_job("b", sender=KID, room=FAMILY_ROOM), sink=FakeSink(), session_id=None, room_kind="family")
     first, second = chat.calls
@@ -792,7 +792,9 @@ async def test_approval_adapter(
     expected: ApprovalDecision,
     prompted: bool,
 ) -> None:
-    bot, chat, _manager = _bot(tmp_path)
+    # strict-project: the kid's turn reaches the callback (owner-operator
+    # refuses it before any agent run, #1955).
+    bot, chat, _manager = _bot(tmp_path, execution_profile="strict-project")
     chat.approval_active = active
     sink = FakeSink(approve=approve)
     seen: dict[str, Any] = {}
@@ -832,32 +834,31 @@ async def test_approval_adapter_honours_bash_policy_without_prompting(
 # --- #1955: non-owner turns fail closed ----------------------------------------
 
 
+@pytest.mark.parametrize("profile", ["owner-operator", "strict-project"])
 @pytest.mark.parametrize(
     ("sender", "expected"),
     [(OWNER, ApprovalDecision.ALLOW), (KID, ApprovalDecision.DENY)],
 )
 @pytest.mark.anyio
 async def test_auto_approve_checks_the_sender_first(
-    tmp_path: Path, matrix_config: dict[str, Any], sender: str, expected: ApprovalDecision
+    tmp_path: Path, matrix_config: dict[str, Any], profile: str, sender: str, expected: ApprovalDecision
 ) -> None:
-    # owner-operator + auto-approve: a family member never inherits the
-    # owner's automatic ALLOW (#1955).
-    bot, chat, _manager = _bot(tmp_path, bash_policy="auto-approve")
+    # A family member never inherits the owner's automatic ALLOW (#1955).
+    bot, _chat, _manager = _bot(tmp_path, bash_policy="auto-approve", execution_profile=profile)
     sink = FakeSink()
-    seen: dict[str, Any] = {}
-
-    async def drive(kwargs: dict[str, Any]) -> None:
-        seen["decision"] = await kwargs["approval_callback"](kwargs["chat_id"], kwargs["user_id"], _event(), 1)
-
-    chat.on_process = drive
-    await bot.run_turn(_job("go", sender=sender, room=FAMILY_ROOM), sink=sink, session_id=None, room_kind="family")
-    assert seen["decision"] is expected
+    callback = bot._make_approval_callback(sink)
+    user_id = bot.ids.user_id(sender)
+    decision = await callback(bot.ids.room_id(FAMILY_ROOM), user_id, _event(), 1)
+    assert decision is expected
     assert sink.approvals == []
 
 
 @pytest.mark.anyio
-async def test_non_owner_codex_turn_gets_narrowed_settings(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
-    bot, chat, _manager = _bot(tmp_path, bash_policy="auto-approve")
+async def test_non_owner_codex_turn_is_reduced_off_owner_operator(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    # strict-project only: owner-operator refuses the turn outright. The
+    # reduction keeps a family turn off never + dangerFullAccess; it is not a
+    # read boundary (#1960).
+    bot, chat, _manager = _bot(tmp_path, bash_policy="auto-approve", execution_profile="strict-project")
     await bot.run_turn(_job("hi", sender=OWNER, room=FAMILY_ROOM), sink=FakeSink(), session_id=None, room_kind="family")
     await bot.run_turn(_job("hi", sender=KID, room=FAMILY_ROOM), sink=FakeSink(), session_id=None, room_kind="family")
     await bot.run_turn(_job("/skills", sender=KID, room=FAMILY_ROOM), sink=FakeSink(), session_id=None, room_kind="family")
@@ -870,7 +871,7 @@ async def test_non_owner_codex_turn_gets_narrowed_settings(tmp_path: Path, matri
         assert call["user_id"] == bot.ids.user_id(KID)
         assert (call["approval_policy"], call["approvals_reviewer"], call["sandbox_policy"]) == narrowed
     # auto-review: the owner keeps the reviewer, the kid does not.
-    bot, chat, _manager = _bot(tmp_path, bash_policy="auto-review")
+    bot, chat, _manager = _bot(tmp_path, bash_policy="auto-review", execution_profile="strict-project")
     await bot.run_turn(_job("hi", sender=OWNER, room=FAMILY_ROOM), sink=FakeSink(), session_id=None, room_kind="family")
     await bot.run_turn(_job("hi", sender=KID, room=FAMILY_ROOM), sink=FakeSink(), session_id=None, room_kind="family")
     assert chat.calls[0]["approvals_reviewer"] == "auto_review"
@@ -879,26 +880,48 @@ async def test_non_owner_codex_turn_gets_narrowed_settings(tmp_path: Path, matri
     assert bot._codex_approval_policy() == "on-request"
 
 
-@pytest.mark.parametrize("provider", ["claude", "danso", "piri", "crush"])
+@pytest.mark.parametrize("provider", ["codex", "claude", "danso", "piri", "crush"])
 @pytest.mark.anyio
-async def test_non_owner_turn_is_refused_on_an_unnarrowable_owner_operator_provider(
+async def test_every_non_owner_turn_is_refused_on_owner_operator(
     tmp_path: Path, matrix_config: dict[str, Any], provider: str
 ) -> None:
     from telegram_bot.core.matrix.bot import NON_OWNER_TURN_REFUSED
 
     bot, chat, _manager = _bot(tmp_path, agent_provider=provider, bash_policy="auto-approve")
-    for body in ("hi", "/skills"):
+    for body in ("hi", "/skills", "/new", "/stop", "/resume"):
         result = await bot.run_turn(
             _job(body, sender=KID, room=FAMILY_ROOM), sink=FakeSink(), session_id=None, room_kind="family"
         )
-        assert result.text == NON_OWNER_TURN_REFUSED
-    assert chat.calls == []  # no agent run at all
+        assert result.text == NON_OWNER_TURN_REFUSED, body
+    assert chat.calls == [] and chat.stop_calls == []  # no agent run, no cancel
     await bot.run_turn(_job("hi", sender=OWNER, room=FAMILY_ROOM), sink=FakeSink(), session_id=None, room_kind="family")
     assert [call["user_id"] for call in chat.calls] == [bot.ids.user_id(OWNER)]
 
 
 @pytest.mark.anyio
-async def test_unnarrowable_provider_gate_is_scoped_to_owner_operator(
+async def test_refused_non_owner_attachment_is_never_staged(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telegram_bot.core.matrix import media as matrix_media
+    from telegram_bot.core.matrix.bot import NON_OWNER_TURN_REFUSED
+
+    staged: list[Any] = []
+
+    async def stage(*args: Any, **kwargs: Any) -> Any:
+        staged.append(args)
+        raise AssertionError("a refused attachment must not be downloaded")
+
+    monkeypatch.setattr(matrix_media, "stage", stage)
+    bot, chat, _manager = _bot(tmp_path)
+    job = _job("(attachment)", sender=KID, room=FAMILY_ROOM)
+    job["attachment"] = {"kind": "image", "name": "p.jpg", "mimetype": "image/jpeg"}
+    result = await bot.run_turn(job, sink=FakeSink(), session_id=None, room_kind="family")
+    assert result.text == NON_OWNER_TURN_REFUSED
+    assert staged == [] and chat.calls == []
+
+
+@pytest.mark.anyio
+async def test_non_owner_gate_is_scoped_to_owner_operator(
     tmp_path: Path, matrix_config: dict[str, Any]
 ) -> None:
     bot, chat, _manager = _bot(tmp_path, agent_provider="claude", execution_profile="strict-project")
@@ -911,7 +934,7 @@ async def test_unnarrowable_provider_gate_is_scoped_to_owner_operator(
 
 @pytest.mark.anyio
 async def test_notification_bot_reverse_maps_chat_id_to_room(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
-    bot, chat, _manager = _bot(tmp_path)
+    bot, chat, _manager = _bot(tmp_path, execution_profile="strict-project")  # owner-operator refuses the kid (#1955)
     holder = await _attach(bot)
 
     async def body(transport: FakeTransport) -> None:

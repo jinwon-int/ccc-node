@@ -242,7 +242,8 @@ async def test_family_room_wait_resumes_as_the_family_member(
     tmp_path: Path, matrix_config: dict[str, Any]
 ) -> None:
     _with_family_room(matrix_config)
-    bot, chat, _manager = _bot(tmp_path, bash_policy="auto-approve")
+    # strict-project: owner-operator refuses every non-owner turn (#1955).
+    bot, chat, _manager = _bot(tmp_path, bash_policy="auto-approve", execution_profile="strict-project")
     transport = SelfJobTransport()
     bot._transport = transport
     user_id, chat_id = _kid_ids(bot)
@@ -300,7 +301,7 @@ async def test_external_wait_self_job_refuses_a_mismatched_or_legacy_non_owner_j
     from telegram_bot.core.matrix.bot import EXTERNAL_WAIT_RESUME_REFUSED
 
     _with_family_room(matrix_config)
-    bot, chat, _manager = _bot(tmp_path)
+    bot, chat, _manager = _bot(tmp_path, execution_profile="strict-project")
     owner_user = bot.ids.user_id(OWNER)
 
     def body(**extra: Any) -> str:
@@ -321,13 +322,33 @@ async def test_external_wait_self_job_refuses_a_mismatched_or_legacy_non_owner_j
 
 
 @pytest.mark.anyio
-async def test_family_resume_on_an_unnarrowable_provider_is_refused_by_the_turn_gate(
+async def test_family_resume_on_owner_operator_is_refused_by_the_turn_gate(
     tmp_path: Path, matrix_config: dict[str, Any]
 ) -> None:
     from telegram_bot.core.matrix.bot import NON_OWNER_TURN_REFUSED
 
     _with_family_room(matrix_config)
     bot, chat, _manager = _bot(tmp_path, agent_provider="claude", bash_policy="auto-approve")
+    user_id, _chat_id = _kid_ids(bot)
+    text = json.dumps(
+        {"kind": SELF_JOB_EXTERNAL_WAIT_RESUME, "v": 1, "wait_id": "w", "user_id": user_id, "prompt": "go"}
+    )
+    result = await bot.run_turn(
+        _job(text, sender=KID, room=FAMILY_ROOM, event_id="$self-kid"),
+        sink=FakeSink(), session_id=None, room_kind="family",
+    )
+    assert result.text == NON_OWNER_TURN_REFUSED
+    assert chat.calls == []
+
+
+@pytest.mark.anyio
+async def test_family_resume_on_owner_operator_codex_is_refused_too(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    from telegram_bot.core.matrix.bot import NON_OWNER_TURN_REFUSED
+
+    _with_family_room(matrix_config)
+    bot, chat, _manager = _bot(tmp_path, agent_provider="codex", bash_policy="auto-approve")
     user_id, _chat_id = _kid_ids(bot)
     text = json.dumps(
         {"kind": SELF_JOB_EXTERNAL_WAIT_RESUME, "v": 1, "wait_id": "w", "user_id": user_id, "prompt": "go"}

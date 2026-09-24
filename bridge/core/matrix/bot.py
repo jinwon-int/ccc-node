@@ -94,9 +94,13 @@ NON_OWNER_TURN_REFUSED = (
 EXTERNAL_WAIT_RESUME_REFUSED = (
     "🔒 A queued follow-up was not run: it could not be matched to the person who asked for it."
 )
-# #1955: only Codex honours per-turn approval/sandbox settings; every other
-# provider runs under the process-wide execution profile.
-_PER_TURN_NARROWABLE_PROVIDERS = frozenset({"codex"})
+OWNER_ONLY_COMMAND = "🔒 Only the owner may use this command here."
+# #1955: commands that read or switch sessions, change model/effort, touch
+# memory, account usage or stored tasks. Non-owners keep /new, /stop and
+# /skills (an agent run, gated like any other turn).
+_OWNER_ONLY_COMMANDS = frozenset(
+    {"resume", "history", "model", "effort", "distill", "usage", "task_pause", "task_resume", "task_recover"}
+)
 STATUS_MIN_INTERVAL_S = 15.0  # match Telegram CCC_HEARTBEAT_* defaults
 _HEALTH_INTERVAL_S = 10.0  # match bot_lifecycle._WORKLOAD_INTERVAL
 _RUNTIME_MODEL_PROVIDERS = frozenset({"codex", "piri", "crush", "danso"})
@@ -998,26 +1002,25 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         )
 
     def _refuses_non_owner_turn(self, user_id: int) -> bool:
-        """Fail-closed gate for non-owner turns on an unnarrowable provider (#1955).
+        """Fail-closed gate: no non-owner turn on ``owner-operator`` (#1955).
 
         ``owner-operator`` binds host-capable execution to exactly one owner,
-        but Matrix also admits ``family_users``. Codex takes approval/sandbox
-        settings per turn, so a non-owner Codex turn is narrowed instead (see
-        :meth:`_codex_approval_policy`). Claude (including the unrestricted
-        path, whose auto-approve allowlist never consults the approval
-        callback), Danso, Piri and Crush run under the process-wide execution
-        profile and cannot be narrowed per turn: on ``owner-operator`` such a
-        turn is refused before any agent run. ``True`` means refuse.
+        but Matrix also admits ``family_users``. No provider can confine a
+        single turn to what a non-owner may see: Claude (including the
+        unrestricted path, whose auto-approve allowlist never consults the
+        approval callback), Danso, Piri and Crush run under the process-wide
+        execution profile, and Codex's ``workspaceWrite`` sandbox limits
+        writes but not reads (host secrets, owner transcripts). So on
+        ``owner-operator`` every non-owner turn — messages, attachments,
+        commands, resumes — is refused before any work. ``True`` means refuse.
         """
 
         if self._check_user_access(user_id):
             return False
-        if self._active_provider() in _PER_TURN_NARROWABLE_PROVIDERS:
-            return False
         if self._execution_profile() != tool_policy.EXECUTION_OWNER_OPERATOR:
             return False
         logger.info(
-            "Matrix non-owner turn refused: provider=%s profile=%s cannot be narrowed per turn",
+            "Matrix non-owner turn refused: provider=%s profile=%s",
             self._active_provider(),
             tool_policy.EXECUTION_OWNER_OPERATOR,
         )
@@ -1084,6 +1087,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         body = str(job.get("body") or "")
         self._active_sink = sink
         try:
+            # #1955: before attachment staging, command parsing or self-jobs.
+            if self._refuses_non_owner_turn(user_id):
+                return _turn_result(NON_OWNER_TURN_REFUSED, None)
             if job.get("attachment"):
                 # #1795: a photo/file never goes through command parsing.
                 return await self._run_attachment(
@@ -1100,6 +1106,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                     room_kind=room_kind,
                 )
             command, args = self._parse_command(body)
+            if command in _OWNER_ONLY_COMMANDS and not self._check_user_access(user_id):
+                return _turn_result(OWNER_ONLY_COMMAND, None)
             if command == "skills":
                 return await self._cmd_skills(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink, turn_marker=str(job.get("event_id") or ""))
             if command == "task_resume":
@@ -1820,6 +1828,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
     async def _select_resume_choice(self, body: str, *, user_id: int, chat_id: int) -> str | None:
         """A digit reply after ``/resume`` switches sessions; anything else is untouched."""
 
+        if not self._check_user_access(user_id):
+            return None  # #1955: /resume is owner-only, so is its selection
         key = self._conversation_key(user_id, chat_id)
         session = await self._session_manager.get_session(key)
         resume_list = session.get("resume_list")
@@ -1921,10 +1931,14 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         await self._offer_danso_recovery_if_failed(response, key, user_id, chat_id)
         return result
 
-    # #1955: ``user_id`` narrows a non-owner turn — "untrusted" approvals (the
-    # sender-first callback then denies), no auto reviewer, and a workspace
-    # sandbox without network. ``None`` keeps the owner-only callers (Danso
-    # recovery) on the configured policy.
+    # #1955: ``user_id`` reduces a non-owner Codex turn — "untrusted" approvals
+    # (the sender-first callback then denies), no auto reviewer, and a
+    # workspace sandbox without network. Reachable only off ``owner-operator``
+    # (that profile refuses non-owner turns outright), where it keeps a family
+    # turn off ``never + dangerFullAccess``. It limits writes and network, NOT
+    # reads: this is not a confidentiality boundary (read scoping is #1960).
+    # ``None`` keeps the owner-only callers (Danso recovery) on the configured
+    # policy.
     def _narrow_for(self, user_id: int | None) -> bool:
         return user_id is not None and not self._check_user_access(user_id)
 

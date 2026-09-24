@@ -76,7 +76,10 @@ async def test_resets_and_shutdown_preserve_old_threads_once(tmp_path, matrix_co
 @pytest.mark.anyio
 async def test_family_and_private_jobs_never_share_private_audience(tmp_path, matrix_config):
     from test_matrix_bot import FAMILY_ROOM, KID
-    bot, chat, _, journal = wired_bot(tmp_path, bridge_memory_mode="audience-scoped", memory_distill_checkpoint_turns=1)
+    bot, chat, _, journal = wired_bot(
+        tmp_path, bridge_memory_mode="audience-scoped", memory_distill_checkpoint_turns=1,
+        execution_profile="strict-project",  # owner-operator refuses the kid (#1955)
+    )
     await bot.run_turn(_job("private", event_id="$p"), sink=FakeSink(), session_id=None, room_kind="direct")
     chat.response.session_id = "family-thread"
     await bot.run_turn(_job("shared", sender=KID, room=FAMILY_ROOM, event_id="$s"), sink=FakeSink(), session_id=None, room_kind="family")
