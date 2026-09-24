@@ -61,7 +61,13 @@ from telegram_bot.core.matrix.attachments import (  # noqa: F401 - re-exported
 )
 
 MAX_TEXT_BYTES = 16_384
+# Notices, status bubbles and operator texts. Agent replies are not bound by
+# it: the outbox splits a reply into as many events as it needs (#1957).
 MAX_REPLY_BYTES = 65_536
+# Storage ceiling for one agent reply (~340k Korean characters, ~90 events).
+# Anything longer is cut with REPLY_TRUNCATED_NOTICE instead of being lost.
+MAX_STORED_REPLY_BYTES = 1_048_576
+REPLY_TRUNCATED_NOTICE = "⚠️ 답변이 너무 길어(1 MiB 초과) 여기까지만 전달합니다. 나머지가 필요하면 이어서 요청해 주세요."
 
 BLOCK_KEYS: tuple[str, ...] = ("blocked_scopes", "uncertain_scopes")
 SCOPE_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -795,6 +801,30 @@ def turn_id(event_id: str) -> str:
     return hashlib.sha256(event_id.encode()).hexdigest()[:32]
 
 
+def stored_reply(reply: str) -> str:
+    """Validate an agent reply for the outbox; never reject it for its length (#1957).
+
+    Up to :data:`MAX_STORED_REPLY_BYTES` the reply is stored as is and the
+    outbox sends it as several events. Beyond that it is cut at a character
+    boundary (an open code fence is closed) and :data:`REPLY_TRUNCATED_NOTICE`
+    is appended, so the user always sees the answer and knows it was cut —
+    the agent work and the session are already done at this point, so a
+    ``ValueError`` here used to replace the whole answer with a turn-error
+    notice. Empty/NUL/unencodable text is still refused.
+    """
+    try:
+        return bounded_text(reply, MAX_STORED_REPLY_BYTES)
+    except ValueError as exc:
+        if str(exc) != "text too large":
+            raise
+    from telegram_bot.core.matrix.render import close_open_fence
+
+    tail = "\n\n" + REPLY_TRUNCATED_NOTICE
+    budget = MAX_STORED_REPLY_BYTES - len(tail.encode()) - len("\n```")
+    head = reply.encode("utf-8")[:budget].decode("utf-8", errors="ignore").rstrip()
+    return close_open_fence(head) + tail
+
+
 def parts(text: str, limit: int = 12_000) -> list[str]:
     result: list[str] = []
     current: list[str] = []
@@ -842,6 +872,14 @@ _MATRIX_SCHEMA = """
     CREATE TABLE IF NOT EXISTS operator_audit(seq INTEGER PRIMARY KEY, at REAL NOT NULL,
         actor TEXT NOT NULL, action TEXT NOT NULL, scope TEXT NOT NULL,
         reason TEXT NOT NULL, before TEXT NOT NULL);
+    -- #1956: outbox parts the homeserver rejected (4xx), skipped for good.
+    -- A separate table, not a job state: jobs.state has a CHECK constraint
+    -- that CREATE TABLE IF NOT EXISTS would never migrate on existing stores.
+    CREATE TABLE IF NOT EXISTS delivery_failures(event_id TEXT NOT NULL, part INTEGER NOT NULL,
+        status INTEGER NOT NULL, errcode TEXT NOT NULL, at REAL NOT NULL,
+        PRIMARY KEY(event_id, part));
+    -- notice event id -> the outbox row whose failed parts it reports.
+    CREATE TABLE IF NOT EXISTS delivery_failure_notices(event_id TEXT PRIMARY KEY, source TEXT NOT NULL);
 """
 
 _STATE_FILES = ("inbox.sqlite3", "inbox.sqlite3-journal", "inbox.sqlite3-wal", "inbox.sqlite3-shm")
@@ -993,7 +1031,7 @@ class Store:
             raise ValueError("invalid text")
         deliver = bool(reply.strip())
         if deliver:
-            bounded_text(reply, MAX_REPLY_BYTES)
+            reply = stored_reply(reply)
         if session_id is not None:
             bounded_text(session_id, 255)
         with self.db:
@@ -1247,6 +1285,37 @@ class MatrixStore(Store):
     def mark_part(self, event: str, part: int) -> None:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO deliveries VALUES (?,?)", (event, part))
+
+    def skip_part(self, event: str, index: int, status: int, errcode: str) -> None:
+        """Record part ``index`` (0-based) as rejected and move past it in one transaction."""
+        with self.db:
+            self.db.execute(
+                "INSERT OR REPLACE INTO delivery_failures VALUES (?,?,?,?,?)",
+                (event, index, int(status), str(errcode or "")[:64], time.time()),
+            )
+            self.db.execute("INSERT OR REPLACE INTO deliveries VALUES (?,?)", (event, index + 1))
+
+    def failed_parts(self, event: str) -> list[dict[str, Any]]:
+        """Body-free records of the rejected parts of one outbox row."""
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT part,status,errcode,at FROM delivery_failures WHERE event_id=? ORDER BY part", (event,)
+            )
+        ]
+
+    def is_failure_notice(self, event: str) -> bool:
+        return (
+            self.db.execute("SELECT 1 FROM delivery_failure_notices WHERE event_id=?", (event,)).fetchone()
+            is not None
+        )
+
+    def failure_notice(self, req: Request, text: str) -> str:
+        """Queue the one undelivered-parts notice for ``req``'s row (idempotent)."""
+        event = self.notice(req, "delivery-failed", text)
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO delivery_failure_notices VALUES (?,?)", (event, req.event_id))
+        return event
 
     def uncertain_job(self, event: str) -> None:
         with self.db:

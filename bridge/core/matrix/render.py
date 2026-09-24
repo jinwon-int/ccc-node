@@ -12,6 +12,10 @@ Two pure helpers with no Matrix client dependency:
   one chunk and reopened at the start of the next). Its limit is measured in
   **UTF-8 bytes**, because what bounds a Matrix event is a byte size and not a
   character count (#1828).
+* :func:`event_chunks` is what the transport actually sends: ``chunk_text``
+  pieces, re-split until each one's *encrypted event* fits the homeserver's
+  PDU limit (#1956). :func:`estimated_event_bytes` and
+  :func:`trim_to_event` are the size model behind it.
 
 Safety model: every character of user/agent text is HTML-escaped *before* any
 tag is inserted, tags are only ever emitted from fixed literals in this
@@ -23,7 +27,9 @@ from __future__ import annotations
 
 from collections import deque
 import html
+import json
 import re
+from typing import Any
 
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}```[ \t]*([A-Za-z0-9_+#.-]{0,32})[ \t]*$")
 _FENCE_CLOSE_RE = re.compile(r"^ {0,3}```[ \t]*$")
@@ -358,3 +364,152 @@ def chunk_text(text: str, limit: int = 12_000) -> list[str]:  # noqa: C901
         current.append("```")
     emit(current)
     return chunks
+
+
+def close_open_fence(text: str) -> str:
+    """Append a closing fence when ``text`` ends inside a fenced code block."""
+
+    in_fence = False
+    for line in text.split("\n"):
+        in_fence = _fence_state(line, in_fence)[2]
+    return text + "\n```" if in_fence else text
+
+
+# --------------------------------------------------------------------------- #
+# Encrypted event size budget (#1956)
+# --------------------------------------------------------------------------- #
+
+#: Homeserver PDU limit: the whole federated event, canonical JSON, in bytes.
+MATRIX_PDU_LIMIT = 65_536
+#: Ceiling for :func:`estimated_event_bytes`. The estimate already carries the
+#: homeserver envelope reserve, so this leaves another 8 KiB of slack below the
+#: PDU limit for anything the model does not see (server-specific fields).
+EVENT_BYTE_BUDGET = 57_344
+#: Megolm message framing before base64: version byte, message-index varint,
+#: ciphertext tag/length, AES-CBC padding (<= 16), 8-byte MAC and a 64-byte
+#: ed25519 signature — about 100 bytes, rounded up.
+_MEGOLM_FRAMING = 128
+#: Fields the homeserver adds when it turns our PUT into a PDU (sender,
+#: room_id, type, origin_server_ts, depth, prev/auth events, hashes,
+#: signatures, unsigned) — ~1-2 KiB in practice, reserved generously.
+_ENVELOPE_RESERVE = 4_096
+# Longest ids the spec allows (255 bytes): the estimate never depends on which
+# room or event it is for, so a chunking decision is stable across rooms.
+_MAX_ROOM_ID = "!" + "x" * 254
+_MAX_EVENT_ID = "$" + "x" * 254
+_TRUNCATION_MARK = "\n…"
+
+
+def event_content(text: str, *, plain: bool = False) -> dict[str, Any]:
+    """``m.text`` content with a Matrix-HTML ``formatted_body`` when the text has markup.
+
+    ``plain=True`` drops the HTML rendering (the 413 downgrade path): the
+    ``body`` alone is roughly half the event.
+    """
+
+    body, formatted = render_matrix_message(text)
+    content: dict[str, Any] = {"msgtype": "m.text", "body": body}
+    if formatted and not plain:
+        content["format"] = "org.matrix.custom.html"
+        content["formatted_body"] = formatted
+    return content
+
+
+def edit_content(text: str, replaces: str, *, plain: bool = False) -> dict[str, Any]:
+    """``m.replace`` edit of ``replaces``: note the text travels twice (fallback + new content)."""
+
+    new_content = event_content(text, plain=plain)
+    content: dict[str, Any] = dict(new_content)
+    content["body"] = "* " + text
+    content["m.new_content"] = new_content
+    content["m.relates_to"] = {"rel_type": "m.replace", "event_id": replaces}
+    return content
+
+
+def estimated_event_bytes(text: str, *, edit: bool = False, plain: bool = False) -> int:
+    """Upper-bound size of the PDU the homeserver builds for one outgoing text event.
+
+    Mirrors what actually goes over the wire, not just ``len(body)`` (#1828
+    budgeted only that):
+
+    * nio's ``group_encrypt`` serialises ``{"content", "type", "room_id"}``
+      with plain ``json.dumps`` — ``ensure_ascii`` stays on, so every
+      non-ASCII character becomes ``\\uXXXX`` (6 bytes; a surrogate pair for
+      emoji is 12). A 12 KB Korean chunk is ~24 KB in ``body`` alone, and the
+      same again in ``formatted_body``; HTML escaping (``&quot;`` → 6 bytes,
+      then JSON) inflates quote-heavy code further.
+    * Megolm framing is added and the ciphertext is base64 (×4/3).
+    * The ``m.room.encrypted`` wrapper and the homeserver's own PDU envelope
+      come on top (:data:`_ENVELOPE_RESERVE`).
+    """
+
+    content = edit_content(text, _MAX_EVENT_ID, plain=plain) if edit else event_content(text, plain=plain)
+    plaintext = json.dumps(
+        {"content": content, "type": "m.room.message", "room_id": _MAX_ROOM_ID}, separators=(",", ":")
+    )
+    ciphertext = -(-(len(plaintext.encode("utf-8")) + _MEGOLM_FRAMING) * 4 // 3)
+    wrapper: dict[str, Any] = {
+        "algorithm": "m.megolm.v1.aes-sha2",
+        "sender_key": "x" * 43,
+        "ciphertext": "",
+        "session_id": "x" * 43,
+        "device_id": "x" * 64,
+    }
+    if "m.relates_to" in content:
+        wrapper["m.relates_to"] = content["m.relates_to"]
+    return ciphertext + len(json.dumps(wrapper).encode("utf-8")) + _ENVELOPE_RESERVE
+
+
+def _smaller_limit(size: int, estimate: int, budget: int) -> int:
+    """Byte limit that should bring a ``size``-byte text with ``estimate`` under ``budget``."""
+
+    return max(_MIN_CHUNK_LIMIT, min(size - 1, size * budget // estimate * 9 // 10))
+
+
+def _fit_event(chunk: str, budget: int) -> list[str]:
+    """``[chunk]`` when its event fits, else a deterministic re-split at a smaller limit."""
+
+    estimate = estimated_event_bytes(chunk)
+    size = _w(chunk)
+    if estimate <= budget or size <= _MIN_CHUNK_LIMIT:
+        return [chunk]
+    out: list[str] = []
+    for piece in chunk_text(chunk, _smaller_limit(size, estimate, budget)):
+        out.extend(_fit_event(piece, budget))
+    return out
+
+
+def event_chunks(text: str, limit: int = 12_000, *, budget: int = EVENT_BYTE_BUDGET) -> list[str]:
+    """Split ``text`` into pieces whose *encrypted event* fits the PDU limit (#1956).
+
+    First the byte-bounded, fence-aware :func:`chunk_text` split at ``limit``;
+    then any piece whose :func:`estimated_event_bytes` exceeds ``budget`` is
+    split again at a proportionally smaller limit, recursively (at the 64-byte
+    floor every event fits). The result is a pure function of ``text``: the
+    outbox resumes a half-delivered reply by part index, so the same reply
+    must always produce the same parts — and pieces that already fit are
+    exactly the ``chunk_text`` pieces they were before this change.
+    """
+
+    out: list[str] = []
+    for chunk in chunk_text(text, limit):
+        out.extend(_fit_event(chunk, budget))
+    return out
+
+
+def trim_to_event(text: str, *, edit: bool = False, budget: int = EVENT_BYTE_BUDGET) -> str:
+    """``text`` cut (with a trailing ``…``) until one event carrying it fits ``budget``.
+
+    For the direct, single-event sends outside the outbox — the progress
+    bubble and its ``m.replace`` edits (``edit=True``: the text is carried
+    twice). Those are cosmetic, so a cut beats a rejected event.
+    """
+
+    candidate = text
+    size = _w(text)
+    estimate = estimated_event_bytes(text, edit=edit)
+    while estimate > budget and size > _MIN_CHUNK_LIMIT:
+        size = _smaller_limit(size, estimate, budget)
+        candidate = close_open_fence(_head_within(text, size)) + _TRUNCATION_MARK
+        estimate = estimated_event_bytes(candidate, edit=edit)
+    return candidate

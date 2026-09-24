@@ -302,3 +302,77 @@ def test_chunk_multibyte_fence_body_stays_balanced_within_byte_limit() -> None:
     chunks = chunk_text("```python\n" + "# 한글 주석 라인\n" * 200 + "```", limit=200)
     assert all(_b(c) <= 200 for c in chunks)
     assert all(_fences(c) == 2 for c in chunks)
+
+
+# --- encrypted event size budget (#1956) ---------------------------------------
+
+from telegram_bot.core.matrix import render as _render  # noqa: E402
+
+_KOREAN_MARKUP = "**요약** 한국어 보고서 문단입니다. `코드`와 *강조*가 섞여 있습니다.\n" * 1_500
+_QUOTE_JSON = "```json\n" + "\n".join('{"k\\"ey": "v\\"al\\"ue", "n": %d, "s": "\\"\\""}' % i for i in range(2_000)) + "\n```"
+
+
+def test_estimate_counts_escaped_non_ascii_and_both_bodies() -> None:
+    # nio's json.dumps keeps ensure_ascii: a 12 KB Korean chunk with markup
+    # carries every Hangul syllable as \uXXXX in body AND formatted_body, so
+    # the encrypted event overruns the 65,536-byte PDU limit — the #1828
+    # body-only byte budget could not see this.
+    first = chunk_text(_KOREAN_MARKUP)[0]
+    assert _b(first) <= 12_000
+    assert _render.estimated_event_bytes(first) > _render.MATRIX_PDU_LIMIT
+    # Plain text of the same chunk is roughly half the event.
+    assert _render.estimated_event_bytes(first, plain=True) < _render.estimated_event_bytes(first) * 0.6
+    # An edit carries the text twice.
+    assert _render.estimated_event_bytes(first, edit=True) > _render.estimated_event_bytes(first) * 1.8
+
+
+@pytest.mark.parametrize("text", [_KOREAN_MARKUP, _QUOTE_JSON, "\x01\x02" * 20_000, "🙂 **x** " * 8_000])
+def test_event_chunks_fit_the_pdu_limit_and_lose_nothing(text: str) -> None:
+    pieces = _render.event_chunks(text)
+    assert len(pieces) > len(chunk_text(text)) or text.startswith("\x01")
+    assert all(_render.estimated_event_bytes(p) <= _render.EVENT_BYTE_BUDGET for p in pieces)
+    # Deterministic: the outbox resumes a half-delivered reply by part index.
+    assert _render.event_chunks(text) == pieces
+    for needle in ("요약", '"k\\"ey"', "\x01", "🙂"):
+        assert sum(p.count(needle) for p in pieces) == text.count(needle)
+    if text.startswith("```"):
+        assert all(_fences(p) == 2 for p in pieces)  # each piece renders as balanced markdown
+
+
+def test_event_chunks_leave_fitting_chunks_untouched() -> None:
+    text = "\n\n".join(["ascii paragraph " * 60] * 40)  # ~38 KB, several 12 KB chunks
+    assert _render.event_chunks(text) == chunk_text(text)
+    assert _render.event_chunks("") == []
+    assert _render.event_chunks("짧은 답") == ["짧은 답"]
+
+
+def test_trim_to_event_fits_an_edit_and_marks_the_cut() -> None:
+    assert _render.trim_to_event("⏳ Working — 1s", edit=True) == "⏳ Working — 1s"
+    text = "```\n" + "진행 상황 " * 6_000
+    cut = _render.trim_to_event(text, edit=True)
+    assert _render.estimated_event_bytes(cut, edit=True) <= _render.EVENT_BYTE_BUDGET
+    assert cut.endswith("\n```\n…") and text.startswith(cut[: len(cut) - len("\n```\n…")])
+
+
+def test_estimate_is_an_upper_bound_of_real_megolm_output() -> None:
+    olm = pytest.importorskip("olm")
+    import json
+
+    session = olm.OutboundGroupSession()
+    for text in (chunk_text(_KOREAN_MARKUP)[0], chunk_text(_QUOTE_JSON)[0], "hi"):
+        for edit in (False, True):
+            content = _render.edit_content(text, "$" + "e" * 254) if edit else _render.event_content(text)
+            plaintext = json.dumps({"content": content, "type": "m.room.message", "room_id": "!" + "r" * 254}, separators=(",", ":"))
+            wrapper = {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "sender_key": "k" * 43,
+                "ciphertext": session.encrypt(plaintext),
+                "session_id": session.id,
+                "device_id": "D" * 64,
+            }
+            if edit:
+                wrapper["m.relates_to"] = content["m.relates_to"]
+            real = len(json.dumps(wrapper).encode())
+            estimate = _render.estimated_event_bytes(text, edit=edit)
+            # The estimate is the wire content plus the envelope reserve.
+            assert real + 4_000 <= estimate <= real + 4_400

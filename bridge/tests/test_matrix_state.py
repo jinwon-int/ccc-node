@@ -335,9 +335,28 @@ class TestStore:
             with pytest.raises(ValueError):
                 s.finish("$two", None)
             with pytest.raises(ValueError):
-                s.finish("$two", "x" * (MAX_REPLY_BYTES + 1))
+                s.finish("$two", "a\x00b")  # length is no longer a reason (#1957); NUL still is
             s.finish("$two", "   ")  # whitespace-only counts as nothing to say
             assert s.outbox() == []
+
+    def test_long_reply_is_stored_whole_and_huge_reply_is_cut_with_notice(self, tmp_path: Path) -> None:
+        # #1957: a reply over the 64 KiB notice cap used to raise ValueError in
+        # finish() after the agent work was done, losing the whole answer.
+        long = "가나다라마바사 보고서 문단입니다.\n" * 3_000  # ~70 KiB+
+        assert len(long.encode()) > MAX_REPLY_BYTES
+        huge = "```\n" + "x" * (m.MAX_STORED_REPLY_BYTES + 10) + "\n```"
+        with Store(tmp_path / "state", BOT) as s:
+            s.accept_batch([request(), request("$two")], "t")
+            s.claim()
+            s.finish("$one", long)
+            assert [row["reply"] for row in s.outbox()] == [long]
+            s.delivered("$one")
+            s.claim()
+            s.finish("$two", huge)
+            (cut,) = [row["reply"] for row in s.outbox()]
+        assert len(cut.encode()) <= m.MAX_STORED_REPLY_BYTES
+        assert cut.endswith("\n```\n\n" + m.REPLY_TRUNCATED_NOTICE)  # fence closed before the notice
+        assert cut.startswith("```\nxxx")
 
     def test_second_process_cannot_open_same_store(self, tmp_path: Path) -> None:
         directory = tmp_path / "state"
@@ -505,6 +524,28 @@ class TestMatrixStore:
             assert s.delivered_parts(first) == 0
             s.mark_part(first, 2)
             assert s.delivered_parts(first) == 2
+
+    def test_skipped_parts_are_durable_and_failure_notice_is_idempotent(self, tmp_path: Path) -> None:
+        directory = tmp_path / "state"
+        # An existing store created before #1956 has no delivery_failures
+        # tables; opening it adds them without touching jobs.
+        with Store(directory, BOT):
+            pass
+        with MatrixStore(directory, BOT) as s:
+            req = request()
+            row = s.notice(req, "k", "안내")
+            s.mark_part(row, 1)
+            s.skip_part(row, 1, 413, "M_TOO_LARGE")
+            assert s.delivered_parts(row) == 2  # moved past the rejected part atomically
+            assert [(f["part"], f["status"], f["errcode"]) for f in s.failed_parts(row)] == [(1, 413, "M_TOO_LARGE")]
+            assert not s.is_failure_notice(row)
+            notice = s.failure_notice(req, "실패 안내")
+            assert s.failure_notice(req, "실패 안내") == notice
+            assert s.is_failure_notice(notice)
+        with MatrixStore(directory, BOT) as s:
+            assert s.delivered_parts(row) == 2
+            assert len(s.failed_parts(row)) == 1
+            assert s.is_failure_notice(notice)
 
     def test_control_dedup_records_only_when_asked(self, tmp_path: Path) -> None:
         with MatrixStore(tmp_path / "state", BOT) as s:
