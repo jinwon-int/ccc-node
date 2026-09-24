@@ -1,5 +1,10 @@
 # Changelog
 
+- **Grok Matrix startup banner stays out of family rooms.** `family_rooms`
+  must be listed in `rooms`, so the banner loop announced every restart to the
+  family as well (observed 2026-09-25 right after enabling the family room,
+  #1982). `_post_banner` now skips `family_rooms`; the family-room admission
+  test uses that production config shape.
 - **Grok Matrix frontend can serve family rooms (opt-in).** With
   `CCC_GROK_MATRIX_FAMILY_ROOMS=1`, `GrokMatrixBot` accepts a config with
   `family_rooms`/`family_users` and admits mention-gated prompts from the owner

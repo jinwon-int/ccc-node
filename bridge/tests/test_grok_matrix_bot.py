@@ -188,7 +188,8 @@ class GrokMatrixLifecycleTests(unittest.IsolatedAsyncioTestCase):
             with self.route.journal.claim() as claim:
                 seen["stage"] = claim.load()[0]["stage"]
 
-        with stub_state(matrix_config(family_rooms=[FAMILY_ROOM], family_users=[KID])):
+        # Production shape: family_rooms must be a subset of rooms (family_config).
+        with stub_state(matrix_config(rooms=[DM_ROOM, FAMILY_ROOM], family_rooms=[FAMILY_ROOM], family_users=[KID])):
             bot = self.bot(settings=settings, script=script)
             await bot.serve()
         self.assertEqual(seen["stranger"], NOT_ADMITTED)
