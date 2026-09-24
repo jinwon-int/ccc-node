@@ -189,6 +189,12 @@ NOTICE_PARTS_UNDELIVERED = (
     "⚠️ 직전 답변 {total}개 조각 중 {failed}개를 Matrix 서버가 거부해 전달하지 못했습니다. "
     "필요하면 나눠서 다시 요청해 주세요."
 )
+# Responses that say "try again", not "this request is wrong": they take the
+# ConnectionError path (network-retry with backoff), never quarantine or stop.
+# 408 Request Timeout and 425 Too Early are transient by definition (RFC 9110
+# / RFC 8470); 429 and the 5xx gateway family were already retried. Every
+# other 4xx describes the request itself, so repeating it cannot help.
+RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 # Bounded, body-free errcode taken from a homeserver error response.
 _ERRCODE_RE = re.compile(r"M_[A-Z0-9_]{1,60}")
 _ERROR_BODY_CAP = 4_096
@@ -222,7 +228,7 @@ class MatrixHTTPError(SafetyStop):
         boundaries — goes unnoticed. The service stops and reports
         ``matrix-http-401/403`` so an operator reconciles it.
         """
-        return 400 <= self.status < 500 and self.status not in (401, 403)
+        return 400 <= self.status < 500 and self.status not in (401, 403) and self.status not in RETRYABLE_STATUSES
 
 
 def message_content(text: str) -> dict[str, Any]:
@@ -487,6 +493,10 @@ class MatrixTransport:
         # Set when the active turn hit ``turn_timeout``, before the runner is
         # cancelled, so the runner can tell a timeout from /stop or shutdown.
         self.turn_timed_out = False
+        # Consecutive outbox parts quarantined on a 4xx; any successfully sent
+        # part resets it. Health reads it (getattr, #1963): a streak means
+        # replies are being dropped even though the service keeps running.
+        self.delivery_rejections_streak = 0
 
     # -- HTTP -----------------------------------------------------------------
 
@@ -499,7 +509,7 @@ class MatrixTransport:
     ) -> Any:
         url = self.c["homeserver"].rstrip("/") + path
         async with self.http.request(method, url, json=data, params=params, allow_redirects=False) as response:
-            if response.status in (429, 500, 502, 503, 504):
+            if response.status in RETRYABLE_STATUSES:
                 raise ConnectionError("matrix-temporary-error")
             if response.status != 200:
                 raise MatrixHTTPError(response.status, await self._errcode(response))
@@ -1367,13 +1377,14 @@ class MatrixTransport:
                     await self.pin_devices()
                     if not await self.room_gate(job["room_id"]):
                         continue
-                    await self._deliver(job)
-                    if "done" in self.turn_timing.get(job["event_id"], {}):
-                        self.mark(job["event_id"], "delivered")
-                        self._finish_timing(job["event_id"])
+                if not await self._deliver(job):
+                    continue  # room muted mid-row: the rest waits, like a muted room's replies
+                if "done" in self.turn_timing.get(job["event_id"], {}):
+                    self.mark(job["event_id"], "delivered")
+                    self._finish_timing(job["event_id"])
             await self._idle(self.send_wake)
 
-    async def _deliver(self, job: Mapping[str, Any]) -> None:
+    async def _deliver(self, job: Mapping[str, Any]) -> bool:
         """Send every undelivered part of one outbox row, then mark it delivered.
 
         Parts are fence-aware 12 KB pieces re-split until each *encrypted
@@ -1385,26 +1396,42 @@ class MatrixTransport:
         behind it keep flowing. Once the row is done, the room gets one
         fixed-text notice naming how many parts were lost; a notice about a
         failed notice is never queued, so this cannot loop.
+
+        ``matrix_lock`` is taken per part, not per row: a 1 MiB reply is ~90
+        events, and holding the lock across all of them would stall sync
+        processing (and with it /cancel, /stop and approvals) for minutes.
+        Between parts a sync batch re-pins devices and re-gates every room,
+        so each part re-checks the room's mute and ``_encrypted_raw`` re-checks
+        the recipients against the fresh trust state. The part index is only
+        advanced after its send, and each part keeps its txn id, so ordering
+        and idempotency are the same as before. Returns ``False`` when the
+        room was muted mid-row (the row stays ready and resumes later).
         """
         from telegram_bot.core.matrix.render import event_chunks
 
         event_id, room = job["event_id"], job["room_id"]
         chunks = event_chunks(job["reply"])
         for i in range(self.store.delivered_parts(event_id), len(chunks)):
-            tx = hashlib.sha256((job["txn_id"] + ":" + str(i)).encode()).hexdigest()
-            try:
-                sent = await self._send_part(room, chunks[i], tx)
-            except MatrixHTTPError as exc:
-                if not exc.part_rejected:
-                    raise
-                logger.warning(
-                    "Matrix outbox part rejected status=%s errcode=%s part=%d/%d turn=%s",
-                    exc.status, exc.errcode or "-", i + 1, len(chunks), turn_id(event_id),
-                )
-                self.store.skip_part(event_id, i, exc.status, exc.errcode)
-                continue
-            self._remember_text(sent, room, self.c["account"], chunks[i])
-            self.store.mark_part(event_id, i + 1)
+            async with self.matrix_lock:
+                if room in self.blocked:
+                    return False
+                tx = hashlib.sha256((job["txn_id"] + ":" + str(i)).encode()).hexdigest()
+                try:
+                    sent = await self._send_part(room, chunks[i], tx)
+                except MatrixHTTPError as exc:
+                    if not exc.part_rejected:
+                        raise
+                    self.delivery_rejections_streak += 1
+                    logger.warning(
+                        "Matrix outbox part rejected status=%s errcode=%s part=%d/%d turn=%s streak=%d",
+                        exc.status, exc.errcode or "-", i + 1, len(chunks), turn_id(event_id),
+                        self.delivery_rejections_streak,
+                    )
+                    self.store.skip_part(event_id, i, exc.status, exc.errcode)
+                    continue
+                self.delivery_rejections_streak = 0
+                self._remember_text(sent, room, self.c["account"], chunks[i])
+                self.store.mark_part(event_id, i + 1)
         failed = self.store.failed_parts(event_id)
         if failed and not self.store.is_failure_notice(event_id):
             # Queued before the row is marked delivered: a crash in between
@@ -1414,6 +1441,7 @@ class MatrixTransport:
                 NOTICE_PARTS_UNDELIVERED.format(failed=len(failed), total=len(chunks)),
             )
         self.store.delivered(event_id)
+        return True
 
     async def _send_part(self, room: str, text: str, txn: str) -> str:
         """One outbox part; a too-large rejection is retried once as plain text.

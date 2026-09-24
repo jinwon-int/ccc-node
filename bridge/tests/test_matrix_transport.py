@@ -1177,6 +1177,44 @@ async def test_raw_error_carries_status_and_bounded_errcode(tmp_path: Path) -> N
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("status", [408, 425, 429, 500, 502, 503, 504])
+async def test_transient_statuses_retry_instead_of_quarantine(tmp_path: Path, status: int) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        f.http = types.SimpleNamespace(request=lambda *a, **k: FakeResponse(status, []), close=AsyncMock())
+        with pytest.raises(ConnectionError, match="matrix-temporary-error"):
+            await f.raw("PUT", "/x", {})
+    assert not t.MatrixHTTPError(status).part_rejected
+
+
+@pytest.mark.anyio
+async def test_rejection_streak_counts_quarantined_parts_and_resets_on_success(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        outbox_ready(f)
+        assert f.delivery_rejections_streak == 0
+        seen: list[int] = []
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            seen.append(f.delivery_rejections_streak)
+            if len(seen) <= 3:
+                raise t.MatrixHTTPError(400, "M_BAD_JSON")
+            return {"event_id": "$ok" + str(len(seen))}
+
+        f.raw = raw
+        for text in ("하나", "둘", "셋"):
+            f.enqueue_notice(room, text)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
+            h.start(f.retry(f.send))
+            await h.until(lambda: len(seen) == 6 and not f.store.outbox())
+        # Three quarantined parts in a row (health degrades at >= 3, #1963),
+        # then the first successful send (a failure notice) resets it.
+        assert seen == [0, 1, 2, 3, 0, 0]
+        assert f.delivery_rejections_streak == 0
+
+
+@pytest.mark.anyio
 async def test_rejected_outbox_rows_do_not_stop_service_or_replay(tmp_path: Path) -> None:
     async with running(tmp_path) as h:
         f = h.f
@@ -1216,6 +1254,80 @@ async def test_rejected_outbox_rows_do_not_stop_service_or_replay(tmp_path: Path
         f.raw = AsyncMock(side_effect=AssertionError("nothing may be replayed"))
         assert f.store.outbox() == []
         assert f.store.failed_parts(bad)[0]["errcode"] == "M_BAD_JSON"
+
+
+@pytest.mark.anyio
+async def test_sync_is_processed_between_parts_of_a_long_row(tmp_path: Path) -> None:
+    # A 1 MiB reply is ~90 events; send() must not hold matrix_lock across
+    # the whole row, or sync commits, /cancel and approvals stall behind it.
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        outbox_ready(f)
+        nio = fake_nio()
+
+        class SyncResponse:
+            @classmethod
+            def from_dict(cls, raw: Any) -> Any:
+                response = cls()
+                response.rooms = types.SimpleNamespace(join={})  # type: ignore[attr-defined]
+                return response
+
+        setattr(nio, "SyncResponse", SyncResponse)
+        order: list[str] = []
+        syncs: list[asyncio.Task[Any]] = []
+
+        async def sync() -> None:
+            await f.process_pending()
+            order.append("sync:" + str(f.store.token()))
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            order.append("part")
+            if len(order) == 1:
+                # A sync batch arrives while part 1 is in flight.
+                f.store.stage_sync({"next_batch": "s1", "rooms": {"join": {}}})
+                syncs.append(asyncio.create_task(sync()))
+            await asyncio.sleep(0)
+            return {"event_id": "$part" + str(len(order))}
+
+        f.raw = raw
+        row = f.enqueue_notice(room, ("긴 답변 문단입니다. " * 400 + "\n\n") * 5)  # < 64 KiB notice cap, 5+ parts
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp(), "nio": nio}):
+            h.start(f.retry(f.send))
+            await h.until(lambda: not f.store.outbox())
+            await asyncio.gather(*syncs)
+        parts = order.count("part")
+        assert parts >= 3 and f.store.delivered_parts(row) == parts
+        # The sync committed right after part 1, not after the whole row.
+        assert order[:3] == ["part", "sync:s1", "part"]
+        assert f.store.token() == "s1"
+
+
+@pytest.mark.anyio
+async def test_room_muted_mid_row_keeps_the_rest_for_later(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        outbox_ready(f)
+        sent: list[str] = []
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            sent.append(path.rsplit("/", 1)[1])
+            if len(sent) == 1:
+                f.blocked.add(room)  # a sync batch muted the room between parts
+            return {"event_id": "$part" + str(len(sent))}
+
+        f.raw = raw
+        row = f.enqueue_notice(room, "a" * 12_000 + "\n" + "b" * 12_000)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
+            h.start(f.retry(f.send))
+            await h.until(lambda: len(sent) == 1)
+            await asyncio.sleep(0.3)
+            assert len(sent) == 1 and f.store.delivered_parts(row) == 1
+            assert [r["event_id"] for r in f.store.outbox()] == [row]
+            f.blocked.discard(room)
+            await h.until(lambda: not f.store.outbox())
+        assert len(sent) == 2 and len(set(sent)) == 2  # resumed at part 2, same txn scheme
 
 
 @pytest.mark.anyio
