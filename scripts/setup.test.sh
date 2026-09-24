@@ -1186,6 +1186,7 @@ ok "dry-run reports the guard install without touching .git" \
 # exits 1. On Termux the installed copy must carry `#!$PREFIX/bin/bash`, with
 # the rest of the file (marker included) byte-identical to the source. The
 # fake prefix matches setup.sh's */com.termux/* detection on any CI host.
+# shellcheck disable=SC2034  # GUARD_SRC_FILE is read via eval inside ok()
 GUARD_SRC_FILE="$guard_repo/scripts/git-hooks/managed-checkout-guard"
 fake_prefix="$TMP/fake/com.termux/files/usr"
 mkdir -p "$fake_prefix/bin"
