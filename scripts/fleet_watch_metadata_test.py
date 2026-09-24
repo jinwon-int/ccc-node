@@ -106,9 +106,11 @@ class MetadataTest(unittest.TestCase):
             parent.chmod(0o755)
             root = parent / 'install'
             root.mkdir(mode=0o755)
+            root.chmod(0o755)  # mkdir mode is umask-masked (0077 -> 0700 blocks nobody traversal)
             for name in ('scripts/ccc-doctor.sh', 'claude/settings.base.json', 'bridge/start.sh'):
                 p = root / name
                 p.parent.mkdir(mode=0o755, exist_ok=True)
+                p.parent.chmod(0o755)
                 p.write_text('exit 0\n')
                 p.chmod(0o644)
             self.ref.write_text(str(root))
