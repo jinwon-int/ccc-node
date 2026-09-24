@@ -183,7 +183,12 @@ class GrokMatrixBot:
     def _post_banner(self, config: Mapping[str, Any], transport: Any) -> None:
         if not getattr(self.settings, "matrix_startup_banner", True):
             return
+        # Owner direct rooms only: family_rooms are a subset of rooms in a
+        # valid config, and a restart must not announce itself to the family.
+        family = set(config.get("family_rooms") or ())
         for room in config.get("rooms") or ():
+            if room in family:
+                continue
             try:
                 transport.enqueue_notice(str(room), BANNER, key=BANNER_KEY)
             except Exception:
