@@ -47,6 +47,7 @@ from urllib.parse import quote
 from telegram_bot.core.matrix.state import (
     MAX_REPLY_BYTES,
     MAX_TEXT_BYTES,
+    MEDIA_MSGTYPES,
     MatrixStore,
     Policy,
     QueueFull,
@@ -68,7 +69,7 @@ from telegram_bot.core.matrix.state import (
 
 logger = logging.getLogger(__name__)
 
-FAMILY_NOTICE = "이 AI는 이 방을 읽을 수 있으며 답변에 필요한 내용이 제공업체에 전달될 수 있습니다."
+FAMILY_NOTICE = "이 AI는 이 방을 읽을 수 있으며 답변에 필요한 내용(부른 메시지의 사진·파일 포함)이 제공업체에 전달될 수 있습니다."
 NOTICE_QUEUE_FULL = "대기 중인 요청이 많습니다. 잠시 후 다시 요청해 주세요."
 NOTICE_QUEUED = "⏳ 이 메시지는 대기 순번 {position}번에 저장되었으며 도착 순서대로 처리됩니다."
 NOTICE_ACKED = "이전 작업의 결과 확인을 완료한 것으로 기록했습니다. 자동 재실행은 하지 않습니다."
@@ -448,6 +449,12 @@ class MatrixTransport:
                 if len(body) > 4_194_304:
                     raise SafetyStop("matrix-response-too-large")
             return json.loads(body)
+
+    async def download_media(self, mxc: str, *, max_bytes: int) -> bytes:
+        """Authenticated media download (#1795); errors never stop the service."""
+        from telegram_bot.core.matrix.media import download_ciphertext
+
+        return await download_ciphertext(self.http, self.c["homeserver"], mxc, max_bytes=max_bytes)
 
     async def send_typing(self, room: str) -> None:
         """PUT the bot's typing indicator (8 s) in ``room``; raises on failure."""
@@ -852,7 +859,7 @@ class MatrixTransport:
     async def input(self, req: Request) -> None:
         if self.store.seen_control(req, record=False):
             return
-        if req.body.startswith(CONTROL_PREFIXES):
+        if req.attachment is None and req.body.startswith(CONTROL_PREFIXES):
             await self.control(req)
             return
         if req.reply_to is not None:
@@ -1045,6 +1052,8 @@ class MatrixTransport:
             # never reach us). Skip it, ask for the key, tell the room once.
             self._undecryptable(room, event)
             return None
+        if self._is_media(event):
+            return self._admit_media(room, event)
         if not isinstance(event, RoomMessageText):
             return None
         if not event.decrypted:
@@ -1058,6 +1067,50 @@ class MatrixTransport:
                 return None
             raise SafetyStop("unverified-owner-event" if event.sender == self.c["owner"] else "unverified-family-event")
         return self.policy.admit(room, event.source, decrypted=event.decrypted, now_ms=int(time.time() * 1000))
+
+    @staticmethod
+    def _is_media(event: Any) -> bool:
+        """An encrypted or plaintext nio media event (image/file/video/audio)."""
+        import nio
+
+        kinds = tuple(
+            cls
+            for cls in (getattr(nio, "RoomEncryptedMedia", None), getattr(nio, "RoomMessageMedia", None))
+            if isinstance(cls, type)
+        )
+        return bool(kinds) and isinstance(event, kinds)
+
+    def _admit_media(self, room: str, event: Any) -> Request | None:
+        """Admit a photo/file under the text rules (#1795); never a new stop path.
+
+        Media used to be dropped silently, so an unverified device is ignored
+        (with the cross-signing notice) rather than raising ``SafetyStop``, and
+        plaintext ``url`` media is refused and recorded, never executed.
+        """
+        source = getattr(event, "source", None)
+        content = source.get("content") if isinstance(source, dict) else None
+        msgtype = content.get("msgtype") if isinstance(content, dict) else None
+        kind = MEDIA_MSGTYPES.get(msgtype, "unknown") if isinstance(msgtype, str) else "unknown"
+        if not event.decrypted or not isinstance(content, dict) or not isinstance(content.get("file"), dict):
+            self._media_ignored(room, "plaintext-attachment-refused", kind)
+            return None
+        trusted = self.trusted.get(event.sender, {})
+        if not event.verified or event.sender_key not in set(trusted.values()):
+            if event.sender in self.identities:
+                self._untrusted_sender(room, event)
+            self._media_ignored(room, "untrusted-device", kind)
+            return None
+        req = self.policy.admit(room, source, decrypted=True, now_ms=int(time.time() * 1000))
+        if req is None or req.attachment is None:
+            self._media_ignored(room, "not-admitted", kind)
+            return None
+        logger.info("matrix media admitted kind=%s room=%s", kind, room)
+        return req
+
+    def _media_ignored(self, room: str, reason: str, kind: str) -> None:
+        """Body-free record of a dropped attachment (no file name, URL or key)."""
+        logger.info("matrix media ignored reason=%s kind=%s room=%s", reason, kind, room)
+        self.store.set_meta("media_ignored", {"room": room, "reason": reason, "kind": kind, "updated": time.time()})
 
     def _untrusted_sender(self, room: str, event: Any) -> None:
         """Ignore a message from an unsigned device; tell the room once per device."""

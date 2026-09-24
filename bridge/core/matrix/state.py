@@ -45,6 +45,17 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
+from telegram_bot.core.matrix.attachments import (  # noqa: F401 - re-exported
+    ATTACHMENT_PLACEHOLDER,
+    MEDIA_MSGTYPES,
+    decode_attachment,
+    encode_attachment,
+    encrypted_file,
+    media_attachment,
+    media_caption,
+    parse_mxc,
+)
+
 MAX_TEXT_BYTES = 16_384
 MAX_REPLY_BYTES = 65_536
 
@@ -266,6 +277,14 @@ class Request:
     body: str
     scope: str
     reply_to: str | None = None  # m.in_reply_to parent event id (#1943)
+    # Canonical JSON of an encrypted media attachment (#1795); None for text.
+    attachment: str | None = None
+
+
+def job_digest(room_id: str, sender: str, body: str, attachment: str | None) -> str:
+    """Identity digest of an admitted job; text jobs keep their pre-#1795 digest."""
+    fields = [room_id, sender, body] if attachment is None else [room_id, sender, body, attachment]
+    return hashlib.sha256(json.dumps(fields).encode()).hexdigest()
 
 
 REPLY_CONTEXT_MAX_CHARS = 2000
@@ -390,10 +409,14 @@ class Policy:
         ):
             return None
         content = event.get("content")
-        if not isinstance(content, dict) or content.get("msgtype") != "m.text":
+        if not isinstance(content, dict):
             return None
         relation = content.get("m.relates_to", {})
         if not isinstance(relation, dict) or "rel_type" in relation:
+            return None
+        if content.get("msgtype") in MEDIA_MSGTYPES:
+            return self._admit_media(room_id, event, sender, content)
+        if content.get("msgtype") != "m.text":
             return None
         try:
             body = bounded_text(content.get("body"), MAX_TEXT_BYTES)
@@ -407,6 +430,31 @@ class Policy:
         if parent is not None:
             body = strip_reply_fallback(body)
         return Request(event["event_id"], room_id, sender, body, scope_of(self.account, room_id, sender), parent)
+
+    def _admit_media(
+        self, room_id: str, event: Mapping[str, Any], sender: str, content: Mapping[str, Any]
+    ) -> Request | None:
+        """Admit an encrypted photo/file (#1795); plaintext ``url`` media never runs.
+
+        A family room still needs an explicit address, so a caption-less photo
+        there is ignored; direct rooms accept one without a caption.
+        """
+        attachment = media_attachment(content)
+        if attachment is None:
+            return None
+        caption = media_caption(content)
+        try:
+            if caption:
+                bounded_text(caption, MAX_TEXT_BYTES)
+            encoded = encode_attachment(attachment)
+        except ValueError:
+            return None
+        if self.rooms[room_id] == "mention" and not self.addressed(content, caption):
+            return None
+        body = caption or ATTACHMENT_PLACEHOLDER
+        return Request(
+            event["event_id"], room_id, sender, body, scope_of(self.account, room_id, sender), None, encoded
+        )
 
     def addressed(self, content: Mapping[str, Any], body: str) -> bool:
         """Family-room gate: spec'd m.mentions, or a typed @localpart handle in the body.
@@ -804,7 +852,12 @@ class Store:
                     if old and old[0] != value:
                         raise ValueError("state identity/schema mismatch")
                     self._db.execute("INSERT OR IGNORE INTO meta VALUES (?,?)", (key, value))
-                self._db.execute("UPDATE jobs SET state='uncertain' WHERE state='running'")
+                # #1795: idempotent additive migration; old rows stay text jobs.
+                columns = {row[1] for row in self._db.execute("PRAGMA table_info(jobs)")}
+                if "attachment" not in columns:
+                    self._db.execute("ALTER TABLE jobs ADD COLUMN attachment TEXT")
+                # A crashed attachment turn also forgets its decryption key.
+                self._db.execute("UPDATE jobs SET state='uncertain',attachment=NULL WHERE state='running'")
         except BaseException:
             self.close()
             raise
@@ -851,7 +904,9 @@ class Store:
                 bounded_text(req.body, MAX_TEXT_BYTES)
                 if req.scope != scope_of(self.account, req.room_id, req.sender):
                     raise ValueError("request belongs to another scope/account")
-                digest = hashlib.sha256(json.dumps([req.room_id, req.sender, req.body]).encode()).hexdigest()
+                if req.attachment is not None and decode_attachment(req.attachment) is None:
+                    raise ValueError("invalid attachment")
+                digest = job_digest(req.room_id, req.sender, req.body, req.attachment)
                 old = self.db.execute("SELECT digest FROM jobs WHERE event_id=?", (req.event_id,)).fetchone()
                 if old:
                     if old[0] != digest:
@@ -865,9 +920,9 @@ class Store:
                     raise QueueFull("inbox capacity reached; sync token unchanged")
                 txn = hashlib.sha256(json.dumps([self.account, req.event_id, "reply-v1"]).encode()).hexdigest()
                 self.db.execute(
-                    "INSERT INTO jobs(event_id,room_id,sender,scope,body,digest,state,txn_id) "
-                    "VALUES (?,?,?,?,?,?,'queued',?)",
-                    (req.event_id, req.room_id, req.sender, req.scope, req.body, digest, txn),
+                    "INSERT INTO jobs(event_id,room_id,sender,scope,body,digest,state,txn_id,attachment) "
+                    "VALUES (?,?,?,?,?,?,'queued',?,?)",
+                    (req.event_id, req.room_id, req.sender, req.scope, req.body, digest, txn, req.attachment),
                 )
             if next_token is not None:
                 self.db.execute("INSERT OR REPLACE INTO meta VALUES ('sync_token',?)", (next_token,))
@@ -909,8 +964,10 @@ class Store:
             row = self.db.execute("SELECT scope,state FROM jobs WHERE event_id=?", (event_id,)).fetchone()
             if row is None or row["state"] != "running":
                 raise ValueError("only running work can finish")
+            # The attachment carries the media decryption key; drop it once the
+            # turn has a result (the digest still pins the event identity).
             self.db.execute(
-                "UPDATE jobs SET state=?,reply=? WHERE event_id=?",
+                "UPDATE jobs SET state=?,reply=?,attachment=NULL WHERE event_id=?",
                 ("ready" if deliver else "done", reply, event_id),
             )
             if session_id is not None:
@@ -973,7 +1030,7 @@ class Store:
         bounded_text(reply, MAX_REPLY_BYTES)
         with self.db:
             changed = self.db.execute(
-                "UPDATE jobs SET state='ready',reply=? WHERE event_id=? AND state='uncertain'",
+                "UPDATE jobs SET state='ready',reply=?,attachment=NULL WHERE event_id=? AND state='uncertain'",
                 (reply, event_id),
             ).rowcount
             if changed != 1:
@@ -1022,7 +1079,7 @@ class MatrixStore(Store):
         with self.db:
             for event_id in cleared:
                 self.db.execute(
-                    "UPDATE jobs SET state='ready',reply=? WHERE event_id=? AND state='uncertain'",
+                    "UPDATE jobs SET state='ready',reply=?,attachment=NULL WHERE event_id=? AND state='uncertain'",
                     (OPERATOR_ACK_TEXT, event_id),
                 )
             seq = self.db.execute(
@@ -1121,4 +1178,6 @@ class MatrixStore(Store):
 
     def uncertain_job(self, event: str) -> None:
         with self.db:
-            self.db.execute("UPDATE jobs SET state='uncertain' WHERE event_id=? AND state='running'", (event,))
+            self.db.execute(
+                "UPDATE jobs SET state='uncertain',attachment=NULL WHERE event_id=? AND state='running'", (event,)
+            )

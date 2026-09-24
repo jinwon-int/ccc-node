@@ -4,6 +4,21 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **Matrix frontend reads photos and files (#1795).** Encrypted `m.image` /
+  `m.file` / `m.video` / `m.audio` events used to be dropped silently — an
+  owner's two photos on 2026-09-24 got no answer and no log line. They are now
+  admitted under the text rules (decrypted, pinned/verified device, family
+  rooms need an explicit address in the caption; plaintext media refused),
+  queued with the `EncryptedFile` in a new `jobs.attachment` column (idempotent
+  migration; cleared once the turn has a result), downloaded from the
+  authenticated media API, SHA-256-verified and AES-CTR-decrypted, bounded by
+  the Telegram image/document limits, staged 0600 under
+  `<BOT_DATA_DIR>/matrix-media/`, and handed to the agent with the Telegram
+  image/document prompt (`channel="Matrix"`; Telegram wording unchanged). The
+  file is deleted when the turn ends. Failures answer the room once without
+  running the agent and never stop the service; drops are logged body-free
+  (`matrix media ignored reason=…`). The Grok frontend stays text-only.
+
 - **setup/termux: the managed-checkout guard hooks actually run on Termux.**
   The installed `post-checkout`/`pre-commit` hooks kept the source's
   `#!/usr/bin/env bash`, but Android has no `/usr/bin/env` and git exec()s

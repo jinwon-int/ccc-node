@@ -75,6 +75,15 @@ SUPPORTED_COMMANDS = frozenset(
 )
 _STATUS_HANDLE = 1
 SELF_JOB_PREFIX = "$self-"
+
+# #1795: one room answer per attachment that could not be staged (no agent run).
+ATTACHMENT_FAILED_DEFAULT = "❌ 첨부를 열 수 없었습니다. 잠시 후 다시 보내 주세요."
+ATTACHMENT_FAILED = {
+    "oversize": "❌ 첨부가 허용 크기를 넘어 열지 않았습니다. 더 작은 파일(또는 해상도를 낮춘 사진)로 보내 주세요.",
+    "integrity": "❌ 첨부의 무결성 확인에 실패해 열지 않았습니다. 다시 보내 주세요.",
+    "download": "❌ 첨부를 내려받지 못했습니다. 잠시 후 다시 보내 주세요.",
+    "invalid": "❌ 첨부 형식을 확인할 수 없어 열지 않았습니다.",
+}
 SELF_JOB_DANSO_AUTO_RESUME = "danso-auto-resume"
 SELF_JOB_EXTERNAL_WAIT_RESUME = "external-wait-resume"
 STATUS_MIN_INTERVAL_S = 15.0  # match Telegram CCC_HEARTBEAT_* defaults
@@ -1011,6 +1020,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         body = str(job.get("body") or "")
         self._active_sink = sink
         try:
+            if job.get("attachment"):
+                # #1795: a photo/file never goes through command parsing.
+                return await self._run_attachment(
+                    job, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink
+                )
             if str(job.get("event_id") or "").startswith(SELF_JOB_PREFIX):
                 return await self._run_self_job(
                     body,
@@ -1036,6 +1050,56 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return await self._run_message(body, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink, turn_marker=str(job.get("event_id") or ""))
         finally:
             self._active_sink = None
+
+    async def _run_attachment(
+        self, job: Mapping[str, Any], *, user_id: int, chat_id: int, room_id: str, sink: TurnSink
+    ) -> Any:
+        """Stage a Matrix photo/file and run it with the Telegram prompt contract (#1795).
+
+        The decrypted file lives under ``<bot_data_dir>/matrix-media`` (0600)
+        only for this turn. A failure answers the room once and does not run
+        the agent; it never raises into the transport.
+        """
+        from telegram_bot.core import media as core_media
+        from telegram_bot.core.matrix import media as matrix_media
+        from telegram_bot.core.matrix.attachments import decode_attachment
+
+        attachment = decode_attachment(job.get("attachment"))
+        if attachment is None:
+            logger.warning("Matrix attachment unavailable reason=invalid")
+            return _turn_result(ATTACHMENT_FAILED.get("invalid", ATTACHMENT_FAILED_DEFAULT), None)
+        directory = self._data_dir() / matrix_media.MEDIA_DIRNAME
+        path: Path | None = None
+        try:
+            try:
+                path = await matrix_media.stage(self._transport, attachment, directory, self._settings)
+            except matrix_media.AttachmentError as exc:
+                logger.warning("Matrix attachment unavailable reason=%s kind=%s", exc.reason, attachment.get("kind"))
+                return _turn_result(ATTACHMENT_FAILED.get(exc.reason, ATTACHMENT_FAILED_DEFAULT), None)
+            # The caption is the job body (``(attachment)`` when there is none).
+            caption = str(job.get("body") or "") if attachment.get("captioned") else ""
+            if attachment.get("kind") == "image":
+                prompt = core_media.build_image_prompt(path, caption, channel="Matrix")
+            else:
+                prompt = core_media.build_document_prompt(
+                    path,
+                    display_name=str(attachment.get("name") or ""),
+                    mime_type=str(attachment.get("mimetype") or "") or None,
+                    size_bytes=path.stat().st_size,
+                    caption=caption,
+                    channel="Matrix",
+                )
+            logger.info("Matrix attachment staged kind=%s bytes=%d", attachment.get("kind"), path.stat().st_size)
+            return await self._run_message(
+                prompt,
+                user_id=user_id,
+                chat_id=chat_id,
+                room_id=room_id,
+                sink=sink,
+                turn_marker=str(job.get("event_id") or ""),
+            )
+        finally:
+            matrix_media.remove(path)
 
     async def cancel(self, job: Mapping[str, Any]) -> bool:
         """``TurnRunner.cancel``: same handler path as ``/stop``."""
