@@ -435,6 +435,9 @@ class MatrixTransport:
         self.leg_failures: dict[str, int] = {"receive": 0, "send": 0}
         self.leg_error: dict[str, str] = {"receive": "", "send": ""}
         self._outbox_head: tuple[str, float, int] | None = None  # (event id, first seen, send-failure baseline)
+        # Set when the active turn hit ``turn_timeout``, before the runner is
+        # cancelled, so the runner can tell a timeout from /stop or shutdown.
+        self.turn_timed_out = False
 
     # -- HTTP -----------------------------------------------------------------
 
@@ -1355,6 +1358,7 @@ class MatrixTransport:
         self.active = job
         self.approvals = {}
         self.cancel_requested = False
+        self.turn_timed_out = False
         outcome = "uncertain"
         # Routing context is admitted data (sender/room passed the gate), not user text.
         turn = asyncio.create_task(
@@ -1388,6 +1392,7 @@ class MatrixTransport:
             # Only the runner task was cancelled (/cancel or /stop): keep serving.
         except Exception as exc:
             outcome = "timeout" if isinstance(exc, TimeoutError) else "error:" + type(exc).__name__
+            self.turn_timed_out = isinstance(exc, TimeoutError)
         finally:
             try:
                 await self._join(turn)

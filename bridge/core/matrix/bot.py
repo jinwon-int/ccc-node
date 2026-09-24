@@ -94,6 +94,7 @@ _HEALTH_INTERVAL_S = 10.0  # match bot_lifecycle._WORKLOAD_INTERVAL
 _SYNC_STALE_S = 90.0
 _SYNC_STARTUP_GRACE_S = 90.0
 _OUTBOX_STUCK_S = 120.0
+_DELIVERY_REJECTIONS_DEGRADED = 3
 _AGENT_ERROR_LABEL_MAX = 160
 # Turn outcomes that are not agent failures (drain, input validation, a turn
 # folded into another, a paused Danso task, an expired recovery choice).
@@ -647,6 +648,12 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return "error", "matrix sync not completed since start", 1
         if sync_age > _SYNC_STALE_S:
             return "error", f"matrix sync stale for {int(sync_age)}s", 1
+        # #1965 contract: parts the homeserver refused with a 4xx are
+        # quarantined (skipped) and counted until a part is sent again, so a
+        # systematic 4xx that silently drops every reply never shows green.
+        streak = int(getattr(self._transport, "delivery_rejections_streak", 0) or 0)
+        if streak >= _DELIVERY_REJECTIONS_DEGRADED:
+            return "error", "outbox-rejections", streak
         head_age = signals.get("outbox_head_age_s")
         if head_age is not None and head_age > _OUTBOX_STUCK_S:
             send_failures = int(signals.get("send_failures") or 0)
@@ -1443,12 +1450,17 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         Before this, ``agent.last_ok_at`` stayed at process start. Outcomes
         that are not agent failures leave the agent state untouched; a raised
         exception is recorded by type name only and re-raised; cancellation
-        is never recorded.
+        is recorded only when the transport's turn timeout caused it.
         """
 
         try:
             response = await turn
         except asyncio.CancelledError:
+            # The transport cancels the runner both for /stop or shutdown and
+            # when ``turn_timeout`` expires; only the last is an agent failure
+            # (a provider hanging until the cap must not stay "healthy").
+            if getattr(self._transport, "turn_timed_out", False) is True:
+                self._mark_agent_health("turn-timeout", prefix="")
             raise
         except Exception as exc:
             self._mark_agent_health(type(exc).__name__)
@@ -1467,7 +1479,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         self._mark_agent_health(label)
         return response
 
-    def _mark_agent_health(self, error: str | None) -> None:
+    def _mark_agent_health(self, error: str | None, *, prefix: str = "agent turn failed: ") -> None:
         if not self._health_active:
             return
         try:
@@ -1475,7 +1487,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                 health_reporter.record_agent_ok()
             else:
                 label = " ".join(str(error).split())[:_AGENT_ERROR_LABEL_MAX]
-                health_reporter.record_agent_error(f"agent turn failed: {label}")
+                health_reporter.record_agent_error(prefix + label)
         except Exception:
             logger.debug("Matrix agent health mark failed", exc_info=True)
 
@@ -2054,7 +2066,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         await self._enqueue_previous_codex_session(
             session, DistillTrigger.NEW_COMMAND, user_id=user_id, chat_id=chat_id,
         )
-        response = await self._project_chat.process_message(
+        response = await self._record_turn_health(self._project_chat.process_message(
             user_message=_SKILLS_PROMPT,
             user_id=user_id,
             chat_id=chat_id,
@@ -2068,7 +2080,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             notification_bot=self._notification_bot(),
             interim_message_callback=self._make_interim_callback(sink, room_id),
             usage_mode=MODE_INTERACTIVE,
-        )
+        ))
         await self._save_session_id(key, response, user_id=user_id, chat_id=chat_id)
         if getattr(response, "success", True):
             await self._record_codex_checkpoint(

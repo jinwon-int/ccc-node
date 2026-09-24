@@ -363,3 +363,95 @@ async def test_transport_signals_track_sync_retries_and_outbox_head(tmp_path: Pa
         assert transport.health_signals(now=2500.0)["outbox_pending"] == 0
     finally:
         transport.store.close()
+
+
+# --- #1820 review round: #1965 rejection streak, /skills, turn timeout -------
+
+
+def test_delivery_rejection_streak_degrades_transport(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reporter = RecordingReporter()
+    monkeypatch.setattr(matrix_bot, "health_reporter", reporter)
+    bot = _verdict_bot(tmp_path, fresh_signals())
+    bot._transport.delivery_rejections_streak = 2  # below the threshold: still green
+    bot._record_transport_health()
+    assert [c[0] for c in _telegram_calls(reporter)] == ["record_telegram_ok"]
+    reporter.calls.clear()
+    bot._transport.delivery_rejections_streak = 5
+    bot._record_transport_health()
+    assert _telegram_calls(reporter) == [
+        ("record_telegram_error", ("outbox-rejections",), {"consecutive_failures": 5})
+    ]
+
+
+@pytest.mark.anyio
+async def test_skills_turn_records_agent_health(tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    from telegram_bot.core.project_chat_types import ChatResponse
+    from test_matrix_bot import FakeSink, _job
+
+    reporter = RecordingReporter()
+    monkeypatch.setattr(matrix_bot, "health_reporter", reporter)
+    bot, chat, _manager = _bot(tmp_path)
+    bot._health_active = True
+    await bot.run_turn(_job("/skills"), sink=FakeSink(), session_id=None, room_kind="direct")
+    chat.response = ChatResponse(content="x", success=False, error="provider exploded")
+    await bot.run_turn(_job("/skills"), sink=FakeSink(), session_id=None, room_kind="direct")
+    assert [c for c in reporter.calls if c[0].startswith("record_agent")] == [
+        ("record_agent_ok", (), {}),
+        ("record_agent_error", ("agent turn failed: provider exploded",), {}),
+    ]
+
+
+@pytest.mark.anyio
+async def test_turn_timeout_cancellation_records_agent_error_but_stop_does_not(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reporter = RecordingReporter()
+    monkeypatch.setattr(matrix_bot, "health_reporter", reporter)
+    bot, _chat, _manager = _bot(tmp_path)
+    bot._health_active = True
+    bot._transport = FakeTransport({}, None)
+
+    async def cancelled() -> Any:
+        raise asyncio.CancelledError
+
+    bot._transport.turn_timed_out = False  # /stop or shutdown
+    with pytest.raises(asyncio.CancelledError):
+        await bot._record_turn_health(cancelled())
+    assert reporter.calls == []
+    bot._transport.turn_timed_out = True  # transport turn_timeout expired
+    with pytest.raises(asyncio.CancelledError):
+        await bot._record_turn_health(cancelled())
+    assert reporter.calls == [("record_agent_error", ("turn-timeout",), {})]
+
+
+@pytest.mark.anyio
+async def test_transport_flags_turn_timeout_before_cancelling_the_runner(tmp_path: Path) -> None:
+    from telegram_bot.core.matrix.transport import TurnResult
+    from test_matrix_transport import request, running
+
+    seen: list[bool] = []
+
+    async with running(tmp_path, turn_timeout=0.1) as h:
+        f = h.f
+
+        class HangingRunner:
+            async def run(self, job: Any, *, sink: Any, session_id: Any, room_kind: str) -> TurnResult:
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    seen.append(f.turn_timed_out)
+                    raise
+                return TurnResult("never", None)
+
+            async def cancel(self, job: Any) -> bool:
+                return True
+
+        f.runner = HangingRunner()
+        await f.input(request(f))
+        h.work()
+        await h.until(lambda: (f.store.get_meta("last_turn") or {}).get("outcome") == "timeout")
+        assert seen == [True]
+        # The next turn starts with the flag cleared.
+        f.runner = h.runner
+        h.drain()  # a scope claims nothing until its timeout notice is out
+        await f.input(request(f, "$next"))
+        await h.until(lambda: (f.store.get_meta("last_turn") or {}).get("event_id") == "$next")
+        assert f.turn_timed_out is False
