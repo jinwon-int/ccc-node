@@ -690,7 +690,7 @@ def test_every_raised_safety_stop_reason_is_listed() -> None:
     assert raised <= SAFETY_STOP_REASONS, raised - SAFETY_STOP_REASONS
     # `+ key` / `+ str(status)` forms use a listed prefix.
     assert {"invalid-family_rooms", "invalid-family_users", "matrix-http-"} <= SAFETY_STOP_REASONS
-    for legacy in ("worker-cleanup-unconfirmed", "invalid-worker-command", "invalid-remote-mode"):
+    for legacy in ("worker-cleanup-unconfirmed", "invalid-worker-command", "invalid-remote-mode", "unverified-family-event", "pinned-device-missing"):
         assert legacy not in SAFETY_STOP_REASONS
 
 
@@ -799,3 +799,127 @@ def test_identities_replace_owner_pins_and_join_the_saved_policy(tmp_path: Path)
     family = {**c, "family_rooms": [c["rooms"][0]], "family_users": [OWNER2 := "@dad:test.invalid"],
               "identities": {OWNER2: {"master": "D" * 43}}}
     assert identities(family) == {OWNER2: "D" * 43}
+
+
+# --------------------------------------------------------------------------- #
+# Audited repin (#1958)
+# --------------------------------------------------------------------------- #
+
+DAD = "@dad:test.invalid"
+MOM = "@mom:test.invalid"
+
+
+def family_repin_config(root: Path) -> dict[str, Any]:
+    c = config(root)
+    return {
+        **c,
+        "rooms": [c["rooms"][0], "!family:test.invalid"],
+        "family_rooms": ["!family:test.invalid"],
+        "family_users": [DAD, MOM],
+        "family_devices": {DAD: {"DAD1": {"ed25519": "c" * 43, "curve25519": "c" * 43}}},
+    }
+
+
+def test_repin_adopts_only_pin_changes_and_is_audited(tmp_path: Path) -> None:
+    c = family_repin_config(tmp_path)
+    directory = Path(c["state_directory"])
+    with MatrixStore(directory, c["account"]) as s:
+        s.set_meta("policy", saved_policy(c))
+        edited = {**c, "family_devices": {**c["family_devices"], MOM: {"MOM1": {"ed25519": "e" * 43, "curve25519": "f" * 43}}}}
+        result = s.repin(edited, "mom's new phone", operator_name())
+        assert result["changed"] == ["family_devices"] and result["audit_seq"] == 1
+        assert result["before"]["family_devices"] == {DAD: {"DAD1": m.key_fingerprint("c" * 43, "c" * 43)}}
+        assert result["after"]["family_devices"][MOM] == {"MOM1": m.key_fingerprint("e" * 43, "f" * 43)}
+        # Exactly the comparison the transport runs at start: no saved-policy-changed.
+        assert upgrade_saved_policy(s.get_meta("policy")) == saved_policy(edited)
+        # An owner device swap is a pin change too.
+        swapped = {**edited, "devices": {"PHONE2": {"ed25519": "g" * 43, "curve25519": "h" * 43}}}
+        assert s.repin(swapped, "owner replaced phone", operator_name())["changed"] == ["devices"]
+        # Moving the owner to cross-signing changes devices and identities together.
+        master = "M" * 43
+        cross = {**swapped, "devices": {}, "identities": {c["owner"]: {"master": master}}}
+        assert s.repin(cross, "owner cross-signing", operator_name())["changed"] == ["devices", "identities"]
+    with MatrixStore(directory, c["account"]) as s:
+        audit = s.audit()
+        assert [(row["action"], row["scope"], row["reason"]) for row in audit] == [
+            ("repin", "policy", "mom's new phone"),
+            ("repin", "policy", "owner replaced phone"),
+            ("repin", "policy", "owner cross-signing"),
+        ]
+        assert audit[0]["actor"] == operator_name()
+        record = json.loads(audit[2]["before"])
+        assert record["after"]["identities"] == {c["owner"]: m.key_fingerprint(master)}
+        assert record["before"]["devices"] == {"PHONE2": m.key_fingerprint("g" * 43, "h" * 43)}
+        text = json.dumps(audit)
+        for raw_key in ("c" * 43, "e" * 43, "f" * 43, "g" * 43, master, c["access_token"], c["pickle_key"]):
+            assert raw_key not in text  # device ids + fingerprints only, never key material or secrets
+
+
+def test_repin_refuses_non_pin_changes_noops_and_bad_input(tmp_path: Path) -> None:
+    c = family_repin_config(tmp_path)
+    with MatrixStore(Path(c["state_directory"]), c["account"]) as s:
+        with pytest.raises(ValueError, match="no-saved-policy"):
+            s.repin(c, "first start never happened", operator_name())
+        s.set_meta("policy", saved_policy(c))
+        with pytest.raises(ValueError, match="no-pin-change"):
+            s.repin(c, "nothing edited", operator_name())
+        pin = {"MOM1": {"ed25519": "e" * 43, "curve25519": "e" * 43}}
+        repin_too = {"family_devices": {**c["family_devices"], MOM: pin}}
+        for update, field in (
+            ({"owner": "@other:test.invalid"}, "owner"),
+            ({"rooms": [c["rooms"][0], "!family:test.invalid", "!more:test.invalid"]}, "rooms"),
+            ({"family_users": [DAD, MOM, "@kid:test.invalid"]}, "family_users"),
+            ({"family_rooms": []}, "family_rooms"),
+            ({"not_before_ms": 1}, "not_before_ms"),
+        ):
+            # A reroute is refused even when bundled with a legitimate pin edit.
+            with pytest.raises(ValueError, match="not-a-pin-change: " + field):
+                s.repin({**c, **repin_too, **update}, "sneaky", operator_name())
+        with pytest.raises(ValueError, match="account-mismatch"):
+            s.repin({**c, **repin_too, "account": "@elsewhere:test.invalid"}, "wrong store", operator_name())
+        with pytest.raises(SafetyStop, match="invalid-family-device-pin"):
+            s.repin({**c, "family_devices": {MOM: {"MOM1": {"ed25519": "short", "curve25519": "e" * 43}}}}, "bad", operator_name())
+        with pytest.raises(SafetyStop, match="pin-owner-devices"):
+            s.repin({**c, "devices": {}}, "no owner pins", operator_name())
+        for reason, actor in (("", operator_name()), ("x" * 2000, operator_name()), ("ok", "")):
+            with pytest.raises(ValueError):
+                s.repin({**c, **repin_too}, reason, actor)
+        assert s.audit() == []
+        assert s.get_meta("policy") == saved_policy(c)  # nothing written on refusal
+
+
+def test_repin_cli_requires_stopped_service_and_reports_refusals(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from telegram_bot.core.matrix import repin as cli
+
+    tmp_path.chmod(0o700)
+    c = family_repin_config(tmp_path)
+    path = tmp_path / "config.json"
+
+    def write(cfg: dict[str, Any]) -> None:
+        path.write_text(json.dumps(cfg))
+        path.chmod(0o600)
+
+    write(c)
+    args = ["--config", str(path), "--reason", "dad's second phone"]
+    assert cli.main(args) == 2  # no state store yet: refused, nothing created
+    assert not Path(c["state_directory"]).exists()
+    with MatrixStore(Path(c["state_directory"]), c["account"]) as s:
+        s.set_meta("policy", saved_policy(c))
+    edited = {**c, "family_devices": {DAD: {**c["family_devices"][DAD], "DAD2": {"ed25519": "d" * 43, "curve25519": "d" * 43}}}}
+    write(edited)
+    with MatrixStore(Path(c["state_directory"]), c["account"]):
+        assert cli.main(args) == 3  # the running service holds the store lock
+    assert "stop the Matrix service first" in capsys.readouterr().err
+    assert cli.main(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["changed"] == ["family_devices"] and "DAD2" in out["after"]["family_devices"][DAD]
+    assert c["access_token"] not in json.dumps(out) and c["pickle_key"] not in json.dumps(out)
+    assert cli.main(args) == 2  # already adopted
+    assert "no-pin-change" in capsys.readouterr().err
+    write({**edited, "owner": "@other:test.invalid"})
+    assert cli.main(args) == 2
+    assert "not-a-pin-change: owner" in capsys.readouterr().err
+    path.chmod(0o644)
+    assert cli.main(args) == 2  # config must stay private
+    with MatrixStore(Path(c["state_directory"]), c["account"]) as s:
+        assert [row["action"] for row in s.audit()] == ["repin"]

@@ -156,6 +156,14 @@ NOTICE_UNTRUSTED_DEVICE = (
     "그 기기에서 기기 검증(이모지 비교)을 마친 뒤 다시 보내 주세요."
 )
 
+# Pin mode (#1958): a family member without a cross-signing identity is
+# trusted per pinned device, so in-app verification cannot help; only an
+# operator re-pin (``python -m telegram_bot.core.matrix.repin``) can.
+NOTICE_UNPINNED_DEVICE = (
+    "등록되지 않은 기기에서 보낸 메시지는 처리하지 않습니다. "
+    "이 기기를 쓰려면 운영자에게 기기 등록을 요청해 주세요. 등록된 기기에서는 계속 이용할 수 있습니다."
+)
+
 NONCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,64}")
 APPROVAL_TIMEOUT_S = 120.0
 TURN_JOIN_TIMEOUT_S = 30.0
@@ -676,19 +684,46 @@ class MatrixTransport:
             self._verify(stored)
         for user in sorted(self.identities):
             self._trust_cross_signed(user, raw)
-        # Family devices are pinned per user. Each user keeps the strict pin
-        # check, while extra unpinned family devices stay merely untrusted and
-        # are handled by exclude_unpinned_devices at session-share time.
+        self._trust_pinned_family()
+
+    def _trust_pinned_family(self) -> None:
+        """Trust exactly the pinned family devices currently present with their pinned keys.
+
+        Family devices are pinned per user. Extra unpinned family devices
+        stay merely untrusted and are handled by exclude_unpinned_devices at
+        session-share time. A pinned family device that is gone (signed out,
+        deleted) is contained the same way (#1958): it leaves the trusted
+        table until it reappears with its pinned keys, so its events get the
+        unpinned-device notice and sends stop expecting it, while the owner
+        room and the rest of the family keep working.
+
+        A pinned device id presenting *different* keys stays fatal: normal
+        clients never re-key a device id (a new login is a new device), so
+        that is homeserver-level key injection — by the same homeserver that
+        serves the owner's device list — and needs an operator.
+        """
+        missing: dict[str, list[str]] = {}
         for user, pins in sorted(self.family_devices.items()):
             if user in self.identities:
                 continue
-            for device, pin in pins.items():
+            present: dict[str, str] = {}
+            for device, pin in sorted(pins.items()):
                 stored = self.client.device_store[user].get(device)
                 if stored is None:
-                    raise SafetyStop("pinned-device-missing")
+                    missing.setdefault(user, []).append(device)
+                    continue
                 if stored.ed25519 != pin["ed25519"] or stored.curve25519 != pin["curve25519"]:
                     raise SafetyStop("pinned-device-key-changed")
                 self._verify(stored)
+                present[device] = pin["curve25519"]
+            self.trusted[user] = present
+        if (self.store.get_meta("family_pins_missing") or {}) != missing:
+            if missing:
+                logger.warning(
+                    "matrix pinned family devices missing (contained): %s",
+                    ", ".join(f"{user}:{'/'.join(devices)}" for user, devices in missing.items()),
+                )
+            self.store.set_meta("family_pins_missing", missing)
 
     def _verify(self, device: Any) -> None:
         """Mark ``device`` verified only when it is not already.
@@ -1086,7 +1121,19 @@ class MatrixTransport:
                 # problem to fix (verify it in the app); never stop the service.
                 self._untrusted_sender(room, event)
                 return None
-            raise SafetyStop("unverified-owner-event" if event.sender == self.c["owner"] else "unverified-family-event")
+            if event.sender != self.c["owner"]:
+                # Pin mode family member (#1958): pin_devices tolerates extra
+                # unpinned family devices, so a message from one is expected,
+                # not an anomaly. Contain it to this event: never processed,
+                # one notice per device, and the sync batch still commits so
+                # the owner's room and every other room keep working.
+                self._untrusted_sender(room, event, pinned=True)
+                return None
+            # The owner's pinned device set and keys were just re-checked by
+            # pin_devices (a set/key change already stops there), so an owner
+            # event outside that set is anomalous key material on the
+            # operator's own channel: stay fail-closed.
+            raise SafetyStop("unverified-owner-event")
         return self.policy.admit(room, event.source, decrypted=event.decrypted, now_ms=int(time.time() * 1000))
 
     @staticmethod
@@ -1119,6 +1166,8 @@ class MatrixTransport:
         if not event.verified or event.sender_key not in set(trusted.values()):
             if event.sender in self.identities:
                 self._untrusted_sender(room, event)
+            elif event.sender != self.c["owner"]:
+                self._untrusted_sender(room, event, pinned=True)
             self._media_ignored(room, "untrusted-device", kind)
             return None
         req = self.policy.admit(room, source, decrypted=True, now_ms=int(time.time() * 1000))
@@ -1133,8 +1182,12 @@ class MatrixTransport:
         logger.info("matrix media ignored reason=%s kind=%s room=%s", reason, kind, room)
         self.store.set_meta("media_ignored", {"room": room, "reason": reason, "kind": kind, "updated": time.time()})
 
-    def _untrusted_sender(self, room: str, event: Any) -> None:
-        """Ignore a message from an unsigned device; tell the room once per device."""
+    def _untrusted_sender(self, room: str, event: Any, *, pinned: bool = False) -> None:
+        """Ignore a message from an unsigned/unpinned device; tell the room once per device.
+
+        ``pinned`` selects the pin-mode text: the fix there is an operator
+        re-pin, not in-app verification.
+        """
         key = str(getattr(event, "sender_key", "") or "")
         seen = self.store.get_meta("untrusted_senders") or {}
         marker = f"{event.sender}:{key}"
@@ -1144,7 +1197,10 @@ class MatrixTransport:
         self.store.set_meta("untrusted_senders", dict(list(seen.items())[-50:]))
         req = Request(str(getattr(event, "event_id", "") or "$untrusted-" + hashlib.sha256(marker.encode()).hexdigest()[:24]),
                       room, event.sender, "notice", scope_of(self.c["account"], room, event.sender))
-        self.store.notice(req, "untrusted-device", NOTICE_UNTRUSTED_DEVICE)
+        if pinned:
+            self.store.notice(req, "unpinned-device", NOTICE_UNPINNED_DEVICE)
+        else:
+            self.store.notice(req, "untrusted-device", NOTICE_UNTRUSTED_DEVICE)
 
     def _undecryptable(self, room: str, event: Any) -> None:
         """Record an undecryptable event, queue a key request and a one-time room notice."""

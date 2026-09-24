@@ -23,6 +23,10 @@ Differences from the pilot (#1780 PR-2a):
   through :meth:`MatrixStore.unblock`, which records who/when/why in
   ``operator_audit``. :data:`BLOCK_KEYS` therefore names the fields of
   :meth:`MatrixStore.block` rather than meta keys.
+* The saved policy (``meta.policy``) is fail-closed against config edits. The
+  one sanctioned way to change the trust pins it carries (``devices``,
+  ``family_devices``, ``identities``) is :meth:`MatrixStore.repin`, which is
+  audited in ``operator_audit`` like ``unblock`` (#1958).
 * :meth:`Store.finish` accepts an empty reply: the turn is recorded as done
   without an outbox delivery (the runner already streamed or had nothing to
   say).
@@ -122,7 +126,8 @@ SAFETY_STOP_REASONS: frozenset[str] = frozenset(
         "unexpected-agent-device",
         "published-agent-key-changed",
         "owner-device-key-changed",
-        "pinned-device-missing",
+        # "pinned-device-missing" is gone (#1958): a missing pinned family
+        # device is contained like an unpinned one (owner: set-changed).
         "pinned-device-key-changed",
         "private-room-membership-changed",
         "encrypted-room-required",
@@ -131,7 +136,8 @@ SAFETY_STOP_REASONS: frozenset[str] = frozenset(
         "timeline-gap-requires-backfill",
         "invalid-sync-response",
         "unverified-owner-event",
-        "unverified-family-event",
+        # "unverified-family-event" is gone (#1958): a pin-mode family
+        # member's unpinned device is ignored with a one-time notice.
         "plaintext-output-refused",
     }
 )
@@ -550,6 +556,10 @@ REQUIRED_CONFIG_FIELDS = frozenset(
 #: Configuration keys that shaped the pilot's saved policy but have no meaning here.
 LEGACY_POLICY_KEYS = ("worker_argv", "worker_argv_family", "remote_worker")
 POLICY_KEYS = ("owner", "rooms", "devices", "not_before_ms")
+#: Saved-policy keys an audited :meth:`MatrixStore.repin` may change (#1958).
+#: Everything else (owner, rooms, family membership, not_before_ms) reroutes
+#: saved jobs and stays a hard ``saved-policy-changed``.
+REPIN_KEYS = ("devices", "family_devices", "identities")
 
 
 def load_config(path: Path | str) -> dict[str, Any]:
@@ -733,6 +743,32 @@ def saved_policy(config: Mapping[str, Any]) -> dict[str, Any]:
     policy["family_devices"] = family_devices
     policy["identities"] = identities(config)
     return policy
+
+
+def key_fingerprint(*keys: Any) -> str:
+    """Short, stable fingerprint of public key material for audit records."""
+    return hashlib.sha256(json.dumps([str(key) for key in keys]).encode()).hexdigest()[:16]
+
+
+def pin_summary(policy: Mapping[str, Any]) -> dict[str, Any]:
+    """Trust pins of a saved policy as device ids + key fingerprints only (#1958)."""
+
+    def devices(pins: Any) -> dict[str, str]:
+        if not isinstance(pins, dict):
+            return {}
+        return {
+            str(device): key_fingerprint(keys.get("ed25519"), keys.get("curve25519"))
+            for device, keys in sorted(pins.items())
+            if isinstance(keys, dict)
+        }
+
+    family = policy.get("family_devices")
+    ids = policy.get("identities")
+    return {
+        "devices": devices(policy.get("devices")),
+        "family_devices": {str(u): devices(p) for u, p in sorted(family.items())} if isinstance(family, dict) else {},
+        "identities": {str(u): key_fingerprint(k) for u, k in sorted(ids.items())} if isinstance(ids, dict) else {},
+    }
 
 
 def upgrade_saved_policy(old: Mapping[str, Any]) -> dict[str, Any]:
@@ -1094,6 +1130,42 @@ class MatrixStore(Store):
             "audit_seq": seq,
             "before": before,
         }
+
+    def repin(self, config: Mapping[str, Any], reason: str, actor: str) -> dict[str, Any]:
+        """Operator decision: adopt the edited config's trust pins and audit who/when/why (#1958).
+
+        ``config`` is the already edited configuration. Only the trust pins
+        (:data:`REPIN_KEYS`) may differ from the saved policy; any other
+        difference would reroute saved jobs and is refused, as is a no-op.
+        The new ``meta.policy`` and the ``operator_audit`` row are written in
+        one transaction. The audit keeps device ids and short key
+        fingerprints only (see :func:`pin_summary`).
+        """
+        bounded_text(reason, 1024)
+        bounded_text(actor, 255)
+        config = validate_config(dict(config))
+        if config["account"] != self.account:
+            raise ValueError("account-mismatch")
+        new = saved_policy(config)
+        saved = self.get_meta("policy")
+        if not isinstance(saved, dict):
+            raise ValueError("no-saved-policy")
+        old = upgrade_saved_policy(saved)
+        fixed = sorted(key for key in set(old) | set(new) if key not in REPIN_KEYS and old.get(key) != new.get(key))
+        if fixed:
+            raise ValueError("not-a-pin-change: " + ",".join(fixed))
+        changed = [key for key in REPIN_KEYS if old.get(key) != new.get(key)]
+        if not changed:
+            raise ValueError("no-pin-change")
+        record = {"changed": changed, "before": pin_summary(old), "after": pin_summary(new)}
+        at = time.time()
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES ('policy',?)", (json.dumps(new),))
+            seq = self.db.execute(
+                "INSERT INTO operator_audit(at,actor,action,scope,reason,before) VALUES (?,?,?,?,?,?)",
+                (at, actor, "repin", "policy", reason, json.dumps(record, sort_keys=True)),
+            ).lastrowid
+        return {"actor": actor, "at": at, "audit_seq": seq, **record}
 
     def audit(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.execute("SELECT * FROM operator_audit ORDER BY seq")]

@@ -29,6 +29,7 @@ from telegram_bot.core.matrix.transport import (
     NOTICE_TIMEOUT,
     NOTICE_TURN_ERROR,
     NOTICE_UNDECRYPTABLE,
+    NOTICE_UNPINNED_DEVICE,
     NOTICE_UNTRUSTED_DEVICE,
     FAMILY_NOTICE,
     NOTICE_CONTROL_FORWARDED,
@@ -1425,7 +1426,20 @@ async def test_pin_devices_pins_each_family_user_and_detects_changes(tmp_path: P
             identity=identity,
         )  # Query rebuilt the store without pinned DAD1.
         h.route_raw(("keys", ""), {"device_keys": {h.account: {"BOT": bot_keys}, **everyone, DAD: {"DAD2": {}}}})
-        with pytest.raises(SafetyStop, match="pinned-device-missing"):
+        # #1958: a signed-out pinned family device is contained, not fatal —
+        # it leaves the trusted table until it reappears with its pinned keys.
+        await f.pin_devices()
+        assert f.trusted[DAD] == {} and f.trusted[h.owner] == {"OWNER": "b" * 43}
+        assert f.store.get_meta("family_pins_missing") == {DAD: ["DAD1"]}
+        client_mock(f, devices=devices, identity=identity)
+        h.route_raw(("keys", ""), {"device_keys": {h.account: {"BOT": bot_keys}, **everyone}})
+        await f.pin_devices()  # DAD1 is back with the pinned keys: trusted again
+        assert f.trusted[DAD] == {"DAD1": "c" * 43}
+        assert f.store.get_meta("family_pins_missing") == {}
+        # The owner's pinned device going missing stays fatal.
+        client_mock(f, devices={**devices, h.owner: {}}, identity=identity)
+        h.route_raw(("keys", ""), {"device_keys": {h.account: {"BOT": bot_keys}, **everyone, h.owner: {}}})
+        with pytest.raises(SafetyStop, match="owner-device-set-changed"):
             await f.pin_devices()
         client_mock(f, devices=devices, identity=identity)
         h.route_raw(("keys", ""), {"device_keys": {h.account: {"BOT": bot_keys}, **everyone, h.owner: {"OWNER": {}, "OWN2": {}}}})
@@ -1562,6 +1576,88 @@ async def test_initial_snapshot_sync_is_not_a_timeline_gap(tmp_path: Path) -> No
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("case", ["extra-unpinned-device", "pinned-device-signed-out"])
+async def test_unpinned_family_device_never_stops_the_batch_or_the_owner_room(tmp_path: Path, case: str) -> None:
+    # #1958: one message from a family member's new (unpinned) phone used to
+    # raise unverified-family-event before commit_sync, and a signed-out
+    # pinned phone raised pinned-device-missing on every sync/send, so the
+    # whole service — owner DM included — stopped and replayed on every start.
+    signed_out = case == "pinned-device-signed-out"
+    dad_store = {"DAD2": pinned_device("z")} if signed_out else {"DAD1": pinned_device("c"), "DAD2": pinned_device("z")}
+    # A signed-out DAD1's last message still arrives (sent before sign-out).
+    dad_key = "c" * 43 if signed_out else "z" * 43
+    async with family(tmp_path) as h:
+        f = h.f
+        direct = f.c["rooms"][0]
+        identity = {"ed25519": "agent-ed", "curve25519": "agent-cu"}
+        client_mock(
+            f,
+            rooms={FAMILY: h.healthy_members(), direct: {h.owner, h.account}},
+            devices={h.owner: {"OWNER": pinned_device("a", "b")}, DAD: dad_store},
+            identity=identity,
+        )
+        bot_keys = {"keys": {"ed25519:BOT": "agent-ed", "curve25519:BOT": "agent-cu"}}
+        h.route_raw(
+            ("keys", ""),
+            {"device_keys": {h.account: {"BOT": bot_keys}, h.owner: {"OWNER": {}}, DAD: {d: {} for d in dad_store}}},
+            *h.gate_routes(h.healthy_members()),
+            (direct, "/joined_members"),
+            {"joined": {h.owner: {}, h.account: {}}},
+            (direct, "/state/m.room.encryption"),
+            {"algorithm": "m.megolm.v1.aes-sha2"},
+        )
+        f.c["not_before_ms"] = h.now - 1000
+        mention = {"msgtype": "m.text", "body": "호출", "m.mentions": {"user_ids": [h.account]}}
+        unpinned = h.nio.RoomMessageText(
+            sender=DAD,
+            source={"type": "m.room.message", "event_id": "$new-phone", "sender": DAD, "origin_server_ts": h.now, "content": mention},
+            sender_key=dad_key,  # DAD2 (never pinned) or DAD1 (pinned, now signed out)
+            ts=h.now,
+        )
+        owner = h.nio.RoomMessageText(
+            sender=h.owner,
+            source={"type": "m.room.message", "event_id": "$owner-dm", "sender": h.owner, "origin_server_ts": h.now,
+                    "content": {"msgtype": "m.text", "body": "개인방 요청"}},
+            sender_key="b" * 43,
+            ts=h.now,
+        )
+        timeline = {FAMILY: [unpinned], direct: [owner]}
+
+        class SyncResponse:
+            @classmethod
+            def from_dict(cls, raw: Any) -> Any:
+                response = cls()
+                response.rooms = types.SimpleNamespace(  # type: ignore[attr-defined]
+                    join={room: types.SimpleNamespace(timeline=types.SimpleNamespace(events=events)) for room, events in timeline.items()}
+                )
+                return response
+
+        setattr(h.nio, "SyncResponse", SyncResponse)
+        f.store.stage_sync({"next_batch": "s1", "rooms": {"join": {}}})
+        await f.process_pending()  # must not raise
+        assert f.store.token() == "s1" and f.store.get_meta("pending_sync") is None  # batch committed
+        assert f.store.get_meta("health")["state"] == "ready"
+        notices = [job for job in f.store.outbox() if job["reply"] == NOTICE_UNPINNED_DEVICE]
+        assert [job["room_id"] for job in notices] == [FAMILY]
+        assert list(f.store.get_meta("untrusted_senders")) == [f"{DAD}:{dad_key}"]
+        assert (f.store.get_meta("family_pins_missing") or {}) == ({DAD: ["DAD1"]} if signed_out else {})
+        # Family-room sends stop expecting the signed-out device.
+        f.room_members[FAMILY] = h.healthy_members()
+        expected = {(h.owner, "OWNER")} if signed_out else {(h.owner, "OWNER"), (DAD, "DAD1")}
+        assert f.expected_recipients(FAMILY) == expected
+        job = f.store.claim()  # the trusted owner DM in the same batch is still admitted
+        assert job is not None and (job["event_id"], job["room_id"]) == ("$owner-dm", direct)
+        assert not f.store.job_exists("$new-phone")  # the unpinned event is never queued
+        # The same events arrive again (server replay / restart): no second
+        # notice, no stop, and the next token still commits.
+        f.store.stage_sync({"next_batch": "s2", "rooms": {"join": {}}})
+        await f.process_pending()
+        assert f.store.token() == "s2"
+        assert sum(NOTICE_UNPINNED_DEVICE == r for r in h.replies()) == 1
+        assert not f.store.job_exists("$new-phone")
+
+
+@pytest.mark.anyio
 async def test_family_admission_pinned_verified_mentioned_humans_only(tmp_path: Path) -> None:
     async with family(tmp_path) as h:
         f = h.f
@@ -1579,12 +1675,21 @@ async def test_family_admission_pinned_verified_mentioned_humans_only(tmp_path: 
         assert f.admit_event(FAMILY, event(sender=h.account)) is None  # 봇 발신 무시.
         assert f.admit_event(FAMILY, event(sender=STRANGER)) is None
         assert f.admit_event(FAMILY, event(ts=h.now - 5000)) is None  # before not_before_ms
-        with pytest.raises(SafetyStop, match="unverified-family-event"):
-            f.admit_event(FAMILY, event(verified=False))
-        with pytest.raises(SafetyStop, match="unverified-family-event"):
-            f.admit_event(FAMILY, event(key="z" * 43))
-        with pytest.raises(SafetyStop, match="unverified-family-event"):
-            f.admit_event(FAMILY, event(sender=MOM))  # allowlisted but without any pinned device
+        # Pin mode (#1958): an unverified/unpinned family device is contained
+        # to its own event — ignored with one notice per device, never a stop.
+        def unpinned_notices() -> int:
+            return sum(NOTICE_UNPINNED_DEVICE == r for r in h.replies())
+
+        assert f.admit_event(FAMILY, event(verified=False)) is None
+        assert unpinned_notices() == 1
+        assert f.admit_event(FAMILY, event(key="z" * 43)) is None
+        assert unpinned_notices() == 2
+        assert f.admit_event(FAMILY, event(key="z" * 43)) is None  # same device again: no second notice
+        assert unpinned_notices() == 2
+        assert f.admit_event(FAMILY, event(sender=MOM)) is None  # allowlisted but without any pinned device
+        assert unpinned_notices() == 3
+        assert NOTICE_UNTRUSTED_DEVICE not in h.replies()  # in-app verification cannot fix pin mode
+        assert all(job["room_id"] == FAMILY for job in f.store.outbox())
         # An undecryptable event never stops the service: it is recorded, a key
         # request is queued and the room is told once (jingun 2026-09-18).
         megolm = h.nio.MegolmEvent()
@@ -2082,6 +2187,7 @@ async def test_media_admission_mirrors_text_rules_without_new_stop_paths(tmp_pat
         family_req = f.admit_event(FAMILY, photo(DAD, "c" * 43, content=addressed, event_id="$fam"))
         assert family_req is not None and family_req.body == "@bot 이거 봐줘"
         assert f.admit_event(FAMILY, photo(DAD, "z" * 43, content=addressed)) is None  # unpinned device: ignored
+        assert sum(NOTICE_UNPINNED_DEVICE == r for r in h.replies()) == 1  # ...with the pin-mode notice (#1958)
         # A caption that looks like a control command is still an attachment job.
         command = {"msgtype": "m.image", "body": "/stop", "filename": "a.jpg", "file": _media_file()}
         stop_photo = f.admit_event(direct, photo(h.owner, "b" * 43, content=command, event_id="$stopphoto"))
