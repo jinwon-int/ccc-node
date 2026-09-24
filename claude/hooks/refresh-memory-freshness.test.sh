@@ -22,6 +22,14 @@ ok() {
   else
     fail=$((fail + 1))
     echo "FAIL: $1"
+    # #1970: the count-based assertions cascade — one missed or extra wiki
+    # call from run N fails every later case — and CI kept only the FAIL
+    # lines, so two identical failures (main push + merge group,
+    # 2026-09-24) could not be told apart. Keep the evidence next to the
+    # verdict: the last hook exit code, the call count, and the hook's
+    # own output tail. validate-harness prints this block on failure.
+    echo "  diag: rc=${rc:-?} wiki_calls=$(wc -l < "$WIKI_CALL_LOG" 2>/dev/null || echo '?')"
+    printf '%s\n' "${out:-}" | tail -12 | sed 's/^/  hook> /'
   fi
 }
 
@@ -34,6 +42,15 @@ mkdir -p "$state" "$cache" "$tools" "$bin"
 write_exec_stub "$bin/timeout" <<'SH'
 shift
 exec "$@"
+SH
+
+# The hook shells out to `gh issue list` for the fleet-alert block whenever a
+# gh binary is on PATH (CI runners ship one, unauthenticated), and the timeout
+# stub above strips the deadline — so this unit test was reaching the network.
+# Make it hermetic: an unauthenticated-shaped gh stub plus the collect switch off.
+write_exec_stub "$bin/gh" <<'SH'
+echo 'gh stub: not authenticated (test fixture)' >&2
+exit 4
 SH
 
 write_exec_stub "$bin/wiki-agent" <<'SH'
@@ -76,6 +93,7 @@ run_refresh() {
   CCC_MEMORY_TOOLS_DIR="$tools" \
   CCC_WIKI_AGENT_BIN="$bin/wiki-agent" \
   CCC_WIKI_CACHE_MAX_AGE_SEC=21600 \
+  CCC_FLEET_ALERTS_COLLECT=0 \
     bash "$REFRESH" 2>&1
 }
 
