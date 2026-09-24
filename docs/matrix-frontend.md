@@ -119,12 +119,50 @@ one is ignored with a one-time notice ("기기 검증을 마친 뒤 다시 보�
 for a broken chain). With an identity, `devices` may be `{}`.
 
 Users without an identity keep the pinned-device rule (`devices`,
-`family_devices`): any change to the device *set* or a pinned *key* stops the
-service (`owner-device-set-changed`, `owner-device-key-changed`) until an
-operator re-pins. Migration: read the master key from `keys/query`
-(`master_keys[user].keys`), set `identities`, set `devices` to `{}`, and
-update the saved policy (`meta.policy`: `devices`, `identities`) in the
-state store before restarting — the policy comparison is fail-closed.
+`family_devices`):
+
+- **Owner** — any change to the owner's device *set* or a pinned *key* stops
+  the service (`owner-device-set-changed`, `owner-device-key-changed`) until
+  an operator re-pins. An owner message from a device outside the (unchanged)
+  pinned set is anomalous key material on the operator's own channel and
+  also stops the service (`unverified-owner-event`).
+- **Family member** (#1958) — a changed *key* of a pinned family device, or
+  a pinned family device that disappeared, still stops the service
+  (`pinned-device-key-changed`, `pinned-device-missing`). An *extra* unpinned
+  device is expected (a new phone), so a message — text or media — from it
+  is contained to that event: it is never processed, the room gets one
+  notice per device ("등록되지 않은 기기에서 보낸 메시지는 처리하지
+  않습니다 … 운영자에게 기기 등록을 요청해 주세요"; deduplicated through meta
+  `untrusted_senders`), and the sync batch still commits, so the owner's
+  room and every other room keep working and nothing is replayed on
+  restart. In-app verification cannot fix this in pin mode; the operator
+  re-pins the device (or moves the user to `identities`).
+
+**Re-pinning** (`devices`, `family_devices`, `identities`). The saved policy
+(`meta.policy`) is fail-closed against config edits (`saved-policy-changed`),
+so never edit it in the database; use the audited `repin` command:
+
+1. Read the new device keys (`keys/query` from the bot token:
+   `device_keys[user][device].keys`) or, for cross-signing, the master key
+   (`master_keys[user].keys`; then set `devices` to `{}` for the owner).
+2. `systemctl stop ccc-matrix-bridge` — the state store is single-process
+   and locked while the service runs (the command exits 3 otherwise).
+3. Edit only the pins in the 0600 config (`CCC_MATRIX_CONFIG_PATH`).
+4. `<venv>/bin/python -m telegram_bot.core.matrix.repin --config <config>
+   --reason "<why>"` (same venv and `WorkingDirectory` as the unit's
+   `ExecStart`). It validates the config, refuses anything but a pin
+   change (owner, rooms, family membership and `not_before_ms` reroute saved
+   jobs and stay `saved-policy-changed`), refuses a no-op, then writes the new
+   `meta.policy` and an `operator_audit` row (`action=repin`, actor, reason,
+   before/after device ids with short key fingerprints — no key material or
+   secrets) in one transaction and prints that record. Exit 2 = refused.
+5. `systemctl start ccc-matrix-bridge`; the replayed batch (if any) is
+   checked against the new pins.
+
+Known gap: an `unverified-owner-event` stop with an *unchanged* owner device
+set is not something a re-pin can clear (there is nothing to re-pin); the
+failed batch stays in `meta.pending_sync` and needs a deliberate operator
+decision to discard it after the device has been investigated.
 
 ## Identity mapping
 
@@ -218,7 +256,8 @@ same prompt contract as Telegram (a local path in the prompt):
   ignored. Per Matrix v1.10 the `body` is a caption only when `filename` is
   present and differs from it. Plaintext media (a bare `url`, no
   `EncryptedFile`) is refused. An unverified device is ignored (with the
-  existing cross-signing notice) — media never adds a `SafetyStop` path. A
+  existing cross-signing notice, or the pin-mode "unregistered device"
+  notice for a family member) — media never adds a `SafetyStop` path. A
   media event the transport sees but does not admit is logged body-free as
   `matrix media ignored reason=… kind=…` and kept in meta `media_ignored`;
   an event nio cannot parse at all (e.g. a malformed `file`, which nio turns
