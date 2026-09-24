@@ -3,6 +3,7 @@
 # mypy: disable-error-code="attr-defined"
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
@@ -313,6 +314,27 @@ def _log_approval_route_deny(
         chat_id,
         generation,
     )
+
+
+@dataclass
+class _TurnSessionSlot:
+    """Locals that ``_acquire_turn_session`` hands back to the turn (#896 PR1).
+
+    The inline code assigned ``session``/``turn_token`` at several points
+    inside the guard lock, and the turn's ``except``/``finally`` read whatever
+    value was current when control left — including after a refused
+    admission or an exception mid-start (a freshly started, uncached session
+    must still be dropped). The helper mirrors every assignment here and the
+    caller adopts the slot in a ``finally`` so those paths stay identical.
+    """
+
+    # Typed ``Any`` on purpose: the inline code's ``session`` was inferred as
+    # ``Any`` (first ``None``, then the runtime's session object) and every
+    # later use relies on that; ``Optional`` here would force guards into
+    # code this PR must not change.
+    runtime: Any = None
+    session: Any = None
+    turn_token: Any = None
 
 
 class ProjectChatProcessMixin:
@@ -713,6 +735,204 @@ class ProjectChatProcessMixin:
             # Reasoning remains private; approval/completion are already consumed.
             return
 
+    def _build_streaming_handler(
+        self,
+        *,
+        bot: Optional[Any],
+        chat_id: int,
+        user_id: int,
+        streaming_sink: Optional[Any],
+    ) -> Optional[Any]:
+        """Pick the turn's streaming handler (#896 PR1: moved out of the turn).
+
+        A frontend-provided sink (Matrix, tests) replaces the Telegram draft
+        editor; the handler only ever calls the five-method contract. Without
+        a sink, the Telegram draft editor is used only when streaming is on.
+        """
+        if streaming_sink is not None:
+            from telegram_bot.core.streaming_sink import validate_streaming_sink
+
+            return validate_streaming_sink(streaming_sink)
+        if bot and getattr(self._config, "enable_streaming", False):
+            from telegram_bot.core.streaming import StreamingMessageHandler
+
+            return StreamingMessageHandler(bot, chat_id, user_id, settings=self._config)
+        return None
+
+    async def _acquire_turn_session(
+        self,
+        *,
+        key: str,
+        user_id: int,
+        chat_id: int,
+        session_id: Optional[str],
+        model: Optional[str],
+        effort: Optional[str],
+        approval_policy: Optional[str],
+        approvals_reviewer: Optional[str],
+        sandbox_policy: Optional[Mapping[str, AgentJsonValue]],
+        new_session: bool,
+        dispatch_guard: Callable[[], bool] | None,
+        notification_bot: Optional[Any],
+        bot: Optional[Any],
+        loop: asyncio.AbstractEventLoop,
+        progress_request: Any,
+        slot: "_TurnSessionSlot",
+    ) -> Optional[ChatResponse]:
+        """Start or resume the conversation's agent session under the guard lock.
+
+        #896 PR1: pure move of the session-acquisition critical section out of
+        ``_process_agent_message``. Session construction and the periodic
+        resource guard share this short critical section. It prevents an
+        idle-runtime recycle from landing between start_or_resume() and active
+        registration, while turns remain parallel after admission.
+
+        Writes ``runtime``/``session``/``turn_token`` into ``slot`` at the same
+        points the inline code assigned them, and returns the refusal reply
+        when admission is refused (``None`` on success). The caller adopts the
+        slot in a ``finally`` so its own ``except``/``finally`` see the same
+        locals as before on every exit — success, refusal, or exception.
+        """
+        async with self._session_guard_lock:
+            # The signal callback and this check run on the same event
+            # loop.  A request already past this point owns admission;
+            # one waiting on the guard when drain begins must not start
+            # a provider process or turn.
+            if getattr(self, "_shutdown_draining", False):
+                _claim_request_terminal(
+                    progress_request,
+                    RequestPhase.FAILED,
+                    cause="bridge-draining",
+                )
+                return ChatResponse(
+                    content=f"⏳ {_DRAIN_RESPONSE}",
+                    success=False,
+                    error="bridge_draining",
+                    session_id=session_id,
+                )
+            runtime = self._require_runtime()
+            slot.runtime = runtime
+            cached = self._agent_session_registry.get_cached(key)
+            entry = cached.entry if cached is not None else None
+            session = entry.session if entry is not None else None
+            slot.session = session
+            if new_session or (
+                entry is not None
+                and (
+                    (
+                        session_id is not None
+                        and entry.session.session_id != session_id
+                    )
+                    or entry.model != model
+                    or entry.effort != effort
+                    or entry.approval_policy != approval_policy
+                    or entry.approvals_reviewer != approvals_reviewer
+                    or entry.sandbox_policy != sandbox_policy
+                )
+            ):
+                await self._drop_agent_session(key, session)
+                session = None
+                slot.session = None
+            if session is None:
+                await self._prepare_agent_session_start_locked()
+                memory_environment = None
+                provider = getattr(self._config, "agent_provider", "claude")
+                audience = resolve_memory_audience(
+                    self._config,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    route=getattr(self, "_memory_route", "telegram"),
+                )
+                if audience is not None:
+                    if provider == "codex":
+                        memory_environment = audience.codex_environment(
+                            self._config
+                        )
+                    elif provider == "claude":
+                        memory_environment = audience.claude_environment(
+                            self._config
+                        )
+                    elif provider == "danso":
+                        memory_environment = audience.danso_environment(self._config)
+                    elif provider == "piri":
+                        memory_environment = audience.piri_environment(
+                            self._config
+                        )
+                session = await runtime.start_or_resume(
+                    SessionRequest(
+                        working_directory=str(
+                            (getattr(self._config, "danso_workspace", None) or self.project_root)
+                            if provider == "danso" else self.project_root
+                        ),
+                        session_id=None if new_session else session_id,
+                        model=model,
+                        effort=effort,
+                        approval_policy=approval_policy,
+                        approvals_reviewer=approvals_reviewer,
+                        sandbox_policy=sandbox_policy,
+                        memory_environment=memory_environment,
+                    )
+                )
+                slot.session = session
+                if dispatch_guard is not None and not dispatch_guard():
+                    # The session is started but not cached; the caller's
+                    # finally still sees it through the slot (#896 PR1).
+                    return ChatResponse(content="Recovery selection expired; use /task_recover.", success=False)
+                if getattr(self, "_agent_connection_error_reported", False):
+                    # #1721: the transport healed (recycle + successful
+                    # session start) — clear the degraded agent state.
+                    self._agent_connection_error_reported = False
+                    health_reporter.record_agent_ok()
+                recorder = getattr(self, "_session_started_recorder", None)
+                if recorder is not None:
+                    # Persist the identity before any tool can execute. A failed
+                    # write must abort this turn, never orphan an uncertain journal.
+                    if dispatch_guard is None:
+                        await recorder(user_id, chat_id, session.session_id)
+                    else:
+                        await recorder(user_id, chat_id, session.session_id, dispatch_guard=dispatch_guard)
+                self._agent_session_attachments += 1
+                self._agent_session_registry.put_cached(
+                    key,
+                    AgentSessionEntry(
+                        session=session,
+                        model=model,
+                        effort=effort,
+                        approval_policy=approval_policy,
+                        approvals_reviewer=approvals_reviewer,
+                        sandbox_policy=sandbox_policy,
+                        last_used_at=loop.time(),
+                    ),
+                )
+            elif cached is not None:
+                self._agent_session_registry.touch_cached_if_same(
+                    key,
+                    cached.token,
+                    loop.time(),
+                )
+
+            # (Re-)register the between-turns delivery route each turn
+            # so the autonomous-output path always targets the latest
+            # bot reference for this conversation.
+            self._register_agent_unsolicited_handler(
+                session,
+                user_id=user_id,
+                chat_id=chat_id,
+                model=model,
+                route_bot=notification_bot or bot,
+            )
+            # Same cadence as the unsolicited route: (re-)register the
+            # /usage observation seam each turn.
+            self._register_agent_frame_observer(
+                session, user_id=user_id, chat_id=chat_id
+            )
+            slot.turn_token = self._agent_session_registry.register_active(
+                key,
+                session,
+                started_at=loop.time(),
+            )
+        return None
+
     async def _process_agent_message(  # noqa: C901 -- #348 baseline hotspot
         self,
         *,
@@ -753,19 +973,9 @@ class ProjectChatProcessMixin:
             # an unintended backend (canary4 401, #926). Pin the configured
             # default (CCC_CRUSH_MODEL) unless the turn chose a model itself.
             model = getattr(self._config, "crush_model", None) or None
-        streaming_handler = None
-        if streaming_sink is not None:
-            # A frontend-provided sink (Matrix, tests) replaces the Telegram
-            # draft editor; the handler only ever calls the five-method contract.
-            from telegram_bot.core.streaming_sink import validate_streaming_sink
-
-            streaming_handler = validate_streaming_sink(streaming_sink)
-        elif bot and getattr(self._config, "enable_streaming", False):
-            from telegram_bot.core.streaming import StreamingMessageHandler
-
-            streaming_handler = StreamingMessageHandler(
-                bot, chat_id, user_id, settings=self._config
-            )
+        streaming_handler = self._build_streaming_handler(
+            bot=bot, chat_id=chat_id, user_id=user_id, streaming_sink=streaming_sink
+        )
 
         async with self._conversation_turn(user_id, chat_id):
             if dispatch_guard is not None and not dispatch_guard():
@@ -799,141 +1009,37 @@ class ProjectChatProcessMixin:
             followup_authorized = False
             try:
                 # Session construction and the periodic resource guard share
-                # this short critical section. It prevents an idle-runtime
-                # recycle from landing between start_or_resume() and active
-                # registration, while turns remain parallel after admission.
-                async with self._session_guard_lock:
-                    # The signal callback and this check run on the same event
-                    # loop.  A request already past this point owns admission;
-                    # one waiting on the guard when drain begins must not start
-                    # a provider process or turn.
-                    if getattr(self, "_shutdown_draining", False):
-                        _claim_request_terminal(
-                            progress_request,
-                            RequestPhase.FAILED,
-                            cause="bridge-draining",
-                        )
-                        return ChatResponse(
-                            content=f"⏳ {_DRAIN_RESPONSE}",
-                            success=False,
-                            error="bridge_draining",
-                            session_id=session_id,
-                        )
-                    runtime = self._require_runtime()
-                    cached = self._agent_session_registry.get_cached(key)
-                    entry = cached.entry if cached is not None else None
-                    session = entry.session if entry is not None else None
-                    if new_session or (
-                        entry is not None
-                        and (
-                            (
-                                session_id is not None
-                                and entry.session.session_id != session_id
-                            )
-                            or entry.model != model
-                            or entry.effort != effort
-                            or entry.approval_policy != approval_policy
-                            or entry.approvals_reviewer != approvals_reviewer
-                            or entry.sandbox_policy != sandbox_policy
-                        )
-                    ):
-                        await self._drop_agent_session(key, session)
-                        session = None
-                    if session is None:
-                        await self._prepare_agent_session_start_locked()
-                        memory_environment = None
-                        provider = getattr(self._config, "agent_provider", "claude")
-                        audience = resolve_memory_audience(
-                            self._config,
-                            user_id=user_id,
-                            chat_id=chat_id,
-                            route=getattr(self, "_memory_route", "telegram"),
-                        )
-                        if audience is not None:
-                            if provider == "codex":
-                                memory_environment = audience.codex_environment(
-                                    self._config
-                                )
-                            elif provider == "claude":
-                                memory_environment = audience.claude_environment(
-                                    self._config
-                                )
-                            elif provider == "danso":
-                                memory_environment = audience.danso_environment(self._config)
-                            elif provider == "piri":
-                                memory_environment = audience.piri_environment(
-                                    self._config
-                                )
-                        session = await runtime.start_or_resume(
-                            SessionRequest(
-                                working_directory=str(
-                                    (getattr(self._config, "danso_workspace", None) or self.project_root)
-                                    if provider == "danso" else self.project_root
-                                ),
-                                session_id=None if new_session else session_id,
-                                model=model,
-                                effort=effort,
-                                approval_policy=approval_policy,
-                                approvals_reviewer=approvals_reviewer,
-                                sandbox_policy=sandbox_policy,
-                                memory_environment=memory_environment,
-                            )
-                        )
-                        if dispatch_guard is not None and not dispatch_guard():
-                            return ChatResponse(content="Recovery selection expired; use /task_recover.", success=False)
-                        if getattr(self, "_agent_connection_error_reported", False):
-                            # #1721: the transport healed (recycle + successful
-                            # session start) — clear the degraded agent state.
-                            self._agent_connection_error_reported = False
-                            health_reporter.record_agent_ok()
-                        recorder = getattr(self, "_session_started_recorder", None)
-                        if recorder is not None:
-                            # Persist the identity before any tool can execute. A failed
-                            # write must abort this turn, never orphan an uncertain journal.
-                            if dispatch_guard is None:
-                                await recorder(user_id, chat_id, session.session_id)
-                            else:
-                                await recorder(user_id, chat_id, session.session_id, dispatch_guard=dispatch_guard)
-                        self._agent_session_attachments += 1
-                        self._agent_session_registry.put_cached(
-                            key,
-                            AgentSessionEntry(
-                                session=session,
-                                model=model,
-                                effort=effort,
-                                approval_policy=approval_policy,
-                                approvals_reviewer=approvals_reviewer,
-                                sandbox_policy=sandbox_policy,
-                                last_used_at=loop.time(),
-                            ),
-                        )
-                    elif cached is not None:
-                        self._agent_session_registry.touch_cached_if_same(
-                            key,
-                            cached.token,
-                            loop.time(),
-                        )
-
-                    # (Re-)register the between-turns delivery route each turn
-                    # so the autonomous-output path always targets the latest
-                    # bot reference for this conversation.
-                    self._register_agent_unsolicited_handler(
-                        session,
+                # a short critical section inside _acquire_turn_session (#896
+                # PR1). The slot is adopted in a finally so the except/finally
+                # clauses below see the same ``session``/``turn_token`` the
+                # inline code left on every exit, including an exception
+                # between start_or_resume() and registration.
+                slot = _TurnSessionSlot()
+                try:
+                    refusal = await self._acquire_turn_session(
+                        key=key,
                         user_id=user_id,
                         chat_id=chat_id,
+                        session_id=session_id,
                         model=model,
-                        route_bot=notification_bot or bot,
+                        effort=effort,
+                        approval_policy=approval_policy,
+                        approvals_reviewer=approvals_reviewer,
+                        sandbox_policy=sandbox_policy,
+                        new_session=new_session,
+                        dispatch_guard=dispatch_guard,
+                        notification_bot=notification_bot,
+                        bot=bot,
+                        loop=loop,
+                        progress_request=progress_request,
+                        slot=slot,
                     )
-                    # Same cadence as the unsolicited route: (re-)register the
-                    # /usage observation seam each turn.
-                    self._register_agent_frame_observer(
-                        session, user_id=user_id, chat_id=chat_id
-                    )
-                    turn_token = self._agent_session_registry.register_active(
-                        key,
-                        session,
-                        started_at=loop.time(),
-                    )
+                finally:
+                    session = slot.session
+                    turn_token = slot.turn_token
+                if refusal is not None:
+                    return refusal
+                runtime = slot.runtime
                 # #740: publish which conversation this turn serves so the
                 # agent-side external-wait CLI can bind CI registrations to
                 # the correct route (cleared in the turn finally below). This
