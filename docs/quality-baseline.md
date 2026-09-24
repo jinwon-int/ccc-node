@@ -72,9 +72,12 @@ same-module helpers, one PR per cut so each is independently revertable.
 ruff-mccabe CC with the marker stripped: 100 before the series → 86 after
 PR1 (#1974, `_build_streaming_handler` / `_acquire_turn_session`) → 51 after
 PR2 (#1975, `_make_turn_callbacks` factories / `_run_turn_stream`) → 28 after
-PR3 (`_resolve_turn_outcome` / `_finish_completed_turn`). The marker stays
-until the remaining `except`/`finally` tail (H6/H7, PR4) brings it under 15;
-every new helper is under the threshold and carries no marker.
+PR3 (#1978, `_resolve_turn_outcome` / `_finish_completed_turn`) → 18 after
+PR4 (`_handle_turn_timeout` / `_handle_turn_exception` / `_release_turn`).
+The marker stays until the danso/dispatch authorization block (P5 in the
+design comment; a slot-style helper so the `finally` still sees the
+authorization flags) brings it under 15; every new helper is under the
+threshold and carries no marker.
 
 ## Mypy scope
 
