@@ -18,7 +18,7 @@ from .agent_runtime import (
 from .grok_journal import GrokJournal
 from .grok_protocol import (
     AcceptedPrompt, Baseline, BoundReply, HOST_VERSION, MAX_PROMPT, ProtocolError, _text,
-    accepted_prompt, bound_reply, capture_baseline, check_host, check_idle,
+    accepted_prompt, bound_reply, capture_baseline, check_host, check_idle, unfinished_preface,
 )
 from .turn_stall import register_turn_liveness
 
@@ -152,6 +152,14 @@ class GrokSession:
     # held until the transcript stays unchanged for that long. A range that is
     # already older (reconciliation, replay) is returned at once.
     REPLY_SETTLE_SECONDS = 10.0
+    # A preface row ("잠깐 확인할게.") means the Bot is still fetching: the real
+    # answer followed 10 s+ later on host 84a5db0 (2026-09-24, #1966) and the
+    # room received the preface alone. While the newest validated row is such a
+    # preface, settling keeps re-reading for up to this long after it first
+    # saw the reply; a plain answer still returns after REPLY_SETTLE_SECONDS.
+    # Well inside TURN_SECONDS so a Bot that never follows up ends the turn
+    # with the preface delivered, not uncertain.
+    REPLY_PREFACE_SETTLE_SECONDS = 90.0
 
     def __init__(self, runtime: GrokRuntime):
         self.runtime = runtime
@@ -265,15 +273,26 @@ class GrokSession:
         """Hold a freshly written reply until this run stops adding rows.
 
         The host has no end-of-run marker, so completeness is judged by
-        quiescence of the bound range. Any validation failure during the wait
-        keeps the range already validated: settling must never lose a
-        confirmed answer. The surrounding TURN_SECONDS timeout bounds it.
+        quiescence of the bound range: REPLY_SETTLE_SECONDS after the newest
+        row, or — while that row is an unfinished preface — up to
+        REPLY_PREFACE_SETTLE_SECONDS after the reply was first seen (#1966).
+        Any validation failure during the wait keeps the range already
+        validated: settling must never lose a confirmed answer. The
+        surrounding TURN_SECONDS timeout bounds it.
         """
         runtime = self.runtime
+        started = time.monotonic()
         while True:
             age = self._range_age_seconds(page, result.entry_ids)
-            if age is None or age >= self.REPLY_SETTLE_SECONDS:
+            if age is None:
                 return result
+            if age >= self.REPLY_SETTLE_SECONDS:
+                if not unfinished_preface(result.texts):
+                    return result
+                if time.monotonic() - started >= self.REPLY_PREFACE_SETTLE_SECONDS:
+                    logger.info("Grok reply preface not followed within %.0fs; delivering the validated range",
+                                self.REPLY_PREFACE_SETTLE_SECONDS)
+                    return result
             await asyncio.sleep(self.POLL_SECONDS)
             try:
                 page = await runtime._call("tail")

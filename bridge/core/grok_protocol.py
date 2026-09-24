@@ -14,6 +14,8 @@ additional ids, or ``any`` to rely on the capability contract alone) — see
 """
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass
 import hashlib
 import json
@@ -231,6 +233,42 @@ def accepted_prompt(value: Any, agent_id: str, nonce: str, prompt: str) -> Accep
     if record.get("status") != "accepted":
         raise ProtocolError("acceptance_not_accepted")
     return AcceptedPrompt(agent_id, nonce, digest, identifier(record.get("echoEntryId")))
+
+
+# The Bot prefaces tool-backed answers with a short promissive row ("서울 오늘
+# 날씨 잠깐 확인할게.", "내일(수) 일정 확인할게.") and writes the real answer only
+# after the lookup — 2026-09-24 09:36 KST, host 84a5db0: the weather row came
+# well after the 10 s quiescence window, so the room got the preface alone
+# (#1966). A row that ends this way is not a complete answer; settling waits
+# longer for it. Korean promissive/near-future endings plus the few English
+# equivalents the Bot uses; punctuation, emoji and closing quotes may follow.
+_UNFINISHED_PREFACE = re.compile(
+    r"(?:[가-힣]*(?:ㄹ게|을게|할게|볼게|줄게|드릴게|께)(?:요)?"
+    r"|잠깐(?:만)?|잠시(?:만)?(?:요)?|확인\s*중|찾아\s*보는\s*중|알아\s*보는\s*중"
+    r"|(?:let me|i'll|i will)\s+(?:check|look|see|find|take a look)[^.!?]*|one (?:moment|sec(?:ond)?)|checking|looking (?:it )?up)"
+    r"[\s.!…~〜)\]\"'”’]*$",
+    re.IGNORECASE,
+)
+UNFINISHED_PREFACE_MAX_CHARS = 60
+_SENTENCE_BREAK = re.compile(r"[.!?。！？]\s+\S")
+
+
+def unfinished_preface(texts: tuple[str, ...] | list[str]) -> bool:
+    """True when the newest reply row reads like a promise to answer next.
+
+    Only the last non-empty row is judged, and only when it is one short
+    sentence: an answer that closes with an offer ("… 필요하면 더 알려줄게.")
+    is complete and must not wait, so a row with a sentence break before its
+    tail, or longer than UNFINISHED_PREFACE_MAX_CHARS, is never a preface.
+    """
+    for text in reversed(list(texts)):
+        row = (text or "").strip()
+        if not row:
+            continue
+        if len(row) > UNFINISHED_PREFACE_MAX_CHARS or "\n" in row or _SENTENCE_BREAK.search(row):
+            return False
+        return bool(_UNFINISHED_PREFACE.search(row))
+    return False
 
 
 @dataclass(frozen=True)

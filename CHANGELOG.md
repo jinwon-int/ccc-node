@@ -4,6 +4,20 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **Grok: tool-backed answers arrive whole (#1966).** On host `84a5db0` the
+  Bot prefaces a lookup with one short row ("서울 오늘 날씨 잠깐 확인할게.") and
+  writes the answer 10 s+ later, so the #1933 quiescence window closed on the
+  preface and the room never saw the weather (2026-09-24 09:36 KST; the
+  native app had both rows). `unfinished_preface()` recognises a single short
+  promissive row (Korean `~할게/~볼게/~줄게`, `잠깐`, `확인 중`, English "let
+  me check" / "one moment"); while the newest validated row is such a
+  preface, settling keeps re-reading the tail for up to
+  `REPLY_PREFACE_SETTLE_SECONDS` (90 s, inside `TURN_SECONDS`) after the reply
+  was first seen. A complete answer — including one that closes with an
+  offer ("… 필요하면 더 알려줄게.") — still returns after the 10 s window, and a
+  preface the Bot never follows up is delivered at the cap, never left
+  uncertain. Nothing is resent.
+
 - **Matrix frontend reads photos and files (#1795).** Encrypted `m.image` /
   `m.file` / `m.video` / `m.audio` events used to be dropped silently — an
   owner's two photos on 2026-09-24 got no answer and no log line. They are now
