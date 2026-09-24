@@ -859,6 +859,44 @@ class Config(
         alias="CCC_PUSH_MAX_PER_MINUTE",
         description="Rate limit: max push messages delivered per minute.",
     )
+    # Telegram HTTPX transport timeouts (seconds). Connect/pool defaults were
+    # raised from 5s/3s: on a mobile or Tailscale uplink a fresh TLS handshake
+    # to api.telegram.org can exceed 3s, which PTB reports as
+    # TimedOut(PoolTimeout) from Application.initialize() and sends the bridge
+    # into its retry loop while the network is merely slow.
+    telegram_connect_timeout: float = Field(
+        default=10.0,
+        gt=0,
+        alias="CCC_TELEGRAM_CONNECT_TIMEOUT",
+        description="HTTPX connect timeout for every Telegram API request.",
+    )
+    telegram_pool_timeout: float = Field(
+        default=10.0,
+        gt=0,
+        alias="CCC_TELEGRAM_POOL_TIMEOUT",
+        description="HTTPX connection-pool acquire timeout for every Telegram API request.",
+    )
+    telegram_read_timeout: float = Field(
+        default=10.0,
+        gt=0,
+        alias="CCC_TELEGRAM_READ_TIMEOUT",
+        description=(
+            "HTTPX read timeout for non-polling Telegram API calls; the getUpdates "
+            "long-poll keeps its own 35s."
+        ),
+    )
+    alert_init_failure_threshold: int = Field(
+        default=3,
+        ge=0,
+        alias="CCC_ALERT_INIT_FAILURES",
+        description=(
+            "Consecutive Application.initialize() failures before one "
+            "telegram_init_retry_loop alert (plus a recovery notice) is written to "
+            "the channel-neutral push spool. Not gated on this process's "
+            "CCC_PUSH_ENABLED — a Matrix spool notifier on the node delivers it "
+            "while Telegram is unreachable. 0 disables."
+        ),
+    )
     push_notify_allowed_chats: List[str] = Field(
         default_factory=list,
         alias="CCC_AGENT_CRON_NOTIFY_ALLOWED_CHATS",

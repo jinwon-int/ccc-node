@@ -190,6 +190,34 @@ def evaluate_alerts(signals: HealthSignals, thresholds: AlertThresholds) -> list
     return alerts
 
 
+def init_retry_loop_alert(failures: int, elapsed_seconds: float) -> Alert:
+    """Bridge stuck retrying ``Application.initialize()`` — not receiving messages.
+
+    Raised by the polling lifecycle (core/bot_lifecycle.py) once the streak of
+    consecutive transient initialize() failures reaches
+    ``CCC_ALERT_INIT_FAILURES``; fired once per episode, numbers only.
+    """
+    return Alert(
+        code="telegram_init_retry_loop",
+        message=(
+            f"Telegram polling failed to initialize {int(failures)} times in a row "
+            f"over {int(max(0.0, elapsed_seconds))}s — the bridge is stuck in its "
+            "transport retry loop and is not receiving messages."
+        ),
+    )
+
+
+def init_retry_recovered_alert(failures: int, elapsed_seconds: float) -> Alert:
+    """Companion notice: initialize() succeeded after an alerted retry streak."""
+    return Alert(
+        code="telegram_init_recovered",
+        message=(
+            f"Telegram polling initialized after {int(failures)} failed attempt(s) "
+            f"over {int(max(0.0, elapsed_seconds))}s — messages are being received again."
+        ),
+    )
+
+
 class AlertGate:
     """Edge-triggered per-code cooldown so a persistent condition alerts once.
 
