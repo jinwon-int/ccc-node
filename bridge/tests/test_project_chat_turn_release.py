@@ -9,6 +9,11 @@ move must not change: the interrupt-before-drop order on a timeout, the
 health mark, and — the one the design comment asked for — that a failing
 ``_finalize_request_progress`` still lets ``clear_active_turn`` run and the
 registry token deactivate, in that order, before the failure propagates.
+
+Module globals are patched through the helper's own ``__globals__`` (the
+repo pattern, see ``test_external_wait.py``): under the CI ``telegram_bot``
+path shim the module can be imported under two names, and patching the
+attribute of the one this file imported does not reach the function.
 """
 
 from __future__ import annotations
@@ -19,7 +24,6 @@ from typing import Any
 
 import pytest
 
-from telegram_bot.core import project_chat_process as module
 from telegram_bot.core.codex_app_server import CodexConnectionClosedError
 from telegram_bot.core.project_chat_process import ProjectChatProcessMixin
 from telegram_bot.core.project_chat_types import _PendingRequest
@@ -203,7 +207,9 @@ def test_codex_connection_closed_marks_transport_health(monkeypatch: pytest.Monk
         def record_agent_error(self, error: str) -> None:
             recorded.append(error)
 
-    monkeypatch.setattr(module, "health_reporter", _Health())
+    monkeypatch.setitem(
+        ProjectChatProcessMixin._handle_turn_exception.__globals__, "health_reporter", _Health()
+    )
 
     async def run() -> None:
         host = _Host()
@@ -222,6 +228,8 @@ def test_codex_connection_closed_marks_transport_health(monkeypatch: pytest.Monk
 def _patch_release(monkeypatch: pytest.MonkeyPatch, log: list[str], *,
                    finalize_raises: bool = False) -> list[dict[str, Any]]:
     clears: list[dict[str, Any]] = []
+    release_globals = ProjectChatProcessMixin._release_turn.__globals__
+    real_clear = release_globals["clear_active_turn"]
 
     async def fake_finalize(**kwargs: Any) -> None:
         log.append("finalize")
@@ -229,12 +237,12 @@ def _patch_release(monkeypatch: pytest.MonkeyPatch, log: list[str], *,
             raise RuntimeError("finalize failed")
 
     async def fake_offloaded(fn: Any, /, *args: Any, **kwargs: Any) -> None:
-        assert fn is module.clear_active_turn
+        assert fn is real_clear
         log.append("clear")
         clears.append(dict(kwargs))
 
-    monkeypatch.setattr(module, "_finalize_request_progress", fake_finalize)
-    monkeypatch.setattr(module, "_await_offloaded_write", fake_offloaded)
+    monkeypatch.setitem(release_globals, "_finalize_request_progress", fake_finalize)
+    monkeypatch.setitem(release_globals, "_await_offloaded_write", fake_offloaded)
     return clears
 
 
