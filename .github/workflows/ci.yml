@@ -199,14 +199,32 @@ jobs:
         # scripts/ is not collected wholesale, so this step is the only place
         # it runs.
         run: python -m pytest -q scripts/timed_test_deadline_scan_test.py
-      - name: auto-distill secret-pattern alignment
-        # The masker (auto-distill.py:_TOKEN_RE) and the publish gate
-        # (publish_wiki.py:TOKEN_RE) are two copies of one pattern set that had
-        # silently drifted by 10 shapes. test_redact.py pins them by comparing
-        # the parsed alternatives, so it has to run somewhere other than a
-        # laptop or the drift just reopens. tests/test_root_test_collection.py
-        # only scans the root tests/ directory and cannot catch this file.
-        run: python -m pytest -q scripts/auto-distill/test_redact.py
+      - name: scripts/ test discovery guard
+        # Counterpart of test_root_test_collection.py for scripts/: every
+        # scripts/**/test_*.py and *_test.py must be named in ci.yml,
+        # validate-harness.sh, or a tracked *.test.sh (a directory handed to
+        # pytest counts for the files inside). Separate step on purpose — the
+        # CI-hardening step above is pinned verbatim by
+        # tests/test_owner_operator_ci_gate.py.
+        run: python -m pytest -q tests/test_scripts_test_collection.py
+      - name: scripts/ python suites with no *.test.sh wrapper
+        # scripts/ python tests normally run through validate-harness.sh or a
+        # sibling *.test.sh wrapper (discovered as a hook-test suite). The
+        # files below have neither, so this step is the only place they run.
+        # The 2026-09-24 audit (#1528) found ten of them orphaned: eight
+        # scripts/auto-distill/test_*.py (only test_redact.py was wired — the
+        # masker/publish-gate pattern pin that had silently drifted by 10
+        # shapes), agent_cron_store_lock_test.py and danso_native_memory_test.py.
+        # tests/test_scripts_test_collection.py now fails on any scripts/ test
+        # file that is not named here, in validate-harness.sh, or in a tracked
+        # *.test.sh — the same guard test_root_test_collection.py gives tests/.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.github/pythonpath
+        run: |
+          python -m pytest -q \
+            scripts/auto-distill \
+            scripts/agent_cron_store_lock_test.py \
+            scripts/danso_native_memory_test.py
 
   secret-scan:
     name: secret-scan
