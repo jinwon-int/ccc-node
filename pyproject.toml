@@ -25,6 +25,21 @@ max-complexity = 15
 "scripts/agent_cron.py" = ["E402"]
 "tests/test_jevlib.py" = ["E402"]
 
+[tool.pytest.ini_options]
+# Root-level discovery (#1528 2026-09-24 재평가, 항목 5). Before this block a
+# bare `pytest` at the repo root collected nothing, and the repo carried two
+# python test naming conventions side by side: `tests/test_*.py` (pytest
+# style) and `scripts/**/*_test.py` (unittest style, run one file per line
+# from validate-harness.sh or a sibling *.test.sh wrapper). pytest only
+# discovers `test_*.py` by default, so `pytest scripts/foo_test.py` worked
+# but `pytest scripts/` silently skipped the `_test.py` files. Both patterns
+# are collected now. `testpaths` stays on `tests/` only: the scripts/ suites
+# are wired individually (see ci.yml python-lint and validate-harness.sh) and
+# tests/test_scripts_test_collection.py fails on any file that is not.
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+pythonpath = [".github/pythonpath"]
+
 [tool.mypy]
 python_version = "3.11"
 warn_unused_ignores = true
