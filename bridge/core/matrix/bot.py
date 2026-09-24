@@ -86,6 +86,17 @@ ATTACHMENT_FAILED = {
 }
 SELF_JOB_DANSO_AUTO_RESUME = "danso-auto-resume"
 SELF_JOB_EXTERNAL_WAIT_RESUME = "external-wait-resume"
+# #1955: visible answers when a non-owner turn is refused (fail-closed).
+NON_OWNER_TURN_REFUSED = (
+    "🔒 This agent runs with the owner's host access on this node, so it only "
+    "takes turns from the owner."
+)
+EXTERNAL_WAIT_RESUME_REFUSED = (
+    "🔒 A queued follow-up was not run: it could not be matched to the person who asked for it."
+)
+# #1955: only Codex honours per-turn approval/sandbox settings; every other
+# provider runs under the process-wide execution profile.
+_PER_TURN_NARROWABLE_PROVIDERS = frozenset({"codex"})
 STATUS_MIN_INTERVAL_S = 15.0  # match Telegram CCC_HEARTBEAT_* defaults
 _HEALTH_INTERVAL_S = 10.0  # match bot_lifecycle._WORKLOAD_INTERVAL
 _RUNTIME_MODEL_PROVIDERS = frozenset({"codex", "piri", "crush", "danso"})
@@ -874,16 +885,30 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                 record.get("chat_id"),
             )
             return False
+        # #1955: the continuation runs as the person who registered the wait,
+        # never silently as the owner. Unknown or no-longer-admitted users are
+        # refused (``False`` -> the monitor posts its resume-failed notice).
+        raw_user = record.get("user_id")
+        user_int = raw_user if isinstance(raw_user, int) and not isinstance(raw_user, bool) else None
+        sender = self.ids.matrix_id(user_int) if user_int is not None else None
+        if user_int is None or sender is None or not self._is_admitted_sender(sender):
+            logger.info(
+                "Matrix external-wait resume refused: requester not admitted for chat %s",
+                record.get("chat_id"),
+            )
+            return False
         body = json.dumps(
             {
                 "kind": SELF_JOB_EXTERNAL_WAIT_RESUME,
                 "v": 1,
                 "wait_id": str(record.get("wait_id") or ""),
+                "user_id": user_int,
                 "prompt": prompt,
             }
         )
+        extra: dict[str, Any] = {} if sender == self.load_config().get("owner") else {"sender": sender}
         try:
-            enqueue(room, body, key=f"{SELF_JOB_EXTERNAL_WAIT_RESUME}:{record.get('wait_id') or 'none'}")
+            enqueue(room, body, key=f"{SELF_JOB_EXTERNAL_WAIT_RESUME}:{record.get('wait_id') or 'none'}", **extra)
         except Exception as error:
             logger.warning("Matrix external-wait self-job enqueue failed: %s", type(error).__name__)
             return False
@@ -959,16 +984,52 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
 
         return interim
 
-    def _bash_policy(self) -> str:
-        profile = tool_policy.resolve_execution_profile(
+    def _execution_profile(self) -> str:
+        return tool_policy.resolve_execution_profile(
             getattr(self._settings, "execution_profile", tool_policy.EXECUTION_STRICT_PROJECT),
             allowed_user_ids=getattr(self._settings, "allowed_user_ids", []),
             require_allowlist=getattr(self._settings, "require_allowlist", True),
         )
+
+    def _bash_policy(self) -> str:
         return tool_policy.effective_bash_policy(
             tool_policy.resolve_bash_policy(getattr(self._settings, "bash_policy", None)),
-            profile,
+            self._execution_profile(),
         )
+
+    def _refuses_non_owner_turn(self, user_id: int) -> bool:
+        """Fail-closed gate for non-owner turns on an unnarrowable provider (#1955).
+
+        ``owner-operator`` binds host-capable execution to exactly one owner,
+        but Matrix also admits ``family_users``. Codex takes approval/sandbox
+        settings per turn, so a non-owner Codex turn is narrowed instead (see
+        :meth:`_codex_approval_policy`). Claude (including the unrestricted
+        path, whose auto-approve allowlist never consults the approval
+        callback), Danso, Piri and Crush run under the process-wide execution
+        profile and cannot be narrowed per turn: on ``owner-operator`` such a
+        turn is refused before any agent run. ``True`` means refuse.
+        """
+
+        if self._check_user_access(user_id):
+            return False
+        if self._active_provider() in _PER_TURN_NARROWABLE_PROVIDERS:
+            return False
+        if self._execution_profile() != tool_policy.EXECUTION_OWNER_OPERATOR:
+            return False
+        logger.info(
+            "Matrix non-owner turn refused: provider=%s profile=%s cannot be narrowed per turn",
+            self._active_provider(),
+            tool_policy.EXECUTION_OWNER_OPERATOR,
+        )
+        return True
+
+    def _is_admitted_sender(self, matrix_user: str) -> bool:
+        """Owner or a configured ``family_users`` member (#1955)."""
+
+        config = self.load_config()
+        if matrix_user == config.get("owner"):
+            return True
+        return matrix_user in (config.get("family_users") or ())
 
     def _make_approval_callback(
         self, sink: TurnSink
@@ -976,15 +1037,18 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         async def approval_callback(
             chat_id: int, user_id: int, event: ApprovalRequestEvent, generation: int
         ) -> ApprovalDecision:
+            # #1955: sender first. Only the owner's turns may be approved —
+            # auto-approve included — so a family member never inherits the
+            # owner-operator grant (fail-closed).
+            if not self._check_user_access(user_id):
+                return ApprovalDecision.DENY
             policy = self._bash_policy()
             if policy == tool_policy.BASH_AUTO_APPROVE:
                 return ApprovalDecision.ALLOW
             if policy != tool_policy.BASH_APPROVE_EACH:
                 return ApprovalDecision.DENY
-            # Same gate as the Telegram route: only the owner may approve, and
-            # only for a turn generation that is still active (fail-closed).
-            if user_id != self._owner_int():
-                return ApprovalDecision.DENY
+            # Same gate as the Telegram route: only for a turn generation that
+            # is still active (fail-closed).
             if not self._project_chat.is_agent_approval_active(user_id, chat_id, generation):
                 return ApprovalDecision.DENY
             try:
@@ -1033,6 +1097,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                     sink=sink,
                     room_id=room_id,
                     turn_marker=str(job.get("event_id") or ""),
+                    room_kind=room_kind,
                 )
             command, args = self._parse_command(body)
             if command == "skills":
@@ -1301,6 +1366,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
     async def _run_message(
         self, body: str, *, user_id: int, chat_id: int, room_id: str, sink: TurnSink, turn_marker: str | None = None
     ) -> Any:
+        if self._refuses_non_owner_turn(user_id):
+            return _turn_result(NON_OWNER_TURN_REFUSED, None)
         key = self._conversation_key(user_id, chat_id)
         session, session_id, new_session, stale_session_id, auto_new_session = (
             await self._resolve_turn_session(key, user_id=user_id, chat_id=chat_id)
@@ -1355,9 +1422,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             session_id=session_id,
             model=session.get("model"),
             effort=session.get("effort"),
-            approval_policy=self._codex_approval_policy(),
-            approvals_reviewer=self._codex_approvals_reviewer(),
-            sandbox_policy=self._codex_sandbox_policy(),
+            approval_policy=self._codex_approval_policy(user_id),
+            approvals_reviewer=self._codex_approvals_reviewer(user_id),
+            sandbox_policy=self._codex_sandbox_policy(user_id),
             new_session=new_session,
             approval_callback=self._make_approval_callback(sink),
             typing_callback=sink.typing,
@@ -1441,13 +1508,20 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         sink: TurnSink,
         room_id: str,
         turn_marker: str | None = None,
+        room_kind: str | None = None,
     ) -> Any:
         try:
             payload = json.loads(body)
         except ValueError:
             payload = None
         kind = payload.get("kind") if isinstance(payload, dict) else None
-        if kind not in (SELF_JOB_DANSO_AUTO_RESUME, SELF_JOB_EXTERNAL_WAIT_RESUME) or not self._check_user_access(user_id):
+        if kind == SELF_JOB_EXTERNAL_WAIT_RESUME and not self._external_wait_job_admitted(
+            payload, user_id=user_id, room_kind=room_kind
+        ):
+            return _turn_result(EXTERNAL_WAIT_RESUME_REFUSED, None)
+        if kind not in (SELF_JOB_DANSO_AUTO_RESUME, SELF_JOB_EXTERNAL_WAIT_RESUME) or (
+            kind == SELF_JOB_DANSO_AUTO_RESUME and not self._check_user_access(user_id)
+        ):
             logger.warning("Matrix self-job ignored: kind=%s", kind)
             return _turn_result("", None, streamed=True)
         if kind == SELF_JOB_EXTERNAL_WAIT_RESUME:
@@ -1468,6 +1542,33 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         # eligible falls back to the ordinary menu.
         await self._offer_danso_recovery(key, user_id, chat_id, auto=True)
         return _turn_result("", None, streamed=True)
+
+    def _external_wait_job_admitted(
+        self, payload: Mapping[str, Any], *, user_id: int, room_kind: str | None
+    ) -> bool:
+        """Whether an external-wait self-job may run as its job sender (#1955).
+
+        The body's ``user_id`` must name the job sender and that sender must
+        still be admitted (owner or ``family_users``). A legacy body without
+        ``user_id`` predates the sender binding and runs only for the owner
+        in a direct room.
+        """
+
+        requested = payload.get("user_id")
+        if requested is None:
+            admitted = self._check_user_access(user_id) and room_kind == "direct"
+        else:
+            sender = self.ids.matrix_id(int(user_id))
+            admitted = (
+                isinstance(requested, int)
+                and not isinstance(requested, bool)
+                and requested == int(user_id)
+                and sender is not None
+                and self._is_admitted_sender(sender)
+            )
+        if not admitted:
+            logger.info("Matrix external-wait self-job refused: requester not matched or not admitted")
+        return admitted
 
     def _danso_recovery_route(self, user_id: int, chat_id: int) -> Any:
         audience = resolve_memory_audience(
@@ -1820,7 +1921,16 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         await self._offer_danso_recovery_if_failed(response, key, user_id, chat_id)
         return result
 
-    def _codex_approval_policy(self) -> str:
+    # #1955: ``user_id`` narrows a non-owner turn — "untrusted" approvals (the
+    # sender-first callback then denies), no auto reviewer, and a workspace
+    # sandbox without network. ``None`` keeps the owner-only callers (Danso
+    # recovery) on the configured policy.
+    def _narrow_for(self, user_id: int | None) -> bool:
+        return user_id is not None and not self._check_user_access(user_id)
+
+    def _codex_approval_policy(self, user_id: int | None = None) -> str:
+        if self._narrow_for(user_id):
+            return "untrusted"
         policy = self._bash_policy()
         if policy == tool_policy.BASH_AUTO_APPROVE:
             return "never"
@@ -1828,10 +1938,14 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return "on-request"
         return "untrusted"
 
-    def _codex_approvals_reviewer(self) -> str | None:
+    def _codex_approvals_reviewer(self, user_id: int | None = None) -> str | None:
+        if self._narrow_for(user_id):
+            return None
         return "auto_review" if self._bash_policy() == tool_policy.BASH_AUTO_REVIEW else None
 
-    def _codex_sandbox_policy(self) -> dict[str, Any] | None:
+    def _codex_sandbox_policy(self, user_id: int | None = None) -> dict[str, Any] | None:
+        if self._narrow_for(user_id):
+            return {"type": "workspaceWrite", "networkAccess": False}
         policy = self._bash_policy()
         if policy == tool_policy.BASH_AUTO_APPROVE:
             return {"type": "dangerFullAccess"}
@@ -1945,6 +2059,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         return reply
 
     async def _cmd_skills(self, *, user_id: int, chat_id: int, room_id: str, sink: TurnSink, turn_marker: str | None = None) -> Any:
+        if self._refuses_non_owner_turn(user_id):
+            return _turn_result(NON_OWNER_TURN_REFUSED, None)
         key = self._conversation_key(user_id, chat_id)
         session = await self._session_manager.get_session(key)
         await self._enqueue_previous_codex_session(
@@ -1955,9 +2071,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             user_id=user_id,
             chat_id=chat_id,
             new_session=True,
-            approval_policy=self._codex_approval_policy(),
-            approvals_reviewer=self._codex_approvals_reviewer(),
-            sandbox_policy=self._codex_sandbox_policy(),
+            approval_policy=self._codex_approval_policy(user_id),
+            approvals_reviewer=self._codex_approvals_reviewer(user_id),
+            sandbox_policy=self._codex_sandbox_policy(user_id),
             approval_callback=self._make_approval_callback(sink),
             typing_callback=sink.typing,
             status_callback=self._make_status_callback(sink),

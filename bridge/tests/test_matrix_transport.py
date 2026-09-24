@@ -439,6 +439,24 @@ class TestConstruction:
         f.store.finish(event, "", None)
         f.store.close()
 
+    def test_enqueue_self_job_admits_a_family_sender_only_in_a_family_room(self, tmp_path: Path) -> None:
+        # #1955: a resumed family wait runs as that family member, never as the
+        # owner — and only where inbound admission would have accepted them.
+        f = MatrixTransport(family_config(tmp_path), FakeRunner())
+        direct = f.c["rooms"][0]
+        with pytest.raises(ValueError, match="sender-not-allowed"):
+            f.enqueue_self_job(direct, '{"kind":"x"}', key="k", sender=DAD)
+        with pytest.raises(ValueError, match="sender-not-allowed"):
+            f.enqueue_self_job(FAMILY, '{"kind":"x"}', key="k", sender="@stranger:test.invalid")
+        event = f.enqueue_self_job(FAMILY, '{"kind":"x"}', key="k", sender=DAD)
+        owner_event = f.enqueue_self_job(FAMILY, '{"kind":"x"}', key="k", sender=f.c["owner"])
+        assert owner_event != event
+        job = f.store.claim()
+        assert job is not None and job["event_id"] == event
+        assert job["sender"] == DAD and job["room_id"] == FAMILY
+        f.store.finish(event, "", None)
+        f.store.close()
+
     def test_enqueue_notice_targets_allowed_rooms_with_unique_keys(self, tmp_path: Path) -> None:
         f = MatrixTransport(config(tmp_path), FakeRunner())
         room = f.c["rooms"][0]

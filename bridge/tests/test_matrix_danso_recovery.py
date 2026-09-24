@@ -180,8 +180,13 @@ async def test_non_owner_cannot_see_or_answer_offers(tmp_path: Path, matrix_conf
     assert len(transport.notices) == 1
     assert (await _turn(bot, "/task_recover", sender=KID)).text.startswith("현재 복구할 작업이 없거나")
     assert len(transport.notices) == 1
-    await _turn(bot, "1", sender=KID)  # falls through to an ordinary message for the kid's own conversation
-    assert chat.calls and chat.calls[-1]["user_message"] == "1"
+    # Falls through to an ordinary message for the kid's own conversation —
+    # which Danso on owner-operator refuses outright (#1955): no agent run.
+    from telegram_bot.core.matrix.bot import NON_OWNER_TURN_REFUSED
+
+    calls_before = len(chat.calls)
+    assert (await _turn(bot, "1", sender=KID)).text == NON_OWNER_TURN_REFUSED
+    assert len(chat.calls) == calls_before
     assert (await _session(bot, manager))[OFFER]["token"]  # owner's offer untouched
 
 
