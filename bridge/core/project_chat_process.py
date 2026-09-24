@@ -1671,6 +1671,150 @@ class ProjectChatProcessMixin:
             streamed=streamed,
         )
 
+    async def _handle_turn_timeout(
+        self,
+        *,
+        key: str,
+        session: Any,
+        session_id: Optional[str],
+        progress_request: Any,
+        streaming_handler: Any,
+    ) -> ChatResponse:
+        """Reply for a whole-turn ``asyncio.wait_for`` timeout (#896 PR4, P8a).
+
+        Pure move of the ``except TimeoutError`` body. ``session`` may be
+        ``None`` when the timeout hit before a session was adopted.
+        """
+        terminal_won = _claim_request_terminal(
+            progress_request,
+            RequestPhase.TIMEOUT,
+            cause="process-timeout",
+        )
+        if terminal_won and session is not None:
+            # Interrupt BEFORE dropping: _drop_agent_session closes the
+            # session, and a closed Claude session ignores interrupt —
+            # the stall paths below already use this order.
+            await self._interrupt_agent_session(session)
+            await self._drop_agent_session(key, session)
+        if terminal_won:
+            await self._cancel_agent_streaming(
+                streaming_handler, context="handling an agent timeout"
+            )
+        message = f"Timed out after {self._process_timeout_seconds}s"
+        return ChatResponse(
+            content=f"⏰ {message}. Please retry or simplify your request.",
+            success=False,
+            error=message,
+            session_id=session.session_id if session is not None else session_id,
+        )
+
+    async def _handle_turn_exception(
+        self,
+        exc: Exception,
+        *,
+        key: str,
+        session: Any,
+        session_id: Optional[str],
+        progress_request: Any,
+        streaming_handler: Any,
+    ) -> ChatResponse:
+        """Reply for any other exception out of the turn (#896 PR4, P8c).
+
+        Pure move of the ``except Exception`` body. ``CancelledError`` never
+        reaches here: the caller's ``except asyncio.CancelledError`` clause
+        stays inline and re-raises, and clause order is unchanged.
+        """
+        terminal_won = _claim_request_terminal(
+            progress_request,
+            RequestPhase.FAILED,
+            cause="runtime-exception",
+        )
+        if terminal_won and session is not None:
+            await self._drop_agent_session(key, session)
+        if terminal_won:
+            await self._cancel_agent_streaming(
+                streaming_handler, context="returning an agent error"
+            )
+        message = str(exc) or "Agent runtime failed"
+        if isinstance(exc, CodexConnectionClosedError):
+            # #1721: a dead or poisoned app-server transport must show
+            # up in /status instead of "Codex: healthy" (the liveness
+            # probe only sees the process, which may still be running).
+            health_reporter.record_agent_error(
+                f"Codex app-server connection failed: {message}"
+            )
+            self._agent_connection_error_reported = True
+        return ChatResponse(
+            content=f"❌ Error: {message}",
+            success=False,
+            error=message,
+            session_id=session.session_id if session is not None else session_id,
+        )
+
+    async def _release_turn(
+        self,
+        *,
+        session: Any,
+        session_id: Optional[str],
+        turn_token: ActiveToken | None,
+        loop: asyncio.AbstractEventLoop,
+        user_id: int,
+        chat_id: int,
+        progress_coordinator: Any,
+        progress_handle: Any,
+        progress_request: Any,
+        resume_authorized: bool,
+        followup_authorized: bool,
+    ) -> None:
+        """The turn's ``finally`` (#896 PR4, P9), moved whole.
+
+        The three nested ``finally`` blocks guarantee "finalize progress even
+        if authorization clear fails; clear the active turn even if finalize
+        fails; deactivate the registry token even if the clear fails". They
+        are moved as one unit so that ordering is untouched. The caller
+        awaits this from its own ``finally``, so ``session`` / ``turn_token``
+        are whatever the turn left on exit — including after an exception
+        between session start and registration.
+        """
+        if followup_authorized and session is not None:
+            session.clear_task_followup_authorization()
+        if resume_authorized:
+            clear_resume = getattr(session, "clear_task_resume_authorization", None)
+            if callable(clear_resume):
+                clear_resume()
+        try:
+            health_reporter.record_delegated_task_activity(
+                id(progress_request),
+                0,
+            )
+        except Exception:
+            pass
+        try:
+            await _finalize_request_progress(
+                coordinator=progress_coordinator,
+                handle=progress_handle,
+                session=session,
+                requested_session_id=session_id,
+            )
+        finally:
+            try:
+                # Offloaded fsync write (#1479); a cancellation landing
+                # here is honoured only after the clear has landed so
+                # the route can never outlive the turn.
+                await _await_offloaded_write(
+                    clear_active_turn,
+                    self._external_wait_home(),
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    session_id=session.session_id if session is not None else None,
+                )
+            finally:
+                if turn_token is not None:
+                    self._agent_session_registry.deactivate_if_same(
+                        turn_token,
+                        touch_at=loop.time(),
+                    )
+
     async def _process_agent_message(  # noqa: C901 -- #348 baseline hotspot
         self,
         *,
@@ -1903,27 +2047,12 @@ class ProjectChatProcessMixin:
                     chat_id=chat_id,
                 )
             except TimeoutError:
-                terminal_won = _claim_request_terminal(
-                    progress_request,
-                    RequestPhase.TIMEOUT,
-                    cause="process-timeout",
-                )
-                if terminal_won and session is not None:
-                    # Interrupt BEFORE dropping: _drop_agent_session closes the
-                    # session, and a closed Claude session ignores interrupt —
-                    # the stall paths below already use this order.
-                    await self._interrupt_agent_session(session)
-                    await self._drop_agent_session(key, session)
-                if terminal_won:
-                    await self._cancel_agent_streaming(
-                        streaming_handler, context="handling an agent timeout"
-                    )
-                message = f"Timed out after {self._process_timeout_seconds}s"
-                return ChatResponse(
-                    content=f"⏰ {message}. Please retry or simplify your request.",
-                    success=False,
-                    error=message,
-                    session_id=session.session_id if session is not None else session_id,
+                return await self._handle_turn_timeout(
+                    key=key,
+                    session=session,
+                    session_id=session_id,
+                    progress_request=progress_request,
+                    streaming_handler=streaming_handler,
                 )
             except asyncio.CancelledError:
                 terminal_won = _claim_request_terminal(
@@ -1939,68 +2068,25 @@ class ProjectChatProcessMixin:
                     )
                 raise
             except Exception as exc:
-                terminal_won = _claim_request_terminal(
-                    progress_request,
-                    RequestPhase.FAILED,
-                    cause="runtime-exception",
-                )
-                if terminal_won and session is not None:
-                    await self._drop_agent_session(key, session)
-                if terminal_won:
-                    await self._cancel_agent_streaming(
-                        streaming_handler, context="returning an agent error"
-                    )
-                message = str(exc) or "Agent runtime failed"
-                if isinstance(exc, CodexConnectionClosedError):
-                    # #1721: a dead or poisoned app-server transport must show
-                    # up in /status instead of "Codex: healthy" (the liveness
-                    # probe only sees the process, which may still be running).
-                    health_reporter.record_agent_error(
-                        f"Codex app-server connection failed: {message}"
-                    )
-                    self._agent_connection_error_reported = True
-                return ChatResponse(
-                    content=f"❌ Error: {message}",
-                    success=False,
-                    error=message,
-                    session_id=session.session_id if session is not None else session_id,
+                return await self._handle_turn_exception(
+                    exc,
+                    key=key,
+                    session=session,
+                    session_id=session_id,
+                    progress_request=progress_request,
+                    streaming_handler=streaming_handler,
                 )
             finally:
-                if followup_authorized and session is not None:
-                    session.clear_task_followup_authorization()
-                if resume_authorized:
-                    clear_resume = getattr(session, "clear_task_resume_authorization", None)
-                    if callable(clear_resume):
-                        clear_resume()
-                try:
-                    health_reporter.record_delegated_task_activity(
-                        id(progress_request),
-                        0,
-                    )
-                except Exception:
-                    pass
-                try:
-                    await _finalize_request_progress(
-                        coordinator=progress_coordinator,
-                        handle=progress_handle,
-                        session=session,
-                        requested_session_id=session_id,
-                    )
-                finally:
-                    try:
-                        # Offloaded fsync write (#1479); a cancellation landing
-                        # here is honoured only after the clear has landed so
-                        # the route can never outlive the turn.
-                        await _await_offloaded_write(
-                            clear_active_turn,
-                            self._external_wait_home(),
-                            user_id=user_id,
-                            chat_id=chat_id,
-                            session_id=session.session_id if session is not None else None,
-                        )
-                    finally:
-                        if turn_token is not None:
-                            self._agent_session_registry.deactivate_if_same(
-                                turn_token,
-                                touch_at=loop.time(),
-                            )
+                await self._release_turn(
+                    session=session,
+                    session_id=session_id,
+                    turn_token=turn_token,
+                    loop=loop,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    progress_coordinator=progress_coordinator,
+                    progress_handle=progress_handle,
+                    progress_request=progress_request,
+                    resume_authorized=resume_authorized,
+                    followup_authorized=followup_authorized,
+                )
