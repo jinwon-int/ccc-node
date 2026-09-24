@@ -1409,6 +1409,44 @@ note "Existing ccc-telegram-bridge systemd unit checked against the canonical re
 # post-checkout hook without our marker is left untouched (never clobbered);
 # a marker hook is updated in place. Warn-only: CCC_MANAGED_CHECKOUT_GUARD=0
 # silences the installed hook.
+#
+# Termux (#1950): Android has no /usr/bin/env, and git exec()s hooks directly
+# (no termux-exec shebang rewrite), so a verbatim `#!/usr/bin/env bash` hook
+# fails with "cannot exec ... No such file or directory". post-checkout's exit
+# status becomes git checkout/switch's, so every successful switch exited 1
+# (breaking self-update's recover_stray_branch) and pre-commit refused every
+# commit without ever running the guard. On Termux the installed copy gets an
+# absolute `#!$PREFIX/bin/bash` first line; the tracked source and the marker
+# line are unchanged, so in-place re-installs and non-Termux nodes are as before.
+IS_TERMUX=0
+[ -n "${TERMUX_VERSION:-}" ] && IS_TERMUX=1
+case "${PREFIX:-}" in */com.termux/*) IS_TERMUX=1 ;; esac
+
+install_guard_hook() { # <src> <dest>
+  local src="$1" dest="$2" tmp first bash_path
+  IFS= read -r first < "$src" || first=""
+  if [ "$IS_TERMUX" != 1 ] || [ "$first" != "#!/usr/bin/env bash" ]; then
+    atomic_install "$src" "$dest"
+    return
+  fi
+  # TERMUX_VERSION alone (no PREFIX) must not resolve to /bin/bash or trip set -u.
+  bash_path="${PREFIX:+$PREFIX/bin/bash}"
+  if [ -z "$bash_path" ] || [ ! -x "$bash_path" ]; then
+    note "WARNING: managed-checkout guard: Termux detected but \$PREFIX/bin/bash is not executable — installing verbatim; git cannot exec a /usr/bin/env shebang here (#1950)"
+    atomic_install "$src" "$dest"
+    return
+  fi
+  tmp="$(mktemp "${dest%/*}/.${dest##*/}.XXXXXX")" \
+    || { echo "ERROR: mktemp failed for $dest" >&2; return 1; }
+  if { printf '#!%s\n' "$bash_path" && tail -n +2 "$src"; } > "$tmp" \
+    && chmod 755 "$tmp" && mv -f "$tmp" "$dest"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  echo "ERROR: atomic install failed: $src -> $dest" >&2
+  return 1
+}
+
 GUARD_SRC="$SRC/scripts/git-hooks/managed-checkout-guard"
 if [ -n "${CCC_SELF_UPDATE_REPO:-}" ]; then
   MANAGED_REPO="$CCC_SELF_UPDATE_REPO"
@@ -1437,7 +1475,7 @@ else
     elif [ "$DRY" = 1 ]; then
       note "would install managed-checkout guard -> $GUARD_HOOK"
     else
-      run atomic_install "$GUARD_SRC" "$GUARD_HOOK"
+      run install_guard_hook "$GUARD_SRC" "$GUARD_HOOK"
       run chmod 755 "$GUARD_HOOK"
       note "managed-checkout guard installed -> $GUARD_HOOK ($guard_name; CCC_MANAGED_CHECKOUT_GUARD=0 disables, =warn keeps pre-commit advisory)"
     fi
@@ -1449,9 +1487,7 @@ fi
 # toolchain killed the daegyo bridge on 2026-08-06 and the prerequisite lived
 # only in prose. Ensure it here so it is a setup-managed property; when the
 # install cannot run, say so loudly with the exact pkg line.
-IS_TERMUX=0
-[ -n "${TERMUX_VERSION:-}" ] && IS_TERMUX=1
-case "${PREFIX:-}" in */com.termux/*) IS_TERMUX=1 ;; esac
+# (IS_TERMUX is computed above, before the managed-checkout guard install.)
 if [ "$IS_TERMUX" = 1 ]; then
   if command -v cargo >/dev/null 2>&1; then
     note "Termux Rust toolchain present ($(cargo --version 2>/dev/null | head -1))"
