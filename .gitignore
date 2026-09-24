@@ -37,3 +37,6 @@ __pycache__/
 
 # Local virtualenvs (accidentally committed in 1d0078a / #1137)
 .venv/
+
+# Stray shell redirect artifact (an empty .err was committed by accident in #1683)
+*.err
