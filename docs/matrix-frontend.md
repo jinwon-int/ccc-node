@@ -121,22 +121,28 @@ for a broken chain). With an identity, `devices` may be `{}`.
 Users without an identity keep the pinned-device rule (`devices`,
 `family_devices`):
 
-- **Owner** — any change to the owner's device *set* or a pinned *key* stops
-  the service (`owner-device-set-changed`, `owner-device-key-changed`) until
-  an operator re-pins. An owner message from a device outside the (unchanged)
+- **Owner** — any change to the owner's device *set* (a new device or a
+  signed-out pinned one) or a pinned *key* stops the service
+  (`owner-device-set-changed`, `owner-device-key-changed`) until an
+  operator re-pins. An owner message from a device outside the (unchanged)
   pinned set is anomalous key material on the operator's own channel and
   also stops the service (`unverified-owner-event`).
-- **Family member** (#1958) — a changed *key* of a pinned family device, or
-  a pinned family device that disappeared, still stops the service
-  (`pinned-device-key-changed`, `pinned-device-missing`). An *extra* unpinned
-  device is expected (a new phone), so a message — text or media — from it
-  is contained to that event: it is never processed, the room gets one
-  notice per device ("등록되지 않은 기기에서 보낸 메시지는 처리하지
-  않습니다 … 운영자에게 기기 등록을 요청해 주세요"; deduplicated through meta
-  `untrusted_senders`), and the sync batch still commits, so the owner's
-  room and every other room keep working and nothing is replayed on
-  restart. In-app verification cannot fix this in pin mode; the operator
-  re-pins the device (or moves the user to `identities`).
+- **Family member** (#1958) — an *extra* unpinned device (a new phone) and a
+  pinned device that is *gone* (signed out or deleted) are both contained:
+  a message — text or media — from such a device is never processed, the
+  room gets one notice per device ("등록되지 않은 기기에서 보낸 메시지는
+  처리하지 않습니다 … 운영자에게 기기 등록을 요청해 주세요"; deduplicated
+  through meta `untrusted_senders`), and the sync batch still commits, so
+  the owner's room and every other room keep working and nothing is
+  replayed on restart. A missing pinned device leaves the trusted set (family
+  room sends stop expecting it) and is listed in meta `family_pins_missing`
+  (logged once per change); it is trusted again if it reappears with its
+  pinned keys. In-app verification cannot fix pin mode; the operator re-pins
+  (or moves the user to `identities`). A pinned family device id that
+  presents *different* keys still stops the service
+  (`pinned-device-key-changed`): clients never re-key a device id (a new
+  login is a new device), so that is key injection by the homeserver — the
+  same one that serves the owner's device list — and needs an operator.
 
 **Re-pinning** (`devices`, `family_devices`, `identities`). The saved policy
 (`meta.policy`) is fail-closed against config edits (`saved-policy-changed`),

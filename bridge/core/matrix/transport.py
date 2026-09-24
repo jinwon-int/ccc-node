@@ -673,19 +673,46 @@ class MatrixTransport:
             self._verify(stored)
         for user in sorted(self.identities):
             self._trust_cross_signed(user, raw)
-        # Family devices are pinned per user. Each user keeps the strict pin
-        # check, while extra unpinned family devices stay merely untrusted and
-        # are handled by exclude_unpinned_devices at session-share time.
+        self._trust_pinned_family()
+
+    def _trust_pinned_family(self) -> None:
+        """Trust exactly the pinned family devices currently present with their pinned keys.
+
+        Family devices are pinned per user. Extra unpinned family devices
+        stay merely untrusted and are handled by exclude_unpinned_devices at
+        session-share time. A pinned family device that is gone (signed out,
+        deleted) is contained the same way (#1958): it leaves the trusted
+        table until it reappears with its pinned keys, so its events get the
+        unpinned-device notice and sends stop expecting it, while the owner
+        room and the rest of the family keep working.
+
+        A pinned device id presenting *different* keys stays fatal: normal
+        clients never re-key a device id (a new login is a new device), so
+        that is homeserver-level key injection — by the same homeserver that
+        serves the owner's device list — and needs an operator.
+        """
+        missing: dict[str, list[str]] = {}
         for user, pins in sorted(self.family_devices.items()):
             if user in self.identities:
                 continue
-            for device, pin in pins.items():
+            present: dict[str, str] = {}
+            for device, pin in sorted(pins.items()):
                 stored = self.client.device_store[user].get(device)
                 if stored is None:
-                    raise SafetyStop("pinned-device-missing")
+                    missing.setdefault(user, []).append(device)
+                    continue
                 if stored.ed25519 != pin["ed25519"] or stored.curve25519 != pin["curve25519"]:
                     raise SafetyStop("pinned-device-key-changed")
                 self._verify(stored)
+                present[device] = pin["curve25519"]
+            self.trusted[user] = present
+        if (self.store.get_meta("family_pins_missing") or {}) != missing:
+            if missing:
+                logger.warning(
+                    "matrix pinned family devices missing (contained): %s",
+                    ", ".join(f"{user}:{'/'.join(devices)}" for user, devices in missing.items()),
+                )
+            self.store.set_meta("family_pins_missing", missing)
 
     def _verify(self, device: Any) -> None:
         """Mark ``device`` verified only when it is not already.

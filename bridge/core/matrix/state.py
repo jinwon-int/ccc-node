@@ -126,7 +126,8 @@ SAFETY_STOP_REASONS: frozenset[str] = frozenset(
         "unexpected-agent-device",
         "published-agent-key-changed",
         "owner-device-key-changed",
-        "pinned-device-missing",
+        # "pinned-device-missing" is gone (#1958): a missing pinned family
+        # device is contained like an unpinned one (owner: set-changed).
         "pinned-device-key-changed",
         "private-room-membership-changed",
         "encrypted-room-required",

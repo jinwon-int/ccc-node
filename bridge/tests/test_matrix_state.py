@@ -690,7 +690,7 @@ def test_every_raised_safety_stop_reason_is_listed() -> None:
     assert raised <= SAFETY_STOP_REASONS, raised - SAFETY_STOP_REASONS
     # `+ key` / `+ str(status)` forms use a listed prefix.
     assert {"invalid-family_rooms", "invalid-family_users", "matrix-http-"} <= SAFETY_STOP_REASONS
-    for legacy in ("worker-cleanup-unconfirmed", "invalid-worker-command", "invalid-remote-mode", "unverified-family-event"):
+    for legacy in ("worker-cleanup-unconfirmed", "invalid-worker-command", "invalid-remote-mode", "unverified-family-event", "pinned-device-missing"):
         assert legacy not in SAFETY_STOP_REASONS
 
 
