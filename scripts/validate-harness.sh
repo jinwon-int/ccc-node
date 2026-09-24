@@ -455,6 +455,16 @@ else
   err "canon node-name scan failed — node identifiers in the canon skill sets"
   tail -20 "$TMP/canon-scan.out" 2>/dev/null
 fi
+# #1451 P4: the same pattern repo-wide, ratcheted against the committed
+# baseline (new files / higher counts fail; lower counts fail until the
+# baseline is regenerated so progress is locked in — never hand-edit it).
+if bash scripts/canon-node-name-scan.sh --repo-wide >"$TMP/canon-scan-repo.out" 2>&1; then
+  say "  ok Repo-wide node-name ratchet — $(sed -n 's/.*matches baseline (\(.*\)).*/\1/p' "$TMP/canon-scan-repo.out")"
+else
+  err "repo-wide node-name ratchet failed — tree differs from scripts/canon-node-name-baseline.txt"
+  tail -20 "$TMP/canon-scan-repo.out" 2>/dev/null
+  printf '  fix: NEW/GREW -> generalize or read from topology config; SHRANK -> bash scripts/canon-node-name-scan.sh --repo-wide --update-baseline\n'
+fi
 if python3 scripts/ccc_memory_timeparse_test.py >"$TMP/timeparse-test.out" 2>&1; then
   say "  ok NL as_of time-reference estimation tests (#871)"
 else
