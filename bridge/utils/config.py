@@ -238,6 +238,15 @@ class Config(
             "owner's direct rooms when the Matrix frontend starts."
         ),
     )
+    grok_matrix_family_rooms: bool = Field(
+        default=False,
+        alias="CCC_GROK_MATRIX_FAMILY_ROOMS",
+        description=(
+            "Grok provider only: also serve the config's family_rooms to the owner and "
+            "family_users (mention-gated by the transport). Every admitted family prompt "
+            "enters the one owner Grok conversation. Off refuses a family config at startup."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_matrix_channel(self):

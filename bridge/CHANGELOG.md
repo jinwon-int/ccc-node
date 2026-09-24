@@ -1,5 +1,13 @@
 # Changelog
 
+- **Grok Matrix frontend can serve family rooms (opt-in).** With
+  `CCC_GROK_MATRIX_FAMILY_ROOMS=1`, `GrokMatrixBot` accepts a config with
+  `family_rooms`/`family_users` and admits mention-gated prompts from the owner
+  and the allowlisted family users in the listed family rooms; the reply goes
+  back to that room. Every admitted prompt still enters the one owner Grok
+  conversation, one turn at a time across rooms, text only. Without the flag a
+  family config is refused at startup exactly as before
+  (`grok_matrix_direct_room_only`). The static denial text is now room-neutral.
 - **Grok multi-row replies are delivered whole.** The Bot answers in several
   transcript rows ("내일 일정 알려줄게", then the list 4-8 s later) and host
   `f7045c4` publishes no end-of-run marker — reply rows carry no `isStreaming`

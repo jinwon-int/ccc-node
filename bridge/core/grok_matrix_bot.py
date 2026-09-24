@@ -41,7 +41,7 @@ UNCERTAIN = (
     "요청 또는 전달 결과를 확정할 수 없습니다. 기록은 보존했습니다. 다시 입력하면 기록과 대조하며, "
     "불확실한 전송은 자동 재전송하지 않습니다."
 )
-NOT_ADMITTED = "이 연결은 지정된 소유자와의 1:1 방에서만 응답합니다."
+NOT_ADMITTED = "이 연결은 지정된 방의 허용된 구성원에게만 응답합니다."
 BANNER = "Grok Matrix 연결을 시작했습니다. " + STATUS_TEXT
 BANNER_KEY = "grok-matrix-startup-banner"
 
@@ -112,12 +112,17 @@ class GrokMatrixBot:
 
             config = load_config(self.config_path())
             # The Grok journal binds exactly one owner conversation. Family
-            # rooms/users would admit other senders into that conversation, so
-            # they are refused before the transport opens (no room gate needed).
-            if config.get("family_rooms") or config.get("family_users"):
+            # rooms/users admit other senders into that conversation, so they
+            # are refused before the transport opens unless the operator opted
+            # in explicitly (CCC_GROK_MATRIX_FAMILY_ROOMS=1).
+            if (config.get("family_rooms") or config.get("family_users")) and not self.family_rooms_enabled:
                 raise ProtocolError("grok_matrix_direct_room_only")
             self._config = config
         return self._config
+
+    @property
+    def family_rooms_enabled(self) -> bool:
+        return bool(getattr(self.settings, "grok_matrix_family_rooms", False))
 
     @property
     def owner(self) -> str:
@@ -269,12 +274,18 @@ class GrokMatrixBot:
     def _admitted(self, job: Mapping[str, Any], room_kind: str) -> bool:
         config = self.load_config()
         event_id = str(job.get("event_id") or "")
-        return bool(
-            self.ready and room_kind == "direct"
-            and job.get("sender") == config["owner"]
-            and job.get("room_id") in (config.get("rooms") or ())
-            and event_id.startswith("$") and not event_id.startswith("$self-")
-        )
+        if not self.ready or not event_id.startswith("$") or event_id.startswith("$self-"):
+            return False
+        sender, room_id = job.get("sender"), job.get("room_id")
+        if room_kind == "direct":
+            return bool(sender == config["owner"] and room_id in (config.get("rooms") or ()))
+        if room_kind == "family" and self.family_rooms_enabled:
+            # The transport's mention gate already required the bot to be
+            # addressed; the sender/room allowlist is re-checked here because
+            # every admitted family prompt enters the owner's one conversation.
+            allowed = {config["owner"], *(config.get("family_users") or ())}
+            return bool(room_id in (config.get("family_rooms") or ()) and sender in allowed)
+        return False
 
     async def _result(self, text: str) -> str:
         binding = self.route.journal.binding
