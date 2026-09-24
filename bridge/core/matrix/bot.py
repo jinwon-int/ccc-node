@@ -991,10 +991,26 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         return _NotificationRoute(self._deliver_notice)
 
     def _supports_formatted(self) -> bool:
+        """Whether the transport offers a direct ``send_formatted``.
+
+        The production :class:`MatrixTransport` deliberately does not (#1957),
+        so this is ``False`` in production and replies, interims and recovery
+        texts all go through the durable outbox, which already renders
+        markdown to ``formatted_body`` at send time. A direct send would
+        bypass what the outbox guarantees: crash-safe idempotent delivery by
+        part, the encrypted-event size budget (#1956) and the quarantine of
+        parts the homeserver rejects. Only test fakes implement it; removing
+        this seam (and its three call sites) is a follow-up.
+        """
         return callable(getattr(self._transport, "send_formatted", None))
 
     async def _send_formatted(self, room_id: str, text: str) -> bool:
-        """Deliver rendered HTML chunks; ``False`` leaves delivery to the plain path."""
+        """Deliver rendered HTML chunks; ``False`` leaves delivery to the plain path.
+
+        Always ``False`` against the real transport (see
+        :meth:`_supports_formatted`): the "plain path" is the outbox, which
+        formats too.
+        """
 
         transport = self._transport
         if transport is None or not self._supports_formatted():

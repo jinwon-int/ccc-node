@@ -185,22 +185,58 @@ TURN_TIMINGS_KEPT = 50  # finished records kept in meta.turn_timings
 FINAL_STATUSES = frozenset({"complete", "error"})
 
 
-def message_content(text: str) -> dict[str, str]:
+NOTICE_PARTS_UNDELIVERED = (
+    "⚠️ 직전 답변 {total}개 조각 중 {failed}개를 Matrix 서버가 거부해 전달하지 못했습니다. "
+    "필요하면 나눠서 다시 요청해 주세요."
+)
+# Bounded, body-free errcode taken from a homeserver error response.
+_ERRCODE_RE = re.compile(r"M_[A-Z0-9_]{1,60}")
+_ERROR_BODY_CAP = 4_096
+
+
+class MatrixHTTPError(SafetyStop):
+    """A non-retryable homeserver response; ``str()`` stays ``matrix-http-<status>``.
+
+    Still a :class:`SafetyStop`, so every caller that does not handle it keeps
+    fail-closing exactly as before (and ``meta.health.reason`` is unchanged).
+    Only the outbox (:meth:`MatrixTransport.send`) looks inside: it downgrades
+    a too-large part to plain text and quarantines other rejected parts.
+    """
+
+    def __init__(self, status: int, errcode: str = "") -> None:
+        super().__init__("matrix-http-" + str(status))
+        self.status = status
+        self.errcode = errcode if _ERRCODE_RE.fullmatch(errcode or "") else ""
+
+    @property
+    def too_large(self) -> bool:
+        return self.status == 413 or self.errcode == "M_TOO_LARGE"
+
+    @property
+    def part_rejected(self) -> bool:
+        """A 4xx that condemns this one event rather than the service.
+
+        401 (token revoked/expired) and 403 (bot no longer allowed in the room)
+        stay fatal: skipping on them would silently discard every later reply
+        while the real fault — credentials or membership, both trust
+        boundaries — goes unnoticed. The service stops and reports
+        ``matrix-http-401/403`` so an operator reconciles it.
+        """
+        return 400 <= self.status < 500 and self.status not in (401, 403)
+
+
+def message_content(text: str) -> dict[str, Any]:
     """``m.text`` content with a Matrix-HTML ``formatted_body`` when the text has markup.
 
     Rendering happens at send time so every outgoing message (replies and
     notices alike) goes through the same escaping renderer; plain text stays
-    a bare ``body``.
+    a bare ``body``. Kept as the transport's name for
+    :func:`~telegram_bot.core.matrix.render.event_content`.
     """
 
-    from telegram_bot.core.matrix.render import render_matrix_message
+    from telegram_bot.core.matrix.render import event_content
 
-    body, formatted = render_matrix_message(text)
-    content = {"msgtype": "m.text", "body": body}
-    if formatted:
-        content["format"] = "org.matrix.custom.html"
-        content["formatted_body"] = formatted
-    return content
+    return event_content(text)
 
 
 # --------------------------------------------------------------------------- #
@@ -311,6 +347,11 @@ class _RoomSink:
         if not isinstance(text, str) or not text.strip():
             return
         bounded_text(text, MAX_REPLY_BYTES)
+        from telegram_bot.core.matrix.render import trim_to_event
+
+        # One event, no chunking: sized for the edit form (text carried twice)
+        # so the same bubble text fits whether it is posted or edited (#1956).
+        text = trim_to_event(text, edit=True)
         async with transport.matrix_lock:
             txn = hashlib.sha256(("status-" + self.tid + ":" + str(time.time_ns())).encode()).hexdigest()
             latest = transport.last_room_event.get(room)
@@ -461,13 +502,29 @@ class MatrixTransport:
             if response.status in (429, 500, 502, 503, 504):
                 raise ConnectionError("matrix-temporary-error")
             if response.status != 200:
-                raise SafetyStop("matrix-http-" + str(response.status))
+                raise MatrixHTTPError(response.status, await self._errcode(response))
             body = bytearray()
             async for chunk in response.content.iter_chunked(65_536):
                 body.extend(chunk)
                 if len(body) > 4_194_304:
                     raise SafetyStop("matrix-response-too-large")
             return json.loads(body)
+
+    @staticmethod
+    async def _errcode(response: Any) -> str:
+        """Best-effort ``errcode`` of an error response (read at most 4 KiB, never logged)."""
+        body = bytearray()
+        try:
+            async for chunk in response.content.iter_chunked(_ERROR_BODY_CAP):
+                body.extend(chunk)
+                if len(body) >= _ERROR_BODY_CAP:
+                    break
+            errcode = json.loads(bytes(body[:_ERROR_BODY_CAP])).get("errcode")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the status alone still classifies the error
+            return ""
+        return errcode if isinstance(errcode, str) and _ERRCODE_RE.fullmatch(errcode) else ""
 
     async def download_media(self, mxc: str, *, max_bytes: int) -> bytes:
         """Authenticated media download (#1795); errors never stop the service."""
@@ -1310,20 +1367,71 @@ class MatrixTransport:
                     await self.pin_devices()
                     if not await self.room_gate(job["room_id"]):
                         continue
-                    # Fence-aware chunking (never splits a ``` block) at the pilot's 12 KB size.
-                    from telegram_bot.core.matrix.render import chunk_text
-
-                    chunks = chunk_text(job["reply"])
-                    for i in range(self.store.delivered_parts(job["event_id"]), len(chunks)):
-                        tx = hashlib.sha256((job["txn_id"] + ":" + str(i)).encode()).hexdigest()
-                        sent = await self.encrypted_send(job["room_id"], chunks[i], tx)
-                        self._remember_text(sent, job["room_id"], self.c["account"], chunks[i])
-                        self.store.mark_part(job["event_id"], i + 1)
-                    self.store.delivered(job["event_id"])
+                    await self._deliver(job)
                     if "done" in self.turn_timing.get(job["event_id"], {}):
                         self.mark(job["event_id"], "delivered")
                         self._finish_timing(job["event_id"])
             await self._idle(self.send_wake)
+
+    async def _deliver(self, job: Mapping[str, Any]) -> None:
+        """Send every undelivered part of one outbox row, then mark it delivered.
+
+        Parts are fence-aware 12 KB pieces re-split until each *encrypted
+        event* fits the PDU limit (``event_chunks``, #1956). A part the
+        homeserver rejects with a non-retryable 4xx (other than 401/403, see
+        :attr:`MatrixHTTPError.part_rejected`) is recorded in
+        ``delivery_failures`` and skipped *durably* — its part index advances
+        in the same transaction — so a restart never replays it and the rows
+        behind it keep flowing. Once the row is done, the room gets one
+        fixed-text notice naming how many parts were lost; a notice about a
+        failed notice is never queued, so this cannot loop.
+        """
+        from telegram_bot.core.matrix.render import event_chunks
+
+        event_id, room = job["event_id"], job["room_id"]
+        chunks = event_chunks(job["reply"])
+        for i in range(self.store.delivered_parts(event_id), len(chunks)):
+            tx = hashlib.sha256((job["txn_id"] + ":" + str(i)).encode()).hexdigest()
+            try:
+                sent = await self._send_part(room, chunks[i], tx)
+            except MatrixHTTPError as exc:
+                if not exc.part_rejected:
+                    raise
+                logger.warning(
+                    "Matrix outbox part rejected status=%s errcode=%s part=%d/%d turn=%s",
+                    exc.status, exc.errcode or "-", i + 1, len(chunks), turn_id(event_id),
+                )
+                self.store.skip_part(event_id, i, exc.status, exc.errcode)
+                continue
+            self._remember_text(sent, room, self.c["account"], chunks[i])
+            self.store.mark_part(event_id, i + 1)
+        failed = self.store.failed_parts(event_id)
+        if failed and not self.store.is_failure_notice(event_id):
+            # Queued before the row is marked delivered: a crash in between
+            # re-queues the same (idempotent) notice instead of losing it.
+            self.store.failure_notice(
+                self.as_request(job),
+                NOTICE_PARTS_UNDELIVERED.format(failed=len(failed), total=len(chunks)),
+            )
+        self.store.delivered(event_id)
+
+    async def _send_part(self, room: str, text: str, txn: str) -> str:
+        """One outbox part; a too-large rejection is retried once as plain text.
+
+        The size model should prevent 413s, but homeservers differ (some also
+        answer ``400 M_TOO_LARGE``). Dropping ``formatted_body`` halves the
+        event. The retry uses its own transaction id: the first attempt was
+        rejected, so no event exists under ``txn`` to deduplicate against.
+        """
+        try:
+            return await self.encrypted_send(room, text, txn)
+        except MatrixHTTPError as exc:
+            if not exc.too_large:
+                raise
+        from telegram_bot.core.matrix.render import event_content
+
+        plain_txn = hashlib.sha256((txn + ":plain").encode()).hexdigest()
+        return await self._encrypted_raw(room, "m.room.message", event_content(text, plain=True), plain_txn)
 
     async def _encrypted_raw(self, room: str, kind: str, content: Mapping[str, Any], txn: str) -> str:
         # nio 0.25.2 room_send ignores incomplete key sharing. Confirm every
@@ -1357,12 +1465,9 @@ class MatrixTransport:
 
     async def encrypted_edit(self, room: str, text: str, replaces: str, txn: str) -> str:
         """m.replace edit of ``replaces``; the bubble keeps its original event id."""
-        new_content = message_content(text)
-        content: dict[str, Any] = dict(new_content)
-        content["body"] = "* " + text
-        content["m.new_content"] = new_content
-        content["m.relates_to"] = {"rel_type": "m.replace", "event_id": replaces}
-        return await self._encrypted_raw(room, "m.room.message", content, txn)
+        from telegram_bot.core.matrix.render import edit_content
+
+        return await self._encrypted_raw(room, "m.room.message", edit_content(text, replaces), txn)
 
     async def redact(self, room: str, event_id: str, tag: str) -> None:
         txn = hashlib.sha256(("redact-" + tag).encode()).hexdigest()

@@ -881,10 +881,18 @@ async def test_status_bubble_edits_in_place_and_redacts(tmp_path: Path) -> None:
         assert repost_edit["m.relates_to"] == {"rel_type": "m.replace", "event_id": "$bubble2"}
         await sink.status(None)  # turn answered: the bubble is redacted
         assert len(redacts) == 2 and "/redact/" in calls[-1][1] and len(sends) == 4
+        # An oversized bubble is cut to fit one event — sized for the edit
+        # form, so its later edits fit too (#1956).
+        from telegram_bot.core.matrix.render import EVENT_BYTE_BUDGET, estimated_event_bytes
+
+        await sink.status("진행 상황 " * 4_000)  # < 64 KiB, far over one edit event
+        big = f.client.encrypt.call_args_list[-1].args[2]["body"]
+        assert big.endswith("…") and big.startswith("진행 상황 ")
+        assert estimated_event_bytes(big, edit=True) <= EVENT_BYTE_BUDGET
         # An inactive turn stays inert.
         f.active = None
         await sink.status("⏳ inert")
-        assert len(sends) == 4 and len(redacts) == 2
+        assert len(sends) == 5 and len(redacts) == 2
 
 
 @pytest.mark.anyio
@@ -1123,6 +1131,179 @@ async def test_outbox_chunks_are_delivered_idempotently_across_failures(tmp_path
         f.room_gate = AsyncMock(return_value=True)
         await h.until(lambda: not f.store.outbox())
         assert len(sent) == 3
+
+
+# --------------------------------------------------------------------------- #
+# Outbox size budget and 4xx quarantine (#1956, #1957)
+# --------------------------------------------------------------------------- #
+
+
+def outbox_ready(f: MatrixTransport) -> None:
+    """Wire a transport whose send path reaches raw() with a shared group session."""
+    room = f.c["rooms"][0]
+    client_mock(f)
+    f.client.olm.outbound_group_sessions = {room: types.SimpleNamespace(users_shared_with={(f.c["owner"], "OWNER")})}
+    f.pin_devices = AsyncMock()
+    f.room_gate = AsyncMock(return_value=True)
+
+
+def sent_bodies(f: MatrixTransport) -> list[dict[str, Any]]:
+    """Plaintext contents handed to encrypt(), in order."""
+    return [c.args[2] for c in f.client.encrypt.call_args_list]
+
+
+@pytest.mark.anyio
+async def test_raw_error_carries_status_and_bounded_errcode(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        responses = [
+            FakeResponse(413, [b'{"errcode":"M_TOO_LARGE","error":"event too large"}']),
+            FakeResponse(400, [b"not json"]),
+            FakeResponse(400, [b'{"errcode":"<script>"}']),
+        ]
+        f.http = types.SimpleNamespace(request=lambda *a, **k: responses.pop(0), close=AsyncMock())
+        with pytest.raises(t.MatrixHTTPError) as info:
+            await f.raw("PUT", "/x", {})
+        assert (info.value.status, info.value.errcode, str(info.value)) == (413, "M_TOO_LARGE", "matrix-http-413")
+        assert info.value.too_large and info.value.part_rejected
+        assert isinstance(info.value, SafetyStop) and stop_reason(info.value) == "matrix-http-413"
+        for _ in range(2):
+            with pytest.raises(t.MatrixHTTPError) as info:
+                await f.raw("PUT", "/x", {})
+            assert info.value.errcode == "" and not info.value.too_large
+    assert t.MatrixHTTPError(400, "M_TOO_LARGE").too_large
+    assert not t.MatrixHTTPError(401).part_rejected and not t.MatrixHTTPError(403).part_rejected
+    assert not t.MatrixHTTPError(302).part_rejected
+
+
+@pytest.mark.anyio
+async def test_rejected_outbox_rows_do_not_stop_service_or_replay(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        outbox_ready(f)
+        paths: list[str] = []
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            paths.append(path)
+            if len(paths) == 1:
+                raise t.MatrixHTTPError(400, "M_BAD_JSON")
+            if len(paths) == 2:
+                raise t.MatrixHTTPError(404)
+            return {"event_id": "$ok" + str(len(paths))}
+
+        f.raw = raw
+        bad = f.enqueue_notice(room, "첫 번째")
+        also_bad = f.enqueue_notice(room, "두 번째")
+        good = f.enqueue_notice(room, "세 번째")
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
+            send = h.start(f.retry(f.send))
+            await h.until(lambda: not f.store.outbox())
+        assert not send.done()  # the service kept running
+        texts = [c["body"] for c in sent_bodies(f)]
+        # Each rejected row got exactly one fixed-text notice; the good row went out.
+        assert texts[:3] == ["첫 번째", "두 번째", "세 번째"]
+        assert sorted(texts[3:]) == sorted([t.NOTICE_PARTS_UNDELIVERED.format(failed=1, total=1)] * 2)
+        assert len(texts) == 5
+        for row in (bad, also_bad):
+            assert [(r["part"], r["status"]) for r in f.store.failed_parts(row)] in ([(0, 400)], [(0, 404)])
+            assert f.store.delivered_parts(row) == 1
+        assert f.store.failed_parts(good) == []
+    # A restart replays nothing: the rejected rows are done, not ready.
+    async with running(tmp_path) as h:
+        f = h.f
+        outbox_ready(f)
+        f.raw = AsyncMock(side_effect=AssertionError("nothing may be replayed"))
+        assert f.store.outbox() == []
+        assert f.store.failed_parts(bad)[0]["errcode"] == "M_BAD_JSON"
+
+
+@pytest.mark.anyio
+async def test_failed_failure_notice_gets_no_further_notice(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        outbox_ready(f)
+        f.raw = AsyncMock(side_effect=t.MatrixHTTPError(400))
+        f.enqueue_notice(f.c["rooms"][0], "거부될 안내")
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
+            h.start(f.retry(f.send))
+            await h.until(lambda: not f.store.outbox())
+            await asyncio.sleep(0.3)  # would loop here if a notice about a notice were queued
+        assert f.raw.await_count == 2  # the row, then its single notice; nothing after
+        assert f.store.outbox() == []
+
+
+@pytest.mark.anyio
+async def test_too_large_part_is_retried_once_as_plain_text(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        outbox_ready(f)
+        txns: list[str] = []
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            txns.append(path.rsplit("/", 1)[1])
+            if len(txns) == 1:
+                raise t.MatrixHTTPError(413, "M_TOO_LARGE")
+            return {"event_id": "$plain"}
+
+        f.raw = raw
+        row = f.enqueue_notice(room, "**굵게** 쓴 답변")
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
+            h.start(f.retry(f.send))
+            await h.until(lambda: not f.store.outbox())
+        first, retry = sent_bodies(f)
+        assert "formatted_body" in first and "formatted_body" not in retry
+        assert retry == {"msgtype": "m.text", "body": "**굵게** 쓴 답변"}
+        assert len(txns) == 2 and txns[0] != txns[1]  # the retry has its own transaction id
+        assert f.store.failed_parts(row) == [] and f.store.delivered_parts(row) == 1
+        assert f.recent_text["$plain"][2] == "**굵게** 쓴 답변"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [401, 403])
+async def test_auth_and_permission_rejections_stay_fatal(tmp_path: Path, status: int) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        outbox_ready(f)
+        f.raw = AsyncMock(side_effect=t.MatrixHTTPError(status, "M_FORBIDDEN"))
+        row = f.enqueue_notice(f.c["rooms"][0], "안내")
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
+            with pytest.raises(SafetyStop, match=f"matrix-http-{status}"):
+                await f.retry(f.send)
+        assert [r["event_id"] for r in f.store.outbox()] == [row]  # kept for after reconciliation
+        assert f.store.failed_parts(row) == []
+
+
+@pytest.mark.anyio
+async def test_long_reply_is_delivered_whole_as_budgeted_parts(tmp_path: Path) -> None:
+    # #1957: a ~70 KiB answer used to die in finish() with ValueError and
+    # reach the room only as a turn-error notice.
+    from telegram_bot.core.matrix.render import EVENT_BYTE_BUDGET, estimated_event_bytes
+
+    answer = "\n\n".join(f"## {i}장\n**요약**: 한국어 보고서 문단 {i}입니다. " * 4 for i in range(300))
+    assert len(answer.encode()) > 70 * 1024
+
+    async def mode_long(sink: Any) -> TurnResult:
+        return TurnResult(answer, "synthetic-session")
+
+    async with running(tmp_path, mode="long") as h:
+        f = h.f
+        h.runner.mode_long = mode_long  # type: ignore[attr-defined]
+        outbox_ready(f)
+        f.raw = AsyncMock(return_value={"event_id": "$part"})
+        await f.input(request(f))
+        h.work()
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
+            h.start(f.retry(f.send))
+            await h.until(lambda: f.raw.await_count > 0 and not f.store.outbox())
+        assert f.store.get_meta("last_turn")["outcome"] == "complete"
+        bodies = [c["body"] for c in sent_bodies(f)]
+        assert len(bodies) > 6
+        assert all(estimated_event_bytes(b) <= EVENT_BYTE_BUDGET for b in bodies)
+        for i in (0, 150, 299):
+            assert sum(b.count(f"## {i}장\n") for b in bodies) == answer.count(f"## {i}장\n")
+        assert NOTICE_TURN_ERROR not in bodies
 
 
 @pytest.mark.anyio
