@@ -4,6 +4,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-24
+
+Release train covering main from `v0.5.0` (2026-07-26) to `c7896c4b`
+(789 commits): Matrix frontend, danso/Codex runtime hardening, skill
+promotion/intake pipeline, self-update activation, and the 2026-09-24
+repository re-evaluation batch (#1528: orphaned-test guard #1968, repo-wide
+node-name ratchet #1969). Notes below are the accumulated `Unreleased`
+entries, newest first.
+
 - **Grok: tool-backed answers arrive whole (#1966).** On host `84a5db0` the
   Bot prefaces a lookup with one short row ("서울 오늘 날씨 잠깐 확인할게.") and
   writes the answer 10 s+ later, so the #1933 quiescence window closed on the
