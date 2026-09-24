@@ -337,6 +337,23 @@ class _TurnSessionSlot:
     turn_token: Any = None
 
 
+@dataclass
+class _TurnAuthorization:
+    """What ``_authorize_turn`` grants for one turn (#896 PR5).
+
+    Mutable on purpose, like ``_TurnSessionSlot``: the inline code flipped
+    ``resume_authorized`` / ``followup_authorized`` as locals at two separate
+    points and the turn's ``finally`` read whatever was current when control
+    left — an exception between the two grants must still release the first.
+    A helper returning both flags at its end could not reproduce that.
+    """
+
+    resume_authorized: bool = False
+    followup_authorized: bool = False
+    # ``session.abort_stalled_turn`` when the session offers one, else None.
+    abort_stalled_turn: Any = None
+
+
 class _TurnCallbacks:
     """The per-turn callbacks handed to consume_turn_stream (#896 PR2).
 
@@ -1815,7 +1832,52 @@ class ProjectChatProcessMixin:
                         touch_at=loop.time(),
                     )
 
-    async def _process_agent_message(  # noqa: C901 -- #348 baseline hotspot
+    def _authorize_turn(
+        self,
+        *,
+        session: Any,
+        dispatch_guard: Callable[[], bool] | None,
+        resume_task: bool,
+        usage_mode: str,
+        authorization: "_TurnAuthorization",
+    ) -> Optional[ChatResponse]:
+        """Bind the recovery guard and Danso authorizations to the session (#896 PR5).
+
+        Move of the pre-stream authorization block (P5). Returns the refusal
+        ``ChatResponse`` when the recovery selection expired or explicit
+        resume is unsupported, else ``None``. The two authorization flags are
+        written into ``authorization`` at the exact points the inline code set
+        its locals, so the caller's ``finally`` (``_release_turn``) still sees a
+        resume authorization that was granted before a later step raised.
+        """
+        authorization.abort_stalled_turn = getattr(session, "abort_stalled_turn", None)
+        if not callable(authorization.abort_stalled_turn):
+            authorization.abort_stalled_turn = None
+        if dispatch_guard is not None:
+            setter = getattr(session, "set_dispatch_guard", None)
+            if not callable(setter) or not dispatch_guard():
+                return ChatResponse(content="Recovery selection expired or unsupported; use /task_recover.", success=False)
+            setter(dispatch_guard)
+        if resume_task:
+            authorize_resume = getattr(session, "authorize_task_resume", None)
+            if not callable(authorize_resume):
+                return ChatResponse(
+                    content="❌ Explicit Danso long-task resume is unavailable for this conversation.",
+                    success=False,
+                    error="danso_task_resume_unavailable",
+                    session_id=session.session_id,
+                )
+            authorize_resume()
+            authorization.resume_authorized = True
+        if (not resume_task and usage_mode == MODE_INTERACTIVE
+                and getattr(self._config, "agent_provider", None) == "danso"):
+            authorize_followup = getattr(session, "authorize_task_followup", None)
+            if callable(authorize_followup):
+                authorize_followup()
+                authorization.followup_authorized = True
+        return None
+
+    async def _process_agent_message(
         self,
         *,
         user_message: str,
@@ -1887,8 +1949,7 @@ class ProjectChatProcessMixin:
             progress_request = progress_handle.request
             session = None
             turn_token: ActiveToken | None = None
-            resume_authorized = False
-            followup_authorized = False
+            authorization = _TurnAuthorization()
             try:
                 # Session construction and the periodic resource guard share
                 # a short critical section inside _acquire_turn_session (#896
@@ -1971,31 +2032,15 @@ class ProjectChatProcessMixin:
                     getattr(self._config, "approval_stall_seconds", 0.0) or 0.0
                 )
 
-                abort_stalled_turn = getattr(session, "abort_stalled_turn", None)
-                if not callable(abort_stalled_turn):
-                    abort_stalled_turn = None
-                if dispatch_guard is not None:
-                    setter = getattr(session, "set_dispatch_guard", None)
-                    if not callable(setter) or not dispatch_guard():
-                        return ChatResponse(content="Recovery selection expired or unsupported; use /task_recover.", success=False)
-                    setter(dispatch_guard)
-                if resume_task:
-                    authorize_resume = getattr(session, "authorize_task_resume", None)
-                    if not callable(authorize_resume):
-                        return ChatResponse(
-                            content="❌ Explicit Danso long-task resume is unavailable for this conversation.",
-                            success=False,
-                            error="danso_task_resume_unavailable",
-                            session_id=session.session_id,
-                        )
-                    authorize_resume()
-                    resume_authorized = True
-                if (not resume_task and usage_mode == MODE_INTERACTIVE
-                        and getattr(self._config, "agent_provider", None) == "danso"):
-                    authorize_followup = getattr(session, "authorize_task_followup", None)
-                    if callable(authorize_followup):
-                        authorize_followup()
-                        followup_authorized = True
+                denied = self._authorize_turn(
+                    session=session,
+                    dispatch_guard=dispatch_guard,
+                    resume_task=resume_task,
+                    usage_mode=usage_mode,
+                    authorization=authorization,
+                )
+                if denied is not None:
+                    return denied
                 turn_message = await advise_turn(
                     user_message, settings=self._config, user_id=user_id, chat_id=chat_id,
                     interactive=(skill_advice_allowed and usage_mode == MODE_INTERACTIVE and not resume_task
@@ -2008,7 +2053,7 @@ class ProjectChatProcessMixin:
                     callbacks=callbacks,
                     turn_state=turn_state,
                     output=output,
-                    abort_stalled_turn=abort_stalled_turn,
+                    abort_stalled_turn=authorization.abort_stalled_turn,
                     admission_grace=admission_grace,
                     approval_grace=approval_grace,
                     stall_grace=stall_grace,
@@ -2087,6 +2132,6 @@ class ProjectChatProcessMixin:
                     progress_coordinator=progress_coordinator,
                     progress_handle=progress_handle,
                     progress_request=progress_request,
-                    resume_authorized=resume_authorized,
-                    followup_authorized=followup_authorized,
+                    resume_authorized=authorization.resume_authorized,
+                    followup_authorized=authorization.followup_authorized,
                 )
