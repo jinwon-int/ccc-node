@@ -142,3 +142,53 @@ async def test_resume_for_danso_and_piri_reports_or_selects_exact_ids(tmp_path: 
     assert (await _turn(bot, "/resume bad id!")).text in {"Usage: /resume <piri-session-id>", "❌ Invalid Piri session id."}
     assert (await _turn(bot, "/resume abc-123")).text == "✅ Piri session selected: abc-123"
     assert (await manager.get_session(key))["session_id"] == "abc-123"
+
+
+# --- #1955: session/config commands are owner-only ------------------------------
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+@pytest.mark.parametrize("profile", ["owner-operator", "strict-project"])
+@pytest.mark.anyio
+async def test_family_member_cannot_list_read_or_switch_sessions(
+    tmp_path: Path, matrix_config: dict[str, Any], provider: str, profile: str
+) -> None:
+    from telegram_bot.core.matrix.bot import NON_OWNER_TURN_REFUSED, OWNER_ONLY_COMMAND
+    from test_matrix_bot import FAMILY_ROOM, KID
+
+    bot, _chat, manager = _bot(tmp_path, agent_provider=provider, bash_policy="auto-approve", execution_profile=profile)
+    chat = SessionProjectChat()
+    bot._project_chat = chat
+    refused = NON_OWNER_TURN_REFUSED if profile == "owner-operator" else OWNER_ONLY_COMMAND
+
+    async def kid(body: str, event_id: str = "$k") -> Any:
+        return await bot.run_turn(
+            _job(body, sender=KID, room=FAMILY_ROOM, event_id=event_id), sink=FakeSink(), session_id=None, room_kind="family"
+        )
+
+    for command in ("/resume", "/resume t1", "/history", "/model", "/model gpt-5-mini", "/effort high", "/usage", "/distill", "/task_recover"):
+        assert (await kid(command)).text == refused, command
+    kid_key = bot._conversation_key(bot.ids.user_id(KID), bot.ids.chat_id(FAMILY_ROOM, KID, direct=False))
+    # Even a planted resume list is never honoured for a non-owner.
+    await manager.patch_session(kid_key, updates={"resume_list": [["s1", "owner session", provider]]})
+    chosen = await kid("1", event_id="$k2")
+    assert "Switched to session" not in chosen.text and "last answer" not in chosen.text
+    session = await manager.get_session(kid_key)
+    assert session.get("session_id") != "s1" and "model" not in session and "effort" not in session
+    if profile == "owner-operator":
+        assert chat.calls == []
+    else:  # the digit fell through to an ordinary (narrowed) turn in the kid's own session
+        assert [call["user_message"] for call in chat.calls] == ["1"]
+        assert chat.calls[0]["session_id"] is None
+
+
+@pytest.mark.anyio
+async def test_family_member_keeps_new_and_stop_off_owner_operator(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    from test_matrix_bot import FAMILY_ROOM, KID
+
+    bot, chat, _manager = _bot(tmp_path, execution_profile="strict-project")
+    for body in ("/new", "/stop"):
+        result = await bot.run_turn(
+            _job(body, sender=KID, room=FAMILY_ROOM), sink=FakeSink(), session_id=None, room_kind="family"
+        )
+        assert not result.text.startswith("🔒"), body

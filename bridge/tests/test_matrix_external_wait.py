@@ -22,6 +22,8 @@ from telegram_bot.core.matrix.bot import SELF_JOB_EXTERNAL_WAIT_RESUME, MatrixBo
 from telegram_bot.core.project_chat_types import ChatResponse
 from test_matrix_bot import (
     DM_ROOM,
+    FAMILY_ROOM,
+    KID,
     OWNER,
     FakeProjectChat,
     FakeSessionManager,
@@ -70,9 +72,11 @@ class SelfJobTransport:
 
     def __init__(self) -> None:
         self.self_jobs: list[tuple[str, str, str]] = []
+        self.senders: list[str | None] = []
 
-    def enqueue_self_job(self, room_id: str, body: str, *, key: str) -> str:
+    def enqueue_self_job(self, room_id: str, body: str, *, key: str, sender: str | None = None) -> str:
         self.self_jobs.append((room_id, body, key))
+        self.senders.append(sender)
         return "$self-" + key
 
 
@@ -128,10 +132,10 @@ async def test_resume_is_enqueued_as_a_durable_self_job_in_the_waiting_room(
     # the resume path resolves against (same seeding as the watchdog test).
     await bot.run_turn(_job("hi"), sink=FakeSink(), session_id=None, room_kind="direct")
     transport.self_jobs.clear()
-    _user_id, chat_id = _owner_ids(bot)
+    user_id, chat_id = _owner_ids(bot)
 
     ok = await bot._enqueue_external_wait_resume(
-        {"chat_id": chat_id, "wait_id": "w-abc"}, "CI finished green; continue with the merge"
+        {"user_id": user_id, "chat_id": chat_id, "wait_id": "w-abc"}, "CI finished green; continue with the merge"
     )
     assert ok is True
     room, body, key = transport.self_jobs[0]
@@ -141,8 +145,10 @@ async def test_resume_is_enqueued_as_a_durable_self_job_in_the_waiting_room(
         "kind": SELF_JOB_EXTERNAL_WAIT_RESUME,
         "v": 1,
         "wait_id": "w-abc",
+        "user_id": user_id,
         "prompt": "CI finished green; continue with the merge",
     }
+    assert transport.senders == [None]  # the owner stays the transport default
 
 
 @pytest.mark.anyio
@@ -150,13 +156,13 @@ async def test_resume_returns_false_without_a_transport_or_room(
     tmp_path: Path, matrix_config: dict[str, Any]
 ) -> None:
     bot, _chat, _manager = _bot(tmp_path)
-    _user_id, chat_id = _owner_ids(bot)
+    user_id, chat_id = _owner_ids(bot)
 
     bot._transport = None
-    assert await bot._enqueue_external_wait_resume({"chat_id": chat_id, "wait_id": "w"}, "p") is False
+    assert await bot._enqueue_external_wait_resume({"user_id": user_id, "chat_id": chat_id, "wait_id": "w"}, "p") is False
 
     bot._transport = SelfJobTransport()
-    assert await bot._enqueue_external_wait_resume({"chat_id": 987654321, "wait_id": "w"}, "p") is False
+    assert await bot._enqueue_external_wait_resume({"user_id": user_id, "chat_id": 987654321, "wait_id": "w"}, "p") is False
 
 
 @pytest.mark.anyio
@@ -215,4 +221,141 @@ async def test_external_wait_self_job_ignores_a_blank_prompt_and_other_kinds(
         _job(other, sender=OWNER, room=DM_ROOM, event_id="$self-b"),
         sink=FakeSink(), session_id=None, room_kind="direct",
     )
+    assert chat.calls == []
+
+
+# --- #1955: the continuation runs as the person who registered the wait ----------
+
+
+def _with_family_room(matrix_config: dict[str, Any]) -> None:
+    matrix_config["rooms"] = [DM_ROOM, FAMILY_ROOM]
+    matrix_config["family_rooms"] = [FAMILY_ROOM]
+    matrix_config["family_users"] = [KID, OWNER]
+
+
+def _kid_ids(bot: MatrixBot) -> tuple[int, int]:
+    return bot.ids.user_id(KID), bot.ids.chat_id(FAMILY_ROOM, KID, direct=False)
+
+
+@pytest.mark.anyio
+async def test_family_room_wait_resumes_as_the_family_member(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    _with_family_room(matrix_config)
+    # strict-project: owner-operator refuses every non-owner turn (#1955).
+    bot, chat, _manager = _bot(tmp_path, bash_policy="auto-approve", execution_profile="strict-project")
+    transport = SelfJobTransport()
+    bot._transport = transport
+    user_id, chat_id = _kid_ids(bot)
+
+    ok = await bot._enqueue_external_wait_resume(
+        {"user_id": user_id, "chat_id": chat_id, "wait_id": "w-kid"}, "CI green; continue"
+    )
+    assert ok is True
+    room, body, _key = transport.self_jobs[0]
+    assert room == FAMILY_ROOM
+    assert transport.senders == [KID]
+    assert json.loads(body)["user_id"] == user_id
+
+    # The transport would store that job with sender KID; running it resumes
+    # with the KID's ids and the narrowed Codex settings, never the owner's.
+    await bot.run_turn(
+        _job(body, sender=KID, room=FAMILY_ROOM, event_id="$self-kid"),
+        sink=FakeSink(), session_id=None, room_kind="family",
+    )
+    assert len(chat.calls) == 1
+    call = chat.calls[0]
+    assert (call["user_id"], call["chat_id"]) == (user_id, chat_id)
+    assert call["user_message"] == "CI green; continue"
+    assert call["approval_policy"] == "untrusted"
+    assert call["sandbox_policy"] == {"type": "workspaceWrite", "networkAccess": False}
+
+
+@pytest.mark.anyio
+async def test_resume_is_refused_for_an_unknown_or_unadmitted_requester(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    _with_family_room(matrix_config)
+    bot, _chat, _manager = _bot(tmp_path)
+    transport = SelfJobTransport()
+    bot._transport = transport
+    kid_user, chat_id = _kid_ids(bot)
+    stranger = bot.ids.user_id("@stranger:example.org")
+
+    for record in (
+        {"chat_id": chat_id, "wait_id": "w"},  # no requester recorded
+        {"user_id": 424242, "chat_id": chat_id, "wait_id": "w"},  # unknown int
+        {"user_id": stranger, "chat_id": chat_id, "wait_id": "w"},  # not family
+    ):
+        assert await bot._enqueue_external_wait_resume(record, "p") is False
+    matrix_config["family_users"] = [OWNER]  # the kid was removed since registering
+    bot._config = None
+    assert await bot._enqueue_external_wait_resume({"user_id": kid_user, "chat_id": chat_id, "wait_id": "w"}, "p") is False
+    assert transport.self_jobs == []
+
+
+@pytest.mark.anyio
+async def test_external_wait_self_job_refuses_a_mismatched_or_legacy_non_owner_job(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    from telegram_bot.core.matrix.bot import EXTERNAL_WAIT_RESUME_REFUSED
+
+    _with_family_room(matrix_config)
+    bot, chat, _manager = _bot(tmp_path, execution_profile="strict-project")
+    owner_user = bot.ids.user_id(OWNER)
+
+    def body(**extra: Any) -> str:
+        return json.dumps({"kind": SELF_JOB_EXTERNAL_WAIT_RESUME, "v": 1, "wait_id": "w", "prompt": "go", **extra})
+
+    cases = [
+        (body(user_id=owner_user), KID, FAMILY_ROOM, "family"),  # body names someone else
+        (body(), KID, FAMILY_ROOM, "family"),  # legacy, non-owner
+        (body(), OWNER, FAMILY_ROOM, "family"),  # legacy, owner outside a direct room
+    ]
+    for index, (text, sender, room, kind) in enumerate(cases):
+        result = await bot.run_turn(
+            _job(text, sender=sender, room=room, event_id=f"$self-{index}"),
+            sink=FakeSink(), session_id=None, room_kind=kind,
+        )
+        assert result.text == EXTERNAL_WAIT_RESUME_REFUSED
+    assert chat.calls == []
+
+
+@pytest.mark.anyio
+async def test_family_resume_on_owner_operator_is_refused_by_the_turn_gate(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    from telegram_bot.core.matrix.bot import NON_OWNER_TURN_REFUSED
+
+    _with_family_room(matrix_config)
+    bot, chat, _manager = _bot(tmp_path, agent_provider="claude", bash_policy="auto-approve")
+    user_id, _chat_id = _kid_ids(bot)
+    text = json.dumps(
+        {"kind": SELF_JOB_EXTERNAL_WAIT_RESUME, "v": 1, "wait_id": "w", "user_id": user_id, "prompt": "go"}
+    )
+    result = await bot.run_turn(
+        _job(text, sender=KID, room=FAMILY_ROOM, event_id="$self-kid"),
+        sink=FakeSink(), session_id=None, room_kind="family",
+    )
+    assert result.text == NON_OWNER_TURN_REFUSED
+    assert chat.calls == []
+
+
+@pytest.mark.anyio
+async def test_family_resume_on_owner_operator_codex_is_refused_too(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    from telegram_bot.core.matrix.bot import NON_OWNER_TURN_REFUSED
+
+    _with_family_room(matrix_config)
+    bot, chat, _manager = _bot(tmp_path, agent_provider="codex", bash_policy="auto-approve")
+    user_id, _chat_id = _kid_ids(bot)
+    text = json.dumps(
+        {"kind": SELF_JOB_EXTERNAL_WAIT_RESUME, "v": 1, "wait_id": "w", "user_id": user_id, "prompt": "go"}
+    )
+    result = await bot.run_turn(
+        _job(text, sender=KID, room=FAMILY_ROOM, event_id="$self-kid"),
+        sink=FakeSink(), session_id=None, room_kind="family",
+    )
+    assert result.text == NON_OWNER_TURN_REFUSED
     assert chat.calls == []

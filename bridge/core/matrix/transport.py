@@ -840,17 +840,25 @@ class MatrixTransport:
         self.wake()
         return event_id
 
-    def enqueue_self_job(self, room_id: str, body: str, *, key: str) -> str:
-        """Queue a turn the frontend runs for the owner in ``room_id`` (#1895 PR-A2).
+    def enqueue_self_job(self, room_id: str, body: str, *, key: str, sender: str | None = None) -> str:
+        """Queue a turn the frontend runs for ``sender`` in ``room_id`` (#1895 PR-A2).
 
-        Only the configured owner's scope and an allowed room: the job then
-        goes through the normal claim → runner.run(sink) → finish path, so the
-        work happens inside the transport's single-turn discipline instead of
-        beside it. Idempotent per ``key``.
+        ``sender`` defaults to the configured owner. A non-owner sender (#1955)
+        must be a ``family_users`` member and the room a family room — the
+        same pairing inbound admission allows. Always an allowed room: the job
+        then goes through the normal claim → runner.run(sink) → finish path, so
+        the work happens inside the transport's single-turn discipline instead
+        of beside it. Idempotent per ``key``.
         """
         if room_id not in self.c["rooms"]:
             raise ValueError("room-not-allowed")
-        event_id = self.store.self_job(room_id, self.c["owner"], body, key=key)
+        if sender is None:
+            sender = self.c["owner"]
+        elif sender != self.c["owner"] and (
+            sender not in self.family_users or room_id not in self.family_rooms
+        ):
+            raise ValueError("sender-not-allowed")
+        event_id = self.store.self_job(room_id, sender, body, key=key)
         self.wake()
         return event_id
 

@@ -175,10 +175,18 @@ async def test_typed_two_and_three_never_call_the_provider(tmp_path: Path, matri
 
 @pytest.mark.anyio
 async def test_non_owner_cannot_see_or_answer_offers(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    from telegram_bot.core.matrix.bot import NON_OWNER_TURN_REFUSED, OWNER_ONLY_COMMAND
+
     bot, chat, manager, transport = await _danso_bot(tmp_path)
     await _turn(bot, "/task_recover")  # owner creates the offer
     assert len(transport.notices) == 1
-    assert (await _turn(bot, "/task_recover", sender=KID)).text.startswith("현재 복구할 작업이 없거나")
+    # owner-operator refuses every non-owner turn before any work (#1955).
+    for body in ("/task_recover", "1"):
+        assert (await _turn(bot, body, sender=KID)).text == NON_OWNER_TURN_REFUSED
+    assert chat.calls == []
+    # Off owner-operator the kid still cannot see or answer the owner's offer.
+    bot._settings.execution_profile = "strict-project"
+    assert (await _turn(bot, "/task_recover", sender=KID)).text == OWNER_ONLY_COMMAND
     assert len(transport.notices) == 1
     await _turn(bot, "1", sender=KID)  # falls through to an ordinary message for the kid's own conversation
     assert chat.calls and chat.calls[-1]["user_message"] == "1"
@@ -333,8 +341,14 @@ async def test_foreign_or_malformed_self_jobs_never_dispatch(tmp_path: Path, mat
     await bot._startup_danso_recovery_scan()
     room, body, key = transport.self_jobs[0]
     kid_job = _job(body, room=room, sender=KID, event_id="$self-" + key)
+    from telegram_bot.core.matrix.bot import NON_OWNER_TURN_REFUSED
+
+    result = await bot.runner.run(kid_job, sink=FakeSink(), session_id=None, room_kind="direct")
+    assert result.text == NON_OWNER_TURN_REFUSED and chat.calls == []  # owner-operator (#1955)
+    bot._settings.execution_profile = "strict-project"
     result = await bot.runner.run(kid_job, sink=FakeSink(), session_id=None, room_kind="direct")
     assert result.streamed is True and chat.calls == []
+    bot._settings.execution_profile = "owner-operator"
     bad = _job('{"kind":"something-else"}', room=room, event_id="$self-other")
     await bot.runner.run(bad, sink=FakeSink(), session_id=None, room_kind="direct")
     assert chat.calls == []
