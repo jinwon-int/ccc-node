@@ -1516,9 +1516,11 @@ async def test_initial_snapshot_sync_is_not_a_timeline_gap(tmp_path: Path) -> No
         assert f.store.token() is None
         await f.process_pending()  # nothing pending: no-op
         f.store.stage_sync(limited)
+        f.leg_failures["receive"] = 2  # an earlier retried /sync (#1820)
         await f.process_pending()  # snapshot sync: must not stop
         assert f.store.token() == "s1"
         assert f.store.get_meta("health")["state"] == "ready"
+        assert f.leg_failures["receive"] == 0 and f.last_sync_at == f.store.get_meta("health")["updated"]
         assert f.client.next_batch is None
         job = f.store.claim()
         assert job is not None and (job["event_id"], job["room_id"]) == ("$family", FAMILY)

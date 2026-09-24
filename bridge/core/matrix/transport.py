@@ -427,6 +427,14 @@ class MatrixTransport:
         self.turn_timing: OrderedDict[str, dict[str, float]] = OrderedDict()
         self._batch: dict[str, float] = {}
         self._origin_ms: int | None = None
+        # Liveness facts for the frontend's health.json (#1820), in memory and
+        # body-free: last committed sync (wall clock), per-leg retry counts and
+        # a safe label of the last retried error, and the outbox head as first
+        # observed by health_signals() (the jobs table carries no timestamps).
+        self.last_sync_at: float | None = None
+        self.leg_failures: dict[str, int] = {"receive": 0, "send": 0}
+        self.leg_error: dict[str, str] = {"receive": "", "send": ""}
+        self._outbox_head: tuple[str, float, int] | None = None  # (event id, first seen, send-failure baseline)
 
     # -- HTTP -----------------------------------------------------------------
 
@@ -1034,7 +1042,9 @@ class MatrixTransport:
             await self._request_room_keys()
             self.store.commit_sync(raw["next_batch"])
             await self._upload_keys_if_needed()
-            self.store.set_meta("health", {"state": "ready", "updated": time.time()})
+            self.last_sync_at = time.time()
+            self.leg_failures["receive"] = 0
+            self.store.set_meta("health", {"state": "ready", "updated": self.last_sync_at})
 
     def admit_event(self, room: str, event: Any) -> Request | None:
         """Admit only decrypted text from allowed senders' verified pinned devices."""
@@ -1435,7 +1445,38 @@ class MatrixTransport:
 
     # -- lifecycle ------------------------------------------------------------
 
-    async def retry(self, operation: Any) -> None:
+    def health_signals(self, now: float | None = None) -> dict[str, Any]:
+        """Body-free liveness snapshot for the frontend's health.json (#1820).
+
+        Read-only apart from remembering when the current outbox head was
+        first seen: ``send_failures`` counts send-leg retries since the head
+        last changed, so one delivered reply clears an earlier failure.
+        """
+
+        now = time.time() if now is None else now
+        pending = [job for job in self.store.outbox() if job["room_id"] not in self.blocked]
+        head_age: float | None = None
+        send_failures = 0
+        if pending:
+            head_id = str(pending[0]["event_id"])
+            if self._outbox_head is None or self._outbox_head[0] != head_id:
+                self._outbox_head = (head_id, now, self.leg_failures["send"])
+            head_age = max(0.0, now - self._outbox_head[1])
+            send_failures = self.leg_failures["send"] - self._outbox_head[2]
+        else:
+            self._outbox_head = None
+        return {
+            "last_sync_at": self.last_sync_at,
+            "sync_age_s": None if self.last_sync_at is None else max(0.0, now - self.last_sync_at),
+            "receive_failures": self.leg_failures["receive"],
+            "receive_error": self.leg_error["receive"],
+            "send_failures": send_failures,
+            "send_error": self.leg_error["send"] if send_failures else "",
+            "outbox_pending": len(pending),
+            "outbox_head_age_s": head_age,
+        }
+
+    async def retry(self, operation: Any, leg: str = "") -> None:
         import aiohttp
 
         delay = 1.0
@@ -1443,15 +1484,18 @@ class MatrixTransport:
             try:
                 await operation()
                 return
-            except (ConnectionError, aiohttp.ClientError, TimeoutError):
+            except (ConnectionError, aiohttp.ClientError, TimeoutError) as exc:
+                if leg:
+                    self.leg_failures[leg] = self.leg_failures.get(leg, 0) + 1
+                    self.leg_error[leg] = retry_label(exc)
                 self.store.set_meta("health", {"state": "network-retry", "updated": time.time()})
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
 
     async def run(self) -> None:
         async with asyncio.TaskGroup() as group:
-            group.create_task(self.retry(self.receive))
-            group.create_task(self.retry(self.send))
+            group.create_task(self.retry(self.receive, leg="receive"))
+            group.create_task(self.retry(self.send, leg="send"))
             group.create_task(self.work())
 
     async def close(self) -> None:
@@ -1464,6 +1508,16 @@ class MatrixTransport:
         if self.http:
             await self.http.close()
         self.store.close()
+
+
+# Static ConnectionError tokens raised by this module; anything else (aiohttp
+# errors can embed hosts or URLs) is reported by exception type name only.
+_SAFE_RETRY_LABELS = frozenset({"matrix-temporary-error", "group-key-share-incomplete"})
+
+
+def retry_label(exc: BaseException) -> str:
+    text = str(exc)
+    return text if text in _SAFE_RETRY_LABELS else type(exc).__name__
 
 
 def stop_reason(exc: BaseException) -> str:
