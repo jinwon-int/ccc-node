@@ -64,6 +64,8 @@ Retired since introduction (function deleted with the legacy direct Claude
 SDK path, #584 slice C-2): `project_chat.py::_create_user_stream`,
 `project_chat.py::_disconnect_stream_state`,
 `project_chat_process.py::process_message` (rewritten below the threshold),
+`project_chat_process.py::_process_agent_message` (#896 series, marker
+removed in PR5 at CC 12),
 `project_chat_reader.py::_reader_loop` (module deleted).
 
 Being retired (#896, 2026-09-24 design comment):
@@ -73,11 +75,11 @@ ruff-mccabe CC with the marker stripped: 100 before the series → 86 after
 PR1 (#1974, `_build_streaming_handler` / `_acquire_turn_session`) → 51 after
 PR2 (#1975, `_make_turn_callbacks` factories / `_run_turn_stream`) → 28 after
 PR3 (#1978, `_resolve_turn_outcome` / `_finish_completed_turn`) → 18 after
-PR4 (`_handle_turn_timeout` / `_handle_turn_exception` / `_release_turn`).
-The marker stays until the danso/dispatch authorization block (P5 in the
-design comment; a slot-style helper so the `finally` still sees the
-authorization flags) brings it under 15; every new helper is under the
-threshold and carries no marker.
+PR4 (#1979, `_handle_turn_timeout` / `_handle_turn_exception` /
+`_release_turn`) → **12** after PR5 (`_authorize_turn` + the
+`_TurnAuthorization` slot, so the `finally` still sees the authorization
+flags). The marker was removed in PR5; every helper introduced by the series
+is under the threshold and carries no marker.
 
 ## Mypy scope
 
