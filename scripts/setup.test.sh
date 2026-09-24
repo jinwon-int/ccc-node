@@ -1181,6 +1181,54 @@ out="$(run_setup_in "$guard_repo" "$dry_home" --dry-run)"
 ok "dry-run reports the guard install without touching .git" \
   'grep -q "would install managed-checkout guard" <<<"$out" && [ ! -e "$GUARD_HOOK" ]'
 
+# #1950: Termux has no /usr/bin/env and git exec()s hooks directly, so a
+# verbatim `#!/usr/bin/env bash` hook fails ("cannot exec") and git switch
+# exits 1. On Termux the installed copy must carry `#!$PREFIX/bin/bash`, with
+# the rest of the file (marker included) byte-identical to the source. The
+# fake prefix matches setup.sh's */com.termux/* detection on any CI host.
+GUARD_SRC_FILE="$guard_repo/scripts/git-hooks/managed-checkout-guard"
+fake_prefix="$TMP/fake/com.termux/files/usr"
+mkdir -p "$fake_prefix/bin"
+ln -sf "$(PATH="$REAL_PATH" command -v bash)" "$fake_prefix/bin/bash"
+for t in stat id; do
+  tp="$(PATH="$REAL_PATH" command -v "$t" || true)"
+  [ -n "$tp" ] && ln -sf "$tp" "$fake_prefix/bin/$t"
+done
+termux_home="$TMP/guard-termux-home"
+out="$(PREFIX="$fake_prefix" TERMUX_VERSION=0.118.3 run_setup_in "$guard_repo" "$termux_home")"
+for gh_name in post-checkout pre-commit; do
+  ok "Termux: $gh_name guard gets an absolute \$PREFIX/bin/bash shebang" \
+    '[ "$(head -1 "$guard_repo/.git/hooks/'"$gh_name"'")" = "#!$fake_prefix/bin/bash" ] && [ -x "$guard_repo/.git/hooks/'"$gh_name"'" ]'
+  ok "Termux: $gh_name guard body and marker are unchanged" \
+    'cmp -s <(tail -n +2 "$GUARD_SRC_FILE") <(tail -n +2 "$guard_repo/.git/hooks/'"$gh_name"'") && grep -q "ccc-node:managed-checkout-guard" "$guard_repo/.git/hooks/'"$gh_name"'"'
+done
+ok "Termux: tracked guard source keeps its portable shebang" \
+  '[ "$(head -1 "$GUARD_SRC_FILE")" = "#!/usr/bin/env bash" ]'
+# The rewritten hook really runs under git: switching to the branch already
+# checked out must exit 0 (it exited 1 before #1950 on a real Termux node).
+ok "Termux: git switch with the installed post-checkout hook exits 0" \
+  '(cd "$guard_repo" && HOME="$termux_home" PATH="$REAL_PATH" git switch -q main)'
+
+# Termux detected but no executable $PREFIX/bin/bash: install verbatim, loudly.
+nobash_prefix="$TMP/fake-nobash/com.termux/files/usr"
+mkdir -p "$nobash_prefix/bin"
+out="$(PREFIX="$nobash_prefix" TERMUX_VERSION=0.118.3 run_setup_in "$guard_repo" "$termux_home")"
+ok "Termux without \$PREFIX/bin/bash warns and installs the guard verbatim" \
+  'grep -q "PREFIX/bin/bash is not executable" <<<"$out" && [ "$(head -1 "$GUARD_HOOK")" = "#!/usr/bin/env bash" ]'
+
+# Non-Termux host: byte-identical install, exactly as before #1950.
+plain_prefix="$TMP/plain-prefix"
+mkdir -p "$plain_prefix/bin"
+out="$(PREFIX="$plain_prefix" TERMUX_VERSION='' run_setup_in "$guard_repo" "$termux_home")"
+ok "non-Termux: guard hooks are installed byte-identical to the source" \
+  'cmp -s "$GUARD_SRC_FILE" "$GUARD_HOOK" && cmp -s "$GUARD_SRC_FILE" "$guard_repo/.git/hooks/pre-commit"'
+
+# TERMUX_VERSION without PREFIX (the #968 Rust cases' env shape): setup must not
+# die on set -u nor resolve the shebang to /bin/bash; it warns and installs verbatim.
+out="$(unset PREFIX; TERMUX_VERSION=0.118 run_setup_in "$guard_repo" "$termux_home")"; rc=$?
+ok "Termux marker without PREFIX: setup succeeds and installs the guard verbatim" \
+  '[ "$rc" = 0 ] && grep -q "PREFIX/bin/bash is not executable" <<<"$out" && cmp -s "$GUARD_SRC_FILE" "$GUARD_HOOK"'
+
 # Checkout owner guard (#1426): setup.sh run as a uid that does not own the
 # source checkout (gongmyoung root-ssh shape) must abort before touching the
 # target. The seam is accepted only under the writable /tmp root, like

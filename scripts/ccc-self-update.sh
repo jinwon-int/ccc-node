@@ -498,8 +498,15 @@ recover_stray_branch() { # <stray-branch>
     git -C "$REPO" update-ref "refs/ccc-stray/$1/$(date -u +%Y%m%dT%H%M%SZ)" "$head_sha" >/dev/null 2>&1 || return 1
     RECOVERY_KIND="unpushed"
   fi
-  git -C "$REPO" checkout -q "$BRANCH" >/dev/null 2>&1 || return 1
-  [ "$(git -C "$REPO" symbolic-ref --short HEAD 2>/dev/null)" = "$BRANCH" ]
+  # #1950: a post-checkout hook's exit status becomes checkout's own, so a
+  # switch that fully completed can still exit nonzero (e.g. Termux, where a
+  # `#!/usr/bin/env` hook cannot even be exec()d). Decide by the resulting
+  # state instead: HEAD must be on $BRANCH with a clean tree. A genuinely
+  # refused checkout (worktree-held branch, conflicts) leaves HEAD where it
+  # was, so it still fails closed below.
+  git -C "$REPO" checkout -q "$BRANCH" >/dev/null 2>&1 || true
+  [ "$(git -C "$REPO" symbolic-ref --short HEAD 2>/dev/null)" = "$BRANCH" ] || return 1
+  [ -z "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]
 }
 
 bridge_service_allowlisted() {

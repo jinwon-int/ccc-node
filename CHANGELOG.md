@@ -4,6 +4,22 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **setup/termux: the managed-checkout guard hooks actually run on Termux.**
+  The installed `post-checkout`/`pre-commit` hooks kept the source's
+  `#!/usr/bin/env bash`, but Android has no `/usr/bin/env` and git exec()s
+  hooks directly, so git failed with `cannot exec … No such file or
+  directory` (#1950). The guard never warned, every commit in the managed
+  checkout was refused without the guard running, and because post-checkout's
+  status becomes checkout's own, even `git switch main` on `main` exited 1.
+  On Termux (`TERMUX_VERSION` or `$PREFIX` under `*/com.termux/*`) setup now
+  installs the hooks with an absolute `#!$PREFIX/bin/bash` first line; the
+  tracked source, the marker, and non-Termux installs are unchanged, and a
+  missing `$PREFIX/bin/bash` warns and installs verbatim.
+  `recover_stray_branch()` in self-update now judges a switch by where HEAD
+  landed (on the branch, clean tree) instead of checkout's exit status, so a
+  failing post-checkout hook no longer turns a completed recovery into a
+  fail-closed stall.
+
 - **self-update: a regular-file `self-update.lock` no longer stalls the node
   silently.** The lock is a `mkdir` directory, but an external script that
   opened the same path with `O_CREAT` + `flock` left a regular file behind and

@@ -811,6 +811,23 @@ ok "kill-switch abort notifies as stalled" 'spool_dedup | grep -qx "SelfUpdate:s
 git -C "$REPO" checkout -q main
 git -C "$REPO" branch -qD switch-off
 
+# (6) #1950: a post-checkout hook that exits nonzero (Termux: a /usr/bin/env
+# hook git cannot exec) makes a COMPLETED switch report failure. Recovery must
+# judge by where HEAD landed, not by checkout's exit status.
+rm -f "$TMP/spool"/*.json
+git -C "$REPO" checkout -q -b hook-fails
+git -C "$REPO" push -q origin hook-fails
+printf '#!%s\nexit 1\n' "$(command -v sh)" > "$REPO/.git/hooks/post-checkout"
+chmod 755 "$REPO/.git/hooks/post-checkout"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "failing post-checkout hook does not defeat stray-branch recovery (rc 0)" '[ "$rc" = 0 ]'
+ok "failing-hook recovery landed on main" '[ "$(git -C "$REPO" symbolic-ref --short HEAD)" = "main" ]'
+ok "failing-hook recovery logged as kind=pushed" \
+  'grep -q "recover reason=wrong-branch from=hook-fails kind=pushed" "$STATE/self-update.log"'
+rm -f "$REPO/.git/hooks/post-checkout"
+git -C "$REPO" checkout -q main
+git -C "$REPO" branch -qD hook-fails
+
 # --- #1081 phase 2: installer re-apply on gen drift --------------------------
 # Plant the real gen-stamp lib + a stub installer in the fixture repo so
 # self-update can recompute stamps and invoke a hermetic --apply.
