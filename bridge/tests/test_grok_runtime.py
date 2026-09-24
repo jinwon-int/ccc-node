@@ -11,7 +11,7 @@ from unittest.mock import patch
 from telegram_bot.core.agent_runtime import SessionRequest
 from runtime_conformance import assert_turn_stream_contract
 from telegram_bot.core.grok_journal import GrokBinding, GrokJournal
-from telegram_bot.core.grok_protocol import HOST_VERSION, ProtocolError, prompt_digest
+from telegram_bot.core.grok_protocol import HOST_VERSION, ProtocolError, prompt_digest, unfinished_preface
 from telegram_bot.core.grok_runtime import GrokRuntime, GrokSession
 
 AGENT = "00000000-0000-4000-8000-000000000001"
@@ -39,6 +39,7 @@ class FakeGrokHost:
         self.extra_replies = 0  # further reply rows the Bot writes, one per later tail read
         self.stamp_rows = False  # add timestampMs so the settle window engages
         self.after_reply = []  # extra rows appended after each reply (foreign input / events)
+        self.extra_reply_after_tails = 0  # tail reads to serve before the first extra row appears (#1966)
 
     def _stamp(self, row):
         if self.stamp_rows:
@@ -52,7 +53,9 @@ class FakeGrokHost:
         if operation == "health":
             return {"ok": True, "isBusy": self.busy, "activeAgentId": self.agent_id, "busyOnlyAwaitingApproval": self.approval}
         if operation == "tail":
-            if self.extra_replies > 0 and self.sends:
+            if self.extra_replies > 0 and self.sends and self.extra_reply_after_tails > 0:
+                self.extra_reply_after_tails -= 1
+            elif self.extra_replies > 0 and self.sends:
                 self.extra_replies -= 1
                 self.rows.append(self._stamp({
                     "id": "extra-" + str(self.extra_replies), "requestId": "request-" + str(len(self.sends)),
@@ -203,6 +206,59 @@ class GrokRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["stage"], "complete")
         self.assertEqual(len(state["reply"]["texts"]), 3)
         self.assertEqual(len(self.host.sends), 1)
+
+    async def test_preface_row_waits_for_the_late_answer(self):
+        # 2026-09-24 09:36 KST (#1966): "서울 오늘 날씨 잠깐 확인할게." then the
+        # weather 10 s+ later; the room received the preface alone.
+        self.host.stamp_rows = True
+        self.host.extra_replies = 1
+        self.host.extra_reply_after_tails = 6  # well past the plain quiescence window
+        with patch.object(GrokSession, "POLL_SECONDS", 0.01), patch.object(GrokSession, "REPLY_SETTLE_SECONDS", 0.03), \
+                patch.object(GrokSession, "REPLY_PREFACE_SETTLE_SECONDS", 3.0):
+            events = await self.collect("잠깐 확인할게")
+        self.assertEqual(events[-2].result["text"], "generated reply 잠깐 확인할게\ncontinued 0")
+        state = self.state()
+        self.assertEqual(state["stage"], "complete")
+        self.assertEqual(len(state["reply"]["texts"]), 2)
+        self.assertEqual(len(self.host.sends), 1)
+
+    async def test_plain_reply_is_not_held_for_late_rows(self):
+        # A complete answer keeps the short window: a row the Bot appends much
+        # later is not waited for (no latency regression from #1966).
+        self.host.stamp_rows = True
+        self.host.extra_replies = 1
+        self.host.extra_reply_after_tails = 40
+        with patch.object(GrokSession, "POLL_SECONDS", 0.01), patch.object(GrokSession, "REPLY_SETTLE_SECONDS", 0.03), \
+                patch.object(GrokSession, "REPLY_PREFACE_SETTLE_SECONDS", 3.0):
+            events = await self.collect("one")
+        self.assertEqual(events[-2].result, {"text": "generated reply one"})
+        self.assertEqual(len(self.state()["reply"]["texts"]), 1)
+        self.assertLess(self.host.calls.count("tail"), 20)
+
+    async def test_preface_without_follow_up_is_delivered_at_the_cap(self):
+        # The Bot never follows up: the preface is delivered once the preface
+        # window closes, never left uncertain.
+        self.host.stamp_rows = True
+        with patch.object(GrokSession, "POLL_SECONDS", 0.01), patch.object(GrokSession, "REPLY_SETTLE_SECONDS", 0.03), \
+                patch.object(GrokSession, "REPLY_PREFACE_SETTLE_SECONDS", 0.2):
+            started = time.monotonic()
+            events = await self.collect("잠깐 확인할게")
+        self.assertEqual(events[-2].result, {"text": "generated reply 잠깐 확인할게"})
+        self.assertEqual(self.state()["stage"], "complete")
+        self.assertGreaterEqual(time.monotonic() - started, 0.2)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_unfinished_preface_heuristic(self):
+        preface = ("서울 오늘 날씨 잠깐 확인할게.", "내일(수) 일정 확인할게.", "내일 일정 알려줄게", "잠깐만", "확인 중...",
+                   "Let me check the weather.", "One moment")
+        complete = ("오늘 서울은 흐린 편이야. 지금 약 21°C.", "응, 맞아.", "고마워!", "내일 일정은 추석 하나야",
+                    "내일은 추석이라 쉬는 날이야. 필요하면 더 알려줄게.", "확인할게.\n오늘은 흐림", "x" * 61, "")
+        for text in preface:
+            self.assertTrue(unfinished_preface((text,)), text)
+        for text in complete:
+            self.assertFalse(unfinished_preface((text,)), text)
+        self.assertFalse(unfinished_preface(("잠깐 확인할게.", "오늘 서울은 흐린 편이야.")))  # last row decides
+        self.assertTrue(unfinished_preface(("첫 답", "잠깐 확인할게.")))
 
     async def test_unstamped_or_old_range_is_delivered_without_waiting(self):
         # No timestamps (and, in production, a range older than the window):
