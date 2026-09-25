@@ -13,6 +13,20 @@ All notable changes to the Claude Code node harness. Dates are KST.
   daegyo for 34 days. The pattern now accepts `codex` or `codex.bin` with any
   options before `exec`; the hermetic test spawns a wrapper-shaped stale
   process and asserts it is swept.
+- **Doctor: warn when the worker model pin needs a newer Claude Code than the
+  node runs (a2a-nexus#2275).** On 2026-09-25 three workers were pinned to
+  `claude-opus-5-5`, which needs Claude Code >= 2.1.280, while both the host
+  CLI and the docker runner image carried older ones; every task got an API
+  400 and the lanes failed silently for a day. `ccc-doctor` now reads only the
+  model keys, runner image and claude-path keys of
+  `/etc/default/a2a-hermes-worker` and compares the pinned models' floors
+  (`scripts/lib/claude-cli-model-floor.json`, sourced from that 400 message)
+  with the host CLI (`A2A_CLAUDE_CODE_BIN` > `CLAUDE_BIN` > PATH, `--version`)
+  and the runner image (build label via `docker image inspect`, else the
+  `-claude-X.Y.Z` tag; a throwaway `docker run --rm --pull=never
+  --network=none` only with `CCC_DOCTOR_RUNNER_CLI_PROBE=1`). An unmet floor is
+  a 경고 with the upgrade/rebuild hint; unknown models, nodes without the env
+  file and docker-less nodes are never warned on.
 - **Telegram: a 409 Conflict right after a transport outage no longer restarts
   the bridge (#1986).** Every `Permanent polling failure (Conflict)` exit on a
   Termux node (11 since 2026-07-21) followed an `Telegram API unreachable`
