@@ -15,6 +15,11 @@ Design / approval boundary (baked in, see ccc-node Fresh-Approval policy):
   which already holds the token) performs delivery.
 - RATE-LIMITED + DEDUPED, and fully best-effort: any delivery failure is logged and never
   crashes the bot. Spool files are retried next cycle until sent, then archived.
+- FAN-OUT (opt-in, ``CCC_PUSH_MIRROR_DIRS``): exactly one process consumes a spool dir.
+  To deliver on a second frontend too, the consumer first copies every pending record into
+  each mirror spool dir (``fan_out_pending``) and only then delivers; the other frontend
+  drains that mirror dir (``CCC_PUSH_CONSUME_SPOOL``). Each dir still has a single
+  consumer, so nothing is sent twice per channel.
 """
 
 import asyncio
@@ -36,6 +41,118 @@ _DEDUP_WINDOW_SECONDS = 300
 _SENT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
+def mirror_dirs_from(settings, *own_dirs: Path) -> List[Path]:
+    """Parse ``push_mirror_dirs`` (``os.pathsep``/comma separated) into mirror spool dirs.
+
+    A mirror equal to one of ``own_dirs`` (the consumed spool, or the dir this
+    process writes into) is dropped: copying a record back into a spool that
+    feeds this consumer would re-queue it forever.
+    """
+    raw = getattr(settings, "push_mirror_dirs", None)
+    if not raw:
+        return []
+    if isinstance(raw, (str, os.PathLike)):
+        parts = re.split(r"[,%s]" % re.escape(os.pathsep), str(raw))
+    else:
+        parts = [str(x) for x in raw]
+    own = set()
+    for o in own_dirs:
+        try:
+            own.add(Path(o).expanduser().resolve())
+        except OSError:
+            own.add(Path(o))
+    dirs: List[Path] = []
+    for part in parts:
+        text = part.strip()
+        if not text:
+            continue
+        d = Path(text).expanduser()
+        try:
+            same = d.resolve() in own
+        except OSError:
+            same = False
+        if same:
+            logger.warning("Push mirror dir %s feeds this consumer; ignoring", d)
+            continue
+        if d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def fan_out(record: Path, raw: str, mirror_dirs: List[Path]) -> bool:
+    """Copy one spool record into every mirror spool dir, idempotently.
+
+    Skips a mirror that already holds the record (pending or in its ``sent/``
+    archive), so a record retried by the consumer is never mirrored twice.
+    The copy is written to a non-``.json`` temp name and renamed into place,
+    so the mirror's consumer never reads a half-written file. Returns False on
+    the first failure; the caller keeps the record and retries next cycle.
+    """
+    for d in mirror_dirs:
+        dest = d / record.name
+        if dest.exists() or (d / "sent" / record.name).exists():
+            continue
+        tmp = d / f".{record.name}.{os.getpid()}.tmp"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(raw, encoding="utf-8")
+            os.replace(tmp, dest)
+        except OSError as e:
+            logger.warning("Push fan-out to %s failed (will retry next cycle): %s", d, e)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return False
+    return True
+
+
+_FANOUT_TMP_STALE_SECONDS = 60 * 60
+
+
+def _sweep_stale_tmp(mirror_dirs: List[Path]) -> None:
+    """Remove fan-out temp files a crash left behind (never read as records)."""
+    cutoff = time.time() - _FANOUT_TMP_STALE_SECONDS
+    for d in mirror_dirs:
+        try:
+            for t in d.glob(".*.tmp"):
+                try:
+                    if t.stat().st_mtime < cutoff:
+                        t.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
+def fan_out_pending(spool_dir: Path, mirror_dirs: List[Path]) -> set:
+    """Mirror every pending record before any delivery; return the names safe to deliver.
+
+    A separate pass, so the mirror's channel is neither throttled by this
+    consumer's rate limit nor stuck behind a record this consumer cannot send.
+    Stops at the first copy failure, preserving order: that record and all later
+    ones are withheld from delivery until a later cycle mirrors them, so no
+    channel gets a notice the other cannot. Malformed / empty records are not
+    mirrored — every consumer archives those without delivering them.
+    """
+    ready: set = set()
+    _sweep_stale_tmp(mirror_dirs)
+    for p in sorted(spool_dir.glob("*.json")):
+        if not p.is_file():
+            continue
+        try:
+            raw = p.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or not (data.get("text") or "").strip():
+            continue
+        if not fan_out(p, raw, mirror_dirs):
+            break
+        ready.add(p.name)
+    return ready
+
+
 class PushNotifier:
     """Polls a spool directory and delivers queued notifications to the owner chat."""
 
@@ -44,12 +161,20 @@ class PushNotifier:
         self.enabled: bool = bool(getattr(self._config, "push_enabled", False))
         # Default mirrors utils.config.push_spool_dir so the notifier is robust to a
         # config object that omits the key (e.g. SimpleNamespace stubs in tests).
-        self.spool_dir: Path = Path(
+        # write_spool_dir is where this process's own writers queue records;
+        # spool_dir is the dir this notifier consumes. They differ only on the
+        # receiving side of a fan-out (CCC_PUSH_CONSUME_SPOOL = a mirror dir).
+        self.write_spool_dir: Path = Path(
             getattr(self._config, "push_spool_dir", None)
             or (Path.home() / ".claude" / "state" / "telegram-spool")
         )
+        consume = getattr(self._config, "push_consume_spool_dir", None)
+        self.spool_dir: Path = Path(consume).expanduser() if consume else self.write_spool_dir
         self.interval: float = float(getattr(self._config, "push_poll_interval", 3.0))
         self.max_per_minute: int = int(getattr(self._config, "push_max_per_minute", 10))
+        self.mirror_dirs: List[Path] = mirror_dirs_from(
+            self._config, self.spool_dir, self.write_spool_dir
+        )
         self._notify_allowed_chats: set = self._load_notify_allowlist()
         self._recent: Dict[str, float] = {}
         self._sent_times: List[float] = []
@@ -115,7 +240,12 @@ class PushNotifier:
             logger.warning("Push notifier cannot create spool dir %s: %s", self.spool_dir, e)
             return
         self._prune_sent(sent_dir)
-        logger.info("Push notifier active → chat %s, spool %s", target, self.spool_dir)
+        logger.info(
+            "Push notifier active → chat %s, spool %s, fan-out %s",
+            target,
+            self.spool_dir,
+            [str(d) for d in self.mirror_dirs] or "none",
+        )
 
         while not stop_event.is_set():
             try:
@@ -128,6 +258,7 @@ class PushNotifier:
                 pass
 
     async def _drain(self, application: Application, target: int, sent_dir: Path) -> None:
+        ready = fan_out_pending(self.spool_dir, self.mirror_dirs) if self.mirror_dirs else None
         for p in sorted(self.spool_dir.glob("*.json")):
             if not p.is_file():
                 continue
@@ -141,6 +272,11 @@ class PushNotifier:
             if not text:
                 self._archive(p, sent_dir)
                 continue
+
+            # Not yet mirrored (copy failed, or it arrived after the fan-out
+            # pass): keep it for the next cycle, preserving order.
+            if ready is not None and p.name not in ready:
+                return
 
             record_target = self._target_for_record(data, target)
             if record_target is None:

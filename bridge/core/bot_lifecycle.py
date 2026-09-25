@@ -1330,7 +1330,8 @@ class BotLifecycleMixin(MemoryDistillMixin):
         """
         logger.error("Health alert [%s]: %s", alert.code, alert.message)
         try:
-            spool_dir = self._push_notifier.spool_dir
+            notifier = self._push_notifier
+            spool_dir = getattr(notifier, "write_spool_dir", None) or notifier.spool_dir
         except AttributeError:
             return
         try:
@@ -1949,6 +1950,11 @@ class BotLifecycleMixin(MemoryDistillMixin):
         probe = HealthProbe(
             project_chat=self._project_chat,
             spool_dir=self._push_notifier.spool_dir,
+            extra_spool_dirs=tuple(
+                d
+                for d in (getattr(self._push_notifier, "write_spool_dir", None),)
+                if d is not None and d != self._push_notifier.spool_dir
+            ),
             thresholds=AlertThresholds(
                 heartbeat_age_factor=float(
                     getattr(settings, "alert_heartbeat_age_factor", 1.0)
@@ -1983,7 +1989,11 @@ class BotLifecycleMixin(MemoryDistillMixin):
                 for alert in fired:
                     logger.warning("Health alert [%s]: %s", alert.code, alert.message)
                     if push_enabled:
-                        write_alert_spool(self._push_notifier.spool_dir, alert)
+                        write_alert_spool(
+                            getattr(self._push_notifier, "write_spool_dir", None)
+                            or self._push_notifier.spool_dir,
+                            alert,
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # detection must never hurt the bridge

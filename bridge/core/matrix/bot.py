@@ -58,6 +58,8 @@ from telegram_bot.core.push_notifier import (
     _DEDUP_WINDOW_SECONDS,
     _SENT_RETENTION_SECONDS,
     PushNotifier,
+    fan_out_pending,
+    mirror_dirs_from,
 )
 from telegram_bot.core.session_scope import storage_key
 from telegram_bot.core.turn_notices import session_start_notice_text, session_start_reason
@@ -250,7 +252,10 @@ class MatrixSpoolNotifier:
     per-service (``CCC_PUSH_ENABLED``): on a node running both frontends
     exactly one process may consume the spool, or every notice is delivered
     twice. Records have no Matrix room of their own, so they land in the
-    owner's direct room, falling back to the family room.
+    owner's direct room, falling back to the family room. To reach Telegram
+    as well, set ``CCC_PUSH_MIRROR_DIRS`` here and point the telegram unit's
+    ``CCC_PUSH_CONSUME_SPOOL`` (not ``CCC_PUSH_SPOOL``, which its own writers
+    keep using) at that mirror dir (see ``push_notifier.fan_out_pending``).
     """
 
     def __init__(self, settings: Any, transport: Any) -> None:
@@ -258,12 +263,15 @@ class MatrixSpoolNotifier:
         # (bot/transport import cycle), so the annotation stays Any here.
         self._transport = transport
         self.enabled: bool = bool(getattr(settings, "push_enabled", False))
-        self.spool_dir = Path(
+        write_dir = Path(
             getattr(settings, "push_spool_dir", None)
             or (Path.home() / ".claude" / "state" / "telegram-spool")
         )
+        consume = getattr(settings, "push_consume_spool_dir", None)
+        self.spool_dir = Path(consume).expanduser() if consume else write_dir
         self.interval: float = float(getattr(settings, "push_poll_interval", 3.0))
         self.max_per_minute: int = int(getattr(settings, "push_max_per_minute", 10))
+        self.mirror_dirs: list[Path] = mirror_dirs_from(settings, self.spool_dir, write_dir)
         self._recent: dict[str, float] = {}
         self._sent_times: list[float] = []
 
@@ -293,7 +301,12 @@ class MatrixSpoolNotifier:
             logger.warning("Matrix spool notifier cannot create spool dir %s: %s", self.spool_dir, e)
             return
         self._prune_sent(sent_dir)
-        logger.info("Matrix spool notifier active → room %s, spool %s", room, self.spool_dir)
+        logger.info(
+            "Matrix spool notifier active → room %s, spool %s, fan-out %s",
+            room,
+            self.spool_dir,
+            [str(d) for d in self.mirror_dirs] or "none",
+        )
         while True:
             try:
                 await self._drain(room, sent_dir)
@@ -302,6 +315,7 @@ class MatrixSpoolNotifier:
             await asyncio.sleep(self.interval)
 
     async def _drain(self, room: str, sent_dir: Path) -> None:
+        ready = fan_out_pending(self.spool_dir, self.mirror_dirs) if self.mirror_dirs else None
         for p in sorted(self.spool_dir.glob("*.json")):
             if not p.is_file():
                 continue
@@ -314,6 +328,8 @@ class MatrixSpoolNotifier:
             if not text:
                 self._archive(p, sent_dir)
                 continue
+            if ready is not None and p.name not in ready:
+                return  # not mirrored yet; keep file, preserve order
             now = time.time()
             key = data.get("dedup") or text
             if key in self._recent and now - self._recent[key] < _DEDUP_WINDOW_SECONDS:

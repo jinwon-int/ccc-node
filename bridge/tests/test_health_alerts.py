@@ -277,6 +277,64 @@ class SpoolTests(unittest.TestCase):
             self.assertEqual(count_spool_backlog(spool), 1)
 
 
+class FanOutSpoolTests(unittest.TestCase):
+    """Receiving side of a push fan-out: consume dir != write dir."""
+
+    def _probe(self, spool, extra=()):
+        handler = SimpleNamespace(
+            foreground_workload_snapshot=lambda now: (0, 0.0),
+            waiting_for_turn_snapshot=lambda: 0,
+            session_resource_snapshot=lambda: {},
+            _process_timeout_seconds=600.0,
+        )
+        return HealthProbe(
+            project_chat=handler,
+            spool_dir=spool,
+            orphan_probe=lambda: [],
+            health_snapshot=lambda: {},
+            extra_spool_dirs=extra,
+        )
+
+    def test_backlog_counts_consume_and_write_dirs_once_each(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            primary, mirror = Path(tmp) / "spool", Path(tmp) / "spool" / "fanout-telegram"
+            mirror.mkdir(parents=True)
+            for i in range(3):
+                (primary / f"p{i}.json").write_text("{}", encoding="utf-8")
+            (mirror / "m.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(self._probe(mirror).collect(1.0).pending_notifications, 1)
+            self.assertEqual(
+                self._probe(mirror, (primary,)).collect(1.0).pending_notifications,
+                4,
+                "a stalled primary consumer must still show up in this probe",
+            )
+            self.assertEqual(
+                self._probe(primary, (primary,)).collect(1.0).pending_notifications, 3
+            )
+
+    def test_init_retry_alert_goes_to_write_spool_not_consume_dir(self):
+        import tempfile
+
+        from telegram_bot.core.bot_lifecycle import BotLifecycleMixin
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_dir, consume_dir = Path(tmp) / "spool", Path(tmp) / "mirror"
+            fake = SimpleNamespace(
+                _push_notifier=SimpleNamespace(
+                    spool_dir=consume_dir, write_spool_dir=write_dir
+                )
+            )
+            BotLifecycleMixin._spool_init_retry_alert(fake, init_retry_loop_alert(3, 30.0))
+            self.assertEqual(len(list(write_dir.glob("*.json"))), 1)
+            self.assertFalse(consume_dir.exists() and list(consume_dir.glob("*.json")))
+            # A stub without write_spool_dir keeps the old behaviour.
+            legacy = SimpleNamespace(_push_notifier=SimpleNamespace(spool_dir=consume_dir))
+            BotLifecycleMixin._spool_init_retry_alert(legacy, init_retry_loop_alert(3, 30.0))
+            self.assertEqual(len(list(consume_dir.glob("*.json"))), 1)
+
+
 class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_collects_all_signal_groups_from_synthetic_state(self):
         import tempfile
