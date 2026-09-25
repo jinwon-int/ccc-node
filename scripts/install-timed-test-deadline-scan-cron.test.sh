@@ -63,6 +63,11 @@ ok "cron line carries no literal owner/repo pair" '! grep -qE "\-\-repo [A-Za-z0
 ok "cron line requests nonzero exit on findings" 'grep -qF -- "--exit-nonzero-on-findings" "$FAKE_CRON"'
 ok "cron line pins an explicit mode" 'grep -qF -- "--mode \"expired\"" "$FAKE_CRON"'
 
+# Owner notice (#1870 잔여 2번): findings that only reach the cron log went
+# unread (ccc-node#1913, 2026-09-25), so the default line asks the scanner to
+# spool a high-confidence owner notice, rendered explicitly.
+ok "cron line notifies the owner at high confidence by default" 'grep -qF -- "--notify \"high\"" "$FAKE_CRON"'
+
 # The installer must not create the operator-owned allowlist.
 ok "installer does not create the repo allowlist" '[ ! -e "$CCC_CLAUDE_DIR/timed-test-deadline-scan.repos" ]'
 
@@ -100,14 +105,35 @@ ok "unknown mode exits 2" '[ "$rc" = 2 ]'
 ok "unknown mode is named in the error" 'printf "%s" "$out" | grep -q "unknown --mode"'
 ok "unknown mode leaves the crontab untouched" '[ "$(cat "$FAKE_CRON")" = "$before" ]'
 
+# --notify is selectable (off restores log-only) and lands in the rendered line
+bash "$INSTALLER" --apply --notify off >/dev/null 2>&1
+ok "notify off applied" 'grep -qF -- "--notify \"off\"" "$FAKE_CRON"'
+ok "notify off still single line" '[ "$(marker_count)" = 1 ]'
+CCC_TIMED_TEST_SCAN_NOTIFY=low bash "$INSTALLER" --apply >/dev/null 2>&1
+ok "notify level env override applied" 'grep -qF -- "--notify \"low\"" "$FAKE_CRON"'
+
+# an unknown notify level is rejected before touching the crontab
+# shellcheck disable=SC2034  # before is read via eval inside ok()
+before="$(cat "$FAKE_CRON")"
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
+out="$(bash "$INSTALLER" --apply --notify loud 2>&1)"; rc=$?
+ok "unknown notify exits 2" '[ "$rc" = 2 ]'
+ok "unknown notify is named in the error" 'printf "%s" "$out" | grep -q "unknown --notify"'
+ok "unknown notify leaves the crontab untouched" '[ "$(cat "$FAKE_CRON")" = "$before" ]'
+
 # install record (#1081 phase 2): replay material for self-update
 bash "$INSTALLER" --apply --schedule "5 * * * *" --mode expired >/dev/null 2>&1
 # shellcheck disable=SC2034  # REC is read via eval inside ok()
 REC="$CCC_CLAUDE_DIR/state/install-timed-test-deadline-scan-cron.json"
 ok "apply writes an install record" '[ -f "$REC" ]'
 ok "record carries schema/marker/gen" 'jq -e ".schema==\"ccc.install-record.v1\" and .marker==\"# ccc-node:timed-test-deadline-scan\" and .gen==\"$want_gen\"" "$REC" >/dev/null'
-ok "record argv materializes schedule and mode" 'jq -e ".argv == [\"--apply\",\"--schedule\",\"5 * * * *\",\"--mode\",\"expired\"]" "$REC" >/dev/null'
+ok "record argv materializes schedule, mode and notify" 'jq -e ".argv == [\"--apply\",\"--schedule\",\"5 * * * *\",\"--mode\",\"expired\",\"--notify\",\"high\"]" "$REC" >/dev/null'
 ok "record is owner-only" '[ "$(stat -c %a "$REC")" = 600 ]'
+
+# A record written before --notify existed replays (self-update step 5) with
+# the old argv; the installer default must then turn the notice on.
+bash "$INSTALLER" --apply --schedule "5 * * * *" --mode expired >/dev/null 2>&1
+ok "pre-notify replay argv renders the high default" 'grep -qF -- "--notify \"high\"" "$FAKE_CRON"'
 
 # a pre-existing unrelated cron line is preserved
 printf '0 4 * * * echo keepme\n' >> "$FAKE_CRON"

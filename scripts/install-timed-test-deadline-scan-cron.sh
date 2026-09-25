@@ -25,6 +25,17 @@
 # installs this itself. The managed entry carries a `gen=h_<sha256:12>` stamp
 # (#1081) so ccc-doctor can tell when it was rendered by older code.
 #
+# OWNER NOTICE (#1870 잔여 2번): the rendered line passes `--notify high`, so a
+# high-confidence finding is also queued as a short owner-only notice in the
+# bridge push spool (~/.claude/state/telegram-spool) — the same channel
+# agent-cron, ccc-self-update.sh and ccc-pr-status-poll.sh use. Until then the
+# findings only reached the cron log, and on 2026-09-25 that log caught
+# ccc-node#1913 expired-unjudged with nobody reading it. The scanner dedups an
+# unchanged finding set (reminder every 3 days). `--notify off` restores the
+# log-only behaviour. An install record written before this option existed
+# carries no --notify in its argv, so a self-update replay renders the new
+# default (high).
+#
 # The cron entry runs through `bash -lc` so the login profile PATH is loaded;
 # the scanner shells out to `gh`, which a bare cron PATH (especially on Termux,
 # which has no /usr/bin) would not resolve.
@@ -37,6 +48,7 @@ STATE_DIR="${CCC_STATE_DIR:-$CLAUDE_DIR/state}"
 SCAN_CMD="${CCC_TIMED_TEST_SCAN_CMD:-$SELF_DIR/timed_test_deadline_scan.py}"
 REPOS="${CCC_TIMED_TEST_SCAN_REPOS:-$CLAUDE_DIR/timed-test-deadline-scan.repos}"
 MODE="${CCC_TIMED_TEST_SCAN_MODE:-expired}"
+NOTIFY="${CCC_TIMED_TEST_SCAN_NOTIFY:-high}"
 # 09:20 KST daily: late enough that an overnight deadline has actually passed,
 # early enough that a finding still has a working day attached to it.
 SCHEDULE="${CCC_TIMED_TEST_SCAN_CRON:-20 9 * * *}"
@@ -66,6 +78,7 @@ usage() {
   cat <<EOF
 Usage: install-timed-test-deadline-scan-cron.sh [--dry-run|--apply] [--remove]
                                                 [--schedule SPEC] [--mode MODE]
+                                                [--notify LEVEL]
 
 Installs (or removes) a crontab entry that runs timed_test_deadline_scan.py so
 a timed test whose KST end datetime has passed gets noticed, instead of only
@@ -88,10 +101,12 @@ Options:
   --remove         Remove the managed entry (with --apply) instead of adding it.
   --schedule SPEC  Cron schedule (5 fields). Default: "$SCHEDULE".
   --mode MODE      Scan mode: expired (default) or relative.
+  --notify LEVEL   Owner notice via the bridge push spool for findings at this
+                   confidence or above: high (default), low, or off (log only).
 
 Env overrides: CCC_CLAUDE_DIR, CCC_STATE_DIR, CCC_TIMED_TEST_SCAN_CMD,
-CCC_TIMED_TEST_SCAN_REPOS, CCC_TIMED_TEST_SCAN_MODE, CCC_TIMED_TEST_SCAN_CRON,
-CCC_TIMED_TEST_SCAN_CRON_LOG, CCC_CRONTAB_CMD.
+CCC_TIMED_TEST_SCAN_REPOS, CCC_TIMED_TEST_SCAN_MODE, CCC_TIMED_TEST_SCAN_NOTIFY,
+CCC_TIMED_TEST_SCAN_CRON, CCC_TIMED_TEST_SCAN_CRON_LOG, CCC_CRONTAB_CMD.
 EOF
 }
 
@@ -102,6 +117,7 @@ while [ $# -gt 0 ]; do
     --remove) REMOVE=1 ;;
     --schedule) ccc_cron_need_val "$1" "${2:-}"; SCHEDULE="$2"; shift ;;
     --mode) ccc_cron_need_val "$1" "${2:-}"; MODE="$2"; shift ;;
+    --notify) ccc_cron_need_val "$1" "${2:-}"; NOTIFY="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -112,11 +128,16 @@ case "$MODE" in
   expired|relative) ;;
   *) echo "unknown --mode: $MODE (expected expired or relative)" >&2; exit 2 ;;
 esac
+case "$NOTIFY" in
+  off|high|low) ;;
+  *) echo "unknown --notify: $NOTIFY (expected off, high or low)" >&2; exit 2 ;;
+esac
 
 # --exit-nonzero-on-findings is intentional: it lets ccc-doctor and any future
 # notification lane branch on the exit code without parsing the report. Exit 1
-# means findings, 3 means the repo list is missing or empty.
-CRON_LINE="$SCHEDULE bash -lc 'python3 \"$SCAN_CMD\" --repos-file \"$REPOS\" --mode \"$MODE\" --exit-nonzero-on-findings' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
+# means findings, 3 means the repo list is missing or empty. --notify is
+# rendered explicitly even at its default so the crontab line says what it does.
+CRON_LINE="$SCHEDULE bash -lc 'python3 \"$SCAN_CMD\" --repos-file \"$REPOS\" --mode \"$MODE\" --notify \"$NOTIFY\" --exit-nonzero-on-findings' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
 
 if [ "$APPLY" = 1 ] && [ "$REMOVE" != 1 ]; then
   # Same redirect-first failure mode as install-memory-refresh-cron.sh: the
@@ -131,4 +152,4 @@ ccc_cron_installer_finish \
   --crontab "$CRONTAB" --state-dir "$STATE_DIR" --self "$SELF" --gen "$GEN" \
   --apply "$APPLY" --remove "$REMOVE" --schedule-desc "$SCHEDULE" \
   --body "$CRON_LINE" -- \
-  --apply --schedule "$SCHEDULE" --mode "$MODE"
+  --apply --schedule "$SCHEDULE" --mode "$MODE" --notify "$NOTIFY"

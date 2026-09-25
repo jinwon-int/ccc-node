@@ -11,13 +11,17 @@ Run standalone: python3 scripts/timed_test_deadline_scan_test.py
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import io
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -447,6 +451,244 @@ class CliTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(code, 0)
+
+
+_BOOKING = "검증 종료 예정: 2026-09-17 07:32 KST"
+_BOOKED_AT = "2026-09-16T22:23:42Z"
+
+
+def _high(number: int, title: str = "example", url: str | None = None) -> dict:
+    issue = _issue(number=number, title=title, comments=[_comment(_BOOKING, _BOOKED_AT)])
+    if url is not None:
+        issue["url"] = url
+    return issue
+
+
+def _low(number: int = 1528) -> dict:
+    # Roadmap row quoting another issue's deadline: demoted to low confidence.
+    return _issue(
+        number=number,
+        comments=[_comment("| [#1353](x) | 예정 종료 2026-09-14 21:41 KST |", "2026-09-13T00:00:00Z")],
+    )
+
+
+class NotifyTests(unittest.TestCase):
+    """Owner notice via the bridge push spool (#1870 잔여 2번).
+
+    On 2026-09-25 the installed cron caught ccc-node#1913 expired-unjudged and
+    only wrote it to a log nobody reads. These pin the notice path: it fires on
+    high findings, stays quiet on demoted ones, does not repeat itself daily,
+    stays short and redacted, lands owner-only (0600) in the spool the bridge
+    already drains, and can never change the scan's exit code.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.state = self.home / ".claude" / "state"
+        self.spool = self.state / "telegram-spool"
+        env = {key: value for key, value in os.environ.items() if not key.startswith("CCC_")}
+        env.update({"HOME": str(self.home), "CCC_NODE": "testnode"})
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _run(self, issues: list[dict], now: str, *extra: str) -> tuple[int, str]:
+        path = self.root / "issues.jsonl"
+        path.write_text(
+            "".join(json.dumps(issue, ensure_ascii=False) + "\n" for issue in issues),
+            encoding="utf-8",
+        )
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = scanner.main(
+                ["--input", str(path), "--now", now, "--exit-nonzero-on-findings", *extra]
+            )
+        return code, err.getvalue()
+
+    def _spooled(self) -> list[dict]:
+        if not self.spool.is_dir():
+            return []
+        return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(self.spool.glob("*.json"))]
+
+    def test_high_finding_is_spooled_owner_only(self) -> None:
+        code, err = self._run([_high(1913, title="관측 종료 판정 대기")], "2026-09-21T01:52", "--notify", "high")
+        self.assertEqual(code, 1)
+        self.assertIn("reason=new", err)
+        records = self._spooled()
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        # The PushNotifier contract: {ts, event, node, text, dedup}; no chatId,
+        # so the bridge can only deliver it to the resolved owner chat.
+        self.assertEqual(set(record), {"ts", "event", "node", "text", "dedup"})
+        self.assertEqual(record["event"], "TimedTestDeadlineScan")
+        self.assertEqual(record["node"], "testnode")
+        self.assertEqual(record["ts"], "2026-09-20T16:52:00Z")
+        self.assertTrue(record["dedup"].startswith("TimedTestDeadlineScan:expired:new:"))
+        text = record["text"]
+        self.assertIn("기한 경과 미판정 1건", text)
+        self.assertIn("jinwon-int/ccc-node#1913 · 종료 2026-09-17 07:32 KST · 경과 3일", text)
+        self.assertIn("관측 종료 판정 대기", text)
+        self.assertIn("https://github.com/jinwon-int/ccc-node/issues/1913", text)
+
+    def test_spool_and_state_are_0600_under_home_state_dir(self) -> None:
+        self._run([_high(1913)], "2026-09-21T01:52", "--notify", "high")
+        files = list(self.spool.iterdir())
+        self.assertEqual(len(files), 1, files)  # no .tmp leftovers either
+        self.assertRegex(files[0].name, r"^2026-09-20T16-52-00Z-TimedTestDeadlineScan-\d+-[0-9a-f]{8}\.json$")
+        self.assertEqual(stat.S_IMODE(files[0].stat().st_mode), 0o600)
+        state = self.state / "timed-test-deadline-scan.notify-expired.json"
+        self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o600)
+        saved = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(saved["fingerprints"], ["jinwon-int/ccc-node#1913@2026-09-17T07:32"])
+        self.assertEqual(saved["notified_at"], "2026-09-21T01:52")
+
+    def test_state_dir_and_spool_env_overrides_are_honoured(self) -> None:
+        custom_state = self.root / "state"
+        custom_spool = self.root / "spool"
+        with mock.patch.dict(
+            os.environ, {"CCC_STATE_DIR": str(custom_state), "CCC_PUSH_SPOOL": str(custom_spool)}
+        ):
+            self._run([_high(1913)], "2026-09-21T01:52", "--notify", "high")
+        self.assertEqual(len(list(custom_spool.glob("*.json"))), 1)
+        self.assertTrue((custom_state / "timed-test-deadline-scan.notify-expired.json").is_file())
+        self.assertFalse(self.spool.exists())
+
+    def test_low_only_findings_stay_quiet_at_high(self) -> None:
+        code, err = self._run([_low()], "2026-09-21T01:52", "--notify", "high")
+        self.assertEqual(code, 1)  # still a finding for the log and the exit code
+        self.assertEqual(self._spooled(), [])
+        self.assertIn("nothing at level=high", err)
+
+    def test_low_level_includes_demoted_findings(self) -> None:
+        self._run([_low()], "2026-09-21T01:52", "--notify", "low")
+        self.assertEqual(len(self._spooled()), 1)
+
+    def test_notify_is_off_unless_asked(self) -> None:
+        code, err = self._run([_high(1913)], "2026-09-21T01:52")
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        self.assertFalse(self.spool.exists())
+        self.assertFalse(self.state.exists())
+
+    def test_env_sets_the_default_level_and_flag_wins(self) -> None:
+        with mock.patch.dict(os.environ, {"CCC_TIMED_TEST_SCAN_NOTIFY": "high"}):
+            self._run([_high(1913)], "2026-09-21T01:52")
+            self.assertEqual(len(self._spooled()), 1)
+            self._run([_high(1914)], "2026-09-21T01:52", "--notify", "off")
+            self.assertEqual(len(self._spooled()), 1)
+
+    def test_bogus_env_level_warns_and_stays_off(self) -> None:
+        with mock.patch.dict(os.environ, {"CCC_TIMED_TEST_SCAN_NOTIFY": "loud"}):
+            code, err = self._run([_high(1913)], "2026-09-21T01:52")
+        self.assertEqual(code, 1)
+        self.assertIn("ignoring CCC_TIMED_TEST_SCAN_NOTIFY", err)
+        self.assertEqual(self._spooled(), [])
+
+    def test_unchanged_set_is_not_resent_until_the_reminder(self) -> None:
+        issues = [_high(1913)]
+        self._run(issues, "2026-09-21T09:20", "--notify", "high")
+        code, err = self._run(issues, "2026-09-22T09:20", "--notify", "high")
+        self.assertEqual(code, 1)
+        self.assertIn("unchanged set of 1", err)
+        self._run(issues, "2026-09-23T09:20", "--notify", "high")
+        self.assertEqual(len(self._spooled()), 1)
+        # Three calendar days later, even if cron starts a little earlier.
+        self._run(issues, "2026-09-24T09:19", "--notify", "high")
+        records = self._spooled()
+        self.assertEqual(len(records), 2)
+        reminder = next(r for r in records if ":reminder:" in r["dedup"])
+        self.assertIn("3일+ 미해소 재알림", reminder["text"])
+        # The reminder restarts the clock.
+        self._run(issues, "2026-09-25T09:20", "--notify", "high")
+        self.assertEqual(len(self._spooled()), 2)
+
+    def test_new_finding_notifies_immediately_and_is_marked(self) -> None:
+        self._run([_high(1913)], "2026-09-21T09:20", "--notify", "high")
+        self._run([_high(1913), _high(1999)], "2026-09-22T09:20", "--notify", "high")
+        records = self._spooled()
+        self.assertEqual(len(records), 2)
+        latest = next(r for r in records if "미판정 2건 (신규 1건)" in r["text"])
+        self.assertIn("🆕 jinwon-int/ccc-node#1999", latest["text"])
+        self.assertIn("• jinwon-int/ccc-node#1913", latest["text"])
+
+    def test_resolved_then_returning_finding_counts_as_new(self) -> None:
+        self._run([_high(1913), _high(1999)], "2026-09-21T09:20", "--notify", "high")
+        self._run([_high(1913)], "2026-09-22T09:20", "--notify", "high")  # 1999 judged
+        self.assertEqual(len(self._spooled()), 1)
+        self._run([_high(1913), _high(1999)], "2026-09-23T09:20", "--notify", "high")
+        self.assertEqual(len(self._spooled()), 2)
+
+    def test_clean_scan_clears_state_so_the_next_finding_notifies(self) -> None:
+        self._run([_high(1913)], "2026-09-21T09:20", "--notify", "high")
+        self._run([_issue(body="시한부 테스트 없음")], "2026-09-22T09:20", "--notify", "high")
+        self._run([_high(1913)], "2026-09-23T09:20", "--notify", "high")
+        self.assertEqual(len(self._spooled()), 2)
+
+    def test_message_is_capped_short_and_redacted(self) -> None:
+        redaction_probe_title = "토큰 누출 ghp_" + "A" * 36 + " 그리고 아주 긴 제목이 계속해서 이어집니다 " * 3
+        issues = [_high(2000 + i, title=f"제목 {i}") for i in range(12)]
+        issues.append(_high(2100, title=redaction_probe_title, url="https://evil.example/phish"))
+        self._run(issues, "2026-09-21T01:52", "--notify", "high")
+        (record,) = self._spooled()
+        text = record["text"]
+        lines = text.splitlines()
+        self.assertTrue(lines[0].startswith("⏰ 시한부 테스트 기한 경과 미판정 13건"))
+        finding_lines = [line for line in lines if line.startswith(("🆕 ", "• "))]
+        self.assertEqual(len(finding_lines), 10)
+        self.assertIn("외 3건", lines)
+        # No body/paragraph excerpt ever reaches the notice.
+        self.assertNotIn("검증 종료 예정", text)
+        self.assertNotIn("ghp_", text)
+        self.assertNotIn("evil.example", text)
+        for line in lines:
+            if line.startswith("  ") and not line.startswith("  https://"):
+                self.assertLessEqual(len(line.strip()), scanner.NOTIFY_TITLE_CHARS)
+
+    def test_capped_list_keeps_the_new_findings_visible(self) -> None:
+        old = [_high(3000 + i) for i in range(12)]
+        self._run(old, "2026-09-21T09:20", "--notify", "high")
+        self._run([*old, _high(3999)], "2026-09-22T09:20", "--notify", "high")
+        latest = next(r for r in self._spooled() if "미판정 13건 (신규 1건)" in r["text"])
+        self.assertIn("🆕 jinwon-int/ccc-node#3999", latest["text"])
+
+    def test_notify_failure_never_masks_the_scan_result(self) -> None:
+        blocker = self.root / "not-a-dir"
+        blocker.write_text("x", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CCC_PUSH_SPOOL": str(blocker / "spool")}):
+            code, err = self._run([_high(1913)], "2026-09-21T01:52", "--notify", "high")
+        self.assertEqual(code, 1)
+        self.assertIn("notify failed (scan result unaffected)", err)
+        # State is only advanced after a successful spool write, so the next
+        # run retries instead of believing it already told the owner.
+        self.assertFalse((self.state / "timed-test-deadline-scan.notify-expired.json").exists())
+        self._run([_high(1913)], "2026-09-21T01:53", "--notify", "high")
+        self.assertEqual(len(self._spooled()), 1)
+
+    def test_clean_scan_exit_code_is_untouched_by_notify(self) -> None:
+        code, _ = self._run([_issue(body="시한부 테스트 없음")], "2026-09-21T01:52", "--notify", "low")
+        self.assertEqual(code, 0)
+        self.assertEqual(self._spooled(), [])
+
+    def test_corrupt_state_fails_toward_notifying(self) -> None:
+        self.state.mkdir(parents=True)
+        (self.state / "timed-test-deadline-scan.notify-expired.json").write_text("{nope", encoding="utf-8")
+        self._run([_high(1913)], "2026-09-21T01:52", "--notify", "high")
+        self.assertEqual(len(self._spooled()), 1)
+
+    def test_relative_mode_uses_its_own_state_and_wording(self) -> None:
+        issue = _issue(
+            number=104,
+            comments=[_comment("**잔여**: 며칠 관찰 후 완전 삭제 별도 승인", "2026-09-17T05:29:33Z")],
+        )
+        self._run([issue], "2026-09-21T01:52", "--mode", "relative", "--notify", "high")
+        (record,) = self._spooled()
+        self.assertIn("절대 종료시각 없음 1건", record["text"])
+        self.assertIn("jinwon-int/ccc-node#104 · 절대시각 없음", record["text"])
+        self.assertTrue((self.state / "timed-test-deadline-scan.notify-relative.json").is_file())
 
 
 if __name__ == "__main__":
