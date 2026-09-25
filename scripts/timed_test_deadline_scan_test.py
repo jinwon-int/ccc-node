@@ -629,9 +629,9 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(len(self._spooled()), 2)
 
     def test_message_is_capped_short_and_redacted(self) -> None:
-        secret_title = "토큰 누출 ghp_" + "A" * 36 + " 그리고 아주 긴 제목이 계속해서 이어집니다 " * 3
+        redaction_probe_title = "토큰 누출 ghp_" + "A" * 36 + " 그리고 아주 긴 제목이 계속해서 이어집니다 " * 3
         issues = [_high(2000 + i, title=f"제목 {i}") for i in range(12)]
-        issues.append(_high(2100, title=secret_title, url="https://evil.example/phish"))
+        issues.append(_high(2100, title=redaction_probe_title, url="https://evil.example/phish"))
         self._run(issues, "2026-09-21T01:52", "--notify", "high")
         (record,) = self._spooled()
         text = record["text"]
