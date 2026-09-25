@@ -20,6 +20,7 @@ import datetime as _dt
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 from pathlib import Path
@@ -28,7 +29,10 @@ from typing import Any, Callable, Mapping
 RUNNER = Callable[[list[str], float], "subprocess.CompletedProcess[bytes]"]
 
 COLLECT_TIMEOUTS = {"locate": 10.0, "service": 25.0, "scheduler": 25.0}
-DEFAULT_REMOTE_PATH = "/opt/ccc-node/scripts/ccc-node-status.py"
+# Where the fleet installs ccc-node, probed on the peer in this order (#1990):
+# root-run VPS nodes at /opt or /root, Termux nodes under $HOME.
+REMOTE_CHECKOUT_CANDIDATES = ("/opt/ccc-node", "/root/ccc-node", "$HOME/ccc-node")
+REMOTE_SCRIPT = "scripts/ccc-node-status.py"
 SSH_TIMEOUT = 45.0
 _MAX_OUTPUT_BYTES = 1_000_000
 
@@ -202,6 +206,34 @@ def collect_local(
     }
 
 
+def remote_command(remote_path: str | None = None) -> str:
+    """Shell snippet run on the peer: locate ccc-node-status.py, then exec it.
+
+    Nodes install ccc-node in different places (/opt/ccc-node on root-run
+    VPS nodes, $HOME/ccc-node on Termux), so a single fixed remote path can
+    never serve a mixed fleet (#1990). ``remote_path`` (from
+    ``CCC_NODE_STATUS_REMOTE_PATH``) is tried first when given; then the fleet
+    checkout candidates in order. ``$HOME`` is left for the peer's shell to
+    expand. No CLI flags are passed: the script without ``--node`` reports
+    the node it runs on.
+    """
+
+    candidates: list[str] = []
+    if remote_path:
+        candidates.append(shlex.quote(remote_path))
+    for root in REMOTE_CHECKOUT_CANDIDATES:
+        if root.startswith("$HOME/"):
+            candidates.append(f'"$HOME"/{shlex.quote(root[len("$HOME/"):])}/{REMOTE_SCRIPT}')
+        else:
+            candidates.append(shlex.quote(f"{root}/{REMOTE_SCRIPT}"))
+    searched = ", ".join(REMOTE_CHECKOUT_CANDIDATES)
+    return (
+        f"for s in {' '.join(candidates)}; do "
+        f'[ -f "$s" ] && exec python3 "$s"; done; '
+        f"echo {shlex.quote(f'ccc-node-status: {REMOTE_SCRIPT} not found under {searched}')} >&2; exit 127"
+    )
+
+
 def collect_remote(
     node: str,
     *,
@@ -213,7 +245,7 @@ def collect_remote(
     environment = os.environ if env is None else env
     if not node or any(ch in node for ch in " \t;\n&|`$"):
         raise NodeStatusError("invalid_node", "node must be an ssh host alias", node=node)
-    remote_path = str(environment.get("CCC_NODE_STATUS_REMOTE_PATH", "")).strip() or DEFAULT_REMOTE_PATH
+    remote_path = str(environment.get("CCC_NODE_STATUS_REMOTE_PATH", "")).strip() or None
     ssh_cmd = str(environment.get("CCC_NODE_STATUS_SSH", "")).strip()
     cmd = [
         *(ssh_cmd.split() or ["ssh"]),
@@ -223,7 +255,7 @@ def collect_remote(
         "ConnectTimeout=10",
         "--",
         node,
-        f"python3 {remote_path} --local",
+        remote_command(remote_path),
     ]
     observed_at = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:

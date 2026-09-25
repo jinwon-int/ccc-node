@@ -66,9 +66,12 @@ alongside `family-skills`; tool pattern `mcp__family-ops__*` pre-allowed in
 contexts as `family-skills`.
 
 Remote aggregation preconditions: passwordless `ssh <alias>` to a peer that
-runs this repo (default remote path `/opt/ccc-node/scripts/ccc-node-status.py`,
-override `CCC_NODE_STATUS_REMOTE_PATH`); the ssh command itself can be
-overridden via `CCC_NODE_STATUS_SSH`. A failed or unreachable peer is
+runs this repo. The peer's checkout is probed on the peer side —
+`CCC_NODE_STATUS_REMOTE_PATH` first when set, then `/opt/ccc-node`,
+`/root/ccc-node`, `$HOME/ccc-node` (`scripts/ccc-node-status.py` under each);
+a peer with none of them reports `exit 127` with the searched roots in
+`stderr_tail`. The ssh command itself can be overridden via
+`CCC_NODE_STATUS_SSH`. A failed or unreachable peer is
 node-scoped `unknown` — other nodes are unaffected. Host aliases are
 validated (no shell metacharacters) and run with `BatchMode` +
 `ConnectTimeout`.

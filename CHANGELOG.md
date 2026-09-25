@@ -31,6 +31,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   one `telegram_init_recovered` notice when initialize() next succeeds.
   `health.json` now reports the real consecutive-failure count instead of 1.
 
+- **`node_status` remote collection works again and finds the peer's checkout
+  (#1990).** The ssh invocation passed `--local`, a flag the peer CLI never
+  had, so every remote call — even against an `/opt/ccc-node` peer — came back
+  `unknown, exit 2`; and the single `/opt/ccc-node` path could not serve
+  Termux (`$HOME/ccc-node`) or `/root/ccc-node` peers. The peer now probes
+  `CCC_NODE_STATUS_REMOTE_PATH` (when set), `/opt/ccc-node`, `/root/ccc-node`
+  and `$HOME/ccc-node` and execs the first `scripts/ccc-node-status.py` it
+  finds, with no flags.
+
 ## [0.6.0] — 2026-09-24
 
 Release train covering main from `v0.5.0` (2026-07-26) to `c7896c4b`
