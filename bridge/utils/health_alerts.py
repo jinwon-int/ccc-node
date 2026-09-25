@@ -288,6 +288,21 @@ class HealthProbe:
     orphan_probe: Any = None  # () -> list[int]; defaults to the read-only reaper scan
     health_snapshot: Any = None  # () -> dict; defaults to health_reporter.snapshot
     thresholds: AlertThresholds = field(default_factory=AlertThresholds)
+    # Other spool dirs whose backlog also counts — on the receiving side of a
+    # push fan-out, the primary spool this process writes into (the consumer
+    # of that dir is another process with no probe of its own).
+    extra_spool_dirs: tuple = ()
+
+    def _pending_notifications(self) -> int:
+        seen: set = set()
+        total = 0
+        for d in (self.spool_dir, *self.extra_spool_dirs):
+            key = str(Path(d))
+            if key in seen:
+                continue
+            seen.add(key)
+            total += count_spool_backlog(Path(d))
+        return total
 
     def collect(self, now: float) -> HealthSignals:
         try:
@@ -353,7 +368,7 @@ class HealthProbe:
             waiting_for_turn=max(0, waiting_for_turn),
             oldest_request_age_seconds=float(oldest_age),
             request_lifetime_seconds=lifetime,
-            pending_notifications=count_spool_backlog(self.spool_dir),
+            pending_notifications=self._pending_notifications(),
             dropped_notifications=dropped,
             orphan_children=len(orphans),
             resident_sessions=max(0, int(resources.get("resident_sessions", 0))),

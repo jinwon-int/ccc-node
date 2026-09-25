@@ -854,6 +854,24 @@ class Config(
         alias="CCC_PUSH_POLL_INTERVAL",
         description="Seconds between spool drains.",
     )
+    push_consume_spool_dir: Optional[Path] = Field(
+        default=None,
+        alias="CCC_PUSH_CONSUME_SPOOL",
+        description=(
+            "Dir the push notifier drains, when it differs from CCC_PUSH_SPOOL (the dir "
+            "this process's own writers queue into). Set it to the other frontend's "
+            "CCC_PUSH_MIRROR_DIRS entry to receive a fan-out. Unset = CCC_PUSH_SPOOL."
+        ),
+    )
+    push_mirror_dirs: str = Field(
+        default="",
+        alias="CCC_PUSH_MIRROR_DIRS",
+        description=(
+            "Fan-out: extra spool dirs (os.pathsep/comma separated) that this consumer "
+            "copies every record into before delivering it, so another frontend can "
+            "consume them as its own spool. Empty (default) = no fan-out."
+        ),
+    )
     push_max_per_minute: int = Field(
         default=10,
         alias="CCC_PUSH_MAX_PER_MINUTE",
@@ -936,6 +954,14 @@ class Config(
             "fail-closed deny. Never widens beyond that single file."
         ),
     )
+
+    @field_validator("push_consume_spool_dir", mode="before")
+    @classmethod
+    def parse_push_consume_spool_dir(cls, v):
+        # An empty env value means "unset", never Path("") (== the CWD).
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        return v
 
     @field_validator("push_enabled", mode="before")
     @classmethod

@@ -198,6 +198,80 @@ class DrainTests(unittest.TestCase):
             self.assertTrue((sent / "bad.json").exists())
 
 
+class FanOutTests(unittest.TestCase):
+    def _write(self, spool, name, text):
+        d = {"ts": "T", "event": "AgentCronRun", "node": "vps7", "text": text}
+        (spool / name).write_text(json.dumps(d), encoding="utf-8")
+
+    def test_consume_dir_is_drained_while_writers_keep_push_spool(self):
+        cfg = _cfg(push_spool_dir="/tmp/w-spool", push_consume_spool_dir="/tmp/r-spool")
+        n = PushNotifier(cfg)
+        self.assertEqual(n.spool_dir, Path("/tmp/r-spool"))
+        self.assertEqual(n.write_spool_dir, Path("/tmp/w-spool"))
+        n2 = PushNotifier(_cfg(push_spool_dir="/tmp/w-spool"))
+        self.assertEqual(n2.spool_dir, n2.write_spool_dir)
+
+    def test_mirror_back_into_write_spool_is_ignored(self):
+        with TemporaryDirectory() as td:
+            w, r = Path(td) / "w", Path(td) / "r"
+            n = PushNotifier(
+                _cfg(push_spool_dir=str(w), push_consume_spool_dir=str(r), push_mirror_dirs=str(w))
+            )
+            self.assertEqual(n.mirror_dirs, [], "a loop back into the primary spool")
+
+    def test_telegram_primary_mirrors_then_sends(self):
+        with TemporaryDirectory() as td, patch.object(pn, "config", _cfg()):
+            spool = Path(td) / "spool"
+            mirror = Path(td) / "mirror"
+            sent = spool / "sent"
+            sent.mkdir(parents=True)
+            self._write(spool, "a.json", "laptop ONLINE")
+            n = PushNotifier(_cfg(push_spool_dir=str(spool), push_mirror_dirs=str(mirror)))
+            app = SimpleNamespace(bot=AsyncMock())
+            asyncio.run(n._drain(app, 7, sent))
+            app.bot.send_message.assert_awaited_once()
+            self.assertTrue((mirror / "a.json").exists())
+            self.assertTrue((sent / "a.json").exists())
+
+    def test_mirror_failure_blocks_send_and_keeps_file(self):
+        with TemporaryDirectory() as td, patch.object(pn, "config", _cfg()):
+            spool = Path(td) / "spool"
+            sent = spool / "sent"
+            sent.mkdir(parents=True)
+            blocker = Path(td) / "file"
+            blocker.write_text("x", encoding="utf-8")
+            self._write(spool, "a.json", "x")
+            n = PushNotifier(
+                _cfg(push_spool_dir=str(spool), push_mirror_dirs=str(blocker / "m"))
+            )
+            app = SimpleNamespace(bot=AsyncMock())
+            asyncio.run(n._drain(app, 7, sent))
+            app.bot.send_message.assert_not_called()
+            self.assertTrue((spool / "a.json").exists())
+
+
+class ConfigFanOutFieldTests(unittest.TestCase):
+    def test_env_parsing(self):
+        from telegram_bot.utils.config import Config
+
+        with TemporaryDirectory() as td:
+            env = {
+                "PROJECT_ROOT": td,
+                "TELEGRAM_BOT_TOKEN": "123456:dummy",
+                "CCC_BOT_ENV_FILE": str(Path(td) / "none.env"),
+                "CCC_PUSH_MIRROR_DIRS": "/a/m1:/a/m2",
+                "CCC_PUSH_CONSUME_SPOOL": "/a/in",
+            }
+            c = Config.load(project_root=td, environ=env)
+            self.assertEqual(c.push_mirror_dirs, "/a/m1:/a/m2")
+            self.assertEqual(c.push_consume_spool_dir, Path("/a/in"))
+            env["CCC_PUSH_CONSUME_SPOOL"] = "  "
+            env.pop("CCC_PUSH_MIRROR_DIRS")
+            c2 = Config.load(project_root=td, environ=env)
+            self.assertIsNone(c2.push_consume_spool_dir, "blank env is unset, never Path('')")
+            self.assertEqual(c2.push_mirror_dirs, "")
+
+
 class FormatTests(unittest.TestCase):
     def test_format_includes_event_node_text(self):
         out = PushNotifier._format(

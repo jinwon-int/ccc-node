@@ -74,6 +74,33 @@ override on each unit (`Environment=CCC_PUSH_ENABLED=true` on the matrix
 unit, `=false` on the telegram unit) so exactly one process consumes the
 spool; real environment beats the shared `.env`.
 
+To deliver every record on **both** frontends, keep one consumer per dir
+and fan out instead of sharing the spool:
+
+| Unit | Environment |
+|---|---|
+| matrix | `CCC_PUSH_ENABLED=true`, `CCC_PUSH_MIRROR_DIRS=~/.claude/state/telegram-spool/fanout-telegram` |
+| telegram | `CCC_PUSH_ENABLED=true`, `CCC_PUSH_CONSUME_SPOOL=~/.claude/state/telegram-spool/fanout-telegram` |
+
+Each drain cycle the matrix notifier first copies every pending record
+into the mirror dir (temp file + rename, skipped if the mirror already
+holds it or archived it in `sent/`), then delivers. A record whose copy
+failed is withheld from Matrix too and retried, so neither channel gets a
+notice the other cannot; Matrix's own rate limit or send failures do not
+hold back the copies. The telegram notifier drains only the mirror dir.
+Both processes' own writers (health alerts, owner notices) still write to
+`CCC_PUSH_SPOOL`, so they too reach both channels, and the telegram
+health probe counts the backlog of both dirs. A mirror dir that points
+back at the consumer's own spool is ignored. Dedup and rate limits stay
+per channel.
+
+Caveats: Telegram delivery depends on the matrix unit being up (it is the
+only process reading the primary spool). Records naming an allowlisted
+Telegram `chatId` (agent-cron group delivery) reach that group through the
+mirror again, while Matrix still posts them to the owner room. A record
+the matrix side keeps failing to send for longer than the 7-day `sent/`
+retention can be mirrored a second time.
+
 `turn_timeout_minutes` (optional, default 360 — 6 h —, allowed 5–360) caps one
 running turn; a timed-out turn still resolves uncertain exactly as
 before — only the ceiling moves. Set it to 360 (6 h) for genuinely long
