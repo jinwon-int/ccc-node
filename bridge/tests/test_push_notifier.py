@@ -200,7 +200,7 @@ class DrainTests(unittest.TestCase):
 
 class FanOutTests(unittest.TestCase):
     def _write(self, spool, name, text):
-        d = {"ts": "T", "event": "AgentCronRun", "node": "vps7", "text": text}
+        d = {"ts": "T", "event": "AgentCronRun", "node": "node-a", "text": text}
         (spool / name).write_text(json.dumps(d), encoding="utf-8")
 
     def test_consume_dir_is_drained_while_writers_keep_push_spool(self):
