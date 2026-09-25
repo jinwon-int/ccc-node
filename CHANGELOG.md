@@ -4,6 +4,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **nunchi codex feed: the stale-lane sweep now catches the Termux codex
+  wrapper (#1994).** `codex-feed.sh` killed leftover `codex exec` processes
+  from earlier ticks with `pgrep -f "codex exec.*<lane tag>"`, but on Termux
+  `codex` is `@bash0816/codex-termux`, whose real argv is `codex.bin -c
+  check_for_update_on_startup=false exec …` — never a contiguous
+  `codex exec` — so two orphans from before the #1926 recursion guard sat on
+  daegyo for 34 days. The pattern now accepts `codex` or `codex.bin` with any
+  options before `exec`; the hermetic test spawns a wrapper-shaped stale
+  process and asserts it is swept.
 - **Telegram: a 409 Conflict right after a transport outage no longer restarts
   the bridge (#1986).** Every `Permanent polling failure (Conflict)` exit on a
   Termux node (11 since 2026-07-21) followed an `Telegram API unreachable`

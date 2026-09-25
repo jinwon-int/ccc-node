@@ -53,6 +53,17 @@ sleep 1
 # shellcheck disable=SC2034  # stale_pid is read via eval inside ok()
 stale_pid="$(tail -n 1 "$TMP/stale-pid" 2>/dev/null || true)"
 ok "stale lane fixture is alive before the feed runs" '[ -n "$stale_pid" ] && kill -0 "$stale_pid" 2>/dev/null'
+# same, in the Termux wrapper's argv shape (#1994): @bash0816/codex-termux runs
+# `.../codex.bin -c check_for_update_on_startup=false exec ...`, so "codex exec"
+# is never a contiguous substring there.
+cp "$TMP/bin/codex" "$TMP/bin/codex.bin"
+CODEX_ARGV_FILE="$TMP/stale-wrapper-argv" CODEX_PID_FILE="$TMP/stale-wrapper-pid" \
+  setsid "$TMP/bin/codex.bin" -c check_for_update_on_startup=false exec --skip-git-repo-check dummy-prompt "[nunchi-codex-feed-816]" >/dev/null 2>&1 &
+wrapper_spawner=$!
+sleep 1
+# shellcheck disable=SC2034  # stale_wrapper_pid is read via eval inside ok()
+stale_wrapper_pid="$(tail -n 1 "$TMP/stale-wrapper-pid" 2>/dev/null || true)"
+ok "stale wrapper-shaped lane fixture is alive before the feed runs" '[ -n "$stale_wrapper_pid" ] && kill -0 "$stale_wrapper_pid" 2>/dev/null'
 
 argv_file="$TMP/codex-argv"; pid_file="$TMP/codex-pid"
 PATH="$TMP/bin:$PATH" \
@@ -99,6 +110,7 @@ ok "resolved-launcher run writes a normal (unskipped) tick" 'jq -e ".schema == \
 # (it silently shipped without a `feed` key).
 ok "piri feed carries the same tick writer" 'grep -q "nunchi_write_status" "$ROOT/claude/hooks/nunchi/piri-feed.sh" && grep -q "nunchi_write_status" "$ROOT/claude/hooks/nunchi/codex-feed.sh" && grep -q "\"feed\":\"%s\"" "$ROOT/claude/hooks/nunchi/feed-common.sh"'
 ok "stale lane process is swept at feed start" '! kill -0 "$stale_pid" 2>/dev/null'
+ok "stale codex.bin wrapper-shaped lane process is swept too (#1994)" '! kill -0 "$stale_wrapper_pid" 2>/dev/null'
 # shellcheck disable=SC2034  # lane_pid is read via eval inside ok()
 lane_pid="$(tail -n 1 "$pid_file" 2>/dev/null || true)"
 ok "this run's codex exec is killed by the bounded timeout" '[ -n "$lane_pid" ] && ! kill -0 "$lane_pid" 2>/dev/null'
@@ -106,7 +118,7 @@ ok "codex exec argv carries the lane tag" 'grep -q "nunchi-codex-feed-816" "$arg
 ok "failed extraction is not marked stored" '! grep -qxF "$rollout" "$NUNCHI_HOME/codex-seen" && jq -e ".status == \"failed\"" "$NUNCHI_HOME/codex-receipts.jsonl" >/dev/null'
 ok "stdin was detached (fake codex did not inherit the test stdin)" '[ "$(wc -l < "$pid_file")" -ge 1 ]'
 
-kill "$spawner" 2>/dev/null || true
+kill "$spawner" "$wrapper_spawner" 2>/dev/null || true
 
 # #1264: both feed lanes must prompt for decision facts with a because reason,
 # and the two prompt blocks must not drift apart (the legacy 4-kind prompt is
