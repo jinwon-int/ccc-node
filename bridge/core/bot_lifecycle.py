@@ -546,6 +546,15 @@ class BotLifecycleMixin(MemoryDistillMixin):
     # a row means the transport problem is not transient — escalate to the full
     # rebuild path (which owns the rapid-crash SystemExit accounting).
     _MAX_RAPID_RECONNECT_CYCLES = 3
+    # A getUpdates 409 Conflict right after a transport outage is Telegram
+    # still holding the long-poll from the half-dead connection, not a second
+    # process (#1986): tolerate Conflicts that arrive within this many seconds
+    # of the last transient polling error / transport reconnect (PTB keeps
+    # retrying getUpdates meanwhile)...
+    _CONFLICT_GRACE_AFTER_OUTAGE = 60.0
+    # ...and fail closed once they persist this long past the first tolerated
+    # one — a genuine duplicate instance keeps producing them.
+    _CONFLICT_TOLERANCE_WINDOW = 90.0
     # getUpdates errors that must fail closed instead of being retried forever.
     # PTB's polling loop (network_retry_loop, max_retries=-1) only invokes the
     # error callback and keeps updater.running True, so without an explicit
@@ -834,6 +843,10 @@ class BotLifecycleMixin(MemoryDistillMixin):
                         init_failures, self._clock.time() - init_failure_started
                     )
                 )
+            if init_failures:
+                # Recovered from an outage: the first getUpdates may still
+                # collide with Telegram's stale long-poll (#1986).
+                self._last_transport_reconnect_at = self._clock.time()
             init_failures = 0
             init_failure_started = None
             init_alerted = False
@@ -1122,6 +1135,8 @@ class BotLifecycleMixin(MemoryDistillMixin):
         """
         try:
             if isinstance(exc, self._PERMANENT_POLLING_ERRORS):
+                if isinstance(exc, telegram.error.Conflict) and self._tolerate_post_outage_conflict(exc):
+                    return
                 self._fatal_polling_error = exc
                 health_reporter.record_telegram_error(
                     f"permanent polling failure: {exc}", consecutive_failures=1
@@ -1132,9 +1147,52 @@ class BotLifecycleMixin(MemoryDistillMixin):
                     exc,
                 )
             else:
+                self._last_transient_polling_error_at = self._clock.time()
                 health_reporter.record_telegram_error(str(exc))
         except Exception:
             logger.exception("Polling error callback failed")
+
+    def _tolerate_post_outage_conflict(self, exc: telegram.error.Conflict) -> bool:
+        """True when a getUpdates Conflict should be retried instead of failing closed.
+
+        After a transport outage the reconnect issues a fresh getUpdates while
+        Telegram still holds the long-poll from the half-dead connection and
+        answers 409 until it expires (#1986: every Conflict exit on a Termux
+        node followed an "API unreachable" window, with one bot process). Such
+        a Conflict arrives within ``_CONFLICT_GRACE_AFTER_OUTAGE`` of a
+        transient polling error or a transport reconnect, and PTB's retry loop
+        clears it on its own once the stale long-poll expires. A genuine
+        duplicate instance keeps producing Conflicts, so once they persist past
+        ``_CONFLICT_TOLERANCE_WINDOW`` the caller falls through to the
+        fail-closed path. A Conflict with no preceding outage signal (cold
+        start, real duplicate) is never tolerated.
+        """
+        now = self._clock.time()
+        signals = (
+            getattr(self, "_last_transient_polling_error_at", None),
+            getattr(self, "_last_transport_reconnect_at", None),
+        )
+        outage_at = max((t for t in signals if t is not None), default=None)
+        since = getattr(self, "_conflict_tolerated_since", None)
+        if since is not None and now - since <= self._CONFLICT_TOLERANCE_WINDOW:
+            pass  # inside the current tolerated episode
+        elif (
+            outage_at is not None
+            and now - outage_at <= self._CONFLICT_GRACE_AFTER_OUTAGE
+            and (since is None or outage_at > since)
+        ):
+            self._conflict_tolerated_since = since = now  # new episode
+        else:
+            return False
+        health_reporter.record_telegram_error(f"transient polling conflict after outage: {exc}")
+        logger.warning(
+            "getUpdates Conflict %.0fs after a transport outage — treating it as "
+            "Telegram's stale long-poll rather than a duplicate instance; PTB keeps "
+            "retrying, failing closed if it persists past %.0fs (#1986)",
+            now - (outage_at if outage_at is not None else since),
+            self._CONFLICT_TOLERANCE_WINDOW,
+        )
+        return True
 
     async def _supervise_polling(self, stop_event: asyncio.Event) -> None:
         """Wait for polling exit; recover transient exits transport-only.
@@ -1229,6 +1287,7 @@ class BotLifecycleMixin(MemoryDistillMixin):
                 except asyncio.TimeoutError:
                     continue
             else:
+                self._last_transport_reconnect_at = self._clock.time()
                 health_reporter.record_transport_reconnect()
                 health_reporter.record_telegram_ok()
                 logger.info(
