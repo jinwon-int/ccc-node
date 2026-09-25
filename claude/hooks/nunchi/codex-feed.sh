@@ -71,8 +71,12 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
 (
   # Stale-lane sweep: under this lock, any codex exec still carrying the lane
   # tag belongs to an earlier tick (this run has spawned none yet). Kill it so
-  # a suspended tick cannot accumulate orphans across cron ticks.
-  for pid in $(pgrep -f "codex exec.*${LANE_TAG}" 2>/dev/null || true); do
+  # a suspended tick cannot accumulate orphans across cron ticks. Match the
+  # wrapper argv too: on Termux `codex` is @bash0816/codex-termux, whose real
+  # process is `.../codex.bin -c check_for_update_on_startup=false exec ...`,
+  # so "codex exec" is never contiguous there and the old pattern let two
+  # orphans live 34 days on a Termux node (#1994).
+  for pid in $(pgrep -f "codex(\.bin)? .*exec .*${LANE_TAG}" 2>/dev/null || true); do
     [ "$pid" = "$$" ] && continue
     kill -9 "$pid" 2>/dev/null || true
   done
