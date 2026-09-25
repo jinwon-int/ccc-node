@@ -415,6 +415,34 @@ is already recorded and the operator is told that GitHub reported no checks.
 Delete the contributor branch using the identity that owns it. If cleanup
 permission is unavailable, report it rather than moving a credential.
 
+## Relay-held `jinon86` owner-repo hygiene
+
+The merge helper above cannot change repository settings, and running an ad-hoc
+`gh api` as `jinon86` on the relay node is a credential use outside any
+fail-closed helper. For the one sanctioned settings change — Dependabot
+vulnerability alerts plus a minimal default-branch ruleset
+(`default-branch-no-delete-no-force-push`: blocks deletion and force-push, no
+review or PR requirement) — use `repo-hygiene-via-relay.sh`. The target
+repositories come from a node-local allowlist (one `OWNER/REPO` per line,
+default `~/.config/ccc/repo-hygiene-allowlist`, override with
+`CCC_REPO_HYGIENE_ALLOWLIST` or `--allowlist`); repository names are fleet
+data, so they never live in this canon file.
+
+```bash
+# dry run (no mutation) — still a relay credential use, so still approved
+bash "$GH_PR_FLOW_DIR/repo-hygiene-via-relay.sh" --operator-approved
+# apply after the operator approves the dry-run result
+bash "$GH_PR_FLOW_DIR/repo-hygiene-via-relay.sh" --operator-approved --apply
+```
+
+`--repo OWNER/REPO` (repeatable) narrows the run; a name outside the allowlist
+is refused. The helper verifies actor `jinon86` and per-repo admin, never
+overwrites a same-name ruleset whose rules differ (reported as
+`conflict-mismatch`), re-reads every change it makes, and exits non-zero unless
+every selected repository ends compliant. Widening the ruleset is a code change
+through this skill's PR flow; editing the allowlist is an operator decision
+recorded with the run's approval.
+
 ## Security and merge rules
 
 - Never push directly to `main`; always use a branch and PR.

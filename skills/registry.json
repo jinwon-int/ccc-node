@@ -236,12 +236,12 @@
       "audience": "claude",
       "classification": "adapted",
       "description": "Ship code through the PR-first GitHub flow on this node, including protected PRs that need an independent cross-account review in either direction — jinon86-authored PR approved via the relay-held seoseo-ai profile (exact-head) or seoseo-ai-authored PR approved/merged as jinon86 (relay-held session) — after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. Enforces no direct main pushes, exact-head and green-check validation, independent review, secret-safe credential use, squash merge, and verified cleanup. Not for Wiki edits (use wiki-record).",
-      "files": 2,
+      "files": 3,
       "managed": false,
       "name": "gh-pr-flow",
       "source": "skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "c1ba65edf77b0ea5c3ed4fb4fecffe8e5c5833c0ed01bbd186f6b6d05d1e7e4c"
+      "tree_sha256": "7704686361baa5efffc59e3a833ffccbfc9694509056ec9644c94f4abfc87355"
     },
     {
       "audience": "claude",
