@@ -373,7 +373,7 @@ async def test_stage_reports_integrity_and_storage_failures_without_leaving_file
     ciphertext, file = encrypt(b"payload")
     attachment = media_attachment(image_content(file))
     with pytest.raises(mm.AttachmentError) as integrity:
-        await mm.stage(FakeTransport(ciphertext[:-1] + b"?"), attachment, tmp_path / "m", settings())  # type: ignore[arg-type]
+        await mm.stage(FakeTransport(ciphertext[:-1] + bytes([ciphertext[-1] ^ 0x01])), attachment, tmp_path / "m", settings())  # type: ignore[arg-type]
     assert integrity.value.reason == "integrity"
     assert not any((tmp_path / "m").glob("document_*"))
     target = tmp_path / "link"
