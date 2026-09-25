@@ -4,6 +4,21 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **Telegram: slow uplinks no longer spin the init retry loop silently (#1985).** On
+  2026-09-24 05:13 KST a Termux node's polling restart hit
+  `TimedOut (PoolTimeout)` from `Application.initialize()` seven times in a
+  row (~60 s with no inbound messages) before recovering on its own — the
+  3 s pool / 5 s connect budget was too tight for a fresh TLS handshake on a
+  mobile/Tailscale link. The HTTPX connect/pool/read timeouts are now
+  settings (`CCC_TELEGRAM_{CONNECT,POOL,READ}_TIMEOUT`, defaults 10 s; the
+  getUpdates long-poll keeps its 35 s read) and the lifecycle counts the
+  consecutive initialize() failures: at `CCC_ALERT_INIT_FAILURES` (default 3)
+  it writes one `telegram_init_retry_loop` alert to the channel-neutral push
+  spool — not gated on the process's own `CCC_PUSH_ENABLED`, so a Matrix
+  spool notifier on the node delivers it while Telegram is unreachable — and
+  one `telegram_init_recovered` notice when initialize() next succeeds.
+  `health.json` now reports the real consecutive-failure count instead of 1.
+
 ## [0.6.0] — 2026-09-24
 
 Release train covering main from `v0.5.0` (2026-07-26) to `c7896c4b`

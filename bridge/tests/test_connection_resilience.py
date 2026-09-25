@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch, PropertyMock
 from pathlib import Path
 import sys
+import tempfile
 import types
 import os
 
@@ -24,15 +25,19 @@ os.environ["PROJECT_ROOT"] = str(Path(__file__).resolve().parents[1])
 # Mock config module
 from pathlib import Path as _Path
 
+# Not a literal /tmp: Termux nodes have no writable /tmp, and run() creates
+# the runtime dir under bot_data_dir.
+_TEST_BOT_DIR = _Path(tempfile.gettempdir()) / "test_bot"
+
 config_module = types.ModuleType("telegram_bot.utils.config")
 setattr(
     config_module,
     "config",
     types.SimpleNamespace(
         telegram_bot_token="test_token",
-        bot_data_dir=_Path("/tmp/test_bot"),
-        logs_dir=_Path("/tmp/test_bot/logs"),
-        session_store_path=_Path("/tmp/test_bot/sessions.json"),
+        bot_data_dir=_TEST_BOT_DIR,
+        logs_dir=_TEST_BOT_DIR / "logs",
+        session_store_path=_TEST_BOT_DIR / "sessions.json",
         allowed_user_ids=[],
         require_allowlist=False,  # access-control guard not under test here
         draft_update_min_chars=150,
@@ -108,13 +113,54 @@ class TestConnectionResilience(unittest.TestCase):
 
         self.assertEqual(polling_request["connection_pool_size"], 4)
         self.assertEqual(polling_request["read_timeout"], 35.0)
-        self.assertEqual(polling_request["pool_timeout"], 5.0)
+        self.assertEqual(polling_request["pool_timeout"], 10.0)
+        self.assertEqual(polling_request["connect_timeout"], 10.0)
         self.assertEqual(polling_request["http_version"], "1.1")
 
         self.assertEqual(default_request["connection_pool_size"], 8)
         self.assertEqual(default_request["read_timeout"], 10.0)
-        self.assertEqual(default_request["pool_timeout"], 3.0)
+        self.assertEqual(default_request["pool_timeout"], 10.0)
+        self.assertEqual(default_request["connect_timeout"], 10.0)
         self.assertEqual(default_request["http_version"], "1.1")
+
+    def test_request_builders_honor_configured_timeouts(self):
+        """CCC_TELEGRAM_{CONNECT,POOL,READ}_TIMEOUT reach both HTTPX requests;
+        garbage or non-positive values fall back to the defaults."""
+        cfg = config_module.config
+        cfg.telegram_connect_timeout = 7.5
+        cfg.telegram_pool_timeout = "12"
+        cfg.telegram_read_timeout = 20
+        try:
+            with patch.object(
+                bot_lifecycle_module, "HTTPXRequest", side_effect=lambda **kw: kw
+            ):
+                default_request = self.bot._build_default_request()
+                polling_request = self.bot._build_get_updates_request()
+            self.assertEqual(default_request["connect_timeout"], 7.5)
+            self.assertEqual(default_request["pool_timeout"], 12.0)
+            self.assertEqual(default_request["read_timeout"], 20.0)
+            self.assertEqual(polling_request["connect_timeout"], 7.5)
+            self.assertEqual(polling_request["pool_timeout"], 12.0)
+            # The long-poll read budget is not a knob.
+            self.assertEqual(polling_request["read_timeout"], 35.0)
+
+            cfg.telegram_connect_timeout = "soon"
+            cfg.telegram_pool_timeout = 0
+            cfg.telegram_read_timeout = float("inf")
+            with patch.object(
+                bot_lifecycle_module, "HTTPXRequest", side_effect=lambda **kw: kw
+            ):
+                default_request = self.bot._build_default_request()
+            self.assertEqual(default_request["connect_timeout"], 10.0)
+            self.assertEqual(default_request["pool_timeout"], 10.0)
+            self.assertEqual(default_request["read_timeout"], 10.0)
+        finally:
+            for name in (
+                "telegram_connect_timeout",
+                "telegram_pool_timeout",
+                "telegram_read_timeout",
+            ):
+                delattr(cfg, name)
 
     @patch.dict(
         os.environ,
@@ -234,6 +280,79 @@ class TestConnectionResilience(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             self.bot.run()
+
+    def _run_init_retry_scenario(self, initialize_effects, *, threshold, on_ready=None):
+        """Drive the polling loop through a streak of initialize() failures.
+
+        Returns the spool calls captured from ``write_alert_spool``. The loop
+        must end with a SystemExit raised by the scenario (a Conflict from
+        initialize() or from ``_on_ready``).
+        """
+        cfg = config_module.config
+        cfg.alert_init_failure_threshold = threshold
+        mock_app = Mock()
+        mock_app.initialize = AsyncMock(side_effect=initialize_effects)
+        self.bot.application = mock_app
+        self.bot.build = Mock()
+        self.bot._graceful_shutdown = AsyncMock()
+        self.bot._on_ready = on_ready or AsyncMock(side_effect=SystemExit("stop"))
+        self.bot._probe_claude_readiness = Mock(return_value=(True, ""))
+        self.bot._push_notifier = types.SimpleNamespace(spool_dir=_TEST_BOT_DIR / "spool")
+        try:
+            with patch.object(
+                bot_lifecycle_module, "write_alert_spool", return_value=True
+            ) as spool, patch("asyncio.sleep", new=AsyncMock()):
+                with self.assertRaises(SystemExit):
+                    self.bot.run()
+        finally:
+            delattr(cfg, "alert_init_failure_threshold")
+        self.assertEqual(mock_app.initialize.await_count, len(initialize_effects))
+        return [call.args[1] for call in spool.call_args_list]
+
+    def test_init_retry_streak_alerts_once_at_threshold(self):
+        """TimedOut/NetworkError streaks keep retrying; the alert fires exactly
+        once when the streak reaches CCC_ALERT_INIT_FAILURES and never for a
+        shorter streak."""
+        alerts = self._run_init_retry_scenario(
+            [
+                telegram.error.TimedOut("Pool timeout"),
+                telegram.error.NetworkError("unreachable"),
+                telegram.error.TimedOut("Pool timeout"),
+                telegram.error.TimedOut("Pool timeout"),
+                telegram.error.Conflict("duplicate"),
+            ],
+            threshold=3,
+        )
+        self.assertEqual([a.code for a in alerts], ["telegram_init_retry_loop"])
+        self.assertIn("3 times in a row", alerts[0].message)
+
+        alerts = self._run_init_retry_scenario(
+            [telegram.error.TimedOut("Pool timeout")] * 2
+            + [telegram.error.Conflict("duplicate")],
+            threshold=3,
+        )
+        self.assertEqual(alerts, [])
+
+    def test_init_retry_alert_disabled_at_zero_threshold(self):
+        alerts = self._run_init_retry_scenario(
+            [telegram.error.TimedOut("Pool timeout")] * 5
+            + [telegram.error.Conflict("duplicate")],
+            threshold=0,
+        )
+        self.assertEqual(alerts, [])
+
+    def test_init_retry_recovery_spools_companion_notice(self):
+        """Once an alerted streak ends in a successful initialize(), one
+        recovery notice follows and the streak counters reset."""
+        alerts = self._run_init_retry_scenario(
+            [telegram.error.TimedOut("Pool timeout")] * 3 + [None],
+            threshold=3,
+        )
+        self.assertEqual(
+            [a.code for a in alerts],
+            ["telegram_init_retry_loop", "telegram_init_recovered"],
+        )
+        self.assertIn("after 3 failed attempt(s)", alerts[1].message)
 
     def test_start_polling_registers_error_callback(self):
         """Polling startup attaches the supervisor error callback."""

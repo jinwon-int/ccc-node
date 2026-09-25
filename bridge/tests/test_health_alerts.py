@@ -26,6 +26,8 @@ from telegram_bot.utils.health_alerts import (
     HealthSignals,
     count_spool_backlog,
     evaluate_alerts,
+    init_retry_loop_alert,
+    init_retry_recovered_alert,
     probe_interval,
     write_alert_spool,
 )
@@ -243,6 +245,19 @@ class AlertGateTests(unittest.TestCase):
 
 
 class SpoolTests(unittest.TestCase):
+    def test_init_retry_alerts_carry_numbers_only(self):
+        loop = init_retry_loop_alert(7, 61.4)
+        recovered = init_retry_recovered_alert(7, -0.5)
+
+        self.assertEqual(loop.code, "telegram_init_retry_loop")
+        self.assertEqual(loop.dedup_key(), "health-alert:telegram_init_retry_loop")
+        self.assertIn("7 times in a row over 61s", loop.message)
+        self.assertEqual(recovered.code, "telegram_init_recovered")
+        self.assertIn("after 7 failed attempt(s) over 0s", recovered.message)
+        for alert in (loop, recovered):
+            self.assertNotIn("/", alert.message)
+            self.assertNotIn("token", alert.message.lower())
+
     def test_alert_spools_as_push_notifier_record(self):
         import tempfile
 

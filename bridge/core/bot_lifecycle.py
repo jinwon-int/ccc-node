@@ -35,6 +35,11 @@ from telegram_bot.core.tool_policy import (
 )
 from telegram_bot.core.session_isolation import apply_subprocess_session_isolation
 from telegram_bot.utils.health import health_reporter
+from telegram_bot.utils.health_alerts import (
+    init_retry_loop_alert,
+    init_retry_recovered_alert,
+    write_alert_spool,
+)
 from telegram_bot.core.task_ledger import (
     INTERRUPTED_NOTICE_TEXT,
     TaskLedger,
@@ -446,6 +451,33 @@ class BotLifecycleMixin(MemoryDistillMixin):
         self._setup_handlers()
         self.application.add_error_handler(self._error_handler)
 
+    # Telegram HTTPX transport timeouts (seconds). The connect/pool defaults
+    # were raised from 5s/3s: on a mobile or Tailscale uplink a fresh TLS
+    # handshake to api.telegram.org routinely exceeds 3s, which PTB surfaces
+    # as ``TimedOut (PoolTimeout)`` from ``Application.initialize()`` and
+    # sends the bridge into its retry loop while the network is merely slow,
+    # not down. Per-node override: CCC_TELEGRAM_{CONNECT,POOL,READ}_TIMEOUT.
+    _DEFAULT_CONNECT_TIMEOUT = 10.0
+    _DEFAULT_POOL_TIMEOUT = 10.0
+    _DEFAULT_READ_TIMEOUT = 10.0
+    _POLLING_READ_TIMEOUT = 35.0  # getUpdates long-poll (timeout=30) + slack
+    _WRITE_TIMEOUT = 10.0
+    #: Consecutive initialize() failures before the init-retry alert spools.
+    _DEFAULT_INIT_FAILURE_ALERT_THRESHOLD = 3
+
+    def _transport_timeout(self, name: str, default: float) -> float:
+        """Configured transport timeout, falling back on non-positive/garbage."""
+        raw = getattr(self._config, name, None)
+        if raw is None:
+            return default
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(value) or value <= 0:
+            return default
+        return value
+
     def _build_default_request(self) -> BaseRequest:
         """Build default request for all non-getUpdates API calls."""
         proxy_url = (
@@ -455,10 +487,16 @@ class BotLifecycleMixin(MemoryDistillMixin):
         )
         return HTTPXRequest(
             connection_pool_size=8,
-            pool_timeout=3.0,
-            read_timeout=10.0,
-            write_timeout=10.0,
-            connect_timeout=5.0,
+            pool_timeout=self._transport_timeout(
+                "telegram_pool_timeout", self._DEFAULT_POOL_TIMEOUT
+            ),
+            read_timeout=self._transport_timeout(
+                "telegram_read_timeout", self._DEFAULT_READ_TIMEOUT
+            ),
+            write_timeout=self._WRITE_TIMEOUT,
+            connect_timeout=self._transport_timeout(
+                "telegram_connect_timeout", self._DEFAULT_CONNECT_TIMEOUT
+            ),
             proxy=proxy_url,
             http_version="1.1",
         )
@@ -472,10 +510,14 @@ class BotLifecycleMixin(MemoryDistillMixin):
         )
         return HTTPXRequest(
             connection_pool_size=4,  # Increased from 2 to handle long polling
-            pool_timeout=5.0,
-            read_timeout=35.0,
-            write_timeout=10.0,
-            connect_timeout=5.0,
+            pool_timeout=self._transport_timeout(
+                "telegram_pool_timeout", self._DEFAULT_POOL_TIMEOUT
+            ),
+            read_timeout=self._POLLING_READ_TIMEOUT,
+            write_timeout=self._WRITE_TIMEOUT,
+            connect_timeout=self._transport_timeout(
+                "telegram_connect_timeout", self._DEFAULT_CONNECT_TIMEOUT
+            ),
             proxy=proxy_url,
             http_version="1.1",
         )
@@ -711,6 +753,12 @@ class BotLifecycleMixin(MemoryDistillMixin):
             )
 
         rapid_crash_count = 0
+        # Consecutive Application.initialize() failures (transient network
+        # errors). A streak reaching the alert threshold is announced once
+        # via the channel-neutral push spool; the streak resets on success.
+        init_failures = 0
+        init_failure_started: Optional[float] = None
+        init_alerted = False
 
         while not stop_event.is_set():
             if not self.application:
@@ -739,30 +787,56 @@ class BotLifecycleMixin(MemoryDistillMixin):
                 health_reporter.record_telegram_error(message, consecutive_failures=1)
                 self._record_transport_teardown("telegram getUpdates conflict")
                 raise SystemExit(message)
-            except telegram.error.TimedOut as e:
-                # PoolTimeout is converted to TimedOut, need force cleanup
-                health_reporter.record_telegram_error(
-                    f"telegram timeout error: {e}",
-                    consecutive_failures=1,
-                )
-                logger.warning(
-                    "TimedOut error during initialization (likely PoolTimeout): %s, retrying...",
-                    e,
-                )
-                # Force cleanup to release leaked connections from pool
-                await self._graceful_shutdown(force=True)
-                await asyncio.sleep(5)
-                continue
             except telegram.error.NetworkError as e:
-                health_reporter.record_telegram_error(
-                    f"telegram startup error: {e}",
-                    consecutive_failures=1,
-                )
-                logger.warning("Network error during initialization: %s, retrying...", e)
+                # TimedOut (PTB's wrapping of httpx PoolTimeout) and every other
+                # NetworkError are transient: force-clean the leaked pool and
+                # retry. The streak is counted so a node stuck in this loop is
+                # announced out-of-band instead of going silent.
+                init_failures += 1
+                if init_failure_started is None:
+                    init_failure_started = start_time
+                if isinstance(e, telegram.error.TimedOut):
+                    health_reporter.record_telegram_error(
+                        f"telegram timeout error: {e}",
+                        consecutive_failures=init_failures,
+                    )
+                    logger.warning(
+                        "TimedOut error during initialization (likely PoolTimeout): "
+                        "%s, retrying... (attempt %d)",
+                        e,
+                        init_failures,
+                    )
+                else:
+                    health_reporter.record_telegram_error(
+                        f"telegram startup error: {e}",
+                        consecutive_failures=init_failures,
+                    )
+                    logger.warning(
+                        "Network error during initialization: %s, retrying... (attempt %d)",
+                        e,
+                        init_failures,
+                    )
+                if not init_alerted and self._init_failure_alert_due(init_failures):
+                    init_alerted = True
+                    self._spool_init_retry_alert(
+                        init_retry_loop_alert(
+                            init_failures, self._clock.time() - init_failure_started
+                        )
+                    )
                 # Force cleanup to release leaked connections from pool
                 await self._graceful_shutdown(force=True)
                 await asyncio.sleep(5)
                 continue
+
+            if init_alerted and init_failure_started is not None:
+                self._spool_init_retry_alert(
+                    init_retry_recovered_alert(
+                        init_failures, self._clock.time() - init_failure_started
+                    )
+                )
+            init_failures = 0
+            init_failure_started = None
+            init_alerted = False
 
             await self._on_ready(self.application)
 
@@ -1170,6 +1244,40 @@ class BotLifecycleMixin(MemoryDistillMixin):
             self._RECONNECT_ATTEMPTS,
         )
         return False
+
+    def _init_failure_alert_due(self, failures: int) -> bool:
+        """True once the initialize() streak reaches CCC_ALERT_INIT_FAILURES (0 = off)."""
+        raw = getattr(
+            self._config,
+            "alert_init_failure_threshold",
+            self._DEFAULT_INIT_FAILURE_ALERT_THRESHOLD,
+        )
+        try:
+            threshold = int(raw)
+        except (TypeError, ValueError):
+            threshold = self._DEFAULT_INIT_FAILURE_ALERT_THRESHOLD
+        return threshold > 0 and failures >= threshold
+
+    def _spool_init_retry_alert(self, alert: Any) -> None:
+        """Queue an init-retry alert on the channel-neutral push spool (fail-open).
+
+        Unlike the periodic health probe this deliberately does NOT gate on this
+        process's own ``push_enabled``: the condition being reported is that
+        Telegram is unreachable, so delivery must come from whichever notifier
+        drains the spool — on a node also running the Matrix frontend that is
+        the Matrix spool notifier (core/matrix/bot.py), i.e. a genuinely
+        out-of-band channel. With no consumer the record simply waits in the
+        spool (one per outage episode, plus one recovery notice).
+        """
+        logger.error("Health alert [%s]: %s", alert.code, alert.message)
+        try:
+            spool_dir = self._push_notifier.spool_dir
+        except AttributeError:
+            return
+        try:
+            write_alert_spool(FilePath(spool_dir), alert)
+        except Exception as exc:  # alerting must never break the retry loop
+            logger.debug("Init-retry alert spool failed: %s", type(exc).__name__)
 
     def _record_transport_teardown(self, reason: str) -> None:
         """Attribute in-flight requests terminated by a transport-caused exit.
