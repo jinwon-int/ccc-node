@@ -262,6 +262,10 @@ def test_polling_error_callback_flags_only_permanent_errors(
     bot._on_polling_error(telegram.error.NetworkError("blip"))
     assert getattr(bot, "_fatal_polling_error", None) is None
 
+    # A Conflict with no preceding outage signal (cold start / real duplicate)
+    # still fails closed; one right after a NetworkError is the #1986 grace
+    # case, covered below.
+    bot = bare_lifecycle_bot(FakeUpdater())
     conflict = telegram.error.Conflict("another instance is polling")
     bot._on_polling_error(conflict)
     assert bot._fatal_polling_error is conflict
@@ -414,3 +418,110 @@ def test_health_reporter_exposes_transport_counters(tmp_path: Path) -> None:
     assert snapshot["transport"] == {"reconnects": 2, "cancelled_by_transport": 3}
     on_disk = json.loads(reporter.health_file.read_text(encoding="utf-8"))
     assert on_disk["transport"] == {"reconnects": 2, "cancelled_by_transport": 3}
+
+
+# --- #1986: post-outage 409 Conflict is Telegram's stale long-poll, not a duplicate ---
+
+
+class _ManualClock:
+    def __init__(self, now: float = 1_000.0) -> None:
+        self.now = now
+
+    def time(self) -> float:
+        return self.now
+
+
+def _bot_with_manual_clock(updater: FakeUpdater | None = None):
+    bot = bare_lifecycle_bot(updater)
+    clock = _ManualClock()
+    bot._clock = clock
+    return bot, clock
+
+
+def _conflict() -> telegram.error.Conflict:
+    return telegram.error.Conflict("terminated by other getUpdates request")
+
+
+def test_conflict_shortly_after_transient_polling_error_is_tolerated(
+    fake_health: FakeHealth,
+) -> None:
+    bot, clock = _bot_with_manual_clock(FakeUpdater())
+    bot._on_polling_error(telegram.error.NetworkError("Telegram API unreachable"))
+    clock.now += 5
+
+    bot._on_polling_error(_conflict())
+
+    assert getattr(bot, "_fatal_polling_error", None) is None
+    assert any("transient polling conflict" in e for e in fake_health.telegram_errors)
+    assert not any("permanent polling failure" in e for e in fake_health.telegram_errors)
+
+
+def test_conflict_long_after_outage_fails_closed(fake_health: FakeHealth) -> None:
+    bot, clock = _bot_with_manual_clock(FakeUpdater())
+    bot._on_polling_error(telegram.error.NetworkError("blip"))
+    clock.now += bot._CONFLICT_GRACE_AFTER_OUTAGE + 1
+
+    conflict = _conflict()
+    bot._on_polling_error(conflict)
+
+    assert bot._fatal_polling_error is conflict
+
+
+def test_conflict_persisting_past_tolerance_window_fails_closed(
+    fake_health: FakeHealth,
+) -> None:
+    """A real duplicate keeps producing 409s; the grace must not hide it."""
+    bot, clock = _bot_with_manual_clock(FakeUpdater())
+    bot._on_polling_error(telegram.error.NetworkError("blip"))
+    clock.now += 5
+    bot._on_polling_error(_conflict())  # opens the tolerated episode
+    clock.now += 30
+    bot._on_polling_error(_conflict())  # still inside the window
+    assert getattr(bot, "_fatal_polling_error", None) is None
+
+    clock.now += bot._CONFLICT_TOLERANCE_WINDOW  # 125s past the first one
+    conflict = _conflict()
+    bot._on_polling_error(conflict)
+
+    assert bot._fatal_polling_error is conflict
+    assert any("permanent polling failure" in e for e in fake_health.telegram_errors)
+
+
+def test_new_outage_after_expired_episode_opens_new_grace(fake_health: FakeHealth) -> None:
+    bot, clock = _bot_with_manual_clock(FakeUpdater())
+    bot._on_polling_error(telegram.error.NetworkError("blip"))
+    clock.now += 5
+    bot._on_polling_error(_conflict())
+    clock.now += 600  # episode long over, polling was healthy in between
+
+    bot._on_polling_error(telegram.error.NetworkError("blip again"))
+    clock.now += 3
+    bot._on_polling_error(_conflict())
+
+    assert getattr(bot, "_fatal_polling_error", None) is None
+
+
+@pytest.mark.anyio
+async def test_conflict_after_transport_reconnect_is_tolerated(fake_health: FakeHealth) -> None:
+    updater = FakeUpdater()
+    bot, clock = _bot_with_manual_clock(updater)
+
+    assert await bot._reconnect_polling(asyncio.Event()) is True
+    clock.now += 10
+    bot._on_polling_error(_conflict())
+
+    assert getattr(bot, "_fatal_polling_error", None) is None
+
+
+@pytest.mark.anyio
+async def test_tolerated_conflict_does_not_leave_polling_wait(fake_health: FakeHealth) -> None:
+    """PTB keeps updater.running True and retries; the supervisor must not restart."""
+    updater = FakeUpdater()
+    updater.running = True
+    bot, clock = _bot_with_manual_clock(updater)
+    bot._on_polling_error(telegram.error.NetworkError("blip"))
+    clock.now += 2
+    bot._on_polling_error(_conflict())
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(bot._wait_for_polling_exit(asyncio.Event()), timeout=0.2)

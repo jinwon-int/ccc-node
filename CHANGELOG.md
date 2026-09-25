@@ -4,6 +4,18 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **Telegram: a 409 Conflict right after a transport outage no longer restarts
+  the bridge (#1986).** Every `Permanent polling failure (Conflict)` exit on a
+  Termux node (11 since 2026-07-21) followed an `Telegram API unreachable`
+  window with exactly one bot process: after the outage the fresh getUpdates
+  collides with the long-poll Telegram still holds from the half-dead
+  connection, and the fail-closed exit cost a process restart, the in-flight
+  turn and a crash log blaming a non-existent duplicate. `_on_polling_error`
+  now tolerates a Conflict that arrives within 60 s of a transient polling
+  error / transport reconnect (PTB keeps retrying getUpdates; health is marked
+  degraded, not fatal) and still fails closed when Conflicts persist past
+  90 s — a real second instance keeps producing them — or arrive with no
+  preceding outage (cold start, duplicate process).
 - **Telegram: slow uplinks no longer spin the init retry loop silently (#1985).** On
   2026-09-24 05:13 KST a Termux node's polling restart hit
   `TimedOut (PoolTimeout)` from `Application.initialize()` seven times in a
