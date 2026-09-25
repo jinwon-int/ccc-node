@@ -213,7 +213,8 @@ for f in claude/settings.base.json claude/settings.local.template.json \
          schemas/auto-distill-evaluation-receipt-v1.schema.json \
          schemas/agent-cron-task-store.schema.json \
          architecture/architecture-contract-v1.json \
-         architecture/side-effect-contract-v1.json; do
+         architecture/side-effect-contract-v1.json \
+         scripts/lib/claude-cli-model-floor.json; do
   [ -f "$f" ] || { say "  (skip $f — absent)"; continue; }
   if jq -e . "$f" >/dev/null 2>&1; then say "  ok $f"; else err "invalid JSON: $f"; fi
 done
@@ -508,6 +509,12 @@ if python3 scripts/ccc_doctor_selfupdate_test.py >"$TMP/doctor-selfupdate-test.o
 else
   err "doctor self-update stall verdict tests failed"
   tail -10 "$TMP/doctor-selfupdate-test.out" 2>/dev/null
+fi
+if python3 scripts/ccc_doctor_cli_floor_test.py >"$TMP/doctor-cli-floor-test.out" 2>&1; then
+  say "  ok doctor worker Claude CLI floor verdict tests (a2a-nexus#2275)"
+else
+  err "doctor worker Claude CLI floor verdict tests failed (a model pin may outrun the node's Claude Code unseen)"
+  tail -10 "$TMP/doctor-cli-floor-test.out" 2>/dev/null
 fi
 if python3 scripts/ccc_doctor_promotion_backlog_test.py >"$TMP/doctor-promotion-backlog-test.out" 2>&1; then
   say "  ok doctor skill-promotion backlog verdict tests"

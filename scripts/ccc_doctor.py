@@ -342,6 +342,98 @@ def _configured_nunchi_lane(cron: str) -> str:
     return "none"
 
 
+# --- worker Claude CLI version floor (a2a-nexus#2275) -------------------------
+# A worker model pin can require a newer Claude Code than the node runs; the API
+# then answers every task with a 400 ("Claude Code X does not support this
+# model; version Y or newer is required.") and the lane fails silently. The
+# per-model floors are data, not code: scripts/lib/claude-cli-model-floor.json.
+CLI_FLOOR_TABLE_PATH = Path(__file__).resolve().parent / "lib" / "claude-cli-model-floor.json"
+WORKER_ENV_FILE_DEFAULT = "/etc/default/a2a-hermes-worker"
+# The worker env file carries secrets; only these keys are ever read out of it.
+WORKER_MODEL_KEYS: tuple[str, ...] = (
+    "A2A_CLAUDE_MODEL",
+    "A2A_CLAUDE_CODE_RUNTIME_MODEL",
+    "A2A_OPENCLAW_MODEL",
+    "A2A_OPENCLAW_ANALYSIS_MODEL",
+    "A2A_HERMES_DEFAULT_MODEL",
+    "WORKER_IMPLEMENTATION_MODEL_TIER",
+)
+WORKER_ENV_READ_KEYS: frozenset[str] = frozenset(
+    (*WORKER_MODEL_KEYS, "A2A_DOCKER_RUNNER_IMAGE", "A2A_DOCKER_RUNNER_ENABLED", "A2A_CLAUDE_CODE_BIN", "CLAUDE_BIN")
+)
+RUNNER_CLI_PACKAGE_LABEL = "org.openclaw.a2a-docker-runner.claude.package"
+RUNNER_CLI_ENTRYPOINT = "/usr/local/bin/claude"
+CLI_VERSION_PROBE_TIMEOUT_SECONDS = 10.0
+RUNNER_RUN_PROBE_TIMEOUT_SECONDS = 20.0
+_SEMVER_RE = re.compile(r"(?<![\d.])(\d+)\.(\d+)\.(\d+)(?![\d])")
+_IMAGE_TAG_CLI_RE = re.compile(r"claude-(\d+\.\d+\.\d+)(?![\d.])")
+
+
+def parse_cli_version(text: str) -> tuple[int, int, int] | None:
+    """First X.Y.Z in ``text`` as an int tuple (so 2.1.280 > 2.1.28), or None."""
+    match = _SEMVER_RE.search(text or "")
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def format_cli_version(version: tuple[int, int, int]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def normalize_model_id(raw: str) -> str:
+    """``anthropic/Claude-Opus-5-5[1m]`` -> ``claude-opus-5-5``."""
+    value = raw.strip().strip("\"'").strip().lower()
+    value = value.rsplit("/", 1)[-1]
+    return re.sub(r"\[[^\]]*\]$", "", value).strip()
+
+
+def load_cli_floor_table(path: Path) -> dict[str, tuple[int, int, int]]:
+    """Normalized model id -> minimum CLI version. Malformed rows are skipped."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    floors = data.get("floors") if isinstance(data, dict) else None
+    out: dict[str, tuple[int, int, int]] = {}
+    if not isinstance(floors, dict):
+        return out
+    for model, row in floors.items():
+        minimum = row.get("min_cli") if isinstance(row, dict) else None
+        version = parse_cli_version(minimum) if isinstance(minimum, str) else None
+        if version is not None:
+            out[normalize_model_id(str(model))] = version
+    return out
+
+
+def read_env_file_keys(path: Path, keys: frozenset[str]) -> dict[str, str]:
+    """Allowlisted ``KEY=VALUE`` pairs from a systemd EnvironmentFile.
+
+    Values outside ``keys`` are never retained. Like systemd, only a line that
+    starts with ``#``/``;`` is a comment — an inline ``#`` stays in the value,
+    because that is the value the worker process actually receives.
+    """
+    out: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped[0] in "#;":
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export "):].lstrip()
+        key, sep, value = stripped.partition("=")
+        key = key.strip()
+        if not sep or key not in keys:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def _printable(value: str, limit: int = 120) -> str:
+    """Control-free, bounded rendering of a path/image value for a report row."""
+    cleaned = "".join(ch if ch.isprintable() else "?" for ch in value)
+    return cleaned if len(cleaned) <= limit else cleaned[: limit - 3] + "..."
+
+
 class Doctor:
     def __init__(self, repo: Path, claude_dir: Path, scope: str):
         self.repo = repo
@@ -688,6 +780,7 @@ class Doctor:
         self.check_skill_promotion_unpromoted()
         self.check_skill_usage_telemetry()
         self.check_self_update_stall()
+        self.check_worker_claude_cli_floor()
         # Managed Codex skills are provider-native (#647): diagnose them only on
         # a Codex node. Claude-only asset findings above stay non-readiness
         # (교정가능/정상), so they never block a Codex node's readiness.
@@ -2081,6 +2174,213 @@ class Doctor:
             "the node receives no harness updates until then",
         )
 
+    def check_worker_claude_cli_floor(self) -> None:
+        """Warn when the worker model pin needs a newer Claude Code (a2a-nexus#2275).
+
+        On 2026-09-25 the worker pin moved to a model that requires Claude Code
+        >= 2.1.280 while both the host CLI and the docker runner image's CLI
+        were older: every task got an API 400 and the lanes failed silently for
+        a day. This compares the pinned models' floors
+        (scripts/lib/claude-cli-model-floor.json) against both CLIs.
+
+        Read-only and provider-free: the worker env file is read for an
+        allowlist of keys only (it holds secrets), the host CLI is asked for
+        ``--version``, and the runner image is identified by its build label
+        (``docker image inspect``) or its ``...-claude-X.Y.Z`` tag. Starting a
+        throwaway container is opt-in (CCC_DOCTOR_RUNNER_CLI_PROBE=1). A model
+        with no row in the table is never warned on — the floor is not guessed.
+        """
+        item = "worker claude cli floor"
+        env_path = Path(os.environ.get("CCC_DOCTOR_WORKER_ENV_FILE") or WORKER_ENV_FILE_DEFAULT)
+        if not env_path.exists():
+            self.add("정상", item, "해당 없음 (no A2A worker env file)", "none")
+            return
+        try:
+            env = read_env_file_keys(env_path, WORKER_ENV_READ_KEYS)
+        except OSError:
+            self.add(
+                "경고", item, "확인 불가 (worker env unreadable)",
+                f"rerun ccc-doctor as the worker's owner to read {env_path}",
+            )
+            return
+        try:
+            table = load_cli_floor_table(CLI_FLOOR_TABLE_PATH)
+        except (OSError, ValueError):
+            self.add(
+                "경고", item, "확인 불가 (model floor table unreadable)",
+                f"restore scripts/lib/{CLI_FLOOR_TABLE_PATH.name} from the repo",
+            )
+            return
+        pinned: list[str] = []
+        for key in WORKER_MODEL_KEYS:
+            model = normalize_model_id(env.get(key, ""))
+            if model and model not in pinned:
+                pinned.append(model)
+        known = {model: table[model] for model in pinned if model in table}
+        unknown = ",".join(_printable(model, 60) for model in pinned if model not in table)
+        if not known:
+            detail = f"floor unknown: {unknown}" if unknown else "no Claude model pin"
+            self.add("정상", item, f"해당 없음 ({detail})", "none")
+            return
+        floor_model = max(known, key=lambda model: known[model])
+        floor = known[floor_model]
+        need = f"pin {floor_model} needs >= {format_cli_version(floor)}"
+        if unknown:
+            need += f"; floor unknown: {unknown}"
+        self._check_host_cli_floor(env, floor, need)
+        self._check_runner_cli_floor(env, floor, need)
+
+    def _check_host_cli_floor(self, env: dict[str, str], floor: tuple[int, int, int], need: str) -> None:
+        """Host CLI the worker spawns: A2A_CLAUDE_CODE_BIN, else CLAUDE_BIN, else PATH."""
+        item = "worker claude cli floor (host)"
+        wanted = format_cli_version(floor)
+        upgrade = f"npm i -g @anthropic-ai/claude-code@{wanted} (or newer), then confirm `claude --version`"
+        source, configured = "PATH", "claude"
+        for key in ("A2A_CLAUDE_CODE_BIN", "CLAUDE_BIN"):
+            if env.get(key, "").strip():
+                source, configured = key, env[key].strip()
+                break
+        override = os.environ.get("CCC_DOCTOR_CLAUDE_BIN", "").strip()
+        if override:
+            source, configured = "CCC_DOCTOR_CLAUDE_BIN", override
+        executable: str | None
+        if "/" in configured:
+            candidate = Path(configured).expanduser()
+            executable = str(candidate) if candidate.is_file() and os.access(candidate, os.X_OK) else None
+        else:
+            executable = shutil.which(configured)
+        if executable is None:
+            self.add(
+                "경고", item,
+                f"{need}; host CLI 확인 불가: {source}={_printable(configured)} is not an executable",
+                "point the worker at an existing claude binary (systemd passes the value verbatim, "
+                f"an inline '#' included); {upgrade}",
+            )
+            return
+        try:
+            proc = subprocess.run(
+                [executable, "--version"],
+                text=True, capture_output=True, stdin=subprocess.DEVNULL, check=False,
+                timeout=CLI_VERSION_PROBE_TIMEOUT_SECONDS,
+                env={**os.environ, "DISABLE_AUTOUPDATER": "1"},
+            )
+            version = parse_cli_version(proc.stdout) or parse_cli_version(proc.stderr)
+        except subprocess.TimeoutExpired:
+            self.note_timeout(f"{executable} --version", CLI_VERSION_PROBE_TIMEOUT_SECONDS)
+            version = None
+        except OSError:
+            version = None
+        if version is None:
+            self.add(
+                "경고", item, f"{need}; host CLI 확인 불가: `{_printable(executable)} --version` gave no version",
+                f"run `{_printable(executable)} --version` by hand; {upgrade}",
+            )
+            return
+        status = f"{need}; host={format_cli_version(version)} ({_printable(executable)})"
+        if version < floor:
+            self.add("경고", item, status, upgrade)
+        else:
+            self.add("정상", item, status, "none")
+
+    def _docker_cli(self) -> str | None:
+        configured = os.environ.get("CCC_DOCTOR_DOCKER_BIN", "").strip()
+        if not configured:
+            return shutil.which("docker")
+        candidate = Path(configured).expanduser()
+        return str(candidate) if candidate.is_file() and os.access(candidate, os.X_OK) else None
+
+    def _runner_image_labels(self, docker: str, image: str) -> tuple[str, dict[str, Any]]:
+        """("ok", labels) | ("missing", {}) | ("unavailable", {}) — never starts a container."""
+        try:
+            proc = subprocess.run(
+                [docker, "image", "inspect", "--format", "{{json .Config.Labels}}", image],
+                text=True, capture_output=True, stdin=subprocess.DEVNULL, check=False,
+                timeout=CLI_VERSION_PROBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            self.note_timeout("docker image inspect", CLI_VERSION_PROBE_TIMEOUT_SECONDS)
+            return "unavailable", {}
+        except OSError:
+            return "unavailable", {}
+        if proc.returncode != 0:
+            return ("missing" if "no such image" in proc.stderr.lower() else "unavailable"), {}
+        try:
+            labels = json.loads(proc.stdout.strip() or "null")
+        except ValueError:
+            labels = None
+        return "ok", labels if isinstance(labels, dict) else {}
+
+    def _runner_run_probe(self, docker: str, image: str) -> tuple[int, int, int] | None:
+        """Opt-in: throwaway container, no pull, no network, bounded."""
+        try:
+            proc = subprocess.run(
+                [docker, "run", "--rm", "--pull=never", "--network=none",
+                 "--entrypoint", RUNNER_CLI_ENTRYPOINT, image, "--version"],
+                text=True, capture_output=True, stdin=subprocess.DEVNULL, check=False,
+                timeout=RUNNER_RUN_PROBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            self.note_timeout("docker run <runner image> --version", RUNNER_RUN_PROBE_TIMEOUT_SECONDS)
+            return None
+        except OSError:
+            return None
+        if proc.returncode != 0:
+            return None
+        return parse_cli_version(proc.stdout) or parse_cli_version(proc.stderr)
+
+    def _check_runner_cli_floor(self, env: dict[str, str], floor: tuple[int, int, int], need: str) -> None:
+        """CLI baked into A2A_DOCKER_RUNNER_IMAGE: build label, then tag, then opt-in run."""
+        item = "worker claude cli floor (runner image)"
+        image = env.get("A2A_DOCKER_RUNNER_IMAGE", "").strip()
+        enabled = env.get("A2A_DOCKER_RUNNER_ENABLED", "").strip().lower()
+        if not image or enabled in {"0", "false", "no", "off"}:
+            self.add("정상", item, "해당 없음 (docker runner not configured)", "none")
+            return
+        wanted = format_cli_version(floor)
+        shown = _printable(image)
+        rebuild = (
+            f"rebuild or `docker load` a runner image whose {RUNNER_CLI_ENTRYPOINT} is >= {wanted} "
+            f"(tag ...-claude-{wanted}) and point A2A_DOCKER_RUNNER_IMAGE at it"
+        )
+        docker = self._docker_cli()
+        state, labels = ("unavailable", {}) if docker is None else self._runner_image_labels(docker, image)
+        if state == "missing":
+            self.add("경고", item, f"{need}; runner image not present locally ({shown})", rebuild)
+            return
+        version: tuple[int, int, int] | None = None
+        source = ""
+        package = labels.get(RUNNER_CLI_PACKAGE_LABEL)
+        if isinstance(package, str) and package.startswith("@anthropic-ai/claude-code@"):
+            version, source = parse_cli_version(package), "label"
+        if version is None:
+            match = _IMAGE_TAG_CLI_RE.search(image.rsplit("/", 1)[-1].partition(":")[2])
+            if match is not None:
+                version, source = parse_cli_version(match.group(1)), "tag"
+        probe = os.environ.get("CCC_DOCTOR_RUNNER_CLI_PROBE", "").strip() == "1"
+        if version is None and probe and docker is not None and state == "ok":
+            version, source = self._runner_run_probe(docker, image), "run"
+        if version is None:
+            if state == "unavailable":
+                reason = "docker CLI not found" if docker is None else "docker daemon unavailable"
+                self.add(
+                    "정상", item,
+                    f"{need}; runner 확인 불가 ({reason}; tag carries no CLI version) ({shown})",
+                    "none",
+                )
+                return
+            self.add(
+                "경고", item,
+                f"{need}; runner 확인 불가 (no CLI label/tag{', probe failed' if probe else ''}) ({shown})",
+                "rerun with CCC_DOCTOR_RUNNER_CLI_PROBE=1 (bounded `docker run --rm --pull=never "
+                f"--network=none`) or check `{RUNNER_CLI_ENTRYPOINT} --version` in the image; {rebuild}",
+            )
+            return
+        status = f"{need}; runner={format_cli_version(version)} via {source} ({shown})"
+        if version < floor:
+            self.add("경고", item, status, rebuild)
+        else:
+            self.add("정상", item, status, "none")
+
     @staticmethod
     def _self_update_abort_reason(line: str) -> str | None:
         """Return the reason of an `abort` log line, else None.
@@ -2890,6 +3190,9 @@ def parse_args(argv: list[str]) -> tuple[int, bool, bool, bool, bool, str]:
             print("- `--rollback --apply` restores only settings.json from that backup, after backing up")
             print("  the current settings.json as `ccc-doctor-pre-rollback-*.tar.gz`.")
             print("- 수동필요/risky/system-level items fail closed and are never auto-repaired.")
+            print("- The worker Claude CLI floor check reads the runner image's CLI version from its")
+            print("  build label or tag only; CCC_DOCTOR_RUNNER_CLI_PROBE=1 opts in to a throwaway")
+            print("  `docker run --rm --pull=never --network=none` when neither carries it.")
             print("- `--json` writes exactly one JSON object to stdout (surrounding whitespace")
             print("  only); probe/subprocess diagnostics go to stderr so stdout stays strictly")
             print("  machine-parseable. `--fix`/`--rollback` take precedence and emit human text.")
