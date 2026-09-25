@@ -6,6 +6,7 @@ aggregation scoping, and the node policy gate.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from typing import Any
 
@@ -173,3 +174,52 @@ def test_aggregate_over_nodes_reports_unknown_for_partial() -> None:
     by_node = {item["node"]: item for item in result["nodes"]}
     assert by_node["peer-ok"]["status"] == "ok"
     assert by_node["peer-down"]["status"] == "unknown"
+
+
+def test_remote_command_has_no_cli_flags_and_probes_fleet_checkouts() -> None:
+    """The peer's CLI takes only --node; the old `--local` made every remote
+    call exit 2, and one fixed /opt path never fit Termux peers (#1990)."""
+    from telegram_bot.core.node_status import remote_command
+
+    ok_runner = _fake_runner({"ssh": json.dumps({"status": "ok"})})
+    calls: list[list[str]] = []
+
+    def runner(cmd: list[str], timeout: float):
+        calls.append(cmd)
+        return ok_runner(cmd, timeout)
+
+    collect_remote("peer-a", env=FLEET_ENV, runner=runner)
+    remote = calls[0][-1]
+    assert "--local" not in remote
+    assert remote == remote_command(None)
+    for root in ("/opt/ccc-node", "/root/ccc-node"):
+        assert f"{root}/scripts/ccc-node-status.py" in remote
+    assert '"$HOME"/ccc-node/scripts/ccc-node-status.py' in remote
+
+    override = {**FLEET_ENV, "CCC_NODE_STATUS_REMOTE_PATH": "/srv/x y/scripts/ccc-node-status.py"}
+    calls.clear()
+    collect_remote("peer-a", env=override, runner=runner)
+    assert calls[0][-1].startswith("for s in '/srv/x y/scripts/ccc-node-status.py' ")
+
+
+def test_remote_command_execs_the_first_checkout_found(tmp_path: Path) -> None:
+    """Run the snippet in a real shell: a Termux-style $HOME checkout is found
+    and executed; nothing found reports where it looked and exits 127."""
+    import shutil
+    from telegram_bot.core.node_status import remote_command
+
+    home = tmp_path / "home"
+    script = home / "ccc-node" / "scripts" / "ccc-node-status.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("import json, sys; print(json.dumps({'status': 'ok', 'argv': sys.argv[1:]}))\n")
+    env = {"HOME": str(home), "PATH": os.environ.get("PATH", "")}
+    sh = shutil.which("sh")
+    assert sh, "a POSIX shell is required"
+
+    found = subprocess.run([sh, "-c", remote_command(None)], env=env, capture_output=True, text=True, timeout=30)
+    assert found.returncode == 0, found.stderr
+    assert json.loads(found.stdout) == {"status": "ok", "argv": []}
+
+    empty = subprocess.run([sh, "-c", remote_command(None)], env={**env, "HOME": str(tmp_path / "nowhere")}, capture_output=True, text=True, timeout=30)
+    assert empty.returncode == 127
+    assert "not found under /opt/ccc-node, /root/ccc-node, $HOME/ccc-node" in empty.stderr
