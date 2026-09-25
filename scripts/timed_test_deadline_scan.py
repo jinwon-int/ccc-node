@@ -39,6 +39,19 @@ Exit codes: 0 clean, 1 findings exist (with ``--exit-nonzero-on-findings``),
 3 not configured. The third one matters — a scheduled scan whose repo list is
 missing or empty must not report a reassuring "0건".
 
+Owner notification (``--notify {off,high,low}``, env
+``CCC_TIMED_TEST_SCAN_NOTIFY``, default off; the cron installer renders
+``high``). A log nobody reads is the failure this scanner hunts, and on
+2026-09-25 its own cron log caught ccc-node#1913 expired-unjudged with nobody
+looking. With notify enabled, findings at or above the chosen confidence are
+summarised into the same owner-only bridge spool that agent-cron,
+ccc-self-update.sh and ccc-pr-status-poll.sh already use
+(``~/.claude/state/telegram-spool``, delivered by the bridge PushNotifier).
+The scanner never touches a bot token. An identical finding set is not
+re-sent daily: new findings notify at once, an unchanged set is re-sent as a
+reminder after three calendar days. A notification failure is reported on
+stderr and never changes the exit code.
+
 CI does not count as a timed test (owner, 2026-09-11): runs finish in minutes
 and GitHub shows the result, so ``gh-ci-wait`` covers them instead. This
 scanner deliberately does not look at check runs.
@@ -52,8 +65,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
+import importlib.util
 import json
+import os
 import re
+import secrets
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -504,6 +522,269 @@ def format_report(findings: Sequence[Finding], now: dt.datetime, mode: str) -> s
     return "\n".join(lines)
 
 
+# --- owner notification ------------------------------------------------------
+#
+# Reuses the owner-only bridge spool that agent-cron (write_owner_spool),
+# ccc-self-update.sh and ccc-pr-status-poll.sh already write: one small JSON
+# file {ts, event, node, text, dedup} per notice in
+# ${CCC_PUSH_SPOOL:-${CCC_STATE_DIR:-~/.claude/state}/telegram-spool}. The bridge
+# PushNotifier (opt-in via CCC_PUSH_ENABLED) delivers it to the owner chat and
+# archives it; a record without chatId can only ever reach the owner. #1821
+# asked that its failure alarms and this scanner share one channel instead of
+# each inventing one, and this is that channel.
+
+NOTIFY_ENV = "CCC_TIMED_TEST_SCAN_NOTIFY"
+NOTIFY_LEVELS = ("off", "high", "low")
+NOTIFY_EVENT = "TimedTestDeadlineScan"
+NOTIFY_MAX_FINDINGS = 10
+NOTIFY_TITLE_CHARS = 60
+# Calendar days, not a 72h timedelta: the cron fires at 09:20 daily and a few
+# seconds of start-up jitter must not push a reminder back by a whole day.
+NOTIFY_REMIND_AFTER_DAYS = 3
+NOTIFY_STATE_SCHEMA = "ccc.timed-test-deadline-scan.notify-state.v1"
+_NOTIFY_STAMP = "%Y-%m-%dT%H:%M"
+
+# Only a canonical GitHub issue/PR URL is copied into a notice; anything else
+# is rebuilt from repo#number so a crafted "url" field cannot smuggle text.
+_GITHUB_ITEM_URL = re.compile(
+    r"^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(?:issues|pull)/\d{1,7}$"
+)
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+class NotifyError(RuntimeError):
+    """Owner notification could not be produced safely; the scan is unaffected."""
+
+
+def _state_dir() -> Path:
+    claude_dir = os.environ.get("CCC_CLAUDE_DIR") or str(Path.home() / ".claude")
+    return Path(os.environ.get("CCC_STATE_DIR") or Path(claude_dir) / "state").expanduser()
+
+
+def push_spool_dir() -> Path:
+    """Same resolution order as the shell spool writers (self-update, pr-status-poll)."""
+    raw = os.environ.get("CCC_PUSH_SPOOL")
+    return Path(raw).expanduser() if raw else _state_dir() / "telegram-spool"
+
+
+def notify_state_path(mode: str) -> Path:
+    return _state_dir() / f"timed-test-deadline-scan.notify-{mode}.json"
+
+
+def resolve_notify_level(cli_value: str | None) -> str:
+    """CLI flag wins, then the env var, then off.
+
+    An unrecognised env value warns and stays off rather than guessing: the
+    installed cron always passes an explicit ``--notify``, so the env var only
+    matters for hand runs, where a surprise message is the worse failure.
+    """
+    if cli_value:
+        return cli_value
+    raw = (os.environ.get(NOTIFY_ENV) or "").strip().lower()
+    if not raw:
+        return "off"
+    if raw not in NOTIFY_LEVELS:
+        print(f"notify: ignoring {NOTIFY_ENV}={raw[:20]!r} (expected off|high|low)", file=sys.stderr)
+        return "off"
+    return raw
+
+
+def notify_candidates(findings: Sequence[Finding], level: str) -> list[Finding]:
+    """Findings worth waking the owner for at the given level.
+
+    ``high`` is the installed default: low-confidence hits are the demoted
+    false-positive shapes, kept in the log for recall but not worth a ping.
+    """
+    if level == "off":
+        return []
+    if level == "high":
+        return [f for f in findings if f.confidence == "high"]
+    return list(findings)
+
+
+def finding_fingerprint(finding: Finding) -> str:
+    """repo#number plus the deadline — a re-booked deadline counts as new."""
+    anchor = finding.deadline.strftime(_NOTIFY_STAMP) if finding.deadline else finding.kind
+    return f"{finding.repo}#{finding.number}@{anchor}"
+
+
+def load_notify_state(path: Path) -> dict[str, Any]:
+    """Previously notified fingerprints; unreadable state means "never notified".
+
+    Failing toward a duplicate notice is deliberate: a lost state file costing
+    one repeated message is cheap, a state glitch silencing a finding is not.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict) or not isinstance(data.get("fingerprints"), list):
+        return {}
+    return data
+
+
+def decide_notification(
+    current: Sequence[str], state: dict[str, Any], now: dt.datetime
+) -> tuple[str | None, set[str]]:
+    """Return (reason, new_fingerprints); reason None means stay quiet.
+
+    ``new``      at least one fingerprint was not in the last notified set.
+    ``reminder`` the set is unchanged (or shrank) and the last notice is
+                 NOTIFY_REMIND_AFTER_DAYS or more calendar days old.
+    """
+    if not current:
+        return None, set()
+    previous = {str(fp) for fp in state.get("fingerprints", [])}
+    new = set(current) - previous
+    if new:
+        return "new", new
+    try:
+        last = dt.datetime.strptime(str(state.get("notified_at")), _NOTIFY_STAMP)
+    except ValueError:
+        return "reminder", set()
+    if (now.date() - last.date()).days >= NOTIFY_REMIND_AFTER_DAYS:
+        return "reminder", set()
+    return None, set()
+
+
+def _load_canonical_redaction() -> Any:
+    """Load bridge/utils/redaction.py from this checkout, as agent-cron does."""
+    source = Path(__file__).resolve().parents[1] / "bridge" / "utils" / "redaction.py"
+    spec = importlib.util.spec_from_file_location("_ccc_timed_test_scan_redaction", source)
+    if spec is None or spec.loader is None or not source.is_file():
+        raise NotifyError("canonical redaction unavailable; notice suppressed")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _clean_title(title: str, redaction: Any) -> str:
+    text = " ".join(_CONTROL_CHARS.sub(" ", title or "").split())
+    text = redaction.redact_credentials(text)
+    if len(text) > NOTIFY_TITLE_CHARS:
+        text = text[: NOTIFY_TITLE_CHARS - 1].rstrip() + "…"
+    return text or "(제목 없음)"
+
+
+def _safe_url(finding: Finding) -> str:
+    if _GITHUB_ITEM_URL.match(finding.url or ""):
+        return finding.url
+    if REPO_NAME.match(finding.repo or ""):
+        return f"https://github.com/{finding.repo}/issues/{int(finding.number)}"
+    return ""
+
+
+def build_notify_text(
+    findings: Sequence[Finding],
+    new: set[str],
+    reason: str,
+    level: str,
+    mode: str,
+    redaction: Any,
+) -> str:
+    """Short Korean owner notice: count, then repo#number / deadline / overdue /
+    title / URL per finding. No paragraph or comment excerpts ever — those are
+    issue prose and may quote anything."""
+    what = "기한 경과 미판정" if mode == "expired" else "절대 종료시각 없음"
+    head = f"⏰ 시한부 테스트 {what} {len(findings)}건"
+    if reason == "new":
+        head += f" (신규 {len(new)}건)"
+    else:
+        head += f" ({NOTIFY_REMIND_AFTER_DAYS}일+ 미해소 재알림)"
+    lines = [head]
+    # New findings first so the cap never hides what triggered the notice.
+    ordered = sorted(findings, key=lambda f: finding_fingerprint(f) not in new)
+    for finding in ordered[:NOTIFY_MAX_FINDINGS]:
+        repo = finding.repo if REPO_NAME.match(finding.repo or "") else "?"
+        mark = "🆕" if finding_fingerprint(finding) in new else "•"
+        if finding.deadline is not None:
+            lines.append(
+                f"{mark} {repo}#{int(finding.number)} · 종료 {finding.deadline:%Y-%m-%d %H:%M} KST"
+                f" · 경과 {finding.days_overdue}일"
+            )
+        else:
+            lines.append(f"{mark} {repo}#{int(finding.number)} · 절대시각 없음")
+        lines.append(f"  {_clean_title(finding.title, redaction)}")
+        url = _safe_url(finding)
+        if url:
+            lines.append(f"  {url}")
+    if len(ordered) > NOTIFY_MAX_FINDINGS:
+        lines.append(f"외 {len(ordered) - NOTIFY_MAX_FINDINGS}건")
+    lines.append(f"신뢰도 {level} 이상 · 전체 목록: timed-test-deadline-scan.cron.log")
+    text = redaction.redact_credentials("\n".join(lines))
+    if redaction.contains_credential(text):
+        raise NotifyError("credential-shaped text survived redaction; notice suppressed")
+    return text
+
+
+def write_owner_spool(text: str, dedup: str, now: dt.datetime) -> Path:
+    """Queue one owner-only notice in the bridge push spool (0600, atomic).
+
+    Written through the canonical secure-fs helper: a private ``.tmp`` sibling
+    renamed into place, so the PushNotifier's ``*.json`` poll never reads a
+    half-written file (it archives unparsable files as malformed, which would
+    silently drop the notice).
+    """
+    import ccc_secure_fs  # lazy: the scan itself must not depend on it
+
+    spool = push_spool_dir()
+    spool.mkdir(parents=True, exist_ok=True)
+    stamp = now.replace(tzinfo=KST).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    node = os.environ.get("CCC_NODE") or socket.gethostname().split(".")[0] or "node"
+    payload = {
+        "ts": stamp,
+        "event": NOTIFY_EVENT,
+        "node": node,
+        "text": text,
+        "dedup": f"{NOTIFY_EVENT}:{dedup}",
+    }
+    name = f"{stamp.replace(':', '-')}-{NOTIFY_EVENT}-{os.getpid()}-{secrets.token_hex(4)}.json"
+    path = spool / name
+    ccc_secure_fs.atomic_write_text(
+        path, json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n", mode=0o600
+    )
+    return path
+
+
+def _save_notify_state(path: Path, fingerprints: Sequence[str], notified_at: str | None) -> None:
+    import ccc_secure_fs
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "schema": NOTIFY_STATE_SCHEMA,
+        "fingerprints": sorted(fingerprints),
+        "notified_at": notified_at,
+    }
+    ccc_secure_fs.atomic_write_text(path, json.dumps(state, ensure_ascii=False) + "\n", mode=0o600)
+
+
+def notify_owner(findings: Sequence[Finding], now: dt.datetime, mode: str, level: str) -> str:
+    """Spool an owner notice when warranted; return a one-line outcome for the log.
+
+    The dedup state is only advanced after the spool file exists, so a failed
+    write is retried on the next run instead of being marked as sent.
+    """
+    candidates = notify_candidates(findings, level)
+    current = [finding_fingerprint(f) for f in candidates]
+    state_path = notify_state_path(mode)
+    state = load_notify_state(state_path)
+    reason, new = decide_notification(current, state, now)
+    if reason is None:
+        previous = sorted(str(fp) for fp in state.get("fingerprints", []))
+        if previous != sorted(current):
+            # Shrunk (or cleared): remember the smaller set so a finding that
+            # comes back later counts as new again. Keep the notice clock.
+            _save_notify_state(state_path, current, state.get("notified_at"))
+        if not current:
+            return f"notify: nothing at level={level}"
+        return f"notify: unchanged set of {len(current)}, last sent {state.get('notified_at')}"
+    text = build_notify_text(candidates, new, reason, level, mode, _load_canonical_redaction())
+    digest = hashlib.sha256("\n".join(sorted(current)).encode("utf-8")).hexdigest()[:12]
+    path = write_owner_spool(text, f"{mode}:{reason}:{digest}:{now:%Y%m%d}", now)
+    _save_notify_state(state_path, current, now.strftime(_NOTIFY_STAMP))
+    return f"notify: spooled reason={reason} findings={len(current)} new={len(new)} file={path.name}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     source = parser.add_mutually_exclusive_group(required=True)
@@ -534,6 +815,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--exit-nonzero-on-findings",
         action="store_true",
         help="exit 1 when findings exist, for cron/doctor wiring",
+    )
+    parser.add_argument(
+        "--notify",
+        choices=NOTIFY_LEVELS,
+        default=None,
+        help=f"owner notice via the bridge push spool for findings at this confidence "
+        f"or above (default: ${NOTIFY_ENV}, else off). Unchanged sets are re-sent "
+        f"only every {NOTIFY_REMIND_AFTER_DAYS} days.",
     )
     return parser
 
@@ -581,6 +870,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(format_report(findings, now, args.mode))
+    sys.stdout.flush()
+
+    level = resolve_notify_level(args.notify)
+    if level != "off":
+        # Never let the notice mask the scan: whatever happens here, the exit
+        # code below still reports what the scan found.
+        try:
+            print(notify_owner(findings, now, args.mode, level), file=sys.stderr)
+        except Exception as exc:  # any failure is non-fatal by contract
+            print(f"notify failed (scan result unaffected): {type(exc).__name__}: {exc}", file=sys.stderr)
 
     if findings and args.exit_nonzero_on_findings:
         return 1

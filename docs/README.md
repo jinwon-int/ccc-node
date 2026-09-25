@@ -35,6 +35,7 @@ Living operator docs stay at the top level of `docs/`; historical closeouts and 
 | [`danso-telegram.md`](danso-telegram.md) | Select Danso with Astra medium and explicit host/bubblewrap execution. |
 | [`piri-runtime-contract.md`](piri-runtime-contract.md) | PiriRuntime provider contract. |
 | [`pr-status-poll.md`](pr-status-poll.md) | PR/issue status poll lane (#962). |
+| [`timed-test-deadline-scan.md`](timed-test-deadline-scan.md) | Expired-unjudged timed-test scanner cron and its owner spool notice (#1870). |
 | [`quality-baseline.md`](quality-baseline.md) | Bridge quality gates and measured coverage baseline (#348). |
 | [`service-control.md`](service-control.md) | Service control and the real enforcement split (post TM-1306). |
 | [`version-and-provenance.md`](version-and-provenance.md) | Version anchor, provenance, and self-update identity. |
