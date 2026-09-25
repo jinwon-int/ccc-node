@@ -75,7 +75,7 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
   # wrapper argv too: on Termux `codex` is @bash0816/codex-termux, whose real
   # process is `.../codex.bin -c check_for_update_on_startup=false exec ...`,
   # so "codex exec" is never contiguous there and the old pattern let two
-  # orphans live 34 days on daegyo (#1994).
+  # orphans live 34 days on a Termux node (#1994).
   for pid in $(pgrep -f "codex(\.bin)? .*exec .*${LANE_TAG}" 2>/dev/null || true); do
     [ "$pid" = "$$" ] && continue
     kill -9 "$pid" 2>/dev/null || true
