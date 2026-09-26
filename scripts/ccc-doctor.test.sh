@@ -12,7 +12,11 @@ pass=0; fail=0
 # provider or extractor-readiness probe. The standalone doctor fixtures model
 # harness drift only; extractor readiness has isolated Python verdict tests.
 unset CCC_AGENT_PROVIDER CCC_CODEX_CLI_PATH CCC_CODEX_READINESS_TIMEOUT
+unset CCC_DOCTOR_CLAUDE_BIN CCC_DOCTOR_DOCKER_BIN CCC_DOCTOR_RUNNER_CLI_PROBE
 export CCC_MEMORY_DISTILL_PROVIDER=off
+# A worker node's real /etc/default/a2a-hermes-worker (and its claude/docker)
+# must not leak into generic fixtures; the CLI floor cases opt in below.
+export CCC_DOCTOR_WORKER_ENV_FILE=/nonexistent/ccc-doctor-test/a2a-hermes-worker
 # Some hardened runners mount /tmp noexec; the doctor must execute fixture CLIs.
 TMP_BASE="${TMPDIR:-$(dirname "$ROOT")}"; mkdir -p "$TMP_BASE"
 TMP="$(mktemp -d "$TMP_BASE/ccc-doctor-test.XXXXXX")"
@@ -1196,6 +1200,38 @@ printf '%s\n' worker > "$mt/home/.claude/a2a-role"
 out="$(run_doctor "$mt")"
 ok "the persisted worker marker opts the roster back in" \
   'grep -q "agents/a2a-demo.md.*missing" <<<"$out"'
+
+# --- worker Claude CLI floor (a2a-nexus#2275) ---------------------------------
+# End-to-end through the wrapper and --json: a model pin that needs a newer
+# Claude Code than the host CLI / runner image surfaces as 경고 rows, never a
+# non-zero exit, and never echoes the secret-bearing env file. Verdict details
+# live in scripts/ccc_doctor_cli_floor_test.py.
+cf="$(make_fixture cli-floor standalone)"
+mkdir -p "$cf/bin"
+printf '#!/usr/bin/env bash\necho "2.1.274 (Claude Code)"\n' > "$cf/bin/claude"
+chmod +x "$cf/bin/claude"
+cat > "$cf/worker.env" <<'EOF'
+A2A_BROKER_TOKEN=SENSITIVE_WORKER_TOKEN_MARKER
+A2A_CLAUDE_MODEL=claude-opus-5-5
+A2A_DOCKER_RUNNER_IMAGE=a2a-docker-runner-claude:cf2c218-claude-2.1.236
+EOF
+cf_json() {
+  CCC_DOCTOR_WORKER_ENV_FILE="$cf/worker.env" CCC_DOCTOR_CLAUDE_BIN="$cf/bin/claude" \
+    CCC_DOCTOR_DOCKER_BIN="$cf/bin/no-docker" run_doctor "$cf" --json
+}
+cf_out="$(cf_json)"
+# shellcheck disable=SC2034  # cf_rc is read via eval inside ok()
+cf_rc=$?
+ok "floor unmet on host is a 경고 with the npm hint" \
+  'jq -e ".rows[] | select(.item == \"worker claude cli floor (host)\" and .class == \"경고\") | (.status | contains(\"host=2.1.274\")) and (.action | contains(\"@anthropic-ai/claude-code@2.1.280\"))" <<<"$cf_out" >/dev/null'
+ok "floor unmet in the runner image tag is a 경고 even without docker" \
+  'jq -e ".rows[] | select(.item == \"worker claude cli floor (runner image)\" and .class == \"경고\") | .status | contains(\"runner=2.1.236 via tag\")" <<<"$cf_out" >/dev/null'
+ok "CLI floor 경고 does not flip the exit code" '[ "$cf_rc" = 0 ]'
+ok "worker env secrets never reach the report" '! grep -q SENSITIVE_WORKER_TOKEN_MARKER <<<"$cf_out"'
+# shellcheck disable=SC2034  # cf_out is read via eval inside ok()
+cf_out="$(run_doctor "$cf" --json)"
+ok "no worker env file is 해당 없음, not a finding" \
+  'jq -e ".rows[] | select(.item == \"worker claude cli floor\" and .class == \"정상\") | .status | contains(\"해당 없음\")" <<<"$cf_out" >/dev/null'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

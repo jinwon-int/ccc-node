@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "description": "Minimum Claude Code CLI version each Claude model id requires. Read by scripts/ccc_doctor.py (check_worker_claude_cli_floor). Source of truth is the API 400 an older CLI receives: 'Claude Code <old> does not support this model; version <min_cli> or newer is required.' Add a row with the version from that message; a model without a row is reported as 'floor unknown' and never warned on. Keys are normalized model ids (lowercase, no provider prefix, no [..] suffix).",
+  "floors": {
+    "claude-opus-5-5": {
+      "min_cli": "2.1.280",
+      "evidence": "jinwon-int/a2a-nexus#2275 (2026-09-25): 'Claude Code 2.1.274 does not support this model; version 2.1.280 or newer is required.'"
+    }
+  }
+}
