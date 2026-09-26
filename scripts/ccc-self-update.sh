@@ -67,6 +67,8 @@
 #      bridge is serving a request, so a restart cannot SIGTERM-kill an in-flight
 #      `claude` child (exit 143) mid-task. Reads the bridge's health.json.
 #      CCC_SELF_UPDATE_HEALTH_FILE (default ~/.telegram_bot/health.json),
+#      CCC_SELF_UPDATE_MATRIX_HEALTH_FILE (default ~/.ccc-matrix/health.json;
+#      consulted only when ccc-matrix-bridge is in the services allowlist),
 #      CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS (90), CCC_SELF_UPDATE_BUSY_MAX_SECONDS
 #      (1800 — never defer a task older than this), CCC_SELF_UPDATE_MAX_DEFER_SECONDS
 #      (3600 — cap total deferral so continuous load can't starve updates).
@@ -509,8 +511,9 @@ recover_stray_branch() { # <stray-branch>
   [ -z "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]
 }
 
-bridge_service_allowlisted() {
-  local svc
+# Return 0 when the allowlist names <unit> (with or without .service, any scope).
+service_allowlisted() {
+  local want="${1%.service}" svc
   [ -f "$SERVICES_FILE" ] || return 1
   while IFS= read -r svc; do
     svc="${svc%%#*}"
@@ -519,11 +522,13 @@ bridge_service_allowlisted() {
       user:*) svc="${svc#user:}" ;;
       system:*) svc="${svc#system:}" ;;
     esac
-    case "$svc" in
-      ccc-telegram-bridge|ccc-telegram-bridge.service) return 0 ;;
-    esac
+    [ "${svc%.service}" = "$want" ] && return 0
   done < "$SERVICES_FILE"
   return 1
+}
+
+bridge_service_allowlisted() {
+  service_allowlisted ccc-telegram-bridge
 }
 
 bridge_runtime_config_preflight() {
@@ -608,6 +613,11 @@ fi
 # or restarted) and let the next scheduled tick retry — bounded so a hung/very-long
 # request, or continuous load, cannot starve updates forever.
 HEALTH_FILE="${CCC_SELF_UPDATE_HEALTH_FILE:-${HOME:-/root}/.telegram_bot/health.json}"
+# The Matrix frontend (ccc-matrix-bridge, BOT_DATA_DIR=~/.ccc-matrix) writes the
+# same workload snapshot to its own data dir. It is consulted only when that unit
+# is allowlisted: this script restarts nothing else, so a busy Matrix turn is
+# only at risk when the Matrix unit itself is in the restart set.
+MATRIX_HEALTH_FILE="${CCC_SELF_UPDATE_MATRIX_HEALTH_FILE:-${HOME:-/root}/.ccc-matrix/health.json}"
 FRESH_SECONDS="${CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS:-90}"
 BUSY_MAX_SECONDS="${CCC_SELF_UPDATE_BUSY_MAX_SECONDS:-1800}"
 MAX_DEFER_SECONDS="${CCC_SELF_UPDATE_MAX_DEFER_SECONDS:-3600}"
@@ -615,9 +625,9 @@ DEFER_MARK="$STATE_DIR/self-update.deferred-since"
 
 # Echo a reason and return 0 when the bridge is busy; return 1 (fail-open) when
 # idle, unknown, stale, or over the per-task cap.
-bridge_is_busy() {
-  [ -f "$HEALTH_FILE" ] || return 1
-  python3 - "$HEALTH_FILE" "$FRESH_SECONDS" "$BUSY_MAX_SECONDS" <<'PY'
+health_file_busy() {
+  [ -f "$1" ] || return 1
+  python3 - "$1" "$FRESH_SECONDS" "$BUSY_MAX_SECONDS" <<'PY'
 import json, sys
 from datetime import datetime, timezone
 path, fresh_window, busy_max = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
@@ -644,6 +654,19 @@ if fresh and active > 0 and oldest < busy_max:
     sys.exit(0)  # busy
 sys.exit(1)  # idle / stale / over-cap -> proceed
 PY
+}
+
+bridge_is_busy() {
+  local r
+  if r="$(health_file_busy "$HEALTH_FILE")"; then
+    printf '%s\n' "$r"
+    return 0
+  fi
+  if service_allowlisted ccc-matrix-bridge && r="$(health_file_busy "$MATRIX_HEALTH_FILE")"; then
+    printf 'matrix %s\n' "$r"
+    return 0
+  fi
+  return 1
 }
 
 if [ "$FORCE" != "1" ] && busy_reason="$(bridge_is_busy)"; then
