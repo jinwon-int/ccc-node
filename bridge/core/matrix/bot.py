@@ -1599,8 +1599,43 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
 
     # -- callbacks handed to process_message ---------------------------------
 
+    def _family_room_ids(self) -> set[str]:
+        try:
+            return {str(room) for room in (self.load_config().get("family_rooms") or ())}
+        except Exception:  # noqa: BLE001 - unknown config: treat every room as shared
+            return {"*"}
+
+    def _progress_callbacks(self, sink: TurnSink, room_id: str) -> dict[str, Any]:
+        """Status, interim and (opt-in) live-preview callbacks for one ``process_message``.
+
+        With ``CCC_MATRIX_STREAMING`` on (#1796, default off like Telegram's
+        ``CCC_TELEGRAM_STREAMING``), the answer grows in the turn's progress
+        bubble; heartbeat texts are held back while the preview shows, and
+        completed intermediate messages go out through the same interim path.
+        """
+
+        interim = self._make_interim_callback(sink, room_id)
+        # Direct rooms only: in a family room, other people's messages bury the
+        # bubble, and every repost (redact + new message) notifies the family.
+        family = self._family_room_ids()
+        direct = bool(room_id) and "*" not in family and room_id not in family
+        if not direct or not ExternalWaitMonitor.env_flag("CCC_MATRIX_STREAMING", default=False):
+            return {"status_callback": self._make_status_callback(sink), "interim_message_callback": interim}
+        from telegram_bot.core.matrix.streaming import MatrixAnswerPreview, interval_from
+
+        preview = MatrixAnswerPreview(
+            sink,
+            interim,
+            interval_s=interval_from(os.environ.get("CCC_MATRIX_DRAFT_EDIT_INTERVAL_S", "")),
+        )
+        return {
+            "status_callback": self._make_status_callback(sink, preview=preview),
+            "interim_message_callback": interim,
+            "streaming_sink": preview,
+        }
+
     def _make_status_callback(
-        self, sink: TurnSink
+        self, sink: TurnSink, *, preview: Any = None
     ) -> Callable[[Optional[str], Optional[int]], Awaitable[Optional[int]]]:
         # Telegram edits one status bubble in place; Matrix now matches via
         # sink.status (create once, then m.replace edits, redact on None).
@@ -1620,6 +1655,12 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                 except Exception:
                     logger.warning("Matrix status redact failed", exc_info=True)
                 return None
+            if preview is not None and preview.holds_heartbeat():
+                # The bubble shows a live answer preview (#1796); a heartbeat
+                # would overwrite it. A preview that stopped moving yields the
+                # bubble so elapsed time / stall warnings still show. The
+                # handle keeps the cleanup path armed.
+                return _STATUS_HANDLE
             now = time.monotonic()
             if text == last["text"] or now - last["at"] < STATUS_MIN_INTERVAL_S:
                 return _STATUS_HANDLE
@@ -2281,9 +2322,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             new_session=new_session,
             approval_callback=self._make_approval_callback(sink),
             typing_callback=sink.typing,
-            status_callback=self._make_status_callback(sink),
             notification_bot=self._notification_bot(),
-            interim_message_callback=self._make_interim_callback(sink, room_id),
+            **self._progress_callbacks(sink, room_id),
             usage_mode=usage_mode,
             **extra,
         ))
@@ -3043,9 +3083,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             sandbox_policy=self._codex_sandbox_policy(user_id),
             approval_callback=self._make_approval_callback(sink),
             typing_callback=sink.typing,
-            status_callback=self._make_status_callback(sink),
             notification_bot=self._notification_bot(),
-            interim_message_callback=self._make_interim_callback(sink, room_id),
+            **self._progress_callbacks(sink, room_id),
             usage_mode=MODE_INTERACTIVE,
         ))
         await self._save_session_id(key, response, user_id=user_id, chat_id=chat_id)
