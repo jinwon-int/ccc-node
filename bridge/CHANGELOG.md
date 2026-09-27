@@ -1,5 +1,14 @@
 # Changelog
 
+- **Matrix frontend answers messages it will not read instead of dropping them (#2002).**
+  A text over 16 KiB (about 5,400 Hangul characters), an edit (`m.replace`)
+  and a thread reply (`m.thread`) used to vanish without a word — the sender
+  could not tell a refusal from a slow answer. A new `Policy.rejection` names
+  the refusal and the transport answers once (durable idempotent notice; an
+  edit once per edited message; family rooms only when addressed). Stickers,
+  emotes and `m.notice` from a trusted device get one notice per direct room.
+  Every refusal bumps a body-free `ignored_messages` counter in the inbox meta.
+
 - **Matrix frontend runs the remaining lifecycle background services (#1825).**
   After #1998 the turn-stall probe, health alerts, session resource guard,
   skill-candidate collector, orphan reaper, task-ledger reconciliation,
