@@ -350,6 +350,23 @@ source code) under `PROJECT_ROOT` — follows the answer. Matrix-specific:
   body-free counters in inbox meta `outbound_file_failures`.
 - `CCC_MATRIX_SEND_FILES=0` turns it off.
 
+## Messages that are not read are answered, not dropped (#2002)
+
+`Policy.admit` still refuses these, but `Policy.rejection` names the refusal
+and the transport answers the sender once (durable, idempotent notice; family
+rooms only when the message addresses the bot):
+
+| Message | Notice | Once per |
+|---|---|---|
+| text over `MAX_TEXT_BYTES` (16 KiB ≈ 5,400 Hangul) | `⚠️ 메시지가 너무 길어 읽지 않았습니다(N KiB, 한도 16 KiB)…` — send it as a file | event |
+| an edit (`rel_type: m.replace`) | `✏️ 수정한 메시지는 다시 읽지 않습니다…` | edited message |
+| a thread reply (`rel_type: m.thread`) | `🧵 스레드 안의 답글은 읽지 않습니다…` | event |
+| sticker, `m.emote`, `m.notice` from a trusted device | `스티커·이모트·알림 형식 메시지는 읽지 않습니다…` | direct room |
+
+Each refusal also bumps a body-free counter in the inbox meta
+`ignored_messages` (`{reason: count, room, updated}`). Stale events, bots and
+family chatter that does not address the bot stay silent as before.
+
 ## Not yet
 
 - Voice transcription for `m.audio` (handled as a file today).

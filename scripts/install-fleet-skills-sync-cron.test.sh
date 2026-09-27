@@ -53,6 +53,26 @@ ok "installed line resolves the exact ref at fire time" 'grep -qF "git ls-remote
 ok "installed line applies the resolved ref" 'grep -qF "ccc-fleet-skills-sync.py\" apply --ref \"\$S\"" "$FAKE_CRON"'
 ok "installed line guards an empty ref (offline)" 'grep -qF "[ -n \"\$S\" ] &&" "$FAKE_CRON"'
 ok "installed line pins CCC_CLAUDE_DIR for the sync" 'grep -qF "CCC_CLAUDE_DIR=\"$CCC_CLAUDE_DIR\" python3" "$FAKE_CRON"'
+ok "installed line runs the skill-listing policy after the sync (#2011)" \
+  'grep -qF "apply --ref \"\$S\"; rc=\$?; [ -f \"$CCC_CLAUDE_DIR/hooks/ccc-skill-listing-policy.py\" ] && CCC_CLAUDE_DIR=\"$CCC_CLAUDE_DIR\" python3 \"$CCC_CLAUDE_DIR/hooks/ccc-skill-listing-policy.py\" apply --quiet; exit \$rc" "$FAKE_CRON"'
+
+# Fire-time behavior of the rendered body (#2011): the policy runs even when the
+# sync fails, and the entry still reports the SYNC's exit status.
+fire_dir="$TMP/fire"; mkdir -p "$fire_dir/bin"
+printf '#!/usr/bin/env bash\nprintf "%%s\\trefs/heads/main\\n" 0123456789012345678901234567890123456789\n' > "$fire_dir/bin/git"
+chmod +x "$fire_dir/bin/git"
+printf 'import sys\nopen(%s, "a").write("sync\\n")\nsys.exit(3)\n' "'$fire_dir/calls'" > "$fire_dir/sync.py"
+printf 'open(%s, "a").write("policy\\n")\n' "'$fire_dir/calls'" > "$fire_dir/policy.py"
+fire_cron="$TMP/fire.cron"
+CCC_FLEET_SKILLS_SYNC_CMD="$fire_dir/sync.py" \
+  CCC_SKILL_LISTING_POLICY_CMD="$fire_dir/policy.py" \
+  bash "$INSTALLER" --dry-run 2>/dev/null | grep -F "# ccc-node:fleet-skills-sync gen=" > "$fire_cron"
+fire_body="$(sed -E "s/^.*bash -lc '(.*)' >> .*$/\\1/" "$fire_cron")"
+PATH="$fire_dir/bin:$PATH" bash -c "$fire_body" >/dev/null 2>&1
+# shellcheck disable=SC2034  # fire_rc is read via eval inside ok()
+fire_rc=$?
+ok "fired entry runs sync then policy" '[ "$(tr "\n" " " < "$fire_dir/calls" 2>/dev/null)" = "sync policy " ]'
+ok "fired entry keeps the sync exit status" '[ "$fire_rc" = 3 ]'
 
 # generation stamp (#1081)
 # shellcheck source=/dev/null

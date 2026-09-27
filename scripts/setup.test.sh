@@ -285,6 +285,30 @@ ok "template-declared env keys stay repo-owned (node override dropped)" \
 ok "env preservation is logged with the key names" 'grep -q "preserved node-local settings env keys: .*CCC_NODE_LOCAL_EXPERIMENT_FLAG" <<<"$out"'
 out="$(HOME="$env_home" CCC_CLAUDE_DIR="$env_claude" CCC_HERMES_DIR="$env_hermes" bash "$SETUP" --no-backup --dry-run 2>&1)"
 ok "dry-run only announces env preservation" 'grep -q "\[dry-run\] preserve node-local settings env keys" <<<"$out"'
+# --- #2011 A: skill-listing policy runs after the merge; its keys survive ----
+# setup applies the policy once repo skills are installed: core skills keep
+# their description, non-core ones become "name-only", and the budget key is
+# set only when absent. A re-render must carry the operator's and the policy's
+# skillOverrides / skillListingBudgetFraction / skillListingMaxDescChars.
+sl_home="$TMP/sl-home"; sl_claude="$sl_home/.claude"; sl_hermes="$sl_home/.hermes"
+mkdir -p "$sl_claude" "$sl_hermes"
+HOME="$sl_home" CCC_CLAUDE_DIR="$sl_claude" CCC_HERMES_DIR="$sl_hermes" bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "setup applies the skill-listing policy (budget key set when absent)" \
+  'jq -e ".skillListingBudgetFraction == 0.02" "$sl_claude/settings.json" >/dev/null && [ -f "$sl_claude/state/skill-listing-policy.json" ]'
+ok "core skill keeps its description; non-core repo skill is name-only" \
+  'jq -e "(.skillOverrides | has(\"gh-pr-flow\") | not) and .skillOverrides[\"hwp-forge-donor-template-restore-build\"] == \"name-only\"" "$sl_claude/settings.json" >/dev/null'
+ok "setup installs the policy and its core list into hooks/" \
+  '[ -x "$sl_claude/hooks/ccc-skill-listing-policy.py" ] && [ -f "$sl_claude/hooks/skill-listing-core.txt" ]'
+jq '.skillOverrides["gh-pr-flow"] = "off" | .skillListingBudgetFraction = 0.05 | .skillListingMaxDescChars = 500' \
+  "$sl_claude/settings.json" > "$TMP/sl-seeded.json" && mv "$TMP/sl-seeded.json" "$sl_claude/settings.json"
+out="$(HOME="$sl_home" CCC_CLAUDE_DIR="$sl_claude" CCC_HERMES_DIR="$sl_hermes" bash "$SETUP" --no-backup 2>&1)"
+ok "operator skill-listing keys survive setup re-render" \
+  'jq -e ".skillOverrides[\"gh-pr-flow\"] == \"off\" and .skillListingBudgetFraction == 0.05 and .skillListingMaxDescChars == 500" "$sl_claude/settings.json" >/dev/null'
+ok "policy-owned name-only entries survive setup re-render" \
+  'jq -e ".skillOverrides[\"hwp-forge-donor-template-restore-build\"] == \"name-only\"" "$sl_claude/settings.json" >/dev/null'
+ok "skill-listing key preservation is logged" 'grep -q "preserved node-local settings keys: .*skillOverrides" <<<"$out"'
+ok "setup never writes an off override of its own" \
+  '[ "$(jq -r "[.skillOverrides | to_entries[] | select(.value == \"off\") | .key] | join(\",\")" "$sl_claude/settings.json")" = "gh-pr-flow" ]'
 # --- #1436: the retired Honcho credential is never resurrected by setup ------
 # Two full setup runs above would have re-seeded hermes/honcho.template.json
 # on the old behavior; the disposal (slice 5) must stick.
@@ -1180,6 +1204,46 @@ dry_home="$TMP/guard-dry-home"
 out="$(run_setup_in "$guard_repo" "$dry_home" --dry-run)"
 ok "dry-run reports the guard install without touching .git" \
   'grep -q "would install managed-checkout guard" <<<"$out" && [ ! -e "$GUARD_HOOK" ]'
+
+# --- family-skills / family-ops MCP registration (#2011 D) --------------------
+# Only from the managed checkout, through mcp-setup.sh --family-only, with a
+# stub `claude` shadowing any real CLI. The suite-wide default (test-stub reset)
+# is off, so each case opts in with CCC_SETUP_FAMILY_MCP=1.
+fam_bin="$TMP/fam-cli"; mkdir -p "$fam_bin"
+fam_log="$TMP/fam-claude.log"
+printf '#!%s\necho "$*" >> %q\nexit "${FAM_CLAUDE_RC:-0}"\n' \
+  "$(PATH="$REAL_PATH" command -v bash)" "$fam_log" > "$fam_bin/claude"
+chmod +x "$fam_bin/claude"
+run_setup_fam() { # <home> [extra setup args...] — CCC_SETUP_FAMILY_MCP=1, stub claude first
+  local home="$1"; shift
+  : > "$fam_log"
+  (cd "$guard_repo" && HOME="$home" CCC_CLAUDE_DIR="$home/.claude" CCC_HERMES_DIR="$home/.hermes" \
+    CCC_SETUP_FAMILY_MCP=1 PATH="$fam_bin:$REAL_PATH" \
+    bash "$guard_repo/setup.sh" --no-backup "$@" 2>&1)
+}
+fam_home="$TMP/fam-home"
+out="$(run_setup_fam "$fam_home")"; rc=$?
+ok "family MCP: managed checkout registers family-skills via mcp-setup --family-only" \
+  '[ "$rc" = 0 ] && grep -Eq "^mcp add family-skills -s user -- /.*python3 $guard_repo/bridge/core/family_skills_server.py$" "$fam_log" && grep -q "family-skills + family-ops MCP registered" <<<"$out"'
+ok "family MCP: family-ops registered, networked/keyed servers untouched" \
+  'grep -q "^mcp add family-ops -s user" "$fam_log" && ! grep -Eq "searxng|context7|firecrawl|family-wiki" "$fam_log"'
+
+out="$(run_setup_fam "$other_home")"
+ok "family MCP: skipped when another checkout is the managed repo" \
+  'grep -q "family MCP registration: not the self-update managed checkout" <<<"$out" && [ ! -s "$fam_log" ]'
+
+out="$(run_setup_fam "$TMP/fam-dry-home" --dry-run)"
+ok "family MCP: dry-run announces without calling claude" \
+  'grep -q "would register family-skills + family-ops MCP" <<<"$out" && [ ! -s "$fam_log" ]'
+
+out="$(FAM_CLAUDE_RC=1 run_setup_fam "$fam_home")"; rc=$?
+ok "family MCP: registration failure is a warning, not a failed install" \
+  '[ "$rc" = 0 ] && grep -q "WARNING: family MCP registration failed" <<<"$out"'
+
+: > "$fam_log"
+out="$(run_setup_in "$guard_repo" "$fam_home")"
+ok "family MCP: CCC_SETUP_FAMILY_MCP=0 opts out" \
+  'grep -q "family MCP registration: disabled" <<<"$out" && [ ! -s "$fam_log" ]'
 
 # #1950: Termux has no /usr/bin/env and git exec()s hooks directly, so a
 # verbatim `#!/usr/bin/env bash` hook fails ("cannot exec") and git switch

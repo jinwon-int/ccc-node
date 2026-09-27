@@ -4,6 +4,50 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **Skills: the model now sees descriptions for the skills that matter
+  (#2011 A).** Claude Code caps the per-turn skill listing at
+  `skillListingBudgetFraction` (1% of context) and, when over budget, only
+  describes the most-used skills; with 189 skills and usage data for 13,
+  one node's sessions described 87 of ~208 in effectively alphabetical order.
+  New `scripts/ccc-skill-listing-policy.py` (`plan`/`apply`/`release`) keeps
+  descriptions for the core list (`claude/skill-listing-core.txt`) and skills
+  used in the last 30 days, sets the rest to `skillOverrides: "name-only"`
+  (never `"off"`, never deletes), and sets the budget to 0.02 only when the key
+  is absent. It manages only the entries it created (operator entries always
+  win), backs up and writes `settings.json` atomically, and is idempotent.
+  `setup.sh` now carries `skillOverrides`/`skillListingBudgetFraction`/
+  `skillListingMaxDescChars` across the settings re-render and runs the policy
+  after skills are installed; the fleet-skills sync cron entry runs it daily
+  after each sync. See `docs/skill-listing-budget.md`.
+- **setup.sh registers the `family-skills` MCP automatically (#2011 D).** The
+  local, stdlib-only skill search server (#1678/#1695) was registered only by
+  the optional manual `claude/mcp-setup.sh`, so a node that never re-ran it
+  (dungae, 2026-09-27: only searxng/context7/firecrawl) had no
+  `mcp__family-skills__*` tools. `setup.sh` now runs the new
+  `claude/mcp-setup.sh --family-only` mode, which registers just the in-repo
+  `family-skills` and `family-ops` servers — only from the self-update managed
+  checkout (never a dev worktree, #842), only with the `claude` CLI on PATH,
+  leaving an identical registration untouched (no `~/.claude.json` rewrite) and
+  re-adding a stale path. Failure is a warning; `CCC_SETUP_FAMILY_MCP=0` opts
+  out. family-wiki and the networked/keyed servers stay manual; the stale
+  setup checklist text now says so. Test suites default the step off via
+  `ccc_test_reset_hook_env` so a full install never calls a real `claude`.
+- **Bridge skill advice: provider-aware candidates and a measurable follow rate
+  (#2011 C).** `ccc_skill_advice` resolved each candidate by probing
+  `~/.codex/skills` before `~/.claude/skills` whatever provider was running,
+  using Codex names, so on a Claude bridge (dungae) 6/6 recommendations pointed
+  at `/root/.codex/skills` paths and 2 named skills Claude did not have.
+  Candidates now resolve only under the running provider's own root
+  (`CCC_AGENT_PROVIDER`): the classifier keeps its stable labels, and after
+  classification each label maps to the provider-local artifact (Claude
+  `wiki-record`/`self-update` skills and `/node-status`/`/agent-cron`
+  commands; Codex `ccc-*` skills). A label not installed for that provider is
+  never offered or borrowed; providers without a skill root get no advice.
+  Each `skill_advice` line now carries `provider`, `target`, a random
+  `advice_id` and a hashed `session` tag, and a body-free
+  `skill_advice_outcome` line records whether the recommendation was followed
+  (Skill tool call or read of its file) within the same session's next three
+  turns, or why the window closed.
 - **nunchi codex feed: the stale-lane sweep now catches the Termux codex
   wrapper (#1994).** `codex-feed.sh` killed leftover `codex exec` processes
   from earlier ticks with `pgrep -f "codex exec.*<lane tag>"`, but on Termux

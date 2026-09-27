@@ -52,6 +52,8 @@ from telegram_bot.core.matrix.state import (
     MatrixStore,
     Policy,
     QueueFull,
+    REJECT_EDIT,
+    REJECT_TEXT_TOO_LARGE,
     Request,
     SafetyStop,
     bounded_text,
@@ -61,6 +63,7 @@ from telegram_bot.core.matrix.state import (
     private_directory,
     reply_context_body,
     saved_policy,
+    identifier,
     scope_of,
     turn_id,
     turn_timeout_minutes,
@@ -91,6 +94,11 @@ MAX_OUTBOUND_FILE_BYTES = 50 * 1024 * 1024
 # A file whose upload keeps failing temporarily is given up after this many
 # tries (one notice) instead of holding the ordered outbox forever.
 MAX_OUTBOUND_FILE_ATTEMPTS = 3
+# #2002: messages that used to vanish without a word.
+NOTICE_TEXT_TOO_LARGE = "⚠️ 메시지가 너무 길어 읽지 않았습니다({size} KiB, 한도 {limit} KiB). 내용을 파일로 첨부해 보내 주세요."
+NOTICE_EDIT_IGNORED = "✏️ 수정한 메시지는 다시 읽지 않습니다. 고친 내용을 새 메시지로 보내 주세요."
+NOTICE_THREAD_IGNORED = "🧵 스레드 안의 답글은 읽지 않습니다. 방에 바로 보내 주세요."
+NOTICE_UNSUPPORTED_KIND = "스티커·이모트·알림 형식 메시지는 읽지 않습니다. 글로 보내 주세요."
 NOTICE_TIMEOUT = "⏳ 시간 제한({minutes}분)을 넘겨 작업을 중단했습니다. 요청을 나눠서 다시 보내 주세요."
 
 
@@ -1376,6 +1384,7 @@ class MatrixTransport:
         if self._is_media(event):
             return self._admit_media(room, event)
         if not isinstance(event, RoomMessageText):
+            self._unsupported_kind(room, event)
             return None
         if not event.decrypted:
             return None  # No plaintext task execution.
@@ -1399,7 +1408,114 @@ class MatrixTransport:
             # event outside that set is anomalous key material on the
             # operator's own channel: stay fail-closed.
             raise SafetyStop("unverified-owner-event")
-        return self.policy.admit(room, event.source, decrypted=event.decrypted, now_ms=int(time.time() * 1000))
+        now_ms = int(time.time() * 1000)
+        req = self.policy.admit(room, event.source, decrypted=event.decrypted, now_ms=now_ms)
+        if req is None:
+            reason = self.policy.rejection(room, event.source, decrypted=event.decrypted, now_ms=now_ms)
+            if reason is not None:
+                self._rejected(room, event, reason)
+        return req
+
+    def _rejected(self, room: str, event: Any, reason: str) -> None:
+        """Tell the sender once why a message was not read (#2002); body-free record.
+
+        An edit is answered once per *edited* message, so fixing a typo twice
+        does not produce two notices. The notice key carries the text digest:
+        notice rows are permanent and ``store.notice`` stops the service on a
+        same-key/different-text conflict, so rewording a notice in a later
+        release must yield a new key, never a conflict on an old message.
+        """
+        source = getattr(event, "source", None)
+        content = source.get("content") if isinstance(source, dict) else None
+        raw_id = source.get("event_id") if isinstance(source, dict) else None
+        event_id = str(getattr(event, "event_id", "") or raw_id or "")
+        if reason == REJECT_EDIT and isinstance(content, dict):
+            relation = content.get("m.relates_to")
+            target = relation.get("event_id") if isinstance(relation, dict) else None
+            if identifier(target, "$"):
+                event_id = str(target)
+        if not identifier(event_id, "$"):
+            return
+        if reason == REJECT_TEXT_TOO_LARGE:
+            body = content.get("body") if isinstance(content, dict) else ""
+            size_kib = -(-len(str(body).encode("utf-8", "replace")) // 1024)
+            text = NOTICE_TEXT_TOO_LARGE.format(size=size_kib, limit=MAX_TEXT_BYTES // 1024)
+        elif reason == REJECT_EDIT:
+            text = NOTICE_EDIT_IGNORED
+        else:
+            text = NOTICE_THREAD_IGNORED
+        sender = str(getattr(event, "sender", ""))
+        req = Request(event_id, room, sender, "notice", scope_of(self.c["account"], room, sender))
+        if self._notice_once(req, f"rejected-{reason}", text):
+            self._count_ignored(room, reason)
+            logger.info("matrix message not read reason=%s room=%s", reason, room)
+
+    def _notice_once(self, req: Request, key: str, text: str) -> bool:
+        """Queue a versioned idempotent notice; ``True`` only the first time (#2002)."""
+        versioned = f"{key}-{hashlib.sha256(text.encode()).hexdigest()[:12]}"
+        if self.store.has_notice(req.event_id, versioned):
+            return False
+        self.store.notice(req, versioned, text)
+        return True
+
+    def _unsupported_kind(self, room: str, event: Any) -> None:
+        """Stickers, emotes and m.notice from a trusted sender: one notice per direct room (#2002).
+
+        Membership, reactions and other state events also land here and stay
+        silent; only message kinds a person sends expecting a reply count.
+        Events older than the 24 h admission window are ignored, as in
+        ``Policy.admit``.
+        """
+        import nio
+
+        kinds = tuple(
+            cls
+            for cls in (
+                getattr(nio, "StickerEvent", None),
+                getattr(nio, "RoomMessageEmote", None),
+                getattr(nio, "RoomMessageNotice", None),
+            )
+            if isinstance(cls, type)
+        )
+        if not kinds or not isinstance(event, kinds):
+            return
+        if not getattr(event, "decrypted", False) or not getattr(event, "verified", False):
+            return
+        stamp = getattr(event, "server_timestamp", None)
+        if not isinstance(stamp, int) or stamp < int(time.time() * 1000) - 86_400_000:
+            return
+        sender = str(getattr(event, "sender", "") or "")
+        trusted_keys = set(self.trusted.get(sender, {}).values())
+        if sender not in self.policy.users or getattr(event, "sender_key", None) not in trusted_keys:
+            return
+        event_id = str(getattr(event, "event_id", "") or "")
+        if not identifier(event_id, "$"):
+            return
+        kind = type(event).__name__
+        seen = self.store.get_meta("unsupported_kind_counted") or []
+        if event_id in seen:
+            return  # a replayed sync batch
+        self.store.set_meta("unsupported_kind_counted", (seen + [event_id])[-50:])
+        self._count_ignored(room, kind)
+        if self.policy.rooms.get(room) != "direct":
+            return
+        notified = self.store.get_meta("unsupported_kind_notified") or {}
+        if room in notified:
+            return
+        req = Request(event_id, room, sender, "notice", scope_of(self.c["account"], room, sender))
+        # Queue first, then remember: a crash in between re-queues the same
+        # (idempotent) notice instead of losing it.
+        self._notice_once(req, "unsupported-kind", NOTICE_UNSUPPORTED_KIND)
+        notified[room] = time.time()
+        self.store.set_meta("unsupported_kind_notified", notified)
+
+    def _count_ignored(self, room: str, reason: str) -> None:
+        """Body-free counter of messages not read, surfaced in the inbox meta."""
+        counts = self.store.get_meta("ignored_messages") or {}
+        counts[reason] = int(counts.get(reason) or 0) + 1
+        counts["updated"] = time.time()
+        counts["room"] = room
+        self.store.set_meta("ignored_messages", counts)
 
     @staticmethod
     def _is_media(event: Any) -> bool:

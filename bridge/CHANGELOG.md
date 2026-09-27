@@ -10,6 +10,23 @@
   under 50 MB or the homeserver's `m.upload.size`; files outside the project
   root are counted, not sent. `CCC_MATRIX_SEND_FILES=0` disables it.
 
+- **Matrix frontend answers messages it will not read instead of dropping them (#2002).**
+  A text over 16 KiB (about 5,400 Hangul characters), an edit (`m.replace`)
+  and a thread reply (`m.thread`) used to vanish without a word — the sender
+  could not tell a refusal from a slow answer. A new `Policy.rejection` names
+  the refusal and the transport answers once (durable idempotent notice; an
+  edit once per edited message; family rooms only when addressed). Stickers,
+  emotes and `m.notice` from a trusted device get one notice per direct room.
+  Every refusal bumps a body-free `ignored_messages` counter in the inbox meta.
+
+- **Matrix health-tick tests wait for ticks instead of a fixed window (#2008).**
+  `test_health_tick_survives_reporter_errors_and_missing_snapshots` required
+  two `record_workload` ticks inside a fixed 50 ms transport window and failed
+  a merge-queue group on a loaded runner (`assert (1 >= 2)`, bridge-tests
+  3.11); the sibling serve test used an 80 ms window. Both now keep the
+  transport leg alive until the ticks land, bounded at 5 s. A loop that stops
+  after a failing tick still fails the test. Test-only change.
+
 - **Matrix approval prompts no longer post raw provider arguments (#1959).**
   The Matrix room sink posted `description + json.dumps(arguments)`, so a
   command carrying a token, password or patch body reached the room verbatim,

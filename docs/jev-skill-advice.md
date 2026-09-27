@@ -41,12 +41,32 @@ Do not restart an active turn to enable advice.
 
 ## Scope, data and failure behavior
 
-Candidates are the following installed, owned, non-writable-by-others skills in
-`$HOME/.codex/skills` then `$HOME/.claude/skills` (first valid copy wins):
-`a2a-task-poll`, `ccc-node-status`, `ccc-self-update`, `ccc-wiki-record`,
-`gh-pr-flow`, `web-routing`, `ccc-agent-cron`, `research-hug-law`.
-A missing skill is never proposed or installed. There are `no_skill` and `defer`
-choices. Other skills remain available to the agent normally.
+Candidates are resolved for the **running provider only**
+(`CCC_AGENT_PROVIDER`), under that provider's own home root — a Claude bridge
+never points at `$HOME/.codex`, a Codex bridge never at `$HOME/.claude` (#2011).
+The classifier sees stable labels; after classification the label is mapped to
+the provider-local artifact:
+
+| Classifier label | Claude (`$HOME/.claude`) | Codex (`$HOME/.codex`) |
+|---|---|---|
+| `a2a-task-poll` | skill `a2a-task-poll` | skill `a2a-task-poll` |
+| `ccc-node-status` | command `/node-status` (`commands/node-status.md`) | skill `ccc-node-status` |
+| `ccc-self-update` | skill `self-update` | skill `ccc-self-update` |
+| `ccc-wiki-record` | skill `wiki-record` | skill `ccc-wiki-record` |
+| `gh-pr-flow` | skill `gh-pr-flow` | skill `gh-pr-flow` |
+| `web-routing` | skill `web-routing` | skill `web-routing` |
+| `ccc-agent-cron` | command `/agent-cron` (`commands/agent-cron.md`) | skill `ccc-agent-cron` |
+| `research-hug-law` | skill `research-hug-law` | skill `research-hug-law` |
+
+Skills live at `skills/<name>/SKILL.md` and must be owned, non-writable by
+others, non-symlinked and carry a matching frontmatter `name`; Claude commands
+live at `commands/<name>.md` with the same ownership/permission rules. Only
+labels installed **for the active provider** are offered to the classifier; a
+label that is missing for that provider is never proposed, never borrowed from
+the other provider and never installed. If none is installed, no request is
+sent (`status=no_candidates`). Providers without a mapped skill root (crush,
+piri, danso, grok) get no advice. There are `no_skill` and `defer` choices.
+Other skills remain available to the agent normally.
 
 Only the bounded current request text (9–4000 characters) and these static
 candidate descriptions are sent to TypeSafe. No session history, memory,
@@ -77,10 +97,36 @@ usage schema. Only the local validated name/path is inserted, never external
 free text. A top-choice weight below 0.65 or margin below 0.20 abstains. These
 are conservative heuristics, **not calibrated accuracy or safety guarantees**.
 
-The body-free `skill_advice` log records status, fixed model, validated choice,
-elapsed milliseconds and validated token counts. It excludes user IDs, request
-and response text, paths, exceptions and keys. Disabled/ineligible requests do
-not emit advice logs. Check `status=recommended` or `abstain` versus
+The body-free `skill_advice` log records status, fixed model, validated choice
+(classifier label), elapsed milliseconds, validated token counts, the active
+`provider`, the provider-local `target` name, a random per-attempt `advice_id`
+and a `session` tag (first 12 hex of SHA-256 of the provider session id — a
+pseudonymous correlation handle, never the raw id). It excludes user IDs,
+request and response text, paths, exceptions and keys. Disabled/ineligible
+requests do not emit advice logs.
+
+### Was the advice followed?
+
+Each `status=recommended` line opens an in-memory follow window for that
+conversation: the recommended turn plus the next turns of the same provider
+session, up to three turns in total. Exactly one body-free
+`skill_advice_outcome` line closes it, carrying the same `advice_id`,
+`provider`, `skill`, `target`, `kind` and `session`, plus `turns` and
+`elapsed_ms`:
+
+- `outcome=followed detail=skill_tool` — Claude invoked the `Skill`
+  (or `SlashCommand`) tool with the recommended provider-local name;
+- `outcome=followed detail=file_read` — Claude `Read` the recommended file, a
+  Claude `Bash` command or a Codex `commandExecution` referenced its path;
+- `outcome=not_followed detail=window|session_changed|superseded|evicted` —
+  the window elapsed, the provider session changed (e.g. `/new`), a newer
+  recommendation replaced it, or the bounded tracker evicted it.
+
+Tool arguments are matched in memory only and never logged. The tracker does
+not survive a bridge restart (an open window then emits no outcome line), so
+treat recommendations without an outcome as unknown, not ignored. Follow rate
+= `followed` / (`followed` + `not_followed`) over outcome lines joined on
+`advice_id`. Check `status=recommended` or `abstain` versus
 `unavailable` after a controlled synthetic private request, and verify normal
 processing continues when the API is unavailable. A standalone probe confirms
 connectivity/helper behavior; a restarted serving process plus an actual turn
@@ -91,5 +137,6 @@ is required to establish end-to-end adoption.
 The initial 120-case synthetic Korean/English pilot matched its intended skill
 in 117 cases. Its median inference time was about 0.70 seconds. This is neither
 a production accuracy guarantee nor evidence of faster full task completion.
-Track request-to-first-action latency and wrong suggestions on actual work
-before widening candidates or turning advice into automatic assignment.
+Track request-to-first-action latency, the `skill_advice_outcome` follow rate
+and wrong suggestions on actual work before widening candidates or turning
+advice into automatic assignment.

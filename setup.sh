@@ -461,6 +461,40 @@ restore_node_local_env() { # <settings-path> <env-json>
     return 1
   fi
 }
+# #2011 A: the skill-listing keys are node-local for the same reason. The
+# skill-listing policy (scripts/ccc-skill-listing-policy.py) and operators write
+# skillOverrides / skillListingBudgetFraction / skillListingMaxDescChars into
+# settings.json; a plain re-render would drop them on every self-update tick,
+# and operator-written overrides would be lost for good. Template-declared keys
+# still win (the repo owns anything it ships).
+NODE_LOCAL_SETTINGS_KEYS='["skillOverrides","skillListingBudgetFraction","skillListingMaxDescChars"]'
+read_node_local_keys() { # <settings-path> -> JSON object of the node-local top-level keys present
+  local src="$1"
+  [ -f "$src" ] || { printf '{}'; return 0; }
+  jq -c --argjson keys "$NODE_LOCAL_SETTINGS_KEYS" \
+    'with_entries(select(.key as $k | $keys | index($k)))' "$src" 2>/dev/null || printf '{}'
+}
+restore_node_local_keys() { # <settings-path> <keys-json>
+  local dest="$1" extra="$2"
+  [ -n "$extra" ] && [ "$extra" != "{}" ] || return 0
+  if [ "$DRY" = 1 ]; then
+    echo "[dry-run] preserve node-local settings keys: $(jq -r 'keys | join(",")' <<<"$extra")"
+    return 0
+  fi
+  [ -f "$dest" ] || return 0
+  local tmp; tmp="$(mktemp "${dest}.XXXXXX")" || { echo "ERROR: mktemp failed for $dest" >&2; return 1; }
+  if jq --argjson extra "$extra" \
+       '. as $cur | . + ($extra | with_entries(select(.key as $k | $cur | has($k) | not)))' \
+       "$dest" > "$tmp" 2>/dev/null \
+     && jq -e . "$tmp" >/dev/null 2>&1; then
+    mv "$tmp" "$dest"
+    note "preserved node-local settings keys: $(jq -r 'keys | join(",")' <<<"$extra")"
+  else
+    rm -f "$tmp"
+    echo "ERROR: failed to re-apply node-local settings keys (existing file left untouched)" >&2
+    return 1
+  fi
+}
 read_node_local_model() { # <settings-path> -> pin on stdout (empty if none)
   local src="$1"
   [ -f "$src" ] || return 0
@@ -539,6 +573,7 @@ run mkdir -p "$CLAUDE_DIR/hooks" "$CLAUDE_DIR/hooks/lib"
 # unless it was captured first (#1235).
 NODE_LOCAL_MODEL="$(read_node_local_model "$CLAUDE_DIR/settings.json")"
 NODE_LOCAL_ENV="$(read_node_local_env "$CLAUDE_DIR/settings.json" "$SRC/claude/settings.base.json")"
+NODE_LOCAL_KEYS="$(read_node_local_keys "$CLAUDE_DIR/settings.json")"
 if [ "$WITH_PLUGIN" = 1 ]; then
   note "plugin mode: lean settings (portable hooks come from the ccc-node plugin)"
   run atomic_install "$SRC/claude/settings.base.json" "$CLAUDE_DIR/settings.json"
@@ -547,6 +582,7 @@ else
 fi
 restore_node_local_model "$CLAUDE_DIR/settings.json" "$NODE_LOCAL_MODEL"
 restore_node_local_env "$CLAUDE_DIR/settings.json" "$NODE_LOCAL_ENV"
+restore_node_local_keys "$CLAUDE_DIR/settings.json" "$NODE_LOCAL_KEYS"
 neutralize_bypass_if_root "$CLAUDE_DIR/settings.json"
 # settings.local.json is the NODE-LOCAL approvals file — seed it from the
 # template ONLY when absent so a node's accumulated/hand-added approvals are
@@ -643,6 +679,11 @@ run atomic_install "$SRC/scripts/ccc-skill-promotion.py" "$CLAUDE_DIR/hooks/ccc-
 # Exact-commit private approved-skill consumer. It refuses floating refs,
 # non-private repositories, user-owned target conflicts, and unverified trees.
 run atomic_install "$SRC/scripts/ccc-fleet-skills-sync.py" "$CLAUDE_DIR/hooks/ccc-fleet-skills-sync.py"
+# Skill-listing budget policy (#2011 A) and its core list. setup runs it below
+# once skills are installed; the fleet-skills sync cron re-runs it daily after
+# each sync (scripts/install-fleet-skills-sync-cron.sh).
+run atomic_install "$SRC/scripts/ccc-skill-listing-policy.py" "$CLAUDE_DIR/hooks/ccc-skill-listing-policy.py"
+run atomic_install "$SRC/claude/skill-listing-core.txt" "$CLAUDE_DIR/hooks/skill-listing-core.txt"
 # Self-update — the pre-approved node maintenance procedure (pull + setup +
 # restart of operator-allowlisted services only; see docs/self-update.md).
 run atomic_install "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
@@ -720,6 +761,7 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/piri-session-normalize.py"
   "$CLAUDE_DIR/hooks/ccc-skill-promotion.py"
   "$CLAUDE_DIR/hooks/ccc-fleet-skills-sync.py"
+  "$CLAUDE_DIR/hooks/ccc-skill-listing-policy.py"
   "$CLAUDE_DIR/hooks/ccc-self-update.sh"
   "$CLAUDE_DIR/hooks/ccc-pr-status-poll.sh"
 )
@@ -1284,6 +1326,23 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ] || [ "$SRC" != "/opt/ccc-node" ]; then
   fi
 fi
 
+# 2c) Skill-listing budget policy (#2011 A). Runs AFTER settings.json was
+# re-rendered (step 1, which carries skillOverrides/skillListingBudgetFraction
+# across the render) and after repo skills were installed above, so it sees the
+# final settings and skill set. Core + recently used skills keep their listing
+# description; the rest get skillOverrides "name-only" (never "off", never
+# deleted). Only entries the policy owns are touched; operator entries win.
+# Best-effort: a policy failure must never roll back the harness install.
+# Opt out per node with CCC_SKILL_LISTING_POLICY=0 or
+# $CLAUDE_DIR/skill-listing-policy.disabled.
+if [ "$DRY" = 1 ]; then
+  CCC_CLAUDE_DIR="$CLAUDE_DIR" python3 "$SRC/scripts/ccc-skill-listing-policy.py" plan --summary \
+    --core "$SRC/claude/skill-listing-core.txt" 2>&1 | sed 's/^/[dry-run] /' || true
+elif ! CCC_CLAUDE_DIR="$CLAUDE_DIR" python3 "$SRC/scripts/ccc-skill-listing-policy.py" apply --quiet \
+       --core "$SRC/claude/skill-listing-core.txt"; then
+  note "WARNING: skill-listing policy apply failed (settings.json left as rendered); rerun: python3 $CLAUDE_DIR/hooks/ccc-skill-listing-policy.py plan"
+fi
+
 # 3) Node-identity substitution — fill <PLACEHOLDER> tokens in the files we just seeded.
 # Only freshly-seeded files are touched (existing identity is never rewritten). Tokens for which
 # no flag was given are left intact so the manual checklist below still applies to them.
@@ -1482,6 +1541,31 @@ else
   done
 fi
 
+# family-skills / family-ops MCP registration (#2011 D, #1678). The in-repo
+# stdlib servers are local, secret-free and network-free, yet only the optional
+# manual `claude/mcp-setup.sh` registered them, so nodes installed or updated
+# without that step (seen 2026-09-27) never saw mcp__family-skills__*. Register
+# them here in mcp-setup.sh's --family-only mode: an identical registration is
+# left untouched (no ~/.claude.json rewrite), a stale path is re-added. Only from
+# the self-update managed checkout, never a dev worktree or secondary clone —
+# the user-scope server path must not be repointed at unreviewed code (#842).
+# Non-fatal; CCC_SETUP_FAMILY_MCP=0 opts out. The networked/keyed servers
+# (searxng, context7, firecrawl) and family-wiki stay manual.
+if [ "${CCC_SETUP_FAMILY_MCP:-1}" = "0" ]; then
+  note "family MCP registration: disabled (CCC_SETUP_FAMILY_MCP=0)"
+elif [ "$MANAGED_REPO" != "$SRC_ABS" ] || [ ! -d "$SRC/.git" ] \
+  || [ -z "$src_gitdir" ] || [ "$src_gitdir" != "$src_commondir" ]; then
+  note "family MCP registration: not the self-update managed checkout — skipped"
+elif ! command -v claude >/dev/null 2>&1; then
+  note "family MCP registration: claude CLI not on PATH — skipped"
+elif [ "$DRY" = 1 ]; then
+  note "would register family-skills + family-ops MCP (claude/mcp-setup.sh --family-only)"
+elif bash "$SRC/claude/mcp-setup.sh" --family-only; then
+  note "family-skills + family-ops MCP registered (user scope)"
+else
+  note "WARNING: family MCP registration failed — re-run: $SRC/claude/mcp-setup.sh --family-only"
+fi
+
 # #968: Termux/Android hash-locked installs may need to build packages from
 # source (cryptography 50 has no Android wheel -> maturin -> Rust). A missing
 # toolchain killed the daegyo bridge on 2026-08-06 and the prerequisite lived
@@ -1516,8 +1600,10 @@ cat <<'EOF'
   6. Start a fresh Claude Code session and confirm the SessionStart snapshot injects.
   7. (Optional) MCP tool servers: ./claude/mcp-setup.sh
      Registers searxng (explicit Tailnet fallback) + context7 (docs) + firecrawl
-     (search + scrape; key read from ~/.hermes/.env). Idempotent; tool perms
-     pre-allowed in settings.json.
+     (search + scrape; key read from ~/.hermes/.env) + family-wiki (when
+     wiki-agent is installed). family-skills + family-ops are already
+     registered by this setup run from the managed checkout. Idempotent; tool
+     perms pre-allowed in settings.json.
   8. (Optional) Telegram bridge: cd bridge && cp .env.example .env && edit, then
      ./start.sh --path $BRIDGE_DEFAULT_PATH -d   (daemon-supervised). See bridge/README.md.
      Linux reboot-persistence: ./start.sh --path $BRIDGE_DEFAULT_PATH --install-systemd   (systemd unit).

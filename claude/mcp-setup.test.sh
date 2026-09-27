@@ -125,5 +125,90 @@ mv "$FAKE_WIKI.bak" "$FAKE_WIKI"
 ok "family-wiki skipped without wiki-agent" \
   '! grep -q "add family-wiki" "$TMP/claude.log"'
 
+# --family-only (#2011 D): setup.sh's non-interactive mode registers only the
+# in-repo stdlib servers, never the networked/keyed ones, and does not rewrite
+# an identical registration.
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+PY3_SEEN="$(env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" bash -c 'command -v python3')"
+run_family() { # run_family [extra env...]; sets $family_rc
+  : > "$TMP/claude.log"
+  env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" "$@" \
+    bash "$SUT" --family-only >/dev/null 2>&1
+  # shellcheck disable=SC2034  # family_rc is read via eval inside ok()
+  family_rc=$?
+}
+write_cfg() { # write_cfg <file> <skills-server-path> [env-json]
+  python3 - "$1" "$PY3_SEEN" "$2" "$REPO_ROOT/bridge/core/family_ops_server.py" "${3:-{\}}" <<'PY'
+import json, sys
+path, py, skills, ops, env = sys.argv[1:]
+servers = {
+    "family-skills": {"type": "stdio", "command": py, "args": [skills], "env": json.loads(env)},
+    "family-ops": {"type": "stdio", "command": py, "args": [ops], "env": {}},
+    "context7": {"type": "stdio", "command": "npx", "args": ["-y", "x"], "env": {}},
+}
+json.dump({"numStartups": 3, "mcpServers": servers}, open(path, "w"))
+PY
+}
+
+rm -f "$FHOME/.claude.json"
+run_family
+ok "family-only: exit 0" '[ "$family_rc" = 0 ]'
+ok "family-only: family-skills added with abs python3" \
+  'grep -Eq "^mcp add family-skills -s user -- /.*python3 $REPO_ROOT/bridge/core/family_skills_server.py$" "$TMP/claude.log"'
+ok "family-only: family-ops added" 'grep -q "^mcp add family-ops -s user" "$TMP/claude.log"'
+ok "family-only: networked/keyed/wiki servers untouched" \
+  '! grep -Eq "searxng|context7|firecrawl|family-wiki" "$TMP/claude.log"'
+ok "family-only: no health-checking mcp list" '! grep -q "^mcp list" "$TMP/claude.log"'
+
+write_cfg "$FHOME/.claude.json" "$REPO_ROOT/bridge/core/family_skills_server.py"
+# shellcheck disable=SC2034  # cfg_before is read via eval inside ok()
+cfg_before="$(cat "$FHOME/.claude.json")"
+run_family
+ok "family-only: identical registration left untouched (no remove/add)" \
+  '[ "$family_rc" = 0 ] && ! grep -q "family-" "$TMP/claude.log"'
+ok "family-only: never writes the Claude config itself" \
+  '[ "$cfg_before" = "$(cat "$FHOME/.claude.json")" ]'
+
+write_cfg "$FHOME/.claude.json" "/stale/checkout/bridge/core/family_skills_server.py"
+run_family
+ok "family-only: stale server path is removed then re-added" \
+  'grep -q "^mcp remove family-skills -s user" "$TMP/claude.log" && grep -q "^mcp add family-skills" "$TMP/claude.log"'
+ok "family-only: unchanged sibling not re-added" '! grep -q "family-ops" "$TMP/claude.log"'
+
+write_cfg "$FHOME/.claude.json" "$REPO_ROOT/bridge/core/family_skills_server.py" '{"X":"1"}'
+run_family
+ok "family-only: env override on the entry forces re-add" 'grep -q "^mcp add family-skills" "$TMP/claude.log"'
+
+printf 'not json' > "$FHOME/.claude.json"
+run_family
+ok "family-only: unreadable config falls back to remove+add" \
+  'grep -q "^mcp add family-skills" "$TMP/claude.log" && grep -q "^mcp add family-ops" "$TMP/claude.log"'
+rm -f "$FHOME/.claude.json"
+
+CFGDIR="$TMP/cfgdir"; mkdir -p "$CFGDIR"
+write_cfg "$CFGDIR/.claude.json" "$REPO_ROOT/bridge/core/family_skills_server.py"
+run_family CLAUDE_CONFIG_DIR="$CFGDIR"
+ok "family-only: CLAUDE_CONFIG_DIR config is honored" '! grep -q "family-" "$TMP/claude.log"'
+
+FAIL_BIN="$TMP/failbin"; mkdir -p "$FAIL_BIN"
+cat > "$FAIL_BIN/claude" <<EOF
+#!$BASH_BIN
+echo "\$*" >> "$TMP/claude.log"
+[ "\$1 \$2" = "mcp add" ] && exit 1
+exit 0
+EOF
+chmod +x "$FAIL_BIN/claude"
+: > "$TMP/claude.log"
+env -i PATH="$FAIL_BIN:$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" bash "$SUT" --family-only >/dev/null 2>&1
+# shellcheck disable=SC2034  # fail_rc is read via eval inside ok()
+fail_rc=$?
+ok "family-only: a failed claude mcp add is reported via exit status" '[ "$fail_rc" = 1 ]'
+
+: > "$TMP/claude.log"
+env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" bash "$SUT" --bogus >/dev/null 2>&1
+# shellcheck disable=SC2034  # bogus_rc is read via eval inside ok()
+bogus_rc=$?
+ok "unknown argument rejected before any registration" '[ "$bogus_rc" = 2 ] && [ ! -s "$TMP/claude.log" ]'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
