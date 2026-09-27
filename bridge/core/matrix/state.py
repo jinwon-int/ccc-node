@@ -61,6 +61,10 @@ from telegram_bot.core.matrix.attachments import (  # noqa: F401 - re-exported
 )
 
 MAX_TEXT_BYTES = 16_384
+# Refusals the sender is told about (#2002) — see Policy.rejection.
+REJECT_TEXT_TOO_LARGE = "text-too-large"
+REJECT_EDIT = "edit"
+REJECT_THREAD = "thread"
 # Notices, status bubbles and operator texts. Agent replies are not bound by
 # it: the outbox splits a reply into as many events as it needs (#1957).
 MAX_REPLY_BYTES = 65_536
@@ -403,8 +407,10 @@ class Policy:
         object.__setattr__(self, "aliases", aliases)
         object.__setattr__(self, "wake_words", wake)
 
-    def admit(self, room_id: str, event: Any, *, decrypted: bool, now_ms: int) -> Request | None:
-        """Reject plaintext, edits, bots, old events and unaddressed group messages."""
+    def _eligible(
+        self, room_id: str, event: Any, *, decrypted: bool, now_ms: int
+    ) -> tuple[str, dict[str, Any]] | None:
+        """``(sender, content)`` of a decrypted, recent ``m.room.message`` from an allowed user."""
         if decrypted is not True or room_id not in self.rooms or not isinstance(event, dict):
             return None
         sender = event.get("sender")
@@ -423,6 +429,55 @@ class Policy:
         content = event.get("content")
         if not isinstance(content, dict):
             return None
+        return sender, content
+
+    def rejection(self, room_id: str, event: Any, *, decrypted: bool, now_ms: int) -> str | None:
+        """Why an eligible message :meth:`admit` refused should be *told* to its sender (#2002).
+
+        ``admit`` answers only "run it or not", so an oversize text, an edit or
+        a thread reply used to vanish without a word. This names the refusals
+        the sender can act on; everything else (bots, stale events, family
+        chatter that does not address the bot) stays silent by design. A family
+        room still needs the message to address the bot before it is answered.
+        """
+        eligible = self._eligible(room_id, event, decrypted=decrypted, now_ms=now_ms)
+        if eligible is None:
+            return None
+        _sender, content = eligible
+        relation = content.get("m.relates_to")
+        rel_type = relation.get("rel_type") if isinstance(relation, dict) else None
+        gate: Any = content
+        if rel_type == "m.replace":
+            reason = REJECT_EDIT
+            new_content = content.get("m.new_content")
+            if isinstance(new_content, dict):
+                gate = new_content
+        elif rel_type == "m.thread":
+            reason = REJECT_THREAD
+        elif rel_type is None and content.get("msgtype") == "m.text":
+            body = content.get("body")
+            if not isinstance(body, str) or not body.strip():
+                return None
+            try:
+                if len(body.encode("utf-8")) <= MAX_TEXT_BYTES:
+                    return None
+            except UnicodeError:
+                return None
+            reason = REJECT_TEXT_TOO_LARGE
+        else:
+            return None
+        if self.rooms[room_id] == "mention":
+            gate_body = gate.get("body") if isinstance(gate.get("body"), str) else ""
+            if not self.addressed(gate, gate_body):
+                return None
+        return reason
+
+    def admit(self, room_id: str, event: Any, *, decrypted: bool, now_ms: int) -> Request | None:
+        """Reject plaintext, edits, bots, old events and unaddressed group messages."""
+        eligible = self._eligible(room_id, event, decrypted=decrypted, now_ms=now_ms)
+        if eligible is None:
+            return None
+        sender, content = eligible
         relation = content.get("m.relates_to", {})
         if not isinstance(relation, dict) or "rel_type" in relation:
             return None
@@ -1258,6 +1313,11 @@ class MatrixStore(Store):
             if record:
                 self.db.execute("INSERT INTO controls VALUES (?,?)", (req.event_id, digest))
         return False
+
+    def has_notice(self, event_id: str, key: str) -> bool:
+        """Whether :meth:`notice` already queued ``key`` for ``event_id``."""
+        event = "$notice-" + hashlib.sha256(json.dumps([event_id, key]).encode()).hexdigest()
+        return self.db.execute("SELECT 1 FROM jobs WHERE event_id=?", (event,)).fetchone() is not None
 
     def notice(self, req: Request, key: str, text: str) -> str:
         """Queue a durable, idempotent notice for ``req``'s room; returns its outbox event id."""
