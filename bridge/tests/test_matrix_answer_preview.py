@@ -188,3 +188,60 @@ async def test_process_message_gets_the_preview_only_when_enabled(
     monkeypatch.setenv("CCC_MATRIX_STREAMING", "true")
     await bot.run_turn(_job("again", event_id="$e2"), sink=FakeSink(), session_id=None, room_kind="direct")
     assert isinstance(chat.calls[-1]["streaming_sink"], MatrixAnswerPreview)
+
+
+# --- review of #2027 --------------------------------------------------------------------
+
+
+async def test_a_frozen_preview_yields_the_bubble_to_the_heartbeat() -> None:
+    """A long tool run must not hide the elapsed time / stall warning (review of #2027)."""
+    preview, sink, _interims, clock = _preview()
+    await preview.add_tool_call("Bash", {})
+    assert preview.holds_heartbeat()
+    clock.now += 61
+    assert not preview.holds_heartbeat(), "no progress for a minute: the heartbeat may show"
+    await sink.status("⏳ 12m … (stalled?)")  # the heartbeat takes the bubble
+    clock.now += 2
+    await preview.update_if_needed("done")
+    assert sink.statuses[-1] == "🔧 Bash\ndone ▍", "the preview takes it back when it moves"
+
+
+@pytest.mark.usefixtures("matrix_config")
+async def test_heartbeats_pass_once_the_preview_stops_moving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import telegram_bot.core.matrix.bot as bot_module
+
+    monkeypatch.setenv("CCC_MATRIX_STREAMING", "1")
+    bot, _chat, _manager = _bot(tmp_path)
+    sink = FakeSink()
+    callbacks = bot._progress_callbacks(sink, DM_ROOM)
+    preview = callbacks["streaming_sink"]
+    clock = Clock()
+    preview._clock = clock
+    await preview.add_tool_call("Bash", {})
+    monkeypatch.setattr(bot_module, "STATUS_MIN_INTERVAL_S", 0.0)
+    await callbacks["status_callback"]("⏳ 1m", None)
+    assert sink.statuses == ["🔧 Bash"]
+    clock.now += 61
+    await callbacks["status_callback"]("⏳ 12m … (stalled?)", None)
+    assert sink.statuses[-1] == "⏳ 12m … (stalled?)"
+
+
+@pytest.mark.usefixtures("matrix_config")
+def test_family_rooms_never_get_the_preview(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from test_matrix_bot import FAMILY_ROOM
+
+    monkeypatch.setenv("CCC_MATRIX_STREAMING", "1")
+    bot, _chat, _manager = _bot(tmp_path)
+    assert "streaming_sink" in bot._progress_callbacks(FakeSink(), DM_ROOM)
+    assert "streaming_sink" not in bot._progress_callbacks(FakeSink(), FAMILY_ROOM)
+    assert "streaming_sink" not in bot._progress_callbacks(FakeSink(), "")
+
+
+@pytest.mark.usefixtures("matrix_config")
+async def test_the_skills_command_gets_the_preview_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CCC_MATRIX_STREAMING", "1")
+    bot, chat, _manager = _bot(tmp_path)
+    await bot._cmd_skills(user_id=bot.ids.user_id("@owner:example.org"), chat_id=bot.ids.user_id("@owner:example.org"), room_id=DM_ROOM, sink=FakeSink())
+    assert isinstance(chat.calls[-1]["streaming_sink"], MatrixAnswerPreview)

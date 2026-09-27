@@ -40,6 +40,8 @@ MAX_INTERVAL_S = 60.0
 # tail of a long answer so the newest text stays visible.
 PREVIEW_MAX_CHARS = 3000
 TOOL_LINES = 3
+# A preview that has not moved for this long yields the bubble to the heartbeat.
+HEARTBEAT_HOLD_S = 60.0
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
@@ -78,7 +80,17 @@ class MatrixAnswerPreview:
         self._tools: list[str] = []
         self._last_push = float("-inf")
         self._pushed_text: str | None = None
+        self._last_change = float("-inf")
         self.showing = False
+
+    def holds_heartbeat(self, *, fresh_s: float = HEARTBEAT_HOLD_S) -> bool:
+        """Whether a heartbeat text should wait: the preview shows *and* moved recently.
+
+        A long tool run or a silent engine leaves the preview frozen; then the
+        heartbeat (elapsed time, stall warning) must get the bubble back, as
+        Telegram only holds heartbeats while there is recent visible progress.
+        """
+        return self.showing and self._clock() - self._last_change < fresh_s
 
     # -- rendering -----------------------------------------------------------
 
@@ -96,7 +108,7 @@ class MatrixAnswerPreview:
         if not force and now - self._last_push < self._interval:
             return
         text = self._preview_text()
-        if not text.strip() or text == self._pushed_text:
+        if not text.strip() or (text == self._pushed_text and self.showing):
             return
         self._last_push = now
         try:
@@ -106,12 +118,14 @@ class MatrixAnswerPreview:
             return
         self._pushed_text = text
         self.showing = True
+        self._last_change = now
 
     async def _clear(self) -> None:
         if not self.showing:
             return
         self.showing = False
         self._pushed_text = None
+        self._last_change = float("-inf")
         try:
             await self._sink.status(None)
         except Exception:  # noqa: BLE001

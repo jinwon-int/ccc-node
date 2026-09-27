@@ -1599,6 +1599,12 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
 
     # -- callbacks handed to process_message ---------------------------------
 
+    def _family_room_ids(self) -> set[str]:
+        try:
+            return {str(room) for room in (self.load_config().get("family_rooms") or ())}
+        except Exception:  # noqa: BLE001 - unknown config: treat every room as shared
+            return {"*"}
+
     def _progress_callbacks(self, sink: TurnSink, room_id: str) -> dict[str, Any]:
         """Status, interim and (opt-in) live-preview callbacks for one ``process_message``.
 
@@ -1609,7 +1615,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         """
 
         interim = self._make_interim_callback(sink, room_id)
-        if not ExternalWaitMonitor.env_flag("CCC_MATRIX_STREAMING", default=False):
+        # Direct rooms only: in a family room, other people's messages bury the
+        # bubble, and every repost (redact + new message) notifies the family.
+        family = self._family_room_ids()
+        direct = bool(room_id) and "*" not in family and room_id not in family
+        if not direct or not ExternalWaitMonitor.env_flag("CCC_MATRIX_STREAMING", default=False):
             return {"status_callback": self._make_status_callback(sink), "interim_message_callback": interim}
         from telegram_bot.core.matrix.streaming import MatrixAnswerPreview, interval_from
 
@@ -1645,9 +1655,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                 except Exception:
                     logger.warning("Matrix status redact failed", exc_info=True)
                 return None
-            if preview is not None and preview.showing:
-                # The bubble shows the answer preview (#1796); a heartbeat text
-                # would overwrite it. The handle keeps the cleanup path armed.
+            if preview is not None and preview.holds_heartbeat():
+                # The bubble shows a live answer preview (#1796); a heartbeat
+                # would overwrite it. A preview that stopped moving yields the
+                # bubble so elapsed time / stall warnings still show. The
+                # handle keeps the cleanup path armed.
                 return _STATUS_HANDLE
             now = time.monotonic()
             if text == last["text"] or now - last["at"] < STATUS_MIN_INTERVAL_S:

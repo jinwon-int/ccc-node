@@ -5,4 +5,5 @@
   only, never arguments). It is a preview: completed intermediate messages
   still go out through the durable interim path, the bubble is cleared at the
   end, and the final answer is still delivered through the durable outbox.
-  Heartbeat texts are held back while the preview shows.
+  Direct rooms only; heartbeat texts are held back only while the preview
+  has moved in the last 60 s, so stall warnings still show.

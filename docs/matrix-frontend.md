@@ -384,7 +384,11 @@ It is a preview, not the delivery (`core/matrix/streaming.py`):
 - at the end of the turn the bubble is cleared and the final answer is
   delivered through the durable outbox (`streamed` stays false), so a crash
   or a failed edit can never lose it;
-- heartbeat texts are held back while the preview shows.
+- heartbeat texts are held back only while the preview has moved in the
+  last 60 s — a long tool run or a silent engine gets the elapsed time and
+  stall warnings back;
+- direct rooms only: in a family room other people's messages bury the
+  bubble, and every repost would notify the family.
 
 Next stage (not yet): deliver the final answer *as* the last edit of the
 draft through the outbox, which needs the outbox to record sent event ids.
