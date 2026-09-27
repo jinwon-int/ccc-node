@@ -298,6 +298,16 @@ class FakeRunner:
         self.decisions.append(ok)
         return TurnResult("approved" if ok else "denied", "synthetic-session")
 
+    async def mode_approval_outcome(self, sink: Any) -> TurnResult:
+        outcome = await sink.approval_outcome("Claude approval request\nSummary: ls")
+        self.decisions.append(outcome)
+        return TurnResult(str(outcome), "synthetic-session")
+
+    async def mode_approval_text_only(self, sink: Any) -> TurnResult:
+        ok = await sink.approval("Claude approval request\nSummary: ls", None)
+        self.decisions.append(ok)
+        return TurnResult("approved" if ok else "denied", "synthetic-session")
+
     async def mode_approval_big(self, sink: Any) -> TurnResult:
         ok = await sink.approval("x" * 13_000, None)
         self.decisions.append(ok)
@@ -535,6 +545,45 @@ async def test_controls_not_blocked_by_ordinary_queue_and_nonce_is_single_use(tm
         # The nonce is bound to that turn and single use: a fresh event replaying it is refused.
         await f.input(request(f, "$replay", "/approve " + tid + " " + nonce))
         assert h.replies().count(NOTICE_INVALID_CONTROL) == 3
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("control", "expected"), [("/approve", "allow"), ("/deny", "deny"), (None, "timeout")])
+async def test_approval_outcome_posts_the_callers_text_verbatim(
+    tmp_path: Path, control: str | None, expected: str
+) -> None:
+    """#1959: the room gets exactly the caller's redacted text plus the controls."""
+
+    async with running(tmp_path, "approval-outcome", approval_timeout=0.3) as h:
+        f = h.f
+        await f.input(request(f))
+        h.work()
+        await h.until(lambda: bool(f.approvals))
+        tid = turn_id("$request")
+        nonce = next(iter(f.approvals))
+        (prompt,) = [r for r in h.replies() if "/approve " + tid + " " + nonce in r]
+        assert prompt.startswith("Claude approval request\nSummary: ls\n승인: /approve ")
+        assert "null" not in prompt and "{" not in prompt
+        if control is not None:
+            await f.input(request(f, "$ctl", control + " " + tid + " " + nonce))
+        await h.until(lambda: bool(h.runner.decisions))
+        assert h.runner.decisions == [expected]
+
+
+@pytest.mark.anyio
+async def test_legacy_approval_without_arguments_posts_no_json(tmp_path: Path) -> None:
+    async with running(tmp_path, "approval-text-only") as h:
+        f = h.f
+        await f.input(request(f))
+        h.work()
+        await h.until(lambda: bool(f.approvals))
+        tid = turn_id("$request")
+        nonce = next(iter(f.approvals))
+        (prompt,) = [r for r in h.replies() if "/approve " + tid + " " + nonce in r]
+        assert prompt.startswith("Claude approval request\nSummary: ls\n승인: /approve ")
+        await f.input(request(f, "$ok", "/approve " + tid + " " + nonce))
+        await h.until(lambda: bool(h.runner.decisions))
+        assert h.runner.decisions == [True]
 
 
 @pytest.mark.anyio
@@ -779,6 +828,7 @@ async def test_sink_typing_is_best_effort_and_interim_is_durable(tmp_path: Path)
         await sink.typing()
         await sink.interim("늦은 안내")
         assert await sink.approval("late", None) is False
+        assert await sink.approval_outcome("late") == "unavailable"
         assert len(calls) == 2 and "늦은 안내" not in h.replies()
 
 

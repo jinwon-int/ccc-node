@@ -10,6 +10,18 @@
   under 50 MB or the homeserver's `m.upload.size`; files outside the project
   root are counted, not sent. `CCC_MATRIX_SEND_FILES=0` disables it.
 
+- **Matrix approval prompts no longer post raw provider arguments (#1959).**
+  The Matrix room sink posted `description + json.dumps(arguments)`, so a
+  command carrying a token, password or patch body reached the room verbatim,
+  and no audit trail was kept. `MatrixBot` now posts the provider-neutral
+  `build_approval_snapshot` text (new `reply_hint=None` omits Telegram's button
+  line, so the display fingerprint binds exactly the posted text) through a new
+  `approval_outcome()` sink method that reports `allow`/`deny`/`timeout`/
+  `unavailable`, and writes body-free `asked`/`answered` rows to the owner-only
+  `ApprovalAuditLedger` under `BOT_DATA_DIR/approval-audit` with Telegram's
+  reasons. The legacy `approval(description, None)` form no longer appends
+  `null`. Telegram prompts are unchanged.
+
 - **Matrix frontend runs the remaining lifecycle background services (#1825).**
   After #1998 the turn-stall probe, health alerts, session resource guard,
   skill-candidate collector, orphan reaper, task-ledger reconciliation,
