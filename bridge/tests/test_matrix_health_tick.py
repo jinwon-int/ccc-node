@@ -39,6 +39,24 @@ class RecordingReporter:
         return [name for name, _a, _k in self.calls]
 
 
+async def _wait_for_ticks(reporter: RecordingReporter, want: int, timeout_s: float = 2.0) -> None:
+    """Poll until the health reporter recorded `want` workload ticks (#2008).
+
+    The tick cadence comes from a wall-clock sleep inside the code under test,
+    so a fixed sleep window in the test flakes on loaded CI runners. Poll up to
+    `timeout_s` instead of assuming a tick count fits the window; if the
+    deadline passes, fail loudly with the recorded tick count.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        if len([c for c in reporter.calls if c[0] == "record_workload"]) >= want:
+            return
+        await asyncio.sleep(0.01)
+    got = len([c for c in reporter.calls if c[0] == "record_workload"])
+    raise AssertionError(f"health tick loop recorded {got}/{want} ticks within {timeout_s}s")
+
+
 class SignalTransport(FakeTransport):
     """A transport that exposes #1820 health signals (fresh sync by default)."""
 
@@ -83,7 +101,7 @@ async def test_serve_binds_marks_and_ticks_health(tmp_path: Path, matrix_config:
     holder = await _attach(bot, SignalTransport)
 
     async def body(transport: FakeTransport) -> None:
-        await asyncio.sleep(0.08)  # several ticks
+        await _wait_for_ticks(reporter, 2)
     holder["body"] = body
     await bot.serve()
 
@@ -116,7 +134,7 @@ async def test_health_tick_survives_reporter_errors_and_missing_snapshots(tmp_pa
     holder = await _attach(bot)
 
     async def body(transport: FakeTransport) -> None:
-        await asyncio.sleep(0.05)
+        await _wait_for_ticks(reporter, 2)
     holder["body"] = body
     await bot.serve()  # a failing tick never stops the transport leg
 
