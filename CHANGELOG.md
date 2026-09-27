@@ -4,6 +4,19 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **Skill promotion: `promote` no longer opens a duplicate batch PR every day
+  (#2011).** fleet-skills #289 (09-22), #298, #302, #310 and #314 (09-26) were
+  five unreviewed drafts staging the same 8 skills: each collect cut a new
+  `promote/auto-<ts>` branch without looking at the open batch from the day
+  before. `_promote` now checks the promote PRs it recorded, confirmed live
+  (hand-closed/merged ones are recorded terminal, sticky). An identical open
+  batch is reused (`promote-pr-already-open`, nothing opened). A different
+  batch opens first, then supersedes the old PR: closed only with
+  `supersede-autoclose` on and only if it is untouched generator output (draft,
+  one commit); otherwise commented and left open for the human, and skipped by
+  auto-merge. An unreadable open PR stops the run rather than risk another
+  copy. New ledger rows record the full `candidates` set (intake PR + tree) as
+  the dedupe key; older rows fall back to `staged_prs`.
 - **Skill autosave: review is the default, auto nodes migrate explicitly, and
   the curator marks candidates without moving anything (#2011).** dungae had
   installed 70 LLM-drafted skills in `auto` mode with no review before install,

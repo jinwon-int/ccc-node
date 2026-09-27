@@ -4471,6 +4471,9 @@ def _sweep_promote_merge(
     pending = [
         row for row in _latest_promote_prs(rows).values()
         if str(row.get("state") or "OPEN") == "OPEN"
+        # A superseded batch left open for a human (#2011) is replaced by a
+        # newer promote PR; merging both would stage the same skills twice.
+        and not row.get("superseded_by")
     ][: config.collect_window]
     if not pending:
         return []
@@ -4689,6 +4692,161 @@ def _promote_stage(
     return target, primary
 
 
+def _promote_candidate_keys(items: list[dict[str, str]]) -> list[str]:
+    """Order-free identity of a promote batch: intake PR + reviewed tree."""
+    return sorted(f"{item['pr']}:{item['tree_sha256']}" for item in items)
+
+
+def _promote_batch_matches(row: dict[str, object], pending: list[dict[str, str]]) -> bool:
+    """True when an open promote PR already stages exactly this batch (#2011).
+
+    Rows written since #2011 record the full candidate set (`candidates`, the
+    intake-PR:tree pairs the run tried to stage), so equality is exact — a
+    changed tree for the same intake PR is a different batch. Older rows only
+    carry `staged_prs`; for those the intake-PR set is the best evidence the
+    ledger holds, and matching on it errs toward NOT opening another copy,
+    which is the failure this guards against (fleet-skills #289/#298/#302/
+    #310/#314: the same 8 skills, one new draft a day).
+    """
+    recorded = row.get("candidates")
+    if isinstance(recorded, list) and recorded:
+        return sorted(str(key) for key in recorded) == _promote_candidate_keys(pending)
+    staged = row.get("staged_prs")
+    if isinstance(staged, list) and staged:
+        return {str(pr) for pr in staged} == {item["pr"] for item in pending}
+    return False
+
+
+def _promote_pr_view(config: Config, pr: str) -> dict[str, object] | None:
+    """Live state of one promote PR, or None when it cannot be read."""
+    try:
+        viewed = _run([
+            "gh", "pr", "view", pr, "--repo", config.repo,
+            "--json", "state,isDraft,commits",
+        ])
+        payload = json.loads(viewed.stdout.decode("utf-8"))
+    except (PromotionError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    state = str(payload.get("state") or "")
+    if state not in {"OPEN", "CLOSED", "MERGED"}:
+        return None
+    commits = payload.get("commits")
+    return {
+        "state": state,
+        "is_draft": payload.get("isDraft") is True,
+        "commits": len(commits) if isinstance(commits, list) else -1,
+    }
+
+
+def _promote_row_record(row: dict[str, object], **changes: object) -> dict[str, object]:
+    """A follow-up `a2a-promote-pr` row: the last row's fields plus changes.
+
+    `_latest_promote_prs` keeps only the newest row per PR, so a state or
+    supersede update must carry the batch fields forward (url, identity hits,
+    candidate set) or the auto-merge sweep and the dedupe check lose them.
+    """
+    record = {key: value for key, value in row.items() if not key.startswith("_")}
+    record.update({"ts": _utc_now(), "kind": _PROMOTE_PR_KIND})
+    record.update(changes)
+    return record
+
+
+def _open_promote_prs(
+    config: Config, rows: list[dict[str, object]], *, dry_run: bool
+) -> tuple[list[dict[str, object]], list[str]]:
+    """Promote PRs this publisher opened that GitHub still reports OPEN.
+
+    Evidence is the publisher ledger (the PRs `_promote` itself recorded),
+    confirmed by one live read each: the ledger alone cannot see a PR a human
+    closed or merged by hand. A PR found terminal is recorded so (sticky, the
+    same row `_sweep_promote_merge` writes) and never polled again. Rows
+    already marked `superseded_by` were handled by an earlier run and are not
+    active batches any more. Returns (open rows, unreadable PR numbers).
+    """
+    active: list[dict[str, object]] = []
+    unreadable: list[str] = []
+    latest = _latest_promote_prs(rows)
+    for pr in sorted(latest, key=lambda value: int(value) if value.isdigit() else -1):
+        row = latest[pr]
+        if str(row.get("state") or "OPEN") != "OPEN" or row.get("superseded_by"):
+            continue
+        view = _promote_pr_view(config, pr)
+        if view is None:
+            unreadable.append(pr)
+            continue
+        if view["state"] != "OPEN":
+            if not dry_run:
+                _append_ledger(config, _promote_row_record(row, state=view["state"]))
+            continue
+        active.append({**row, "_is_draft": view["is_draft"], "_commits": view["commits"]})
+    return active, unreadable
+
+
+def _supersede_promote_prs(
+    config: Config, old_rows: list[dict[str, object]], *, new_pr: str, new_url: str
+) -> list[dict[str, object]]:
+    """Retire older open promote PRs once a newer batch PR exists (#2011).
+
+    Mirrors the intake supersede convention: the newer batch is authoritative,
+    closing is opt-in (`supersede_autoclose_enabled`, default OFF), and without
+    it the old PR is left open for the human with a pointer to its successor.
+    Even with the opt-in, only untouched generator output is closed — still a
+    draft with the generator's single commit. A PR a human marked ready or
+    edited (audience moves, generalization fixes) is never auto-closed: those
+    edits are the non-mechanical half of promotion and must not be discarded.
+    """
+    results: list[dict[str, object]] = []
+    autoclose = bool(getattr(config, "supersede_autoclose_enabled", False))
+    for row in old_rows:
+        pr = str(row.get("pr") or "")
+        if not pr:
+            continue
+        untouched = row.get("_is_draft") is True and row.get("_commits") == 1
+        if autoclose and untouched:
+            body = (
+                "새 승격 배치로 대체되어 종료합니다.\n\n"
+                f"- 후속 PR: #{new_pr} ({new_url})\n"
+                "- 대기 중인 승인 후보 집합이 바뀌어 새 배치 PR이 열렸고, 이 PR은 "
+                "그 이전 배치입니다.\n"
+                "- 생성기 커밋 1개 그대로인 draft만 자동 종료합니다(사람이 수정한 "
+                "PR은 열어 둡니다).\n"
+            )
+            try:
+                _run(["gh", "pr", "close", pr, "--repo", config.repo, "--comment", body])
+            except PromotionError as error:
+                results.append({"outcome": "close-failed", "pr": pr, "code": error.code})
+                continue
+            _append_ledger(
+                config, _promote_row_record(row, state="CLOSED", superseded_by=new_pr)
+            )
+            results.append(
+                {"outcome": "promote-pr-superseded-closed", "pr": pr, "superseded_by": new_pr}
+            )
+            continue
+        reason = "human-edited" if autoclose else "autoclose-off"
+        body = (
+            f"이 승격 배치는 #{new_pr} ({new_url})로 대체되었습니다.\n\n"
+            "- 대기 중인 승인 후보 집합이 바뀌어 새 배치 PR이 열렸습니다.\n"
+            + (
+                "- 사람이 수정한 PR이라 자동 종료하지 않습니다 — 필요한 수정을 새 PR로 "
+                "옮긴 뒤 닫아 주세요.\n"
+                if autoclose
+                else "- 자동 종료(supersede-autoclose)가 꺼져 있어 열어 둡니다 — 확인 후 "
+                "닫아 주세요.\n"
+            )
+        )
+        try:
+            _pr_comment(config, pr, body)
+        except PromotionError as error:
+            results.append({"outcome": "comment-failed", "pr": pr, "code": error.code})
+        _append_ledger(config, _promote_row_record(row, superseded_by=new_pr))
+        results.append({
+            "outcome": "promote-pr-superseded-left-open", "pr": pr,
+            "superseded_by": new_pr, "reason": reason,
+        })
+    return results
+
+
 def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
     """Open ONE draft PR staging every approved-but-unpromoted candidate.
 
@@ -4709,12 +4867,31 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
 
     Never merges, never marks ready, never closes an intake PR — #1778's
     autoclose does that later, and only once the content is provably merged.
+
+    One open batch at a time (#2011). An open promote PR that already stages
+    exactly this candidate set is reused — nothing is opened and the outcome
+    says which PR is current. A different set opens the new batch and then
+    supersedes the older open ones (`_supersede_promote_prs`). If any open
+    promote PR's live state cannot be read, the run opens nothing: a missed
+    day is cheaper than another duplicate draft.
     """
     rows = _ledger_rows(config)
     promoted = _promoted_source_trees(config)
     pending = _promotable(config, rows, promoted)[:limit]
     if not pending:
         return {"ok": True, "mode": "promote", "staged": [], "outcome": "nothing-to-promote"}
+    open_rows, unreadable = _open_promote_prs(config, rows, dry_run=dry_run)
+    if unreadable:
+        return {"ok": False, "mode": "promote", "staged": [],
+                "outcome": "open-promote-pr-unreadable", "prs": unreadable}
+    current = [row for row in open_rows if _promote_batch_matches(row, pending)]
+    if current:
+        return {
+            "ok": True, "mode": "promote-dry-run" if dry_run else "promote", "staged": [],
+            "outcome": "promote-pr-already-open",
+            "pr": str(current[-1].get("pr") or ""), "url": current[-1].get("url"),
+            "candidates": len(pending),
+        }
     if dry_run:
         return {
             "ok": True,
@@ -4724,6 +4901,7 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
                  "audience": _PROMOTE_DEFAULT_AUDIENCE}
                 for item in pending
             ],
+            "would_supersede": [str(row.get("pr") or "") for row in open_rows],
         }
     nodes = _promote_worker_nodes(config)
     branch = f"promote/auto-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
@@ -4831,10 +5009,19 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
                 for row in flagged
             ],
             "staged_prs": [str(row["pr"]) for row in staged],
+            # The whole batch this run tried to stage (#2011 dedupe key) — not
+            # just what staged: a candidate that errors every run must not
+            # make each day's batch look new.
+            "candidates": _promote_candidate_keys(pending),
         },
     )
+    superseded = (
+        _supersede_promote_prs(config, open_rows, new_pr=pr_number, new_url=url)
+        if open_rows and pr_number
+        else []
+    )
     return {"ok": not errors, "mode": "promote", "branch": branch, "url": url,
-            "staged": staged, "errors": errors}
+            "staged": staged, "errors": errors, "superseded": superseded}
 
 
 def _receipt_retries(rows: list[dict[str, object]]) -> list[dict[str, object]]:

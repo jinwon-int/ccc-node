@@ -26,6 +26,7 @@ verdict was bound to.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 import importlib.util
 import sys
 import types
@@ -244,6 +245,225 @@ class PromoteFlowTests(unittest.TestCase):
             rows += lineage(str(100 + n), f"{n}" * 64, name=f"s{n}")
         out, _ = self.run_promote(rows, limit=2)
         self.assertEqual(len(out["staged"]), 2)
+
+
+def promote_row(pr: str, *, staged=None, candidates=None, state: str = "OPEN",
+                **extra) -> dict:
+    """An `a2a-promote-pr` ledger row as `_promote` writes it."""
+    row = {
+        "ts": iso(days_ago=1), "kind": "a2a-promote-pr", "pr": pr,
+        "url": f"https://github.com/jinwon-int/fleet-skills/pull/{pr}",
+        "branch": f"promote/auto-2026092{pr[-1]}T000000Z", "state": state,
+        "identity_hits": [], "staged_prs": list(staged or []),
+    }
+    if candidates is not None:
+        row["candidates"] = list(candidates)
+    row.update(extra)
+    return row
+
+
+class PromoteDedupeTests(unittest.TestCase):
+    """#2011 item F: never stack duplicate promote PRs.
+
+    fleet-skills #289 (09-22), #298, #302, #310 and #314 (09-26) were five
+    drafts staging the SAME 8 skills — `promote` cut a new timestamped branch
+    and opened a new draft on every collect, without looking at the batch it
+    had opened the day before. These tests pin the fix: an identical open
+    batch is reused, a different one supersedes the old PR per the intake
+    supersede convention (auto-close opt-in, human edits never discarded), and
+    an unreadable open PR stops the run instead of risking another copy.
+    """
+
+    def run_promote(self, rows, *, views, dry_run=False, autoclose=False, limit=8):
+        """`views`: PR number -> gh `pr view` payload dict, or None = unreadable."""
+        calls: list[list[str]] = []
+        ledger: list[dict] = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if args[:3] == ["gh", "pr", "view"]:
+                payload = views.get(args[3])
+                if payload is None:
+                    raise promotion.PromotionError("github_unavailable")
+                return types.SimpleNamespace(stdout=json.dumps(payload).encode())
+            if args[:3] == ["gh", "pr", "create"]:
+                return types.SimpleNamespace(
+                    stdout=b"https://github.com/jinwon-int/fleet-skills/pull/999\n")
+            return types.SimpleNamespace(stdout=b"")
+
+        cfg = types.SimpleNamespace(
+            node="publisher", collect_nodes=(), repo="jinwon-int/fleet-skills",
+            base="main", remote="https://example.invalid/fleet-skills.git",
+            promotion_state_dir=Path("/tmp"), supersede_autoclose_enabled=autoclose)
+        with patch.object(promotion, "_ledger_rows", return_value=rows), \
+             patch.object(promotion, "_promoted_source_trees", return_value={}), \
+             patch.object(promotion, "_promote_worker_nodes", return_value=[]), \
+             patch.object(promotion, "_promote_stage",
+                          side_effect=lambda work, item, *, audience: (
+                              work / "approved" / audience / item["name"], "clean")), \
+             patch.object(promotion, "_append_ledger",
+                          side_effect=lambda _cfg, record: ledger.append(record)), \
+             patch.object(promotion, "_run", side_effect=fake_run):
+            out = promotion._promote(cfg, dry_run=dry_run, limit=limit)
+        return out, calls, ledger
+
+    @staticmethod
+    def view(state="OPEN", *, draft=True, commits=1) -> dict:
+        return {"state": state, "isDraft": draft, "commits": [{}] * commits}
+
+    @staticmethod
+    def gh(calls, verb):
+        return [c for c in calls if c[:3] == ["gh", "pr", verb]]
+
+    def two_candidates(self) -> list:
+        return lineage("140", TREE_A, name="s1") + lineage("141", TREE_B, name="s2")
+
+    def test_identical_open_batch_is_reused_not_duplicated(self) -> None:
+        rows = self.two_candidates() + [promote_row(
+            "314", staged=["140", "141"], candidates=[f"140:{TREE_A}", f"141:{TREE_B}"])]
+        out, calls, ledger = self.run_promote(rows, views={"314": self.view()})
+        self.assertEqual(out["outcome"], "promote-pr-already-open")
+        self.assertEqual(out["pr"], "314")
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.gh(calls, "create"), [])
+        self.assertFalse([c for c in calls if c[:1] == ["git"]], "no clone/push either")
+        self.assertEqual(ledger, [])
+
+    def test_legacy_row_without_candidate_trees_matches_on_intake_prs(self) -> None:
+        """Rows written before #2011 carry only `staged_prs` — like #314."""
+        rows = self.two_candidates() + [promote_row("314", staged=["141", "140"])]
+        out, calls, _ = self.run_promote(rows, views={"314": self.view()})
+        self.assertEqual(out["outcome"], "promote-pr-already-open")
+        self.assertEqual(self.gh(calls, "create"), [])
+
+    def test_the_289_to_314_incident_opens_nothing_new(self) -> None:
+        """Five open-in-ledger drafts with one batch; four closed by hand."""
+        rows = self.two_candidates() + [
+            promote_row(pr, staged=["140", "141"])
+            for pr in ("289", "298", "302", "310", "314")
+        ]
+        views = {pr: self.view("CLOSED") for pr in ("289", "298", "302", "310")}
+        views["314"] = self.view()
+        out, calls, ledger = self.run_promote(rows, views=views)
+        self.assertEqual(out["outcome"], "promote-pr-already-open")
+        self.assertEqual(out["pr"], "314")
+        self.assertEqual(self.gh(calls, "create"), [])
+        self.assertEqual(
+            sorted((r["pr"], r["state"]) for r in ledger),
+            [("289", "CLOSED"), ("298", "CLOSED"), ("302", "CLOSED"), ("310", "CLOSED")],
+            "hand-closed PRs are recorded terminal (sticky) so they are not re-polled",
+        )
+        self.assertTrue(all(r["kind"] == "a2a-promote-pr" for r in ledger))
+
+    def test_terminal_rows_are_not_polled_again(self) -> None:
+        rows = self.two_candidates() + [
+            promote_row("289", staged=["140", "141"]),
+            promote_row("289", staged=["140", "141"], state="CLOSED"),
+        ]
+        _, calls, _ = self.run_promote(rows, views={})
+        self.assertEqual(self.gh(calls, "view"), [])
+
+    def test_closed_old_batch_does_not_block_a_new_pr(self) -> None:
+        rows = self.two_candidates() + [promote_row("314", staged=["140", "141"])]
+        out, calls, ledger = self.run_promote(rows, views={"314": self.view("MERGED")})
+        self.assertEqual(len(self.gh(calls, "create")), 1)
+        self.assertEqual(out["superseded"], [])
+        self.assertIn(("314", "MERGED"), [(r["pr"], r["state"]) for r in ledger])
+
+    def test_new_row_records_the_candidate_set(self) -> None:
+        _, _, ledger = self.run_promote(self.two_candidates(), views={})
+        opened = [r for r in ledger if r.get("pr") == "999"]
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0]["candidates"], [f"140:{TREE_A}", f"141:{TREE_B}"])
+
+    def test_a_changed_tree_for_the_same_intake_is_a_new_batch(self) -> None:
+        rows = self.two_candidates() + [promote_row(
+            "314", staged=["140", "141"], candidates=[f"140:{'c' * 64}", f"141:{TREE_B}"])]
+        out, calls, _ = self.run_promote(rows, views={"314": self.view()})
+        self.assertEqual(len(self.gh(calls, "create")), 1)
+        self.assertEqual([s["pr"] for s in out["superseded"]], ["314"])
+
+    def test_different_batch_supersedes_and_leaves_open_without_autoclose(self) -> None:
+        rows = self.two_candidates() + [promote_row("314", staged=["140"])]
+        out, calls, ledger = self.run_promote(rows, views={"314": self.view()})
+        self.assertEqual(len(self.gh(calls, "create")), 1)
+        self.assertEqual(self.gh(calls, "close"), [])
+        comments = self.gh(calls, "comment")
+        self.assertEqual([c[3] for c in comments], ["314"])
+        self.assertIn("#999", comments[0][-1])
+        self.assertEqual(out["superseded"], [{
+            "outcome": "promote-pr-superseded-left-open", "pr": "314",
+            "superseded_by": "999", "reason": "autoclose-off"}])
+        marker = [r for r in ledger if r.get("pr") == "314"]
+        self.assertEqual(marker[-1]["superseded_by"], "999")
+        self.assertEqual(marker[-1]["state"], "OPEN")
+        self.assertEqual(marker[-1]["url"], rows[-1]["url"], "batch fields carry forward")
+        self.assertFalse(any(k.startswith("_") for k in marker[-1]), "no private keys")
+
+    def test_autoclose_closes_untouched_generator_output_after_the_new_pr(self) -> None:
+        rows = self.two_candidates() + [promote_row("314", staged=["140"])]
+        out, calls, ledger = self.run_promote(
+            rows, views={"314": self.view()}, autoclose=True)
+        create_at = calls.index(self.gh(calls, "create")[0])
+        close = self.gh(calls, "close")
+        self.assertEqual([c[3] for c in close], ["314"])
+        self.assertGreater(calls.index(close[0]), create_at, "successor exists first")
+        self.assertEqual(out["superseded"][0]["outcome"], "promote-pr-superseded-closed")
+        marker = [r for r in ledger if r.get("pr") == "314"][-1]
+        self.assertEqual((marker["state"], marker["superseded_by"]), ("CLOSED", "999"))
+
+    def test_autoclose_never_closes_a_human_edited_batch(self) -> None:
+        """Audience moves and generalization edits are the human half of
+        promotion — an edited or ready-marked PR is never discarded."""
+        for view in (self.view(commits=2), self.view(draft=False)):
+            rows = self.two_candidates() + [promote_row("314", staged=["140"])]
+            out, calls, _ = self.run_promote(rows, views={"314": view}, autoclose=True)
+            self.assertEqual(self.gh(calls, "close"), [], view)
+            self.assertEqual(out["superseded"][0]["reason"], "human-edited")
+
+    def test_unreadable_open_pr_opens_nothing(self) -> None:
+        rows = self.two_candidates() + [promote_row("314", staged=["140"])]
+        out, calls, ledger = self.run_promote(rows, views={"314": None})
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["outcome"], "open-promote-pr-unreadable")
+        self.assertEqual(out["prs"], ["314"])
+        self.assertEqual(self.gh(calls, "create"), [])
+        self.assertEqual(ledger, [])
+
+    def test_already_superseded_rows_are_not_active_batches(self) -> None:
+        rows = self.two_candidates() + [
+            promote_row("314", staged=["140", "141"], superseded_by="320")]
+        out, calls, _ = self.run_promote(rows, views={})
+        self.assertEqual(self.gh(calls, "view"), [])
+        self.assertEqual(len(self.gh(calls, "create")), 1)
+        self.assertEqual(out["superseded"], [])
+
+    def test_dry_run_reuses_or_previews_without_writing(self) -> None:
+        same = self.two_candidates() + [promote_row("314", staged=["140", "141"])]
+        out, calls, ledger = self.run_promote(same, views={"314": self.view()}, dry_run=True)
+        self.assertEqual(out["outcome"], "promote-pr-already-open")
+        self.assertEqual(ledger, [])
+        diff = self.two_candidates() + [promote_row("314", staged=["140"])]
+        out, calls, ledger = self.run_promote(diff, views={"314": self.view()}, dry_run=True)
+        self.assertEqual(out["would_supersede"], ["314"])
+        self.assertEqual([c[:3] for c in calls], [["gh", "pr", "view"]])
+        self.assertEqual(ledger, [])
+
+    def test_dry_run_records_nothing_for_a_hand_closed_pr(self) -> None:
+        rows = self.two_candidates() + [promote_row("289", staged=["140", "141"])]
+        _, _, ledger = self.run_promote(rows, views={"289": self.view("CLOSED")},
+                                        dry_run=True)
+        self.assertEqual(ledger, [])
+
+
+class PromoteMergeSupersededTests(unittest.TestCase):
+    def test_auto_merge_skips_a_superseded_batch(self) -> None:
+        rows = [promote_row("314", staged=["140"], superseded_by="999")]
+        cfg = types.SimpleNamespace(auto_merge_promote_enabled=True, collect_window=5,
+                                    repo="jinwon-int/fleet-skills")
+        with patch.object(promotion, "_ledger_rows", return_value=rows), \
+             patch.object(promotion, "_run", side_effect=AssertionError("no gh call")):
+            self.assertEqual(promotion._sweep_promote_merge(cfg, dry_run=False), [])
 
 
 if __name__ == "__main__":

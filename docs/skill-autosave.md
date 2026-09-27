@@ -601,6 +601,23 @@ Env equivalents: `CCC_SKILL_PROMOTION_AUTO_PROMOTE`,
 `CCC_SKILL_PROMOTION_SUPERSEDE_AUTOCLOSE`. A `reject` verdict remains an
 owner decision and is never auto-closed.
 
+**One open promote batch at a time (#2011).** `promote` (and auto-promote)
+first checks the promote PRs it recorded in its ledger, confirming each with a
+live `gh pr view`. A PR closed or merged by hand is recorded terminal and never
+polled again. If an open promote PR already stages exactly the pending
+candidate set (intake PR + reviewed tree, recorded as `candidates`; older rows
+fall back to `staged_prs`), the run opens nothing and reports
+`promote-pr-already-open` with that PR. A different set opens the new batch
+first, then supersedes the older open batch:
+- With `supersede-autoclose` on, it is closed only if it is still untouched
+  generator output (draft, single commit).
+- Otherwise — the flag is off, or a human edited it or marked it ready — it
+  gets a pointer comment and stays open for the human, and auto-merge skips it.
+
+If any open promote PR cannot be read, the run opens nothing
+(`open-promote-pr-unreadable`). This stops the daily duplicate drafts
+(fleet-skills #289/#298/#302/#310/#314 all staged the same 8 skills).
+
 ### Installing approved private skills
 
 Setup installs the consumer beside the autosave hooks, but does not run it.
