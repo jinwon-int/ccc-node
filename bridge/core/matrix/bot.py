@@ -34,6 +34,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import secrets
 import signal
 import subprocess
 import time
@@ -44,6 +45,12 @@ from telegram_bot.core import session_resume, tool_policy
 from telegram_bot.core.memory_distill import MemoryDistillMixin
 from telegram_bot.memory.distill_types import DistillTrigger
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
+from telegram_bot.core.approval_audit import ApprovalAuditLedger, ApprovalAuditRecord
+from telegram_bot.core.approval_contract import (
+    ApprovalDisplaySnapshot,
+    build_approval_snapshot,
+    opaque_ref,
+)
 from telegram_bot.core.bot_danso_recovery import (
     OFFER,
     RECOVERY_TEXT_ACTIONS,
@@ -154,6 +161,13 @@ _NON_AGENT_ERRORS = frozenset(
     {"bridge_draining", "danso_input", "danso_task_resume_unavailable", "coalesced_turn"}
 )
 _NON_AGENT_FAILURE_CLASSES = frozenset({"danso_task_paused", "coalesced-turn"})
+# #1959: room-sink approval outcome -> Telegram's audit reason / decision.
+_APPROVAL_AUDIT_REASONS = {"allow": "owner_allow", "deny": "owner_deny", "timeout": "timeout"}
+_APPROVAL_AUDIT_DECISIONS = {
+    "owner_allow": "allow",
+    "owner_deny": "deny",
+    "timeout": "timeout",
+}
 _RUNTIME_MODEL_PROVIDERS = frozenset({"codex", "piri", "crush", "danso"})
 _EFFORT_PROVIDERS = frozenset({"codex", "piri", "danso"})
 _CLAUDE_MODELS: tuple[tuple[str, str], ...] = (
@@ -507,6 +521,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         # #1825: continuation_id -> outcome of its self-job turn, awaited by the
         # continuation monitor's runner while this process serves.
         self._continuation_waiters: dict[str, asyncio.Future[bool]] = {}
+        self._approval_audit_ledger: ApprovalAuditLedger | None = None
 
     # -- configuration -------------------------------------------------------
 
@@ -1639,16 +1654,117 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             # is still active (fail-closed).
             if not self._project_chat.is_agent_approval_active(user_id, chat_id, generation):
                 return ApprovalDecision.DENY
+            # #1959: the room sees only the provider-neutral redacted snapshot
+            # (as Telegram), never the raw provider arguments.
+            snapshot = build_approval_snapshot(event, reply_hint=None)
+            asked = self._record_approval_asked(snapshot, event, user_id, chat_id, generation)
             try:
-                allowed = await sink.approval(event.description, event.arguments)
+                outcome = await self._ask_approval(sink, snapshot.prompt_text)
             except asyncio.CancelledError:
+                self._record_approval_answered(asked, "cancelled", actor_user_id=None)
                 raise
             except Exception:
                 logger.exception("Matrix approval prompt failed; denying")
+                self._record_approval_answered(asked, "send_failure", actor_user_id=None)
                 return ApprovalDecision.DENY
-            return ApprovalDecision.ALLOW if allowed is True else ApprovalDecision.DENY
+            reason = _APPROVAL_AUDIT_REASONS.get(outcome, "send_failure")
+            self._record_approval_answered(
+                asked, reason, actor_user_id=user_id if outcome in ("allow", "deny") else None
+            )
+            return ApprovalDecision.ALLOW if outcome == "allow" else ApprovalDecision.DENY
 
         return approval_callback
+
+    @staticmethod
+    async def _ask_approval(sink: TurnSink, text: str) -> str:
+        """``allow``/``deny``/``timeout``/``unavailable`` from the room sink."""
+
+        ask = getattr(sink, "approval_outcome", None)
+        if callable(ask):
+            return str(await ask(text))
+        return "allow" if await sink.approval(text, None) is True else "deny"
+
+    # -- approval audit (#1959) ------------------------------------------------
+
+    def _approval_ledger(self) -> ApprovalAuditLedger | None:
+        if self._approval_audit_ledger is None:
+            try:
+                self._approval_audit_ledger = ApprovalAuditLedger(self._data_dir() / "approval-audit")
+            except Exception as error:
+                logger.warning("Matrix approval audit unavailable: %s", type(error).__name__)
+                return None
+        return self._approval_audit_ledger
+
+    @staticmethod
+    def _audit_now() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    def _record_approval_asked(
+        self,
+        snapshot: ApprovalDisplaySnapshot,
+        event: ApprovalRequestEvent,
+        user_id: int,
+        chat_id: int,
+        generation: int,
+    ) -> dict[str, Any]:
+        """Body-free ``asked`` record, same schema as Telegram; fail-open."""
+
+        key = self._conversation_key(user_id, chat_id)
+        asked: dict[str, Any] = {
+            "snapshot": snapshot,
+            "approval_ref": opaque_ref("approval", secrets.token_urlsafe(16)),
+            "session_ref": opaque_ref("approval-session", key),
+            "turn_ref": opaque_ref("approval-turn", key, generation),
+            "request_ref": opaque_ref("approval-request", event.request_id),
+            "asked_at": self._audit_now(),
+            "asked_monotonic": time.monotonic(),
+        }
+        self._write_approval_audit(asked, event="asked")
+        return asked
+
+    def _record_approval_answered(
+        self, asked: Mapping[str, Any], reason: str, *, actor_user_id: int | None
+    ) -> None:
+        decision = _APPROVAL_AUDIT_DECISIONS.get(reason, "invalidated")
+        self._write_approval_audit(
+            asked,
+            event="answered",
+            answered_at=self._audit_now(),
+            decision=decision,
+            reason=reason,
+            latency_ms=max(0, round((time.monotonic() - float(asked["asked_monotonic"])) * 1000)),
+            actor_ref=(
+                opaque_ref("approval-actor", actor_user_id) if actor_user_id is not None else None
+            ),
+        )
+
+    def _write_approval_audit(self, asked: Mapping[str, Any], *, event: str, **terminal: Any) -> None:
+        ledger = self._approval_ledger()
+        if ledger is None:
+            return
+        snapshot: ApprovalDisplaySnapshot = asked["snapshot"]
+        try:
+            ledger.record(
+                ApprovalAuditRecord(
+                    event=event,
+                    approval_ref=asked["approval_ref"],
+                    provider=snapshot.provider,
+                    action=snapshot.action,
+                    target_shape=snapshot.target_shape,
+                    session_ref=asked["session_ref"],
+                    turn_ref=asked["turn_ref"],
+                    request_ref=asked["request_ref"],
+                    actor_ref=terminal.pop("actor_ref", None),
+                    request_fingerprint=snapshot.request_fingerprint,
+                    display_fingerprint=snapshot.display_fingerprint,
+                    asked_at=asked["asked_at"],
+                    redaction_flags=snapshot.redaction_flags,
+                    displayed_fields=snapshot.displayed_fields,
+                    **terminal,
+                )
+            )
+        except Exception as error:
+            logger.warning("Matrix approval audit %s record failed (continuing): %s", event, type(error).__name__)
 
     # -- TurnRunner ----------------------------------------------------------
 

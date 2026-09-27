@@ -341,7 +341,14 @@ family chatter that does not address the bot stay silent as before.
 - Voice transcription for `m.audio` (handled as a file today).
 - Draft edits (`m.replace`) for streamed text — interim notices only.
 - Approval buttons: approvals are `/approve <turn> <nonce>` replies in the
-  room, exactly as the pilot.
+  room, exactly as the pilot. The prompt is the same redacted,
+  provider-neutral snapshot Telegram shows (`build_approval_snapshot`:
+  action, target shape, bounded summary, cwd and risk hints; sensitive fields
+  omitted, credentials redacted) — never the raw provider arguments (#1959).
+  Each prompt writes body-free `asked`/`answered` rows to
+  `BOT_DATA_DIR/approval-audit/approval-audit.jsonl` (owner-only, same schema
+  as Telegram; reasons `owner_allow`, `owner_deny`, `timeout`, `send_failure`,
+  `cancelled`). An audit write failure never changes the decision.
 
 ## Danso long tasks and recovery (#1895 PR-A)
 
