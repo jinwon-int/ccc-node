@@ -329,9 +329,16 @@ source code) under `PROJECT_ROOT` — follows the answer. Matrix-specific:
   v2), only the ciphertext is uploaded (`/_matrix/media/v3/upload`, no file
   name in the request), and an encrypted `m.image`/`m.file` event carries the
   key (`core/matrix/outbound_media.py`).
-- **Durable**: each file is its own outbox row (`$file-…`, body `file`)
-  queued after the answer, idempotent per turn and index; a restart resumes
-  it, a retryable upload error rides the send leg's back-off.
+- **Durable, and after the answer**: each file is held (`held_files`) until
+  its turn's answer is recorded, then becomes its own outbox row (`$file-…`,
+  body `file`) behind that answer — idempotent per turn and index. A
+  cancelled, timed-out or interrupted turn sends none of its files; a crash
+  settles held files on the next start. A retryable upload error rides the
+  send leg's back-off at most 3 times, then the file gets the "not sent"
+  notice so it can never hold the ordered outbox (every room) behind it.
+- **Re-checked at delivery**: the path must still resolve to itself (no
+  symlink swapped in), stay inside `PROJECT_ROOT`, and is opened
+  `O_NOFOLLOW`; a muted room uploads nothing until it reopens.
 - **Direct rooms only**: a family room gets one notice instead — an
   owner-host file never lands where other people read.
 - **Bounded**: at most 10 files per turn; each under 50 MB or the

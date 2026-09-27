@@ -18,6 +18,7 @@ import base64
 import hashlib
 import mimetypes
 import os
+import stat
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -118,7 +119,10 @@ async def upload(http: Any, homeserver: str, ciphertext: bytes) -> str:
                 raise ConnectionError("matrix-upload-temporary-error")
             if status != 200:
                 raise OutboundMediaError("upload-refused")
-            data = await response.json()
+            try:
+                data = await response.json(content_type=None)
+            except Exception:  # noqa: BLE001 - a 200 that is not JSON will not become JSON on retry
+                raise OutboundMediaError("upload-invalid-response") from None
     except (OutboundMediaError, ConnectionError):
         raise
     except Exception:  # noqa: BLE001 - network trouble is retryable, never a stop
@@ -129,19 +133,49 @@ async def upload(http: Any, homeserver: str, ciphertext: bytes) -> str:
     return uri
 
 
-def read_deliverable(path: Path, *, max_bytes: int) -> bytes:
-    """Read a regular file once, bounded; the size is re-checked on the bytes read."""
+def read_deliverable(path: Path, *, max_bytes: int, root: Path | None = None) -> bytes:
+    """Read a regular file once, bounded, re-checking what was queued.
+
+    The path was resolved and scope-checked when the file was queued; the row
+    may wait (a muted room keeps it), so the check is repeated here: the path
+    must still resolve to itself (no symlink swapped in), stay inside
+    ``root``, and the final component is opened with ``O_NOFOLLOW``.
+    """
+    from telegram_bot.core.paths import is_within_project_root
+
     try:
-        if not path.is_file():
+        if path.resolve() != path:
+            raise OutboundMediaError("path-changed")
+        if root is not None and not is_within_project_root(path, root):
+            raise OutboundMediaError("outside-root")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except OutboundMediaError:
+        raise
+    except FileNotFoundError:
+        raise OutboundMediaError("missing") from None
+    except OSError:
+        raise OutboundMediaError("unreadable") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
             raise OutboundMediaError("missing")
-        if path.stat().st_size > max_bytes:
+        if info.st_size > max_bytes:
             raise OutboundMediaError("too-large")
-        with open(path, "rb") as handle:
-            data = handle.read(max_bytes + 1)
+        chunks = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(remaining, 1 << 20))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
     except OutboundMediaError:
         raise
     except OSError:
         raise OutboundMediaError("unreadable") from None
+    finally:
+        os.close(descriptor)
+    data = b"".join(chunks)
     if len(data) > max_bytes:
         raise OutboundMediaError("too-large")
     return data

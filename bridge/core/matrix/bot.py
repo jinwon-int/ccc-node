@@ -2016,8 +2016,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             if transport.room_kind(room_id) != "direct":
                 self._deliverable_notice(transport, room_id, FILES_DIRECT_ONLY.format(count=len(found)), f"files-family-{turn}")
                 return
+            parent = self._active_turn_id or None
             for index, path in enumerate(inside[:MAX_FILES_PER_TURN]):
-                enqueue(room_id, str(path), key=f"deliverable-{turn}-{index}")
+                enqueue(room_id, str(path), key=f"deliverable-{turn}-{index}", after=parent, root=str(root))
             skipped = len(outside) + max(0, len(inside) - MAX_FILES_PER_TURN)
             if skipped:
                 self._deliverable_notice(transport, room_id, FILES_SKIPPED.format(count=skipped), f"files-skipped-{turn}")

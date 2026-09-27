@@ -88,6 +88,9 @@ NOTICE_FILE_UNSENT = "📎 파일을 보내지 못했습니다: {name}"
 # Same cap as the Telegram bridge (bot_delivery.MAX_SEND_FILE_BYTES); the
 # homeserver's m.upload.size lowers it further.
 MAX_OUTBOUND_FILE_BYTES = 50 * 1024 * 1024
+# A file whose upload keeps failing temporarily is given up after this many
+# tries (one notice) instead of holding the ordered outbox forever.
+MAX_OUTBOUND_FILE_ATTEMPTS = 3
 NOTICE_TIMEOUT = "⏳ 시간 제한({minutes}분)을 넘겨 작업을 중단했습니다. 요청을 나눠서 다시 보내 주세요."
 
 
@@ -960,7 +963,9 @@ class MatrixTransport:
         self.wake()
         return event_id
 
-    def enqueue_file(self, room_id: str, path: str, *, key: str) -> str:
+    def enqueue_file(
+        self, room_id: str, path: str, *, key: str, after: str | None = None, root: str | None = None
+    ) -> str:
         """Queue one agent deliverable for a *direct* room (#2001); idempotent per ``key``.
 
         Family rooms are refused: a file an owner-host agent names must not
@@ -974,7 +979,10 @@ class MatrixTransport:
         file_path = Path(path)
         if not file_path.is_absolute():
             raise ValueError("file-path-not-absolute")
-        payload = json.dumps({"v": 1, "path": str(file_path), "name": file_path.name}, ensure_ascii=False)
+        record: dict[str, Any] = {"v": 1, "path": str(file_path), "name": file_path.name}
+        if root:
+            record["root"] = str(root)
+        payload = json.dumps(record, ensure_ascii=False)
         req = Request(
             "$outbound-file-" + hashlib.sha256(room_id.encode()).hexdigest()[:32],
             room_id,
@@ -982,6 +990,11 @@ class MatrixTransport:
             "file",
             hashlib.sha256(json.dumps([self.c["account"], room_id, "outbound-file"]).encode()).hexdigest(),
         )
+        if after:
+            # Held until ``after``'s answer is recorded, then queued behind it;
+            # dropped if that turn is cancelled, times out or is interrupted.
+            self.store.hold_file(after, req, key, payload)
+            return ""
         event_id = self.store.file_job(req, key, payload)
         self.wake()
         return event_id
@@ -993,7 +1006,9 @@ class MatrixTransport:
             from telegram_bot.core.matrix.outbound_media import upload_limit
 
             server = await upload_limit(self.http, self.c["homeserver"])
-            cached = min(MAX_OUTBOUND_FILE_BYTES, server) if server else MAX_OUTBOUND_FILE_BYTES
+            if not server:
+                return MAX_OUTBOUND_FILE_BYTES  # unknown: ask again next time
+            cached = min(MAX_OUTBOUND_FILE_BYTES, server)
             self._upload_cap_cache = cached
         return int(cached)
 
@@ -1020,12 +1035,15 @@ class MatrixTransport:
             payload = json.loads(job["reply"])
             path = Path(str(payload["path"]))
             name = str(payload.get("name") or path.name)[:255]
+            root = Path(str(payload["root"])) if payload.get("root") else None
         except (ValueError, KeyError, TypeError):
             self.store.delivered(event_id)
             return True
+        if room in self.blocked:
+            return False  # a muted room keeps the row; nothing is uploaded meanwhile
         try:
             cap = await self._upload_cap()
-            plaintext = await asyncio.to_thread(read_deliverable, path, max_bytes=cap)
+            plaintext = await asyncio.to_thread(read_deliverable, path, max_bytes=cap, root=root)
             ciphertext, file_info = await asyncio.to_thread(encrypt, plaintext)
             mxc = await upload(self.http, self.c["homeserver"], ciphertext)
             content = file_content(name, mimetype_of(path), len(plaintext), mxc, file_info)
@@ -1038,6 +1056,17 @@ class MatrixTransport:
             logger.info("matrix outbound file not sent reason=%s room=%s", exc.reason, room)
             self._count_file_failure(exc.reason)
             self._file_unsent_notice(job, name)
+        except ConnectionError:
+            # Retryable, but bounded: the outbox is one ordered queue, so a
+            # file whose upload keeps failing would hold every later reply in
+            # every room behind it (review of #2010).
+            if self._file_attempt_exhausted(event_id):
+                logger.info("matrix outbound file gave up after retries room=%s", room)
+                self._count_file_failure("retries-exhausted")
+                self._file_unsent_notice(job, name)
+                self.store.delivered(event_id)
+                return True
+            raise
         except MatrixHTTPError as exc:
             if not exc.part_rejected:
                 raise
@@ -1046,8 +1075,26 @@ class MatrixTransport:
             self._file_unsent_notice(job, name)
         else:
             logger.info("matrix outbound file sent room=%s", room)
+        self._forget_file_attempts(event_id)
         self.store.delivered(event_id)
         return True
+
+    def _file_attempt_exhausted(self, event_id: str) -> bool:
+        attempts = self.store.get_meta("outbound_file_attempts") or {}
+        count = int(attempts.get(event_id) or 0) + 1
+        if count >= MAX_OUTBOUND_FILE_ATTEMPTS:
+            attempts.pop(event_id, None)
+            self.store.set_meta("outbound_file_attempts", attempts)
+            return True
+        attempts[event_id] = count
+        self.store.set_meta("outbound_file_attempts", dict(list(attempts.items())[-50:]))
+        return False
+
+    def _forget_file_attempts(self, event_id: str) -> None:
+        attempts = self.store.get_meta("outbound_file_attempts") or {}
+        if event_id in attempts:
+            attempts.pop(event_id, None)
+            self.store.set_meta("outbound_file_attempts", attempts)
 
     def _file_unsent_notice(self, job: Mapping[str, Any], name: str) -> None:
         """One notice per failed file row; the key carries the text digest.

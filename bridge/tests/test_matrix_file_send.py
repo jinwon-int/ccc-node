@@ -86,9 +86,11 @@ class FileTransport(FakeTransport):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.files: list[tuple[str, str, str]] = []
+        self.after: list[Any] = []
 
-    def enqueue_file(self, room_id: str, path: str, *, key: str) -> str:
+    def enqueue_file(self, room_id: str, path: str, *, key: str, after: Any = None, root: Any = None) -> str:
         self.files.append((room_id, path, key))
+        self.after.append(after)
         return "$file-x"
 
 
@@ -117,6 +119,7 @@ def test_direct_room_answers_queue_their_files_once_per_turn(tmp_path: Path) -> 
     bot._enqueue_deliverables(DM_ROOM, f"done: out/r0.pdf and {b}")
     assert [(room, path) for room, path, _key in transport.files] == [(DM_ROOM, str(a)), (DM_ROOM, str(b))]
     assert [key for *_rest, key in transport.files] == ["deliverable-$turn1-0", "deliverable-$turn1-1"]
+    assert transport.after == ["$turn1", "$turn1"], "held behind the turn's answer"
     assert transport.notices == []
 
 
@@ -162,7 +165,7 @@ class _Response:
         self.status = status
         self._body = body
 
-    async def json(self) -> Any:
+    async def json(self, **_kwargs: Any) -> Any:
         return self._body
 
     async def __aenter__(self) -> "_Response":
@@ -241,16 +244,109 @@ async def test_a_missing_or_refused_file_gets_one_notice_and_never_blocks(tmp_pa
         assert NOTICE_FILE_UNSENT.format(name="gone.pdf") in h.replies()
 
 
-async def test_a_temporary_upload_error_keeps_the_row_for_retry(tmp_path: Path) -> None:
+async def test_a_temporary_upload_error_is_retried_then_given_up(tmp_path: Path) -> None:
+    """The outbox is one ordered queue: a file that keeps failing must not hold every later reply."""
+    from telegram_bot.core.matrix.transport import MAX_OUTBOUND_FILE_ATTEMPTS
+
     async with running(tmp_path) as h:
         f = h.f
-        f.http, _calls = _http(upload_status=503)
+        f.http, calls = _http(upload_status=503)
         report = tmp_path / "r.pdf"
         report.write_bytes(b"x")
         row = await _file_row(h, report)
-        with pytest.raises(ConnectionError):
-            await f._deliver(row)
-        assert [r for r in f.store.outbox() if r["event_id"] == row["event_id"]], "row still ready"
+        for _ in range(MAX_OUTBOUND_FILE_ATTEMPTS - 1):
+            with pytest.raises(ConnectionError):
+                await f._deliver(row)
+            assert [r for r in f.store.outbox() if r["event_id"] == row["event_id"]], "row still ready"
+        assert await f._deliver(row) is True
+        assert not [r for r in f.store.outbox() if r["event_id"] == row["event_id"]]
+        assert NOTICE_FILE_UNSENT.format(name="r.pdf") in h.replies()
+        assert len([c for c in calls if c[0] == "POST"]) == MAX_OUTBOUND_FILE_ATTEMPTS
+
+
+async def test_a_non_json_upload_answer_is_not_retried(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+
+        class Html(_Response):
+            async def json(self, **_kwargs: Any) -> Any:
+                raise ValueError("not json")
+
+        f.http = types.SimpleNamespace(
+            request=lambda method, url, **kw: _Response(200, {}) if url.endswith("/config") else Html(200, None),
+            close=AsyncMock(),
+        )
+        f._encrypted_raw = AsyncMock(return_value="$sent")  # type: ignore[method-assign]
+        report = tmp_path / "r.pdf"
+        report.write_bytes(b"x")
+        row = await _file_row(h, report)
+        assert await f._deliver(row) is True
+        assert f.store.get_meta("outbound_file_failures")["upload-invalid-response"] == 1
+
+
+async def test_a_symlink_swapped_in_after_queueing_is_not_followed(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        f.http, calls = _http()
+        f._encrypted_raw = AsyncMock(return_value="$sent")  # type: ignore[method-assign]
+        root = tmp_path / "project"
+        root.mkdir()
+        secret = tmp_path / "secret.txt"
+        secret.write_bytes(b"OUTSIDE")
+        report = root / "report.txt"
+        report.write_bytes(b"inside")
+        f.enqueue_file(f.c["rooms"][0], str(report), key="k", root=str(root))
+        row = [r for r in f.store.outbox() if r["body"] == FILE_JOB_BODY][0]
+        report.unlink()
+        report.symlink_to(secret)
+        assert await f._deliver(row) is True
+        assert not [c for c in calls if c[0] == "POST"], "nothing uploaded"
+        assert f.store.get_meta("outbound_file_failures")["path-changed"] == 1
+
+
+async def test_a_muted_room_uploads_nothing(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        f.http, calls = _http()
+        report = tmp_path / "r.pdf"
+        report.write_bytes(b"x")
+        row = await _file_row(h, report)
+        f.blocked.add(row["room_id"])
+        assert await f._deliver(row) is False
+        assert calls == []
+
+
+async def test_held_files_follow_the_answer_and_die_with_an_interrupted_turn(tmp_path: Path) -> None:
+    from telegram_bot.core.matrix.state import Request, scope_of
+
+    async with running(tmp_path) as h:
+        f = h.f
+        room, owner = f.c["rooms"][0], f.c["owner"]
+        report = tmp_path / "r.pdf"
+        report.write_bytes(b"x")
+
+        def turn(event_id: str) -> str:
+            req = Request(event_id, room, owner, "make a report", scope_of(f.c["account"], room, owner))
+            f.store.accept_batch([req], None)
+            claimed = f.store.claim()
+            assert claimed is not None and claimed["event_id"] == event_id
+            return event_id
+
+        answered = turn("$answered")
+        f.enqueue_file(room, str(report), key="k0", after=answered)
+        assert not [r for r in f.store.outbox() if r["body"] == FILE_JOB_BODY], "held while the turn runs"
+        f.store.finish(answered, "answer naming r.pdf", None)
+        order = [r["body"] for r in f.store.outbox()]
+        assert order == ["make a report", FILE_JOB_BODY], "the file sorts behind its answer"
+        for row in f.store.outbox():
+            f.store.delivered(row["event_id"])
+
+        interrupted = turn("$interrupted")
+        f.enqueue_file(room, str(report), key="k1", after=interrupted)
+        f.store.uncertain_job(interrupted)
+        f.store.resolve_uncertain(interrupted, "interrupted")
+        assert not [r for r in f.store.outbox() if r["body"] == FILE_JOB_BODY], "no file for it"
+        assert f.store.db.execute("SELECT COUNT(*) FROM held_files").fetchone()[0] == 0
 
 
 async def test_the_homeserver_upload_limit_lowers_the_cap(tmp_path: Path) -> None:
