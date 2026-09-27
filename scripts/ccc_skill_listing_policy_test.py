@@ -273,4 +273,9 @@ class SafetyTests(PolicyCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=1)
+    # validate-harness requires a `PASS=<n> FAIL=<n>` summary line.
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    failed = len(result.failures) + len(result.errors)
+    print(f"PASS={result.testsRun - failed} FAIL={failed}")
+    raise SystemExit(0 if result.wasSuccessful() else 1)
