@@ -116,7 +116,15 @@ def _install_nio() -> Any:
             self.verified = True
             self.source: dict[str, Any] = {}
 
+    class RoomMessageEmote(StickerEvent):
+        pass
+
+    class RoomMessageNotice(StickerEvent):
+        pass
+
     nio.StickerEvent = StickerEvent  # type: ignore[attr-defined]
+    nio.RoomMessageEmote = RoomMessageEmote  # type: ignore[attr-defined]
+    nio.RoomMessageNotice = RoomMessageNotice  # type: ignore[attr-defined]
     sys.modules["nio"] = nio
     return nio
 
@@ -152,7 +160,8 @@ async def test_the_transport_answers_each_refusal_once(tmp_path: Path) -> None:
         assert replies.count(NOTICE_EDIT_IGNORED) == 1
         assert replies.count(NOTICE_THREAD_IGNORED) == 1
         counts = f.store.get_meta("ignored_messages")
-        assert counts[REJECT_TEXT_TOO_LARGE] == 2 and counts[REJECT_EDIT] == 2 and counts[REJECT_THREAD] == 1
+        # Idempotent like the notices: a replay or a second edit is not recounted.
+        assert counts[REJECT_TEXT_TOO_LARGE] == 1 and counts[REJECT_EDIT] == 1 and counts[REJECT_THREAD] == 1
         assert OVERSIZE not in str(counts), "the counter is body-free"
 
 
@@ -166,5 +175,39 @@ async def test_stickers_get_one_notice_per_direct_room_and_untrusted_ones_none(t
         assert f.admit_event(room, nio.StickerEvent(owner, "$s1", "b" * 43, now + 500)) is None
         assert f.admit_event(room, nio.StickerEvent(owner, "$s2", "b" * 43, now + 600)) is None
         assert f.admit_event(room, nio.StickerEvent(owner, "$s3", "z" * 43, now + 700)) is None  # untrusted key
+        assert f.admit_event(room, nio.StickerEvent(owner, "$s1", "b" * 43, now + 500)) is None  # replay
+        assert f.admit_event(room, nio.RoomMessageEmote(owner, "$e1", "b" * 43, now + 800)) is None
+        assert f.admit_event(room, nio.RoomMessageNotice(owner, "$n1", "b" * 43, now + 900)) is None
+        assert f.admit_event(room, nio.StickerEvent(owner, "$old", "b" * 43, now - 90_000_000)) is None  # stale
         assert h.replies().count(NOTICE_UNSUPPORTED_KIND) == 1
-        assert f.store.get_meta("ignored_messages")["StickerEvent"] == 2
+        counts = f.store.get_meta("ignored_messages")
+        assert counts["StickerEvent"] == 2 and counts["RoomMessageEmote"] == 1 and counts["RoomMessageNotice"] == 1
+
+
+async def test_rewording_a_notice_in_a_later_release_never_stops_the_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Notice rows are permanent; a same-key/different-text notice raises SafetyStop (review of #2009)."""
+    import telegram_bot.core.matrix.transport as transport_module
+
+    async with running(tmp_path) as h:
+        f = h.f
+        nio = _install_nio()
+        owner, room = f.c["owner"], f.c["rooms"][0]
+        f.trusted[owner] = {"DEV": "b" * 43}
+        f.c["not_before_ms"] = now = int(time.time() * 1000) - 1000
+
+        def edit(event_id: str, target: str) -> Any:
+            content = {"msgtype": "m.text", "body": "* x", "m.new_content": {"msgtype": "m.text", "body": "x"},
+                       "m.relates_to": {"rel_type": "m.replace", "event_id": target}}
+            source = {"type": "m.room.message", "event_id": event_id, "sender": owner,
+                      "origin_server_ts": now + 500, "content": content}
+            return nio.RoomMessageText(sender=owner, source=source, verified=True, sender_key="b" * 43, ts=now + 500)
+
+        f.admit_event(room, edit("$e1", "$orig"))
+        monkeypatch.setattr(transport_module, "NOTICE_EDIT_IGNORED", "✏️ reworded in a later release")
+        f.admit_event(room, edit("$e2", "$orig"))  # must not raise notice-identity-conflict
+        assert "✏️ reworded in a later release" in h.replies()
+        # A malformed edit target falls back to the edit event itself.
+        f.admit_event(room, edit("$e3", "$" + "x" * 5000))
+        assert h.replies().count("✏️ reworded in a later release") == 2

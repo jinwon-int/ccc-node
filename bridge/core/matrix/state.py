@@ -1314,6 +1314,11 @@ class MatrixStore(Store):
                 self.db.execute("INSERT INTO controls VALUES (?,?)", (req.event_id, digest))
         return False
 
+    def has_notice(self, event_id: str, key: str) -> bool:
+        """Whether :meth:`notice` already queued ``key`` for ``event_id``."""
+        event = "$notice-" + hashlib.sha256(json.dumps([event_id, key]).encode()).hexdigest()
+        return self.db.execute("SELECT 1 FROM jobs WHERE event_id=?", (event,)).fetchone() is not None
+
     def notice(self, req: Request, key: str, text: str) -> str:
         """Queue a durable, idempotent notice for ``req``'s room; returns its outbox event id."""
         bounded_text(text, MAX_REPLY_BYTES)
