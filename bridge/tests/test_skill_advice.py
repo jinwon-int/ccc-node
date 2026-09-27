@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from types import SimpleNamespace
 
 import httpx
@@ -11,6 +12,13 @@ import pytest
 from telegram_bot.core import skill_advice as m
 
 MESSAGE = "Find the public Python documentation for asyncio."
+
+
+@pytest.fixture(autouse=True)
+def _fresh_tracker():
+    m._TRACKER.clear()
+    yield
+    m._TRACKER.clear()
 
 
 @pytest.fixture
@@ -26,7 +34,7 @@ def setup(tmp_path, monkeypatch):
     key = secrets / "typesafe-api-key"
     key.write_text("synthetic-key-never-log")
     key.chmod(0o600)
-    skill = home / ".codex/skills/web-routing/SKILL.md"
+    skill = home / ".claude/skills/web-routing/SKILL.md"
     skill.parent.mkdir(parents=True)
     skill.write_text("---\nname: web-routing\n---\nUse public search.\n")
     calls = []
@@ -38,7 +46,7 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "_infer", infer)
     return SimpleNamespace(
         home=home,
-        settings=SimpleNamespace(bot_data_dir=data),
+        settings=SimpleNamespace(bot_data_dir=data, agent_provider="claude"),
         config=config,
         key=key,
         skill=skill,
@@ -70,6 +78,7 @@ def run(s, message=MESSAGE, **kwargs):
             user_id=kwargs.get("user_id", 7),
             chat_id=kwargs.get("chat_id", 7),
             interactive=kwargs.get("interactive", True),
+            session_id=kwargs.get("session_id"),
         )
     )
 
@@ -349,3 +358,246 @@ def test_whitespace_context_only_excluded(setup):
     message = "  continue with the previous request"
     assert run(setup, message) == message
     assert not setup.calls
+
+
+# --- #2011 C: provider-aware candidates and follow-up measurement -----------
+
+
+def _install_skill(home, provider_root, name):
+    path = home / provider_root / "skills" / name / "SKILL.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"---\nname: {name}\n---\nSynthetic skill.\n")
+    return path
+
+
+def _install_command(home, name):
+    path = home / ".claude" / "commands" / f"{name}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("Synthetic command body.\n")
+    return path
+
+
+def _choose(monkeypatch, setup, label):
+    async def infer(payload, key):
+        setup.calls.append((payload, key))
+        return response(payload["questions"]["skill"]["criteria"], choice=label)
+
+    monkeypatch.setattr(m, "_infer", infer)
+
+
+def test_claude_uses_claude_names_and_never_codex_paths(setup, monkeypatch):
+    codex_copy = _install_skill(setup.home, ".codex", "ccc-wiki-record")
+    claude_copy = _install_skill(setup.home, ".claude", "wiki-record")
+    _choose(monkeypatch, setup, "ccc-wiki-record")
+    output = run(setup)
+    criteria = setup.calls[0][0]["questions"]["skill"]["criteria"]
+    # Classifier labels stay stable; the insert is the Claude-local artifact.
+    assert set(criteria) == {"web-routing", "ccc-wiki-record", "no_skill", "defer"}
+    assert "recommendation: wiki-record\n" in output
+    assert str(claude_copy) in output and str(codex_copy) not in output
+    assert ".codex" not in output
+
+
+def test_codex_uses_codex_root_only(setup, monkeypatch):
+    setup.settings.agent_provider = "codex"
+    codex_copy = _install_skill(setup.home, ".codex", "ccc-wiki-record")
+    _install_skill(setup.home, ".claude", "wiki-record")
+    _choose(monkeypatch, setup, "ccc-wiki-record")
+    output = run(setup)
+    criteria = setup.calls[0][0]["questions"]["skill"]["criteria"]
+    # web-routing exists only under .claude, so Codex must not be offered it.
+    assert set(criteria) == {"ccc-wiki-record", "no_skill", "defer"}
+    assert "recommendation: ccc-wiki-record\n" in output and str(codex_copy) in output
+    assert ".claude" not in output
+
+
+def test_candidate_missing_for_active_provider_is_never_offered(setup, monkeypatch, caplog):
+    # Installed for Codex only; the Claude bridge has no candidates at all.
+    setup.skill.unlink()
+    _install_skill(setup.home, ".codex", "research-hug-law")
+    _install_skill(setup.home, ".codex", "ccc-node-status")
+    with caplog.at_level(logging.INFO):
+        assert run(setup) == MESSAGE
+    assert not setup.calls
+    assert "status=no_candidates" in caplog.text and "provider=claude" in caplog.text
+
+
+def test_unmapped_choice_after_classification_abstains(setup, monkeypatch):
+    # A label outside the offered set (not installed for Claude) never injects.
+    _install_skill(setup.home, ".codex", "research-hug-law")
+    _choose(monkeypatch, setup, "research-hug-law")
+    assert run(setup) == MESSAGE
+
+
+@pytest.mark.parametrize("provider", ["crush", "piri", "danso", "grok"])
+def test_provider_without_skill_root_gets_no_advice(setup, provider):
+    setup.settings.agent_provider = provider
+    _install_skill(setup.home, ".codex", "web-routing")
+    assert run(setup) == MESSAGE and not setup.calls
+
+
+def test_claude_command_candidate(setup, monkeypatch):
+    command = _install_command(setup.home, "node-status")
+    _choose(monkeypatch, setup, "ccc-node-status")
+    output = run(setup)
+    assert "ccc-node-status" in setup.calls[0][0]["questions"]["skill"]["criteria"]
+    assert "Optional local command recommendation: /node-status\n" in output
+    assert json.dumps(str(command)) in output and "grants no approval" in output
+    assert output.endswith("\n\n" + MESSAGE)
+
+
+@pytest.mark.parametrize("kind", ["writable", "symlink", "empty"])
+def test_unsafe_command_file_not_offered(setup, monkeypatch, kind):
+    command = _install_command(setup.home, "node-status")
+    if kind == "writable":
+        command.chmod(0o666)
+    elif kind == "symlink":
+        target = command.with_name("real.md")
+        command.rename(target)
+        command.symlink_to(target)
+    else:
+        command.write_text("")
+    run(setup)
+    assert "ccc-node-status" not in setup.calls[0][0]["questions"]["skill"]["criteria"]
+
+
+def test_provider_alias_mention_is_explicit(setup):
+    message = "please run wiki-record for this decision"
+    assert run(setup, message) == message and not setup.calls
+
+
+def _outcomes(caplog):
+    return [r.getMessage() for r in caplog.records if "skill_advice_outcome" in r.getMessage()]
+
+
+def test_recommendation_log_has_correlation_ids_and_no_private_text(setup, caplog):
+    with caplog.at_level(logging.INFO):
+        run(setup, session_id="sess-synthetic-1")
+    line = next(r.getMessage() for r in caplog.records if "status=recommended" in r.getMessage())
+    assert "provider=claude" in line and "target=web-routing" in line
+    assert re.search(r"advice_id=[0-9a-f]{12}\b", line)
+    tag = m._session_tag("sess-synthetic-1")
+    assert f"session={tag}" in line and "sess-synthetic-1" not in caplog.text
+    assert MESSAGE not in caplog.text and str(setup.home) not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments", "evidence"),
+    [
+        ("Skill", {"skill": "web-routing"}, "skill_tool"),
+        ("Skill", {"skill": "/web-routing", "args": "x"}, "skill_tool"),
+        ("Read", {"file_path": "SKILL_PATH"}, "file_read"),
+        ("Bash", {"command": "sed -n 1,200p SKILL_PATH"}, "file_read"),
+    ],
+)
+def test_claude_follow_detected(setup, caplog, tool, arguments, evidence):
+    with caplog.at_level(logging.INFO):
+        run(setup, session_id="s1")
+        args = {k: v.replace("SKILL_PATH", str(setup.skill)) for k, v in arguments.items()}
+        m.observe_tool_event(7, 7, "s1", tool, args)
+    (line,) = _outcomes(caplog)
+    assert "outcome=followed" in line and f"detail={evidence}" in line and "turns=1" in line
+    assert str(setup.skill) not in caplog.text
+    assert m._TRACKER.pending((7, 7)) is None
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("Skill", {"skill": "gh-pr-flow"}),
+        ("Read", {"file_path": "/elsewhere/SKILL.md"}),
+        ("Write", {"file_path": "/tmp/x", "content": "SKILL_PATH"}),
+        ("commandExecution", {"command": "cat SKILL_PATH"}),  # not a Claude tool
+    ],
+)
+def test_claude_unrelated_tools_do_not_count(setup, caplog, tool, arguments):
+    with caplog.at_level(logging.INFO):
+        run(setup, session_id="s1")
+        args = {k: v.replace("SKILL_PATH", str(setup.skill)) for k, v in arguments.items()}
+        m.observe_tool_event(7, 7, "s1", tool, args)
+    assert not _outcomes(caplog) and m._TRACKER.pending((7, 7)) is not None
+
+
+def test_codex_follow_via_command_execution(setup, monkeypatch, caplog):
+    setup.settings.agent_provider = "codex"
+    codex_copy = _install_skill(setup.home, ".codex", "ccc-wiki-record")
+    _choose(monkeypatch, setup, "ccc-wiki-record")
+    with caplog.at_level(logging.INFO):
+        run(setup, session_id="thread-1")
+        m.observe_tool_event(7, 7, "thread-1", "Skill", {"skill": "ccc-wiki-record"})
+        assert not _outcomes(caplog)
+        m.observe_tool_event(
+            7, 7, "thread-1", "commandExecution",
+            {"type": "commandExecution", "command": f"/bin/bash -lc 'cat {codex_copy}'"},
+        )
+    (line,) = _outcomes(caplog)
+    assert "provider=codex" in line and "outcome=followed" in line and "detail=file_read" in line
+
+
+def test_follow_in_later_turn_of_same_session(setup, caplog):
+    with caplog.at_level(logging.INFO):
+        run(setup, session_id="s1")
+        m.finish_advice_turn(7, 7, "s1")
+        m.observe_tool_event(7, 7, "s1", "Skill", {"skill": "web-routing"})
+    (line,) = _outcomes(caplog)
+    assert "outcome=followed" in line and "turns=2" in line
+
+
+def test_not_followed_after_window(setup, caplog):
+    with caplog.at_level(logging.INFO):
+        run(setup, session_id="s1")
+        for _ in range(m.FOLLOW_WINDOW_TURNS):
+            assert not _outcomes(caplog)
+            m.finish_advice_turn(7, 7, "s1")
+        m.observe_tool_event(7, 7, "s1", "Skill", {"skill": "web-routing"})
+    (line,) = _outcomes(caplog)
+    assert "outcome=not_followed" in line and "detail=window" in line
+    assert f"turns={m.FOLLOW_WINDOW_TURNS}" in line
+
+
+def test_session_change_closes_window(setup, caplog):
+    with caplog.at_level(logging.INFO):
+        run(setup, session_id="s1")
+        m.observe_tool_event(7, 7, "s2", "Skill", {"skill": "web-routing"})
+    (line,) = _outcomes(caplog)
+    assert "outcome=not_followed" in line and "detail=session_changed" in line
+
+
+def test_session_bound_lazily_when_unknown_at_advice(setup, caplog):
+    with caplog.at_level(logging.INFO):
+        run(setup, session_id=None)
+        m.finish_advice_turn(7, 7, "s-new")
+        m.observe_tool_event(7, 7, "s-new", "Skill", {"skill": "web-routing"})
+    (line,) = _outcomes(caplog)
+    assert "outcome=followed" in line and f"session={m._session_tag('s-new')}" in line
+
+
+def test_new_recommendation_supersedes_pending(setup, caplog):
+    with caplog.at_level(logging.INFO):
+        run(setup, session_id="s1")
+        run(setup, session_id="s1")
+    (line,) = _outcomes(caplog)
+    assert "outcome=not_followed" in line and "detail=superseded" in line
+    assert m._TRACKER.pending((7, 7)) is not None
+
+
+def test_other_conversation_events_ignored_and_taps_fail_open(setup, caplog):
+    with caplog.at_level(logging.INFO):
+        run(setup, session_id="s1")
+        m.observe_tool_event(8, 8, "s1", "Skill", {"skill": "web-routing"})
+        m.observe_tool_event(7, 7, "s1", None, None)
+        m.observe_tool_event(7, 7, "s1", "Skill", "not-a-mapping")
+        m.finish_advice_turn(8, 8, "s1")
+    assert not _outcomes(caplog) and m._TRACKER.pending((7, 7)).turns == 0
+
+
+def test_pending_tracker_is_bounded(setup, monkeypatch, caplog):
+    monkeypatch.setattr(m, "_MAX_PENDING", 2)
+    target = m._Target("skill", "web-routing", setup.skill)
+    with caplog.at_level(logging.INFO):
+        for uid in (1, 2, 3):
+            m._TRACKER.register(
+                (uid, uid), m._PendingAdvice(f"{uid:012x}", "claude", "web-routing", target, None, 0.0)
+            )
+    (line,) = _outcomes(caplog)
+    assert "detail=evicted" in line and m._TRACKER.pending((1, 1)) is None

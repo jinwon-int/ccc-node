@@ -63,7 +63,11 @@ from telegram_bot.core.request_lifecycle import (
 from telegram_bot.core.usage import claude_endpoint_host
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE
 from telegram_bot.core.sdk_text import TERMINAL_STALL_NOTICE
-from telegram_bot.core.skill_advice import advise_turn
+from telegram_bot.core.skill_advice import (
+    advise_turn,
+    finish_advice_turn,
+    observe_tool_event as observe_advice_tool,
+)
 from telegram_bot.utils.chat_logger import log_chat
 from telegram_bot.core.codex_app_server import CodexConnectionClosedError
 from telegram_bot.utils.health import health_reporter
@@ -352,6 +356,15 @@ class _TurnAuthorization:
     followup_authorized: bool = False
     # ``session.abort_stalled_turn`` when the session offers one, else None.
     abort_stalled_turn: Any = None
+
+
+def _advice_session_id(session: Any) -> Optional[str]:
+    """Session id for skill-advice correlation; never raises (unstarted Claude)."""
+    try:
+        value = getattr(session, "session_id", None)
+    except Exception:
+        return None
+    return value if isinstance(value, str) and value else None
 
 
 class _TurnCallbacks:
@@ -1125,6 +1138,15 @@ class ProjectChatProcessMixin:
             if _observer is not None:
                 _observer.observe(event, session_id=session.session_id)
             transition = turn_state.observe(event, observed_at=now)
+            if isinstance(transition, ToolStartedTransition):
+                # Body-free, fail-open: did the agent use a recommended skill?
+                observe_advice_tool(
+                    getattr(progress_request, "user_id", None),
+                    getattr(progress_request, "chat_id", None),
+                    _advice_session_id(session),
+                    transition.event.tool_name,
+                    transition.event.arguments,
+                )
             if isinstance(transition, DelegatedTaskLifecycleTransition):
                 try:
                     health_reporter.record_delegated_task_activity(
@@ -1793,6 +1815,8 @@ class ProjectChatProcessMixin:
         are whatever the turn left on exit — including after an exception
         between session start and registration.
         """
+        # Close the skill-advice follow window (body-free, fail-open).
+        finish_advice_turn(user_id, chat_id, _advice_session_id(session))
         if followup_authorized and session is not None:
             session.clear_task_followup_authorization()
         if resume_authorized:
@@ -2043,6 +2067,7 @@ class ProjectChatProcessMixin:
                     return denied
                 turn_message = await advise_turn(
                     user_message, settings=self._config, user_id=user_id, chat_id=chat_id,
+                    session_id=_advice_session_id(session),
                     interactive=(skill_advice_allowed and usage_mode == MODE_INTERACTIVE and not resume_task
                                  and dispatch_guard is None
                                  and admission_timeout_override is None),

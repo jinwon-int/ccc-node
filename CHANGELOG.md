@@ -4,6 +4,22 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **Bridge skill advice: provider-aware candidates and a measurable follow rate
+  (#2011 C).** `ccc_skill_advice` resolved each candidate by probing
+  `~/.codex/skills` before `~/.claude/skills` whatever provider was running,
+  using Codex names, so on a Claude bridge (dungae) 6/6 recommendations pointed
+  at `/root/.codex/skills` paths and 2 named skills Claude did not have.
+  Candidates now resolve only under the running provider's own root
+  (`CCC_AGENT_PROVIDER`): the classifier keeps its stable labels, and after
+  classification each label maps to the provider-local artifact (Claude
+  `wiki-record`/`self-update` skills and `/node-status`/`/agent-cron`
+  commands; Codex `ccc-*` skills). A label not installed for that provider is
+  never offered or borrowed; providers without a skill root get no advice.
+  Each `skill_advice` line now carries `provider`, `target`, a random
+  `advice_id` and a hashed `session` tag, and a body-free
+  `skill_advice_outcome` line records whether the recommendation was followed
+  (Skill tool call or read of its file) within the same session's next three
+  turns, or why the window closed.
 - **nunchi codex feed: the stale-lane sweep now catches the Termux codex
   wrapper (#1994).** `codex-feed.sh` killed leftover `codex exec` processes
   from earlier ticks with `pgrep -f "codex exec.*<lane tag>"`, but on Termux

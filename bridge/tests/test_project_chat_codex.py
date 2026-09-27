@@ -3241,3 +3241,42 @@ async def test_skill_advice_reaches_common_provider_turn_only(
                                              sensitive_log_event=sensitive)
     assert response.success and session.messages == ["advisory\nFind public documentation"]
     assert len(observed) == 1 and observed[0][1]["interactive"] is (sensitive is None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+async def test_skill_advice_follow_taps_see_tool_starts_and_turn_end(
+    tmp_path: Path, monkeypatch, provider: str,
+) -> None:
+    """#2011 C: tool starts and turn end reach the body-free follow tracker."""
+    calls: list[tuple] = []
+    session = FakeSession(
+        "advice-follow",
+        [
+            ToolStartedEvent("tool-1", "Skill", {"skill": "web-routing"}),
+            ToolCompletedEvent("tool-1", "Skill", {"output": "ok"}, True),
+            TextDeltaEvent("ok"),
+            CompletionEvent("end_turn"),
+        ],
+    )
+    handler = ProjectChatHandler(settings=_settings(tmp_path, provider=provider),
+                                 agent_runtime=FakeRuntime([session]))
+    handler._task_ledger_cache = False
+    bound = handler._process_agent_message.__func__.__globals__
+
+    async def advise(message, **kwargs):
+        calls.append(("advise", kwargs["session_id"]))
+        return message
+
+    monkeypatch.setitem(bound, "advise_turn", advise)
+    monkeypatch.setitem(bound, "observe_advice_tool",
+                        lambda *args: calls.append(("tool", *args[:4])))
+    monkeypatch.setitem(bound, "finish_advice_turn",
+                        lambda *args: calls.append(("finish", *args)))
+    response = await handler.process_message("Find public documentation", user_id=7, chat_id=7)
+    assert response.success
+    assert calls == [
+        ("advise", "advice-follow"),
+        ("tool", 7, 7, "advice-follow", "Skill"),
+        ("finish", 7, 7, "advice-follow"),
+    ]
