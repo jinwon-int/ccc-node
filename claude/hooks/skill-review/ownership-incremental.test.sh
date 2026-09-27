@@ -129,6 +129,27 @@ out="$(tool apply-proposal --proposal "$TMP/patch.json")"
 ok "patch replay is idempotent and counted once" \
   'jq -e ".changed == false and .idempotent == true and .code == \"already_applied\"" >/dev/null <<<"$out" && [ "$(jq -s "[.[] | select(.event == \"skill-proposal-apply\" and .outcome == \"applied\" and .proposal_id == (\"1\"*64))] | length" "$STATE/skill-autosave-ownership.jsonl")" = 1 ]'
 
+# Trigger-first description (fleet-skills#315/#316): the body-only patch above
+# applied to a skill whose description has no trigger wording, but a patch that
+# REWRITES the description must lead with when to use the skill.
+make_skill desc-one
+make_patch desc-one SKILL.md \
+  "description: A sufficiently detailed recurring workflow for incremental ownership tests." \
+  "description: A reworded recurring workflow summary for incremental ownership tests." \
+  "$(printf 'd%.0s' {1..64})" "$TMP/desc-bad.json"
+# shellcheck disable=SC2034  # desc_before is read via eval inside ok()
+desc_before="$(sha256sum "$SKILLS/desc-one/SKILL.md")"
+out="$(tool apply-proposal --proposal "$TMP/desc-bad.json")"; rc=$?
+ok "description rewrite without trigger wording fails closed" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"incremental_description_trigger_missing\"" >/dev/null <<<"$out" && [ "$desc_before" = "$(sha256sum "$SKILLS/desc-one/SKILL.md")" ]'
+make_patch desc-one SKILL.md \
+  "description: A sufficiently detailed recurring workflow for incremental ownership tests." \
+  "description: Use when an incremental ownership workflow needs a detailed recurring checklist." \
+  "$(printf 'e%.0s' {1..64})" "$TMP/desc-good.json"
+out="$(tool apply-proposal --proposal "$TMP/desc-good.json")"
+ok "description rewrite with trigger wording applies" \
+  'jq -e ".changed == true and .code == \"applied\"" >/dev/null <<<"$out" && grep -q "^description: Use when an incremental ownership" "$SKILLS/desc-one/SKILL.md"'
+
 make_patch patch-one SKILL.md "1. Read twice." "1. Read three times." "$(printf '2%.0s' {1..64})" "$TMP/stale.json"
 sed -i 's/1\. Read twice\./1. Read changed externally./' "$SKILLS/patch-one/SKILL.md"
 out="$(tool apply-proposal --proposal "$TMP/stale.json")"; rc=$?

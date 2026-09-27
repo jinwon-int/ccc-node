@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -3014,7 +3015,7 @@ def _recover_incremental_transaction(
     raise ContractError("incremental_recovery_conflict")
 
 
-def _validate_skill_md_structure(name: str, payload: bytes) -> None:
+def _validate_skill_md_structure(name: str, payload: bytes) -> str:
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError:
@@ -3039,6 +3040,45 @@ def _validate_skill_md_structure(name: str, payload: bytes) -> None:
     ]
     if name_values != [name] or len(descriptions) != 1 or not descriptions[0]:
         raise ContractError("incremental_skill_structure_invalid")
+    return descriptions[0]
+
+
+def _skill_md_description(payload: bytes) -> str | None:
+    try:
+        lines = payload.decode("utf-8").splitlines()
+        closing = lines.index("---", 1)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not lines or lines[0] != "---":
+        return None
+    for line in lines[1:closing]:
+        if line.startswith("description:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _has_trigger_wording(description: str) -> bool:
+    """Shared fleet-skills TRIGGER_RE check (description_trigger.py, fleet-skills#315)."""
+    path = Path(__file__).resolve().parent / "description_trigger.py"
+    spec = importlib.util.spec_from_file_location("ccc_description_trigger", path)
+    if spec is None or spec.loader is None:
+        raise ContractError("incremental_description_trigger_unverifiable")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except (OSError, SyntaxError):
+        raise ContractError("incremental_description_trigger_unverifiable") from None
+    return bool(module.has_trigger_wording(description))
+
+
+def _gate_description_trigger(description: str, old_snapshot: TargetSnapshot | None) -> None:
+    # Only a patch that REWRITES the description is held to the trigger-first
+    # rule: body-only patches to an older skill must stay possible, the same way
+    # fleet-skills does not fail untouched descriptions on main.
+    if old_snapshot is not None and _skill_md_description(old_snapshot.content) == description:
+        return
+    if not _has_trigger_wording(description):
+        raise ContractError("incremental_description_trigger_missing")
 
 
 def _idempotent_apply_result(
@@ -3173,7 +3213,8 @@ def _validate_incremental_output(
         raise ContractError("incremental_content_non_utf8") from None
     _gate_incremental_content(new_text, context)
     if relative == "SKILL.md":
-        _validate_skill_md_structure(name, new_payload)
+        description = _validate_skill_md_structure(name, new_payload)
+        _gate_description_trigger(description, old_snapshot)
         return
     if not enforce_support_caps:
         return

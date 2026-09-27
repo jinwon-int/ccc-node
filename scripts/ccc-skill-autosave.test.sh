@@ -44,7 +44,7 @@ cat > "$TMP/bin/claude" <<'SH'
 #!/usr/bin/env bash
 cat >/dev/null
 cat <<'JSON'
-{"skill_candidates":[{"name":"release-checklist","category":"ops","summary":"Capture the recurring release checklist.","reason":"Transcript repeats a release flow.","evidence_excerpt":"automate recurring release checklist","skill_md":"---\nname: release-checklist\ndescription: Capture release checklist procedures.\n---\n\n# Release Checklist\n\n## When to Use\n- Recurring release verification.\n\n## Procedure\n1. Inspect git state.\n\n## Safety\n- No raw secrets.\n\n## Verification\n- Output recorded.\n"}]}
+{"skill_candidates":[{"name":"release-checklist","category":"ops","summary":"Capture the recurring release checklist.","reason":"Transcript repeats a release flow.","evidence_excerpt":"automate recurring release checklist","skill_md":"---\nname: release-checklist\ndescription: Use when capturing release checklist procedures.\n---\n\n# Release Checklist\n\n## When to Use\n- Recurring release verification.\n\n## Procedure\n1. Inspect git state.\n\n## Safety\n- No raw secrets.\n\n## Verification\n- Output recorded.\n"}]}
 JSON
 SH
 chmod +x "$TMP/bin/claude"

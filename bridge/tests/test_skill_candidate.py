@@ -68,7 +68,7 @@ JOB_ID = "c" * 64
 def _skill_md(name: str = "codex-release-check") -> str:
     return (
         f"---\nname: {name}\n"
-        "description: Capture the recurring Codex release verification checklist procedure.\n"
+        "description: Use when capturing the recurring Codex release verification checklist procedure.\n"
         "---\n\n"
         f"# {name}\n\n"
         "## When to Use\n- Recurring Codex release verification.\n\n"

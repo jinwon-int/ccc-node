@@ -73,7 +73,7 @@ make_draft() { # <id> <name> <description> [body]
 }
 
 # --- 1) approve mode (default): no install on the Codex surface ------------------
-make_draft 20260101-000000-a-clean codex-clean-one "Capture the recurring Codex release verification checklist procedure."
+make_draft 20260101-000000-a-clean codex-clean-one "Use when capturing the recurring Codex release verification checklist procedure."
 out="$(run_codex bash "$AUTO" run)"
 ok "codex approve mode reports skipped" 'jq -e ".skipped == \"mode\"" >/dev/null <<<"$out"'
 ok "codex approve installs nothing" '[ ! -e "$CODEX_SKILLS/codex-clean-one" ]'
@@ -114,7 +114,7 @@ ok "piri skills dir honors overrides and default" '
   d3="$(ccc_skills_dir piri)"; [ "$d3" = "$HOME/.piri/agent/skills" ]'
 
 # --- 4) secret / node-specific drafts blocked (redaction-safe reason) ------------
-make_draft 20260101-000001-b-leaky codex-leaky "Automate the recurring Codex token rotation procedure for the deploy pipeline." \
+make_draft 20260101-000001-b-leaky codex-leaky "Use when automating the recurring Codex token rotation procedure for the deploy pipeline." \
 "# Leaky
 
 ## Procedure
@@ -128,7 +128,7 @@ ok "codex secret draft not installed" '[ ! -e "$CODEX_SKILLS/codex-leaky" ]'
 ok "codex secret block names pattern class only" 'jq -e ".reason == \"secret gh-token\"" "$PENDING/20260101-000001-b-leaky/autosave-block.json" >/dev/null'
 ok "codex secret block never quotes the secret" '! grep -q ghp_ "$PENDING/20260101-000001-b-leaky/autosave-block.json"'
 
-make_draft 20260101-000002-c-node codex-nodefact "Capture the recurring Codex log inspection procedure used across sessions." \
+make_draft 20260101-000002-c-node codex-nodefact "Use when capturing the recurring Codex log inspection procedure used across sessions." \
 "# Node fact
 
 ## Procedure
@@ -141,7 +141,7 @@ run_codex env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "codex node-specific draft blocked" '[ ! -e "$CODEX_SKILLS/codex-nodefact" ] && jq -e ".reason | startswith(\"node-specific\")" "$PENDING/20260101-000002-c-node/autosave-block.json" >/dev/null'
 
 # --- 5) Codex-incompatible (Claude-only) drafts are isolated, not installed ------
-make_draft 20260101-000003-d-cli codex-claude-cli "Document the recurring Codex review drafting procedure for operators." \
+make_draft 20260101-000003-d-cli codex-claude-cli "Use when documenting the recurring Codex review drafting procedure for operators." \
 "# Uses the Claude CLI
 
 ## Procedure
@@ -153,7 +153,7 @@ make_draft 20260101-000003-d-cli codex-claude-cli "Document the recurring Codex 
 run_codex env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "codex rejects claude -p coupling" 'jq -e ".reason == \"codex-incompat claude-cli\"" "$PENDING/20260101-000003-d-cli/autosave-block.json" >/dev/null'
 
-make_draft 20260101-000004-e-home codex-claude-home "Document the recurring Codex state inspection procedure for the node here." \
+make_draft 20260101-000004-e-home codex-claude-home "Use when documenting the recurring Codex state inspection procedure for the node here." \
 "# Reads the Claude home tree
 
 ## Procedure
@@ -165,7 +165,7 @@ make_draft 20260101-000004-e-home codex-claude-home "Document the recurring Code
 run_codex env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "codex rejects .claude home coupling" 'jq -e ".reason == \"codex-incompat claude-home\"" "$PENDING/20260101-000004-e-home/autosave-block.json" >/dev/null'
 
-make_draft 20260101-000005-f-env codex-claude-env "Document the recurring Codex skills directory audit procedure for the fleet." \
+make_draft 20260101-000005-f-env codex-claude-env "Use when documenting the recurring Codex skills directory audit procedure for the fleet." \
 "# Uses CLAUDE env
 
 ## Procedure
@@ -178,7 +178,7 @@ run_codex env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "codex rejects CLAUDE_ env coupling" 'jq -e ".reason == \"codex-incompat claude-env\"" "$PENDING/20260101-000005-f-env/autosave-block.json" >/dev/null'
 
 # Prose that merely mentions Claude Code (no concrete coupling) still installs.
-make_draft 20260101-000006-g-prose codex-prose-ok "Capture the recurring Codex and Claude Code parity note review procedure." \
+make_draft 20260101-000006-g-prose codex-prose-ok "Use when capturing the recurring Codex and Claude Code parity note review procedure." \
 "# Mentions Claude Code in prose only
 
 ## When to Use
@@ -201,7 +201,7 @@ printf -- '---\nname: user-made\ndescription: Operator-authored Codex skill that
   > "$CODEX_SKILLS/user-made/SKILL.md"
 # shellcheck disable=SC2034  # before_sha is read via eval inside ok()
 before_sha="$(sha256sum "$CODEX_SKILLS/user-made/SKILL.md" | awk '{print $1}')"
-make_draft 20260101-000007-h-dup user-made "A different take on the same-named Codex skill with entirely different wording."
+make_draft 20260101-000007-h-dup user-made "Use when taking a different pass at the same-named Codex skill with entirely different wording."
 run_codex env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "codex existing skill blocked (never overwrite)" 'jq -e ".reason | startswith(\"dedup already-exists\")" "$PENDING/20260101-000007-h-dup/autosave-block.json" >/dev/null'
 ok "codex existing skill content unchanged" '[ "$(sha256sum "$CODEX_SKILLS/user-made/SKILL.md" | awk "{print \$1}")" = "$before_sha" ]'
@@ -214,7 +214,7 @@ mkdir -p "$CC_CODEX"   # pre-create so all racers share one install target
 chmod 700 "$CC_CODEX"  # contract-compliant root under any umask (#770)
 cc_make() {
   mkdir -p "$CC_STATE/pending-skills/race-1"
-  printf -- '---\nname: codex-race-one\ndescription: Capture the recurring Codex concurrency-safe install verification procedure.\n---\n\n# Race
+  printf -- '---\nname: codex-race-one\ndescription: Use when capturing the recurring Codex concurrency-safe install verification procedure.\n---\n\n# Race
 
 ## Procedure
 1. Do the recurring step.
@@ -241,8 +241,8 @@ mkdir -p "$CAP_STATE/pending-skills" "$CAP_CODEX"
 chmod 700 "$CAP_STATE"
 chmod 700 "$CAP_CODEX"  # contract-compliant root under any umask (#770)
 mkdir -p "$CAP_STATE/pending-skills/cap-a" "$CAP_STATE/pending-skills/cap-b"
-printf -- '---\nname: codex-cap-a\ndescription: Capture the first recurring Codex maintenance procedure for the fleet nodes.\n---\n\n# A\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$CAP_STATE/pending-skills/cap-a/SKILL.md"
-printf -- '---\nname: codex-cap-b\ndescription: Capture the second recurring Codex maintenance procedure for backup checks.\n---\n\n# B\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$CAP_STATE/pending-skills/cap-b/SKILL.md"
+printf -- '---\nname: codex-cap-a\ndescription: Use when capturing the first recurring Codex maintenance procedure for the fleet nodes.\n---\n\n# A\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$CAP_STATE/pending-skills/cap-a/SKILL.md"
+printf -- '---\nname: codex-cap-b\ndescription: Use when capturing the second recurring Codex maintenance procedure for backup checks.\n---\n\n# B\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$CAP_STATE/pending-skills/cap-b/SKILL.md"
 jq -nc '{id:"cap-a",name:"codex-cap-a",status:"pending"}' > "$CAP_STATE/pending-skills/cap-a/meta.json"
 jq -nc '{id:"cap-b",name:"codex-cap-b",status:"pending"}' > "$CAP_STATE/pending-skills/cap-b/meta.json"
 out="$(CCC_SKILL_REVIEW_STATE_DIR="$CAP_STATE" CCC_SKILL_PROVIDER=codex CODEX_SKILLS_DIR="$CAP_CODEX" \
@@ -256,7 +256,7 @@ mkdir -p "$SL_STATE/pending-skills" "$SL_REAL"
 chmod 700 "$SL_STATE"
 ln -s "$SL_REAL" "$SL_LINK"
 mkdir -p "$SL_STATE/pending-skills/sl-1"
-printf -- '---\nname: codex-symlink-target\ndescription: Capture the recurring Codex secure install directory verification procedure.\n---\n\n# S\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$SL_STATE/pending-skills/sl-1/SKILL.md"
+printf -- '---\nname: codex-symlink-target\ndescription: Use when capturing the recurring Codex secure install directory verification procedure.\n---\n\n# S\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$SL_STATE/pending-skills/sl-1/SKILL.md"
 jq -nc '{id:"sl-1",name:"codex-symlink-target",status:"pending"}' > "$SL_STATE/pending-skills/sl-1/meta.json"
 out="$(CCC_SKILL_REVIEW_STATE_DIR="$SL_STATE" CCC_SKILL_PROVIDER=codex CODEX_SKILLS_DIR="$SL_LINK" \
   CCC_PUSH_SPOOL="$TMP/sl-spool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"

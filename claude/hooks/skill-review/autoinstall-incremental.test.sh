@@ -127,7 +127,7 @@ stage_write() { # draft name relative content proposal-id
 stage_legacy_create() { # draft name
   local draft="$1" name="$2"
   mkdir -m 700 "$PENDING/$draft"
-  printf -- '---\nname: %s\ndescription: Capture a distinct recurring legacy create integration procedure.\n---\n\n# %s\n\n## Procedure\n1. Read.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Finish.\n' \
+  printf -- '---\nname: %s\ndescription: Use when capturing a distinct recurring legacy create integration procedure.\n---\n\n# %s\n\n## Procedure\n1. Read.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Finish.\n' \
     "$name" "$name" > "$PENDING/$draft/SKILL.md"
   jq -nc --arg id "$draft" --arg name "$name" \
     '{id:$id,name:$name,status:"pending",session_id:"legacy"}' \

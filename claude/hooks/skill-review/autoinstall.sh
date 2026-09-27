@@ -200,6 +200,29 @@ incremental_installs_today() {
 # logs, meta markers and notifications stay redaction-safe.
 # ---------------------------------------------------------------------------
 
+# Trigger-first description (fleet-skills#315/#316). The runtime picks a skill
+# from its description alone, and the per-turn listing truncates it, so the
+# description must say WHEN to use the skill. fleet-skills validate.py ERRORs
+# on approved skills without trigger wording; the regex lives ONLY in
+# description_trigger.py (a verbatim copy of fleet-skills TRIGGER_RE) so this
+# gate and the promotion gate cannot diverge silently. Fails closed: without
+# python3 or the helper the draft stays pending as `-unverifiable`.
+DESC_TRIGGER_TOOL="$AUTOINSTALL_LIB_DIR/description_trigger.py"
+gate_description_trigger() { # <description>
+  local rc
+  if ! command -v python3 >/dev/null 2>&1 || [ ! -r "$DESC_TRIGGER_TOOL" ]; then
+    printf 'lint description-trigger-unverifiable'; return 1
+  fi
+  printf '%s' "$1" | python3 "$DESC_TRIGGER_TOOL" check >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) printf 'lint description-trigger' ;;
+    *) printf 'lint description-trigger-unverifiable' ;;
+  esac
+  return 1
+}
+
 gate_lint() { # <skill.md>
   local f="$1" close name desc body_lines
   [ -f "$f" ] || { printf 'lint missing-skill-md'; return 1; }
@@ -214,6 +237,7 @@ gate_lint() { # <skill.md>
   [ -n "$desc" ] || { printf 'lint missing-description'; return 1; }
   [ "${#desc}" -ge "$DESC_MIN" ] || { printf 'lint description-too-short'; return 1; }
   [ "${#desc}" -le "$DESC_MAX" ] || { printf 'lint description-too-long'; return 1; }
+  gate_description_trigger "$desc" || return 1
   compat="$(fm_field "$f" compatibility)"
   [ "${#compat}" -le 500 ] || { printf 'lint compatibility-too-long'; return 1; }
   body_lines="$(awk -v s="$close" 'NR>s && NF' "$f" 2>/dev/null | wc -l | tr -d '[:space:]')"
@@ -409,9 +433,14 @@ claim_urls() { # <skill.md> — every citable URL, deduped, scheme-normalized
 
 norm_name() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -dc 'a-z0-9'; }
 
+# Trigger-first descriptions all open with the same "Use when ..." clause, so
+# those words would count as shared tokens in every pair and push unrelated
+# skills toward the similarity threshold. Drop them, as the fleet-skills
+# near-duplicate advisory does (its SIMILARITY_STOPWORDS covers these).
+DESC_TRIGGER_STOPWORDS=' use using when whenever while before after this '
 desc_tokens() { # <text> — one lowercase token (len>=3) per line, unique+sorted
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '\n' \
-    | awk 'length($0) >= 3' | sort -u
+    | awk -v stop="$DESC_TRIGGER_STOPWORDS" 'length($0) >= 3 && index(stop, " " $0 " ") == 0' | sort -u
 }
 
 gate_dedup() { # <name> <description> <workdir>

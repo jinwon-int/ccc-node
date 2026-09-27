@@ -107,6 +107,11 @@ Each owner-only pending directory contains exactly one `proposal.json` plus
   bound to provenance revision/hash and `expected_absent=true`;
 - `noop`: records the job complete without staging a draft.
 
+A `patch` that rewrites the `SKILL.md` `description` must carry trigger
+wording too (`incremental_description_trigger_missing`, same shared pattern as
+the install lint). Body-only patches to an older skill whose description
+predates the rule still apply.
+
 Patch and support-file apply run entirely inside the ownership mutation lock.
 The engine rechecks ownership, pin state, hashes, path components, link count,
 content gates and support caps. It fsyncs a body-free `prepared` ledger row
@@ -344,11 +349,32 @@ surface + enforced authoring standards + after-the-fact visibility:
    paths, non-loopback IPs, `user@host`/emails (git@github.com allowed).
 3. **Dedup** against installed skills: existing directory is never
    overwritten; normalized-name and description-similarity matches are blocked.
+   The similarity tokens drop the shared trigger words (`use`, `when`,
+   `before`, `after`, …) so trigger-first descriptions do not look alike just
+   because they all open with "Use when".
 4. **Structure lint** (Hermes HARDLINE-style + Agent Skills spec): frontmatter
    with kebab-case `name` (≤64, no leading/trailing/consecutive hyphens),
    routing-friendly `description` (20–1024 chars), non-trivial body with
    headings, and an optional `compatibility` field of at most 500 chars
    (agentskills.io spec).
+   The `description` must also carry **trigger wording** — say WHEN to use the
+   skill, ideally first ("Use when …", "When …", "Before …", or Korean
+   "…할 때 사용" / "… 시 적용"). The agent picks a skill from its description
+   alone and the per-turn skill listing truncates it, and fleet-skills
+   `scripts/validate.py` ERRORs on approved skills without it
+   (fleet-skills#315/#316), so a trigger-less draft would install locally and
+   then fail promotion. It is isolated as `lint description-trigger`
+   (`lint description-trigger-unverifiable` if `python3` or the helper is
+   missing — fail closed). The pattern lives only in
+   `claude/hooks/skill-review/description_trigger.py`, a verbatim copy of the
+   fleet-skills `TRIGGER_RE`; change fleet-skills first, then copy it there.
+   `description-trigger.test.sh` compares the two when
+   `CCC_FLEET_SKILLS_VALIDATE=<fleet-skills>/scripts/validate.py` is set.
+   The drafting prompts (`skill-review/extract.sh` and the bridge collector)
+   ask for exactly this shape: trigger first, then what the skill does, at most
+   300 characters, no incident numbers or node names, a general reusable name,
+   and an overlap check against the installed skills list before proposing a
+   new skill.
 5. **Body size** (progressive disclosure): a `SKILL.md` over 500 lines is
    isolated as `size oversized-body` — the author splits it into
    `references/` with read-when pointers per the official guidance.

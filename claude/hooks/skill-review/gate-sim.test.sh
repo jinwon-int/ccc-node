@@ -29,7 +29,7 @@ mkdraft() { # <dirname> <distinguishing-body-line>
   mkdir -p "$d"
   {
     printf -- '---\nname: %s\n' "${1%%.*}"
-    printf 'description: a deterministic fixture draft used by the gate-sim tests\n'
+    printf 'description: Use when exercising the deterministic fixture draft of the gate-sim tests\n'
     printf -- '---\n\n## Steps\n\n'
     printf -- '%s\n' "$2"
     printf -- '1. Inspect the current state before changing anything.\n'
@@ -92,7 +92,7 @@ ok "explicit path argument replays just that draft" \
 #    silently reported as PASS.
 thin="$PENDING/thin-draft"
 mkdir -p "$thin"
-printf -- '---\nname: thin-draft\ndescription: a deterministic fixture draft used by the gate-sim tests\n---\n\nonly one line\n' \
+printf -- '---\nname: thin-draft\ndescription: Use when exercising the deterministic fixture draft of the gate-sim tests\n---\n\nonly one line\n' \
   > "$thin/SKILL.md"
 # shellcheck disable=SC2034  # used inside ok()'s eval
 out="$(run_sim "$thin/SKILL.md" 2>&1)"
