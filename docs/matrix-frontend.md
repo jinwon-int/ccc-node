@@ -414,8 +414,32 @@ accepted the notice (at-least-once). Only Claude-owned sessions are eligible.
 The opt-in dead-session *wakeup* (`CCC_DEAD_SESSION_WAKEUP`) is not run by this
 frontend, so recovery never defers to it.
 
-Still Telegram-only: the turn-stall probe, the restart handoff, the
-rapid-crash policy and the GitHub webhook nudge.
+## Background services rebuilt for Matrix (#1825)
+
+The rest of the Telegram lifecycle's background services, redesigned for a
+frontend that runs directly under systemd and delivers through an E2EE
+outbox (`core/matrix/lifecycle.py`; the channel-neutral loops live in
+`core/lifecycle_loops.py` and the Telegram mixin now delegates to them):
+
+| Service | On Matrix | Switch |
+|---|---|---|
+| Rapid-crash guard | `BOT_DATA_DIR/crash-budget.json` (0600, body-free) counts consecutive *rapid unclean* exits — a run that never stopped in an orderly way and was restarted within `CCC_PROCESS_CRASH_WINDOW_SECONDS` of its own start. The next start waits `CCC_RESTART_DELAY_BASE_SECONDS·2^(n-1)` capped at `CCC_RESTART_DELAY_MAX_SECONDS`; at `CCC_MAX_RAPID_CRASHES` one `matrix_crash_loop` health alert is spooled per streak. Same `crash-policy.env` numbers as the Telegram supervisor; the window is measured from when serving began (after the back-off), like the supervisor's uptime. An orderly stop (SIGTERM — also during the back-off — or a clean return) ends the streak. Start-up checks inside `run()` (access control, session store) are counted; `validate_runtime_paths` runs in `__main__` before it and is not. | always on; the alert needs `CCC_PUSH_ENABLED` |
+| Health alerts | shared probe; signals land in this frontend's `health.json`; fired alerts are spooled (dedup key `health-alert:<code>`), so a host-wide condition both frontends see reaches the owner once | `CCC_HEALTH_ALERTS_*`; spooling needs `CCC_PUSH_ENABLED` |
+| Session resource guard | shared loop over the same `ProjectChat` enforcement | `CCC_BRIDGE_SESSION_GUARD_*` (off by default) |
+| Skill-candidate collector | shared loop over this frontend's distill journal | the provider's collector switch; needs a distill journal |
+| Turn-stall probe | shared `StallProbeMonitor`; notices go to the conversation's room, recovery is the outbox-backed dead-session scan | `CCC_TURN_STALL_PROBE_MIN` (0 = off, the default) |
+| Orphan reaper | marker-scoped (`CCC_BRIDGE_CLAUDE_CHILD`) sweep at startup and every 15 min — only children a bridge started, reparented to PID 1 for 30+ min | `CCC_MATRIX_ORPHAN_REAPER=0` disables |
+| Task-ledger reconciliation | at startup, records a previous process left non-terminal are closed; the room already got the transport's interrupted-turn notice and the status bubble is transport-owned, so no message is edited | always on |
+| GitHub webhook nudge | only on **`CCC_MATRIX_WEBHOOK_NUDGE_PORT`**, which must differ from the Telegram listener's `CCC_WEBHOOK_NUDGE_PORT` (default 8791): both frontends restart together under self-update and would otherwise race for one socket. Same enable flag, secret, host and body cap. | `CCC_WEBHOOK_NUDGE_ENABLED` + the Matrix port |
+
+Not rebuilt, deliberately:
+
+- **Restart handoff / receipt** — the receipt only exists after `/restart`,
+  which Matrix does not offer, and `restart_handoff.validate_unit` accepts
+  `ccc-telegram-bridge*.service` only. Adding it is a command change.
+- **"⏳ Working" heartbeat sweep** — Telegram deletes status messages a killed
+  run left frozen. The Matrix status bubble belongs to the transport, which
+  already closes an interrupted turn with `NOTICE_RESTARTED` on restart.
 
 ## Grok (`CCC_AGENT_PROVIDER=grok`) — owner direct room, opt-in family rooms
 

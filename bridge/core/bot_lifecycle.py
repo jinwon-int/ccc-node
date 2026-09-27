@@ -76,6 +76,11 @@ from telegram_bot.utils.orphan_reaper import (
     sweep_orphaned_claude_processes,
 )
 
+from telegram_bot.core.lifecycle_loops import (
+    run_health_alerts_probe,
+    run_session_resource_guard,
+    run_skill_candidate_collector,
+)
 from telegram_bot.core.memory_distill import MemoryDistillMixin
 
 logger = logging.getLogger(__name__)
@@ -1870,168 +1875,44 @@ class BotLifecycleMixin(MemoryDistillMixin):
         carry a snapshot and stages via the idempotent sink. Never mutates a
         distill job, so the memory-distill pipeline is unaffected. Provider
         attempts per sweep are hard-bounded to avoid a first-start backlog burst.
+        The loop body is shared with the Matrix frontend (``lifecycle_loops``).
         """
 
-        worker = self._skill_candidate_collector_worker
-        collector_provider = worker.provider
-        interval = float(
-            getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
+        await run_skill_candidate_collector(
+            self._skill_candidate_collector_worker,
+            self._distill_sweep_jobs,
+            self._config,
+            stop_event,
         )
-        max_jobs = int(
-            getattr(
-                self._config,
-                "codex_skill_collector_max_jobs_per_sweep",
-                1,
-            )
-            or 1
-        )
-        while not stop_event.is_set():
-            try:
-                jobs = await self._distill_sweep_jobs(interval, recover=False)
-                attempted = 0
-                for job in jobs:
-                    if stop_event.is_set() or attempted >= max_jobs:
-                        break
-                    if getattr(job, "snapshot", None) is None:
-                        continue
-                    if getattr(job, "provider", None) != collector_provider:
-                        continue
-                    if not await asyncio.to_thread(
-                        worker.should_collect, job_id=job.job_id
-                    ):
-                        continue
-                    attempted += 1
-                    try:
-                        await worker.collect_once(job_id=job.job_id)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        logger.warning(
-                            "Skill-candidate job failed; backing off job_id=%s",
-                            job.job_id,
-                            exc_info=True,
-                        )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Skill-candidate collector sweep failed; continuing",
-                    exc_info=True,
-                )
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            except (TimeoutError, asyncio.TimeoutError):
-                continue
 
     async def _health_alerts_probe(self, stop_event: asyncio.Event) -> None:
         """Detection-only runtime health probe + threshold alerts (#389).
 
-        Every tick exports the four structured signals to ``health.json`` and
+        Every tick exports the structured signals to ``health.json`` and
         evaluates alert thresholds. Fired alerts are logged and queued through
         the owner-only push-notifier spool — the actual Telegram send stays
         behind the notifier's ``CCC_PUSH_ENABLED`` opt-in, so this task never
-        contacts a provider on its own. No remediation is performed here.
+        contacts a provider on its own. No remediation is performed here. The
+        loop body is shared with the Matrix frontend (``lifecycle_loops``).
         """
-        from telegram_bot.utils.health_alerts import (
-            AlertGate,
-            AlertThresholds,
-            HealthProbe,
-            evaluate_alerts,
-            probe_interval,
-            write_alert_spool,
-        )
 
-        settings = self._config
-        if not getattr(settings, "health_alerts_enabled", True):
-            return
-        # Defensive clamp: a non-positive configured interval would make
-        # wait_for time out immediately and spin this loop hot (#430 review).
-        interval = probe_interval(getattr(settings, "health_alerts_interval_seconds", None))
-        probe = HealthProbe(
-            project_chat=self._project_chat,
+        await run_health_alerts_probe(
+            self._config,
+            self._project_chat,
+            stop_event,
             spool_dir=self._push_notifier.spool_dir,
-            extra_spool_dirs=tuple(
-                d
-                for d in (getattr(self._push_notifier, "write_spool_dir", None),)
-                if d is not None and d != self._push_notifier.spool_dir
-            ),
-            thresholds=AlertThresholds(
-                heartbeat_age_factor=float(
-                    getattr(settings, "alert_heartbeat_age_factor", 1.0)
-                ),
-                max_pending_notifications=int(
-                    getattr(settings, "alert_max_pending_notifications", 10)
-                ),
-                max_orphan_children=int(
-                    getattr(settings, "alert_max_orphan_children", 1)
-                ),
-            ),
+            write_spool_dir=getattr(self._push_notifier, "write_spool_dir", None),
         )
-        gate = AlertGate(
-            cooldown_seconds=float(
-                getattr(settings, "health_alerts_cooldown_seconds", 1800.0)
-            )
-        )
-        push_enabled = bool(getattr(settings, "push_enabled", False))
-        while not stop_event.is_set():
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
-                return
-            except asyncio.TimeoutError:
-                pass
-            try:
-                now = asyncio.get_running_loop().time()
-                signals = probe.collect(now)
-                fired = gate.admit(evaluate_alerts(signals, probe.thresholds))
-                health_reporter.record_health_signals(
-                    signals.as_dict(), alerts_fired=len(fired)
-                )
-                for alert in fired:
-                    logger.warning("Health alert [%s]: %s", alert.code, alert.message)
-                    if push_enabled:
-                        write_alert_spool(
-                            getattr(self._push_notifier, "write_spool_dir", None)
-                            or self._push_notifier.spool_dir,
-                            alert,
-                        )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # detection must never hurt the bridge
-                logger.debug("Health probe tick failed: %s", type(exc).__name__)
 
     async def _session_resource_guard(self, stop_event: asyncio.Event) -> None:
         """Periodically release idle provider and MCP process trees.
 
         Enforcement is delegated to ProjectChat, which owns the active-session
         registry and can therefore guarantee that no in-flight request is
-        interrupted. Failures are logged and retried on the next bounded tick.
+        interrupted. The loop body is shared with the Matrix frontend.
         """
 
-        raw_interval = getattr(
-            self._config, "session_guard_interval_seconds", 60.0
-        )
-        try:
-            interval = float(raw_interval)
-        except (TypeError, ValueError):
-            interval = 60.0
-        if not math.isfinite(interval):
-            interval = 60.0
-        interval = min(max(interval, 10.0), 3600.0)
-        while not stop_event.is_set():
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
-                return
-            except asyncio.TimeoutError:
-                pass
-            try:
-                await self._project_chat.enforce_session_resource_limits()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Session resource guard sweep failed; continuing",
-                    exc_info=True,
-                )
+        await run_session_resource_guard(self._config, self._project_chat, stop_event)
 
     async def _workload_reporter(self, stop_event: asyncio.Event):
         """Publish in-flight request count to health.json on a fixed interval.
