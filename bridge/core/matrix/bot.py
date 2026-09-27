@@ -67,6 +67,7 @@ from telegram_bot.core.external_wait import (
     ExternalWaitRegistry,
     default_active_turns_path,
     default_registry_path,
+    render_waits,
 )
 from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
 from telegram_bot.core.lifecycle_loops import (
@@ -107,6 +108,7 @@ SUPPORTED_COMMANDS = frozenset(
     {
         "new", "distill", "model", "effort", "usage", "skills", "stop", "continue",
         "task_pause", "task_resume", "task_recover", "history", "resume", "restart",
+        "waits", "cancelwait",
     }
 )
 _STATUS_HANDLE = 1
@@ -142,7 +144,7 @@ OWNER_ONLY_COMMAND = "🔒 Only the owner may use this command here."
 _OWNER_ONLY_COMMANDS = frozenset(
     {
         "resume", "history", "model", "effort", "distill", "usage", "continue",
-        "task_pause", "task_resume", "task_recover", "restart",
+        "task_pause", "task_resume", "task_recover", "restart", "waits", "cancelwait",
     }
 )
 # #2001: files an answer names are sent after it, at most this many per turn.
@@ -1170,7 +1172,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         if not ExternalWaitMonitor.env_flag("CCC_EXTERNAL_WAIT_ENABLED", default=True):
             logger.info("Matrix external-wait monitor disabled (CCC_EXTERNAL_WAIT_ENABLED=0)")
             return None
-        registry = ExternalWaitRegistry(default_registry_path(self._data_dir() / "external-wait"))
+        registry = self._external_wait_registry()
         return ExternalWaitMonitor(
             registry,
             transport=GhCliTransport(),
@@ -1425,6 +1427,40 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         if repended:
             return f"▶️ Resumed {len(repended)} queued continuation(s) — auto-continue re-armed for today."
         return "ℹ️ No continuations waiting on the daily cap."
+
+    # -- /waits and /cancelwait (#2004) -----------------------------------------
+
+    def _external_wait_registry(self) -> ExternalWaitRegistry:
+        """The registry the Matrix monitor polls (``bot_data_dir/external-wait``, #1934)."""
+
+        return ExternalWaitRegistry(default_registry_path(self._data_dir() / "external-wait"))
+
+    @staticmethod
+    def _wait_is_requesters(record: Mapping[str, Any], user_id: int) -> bool:
+        # Same visibility as Telegram's /waits; legacy records carry no user_id.
+        return record.get("user_id") in (None, user_id)
+
+    async def _cmd_waits(self, *, user_id: int) -> str:
+        """List this requester's active and recent external waits, read-only."""
+
+        records = [rec for rec in self._external_wait_registry().records() if self._wait_is_requesters(rec, user_id)]
+        return render_waits(records)
+
+    async def _cmd_cancelwait(self, args: list[str], *, user_id: int) -> str:
+        """Cancel exactly one of this requester's external waits by ``wait_id``.
+
+        Tighter than Telegram's form (any id): a wait registered by someone
+        else is reported as not found rather than cancelled.
+        """
+
+        wait_id = args[0].strip() if args else ""
+        if not wait_id:
+            return "Usage: /cancelwait <wait_id> — see /waits"
+        registry = self._external_wait_registry()
+        record = registry.get(wait_id)
+        if record is None or not self._wait_is_requesters(record, user_id) or not registry.cancel(wait_id):
+            return f"No active external wait with id `{wait_id}`."
+        return f"Cancelled external wait `{wait_id}`."
 
     # -- dead-session recovery (#1825) ------------------------------------------
 
@@ -1994,6 +2030,10 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return await self._cmd_stop(user_id=user_id, chat_id=chat_id)
         if command == "continue":
             return await self._cmd_continue(user_id=user_id, chat_id=chat_id)
+        if command == "waits":
+            return await self._cmd_waits(user_id=user_id)
+        if command == "cancelwait":
+            return await self._cmd_cancelwait(args, user_id=user_id)
         if command == "task_pause":
             return await self._cmd_task_pause(args, user_id=user_id, chat_id=chat_id)
         if command == "task_recover":
