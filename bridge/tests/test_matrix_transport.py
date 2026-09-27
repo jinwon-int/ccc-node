@@ -1104,6 +1104,13 @@ async def test_raw_classifies_http_outcomes(tmp_path: Path) -> None:
         queue.append(FakeResponse(429, []))
         with pytest.raises(ConnectionError, match="matrix-temporary-error"):
             await f.raw("GET", "/x")
+        # #1959: the server's requested wait travels with the retryable error.
+        from telegram_bot.core.matrix.transport import MatrixTemporaryError
+
+        queue.append(FakeResponse(429, [b'{"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 1500}']))
+        with pytest.raises(MatrixTemporaryError) as limited:
+            await f.raw("GET", "/x")
+        assert limited.value.retry_after == 1.5
         queue.append(FakeResponse(404, []))
         with pytest.raises(SafetyStop, match="matrix-http-404"):
             await f.raw("GET", "/x")
@@ -1739,6 +1746,58 @@ async def test_family_notice_text_override(tmp_path: Path) -> None:
         h.route_raw(*h.gate_routes(h.healthy_members()))
         assert await f.room_gate(FAMILY) is True
         assert [job["reply"] for job in f.store.outbox()] == ["맞춤 안내"]
+
+
+@pytest.mark.anyio
+async def test_stop_with_a_hung_runner_cancel_releases_the_lock(tmp_path: Path) -> None:
+    """#1959: /stop runs under matrix_lock; a runner that never finishes its
+    graceful cancel must not freeze sync and sending."""
+
+    async with running(tmp_path, "cancel", runner_cancel_timeout=0.2) as h:
+        f = h.f
+        hung: list[str] = []
+
+        async def never_returns(job: Any) -> bool:
+            hung.append(job["event_id"])
+            await asyncio.Event().wait()
+            return True
+
+        h.runner.cancel = never_returns  # type: ignore[method-assign]
+        await f.input(request(f))
+        h.work()
+        await h.until(lambda: bool(f.approvals))
+        async with f.matrix_lock:  # the production caller holds it (process_pending)
+            await asyncio.wait_for(f.input(request(f, "$stop", "/stop")), timeout=5)
+        assert hung == ["$request"] and not f.matrix_lock.locked()
+        await h.until(lambda: f.store.get_meta("last_turn") is not None and f.store.get_meta("last_turn")["outcome"] == "cancelled")
+
+
+@pytest.mark.anyio
+async def test_unencrypted_room_404_is_classified_encrypted_room_required(tmp_path: Path) -> None:
+    """#1959: no m.room.encryption state answers 404, which used to stop the
+    service as an opaque matrix-http-404."""
+
+    from telegram_bot.core.matrix.transport import MatrixHTTPError
+
+    async with family(tmp_path) as h:
+        f = h.f
+        client_mock(f, rooms={FAMILY: h.healthy_members()})
+        members = {"joined": {user: {} for user in h.healthy_members()}}
+
+        async def fake_raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            if path.endswith("/joined_members"):
+                return members
+            if path.endswith("/state/m.room.encryption"):
+                raise MatrixHTTPError(status)
+            raise AssertionError(path)
+
+        f.raw = fake_raw
+        status = 404
+        with pytest.raises(SafetyStop, match="encrypted-room-required"):
+            await f.room_gate(FAMILY)
+        status = 403  # any other status keeps its own verdict
+        with pytest.raises(SafetyStop, match="matrix-http-403"):
+            await f.room_gate(FAMILY)
 
 
 @pytest.mark.anyio

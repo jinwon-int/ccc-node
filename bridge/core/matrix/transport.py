@@ -184,6 +184,10 @@ NOTICE_UNPINNED_DEVICE = (
 
 NONCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,64}")
 APPROVAL_TIMEOUT_S = 120.0
+# #1959: /stop runs inside process_pending while matrix_lock is held; the
+# runner's graceful stop is bounded so a hung provider cannot freeze sync and
+# sending. The task cancellation that follows stays authoritative.
+RUNNER_CANCEL_TIMEOUT_S = 10.0
 # ``_RoomSink.approval_outcome`` results (#1959).
 APPROVAL_ALLOW = "allow"
 APPROVAL_DENY = "deny"
@@ -221,6 +225,23 @@ RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 # Bounded, body-free errcode taken from a homeserver error response.
 _ERRCODE_RE = re.compile(r"M_[A-Z0-9_]{1,60}")
 _ERROR_BODY_CAP = 4_096
+# #1959: a server-requested wait (429 ``retry_after_ms`` / ``Retry-After``) is
+# honoured but bounded, and a leg that ran this long before failing is treated
+# as healthy again, so its backoff restarts at 1 s instead of staying at 30 s.
+_RETRY_AFTER_CAP_S = 300.0
+_HEALTHY_RUN_S = 60.0
+
+
+class MatrixTemporaryError(ConnectionError):
+    """A retryable homeserver status; ``str()`` stays ``matrix-temporary-error``.
+
+    ``retry_after`` (seconds, bounded) carries the server's requested wait when
+    it sent one (``Retry-After`` header or 429 body ``retry_after_ms``).
+    """
+
+    def __init__(self, retry_after: float | None = None) -> None:
+        super().__init__("matrix-temporary-error")
+        self.retry_after = retry_after
 
 
 class MatrixHTTPError(SafetyStop):
@@ -457,10 +478,12 @@ class MatrixTransport:
         *,
         approval_timeout: float = APPROVAL_TIMEOUT_S,
         turn_timeout: float | None = None,
+        runner_cancel_timeout: float = RUNNER_CANCEL_TIMEOUT_S,
     ) -> None:
         self.c = config
         self.runner = runner
         self.approval_timeout = approval_timeout
+        self.runner_cancel_timeout = runner_cancel_timeout
         # Config ceiling (default 20 min, up to 6 h); explicit tests still win.
         self.turn_timeout = (
             turn_timeout if turn_timeout is not None else turn_timeout_minutes(config) * 60.0
@@ -549,7 +572,7 @@ class MatrixTransport:
         url = self.c["homeserver"].rstrip("/") + path
         async with self.http.request(method, url, json=data, params=params, allow_redirects=False) as response:
             if response.status in RETRYABLE_STATUSES:
-                raise ConnectionError("matrix-temporary-error")
+                raise MatrixTemporaryError(await self._retry_after(response))
             if response.status != 200:
                 raise MatrixHTTPError(response.status, await self._errcode(response))
             body = bytearray()
@@ -558,6 +581,32 @@ class MatrixTransport:
                 if len(body) > 4_194_304:
                     raise SafetyStop("matrix-response-too-large")
             return json.loads(body)
+
+    @staticmethod
+    async def _retry_after(response: Any) -> float | None:
+        """Server-requested wait in seconds, bounded; ``None`` when absent or unreadable."""
+
+        value: float | None = None
+        try:
+            header = (getattr(response, "headers", None) or {}).get("Retry-After")
+            if header is not None and str(header).strip().isdigit():
+                value = float(str(header).strip())
+            elif response.status == 429:
+                body = bytearray()
+                async for chunk in response.content.iter_chunked(_ERROR_BODY_CAP):
+                    body.extend(chunk)
+                    if len(body) >= _ERROR_BODY_CAP:
+                        break
+                raw = json.loads(bytes(body[:_ERROR_BODY_CAP])).get("retry_after_ms")
+                if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                    value = float(raw) / 1000.0
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the status alone still makes it retryable
+            return None
+        if value is None or value != value or value < 0:
+            return None
+        return min(value, _RETRY_AFTER_CAP_S)
 
     @staticmethod
     async def _errcode(response: Any) -> str:
@@ -902,7 +951,15 @@ class MatrixTransport:
         if room not in self.family_rooms and joined != {self.c["owner"], self.c["account"]}:
             raise SafetyStop("private-room-membership-changed")
         await self.client.receive_response(JoinedMembersResponse.from_dict(members, room))
-        encryption = await self.raw("GET", path + "/state/m.room.encryption")
+        try:
+            encryption = await self.raw("GET", path + "/state/m.room.encryption")
+        except MatrixHTTPError as exc:
+            # #1959: an unencrypted room has no m.room.encryption state event,
+            # which the homeserver answers with 404 — the same verdict as a
+            # non-Megolm algorithm, not an opaque matrix-http-404 stop.
+            if exc.status == 404:
+                raise SafetyStop("encrypted-room-required") from None
+            raise
         if encryption.get("algorithm") != MEGOLM:
             raise SafetyStop("encrypted-room-required")
         if room not in self.client.rooms or not self.client.rooms[room].encrypted:
@@ -1269,7 +1326,9 @@ class MatrixTransport:
             return
         self.cancel_requested = True
         try:
-            await self.runner.cancel(job)
+            await asyncio.wait_for(self.runner.cancel(job), timeout=self.runner_cancel_timeout)
+        except TimeoutError:
+            logger.warning("matrix runner cancel exceeded %.0fs; cancelling the turn task", self.runner_cancel_timeout)
         except Exception:
             pass  # The task cancellation below is authoritative; the turn stays uncertain.
         task.cancel()
@@ -1997,8 +2056,10 @@ class MatrixTransport:
     async def retry(self, operation: Any, leg: str = "") -> None:
         import aiohttp
 
+        loop = asyncio.get_running_loop()
         delay = 1.0
         while True:
+            started = loop.time()
             try:
                 await operation()
                 return
@@ -2007,7 +2068,13 @@ class MatrixTransport:
                     self.leg_failures[leg] = self.leg_failures.get(leg, 0) + 1
                     self.leg_error[leg] = retry_label(exc)
                 self.store.set_meta("health", {"state": "network-retry", "updated": time.time()})
-                await asyncio.sleep(delay)
+                if loop.time() - started >= _HEALTHY_RUN_S:
+                    delay = 1.0  # #1959: a long healthy run resets the backoff
+                wait = delay
+                retry_after = getattr(exc, "retry_after", None)
+                if isinstance(retry_after, (int, float)) and retry_after > wait:
+                    wait = float(retry_after)
+                await asyncio.sleep(wait)
                 delay = min(delay * 2, 30)
 
     async def run(self) -> None:

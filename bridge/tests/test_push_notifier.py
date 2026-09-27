@@ -198,6 +198,25 @@ class DrainTests(unittest.TestCase):
             self.assertTrue((sent / "bad.json").exists())
 
 
+    def test_non_record_json_is_archived_and_later_records_still_send(self):
+        # #1959: "[]" is valid JSON without .get(); it used to jam the spool head.
+        with TemporaryDirectory() as td, patch.object(pn, "config", _cfg()):
+            spool = Path(td)
+            sent = spool / "sent"
+            sent.mkdir()
+            (spool / "a-list.json").write_text("[]", encoding="utf-8")
+            (spool / "b-good.json").write_text(
+                json.dumps({"ts": "T", "event": "E", "node": "n", "text": "hello"}), encoding="utf-8"
+            )
+            n = PushNotifier()
+            n.spool_dir = spool
+            app = SimpleNamespace(bot=AsyncMock())
+            asyncio.run(n._drain(app, 1, sent))
+            app.bot.send_message.assert_called_once()
+            self.assertTrue((sent / "a-list.json").exists())
+            self.assertTrue((sent / "b-good.json").exists())
+
+
 class FanOutTests(unittest.TestCase):
     def _write(self, spool, name, text):
         d = {"ts": "T", "event": "AgentCronRun", "node": "node-a", "text": text}

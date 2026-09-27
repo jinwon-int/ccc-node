@@ -267,6 +267,11 @@ class PushNotifier:
             except (OSError, ValueError):
                 self._archive(p, sent_dir)  # malformed → don't retry forever
                 continue
+            if not isinstance(data, dict):
+                # #1959: valid JSON but not a record ([], "x", 1) — archiving it
+                # like malformed input keeps it from jamming the head forever.
+                self._archive(p, sent_dir)
+                continue
 
             text = (data.get("text") or "").strip()
             if not text:

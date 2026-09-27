@@ -83,6 +83,23 @@ async def test_drain_archives_malformed_and_empty_without_enqueue(tmp_path: Path
 
 
 @pytest.mark.anyio
+async def test_drain_archives_non_record_json_and_keeps_going(tmp_path: Path) -> None:
+    """#1959: valid JSON that is not a record ([], "x") used to raise inside the
+    loop and jam the spool head forever."""
+
+    settings = _settings(tmp_path)
+    t, enqueued = _transport({DIRECT: "direct"})
+    notifier = MatrixSpoolNotifier(settings, t)
+    (tmp_path / "spool").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "spool" / "a-list.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "spool" / "b-str.json").write_text('"x"', encoding="utf-8")
+    _record(tmp_path, "c-good.json", {"event": "x", "node": "n", "text": "hello"})
+    await notifier._drain(DIRECT, tmp_path / "spool" / "sent")
+    assert len(enqueued) == 1 and "hello" in enqueued[0][1]
+    assert not list((tmp_path / "spool").glob("*.json"))
+
+
+@pytest.mark.anyio
 async def test_drain_dedups_within_window(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     t, enqueued = _transport({DIRECT: "direct"})
