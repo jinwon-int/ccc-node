@@ -60,12 +60,12 @@ class FragmentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         harness = (self.root / "CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn(
-            "## [Unreleased]\n\n- **Newer (#2022).**\n  continued line\n\n- **Older (#10).**\n\n- **Old entry (#1).**\n",
+            "## [Unreleased]\n\n- **Newer (#2022).**\n  continued line\n- **Older (#10).**\n- **Old entry (#1).**\n",
             harness,
         )
         self.assertIn("## [0.6.0] — 2026-09-24", harness)
         bridge = (self.root / "bridge" / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertTrue(bridge.startswith("# Changelog\n\n- **Files (#2001).**\n\n- **Old bridge entry (#2).**\n"))
+        self.assertTrue(bridge.startswith("# Changelog\n\n- **Files (#2001).**\n- **Old bridge entry (#2).**\n"))
         remaining = sorted(p.name for p in (self.root / "changelog.d").iterdir())
         self.assertEqual(remaining, ["README.md"], "fragments are consumed, the README stays")
         self.assertEqual(list((self.root / "bridge" / "changelog.d").iterdir()), [])
@@ -83,6 +83,7 @@ class FragmentTests(unittest.TestCase):
             "changelog.d/14-prose.md": "Not a bullet.\n",
             "changelog.d/15-empty.md": "\n\n",
             "changelog.d/16-conflict.md": "- a\n<<<<<<< HEAD\n",
+            "changelog.d/18-h3.md": "- a\n### sub\n",
             "changelog.d/17-entry.txt": "- wrong suffix\n",
         }
         for rel, text in cases.items():
@@ -91,6 +92,19 @@ class FragmentTests(unittest.TestCase):
                 result = _run(self.root, "check")
                 self.assertEqual(result.returncode, 1, f"{rel} should fail: {result.stdout}")
                 path.unlink()
+
+    def test_code_fences_may_hold_hash_lines_and_subdirectories_are_rejected(self) -> None:
+        self.write("changelog.d/50-code.md", "- Example:\n  ```sh\n# a shell comment\n  ```\n")
+        self.assertEqual(_run(self.root, "check").returncode, 0)
+        (self.root / "changelog.d" / "sub").mkdir()
+        self.write("changelog.d/sub/51-x.md", "- hidden\n")
+        self.assertEqual(_run(self.root, "check").returncode, 1)
+
+    def test_an_empty_unreleased_section_keeps_the_next_heading_separated(self) -> None:
+        (self.root / "CHANGELOG.md").write_text("# C\n\n## [Unreleased]\n\n## [0.6.0]\n\n- old\n", encoding="utf-8")
+        self.write("changelog.d/60-x.md", "- x\n")
+        self.assertEqual(_run(self.root, "apply").returncode, 0)
+        self.assertEqual((self.root / "CHANGELOG.md").read_text(encoding="utf-8"), "# C\n\n## [Unreleased]\n\n- x\n\n## [0.6.0]\n\n- old\n")
 
     def test_a_failing_fragment_writes_nothing(self) -> None:
         self.write("changelog.d/20-good.md", "- good\n")
@@ -102,6 +116,11 @@ class FragmentTests(unittest.TestCase):
 
     def test_none_pending_guards_a_release(self) -> None:
         self.assertEqual(_run(self.root, "check", "--none-pending").returncode, 0)
+        self.write("bridge/changelog.d/31-bridge.md", "- bridge only\n")
+        self.assertEqual(
+            _run(self.root, "check", "--none-pending").returncode, 0,
+            "bridge fragments do not feed the release notes",
+        )
         self.write("changelog.d/30-pending.md", "- pending\n")
         self.assertEqual(_run(self.root, "check").returncode, 0)
         self.assertEqual(_run(self.root, "check", "--none-pending").returncode, 1)

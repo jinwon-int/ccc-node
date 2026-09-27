@@ -18,7 +18,7 @@ number first, the order prepending produced) and deletes the files.
 Commands (stdlib only, run from anywhere inside the checkout):
 
     changelog_fragments.py check            # validate fragments (CI)
-    changelog_fragments.py check --none-pending   # also fail if any are pending (release)
+    changelog_fragments.py check --none-pending   # also fail if CHANGELOG.md ones are pending (release)
     changelog_fragments.py preview          # print what apply would insert
     changelog_fragments.py apply            # insert and delete fragments
 """
@@ -33,6 +33,8 @@ import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 README = "README.md"
+# The release notes are extracted from this target's changelog only.
+RELEASE_NOTES_TARGET = "harness"
 _NAME = re.compile(r"^(\d+)-[a-z0-9][a-z0-9._-]*\.md$")
 
 
@@ -84,19 +86,24 @@ def validate(path: Path) -> str:
         raise FragmentError(f"{path}: empty")
     if not body.startswith("- "):
         raise FragmentError(f"{path}: must start with a '- ' bullet")
+    fenced = False
     for number, line in enumerate(body.splitlines(), 1):
-        if line.startswith("#"):
-            raise FragmentError(f"{path}:{number}: headings are not allowed in a fragment")
         if line.startswith(("<<<<<<<", ">>>>>>>", "=======")):
             raise FragmentError(f"{path}:{number}: merge conflict marker")
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+            continue
+        if not fenced and re.match(r"#{1,6}(\s|$)", line):
+            raise FragmentError(f"{path}:{number}: headings are not allowed in a fragment")
     return body + "\n"
 
 
 def insertion(target: Target) -> tuple[str, list[Path]]:
-    """The block to insert (fragments separated by blank lines) and the files it came from."""
+    """The block to insert (a tight list, newest first) and the files it came from."""
     files = fragment_files(target)
     blocks = [validate(path) for path in files]
-    return "\n".join(blocks), files
+    # Tight list, like both changelogs: no blank line between entries.
+    return "".join(blocks), files
 
 
 def assemble(text: str, block: str, anchor: re.Pattern[str], *, label: str) -> str:
@@ -109,13 +116,18 @@ def assemble(text: str, block: str, anchor: re.Pattern[str], *, label: str) -> s
                 cut += 1
             head = "".join(lines[:index + 1]) + "\n"
             rest = "".join(lines[cut:])
-            return head + block + ("\n" + rest if rest else "")
+            # The new entries join the existing list directly (tight list); a
+            # following "## " section keeps its blank-line separation.
+            if rest and rest.startswith("#"):
+                return head + block + "\n" + rest
+            return head + block + rest
     raise FragmentError(f"{label}: anchor {anchor.pattern!r} not found in the changelog")
 
 
 def cmd_check(none_pending: bool, root: Path) -> int:
     errors: list[str] = []
     pending = 0
+    release_pending = 0
     for target in targets(root):
         for path in fragment_files(target):
             pending += 1
@@ -123,19 +135,26 @@ def cmd_check(none_pending: bool, root: Path) -> int:
                 validate(path)
             except FragmentError as error:
                 errors.append(str(error))
-        # Anything other than *.md or README in the directory is a mistake too.
+        # Anything other than *.md files (and the README) is a mistake too:
+        # other suffixes and subdirectories would be silently never applied.
         if target.fragments.is_dir():
             for path in target.fragments.iterdir():
-                if path.is_file() and path.name != README and path.suffix != ".md":
+                if path.is_dir():
+                    errors.append(f"{path}: fragments live directly in {target.fragments.name}/, not in subdirectories")
+                elif path.name != README and path.suffix != ".md":
                     errors.append(f"{path}: fragments must be .md files")
+        if target.label == RELEASE_NOTES_TARGET:
+            release_pending = len(fragment_files(target))
     for error in errors:
         print(f"changelog fragment: {error}", file=sys.stderr)
     if errors:
         return 1
-    if none_pending and pending:
+    if none_pending and release_pending:
+        # Only CHANGELOG.md feeds the release notes; bridge fragments can wait
+        # for the next apply without making the notes incomplete.
         print(
-            f"changelog fragment: {pending} fragment(s) pending — run "
-            "`python3 scripts/changelog_fragments.py apply` before tagging",
+            f"changelog fragment: {release_pending} CHANGELOG.md fragment(s) pending — run "
+            "`python3 scripts/changelog_fragments.py apply` in the release PR and tag its merge commit",
             file=sys.stderr,
         )
         return 1

@@ -137,8 +137,10 @@ queue cost a new head, a CI rerun and a fresh exact-head approval). CI runs
 - Cut releases in trains, not on every merge. Prefer tagging after a meaningful
   issue bundle lands, with a practical upper bound of one release train per week.
 - Before tagging, fold pending changelog fragments in with
-  `python3 scripts/changelog_fragments.py apply` (the release workflow refuses
-  a tag while any are pending), then move completed notes from `CHANGELOG.md`
+  `python3 scripts/changelog_fragments.py apply` in the release PR and tag
+  that PR's merge commit (the release workflow refuses a tag while any
+  `changelog.d/` fragment is pending; a fragment merged after the release PR
+  would otherwise block the tag), then move completed notes from `CHANGELOG.md`
   `Unreleased` into a dated version section, run the local checks above, and verify
   `scripts/ccc-version.sh` resolves the intended tag after `git fetch --tags`.
 - Creating/pushing tags and GitHub Releases is a separate release approval gate;

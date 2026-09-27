@@ -108,7 +108,7 @@ esac
 # Paths come out of grep relative to $root because grep runs there.
 current="$(
   cd "$root" && git ls-files -z \
-    | grep -zvE "^((.*/)?CHANGELOG\.md|(.*/)?changelog\.d/[^/]+\.md|\.github/requirements/.*|${baseline_rel})$" \
+    | grep -zvE "^((.*/)?CHANGELOG\.md|(bridge/)?changelog\.d/[^/]+\.md|\.github/requirements/.*|${baseline_rel})$" \
     | xargs -0 grep -IniE "$pattern" -- 2>/dev/null \
     | filter_hits \
     | awk '{ c1 = index($0, ":"); p = substr($0, 1, c1 - 1); n[p]++ }
