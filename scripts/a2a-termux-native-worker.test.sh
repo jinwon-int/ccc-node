@@ -391,6 +391,11 @@ export A2A_SUPERVISOR_LOCK="$SUP_TMP/sup.lock"
 export A2A_SUPERVISOR_LOG="$SUP_TMP/sup.log"
 export A2A_TEST_SSH_MARKER="$SUP_TMP/ssh-started"
 export A2A_TEST_CURL_OK=0
+# The mock curl defaults to DOWN, so the #1923 spawn gate exercises its
+# fail-open path in every supervise E2E below.  Cap the gate so the bounded
+# wait does not stall the suite; the real default (30s) is asserted indirectly
+# by the unit-level gate tests via the explicit override.
+export A2A_TUNNEL_GATE_TIMEOUT=1
 export A2A_PYTHON_HARNESS="$SUP_TMP/mock-python-harness.sh"
 export PATH="$SUP_TMP/bin:$PATH"
 SUP_PIDFILE="$A2A_SUPERVISOR_LOCK.pid"
@@ -509,6 +514,15 @@ ok "second supervise fails rc=3 while lock held" '[ "$rc" = 3 ]'
 out="$(bash "$TOOL" status 2>&1)"
 ok "status shows running supervisor pid" 'grep -qE "supervisor: [0-9]+" <<<"$out"'
 
+# Wait out the bounded spawn gate (capped at 1s via A2A_TUNNEL_GATE_TIMEOUT)
+# so the fail-open defer label is durably in the log before we stop the
+# supervisor — otherwise stop can race the gate mid-wait and the assertion
+# below becomes flaky.
+for _ in $(seq 1 40); do
+    grep -q "tunnel-gate: tunnel not ready" "$SUP_TMP/sup.log" 2>/dev/null && break
+    sleep 0.1
+done
+
 # stop cleanly tears the supervisor down.
 out="$(bash "$TOOL" stop 2>&1)"
 # shellcheck disable=SC2034  # rc is consumed by the eval-based ok() assertion.
@@ -521,6 +535,12 @@ for _ in $(seq 1 40); do
     sleep 0.1
 done
 ok "supervisor #1 exited after stop" '! kill -0 "$SUP1_PID" 2>/dev/null'
+
+# #1923: with the mock curl down, the spawn gate must fail open after its
+# bounded wait and log the dedicated defer label — a down tunnel must delay
+# the boot, not wedge the supervisor.
+ok "spawn gate fails open with the defer label (curl down)" \
+    'grep -q "tunnel-gate: tunnel not ready; deferring worker start" "$SUP_TMP/sup.log"'
 
 # After stop, another supervise can proceed (lock released).
 bash "$TOOL" supervise --env-file "$ENVF" >/dev/null 2>&1 &
@@ -589,6 +609,47 @@ wait "$OTHER_TUNNEL_PID" 2>/dev/null || true
 # shellcheck disable=SC2034  # out is consumed by the eval-based ok() assertion.
 out=$(A2A_TEST_CURL_OK=1 bash "$TOOL" status 2>&1)
 ok "status reports tunnel UP when curl returns 0" 'grep -q "tunnel: UP" <<<"$out"'
+
+# ---- unit-level: tunnel readiness gate (#1923) ----
+# Gate passes immediately when /livez is reachable, and its success path must
+# stay silent (the defer label is reserved for the fail-open timeout).
+(
+    export A2A_SUPERVISOR_LOCK_DIR="$SUP_TMP"
+    export A2A_SUPERVISOR_LOG_DIR="$SUP_TMP"
+    export A2A_SUPERVISOR_LOG="$SUP_TMP/gate-up.log"
+    export A2A_TEST_CURL_OK=1
+    # shellcheck disable=SC1090
+    source "$TOOL"
+    if wait_for_tunnel; then
+        echo "OK" > "$SUP_TMP/gate-up.marker"
+    fi
+) || true
+ok "tunnel gate passes when /livez is reachable" \
+    'grep -q "^OK$" "$SUP_TMP/gate-up.marker" 2>/dev/null'
+ok "tunnel gate success path stays silent" '! grep -q "tunnel-gate" "$SUP_TMP/gate-up.log" 2>/dev/null'
+
+# Gate with /livez down: nonzero rc (fail-open signal), bounded wall time, and
+# the dedicated defer label in its log.
+(
+    export A2A_SUPERVISOR_LOCK_DIR="$SUP_TMP"
+    export A2A_SUPERVISOR_LOG_DIR="$SUP_TMP"
+    export A2A_SUPERVISOR_LOG="$SUP_TMP/gate-down.log"
+    export A2A_TEST_CURL_OK=0
+    export A2A_TUNNEL_GATE_TIMEOUT=1
+    export A2A_TUNNEL_GATE_INTERVAL=0.2
+    # shellcheck disable=SC1090
+    source "$TOOL"
+    start=$(date +%s)
+    wait_for_tunnel
+    rc=$?
+    echo "rc=$rc waited=$(( $(date +%s) - start ))" > "$SUP_TMP/gate-down.marker"
+) || true
+ok "tunnel gate returns nonzero when /livez stays down" \
+    'grep -q "^rc=1 " "$SUP_TMP/gate-down.marker" 2>/dev/null'
+ok "tunnel gate respects its bounded wait (no unbounded stall)" \
+    '[[ "$(sed -n "s/^rc=1 waited=//p" "$SUP_TMP/gate-down.marker")" -le 3 ]]'
+ok "tunnel gate logs the dedicated defer label" \
+    'grep -q "tunnel-gate: tunnel not ready; deferring worker start" "$SUP_TMP/gate-down.log" 2>/dev/null'
 
 # ---- unit-level: sanitize_termux_env scrubs a poisoned LD_LIBRARY_PATH ----
 # Regression guard for Wiki ND-1236: a leaked glibc LD_LIBRARY_PATH crashed the
