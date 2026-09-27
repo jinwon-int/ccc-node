@@ -262,8 +262,18 @@ class ApprovalDisplaySnapshot:
     prompt_text: str
 
 
-def build_approval_snapshot(event: ApprovalRequestEvent) -> ApprovalDisplaySnapshot:
-    """Return a deterministic request binding and exact safe owner-facing text."""
+TELEGRAM_REPLY_HINT = "Reply with 승인 or 거절, or use the buttons."
+
+
+def build_approval_snapshot(
+    event: ApprovalRequestEvent, *, reply_hint: str | None = TELEGRAM_REPLY_HINT
+) -> ApprovalDisplaySnapshot:
+    """Return a deterministic request binding and exact safe owner-facing text.
+
+    ``reply_hint`` is the channel's last line (Telegram buttons by default);
+    ``None`` omits it for a channel that appends its own controls, so the
+    display fingerprint still binds exactly the text the owner sees.
+    """
     arguments = {str(key): value for key, value in event.arguments.items()}
     provider, action, target_shape = _provider_and_shape(event.action)
     summary, flags = _summary(action, target_shape, arguments)
@@ -292,7 +302,8 @@ def build_approval_snapshot(event: ApprovalRequestEvent) -> ApprovalDisplaySnaps
     if risks:
         lines.append(f"Risk hints: {', '.join(risks)}")
         displayed_fields.append("risk_hints")
-    lines.append("Reply with 승인 or 거절, or use the buttons.")
+    if reply_hint:
+        lines.append(reply_hint)
     prompt_text = "\n".join(lines)
     display_fingerprint = _display_fingerprint(prompt_text)
     return ApprovalDisplaySnapshot(
@@ -312,6 +323,7 @@ def build_approval_snapshot(event: ApprovalRequestEvent) -> ApprovalDisplaySnaps
 
 
 __all__ = [
+    "TELEGRAM_REPLY_HINT",
     "ApprovalDisplaySnapshot",
     "build_approval_snapshot",
     "opaque_ref",
