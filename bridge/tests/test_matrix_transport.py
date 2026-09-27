@@ -989,6 +989,31 @@ async def test_controls_without_an_active_turn_are_refused(tmp_path: Path) -> No
         assert h.runner.cancels == []
 
 
+@pytest.mark.anyio
+async def test_idle_stop_cancels_queued_continuations_through_the_runner(tmp_path: Path) -> None:
+    """#1825: a bare /stop with no running turn still reaches queued background work."""
+
+    from telegram_bot.core.matrix.transport import NOTICE_CONTINUATIONS_CANCELLED
+
+    async with running(tmp_path) as h:
+        f = h.f
+        await f.input(request(f, "$s0", "/stop"))  # runner without the seam
+        stops: list[dict[str, Any]] = []
+        queued = [True]
+
+        async def stop_idle(job: Any) -> bool:
+            stops.append(dict(job))
+            return queued.pop() if queued else False
+
+        h.runner.stop_idle = stop_idle  # type: ignore[attr-defined]
+        await f.input(request(f, "$s1", "/stop"))
+        await f.input(request(f, "$s2", "/stop"))  # nothing left to cancel
+        assert h.replies().count(NOTICE_CONTINUATIONS_CANCELLED) == 1
+        assert h.replies().count(NOTICE_INVALID_CONTROL) == 2
+        assert [stop["room_id"] for stop in stops] == [f.c["rooms"][0]] * 2
+        assert h.runner.cancels == [] and f.store.claim() is None
+
+
 # --------------------------------------------------------------------------- #
 # HTTP, delivery, lifecycle
 # --------------------------------------------------------------------------- #

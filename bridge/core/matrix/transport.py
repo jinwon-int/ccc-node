@@ -74,6 +74,7 @@ NOTICE_QUEUE_FULL = "대기 중인 요청이 많습니다. 잠시 후 다시 요
 NOTICE_QUEUED = "⏳ 이 메시지는 대기 순번 {position}번에 저장되었으며 도착 순서대로 처리됩니다."
 NOTICE_ACKED = "이전 작업의 결과 확인을 완료한 것으로 기록했습니다. 자동 재실행은 하지 않습니다."
 NOTICE_CONTROL_FORWARDED = "요청을 전달했습니다. 실제 처리 결과는 이어지는 안내를 확인해 주세요."
+NOTICE_CONTINUATIONS_CANCELLED = "⏹️ 대기 중이던 자동 이어하기를 취소했습니다."
 NOTICE_INVALID_CONTROL = "현재 이 대화방에서 처리할 수 있는 제어 요청이 아닙니다. 작업 번호와 승인 번호를 확인해 주세요."
 NOTICE_UNCERTAIN = (
     "작업이 중단되어 결과 확인이 필요합니다. 자동으로 다시 실행하지 않습니다.\n"
@@ -1054,8 +1055,26 @@ class MatrixTransport:
                 self.store.notice(req, "control", NOTICE_CONTROL_FORWARDED)
                 self.wake()
                 return
+        elif fields == ["/stop"] and await self._stop_idle(req):
+            # #1825: with no turn running in the sender's scope, a bare /stop
+            # still cancels that conversation's queued auto-continuations.
+            self.store.notice(req, "control", NOTICE_CONTINUATIONS_CANCELLED)
+            self.wake()
+            return
         self.store.notice(req, "invalid-control", NOTICE_INVALID_CONTROL)
         self.wake()
+
+    async def _stop_idle(self, req: Request) -> bool:
+        """Optional runner seam: cancel queued background work for an idle scope."""
+
+        stop_idle = getattr(self.runner, "stop_idle", None)
+        if not callable(stop_idle):
+            return False
+        try:
+            return bool(await stop_idle({"room_id": req.room_id, "sender": req.sender}))
+        except Exception:
+            logger.warning("Matrix idle /stop hook failed", exc_info=True)
+            return False
 
     async def _cancel_active(self) -> None:
         job, task = self.active, self.turn_task

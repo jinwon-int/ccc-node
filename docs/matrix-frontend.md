@@ -15,7 +15,7 @@ changed versus the family-messenger pilot bot ("fambot"):
 | brain | one Codex process per turn, JSON port | `ProjectChatHandler` in-process (as Telegram) |
 | session | `session_id` per room, cold start each turn | warm `AgentSession` per room |
 | progress | "작업을 시작했습니다" only | typing + interim/status notices + the Telegram session-start banner (`◐ CCC session started (<reason>)…`) whenever a turn opens a fresh provider stream |
-| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) + `/history /resume` (#1895 PR-B) |
+| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) + `/history /resume` (#1895 PR-B) + `/continue` (#1825) |
 | output | plain `m.text` | plain `body` + Matrix HTML `formatted_body` |
 | E2EE / trust / room gate | fleet_matrix | same code, ported (fail-closed reasons unchanged) |
 
@@ -377,6 +377,45 @@ Flags: `CCC_EXTERNAL_WAIT_ENABLED` (default on), `CCC_EXTERNAL_WAIT_RESUME`
 (default on), `CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP` (default 10 continuations
 per day; beyond the cap the rollup is still delivered, only the
 auto-continuation is skipped).
+
+## Auto-continue and dead-session notices (#1825)
+
+**Yield-and-continue** (`continuation_cli`, #1113) now runs on Matrix. The
+agent-side CLI resolves its queue next to `CCC_EXTERNAL_WAIT_HOME`, i.e.
+`BOT_DATA_DIR/continuation`; before this change a Matrix registration answered
+`ok`, wrote the record and nothing ever read it, so the promised next bundle
+silently never started. The frontend now runs the shared `ContinuationMonitor`
+over that queue:
+
+- **Start** — only when the conversation has no fresh active-turn route (same
+  fail-closed check as Telegram). The bundle is a durable **self-job**
+  (`$self-continuation:<id>`) in the conversation's room, run as the person
+  whose turn registered it (#1955) and metered as `autonomous` usage.
+- **Loop guards** — unchanged: `CCC_CONTINUATION_DAILY_CAP` (default 20) parks
+  the bundle in `cap-hold` with a notice; three consecutive failed bundle turns
+  park the chain. The monitor waits for the self-job turn's real outcome (up to
+  the turn ceiling plus 30 min of queue slack), so a failed turn counts; after
+  a restart the self-job records its own outcome.
+- **`/stop`** — cancels the conversation's pending and running bundles before
+  cancelling the turn, so a stopped bundle is never counted as a failure. With
+  no turn running, a bare `/stop` still cancels queued bundles
+  ("⏹️ 대기 중이던 자동 이어하기를 취소했습니다.") instead of the
+  invalid-control notice. A bundle cancelled while its self-job was queued is
+  skipped when the job comes up.
+- **`/continue`** (owner) — re-arms `cap-hold` bundles for today.
+- Opt out with `CCC_CONTINUATION_ENABLED=0`.
+
+**Dead-session recovery** — terminal Claude task notifications left in a dead
+session's transcript FIFO are delivered to the conversation's room at startup
+and every `CCC_DEAD_SESSION_RECOVERY_INTERVAL_SECONDS` (same scanner, caps,
+markers and quarantine as Telegram; `CCC_DEAD_SESSION_RECOVERY=0` disables).
+Delivery rides the durable outbox; the marker is written after the outbox
+accepted the notice (at-least-once). Only Claude-owned sessions are eligible.
+The opt-in dead-session *wakeup* (`CCC_DEAD_SESSION_WAKEUP`) is not run by this
+frontend, so recovery never defers to it.
+
+Still Telegram-only: the turn-stall probe, the restart handoff, the
+rapid-crash policy and the GitHub webhook nudge.
 
 ## Grok (`CCC_AGENT_PROVIDER=grok`) — owner direct room, opt-in family rooms
 
