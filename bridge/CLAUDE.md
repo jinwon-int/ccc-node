@@ -180,6 +180,8 @@ SDK conversation logs: `~/.claude/projects/{PROJECT_DIR_NAME}/*.jsonl`
 ## Version Release Preference
 <!-- github-push-and-release: release -->
 This project uses full release mode: CHANGELOG + commit + git tag + GitHub release.
+Changelog entries go in `bridge/changelog.d/<issue>-<slug>.md` fragments, not in
+`bridge/CHANGELOG.md` directly (#2022; see `CONTRIBUTING.md`).
 To force a full release, use `/github-push-and-release release`.
 
 ## Git Commit Language Preference
