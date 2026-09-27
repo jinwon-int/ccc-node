@@ -4,6 +4,23 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **Skill autosave: review is the default, auto nodes migrate explicitly, and
+  the curator marks candidates without moving anything (#2011).** dungae had
+  installed 70 LLM-drafted skills in `auto` mode with no review before install,
+  and the lifecycle curator was off, so the library only grew. `review` is now
+  an accepted alias of the canonical `approve` human gate (already the default
+  for unset/unknown modes). Existing `auto` nodes are **not** flipped silently —
+  node mode stays a per-node operator decision — but `status` now prints an
+  advisory and every sweep logs `mode-advisory`, pointing at the new explicit,
+  idempotent `ccc-skill-autosave.sh set-mode review|approve|auto` (atomic,
+  0600, logged, no-op when unchanged). The curator now runs from the sweep by
+  default (`CCC_SKILL_CURATOR_ENABLED=false` opts out) in a two-stage
+  mark-only mode per owner decision #1739: 30 days idle → `stale` candidate
+  (observation list, stamped `stale_marked_at`), still idle after a 30-day
+  recheck (`CCC_SKILL_CURATOR_RECHECK_AFTER_DAYS`) → `archive-candidate`,
+  report-only (`report` → `lifecycle_candidates`). Automatic archive moves
+  need the new explicit `CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true` (default off);
+  otherwise archiving stays PR-first + owner approval. Nothing deletes skills.
 - **Skills: the model now sees descriptions for the skills that matter
   (#2011 A).** Claude Code caps the per-turn skill listing at
   `skillListingBudgetFraction` (1% of context) and, when over budget, only

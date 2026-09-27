@@ -25,6 +25,11 @@ STATE="$TMP/state"
 SKILLS="$TMP/skills"
 mkdir -m 700 "$STATE" "$SKILLS"
 
+# Sections 1-12 pin the automatic archive contract (#752), which since #2011 is
+# an explicit opt-in. The default two-stage mark-only lifecycle (#1739) is
+# covered by section 13, which unsets this again.
+export CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true
+
 tool() {
   python3 "$TOOL" --provider claude --skills-dir "$SKILLS" --state-dir "$STATE" "$@"
 }
@@ -195,9 +200,8 @@ out="$(at 500 restore epsilon)"
 ok "recovered skill restores normally" 'jq -e ".changed == true" >/dev/null <<<"$out"'
 
 # --- 9. auto gating ------------------------------------------------------------
-out="$(at 600 run --auto)"
-ok "auto run is disabled by default" 'jq -e ".skipped == \"curator-disabled\"" >/dev/null <<<"$out"'
-export CCC_SKILL_CURATOR_ENABLED=true
+out="$(CCC_SKILL_CURATOR_ENABLED=false at 600 run --auto)"
+ok "auto run honours the explicit off-switch" 'jq -e ".skipped == \"curator-disabled\"" >/dev/null <<<"$out"'
 NEWTMP="$(mktemp -d)"; NSTATE="$NEWTMP/state"; NSKILLS="$NEWTMP/skills"
 mkdir -m 700 "$NSTATE" "$NSKILLS"
 ntool() { python3 "$TOOL" --provider claude --skills-dir "$NSKILLS" --state-dir "$NSTATE" "$@"; }
@@ -215,7 +219,6 @@ ok "auto run proceeds after the interval" 'jq -e ".counts.seeded == 1" >/dev/nul
 CCC_SKILL_CURATOR_NOW="$(python3 -c "from datetime import datetime,timedelta,timezone; print((datetime.now(timezone.utc)+timedelta(days=3)).isoformat())")" ntool bump --event use --name zeta >/dev/null
 out="$(CCC_SKILL_CURATOR_NOW="$(python3 -c "from datetime import datetime,timedelta,timezone; print((datetime.now(timezone.utc)+timedelta(days=3,hours=1)).isoformat())")" ntool run --auto)"
 ok "auto run skips while the node is active within min-idle" 'jq -e ".skipped == \"node-active-within-min-idle\"" >/dev/null <<<"$out"'
-unset CCC_SKILL_CURATOR_ENABLED
 rm -rf "$NEWTMP"
 
 # --- 10. configuration + fail-closed boundaries --------------------------------
@@ -376,6 +379,77 @@ PY
 rc=$?
 ok "mutating run reads the ownership ledger exactly once" '[ "$rc" = 0 ]'
 rm -rf "$RB_TMP"
+
+# --- 13. default two-stage mark-only lifecycle (#2011, owner decision #1739) ---
+# Default: the curator is on (an unset CCC_SKILL_CURATOR_ENABLED no longer
+# skips --auto) but automatic archive moves are off. Stage 1 marks a skill idle
+# past the stale window as `stale` (observation list, skill stays live);
+# stage 2 reports it as an `archive-candidate` once it has stayed stale and
+# idle for a full recheck window. Nothing ever moves or disappears.
+unset CCC_SKILL_CURATOR_ARCHIVE_ENABLED
+MO_TMP="$(mktemp -d)"; MO_STATE="$MO_TMP/state"; MO_SKILLS="$MO_TMP/skills"
+mkdir -m 700 "$MO_STATE" "$MO_SKILLS"
+mo() { python3 "$TOOL" --provider claude --skills-dir "$MO_SKILLS" --state-dir "$MO_STATE" "$@"; }
+mo_at() { # <days-from-now> <cmd...>
+  local days="$1"; shift
+  CCC_SKILL_CURATOR_NOW="$(python3 -c "from datetime import datetime,timedelta,timezone; print((datetime.now(timezone.utc)+timedelta(days=$days)).isoformat())")" mo "$@"
+}
+mo_skill() {
+  mkdir -m 700 "$MO_SKILLS/$1"
+  printf -- '---\nname: %s\ndescription: A sufficiently detailed recurring workflow for mark-only lifecycle tests.\n---\n\n# %s\n' "$1" "$1" > "$MO_SKILLS/$1/SKILL.md"
+  chmod 600 "$MO_SKILLS/$1/SKILL.md"
+  python3 "$OWN" --provider claude --skills-dir "$MO_SKILLS" --state-dir "$MO_STATE" mark-created "$1" >/dev/null
+}
+mo_decision() { # <json> <name> — the run's action for one skill
+  jq -r --arg n "$2" '[.decisions[] | select(.name == $n) | .action] | first // "none"' <<<"$1"
+}
+mo_skill mo-idle
+mo_skill mo-used
+mo_skill mo-pinned
+mo run >/dev/null  # first sight seeds every record
+python3 "$OWN" --provider claude --skills-dir "$MO_SKILLS" --state-dir "$MO_STATE" pin mo-pinned >/dev/null
+out="$(mo_at 1 run --auto)"
+ok "mark-only: curator is enabled by default (no curator-disabled skip)" 'jq -e "(.skipped // \"\") != \"curator-disabled\" and .ok == true" >/dev/null <<<"$out"'
+out="$(mo_at 40 run)"
+ok "mark-only: run reports archive disabled by default" 'jq -e ".config.archive_enabled == false and .config.recheck_after_days == 30" >/dev/null <<<"$out"'
+ok "mark-only: stage 1 marks the idle skill stale" '[ "$(mo_decision "$out" mo-idle)" = "mark-stale" ]'
+ok "mark-only: pinned skill stays protected" '[ "$(mo_decision "$out" mo-pinned)" = "protect" ]'
+out="$(mo_at 40 status mo-idle)"
+ok "mark-only: stale mark is stamped with stale_marked_at" 'jq -e ".skills[0].telemetry.state == \"stale\" and (.skills[0].telemetry.stale_marked_at | type) == \"string\"" >/dev/null <<<"$out"'
+ok "mark-only: stale skill stays live on disk" '[ -f "$MO_SKILLS/mo-idle/SKILL.md" ]'
+mo_at 41 bump --event use --name mo-used >/dev/null
+out="$(mo_at 55 run)"
+ok "mark-only: inside the recheck window the candidate is only observed" 'jq -e "[.decisions[] | select(.name == \"mo-idle\") | [.action, .reason]] == [[\"keep\", \"stale-observing\"]]" >/dev/null <<<"$out"'
+ok "mark-only: fresh activity reactivates a stale skill" '[ "$(mo_decision "$out" mo-used)" = "reactivate" ]'
+out="$(mo_at 55 status mo-used)"
+ok "mark-only: reactivation clears stale_marked_at" 'jq -e ".skills[0].telemetry.state == \"active\" and .skills[0].telemetry.stale_marked_at == null" >/dev/null <<<"$out"'
+out="$(mo_at 71 run)"
+ok "mark-only: stage 2 reports an archive candidate after the recheck window" '[ "$(mo_decision "$out" mo-idle)" = "archive-candidate" ] && jq -e ".counts.archive_candidates == 1 and .counts.archived == 0" >/dev/null <<<"$out"'
+out="$(mo_at 400 run)"
+ok "mark-only: even far past archive_after_days nothing is archived" 'jq -e ".counts.archived == 0" >/dev/null <<<"$out" && [ "$(mo_decision "$out" mo-idle)" = "archive-candidate" ]'
+ok "mark-only: every skill is still live" '[ -f "$MO_SKILLS/mo-idle/SKILL.md" ] && [ -f "$MO_SKILLS/mo-used/SKILL.md" ] && [ -f "$MO_SKILLS/mo-pinned/SKILL.md" ]'
+ok "mark-only: the archive root holds no entries" '[ -z "$(ls -A "$MO_STATE/skill-autosave-archive" 2>/dev/null)" ]'
+ok "mark-only: no curator lifecycle transaction reached the ledger" '! grep -q "\"curator-" "$MO_STATE/skill-autosave-ownership.jsonl"'
+out="$(mo_at 400 report)"
+ok "mark-only: report lists the observation/candidate list" 'jq -e "[.lifecycle_candidates[] | select(.name == \"mo-idle\" and .stage == \"archive-candidate\")] | length == 1" >/dev/null <<<"$out"'
+ok "mark-only: report never lists pinned skills as candidates" 'jq -e "[.lifecycle_candidates[] | select(.name == \"mo-pinned\")] | length == 0" >/dev/null <<<"$out"'
+# A record already stale before the two-stage clock existed starts its recheck
+# window instead of jumping straight to a candidate.
+jq '.records |= with_entries(if (.key | endswith(":mo-idle")) then .value |= del(.stale_marked_at) else . end)' \
+  "$MO_STATE/skill-autosave-usage.json" > "$MO_TMP/usage.json"
+install -m 600 "$MO_TMP/usage.json" "$MO_STATE/skill-autosave-usage.json"
+out="$(mo_at 400 run)"
+ok "mark-only: a legacy unstamped stale record restarts its recheck window" 'jq -e "[.decisions[] | select(.name == \"mo-idle\") | .reason] == [\"recheck-window-start\"]" >/dev/null <<<"$out"'
+out="$(CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true mo_at 400 run --dry-run)"
+ok "explicit archive opt-in restores the automatic archive decision" '[ "$(mo_decision "$out" mo-idle)" = "archive" ]'
+out="$(CCC_SKILL_CURATOR_RECHECK_AFTER_DAYS=0 mo_at 400 run)"; rc=$?
+ok "out-of-range recheck window fails closed" '[ "$rc" -eq 2 ] && jq -e ".code == \"invalid_config_CCC_SKILL_CURATOR_RECHECK_AFTER_DAYS\"" >/dev/null <<<"$out"'
+out="$(CCC_SKILL_CURATOR_ARCHIVE_ENABLED=maybe mo_at 400 run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "malformed archive switch fails closed" '[ "$rc" -eq 2 ] && jq -e ".code == \"invalid_config_CCC_SKILL_CURATOR_ARCHIVE_ENABLED\"" >/dev/null <<<"$out"'
+ok "mark-only: skills survive the whole run sequence" '[ -f "$MO_SKILLS/mo-idle/SKILL.md" ]'
+rm -rf "$MO_TMP"
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

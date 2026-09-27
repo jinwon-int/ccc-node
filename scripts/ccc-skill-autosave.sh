@@ -14,12 +14,15 @@
 #
 # Safety (same contract as the hooks it orchestrates):
 #   - Always exits 0; every step is best-effort and logged.
-#   - approve mode (default): never installs or overwrites ~/.claude/skills —
-#     drafts stay in the human-gated pending-skills queue (/skillsuggest).
+#   - approve mode (default; `review` is an accepted alias, #2011): never
+#     installs or overwrites ~/.claude/skills — drafts stay in the human-gated
+#     pending-skills queue (/skillsuggest) until an operator reviews them.
 #   - auto mode (#355, opt-in via CCC_SKILL_AUTOSAVE_MODE=auto or `auto` in
 #     ~/.claude/state/skill-autosave.mode): after drafting, the machine-gated
 #     installer (hooks/skill-review/autoinstall.sh) installs passing drafts and
 #     queues a post-hoc Telegram notice; gate failures stay pending for humans.
+#     No longer recommended (#2011): `set-mode review` moves a node back to the
+#     human gate — explicitly, never silently.
 #   - Off-switch: touch ~/.claude/state/skill-autosave.disabled
 #     (skill-review's own skill-review.disabled off-switch is honored too).
 #   - Cost-bounded: at most CCC_SKILL_AUTOSAVE_MAX_SESSIONS transcripts are
@@ -81,15 +84,33 @@ pending_count() {
     | grep -Ev '\.(approved|rejected|installed)-[0-9]+$' | wc -l | tr -d '[:space:]'
 }
 
-# approve (default) keeps the human gate; auto (#355) hands passing drafts to
-# the machine-gated installer. Env wins over the state file.
+MODE_FILE="$STATE_DIR/skill-autosave.mode"
+
+# approve (default; `review` is its alias, #2011) keeps the human gate; auto
+# (#355) hands passing drafts to the machine-gated installer. Env wins over the
+# state file. Anything that is not exactly `auto` is the human gate, so an
+# unset, empty or unknown value fails safe (autoinstall.sh resolves the same).
 resolve_mode() {
   local m="${CCC_SKILL_AUTOSAVE_MODE:-}"
-  if [ -z "$m" ] && [ -f "$STATE_DIR/skill-autosave.mode" ]; then
-    m="$(head -1 "$STATE_DIR/skill-autosave.mode" 2>/dev/null | tr -d '[:space:]')"
+  if [ -z "$m" ] && [ -f "$MODE_FILE" ]; then
+    m="$(head -1 "$MODE_FILE" 2>/dev/null | tr -d '[:space:]')"
   fi
   case "$m" in auto) printf 'auto' ;; *) printf 'approve' ;; esac
 }
+
+# Where the effective mode came from — env, state file, or the built-in default.
+mode_source() {
+  if [ -n "${CCC_SKILL_AUTOSAVE_MODE:-}" ]; then printf 'env'
+  elif [ -f "$MODE_FILE" ]; then printf 'state-file'
+  else printf 'default'
+  fi
+}
+
+# #2011: auto installs LLM-drafted skills with no human review before install.
+# The owner moved the fleet default to review, but switching an existing node
+# stays an explicit operator action (never silently flipped by an update) — so
+# auto nodes get a visible, actionable advisory instead.
+AUTO_ADVISORY="auto mode installs LLM-drafted skills without pre-install human review; the fleet default is review (#2011). Migrate explicitly: ccc-skill-autosave.sh set-mode review"
 
 # Run the central promoter with the publisher edge env loaded (#1766). Sourced
 # inside a subshell so A2A_EDGE_SECRET reaches exactly the child that dispatches
@@ -113,13 +134,72 @@ collect_with_edge_env() {
   )
 }
 
+# Curator switches (#2011). The curator itself validates the exact values and
+# fails closed on garbage; the sweep only needs the off-switch direction.
+curator_enabled() {
+  case "$(printf '%s' "${CCC_SKILL_CURATOR_ENABLED:-true}" | tr '[:upper:]' '[:lower:]')" in
+    0|false|no|off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+curator_archive_state() {
+  case "$(printf '%s' "${CCC_SKILL_CURATOR_ARCHIVE_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) printf 'ENABLED' ;;
+    *) printf 'off' ;;
+  esac
+}
+
 MODE="${1:-run}"
 
+# --- set-mode: explicit, idempotent mode migration (#2011) -------------------
+# The only supported way to move an existing node between modes. It writes the
+# canonical value (`review` is stored as `approve`, which every reader —
+# this sweep, autoinstall.sh, skill-review.sh — already treats as the human
+# gate) atomically, owner-only, and logs the transition. Re-running with the
+# same target is a no-op. Runs before the off-switch/autonomy gates on purpose:
+# moving TO the human gate must work even while the sweep is paused.
+if [ "$MODE" = "set-mode" ]; then
+  want="${2:-}"
+  case "$want" in
+    review|approve) target="approve" ;;
+    auto) target="auto" ;;
+    *)
+      echo "usage: ccc-skill-autosave.sh set-mode review|approve|auto" >&2
+      exit 2
+      ;;
+  esac
+  current=""
+  [ -f "$MODE_FILE" ] && current="$(head -1 "$MODE_FILE" 2>/dev/null | tr -d '[:space:]')"
+  if [ -f "$MODE_FILE" ] && [ "$current" = "$target" ]; then
+    echo "set-mode: unchanged ($MODE_FILE already '$target')"
+  else
+    tmp="$MODE_FILE.tmp.$$"
+    if ( umask 077; printf '%s\n' "$target" > "$tmp" ) 2>/dev/null && mv -f "$tmp" "$MODE_FILE" 2>/dev/null; then
+      log "set-mode from=${current:-unset} to=$target"
+      echo "set-mode: $MODE_FILE ${current:-unset} -> $target"
+    else
+      rm -f "$tmp" 2>/dev/null
+      echo "set-mode: failed to write $MODE_FILE" >&2
+      exit 1
+    fi
+  fi
+  if [ -n "${CCC_SKILL_AUTOSAVE_MODE:-}" ] && [ "$(resolve_mode)" != "$target" ]; then
+    echo "set-mode: WARNING env CCC_SKILL_AUTOSAVE_MODE=${CCC_SKILL_AUTOSAVE_MODE} overrides the state file; unset it (cron entry / shell profile) for '$target' to take effect" >&2
+  fi
+  echo "effective mode: $(resolve_mode) (source: $(mode_source))"
+  exit 0
+fi
+
 if [ "$MODE" = "status" ]; then
-  echo "mode: $(resolve_mode) (approve = human gate, auto = machine gate + post-hoc notify)"
+  echo "mode: $(resolve_mode) (source: $(mode_source); approve/review = human review before install [default], auto = machine gate + post-hoc notify)"
+  [ "$(resolve_mode)" = "auto" ] && echo "advisory: $AUTO_ADVISORY"
   echo "off-switch: $([ -f "$STATE_DIR/skill-autosave.disabled" ] && echo ON || echo off)"
   echo "autonomy: $(declare -f ccc_autonomy_state >/dev/null 2>&1 && ccc_autonomy_state || echo active) (kill = skip whole sweep, dry-run = draft/report only)"
-  echo "curator: ${CCC_SKILL_CURATOR_ENABLED:-false} (enabled=true lets the sweep run the deterministic stale/archive lifecycle; first auto run only seeds the interval timer)"
+  if curator_enabled; then
+    echo "curator: enabled, archive moves $(curator_archive_state) (default mark-only: stale = observation list, archive-candidate = report only; #2011/#1739. CCC_SKILL_CURATOR_ENABLED=false turns it off; first auto run only seeds the interval timer)"
+  else
+    echo "curator: disabled (CCC_SKILL_CURATOR_ENABLED=${CCC_SKILL_CURATOR_ENABLED:-})"
+  fi
   echo "pending skill drafts: $(pending_count)"
   # Presence only, never the value (#1766): absent on a publisher is exactly the
   # wiring gap that stalled six intake PRs, so it has to be visible at a glance.
@@ -132,7 +212,7 @@ if [ "$MODE" = "status" ]; then
 fi
 
 if [ "$MODE" != "run" ]; then
-  echo "usage: ccc-skill-autosave.sh [run|status]" >&2
+  echo "usage: ccc-skill-autosave.sh [run|status|set-mode review|approve|auto]" >&2
   exit 0
 fi
 
@@ -514,6 +594,7 @@ fi
 # and blocks, so the sweep just invokes it and records the summary.
 EFFECTIVE_MODE="$(resolve_mode)"
 if [ "$EFFECTIVE_MODE" = "auto" ]; then
+  log "mode-advisory mode=auto source=$(mode_source) recommended=review (#2011) migrate='ccc-skill-autosave.sh set-mode review'"
   if [ -f "$AUTOINSTALL" ]; then
     # autoinstall.sh anchors its queue to CCC_SKILL_REVIEW_STATE_DIR, never to
     # CCC_STATE_DIR (which the bridge scopes per memory audience). Hand it the
@@ -528,13 +609,20 @@ if [ "$EFFECTIVE_MODE" = "auto" ]; then
   fi
 fi
 
-# --- 2c) curator lifecycle (#752, opt-in) --------------------------------------
-# Deterministic stale/archive lifecycle for autosave-managed skills. Default
-# OFF fleet-wide; enabling requires CCC_SKILL_CURATOR_ENABLED=true plus a
-# separate rollout decision (see docs/skill-autosave.md). The curator self-
+# --- 2c) curator lifecycle (#752; mark-only by default, #2011) -----------------
+# Deterministic lifecycle for autosave-managed skills. ON by default since
+# #2011, but only its candidate-marking stage: skills idle past the stale
+# window are marked `stale` (observation list) and, after a full recheck
+# window, reported as archive candidates — nothing is moved or deleted. The
+# archive move stays PR-first + owner approval (#1739) unless
+# CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true is set explicitly (not recommended
+# before #1648's fleet measurement preconditions hold).
+# CCC_SKILL_CURATOR_ENABLED=false turns the curator off. The curator self-
 # gates (first-run deferral, interval, min-idle) and never calls a provider.
 # Under autonomy dry-run it reports only; kill already exited above.
-if [ "${CCC_SKILL_CURATOR_ENABLED:-false}" = "true" ]; then
+if ! curator_enabled; then
+  log "curator skipped reason=disabled"
+else
   if [ ! -f "$CURATOR" ]; then
     log "curator skipped reason=missing path=$CURATOR"
   elif ! command -v python3 >/dev/null 2>&1; then

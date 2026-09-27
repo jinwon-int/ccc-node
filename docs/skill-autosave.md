@@ -1,9 +1,12 @@
 # Skill autosave (Hermes-style auto-skillification)
 
 ccc-node learns frequently-repeated procedures as skill drafts automatically.
-By default a strict human approval gate applies; the opt-in **auto mode**
-(#355) replaces it with machine gates + after-the-fact notification and
-rollback, Hermes-style. Three layers cooperate:
+By default a strict human review gate applies (**review** mode — stored as
+`approve`; draft → human review → install). The opt-in **auto mode** (#355)
+replaces it with machine gates + after-the-fact notification and rollback,
+Hermes-style; since #2011 auto is no longer recommended (see
+[Mode migration](#mode-migration--review-is-the-default-2011)). Three layers
+cooperate:
 
 | Layer | Trigger | What it does |
 |---|---|---|
@@ -281,13 +284,51 @@ not-group/world-writable, non-symlinked `SKILL.md` under its trusted skill
 roots and asks Claude to read that exact file. Other filesystem settings and
 unknown slash commands remain disabled/native respectively.
 
+## Mode migration — review is the default (#2011)
+
+The owner decision in #2011 (2026-09-27) makes **review** the fleet default:
+LLM-drafted skills wait in the pending queue until a human reviews them
+(`/skillsuggest`), and only then install. `review` is an accepted alias of the
+canonical `approve` value — every reader (`ccc-skill-autosave.sh`,
+`skill-review/autoinstall.sh`, `skill-review.sh`) treats anything that is not
+exactly `auto` as the human gate, so an unset, empty or unknown mode already
+fails safe. New nodes therefore start in review mode with no action.
+
+**Existing `auto` nodes are not flipped silently.** A node's mode is a
+per-node operator decision recorded in its own state file (the #355 contract
+below, and the `/skillsuggest` "ask before changing it" rule); a harness update
+does not rewrite node state behind the operator's back. Instead an auto node
+now surfaces the change until it is migrated explicitly:
+
+- `ccc-skill-autosave.sh status` prints `mode: auto (source: …)` followed by an
+  `advisory:` line with the migration command;
+- every sweep logs `mode-advisory mode=auto source=<env|state-file>
+  recommended=review` to `~/.claude/state/skill-autosave.log`.
+
+Migrate with the explicit, idempotent one-shot command:
+
+```bash
+~/.claude/hooks/ccc-skill-autosave.sh set-mode review   # auto -> approve (review)
+~/.claude/hooks/ccc-skill-autosave.sh status            # verify: mode: approve (source: state-file)
+```
+
+`set-mode review|approve|auto` writes the canonical value atomically and
+owner-only (0600) to `~/.claude/state/skill-autosave.mode`, logs
+`set-mode from=<old> to=<new>`, and is a no-op (`unchanged`) when the file
+already holds the target. It works while the sweep is paused
+(`skill-autosave.disabled`), and warns when an env `CCC_SKILL_AUTOSAVE_MODE`
+(cron entry or shell profile) would still override the file. Skills that auto
+mode already installed stay installed; audit or undo them with
+`autoinstall.sh list` / `rollback <name>` (see `/skillsuggest` step 1b).
+
 ## Auto mode — unattended install with post-hoc review (#355)
 
-Opt in per node (default stays `approve`; existing nodes are unchanged):
+Opt in per node (default stays `approve`/review; existing nodes are unchanged).
+**Not recommended since #2011** — prefer review mode:
 
 ```bash
 export CCC_SKILL_AUTOSAVE_MODE=auto              # env (wins), or
-printf 'auto' > ~/.claude/state/skill-autosave.mode   # durable state file
+~/.claude/hooks/ccc-skill-autosave.sh set-mode auto   # durable state file
 ```
 
 Drafting is unchanged. What changes is the gate: instead of a human,
@@ -726,7 +767,30 @@ fail closed when telemetry or provenance is unreadable, and every mutating
 command loads the usage store inside the mutation lock so a concurrent bump
 can never be silently overwritten.
 
-**Deterministic lifecycle.** States are `active → stale → archived` with
+**Default: two-stage, mark-only (#2011, owner decision #1739).** Unless
+`CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true` is set explicitly, `run` never moves
+or deletes anything:
+
+1. **Candidate marking** — a skill idle past the stale window (30 d) is marked
+   `stale` and stamped `stale_marked_at`. It stays live; `stale` is an
+   observation list, nothing more.
+2. **Recheck** — a stale skill that is *still* idle once a full recheck window
+   (`CCC_SKILL_CURATOR_RECHECK_AFTER_DAYS`, 30 d; effective 60 d total) has
+   passed since it was marked is reported as `archive-candidate`
+   (`counts.archive_candidates`, and `report` → `lifecycle_candidates[]` with
+   `stage: observe|archive-candidate`). This is report-only.
+
+Fresh activity at any point reactivates the skill and clears the mark. A
+record that was already `stale` before the stamp existed restarts its recheck
+window (`recheck-window-start`) rather than jumping straight to a candidate.
+The archive move itself stays an operator action through the #1739 flow —
+PR-first + owner approval — using `curator.py archive <name>` (restorable, never
+a delete). Turning on automatic archive (`CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true`)
+is a separate rollout decision and should wait for #1648's retirement
+preconditions (≥30 days of post-deploy usage data from >3 measured nodes);
+with it on, the legacy lifecycle below applies (`archive_after_days`).
+
+**Deterministic lifecycle (archive opt-in).** States are `active → stale → archived` with
 reactivation on fresh activity; the anchor is the latest activity timestamp
 or the first-sight seed time (never epoch — a newly seen skill gets a full
 fresh window). `stale` is display-only; `archived` is an atomic same-filesystem
@@ -778,12 +842,17 @@ python3 "$CUR" list-archived
 python3 "$CUR" backup --reason manual / list-backups / rollback [--id <id>]
 ```
 
-**Sweep integration is opt-in and fleet-gated.** The daily sweep runs the
-curator only when `CCC_SKILL_CURATOR_ENABLED=true` (default off — enabling is
-a rollout decision). Under autonomy `dry-run` the sweep passes `--dry-run`;
-under `kill` the sweep never starts. Tuning (env):
-`CCC_SKILL_CURATOR_STALE_AFTER_DAYS` (30), `CCC_SKILL_CURATOR_ARCHIVE_AFTER_DAYS`
-(90), `CCC_SKILL_CURATOR_MIN_IDLE_HOURS` (2), `CCC_SKILL_CURATOR_INTERVAL_HOURS`
+**Sweep integration is on by default, mark-only (#2011).** The daily sweep
+runs `curator.py run --auto` unless `CCC_SKILL_CURATOR_ENABLED=false` (before
+#2011 it was default off). Because automatic archive stays off unless
+`CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true`, the default sweep only marks and
+reports candidates; `ccc-skill-autosave.sh status` shows
+`curator: enabled, archive moves off|ENABLED`. Under autonomy `dry-run` the
+sweep passes `--dry-run`; under `kill` the sweep never starts. Tuning (env):
+`CCC_SKILL_CURATOR_ENABLED` (true), `CCC_SKILL_CURATOR_ARCHIVE_ENABLED` (false),
+`CCC_SKILL_CURATOR_STALE_AFTER_DAYS` (30), `CCC_SKILL_CURATOR_RECHECK_AFTER_DAYS`
+(30), `CCC_SKILL_CURATOR_ARCHIVE_AFTER_DAYS` (90, archive opt-in only),
+`CCC_SKILL_CURATOR_MIN_IDLE_HOURS` (2), `CCC_SKILL_CURATOR_INTERVAL_HOURS`
 (24), `CCC_SKILL_CURATOR_BACKUP_KEEP` (5), `CCC_SKILL_CURATOR_NOW` (test-only
 clock pin, UTC). Codex nodes share the same contract (`CCC_SKILL_PROVIDER=codex`);
 only the `PostToolUse` bump is Claude-only, so Codex telemetry is ledger-derived
@@ -814,7 +883,8 @@ rework it to be provider-neutral before it can autosave there.
 ## Operations
 
 ```bash
-~/.claude/hooks/ccc-skill-autosave.sh status   # pending count, ledger, log tail
+~/.claude/hooks/ccc-skill-autosave.sh status   # mode (+ auto advisory), curator, pending count, ledger, log tail
+~/.claude/hooks/ccc-skill-autosave.sh set-mode review  # explicit, idempotent mode migration (#2011)
 touch ~/.claude/state/skill-autosave.disabled  # off-switch (sweep)
 touch ~/.claude/state/skill-review.disabled    # off-switch (drafting pipeline)
 ```
@@ -824,7 +894,7 @@ each drafting run is an LLM call), `CCC_SKILL_AUTOSAVE_WINDOW_DAYS` (2),
 `CCC_SKILL_AUTOSAVE_REGROWTH_BYTES` (16384 — a long-lived bridge transcript is
 re-reviewed only after growing this much), `CCC_SKILL_AUTOSAVE_NOTIFY` (1),
 `CCC_SKILL_AUTOSAVE_SETTLE_SECONDS` (90), `CCC_SKILL_AUTOSAVE_MODE`
-(approve|auto, default approve), `CCC_SKILL_AUTOSAVE_DAILY_CAP` (3 — auto-mode
+(approve|review|auto, default approve = review), `CCC_SKILL_AUTOSAVE_DAILY_CAP` (3 — auto-mode
 installs per UTC day), `CCC_SKILL_PROVIDER` (claude|codex|piri, default
 auto-detect — selects the install surface), `CODEX_SKILLS_DIR` (Codex install
 target override, default `${CODEX_HOME:-~/.codex}/skills`),

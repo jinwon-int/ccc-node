@@ -550,5 +550,95 @@ ok "#1766: a malformed edge env file still runs collect" \
 ok "#1766: edge env output never reaches the summary or the log" \
   '! grep -rq "leaked-edge-secret-1766" "$STATE11C" 2>/dev/null'
 
+# --- 12) #2011: review is the default, auto nodes migrate only explicitly ------
+# The owner moved the fleet default to review (draft -> human review ->
+# install). An unset mode already resolves to the human gate; an existing
+# `auto` node is never flipped silently — it gets an advisory and migrates via
+# the explicit, idempotent `set-mode` command.
+ok "#2011: auto sweep logs the review advisory" \
+  'grep -q "mode-advisory mode=auto source=env recommended=review" "$STATE2/skill-autosave.log"'
+STATE12="$TMP/state12"; mkdir -p "$STATE12"; chmod 700 "$STATE12"
+out="$(CCC_STATE_DIR="$STATE12" bash "$AUTOSAVE" status 2>&1)"
+ok "#2011: unset mode resolves to the human gate (default source)" \
+  'printf "%s" "$out" | grep -q "^mode: approve (source: default"'
+ok "#2011: default mode prints no auto advisory" '! printf "%s" "$out" | grep -q "^advisory:"'
+printf 'review\n' > "$STATE12/skill-autosave.mode"
+out="$(CCC_STATE_DIR="$STATE12" bash "$AUTOSAVE" status 2>&1)"
+ok "#2011: 'review' in the state file is the human gate" \
+  'printf "%s" "$out" | grep -q "^mode: approve (source: state-file"'
+printf 'auto\n' > "$STATE12/skill-autosave.mode"
+out="$(CCC_STATE_DIR="$STATE12" bash "$AUTOSAVE" status 2>&1)"
+ok "#2011: an auto node keeps auto until migrated (no silent flip)" \
+  'printf "%s" "$out" | grep -q "^mode: auto (source: state-file"'
+ok "#2011: status shows the actionable migration advisory" \
+  'printf "%s" "$out" | grep -q "^advisory: .*set-mode review"'
+out="$(CCC_STATE_DIR="$STATE12" bash "$AUTOSAVE" set-mode review 2>&1)"; rc=$?
+ok "#2011: set-mode review migrates an auto node" \
+  '[ "$rc" = 0 ] && printf "%s" "$out" | grep -q "auto -> approve" && [ "$(cat "$STATE12/skill-autosave.mode")" = approve ]'
+ok "#2011: set-mode writes the mode file owner-only" \
+  '[ "$(stat -c %a "$STATE12/skill-autosave.mode")" = 600 ]'
+ok "#2011: set-mode logs the transition" \
+  'grep -q "set-mode from=auto to=approve" "$STATE12/skill-autosave.log"'
+out="$(CCC_STATE_DIR="$STATE12" bash "$AUTOSAVE" status 2>&1)"
+ok "#2011: migrated node reports the human gate without advisory" \
+  'printf "%s" "$out" | grep -q "^mode: approve" && ! printf "%s" "$out" | grep -q "^advisory:"'
+out="$(CCC_STATE_DIR="$STATE12" bash "$AUTOSAVE" set-mode review 2>&1)"; rc=$?
+ok "#2011: set-mode is idempotent" \
+  '[ "$rc" = 0 ] && printf "%s" "$out" | grep -q "unchanged" && [ "$(grep -c "set-mode from=" "$STATE12/skill-autosave.log")" = 1 ]'
+out="$(CCC_STATE_DIR="$STATE12" bash "$AUTOSAVE" set-mode yolo 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "#2011: set-mode rejects an unknown mode and leaves the file alone" \
+  '[ "$rc" = 2 ] && [ "$(cat "$STATE12/skill-autosave.mode")" = approve ]'
+out="$(CCC_STATE_DIR="$STATE12" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTOSAVE" set-mode review 2>&1)"
+ok "#2011: set-mode warns when an env override would mask the change" \
+  'printf "%s" "$out" | grep -q "WARNING env CCC_SKILL_AUTOSAVE_MODE=auto overrides"'
+touch "$STATE12/skill-autosave.disabled"
+rm -f "$STATE12/skill-autosave.mode"
+CCC_STATE_DIR="$STATE12" bash "$AUTOSAVE" set-mode review >/dev/null 2>&1
+ok "#2011: set-mode works while the sweep is paused" \
+  '[ "$(cat "$STATE12/skill-autosave.mode" 2>/dev/null)" = approve ]'
+rm -f "$STATE12/skill-autosave.disabled"
+
+# --- 13) #2011: curator runs by default, mark-only unless archive is opted in --
+CURATOR_STUB="$TMP/curator-stub.py"
+cat > "$CURATOR_STUB" <<'PY'
+#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+line = " ".join(sys.argv[1:]) + " archive=" + os.environ.get("CCC_SKILL_CURATOR_ARCHIVE_ENABLED", "unset")
+with Path(os.environ["CURATOR_TOUCH"]).open("a", encoding="utf-8") as handle:
+    handle.write(line + "\n")
+print('{"ok":true,"command":"run"}')
+PY
+STATE13="$TMP/state13"; mkdir -p "$STATE13"; chmod 700 "$STATE13"
+run13() {
+  env CCC_STATE_DIR="$STATE13" CLAUDE_PROJECTS_DIR="$TMP/projects13" \
+    CCC_PUSH_SPOOL="$TMP/spool13" CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+    SCAN_TOUCH="$TMP/scan13.touched" CCC_SKILL_PROMOTION_CMD="$PROMOTER" \
+    PROMOTION_TOUCH="$TMP/promotion13.touched" CCC_SKILL_CURATOR_CMD="$CURATOR_STUB" \
+    CURATOR_TOUCH="$TMP/curator13.touched" CLAUDE_SKILLS_DIR="$TMP/skills13" \
+    CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode "$@" bash "$AUTOSAVE" run
+}
+run13
+ok "#2011: the sweep runs the curator by default" 'grep -qx "run --auto archive=unset" "$TMP/curator13.touched"'
+ok "#2011: the curator summary is logged" 'grep -q "curator {\"ok\":true" "$STATE13/skill-autosave.log"'
+: > "$TMP/curator13.touched"
+run13 CCC_SKILL_CURATOR_ENABLED=false
+ok "#2011: CCC_SKILL_CURATOR_ENABLED=false skips the curator" '[ ! -s "$TMP/curator13.touched" ]'
+ok "#2011: the curator off-switch is logged" 'grep -q "curator skipped reason=disabled" "$STATE13/skill-autosave.log"'
+run13 CCC_AUTONOMY=dry-run
+ok "#2011: autonomy dry-run keeps the curator report-only" 'grep -qx "run --auto --dry-run archive=unset" "$TMP/curator13.touched"'
+out="$(CCC_STATE_DIR="$STATE13" bash "$AUTOSAVE" status 2>&1)"
+ok "#2011: status reports curator enabled with archive moves off" \
+  'printf "%s" "$out" | grep -q "^curator: enabled, archive moves off"'
+out="$(CCC_STATE_DIR="$STATE13" CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true bash "$AUTOSAVE" status 2>&1)"
+ok "#2011: status makes an archive opt-in visible" \
+  'printf "%s" "$out" | grep -q "^curator: enabled, archive moves ENABLED"'
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(CCC_STATE_DIR="$STATE13" CCC_SKILL_CURATOR_ENABLED=off bash "$AUTOSAVE" status 2>&1)"
+ok "#2011: status reports a disabled curator" 'printf "%s" "$out" | grep -q "^curator: disabled"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
