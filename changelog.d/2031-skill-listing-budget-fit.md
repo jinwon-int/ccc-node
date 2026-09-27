@@ -14,5 +14,5 @@
   costs alone exceed the budget. New env `CCC_SKILL_LISTING_CONTEXT_TOKENS`
   (default 200000) for nodes on a larger context window. The 16 repo-shipped
   core skills' descriptions now lead with "Use when …" and are ≤300 chars
-  (5,209 instead of 7,664 listing chars for the 17 measured core skills); a
+  (5,200 instead of 7,664 listing chars for the 17 measured core skills); a
   test enforces the 350-char cap and trigger-first wording.
