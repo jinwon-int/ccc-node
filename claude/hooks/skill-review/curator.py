@@ -8,7 +8,13 @@ Scope and safety contract:
   unknown skills are observed for telemetry but never auto-transitioned.
 - No permanent deletion anywhere: the maximum destructive action is an atomic
   move into the owner-only archive root on the same filesystem, and every
-  archived skill can be restored. Backup pruning follows an explicit retention
+  archived skill can be restored.
+- Two-stage, mark-only by default (#2011, owner decision #1739): ``run`` marks
+  skills idle past the stale window as ``stale`` (an observation/candidate
+  list — nothing moves) and, once a stale skill has stayed idle for a full
+  recheck window, reports it as an ``archive-candidate``. Automatic archive
+  moves happen only with CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true; otherwise an
+  archive move is an operator action (PR-first + owner approval). Backup pruning follows an explicit retention
   cap and never touches the newest ``keep`` snapshots.
 - Telemetry is body-free: counters, ISO timestamps and state flags only. Bump
   is fail-open (telemetry failure never blocks a foreground skill call);
@@ -115,10 +121,18 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _load_config() -> dict[str, Any]:
     return {
-        "enabled": _env_bool("CCC_SKILL_CURATOR_ENABLED", False),
+        # #2011: on by default — safe because the default is mark-only.
+        "enabled": _env_bool("CCC_SKILL_CURATOR_ENABLED", True),
+        # #2011 / #1739: automatic archive moves are a separate, explicit opt-in.
+        "archive_enabled": _env_bool("CCC_SKILL_CURATOR_ARCHIVE_ENABLED", False),
         "stale_after_days": _env_int("CCC_SKILL_CURATOR_STALE_AFTER_DAYS", 30, 1, 3650),
         "archive_after_days": _env_int(
             "CCC_SKILL_CURATOR_ARCHIVE_AFTER_DAYS", 90, 1, 3650
+        ),
+        # Second stage of the mark-only lifecycle: how long a skill must stay
+        # stale (and still idle) before it is reported as an archive candidate.
+        "recheck_after_days": _env_int(
+            "CCC_SKILL_CURATOR_RECHECK_AFTER_DAYS", 30, 1, 3650
         ),
         "min_idle_hours": _env_int("CCC_SKILL_CURATOR_MIN_IDLE_HOURS", 2, 0, 24 * 365),
         "interval_hours": _env_int("CCC_SKILL_CURATOR_INTERVAL_HOURS", 24, 1, 24 * 365),
@@ -172,6 +186,7 @@ def _empty_record(target_id: str, created_at: str) -> dict[str, Any]:
         "last_used_at": None,
         "last_patched_at": None,
         "state": "active",
+        "stale_marked_at": None,
         "archived_at": None,
         "archive_name": None,
     }
@@ -203,6 +218,7 @@ def _validate_usage(data: dict[str, Any]) -> dict[str, Any]:
             "last_viewed_at",
             "last_used_at",
             "last_patched_at",
+            "stale_marked_at",
             "archived_at",
             "archive_name",
         ):
@@ -1271,10 +1287,11 @@ def _decide(
 ) -> tuple[str, str]:
     """Pure transition decision: (action, reason).
 
-    Actions: keep, mark-stale, archive, reactivate. Mirrors the Hermes
-    semantics: anchor = last activity or created_at; never-used skills younger
-    than the stale window get a grace pass; stale skills with fresh activity
-    reactivate.
+    Actions: keep, mark-stale, archive, archive-candidate, reactivate.
+    Mirrors the Hermes semantics: anchor = last activity or created_at;
+    never-used skills younger than the stale window get a grace pass; stale
+    skills with fresh activity reactivate. With archive disabled (the default,
+    #2011) the decision is mark-only and never returns ``archive``.
     """
     stale_cutoff = now - timedelta(days=config["stale_after_days"])
     archive_cutoff = now - timedelta(days=config["archive_after_days"])
@@ -1288,6 +1305,8 @@ def _decide(
         if state == "stale":
             return "reactivate", "never-used-grace"
         return "keep", "never-used-grace"
+    if not config.get("archive_enabled", False):
+        return _decide_mark_only(record, now, config, anchor, stale_cutoff)
     if anchor <= archive_cutoff:
         return "archive", f"idle>{config['archive_after_days']}d"
     if anchor <= stale_cutoff and state == "active":
@@ -1295,6 +1314,41 @@ def _decide(
     if anchor > stale_cutoff and state == "stale":
         return "reactivate", "fresh-activity"
     return "keep", "within-window"
+
+
+def _decide_mark_only(
+    record: dict[str, Any],
+    now: datetime,
+    config: dict[str, Any],
+    anchor: datetime,
+    stale_cutoff: datetime,
+) -> tuple[str, str]:
+    """Two-stage mark-only lifecycle (#2011, owner decision #1739).
+
+    Stage 1: idle past the stale window -> ``mark-stale`` (observation list;
+    the skill stays live). Stage 2: still idle after staying stale for a full
+    recheck window -> ``archive-candidate``, a report-only decision. Nothing
+    is ever moved here: the archive move itself stays an operator action
+    (PR-first + owner approval) or the explicit ARCHIVE_ENABLED opt-in.
+    """
+    state = record["state"]
+    if anchor > stale_cutoff:
+        if state == "stale":
+            return "reactivate", "fresh-activity"
+        return "keep", "within-window"
+    if state == "active":
+        return "mark-stale", f"idle>{config['stale_after_days']}d"
+    marked_at = _parse_ts(record.get("stale_marked_at"))
+    if marked_at is None:
+        # Stale since before the two-stage clock existed: start its recheck
+        # window now instead of promoting it straight to a candidate.
+        return "mark-stale", "recheck-window-start"
+    if marked_at <= now - timedelta(days=config["recheck_after_days"]):
+        return (
+            "archive-candidate",
+            f"stale>={config['recheck_after_days']}d-still-idle;archive-disabled",
+        )
+    return "keep", "stale-observing"
 
 
 def _node_recently_active(usage: dict[str, Any], now: datetime, min_idle_hours: int) -> bool:
@@ -1338,6 +1392,8 @@ def _run_report_skeleton(auto: bool, dry_run: bool, now: datetime, config) -> di
         "config": {
             "stale_after_days": config["stale_after_days"],
             "archive_after_days": config["archive_after_days"],
+            "recheck_after_days": config["recheck_after_days"],
+            "archive_enabled": config["archive_enabled"],
             "min_idle_hours": config["min_idle_hours"],
         },
         "decisions": [],
@@ -1347,6 +1403,7 @@ def _run_report_skeleton(auto: bool, dry_run: bool, now: datetime, config) -> di
             "protected": 0,
             "marked_stale": 0,
             "archived": 0,
+            "archive_candidates": 0,
             "reactivated": 0,
             "kept": 0,
         },
@@ -1405,6 +1462,7 @@ def _classify_run_decision(
         "mark-stale": "marked_stale",
         "reactivate": "reactivated",
         "archive": "archived",
+        "archive-candidate": "archive_candidates",
     }
     report["counts"][count_keys[action]] += 1
 
@@ -1440,8 +1498,10 @@ def _apply_run_decisions(
         record = usage["records"][_record_key(context, decision["name"])]
         if action == "mark-stale":
             record["state"] = "stale"
+            record["stale_marked_at"] = _ts(now)
         elif action == "reactivate":
             record["state"] = "active"
+            record["stale_marked_at"] = None
         elif action == "archive" and record["state"] != "archived":
             if decision["name"] in quarantined:
                 decision["action"] = "quarantine"
@@ -1558,6 +1618,7 @@ def _skill_report(context, name, classification, usage, now) -> dict[str, Any]:
             _ts(activity) if (activity := _last_activity(record)) else None
         ),
         "idle_days": _idle_days(record, now),
+        "stale_marked_at": record.get("stale_marked_at"),
         "archived_at": record["archived_at"],
     }
     return entry
@@ -1582,9 +1643,41 @@ def _command_status(context, name: str | None) -> dict[str, Any]:
     }
 
 
+def _lifecycle_candidate(
+    record: dict[str, Any] | None,
+    classification: dict[str, Any],
+    now: datetime,
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Observation-list entry for a stale, lifecycle-eligible skill (#2011).
+
+    ``stage`` is ``observe`` (stage 1: marked, still inside the recheck
+    window) or ``archive-candidate`` (stage 2: still idle after a full recheck
+    window). Report-only: the archive move itself stays PR-first + owner
+    approval unless CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true.
+    """
+    if (
+        record is None
+        or record["state"] != "stale"
+        or classification["base_classification"] != "autosave-managed"
+        or classification["pinned"]
+    ):
+        return None
+    action, _reason = _decide(record, now, config)
+    return {
+        "stage": "archive-candidate"
+        if action in {"archive", "archive-candidate"}
+        else "observe",
+        "idle_days": _idle_days(record, now),
+        "stale_marked_at": record.get("stale_marked_at"),
+    }
+
+
 def _command_report(context) -> dict[str, Any]:
     now = _now()
+    config = _load_config()
     usage = _load_usage(context, strict=False)
+    candidates: list[dict[str, Any]] = []
     by_state: dict[str, int] = {"active": 0, "stale": 0, "archived": 0, "untracked": 0}
     by_class: dict[str, int] = {}
     controls = ownership._preload_controls(context)
@@ -1599,6 +1692,9 @@ def _command_report(context) -> dict[str, Any]:
             by_state["untracked"] += 1
         else:
             by_state[record["state"]] += 1
+        candidate = _lifecycle_candidate(record, classification, now, config)
+        if candidate is not None:
+            candidates.append({"name": name, **candidate})
         skills.append(_skill_report(context, name, classification, usage, now))
     recent = sorted(
         (
@@ -1633,7 +1729,8 @@ def _command_report(context) -> dict[str, Any]:
         "last_run_at": (state or {}).get("last_run_at"),
         "run_count": (state or {}).get("run_count", 0),
         "recent_activity": recent,
-        "config": _load_config(),
+        "lifecycle_candidates": candidates,
+        "config": config,
     }
 
 

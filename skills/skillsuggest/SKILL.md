@@ -92,8 +92,9 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
    Rollback archives into `~/.claude/state/skill-autosave-rollback/` (never
    deletes) and refuses skills that lack the `.autosave-meta.json` marker, so
    hand-authored skills are untouchable. Mode switch (owner decision — ask
-   before changing it): `printf auto > "$STATE/skill-autosave.mode"` or export
-   `CCC_SKILL_AUTOSAVE_MODE=auto`; remove/`approve` to restore the human gate.
+   before changing it): `~/.claude/hooks/ccc-skill-autosave.sh set-mode review`
+   restores the human gate (the fleet default since #2011);
+   `set-mode auto` (or exporting `CCC_SKILL_AUTOSAVE_MODE=auto`) opts back in.
 
 2. **Refresh deterministic candidates** (command-shape scan of transcripts):
    ```bash
