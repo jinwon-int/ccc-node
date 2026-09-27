@@ -34,9 +34,8 @@ of the skill's `SKILL.md`, `skill-usage-log.sh`) or a `claude:`-lane
 ### Budget fit for recent skills (#2031)
 
 Describing every recent skill regardless of size left five nodes over the
-estimate after the policy (2026-09-28: gwakga 20,537, gongyung 21,583, yukson
-19,609, sogyo 18,702, daegyo 17,511 chars against 16,000). The policy now fits
-recent skills into the budget:
+estimate after the policy (2026-09-28: 17,511–21,583 chars against 16,000 on
+nodes with 133–284 skills). The policy now fits recent skills into the budget:
 
 1. Fixed costs first: operator entries as written, core skills described,
    everything else name-only. Every recent skill starts as name-only.
