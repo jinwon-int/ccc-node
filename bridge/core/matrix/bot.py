@@ -41,7 +41,7 @@ import time
 import tomllib
 from typing import Any, Awaitable, Callable, Coroutine, Mapping, Optional, Protocol, Sequence
 
-from telegram_bot.core import session_resume, tool_policy
+from telegram_bot.core import restart_handoff, session_resume, tool_policy
 from telegram_bot.core.memory_distill import MemoryDistillMixin
 from telegram_bot.memory.distill_types import DistillTrigger
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
@@ -106,7 +106,7 @@ DIRECT_ROOMS_FILENAME = "matrix-direct-rooms.json"
 SUPPORTED_COMMANDS = frozenset(
     {
         "new", "distill", "model", "effort", "usage", "skills", "stop", "continue",
-        "task_pause", "task_resume", "task_recover", "history", "resume",
+        "task_pause", "task_resume", "task_recover", "history", "resume", "restart",
     }
 )
 _STATUS_HANDLE = 1
@@ -142,7 +142,7 @@ OWNER_ONLY_COMMAND = "🔒 Only the owner may use this command here."
 _OWNER_ONLY_COMMANDS = frozenset(
     {
         "resume", "history", "model", "effort", "distill", "usage", "continue",
-        "task_pause", "task_resume", "task_recover",
+        "task_pause", "task_resume", "task_recover", "restart",
     }
 )
 # #2001: files an answer names are sent after it, at most this many per turn.
@@ -216,7 +216,7 @@ class TransportPort(Protocol):
 
     async def close(self) -> None: ...
 
-    def enqueue_notice(self, room_id: str, text: str) -> None: ...
+    def enqueue_notice(self, room_id: str, text: str, *, key: str | None = None) -> None: ...
 
     def room_kind(self, room_id: str) -> str: ...
 
@@ -745,7 +745,51 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         stall_probe = self._build_turn_stall_probe()
         if stall_probe is not None:
             stop_driven.append(("matrix-turn-stall-probe", lambda: stall_probe.run(stop)))
+        if str(getattr(self._settings, "restart_handoff", "off")) == "systemd":
+            stop_driven.append(("matrix-restart-receipt", lambda: self._restart_receipt_loop(stop)))
         return cancel_on_stop, stop_driven
+
+    async def _restart_receipt_loop(self, stop: asyncio.Event) -> None:
+        """Deliver a terminal restart receipt to the owner's direct room (#2003).
+
+        Mirrors ``bot_lifecycle._restart_receipt_loop``: poll ``read_receipt``
+        every 2s; on a terminal state send ``✅``/``❌`` to the chat that asked
+        for the restart and archive the receipt so the next request can start.
+        A room the id map cannot reverse (or a delivery error) keeps the
+        receipt pending for the next poll; the ``request_id`` enqueue key
+        keeps a retry from queueing the notice twice.
+        """
+
+        while not stop.is_set():
+            try:
+                receipt = await asyncio.to_thread(restart_handoff.read_receipt, self._data_dir())
+                if receipt and receipt.get("state") in restart_handoff.TERMINAL_STATES:
+                    request_id = str(receipt.get("request_id", ""))
+                    if receipt["state"] == "completed":
+                        text = (
+                            f"✅ Bridge restart completed ({request_id[:8]}). "
+                            f"New PID: {receipt.get('new_pid', 'unknown')}."
+                        )
+                    else:
+                        text = (
+                            f"❌ Bridge restart failed ({request_id[:8]}): "
+                            f"{receipt.get('reason_code', 'worker_error')}."
+                        )
+                    delivered = self._deliver_notice(
+                        int(receipt["chat_id"]), text, key=f"restart-receipt-{request_id}"
+                    )
+                    if delivered:
+                        await asyncio.to_thread(
+                            restart_handoff.archive_receipt, self._data_dir(), request_id
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Restart receipt delivery deferred: %s", type(exc).__name__)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                pass
 
     @staticmethod
     async def _run_until_stop(
@@ -1033,12 +1077,18 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return matrix_id
         return self._direct_room_map().room_for(matrix_id)
 
-    def _deliver_notice(self, chat_id: int, text: str) -> bool:
+    def _deliver_notice(self, chat_id: int, text: str, *, key: str | None = None) -> bool:
         transport = self._transport
         room = self.room_for_chat(chat_id)
         if transport is None or room is None:
             return False
-        transport.enqueue_notice(room, text)
+        if key is None:
+            transport.enqueue_notice(room, text)
+        else:
+            try:
+                transport.enqueue_notice(room, text, key=key)
+            except TypeError:  # transport without the key parameter
+                transport.enqueue_notice(room, text)
         return True
 
     async def async_completion_sender(self, user_id: int, chat_id: int, text: str) -> bool:
@@ -1820,6 +1870,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                 return await self._cmd_skills(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink, turn_marker=str(job.get("event_id") or ""))
             if command == "task_resume":
                 return await self._cmd_task_resume(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink)
+            if command == "restart":
+                return _turn_result(
+                    await self._cmd_restart(user_id=user_id, chat_id=chat_id, room_kind=room_kind),
+                    None,
+                )
             if command is not None:
                 text = await self._run_command(command, args, user_id=user_id, chat_id=chat_id)
                 return _turn_result(text, None)
@@ -2741,6 +2796,35 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         if shown:
             return ""
         return "현재 복구할 작업이 없거나 실행 중이라 기록을 읽을 수 없습니다. 잠시 후 다시 확인해 주세요."
+
+    async def _cmd_restart(self, *, user_id: int, chat_id: int, room_kind: str) -> str:
+        """``/restart``: owner-only safe restart via the systemd handoff (#2003).
+
+        Mirrors ``bot_commands._cmd_restart``: the owner's direct chat plus the
+        ``restart_handoff == "systemd"`` opt-in schedules a ``systemd-run``
+        worker that replaces this process; the receipt loop reports the
+        outcome once the replacement bridge is healthy.
+        """
+
+        if room_kind != "direct" or str(getattr(self._settings, "restart_handoff", "off")) != "systemd":
+            return (
+                "⛔ Safe restart is unavailable. It requires systemd opt-in and "
+                "a private chat with the sole allowlisted owner."
+            )
+        try:
+            scheduled = await asyncio.to_thread(
+                restart_handoff.schedule_restart,
+                data_dir=self._data_dir(),
+                chat_id=chat_id,
+                unit=str(getattr(self._settings, "restart_service_unit", "") or ""),
+                delay_seconds=int(getattr(self._settings, "restart_delay_seconds", 10)),
+            )
+        except restart_handoff.RestartHandoffError as exc:
+            return f"❌ Restart was not scheduled ({exc.code}). The bridge is still running."
+        return (
+            f"♻️ Restart scheduled ({scheduled.request_id[:8]}). "
+            "I will report when the replacement bridge is healthy."
+        )
 
     async def _cmd_task_resume(self, *, user_id: int, chat_id: int, room_id: str, sink: TurnSink) -> Any:
         """``/task_resume``: explicit no-prompt resume of the stored Danso journal."""

@@ -31,7 +31,7 @@ SCHEMA_VERSION = 1
 MAX_RECEIPT_BYTES = 8192
 ACTIVE_TTL_SECONDS = 300
 TERMINAL_STATES = {"completed", "failed"}
-_UNIT_RE = re.compile(r"ccc-telegram-bridge(?:-[A-Za-z0-9_.@:-]+)?\.service\Z")
+_UNIT_RE = re.compile(r"ccc-(?:telegram|matrix)-bridge(?:-[A-Za-z0-9_.@:-]+)?\.service\Z")
 _RUNNER = Callable[..., subprocess.CompletedProcess[str]]
 
 
