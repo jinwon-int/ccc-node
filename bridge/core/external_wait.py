@@ -541,6 +541,25 @@ class ExternalWaitRegistry:
             return self._read().get(wait_id)
 
 
+def render_waits(records: List[Dict[str, Any]]) -> str:
+    """Channel-neutral listing for ``/waits`` (Telegram and Matrix, #2004)."""
+
+    if not records:
+        return "No external waits registered."
+    lines = []
+    for rec in records:
+        state = rec.get("state")
+        marker = "⏳" if state == STATE_MONITORING else "🏁"
+        lines.append(
+            f"{marker} `{rec.get('wait_id')}` — {rec.get('repo')}#{rec.get('pr_number')}"
+            f" @ {str(rec.get('head_sha') or '')[:8]} · {state}"
+        )
+        summary = str(rec.get("summary") or "").strip()
+        if summary:
+            lines.append(f"   ↳ {summary}")
+    return "External waits (GitHub CI):\n" + "\n".join(lines)
+
+
 # --- active-turn route publication ----------------------------------------------
 
 _active_turns_lock = threading.Lock()
@@ -646,6 +665,7 @@ def resolve_active_route(
 
 
 __all__ = [
+    "render_waits",
     "ACTIVE_ROUTE_TTL_SECONDS",
     "ExternalWaitRegistry",
     "ExternalWaitValidationError",

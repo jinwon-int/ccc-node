@@ -15,7 +15,7 @@ changed versus the family-messenger pilot bot ("fambot"):
 | brain | one Codex process per turn, JSON port | `ProjectChatHandler` in-process (as Telegram) |
 | session | `session_id` per room, cold start each turn | warm `AgentSession` per room |
 | progress | "작업을 시작했습니다" only | typing + interim/status notices + the Telegram session-start banner (`◐ CCC session started (<reason>)…`) whenever a turn opens a fresh provider stream |
-| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) + `/history /resume` (#1895 PR-B) + `/continue` (#1825) + `/restart` (#2003) |
+| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) + `/history /resume` (#1895 PR-B) + `/continue` (#1825) + `/restart` (#2003) + `/waits /cancelwait` (#2004) |
 | output | plain `m.text` | plain `body` + Matrix HTML `formatted_body` |
 | E2EE / trust / room gate | fleet_matrix | same code, ported (fail-closed reasons unchanged) |
 
@@ -454,6 +454,11 @@ frontend now runs the shared `ExternalWaitMonitor` in its serve loop:
   self-job instead of losing the wake.
 - A wait whose session has moved on (`/new`, provider switch) is notified
   only — the stale promise is never injected into a new session (#740).
+
+`/waits` lists and `/cancelwait <wait_id>` cancels waits from this frontend's
+registry (#2004). Both are owner-only (#1955) and scoped to the requester's own
+waits — records without a `user_id` (legacy) included, as on Telegram; a wait
+registered by someone else is reported as not found, never cancelled.
 
 Flags: `CCC_EXTERNAL_WAIT_ENABLED` (default on), `CCC_EXTERNAL_WAIT_RESUME`
 (default on), `CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP` (default 10 continuations

@@ -31,8 +31,8 @@ from telegram.ext import (
 from telegram_bot.core import revert as revert_ops
 from telegram_bot.core import restart_handoff
 from telegram_bot.core.external_wait import (
-    STATE_MONITORING,
     ExternalWaitRegistry,
+    render_waits,
     default_registry_path as external_wait_registry_path,
 )
 from telegram_bot.core.continuation import (
@@ -323,20 +323,7 @@ class BotCommandMixin:
 
     @staticmethod
     def _render_waits(records: list) -> str:
-        if not records:
-            return "No external waits registered."
-        lines = []
-        for rec in records:
-            state = rec.get("state")
-            marker = "⏳" if state == STATE_MONITORING else "🏁"
-            lines.append(
-                f"{marker} `{rec.get('wait_id')}` — {rec.get('repo')}#{rec.get('pr_number')}"
-                f" @ {str(rec.get('head_sha') or '')[:8]} · {state}"
-            )
-            summary = str(rec.get("summary") or "").strip()
-            if summary:
-                lines.append(f"   ↳ {summary}")
-        return "External waits (GitHub CI):\n" + "\n".join(lines)
+        return render_waits(records)
 
     async def _cmd_waits(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """List active and recent external waits (#740), read-only."""
