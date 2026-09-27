@@ -99,6 +99,16 @@ def test_schedule_rejects_active_request_and_invalid_unit(tmp_path: Path) -> Non
         rh.validate_unit("ssh.service")
 
 
+def test_validate_unit_accepts_matrix_bridge_family() -> None:
+    assert rh.validate_unit("ccc-matrix-bridge.service") == "ccc-matrix-bridge.service"
+    assert rh.validate_unit("ccc-matrix-bridge-node-a.service") == "ccc-matrix-bridge-node-a.service"
+    assert rh.validate_unit(" ccc-matrix-bridge-v2.service ") == "ccc-matrix-bridge-v2.service"
+    with pytest.raises(rh.RestartHandoffError, match="invalid_unit"):
+        rh.validate_unit("ssh.service")
+    with pytest.raises(rh.RestartHandoffError, match="invalid_unit"):
+        rh.validate_unit("nginx.service")
+
+
 def test_schedule_does_not_overwrite_an_undelivered_terminal_result(
     tmp_path: Path,
 ) -> None:

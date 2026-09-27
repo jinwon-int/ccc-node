@@ -1,5 +1,22 @@
 # Changelog
 
+- **Matrix frontend gains `/restart` and the restart receipt (#2003).**
+  Telegram's owner-only safe restart had no Matrix counterpart, and the
+  handoff refused to serve it: `restart_handoff.validate_unit` accepted
+  `ccc-telegram-bridge*.service` only. The Matrix frontend now registers
+  `/restart` (owner, direct room, `CCC_BRIDGE_RESTART_HANDOFF=systemd`
+  opt-in): it schedules the same detached `systemd-run` worker — the bridge
+  never restarts its own process — and replies with the 8-hex request id, or
+  ⛔/❌ when the gate or the scheduling refuses. A new
+  `matrix-restart-receipt` background leg (active only under the opt-in)
+  polls the request receipt every 2 s like the Telegram lifecycle loop and
+  delivers the terminal outcome once to the chat that asked — `✅ … New PID:`
+  or `❌ … <reason_code>` — then archives the receipt; an unmappable room or a
+  failed delivery keeps it pending, and the `restart-receipt-<request_id>`
+  enqueue key dedupes retries. `_deliver_notice`/`enqueue_notice` grew an
+  optional idempotency `key` (transports without one fall back). Unit
+  allowlist widened to `ccc-matrix-bridge*.service`; `CCC_BRIDGE_RESTART_UNIT`
+  still resolves empty to `ccc-<channel>-bridge.service`.
 - **Matrix frontend sends the files an answer names (#2001).** Telegram has
   always sent a real deliverable file an answer mentions; Matrix sent nothing.
   The deliverable rule moved to `core/deliverables.py` (Telegram unchanged).

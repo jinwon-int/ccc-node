@@ -7,6 +7,7 @@ replaced by a stub module so ``load_config`` can be exercised lazily.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import sys
@@ -18,6 +19,7 @@ from typing import Any
 import anyio
 import pytest
 
+from telegram_bot.core import restart_handoff
 from telegram_bot.contracts.agent_runtime import ModelInfo
 from telegram_bot.core.approval_contract import build_approval_snapshot
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
@@ -1474,3 +1476,170 @@ async def test_matrix_attachment_is_deleted_when_the_turn_fails(tmp_path: Path, 
     with pytest.raises(RuntimeError, match="provider failed"):
         await bot.run_turn(_media_job(photo), sink=FakeSink(), session_id=None, room_kind="direct")
     assert list((tmp_path / "data" / "matrix-media").iterdir()) == []
+
+
+# --- #2003: /restart command + restart receipt ---------------------------------
+
+_RESTART_TEXT = "♻️ Restart scheduled (deadbeef). I will report when the replacement bridge is healthy."
+_UNAVAILABLE_TEXT = (
+    "⛔ Safe restart is unavailable. It requires systemd opt-in and "
+    "a private chat with the sole allowlisted owner."
+)
+
+
+def _patch_schedule(
+    monkeypatch: pytest.MonkeyPatch, *, outcome: Any = None, error: str | None = None
+) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+
+    def fake(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        if error is not None:
+            raise restart_handoff.RestartHandoffError(error)
+        return outcome
+
+    monkeypatch.setattr(restart_handoff, "schedule_restart", fake)
+    return calls
+
+
+@pytest.mark.anyio
+async def test_restart_schedules_systemd_handoff_for_owner_dm(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bot, chat, _manager = _bot(
+        tmp_path,
+        restart_handoff="systemd",
+        restart_service_unit="ccc-matrix-bridge-test.service",
+        restart_delay_seconds=7,
+    )
+    calls = _patch_schedule(monkeypatch, outcome=SimpleNamespace(request_id="deadbeef" + "cafe" * 4))
+    result = await bot.run_turn(_job("/restart"), sink=FakeSink(), session_id=None, room_kind="direct")
+    assert result.text == _RESTART_TEXT
+    assert len(calls) == 1
+    assert calls[0]["data_dir"] == tmp_path / "data"
+    assert calls[0]["chat_id"] == bot.ids.user_id(OWNER)
+    assert calls[0]["unit"] == "ccc-matrix-bridge-test.service"
+    assert calls[0]["delay_seconds"] == 7
+    assert chat.calls == []  # the restart command never runs the agent
+
+
+@pytest.mark.anyio
+async def test_restart_is_refused_for_non_owner(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telegram_bot.core.matrix.bot import NON_OWNER_TURN_REFUSED
+
+    bot, chat, _manager = _bot(tmp_path, restart_handoff="systemd")
+    calls = _patch_schedule(monkeypatch, outcome=SimpleNamespace(request_id="x"))
+    result = await bot.run_turn(
+        _job("/restart", sender=KID, room=FAMILY_ROOM), sink=FakeSink(), session_id=None, room_kind="family"
+    )
+    assert result.text == NON_OWNER_TURN_REFUSED
+    assert calls == []
+    assert chat.calls == []
+
+
+@pytest.mark.anyio
+async def test_restart_requires_direct_room_and_systemd_optin(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bot, _chat, _manager = _bot(tmp_path, restart_handoff="systemd")
+    calls = _patch_schedule(monkeypatch, outcome=SimpleNamespace(request_id="x"))
+    family = await bot.run_turn(
+        _job("/restart", room=FAMILY_ROOM), sink=FakeSink(), session_id=None, room_kind="family"
+    )
+    off_bot, _off_chat, _off_manager = _bot(tmp_path)  # default restart_handoff='off'
+    dm_without_optin = await off_bot.run_turn(_job("/restart"), sink=FakeSink(), session_id=None, room_kind="direct")
+    assert family.text == _UNAVAILABLE_TEXT
+    assert dm_without_optin.text == _UNAVAILABLE_TEXT
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_restart_reports_handoff_error(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bot, _chat, _manager = _bot(tmp_path, restart_handoff="systemd")
+    _patch_schedule(monkeypatch, error="restart_already_pending")
+    result = await bot.run_turn(_job("/restart"), sink=FakeSink(), session_id=None, room_kind="direct")
+    assert result.text == "❌ Restart was not scheduled (restart_already_pending). The bridge is still running."
+
+
+def _receipt_record(rid: str, chat_id: int, **overrides: Any) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "request_id": rid,
+        "state": "completed",
+        "new_pid": 4242,
+        "unit": "ccc-matrix-bridge-test.service",
+        "chat_id": chat_id,
+        "origin_pid": 111,
+        "created_at": 1.0,
+        "updated_at": 1.0,
+        "user_scope": False,
+    }
+    record.update(overrides)
+    return record
+
+
+async def _run_receipt_once(bot: MatrixBot, transport: FakeTransport | None) -> None:
+    bot._transport = transport
+    stop = asyncio.Event()
+    task = asyncio.create_task(bot._restart_receipt_loop(stop))
+    try:
+        for _ in range(200):
+            if transport is not None and transport.notices:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=5)
+
+
+@pytest.mark.anyio
+async def test_restart_receipt_loop_delivers_then_archives_terminal_receipt(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    rid = "1234567890abcdef" * 2
+    bot, chat, _manager = _bot(tmp_path, restart_handoff="systemd")
+    _patch_schedule(monkeypatch, outcome=SimpleNamespace(request_id=rid))
+    # One direct turn remembers the owner DM in the direct-room map so the
+    # receipt's handler chat_id reverse-maps back to the room.
+    scheduled = await bot.run_turn(_job("/restart"), sink=FakeSink(), session_id=None, room_kind="direct")
+    assert scheduled.text == f"♻️ Restart scheduled ({rid[:8]}). I will report when the replacement bridge is healthy."
+    assert chat.calls == []
+    restart_handoff._write_at(data_dir, restart_handoff.RECEIPT_NAME, _receipt_record(rid, bot.ids.user_id(OWNER)))
+
+    # Undeliverable (no transport): the receipt must stay pending.
+    await _run_receipt_once(bot, None)
+    pending = restart_handoff.read_receipt(data_dir)
+    assert pending is not None and pending["request_id"] == rid
+    assert not (data_dir / restart_handoff.ARCHIVE_NAME).exists()
+
+    # Completed receipt: delivered once with the enqueue key, then archived.
+    transport = FakeTransport(None, None)
+    await _run_receipt_once(bot, transport)
+    assert transport.notices == [
+        (DM_ROOM, f"✅ Bridge restart completed ({rid[:8]}). New PID: 4242.")
+    ]
+    assert transport.notice_keys == [f"restart-receipt-{rid}"]
+    assert restart_handoff.read_receipt(data_dir) is None
+    assert (data_dir / restart_handoff.ARCHIVE_NAME).is_file()
+
+    # Failed receipt: the ❌ body carries the body-free reason code.
+    failed_rid = "fedcba0987654321" * 2
+    restart_handoff._write_at(
+        data_dir,
+        restart_handoff.RECEIPT_NAME,
+        _receipt_record(failed_rid, bot.ids.user_id(OWNER), state="failed", reason_code="systemd_run_rejected"),
+    )
+    transport.notices.clear()
+    transport.notice_keys.clear()
+    await _run_receipt_once(bot, transport)
+    assert transport.notices == [
+        (DM_ROOM, f"❌ Bridge restart failed ({failed_rid[:8]}): systemd_run_rejected.")
+    ]
+    assert transport.notice_keys == [f"restart-receipt-{failed_rid}"]
+    assert restart_handoff.read_receipt(data_dir) is None
+    assert (data_dir / restart_handoff.ARCHIVE_NAME).is_file()

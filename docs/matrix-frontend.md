@@ -15,7 +15,7 @@ changed versus the family-messenger pilot bot ("fambot"):
 | brain | one Codex process per turn, JSON port | `ProjectChatHandler` in-process (as Telegram) |
 | session | `session_id` per room, cold start each turn | warm `AgentSession` per room |
 | progress | "작업을 시작했습니다" only | typing + interim/status notices + the Telegram session-start banner (`◐ CCC session started (<reason>)…`) whenever a turn opens a fresh provider stream |
-| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) + `/history /resume` (#1895 PR-B) + `/continue` (#1825) |
+| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) + `/history /resume` (#1895 PR-B) + `/continue` (#1825) + `/restart` (#2003) |
 | output | plain `m.text` | plain `body` + Matrix HTML `formatted_body` |
 | E2EE / trust / room gate | fleet_matrix | same code, ported (fail-closed reasons unchanged) |
 
@@ -489,12 +489,34 @@ outbox (`core/matrix/lifecycle.py`; the channel-neutral loops live in
 
 Not rebuilt, deliberately:
 
-- **Restart handoff / receipt** — the receipt only exists after `/restart`,
-  which Matrix does not offer, and `restart_handoff.validate_unit` accepts
-  `ccc-telegram-bridge*.service` only. Adding it is a command change.
 - **"⏳ Working" heartbeat sweep** — Telegram deletes status messages a killed
   run left frozen. The Matrix status bubble belongs to the transport, which
   already closes an interrupted turn with `NOTICE_RESTARTED` on restart.
+
+## /restart and the restart receipt (#2003)
+
+`/restart` is the owner-only safe restart, mirroring Telegram's
+`bot_commands._cmd_restart`: it schedules an external `systemd-run` transient
+worker that waits out the delay and replaces the bridge process — the bridge
+never restarts itself. It needs the owner's direct room and the
+`CCC_BRIDGE_RESTART_HANDOFF=systemd` opt-in; anything else answers ⛔. On
+success it replies `♻️ Restart scheduled (<id8>). I will report when the
+replacement bridge is healthy.`; a scheduling failure answers ❌ with the
+machine reason (e.g. `restart_already_pending`) and leaves the bridge running.
+The unit is `CCC_BRIDGE_RESTART_UNIT` (empty resolves to
+`ccc-matrix-bridge.service`; `restart_handoff.validate_unit` now accepts
+`ccc-matrix-bridge*.service` alongside the Telegram units) and the delay is
+`CCC_BRIDGE_RESTART_DELAY_SECONDS` (5-30 s).
+
+While the opt-in is active a `matrix-restart-receipt` background leg polls the
+receipt every 2 s (like `bot_lifecycle._restart_receipt_loop`): on a terminal
+state it delivers `✅ Bridge restart completed (<id8>). New PID: <pid>.` or
+`❌ Bridge restart failed (<id8>): <reason>.` exactly once to the chat that
+asked, reverse-mapped through the direct-room map, and archives the receipt so
+the next `/restart` can start. A room the map cannot reverse or a failed
+delivery keeps the receipt pending for the next poll; the
+`restart-receipt-<request_id>` enqueue key keeps a retry from posting the
+notice twice.
 
 ## Grok (`CCC_AGENT_PROVIDER=grok`) — owner direct room, opt-in family rooms
 
