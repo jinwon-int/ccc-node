@@ -383,10 +383,16 @@ ok "--fix --apply --scope=files repairs allowlisted files" '[ "$rc" = 0 ] && gre
 ok "file repair restores missing hook" 'cmp -s "$ROOT/claude/hooks/statusline.sh" "$files/home/.claude/hooks/statusline.sh"'
 ok "file repair restores output style drift" 'cmp -s "$ROOT/claude/output-styles/ccc-report.md" "$files/home/.claude/output-styles/ccc-report.md"'
 # #1481: hook reinstall is atomic too — no temp residue, source mode carried over.
+# The mode source is the doctor's actual repair source, CCC_DOCTOR_REPO_DIR
+# (the fixture's repo tree) — not $ROOT. make_fixture's plain `cp` applies the
+# running umask, so under a restrictive umask the repo-side copy's mode
+# legitimately differs from $ROOT's checkout mode and comparing against $ROOT
+# made this test fail on any node whose checkout predates that umask (#2021).
+# The repaired file must carry exactly the mode of the tree installed from.
 ok "file repair leaves no temp file behind" \
   '! find "$files/home/.claude/hooks" "$files/home/.claude/output-styles" -name ".*.tmp" | grep -q .'
 ok "file repair keeps the repo hook mode" \
-  '[ "$(stat -c %a "$files/home/.claude/hooks/statusline.sh")" = "$(stat -c %a "$ROOT/claude/hooks/statusline.sh")" ]'
+  '[ "$(stat -c %a "$files/home/.claude/hooks/statusline.sh")" = "$(stat -c %a "$files/repo/claude/hooks/statusline.sh")" ]'
 ok "file repair creates scoped backup tar" 'find "$files/home/.claude/backups" -name "ccc-doctor-files-*.tar.gz" | grep -q .'
 # shellcheck disable=SC2034  # backup_count_before is read via eval inside ok()
 backup_count_before="$(find "$files/home/.claude/backups" -name "ccc-doctor-files-*.tar.gz" | wc -l)"
