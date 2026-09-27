@@ -1,5 +1,13 @@
 # Changelog
 
+- **Matrix health-tick tests wait for ticks instead of a fixed window (#2008).**
+  `test_health_tick_survives_reporter_errors_and_missing_snapshots` required
+  two `record_workload` ticks inside a fixed 50 ms transport window and failed
+  a merge-queue group on a loaded runner (`assert (1 >= 2)`, bridge-tests
+  3.11); the sibling serve test used an 80 ms window. Both now keep the
+  transport leg alive until the ticks land, bounded at 5 s. A loop that stops
+  after a failing tick still fails the test. Test-only change.
+
 - **Matrix approval prompts no longer post raw provider arguments (#1959).**
   The Matrix room sink posted `description + json.dumps(arguments)`, so a
   command carrying a token, password or patch body reached the room verbatim,
