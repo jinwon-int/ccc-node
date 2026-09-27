@@ -367,10 +367,33 @@ Each refusal also bumps a body-free counter in the inbox meta
 `ignored_messages` (`{reason: count, room, updated}`). Stale events, bots and
 family chatter that does not address the bot stay silent as before.
 
+## Live answer preview (#1796, opt-in)
+
+`CCC_MATRIX_STREAMING=1` (default **off**, like Telegram's
+`CCC_TELEGRAM_STREAMING`) streams the answer-in-progress into the turn's
+progress bubble — the same one-per-turn bubble the heartbeat uses: edited in
+place (`m.replace`) while it is the newest event, reposted at the bottom when
+buried. Edits are throttled by `CCC_MATRIX_DRAFT_EDIT_INTERVAL_S` (default 2 s,
+clamped 1–60). The bubble shows the last 3 tool *names* (never arguments) and
+the tail (≤ 3,000 chars) of the current message.
+
+It is a preview, not the delivery (`core/matrix/streaming.py`):
+
+- completed intermediate messages go out through the durable interim path,
+  exactly as without the preview, and the bubble is cleared;
+- at the end of the turn the bubble is cleared and the final answer is
+  delivered through the durable outbox (`streamed` stays false), so a crash
+  or a failed edit can never lose it;
+- heartbeat texts are held back while the preview shows.
+
+Next stage (not yet): deliver the final answer *as* the last edit of the
+draft through the outbox, which needs the outbox to record sent event ids.
+
 ## Not yet
 
 - Voice transcription for `m.audio` (handled as a file today).
-- Draft edits (`m.replace`) for streamed text — interim notices only.
+- Draft edits (`m.replace`) for streamed text: **opt-in preview only** (#1796, below);
+  the final answer is still a separate message, not the edited draft.
 - Approval buttons: approvals are `/approve <turn> <nonce>` replies in the
   room, exactly as the pilot. The prompt is the same redacted,
   provider-neutral snapshot Telegram shows (`build_approval_snapshot`:
