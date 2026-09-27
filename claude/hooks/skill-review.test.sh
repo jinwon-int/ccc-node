@@ -80,7 +80,7 @@ if [ -n "${CLAUDE_TOOL_ENV_SNAPSHOT:-}" ]; then
   printf '<%s>\n' "${CCC_ALLOWED_TOOLS-unset}" > "$CLAUDE_TOOL_ENV_SNAPSHOT"
 fi
 cat <<'JSON'
-{"skill_candidates":[{"name":"deploy-checklist","category":"ops","summary":"Capture a recurring deploy checklist.","reason":"The transcript repeats a multi-step deploy verification flow.","evidence_excerpt":"automate recurring deploy checklist","skill_md":"---\nname: deploy-checklist\ndescription: Capture deploy checklist procedures.\n---\n\n# Deploy Checklist\n\n## When to Use\n- Use when deploy verification repeats.\n\n## Procedure\n1. Inspect git state.\n2. Run the verified checklist.\n\n## Safety\n- Never store raw secrets.\n\n## Verification\n- Confirm the checklist output is recorded.\n"}]}
+{"skill_candidates":[{"name":"deploy-checklist","category":"ops","summary":"Capture a recurring deploy checklist.","reason":"The transcript repeats a multi-step deploy verification flow.","evidence_excerpt":"automate recurring deploy checklist","skill_md":"---\nname: deploy-checklist\ndescription: Use when capturing deploy checklist procedures.\n---\n\n# Deploy Checklist\n\n## When to Use\n- Use when deploy verification repeats.\n\n## Procedure\n1. Inspect git state.\n2. Run the verified checklist.\n\n## Safety\n- Never store raw secrets.\n\n## Verification\n- Confirm the checklist output is recorded.\n"}]}
 JSON
 SH
 chmod +x "$TMP/bin/claude"
@@ -188,7 +188,7 @@ write_exec_stub "$TMP/bin-llm/fake-llm" <<SH
 cat > "$LLM_SNAPSHOT"
 printf '%s\\n' "\$@" > "$LLM_ARGS_SNAPSHOT"
 cat <<'JSON'
-{"skill_candidates":[{"name":"neutral-probe","category":"piri","summary":"Probe emitted by the neutral LLM command.","reason":"Synthetic fixture response.","evidence_excerpt":"fixture","skill_md":"---\nname: neutral-probe\ndescription: Probe skill emitted by the fake neutral LLM command fixture.\n---\n\n# Neutral Probe\n\n## When to Use\n- Never; this is a fixture.\n\n## Procedure\n1. Emit.\n\n## Safety\n- No secrets.\n\n## Verification\n- Fixture only.\n"}]}
+{"skill_candidates":[{"name":"neutral-probe","category":"piri","summary":"Probe emitted by the neutral LLM command.","reason":"Synthetic fixture response.","evidence_excerpt":"fixture","skill_md":"---\nname: neutral-probe\ndescription: Use when probing the skill emitted by the fake neutral LLM command fixture.\n---\n\n# Neutral Probe\n\n## When to Use\n- Never; this is a fixture.\n\n## Procedure\n1. Emit.\n\n## Safety\n- No secrets.\n\n## Verification\n- Fixture only.\n"}]}
 JSON
 SH
 chmod +x "$TMP/bin-llm/fake-llm"
@@ -209,6 +209,14 @@ ok "LLM_CMD argv is shlex-split (flags reach the command)" \
 ok "prompt is provider-routed (category=piri)" 'grep -q '\''"category": "piri"'\'' "$LLM_SNAPSHOT"'
 ok "prompt drops the Claude-node framing" '! grep -q "Claude Code node" "$LLM_SNAPSHOT"'
 ok "prompt forbids runtime couplings in drafts" 'grep -q "never write" "$LLM_SNAPSHOT" && grep -q "agent CLI" "$LLM_SNAPSHOT"'
+# fleet-skills#315/#316: descriptions must lead with the trigger, or the draft
+# is blocked at install (lint description-trigger) and at promotion.
+ok "prompt requires a trigger-first description" \
+  'grep -q "MUST START with the trigger" "$LLM_SNAPSHOT" && grep -q "\"Use when <situation> ...\"" "$LLM_SNAPSHOT" && grep -q "할 때 사용" "$LLM_SNAPSHOT" && grep -q "at most 300 characters" "$LLM_SNAPSHOT"'
+ok "prompt asks for a general name and an overlap check against existing skills" \
+  'grep -q "general, reusable capability name" "$LLM_SNAPSHOT" && grep -q "Check the existing skills list" "$LLM_SNAPSHOT" && grep -q "near-duplicate" "$LLM_SNAPSHOT"'
+ok "neutral fixture draft itself satisfies the trigger lint" \
+  'jq -r ".skill_candidates[0].skill_md" "$TMP/llm-out.json" | grep "^description:" | sed "s/^description: //" | python3 "$HERE/skill-review/description_trigger.py" check'
 
 # meta.json records the staging provider so autoinstall (#1655) and promotion
 # can route per-draft without guessing from the process environment.

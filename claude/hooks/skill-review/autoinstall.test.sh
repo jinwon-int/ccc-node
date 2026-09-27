@@ -63,7 +63,7 @@ make_draft() { # <id> <name> <description> [body]
 }
 
 # --- 1) approve mode (default): run is a strict no-op --------------------------
-make_draft 20260101-000000-a-clean-one clean-one "Capture the recurring release verification checklist procedure."
+make_draft 20260101-000000-a-clean-one clean-one "Use when capturing the recurring release verification checklist procedure."
 out="$(run_auto bash "$AUTO" run)"
 ok "approve mode reports skipped" 'jq -e ".skipped == \"mode\"" >/dev/null <<<"$out"'
 ok "approve mode installs nothing" '[ ! -e "$SKILLS/clean-one" ]'
@@ -83,17 +83,21 @@ ok "notification carries dedup key" 'jq -r ".dedup" "$SPOOL"/*SkillAutoInstall*.
 
 # mode via state file (no env) behaves the same
 printf 'auto\n' > "$STATE/skill-autosave.mode"
-make_draft 20260101-000001-b-mode-file mode-file-skill "Summarize the recurring dependency upgrade triage workflow for the node."
+make_draft 20260101-000001-b-mode-file mode-file-skill "Use when summarizing the recurring dependency upgrade triage workflow for the node."
 out="$(run_auto bash "$AUTO" run)"
 ok "mode state file enables auto" '[ -f "$SKILLS/mode-file-skill/SKILL.md" ]'
 rm -f "$STATE/skill-autosave.mode"
 
 # Provenance failure removes only the exclusively-created install directory,
 # leaves the draft pending, and never publishes an install ledger row.
-make_draft 20260101-000001-c-provenance provenance-fail "Capture the recurring provenance failure recovery procedure."
+make_draft 20260101-000001-c-provenance provenance-fail "Use when capturing the recurring provenance failure recovery procedure."
 mkdir -p "$TMP/fail-bin"
-cat > "$TMP/fail-bin/python3" <<'STUB'
+# The stub fails only the ownership tool; the description-trigger lint helper
+# still runs on the real interpreter so the draft reaches the install step.
+REAL_PY3="$(command -v python3)"
+cat > "$TMP/fail-bin/python3" <<STUB
 #!/bin/sh
+case "\$1" in */description_trigger.py) exec "$REAL_PY3" "\$@" ;; esac
 printf '%s\n' '{"ok": false, "code": "stubbed_unsafe_skills_root"}'
 exit 2
 STUB
@@ -106,7 +110,7 @@ rm -rf "$PENDING/20260101-000001-c-provenance"
 
 # Unsafe skills root (#1415): a group/other-writable root is caught up front
 # with an actionable skip — no per-draft install churn, draft stays pending.
-make_draft 20260101-000001-d-unsafe-root unsafe-root-skill "Track the recurring unsafe skills root remediation procedure."
+make_draft 20260101-000001-d-unsafe-root unsafe-root-skill "Use when tracking the recurring unsafe skills root remediation procedure."
 chmod 775 "$SKILLS"
 out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "unsafe skills root skips the sweep" 'jq -e ".skipped == \"unsafe-skills-root\"" >/dev/null <<<"$out"'
@@ -118,7 +122,7 @@ rm -rf "$PENDING/20260101-000001-d-unsafe-root"
 # --- 3) secret drafts are blocked and stay pending ------------------------------
 : > "$STATE/skill-autosave-install.jsonl"
 find "$SPOOL" -type f -delete 2>/dev/null
-make_draft 20260101-000002-c-leaky leaky-skill "Automate the recurring token rotation procedure for the deploy pipeline." \
+make_draft 20260101-000002-c-leaky leaky-skill "Use when automating the recurring token rotation procedure for the deploy pipeline." \
 "# Leaky
 
 ## Procedure
@@ -151,7 +155,7 @@ ok "still-blocked draft reported but not newly" 'jq -e "(.blocked | length == 1)
 # corpus, and the block is terminal: the draft never installs, and one of the
 # two had already been judged worth keeping.
 make_draft 20260101-000009-a-riskword disk-usage-diagnosis-and-planning \
-  "Diagnose the recurring disk-usage growth and rank risk-driven cleanup options."
+  "Use when diagnosing the recurring disk-usage growth and rank risk-driven cleanup options."
 out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "word containing sk- is not blocked as an api key" \
   '[ ! -f "$PENDING/20260101-000009-a-riskword/autosave-block.json" ]'
@@ -161,7 +165,7 @@ ok "draft named with sk- inside a word installs" \
 # ...while a real key in the same position is still caught. Widening a secret
 # pattern is a loosening, so pin the detection it must keep.
 make_draft 20260101-000010-a-realkey real-key-skill \
-  "Automate the recurring provider key rotation procedure for the pipeline." \
+  "Use when automating the recurring provider key rotation procedure for the pipeline." \
 "# Real key
 
 ## Procedure
@@ -178,7 +182,7 @@ ok "api-key block marker never quotes the secret" \
   '! grep -q "sk-abcdefghij" "$PENDING/20260101-000010-a-realkey/autosave-block.json"'
 
 # --- 4) node-specific facts are blocked -----------------------------------------
-make_draft 20260101-000003-d-nodefact node-fact-skill "Capture the recurring log inspection procedure used across sessions." \
+make_draft 20260101-000003-d-nodefact node-fact-skill "Use when capturing the recurring log inspection procedure used across sessions." \
 "# Node fact
 
 ## Procedure
@@ -190,7 +194,7 @@ make_draft 20260101-000003-d-nodefact node-fact-skill "Capture the recurring log
 run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "home-path draft blocked" '[ ! -e "$SKILLS/node-fact-skill" ] && jq -e ".reason | startswith(\"node-specific\")" "$PENDING/20260101-000003-d-nodefact/autosave-block.json" >/dev/null'
 
-make_draft 20260101-000004-e-ip ip-skill "Document the recurring service health check flow for operators here." \
+make_draft 20260101-000004-e-ip ip-skill "Use when documenting the recurring service health check flow for operators here." \
 "# IP
 
 ## Procedure
@@ -202,7 +206,7 @@ make_draft 20260101-000004-e-ip ip-skill "Document the recurring service health 
 run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "non-loopback IP blocked" 'jq -e ".reason == \"node-specific ipv4\"" "$PENDING/20260101-000004-e-ip/autosave-block.json" >/dev/null'
 
-make_draft 20260101-000005-f-local localhost-ok-skill "Verify the recurring local bridge smoke test procedure end to end." \
+make_draft 20260101-000005-f-local localhost-ok-skill "Use when verifying the recurring local bridge smoke test procedure end to end." \
 "# Localhost is node-agnostic
 
 ## Procedure
@@ -215,13 +219,42 @@ run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "loopback IP is allowed" '[ -f "$SKILLS/localhost-ok-skill/SKILL.md" ]'
 
 # --- 5) lint gate ----------------------------------------------------------------
-make_draft 20260101-000006-g-badname Bad_Name "Capture the recurring formatting cleanup procedure for the repository."
+make_draft 20260101-000006-g-badname Bad_Name "Use when capturing the recurring formatting cleanup procedure for the repository."
 run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "non-kebab name blocked" 'jq -e ".reason == \"lint name-not-kebab\"" "$PENDING/20260101-000006-g-badname/autosave-block.json" >/dev/null'
 
 make_draft 20260101-000007-h-shortdesc short-desc-skill "Too short."
 run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "short description blocked" 'jq -e ".reason == \"lint description-too-short\"" "$PENDING/20260101-000007-h-shortdesc/autosave-block.json" >/dev/null'
+
+# Trigger-first description (fleet-skills#315/#316): a description that never
+# says WHEN to use the skill fails promotion, so the install lint blocks it too.
+make_draft 20260101-000007-h2-notrigger no-trigger-skill "Capture the recurring formatting cleanup procedure for the repository."
+run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
+ok "description without trigger wording blocked" 'jq -e ".reason == \"lint description-trigger\"" "$PENDING/20260101-000007-h2-notrigger/autosave-block.json" >/dev/null'
+ok "trigger-less draft stays pending, not installed" '[ -d "$PENDING/20260101-000007-h2-notrigger" ] && [ ! -e "$SKILLS/no-trigger-skill" ]'
+
+# Direct gate_lint checks over the shared regex (description_trigger.py).
+# Sourced like gate-sim.sh: the `status` verb is read-only.
+lint_desc() { # <description> -> gate_lint verdict ("PASS" or the lint reason)
+  local f="$TMP/lint-desc.SKILL.md" v
+  printf -- '---\nname: lint-probe\ndescription: %s\n---\n\n# Probe\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n' "$1" > "$f"
+  v="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_PUSH_SPOOL="$SPOOL" \
+    bash -c '. "$1" status >/dev/null 2>&1; gate_lint "$2"' _ "$AUTO" "$f")" && v=PASS
+  printf '%s' "$v"
+}
+ok "Use when ... passes the trigger lint" '[ "$(lint_desc "Use when a release checklist must be re-verified before tagging.")" = PASS ]'
+ok "leading When ... passes the trigger lint" '[ "$(lint_desc "When a release checklist must be re-verified, walk it step by step.")" = PASS ]'
+ok "Korean 할 때 사용 passes the trigger lint" '[ "$(lint_desc "릴리스 체크리스트를 다시 검증할 때 사용. 단계별로 확인한다.")" = PASS ]'
+ok "Korean 시 적용 passes the trigger lint" '[ "$(lint_desc "릴리스 태그 생성 시 적용하는 체크리스트 검증 절차.")" = PASS ]'
+ok "quoted description is unquoted before matching" '[ "$(lint_desc "\"Use when a release checklist must be re-verified.\"")" = PASS ]'
+ok "what-only description is blocked" '[ "$(lint_desc "Walk the recurring release checklist and record the output.")" = "lint description-trigger" ]'
+ok "Korean 때문 is not trigger wording" '[ "$(lint_desc "설정이 바뀌었기 때문에 체크리스트를 다시 검증하는 절차.")" = "lint description-trigger" ]'
+ok "mid-sentence 'used when' is not trigger wording" '[ "$(lint_desc "Release checklist procedure used when tagging goes wrong.")" = "lint description-trigger" ]'
+mkdir -p "$TMP/trigger-err-bin"
+printf '#!/bin/sh\nexit 3\n' > "$TMP/trigger-err-bin/python3"
+chmod +x "$TMP/trigger-err-bin/python3"
+ok "helper failure fails closed as unverifiable" '[ "$(PATH="$TMP/trigger-err-bin:$PATH" lint_desc "Use when a release checklist must be re-verified.")" = "lint description-trigger-unverifiable" ]'
 
 mkdir -p "$PENDING/20260101-000008-i-nofm"
 printf '# no frontmatter\njust text\n' > "$PENDING/20260101-000008-i-nofm/SKILL.md"
@@ -234,7 +267,7 @@ ok "missing frontmatter blocked" 'jq -e ".reason == \"lint no-frontmatter\"" "$P
 big="$PENDING/20260101-000009-j-bigbody"
 mkdir -p "$big"
 {
-  printf -- '---\nname: big-body-skill\ndescription: Exercise the progressive disclosure size gate with an oversized body.\n---\n\n# Big\n\n'
+  printf -- '---\nname: big-body-skill\ndescription: Use when exercising the progressive disclosure size gate with an oversized body.\n---\n\n# Big\n\n'
   seq -f 'Filler line %g.' 1 501
 } > "$big/SKILL.md"
 big_out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run 2>&1)"
@@ -258,7 +291,7 @@ fi
 edge="$PENDING/20260101-000010-k-edgebody"
 mkdir -p "$edge"
 {
-  printf -- '---\nname: edge-body-skill\ndescription: Sit exactly at the progressive disclosure limit and stay installable.\n---\n\n# Edge\n\n'
+  printf -- '---\nname: edge-body-skill\ndescription: Use when sitting exactly at the progressive disclosure limit and stay installable.\n---\n\n# Edge\n\n'
   seq -f 'Filler line %g.' 1 493
 } > "$edge/SKILL.md"
 edge_out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run 2>&1)"
@@ -275,7 +308,7 @@ fi
 wide="$PENDING/20260101-000011-l-widebody"
 mkdir -p "$wide"
 {
-  printf -- '---\nname: wide-body-skill\ndescription: Long lines below the limit must not trip the heading check.\n---\n\n# Wide\n\n'
+  printf -- '---\nname: wide-body-skill\ndescription: Use when long lines below the limit must not trip the heading check.\n---\n\n# Wide\n\n'
   seq -f 'Filler line %g. abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz' 1 493
 } > "$wide/SKILL.md"
 run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOSAVE_DAILY_CAP=99 bash "$AUTO" run >/dev/null
@@ -289,7 +322,7 @@ ok "body larger than the pipe buffer still passes the heading lint (#1399)" \
 huge="$PENDING/20260101-000012-m-hugebody"
 mkdir -p "$huge"
 {
-  printf -- '---\nname: huge-body-skill\ndescription: A megabyte of body must be judged by the size gate, not misread as headingless.\n---\n\n# Huge\n\n'
+  printf -- '---\nname: huge-body-skill\ndescription: Use when a megabyte of body must be judged by the size gate, not misread as headingless.\n---\n\n# Huge\n\n'
   seq -f 'Filler line %g. abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz' 1 5000
 } > "$huge/SKILL.md"
 run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOSAVE_DAILY_CAP=99 bash "$AUTO" run >/dev/null
@@ -302,20 +335,20 @@ mkdir -p "$long_compat"
 {
   printf -- '---\nname: long-compat-skill\n'
   printf 'compatibility: %s\n' "$(printf 'Requires %s ' $(seq 1 120))"
-  printf -- 'description: Exercise the optional compatibility field length lint.\n---\n\n# Compat\n\n1. Step.\n2. Step.\n3. Step.\n'
+  printf -- 'description: Use when exercising the optional compatibility field length lint.\n---\n\n# Compat\n\n1. Step.\n2. Step.\n3. Step.\n'
 } > "$long_compat/SKILL.md"
 run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "over-long compatibility field blocked" 'jq -e ".reason == \"lint compatibility-too-long\"" "$PENDING/20260101-000011-l-longcompat/autosave-block.json" >/dev/null'
 
 # --- 6) dedup gate ----------------------------------------------------------------
 mkdir -p "$SKILLS/existing-skill"
-printf -- '---\nname: existing-skill\ndescription: Run the recurring wiki record procedure for durable decisions.\n---\n\n# Existing\n' \
+printf -- '---\nname: existing-skill\ndescription: Use when running the recurring wiki record procedure for durable decisions.\n---\n\n# Existing\n' \
   > "$SKILLS/existing-skill/SKILL.md"
-make_draft 20260101-000009-j-dupname existing-skill "Another take on the wiki record procedure with different wording entirely."
+make_draft 20260101-000009-j-dupname existing-skill "Use when taking another pass at the wiki record procedure with different wording entirely."
 run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "existing name blocked (never overwrite)" 'jq -e ".reason | startswith(\"dedup already-exists\")" "$PENDING/20260101-000009-j-dupname/autosave-block.json" >/dev/null'
 
-make_draft 20260101-000010-k-dupdesc wiki-recorder "Run the recurring wiki record procedure for durable decisions."
+make_draft 20260101-000010-k-dupdesc wiki-recorder "Use when running the recurring wiki record procedure for durable decisions."
 run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "similar description blocked" 'jq -e ".reason | startswith(\"dedup description-similar\")" "$PENDING/20260101-000010-k-dupdesc/autosave-block.json" >/dev/null'
 
@@ -326,8 +359,8 @@ chmod 700 "$CAP_STATE"
 chmod 700 "$CAP_SKILLS"  # contract-compliant root under any umask (#770)
 PENDING_SAVE="$PENDING"; STATE_SAVE="$STATE"; SKILLS_SAVE="$SKILLS"
 STATE="$CAP_STATE"; SKILLS="$CAP_SKILLS"; PENDING="$CAP_STATE/pending-skills"
-make_draft 20260101-000011-l-cap1 cap-one "Capture the first recurring maintenance procedure for the fleet nodes."
-make_draft 20260101-000012-m-cap2 cap-two "Capture the second recurring maintenance procedure for backup checks."
+make_draft 20260101-000011-l-cap1 cap-one "Use when capturing the first recurring maintenance procedure for the fleet nodes."
+make_draft 20260101-000012-m-cap2 cap-two "Use when capturing the second recurring maintenance procedure for backup checks."
 out="$(CCC_SKILL_REVIEW_STATE_DIR="$CAP_STATE" CLAUDE_SKILLS_DIR="$CAP_SKILLS" CCC_PUSH_SPOOL="$CAP_SPOOL" \
   CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOSAVE_DAILY_CAP=1 bash "$AUTO" run)"
 ok "cap installs only one" '[ "$(find "$CAP_SKILLS" -name SKILL.md | wc -l | tr -d "[:space:]")" = 1 ]'
@@ -337,7 +370,7 @@ STATE="$STATE_SAVE"; SKILLS="$SKILLS_SAVE"; PENDING="$PENDING_SAVE"
 
 # --- 8) off-switch wins over auto mode ----------------------------------------------
 touch "$STATE/skill-autosave.disabled"
-make_draft 20260101-000013-n-off off-switch-skill "Capture the recurring certificate renewal check procedure for services."
+make_draft 20260101-000013-n-off off-switch-skill "Use when capturing the recurring certificate renewal check procedure for services."
 out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "off-switch skips auto install" 'jq -e ".skipped == \"disabled\"" >/dev/null <<<"$out" && [ ! -e "$SKILLS/off-switch-skill" ]'
 rm -f "$STATE/skill-autosave.disabled"
@@ -391,7 +424,7 @@ make_draft_at() { # <store> <skills> <id> <name> <desc>
 }
 
 # CCC_AUTONOMY=kill halts autonomous install regardless of auto mode.
-make_draft_at "$A_STATE" "$A_SKILLS" a-kill kill-me "Capture the recurring autonomy kill-switch verification procedure now."
+make_draft_at "$A_STATE" "$A_SKILLS" a-kill kill-me "Use when capturing the recurring autonomy kill-switch verification procedure now."
 out="$(CCC_SKILL_REVIEW_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_AUTONOMY=kill CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "CCC_AUTONOMY=kill installs nothing" 'jq -e ".skipped == \"autonomy-kill\"" >/dev/null <<<"$out" && [ ! -e "$A_SKILLS/kill-me" ]'
 
@@ -416,7 +449,7 @@ F_STATE="$TMP/failstate"; F_SKILLS="$TMP/failskills"
 mkdir -p "$F_STATE/pending-skills" "$F_SKILLS"
 chmod 700 "$F_STATE"
 chmod 777 "$F_SKILLS"  # deliberately non-compliant: contract must fail closed
-make_draft_at "$F_STATE" "$F_SKILLS" f-fail fail-one "Capture the recurring failed-counter verification procedure here."
+make_draft_at "$F_STATE" "$F_SKILLS" f-fail fail-one "Use when capturing the recurring failed-counter verification procedure here."
 out="$(CCC_SKILL_REVIEW_STATE_DIR="$F_STATE" CLAUDE_SKILLS_DIR="$F_SKILLS" CCC_PUSH_SPOOL="$TMP/fspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "non-compliant root skips the sweep fail-closed" 'jq -e ".skipped == \"unsafe-skills-root\" and (.installed | length == 0)" >/dev/null <<<"$out" && [ ! -e "$F_SKILLS/fail-one" ]'
 ok "skipped sweep leaves draft pending" '[ -d "$F_STATE/pending-skills/f-fail" ]'
@@ -429,7 +462,7 @@ ok "non-compliant root log carries an actionable hint" 'grep -q "reason=unsafe-s
 Q_STATE="$TMP/qstate"; Q_SKILLS="$TMP/qskills"; Q_DECOY="$TMP/qdecoy"
 mkdir -p "$Q_STATE/pending-skills" "$Q_SKILLS" "$Q_DECOY/pending-skills"
 chmod 700 "$Q_STATE" "$Q_SKILLS" "$Q_DECOY"
-make_draft_at "$Q_STATE" "$Q_SKILLS" q-anchor queue-anchor "Capture the recurring queue anchor verification procedure here."
+make_draft_at "$Q_STATE" "$Q_SKILLS" q-anchor queue-anchor "Use when capturing the recurring queue anchor verification procedure here."
 out="$(CCC_SKILL_REVIEW_STATE_DIR="$Q_STATE" CCC_STATE_DIR="$Q_DECOY" CLAUDE_SKILLS_DIR="$Q_SKILLS" CCC_PUSH_SPOOL="$TMP/qspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" status)"
 ok "CCC_STATE_DIR does not hide the real queue" 'grep -q "pending drafts: 1" <<<"$out"'
 # shellcheck disable=SC2034  # out is read via eval inside ok()
@@ -448,7 +481,7 @@ run_claims() {
     CCC_SKILL_AUTOSAVE_DAILY_CAP=99 bash "$AUTO" run >/dev/null
 }
 
-make_draft 20260101-000020-a-exitcode exit-claim-skill "Diagnose the recurring watch timeout by reading the command exit status." \
+make_draft 20260101-000020-a-exitcode exit-claim-skill "Use when diagnosing the recurring watch timeout by reading the command exit status." \
 "# Exit claim
 
 ## Procedure
@@ -463,7 +496,7 @@ ok "uncited exit-code claim blocked" \
 ok "claim block marker never quotes the draft" \
   '! grep -q "124" "$PENDING/20260101-000020-a-exitcode/autosave-block.json"'
 
-make_draft 20260101-000021-b-cited exit-cited-skill "Diagnose the recurring watch timeout using the documented command exit status." \
+make_draft 20260101-000021-b-cited exit-cited-skill "Use when diagnosing the recurring watch timeout using the documented command exit status." \
 "# Exit claim with a source citation
 
 ## Procedure
@@ -475,7 +508,7 @@ make_draft 20260101-000021-b-cited exit-cited-skill "Diagnose the recurring watc
 run_claims
 ok "exit-code claim with source ref installs" '[ -f "$SKILLS/exit-cited-skill/SKILL.md" ]'
 
-make_draft 20260101-000022-c-helpcited exit-help-skill "Diagnose the recurring watch failure by consulting the command help output." \
+make_draft 20260101-000022-c-helpcited exit-help-skill "Use when diagnosing the recurring watch failure by consulting the command help output." \
 "# Exit claim backed by a runnable check
 
 ## Procedure
@@ -487,7 +520,7 @@ make_draft 20260101-000022-c-helpcited exit-help-skill "Diagnose the recurring w
 run_claims
 ok "exit-code claim with --help installs" '[ -f "$SKILLS/exit-help-skill/SKILL.md" ]'
 
-make_draft 20260101-000023-d-httpstatus http-claim-skill "Audit the recurring API failure path by classifying the returned status." \
+make_draft 20260101-000023-d-httpstatus http-claim-skill "Use when auditing the recurring API failure path by classifying the returned status." \
 "# HTTP claim
 
 ## Procedure
@@ -500,7 +533,7 @@ run_claims
 ok "uncited http-status claim blocked" \
   'jq -e ".reason == \"unverified-claim http-status\"" "$PENDING/20260101-000023-d-httpstatus/autosave-block.json" >/dev/null'
 
-make_draft 20260101-000024-e-version version-claim-skill "Pin the recurring upgrade procedure to the release that fixed the defect." \
+make_draft 20260101-000024-e-version version-claim-skill "Use when pinning the recurring upgrade procedure to the release that fixed the defect." \
 "# Version claim
 
 ## Procedure
@@ -513,7 +546,7 @@ run_claims
 ok "uncited version-pin claim blocked" \
   'jq -e ".reason == \"unverified-claim version-pin\"" "$PENDING/20260101-000024-e-version/autosave-block.json" >/dev/null'
 
-make_draft 20260101-000025-f-noclaim no-claim-skill "Capture the recurring review walkthrough that carries no factual assertions." \
+make_draft 20260101-000025-f-noclaim no-claim-skill "Use when capturing the recurring review walkthrough that carries no factual assertions." \
 "# No falsifiable claim
 
 ## Procedure
@@ -560,11 +593,11 @@ make_draft_in() { # <pending-dir> <id> <name> <description>
   jq -nc --arg id "$2" --arg name "$3" \
     '{id:$id, name:$name, status:"pending", session_id:"sess-route"}' > "$1/$2/meta.json"
 }
-make_draft_in "$PENDING_ROUTE" 20260911-000001-route-piri route-piri-skill "Capture the piri lane recurring log rotation check workflow."
+make_draft_in "$PENDING_ROUTE" 20260911-000001-route-piri route-piri-skill "Use when capturing the piri lane recurring log rotation check workflow."
 jq '.provider = "piri"' "$PENDING_ROUTE/20260911-000001-route-piri/meta.json" > "$PENDING_ROUTE/.tmp" \
   && mv "$PENDING_ROUTE/.tmp" "$PENDING_ROUTE/20260911-000001-route-piri/meta.json"
 chmod 600 "$PENDING_ROUTE/20260911-000001-route-piri/meta.json"
-make_draft_in "$PENDING_ROUTE" 20260911-000002-route-base route-base-skill "Capture the default lane recurring backup verification workflow."
+make_draft_in "$PENDING_ROUTE" 20260911-000002-route-base route-base-skill "Use when capturing the default lane recurring backup verification workflow."
 printf 'auto\n' > "$STATE_ROUTE/skill-autosave.mode"
 # shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_ROUTE" CLAUDE_SKILLS_DIR="$SKILLS" PIRI_SKILLS_DIR="$PIRI_SKILLS" \
@@ -581,7 +614,7 @@ ok "ledger records both installs" \
 
 # A piri-routed draft with a Claude-only coupling stays pending (compat screen
 # follows the routed provider, not the process provider).
-make_draft_in "$PENDING_ROUTE" 20260911-000003-route-claude route-claude-coupled "Capture a recurring claude invocation procedure for review."
+make_draft_in "$PENDING_ROUTE" 20260911-000003-route-claude route-claude-coupled "Use when capturing a recurring claude invocation procedure for review."
 printf '%s\n' 'run: claude -p --model haiku' >> "$PENDING_ROUTE/20260911-000003-route-claude/SKILL.md"
 jq '.provider = "piri"' "$PENDING_ROUTE/20260911-000003-route-claude/meta.json" > "$PENDING_ROUTE/.tmp" \
   && mv "$PENDING_ROUTE/.tmp" "$PENDING_ROUTE/20260911-000003-route-claude/meta.json"
@@ -594,7 +627,7 @@ ok "coupled piri-routed draft stays pending with codex-incompat" \
 ok "summary reports single piri provider" 'jq -e ".provider == \"piri\" and .providers == [\"piri\"]" >/dev/null <<<"$out"'
 
 # An unsupported provider value fails closed.
-make_draft_in "$PENDING_ROUTE" 20260911-000004-route-bad route-bad-provider "Capture a recurring workflow with an invalid provider lane."
+make_draft_in "$PENDING_ROUTE" 20260911-000004-route-bad route-bad-provider "Use when capturing a recurring workflow with an invalid provider lane."
 # danso became a valid provider in #1659; an authorless value stays unsupported.
 jq '.provider = "gorani"' "$PENDING_ROUTE/20260911-000004-route-bad/meta.json" > "$PENDING_ROUTE/.tmp" \
   && mv "$PENDING_ROUTE/.tmp" "$PENDING_ROUTE/20260911-000004-route-bad/meta.json"
@@ -614,7 +647,7 @@ ok "unsupported provider draft stays pending" '[ -d "$PENDING_ROUTE/20260911-000
 DANSO_SKILLS="$TMP/danso-skills"
 STATE_DANSO="$TMP/state-danso"; PENDING_DANSO="$STATE_DANSO/pending-skills"
 mkdir -m 700 "$STATE_DANSO" "$PENDING_DANSO"
-make_draft_in "$PENDING_DANSO" 20260911-000101-danso-route danso-route-skill "Capture the danso lane recurring journal hygiene verification workflow."
+make_draft_in "$PENDING_DANSO" 20260911-000101-danso-route danso-route-skill "Use when capturing the danso lane recurring journal hygiene verification workflow."
 jq '.provider = "danso"' "$PENDING_DANSO/20260911-000101-danso-route/meta.json" > "$PENDING_DANSO/.tmp" \
   && mv "$PENDING_DANSO/.tmp" "$PENDING_DANSO/20260911-000101-danso-route/meta.json"
 chmod 600 "$PENDING_DANSO/20260911-000101-danso-route/meta.json"
@@ -637,7 +670,7 @@ ok "summary reports danso provider" 'jq -e ".providers == [\"danso\"] and .provi
 # c) CCC_DANSO_STATE_DIR fallback resolves <state>/home/.pi/agent/skills.
 DANSO_STATE_FIX="$TMP/danso-state"
 mkdir -p "$DANSO_STATE_FIX/home" && chmod 700 "$DANSO_STATE_FIX/home"
-make_draft_in "$PENDING_DANSO" 20260911-000102-danso-state danso-state-skill "Capture the danso state fallback recurring session index workflow."
+make_draft_in "$PENDING_DANSO" 20260911-000102-danso-state danso-state-skill "Use when capturing the danso state fallback recurring session index workflow."
 jq '.provider = "danso"' "$PENDING_DANSO/20260911-000102-danso-state/meta.json" > "$PENDING_DANSO/.tmp" \
   && mv "$PENDING_DANSO/.tmp" "$PENDING_DANSO/20260911-000102-danso-state/meta.json"
 chmod 600 "$PENDING_DANSO/20260911-000102-danso-state/meta.json"
@@ -647,7 +680,7 @@ out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DANSO" CLAUDE_SKILLS_DIR="$SKILLS" CCC
 ok "CCC_DANSO_STATE_DIR fallback installs under home/.pi/agent/skills" \
   '[ -f "$DANSO_STATE_FIX/home/.pi/agent/skills/danso-state-skill/SKILL.md" ]'
 # d) codex couplings are screened on danso targets.
-make_draft_in "$PENDING_DANSO" 20260911-000103-danso-codex danso-codex-coupled "Capture a recurring codex invocation procedure for the danso lane."
+make_draft_in "$PENDING_DANSO" 20260911-000103-danso-codex danso-codex-coupled "Use when capturing a recurring codex invocation procedure for the danso lane."
 printf '%s\n' 'run: codex exec --full-auto' >> "$PENDING_DANSO/20260911-000103-danso-codex/SKILL.md"
 jq '.provider = "danso"' "$PENDING_DANSO/20260911-000103-danso-codex/meta.json" > "$PENDING_DANSO/.tmp" \
   && mv "$PENDING_DANSO/.tmp" "$PENDING_DANSO/20260911-000103-danso-codex/meta.json"

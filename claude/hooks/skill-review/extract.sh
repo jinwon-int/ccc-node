@@ -137,10 +137,12 @@ Schema:
 Criteria:
 - Propose at most 2 candidates.
 - Return [] if no non-trivial reusable multi-step workflow, correction, debugging path, or operator preference emerged.
-- Do NOT duplicate an existing skill; patching existing skills is out of scope for this hook, so return [] if an existing skill already covers it.
+- Check the existing skills list below (names and descriptions) for overlap first. Prefer improving an existing skill over creating a near-duplicate; this hook cannot patch, so return [] if an existing skill already covers or nearly covers it.
 - Do NOT capture one-off task narratives, PR numbers, transient errors, mutable live node facts, raw secrets, endpoints, tokens, private message text, or credentials.
 - Keep proposed skills node-agnostic and public-safe. Mention credential locations/handling rules only, never values.
-- A valid SKILL.md starts with YAML frontmatter containing name and description. Description must be concise and routing-friendly.
+- A valid SKILL.md starts with YAML frontmatter containing name and description.
+- name: a general, reusable capability name (what kind of work it helps with), not one derived from the incident. No dates, PR/issue numbers, node or host names, or one-off error text in the name.
+- description: one line, at most 300 characters. It MUST START with the trigger, i.e. when to use the skill: "Use when <situation> ..." in English or "<상황>할 때 사용 ..." in Korean. Put what the skill does after the trigger. The agent picks skills from a truncated description listing, and a description without trigger wording is rejected at install and at promotion. No incident-specific numbers (counts, PR/issue numbers, versions, dates) and no node or host names.
 - The body should include: When to Use, Procedure, Safety, Verification.
 - Frame commands as generic agent-CLI / ccc-node procedures. Use exact commands only if the transcript clearly showed them; otherwise describe the safe decision rule instead of inventing flags.
 - Do NOT hard-code a runtime coupling in the skill body: never write 'claude -p', 'codex exec', '~/.claude/', '~/.codex/', 'CLAUDE_*', or 'CODEX_*'. Refer to 'this node's agent CLI' or a neutral tool name so the draft installs on any provider.

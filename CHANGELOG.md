@@ -4,6 +4,24 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **Skill autosave: drafts must say WHEN to use the skill, and the install
+  lint enforces it (Refs #2011).** The agent picks a skill from a per-turn
+  listing that truncates descriptions, and fleet-skills #316 made
+  `validate.py` ERROR on approved skills without trigger wording. Autosave
+  drafts, asked only for a "concise and routing-friendly" description, often
+  opened with what the skill does and failed that gate at promotion time. The
+  `extract.sh` drafting prompt (and the bridge collector prompt) now require
+  the description to start with the trigger ("Use when …" / "…할 때 사용"),
+  then what it does, at most 300 characters, with no incident numbers or node
+  names. The prompt also asks for a general reusable name and an overlap check
+  against the installed skills it already lists. `autoinstall.sh` `gate_lint`
+  blocks a trigger-less draft as `lint description-trigger` on the unattended
+  path, the owner `apply` create path and `gate-sim.sh`. A v2 `patch` that
+  rewrites a description is held to the same rule
+  (`incremental_description_trigger_missing`); body-only patches are not. The
+  single regex lives in `skill-review/description_trigger.py`, copied
+  verbatim from fleet-skills `TRIGGER_RE`, and fails closed without
+  `python3`. Dedup similarity now ignores the shared trigger words.
 - **Skill promotion: `promote` no longer opens a duplicate batch PR every day
   (#2011).** fleet-skills #289 (09-22), #298, #302, #310 and #314 (09-26) were
   five unreviewed drafts staging the same 8 skills: each collect cut a new
