@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 from pathlib import Path
 import tomllib
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -23,6 +25,7 @@ from telegram_bot.core.matrix import bot as matrix_bot
 from telegram_bot.core.matrix import transport as t
 from telegram_bot.core.matrix.transport import MatrixTemporaryError, MatrixTransport
 from test_matrix_bot import OWNER, FakeSink, _bot, _job
+from test_matrix_transport import fake_aiohttp
 from test_matrix_bot import matrix_config as _shared  # noqa: F401 - fixture registration below
 
 BRIDGE = Path(__file__).resolve().parents[1]
@@ -73,7 +76,10 @@ async def test_retry_resets_after_a_healthy_run_and_honours_retry_after(monkeypa
         return None
 
     monkeypatch.setattr(t.asyncio, "sleep", fake_sleep)
-    await MatrixTransport.retry(_retry_self(), operation, leg="receive")
+    # retry() imports aiohttp lazily; CI installs the bridge without the Matrix
+    # extra, so stand in the same fake module the transport tests use.
+    with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
+        await MatrixTransport.retry(_retry_self(), operation, leg="receive")
     assert sleeps == [1.0, 2.0, 4.0, 1.0, 7.0]
 
 
