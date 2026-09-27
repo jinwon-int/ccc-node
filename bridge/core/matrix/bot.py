@@ -2374,11 +2374,14 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         turn_marker: str | None = None,
         dispatch_guard: Callable[[], bool] | None = None,
         usage_mode: str = MODE_INTERACTIVE,
+        room_id: str | None = None,
     ) -> ChatResponse:
         """One ``process_message`` call with this room's callbacks; persists the session."""
 
         sink = sink or self._active_sink or _NullSink()
-        room_id = self.room_for_chat(chat_id) or ""
+        # The job's own room when the caller has it (#1959: /skills), else the
+        # reverse map — the same room for every turn run_turn has admitted.
+        room_id = room_id or self.room_for_chat(chat_id) or ""
         extra: dict[str, Any] = {}
         if resume_task:
             extra["resume_task"] = True
@@ -3153,7 +3156,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         # Telegram's /skills; it always starts a fresh session.
         response = await self._dispatch_turn(
             _SKILLS_PROMPT, key=key, user_id=user_id, chat_id=chat_id, session={},
-            session_id=None, new_session=True, sink=sink, turn_marker=turn_marker,
+            session_id=None, new_session=True, sink=sink, turn_marker=turn_marker, room_id=room_id,
         )
         return await self._finish(response, room_id)
 
