@@ -575,6 +575,7 @@ def create_app(context: AppContext):
             distill_extraction_worker=context.distill_extraction_worker,
             distill_local_sink_worker=context.distill_local_sink_worker,
             distill_wiki_sink_worker=context.distill_wiki_sink_worker,
+            skill_candidate_collector_worker=context.skill_candidate_collector_worker,
         )
     from telegram_bot.core.bot import TelegramBot
 

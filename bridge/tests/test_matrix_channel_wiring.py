@@ -91,7 +91,16 @@ def test_create_app_selects_matrix_bot(tmp_path: Path, monkeypatch: pytest.Monke
     assert isinstance(bot, FakeMatrixBot)
     assert created["project_chat"] is context.project_chat
     assert created["session_manager"] is context.session_manager
-    for field in ("distill_journal", "distill_snapshot_worker", "distill_extraction_worker", "distill_local_sink_worker", "distill_wiki_sink_worker"):
+    for field in (
+        "distill_journal",
+        "distill_snapshot_worker",
+        "distill_extraction_worker",
+        "distill_local_sink_worker",
+        "distill_wiki_sink_worker",
+        # #1825: the collector used to be Telegram-only.
+        "skill_candidate_collector_worker",
+    ):
+        assert field in created
         assert created[field] is getattr(context, field)
 
     # Telegram stays the default frontend.

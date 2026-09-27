@@ -1,5 +1,23 @@
 # Changelog
 
+- **Matrix frontend runs the remaining lifecycle background services (#1825).**
+  After #1998 the turn-stall probe, health alerts, session resource guard,
+  skill-candidate collector, orphan reaper, task-ledger reconciliation,
+  rapid-crash policy and webhook nudge still ran on Telegram only. They are
+  now rebuilt for Matrix in `core/matrix/lifecycle.py`: a durable
+  `crash-budget.json` backs off rapid unclean restarts with the
+  `crash-policy.env` numbers (systemd `RestartSec=5` never tripped its start
+  limit) and spools one `matrix_crash_loop` alert per streak; stale `working`
+  ledger records are closed at startup without message edits; the orphan
+  reaper runs at startup and every 15 min (`CCC_MATRIX_ORPHAN_REAPER=0`
+  disables); the stall probe is off by default as on Telegram; and the
+  webhook nudge listens only on an explicit `CCC_MATRIX_WEBHOOK_NUDGE_PORT`
+  distinct from the Telegram port. The health-alert, session-guard and
+  skill-collector loops moved to `core/lifecycle_loops.py`, shared by both
+  frontends; the Telegram mixin delegates with unchanged behaviour. The
+  restart receipt (needs `/restart`) and the "⏳ Working" sweep (no Matrix
+  equivalent) are deliberately not ported.
+
 - **Matrix frontend runs auto-continue and dead-session recovery (#1825).**
   `MatrixBot` does not inherit `BotLifecycleMixin`, so a Matrix
   `continuation_cli register` answered `ok`, wrote

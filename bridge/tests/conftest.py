@@ -98,6 +98,10 @@ def _reset_bridge_environment() -> None:
     # Minimal, fixed test env so the real pydantic config validates on import.
     os.environ["PROJECT_ROOT"] = str(BRIDGE_DIR)
     os.environ["TELEGRAM_BOT_TOKEN"] = _TEST_BOT_TOKEN
+    # MatrixBot.serve() runs the marker-scoped orphan reaper, which reads the
+    # real /proc and signals matching PIDs. A test run on a node that hosts a
+    # live bridge must never do that; reaper tests opt back in explicitly.
+    os.environ["CCC_MATRIX_ORPHAN_REAPER"] = "0"
 
 
 # conftest is imported before test modules, so collection-time Config imports

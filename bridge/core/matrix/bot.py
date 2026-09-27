@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import functools
 import hashlib
 import json
 import logging
@@ -37,7 +38,7 @@ import signal
 import subprocess
 import time
 import tomllib
-from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Coroutine, Mapping, Optional, Protocol, Sequence
 
 from telegram_bot.core import session_resume, tool_policy
 from telegram_bot.core.memory_distill import MemoryDistillMixin
@@ -61,6 +62,12 @@ from telegram_bot.core.external_wait import (
     default_registry_path,
 )
 from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
+from telegram_bot.core.lifecycle_loops import (
+    run_health_alerts_probe,
+    run_session_resource_guard,
+    run_skill_candidate_collector,
+)
+from telegram_bot.core.matrix import lifecycle as matrix_lifecycle
 from telegram_bot.core.matrix.render import chunk_text, render_matrix_message
 from telegram_bot.core.matrix_ids import MatrixIdMap
 from telegram_bot.core.memory_audience import resolve_memory_audience
@@ -78,9 +85,15 @@ from telegram_bot.core.turn_watchdog import DEFAULT_NOTIFY_MINUTES, TurnAgeWatch
 from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.core.usage_meter import MODE_AUTONOMOUS, MODE_INTERACTIVE
 from telegram_bot.utils.health import health_reporter
+from telegram_bot.utils.orphan_reaper import (
+    run_periodic_reaper,
+    sweep_orphaned_claude_processes,
+)
 
 logger = logging.getLogger(__name__)
 
+# serve()'s task-group legs: zero-argument coroutine factories (#1825).
+_LegFactory = Callable[[], Coroutine[Any, Any, Any]]
 IDS_FILENAME = "matrix-ids.json"
 DIRECT_ROOMS_FILENAME = "matrix-direct-rooms.json"
 SUPPORTED_COMMANDS = frozenset(
@@ -254,6 +267,15 @@ class _DirectRoomMap:
         return self._rooms.get(user)
 
 
+def spool_write_dir(settings: Any) -> Path:
+    """The push spool this process's writers use (``CCC_PUSH_SPOOL`` or the default)."""
+
+    return Path(
+        getattr(settings, "push_spool_dir", None)
+        or (Path.home() / ".claude" / "state" / "telegram-spool")
+    )
+
+
 class _NotificationRoute:
     """``notification_bot`` duck type: ``send_message(chat_id=, text=)``."""
 
@@ -285,12 +307,11 @@ class MatrixSpoolNotifier:
         # (bot/transport import cycle), so the annotation stays Any here.
         self._transport = transport
         self.enabled: bool = bool(getattr(settings, "push_enabled", False))
-        write_dir = Path(
-            getattr(settings, "push_spool_dir", None)
-            or (Path.home() / ".claude" / "state" / "telegram-spool")
-        )
+        write_dir = spool_write_dir(settings)
         consume = getattr(settings, "push_consume_spool_dir", None)
         self.spool_dir = Path(consume).expanduser() if consume else write_dir
+        # Where this process's own writers (health alerts) queue records.
+        self.write_spool_dir = write_dir
         self.interval: float = float(getattr(settings, "push_poll_interval", 3.0))
         self.max_per_minute: int = int(getattr(settings, "push_max_per_minute", 10))
         self.mirror_dirs: list[Path] = mirror_dirs_from(settings, self.spool_dir, write_dir)
@@ -456,9 +477,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         distill_extraction_worker: Any = None,
         distill_local_sink_worker: Any = None,
         distill_wiki_sink_worker: Any = None,
+        skill_candidate_collector_worker: Any = None,
         clock: Any = None,
         transport_factory: TransportFactory | None = None,
     ) -> None:
+        self._skill_candidate_collector_worker = skill_candidate_collector_worker
         self._distill_journal = distill_journal
         self._distill_snapshot_worker = distill_snapshot_worker
         self._distill_extraction_worker = distill_extraction_worker
@@ -588,59 +611,120 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                 self._distill_journal.initialize()
             self._post_startup_banner(config, transport)
             self._start_health_reporting()
+            await self._startup_lifecycle_sweeps()
             await self._startup_danso_recovery_scan()
             await self._startup_dead_session_recovery()
             notifier = MatrixSpoolNotifier(self._settings, transport)
-            watchdog = self._build_turn_age_watchdog()
-            external_wait = self._build_external_wait_monitor()
-            continuation = self._build_continuation_monitor()
             # Same TaskGroup semantics as transport.run(): a leg that dies
-            # stops the service so systemd restarts it whole.
+            # stops the service so systemd restarts it whole. Legs are built
+            # before the listener binds, so a failing builder cannot leave the
+            # socket open outside the ``finally`` that closes it.
             stop = asyncio.Event()
+            cancel_on_stop, stop_driven = self._background_legs(stop, notifier)
+            nudge_server = self._build_webhook_nudge_server()
             try:
+                if nudge_server is not None:
+                    # Bind failures log and degrade to polling; never fatal.
+                    await nudge_server.start()
                 async with asyncio.TaskGroup() as group:
                     # The watchdog/health loops run until the stop event is set,
                     # and a TaskGroup only cancels siblings when a leg raises — a
                     # transport that returns *cleanly* would otherwise leave the
                     # group waiting forever. Setting the event from the transport
                     # leg's finally keeps shutdown finite on both paths.
-                    memory_tasks = []
-                    if self._distill_journal is not None:
-                        for stage in ("snapshot", "extraction", "local_sink", "wiki_sink"):
-                            if getattr(self, f"_distill_{stage}_worker") is not None:
-                                loop = getattr(self, f"_distill_{stage}_loop")
-                                memory_tasks.append(group.create_task(loop(stop), name=f"matrix-distill-{stage}"))
-                    if continuation is not None:
-                        # Cancelled on stop like the distill loops: its runner
-                        # may be awaiting a self-job turn that shutdown will
-                        # never finish. The durable self-job then records its
-                        # own outcome after the restart (#1825).
-                        memory_tasks.append(
-                            group.create_task(continuation.run(stop), name="matrix-continuation-monitor")
-                        )
+                    memory_tasks: list[asyncio.Task[Any]] = [
+                        group.create_task(start(), name=name) for name, start in cancel_on_stop
+                    ]
                     group.create_task(self._run_until_stop(transport.run(), stop, memory_tasks))
-                    group.create_task(self._health_reporter_loop(stop), name="matrix-health-reporter")
-                    if notifier.enabled:
-                        group.create_task(notifier.run())
-                    if watchdog is not None:
-                        group.create_task(watchdog.run(stop), name="matrix-turn-age-watchdog")
-                    if external_wait is not None:
-                        group.create_task(external_wait.run(stop), name="matrix-external-wait-monitor")
-                    group.create_task(
-                        self._periodic_dead_session_recovery(stop), name="matrix-dead-session-recovery"
-                    )
+                    for name, start in stop_driven:
+                        group.create_task(start(), name=name)
             except BaseExceptionGroup as failure:
                 # A single failing leg (normally the transport) surfaces as itself,
                 # as it did when the transport was awaited directly.
                 if len(failure.exceptions) == 1:
                     raise failure.exceptions[0] from None
                 raise
+            finally:
+                if nudge_server is not None:
+                    await nudge_server.close()
         finally:
             if not initialize:
                 await self._enqueue_shutdown_distills()
             self._transport = None
             self._stop_health_reporting()
             await transport.close()
+
+    def _background_legs(
+        self, stop: asyncio.Event, notifier: "MatrixSpoolNotifier"
+    ) -> tuple[list[tuple[str, _LegFactory]], list[tuple[str, _LegFactory]]]:
+        """``(cancel_on_stop, stop_driven)`` legs for ``serve()``'s task group.
+
+        *Stop-driven* legs watch ``stop`` and return on their own. Legs that
+        may be parked where the event is not seen — a distill or collector
+        sweep awaiting a provider call, the continuation runner awaiting a
+        self-job turn shutdown will never finish, the reaper's sleep — are
+        cancelled when the transport leg ends instead. Each entry is
+        ``(task name, zero-argument coroutine factory)``.
+        """
+
+        cancel_on_stop: list[tuple[str, _LegFactory]] = []
+        stop_driven: list[tuple[str, _LegFactory]] = []
+        if self._distill_journal is not None:
+            for stage in ("snapshot", "extraction", "local_sink", "wiki_sink"):
+                if getattr(self, f"_distill_{stage}_worker") is not None:
+                    loop = getattr(self, f"_distill_{stage}_loop")
+                    cancel_on_stop.append((f"matrix-distill-{stage}", functools.partial(loop, stop)))
+            collector = self._skill_candidate_collector_worker
+            if collector is not None:
+                cancel_on_stop.append(
+                    (
+                        "matrix-skill-candidate-collector",
+                        lambda: run_skill_candidate_collector(collector, self._distill_sweep_jobs, self._settings, stop),
+                    )
+                )
+        continuation = self._build_continuation_monitor()
+        if continuation is not None:
+            # The durable self-job records its own outcome after a restart (#1825).
+            cancel_on_stop.append(("matrix-continuation-monitor", lambda: continuation.run(stop)))
+        if self._orphan_reaper_enabled():
+            cancel_on_stop.append(("matrix-orphan-reaper", lambda: self._periodic_reaper()))
+        if notifier.enabled:
+            # ``MatrixSpoolNotifier.run`` polls forever without watching
+            # ``stop``; as a stop-driven leg it held the group open after a
+            # clean transport return.
+            cancel_on_stop.append(("matrix-spool-notifier", notifier.run))
+
+        stop_driven.append(("matrix-health-reporter", lambda: self._health_reporter_loop(stop)))
+        watchdog = self._build_turn_age_watchdog()
+        if watchdog is not None:
+            stop_driven.append(("matrix-turn-age-watchdog", lambda: watchdog.run(stop)))
+        external_wait = self._build_external_wait_monitor()
+        if external_wait is not None:
+            stop_driven.append(("matrix-external-wait-monitor", lambda: external_wait.run(stop)))
+        stop_driven.append(("matrix-dead-session-recovery", lambda: self._periodic_dead_session_recovery(stop)))
+        stop_driven.append(
+            (
+                "matrix-health-alerts",
+                lambda: run_health_alerts_probe(
+                    self._settings,
+                    self._project_chat,
+                    stop,
+                    spool_dir=notifier.spool_dir,
+                    write_spool_dir=notifier.write_spool_dir,
+                ),
+            )
+        )
+        if getattr(self._settings, "session_guard_enabled", False):
+            stop_driven.append(
+                (
+                    "matrix-session-resource-guard",
+                    lambda: run_session_resource_guard(self._settings, self._project_chat, stop),
+                )
+            )
+        stall_probe = self._build_turn_stall_probe()
+        if stall_probe is not None:
+            stop_driven.append(("matrix-turn-stall-probe", lambda: stall_probe.run(stop)))
+        return cancel_on_stop, stop_driven
 
     @staticmethod
     async def _run_until_stop(
@@ -843,10 +927,19 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         # (unsafe-crypto-store); nio creates its SQLite store with the process
         # umask, which systemd leaves at 022. The pilot set this in main().
         os.umask(0o077)
-        enforce_access_control(self._settings)
-        initialize = getattr(self._session_manager, "initialize", None)
-        if callable(initialize):
-            initialize()
+        # Account before the start-up checks, so a unit that dies in them is
+        # backed off and alerted like one that dies while serving.
+        budget = self._crash_budget()
+        decision = budget.begin() if budget is not None else None
+        try:
+            enforce_access_control(self._settings)
+            initialize = getattr(self._session_manager, "initialize", None)
+            if callable(initialize):
+                initialize()
+        except BaseException as error:
+            if budget is not None:
+                budget.record_error(error)
+            raise
 
         async def _main() -> None:
             loop = asyncio.get_running_loop()
@@ -858,11 +951,54 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                 except (NotImplementedError, RuntimeError):  # pragma: no cover - non-POSIX loops
                     pass
             try:
+                await self._crash_backoff(decision)
                 await self.serve()
             except asyncio.CancelledError:
                 logger.info("Matrix frontend stopped")
+            except BaseException as error:
+                if budget is not None:
+                    budget.record_error(error)
+                raise
+            # Reached only on an orderly stop (signal) or a clean return.
+            if budget is not None:
+                budget.mark_clean()
 
         asyncio.run(_main())
+
+    def _crash_budget(self) -> "matrix_lifecycle.CrashBudget | None":
+        try:
+            return matrix_lifecycle.CrashBudget(self._data_dir() / matrix_lifecycle.CRASH_BUDGET_FILENAME)
+        except Exception as error:
+            logger.warning("Matrix crash budget unavailable: %s", type(error).__name__)
+            return None
+
+    async def _crash_backoff(self, decision: "matrix_lifecycle.CrashDecision | None") -> None:
+        """Delay this start after a streak of rapid unclean exits (Matrix rapid-crash guard).
+
+        systemd restarts the unit every ``RestartSec`` forever; this is the
+        back-off the Telegram ``start.sh`` supervisor provides, with the same
+        ``crash-policy.env`` numbers. One owner alert per streak rides the push
+        spool (delivered once the spool consumer is up; ``CCC_PUSH_ENABLED``).
+        """
+
+        if decision is None:
+            return
+        if decision.streak:
+            logger.warning(
+                "Matrix frontend: %d rapid unclean exit(s) in a row (last: %s); delaying start %ds",
+                decision.streak,
+                decision.last_error or "unknown",
+                int(decision.delay_seconds),
+            )
+        if decision.alert:
+            alert = matrix_lifecycle.crash_loop_alert(decision)
+            logger.error("Health alert [%s]: %s", alert.code, alert.message)
+            if getattr(self._settings, "push_enabled", False):
+                from telegram_bot.utils.health_alerts import write_alert_spool
+
+                write_alert_spool(spool_write_dir(self._settings), alert)
+        if decision.delay_seconds > 0:
+            await asyncio.sleep(decision.delay_seconds)
 
     # -- outbound routing ----------------------------------------------------
 
@@ -1284,6 +1420,72 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                 health_reporter.record_transcript_hard_quarantined(stats.hard_quarantined)
         except Exception as error:
             logger.debug("Matrix recovery stats health recording failed: %s", type(error).__name__)
+
+    # -- Matrix-native background services (#1825, rest of #1998) -------------
+
+    # Seams: the marker-scoped reaper reads /proc and signals real PIDs.
+    _orphan_sweep = staticmethod(sweep_orphaned_claude_processes)
+    _periodic_reaper = staticmethod(run_periodic_reaper)
+
+    @staticmethod
+    def _orphan_reaper_enabled() -> bool:
+        """``CCC_MATRIX_ORPHAN_REAPER`` (default on) — a per-unit kill switch."""
+
+        return ExternalWaitMonitor.env_flag("CCC_MATRIX_ORPHAN_REAPER", default=True)
+
+    async def _startup_lifecycle_sweeps(self) -> None:
+        """One-shot startup cleanups of what a previous process left behind.
+
+        * task ledger: non-terminal records died with the previous process
+          (the transport has already told their rooms; see ``lifecycle``);
+        * orphan reaper: bridge-marked ``node claude`` children reparented to
+          PID 1 by a previous run. Both are best-effort and never fatal.
+        """
+
+        try:
+            interrupted = await asyncio.to_thread(
+                matrix_lifecycle.reconcile_task_ledger, self._settings
+            )
+            if interrupted:
+                logger.info(
+                    "Matrix task ledger reconciliation: %d task(s) from a previous run marked interrupted",
+                    interrupted,
+                )
+        except Exception as error:
+            logger.warning("Matrix task ledger reconciliation failed: %s", type(error).__name__)
+        if not self._orphan_reaper_enabled():
+            return
+        try:
+            killed = await asyncio.to_thread(self._orphan_sweep)
+            if killed:
+                logger.info(
+                    "Matrix startup orphan sweep: signalled %d orphan node-claude process(es) — PIDs %s",
+                    len(killed),
+                    killed,
+                )
+        except Exception as error:
+            logger.warning("Matrix startup orphan sweep failed: %s", type(error).__name__)
+
+    async def _recover_for_stall_probe(self) -> None:
+        await recover_dead_session_notifications(*self._dead_session_recovery_args())
+
+    def _build_turn_stall_probe(self) -> Any:
+        """Silent-death stall probe (#1112); ``None`` unless ``CCC_TURN_STALL_PROBE_MIN`` > 0."""
+
+        return matrix_lifecycle.build_turn_stall_probe(
+            self._project_chat,
+            notifier=self._notify_chat,
+            recover=self._recover_for_stall_probe,
+        )
+
+    def _build_webhook_nudge_server(self) -> Any:
+        """External-wait nudge listener on this frontend's own port; ``None`` when off."""
+
+        try:
+            return matrix_lifecycle.build_webhook_nudge_server(self._data_dir())
+        except Exception as error:
+            logger.warning("Matrix webhook nudge not started: %s", type(error).__name__)
+            return None
 
     def _notification_bot(self) -> _NotificationRoute:
         return _NotificationRoute(self._deliver_notice)
