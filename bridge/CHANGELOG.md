@@ -1,5 +1,15 @@
 # Changelog
 
+- **Matrix frontend sends the files an answer names (#2001).** Telegram has
+  always sent a real deliverable file an answer mentions; Matrix sent nothing.
+  The deliverable rule moved to `core/deliverables.py` (Telegram unchanged).
+  In a direct room each named file under `PROJECT_ROOT` is AES-256-CTR
+  encrypted locally, only the ciphertext is uploaded, and an encrypted
+  `m.image`/`m.file` event follows the answer — one durable, idempotent outbox
+  row per file. Family rooms get a notice instead; at most 10 files per turn,
+  under 50 MB or the homeserver's `m.upload.size`; files outside the project
+  root are counted, not sent. `CCC_MATRIX_SEND_FILES=0` disables it.
+
 - **Matrix frontend runs the remaining lifecycle background services (#1825).**
   After #1998 the turn-stall probe, health alerts, session resource guard,
   skill-candidate collector, orphan reaper, task-ledger reconciliation,

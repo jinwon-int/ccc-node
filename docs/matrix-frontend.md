@@ -319,6 +319,30 @@ same prompt contract as Telegram (a local path in the prompt):
   unchanged. A download/integrity/size failure answers the room once and does
   not run the agent. The Grok frontend stays text-only.
 
+## Files the agent names are sent to direct rooms (#2001)
+
+As on Telegram, a real file an answer names — the shared rule in
+`core/deliverables.py` (documents, data, archives, images, audio, video; not
+source code) under `PROJECT_ROOT` — follows the answer. Matrix-specific:
+
+- **Encrypted**: the file is AES-256-CTR encrypted locally (`EncryptedFile`
+  v2), only the ciphertext is uploaded (`/_matrix/media/v3/upload`, no file
+  name in the request), and an encrypted `m.image`/`m.file` event carries the
+  key (`core/matrix/outbound_media.py`).
+- **Durable**: each file is its own outbox row (`$file-…`, body `file`)
+  queued after the answer, idempotent per turn and index; a restart resumes
+  it, a retryable upload error rides the send leg's back-off.
+- **Direct rooms only**: a family room gets one notice instead — an
+  owner-host file never lands where other people read.
+- **Bounded**: at most 10 files per turn; each under 50 MB or the
+  homeserver's `m.upload.size`, whichever is lower. Files outside
+  `PROJECT_ROOT` are not sent (Telegram asks with a button; Matrix has none)
+  and the room is told how many were skipped.
+- A file that is gone, unreadable, too large or refused gets
+  `📎 파일을 보내지 못했습니다: <name>` once and never blocks later rows;
+  body-free counters in inbox meta `outbound_file_failures`.
+- `CCC_MATRIX_SEND_FILES=0` turns it off.
+
 ## Not yet
 
 - Voice transcription for `m.audio` (handled as a file today).

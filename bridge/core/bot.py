@@ -1,7 +1,6 @@
 # ruff: noqa: E402
 import asyncio
 import logging
-import re
 import time
 from typing import Any, Dict, Optional, cast
 from datetime import datetime, timezone
@@ -23,7 +22,7 @@ from telegram.ext import (
     filters,
 )
 from telegram_bot.utils.chat_logger import log_debug
-from telegram_bot.core import session_resume
+from telegram_bot.core import deliverables, session_resume
 from telegram_bot.core.push_notifier import PushNotifier
 from telegram_bot.core.task_queue import UserTaskQueue
 from telegram_bot.core.bot_followup_queue import (
@@ -876,32 +875,7 @@ class TelegramBot(
     # matched path must still pass _resolve_paths' is_file()/size/scope gate
     # before anything is sent, so a false-positive token that is not a real file
     # is harmless.
-    _SENDABLE_FILE_EXTENSIONS = (
-        # documents
-        "pdf", "txt", "md", "markdown", "rtf", "doc", "docx", "odt", "tex", "epub",
-        # Korean word processor (Hangul) documents
-        "hwp", "hwpx",
-        # data / markup
-        "csv", "tsv", "json", "jsonl", "ndjson", "xml", "yaml", "yml", "ics", "log",
-        # spreadsheets / presentations
-        "xls", "xlsx", "ods", "ppt", "pptx", "odp",
-        # archives
-        "zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar",
-        # images
-        "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "svg", "heic",
-        # audio
-        "mp3", "wav", "ogg", "oga", "m4a", "flac", "aac", "opus", "amr",
-        # video
-        "mp4", "mov", "webm", "mkv", "avi", "m4v",
-    )
-    # Match both absolute (/foo/bar.pdf) and relative (foo/bar.pdf) file paths.
-    # A directory separator is required (reduces prose false-positives), and the
-    # trailing (?![A-Za-z0-9]) makes the extension alternation order-independent
-    # and stops partial matches (e.g. ".json" is not clipped to ".js").
-    _FILE_PATH_RE = re.compile(
-        r"(/?(?:[\w.@-]+/)+[\w.@-]+\.(?:"
-        + "|".join(_SENDABLE_FILE_EXTENSIONS)
-        + r"))(?![A-Za-z0-9])",
-        re.IGNORECASE,
-    )
-    _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+    # The deliverable rule is shared with the Matrix frontend (#2001).
+    _SENDABLE_FILE_EXTENSIONS = deliverables.SENDABLE_FILE_EXTENSIONS
+    _FILE_PATH_RE = deliverables.FILE_PATH_RE
+    _IMAGE_EXTS = deliverables.IMAGE_EXTS

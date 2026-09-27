@@ -61,6 +61,8 @@ from telegram_bot.core.matrix.attachments import (  # noqa: F401 - re-exported
 )
 
 MAX_TEXT_BYTES = 16_384
+# Outbox rows whose ``reply`` is an outbound-file payload, not text (#2001).
+FILE_JOB_BODY = "file"
 # Notices, status bubbles and operator texts. Agent replies are not bound by
 # it: the outbox splits a reply into as many events as it needs (#1957).
 MAX_REPLY_BYTES = 65_536
@@ -1262,9 +1264,22 @@ class MatrixStore(Store):
     def notice(self, req: Request, key: str, text: str) -> str:
         """Queue a durable, idempotent notice for ``req``'s room; returns its outbox event id."""
         bounded_text(text, MAX_REPLY_BYTES)
-        event = "$notice-" + hashlib.sha256(json.dumps([req.event_id, key]).encode()).hexdigest()
+        return self._ready_row(req, key, text, prefix="$notice-", body="notice")
+
+    def file_job(self, req: Request, key: str, payload: str) -> str:
+        """Queue one outbound file (#2001) as a durable, idempotent outbox row.
+
+        ``payload`` is the JSON the transport's file delivery reads (path, name,
+        size); the row rides the same ``ready`` → ``done`` lifecycle and seq
+        ordering as replies, so a file follows the answer that named it.
+        """
+        bounded_text(payload, 4096)
+        return self._ready_row(req, key, payload, prefix="$file-", body=FILE_JOB_BODY)
+
+    def _ready_row(self, req: Request, key: str, reply: str, *, prefix: str, body: str) -> str:
+        event = prefix + hashlib.sha256(json.dumps([req.event_id, key]).encode()).hexdigest()
         txn = hashlib.sha256(json.dumps([self.account, event, "reply-v1"]).encode()).hexdigest()
-        digest = hashlib.sha256(text.encode()).hexdigest()
+        digest = hashlib.sha256(reply.encode()).hexdigest()
         with self.db:
             old = self.db.execute("SELECT digest FROM jobs WHERE event_id=?", (event,)).fetchone()
             if old:
@@ -1274,7 +1289,7 @@ class MatrixStore(Store):
             self.db.execute(
                 "INSERT INTO jobs(event_id,room_id,sender,scope,body,digest,state,reply,txn_id) "
                 "VALUES (?,?,?,?,?,?,'ready',?,?)",
-                (event, req.room_id, req.sender, req.scope, "notice", digest, text, txn),
+                (event, req.room_id, req.sender, req.scope, body, digest, reply, txn),
             )
         return event
 

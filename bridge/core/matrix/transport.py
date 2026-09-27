@@ -45,6 +45,7 @@ from typing import Any, Mapping, Protocol
 from urllib.parse import quote
 
 from telegram_bot.core.matrix.state import (
+    FILE_JOB_BODY,
     MAX_REPLY_BYTES,
     MAX_TEXT_BYTES,
     MEDIA_MSGTYPES,
@@ -82,6 +83,11 @@ NOTICE_UNCERTAIN = (
 )  # legacy text kept for the operator unblock audit; no longer posted to rooms
 NOTICE_RESTARTED = "⏳ 답변 중에 서비스가 재시작되어 마지막 답변이 끊겼습니다. 메시지를 다시 보내 주세요."
 NOTICE_CANCELLED = "⏹ 요청대로 작업을 중단했습니다."
+# #2001: an agent deliverable that could not be sent (gone, too large, refused).
+NOTICE_FILE_UNSENT = "📎 파일을 보내지 못했습니다: {name}"
+# Same cap as the Telegram bridge (bot_delivery.MAX_SEND_FILE_BYTES); the
+# homeserver's m.upload.size lowers it further.
+MAX_OUTBOUND_FILE_BYTES = 50 * 1024 * 1024
 NOTICE_TIMEOUT = "⏳ 시간 제한({minutes}분)을 넘겨 작업을 중단했습니다. 요청을 나눠서 다시 보내 주세요."
 
 
@@ -954,6 +960,111 @@ class MatrixTransport:
         self.wake()
         return event_id
 
+    def enqueue_file(self, room_id: str, path: str, *, key: str) -> str:
+        """Queue one agent deliverable for a *direct* room (#2001); idempotent per ``key``.
+
+        Family rooms are refused: a file an owner-host agent names must not
+        land in a room other people read. The file is read, encrypted and
+        uploaded only when :meth:`send` reaches the row, after the answer.
+        """
+        if room_id not in self.c["rooms"]:
+            raise ValueError("room-not-allowed")
+        if self.room_kind(room_id) != "direct":
+            raise ValueError("file-room-not-direct")
+        file_path = Path(path)
+        if not file_path.is_absolute():
+            raise ValueError("file-path-not-absolute")
+        payload = json.dumps({"v": 1, "path": str(file_path), "name": file_path.name}, ensure_ascii=False)
+        req = Request(
+            "$outbound-file-" + hashlib.sha256(room_id.encode()).hexdigest()[:32],
+            room_id,
+            self.c["account"],
+            "file",
+            hashlib.sha256(json.dumps([self.c["account"], room_id, "outbound-file"]).encode()).hexdigest(),
+        )
+        event_id = self.store.file_job(req, key, payload)
+        self.wake()
+        return event_id
+
+    async def _upload_cap(self) -> int:
+        """Bridge cap (50 MB, as Telegram) or the homeserver's ``m.upload.size`` if lower."""
+        cached = getattr(self, "_upload_cap_cache", None)
+        if cached is None:
+            from telegram_bot.core.matrix.outbound_media import upload_limit
+
+            server = await upload_limit(self.http, self.c["homeserver"])
+            cached = min(MAX_OUTBOUND_FILE_BYTES, server) if server else MAX_OUTBOUND_FILE_BYTES
+            self._upload_cap_cache = cached
+        return int(cached)
+
+    async def _deliver_file(self, job: Mapping[str, Any]) -> bool:
+        """Encrypt, upload and send one queued file row (#2001), then mark it delivered.
+
+        A file that is gone, unreadable, too large or refused by the homeserver
+        gets one fixed notice naming it and the row completes — it never
+        blocks the rows behind it. A retryable transport error propagates to
+        the send leg's backoff and the row is retried from the start (the
+        upload is repeated; the room event keeps one transaction id).
+        """
+        from telegram_bot.core.matrix.outbound_media import (
+            OutboundMediaError,
+            encrypt,
+            file_content,
+            mimetype_of,
+            read_deliverable,
+            upload,
+        )
+
+        event_id, room = job["event_id"], job["room_id"]
+        try:
+            payload = json.loads(job["reply"])
+            path = Path(str(payload["path"]))
+            name = str(payload.get("name") or path.name)[:255]
+        except (ValueError, KeyError, TypeError):
+            self.store.delivered(event_id)
+            return True
+        try:
+            cap = await self._upload_cap()
+            plaintext = await asyncio.to_thread(read_deliverable, path, max_bytes=cap)
+            ciphertext, file_info = await asyncio.to_thread(encrypt, plaintext)
+            mxc = await upload(self.http, self.c["homeserver"], ciphertext)
+            content = file_content(name, mimetype_of(path), len(plaintext), mxc, file_info)
+            async with self.matrix_lock:
+                if room in self.blocked:
+                    return False
+                txn = hashlib.sha256((job["txn_id"] + ":file").encode()).hexdigest()
+                await self._encrypted_raw(room, "m.room.message", content, txn)
+        except OutboundMediaError as exc:
+            logger.info("matrix outbound file not sent reason=%s room=%s", exc.reason, room)
+            self._count_file_failure(exc.reason)
+            self._file_unsent_notice(job, name)
+        except MatrixHTTPError as exc:
+            if not exc.part_rejected:
+                raise
+            logger.info("matrix outbound file event rejected status=%s room=%s", exc.status, room)
+            self._count_file_failure("event-rejected")
+            self._file_unsent_notice(job, name)
+        else:
+            logger.info("matrix outbound file sent room=%s", room)
+        self.store.delivered(event_id)
+        return True
+
+    def _file_unsent_notice(self, job: Mapping[str, Any], name: str) -> None:
+        """One notice per failed file row; the key carries the text digest.
+
+        Notice rows are permanent and a same-key/different-text notice stops
+        the service, so a reworded text in a later release must be a new key.
+        """
+        text = NOTICE_FILE_UNSENT.format(name=name)
+        key = "file-unsent-" + hashlib.sha256(text.encode()).hexdigest()[:12]
+        self.store.notice(self.as_request(job), key, text)
+
+    def _count_file_failure(self, reason: str) -> None:
+        counts = self.store.get_meta("outbound_file_failures") or {}
+        counts[reason] = int(counts.get(reason) or 0) + 1
+        counts["updated"] = time.time()
+        self.store.set_meta("outbound_file_failures", counts)
+
     def enqueue_self_job(self, room_id: str, body: str, *, key: str, sender: str | None = None) -> str:
         """Queue a turn the frontend runs for ``sender`` in ``room_id`` (#1895 PR-A2).
 
@@ -1428,6 +1539,8 @@ class MatrixTransport:
         """
         from telegram_bot.core.matrix.render import event_chunks
 
+        if job.get("body") == FILE_JOB_BODY and str(job["event_id"]).startswith("$file-"):
+            return await self._deliver_file(job)
         event_id, room = job["event_id"], job["room_id"]
         chunks = event_chunks(job["reply"])
         for i in range(self.store.delivered_parts(event_id), len(chunks)):
