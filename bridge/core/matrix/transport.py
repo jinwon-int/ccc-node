@@ -167,6 +167,11 @@ NOTICE_UNPINNED_DEVICE = (
 
 NONCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,64}")
 APPROVAL_TIMEOUT_S = 120.0
+# ``_RoomSink.approval_outcome`` results (#1959).
+APPROVAL_ALLOW = "allow"
+APPROVAL_DENY = "deny"
+APPROVAL_TIMEOUT = "timeout"
+APPROVAL_UNAVAILABLE = "unavailable"
 TURN_JOIN_TIMEOUT_S = 30.0
 MAX_APPROVAL_TEXT_BYTES = 12_000
 MAX_PENDING_APPROVALS = 16
@@ -381,15 +386,31 @@ class _RoomSink:
                 transport.last_room_event[room] = self._bubble
 
     async def approval(self, description: str, arguments: Any) -> bool:
+        """Legacy bool form; ``arguments=None`` posts ``description`` alone."""
+
+        text = str(description)
+        if arguments is not None:
+            text += "\n" + json.dumps(arguments, ensure_ascii=False, default=str)
+        return await self.approval_outcome(text) == APPROVAL_ALLOW
+
+    async def approval_outcome(self, text: str) -> str:
+        """Post an already-redacted approval prompt and return how it ended.
+
+        One of ``allow`` / ``deny`` (the sender's ``/approve`` / ``/deny``),
+        ``timeout``, or ``unavailable`` (turn inactive, over the size or
+        pending cap -- nothing was posted). The caller owns redaction (#1959):
+        this layer never serializes provider arguments itself.
+        """
+
         transport = self.transport
         if not self._active():
-            return False
-        text = str(description) + "\n" + json.dumps(arguments, ensure_ascii=False, default=str)
+            return APPROVAL_UNAVAILABLE
+        text = str(text)
         if len(text.encode()) > MAX_APPROVAL_TEXT_BYTES or len(transport.approvals) >= MAX_PENDING_APPROVALS:
-            return False
+            return APPROVAL_UNAVAILABLE
         nonce = secrets.token_urlsafe(24)
         if not NONCE_PATTERN.fullmatch(nonce) or nonce in transport.approvals:
-            return False
+            return APPROVAL_UNAVAILABLE
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         transport.approvals[nonce] = future
         try:
@@ -399,9 +420,9 @@ class _RoomSink:
                 text + "\n승인: /approve " + self.tid + " " + nonce + "\n거절: /deny " + self.tid + " " + nonce,
             )
             async with asyncio.timeout(transport.approval_timeout):
-                return await future
+                return APPROVAL_ALLOW if await future else APPROVAL_DENY
         except TimeoutError:
-            return False
+            return APPROVAL_TIMEOUT
         finally:
             transport.approvals.pop(nonce, None)
 

@@ -19,6 +19,7 @@ import anyio
 import pytest
 
 from telegram_bot.contracts.agent_runtime import ModelInfo
+from telegram_bot.core.approval_contract import build_approval_snapshot
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
 from telegram_bot.core.matrix.bot import (
     DIRECT_ROOMS_FILENAME,
@@ -807,7 +808,9 @@ async def test_approval_adapter(
     assert seen["decision"] is expected
     assert bool(sink.approvals) is prompted
     if prompted:
-        assert sink.approvals == [("Run ls", {"cmd": "ls"})]
+        # #1959: the redacted provider-neutral snapshot, never the raw arguments.
+        expected_text = build_approval_snapshot(_event(), reply_hint=None).prompt_text
+        assert sink.approvals == [(expected_text, None)]
 
 
 @pytest.mark.parametrize(
