@@ -288,6 +288,43 @@ validate_env() {
     }
 }
 
+# ---- tunnel readiness gate (#1923) ----
+
+# Probe the broker health endpoint through the local tunnel exactly once.
+# Shared by `status` (read-only reporting) and the supervise spawn gates, so
+# every /livez check uses the same timeout and flags.
+tunnel_ready() {
+    timeout 3 curl -fsS -o /dev/null "http://127.0.0.1:${LOCAL_PORT}/livez" 2>/dev/null
+}
+
+# Bounded wait for the SSH tunnel to start forwarding before the worker dials
+# the broker through 127.0.0.1:$LOCAL_PORT (#1923).  Spawning the worker
+# against a not-yet-forwarding tunnel guarantees one failed boot and another
+# retry-loop iteration; polling /livez instead of sleeping a fixed number of
+# seconds means the worker spawns as soon as the tunnel is actually up.
+#
+# Fail-open by design: if /livez never answers within A2A_TUNNEL_GATE_TIMEOUT
+# seconds we log the dedicated defer label and return nonzero, and the caller
+# proceeds anyway.  Keeping the loop moving is the supervisor's job — turning
+# a down tunnel into a wedged supervisor would just trade the old failure mode
+# for a new one, and escalation for a persistently down tunnel is the health
+# checker's contract, not the spawn gate's.
+wait_for_tunnel() {
+    local gate_timeout="${A2A_TUNNEL_GATE_TIMEOUT:-30}"
+    local gate_interval="${A2A_TUNNEL_GATE_INTERVAL:-0.5}"
+    local deadline=$(( SECONDS + gate_timeout ))
+    while true; do
+        if tunnel_ready; then
+            return 0
+        fi
+        (( SECONDS >= deadline )) && break
+        sleep "$gate_interval"
+    done
+    log "tunnel-gate: tunnel not ready; deferring worker start" \
+        "(waited ${gate_timeout}s, fail-open)"
+    return 1
+}
+
 cmd_supervise() {
     local env_file="$1"
     # Scrub a poisoned LD_LIBRARY_PATH before the Python validation and before
@@ -359,8 +396,11 @@ cmd_supervise() {
     trap _cleanup EXIT
     trap 'log "signal received"; exit 0' TERM INT HUP
 
-    # Give the tunnel a moment to establish before the worker connects.
-    sleep 3
+    # Give the tunnel a bounded chance to establish before the worker
+    # connects (#1923).  The gate polls /livez so the worker spawns as soon as
+    # the tunnel actually forwards; on timeout it fails open and we still
+    # spawn, because the retry loop below owns recovery.
+    wait_for_tunnel || true
 
     while true; do
         # Close the inherited flock fd in the worker child so a hung
@@ -374,6 +414,11 @@ cmd_supervise() {
         log "worker exited pid=$worker_pid rc=$rc; retry 8s"
         worker_pid=0
         sleep 8
+        # Same bounded gate before every respawn (#1923): when the broker or
+        # tunnel is down, this keeps the 8s retry loop from becoming a tight
+        # worker-boot crash loop — each iteration waits for /livez before
+        # spending a boot.  Fail-open keeps the loop alive.
+        wait_for_tunnel || true
     done
 }
 
@@ -424,7 +469,7 @@ cmd_status() {
     printf 'lock: %s\n' "$LOCK"
     printf 'log: %s\n' "$LOG"
     printf 'tunnel: '
-    if timeout 3 curl -fsS -o /dev/null "http://127.0.0.1:${LOCAL_PORT}/livez" 2>/dev/null; then
+    if tunnel_ready; then
         printf 'UP (127.0.0.1:%s -> %s)\n' "$LOCAL_PORT" "$REMOTE_ENDPOINT"
     else
         printf 'DOWN\n'
@@ -475,6 +520,9 @@ Environment overrides (supervisor paths):
   A2A_SUPERVISOR_LOG_DIR    Default \$HOME/.hermes/logs
   A2A_SUPERVISOR_LOCK       Full lock file path (overrides LOCK_DIR)
   A2A_SUPERVISOR_LOG        Full log file path (overrides LOG_DIR)
+  A2A_TUNNEL_GATE_TIMEOUT   Tunnel /livez gate bound in seconds before the
+                            worker spawns anyway (fail-open); default 30.
+  A2A_TUNNEL_GATE_INTERVAL  Gate poll interval in seconds; default 0.5.
 EOF
     return 2
 }
