@@ -80,7 +80,7 @@ _ccc_test_nlink() {
 #
 # Unsets every exported `CCC_*` / `NUNCHI_*` name except `CCC_TEST_*` (fixture
 # plumbing such as `CCC_TEST_STUB_ROOT`) and any extra names passed as
-# arguments. Call it immediately after sourcing this file, before the suite
+# arguments, then exports CCC_SETUP_FAMILY_MCP=0 (unless preserved). Call it immediately after sourcing this file, before the suite
 # assigns its own fixture variables.
 ccc_test_reset_hook_env() {
   local name keep preserved=" "
@@ -100,6 +100,15 @@ ccc_test_reset_hook_env() {
     esac
     unset "$name"
   done
+
+  # setup.sh registers the family MCP servers through the REAL `claude` CLI
+  # (#2011 D). Suites run full installs with the node's PATH, so default that
+  # step off; a suite exercising it passes CCC_SETUP_FAMILY_MCP=1 per command
+  # with a stub `claude` on PATH.
+  case "$preserved" in
+    *" CCC_SETUP_FAMILY_MCP "*) ;;
+    *) export CCC_SETUP_FAMILY_MCP=0 ;;
+  esac
 }
 
 # Stub BODY is read from stdin (typically a quoted heredoc). The destination

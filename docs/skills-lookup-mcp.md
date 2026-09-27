@@ -13,7 +13,8 @@ server (`wiki-agent mcp-serve`) and is never reimplemented here.
 | `bridge/core/family_skills_server.py` | `family-skills` stdio MCP server (JSON-RPC 2.0, newline-delimited). stdlib-only. |
 | `bridge/core/family_mcp.py` | Bridge-side explicit injection for owner profiles; merges with the curated web MCP without overwriting it. |
 | `scripts/ccc-skill-lookup.py` | JSON CLI. `stdout` carries results only; diagnostics go to `stderr`. |
-| `claude/mcp-setup.sh` | Idempotent user-scope registration of `family-skills` and `family-wiki` for Claude CLI. |
+| `claude/mcp-setup.sh` | Idempotent user-scope registration of `family-skills` and `family-wiki` for Claude CLI; `--family-only` registers just the in-repo `family-skills`/`family-ops` servers. |
+| `setup.sh` | Runs `claude/mcp-setup.sh --family-only` from the self-update managed checkout, so installs and self-updates register `family-skills` automatically (#2011 D). |
 
 ## Sources, ids, and revisions
 
@@ -64,6 +65,29 @@ MCP server (registration happens in `claude/mcp-setup.sh`):
 claude mcp add family-skills -s user -- python3 /opt/ccc-node/bridge/core/family_skills_server.py
 claude mcp add family-wiki   -s user -- wiki-agent mcp-serve
 ```
+
+Automatic registration (#2011 D). Until #2011 only the optional manual
+`claude/mcp-setup.sh` registered the server, so a node that never re-ran it
+after #1695 (seen 2026-09-27) had no `mcp__family-skills__*` tools. `setup.sh`
+now calls `claude/mcp-setup.sh --family-only` on every run, which registers only
+the local, stdlib-only, secret-free `family-skills` and `family-ops` servers
+(absolute `python3` + this checkout's server path):
+
+- only when setup runs from the **self-update managed checkout** (normal
+  checkout, not a linked worktree or secondary clone) — a dev worktree must not
+  repoint the user-scope server at unreviewed code (#842);
+- only when the `claude` CLI is on `PATH`; `--dry-run` only announces it;
+- an identical existing registration (same command/args, no env) is left
+  untouched, so `~/.claude.json` is not rewritten on every update; a stale path
+  (e.g. an old checkout) is removed and re-added;
+- failure is a warning, never a failed install; `CCC_SETUP_FAMILY_MCP=0`
+  opts a node out.
+
+`family-wiki` (external `wiki-agent`) and the networked/keyed `searxng`,
+`context7` and `firecrawl` servers stay manual via `./claude/mcp-setup.sh`.
+Codex, Piri and Danso registration remains out of scope (see below). A running
+Claude session sees a new user-scope server only after it restarts; the
+bridge's owner-profile injection is unchanged.
 
 Protocol flow: `initialize` (echoes a supported protocol version) →
 `tools/list` → `tools/call`. Results are returned as a single JSON text

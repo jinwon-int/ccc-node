@@ -1181,6 +1181,46 @@ out="$(run_setup_in "$guard_repo" "$dry_home" --dry-run)"
 ok "dry-run reports the guard install without touching .git" \
   'grep -q "would install managed-checkout guard" <<<"$out" && [ ! -e "$GUARD_HOOK" ]'
 
+# --- family-skills / family-ops MCP registration (#2011 D) --------------------
+# Only from the managed checkout, through mcp-setup.sh --family-only, with a
+# stub `claude` shadowing any real CLI. The suite-wide default (test-stub reset)
+# is off, so each case opts in with CCC_SETUP_FAMILY_MCP=1.
+fam_bin="$TMP/fam-cli"; mkdir -p "$fam_bin"
+fam_log="$TMP/fam-claude.log"
+printf '#!%s\necho "$*" >> %q\nexit "${FAM_CLAUDE_RC:-0}"\n' \
+  "$(PATH="$REAL_PATH" command -v bash)" "$fam_log" > "$fam_bin/claude"
+chmod +x "$fam_bin/claude"
+run_setup_fam() { # <home> [extra setup args...] — CCC_SETUP_FAMILY_MCP=1, stub claude first
+  local home="$1"; shift
+  : > "$fam_log"
+  (cd "$guard_repo" && HOME="$home" CCC_CLAUDE_DIR="$home/.claude" CCC_HERMES_DIR="$home/.hermes" \
+    CCC_SETUP_FAMILY_MCP=1 PATH="$fam_bin:$REAL_PATH" \
+    bash "$guard_repo/setup.sh" --no-backup "$@" 2>&1)
+}
+fam_home="$TMP/fam-home"
+out="$(run_setup_fam "$fam_home")"; rc=$?
+ok "family MCP: managed checkout registers family-skills via mcp-setup --family-only" \
+  '[ "$rc" = 0 ] && grep -Eq "^mcp add family-skills -s user -- /.*python3 $guard_repo/bridge/core/family_skills_server.py$" "$fam_log" && grep -q "family-skills + family-ops MCP registered" <<<"$out"'
+ok "family MCP: family-ops registered, networked/keyed servers untouched" \
+  'grep -q "^mcp add family-ops -s user" "$fam_log" && ! grep -Eq "searxng|context7|firecrawl|family-wiki" "$fam_log"'
+
+out="$(run_setup_fam "$other_home")"
+ok "family MCP: skipped when another checkout is the managed repo" \
+  'grep -q "family MCP registration: not the self-update managed checkout" <<<"$out" && [ ! -s "$fam_log" ]'
+
+out="$(run_setup_fam "$TMP/fam-dry-home" --dry-run)"
+ok "family MCP: dry-run announces without calling claude" \
+  'grep -q "would register family-skills + family-ops MCP" <<<"$out" && [ ! -s "$fam_log" ]'
+
+out="$(FAM_CLAUDE_RC=1 run_setup_fam "$fam_home")"; rc=$?
+ok "family MCP: registration failure is a warning, not a failed install" \
+  '[ "$rc" = 0 ] && grep -q "WARNING: family MCP registration failed" <<<"$out"'
+
+: > "$fam_log"
+out="$(run_setup_in "$guard_repo" "$fam_home")"
+ok "family MCP: CCC_SETUP_FAMILY_MCP=0 opts out" \
+  'grep -q "family MCP registration: disabled" <<<"$out" && [ ! -s "$fam_log" ]'
+
 # #1950: Termux has no /usr/bin/env and git exec()s hooks directly, so a
 # verbatim `#!/usr/bin/env bash` hook fails ("cannot exec") and git switch
 # exits 1. On Termux the installed copy must carry `#!$PREFIX/bin/bash`, with
