@@ -4,6 +4,21 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **Skills: the model now sees descriptions for the skills that matter
+  (#2011 A).** Claude Code caps the per-turn skill listing at
+  `skillListingBudgetFraction` (1% of context) and, when over budget, only
+  describes the most-used skills; with 189 skills and usage data for 13,
+  one node's sessions described 87 of ~208 in effectively alphabetical order.
+  New `scripts/ccc-skill-listing-policy.py` (`plan`/`apply`/`release`) keeps
+  descriptions for the core list (`claude/skill-listing-core.txt`) and skills
+  used in the last 30 days, sets the rest to `skillOverrides: "name-only"`
+  (never `"off"`, never deletes), and sets the budget to 0.02 only when the key
+  is absent. It manages only the entries it created (operator entries always
+  win), backs up and writes `settings.json` atomically, and is idempotent.
+  `setup.sh` now carries `skillOverrides`/`skillListingBudgetFraction`/
+  `skillListingMaxDescChars` across the settings re-render and runs the policy
+  after skills are installed; the fleet-skills sync cron entry runs it daily
+  after each sync. See `docs/skill-listing-budget.md`.
 - **setup.sh registers the `family-skills` MCP automatically (#2011 D).** The
   local, stdlib-only skill search server (#1678/#1695) was registered only by
   the optional manual `claude/mcp-setup.sh`, so a node that never re-ran it

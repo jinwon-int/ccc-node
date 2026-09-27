@@ -1,0 +1,38 @@
+# Skill-listing core set (ccc-node#2011 A) — one skill name per line.
+#
+# Claude Code injects the skill listing each turn under a character budget
+# (`skillListingBudgetFraction`, default 1% of the context window). Over the
+# budget it keeps every name but only describes the most-used skills, so on a
+# node with ~200 skills most of them — including the fleet workflows below —
+# were listed as bare names. scripts/ccc-skill-listing-policy.py keeps the
+# description for every skill named here plus every skill used within the
+# recent window, and sets the rest to `skillOverrides: "name-only"` (still
+# listed and invocable; never "off", never deleted).
+#
+# Keep this list short: every entry spends listing budget on every turn of
+# every session. Names absent on a node are ignored. Custom commands under
+# ~/.claude/commands (wiki-log, a2a-claim, doctor, ...) are not managed by the
+# policy at all, so they do not need an entry here.
+
+# --- repo-shipped fleet workflows (skills/ in this repository) ---
+gh-pr-flow
+gh-ci-wait
+wiki-record
+self-update
+bridge-safe-detached-run
+bridge-detached-self-restart
+bridge-yield-continue
+distill
+skillsuggest
+mcp-add
+web-routing
+debug-long-running-agent-tasks
+fleet-task-handoff-with-constraints
+ghost-process-cleanup-and-verification
+github-merge-state-conflict-diagnosis
+github-incident-recovery-merge-retry
+
+# --- fleet flows installed outside this repository (fleet-skills / node) ---
+a2a-task-poll
+remote-node-harness-sync
+model-migrate

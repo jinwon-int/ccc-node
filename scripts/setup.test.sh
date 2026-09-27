@@ -285,6 +285,30 @@ ok "template-declared env keys stay repo-owned (node override dropped)" \
 ok "env preservation is logged with the key names" 'grep -q "preserved node-local settings env keys: .*CCC_NODE_LOCAL_EXPERIMENT_FLAG" <<<"$out"'
 out="$(HOME="$env_home" CCC_CLAUDE_DIR="$env_claude" CCC_HERMES_DIR="$env_hermes" bash "$SETUP" --no-backup --dry-run 2>&1)"
 ok "dry-run only announces env preservation" 'grep -q "\[dry-run\] preserve node-local settings env keys" <<<"$out"'
+# --- #2011 A: skill-listing policy runs after the merge; its keys survive ----
+# setup applies the policy once repo skills are installed: core skills keep
+# their description, non-core ones become "name-only", and the budget key is
+# set only when absent. A re-render must carry the operator's and the policy's
+# skillOverrides / skillListingBudgetFraction / skillListingMaxDescChars.
+sl_home="$TMP/sl-home"; sl_claude="$sl_home/.claude"; sl_hermes="$sl_home/.hermes"
+mkdir -p "$sl_claude" "$sl_hermes"
+HOME="$sl_home" CCC_CLAUDE_DIR="$sl_claude" CCC_HERMES_DIR="$sl_hermes" bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "setup applies the skill-listing policy (budget key set when absent)" \
+  'jq -e ".skillListingBudgetFraction == 0.02" "$sl_claude/settings.json" >/dev/null && [ -f "$sl_claude/state/skill-listing-policy.json" ]'
+ok "core skill keeps its description; non-core repo skill is name-only" \
+  'jq -e "(.skillOverrides | has(\"gh-pr-flow\") | not) and .skillOverrides[\"hwp-forge-donor-template-restore-build\"] == \"name-only\"" "$sl_claude/settings.json" >/dev/null'
+ok "setup installs the policy and its core list into hooks/" \
+  '[ -x "$sl_claude/hooks/ccc-skill-listing-policy.py" ] && [ -f "$sl_claude/hooks/skill-listing-core.txt" ]'
+jq '.skillOverrides["gh-pr-flow"] = "off" | .skillListingBudgetFraction = 0.05 | .skillListingMaxDescChars = 500' \
+  "$sl_claude/settings.json" > "$TMP/sl-seeded.json" && mv "$TMP/sl-seeded.json" "$sl_claude/settings.json"
+out="$(HOME="$sl_home" CCC_CLAUDE_DIR="$sl_claude" CCC_HERMES_DIR="$sl_hermes" bash "$SETUP" --no-backup 2>&1)"
+ok "operator skill-listing keys survive setup re-render" \
+  'jq -e ".skillOverrides[\"gh-pr-flow\"] == \"off\" and .skillListingBudgetFraction == 0.05 and .skillListingMaxDescChars == 500" "$sl_claude/settings.json" >/dev/null'
+ok "policy-owned name-only entries survive setup re-render" \
+  'jq -e ".skillOverrides[\"hwp-forge-donor-template-restore-build\"] == \"name-only\"" "$sl_claude/settings.json" >/dev/null'
+ok "skill-listing key preservation is logged" 'grep -q "preserved node-local settings keys: .*skillOverrides" <<<"$out"'
+ok "setup never writes an off override of its own" \
+  '[ "$(jq -r "[.skillOverrides | to_entries[] | select(.value == \"off\") | .key] | join(\",\")" "$sl_claude/settings.json")" = "gh-pr-flow" ]'
 # --- #1436: the retired Honcho credential is never resurrected by setup ------
 # Two full setup runs above would have re-seeded hermes/honcho.template.json
 # on the old behavior; the disposal (slice 5) must stick.

@@ -35,6 +35,7 @@ SELF="$SELF_DIR/install-fleet-skills-sync-cron.sh"
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}"
 STATE_DIR="${CCC_STATE_DIR:-$CLAUDE_DIR/state}"
 SYNC="${CCC_FLEET_SKILLS_SYNC_CMD:-$CLAUDE_DIR/hooks/ccc-fleet-skills-sync.py}"
+POLICY="${CCC_SKILL_LISTING_POLICY_CMD:-$CLAUDE_DIR/hooks/ccc-skill-listing-policy.py}"
 REPO_URL="${CCC_FLEET_SKILLS_REPO:-https://github.com/jinwon-int/fleet-skills.git}"
 REPO_BRANCH="${CCC_FLEET_SKILLS_BRANCH:-main}"
 SCHEDULE="${CCC_FLEET_SKILLS_SYNC_CRON:-0 5 * * *}"
@@ -87,6 +88,7 @@ Options:
                    back to the inherited CCC_DANSO_STATE_DIR when unset.
 
 Env overrides: CCC_CLAUDE_DIR, CCC_STATE_DIR, CCC_FLEET_SKILLS_SYNC_CMD,
+CCC_SKILL_LISTING_POLICY_CMD (skill-listing policy run after each sync, #2011),
 CCC_FLEET_SKILLS_REPO, CCC_FLEET_SKILLS_BRANCH, CCC_FLEET_SKILLS_SYNC_CRON,
 CCC_FLEET_SKILLS_SYNC_CRON_LOG, CCC_CRONTAB_CMD.
 CCC_DANSO_STATE_DIR (inherited when --danso-state-dir is unset).
@@ -143,7 +145,12 @@ DANSO_ENV=""
 # The body is single-quoted for `bash -lc`; \$S is resolved at fire time, not
 # at install time, so the entry never pins a stale ref. An empty ls-remote
 # (offline) short-circuits instead of handing the sync an empty --ref.
-CRON_LINE="$SCHEDULE bash -lc 'S=\$(git ls-remote \"$REPO_URL\" \"$REPO_BRANCH\" | cut -f1); [ -n \"\$S\" ] && ${DANSO_ENV}CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" python3 \"$SYNC\" apply --ref \"\$S\"' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
+#
+# #2011 A: after the sync (which may install or remove skills) the skill-listing
+# budget policy re-derives which skills keep their listing description. It runs
+# whether or not the sync succeeded (usage ages even on an offline day), and
+# the entry still exits with the SYNC's status so a failed sync stays visible.
+CRON_LINE="$SCHEDULE bash -lc 'S=\$(git ls-remote \"$REPO_URL\" \"$REPO_BRANCH\" | cut -f1); [ -n \"\$S\" ] && ${DANSO_ENV}CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" python3 \"$SYNC\" apply --ref \"\$S\"; rc=\$?; [ -f \"$POLICY\" ] && CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" python3 \"$POLICY\" apply --quiet; exit \$rc' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
 
 if [ "$APPLY" = 1 ] && [ "$REMOVE" != 1 ]; then
   # Same redirect-first failure mode as the sibling installers: the cron line
