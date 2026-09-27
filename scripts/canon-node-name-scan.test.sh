@@ -93,6 +93,8 @@ make_repo() { # $1 = fixture root
   printf 'role wording only: relay node, broker host\n' > "$1/src/clean.sh"
   printf 'seoseo-ai approves; gh-seoseo-ai config\n' > "$1/src/accounts.md"
   printf '## history\n- moved off yukson\n' > "$1/CHANGELOG.md"
+  mkdir -p "$1/changelog.d"
+  cp "$1/CHANGELOG.md" "$1/changelog.d/2022-move.md"  # a #2022 fragment naming a node
   git -C "$1" add -A
 }
 make_repo "$TMP/repo"
@@ -105,8 +107,8 @@ ok "repo-wide --update-baseline writes the file" \
   "bash '$SCAN' --repo-wide --root '$TMP/repo' --update-baseline >'$TMP/out' 2>&1"
 ok "baseline counts hits per file (2 on the dirty file only)" \
   "grep -qx '2 src/fleet.sh' '$TMP/repo/scripts/canon-node-name-baseline.txt'"
-ok "baseline skips clean files, account tokens and CHANGELOG.md" \
-  "! grep -qE 'clean.sh|accounts.md|CHANGELOG' '$TMP/repo/scripts/canon-node-name-baseline.txt'"
+ok "baseline skips clean files, account tokens, CHANGELOG.md and its fragments" \
+  "! grep -qE 'clean.sh|accounts.md|CHANGELOG|changelog.d' '$TMP/repo/scripts/canon-node-name-baseline.txt'"
 ok "repo-wide matches its own baseline" \
   "bash '$SCAN' --repo-wide --root '$TMP/repo' >'$TMP/out' 2>&1 && grep -q 'ok — matches baseline (1 files, 2 hits)' '$TMP/out'"
 

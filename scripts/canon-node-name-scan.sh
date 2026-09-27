@@ -14,7 +14,8 @@
 #   - a baseline file whose hit count went DOWN (or to zero)      -> fail until
 #     the baseline is regenerated, so the progress is locked in   (shrank)
 # `--update-baseline` regenerates the file from the current tree; it is the
-# only sanctioned way to edit it. Allowed outside the scan: CHANGELOG.md and
+# only sanctioned way to edit it. Allowed outside the scan: CHANGELOG.md, its
+# changelog.d/ fragments (#2022 — they become CHANGELOG.md at release), and
 # git history (mitigation, not rewrite — #1451), the hashed CI requirement
 # pins, and the baseline file itself.
 set -euo pipefail
@@ -107,7 +108,7 @@ esac
 # Paths come out of grep relative to $root because grep runs there.
 current="$(
   cd "$root" && git ls-files -z \
-    | grep -zvE "^((.*/)?CHANGELOG\.md|\.github/requirements/.*|${baseline_rel})$" \
+    | grep -zvE "^((.*/)?CHANGELOG\.md|(bridge/)?changelog\.d/[^/]+\.md|\.github/requirements/.*|${baseline_rel})$" \
     | xargs -0 grep -IniE "$pattern" -- 2>/dev/null \
     | filter_hits \
     | awk '{ c1 = index($0, ":"); p = substr($0, 1, c1 - 1); n[p]++ }
