@@ -150,9 +150,9 @@ reset_probe() {
     bash -c '
       . "$1/test-stub.sh"
       ccc_test_reset_hook_env CCC_KEEP_ME
-      printf "managed=[%s] state=[%s] nunchi=[%s] stubroot=[%s] keep=[%s] home=[%s]\n" \
+      printf "managed=[%s] state=[%s] nunchi=[%s] stubroot=[%s] keep=[%s] home=[%s] familymcp=[%s]\n" \
         "${CCC_BRIDGE_DISTILL_MANAGED:-}" "${CCC_STATE_DIR:-}" "${NUNCHI_HOME:-}" \
-        "${CCC_TEST_STUB_ROOT:-}" "${CCC_KEEP_ME:-}" "${HOME:+set}"
+        "${CCC_TEST_STUB_ROOT:-}" "${CCC_KEEP_ME:-}" "${HOME:+set}" "${CCC_SETUP_FAMILY_MCP:-}"
     ' _ "$HERE"
 }
 # shellcheck disable=SC2034  # $reset_out is consumed via eval in ok()
@@ -170,6 +170,8 @@ ok "reset preserves explicitly named variables" \
   '[[ "$reset_out" == *"keep=[/keep]"* ]]'
 ok "reset leaves unrelated environment untouched" \
   '[[ "$reset_out" == *"home=[set]"* ]]'
+ok "reset defaults setup.sh family MCP registration off (#2011 D)" \
+  '[[ "$reset_out" == *"familymcp=[0]"* ]]'
 
 # The helper only fixes suites that actually call it, so audit every suite that
 # sources the stub -- not just the distill lane it was introduced for. The leak

@@ -15,7 +15,21 @@
 # Linux keeps `npx -y <pkg>`. (#663)
 #
 # Usage: ./claude/mcp-setup.sh   (or from anywhere: bash mcp-setup.sh)
+#        ./claude/mcp-setup.sh --family-only
+#          Register only the in-repo, stdlib-only, secret-free family-skills and
+#          family-ops servers (no npx, network or keys). setup.sh runs this mode
+#          from the managed checkout (#2011 D); an identical registration is
+#          left untouched so re-runs do not rewrite ~/.claude.json.
 set -uo pipefail
+
+FAMILY_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --family-only) FAMILY_ONLY=1 ;;
+    -h|--help) sed -n '2,/^set -uo/p' "$0" | sed '$d'; exit 0 ;;
+    *) echo "mcp-setup.sh: unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
 
 IS_TERMUX=0
 case "${PREFIX:-}" in */com.termux/files/usr) IS_TERMUX=1 ;; esac
@@ -26,6 +40,42 @@ add() { # add <name> [claude-mcp-add args...]
   local name="$1"; shift
   claude mcp remove "$name" -s user >/dev/null 2>&1 || true
   claude mcp add "$name" -s user "$@"
+}
+
+# True when the user-scope registration of <name> already launches exactly
+# <command> <args...> with no env overrides. Read-only JSON inspection of the
+# Claude user config (never printed), so an unchanged server is not removed and
+# re-added on every run. Any doubt (missing/unreadable config) -> not registered.
+registered_as() { # registered_as <name> <command> [args...]
+  local cfg="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+  [ -f "$cfg" ] || return 1
+  python3 - "$cfg" "$@" <<'PY' 2>/dev/null
+import json, sys
+cfg, name, command, *args = sys.argv[1:]
+try:
+    with open(cfg, encoding="utf-8") as fh:
+        entry = json.load(fh).get("mcpServers", {}).get(name)
+except Exception:
+    sys.exit(1)
+ok = (
+    isinstance(entry, dict)
+    and entry.get("type", "stdio") == "stdio"
+    and entry.get("command") == command
+    and entry.get("args", []) == args
+    and not entry.get("env")
+)
+sys.exit(0 if ok else 1)
+PY
+}
+
+# add_if_changed <name> <command> [args...]: idempotent without churn.
+add_if_changed() {
+  local name="$1"; shift
+  if registered_as "$name" "$@"; then
+    echo "  - $name: already registered (unchanged)"
+    return 0
+  fi
+  add "$name" -- "$@"
 }
 
 # Absolute path to a globally-installed package's first bin entry. Reads `bin`
@@ -72,13 +122,22 @@ echo "==> Registering MCP servers (user scope)…"
 # server re-checks the node isolation/audience policy at every tools/call.
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY3="$(command -v python3)"
+FAMILY_FAIL=0
 if [ -n "$PY3" ] && [ -f "$REPO_ROOT/bridge/core/family_skills_server.py" ] && [ -f "$REPO_ROOT/bridge/core/family_ops_server.py" ]; then
-  add family-skills -- "$PY3" "$REPO_ROOT/bridge/core/family_skills_server.py"
+  add_if_changed family-skills "$PY3" "$REPO_ROOT/bridge/core/family_skills_server.py" || FAMILY_FAIL=1
   echo "  - family-skills: $REPO_ROOT/bridge/core/family_skills_server.py"
-  add family-ops -- "$PY3" "$REPO_ROOT/bridge/core/family_ops_server.py"
+  add_if_changed family-ops "$PY3" "$REPO_ROOT/bridge/core/family_ops_server.py" || FAMILY_FAIL=1
   echo "  - family-ops: $REPO_ROOT/bridge/core/family_ops_server.py"
 else
   echo "  - family-skills/family-ops: SKIPPED — python3 or server file missing"
+  FAMILY_FAIL=1
+fi
+
+if [ "$FAMILY_ONLY" = 1 ]; then
+  # No `claude mcp list`: it health-checks every server, including networked ones.
+  # Exit status reports the family registrations so setup.sh can warn.
+  echo "==> Done (family-only: family-wiki, searxng, context7, firecrawl untouched)."
+  exit "$FAMILY_FAIL"
 fi
 
 # family-wiki — the existing wiki-agent read-only server, reused verbatim

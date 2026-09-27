@@ -4,6 +4,19 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **setup.sh registers the `family-skills` MCP automatically (#2011 D).** The
+  local, stdlib-only skill search server (#1678/#1695) was registered only by
+  the optional manual `claude/mcp-setup.sh`, so a node that never re-ran it
+  (dungae, 2026-09-27: only searxng/context7/firecrawl) had no
+  `mcp__family-skills__*` tools. `setup.sh` now runs the new
+  `claude/mcp-setup.sh --family-only` mode, which registers just the in-repo
+  `family-skills` and `family-ops` servers — only from the self-update managed
+  checkout (never a dev worktree, #842), only with the `claude` CLI on PATH,
+  leaving an identical registration untouched (no `~/.claude.json` rewrite) and
+  re-adding a stale path. Failure is a warning; `CCC_SETUP_FAMILY_MCP=0` opts
+  out. family-wiki and the networked/keyed servers stay manual; the stale
+  setup checklist text now says so. Test suites default the step off via
+  `ccc_test_reset_hook_env` so a full install never calls a real `claude`.
 - **Bridge skill advice: provider-aware candidates and a measurable follow rate
   (#2011 C).** `ccc_skill_advice` resolved each candidate by probing
   `~/.codex/skills` before `~/.claude/skills` whatever provider was running,

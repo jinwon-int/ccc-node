@@ -1482,6 +1482,31 @@ else
   done
 fi
 
+# family-skills / family-ops MCP registration (#2011 D, #1678). The in-repo
+# stdlib servers are local, secret-free and network-free, yet only the optional
+# manual `claude/mcp-setup.sh` registered them, so nodes installed or updated
+# without that step (seen 2026-09-27) never saw mcp__family-skills__*. Register
+# them here in mcp-setup.sh's --family-only mode: an identical registration is
+# left untouched (no ~/.claude.json rewrite), a stale path is re-added. Only from
+# the self-update managed checkout, never a dev worktree or secondary clone —
+# the user-scope server path must not be repointed at unreviewed code (#842).
+# Non-fatal; CCC_SETUP_FAMILY_MCP=0 opts out. The networked/keyed servers
+# (searxng, context7, firecrawl) and family-wiki stay manual.
+if [ "${CCC_SETUP_FAMILY_MCP:-1}" = "0" ]; then
+  note "family MCP registration: disabled (CCC_SETUP_FAMILY_MCP=0)"
+elif [ "$MANAGED_REPO" != "$SRC_ABS" ] || [ ! -d "$SRC/.git" ] \
+  || [ -z "$src_gitdir" ] || [ "$src_gitdir" != "$src_commondir" ]; then
+  note "family MCP registration: not the self-update managed checkout — skipped"
+elif ! command -v claude >/dev/null 2>&1; then
+  note "family MCP registration: claude CLI not on PATH — skipped"
+elif [ "$DRY" = 1 ]; then
+  note "would register family-skills + family-ops MCP (claude/mcp-setup.sh --family-only)"
+elif bash "$SRC/claude/mcp-setup.sh" --family-only; then
+  note "family-skills + family-ops MCP registered (user scope)"
+else
+  note "WARNING: family MCP registration failed — re-run: $SRC/claude/mcp-setup.sh --family-only"
+fi
+
 # #968: Termux/Android hash-locked installs may need to build packages from
 # source (cryptography 50 has no Android wheel -> maturin -> Rust). A missing
 # toolchain killed the daegyo bridge on 2026-08-06 and the prerequisite lived
@@ -1516,8 +1541,10 @@ cat <<'EOF'
   6. Start a fresh Claude Code session and confirm the SessionStart snapshot injects.
   7. (Optional) MCP tool servers: ./claude/mcp-setup.sh
      Registers searxng (explicit Tailnet fallback) + context7 (docs) + firecrawl
-     (search + scrape; key read from ~/.hermes/.env). Idempotent; tool perms
-     pre-allowed in settings.json.
+     (search + scrape; key read from ~/.hermes/.env) + family-wiki (when
+     wiki-agent is installed). family-skills + family-ops are already
+     registered by this setup run from the managed checkout. Idempotent; tool
+     perms pre-allowed in settings.json.
   8. (Optional) Telegram bridge: cd bridge && cp .env.example .env && edit, then
      ./start.sh --path $BRIDGE_DEFAULT_PATH -d   (daemon-supervised). See bridge/README.md.
      Linux reboot-persistence: ./start.sh --path $BRIDGE_DEFAULT_PATH --install-systemd   (systemd unit).
