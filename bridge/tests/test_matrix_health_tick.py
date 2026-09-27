@@ -39,6 +39,24 @@ class RecordingReporter:
         return [name for name, _a, _k in self.calls]
 
 
+async def _until_calls(reporter: RecordingReporter, minimums: dict[str, int], timeout: float = 5.0) -> None:
+    """Keep the transport leg alive until the health loop has ticked enough (#2008).
+
+    A fixed sleep window assumed the first ticks land within tens of
+    milliseconds; on a loaded CI runner the startup path can take most of
+    that window and only one tick lands. Polling to a count, bounded by a
+    generous deadline, keeps the assertion meaning without the race.
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        names = reporter.names()
+        if all(names.count(name) >= count for name, count in minimums.items()):
+            return
+        await asyncio.sleep(0.005)
+
+
 class SignalTransport(FakeTransport):
     """A transport that exposes #1820 health signals (fresh sync by default)."""
 
@@ -83,7 +101,7 @@ async def test_serve_binds_marks_and_ticks_health(tmp_path: Path, matrix_config:
     holder = await _attach(bot, SignalTransport)
 
     async def body(transport: FakeTransport) -> None:
-        await asyncio.sleep(0.08)  # several ticks
+        await _until_calls(reporter, {"record_workload": 2, "record_telegram_ok": 2})
     holder["body"] = body
     await bot.serve()
 
@@ -116,7 +134,7 @@ async def test_health_tick_survives_reporter_errors_and_missing_snapshots(tmp_pa
     holder = await _attach(bot)
 
     async def body(transport: FakeTransport) -> None:
-        await asyncio.sleep(0.05)
+        await _until_calls(reporter, {"record_workload": 2})
     holder["body"] = body
     await bot.serve()  # a failing tick never stops the transport leg
 
