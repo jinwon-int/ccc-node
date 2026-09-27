@@ -61,6 +61,8 @@ from telegram_bot.core.matrix.attachments import (  # noqa: F401 - re-exported
 )
 
 MAX_TEXT_BYTES = 16_384
+# Outbox rows whose ``reply`` is an outbound-file payload, not text (#2001).
+FILE_JOB_BODY = "file"
 # Refusals the sender is told about (#2002) — see Policy.rejection.
 REJECT_TEXT_TOO_LARGE = "text-too-large"
 REJECT_EDIT = "edit"
@@ -935,6 +937,11 @@ _MATRIX_SCHEMA = """
         PRIMARY KEY(event_id, part));
     -- notice event id -> the outbox row whose failed parts it reports.
     CREATE TABLE IF NOT EXISTS delivery_failure_notices(event_id TEXT PRIMARY KEY, source TEXT NOT NULL);
+    -- #2001: files a turn named, held until that turn's answer is recorded
+    -- (then they become outbox rows behind it) or dropped if it never is.
+    CREATE TABLE IF NOT EXISTS held_files(parent TEXT NOT NULL, key TEXT NOT NULL,
+        room_id TEXT NOT NULL, sender TEXT NOT NULL, scope TEXT NOT NULL, payload TEXT NOT NULL,
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, UNIQUE(parent, key));
 """
 
 _STATE_FILES = ("inbox.sqlite3", "inbox.sqlite3-journal", "inbox.sqlite3-wal", "inbox.sqlite3-shm")
@@ -1173,9 +1180,56 @@ class MatrixStore(Store):
         super().__init__(directory, account)
         try:
             self.db.executescript(_MATRIX_SCHEMA)
+            self._settle_held_files()
         except BaseException:
             self.close()
             raise
+
+    # -- held outbound files (#2001) ------------------------------------------
+
+    def hold_file(self, parent: str, req: Request, key: str, payload: str) -> None:
+        """Hold one outbound file until ``parent``'s answer is recorded; idempotent per key."""
+        bounded_text(payload, 4096)
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO held_files(parent,key,room_id,sender,scope,payload) VALUES (?,?,?,?,?,?)",
+                (parent, key, req.room_id, req.sender, req.scope, payload),
+            )
+
+    def _release_files(self, parent: str) -> int:
+        rows = self.db.execute(
+            "SELECT * FROM held_files WHERE parent=? ORDER BY seq", (parent,)
+        ).fetchall()
+        for row in rows:
+            req = Request(parent, row["room_id"], row["sender"], FILE_JOB_BODY, row["scope"])
+            self.file_job(req, row["key"], row["payload"])
+        with self.db:
+            self.db.execute("DELETE FROM held_files WHERE parent=?", (parent,))
+        return len(rows)
+
+    def _discard_files(self, parent: str) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM held_files WHERE parent=?", (parent,))
+
+    def _settle_held_files(self) -> None:
+        """After a crash: release files of answered turns, drop the rest (never re-run a turn)."""
+        parents = [row[0] for row in self.db.execute("SELECT DISTINCT parent FROM held_files")]
+        for parent in parents:
+            row = self.db.execute("SELECT state FROM jobs WHERE event_id=?", (parent,)).fetchone()
+            if row is not None and row["state"] in ("ready", "done"):
+                self._release_files(parent)
+            elif row is None or row["state"] != "running":
+                self._discard_files(parent)
+
+    def finish(self, event_id: str, reply: str, session_id: str | None = None) -> None:
+        super().finish(event_id, reply, session_id)
+        # After the answer row exists, so a released file sorts behind it.
+        self._release_files(event_id)
+
+    def resolve_uncertain(self, event_id: str, reply: str) -> None:
+        super().resolve_uncertain(event_id, reply)
+        # A cancelled, timed-out or interrupted turn sends none of its files.
+        self._discard_files(event_id)
 
     # -- operator block -------------------------------------------------------
 
@@ -1211,6 +1265,8 @@ class MatrixStore(Store):
                     "UPDATE jobs SET state='ready',reply=?,attachment=NULL WHERE event_id=? AND state='uncertain'",
                     (OPERATOR_ACK_TEXT, event_id),
                 )
+                # An interrupted turn sends none of its held files (#2001).
+                self.db.execute("DELETE FROM held_files WHERE parent=?", (event_id,))
             seq = self.db.execute(
                 "INSERT INTO operator_audit(at,actor,action,scope,reason,before) VALUES (?,?,?,?,?,?)",
                 (at, actor, "unblock", scope, reason, json.dumps(before)),
@@ -1322,9 +1378,22 @@ class MatrixStore(Store):
     def notice(self, req: Request, key: str, text: str) -> str:
         """Queue a durable, idempotent notice for ``req``'s room; returns its outbox event id."""
         bounded_text(text, MAX_REPLY_BYTES)
-        event = "$notice-" + hashlib.sha256(json.dumps([req.event_id, key]).encode()).hexdigest()
+        return self._ready_row(req, key, text, prefix="$notice-", body="notice")
+
+    def file_job(self, req: Request, key: str, payload: str) -> str:
+        """Queue one outbound file (#2001) as a durable, idempotent outbox row.
+
+        ``payload`` is the JSON the transport's file delivery reads (path, name,
+        size); the row rides the same ``ready`` → ``done`` lifecycle and seq
+        ordering as replies, so a file follows the answer that named it.
+        """
+        bounded_text(payload, 4096)
+        return self._ready_row(req, key, payload, prefix="$file-", body=FILE_JOB_BODY)
+
+    def _ready_row(self, req: Request, key: str, reply: str, *, prefix: str, body: str) -> str:
+        event = prefix + hashlib.sha256(json.dumps([req.event_id, key]).encode()).hexdigest()
         txn = hashlib.sha256(json.dumps([self.account, event, "reply-v1"]).encode()).hexdigest()
-        digest = hashlib.sha256(text.encode()).hexdigest()
+        digest = hashlib.sha256(reply.encode()).hexdigest()
         with self.db:
             old = self.db.execute("SELECT digest FROM jobs WHERE event_id=?", (event,)).fetchone()
             if old:
@@ -1334,7 +1403,7 @@ class MatrixStore(Store):
             self.db.execute(
                 "INSERT INTO jobs(event_id,room_id,sender,scope,body,digest,state,reply,txn_id) "
                 "VALUES (?,?,?,?,?,?,'ready',?,?)",
-                (event, req.room_id, req.sender, req.scope, "notice", digest, text, txn),
+                (event, req.room_id, req.sender, req.scope, body, digest, reply, txn),
             )
         return event
 

@@ -145,6 +145,10 @@ _OWNER_ONLY_COMMANDS = frozenset(
         "task_pause", "task_resume", "task_recover",
     }
 )
+# #2001: files an answer names are sent after it, at most this many per turn.
+MAX_FILES_PER_TURN = 10
+FILES_DIRECT_ONLY = "📎 답변에 파일 {count}개가 있지만, 파일은 개인 대화방에서만 보냅니다."
+FILES_SKIPPED = "📎 파일 {count}개는 보내지 않았습니다(프로젝트 폴더 밖이거나 한 번에 보낼 수 있는 {limit}개 초과).".replace("{limit}", str(MAX_FILES_PER_TURN))
 STATUS_MIN_INTERVAL_S = 15.0  # match Telegram CCC_HEARTBEAT_* defaults
 _HEALTH_INTERVAL_S = 10.0  # match bot_lifecycle._WORKLOAD_INTERVAL
 # #1820: a /sync long-poll returns within ~25s (40s HTTP ceiling), so a commit
@@ -511,6 +515,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         # recovery choice can dispatch with the same room callbacks.
         self._task_resume_generations: dict[Any, int] = {}
         self._active_sink: Any = None
+        # #2001: event id of the turn being served, keying its outbound files.
+        self._active_turn_id = ""
         self._config: Mapping[str, Any] | None = None
         self._ids: MatrixIdMap | None = None
         self._direct_rooms: _DirectRoomMap | None = None
@@ -1787,6 +1793,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         user_id, chat_id, room_id = self._job_identity(job, room_kind)
         body = str(job.get("body") or "")
         self._active_sink = sink
+        self._active_turn_id = str(job.get("event_id") or "")
         try:
             # #1955: before attachment staging, command parsing or self-jobs.
             if self._refuses_non_owner_turn(user_id):
@@ -1824,6 +1831,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return await self._run_message(body, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink, turn_marker=str(job.get("event_id") or ""))
         finally:
             self._active_sink = None
+            self._active_turn_id = ""
 
     async def _run_attachment(
         self, job: Mapping[str, Any], *, user_id: int, chat_id: int, room_id: str, sink: TurnSink
@@ -2089,7 +2097,54 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         content = str(response.content or "")
         if content.strip() and not streamed and await self._send_formatted(room_id, content):
             streamed = True
+        self._enqueue_deliverables(room_id, content)
         return _turn_result(content, response.session_id, streamed=streamed, status=status)
+
+    def _enqueue_deliverables(self, room_id: str, content: str) -> None:
+        """Queue the files an answer names for the room, after the answer (#2001).
+
+        Same rule as Telegram (``core/deliverables.py``): a real file with a
+        deliverable extension, under the size cap, inside ``PROJECT_ROOT``.
+        Files go to *direct* rooms only — a family room gets one notice
+        instead, so an owner-host file never lands where others read. Files
+        outside the project root are not sent (Telegram asks with a button;
+        Matrix has none) and the room is told how many. Never raises.
+        ``CCC_MATRIX_SEND_FILES=0`` turns it off.
+        """
+
+        transport = self._transport
+        enqueue = getattr(transport, "enqueue_file", None)
+        if not content.strip() or transport is None or not callable(enqueue):
+            return
+        if not ExternalWaitMonitor.env_flag("CCC_MATRIX_SEND_FILES", default=True):
+            return
+        try:
+            from telegram_bot.core import deliverables
+            from telegram_bot.core import paths as path_scope
+            from telegram_bot.core.matrix.transport import MAX_OUTBOUND_FILE_BYTES
+
+            root = Path(str(getattr(self._settings, "project_root", "") or ".")).resolve()
+            found = deliverables.resolve_deliverable_paths(content, root, max_bytes=MAX_OUTBOUND_FILE_BYTES)
+            if not found:
+                return
+            inside, outside = path_scope.split_paths_by_scope(found, root)
+            turn = self._active_turn_id or hashlib.sha256(content.encode()).hexdigest()[:24]
+            if transport.room_kind(room_id) != "direct":
+                self._deliverable_notice(transport, room_id, FILES_DIRECT_ONLY.format(count=len(found)), f"files-family-{turn}")
+                return
+            parent = self._active_turn_id or None
+            for index, path in enumerate(inside[:MAX_FILES_PER_TURN]):
+                enqueue(room_id, str(path), key=f"deliverable-{turn}-{index}", after=parent, root=str(root))
+            skipped = len(outside) + max(0, len(inside) - MAX_FILES_PER_TURN)
+            if skipped:
+                self._deliverable_notice(transport, room_id, FILES_SKIPPED.format(count=skipped), f"files-skipped-{turn}")
+        except Exception:
+            logger.warning("Matrix deliverable files not queued", exc_info=True)
+
+    @staticmethod
+    def _deliverable_notice(transport: Any, room_id: str, text: str, key: str) -> None:
+        # Versioned key: notice rows are permanent (see transport._file_unsent_notice).
+        transport.enqueue_notice(room_id, text, key=f"{key}-{hashlib.sha256(text.encode()).hexdigest()[:12]}")
 
     async def _run_message(
         self,
