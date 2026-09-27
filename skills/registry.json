@@ -114,24 +114,24 @@
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Restart the systemd service that hosts the CURRENT bridge/agent session (Telegram bridge, gateway, broker tunnel) without losing the post-restart verification step. A plain `systemctl restart <own-service>` kills the calling shell/session mid-command — any verification lines written after it never run, and the next session sees no evidence. Detach the restart+verify sequence into an independent `systemd-run` transient unit BEFORE issuing the restart, so it survives being severed from its own parent, then read its log/registry entry from the next session. Use whenever you are about to restart a service you are currently running inside of (config reload, timeout tuning, self-update checkout swap), not for restarting a peer/unrelated service (plain `systemctl restart` is fine there).",
+      "description": "Use whenever you are about to restart a service your current session runs inside (Telegram bridge, gateway, broker tunnel), e.g. config reload, timeout tuning, self-update checkout swap. Detaches restart+verify into a systemd-run unit first so verification survives. Not for peer/unrelated services.",
       "files": 1,
       "managed": false,
       "name": "bridge-detached-self-restart",
       "source": "skills/bridge-detached-self-restart",
       "status": "active",
-      "tree_sha256": "e7dfbd31630756632acf5fd15b0fa5e0f360a0da1c67da04c1cee71775cfc4e0"
+      "tree_sha256": "d8c020cc4bd7cde26559624282b07bd0d2ed493ed27bedcb6363ea5e7db1794f"
     },
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Run a long-running command as a detached systemd transient unit so it survives Telegram-bridge/session restarts — with persistent log file, EXIT marker, HOME/PATH env injection, and a durable job registry that lets any later session read the completion evidence. Use when a task may outlive the current session (installs, mining/indexing, builds, migrations, long tests), when a previous background task was killed by a bridge restart (ccc-node #822), when a watcher died and a finished job looks failed (ccc-node #1258), or when systemd-run output mysteriously fails due to missing HOME.",
+      "description": "Use when a command may outlive the session or a bridge restart (installs, indexing, builds, migrations, long tests), a background job was killed by a bridge restart, or a finished job looks failed because its watcher died. Runs it as a logged systemd transient unit with EXIT marker and job registry.",
       "files": 1,
       "managed": false,
       "name": "bridge-safe-detached-run",
       "source": "skills/bridge-safe-detached-run",
       "status": "active",
-      "tree_sha256": "1675b4bef266c19460d1d23d8c4046be7576bf46094649b5862e710a286f3ef0"
+      "tree_sha256": "2882d9ae65c5d63c2c7b7cef0857d6334234b86632343291fe03cce32dca76a5"
     },
     {
       "audience": "claude",
@@ -147,13 +147,13 @@
     {
       "audience": "shared",
       "classification": "adapted",
-      "description": "Register a durable bridge baton for the next authorized work bundle and end the current turn cleanly. Use when multi-bundle work remains after the current logical unit, including after handling a GitHub CI external event, and the next unit needs no new user choice or approval.",
+      "description": "Use when multi-bundle work remains after the current logical unit (including after a GitHub CI external event) and the next unit needs no new user choice or approval. Registers a durable bridge baton for the next authorized work bundle and ends the current turn cleanly.",
       "files": 2,
       "managed": true,
       "name": "bridge-yield-continue",
       "source": "skills/bridge-yield-continue",
       "status": "active",
-      "tree_sha256": "4d896795068b527f3f44e7eefc2c05e0eba112d3b3f478e888d6a5aeddc5e8f1"
+      "tree_sha256": "8285f97edd8e4655e46d41a2ff5f6332e899896b546da8b79f89c9f4423ecce3"
     },
     {
       "audience": "shared",
@@ -180,24 +180,24 @@
     {
       "audience": "shared",
       "classification": "claude-only",
-      "description": "Diagnose and fix stalled background agents that report \"running\" or \"came to rest\" but produce no output files — verify via the filesystem, then relaunch as foreground agents with small logical chunks. Use when long-running file-producing agent tasks stall or repeat task-notifications without artifacts appearing.",
+      "description": "Use when long-running file-producing background agents report \"running\" or \"came to rest\" or repeat task-notifications but no output files appear. Verify via the filesystem, then relaunch them as foreground agents with small logical chunks.",
       "files": 1,
       "managed": false,
       "name": "debug-long-running-agent-tasks",
       "source": "skills/debug-long-running-agent-tasks",
       "status": "active",
-      "tree_sha256": "096a9d29fc92ae3a1cbf004829b1c655b5fa9d94b6b645694698dce66335a926"
+      "tree_sha256": "1b156c87cde3fabde41dfa5a926339ce8c819eb0d5af900d6b551009ddd00a65"
     },
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Manually trigger / inspect / toggle the Session Distiller (TM-1058) — the PreCompact+SessionEnd memory pipeline that distills transcripts via Haiku and routes to Honcho + wiki-candidates. Use when the operator says `/distill`, asks to \"run distill now\", wants to see what the last distill captured, wants aggregate distill health stats, wants to flip between LIVE and DRY-RUN, or wants to turn distill off. Arg options are (empty)/`manual` (fire now), `status` (show last result + queue), `stats [days]` (read-only log summary), `dryrun` (enable dry-run mode), `live` (disable dry-run), `disable` (off-switch), `enable` (clear off-switch), `compact` (retroactive de-dup of pending wiki-candidates backlog).",
+      "description": "Use when the operator says `/distill` or wants to run, inspect (`status`, `stats [days]`), toggle (`dryrun`/`live`, `disable`/`enable`) or `compact` the Session Distiller — the PreCompact+SessionEnd pipeline that distills transcripts via Haiku into Honcho and wiki-candidates.",
       "files": 3,
       "managed": false,
       "name": "distill",
       "source": "skills/distill",
       "status": "active",
-      "tree_sha256": "9957b0ef72b2b909d08704f77414cf4659276154a619f8ad2d574c579a51024f"
+      "tree_sha256": "c49031ab9bced36095a9df82ff8752f282e916f3bb48b5a7ee87283cce75734b"
     },
     {
       "audience": "shared",
@@ -213,68 +213,68 @@
     {
       "audience": "shared",
       "classification": "claude-only",
-      "description": "Hand off unfinished multi-node work by classifying each item's approval gate, recording where it may NOT run (observation nodes under measurement), verifying every cited metric's counting method, and naming prior errors so they aren't rediscovered. Use when transferring work mid-pilot, at session end with items outstanding, or when a task must move to a different node.",
+      "description": "Use when handing off unfinished multi-node work — mid-pilot, at session end with items outstanding, or moving a task to another node. Classify each item's approval gate, record where it may NOT run, verify each cited metric's counting method, and name prior errors so they aren't rediscovered.",
       "files": 1,
       "managed": false,
       "name": "fleet-task-handoff-with-constraints",
       "source": "skills/fleet-task-handoff-with-constraints",
       "status": "active",
-      "tree_sha256": "b04139a83645f1b717da95b1e8953930970427437daa1e03bd053c715c1837ac"
+      "tree_sha256": "9e89045b8d8f6433722f7bd27299a0486fba5177583287b70002d7050071e5f5"
     },
     {
       "audience": "shared",
       "classification": "adapted",
-      "description": "Register a durable GitHub CI wait when you promise to continue after CI finishes (#740). Use whenever you pushed or opened/updated a PR and would otherwise say \"I'll continue once CI is green/failed\" — the promise is real only with a wait_id. Never claim auto-resume without one. Also use when SessionStart injects a `⚠ 미완 약속` block and you must triage it — active `⏳` waits must NOT be re-registered, while dropped promises branch on their skip_reason.",
+      "description": "Use when you pushed or opened/updated a PR and would say \"I'll continue once CI is green/failed\" — register a durable CI wait; the promise is real only with a wait_id. Also use to triage a SessionStart `⚠ 미완 약속` block (never re-register active `⏳` waits; dropped ones branch on skip_reason).",
       "files": 2,
       "managed": true,
       "name": "gh-ci-wait",
       "source": "skills/gh-ci-wait",
       "status": "active",
-      "tree_sha256": "a1da54f0bfd3718a8da260031b6b81572dec11128984ab583797f7e84409e6d0"
+      "tree_sha256": "fdb704aa1a67bf7e718d385c78f511836932b04427c4b66da74b676a4f15b796"
     },
     {
       "audience": "claude",
       "classification": "adapted",
-      "description": "Ship code through the PR-first GitHub flow on this node, including protected PRs that need an independent cross-account review in either direction — jinon86-authored PR approved via the relay-held seoseo-ai profile (exact-head) or seoseo-ai-authored PR approved/merged as jinon86 (relay-held session) — after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. Enforces no direct main pushes, exact-head and green-check validation, independent review, secret-safe credential use, squash merge, and verified cleanup. Not for Wiki edits (use wiki-record).",
+      "description": "Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. PR-first — exact-head green checks, cross-account review (jinon86/seoseo-ai via relay) after fresh user approval, squash merge, cleanup. Not for Wiki edits (wiki-record).",
       "files": 3,
       "managed": false,
       "name": "gh-pr-flow",
       "source": "skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "7704686361baa5efffc59e3a833ffccbfc9694509056ec9644c94f4abfc87355"
+      "tree_sha256": "ffcf05b81bed8f93b50bc77c5c285ef84597153cea40d4e3575d615dad8e41ae"
     },
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Identify, back up, and cleanly remove stale background processes (cron, timers, scheduled tasks) while verifying parallel installations aren't collateral damage. Use when a background process (cron job, systemd timer, at job, scheduled task) exists but should not, or when the same task exists in multiple places and only one copy should remain.",
+      "description": "Use when a background process (cron job, systemd timer, at job, scheduled task) exists but should not, or the same task runs in several places and only one copy should remain. Back up, remove only the stale entries, and verify parallel installations aren't collateral damage.",
       "files": 1,
       "managed": false,
       "name": "ghost-process-cleanup-and-verification",
       "source": "skills/ghost-process-cleanup-and-verification",
       "status": "active",
-      "tree_sha256": "2e3226b8a54e586ca96da061d47c9e2a464fa5f736cdd093c60075b80660ff08"
+      "tree_sha256": "5ff903ec36716007affdf759ea495aef2f87ba76d3665e2d1fcc7d0a59d1871f"
     },
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Recover an authorized, reviewed pull request after GitHub transport or service failures. Verify checks and independent review on the exact head, distinguish queue admission from merge completion, and retry only classified transient failures within a fixed budget. Use when CI or merge operations fail because of GitHub infrastructure rather than a code or policy failure.",
+      "description": "Use when CI or merge operations on an authorized, reviewed PR fail because of GitHub transport/service failures, not code or policy. Verify checks and independent review on the exact head, tell queue admission from merge completion, retry only classified transient failures within a fixed budget.",
       "files": 1,
       "managed": false,
       "name": "github-incident-recovery-merge-retry",
       "source": "skills/github-incident-recovery-merge-retry",
       "status": "active",
-      "tree_sha256": "3a9a1f723158315293f85a0b093b92849c1bab839ec499847f73bf5ab7e0fbe5"
+      "tree_sha256": "ecee987ff4cf6061861b6ad529dce5fbff405d9c8d7bc697309bbe69129847a2"
     },
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Diagnose missing PR checks, conflicting or stale branches, and unresolved GitHub mergeability. Compare CLI and API fields, test the exact PR objects without changing the user's checkout, and verify which revision CI actually tested. Use when checks never appear, mergeable remains UNKNOWN, or the base advances beneath a reviewed PR.",
+      "description": "Use when PR checks never appear, mergeable stays UNKNOWN, a branch is conflicting or stale, or the base advances beneath a reviewed PR. Compare CLI and API fields, test the exact PR objects without changing the user's checkout, and verify which revision CI actually tested.",
       "files": 1,
       "managed": false,
       "name": "github-merge-state-conflict-diagnosis",
       "source": "skills/github-merge-state-conflict-diagnosis",
       "status": "active",
-      "tree_sha256": "2a7f08a14fe9b3e88d7d3cb16cb6fe15d472c68856e89a05fac1eebd8c7b409b"
+      "tree_sha256": "8278dc71d68e8ad06923e99b5794aa939a483cecb5669778c29531b2adc49277"
     },
     {
       "audience": "claude",
@@ -301,13 +301,13 @@
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Register a Claude Code MCP tool server at user scope (node-global), reading any API key from the node's resolved env file so the secret never appears in a command, transcript, or commit. Use when adding web search, fetch/scrape, docs, or other MCP tools to this node. Idempotent; also pre-allows the tool in settings.json.",
+      "description": "Use when adding web search, fetch/scrape, docs, or other MCP tool servers to this node. Registers at user scope (node-global), reading any API key from the node's resolved env file so the secret never appears in a command, transcript, or commit. Idempotent; pre-allows the tools in settings.json.",
       "files": 1,
       "managed": false,
       "name": "mcp-add",
       "source": "skills/mcp-add",
       "status": "active",
-      "tree_sha256": "e19c2cdc4b5e013714e71e02a73c83cf2b093b126b88198e86752d217c637837"
+      "tree_sha256": "5f22c32069b0709d5baad9b28f90c6b4951868d5952c17b55ccfdafa7303d8e7"
     },
     {
       "audience": "shared",
@@ -367,24 +367,24 @@
     {
       "audience": "claude",
       "classification": "adapted",
-      "description": "Safely update this node's ccc-node harness (~/.claude) to GitHub latest — detect drift, show the diff, back up, run setup.sh, validate, and roll back on failure. Use when asked to update/upgrade the harness, sync a node to the latest ccc-node, or check harness drift across the fleet. Approval-gated; detection is read-only and applying never happens without explicit OK. Not for the Telegram bridge (use bridge/start.sh --upgrade).",
+      "description": "Use when asked to update/upgrade this node's ccc-node harness (~/.claude) to GitHub latest or check harness drift across the fleet. Read-only drift check and diff; applying needs explicit OK, backs up, runs setup.sh, validates, rolls back on failure. Not for the bridge (bridge/start.sh --upgrade).",
       "files": 2,
       "managed": false,
       "name": "self-update",
       "source": "skills/self-update",
       "status": "active",
-      "tree_sha256": "22df3caf8f1d9fb136f71c82703ed8c321530c018e96e6cfe964bebab4a96ae5"
+      "tree_sha256": "ec2cb67d4f26669c664ef9eb29702b0b6e27e15cfd479407fcf837fc1b5329e0"
     },
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Detect repeated procedures and review create, patch, or support-file skill proposals (human-in-the-loop), and audit or roll back autosave auto-mode changes. Use when asked to find automatable routines, improve an existing skill, review skill candidates, or list and roll back autosave-installed skills.",
+      "description": "Use when asked to find automatable routines, improve an existing skill, review skill candidates, or list and roll back autosave-installed skills. Detects repeated procedures, reviews create/patch/support-file skill proposals (human-in-the-loop), and audits autosave auto-mode changes.",
       "files": 2,
       "managed": false,
       "name": "skillsuggest",
       "source": "skills/skillsuggest",
       "status": "active",
-      "tree_sha256": "b0407290086f57a70e20801eb81186fa2dfb40713e929256da63097d3027c6a6"
+      "tree_sha256": "a0e700a2e096dcf64c225239901660ff33887432fadc85e4b49415180498b414"
     },
     {
       "audience": "shared",
@@ -400,24 +400,24 @@
     {
       "audience": "shared",
       "classification": "adapted",
-      "description": "Route general web search through Firecrawl Search, known public URL reads through Firecrawl scrape, and public developer documentation/README/issue/merged-PR lookup through the Firecrawl Developer Index; explicit fleet SearXNG only as a fallback. Portable across fleet harnesses (Claude, Codex, Danso) via bundled stdlib helpers. Use when doing web research, reading known public URLs, or looking up developer documentation/issues/PRs.",
+      "description": "Use when doing web research, reading known public URLs, or looking up developer docs/README/issues/merged PRs. Routes search to Firecrawl Search, URL reads to Firecrawl scrape, dev lookups to the Firecrawl Developer Index; fleet SearXNG only as explicit fallback. Portable via bundled stdlib helpers.",
       "files": 6,
       "managed": true,
       "name": "web-routing",
       "source": "skills/web-routing",
       "status": "active",
-      "tree_sha256": "aaa68715d7f932db4c0f5759a38c03769153279132c0cfa2323fdd4762eefd35"
+      "tree_sha256": "0343f9f9edaab564dacf16068a645dc64b83eff3d9cf4daa55ff9fbce7338c68"
     },
     {
       "audience": "shared",
       "classification": "adapted",
-      "description": "Record durable knowledge to the Seoyoon Family Wiki via the PR-first flow (wiki-agent write-path -> edit in the worktree -> wiki-agent pr). Use whenever you need to durably record a decision, runbook, node fact, incident, or operating-log entry. Handles the section-ID conventions (TM-/ND-/LOG-), the worktree path, and the no-raw-secrets rule.",
+      "description": "Use when you need to durably record a decision, runbook, node fact, incident, or operating-log entry in the Seoyoon Family Wiki. PR-first flow (wiki-agent write-path -> edit in the worktree -> wiki-agent pr); handles TM-/ND-/LOG- section IDs, the worktree path, and the no-raw-secrets rule.",
       "files": 1,
       "managed": false,
       "name": "wiki-record",
       "source": "skills/wiki-record",
       "status": "active",
-      "tree_sha256": "cc228c19ce4f30556e434acc351cc82677707f0ba70e6618ab920e0a3d50e217"
+      "tree_sha256": "39468a1184db72cd09afb98a54c6b9c4fb0846e8617f1cb2e3d441cb1dbadd47"
     }
   ]
 }

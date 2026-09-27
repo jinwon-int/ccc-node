@@ -1,6 +1,6 @@
 ---
 name: fleet-task-handoff-with-constraints
-description: Hand off unfinished multi-node work by classifying each item's approval gate, recording where it may NOT run (observation nodes under measurement), verifying every cited metric's counting method, and naming prior errors so they aren't rediscovered. Use when transferring work mid-pilot, at session end with items outstanding, or when a task must move to a different node.
+description: Use when handing off unfinished multi-node work — mid-pilot, at session end with items outstanding, or moving a task to another node. Classify each item's approval gate, record where it may NOT run, verify each cited metric's counting method, and name prior errors so they aren't rediscovered.
 ---
 
 # When to Use

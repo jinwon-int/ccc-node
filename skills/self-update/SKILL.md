@@ -1,6 +1,6 @@
 ---
 name: self-update
-description: Safely update this node's ccc-node harness (~/.claude) to GitHub latest — detect drift, show the diff, back up, run setup.sh, validate, and roll back on failure. Use when asked to update/upgrade the harness, sync a node to the latest ccc-node, or check harness drift across the fleet. Approval-gated; detection is read-only and applying never happens without explicit OK. Not for the Telegram bridge (use bridge/start.sh --upgrade).
+description: Use when asked to update/upgrade this node's ccc-node harness (~/.claude) to GitHub latest or check harness drift across the fleet. Read-only drift check and diff; applying needs explicit OK, backs up, runs setup.sh, validates, rolls back on failure. Not for the bridge (bridge/start.sh --upgrade).
 ---
 
 # self-update — safe harness update (fleet drift control)

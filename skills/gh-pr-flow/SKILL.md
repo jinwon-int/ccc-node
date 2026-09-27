@@ -1,6 +1,6 @@
 ---
 name: gh-pr-flow
-description: Ship code through the PR-first GitHub flow on this node, including protected PRs that need an independent cross-account review in either direction — jinon86-authored PR approved via the relay-held seoseo-ai profile (exact-head) or seoseo-ai-authored PR approved/merged as jinon86 (relay-held session) — after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. Enforces no direct main pushes, exact-head and green-check validation, independent review, secret-safe credential use, squash merge, and verified cleanup. Not for Wiki edits (use wiki-record).
+description: Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. PR-first — exact-head green checks, cross-account review (jinon86/seoseo-ai via relay) after fresh user approval, squash merge, cleanup. Not for Wiki edits (wiki-record).
 ---
 
 # gh-pr-flow — PR-first GitHub flow
@@ -8,6 +8,11 @@ description: Ship code through the PR-first GitHub flow on this node, including 
 Use this for code changes that land in GitHub. Operational repos live under
 `jinwon-int` where possible. Never push directly to `main`; use a branch and PR.
 For Wiki content use `wiki-record` instead.
+
+The flow enforces: no direct `main` pushes, exact-head and green-check
+validation, an independent cross-account review in either direction (protected
+PRs; see the table below) after fresh explicit user approval, secret-safe
+credential use, squash merge, and verified cleanup.
 
 ## Identities and review directions
 
