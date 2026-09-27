@@ -22,6 +22,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from telegram_bot.utils.secure_fs import _fsync_directory
+
 MATRIX_USER_RE = re.compile(r"@[^:\s]{1,255}:[A-Za-z0-9.\-\[\]:]{1,255}")
 MATRIX_ROOM_RE = re.compile(r"![^:\s]{1,255}:[A-Za-z0-9.\-\[\]:]{1,255}")
 _ID_BITS = 52  # fits a JSON/JS-safe integer; leaves headroom below 2**53
@@ -76,9 +78,11 @@ class MatrixIdMap:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             os.write(fd, payload.encode("utf-8"))
+            os.fsync(fd)  # #1959: durable before the rename publishes it
         finally:
             os.close(fd)
         os.replace(tmp, self._path)
+        _fsync_directory(self._path.parent)
 
     # -- lookups -------------------------------------------------------------
 

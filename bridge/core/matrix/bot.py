@@ -93,6 +93,7 @@ from telegram_bot.core.turn_watchdog import DEFAULT_NOTIFY_MINUTES, TurnAgeWatch
 from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.core.usage_meter import MODE_AUTONOMOUS, MODE_INTERACTIVE
 from telegram_bot.utils.health import health_reporter
+from telegram_bot.utils.secure_fs import _fsync_directory
 from telegram_bot.utils.orphan_reaper import (
     run_periodic_reaper,
     sweep_orphaned_claude_processes,
@@ -192,6 +193,34 @@ _SKILLS_PROMPT = (
 )
 
 
+_TRANSPORT_LOG_WITHHELD = "Matrix transport diagnostic (details withheld)"
+
+
+class _TransportLogFilter(logging.Filter):
+    """Matrix/HTTP client records may carry access tokens or bodies; withhold them (#1959).
+
+    Same contract as the Grok frontends' filter: the record still flows (level
+    and logger name stay visible), only its message, args and traceback go.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name.split(".")[0] in {"nio", "aiohttp", "httpx", "httpcore"}:
+            record.msg = _TRANSPORT_LOG_WITHHELD
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+        return True
+
+
+def _install_transport_log_filter() -> None:
+    """Attach the filter to every root handler once (idempotent)."""
+
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(existing, _TransportLogFilter) for existing in handler.filters):
+            handler.addFilter(_TransportLogFilter())
+
+
 class MatrixConfigError(RuntimeError):
     """The Matrix frontend cannot start because its configuration is missing."""
 
@@ -279,9 +308,11 @@ class _DirectRoomMap:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             os.write(fd, payload.encode("utf-8"))
+            os.fsync(fd)  # #1959: durable before the rename publishes it
         finally:
             os.close(fd)
         os.replace(tmp, self._path)
+        _fsync_directory(self._path.parent)
 
     def room_for(self, user: str) -> str | None:
         return self._rooms.get(user)
@@ -386,6 +417,9 @@ class MatrixSpoolNotifier:
                 data = json.loads(p.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 self._archive(p, sent_dir)  # malformed → don't retry forever
+                continue
+            if not isinstance(data, dict):
+                self._archive(p, sent_dir)  # #1959: valid JSON, not a record
                 continue
             text = (data.get("text") or "").strip()
             if not text:
@@ -990,6 +1024,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
 
         from telegram_bot.core.bot_shared import enforce_access_control
 
+        _install_transport_log_filter()
         # The transport refuses a crypto store with group/other-readable files
         # (unsafe-crypto-store); nio creates its SQLite store with the process
         # umask, which systemd leaves at 022. The pilot set this in main().
@@ -2339,11 +2374,14 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         turn_marker: str | None = None,
         dispatch_guard: Callable[[], bool] | None = None,
         usage_mode: str = MODE_INTERACTIVE,
+        room_id: str | None = None,
     ) -> ChatResponse:
         """One ``process_message`` call with this room's callbacks; persists the session."""
 
         sink = sink or self._active_sink or _NullSink()
-        room_id = self.room_for_chat(chat_id) or ""
+        # The job's own room when the caller has it (#1959: /skills), else the
+        # reverse map — the same room for every turn run_turn has admitted.
+        room_id = room_id or self.room_for_chat(chat_id) or ""
         extra: dict[str, Any] = {}
         if resume_task:
             extra["resume_task"] = True
@@ -3113,26 +3151,13 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         await self._enqueue_previous_codex_session(
             session, DistillTrigger.NEW_COMMAND, user_id=user_id, chat_id=chat_id,
         )
-        response = await self._record_turn_health(self._project_chat.process_message(
-            user_message=_SKILLS_PROMPT,
-            user_id=user_id,
-            chat_id=chat_id,
-            new_session=True,
-            approval_policy=self._codex_approval_policy(user_id),
-            approvals_reviewer=self._codex_approvals_reviewer(user_id),
-            sandbox_policy=self._codex_sandbox_policy(user_id),
-            approval_callback=self._make_approval_callback(sink),
-            typing_callback=sink.typing,
-            notification_bot=self._notification_bot(),
-            **self._progress_callbacks(sink, room_id),
-            usage_mode=MODE_INTERACTIVE,
-        ))
-        await self._save_session_id(key, response, user_id=user_id, chat_id=chat_id)
-        if getattr(response, "success", True):
-            await self._record_codex_checkpoint(
-                key, response, request_text=_SKILLS_PROMPT, turn_marker=turn_marker,
-                user_id=user_id, chat_id=chat_id,
-            )
+        # #1959: one dispatch path. ``session={}`` keeps the listing on the
+        # provider defaults (no stored model/effort), exactly as before and as
+        # Telegram's /skills; it always starts a fresh session.
+        response = await self._dispatch_turn(
+            _SKILLS_PROMPT, key=key, user_id=user_id, chat_id=chat_id, session={},
+            session_id=None, new_session=True, sink=sink, turn_marker=turn_marker, room_id=room_id,
+        )
         return await self._finish(response, room_id)
 
     @staticmethod

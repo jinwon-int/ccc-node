@@ -550,6 +550,28 @@ delivery keeps the receipt pending for the next poll; the
 `restart-receipt-<request_id>` enqueue key keeps a retry from posting the
 notice twice.
 
+## Transport robustness (#1959)
+
+- **Retry pacing** — a retryable homeserver status (408/425/429/5xx) raises
+  `MatrixTemporaryError` (still `matrix-temporary-error` in health). The leg
+  waits the larger of its backoff (1 s doubling to 30 s) and the server's
+  requested wait (`Retry-After`, or a 429 body's `retry_after_ms`, capped at
+  300 s). A leg that ran ≥ 60 s before failing restarts its backoff at 1 s.
+- **`/stop` never freezes the transport** — the control runs while
+  `matrix_lock` is held, so the runner's graceful cancel is bounded (10 s);
+  the turn task is then cancelled as before.
+- **Unencrypted room** — a missing `m.room.encryption` state (404) stops the
+  room as `encrypted-room-required`, not an opaque `matrix-http-404`.
+- **Push spool** — a record that is valid JSON but not an object (`[]`, `"x"`)
+  is archived like malformed input instead of jamming the spool head (both
+  frontends).
+- **Durable maps** — `matrix-ids.json` and `matrix-direct-rooms.json` are
+  fsynced (file and directory) before and after the atomic rename.
+- **Logs** — `nio`/`aiohttp`/`httpx`/`httpcore` records have their message,
+  args and traceback withheld, as on the Grok frontends.
+- `group-key-share-incomplete` already surfaces in health as a send retry label
+  (#1820/#1963). Pruning old `inbox.sqlite3` rows is deliberately not done here.
+
 ## Grok (`CCC_AGENT_PROVIDER=grok`) — owner direct room, opt-in family rooms
 
 With the Grok provider, `CCC_CHANNEL=matrix` selects `core/grok_matrix_bot.py`
