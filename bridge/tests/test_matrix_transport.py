@@ -1483,7 +1483,15 @@ async def test_long_reply_is_delivered_whole_as_budgeted_parts(tmp_path: Path) -
         h.work()
         with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
             h.start(f.retry(f.send))
-            await h.until(lambda: f.raw.await_count > 0 and not f.store.outbox())
+            # #1976: input() spawns an early typing PUT through the same raw(),
+            # so "raw awaited, outbox empty" can hold before the turn finishes.
+            # last_turn is written after finish() queued the reply, so waiting
+            # for it too means the empty outbox is the delivered reply.
+            await h.until(
+                lambda: f.store.get_meta("last_turn") is not None
+                and f.raw.await_count > 0
+                and not f.store.outbox()
+            )
         assert f.store.get_meta("last_turn")["outcome"] == "complete"
         bodies = [c["body"] for c in sent_bodies(f)]
         assert len(bodies) > 6
