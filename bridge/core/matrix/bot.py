@@ -48,7 +48,18 @@ from telegram_bot.core.bot_danso_recovery import (
     RECOVERY_TEXT_ACTIONS,
     DansoRecoveryMixin,
 )
-from telegram_bot.core.external_wait import ExternalWaitRegistry, default_registry_path
+from telegram_bot.core.continuation import STATE_RUNNING, ContinuationQueue
+from telegram_bot.core.continuation import default_queue_path as continuation_queue_path
+from telegram_bot.core.continuation_monitor import ContinuationMonitor
+from telegram_bot.core.dead_session_recovery import (
+    recover_dead_session_notifications,
+    run_periodic_dead_session_recovery,
+)
+from telegram_bot.core.external_wait import (
+    ExternalWaitRegistry,
+    default_active_turns_path,
+    default_registry_path,
+)
 from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
 from telegram_bot.core.matrix.render import chunk_text, render_matrix_message
 from telegram_bot.core.matrix_ids import MatrixIdMap
@@ -65,7 +76,7 @@ from telegram_bot.core.session_scope import storage_key
 from telegram_bot.core.turn_notices import session_start_notice_text, session_start_reason
 from telegram_bot.core.turn_watchdog import DEFAULT_NOTIFY_MINUTES, TurnAgeWatchdog
 from telegram_bot.core.usage import UsageSnapshot, render_usage
-from telegram_bot.core.usage_meter import MODE_INTERACTIVE
+from telegram_bot.core.usage_meter import MODE_AUTONOMOUS, MODE_INTERACTIVE
 from telegram_bot.utils.health import health_reporter
 
 logger = logging.getLogger(__name__)
@@ -73,7 +84,10 @@ logger = logging.getLogger(__name__)
 IDS_FILENAME = "matrix-ids.json"
 DIRECT_ROOMS_FILENAME = "matrix-direct-rooms.json"
 SUPPORTED_COMMANDS = frozenset(
-    {"new", "distill", "model", "effort", "usage", "skills", "stop", "task_pause", "task_resume", "task_recover", "history", "resume"}
+    {
+        "new", "distill", "model", "effort", "usage", "skills", "stop", "continue",
+        "task_pause", "task_resume", "task_recover", "history", "resume",
+    }
 )
 _STATUS_HANDLE = 1
 SELF_JOB_PREFIX = "$self-"
@@ -88,6 +102,11 @@ ATTACHMENT_FAILED = {
 }
 SELF_JOB_DANSO_AUTO_RESUME = "danso-auto-resume"
 SELF_JOB_EXTERNAL_WAIT_RESUME = "external-wait-resume"
+# #1825: a registered next bundle (continuation_cli) started as a room turn.
+SELF_JOB_CONTINUATION = "continuation"
+# Slack on top of the turn ceiling for a continuation self-job that is still
+# queued behind the room's earlier jobs when the monitor starts waiting on it.
+_CONTINUATION_QUEUE_SLACK_S = 1800.0
 # #1955: visible answers when a non-owner turn is refused (fail-closed).
 NON_OWNER_TURN_REFUSED = (
     "🔒 This agent runs with the owner's host access on this node, so it only "
@@ -101,7 +120,10 @@ OWNER_ONLY_COMMAND = "🔒 Only the owner may use this command here."
 # memory, account usage or stored tasks. Non-owners keep /new, /stop and
 # /skills (an agent run, gated like any other turn).
 _OWNER_ONLY_COMMANDS = frozenset(
-    {"resume", "history", "model", "effort", "distill", "usage", "task_pause", "task_resume", "task_recover"}
+    {
+        "resume", "history", "model", "effort", "distill", "usage", "continue",
+        "task_pause", "task_resume", "task_recover",
+    }
 )
 STATUS_MIN_INTERVAL_S = 15.0  # match Telegram CCC_HEARTBEAT_* defaults
 _HEALTH_INTERVAL_S = 10.0  # match bot_lifecycle._WORKLOAD_INTERVAL
@@ -459,6 +481,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         # Same role as TelegramBot._runtime_active_sessions: conversation keys
         # whose persisted session id this process has already resumed/created.
         self._runtime_active_sessions: set[Any] = set()
+        # #1825: continuation_id -> outcome of its self-job turn, awaited by the
+        # continuation monitor's runner while this process serves.
+        self._continuation_waiters: dict[str, asyncio.Future[bool]] = {}
 
     # -- configuration -------------------------------------------------------
 
@@ -564,9 +589,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             self._post_startup_banner(config, transport)
             self._start_health_reporting()
             await self._startup_danso_recovery_scan()
+            await self._startup_dead_session_recovery()
             notifier = MatrixSpoolNotifier(self._settings, transport)
             watchdog = self._build_turn_age_watchdog()
             external_wait = self._build_external_wait_monitor()
+            continuation = self._build_continuation_monitor()
             # Same TaskGroup semantics as transport.run(): a leg that dies
             # stops the service so systemd restarts it whole.
             stop = asyncio.Event()
@@ -583,6 +610,14 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                             if getattr(self, f"_distill_{stage}_worker") is not None:
                                 loop = getattr(self, f"_distill_{stage}_loop")
                                 memory_tasks.append(group.create_task(loop(stop), name=f"matrix-distill-{stage}"))
+                    if continuation is not None:
+                        # Cancelled on stop like the distill loops: its runner
+                        # may be awaiting a self-job turn that shutdown will
+                        # never finish. The durable self-job then records its
+                        # own outcome after the restart (#1825).
+                        memory_tasks.append(
+                            group.create_task(continuation.run(stop), name="matrix-continuation-monitor")
+                        )
                     group.create_task(self._run_until_stop(transport.run(), stop, memory_tasks))
                     group.create_task(self._health_reporter_loop(stop), name="matrix-health-reporter")
                     if notifier.enabled:
@@ -591,6 +626,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
                         group.create_task(watchdog.run(stop), name="matrix-turn-age-watchdog")
                     if external_wait is not None:
                         group.create_task(external_wait.run(stop), name="matrix-external-wait-monitor")
+                    group.create_task(
+                        self._periodic_dead_session_recovery(stop), name="matrix-dead-session-recovery"
+                    )
             except BaseExceptionGroup as failure:
                 # A single failing leg (normally the transport) surfaces as itself,
                 # as it did when the transport was awaited directly.
@@ -1003,6 +1041,250 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return False
         return True
 
+    # -- yield-and-continue (#1113 / #1825) -----------------------------------
+
+    def _continuation_queue(self) -> ContinuationQueue:
+        """This frontend's continuation queue.
+
+        The agent-side ``continuation_cli`` resolves its home as the sibling of
+        ``CCC_EXTERNAL_WAIT_HOME`` (``bot_data_dir/external-wait``), so a Matrix
+        registration lands in ``bot_data_dir/continuation`` -- the directory
+        this monitor reads.
+        """
+
+        return ContinuationQueue(continuation_queue_path(self._data_dir() / "continuation"))
+
+    def _build_continuation_monitor(self) -> ContinuationMonitor | None:
+        """Yield-and-continue loop for the Matrix frontend (#1825); ``None`` when opted out.
+
+        Telegram builds this in ``BotLifecycleMixin``, which ``MatrixBot`` does
+        not inherit: a Matrix ``continuation_cli register`` answered ``ok`` and
+        wrote the record while nothing ever read it, so the promised next
+        bundle silently never started. Same contract and flags as Telegram
+        (``CCC_CONTINUATION_ENABLED`` default on, ``CCC_CONTINUATION_DAILY_CAP``
+        default 20, three consecutive failures park the chain); the bundle
+        runs as a **self-job** turn in the conversation's room, like the
+        external-wait resume (#1934).
+        """
+
+        if not ExternalWaitMonitor.env_flag("CCC_CONTINUATION_ENABLED", default=True):
+            logger.info("Matrix continuation monitor disabled (CCC_CONTINUATION_ENABLED=0)")
+            return None
+        return ContinuationMonitor(
+            self._continuation_queue(),
+            runner=self._run_continuation,
+            notifier=self._notify_chat,
+            active_turns_path=default_active_turns_path(self._data_dir() / "external-wait"),
+            daily_cap=ExternalWaitMonitor.env_int("CCC_CONTINUATION_DAILY_CAP", default=20),
+        )
+
+    def _continuation_wait_seconds(self) -> float:
+        """Upper bound the runner waits for its self-job turn to finish."""
+
+        try:
+            minutes = float(self.load_config().get("turn_timeout_minutes", 360))
+        except Exception:
+            minutes = 360.0
+        return max(5.0, min(minutes, 360.0)) * 60.0 + _CONTINUATION_QUEUE_SLACK_S
+
+    async def _run_continuation(self, record: Mapping[str, Any], prompt: str) -> bool:
+        """``ContinuationMonitor`` runner: enqueue the bundle, await its turn outcome.
+
+        Telegram's runner awaits ``process_message`` inline, so a failed turn
+        counts toward the consecutive-failure guard. The Matrix turn runs as a
+        durable self-job instead (room serialization, sink, outbox), so the
+        runner waits on a future the self-job resolves when the turn ends.
+        ``False`` (not enqueued, refused, failed or not finished within the
+        turn ceiling) is a failed bundle, exactly as on Telegram.
+        """
+
+        cid = str(record.get("continuation_id") or "")
+        transport = self._transport
+        room = self.room_for_chat(int(record.get("chat_id") or 0))
+        enqueue = getattr(transport, "enqueue_self_job", None)
+        if not cid or transport is None or room is None or not callable(enqueue):
+            logger.info(
+                "Matrix continuation deferred: no transport/room for chat %s", record.get("chat_id")
+            )
+            return False
+        # #1955: the bundle runs as the person whose turn registered it, never
+        # silently as the owner; a no-longer-admitted requester is refused.
+        raw_user = record.get("user_id")
+        user_int = raw_user if isinstance(raw_user, int) and not isinstance(raw_user, bool) else None
+        sender = self.ids.matrix_id(user_int) if user_int is not None else None
+        if user_int is None or sender is None or not self._is_admitted_sender(sender):
+            logger.info(
+                "Matrix continuation refused: requester not admitted for chat %s", record.get("chat_id")
+            )
+            return False
+        body = json.dumps(
+            {
+                "kind": SELF_JOB_CONTINUATION,
+                "v": 1,
+                "continuation_id": cid,
+                "user_id": user_int,
+                "prompt": prompt,
+            }
+        )
+        extra: dict[str, Any] = {} if sender == self.load_config().get("owner") else {"sender": sender}
+        waiter: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._continuation_waiters[cid] = waiter
+        try:
+            try:
+                enqueue(room, body, key=f"{SELF_JOB_CONTINUATION}:{cid}", **extra)
+            except Exception as error:
+                logger.warning("Matrix continuation self-job enqueue failed: %s", type(error).__name__)
+                return False
+            try:
+                return bool(
+                    await asyncio.wait_for(asyncio.shield(waiter), timeout=self._continuation_wait_seconds())
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Matrix continuation turn did not finish within its ceiling: %s", cid)
+                return False
+        finally:
+            self._continuation_waiters.pop(cid, None)
+
+    def _settle_continuation(self, cid: str, ok: bool) -> None:
+        """Hand a continuation turn's outcome to its waiting runner.
+
+        With no runner waiting (the process restarted after the enqueue, or
+        the runner gave up) the self-job records the outcome itself; both
+        transitions are no-ops unless the record is still ``running`` (a
+        ``/stop`` has already cancelled it, or the runner already marked it).
+        """
+
+        if not cid:
+            return
+        waiter = self._continuation_waiters.get(cid)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(bool(ok))
+            return
+        try:
+            queue = self._continuation_queue()
+            if ok:
+                queue.mark_done(cid)
+            else:
+                queue.mark_failed(cid, "turn_failed")
+        except Exception:
+            logger.warning("Matrix continuation outcome not recorded: %s", cid, exc_info=True)
+
+    async def _run_continuation_job(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        user_id: int,
+        chat_id: int,
+        room_id: str,
+        sink: TurnSink,
+        turn_marker: str | None,
+    ) -> Any:
+        """The continuation self-job: the bundle prompt as an autonomous room turn."""
+
+        cid = str(payload.get("continuation_id") or "")
+        prompt = str(payload.get("prompt") or "")
+        ok = False
+        try:
+            record = self._continuation_queue().get(cid) if cid else None
+            if record is None or record.get("state") != STATE_RUNNING:
+                # /stop (or a newer registration) cancelled the bundle while its
+                # self-job was still queued behind other room jobs.
+                logger.info("Matrix continuation self-job skipped: %s is no longer running", cid)
+                return _turn_result("", None, streamed=True)
+            if not prompt.strip():
+                logger.warning("Matrix continuation self-job has no prompt; ignored")
+                return _turn_result("", None, streamed=True)
+            outcome: list[Any] = []
+            result = await self._run_message(
+                prompt,
+                user_id=user_id,
+                chat_id=chat_id,
+                room_id=room_id,
+                sink=sink,
+                turn_marker=turn_marker,
+                usage_mode=MODE_AUTONOMOUS,
+                responses=outcome,
+            )
+            ok = bool(outcome) and bool(getattr(outcome[-1], "success", False))
+            return result
+        finally:
+            # Cancellation (/stop, turn timeout, shutdown) ends here too.
+            self._settle_continuation(cid, ok)
+
+    async def _cmd_continue(self, *, user_id: int, chat_id: int) -> str:
+        """Owner confirmation to keep auto-continuing past the daily tripwire."""
+
+        repended = self._continuation_queue().repend_cap_holds(user_id, chat_id)
+        if repended:
+            return f"▶️ Resumed {len(repended)} queued continuation(s) — auto-continue re-armed for today."
+        return "ℹ️ No continuations waiting on the daily cap."
+
+    # -- dead-session recovery (#1825) ------------------------------------------
+
+    def _dead_session_recovery_args(self) -> tuple[Any, ...]:
+        # Delivery rides the durable outbox through the same bot-shaped port
+        # the Danso recovery offers use; the marker is written only after the
+        # notice was accepted into the outbox (at-least-once, as on Telegram).
+        return (
+            _NoticeBotPort(self),
+            self._session_manager,
+            self._project_chat,
+            getattr(self._project_chat, "conversations_dir", None),
+        )
+
+    async def _startup_dead_session_recovery(self) -> None:
+        """Deliver terminal Claude task notices a dead session left behind (#1825).
+
+        Same scanner as the Telegram startup pass. The opt-in dead-session
+        *wakeup* is not run by this frontend, so recovery never defers to it
+        (``wakeup_defer=None``): notices are always delivered raw.
+        """
+
+        try:
+            stats = await recover_dead_session_notifications(
+                *self._dead_session_recovery_args(),
+                max_delivery_attempts_per_scan=3,
+                send_timeout=5.0,
+            )
+        except Exception as error:
+            logger.warning("Matrix dead-session recovery failed at startup: %s", type(error).__name__)
+            return
+        self._record_recovery_stats(stats)
+        if stats.delivered or stats.failed or stats.rejected:
+            logger.info(
+                "Matrix dead-session recovery: scanned=%d delivered=%d duplicate=%d failed=%d "
+                "rejected=%d quarantined=%d locked=%d",
+                stats.scanned,
+                stats.delivered,
+                stats.duplicate,
+                stats.failed,
+                stats.rejected,
+                stats.quarantined,
+                stats.skipped_locked,
+            )
+
+    async def _periodic_dead_session_recovery(self, stop: asyncio.Event) -> None:
+        """Periodic scan (``CCC_DEAD_SESSION_RECOVERY_INTERVAL_SECONDS``) until stop."""
+
+        await run_periodic_dead_session_recovery(
+            *self._dead_session_recovery_args(),
+            stop,
+            on_stats=self._record_recovery_stats,
+        )
+
+    def _record_recovery_stats(self, stats: Any) -> None:
+        """Surface quarantine counters in health.json (fail-open), as Telegram does."""
+
+        if not self._health_active:
+            return
+        try:
+            if getattr(stats, "quarantined", 0):
+                health_reporter.record_transcript_quarantined(stats.quarantined)
+            if getattr(stats, "hard_quarantined", 0):
+                health_reporter.record_transcript_hard_quarantined(stats.hard_quarantined)
+        except Exception as error:
+            logger.debug("Matrix recovery stats health recording failed: %s", type(error).__name__)
+
     def _notification_bot(self) -> _NotificationRoute:
         return _NotificationRoute(self._deliver_notice)
 
@@ -1275,9 +1557,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         finally:
             matrix_media.remove(path)
 
-    async def cancel(self, job: Mapping[str, Any]) -> bool:
-        """``TurnRunner.cancel``: same handler path as ``/stop``."""
-
+    def _control_identity(self, job: Mapping[str, Any]) -> tuple[int, int]:
         room_id = str(job["room_id"])
         sender = str(job["sender"])
         transport = self._transport
@@ -1286,6 +1566,25 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         else:
             kind = "direct" if self._direct_room_map().room_for(sender) == room_id else "family"
         user_id, chat_id, _ = self._job_identity(job, kind)
+        return user_id, chat_id
+
+    async def stop_idle(self, job: Mapping[str, Any]) -> bool:
+        """``/stop`` with no turn running in the sender's scope (#1825).
+
+        Cancels that conversation's queued continuations; ``False`` (nothing
+        queued) leaves the transport's ordinary invalid-control answer.
+        """
+
+        user_id, chat_id = self._control_identity(job)
+        return bool(self._cancel_continuations(user_id, chat_id))
+
+    async def cancel(self, job: Mapping[str, Any]) -> bool:
+        """``TurnRunner.cancel``: same handler path as ``/stop``."""
+
+        user_id, chat_id = self._control_identity(job)
+        # Only a user control (/stop, /cancel <turn>) reaches this runner seam;
+        # the turn timeout cancels the task directly.
+        self._cancel_continuations(user_id, chat_id)
         return await self._cancel_turn(user_id, chat_id)
 
     @staticmethod
@@ -1312,6 +1611,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return await self._cmd_usage(user_id=user_id, chat_id=chat_id)
         if command == "stop":
             return await self._cmd_stop(user_id=user_id, chat_id=chat_id)
+        if command == "continue":
+            return await self._cmd_continue(user_id=user_id, chat_id=chat_id)
         if command == "task_pause":
             return await self._cmd_task_pause(args, user_id=user_id, chat_id=chat_id)
         if command == "task_recover":
@@ -1473,8 +1774,19 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         return _turn_result(content, response.session_id, streamed=streamed, status=status)
 
     async def _run_message(
-        self, body: str, *, user_id: int, chat_id: int, room_id: str, sink: TurnSink, turn_marker: str | None = None
+        self,
+        body: str,
+        *,
+        user_id: int,
+        chat_id: int,
+        room_id: str,
+        sink: TurnSink,
+        turn_marker: str | None = None,
+        usage_mode: str = MODE_INTERACTIVE,
+        responses: list[Any] | None = None,
     ) -> Any:
+        """One agent turn; ``responses`` (optional) receives the ``ChatResponse``."""
+
         if self._refuses_non_owner_turn(user_id):
             return _turn_result(NON_OWNER_TURN_REFUSED, None)
         key = self._conversation_key(user_id, chat_id)
@@ -1493,7 +1805,10 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         response = await self._dispatch_turn(
             body, key=key, user_id=user_id, chat_id=chat_id, session=session,
             session_id=session_id, new_session=new_session, sink=sink, turn_marker=turn_marker,
+            usage_mode=usage_mode,
         )
+        if responses is not None:
+            responses.append(response)
         # #1895: like the Telegram path, a failed Danso turn is followed by the
         # recovery menu — after the failure text, never instead of it.
         result = await self._finish(response, room_id)
@@ -1514,6 +1829,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         resume_task: bool = False,
         turn_marker: str | None = None,
         dispatch_guard: Callable[[], bool] | None = None,
+        usage_mode: str = MODE_INTERACTIVE,
     ) -> ChatResponse:
         """One ``process_message`` call with this room's callbacks; persists the session."""
 
@@ -1540,7 +1856,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             status_callback=self._make_status_callback(sink),
             notification_bot=self._notification_bot(),
             interim_message_callback=self._make_interim_callback(sink, room_id),
-            usage_mode=MODE_INTERACTIVE,
+            usage_mode=usage_mode,
             **extra,
         ))
         await self._save_session_id(key, response, user_id=user_id, chat_id=chat_id)
@@ -1675,6 +1991,16 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             payload, user_id=user_id, room_kind=room_kind
         ):
             return _turn_result(EXTERNAL_WAIT_RESUME_REFUSED, None)
+        if kind == SELF_JOB_CONTINUATION:
+            # #1825: same sender binding as the external-wait resume (#1955).
+            if payload.get("user_id") is None or not self._external_wait_job_admitted(
+                payload, user_id=user_id, room_kind=room_kind
+            ):
+                self._settle_continuation(str(payload.get("continuation_id") or ""), False)
+                return _turn_result(EXTERNAL_WAIT_RESUME_REFUSED, None)
+            return await self._run_continuation_job(
+                payload, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink, turn_marker=turn_marker
+            )
         if kind not in (SELF_JOB_DANSO_AUTO_RESUME, SELF_JOB_EXTERNAL_WAIT_RESUME) or (
             kind == SELF_JOB_DANSO_AUTO_RESUME and not self._check_user_access(user_id)
         ):
@@ -2135,9 +2461,31 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             killed = await self._project_chat.stop(user_id)
         return bool(killed)
 
+    def _cancel_continuations(self, user_id: int, chat_id: int) -> list[str]:
+        """User intent wins over queued autonomous continuations (#1113/#1825).
+
+        Drops the pending bundle and marks the in-flight one cancelled *before*
+        the turn is cancelled, so a stopped continuation turn is never counted
+        as a failed bundle.
+        """
+
+        try:
+            cancelled = self._continuation_queue().cancel_for(user_id, chat_id, include_running=True)
+        except Exception:
+            logger.warning("Matrix continuation cancel on /stop failed", exc_info=True)
+            return []
+        if cancelled:
+            logger.info("Cancelled %s queued continuation(s) on /stop", len(cancelled))
+        return cancelled
+
     async def _cmd_stop(self, *, user_id: int, chat_id: int) -> str:
+        cancelled = self._cancel_continuations(user_id, chat_id)
         killed = await self._cancel_turn(user_id, chat_id)
-        return "⏸️ Paused" if killed else "ℹ️ Nothing running"
+        if killed:
+            return "⏸️ Paused"
+        if cancelled:
+            return f"⏹️ Cancelled {len(cancelled)} queued continuation(s)"
+        return "ℹ️ Nothing running"
 
     def _claude_settings_model(self, default: str | None) -> str | None:
         try:
@@ -2424,3 +2772,6 @@ class MatrixTurnRunner:
 
     async def cancel(self, job: Mapping[str, Any]) -> bool:
         return await self._bot.cancel(job)
+
+    async def stop_idle(self, job: Mapping[str, Any]) -> bool:
+        return await self._bot.stop_idle(job)

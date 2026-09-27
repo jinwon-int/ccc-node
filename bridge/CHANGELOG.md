@@ -1,5 +1,20 @@
 # Changelog
 
+- **Matrix frontend runs auto-continue and dead-session recovery (#1825).**
+  `MatrixBot` does not inherit `BotLifecycleMixin`, so a Matrix
+  `continuation_cli register` answered `ok`, wrote
+  `BOT_DATA_DIR/continuation/queue.json` and nothing ever read it — the
+  promised next bundle silently never started. The frontend now runs the shared
+  `ContinuationMonitor` over that queue; each bundle is a durable self-job turn
+  in its room (requester-bound, `autonomous` usage), and the monitor waits for
+  that turn's outcome so the daily cap and the three-failure guard behave as on
+  Telegram. `/stop` cancels pending and running bundles (also with no turn
+  running, via a new optional `TurnRunner.stop_idle` transport seam), a
+  cancelled bundle whose self-job is still queued is skipped, and `/continue`
+  re-arms `cap-hold` bundles. The shared dead-session scanner now delivers
+  terminal Claude task notices to the room at startup and periodically,
+  through the durable outbox.
+
 - **Grok Matrix startup banner stays out of family rooms.** `family_rooms`
   must be listed in `rooms`, so the banner loop announced every restart to the
   family as well (observed 2026-09-25 right after enabling the family room,
