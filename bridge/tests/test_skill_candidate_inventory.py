@@ -173,3 +173,24 @@ def test_every_status_metadata_field_is_sanitized(tmp_path: Path) -> None:
     assert row["classification_excluded_reason"] == "metadata_injected_directive"
     assert row["reason_excluded_reason"] == "metadata_injected_directive"
     assert row["description_excluded_reason"] == "metadata_injected_directive"
+
+
+def test_overlap_description_decodes_yaml_quoted_line(tmp_path: Path) -> None:
+    """#2032: a writer-quoted description reaches the inventory without quotes."""
+    skills, state = _make_managed_skill(tmp_path)
+    overlap = skills / "read-only-overlap"
+    overlap.mkdir(mode=0o700)
+    (overlap / "SKILL.md").write_text(
+        "---\n"
+        "name: read-only-overlap\n"
+        'description: "Use when reviewing: the same recurring \\"bounded\\" inventory #42"\n'
+        "---\n\n# Read only\n"
+    )
+    (overlap / "SKILL.md").chmod(0o600)
+
+    inventory = _builder(skills, state).build()
+
+    overlap_row = inventory["read_only_overlaps"][0]
+    assert overlap_row["description"] == (
+        'Use when reviewing: the same recurring "bounded" inventory #42'
+    )

@@ -73,7 +73,13 @@ AUTOINSTALL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pw
 . "$AUTOINSTALL_LIB_DIR/provider.sh" 2>/dev/null || true
 # shellcheck source=claude/hooks/lib/autonomy-guard.sh
 . "$AUTOINSTALL_LIB_DIR/../lib/autonomy-guard.sh" 2>/dev/null || true
+# shellcheck source=claude/hooks/lib/skill-frontmatter.sh
+. "$AUTOINSTALL_LIB_DIR/../lib/skill-frontmatter.sh" || exit 0
 OWNERSHIP_TOOL="$AUTOINSTALL_LIB_DIR/ownership.py"
+# YAML-safe description renderer (#2032): installed beside the hooks root as
+# ccc_skill_frontmatter.py; a repository checkout uses the canonical module.
+SKILL_FM_TOOL="$AUTOINSTALL_LIB_DIR/../ccc_skill_frontmatter.py"
+[ -r "$SKILL_FM_TOOL" ] || SKILL_FM_TOOL="$AUTOINSTALL_LIB_DIR/../../../bridge/utils/skill_frontmatter.py"
 ts_id() { date -u +%Y%m%d%H%M%S; }
 
 # Provider-neutral install target (#643): the gate/ledger/rollback pipeline is
@@ -148,8 +154,18 @@ file_sha() {
   fi
 }
 
-fm_field() { # <skill.md> <key> — first single-line frontmatter value
-  awk -v k="$2" 'NR==1{next} /^---/{exit} $0 ~ "^"k":" {sub("^"k":[[:space:]]*", ""); print; exit}' "$1" 2>/dev/null
+fm_field() { # <skill.md> <key> — first single-line frontmatter value (YAML-unquoted, #2032)
+  ccc_fm_field "$1" "$2"
+}
+
+# Re-render the draft's description line YAML-safely (#2032) into <out>:
+# model-written drafts carry unquoted descriptions such as "Use when X: do Y",
+# which fleet-skills validate.py (fleet-skills#328) rejects and YAML runtimes
+# misread. Fails closed (the draft stays pending) when the renderer is missing.
+normalize_skill_md() { # <in> <out>
+  command -v python3 >/dev/null 2>&1 || return 2
+  [ -r "$SKILL_FM_TOOL" ] || return 2
+  python3 "$SKILL_FM_TOOL" normalize "$1" "$2" 2>/dev/null
 }
 
 fm_close_line() { awk 'NR>1 && /^---[[:space:]]*$/{print NR; exit}' "$1" 2>/dev/null; }
@@ -701,6 +717,10 @@ do_run() {
           ;;
       esac
     fi
+    if ! normalize_skill_md "$f" "$work/$id.yaml-safe.SKILL.md"; then
+      record_block "$dir" "$id" "lint description-yaml-unsafe"; continue
+    fi
+    f="$work/$id.yaml-safe.SKILL.md"
     if ! verdict="$(gate_lint "$f")"; then
       record_block "$dir" "$id" "$verdict"; continue
     fi
@@ -1027,6 +1047,11 @@ do_apply() {
       jq -j '.proposal.skill_md' "$proposal" > "$f" 2>/dev/null || {
         rm -f "$f"
         echo '{"ok":false,"code":"incremental_create_invalid"}'
+        return 2
+      }
+      normalize_skill_md "$f" "$f" || {
+        rm -f "$f"
+        echo '{"ok":false,"code":"lint description-yaml-unsafe"}'
         return 2
       }
       verdict="$(gate_lint "$f")" || {

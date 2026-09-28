@@ -366,13 +366,17 @@ ok "pipeline: render pipeline leaves no scratch directory behind (#1484)" \
   '[ "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name "ccc-mem-pipe.*" 2>/dev/null | wc -l)" = 0 ]'
 
 # --- Skill index injection (#1145) ---
-skills="$TMP/skills"; mkdir -p "$skills/gh-pr-flow" "$skills/no-frontmatter"
+skills="$TMP/skills"; mkdir -p "$skills/gh-pr-flow" "$skills/no-frontmatter" "$skills/quoted-desc"
 printf -- '---\nname: gh-pr-flow\ndescription: Ship code through the PR-first flow including REVIEW_REQUIRED cross-account review\n---\nbody\n' > "$skills/gh-pr-flow/SKILL.md"
+# #2032: writers quote descriptions YAML would misread; the index decodes them.
+printf -- '---\nname: quoted-desc\ndescription: "Use when X: do Y, see #1"\n---\nbody\n' > "$skills/quoted-desc/SKILL.md"
 printf 'no frontmatter here\n' > "$skills/no-frontmatter/SKILL.md"
 out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_SKILL_INDEX_ENABLED=1 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "skill index injects name and description from frontmatter" \
   '[ "$rc" = 0 ] && grep -q "Node skills index" <<<"$out" && grep -q "gh-pr-flow — Ship code through the PR-first flow" <<<"$out"'
 ok "skill without frontmatter is skipped, not misparsed" '! grep -q "no-frontmatter" <<<"$out"'
+ok "skill index decodes a YAML-quoted description (#2032)" \
+  'grep -Fq -- "- quoted-desc — Use when X: do Y, see #1\\n" <<<"$out"'
 big="$skills/zz-big"; mkdir -p "$big"
 printf -- '---\nname: zz-big\ndescription: %s\n---\n' "$(printf 'x%.0s' $(seq 1 3000))" > "$big/SKILL.md"
 out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_SKILL_INDEX_ENABLED=1 CCC_SKILL_INDEX_MAX_BYTES=200 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?

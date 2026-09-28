@@ -2118,4 +2118,5 @@ python3 "$HERE/ccc_skill_promotion_auto_drain_test.py" || fail=$((fail+1))
 python3 "$HERE/ccc_skill_promotion_lineage_state_test.py" || fail=$((fail+1))
 python3 "$HERE/ccc_skill_promotion_danso_test.py" || fail=$((fail+1))
 python3 "$HERE/ccc_skill_receipt_retry_test.py" || fail=$((fail+1))
+python3 "$HERE/ccc_skill_promotion_yaml_safe_test.py" || fail=$((fail+1))
 [ "$fail" -eq 0 ]

@@ -93,11 +93,12 @@ rm -f "$STATE/skill-autosave.mode"
 make_draft 20260101-000001-c-provenance provenance-fail "Use when capturing the recurring provenance failure recovery procedure."
 mkdir -p "$TMP/fail-bin"
 # The stub fails only the ownership tool; the description-trigger lint helper
-# still runs on the real interpreter so the draft reaches the install step.
+# and the YAML-safe frontmatter renderer (#2032) still run on the real
+# interpreter so the draft reaches the install step.
 REAL_PY3="$(command -v python3)"
 cat > "$TMP/fail-bin/python3" <<STUB
 #!/bin/sh
-case "\$1" in */description_trigger.py) exec "$REAL_PY3" "\$@" ;; esac
+case "\$1" in */description_trigger.py|*skill_frontmatter.py) exec "$REAL_PY3" "\$@" ;; esac
 printf '%s\n' '{"ok": false, "code": "stubbed_unsafe_skills_root"}'
 exit 2
 STUB
@@ -690,6 +691,52 @@ out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DANSO" CLAUDE_SKILLS_DIR="$SKILLS" DAN
   CCC_PUSH_SPOOL="$TMP/spool-danso" CCC_NODE=testnode CCC_SKILL_AUTOSAVE_TRIGGER=danso3 bash "$AUTO" run)"
 ok "codex-coupled danso draft stays pending with codex-incompat" \
   'jq -e ".blocked[] | select(.id == \"20260911-000103-danso-codex\" and .reason == \"codex-incompat codex-cli\")" >/dev/null <<<"$out"'
+
+# --- #2032: installed drafts carry a YAML-safe description line -----------------
+# Model drafts write descriptions unquoted; ": " is invalid YAML and " #" starts
+# a YAML comment, so fleet-skills validate.py (fleet-skills#328) rejects them.
+# The installer re-renders the line quoted; gates see the decoded value.
+STATE_YAML="$TMP/state-yaml"; PENDING_YAML="$STATE_YAML/pending-skills"; SKILLS_YAML="$TMP/skills-yaml"
+mkdir -p "$PENDING_YAML" "$SKILLS_YAML" && chmod 700 "$STATE_YAML" "$SKILLS_YAML"
+printf 'auto\n' > "$STATE_YAML/skill-autosave.mode"
+yaml_desc='Use when a Cloudflare token leaked. Triggers: cache purge, rotation of token #42'
+make_draft_in "$PENDING_YAML" 20260928-000001-yaml-colon yaml-colon-skill "$yaml_desc"
+make_draft_in "$PENDING_YAML" 20260928-000002-yaml-plain yaml-plain-skill "Use when capturing the plain recurring certificate renewal checklist workflow."
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_YAML" CLAUDE_SKILLS_DIR="$SKILLS_YAML" CCC_PUSH_SPOOL="$TMP/spool-yaml" \
+  CCC_NODE=testnode CCC_SKILL_AUTOSAVE_TRIGGER=yaml bash "$AUTO" run)"
+# shellcheck disable=SC2034  # yaml_md is read via eval inside ok()
+yaml_md="$SKILLS_YAML/yaml-colon-skill/SKILL.md"
+ok "#2032 unsafe description installs with a double-quoted line" \
+  'grep -Fxq "description: \"$yaml_desc\"" "$yaml_md"'
+ok "#2032 safe description installs byte-identical (still plain)" \
+  'cmp -s "$PENDING_YAML"/20260928-000002-yaml-plain*/SKILL.md "$SKILLS_YAML/yaml-plain-skill/SKILL.md"'
+ok "#2032 marker hash covers the normalized SKILL.md" \
+  '[ "$(jq -r .skill_sha256 "$SKILLS_YAML/yaml-colon-skill/.autosave-meta.json")" = "$(sha256sum "$yaml_md" | cut -d" " -f1)" ]'
+ok "#2032 fm_field decodes the quoted description" \
+  '[ "$(bash -c ". \"$HERE/../lib/skill-frontmatter.sh\"; ccc_fm_field \"\$1\" description" _ "$yaml_md")" = "$yaml_desc" ]'
+if python3 -c 'import yaml' 2>/dev/null; then
+  ok "#2032 installed frontmatter parses with PyYAML to the original description" \
+    'python3 - "$yaml_md" "$yaml_desc" <<"PY"
+import sys, yaml
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+data = yaml.safe_load("\n".join(lines[1:lines.index("---", 1)]))
+sys.exit(0 if data == {"name": "yaml-colon-skill", "description": sys.argv[2]} else 1)
+PY'
+else
+  echo "SKIP: #2032 PyYAML parse check (PyYAML not installed)"
+fi
+# Fail closed: a missing renderer leaves the draft pending instead of
+# installing an unverified description line.
+mkdir -p "$TMP/no-fm/hooks/skill-review" "$TMP/no-fm/hooks/lib"
+cp "$HERE"/*.sh "$HERE"/*.py "$TMP/no-fm/hooks/skill-review/"
+cp "$HERE"/../lib/*.sh "$TMP/no-fm/hooks/lib/"
+make_draft_in "$PENDING_YAML" 20260928-000003-yaml-nofm yaml-nofm-skill "Use when the renderer is missing: the draft must stay pending."
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_YAML" CLAUDE_SKILLS_DIR="$SKILLS_YAML" CCC_PUSH_SPOOL="$TMP/spool-yaml" \
+  CCC_NODE=testnode CCC_SKILL_AUTOSAVE_TRIGGER=yaml bash "$TMP/no-fm/hooks/skill-review/autoinstall.sh" run)"
+ok "#2032 missing renderer blocks the draft (fail closed)" \
+  '[ ! -e "$SKILLS_YAML/yaml-nofm-skill" ] && jq -e ".blocked[] | select(.id == \"20260928-000003-yaml-nofm\" and .reason == \"lint description-yaml-unsafe\")" >/dev/null <<<"$out"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

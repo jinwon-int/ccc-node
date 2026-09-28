@@ -10,6 +10,11 @@ TRIGGER="${CLAUDE_SKILL_REVIEW_TRIGGER:-manual}"
 SOURCE_CWD="${CLAUDE_SKILL_REVIEW_SOURCE_CWD:-}"
 SOURCE_PROJECT="${CLAUDE_SKILL_REVIEW_SOURCE_PROJECT:-}"
 SKILLS_DIR="${CLAUDE_SKILLS_DIR:-${HOME:-/root}/.claude/skills}"
+# Decoder for YAML-quoted description lines (#2032); a missing lib degrades to
+# the historical verbatim value rather than failing the review.
+# shellcheck source=claude/hooks/lib/skill-frontmatter.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/../lib/skill-frontmatter.sh" 2>/dev/null \
+  || CCC_YAML_UNQUOTE_AWK='function ccc_yaml_unquote(s) { return s }'
 MAX_TURNS="${CCC_SKILL_REVIEW_MAX_TURNS:-80}"
 MAX_BYTES="${CCC_SKILL_REVIEW_MAX_BYTES:-60000}"
 MODEL="${CCC_SKILL_REVIEW_MODEL:-haiku}"
@@ -103,7 +108,7 @@ existing_skills() {
   fi
   find "$SKILLS_DIR" -maxdepth 2 -name SKILL.md 2>/dev/null | sort | while IFS= read -r f; do
     name="$(awk 'NR>1 && /^---/{exit} /^name:/ {sub(/^name:[[:space:]]*/,""); print; exit}' "$f" 2>/dev/null)"
-    desc="$(awk 'NR>1 && /^---/{exit} /^description:/ {sub(/^description:[[:space:]]*/,""); print; exit}' "$f" 2>/dev/null)"
+    desc="$(awk "$CCC_YAML_UNQUOTE_AWK"'NR>1 && /^---/{exit} /^description:/ {sub(/^description:[[:space:]]*/,""); print ccc_yaml_unquote($0); exit}' "$f" 2>/dev/null)"
     [ -n "$name" ] && printf -- '- %s — %s\n' "$name" "$desc"
   done
 }

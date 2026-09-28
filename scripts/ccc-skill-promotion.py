@@ -30,6 +30,7 @@ import time
 from typing import Any, Iterator
 
 import ccc_secure_fs as _secure_fs
+import ccc_skill_frontmatter as _skill_frontmatter
 
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -763,7 +764,22 @@ def _safe_read(path: Path, *, max_bytes: int, exact_mode: int | None = None) -> 
         raise PromotionError("source_file_unsafe") from None
 
 
-def _frontmatter(payload: bytes, expected_name: str) -> str:
+def _frontmatter(payload: bytes, expected_name: str, *, require_yaml_safe: bool = False) -> str:
+    """Line-by-line frontmatter gate; returns the decoded description.
+
+    The description line may be a YAML-quoted scalar (#2032): it is decoded
+    with the shared helper so quotes never leak into lengths, dedup, or PR
+    text. ``require_yaml_safe`` (node-side snapshot) additionally refuses a
+    line YAML would read differently -- fleet-skills validate.py rejects it
+    (fleet-skills#328) -- so the autorepair pass can re-render it quoted.
+    """
+    return _frontmatter_fields(payload, expected_name, require_yaml_safe=require_yaml_safe)[0]
+
+
+def _frontmatter_fields(
+    payload: bytes, expected_name: str, *, require_yaml_safe: bool = False
+) -> tuple[str, str]:
+    """(decoded description, raw description line value)."""
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError:
@@ -788,10 +804,17 @@ def _frontmatter(payload: bytes, expected_name: str) -> str:
         raise PromotionError("skill_frontmatter_invalid")
     if fields.get("name") != expected_name:
         raise PromotionError("skill_name_mismatch")
-    description = fields.get("description", "")
-    if not 20 <= len(description) <= 1024 or len(lines[end + 1 :]) < 3:
+    raw = fields.get("description", "")
+    description = _skill_frontmatter.unquote_scalar(raw)
+    if (
+        not 20 <= len(description) <= 1024
+        or len(raw) > 1024
+        or len(lines[end + 1 :]) < 3
+    ):
         raise PromotionError("skill_frontmatter_invalid")
-    return description
+    if require_yaml_safe and not _skill_frontmatter.is_yaml_safe(raw):
+        raise PromotionError("skill_description_yaml_unsafe")
+    return description, raw
 
 
 def _scan_text(payload: bytes) -> None:
@@ -912,7 +935,7 @@ def _snapshot(config: Config, provider: str, row: dict[str, Any]) -> Candidate: 
     actual_skill_sha = hashlib.sha256(files[0].content).hexdigest()
     if actual_skill_sha != skill_sha:
         raise PromotionError("skill_hash_mismatch")
-    description = _frontmatter(files[0].content, name)
+    description = _frontmatter(files[0].content, name, require_yaml_safe=True)
     digest = hashlib.sha256()
     for item in files:
         digest.update(item.relative.encode())
@@ -1018,7 +1041,7 @@ def _central_frontmatter(path: Path) -> tuple[str, str] | None:
     name, description = fields.get("name"), fields.get("description")
     if not name or not description:
         return None
-    return name, description
+    return name, _skill_frontmatter.unquote_scalar(description)
 
 
 def _central_dedup(root: Path, candidate: Candidate) -> None:
@@ -1407,9 +1430,14 @@ def _candidate_from_envelope(  # noqa: C901
     files.sort(key=lambda item: item.relative)
     if not files or files[0].relative != "SKILL.md":
         raise PromotionError("envelope_skill_missing")
-    actual_description = _frontmatter(files[0].content, name)
-    if actual_description != description or hashlib.sha256(files[0].content).hexdigest() != skill_sha:
+    actual_description, raw_description = _frontmatter_fields(files[0].content, name)
+    # Pre-#2032 exporters recorded the raw line value; accept it, but carry the
+    # decoded description from here on.
+    if description not in (actual_description, raw_description) or (
+        hashlib.sha256(files[0].content).hexdigest() != skill_sha
+    ):
         raise PromotionError("envelope_skill_mismatch")
+    description = actual_description
     digest = hashlib.sha256()
     for item in files:
         digest.update(item.relative.encode())
@@ -2347,7 +2375,9 @@ def _inventory_snapshot(config: Config, *, limit: int = 64) -> list[dict[str, st
             {
                 "name": name_match.group(1).strip() if name_match else Path(path).parts[-2],
                 "audience": path.split("/")[1],
-                "description": (desc_match.group(1).strip()[:200] if desc_match else ""),
+                "description": (
+                    _skill_frontmatter.unquote_scalar(desc_match.group(1))[:200] if desc_match else ""
+                ),
             }
         )
     return snapshot
@@ -2882,6 +2912,17 @@ def _revised_files_from_output(
     return files
 
 
+def _yaml_safe_skill_md(blob: bytes) -> bytes:
+    try:
+        text = blob.decode("utf-8")
+    except UnicodeDecodeError:
+        return blob  # the frontmatter gate below reports skill_not_utf8
+    try:
+        return _skill_frontmatter.normalize_skill_md(text).encode("utf-8")
+    except ValueError:
+        raise PromotionError("skill_description_yaml_unsafe") from None
+
+
 def _candidate_from_revised_files(
     node: str,
     provider: str,
@@ -2892,8 +2933,14 @@ def _candidate_from_revised_files(
     """Rebuild a Candidate through the full envelope path: path safety, size
     caps, secret/node-fact/coupling scans, frontmatter rules, and tree-hash
     consistency all re-apply — a revision never bypasses the machine gates."""
+    # A reviser rewrites SKILL.md freely; re-render its description line so a
+    # revision never reintroduces YAML the fleet-skills gate rejects (#2032).
     files = [
-        SnapshotFile(relative=path, content=blob, executable=original_exec.get(path, False))
+        SnapshotFile(
+            relative=path,
+            content=_yaml_safe_skill_md(blob) if path == "SKILL.md" else blob,
+            executable=original_exec.get(path, False),
+        )
         for path, blob in revised
     ]
     files.sort(key=lambda item: item.relative)
@@ -5668,6 +5715,9 @@ def _republish_revised_candidate(
 
 _AUTOREPAIR_CODES = frozenset({
     "skill_frontmatter_invalid",
+    # #2032: an unquoted description YAML reads differently (": ", " #", a
+    # leading indicator); the deterministic repair re-renders it quoted.
+    "skill_description_yaml_unsafe",
     "runtime_specific_claude",
     "runtime_specific_codex",
 })
@@ -5690,7 +5740,7 @@ def _repair_skill_frontmatter(skill_dir: Path, expected_name: str) -> None:
                 if ":" in line:
                     key, value = line.split(":", 1)
                     if key.strip() == "description":
-                        description = value.strip()
+                        description = _skill_frontmatter.unquote_scalar(value)
     if not (20 <= len(description) <= 1024):
         derived = ""
         for line in body:
@@ -5703,7 +5753,11 @@ def _repair_skill_frontmatter(skill_dir: Path, expected_name: str) -> None:
         description = derived
     if len(body) < 3:
         body = body + ["", "Follow the steps in order and record evidence for each step."][: 3 - len(body)]
-    frontmatter = ["---", f"name: {expected_name}", f"description: {description}", "---"]
+    try:
+        description_line = _skill_frontmatter.render_line("description", description)
+    except ValueError:
+        raise PromotionError("skill_description_yaml_unsafe") from None
+    frontmatter = ["---", f"name: {expected_name}", description_line, "---"]
     path.write_text("\n".join(frontmatter + body) + "\n", encoding="utf-8")
 
 
@@ -5745,7 +5799,7 @@ def _autorepair_candidate(config: Config, provider: str, name: str, code: str) -
     if not skill_dir.is_dir():
         return False
     try:
-        if code == "skill_frontmatter_invalid":
+        if code in ("skill_frontmatter_invalid", "skill_description_yaml_unsafe"):
             _repair_skill_frontmatter(skill_dir, name)
         elif code in ("runtime_specific_claude", "runtime_specific_codex"):
             _autorepair_llm(skill_dir, provider, config.review_llm_cmd)

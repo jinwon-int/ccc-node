@@ -17,6 +17,8 @@ import subprocess
 import sys
 from typing import Any, Literal
 
+from telegram_bot.utils.skill_frontmatter import unquote_scalar
+
 from .skill_candidate import _CREDENTIAL_PATTERNS, _DIRECTIVE_RE
 
 MAX_WRITABLE_SKILLS = 8
@@ -374,7 +376,8 @@ class SkillCandidateInventoryBuilder:
             if line == "---":
                 break
             if line.startswith("description:"):
-                description = line.split(":", 1)[1].strip()
+                # YAML-quoted descriptions (#2032) are decoded, not echoed.
+                description = unquote_scalar(line.split(":", 1)[1])
                 return _safe_metadata(
                     description,
                     kind="description",

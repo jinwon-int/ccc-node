@@ -32,6 +32,21 @@ import subprocess
 from pathlib import Path
 from typing import Any, Mapping
 
+try:
+    from telegram_bot.utils.skill_frontmatter import unquote_scalar as _unquote_scalar
+except ImportError:  # pragma: no cover - standalone/sibling load outside the package
+    import importlib.util as _importlib_util
+
+    _FM_SPEC = _importlib_util.spec_from_file_location(
+        "ccc_skill_frontmatter",
+        Path(__file__).resolve().parents[1] / "utils" / "skill_frontmatter.py",
+    )
+    if _FM_SPEC is None or _FM_SPEC.loader is None:
+        raise
+    _FM_MODULE = _importlib_util.module_from_spec(_FM_SPEC)
+    _FM_SPEC.loader.exec_module(_FM_MODULE)
+    _unquote_scalar = _FM_MODULE.unquote_scalar
+
 MAX_QUERY_CHARS = 256
 DEFAULT_LIMIT = 10
 MAX_LIMIT = 50
@@ -142,6 +157,8 @@ def _frontmatter(text: str) -> dict[str, str] | None:
             return None
         if value:
             values[key] = value
+    if "description" in values:  # YAML-quoted (#2032): decode, never echo quotes
+        values["description"] = _unquote_scalar(values["description"])
     name = values.get("name")
     description = values.get("description")
     if not isinstance(name, str) or not _NAME_RE.fullmatch(name):

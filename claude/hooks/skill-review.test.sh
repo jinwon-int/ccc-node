@@ -80,7 +80,7 @@ if [ -n "${CLAUDE_TOOL_ENV_SNAPSHOT:-}" ]; then
   printf '<%s>\n' "${CCC_ALLOWED_TOOLS-unset}" > "$CLAUDE_TOOL_ENV_SNAPSHOT"
 fi
 cat <<'JSON'
-{"skill_candidates":[{"name":"deploy-checklist","category":"ops","summary":"Capture a recurring deploy checklist.","reason":"The transcript repeats a multi-step deploy verification flow.","evidence_excerpt":"automate recurring deploy checklist","skill_md":"---\nname: deploy-checklist\ndescription: Use when capturing deploy checklist procedures.\n---\n\n# Deploy Checklist\n\n## When to Use\n- Use when deploy verification repeats.\n\n## Procedure\n1. Inspect git state.\n2. Run the verified checklist.\n\n## Safety\n- Never store raw secrets.\n\n## Verification\n- Confirm the checklist output is recorded.\n"}]}
+{"skill_candidates":[{"name":"deploy-checklist","category":"ops","summary":"Capture a recurring deploy checklist.","reason":"The transcript repeats a multi-step deploy verification flow.","evidence_excerpt":"automate recurring deploy checklist","skill_md":"---\nname: deploy-checklist\ndescription: Use when capturing deploy checklist procedures: inspect git state, then verify.\n---\n\n# Deploy Checklist\n\n## When to Use\n- Use when deploy verification repeats.\n\n## Procedure\n1. Inspect git state.\n2. Run the verified checklist.\n\n## Safety\n- Never store raw secrets.\n\n## Verification\n- Confirm the checklist output is recorded.\n"}]}
 JSON
 SH
 chmod +x "$TMP/bin/claude"
@@ -98,6 +98,10 @@ for _ in $(seq 1 30); do
 done
 ok "skill-review stages SKILL.md" 'find "$STATE/pending-skills" -name SKILL.md 2>/dev/null | grep -q .'
 ok "skill-review writes meta" 'find "$STATE/pending-skills" -name meta.json 2>/dev/null | grep -q .'
+# #2032: the model wrote the description unquoted with ": "; the staged draft
+# carries it as one YAML-safe double-quoted line.
+ok "skill-review stages a YAML-safe description line" \
+  'grep -Fxq "description: \"Use when capturing deploy checklist procedures: inspect git state, then verify.\"" "$(find "$STATE/pending-skills" -name SKILL.md | head -1)"'
 ok "skill-review does not install live skill" '[ ! -e "$SKILLS/deploy-checklist/SKILL.md" ]'
 ok "approval marker written" '[ -f "$STATE/approval-needed.log" ] && grep -q "PENDING_SKILL_REVIEW" "$STATE/approval-needed.log"'
 for _ in $(seq 1 30); do

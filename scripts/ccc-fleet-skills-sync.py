@@ -18,6 +18,20 @@ import subprocess
 import tempfile
 from typing import Any
 
+try:  # Installed beside this file by setup.sh (#2032).
+    import ccc_skill_frontmatter as _skill_frontmatter
+except ImportError:  # pragma: no cover - repository checkout without the adapter
+    import importlib.util as _importlib_util
+
+    _FM_SPEC = _importlib_util.spec_from_file_location(
+        "ccc_skill_frontmatter",
+        Path(__file__).resolve().parents[1] / "bridge" / "utils" / "skill_frontmatter.py",
+    )
+    if _FM_SPEC is None or _FM_SPEC.loader is None:
+        raise
+    _skill_frontmatter = _importlib_util.module_from_spec(_FM_SPEC)
+    _FM_SPEC.loader.exec_module(_skill_frontmatter)
+
 
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -353,7 +367,10 @@ def frontmatter(payload: bytes, expected: str) -> None:
         fields[key] = value
     if set(fields) != {"name", "description"} or fields["name"] != expected:
         raise SyncError("frontmatter_invalid")
-    if not 20 <= len(fields["description"]) <= 1024 or len(lines[end + 1 :]) < 3:
+    # fleet-skills#328 quotes descriptions YAML would misread (#2032); measure
+    # the decoded value, as the runtimes and validate.py do.
+    description = _skill_frontmatter.unquote_scalar(fields["description"])
+    if not 20 <= len(description) <= 1024 or len(lines[end + 1 :]) < 3:
         raise SyncError("frontmatter_invalid")
 
 

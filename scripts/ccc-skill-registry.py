@@ -36,6 +36,30 @@ import sys
 import tempfile
 from typing import Any
 
+
+def _load_unquote() -> Any:
+    """Shared YAML scalar decoder (#2032): the sibling ccc_skill_frontmatter
+    adapter, else this checkout's canonical bridge module. A lone copy of this
+    script (test fixtures) keeps the historical verbatim reading."""
+    try:
+        import ccc_skill_frontmatter
+
+        return ccc_skill_frontmatter.unquote_scalar
+    except ImportError:
+        pass
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "bridge" / "utils" / "skill_frontmatter.py"
+    spec = importlib.util.spec_from_file_location("ccc_skill_frontmatter", path)
+    if spec is None or spec.loader is None or not path.is_file():
+        return lambda raw: raw.strip()
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.unquote_scalar
+
+
+_unquote_scalar = _load_unquote()
+
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 SCHEMA_VERSION = 1
 STATUS_VALUES = ("active", "deprecated")
@@ -123,6 +147,8 @@ def _frontmatter(path: Path) -> dict[str, str]:
         if key in values:
             raise RegistryError("registry_skill_invalid")
         values[key] = value
+    if "description" in values:
+        values["description"] = _unquote_scalar(values["description"])
     name = values.get("name")
     description = values.get("description")
     if not isinstance(name, str) or not NAME_RE.fullmatch(name):
