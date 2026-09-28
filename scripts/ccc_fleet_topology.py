@@ -742,6 +742,21 @@ def _parse_port(text: str) -> int:
     return port
 
 
+def _canonical_ipv6_literal(address: ipaddress.IPv6Address) -> str:
+    # ``str(IPv6Address)`` is interpreter-dependent for IPv4-mapped
+    # addresses: through 3.12 the mapped tail renders in hex
+    # ("::ffff:c000:201") while 3.13+ renders dotted-quad mixed notation
+    # ("::ffff:192.0.2.1"). Pin the hex rendering here so the
+    # normalized-literal gate below accepts and refuses the same endpoints
+    # regardless of the Python version running this check.
+    mapped = address.ipv4_mapped
+    if mapped is None:
+        return str(address)
+    # Group text matches the stdlib rendering: lowercase hex with no
+    # zero-padding ("::ffff:c000:201", "::ffff:7f00:1").
+    return f"::ffff:{int(mapped) >> 16:x}:{int(mapped) & 0xffff:x}"
+
+
 def _parse_ipv6_host(netloc: str) -> tuple[str, str, int | None]:
     end = netloc.find("]")
     if end < 0:
@@ -752,7 +767,7 @@ def _parse_ipv6_host(netloc: str) -> tuple[str, str, int | None]:
         address = ipaddress.IPv6Address(literal)
     except ValueError:
         raise _endpoint_error("endpoint_ip_invalid") from None
-    if str(address) != literal:
+    if _canonical_ipv6_literal(address) != literal:
         raise _endpoint_error("endpoint_not_normalized")
     port = None
     if rest:
