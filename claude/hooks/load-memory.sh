@@ -109,6 +109,11 @@ LOAD_MEMORY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pw
 . "$LOAD_MEMORY_LIB_DIR/lib/hook-common.sh" || exit 0
 # shellcheck source=claude/hooks/lib/memory-common.sh
 . "$LOAD_MEMORY_LIB_DIR/lib/memory-common.sh" || exit 0
+# YAML-quoted SKILL.md description decoder (#2032). Optional on purpose: a
+# missing lib keeps the historical verbatim skill index instead of no memory.
+# shellcheck source=claude/hooks/lib/skill-frontmatter.sh
+. "$LOAD_MEMORY_LIB_DIR/lib/skill-frontmatter.sh" 2>/dev/null \
+  || CCC_YAML_UNQUOTE_AWK='function ccc_yaml_unquote(s) { return s }'
 # Rendering/budget/bounded-search helpers (#584 P2-1): the former inline python3
 # heredocs live in this stdlib-only module. Every caller keeps its fail-open
 # `||` fallback, so a missing module degrades exactly like a heredoc failure.
@@ -695,13 +700,13 @@ if ! is_disabled "$SKILLS_ENABLED" && [ -d "$SKILLS_DIR" ]; then
   done
   skills_pairs=""
   if [ "${#skill_files[@]}" -gt 0 ]; then
-    skills_pairs="$(awk '
+    skills_pairs="$(awk "$CCC_YAML_UNQUOTE_AWK"'
       function flush() { if (name != "") printf "%s\t%s\n", name, desc; name=""; desc=""; fm=0; skip=0 }
       FNR==1 { flush(); if ($0 != "---") { skip=1 } else { fm=1 }; next }
       skip { next }
       /^---$/ { fm++; next }
       fm==1 && /^name:[ ]*/ { sub(/^name:[ ]*/,""); name=$0; next }
-      fm==1 && /^description:[ ]*/ { sub(/^description:[ ]*/,""); desc=substr($0,1,160); next }
+      fm==1 && /^description:[ ]*/ { sub(/^description:[ ]*/,""); desc=substr(ccc_yaml_unquote($0),1,160); next }
       END { flush() }' "${skill_files[@]}" 2>/dev/null | sort)"
   fi
   skills_index=""

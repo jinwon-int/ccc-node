@@ -22,13 +22,39 @@ For every `~/.claude/skills/<dir>/SKILL.md` (skills with
 |---|---|
 | operator wrote a `skillOverrides` entry | left exactly as written |
 | name in the core list (`claude/skill-listing-core.txt`) | description kept (no entry) |
-| used within the last 30 days (`--days`, `CCC_SKILL_LISTING_RECENT_DAYS`) | description kept (no entry) |
+| used within the last 30 days (`--days`, `CCC_SKILL_LISTING_RECENT_DAYS`) and it fits the budget | description kept (no entry) |
+| used within the last 30 days but does not fit (`recent, over budget`) | `skillOverrides[<name>] = "name-only"` |
 | anything else | `skillOverrides[<name>] = "name-only"` |
 
 "Used" means a record in `state/skill-usage/usage.jsonl` (Skill tool or a Read
 of the skill's `SKILL.md`, `skill-usage-log.sh`) or a `claude:`-lane
 `last_used_at` / `last_viewed_at` in `state/skill-autosave-usage.json`.
 `skillListingBudgetFraction` is set to `0.02` only when the key is absent.
+
+### Budget fit for recent skills (#2031)
+
+Describing every recent skill regardless of size left five nodes over the
+estimate after the policy (2026-09-28: 17,511–21,583 chars against 16,000 on
+nodes with 133–284 skills). The policy now fits recent skills into the budget:
+
+1. Fixed costs first: operator entries as written, core skills described,
+   everything else name-only. Every recent skill starts as name-only.
+2. Recent (non-core, non-operator) skills are ranked by most recent use, then
+   in-window use count (descending), then name.
+3. In that order, a skill keeps its description while the running estimate
+   stays at or below the budget. From the first skill that does not fit, it
+   and every lower-ranked recent skill become policy-owned `name-only` with
+   reason `recent, over budget (used <ts>)`. The policy does not skip over a
+   skill to fit a smaller one, so a less recently used skill is never
+   described while a more recent one is not.
+
+The budget is the one the settings will have after the run (the key may be set
+by that same run) for `--context-tokens` (default 200000, env
+`CCC_SKILL_LISTING_CONTEXT_TOKENS`); nodes on a larger context window may set
+it to their real window. The decision depends only on the inputs, so a second
+`apply` is a no-op. A skill that fits again later (a skill was archived, the
+budget grew, a more recent skill aged out) gets its policy-owned entry removed.
+`release` removes every policy-owned entry, including these.
 
 A `name-only` skill is still listed and still invocable by name
 (`/<name>` or the Skill tool); it just costs no description budget. The policy
@@ -74,9 +100,22 @@ python3 ~/.claude/hooks/ccc-skill-listing-policy.py release         # remove eve
 (`- name: description` per skill, descriptions capped at
 `skillListingMaxDescChars`, default 1536) against a budget of
 `fraction × --context-tokens (200000) × 4` chars. Claude Code's exact
-accounting differs; use `/context` in a session for the real number. If the
-estimate stays over budget, trim the core list rather than raising the
-fraction.
+accounting differs; use `/context` in a session for the real number.
+
+The estimate breaks down into described chars (of which core), name-only
+chars, and `over_budget` (`plan --json`: `after.over_budget`,
+`after.described_chars`, `after.core_desc_chars`, `after.name_only_chars`,
+and a top-level `warning`). When the estimate is still over budget after the
+fit, every recent skill is already name-only, and a `WARNING:` line names the
+dominant cost and what to trim:
+
+- **core descriptions** — shorten the core skills' `description:` (keep it
+  under ~300 chars, trigger first) or trim the core list;
+- **name list** — too many installed skills; reduce the count (archive per
+  #1739, owner-approved);
+- **other kept descriptions** — operator `"on"` pins; review them.
+
+Do not raise the fraction to hide it.
 
 `apply` writes only when the rendered result differs: it backs up
 `settings.json` to `~/.claude/backups/skill-listing-policy/` (newest 10 kept),
@@ -95,6 +134,10 @@ Kill switch: `CCC_SKILL_LISTING_POLICY=0` or the file
 script. It holds the fleet workflows every node should always see described:
 the repo-shipped operational skills plus a few fleet-installed flows
 (`a2a-task-poll`, `remote-node-harness-sync`, `model-migrate`). Keep it short —
-every entry costs budget on every turn of every session. Names not installed on
+every entry costs budget on every turn of every session, and core costs are
+paid before any recent skill is described. Keep core descriptions short: a
+"Use when …" trigger first, ≤300 chars (350 hard cap, enforced for the
+repo-shipped ones by `scripts/ccc_skill_listing_policy_test.py`); put the
+detail in the SKILL.md body. Names not installed on
 a node are ignored; custom commands under `~/.claude/commands` are not managed
 by the policy and need no entry.

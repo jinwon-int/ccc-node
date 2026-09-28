@@ -19,6 +19,7 @@ from telegram_bot.utils.memory_policy import MEMORY_MODE_AUDIENCE_SCOPED, MEMORY
 from telegram_bot.utils.orphan_reaper import BRIDGE_CHILD_ENV_VALUE, BRIDGE_CHILD_ENV_VAR
 
 from .agent_runtime import SessionRequest
+from .browser_mcp import build_browser_mcp
 from .curated_memory import build_curated_memory_settings
 from .family_mcp import build_family_mcp, merge_mcp_bundle
 from .memory_audience import audience_from_claude_environment
@@ -181,6 +182,10 @@ class ClaudeRuntimeOptionsMixin:
                 family = build_family_mcp(settings, audience_kind=audience_kind)
                 if family is not None:
                     merge_mcp_bundle(options, family)
+                # Opt-in fleet browser (#2034): same owner-only, non-shared rule.
+                browser = build_browser_mcp(settings, audience_kind=audience_kind)
+                if browser is not None:
+                    merge_mcp_bundle(options, browser)
             return
         # Every non-owner profile suppresses filesystem settings. Even when
         # Bash is disallowed, user/project/local settings can register host

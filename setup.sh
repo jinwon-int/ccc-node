@@ -599,6 +599,11 @@ run atomic_install "$SRC/bridge/utils/secure_fs.py" "$CLAUDE_DIR/hooks/ccc_secur
 run chmod 644 "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
 run atomic_install "$SRC/bridge/memory/journal_core.py" "$CLAUDE_DIR/hooks/ccc_journal_core.py"
 run chmod 644 "$CLAUDE_DIR/hooks/ccc_journal_core.py"
+# YAML-safe single-line SKILL.md frontmatter render/unquote (#2032): shared by
+# the autosave writers (skill-review/), the promotion publisher and every
+# line-by-line frontmatter reader installed beside it.
+run atomic_install "$SRC/bridge/utils/skill_frontmatter.py" "$CLAUDE_DIR/hooks/ccc_skill_frontmatter.py"
+run chmod 644 "$CLAUDE_DIR/hooks/ccc_skill_frontmatter.py"
 # Hook tree deployment (#569): every deployable file under claude/hooks/ is
 # discovered by the shared walk (ccc_hook_tree_files in scripts/lib/harness-paths.sh)
 # instead of a hand-maintained list — the same convention validate-harness.sh

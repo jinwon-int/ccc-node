@@ -375,6 +375,19 @@ surface + enforced authoring standards + after-the-fact visibility:
    300 characters, no incident numbers or node names, a general reusable name,
    and an overlap check against the installed skills list before proposing a
    new skill.
+   Before any gate runs, the `description` line is re-rendered **YAML-safe**
+   (#2032): plain when YAML reads the text back unchanged, otherwise one
+   double-quoted line. fleet-skills `validate.py` parses frontmatter with PyYAML
+   (fleet-skills#328), and an unquoted `": "` (invalid YAML) or `" #"` (comment
+   truncation) fails it. The renderer is `bridge/utils/skill_frontmatter.py`
+   (installed as `~/.claude/hooks/ccc_skill_frontmatter.py`; stdlib only, with a
+   `yaml.safe_load` round-trip where PyYAML exists); a missing renderer blocks
+   the draft as `lint description-yaml-unsafe`. Staging (`skill-review.sh`),
+   incremental `SKILL.md` patches (`ownership.py`), the promoter's frontmatter
+   autorepair and reviser republish use the same renderer, and the promoter's
+   node-side snapshot refuses an unsafe line as `skill_description_yaml_unsafe`
+   (an autorepair code). Every line-by-line reader decodes quoted values with
+   the matching `unquote_scalar` (shell readers: `lib/skill-frontmatter.sh`).
 5. **Body size** (progressive disclosure): a `SKILL.md` over 500 lines is
    isolated as `size oversized-body` — the author splits it into
    `references/` with read-when pointers per the official guidance.

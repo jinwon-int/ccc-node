@@ -150,6 +150,35 @@ out="$(tool apply-proposal --proposal "$TMP/desc-good.json")"
 ok "description rewrite with trigger wording applies" \
   'jq -e ".changed == true and .code == \"applied\"" >/dev/null <<<"$out" && grep -q "^description: Use when an incremental ownership" "$SKILLS/desc-one/SKILL.md"'
 
+# #2032: a patch that writes a description YAML would misread (": " invalid,
+# " #" comment) is applied with the description line re-rendered quoted, and
+# the marker hash covers the bytes actually written.
+make_skill desc-yaml
+yaml_desc='Use when an incremental ownership workflow fails: rerun the recurring checklist #7'
+make_patch desc-yaml SKILL.md \
+  "description: A sufficiently detailed recurring workflow for incremental ownership tests." \
+  "description: $yaml_desc" \
+  "$(printf 'f%.0s' {1..64})" "$TMP/desc-yaml.json"
+out="$(tool apply-proposal --proposal "$TMP/desc-yaml.json")"
+ok "#2032 unsafe description patch applies as a quoted YAML line" \
+  'jq -e ".changed == true and .code == \"applied\"" >/dev/null <<<"$out" && grep -Fxq "description: \"$yaml_desc\"" "$SKILLS/desc-yaml/SKILL.md"'
+ok "#2032 marker hash covers the normalized SKILL.md" \
+  '[ "$(jq -r .skill_sha256 "$SKILLS/desc-yaml/.autosave-meta.json")" = "$(sha256sum "$SKILLS/desc-yaml/SKILL.md" | cut -d" " -f1)" ]'
+out="$(tool apply-proposal --proposal "$TMP/desc-yaml.json")"
+ok "#2032 normalized patch replay stays idempotent" \
+  'jq -e ".changed == false and .code == \"already_applied\"" >/dev/null <<<"$out"'
+if python3 -c 'import yaml' 2>/dev/null; then
+  ok "#2032 patched frontmatter parses with PyYAML to the written description" \
+    'python3 - "$SKILLS/desc-yaml/SKILL.md" "$yaml_desc" <<"PY"
+import sys, yaml
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+data = yaml.safe_load("\n".join(lines[1:lines.index("---", 1)]))
+sys.exit(0 if data.get("description") == sys.argv[2] else 1)
+PY'
+else
+  echo "SKIP: #2032 PyYAML parse check (PyYAML not installed)"
+fi
+
 make_patch patch-one SKILL.md "1. Read twice." "1. Read three times." "$(printf '2%.0s' {1..64})" "$TMP/stale.json"
 sed -i 's/1\. Read twice\./1. Read changed externally./' "$SKILLS/patch-one/SKILL.md"
 out="$(tool apply-proposal --proposal "$TMP/stale.json")"; rc=$?

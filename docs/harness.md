@@ -58,6 +58,11 @@ re-implementing them (#1484, #1503, #1508).
   `unsafe_ownership_ledger`, `ownership_ledger_changed`, ...) rather than leaking
   the shared exception, and directory-descriptor-relative writes go through
   `atomic_write_bytes_at` after the caller has validated the directory.
+- The same convention ships `bridge/utils/skill_frontmatter.py` as
+  `~/.claude/hooks/ccc_skill_frontmatter.py` (#2032): the YAML-safe single-line
+  SKILL.md frontmatter renderer/decoder shared by the autosave writers, the
+  promoter, and every line-by-line frontmatter reader.
+  `scripts/ccc_skill_frontmatter.py` re-exports it for repository runs.
 
 ## Status line
 

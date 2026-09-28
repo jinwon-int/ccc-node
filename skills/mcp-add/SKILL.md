@@ -1,6 +1,6 @@
 ---
 name: mcp-add
-description: Register a Claude Code MCP tool server at user scope (node-global), reading any API key from the node's resolved env file so the secret never appears in a command, transcript, or commit. Use when adding web search, fetch/scrape, docs, or other MCP tools to this node. Idempotent; also pre-allows the tool in settings.json.
+description: Use when adding web search, fetch/scrape, docs, or other MCP tool servers to this node. Registers at user scope (node-global), reading any API key from the node's resolved env file so the secret never appears in a command, transcript, or commit. Idempotent; pre-allows the tools in settings.json.
 ---
 
 # mcp-add — register an MCP tool server (secret-safe)

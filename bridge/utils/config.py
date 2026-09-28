@@ -812,6 +812,23 @@ class Config(
         alias="CCC_BRIDGE_FIRECRAWL_API_KEY",
         description="Firecrawl API key used only by the curated Firecrawl MCP process.",
     )
+    bridge_browser_mcp_host: Optional[str] = Field(
+        default=None,
+        alias="CCC_BRIDGE_BROWSER_MCP_HOST",
+        description=(
+            "Opt-in fleet-browser MCP (#2034): plain ssh destination of the browser "
+            "pilot node. Injected only into owner sessions that suppress filesystem "
+            "settings; never for external isolation or shared audiences."
+        ),
+    )
+    bridge_browser_mcp_command: Optional[str] = Field(
+        default=None,
+        alias="CCC_BRIDGE_BROWSER_MCP_COMMAND",
+        description=(
+            "Absolute path of the stdio entrypoint on the pilot node "
+            "(default /opt/fleet-mcp/current/deploy/bin/browser-mcp)."
+        ),
+    )
     image_context_guard: bool = Field(
         default=False,
         alias="CCC_BRIDGE_IMAGE_CONTEXT_GUARD",

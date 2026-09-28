@@ -1,6 +1,6 @@
 ---
 name: github-incident-recovery-merge-retry
-description: Recover an authorized, reviewed pull request after GitHub transport or service failures. Verify checks and independent review on the exact head, distinguish queue admission from merge completion, and retry only classified transient failures within a fixed budget. Use when CI or merge operations fail because of GitHub infrastructure rather than a code or policy failure.
+description: Use when CI or merge operations on an authorized, reviewed PR fail because of GitHub transport/service failures, not code or policy. Verify checks and independent review on the exact head, tell queue admission from merge completion, retry only classified transient failures within a fixed budget.
 ---
 
 ## Preconditions

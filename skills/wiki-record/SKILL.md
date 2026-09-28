@@ -1,6 +1,6 @@
 ---
 name: wiki-record
-description: Record durable knowledge to the Seoyoon Family Wiki via the PR-first flow (wiki-agent write-path -> edit in the worktree -> wiki-agent pr). Use whenever you need to durably record a decision, runbook, node fact, incident, or operating-log entry. Handles the section-ID conventions (TM-/ND-/LOG-), the worktree path, and the no-raw-secrets rule.
+description: Use when you need to durably record a decision, runbook, node fact, incident, or operating-log entry in the Seoyoon Family Wiki. PR-first flow (wiki-agent write-path -> edit in the worktree -> wiki-agent pr); handles TM-/ND-/LOG- section IDs, the worktree path, and the no-raw-secrets rule.
 ---
 
 # wiki-record — durable Wiki recording (PR-first)

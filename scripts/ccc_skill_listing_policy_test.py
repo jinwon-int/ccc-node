@@ -7,6 +7,7 @@ real CLI through a subprocess, so the live ~/.claude is never read or written.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -22,6 +23,27 @@ RECENT = "2026-09-20T00:00:00Z"
 STALE = "2026-07-01T00:00:00Z"
 
 
+def described_cost(name: str, desc: str) -> int:
+    """Estimate of one described entry (mirrors entry_chars in the script)."""
+    return len(name) + 5 + len(desc)
+
+
+def name_only_cost(name: str) -> int:
+    return len(name) + 3
+
+
+def extra_cost(name: str, desc: str) -> int:
+    return described_cost(name, desc) - name_only_cost(name)
+
+
+def load_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class PolicyCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -31,6 +53,7 @@ class PolicyCase(unittest.TestCase):
         (self.claude / "state" / "skill-usage").mkdir(parents=True)
         self.core = self.root / "core.txt"
         self.core.write_text("# core\ncore-flow\nabsent-core  # not installed\n", encoding="utf-8")
+        self.descs: dict[str, str] = {}
         for name in ("core-flow", "recent-jsonl", "recent-autosave", "stale-one", "stale-two",
                      "codex-lane-only"):
             self.skill(name, f"Describe {name} in enough words to matter for the listing.")
@@ -50,6 +73,8 @@ class PolicyCase(unittest.TestCase):
 
     # -- fixtures ---------------------------------------------------------
     def skill(self, name: str, description: str, extra: str = "") -> None:
+        if "disable-model-invocation: true" not in extra:
+            self.descs[name] = description
         d = self.claude / "skills" / name
         d.mkdir(parents=True, exist_ok=True)
         (d / "SKILL.md").write_text(
@@ -89,8 +114,8 @@ class PolicyCase(unittest.TestCase):
             argv += ["--core", str(self.core)]
         return subprocess.run(argv, capture_output=True, text=True, env=full_env, timeout=60)
 
-    def apply(self, **kw) -> subprocess.CompletedProcess:
-        proc = self.run_cli("apply", **kw)
+    def apply(self, *args: str, **kw) -> subprocess.CompletedProcess:
+        proc = self.run_cli("apply", *args, **kw)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc
 
@@ -270,6 +295,183 @@ class SafetyTests(PolicyCase):
         repo_skills = {p.name for p in (REPO / "skills").iterdir() if p.is_dir()}
         external = {"a2a-task-poll", "remote-node-harness-sync", "model-migrate"}
         self.assertEqual(sorted(set(names) - repo_skills - external), [])
+
+
+class BudgetFitTests(PolicyCase):
+    """Recent (non-core) skills are described only while the estimate fits (#2031)."""
+
+    def recent_skill(self, name: str, ts: str, desc_len: int = 1000, uses: int = 1) -> None:
+        self.skill(name, "d" * desc_len)
+        self.usage(*({"ts": ts, "skill": name, "tool": "Skill"} for _ in range(uses)))
+
+    def fixed_chars(self, described: tuple[str, ...] = ("core-flow",)) -> int:
+        return sum(described_cost(n, d) if n in described else name_only_cost(n)
+                   for n, d in self.descs.items())
+
+    def plan(self, *args: str, env: dict | None = None) -> dict:
+        proc = self.run_cli("plan", "--json", *args, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Budget = 0.25 x ctx x 4 = ctx chars exactly, so a test can pick it.
+        self.write_settings({"skillListingBudgetFraction": 0.25})
+        self.recent_skill("r-new", "2026-09-26T00:00:00Z")
+        self.recent_skill("r-mid", "2026-09-24T00:00:00Z")
+        self.recent_skill("r-old", "2026-09-22T00:00:00Z")
+
+    def test_most_recent_fit_rest_become_recent_over_budget(self) -> None:
+        budget = self.fixed_chars() + extra_cost("r-new", self.descs["r-new"]) \
+            + extra_cost("r-mid", self.descs["r-mid"])
+        self.apply("--context-tokens", str(budget))
+        ov = self.settings()["skillOverrides"]
+        self.assertNotIn("r-new", ov)
+        self.assertNotIn("r-mid", ov)
+        # r-old does not fit; everything ranked after it is demoted too.
+        for name in ("r-old", "recent-jsonl", "recent-autosave"):
+            self.assertEqual(ov[name], "name-only", name)
+            self.assertEqual(self.state()["owned_overrides"][name], "name-only")
+        self.assertNotIn("core-flow", ov)
+        plan = self.plan("--context-tokens", str(budget))
+        reasons = {d["skill"]: d["reason"] for d in plan["decisions"]}
+        self.assertTrue(reasons["r-old"].startswith("recent, over budget"), reasons["r-old"])
+        self.assertTrue(reasons["r-new"].startswith("used "))
+        self.assertEqual(reasons["stale-one"], "not core, not recently used")
+        self.assertEqual(plan["after"]["listing_chars"], budget)
+        self.assertFalse(plan["after"]["over_budget"])
+        self.assertIsNone(plan["warning"])
+        self.assertFalse(plan["changed"])
+        # Idempotent: a second apply with the same inputs writes nothing.
+        proc = self.apply("--context-tokens", str(budget))
+        self.assertIn("no change", proc.stdout)
+
+    def test_skill_that_fits_again_loses_its_policy_entry(self) -> None:
+        budget = self.fixed_chars() + extra_cost("r-new", self.descs["r-new"])
+        self.apply("--context-tokens", str(budget))
+        self.assertEqual(self.settings()["skillOverrides"]["r-mid"], "name-only")
+        bigger = budget + extra_cost("r-mid", self.descs["r-mid"])
+        self.apply("--context-tokens", str(bigger))
+        ov = self.settings()["skillOverrides"]
+        self.assertNotIn("r-mid", ov)
+        self.assertNotIn("r-mid", self.state()["owned_overrides"])
+        self.assertEqual(ov["r-old"], "name-only")
+
+    def test_prefix_rule_never_skips_over_a_skill_that_does_not_fit(self) -> None:
+        self.recent_skill("r-new", "2026-09-26T00:00:00Z", desc_len=1500)
+        self.recent_skill("r-mid", "2026-09-24T00:00:00Z", desc_len=600)
+        self.recent_skill("r-old", "2026-09-22T00:00:00Z", desc_len=600)
+        budget = self.fixed_chars() + extra_cost("r-mid", self.descs["r-mid"]) \
+            + extra_cost("r-old", self.descs["r-old"])
+        self.apply("--context-tokens", str(budget))
+        ov = self.settings()["skillOverrides"]
+        for name in ("r-new", "r-mid", "r-old"):
+            self.assertEqual(ov[name], "name-only", name)
+
+    def test_ties_break_on_use_count_then_name(self) -> None:
+        same = "2026-09-27T00:00:00Z"
+        self.recent_skill("t-c", same)
+        self.recent_skill("t-a", same)
+        self.recent_skill("t-b", same, uses=3)
+        one = self.fixed_chars() + extra_cost("t-b", self.descs["t-b"])
+        self.apply("--context-tokens", str(one))
+        ov = self.settings()["skillOverrides"]
+        self.assertNotIn("t-b", ov)
+        self.assertEqual((ov["t-a"], ov["t-c"]), ("name-only", "name-only"))
+        self.apply("--context-tokens", str(one + extra_cost("t-a", self.descs["t-a"])))
+        ov = self.settings()["skillOverrides"]
+        self.assertNotIn("t-a", ov)
+        self.assertEqual(ov["t-c"], "name-only")
+
+    def test_operator_pins_are_counted_and_left_alone(self) -> None:
+        self.write_settings({"skillListingBudgetFraction": 0.25,
+                             "skillOverrides": {"r-new": "on", "stale-one": "name-only"}})
+        budget = self.fixed_chars(("core-flow", "r-new")) + extra_cost("r-mid", self.descs["r-mid"])
+        self.apply("--context-tokens", str(budget))
+        ov = self.settings()["skillOverrides"]
+        self.assertEqual(ov["r-new"], "on")
+        self.assertNotIn("r-mid", ov)
+        self.assertEqual(ov["r-old"], "name-only")
+        owned = self.state()["owned_overrides"]
+        self.assertNotIn("r-new", owned)
+        self.assertNotIn("stale-one", owned)  # operator-written, even though "name-only"
+
+    def test_context_tokens_env_knob(self) -> None:
+        budget = self.fixed_chars() + extra_cost("r-new", self.descs["r-new"])
+        plan = self.plan(env={"CCC_SKILL_LISTING_CONTEXT_TOKENS": str(budget)})
+        by = {d["skill"]: d["decision"] for d in plan["decisions"]}
+        self.assertEqual((by["r-new"], by["r-mid"]), ("keep", "name-only"))
+        self.assertEqual(plan["after"]["budget_chars"], budget)
+        proc = self.run_cli("plan", env={"CCC_SKILL_LISTING_CONTEXT_TOKENS": "12"})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("CCC_SKILL_LISTING_CONTEXT_TOKENS", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_release_keeps_recent_described_without_fitting(self) -> None:
+        budget = self.fixed_chars() + extra_cost("r-new", self.descs["r-new"])
+        self.apply("--context-tokens", str(budget))
+        self.assertEqual(self.settings()["skillOverrides"]["r-mid"], "name-only")
+        proc = self.run_cli("release", "--context-tokens", str(budget), core=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("skillOverrides", self.settings())
+
+
+class OverBudgetReportTests(PolicyCase):
+    def test_core_descriptions_dominate(self) -> None:
+        self.skill("core-flow", "c" * 1400)
+        proc = self.run_cli("plan", "--json", "--context-tokens", "1000")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        plan = json.loads(proc.stdout)
+        self.assertEqual(plan["after"]["budget_chars"], 80)
+        self.assertTrue(plan["after"]["over_budget"])
+        self.assertIn("core descriptions", plan["warning"])
+        self.assertEqual(plan["after"]["core_desc_chars"], described_cost("core-flow", "c" * 1400))
+        by = {d["skill"]: d for d in plan["decisions"]}
+        for name in ("recent-jsonl", "recent-autosave"):
+            self.assertEqual(by[name]["decision"], "name-only")
+            self.assertTrue(by[name]["reason"].startswith("recent, over budget"))
+        text = self.run_cli("plan", "--summary", "--context-tokens", "1000").stdout
+        self.assertIn("over_budget=true", text)
+        self.assertIn("WARNING: still over the estimated budget", text)
+        self.assertIn("core descriptions", text)
+
+    def test_name_list_dominates(self) -> None:
+        for i in range(30):
+            self.skill(f"stale-extra-skill-{i:02d}", "short")
+        plan = json.loads(self.run_cli("plan", "--json", "--context-tokens", "1000").stdout)
+        self.assertTrue(plan["after"]["over_budget"])
+        self.assertIn("name list", plan["warning"])
+        self.assertIn("reduce the installed skill count", plan["warning"])
+
+    def test_under_budget_has_no_warning(self) -> None:
+        proc = self.run_cli("plan", "--summary")
+        self.assertIn("over_budget=false", proc.stdout)
+        self.assertNotIn("WARNING", proc.stdout)
+
+
+class RepoCoreDescriptionTests(unittest.TestCase):
+    """Core skills are described on every turn: keep them short and trigger-first."""
+
+    HARD_CAP = 350
+
+    def test_repo_core_descriptions_are_short_and_trigger_first(self) -> None:
+        policy = load_module(SCRIPT, "ccc_skill_listing_policy_mod")
+        trigger = load_module(REPO / "claude" / "hooks" / "skill-review" / "description_trigger.py",
+                              "description_trigger_mod")
+        core = policy.load_core(REPO / "claude" / "skill-listing-core.txt")
+        checked = 0
+        for name in core:
+            path = REPO / "skills" / name / "SKILL.md"
+            if not path.is_file():
+                continue  # fleet-installed (a2a-task-poll, ...), not shipped here
+            fm = policy.parse_frontmatter(path.read_text(encoding="utf-8"))
+            desc = fm.get("description", "")
+            with self.subTest(skill=name):
+                self.assertLessEqual(len(desc), self.HARD_CAP)
+                self.assertTrue(desc.startswith("Use "), desc[:40])
+                self.assertTrue(trigger.has_trigger_wording(desc))
+            checked += 1
+        self.assertGreaterEqual(checked, 10)
 
 
 if __name__ == "__main__":

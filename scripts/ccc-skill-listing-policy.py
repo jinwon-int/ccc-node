@@ -12,8 +12,13 @@ often name-only.
 This tool makes the choice explicit:
 
 * a skill KEEPS its description when it is in the repo-shipped core list
-  (``claude/skill-listing-core.txt``) or was used within the recent window
-  (``state/skill-usage/usage.jsonl`` and ``state/skill-autosave-usage.json``);
+  (``claude/skill-listing-core.txt``);
+* a skill used within the recent window (``state/skill-usage/usage.jsonl`` and
+  ``state/skill-autosave-usage.json``) keeps its description only while the
+  estimated listing still fits the budget (ccc-node#2031): recent skills are
+  ranked by most recent use (then use count, then name) and described in that
+  order until the next one would cross the budget; the rest are
+  ``recent, over budget``;
 * every other skill gets ``skillOverrides[<name>] = "name-only"`` — still
   listed, still invocable by name.
 
@@ -50,6 +55,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+try:  # Installed beside this file by setup.sh (#2032).
+    import ccc_skill_frontmatter as _skill_frontmatter
+except ImportError:  # pragma: no cover - repository checkout without the adapter
+    import importlib.util as _importlib_util
+
+    _FM_SPEC = _importlib_util.spec_from_file_location(
+        "ccc_skill_frontmatter",
+        Path(__file__).resolve().parents[1] / "bridge" / "utils" / "skill_frontmatter.py",
+    )
+    if _FM_SPEC is None or _FM_SPEC.loader is None:
+        raise
+    _skill_frontmatter = _importlib_util.module_from_spec(_FM_SPEC)
+    _FM_SPEC.loader.exec_module(_skill_frontmatter)
+
 STATE_SCHEMA = "ccc.skill-listing-policy.v1"
 STATE_FILE = "skill-listing-policy.json"
 LOCK_FILE = ".skill-listing-policy.lock"
@@ -68,6 +87,7 @@ DEFAULT_MAX_DESC_CHARS = 1536
 DEFAULT_DAYS = 30
 DEFAULT_CONTEXT_TOKENS = 200_000
 CHARS_PER_TOKEN = 4
+REASON_OVER_BUDGET = "recent, over budget"
 
 MAX_SETTINGS_BYTES = 4 * 1024 * 1024
 MAX_SKILL_MD_BYTES = 256 * 1024
@@ -149,17 +169,8 @@ def load_core(path: Path) -> list[str]:
 
 
 def _unquote(value: str) -> str:
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        inner = value[1:-1]
-        if value[0] == "'":
-            return inner.replace("''", "'")
-        try:
-            decoded = json.loads(value)
-        except ValueError:
-            return inner
-        return decoded if isinstance(decoded, str) else inner
-    return value
+    """Decode a quoted scalar with the shared YAML escape rules (#2032)."""
+    return _skill_frontmatter.unquote_scalar(value)
 
 
 def parse_frontmatter(text: str) -> dict[str, str]:
@@ -249,9 +260,14 @@ def _read_bounded(path: Path, limit: int) -> bytes | None:
         return None
 
 
-def recent_usage(state_dir: Path, cutoff: datetime) -> dict[str, str]:
-    """skill -> latest ISO timestamp at/after ``cutoff`` from both ledgers."""
+def recent_usage(state_dir: Path, cutoff: datetime) -> dict[str, dict[str, Any]]:
+    """skill -> {"ts": latest ISO timestamp at/after ``cutoff``, "count": n}.
+
+    ``count`` is the number of in-window ``usage.jsonl`` records; an in-window
+    autosave record counts once. It only breaks ties between equal timestamps.
+    """
     latest: dict[str, datetime] = {}
+    counts: dict[str, int] = {}
 
     def note(skill: Any, ts: Any) -> None:
         if not isinstance(skill, str) or not NAME_RE.match(skill):
@@ -259,6 +275,7 @@ def recent_usage(state_dir: Path, cutoff: datetime) -> dict[str, str]:
         when = parse_ts(ts)
         if when is None or when < cutoff:
             return
+        counts[skill] = counts.get(skill, 0) + 1
         if skill not in latest or when > latest[skill]:
             latest[skill] = when
 
@@ -285,9 +302,10 @@ def recent_usage(state_dir: Path, cutoff: datetime) -> dict[str, str]:
             if sep and provider != "claude":
                 continue  # codex/piri/danso lanes list their own skills
             skill = name if sep else key
-            for field in ("last_used_at", "last_viewed_at"):
-                note(skill, rec.get(field))
-    return {k: v.strftime("%Y-%m-%dT%H:%M:%SZ") for k, v in latest.items()}
+            stamps = [t for t in (parse_ts(rec.get(f)) for f in ("last_used_at", "last_viewed_at")) if t]
+            if stamps:
+                note(skill, max(stamps).isoformat())
+    return {k: {"ts": v.strftime("%Y-%m-%dT%H:%M:%SZ"), "count": counts[k]} for k, v in latest.items()}
 
 
 def load_settings(path: Path) -> tuple[bytes | None, dict[str, Any] | None]:
@@ -347,32 +365,93 @@ def entry_chars(name: str, desc_chars: int, mode: str, max_desc: int) -> int:
     return len(name) + 5 + min(desc_chars, max_desc)
 
 
+def effective_max_desc(settings: dict[str, Any]) -> int:
+    max_desc = settings.get(MAX_DESC_KEY)
+    if not isinstance(max_desc, int) or isinstance(max_desc, bool) or max_desc <= 0:
+        return DEFAULT_MAX_DESC_CHARS
+    return max_desc
+
+
+def effective_fraction(settings: dict[str, Any]) -> float:
+    fraction = settings.get(BUDGET_KEY)
+    if not isinstance(fraction, (int, float)) or isinstance(fraction, bool) or not 0 < fraction <= 1:
+        return DEFAULT_BUDGET_FRACTION
+    return float(fraction)
+
+
+def budget_chars_for(fraction: float, context_tokens: int) -> int:
+    return int(fraction * context_tokens * CHARS_PER_TOKEN)
+
+
+def override_mode(value: Any) -> str:
+    """The listing mode an override value stands for (non-strings list as "on")."""
+    return value if isinstance(value, str) else "on"
+
+
 def decide(
     skills: dict[str, dict[str, Any]],
     operator: dict[str, Any],
     core: set[str],
-    recent: dict[str, str],
+    recent: dict[str, dict[str, Any]],
     release: bool,
+    max_desc: int = DEFAULT_MAX_DESC_CHARS,
+    budget_chars: int | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, str]]:
-    """Per-skill decisions and the override entries this tool wants to own."""
-    decisions: list[dict[str, str]] = []
+    """Per-skill decisions and the override entries this tool wants to own.
+
+    Operator entries, core descriptions and plain name-only entries are fixed
+    costs. Recently used skills then get descriptions in rank order (latest
+    use, then use count, then name) while the running estimate stays within
+    ``budget_chars``; from the first one that does not fit, every remaining
+    recent skill is name-only (``recent, over budget``), so a less recently
+    used skill is never described while a more recent one is not.
+    ``budget_chars=None`` (release) keeps every recent skill described.
+    """
+    decisions: dict[str, dict[str, str]] = {}
     desired: dict[str, str] = {}
-    for name in sorted(skills):
-        if not skills[name]["listed"]:
-            decision, reason = "unlisted", "disable-model-invocation"
-        elif name in operator:
-            decision, reason = "operator", f"operator override {operator[name]!r}"
-        elif name in core:
-            decision, reason = "keep", "core"
-        elif name in recent:
-            decision, reason = "keep", f"used {recent[name]}"
-        elif release:
-            decision, reason = "keep", "release"
-        else:
-            decision, reason = MANAGED_VALUE, "not core, not recently used"
+    pending: list[str] = []
+    used = 0
+
+    def put(name: str, decision: str, reason: str) -> None:
+        decisions[name] = {"skill": name, "decision": decision, "reason": reason}
+        if decision == MANAGED_VALUE:
             desired[name] = MANAGED_VALUE
-        decisions.append({"skill": name, "decision": decision, "reason": reason})
-    return decisions, desired
+
+    for name in sorted(skills):
+        desc_chars = skills[name]["desc_chars"]
+        if not skills[name]["listed"]:
+            put(name, "unlisted", "disable-model-invocation")
+        elif name in operator:
+            put(name, "operator", f"operator override {operator[name]!r}")
+            used += entry_chars(name, desc_chars, override_mode(operator[name]), max_desc)
+        elif name in core:
+            put(name, "keep", "core")
+            used += entry_chars(name, desc_chars, "on", max_desc)
+        elif name in recent and (release or budget_chars is None):
+            put(name, "keep", f"used {recent[name]['ts']}")
+        elif name in recent:
+            pending.append(name)  # provisionally name-only; placed below
+            used += entry_chars(name, desc_chars, MANAGED_VALUE, max_desc)
+        elif release:
+            put(name, "keep", "release")
+        else:
+            put(name, MANAGED_VALUE, "not core, not recently used")
+            used += entry_chars(name, desc_chars, MANAGED_VALUE, max_desc)
+
+    # Stable two-key sort: name ascending, then latest use / count descending.
+    pending.sort(key=lambda n: (recent[n]["ts"], recent[n]["count"]), reverse=True)
+    fits = True
+    for name in pending:
+        desc_chars = skills[name]["desc_chars"]
+        extra = (entry_chars(name, desc_chars, "on", max_desc)
+                 - entry_chars(name, desc_chars, MANAGED_VALUE, max_desc))
+        if fits and budget_chars is not None and used + extra <= budget_chars:
+            put(name, "keep", f"used {recent[name]['ts']}")
+            used += extra
+        else:
+            fits = False
+            put(name, MANAGED_VALUE, f"{REASON_OVER_BUDGET} (used {recent[name]['ts']})")
+    return [decisions[name] for name in sorted(decisions)], desired
 
 
 def apply_budget(
@@ -401,16 +480,23 @@ def compute(
     state: dict[str, Any],
     skills: dict[str, dict[str, Any]],
     core: list[str],
-    recent: dict[str, str],
+    recent: dict[str, dict[str, Any]],
     budget_fraction: float,
     release: bool = False,
+    context_tokens: int = DEFAULT_CONTEXT_TOKENS,
 ) -> dict[str, Any]:
     current: dict[str, Any] = dict(settings.get(OVERRIDES_KEY) or {})
     owned_before: dict[str, str] = state["owned_overrides"]
     # An owned key is still ours only while its value is exactly what we wrote.
     ours_now = {k for k, v in current.items() if owned_before.get(k) == v}
     operator = {k: v for k, v in current.items() if k not in ours_now}
-    decisions, desired_ours = decide(skills, operator, set(core), recent, release)
+    # Fit against the budget the settings will have AFTER this run (the key may
+    # be set by this very run), so a second run sees the same budget.
+    probe = dict(settings)
+    apply_budget(settings, probe, state.get("owned_budget_fraction"), budget_fraction, release)
+    budget_chars = None if release else budget_chars_for(effective_fraction(probe), context_tokens)
+    decisions, desired_ours = decide(skills, operator, set(core), recent, release,
+                                     effective_max_desc(probe), budget_chars)
     if any(v != MANAGED_VALUE for v in desired_ours.values()):
         raise PolicyError("internal: refusing to write a value other than name-only")
 
@@ -450,32 +536,65 @@ def compute(
     }
 
 
-def estimate(settings: dict[str, Any], skills: dict[str, dict[str, Any]], context_tokens: int) -> dict[str, Any]:
+def estimate(settings: dict[str, Any], skills: dict[str, dict[str, Any]], context_tokens: int,
+             core: set[str] | None = None) -> dict[str, Any]:
     overrides = settings.get(OVERRIDES_KEY) or {}
-    max_desc = settings.get(MAX_DESC_KEY)
-    if not isinstance(max_desc, int) or isinstance(max_desc, bool) or max_desc <= 0:
-        max_desc = DEFAULT_MAX_DESC_CHARS
-    fraction = settings.get(BUDGET_KEY)
-    if not isinstance(fraction, (int, float)) or isinstance(fraction, bool) or not 0 < fraction <= 1:
-        fraction = DEFAULT_BUDGET_FRACTION
-    total = described = name_only = 0
+    max_desc = effective_max_desc(settings)
+    fraction = effective_fraction(settings)
+    core = core or set()
+    described = name_only = 0
+    described_chars = name_only_chars = core_desc_chars = 0
     for name, info in skills.items():
         if not info["listed"]:
             continue
-        mode = overrides.get(name, "on")
-        mode = mode if isinstance(mode, str) else "on"
-        total += entry_chars(name, info["desc_chars"], mode, max_desc)
+        mode = override_mode(overrides.get(name, "on"))
+        cost = entry_chars(name, info["desc_chars"], mode, max_desc)
         if mode == MANAGED_VALUE:
             name_only += 1
+            name_only_chars += cost
         elif mode not in {"off", "user-invocable-only"}:
             described += 1
+            described_chars += cost
+            if name in core:
+                core_desc_chars += cost
+    total = described_chars + name_only_chars
+    budget = budget_chars_for(fraction, context_tokens)
     return {
         "listing_chars": total,
         "described": described,
         "name_only": name_only,
+        "described_chars": described_chars,
+        "name_only_chars": name_only_chars,
+        "core_desc_chars": core_desc_chars,
         "budget_fraction": fraction,
-        "budget_chars": int(fraction * context_tokens * CHARS_PER_TOKEN),
+        "budget_chars": budget,
+        "over_budget": total > budget,
     }
+
+
+def budget_warning(after: dict[str, Any]) -> str | None:
+    """One line naming the dominant cost when the after-estimate is over budget.
+
+    After the fit, every recent non-core skill is already name-only when the
+    fixed costs alone exceed the budget, so what is left to trim is the core
+    list's descriptions, the installed skill count (name list), or operator
+    pins that keep a description.
+    """
+    if not after["over_budget"]:
+        return None
+    over = after["listing_chars"] - after["budget_chars"]
+    other = after["described_chars"] - after["core_desc_chars"]
+    costs = [
+        (after["core_desc_chars"], "core descriptions",
+         "shorten core SKILL.md descriptions or trim claude/skill-listing-core.txt"),
+        (after["name_only_chars"], f"name list ({after['name_only']} name-only skills)",
+         "reduce the installed skill count (archive per #1739)"),
+        (other, "other kept descriptions", "review operator skillOverrides pins"),
+    ]
+    chars, label, fix = max(costs, key=lambda c: c[0])
+    return (f"still over the estimated budget by {over} chars "
+            f"({after['listing_chars']}/{after['budget_chars']}); dominant cost: "
+            f"{label} = {chars} chars — {fix}")
 
 
 # ---------------------------------------------------------------------------
@@ -554,16 +673,18 @@ def disabled(claude_dir: Path) -> str | None:
 def summarize(cmd: str, result: dict[str, Any], before: dict[str, Any], after: dict[str, Any],
               recent_days: int, context_tokens: int) -> list[str]:
     counts: dict[str, int] = {}
-    reasons = {"core": 0, "recent": 0}
+    reasons = {"core": 0, "recent": 0, "over": 0}
     for d in result["decisions"]:
         counts[d["decision"]] = counts.get(d["decision"], 0) + 1
         if d["decision"] == "keep":
             reasons["core" if d["reason"] == "core" else "recent"] += 1
+        elif d["reason"].startswith(REASON_OVER_BUDGET):
+            reasons["over"] += 1
     lines = [
         f"skill-listing-policy {cmd}: skills={len(result['decisions'])} "
         f"keep={counts.get('keep', 0)} (core={reasons['core']} recent<{recent_days}d={reasons['recent']}) "
-        f"name-only={counts.get(MANAGED_VALUE, 0)} operator={counts.get('operator', 0)} "
-        f"unlisted={counts.get('unlisted', 0)}",
+        f"name-only={counts.get(MANAGED_VALUE, 0)} (recent over budget={reasons['over']}) "
+        f"operator={counts.get('operator', 0)} unlisted={counts.get('unlisted', 0)}",
         f"  owned entries: +{len(result['added'])} -{len(result['removed'])}; "
         f"operator entries left untouched: {len(result['operator'])}",
         f"  {BUDGET_KEY}: {result['budget_action']} "
@@ -572,24 +693,27 @@ def summarize(cmd: str, result: dict[str, Any], before: dict[str, Any], after: d
         f"(described={before['described']}) after={after['listing_chars']} "
         f"(described={after['described']}); budget@{context_tokens // 1000}k ctx: "
         f"{before['budget_chars']} -> {after['budget_chars']}",
+        f"  after: described chars={after['described_chars']} (core={after['core_desc_chars']}) "
+        f"name-only chars={after['name_only_chars']} over_budget={str(after['over_budget']).lower()}",
     ]
-    if after["listing_chars"] > after["budget_chars"]:
-        lines.append("  note: still over the estimated budget — Claude Code will drop "
-                     "descriptions of the least-used kept skills; trim the core list")
+    warning = budget_warning(after)
+    if warning:
+        lines.append(f"  WARNING: {warning}")
     return lines
 
 
 def print_plan(args: argparse.Namespace, claude_dir: Path, raw: bytes | None,
                settings: dict[str, Any], result: dict[str, Any],
-               skills: dict[str, dict[str, Any]]) -> None:
-    before = estimate(settings, skills, args.context_tokens)
-    after = estimate(result["settings"], skills, args.context_tokens)
+               skills: dict[str, dict[str, Any]], core: set[str]) -> None:
+    before = estimate(settings, skills, args.context_tokens, core)
+    after = estimate(result["settings"], skills, args.context_tokens, core)
     if args.json:
         print(json.dumps({
             "claude_dir": str(claude_dir), "recent_days": args.days,
             "decisions": result["decisions"], "added": result["added"],
             "removed": result["removed"], "operator": sorted(result["operator"]),
             "budget_action": result["budget_action"], "before": before, "after": after,
+            "warning": budget_warning(after),
             "changed": render(result["settings"]) != raw,
         }, indent=2, ensure_ascii=False))
         return
@@ -649,7 +773,8 @@ def run(args: argparse.Namespace) -> int:
         if settings is None:
             return None, None, None
         result = compute(settings, load_state(state_dir / STATE_FILE), skills, core, recent,
-                         args.budget_fraction, release=(cmd == "release"))
+                         args.budget_fraction, release=(cmd == "release"),
+                         context_tokens=args.context_tokens)
         return raw, settings, result
 
     if cmd == "plan":
@@ -657,7 +782,7 @@ def run(args: argparse.Namespace) -> int:
         if settings is None or result is None:
             print(f"skill-listing-policy plan: {settings_path} absent — nothing to manage")
         else:
-            print_plan(args, claude_dir, raw, settings, result, skills)
+            print_plan(args, claude_dir, raw, settings, result, skills, set(core))
         return 0
 
     with locked(state_dir):
@@ -668,8 +793,8 @@ def run(args: argparse.Namespace) -> int:
         status = write_result(claude_dir, raw, result, now.strftime("%Y%m%dT%H%M%SZ"))
     print(f"skill-listing-policy {cmd}: {status}")
     if not args.quiet:
-        before = estimate(settings, skills, args.context_tokens)
-        after = estimate(result["settings"], skills, args.context_tokens)
+        before = estimate(settings, skills, args.context_tokens, set(core))
+        after = estimate(result["settings"], skills, args.context_tokens, set(core))
         for line in summarize(cmd, result, before, after, args.days, args.context_tokens):
             print(line)
     return 0
@@ -679,6 +804,13 @@ def positive_days(raw: str) -> int:
     value = int(raw)
     if not 1 <= value <= 3650:
         raise argparse.ArgumentTypeError("days must be 1..3650")
+    return value
+
+
+def context_tokens(raw: str) -> int:
+    value = int(raw)
+    if not 1_000 <= value <= 10_000_000:
+        raise argparse.ArgumentTypeError("context tokens must be 1000..10000000")
     return value
 
 
@@ -692,7 +824,16 @@ def fraction(raw: str) -> float:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
-    env_days = os.environ.get("CCC_SKILL_LISTING_RECENT_DAYS", "")
+    defaults: dict[str, Any] = {"days": DEFAULT_DAYS, "context_tokens": DEFAULT_CONTEXT_TOKENS}
+    for key, env, check in (("days", "CCC_SKILL_LISTING_RECENT_DAYS", positive_days),
+                            ("context_tokens", "CCC_SKILL_LISTING_CONTEXT_TOKENS", context_tokens)):
+        raw = os.environ.get(env, "")
+        if raw:
+            try:
+                defaults[key] = check(raw)
+            except (argparse.ArgumentTypeError, ValueError) as exc:
+                print(f"skill-listing-policy: invalid {env}: {exc}", file=sys.stderr)
+                return 2
     for name, help_text in (
         ("plan", "read-only: print per-skill decisions and estimated listing chars"),
         ("apply", "write skillOverrides/budget into settings.json (idempotent)"),
@@ -700,12 +841,14 @@ def main(argv: list[str] | None = None) -> int:
     ):
         p = sub.add_parser(name, help=help_text)
         p.add_argument("--core", help=f"core list (default: sibling {CORE_FILE})")
-        p.add_argument("--days", type=positive_days, default=positive_days(env_days) if env_days else DEFAULT_DAYS,
+        p.add_argument("--days", type=positive_days, default=defaults["days"],
                        help="recent-use window in days (default 30; env CCC_SKILL_LISTING_RECENT_DAYS)")
         p.add_argument("--budget-fraction", type=fraction, default=POLICY_BUDGET_FRACTION,
                        help=f"{BUDGET_KEY} to set when the key is absent (default 0.02)")
-        p.add_argument("--context-tokens", type=int, default=DEFAULT_CONTEXT_TOKENS,
-                       help="context window used for the budget estimate (default 200000)")
+        p.add_argument("--context-tokens", type=context_tokens,
+                       default=defaults["context_tokens"],
+                       help="context window the budget (and the recent-skill fit) is computed "
+                            "for (default 200000; env CCC_SKILL_LISTING_CONTEXT_TOKENS)")
         p.add_argument("--quiet", action="store_true", help="apply/release: one status line only")
         if name == "plan":
             p.add_argument("--summary", action="store_true", help="omit per-skill decision lines")
