@@ -7,7 +7,7 @@
   session start in both memory modes): self-serve the cross-account approval
   through `approve-via-relay.sh` when the user asked to merge a PR opened in
   the current task (exact head, green, mergeable, self-reviewed diff), use the
-  `gh-pr-flow-danso` skill (fleet-skills), bound waiting per phase (30 minutes
+  `gh-pr-flow-danso` skill (fleet-skills#329), bound waiting per phase (30 minutes
   for head CI, 30 after enqueue), and never wait on a human approval. Operator-written files, symlinks
   and group-writable directories are never overwritten. New env
   `CCC_DANSO_FLEET_RULES` (default `true`) (#2040).
