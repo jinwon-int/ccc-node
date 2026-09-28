@@ -55,7 +55,7 @@ def terminal_stall_floor_seconds(provider_timeout_seconds: float) -> float:
     silence following answer text. Under danso that silence is normally one
     model request still thinking, which the subprocess already bounds with its
     own provider timeout and retries. A guard shorter than that budget kills a
-    healthy request (seen on gongmyoung: 300s guard == 300s provider timeout,
+    healthy request (seen in production: 300s guard == 300s provider timeout,
     so a long GLM reasoning call was terminated before danso could answer or
     retry), and the auto-resumed task repeats the same cut (#1913).
     """

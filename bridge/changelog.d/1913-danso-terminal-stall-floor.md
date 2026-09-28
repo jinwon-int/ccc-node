@@ -1,7 +1,7 @@
 - **Danso: the terminal-stall guard no longer cuts a model request that is
   still thinking (#1913).** A non-streaming Danso model request sends no
   events until it answers, so the shared `CCC_TERMINAL_STALL_SECONDS` guard
-  (300s) read long GLM reasoning calls as a vanished completion. On gongmyoung
+  (300s) read long GLM reasoning calls as a vanished completion. On one node
   the guard equalled the 300s provider timeout, so the bridge killed the
   request before Danso could answer or retry (`reason=signal_termination`
   exactly 300s after the request). Auto-resume then repeated the same cut,

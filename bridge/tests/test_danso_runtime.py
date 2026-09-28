@@ -2074,7 +2074,7 @@ def test_terminal_stall_floor_covers_every_bounded_provider_attempt():
     for timeout in (1, 180, 300):
         floor = terminal_stall_floor_seconds(timeout)
         assert floor > timeout * PROVIDER_WIRE_ATTEMPTS
-    # gongmyoung: a 300s guard equal to the 300s provider timeout cut live
+    # Production: a 300s guard equal to the 300s provider timeout cut live
     # GLM reasoning calls; the floor now sits past all four attempts.
     assert terminal_stall_floor_seconds(300) == 1290
     assert terminal_stall_floor_seconds(180) == 810
