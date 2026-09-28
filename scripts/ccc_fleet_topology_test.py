@@ -566,6 +566,27 @@ class EndpointParsingTests(unittest.TestCase):
         self.assertEqual(self._code("https://fixture-node.internal/a/../b"), "endpoint_path")
         self.assertEqual(self._code("https://fixture-node.internal/a//b"), "endpoint_path")
 
+    def test_ipv4_mapped_literals_are_version_independent(self) -> None:
+        # Python 3.13 changed ``str(IPv6Address)`` for IPv4-mapped addresses
+        # from hex ("::ffff:c000:201") to dotted-quad mixed notation
+        # ("::ffff:192.0.2.1"). The normalized-literal gate must keep
+        # accepting the hex form and refusing every other spelling on every
+        # interpreter, so it pins its own rendering instead of str().
+        facts = topology.parse_endpoint("http://[::ffff:c000:201]")
+        self.assertEqual((facts.host_kind, facts.host, facts.reserved_example),
+                         ("ipv6", "::ffff:c000:201", True))
+        # Loopback (127.0.0.1) is not a documentation range: it parses and
+        # still reaches the consumer policy (see the regression test in
+        # RecoveredBoundaryRegressionTests).
+        loopback = topology.parse_endpoint("http://[::ffff:7f00:1]")
+        self.assertEqual((loopback.host_kind, loopback.host), ("ipv6", "::ffff:7f00:1"))
+        self.assertFalse(loopback.reserved_example)
+        for literal in ("::ffff:192.0.2.1", "0:0:0:0:0:ffff:c000:201", "::FFFF:c000:201"):
+            with self.subTest(literal=literal):
+                self.assertEqual(
+                    self._code("http://[" + literal + "]"), "endpoint_not_normalized"
+                )
+
     def test_rejects_invalid_ip_literals(self) -> None:
         self.assertEqual(self._code("https://192.168.001.1"), "endpoint_ip_invalid")
         self.assertEqual(self._code("https://1.2.3.4.5"), "endpoint_ip_invalid")
