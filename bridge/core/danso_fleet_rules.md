@@ -12,12 +12,14 @@
   once with numbered options and end the turn — do not poll.
 - Reviewer = the account that did NOT author the PR (`jinon86` ↔ `seoseo-ai`). Approve through the
   fail-closed relay helper (credentials stay on the relay node):
-  `CCC_EXPLICIT_USER_APPROVAL=1 bash /opt/ccc-node/codex/skills/gh-pr-flow/scripts/approve-via-relay.sh --review-profile <reviewer> --repo jinwon-int/<repo> --pr <n> --expected-head <sha> --operator-approved --ssh-target seoseo`
-  Then `gh pr merge <n> --squash --delete-branch`, or `gh pr merge <n>` to enqueue on a merge-queue repo.
+  `CCC_EXPLICIT_USER_APPROVAL=1 bash /opt/ccc-node/codex/skills/gh-pr-flow/scripts/approve-via-relay.sh --review-profile <reviewer> --repo jinwon-int/<repo> --pr <n> --expected-head <sha> --operator-approved --ssh-target "${CCC_RELAY_SSH_TARGET:-relay}"`
+  (a node without a `relay` ssh alias uses the relay-node alias named in the `gh-pr-flow-danso` skill).
+  Then `gh pr merge <n> --repo jinwon-int/<repo> --squash --delete-branch --match-head-commit <sha>`,
+  or `gh pr merge <n> --repo jinwon-int/<repo> --match-head-commit <sha>` to enqueue on a merge-queue repo.
 - **Waiting limits:** head CI up to 30 minutes, merge queue up to 30 minutes after enqueue; stop early on
   a failed check or eviction; at a cap report "enqueued/pending" with PR number and exact head, then end
   the turn. A helper refusal for pending checks or `UNKNOWN` mergeability means wait within the cap;
   any other refusal (actor/author mismatch, head changed, failed check, no eligible reviewer) means stop
-  and report. Never wait for a human's or another session's approval. No sleep loops.
+  and report. Never wait for a human's or another session's approval. No unbounded polling.
 - Never `--admin`, never weaken branch protection, never print, copy or export a token, never push to
   a PR authored by the other account.
