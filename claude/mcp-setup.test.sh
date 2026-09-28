@@ -210,5 +210,26 @@ env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" bash "$SUT" --bogus >/d
 bogus_rc=$?
 ok "unknown argument rejected before any registration" '[ "$bogus_rc" = 2 ] && [ ! -s "$TMP/claude.log" ]'
 
+# fleet-browser opt-in (#2034): unset → untouched, host → ssh stdio, off → removed,
+# external isolation and option-shaped/metachar values → skipped.
+brun() { # brun <env assignments...>
+  : > "$TMP/claude.log"
+  env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" "$@" bash "$SUT" >/dev/null 2>&1 || true
+}
+brun
+ok "fleet-browser: unset leaves registrations untouched" '! grep -q "fleet-browser" "$TMP/claude.log"'
+brun CCC_BROWSER_MCP_HOST=soonwook
+ok "fleet-browser: registered as ssh stdio with the default entrypoint" \
+  'grep -Eq "add fleet-browser -s user -- ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -- soonwook /opt/fleet-mcp/current/deploy/bin/browser-mcp$" "$TMP/claude.log"'
+brun CCC_BROWSER_MCP_HOST=off
+ok "fleet-browser: off removes and does not add" \
+  'grep -q "remove fleet-browser -s user" "$TMP/claude.log" && ! grep -q "add fleet-browser" "$TMP/claude.log"'
+brun CCC_BROWSER_MCP_HOST=soonwook CCC_NODE_ISOLATION_PROFILE=external
+ok "fleet-browser: external isolation skips" '! grep -q "add fleet-browser" "$TMP/claude.log"'
+brun "CCC_BROWSER_MCP_HOST=-oProxyCommand=sh"
+ok "fleet-browser: option-shaped host rejected" '! grep -q "add fleet-browser" "$TMP/claude.log"'
+brun CCC_BROWSER_MCP_HOST=soonwook "CCC_BROWSER_MCP_COMMAND=/opt/x;id"
+ok "fleet-browser: shell metacharacters in command rejected" '! grep -q "add fleet-browser" "$TMP/claude.log"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

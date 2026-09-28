@@ -459,3 +459,62 @@ def test_approval_target_kind_is_body_free() -> None:
     assert _approval_target_kind({"unrelated": "x"}) == ""
     assert _approval_target_kind(None) == ""
     assert _approval_target_kind({"path": ""}) == ""
+
+
+def test_fleet_browser_injected_only_for_owner_without_settings_chain(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # #2034: the opt-in browser bundle follows the family-MCP rule — only owner
+    # sessions that drop the host settings chain get it injected.
+    monkeypatch.setattr(claude_runtime, "running_as_root", lambda: False)
+    unrestricted = _build(
+        ClaudeRuntime(
+            settings=_settings(
+                tmp_path,
+                execution_profile="owner-operator",
+                claude_unrestricted=True,
+                bridge_browser_mcp_host="soonwook",
+            )
+        ),
+        tmp_path,
+    )
+    assert "fleet-browser" in unrestricted.mcp_servers
+    assert unrestricted.mcp_servers["fleet-browser"]["command"] == "ssh"
+    assert "mcp__fleet-browser__browser_evaluate" in unrestricted.disallowed_tools
+    assert "mcp__fleet-browser__browser_close" in unrestricted.allowed_tools
+
+    # Governed owner keeps the host settings chain: the user-scope registration
+    # from claude/mcp-setup.sh is visible there, so nothing is injected.
+    governed = _build(
+        ClaudeRuntime(
+            settings=_settings(
+                tmp_path,
+                execution_profile="owner-operator",
+                bridge_browser_mcp_host="soonwook",
+            )
+        ),
+        tmp_path,
+    )
+    assert governed.setting_sources == ["user", "project", "local"]
+    assert "fleet-browser" not in (governed.mcp_servers or {})
+
+    strict = _build(
+        ClaudeRuntime(settings=_settings(tmp_path, bridge_browser_mcp_host="soonwook")),
+        tmp_path,
+    )
+    assert "fleet-browser" not in (strict.mcp_servers or {})
+
+
+def test_fleet_browser_off_by_default_for_unrestricted_owner(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(claude_runtime, "running_as_root", lambda: False)
+    options = _build(
+        ClaudeRuntime(
+            settings=_settings(
+                tmp_path, execution_profile="owner-operator", claude_unrestricted=True
+            )
+        ),
+        tmp_path,
+    )
+    assert "fleet-browser" not in (options.mcp_servers or {})

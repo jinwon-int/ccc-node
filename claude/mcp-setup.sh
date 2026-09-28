@@ -173,6 +173,28 @@ else
 fi
 unset FCKEY
 
+# fleet-browser — opt-in windowed-browser MCP on the fleet browser pilot node
+# (#2034; jinwon-int/fleet-mcp). Stdio over ssh, no secrets on this side.
+# CCC_BROWSER_MCP_HOST=<ssh destination> registers, =off removes, unset leaves
+# any existing registration untouched. Not pre-allowed in settings: under the
+# governed (non-bypass) path each call asks the owner (fleet-mcp decision E3).
+BROWSER_HOST="${CCC_BROWSER_MCP_HOST:-}"
+BROWSER_CMD="${CCC_BROWSER_MCP_COMMAND:-/opt/fleet-mcp/current/deploy/bin/browser-mcp}"
+if [ -z "$BROWSER_HOST" ]; then
+  echo "  - fleet-browser: SKIPPED (set CCC_BROWSER_MCP_HOST to opt in)"
+elif [ "$BROWSER_HOST" = off ]; then
+  claude mcp remove fleet-browser -s user >/dev/null 2>&1 || true
+  echo "  - fleet-browser: removed (CCC_BROWSER_MCP_HOST=off)"
+elif [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ]; then
+  echo "  - fleet-browser: SKIPPED (external isolation)"
+elif ! printf '%s' "$BROWSER_HOST" | grep -Eq '^([A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*$' \
+  || ! printf '%s' "$BROWSER_CMD" | grep -Eq '^/[A-Za-z0-9._/-]+$'; then
+  echo "  ! fleet-browser: SKIPPED — CCC_BROWSER_MCP_HOST/COMMAND must be a plain ssh destination and absolute path" >&2
+else
+  add_if_changed fleet-browser ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -- "$BROWSER_HOST" "$BROWSER_CMD"
+  echo "  - fleet-browser: ssh $BROWSER_HOST $BROWSER_CMD"
+fi
+
 echo "==> Done. Verifying:"
 claude mcp list
 echo
