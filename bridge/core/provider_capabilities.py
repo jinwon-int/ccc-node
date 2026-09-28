@@ -273,7 +273,7 @@ _DANSO_STATUSES: Mapping[str, CapabilityStatus] = {
     "session_browsing": _unsupported('Not implemented by the initial Danso Telegram integration.'),
     "model_discovery": _degraded('The configured model and supported efforts are listed locally per auth mode (gpt-6-astra for api-key/chatgpt, glm-5.3-flash default for zai); account discovery is not implemented.'),
     "usage_metering": _degraded('Successful turn counters are locally recorded; failed request usage and account quotas are not complete.'),
-    "terminal_stall_release": _supported('The CLI and adapter enforce finite deadlines and drain owned readers before emitting a terminal event.'),
+    "terminal_stall_release": _supported('The CLI and adapter enforce finite deadlines and drain owned readers before emitting a terminal event. The shared stall guard is floored at one model request\'s own budget (provider timeout x 4 bounded wire attempts + backoff + margin) so a silent, still-thinking request is never cut before Danso can answer or retry (#1913).'),
     "async_completion_delivery": _unsupported('Not implemented by the initial Danso Telegram integration.'),
     "external_wait": _unsupported('Not implemented by the initial Danso Telegram integration.'),
     "memory_session_resume": _degraded('Native journal history resumes within its exact audience namespace; enabling memory requires a new conversation.'),

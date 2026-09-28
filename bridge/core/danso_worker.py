@@ -37,6 +37,31 @@ PROVIDERS = {
 # danso #109: DANSO_PROVIDER_STREAM=1 opts the adapters into SSE.
 RUNTIME_ENV = ('DANSO_PROVIDER_STREAM',)
 EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
+# One native model request is silent on the bridge's event stream until it
+# answers: danso emits nothing while a non-streaming provider call is in
+# flight. The bridge never passes --provider-retries and RUNTIME_ENV does not
+# forward DANSO_PROVIDER_RETRIES, so danso's default of 3 wire retries applies
+# (danso #67 B): at most 4 attempts, each bounded by --provider-timeout-seconds,
+# separated by a ~1s/4s/16s jittered backoff (<= ~24s in total).
+PROVIDER_WIRE_ATTEMPTS = 4
+PROVIDER_RETRY_BACKOFF_SECONDS = 30
+TERMINAL_STALL_MARGIN_SECONDS = 60
+
+
+def terminal_stall_floor_seconds(provider_timeout_seconds: float) -> float:
+    """Shortest missing-terminal grace that cannot cut a live model request.
+
+    The generic terminal-stall guard releases a turn after N seconds of stream
+    silence following answer text. Under danso that silence is normally one
+    model request still thinking, which the subprocess already bounds with its
+    own provider timeout and retries. A guard shorter than that budget kills a
+    healthy request (seen on gongmyoung: 300s guard == 300s provider timeout,
+    so a long GLM reasoning call was terminated before danso could answer or
+    retry), and the auto-resumed task repeats the same cut (#1913).
+    """
+    timeout = max(0.0, float(provider_timeout_seconds))
+    return (timeout * PROVIDER_WIRE_ATTEMPTS
+            + PROVIDER_RETRY_BACKOFF_SECONDS + TERMINAL_STALL_MARGIN_SECONDS)
 
 
 async def _read(stream):

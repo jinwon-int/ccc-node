@@ -153,7 +153,10 @@ class HeartbeatSettingsMixin:
             "is released so queued messages proceed. Without it the request "
             "would hold the conversation until the full process timeout "
             "(default 21660s). Set 0 to disable and fall back to the process "
-            "timeout only."
+            "timeout only. Under the danso provider this value is a minimum: "
+            "the effective grace is raised to CCC_DANSO_PROVIDER_TIMEOUT_SECONDS "
+            "x 4 bounded wire attempts + 90s, because a non-streaming model "
+            "request is silent until it answers (#1913)."
         ),
     )
     delegated_task_stall_seconds: float = Field(
