@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import shutil
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -2117,3 +2118,83 @@ async def test_turn_consumer_receives_danso_terminal_stall_floor(
     assert response.success, response.error
     assert seen and seen[0] == expected
     await handler.close()
+
+
+# ─── managed fleet rules (<HOME>/.pi/agent/AGENTS.md) ────────────────────────
+
+from telegram_bot.core.danso_runtime import FLEET_RULES_MARKER, install_danso_fleet_rules  # noqa: E402
+
+
+def _rules_path(home: Path) -> Path:
+    return home / ".pi" / "agent" / "AGENTS.md"
+
+
+def _private_agent_dir(home: Path) -> None:
+    # Explicit chmod: mkdir(parents=True) applies the ambient umask to the
+    # intermediate .pi, which the owner-only contract then rightly rejects.
+    for directory in (home / ".pi", home / ".pi" / "agent"):
+        directory.mkdir(exist_ok=True)
+        directory.chmod(0o700)
+
+
+def test_build_danso_runtime_installs_managed_fleet_rules(configured, tmp_path):
+    build_danso_runtime(configured)
+    target = _rules_path(tmp_path / "private" / "home")
+    body = target.read_text(encoding="utf-8")
+    assert body.startswith(FLEET_RULES_MARKER)
+    assert "gh-pr-flow" in body and "30 minutes" in body and "--admin" in body
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    for directory in (target.parent, target.parent.parent):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
+def test_fleet_rules_replace_managed_copy_and_are_idempotent(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _private_agent_dir(home)
+    _rules_path(home).write_text(f"{FLEET_RULES_MARKER}v1 managed=stopgap -->\nold rules\n", encoding="utf-8")
+    assert install_danso_fleet_rules(home) == "installed"
+    assert "old rules" not in _rules_path(home).read_text(encoding="utf-8")
+    assert install_danso_fleet_rules(home) == "unchanged"
+
+
+def test_fleet_rules_never_overwrite_operator_file_or_symlink(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _private_agent_dir(home)
+    _rules_path(home).write_text("# operator instructions\n", encoding="utf-8")
+    assert install_danso_fleet_rules(home) == "operator-file"
+    assert _rules_path(home).read_text(encoding="utf-8") == "# operator instructions\n"
+
+    other = tmp_path / "elsewhere.md"
+    other.write_text("x", encoding="utf-8")
+    _rules_path(home).unlink()
+    _rules_path(home).symlink_to(other)
+    assert install_danso_fleet_rules(home) == "operator-file"
+    assert other.read_text(encoding="utf-8") == "x"
+
+
+def test_fleet_rules_can_be_disabled_and_fail_soft(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    assert install_danso_fleet_rules(home, enabled=False) == "disabled"
+    assert not _rules_path(home).exists()
+    bad = tmp_path / "bad.md"
+    bad.write_text("no marker\n", encoding="utf-8")
+    assert install_danso_fleet_rules(home, template=bad) == "error"
+    assert not _rules_path(home).exists()
+
+
+def test_fleet_rules_setting_off_skips_install(tmp_path, configured):
+    disabled = configured.model_copy(update={"danso_fleet_rules": False})
+    build_danso_runtime(disabled)
+    assert not _rules_path(tmp_path / "private" / "home").exists()
+
+
+def test_fleet_rules_refuse_a_group_writable_agent_dir(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _private_agent_dir(home)
+    (home / ".pi").chmod(0o775)
+    assert install_danso_fleet_rules(home) == "error"
+    assert not _rules_path(home).exists()

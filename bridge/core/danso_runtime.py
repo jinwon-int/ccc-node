@@ -1,6 +1,7 @@
 """Telegram composition for the Danso CLI with explicit execution and OpenAI authentication modes."""
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import replace
 import os
@@ -17,7 +18,9 @@ from telegram_bot.core.danso_memory import prepare_memory_context
 from telegram_bot.core.memory_audience import audience_from_danso_environment, shared_memory_audience
 from telegram_bot.core.turn_stall import register_turn_liveness
 from telegram_bot.utils.config import Settings
-from telegram_bot.utils.secure_fs import ensure_private_directory
+from telegram_bot.utils.secure_fs import atomic_write_text, ensure_private_directory
+
+logger = logging.getLogger(__name__)
 
 ASTRA_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 LONG_TASK_FLAGS = (
@@ -408,12 +411,56 @@ class DansoRuntime(WorkerRuntime):
             raise ValueError("Stored Danso journal is unavailable. Check previous work, then use /new; no automatic replay.") from None
 
 
+FLEET_RULES_MARKER = "<!-- ccc-fleet-rules:"
+FLEET_RULES_TEMPLATE = Path(__file__).with_name("danso_fleet_rules.md")
+
+
+def install_danso_fleet_rules(private_home: Path, *, enabled: bool = True,
+                              template: Path = FLEET_RULES_TEMPLATE) -> str:
+    """Keep ``<HOME>/.pi/agent/AGENTS.md`` equal to the managed fleet rules.
+
+    Danso reads ``$HOME/.pi/agent/AGENTS.md`` at every session start without
+    ``--trust-project`` (danso ``src/context.rs`` ``discover``), in both the
+    materializer and native memory modes, so this is the one injection point
+    every Danso session sees. Only a missing file or a file that starts with
+    the managed marker is (re)written; an operator-written file is left alone.
+    Never raises: a failure is logged and the runtime starts without it.
+    Returns ``disabled``, ``installed``, ``unchanged``, ``operator-file`` or
+    ``error``.
+    """
+    if not enabled:
+        return "disabled"
+    target = private_home / ".pi" / "agent" / "AGENTS.md"
+    try:
+        body = template.read_text(encoding="utf-8")
+        if not body.startswith(FLEET_RULES_MARKER):
+            raise ValueError("fleet rules template lacks the managed marker")
+        ensure_private_directory(private_home / ".pi")
+        ensure_private_directory(private_home / ".pi" / "agent")
+        if target.is_symlink():
+            logger.warning("danso fleet rules: %s is a symlink; leaving it untouched", target)
+            return "operator-file"
+        if target.exists():
+            current = target.read_text(encoding="utf-8", errors="replace")
+            if not current.startswith(FLEET_RULES_MARKER):
+                logger.warning("danso fleet rules: %s is operator-written; not overwriting", target)
+                return "operator-file"
+            if current == body:
+                return "unchanged"
+        atomic_write_text(target, body, mode=0o600)
+        return "installed"
+    except (OSError, UnicodeError, ValueError) as error:
+        logger.warning("danso fleet rules not installed: %s", error)
+        return "error"
+
+
 def build_danso_runtime(settings: Settings) -> DansoRuntime:
     binary, root = _configuration(settings)
     tool_home = _validate_tool_home(settings)
     ensure_private_directory(root)
     private_home = root / "home"
     ensure_private_directory(private_home)
+    install_danso_fleet_rules(private_home, enabled=getattr(settings, "danso_fleet_rules", True))
     environment: dict[str, str | None] = {"PATH": os.defpath, "HOME": str(private_home)}
     if settings.danso_auth_mode == "chatgpt":
         environment["DANSO_CHATGPT_AUTH_FILE"] = settings.danso_chatgpt_auth_file

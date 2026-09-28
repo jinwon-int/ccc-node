@@ -340,6 +340,13 @@ class Config(
         default=None, ge=8192, le=393216, alias="CCC_DANSO_COMPACT_AT_BYTES",
         description="Explicit native compaction threshold in serialized bytes; unset lets Danso "
                     "use its provider/model default (#1913).")
+    danso_fleet_rules: bool = Field(
+        default=True, alias="CCC_DANSO_FLEET_RULES",
+        description="Install the repo's managed fleet operating rules as "
+                    "<danso HOME>/.pi/agent/AGENTS.md, which Danso reads at every session "
+                    "start (PR merge policy: self-serve cross-account approval, bounded "
+                    "waiting). An operator-written AGENTS.md without the managed marker is "
+                    "never overwritten.")
     danso_provider_stream: bool = Field(
         default=False, alias="CCC_DANSO_PROVIDER_STREAM",
         description="Forward DANSO_PROVIDER_STREAM=1 so the native provider adapters use SSE "

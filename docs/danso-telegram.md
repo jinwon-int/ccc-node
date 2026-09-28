@@ -82,6 +82,19 @@ measures the serialized request including system context, JSON escaping and
 tool schemas, so keep any override above the 32 KiB CCC memory snapshot and its
 request envelope. Installations that pinned `131072` should drop the setting.
 
+**Fleet operating rules.** At every start the bridge installs
+`bridge/core/danso_fleet_rules.md` as `<CCC_DANSO_STATE_DIR>/home/.pi/agent/AGENTS.md`
+(owner-only, `0600` in `0700` directories). Danso reads that file at every
+session start without `--trust-project`, in both the materializer and the
+native memory mode, so it is the one place every Danso session sees fleet
+policy. Today it carries the PR merge policy: use the `gh-pr-flow-danso` skill,
+self-serve the cross-account approval through the relay helper when the user
+asked to merge a PR opened in the current task, bound waiting per phase (30
+minutes for head CI, 30 after enqueue), and never wait on a human approval. Only a missing file or a file that
+starts with the `<!-- ccc-fleet-rules:` marker is rewritten; an operator-written
+`AGENTS.md`, a symlink, or a group-writable `.pi` directory is left alone and
+logged. `CCC_DANSO_FLEET_RULES=false` turns the install off.
+
 `CCC_DANSO_PROVIDER_STREAM=true` forwards `DANSO_PROVIDER_STREAM=1` to the
 native child so provider responses stream (danso #109 opt-in; default off).
 Without it a long generation sends no bytes until it finishes, which the
