@@ -20,7 +20,10 @@ from telegram_bot.core.agent_runtime import (
     SessionRequest,
     TaskProgressEvent,
 )
-from telegram_bot.core.danso_worker import TASK_RESUME_CONTROL
+from telegram_bot.core.danso_worker import (
+    TASK_RESUME_CONTROL,
+    terminal_stall_floor_seconds,
+)
 from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core.agent_session_registry import ActiveToken
 from telegram_bot.core.external_wait import clear_active_turn, publish_active_turn
@@ -75,6 +78,23 @@ from telegram_bot.utils.health import health_reporter
 logger = logging.getLogger(__name__)
 
 _DRAIN_RESPONSE = "Bridge restart is draining existing work; please retry shortly."
+
+
+def _danso_terminal_stall_grace(configured: float, config: Any) -> float:
+    """Raise a danso turn's missing-terminal grace above one request's budget.
+
+    ``0`` keeps the guard disabled. Otherwise the configured grace is only a
+    minimum: danso owns each model request's finite deadline (provider timeout
+    x bounded wire retries), so the bridge must not declare the stream stalled
+    while that request can still answer (#1913).
+    """
+    if configured <= 0:
+        return configured
+    try:
+        provider_timeout = float(getattr(config, "danso_provider_timeout_seconds", 180))
+    except (TypeError, ValueError):
+        provider_timeout = 180.0
+    return max(configured, terminal_stall_floor_seconds(provider_timeout))
 
 
 def _elapsed_since(loop: Any, request: _PendingRequest) -> str:
@@ -2051,6 +2071,7 @@ class ProjectChatProcessMixin:
                 )
                 if getattr(self._config, "agent_provider", "claude") == "danso":
                     admission_grace = 0.0  # Tool progress may start late; subprocess owns the finite deadline.
+                    stall_grace = _danso_terminal_stall_grace(stall_grace, self._config)
 
                 approval_grace = float(
                     getattr(self._config, "approval_stall_seconds", 0.0) or 0.0

@@ -2062,3 +2062,58 @@ async def test_followup_authorization_is_one_shot_even_when_validation_rejects(c
     session.authorize_task_followup()
     assert [e async for e in session.send_turn('')][-1].code == 'danso_input'
     assert not session._followup_task_authorized
+
+
+def test_terminal_stall_floor_covers_every_bounded_provider_attempt():
+    """#1913: the floor is danso's own worst-case silence for one request."""
+    from telegram_bot.core.danso_worker import (
+        PROVIDER_WIRE_ATTEMPTS, terminal_stall_floor_seconds,
+    )
+
+    assert PROVIDER_WIRE_ATTEMPTS == 4  # danso default: 3 retries + first try
+    for timeout in (1, 180, 300):
+        floor = terminal_stall_floor_seconds(timeout)
+        assert floor > timeout * PROVIDER_WIRE_ATTEMPTS
+    # Production: a 300s guard equal to the 300s provider timeout cut live
+    # GLM reasoning calls; the floor now sits past all four attempts.
+    assert terminal_stall_floor_seconds(300) == 1290
+    assert terminal_stall_floor_seconds(180) == 810
+
+
+def test_danso_terminal_stall_grace_is_a_floor_and_keeps_disable():
+    from telegram_bot.core.project_chat_process import _danso_terminal_stall_grace
+
+    config = SimpleNamespace(danso_provider_timeout_seconds=300)
+    assert _danso_terminal_stall_grace(300.0, config) == 1290
+    assert _danso_terminal_stall_grace(5000.0, config) == 5000.0  # longer operator value wins
+    assert _danso_terminal_stall_grace(0.0, config) == 0.0  # 0 still disables the guard
+    assert _danso_terminal_stall_grace(300.0, SimpleNamespace()) == 810  # config default 180s
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(('configured_grace', 'expected'), [(300.0, 1290.0), (0.0, 0.0)])
+async def test_turn_consumer_receives_danso_terminal_stall_floor(
+        configured, monkeypatch, configured_grace, expected):
+    """A danso turn's stream consumer gets the floored grace; 0 stays off."""
+    # Patch the globals the handler's own method resolves, not a fresh
+    # import: other suites swap telegram_bot.* sys.modules entries.
+    process_globals = ProjectChatHandler._run_turn_stream.__globals__
+    seen = []
+    real = process_globals['consume_turn_stream']
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs['terminal_stall_seconds'])
+        return real(*args, **kwargs)
+
+    monkeypatch.setitem(process_globals, 'consume_turn_stream', spy)
+    runtime = build_danso_runtime(configured)
+    settings = _settings(Path(configured.danso_workspace), 'danso')
+    settings.terminal_stall_seconds = configured_grace
+    settings.danso_provider_timeout_seconds = 300
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    handler._usage_meter = Mock()
+    response = await handler.process_message('slow', 7, 9,
+        approval_policy='untrusted', sandbox_policy={'type': 'dangerFullAccess'})
+    assert response.success, response.error
+    assert seen and seen[0] == expected
+    await handler.close()
