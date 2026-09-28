@@ -1,6 +1,6 @@
 ---
 name: bridge-detached-self-restart
-description: Restart the systemd service that hosts the CURRENT bridge/agent session (Telegram bridge, gateway, broker tunnel) without losing the post-restart verification step. A plain `systemctl restart <own-service>` kills the calling shell/session mid-command — any verification lines written after it never run, and the next session sees no evidence. Detach the restart+verify sequence into an independent `systemd-run` transient unit BEFORE issuing the restart, so it survives being severed from its own parent, then read its log/registry entry from the next session. Use whenever you are about to restart a service you are currently running inside of (config reload, timeout tuning, self-update checkout swap), not for restarting a peer/unrelated service (plain `systemctl restart` is fine there).
+description: Use whenever you are about to restart a service your current session runs inside (Telegram bridge, gateway, broker tunnel), e.g. config reload, timeout tuning, self-update checkout swap. Detaches restart+verify into a systemd-run unit first so verification survives. Not for peer/unrelated services.
 metadata:
   type: ccc-skill
 ---

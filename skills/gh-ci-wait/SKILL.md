@@ -1,6 +1,6 @@
 ---
 name: gh-ci-wait
-description: Register a durable GitHub CI wait when you promise to continue after CI finishes (#740). Use whenever you pushed or opened/updated a PR and would otherwise say "I'll continue once CI is green/failed" — the promise is real only with a wait_id. Never claim auto-resume without one. Also use when SessionStart injects a `⚠ 미완 약속` block and you must triage it — active `⏳` waits must NOT be re-registered, while dropped promises branch on their skip_reason.
+description: Use when you pushed or opened/updated a PR and would say "I'll continue once CI is green/failed" — register a durable CI wait; the promise is real only with a wait_id. Also use to triage a SessionStart `⚠ 미완 약속` block (never re-register active `⏳` waits; dropped ones branch on skip_reason).
 ---
 
 # gh-ci-wait — durable GitHub CI wait (#740)

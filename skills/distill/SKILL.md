@@ -1,6 +1,6 @@
 ---
 name: distill
-description: Manually trigger / inspect / toggle the Session Distiller (TM-1058) — the PreCompact+SessionEnd memory pipeline that distills transcripts via Haiku and routes to Honcho + wiki-candidates. Use when the operator says `/distill`, asks to "run distill now", wants to see what the last distill captured, wants aggregate distill health stats, wants to flip between LIVE and DRY-RUN, or wants to turn distill off. Arg options are (empty)/`manual` (fire now), `status` (show last result + queue), `stats [days]` (read-only log summary), `dryrun` (enable dry-run mode), `live` (disable dry-run), `disable` (off-switch), `enable` (clear off-switch), `compact` (retroactive de-dup of pending wiki-candidates backlog).
+description: Use when the operator says `/distill` or wants to run, inspect (`status`, `stats [days]`), toggle (`dryrun`/`live`, `disable`/`enable`) or `compact` the Session Distiller — the PreCompact+SessionEnd pipeline that distills transcripts via Haiku into Honcho and wiki-candidates.
 ---
 
 # distill — Session Distiller manual control

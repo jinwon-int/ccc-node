@@ -1,6 +1,6 @@
 ---
 name: github-merge-state-conflict-diagnosis
-description: Diagnose missing PR checks, conflicting or stale branches, and unresolved GitHub mergeability. Compare CLI and API fields, test the exact PR objects without changing the user's checkout, and verify which revision CI actually tested. Use when checks never appear, mergeable remains UNKNOWN, or the base advances beneath a reviewed PR.
+description: Use when PR checks never appear, mergeable stays UNKNOWN, a branch is conflicting or stale, or the base advances beneath a reviewed PR. Compare CLI and API fields, test the exact PR objects without changing the user's checkout, and verify which revision CI actually tested.
 ---
 
 # Diagnose PR merge and CI state

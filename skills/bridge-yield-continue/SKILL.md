@@ -1,6 +1,6 @@
 ---
 name: bridge-yield-continue
-description: Register a durable bridge baton for the next authorized work bundle and end the current turn cleanly. Use when multi-bundle work remains after the current logical unit, including after handling a GitHub CI external event, and the next unit needs no new user choice or approval.
+description: Use when multi-bundle work remains after the current logical unit (including after a GitHub CI external event) and the next unit needs no new user choice or approval. Registers a durable bridge baton for the next authorized work bundle and ends the current turn cleanly.
 ---
 
 # Bridge Yield and Continue

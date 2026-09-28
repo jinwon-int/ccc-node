@@ -1,6 +1,6 @@
 ---
 name: web-routing
-description: Route general web search through Firecrawl Search, known public URL reads through Firecrawl scrape, and public developer documentation/README/issue/merged-PR lookup through the Firecrawl Developer Index; explicit fleet SearXNG only as a fallback. Portable across fleet harnesses (Claude, Codex, Danso) via bundled stdlib helpers. Use when doing web research, reading known public URLs, or looking up developer documentation/issues/PRs.
+description: Use when doing web research, reading known public URLs, or looking up developer docs/README/issues/merged PRs. Routes search to Firecrawl Search, URL reads to Firecrawl scrape, dev lookups to the Firecrawl Developer Index; fleet SearXNG only as explicit fallback. Portable via bundled stdlib helpers.
 ---
 
 # Fleet web routing — all harnesses

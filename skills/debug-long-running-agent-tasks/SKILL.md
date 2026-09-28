@@ -1,6 +1,6 @@
 ---
 name: debug-long-running-agent-tasks
-description: Diagnose and fix stalled background agents that report "running" or "came to rest" but produce no output files — verify via the filesystem, then relaunch as foreground agents with small logical chunks. Use when long-running file-producing agent tasks stall or repeat task-notifications without artifacts appearing.
+description: Use when long-running file-producing background agents report "running" or "came to rest" or repeat task-notifications but no output files appear. Verify via the filesystem, then relaunch them as foreground agents with small logical chunks.
 category: claude
 ---
 

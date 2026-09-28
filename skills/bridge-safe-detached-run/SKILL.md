@@ -1,6 +1,6 @@
 ---
 name: bridge-safe-detached-run
-description: Run a long-running command as a detached systemd transient unit so it survives Telegram-bridge/session restarts — with persistent log file, EXIT marker, HOME/PATH env injection, and a durable job registry that lets any later session read the completion evidence. Use when a task may outlive the current session (installs, mining/indexing, builds, migrations, long tests), when a previous background task was killed by a bridge restart (ccc-node #822), when a watcher died and a finished job looks failed (ccc-node #1258), or when systemd-run output mysteriously fails due to missing HOME.
+description: Use when a command may outlive the session or a bridge restart (installs, indexing, builds, migrations, long tests), a background job was killed by a bridge restart, or a finished job looks failed because its watcher died. Runs it as a logged systemd transient unit with EXIT marker and job registry.
 ---
 
 # bridge-safe-detached-run
@@ -17,6 +17,9 @@ the process watching it did not.
 - Long installs / package builds / model or corpus mining / migrations / long test suites
 - Any command expected to run >2–3 minutes while the session or Telegram bridge might restart
 - Re-running a job that previously died with the session ("bg task killed")
+- A finished job looks failed because the process watching it died (#1258; Step 2)
+- `systemd-run` output mysteriously fails because `HOME` is missing (see the
+  `HOME`/`PATH` injection rule in Step 1)
 
 ## Step 1 — Launch as a transient unit
 

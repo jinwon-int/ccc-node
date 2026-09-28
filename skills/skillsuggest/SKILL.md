@@ -1,6 +1,6 @@
 ---
 name: skillsuggest
-description: Detect repeated procedures and review create, patch, or support-file skill proposals (human-in-the-loop), and audit or roll back autosave auto-mode changes. Use when asked to find automatable routines, improve an existing skill, review skill candidates, or list and roll back autosave-installed skills.
+description: Use when asked to find automatable routines, improve an existing skill, review skill candidates, or list and roll back autosave-installed skills. Detects repeated procedures, reviews create/patch/support-file skill proposals (human-in-the-loop), and audits autosave auto-mode changes.
 ---
 
 # skillsuggest — propose skills from repeated work (+ autosave post-hoc review)
