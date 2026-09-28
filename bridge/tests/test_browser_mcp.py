@@ -30,7 +30,7 @@ PINNED_SERVER_TOOLS = [
 
 def _settings(**overrides: object) -> SimpleNamespace:
     base = {
-        "bridge_browser_mcp_host": "soonwook",
+        "bridge_browser_mcp_host": "browser-pilot",
         "bridge_browser_mcp_command": None,
         "node_isolation_profile": "fleet",
     }
@@ -59,7 +59,7 @@ def test_ssh_stdio_server_without_env_or_secrets() -> None:
     server = bundle["mcp_servers"][BROWSER_SERVER]
     assert server["type"] == "stdio"
     assert server["command"] == "ssh"
-    assert server["args"][-3:] == ["--", "soonwook", DEFAULT_BROWSER_COMMAND]
+    assert server["args"][-3:] == ["--", "browser-pilot", DEFAULT_BROWSER_COMMAND]
     assert "BatchMode=yes" in server["args"]
     assert "env" not in server
     assert "process_env" not in bundle
@@ -67,13 +67,13 @@ def test_ssh_stdio_server_without_env_or_secrets() -> None:
 
 def test_custom_command_and_user_host() -> None:
     bundle = build_browser_mcp(
-        _settings(bridge_browser_mcp_host="root@soonwook", bridge_browser_mcp_command="/opt/x/browser-mcp")
+        _settings(bridge_browser_mcp_host="root@browser-pilot", bridge_browser_mcp_command="/opt/x/browser-mcp")
     )
     assert bundle is not None
-    assert bundle["mcp_servers"][BROWSER_SERVER]["args"][-2:] == ["root@soonwook", "/opt/x/browser-mcp"]
+    assert bundle["mcp_servers"][BROWSER_SERVER]["args"][-2:] == ["root@browser-pilot", "/opt/x/browser-mcp"]
 
 
-@pytest.mark.parametrize("host", ["-oProxyCommand=sh", "soonwook other", "soon;wook", "a b@c"])
+@pytest.mark.parametrize("host", ["-oProxyCommand=sh", "browser-pilot other", "soon;wook", "a b@c"])
 def test_rejects_hosts_that_could_become_ssh_options(host: str) -> None:
     with pytest.raises(ValueError):
         build_browser_mcp(_settings(bridge_browser_mcp_host=host))

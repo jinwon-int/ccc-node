@@ -1,5 +1,5 @@
 - **Opt-in fleet-browser MCP (#2034).** Nodes can reach the fleet browser
-  pilot (jinwon-int/fleet-mcp: windowed Chrome + Playwright MCP on soonwook,
+  pilot (jinwon-int/fleet-mcp: windowed Chrome + Playwright MCP on the pilot node,
   owner-observable over Tailnet noVNC) as a stdio MCP server over ssh.
   `claude/mcp-setup.sh` registers `fleet-browser` when `CCC_BROWSER_MCP_HOST`
   is set (`off` removes it; not pre-allowed, so governed sessions ask per

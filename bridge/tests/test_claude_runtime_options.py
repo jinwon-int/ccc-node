@@ -473,7 +473,7 @@ def test_fleet_browser_injected_only_for_owner_without_settings_chain(
                 tmp_path,
                 execution_profile="owner-operator",
                 claude_unrestricted=True,
-                bridge_browser_mcp_host="soonwook",
+                bridge_browser_mcp_host="browser-pilot",
             )
         ),
         tmp_path,
@@ -490,7 +490,7 @@ def test_fleet_browser_injected_only_for_owner_without_settings_chain(
             settings=_settings(
                 tmp_path,
                 execution_profile="owner-operator",
-                bridge_browser_mcp_host="soonwook",
+                bridge_browser_mcp_host="browser-pilot",
             )
         ),
         tmp_path,
@@ -499,7 +499,7 @@ def test_fleet_browser_injected_only_for_owner_without_settings_chain(
     assert "fleet-browser" not in (governed.mcp_servers or {})
 
     strict = _build(
-        ClaudeRuntime(settings=_settings(tmp_path, bridge_browser_mcp_host="soonwook")),
+        ClaudeRuntime(settings=_settings(tmp_path, bridge_browser_mcp_host="browser-pilot")),
         tmp_path,
     )
     assert "fleet-browser" not in (strict.mcp_servers or {})

@@ -218,17 +218,17 @@ brun() { # brun <env assignments...>
 }
 brun
 ok "fleet-browser: unset leaves registrations untouched" '! grep -q "fleet-browser" "$TMP/claude.log"'
-brun CCC_BROWSER_MCP_HOST=soonwook
+brun CCC_BROWSER_MCP_HOST=browser-pilot
 ok "fleet-browser: registered as ssh stdio with the default entrypoint" \
-  'grep -Eq "add fleet-browser -s user -- ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -- soonwook /opt/fleet-mcp/current/deploy/bin/browser-mcp$" "$TMP/claude.log"'
+  'grep -Eq "add fleet-browser -s user -- ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -- browser-pilot /opt/fleet-mcp/current/deploy/bin/browser-mcp$" "$TMP/claude.log"'
 brun CCC_BROWSER_MCP_HOST=off
 ok "fleet-browser: off removes and does not add" \
   'grep -q "remove fleet-browser -s user" "$TMP/claude.log" && ! grep -q "add fleet-browser" "$TMP/claude.log"'
-brun CCC_BROWSER_MCP_HOST=soonwook CCC_NODE_ISOLATION_PROFILE=external
+brun CCC_BROWSER_MCP_HOST=browser-pilot CCC_NODE_ISOLATION_PROFILE=external
 ok "fleet-browser: external isolation skips" '! grep -q "add fleet-browser" "$TMP/claude.log"'
 brun "CCC_BROWSER_MCP_HOST=-oProxyCommand=sh"
 ok "fleet-browser: option-shaped host rejected" '! grep -q "add fleet-browser" "$TMP/claude.log"'
-brun CCC_BROWSER_MCP_HOST=soonwook "CCC_BROWSER_MCP_COMMAND=/opt/x;id"
+brun CCC_BROWSER_MCP_HOST=browser-pilot "CCC_BROWSER_MCP_COMMAND=/opt/x;id"
 ok "fleet-browser: shell metacharacters in command rejected" '! grep -q "add fleet-browser" "$TMP/claude.log"'
 
 echo "PASS=$pass FAIL=$fail"
