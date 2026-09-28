@@ -16,6 +16,21 @@ import stat
 from pathlib import Path
 from typing import Any
 
+try:
+    from telegram_bot.utils.skill_frontmatter import unquote_scalar as _unquote_scalar
+except ImportError:  # pragma: no cover - standalone/sibling load outside the package
+    import importlib.util as _importlib_util
+
+    _FM_SPEC = _importlib_util.spec_from_file_location(
+        "ccc_skill_frontmatter",
+        Path(__file__).resolve().parents[1] / "utils" / "skill_frontmatter.py",
+    )
+    if _FM_SPEC is None or _FM_SPEC.loader is None:
+        raise
+    _FM_MODULE = _importlib_util.module_from_spec(_FM_SPEC)
+    _FM_SPEC.loader.exec_module(_FM_MODULE)
+    _unquote_scalar = _FM_MODULE.unquote_scalar
+
 
 EXPLICIT_SKILL_PREFIX = "The bridge resolved the operator's command as an explicitly invoked "
 
@@ -73,10 +88,7 @@ def _frontmatter_name(text: str) -> str | None:
         if line.strip() == "---":
             break
         if line.startswith("name:"):
-            value = line.partition(":")[2].strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            return value
+            return _unquote_scalar(line.partition(":")[2])
     return None
 
 

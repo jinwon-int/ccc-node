@@ -813,6 +813,8 @@ ok "setup installs the body-free memory readiness probe beside memory-check" \
   '[ -f "$rewrite_claude/hooks/ccc_memory_probe.py" ] && [ ! -x "$rewrite_claude/hooks/ccc_memory_probe.py" ] && cmp -s "$ROOT/scripts/ccc_memory_probe.py" "$rewrite_claude/hooks/ccc_memory_probe.py"'
 ok "setup installs the canonical secure-fs helper beside the Codex materializer" \
   '[ -f "$rewrite_claude/hooks/ccc_secure_fs.py" ] && [ ! -x "$rewrite_claude/hooks/ccc_secure_fs.py" ] && cmp -s "$ROOT/bridge/utils/secure_fs.py" "$rewrite_claude/hooks/ccc_secure_fs.py"'
+ok "setup installs the canonical YAML-safe skill frontmatter helper beside its hook callers (#2032)" \
+  '[ -f "$rewrite_claude/hooks/ccc_skill_frontmatter.py" ] && [ ! -x "$rewrite_claude/hooks/ccc_skill_frontmatter.py" ] && cmp -s "$ROOT/bridge/utils/skill_frontmatter.py" "$rewrite_claude/hooks/ccc_skill_frontmatter.py"'
 ok "setup installs the canonical journal core for the pending-v1 adapter" \
   '[ -f "$rewrite_claude/hooks/ccc_journal_core.py" ] && [ ! -x "$rewrite_claude/hooks/ccc_journal_core.py" ] && cmp -s "$ROOT/bridge/memory/journal_core.py" "$rewrite_claude/hooks/ccc_journal_core.py" && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH= python3 -S "$rewrite_claude/hooks/distill/pending_journal.py" --help >/dev/null 2>&1'
 ok "setup installs one canonical local-memory transaction module for both providers" \

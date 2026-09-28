@@ -55,6 +55,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+try:  # Installed beside this file by setup.sh (#2032).
+    import ccc_skill_frontmatter as _skill_frontmatter
+except ImportError:  # pragma: no cover - repository checkout without the adapter
+    import importlib.util as _importlib_util
+
+    _FM_SPEC = _importlib_util.spec_from_file_location(
+        "ccc_skill_frontmatter",
+        Path(__file__).resolve().parents[1] / "bridge" / "utils" / "skill_frontmatter.py",
+    )
+    if _FM_SPEC is None or _FM_SPEC.loader is None:
+        raise
+    _skill_frontmatter = _importlib_util.module_from_spec(_FM_SPEC)
+    _FM_SPEC.loader.exec_module(_skill_frontmatter)
+
 STATE_SCHEMA = "ccc.skill-listing-policy.v1"
 STATE_FILE = "skill-listing-policy.json"
 LOCK_FILE = ".skill-listing-policy.lock"
@@ -155,17 +169,8 @@ def load_core(path: Path) -> list[str]:
 
 
 def _unquote(value: str) -> str:
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        inner = value[1:-1]
-        if value[0] == "'":
-            return inner.replace("''", "'")
-        try:
-            decoded = json.loads(value)
-        except ValueError:
-            return inner
-        return decoded if isinstance(decoded, str) else inner
-    return value
+    """Decode a quoted scalar with the shared YAML escape rules (#2032)."""
+    return _skill_frontmatter.unquote_scalar(value)
 
 
 def parse_frontmatter(text: str) -> dict[str, str]:

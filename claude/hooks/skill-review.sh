@@ -68,7 +68,7 @@ run_skill_review_bg() {
     fi
   fi
 
-  local PIPE_PID OUT ec STASH count i staged item name skill_md id safe_id dest
+  local PIPE_PID OUT ec STASH count i staged item name skill_md id safe_id dest fm_tool
   PIPE_PID="${BASHPID:-$$}"
   OUT="$(bash "$HOOKDIR/skill-review/extract.sh" 2>>"$LOG")"
   ec=$?
@@ -106,6 +106,15 @@ run_skill_review_bg() {
     dest="$PENDING_DIR/$safe_id"
     mkdir -p "$dest" 2>/dev/null || { i=$((i + 1)); continue; }
     printf '%s\n' "$skill_md" > "$dest/SKILL.md"
+    # YAML-safe description line (#2032) so a human `/skillsuggest` approve
+    # copies a draft fleet-skills can parse. Best-effort: autoinstall.sh
+    # re-normalizes (fail-closed) before any automatic install.
+    fm_tool="$HOOKDIR/ccc_skill_frontmatter.py"
+    [ -r "$fm_tool" ] || fm_tool="$HOOKDIR/../../bridge/utils/skill_frontmatter.py"
+    if [ -r "$fm_tool" ]; then
+      python3 "$fm_tool" normalize "$dest/SKILL.md" >/dev/null 2>&1 \
+        || log "candidate normalize-failed name=$name trigger=$TRIGGER pid=$PIPE_PID"
+    fi
     printf '%s' "$item" | jq -c \
       --arg id "$safe_id" \
       --arg session "$SESSION_ID" \

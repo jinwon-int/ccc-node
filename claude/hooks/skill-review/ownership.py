@@ -52,6 +52,25 @@ except ImportError:
     sys.modules["ccc_secure_fs"] = ccc_secure_fs
     _SECURE_FS_SPEC.loader.exec_module(ccc_secure_fs)
 
+# YAML-safe SKILL.md description lines (#2032): same install convention —
+# setup.sh installs bridge/utils/skill_frontmatter.py as
+# ~/.claude/hooks/ccc_skill_frontmatter.py; the repository tree loads the
+# canonical file under the same module name.
+try:
+    import ccc_skill_frontmatter
+except ImportError:
+    import importlib.util
+
+    _SKILL_FM_SPEC = importlib.util.spec_from_file_location(
+        "ccc_skill_frontmatter",
+        Path(__file__).resolve().parents[3] / "bridge/utils/skill_frontmatter.py",
+    )
+    if _SKILL_FM_SPEC is None or _SKILL_FM_SPEC.loader is None:
+        raise RuntimeError("skill_frontmatter_unavailable") from None
+    ccc_skill_frontmatter = importlib.util.module_from_spec(_SKILL_FM_SPEC)
+    sys.modules["ccc_skill_frontmatter"] = ccc_skill_frontmatter
+    _SKILL_FM_SPEC.loader.exec_module(ccc_skill_frontmatter)
+
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 # #1656/#1659: single provider set — the CLI choices, the env auto-detect, and
@@ -3034,7 +3053,7 @@ def _validate_skill_md_structure(name: str, payload: bytes) -> str:
         if line.startswith("name:")
     ]
     descriptions = [
-        line.split(":", 1)[1].strip()
+        ccc_skill_frontmatter.unquote_scalar(line.split(":", 1)[1])
         for line in frontmatter
         if line.startswith("description:")
     ]
@@ -3053,8 +3072,25 @@ def _skill_md_description(payload: bytes) -> str | None:
         return None
     for line in lines[1:closing]:
         if line.startswith("description:"):
-            return line.split(":", 1)[1].strip()
+            return ccc_skill_frontmatter.unquote_scalar(line.split(":", 1)[1])
     return None
+
+
+def _yaml_safe_skill_md(payload: bytes) -> bytes:
+    """Re-render the description line YAML-safely (#2032).
+
+    Autosave patches come from a model that writes descriptions unquoted;
+    fleet-skills validate.py (fleet-skills#328) rejects ones YAML misreads.
+    Non-UTF-8 payloads pass through for the structure gate to reject.
+    """
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return payload
+    try:
+        return ccc_skill_frontmatter.normalize_skill_md(text).encode("utf-8")
+    except ValueError:
+        raise ContractError("incremental_description_yaml_unsafe") from None
 
 
 def _has_trigger_wording(description: str) -> bool:
@@ -3274,6 +3310,8 @@ def _build_incremental_plan(
             name=name,
             relative=relative,
         )
+    if relative == "SKILL.md":
+        new_payload = _yaml_safe_skill_md(new_payload)
     _validate_incremental_output(
         context,
         name=name,
