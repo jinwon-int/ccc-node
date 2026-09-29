@@ -415,7 +415,13 @@ surface + enforced authoring standards + after-the-fact visibility:
 Passing drafts are installed to `~/.claude/skills/<name>/` immediately and
 recorded in the `installed-by=autosave` ledger
 (`~/.claude/state/skill-autosave-install.jsonl`) plus an in-dir
-owner-only `.autosave-meta.json` v2 provenance marker. Failing drafts are
+owner-only `.autosave-meta.json` v2 provenance marker. Every ledger row
+(`install` from the auto and owner-approved paths, and `rollback`) carries the
+routed install lane as `provider` (claude|codex|piri|danso) from #1823 on.
+Rows written before that change have no `provider` and cannot be backfilled:
+per-provider counts over them are inferred (a `rollout-` session_id prefix is
+the codex branch; the draft `meta.json` provider exists only for drafts staged
+after #1654) and must be labelled as such. Failing drafts are
 **never dropped**: they stay
 in the pending queue with an `autosave-block.json` reason and keep the normal
 human review path. The Telegram push becomes a post-hoc notice ("스킬 자동

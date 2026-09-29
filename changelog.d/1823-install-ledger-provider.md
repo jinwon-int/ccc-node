@@ -1,0 +1,1 @@
+- skill-autosave: `skill-autosave-install.jsonl` rows (`install` from the auto and owner-approved paths, and `rollback`) now carry the routed install lane as `provider`, so per-provider accounting no longer infers it from `session_id` prefixes. Older rows are not backfilled; the docs mark counts over them as inferred (#1823).
