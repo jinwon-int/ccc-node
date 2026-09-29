@@ -77,6 +77,7 @@ class PiriRpcProcessClient:
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._stderr_tail = bytearray()
+        self._stderr_tail_trimmed = False
         self._pending: dict[str, asyncio.Future[Mapping[str, Any]]] = {}
         self._events: asyncio.Queue[Mapping[str, Any] | BaseException] = asyncio.Queue()
         self._write_lock = asyncio.Lock()
@@ -317,14 +318,22 @@ class PiriRpcProcessClient:
             self._stderr_tail += chunk
             if len(self._stderr_tail) > STDERR_TAIL_BYTES:
                 del self._stderr_tail[:-STDERR_TAIL_BYTES]
+                self._stderr_tail_trimmed = True
 
     def stderr_tail(self) -> tuple[str, ...]:
         """Last stderr lines, each bounded and credential-redacted."""
 
         text = bytes(self._stderr_tail).decode("utf-8", "replace")
-        lines = [" ".join(line.split()) for line in text.splitlines()]
+        raw_lines = text.splitlines()
+        if self._stderr_tail_trimmed and raw_lines:
+            # The byte cap may have cut the first line mid-way; a truncated
+            # credential fragment could evade the redaction patterns, so drop it.
+            raw_lines = raw_lines[1:]
+        lines = [" ".join(line.split()) for line in raw_lines]
         lines = [line for line in lines if line][-STDERR_TAIL_LINES:]
-        return tuple(redact_credentials(line[:STDERR_TAIL_LINE_CHARS]) for line in lines)
+        # Redact BEFORE truncating: cutting first could split a secret at the
+        # boundary and leave a prefix the patterns no longer recognize.
+        return tuple(redact_credentials(line)[:STDERR_TAIL_LINE_CHARS] for line in lines)
 
     async def startup_failure_diagnostics(
         self, *, timeout: float = 1.0

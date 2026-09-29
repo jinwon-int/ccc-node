@@ -1184,6 +1184,23 @@ raise SystemExit(127)
         self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz0123", joined)
         self.assertIn("[REDACTED_CREDENTIAL]", joined)
 
+    def test_stderr_tail_redacts_before_truncating(self) -> None:
+        """A secret straddling the 300-char cut must not leak as a prefix."""
+
+        client = PiriRpcProcessClient(("true",), working_directory=".", request_timeout=1.0)
+        client._stderr_tail += ("x" * 290 + " sk-abcdefghijklmnopqrstuvwxyz0123\n").encode()
+        (line,) = client.stderr_tail()
+        self.assertLessEqual(len(line), 300)
+        self.assertNotIn("sk-abc", line)
+
+    def test_stderr_tail_drops_first_line_cut_by_the_byte_cap(self) -> None:
+        """The oldest line may start mid-secret after trimming; drop it."""
+
+        client = PiriRpcProcessClient(("true",), working_directory=".", request_timeout=1.0)
+        client._stderr_tail += b"ijklmnopqrstuvwxyz0123456789 partial\nlast words\n"
+        client._stderr_tail_trimmed = True
+        self.assertEqual(client.stderr_tail(), ("last words",))
+
 
 if __name__ == "__main__":
     unittest.main()
