@@ -7,7 +7,10 @@
 # Three checks per node:
 #   1. availability — the bridge answers "Bot status: available". "degraded"
 #                     (alive, but start.sh has lost the bookkeeping that makes
-#                     it restartable) is reported as DEGRADED, not DOWN.
+#                     it restartable, or the bridge's own health snapshot is
+#                     degraded) is reported as DEGRADED with its reason, not
+#                     DOWN — after one delayed recheck, since a health blip
+#                     heals by itself (see CCC_FLEET_DEGRADED_RECHECK_DELAY).
 #                     A node migrated to Danso (danso #118) answers through
 #                     `danso service status --json` instead; its exit code
 #                     carries the same three states plus an explicit
@@ -55,6 +58,9 @@
 #                    see is_prepared_runtime
 #   CCC_FLEET_MATRIX set to 0 to skip the separate Matrix process and health
 #                    check. Enabled by default during the channel transition.
+#   CCC_FLEET_DEGRADED_RECHECK_DELAY seconds before a degraded node is asked
+#                    again (default 75, capped at 300); CCC_FLEET_DEGRADED_RECHECK=0
+#                    pages on the first answer instead
 set -u
 
 NODES="${CCC_FLEET_NODES:-seoseo dungae sogyo nosuk bangtong yukson soonwook gwakga jingun gongmyoung gongyung daegyo}"
@@ -217,7 +223,7 @@ if [ -z "$line" ]; then
     fi
     case "$drc" in
       0) echo "AVAIL=yes" ;;
-      1) echo "AVAIL=degraded" ;;
+      1) echo "AVAIL=degraded"; echo "AVAIL_REASON=danso-status-degraded" ;;
       2) echo "AVAIL=no" ;;
       # Exit 3 is danso's explicit "could not determine", and any other code is
       # a failed inspection. Neither is evidence that the live process is down.
@@ -344,6 +350,28 @@ if printf '%s' "$st" | grep -q 'Bot status: available'; then
   echo "AVAIL=yes"
 elif printf '%s' "$st" | grep -q 'Bot status: degraded'; then
   echo "AVAIL=degraded"
+  # "degraded" has two unrelated sources that need opposite responses. start.sh
+  # says it when the pid file is lost (restore bookkeeping; it will not heal),
+  # and health_render.py says it when the bridge's own health snapshot is
+  # degraded — most often one missed Telegram getMe, which the bridge's 60s
+  # watchdog clears by itself. On 2026-09-29 a dual-bridge node paged DEGRADED
+  # for the latter (Telegram unreachable 10:11:11-10:12:11 KST, probe at
+  # 10:11:16, #2047). Name it.
+  if printf '%s' "$st" | grep -q 'unmanaged PID'; then
+    echo "AVAIL_REASON=pid-bookkeeping-lost"
+  elif printf '%s' "$st" | grep -q 'health missing'; then
+    echo "AVAIL_REASON=health-missing"
+  elif printf '%s' "$st" | grep -qE 'health unreadable|invalid health file'; then
+    echo "AVAIL_REASON=health-unreadable"
+  elif printf '%s' "$st" | grep -q 'health stale'; then
+    echo "AVAIL_REASON=health-stale"
+  elif printf '%s' "$st" | grep -qE '^ *Telegram: degraded'; then
+    echo "AVAIL_REASON=health:telegram-degraded"
+  elif printf '%s' "$st" | grep -E '^ *[A-Za-z][A-Za-z ]*: degraded' | grep -qvE '^ *(Bot status|Service|Telegram):'; then
+    echo "AVAIL_REASON=health:agent-degraded"
+  else
+    echo "AVAIL_REASON=health:service-degraded"
+  fi
 elif ! printf '%s' "$st" | grep -q 'Bot status: unavailable'; then
   # A failed inspection is not evidence that the live process is down.
   echo "AVAIL=unverified"
@@ -527,19 +555,21 @@ fail=0
 if [ "${CCC_FLEET_MATRIX:-1}" = 1 ]; then
   bash "$(dirname "$0")/fleet-matrix-watch.sh" || fail=1
 fi
-for node in $NODES; do
+# probe_node <node> <doctor-flag>: sets $out and $probe_rc, retrying transport
+# failures only (see RETRIES above).
+probe_node() {
   # The flag is prepended to the piped script rather than passed as an ssh
   # argument: the remote command stays exactly `sh -s`, so nothing downstream
   # has to parse a modified argv.
-  payload="CCC_FLEET_DOCTOR=${CCC_FLEET_DOCTOR:-0}
+  payload="CCC_FLEET_DOCTOR=$2
 $PROBE"
-  if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ]; then node_budget=90; else node_budget=30; fi
+  if [ "$2" = "1" ]; then node_budget=90; else node_budget=30; fi
   attempt=0
   while :; do
-    if [ "$node" = "$SELF" ]; then
+    if [ "$1" = "$SELF" ]; then
       out=$(printf '%s' "$payload" | sh -s 2>/dev/null)
     else
-      out=$(printf '%s' "$payload" | timeout "$node_budget" "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$node" sh -s 2>/dev/null)
+      out=$(printf '%s' "$payload" | timeout "$node_budget" "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$1" sh -s 2>/dev/null)
     fi
     probe_rc=$?
     [ -n "$out" ] && break
@@ -547,15 +577,26 @@ $PROBE"
     [ "$attempt" -gt "$RETRIES" ] && break
     [ "$RETRY_DELAY" -gt 0 ] && sleep "$RETRY_DELAY"
   done
+}
 
+# probe_complete: the last probe answered in full (transport exit 0 and the
+# completion marker as its final line).
+probe_complete() {
+  [ -n "$out" ] && [ "$probe_rc" = 0 ] && [ "$(printf '%s\n' "$out" | tail -1)" = PROBE_COMPLETE=1 ]
+}
+
+# judge_node <node> [<ok-tag>] [<degraded-note>]: classify $out and print the
+# node's one verdict line; sets fail=1 on anything but OK.
+judge_node() {
+  node=$1 ok_note=${2:-} degraded_note=${3:-}
   if [ -z "$out" ]; then
-    echo "UNREACHABLE $node"; fail=1; continue
+    echo "UNREACHABLE $node"; fail=1; return
   fi
 
   # Partial stdout does not prove the inspection finished. The probe is sent
   # by this watcher, so there is no older remote protocol to fall back to.
   if [ "$probe_rc" != 0 ] || [ "$(printf '%s\n' "$out" | tail -1)" != PROBE_COMPLETE=1 ]; then
-    echo "UNVERIFIED $node inspection=incomplete-probe"; fail=1; continue
+    echo "UNVERIFIED $node inspection=incomplete-probe"; fail=1; return
   fi
 
   avail=$(printf '%s\n' "$out" | sed -n 's/^AVAIL=//p' | head -1)
@@ -572,14 +613,15 @@ $PROBE"
   # response differs: DOWN means restore service, DEGRADED means restore
   # bookkeeping for a service that is already answering.
   if [ "$avail" = "degraded" ]; then
-    echo "DEGRADED $node runtime=$runtime"; fail=1; continue
+    reason=$(printf '%s\n' "$out" | sed -n 's/^AVAIL_REASON=//p' | head -1)
+    echo "DEGRADED $node runtime=$runtime reason=${reason:-unknown}$degraded_note"; fail=1; return
   fi
 
   if [ "$avail" != yes ] && [ "$avail" != no ]; then
-    echo "UNVERIFIED $node runtime=$runtime"; fail=1; continue
+    echo "UNVERIFIED $node runtime=$runtime"; fail=1; return
   fi
   if [ "$avail" != "yes" ]; then
-    echo "DOWN $node"; fail=1; continue
+    echo "DOWN $node"; fail=1; return
   fi
 
   # Reported before the boot-path comparison and separately from it: a node
@@ -611,45 +653,45 @@ $PROBE"
   checkout=$(printf '%s\n' "$out" | sed -n 's/^CHECKOUT=//p' | head -1)
   if [ "$kind" = danso ]; then
     if [ -n "$CANON_DANSO_EXES" ] && ! is_canonical_danso_exe "$runtime"; then
-      echo "NONCANONICAL $node runtime=$runtime"; fail=1; continue
+      echo "NONCANONICAL $node runtime=$runtime"; fail=1; return
     fi
   elif ! is_canonical_root "$runtime"; then
     if [ "$checkout" = verified ]; then
       prepared_tag=", verified-checkout:${prepared##*/}"
     elif [ "$checkout" = unverified ]; then
-      echo "UNVERIFIED $node runtime=$runtime inspection=prepared-checkout"; fail=1; continue
+      echo "UNVERIFIED $node runtime=$runtime inspection=prepared-checkout"; fail=1; return
     elif is_prepared_runtime "$runtime" "$prepared"; then
       prep_dir=${prepared%/*}
       prepared_tag=", prepared:${prep_dir##*/}"
     else
-      echo "NONCANONICAL $node runtime=$runtime"; fail=1; continue
+      echo "NONCANONICAL $node runtime=$runtime"; fail=1; return
     fi
   fi
 
   # A unit pointing elsewhere is silent while the bridge is up: the next reboot
   # serves the stale checkout. Report it even though availability passed.
   if [ -n "$unit" ] && [ "$unit" != "-" ] && [ "$unit" != "$runtime" ]; then
-    echo "BOOTPATH $node unit=$unit runtime=$runtime"; fail=1; continue
+    echo "BOOTPATH $node unit=$unit runtime=$runtime"; fail=1; return
   fi
 
   doctor=$(printf '%s\n' "$out" | sed -n 's/^DOCTOR=//p' | head -1)
   if [ "$doctor" = unverified ]; then
-    echo "UNVERIFIED $node runtime=$runtime inspection=harness-reference"; fail=1; continue
+    echo "UNVERIFIED $node runtime=$runtime inspection=harness-reference"; fail=1; return
   fi
   dual=$(printf '%s\n' "$out" | sed -n 's/^DUALDOMAIN=//p' | head -1)
   if [ "${CCC_FLEET_DOCTOR:-0}" = 1 ] && { [ -z "$doctor" ] || [ -z "$dual" ] || { [ "$kind" = ccc ] && [ "$doctor" = - ]; }; }; then
-    echo "UNVERIFIED $node runtime=$runtime inspection=incomplete-doctor"; fail=1; continue
+    echo "UNVERIFIED $node runtime=$runtime inspection=incomplete-doctor"; fail=1; return
   fi
   # doctor exits nonzero on 교정가능/수동필요 findings; 경고 does not count.
   if [ -n "$doctor" ] && [ "$doctor" != "-" ] && [ "$doctor" != "0" ]; then
-    echo "DRIFT $node doctor_exit=$doctor runtime=$runtime"; fail=1; continue
+    echo "DRIFT $node doctor_exit=$doctor runtime=$runtime"; fail=1; return
   fi
 
   # gongmyoung dual-domain coherence (#980). Emitted only by the doctor sweep;
   # "-" (single-domain node) and "skip" (probe lacked root) are not failures.
   dual=$(printf '%s\n' "$out" | sed -n 's/^DUALDOMAIN=//p' | head -1)
   case "$dual" in
-    fail\ *) echo "DUALDOMAIN $node ${dual#fail }"; fail=1; continue ;;
+    fail\ *) echo "DUALDOMAIN $node ${dual#fail }"; fail=1; return ;;
   esac
 
   # The generation is shown for Danso nodes because nothing else identifies
@@ -660,6 +702,70 @@ $PROBE"
   if [ "$kind" = danso ] && [ -n "$generation" ] && [ "$generation" != "-" ]; then
     gen_tag=", generation:$(printf '%s' "$generation" | cut -c1-12)"
   fi
-  echo "OK $node ($runtime$prepared_tag$gen_tag)"
+  echo "OK $node ($runtime$prepared_tag$gen_tag$ok_note)"
+}
+
+# A degraded answer is re-asked once before it pages. The bridge's health
+# snapshot turns degraded on a single missed Telegram getMe and its watchdog
+# (60s interval, 10s timeout) clears it within ~70s, so a verdict read inside
+# that window is a coin toss, not a signal: on 2026-09-29 a node paged DEGRADED
+# five seconds into a one-minute Telegram blip and was healthy a minute later
+# (#2047). Lost pid bookkeeping does not heal, so it still pages after the
+# recheck, now with its reason attached.
+#
+# Degraded nodes are deferred and re-probed together after ONE wait measured
+# from the first deferral, so a fleet-wide Telegram blip costs the sweep one
+# delay rather than one per node (the doctor sweep runs under a 600s timeout).
+# The recheck skips ccc-doctor: it only needs availability, and the first
+# probe's doctor, boot-path and canonical evidence is still judged in full.
+#   CCC_FLEET_DEGRADED_RECHECK_DELAY seconds to wait (default 75, capped at 300);
+#                    0 re-probes immediately
+#   CCC_FLEET_DEGRADED_RECHECK=0 disables the recheck (page on first answer)
+RECHECK="${CCC_FLEET_DEGRADED_RECHECK:-1}"
+RECHECK_DELAY="${CCC_FLEET_DEGRADED_RECHECK_DELAY:-75}"
+case "$RECHECK_DELAY" in ''|*[!0-9]*) RECHECK_DELAY=75 ;; esac
+[ "$RECHECK_DELAY" -le 300 ] || RECHECK_DELAY=300
+
+declare -A deferred_out=()
+deferred=""
+first_deferred_at=""
+for node in $NODES; do
+  probe_node "$node" "${CCC_FLEET_DOCTOR:-0}"
+  if [ "$RECHECK" != 0 ] && probe_complete \
+      && [ "$(printf '%s\n' "$out" | sed -n 's/^AVAIL=//p' | head -1)" = degraded ]; then
+    deferred_out[$node]=$out
+    deferred="$deferred $node"
+    [ -n "$first_deferred_at" ] || first_deferred_at=$SECONDS
+    continue
+  fi
+  judge_node "$node"
 done
+
+if [ -n "$deferred" ]; then
+  wait_left=$((RECHECK_DELAY - (SECONDS - first_deferred_at)))
+  [ "$wait_left" -le 0 ] || sleep "$wait_left"
+  for node in $deferred; do
+    first=${deferred_out[$node]}
+    first_reason=$(printf '%s\n' "$first" | sed -n 's/^AVAIL_REASON=//p' | head -1)
+    probe_node "$node" 0
+    if ! probe_complete; then
+      # The recheck itself failed: keep the first answer, and say so.
+      out=$first probe_rc=0
+      judge_node "$node" "" " recheck=unverified"
+      continue
+    fi
+    avail=$(printf '%s\n' "$out" | sed -n 's/^AVAIL=//p' | head -1)
+    if [ "$avail" = yes ]; then
+      # Healed. Judge the FIRST answer — it carries the doctor and boot-path
+      # evidence the light recheck skipped — as available, and keep the blip
+      # visible on the OK line.
+      out=$(printf '%s\n' "$first" | sed 's/^AVAIL=degraded$/AVAIL=yes/')
+      judge_node "$node" ", recovered-from:${first_reason:-unknown}"
+    else
+      # Still degraded (reason from the recheck), or worse: the recheck's
+      # answer is the current truth.
+      judge_node "$node" "" " rechecked=${RECHECK_DELAY}s"
+    fi
+  done
+fi
 exit $fail

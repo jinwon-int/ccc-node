@@ -16,7 +16,15 @@ after the reviewed fix is integrated into the normal checkout.
 ## Distinct sources of evidence
 
 - **Availability:** confirmed unavailable/absent is `DOWN`; an alive but
-  unmanaged service is `DEGRADED`. An incomplete or failed inspection is
+  unmanaged service, or one whose own health snapshot is degraded, is
+  `DEGRADED reason=<source>` (`pid-bookkeeping-lost`, `health-stale`,
+  `health:telegram-degraded`, …). A degraded node is re-probed once, without
+  the doctor, after one shared wait (`CCC_FLEET_DEGRADED_RECHECK_DELAY`,
+  default 75s — longer than the bridge's 60s Telegram watchdog). If it has
+  healed it is judged on its first answer as `OK (…, recovered-from:<reason>)`;
+  otherwise the recheck's answer stands. A recheck that cannot complete keeps
+  the first answer with `recheck=unverified`. `CCC_FLEET_DEGRADED_RECHECK=0`
+  pages on the first answer. An incomplete or failed inspection is
   `UNVERIFIED`, not evidence of downtime. A successful transport exit and final
   completion marker are required before accepting a result; a truncated doctor
   response cannot become `OK`.

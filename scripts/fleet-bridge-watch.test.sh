@@ -5,6 +5,8 @@
 # BOOTPATH / UNREACHABLE) and its exit contract are exercised without a fleet.
 set -uo pipefail
 export CCC_FLEET_MATRIX=0
+# Degraded rechecks re-probe immediately in tests; the real default waits 75s.
+export CCC_FLEET_DEGRADED_RECHECK_DELAY=0
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SC="$ROOT/scripts/fleet-bridge-watch.sh"
 pass=0; fail=0
@@ -22,11 +24,22 @@ trap 'rm -rf "$TMP"' EXIT
 STUB="$TMP/ssh"
 cat > "$STUB" <<STUBEOF
 #!$(command -v bash)
-# args: -o.. -o.. <node> sh -s   (probe arrives on stdin and is discarded)
-cat >/dev/null
+# args: -o.. -o.. <node> sh -s   (probe arrives on stdin; its first line — the
+# CCC_FLEET_DOCTOR flag — is logged per node, the rest discarded)
 node=""
 for a in "\$@"; do case "\$a" in -o|-*) ;; sh|-s) ;; *) node="\$a" ;; esac; done
+IFS= read -r first_line || true
+cat >/dev/null
+printf '%s\n' "\$first_line" >> "$TMP/reply/\$node.flags"
 f="$TMP/reply/\$node"
+# Second and later answers come from <node>.2 when it exists (a degraded
+# recheck); <node>.2.unreachable makes every later answer a transport failure.
+if [ -f "\$f.seen" ]; then
+  [ ! -f "\$f.2.unreachable" ] || exit 255
+  [ ! -f "\$f.2" ] || f="\$f.2"
+elif [ -f "\$f" ]; then
+  : > "\$f.seen"
+fi
 [ -f "\$f" ] || exit 255
 cat "\$f"
 [ -f "\$f.incomplete" ] || echo PROBE_COMPLETE=1
@@ -42,6 +55,7 @@ reply() { # <node> <runtime> <avail> <unit>
 
 run() { # <nodes>
   OUT="$TMP/out"; RC=0
+  rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags
   CCC_FLEET_NODES="$1" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ \
     CCC_FLEET_RETRY_DELAY=0 CCC_FLEET_MATRIX=0 \
     bash "$SC" >"$OUT" 2>&1 || RC=$?
@@ -79,6 +93,81 @@ reply beta /root/ccc-node no /root/ccc-node
 run "beta"
 okc "$RC" 1 "absent bridge still exits nonzero"
 ok "absent bridge is DOWN, not DEGRADED" 'grep -q "^DOWN beta" "$OUT" && ! grep -q "^DEGRADED beta" "$OUT"'
+
+# ---- degraded recheck (#2047) ----------------------------------------------
+# A health-snapshot blip heals within one bridge watchdog cycle. The 2026-09-29
+# shape: Telegram getMe missed once, the probe read "degraded" five seconds
+# later, and the bridge was healthy a minute after that.
+rm -f "$TMP"/reply/*.2 "$TMP"/reply/*.2.unreachable
+reply beta /root/ccc-node degraded /root/ccc-node
+echo "AVAIL_REASON=health:telegram-degraded" >> "$TMP/reply/beta"
+reply alpha /opt/ccc-node yes /opt/ccc-node
+cp "$TMP/reply/alpha" "$TMP/reply/beta.2"; sed -i 's#/opt/ccc-node#/root/ccc-node#g' "$TMP/reply/beta.2"
+run "alpha beta"
+okc "$RC" 0 "a degraded blip that heals on recheck does not page"
+ok "healed node is OK and names what it recovered from" \
+  'grep -q "^OK beta (/root/ccc-node, recovered-from:health:telegram-degraded)$" "$OUT"'
+ok "healed node is not also reported DEGRADED" '! grep -q "^DEGRADED beta" "$OUT"'
+ok "recheck skips the doctor" '[ "$(sed -n 2p "$TMP/reply/beta.flags")" = "CCC_FLEET_DOCTOR=0" ]'
+ok "healthy peer is probed once" '[ "$(wc -l < "$TMP/reply/alpha.flags")" = 1 ]'
+ok "one verdict line per node after a recheck" '[ "$(grep -cE "^(OK|DOWN|DEGRADED|UNVERIFIED|DRIFT) " "$OUT")" = 2 ]'
+
+# The healed verdict still judges the FIRST answer's doctor evidence: the light
+# recheck carries none, and it must not launder a drifted node into OK.
+printf 'RUNTIME=%s\nAVAIL=degraded\nUNIT=%s\nDOCTOR=1\nAVAIL_REASON=health:telegram-degraded\n' \
+  /root/ccc-node /root/ccc-node > "$TMP/reply/beta"
+run "beta"
+okc "$RC" 1 "a healed node with doctor drift still fails"
+ok "drift from the first probe survives the recheck" 'grep -q "^DRIFT beta doctor_exit=1" "$OUT"'
+
+# Lost pid bookkeeping does not heal: it pages after the recheck, with reason.
+reply beta /root/ccc-node degraded /root/ccc-node
+echo "AVAIL_REASON=pid-bookkeeping-lost" >> "$TMP/reply/beta"
+cp "$TMP/reply/beta" "$TMP/reply/beta.2"
+run "beta"
+okc "$RC" 1 "persistent degraded still pages"
+ok "persistent degraded names its reason and the recheck" \
+  'grep -q "^DEGRADED beta runtime=/root/ccc-node reason=pid-bookkeeping-lost rechecked=0s$" "$OUT"'
+
+# A recheck that finds the bridge gone reports the current truth.
+reply beta.2 /root/ccc-node no /root/ccc-node
+run "beta"
+okc "$RC" 1 "degraded then down pages"
+ok "degraded then down is DOWN" 'grep -q "^DOWN beta" "$OUT" && ! grep -q "^DEGRADED beta" "$OUT"'
+
+# A recheck that cannot reach the node keeps the first answer and says so —
+# never OK, never a silent drop.
+rm -f "$TMP/reply/beta.2"; : > "$TMP/reply/beta.2.unreachable"
+run "beta"
+okc "$RC" 1 "degraded with an unreachable recheck pages"
+ok "unreachable recheck keeps the first reason" \
+  'grep -q "^DEGRADED beta runtime=/root/ccc-node reason=pid-bookkeeping-lost recheck=unverified$" "$OUT"'
+rm -f "$TMP/reply/beta.2.unreachable"
+
+# Opt-out pages on the first answer, as before.
+reply beta /root/ccc-node degraded /root/ccc-node
+cp "$TMP/reply/alpha" "$TMP/reply/beta.2"
+OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags
+CCC_FLEET_NODES="beta" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ CCC_FLEET_RETRY_DELAY=0 \
+  CCC_FLEET_DEGRADED_RECHECK=0 bash "$SC" >"$OUT" 2>&1 || RC=$?
+okc "$RC" 1 "recheck disabled pages on the first degraded answer"
+ok "recheck disabled probes once" '[ "$(wc -l < "$TMP/reply/beta.flags")" = 1 ]'
+ok "reason is reported even without a recheck" 'grep -q "^DEGRADED beta runtime=/root/ccc-node reason=unknown$" "$OUT"'
+
+# Several degraded nodes share ONE wait (the doctor sweep has a 600s budget).
+for n in d1 d2 d3; do
+  reply "$n" /opt/ccc-node degraded /opt/ccc-node
+  reply "$n.2" /opt/ccc-node yes /opt/ccc-node
+done
+OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags
+t0=$SECONDS
+CCC_FLEET_NODES="d1 d2 d3" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ CCC_FLEET_RETRY_DELAY=0 \
+  CCC_FLEET_DEGRADED_RECHECK_DELAY=2 bash "$SC" >"$OUT" 2>&1 || RC=$?
+elapsed=$((SECONDS - t0))
+okc "$RC" 0 "three healed nodes do not page"
+ok "three degraded nodes share one recheck wait (${elapsed}s)" '[ "$elapsed" -le 4 ]'
+ok "all three healed nodes reported OK" '[ "$(grep -c "^OK d[123] (/opt/ccc-node, recovered-from:unknown)$" "$OUT")" = 3 ]'
+rm -f "$TMP"/reply/d[123]* "$TMP"/reply/beta.2
 
 # ---- boot-path mismatch: available, but the unit points elsewhere ----------
 # The yukson 2026-07-27 shape. Availability alone would call this healthy.
@@ -384,7 +473,7 @@ cat > "$TMP/probe-bin/sudo" <<EOF
 printf '%s\n' "\$*" >> "$TMP/sudo-calls"
 [ "\$*" != "" ] || exit 99
 [ "\${PROBE_DENIED:-0}" = 0 ] || exit 1
-case "\$*" in *--status) printf '%s\n' "Bot status: \${PROBE_STATUS:-available}" ;; *) exit "\${PROBE_DOCTOR:-0}" ;; esac
+case "\$*" in *--status) printf '%s\n' "Bot status: \${PROBE_STATUS:-available}"; [ -z "\${PROBE_STATUS_BODY:-}" ] || printf '%b\n' "\$PROBE_STATUS_BODY" ;; *) exit "\${PROBE_DOCTOR:-0}" ;; esac
 EOF
 cat > "$TMP/probe-bin/su" <<EOF
 #!$(command -v sh)
@@ -405,6 +494,24 @@ PATH="$TMP/probe-bin:$PATH" PROBE_STATUS=unavailable sh "$TMP/owner-probe.sh" > 
 ok "confirmed unavailable status remains down" 'grep -q "^AVAIL=no$" "$TMP/owner-out"'
 PATH="$TMP/probe-bin:$PATH" PROBE_DENIED=1 sh "$TMP/owner-probe.sh" > "$TMP/owner-out"
 ok "permission failure is unverified, not down" 'grep -q "^AVAIL=unverified$" "$TMP/owner-out"'
+# "degraded" names its source (#2047): lost bookkeeping never heals, a health
+# blip does, and the operator response differs.
+for reason_case in \
+  'pid-bookkeeping-lost|   Process: alive (unmanaged PID(s): 42 (no PID file))\n   Service: degraded (running without pid file; not recoverable by --status/--stop bookkeeping)' \
+  'health-stale|   Process: alive (PID: 42)\n   Service: degraded (health stale: last update 9m ago)\n   Telegram: degraded (health stale: last update 9m ago)' \
+  'health-missing|   Service: degraded (health missing)' \
+  'health-unreadable|   Service: degraded (invalid health file: boom)' \
+  'health:telegram-degraded|   Process: alive (PID: 42)\n   Service: degraded\n   Turn occupancy: idle\n   Telegram: degraded (Timed out)\n   Claude: healthy' \
+  'health:agent-degraded|   Service: degraded\n   Telegram: healthy\n   Claude: degraded (rate limited)' \
+  'health:service-degraded|   Service: degraded\n   Telegram: healthy\n   Claude: healthy'; do
+  want=${reason_case%%|*}
+  PATH="$TMP/probe-bin:$PATH" PROBE_STATUS=degraded PROBE_STATUS_BODY="${reason_case#*|}" \
+    sh "$TMP/owner-probe.sh" > "$TMP/owner-out"
+  ok "degraded status reports reason $want" \
+    "grep -q '^AVAIL=degraded\$' \"\$TMP/owner-out\" && grep -qx 'AVAIL_REASON=$want' \"\$TMP/owner-out\""
+done
+PATH="$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/owner-out"
+ok "available status carries no degraded reason" '! grep -q "^AVAIL_REASON=" "$TMP/owner-out"'
 reply beta /opt/ccc-node unverified /opt/ccc-node
 run beta
 okc "$RC" 1 "unverified inspection still alerts"
@@ -650,6 +757,8 @@ for rc_case in "1 degraded" "2 no" "3 unverified"; do
   PATH="$TMP/danso-bin:$TMP/probe-bin:$PATH" DANSO_RC="$1" sh "$TMP/owner-probe.sh" > "$TMP/danso-out"
   ok "danso exit $1 maps to AVAIL=$2" "grep -q '^AVAIL=$2\$' \"\$TMP/danso-out\""
 done
+PATH="$TMP/danso-bin:$TMP/probe-bin:$PATH" DANSO_RC=1 sh "$TMP/owner-probe.sh" > "$TMP/danso-out"
+ok "danso degraded names its source" 'grep -qx "AVAIL_REASON=danso-status-degraded" "$TMP/danso-out"'
 # Any unexpected code is a failed inspection, never evidence of a down service.
 PATH="$TMP/danso-bin:$TMP/probe-bin:$PATH" DANSO_RC=77 sh "$TMP/owner-probe.sh" > "$TMP/danso-out"
 ok "an unknown danso exit code is unverified, not down" 'grep -q "^AVAIL=unverified$" "$TMP/danso-out"'
