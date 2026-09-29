@@ -11,17 +11,23 @@
 #     bot's config + state_directory so no new Matrix device is created
 #   - the pilot service (family-matrix) stopped — one bot device runs once
 #
-# The unit reuses the Telegram bridge's project .env (<project>/.telegram_bot/.env)
-# for provider/memory keys; only the channel keys and the data directory differ.
-# If the Telegram unit carries provider/memory settings as Environment= lines
-# (CCC_AGENT_PROVIDER, CCC_PIRI_*, CCC_BRIDGE_MEMORY_*, usage limits ...), mirror
-# them into a drop-in so both frontends run the same agent, e.g.
-#   mkdir -p /etc/systemd/system/ccc-matrix-bridge.service.d
-#   { echo '[Service]'; systemctl cat ccc-telegram-bridge | grep '^Environment=' \
-#       | grep -vE '^Environment=(HOME|PATH|BOT_DATA_DIR|CCC_CHANNEL|CCC_MATRIX_)'; } \
-#     > /etc/systemd/system/ccc-matrix-bridge.service.d/provider.conf
-# (jingun 2026-09-18: without it the Matrix frontend started with the default
-# provider while Telegram ran Piri.)
+# Provider / auth env (#1771). This unit runs `python -m telegram_bot` directly,
+# NOT bridge/start.sh, so start.sh's bridge/.env export never happens here. Only
+# the wrapper paths (WRAPPER_ENV_KEYS, #2065) are handed from the .env files to
+# the wrapper child; keys that must be in the PROCESS env for both frontends —
+# provider selection and every secret — belong in the shared owner-only
+# EnvironmentFile below, which the Telegram unit (bridge/service-systemd.sh)
+# reads too:
+#   install -d -m 0700 /root/.config/ccc-node
+#   install -m 0600 /dev/null /root/.config/ccc-node/bridge.env   # then edit
+#   # e.g. CCC_AGENT_PROVIDER=piri, CCC_PIRI_CLI_PATH=..., CCC_PIRI_REAL_CLI_PATH=...,
+#   #      CLAUDE_CODE_OAUTH_TOKEN=... (secrets ONLY here, never in Environment=)
+#   systemd-analyze verify /etc/systemd/system/ccc-matrix-bridge.service
+# EnvironmentFile= overrides Environment= lines, so never put HOME, PATH,
+# PROJECT_ROOT, BOT_DATA_DIR, CCC_CHANNEL or CCC_MATRIX_* in the shared file.
+# This replaces the older hand-mirrored provider.conf drop-in (jingun/nosuk
+# 2026-09-18: a missing drop-in, or one without its [Service] header, silently
+# ran the default provider / lost the real CLI path). See docs/bridge-ops.md.
 [Unit]
 Description=ccc-node Matrix frontend (family messenger, CCC_CHANNEL=matrix)
 After=network-online.target
@@ -37,6 +43,8 @@ Environment=PROJECT_ROOT=/root
 Environment=BOT_DATA_DIR=/root/.ccc-matrix
 Environment=CCC_CHANNEL=matrix
 Environment=CCC_MATRIX_CONFIG_PATH=/etc/family-matrix/config.json
+# Shared with the Telegram unit; optional ("-") until the node's file is placed.
+EnvironmentFile=-/root/.config/ccc-node/bridge.env
 ExecStart=/opt/ccc-node/bridge/venv/bin/python -m telegram_bot --path /root
 Restart=always
 RestartSec=5

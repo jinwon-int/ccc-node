@@ -72,6 +72,10 @@ ok "unit WorkingDirectory is repo root" 'grep -Fxq "WorkingDirectory=$REPO" "$UN
 ok "unit WantedBy matches scope"        'grep -Fxq "WantedBy=$WANTED" "$UNIT"'
 ok "unit has no proxy env when unset"   '! grep -q "http_proxy" "$UNIT"'
 ok "unit has no blank lines (sed collapse)" '! grep -q "^$" "$UNIT"'
+ok "unit reads the shared owner-only bridge EnvironmentFile (#1771)" \
+   'grep -Fxq "EnvironmentFile=-$FH/.config/ccc-node/bridge.env" "$UNIT"'
+ok "unit carries no provider secret in an Environment= line" \
+   '! grep -Eq "^Environment=(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_)" "$UNIT"'
 ok "systemd install ran daemon-reload"  'grep -q "daemon-reload" "$SC_CALLS"'
 ok "systemd install enabled --now the service" \
    'grep -q "enable --now ccc-telegram-bridge.service" "$SC_CALLS"'
@@ -131,6 +135,31 @@ ok "pre-drain unit gains bounded mixed cgroup lifecycle" \
    'grep -Fxq "KillMode=mixed" "$UNIT" && grep -Fxq "SendSIGKILL=yes" "$UNIT" && grep -Fxq "TimeoutStopSec=70" "$UNIT"'
 ok "pre-drain reconciliation only daemon-reloads" \
    '[ "$(cat "$SC_CALLS")" = "$DAEMON_RELOAD" ]'
+
+# Units rendered before #1771 have no shared EnvironmentFile. They are still
+# recognized and gain it in place (optional "-" path: inert until placed).
+sed -i '/^EnvironmentFile=/d; /^# Shared provider\/auth env/d; /^# 0600 (#1771)/d' "$UNIT"
+: > "$SC_CALLS"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SD" CCC_SYSTEMCTL="$SC_STUB" \
+    bash "$SSD" reconcile
+okc "$RC" 0 "pre-#1771 generated unit reconciles"
+ok "pre-#1771 unit gains the shared EnvironmentFile" \
+   'grep -Fxq "EnvironmentFile=-$FH/.config/ccc-node/bridge.env" "$UNIT"'
+ok "pre-#1771 reconciliation only daemon-reloads" \
+   '[ "$(cat "$SC_CALLS")" = "$DAEMON_RELOAD" ]'
+
+# Any other EnvironmentFile is node-local policy: the unit is bespoke and left
+# untouched rather than silently dropping the operator's file.
+sed -i 's|^EnvironmentFile=.*|EnvironmentFile=/etc/ccc-local/other.env|' "$UNIT"
+# shellcheck disable=SC2034  # foreign_envfile_before is read via eval inside ok()
+foreign_envfile_before="$(sha256sum "$UNIT")"
+: > "$SC_CALLS"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SD" CCC_SYSTEMCTL="$SC_STUB" \
+    bash "$SSD" reconcile
+okc "$RC" 0 "foreign EnvironmentFile unit is a bounded skip"
+ok "foreign EnvironmentFile unit stays untouched" \
+   '[ "$(sha256sum "$UNIT")" = "$foreign_envfile_before" ] && [ ! -s "$SC_CALLS" ]'
+sed -i "s|^EnvironmentFile=.*|EnvironmentFile=-$FH/.config/ccc-node/bridge.env|" "$UNIT"
 
 # Dry-run compares the same renderer but cannot mutate the main unit/drop-in or
 # contact systemctl.

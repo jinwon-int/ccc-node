@@ -760,11 +760,27 @@ class BotLifecycleMixin(MemoryDistillMixin):
             from telegram_bot.core.danso_runtime import probe_danso_readiness
 
             return probe_danso_readiness(self._config)
+        from telegram_bot.utils.provider_requirements import provider_environment_problem
+
+        # #1771: name the missing key instead of the generic "piri command
+        # unavailable", checked against the same env the probes/children get
+        # (process env + #2065 wrapper keys). CLI resolution is deterministic,
+        # so it gates the probe; Claude auth has non-env sources this check
+        # cannot see, so `claude auth status` stays authoritative there and the
+        # names are only appended to its failure.
+        problem = provider_environment_problem(
+            self._config, self._wrapper_child_environment()
+        )
+        if problem and provider in {"codex", "piri"}:
+            return False, problem
         if provider == "codex":
             return self._probe_codex_readiness()
         if provider == "piri":
             return self._probe_piri_readiness()
-        return self._probe_claude_readiness()
+        ready, reason = self._probe_claude_readiness()
+        if not ready and problem:
+            reason = f"{reason} ({problem})"
+        return ready, reason
 
     async def _run_async(self):  # noqa: C901 -- #348 baseline hotspot
         """Async entry: manage Application lifecycle and polling restart loop."""

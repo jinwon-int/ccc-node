@@ -216,6 +216,15 @@ validate_render_home() {
     fi
 }
 
+bridge_env_file_path() {
+    # Canonical shared bridge EnvironmentFile (#1771). Read by the Telegram unit
+    # rendered here AND by the Matrix unit (service-systemd-matrix.service.example),
+    # so provider/auth keys (CCC_AGENT_PROVIDER, CCC_PIRI_*, CLAUDE_CODE_OAUTH_TOKEN
+    # ...) live in one place instead of hand-mirrored drop-ins. Secrets go in
+    # this 0600 file only — never in an Environment= line (world-readable unit).
+    printf '%s\n' "${HOME}/.config/ccc-node/bridge.env"
+}
+
 render_systemd_unit() {
     local project_root="$1" proxy_url="$2"
     local project_slug svc_path proxy_env="" wanted_by="default.target"
@@ -245,6 +254,9 @@ WorkingDirectory=${REPO_ROOT}
 Environment=HOME=${HOME}
 Environment=PATH=${svc_path}
 ${proxy_env}
+# Shared provider/auth env for BOTH bridge units (Telegram + Matrix), owner-only
+# 0600 (#1771). Optional ("-"): a node without the file keeps its old env.
+EnvironmentFile=-$(bridge_env_file_path)
 ExecStart=/bin/bash ${SCRIPT_DIR}/start.sh --path ${project_root}
 # Recover when the bridge handles a direct SIGTERM as a clean exit. An explicit
 # systemctl stop still suppresses restart, preserving operator stop semantics.
@@ -488,6 +500,7 @@ is_supported_generated_unit() {
             "After=network-online.target"|"Wants=network-online.target") ;;
             "Type=simple"|"WorkingDirectory="*) ;;
             "Environment=HOME="*|"Environment=PATH="*) ;;
+            "EnvironmentFile=-/"*"/.config/ccc-node/bridge.env") ;;
             "Environment=http_proxy="*|"Environment=https_proxy="*) ;;
             "Environment=all_proxy="*|"Environment=no_proxy="*) ;;
             "ExecStart=/bin/bash "*"start.sh --path "*) ;;
@@ -511,6 +524,7 @@ is_supported_generated_unit() {
         && [ "$(grep -c '^WorkingDirectory=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
         && [ "$(grep -c '^Environment=HOME=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
         && [ "$(grep -c '^Environment=PATH=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -c '^EnvironmentFile=' "$SYSTEMD_UNIT_FILE")" -le "1" ] \
         && [ "$(grep -c '^ExecStart=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
         && [ "$(grep -c '^Restart=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
         && [ "$(grep -c '^RestartSec=' "$SYSTEMD_UNIT_FILE")" = "1" ] \

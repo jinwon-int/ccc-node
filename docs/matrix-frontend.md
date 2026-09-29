@@ -220,9 +220,14 @@ process oracle (`find_project_bot_pids`) matches `--path` **and**
 `CCC_CHANNEL`, so a healthy Matrix frontend is not "already running" for
 Telegram start/`--stop`/`reap_competing_pollers` (jingun 2026-09-18 crash
 loop). It still reads the project `.env`
-(`<project>/.telegram_bot/.env`) for provider and memory keys, so both
-frontends run the same model, materializer and working-state files; they do
-not share Telegram state or sessions. `MatrixBot.run()` is the blocking entry
+(`<project>/.telegram_bot/.env`) and `bridge/.env` for provider and memory
+keys (wrapper paths reach the wrapper child via #2065), and — like the Telegram
+unit — the shared owner-only EnvironmentFile `~/.config/ccc-node/bridge.env`
+for keys that must be in the process environment (provider selection,
+env-only secrets such as `CLAUDE_CODE_OAUTH_TOKEN`; see
+[bridge-ops.md](bridge-ops.md#provider-environment-contract), #1771). Both
+frontends therefore run the same model, materializer and working-state files;
+they do not share Telegram state or sessions. `MatrixBot.run()` is the blocking entry
 `__main__` expects (access control + session store init, SIGTERM/SIGINT →
 orderly stop).
 
@@ -264,11 +269,14 @@ second node starts with a direct room only.
    node pins; `keys/query` from the bot token), `not_before_ms` = now.
 5. **Extra + unit** — `pip install -r bridge/requirements-matrix.txt`
    (needs `libolm3`/`libolm-dev`), install
-   `bridge/service-systemd-matrix.service.example`. If the node's Telegram
-   unit sets the provider through `Environment=` lines (Piri on jingun),
-   mirror them into a `ccc-matrix-bridge.service.d/provider.conf` drop-in
-   (recipe in the example file) — otherwise the Matrix frontend runs the
-   default provider.
+   `bridge/service-systemd-matrix.service.example`. Provider settings the
+   Telegram unit gets from its environment (Piri on jingun) belong in the
+   shared `~/.config/ccc-node/bridge.env` both units read (#1771; see
+   [bridge-ops.md](bridge-ops.md#provider-environment-contract)) —
+   hand-mirrored `provider.conf` drop-ins are the legacy path. Run
+   `systemd-analyze verify` on the unit; at startup the bridge logs
+   `required provider environment missing: ...` (names only) if the selected
+   provider still cannot resolve its CLI or auth.
 6. **Initialize once** (after the owner accepted the invite — a direct room must be exactly {owner, bot}) — `CCC_MATRIX_INITIALIZE=1 BOT_DATA_DIR=… CCC_CHANNEL=matrix
    CCC_MATRIX_CONFIG_PATH=… <venv>/bin/python -m telegram_bot --path <root>`:
    creates the crypto store, uploads keys, pins devices, gates the room, exits.

@@ -96,6 +96,7 @@ async def test_serve_binds_marks_and_ticks_health(tmp_path: Path, matrix_config:
     reporter = RecordingReporter()
     monkeypatch.setattr(matrix_bot, "health_reporter", reporter)
     monkeypatch.setattr(matrix_bot, "_HEALTH_INTERVAL_S", 0.01)
+    monkeypatch.setattr(matrix_bot, "provider_environment_problem", lambda *_a, **_k: None)
     bot, _chat, _manager = _bot(tmp_path)
     bot._project_chat = WorkloadProjectChat()
     holder = await _attach(bot, SignalTransport)
@@ -114,6 +115,37 @@ async def test_serve_binds_marks_and_ticks_health(tmp_path: Path, matrix_config:
     assert ticks[0][1] == (1, 3.5) and ticks[0][2] == {"waiting_for_turn": 2}
     assert names.count("record_telegram_ok") >= 2
     assert names[-1] == "mark_unavailable"
+
+
+@pytest.mark.anyio
+async def test_startup_records_missing_provider_env_instead_of_healthy(tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1771: the Matrix unit bypasses start.sh; a provider env that never
+    reached it must show up at startup (names only), not as a healthy agent."""
+    reporter = RecordingReporter()
+    monkeypatch.setattr(matrix_bot, "health_reporter", reporter)
+    monkeypatch.setattr(matrix_bot, "_HEALTH_INTERVAL_S", 0.01)
+    seen: list[Any] = []
+
+    def problem(settings: Any, environ: Any = None) -> str:
+        seen.append(settings)
+        return "required provider environment missing: provider=codex missing=CCC_CODEX_REAL_CLI_PATH"
+
+    monkeypatch.setattr(matrix_bot, "provider_environment_problem", problem)
+    bot, _chat, _manager = _bot(tmp_path)
+    holder = await _attach(bot, SignalTransport)
+
+    async def body(transport: FakeTransport) -> None:
+        await _until_calls(reporter, {"record_workload": 1})
+    holder["body"] = body
+    await bot.serve()
+
+    names = reporter.names()
+    assert names[:4] == ["bind", "initialize_process", "mark_starting", "record_agent_error"]
+    assert "record_agent_ok" not in names
+    assert reporter.calls[3][1] == (
+        "required provider environment missing: provider=codex missing=CCC_CODEX_REAL_CLI_PATH",
+    )
+    assert seen == [bot._settings]
 
 
 @pytest.mark.anyio
