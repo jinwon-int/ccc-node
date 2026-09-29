@@ -663,6 +663,17 @@ def _safe_tool(path: Path) -> bool:
         return False
 
 
+# #1903: every git call runs with auto-maintenance and auto-gc off. The
+# publish/promote paths commit inside a throwaway `TemporaryDirectory` clone,
+# and a commit or fetch ends by spawning a DETACHED `git maintenance run
+# --auto` (older git: `git gc --auto`). That child kept writing under
+# `.git/objects` while the context manager was deleting the clone, so cleanup
+# intermittently raised ENOTEMPTY -> `internal_error` after the branch was
+# pushed but before the PR/ledger row existed. A short-lived clone never needs
+# maintenance; the persistent remote is maintained by its own host.
+_GIT_NO_BACKGROUND = ("-c", "maintenance.auto=false", "-c", "gc.auto=0")
+
+
 def _run(
     argv: list[str],
     *,
@@ -671,6 +682,8 @@ def _run(
     env: dict[str, str] | None = None,
     timeout: int = 120,
 ) -> subprocess.CompletedProcess[bytes]:
+    if argv and argv[0] == "git":
+        argv = ["git", *_GIT_NO_BACKGROUND, *argv[1:]]
     try:
         completed = subprocess.run(
             argv,
