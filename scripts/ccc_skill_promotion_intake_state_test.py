@@ -36,11 +36,18 @@ sys.modules[SPEC.name] = promotion
 SPEC.loader.exec_module(promotion)
 
 
+# #1903: every fixture stamp derives from this one instant, read once at
+# import. iso() used to call datetime.now() per stamp, so a fixture row and
+# the expected value built from it straddled a second boundary whenever the
+# wall clock ticked between the two calls — the `approved_at` equality pins
+# then failed at random on CI. The wall-clock reading stays (the doctor age
+# helper below ages stamps against the real now), it is just taken once.
+FIXTURE_NOW = datetime.now(timezone.utc).replace(microsecond=0)
+
+
 def iso(*, days_ago: int) -> str:
     """A timestamp in the exact format _utc_now writes to the ledger."""
-    return (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    return (FIXTURE_NOW - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def config(collect_window: int = 32) -> types.SimpleNamespace:
@@ -86,6 +93,36 @@ def verdict_row(task: str, verdict: str, *, days_ago: int) -> dict:
 def approved(pr: str, *, days_ago: int, task: str | None = None) -> list[dict]:
     task = task or f"skills_intake_review-pr{pr}-dungae-x"
     return [dispatch_row(task, pr), verdict_row(task, "approve", days_ago=days_ago)]
+
+
+class _WallClockForbidden(datetime):
+    """Stands in for `datetime` while a fixture is built: any now() read fails
+    the test, which is how a per-call clock read (#1903) would surface."""
+
+    @classmethod
+    def now(cls, tz=None):  # noqa: D102 - override
+        raise AssertionError("fixture stamp read the wall clock (#1903)")
+
+
+class FixtureClockTests(unittest.TestCase):
+    """#1903: fixture stamps must not depend on when they are built."""
+
+    def test_fixture_stamps_never_read_the_wall_clock(self) -> None:
+        with patch.dict(globals(), {"datetime": _WallClockForbidden}):
+            first = iso(days_ago=9)
+            rows = approved("140", days_ago=9)
+        self.assertEqual(first, rows[1]["ts"])
+
+    def test_verdict_stamp_equality_survives_a_second_boundary(self) -> None:
+        """The exact CI failure: fixture and expectation built a tick apart."""
+        with patch.dict(globals(), {"datetime": _WallClockForbidden}):
+            rows = approved("140", days_ago=9)
+            expected = iso(days_ago=9)
+        with patch.object(promotion, "_ledger_rows", return_value=rows), \
+             patch.object(promotion, "_append_ledger") as append, \
+             patch.object(promotion, "_pr_state", return_value="OPEN"):
+            promotion._sweep_intake_states(config(), dry_run=False)
+        self.assertEqual(append.call_args.args[1]["approved_at"], expected)
 
 
 class ApproveLineageJoinTests(unittest.TestCase):
