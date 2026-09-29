@@ -19,6 +19,70 @@ On Linux production nodes, prefer the node's scoped `ccc-telegram-bridge.service
 - Codex approval requests are single-owner and turn-scoped (Allow or Deny only); never provide a session-wide Allow All.
 - Never let two services poll the same Telegram bot token concurrently.
 
+## Before a manual restart: occupancy check
+
+A restart SIGTERMs the bridge, which closes admission and drains for at most
+45 seconds (`_SHUTDOWN_DRAIN_SECONDS`) before tearing down whatever is still
+running. An in-flight turn or tracked background job is then killed and the
+user's work is lost. Before any manual `systemctl restart`, `start.sh --stop`,
+or checkout swap, read the bridge's own occupancy record (#1881).
+
+The canonical source is `workload` in `<project>/.telegram_bot/health.json`,
+normally `~/.telegram_bot/health.json`. The same file is the default for the
+self-update idle gate. The Matrix frontend writes the same shape to
+`~/.ccc-matrix/health.json`. The occupancy fields are:
+
+| Field | Meaning |
+|---|---|
+| `workload.turn_occupancy.state` | `idle` or `occupied`. `occupied` exactly when `active_requests > 0`. |
+| `workload.active_requests` | Tracked in-flight work: the larger of provider sessions (including provider-owned background tasks such as Claude run-in-background Bash) and accepted Telegram run tasks. |
+| `workload.oldest_request_age_seconds` | Age in whole seconds of the oldest tracked item. `0` when idle. |
+| `workload.waiting_for_turn` | Requests queued for runtime admission, never more than `active_requests`. |
+| `workload.turn_occupancy.observed_at` | UTC time of the observation. It is missing only before the first reporter tick. |
+| `workload.turn_occupancy.oldest_turn_started_at` | Present only while `occupied`. `occupied_since` is a legacy alias and `elapsed_seconds` repeats the age. |
+
+Copy-paste check (jq):
+
+```bash
+jq -r '.workload as $w | "\($w.turn_occupancy.state) active=\($w.active_requests) oldest=\($w.oldest_request_age_seconds)s waiting=\($w.waiting_for_turn) observed_at=\($w.turn_occupancy.observed_at) updated_at=\(.updated_at)"' ~/.telegram_bot/health.json
+```
+
+For scripts, `jq -e '.workload.turn_occupancy.state == "idle"' ~/.telegram_bot/health.json`
+exits `0` only when the bridge reports idle. A missing field makes jq print
+`false` or `null` and exit non-zero, so the check fails closed. Without jq:
+`python3 -c 'import json,os;w=json.load(open(os.path.expanduser("~/.telegram_bot/health.json")))["workload"];print(w["turn_occupancy"]["state"],w["active_requests"],w["oldest_request_age_seconds"])'`.
+`bridge/start.sh --path <project> --status` shows the same data in its
+`Turn occupancy` line and reports `unknown` when the observation is stale.
+
+How to read the result:
+
+- **`idle`, and `updated_at` is recent**: safe to restart. While the bridge
+  is idle the workload record is rewritten about every 30 seconds, and the
+  reporter samples every 10 seconds. The self-update gate treats a snapshot as
+  fresh for 90 seconds.
+- **`occupied`**: do not restart. Wait, or ask the owner. Long-running work can
+  keep a bridge `occupied` for a long time, such as a provider background job
+  or an accepted run task. In the 2026-09-21 case the tracked item was a paused
+  long task. That is still tracked work, and the drain gives up after 45
+  seconds. For Danso, pause the task before restarting so the restart does not
+  spend an interrupted-request slot (see [danso-telegram.md](danso-telegram.md)).
+- **Stale, unreadable, or missing fields**: treat as *unknown*, never as idle.
+  The self-update gate fails open here, but a manual restart should not. Use
+  `--status`, or confirm with the owner.
+
+> **Warning:** `health.json` has **no** `active_turns` field, and no top-level
+> or `workload.active` field. A check that reads them gets `null`/`0` and
+> reports "idle" while the bridge is busy. On 2026-09-21 this let two nodes be
+> restarted with tracked work still running (#1881). Read
+> `workload.turn_occupancy.state` and `workload.active_requests` only.
+
+The fields are written by `RuntimeHealthReporter.record_workload`
+(`bridge/utils/health.py`). The counts come from
+`_bridge_workload_snapshot` (`bridge/core/bot_lifecycle.py`); the Matrix
+frontend has its own `_workload_snapshot`. The automated consumer that
+applies this gate is `health_file_busy` in `scripts/ccc-self-update.sh`, which
+defers with exit `8` (see [self-update.md](self-update.md#idle-gate-dont-restart-mid-task)).
+
 ## Provider rollout
 
 The default is `CCC_AGENT_PROVIDER=claude`. For Codex, install and authenticate

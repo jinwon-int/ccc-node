@@ -486,7 +486,8 @@ Two native `--task-status` fields are easy to misread next to this feature:
   be resumed. A forced bridge restart while a request is in flight spends one
   (soonwook's journal reached 1/3 on 2026-09-21). A cooperative pause
   (`/task_pause` / SIGUSR1) settles first and spends none. **Pause before you
-  restart** when `workload.turn_occupancy.state` is `occupied` (#1881).
+  restart** when `workload.turn_occupancy.state` is `occupied` (#1881; check
+  command in [bridge-ops.md](bridge-ops.md#before-a-manual-restart-occupancy-check)).
 
 Completed tasks and sessions without a long-task ledger do not trigger startup
 offers. An unreadable, malformed, or actively locked journal produces no advice;
