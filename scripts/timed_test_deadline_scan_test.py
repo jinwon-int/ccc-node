@@ -75,6 +75,33 @@ class DateExtractionTests(unittest.TestCase):
     def test_impossible_dates_are_skipped(self) -> None:
         self.assertEqual(scanner._dates_in("종료 일시 2026-13-45"), [])
 
+    def test_marked_utc_is_converted_to_kst(self) -> None:
+        # a2a-nexus#2256: "07:36:11 UTC (16:36 KST)" was read as 07:36 KST.
+        self.assertEqual(
+            scanner._dates_in("테스트 종료: 2026-09-28 07:36:11 UTC (16:36 KST)"),
+            [(dt.datetime(2026, 9, 28, 16, 36), True)],
+        )
+        self.assertEqual(
+            scanner._dates_in("deadline 2026-09-28T07:36:11Z"),
+            [(dt.datetime(2026, 9, 28, 16, 36), True)],
+        )
+
+    def test_utc_and_kst_renderings_of_one_instant_agree(self) -> None:
+        self.assertEqual(
+            {stamp for stamp, _ in scanner._dates_in(
+                "종료일시: 2026-09-15 23:44 UTC (2026-09-16 08:44 KST)"
+            )},
+            {dt.datetime(2026, 9, 16, 8, 44)},
+        )
+
+    def test_utc_offset_annotation_is_not_a_utc_clock(self) -> None:
+        # a2a-nexus#1597 wrote "09:30 KST (Asia/Seoul, UTC+09:00)"; a bare
+        # "UTC+09:00" right after the time must not shift it either.
+        self.assertEqual(
+            scanner._dates_in("종료 예정: 2026-09-14 09:30 UTC+09:00"),
+            [(dt.datetime(2026, 9, 14, 9, 30), True)],
+        )
+
     def test_korean_date_notation_is_read(self) -> None:
         found = scanner._dates_in("종료 예정 2026년 9월 17일 07:32")
         self.assertEqual(found, [(dt.datetime(2026, 9, 17, 7, 32), True)])
@@ -109,6 +136,36 @@ class FalsePositiveClassificationTests(unittest.TestCase):
             ),
             "already-settled-comment",
         )
+
+    def test_time_already_past_when_posted_is_a_record_not_a_booking(self) -> None:
+        # a2a-nexus#2256: the result report posted at 16:44 KST stated
+        # "테스트 종료: 07:36:11 UTC (16:36 KST)" under a neutral heading and
+        # was a daily high-confidence finding.
+        issue = _issue(
+            number=2256,
+            repo="jinwon-int/a2a-nexus",
+            comments=[
+                _comment(
+                    "## 후속 PR #2286 착지 — 검증 종료 · jingun · 2026-09-28\n\n"
+                    "- **착지**: #2286 → main `7a105b66`\n"
+                    "- **테스트 종료**: 2026-09-28 07:36:11 UTC (16:36 KST). 전체 게이트 실행.",
+                    "2026-09-28T07:44:22Z",
+                )
+            ],
+        )
+        hits, _ = scanner.collect_hits(issue)
+        record = [h for h in hits if h.deadline == dt.datetime(2026, 9, 28, 16, 36)]
+        self.assertEqual(len(record), 1)
+        self.assertEqual(record[0].weak_reason, "past-at-posting")
+        now = dt.datetime(2026, 9, 29, 9, 20)
+        self.assertEqual(scanner.scan([issue], now, "expired", "high"), [])
+
+    def test_future_booking_is_not_demoted_as_past(self) -> None:
+        issue = _issue(
+            comments=[_comment("검증 종료 예정: 2026-09-17 07:32 KST", "2026-09-16T22:23:42Z")]
+        )
+        hits, _ = scanner.collect_hits(issue)
+        self.assertEqual([h.weak_reason for h in hits], [None])
 
     def test_demoted_hits_are_kept_not_discarded(self) -> None:
         issue = _issue(
@@ -197,6 +254,69 @@ class ExpiredModeTests(unittest.TestCase):
             comments=[
                 _comment("## 판정 완료", "2026-09-10T00:00:00Z"),
                 _comment("검증 종료 예정: 2026-09-17 07:32 KST", "2026-09-16T22:23:42Z"),
+            ]
+        )
+        self.assertIsNotNone(scanner.judge_issue(issue, NOW, "expired"))
+
+    def test_early_verdict_after_the_booking_clears_the_issue(self) -> None:
+        # a2a-nexus#1597: booked for 09-26 12:00 KST, run early the evening
+        # before and judged twice before the window closed.
+        issue = _issue(
+            number=1597,
+            repo="jinwon-int/a2a-nexus",
+            comments=[
+                _comment(
+                    "## 재카나리 일정 확정 + 대상 정정 — **종료 일시 2026-09-26 12:00 KST**",
+                    "2026-09-25T11:30:31Z",
+                ),
+                _comment(
+                    "## 재카나리 착수 — 일정 앞당김\n\n"
+                    "- 종료 예정: 늦어도 기존 종료 일시 **2026-09-26 12:00 KST**를 넘기지 않습니다.",
+                    "2026-09-25T12:53:15Z",
+                ),
+                _comment("## 재카나리 판정 — **불합격 (runtime mismatch)**", "2026-09-25T12:56:18Z"),
+                _comment("## 재카나리 r2 — **합격** · 등애 `canary_passed` 승격", "2026-09-25T13:50:36Z"),
+            ],
+        )
+        now = dt.datetime(2026, 9, 29, 9, 20)
+        self.assertIsNone(scanner.judge_issue(issue, now, "expired"))
+
+    def test_early_window_opens_at_the_last_restatement_of_the_booking(self) -> None:
+        # A verdict between the first booking and a later re-affirmation of
+        # the same deadline belongs to an earlier round, not this one.
+        issue = _issue(
+            comments=[
+                _comment("검증 종료 예정: 2026-09-17 07:32 KST", "2026-09-10T00:00:00Z"),
+                _comment("## 1차 판정 — 불합격", "2026-09-11T00:00:00Z"),
+                _comment("재시험. 종료 예정은 그대로 2026-09-17 07:32 KST", "2026-09-12T00:00:00Z"),
+            ]
+        )
+        self.assertIsNotNone(scanner.judge_issue(issue, NOW, "expired"))
+
+    def test_early_progress_headings_are_not_verdicts(self) -> None:
+        # ccc-node#1528 was cleared by "판정표" when the 200-char window was
+        # read before the deadline; interim and pending calls are not results.
+        for heading in (
+            "## 오너 결정 반영 (2026-09-13 09:5x KST) — TM-3353 판정표 후속",
+            "## 중간 판정 — 관측 계속",
+            "## 판정 기준 확정",
+            "## 관측 중 — 결과는 아래 표, 판정은 종료 후",
+            "## 기한 연장",
+        ):
+            with self.subTest(heading=heading):
+                issue = _issue(
+                    comments=[
+                        _comment("검증 종료 예정: 2026-09-17 07:32 KST", "2026-09-10T00:00:00Z"),
+                        _comment(heading, "2026-09-12T00:00:00Z"),
+                    ]
+                )
+                self.assertIsNotNone(scanner.judge_issue(issue, NOW, "expired"))
+
+    def test_early_verdict_must_lead_the_comment(self) -> None:
+        issue = _issue(
+            comments=[
+                _comment("검증 종료 예정: 2026-09-17 07:32 KST", "2026-09-10T00:00:00Z"),
+                _comment("## 진행 상황\n\n지난 라운드는 합격이었다.", "2026-09-12T00:00:00Z"),
             ]
         )
         self.assertIsNotNone(scanner.judge_issue(issue, NOW, "expired"))
