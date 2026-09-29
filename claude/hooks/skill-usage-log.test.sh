@@ -40,6 +40,14 @@ ok "read of a SKILL.md appends one ledger line and exits 0" \
   '[ "$rc" = 0 ] && [ "$(wc -l < "$LEDGER")" = 1 ]'
 ok "ledger line carries the skill name and the Read tool" \
   'jq -e "select(.skill == \"gh-pr-flow\" and .tool == \"Read\" and .ts != null)" "$LEDGER" >/dev/null'
+ok "ledger line attributes the load to the claude runtime by default (#1739)" \
+  'jq -e "select(.skill == \"gh-pr-flow\" and .runtime == \"claude\")" "$LEDGER" >/dev/null'
+printf '%s' '{"tool_name":"Read","tool_input":{"file_path":"/skills/rt-probe/SKILL.md"}}' \
+  | CCC_SKILL_USAGE_RUNTIME=piri bash "$HOOK"
+printf '%s' '{"tool_name":"Read","tool_input":{"file_path":"/skills/rt-inject/SKILL.md"}}' \
+  | CCC_SKILL_USAGE_RUNTIME='Piri","evil":"1' bash "$HOOK"
+ok "an explicit runtime is recorded and sanitized into valid JSON" \
+  'jq -e "select(.skill == \"rt-probe\" and .runtime == \"piri\")" "$LEDGER" >/dev/null && jq -e "select(.skill == \"rt-inject\" and .runtime == \"irievil1\" and (has(\"evil\") | not))" "$LEDGER" >/dev/null'
 ok "ledger is owner-only and so is its directory" \
   '[ "$(stat -c %a "$LEDGER")" = 600 ] && [ "$(stat -c %a "$CCC_CLAUDE_DIR/state/skill-usage")" = 700 ]'
 

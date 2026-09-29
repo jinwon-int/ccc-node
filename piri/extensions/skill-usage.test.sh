@@ -129,6 +129,8 @@ ok "ledger records the Read of the SKILL.md" \
 ok "ledger records the explicit /skill: request" \
 	'[ "$(jq -s "[.[] | select(.skill == \"web\" and .tool == \"Skill\")] | length" "$LEDGER")" = 1 ]'
 ok "ledger line stays path-free (privacy)" '! grep -q "SKILL.md" "$LEDGER"'
+ok "every piri-originated line is tagged runtime piri (#1739)" \
+	'[ "$(jq -s "[.[] | select(.runtime == \"piri\")] | length" "$LEDGER")" = 2 ]'
 
 if [ "$fail" != 0 ]; then
   cat "$TMP/"*.out "$TMP/"*.err
