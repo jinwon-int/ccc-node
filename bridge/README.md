@@ -168,6 +168,18 @@ reviewed `scripts/ccc-self-update.sh` path. See
 > in `/etc/systemd/system/ccc-telegram-bridge.service.d/*.conf` (or the corresponding
 > `~/.config/systemd/user/...service.d/` directory), because bespoke main units are deliberately
 > left untouched for explicit operator normalization.
+>
+> **Memory guard (#1877).** `--install-systemd` also writes
+> `<unit>.service.d/10-ccc-memory-guard.conf` with `MemoryHigh=50%`, `MemoryMax=75%` (of host RAM)
+> and `OOMPolicy=continue`, so a runaway agent child is throttled and, at worst, OOM-killed inside
+> the bridge cgroup while the bridge and its other sessions keep running (that turn reports as
+> failed). Override with `CCC_BRIDGE_MEMORY_HIGH=` / `CCC_BRIDGE_MEMORY_MAX=` (`1%`..`100%`,
+> bytes with `K/M/G/T`, or `infinity`) or skip it with `CCC_BRIDGE_MEMORY_GUARD=0`. Reconcile never
+> touches the drop-in; to add it to an existing unit run
+> `bridge/service-systemd.sh memory-guard [--dry-run]` (set `BRIDGE_SERVICE_NAME=ccc-matrix-bridge`
+> for the Matrix frontend). It writes the drop-in and runs only `daemon-reload` — no restart — but
+> the new limits apply to the running cgroup at once. Any later-sorting operator drop-in wins.
+> Hosts without systemd (Termux) are unaffected.
 
 > **Restart ownership.** Run `--restart` from a shell outside the serving
 > bridge process tree. An agent turn that tries to restart its own bridge is
