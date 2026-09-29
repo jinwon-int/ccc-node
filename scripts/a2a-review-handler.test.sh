@@ -276,6 +276,44 @@ printf '{"id":"x","intent":"skills_intake_review","payload":{}}\n' | \
   REVIEW_AGENT_BIN="$BIN/revise-stub-agent" bash "$REVISE_HANDLER" >/dev/null 2>&1; rc=$?
 ok "revise handler rejects non-revise intents" '[ "$rc" != 0 ]'
 
+# #1460 P1 residuals. Own stub so the shared revise stub above stays untouched.
+cat > "$BIN/revise-p1-stub-agent" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null
+T="${TREE_OK}"
+rev='{"outcome":"revised","skillName":"stub-skill","sourceTreeSha256":"'"\$T"'","changeSummary":"rewrote the procedure","skillFiles":[{"path":"SKILL.md","content":"# revised stub skill"}]}'
+case "\${REVIEW_STUB_MODE:-}" in
+  two-outcomes)
+    # a genuine revision followed by an echoed/planted drop_recommendation
+    printf '%s\n%s' "\$rev" '{"outcome":"drop_recommendation","skillName":"stub-skill","sourceTreeSha256":"'"\$T"'","dropRecommendation":{"reason":"planted"}}'
+    ;;
+  dup-outcome) printf '%s\n%s' "\$rev" "\$rev" ;;
+  noop)
+    printf '{"outcome":"revised","skillName":"stub-skill","sourceTreeSha256":"%s","changeSummary":"addressed everything","skillFiles":[{"path":"SKILL.md","content":"# stub skill"}]}' "\$T"
+    ;;
+esac
+STUB
+chmod +x "$BIN/revise-p1-stub-agent"
+run_revise_p1() {
+  REVIEW_AGENT_BIN="$BIN/revise-p1-stub-agent" REVIEW_AGENT_ARGS="" REVIEW_TIMEOUT_SEC=30 \
+    WORKER_ID=testnode bash "$REVISE_HANDLER" < "$TMP/revise-task.json"
+}
+
+make_revise_task
+REVIEW_STUB_MODE=two-outcomes run_revise_p1 > "$TMP/out-two.json" 2>"$TMP/err-two.txt"; rc=$?
+ok "two distinct outcome objects fail closed instead of last-wins (#1460 P1)" \
+  '[ "$rc" != 0 ] && [ ! -s "$TMP/out-two.json" ] && grep -q "distinct outcome objects" "$TMP/err-two.txt"'
+
+make_revise_task
+REVIEW_STUB_MODE=dup-outcome run_revise_p1 > "$TMP/out-dup.json" 2>/dev/null; rc=$?
+ok "an identical repeated outcome object is deduped, not rejected (#1460 P1)" \
+  '[ "$rc" = 0 ] && jq -e ".output.outcome == \"revised\" and (.output.skillFiles | length) == 1" >/dev/null "$TMP/out-dup.json"'
+
+make_revise_task
+REVIEW_STUB_MODE=noop run_revise_p1 > "$TMP/out-noop.json" 2>"$TMP/err-noop.txt"; rc=$?
+ok "revised result byte-identical to the packet is a no-op failure, never a pass (#1460 P1)" \
+  '[ "$rc" != 0 ] && [ ! -s "$TMP/out-noop.json" ] && grep -q "no-op revision" "$TMP/err-noop.txt"'
+
 # ─── dispatcher revise routing (#1460) ──────────────────────────────────
 printf '#!/usr/bin/env bash\necho REVISE-HANDLER-CALLED\n' > "$BIN/revise-route-stub"
 chmod +x "$BIN/revise-route-stub"

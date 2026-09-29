@@ -130,11 +130,12 @@ fi
 [ -n "$model_out" ] || fail "empty reviser output"
 printf '%s' "$model_out" > "$tmp/model-out.txt"
 
-task_result="$(python3 - "$tmp/model-out.txt" "$task_id" "$skill_name" "$tree_sha" "${round_no:-1}" "$reviser_agent" "$reviser_model_arg" <<'PYEOF'
+task_result="$(python3 - "$tmp/model-out.txt" "$task_id" "$skill_name" "$tree_sha" "${round_no:-1}" "$reviser_agent" "$reviser_model_arg" "$tmp/task.json" <<'PYEOF'
 import json, os, sys
 
 raw = open(sys.argv[1], encoding="utf-8").read()
 task_id, skill_name, tree, round_no, reviser_agent, reviser_model_arg = sys.argv[2:8]
+task_path = sys.argv[8]
 reviser_node = os.environ.get("WORKER_ID") or os.environ.get("A2A_WORKER_ID") or "unknown"
 
 MAX_FILES = 16
@@ -177,17 +178,25 @@ for i, ch in enumerate(raw):
                 candidates.append(raw[start:i + 1])
                 start = None
 
-result_obj = None
-for cand in reversed(candidates):
+# #1460 P1: outcome uniqueness. The reviser echoes untrusted packet material,
+# so a planted outcome object can ride along with the real one. Picking the
+# first or the last would let position decide which one becomes authoritative
+# (a trailing forged drop_recommendation used to win silently). Byte-for-byte
+# repeats of one object are harmless and collapse; two DISTINCT outcome
+# objects make the result ambiguous and it fails closed.
+outcome_objs = {}
+for cand in candidates:
     try:
         obj = json.loads(cand)
     except Exception:
         continue
     if isinstance(obj, dict) and str(obj.get("outcome", "")).lower() in ("revised", "drop_recommendation"):
-        result_obj = obj
-        break
-if result_obj is None:
+        outcome_objs.setdefault(json.dumps(obj, sort_keys=True, ensure_ascii=False), obj)
+if not outcome_objs:
     die("no parseable revise result JSON in reviser output")
+if len(outcome_objs) > 1:
+    die(f"ambiguous reviser output: {len(outcome_objs)} distinct outcome objects")
+result_obj = next(iter(outcome_objs.values()))
 
 outcome = str(result_obj.get("outcome", "")).lower()
 cleaned = []
@@ -232,6 +241,24 @@ if outcome == "revised":
         if len(encoded) > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
             die("revised result exceeds the packet size caps")
         cleaned.append({"path": path, "content": content})
+    # #1460 P1: a "revised" result that hands the packet's files back
+    # unchanged is a no-op, not a revision — it must never compose a pass.
+    # Same path set with byte-identical content (order-insensitive) counts.
+    try:
+        with open(task_path, encoding="utf-8") as handle:
+            packet_files = json.load(handle).get("payload", {}).get("skillFiles")
+    except Exception:
+        packet_files = None
+    if isinstance(packet_files, list):
+        original = {}
+        for item in packet_files:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str) \
+                    or not isinstance(item.get("content"), str):
+                original = None
+                break
+            original[item["path"]] = item["content"]
+        if original is not None and original == {f["path"]: f["content"] for f in cleaned}:
+            die("revised result is byte-identical to the packet skillFiles (no-op revision)")
     result_obj["skillFiles"] = cleaned
     note = f"revision round {round_no}: revised {len(cleaned)} file(s)"
 else:  # drop_recommendation
