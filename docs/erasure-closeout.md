@@ -50,6 +50,44 @@ erasure remains restricted to its audience root. Primary paths are not repeated
 as secondary targets, and conflicting actions on a present path block apply
 before deletion.
 
+## Retention classes — groups a/b (#1468)
+
+Owner decision (2026-09-29, option ②): group a (legacy unscoped stores,
+e.g. `~/.nunchi/{facts.db,backend-health.json,snapshot.md}` once the live
+resolver points elsewhere) and group b (sensitive backups: `.env.bak-*`,
+`.env.pre-*`, `sessions.json.bak-*`, `crontab.bak-*`) are kept **30 days**,
+then become **eligible** for destruction at the apply boundary. Key files are
+always kept.
+
+- Inventory: entries with a `retention_policy` object (`group`, optional
+  `max_age_days`); defaults live in `retention_defaults` (`max_age_days: 30`,
+  `age_source: mtime`, `key_file_patterns`). Their resolve candidates are
+  anchored name patterns only.
+- Age is the file's **mtime** (never its contents). A file still being
+  written keeps a fresh mtime and never becomes eligible.
+- `CCC_ERASURE_RETENTION_DAYS` may only **lengthen** retention; shortening it
+  is a reviewed inventory change.
+- Key files (`*.key*`, `*.pem*`, `*.p12`/`*.pfx`/keystores, `id_rsa`-style
+  private keys, `*credential*`) plan as `retain (key-file)` at any age. The
+  inventory can add patterns, never remove the built-in ones. Key backups
+  (`memory-audience.key.bak-*`) are classified with an explicit `retain`
+  action as well.
+- A path that a non-retention class resolves as its live file (for example
+  `~/.nunchi/facts.db` while `NUNCHI_DB` is unset or names a missing file,
+  or the live `.env`) is never a retention target.
+- Dry-run: `scripts/ccc-erasure-planner.py retention [--json]` lists every
+  retention file with its group, mtime, `eligible` and `eligible_at` date —
+  paths, dates and counts only. `prune-expired` / `node-decommission` plans
+  carry `delete` only for expired files; younger ones plan as
+  `retain-until:<ISO date>`, which apply skips.
+
+**Out of scope here:** actually deleting anything on a node. Eligible files
+are destroyed only by a `prune-expired` plan run through
+`ccc-erasure-apply.py` with `ERASURE_APPLY=1` (digest, blockers, owner-only,
+rollback-first), and every such per-node run needs its **own fresh owner
+approval**. Measuring the two Termux nodes is also still
+open (#1468).
+
 ## Wiki promotion records (#1447 batch)
 
 The nunchi wiki-promote batch embeds `<!-- nunchi-p3-8 fact#ID -->` markers

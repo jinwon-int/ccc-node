@@ -30,9 +30,23 @@ Requests (#873 §2):
   scan --json                        inventory drift diagnostics (no request):
                                      unknown files in managed state roots +
                                      absent inventoried classes (#873 step 3)
-  scan --json                        inventory drift diagnostics (no request):
-                                     unknown files in managed state roots +
-                                     absent inventoried classes (#873 step 3)
+  retention [--json]                 retention dry-run (no request, #1468):
+                                     every file of a retention class (group a
+                                     legacy stores, group b sensitive backups)
+                                     with its mtime age, whether it is
+                                     eligible for destruction now, and the
+                                     date it becomes eligible
+
+Retention classes (#1468, owner decision 2026-09-29): an inventory entry with
+a "retention_policy" object is age-gated. Its files keep their "delete"
+action only once they are older than max_age_days (default 30, measured from
+the file's mtime); younger files are planned as "retain-until:<ISO date>",
+and a file whose name matches a key-file pattern is planned as
+"retain (key-file)" at ANY age. A path that a non-retention class resolves
+as its live file is never a retention target. Eligibility is only a plan
+state: destruction still happens exclusively through ccc-erasure-apply.py
+(digest + blockers + owner-only + rollback-first, ERASURE_APPLY=1), which
+needs a separate per-node owner approval.
 
 Exit codes: 0 plan (blockers allowed, they are reported), 2 usage, 3 unknown
 request type. Read-only is contractual — this script never writes, never
@@ -44,12 +58,34 @@ import json
 import os
 import re
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 SCHEMA = "ccc.erasure-plan.v1"
 INVENTORY_SCHEMA = "ccc.memory-artifact-inventory.v1"
 DEFAULT_INVENTORY = str(Path(__file__).resolve().parent.parent
                         / "schemas" / "memory-artifact-inventory.v1.json")
+
+RETENTION_SCHEMA = "ccc.erasure-retention.v1"
+# Owner decision (#1468, 2026-09-29): groups a/b are kept 30 days, then
+# become eligible for destruction at the apply boundary.
+DEFAULT_RETENTION_DAYS = 30
+# Operator knob: may only LENGTHEN retention. Shortening it below the
+# inventory value is a policy change and needs a reviewed inventory edit.
+RETENTION_DAYS_ENV = "CCC_ERASURE_RETENTION_DAYS"
+# Upper clamp (100 years) so an absurd value cannot overflow date math.
+MAX_RETENTION_DAYS = 36500
+# Key files are always kept, at any age (#1468). Built-in, anchored regexes
+# over the file NAME; the inventory's retention_defaults.key_file_patterns
+# can only ADD to this list, never remove from it.
+BUILTIN_KEY_FILE_PATTERNS = (
+    r".*\.key(\..*)?",
+    r".*\.pem(\..*)?",
+    r".*\.(p12|pfx|jks|keystore)(\..*)?",
+    r"id_(rsa|dsa|ecdsa|ed25519)(_sk)?(\..*)?",
+    r"(.*[._-])?credentials?([._-].*)?",
+)
 
 REQUESTS = {
     "audience-erasure": {"arg": "--audience"},
@@ -191,6 +227,138 @@ def resolve_entry(entry: dict) -> str | None:
     return _expand(cands[-1]["path"]) if cands else None
 
 
+def _iso(epoch: float) -> str:
+    try:
+        stamp = datetime.fromtimestamp(int(epoch), timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return "9999-12-31T23:59:59Z"   # beyond any real clock: never eligible
+    return stamp.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _positive_int(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return min(number, MAX_RETENTION_DAYS) if number >= 1 else None
+
+
+def retention_days(inventory: dict, entry: dict) -> int:
+    """Effective retention (days) for one retention class.
+
+    Precedence: entry retention_policy.max_age_days → inventory
+    retention_defaults.max_age_days → DEFAULT_RETENTION_DAYS. Invalid or
+    non-positive values fall through (a broken value never means "delete
+    now"). The env knob is honoured only when it LENGTHENS retention.
+    """
+    policy = entry.get("retention_policy") or {}
+    defaults = inventory.get("retention_defaults") or {}
+    days = (_positive_int(policy.get("max_age_days"))
+            or _positive_int(defaults.get("max_age_days"))
+            or DEFAULT_RETENTION_DAYS)
+    override = _positive_int(os.environ.get(RETENTION_DAYS_ENV))
+    if override and override > days:
+        days = override
+    return days
+
+
+def _key_file_patterns(inventory: dict) -> list[re.Pattern[str]]:
+    sources = list(BUILTIN_KEY_FILE_PATTERNS)
+    extra = (inventory.get("retention_defaults") or {}).get("key_file_patterns")
+    if isinstance(extra, list):
+        sources.extend(str(x) for x in extra)
+    out = []
+    for src in sources:
+        try:
+            out.append(re.compile(src))
+        except re.error:
+            continue
+    return out
+
+
+def is_key_file(inventory: dict, path: str) -> bool:
+    name = os.path.basename(path)
+    return any(rx.fullmatch(name) for rx in _key_file_patterns(inventory))
+
+
+def _live_claims(inventory: dict) -> tuple[set[str], list[str]]:
+    """Files/dirs owned by NON-retention classes (the live resolver view).
+
+    A retention pattern may name a path that is still a live store under the
+    current env (e.g. ~/.nunchi/facts.db when NUNCHI_DB is unset) — the live
+    class wins and the path is never a retention target.
+    """
+    files: set[str] = set()
+    dirs: list[str] = []
+    for entry in inventory.get("artifacts", []):
+        if entry.get("retention_policy"):
+            continue
+        resolved = resolve_entry(entry)
+        if resolved:
+            resolved = os.path.abspath(resolved)
+            is_dir = any(c.get("kind") == "dir" for c in
+                         (entry.get("resolve") or {}).get("candidates", []))
+            if is_dir and os.path.isdir(resolved):
+                dirs.append(resolved)
+            elif not is_dir and os.path.isfile(resolved):
+                files.add(resolved)
+        files.update(secondary_paths(entry))
+    return files, dirs
+
+
+def retention_paths(inventory: dict, entry: dict,
+                    claims: tuple[set[str], list[str]] | None = None) -> list[str]:
+    """Secondary paths of a retention class minus live-claimed ones."""
+    files, dirs = claims if claims is not None else _live_claims(inventory)
+    out = []
+    for path in secondary_paths(entry):
+        if path in files or any(path.startswith(d + os.sep) for d in dirs):
+            continue
+        out.append(path)
+    return out
+
+
+def retention_verdict(inventory: dict, entry: dict, path: str,
+                      now: float | None = None) -> dict:
+    """Age verdict for one file of a retention class. Body-free: name/mtime
+    only — the file is never opened."""
+    policy = entry.get("retention_policy") or {}
+    days = retention_days(inventory, entry)
+    verdict = {"group": policy.get("group"), "max_age_days": days,
+               "age_source": "mtime", "mtime": None, "eligible_at": None,
+               "eligible": False, "reason": "unreadable"}
+    try:
+        meta = os.lstat(path)
+    except OSError:
+        return verdict
+    current = time.time() if now is None else now
+    eligible_at = int(meta.st_mtime) + days * 86400
+    verdict["mtime"] = _iso(meta.st_mtime)
+    if is_key_file(inventory, path):
+        verdict["reason"] = "key-file"          # always kept, any age
+        return verdict
+    verdict["eligible_at"] = _iso(eligible_at)
+    if os.path.islink(path):
+        verdict["reason"] = "symlink"           # never a destruction target
+        return verdict
+    verdict["eligible"] = current >= eligible_at
+    verdict["reason"] = "retention-expired" if verdict["eligible"] \
+        else "within-retention"
+    return verdict
+
+
+def gated_action(action: str, verdict: dict) -> str:
+    """Destruction actions stay only for eligible files; everything else in
+    a retention class is planned as a retain variant (apply skips it)."""
+    if not action.startswith("delete") or verdict.get("eligible"):
+        return action
+    if verdict.get("reason") in ("key-file", "symlink", "unreadable"):
+        return f"retain ({verdict['reason']})"
+    return f"retain-until:{verdict['eligible_at']}"
+
+
 def _scan(inventory: dict) -> tuple[set[str], set[str], list[str]]:
     """Strict resolution sweep → (known_files, known_dirs, sweep_roots).
 
@@ -294,10 +462,34 @@ def _estimate(path: str | None) -> dict:
         return {"files": 0, "bytes": 0}
 
 
+def _secondary_targets(inventory: dict, entry: dict, action: str,
+                       cache: dict, now: float) -> list[dict]:
+    """Per-path targets beyond the primary resolution. Retention classes
+    (#1468) get a per-file age gate: live-claimed paths are excluded, key
+    files are always kept, and only expired files keep a delete action.
+    ``cache`` holds the live-claim sweep so one plan computes it once."""
+    out = []
+    if entry.get("retention_policy"):
+        if "claims" not in cache:
+            cache["claims"] = _live_claims(inventory)
+        for path in retention_paths(inventory, entry, cache["claims"]):
+            verdict = retention_verdict(inventory, entry, path, now)
+            out.append({"artifact": entry["id"], "path": path, "present": True,
+                        "action": gated_action(action, verdict),
+                        "estimate": _estimate(path), "retention": verdict})
+        return out
+    for path in secondary_paths(entry):
+        out.append({"artifact": entry["id"], "path": path, "present": True,
+                    "action": action, "estimate": _estimate(path)})
+    return out
+
+
 def plan(request: str, inventory: dict, audience: str | None,
          key: str | None) -> dict:
     scopes = REQUEST_SCOPES.get(request, ())
     targets = []
+    cache: dict = {}
+    now = time.time()
     external = []
     for entry in inventory.get("artifacts", []):
         req_actions = entry.get("requests") or {}
@@ -329,14 +521,7 @@ def plan(request: str, inventory: dict, audience: str | None,
         })
         # Multi-file classes (extra_paths + pattern matches) target per path:
         # an apply slice must name every file it would touch, never a class.
-        for secondary in secondary_paths(entry):
-            targets.append({
-                "artifact": entry["id"],
-                "path": secondary,
-                "present": True,
-                "action": action,
-                "estimate": _estimate(secondary),
-            })
+        targets.extend(_secondary_targets(inventory, entry, action, cache, now))
     return {
         "schema": SCHEMA,
         "request": request,
@@ -400,6 +585,59 @@ def _run_scan(inventory: dict) -> dict:
     }
 
 
+def retention_report(inventory: dict) -> dict:
+    """#1468 dry-run: every file of every retention class with its verdict.
+    Read-only, body-free (paths, dates, counts)."""
+    now = time.time()
+    claims = _live_claims(inventory)
+    entries = []
+    for entry in inventory.get("artifacts", []):
+        if not entry.get("retention_policy"):
+            continue
+        action = (entry.get("requests") or {}).get("prune-expired", "retain")
+        for path in retention_paths(inventory, entry, claims):
+            verdict = retention_verdict(inventory, entry, path, now)
+            planned = gated_action(action, verdict)
+            if verdict["eligible"] and not planned.startswith("delete"):
+                # Age passed, but the class itself never destroys (retain).
+                verdict.update(eligible=False, reason="class-retain")
+            entries.append({"artifact": entry["id"], "path": path, **verdict,
+                            "planned_action": planned})
+    eligible = sum(1 for e in entries if e["eligible"])
+    keys = sum(1 for e in entries if e["reason"] == "key-file")
+    return {
+        "schema": RETENTION_SCHEMA,
+        "read_only": True,
+        "generated_at": _iso(now),
+        "default_max_age_days": DEFAULT_RETENTION_DAYS,
+        "entries": entries,
+        "summary": {"files": len(entries), "eligible": eligible,
+                    "retained": len(entries) - eligible, "key_files": keys},
+        "apply_note": ("eligible means planned, not deleted: destruction runs "
+                       "only via a prune-expired plan through "
+                       "ccc-erasure-apply.py with ERASURE_APPLY=1 and a "
+                       "separate per-node owner approval"),
+    }
+
+
+def _print_retention_human(doc: dict) -> None:
+    summary = doc["summary"]
+    print(f"erasure retention — {summary['files']} file(s): "
+          f"{summary['eligible']} eligible now, {summary['retained']} retained "
+          f"({summary['key_files']} key file(s)) (READ-ONLY, nothing deleted)")
+    for e in doc["entries"]:
+        group = e.get("group") or "-"
+        if e["eligible"]:
+            state = f"eligible since {e['eligible_at']}"
+        elif e["reason"] == "within-retention":
+            state = f"retained until {e['eligible_at']}"
+        else:
+            state = f"retained ({e['reason']})"
+        print(f"  - [{group}] {e['artifact']}: {state}")
+        print(f"      {e['path']}")
+    print(f"  note: {doc['apply_note']}")
+
+
 def _print_plan_human(doc: dict) -> None:
     print(f"erasure plan — request={doc['request']} key={doc['key'] or '-'} "
           f"(READ-ONLY, no mutation performed)")
@@ -417,6 +655,19 @@ def _print_plan_human(doc: dict) -> None:
     if doc["blockers"]:
         print(f"  {len(doc['blockers'])} blocker(s): an apply slice must stop "
               "until these are classified.")
+
+
+def _run_diagnostic(request: str, inventory: dict, as_json: bool) -> int:
+    """Request-free read-only reports: scan (always JSON) and retention."""
+    if request == "scan":
+        print(json.dumps(_run_scan(inventory), ensure_ascii=False, indent=2))
+        return 0
+    doc = retention_report(inventory)
+    if as_json:
+        print(json.dumps(doc, ensure_ascii=False, indent=2))
+    else:
+        _print_retention_human(doc)
+    return 0
 
 
 def main(argv: list[str]) -> int:
@@ -444,12 +695,11 @@ def main(argv: list[str]) -> int:
         print(f"erasure-planner: inventory schema mismatch: "
               f"{inventory.get('schema')}", file=sys.stderr)
         return 2
-    if request == "scan":
-        print(json.dumps(_run_scan(inventory), ensure_ascii=False, indent=2))
-        return 0
+    if request in ("scan", "retention"):
+        return _run_diagnostic(request, inventory, "--json" in args)
     if request not in REQUESTS:
         print(f"erasure-planner: unknown request '{request}' "
-              f"(known: {', '.join(REQUESTS)}, scan)", file=sys.stderr)
+              f"(known: {', '.join(REQUESTS)}, scan, retention)", file=sys.stderr)
         return 3
     arg_name = REQUESTS[request]["arg"]
     value = None
