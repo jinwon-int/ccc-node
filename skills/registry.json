@@ -76,7 +76,7 @@
       "name": "gh-pr-flow",
       "source": "codex/skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "67236d60fdaa633c665ccc1c5895deca2ebb987ae7fdcdf923584b0e962cbd9e"
+      "tree_sha256": "ce9f5b095c5229744254b4d97673c9c4432b8be1bcef56ecddd2e2ef51a41355"
     },
     {
       "audience": "codex",
@@ -241,7 +241,7 @@
       "name": "gh-pr-flow",
       "source": "skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "ffcf05b81bed8f93b50bc77c5c285ef84597153cea40d4e3575d615dad8e41ae"
+      "tree_sha256": "026e8c2707005e3517f91df424657ae760278b4cb8485112c019d3e95191aa3a"
     },
     {
       "audience": "claude",

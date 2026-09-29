@@ -448,6 +448,41 @@ every selected repository ends compliant. Widening the ruleset is a code change
 through this skill's PR flow; editing the allowlist is an operator decision
 recorded with the run's approval.
 
+## Environment deployment approval
+
+A workflow job gated by a GitHub Actions environment with required reviewers
+(for example a `release` environment whose reviewer is `jinon86`) waits in
+`pending_deployments` until that reviewer approves. Approving it is a
+**release-gate action**: it needs fresh explicit user approval for that exact
+repository, run, environment, and head, every time — an earlier release
+approval or a PR merge approval does not carry over. Never approve it with an
+ad-hoc `gh api` call on the relay node; use the fail-closed helper, which ships
+with the managed Codex skills next to `approve-via-relay.sh` (resolve
+`RELAY_FLOW_DIR` as in step 5):
+
+```bash
+CCC_EXPLICIT_USER_APPROVAL=1 \
+  bash "$RELAY_FLOW_DIR/approve-deployment-via-relay.sh" \
+  --repo jinwon-int/<repo> --run-id <run-id> --environment release \
+  --expected-head <full-40-char-sha> --operator-approved
+# optional: --expected-workflow .github/workflows/release.yml (default)
+#           --expected-branch main (default) --expected-event workflow_dispatch
+#           (default) --ssh-target <relay-alias> --dry-run
+```
+
+The helper runs `gh` on the relay node with the root-owned `jinon86` config and
+fail-closes unless the actor is `jinon86`, the run belongs to the repository
+(not a fork), its head SHA, branch, event, and workflow path match exactly, and
+exactly one environment — the named one — is pending with
+`current_user_can_approve: true`. It records the approval with a comment naming
+the operator approval and the source node, then verifies it from the run's
+review history. It is idempotent: when the environment is no longer pending (or
+the run is no longer waiting) and `jinon86` already approved it, it reports
+`already_approved` without posting again; a run that is no longer waiting and
+was never approved exits `66` with its state and submits nothing. Approving the
+deployment authorizes only that job to proceed — not a re-run, another
+environment, or a follow-up release.
+
 ## Security and merge rules
 
 - Never push directly to `main`; always use a branch and PR.
