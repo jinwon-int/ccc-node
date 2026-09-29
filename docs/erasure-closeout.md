@@ -61,25 +61,45 @@ always kept.
 
 - Inventory: entries with a `retention_policy` object (`group`, optional
   `max_age_days`); defaults live in `retention_defaults` (`max_age_days: 30`,
-  `age_source: mtime`, `key_file_patterns`). Their resolve candidates are
-  anchored name patterns only.
-- Age is the file's **mtime** (never its contents). A file still being
-  written keeps a fresh mtime and never becomes eligible.
+  `age_source: max(mtime,ctime)`, `key_file_patterns`). Their resolve
+  candidates are anchored name patterns only.
+- Age is measured from the **later of mtime and ctime** (never contents).
+  `cp -p`, `cp -a`, `rsync -a` and `shutil.copy2` carry the source's old
+  mtime, so a backup taken today must not look months old; ctime cannot be
+  backdated. A chmod/rename/restore also refreshes ctime and so restarts the
+  clock (errs toward keeping).
 - `CCC_ERASURE_RETENTION_DAYS` may only **lengthen** retention; shortening it
   is a reviewed inventory change.
-- Key files (`*.key*`, `*.pem*`, `*.p12`/`*.pfx`/keystores, `id_rsa`-style
-  private keys, `*credential*`) plan as `retain (key-file)` at any age. The
-  inventory can add patterns, never remove the built-in ones. Key backups
-  (`memory-audience.key.bak-*`) are classified with an explicit `retain`
-  action as well.
-- A path that a non-retention class resolves as its live file (for example
-  `~/.nunchi/facts.db` while `NUNCHI_DB` is unset or names a missing file,
-  or the live `.env`) is never a retention target.
+- Key files plan as `retain (key-file)` at any age. The rule searches the
+  file name case-insensitively for key tokens on `.`/`_`/`-` boundaries —
+  `pem`, `p12`, `pfx`, `jks`, `keystore`, `key(s)`, `gpg`, `asc`, `age`,
+  `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`, `credential(s)`, `secret(s)`,
+  `token(s)`, `oauth`, `auth.json`, `netrc`, `hosts.yml` — so
+  `.env.bak-x.PEM` or `.env.bak-ID_ED25519` are kept. The inventory can add
+  patterns, never remove the built-in ones. Key backups
+  (`memory-audience.key.bak-*`) also carry an explicit `retain` action.
+- Live files are never retention targets. A path any non-retention class
+  resolves as live is claimed by **path, realpath and inode**, so a live
+  `.env` that is a symlink to `.env.pre-mig`, a `NUNCHI_DB` symlinked onto
+  `~/.nunchi/facts.db`, or a hard link of a live file all stay protected.
+- Legacy `~/.nunchi/{facts.db,snapshot.md,backend-health.json}` is still read
+  through `CCC_MEMORY_LEGACY_NUNCHI_HOME` even while `NUNCHI_DB` /
+  `NUNCHI_SNAPSHOT` point at the audience store, and reads never bump mtime.
+  So these stay claimed live **regardless of env** until the operator creates
+  the retirement marker `~/.nunchi/.legacy-retired` (default absent; itself
+  classified as retained). Only then does their 30-day clock matter. For
+  `facts.db`, `node-decommission` stays `handoff-or-drop` (never a plain
+  delete), so decommission keeps its handoff contract.
+- Last copy: while a backup family's live counterpart is absent (`.env` for
+  `.env.bak-*`/`.env.pre-*`, `sessions.json` for its backups; crontab has no
+  checkable file, so it always counts as absent), the newest copy per
+  directory is planned as `retain (last copy; live missing)` even past
+  retention.
 - Dry-run: `scripts/ccc-erasure-planner.py retention [--json]` lists every
-  retention file with its group, mtime, `eligible` and `eligible_at` date —
-  paths, dates and counts only. `prune-expired` / `node-decommission` plans
-  carry `delete` only for expired files; younger ones plan as
-  `retain-until:<ISO date>`, which apply skips.
+  retention file with its group, mtime, age basis, `eligible`, `eligible_at`
+  and planned action — paths, dates and counts only. `prune-expired` /
+  `node-decommission` plans carry `delete` only for expired files; younger
+  ones plan as `retain-until:<ISO date>`, which apply skips.
 
 **Out of scope here:** actually deleting anything on a node. Eligible files
 are destroyed only by a `prune-expired` plan run through

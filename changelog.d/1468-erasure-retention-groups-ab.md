@@ -5,11 +5,17 @@
   b (`.env.bak-*`/`.env.pre-*`, `sessions.json.bak-*`, `crontab.bak-*`) as
   age-gated `retention_policy` classes, so they no longer surface as
   unknown-artifact blockers. The planner keeps a `delete` action only for
-  files whose mtime is older than 30 days (`retention_defaults.max_age_days`;
-  `CCC_ERASURE_RETENTION_DAYS` may only lengthen it); younger files plan as
-  `retain-until:<date>`, key files (`*.key*`, `*.pem*`, private-key and
-  credential names) plan as retained at any age, and a path a live class
-  still resolves is never a target. New read-only `ccc-erasure-planner.py
+  files older than 30 days measured from max(mtime, ctime), so `cp -p` /
+  `rsync -a` copies are not instantly eligible (`retention_defaults.max_age_days`;
+  `CCC_ERASURE_RETENTION_DAYS` may only lengthen it). Younger files plan as
+  `retain-until:<date>`. Key files (case-insensitive key tokens such as
+  `pem`, `key`, `id_ed25519`, `credential`, `secret`, `token`) are retained at
+  any age, and the newest copy of a backup family is retained while its live
+  file is missing. Live files are claimed by path, realpath and inode, so
+  symlinked or hard-linked live files are never targets. The legacy
+  `~/.nunchi` store stays claimed live regardless of `NUNCHI_*` env until the
+  operator creates `~/.nunchi/.legacy-retired`, and its `facts.db` keeps
+  `handoff-or-drop` on decommission. New read-only `ccc-erasure-planner.py
   retention [--json]` lists what is eligible and when (paths/dates/counts
   only). Nothing is deleted by this change: destruction still runs only
   through `ccc-erasure-apply.py` with `ERASURE_APPLY=1`, and each per-node

@@ -160,15 +160,19 @@ ok "READ-ONLY: fixture tree byte-identical after codex-feed lock scans" \
   '[ "$before2" = "$after2" ]'
 
 # --- 7) retention classes: group a/b age gate + key-file rule (#1468) --------
-# Owner decision 2026-09-29: 30 days from mtime, then eligible at the apply
-# boundary; key files always kept. The CLI dry-run lists paths/dates/counts
-# only and never mutates the fixture tree.
+# Owner decision 2026-09-29: 30 days, then eligible at the apply boundary; key
+# files always kept. Age is max(mtime, ctime): `touch -d` (like cp -p / rsync
+# -a) backdates only mtime, so every file here is ctime-fresh and must stay
+# RETAINED at the CLI — the eligible path is exercised with a test clock in
+# ccc_erasure_retention_test.py. The dry-run lists paths/dates/counts only and
+# never mutates the fixture tree.
 # Default-home layout (CCC_BOT_DATA_DIR unset, as on real nodes): with that
 # env set, two pre-existing non-join dir classes claim the whole bot dir and
 # the live-claim guard then retains every backup (fail-safe, not exercised).
 FIX3="$TMP/fix3"
 BOT3="$FIX3/home/.telegram_bot"
 mkdir -p "$BOT3"
+printf 'x' > "$BOT3/.env"
 printf 'x' > "$BOT3/.env.bak-x"
 printf 'x' > "$BOT3/.env.bak-young"
 printf 'x' > "$BOT3/memory-audience.key.bak-1"
@@ -186,18 +190,19 @@ rc=$?
 ok "retention exits 0" '[ "$rc" = 0 ]'
 # shellcheck disable=SC2034  # verdicts is read via eval inside ok()
 verdicts="$(python3 -c 'import json,sys,os; d=json.load(sys.stdin); print("\n".join(os.path.basename(e["path"])+" "+str(e["eligible"])+" "+e["reason"]+" "+str(e["eligible_at"]) for e in d["entries"])); print("READONLY", d["read_only"])' <<<"$out")"
-ok "31-day .env backup is eligible" 'grep -q "^.env.bak-x True retention-expired " <<<"$verdicts"'
+ok "31-day-mtime but ctime-fresh .env backup is retained (cp -p safe)" \
+  'grep -Eq "^.env.bak-x False within-retention [0-9]{4}-" <<<"$verdicts"'
 ok "5-day .env backup retained with an eligible date" \
   'grep -Eq "^.env.bak-young False within-retention [0-9]{4}-[0-9]{2}-[0-9]{2}T" <<<"$verdicts"'
 ok "key backup retained at any age" 'grep -q "^memory-audience.key.bak-1 False key-file None" <<<"$verdicts"'
 ok "retention report is read-only" 'grep -q "^READONLY True" <<<"$verdicts"'
 ok "retention report carries no file body" '! grep -q "\"x\"" <<<"$out"'
 out="$(run3 retention)"
-ok "human retention output names the eligible date" 'grep -q "retained until 20" <<<"$out" && grep -q "eligible since 20" <<<"$out"'
+ok "human retention output names the eligible date" 'grep -q "retained until 20" <<<"$out" && ! grep -q "eligible since" <<<"$out"'
 out="$(run3 prune-expired --json)"
 # shellcheck disable=SC2034  # actions is read via eval inside ok()
 actions="$(python3 -c 'import json,sys; print("\n".join(t["action"] for t in json.load(sys.stdin)["targets"] if t["present"]))' <<<"$out")"
-ok "prune-expired plans exactly one delete (the expired backup)" '[ "$(grep -cx "delete" <<<"$actions")" = 1 ]'
+ok "prune-expired plans no delete for ctime-fresh backups" '! grep -qx "delete" <<<"$actions"'
 ok "prune-expired plans retain-until for the young backup" 'grep -q "^retain-until:20" <<<"$actions"'
 ok "prune-expired plans retain for the key backup" 'grep -qx "retain" <<<"$actions"'
 # shellcheck disable=SC2034  # after3 is read via eval inside ok()
