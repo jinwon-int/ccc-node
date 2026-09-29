@@ -292,7 +292,113 @@ okc "$RC" 4 "never-available restart exits 4"
 ok "timeout reason is explicit" 'grep -q "not-available-within-timeout" "$OUT"'
 ok "timed-out restart leaves the new process running (reported, not killed)" \
    '[ -n "$SNEW" ] && kill -0 "$SNEW" 2>/dev/null && grep -q "left running" "$OUT"'
+# #1868: the timeout is machine-distinguishable and names who serves now.
+ok "timeout emits a timeout outcome with the live-but-unavailable process" \
+   'grep "^ccc-restart-outcome: " "$OUT" | sed "s/^ccc-restart-outcome: //" | jq -e --argjson p "$SNEW" \
+      ".candidate == \"timeout\" and .candidate_exit == 4 and .candidate_window == 2 and .recovery == \"not-configured\" and .serving == \"alive\" and .serving_pid == \$p" >/dev/null'
 kill "$SNEW" 2>/dev/null
+
+# ---- #1868: invalid available window is refused before anything stops -------
+new_project badwin "123456:TEST-restart-badwin"
+BW_OLD="$( ( sleep 300 >/dev/null 2>&1 & echo $! ) )"
+echo "$BW_OLD" >> "$SPAWNED_PIDS"
+echo "$BW_OLD" > "$BD/bot.pid"
+for bad in abc 0 3601 090; do
+    run env HOME="$HOMEDIR" CCC_SYSTEMD_DIR="$SD_EMPTY" CCC_SYSTEMCTL="$SC_OK" \
+        CCC_BRIDGE_RESTART_SPAWN="$TMP/never-spawned" CCC_BRIDGE_RESTART_READY_TIMEOUT="$bad" \
+        bash "$START" --path "$PROJ" --restart
+    okc "$RC" 6 "invalid ready window '$bad' is refused before stop"
+done
+run env HOME="$HOMEDIR" CCC_SYSTEMD_DIR="$SD_EMPTY" CCC_SYSTEMCTL="$SC_OK" \
+    CCC_BRIDGE_RESTART_SPAWN="$TMP/never-spawned" CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT=-5 \
+    bash "$START" --path "$PROJ" --restart
+okc "$RC" 6 "invalid recovery window is refused before stop"
+ok "invalid window names the variable" 'grep -q "CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT must be an integer" "$OUT"'
+ok "invalid window leaves the serving process untouched" \
+   'kill -0 "$BW_OLD" 2>/dev/null && [ "$(cat "$BD/bot.pid")" = "$BW_OLD" ]'
+kill "$BW_OLD" 2>/dev/null
+
+# ---- #1868: recovery window derivation (pure helper, sourced seam) -----------
+recovery_window() { # <candidate-rc> [env assignments...]
+    local rc="$1"; shift
+    env -u CCC_BRIDGE_RESTART_READY_TIMEOUT -u CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT \
+        -u CCC_BRIDGE_RESTART_DEADLINE_EPOCH -u TERMUX_VERSION -u PREFIX \
+        HOME="$TMP/home-win" "$@" bash -c '
+        CCC_START_SH_LIB_ONLY=1 . "$1" --path "$2" >/dev/null
+        restart_resolve_windows >/dev/null || exit 6
+        restart_recovery_window "$3"' _ "$START" "$TMP/win-project" "$rc"
+}
+mkdir -p "$TMP/win-project"
+okc "$(recovery_window 4)" 180 "timeout recovery default is max(2x90, 180) = 180"
+okc "$(recovery_window 2)" 90 "start-error recovery keeps the candidate window"
+okc "$(recovery_window 4 CCC_BRIDGE_RESTART_READY_TIMEOUT=120)" 240 "timeout recovery doubles a larger candidate window"
+okc "$(recovery_window 4 CCC_BRIDGE_RESTART_READY_TIMEOUT=30)" 180 "timeout recovery never drops below 180"
+okc "$(recovery_window 2 CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT=300)" 300 "explicit recovery window applies to any failure"
+NOW="$(date -u +%s)"
+w="$(recovery_window 4 CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$((NOW + 60 + 120))")"
+ok "outer deadline shrinks the timeout recovery window (got $w)" '[ "$w" -ge 118 ] && [ "$w" -le 120 ]'
+okc "$(recovery_window 4 CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$((NOW + 10))")" 1 "an exhausted outer deadline still wins (1s floor), before its group kill"
+okc "$(recovery_window 4 CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$((NOW + 3600))")" 180 "a roomy outer deadline changes nothing"
+# Owner decision on #1868 (option 3): Termux defaults to a 180s candidate
+# window, so a timed-out candidate's recovery gets 360s. Both detections count.
+okc "$(recovery_window 4 TERMUX_VERSION=0.118.0)" 360 "Termux timeout recovery default is max(2x180, 180) = 360"
+okc "$(recovery_window 2 PREFIX=/data/data/com.termux/files/usr)" 180 "Termux (PREFIX) start-error recovery keeps the 180s candidate window"
+okc "$(recovery_window 4 TERMUX_VERSION=0.118.0 CCC_BRIDGE_RESTART_READY_TIMEOUT=90)" 180 "explicit ready window still overrides the Termux default"
+okc "$(recovery_window 4 TERMUX_VERSION=0.118.0 CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$((NOW + 720))")" 360 "Termux 720s command budget leaves the full 360s recovery at its start"
+w="$(recovery_window 4 TERMUX_VERSION=0.118.0 CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$((NOW + 360))")"
+ok "a 360s outer budget clamps the Termux recovery inside the deadline (got $w)" '[ "$w" -ge 298 ] && [ "$w" -le 300 ]'
+
+# ---- #1868: candidate + recovery outcomes (real finish path, stubbed lifecycle)
+# Lifecycle predicates are fixtures; finish_prepared_restart_failure decides the
+# recovery window, the exit code and the outcome record.
+FIN_LIVE="$( ( sleep 300 >/dev/null 2>&1 & echo $! ) )"
+echo "$FIN_LIVE" >> "$SPAWNED_PIDS"
+finish_case() { # <candidate-rc> <recovery-rc> <verify-rc> <serving: dead|alive|available>
+    mkdir -p "$TMP/fin-project"
+    rm -f "$TMP/fin-project/recovery.env"
+    run env -u CCC_BRIDGE_RESTART_READY_TIMEOUT -u CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT \
+        -u CCC_BRIDGE_RESTART_DEADLINE_EPOCH -u TERMUX_VERSION -u PREFIX HOME="$TMP/home-fin" \
+        FIN_RECOVERY_RC="$2" FIN_VERIFY_RC="$3" FIN_SERVING="$4" FIN_LIVE="$FIN_LIVE" \
+        bash -c '
+        CCC_START_SH_LIB_ONLY=1 . "$1" --path "$2" >/dev/null
+        restart_resolve_windows >/dev/null
+        TRANSITION_RUN=fixture
+        RECOVERY_SOURCE="$2/old"
+        RECOVERY_RUNTIME="$2/job"
+        RESTART_OLD_PID=3999999
+        transition_phase() { :; }
+        bash() { printf "%s\n" "$CCC_BRIDGE_RESTART_READY_TIMEOUT" > "$PROJECT_ROOT/recovery.env"; printf "%s\n" "${CCC_BRIDGE_RESTART_SUPPRESS_OUTCOME:-}" > "$PROJECT_ROOT/recovery.quiet"; return "$FIN_RECOVERY_RC"; }
+        verify_previous_serving() { return "$FIN_VERIFY_RC"; }
+        find_project_bot_pids() { :; }
+        read_pid() { [ "$FIN_SERVING" = dead ] || echo "$FIN_LIVE"; }
+        render_status_from_health() { [ "$FIN_SERVING" = available ] && echo "Bot status: available" || echo "Bot status: starting"; }
+        finish_prepared_restart_failure "$3"' _ "$START" "$TMP/fin-project" "$1"
+    # shellcheck disable=SC2034  # FIN_OUTCOME is read via eval inside ok()
+    FIN_OUTCOME="$(grep "^ccc-restart-outcome: " "$OUT" | sed "s/^ccc-restart-outcome: //")"
+}
+finish_case 4 4 1 dead
+okc "$RC" 8 "timeout candidate + timeout recovery exits 8"
+okc "$(cat "$TMP/fin-project/recovery.env")" 180 "timed-out candidate hands the recovery a 180s window"
+okc "$(cat "$TMP/fin-project/recovery.quiet")" 1 "nested recovery run is told not to emit its own outcome line"
+ok "double timeout outcome is explicit and reports the service DOWN" \
+   'jq -e ".schema == \"ccc.restart-outcome.v1\" and .candidate == \"timeout\" and .candidate_window == 90 and .recovery == \"timeout\" and .recovery_exit == 4 and .recovery_window == 180 and .serving == \"dead\" and .serving_pid == null and .previous_pid == 3999999 and .previous_alive == false" <<<"$FIN_OUTCOME" >/dev/null'
+ok "double failure says no live bridge in plain text" 'grep -q "NO live bridge process" "$OUT" && grep -q "Previously serving PID 3999999: dead" "$OUT"'
+finish_case 4 4 1 alive
+ok "double failure distinguishes a still-starting bridge" \
+   'jq -e --argjson p "$FIN_LIVE" ".serving == \"alive\" and .serving_pid == \$p" <<<"$FIN_OUTCOME" >/dev/null && grep -q "alive but NOT available" "$OUT"'
+finish_case 2 2 1 available
+okc "$RC" 8 "start-error candidate + start-error recovery exits 8"
+okc "$(cat "$TMP/fin-project/recovery.env")" 90 "start-error candidate keeps the 90s recovery window"
+ok "start-error outcome is distinguishable from timeout" \
+   'jq -e ".candidate == \"start-error\" and .candidate_exit == 2 and .recovery == \"start-error\" and .serving == \"available\"" <<<"$FIN_OUTCOME" >/dev/null'
+finish_case 4 0 1 alive
+okc "$RC" 8 "unverified recovery still exits 8"
+ok "unverified recovery is not reported as a timeout" 'jq -e ".recovery == \"unverified\" and .recovery_exit == 4" <<<"$FIN_OUTCOME" >/dev/null'
+finish_case 4 0 0 available
+okc "$RC" 7 "verified recovery exits 7"
+ok "recovered outcome keeps the candidate timeout cause" \
+   'jq -e ".candidate == \"timeout\" and .recovery == \"recovered\" and .recovery_exit == 0 and .serving == \"available\"" <<<"$FIN_OUTCOME" >/dev/null'
+kill "$FIN_LIVE" 2>/dev/null
 
 # ---- stop refusal: report + refuse to start on top --------------------------
 # BASH_ENV seam: make one fake pid report alive to kill -0 and immune to

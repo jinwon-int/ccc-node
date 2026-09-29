@@ -232,11 +232,42 @@ and service configuration are not restored; keep configuration compatible with
 both retained generations. This is an observation of retained owner-controlled
 artifacts, not an immutable-source or loaded-package attestation.
 
+Readiness windows (#1868). The candidate waits
+`CCC_BRIDGE_RESTART_READY_TIMEOUT` seconds for `available` (default 90, and
+180 on Termux per the #1868 owner decision; integer 1..3600; an invalid value
+is refused before anything is stopped).
+When the candidate failed by readiness **timeout**, the recovery attempt gets
+`max(2 × candidate window, 180s)` — the usual cause is a slow device, not a
+bad head, and the same window would fail the recovery for the same reason.
+On Termux that is 360s by default. After a start error the recovery keeps
+the candidate window.
+`CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT` overrides the recovery window for
+any cause. The window reaches the retained previous `start.sh` through
+`CCC_BRIDGE_RESTART_READY_TIMEOUT`, which older sources already honor.
+
 Budget external watchdogs for **both** candidate and possible recovery
 validation, drains, launches and readiness waits. The self-updater's default
-180-second external command budget may be insufficient; explicitly measure
-and configure the linked restart command budget. The controller does not
-silently extend an outer deadline or resume after it is killed.
+external command budget is 180 seconds (720 on Termux, sized for the 180s
+candidate + 360s recovery windows plus stop/validation overhead and the 60s
+margin below); an explicit `CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS`
+still wins, so remove or raise an older explicit Termux value such as 360.
+The controller does not silently extend an outer deadline or resume after it
+is killed. When the caller exports `CCC_BRIDGE_RESTART_DEADLINE_EPOCH` (the
+self-updater does), the recovery window shrinks to end 60 seconds before it
+(floor 1s): the watchdog kills the whole process group, including a recovery
+bridge that is still starting, whereas an early readiness verdict only reports
+failure and leaves that process running.
+
+Every launch-attempted failure (exit `2`/`4` without recovery options, `7`,
+`8`) prints one line
+`ccc-restart-outcome: {"schema":"ccc.restart-outcome.v1",...}` with the
+candidate and recovery causes (`timeout`, `start-error`, `unverified`,
+`recovered`, ...), exit codes, windows, the previously serving PID and whether
+it is alive, and `serving`: `available`, `alive` (a bridge process lives but
+generic status is not available) or `dead` (no live bridge process — the
+service is down). The self-updater records it in its audit as `failure_kind`
+plus `restart_outcome` (the `result` field is unchanged) and names the serving
+state in its notification.
 
 ### Offline recovery rehearsal
 

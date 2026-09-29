@@ -1224,14 +1224,146 @@ cleanup_token_lock_if_safe() {
 #   3  supervisor-managed (systemd/launchd owns the bridge; restart it there)
 #   4  not-available-within-timeout
 #   5  self-invoked       (caller is inside the target bridge process tree)
+#   6  refused before stop (preflight, prepared runtime, invalid window value)
 #
-# Test seams (defaults preserve production behavior):
+# Operator knobs (#1868; defaults preserve production behavior):
+#   CCC_BRIDGE_RESTART_READY_TIMEOUT  seconds to wait for "available" (90;
+#       180 on Termux per the #1868 owner decision; integer 1..3600,
+#       validated before anything is stopped)
+#   CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT  "available" window for the
+#       one-shot --recovery-source attempt (integer 1..3600). Unset: when the
+#       candidate failed by readiness TIMEOUT the recovery gets
+#       max(2 x candidate window, 180s) — the cause is usually a slow device,
+#       not a bad head, and recovery exists for service continuity; after a
+#       start error it keeps the candidate window (unchanged behavior).
+#   CCC_BRIDGE_RESTART_DEADLINE_EPOCH  optional outer watchdog deadline (epoch
+#       seconds; ccc-self-update exports it). The recovery window is shrunk to
+#       end 60s before it (floor 1s): the watchdog's process-group kill would
+#       also take the recovery bridge, an early readiness verdict does not.
+# Test seams:
 #   CCC_BRIDGE_RESTART_STOP_TIMEOUT   seconds to wait for old-process exit (15)
-#   CCC_BRIDGE_RESTART_READY_TIMEOUT  seconds to wait for "available" (90)
 #   CCC_BRIDGE_RESTART_SPAWN          start command override (this start.sh)
+#
+# Launch-attempted failures print one machine-readable line for callers such
+# as ccc-self-update (#1868):
+#   ccc-restart-outcome: {"schema":"ccc.restart-outcome.v1","candidate":...}
+# (exactly one per controller run: the nested recovery run is told to stay quiet
+# via CCC_BRIDGE_RESTART_SUPPRESS_OUTCOME=1; callers still take the last line)
+# candidate/recovery kinds: timeout | start-error | stop-failed | rejected |
+# unverified | not-configured | recovered | exit-<n>; serving: available |
+# alive (a bridge process lives but is not available) | dead (none alive).
 
 RESTART_OLD_PID=""
 RESTART_OLD_SUPERVISOR_PID=""
+RESTART_READY_DEFAULT=90
+# Owner decision on #1868 (option 3): Termux devices get a 180s default.
+RESTART_READY_DEFAULT_TERMUX=180
+RESTART_READY_TIMEOUT="$RESTART_READY_DEFAULT"
+RESTART_RECOVERY_MIN_WINDOW=180
+# Reserve for the recovery's own stop/validation/launch inside an outer deadline.
+RESTART_DEADLINE_MARGIN=60
+
+restart_is_termux() {
+    [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]
+}
+
+restart_window_valid() { # <value> — integer seconds 1..3600, no leading zero
+    [[ "$1" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$1" -le 3600 ]
+}
+
+# Validate the operator window knobs; called before anything is stopped.
+restart_resolve_windows() {
+    local default="$RESTART_READY_DEFAULT"
+    restart_is_termux && default="$RESTART_READY_DEFAULT_TERMUX"
+    RESTART_READY_TIMEOUT="${CCC_BRIDGE_RESTART_READY_TIMEOUT:-$default}"
+    if ! restart_window_valid "$RESTART_READY_TIMEOUT"; then
+        echo "❌ Restart refused before stop: CCC_BRIDGE_RESTART_READY_TIMEOUT must be an integer in 1..3600 (got '${CCC_BRIDGE_RESTART_READY_TIMEOUT}')."
+        return 1
+    fi
+    if [ -n "${CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT:-}" ] \
+        && ! restart_window_valid "$CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT"; then
+        echo "❌ Restart refused before stop: CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT must be an integer in 1..3600 (got '${CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT}')."
+        return 1
+    fi
+    return 0
+}
+
+# Recovery "available" window after a failed candidate (#1868). A candidate
+# that TIMED OUT most likely met a slow device, and the retained recovery would
+# fail the same window for the same reason; give it a longer one. Other
+# candidate failures keep the candidate window unless the operator set one.
+restart_recovery_window() { # <candidate-rc>
+    local candidate="$RESTART_READY_TIMEOUT" window deadline remaining
+    if [ -n "${CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT:-}" ] \
+        && restart_window_valid "$CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT"; then
+        window="$CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT"
+    elif [ "$1" = 4 ]; then
+        window=$((candidate * 2))
+        [ "$window" -ge "$RESTART_RECOVERY_MIN_WINDOW" ] || window="$RESTART_RECOVERY_MIN_WINDOW"
+    else
+        window="$candidate"
+    fi
+    # Stay inside an outer watchdog. Its kill takes the whole process group —
+    # including the freshly spawned recovery bridge — whereas a readiness
+    # window that ends early only reports failure and leaves that process
+    # running. So the deadline wins, down to a 1s floor.
+    deadline="${CCC_BRIDGE_RESTART_DEADLINE_EPOCH:-}"
+    if [[ "$deadline" =~ ^[1-9][0-9]{0,11}$ ]]; then
+        remaining=$((deadline - $(date -u +%s) - RESTART_DEADLINE_MARGIN))
+        if [ "$remaining" -lt "$window" ]; then
+            window="$remaining"
+            [ "$window" -ge 1 ] || window=1
+        fi
+    fi
+    printf '%s\n' "$window"
+}
+
+restart_failure_kind() { # <rc>
+    case "$1" in
+        1) echo stop-failed ;;
+        2) echo start-error ;;
+        4) echo timeout ;;
+        6) echo rejected ;;
+        *) echo "exit-$1" ;;
+    esac
+}
+
+# Who serves after a launch-attempted failure: "available <pid>", "alive <pid>"
+# or "dead". Read-only (never signals, never cleans the PID file).
+restart_serving_state() {
+    local pid
+    pid="$(read_pid)"
+    [ -n "$pid" ] || pid="$(find_project_bot_pids 2>/dev/null | head -n1)"
+    if [ -n "$pid" ] && stop_pid_alive "$pid"; then
+        if [ "$(read_pid)" = "$pid" ] && render_status_from_health "$HEALTH_FILE" "$pid" \
+            "$HEALTH_STALE_SECONDS" "$(configured_agent_provider)" 2>/dev/null \
+            | grep -q "Bot status: available"; then
+            printf 'available %s\n' "$pid"
+        else
+            printf 'alive %s\n' "$pid"
+        fi
+    else
+        printf 'dead\n'
+    fi
+}
+
+# <candidate-rc> <candidate-window> <recovery-kind> <recovery-rc|null> <recovery-window|null>
+emit_restart_outcome() {
+    local serving="" serving_pid="" previous_alive=false
+    read -r serving serving_pid < <(restart_serving_state)
+    [ -n "$RESTART_OLD_PID" ] && stop_pid_alive "$RESTART_OLD_PID" && previous_alive=true
+    case "$serving" in
+        available) echo "   Serving now: bridge PID $serving_pid is alive and available." ;;
+        alive) echo "   Serving now: bridge PID $serving_pid is alive but NOT available (still starting or stuck)." ;;
+        *) echo "   Serving now: NO live bridge process — the service is down." >&2 ;;
+    esac
+    echo "   Previously serving PID ${RESTART_OLD_PID:-none}: $([ "$previous_alive" = true ] && echo alive || echo dead)."
+    # A nested recovery run leaves the one record to its controller.
+    [ "${CCC_BRIDGE_RESTART_SUPPRESS_OUTCOME:-}" = 1 ] && return 0
+    printf 'ccc-restart-outcome: {"schema":"ccc.restart-outcome.v1","candidate":"%s","candidate_exit":%d,"candidate_window":%d,"recovery":"%s","recovery_exit":%s,"recovery_window":%s,"serving":"%s","serving_pid":%s,"previous_pid":%s,"previous_alive":%s}\n' \
+        "$(restart_failure_kind "$1")" "$1" "$2" "$3" "${4:-null}" "${5:-null}" \
+        "${serving:-dead}" "${serving_pid:-null}" "${RESTART_OLD_PID:-null}" "$previous_alive"
+}
 
 restart_status_snapshot() {
     # do_status exits, so run it in a subshell to reuse it as a probe.
@@ -1268,22 +1400,37 @@ verify_previous_serving() { # <earliest-process-start>
 }
 
 finish_prepared_restart_failure() { # Only after old stop completed and launch was attempted.
-    local candidate_rc="$1" recovery_rc=0 recovery_boundary
-    [ -n "$TRANSITION_RUN" ] || exit "$candidate_rc"
+    local candidate_rc="$1" recovery_rc=0 recovery_boundary recovery_window recovery_kind
+    if [ -z "$TRANSITION_RUN" ]; then
+        emit_restart_outcome "$candidate_rc" "$RESTART_READY_TIMEOUT" not-configured "" ""
+        exit "$candidate_rc"
+    fi
     transition_phase candidate_failed "$candidate_rc"
-    echo "↩️  Candidate failed; attempting the explicitly retained previous source/runtime once."
+    # The retained previous start.sh already honors
+    # CCC_BRIDGE_RESTART_READY_TIMEOUT, so the window is passed through the
+    # environment rather than a flag the older source may not know.
+    recovery_window="$(restart_recovery_window "$candidate_rc")"
+    echo "↩️  Candidate failed ($(restart_failure_kind "$candidate_rc")); attempting the explicitly retained previous source/runtime once (available window ${recovery_window}s; candidate had ${RESTART_READY_TIMEOUT}s)."
     recovery_boundary="$(date -u +%s)"
     local recovery_args=(--path "$PROJECT_ROOT" --prepared-runtime "$RECOVERY_RUNTIME" --restart)
     [ "$DAEMON_MODE" -eq 0 ] || recovery_args+=(--daemon)
-    bash "$RECOVERY_SOURCE/start.sh" "${recovery_args[@]}" || recovery_rc=$?
+    CCC_BRIDGE_RESTART_READY_TIMEOUT="$recovery_window" CCC_BRIDGE_RESTART_SUPPRESS_OUTCOME=1 \
+        bash "$RECOVERY_SOURCE/start.sh" "${recovery_args[@]}" || recovery_rc=$?
     if [ "$recovery_rc" -eq 0 ] && verify_previous_serving "$recovery_boundary"; then
         transition_phase recovered "$candidate_rc"
         echo "⚠️  Candidate update failed; previous prepared generation restored. Evidence: $TRANSITION_RUN"
+        emit_restart_outcome "$candidate_rc" "$RESTART_READY_TIMEOUT" recovered 0 "$recovery_window"
         exit 7
     fi
-    [ "$recovery_rc" -ne 0 ] || recovery_rc=4
+    if [ "$recovery_rc" -eq 0 ]; then
+        recovery_rc=4
+        recovery_kind=unverified
+    else
+        recovery_kind="$(restart_failure_kind "$recovery_rc")"
+    fi
     transition_phase recovery_failed "$recovery_rc"
     echo "❌ Candidate and recovery failed; retain both environments and inspect: $TRANSITION_RUN" >&2
+    emit_restart_outcome "$candidate_rc" "$RESTART_READY_TIMEOUT" "$recovery_kind" "$recovery_rc" "$recovery_window"
     exit 8
 }
 
@@ -1294,8 +1441,8 @@ do_restart() {
     # busy with a concurrent Claude worker, even though the supervisor's own
     # respawn brought the bot up healthy ~2min later on its own. The restart
     # call had already reported failure by then, so it read as a stale-code
-    # incident until a live check showed the process was fine.
-    local ready_timeout="${CCC_BRIDGE_RESTART_READY_TIMEOUT:-90}"
+    # incident until a live check showed the process was fine. The window is
+    # RESTART_READY_TIMEOUT, validated by restart_resolve_windows (#1868).
     local spawn_cmd="${CCC_BRIDGE_RESTART_SPAWN:-$SCRIPT_DIR/start.sh}"
     # The spawn target is executed directly, so it depends on its shebang
     # resolving. `start.sh` declares `#!/bin/bash`, and Termux has neither
@@ -1351,6 +1498,7 @@ do_restart() {
     # Pre-flight BEFORE touching the running bot: fail while the old instance
     # is still up rather than after the stop (the 2026-07-19 mode where the
     # bot stayed down because the start half could not resolve its token).
+    restart_resolve_windows || exit 6
     if [ -n "$RECOVERY_SOURCE" ]; then
         TRANSITION_RUN="$(python3 -I -B "$SCRIPT_DIR/prepared_transition.py" begin \
             --root "$BOT_DATA_DIR/runtime-transitions" --candidate-source "$SCRIPT_DIR" \
@@ -1377,7 +1525,7 @@ do_restart() {
     # Ordinary Termux restarts used to discover incompatible installed wheels
     # only after stopping a healthy bridge (#1577). Observe the selected venv;
     # never install or repair packages underneath the running process.
-    if [ -z "$PREPARED_RUNTIME" ] && { [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]; }; then
+    if [ -z "$PREPARED_RUNTIME" ] && restart_is_termux; then
         if ! "$VENV_DIR/bin/python" -I -B "$SCRIPT_DIR/restart_preflight.py" \
             --bridge-dir "$SCRIPT_DIR" --venv-dir "$VENV_DIR" --project-env "$ENV_FILE" \
             "--process-unlocked=$DEPS_UNLOCKED_PROCESS"; then
@@ -1456,7 +1604,7 @@ do_restart() {
     # health snapshot renders "available".
     waited=0
     ready=0
-    while [ "$waited" -lt "$ready_timeout" ]; do
+    while [ "$waited" -lt "$RESTART_READY_TIMEOUT" ]; do
         if [ -n "$PREPARED_RUNTIME" ]; then
             new_pid="$(read_pid)"
             if [ -n "$new_pid" ] && [ "$new_pid" != "$RESTART_OLD_PID" ] \
@@ -1484,7 +1632,7 @@ do_restart() {
     done
 
     if [ "$ready" -ne 1 ]; then
-        echo "❌ Restart failed: not-available-within-timeout (${ready_timeout}s)"
+        echo "❌ Restart failed: not-available-within-timeout (${RESTART_READY_TIMEOUT}s)"
         if [ -n "$PREPARED_RUNTIME" ]; then
             echo "   Selected prepared generation was not verified in a fresh serving process."
         fi

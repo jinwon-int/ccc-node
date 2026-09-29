@@ -56,8 +56,16 @@
 #      CCC_SELF_UPDATE_AUTO_RECOVER (default 1; 0 restores the unconditional
 #      wrong-branch fail-closed abort, #1328),
 #      CCC_SELF_UPDATE_SYSTEMCTL (default systemctl; tests inject a fake),
-#      CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS (180; integer 1..900),
+#      CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS (180, 720 on Termux;
+#      integer 1..900. Termux: the #1868 owner decision gives the bridge a 180s
+#      candidate window and a 360s recovery window after a candidate timeout;
+#      720 = both plus stop/validation overhead and the 60s recovery margin),
 #      CCC_SELF_UPDATE_RESTART_WAIT_SECONDS (60; separate health-probe budget),
+#      The restart command receives CCC_BRIDGE_RESTART_DEADLINE_EPOCH (this
+#      budget's end) so a bridge recovery attempt can size itself to fit
+#      (#1868). Bridge "available" windows are the bridge's own knobs
+#      (CCC_BRIDGE_RESTART_READY_TIMEOUT / _RECOVERY_READY_TIMEOUT); put them
+#      in the restart-cmd line when a slow device needs more than the default.
 #      CCC_STATE_DIR, CCC_PUSH_SPOOL, CCC_NODE,
 #      CCC_SELF_UPDATE_FLOCK (flock(1) probe for a foreign regular-file lock, #1945).
 #      Pending-activation evaluation (#1527): CCC_SELF_UPDATE_SERVING_GENERATION_CMD
@@ -81,6 +89,11 @@
 #      was never verified active — a pending-activation record exists (or its
 #      bookkeeping failed) and the tick refuses to report convergence from
 #      health alone; other non-zero = aborted (reason logged).
+# Audit records keep `result` unchanged; an external restart failure adds
+#      `failure_kind` (timeout | start-error | stop-failed | rejected |
+#      command-timeout | health-timeout | command-failed | ...) and a
+#      `restart_outcome` object (candidate/recovery kinds, exit codes, windows,
+#      and whether a bridge is still serving: available | alive | dead) (#1868).
 set -uo pipefail
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
@@ -95,7 +108,11 @@ REPO_FILE="$CLAUDE_DIR/self-update.repo"
 RESTART_CMD_FILE="${CCC_SELF_UPDATE_RESTART_CMD_FILE:-$CLAUDE_DIR/self-update.restart-cmd}"
 HEALTH_CMD_FILE="${CCC_SELF_UPDATE_HEALTH_CMD_FILE:-$CLAUDE_DIR/self-update.health-cmd}"
 RESTART_WAIT_SECONDS="${CCC_SELF_UPDATE_RESTART_WAIT_SECONDS:-60}"
-RESTART_COMMAND_TIMEOUT_SECONDS="${CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS-180}"
+RESTART_COMMAND_TIMEOUT_DEFAULT=180
+if [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]; then
+  RESTART_COMMAND_TIMEOUT_DEFAULT=720
+fi
+RESTART_COMMAND_TIMEOUT_SECONDS="${CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS-$RESTART_COMMAND_TIMEOUT_DEFAULT}"
 BRANCH="${CCC_SELF_UPDATE_BRANCH:-main}"
 SYSTEMCTL="${CCC_SELF_UPDATE_SYSTEMCTL:-systemctl}"
 
@@ -221,10 +238,16 @@ notify() { # <text> <dedup-suffix>
     > "$fname" 2>/dev/null || rm -f "$fname" 2>/dev/null
 }
 
-audit() { # <result> <old> <new> <changed> <setup_ok> <services-json>
+audit() { # <result> <old> <new> <changed> <setup_ok> <services-json> [extra-object-json]
+  # The optional extra object only ADDS keys (e.g. failure_kind, #1868); the
+  # base fields always win so existing consumers of `result` keep working.
+  local extra="${7:-}"
+  [ -n "$extra" ] || extra='{}'
   jq -nc --arg ts "$(ts)" --arg result "$1" --arg old "$2" --arg new "$3" \
     --argjson changed "$4" --argjson setup_ok "$5" --argjson services "$6" \
-    '{ts:$ts, result:$result, old:$old, new:$new, changed:$changed, setup_ok:$setup_ok, services:$services}' \
+    --argjson extra "$extra" \
+    '(if ($extra|type) == "object" then $extra else {} end)
+     + {ts:$ts, result:$result, old:$old, new:$new, changed:$changed, setup_ok:$setup_ok, services:$services}' \
     2>/dev/null >> "$LOG" || :
 }
 
@@ -354,20 +377,91 @@ run_bounded_operator_cmd() { # <seconds> <command>
   timeout --kill-after=1 "$1" bash -c "$2" >>"$LOG" 2>&1
 }
 
+RESTART_FAILURE_JSON=""
+
+# Classify a failed external restart (#1868). Timeouts and start errors used to
+# be indistinguishable in the audit (both only `result:"restart-failures"`).
+# The bridge restart controller prints one `ccc-restart-outcome:` JSON line on
+# launch-attempted failures; any other restart command falls back to the
+# watchdog/exit-code classes. Values are re-validated, never trusted verbatim.
+record_restart_failure() { # <rc> <log-offset-bytes> [health-timeout]
+  local rc="$1" offset="$2" kind outcome
+  case "$rc" in
+    124|137) kind="command-timeout" ;;
+    125) kind="command-unavailable" ;;
+    *) kind="command-failed" ;;
+  esac
+  [ "${3:-}" = "health-timeout" ] && kind="health-timeout"
+  outcome="$(tail -c +"$((offset + 1))" "$LOG" 2>/dev/null \
+    | sed -n 's/^ccc-restart-outcome: //p' | tail -n 1)"
+  RESTART_FAILURE_JSON="$(jq -nc --argjson rc "$rc" --arg kind "$kind" --arg outcome "$outcome" '
+    def tok: if type == "string" and test("^[a-z0-9-]{1,32}$") then . else null end;
+    def int: if type == "number" and . >= 0 and . == floor then . else null end;
+    (try ($outcome | fromjson) catch null) as $o
+    | if ($o | type) == "object" and $o.schema == "ccc.restart-outcome.v1" then
+        {failure_kind: (if $kind == "command-timeout" or $kind == "health-timeout" then $kind
+                        else (($o.candidate | tok) // $kind) end),
+         restart_outcome: {restart_exit: $rc,
+           candidate: ($o.candidate | tok), candidate_exit: ($o.candidate_exit | int),
+           candidate_window: ($o.candidate_window | int),
+           recovery: ($o.recovery | tok), recovery_exit: ($o.recovery_exit | int),
+           recovery_window: ($o.recovery_window | int),
+           serving: ($o.serving | tok), serving_pid: ($o.serving_pid | int),
+           previous_pid: ($o.previous_pid | int),
+           previous_alive: (if ($o.previous_alive | type) == "boolean" then $o.previous_alive else null end)}}
+      else
+        {failure_kind: $kind, restart_outcome: {restart_exit: $rc}}
+      end' 2>/dev/null)" || RESTART_FAILURE_JSON=""
+  [ -n "$RESTART_FAILURE_JSON" ] || RESTART_FAILURE_JSON="$(jq -nc --argjson rc "$rc" --arg kind "$kind" \
+    '{failure_kind: $kind, restart_outcome: {restart_exit: $rc}}' 2>/dev/null)"
+  log "external-restart failure $(printf '%s' "$RESTART_FAILURE_JSON" | jq -r '
+    "failure_kind=\(.failure_kind) recovery=\(.restart_outcome.recovery // "unknown") serving=\(.restart_outcome.serving // "unknown") serving_pid=\(.restart_outcome.serving_pid // "none")"' 2>/dev/null)"
+}
+
+# Korean one-liner for the notification: cause, recovery result, and — the
+# operator's first question — whether any bridge is still serving.
+restart_failure_summary() {
+  [ -n "$RESTART_FAILURE_JSON" ] || return 0
+  printf '%s' "$RESTART_FAILURE_JSON" | jq -r --arg budget "$RESTART_COMMAND_TIMEOUT_SECONDS" '
+    .restart_outcome as $r
+    | def win(w): if w == null then "" else " \(w)s" end;
+    ([ (if .failure_kind == "timeout" then "원인: 후보가 available 대기 시간 초과\(win($r.candidate_window))"
+        elif .failure_kind == "start-error" then "원인: 후보 기동 오류(available 전 프로세스 종료/기동 실패)"
+        elif .failure_kind == "command-timeout" then "원인: 재시작 명령이 전체 제한시간 \($budget)s 초과로 중단됨"
+        elif .failure_kind == "health-timeout" then "원인: 재시작 후 health 확인 시간 초과"
+        else "원인: \(.failure_kind) (종료 코드 \($r.restart_exit))" end),
+       (if $r.recovery == null or $r.recovery == "not-configured" then empty
+        elif $r.recovery == "recovered" then "직전 세대 복구됨"
+        elif $r.recovery == "timeout" then "복구본도 available 대기 시간 초과\(win($r.recovery_window))"
+        else "복구 실패(\($r.recovery))" end),
+       (if $r.serving == "available" then "현재 브리지 PID \($r.serving_pid) 서빙 중(available)"
+        elif $r.serving == "alive" then "브리지 PID \($r.serving_pid) 살아 있으나 available 아님"
+        elif $r.serving == "dead" then "살아 있는 브리지 프로세스 없음 — 서비스 중단 상태"
+        else "서빙 상태 미확인" end)
+     ] | join("; "))' 2>/dev/null
+}
+
 # Run the operator's external restart command INSIDE the audit/notify boundary.
 # Restart must succeed, then health-cmd must pass within a wall-time budget.
 # RESTART_WAIT_SECONDS includes probe execution and retry sleeps; timeout may
 # use one extra second to kill TERM-resistant descendants in its process group.
 run_external_restart() {
-  local rcmd hcmd rc deadline remaining pause started
+  local rcmd hcmd rc deadline remaining pause started log_offset
+  RESTART_FAILURE_JSON=""
   rcmd="$(resolve_restart_cmd)" || return 1
   hcmd="$(resolve_health_cmd || true)"
   started=$SECONDS
+  log_offset="$(wc -c < "$LOG" 2>/dev/null | tr -cd '0-9')"
+  [ -n "$log_offset" ] || log_offset=0
   log "external-restart begin timeout=${RESTART_COMMAND_TIMEOUT_SECONDS}s"
-  run_bounded_operator_cmd "$RESTART_COMMAND_TIMEOUT_SECONDS" "$rcmd"
+  CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$(( $(date -u +%s) + RESTART_COMMAND_TIMEOUT_SECONDS ))" \
+    run_bounded_operator_cmd "$RESTART_COMMAND_TIMEOUT_SECONDS" "$rcmd"
   rc=$?
   log "external-restart exit=$rc elapsed=$((SECONDS - started))s timeout=${RESTART_COMMAND_TIMEOUT_SECONDS}s"
-  [ "$rc" -eq 0 ] || return "$rc"
+  if [ "$rc" -ne 0 ]; then
+    record_restart_failure "$rc" "$log_offset"
+    return "$rc"
+  fi
   if [ -n "$hcmd" ]; then
     started=$SECONDS
     deadline=$((started + RESTART_WAIT_SECONDS))
@@ -385,6 +479,7 @@ run_external_restart() {
       sleep "$pause"
     done
     log "external-restart health-timeout waited=$((SECONDS - started))s"
+    record_restart_failure 0 "$log_offset" health-timeout
     return 1
   fi
   return 0
@@ -974,8 +1069,9 @@ if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
       # Refine the retained evidence with the failed recovery attempt.
       write_pending_activation "recovery-restart-failed" '[{"name":"external-restart","ok":false,"scope":"external"}]' "" || exit 14
     fi
-    audit "runtime-down" "$OLD_SHA" "$NEW_SHA" "$CHANGED" true '[{"name":"external-restart","ok":false,"scope":"external"}]'
-    notify "self-update ${SHORT_CUR} 경고: 코드는 최신이나 런타임이 다운 상태이며 복구 재시작도 실패했습니다. 브리지가 남아있는지 즉시 확인 필요. ~/.claude/state/self-update.log" "runtime-down-$NEW_SHA"
+    audit "runtime-down" "$OLD_SHA" "$NEW_SHA" "$CHANGED" true '[{"name":"external-restart","ok":false,"scope":"external"}]' "$RESTART_FAILURE_JSON"
+    FAILURE_SUMMARY="$(restart_failure_summary)"
+    notify "self-update ${SHORT_CUR} 경고: 코드는 최신이나 런타임이 다운 상태이며 복구 재시작도 실패했습니다${FAILURE_SUMMARY:+ (${FAILURE_SUMMARY})}. 브리지가 남아있는지 즉시 확인 필요. ~/.claude/state/self-update.log" "runtime-down-$NEW_SHA"
     say "self-update: code up to date but runtime is DOWN and the recovery restart failed" >&2
     exit 7
   fi
@@ -1210,9 +1306,10 @@ if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && [ "$RESTARTED" -eq 0 ];
       KEEP_INSTALL_SNAPSHOT=1
       SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c '. + [{"name":"external-restart","ok":false,"scope":"external"}]')"
       write_pending_activation "external-restart-failed" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
-      audit "restart-failures" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
+      audit "restart-failures" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON" "$RESTART_FAILURE_JSON"
       log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=external-restart-failure"
-      notify "self-update ${SHORT_NEW}: 코드 갱신 후 외부 재시작 명령이 실패했습니다 — 브리지가 남아있는지 즉시 확인 필요. 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log" "fail-$NEW_SHA"
+      FAILURE_SUMMARY="$(restart_failure_summary)"
+      notify "self-update ${SHORT_NEW}: 코드 갱신 후 외부 재시작 명령이 실패했습니다${FAILURE_SUMMARY:+ (${FAILURE_SUMMARY})} — 브리지가 남아있는지 즉시 확인 필요. 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log" "fail-$NEW_SHA"
       say "self-update: updated to $SHORT_NEW but the external restart command failed; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
       exit 7
     fi
