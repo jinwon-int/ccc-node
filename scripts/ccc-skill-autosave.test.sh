@@ -711,9 +711,9 @@ run15() { # <state> [env...]
     CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=0 CCC_SKILL_AUTOSAVE_MAX_SESSIONS=3 CCC_NODE=testnode \
     "$@" bash "$AUTOSAVE" run
 }
-run15 "$TMP/state15a"
-ok "#1824: without a total cap every branch keeps its own budget" \
-  'grep -q "sweep done drafted_sessions=2 codex_drafted=1 .*total_drafted=3 max_sessions_per_branch=3 total_max_sessions=0" "$TMP/state15a/skill-autosave.log" && ! grep -q "budget-stop" "$TMP/state15a/skill-autosave.log"'
+run15 "$TMP/state15a" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=0
+ok "#1824/#1647: an explicit 0 opts out of the total cap (every branch keeps its own budget)" \
+  'grep -q "sweep done drafted_sessions=2 codex_drafted=1 .*total_drafted=3 max_sessions_per_branch=3 total_max_sessions=0 total_max_source=env" "$TMP/state15a/skill-autosave.log" && ! grep -q "budget-stop" "$TMP/state15a/skill-autosave.log"'
 run15 "$TMP/state15b" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=2
 ok "#1824: the total cap stops later branches once the sum is spent" \
   'grep -q "sweep done drafted_sessions=2 codex_drafted=0 .*total_drafted=2 .*total_max_sessions=2" "$TMP/state15b/skill-autosave.log"'
@@ -721,9 +721,38 @@ ok "#1824: a capped branch says so instead of looking idle" \
   'grep -q "codex budget-stop reason=total-max-sessions total_max=2" "$TMP/state15b/skill-autosave.log"'
 ok "#1824: the capped rollout is not ledgered (drafted on a later run)" \
   '! grep -q "^rollout-2026-08-31T09-00-00-aaaa-bbbb	" "$TMP/state15b/skill-autosave.codex-seen" 2>/dev/null'
-run15 "$TMP/state15c" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=garbage
-ok "#1824: a malformed total cap means no cap" \
-  'grep -q "total_drafted=3 .*total_max_sessions=0" "$TMP/state15c/skill-autosave.log"'
+
+# #1647 (owner decision 2026-09-29): unset now means a combined cap of 3. Four
+# eligible transcripts (3 claude + 1 codex) would draft 4 without it.
+PROJECTS15D="$TMP/projects15d"
+make_transcript "$PROJECTS15D/-root--work/sess-a.jsonl" 6
+make_transcript "$PROJECTS15D/-root--work/sess-b.jsonl" 6
+make_transcript "$PROJECTS15D/-root--work/sess-c.jsonl" 6
+run15 "$TMP/state15d" CLAUDE_PROJECTS_DIR="$PROJECTS15D"
+ok "#1647: unset total cap defaults to 3 across branches" \
+  'grep -q "sweep done drafted_sessions=3 codex_drafted=0 .*total_drafted=3 .*total_max_sessions=3 total_max_source=default" "$TMP/state15d/skill-autosave.log"'
+ok "#1647: the default cap stops the later branch visibly" \
+  'grep -q "codex budget-stop reason=total-max-sessions total_max=3" "$TMP/state15d/skill-autosave.log"'
+run15 "$TMP/state15e" CLAUDE_PROJECTS_DIR="$PROJECTS15D" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=0
+ok "#1647: the same fixture drafts 4 when the operator opts out with 0 (the default is what capped it)" \
+  'grep -q "sweep done drafted_sessions=3 codex_drafted=1 .*total_drafted=4 .*total_max_sessions=0 total_max_source=env" "$TMP/state15e/skill-autosave.log"'
+run15 "$TMP/state15f" CLAUDE_PROJECTS_DIR="$PROJECTS15D" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=4
+ok "#1647: an explicit value above the default wins" \
+  'grep -q "sweep done drafted_sessions=3 codex_drafted=1 .*total_drafted=4 .*total_max_sessions=4 total_max_source=env" "$TMP/state15f/skill-autosave.log" && ! grep -q "budget-stop" "$TMP/state15f/skill-autosave.log"'
+run15 "$TMP/state15g" CLAUDE_PROJECTS_DIR="$PROJECTS15D" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=1
+ok "#1647: an explicit value below the default wins" \
+  'grep -q "sweep done drafted_sessions=1 codex_drafted=0 .*total_drafted=1 .*total_max_sessions=1 total_max_source=env" "$TMP/state15g/skill-autosave.log"'
+run15 "$TMP/state15c" CLAUDE_PROJECTS_DIR="$PROJECTS15D" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=garbage
+ok "#1647: a malformed total cap falls back to the default cap, never to no cap" \
+  'grep -q "total_drafted=3 .*total_max_sessions=3 total_max_source=default-invalid" "$TMP/state15c/skill-autosave.log"'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_STATE_DIR="$TMP/state15d" bash "$AUTOSAVE" status 2>&1)"
+ok "#1647: status shows the effective drafting budget and its source" \
+  'printf "%s" "$out" | grep -q "^drafting budget: per-branch max=3, total max=3 (source: default;"'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_STATE_DIR="$TMP/state15d" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=0 bash "$AUTOSAVE" status 2>&1)"
+ok "#1647: status names the explicit opt-out" \
+  'printf "%s" "$out" | grep -q "^drafting budget: per-branch max=3, total max=0 (no cap) (source: env;"'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
