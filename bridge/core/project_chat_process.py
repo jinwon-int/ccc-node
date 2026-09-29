@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 import logging
 import re
+import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any, Optional
@@ -74,6 +75,7 @@ from telegram_bot.core.skill_advice import (
 from telegram_bot.utils.chat_logger import log_chat
 from telegram_bot.core.codex_app_server import CodexConnectionClosedError
 from telegram_bot.utils.health import health_reporter
+from telegram_bot.utils.redaction import redact_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +294,16 @@ async def _finalize_request_progress(
         terminal_outcome=terminal_outcome,
         session_id=resolved_session_id,
     )
+
+
+def _raise_site(exc: BaseException) -> str:
+    """``file:line in function`` of the innermost frame, or ``unknown``."""
+
+    frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ else []
+    if not frames:
+        return "unknown"
+    frame = frames[-1]
+    return f"{Path(frame.filename).name}:{frame.lineno} in {frame.name}"
 
 
 def _log_user_input(
@@ -1795,6 +1807,26 @@ class ProjectChatProcessMixin:
                 streaming_handler, context="returning an agent error"
             )
         message = str(exc) or "Agent runtime failed"
+        # #1819: this was the one terminal branch with no log line, so a
+        # provider that failed to start left no trace in bot.log/error_*.log
+        # (the other branches — runtime-error, empty-completion, admission
+        # timeout — all log). Message redacted and bounded; the raise site is
+        # logged instead of a full traceback, whose chained causes are not
+        # redacted and may quote provider transport payloads.
+        logger.error(
+            "Turn failed: provider=%s cause=runtime-exception error=%s: %s at=%s",
+            getattr(getattr(self, "_config", None), "agent_provider", "claude"),
+            type(exc).__name__,
+            redact_credentials(" ".join(message.split()))[:500],
+            _raise_site(exc),
+        )
+        health_reason = getattr(exc, "health_reason", None)
+        if isinstance(health_reason, str) and health_reason:
+            # Startup failures carry a redacted, bounded cause for
+            # health.json agent.last_error; the next successful session start
+            # clears it through the same flag as #1721 below.
+            health_reporter.record_agent_error(health_reason)
+            self._agent_connection_error_reported = True
         if isinstance(exc, CodexConnectionClosedError):
             # #1721: a dead or poisoned app-server transport must show
             # up in /status instead of "Codex: healthy" (the liveness

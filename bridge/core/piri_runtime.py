@@ -45,6 +45,7 @@ from telegram_bot.memory.piri_snapshot import (
     find_piri_session_directory,
     read_piri_snapshot,
 )
+from telegram_bot.utils.redaction import redact_credentials
 from telegram_bot.utils.secure_fs import ensure_private_directory
 
 
@@ -56,6 +57,53 @@ _SESSION_ID_PATTERN = re.compile(
 )
 _MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$")
 logger = logging.getLogger(__name__)
+
+
+class PiriStartupError(RuntimeError):
+    """The Piri process did not come up (#1819).
+
+    ``str()`` stays short and body-free (it is the user-facing text); the
+    redacted cause is logged at the raise site and carried in
+    ``health_reason`` for ``health.json`` ``agent.last_error``. The original
+    exception is not chained: transport errors may carry credentials.
+    """
+
+    def __init__(self, message: str, *, health_reason: str) -> None:
+        super().__init__(message)
+        self.health_reason = health_reason
+
+
+_STARTUP_CAUSE_CHARS = 300
+
+
+async def _startup_failure_diagnostics(client: object) -> tuple[int | None, tuple[str, ...]]:
+    probe = getattr(client, "startup_failure_diagnostics", None)
+    if probe is None:
+        return None, ()
+    try:
+        exit_code, lines = await probe()
+    except Exception:  # a diagnostic must never mask the startup failure
+        logger.debug("Piri startup diagnostics unavailable", exc_info=True)
+        return None, ()
+    return exit_code, tuple(lines)
+
+
+def _startup_error(
+    exc: Exception, exit_code: int | None, stderr_lines: Sequence[str]
+) -> PiriStartupError:
+    cause = redact_credentials(" ".join(str(exc).split()))[:_STARTUP_CAUSE_CHARS]
+    logger.error(
+        "Piri runtime failed to start: exit=%s cause=%s: %s stderr_tail=%s",
+        exit_code,
+        type(exc).__name__,
+        cause,
+        " | ".join(stderr_lines) or "(empty)",
+    )
+    message = "Piri runtime failed to start"
+    if exit_code is not None:
+        message += f" (exit {exit_code})"
+    detail = stderr_lines[-1] if stderr_lines else f"{type(exc).__name__}: {cause}"
+    return PiriStartupError(message, health_reason=f"{message}: {detail}")
 
 
 class PiriClient(Protocol):
@@ -462,7 +510,14 @@ class PiriRuntime:
                         memory_route.context_file,
                     )
                     await client.set_append_system_prompt(content)
-                except Exception:
+                except Exception as exc:
+                    # #1819: same silent-startup shape as _spawn_and_verify —
+                    # keep the redacted cause in the log, not the exception.
+                    logger.error(
+                        "Piri memory bootstrap failed: cause=%s: %s",
+                        type(exc).__name__,
+                        redact_credentials(" ".join(str(exc).split()))[:_STARTUP_CAUSE_CHARS],
+                    )
                     with suppress(Exception):
                         await client.close()
                     raise RuntimeError("Piri memory bootstrap unavailable") from None
@@ -514,10 +569,11 @@ class PiriRuntime:
             with suppress(Exception):
                 await client.close()
             raise
-        except Exception:
+        except Exception as exc:
+            exit_code, stderr_lines = await _startup_failure_diagnostics(client)
             with suppress(Exception):
                 await client.close()
-            raise RuntimeError("Piri runtime failed to start") from None
+            raise _startup_error(exc, exit_code, stderr_lines) from None
 
         session_id = state.get("sessionId")
         if not isinstance(session_id, str) or not session_id:

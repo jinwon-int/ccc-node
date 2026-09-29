@@ -12,10 +12,17 @@ import time
 from typing import Any, TypeAlias, cast
 
 from telegram_bot.core.jsonl_frames import read_jsonl_frame
+from telegram_bot.utils.redaction import redact_credentials
 
 
 JsonObject: TypeAlias = dict[str, Any]
 STDOUT_BUFFER_LIMIT = 16 * 1024 * 1024
+# #1819: the last bytes of stderr are kept (in memory only) so a process that
+# dies during startup can say why. Rendered only through ``stderr_tail()``,
+# which bounds and credential-redacts every line.
+STDERR_TAIL_BYTES = 4096
+STDERR_TAIL_LINES = 8
+STDERR_TAIL_LINE_CHARS = 300
 
 
 class PiriConnectionClosedError(RuntimeError):
@@ -69,6 +76,8 @@ class PiriRpcProcessClient:
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        self._stderr_tail = bytearray()
+        self._stderr_tail_trimmed = False
         self._pending: dict[str, asyncio.Future[Mapping[str, Any]]] = {}
         self._events: asyncio.Queue[Mapping[str, Any] | BaseException] = asyncio.Queue()
         self._write_lock = asyncio.Lock()
@@ -295,13 +304,58 @@ class PiriRpcProcessClient:
             await self._events.put(error)
 
     async def _drain_stderr(self) -> None:
-        """Drain stderr without retaining provider output or possible secrets."""
+        """Drain stderr, keeping only a small in-memory tail (#1819).
+
+        Everything else is discarded as before. The tail is what lets a
+        startup failure name its cause (e.g. the ``ccc-piri`` wrapper's
+        ``real CLI unavailable`` / exit 127) instead of vanishing.
+        """
 
         process = self._process
         if process is None or process.stderr is None:
             return
-        while await process.stderr.read(65536):
-            pass
+        while chunk := await process.stderr.read(65536):
+            self._stderr_tail += chunk
+            if len(self._stderr_tail) > STDERR_TAIL_BYTES:
+                del self._stderr_tail[:-STDERR_TAIL_BYTES]
+                self._stderr_tail_trimmed = True
+
+    def stderr_tail(self) -> tuple[str, ...]:
+        """Last stderr lines, each bounded and credential-redacted."""
+
+        text = bytes(self._stderr_tail).decode("utf-8", "replace")
+        raw_lines = text.splitlines()
+        if self._stderr_tail_trimmed and raw_lines:
+            # The byte cap may have cut the first line mid-way; a truncated
+            # credential fragment could evade the redaction patterns, so drop it.
+            raw_lines = raw_lines[1:]
+        lines = [" ".join(line.split()) for line in raw_lines]
+        lines = [line for line in lines if line][-STDERR_TAIL_LINES:]
+        # Redact BEFORE truncating: cutting first could split a secret at the
+        # boundary and leave a prefix the patterns no longer recognize.
+        return tuple(redact_credentials(line)[:STDERR_TAIL_LINE_CHARS] for line in lines)
+
+    async def startup_failure_diagnostics(
+        self, *, timeout: float = 1.0
+    ) -> tuple[int | None, tuple[str, ...]]:
+        """Exit code and redacted stderr tail after a failed startup (#1819).
+
+        Waits briefly (bounded) for a process that is already going down to
+        exit and for its stderr to reach EOF, so the wrapper's last words are
+        captured before ``close()`` cancels the drain. ``None`` exit code means
+        the process was still running.
+        """
+
+        process = self._process
+        if process is None:
+            return None, ()
+        if process.returncode is None:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(process.wait()), timeout=timeout)
+        task = self._stderr_task
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=timeout)
+        return process.returncode, self.stderr_tail()
 
     async def _handle_extension_ui(self, payload: Mapping[str, Any]) -> None:
         method = payload.get("method")

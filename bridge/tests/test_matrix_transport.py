@@ -684,6 +684,24 @@ async def test_runner_failure_posts_an_error_notice_and_the_next_job_runs(tmp_pa
 
 
 @pytest.mark.anyio
+async def test_runner_failure_is_logged_with_message_and_raise_site(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#1819: the outcome keeps only the type name; the log must keep the cause."""
+
+    caplog.set_level("ERROR")
+    async with running(tmp_path, "raise") as h:
+        f = h.f
+        await f.input(request(f))
+        h.work()
+        await h.until(lambda: f.store.get_meta("last_turn") is not None and f.store.get_meta("last_turn")["outcome"] == "error:RuntimeError")
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Matrix turn failed:")]
+    assert len(lines) == 1
+    assert "error=RuntimeError: synthetic failure" in lines[0]
+    assert "in mode_raise" in lines[0]
+
+
+@pytest.mark.anyio
 async def test_uncertain_result_and_turn_timeout_never_publish_the_answer(tmp_path: Path) -> None:
     async with running(tmp_path, "uncertain", turn_timeout=0.1) as h:
         f = h.f

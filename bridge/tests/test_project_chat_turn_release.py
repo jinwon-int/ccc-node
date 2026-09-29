@@ -222,6 +222,56 @@ def test_codex_connection_closed_marks_transport_health(monkeypatch: pytest.Monk
     asyncio.run(run())
 
 
+def test_exception_is_logged_redacted_with_its_raise_site(caplog: pytest.LogCaptureFixture) -> None:
+    """#1819: the runtime-exception branch was the one terminal path with no log."""
+
+    def raise_it() -> None:
+        raise RuntimeError("boom token=sk-abcdefghijklmnopqrstuvwxyz0123")
+
+    async def run() -> None:
+        try:
+            raise_it()
+        except RuntimeError as exc:
+            await _exception(_Host(), _request(), exc, _Session())
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(run())
+    lines = [r.getMessage() for r in caplog.records if "cause=runtime-exception" in r.getMessage()]
+    assert len(lines) == 1
+    assert "error=RuntimeError: boom" in lines[0]
+    assert "raise_it" in lines[0]
+    assert "sk-abcdefghijklmnopqrstuvwxyz0123" not in caplog.text
+    assert all(r.exc_info is None for r in caplog.records)
+
+
+def test_startup_failure_health_reason_marks_agent_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1819: a startup failure's redacted cause reaches health.json last_error."""
+
+    recorded: list[str] = []
+
+    class _Health:
+        def record_agent_error(self, error: str) -> None:
+            recorded.append(error)
+
+    monkeypatch.setitem(
+        ProjectChatProcessMixin._handle_turn_exception.__globals__, "health_reporter", _Health()
+    )
+
+    class _StartupError(RuntimeError):
+        health_reason = "Piri runtime failed to start (exit 127): ccc-piri: real CLI unavailable"
+
+    async def run() -> None:
+        host = _Host()
+        response = await _exception(
+            host, _request(), _StartupError("Piri runtime failed to start (exit 127)"), None
+        )
+        assert response.content == "❌ Error: Piri runtime failed to start (exit 127)"
+        assert host._agent_connection_error_reported is True
+        assert recorded == [_StartupError.health_reason]
+
+    asyncio.run(run())
+
+
 # --- _release_turn ---------------------------------------------------------
 
 
