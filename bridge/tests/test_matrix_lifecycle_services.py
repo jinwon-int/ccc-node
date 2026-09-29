@@ -296,7 +296,18 @@ async def _recover() -> None:
     return None
 
 
-def test_turn_stall_probe_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_turn_stall_probe_is_on_by_default_at_20_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1741: same default as Telegram — unset means enabled at 20 min."""
+    monkeypatch.delenv("CCC_TURN_STALL_PROBE_MIN", raising=False)
+    chat = SimpleNamespace(_agent_session_registry=SimpleNamespace(active_handles_snapshot=tuple))
+    probe = ml.build_turn_stall_probe(chat, notifier=_notify, recover=_recover)
+    assert probe is not None
+    assert probe._stall_seconds == 20 * 60.0
+
+
+@pytest.mark.parametrize("value", ["0", "-5"])
+def test_turn_stall_probe_explicit_zero_opts_out(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("CCC_TURN_STALL_PROBE_MIN", value)
     chat = SimpleNamespace(_agent_session_registry=SimpleNamespace(active_handles_snapshot=tuple))
     assert ml.build_turn_stall_probe(chat, notifier=_notify, recover=_recover) is None
 

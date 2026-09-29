@@ -1665,7 +1665,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         await recover_dead_session_notifications(*self._dead_session_recovery_args())
 
     def _build_turn_stall_probe(self) -> Any:
-        """Silent-death stall probe (#1112); ``None`` unless ``CCC_TURN_STALL_PROBE_MIN`` > 0."""
+        """Silent-death stall probe (#1112); on by default (20 min), ``=0`` opts out (#1741)."""
 
         return matrix_lifecycle.build_turn_stall_probe(
             self._project_chat,
