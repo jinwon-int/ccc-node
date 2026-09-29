@@ -186,36 +186,47 @@ out="$(HOME="$TMP/home" \
 ok "incomplete scoped paths fail closed before global memory read" '[ "$rc" = 0 ] && grep -q "invalid audience metadata" <<<"$out" && ! grep -q "Node memory: safe fact\|Cached wiki fact\|Cached honcho fact" <<<"$out"'
 
 fakebin="$TMP/bin"; mkdir -p "$fakebin"
-cat > "$fakebin/timeout" <<'SH'
-#!/usr/bin/env bash
+# Stubs go through write_exec_stub: a `#!/usr/bin/env bash` stub cannot exec on
+# Termux (no /usr/bin/env), so the timeout stub below silently failed there
+# while working on Linux CI — the two hosts ran different code paths (#1970).
+write_exec_stub "$fakebin/timeout" <<'SH'
 shift
 exec "$@"
 SH
-chmod +x "$fakebin/timeout"
-cat > "$tools/ccc-memory-index.sh" <<'SH'
-#!/usr/bin/env bash
+# #1970: refresh-memory.sh runs `gh issue list` for the fleet-alert block
+# whenever a gh binary is on PATH (CI runners ship one, unauthenticated), and
+# the timeout stub above strips the deadline — so this no-network suite was
+# reaching the network from every refresh. Same pattern as the freshness suite
+# (#1973): the collect switch is off for every refresh run here, and an
+# unauthenticated-shaped gh stub shadows the host's gh and records any call.
+write_exec_stub "$fakebin/gh" <<'SH'
+printf '%s\n' "${1:-}" >> "${GH_CALL_LOG:?}"
+echo 'gh stub: not authenticated (test fixture)' >&2
+exit 4
+SH
+export GH_CALL_LOG="$TMP/gh-calls.log"
+: > "$GH_CALL_LOG"
+write_exec_stub "$tools/ccc-memory-index.sh" <<'SH'
 exit 0
 SH
-cat > "$tools/ccc-memory-consolidate.sh" <<'SH'
-#!/usr/bin/env bash
+write_exec_stub "$tools/ccc-memory-consolidate.sh" <<'SH'
 exit 0
 SH
-chmod +x "$tools/ccc-memory-index.sh" "$tools/ccc-memory-consolidate.sh"
-out="$(PATH="$fakebin:$PATH" HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_WIKI_AGENT_BIN="$TMP/missing/wiki-agent" bash "$ROOT/claude/hooks/refresh-memory.sh" 2>&1)"; rc=$?
+out="$(PATH="$fakebin:$PATH" HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_WIKI_AGENT_BIN="$TMP/missing/wiki-agent" CCC_FLEET_ALERTS_COLLECT=0 bash "$ROOT/claude/hooks/refresh-memory.sh" 2>&1)"; rc=$?
 ok "refresh-memory exits 0 when the wiki agent is missing" '[ "$rc" = 0 ]'
 ok "refresh-memory writes source meta without network success" 'jq -e ".sources.wiki.status == \"missing\" and .sources.local_index.status == \"ok\"" "$cache/meta.json" >/dev/null'
 ok "refresh-memory lock and meta stay local" '[ -f "$cache/.refresh.lock" ] && [ -f "$cache/.last-refresh" ]'
+ok "refresh-memory skips fleet-alert collection and never calls gh" '[ ! -s "$GH_CALL_LOG" ] && jq -e ".sources.fleet_alerts.status == \"skipped\"" "$cache/meta.json" >/dev/null'
 
-cat > "$fakebin/wiki-agent" <<'SH'
-#!/usr/bin/env bash
+write_exec_stub "$fakebin/wiki-agent" <<'SH'
 printf called > "${WIKI_CALL_MARKER:?}"
 printf 'unexpected wiki payload\n'
 SH
-chmod +x "$fakebin/wiki-agent"
 rm -f "$TMP/wiki-called"
-out="$(PATH="$fakebin:$PATH" WIKI_CALL_MARKER="$TMP/wiki-called" HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_WIKI_AGENT_BIN="$fakebin/wiki-agent" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/claude/hooks/refresh-memory.sh" 2>&1)"; rc=$?
+out="$(PATH="$fakebin:$PATH" WIKI_CALL_MARKER="$TMP/wiki-called" HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_WIKI_AGENT_BIN="$fakebin/wiki-agent" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 CCC_FLEET_ALERTS_COLLECT=0 bash "$ROOT/claude/hooks/refresh-memory.sh" 2>&1)"; rc=$?
 ok "wiki-disabled refresh does not invoke wiki-agent" '[ "$rc" = 0 ] && [ ! -e "$TMP/wiki-called" ]'
 ok "wiki-disabled refresh reports effective disabled status" 'jq -e ".sources.wiki.status == \"disabled\" and .sources.wiki.bytes == 0" "$cache/meta.json" >/dev/null'
+ok "wiki-disabled refresh never calls gh" '[ ! -s "$GH_CALL_LOG" ] && jq -e ".sources.fleet_alerts.status == \"skipped\"" "$cache/meta.json" >/dev/null'
 
 
 
