@@ -371,14 +371,20 @@ def _build_standard_context(
             # .env files that os.environ lacks; an explicit value always wins.
             wrapper_overlay = missing_wrapper_environment(settings, os.environ)
             if process_environment is None:
+                # Without an overlay the runtime keeps inheriting os.environ
+                # exactly as before; only a configured key opts into the
+                # explicit child environment.
+                overlay_kwargs = (
+                    {"process_environment": wrapper_overlay} if wrapper_overlay else {}
+                )
                 return CodexRuntime(
                     cli_path=settings.codex_cli_path,
-                    process_environment=wrapper_overlay or None,
                     working_state_environment=os.environ,
                     memory_materializer_path=settings.codex_memory_materializer_path,
                     memory_bootstrap_timeout_seconds=(
                         settings.codex_memory_bootstrap_timeout_seconds
                     ),
+                    **overlay_kwargs,
                 )
             from telegram_bot.utils.secure_fs import ensure_private_directory
 
