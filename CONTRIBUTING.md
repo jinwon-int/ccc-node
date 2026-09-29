@@ -22,11 +22,31 @@ unpushed one is pinned under `refs/ccc-stray/<branch>/<utc-ts>` first so no
 commit can be orphaned, and the notice tells you where it lives. A dirty tree
 or a `main` held by a linked worktree still require the human path below.
 
-Develop in a separate worktree instead:
+Develop in a separate worktree **outside** the managed checkout instead:
 
 ```bash
 git -C /opt/ccc-node worktree add ~/dev/<slug> -b <type>/<slug> origin/main
 ```
+
+**Never create a worktree INSIDE the managed checkout's directory tree** —
+neither a dev worktree nor an agent one. In particular, do not run Claude Code
+`Agent(isolation: worktree)` from a session whose repository IS the managed
+checkout: it creates `<checkout>/.claude/worktrees/<name>`. On a fleet node
+(2026-09-24, #1961) four such agent worktrees vanished right after a
+self-update tick fast-forwarded the checkout; the deleting actor is still
+unconfirmed, and the dirty-tree guard did not stop that tick (suspected: the
+directory was hidden from `git status` by an exclude rule). Run agent sessions
+from a dev worktree or a separate clone instead, so `.claude/worktrees/` lands
+outside the managed checkout.
+
+The updater enforces this (#1961): while a linked worktree's real path lies
+inside the managed checkout, or `<checkout>/.claude/worktrees/` is non-empty
+(checked on the filesystem, so ignore/exclude rules cannot hide it), every
+tick **defers** with exit 8 — nothing is fetched, merged, installed or
+restarted, `--force` does not override it, and the owner is notified with the
+offending paths. Linked worktrees outside the checkout (like `~/dev/<slug>`
+above) never block an update. See
+[docs/self-update.md](docs/self-update.md#worktree-gate-1961).
 
 The managed checkout stays on `main` and keeps updating; git also refuses to
 check out the same branch twice, which enforces part of this for you. Two

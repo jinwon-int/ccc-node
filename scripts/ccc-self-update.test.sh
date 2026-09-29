@@ -818,6 +818,121 @@ cat > "$TMP/seed/setup.sh" <<'SH'
 echo "setup ran at $(git rev-parse --short HEAD)" >> "${SETUP_MARKER:?}"
 SH
 
+# --- 8b) #1961: worktrees INSIDE the managed checkout defer ------------------
+# A fleet node, 2026-09-24: four Agent(isolation: worktree) trees under
+# <checkout>/.claude/worktrees vanished after a tick fast-forwarded the live
+# checkout. The run must DEFER (exit 8) without touching the tree whenever a
+# linked worktree lies inside the checkout or .claude/worktrees is non-empty —
+# including one hidden from `git status` by .git/info/exclude. Linked
+# worktrees OUTSIDE the checkout (~/dev/<slug>, a Matrix runtime source tree)
+# are normal across the fleet: they must never defer or notify.
+[ -f "$CLAUDE/self-update.services" ] && cp "$CLAUDE/self-update.services" "$TMP/services.pre1961"
+printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
+cp "$REPO/.git/info/exclude" "$TMP/exclude.pre1961" 2>/dev/null || : > "$TMP/exclude.pre1961"
+printf '%s\n' '.claude/worktrees/' '/wt-inside/' > "$REPO/.git/info/exclude"
+echo wt-gate > "$TMP/seed/wt-gate.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm wt-gate && git -C "$TMP/seed" push -q origin main
+# shellcheck disable=SC2034  # read via eval inside ok()
+wt_before="$(git -C "$REPO" rev-parse HEAD)"
+touch "$SETUP_MARKER"
+wt_setup_lines="$(wc -l < "$SETUP_MARKER")"
+wt_untouched() { # HEAD, setup marker and service restarts all unchanged
+  [ "$(git -C "$REPO" rev-parse HEAD)" = "$wt_before" ] \
+    && [ "$(wc -l < "$SETUP_MARKER")" = "$wt_setup_lines" ] \
+    && [ ! -s "$TMP/systemctl.calls" ]
+}
+wt_reset() { : > "$TMP/systemctl.calls"; rm -f "$TMP/spool"/*.json; : > "$STATE/self-update.log"; }
+wt_notified() { jq -r .dedup "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | grep -qx "SelfUpdate:deferred-worktrees"; }
+
+# (1) a linked worktree INSIDE the checkout (not under .claude/worktrees).
+git -C "$REPO" worktree add -q -b wt-gate-in "$REPO/wt-inside" HEAD
+echo wip > "$REPO/wt-inside/wip.txt"
+wt_reset
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#1961 in-checkout linked worktree defers (rc 8)" '[ "$rc" = 8 ] && grep -q "deferring" <<<"$out"'
+ok "#1961 defer message names the in-checkout path" 'grep -qF "$REPO/wt-inside" <<<"$out"'
+ok "#1961 in-checkout defer touches nothing" 'wt_untouched && [ -f "$REPO/wt-inside/wip.txt" ]'
+ok "#1961 defer is logged with reason and path" \
+  'grep "deferred reason=in-checkout-worktrees" "$STATE/self-update.log" | grep -qF "$REPO/wt-inside"'
+ok "#1961 defer notifies the owner with the path" \
+  'wt_notified && jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -qF "$REPO/wt-inside"'
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "#1961 --force does not bypass the worktree defer" '[ "$rc" = 8 ] && wt_untouched && [ -f "$REPO/wt-inside/wip.txt" ]'
+git -C "$REPO" worktree remove --force "$REPO/wt-inside"
+git -C "$REPO" branch -qD wt-gate-in
+
+# (1b) added through a symlink that lives OUTSIDE but resolves INSIDE: real
+# paths are compared, so it still defers.
+ln -s "$REPO" "$TMP/repo-link"
+git -C "$REPO" worktree add -q --detach "$TMP/repo-link/wt-inside" HEAD
+wt_reset
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#1961 symlinked path resolving inside the checkout defers" '[ "$rc" = 8 ] && wt_untouched'
+git -C "$REPO" worktree remove --force "$REPO/wt-inside" 2>/dev/null || git -C "$REPO" worktree remove --force "$TMP/repo-link/wt-inside"
+rm -f "$TMP/repo-link"
+
+# (1c) a failed worktree listing cannot prove the checkout is safe: defer.
+mkdir -p "$TMP/gitfail"
+printf '#!/usr/bin/env bash\ncase " $* " in *" worktree list "*) exit 1 ;; esac\nexec %q "$@"\n' "$(command -v git)" > "$TMP/gitfail/git"
+chmod +x "$TMP/gitfail/git"
+wt_reset
+out="$(PATH="$TMP/gitfail:$PATH" run_selfup run 2>&1)"; rc=$?
+ok "#1961 failed worktree listing defers (rc 8) and touches nothing" \
+  '[ "$rc" = 8 ] && grep -q "cannot list worktrees" <<<"$out" && grep -q "deferred reason=worktree-list-failed" "$STATE/self-update.log" && wt_untouched'
+rm -rf "$TMP/gitfail"
+
+# (2) an excluded .claude/worktrees/x holding files (invisible to git status).
+mkdir -p "$REPO/.claude/worktrees/x/sub"
+echo agent-work > "$REPO/.claude/worktrees/x/sub/wip.txt"
+ok "#1961 fixture: excluded agent dir is invisible to git status" '[ -z "$(git -C "$REPO" status --porcelain)" ]'
+wt_reset
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#1961 excluded .claude/worktrees/x defers (rc 8)" '[ "$rc" = 8 ] && wt_notified'
+ok "#1961 defer message names the agent worktree dir" 'grep -qF "$REPO/.claude/worktrees/x" <<<"$out"'
+ok "#1961 agent-dir defer touches nothing" 'wt_untouched && [ "$(cat "$REPO/.claude/worktrees/x/sub/wip.txt")" = agent-work ]'
+# A real agent worktree there is both a linked worktree and a dir entry: listed once.
+git -C "$REPO" worktree add -q --detach "$REPO/.claude/worktrees/agent-1" HEAD
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#1961 in-tree agent worktree defers and is named once" \
+  '[ "$rc" = 8 ] && [ "$(grep -cF "$REPO/.claude/worktrees/agent-1" <<<"$out")" = 1 ] && wt_untouched'
+git -C "$REPO" worktree remove --force "$REPO/.claude/worktrees/agent-1"
+rm -rf "$REPO/.claude/worktrees/x"
+
+# (3) external linked worktrees only (a ~/dev/<slug> dev tree, a Matrix-style
+# runtime source tree, and a sibling whose name merely shares the checkout's
+# prefix) + an EMPTY .claude/worktrees + a stale prunable entry: proceeds,
+# no notification, one count-only log line.
+git -C "$REPO" worktree add -q -b wt-gate-dev "$TMP/home/dev/x" HEAD
+echo wip > "$TMP/home/dev/x/wip.txt"
+git -C "$REPO" worktree add -q --detach "$TMP/home/.local/share/ccc-matrix/source" HEAD
+git -C "$REPO" worktree add -q --detach "${REPO}-sibling" HEAD
+git -C "$REPO" worktree add -q --detach "$TMP/gone-wt" HEAD
+rm -rf "$TMP/gone-wt"
+wt_reset
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#1961 external worktrees + empty agent dir: update proceeds (rc 0)" \
+  '[ "$rc" = 0 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ] && [ "$(wc -l < "$SETUP_MARKER")" -gt "$wt_setup_lines" ]'
+ok "#1961 external worktrees are never notified" '! wt_notified && ! grep -q "deferring" <<<"$out"'
+ok "#1961 external worktrees logged once, count only, no paths" \
+  '[ "$(grep -c "external-worktrees=" "$STATE/self-update.log")" = 1 ] && grep -q "worktree-gate ok external-worktrees=3" "$STATE/self-update.log" && ! grep -qF "$TMP/home" "$STATE/self-update.log"'
+ok "#1961 external worktree content untouched" '[ -f "$TMP/home/dev/x/wip.txt" ]'
+for w in "$TMP/home/dev/x" "$TMP/home/.local/share/ccc-matrix/source" "${REPO}-sibling"; do
+  git -C "$REPO" worktree remove --force "$w"
+done
+git -C "$REPO" branch -qD wt-gate-dev
+git -C "$REPO" worktree prune
+
+# (4) fully clean checkout: proceeds and logs no worktree line.
+echo wt-gate2 > "$TMP/seed/wt-gate.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm wt-gate2 && git -C "$TMP/seed" push -q origin main
+rm -rf "$REPO/.claude"
+wt_reset
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#1961 clean checkout updates (rc 0) without worktree log noise" \
+  '[ "$rc" = 0 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ] && ! grep -q "worktree" "$STATE/self-update.log" && ! wt_notified'
+cp "$TMP/exclude.pre1961" "$REPO/.git/info/exclude"
+if [ -f "$TMP/services.pre1961" ]; then cp "$TMP/services.pre1961" "$CLAUDE/self-update.services"; else rm -f "$CLAUDE/self-update.services"; fi
+
 # --- #1328: conditional auto-recovery from a wrong-branch stall ----------------
 # Safe shape (validated by the yukson 2026-08-27 recovery): stray branch fully
 # pushed to origin + clean tree — switching back to main cannot lose anything.

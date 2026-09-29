@@ -183,6 +183,54 @@ the bridge is serving a request:
 - fail-open (missing / unreadable / stale `health.json` → proceed) and
   `--force` bypasses the gate entirely.
 
+## Worktree gate (#1961)
+
+On a fleet node (2026-09-24) four Claude Code `Agent(isolation: worktree)` trees,
+created at `<checkout>/.claude/worktrees/agent-*` inside the live managed
+checkout, disappeared right after a self-update tick fast-forwarded that
+checkout and re-ran setup; the four agents stopped with "File does not exist".
+**Which process deleted them is still unconfirmed** — no code path in
+`setup.sh` or this script is known to remove them. The dirty-tree precondition
+did not stop that tick; the suspected (unproven) reason is that the directory
+was hidden from `git status` by an exclude rule.
+
+Independently of the root cause, the run now **defers before touching the
+tree** (before wrong-branch recovery, fetch, merge, setup, restart) while the
+managed checkout has either:
+
+- a **linked worktree inside the checkout** — a `git worktree list
+  --porcelain` entry (other than the main worktree) whose real path, with
+  symlinks resolved, is the checkout or lies under it; or
+- a **non-empty `.claude/worktrees`** inside the checkout (Claude Code's agent
+  worktree location). This is a filesystem check, so `.gitignore` /
+  `.git/info/exclude` cannot hide it. An empty directory does not block.
+
+If `git worktree list` itself fails, the run defers too (it cannot prove the
+checkout is safe).
+
+**Linked worktrees outside the checkout never defer and never notify.** A
+read-only fleet survey on 2026-09-29 found them on 11 of 12 nodes (up to 66
+entries on one node) — the documented `~/dev/<slug>` dev recipe, and on one
+node the Matrix runtime source tree is itself a linked worktree — and an update
+of the main worktree does not touch them. The run logs only their count, one
+line per run (`worktree-gate ok external-worktrees=N`), with no paths. An entry
+git marks `prunable` whose directory is already gone is ignored.
+
+The defer uses the same contract as the idle gate: exit `8`, a
+`deferred reason=in-checkout-worktrees ... paths=...` log line, nothing
+fetched, merged, installed or restarted, and the next scheduled tick retries.
+The differences are deliberate: it is **not capped** by
+`CCC_SELF_UPDATE_MAX_DEFER_SECONDS` and **`--force` does not bypass it**
+(forcing through is exactly the shape that lost work). Because the scheduled
+task treats exit 8 as success, every deferring tick also queues an owner
+notification (dedup `SelfUpdate:deferred-worktrees`) that names the offending
+paths, so a forgotten worktree cannot stall a node silently.
+
+To unblock: finish the work, then `git -C <checkout> worktree remove <path>`
+(or delete the `.claude/worktrees/<name>` directory once nothing needs it)
+and let the next tick apply. Create agent and dev worktrees outside the
+managed checkout — see CONTRIBUTING.md.
+
 ## Scheduling
 
 Self-update does **not** schedule itself. It runs only when invoked — either
@@ -195,7 +243,8 @@ so a deferred run had no tick to retry on.)
 
 The default schedule is `17 4,10,16,22 * * *` (four times daily, off-zero
 minute); override with `CCC_SELF_UPDATE_CRON`. The task uses
-`--success-exit-codes 0,8,11`, so a clean update (0), a bridge-busy defer (8),
+`--success-exit-codes 0,8,11`, so a clean update (0), a bridge-busy or
+worktree-gate defer (8),
 and a no-services-allowlist degraded run (11) do not raise on-failure alerts —
 only real aborts do. To verify registration: `agent-cron.sh list | grep
 self-update`.
@@ -284,7 +333,8 @@ Exit codes: 0 ok/up-to-date · 3 lock held · 4 precondition failed · 5 fetch/f
 failed · 6 setup/snapshot failed (repo and managed artifacts were verified
 rolled back, or setup never started) · 7 service restart failure, external
 restart-cmd failure, or failed runtime recovery · 8 deferred
-(bridge busy — retry next tick) · 9 repository or installed-artifact rollback
+(bridge busy, or worktrees inside the managed checkout — retry next tick;
+see "Worktree gate") · 9 repository or installed-artifact rollback
 was degraded · 10 successful-update recovery snapshot cleanup failed ·
 11 degraded — code updated but no allowlisted service restarted (services
 file missing/empty); running processes may still hold the old code, so this
