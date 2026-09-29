@@ -15,7 +15,7 @@ changed versus the family-messenger pilot bot ("fambot"):
 | brain | one Codex process per turn, JSON port | `ProjectChatHandler` in-process (as Telegram) |
 | session | `session_id` per room, cold start each turn | warm `AgentSession` per room |
 | progress | "작업을 시작했습니다" only | typing + interim/status notices + the Telegram session-start banner (`◐ CCC session started (<reason>)…`) whenever a turn opens a fresh provider stream |
-| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) + `/history /resume` (#1895 PR-B) + `/continue` (#1825) + `/restart` (#2003) + `/waits /cancelwait` (#2004) |
+| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) + `/history /resume` (#1895 PR-B) + `/continue` (#1825) + `/restart` (#2003) + `/waits /cancelwait` (#2004) + `/memory_promote` (#2004, audience-scoped memory only) |
 | output | plain `m.text` | plain `body` + Matrix HTML `formatted_body` |
 | E2EE / trust / room gate | fleet_matrix | same code, ported (fail-closed reasons unchanged) |
 
@@ -464,6 +464,14 @@ Flags: `CCC_EXTERNAL_WAIT_ENABLED` (default on), `CCC_EXTERNAL_WAIT_RESUME`
 (default on), `CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP` (default 10 continuations
 per day; beyond the cap the rollup is still delivered, only the
 auto-continuation is skipped).
+
+## Memory promotion (#2004)
+
+`/memory_promote distill-<12 hex>` (#2004) promotes one fact from the owner's
+private Matrix memory scope to shared memory, with Telegram's semantics and
+answers: owner-only, `CCC_BRIDGE_MEMORY_MODE=audience-scoped` only (otherwise it
+answers that promotion is unavailable), accepted only in the owner's direct
+room, then the shared index is refreshed.
 
 ## Auto-continue and dead-session notices (#1825)
 

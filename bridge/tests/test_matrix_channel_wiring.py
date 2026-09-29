@@ -99,6 +99,8 @@ def test_create_app_selects_matrix_bot(tmp_path: Path, monkeypatch: pytest.Monke
         "distill_wiki_sink_worker",
         # #1825: the collector used to be Telegram-only.
         "skill_candidate_collector_worker",
+        # #2004: /memory_promote needs the promoter on Matrix too.
+        "memory_promoter",
     ):
         assert field in created
         assert created[field] is getattr(context, field)

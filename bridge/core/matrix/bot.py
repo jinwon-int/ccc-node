@@ -109,7 +109,7 @@ SUPPORTED_COMMANDS = frozenset(
     {
         "new", "distill", "model", "effort", "usage", "skills", "stop", "continue",
         "task_pause", "task_resume", "task_recover", "history", "resume", "restart",
-        "waits", "cancelwait",
+        "waits", "cancelwait", "memory_promote",
     }
 )
 _STATUS_HANDLE = 1
@@ -146,6 +146,7 @@ _OWNER_ONLY_COMMANDS = frozenset(
     {
         "resume", "history", "model", "effort", "distill", "usage", "continue",
         "task_pause", "task_resume", "task_recover", "restart", "waits", "cancelwait",
+        "memory_promote",
     }
 )
 # #2001: files an answer names are sent after it, at most this many per turn.
@@ -532,10 +533,13 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         distill_local_sink_worker: Any = None,
         distill_wiki_sink_worker: Any = None,
         skill_candidate_collector_worker: Any = None,
+        memory_promoter: Any = None,
         clock: Any = None,
         transport_factory: TransportFactory | None = None,
     ) -> None:
         self._skill_candidate_collector_worker = skill_candidate_collector_worker
+        # #2004: explicit private -> shared fact promotion (audience-scoped only).
+        self._memory_promoter = memory_promoter
         self._distill_journal = distill_journal
         self._distill_snapshot_worker = distill_snapshot_worker
         self._distill_extraction_worker = distill_extraction_worker
@@ -1497,6 +1501,55 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return f"No active external wait with id `{wait_id}`."
         return f"Cancelled external wait `{wait_id}`."
 
+    # -- /memory_promote (#2004) -----------------------------------------------
+
+    async def _cmd_memory_promote(self, args: list[str], *, user_id: int, chat_id: int) -> str:
+        """Promote one validated private fact to shared memory (port of Telegram's).
+
+        Same contract as ``BotCommandMixin._cmd_memory_promote``: audience-scoped
+        mode with a promoter and local sink wired, the owner's private DM only
+        (the private scope is this frontend's own ``matrix`` route), one exact
+        ``distill-<12 hex>`` id, and body-free logs.
+        """
+
+        if (
+            getattr(self._settings, "bridge_memory_mode", "off") != "audience-scoped"
+            or self._memory_promoter is None
+            or self._distill_local_sink_worker is None
+        ):
+            return "ℹ️ Explicit memory promotion is unavailable on this bridge."
+        audience = resolve_memory_audience(
+            self._settings, user_id=user_id, chat_id=chat_id, route=self._memory_route()
+        )
+        if audience is None or audience.kind != "private":
+            return "❌ Memory promotion is allowed only from your private DM."
+        if len(args) != 1 or re.fullmatch(r"distill-[0-9a-f]{12}", args[0]) is None:
+            return "Usage: /memory_promote distill-<12 lowercase hex>"
+
+        fact_id = args[0]
+        try:
+            result = await asyncio.to_thread(
+                self._memory_promoter.promote,
+                source_scope=audience.scope,
+                fact_id=fact_id,
+            )
+            await self._distill_local_sink_worker.refresh_route(audience="shared", scope="shared")
+        except LookupError:
+            return "ℹ️ That fact was not found in your private memory."
+        except ValueError:
+            logger.warning("Private memory promotion rejected by validation")
+            return "⚠️ That private fact is not eligible for promotion."
+        except Exception:
+            logger.warning("Private memory promotion or shared index refresh failed")
+            return "⚠️ Memory promotion could not be completed. You can retry safely."
+
+        if result.promoted:
+            return f"✅ Promoted {fact_id} to shared memory as {result.destination_fact_id}."
+        return (
+            f"✅ {fact_id} was already promoted as "
+            f"{result.destination_fact_id}; shared memory was refreshed."
+        )
+
     # -- dead-session recovery (#1825) ------------------------------------------
 
     def _dead_session_recovery_args(self) -> tuple[Any, ...]:
@@ -2110,6 +2163,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             return await self._cmd_waits(user_id=user_id)
         if command == "cancelwait":
             return await self._cmd_cancelwait(args, user_id=user_id)
+        if command == "memory_promote":
+            return await self._cmd_memory_promote(args, user_id=user_id, chat_id=chat_id)
         if command == "task_pause":
             return await self._cmd_task_pause(args, user_id=user_id, chat_id=chat_id)
         if command == "task_recover":

@@ -617,6 +617,7 @@ def create_app(context: AppContext):
             distill_local_sink_worker=context.distill_local_sink_worker,
             distill_wiki_sink_worker=context.distill_wiki_sink_worker,
             skill_candidate_collector_worker=context.skill_candidate_collector_worker,
+            memory_promoter=context.memory_promoter,
         )
     from telegram_bot.core.bot import TelegramBot
 
