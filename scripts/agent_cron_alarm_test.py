@@ -167,6 +167,37 @@ class NodeTransition(unittest.TestCase):
         _state, reasons = self.drive([('b', None)], prev=state)
         self.assertEqual(reasons, ['recovered'])
 
+    def test_alerted_streak_with_no_runnable_member_resets_silently(self) -> None:
+        state, reasons = self.drive([('a', 'auth_failed'), ('b', 'auth_failed'),
+                                     ('c', 'auth_failed')])
+        self.assertEqual(reasons, [None, None, 'threshold'])
+        # a, b, c can never run again; a healthy d succeeding clears silently.
+        state, event = node_transition(state, task_id='d', failed=False, failure_class=None,
+                                       threshold=3, at=stamp(10), runnable_ids={'d', 'e', 'f'})
+        self.assertIsNone(event)
+        self.assertFalse(state['alerted'])
+        self.assertEqual((state['consecutiveFailures'], state['taskIds']), (0, []))
+
+    def test_pruned_but_nonempty_alerted_streak_stays_latched(self) -> None:
+        state, _reasons = self.drive([('a', 'other'), ('b', 'other'), ('c', 'other')])
+        state, event = node_transition(state, task_id='x', failed=True, failure_class='other',
+                                       threshold=3, at=stamp(10), runnable_ids={'b', 'x'})
+        self.assertIsNone(event)
+        self.assertTrue(state['alerted'])
+        self.assertEqual(state['taskIds'], ['b', 'x'])
+        _state, event = node_transition(state, task_id='b', failed=False, failure_class=None,
+                                        threshold=3, at=stamp(11), runnable_ids={'b', 'x'})
+        self.assertEqual(event['reason'], 'recovered')
+
+    def test_unalerted_streak_is_not_pruned(self) -> None:
+        # Finished one-shots that each failed once are the incident itself.
+        state = None
+        for offset, tid in enumerate(('a', 'b', 'c')):
+            state, event = node_transition(state, task_id=tid, failed=True,
+                                           failure_class='auth_failed', threshold=3,
+                                           at=stamp(offset), runnable_ids=set())
+        self.assertEqual(event['reason'], 'threshold')
+
     def test_no_recovery_notice_without_alert(self) -> None:
         _state, reasons = self.drive([('a', 'other'), ('b', 'other'), ('a', None)])
         self.assertEqual([r for r in reasons if r], [])
@@ -314,6 +345,38 @@ class Integration(unittest.TestCase):
         self.assertEqual(box.alarms()[-1]['reasons'], ['node=recovered'])
         box.run('t3', 'ok')
         self.assertEqual(len(box.alarms()), 2)
+
+    @staticmethod
+    def one_shots(*ids: str) -> list[dict]:
+        return [{'id': tid, 'schedule': 'at 2026-01-01T00:01:00Z', 'prompt': tid,
+                 'enabled': True, 'notify': 'none'} for tid in ids]
+
+    def test_node_alarm_does_not_latch_after_alerted_tasks_finish(self) -> None:
+        # Re-review repro: one-shots a,b,c each fail once -> node alarm; they
+        # can never run again; healthy d succeeds; later e,f,g fail once each
+        # and e,f fail again -> a second node alarm must fire, silently reset.
+        box = self.sandbox(['d', 'e', 'f', 'g'], extra_tasks=self.one_shots('a', 'b', 'c'))
+        for tid in ('a', 'b', 'c'):
+            box.run(tid, 'auth')
+        self.assertEqual([a['reasons'] for a in box.alarms()], [['node=threshold']])
+        box.run('d', 'ok')
+        self.assertEqual(len(box.alarms()), 1)  # silent reset: no "cleared" message
+        node = box.alarm_state()['node']
+        self.assertEqual((node['alerted'], node['taskIds']), (False, []))
+        for tid in ('e', 'f', 'g', 'e', 'f'):
+            box.run(tid, 'auth')
+        alarms = box.alarms()
+        self.assertEqual([a['reasons'] for a in alarms], [['node=threshold'], ['node=threshold']])
+        self.assertIn('across 3 tasks (e, f, g)', alarms[1]['text'])
+        self.assertFalse(any('cleared' in a['text'] for a in alarms))
+
+    def test_node_alarm_resets_without_a_healthy_run_too(self) -> None:
+        box = self.sandbox(['e', 'f', 'g'], extra_tasks=self.one_shots('a', 'b', 'c'))
+        for tid in ('a', 'b', 'c', 'e', 'f', 'g'):
+            box.run(tid, 'auth')
+        alarms = box.alarms()
+        self.assertEqual([a['reasons'] for a in alarms], [['node=threshold'], ['node=threshold']])
+        self.assertFalse(any('cleared' in a['text'] for a in alarms))
 
     def test_opted_out_task_is_excluded_from_node_counter(self) -> None:
         box = self.sandbox(['a'], extra_tasks=[

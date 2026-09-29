@@ -146,7 +146,10 @@ bounded to 50), each task's `lastSuccessAt`, and the alarm counters live in
 The task store therefore stays valid under the pre-#1821 schema, so reverting
 this feature cannot make the scheduler (including the self-update task) refuse
 its own store. The only new task field is the operator-set, optional
-`failureAlertAfter`; remove it from tasks before reverting.
+`failureAlertAfter`. **Before reverting this feature, remove
+`failureAlertAfter` from every task in `tasks.json`**: the pre-#1821 schema
+rejects it (`additionalProperties: false`) and the scheduler would refuse the
+store.
 
 Two counters, each bounded so no pattern of outcomes alerts on every run:
 
@@ -161,7 +164,12 @@ Two counters, each bounded so no pattern of outcomes alerts on every run:
   class change. A success by a task outside the streak does not clear an
   alerted streak; one "cleared" notice when a task that was part of it
   succeeds. The message names the failing tasks. This catches the incident
-  shape, where four different one-shot prompt tasks each failed once.
+  shape, where four different one-shot prompt tasks each failed once. On every
+  prompt run an alerted streak's task list is pruned to tasks that can still
+  run (present, enabled, under `maxRuns`, not a finished one-shot); if none
+  remain, nothing could ever send its "cleared" notice, so the counter resets
+  **silently** and the next streak can alert again. A streak that has not
+  alerted yet is never pruned (finished one-shots are the incident evidence).
 
 A run where both counters fire produces one message. Alarms go to the owner
 through the same push spool as `notify=telegram-owner`, carry only task ids,

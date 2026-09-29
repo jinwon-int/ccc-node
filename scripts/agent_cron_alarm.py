@@ -205,14 +205,34 @@ def _task_ids(value: Any) -> list[str]:
     return out[-NODE_TASK_IDS_MAX:]
 
 
+_NODE_RESET = {'consecutiveFailures': 0, 'taskIds': [], 'alerted': False,
+               'alertedAt': None, 'failureClass': None}
+
+
 def node_transition(prev: Any, *, task_id: str, failed: bool, failure_class: str | None,
-                    threshold: int, at: str, seed_streak: int = 0,
-                    seed_ids: Any = ()) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Advance the node-wide prompt counter by one eligible prompt run."""
+                    threshold: int, at: str, seed_streak: int = 0, seed_ids: Any = (),
+                    runnable_ids: Any = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Advance the node-wide prompt counter by one eligible prompt run.
+
+    ``runnable_ids`` (live, enabled prompt tasks that can still run) prunes an
+    ALERTED streak's task list on every run; the running task always counts as
+    runnable. If none of the alerted tasks can run again (removed, disabled,
+    finished one-shots) nothing could ever send its "cleared" notice, so the
+    counter resets silently and a new streak can alert. A streak that has not
+    alerted yet is not pruned: finished one-shots that each failed once are
+    exactly the incident this counter exists to catch.
+    """
     state = dict(prev) if isinstance(prev, dict) else {}
     ids = _task_ids(state.get('taskIds'))
     alerted = state.get('alerted') is True
     previous_streak = _nonneg_int(state.get('consecutiveFailures')) if prev else None
+    if alerted and runnable_ids is not None:
+        keep = set(runnable_ids) | {task_id}
+        ids = [item for item in ids if item in keep]
+        state['taskIds'] = ids
+        if not ids:
+            state.update(_NODE_RESET)
+            alerted, previous_streak = False, 0
     if not failed:
         state['lastSuccessAt'] = at
         if alerted and task_id not in ids:
@@ -223,8 +243,7 @@ def node_transition(prev: Any, *, task_id: str, failed: bool, failure_class: str
         if alerted:
             event = {'reason': 'recovered', 'consecutiveFailures': previous_streak or 0,
                      'taskIds': ids, 'failureClass': state.get('failureClass')}
-        state.update({'consecutiveFailures': 0, 'taskIds': [], 'alerted': False,
-                      'alertedAt': None, 'failureClass': None})
+        state.update(_NODE_RESET)
         return state, event
     if previous_streak is None:
         streak = max(1, _nonneg_int(seed_streak) or 0)

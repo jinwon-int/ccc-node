@@ -1564,6 +1564,28 @@ def _node_eligible(item, env_threshold):
             and resolve_threshold(item.get('failureAlertAfter'), env_threshold) != 0)
 
 
+def _one_shot_finished(item):
+    """A one-shot that already ran at/after its runAt and has no retry pending."""
+    try:
+        spec = parse_schedule(item.get('schedule') or '', item.get('timezone', 'UTC'))
+        last = parse_dt(item.get('lastRunAt'), 'lastRunAt')
+    except Exception:
+        return False
+    if spec.get('kind') != 'once' or last is None or last < spec['runAt']:
+        return False
+    retry = item.get('retryState')
+    return not (isinstance(retry, dict) and retry.get('retryEligibleAt'))
+
+
+def _node_runnable_ids(tasks, env_threshold):
+    """Node-eligible prompt tasks that can still run (and so still recover)."""
+    return {
+        str(item.get('id')) for item in tasks
+        if _node_eligible(item, env_threshold) and item.get('enabled') is True
+        and not run_limit_metadata(item)['reached'] and not _one_shot_finished(item)
+    }
+
+
 def _prompt_history_seed(tasks, env_threshold):
     """(trailing node-wide prompt failures, distinct task ids in them)."""
     merged = []
@@ -1654,7 +1676,8 @@ def _write_failure_alarm_state(state):
     )
 
 
-def _advance_failure_alarm(state, task_id, current, tasks, run_id, status, failure_class, at_s):
+def _advance_failure_alarm(state, task_id, current, tasks, run_id, status, failure_class, at_s,
+                           live_store=True):
     env_threshold = os.environ.get('CCC_AGENT_CRON_FAILURE_ALERT_AFTER', '')
     failed = status != 'success'
     threshold = resolve_threshold(current.get('failureAlertAfter'), env_threshold)
@@ -1673,6 +1696,8 @@ def _advance_failure_alarm(state, task_id, current, tasks, run_id, status, failu
             state['node'], task_id=task_id, failed=failed, failure_class=failure_class,
             threshold=resolve_threshold(None, env_threshold), at=at_s,
             seed_streak=seed, seed_ids=seed_ids,
+            # Without a trustworthy fresh store, never prune the alerted streak.
+            runnable_ids=_node_runnable_ids(tasks, env_threshold) if live_store else None,
         )
         result['nodeConsecutiveFailures'] = state['node']['consecutiveFailures']
     return task_event, node_event, result
@@ -1708,7 +1733,8 @@ def record_failure_alarm(task_id, task, run_id, status, failure_class, at):
                 for key in [k for k in state['tasks'] if k not in live]:
                     del state['tasks'][key]
             task_event, node_event, result = _advance_failure_alarm(
-                state, task_id, current, tasks, run_id, status, failure_class, at_s)
+                state, task_id, current, tasks, run_id, status, failure_class, at_s,
+                live_store=live is not None)
             last_success = _prompt_last_success(tasks, state) if node_event else None
             try:
                 _write_failure_alarm_state(state)
