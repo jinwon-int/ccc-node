@@ -41,6 +41,11 @@ async def run_skill_candidate_collector(
     attempts per sweep are hard-bounded to avoid a first-start backlog burst.
     """
 
+    # Lazy: keep the collector's memory stack out of this module's import path.
+    from telegram_bot.memory.skill_candidate_worker import (
+        skill_candidate_failure_fields,
+    )
+
     collector_provider = worker.provider
     interval = float(getattr(settings, "distill_extraction_poll_interval", 300.0) or 300.0)
     max_jobs = int(getattr(settings, "codex_skill_collector_max_jobs_per_sweep", 1) or 1)
@@ -62,10 +67,16 @@ async def run_skill_candidate_collector(
                     await worker.collect_once(job_id=job.job_id)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as exc:
+                    # Body-free diagnostics only: the classified code and the
+                    # provider exit status, never stdout/stderr bytes.
+                    error_code, exit_status = skill_candidate_failure_fields(exc)
                     logger.warning(
-                        "Skill-candidate job failed; backing off job_id=%s",
+                        "Skill-candidate job failed; backing off job_id=%s "
+                        "code=%s exit_status=%s",
                         job.job_id,
+                        error_code,
+                        exit_status,
                         exc_info=True,
                     )
         except asyncio.CancelledError:

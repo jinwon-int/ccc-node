@@ -22,9 +22,12 @@ from typing import Any, Protocol
 
 from .distill_extraction import DistillProvenance
 from .skill_candidate import (
+    RETRY_QUARANTINED,
+    RETRY_READY,
     SkillCandidateBackend,
     SkillCandidateSink,
     SkillCandidateStageResult,
+    body_free_exit_status,
 )
 from .skill_candidate_backend import (
     MAX_SKILL_CANDIDATE_OUTPUT_BYTES,
@@ -39,6 +42,11 @@ _RESERVED_OVERHEAD_TOKENS = 8192
 _RETRY_BASE_SECONDS = 5 * 60.0
 _RETRY_MAX_SECONDS = 24 * 60 * 60.0
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# Consecutive provider-started failures after which a job is quarantined: no
+# further retries and therefore no further worst-case usage reservations. Every
+# provider-started failure keeps its reservation (conservative accounting), so
+# this cap is what bounds the cost of a persistently failing job.
+MAX_SKILL_CANDIDATE_ATTEMPTS = 5
 
 
 class _ReservationLike(Protocol):
@@ -61,11 +69,24 @@ class _AutonomousSpendGate(Protocol):
     def refund_reservation(self, reservation: object) -> None: ...
 
 
-def _body_free_error_code(error: Exception) -> str:
+def _body_free_error_code(error: BaseException) -> str:
     code = getattr(error, "code", None)
     if isinstance(code, str) and _SAFE_ERROR_CODE_RE.fullmatch(code):
         return code
     return "skill_candidate_worker_failed"
+
+
+def skill_candidate_failure_fields(error: BaseException) -> tuple[str, int | None]:
+    """Body-free ``(error_code, exit_status)`` for logs and retry state.
+
+    Only the stable classified code and the provider's integer exit status are
+    ever exposed; exception messages, stdout, and stderr never are.
+    """
+
+    return (
+        _body_free_error_code(error),
+        body_free_exit_status(getattr(error, "exit_status", None)),
+    )
 
 
 class SkillCandidateCollectorWorker:
@@ -80,9 +101,15 @@ class SkillCandidateCollectorWorker:
         usage_meter: _AutonomousSpendGate | None,
         provider: str = "codex",
         clock: Callable[[], float] = time.time,
+        max_attempts: int = MAX_SKILL_CANDIDATE_ATTEMPTS,
     ) -> None:
         if provider not in {"codex", "piri", "danso"}:
             raise ValueError("unsupported skill-candidate collector provider")
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise ValueError("max_attempts must be a positive integer")
+        self._max_attempts = max_attempts
+        # Job ids whose quarantine was already logged by this process.
+        self._quarantine_logged: set[str] = set()
         self._provider = provider
         self._journal = journal
         self._backend = backend
@@ -99,21 +126,52 @@ class SkillCandidateCollectorWorker:
     def should_collect(self, *, job_id: str) -> bool:
         """Cheap durable preflight used by the sweep before consuming its cap."""
 
-        return not self._sink.has(job_id) and self._sink.retry_ready(
-            job_id, now=self._clock()
+        if self._sink.has(job_id):
+            return False
+        status = self._sink.retry_status(
+            job_id, now=self._clock(), max_attempts=self._max_attempts
         )
+        if status == RETRY_QUARANTINED and job_id not in self._quarantine_logged:
+            self._quarantine_logged.add(job_id)
+            logger.warning(
+                "Skill-candidate job quarantined; skipping without provider call "
+                "or usage reservation: provider=%s job_id=%s max_attempts=%d "
+                "(remove its .retries record to requeue)",
+                self._provider,
+                job_id,
+                self._max_attempts,
+            )
+        return status == RETRY_READY
 
-    def _record_failure(self, job_id: str, error: Exception) -> None:
-        self._record_failure_code(job_id, _body_free_error_code(error))
+    def _record_failure(self, job_id: str, error: BaseException) -> None:
+        error_code, exit_status = skill_candidate_failure_fields(error)
+        self._record_failure_code(job_id, error_code, exit_status=exit_status)
 
-    def _record_failure_code(self, job_id: str, error_code: str) -> None:
-        self._sink.record_retry_failure(
+    def _record_failure_code(
+        self, job_id: str, error_code: str, *, exit_status: int | None = None
+    ) -> None:
+        record = self._sink.record_retry_failure(
             job_id,
             error_code=error_code,
             now=self._clock(),
             base_delay_seconds=_RETRY_BASE_SECONDS,
             max_delay_seconds=_RETRY_MAX_SECONDS,
+            exit_status=exit_status,
+            max_attempts=self._max_attempts,
         )
+        if record.get("quarantined") is True and job_id not in self._quarantine_logged:
+            self._quarantine_logged.add(job_id)
+            logger.warning(
+                "Skill-candidate job quarantined after %s failed provider "
+                "attempts; no further retries or usage reservations: "
+                "provider=%s job_id=%s code=%s exit_status=%s "
+                "(remove its .retries record to requeue)",
+                record.get("attempts"),
+                self._provider,
+                job_id,
+                error_code,
+                exit_status,
+            )
 
     def _refund_unused(self, reservation: _ReservationLike | None) -> None:
         if (
@@ -223,4 +281,8 @@ class SkillCandidateCollectorWorker:
             return result
 
 
-__all__ = ["SkillCandidateCollectorWorker"]
+__all__ = [
+    "MAX_SKILL_CANDIDATE_ATTEMPTS",
+    "SkillCandidateCollectorWorker",
+    "skill_candidate_failure_fields",
+]

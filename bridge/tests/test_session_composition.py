@@ -987,6 +987,80 @@ print("CODEX-SKILL-COLLECTOR-DEFAULT-ON-OK")
     assert "CODEX-SKILL-COLLECTOR-DEFAULT-ON-OK" in result.stdout
 
 
+def test_build_context_skill_collector_fails_closed_without_finite_budget(tmp_path):
+    result = _run_probe(
+        """
+import logging
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+root = Path(os.environ["PROBE_ROOT"])
+(root / "project").mkdir(parents=True, exist_ok=True)
+os.environ["PROJECT_ROOT"] = str(root / "project")
+os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
+os.environ["ALLOWED_USER_IDS"] = "1"
+os.environ["CCC_AGENT_PROVIDER"] = "codex"
+os.environ["CCC_USAGE_BUDGET_TOKENS_CODEX"] = "0"
+
+from telegram_bot import __main__ as entry
+from telegram_bot.__main__ import build_context, load_runtime_settings
+from telegram_bot.memory.skill_candidate_worker import SkillCandidateCollectorWorker
+
+messages = []
+
+
+class _Capture(logging.Handler):
+    def emit(self, record):
+        messages.append(record.getMessage())
+
+
+entry.logger.addHandler(_Capture())
+entry.logger.setLevel(logging.WARNING)
+
+gated = build_context(load_runtime_settings())
+assert gated.skill_candidate_collector_worker is None
+gate_lines = [m for m in messages if m.startswith("Skill-candidate collection disabled")]
+assert gate_lines == [
+    "Skill-candidate collection disabled: provider=codex requires usage "
+    "metering and a finite autonomous budget (or explicit "
+    "CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED=1)"
+], messages
+
+# The distill escape hatch is the single explicit opt-in for both.
+os.environ["CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED"] = "1"
+unbounded = build_context(load_runtime_settings())
+assert isinstance(
+    unbounded.skill_candidate_collector_worker, SkillCandidateCollectorWorker
+)
+os.environ.pop("CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED")
+
+# Metering disabled is not a finite gate even with a positive budget.
+os.environ["CCC_USAGE_BUDGET_TOKENS_CODEX"] = "1000"
+os.environ["CCC_USAGE_METER_ENABLED"] = "false"
+unmetered = build_context(load_runtime_settings())
+assert unmetered.skill_candidate_collector_worker is None
+os.environ.pop("CCC_USAGE_METER_ENABLED")
+
+# Danso's default budget is 0 (the Matrix bridge shape): gated without an
+# explicit budget, allowed once a finite one is configured.
+danso = SimpleNamespace(
+    usage_budget_tokens_danso=0,
+    usage_meter_enabled=True,
+    memory_distill_allow_unbounded=False,
+)
+assert not entry._skill_candidate_collection_authorized(danso, object(), "danso")
+danso.usage_budget_tokens_danso = 500_000
+assert entry._skill_candidate_collection_authorized(danso, object(), "danso")
+assert not entry._skill_candidate_collection_authorized(danso, None, "danso")
+print("SKILL-COLLECTOR-FINITE-BUDGET-GATE-OK")
+""",
+        probe_root=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "SKILL-COLLECTOR-FINITE-BUDGET-GATE-OK" in result.stdout
+
+
 def test_build_context_composes_audience_local_sink_worker(tmp_path):
     result = _run_probe(
         """

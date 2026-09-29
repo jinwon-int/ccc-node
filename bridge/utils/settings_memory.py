@@ -212,7 +212,8 @@ class MemorySettingsMixin:
             "without a finite provider budget. False keeps the doctor's "
             "finite-budget expectation when usage metering is disabled or the "
             "budget is explicitly zeroed; piri's fleet default 0 (2026-09-18) "
-            "is policy, not an opt-out, and is reported as informational."
+            "is policy, not an opt-out, and is reported as informational. "
+            "The skill-candidate collector shares this gate and opt-in."
         ),
     )
     memory_distill_max_attempts: int = Field(

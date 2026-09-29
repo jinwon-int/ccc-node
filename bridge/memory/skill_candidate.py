@@ -50,7 +50,25 @@ _KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SAFE_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# Additive optional fields (``exit_status``, ``quarantined``) keep the version
+# at 1 so an older bridge still reads a newer record instead of failing the
+# whole sweep closed; it just ignores the quarantine flag.
 _RETRY_SCHEMA_VERSION = 1
+# A provider exit status is a small signed integer (negative = signal). Anything
+# outside this range is not a process exit status and is never persisted.
+_MAX_ABS_EXIT_STATUS = 1024
+RETRY_READY = "ready"
+RETRY_BACKOFF = "backoff"
+RETRY_QUARANTINED = "quarantined"
+
+
+def body_free_exit_status(value: object) -> int | None:
+    """Return ``value`` only when it is a plausible process exit status."""
+
+    if type(value) is int and -_MAX_ABS_EXIT_STATUS <= value <= _MAX_ABS_EXIT_STATUS:
+        return value
+    return None
+
 
 # Redaction / injection guards applied to the skill body before it is ever
 # staged, so a leaked credential or a prompt-injection directive fails closed
@@ -497,13 +515,32 @@ class SkillCandidateSink:
             or float(record["next_retry_at"]) < 0
             or not isinstance(record.get("error_code"), str)
             or _SAFE_ERROR_CODE_RE.fullmatch(str(record["error_code"])) is None
+            # Optional since the retry cap; absent in records written before it.
+            or (
+                record.get("exit_status") is not None
+                and body_free_exit_status(record.get("exit_status")) is None
+            )
+            or not isinstance(record.get("quarantined", False), bool)
         ):
             raise ValueError("skill-candidate retry state is invalid")
         return record
 
-    def retry_ready(self, job_id: str, *, now: float) -> bool:
-        """Return whether a failed job's durable backoff window has elapsed.
+    @staticmethod
+    def _validate_max_attempts(max_attempts: int | None) -> None:
+        if max_attempts is not None and (
+            type(max_attempts) is not int or max_attempts < 1
+        ):
+            raise ValueError("max_attempts must be a positive integer")
 
+    def retry_status(
+        self, job_id: str, *, now: float, max_attempts: int | None = None
+    ) -> str:
+        """Classify a job's durable retry state.
+
+        Returns ``RETRY_READY`` (no record, or the backoff window elapsed),
+        ``RETRY_BACKOFF`` (still waiting), or ``RETRY_QUARANTINED`` (the record
+        is marked terminal, or it already holds ``max_attempts`` failures —
+        which also quarantines records written before the cap existed).
         Corrupt/untrusted retry state raises and therefore fails closed before
         another provider call.
         """
@@ -515,13 +552,32 @@ class SkillCandidateSink:
             or float(now) < 0
         ):
             raise ValueError("now must be a finite non-negative timestamp")
+        self._validate_max_attempts(max_attempts)
         path = self._retry_path(job_id)
         with self._exclusive():
             ensure_private_directory(path.parent)
             record = self._read_retry_unlocked(path, job_id=job_id)
-            return record is None or float(
-                cast(int | float, record["next_retry_at"])
-            ) <= float(now)
+            if record is None:
+                return RETRY_READY
+            if record.get("quarantined") is True or (
+                max_attempts is not None
+                and cast(int, record["attempts"]) >= max_attempts
+            ):
+                return RETRY_QUARANTINED
+            if float(cast(int | float, record["next_retry_at"])) <= float(now):
+                return RETRY_READY
+            return RETRY_BACKOFF
+
+    def retry_ready(
+        self, job_id: str, *, now: float, max_attempts: int | None = None
+    ) -> bool:
+        """Return whether a failed job's durable backoff window has elapsed
+        and the job is not quarantined."""
+
+        return (
+            self.retry_status(job_id, now=now, max_attempts=max_attempts)
+            == RETRY_READY
+        )
 
     def record_retry_failure(
         self,
@@ -531,11 +587,21 @@ class SkillCandidateSink:
         now: float,
         base_delay_seconds: float,
         max_delay_seconds: float,
-    ) -> None:
-        """Durably apply exponential backoff using body-free error metadata."""
+        exit_status: int | None = None,
+        max_attempts: int | None = None,
+    ) -> dict[str, object]:
+        """Durably apply exponential backoff using body-free error metadata.
 
+        ``exit_status`` is the provider process's exit status (never output
+        bytes). Once ``attempts`` reaches ``max_attempts`` the record is marked
+        ``quarantined`` and ``retry_status`` never reports it ready again.
+        Returns the persisted record.
+        """
+
+        self._validate_max_attempts(max_attempts)
         if (
-            not isinstance(error_code, str)
+            (exit_status is not None and body_free_exit_status(exit_status) is None)
+            or not isinstance(error_code, str)
             or _SAFE_ERROR_CODE_RE.fullmatch(error_code) is None
             or not isinstance(now, (int, float))
             or isinstance(now, bool)
@@ -559,23 +625,34 @@ class SkillCandidateSink:
                 cast(int, current["attempts"]) + 1 if current is not None else 1
             )
             exponent = min(attempts - 1, 30)
-            delay = min(
-                float(max_delay_seconds),
-                float(base_delay_seconds) * (2**exponent),
+            quarantined = max_attempts is not None and attempts >= max_attempts
+            # A quarantined record still carries a finite retry time so an
+            # older bridge that ignores the flag keeps its maximum backoff.
+            delay = (
+                float(max_delay_seconds)
+                if quarantined
+                else min(
+                    float(max_delay_seconds),
+                    float(base_delay_seconds) * (2**exponent),
+                )
             )
+            record: dict[str, object] = {
+                "schema_version": _RETRY_SCHEMA_VERSION,
+                "job_id": job_id,
+                "attempts": attempts,
+                "error_code": error_code,
+                "exit_status": exit_status,
+                "next_retry_at": float(now) + delay,
+                "quarantined": quarantined,
+            }
             payload = json.dumps(
-                {
-                    "schema_version": _RETRY_SCHEMA_VERSION,
-                    "job_id": job_id,
-                    "attempts": attempts,
-                    "error_code": error_code,
-                    "next_retry_at": float(now) + delay,
-                },
+                record,
                 allow_nan=False,
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
             _atomic_write_bytes(path, payload)
+            return record
 
     def clear_retry(self, job_id: str) -> None:
         """Remove retry metadata after a successful/zero-candidate stage."""
@@ -937,4 +1014,8 @@ __all__ = [
     "SkillCandidateCollector",
     "SkillCandidateStageResult",
     "SkillCandidateCollisionError",
+    "RETRY_BACKOFF",
+    "RETRY_QUARANTINED",
+    "RETRY_READY",
+    "body_free_exit_status",
 ]

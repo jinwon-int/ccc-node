@@ -369,6 +369,17 @@ distill; `CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED=1` is an explicit, discouraged
 escape hatch. Enforce defers autonomous extraction before claim/provider
 execution without blocking interactive turns.
 
+The Codex/Piri/Danso skill-candidate collector reads the same snapshots and
+applies the same gate: without usage metering and a finite
+`CCC_USAGE_BUDGET_TOKENS_<PROVIDER>` it is not composed and logs
+`Skill-candidate collection disabled: ...` once at startup, unless
+`CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED=1`. A provider-started collector attempt
+keeps its worst-case reservation even when it fails, so each job is
+quarantined after 5 consecutive failed attempts: its body-free
+`.retries/<job_id>.json` record (`error_code`, `exit_status`, `attempts`) is
+marked `quarantined` and the job is never retried or reserved again. Delete
+that record to requeue the job once the underlying failure is fixed.
+
 The legacy and bridge paths share
 `${CCC_STATE_DIR:-~/.claude/state}/distill.disabled` as a global off-switch.
 Provider stderr is captured only in a bounded owner-only tempfile, classified
