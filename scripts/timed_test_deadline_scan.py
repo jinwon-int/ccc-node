@@ -22,7 +22,8 @@ and correctly stays quiet about ccc-node#1353, which was judged on time.
 Two modes:
 
 ``expired``
-    Deadline is in the past and no verdict-shaped comment followed it.
+    Deadline is in the past and no verdict-shaped comment followed it — or
+    preceded it, for a test run early and judged after its booking.
 
 ``relative``
     A timed test described only in relative terms ("며칠", "1~2주") with no
@@ -97,11 +98,18 @@ DEADLINE_KEYWORD = re.compile(
     re.IGNORECASE,
 )
 
-# 2026-09-17 07:32 / 2026.09.17 / 2026년 9월 17일 07:32
+# 2026-09-17 07:32 / 2026.09.17 / 2026년 9월 17일 07:32 / 2026-09-28 07:36:11 UTC
+#
+# Group 6 captures an explicit UTC marker. Without it a completion report's
+# "테스트 종료: 2026-09-28 07:36:11 UTC (16:36 KST)" was read as 07:36 *KST*,
+# nine hours early (a2a-nexus#2256). "UTC+09:00" is an offset annotation, not
+# a UTC clock reading, so a following sign excludes it.
 DEADLINE_DATE = re.compile(
     r"(20\d{2})[-./년]\s*(\d{1,2})[-./월]\s*(\d{1,2})일?"
-    r"(?:\s*(?:T|\s)\s*(\d{1,2}):(\d{2}))?"
+    r"(?:\s*(?:T|\s)\s*(\d{1,2}):(\d{2})(?::\d{2})?"
+    r"(?:\s*(UTC|GMT)(?![+-]\d)\b|(Z)\b)?)?"
 )
+UTC_TO_KST = dt.timedelta(hours=9)
 
 # A comment that reads like somebody actually rendered a judgement.
 #
@@ -128,12 +136,42 @@ VERDICT = re.compile(
     re.IGNORECASE,
 )
 
+# A verdict that lands *before* the deadline — the test was run early and
+# judged on the spot — counts only when it follows the booking and its heading
+# states a conclusion. "연장"/"재관측" are excluded: posted early they announce
+# more waiting, not a result (and an extension carries its own new deadline).
+# a2a-nexus#1597 booked 2026-09-26 12:00, ran early and was judged
+# "## 재카나리 판정 — 불합격" then "## 재카나리 r2 — 합격" the evening before,
+# yet was reported expired-unjudged because only post-deadline comments were
+# read. A verdict posted before the booking still never counts.
+#
+# The pre-deadline window spans days of progress updates, so it is held to a
+# stricter test than the post-deadline one: only the *first line* is read, and
+# "판정" must not be a table, a criterion, a pending state or an interim call,
+# nor a topic ("판정은 종료 후") — a real one then still says 합격/불합격.
+# Matching the 200-char window instead cleared ccc-node#1528 on
+# "## 오너 결정 반영 — TM-3353 판정표 후속", which judged nothing.
+EARLY_VERDICT = re.compile(
+    r"((?<!중간\s)(?<!중간)판정(?!\s*(표|기준|대기|예정|보류|일정|요청|전)|은|는)"
+    r"|결과\s*보고|종료\s*보고|합격|불합격"
+    r"|실제\s*종료|결과\s*갱신|(검증|관측|테스트|카나리)\s*완료)",
+    re.IGNORECASE,
+)
+
 # A verdict announces itself in the heading. Searching the whole comment body
 # instead picked up "판정" from a table header (`| 항목 | 값 | 판정 |`,
 # ccc-node#1692) and from mid-sentence prose ("불충분 판정", a2a-nexus#1597),
 # hiding both real findings. Real verdicts led with "## 관측 종료 판정"
 # (ccc-node#1353), so the heading window is where to look.
 VERDICT_HEADER_CHARS = 200
+
+
+def _first_line(body: str) -> str:
+    for line in (body or "").splitlines():
+        if line.strip():
+            return line.strip()[:VERDICT_HEADER_CHARS]
+    return ""
+
 
 # The deadline paragraph itself already reports a finished test.
 SETTLED = re.compile(
@@ -253,9 +291,12 @@ def _dates_in(paragraph: str) -> list[tuple[dt.datetime, bool]]:
         hour = int(match.group(4)) if explicit else 23
         minute = int(match.group(5)) if explicit else 59
         try:
-            found.append((dt.datetime(year, month, day, hour, minute), explicit))
+            stamp = dt.datetime(year, month, day, hour, minute)
         except ValueError:
             continue  # 2026-13-45 and friends
+        if match.group(6) or match.group(7):
+            stamp += UTC_TO_KST  # everything downstream is naive KST
+        found.append((stamp, explicit))
     return found
 
 
@@ -314,9 +355,18 @@ def collect_hits(issue: dict[str, Any]) -> tuple[list[Hit], list[str]]:
             if not dates:
                 continue
             reason = classify_false_positive(paragraph, number, header)
-            # A paragraph may render the same instant twice (KST and UTC).
-            # Keep the latest, which is the KST rendering when both appear.
+            # A paragraph may render the same instant twice (KST and UTC);
+            # _dates_in already normalised marked UTC, so both agree. Keep the
+            # latest, which is also the KST rendering of an unmarked UTC pair.
             deadline, explicit = max(dates, key=lambda item: item[0])
+            # A booking always precedes its deadline. A comment stating a time
+            # that had already passed when it was posted is a record of what
+            # happened — "테스트 종료: 07:36:11 UTC" inside the result report
+            # posted eight minutes later (a2a-nexus#2256) — or a nag citing a
+            # missed deadline whose original booking is scored on its own.
+            # Demote, keep.
+            if reason is None and posted is not None and deadline <= posted:
+                reason = "past-at-posting"
             # The owner rule asks for an absolute KST *datetime*. A bare date
             # next to a deadline keyword is more often a citation than a
             # booking — "오너 규칙(2026-09-11)은 … 종료 일시를 …" got the
@@ -393,12 +443,23 @@ def judge_issue(issue: dict[str, Any], now: dt.datetime, mode: str) -> Finding |
         return None  # still running; not our business
 
     after = [t for t in comment_times if t > latest.deadline]
-    judged = [
-        c
-        for c, t in zip(comments, comment_times)
-        if t > latest.deadline
-        and VERDICT.search((c.get("body") or "")[:VERDICT_HEADER_CHARS])
-    ]
+    # The early-verdict window opens at the *last* comment that stated this
+    # deadline, so a re-affirmed booking resets it. The issue body (posted_at
+    # None) predates every comment.
+    booked_at = max(
+        (hit.posted_at for hit in hits if hit.deadline == latest.deadline and hit.posted_at),
+        default=None,
+    )
+    judged = []
+    for comment, posted in zip(comments, comment_times):
+        head = (comment.get("body") or "")[:VERDICT_HEADER_CHARS]
+        if posted > latest.deadline:
+            if VERDICT.search(head):
+                judged.append(comment)
+        elif (booked_at is None or posted > booked_at) and EARLY_VERDICT.search(
+            _first_line(comment.get("body") or "")
+        ):
+            judged.append(comment)
     if judged:
         return None
 
