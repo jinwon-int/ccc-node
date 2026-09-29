@@ -146,7 +146,7 @@ class FalsePositiveClassificationTests(unittest.TestCase):
             repo="jinwon-int/a2a-nexus",
             comments=[
                 _comment(
-                    "## 후속 PR #2286 착지 — 검증 종료 · jingun · 2026-09-28\n\n"
+                    "## 후속 PR #2286 착지 — 검증 종료 · worker · 2026-09-28\n\n"
                     "- **착지**: #2286 → main `7a105b66`\n"
                     "- **테스트 종료**: 2026-09-28 07:36:11 UTC (16:36 KST). 전체 게이트 실행.",
                     "2026-09-28T07:44:22Z",
@@ -275,7 +275,7 @@ class ExpiredModeTests(unittest.TestCase):
                     "2026-09-25T12:53:15Z",
                 ),
                 _comment("## 재카나리 판정 — **불합격 (runtime mismatch)**", "2026-09-25T12:56:18Z"),
-                _comment("## 재카나리 r2 — **합격** · 등애 `canary_passed` 승격", "2026-09-25T13:50:36Z"),
+                _comment("## 재카나리 r2 — **합격** · 대상 노드 `canary_passed` 승격", "2026-09-25T13:50:36Z"),
             ],
         )
         now = dt.datetime(2026, 9, 29, 9, 20)
