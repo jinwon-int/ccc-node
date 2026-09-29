@@ -16,6 +16,12 @@ Scope and safety contract:
   moves happen only with CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true; otherwise an
   archive move is an operator action (PR-first + owner approval). Backup pruning follows an explicit retention
   cap and never touches the newest ``keep`` snapshots.
+- "Idle" is judged on the UNION of two usage ledgers (owner decision #1739):
+  the Skill-tool record in ``skill-autosave-usage.json`` and the Read|Skill
+  ledger ``skill-usage/usage.jsonl``. Either one showing use in the window
+  keeps a skill active; a missing ledger falls back to the other; when
+  neither has recorded any use (or usage.jsonl is unreadable) no idle
+  transition is made.
 - Telemetry is body-free: counters, ISO timestamps and state flags only. Bump
   is fail-open (telemetry failure never blocks a foreground skill call);
   lifecycle mutations are fail-closed when telemetry/provenance is unreadable.
@@ -64,6 +70,12 @@ ContractError = ownership.ContractError
 import ccc_secure_fs  # noqa: E402
 
 _USAGE_FILE = "skill-autosave-usage.json"
+# Second usage ledger (#1347/#1692, owner decision #1739): the PostToolUse
+# Read|Skill logger (skill-usage-log.sh) and the piri extension append one
+# ``{"ts","skill","tool"[,"runtime"]}`` line per skill load. _USAGE_FILE only
+# sees the Skill tool, so the stale judgement uses the UNION of both.
+_READ_LEDGER_FILE = Path("skill-usage") / "usage.jsonl"
+_MAX_READ_LEDGER_BYTES = 8 * 1024 * 1024
 _CURATOR_STATE_FILE = "skill-autosave-curator-state.json"
 _ARCHIVE_DIR = "skill-autosave-archive"
 _BACKUP_DIR = "skill-autosave-curator-backups"
@@ -167,7 +179,10 @@ def _parse_ts(value: Any) -> datetime | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError:  # e.g. year 1 with a positive offset (#1739)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +276,109 @@ def _last_activity(record: dict[str, Any]) -> datetime | None:
     ]
     stamps = [stamp for stamp in stamps if stamp is not None]
     return max(stamps) if stamps else None
+
+
+def _read_ledger_tail(path: Path, uid: int) -> tuple[str, bytes]:
+    """(status, newest bytes) of an owner-only append-only ledger. Never raises.
+
+    status is ``missing`` (no file), ``unreadable`` (unsafe or unreadable) or
+    ``read``. Only the newest ``_MAX_READ_LEDGER_BYTES`` are returned; a tail
+    read drops its partial first line.
+    """
+    try:
+        linked = os.lstat(path)
+    except FileNotFoundError:
+        return "missing", b""
+    except OSError:
+        return "unreadable", b""
+    if not stat.S_ISREG(linked.st_mode):
+        return "unreadable", b""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return "unreadable", b""
+    try:
+        meta = os.fstat(descriptor)
+        if (
+            (meta.st_dev, meta.st_ino) != (linked.st_dev, linked.st_ino)
+            or not stat.S_ISREG(meta.st_mode)
+            or meta.st_uid != uid
+            or meta.st_nlink != 1
+            or stat.S_IMODE(meta.st_mode) & 0o022
+        ):
+            return "unreadable", b""
+        # Appends may land concurrently: read only up to the size seen now.
+        offset = max(0, meta.st_size - _MAX_READ_LEDGER_BYTES)
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = meta.st_size - offset
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError:
+        return "unreadable", b""
+    finally:
+        os.close(descriptor)
+    data = b"".join(chunks)
+    if offset > 0:
+        data = data.split(b"\n", 1)[1] if b"\n" in data else b""
+    return "read", data
+
+
+def _read_usage_ledger(context) -> tuple[str, dict[str, datetime]]:
+    """Latest use per skill from ``usage.jsonl``: (status, {name: ts}).
+
+    status is ``present`` (at least one valid row), ``missing`` (no file, or
+    no valid row at all — nothing that could prove use) or ``unreadable``
+    (the file exists but is unsafe/unreadable, so it MIGHT hold use evidence).
+    Corrupt, partial or malformed lines are skipped, never fatal. Never raises.
+    """
+    status, data = _read_ledger_tail(context.state_dir / _READ_LEDGER_FILE, context.uid)
+    if status != "read":
+        return status, {}
+    latest: dict[str, datetime] = {}
+    for line in data.splitlines():
+        try:
+            row = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(row, dict):
+            continue
+        name = row.get("skill")
+        when = _parse_ts(row.get("ts"))
+        if not isinstance(name, str) or not ownership._NAME_RE.fullmatch(name) or when is None:
+            continue
+        if name not in latest or when > latest[name]:
+            latest[name] = when
+    return ("present" if latest else "missing"), latest
+
+
+def _usage_evidence(usage: dict[str, Any], ledger_status: str) -> str:
+    """Whether any usage ledger can back a stale judgement (#1739).
+
+    ``ok`` when usage.jsonl holds valid rows, or when it is missing but the
+    Skill-tool ledger holds real bump telemetry (a curator-seeded record with
+    zero counts is not evidence). ``missing`` when neither ledger has recorded
+    any use (absence must never read as zero use); ``unreadable`` when
+    usage.jsonl exists but could not be read safely.
+    """
+    if ledger_status == "unreadable":
+        return "unreadable"
+    if ledger_status == "present":
+        return "ok"
+    for record in usage["records"].values():
+        if (
+            record.get("use_count", 0) > 0
+            or record.get("view_count", 0) > 0
+            or record.get("last_used_at")
+            or record.get("last_viewed_at")
+        ):
+            return "ok"
+    return "missing"
 
 
 def _ledger_created_index(context, rows: list[dict[str, Any]]) -> dict[str, datetime]:
@@ -1280,10 +1398,16 @@ def _rollback_backup(
 # ---------------------------------------------------------------------------
 
 
+_IDLE_ACTIONS = {"mark-stale", "archive-candidate", "archive"}
+
+
 def _decide(
     record: dict[str, Any],
     now: datetime,
     config: dict[str, Any],
+    *,
+    ledger_used_at: datetime | None = None,
+    evidence: str = "ok",
 ) -> tuple[str, str]:
     """Pure transition decision: (action, reason).
 
@@ -1292,13 +1416,39 @@ def _decide(
     never-used skills younger than the stale window get a grace pass; stale
     skills with fresh activity reactivate. With archive disabled (the default,
     #2011) the decision is mark-only and never returns ``archive``.
+
+    Owner decision #1739: activity is the union of the Skill-tool record and
+    ``ledger_used_at`` (latest usage.jsonl row for this skill). When
+    ``evidence`` is not ``ok`` (no ledger recorded any use, or usage.jsonl is
+    unreadable) idleness cannot be judged: every idle transition is held.
     """
+    action, reason = _decide_union(record, now, config, ledger_used_at)
+    if evidence != "ok" and action in _IDLE_ACTIONS:
+        return "keep", f"usage-ledger-{evidence}"
+    return action, reason
+
+
+def _decide_union(
+    record: dict[str, Any],
+    now: datetime,
+    config: dict[str, Any],
+    ledger_used_at: datetime | None,
+) -> tuple[str, str]:
     stale_cutoff = now - timedelta(days=config["stale_after_days"])
     archive_cutoff = now - timedelta(days=config["archive_after_days"])
     state = record["state"]
+    created = _parse_ts(record.get("created_at"))
+    if ledger_used_at is not None and created is not None and ledger_used_at < created:
+        # A load logged before this skill existed belongs to an earlier
+        # same-name skill; it must not end this one's never-used grace.
+        ledger_used_at = None
     last_activity = _last_activity(record)
+    if ledger_used_at is not None and (
+        last_activity is None or ledger_used_at > last_activity
+    ):
+        last_activity = ledger_used_at
     anchor = last_activity or _parse_ts(record.get("created_at")) or now
-    never_used = record["use_count"] == 0
+    never_used = record["use_count"] == 0 and ledger_used_at is None
     if state == "archived":
         return "keep", "already-archived"
     if never_used and anchor > stale_cutoff:
@@ -1423,12 +1573,15 @@ def _classify_run_decision(
     controls: dict[str, Any] | None = None,
     created_index: dict[str, datetime] | None = None,
     classifications: dict[str, dict[str, Any]] | None = None,
+    ledger_uses: dict[str, datetime] | None = None,
+    evidence: str = "ok",
 ) -> None:
     """Append one skill's transition decision to the run report (no mutation).
 
     ``controls``/``created_index`` share reads the run performed once up
     front; ``classifications`` collects this skill's record so the backup
     pass can reuse it instead of classifying everything a second time.
+    ``ledger_uses``/``evidence`` carry the usage.jsonl union (#1739).
     """
     report["counts"]["checked"] += 1
     classification = ownership._classification(context, name, controls=controls)
@@ -1455,7 +1608,13 @@ def _classify_run_decision(
         report["counts"]["seeded"] += 1
         report["decisions"].append({"name": name, "action": "seed", "reason": "first-sight"})
         return
-    action, reason = _decide(record, now, config)
+    action, reason = _decide(
+        record,
+        now,
+        config,
+        ledger_used_at=(ledger_uses or {}).get(name),
+        evidence=evidence,
+    )
     report["decisions"].append({"name": name, "action": action, "reason": reason})
     count_keys = {
         "keep": "kept",
@@ -1548,6 +1707,9 @@ def _command_run(context, *, dry_run: bool, auto: bool) -> dict[str, Any]:
             return report
         controls = ownership._preload_controls(context)
         created_index = _ledger_created_index(context, ledger_rows)
+        ledger_status, ledger_uses = _read_usage_ledger(context)
+        evidence = _usage_evidence(usage, ledger_status)
+        report["usage_ledgers"] = {"usage_jsonl": ledger_status, "evidence": evidence}
         classifications: dict[str, dict[str, Any]] = {}
         for name in ownership._skill_names(context):
             _classify_run_decision(
@@ -1561,6 +1723,8 @@ def _command_run(context, *, dry_run: bool, auto: bool) -> dict[str, Any]:
                 controls=controls,
                 created_index=created_index,
                 classifications=classifications,
+                ledger_uses=ledger_uses,
+                evidence=evidence,
             )
         planned = any(
             decision["action"] in {"mark-stale", "reactivate", "archive"}
@@ -1648,6 +1812,9 @@ def _lifecycle_candidate(
     classification: dict[str, Any],
     now: datetime,
     config: dict[str, Any],
+    *,
+    ledger_used_at: datetime | None = None,
+    evidence: str = "ok",
 ) -> dict[str, Any] | None:
     """Observation-list entry for a stale, lifecycle-eligible skill (#2011).
 
@@ -1663,7 +1830,9 @@ def _lifecycle_candidate(
         or classification["pinned"]
     ):
         return None
-    action, _reason = _decide(record, now, config)
+    action, _reason = _decide(
+        record, now, config, ledger_used_at=ledger_used_at, evidence=evidence
+    )
     return {
         "stage": "archive-candidate"
         if action in {"archive", "archive-candidate"}
@@ -1677,6 +1846,8 @@ def _command_report(context) -> dict[str, Any]:
     now = _now()
     config = _load_config()
     usage = _load_usage(context, strict=False)
+    ledger_status, ledger_uses = _read_usage_ledger(context)
+    evidence = _usage_evidence(usage, ledger_status)
     candidates: list[dict[str, Any]] = []
     by_state: dict[str, int] = {"active": 0, "stale": 0, "archived": 0, "untracked": 0}
     by_class: dict[str, int] = {}
@@ -1692,7 +1863,14 @@ def _command_report(context) -> dict[str, Any]:
             by_state["untracked"] += 1
         else:
             by_state[record["state"]] += 1
-        candidate = _lifecycle_candidate(record, classification, now, config)
+        candidate = _lifecycle_candidate(
+            record,
+            classification,
+            now,
+            config,
+            ledger_used_at=ledger_uses.get(name),
+            evidence=evidence,
+        )
         if candidate is not None:
             candidates.append({"name": name, **candidate})
         skills.append(_skill_report(context, name, classification, usage, now))
@@ -1730,6 +1908,7 @@ def _command_report(context) -> dict[str, Any]:
         "run_count": (state or {}).get("run_count", 0),
         "recent_activity": recent,
         "lifecycle_candidates": candidates,
+        "usage_ledgers": {"usage_jsonl": ledger_status, "evidence": evidence},
         "config": config,
     }
 

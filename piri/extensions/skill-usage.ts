@@ -8,10 +8,10 @@
  *
  * The existing logger receives its Read/Skill stdin contract with only a skill
  * name and a synthetic /skills/<name>/SKILL.md path, never the original path,
- * prompt, or tool result. Its ts/skill/tool ledger format stays unchanged.
- * Existing flock and owner-only ledger permissions are reused; the logger has
- * no retention policy. Its aggregate report does not separate these semantics
- * or identify which runtime supplied a line.
+ * prompt, or tool result. Lines keep the ts/skill/tool format and are tagged
+ * runtime "piri" via CCC_SKILL_USAGE_RUNTIME (#1739). Existing flock and
+ * owner-only ledger permissions are reused; the logger has no retention
+ * policy. Its aggregate report does not separate these semantics.
  *
  * pi.exec has no stdin. Dedicated process groups provide bounded, best-effort
  * children instead: at most four active loggers, no queued overflow, timeout
@@ -154,7 +154,7 @@ export function emitSkillUse(
 				// A separate process group lets timeout kill flock/sleep descendants,
 				// including descendants that inherited the logger's lock descriptor.
 				detached: true,
-				env,
+				env: { ...env, CCC_SKILL_USAGE_RUNTIME: "piri" },
 			});
 		} catch {
 			activeLoggerChildren -= 1;

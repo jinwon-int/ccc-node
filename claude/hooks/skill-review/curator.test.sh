@@ -403,6 +403,11 @@ mo_skill() {
 mo_decision() { # <json> <name> — the run's action for one skill
   jq -r --arg n "$2" '[.decisions[] | select(.name == $n) | .action] | first // "none"' <<<"$1"
 }
+# A wired Read|Skill ledger with no rows for these skills: idleness is
+# judgeable (#1739 — with no usage ledger at all nothing is marked).
+mkdir -m 700 "$MO_STATE/skill-usage"
+printf '{"ts":"%s","skill":"unrelated-skill","tool":"Read"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MO_STATE/skill-usage/usage.jsonl"
+chmod 600 "$MO_STATE/skill-usage/usage.jsonl"
 mo_skill mo-idle
 mo_skill mo-used
 mo_skill mo-pinned
@@ -450,6 +455,106 @@ rc=$?
 ok "malformed archive switch fails closed" '[ "$rc" -eq 2 ] && jq -e ".code == \"invalid_config_CCC_SKILL_CURATOR_ARCHIVE_ENABLED\"" >/dev/null <<<"$out"'
 ok "mark-only: skills survive the whole run sequence" '[ -f "$MO_SKILLS/mo-idle/SKILL.md" ]'
 rm -rf "$MO_TMP"
+
+# --- 14. usage-ledger union (owner decision #1739) ------------------------------
+# "Unused for 30 days" = no use in skill-autosave-usage.json (Skill tool) AND
+# none in skill-usage/usage.jsonl (Read of SKILL.md + piri). A missing ledger
+# falls back to the other; no ledger at all, or an unreadable usage.jsonl,
+# marks nothing. Corrupt usage.jsonl lines are skipped. Archive stays off.
+U_TMP="$(mktemp -d)"; U_STATE="$U_TMP/state"; U_SKILLS="$U_TMP/skills"
+mkdir -m 700 "$U_STATE" "$U_SKILLS"
+U_LEDGER="$U_STATE/skill-usage/usage.jsonl"
+ut() { python3 "$TOOL" --provider claude --skills-dir "$U_SKILLS" --state-dir "$U_STATE" "$@"; }
+ut_at() { # <days-from-now> <cmd...>
+  local days="$1"; shift
+  CCC_SKILL_CURATOR_NOW="$(python3 -c "from datetime import datetime,timedelta,timezone; print((datetime.now(timezone.utc)+timedelta(days=$days)).isoformat())")" ut "$@"
+}
+ts_at() { # <days-from-now> — a usage.jsonl timestamp
+  python3 -c "from datetime import datetime,timedelta,timezone; print((datetime.now(timezone.utc)+timedelta(days=$1)).strftime('%Y-%m-%dT%H:%M:%SZ'))"
+}
+u_skill() {
+  mkdir -m 700 "$U_SKILLS/$1"
+  printf -- '---\nname: %s\ndescription: A sufficiently detailed recurring workflow for usage-ledger union tests.\n---\n\n# %s\n' "$1" "$1" > "$U_SKILLS/$1/SKILL.md"
+  chmod 600 "$U_SKILLS/$1/SKILL.md"
+  python3 "$OWN" --provider claude --skills-dir "$U_SKILLS" --state-dir "$U_STATE" mark-created "$1" >/dev/null
+}
+u_ledger() { # <line...> — replace usage.jsonl with the given raw lines
+  mkdir -p -m 700 "$U_STATE/skill-usage"
+  printf '%s\n' "$@" > "$U_LEDGER"
+  chmod 600 "$U_LEDGER"
+}
+u_decision() { # <json> <name> — "action reason" for one skill
+  jq -r --arg n "$2" '[.decisions[] | select(.name == $n) | "\(.action) \(.reason)"] | first // "none"' <<<"$1"
+}
+u_skill u-read-only
+u_skill u-unused
+ut run >/dev/null  # first sight seeds every record
+
+# 14a. both ledgers missing: no usage evidence anywhere -> nothing is marked.
+out="$(ut_at 40 run --dry-run)"
+ok "union: no usage ledger at all marks nothing stale (fail-safe)" \
+  'jq -e ".counts.marked_stale == 0 and .usage_ledgers.evidence == \"missing\"" >/dev/null <<<"$out" && [ "$(u_decision "$out" u-unused)" = "keep usage-ledger-missing" ]'
+
+# 14b. used ONLY via usage.jsonl within the window -> NOT stale; used in
+# neither -> stale. Corrupt / partial / foreign-shaped lines are skipped.
+u_ledger \
+  "{\"ts\":\"$(ts_at 25)\",\"skill\":\"u-read-only\",\"tool\":\"Read\"}" \
+  'not json at all' \
+  '{"ts":"garbage","skill":"u-unused","tool":"Read"}' \
+  '{"ts":"2026-01-01T00:00:00Z","skill":"BAD NAME","tool":"Read"}' \
+  '["an","array"]' \
+  '{"ts":"0001-01-01T00:00:00+01:00","skill":"u-unused","tool":"Read"}' \
+  "{\"ts\":\"$(ts_at 26)\",\"skill\":\"u-read-only\",\"tool\":\"Read\",\"runtime\":\"piri\"}" \
+  '{"ts":"2026-01-01T00:0'
+out="$(ut_at 40 run)"; rc=$?
+ok "union: corrupt usage.jsonl lines are skipped, never fatal" '[ "$rc" -eq 0 ] && jq -e ".ok == true and .usage_ledgers.usage_jsonl == \"present\"" >/dev/null <<<"$out"'
+ok "union: a skill used only via usage.jsonl within 30d is NOT marked stale" \
+  '[ "$(u_decision "$out" u-read-only)" = "keep within-window" ]'
+ok "union: a skill used in neither ledger is marked stale" \
+  '[ "$(u_decision "$out" u-unused)" = "mark-stale idle>30d" ]'
+out="$(ut_at 40 status u-read-only)"
+ok "union: the read-only skill stays active" 'jq -e ".skills[0].telemetry.state == \"active\"" >/dev/null <<<"$out"'
+
+# 14c. a fresh usage.jsonl row reactivates a stale skill; the report agrees.
+u_ledger \
+  "{\"ts\":\"$(ts_at 25)\",\"skill\":\"u-read-only\",\"tool\":\"Read\"}" \
+  "{\"ts\":\"$(ts_at 45)\",\"skill\":\"u-unused\",\"tool\":\"Skill\"}"
+out="$(ut_at 50 run)"
+ok "union: a fresh usage.jsonl row reactivates a stale skill" '[ "$(u_decision "$out" u-unused)" = "reactivate fresh-activity" ]'
+out="$(ut_at 50 report)"
+ok "union: report carries the ledger status and lists no candidate" \
+  'jq -e ".usage_ledgers.evidence == \"ok\" and (.lifecycle_candidates | length) == 0" >/dev/null <<<"$out"'
+
+# 14d. usage.jsonl missing -> the Skill-tool ledger alone decides.
+rm -f "$U_LEDGER"
+ut_at 60 bump --event use --name u-read-only >/dev/null
+out="$(ut_at 80 run --dry-run)"
+ok "union: missing usage.jsonl falls back to the Skill-tool ledger" \
+  'jq -e ".usage_ledgers.usage_jsonl == \"missing\" and .usage_ledgers.evidence == \"ok\"" >/dev/null <<<"$out" && [ "$(u_decision "$out" u-read-only)" = "keep within-window" ] && [ "$(u_decision "$out" u-unused)" = "mark-stale idle>30d" ]'
+
+# 14e. usage.jsonl present but unsafe (group/world-writable) -> it may hold
+# use evidence, so no idle transition is made at all.
+u_ledger "{\"ts\":\"$(ts_at 1)\",\"skill\":\"u-read-only\",\"tool\":\"Read\"}"
+chmod 666 "$U_LEDGER"
+out="$(ut_at 80 run --dry-run)"; rc=$?
+ok "union: an unreadable usage.jsonl holds every idle transition" \
+  '[ "$rc" -eq 0 ] && jq -e ".usage_ledgers.evidence == \"unreadable\" and .counts.marked_stale == 0" >/dev/null <<<"$out" && [ "$(u_decision "$out" u-unused)" = "keep usage-ledger-unreadable" ]'
+rm -f "$U_LEDGER"
+ln -s "$U_TMP/elsewhere.jsonl" "$U_LEDGER"
+out="$(ut_at 80 run --dry-run)"
+ok "union: a symlinked usage.jsonl is never followed and holds transitions" \
+  'jq -e ".usage_ledgers.usage_jsonl == \"unreadable\" and .counts.marked_stale == 0" >/dev/null <<<"$out"'
+rm -f "$U_LEDGER"
+
+# 14f. a usage.jsonl row older than the skill (an earlier same-name skill)
+# never ends a young skill's never-used grace.
+u_skill u-young
+u_ledger "{\"ts\":\"$(ts_at -60)\",\"skill\":\"u-young\",\"tool\":\"Read\"}"
+ut run >/dev/null
+out="$(ut_at 5 run --dry-run)"
+ok "union: a pre-creation usage row does not end the never-used grace" '[ "$(u_decision "$out" u-young)" = "keep never-used-grace" ]'
+ok "union: archive stays off throughout" '[ -z "$(ls -A "$U_STATE/skill-autosave-archive" 2>/dev/null)" ] && [ -f "$U_SKILLS/u-unused/SKILL.md" ]'
+rm -rf "$U_TMP"
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

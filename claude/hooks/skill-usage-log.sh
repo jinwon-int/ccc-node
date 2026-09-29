@@ -53,6 +53,11 @@ esac
 skill="$(printf '%s' "$skill" | tr -cd 'a-z0-9-')"
 [ -n "$skill" ] || exit 0
 
+# Which runtime loaded the skill (#1739). This hook is wired into Claude Code,
+# so the default is claude; other callers (the piri extension) say who they are.
+runtime="$(printf '%s' "${CCC_SKILL_USAGE_RUNTIME:-claude}" | tr -cd 'a-z0-9-' | cut -c1-32)"
+[ -n "$runtime" ] || runtime="claude"
+
 state="${CCC_CLAUDE_DIR:-$HOME/.claude}/state/skill-usage"
 mkdir -p "$state" 2>/dev/null || exit 0
 chmod 700 "$state" 2>/dev/null || true
@@ -60,8 +65,8 @@ ledger="$state/usage.jsonl"
 lock="$state/.usage.lock"
 {
   flock -x 9
-  printf '{"ts":"%s","skill":"%s","tool":"%s"}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$skill" "$tool" >>"$ledger" 2>/dev/null || true
+  printf '{"ts":"%s","skill":"%s","tool":"%s","runtime":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$skill" "$tool" "$runtime" >>"$ledger" 2>/dev/null || true
   chmod 600 "$ledger" 2>/dev/null || true
 } 9>>"$lock" 2>/dev/null || true
 exit 0

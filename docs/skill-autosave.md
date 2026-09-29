@@ -859,6 +859,21 @@ or deletes anything:
    (`counts.archive_candidates`, and `report` → `lifecycle_candidates[]` with
    `stage: observe|archive-candidate`). This is report-only.
 
+**"Idle" = no use in either usage ledger (owner decision #1739, 2026-09-29).**
+The Skill-tool store above cannot see the Read path — how bridge-resolved and
+file-invoked skills actually load — so the stale judgement takes the UNION of
+`skill-autosave-usage.json` and `state/skill-usage/usage.jsonl` (the
+`skill-usage-log.sh` Read|Skill ledger, also fed by the piri extension; lines
+now carry a `runtime` field). A skill with a row in either within the window
+stays active, and a fresh `usage.jsonl` row reactivates a stale one. Rows older
+than the skill's `created_at` are ignored (an earlier same-name skill).
+Fail-safe: a missing `usage.jsonl` falls back to the Skill-tool store; when
+neither ledger has recorded any use at all (`usage-ledger-missing`) or
+`usage.jsonl` exists but is unsafe/unreadable (`usage-ledger-unreadable`), no
+skill is marked stale, promoted, or archived that run. Corrupt or partial
+`usage.jsonl` lines are skipped; only the newest 8 MiB is read. `run` and
+`report` expose the result as `usage_ledgers: {usage_jsonl, evidence}`.
+
 Fresh activity at any point reactivates the skill and clears the mark. A
 record that was already `stale` before the stamp existed restarts its recheck
 window (`recheck-window-start`) rather than jumping straight to a candidate.

@@ -457,6 +457,7 @@ async function groupIntegration(cap: string): Promise<void> {
 	const first = JSON.parse(linesOf(ledger)[0]) as Record<string, unknown>;
 	ok("real logger: skill name", first.skill === "web");
 	ok("real logger: tool recorded", first.tool === "Read");
+	ok("real logger: piri runtime recorded", first.runtime === "piri", `runtime=${String(first.runtime)}`);
 	ok("real logger: ts recorded", typeof first.ts === "string" && (first.ts as string).length > 0);
 	const firstRaw = linesOf(ledger)[0];
 	ok(

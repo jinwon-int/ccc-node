@@ -22,8 +22,10 @@ line. Piri treats `#` as part of a filename: a successful read of
 In a no-tools session only explicit attempts can be observed. SDK paths
 that bypass these events are outside this coverage.
 
-The existing ledger contains only `ts`, `skill`, and `tool`. It cannot distinguish
-Claude from Piri, and `skill-usage-log.sh report` aggregates both evidence types.
+Ledger lines carry `ts`, `skill`, `tool`, and (since #1739) `runtime`: the
+extension sets `CCC_SKILL_USAGE_RUNTIME=piri` for its logger child, and the
+Claude Code hook records `claude`. Older lines have no `runtime` field, and
+`skill-usage-log.sh report` still aggregates both runtimes and evidence types.
 Do not present its total as a count of successful Piri reads or use zero as proof
 that a skill is unused. A request followed by a read is two distinct observations.
 Startup discovery and context injection are deliberately not counted.
