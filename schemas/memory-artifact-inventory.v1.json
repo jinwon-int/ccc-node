@@ -1,6 +1,12 @@
 {
   "schema": "ccc.memory-artifact-inventory.v1",
-  "note": "#873 step-1 inventory. Machine-readable policy registration for every private/body-bearing artifact class the harness writes. Paths are RESOLVER CHAINS (first existing candidate wins), never globs — an apply slice must go through these same chains, never raw $HOME expansion. Fields: role (source|derived|outbox|audit|index|operational), owner, requests (lifecycle request -> action; 'external-handoff' means a node-local run must not touch it). related_dirs (optional, dir-kind entries): sibling directories owned by the same class — classified alongside the resolved dir, never flagged unknown. extra_paths (optional, file-kind entries): additional literal candidates owned by the SAME class (multi-file classes like the managed cron logs) — classified, estimated and targeted per path. resolve candidates may also carry kind=pattern: an ANCHORED regex over sibling file names under the candidate's base (join form: env is the base; absolute form: dirname is the base) — lets one class own dated artifacts (bench-YYYYMMDD.md) without inventing files; name matching only, never glob expansion.",
+  "note": "#873 step-1 inventory. Machine-readable policy registration for every private/body-bearing artifact class the harness writes. Paths are RESOLVER CHAINS (first existing candidate wins), never globs — an apply slice must go through these same chains, never raw $HOME expansion. Fields: role (source|derived|outbox|audit|index|operational), owner, requests (lifecycle request -> action; 'external-handoff' means a node-local run must not touch it). related_dirs (optional, dir-kind entries): sibling directories owned by the same class — classified alongside the resolved dir, never flagged unknown. extra_paths (optional, file-kind entries): additional literal candidates owned by the SAME class (multi-file classes like the managed cron logs) — classified, estimated and targeted per path. resolve candidates may also carry kind=pattern: an ANCHORED regex over sibling file names under the candidate's base (join form: env is the base; absolute form: dirname is the base) — lets one class own dated artifacts (bench-YYYYMMDD.md) without inventing files; name matching only, never glob expansion. retention_policy (optional, #1468): marks an age-gated retention class (group a = legacy unscoped stores, group b = sensitive backups). Its resolve candidates are kind=pattern only; each matched file keeps a delete action only once max(mtime, ctime) is older than max_age_days (copies made with cp -p/rsync -a carry an old mtime, so ctime bounds the age) (retention_defaults.max_age_days, default 30; CCC_ERASURE_RETENTION_DAYS may only lengthen it), younger files plan as retain-until:<date>, key files (case-insensitive key tokens on [._-] boundaries: the planner's built-in list plus retention_defaults.key_file_patterns) plan as retain at any age, and a path a non-retention class resolves as live — matched by path, realpath and inode — is never a retention target. live_until_retired (optional): {marker, paths} — the listed paths stay claimed live regardless of env until the marker file exists (default absent). last_copy_guard (optional): {counterpart: <sibling live file name>|null} — while that live file is absent (null = not checkable), the newest copy per directory is retained past its retention. Destruction still runs only through ccc-erasure-apply.py under a separate per-node approval.",
+  "retention_defaults": {
+    "max_age_days": 30,
+    "age_source": "max(mtime,ctime)",
+    "decision": "#1468 owner decision 2026-09-29: groups a/b kept 30 days, then eligible for destruction at the apply boundary; key files always kept; per-node apply needs separate approval",
+    "key_file_patterns": []
+  },
   "artifacts": [
     {
       "id": "nunchi.peer_facts",
@@ -1580,7 +1586,7 @@
       },
       "derived_copies": [],
       "verification": "file presence",
-      "handoff_note": ".bak-* copies are owner-decision blockers (credential-adjacent)"
+      "handoff_note": ".bak-*/.pre-* copies are the bot.env_backups retention class (#1468 group b); the live .env itself is never a retention target"
     },
     {
       "id": "bot.credential_key",
@@ -1607,6 +1613,269 @@
         "audience-erasure": "retain",
         "node-decommission": "retain",
         "telegram-user-erasure": "retain"
+      },
+      "derived_copies": [],
+      "verification": "file presence"
+    },
+    {
+      "id": "legacy.nunchi_unscoped_db",
+      "path_class": "node-local legacy",
+      "contains": [
+        "pre-audience-scope-facts"
+      ],
+      "role": "source",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/facts\\.db"
+          }
+        ]
+      },
+      "retention_policy": {
+        "group": "a-legacy-store"
+      },
+      "live_until_retired": {
+        "marker": "~/.nunchi/.legacy-retired",
+        "paths": [
+          "~/.nunchi/facts.db",
+          "~/.nunchi/snapshot.md",
+          "~/.nunchi/backend-health.json"
+        ]
+      },
+      "retention": "group a (#1468): claimed live (still read via CCC_MEMORY_LEGACY_NUNCHI_HOME) until ~/.nunchi/.legacy-retired exists; then 30 days from max(mtime,ctime) before prune-expired may destroy it; decommission goes through handoff",
+      "requests": {
+        "prune-expired": "delete",
+        "node-decommission": "handoff-or-drop"
+      },
+      "derived_copies": [
+        "facts_fts"
+      ],
+      "verification": "retirement marker + age, body-free"
+    },
+    {
+      "id": "legacy.nunchi_unscoped_store",
+      "path_class": "node-local legacy",
+      "contains": [
+        "legacy-snapshot",
+        "legacy-backend-counters",
+        "stale-ingest-status"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/(backend-health\\.json|snapshot\\.md)"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/ingest\\.status\\.json\\.stale-[A-Za-z0-9._-]+"
+          }
+        ]
+      },
+      "retention_policy": {
+        "group": "a-legacy-store"
+      },
+      "live_until_retired": {
+        "marker": "~/.nunchi/.legacy-retired",
+        "paths": [
+          "~/.nunchi/facts.db",
+          "~/.nunchi/snapshot.md",
+          "~/.nunchi/backend-health.json"
+        ]
+      },
+      "retention": "group a (#1468): snapshot/backend-health stay claimed live until ~/.nunchi/.legacy-retired exists; then (and for stale ingest status always) 30 days from max(mtime,ctime), then eligible for destruction at the apply boundary",
+      "requests": {
+        "prune-expired": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "mtime age + live-resolver exclusion"
+    },
+    {
+      "id": "legacy.nunchi_retired_marker",
+      "path_class": "node-local config",
+      "contains": [
+        "operator-retirement-flag"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "path": "~/.nunchi/.legacy-retired"
+          }
+        ]
+      },
+      "retention": "operator-created flag (#1468): its presence releases the legacy ~/.nunchi store to the retention clock; retained",
+      "requests": {
+        "node-decommission": "retain"
+      },
+      "derived_copies": [],
+      "verification": "file presence"
+    },
+    {
+      "id": "bot.env_backups",
+      "path_class": "node-local config backup",
+      "contains": [
+        "bridge-env-copy",
+        "credential-references"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "\\.env\\.bak-[A-Za-z0-9._-]+"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.telegram_bot/\\.env\\.bak-[A-Za-z0-9._-]+"
+          },
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "\\.env\\.pre-[A-Za-z0-9._-]+"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.telegram_bot/\\.env\\.pre-[A-Za-z0-9._-]+"
+          }
+        ]
+      },
+      "retention_policy": {
+        "group": "b-sensitive-backup"
+      },
+      "retention": "group b (#1468): 30 days from mtime, then eligible for destruction at the apply boundary; the live .env is bot.env_config (retain)",
+      "requests": {
+        "prune-expired": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "mtime age, body-free",
+      "last_copy_guard": {
+        "counterpart": ".env"
+      }
+    },
+    {
+      "id": "bot.sessions_backups",
+      "path_class": "node-local operational backup",
+      "contains": [
+        "session-config-copy",
+        "chat-ids"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "sessions\\.json\\.bak-[A-Za-z0-9._-]+"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.telegram_bot/sessions\\.json\\.bak-[A-Za-z0-9._-]+"
+          }
+        ]
+      },
+      "retention_policy": {
+        "group": "b-sensitive-backup"
+      },
+      "retention": "group b (#1468): 30 days from mtime, then eligible for destruction at the apply boundary",
+      "requests": {
+        "prune-expired": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "mtime age, body-free",
+      "last_copy_guard": {
+        "counterpart": "sessions.json"
+      }
+    },
+    {
+      "id": "state.crontab_backups",
+      "path_class": "node-local operational backup",
+      "contains": [
+        "scheduled-command-history"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "crontab\\.bak-[A-Za-z0-9._-]+"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.telegram_bot/crontab\\.bak-[A-Za-z0-9._-]+"
+          },
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "crontab\\.bak-[A-Za-z0-9._-]+"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.claude/state/crontab\\.bak-[A-Za-z0-9._-]+"
+          }
+        ]
+      },
+      "retention_policy": {
+        "group": "b-sensitive-backup"
+      },
+      "retention": "group b (#1468): 30 days from mtime, then eligible for destruction at the apply boundary",
+      "requests": {
+        "prune-expired": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "mtime age, body-free",
+      "last_copy_guard": {
+        "counterpart": null
+      }
+    },
+    {
+      "id": "bot.credential_key_backups",
+      "path_class": "node-local config backup",
+      "contains": [
+        "audience-routing-key-material-copy"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "memory-audience\\.key\\.(bak|pre)-[A-Za-z0-9._-]+"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.telegram_bot/memory-audience\\.key\\.(bak|pre)-[A-Za-z0-9._-]+"
+          }
+        ]
+      },
+      "retention_policy": {
+        "group": "b-sensitive-backup"
+      },
+      "retention": "key material (#1468): classified with group b but ALWAYS kept — the key-file rule overrides age; rotate/retire via the credential manager (FW-03)",
+      "requests": {
+        "prune-expired": "retain",
+        "node-decommission": "retain"
       },
       "derived_copies": [],
       "verification": "file presence"

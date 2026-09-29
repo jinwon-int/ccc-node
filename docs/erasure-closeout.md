@@ -50,6 +50,75 @@ erasure remains restricted to its audience root. Primary paths are not repeated
 as secondary targets, and conflicting actions on a present path block apply
 before deletion.
 
+## Retention classes — groups a/b (#1468)
+
+Owner decision (2026-09-29, option ②): group a (legacy unscoped stores,
+e.g. `~/.nunchi/{facts.db,backend-health.json,snapshot.md}` once the live
+resolver points elsewhere) and group b (sensitive backups: `.env.bak-*`,
+`.env.pre-*`, `sessions.json.bak-*`, `crontab.bak-*`) are kept **30 days**,
+then become **eligible** for destruction at the apply boundary. Key files are
+always kept.
+
+- Inventory: entries with a `retention_policy` object (`group`, optional
+  `max_age_days`); defaults live in `retention_defaults` (`max_age_days: 30`,
+  `age_source: max(mtime,ctime)`, `key_file_patterns`). Their resolve
+  candidates are anchored name patterns only.
+- Age is measured from the **later of mtime and ctime** (never contents).
+  `cp -p`, `cp -a`, `rsync -a` and `shutil.copy2` carry the source's old
+  mtime, so a backup taken today must not look months old; ctime cannot be
+  backdated. A chmod/rename/restore also refreshes ctime and so restarts the
+  clock (errs toward keeping).
+- `CCC_ERASURE_RETENTION_DAYS` may only **lengthen** retention; shortening it
+  is a reviewed inventory change.
+- Key files plan as `retain (key-file)` at any age. The rule searches the
+  file name case-insensitively for key tokens on `.`/`_`/`-` boundaries —
+  `pem`, `p12`, `pfx`, `jks`, `keystore`, `key(s)`, `gpg`, `asc`, `age`,
+  `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`, `credential(s)`, `secret(s)`,
+  `token(s)`, `oauth`, `auth.json`, `netrc`, `hosts.yml` — so
+  `.env.bak-x.PEM` or `.env.bak-ID_ED25519` are kept. The inventory can add
+  patterns, never remove the built-in ones. Key backups
+  (`memory-audience.key.bak-*`) also carry an explicit `retain` action.
+- Live files are never retention targets. A path any non-retention class
+  resolves as live is claimed by **path, realpath and inode**, so a live
+  `.env` that is a symlink to `.env.pre-mig`, a `NUNCHI_DB` symlinked onto
+  `~/.nunchi/facts.db`, or a hard link of a live file all stay protected.
+- Legacy `~/.nunchi/{facts.db,snapshot.md,backend-health.json}` is still read
+  through `CCC_MEMORY_LEGACY_NUNCHI_HOME` even while `NUNCHI_DB` /
+  `NUNCHI_SNAPSHOT` point at the audience store, and reads never bump mtime.
+  So these stay claimed live **regardless of env** until the operator creates
+  the retirement marker `~/.nunchi/.legacy-retired` (default absent; itself
+  classified as retained; it must be a regular file — a symlink is not
+  honoured and surfaces as a blocker). Only then does their 30-day clock
+  matter. For `facts.db`, `node-decommission` stays `handoff-or-drop` (never
+  a plain delete), so decommission keeps its handoff contract.
+  **Creating the marker is a one-way retirement decision:** from then on the
+  pre-scope memory (`facts.db`, `snapshot.md`, `backend-health.json`) becomes
+  deletable by `prune-expired` once 30 days old, and after an apply run it
+  can only be recovered from that run's apply backup directory
+  (`$CCC_ERASURE_BACKUP_DIR` / `~/.erasure-backup/<run>/`, see
+  `manifest.json`). Removing the marker afterwards does not bring deleted
+  files back.
+- Last copy: while a backup family's live counterpart is absent (`.env` for
+  `.env.bak-*`/`.env.pre-*`, `sessions.json` for its backups; crontab has no
+  checkable file, so it always counts as absent), the newest copy per
+  directory is planned as `retain (last copy; live missing)` even past
+  retention. Only regular, non-symlink files can be that kept copy (a
+  symlink is not a copy), and "newest" is ranked by `(mtime, ctime, path)`:
+  ctime bounds the eligibility age but never decides recency between copies,
+  because an `rsync -a` / `cp -a` / `chmod` sweep leaves every ctime equal.
+- Dry-run: `scripts/ccc-erasure-planner.py retention [--json]` lists every
+  retention file with its group, mtime, age basis, `eligible`, `eligible_at`
+  and planned action — paths, dates and counts only. `prune-expired` /
+  `node-decommission` plans carry `delete` only for expired files; younger
+  ones plan as `retain-until:<ISO date>`, which apply skips.
+
+**Out of scope here:** actually deleting anything on a node. Eligible files
+are destroyed only by a `prune-expired` plan run through
+`ccc-erasure-apply.py` with `ERASURE_APPLY=1` (digest, blockers, owner-only,
+rollback-first), and every such per-node run needs its **own fresh owner
+approval**. Measuring the two Termux nodes is also still
+open (#1468).
+
 ## Wiki promotion records (#1447 batch)
 
 The nunchi wiki-promote batch embeds `<!-- nunchi-p3-8 fact#ID -->` markers
