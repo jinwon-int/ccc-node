@@ -93,6 +93,7 @@ from telegram_bot.core.turn_watchdog import DEFAULT_NOTIFY_MINUTES, TurnAgeWatch
 from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.core.usage_meter import MODE_AUTONOMOUS, MODE_INTERACTIVE
 from telegram_bot.utils.health import health_reporter
+from telegram_bot.utils.provider_requirements import provider_environment_problem
 from telegram_bot.utils.secure_fs import _fsync_directory
 from telegram_bot.utils.orphan_reaper import (
     run_periodic_reaper,
@@ -860,9 +861,15 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             health_reporter.bind(self._data_dir(), agent_provider=self._active_provider())
             health_reporter.initialize_process()
             health_reporter.mark_starting("matrix frontend syncing")
-            # Telegram marks the agent healthy once its provider probe passes at
-            # startup; the Matrix frontend shares that runtime and start-up gate.
-            health_reporter.record_agent_ok()
+            # The Matrix frontend runs no provider probe of its own; it used to
+            # mark the agent healthy unconditionally, which hid a provider env
+            # that never reached this unit (#1771). Record
+            # the names-only startup check instead; a successful turn clears it.
+            problem = provider_environment_problem(self._settings)
+            if problem:
+                health_reporter.record_agent_error(problem)
+            else:
+                health_reporter.record_agent_ok()
             self._health_started = time.monotonic()
             self._health_active = True
         except Exception:

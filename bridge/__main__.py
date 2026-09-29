@@ -33,6 +33,32 @@ def load_runtime_settings(
     return settings
 
 
+def report_provider_environment(
+    settings: Any, environ: Mapping[str, str] | None = None
+) -> str | None:
+    """Startup required-env check for the selected provider, names only (#1771).
+
+    Logged as one ERROR at startup instead of surfacing at the first user turn.
+    The bridge keeps running degraded — the readiness probe (Telegram) and
+    ``health.json`` (Matrix) carry the same text — because exiting would
+    crash-loop the unit under ``Restart=always`` and stop push-spool delivery,
+    the owner's alert channel. Returns the problem text (or None).
+    """
+    from telegram_bot.utils.provider_requirements import provider_environment_problem
+
+    if getattr(settings, "agent_provider", None) is None:
+        return None
+    problem = provider_environment_problem(settings, environ)
+    if problem:
+        logger.error(
+            "%s — put the key in the shared EnvironmentFile "
+            "~/.config/ccc-node/bridge.env (secrets) or the project/package .env "
+            "(wrapper paths); see docs/bridge-ops.md, provider environment contract",
+            problem,
+        )
+    return problem
+
+
 @dataclass(frozen=True)
 class AppContext:
     """Validated runtime dependencies shared by one bridge application."""
@@ -687,6 +713,7 @@ def main() -> None:
 
     bot.validate_runtime_paths()
     setup_logging(settings)
+    report_provider_environment(settings)
     try:
         bot.run()
     except SystemExit as exc:

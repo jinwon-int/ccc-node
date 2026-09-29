@@ -94,6 +94,90 @@ Rollback is the reverse: stop Codex, restore `CCC_AGENT_PROVIDER=claude`, start
 the prior Claude bridge, and again verify a single poller. Readiness checks and
 source validation do not authorize a live provider/Telegram canary or restart.
 
+## Provider environment contract
+
+Some keys are read only from the provider CLI's own process environment: the
+`ccc-piri`/`ccc-codex` wrappers resolve the real CLI through
+`CCC_PIRI_REAL_CLI_PATH`/`CCC_CODEX_REAL_CLI_PATH`, and the Claude CLI
+authenticates from `CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_*`. `Config.load`
+reads the project and package `.env` files without exporting them, and the
+Matrix unit (which runs `python -m telegram_bot`, not `start.sh`) never gets
+`start.sh`'s `bridge/.env` export (#1771).
+
+**Two routes, by kind of key.**
+
+- *Wrapper paths/switches* (`WRAPPER_ENV_KEYS` in
+  `bridge/utils/wrapper_environment.py`: `CCC_PIRI_REAL_CLI_PATH`,
+  `CCC_PIRI_MEMORY_*`, `CCC_CODEX_REAL_CLI_PATH`,
+  `CCC_CODEX_MEMORY_MATERIALIZER_PATH`) may live in the project `.env` or
+  `bridge/.env`: the bridge hands them from the merged config to the wrapper
+  child (#2065). Process environment still wins.
+- *Everything else the CLI reads only from its environment* — above all
+  secrets such as `CLAUDE_CODE_OAUTH_TOKEN` — is never injected by the
+  application. It must be in the bridge **process** environment, i.e. the
+  shared EnvironmentFile below (or `bridge/.env` exported by `start.sh`, which
+  covers the Telegram unit only).
+
+**Shared EnvironmentFile.** Both systemd units read one owner-only file:
+`EnvironmentFile=-%h/.config/ccc-node/bridge.env` — the Telegram unit rendered
+by `bridge/service-systemd.sh` (literal `$HOME` path) and
+`bridge/service-systemd-matrix.service.example` (`/root/...`). The leading `-`
+keeps a node without the file on its previous environment. Keep secrets there
+(0600), **never** in an `Environment=` line (unit files and `systemctl show`
+are world-readable). `EnvironmentFile=` overrides `Environment=`, so never put
+`HOME`, `PATH`, `PROJECT_ROOT`, `BOT_DATA_DIR`, `CCC_CHANNEL` or `CCC_MATRIX_*`
+in it. Keep each key in exactly one place: `start.sh` (Telegram) re-exports a
+`bridge/.env` value over the process environment for keys outside its
+preserve list, while the Matrix unit keeps the EnvironmentFile value, so a key
+present in both with different values diverges between the two frontends.
+
+**Startup required-env check.** Right after logging starts the bridge checks
+what the selected provider needs — against the process environment plus the
+#2065 wrapper keys, i.e. what the child will get — and logs one ERROR with key
+**names** only, e.g. `required provider environment missing: provider=piri
+missing=CCC_PIRI_REAL_CLI_PATH`:
+
+- piri/codex: the configured CLI (`CCC_PIRI_CLI_PATH`/`CCC_CODEX_CLI_PATH`) must
+  resolve on the child `PATH`; when it is the `ccc-*` wrapper, the real CLI it
+  execs must resolve too.
+- claude: one of `CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN`
+  in the process environment, unless a non-env login exists
+  (`.credentials.json`, `apiKeyHelper`, Bedrock/Vertex/Foundry flags, macOS
+  keychain).
+
+The bridge then runs **degraded**, not stopped — the same policy as the existing
+provider readiness probes. Exiting would crash-loop the unit under
+`Restart=always` (or exhaust `start.sh`'s rapid-crash budget) and stop push-spool
+delivery, the owner's alert channel. Telegram reports the message as the probe
+reason (`Service: degraded (...)`; for Claude it is appended to a failed
+`claude auth status`, which stays authoritative); the Matrix frontend, which has
+no provider probe, records it as `health.json` `agent.last_error` instead of
+marking the agent healthy. A successful turn clears it. The provider's own
+startup failure cause (exit code, redacted stderr tail) is logged by #1819.
+
+**Migration (per node, operator-run; not automated).**
+
+1. `install -d -m 0700 ~/.config/ccc-node && install -m 0600 /dev/null
+   ~/.config/ccc-node/bridge.env` (as the unit's user; `/root` for system units).
+2. Move the provider/auth lines from the Telegram and Matrix drop-ins
+   (`*.service.d/provider.conf`, `zz-piri.conf`, ...) into it, plus any env-only
+   secret such as `CLAUDE_CODE_OAUTH_TOKEN`. Remove the same keys from
+   `bridge/.env` (one place per key, see above). Check `stat -c %a` is `600`.
+3. Refresh the units: `./setup.sh` (or `bridge/service-systemd.sh reconcile`)
+   rewrites a ccc-generated Telegram unit with the `EnvironmentFile=` line and
+   only daemon-reloads; add the line to the hand-installed Matrix unit from the
+   example. Run `systemd-analyze verify <unit>` on both — a drop-in without its
+   `[Service]` header is otherwise ignored silently.
+4. Delete the now-empty drop-ins, `systemctl daemon-reload`, then restart both
+   bridges at an idle moment (see the occupancy check above).
+5. Verify without printing values: both bridges' `bot.log` show no
+   `required provider environment missing`, and
+   `tr '\0' '\n' < /proc/<pid>/environ | cut -d= -f1 | sort` lists the same
+   provider key names for the Telegram and Matrix PIDs.
+
+Rollback: restore the drop-ins; the optional `EnvironmentFile=-` line is inert
+once the file is removed.
+
 ## Health evidence
 
 Useful non-secret evidence is service state, PID, restart count, `health.json` state, recent redacted warning/error classes, source commit, and test output.
