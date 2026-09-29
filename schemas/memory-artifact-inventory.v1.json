@@ -606,7 +606,7 @@
           }
         ]
       },
-      "retention": "TTL window (CCC_DISTILL_SEEN_TTL_DAYS, default 7d); loss is benign",
+      "retention": "no-TTL dedup ledger by default (#1885; CCC_DISTILL_SEEN_TTL_DAYS=N opts into an N-day window); loss is benign (possible re-queue of an already-queued topic)",
       "requests": {
         "audience-erasure": "delete",
         "node-decommission": "delete"

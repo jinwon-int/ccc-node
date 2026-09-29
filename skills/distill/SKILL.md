@@ -120,7 +120,7 @@ wc -l ~/.claude/state/wiki-candidates.md
 
 ## Safety
 - Scope control: by default distill accepts every transcript visible to the node. To restrict a multi-tenant node, set `CCC_DISTILL_SCOPE_CWDS` to a comma/colon-separated allowlist of cwd paths, or write one cwd/project-encoded entry per line to `~/.claude/state/distill.scope`. Out-of-scope transcripts log `skip reason=cwd-out-of-scope` and do not extract, push, or queue.
-- Noise controls (issue #298): wiki-candidates are extracted only when reusable + new + settled (exclusion list in the extract prompt), capped at `CCC_DISTILL_MAX_WIKI_CANDS` (default 3) per session by wiki-queue, and deduped by topic for `CCC_DISTILL_SEEN_TTL_DAYS` (default 7). `/distill compact` cleans pre-existing duplicate backlog.
+- Noise controls (issue #298): wiki-candidates are extracted only when reusable + new + settled (exclusion list in the extract prompt), capped at `CCC_DISTILL_MAX_WIKI_CANDS` (default 3) per session by wiki-queue, and deduped by topic through a permanent seen ledger (`CCC_DISTILL_SEEN_TTL_DAYS=<N>` opts into an N-day window; default 0 = permanent, #1885). `/distill compact` cleans pre-existing duplicate backlog.
 - All outputs carry provenance: `source_cwd`/`source_project` in `distill-last.json`, Honcho metadata, and wiki-candidates entries.
 - Re-enable by `mv`-ing `distill.disabled` / `distill.dryrun` to a timestamped archive name rather than deleting them, so the previous toggle state stays recoverable and the change is auditable. Choose `mv` for that reason — **not** to avoid the guard: if the guard blocks an action you believe is correct, stop and get approval instead of reaching for a verb it does not cover.
 - The foreground entry in `claude/hooks/distill.sh` reads `transcript_path` and cwd/workspace metadata from hook JSON on stdin. When the path is absent or is not a file, it looks for the newest `*.jsonl` in the current `PWD`'s encoded project directory under `CLAUDE_PROJECTS_DIR` (default `~/.claude/projects`). An ordinary manual invocation with empty stdin uses that fallback; no match logs `skip reason=no-transcript`.
@@ -136,7 +136,7 @@ file can drift from them silently, so check rather than trust it (#1630):
 | Pinned here | Check |
 |---|---|
 | `CCC_DISTILL_MAX_WIKI_CANDS` default 3 | `grep -rn 'CCC_DISTILL_MAX_WIKI_CANDS' claude/hooks/` |
-| `CCC_DISTILL_SEEN_TTL_DAYS` default 7 | `grep -rn 'CCC_DISTILL_SEEN_TTL_DAYS' claude/hooks/` |
+| `CCC_DISTILL_SEEN_TTL_DAYS` default 0 (permanent) | `grep -rn 'CCC_DISTILL_SEEN_TTL_DAYS' claude/hooks/` |
 | `CCC_DISTILL_HOTNESS_THRESHOLD` default 3 | `grep -rn 'CCC_DISTILL_HOTNESS_THRESHOLD' claude/hooks/` |
 | `wiki-queue.sh --compact` exists | `grep -n -- '--compact' claude/hooks/distill/wiki-queue.sh` |
 | Foreground selection does not read `CLAUDE_DISTILL_TRANSCRIPT` | `grep -n 'CLAUDE_DISTILL_TRANSCRIPT' claude/hooks/distill.sh` — export after foreground selection; detached-pipeline input is separate |

@@ -29,10 +29,20 @@ candidates_file = Path(candidates_path)
 decisions_file = Path(decisions_path)
 text = candidates_file.read_text(encoding="utf-8", errors="replace") if candidates_file.exists() else ""
 SECRET_LINE = re.compile(r"(?i)(token|secret|password|api[_-]?key|authorization|private[_-]?key|cookie|session)\s*[:=]|bearer\s+[A-Za-z0-9._-]+")
+# #1885: every producer (distill wiki-queue.sh, nunchi wiki-promote.py,
+# cost-ledger-weekly.py) writes a `- source-session: `<id>` (...)` provenance
+# line, and its own LABEL matched `session:` above — so every candidate carried
+# a redaction, `redaction_applied` said nothing, and the reviewer never saw the
+# source session. Only that exact line-leading metadata label is exempt: the
+# value and the parenthetical after it are still scanned by SECRET_LINE and
+# SECRET_TOKEN, and `session:`/`session=` anywhere else still redacts.
+SOURCE_SESSION_LABEL = re.compile(r"^- source-session:(?=\s)")
 # Labelled `keyword:`/`keyword=` shapes are only half the problem: a bare token
 # pasted without a label matched nothing and was printed verbatim by `show`.
-# These mirror the FW-03 redact pass in claude/hooks/distill/extract.sh so the
-# two stay consistent; keep them high-precision so ordinary wiki prose survives.
+# These cover the token shapes of the FW-03 redact pass in
+# claude/hooks/distill/extract.sh (plus a few more); SECRET_LINE's labelled
+# keywords are this script's own, broader rule. Keep them high-precision so
+# ordinary wiki prose survives.
 SECRET_TOKEN = re.compile(
     r"(ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"
     r"|sk-[A-Za-z0-9_-]{20,}"
@@ -58,7 +68,7 @@ def clean(body: str) -> str:
         if PEM_BEGIN.search(line):
             in_pem=not PEM_END.search(line)
             lines.append("[REDACTED_SENSITIVE_LINE]")
-        elif SECRET_LINE.search(line) or SECRET_TOKEN.search(line):
+        elif SECRET_LINE.search(SOURCE_SESSION_LABEL.sub("", line, count=1)) or SECRET_TOKEN.search(line):
             lines.append("[REDACTED_SENSITIVE_LINE]")
         else:
             lines.append(line)

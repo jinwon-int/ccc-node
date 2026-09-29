@@ -5,7 +5,11 @@
 # Auto-PR is intentionally NOT done here (human gate per TM-1058).
 #
 # De-dup: each candidate's title (lowercased, trimmed) is hashed; we maintain a
-# .seen file with a TTL window (CCC_DISTILL_SEEN_TTL_DAYS, default 7 days).
+# .seen ledger. It is PERMANENT by default (no TTL), like nunchi
+# wiki-promote.py's wiki-promoted.seen that feeds the same queue (#1885): the
+# queue itself never expires, so a 7-day ledger re-queued every still-pending
+# topic as a new candidate a week later. CCC_DISTILL_SEEN_TTL_DAYS=<N> (N >= 1)
+# opts back into a finite TTL window; unset, 0 or invalid means permanent.
 # The canonical format is:
 #   <first_epoch> <last_epoch> <count> <hash>
 # Legacy lines are accepted as either `<epoch> <hash>` or `<hash>`.
@@ -48,12 +52,14 @@ EOF
 fi
 
 NOW_EPOCH="$(date -u +%s)"
-# Dedup memory TTL: how long a queued topic suppresses re-extraction. Longer
-# values reduce weekly re-queueing of long-running topics (issue #298).
-SEEN_TTL_DAYS="${CCC_DISTILL_SEEN_TTL_DAYS:-7}"
-case "$SEEN_TTL_DAYS" in ''|*[!0-9]*) SEEN_TTL_DAYS=7 ;; esac
-[ "$SEEN_TTL_DAYS" -lt 1 ] && SEEN_TTL_DAYS=7
-CUTOFF_EPOCH="$(date -u -d "$SEEN_TTL_DAYS days ago" +%s 2>/dev/null || echo 0)"
+# Dedup memory TTL: how long a queued topic suppresses re-extraction (issue
+# #298). Default 0 = permanent (#1885); a positive value opts into a window.
+SEEN_TTL_DAYS="${CCC_DISTILL_SEEN_TTL_DAYS:-0}"
+case "$SEEN_TTL_DAYS" in ''|*[!0-9]*) SEEN_TTL_DAYS=0 ;; esac
+CUTOFF_EPOCH=0
+if [ "$SEEN_TTL_DAYS" -ge 1 ]; then
+  CUTOFF_EPOCH="$(date -u -d "$SEEN_TTL_DAYS days ago" +%s 2>/dev/null || echo 0)"
+fi
 # Review-staleness marker stays at a fixed 7 days (independent of dedup TTL).
 STALE_CUTOFF_ISO="$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '0000-00-00T00:00:00Z')"
 HOTNESS_THRESHOLD="${CCC_DISTILL_HOTNESS_THRESHOLD:-3}"
