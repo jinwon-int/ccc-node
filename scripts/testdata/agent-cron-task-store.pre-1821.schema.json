@@ -71,7 +71,6 @@
           "notBefore": { "type": "string", "minLength": 1 },
           "maxRuns": { "type": "integer", "minimum": 1, "maximum": 100000 },
           "runCount": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 0 },
-          "failureAlertAfter": { "type": "integer", "minimum": 0, "maximum": 1000 },
           "runHistory": {
             "type": "array",
             "items": {

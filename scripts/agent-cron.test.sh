@@ -7,6 +7,12 @@ CMD="$ROOT/scripts/agent-cron.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+# Hermetic push spool: the #1821 failure alarm spools regardless of a task's
+# notify setting, so any failing run below would otherwise land in the
+# developer node's real owner spool (and be delivered). Tests that assert
+# spool writes still pass their own CCC_PUSH_SPOOL.
+unset CCC_AGENT_CRON_PUSH_SPOOL
+export CCC_PUSH_SPOOL="$TMP/default-push-spool"
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
@@ -890,6 +896,37 @@ out="$(CCC_AGENT_CRON_STORE="$STORE" bash "$CMD" run no-such-task --json --at 20
 # shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "unknown task id --json stays machine-readable" '[ "$rc" = 1 ] && jq -e ".ok == false and .error == \"task id not found\"" <<<"$out" >/dev/null'
+
+# --- #1821: consecutive-failure owner alarm (behaviour is covered in depth by
+# agent_cron_alarm_test.py; these pin the CLI surface and store compatibility).
+ALARM_DIR="$TMP/alarm"
+mkdir -p "$ALARM_DIR/store"
+ALARM_HEADLESS="$ALARM_DIR/fake-headless.sh"
+cat > "$ALARM_HEADLESS" <<'SH'
+echo 'ccc-headless: /usr/bin/claude exited 1' >&2
+echo 'ccc-headless: stdout (first 2000B of 64B):' >&2
+echo '{"type":"result","is_error":true,"error":"authentication_failed","secret":"sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789"}' >&2
+exit 1
+SH
+ALARM_STORE="$ALARM_DIR/store/tasks.json"
+ALARM_SPOOL="$ALARM_DIR/spool"
+cat > "$ALARM_STORE" <<'JSON'
+{"version":1,"tasks":[{"id":"auth-a","schedule":"* * * * *","prompt":"observe","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z"}]}
+JSON
+for minute in 01 02 03 04; do
+  # The fake runner is invoked through `bash` so this also runs where a
+  # `#!/usr/bin/env` shebang does not resolve (Termux).
+  out="$(CCC_AGENT_CRON_STORE="$ALARM_STORE" CCC_HEADLESS_CMD="bash $ALARM_HEADLESS" \
+    CCC_PUSH_SPOOL="$ALARM_SPOOL" bash "$CMD" run auth-a --json --at "2026-01-01T00:$minute:00Z" 2>/dev/null)"
+done
+ok "notify=none task alarms once after 3 auth failures, into the configured spool only" '[ "$(find "$ALARM_SPOOL" -name "*-alarm.json" | wc -l | tr -d " ")" = 1 ] && jq -e ".failureAlarm.failureClass == \"auth_failed\" and .failureAlarm.state == \"no-alert\"" <<<"$out" >/dev/null'
+ok "alarm spool is owner-only and output-free" 'f="$(find "$ALARM_SPOOL" -name "*-alarm.json" | head -1)"; [ "$(stat -c %a "$f")" = 600 ] && jq -e ".event == \"AgentCronFailureAlarm\" and .recipient == \"owner\" and (has(\"chatId\") | not) and (.text | contains(\"sk-ant\") | not)" "$f" >/dev/null'
+ok "task store gains no alarm fields (pre-#1821 schema stays valid)" '! grep -q "failureClass\|lastSuccessAt\|sk-ant" "$ALARM_STORE" && jq -e ".tasks[\"auth-a\"].runs[-1].failureClass == \"auth_failed\"" "$ALARM_DIR/store/failure-alarm.json" >/dev/null'
+# shellcheck disable=SC2034  # out and rc are read via eval inside ok()
+out="$(CCC_AGENT_CRON_STORE="$ALARM_DIR/crud.json" bash "$CMD" add crud-quiet --schedule "0 0 * * *" --prompt "p" --failure-alert-after 0 --json 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "add --failure-alert-after persists the per-task threshold" '[ "$rc" = 0 ] && jq -e ".ok == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"crud-quiet\") | .failureAlertAfter == 0" "$ALARM_DIR/crud.json" >/dev/null'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

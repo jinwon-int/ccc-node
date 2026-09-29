@@ -65,6 +65,7 @@ files = [
   "bridge/tests/test_runtime_conformance.py",
   "bridge/tests/test_usage_meter.py",
   "scripts/agent_cron_lib.py",
+  "scripts/agent_cron_alarm.py",
   "scripts/agent_cron_schema.py",
   "scripts/agent_cron_model.py",
   "scripts/agent_cron_repository.py",
