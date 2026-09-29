@@ -309,6 +309,30 @@ ok "policy-owned name-only entries survive setup re-render" \
 ok "skill-listing key preservation is logged" 'grep -q "preserved node-local settings keys: .*skillOverrides" <<<"$out"'
 ok "setup never writes an off override of its own" \
   '[ "$(jq -r "[.skillOverrides | to_entries[] | select(.value == \"off\") | .key] | join(\",\")" "$sl_claude/settings.json")" = "gh-pr-flow" ]'
+# --- #1920: every top-level key the templates do not declare is node-local ---
+# effortLevel (set by the CLI's /effort) was the third key lost to a re-render
+# after model (#1235) and env keys (#1402). Seed node-local top-level keys of
+# several JSON types next to a model pin, a node-local env key and a node-local
+# override of a template-declared key, then re-render twice (setup + the next
+# self-update tick): the node-local ones survive, the template one is reset.
+jq '.effortLevel = "medium" | .alwaysThinkingEnabled = true
+    | .modelSettings = {"claude-opus-5": {"effortLevel": "high"}}
+    | .model = "claude-fable-5" | .env.CCC_NODE_LOCAL_1920 = "kept"
+    | .outputStyle = "node-local-override"' \
+  "$sl_claude/settings.json" > "$TMP/tl-seeded.json" && mv "$TMP/tl-seeded.json" "$sl_claude/settings.json"
+out="$(HOME="$sl_home" CCC_CLAUDE_DIR="$sl_claude" CCC_HERMES_DIR="$sl_hermes" bash "$SETUP" --no-backup --dry-run 2>&1)"
+ok "dry-run announces the node-local top-level keys it would preserve" \
+  'grep -q "\[dry-run\] preserve node-local settings keys: .*effortLevel" <<<"$out" && jq -e ".effortLevel == \"medium\"" "$sl_claude/settings.json" >/dev/null'
+out="$(HOME="$sl_home" CCC_CLAUDE_DIR="$sl_claude" CCC_HERMES_DIR="$sl_hermes" bash "$SETUP" --no-backup 2>&1)"
+HOME="$sl_home" CCC_CLAUDE_DIR="$sl_claude" CCC_HERMES_DIR="$sl_hermes" bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "node-local top-level keys survive two re-renders (#1920)" \
+  'jq -e ".effortLevel == \"medium\" and .alwaysThinkingEnabled == true and .modelSettings[\"claude-opus-5\"].effortLevel == \"high\"" "$sl_claude/settings.json" >/dev/null'
+ok "model pin, node-local env key and skill-listing keys survive alongside" \
+  'jq -e ".model == \"claude-fable-5\" and .env.CCC_NODE_LOCAL_1920 == \"kept\" and .skillListingBudgetFraction == 0.05 and .skillOverrides[\"gh-pr-flow\"] == \"off\"" "$sl_claude/settings.json" >/dev/null'
+ok "template-declared top-level keys stay repo-owned (node override dropped)" \
+  '[ "$(jq -r .outputStyle "$sl_claude/settings.json")" = "$(jq -r .outputStyle "$ROOT/claude/settings.base.json")" ]'
+ok "top-level preservation logs the key names, not the model pin" \
+  'grep -q "preserved node-local settings keys: .*effortLevel" <<<"$out" && ! grep -Eq "preserved node-local settings keys: (.*,)?model(,|\$)" <<<"$out" && grep -q "preserved node-local model pin: claude-fable-5" <<<"$out"'
 # --- #1436: the retired Honcho credential is never resurrected by setup ------
 # Two full setup runs above would have re-seeded hermes/honcho.template.json
 # on the old behavior; the disposal (slice 5) must stick.
