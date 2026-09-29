@@ -79,6 +79,20 @@ class DispatcherTest(unittest.TestCase):
             self.assertEqual(proc.returncode, -signal.SIGTERM, errors)
         self.assertEqual(list(self.payloads.iterdir()), [])
 
+    def test_unrouted_skills_intake_variants_fail_loudly(self):
+        # #1460 P1: intake-family intents outside the exact routes must never
+        # reach the generic ack handler (the stub would echo the payload).
+        for intent in ('skill-intake-revise', 'skills.skill-intake-revise.v1',
+                       'skills-intake-revise-v2', 'skills_intake', 'Skills-Intake-Review',
+                       'SKILLS_INTAKE_REVISE', 'skills-intake-reviewer'):
+            with self.subTest(intent=intent):
+                result = self.run_dispatch(json.dumps({'intent': intent}).encode())
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, b'')
+                self.assertIn(b'unrouted skills-intake intent', result.stderr)
+                self.assertIn(intent.encode(), result.stderr)
+                self.assertEqual(list(self.payloads.iterdir()), [])
+
     def test_cleanup_failure_does_not_dispatch(self):
         fakebin = self.root / 'bin'
         fakebin.mkdir()

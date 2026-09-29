@@ -9,6 +9,10 @@
 #
 # Reads the full task JSON from stdin exactly once, routes by task.intent:
 #   skills-intake-review -> $INTAKE_REVIEW_HANDLER
+#   skills-intake-revise -> $INTAKE_REVISE_HANDLER
+#   (both accept the hyphen and underscore spellings, exact match only)
+#   any other *skill*intake* intent (case-insensitive: singular, versioned,
+#   misspelt, schema-id forms) -> loud failure, never the generic ack (#1460)
 #   anything else        -> $DEFAULT_TASK_HANDLER (word-split, exec'd)
 #
 # Env (worker child inherits the worker env file, so node config lives there):
@@ -66,6 +70,17 @@ case "$intent" in
     exec bash "$INTAKE_REVISE_HANDLER" <&3 3<&-
     ;;
   *)
+    # #1460 P1: the generic handler acks anything, so an intake-family intent
+    # that is not routed above (singular `skill-intake-*`, a version suffix,
+    # the schema id, a typo, other casing) would be consumed as a silent ack.
+    # Fail loudly instead; the reason names the intent on stderr.
+    intent_lc="$(printf '%s' "$intent" | tr '[:upper:]' '[:lower:]')"
+    case "$intent_lc" in
+      *skill*intake*)
+        log "unrouted skills-intake intent: $intent (only skills-intake-review/skills-intake-revise and their underscore forms are routed; refusing the generic ack)"
+        exit 1
+        ;;
+    esac
     # Intentional word split of an operator-owned command line (shellcheck-disable=SC2086)
     exec $DEFAULT_TASK_HANDLER <&3 3<&-
     ;;
