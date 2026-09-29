@@ -26,7 +26,7 @@ class PlanRowReuseTest(unittest.TestCase):
             "run_headless", "write_owner_spool", "history_attempt",
             "append_run_history", "apply_retry_transition", "apply_run_limit",
             "commit_run_state", "release_for_run", "notification_base",
-            "headless_metadata", "parse_schedule",
+            "headless_metadata", "parse_schedule", "record_failure_alarm",
         ):
             self._saved[name] = getattr(agent_cron, name)
 
@@ -50,6 +50,9 @@ class PlanRowReuseTest(unittest.TestCase):
         agent_cron.acquire_for_run = lambda *a, **k: (True, {"state": "acquired", "path": "/tmp/x"})
         agent_cron.run_headless = lambda t: {"exitCode": 0, "stdout": "", "stderr": ""}
         agent_cron.write_owner_spool = lambda *a, **k: {"delivery": "none"}
+        # The #1821 alarm writes a sidecar next to the store and may spool; a
+        # stubbed run must never touch the default (live) store dir or spool.
+        agent_cron.record_failure_alarm = lambda *a, **k: {"state": "stubbed"}
         agent_cron.history_attempt = lambda *a, **k: 1
         agent_cron.append_run_history = lambda *a, **k: None
         agent_cron.apply_retry_transition = lambda *a, **k: {}

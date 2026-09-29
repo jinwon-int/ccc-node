@@ -510,6 +510,12 @@ else
   err "doctor self-update stall verdict tests failed"
   tail -10 "$TMP/doctor-selfupdate-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_agent_cron_test.py >"$TMP/doctor-agent-cron-test.out" 2>&1; then
+  say "  ok doctor agent-cron stale prompt-task success verdict tests (#1821)"
+else
+  err "doctor agent-cron stale prompt-task success verdict tests failed"
+  tail -10 "$TMP/doctor-agent-cron-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_cli_floor_test.py >"$TMP/doctor-cli-floor-test.out" 2>&1; then
   say "  ok doctor worker Claude CLI floor verdict tests (a2a-nexus#2275)"
 else

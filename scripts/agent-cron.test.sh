@@ -7,6 +7,12 @@ CMD="$ROOT/scripts/agent-cron.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+# Hermetic push spool: the #1821 failure alarm spools regardless of a task's
+# notify setting, so any failing run below would otherwise land in the
+# developer node's real owner spool (and be delivered). Tests that assert
+# spool writes still pass their own CCC_PUSH_SPOOL.
+unset CCC_AGENT_CRON_PUSH_SPOOL
+export CCC_PUSH_SPOOL="$TMP/default-push-spool"
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
@@ -890,6 +896,68 @@ out="$(CCC_AGENT_CRON_STORE="$STORE" bash "$CMD" run no-such-task --json --at 20
 # shellcheck disable=SC2034  # rc is read via eval inside ok()
 rc=$?
 ok "unknown task id --json stays machine-readable" '[ "$rc" = 1 ] && jq -e ".ok == false and .error == \"task id not found\"" <<<"$out" >/dev/null'
+
+# --- #1821: failureClass + consecutive-failure owner alarm ---------------------
+# The fake runner is invoked through `bash` so the test also runs where a
+# `#!/usr/bin/env` shebang does not resolve (Termux).
+ALARM_DIR="$TMP/alarm"
+mkdir -p "$ALARM_DIR/store"
+ALARM_HEADLESS="$ALARM_DIR/fake-headless.sh"
+cat > "$ALARM_HEADLESS" <<'SH'
+if [ -e "$ALARM_OK" ]; then echo "fine"; exit 0; fi
+echo 'ccc-headless: /usr/bin/claude exited 1' >&2
+echo '{"type":"result","is_error":true,"error":"authentication_failed","secret":"sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789"}' >&2
+exit 1
+SH
+ALARM_STORE="$ALARM_DIR/store/tasks.json"
+ALARM_SPOOL="$ALARM_DIR/spool"
+export ALARM_OK="$ALARM_DIR/ok"
+cat > "$ALARM_STORE" <<'JSON'
+{"version":1,"tasks":[
+  {"id":"auth-a","schedule":"* * * * *","prompt":"observe","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z"},
+  {"id":"auth-b","schedule":"* * * * *","prompt":"observe","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z"},
+  {"id":"auth-c","schedule":"* * * * *","prompt":"observe","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z"},
+  {"id":"auth-quiet","schedule":"* * * * *","prompt":"observe","enabled":true,"notify":"none","failureAlertAfter":0,"lastRunAt":"2026-01-01T00:00:00Z"}
+]}
+JSON
+alarm_run() {
+  CCC_AGENT_CRON_STORE="$ALARM_STORE" CCC_HEADLESS_CMD="bash $ALARM_HEADLESS" \
+    CCC_PUSH_SPOOL="$ALARM_SPOOL" bash "$CMD" run "$1" --json --at "$2" 2>/dev/null
+}
+alarm_files() { find "$ALARM_SPOOL" -maxdepth 1 -type f -name '*-alarm.json' 2>/dev/null | wc -l | tr -d ' '; }
+
+# The incident shape: different prompt tasks each fail once on a broken login.
+out="$(alarm_run auth-a 2026-01-01T00:01:00Z)"
+ok "failed run records bounded failureClass=auth_failed in runHistory" 'jq -e ".failureAlarm.failureClass == \"auth_failed\"" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"auth-a\") | .runHistory[-1].failureClass == \"auth_failed\"" "$ALARM_STORE" >/dev/null'
+ok "runHistory stores no raw stderr" '! grep -q "sk-ant-oat01\|authentication_failed\"," "$ALARM_STORE"'
+out="$(alarm_run auth-quiet 2026-01-01T00:01:00Z)"
+ok "opted-out task (failureAlertAfter=0) neither alerts nor feeds the node streak" 'jq -e ".failureAlarm.state == \"no-alert\" and (.failureAlarm | has(\"nodeConsecutiveFailures\") | not)" <<<"$out" >/dev/null'
+out="$(alarm_run auth-b 2026-01-01T00:02:00Z)"
+ok "no alarm before the 3rd consecutive failure" '[ "$(alarm_files)" = 0 ] && jq -e ".failureAlarm.nodeConsecutiveFailures == 2" <<<"$out" >/dev/null'
+out="$(alarm_run auth-c 2026-01-01T00:03:00Z)"
+ok "3rd consecutive prompt failure across tasks spools one node-level owner alarm despite notify=none" '[ "$(alarm_files)" = 1 ] && jq -e ".failureAlarm.state == \"alerted\" and .failureAlarm.reasons == [\"node:prompt=threshold\"] and .mutations.pushSpoolWrite == true and .notification.delivery == \"none\"" <<<"$out" >/dev/null'
+ok "alarm spool is owner-only, class-named and output-free" 'f="$(find "$ALARM_SPOOL" -name "*-alarm.json" | head -1)"; [ "$(stat -c %a "$f")" = 600 ] && jq -e ".event == \"AgentCronFailureAlarm\" and .recipient == \"owner\" and (has(\"chatId\") | not) and (.text | contains(\"class=auth_failed\")) and (.text | contains(\"sk-ant\") | not) and (.text | contains(\"exited 1\") | not)" "$f" >/dev/null'
+out="$(alarm_run auth-a 2026-01-01T00:04:00Z)"
+ok "4th failure of the same class does not re-alert" '[ "$(alarm_files)" = 1 ] && jq -e ".failureAlarm.state == \"no-alert\"" <<<"$out" >/dev/null'
+out="$(alarm_run auth-a 2026-01-01T00:05:00Z)"
+ok "same task's own 3rd consecutive failure alerts once for the task key" '[ "$(alarm_files)" = 2 ] && jq -e ".failureAlarm.reasons == [\"task=threshold\"]" <<<"$out" >/dev/null'
+touch "$ALARM_OK"
+out="$(alarm_run auth-a 2026-01-01T00:06:00Z)"
+ok "success after an alert spools one recovery notice and records lastSuccessAt" '[ "$(alarm_files)" = 3 ] && jq -e ".failureAlarm.reasons == [\"node:prompt=recovered\",\"task=recovered\"]" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"auth-a\") | .lastSuccessAt == \"2026-01-01T00:06:00Z\" and (.runHistory[-1] | has(\"failureClass\") | not)" "$ALARM_STORE" >/dev/null'
+out="$(alarm_run auth-a 2026-01-01T00:07:00Z)"
+ok "a further success stays silent" '[ "$(alarm_files)" = 3 ]'
+rm -f "$ALARM_OK"
+out="$(CCC_AGENT_CRON_STORE="$ALARM_STORE" bash "$CMD" validate 2>&1)"; rc=$?
+ok "store with failureClass/lastSuccessAt/failureAlertAfter validates" '[ "$rc" = 0 ]'
+BAD_CLASS_STORE="$ALARM_DIR/bad-class.json"
+jq '.tasks[0].runHistory[0].failureClass = "raw stderr text"' "$ALARM_STORE" > "$BAD_CLASS_STORE"
+out="$(CCC_AGENT_CRON_STORE="$BAD_CLASS_STORE" bash "$CMD" validate 2>&1)"; rc=$?
+ok "unbounded failureClass value fails validation" '[ "$rc" = 1 ] && grep -q "failureClass" <<<"$out"'
+# shellcheck disable=SC2034  # out and rc are read via eval inside ok()
+out="$(CCC_AGENT_CRON_STORE="$ALARM_DIR/crud.json" bash "$CMD" add crud-quiet --schedule "0 0 * * *" --prompt "p" --failure-alert-after 0 --json 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "add --failure-alert-after persists the per-task threshold" '[ "$rc" = 0 ] && jq -e ".ok == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"crud-quiet\") | .failureAlertAfter == 0" "$ALARM_DIR/crud.json" >/dev/null'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

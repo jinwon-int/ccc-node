@@ -129,6 +129,49 @@ line, and successful notifications keep their existing text. This shared
 formatting applies to existing command tasks such as `adapter-fleet-watch` and
 `fleet-doctor-sweep` without a task-store field or migration.
 
+## Failure classes and the consecutive-failure alarm (#1821)
+
+Every non-success run records a bounded `failureClass` in its `runHistory`
+entry — `auth_failed`, `cli_missing`, `timeout`, or `other` — derived from the
+exit code and a fixed pattern scan of the captured output. Only the enum is
+stored; stdout/stderr never enter the task store. `timeout` covers status
+`timeout` and exit 124; `cli_missing` covers exit 126/127 and a runner that
+could not be spawned; `auth_failed` matches provider login errors such as
+`"error":"authentication_failed"`, `Not logged in`, or an invalid/expired key.
+A successful run also records `lastSuccessAt` on the task, because the bounded
+`runHistory` can lose the last success during a long failing streak.
+
+After **N consecutive failures** (default 3) the runner spools **one**
+owner-only `AgentCronFailureAlarm` entry through the same bridge push spool as
+`notify=telegram-owner`. Two streaks are tracked in the sidecar
+`failure-alarm.json` next to the store:
+
+- `task:<id>` — this task's own consecutive failures;
+- `node:prompt` — consecutive prompt-task failures across **all** tasks, reset
+  by any prompt success. This catches the incident shape where several
+  different one-shot prompt tasks each failed once on a broken login.
+
+Each streak alerts once at the Nth failure, again only when its failure class
+changes, and once more (a recovery notice) on the next success. Both streaks
+firing on the same run produce a single message. The text carries only the
+task id, class, counts, and timestamps — never run output.
+
+**Semantics change:** the alarm fires regardless of the task's `notify`
+setting, including `notify: none`. The incident it fixes was a silent task;
+an opt-in alarm would have stayed silent too. Opt out per task with
+`failureAlertAfter: 0` (`--failure-alert-after 0`; an opted-out task's failures
+also stop feeding the node streak) or node-wide with
+`CCC_AGENT_CRON_FAILURE_ALERT_AFTER=0`; a positive value changes the default N.
+If the spool write fails the key is left un-alerted so the next run retries.
+When a key has no state yet (first run after upgrade) its streak is seeded from
+the existing `runHistory`, so an already-failing node alerts on its next
+failure.
+
+`ccc-doctor` reports `agent-cron prompt success` as a warning when an enabled
+prompt task's newest run did not succeed and its last success (or, with none
+recorded, its oldest recorded run) is older than D days (default 7,
+`CCC_DOCTOR_AGENT_CRON_STALE_DAYS`). Disabled and command tasks are skipped.
+
 ## Safety boundaries
 
 Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly. `add`/`remove`/`enable`/`disable` mutate only the validated task store via the same atomic private write path.
@@ -165,6 +208,7 @@ outcome rather than something to wait out.
 - `scripts/agent_cron_model.py` owns pure task lookup and prompt-free list projections.
 - `scripts/agent_cron_repository.py` owns validated load and private atomic writes.
 - `scripts/agent_cron_lib.py` owns pure schedule and retry calculations.
+- `scripts/agent_cron_alarm.py` owns pure failure classification and alarm transitions.
 - `scripts/agent_cron.py` is an import-safe CLI composition root. Dispatch only runs
   through `main()`; importing it does not parse commands, print, or mutate the
   filesystem or process environment.

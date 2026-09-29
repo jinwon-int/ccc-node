@@ -71,6 +71,7 @@
           "notBefore": { "type": "string", "minLength": 1 },
           "maxRuns": { "type": "integer", "minimum": 1, "maximum": 100000 },
           "runCount": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 0 },
+          "failureAlertAfter": { "type": "integer", "minimum": 0, "maximum": 1000 },
           "runHistory": {
             "type": "array",
             "items": {
@@ -85,7 +86,8 @@
                 "status": { "type": "string", "minLength": 1 },
                 "exitCode": { "type": ["integer", "null"] },
                 "attempt": { "type": "integer", "minimum": 1 },
-                "notifyState": { "type": "string", "minLength": 1 }
+                "notifyState": { "type": "string", "minLength": 1 },
+                "failureClass": { "enum": ["auth_failed", "cli_missing", "timeout", "other"] }
               }
             },
             "default": []
@@ -114,7 +116,8 @@
           },
           "lastRunAt": { "type": ["string", "null"] },
           "lastStatus": { "type": ["string", "null"] },
-          "lastRunId": { "type": ["string", "null"] }
+          "lastRunId": { "type": ["string", "null"] },
+          "lastSuccessAt": { "type": ["string", "null"] }
         }
       }
     }
