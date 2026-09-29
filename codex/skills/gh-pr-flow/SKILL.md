@@ -141,6 +141,31 @@ explicit `CHANGES_REQUESTED` fails verification. Compatibility wrappers
 `approve-via-seoseo-ai.sh` and `approve-via-jinon86.sh` select their named
 profiles but cannot override them.
 
+## Environment deployment approval
+
+Approving a GitHub Actions environment deployment (a job waiting in
+`pending_deployments` on a required reviewer such as `jinon86` for a `release`
+environment) is a release-gate action. It needs fresh explicit user approval for
+the exact repository, run, environment, and head on every invocation; never do
+it with an ad-hoc `gh api` call on the relay node:
+
+```bash
+CCC_EXPLICIT_USER_APPROVAL=1 \
+  bash "${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts/approve-deployment-via-relay.sh" \
+    --repo jinwon-int/REPO --run-id RUN_ID --environment release \
+    --expected-head FULL_40_CHAR_SHA --ssh-target relay --operator-approved
+```
+
+The profile is fixed to `jinon86`. `--expected-workflow` (default
+`.github/workflows/release.yml`), `--expected-branch` (default `main`), and
+`--expected-event` (default `workflow_dispatch`) must match the run exactly;
+the run must not come from a fork, and exactly one environment — the named one —
+may be pending with `current_user_can_approve: true`. The approval comment
+records the operator approval and source node, and success is verified from the
+run's review history. A re-run reports `already_approved` instead of posting
+again; a run that is no longer waiting and was never approved exits `66` with
+its state. `--dry-run` checks every gate without submitting.
+
 ## Security boundary
 
 - Require fresh explicit approval for every helper invocation and review

@@ -71,12 +71,12 @@
       "audience": "codex",
       "classification": null,
       "description": "Validate, independently review, and normally squash-merge protected GitHub pull requests. Use when a PR must pass exact-head, green-check, author/reviewer separation, or required-review gates; when a jinon86- or seoseo-ai-authored PR needs approval from the other relay-held account; or when landing changes without weakening branch protection.",
-      "files": 5,
+      "files": 6,
       "managed": true,
       "name": "gh-pr-flow",
       "source": "codex/skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "67236d60fdaa633c665ccc1c5895deca2ebb987ae7fdcdf923584b0e962cbd9e"
+      "tree_sha256": "ec18fd3ac323b97f89a5b3f06c1fe9177423f0e78d9c00eba35b1876daf746c9"
     },
     {
       "audience": "codex",
@@ -241,7 +241,7 @@
       "name": "gh-pr-flow",
       "source": "skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "ffcf05b81bed8f93b50bc77c5c285ef84597153cea40d4e3575d615dad8e41ae"
+      "tree_sha256": "026e8c2707005e3517f91df424657ae760278b4cb8485112c019d3e95191aa3a"
     },
     {
       "audience": "claude",
