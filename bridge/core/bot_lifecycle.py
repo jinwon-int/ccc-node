@@ -66,7 +66,11 @@ from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTr
 from telegram_bot.core.webhook_nudge import build_from_env as build_webhook_nudge_server
 from telegram_bot.core.turn_watchdog import DEFAULT_NOTIFY_MINUTES, TurnAgeWatchdog
 from telegram_bot.core.codex_app_server import live_app_server_clients
-from telegram_bot.core.turn_stall import StallProbeMonitor
+from telegram_bot.core.turn_stall import (
+    DEFAULT_STALL_PROBE_MINUTES,
+    STALL_PROBE_ENV,
+    StallProbeMonitor,
+)
 from telegram_bot.core.usage_meter import MODE_AUTONOMOUS
 from telegram_bot.memory.distill_types import DistillJob
 from telegram_bot.memory.skill_candidate import SkillCandidateStageResult
@@ -1713,13 +1717,17 @@ class BotLifecycleMixin(MemoryDistillMixin):
         )
 
     def _build_turn_stall_probe(self):
-        """Silent-death stall probe (#1112); None when off (the default).
+        """Silent-death stall probe (#1112); on by default at 20 min (#1741).
+
+        ``CCC_TURN_STALL_PROBE_MIN=0`` is the explicit opt-out (returns None).
 
         Recovers ONLY on a confirmed-dead engine (spawned process exited).
         A quiet-but-alive turn is never touched; an ambiguous liveness
         verdict only logs — never recover on a guess (fail-closed).
         """
-        probe_min = ExternalWaitMonitor.env_int("CCC_TURN_STALL_PROBE_MIN", default=0)
+        probe_min = ExternalWaitMonitor.env_int(
+            STALL_PROBE_ENV, default=DEFAULT_STALL_PROBE_MINUTES
+        )
         if probe_min <= 0:
             logger.info("Turn-stall probe disabled (CCC_TURN_STALL_PROBE_MIN=0)")
             return None

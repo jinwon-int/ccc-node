@@ -3,11 +3,12 @@
 Both arms report or recover — neither limits work:
 
 1. **Stall probe** — an active turn whose rollout file has not moved for
-   ``CCC_TURN_STALL_PROBE_MIN`` minutes triggers an app-server liveness
-   check. Recovery runs ONLY on a confirmed-dead engine (spawned process
-   exited). A quiet but alive turn is never touched, and an ambiguous
-   liveness verdict only gets logged — never recovered on a guess
-   (fail-closed, per the work-continuity guard).
+   ``CCC_TURN_STALL_PROBE_MIN`` minutes (default 20 since #1741; ``0``
+   disables) triggers an app-server liveness check. Recovery runs ONLY on
+   a confirmed-dead engine (spawned process exited). A quiet but alive
+   turn is never touched, and an ambiguous liveness verdict only gets
+   logged — never recovered on a guess (fail-closed, per the
+   work-continuity guard).
 
    Since #1741 the stall signal is provider-agnostic: a runtime adapter can
    register a :class:`TurnLivenessSource` — "has this turn's underlying
@@ -41,6 +42,13 @@ ORPHAN_LOOP_THRESHOLD = 10
 
 DEFAULT_TICK_SECONDS = 60.0
 DEFAULT_REPROBE_SECONDS = 10 * 60.0
+
+# Stall-probe threshold (#1741): on by default at 20 minutes on every
+# frontend. ``CCC_TURN_STALL_PROBE_MIN=0`` (or a negative value) is the
+# explicit opt-out. Recovery still requires a confirmed-dead engine, so the
+# default only widens *coverage*, never what counts as a recoverable stall.
+STALL_PROBE_ENV = "CCC_TURN_STALL_PROBE_MIN"
+DEFAULT_STALL_PROBE_MINUTES = 20
 
 
 class OrphanLoopTracker:
@@ -356,11 +364,13 @@ class StallProbeMonitor:
 
 __all__ = [
     "DEFAULT_REPROBE_SECONDS",
+    "DEFAULT_STALL_PROBE_MINUTES",
     "DEFAULT_TICK_SECONDS",
     "ORPHAN_LOOP_PATTERN",
     "ORPHAN_LOOP_THRESHOLD",
     "ORPHAN_LOOP_WINDOW_SECONDS",
     "OrphanLoopTracker",
+    "STALL_PROBE_ENV",
     "StallProbeMonitor",
     "TurnLivenessBinding",
     "TurnLivenessSource",

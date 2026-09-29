@@ -479,14 +479,45 @@ async def test_generic_arm_precedes_the_codex_rollout_fallback(tmp_path: Path) -
 # --- lifecycle builder --------------------------------------------------------
 
 
-def test_lifecycle_stall_probe_is_none_when_off(tmp_path: Path) -> None:
+@pytest.mark.parametrize("value", ["0", "-5"])
+def test_lifecycle_stall_probe_is_none_when_opted_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
     from telegram_bot.core import bot_lifecycle
 
+    monkeypatch.setenv("CCC_TURN_STALL_PROBE_MIN", value)
     lifecycle = bot_lifecycle.BotLifecycleMixin()
     lifecycle._config = SimpleNamespace(  # type: ignore[assignment]
         bot_data_dir=tmp_path, project_root=str(tmp_path)
     )
     assert lifecycle._build_turn_stall_probe() is None
+
+
+@pytest.mark.parametrize("value", [None, ""])
+def test_lifecycle_stall_probe_is_on_by_default_at_20_minutes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    """#1741: unset (or empty) CCC_TURN_STALL_PROBE_MIN enables the probe at 20 min."""
+    from telegram_bot.core import agent_session_registry, bot_lifecycle, turn_stall
+
+    if value is None:
+        monkeypatch.delenv("CCC_TURN_STALL_PROBE_MIN", raising=False)
+    else:
+        monkeypatch.setenv("CCC_TURN_STALL_PROBE_MIN", value)
+    lifecycle = bot_lifecycle.BotLifecycleMixin()
+    lifecycle._config = SimpleNamespace(  # type: ignore[assignment]
+        bot_data_dir=tmp_path, project_root=str(tmp_path)
+    )
+    lifecycle._project_chat = SimpleNamespace(  # type: ignore[assignment]
+        _agent_session_registry=agent_session_registry.AgentSessionRegistry()
+    )
+    lifecycle.application = SimpleNamespace(bot=object())
+    lifecycle._session_manager = SimpleNamespace()  # type: ignore[assignment]
+
+    monitor = lifecycle._build_turn_stall_probe()
+    assert monitor is not None
+    assert turn_stall.DEFAULT_STALL_PROBE_MINUTES == 20
+    assert monitor._stall_seconds == 20 * 60.0
 
 
 def test_liveness_verdict_requires_confirmed_death(

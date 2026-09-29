@@ -22,8 +22,9 @@ remaining ones for Matrix rather than porting them line by line:
   resolved without any message edit — the Telegram edit/delete has no
   Matrix equivalent to perform.
 * **Turn-stall probe** — the shared :class:`StallProbeMonitor` with the Matrix
-  notice seam and the outbox-backed dead-session recovery (#1998). Off by
-  default, exactly as on Telegram (``CCC_TURN_STALL_PROBE_MIN``).
+  notice seam and the outbox-backed dead-session recovery (#1998). On by
+  default at 20 min, exactly as on Telegram (``CCC_TURN_STALL_PROBE_MIN``;
+  ``0`` opts out, #1741).
 * **Webhook nudge** — opt-in, and only on an *explicit Matrix port*
   (``CCC_MATRIX_WEBHOOK_NUDGE_PORT``). Both frontends restart together
   under self-update; sharing ``CCC_WEBHOOK_NUDGE_PORT`` would make them race
@@ -237,7 +238,9 @@ def build_turn_stall_probe(
     notifier: Callable[[int, str], Awaitable[bool]],
     recover: Callable[[], Awaitable[Any]],
 ) -> Any:
-    """Silent-death stall probe (#1112) for Matrix; ``None`` when off (the default).
+    """Silent-death stall probe (#1112) for Matrix; on by default at 20 min (#1741).
+
+    ``CCC_TURN_STALL_PROBE_MIN=0`` is the explicit opt-out (returns ``None``).
 
     Recovers ONLY on a confirmed-dead engine (spawned process exited); a
     quiet-but-alive turn is never touched and an ambiguous liveness verdict
@@ -246,9 +249,13 @@ def build_turn_stall_probe(
 
     from telegram_bot.core.codex_app_server import live_app_server_clients
     from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor
-    from telegram_bot.core.turn_stall import StallProbeMonitor
+    from telegram_bot.core.turn_stall import (
+        DEFAULT_STALL_PROBE_MINUTES,
+        STALL_PROBE_ENV,
+        StallProbeMonitor,
+    )
 
-    probe_min = ExternalWaitMonitor.env_int("CCC_TURN_STALL_PROBE_MIN", default=0)
+    probe_min = ExternalWaitMonitor.env_int(STALL_PROBE_ENV, default=DEFAULT_STALL_PROBE_MINUTES)
     if probe_min <= 0:
         logger.info("Matrix turn-stall probe disabled (CCC_TURN_STALL_PROBE_MIN=0)")
         return None

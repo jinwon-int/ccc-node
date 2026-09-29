@@ -388,6 +388,7 @@ a provider turn or reads transcript/credential files.
 | `CCC_BRIDGE_BUSY_NOTICE_MIN_ELAPSED_SECONDS` | No | `10` | Minimum active-turn age before sending the acknowledgement |
 | `CCC_TURN_AGE_NOTIFY_MIN` | No | `30` | Provider-neutral, notify-only age notice after this many minutes; `0` disables it. The notice reports age only, does not establish progress or classify the turn, and never interrupts or recovers it; use `/stop` for manual control |
 | `CCC_TURN_AGE_RENOTIFY_MIN` | No | `30` | Minimum minutes between delivered age notices for the same active turn; does not change stop, recovery, or provider hard timeouts |
+| `CCC_TURN_STALL_PROBE_MIN` | No | `20` | Silent-death stall probe (Telegram and Matrix, #1741): when an active turn has produced no output for this many minutes, check engine liveness and run dead-session recovery only if the engine is confirmed dead; a quiet-but-alive or ambiguous turn is never touched. `0` disables it |
 | `CCC_BRIDGE_FOLLOWUP_QUEUE_CAP` | No | `32` | Maximum restart-safe FIFO follow-ups per conversation; excess messages are explicitly rejected and never silently dropped |
 | `CCC_BRIDGE_FOLLOWUP_FAILURE_NOTIFICATION_CAP` | No | `32` | Separate cap for retained discard receipts per conversation; at the cap, the newest failed item remains queued and processing pauses instead of evicting an older receipt |
 | `CCC_BRIDGE_FOLLOWUP_RETRY_BACKOFF_SECONDS` | No | `1,5,30` | Increasing wall-clock delays for durable follow-up dispatch and discard-notification retries |
