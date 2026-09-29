@@ -173,7 +173,8 @@ in, the sweep runs a **codex branch** right after the Claude draft loop:
 
 **Opt in** with `CCC_SKILL_CODEX_DRAFTING=1` (or `1` in
 `<CCC_STATE_DIR>/skill-autosave.codex-drafting`). Default is off: nodes without
-the flag pay nothing — the sessions tree is not even walked.
+the flag pay nothing — the sessions tree is not walked (only a first-hit
+recency probe feeds the #1867 `WARN lanes-not-enabled` signal).
 
 Safety rails:
 
@@ -257,6 +258,19 @@ branch carry their provider in `meta.json`, and autoinstall routes every draft
 to its own install root (claude drafts → `~/.claude/skills`, piri drafts →
 `~/.piri/agent/skills`) within the same run — the autoinstall summary reports
 the routed providers.
+
+Re-runs keep the lane (#1867): a re-run reads the existing managed entry and
+carries forward the baked `CCC_SKILL_PROVIDER`,
+`CCC_SKILL_{PIRI,CODEX,DANSO}_DRAFTING`, `CCC_DANSO_STATE_DIR` and
+`CCC_SKILL_PROMOTION_PROVIDERS` unless an explicit flag (or inherited env)
+sets them, printing `NOTICE: kept lane settings …` on stderr. `--reset-lane`
+drops them on purpose. Every `--apply` appends a row (ts, action, gen, invoked
+and rendered argv, preserved keys) to
+`<state>/skill-autosave-cron.history.jsonl` (mode 600). At sweep time, a
+non-Claude lane that is not enabled — with no explicit
+`CCC_SKILL_<LANE>_DRAFTING` value — while its session tree has a session inside
+the window logs `WARN lanes-not-enabled lanes=…` (set the value to `0` to mark
+a deliberate opt-out).
 
 ## Telegram notification
 

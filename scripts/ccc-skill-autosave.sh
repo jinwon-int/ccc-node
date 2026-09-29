@@ -286,6 +286,30 @@ else
   done < <(find "$PROJECTS_DIR" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" -print0 2>/dev/null \
              | xargs -0 -r ls -t 2>/dev/null)
 
+  # #1867: a non-Claude lane whose opt-in is simply absent (not an explicit
+  # CCC_SKILL_<LANE>_DRAFTING=0) while its session tree holds recent sessions is
+  # the signature of lost cron baking — nosuk's piri lane logged the ordinary
+  # "not-enabled" skip for nine days. Probe with -quit (first hit only) and
+  # surface it as a WARN line below instead of a routine skip.
+  lanes_not_enabled=""
+  lane_has_recent_sessions() { # <sessions-dir>...
+    local _dir
+    for _dir in "$@"; do
+      [ -d "$_dir" ] || continue
+      [ -n "$(find "$_dir" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" -print -quit 2>/dev/null)" ] && return 0
+    done
+    return 1
+  }
+  note_lane_not_enabled() { # <lane> <explicit-opt-in-value> <sessions-dir>... -> $lane_hint
+    local lane="$1" explicit="$2"
+    shift 2
+    lane_hint=""
+    [ -z "$explicit" ] || return 0
+    lane_has_recent_sessions "$@" || return 0
+    lanes_not_enabled="${lanes_not_enabled:+$lanes_not_enabled,}$lane"
+    lane_hint=" recent_sessions=yes"
+  }
+
   # --- 2a) codex branch (#1353, opt-in) --------------------------------------
   # Codex sessions live in $CODEX_HOME/sessions/**/rollout-*.jsonl with a
   # different record shape, so the drafting brain above never sees them. When
@@ -297,9 +321,10 @@ else
   # tree via CLAUDE_PROJECTS_DIR — all unchanged downstream.
   # Default OFF (CCC_SKILL_CODEX_DRAFTING=1, or state file
   # skill-autosave.codex-drafting): nodes without the flag pay nothing — the
-  # sessions tree is not even walked. Machine-driven codex_exec sessions are
-  # excluded at projection time (self-reference bias, same as promotion's
-  # self-review ban); CCC_SKILL_CODEX_INCLUDE_EXEC=1 lifts it.
+  # sessions tree is not walked (only a -quit recency probe, #1867).
+  # Machine-driven codex_exec sessions are excluded at projection time
+  # (self-reference bias, same as promotion's self-review ban);
+  # CCC_SKILL_CODEX_INCLUDE_EXEC=1 lifts it.
   codex_drafted=0
   codex_opt_in="${CCC_SKILL_CODEX_DRAFTING:-}"
   if [ -z "$codex_opt_in" ] && [ -f "$STATE_DIR/skill-autosave.codex-drafting" ]; then
@@ -316,7 +341,8 @@ else
     unset _codex_norm
   fi
   if [ "$codex_opt_in" != "1" ]; then
-    log "codex skipped reason=not-enabled"
+    note_lane_not_enabled codex "${CCC_SKILL_CODEX_DRAFTING:-}" "$codex_home/sessions"
+    log "codex skipped reason=not-enabled$lane_hint"
   elif [ ! -f "$codex_normalizer" ]; then
     log "codex skipped reason=no-normalizer"
   elif [ ! -d "$codex_home/sessions" ]; then
@@ -395,7 +421,7 @@ else
   # tree via CLAUDE_PROJECTS_DIR — all unchanged downstream.
   # Default OFF (CCC_SKILL_PIRI_DRAFTING=1, or state file
   # skill-autosave.piri-drafting): nodes without the flag pay nothing — the
-  # sessions tree is not even walked.
+  # sessions tree is not walked (only a -quit recency probe, #1867).
   piri_drafted=0
   piri_opt_in="${CCC_SKILL_PIRI_DRAFTING:-}"
   if [ -z "$piri_opt_in" ] && [ -f "$STATE_DIR/skill-autosave.piri-drafting" ]; then
@@ -412,7 +438,8 @@ else
     unset _piri_norm
   fi
   if [ "$piri_opt_in" != "1" ]; then
-    log "piri skipped reason=not-enabled"
+    note_lane_not_enabled piri "${CCC_SKILL_PIRI_DRAFTING:-}" "$piri_home/sessions"
+    log "piri skipped reason=not-enabled$lane_hint"
   elif [ ! -f "$piri_normalizer" ]; then
     log "piri skipped reason=no-normalizer"
   elif [ ! -d "$piri_home/sessions" ]; then
@@ -486,7 +513,14 @@ else
   fi
   danso_state="${CCC_DANSO_STATE_DIR:-}"
   if [ "$danso_opt_in" != "1" ]; then
-    log "danso skipped reason=not-enabled"
+    lane_hint=""
+    if [ -n "$danso_state" ]; then
+      note_lane_not_enabled danso "${CCC_SKILL_DANSO_DRAFTING:-}" \
+        "$danso_state/journals" "$danso_state/journals-audience" \
+        "$danso_state/chatgpt-journals" "$danso_state/chatgpt-journals-audience" \
+        "$danso_state/glm-journals" "$danso_state/glm-journals-audience"
+    fi
+    log "danso skipped reason=not-enabled$lane_hint"
   elif [ -z "$danso_state" ]; then
     log "danso skipped reason=no-state-dir"
   else
@@ -567,6 +601,10 @@ else
       )
       log "danso sweep done drafted_sessions=$danso_drafted"
     fi
+  fi
+
+  if [ -n "$lanes_not_enabled" ]; then
+    log "WARN lanes-not-enabled lanes=$lanes_not_enabled (recent sessions exist but drafting is off; lost cron baking? reinstall with the lane flags or set CCC_SKILL_<LANE>_DRAFTING=0 if deliberate, #1867)"
   fi
 
   # skill-review.sh stages drafts from a detached background pipeline; give it
