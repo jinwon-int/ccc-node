@@ -342,6 +342,12 @@ def _configured_nunchi_lane(cron: str) -> str:
     return "none"
 
 
+def _claude_scoped_nunchi_lane(cron: str, configured: str, runtime: str) -> bool:
+    """True for an audience-scoped nunchi cron on a Claude lane or runtime (#1921)."""
+    scoped = re.search(r"\bCCC_NUNCHI_AUDIENCE_SCOPED=1\b", cron) is not None
+    return scoped and "claude" in {configured, runtime}
+
+
 # --- worker Claude CLI version floor (a2a-nexus#2275) -------------------------
 # A worker model pin can require a newer Claude Code than the node runs; the API
 # then answers every task with a 400 ("Claude Code X does not support this
@@ -2836,8 +2842,17 @@ class Doctor:
             collection, ticks,
         )
 
+        claude_scoped = _claude_scoped_nunchi_lane(cron, configured, self.provider)
+        # A Claude audience-scoped lane has no verbatim MemPalace sweep by
+        # design (#1921: ~/.claude/projects is not audience-routable), so a
+        # missing binary/status is not a finding there; its health is the
+        # sidecar row below plus the ingest tick.
+        mp_needed = not (claude_scoped and configured == "claude")
         healthy = (
-            match == "ok" and mp_ok and coll_state in {"ok", "running", ""} and not stale
+            match == "ok"
+            and (mp_ok or not mp_needed)
+            and coll_state in {"ok", "running", ""}
+            and not stale
         )
         self.add(
             "정상" if healthy else "경고",
@@ -2849,6 +2864,64 @@ class Doctor:
             "install MemPalace for verbatim collection; on stale ticks check "
             "~/.nunchi/*.cron.log and the cron PATH (#996/#1200 class)",
         )
+        self._check_claude_audience_sidecars(cron, configured, claude_scoped)
+
+    def _check_claude_audience_sidecars(self, cron: str, configured: str, applies: bool) -> None:
+        """Flag an audience-scoped Claude node whose collection is structurally 0 (#1921).
+
+        Claude transcripts share one ``~/.claude/projects`` tree, so the scoped
+        collector routes a session only through the bridge's per-turn sidecar
+        (``<root>/<scope>/claude/session-map/<sid>.json``); with none present
+        every item is unmapped and skipped (fail-closed) while the cron keeps
+        ticking — the silent-freeze shape #1921 measured (17 days, 0 collected).
+        Body-free: counts only, never session ids or scope names.
+        """
+        if not applies:
+            return
+        root_match = re.search(r"\bCCC_NUNCHI_AUDIENCE_ROOT=(\S+)", cron)
+        root = root_match.group(1).strip("\"'") if root_match else None
+        item = "nunchi claude audience map"
+        reapply = (
+            "scripts/install-nunchi.sh --apply --claude --audience-scoped "
+            f"{root or '<absolute-memory-audience-root>'}"
+        )
+        if configured != "claude":
+            self.add(
+                "경고",
+                item,
+                f"DEFECT: runtime is claude but the audience-scoped nunchi lane is "
+                f"'{configured}' — its input never fills, collection is 0",
+                f"re-run {reapply}",
+            )
+            return
+        count = 0
+        base = Path(root) if root else None
+        with contextlib.suppress(OSError):
+            children = sorted(base.iterdir()) if base and base.is_absolute() and base.is_dir() else []
+            for child in children:
+                if child.name != "shared" and not re.fullmatch(r"private-[0-9a-f]{32}", child.name):
+                    continue
+                mdir = child / "claude" / "session-map"
+                if mdir.is_symlink() or not mdir.is_dir():
+                    continue
+                count += sum(
+                    1
+                    for p in mdir.iterdir()
+                    if p.name.endswith(".json") and not p.name.startswith(".")
+                )
+        if count == 0:
+            self.add(
+                "경고",
+                item,
+                "DEFECT: audience-scoped Claude collection has no session->audience "
+                "sidecar under <root>/*/claude/session-map — every Claude transcript "
+                "is unmapped and skipped (fail-closed); collection is 0",
+                "update the bridge to a build that writes the per-turn sidecar "
+                "(#1921) and let it serve one Claude turn; then check "
+                "~/.nunchi/ingest.status.json unmapped/ingested counts",
+            )
+            return
+        self.add("정상", item, f"sidecars={count}", "none")
 
     @staticmethod
     def _newest_scoped_status(m_root, name: str) -> Path | None:

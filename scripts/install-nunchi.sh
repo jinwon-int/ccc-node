@@ -9,6 +9,9 @@
 #   install-nunchi.sh --apply --piri       # explicit Piri override
 #   install-nunchi.sh --apply --danso      # explicit Danso override (#1698)
 #   install-nunchi.sh --apply --piri --audience-scoped /absolute/audience/root
+#   install-nunchi.sh --apply --claude --audience-scoped /absolute/audience/root
+#                                            # routed per session via the bridge's
+#                                            # session_id->audience sidecar (#1921)
 #   install-nunchi.sh --apply --judge    # + daily review-queue judge batch (#1204)
 #   install-nunchi.sh --apply --judge-apply  # judge batch in APPLY mode — MUTATES
 #                                            # the fact store; implies --judge and
@@ -85,7 +88,7 @@ while [ $# -gt 0 ]; do
     # cron without the batch cron is not a state the installer can express.
     --wiki-promote-apply) WIKI_PROMOTE=1; WIKI_PROMOTE_APPLY=1 ;;
     --help|-h)
-      sed -n '2,22p' "$0"; exit 0 ;;
+      sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -565,6 +568,25 @@ finally:
 PY
 }
 
+# #1921: the bridge writes <root>/<scope>/claude/session-map/<sid>.json per
+# Claude turn. Body-free presence probe (count only) over canonical scopes.
+_claude_sidecars_present() {  # <audience-root> -> exit 0 when >=1 sidecar exists
+  python3 - "$1" <<'PY'
+import re, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+for child in (root.iterdir() if root.is_dir() else []):
+    if child.name != "shared" and not re.fullmatch(r"private-[0-9a-f]{32}", child.name):
+        continue
+    mdir = child / "claude" / "session-map"
+    if mdir.is_dir() and not mdir.is_symlink() and any(
+        p.name.endswith(".json") and not p.name.startswith(".") for p in mdir.iterdir()
+    ):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 detect_provider() {
   if [ "$PROVIDER" != "auto" ]; then printf '%s' "$PROVIDER"; return; fi
   local root bridge_status="" runtime=""
@@ -600,7 +622,13 @@ case "$ACTION" in
     mkdir -p "$NUNCHI_DIR"; chmod 700 "$NUNCHI_DIR"  # owner-only: logs/state stay private (#865)
     resolved_provider="$(detect_provider)"
     if [ "$AUDIENCE_SCOPED" = 1 ]; then
-      [ "$resolved_provider" = piri ] || { echo "audience-scoped collection currently requires Piri" >&2; exit 2; }
+      # Piri isolates transcripts per audience structurally; Claude is routed
+      # per session through the bridge's session_id -> audience sidecar
+      # (#1921). Codex/Danso have no audience-routed nunchi feed — refuse.
+      case "$resolved_provider" in
+        piri|claude) ;;
+        *) echo "audience-scoped collection supports Piri and Claude only (resolved provider: $resolved_provider)" >&2; exit 2 ;;
+      esac
       case "$AUDIENCE_ROOT" in
         /*) ;;
         *) echo "audience-scoped collection requires an absolute root" >&2; exit 2 ;;
@@ -612,6 +640,11 @@ case "$ACTION" in
       [ "$(stat -c %u -- "$AUDIENCE_ROOT")" = "$(id -u)" ] \
         || { echo "audience-scoped root owner is unsafe" >&2; exit 2; }
       chmod 700 "$AUDIENCE_ROOT"
+      if [ "$resolved_provider" = claude ] && ! _claude_sidecars_present "$AUDIENCE_ROOT"; then
+        echo "WARNING: no Claude session->audience sidecar under $AUDIENCE_ROOT/*/claude/session-map yet —" >&2
+        echo "  until the bridge (a build with #1921) serves a Claude turn, every transcript is" >&2
+        echo "  unmapped and skipped (fail-closed); ccc-doctor reports this as a defect." >&2
+      fi
     fi
     if [ "$resolved_provider" = "codex" ] && ! validate_codex_loader; then
       echo "Codex nunchi loader missing or unsafe at $HOOKS/codex-loader.py — run setup.sh first" >&2
@@ -663,7 +696,15 @@ case "$ACTION" in
     sweep_dir="${NUNCHI_SWEEP_DIR:-$default_sweep}"
     refresh="$HOOKS/mempalace-refresh.sh"
     refresh_ready=0
-    if [ -n "$mp" ] && [ -f "$mp" ] && [ -x "$mp" ] && [ -d "$sweep_dir" ] && [ -x "$refresh" ]; then
+    # The verbatim MemPalace sweep reads ~/.claude/projects wholesale and has
+    # no per-session router, so a Claude audience-scoped node would mix every
+    # audience into one palace (and mempalace-refresh.sh refuses scoped
+    # non-Piri runs anyway). Fail closed: peer facts only for that lane.
+    claude_scoped=0
+    [ "$resolved_provider" = claude ] && [ "$AUDIENCE_SCOPED" = 1 ] && claude_scoped=1
+    if [ "$claude_scoped" = 1 ]; then
+      :
+    elif [ -n "$mp" ] && [ -f "$mp" ] && [ -x "$mp" ] && [ -d "$sweep_dir" ] && [ -x "$refresh" ]; then
       timeout_bin="${CCC_NUNCHI_TIMEOUT_CLI:-$(command -v timeout || true)}"
       flock_bin="${CCC_NUNCHI_FLOCK_CLI:-$(command -v flock || true)}"
       [ -n "$timeout_bin" ] && [ -f "$timeout_bin" ] && [ -x "$timeout_bin" ] \
@@ -684,6 +725,8 @@ case "$ACTION" in
     if [ "$refresh_ready" = 1 ]; then
       append_cron_line "17 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK gen=$GEN"
       echo "mempalace hourly refresh cron added ($resolved_provider: $sweep_dir)"
+    elif [ "$claude_scoped" = 1 ]; then
+      echo "claude audience-scoped: verbatim MemPalace refresh is not audience-routable — refresh cron skipped (peer facts are routed per session via the bridge sidecar)"
     else
       echo "mempalace CLI, refresh hook or transcript dir missing — verbatim refresh cron skipped"
     fi

@@ -1008,6 +1008,41 @@ ok "genuinely stale scoped ingest tick is a 경고 (ingest-tick-stale)" \
   'jq -e ".klass == \"경고\" and (.status | contains(\"scopes=1\") and contains(\"ingest-tick-stale\"))" <<<"$nc" >/dev/null'
 rm -f "$nc_aud/private-x/nunchi/ingest.status.json"
 
+# #1921: an audience-scoped Claude node collects only sessions the bridge has
+# mapped through its per-turn session_id -> audience sidecar. With no sidecar
+# the lane still ticks on schedule while every transcript is skipped
+# (fail-closed) — the doctor must call that a defect, not stay silent.
+sed 's/r = d.rows\[0\] if d.rows else None/r = next((x for x in d.rows if x.item == "nunchi claude audience map"), None)/' \
+  "$TMP/nunchi-collection.py" > "$TMP/nunchi-audience-map.py"
+run_map() {  # <provider> <cron-text>
+  ND_PROVIDER="$1" ND_CRON="$2" ND_STATUS_JSON="" ND_MP="$nbin/mempalace" \
+  ND_HOME="$TMP/nc-home" ND_PATH="$nbin:/usr/bin:/bin" ND_INGEST_JSON="$fresh_ingest" \
+  ND_CRONTAB="$nbin/crontab" ND_CRON_STORE="$TMP/nc-cron" ND_STATUS="$TMP/nc-status.json" \
+  NUNCHI_COLL_REPO="$nrepo" DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" \
+  python3 "$TMP/nunchi-audience-map.py" 2>/dev/null
+}
+map_aud="$TMP/map-aud"; mkdir -p "$map_aud/shared" "$map_aud/private-0123456789abcdef0123456789abcdef"
+claude_scoped_cron="*/10 * * * * CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$map_aud bash /h/.claude/hooks/nunchi/ingest-cron.sh >> /log 2>&1 # nunchi:#816"
+nc="$(run_map claude "$claude_scoped_cron")"
+ok "claude audience-scoped lane with no sidecar is flagged as a DEFECT (경고)" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"DEFECT\") and contains(\"unmapped and skipped\") and contains(\"collection is 0\"))" <<<"$nc" >/dev/null'
+nc="$(run_map claude "$scoped_cron")"
+ok "runtime claude on a scoped piri lane is a DEFECT that names the re-apply command" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"DEFECT\") and contains(\"piri\"))" <<<"$nc" >/dev/null'
+mkdir -p "$map_aud/shared/claude/session-map"
+printf '{}' > "$map_aud/shared/claude/session-map/aaaaaaaa-0000-4000-8000-000000000001.json"
+printf '{}' > "$map_aud/shared/claude/session-map/.aaaaaaaa-0000-4000-8000-000000000002.json.tmp"
+nc="$(run_map claude "$claude_scoped_cron")"
+ok "claude audience-scoped lane with sidecar data is 정상 and body-free (count only)" \
+  'jq -e ".klass == \"정상\" and .status == \"sidecars=1\"" <<<"$nc" >/dev/null'
+nc="$(run_map codex "$codex_cron")"
+ok "non-claude, non-scoped lanes get no audience-map row" \
+  'jq -e ".klass == \"none\"" <<<"$nc" >/dev/null'
+# shellcheck disable=SC2034  # nc is read via eval inside ok()
+nc="$(run_nc claude "$claude_scoped_cron" "" "" "/usr/bin:/bin" "$fresh_ingest")"
+ok "claude scoped lane is not faulted for the MemPalace sweep it deliberately lacks" \
+  'jq -e ".klass == \"정상\"" <<<"$nc" >/dev/null'
+
 # #1081: doctor surfaces installer-managed cron entries frozen at older code.
 # One row per known marker (absent = opt-in 정상; gen match = 정상; unstamped
 # or mismatched gen = non-fatal 경고) plus unmanaged-marker classification.

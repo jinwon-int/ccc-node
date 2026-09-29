@@ -143,6 +143,30 @@ dispatchers over canonical direct children named `shared` or
 `mempalace-home`. Unsafe owners/modes, symlinks, non-canonical names, and
 out-of-root transcript inputs fail closed. Provider provenance remains `piri`.
 
+A Claude-provider bridge enables the same scoped collection with
+`scripts/install-nunchi.sh --apply --claude --audience-scoped
+<absolute-memory-audience-root>` (#1921). Claude transcripts all share
+`~/.claude/projects`, so the audience cannot come from where a transcript
+lives. Instead, after every successful Claude turn the bridge writes one
+body-free sidecar, `<root>/<scope>/claude/session-map/<session_id>.json`
+(schema `ccc.claude.session-audience.v1`: `provider`, `session_id`,
+`memory_audience`, `memory_scope`, `updated_at` — no message content, no raw
+Telegram/Matrix ids; directory 0700, file 0600, atomic rename), using the same
+`resolve_memory_audience` route the session store records. `ingest-cron.sh`
+then hands off to `claude-audience-feed.py`, which routes each distill-history
+snapshot and bridge distill-journal job by its Claude session id into exactly
+one `<scope>/nunchi` store. A session with no sidecar (`unmapped`), valid
+sidecars under two scopes (`ambiguous`), or a malformed, mislabelled,
+symlinked or group/other-readable sidecar — or a journal job whose own route
+disagrees with it (`invalid`) — is skipped, left unseen for a later tick, and
+counted in `ingest.status.json`; nothing is ever written to the node-global
+store in this mode. The verbatim MemPalace sweep has no per-session router, so
+the installer does not wire it for this lane. Until the audience root holds
+any sidecar, the tick carries `skipped: no-audience-sidecar` and `ccc-doctor`
+reports a `nunchi claude audience map` DEFECT row (as it does when the runtime
+is Claude but the scoped lane is still another provider's). Codex and Danso
+remain refused with `--audience-scoped`.
+
 Recall follows one rule across Piri, Claude, and Codex materialization: a
 private route may read its own scoped Nunchi snapshot, the shared snapshot, and
 the original node-global snapshot as private-only migration input; a shared

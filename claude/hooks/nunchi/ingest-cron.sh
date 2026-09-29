@@ -36,6 +36,38 @@ touch "$SEEN"
 (
   flock -n 9 || exit 0
 
+  # Audience-scoped mode (#1921): every Claude transcript lives in one shared
+  # ~/.claude/projects tree, so items are routed per session through the
+  # bridge's session_id -> audience sidecar into <root>/<scope>/nunchi. An
+  # item with no, ambiguous or invalid mapping is skipped and counted — never
+  # written to this node-global store, which would mix audiences.
+  if [ "${CCC_NUNCHI_AUDIENCE_SCOPED:-0}" = 1 ]; then
+    counts="$(python3 "$HERE/claude-audience-feed.py" \
+      --audience-root "${CCC_NUNCHI_AUDIENCE_ROOT:-}" \
+      --history "$HIST" --journal "$JOURNAL" --seen "$SEEN" \
+      --nunchi-py "$FM" ${CCC_NUNCHI_CLAUDE_PROJECTS:+--projects-root "$CCC_NUNCHI_CLAUDE_PROJECTS"})" || counts=""
+    case "$counts" in *[!0-9\ ]*) counts="" ;; esac  # nine integers or nothing
+    read -r sources ingested retired deferred unmapped ambiguous invalid scopes sidecars <<<"$counts"
+    if [ -z "${sidecars:-}" ]; then
+      echo "nunchi ingest (audience-scoped): router failed — nothing ingested this tick" >&2
+      nunchi_write_status "$STATUS" claude 0 0 0 0 '"audience_scoped":true,"skipped":"audience-router-failed"'
+      exit 0
+    fi
+    if [ "$sidecars" -eq 0 ]; then
+      echo "nunchi ingest (audience-scoped): no Claude session->audience sidecar under ${CCC_NUNCHI_AUDIENCE_ROOT:-<unset>} — every item is unmapped and skipped (fail-closed); the bridge writes one per Claude turn (#1921)" >&2
+    fi
+    # unmapped is reported every tick in the status file; the log line only
+    # fires when something moved or a mapping was rejected, so a backlog of
+    # pre-sidecar sessions does not add a line every ten minutes.
+    if [ $((ingested + retired + ambiguous + invalid)) -gt 0 ]; then
+      echo "nunchi ingest (audience-scoped): ingested=$ingested retired=$retired deferred=$deferred unmapped=$unmapped ambiguous=$ambiguous invalid=$invalid scopes=$scopes sidecars=$sidecars"
+    fi
+    extra="\"audience_scoped\":true,\"unmapped\":$unmapped,\"ambiguous\":$ambiguous,\"invalid\":$invalid,\"scopes\":$scopes,\"sidecars\":$sidecars"
+    [ "$sidecars" -eq 0 ] && extra="$extra,\"skipped\":\"no-audience-sidecar\""
+    nunchi_write_status "$STATUS" claude "$sources" "$ingested" "$retired" "$deferred" "$extra"
+    exit 0
+  fi
+
   sources=0
   [ -d "$HIST" ] && sources=$((sources+1))
   [ -d "$JOURNAL" ] && sources=$((sources+1))

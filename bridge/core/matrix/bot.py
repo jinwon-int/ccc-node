@@ -78,6 +78,7 @@ from telegram_bot.core.lifecycle_loops import (
 from telegram_bot.core.matrix import lifecycle as matrix_lifecycle
 from telegram_bot.core.matrix.render import chunk_text, render_matrix_message
 from telegram_bot.core.matrix_ids import MatrixIdMap
+from telegram_bot.core.claude_audience_sidecar import record_claude_turn_audience
 from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core.project_chat_types import ChatResponse
 from telegram_bot.core.push_notifier import (
@@ -2316,6 +2317,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             )
         await self._session_manager.patch_session(key, updates=updates, remove_fields=remove)
         self._runtime_active_sessions.add(key)
+        # #1921: per-turn Claude session_id -> audience record for nunchi.
+        await record_claude_turn_audience(provider, audience, response.session_id)
 
     async def _finish(self, response: ChatResponse, room_id: str) -> Any:
         status = "complete" if getattr(response, "success", True) else "error"
