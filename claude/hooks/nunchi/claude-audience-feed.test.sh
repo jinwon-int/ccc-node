@@ -155,6 +155,42 @@ run_cron
 ok "a late sidecar routes the previously unmapped job" \
   "ingests_into '$aud/$PRIV/nunchi/facts.db' | grep -q 'unmapped-fact'"
 
+# --- 2b. node-wide distill-history is never an input (privacy review repro) --
+# The owner runs `claude --resume <family-room sid>` in a terminal; that CLI
+# distill lands in the node-wide ~/.claude/state/distill-history under the
+# room's session id, which HAS a shared sidecar. Routing it by session id
+# alone would push the owner's private CLI facts into the shared store.
+hist_item() {  # <dir> <file> <sid> <fact-text>
+  mkdir -p "$1"
+  printf '{"session_id":"%s","honcho":[{"kind":"fact","subject":"user","text":"%s"}]}\n' "$3" "$4" > "$1/$2"
+  chmod 600 "$1/$2"
+}
+hist_item "$state/distill-history" cli.json "$SID_ROOM" "owner-terminal-cli-fact"
+: > "$TMP/calls.log"
+run_cron
+ok "node-wide CLI distill with a shared-mapped sid is ingested nowhere" \
+  "! grep -q 'owner-terminal-cli-fact' '$TMP/calls.log'"
+ok "and in particular not into the shared store" \
+  "[ -z \"\$(ingests_into '$aud/shared/nunchi/facts.db' | grep owner-terminal-cli-fact)\" ]"
+
+# --- 2c. a scope's own distill-history feeds only that scope ------------------
+mkdir -p "$aud/shared/state" "$aud/$PRIV/state"; chmod 700 "$aud/shared/state" "$aud/$PRIV/state"
+hist_item "$aud/shared/state/distill-history" h1.json "$SID_ROOM" "scoped-history-room-fact"
+hist_item "$aud/$PRIV/state/distill-history" h2.json "$SID_ROOM" "misplaced-history-fact"
+: > "$TMP/calls.log"
+run_cron
+ok "per-scope history whose sidecar agrees is ingested into its own scope" \
+  "ingests_into '$aud/shared/nunchi/facts.db' | grep -q 'scoped-history-room-fact'"
+ok "per-scope history whose sidecar maps elsewhere is invalid and collected nowhere" \
+  "! grep -q 'misplaced-history-fact' '$TMP/calls.log' && [ \"\$(status_field invalid)\" -ge 1 ]"
+
+# --- 2d. a steady rejection backlog does not re-log every tick ----------------
+run_cron
+: > "$TMP/calls.log"
+run_cron
+ok "unchanged counts: the tick writes no log line" "[ ! -s '$TMP/out' ]"
+ok "unchanged counts: the status still reports the backlog" "[ \"\$(status_field invalid)\" -ge 1 ]"
+
 # --- 3. unsafe sidecars fail closed -------------------------------------------
 SID_PERM="12121212-0000-4000-8000-000000000007"
 sidecar shared "$SID_PERM"; chmod 644 "$aud/shared/claude/session-map/$SID_PERM.json"
@@ -177,6 +213,22 @@ run_cron
 ok "a group/other-accessible audience root routes nothing" "! grep -q 'open-root-fact' '$TMP/calls.log'"
 ok "and reports zero sidecars" "[ \"\$(status_field sidecars)\" = 0 ]"
 chmod 700 "$aud"
+
+# --- 4b. stale sidecars are pruned unless their session still has input -----
+SID_OLD="56565656-0000-4000-8000-00000000000a"
+SID_OLD_PENDING="78787878-0000-4000-8000-00000000000b"
+sidecar shared "$SID_OLD"; sidecar shared "$SID_OLD_PENDING"
+job "$journal/old-pending.json" "$SID_OLD_PENDING" "" running
+touch -d '100 days ago' "$aud/shared/claude/session-map/$SID_OLD.json" \
+  "$aud/shared/claude/session-map/$SID_OLD_PENDING.json"
+CCC_NUNCHI_CLAUDE_SIDECAR_MAX_AGE_DAYS=0 run_cron
+ok "max age 0 disables pruning" "[ -f '$aud/shared/claude/session-map/$SID_OLD.json' ]"
+run_cron
+ok "a sidecar older than 90 days with no pending input is pruned" \
+  "[ ! -e '$aud/shared/claude/session-map/$SID_OLD.json' ] && [ \"\$(status_field pruned)\" -ge 1 ]"
+ok "an old sidecar whose session still has a pending job is kept" \
+  "[ -f '$aud/shared/claude/session-map/$SID_OLD_PENDING.json' ]"
+ok "fresh sidecars are kept" "[ -f '$aud/shared/claude/session-map/$SID_ROOM.json' ]"
 
 # --- 5. the unscoped Claude lane is unchanged ---------------------------------
 : > "$TMP/calls.log"

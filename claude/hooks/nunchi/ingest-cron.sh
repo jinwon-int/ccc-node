@@ -40,30 +40,41 @@ touch "$SEEN"
   # ~/.claude/projects tree, so items are routed per session through the
   # bridge's session_id -> audience sidecar into <root>/<scope>/nunchi. An
   # item with no, ambiguous or invalid mapping is skipped and counted — never
-  # written to this node-global store, which would mix audiences.
+  # written to this node-global store, which would mix audiences. The
+  # node-wide $HIST is NOT an input here: bridge-managed distill never writes
+  # it, so it only holds non-bridge (terminal CLI/cron/worker) sessions, which
+  # must not be routed into an audience by session id alone.
   if [ "${CCC_NUNCHI_AUDIENCE_SCOPED:-0}" = 1 ]; then
+    # Last tick's rejection counts: the log only speaks when they change, so a
+    # permanently unmapped/invalid backlog is not re-logged every ten minutes.
+    prev="$(python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+print(d.get("unmapped", "-"), d.get("ambiguous", "-"), d.get("invalid", "-"), d.get("skipped") or "-")' "$STATUS" 2>/dev/null)" || prev=""
     counts="$(python3 "$HERE/claude-audience-feed.py" \
       --audience-root "${CCC_NUNCHI_AUDIENCE_ROOT:-}" \
-      --history "$HIST" --journal "$JOURNAL" --seen "$SEEN" \
+      --journal "$JOURNAL" --seen "$SEEN" \
       --nunchi-py "$FM" ${CCC_NUNCHI_CLAUDE_PROJECTS:+--projects-root "$CCC_NUNCHI_CLAUDE_PROJECTS"})" || counts=""
-    case "$counts" in *[!0-9\ ]*) counts="" ;; esac  # nine integers or nothing
-    read -r sources ingested retired deferred unmapped ambiguous invalid scopes sidecars <<<"$counts"
-    if [ -z "${sidecars:-}" ]; then
+    case "$counts" in *[!0-9\ ]*) counts="" ;; esac  # ten integers or nothing
+    read -r sources ingested retired deferred unmapped ambiguous invalid scopes sidecars pruned <<<"$counts"
+    if [ -z "${pruned:-}" ]; then
       echo "nunchi ingest (audience-scoped): router failed — nothing ingested this tick" >&2
       nunchi_write_status "$STATUS" claude 0 0 0 0 '"audience_scoped":true,"skipped":"audience-router-failed"'
       exit 0
     fi
-    if [ "$sidecars" -eq 0 ]; then
+    skipped="-"
+    [ "$sidecars" -eq 0 ] && skipped="no-audience-sidecar"
+    if [ "$skipped" = no-audience-sidecar ] && [ "${prev##* }" != no-audience-sidecar ]; then
       echo "nunchi ingest (audience-scoped): no Claude session->audience sidecar under ${CCC_NUNCHI_AUDIENCE_ROOT:-<unset>} — every item is unmapped and skipped (fail-closed); the bridge writes one per Claude turn (#1921)" >&2
     fi
-    # unmapped is reported every tick in the status file; the log line only
-    # fires when something moved or a mapping was rejected, so a backlog of
-    # pre-sidecar sessions does not add a line every ten minutes.
-    if [ $((ingested + retired + ambiguous + invalid)) -gt 0 ]; then
-      echo "nunchi ingest (audience-scoped): ingested=$ingested retired=$retired deferred=$deferred unmapped=$unmapped ambiguous=$ambiguous invalid=$invalid scopes=$scopes sidecars=$sidecars"
+    if [ $((ingested + retired + pruned)) -gt 0 ] \
+        || [ "$unmapped $ambiguous $invalid $skipped" != "$prev" ]; then
+      echo "nunchi ingest (audience-scoped): ingested=$ingested retired=$retired deferred=$deferred unmapped=$unmapped ambiguous=$ambiguous invalid=$invalid scopes=$scopes sidecars=$sidecars pruned=$pruned"
     fi
-    extra="\"audience_scoped\":true,\"unmapped\":$unmapped,\"ambiguous\":$ambiguous,\"invalid\":$invalid,\"scopes\":$scopes,\"sidecars\":$sidecars"
-    [ "$sidecars" -eq 0 ] && extra="$extra,\"skipped\":\"no-audience-sidecar\""
+    extra="\"audience_scoped\":true,\"unmapped\":$unmapped,\"ambiguous\":$ambiguous,\"invalid\":$invalid,\"scopes\":$scopes,\"sidecars\":$sidecars,\"pruned\":$pruned"
+    [ "$skipped" != "-" ] && extra="$extra,\"skipped\":\"$skipped\""
     nunchi_write_status "$STATUS" claude "$sources" "$ingested" "$retired" "$deferred" "$extra"
     exit 0
   fi

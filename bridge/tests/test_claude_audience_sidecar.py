@@ -264,3 +264,66 @@ async def test_collector_contract_routes_bridge_written_sidecars(tmp_path: Path)
     assert index.resolve(SID) == ("routed", ("private", session["distill_memory_scope"]))
     assert index.resolve(room_sid) == ("routed", ("shared", "shared"))
     assert index.resolve("99999999-0000-4000-8000-000000000000") == ("unmapped", None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("lane", ["continuation", "ci_resume"])
+async def test_bridge_started_turn_records_its_route_so_reuse_is_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    """External-wait resume / continuation look up the DM-keyed session and run
+    it in the record's chat without _save_session_id. Recording that run's
+    route makes a DM session reused in the family room ``ambiguous`` (skipped)
+    instead of being routed by its older private record."""
+
+    from telegram_bot.core import bot_delivery, bot_lifecycle
+
+    class Lifecycle(bot_lifecycle.BotLifecycleMixin, bot_delivery.BotDeliveryMixin):
+        pass
+
+    dm = _telegram_bot(tmp_path)  # same config/root as the lifecycle below
+    await dm._save_session_id(
+        OWNER, ChatResponse("ok", session_id=SID), user_id=OWNER, chat_id=OWNER
+    )
+
+    sent: list[str] = []
+
+    class Bot:
+        async def send_message(self, chat_id, text, **kwargs):
+            sent.append(text)
+
+    lifecycle = Lifecycle()
+    lifecycle._config = SimpleNamespace(
+        **vars(dm._config),
+        bot_data_dir=tmp_path,
+        project_root=str(tmp_path),
+        telegram_max_bubble_chars=1200,
+        enable_entity_renderer=True,
+    )
+    lifecycle.application = SimpleNamespace(bot=Bot())
+
+    async def lookup(user_id):
+        return {"session_id": SID}  # get_session(user_id): the DM session
+
+    lifecycle._session_manager = SimpleNamespace(get_session=lookup)
+
+    class ProjectChat:
+        async def process_message(self, *args, **kwargs):
+            return ChatResponse("done", session_id=kwargs.get("session_id"))
+
+    lifecycle._project_chat = ProjectChat()
+    monkeypatch.setenv("CCC_CONTINUATION_ENABLED", "1")
+    monkeypatch.setenv("CCC_EXTERNAL_WAIT_ENABLED", "1")
+    record = {"user_id": OWNER, "chat_id": FAMILY_ROOM, "session_id": SID,
+              "wait_id": "w", "continuation_id": "c"}
+    monitor = (lifecycle._build_continuation_monitor() if lane == "continuation"
+               else lifecycle._build_external_wait_monitor())
+    runner = monitor._runner if lane == "continuation" else monitor._resumer
+
+    assert await runner(record, "synthetic prompt") is True
+
+    root = tmp_path / "audiences"
+    scopes = sorted(p.parents[2].name for p in _sidecars(root))
+    assert scopes[-1] == "shared" and scopes[0].startswith("private-")
+    root.chmod(0o700)
+    assert _collector().SidecarIndex(root).resolve(SID) == ("ambiguous", None)

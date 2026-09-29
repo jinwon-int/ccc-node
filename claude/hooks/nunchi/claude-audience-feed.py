@@ -2,11 +2,21 @@
 """Audience-scoped nunchi mirror for Claude-provider nodes (#1921).
 
 ``ingest-cron.sh`` hands off here when its cron line carries
-``CCC_NUNCHI_AUDIENCE_SCOPED=1``. Inputs are the same two zero-LLM-cost sources
-the global Claude lane mirrors — ``distill-history`` snapshots and the bridge
-distill journal — but every item is routed to exactly one audience store:
+``CCC_NUNCHI_AUDIENCE_SCOPED=1``. Inputs are the zero-LLM-cost sources the
+global Claude lane mirrors, each routed to exactly one audience store:
 
     <audience-root>/<scope>/nunchi/{facts.db,snapshot.md}
+
+* the bridge distill journal (the bridge-managed lane), and
+* each scope's OWN ``<root>/<scope>/state/distill-history`` — bridge sessions
+  run their hooks with ``CCC_STATE_DIR`` pointed there — ingested only into
+  that scope and only when the sidecar maps the session to that same scope.
+
+The node-wide ``~/.claude/state/distill-history`` is deliberately NOT read in
+this mode: bridge-managed distill never writes it, so everything there comes
+from non-bridge sessions (the operator's terminal CLI, cron, workers). Routing
+those by session id alone would let ``claude --resume <room session>`` on the
+owner's terminal push private CLI facts into the shared store.
 
 The route comes ONLY from the bridge's per-turn sidecar
 (``<audience-root>/<scope>/claude/session-map/<session_id>.json``, contract in
@@ -36,6 +46,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 SIDECAR_SCHEMA = "ccc.claude.session-audience.v1"
@@ -110,12 +121,49 @@ def _read_sidecar(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _trusted_dir(path: Path) -> bool:
+    """Owner directory, not a symlink, not writable by group/other."""
+    try:
+        meta = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(meta.st_mode)
+        and meta.st_uid == os.geteuid()
+        and not stat.S_IMODE(meta.st_mode) & 0o022
+    )
+
+
+def _trusted_file(path: Path) -> bool:
+    try:
+        meta = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(meta.st_mode)
+        and meta.st_uid == os.geteuid()
+        and meta.st_nlink == 1
+        and not stat.S_IMODE(meta.st_mode) & 0o022
+    )
+
+
+def _max_age_days() -> int:
+    """CCC_NUNCHI_CLAUDE_SIDECAR_MAX_AGE_DAYS (default 90, 0 disables, max 3650)."""
+    raw = os.environ.get("CCC_NUNCHI_CLAUDE_SIDECAR_MAX_AGE_DAYS", "90")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 90
+    return value if 0 <= value <= 3650 else 90
+
+
 class SidecarIndex:
     """session_id -> {(kind, scope)} built once per tick; poisoned ids fail closed."""
 
     def __init__(self, root: Path) -> None:
         self.routes: dict[str, set[tuple[str, str]]] = {}
         self.poisoned: set[str] = set()
+        self.files: dict[str, list[Path]] = {}
         self.records = 0
         self.scopes = scope_dirs(root)
         for scope_dir in self.scopes:
@@ -143,6 +191,7 @@ class SidecarIndex:
             sid = entry[: -len(".json")]
             if not SESSION_ID_RE.fullmatch(sid):
                 continue
+            self.files.setdefault(sid, []).append(map_dir / entry)
             record = _read_sidecar(map_dir / entry)
             if (
                 record is None
@@ -185,6 +234,10 @@ class Feed:
         except OSError:
             self.seen = set()
         self.touched: set[str] = set()
+        # Session ids that still have an unseen input item; their sidecars
+        # are never pruned, whatever their age.
+        self.pending: set[str] = set()
+        self.pruned = 0
 
     def _mark_seen(self, path: Path) -> None:
         with self.seen_path.open("a", encoding="utf-8") as handle:
@@ -213,8 +266,17 @@ class Feed:
         )
         return env
 
-    def _route(self, sid: str, declared: tuple[object, object] | None = None):
+    def _route(
+        self,
+        sid: str,
+        declared: tuple[object, object] | None = None,
+        pinned_scope: str | None = None,
+    ):
         outcome, route = self.index.resolve(sid)
+        if outcome == "routed" and pinned_scope is not None and route[1] != pinned_scope:
+            # A scope's own distill-history item whose session the sidecar
+            # maps to a different audience: neither location is trusted.
+            outcome, route = "invalid", None
         if outcome == "routed" and declared is not None and tuple(declared) != route:
             # Defence in depth: a bridge journal job carries the route its own
             # local sink uses. It must agree with the sidecar, or neither is
@@ -248,22 +310,29 @@ class Feed:
         self.counts["ingested"] += 1
         return True
 
-    def history(self, directory: Path) -> None:
-        if not directory.is_dir():
-            return
-        self.counts["sources"] += 1
-        for path in sorted(directory.glob("*.json")):
-            if not path.is_file() or str(path) in self.seen:
+    def scoped_history(self) -> None:
+        """Each scope's own distill-history, into that scope only (never node-wide)."""
+        for scope_dir in self.index.scopes:
+            state = scope_dir / "state"
+            directory = state / "distill-history"
+            if not (_trusted_dir(state) and _trusted_dir(directory)):
                 continue
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-            except (OSError, ValueError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-            route = self._route(str(payload.get("session_id") or ""))
-            if route is not None and self._ingest(payload, route):
-                self._mark_seen(path)
+            self.counts["sources"] += 1
+            for path in sorted(directory.glob("*.json")):
+                if str(path) in self.seen or not _trusted_file(path):
+                    continue
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                sid = str(payload.get("session_id") or "")
+                route = self._route(sid, pinned_scope=scope_dir.name)
+                if route is not None and self._ingest(payload, route):
+                    self._mark_seen(path)
+                else:
+                    self.pending.add(sid)
 
     def journal(self, directory: Path, adapter) -> None:
         if not directory.is_dir():
@@ -285,11 +354,43 @@ class Feed:
                     self.counts["retired"] += 1
                 else:
                     self.counts["deferred"] += 1
+                    if isinstance(job, dict):
+                        self.pending.add(str(job.get("thread_id") or ""))
                 continue
+            sid = str(job.get("thread_id") or "")
             declared = (job.get("memory_audience"), job.get("memory_scope"))
-            route = self._route(str(job.get("thread_id") or ""), declared)
+            route = self._route(sid, declared)
             if route is not None and self._ingest(payload, route):
                 self._mark_seen(path)
+            else:
+                self.pending.add(sid)
+
+    def prune(self, max_age_days: int, now: float) -> None:
+        """Remove sidecars untouched for ``max_age_days`` with no pending input.
+
+        The bridge rewrites a session's sidecar on every turn, so mtime is the
+        last turn. Only owner-owned regular files inside an owner-only map dir
+        are removed (a symlink entry is never followed or unlinked); a session
+        that is resumed later simply gets a fresh sidecar on its next turn.
+        """
+        if max_age_days <= 0:
+            return
+        cutoff = now - max_age_days * 86400
+        for sid, paths in self.index.files.items():
+            if sid in self.pending:
+                continue
+            for path in paths:
+                try:
+                    meta = path.lstat()
+                    if (
+                        stat.S_ISREG(meta.st_mode)
+                        and meta.st_uid == os.geteuid()
+                        and meta.st_mtime < cutoff
+                    ):
+                        path.unlink()
+                        self.pruned += 1
+                except OSError:
+                    continue
 
     def snapshots(self) -> None:
         for scope in sorted(self.touched):
@@ -307,7 +408,6 @@ class Feed:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--audience-root", required=True)
-    parser.add_argument("--history", required=True)
     parser.add_argument("--journal", required=True)
     parser.add_argument("--seen", required=True)
     parser.add_argument("--nunchi-py", required=True)
@@ -315,15 +415,16 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     feed = Feed(args)
-    feed.history(Path(args.history))
+    feed.scoped_history()
     feed.journal(Path(args.journal), _load_adapter())
     feed.snapshots()
+    feed.prune(_max_age_days(), time.time())
     c = feed.counts
     # Fixed field order; the shell caller `read`s it positionally.
     print(
         c["sources"], c["ingested"], c["retired"], c["deferred"],
         c["unmapped"], c["ambiguous"], c["invalid"],
-        len(feed.index.scopes), feed.index.records,
+        len(feed.index.scopes), feed.index.records, feed.pruned,
     )
     return 0
 

@@ -41,7 +41,12 @@ import logging
 import re
 from pathlib import Path
 
-from telegram_bot.core.memory_audience import AUDIENCE_PRIVATE, AUDIENCE_SHARED, MemoryAudience
+from telegram_bot.core.memory_audience import (
+    AUDIENCE_PRIVATE,
+    AUDIENCE_SHARED,
+    MemoryAudience,
+    resolve_memory_audience,
+)
 from telegram_bot.memory.distill_types import validate_memory_route
 from telegram_bot.utils.secure_fs import atomic_write_bytes, ensure_private_directory, utc_now_iso
 
@@ -120,3 +125,39 @@ async def record_claude_turn_audience(
         )
         return False
     return True
+
+
+async def record_bridge_started_turn(
+    settings: object,
+    *,
+    user_id: int,
+    chat_id: int,
+    response: object,
+    route: str = "telegram",
+) -> bool:
+    """Sidecar for a bridge-started turn that bypasses ``_save_session_id``.
+
+    The Telegram external-wait resume and continuation runners bind the turn
+    to a looked-up session and run it in the record's chat, but never persist
+    the session. Recording the route they actually ran under means a session
+    reused across surfaces shows up as ``ambiguous`` in the collector (and is
+    skipped) instead of being silently routed by its older record. Never raises.
+    """
+
+    session_id = getattr(response, "session_id", None)
+    if not getattr(response, "success", False) or not session_id:
+        return False
+    provider = str(getattr(settings, "agent_provider", "claude")).strip().lower()
+    if provider != SIDECAR_PROVIDER:
+        return False
+    try:
+        audience = resolve_memory_audience(
+            settings, user_id=int(user_id), chat_id=int(chat_id), route=route
+        )
+    except Exception as error:
+        logger.warning(
+            "Claude session audience resolve failed error=%s (session stays unmapped)",
+            type(error).__name__,
+        )
+        return False
+    return await record_claude_turn_audience(provider, audience, str(session_id))

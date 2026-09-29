@@ -1014,7 +1014,8 @@ rm -f "$nc_aud/private-x/nunchi/ingest.status.json"
 # (fail-closed) — the doctor must call that a defect, not stay silent.
 sed 's/r = d.rows\[0\] if d.rows else None/r = next((x for x in d.rows if x.item == "nunchi claude audience map"), None)/' \
   "$TMP/nunchi-collection.py" > "$TMP/nunchi-audience-map.py"
-run_map() {  # <provider> <cron-text>
+run_map() {  # <provider> <cron-text> [bridge-audience-root]
+  CCC_BRIDGE_MEMORY_AUDIENCE_ROOT="${3:-$map_aud}" CCC_DOCTOR_BRIDGE_PROJECT_ROOT="$TMP/nc-home" \
   ND_PROVIDER="$1" ND_CRON="$2" ND_STATUS_JSON="" ND_MP="$nbin/mempalace" \
   ND_HOME="$TMP/nc-home" ND_PATH="$nbin:/usr/bin:/bin" ND_INGEST_JSON="$fresh_ingest" \
   ND_CRONTAB="$nbin/crontab" ND_CRON_STORE="$TMP/nc-cron" ND_STATUS="$TMP/nc-status.json" \
@@ -1030,11 +1031,20 @@ nc="$(run_map claude "$scoped_cron")"
 ok "runtime claude on a scoped piri lane is a DEFECT that names the re-apply command" \
   'jq -e ".klass == \"경고\" and (.status | contains(\"DEFECT\") and contains(\"piri\"))" <<<"$nc" >/dev/null'
 mkdir -p "$map_aud/shared/claude/session-map"
-printf '{}' > "$map_aud/shared/claude/session-map/aaaaaaaa-0000-4000-8000-000000000001.json"
+map_sid="aaaaaaaa-0000-4000-8000-000000000001"
+printf '{}' > "$map_aud/shared/claude/session-map/$map_sid.json"
 printf '{}' > "$map_aud/shared/claude/session-map/.aaaaaaaa-0000-4000-8000-000000000002.json.tmp"
 nc="$(run_map claude "$claude_scoped_cron")"
-ok "claude audience-scoped lane with sidecar data is 정상 and body-free (count only)" \
-  'jq -e ".klass == \"정상\" and .status == \"sidecars=1\"" <<<"$nc" >/dev/null'
+ok "sidecar names that never parse as a valid record are still a DEFECT" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"1 unreadable/invalid\"))" <<<"$nc" >/dev/null'
+printf '{"schema":"ccc.claude.session-audience.v1","provider":"claude","session_id":"%s","memory_audience":"shared","memory_scope":"shared","updated_at":"x"}' \
+  "$map_sid" > "$map_aud/shared/claude/session-map/$map_sid.json"
+nc="$(run_map claude "$claude_scoped_cron")"
+ok "claude audience-scoped lane with a valid sidecar is 정상 and body-free (count only)" \
+  'jq -e ".klass == \"정상\" and .status == \"sidecars=1 valid>=1\"" <<<"$nc" >/dev/null'
+nc="$(run_map claude "$claude_scoped_cron" "$TMP/some-other-root")"
+ok "cron audience root that differs from the bridge root is a DEFECT naming the bridge root" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"differs from the bridge\"))" <<<"$nc" >/dev/null'
 nc="$(run_map codex "$codex_cron")"
 ok "non-claude, non-scoped lanes get no audience-map row" \
   'jq -e ".klass == \"none\"" <<<"$nc" >/dev/null'

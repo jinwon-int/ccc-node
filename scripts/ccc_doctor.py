@@ -342,6 +342,75 @@ def _configured_nunchi_lane(cron: str) -> str:
     return "none"
 
 
+def _resolved(path: str) -> Path:
+    with contextlib.suppress(OSError, RuntimeError):
+        return Path(path).expanduser().resolve()
+    return Path(path)
+
+
+def _dotenv_value(path: Path, key: str) -> str | None:
+    """Last ``KEY=value`` for one key in a dotenv file (never sourced), or None."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    value = None
+    pattern = re.compile(rf"^\s*(?:export\s+)?{re.escape(key)}\s*=\s*(.*)$")
+    for line in lines:
+        match = pattern.match(line)
+        if match:
+            raw = re.sub(r"\s+#.*$", "", match.group(1)).strip()
+            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+                raw = raw[1:-1]
+            value = raw or None
+    return value
+
+
+_SIDECAR_SCOPE_RE = re.compile(r"shared|private-[0-9a-f]{32}")
+
+
+def _count_claude_sidecars(root: Path | None) -> tuple[int, int]:
+    """(sidecar names, parsed valid records up to the first) under canonical scopes.
+
+    Validation mirrors the collector (claude-audience-feed.py): schema,
+    provider, filename == session_id and a kind/scope that match the directory.
+    Stops parsing at the first valid record; body-free.
+    """
+    count = valid = 0
+    if root is None or not root.is_absolute() or not root.is_dir():
+        return 0, 0
+    with contextlib.suppress(OSError):
+        for child in sorted(root.iterdir()):
+            if not _SIDECAR_SCOPE_RE.fullmatch(child.name):
+                continue
+            mdir = child / "claude" / "session-map"
+            if mdir.is_symlink() or not mdir.is_dir():
+                continue
+            kind = "shared" if child.name == "shared" else "private"
+            for entry in mdir.iterdir():
+                if entry.name.startswith(".") or not entry.name.endswith(".json"):
+                    continue
+                count += 1
+                if valid or entry.is_symlink() or not entry.is_file():
+                    continue
+                with contextlib.suppress(OSError, ValueError):
+                    if entry.stat().st_size > 4096:
+                        continue
+                    data = json.loads(entry.read_text())
+                    if (
+                        isinstance(data, dict)
+                        and data.get("schema") == "ccc.claude.session-audience.v1"
+                        and data.get("provider") == "claude"
+                        and data.get("session_id") == entry.name[: -len(".json")]
+                        and data.get("memory_audience") == kind
+                        and data.get("memory_scope") == child.name
+                    ):
+                        valid = 1
+    return count, valid
+
+
 def _claude_scoped_nunchi_lane(cron: str, configured: str, runtime: str) -> bool:
     """True for an audience-scoped nunchi cron on a Claude lane or runtime (#1921)."""
     scoped = re.search(r"\bCCC_NUNCHI_AUDIENCE_SCOPED=1\b", cron) is not None
@@ -2894,34 +2963,58 @@ class Doctor:
                 f"re-run {reapply}",
             )
             return
-        count = 0
-        base = Path(root) if root else None
-        with contextlib.suppress(OSError):
-            children = sorted(base.iterdir()) if base and base.is_absolute() and base.is_dir() else []
-            for child in children:
-                if child.name != "shared" and not re.fullmatch(r"private-[0-9a-f]{32}", child.name):
-                    continue
-                mdir = child / "claude" / "session-map"
-                if mdir.is_symlink() or not mdir.is_dir():
-                    continue
-                count += sum(
-                    1
-                    for p in mdir.iterdir()
-                    if p.name.endswith(".json") and not p.name.startswith(".")
-                )
-        if count == 0:
+        bridge_root = self._bridge_memory_audience_root()
+        if root and bridge_root is not None and _resolved(root) != _resolved(bridge_root):
             self.add(
                 "경고",
                 item,
-                "DEFECT: audience-scoped Claude collection has no session->audience "
-                "sidecar under <root>/*/claude/session-map — every Claude transcript "
+                "DEFECT: the nunchi cron's audience root differs from the bridge's "
+                "memory audience root — the collector never sees the sidecars the "
+                "bridge writes, collection is 0",
+                f"re-run scripts/install-nunchi.sh --apply --claude --audience-scoped {bridge_root}",
+            )
+            return
+        count, valid = _count_claude_sidecars(Path(root) if root else None)
+        if count == 0 or valid == 0:
+            what = "no" if count == 0 else f"{count} unreadable/invalid"
+            self.add(
+                "경고",
+                item,
+                f"DEFECT: audience-scoped Claude collection has {what} session->audience "
+                "sidecar(s) under <root>/*/claude/session-map — every Claude transcript "
                 "is unmapped and skipped (fail-closed); collection is 0",
                 "update the bridge to a build that writes the per-turn sidecar "
                 "(#1921) and let it serve one Claude turn; then check "
                 "~/.nunchi/ingest.status.json unmapped/ingested counts",
             )
             return
-        self.add("정상", item, f"sidecars={count}", "none")
+        self.add("정상", item, f"sidecars={count} valid>=1", "none")
+
+    def _bridge_memory_audience_root(self) -> str | None:
+        """The bridge's audience root, mirroring settings precedence (#1921).
+
+        Process env, then the bot data dir ``.env``, then ``bridge/.env`` for
+        ``CCC_BRIDGE_MEMORY_AUDIENCE_ROOT``; otherwise the settings default
+        ``<bot-data-dir>/memory-audiences``. Only that one key (and
+        ``BOT_DATA_DIR``) is read from an env file — never sourced, never shown.
+        """
+        project = Path(
+            os.environ.get("CCC_DOCTOR_BRIDGE_PROJECT_ROOT")
+            or self.running_bridge_home()
+            or os.path.expanduser("~")
+        ).expanduser()
+        data_dir = os.environ.get("BOT_DATA_DIR") or str(project / ".telegram_bot")
+        files = [Path(data_dir) / ".env", self.repo / "bridge/.env"]
+        key = "CCC_BRIDGE_MEMORY_AUDIENCE_ROOT"
+        value = os.environ.get(key) or next(
+            (v for v in (_dotenv_value(f, key) for f in files) if v), None
+        )
+        if value:
+            return value
+        data_dir = next(
+            (v for v in (_dotenv_value(f, "BOT_DATA_DIR") for f in files) if v), data_dir
+        )
+        return str(Path(data_dir).expanduser() / "memory-audiences")
 
     @staticmethod
     def _newest_scoped_status(m_root, name: str) -> Path | None:
