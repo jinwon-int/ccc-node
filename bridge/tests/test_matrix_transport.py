@@ -2725,4 +2725,27 @@ async def test_new_attachment_reply_keeps_both_files_and_relation(tmp_path: Path
         job = h.f.store.claim()
         assert job is not None
         assert json.loads(job["attachment"])["name"] == "current.md"
+        assert json.loads(job["attachment"])["captioned"] is True
         assert json.loads(job["reply_attachment"])["name"] == "report.md"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("media_parent", [False, True])
+async def test_captionless_current_media_preserves_trusted_original_caption(tmp_path: Path, media_parent: bool) -> None:
+    async with family(tmp_path) as h:
+        parent = _reply_media_parent(h)
+        caption = "Apply only recommendations 2 and 4"
+        if media_parent:
+            parent.source["content"].update(body=caption, filename="report.md")
+        else:
+            h.f._remember_text("$parent", h.f.c["rooms"][0], h.account, caption)
+        now = int(time.time() * 1000)
+        event = reply_event(now=now, body="IMG.png", msgtype="m.image", file=_media_file(),
+                            info={"mimetype": "image/png"})
+        req = h.f.policy.admit(h.f.c["rooms"][0], event, decrypted=True, now_ms=now)
+        assert req is not None and json.loads(req.attachment)["captioned"] is False
+        await h.f.input(req)
+        job = h.f.store.claim()
+        assert job is not None and caption in job["body"]
+        assert json.loads(job["attachment"])["captioned"] is True
+        assert bool(job["reply_attachment"]) is media_parent

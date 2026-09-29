@@ -71,7 +71,7 @@ from telegram_bot.core.matrix.state import (
     upgrade_saved_policy,
     wake_words,
 )
-from telegram_bot.core.matrix.attachments import encode_attachment, media_attachment, media_caption
+from telegram_bot.core.matrix.attachments import decode_attachment, encode_attachment, media_attachment, media_caption
 from telegram_bot.utils.redaction import redact_credentials
 
 logger = logging.getLogger(__name__)
@@ -1761,7 +1761,14 @@ class MatrixTransport:
             sender=req.sender,
             limit_bytes=MAX_TEXT_BYTES,
         )
-        return replace(req, body=body, reply_attachment=parent.attachment)
+        attachment = req.attachment
+        if attachment is not None and body != req.body:
+            current = decode_attachment(attachment)
+            if current is not None:
+                # The trusted parent prefix is meaningful input even when the
+                # newly attached media originally had no caption.
+                attachment = encode_attachment({**current, "captioned": True})
+        return replace(req, body=body, attachment=attachment, reply_attachment=parent.attachment)
 
     async def _request_room_keys(self) -> None:
         """Best-effort m.room_key_request for events we could not decrypt."""

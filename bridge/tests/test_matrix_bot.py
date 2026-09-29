@@ -15,6 +15,7 @@ import time
 import types
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import anyio
 import pytest
@@ -30,6 +31,8 @@ from telegram_bot.core.matrix.bot import (
     MatrixConfigError,
     MatrixTurnRunner,
 )
+from telegram_bot.core.matrix.state import Request
+from telegram_bot.core.matrix.transport import MatrixTransport, ReplyParent
 from telegram_bot.core.matrix_ids import MatrixIdMap
 from telegram_bot.core.project_chat_types import ChatResponse
 from telegram_bot.core.session_scope import is_group_conversation
@@ -1720,4 +1723,35 @@ async def test_reply_and_current_media_are_both_staged_and_cleaned_on_cancellati
     chat.on_process = cancel
     with pytest.raises(asyncio.CancelledError):
         await bot.run_turn(current, sink=FakeSink(), session_id=None, room_kind="direct")
+    assert not list((tmp_path / "data" / "matrix-media").iterdir())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("media_parent", [False, True])
+async def test_captionless_media_reply_keeps_original_caption_in_provider_prompt(
+    tmp_path: Path, matrix_config: dict[str, Any], media_parent: bool,
+) -> None:
+    bot, chat, manager = _bot(tmp_path, max_document_size_mb=10, image_context_guard=False)
+    _resume_existing_session(bot, manager)
+    current_cipher, current_file = _encrypted(b"current screenshot")
+    parent_cipher, parent_file = _encrypted(b"report payload")
+    current_file["url"], parent_file["url"] = "mxc://example.org/current", "mxc://example.org/parent"
+
+    class TwoFiles(_MediaTransport):
+        async def download_media(self, mxc: str, *, max_bytes: int) -> bytes:
+            return current_cipher if mxc.endswith("/current") else parent_cipher
+
+    bot._transport = TwoFiles(current_cipher)
+    current = _media_job({"msgtype": "m.image", "body": "IMG.png", "info": {"mimetype": "image/png"}, "file": current_file})
+    caption = "Apply only recommendations 2 and 4"
+    parent = _media_job({"msgtype": "m.file", "body": caption, "filename": "report.md", "file": parent_file})
+    frontend = object.__new__(MatrixTransport)
+    frontend.c = {"account": "@bot:test.invalid"}
+    frontend.recent_text = {}
+    frontend._fetch_parent = AsyncMock(return_value=ReplyParent(OWNER, caption, parent["attachment"] if media_parent else None))
+    req = Request(current["event_id"], DM_ROOM, OWNER, current["body"], "direct", "$parent", current["attachment"])
+    enriched = await frontend.with_reply_context(req)
+    current.update(body=enriched.body, attachment=enriched.attachment, reply_attachment=enriched.reply_attachment)
+    await bot.run_turn(current, sink=FakeSink(), session_id=None, room_kind="direct")
+    assert caption in chat.calls[0]["user_message"]
     assert not list((tmp_path / "data" / "matrix-media").iterdir())
