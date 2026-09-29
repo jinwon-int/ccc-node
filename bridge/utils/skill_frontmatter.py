@@ -19,9 +19,12 @@ CLI (used by the shell autosave writers)::
     skill_frontmatter.py normalize <in> [<out>]   rewrite description line(s)
     skill_frontmatter.py render                   stdin value -> YAML scalar
     skill_frontmatter.py unquote                  stdin raw   -> value
+    skill_frontmatter.py check <file>             promotion frontmatter gate
 
 ``normalize`` exits 0 on success and 3 when the rendered value cannot be
-proven YAML-safe (the caller keeps the draft blocked).
+proven YAML-safe (the caller keeps the draft blocked). ``check`` exits 0 when
+the file passes :func:`strict_frontmatter_fields` and 1 (printing the gate
+code) when it does not; 2 means the file could not be read.
 """
 
 from __future__ import annotations
@@ -300,6 +303,62 @@ def normalize_skill_md(text: str, keys: tuple[str, ...] = ("description",)) -> s
     return "".join(lines)
 
 
+class FrontmatterError(ValueError):
+    """A strict-gate rejection; ``code`` is the stable promotion gate code."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def strict_frontmatter_fields(
+    text: str, expected_name: str | None = None, *, require_yaml_safe: bool = False
+) -> tuple[str, str]:
+    """The skill-promotion frontmatter contract; returns (description, raw).
+
+    The single validator shared by the node-side promotion snapshot and the
+    autosave install gate (#1822), so a draft cannot pass one and fail the
+    other. The block holds exactly two single-line keys, ``name`` and
+    ``description`` -- no other key, no nested mapping, no blank or comment
+    line -- the decoded description is 20-1024 characters, and at least three
+    lines follow the block. ``expected_name`` (the skill directory) must equal
+    ``name`` when given; ``require_yaml_safe`` additionally refuses a
+    description line YAML would read differently. Raises
+    :class:`FrontmatterError` with the promotion gate code.
+    """
+    lines = text.splitlines()
+    if not lines or lines[0] != "---":
+        raise FrontmatterError("skill_frontmatter_invalid")
+    try:
+        end = lines.index("---", 1)
+    except ValueError:
+        raise FrontmatterError("skill_frontmatter_invalid") from None
+    fields: dict[str, str] = {}
+    for line in lines[1:end]:
+        if ":" not in line:
+            raise FrontmatterError("skill_frontmatter_invalid")
+        key, value = line.split(":", 1)
+        key, value = key.strip(), value.strip()
+        if key in fields or not value:
+            raise FrontmatterError("skill_frontmatter_invalid")
+        fields[key] = value
+    if set(fields) != {"name", "description"}:
+        raise FrontmatterError("skill_frontmatter_invalid")
+    if expected_name is not None and fields.get("name") != expected_name:
+        raise FrontmatterError("skill_name_mismatch")
+    raw = fields.get("description", "")
+    description = unquote_scalar(raw)
+    if (
+        not 20 <= len(description) <= 1024
+        or len(raw) > 1024
+        or len(lines[end + 1 :]) < 3
+    ):
+        raise FrontmatterError("skill_frontmatter_invalid")
+    if require_yaml_safe and not is_yaml_safe(raw):
+        raise FrontmatterError("skill_description_yaml_unsafe")
+    return description, raw
+
+
 def _main(argv: list[str]) -> int:
     if len(argv) >= 2 and argv[1] == "normalize" and len(argv) in (3, 4):
         try:
@@ -327,8 +386,23 @@ def _main(argv: list[str]) -> int:
         else:
             sys.stdout.write(unquote_scalar(data.rstrip("\n")))
         return 0
+    if len(argv) == 3 and argv[1] == "check":
+        try:
+            with open(argv[2], "rb") as handle:
+                payload = handle.read()
+        except OSError:
+            return 2
+        try:
+            strict_frontmatter_fields(payload.decode("utf-8"))
+        except UnicodeDecodeError:
+            sys.stdout.write("skill_not_utf8\n")
+            return 1
+        except FrontmatterError as error:
+            sys.stdout.write(error.code + "\n")
+            return 1
+        return 0
     sys.stderr.write(
-        "usage: skill_frontmatter.py normalize <in> [<out>] | render | unquote\n"
+        "usage: skill_frontmatter.py normalize <in> [<out>] | render | unquote | check <file>\n"
     )
     return 64
 

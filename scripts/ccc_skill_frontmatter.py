@@ -15,6 +15,7 @@ if _SPEC is None or _SPEC.loader is None:
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 
+FrontmatterError = _MODULE.FrontmatterError
 collapse = _MODULE.collapse
 double_quote = _MODULE.double_quote
 is_block_scalar = _MODULE.is_block_scalar
@@ -24,4 +25,5 @@ normalize_skill_md = _MODULE.normalize_skill_md
 parse_scalar = _MODULE.parse_scalar
 render_line = _MODULE.render_line
 render_scalar = _MODULE.render_scalar
+strict_frontmatter_fields = _MODULE.strict_frontmatter_fields
 unquote_scalar = _MODULE.unquote_scalar

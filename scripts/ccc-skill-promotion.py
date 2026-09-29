@@ -792,42 +792,21 @@ def _frontmatter(payload: bytes, expected_name: str, *, require_yaml_safe: bool 
 def _frontmatter_fields(
     payload: bytes, expected_name: str, *, require_yaml_safe: bool = False
 ) -> tuple[str, str]:
-    """(decoded description, raw description line value)."""
+    """(decoded description, raw description line value).
+
+    The contract itself lives in the shared helper (#1822) so the autosave
+    install gate applies the very same check before it installs a draft.
+    """
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError:
         raise PromotionError("skill_not_utf8") from None
-    lines = text.splitlines()
-    if not lines or lines[0] != "---":
-        raise PromotionError("skill_frontmatter_invalid")
     try:
-        end = lines.index("---", 1)
-    except ValueError:
-        raise PromotionError("skill_frontmatter_invalid") from None
-    fields: dict[str, str] = {}
-    for line in lines[1:end]:
-        if ":" not in line:
-            raise PromotionError("skill_frontmatter_invalid")
-        key, value = line.split(":", 1)
-        key, value = key.strip(), value.strip()
-        if key in fields or not value:
-            raise PromotionError("skill_frontmatter_invalid")
-        fields[key] = value
-    if set(fields) != {"name", "description"}:
-        raise PromotionError("skill_frontmatter_invalid")
-    if fields.get("name") != expected_name:
-        raise PromotionError("skill_name_mismatch")
-    raw = fields.get("description", "")
-    description = _skill_frontmatter.unquote_scalar(raw)
-    if (
-        not 20 <= len(description) <= 1024
-        or len(raw) > 1024
-        or len(lines[end + 1 :]) < 3
-    ):
-        raise PromotionError("skill_frontmatter_invalid")
-    if require_yaml_safe and not _skill_frontmatter.is_yaml_safe(raw):
-        raise PromotionError("skill_description_yaml_unsafe")
-    return description, raw
+        return _skill_frontmatter.strict_frontmatter_fields(
+            text, expected_name, require_yaml_safe=require_yaml_safe
+        )
+    except _skill_frontmatter.FrontmatterError as error:
+        raise PromotionError(error.code) from None
 
 
 def _scan_text(payload: bytes) -> None:

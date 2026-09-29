@@ -196,6 +196,51 @@ make_draft 20260101-000006-g-prose codex-prose-ok "Use when capturing the recurr
 run_codex env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
 ok "codex allows prose that only mentions Claude Code" '[ -f "$CODEX_SKILLS/codex-prose-ok/SKILL.md" ]'
 
+# --- 5b) promotion frontmatter contract enforced at install (#1822) ------------
+# Codex-style frontmatter (a nested `metadata:` block with short-description)
+# passed every install gate before #1822 and was then refused by the promotion
+# snapshot as skill_frontmatter_invalid. The unattended install now runs the
+# promoter's own validator, so the draft is blocked up front and never installed.
+# shellcheck disable=SC2034  # FM_TOOL/PROMOTION are read via eval inside ok()
+FM_TOOL="$HERE/../../../bridge/utils/skill_frontmatter.py"
+# shellcheck disable=SC2034
+PROMOTION="$HERE/../../../scripts/ccc-skill-promotion.py"
+codex_fm="$PENDING/20260101-000008-i-codexfm"
+mkdir -p "$codex_fm"
+printf -- '---\nname: codex-metadata-fm\ndescription: Use when checking that nightly backup archives rotate and stale snapshots expire as scheduled.\nmetadata:\n  short-description: Codex backup rotation check\n---\n\n# Codex frontmatter\n\n## When to Use\n- Recurring backup rotation check.\n\n## Procedure\n1. Run the checked steps.\n2. Verify the output.\n3. Record it.\n\n## Verification\n- Confirm the recorded output.\n' \
+  > "$codex_fm/SKILL.md"
+jq -nc '{id:"20260101-000008-i-codexfm", name:"codex-metadata-fm", status:"pending", provider:"codex"}' \
+  > "$codex_fm/meta.json"
+ok "codex-style metadata frontmatter is rejected by the promotion validator" '
+  python3 - "$PROMOTION" "$codex_fm/SKILL.md" <<"PY"
+import importlib.util, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[1])))
+spec = importlib.util.spec_from_file_location("ccc_skill_promotion_1822", sys.argv[1])
+mod = importlib.util.module_from_spec(spec); sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+try:
+    mod._frontmatter_fields(open(sys.argv[2], "rb").read(), "codex-metadata-fm")
+except mod.PromotionError as error:
+    sys.exit(0 if str(error) == "skill_frontmatter_invalid" else 1)
+sys.exit(1)
+PY'
+ok "shared check CLI agrees with promotion" '[ "$(python3 "$FM_TOOL" check "$codex_fm/SKILL.md")" = skill_frontmatter_invalid ]'
+run_codex env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
+ok "codex-style metadata frontmatter not installed" '[ ! -e "$CODEX_SKILLS/codex-metadata-fm" ]'
+ok "codex-style metadata frontmatter blocked with the promotion code" 'jq -e ".reason == \"lint frontmatter-not-promotable skill_frontmatter_invalid\"" "$codex_fm/autosave-block.json" >/dev/null'
+ok "codex-style metadata draft stays pending for repair" '[ -f "$codex_fm/SKILL.md" ]'
+# Same draft with only name/description installs — the new gate is not a blanket block.
+fixed_fm="$PENDING/20260101-000008-j-codexfm-fixed"
+mkdir -p "$fixed_fm"
+grep -v -e '^metadata:' -e '^  short-description:' "$codex_fm/SKILL.md" \
+  | sed 's/^name: codex-metadata-fm$/name: codex-metadata-fixed/;s/^description: .*/description: Use when reconciling a package lockfile after a dependency bump fails its integrity check./' \
+  > "$fixed_fm/SKILL.md"
+jq -nc '{id:"20260101-000008-j-codexfm-fixed", name:"codex-metadata-fixed", status:"pending", provider:"codex"}' \
+  > "$fixed_fm/meta.json"
+ok "repaired draft passes the shared check" 'python3 "$FM_TOOL" check "$fixed_fm/SKILL.md" >/dev/null'
+run_codex env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run >/dev/null
+ok "repaired codex draft installs" '[ -f "$CODEX_SKILLS/codex-metadata-fixed/SKILL.md" ]'
+
 # --- 6) existing user-authored Codex skill is never overwritten -----------------
 mkdir -p "$CODEX_SKILLS/user-made"
 printf -- '---\nname: user-made\ndescription: Operator-authored Codex skill that autosave must never overwrite ever.\n---\n\n# Hand\n' \
