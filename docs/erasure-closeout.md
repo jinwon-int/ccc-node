@@ -87,14 +87,25 @@ always kept.
   `NUNCHI_SNAPSHOT` point at the audience store, and reads never bump mtime.
   So these stay claimed live **regardless of env** until the operator creates
   the retirement marker `~/.nunchi/.legacy-retired` (default absent; itself
-  classified as retained). Only then does their 30-day clock matter. For
-  `facts.db`, `node-decommission` stays `handoff-or-drop` (never a plain
-  delete), so decommission keeps its handoff contract.
+  classified as retained; it must be a regular file — a symlink is not
+  honoured and surfaces as a blocker). Only then does their 30-day clock
+  matter. For `facts.db`, `node-decommission` stays `handoff-or-drop` (never
+  a plain delete), so decommission keeps its handoff contract.
+  **Creating the marker is a one-way retirement decision:** from then on the
+  pre-scope memory (`facts.db`, `snapshot.md`, `backend-health.json`) becomes
+  deletable by `prune-expired` once 30 days old, and after an apply run it
+  can only be recovered from that run's apply backup directory
+  (`$CCC_ERASURE_BACKUP_DIR` / `~/.erasure-backup/<run>/`, see
+  `manifest.json`). Removing the marker afterwards does not bring deleted
+  files back.
 - Last copy: while a backup family's live counterpart is absent (`.env` for
   `.env.bak-*`/`.env.pre-*`, `sessions.json` for its backups; crontab has no
   checkable file, so it always counts as absent), the newest copy per
   directory is planned as `retain (last copy; live missing)` even past
-  retention.
+  retention. Only regular, non-symlink files can be that kept copy (a
+  symlink is not a copy), and "newest" is ranked by `(mtime, ctime, path)`:
+  ctime bounds the eligibility age but never decides recency between copies,
+  because an `rsync -a` / `cp -a` / `chmod` sweep leaves every ctime equal.
 - Dry-run: `scripts/ccc-erasure-planner.py retention [--json]` lists every
   retention file with its group, mtime, age basis, `eligible`, `eligible_at`
   and planned action — paths, dates and counts only. `prune-expired` /

@@ -257,6 +257,57 @@ class RetentionTests(unittest.TestCase):
         self.seed(self.bot / "sessions.json", 0)
         self.assertEqual(self.plan_actions()[str(s_new)], "delete")
 
+    # --- re-review N1/N2: which copy is "newest" -----------------------------
+    def seed_past(self, path, mtime_days_ago, after_ctime=None):
+        """Real-past mtime; ctime strictly later than ``after_ctime`` so a
+        ctime-ranked pick is deterministic (the shape an rsync -a / cp -a /
+        chmod sweep leaves: every ctime ≈ now, mtimes spread in the past)."""
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_text("fixture\n")
+        stamp = time.time() - mtime_days_ago * DAY
+        while True:
+            os.utime(path, (stamp, stamp))          # utime also sets ctime
+            path.chmod(0o600)
+            if after_ctime is None or path.stat().st_ctime > after_ctime:
+                return path
+            time.sleep(0.01)
+
+    def test_symlink_never_counts_as_the_kept_copy(self):
+        self.T = time.time() + 60 * DAY
+        real = self.seed_past(self.bot / ".env.bak-old", 1)
+        if os.utime not in os.supports_follow_symlinks:
+            self.skipTest("cannot set a symlink's own mtime here")
+        link = self.bot / ".env.bak-latest"
+        link.symlink_to(".env.bak-old")
+        newer = self.T - 1 * DAY                    # the link looks newest
+        os.utime(link, (newer, newer), follow_symlinks=False)
+        self.assertGreater(os.lstat(link).st_mtime, real.stat().st_ctime)
+        report = self.report()
+        self.assertFalse(report[str(real)]["eligible"])
+        self.assertEqual(report[str(real)]["reason"], "last-copy-live-missing")
+        actions = self.plan_actions()
+        self.assertEqual(actions[str(real)], "retain (last copy; live missing)")
+        self.assertEqual(actions[str(link)], "retain (symlink)")
+
+    def test_newest_copy_ranked_by_mtime_not_swept_ctime(self):
+        self.T = time.time() + 60 * DAY
+        aug = self.seed_past(self.bot / ".env.bak-aug", 45)
+        old = self.seed_past(self.bot / ".env.pre-2025", 300,
+                             after_ctime=aug.stat().st_ctime)
+        actions = self.plan_actions()
+        self.assertEqual(actions[str(aug)], "retain (last copy; live missing)")
+        self.assertEqual(actions[str(old)], "delete")
+
+    def test_crontab_newest_copy_ranked_by_mtime(self):
+        self.T = time.time() + 60 * DAY
+        state = self.home / ".claude/state"
+        recent = self.seed_past(state / "crontab.bak-20260801", 60)
+        ancient = self.seed_past(state / "crontab.bak-20250101", 400,
+                                 after_ctime=recent.stat().st_ctime)
+        actions = self.plan_actions()
+        self.assertEqual(actions[str(recent)], "retain (last copy; live missing)")
+        self.assertEqual(actions[str(ancient)], "delete")
+
     # --- policy details ------------------------------------------------------
     def test_retention_days_configurable_but_env_only_lengthens(self):
         self.live_env()

@@ -45,8 +45,9 @@ mtime, ctime cannot be backdated. Younger files are planned as
 "retain-until:<ISO date>"; a name carrying a key token (pem, key, id_rsa,
 credential, secret, token, ... — case-insensitive) is "retain (key-file)"
 at ANY age; while a family's live counterpart is absent the newest copy is
-"retain (last copy; live missing)". A path a non-retention class resolves
-as live — matched by path, realpath and inode, so symlinked and hard-linked
+"retain (last copy; live missing)" (regular files only, ranked by mtime).
+A path a non-retention class resolves as
+live — matched by path, realpath and inode, so symlinked and hard-linked
 live files count — is never a retention target, and the legacy ~/.nunchi
 store stays claimed live regardless of NUNCHI_* env until the operator
 creates ~/.nunchi/.legacy-retired. Eligibility is only a plan state:
@@ -63,6 +64,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import sys
 import time
 from datetime import datetime, timezone
@@ -451,21 +453,31 @@ def retention_verdicts(inventory: dict, entry: dict, claims: _Claims,
                        now: float) -> list[tuple[str, dict]]:
     """(path, verdict) for every non-claimed file of one retention class,
     with the last-copy guard applied: when the live counterpart is absent,
-    the NEWEST copy per directory is retained even past its retention."""
+    the NEWEST copy per directory is retained even past its retention.
+
+    Only regular, non-symlink files can be the kept copy — a symlink is not a
+    copy, and ranking it would let the only real file be destroyed (#1468
+    re-review N1). Recency is (st_mtime, st_ctime, path): ctime gates the
+    eligibility AGE only; an rsync -a / cp -a / chmod sweep equalises every
+    ctime, so it must never decide which copy is newest (re-review N2).
+    """
     out = [(p, retention_verdict(inventory, entry, p, now))
            for p in retention_paths(inventory, entry, claims)]
-    newest: dict[str, tuple[float, str]] = {}
+    newest: dict[str, tuple[float, float, str]] = {}
     for path, _verdict in out:
         if not _live_counterpart_missing(entry, path):
             continue
         try:
-            basis = _age_basis(os.lstat(path))
+            meta = os.lstat(path)
         except OSError:
             continue
+        if not stat.S_ISREG(meta.st_mode):
+            continue                    # symlinks never count as a kept copy
+        rank = (meta.st_mtime, meta.st_ctime, path)
         key = os.path.dirname(path)
-        if key not in newest or (basis, path) > newest[key]:
-            newest[key] = (basis, path)
-    keep = {path for _basis, path in newest.values()}
+        if key not in newest or rank > newest[key]:
+            newest[key] = rank
+    keep = {rank[2] for rank in newest.values()}
     for path, verdict in out:
         if path in keep and verdict["eligible"]:
             verdict.update(eligible=False, reason="last-copy-live-missing")
