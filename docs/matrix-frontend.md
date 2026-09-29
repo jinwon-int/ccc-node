@@ -126,6 +126,14 @@ feature, the agent receives the replied-to message as a quoted
 comes from a bounded in-memory cache of recent trusted texts (the bot's own
 answers included) or is fetched and decrypted on demand; only encrypted
 parents from the bot or a trusted device of an allowed sender are quoted.
+Encrypted file/image/audio/video parents are also supported (#2076). The
+replied-to attachment is stored separately from any new attachment and is
+staged through the same bounded download, integrity check and private-file
+cleanup path at turn execution. The provider receives the earlier attachment
+as reply context alongside the current question (and current attachment, if
+present). If staging the original fails, the question still runs with an
+explicit "reply attachment unavailable" context rather than inferred contents.
+Parent decryption keys are dropped when a turn completes or becomes uncertain.
 A missing, plaintext, untrusted or undecryptable parent simply leaves the
 reply as-is. `/command` and bare-number replies are never rewritten. A reply
 in a family room still needs a mention, exactly like any other message.

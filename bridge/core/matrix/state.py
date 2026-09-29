@@ -297,11 +297,17 @@ class Request:
     reply_to: str | None = None  # m.in_reply_to parent event id (#1943)
     # Canonical JSON of an encrypted media attachment (#1795); None for text.
     attachment: str | None = None
+    # The trusted encrypted file/image being replied to, distinct from new media.
+    reply_attachment: str | None = None
 
 
-def job_digest(room_id: str, sender: str, body: str, attachment: str | None) -> str:
+def job_digest(
+    room_id: str, sender: str, body: str, attachment: str | None, reply_attachment: str | None = None,
+) -> str:
     """Identity digest of an admitted job; text jobs keep their pre-#1795 digest."""
-    fields = [room_id, sender, body] if attachment is None else [room_id, sender, body, attachment]
+    fields: list[str | None] = [room_id, sender, body] if attachment is None else [room_id, sender, body, attachment]
+    if reply_attachment is not None:
+        fields = [room_id, sender, body, attachment, reply_attachment]
     return hashlib.sha256(json.dumps(fields).encode()).hexdigest()
 
 
@@ -511,6 +517,7 @@ class Policy:
         attachment = media_attachment(content)
         if attachment is None:
             return None
+        parent = reply_target(content)
         caption = media_caption(content)
         try:
             if caption:
@@ -520,9 +527,9 @@ class Policy:
             return None
         if self.rooms[room_id] == "mention" and not self.addressed(content, caption):
             return None
-        body = caption or ATTACHMENT_PLACEHOLDER
+        body = (strip_reply_fallback(caption) if parent is not None else caption) or ATTACHMENT_PLACEHOLDER
         return Request(
-            event["event_id"], room_id, sender, body, scope_of(self.account, room_id, sender), None, encoded
+            event["event_id"], room_id, sender, body, scope_of(self.account, room_id, sender), parent, encoded
         )
 
     def addressed(self, content: Mapping[str, Any], body: str) -> bool:
@@ -992,8 +999,10 @@ class Store:
                 columns = {row[1] for row in self._db.execute("PRAGMA table_info(jobs)")}
                 if "attachment" not in columns:
                     self._db.execute("ALTER TABLE jobs ADD COLUMN attachment TEXT")
-                # A crashed attachment turn also forgets its decryption key.
-                self._db.execute("UPDATE jobs SET state='uncertain',attachment=NULL WHERE state='running'")
+                if "reply_attachment" not in columns:
+                    self._db.execute("ALTER TABLE jobs ADD COLUMN reply_attachment TEXT")
+                # A crashed attachment turn also forgets its decryption keys.
+                self._db.execute("UPDATE jobs SET state='uncertain',attachment=NULL,reply_attachment=NULL WHERE state='running'")
         except BaseException:
             self.close()
             raise
@@ -1042,7 +1051,9 @@ class Store:
                     raise ValueError("request belongs to another scope/account")
                 if req.attachment is not None and decode_attachment(req.attachment) is None:
                     raise ValueError("invalid attachment")
-                digest = job_digest(req.room_id, req.sender, req.body, req.attachment)
+                if req.reply_attachment is not None and decode_attachment(req.reply_attachment) is None:
+                    raise ValueError("invalid reply attachment")
+                digest = job_digest(req.room_id, req.sender, req.body, req.attachment, req.reply_attachment)
                 old = self.db.execute("SELECT digest FROM jobs WHERE event_id=?", (req.event_id,)).fetchone()
                 if old:
                     if old[0] != digest:
@@ -1056,9 +1067,9 @@ class Store:
                     raise QueueFull("inbox capacity reached; sync token unchanged")
                 txn = hashlib.sha256(json.dumps([self.account, req.event_id, "reply-v1"]).encode()).hexdigest()
                 self.db.execute(
-                    "INSERT INTO jobs(event_id,room_id,sender,scope,body,digest,state,txn_id,attachment) "
-                    "VALUES (?,?,?,?,?,?,'queued',?,?)",
-                    (req.event_id, req.room_id, req.sender, req.scope, req.body, digest, txn, req.attachment),
+                    "INSERT INTO jobs(event_id,room_id,sender,scope,body,digest,state,txn_id,attachment,reply_attachment) "
+                    "VALUES (?,?,?,?,?,?,'queued',?,?,?)",
+                    (req.event_id, req.room_id, req.sender, req.scope, req.body, digest, txn, req.attachment, req.reply_attachment),
                 )
             if next_token is not None:
                 self.db.execute("INSERT OR REPLACE INTO meta VALUES ('sync_token',?)", (next_token,))
@@ -1103,7 +1114,7 @@ class Store:
             # The attachment carries the media decryption key; drop it once the
             # turn has a result (the digest still pins the event identity).
             self.db.execute(
-                "UPDATE jobs SET state=?,reply=?,attachment=NULL WHERE event_id=?",
+                "UPDATE jobs SET state=?,reply=?,attachment=NULL,reply_attachment=NULL WHERE event_id=?",
                 ("ready" if deliver else "done", reply, event_id),
             )
             if session_id is not None:
@@ -1166,7 +1177,7 @@ class Store:
         bounded_text(reply, MAX_REPLY_BYTES)
         with self.db:
             changed = self.db.execute(
-                "UPDATE jobs SET state='ready',reply=?,attachment=NULL WHERE event_id=? AND state='uncertain'",
+                "UPDATE jobs SET state='ready',reply=?,attachment=NULL,reply_attachment=NULL WHERE event_id=? AND state='uncertain'",
                 (reply, event_id),
             ).rowcount
             if changed != 1:
@@ -1262,7 +1273,7 @@ class MatrixStore(Store):
         with self.db:
             for event_id in cleared:
                 self.db.execute(
-                    "UPDATE jobs SET state='ready',reply=?,attachment=NULL WHERE event_id=? AND state='uncertain'",
+                    "UPDATE jobs SET state='ready',reply=?,attachment=NULL,reply_attachment=NULL WHERE event_id=? AND state='uncertain'",
                     (OPERATOR_ACK_TEXT, event_id),
                 )
                 # An interrupted turn sends none of its held files (#2001).
@@ -1449,5 +1460,5 @@ class MatrixStore(Store):
     def uncertain_job(self, event: str) -> None:
         with self.db:
             self.db.execute(
-                "UPDATE jobs SET state='uncertain',attachment=NULL WHERE event_id=? AND state='running'", (event,)
+                "UPDATE jobs SET state='uncertain',attachment=NULL,reply_attachment=NULL WHERE event_id=? AND state='running'", (event,)
             )

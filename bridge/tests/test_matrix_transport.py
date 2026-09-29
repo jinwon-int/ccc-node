@@ -2647,3 +2647,82 @@ async def test_media_admission_mirrors_text_rules_without_new_stop_paths(tmp_pat
         assert stop_photo is not None
         await f.input(stop_photo)
         assert f.store.job_exists("$stopphoto")
+
+
+# Attachment reply originals (#2076): the parent is not a RoomMessageText.
+def _reply_media_parent(h: Any, *, sender: str | None = None, verified: bool = True, key: str = "b" * 43) -> Any:
+    class EncryptedMedia:
+        def __init__(self) -> None:
+            self.sender = sender or h.account
+            self.decrypted, self.verified, self.sender_key = True, verified, key
+            self.source = {"content": {"msgtype": "m.file", "body": "report.md",
+                "info": {"mimetype": "text/markdown", "size": 20}, "file": {
+                    "url": "mxc://test.invalid/report", "v": "v2",
+                    "key": {"kty": "oct", "alg": "A256CTR", "k": "a" * 43},
+                    "iv": "a" * 22, "hashes": {"sha256": "b" * 43},
+                }}}
+    h.nio.RoomEncryptedMedia = EncryptedMedia
+    h.nio.Event = types.SimpleNamespace(parse_encrypted_event=lambda raw: h.nio.MegolmEvent())
+    client_mock(h.f)
+    parent = EncryptedMedia()
+    h.f.client.decrypt_event = Mock(return_value=parent)
+    h.f.raw = AsyncMock(return_value={"event_id": "$parent", "type": "m.room.encrypted", "content": {}})
+    return parent
+
+
+@pytest.mark.anyio
+async def test_reply_to_encrypted_report_persists_parent_and_replay_identity(tmp_path: Path) -> None:
+    async with family(tmp_path) as h:
+        _reply_media_parent(h)
+        req = _admit_reply(h.f)
+        await h.f.input(req)
+        job = h.f.store.claim()
+        assert job is not None and job["attachment"] is None
+        parent = json.loads(job["reply_attachment"])
+        assert parent["name"] == "report.md" and parent["kind"] == "file"
+        assert "Attached file: report.md" in job["body"]
+        assert job["body"].endswith("이거 다시 설명해줘")
+        h.f.store.finish(job["event_id"], "answer")
+        assert h.f.store.db.execute("SELECT reply_attachment FROM jobs WHERE event_id=?", (req.event_id,)).fetchone()[0] is None
+        h.f.raw.reset_mock()
+        await h.f.input(req)
+        h.f.raw.assert_not_called()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("sender,verified,key,accepted", [
+    (None, True, "b" * 43, True),
+    ("@owner:test.invalid", True, "b" * 43, True),
+    (STRANGER, True, "b" * 43, False),
+    ("@owner:test.invalid", True, "z" * 43, False),
+    (None, False, "b" * 43, False),
+])
+async def test_reply_media_parent_keeps_device_trust_boundary(
+    tmp_path: Path, sender: str | None, verified: bool, key: str, accepted: bool,
+) -> None:
+    async with family(tmp_path) as h:
+        _reply_media_parent(h, sender=sender, verified=verified, key=key)
+        await h.f.input(_admit_reply(h.f))
+        job = h.f.store.claim()
+        assert job is not None
+        assert bool(job["reply_attachment"]) is accepted
+        if not accepted:
+            assert job["body"] == "이거 다시 설명해줘"
+
+
+@pytest.mark.anyio
+async def test_new_attachment_reply_keeps_both_files_and_relation(tmp_path: Path) -> None:
+    async with family(tmp_path) as h:
+        parent = _reply_media_parent(h)
+        now = int(time.time() * 1000)
+        content = {**parent.source["content"], "body": "current.md", "filename": "current.md",
+                   "m.relates_to": {"m.in_reply_to": {"event_id": "$parent"}}}
+        event = reply_event(now=now, body="current.md", msgtype="m.file", filename="current.md",
+                            file=content["file"], info=content["info"])
+        req = h.f.policy.admit(h.f.c["rooms"][0], event, decrypted=True, now_ms=now)
+        assert req is not None and req.reply_to == "$parent"
+        await h.f.input(req)
+        job = h.f.store.claim()
+        assert job is not None
+        assert json.loads(job["attachment"])["name"] == "current.md"
+        assert json.loads(job["reply_attachment"])["name"] == "report.md"

@@ -71,9 +71,17 @@ from telegram_bot.core.matrix.state import (
     upgrade_saved_policy,
     wake_words,
 )
+from telegram_bot.core.matrix.attachments import encode_attachment, media_attachment, media_caption
 from telegram_bot.utils.redaction import redact_credentials
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ReplyParent:
+    sender: str
+    body: str
+    attachment: str | None = None
 
 
 def _raise_site(exc: BaseException) -> str:
@@ -1670,17 +1678,21 @@ class MatrixTransport:
 
     # -- reply context (#1943) ------------------------------------------------
 
-    def _trusted_text(self, event: Any) -> bool:
-        """A decrypted text from our own device or an allowed sender's trusted device."""
-        from nio import RoomMessageText
-
-        if not isinstance(event, RoomMessageText) or not event.decrypted or not event.verified:
-            return False
-        if not isinstance(getattr(event, "body", None), str):
+    def _trusted_parent_sender(self, event: Any) -> bool:
+        """Only decrypted/verified events from our device or a pinned allowed sender."""
+        if not getattr(event, "decrypted", False) or not getattr(event, "verified", False):
             return False
         if event.sender == self.c["account"]:
             return True
         return event.sender in self.senders and event.sender_key in set(self.trusted.get(event.sender, {}).values())
+
+    def _trusted_text(self, event: Any) -> bool:
+        """A trusted text suitable for the bounded recent-text cache."""
+        from nio import RoomMessageText
+
+        return (isinstance(event, RoomMessageText)
+                and isinstance(getattr(event, "body", None), str)
+                and self._trusted_parent_sender(event))
 
     def _remember_text(self, event_id: Any, room: str, sender: str, body: str) -> None:
         if not isinstance(event_id, str) or not event_id or not body.strip():
@@ -1690,7 +1702,7 @@ class MatrixTransport:
         while len(self.recent_text) > RECENT_TEXT_CAP:
             self.recent_text.popitem(last=False)
 
-    async def _fetch_parent(self, room: str, event_id: str) -> tuple[str, str] | None:
+    async def _fetch_parent(self, room: str, event_id: str) -> ReplyParent | None:
         """Fetch and decrypt a reply parent; ``None`` on any failure (best-effort)."""
         try:
             from nio import Event, MegolmEvent
@@ -1706,10 +1718,19 @@ class MatrixTransport:
                 return None
             encrypted.room_id = room
             event = self.client.decrypt_event(encrypted)
-            if not self._trusted_text(event):
+            if not self._trusted_parent_sender(event):
                 return None
-            self._remember_text(event_id, room, event.sender, event.body)
-            return event.sender, event.body
+            if self._trusted_text(event):
+                self._remember_text(event_id, room, event.sender, event.body)
+                return ReplyParent(event.sender, event.body)
+            if self._is_media(event):
+                source = getattr(event, "source", {})
+                content = source.get("content") if isinstance(source, dict) else None
+                attachment = media_attachment(content) if isinstance(content, dict) else None
+                if attachment is not None:
+                    description = media_caption(content) or f"Attached {attachment['kind']}: {attachment['name']}"
+                    return ReplyParent(event.sender, description, encode_attachment(attachment))
+            return None
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - context is optional; never stop the service for it
@@ -1723,24 +1744,24 @@ class MatrixTransport:
         Danso recovery, ``/resume`` pick) stay verbatim so the bot still parses them.
         """
         text = req.body.strip()
-        if req.reply_to is None or text.startswith("/") or text.isdigit():
+        if req.reply_to is None or (req.attachment is None and (text.startswith("/") or text.isdigit())):
             return req
         cached = self.recent_text.get(req.reply_to)
         if cached is not None and cached[0] == req.room_id:
-            parent: tuple[str, str] | None = (cached[1], cached[2])
+            parent: ReplyParent | None = ReplyParent(cached[1], cached[2])
         else:
             parent = await self._fetch_parent(req.room_id, req.reply_to)
         if parent is None:
             return req
         body = reply_context_body(
             req.body,
-            parent_sender=parent[0],
-            parent_body=parent[1],
+            parent_sender=parent.sender,
+            parent_body=parent.body,
             account=self.c["account"],
             sender=req.sender,
             limit_bytes=MAX_TEXT_BYTES,
         )
-        return replace(req, body=body)
+        return replace(req, body=body, reply_attachment=parent.attachment)
 
     async def _request_room_keys(self) -> None:
         """Best-effort m.room_key_request for events we could not decrypt."""

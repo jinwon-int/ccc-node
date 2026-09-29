@@ -964,3 +964,40 @@ def test_repin_cli_requires_stopped_service_and_reports_refusals(tmp_path: Path,
     assert cli.main(args) == 2  # config must stay private
     with MatrixStore(Path(c["state_directory"]), c["account"]) as s:
         assert [row["action"] for row in s.audit()] == ["repin"]
+
+
+@pytest.mark.parametrize("completion", ["finish", "uncertain", "restart"])
+def test_reply_attachment_survives_queue_and_forgets_key_after_turn(tmp_path: Path, completion: str) -> None:
+    from dataclasses import replace
+    from telegram_bot.core.matrix.attachments import encode_attachment, media_attachment
+
+    attachment = media_attachment({"msgtype": "m.file", "body": "report.md", "file": {
+        "url": "mxc://example.test/report", "v": "v2",
+        "key": {"kty": "oct", "alg": "A256CTR", "k": "a" * 43},
+        "iv": "a" * 22, "hashes": {"sha256": "b" * 43},
+    }})
+    assert attachment is not None
+    encoded = encode_attachment(attachment)
+    req = Request("$reply-media", ROOM, OWNER, "Explain", SCOPE, reply_attachment=encoded)
+    root = tmp_path / "state"
+    store = MatrixStore(root, BOT)
+    try:
+        store.accept_batch([req], None)
+        store.close()
+        store = MatrixStore(root, BOT)
+        assert store.db.execute("SELECT reply_attachment FROM jobs").fetchone()[0] == encoded
+        store.accept_batch([req], None)  # restart preserves replay identity
+        with pytest.raises(ValueError, match="identity conflict"):
+            store.accept_batch([replace(req, reply_attachment=None)], None)
+        job = store.claim()
+        assert job is not None and job["reply_attachment"] == encoded
+        if completion == "finish":
+            store.finish(req.event_id, "done")
+        elif completion == "uncertain":
+            store.uncertain_job(req.event_id)
+        else:
+            store.close()
+            store = MatrixStore(root, BOT)
+        assert store.db.execute("SELECT reply_attachment FROM jobs").fetchone()[0] is None
+    finally:
+        store.close()
