@@ -596,3 +596,316 @@ def test_collector_loop_filters_provider_and_bounds_attempts_per_sweep(
     ]
     assert third_collect_job_id not in worker.preflight_ids
     assert worker.calls == [first_collect_job_id, second_collect_job_id]
+
+
+class _ExitStatusBackend:
+    """Fails like the Danso/runtime-CLI boundary: classified code + exit status."""
+
+    def __init__(self, *, code: str = "skill_candidate_backend_failed", exit_status=7) -> None:
+        self.calls = 0
+        self._code = code
+        self._exit_status = exit_status
+
+    async def extract(self, *, snapshot, provenance):  # noqa: ARG002
+        from telegram_bot.memory.skill_candidate_backend import (
+            SkillCandidateBackendError,
+        )
+
+        self.calls += 1
+        raise SkillCandidateBackendError(self._code, exit_status=self._exit_status)
+
+
+def _retry_record(tmp_path: Path) -> dict:
+    import json
+
+    retry_path = tmp_path / "skill-candidates" / ".retries" / f"{JOB_ID}.json"
+    return json.loads(retry_path.read_text())
+
+
+def test_retry_record_persists_code_and_exit_status_body_free(tmp_path: Path) -> None:
+    backend = _ExitStatusBackend(code="skill_candidate_provider_quota", exit_status=2)
+    worker = _worker(tmp_path, _FakeJournal(_job()), backend)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(worker.collect_once(job_id=JOB_ID))
+
+    record = _retry_record(tmp_path)
+    assert record["error_code"] == "skill_candidate_provider_quota"
+    assert record["exit_status"] == 2
+    assert record["attempts"] == 1
+    assert record["quarantined"] is False
+    assert set(record) == {
+        "schema_version",
+        "job_id",
+        "attempts",
+        "error_code",
+        "exit_status",
+        "next_retry_at",
+        "quarantined",
+    }
+
+
+def test_retry_record_exit_status_is_null_without_integer_status(tmp_path: Path) -> None:
+    # The generic failing backend carries no exit status; a bool or huge value
+    # is not a process exit status either and must never be persisted.
+    for exit_status in (None, True, 10**9, "3"):
+        queue = tmp_path / str(type(exit_status).__name__) / str(exit_status)
+        backend = _ExitStatusBackend(exit_status=exit_status)
+        worker = _worker(queue, _FakeJournal(_job()), backend)
+        with pytest.raises(RuntimeError):
+            asyncio.run(worker.collect_once(job_id=JOB_ID))
+        assert _retry_record(queue)["exit_status"] is None
+
+
+def test_legacy_retry_record_without_new_fields_still_reads(tmp_path: Path) -> None:
+    import json
+
+    queue = tmp_path / "skill-candidates"
+    retries = queue / ".retries"
+    retries.mkdir(parents=True, mode=0o700)
+    queue.chmod(0o700)
+    legacy = retries / f"{JOB_ID}.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "job_id": JOB_ID,
+                "attempts": 2,
+                "error_code": "skill_candidate_backend_failed",
+                "next_retry_at": 2_000.0,
+            }
+        )
+    )
+    legacy.chmod(0o600)
+    now = [1_000.0]
+    backend = _ExitStatusBackend(exit_status=9)
+    worker = _worker(tmp_path, _FakeJournal(_job()), backend, clock=lambda: now[0])
+
+    assert worker.should_collect(job_id=JOB_ID) is False
+    now[0] = 2_000.0
+    assert worker.should_collect(job_id=JOB_ID) is True
+    with pytest.raises(RuntimeError):
+        asyncio.run(worker.collect_once(job_id=JOB_ID))
+    record = _retry_record(tmp_path)
+    assert record["attempts"] == 3
+    assert record["exit_status"] == 9
+
+
+def test_invalid_exit_status_in_retry_state_fails_closed(tmp_path: Path) -> None:
+    import json
+
+    queue = tmp_path / "skill-candidates"
+    retries = queue / ".retries"
+    retries.mkdir(parents=True, mode=0o700)
+    queue.chmod(0o700)
+    record = retries / f"{JOB_ID}.json"
+    record.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "job_id": JOB_ID,
+                "attempts": 1,
+                "error_code": "skill_candidate_backend_failed",
+                "exit_status": "stderr body",
+                "next_retry_at": 0.0,
+            }
+        )
+    )
+    record.chmod(0o600)
+    backend = _FakeBackend(_output())
+    worker = _worker(tmp_path, _FakeJournal(_job()), backend)
+    with pytest.raises(ValueError):
+        worker.should_collect(job_id=JOB_ID)
+    assert backend.calls == 0
+
+
+def test_retry_cap_quarantines_job_and_stops_reservations(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from telegram_bot.memory.skill_candidate_worker import (
+        MAX_SKILL_CANDIDATE_ATTEMPTS,
+    )
+
+    assert MAX_SKILL_CANDIDATE_ATTEMPTS == 5
+    now = [1_000.0]
+    meter = _Meter()
+    backend = _ExitStatusBackend(exit_status=1)
+    worker = _worker(
+        tmp_path,
+        _FakeJournal(_job()),
+        backend,
+        usage_meter=meter,
+        clock=lambda: now[0],
+    )
+    caplog.set_level("WARNING", logger="telegram_bot.memory.skill_candidate_worker")
+
+    for attempt in range(1, MAX_SKILL_CANDIDATE_ATTEMPTS + 1):
+        now[0] += 48 * 60 * 60  # well past any backoff window
+        assert worker.should_collect(job_id=JOB_ID) is True
+        with pytest.raises(RuntimeError):
+            asyncio.run(worker.collect_once(job_id=JOB_ID))
+        assert _retry_record(tmp_path)["attempts"] == attempt
+
+    record = _retry_record(tmp_path)
+    assert record["quarantined"] is True
+    assert record["exit_status"] == 1
+    assert backend.calls == MAX_SKILL_CANDIDATE_ATTEMPTS
+    # Provider-started failures keep their reservation (no refunds), and the
+    # cap is what bounds how many are taken.
+    assert len(meter.reservations) == MAX_SKILL_CANDIDATE_ATTEMPTS
+    assert meter.refunds == []
+
+    # Long after every backoff window, across repeated sweeps and a restart,
+    # the job is never retried and never reserves spend again.
+    now[0] += 365 * 24 * 60 * 60
+    restarted = _worker(
+        tmp_path,
+        _FakeJournal(_job()),
+        backend,
+        usage_meter=meter,
+        clock=lambda: now[0],
+    )
+    for candidate in (worker, restarted):
+        for _ in range(3):
+            assert candidate.should_collect(job_id=JOB_ID) is False
+            assert asyncio.run(candidate.collect_once(job_id=JOB_ID)) is None
+    assert backend.calls == MAX_SKILL_CANDIDATE_ATTEMPTS
+    assert len(meter.reservations) == MAX_SKILL_CANDIDATE_ATTEMPTS
+
+    quarantine_logs = [
+        rec.getMessage() for rec in caplog.records if "quarantined" in rec.getMessage()
+    ]
+    # Once at the transition (original worker) and once for the restarted
+    # process's first observation — never per sweep.
+    assert len(quarantine_logs) == 2, quarantine_logs
+    assert "code=skill_candidate_backend_failed" in quarantine_logs[0]
+    assert "exit_status=1" in quarantine_logs[0]
+
+
+def test_legacy_over_cap_record_is_quarantined_without_provider_call(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    import json
+
+    # Pre-cap records reached attempts=21 in production; they must stop
+    # burning budget on the first sweep after upgrade.
+    queue = tmp_path / "skill-candidates"
+    retries = queue / ".retries"
+    retries.mkdir(parents=True, mode=0o700)
+    queue.chmod(0o700)
+    legacy = retries / f"{JOB_ID}.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "job_id": JOB_ID,
+                "attempts": 21,
+                "error_code": "skill_candidate_backend_failed",
+                "next_retry_at": 0.0,
+            }
+        )
+    )
+    legacy.chmod(0o600)
+    meter = _Meter()
+    backend = _FakeBackend(_output())
+    worker = _worker(tmp_path, _FakeJournal(_job()), backend, usage_meter=meter)
+    caplog.set_level("WARNING", logger="telegram_bot.memory.skill_candidate_worker")
+
+    for _ in range(3):
+        assert worker.should_collect(job_id=JOB_ID) is False
+        assert asyncio.run(worker.collect_once(job_id=JOB_ID)) is None
+    assert backend.calls == 0
+    assert meter.reservations == []
+    assert (
+        sum("quarantined" in rec.getMessage() for rec in caplog.records) == 1
+    )
+
+
+def test_success_before_cap_clears_retry_state(tmp_path: Path) -> None:
+    now = [1_000.0]
+
+    class _FlakyBackend:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def extract(self, *, snapshot, provenance):  # noqa: ARG002
+            from telegram_bot.memory.skill_candidate_backend import (
+                SkillCandidateBackendError,
+            )
+
+            self.calls += 1
+            if self.calls < 4:
+                raise SkillCandidateBackendError(
+                    "skill_candidate_backend_failed", exit_status=1
+                )
+            return _output()
+
+    backend = _FlakyBackend()
+    worker = _worker(tmp_path, _FakeJournal(_job()), backend, clock=lambda: now[0])
+    for _ in range(3):
+        now[0] += 48 * 60 * 60
+        with pytest.raises(RuntimeError):
+            asyncio.run(worker.collect_once(job_id=JOB_ID))
+    now[0] += 48 * 60 * 60
+    result = asyncio.run(worker.collect_once(job_id=JOB_ID))
+    assert result is not None and result.candidates_staged == 1
+    retry_path = tmp_path / "skill-candidates" / ".retries" / f"{JOB_ID}.json"
+    assert not retry_path.exists()
+
+
+def test_worker_rejects_invalid_max_attempts(tmp_path: Path) -> None:
+    for value in (0, -1, True, 2.0):
+        with pytest.raises(ValueError):
+            SkillCandidateCollectorWorker(
+                journal=_FakeJournal(_job()),
+                backend=_FakeBackend(_output()),
+                sink=SkillCandidateSink(
+                    tmp_path / "skill-candidates",
+                    tmp_path / "state" / "pending-skills",
+                ),
+                usage_meter=None,
+                max_attempts=value,
+            )
+
+
+def test_collector_loop_warning_carries_code_and_exit_status_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from telegram_bot.core.lifecycle_loops import run_skill_candidate_collector
+
+    stop_event = asyncio.Event()
+    job_id = "7" * 64
+
+    class _Worker:
+        provider = "danso"
+
+        def should_collect(self, *, job_id: str) -> bool:  # noqa: ARG002
+            return True
+
+        async def collect_once(self, *, job_id: str):  # noqa: ARG002
+            stop_event.set()
+            error = RuntimeError("provider stderr body must not be logged")
+            error.code = "skill_candidate_backend_failed"  # type: ignore[attr-defined]
+            error.exit_status = 137  # type: ignore[attr-defined]
+            raise error
+
+    async def sweep_jobs(interval, *, recover):  # noqa: ARG001
+        return (SimpleNamespace(job_id=job_id, provider="danso", snapshot=object()),)
+
+    caplog.set_level("WARNING", logger="telegram_bot.core.lifecycle_loops")
+    asyncio.run(
+        run_skill_candidate_collector(
+            _Worker(),
+            sweep_jobs,
+            SimpleNamespace(distill_extraction_poll_interval=0.001),
+            stop_event,
+        )
+    )
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any(
+        f"job_id={job_id}" in message
+        and "code=skill_candidate_backend_failed" in message
+        and "exit_status=137" in message
+        for message in messages
+    ), messages
+    assert not any("stderr body" in message for message in messages)

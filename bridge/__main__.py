@@ -135,6 +135,23 @@ def _build_distill_environment(
     return environment
 
 
+def _finite_autonomous_spend_gate(
+    settings: Settings,
+    usage_meter: Any,
+    provider: str,
+) -> bool:
+    """True when ``provider``'s autonomous spend has a real finite budget."""
+
+    provider_budget = int(
+        getattr(settings, f"usage_budget_tokens_{provider}", 0) or 0
+    )
+    return (
+        bool(getattr(settings, "usage_meter_enabled", True))
+        and provider_budget > 0
+        and usage_meter is not None
+    )
+
+
 def _distill_extraction_authorized(
     settings: Settings,
     project_chat: Any,
@@ -144,18 +161,38 @@ def _distill_extraction_authorized(
 
     if provider is None:
         return False
-    provider_budget = int(
-        getattr(settings, f"usage_budget_tokens_{provider}", 0) or 0
-    )
-    finite_spend_gate = (
-        bool(getattr(settings, "usage_meter_enabled", True))
-        and provider_budget > 0
-        and project_chat.usage_meter is not None
-    )
-    if finite_spend_gate or bool(settings.memory_distill_allow_unbounded):
+    if _finite_autonomous_spend_gate(
+        settings, project_chat.usage_meter, provider
+    ) or bool(settings.memory_distill_allow_unbounded):
         return True
     logger.warning(
         "Provider-neutral distill extraction disabled: provider=%s requires "
+        "usage metering and a finite autonomous budget (or explicit "
+        "CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED=1)",
+        provider,
+    )
+    return False
+
+
+def _skill_candidate_collection_authorized(
+    settings: Settings,
+    usage_meter: Any,
+    provider: str,
+) -> bool:
+    """Same fail-closed spend gate as distill extraction.
+
+    Every provider-started collector attempt keeps its worst-case reservation,
+    so without a finite budget a persistently failing backend charges the
+    shared usage meter without bound. The distill escape hatch is reused: it
+    is the operator's one opt-in for unbounded autonomous memory extraction.
+    """
+
+    if _finite_autonomous_spend_gate(settings, usage_meter, provider) or bool(
+        getattr(settings, "memory_distill_allow_unbounded", False)
+    ):
+        return True
+    logger.warning(
+        "Skill-candidate collection disabled: provider=%s requires "
         "usage metering and a finite autonomous budget (or explicit "
         "CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED=1)",
         provider,
@@ -184,6 +221,10 @@ def _build_skill_candidate_collector(
             True,
         )
         and distill_journal is not None
+    ):
+        return None
+    if not _skill_candidate_collection_authorized(
+        settings, usage_meter, collector_provider
     ):
         return None
     from telegram_bot.memory.skill_candidate import SkillCandidateSink
