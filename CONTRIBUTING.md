@@ -39,9 +39,11 @@ things a worktree does **not** solve:
   auto-recovery (#1328) only fires on the provably lossless shape and only
   after the bridge's idle gate; a MANUAL `git checkout` bypasses that
   protection. Check the bridge's idle gate
-  (`~/.telegram_bot/health.json`, `workload.active_requests`) first — the
-  updater defers while the bridge is busy precisely because swapping the tree
-  under a running session destroys in-flight work.
+  (`~/.telegram_bot/health.json`, `workload.turn_occupancy.state` /
+  `workload.active_requests`; see
+  [docs/bridge-ops.md](docs/bridge-ops.md#before-a-manual-restart-occupancy-check))
+  first — the updater defers while the bridge is busy precisely because
+  swapping the tree under a running session destroys in-flight work.
 
 ## Claim an issue before you build it
 
