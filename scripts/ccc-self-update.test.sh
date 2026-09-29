@@ -163,6 +163,7 @@ ok "external restart-cmd on change exits 0 (not degraded 11)" '[ "$rc" = 0 ]'
 ok "external restart-cmd actually ran" '[ -f "$TMP/external-restarted.marker" ]'
 ok "external restart audited as ok with external scope" \
   'grep -q "\"result\":\"ok\"" "$STATE/self-update.log" && grep -q "\"name\":\"external-restart\",\"ok\":true" "$STATE/self-update.log"'
+ok "successful restart audit has no failure_kind" 'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"ok\" and (has(\"failure_kind\") | not)" >/dev/null'
 
 # (2) changed + no allowlist + restart-cmd FAILS -> rc 7 + failure notified,
 #     never silently discarded (the daegyo cron `exit 0` bug).
@@ -175,7 +176,61 @@ ok "failing external restart audited as restart-failures" \
   'grep -q "\"result\":\"restart-failures\"" "$STATE/self-update.log" && grep -q "\"name\":\"external-restart\",\"ok\":false" "$STATE/self-update.log"'
 ok "failing external restart notifies immediately" 'grep -rh "외부 재시작 명령이 실패" "$TMP/spool" >/dev/null 2>&1'
 ok "external restart failure retains recovery snapshot" 'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "outcome-less restart failure is classified command-failed (#1868)" \
+  'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"restart-failures\" and .failure_kind == \"command-failed\" and .restart_outcome.restart_exit == 1" >/dev/null'
 rm -rf "$STATE"/self-update-install-rollback.*
+
+# (2b) #1868: timeout vs start-error failures are distinguishable, and the
+#      "Candidate and recovery failed" outcome says whether a bridge serves.
+selfup_bump() { echo "$1" > "$TMP/seed/$1.txt"; git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm "$1" && git -C "$TMP/seed" push -q origin main; }
+last_audit() { grep "^{" "$STATE/self-update.log" | tail -1; }
+: > "$TMP/spool.before"; find "$TMP/spool" -type f 2>/dev/null | sort > "$TMP/spool.before"
+new_notification() { find "$TMP/spool" -type f 2>/dev/null | sort | comm -13 "$TMP/spool.before" - | xargs -r cat | jq -r .text; find "$TMP/spool" -type f 2>/dev/null | sort > "$TMP/spool.before"; }
+cat > "$CLAUDE/self-update.restart-cmd" <<'CMD'
+printf '%s\n' "$CCC_BRIDGE_RESTART_DEADLINE_EPOCH" > "$CCC_TEST_DEADLINE_OUT"; echo 'ccc-restart-outcome: {"schema":"ccc.restart-outcome.v1","candidate":"start-error","candidate_exit":2,"recovery":"not-configured","serving":"available"}'; echo 'ccc-restart-outcome: {"schema":"ccc.restart-outcome.v1","candidate":"timeout","candidate_exit":4,"candidate_window":90,"recovery":"timeout","recovery_exit":4,"recovery_window":180,"serving":"dead","serving_pid":null,"previous_pid":4321,"previous_alive":false}'; exit 8
+CMD
+export CCC_TEST_DEADLINE_OUT="$TMP/deadline.out"
+selfup_bump double-timeout
+# shellcheck disable=SC2034  # before_epoch is read via eval inside ok()
+before_epoch="$(date -u +%s)"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "double-timeout restart still exits 7 with result unchanged" '[ "$rc" = 7 ] && last_audit | jq -e ".result == \"restart-failures\"" >/dev/null'
+ok "double-timeout failure_kind is timeout" \
+  'last_audit | jq -e ".failure_kind == \"timeout\" and .restart_outcome.restart_exit == 8 and .restart_outcome.recovery == \"timeout\" and .restart_outcome.recovery_window == 180 and .restart_outcome.serving == \"dead\" and .restart_outcome.serving_pid == null and .restart_outcome.previous_pid == 4321 and .restart_outcome.previous_alive == false" >/dev/null'
+ok "double-timeout logs the classification" 'grep -q "external-restart failure failure_kind=timeout recovery=timeout serving=dead" "$STATE/self-update.log"'
+# shellcheck disable=SC2034  # notice is read via eval inside ok()
+notice="$(new_notification)"
+ok "double-timeout notification says the service is down" \
+  'grep -q "후보가 available 대기 시간 초과 90s" <<<"$notice" && grep -q "복구본도 available 대기 시간 초과 180s" <<<"$notice" && grep -q "살아 있는 브리지 프로세스 없음" <<<"$notice"'
+# shellcheck disable=SC2034  # deadline is read via eval inside ok()
+deadline="$(cat "$TMP/deadline.out" 2>/dev/null)"
+ok "restart command receives the outer deadline epoch" \
+  '[ -n "$deadline" ] && [ "$deadline" -ge "$((before_epoch + 180))" ] && [ "$deadline" -le "$(( $(date -u +%s) + 180 ))" ]'
+rm -rf "$STATE"/self-update-install-rollback.*
+
+cat > "$CLAUDE/self-update.restart-cmd" <<'CMD'
+echo 'ccc-restart-outcome: {"schema":"ccc.restart-outcome.v1","candidate":"start-error","candidate_exit":2,"candidate_window":90,"recovery":"start-error","recovery_exit":2,"recovery_window":90,"serving":"available","serving_pid":4242,"previous_pid":4321,"previous_alive":false}'; exit 8
+CMD
+selfup_bump start-error
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "start-error failure_kind differs from timeout" \
+  '[ "$rc" = 7 ] && last_audit | jq -e ".result == \"restart-failures\" and .failure_kind == \"start-error\" and .restart_outcome.serving == \"available\" and .restart_outcome.serving_pid == 4242" >/dev/null'
+# shellcheck disable=SC2034  # notice is read via eval inside ok()
+notice="$(new_notification)"
+ok "start-error notification names the serving bridge" 'grep -q "후보 기동 오류" <<<"$notice" && grep -q "현재 브리지 PID 4242 서빙 중" <<<"$notice"'
+rm -rf "$STATE"/self-update-install-rollback.*
+
+# Outcome values are re-validated, never copied verbatim into audit/notify.
+cat > "$CLAUDE/self-update.restart-cmd" <<'CMD'
+echo 'ccc-restart-outcome: {"schema":"ccc.restart-outcome.v1","candidate":"$(touch pwned) x","candidate_exit":"4","serving":"available; rm","serving_pid":"12a","previous_alive":"yes"}'; exit 8
+CMD
+selfup_bump hostile-outcome
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "hostile outcome values are dropped" \
+  '[ "$rc" = 7 ] && last_audit | jq -e ".failure_kind == \"command-failed\" and .restart_outcome.candidate == null and .restart_outcome.candidate_exit == null and .restart_outcome.serving == null and .restart_outcome.serving_pid == null and .restart_outcome.previous_alive == null" >/dev/null'
+ok "hostile outcome text never reaches the notification" '! new_notification | grep -q "pwned"'
+rm -rf "$STATE"/self-update-install-rollback.*
+unset CCC_TEST_DEADLINE_OUT
 
 # (3) up-to-date but runtime DOWN + health/restart-cmd -> recovery restart.
 printf '[ -f %s ]\n' "$TMP/runtime-healthy" > "$CLAUDE/self-update.health-cmd"
@@ -200,6 +255,7 @@ out="$(run_selfup run 2>&1)"; rc=$?
 ok "failed recovery exits 7" '[ "$rc" = 7 ]'
 ok "failed recovery audited as runtime-down" 'grep -q "\"result\":\"runtime-down\"" "$STATE/self-update.log"'
 ok "failed recovery notifies" 'grep -rh "복구 재시작도 실패" "$TMP/spool" >/dev/null 2>&1'
+ok "failed recovery audit carries failure_kind (#1868)" 'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"runtime-down\" and .failure_kind == \"command-failed\"" >/dev/null'
 
 # A failed restart cannot be hidden by a stale/overbroad successful probe.
 # The Termux incident used pgrep, which matched a launcher instead of the bot.
@@ -301,6 +357,7 @@ snapshots_after="$(find "$STATE" -maxdepth 1 -type d -name 'self-update-install-
 ok "TERM-resistant restart times out using configured budget" '[ "$rc" = 7 ] && [ "$(cat "$CCC_TEST_TIMEOUT_CALLS")" = 1 ]'
 ok "restart timeout retains its new snapshot and releases lock" '[ ! -d "$STATE/self-update.lock" ] && [ "$snapshots_after" -eq "$((snapshots_before + 1))" ]'
 ok "restart timeout does not get masked by healthy probe" 'grep "^{" "$STATE/self-update.log" | tail -1 | grep -q "restart-failures"'
+ok "watchdog-killed restart is classified command-timeout (#1868)" 'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".failure_kind == \"command-timeout\" and (.restart_outcome.restart_exit == 124 or .restart_outcome.restart_exit == 137)" >/dev/null'
 # shellcheck disable=SC2034  # child_state is read via eval inside ok()
 child_state="$(ps -o stat= -p "$(cat "$TMP/restart-child.pid")" 2>/dev/null || true)"
 ok "TERM-resistant restart child is no longer executing" '[[ -z "$child_state" || "$child_state" = Z* ]]'
@@ -329,6 +386,7 @@ out="$(run_selfup run --force 2>&1)"; rc=$?
 ok "post-restart health has a real deadline" '[ "$rc" = 7 ] && [ "$((SECONDS - probe_started))" -lt 12 ]'
 ok "timeout keeps recovery artifacts and releases the lock" '[ ! -d "$STATE/self-update.lock" ] && compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
 ok "timed-out health cannot report success" 'grep "^{" "$STATE/self-update.log" | tail -1 | grep -q "restart-failures"'
+ok "post-restart health timeout is its own failure_kind (#1868)" 'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".failure_kind == \"health-timeout\" and .restart_outcome.restart_exit == 0" >/dev/null'
 # With unchanged code the initial health probe is bounded too; its failure
 # takes the existing one-recovery-attempt path, with a bounded second probe.
 printf '%s\n' 'sleep 20' > "$CLAUDE/self-update.health-cmd"

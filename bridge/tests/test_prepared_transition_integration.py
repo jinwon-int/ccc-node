@@ -10,6 +10,10 @@ from telegram_bot.prepared_serving import process_alive
 @pytest.fixture
 def rehearsal(tmp_path):
     r = Rehearsal(tmp_path)
+    # #1868 extends a timed-out candidate's recovery window to >=180s; keep the
+    # rehearsal bounded with the explicit knob (the derivation itself is unit
+    # tested in restart.test.sh).
+    r.env["CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT"] = "12"
     try:
         r.prepare("previous")
         r.prepare("candidate")
@@ -24,6 +28,12 @@ def controlled(r, daemon=False):
     source, work = r.generations["previous"]
     return r.command("candidate", extra_args=("--recovery-source", str(source),
                      "--recovery-runtime", str(work), *(("--daemon",) if daemon else ())), timeout=90)
+
+
+def outcome(output):
+    lines = [line for line in output.splitlines() if line.startswith("ccc-restart-outcome: ")]
+    assert len(lines) <= 1, output
+    return json.loads(lines[0].split(": ", 1)[1]) if lines else None
 
 
 def records(r):
@@ -56,6 +66,19 @@ def test_controlled_candidate_and_single_recovery(rehearsal, candidate_mode, rec
     assert [e["label"] for e in events] == (["previous", "candidate"] if expected == 0 else ["previous", "candidate", "previous"])
     assert all(e["label"] == e["dependency"] for e in events)
     assert all(e["kind"] != "overlap" for e in r.events())
+    result = outcome(output)
+    if expected == 0:
+        assert result is None
+    else:
+        # #1868: the cause and who serves now are machine-readable.
+        assert result["schema"] == "ccc.restart-outcome.v1"
+        assert result["candidate"] == {"unready": "timeout", "crash": "start-error"}[candidate_mode]
+        assert result["recovery"] == ("recovered" if expected == 7 else "timeout")
+        assert result["recovery_window"] == 12
+        assert result["previous_pid"] == old["process"]["pid"]
+        assert result["previous_alive"] is False
+        assert result["serving"] == ("available" if expected == 7 else "alive")
+        assert result["serving_pid"] == r.health()["process"]["pid"]
     if expected == 7:
         for key in ("source_dir", "source_seal", "python_prefix", "dependency_fingerprint"):
             assert r.health()["runtime_generation"][key] == old["runtime_generation"][key]

@@ -232,11 +232,36 @@ and service configuration are not restored; keep configuration compatible with
 both retained generations. This is an observation of retained owner-controlled
 artifacts, not an immutable-source or loaded-package attestation.
 
+Readiness windows (#1868). The candidate waits
+`CCC_BRIDGE_RESTART_READY_TIMEOUT` seconds for `available` (default 90,
+integer 1..3600; an invalid value is refused before anything is stopped).
+When the candidate failed by readiness **timeout**, the recovery attempt gets
+`max(2 × candidate window, 180s)` — the usual cause is a slow device, not a
+bad head, and the same window would fail the recovery for the same reason.
+After a start error the recovery keeps the candidate window.
+`CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT` overrides the recovery window for
+any cause. The window reaches the retained previous `start.sh` through
+`CCC_BRIDGE_RESTART_READY_TIMEOUT`, which older sources already honor.
+
 Budget external watchdogs for **both** candidate and possible recovery
 validation, drains, launches and readiness waits. The self-updater's default
 180-second external command budget may be insufficient; explicitly measure
 and configure the linked restart command budget. The controller does not
-silently extend an outer deadline or resume after it is killed.
+silently extend an outer deadline or resume after it is killed. When the
+caller exports `CCC_BRIDGE_RESTART_DEADLINE_EPOCH` (the self-updater does),
+the recovery window shrinks to end 60 seconds before it, but never below the
+smaller of the recovery and candidate windows.
+
+Every launch-attempted failure (exit `2`/`4` without recovery options, `7`,
+`8`) prints one line
+`ccc-restart-outcome: {"schema":"ccc.restart-outcome.v1",...}` with the
+candidate and recovery causes (`timeout`, `start-error`, `unverified`,
+`recovered`, ...), exit codes, windows, the previously serving PID and whether
+it is alive, and `serving`: `available`, `alive` (a bridge process lives but
+generic status is not available) or `dead` (no live bridge process — the
+service is down). The self-updater records it in its audit as `failure_kind`
+plus `restart_outcome` (the `result` field is unchanged) and names the serving
+state in its notification.
 
 ### Offline recovery rehearsal
 
