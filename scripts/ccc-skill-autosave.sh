@@ -26,8 +26,10 @@
 #   - Off-switch: touch ~/.claude/state/skill-autosave.disabled
 #     (skill-review's own skill-review.disabled off-switch is honored too).
 #   - Cost-bounded: at most CCC_SKILL_AUTOSAVE_MAX_SESSIONS transcripts are
-#     drafted per run; a ledger prevents re-drafting a transcript that has not
-#     grown since it was last processed.
+#     drafted per run PER BRANCH (claude/codex/piri/danso each have their own
+#     counter, #1824); the optional CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS caps
+#     the sum across branches. A ledger prevents re-drafting a transcript that
+#     has not grown since it was last processed.
 set -uo pipefail
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
@@ -72,6 +74,12 @@ WINDOW_DAYS="${CCC_SKILL_AUTOSAVE_WINDOW_DAYS:-2}"
 REGROWTH_BYTES="${CCC_SKILL_AUTOSAVE_REGROWTH_BYTES:-16384}"
 NOTIFY="${CCC_SKILL_AUTOSAVE_NOTIFY:-1}"
 case "$MAX_SESSIONS" in ''|*[!0-9]*) MAX_SESSIONS=3 ;; esac
+# #1824: MAX_SESSIONS is a per-branch budget, so N enabled branches can draft
+# up to N x MAX_SESSIONS per run. This optional cross-branch cap (0/unset = no
+# cap, the historical behavior) bounds the sum; branches run in the fixed
+# order claude, codex, piri, danso and each stops once the sum reaches it.
+TOTAL_MAX_SESSIONS="${CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS:-0}"
+case "$TOTAL_MAX_SESSIONS" in ''|*[!0-9]*) TOTAL_MAX_SESSIONS=0 ;; esac
 case "$WINDOW_DAYS" in ''|*[!0-9]*) WINDOW_DAYS=2 ;; esac
 case "$REGROWTH_BYTES" in ''|*[!0-9]*) REGROWTH_BYTES=16384 ;; esac
 # #1932: skill-review.sh returns this code (CCC_SKILL_REVIEW_SKIP_RC) when it
@@ -265,7 +273,18 @@ fi
 
 # --- 2) draft skills from recent, unprocessed transcripts --------------------
 drafted=0
+codex_drafted=0
+piri_drafted=0
+danso_drafted=0
 skipped_unreviewable=0
+# #1824: true once the optional cross-branch cap is spent; logs which branch
+# stopped so a capped run is distinguishable from an idle one.
+total_budget_spent() { # <branch-label>
+  [ "$TOTAL_MAX_SESSIONS" -gt 0 ] || return 1
+  [ $((drafted + codex_drafted + piri_drafted + danso_drafted)) -ge "$TOTAL_MAX_SESSIONS" ] || return 1
+  log "$1 budget-stop reason=total-max-sessions total_max=$TOTAL_MAX_SESSIONS"
+  return 0
+}
 if [ ! -f "$REVIEW" ]; then
   log "review skipped reason=no-skill-review path=$REVIEW"
 elif [ -f "$STATE_DIR/skill-review.disabled" ]; then
@@ -275,6 +294,7 @@ else
   before="$(pending_count)"
   while IFS= read -r transcript; do
     [ "$drafted" -ge "$MAX_SESSIONS" ] && break
+    total_budget_spent review && break
     [ -f "$transcript" ] || continue
     sid="$(basename "$transcript" .jsonl)"
     size="$(wc -c < "$transcript" 2>/dev/null | tr -d '[:space:]')"
@@ -357,6 +377,7 @@ else
     }
     while IFS= read -r rollout; do
       [ "$codex_drafted" -ge "$MAX_SESSIONS" ] && break
+      total_budget_spent codex && break
       [ -f "$rollout" ] || continue
       sid="$(basename "$rollout" .jsonl)"
       size="$(wc -c < "$rollout" 2>/dev/null | tr -d '[:space:]')"
@@ -460,6 +481,7 @@ else
     }
     while IFS= read -r session; do
       [ "$piri_drafted" -ge "$MAX_SESSIONS" ] && break
+      total_budget_spent piri && break
       [ -f "$session" ] || continue
       sid="$(basename "$session" .jsonl)"
       size="$(wc -c < "$session" 2>/dev/null | tr -d '[:space:]')"
@@ -551,6 +573,7 @@ else
       }
       while IFS= read -r journal; do
         [ "$danso_drafted" -ge "$MAX_SESSIONS" ] && break
+        total_budget_spent danso && break
         [ -f "$journal" ] || continue
         jid="$(basename "$journal" .jsonl)"
         size="$(wc -c < "$journal" 2>/dev/null | tr -d '[:space:]')"
@@ -629,7 +652,7 @@ else
     done
   fi
   after="$(pending_count)"
-  log "sweep done drafted_sessions=$drafted codex_drafted=$codex_drafted piri_drafted=$piri_drafted danso_drafted=$danso_drafted pending_before=$before pending_after=$after skipped_unreviewable=$skipped_unreviewable"
+  log "sweep done drafted_sessions=$drafted codex_drafted=$codex_drafted piri_drafted=$piri_drafted danso_drafted=$danso_drafted pending_before=$before pending_after=$after skipped_unreviewable=$skipped_unreviewable total_drafted=$((drafted + codex_drafted + piri_drafted + danso_drafted)) max_sessions_per_branch=$MAX_SESSIONS total_max_sessions=$TOTAL_MAX_SESSIONS"
 fi
 
 # --- 2b) auto mode (#355): machine-gate + install passing drafts -------------

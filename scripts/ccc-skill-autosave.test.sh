@@ -682,5 +682,34 @@ run14
 ok "#1932: a rerun revisits neither skips nor drafts" \
   '! grep -Eq "review (ok|skipped) session=" "$STATE14/skill-autosave.log"'
 
+# --- 15) #1824: MAX_SESSIONS is per branch; the optional total cap bounds the sum
+PROJECTS15="$TMP/projects15"
+make_transcript "$PROJECTS15/-root--work/sess-a.jsonl" 6
+make_transcript "$PROJECTS15/-root--work/sess-b.jsonl" 6
+run15() { # <state> [env...]
+  local st="$1"; shift
+  mkdir -p "$st"; chmod 700 "$st"
+  env CCC_STATE_DIR="$st" CLAUDE_PROJECTS_DIR="$PROJECTS15" CCC_PUSH_SPOOL="$TMP/spool15" \
+    CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+    CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion15.touched" \
+    CCC_SKILL_CODEX_NORMALIZE_CMD="$HERE/codex-rollout-normalize.py" CCC_SKILL_CODEX_DRAFTING=1 \
+    CODEX_HOME="$CODEX_HOME4" CLAUDE_SKILLS_DIR="$TMP/skills15" \
+    CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=0 CCC_SKILL_AUTOSAVE_MAX_SESSIONS=3 CCC_NODE=testnode \
+    "$@" bash "$AUTOSAVE" run
+}
+run15 "$TMP/state15a"
+ok "#1824: without a total cap every branch keeps its own budget" \
+  'grep -q "sweep done drafted_sessions=2 codex_drafted=1 .*total_drafted=3 max_sessions_per_branch=3 total_max_sessions=0" "$TMP/state15a/skill-autosave.log" && ! grep -q "budget-stop" "$TMP/state15a/skill-autosave.log"'
+run15 "$TMP/state15b" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=2
+ok "#1824: the total cap stops later branches once the sum is spent" \
+  'grep -q "sweep done drafted_sessions=2 codex_drafted=0 .*total_drafted=2 .*total_max_sessions=2" "$TMP/state15b/skill-autosave.log"'
+ok "#1824: a capped branch says so instead of looking idle" \
+  'grep -q "codex budget-stop reason=total-max-sessions total_max=2" "$TMP/state15b/skill-autosave.log"'
+ok "#1824: the capped rollout is not ledgered (drafted on a later run)" \
+  '! grep -q "^rollout-2026-08-31T09-00-00-aaaa-bbbb	" "$TMP/state15b/skill-autosave.codex-seen" 2>/dev/null'
+run15 "$TMP/state15c" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=garbage
+ok "#1824: a malformed total cap means no cap" \
+  'grep -q "total_drafted=3 .*total_max_sessions=0" "$TMP/state15c/skill-autosave.log"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

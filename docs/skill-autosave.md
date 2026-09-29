@@ -168,8 +168,11 @@ in, the sweep runs a **codex branch** right after the Claude draft loop:
    daily-cap ledger stay shared (`CCC_SKILL_REVIEW_STATE_DIR`), so install
    counts sum across both branches.
 3. A separate regrowth ledger (`skill-autosave.codex-seen`, same 16 KiB
-   semantics and `MAX_SESSIONS` per-run budget as the Claude branch) prevents
-   re-processing unchanged rollouts.
+   semantics as the Claude branch) prevents re-processing unchanged rollouts.
+   The branch has its **own** `MAX_SESSIONS` per-run budget (not shared with
+   the Claude branch, #1824); only the pending queue and the autoinstall
+   daily cap are shared. `CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS` bounds the
+   cross-branch sum when set.
 
 **Opt in** with `CCC_SKILL_CODEX_DRAFTING=1` (or `1` in
 `<CCC_STATE_DIR>/skill-autosave.codex-drafting`). Default is off: nodes without
@@ -951,8 +954,14 @@ touch ~/.claude/state/skill-autosave.disabled  # off-switch (sweep)
 touch ~/.claude/state/skill-review.disabled    # off-switch (drafting pipeline)
 ```
 
-Tuning (env): `CCC_SKILL_AUTOSAVE_MAX_SESSIONS` (default 3 transcripts/run —
-each drafting run is an LLM call), `CCC_SKILL_AUTOSAVE_WINDOW_DAYS` (2),
+Tuning (env): `CCC_SKILL_AUTOSAVE_MAX_SESSIONS` (default 3 transcripts/run
+**per drafting branch** — each drafting run is an LLM call; claude, codex, piri
+and danso each keep their own counter, so a node with N enabled branches can
+draft up to N×3 per run, #1824), `CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS`
+(default 0 = no cross-branch cap; when set, the sum over all branches stops at
+this value — branches run claude → codex → piri → danso and a capped branch
+logs `<branch> budget-stop reason=total-max-sessions`; the sweep summary always
+reports `total_drafted=`), `CCC_SKILL_AUTOSAVE_WINDOW_DAYS` (2),
 `CCC_SKILL_AUTOSAVE_REGROWTH_BYTES` (16384 — a long-lived bridge transcript is
 re-reviewed only after growing this much), `CCC_SKILL_AUTOSAVE_NOTIFY` (1),
 `CCC_SKILL_AUTOSAVE_SETTLE_SECONDS` (90), `CCC_SKILL_AUTOSAVE_MODE`
