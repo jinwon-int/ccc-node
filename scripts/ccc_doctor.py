@@ -2177,6 +2177,7 @@ class Doctor:
 
     _AGENT_CRON_STALE_DAYS_DEFAULT = 7
     _AGENT_CRON_STORE_MAX_BYTES = 8 * 1024 * 1024
+    _AGENT_CRON_ONE_SHOT = re.compile(r"^\s*(?:at\s|\d{4}-\d{2}-\d{2}T\S*\s*$)")
 
     @staticmethod
     def _agent_cron_stamp(value: Any) -> datetime | None:
@@ -2190,59 +2191,110 @@ class Doctor:
         return parsed.astimezone(timezone.utc)
 
     def _agent_cron_store_path(self) -> Path:
+        """Resolve the store exactly as agent_cron.py does (no CCC_STATE_DIR)."""
         store_env = os.environ.get("CCC_AGENT_CRON_STORE", "").strip()
         if store_env:
             return Path(store_env).expanduser()
-        state_dir = Path(os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")).expanduser()
-        return state_dir / "agent-cron" / "tasks.json"
+        return self.claude_dir / "state" / "agent-cron" / "tasks.json"
+
+    def _agent_cron_alarm_tasks(self, store: Path) -> dict[str, Any]:
+        """Per-task alarm state (lastSuccessAt, failureClass); {} when absent/bad."""
+        path = store.parent / "failure-alarm.json"
+        try:
+            if path.is_symlink() or path.stat().st_size > self._AGENT_CRON_STORE_MAX_BYTES:
+                return {}
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        tasks = doc.get("tasks") if isinstance(doc, dict) and doc.get("version") == 2 else None
+        return tasks if isinstance(tasks, dict) else {}
 
     @classmethod
-    def _agent_cron_stale_task(
-        cls, task: Any, now: datetime, days: int
-    ) -> tuple[float, str] | None:
-        """(age_days, label) when an enabled prompt task is stale, else None."""
-        if not isinstance(task, dict) or task.get("enabled") is not True:
-            return None
+    def _agent_cron_runs(cls, task: dict[str, Any]) -> list[tuple[datetime, dict[str, Any]]]:
+        rows = []
+        for entry in task.get("runHistory") or []:
+            if isinstance(entry, dict):
+                stamp = cls._agent_cron_stamp(entry.get("startedAt"))
+                if stamp is not None:
+                    rows.append((stamp, entry))
+        return sorted(rows, key=lambda pair: pair[0])
+
+    @classmethod
+    def _agent_cron_successes(
+        cls, task: dict[str, Any], alarm: dict[str, Any], runs: list[tuple[datetime, dict[str, Any]]]
+    ) -> list[datetime]:
+        found = [stamp for stamp, entry in runs if entry.get("status") == "success"]
+        recorded = cls._agent_cron_stamp(alarm.get("lastSuccessAt"))
+        return found + ([recorded] if recorded is not None else [])
+
+    @staticmethod
+    def _agent_cron_is_prompt(task: Any) -> bool:
+        if not isinstance(task, dict):
+            return False
         payload = task.get("payload")
-        if isinstance(payload, dict) and (payload.get("kind") or "prompt") != "prompt":
+        return not isinstance(payload, dict) or (payload.get("kind") or "prompt") == "prompt"
+
+    def _agent_cron_stale_task(
+        self, task: dict[str, Any], alarm: dict[str, Any], now: datetime, days: int
+    ) -> tuple[float, str] | None:
+        """(age_days, label) for an enabled recurring prompt task stale > D days.
+
+        Disabled tasks (operator acknowledged) and one-shot tasks (they never
+        run again, so a per-task warning would never clear) are left to the
+        bounded node-level verdict.
+        """
+        if task.get("enabled") is not True or self._AGENT_CRON_ONE_SHOT.match(str(task.get("schedule") or "")):
             return None
-        runs = sorted(
-            (
-                (stamp, entry)
-                for entry in task.get("runHistory") or []
-                if isinstance(entry, dict)
-                and (stamp := cls._agent_cron_stamp(entry.get("startedAt"))) is not None
-            ),
-            key=lambda pair: pair[0],
-        )
+        runs = self._agent_cron_runs(task)
         if not runs or runs[-1][1].get("status") == "success":
             return None
-        successes = [stamp for stamp, entry in runs if entry.get("status") == "success"]
-        recorded = cls._agent_cron_stamp(task.get("lastSuccessAt"))
-        if recorded is not None:
-            successes.append(recorded)
+        successes = self._agent_cron_successes(task, alarm, runs)
         since = max(successes) if successes else runs[0][0]
         age_days = (now - since).total_seconds() / 86400
         if age_days <= days:
             return None
-        failure_class = runs[-1][1].get("failureClass")
+        failure_class = alarm.get("failureClass")
         class_text = _printable(failure_class, 20) if isinstance(failure_class, str) else "unclassified"
         basis = "last-success" if successes else "no-success-since-first-run"
         task_id = _printable(str(task.get("id") or "?"), 60)
         return age_days, f"{task_id}({basis}={int(age_days)}d,class={class_text})"
 
-    def check_agent_cron_prompt_success(self) -> None:
-        """Warn when an enabled prompt task has not succeeded for > D days (#1821).
+    def _agent_cron_node_stale(
+        self, prompt_tasks: list[dict[str, Any]], alarms: dict[str, Any], now: datetime, days: int
+    ) -> str | None:
+        """Node verdict: prompt runs are still being attempted (newest within D
+        days) and failing, and no prompt task succeeded for > D days. Bounded:
+        it clears by itself once nothing has been attempted for D days."""
+        runs: list[tuple[datetime, dict[str, Any]]] = []
+        successes: list[datetime] = []
+        for task in prompt_tasks:
+            task_runs = self._agent_cron_runs(task)
+            alarm = alarms.get(str(task.get("id")))
+            runs.extend(task_runs)
+            successes.extend(self._agent_cron_successes(task, alarm if isinstance(alarm, dict) else {}, task_runs))
+        if not runs:
+            return None
+        runs.sort(key=lambda pair: pair[0])
+        newest_stamp, newest = runs[-1]
+        if newest.get("status") == "success" or (now - newest_stamp).total_seconds() > days * 86400:
+            return None
+        since = max(successes) if successes else runs[0][0]
+        age_days = (now - since).total_seconds() / 86400
+        if age_days <= days:
+            return None
+        basis = "last-success" if successes else "no-success-since-first-run"
+        return f"node-prompt({basis}={int(age_days)}d)"
 
-        On 2026-09 a node's claude login broke and four prompt tasks failed for
-        six days while every other signal stayed green; the task store knew all
-        along. A task counts as stale when its NEWEST run did not succeed and
-        its last success (``lastSuccessAt``, else the newest success still in
-        the bounded runHistory) is older than D days — or, if no success is
-        recorded at all, when its oldest recorded run is. A task whose latest
-        run succeeded, or that has never run, is not stale. Disabled tasks are
-        skipped: disabling is an operator's acknowledgement. Command payloads
-        are out of scope — they do not exercise the node's model login.
+    def check_agent_cron_prompt_success(self) -> None:
+        """Warn when prompt tasks have not succeeded for > D days (#1821).
+
+        On 2026-09 a node's claude login broke and four one-shot prompt tasks
+        failed for six days while every other signal stayed green; the task
+        store knew all along. Two bounded verdicts: an enabled recurring prompt
+        task whose newest run failed and whose last success (failure-alarm.json
+        ``lastSuccessAt``, else runHistory) is older than D days; and a node
+        verdict for prompt runs still being attempted and failing with no
+        prompt success anywhere for > D days (the one-shot incident shape).
         """
         item = "agent-cron prompt success"
         raw_days = os.environ.get("CCC_DOCTOR_AGENT_CRON_STALE_DAYS", "").strip()
@@ -2265,19 +2317,28 @@ class Doctor:
             return
 
         now = datetime.now(timezone.utc)
-        found = [self._agent_cron_stale_task(task, now, days) for task in tasks]
-        stale = sorted((entry for entry in found if entry is not None), key=lambda pair: -pair[0])
-        if not stale:
+        alarms = self._agent_cron_alarm_tasks(store)
+        prompt_tasks = [task for task in tasks if self._agent_cron_is_prompt(task)]
+        found = []
+        for task in prompt_tasks:
+            alarm = alarms.get(str(task.get("id")))
+            found.append(self._agent_cron_stale_task(task, alarm if isinstance(alarm, dict) else {}, now, days))
+        labels = [label for _age, label in sorted((f for f in found if f), key=lambda pair: -pair[0])]
+        node = self._agent_cron_node_stale(prompt_tasks, alarms, now, days)
+        if node:
+            labels.insert(0, node)
+        if not labels:
             self.add("정상", item, f"stale=0; threshold={days}d", "none")
             return
-        shown = ", ".join(label for _age, label in stale[:5])
-        more = f" (+{len(stale) - 5} more)" if len(stale) > 5 else ""
+        shown = ", ".join(labels[:5])
+        more = f" (+{len(labels) - 5} more)" if len(labels) > 5 else ""
         self.add(
             "경고",
             item,
-            f"stale={len(stale)}; threshold={days}d; {shown}{more}",
-            "run `agent-cron.sh status`; class=auth_failed means the node's claude "
-            "login is broken (re-authenticate), cli_missing means the runner/PATH is broken",
+            f"stale={len(labels)}; threshold={days}d; {shown}{more}",
+            "run `agent-cron.sh status` and read failure-alarm.json next to the store; "
+            "class=auth_failed means that task's claude login/credential is broken, "
+            "cli_missing means the runner/PATH is broken",
         )
 
     def check_worker_claude_cli_floor(self) -> None:

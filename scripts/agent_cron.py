@@ -10,7 +10,7 @@ import shlex as _shlex
 import sys as _sys
 from pathlib import Path as _Path
 
-_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [--name N] [--timezone IANA] [--notify none|telegram-owner|telegram-owner-on-failure|telegram-chat|telegram-chat-on-failure] [--notify-chat-id ID] [--allowed-tools a,b] [--success-exit-codes 0,1] [--permission-mode M] [--catch-up-policy P] [--max-catchup N] [--lock-timeout-sec N] [--anchor-at ISO] [--not-before ISO] [--max-runs N] [--failure-alert-after N] [--keep-after-run] [--disabled] [--argv WORD ...] [--cwd DIR] [--model M] [--timeout-sec N] [--output-max-bytes N] [--json]\n       agent-cron.sh edit <task-id> [same flags as add; set-only partial update] [--json]\n       agent-cron.sh remove|enable|disable <task-id> [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears\n  retryState on success, and releases the lock in all normal failure/success\n  paths. Failed runs record a bounded runHistory failureClass\n  (auth_failed|cli_missing|timeout|other); after N consecutive failures\n  (failureAlertAfter, default 3, 0 disables) one owner alarm is spooled\n  regardless of notify, repeated only on class change and on recovery. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
+_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [--name N] [--timezone IANA] [--notify none|telegram-owner|telegram-owner-on-failure|telegram-chat|telegram-chat-on-failure] [--notify-chat-id ID] [--allowed-tools a,b] [--success-exit-codes 0,1] [--permission-mode M] [--catch-up-policy P] [--max-catchup N] [--lock-timeout-sec N] [--anchor-at ISO] [--not-before ISO] [--max-runs N] [--failure-alert-after N] [--keep-after-run] [--disabled] [--argv WORD ...] [--cwd DIR] [--model M] [--timeout-sec N] [--output-max-bytes N] [--json]\n       agent-cron.sh edit <task-id> [same flags as add; set-only partial update] [--json]\n       agent-cron.sh remove|enable|disable <task-id> [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears\n  retryState on success, and releases the lock in all normal failure/success\n  paths. Failed runs get a bounded failureClass\n  (auth_failed|cli_missing|timeout|other) in failure-alarm.json next to the\n  store (never in tasks.json); after N consecutive failures (failureAlertAfter,\n  default 3, 0 disables) one owner alarm is spooled regardless of notify. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
 
 
 def _die(message, code=2):
@@ -93,11 +93,11 @@ from agent_cron_lib import (  # noqa: E402
 )
 from agent_cron_schema import validate_store  # noqa: E402
 from agent_cron_alarm import (  # noqa: E402
-    NODE_PROMPT_KEY,
     alarm_text,
-    alarm_transition,
     classify_failure,
+    node_transition,
     resolve_threshold,
+    task_transition,
     trailing_failures,
 )
 from agent_cron_model import normalize, task_by_id  # noqa: E402
@@ -170,7 +170,6 @@ def store_lock():
 # payload) belongs to whoever edits it, and must survive a concurrent run.
 RUN_STATE_FIELDS = (
     'runHistory', 'retryState', 'lastRunAt', 'lastStatus', 'lastRunId', 'runCount',
-    'lastSuccessAt',
 )
 
 
@@ -1524,7 +1523,8 @@ def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
         return {**base, 'delivery': 'spool-error', 'redacted': True, 'error': short_text(str(e), 600)}
 
 
-FAILURE_ALARM_STATE_VERSION = 1
+FAILURE_ALARM_STATE_VERSION = 2
+FAILURE_ALARM_RUNS_MAX = 50
 
 
 def failure_alarm_path():
@@ -1532,68 +1532,79 @@ def failure_alarm_path():
     return base / 'failure-alarm.json'
 
 
-def load_failure_alarm_state():
-    """Read the alarm sidecar; anything unreadable restarts from empty state.
+def _empty_alarm_state():
+    return {'version': FAILURE_ALARM_STATE_VERSION, 'tasks': {}, 'node': {}}
 
-    Losing this state can only cost a repeated alert (the key re-seeds from
+
+def load_failure_alarm_state():
+    """Read the alarm state; anything unreadable restarts from empty state.
+
+    Losing this state can only cost one repeated alert (counters re-seed from
     runHistory), never a missed one, so it fails open rather than closed.
     """
     path = failure_alarm_path()
     try:
         if path.is_symlink():
-            return {'version': FAILURE_ALARM_STATE_VERSION, 'keys': {}}
+            return _empty_alarm_state()
         doc = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, ValueError):
-        return {'version': FAILURE_ALARM_STATE_VERSION, 'keys': {}}
-    keys = doc.get('keys') if isinstance(doc, dict) else None
-    if not isinstance(keys, dict):
-        keys = {}
+        return _empty_alarm_state()
+    if not isinstance(doc, dict) or doc.get('version') != FAILURE_ALARM_STATE_VERSION:
+        return _empty_alarm_state()
+    tasks = doc.get('tasks') if isinstance(doc.get('tasks'), dict) else {}
+    node = doc.get('node') if isinstance(doc.get('node'), dict) else {}
     return {'version': FAILURE_ALARM_STATE_VERSION,
-            'keys': {k: v for k, v in keys.items() if isinstance(k, str) and isinstance(v, dict)}}
+            'tasks': {k: v for k, v in tasks.items() if isinstance(k, str) and isinstance(v, dict)},
+            'node': node}
+
+
+def _node_eligible(item, env_threshold):
+    """Prompt tasks feed the node counter unless opted out (failureAlertAfter=0)."""
+    return (isinstance(item, dict) and task_payload(item)['kind'] == 'prompt'
+            and resolve_threshold(item.get('failureAlertAfter'), env_threshold) != 0)
 
 
 def _prompt_history_seed(tasks, env_threshold):
-    """Trailing node-wide prompt failures across opted-in prompt tasks."""
+    """(trailing node-wide prompt failures, distinct task ids in them)."""
     merged = []
     for item in tasks:
-        if not isinstance(item, dict) or task_payload(item)['kind'] != 'prompt':
-            continue
-        if resolve_threshold(item.get('failureAlertAfter'), env_threshold) == 0:
+        if not _node_eligible(item, env_threshold):
             continue
         for entry in item.get('runHistory') or []:
             if isinstance(entry, dict) and isinstance(entry.get('startedAt'), str):
-                merged.append(entry)
-    merged.sort(key=lambda entry: entry['startedAt'])
-    return trailing_failures(merged)
+                merged.append((entry['startedAt'], str(item.get('id')), entry))
+    merged.sort(key=lambda row: row[0])
+    count = trailing_failures([entry for _stamp, _id, entry in merged])
+    ids = []
+    for _stamp, task_id, _entry in merged[len(merged) - count:] if count else []:
+        if task_id not in ids:
+            ids.append(task_id)
+    return count, ids
 
 
-def _prompt_last_success(tasks):
-    """Newest recorded prompt-task success, for the node-level alarm text."""
-    newest = None
+def _prompt_last_success(tasks, state):
+    """Newest recorded prompt-task success, for the node alarm text."""
+    stamps = [state.get('node', {}).get('lastSuccessAt')]
     for item in tasks:
         if not isinstance(item, dict) or task_payload(item)['kind'] != 'prompt':
             continue
-        stamps = [item.get('lastSuccessAt')] + [
-            entry.get('startedAt') for entry in item.get('runHistory') or []
-            if isinstance(entry, dict) and entry.get('status') == 'success'
-        ]
-        for stamp in stamps:
-            if isinstance(stamp, str) and (newest is None or stamp > newest):
-                newest = stamp
-    return newest
+        stamps.append((state['tasks'].get(str(item.get('id'))) or {}).get('lastSuccessAt'))
+        stamps.extend(entry.get('startedAt') for entry in item.get('runHistory') or []
+                      if isinstance(entry, dict) and entry.get('status') == 'success')
+    valid = [stamp for stamp in stamps if isinstance(stamp, str)]
+    return max(valid) if valid else None
 
 
-def write_failure_alarm_spool(task_id, run_id, text, events, at):
+def write_failure_alarm_spool(task_id, run_id, text, reasons, at):
     spool = push_spool_dir()
     ts = fmt_dt(at) or _secure_fs.utc_now_iso()
-    reasons = ','.join(sorted({f"{key}={event['reason']}" for key, event in events.items()}))
     payload = {
         'version': 1,
         'ts': ts,
         'event': 'AgentCronFailureAlarm',
         'node': socket.gethostname(),
         'text': text,
-        'dedup': f'agent-cron-alarm:{task_id}:{run_id}:{reasons}',
+        'dedup': f"agent-cron-alarm:{task_id}:{run_id}:{','.join(reasons)}",
         'recipient': 'owner',
         'taskId': task_id,
         'runId': run_id,
@@ -1621,46 +1632,17 @@ def _alarm_context(task_id, task):
     fresh_tasks = fresh.get('tasks') if isinstance(fresh, dict) and not errors else None
     if not isinstance(fresh_tasks, list):
         return task, [task], None
-    live = {f"task:{t.get('id')}" for t in fresh_tasks if isinstance(t, dict)}
+    live = {str(t.get('id')) for t in fresh_tasks if isinstance(t, dict)}
     return task_by_id(fresh, task_id) or task, fresh_tasks, live
 
 
-def _advance_alarm_keys(keys, task_id, current, tasks, failed, failure_class, at_s, env_threshold):
-    """Advance the task key and, for prompt tasks, the node-wide prompt key."""
-    task_threshold = resolve_threshold(current.get('failureAlertAfter'), env_threshold)
-    task_key = f'task:{task_id}'
-    new_states, events = {}, {}
-    new_states[task_key], event = alarm_transition(
-        keys.get(task_key), failed=failed, failure_class=failure_class,
-        threshold=task_threshold, at=at_s,
-        seed_streak=trailing_failures(current.get('runHistory')),
-    )
-    if event:
-        events['task'] = event
-    # An opted-out task's failures never feed the node streak, but its success
-    # still proves the prompt runner works.
-    if task_payload(current)['kind'] == 'prompt' and not (failed and task_threshold == 0):
-        new_states[NODE_PROMPT_KEY], event = alarm_transition(
-            keys.get(NODE_PROMPT_KEY), failed=failed, failure_class=failure_class,
-            threshold=resolve_threshold(None, env_threshold), at=at_s,
-            seed_streak=_prompt_history_seed(tasks, env_threshold),
-        )
-        if event:
-            events[NODE_PROMPT_KEY] = event
-    return new_states, events, task_threshold
-
-
-def _mark_alarm_delivery(new_states, events, task_key, delivered, at_s):
-    """Record an alert only once it was really spooled; else retry next run."""
-    for name, event in events.items():
-        state = new_states[task_key if name == 'task' else name]
-        if event['reason'] == 'recovered':
-            if not delivered:
-                # Keep the alert open so the next success retries the notice.
-                state['alertedClass'] = event['failureClass']
-        elif delivered:
-            state['alertedClass'] = event['failureClass']
-            state['alertedAt'] = at_s
+def _record_task_run(task_state, run_id, at_s, status, failure_class):
+    """Per-run failure class ledger (acceptance (a) of #1821), bounded."""
+    runs = [r for r in task_state.get('runs') or [] if isinstance(r, dict)]
+    row = {'runId': run_id, 'startedAt': at_s, 'status': status}
+    if failure_class is not None:
+        row['failureClass'] = failure_class
+    task_state['runs'] = (runs + [row])[-FAILURE_ALARM_RUNS_MAX:]
 
 
 def _write_failure_alarm_state(state):
@@ -1672,62 +1654,78 @@ def _write_failure_alarm_state(state):
     )
 
 
+def _advance_failure_alarm(state, task_id, current, tasks, run_id, status, failure_class, at_s):
+    env_threshold = os.environ.get('CCC_AGENT_CRON_FAILURE_ALERT_AFTER', '')
+    failed = status != 'success'
+    threshold = resolve_threshold(current.get('failureAlertAfter'), env_threshold)
+    task_state, task_event = task_transition(
+        state['tasks'].get(task_id), failed=failed, failure_class=failure_class,
+        threshold=threshold, at=at_s, seed_streak=trailing_failures(current.get('runHistory')),
+    )
+    _record_task_run(task_state, run_id, at_s, status, failure_class)
+    state['tasks'][task_id] = task_state
+    node_event = None
+    result = {'failureClass': failure_class, 'threshold': threshold,
+              'consecutiveFailures': task_state['consecutiveFailures']}
+    if _node_eligible(current, env_threshold):
+        seed, seed_ids = _prompt_history_seed(tasks, env_threshold)
+        state['node'], node_event = node_transition(
+            state['node'], task_id=task_id, failed=failed, failure_class=failure_class,
+            threshold=resolve_threshold(None, env_threshold), at=at_s,
+            seed_streak=seed, seed_ids=seed_ids,
+        )
+        result['nodeConsecutiveFailures'] = state['node']['consecutiveFailures']
+    return task_event, node_event, result
+
+
 # ccc-side-effect: agent_cron.failure_alarm
 def record_failure_alarm(task_id, task, run_id, status, failure_class, at):
     """Deduplicated owner alarm for consecutive failures (#1821).
 
-    Two keys advance per run: ``task:<id>`` (this task's own streak) and, for
-    prompt tasks, ``node:prompt`` (consecutive prompt-task failures across all
-    tasks — the shape of the 2026-09 incident, where four different one-shot
-    tasks each failed once on a broken login). Each key alerts once at the Nth
-    consecutive failure, again only on a failure-class change, and once on
-    recovery. Both keys firing on one run produce a single message.
+    Two counters advance per run (see agent_cron_alarm): the task's own streak
+    and, for prompt tasks not opted out, the node-wide prompt streak. Both
+    firing on one run produce a single message.
+
+    State is persisted BEFORE the spool write, with the alert already marked as
+    sent. If the state cannot be written the alert is suppressed (and a warning
+    printed to stderr): failing quiet beats alerting on every run. If the spool
+    write fails after the state was saved, that one alert is lost.
 
     This alarm deliberately ignores the task ``notify`` setting: the incident
     being fixed is precisely a notify=none task failing in silence. Opt out per
     task with ``failureAlertAfter: 0`` or node-wide with
-    ``CCC_AGENT_CRON_FAILURE_ALERT_AFTER=0``. Text is composed from the task id,
-    enums, counts and timestamps only — never from run output.
-
-    Never raises: the run itself has already happened and been recorded.
+    ``CCC_AGENT_CRON_FAILURE_ALERT_AFTER=0``. Nothing is written to the task
+    store. Never raises: the run itself has already happened and been recorded.
     """
     if _VALID_TASK_ID.fullmatch(str(task_id or '')) is None:
         return {'state': 'skipped-invalid-task-id'}
-    env_threshold = os.environ.get('CCC_AGENT_CRON_FAILURE_ALERT_AFTER', '')
     at_s = fmt_dt(at) or _secure_fs.utc_now_iso()
-    task_key = f'task:{task_id}'
     try:
         with store_lock():
             current, tasks, live = _alarm_context(task_id, task)
             state = load_failure_alarm_state()
-            keys = state['keys']
             if live is not None:
-                for key in [k for k in keys if k.startswith('task:') and k not in live]:
-                    del keys[key]
-            new_states, events, threshold = _advance_alarm_keys(
-                keys, task_id, current, tasks, status != 'success', failure_class,
-                at_s, env_threshold,
-            )
-            result = {'state': 'no-alert', 'failureClass': failure_class,
-                      'consecutiveFailures': new_states[task_key]['consecutiveFailures'],
-                      'threshold': threshold}
-            if NODE_PROMPT_KEY in new_states:
-                result['nodeConsecutiveFailures'] = new_states[NODE_PROMPT_KEY]['consecutiveFailures']
-            if events:
-                node_state = new_states.get(NODE_PROMPT_KEY) or keys.get(NODE_PROMPT_KEY) or {}
-                text = alarm_text(task_id, events,
-                                  node_state.get('lastSuccessAt') or _prompt_last_success(tasks))
-                spooled = write_failure_alarm_spool(task_id, run_id, text, events, at)
-                delivered = spooled.get('delivery') == 'spooled'
-                _mark_alarm_delivery(new_states, events, task_key, delivered, at_s)
-                result.update({
-                    'state': 'alerted' if delivered else 'alert-failed',
-                    'reasons': sorted(f"{k}={e['reason']}" for k, e in events.items()),
-                    **spooled,
-                })
-            keys.update(new_states)
-            _write_failure_alarm_state(state)
-        return result
+                for key in [k for k in state['tasks'] if k not in live]:
+                    del state['tasks'][key]
+            task_event, node_event, result = _advance_failure_alarm(
+                state, task_id, current, tasks, run_id, status, failure_class, at_s)
+            last_success = _prompt_last_success(tasks, state) if node_event else None
+            try:
+                _write_failure_alarm_state(state)
+            except Exception as e:
+                suppressed = bool(task_event or node_event)
+                print(f'agent-cron: failure-alarm state not persisted; '
+                      f'{"alert suppressed" if suppressed else "counters not advanced"}: '
+                      f'{short_text(str(e), 200)}', file=sys.stderr)
+                return {**result, 'state': 'state-write-failed', 'alertSuppressed': suppressed}
+        if not (task_event or node_event):
+            return {**result, 'state': 'no-alert'}
+        reasons = sorted(f'{name}={event["reason"]}' for name, event in
+                         (('task', task_event), ('node', node_event)) if event)
+        text = alarm_text(task_id, task_event, node_event, last_success)
+        spooled = write_failure_alarm_spool(task_id, run_id, text, reasons, at)
+        state_name = 'alerted' if spooled.get('delivery') == 'spooled' else 'alert-lost'
+        return {**result, 'state': state_name, 'reasons': reasons, **spooled}
     except Exception as e:
         return {'state': 'error', 'error': short_text(str(e), 300)}
 
@@ -1823,16 +1821,15 @@ def run_execute(data, task_id, at_value, as_json, plan_row=None, plan_at=None): 
             'attempt': attempt,
             'notifyState': notify_state,
         }
+        # Bounded enum from exit code + stderr only (#1821). It is kept in the
+        # alarm state file, not the task store, so tasks.json stays valid
+        # under the pre-#1821 schema and a revert cannot brick the scheduler.
         failure_class = classify_failure(
             status,
             entry['exitCode'],
-            (headless or {}).get('stdout', ''),
             (headless or {}).get('stderr', ''),
             (headless or {}).get('failureClassHint'),
         )
-        if failure_class is not None:
-            # Bounded enum only; raw stderr never enters the task store (#1821).
-            entry['failureClass'] = failure_class
         append_run_history(task, entry)
         retry = apply_retry_transition(task, scheduled_at, attempt, run_id, status, at)
         run_limit = apply_run_limit(task)
@@ -1841,10 +1838,6 @@ def run_execute(data, task_id, at_value, as_json, plan_row=None, plan_at=None): 
         task['lastRunAt'] = scheduled_at
         task['lastStatus'] = status
         task['lastRunId'] = run_id
-        if status == 'success':
-            # runHistory is bounded, so a long failing streak can push the last
-            # success out of it; ccc-doctor needs this to age the streak.
-            task['lastSuccessAt'] = fmt_dt(at)
         if status == 'success' and not task.get('keepAfterRun'):
             try:
                 spec = parse_schedule(task.get('schedule') or '', task.get('timezone', 'UTC'))

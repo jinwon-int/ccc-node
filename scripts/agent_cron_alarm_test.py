@@ -1,164 +1,349 @@
 #!/usr/bin/env python3
-"""Unit tests for agent-cron failure classification and alarm transitions (#1821).
+"""Tests for agent-cron failure classification and the bounded alarm (#1821).
 
 The incident: a node's claude login broke and prompt tasks failed for six days
-(`exited 1` + `"error":"authentication_failed"`) with no alarm. These tests pin
-the bounded failure class and the dedupe contract: one alert at the Nth
-consecutive failure, a repeat only on class change, one recovery notice.
+(`exited 1` + `"error":"authentication_failed"`) with no alarm. Unit tests pin
+the transitions; the integration scenarios drive the real CLI through a fake
+runner and COUNT alarm spool files over a run sequence, asserting that no
+outcome pattern can produce an alarm per run.
+
+Every integration run uses a from-scratch environment with a temporary HOME,
+store and push spool, so no run can reach a node's live spool or state.
 """
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
+import subprocess
 import sys
+import tempfile
+import textwrap
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 
 from agent_cron_alarm import (  # noqa: E402
     FAILURE_CLASSES,
-    NODE_PROMPT_KEY,
     alarm_text,
-    alarm_transition,
     classify_failure,
+    node_transition,
     resolve_threshold,
+    task_transition,
     trailing_failures,
 )
+import agent_cron_schema  # noqa: E402
 
 AUTH_STDERR = (
     'ccc-headless: /usr/bin/claude exited 1\n'
-    'ccc-headless: stdout (first 2000B of 180B):\n'
-    '{"type":"result","is_error":true,"error":"authentication_failed"}'
+    'ccc-headless: stdout (first 2000B of 70B):\n'
+    '{"type":"result","is_error":true,"error":"authentication_failed"}\n'
 )
 
 
 class ClassifyFailure(unittest.TestCase):
     def test_success_has_no_class(self) -> None:
-        self.assertIsNone(classify_failure('success', 0, '', AUTH_STDERR))
+        self.assertIsNone(classify_failure('success', 0, AUTH_STDERR))
 
     def test_observed_auth_failure(self) -> None:
-        self.assertEqual(classify_failure('failed', 1, '', AUTH_STDERR), 'auth_failed')
+        self.assertEqual(classify_failure('failed', 1, AUTH_STDERR), 'auth_failed')
 
-    def test_auth_variants(self) -> None:
+    def test_auth_variants_on_stderr(self) -> None:
         for text in ('Not logged in · Please run /login', 'Invalid API key',
-                     'OAuth token has expired', 'HTTP 401 Unauthorized',
-                     '{"type":"authentication_error"}'):
+                     'OAuth token has expired', 'HTTP 401 Unauthorized'):
             with self.subTest(text=text):
-                self.assertEqual(classify_failure('failed', 1, text, ''), 'auth_failed')
+                self.assertEqual(classify_failure('failed', 1, text), 'auth_failed')
+
+    def test_model_result_text_is_not_auth(self) -> None:
+        # The echoed stdout carries the model's own words; only an unescaped
+        # structured error field counts there.
+        echoed = ('ccc-headless: claude exited 1\n'
+                  'ccc-headless: stdout (first 2000B of 99B):\n'
+                  '{"type":"result","result":"the page said \\"Not logged in\\" '
+                  'and \\"error\\":\\"authentication_failed\\""}\n')
+        self.assertEqual(classify_failure('failed', 1, echoed), 'other')
 
     def test_cli_missing(self) -> None:
-        self.assertEqual(classify_failure('failed', 127, '', "claude: not found in PATH"), 'cli_missing')
-        self.assertEqual(classify_failure('failed', 126, '', ''), 'cli_missing')
-        self.assertEqual(classify_failure('failed', 127, '', '', hint='cli_missing'), 'cli_missing')
+        self.assertEqual(classify_failure('failed', 127, "not found in PATH"), 'cli_missing')
+        self.assertEqual(classify_failure('failed', 126, ''), 'cli_missing')
 
     def test_spawn_hint_other_beats_exit_127(self) -> None:
-        # run_execute reports every pre-spawn exception as exit 127; a payload
-        # error is not a missing CLI.
-        self.assertEqual(classify_failure('failed', 127, '', 'bad payload', hint='other'), 'other')
+        self.assertEqual(classify_failure('failed', 127, 'bad payload', hint='other'), 'other')
 
     def test_timeout(self) -> None:
-        self.assertEqual(classify_failure('timeout', 124, '', AUTH_STDERR), 'timeout')
-        self.assertEqual(classify_failure('failed', 124, '', ''), 'timeout')
-
-    def test_other(self) -> None:
-        self.assertEqual(classify_failure('failed', 7, 'fake failure', ''), 'other')
+        self.assertEqual(classify_failure('timeout', 124, AUTH_STDERR), 'timeout')
+        self.assertEqual(classify_failure('failed', 124, ''), 'timeout')
 
     def test_result_is_always_bounded_enum(self) -> None:
-        for args in (('failed', None, None, None), ('failed', 'x', 5, object()),
-                     ('weird', 2, 'a' * 100000, 'b' * 100000)):
+        for args in (('failed', None, None), ('failed', 'x', object()),
+                     ('weird', 2, 'b' * 100000)):
             self.assertIn(classify_failure(*args), FAILURE_CLASSES)
 
 
 class Threshold(unittest.TestCase):
-    def test_default_is_three(self) -> None:
+    def test_resolution(self) -> None:
         self.assertEqual(resolve_threshold(None, ''), 3)
-
-    def test_env_override_and_disable(self) -> None:
         self.assertEqual(resolve_threshold(None, '2'), 2)
         self.assertEqual(resolve_threshold(None, '0'), 0)
         self.assertEqual(resolve_threshold(None, 'junk'), 3)
-
-    def test_task_value_wins(self) -> None:
         self.assertEqual(resolve_threshold(0, '5'), 0)
-        self.assertEqual(resolve_threshold(2, '5'), 2)
         self.assertEqual(resolve_threshold(True, '5'), 5)
-
-
-def drive(outcomes, threshold=3, prev=None, seed=0):
-    """Feed (failed, class) outcomes; mark alerts delivered like the caller."""
-    state, events = prev, []
-    for index, (failed, cls) in enumerate(outcomes):
-        state, event = alarm_transition(state, failed=failed, failure_class=cls,
-                                        threshold=threshold, at=f't{index}', seed_streak=seed)
-        if event and event['reason'] != 'recovered':
-            state['alertedClass'] = event['failureClass']
-        events.append(event and event['reason'])
-    return state, events
-
-
-class AlarmTransition(unittest.TestCase):
-    def test_alerts_once_at_threshold(self) -> None:
-        _state, events = drive([(True, 'auth_failed')] * 6)
-        self.assertEqual(events, [None, None, 'threshold', None, None, None])
-
-    def test_class_change_realerts_once(self) -> None:
-        _state, events = drive([(True, 'auth_failed')] * 3 + [(True, 'timeout')] * 2)
-        self.assertEqual(events, [None, None, 'threshold', 'class-change', None])
-
-    def test_recovery_after_alert(self) -> None:
-        state, events = drive([(True, 'other')] * 3 + [(False, None)] + [(True, 'other')] * 3)
-        self.assertEqual(events, [None, None, 'threshold', 'recovered', None, None, 'threshold'])
-        self.assertEqual(state['consecutiveFailures'], 3)
-
-    def test_success_without_alert_is_silent(self) -> None:
-        _state, events = drive([(True, 'other')] * 2 + [(False, None)] + [(True, 'other')] * 2)
-        self.assertEqual(events, [None] * 5)
-
-    def test_disabled_threshold_never_fires(self) -> None:
-        _state, events = drive([(True, 'auth_failed')] * 10, threshold=0)
-        self.assertEqual(events, [None] * 10)
-
-    def test_undelivered_alert_retries_next_run(self) -> None:
-        state, event = alarm_transition(None, failed=True, failure_class='other',
-                                        threshold=1, at='t0')
-        self.assertEqual(event['reason'], 'threshold')
-        # Caller did not mark alertedClass (spool failed): next failure retries.
-        _state, event = alarm_transition(state, failed=True, failure_class='other',
-                                         threshold=1, at='t1')
-        self.assertEqual(event['reason'], 'threshold')
-
-    def test_seed_from_history_on_first_state(self) -> None:
-        _state, event = alarm_transition(None, failed=True, failure_class='auth_failed',
-                                         threshold=3, at='t', seed_streak=4)
-        self.assertEqual(event['reason'], 'threshold')
-        self.assertEqual(event['consecutiveFailures'], 4)
 
     def test_trailing_failures(self) -> None:
         history = [{'status': 'failed'}, {'status': 'success'}, {'status': 'failed'},
                    'junk', {'status': 'timeout'}]
         self.assertEqual(trailing_failures(history), 2)
-        self.assertEqual(trailing_failures(None), 0)
+
+
+def stamp(minutes: int) -> str:
+    return f'2026-01-{1 + minutes // 1440:02d}T{(minutes // 60) % 24:02d}:{minutes % 60:02d}:00Z'
+
+
+class TaskTransition(unittest.TestCase):
+    def drive(self, classes: list[str | None], start: int = 0, prev=None):
+        state, reasons = prev, []
+        for offset, cls in enumerate(classes):
+            state, event = task_transition(state, failed=cls is not None, failure_class=cls,
+                                           threshold=3, at=stamp(start + offset))
+            reasons.append(event and event['reason'])
+        return state, reasons
+
+    def test_alerts_once_per_streak(self) -> None:
+        _state, reasons = self.drive(['auth_failed'] * 8)
+        self.assertEqual(reasons.count('threshold'), 1)
+        self.assertEqual(reasons, [None, None, 'threshold'] + [None] * 5)
+
+    def test_flapping_exit_codes_do_not_realert_within_24h(self) -> None:
+        _state, reasons = self.drive(['other', 'cli_missing'] * 10)
+        self.assertEqual([r for r in reasons if r], ['threshold'])
+
+    def test_flapping_timeout_other_never_realerts(self) -> None:
+        state, reasons = self.drive(['timeout', 'other'] * 5)
+        self.assertEqual([r for r in reasons if r], ['threshold'])
+        _state, reasons = self.drive(['timeout', 'other'] * 5, start=3000, prev=state)
+        self.assertEqual([r for r in reasons if r], [])
+
+    def test_escalation_to_auth_realerts_at_most_once_per_24h(self) -> None:
+        state, reasons = self.drive(['other'] * 3 + ['auth_failed'])
+        self.assertEqual(reasons, [None, None, 'threshold', None])  # cooldown
+        state, reasons = self.drive(['auth_failed'], start=3 + 1440, prev=state)
+        self.assertEqual(reasons, ['class-change'])
+        state, reasons = self.drive(['cli_missing', 'auth_failed'], start=3 + 1441, prev=state)
+        self.assertEqual(reasons, [None, None])
+
+    def test_recovery_once(self) -> None:
+        _state, reasons = self.drive(['other'] * 3 + [None, None])
+        self.assertEqual(reasons, [None, None, 'threshold', 'recovered', None])
+
+    def test_seed(self) -> None:
+        _state, event = task_transition(None, failed=True, failure_class='auth_failed',
+                                        threshold=3, at=stamp(0), seed_streak=4)
+        self.assertEqual((event['reason'], event['consecutiveFailures']), ('threshold', 4))
+
+
+class NodeTransition(unittest.TestCase):
+    def drive(self, runs: list[tuple[str, str | None]], prev=None):
+        state, reasons = prev, []
+        for offset, (task_id, cls) in enumerate(runs):
+            state, event = node_transition(state, task_id=task_id, failed=cls is not None,
+                                           failure_class=cls, threshold=3, at=stamp(offset))
+            reasons.append(event and event['reason'])
+        return state, reasons
+
+    def test_needs_two_distinct_tasks(self) -> None:
+        _state, reasons = self.drive([('a', 'auth_failed')] * 6)
+        self.assertEqual([r for r in reasons if r], [])
+
+    def test_once_per_streak_even_with_class_changes(self) -> None:
+        _state, reasons = self.drive([('a', 'auth_failed'), ('b', 'other')] * 5)
+        self.assertEqual([r for r in reasons if r], ['threshold'])
+
+    def test_non_member_success_neither_clears_nor_announces(self) -> None:
+        state, reasons = self.drive([('a', 'auth_failed'), ('b', 'auth_failed'),
+                                     ('c', 'auth_failed'), ('healthy', None)])
+        self.assertEqual(reasons, [None, None, 'threshold', None])
+        _state, reasons = self.drive([('b', None)], prev=state)
+        self.assertEqual(reasons, ['recovered'])
+
+    def test_no_recovery_notice_without_alert(self) -> None:
+        _state, reasons = self.drive([('a', 'other'), ('b', 'other'), ('a', None)])
+        self.assertEqual([r for r in reasons if r], [])
 
 
 class AlarmText(unittest.TestCase):
-    def test_text_names_class_and_node_scope(self) -> None:
-        events = {
-            'task': {'reason': 'threshold', 'consecutiveFailures': 3, 'failureClass': 'auth_failed'},
-            NODE_PROMPT_KEY: {'reason': 'threshold', 'consecutiveFailures': 3,
-                              'failureClass': 'auth_failed'},
-        }
-        text = alarm_text('probe', events, '2026-08-05T00:00:00Z')
-        self.assertIn('class=auth_failed', text)
-        self.assertIn('task probe failed 3 consecutive runs', text)
-        self.assertIn('last prompt success: 2026-08-05T00:00:00Z', text)
-        self.assertIn('re-authenticated', text)
-        self.assertIn('failureAlertAfter=0', text)
+    def test_task_auth_hint_does_not_claim_every_prompt_task(self) -> None:
+        event = {'reason': 'threshold', 'consecutiveFailures': 3, 'failureClass': 'auth_failed'}
+        text = alarm_text('probe', event, None, None)
+        self.assertIn('task probe failed 3 consecutive runs, class=auth_failed', text)
+        self.assertNotIn('every prompt task', text)
 
-    def test_recovery_text(self) -> None:
-        events = {'task': {'reason': 'recovered', 'consecutiveFailures': 4, 'failureClass': 'other'}}
-        text = alarm_text('probe', events, None)
-        self.assertIn('cleared: task probe succeeded after 4 consecutive failures', text)
-        self.assertNotIn('failureAlertAfter', text)
+    def test_node_text_names_tasks(self) -> None:
+        event = {'reason': 'threshold', 'consecutiveFailures': 3, 'failureClass': 'auth_failed',
+                 'taskIds': ['a', 'b', 'c']}
+        text = alarm_text('c', None, event, '2026-08-05T00:00:00Z')
+        self.assertIn('across 3 tasks (a, b, c)', text)
+        self.assertIn('last prompt success: 2026-08-05T00:00:00Z', text)
+
+
+FAKE_RUNNER = textwrap.dedent('''
+    import json, os, sys
+    modes = json.load(open(os.environ["FAKE_MODES"]))
+    mode = modes.get(sys.argv[-1], "ok")
+    if mode == "ok":
+        print("fine"); sys.exit(0)
+    if mode == "auth":
+        sys.stderr.write(%r); sys.exit(1)
+    codes = {"exit1": 1, "exit127": 127, "exit124": 124}
+    sys.stderr.write("boom\\n"); sys.exit(codes[mode])
+''') % AUTH_STDERR
+
+
+class Sandbox:
+    """Temporary HOME/store/spool; the environment is built from scratch."""
+
+    def __init__(self, task_ids: list[str], extra_tasks: list[dict] | None = None) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = Path(self._dir.name)
+        self.store = self.root / 'home' / 'state' / 'tasks.json'
+        self.store.parent.mkdir(parents=True)
+        self.spool = self.root / 'spool'
+        self.modes = self.root / 'modes.json'
+        runner = self.root / 'fake_runner.py'
+        runner.write_text(FAKE_RUNNER, encoding='utf-8')
+        tasks = [{'id': tid, 'schedule': '* * * * *', 'prompt': tid, 'enabled': True,
+                  'notify': 'none', 'lastRunAt': '2026-01-01T00:00:00Z'} for tid in task_ids]
+        tasks += extra_tasks or []
+        self.store.write_text(json.dumps({'version': 1, 'tasks': tasks}), encoding='utf-8')
+        self.env = {
+            'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+            'TMPDIR': str(self.root),
+            'HOME': str(self.root / 'home'),
+            'LANG': 'C.UTF-8',
+            'CCC_AGENT_CRON_STORE': str(self.store),
+            'CCC_PUSH_SPOOL': str(self.spool),
+            'CCC_HEADLESS_CMD': f'{sys.executable} {runner}',
+            'FAKE_MODES': str(self.modes),
+        }
+        self.minute = 0
+
+    def close(self) -> None:
+        self._dir.cleanup()
+
+    def run(self, task_id: str, mode: str, advance: int = 1) -> dict:
+        self.minute += advance
+        self.modes.write_text(json.dumps({task_id: mode}), encoding='utf-8')
+        proc = subprocess.run(
+            [sys.executable, str(HERE / 'agent_cron.py'), 'run', task_id, '--json',
+             '--at', stamp(self.minute)],
+            env=self.env, capture_output=True, text=True, timeout=120,
+        )
+        result = json.loads(proc.stdout)
+        result['_stderr'] = proc.stderr
+        return result
+
+    def alarms(self) -> list[dict]:
+        return [json.loads(p.read_text()) for p in sorted(self.spool.glob('*-alarm.json'))]
+
+    def alarm_state(self) -> dict:
+        return json.loads((self.store.parent / 'failure-alarm.json').read_text())
+
+
+class Integration(unittest.TestCase):
+    def sandbox(self, task_ids: list[str], **kwargs) -> Sandbox:
+        box = Sandbox(task_ids, **kwargs)
+        self.addCleanup(box.close)
+        return box
+
+    def test_two_tasks_with_different_classes_do_not_storm(self) -> None:
+        # Review finding 1: 8 alarms in 10 runs before the fix.
+        box = self.sandbox(['a', 'b'])
+        for _ in range(5):
+            box.run('a', 'auth')
+            box.run('b', 'exit1')
+        reasons = [r for alarm in box.alarms() for r in alarm['reasons']]
+        self.assertEqual(sorted(reasons), ['node=threshold', 'task=threshold', 'task=threshold'])
+        self.assertLessEqual(len(box.alarms()), 3)
+
+    def test_per_task_class_flapping_is_bounded(self) -> None:
+        # Review finding 2: exit 1 <-> 127 alerted on every run.
+        box = self.sandbox(['flappy'])
+        for _ in range(5):
+            box.run('flappy', 'exit1')
+            box.run('flappy', 'exit127')
+        self.assertEqual(len(box.alarms()), 1)
+        box.run('flappy', 'exit127', advance=25 * 60)
+        self.assertEqual(len(box.alarms()), 2)
+        self.assertEqual(box.alarms()[-1]['reasons'], ['task=class-change'])
+        for _ in range(4):
+            box.run('flappy', 'exit124')
+            box.run('flappy', 'exit1')
+        self.assertEqual(len(box.alarms()), 2)
+
+    def test_one_broken_one_healthy_task_is_one_alarm_total(self) -> None:
+        # Review finding 3: alarm/"cleared" pair every cycle forever.
+        box = self.sandbox(['broken', 'healthy'])
+        for _ in range(10):
+            box.run('broken', 'auth')
+            box.run('healthy', 'ok')
+        alarms = box.alarms()
+        self.assertEqual([a['reasons'] for a in alarms], [['task=threshold']])
+        self.assertNotIn('every prompt task', alarms[0]['text'])
+        self.assertNotIn('node', alarms[0]['text'].split('\n')[0])
+
+    def test_state_write_failure_fails_quiet(self) -> None:
+        # Review finding 5: spool-before-save alerted on every run.
+        box = self.sandbox(['a'])
+        (box.store.parent / 'failure-alarm.json').mkdir()
+        results = [box.run('a', 'auth') for _ in range(6)]
+        self.assertEqual(box.alarms(), [])
+        self.assertTrue(all(r['failureAlarm']['state'] == 'state-write-failed' for r in results))
+        self.assertTrue(results[-1]['failureAlarm']['alertSuppressed'])
+        self.assertIn('alert suppressed', results[-1]['_stderr'])
+
+    def test_incident_shape_alerts_once_and_recovers_once(self) -> None:
+        box = self.sandbox(['t1', 't2', 't3', 't4', 'other-ok'])
+        for tid in ('t1', 't2', 't3', 't4'):
+            box.run(tid, 'auth')
+        self.assertEqual([a['reasons'] for a in box.alarms()], [['node=threshold']])
+        self.assertIn('across 3 tasks (t1, t2, t3)', box.alarms()[0]['text'])
+        box.run('other-ok', 'ok')  # not part of the streak: stays silent
+        self.assertEqual(len(box.alarms()), 1)
+        box.run('t2', 'ok')
+        self.assertEqual(box.alarms()[-1]['reasons'], ['node=recovered'])
+        box.run('t3', 'ok')
+        self.assertEqual(len(box.alarms()), 2)
+
+    def test_opted_out_task_is_excluded_from_node_counter(self) -> None:
+        box = self.sandbox(['a'], extra_tasks=[
+            {'id': 'quiet', 'schedule': '* * * * *', 'prompt': 'quiet', 'enabled': True,
+             'notify': 'none', 'failureAlertAfter': 0, 'lastRunAt': '2026-01-01T00:00:00Z'}])
+        for _ in range(3):
+            box.run('quiet', 'auth')
+            box.run('a', 'auth')
+        # 'a' alone reaches its own threshold; 'quiet' never counts anywhere.
+        self.assertEqual([a['reasons'] for a in box.alarms()], [['task=threshold']])
+        self.assertEqual(box.alarms()[0]['taskId'], 'a')
+
+    def test_task_store_stays_valid_under_pre_1821_schema(self) -> None:
+        # Review finding 4: reverting must not brick the scheduler.
+        box = self.sandbox(['a', 'b'])
+        for mode in ('auth', 'exit127', 'ok', 'exit124'):
+            box.run('a', mode)
+            box.run('b', mode)
+        old_schema = json.loads((HERE / 'testdata' /
+                                 'agent-cron-task-store.pre-1821.schema.json').read_text())
+        store = json.loads(box.store.read_text())
+        self.assertEqual(agent_cron_schema._validate_node(store, old_schema, ''), [])
+        self.assertNotIn('failureClass', box.store.read_text())
+        self.assertNotIn('lastSuccessAt', box.store.read_text())
+        # Acceptance (a): the per-run class lives in the alarm state instead.
+        runs = box.alarm_state()['tasks']['a']['runs']
+        self.assertEqual([r.get('failureClass') for r in runs],
+                         ['auth_failed', 'cli_missing', None, 'timeout'])
+        self.assertEqual(box.alarm_state()['tasks']['a']['lastSuccessAt'], stamp(5))
+        self.assertNotIn('boom', json.dumps(box.alarm_state()))
 
 
 if __name__ == '__main__':

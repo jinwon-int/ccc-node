@@ -131,46 +131,70 @@ formatting applies to existing command tasks such as `adapter-fleet-watch` and
 
 ## Failure classes and the consecutive-failure alarm (#1821)
 
-Every non-success run records a bounded `failureClass` in its `runHistory`
-entry — `auth_failed`, `cli_missing`, `timeout`, or `other` — derived from the
-exit code and a fixed pattern scan of the captured output. Only the enum is
-stored; stdout/stderr never enter the task store. `timeout` covers status
-`timeout` and exit 124; `cli_missing` covers exit 126/127 and a runner that
-could not be spawned; `auth_failed` matches provider login errors such as
-`"error":"authentication_failed"`, `Not logged in`, or an invalid/expired key.
-A successful run also records `lastSuccessAt` on the task, because the bounded
-`runHistory` can lose the last success during a long failing streak.
+Every non-success run gets a bounded `failureClass` — `auth_failed`,
+`cli_missing`, `timeout`, or `other` — from the exit code, the runner spawn
+error, and stderr only (never stdout or the model's result text). `timeout` is
+status `timeout` or exit 124; `cli_missing` is exit 126/127 or a runner that
+could not be spawned; `auth_failed` matches provider login errors on the
+runner's own stderr (`authentication_failed`, `Not logged in`, invalid/expired
+key, `401 … Unauthorized`), and inside the stdout block that `ccc-headless`
+echoes to stderr only an unescaped `"error":"authentication_failed"` field.
 
-After **N consecutive failures** (default 3) the runner spools **one**
-owner-only `AgentCronFailureAlarm` entry through the same bridge push spool as
-`notify=telegram-owner`. Two streaks are tracked in the sidecar
-`failure-alarm.json` next to the store:
+**Nothing new is written to `tasks.json`.** The per-run class ledger (`runs`,
+bounded to 50), each task's `lastSuccessAt`, and the alarm counters live in
+`failure-alarm.json` next to the store (0600, updated under the store lock).
+The task store therefore stays valid under the pre-#1821 schema, so reverting
+this feature cannot make the scheduler (including the self-update task) refuse
+its own store. The only new task field is the operator-set, optional
+`failureAlertAfter`; remove it from tasks before reverting.
 
-- `task:<id>` — this task's own consecutive failures;
-- `node:prompt` — consecutive prompt-task failures across **all** tasks, reset
-  by any prompt success. This catches the incident shape where several
-  different one-shot prompt tasks each failed once on a broken login.
+Two counters, each bounded so no pattern of outcomes alerts on every run:
 
-Each streak alerts once at the Nth failure, again only when its failure class
-changes, and once more (a recovery notice) on the next success. Both streaks
-firing on the same run produce a single message. The text carries only the
-task id, class, counts, and timestamps — never run output.
+- **Task counter** — the task's own consecutive failures. One owner alarm when
+  it reaches N (default 3). Within the same streak it re-alerts only when the
+  class changes **to** `auth_failed` or `cli_missing`, at most once per 24h;
+  flapping between other classes (exit 1 ↔ 124, timeout ↔ other) stays quiet.
+  One "cleared" notice on the next success.
+- **Node counter** — consecutive prompt-task failures across tasks. One alarm
+  per streak, only when the streak reaches N **and spans at least two distinct
+  tasks** (one broken task is the task counter's job); never re-alerts on a
+  class change. A success by a task outside the streak does not clear an
+  alerted streak; one "cleared" notice when a task that was part of it
+  succeeds. The message names the failing tasks. This catches the incident
+  shape, where four different one-shot prompt tasks each failed once.
 
-**Semantics change:** the alarm fires regardless of the task's `notify`
-setting, including `notify: none`. The incident it fixes was a silent task;
-an opt-in alarm would have stayed silent too. Opt out per task with
-`failureAlertAfter: 0` (`--failure-alert-after 0`; an opted-out task's failures
-also stop feeding the node streak) or node-wide with
-`CCC_AGENT_CRON_FAILURE_ALERT_AFTER=0`; a positive value changes the default N.
-If the spool write fails the key is left un-alerted so the next run retries.
-When a key has no state yet (first run after upgrade) its streak is seeded from
-the existing `runHistory`, so an already-failing node alerts on its next
-failure.
+A run where both counters fire produces one message. Alarms go to the owner
+through the same push spool as `notify=telegram-owner`, carry only task ids,
+classes, counts and timestamps, and never run output. The state is persisted
+with the alert marked sent **before** the spool write: if the state cannot be
+written the alert is suppressed with a stderr warning (failing quiet, not once
+per run); if the spool write fails after that, the one alert is lost.
 
-`ccc-doctor` reports `agent-cron prompt success` as a warning when an enabled
-prompt task's newest run did not succeed and its last success (or, with none
-recorded, its oldest recorded run) is older than D days (default 7,
-`CCC_DOCTOR_AGENT_CRON_STALE_DAYS`). Disabled and command tasks are skipped.
+**Semantics change:** the alarm fires regardless of the task `notify` setting,
+including `notify: none` — the incident was exactly such a silent task. Opt out:
+
+- per task: `failureAlertAfter: 0` (`--failure-alert-after 0`) — the task then
+  feeds neither counter. A positive per-task value sets that task's own N
+  only; the node counter uses the node-wide default;
+- node-wide: `CCC_AGENT_CRON_FAILURE_ALERT_AFTER=0` (a positive value changes
+  the default N for both counters).
+
+Upgrade notes: a counter without state is seeded from existing `runHistory`,
+so tasks already mid-streak alert on their **first** failure after upgrade (a
+one-time burst of at most one message per task plus one node message). Command
+tasks count too: e.g. the self-update task accepts exit 0/8/11, so its exit 3
+(lock held) and 14 (restart/activation failure) are failures and three in a row
+alert once.
+
+`ccc-doctor` reports `agent-cron prompt success` (warning; D = 7 days,
+`CCC_DOCTOR_AGENT_CRON_STALE_DAYS`). It resolves the store exactly like
+agent-cron (`CCC_AGENT_CRON_STORE`, else `~/.claude/state/agent-cron/tasks.json`)
+and reads `lastSuccessAt`/class from `failure-alarm.json`, falling back to
+`runHistory`. Two bounded verdicts: an enabled recurring prompt task whose
+newest run failed and whose last success is older than D days; and a node
+verdict when prompt runs are still being attempted (newest within D days) and
+failing with no prompt success anywhere for more than D days. Disabled and
+one-shot tasks never get a per-task warning, so nothing warns forever.
 
 ## Safety boundaries
 
