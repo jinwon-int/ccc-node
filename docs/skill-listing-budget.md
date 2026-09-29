@@ -72,9 +72,10 @@ key the policy did not create — including `"off"` or `"user-invocable-only"`
 `"skillOverrides": {"<name>": "on"}`.
 
 `settings.json` is re-rendered by `setup.sh` on every self-update; setup
-captures `skillOverrides`, `skillListingBudgetFraction`, and
-`skillListingMaxDescChars` before the render and restores them afterwards
-(template-declared keys would win, as for `model`/`env`), then runs the policy.
+captures every top-level key the repo templates do not declare — including
+`skillOverrides`, `skillListingBudgetFraction`, and `skillListingMaxDescChars`
+(#1920) — before the render and restores them afterwards (template-declared
+keys would win, as for `model`/`env`), then runs the policy.
 
 ## When it runs
 

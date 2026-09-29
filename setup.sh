@@ -461,18 +461,36 @@ restore_node_local_env() { # <settings-path> <env-json>
     return 1
   fi
 }
-# #2011 A: the skill-listing keys are node-local for the same reason. The
-# skill-listing policy (scripts/ccc-skill-listing-policy.py) and operators write
-# skillOverrides / skillListingBudgetFraction / skillListingMaxDescChars into
-# settings.json; a plain re-render would drop them on every self-update tick,
-# and operator-written overrides would be lost for good. Template-declared keys
-# still win (the repo owns anything it ships).
-NODE_LOCAL_SETTINGS_KEYS='["skillOverrides","skillListingBudgetFraction","skillListingMaxDescChars"]'
-read_node_local_keys() { # <settings-path> -> JSON object of the node-local top-level keys present
-  local src="$1"
+# #1920: top-level keys follow the same rule as env. #2011 A had carved out the
+# skill-listing keys (skillOverrides / skillListingBudgetFraction /
+# skillListingMaxDescChars) by name, but every other key a node or the CLI
+# writes (effortLevel via /effort, alwaysThinkingEnabled, modelSettings, ...)
+# still vanished on the next re-render — the third instance of #1235/#1402. So
+# generalize: a top-level key the repo templates (settings.base.json +
+# enforcement-overlay.json) do not declare is node-local by definition and is
+# carried across; template-declared keys stay repo-owned and win. `model` keeps
+# its own handler below (unchanged behavior and log line).
+#
+# If a key is ever REMOVED from the templates, add it to
+# RETIRED_SETTINGS_KEYS in the same change: otherwise nodes that still carry
+# the old repo value would keep it forever as "node-local".
+RETIRED_SETTINGS_KEYS='[]'
+read_node_local_keys() { # <settings-path> <template-path>... -> JSON object of node-local top-level keys
+  local src="$1" owned
+  shift
   [ -f "$src" ] || { printf '{}'; return 0; }
-  jq -c --argjson keys "$NODE_LOCAL_SETTINGS_KEYS" \
-    'with_entries(select(.key as $k | $keys | index($k)))' "$src" 2>/dev/null || printf '{}'
+  # Fail closed: if the templates cannot be read, preserve nothing (old behavior)
+  # rather than treat every key as node-local.
+  owned="$(jq -cn '[inputs | keys[]] | unique' "$@" 2>/dev/null)" || { printf '{}'; return 0; }
+  [ -n "$owned" ] || { printf '{}'; return 0; }
+  jq -c --argjson owned "$owned" --argjson retired "$RETIRED_SETTINGS_KEYS" '
+    if type == "object" then
+      with_entries(select(.key as $k
+        | ($owned | index($k) | not)
+        and ($retired | index($k) | not)
+        and $k != "model"))
+    else {} end
+  ' "$src" 2>/dev/null || printf '{}'
 }
 restore_node_local_keys() { # <settings-path> <keys-json>
   local dest="$1" extra="$2"
@@ -573,7 +591,7 @@ run mkdir -p "$CLAUDE_DIR/hooks" "$CLAUDE_DIR/hooks/lib"
 # unless it was captured first (#1235).
 NODE_LOCAL_MODEL="$(read_node_local_model "$CLAUDE_DIR/settings.json")"
 NODE_LOCAL_ENV="$(read_node_local_env "$CLAUDE_DIR/settings.json" "$SRC/claude/settings.base.json")"
-NODE_LOCAL_KEYS="$(read_node_local_keys "$CLAUDE_DIR/settings.json")"
+NODE_LOCAL_KEYS="$(read_node_local_keys "$CLAUDE_DIR/settings.json" "$SRC/claude/settings.base.json" "$SRC/claude/hooks/enforcement-overlay.json")"
 if [ "$WITH_PLUGIN" = 1 ]; then
   note "plugin mode: lean settings (portable hooks come from the ccc-node plugin)"
   run atomic_install "$SRC/claude/settings.base.json" "$CLAUDE_DIR/settings.json"
