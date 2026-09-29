@@ -331,7 +331,10 @@ cat > "$PIRI_SESS/2026-09-05T09-00-00-1111-2222.jsonl" <<'EOF'
 {"type":"message","id":"a1","timestamp":"2026-09-05T09:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","text":"noise"}]}}
 {"type":"message","id":"a2","timestamp":"2026-09-05T09:00:03.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"ls -la /var/backups | head"}}]}}
 {"type":"message","id":"a3","timestamp":"2026-09-05T09:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"백업 정상입니다"}]}}
+{"type":"message","id":"a4","timestamp":"2026-09-05T09:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"검증 결과를 기록했습니다"}]}}
 EOF
+# (a4 lifts the projection to MIN_TURNS=4: since #1932 a shorter session is
+# a no-budget "not-reviewable" skip, not a "review ok" dispatch.)
 
 run9() {
   env CCC_STATE_DIR="$STATE9" CLAUDE_PROJECTS_DIR="$PROJECTS9" CCC_PUSH_SPOOL="$SPOOL9" \
@@ -639,6 +642,75 @@ ok "#2011: status makes an archive opt-in visible" \
 # shellcheck disable=SC2034  # read via eval inside ok()
 out="$(CCC_STATE_DIR="$STATE13" CCC_SKILL_CURATOR_ENABLED=off bash "$AUTOSAVE" status 2>&1)"
 ok "#2011: status reports a disabled curator" 'printf "%s" "$out" | grep -q "^curator: disabled"'
+
+# --- 14) #1932: unreviewable one-turn transcripts do not consume the budget ---
+# Four one-turn `claude -p` batch transcripts are the newest files; the real
+# multi-turn session is older. Before #1932 the three newest skips filled
+# MAX_SESSIONS=3 and the real session was never drafted.
+STATE14="$TMP/state14"; PROJECTS14="$TMP/projects14"
+mkdir -p "$STATE14"; chmod 700 "$STATE14"
+make_transcript "$PROJECTS14/-root/real-work.jsonl" 6
+touch -d '-2 hours' "$PROJECTS14/-root/real-work.jsonl"
+for n in 1 2 3 4; do
+  make_transcript "$PROJECTS14/-root/batch-$n.jsonl" 1
+  touch -d "-$((5 - n)) minutes" "$PROJECTS14/-root/batch-$n.jsonl"
+done
+run14() {
+  env CCC_STATE_DIR="$STATE14" CLAUDE_PROJECTS_DIR="$PROJECTS14" CCC_PUSH_SPOOL="$TMP/spool14" \
+    CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" SCAN_TOUCH="$TMP/scan14.touched" \
+    CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion14.touched" \
+    CLAUDE_SKILLS_DIR="$TMP/skills14" CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 \
+    CCC_SKILL_AUTOSAVE_MAX_SESSIONS=3 CCC_NODE=testnode bash "$AUTOSAVE" run
+}
+out="$(CCC_STATE_DIR="$STATE14" bash "$AUTOSAVE" status 2>&1)"
+ok "#1932: status shows no drafting review yet" 'printf "%s" "$out" | grep -q "^last drafting review: never"'
+run14
+ok "#1932: the older real session is drafted past the batch transcripts" \
+  'grep -q "review ok session=real-work " "$STATE14/skill-autosave.log"'
+ok "#1932: every one-turn transcript is skipped, not drafted" \
+  '[ "$(grep -c "review skipped session=batch-[1-4] .*reason=not-reviewable" "$STATE14/skill-autosave.log")" = 4 ] && ! grep -q "review ok session=batch-" "$STATE14/skill-autosave.log"'
+ok "#1932: sweep summary separates drafts from skips" \
+  'grep -q "sweep done drafted_sessions=1 .*skipped_unreviewable=4" "$STATE14/skill-autosave.log"'
+ok "#1932: skipped transcripts are ledgered so they are not revisited" \
+  '[ "$(grep -c "^batch-[1-4]	" "$STATE14/skill-autosave.seen")" = 4 ]'
+for _ in $(seq 1 40); do [ -f "$STATE14/skill-review-last.json" ] && break; sleep 0.25; done
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_STATE_DIR="$STATE14" bash "$AUTOSAVE" status 2>&1)"
+ok "#1932: status reports the last real drafting review" \
+  'printf "%s" "$out" | grep -Eq "^last drafting review: [0-9]{4}-[0-9]{2}-[0-9]{2}T"'
+: > "$STATE14/skill-autosave.log"
+run14
+ok "#1932: a rerun revisits neither skips nor drafts" \
+  '! grep -Eq "review (ok|skipped) session=" "$STATE14/skill-autosave.log"'
+
+# --- 15) #1824: MAX_SESSIONS is per branch; the optional total cap bounds the sum
+PROJECTS15="$TMP/projects15"
+make_transcript "$PROJECTS15/-root--work/sess-a.jsonl" 6
+make_transcript "$PROJECTS15/-root--work/sess-b.jsonl" 6
+run15() { # <state> [env...]
+  local st="$1"; shift
+  mkdir -p "$st"; chmod 700 "$st"
+  env CCC_STATE_DIR="$st" CLAUDE_PROJECTS_DIR="$PROJECTS15" CCC_PUSH_SPOOL="$TMP/spool15" \
+    CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+    CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion15.touched" \
+    CCC_SKILL_CODEX_NORMALIZE_CMD="$HERE/codex-rollout-normalize.py" CCC_SKILL_CODEX_DRAFTING=1 \
+    CODEX_HOME="$CODEX_HOME4" CLAUDE_SKILLS_DIR="$TMP/skills15" \
+    CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=0 CCC_SKILL_AUTOSAVE_MAX_SESSIONS=3 CCC_NODE=testnode \
+    "$@" bash "$AUTOSAVE" run
+}
+run15 "$TMP/state15a"
+ok "#1824: without a total cap every branch keeps its own budget" \
+  'grep -q "sweep done drafted_sessions=2 codex_drafted=1 .*total_drafted=3 max_sessions_per_branch=3 total_max_sessions=0" "$TMP/state15a/skill-autosave.log" && ! grep -q "budget-stop" "$TMP/state15a/skill-autosave.log"'
+run15 "$TMP/state15b" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=2
+ok "#1824: the total cap stops later branches once the sum is spent" \
+  'grep -q "sweep done drafted_sessions=2 codex_drafted=0 .*total_drafted=2 .*total_max_sessions=2" "$TMP/state15b/skill-autosave.log"'
+ok "#1824: a capped branch says so instead of looking idle" \
+  'grep -q "codex budget-stop reason=total-max-sessions total_max=2" "$TMP/state15b/skill-autosave.log"'
+ok "#1824: the capped rollout is not ledgered (drafted on a later run)" \
+  '! grep -q "^rollout-2026-08-31T09-00-00-aaaa-bbbb	" "$TMP/state15b/skill-autosave.codex-seen" 2>/dev/null'
+run15 "$TMP/state15c" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=garbage
+ok "#1824: a malformed total cap means no cap" \
+  'grep -q "total_drafted=3 .*total_max_sessions=0" "$TMP/state15c/skill-autosave.log"'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

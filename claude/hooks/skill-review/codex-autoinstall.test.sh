@@ -85,6 +85,7 @@ ok "codex clean draft installed into codex skills dir" '[ -f "$CODEX_SKILLS/code
 ok "codex install never touched claude skills dir" '[ -z "$(ls -A "$CLAUDE_SKILLS" 2>/dev/null)" ]'
 ok "codex v2 install marker written owner-only" 'jq -e ".schema_version == 2 and .installed_by == \"autosave\" and .created_by == \"ccc-node\" and .rollback_eligible == true" "$CODEX_SKILLS/codex-clean-one/.autosave-meta.json" >/dev/null && [ "$(stat -c %a "$CODEX_SKILLS/codex-clean-one/.autosave-meta.json")" = 600 ]'
 ok "codex ledger records install" 'jq -e "select(.event==\"install\") | .name == \"codex-clean-one\" and .trigger == \"test\"" "$STATE/skill-autosave-install.jsonl" >/dev/null'
+ok "#1823: codex ledger row carries provider=codex" 'jq -e "select(.event==\"install\" and .name==\"codex-clean-one\") | .provider == \"codex\"" "$STATE/skill-autosave-install.jsonl" >/dev/null'
 ok "codex draft archived as installed" 'ls -d "$PENDING/20260101-000000-a-clean.installed-"* >/dev/null 2>&1'
 ok "codex post-hoc notification queued" 'ls "$SPOOL"/*SkillAutoInstall*.json >/dev/null 2>&1'
 # Freshly created codex skills dir is owner-only (holds on root/non-root/Termux).

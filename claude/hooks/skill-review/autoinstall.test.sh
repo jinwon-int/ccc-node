@@ -75,6 +75,7 @@ out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOSAVE_TRIGGER=test
 ok "clean draft installed" '[ -f "$SKILLS/clean-one/SKILL.md" ]'
 ok "v2 install marker written owner-only" 'jq -e ".schema_version == 2 and .installed_by == \"autosave\" and .created_by == \"ccc-node\" and .rollback_eligible == true" "$SKILLS/clean-one/.autosave-meta.json" >/dev/null && [ "$(stat -c %a "$SKILLS/clean-one/.autosave-meta.json")" = 600 ]'
 ok "ledger records installed-by=autosave" 'jq -e "select(.event==\"install\") | .installed_by == \"autosave\" and .name == \"clean-one\" and .trigger == \"test\"" "$STATE/skill-autosave-install.jsonl" >/dev/null'
+ok "#1823: install ledger row carries the provider" 'jq -e "select(.event==\"install\" and .name==\"clean-one\") | .provider == \"claude\"" "$STATE/skill-autosave-install.jsonl" >/dev/null'
 ok "draft archived as installed" 'ls -d "$PENDING/20260101-000000-a-clean-one.installed-"* >/dev/null 2>&1'
 ok "summary lists installed name" 'jq -e ".installed == [\"clean-one\"]" >/dev/null <<<"$out"'
 ok "post-hoc notification queued" 'ls "$SPOOL"/*SkillAutoInstall*.json >/dev/null 2>&1'
@@ -386,6 +387,7 @@ out="$(run_auto bash "$AUTO" rollback clean-one)"
 ok "rollback removes the skill" '[ ! -e "$SKILLS/clean-one" ]'
 ok "rollback archives, not deletes" 'ls -d "$STATE/skill-autosave-rollback/clean-one."* >/dev/null 2>&1'
 ok "rollback appends ledger event" 'jq -e "select(.event==\"rollback\") | .name == \"clean-one\"" "$STATE/skill-autosave-install.jsonl" >/dev/null'
+ok "#1823: rollback ledger row carries the provider" 'jq -e "select(.event==\"rollback\" and .name==\"clean-one\") | .provider == \"claude\"" "$STATE/skill-autosave-install.jsonl" >/dev/null'
 
 mkdir -p "$SKILLS/hand-made"
 printf -- '---\nname: hand-made\ndescription: Operator-authored skill that autosave must never touch at all.\n---\n\n# Hand\n' \
@@ -612,6 +614,8 @@ ok "summary reports distinct routed providers" 'jq -e ".providers | sort == [\"c
 ok "summary has no singular provider when the run is mixed" 'jq -e ".provider == null" >/dev/null <<<"$out"'
 ok "ledger records both installs" \
   'jq -s -e "[.[] | select(.event==\"install\") | .name] | sort == [\"route-base-skill\",\"route-piri-skill\"]" "$STATE_ROUTE/skill-autosave-install.jsonl" >/dev/null'
+ok "#1823: each ledger row records its routed provider" \
+  'jq -s -e "[.[] | select(.event==\"install\") | {(.name): .provider}] | add == {\"route-base-skill\":\"claude\",\"route-piri-skill\":\"piri\"}" "$STATE_ROUTE/skill-autosave-install.jsonl" >/dev/null'
 
 # A piri-routed draft with a Claude-only coupling stays pending (compat screen
 # follows the routed provider, not the process provider).

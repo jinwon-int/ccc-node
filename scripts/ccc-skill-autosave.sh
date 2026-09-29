@@ -26,8 +26,10 @@
 #   - Off-switch: touch ~/.claude/state/skill-autosave.disabled
 #     (skill-review's own skill-review.disabled off-switch is honored too).
 #   - Cost-bounded: at most CCC_SKILL_AUTOSAVE_MAX_SESSIONS transcripts are
-#     drafted per run; a ledger prevents re-drafting a transcript that has not
-#     grown since it was last processed.
+#     drafted per run PER BRANCH (claude/codex/piri/danso each have their own
+#     counter, #1824); the optional CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS caps
+#     the sum across branches. A ledger prevents re-drafting a transcript that
+#     has not grown since it was last processed.
 set -uo pipefail
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
@@ -72,8 +74,20 @@ WINDOW_DAYS="${CCC_SKILL_AUTOSAVE_WINDOW_DAYS:-2}"
 REGROWTH_BYTES="${CCC_SKILL_AUTOSAVE_REGROWTH_BYTES:-16384}"
 NOTIFY="${CCC_SKILL_AUTOSAVE_NOTIFY:-1}"
 case "$MAX_SESSIONS" in ''|*[!0-9]*) MAX_SESSIONS=3 ;; esac
+# #1824: MAX_SESSIONS is a per-branch budget, so N enabled branches can draft
+# up to N x MAX_SESSIONS per run. This optional cross-branch cap (0/unset = no
+# cap, the historical behavior) bounds the sum; branches run in the fixed
+# order claude, codex, piri, danso and each stops once the sum reaches it.
+TOTAL_MAX_SESSIONS="${CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS:-0}"
+case "$TOTAL_MAX_SESSIONS" in ''|*[!0-9]*) TOTAL_MAX_SESSIONS=0 ;; esac
 case "$WINDOW_DAYS" in ''|*[!0-9]*) WINDOW_DAYS=2 ;; esac
 case "$REGROWTH_BYTES" in ''|*[!0-9]*) REGROWTH_BYTES=16384 ;; esac
+# #1932: skill-review.sh returns this code (CCC_SKILL_REVIEW_SKIP_RC) when it
+# skips a transcript as not reviewable (too few turns). Such a skip is ledgered
+# so it is not revisited, but it never counts against MAX_SESSIONS: one-turn
+# `claude -p` batch transcripts (memory QA, the drafting call itself) are the
+# newest files every evening and used to fill the whole budget silently.
+REVIEW_SKIP_RC=3
 
 mkdir -p "$STATE_DIR" "$PENDING_DIR" 2>/dev/null
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -201,6 +215,14 @@ if [ "$MODE" = "status" ]; then
     echo "curator: disabled (CCC_SKILL_CURATOR_ENABLED=${CCC_SKILL_CURATOR_ENABLED:-})"
   fi
   echo "pending skill drafts: $(pending_count)"
+  # #1932: sweeps can report drafted_sessions>0 every day while no transcript
+  # ever reaches the drafting LLM. skill-review-last.json is written only after
+  # a real drafting call, so its age is the honest "is drafting alive" signal.
+  last_review="never"
+  if [ -f "$STATE_DIR/skill-review-last.json" ]; then
+    last_review="$(date -u -r "$STATE_DIR/skill-review-last.json" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+  fi
+  echo "last drafting review: $last_review (skill-review-last.json; stale while sweeps log 'review ok' = drafting is stalled, #1932)"
   # Presence only, never the value (#1766): absent on a publisher is exactly the
   # wiring gap that stalled six intake PRs, so it has to be visible at a glance.
   echo "a2a edge env: $([ -f "$EDGE_ENV" ] && echo present || echo absent) ($EDGE_ENV — exports A2A_EDGE_SECRET for the 2d intake review dispatch; publisher only)"
@@ -251,6 +273,18 @@ fi
 
 # --- 2) draft skills from recent, unprocessed transcripts --------------------
 drafted=0
+codex_drafted=0
+piri_drafted=0
+danso_drafted=0
+skipped_unreviewable=0
+# #1824: true once the optional cross-branch cap is spent; logs which branch
+# stopped so a capped run is distinguishable from an idle one.
+total_budget_spent() { # <branch-label>
+  [ "$TOTAL_MAX_SESSIONS" -gt 0 ] || return 1
+  [ $((drafted + codex_drafted + piri_drafted + danso_drafted)) -ge "$TOTAL_MAX_SESSIONS" ] || return 1
+  log "$1 budget-stop reason=total-max-sessions total_max=$TOTAL_MAX_SESSIONS"
+  return 0
+}
 if [ ! -f "$REVIEW" ]; then
   log "review skipped reason=no-skill-review path=$REVIEW"
 elif [ -f "$STATE_DIR/skill-review.disabled" ]; then
@@ -260,6 +294,7 @@ else
   before="$(pending_count)"
   while IFS= read -r transcript; do
     [ "$drafted" -ge "$MAX_SESSIONS" ] && break
+    total_budget_spent review && break
     [ -f "$transcript" ] || continue
     sid="$(basename "$transcript" .jsonl)"
     size="$(wc -c < "$transcript" 2>/dev/null | tr -d '[:space:]')"
@@ -271,15 +306,23 @@ else
     fi
     # skill-review.sh derives cwd/project from the transcript path itself; the
     # "manual" trigger bypasses its hook cooldown (this sweep budgets itself).
-    if jq -nc --arg sid "$sid" --arg tp "$transcript" \
+    review_rc=0
+    jq -nc --arg sid "$sid" --arg tp "$transcript" \
         '{session_id:$sid, transcript_path:$tp}' 2>/dev/null \
-        | CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" bash "$REVIEW" manual >>"$LOG" 2>&1; then
-      drafted=$((drafted + 1))
+        | CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" CCC_SKILL_REVIEW_SKIP_RC="$REVIEW_SKIP_RC" \
+            bash "$REVIEW" manual >>"$LOG" 2>&1 || review_rc=$?
+    if [ "$review_rc" = 0 ] || [ "$review_rc" = "$REVIEW_SKIP_RC" ]; then
       tmp="$LEDGER.tmp.$$"
       { awk -F'\t' -v s="$sid" '$1!=s' "$LEDGER" 2>/dev/null;
         printf '%s\t%s\t%s\n' "$sid" "$(ts)" "$size"; } > "$tmp" 2>/dev/null \
         && mv "$tmp" "$LEDGER" 2>/dev/null
+    fi
+    if [ "$review_rc" = 0 ]; then
+      drafted=$((drafted + 1))
       log "review ok session=$sid size=$size"
+    elif [ "$review_rc" = "$REVIEW_SKIP_RC" ]; then
+      skipped_unreviewable=$((skipped_unreviewable + 1))
+      log "review skipped session=$sid size=$size reason=not-reviewable (no budget used)"
     else
       log "review failed session=$sid (non-fatal)"
     fi
@@ -334,6 +377,7 @@ else
     }
     while IFS= read -r rollout; do
       [ "$codex_drafted" -ge "$MAX_SESSIONS" ] && break
+      total_budget_spent codex && break
       [ -f "$rollout" ] || continue
       sid="$(basename "$rollout" .jsonl)"
       size="$(wc -c < "$rollout" 2>/dev/null | tr -d '[:space:]')"
@@ -367,15 +411,22 @@ else
       # its project discovery at the normalized tree, and the shared
       # CCC_SKILL_REVIEW_STATE_DIR keeps the pending queue and the autoinstall
       # daily-cap ledger summed across both branches (#1353).
-      if jq -nc --arg sid "$sid" --arg tp "$out_path" \
+      review_rc=0
+      jq -nc --arg sid "$sid" --arg tp "$out_path" \
           '{session_id:$sid, transcript_path:$tp}' 2>/dev/null \
           | env CCC_SKILL_PROVIDER=codex \
                 CLAUDE_PROJECTS_DIR="$codex_tree" \
                 CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" \
-                bash "$REVIEW" manual >>"$LOG" 2>&1; then
+                CCC_SKILL_REVIEW_SKIP_RC="$REVIEW_SKIP_RC" \
+                bash "$REVIEW" manual >>"$LOG" 2>&1 || review_rc=$?
+      if [ "$review_rc" = 0 ]; then
         codex_drafted=$((codex_drafted + 1))
         codex_record_ledger "$sid" "$size"
         log "codex review ok session=$sid size=$size"
+      elif [ "$review_rc" = "$REVIEW_SKIP_RC" ]; then
+        skipped_unreviewable=$((skipped_unreviewable + 1))
+        codex_record_ledger "$sid" "$size"
+        log "codex review skipped session=$sid size=$size reason=not-reviewable (no budget used)"
       else
         log "codex review failed session=$sid (non-fatal)"
       fi
@@ -430,6 +481,7 @@ else
     }
     while IFS= read -r session; do
       [ "$piri_drafted" -ge "$MAX_SESSIONS" ] && break
+      total_budget_spent piri && break
       [ -f "$session" ] || continue
       sid="$(basename "$session" .jsonl)"
       size="$(wc -c < "$session" 2>/dev/null | tr -d '[:space:]')"
@@ -455,15 +507,22 @@ else
       # its project discovery at the normalized tree, and the shared
       # CCC_SKILL_REVIEW_STATE_DIR keeps the pending queue and the autoinstall
       # daily-cap ledger summed across all branches (codex #1353 precedent).
-      if jq -nc --arg sid "$sid" --arg tp "$out_path" \
+      review_rc=0
+      jq -nc --arg sid "$sid" --arg tp "$out_path" \
           '{session_id:$sid, transcript_path:$tp}' 2>/dev/null \
           | env CCC_SKILL_PROVIDER=piri \
                 CLAUDE_PROJECTS_DIR="$piri_tree" \
                 CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" \
-                bash "$REVIEW" manual >>"$LOG" 2>&1; then
+                CCC_SKILL_REVIEW_SKIP_RC="$REVIEW_SKIP_RC" \
+                bash "$REVIEW" manual >>"$LOG" 2>&1 || review_rc=$?
+      if [ "$review_rc" = 0 ]; then
         piri_drafted=$((piri_drafted + 1))
         piri_record_ledger "$sid" "$size"
         log "piri review ok session=$sid size=$size"
+      elif [ "$review_rc" = "$REVIEW_SKIP_RC" ]; then
+        skipped_unreviewable=$((skipped_unreviewable + 1))
+        piri_record_ledger "$sid" "$size"
+        log "piri review skipped session=$sid size=$size reason=not-reviewable (no budget used)"
       else
         log "piri review failed session=$sid (non-fatal)"
       fi
@@ -514,6 +573,7 @@ else
       }
       while IFS= read -r journal; do
         [ "$danso_drafted" -ge "$MAX_SESSIONS" ] && break
+        total_budget_spent danso && break
         [ -f "$journal" ] || continue
         jid="$(basename "$journal" .jsonl)"
         size="$(wc -c < "$journal" 2>/dev/null | tr -d '[:space:]')"
@@ -546,15 +606,22 @@ else
         # CCC_SKILL_PROVIDER; the shared CCC_SKILL_REVIEW_STATE_DIR keeps the
         # pending queue and the autoinstall daily-cap ledger summed across all
         # branches (codex #1353, piri #1652 precedent).
-        if jq -nc --arg sid "$jid" --arg tp "$out_path" \
+        review_rc=0
+        jq -nc --arg sid "$jid" --arg tp "$out_path" \
             '{session_id:$sid, transcript_path:$tp}' 2>/dev/null \
             | env CCC_SKILL_PROVIDER=danso \
                   CLAUDE_PROJECTS_DIR="$danso_tree" \
                   CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" \
-                  bash "$REVIEW" manual >>"$LOG" 2>&1; then
+                  CCC_SKILL_REVIEW_SKIP_RC="$REVIEW_SKIP_RC" \
+                  bash "$REVIEW" manual >>"$LOG" 2>&1 || review_rc=$?
+        if [ "$review_rc" = 0 ]; then
           danso_drafted=$((danso_drafted + 1))
           danso_record_ledger "$jid" "$size"
           log "danso review ok session=$jid size=$size"
+        elif [ "$review_rc" = "$REVIEW_SKIP_RC" ]; then
+          skipped_unreviewable=$((skipped_unreviewable + 1))
+          danso_record_ledger "$jid" "$size"
+          log "danso review skipped session=$jid size=$size reason=not-reviewable (no budget used)"
         else
           log "danso review failed session=$jid (non-fatal)"
         fi
@@ -585,7 +652,7 @@ else
     done
   fi
   after="$(pending_count)"
-  log "sweep done drafted_sessions=$drafted codex_drafted=$codex_drafted piri_drafted=$piri_drafted danso_drafted=$danso_drafted pending_before=$before pending_after=$after"
+  log "sweep done drafted_sessions=$drafted codex_drafted=$codex_drafted piri_drafted=$piri_drafted danso_drafted=$danso_drafted pending_before=$before pending_after=$after skipped_unreviewable=$skipped_unreviewable total_drafted=$((drafted + codex_drafted + piri_drafted + danso_drafted)) max_sessions_per_branch=$MAX_SESSIONS total_max_sessions=$TOTAL_MAX_SESSIONS"
 fi
 
 # --- 2b) auto mode (#355): machine-gate + install passing drafts -------------

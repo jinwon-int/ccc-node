@@ -800,10 +800,14 @@ do_run() {
       fi
       continue
     fi
+    # provider (#1823): the routed install lane, so per-provider accounting
+    # reads the ledger instead of guessing from session_id prefixes.
     rec="$(jq -nc --arg ts "$(ts)" --arg id "$id" --arg name "$name" \
       --arg path "$dest/SKILL.md" --arg sid "$sid" --arg sha "$sha" --arg trg "$TRIGGER" \
+      --arg provider "$SKILL_PROVIDER" \
       '{event:"install", ts:$ts, id:$id, name:$name, path:$path,
-        session_id:$sid, sha256:$sha, installed_by:"autosave", trigger:$trg}')"
+        session_id:$sid, sha256:$sha, installed_by:"autosave", trigger:$trg,
+        provider:$provider}')"
     printf '%s\n' "$rec" >> "$LEDGER" 2>/dev/null || true
     if [ -f "$dir/meta.json" ]; then
       jq --arg at "$(ts)" '.status="installed" | .installed_by="autosave" | .installed_at=$at' \
@@ -890,8 +894,8 @@ rollback_one() { # <name>
   fi
   arch="$(jq -r '.archive_path // empty' <<<"$archive_json" 2>/dev/null)"
   [ -n "$arch" ] || { echo "rollback: archive result missing for $name" >&2; return 1; }
-  jq -nc --arg ts "$(ts)" --arg name "$name" --arg arch "$arch" \
-    '{event:"rollback", ts:$ts, name:$name, archived_to:$arch}' >> "$LEDGER" 2>/dev/null || true
+  jq -nc --arg ts "$(ts)" --arg name "$name" --arg arch "$arch" --arg provider "$SKILL_PROVIDER" \
+    '{event:"rollback", ts:$ts, name:$name, archived_to:$arch, provider:$provider}' >> "$LEDGER" 2>/dev/null || true
   log "rollback name=$name archived_to=$arch"
   echo "rolled back: $name -> $arch"
   return 0
@@ -1113,8 +1117,9 @@ do_apply() {
       sid="$(jq -r '.provenance.source_thread_hash // empty' "$proposal" 2>/dev/null)"
       rec="$(jq -nc --arg ts "$(ts)" --arg id "$(basename "$dir")" --arg name "$name" \
         --arg path "$dest/SKILL.md" --arg sid "$sid" --arg sha "$sha" --arg trg "$TRIGGER" \
+        --arg provider "$SKILL_PROVIDER" \
         '{event:"install",ts:$ts,id:$id,name:$name,path:$path,session_id:$sid,
-          sha256:$sha,installed_by:"approved",trigger:$trg}')"
+          sha256:$sha,installed_by:"approved",trigger:$trg,provider:$provider}')"
       printf '%s\n' "$rec" >> "$LEDGER" 2>/dev/null || true
       result="$(jq -nc --arg name "$name" --arg sha "$sha" \
         '{ok:true,command:"apply",action:"create",changed:true,name:$name,sha256:$sha}')"

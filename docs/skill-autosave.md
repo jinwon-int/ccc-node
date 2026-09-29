@@ -168,8 +168,11 @@ in, the sweep runs a **codex branch** right after the Claude draft loop:
    daily-cap ledger stay shared (`CCC_SKILL_REVIEW_STATE_DIR`), so install
    counts sum across both branches.
 3. A separate regrowth ledger (`skill-autosave.codex-seen`, same 16 KiB
-   semantics and `MAX_SESSIONS` per-run budget as the Claude branch) prevents
-   re-processing unchanged rollouts.
+   semantics as the Claude branch) prevents re-processing unchanged rollouts.
+   The branch has its **own** `MAX_SESSIONS` per-run budget (not shared with
+   the Claude branch, #1824); only the pending queue and the autoinstall
+   daily cap are shared. `CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS` bounds the
+   cross-branch sum when set.
 
 **Opt in** with `CCC_SKILL_CODEX_DRAFTING=1` (or `1` in
 `<CCC_STATE_DIR>/skill-autosave.codex-drafting`). Default is off: nodes without
@@ -415,7 +418,13 @@ surface + enforced authoring standards + after-the-fact visibility:
 Passing drafts are installed to `~/.claude/skills/<name>/` immediately and
 recorded in the `installed-by=autosave` ledger
 (`~/.claude/state/skill-autosave-install.jsonl`) plus an in-dir
-owner-only `.autosave-meta.json` v2 provenance marker. Failing drafts are
+owner-only `.autosave-meta.json` v2 provenance marker. Every ledger row
+(`install` from the auto and owner-approved paths, and `rollback`) carries the
+routed install lane as `provider` (claude|codex|piri|danso) from #1823 on.
+Rows written before that change have no `provider` and cannot be backfilled:
+per-provider counts over them are inferred (a `rollout-` session_id prefix is
+the codex branch; the draft `meta.json` provider exists only for drafts staged
+after #1654) and must be labelled as such. Failing drafts are
 **never dropped**: they stay
 in the pending queue with an `autosave-block.json` reason and keep the normal
 human review path. The Telegram push becomes a post-hoc notice ("스킬 자동
@@ -945,8 +954,14 @@ touch ~/.claude/state/skill-autosave.disabled  # off-switch (sweep)
 touch ~/.claude/state/skill-review.disabled    # off-switch (drafting pipeline)
 ```
 
-Tuning (env): `CCC_SKILL_AUTOSAVE_MAX_SESSIONS` (default 3 transcripts/run —
-each drafting run is an LLM call), `CCC_SKILL_AUTOSAVE_WINDOW_DAYS` (2),
+Tuning (env): `CCC_SKILL_AUTOSAVE_MAX_SESSIONS` (default 3 transcripts/run
+**per drafting branch** — each drafting run is an LLM call; claude, codex, piri
+and danso each keep their own counter, so a node with N enabled branches can
+draft up to N×3 per run, #1824), `CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS`
+(default 0 = no cross-branch cap; when set, the sum over all branches stops at
+this value — branches run claude → codex → piri → danso and a capped branch
+logs `<branch> budget-stop reason=total-max-sessions`; the sweep summary always
+reports `total_drafted=`), `CCC_SKILL_AUTOSAVE_WINDOW_DAYS` (2),
 `CCC_SKILL_AUTOSAVE_REGROWTH_BYTES` (16384 — a long-lived bridge transcript is
 re-reviewed only after growing this much), `CCC_SKILL_AUTOSAVE_NOTIFY` (1),
 `CCC_SKILL_AUTOSAVE_SETTLE_SECONDS` (90), `CCC_SKILL_AUTOSAVE_MODE`
@@ -956,6 +971,19 @@ auto-detect — selects the install surface), `CODEX_SKILLS_DIR` (Codex install
 target override, default `${CODEX_HOME:-~/.codex}/skills`),
 `CCC_CODEX_SKILL_COLLECTOR` (Codex-only candidate collection, default true),
 `CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP` (default 1, range 1–10).
+
+Budget accounting (#1932): `MAX_SESSIONS` counts only transcripts that were
+actually dispatched to the drafting pipeline. The sweep asks `skill-review.sh`
+for a distinct exit code (`CCC_SKILL_REVIEW_SKIP_RC`; hooks keep exit 0) when it
+skips a transcript as not reviewable (fewer than `CCC_SKILL_REVIEW_MIN_TURNS`
+turns). Such transcripts — typically one-turn `claude -p` batch output such as
+memory-QA calls or the drafting call itself, which are always the newest files
+— are ledgered (so they are not revisited until they grow) and logged as
+`review skipped … reason=not-reviewable (no budget used)`, and the sweep
+summary reports them as `skipped_unreviewable=N`. `status` prints
+`last drafting review:` (mtime of `skill-review-last.json`, written only after
+a real drafting LLM call): a stale value while sweeps keep logging `review ok`
+means drafting is silently stalled.
 
 Neutral drafting LLM (#1654): `extract.sh` normally drafts through
 `claude -p --model haiku`. On nodes without the claude CLI (piri/codex lanes,
