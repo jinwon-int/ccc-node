@@ -158,7 +158,8 @@ out="$(printf '%s' "$CAP_PAYLOAD" | CCC_DISTILL_MAX_WIKI_CANDS=1 bash "$WIKI_QUE
 ok "cap env override to 1" '[ "$rc" = 0 ] && grep -q "total_in=5 truncated(cap)=4" <<<"$out"'
 
 # Dedup TTL env: a row last seen 10 days ago survives with TTL=30 (dedup hit)
-# but is expired by the default 7-day TTL (fresh add).
+# and with the default permanent ledger (#1885), but is expired by an explicit
+# 7-day TTL (fresh add).
 rm -rf "$CCC_STATE_DIR"
 mkdir -p "$CCC_STATE_DIR"
 TTL_PAYLOAD='{"session_id":"sess-ttl","trigger":"manual","wiki_candidates":[
@@ -173,7 +174,16 @@ ok "TTL=30 keeps 10-day-old row (dedup hit)" 'grep -q "added=0 skipped(dup)=1 to
 awk -v e="$OLD_EPOCH" '{print e, e, 1, $4}' "$CCC_STATE_DIR/wiki-candidates.seen" > "$CCC_STATE_DIR/wiki-candidates.seen.tmp" \
   && mv "$CCC_STATE_DIR/wiki-candidates.seen.tmp" "$CCC_STATE_DIR/wiki-candidates.seen"
 out="$(printf '%s' "$TTL_PAYLOAD" | bash "$WIKI_QUEUE" 2>&1)"
-ok "default 7-day TTL expires 10-day-old row (fresh add)" 'grep -q "added=1 skipped(dup)=0 total_in=1" <<<"$out"'
+ok "default permanent ledger keeps 10-day-old row (dedup hit, #1885)" 'grep -q "added=0 skipped(dup)=1 total_in=1" <<<"$out"'
+ANCIENT_EPOCH=$(( $(date -u +%s) - 400*24*3600 ))
+awk -v e="$ANCIENT_EPOCH" '{print e, e, 1, $4}' "$CCC_STATE_DIR/wiki-candidates.seen" > "$CCC_STATE_DIR/wiki-candidates.seen.tmp" \
+  && mv "$CCC_STATE_DIR/wiki-candidates.seen.tmp" "$CCC_STATE_DIR/wiki-candidates.seen"
+out="$(printf '%s' "$TTL_PAYLOAD" | CCC_DISTILL_SEEN_TTL_DAYS=0 bash "$WIKI_QUEUE" 2>&1)"
+ok "TTL=0 is permanent: 400-day-old row still dedups (#1885)" 'grep -q "added=0 skipped(dup)=1 total_in=1" <<<"$out"'
+awk -v e="$OLD_EPOCH" '{print e, e, 1, $4}' "$CCC_STATE_DIR/wiki-candidates.seen" > "$CCC_STATE_DIR/wiki-candidates.seen.tmp" \
+  && mv "$CCC_STATE_DIR/wiki-candidates.seen.tmp" "$CCC_STATE_DIR/wiki-candidates.seen"
+out="$(printf '%s' "$TTL_PAYLOAD" | CCC_DISTILL_SEEN_TTL_DAYS=7 bash "$WIKI_QUEUE" 2>&1)"
+ok "explicit 7-day TTL expires 10-day-old row (fresh add)" 'grep -q "added=1 skipped(dup)=0 total_in=1" <<<"$out"'
 
 # --compact: retroactive backlog dedup. Build a queue with the dungae-style
 # pattern: three pending #82 variants (one HOT-displayed), one merged #82, and

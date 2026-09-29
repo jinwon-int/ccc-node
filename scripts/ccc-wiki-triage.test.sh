@@ -66,5 +66,54 @@ out="$(CCC_STATE_DIR="$state2" bash "$ROOT/scripts/ccc-wiki-triage.sh" show CAND
 rc=$?
 ok "triage leaves ordinary prose intact" '[ "$rc" = 0 ] && grep -q "broker tunnel is documented" <<<"$out" && jq -e ".candidate.redaction_applied == false" <<<"$out" >/dev/null'
 
+# #1885: every producer writes a `- source-session: ...` provenance line, and
+# SECRET_LINE's `session[:=]` matched its label, so EVERY candidate was
+# redacted and the reviewer never saw the source session. Build one entry with
+# the real distill producer (locks the producer/consumer contract) plus the
+# nunchi/cost-ledger shapes; only the label is exempt, not the value.
+state3="$TMP/state3"; mkdir -p "$state3"
+printf '%s' '{"session_id":"3f2a9c1e-7b4d-4e5f-9a0b-1c2d3e4f5a6b","trigger":"session-end","wiki_candidates":[{"title":"Source session stays visible","suggested_path":"pages/log.md","summary":"ordinary fact"}],"honcho":[]}' \
+  | CCC_STATE_DIR="$state3" CCC_NODE_ISOLATION_PROFILE=fleet CCC_WIKI_MEMORY_ENABLED=1 \
+    bash "$ROOT/claude/hooks/distill/wiki-queue.sh" >/dev/null 2>&1
+{
+  echo
+  echo '## [CAND-2] 2026-09-29 — nunchi promoted fact'
+  echo '- source-session: `nunchi-wiki-promote/unscoped` (trigger=#1447-p3-8)'
+  echo '- status: pending'
+  echo
+  echo '## [CAND-3] 2026-09-29 — cost ledger rollup'
+  echo '- source-session: `cost-ledger-weekly` (machine, node=testnode)'
+  echo '- status: pending'
+  echo
+  echo '## [CAND-4] 2026-09-29 — secret in the value'
+  echo '- source-session: session=should_not_print_value'
+  echo '- status: pending'
+  echo
+  echo '## [CAND-5] 2026-09-29 — token in the value'
+  echo "- source-session: \`$gh_tok\` (trigger=manual)"
+  echo
+  echo '## [CAND-6] 2026-09-29 — labelled session secret in prose'
+  echo 'cookie was set, session: should_not_print_prose'
+} >> "$state3/wiki-candidates.md"
+
+out="$(CCC_STATE_DIR="$state3" bash "$ROOT/scripts/ccc-wiki-triage.sh" show '[CAND-1]')"; rc=$?
+ok "show exposes the distill source-session line, redaction_applied=false (#1885)" \
+  '[ "$rc" = 0 ] && grep -q "source-session: \`3f2a9c1e-7b4d-4e5f-9a0b-1c2d3e4f5a6b\` (trigger=session-end)" <<<"$out" && jq -e ".candidate.redaction_applied == false" <<<"$out" >/dev/null'
+out="$(CCC_STATE_DIR="$state3" bash "$ROOT/scripts/ccc-wiki-triage.sh" list)"; rc=$?
+ok "nunchi and cost-ledger source-session lines are not redacted (#1885)" \
+  '[ "$rc" = 0 ] && jq -e "[.candidates[] | select(.id == \"[CAND-2]\" or .id == \"[CAND-3]\") | .redaction_applied] == [false, false]" <<<"$out" >/dev/null'
+out="$(CCC_STATE_DIR="$state3" bash "$ROOT/scripts/ccc-wiki-triage.sh" show '[CAND-4]')"; rc=$?
+ok "a session= secret in the source-session VALUE is still redacted (#1885)" \
+  '[ "$rc" = 0 ] && ! grep -q "should_not_print_value" <<<"$out" && jq -e ".candidate.redaction_applied == true" <<<"$out" >/dev/null'
+out="$(CCC_STATE_DIR="$state3" bash "$ROOT/scripts/ccc-wiki-triage.sh" show '[CAND-5]')"; rc=$?
+ok "a token shape in the source-session value is still redacted (#1885)" \
+  '[ "$rc" = 0 ] && ! grep -q "$gh_tok" <<<"$out" && jq -e ".candidate.redaction_applied == true" <<<"$out" >/dev/null'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_STATE_DIR="$state3" bash "$ROOT/scripts/ccc-wiki-triage.sh" show '[CAND-6]')"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "session: elsewhere in a candidate still redacts (#1885)" \
+  '[ "$rc" = 0 ] && ! grep -q "should_not_print_prose" <<<"$out" && jq -e ".candidate.redaction_applied == true" <<<"$out" >/dev/null'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
