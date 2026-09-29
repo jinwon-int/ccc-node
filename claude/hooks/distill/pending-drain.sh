@@ -24,6 +24,14 @@ case "$MAX_INFLIGHT" in ''|*[!0-9]*) MAX_INFLIGHT=3 ;; esac
 [ "$MAX_BATCH" -gt 0 ] || exit 0
 mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 
+# Same size-based rotation as distill.sh (#1882) — this SessionStart launcher is
+# the other entry that appends to distill.log without passing through distill.sh.
+_drain_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../lib" 2>/dev/null && pwd)" || _drain_lib_dir=""
+# shellcheck source=claude/hooks/lib/log-rotate.sh
+if [ -n "$_drain_lib_dir" ] && [ -r "$_drain_lib_dir/log-rotate.sh" ] && . "$_drain_lib_dir/log-rotate.sh" 2>/dev/null; then
+  ccc_rotate_log_if_large "$LOG" "${CCC_DISTILL_LOG_MAX_BYTES:-10485760}" "${CCC_DISTILL_LOG_KEEP:-2}"
+fi
+
 log() { printf '%s [pending-drain] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" 2>/dev/null >> "$LOG" || :; }
 
 if [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ]; then

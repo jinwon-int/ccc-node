@@ -44,6 +44,12 @@ LOG="$STATE_DIR/distill.log"
 PENDING_DIR="$STATE_DIR/distill-pending"
 umask 077
 mkdir -p "$STATE_DIR" 2>/dev/null
+# Size-based rotation before the first append of this run (#1882): the log was
+# append-only forever. Defaults 10 MiB x 2 kept generations (.1/.2, gzip'd).
+# shellcheck source=claude/hooks/lib/log-rotate.sh
+if [ -r "$DISTILL_LIB_DIR/lib/log-rotate.sh" ] && . "$DISTILL_LIB_DIR/lib/log-rotate.sh" 2>/dev/null; then
+  ccc_rotate_log_if_large "$LOG" "${CCC_DISTILL_LOG_MAX_BYTES:-10485760}" "${CCC_DISTILL_LOG_KEEP:-2}"
+fi
 
 if [ -f "$STATE_DIR/distill.disabled" ]; then
   printf '%s skipped reason=disabled trigger=%s\n' \
