@@ -56,6 +56,16 @@ OPT_PROMOTION_PROVIDERS=""
 # baked into the entry itself, exactly like the #1655 provider lane.
 OPT_DANSO_DRAFTING=0
 OPT_DANSO_STATE_DIR=""
+# #1867: a re-run without the lane flags used to re-render the managed block
+# from scratch and silently drop the provider/drafting/state-dir env the
+# previous install baked (a piri node lost CCC_SKILL_PROVIDER=piri and
+# CCC_SKILL_PIRI_DRAFTING=1; piri drafting then skipped as not-enabled for nine
+# days). Lane settings found in the existing entry are now carried forward
+# unless an explicit flag/env overrides them; --reset-lane drops them on
+# purpose. Same failure class as the sync-cron baking loss fixed by #1705.
+OPT_RESET_LANE=0
+PRESERVED_LANE=()
+HISTORY="$STATE_DIR/skill-autosave-cron.history.jsonl"
 
 # Shared installer libs (#1081, #1077): gen stamps + records, and the common
 # crontab install/remove driver.
@@ -205,6 +215,12 @@ Options:
                    the sweep. PATH must be absolute and must not contain a
                    double quote, dollar, backtick, or backslash (it is baked
                    inside a double-quoted segment of the cron line).
+  --reset-lane     Do not carry lane settings forward from the existing entry.
+                   By default a re-run keeps CCC_SKILL_PROVIDER,
+                   CCC_SKILL_{PIRI,CODEX,DANSO}_DRAFTING, CCC_DANSO_STATE_DIR
+                   and CCC_SKILL_PROMOTION_PROVIDERS already baked into the
+                   managed entry unless a flag (or inherited env) sets them
+                   (#1867); preserved values are reported on stderr.
   --promotion-providers LIST
                    Bake CCC_SKILL_PROMOTION_PROVIDERS=LIST (comma-separated,
                    each of claude|codex|piri) into the entry so scheduled
@@ -224,6 +240,8 @@ tests; normal installs auto-detect both.
 EOF
 }
 
+# #1867: the operator's literal argv, kept for the render history below.
+INVOKED_ARGV=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) APPLY=0 ;;
@@ -241,6 +259,7 @@ while [ $# -gt 0 ]; do
     --piri-drafting) OPT_PIRI_DRAFTING=1 ;;
     --codex-drafting) OPT_CODEX_DRAFTING=1 ;;
     --danso-drafting) OPT_DANSO_DRAFTING=1 ;;
+    --reset-lane) OPT_RESET_LANE=1 ;;
     --danso-state-dir)
       ccc_cron_need_val "$1" "${2:-}"
       OPT_DANSO_STATE_DIR="$2"
@@ -270,6 +289,29 @@ if [ ! -f "$AUTOSAVE" ] && [ -f "$ROOT/scripts/ccc-skill-autosave.sh" ]; then
 fi
 
 FLEET_NODE="$(resolve_fleet_node)"
+
+# #1867: the lane env baked into the current managed entry (block entry line or
+# a legacy bare marker line). Read-only; empty on --remove/--reset-lane or when
+# no crontab/entry exists.
+EXISTING_ENTRY=""
+if [ "$REMOVE" != 1 ] && [ "$OPT_RESET_LANE" != 1 ]; then
+  EXISTING_ENTRY="$({ "$CRONTAB" -l 2>/dev/null || true; } | grep -F -- "$MARKER" || true)"
+fi
+baked_value() { # <KEY> — value of KEY="v" / KEY=v in the existing entry
+  [ -n "$EXISTING_ENTRY" ] || return 0
+  printf '%s\n' "$EXISTING_ENTRY" \
+    | grep -oE "(^|[ '])$1=(\"[^\"]*\"|[^ \"']+)" \
+    | head -1 | sed -E "s/^[ ']?$1=//; s/^\"(.*)\"\$/\\1/" || true
+}
+provider_list_ok() { # <comma list> — each member in the promoter vocabulary
+  local _item _items
+  [ -n "$1" ] || return 1
+  IFS=',' read -ra _items <<<"$1"
+  for _item in "${_items[@]}"; do
+    case "$_item" in claude|codex|piri|danso) ;; *) return 1 ;; esac
+  done
+  return 0
+}
 # #1655: --provider > inherited \$CCC_SKILL_PROVIDER > none (auto-detect).
 CRON_PROVIDER="$OPT_PROVIDER"
 if [ -z "$CRON_PROVIDER" ] && [ -n "${CCC_SKILL_PROVIDER:-}" ]; then
@@ -277,6 +319,20 @@ if [ -z "$CRON_PROVIDER" ] && [ -n "${CCC_SKILL_PROVIDER:-}" ]; then
     claude|codex|piri) CRON_PROVIDER="$CCC_SKILL_PROVIDER" ;;
   esac
 fi
+if [ -z "$CRON_PROVIDER" ]; then
+  _baked="$(baked_value CCC_SKILL_PROVIDER)"
+  case "$_baked" in
+    claude|codex|piri|danso) CRON_PROVIDER="$_baked"; PRESERVED_LANE+=("CCC_SKILL_PROVIDER=$_baked") ;;
+  esac
+fi
+for _lane in PIRI CODEX DANSO; do
+  _opt="OPT_${_lane}_DRAFTING"
+  if [ "${!_opt}" != 1 ] && [ "$(baked_value "CCC_SKILL_${_lane}_DRAFTING")" = 1 ]; then
+    printf -v "$_opt" '%s' 1
+    PRESERVED_LANE+=("CCC_SKILL_${_lane}_DRAFTING=1")
+  fi
+done
+unset _baked _lane _opt
 CRON_ENV=""
 if [ -n "$FLEET_NODE" ]; then
   CRON_ENV="CCC_NODE=\"$FLEET_NODE\" CCC_CLAUDE_DIR=\"$CLAUDE_DIR\""
@@ -320,6 +376,14 @@ elif [ -n "${CCC_DANSO_STATE_DIR:-}" ]; then
     echo "WARNING: ignoring invalid inherited CCC_DANSO_STATE_DIR (absolute path; no quote, dollar, backtick, or backslash)." >&2
   fi
 fi
+if [ -z "$CRON_DANSO_STATE_DIR" ]; then
+  _baked="$(baked_value CCC_DANSO_STATE_DIR)"
+  if [ -n "$_baked" ] && danso_state_dir_ok "$_baked"; then
+    CRON_DANSO_STATE_DIR="$_baked"
+    PRESERVED_LANE+=("CCC_DANSO_STATE_DIR=$_baked")
+  fi
+  unset _baked
+fi
 if [ "$CRON_PROVIDER" = "danso" ] && [ -z "$CRON_DANSO_STATE_DIR" ]; then
   echo "WARNING: danso lane without a state dir: the scheduled sweep will fail closed" >&2
   echo "         (DANSO_SKILLS_DIR/CCC_DANSO_STATE_DIR unset, #1659). Pass --danso-state-dir." >&2
@@ -339,6 +403,18 @@ if [ -z "$CRON_PROMOTION_PROVIDERS" ] && [ -n "${CCC_SKILL_PROMOTION_PROVIDERS:-
   done
   [ "$_pp_inherit_ok" = 1 ] && CRON_PROMOTION_PROVIDERS="$CCC_SKILL_PROMOTION_PROVIDERS"
   unset _pp_inherit_ok _pp_parts _pp
+fi
+if [ -z "$CRON_PROMOTION_PROVIDERS" ]; then
+  _baked="$(baked_value CCC_SKILL_PROMOTION_PROVIDERS)"
+  if provider_list_ok "$_baked"; then
+    CRON_PROMOTION_PROVIDERS="$_baked"
+    PRESERVED_LANE+=("CCC_SKILL_PROMOTION_PROVIDERS=$_baked")
+  fi
+  unset _baked
+fi
+if [ "${#PRESERVED_LANE[@]}" -gt 0 ]; then
+  echo "NOTICE: kept lane settings baked into the existing entry (#1867): ${PRESERVED_LANE[*]}" >&2
+  echo "        Pass explicit flags to change them, or --reset-lane to drop them." >&2
 fi
 [ -n "$CRON_PROMOTION_PROVIDERS" ] && CRON_ENV="$CRON_ENV CCC_SKILL_PROMOTION_PROVIDERS=\"$CRON_PROMOTION_PROVIDERS\""
 CRON_LINE="$SCHEDULE bash -lc '$CRON_ENV \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
@@ -365,3 +441,21 @@ ccc_cron_installer_finish \
   --apply "$APPLY" --remove "$REMOVE" --schedule-desc "$SCHEDULE" \
   --body "$(printf 'CRON_TZ=%s\n%s' "$LOCAL_TIMEZONE" "$CRON_LINE")" -- \
   "${record_argv[@]}"
+
+# #1867: append-only render history. The install record above keeps only the
+# latest invocation (for self-update replay); this log answers "when, and with
+# which argv, did the managed block lose/gain a lane setting". Best-effort.
+if [ "$APPLY" = 1 ] && command -v jq >/dev/null 2>&1; then
+  if [ "$REMOVE" = 1 ]; then _action=remove; else _action=install; fi
+  { [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR"; } 2>/dev/null \
+    && ( umask 077
+         jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg action "$_action" \
+           --arg gen "$GEN" --arg reset "$OPT_RESET_LANE" \
+           --argjson preserved "$(printf '%s\n' "${PRESERVED_LANE[@]:-}" | jq -R . | jq -sc 'map(select(length>0))')" \
+           --argjson argv "$(printf '%s\n' "${record_argv[@]}" | jq -R . | jq -sc .)" \
+           --argjson invoked "$(printf '%s\n' "${INVOKED_ARGV[@]:-}" | jq -R . | jq -sc 'map(select(length>0))')" \
+           '{ts:$ts, action:$action, gen:$gen, reset_lane:($reset=="1"), preserved:$preserved, invoked:$invoked, argv:$argv}' \
+           >> "$HISTORY" ) 2>/dev/null \
+    || echo "WARNING: render history append failed ($HISTORY)" >&2
+  unset _action
+fi

@@ -263,6 +263,7 @@ okc "$RC" 2 "double-quote --danso-state-dir exits 2"
 ok "double-quote danso state dir is reported" 'grep -q "invalid --danso-state-dir" "$OUT"'
 run bash "$SC" --danso-state-dir '/tmp/$y'
 okc "$RC" 2 "dollar --danso-state-dir exits 2"
+rm -f "$CRON_STORE"
 run env CCC_DANSO_STATE_DIR='not-absolute' bash "$SC" --apply
 okc "$RC" 0 "invalid inherited danso state dir does not block install"
 ok "invalid inherited danso state dir warns" 'grep -q "ignoring invalid inherited CCC_DANSO_STATE_DIR" "$OUT"'
@@ -288,6 +289,66 @@ rm -f "$CRON_STORE"
 run env CCC_SKILL_PROMOTION_PROVIDERS=danso bash "$SC" --apply
 ok "danso promotion providers inherited from env" \
   'grep -qF "CCC_SKILL_PROMOTION_PROVIDERS=\"danso\"" "$CRON_STORE"'
+
+# --- #1867: a re-run keeps the lane settings baked into the existing entry ---
+# A piri node: the lane (provider + drafting) was baked, a later re-run without
+# the flags re-rendered the block from scratch, and piri drafting then skipped
+# as not-enabled for nine days with nothing but routine log lines.
+rm -f "$CRON_STORE" "$CCC_STATE_DIR/skill-autosave-cron.history.jsonl"
+run bash "$SC" --apply --provider piri --piri-drafting --promotion-providers claude,piri
+okc "$RC" 0 "#1867: piri lane install applies"
+run env -u CCC_SKILL_PROVIDER -u CCC_SKILL_PROMOTION_PROVIDERS bash "$SC" --apply
+okc "$RC" 0 "#1867: flagless re-run applies"
+ok "#1867: re-run keeps the baked provider" 'grep -qF "CCC_SKILL_PROVIDER=\"piri\"" "$CRON_STORE"'
+ok "#1867: re-run keeps the baked drafting opt-in" 'grep -qF "CCC_SKILL_PIRI_DRAFTING=1" "$CRON_STORE"'
+ok "#1867: re-run keeps the baked promotion providers" 'grep -qF "CCC_SKILL_PROMOTION_PROVIDERS=\"claude,piri\"" "$CRON_STORE"'
+ok "#1867: preserved settings are reported, not silent" \
+  'grep -q "kept lane settings baked into the existing entry" "$OUT" && grep -q "CCC_SKILL_PIRI_DRAFTING=1" "$OUT"'
+ok "#1867: record argv materializes the preserved lane for self-update replay" \
+  'jq -e "[(.argv | index(\"--provider\")), (.argv | index(\"piri\")), (.argv | index(\"--piri-drafting\")), (.argv | index(\"claude,piri\"))] | all(. != null)" "$REC" >/dev/null'
+ok "#1867: still a single managed entry" '[ "$(grep -c "$MARKER" "$CRON_STORE")" = 1 ]'
+
+# An explicit flag still wins over the preserved value.
+run bash "$SC" --apply --provider claude
+ok "#1867: an explicit --provider overrides the baked one" \
+  'grep -qF "CCC_SKILL_PROVIDER=\"claude\"" "$CRON_STORE" && ! grep -qF "CCC_SKILL_PROVIDER=\"piri\"" "$CRON_STORE"'
+ok "#1867: drafting opt-in survives a provider change" 'grep -qF "CCC_SKILL_PIRI_DRAFTING=1" "$CRON_STORE"'
+
+# Dry-run previews the preserved lane without writing.
+cp "$CRON_STORE" "$TMP/crontab.before"
+run bash "$SC"
+ok "#1867: dry-run previews the preserved lane" 'grep -q "CCC_SKILL_PIRI_DRAFTING=1" "$OUT" && cmp -s "$CRON_STORE" "$TMP/crontab.before"'
+
+# --reset-lane drops the baked lane deliberately.
+run env -u CCC_SKILL_PROVIDER -u CCC_SKILL_PROMOTION_PROVIDERS bash "$SC" --apply --reset-lane
+okc "$RC" 0 "#1867: --reset-lane applies"
+ok "#1867: --reset-lane drops every baked lane setting" \
+  '! grep -qE "CCC_SKILL_PROVIDER=|CCC_SKILL_PIRI_DRAFTING|CCC_SKILL_PROMOTION_PROVIDERS" "$CRON_STORE"'
+ok "#1867: --reset-lane reports nothing preserved" '! grep -q "kept lane settings" "$OUT"'
+
+# danso state dir + drafting are carried forward; a hand-edited unquoted value
+# is read too, and an unsafe baked state dir is never re-baked.
+rm -f "$CRON_STORE"
+run bash "$SC" --apply --provider danso --danso-state-dir /var/lib/ccc-danso/node-a --danso-drafting
+run env -u CCC_DANSO_STATE_DIR bash "$SC" --apply
+ok "#1867: danso state dir and drafting survive a flagless re-run" \
+  'grep -qF "CCC_DANSO_STATE_DIR=\"/var/lib/ccc-danso/node-a\"" "$CRON_STORE" && grep -qF "CCC_SKILL_DANSO_DRAFTING=1" "$CRON_STORE" && grep -qF "CCC_SKILL_PROVIDER=\"danso\"" "$CRON_STORE"'
+ok "#1867: preserved danso state dir suppresses the absence warning" '! grep -q "danso lane without a state dir" "$OUT"'
+printf '%s\n' "30 22 * * * bash -lc 'CCC_CLAUDE_DIR=/x CCC_SKILL_PROVIDER=piri CCC_SKILL_CODEX_DRAFTING=1 CCC_DANSO_STATE_DIR=relative/x \"/x/ccc-skill-autosave.sh\" run'  $MARKER gen=h_old" > "$CRON_STORE"
+run env -u CCC_DANSO_STATE_DIR bash "$SC" --apply
+ok "#1867: legacy/hand-edited unquoted lane values are preserved" \
+  'grep -qF "CCC_SKILL_PROVIDER=\"piri\"" "$CRON_STORE" && grep -qF "CCC_SKILL_CODEX_DRAFTING=1" "$CRON_STORE"'
+ok "#1867: an unsafe baked danso state dir is not carried forward" '! grep -qF "relative/x" "$CRON_STORE"'
+
+# Append-only render history (the install record keeps only the latest argv).
+# shellcheck disable=SC2034  # $HIST is consumed via eval in ok()
+HIST="$CCC_STATE_DIR/skill-autosave-cron.history.jsonl"
+ok "#1867: every apply appends a render history row" '[ "$(wc -l < "$HIST")" -ge 6 ]'
+ok "#1867: history rows carry ts, argv and the preserved keys" \
+  'tail -1 "$HIST" | jq -e ".action == \"install\" and (.ts | length > 0) and (.argv | index(\"--apply\") != null) and (.preserved | index(\"CCC_SKILL_PROVIDER=piri\") != null) and (.invoked == [\"--apply\"])" >/dev/null'
+ok "#1867: history file is owner-only" '[ "$(stat -c %a "$HIST")" = 600 ]'
+run bash "$SC" --remove --apply
+ok "#1867: removal is recorded in the history" 'tail -1 "$HIST" | jq -e ".action == \"remove\"" >/dev/null'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
