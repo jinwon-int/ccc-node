@@ -748,6 +748,92 @@ cat > "$TMP/seed/setup.sh" <<'SH'
 echo "setup ran at $(git rev-parse --short HEAD)" >> "${SETUP_MARKER:?}"
 SH
 
+# --- 8b) #1961: linked / agent worktrees in the managed checkout defer --------
+# A fleet node, 2026-09-24: four Agent(isolation: worktree) trees under
+# <checkout>/.claude/worktrees vanished after a tick fast-forwarded the live
+# checkout. The run must DEFER (exit 8) without touching the tree whenever the
+# checkout has a linked worktree or a non-empty .claude/worktrees — including
+# one hidden from `git status` by .git/info/exclude — and a clean checkout
+# must still update normally.
+[ -f "$CLAUDE/self-update.services" ] && cp "$CLAUDE/self-update.services" "$TMP/services.pre1961"
+printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
+cp "$REPO/.git/info/exclude" "$TMP/exclude.pre1961" 2>/dev/null || : > "$TMP/exclude.pre1961"
+echo wt-gate > "$TMP/seed/wt-gate.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm wt-gate && git -C "$TMP/seed" push -q origin main
+# shellcheck disable=SC2034  # read via eval inside ok()
+wt_before="$(git -C "$REPO" rev-parse HEAD)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+wt_target="$(git -C "$TMP/seed" rev-parse HEAD)"
+touch "$SETUP_MARKER"
+wt_setup_lines="$(wc -l < "$SETUP_MARKER")"
+wt_untouched() { # HEAD, setup marker and service restarts all unchanged
+  [ "$(git -C "$REPO" rev-parse HEAD)" = "$wt_before" ] \
+    && [ "$(wc -l < "$SETUP_MARKER")" = "$wt_setup_lines" ] \
+    && [ ! -s "$TMP/systemctl.calls" ]
+}
+
+# (1) a linked worktree (outside the checkout) with work in it.
+git -C "$REPO" worktree add -q -b wt-gate-dev "$TMP/dev-wt" HEAD
+echo wip > "$TMP/dev-wt/wip.txt"
+: > "$TMP/systemctl.calls"; rm -f "$TMP/spool"/*.json; : > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#1961 linked worktree defers (rc 8)" '[ "$rc" = 8 ] && grep -q "deferring" <<<"$out"'
+ok "#1961 defer message names the linked worktree path" 'grep -qF "$TMP/dev-wt" <<<"$out"'
+ok "#1961 linked-worktree defer touches nothing" 'wt_untouched && [ -f "$TMP/dev-wt/wip.txt" ] && [ -z "$(git -C "$REPO" status --porcelain)" ]'
+ok "#1961 defer is logged with reason and path" \
+  'grep "deferred reason=agent-worktrees" "$STATE/self-update.log" | grep -qF "$TMP/dev-wt"'
+ok "#1961 defer notifies the owner with the path" \
+  'jq -r .dedup "$TMP/spool"/*SelfUpdate*.json | grep -qx "SelfUpdate:deferred-worktrees" && jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -qF "$TMP/dev-wt"'
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "#1961 --force does not bypass the worktree defer" '[ "$rc" = 8 ] && wt_untouched && [ -f "$TMP/dev-wt/wip.txt" ]'
+git -C "$REPO" worktree remove --force "$TMP/dev-wt"
+git -C "$REPO" branch -qD wt-gate-dev
+# An unreadable worktree list cannot prove the checkout is safe: defer too.
+mkdir -p "$TMP/gitfail"
+printf '#!/usr/bin/env bash\ncase " $* " in *" worktree list "*) exit 1 ;; esac\nexec %q "$@"\n' "$(command -v git)" > "$TMP/gitfail/git"
+chmod +x "$TMP/gitfail/git"
+: > "$STATE/self-update.log"
+out="$(PATH="$TMP/gitfail:$PATH" run_selfup run 2>&1)"; rc=$?
+ok "#1961 failed worktree listing defers (rc 8) and touches nothing" \
+  '[ "$rc" = 8 ] && grep -q "cannot list worktrees" <<<"$out" && grep -q "deferred reason=worktree-list-failed" "$STATE/self-update.log" && wt_untouched'
+rm -rf "$TMP/gitfail"
+
+# (2) an excluded .claude/worktrees/x holding files (invisible to git status).
+printf '%s\n' '.claude/worktrees/' >> "$REPO/.git/info/exclude"
+mkdir -p "$REPO/.claude/worktrees/x/sub"
+echo agent-work > "$REPO/.claude/worktrees/x/sub/wip.txt"
+ok "#1961 fixture: excluded agent dir is invisible to git status" '[ -z "$(git -C "$REPO" status --porcelain)" ]'
+: > "$TMP/systemctl.calls"; : > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#1961 excluded .claude/worktrees/x defers (rc 8)" '[ "$rc" = 8 ]'
+ok "#1961 defer message names the agent worktree dir" 'grep -qF "$REPO/.claude/worktrees/x" <<<"$out"'
+ok "#1961 agent-dir defer touches nothing" 'wt_untouched && [ "$(cat "$REPO/.claude/worktrees/x/sub/wip.txt")" = agent-work ]'
+# A real agent worktree there is both a linked worktree and a dir entry: listed once.
+git -C "$REPO" worktree add -q --detach "$REPO/.claude/worktrees/agent-1" HEAD
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#1961 in-tree agent worktree defers and is named once" \
+  '[ "$rc" = 8 ] && [ "$(grep -cF "$REPO/.claude/worktrees/agent-1" <<<"$out")" = 1 ] && wt_untouched'
+git -C "$REPO" worktree remove --force "$REPO/.claude/worktrees/agent-1"
+rm -rf "$REPO/.claude/worktrees/x"
+
+# (3) clean checkout (an EMPTY .claude/worktrees left behind) proceeds.
+: > "$TMP/systemctl.calls"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#1961 clean checkout with empty agent dir updates (rc 0)" \
+  '[ "$rc" = 0 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$wt_target" ] && [ "$(wc -l < "$SETUP_MARKER")" -gt "$wt_setup_lines" ]'
+# A prunable entry whose directory is already gone protects nothing: proceeds.
+echo wt-gate2 > "$TMP/seed/wt-gate.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm wt-gate2 && git -C "$TMP/seed" push -q origin main
+git -C "$REPO" worktree add -q --detach "$TMP/gone-wt" HEAD
+rm -rf "$TMP/gone-wt"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#1961 stale prunable worktree entry does not block (rc 0)" \
+  '[ "$rc" = 0 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
+git -C "$REPO" worktree prune
+rm -rf "$REPO/.claude"
+cp "$TMP/exclude.pre1961" "$REPO/.git/info/exclude"
+if [ -f "$TMP/services.pre1961" ]; then cp "$TMP/services.pre1961" "$CLAUDE/self-update.services"; else rm -f "$CLAUDE/self-update.services"; fi
+
 # --- #1328: conditional auto-recovery from a wrong-branch stall ----------------
 # Safe shape (validated by the yukson 2026-08-27 recovery): stray branch fully
 # pushed to origin + clean tree — switching back to main cannot lose anything.
@@ -811,12 +897,15 @@ git -C "$REPO" checkout -q -- file.txt
 git -C "$REPO" checkout -q main
 git -C "$REPO" branch -qD dirty-stray
 
-# (4) main held by a linked worktree: git refuses the double checkout -> fail-closed.
+# (4) main held by a linked worktree: never auto-recovered. Since #1961 any
+# linked worktree defers the whole run (rc 8) before recovery is attempted;
+# the recovery code itself still refuses this shape (git will not check out a
+# branch another worktree holds).
 git -C "$REPO" checkout -q -b stray-wt
 git -C "$REPO" push -q origin stray-wt
 git -C "$REPO" worktree add -q "$TMP/held-main" main
 out="$(run_selfup run 2>&1)"; rc=$?
-ok "main held by a linked worktree keeps fail-closed (rc 4)" '[ "$rc" = 4 ]'
+ok "main held by a linked worktree is not recovered (deferred, rc 8)" '[ "$rc" = 8 ]'
 ok "worktree-held main leaves the stray branch checked out" \
   '[ "$(git -C "$REPO" symbolic-ref --short HEAD)" = "stray-wt" ]'
 git -C "$REPO" worktree remove --force "$TMP/held-main"

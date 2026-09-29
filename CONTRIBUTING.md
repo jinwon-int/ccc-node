@@ -22,11 +22,39 @@ unpushed one is pinned under `refs/ccc-stray/<branch>/<utc-ts>` first so no
 commit can be orphaned, and the notice tells you where it lives. A dirty tree
 or a `main` held by a linked worktree still require the human path below.
 
-Develop in a separate worktree instead:
+### Never create worktrees inside (or off) the managed checkout
+
+**Never create an agent or dev worktree inside the live managed checkout** —
+in particular not Claude Code's default agent location
+`<checkout>/.claude/worktrees/<name>` (what `Agent(isolation: worktree)` uses
+when the session's repository IS the managed checkout). On a fleet node
+(2026-09-24, #1961) four such agent worktrees vanished right after a
+self-update tick fast-forwarded the checkout; the deleting actor is still
+unconfirmed, and the dirty-tree guard did not stop that tick (suspected: the
+directory was hidden from `git status` by an exclude rule). Put worktrees on a
+path outside the checkout instead, and base them on a **separate clone**, not
+on the managed checkout itself:
 
 ```bash
-git -C /opt/ccc-node worktree add ~/dev/<slug> -b <type>/<slug> origin/main
+git clone https://github.com/jinwon-int/ccc-node ~/work/ccc-node   # once
+git -C ~/work/ccc-node worktree add ~/work/wt/<slug> -b <type>/<slug> origin/main
 ```
+
+Run agent sessions that need `isolation: worktree` from that clone, so their
+`.claude/worktrees/` lands under `~/work/ccc-node`, never under the managed
+checkout.
+
+The updater enforces this (#1961): while the managed checkout has **any
+linked worktree** (`git worktree list` shows more than the main entry,
+wherever the linked tree lives) or a **non-empty `.claude/worktrees/`**
+(checked on the filesystem, so ignore/exclude rules cannot hide it), every
+tick **defers** with exit 8 — nothing is fetched, merged, installed or
+restarted, `--force` does not override it, and the owner is notified with the
+offending paths. The node stops updating until the worktree is removed, which
+is why a linked worktree of the managed checkout (even one outside it, the
+previously documented `git -C /opt/ccc-node worktree add ~/dev/<slug>`
+recipe) is no longer the recommended dev path. See
+[docs/self-update.md](docs/self-update.md#worktree-gate-1961).
 
 The managed checkout stays on `main` and keeps updating; git also refuses to
 check out the same branch twice, which enforces part of this for you. Two
