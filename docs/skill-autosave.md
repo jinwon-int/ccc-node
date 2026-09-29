@@ -957,6 +957,19 @@ target override, default `${CODEX_HOME:-~/.codex}/skills`),
 `CCC_CODEX_SKILL_COLLECTOR` (Codex-only candidate collection, default true),
 `CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP` (default 1, range 1–10).
 
+Budget accounting (#1932): `MAX_SESSIONS` counts only transcripts that were
+actually dispatched to the drafting pipeline. The sweep asks `skill-review.sh`
+for a distinct exit code (`CCC_SKILL_REVIEW_SKIP_RC`; hooks keep exit 0) when it
+skips a transcript as not reviewable (fewer than `CCC_SKILL_REVIEW_MIN_TURNS`
+turns). Such transcripts — typically one-turn `claude -p` batch output such as
+memory-QA calls or the drafting call itself, which are always the newest files
+— are ledgered (so they are not revisited until they grow) and logged as
+`review skipped … reason=not-reviewable (no budget used)`, and the sweep
+summary reports them as `skipped_unreviewable=N`. `status` prints
+`last drafting review:` (mtime of `skill-review-last.json`, written only after
+a real drafting LLM call): a stale value while sweeps keep logging `review ok`
+means drafting is silently stalled.
+
 Neutral drafting LLM (#1654): `extract.sh` normally drafts through
 `claude -p --model haiku`. On nodes without the claude CLI (piri/codex lanes,
 non-Anthropic gateways), set `CCC_SKILL_REVIEW_LLM_CMD` to a shell-quoted

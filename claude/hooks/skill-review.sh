@@ -8,7 +8,10 @@
 # install passing drafts and leave failing ones pending for humans.
 #
 # Safety:
-#   - Always exit 0 when used as a hook.
+#   - Always exit 0 when used as a hook. A batch caller (the autosave sweep)
+#     may set CCC_SKILL_REVIEW_SKIP_RC=<1-125> to get that code back instead
+#     when the transcript is not reviewable (too few turns), so it can tell a
+#     skip from a drafting dispatch and not charge its budget for it (#1932).
 #   - Recursion guard prevents child `claude -p` sessions from re-firing hooks.
 #   - Redaction happens in skill-review/extract.sh before model input.
 #   - Off-switch: touch ~/.claude/state/skill-review.disabled
@@ -214,6 +217,10 @@ TURNS="$(tail -n "$TURN_WINDOW" "$TRANSCRIPT_PATH" 2>/dev/null \
 case "$TURNS" in ''|*[!0-9]*) TURNS=0 ;; esac
 if [ "$TURNS" -lt "$MIN_TURNS" ]; then
   log "skip reason=too-few-turns turns=$TURNS min_turns=$MIN_TURNS trigger=$TRIGGER pid=$$"
+  # #1932: hooks keep exit 0; only an explicit batch caller asks for a code.
+  case "${CCC_SKILL_REVIEW_SKIP_RC:-}" in
+    [1-9]|[1-9][0-9]|1[01][0-9]|12[0-5]) exit "$CCC_SKILL_REVIEW_SKIP_RC" ;;
+  esac
   exit 0
 fi
 
