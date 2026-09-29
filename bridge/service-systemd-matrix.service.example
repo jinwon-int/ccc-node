@@ -42,6 +42,14 @@ Restart=always
 RestartSec=5
 KillMode=mixed
 TimeoutStopSec=70
+# Memory guard (#1877): bound the frontend's cgroup below the host so one
+# runaway agent child is throttled/killed inside it, and keep the unit alive
+# when that child is OOM-killed instead of SIGKILLing every in-flight session.
+# For an already installed unit the same values can be applied as a drop-in:
+#   BRIDGE_SERVICE_NAME=ccc-matrix-bridge bash /opt/ccc-node/bridge/service-systemd.sh memory-guard
+MemoryHigh=50%
+MemoryMax=75%
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target

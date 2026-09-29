@@ -75,6 +75,15 @@ ok "unit has no blank lines (sed collapse)" '! grep -q "^$" "$UNIT"'
 ok "systemd install ran daemon-reload"  'grep -q "daemon-reload" "$SC_CALLS"'
 ok "systemd install enabled --now the service" \
    'grep -q "enable --now ccc-telegram-bridge.service" "$SC_CALLS"'
+# shellcheck disable=SC2034  # GUARD is read via eval inside ok()
+GUARD="$UNIT.d/10-ccc-memory-guard.conf"
+ok "install writes the memory-guard drop-in (#1877)" '[ -f "$GUARD" ]'
+ok "memory guard defaults to MemoryHigh=50% MemoryMax=75% OOMPolicy=continue" \
+   'grep -Fxq "[Service]" "$GUARD" && grep -Fxq "MemoryHigh=50%" "$GUARD" && grep -Fxq "MemoryMax=75%" "$GUARD" && grep -Fxq "OOMPolicy=continue" "$GUARD"'
+ok "memory guard drop-in carries the generator marker" \
+   'head -n 1 "$GUARD" | grep -q "^# ccc-node bridge memory guard (#1877)"'
+ok "memory guard stays out of the canonical main unit" \
+   '! grep -Eq "^(MemoryHigh|MemoryMax|OOMPolicy)=" "$UNIT"'
 
 # ---- systemd: setup/self-update reconciliation -----------------------------
 # Identical canonical content is a true no-op: no inode replacement, reload,
@@ -320,9 +329,84 @@ ok "uninstall removed the unit file" '[ ! -f "$UNIT" ]'
 ok "uninstall disabled --now the service" \
    'grep -q "disable --now ccc-telegram-bridge.service" "$SC_CALLS"'
 ok "uninstall ran daemon-reload" 'grep -q "daemon-reload" "$SC_CALLS"'
+ok "uninstall removes the generated memory-guard drop-in" '[ ! -e "$GUARD" ]'
+ok "uninstall keeps operator drop-ins" '[ -f "$UNIT.d/override.conf" ]'
 run env HOME="$FH" CCC_SYSTEMD_DIR="$SD" CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" uninstall
 okc "$RC" 0 "second uninstall exits 0 (idempotent)"
 ok "second uninstall reports not installed" 'grep -q "not installed" "$OUT"'
+
+# ---- systemd: memory guard overrides + subcommand (#1877) -------------------
+SDG="$TMP/sd-guard"
+UG="$SDG/ccc-telegram-bridge.service"
+GG="$UG.d/10-ccc-memory-guard.conf"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" \
+    CCC_BRIDGE_MEMORY_HIGH=8G CCC_BRIDGE_MEMORY_MAX=12G \
+    bash "$SSD" install --project-root "$PROJECT"
+okc "$RC" 0 "install with memory overrides exits 0"
+ok "memory overrides land in the drop-in" \
+   'grep -Fxq "MemoryHigh=8G" "$GG" && grep -Fxq "MemoryMax=12G" "$GG" && grep -Fxq "OOMPolicy=continue" "$GG"'
+
+rm -rf "$SDG"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" CCC_BRIDGE_MEMORY_GUARD=0 \
+    bash "$SSD" install --project-root "$PROJECT"
+okc "$RC" 0 "install with CCC_BRIDGE_MEMORY_GUARD=0 exits 0"
+ok "CCC_BRIDGE_MEMORY_GUARD=0 installs the unit without the drop-in" '[ -f "$UG" ] && [ ! -e "$GG" ]'
+
+for bad in "HIGH=abc" "MAX=0%" "MAX=101%" "HIGH=80% MAX=60%" "HIGH=16G MAX=8G" "HIGH=infinity MAX=75%"; do
+    rm -rf "$SDG"
+    # shellcheck disable=SC2046  # intentional word splitting into env assignments
+    run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" \
+        $(for kv in $bad; do printf 'CCC_BRIDGE_MEMORY_%s ' "$kv"; done) \
+        bash "$SSD" install --project-root "$PROJECT"
+    okc "$RC" 1 "invalid memory guard ($bad) is refused"
+    ok "invalid memory guard ($bad) writes nothing" '[ ! -e "$UG" ]'
+done
+
+# memory-guard on an existing unit (e.g. installed before #1877): dry-run is
+# read-only; the real run writes the drop-in and only daemon-reloads.
+rm -rf "$SDG"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" CCC_BRIDGE_MEMORY_GUARD=0 \
+    bash "$SSD" install --project-root "$PROJECT"
+: > "$SC_CALLS"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" memory-guard --dry-run
+okc "$RC" 0 "memory-guard --dry-run exits 0"
+ok "memory-guard --dry-run writes nothing and never calls systemctl" \
+   '[ ! -e "$GG" ] && [ ! -s "$SC_CALLS" ] && grep -q "MemoryMax=75%" "$OUT"'
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" memory-guard
+okc "$RC" 0 "memory-guard exits 0"
+ok "memory-guard writes the drop-in" 'grep -Fxq "OOMPolicy=continue" "$GG"'
+ok "memory-guard only daemon-reloads (no restart)" '[ "$(cat "$SC_CALLS")" = "$DAEMON_RELOAD" ]'
+: > "$SC_CALLS"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" memory-guard
+okc "$RC" 0 "repeated memory-guard exits 0"
+ok "repeated memory-guard is a no-op" \
+   'grep -q "already current" "$OUT" && [ ! -s "$SC_CALLS" ]'
+: > "$SC_CALLS"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" reconcile
+ok "reconcile leaves the memory-guard drop-in alone" \
+   'grep -Fxq "MemoryMax=75%" "$GG" && grep -q "already canonical" "$OUT"'
+printf '[Service]\nMemoryMax=4G\n' > "$GG"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" memory-guard
+okc "$RC" 1 "memory-guard refuses a foreign file at its path"
+ok "foreign drop-in is left byte-for-byte" '[ "$(cat "$GG")" = "$(printf "[Service]\nMemoryMax=4G")" ]'
+
+# The Matrix frontend unit is hand-installed; memory-guard serves it by name.
+SDM="$TMP/sd-matrix"
+mkdir -p "$SDM"
+printf '[Service]\nExecStart=/bin/true\n' > "$SDM/ccc-matrix-bridge.service"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SDM" CCC_SYSTEMCTL="$SC_STUB" BRIDGE_SERVICE_NAME=ccc-matrix-bridge \
+    bash "$SSD" memory-guard
+okc "$RC" 0 "memory-guard serves the Matrix unit"
+ok "Matrix unit gets the same drop-in" \
+   'grep -Fxq "OOMPolicy=continue" "$SDM/ccc-matrix-bridge.service.d/10-ccc-memory-guard.conf"'
+run env HOME="$FH" CCC_SYSTEMD_DIR="$TMP/sd-none" CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" memory-guard
+okc "$RC" 0 "memory-guard without an installed unit exits 0"
+ok "memory-guard without a unit writes nothing" '[ ! -e "$TMP/sd-none" ] && grep -q "not installed" "$OUT"'
+
+# No systemd (Termux): the subcommand is a clean no-op.
+run env HOME="$FH" CCC_SYSTEMCTL="$TMP/no-such-systemctl" bash "$SSD" memory-guard
+okc "$RC" 0 "memory-guard on a host without systemctl exits 0"
+ok "memory-guard reports systemd absent" 'grep -q "no systemd on this host" "$OUT"'
 
 # ---- systemd: validation ----------------------------------------------------
 run env CCC_SYSTEMD_DIR="$SD" CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" install
