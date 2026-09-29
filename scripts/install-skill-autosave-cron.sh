@@ -58,7 +58,7 @@ OPT_DANSO_DRAFTING=0
 OPT_DANSO_STATE_DIR=""
 # #1867: a re-run without the lane flags used to re-render the managed block
 # from scratch and silently drop the provider/drafting/state-dir env the
-# previous install baked (nosuk lost CCC_SKILL_PROVIDER=piri and
+# previous install baked (a piri node lost CCC_SKILL_PROVIDER=piri and
 # CCC_SKILL_PIRI_DRAFTING=1; piri drafting then skipped as not-enabled for nine
 # days). Lane settings found in the existing entry are now carried forward
 # unless an explicit flag/env overrides them; --reset-lane drops them on

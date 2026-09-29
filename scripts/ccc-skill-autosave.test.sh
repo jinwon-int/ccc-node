@@ -351,7 +351,7 @@ run9
 ok "piri branch default off logs not-enabled" 'grep -q "piri skipped reason=not-enabled" "$STATE9/skill-autosave.log"'
 ok "default off walks no piri sessions (no normalized tree)" '[ ! -d "$STATE9/piri-normalized" ]'
 # #1867: an absent opt-in with recent piri sessions is the lost-cron-baking
-# signature (nosuk: nine days of routine "not-enabled" skips), so it is surfaced
+# signature (a piri node saw nine days of routine "not-enabled" skips), so it is surfaced
 # as a WARN line instead of blending into the ordinary skip.
 ok "#1867: absent piri opt-in with recent sessions is hinted on the skip line" \
   'grep -q "piri skipped reason=not-enabled recent_sessions=yes" "$STATE9/skill-autosave.log"'

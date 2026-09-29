@@ -1,6 +1,6 @@
 - **Skill autosave: re-running `install-skill-autosave-cron.sh` no longer
   silently drops the baked provider/drafting lane (#1867).** A flagless
-  re-run used to re-render the managed cron block from scratch, so nosuk lost
+  re-run used to re-render the managed cron block from scratch, so a piri node lost
   `CCC_SKILL_PROVIDER="piri"` and `CCC_SKILL_PIRI_DRAFTING=1` and its piri
   drafting skipped as `not-enabled` for nine days. The installer now reads the
   existing managed entry and carries forward `CCC_SKILL_PROVIDER`,

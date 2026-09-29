@@ -291,7 +291,7 @@ ok "danso promotion providers inherited from env" \
   'grep -qF "CCC_SKILL_PROMOTION_PROVIDERS=\"danso\"" "$CRON_STORE"'
 
 # --- #1867: a re-run keeps the lane settings baked into the existing entry ---
-# nosuk: the piri lane (provider + drafting) was baked, a later re-run without
+# A piri node: the lane (provider + drafting) was baked, a later re-run without
 # the flags re-rendered the block from scratch, and piri drafting then skipped
 # as not-enabled for nine days with nothing but routine log lines.
 rm -f "$CRON_STORE" "$CCC_STATE_DIR/skill-autosave-cron.history.jsonl"
@@ -329,10 +329,10 @@ ok "#1867: --reset-lane reports nothing preserved" '! grep -q "kept lane setting
 # danso state dir + drafting are carried forward; a hand-edited unquoted value
 # is read too, and an unsafe baked state dir is never re-baked.
 rm -f "$CRON_STORE"
-run bash "$SC" --apply --provider danso --danso-state-dir /var/lib/ccc-danso/gongmyoung --danso-drafting
+run bash "$SC" --apply --provider danso --danso-state-dir /var/lib/ccc-danso/node-a --danso-drafting
 run env -u CCC_DANSO_STATE_DIR bash "$SC" --apply
 ok "#1867: danso state dir and drafting survive a flagless re-run" \
-  'grep -qF "CCC_DANSO_STATE_DIR=\"/var/lib/ccc-danso/gongmyoung\"" "$CRON_STORE" && grep -qF "CCC_SKILL_DANSO_DRAFTING=1" "$CRON_STORE" && grep -qF "CCC_SKILL_PROVIDER=\"danso\"" "$CRON_STORE"'
+  'grep -qF "CCC_DANSO_STATE_DIR=\"/var/lib/ccc-danso/node-a\"" "$CRON_STORE" && grep -qF "CCC_SKILL_DANSO_DRAFTING=1" "$CRON_STORE" && grep -qF "CCC_SKILL_PROVIDER=\"danso\"" "$CRON_STORE"'
 ok "#1867: preserved danso state dir suppresses the absence warning" '! grep -q "danso lane without a state dir" "$OUT"'
 printf '%s\n' "30 22 * * * bash -lc 'CCC_CLAUDE_DIR=/x CCC_SKILL_PROVIDER=piri CCC_SKILL_CODEX_DRAFTING=1 CCC_DANSO_STATE_DIR=relative/x \"/x/ccc-skill-autosave.sh\" run'  $MARKER gen=h_old" > "$CRON_STORE"
 run env -u CCC_DANSO_STATE_DIR bash "$SC" --apply

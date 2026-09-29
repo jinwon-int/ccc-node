@@ -288,7 +288,7 @@ else
 
   # #1867: a non-Claude lane whose opt-in is simply absent (not an explicit
   # CCC_SKILL_<LANE>_DRAFTING=0) while its session tree holds recent sessions is
-  # the signature of lost cron baking — nosuk's piri lane logged the ordinary
+  # the signature of lost cron baking — a piri node's lane logged the ordinary
   # "not-enabled" skip for nine days. Probe with -quit (first hit only) and
   # surface it as a WARN line below instead of a routine skip.
   lanes_not_enabled=""
