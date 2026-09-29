@@ -65,6 +65,10 @@ OPT_DANSO_STATE_DIR=""
 # purpose. Same failure class as the sync-cron baking loss fixed by #1705.
 OPT_RESET_LANE=0
 PRESERVED_LANE=()
+# #1647: the cross-branch drafting cap now defaults to 3 in the sweep, so an
+# operator who wants a different value (or 0 = no cap) must be able to bake it
+# into the entry and keep it across re-runs, exactly like the lane above.
+OPT_TOTAL_MAX_SESSIONS=""
 HISTORY="$STATE_DIR/skill-autosave-cron.history.jsonl"
 
 # Shared installer libs (#1081, #1077): gen stamps + records, and the common
@@ -217,10 +221,11 @@ Options:
                    inside a double-quoted segment of the cron line).
   --reset-lane     Do not carry lane settings forward from the existing entry.
                    By default a re-run keeps CCC_SKILL_PROVIDER,
-                   CCC_SKILL_{PIRI,CODEX,DANSO}_DRAFTING, CCC_DANSO_STATE_DIR
-                   and CCC_SKILL_PROMOTION_PROVIDERS already baked into the
-                   managed entry unless a flag (or inherited env) sets them
-                   (#1867); preserved values are reported on stderr.
+                   CCC_SKILL_{PIRI,CODEX,DANSO}_DRAFTING, CCC_DANSO_STATE_DIR,
+                   CCC_SKILL_PROMOTION_PROVIDERS and (#1647)
+                   CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS already baked into
+                   the managed entry unless a flag (or inherited env) sets
+                   them (#1867); preserved values are reported on stderr.
   --promotion-providers LIST
                    Bake CCC_SKILL_PROMOTION_PROVIDERS=LIST (comma-separated,
                    each of claude|codex|piri) into the entry so scheduled
@@ -228,12 +233,23 @@ Options:
                    \$CCC_SKILL_PROMOTION_PROVIDERS when set; otherwise omitted
                    (the promoter default claude,codex applies). piri nodes
                    wanting daily piri staging pass claude,piri.
+  --total-max-sessions N
+                   Bake CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=N (non-negative
+                   integer) into the entry: the per-run drafting cap summed
+                   across claude/codex/piri/danso (#1824). Defaults to
+                   \$CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS when set; otherwise
+                   omitted and the sweep default (3, #1647) applies. 0 = no
+                   cross-branch cap. Like the lane settings, a re-run keeps a
+                   baked value unless this flag/env overrides it; --reset-lane
+                   drops it.
 
 Env overrides: CCC_CLAUDE_DIR, CCC_STATE_DIR, CCC_SKILL_AUTOSAVE_CMD,
 CCC_SKILL_AUTOSAVE_CRON, CCC_SKILL_AUTOSAVE_CRON_LOG, CCC_CRONTAB_CMD,
 CCC_SKILL_PROVIDER (inherited as the baked provider when --provider is unset),
 CCC_SKILL_PROMOTION_PROVIDERS (inherited when --promotion-providers is unset),
-CCC_DANSO_STATE_DIR (inherited when --danso-state-dir is unset).
+CCC_DANSO_STATE_DIR (inherited when --danso-state-dir is unset),
+CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS (inherited when --total-max-sessions is
+unset).
 CCC_SKILL_AUTOSAVE_LOCAL_TIMEZONE and CCC_SKILL_AUTOSAVE_LOCAL_UTC_OFFSET
 (+HHMM/-HHMM) are advanced deterministic overrides for image builds and
 tests; normal installs auto-detect both.
@@ -277,6 +293,13 @@ while [ $# -gt 0 ]; do
       [ "$_pp_ok" = 1 ] || { echo "invalid --promotion-providers '$2' (comma list of claude|codex|piri)" >&2; exit 2; }
       unset _pp_ok _pp_parts _pp
       OPT_PROMOTION_PROVIDERS="$2"
+      shift ;;
+    --total-max-sessions)
+      ccc_cron_need_val "$1" "${2:-}"
+      case "$2" in
+        *[!0-9]*) echo "invalid --total-max-sessions '$2' (want a non-negative integer; 0 = no cap)" >&2; exit 2 ;;
+      esac
+      OPT_TOTAL_MAX_SESSIONS="$2"
       shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
@@ -412,11 +435,30 @@ if [ -z "$CRON_PROMOTION_PROVIDERS" ]; then
   fi
   unset _baked
 fi
+# #1647: --total-max-sessions > inherited env > baked value > omitted (the
+# sweep default 3 applies). Only plain digits are ever baked, so the value
+# cannot break out of the double-quoted env segment of the entry.
+CRON_TOTAL_MAX_SESSIONS="$OPT_TOTAL_MAX_SESSIONS"
+if [ -z "$CRON_TOTAL_MAX_SESSIONS" ] && [ -n "${CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS:-}" ]; then
+  case "$CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS" in
+    *[!0-9]*) echo "WARNING: ignoring invalid inherited CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS (want a non-negative integer)." >&2 ;;
+    *) CRON_TOTAL_MAX_SESSIONS="$CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS" ;;
+  esac
+fi
+if [ -z "$CRON_TOTAL_MAX_SESSIONS" ]; then
+  _baked="$(baked_value CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS)"
+  case "$_baked" in
+    ''|*[!0-9]*) ;;
+    *) CRON_TOTAL_MAX_SESSIONS="$_baked"; PRESERVED_LANE+=("CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=$_baked") ;;
+  esac
+  unset _baked
+fi
 if [ "${#PRESERVED_LANE[@]}" -gt 0 ]; then
   echo "NOTICE: kept lane settings baked into the existing entry (#1867): ${PRESERVED_LANE[*]}" >&2
   echo "        Pass explicit flags to change them, or --reset-lane to drop them." >&2
 fi
 [ -n "$CRON_PROMOTION_PROVIDERS" ] && CRON_ENV="$CRON_ENV CCC_SKILL_PROMOTION_PROVIDERS=\"$CRON_PROMOTION_PROVIDERS\""
+[ -n "$CRON_TOTAL_MAX_SESSIONS" ] && CRON_ENV="$CRON_ENV CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=\"$CRON_TOTAL_MAX_SESSIONS\""
 CRON_LINE="$SCHEDULE bash -lc '$CRON_ENV \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
 
 # Install record (#1081 phase 2): replay must reproduce THIS entry, so the
@@ -430,6 +472,7 @@ record_argv=(--apply --schedule "$SCHEDULE")
 [ "$OPT_DANSO_DRAFTING" = 1 ] && record_argv+=(--danso-drafting)
 [ -n "$CRON_DANSO_STATE_DIR" ] && record_argv+=(--danso-state-dir "$CRON_DANSO_STATE_DIR")
 [ -n "$CRON_PROMOTION_PROVIDERS" ] && record_argv+=(--promotion-providers "$CRON_PROMOTION_PROVIDERS")
+[ -n "$CRON_TOTAL_MAX_SESSIONS" ] && record_argv+=(--total-max-sessions "$CRON_TOTAL_MAX_SESSIONS")
 
 # The block body carries the CRON_TZ pin ahead of the entry line (cron has no
 # per-job inline timezone syntax; the pin keeps an unrelated earlier CRON_TZ

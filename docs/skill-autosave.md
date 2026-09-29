@@ -172,7 +172,7 @@ in, the sweep runs a **codex branch** right after the Claude draft loop:
    The branch has its **own** `MAX_SESSIONS` per-run budget (not shared with
    the Claude branch, #1824); only the pending queue and the autoinstall
    daily cap are shared. `CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS` bounds the
-   cross-branch sum when set.
+   cross-branch sum (default 3 since #1647; explicit `0` = no cap).
 
 **Opt in** with `CCC_SKILL_CODEX_DRAFTING=1` (or `1` in
 `<CCC_STATE_DIR>/skill-autosave.codex-drafting`). Default is off: nodes without
@@ -267,7 +267,13 @@ carries forward the baked `CCC_SKILL_PROVIDER`,
 `CCC_SKILL_{PIRI,CODEX,DANSO}_DRAFTING`, `CCC_DANSO_STATE_DIR` and
 `CCC_SKILL_PROMOTION_PROVIDERS` unless an explicit flag (or inherited env)
 sets them, printing `NOTICE: kept lane settings …` on stderr. `--reset-lane`
-drops them on purpose. Every `--apply` appends a row (ts, action, gen, invoked
+drops them on purpose. The same carry-forward applies to the cross-branch
+drafting cap (#1647): `--total-max-sessions N` bakes
+`CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=N` (inheritable from the environment;
+non-negative integer, `0` = no cap), a flagless re-run keeps a baked value —
+including a hand-edited one — and `--reset-lane` drops it so the sweep default
+(3) applies again. Without it nothing is baked and the sweep default applies.
+Every `--apply` appends a row (ts, action, gen, invoked
 and rendered argv, preserved keys) to
 `<state>/skill-autosave-cron.history.jsonl` (mode 600). At sweep time, a
 non-Claude lane that is not enabled — with no explicit
@@ -342,6 +348,18 @@ already holds the target. It works while the sweep is paused
 (cron entry or shell profile) would still override the file. Skills that auto
 mode already installed stay installed; audit or undo them with
 `autoinstall.sh list` / `rollback <name>` (see `/skillsuggest` step 1b).
+
+**Recommendation for remaining auto nodes (#1647, owner decision 2026-09-29).**
+Together with the new default cross-branch drafting cap
+(`CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS`, default 3 — see Operations), nodes
+still in auto mode are recommended to run `set-mode review`, so drafts reach
+the human gate instead of adding unreviewed installs and promotion-staging
+inflow. This is a recommendation, not an automatic change: each node's switch
+is a separate, per-node operator approval, and the harness never flips the
+mode itself. The `status` advisory and the sweep's `mode-advisory` log line are
+the hint to act on. The effect of both measures on the staging backlog is
+re-measured two weeks after the default change (2026-10-13) to decide whether
+#1647 can close.
 
 ## Auto mode — unattended install with post-hoc review (#355)
 
@@ -987,10 +1005,16 @@ Tuning (env): `CCC_SKILL_AUTOSAVE_MAX_SESSIONS` (default 3 transcripts/run
 **per drafting branch** — each drafting run is an LLM call; claude, codex, piri
 and danso each keep their own counter, so a node with N enabled branches can
 draft up to N×3 per run, #1824), `CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS`
-(default 0 = no cross-branch cap; when set, the sum over all branches stops at
-this value — branches run claude → codex → piri → danso and a capped branch
-logs `<branch> budget-stop reason=total-max-sessions`; the sweep summary always
-reports `total_drafted=`), `CCC_SKILL_AUTOSAVE_WINDOW_DAYS` (2),
+(default 3 since #1647 — the sum over all branches stops at this value;
+branches run claude → codex → piri → danso, so on a busy node an earlier
+branch can use the whole budget, and a capped branch logs `<branch>
+budget-stop reason=total-max-sessions`. An explicit value always wins; an
+explicit `0` is the opt-out = no cross-branch cap, the pre-#1647 behavior;
+an empty or malformed value falls back to the default 3, never to no cap. The
+sweep summary always reports `total_drafted=`, `total_max_sessions=` and
+`total_max_source=default|env|default-invalid`, and `status` prints a
+`drafting budget:` line. Bake a node-specific value into the cron entry with
+`install-skill-autosave-cron.sh --total-max-sessions N`), `CCC_SKILL_AUTOSAVE_WINDOW_DAYS` (2),
 `CCC_SKILL_AUTOSAVE_REGROWTH_BYTES` (16384 — a long-lived bridge transcript is
 re-reviewed only after growing this much), `CCC_SKILL_AUTOSAVE_NOTIFY` (1),
 `CCC_SKILL_AUTOSAVE_SETTLE_SECONDS` (90), `CCC_SKILL_AUTOSAVE_MODE`

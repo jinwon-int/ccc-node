@@ -350,5 +350,50 @@ ok "#1867: history file is owner-only" '[ "$(stat -c %a "$HIST")" = 600 ]'
 run bash "$SC" --remove --apply
 ok "#1867: removal is recorded in the history" 'tail -1 "$HIST" | jq -e ".action == \"remove\"" >/dev/null'
 
+# --- #1647: the cross-branch drafting cap is bakeable and survives re-runs ---
+# The sweep defaults the cap to 3 when unset; an operator's explicit value (or
+# 0 = no cap) lives in the entry and must not be dropped by a later re-run.
+rm -f "$CRON_STORE"
+run env -u CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS bash "$SC" --apply
+ok "#1647: no value is baked by default (the sweep default applies)" \
+  '! grep -q "CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS" "$CRON_STORE"'
+run env -u CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS bash "$SC" --apply --total-max-sessions 5 --provider piri --piri-drafting
+okc "$RC" 0 "#1647: --total-max-sessions applies"
+ok "#1647: the explicit cap is baked into the entry" \
+  'grep -qF "CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=\"5\"" "$CRON_STORE"'
+run env -u CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS -u CCC_SKILL_PROVIDER bash "$SC" --apply
+okc "$RC" 0 "#1647: flagless re-run applies"
+ok "#1647: a flagless re-run preserves the explicit cap" \
+  'grep -qF "CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=\"5\"" "$CRON_STORE"'
+ok "#1647: ...without regressing the #1867 lane preservation" \
+  'grep -qF "CCC_SKILL_PROVIDER=\"piri\"" "$CRON_STORE" && grep -qF "CCC_SKILL_PIRI_DRAFTING=1" "$CRON_STORE"'
+ok "#1647: the preserved cap is reported" 'grep -q "CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=5" "$OUT"'
+ok "#1647: record argv materializes the cap for self-update replay" \
+  'jq -e "(.argv | index(\"--total-max-sessions\")) as \$i | \$i != null and .argv[\$i + 1] == \"5\"" "$REC" >/dev/null'
+ok "#1647: still a single managed entry" '[ "$(grep -c "$MARKER" "$CRON_STORE")" = 1 ]'
+run env -u CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS bash "$SC" --apply --total-max-sessions 0
+ok "#1647: an explicit flag overrides the baked cap (0 = no cap is bakeable)" \
+  'grep -qF "CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=\"0\"" "$CRON_STORE" && ! grep -qF "CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=\"5\"" "$CRON_STORE"'
+run env -u CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS bash "$SC" --apply
+ok "#1647: an explicit 0 also survives a flagless re-run" \
+  'grep -qF "CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=\"0\"" "$CRON_STORE"'
+run env CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=2 bash "$SC" --apply
+ok "#1647: an inherited env value overrides the baked cap" \
+  'grep -qF "CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=\"2\"" "$CRON_STORE"'
+run env CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS='4;zzinjected' bash "$SC" --apply
+ok "#1647: an invalid inherited value is ignored with a warning (baked value kept)" \
+  'grep -q "ignoring invalid inherited CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS" "$OUT" && grep -qF "CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=\"2\"" "$CRON_STORE" && ! grep -qF "zzinjected" "$CRON_STORE"'
+cp "$CRON_STORE" "$TMP/crontab.before1647"
+run bash "$SC" --apply --total-max-sessions 'x"; id'
+okc "$RC" 2 "#1647: a non-integer --total-max-sessions is rejected"
+ok "#1647: a rejected value leaves the crontab untouched" 'cmp -s "$CRON_STORE" "$TMP/crontab.before1647"'
+printf '%s\n' "30 22 * * * bash -lc 'CCC_CLAUDE_DIR=/x CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=7 \"/x/ccc-skill-autosave.sh\" run'  $MARKER gen=h_old" > "$CRON_STORE"
+run env -u CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS bash "$SC" --apply
+ok "#1647: a hand-edited unquoted cap is preserved" \
+  'grep -qF "CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=\"7\"" "$CRON_STORE"'
+run env -u CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS bash "$SC" --apply --reset-lane
+ok "#1647: --reset-lane drops the baked cap (sweep default 3 applies again)" \
+  '! grep -q "CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS" "$CRON_STORE"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

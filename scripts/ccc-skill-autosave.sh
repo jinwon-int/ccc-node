@@ -27,9 +27,10 @@
 #     (skill-review's own skill-review.disabled off-switch is honored too).
 #   - Cost-bounded: at most CCC_SKILL_AUTOSAVE_MAX_SESSIONS transcripts are
 #     drafted per run PER BRANCH (claude/codex/piri/danso each have their own
-#     counter, #1824); the optional CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS caps
-#     the sum across branches. A ledger prevents re-drafting a transcript that
-#     has not grown since it was last processed.
+#     counter, #1824); CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS caps the sum
+#     across branches (default 3 since #1647; explicit 0 = no cap). A ledger
+#     prevents re-drafting a transcript that has not grown since it was last
+#     processed.
 set -uo pipefail
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
@@ -75,11 +76,20 @@ REGROWTH_BYTES="${CCC_SKILL_AUTOSAVE_REGROWTH_BYTES:-16384}"
 NOTIFY="${CCC_SKILL_AUTOSAVE_NOTIFY:-1}"
 case "$MAX_SESSIONS" in ''|*[!0-9]*) MAX_SESSIONS=3 ;; esac
 # #1824: MAX_SESSIONS is a per-branch budget, so N enabled branches can draft
-# up to N x MAX_SESSIONS per run. This optional cross-branch cap (0/unset = no
-# cap, the historical behavior) bounds the sum; branches run in the fixed
-# order claude, codex, piri, danso and each stops once the sum reaches it.
-TOTAL_MAX_SESSIONS="${CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS:-0}"
-case "$TOTAL_MAX_SESSIONS" in ''|*[!0-9]*) TOTAL_MAX_SESSIONS=0 ;; esac
+# up to N x MAX_SESSIONS per run. This cross-branch cap bounds the sum;
+# branches run in the fixed order claude, codex, piri, danso and each stops
+# once the sum reaches it. #1647 (owner decision 2026-09-29): unset now means
+# a cap of 3 so staging inflow no longer multiplies with enabled branches. An
+# explicit value always wins; an explicit 0 is the documented opt-out (no cap,
+# the pre-#1647 behavior). Empty or malformed values fall back to the default,
+# like MAX_SESSIONS does, so a typo can never silently remove the cap.
+TOTAL_MAX_SESSIONS_DEFAULT=3
+TOTAL_MAX_SESSIONS="${CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS:-}"
+TOTAL_MAX_SOURCE="env"
+case "$TOTAL_MAX_SESSIONS" in
+  '') TOTAL_MAX_SESSIONS=$TOTAL_MAX_SESSIONS_DEFAULT; TOTAL_MAX_SOURCE=default ;;
+  *[!0-9]*) TOTAL_MAX_SESSIONS=$TOTAL_MAX_SESSIONS_DEFAULT; TOTAL_MAX_SOURCE=default-invalid ;;
+esac
 case "$WINDOW_DAYS" in ''|*[!0-9]*) WINDOW_DAYS=2 ;; esac
 case "$REGROWTH_BYTES" in ''|*[!0-9]*) REGROWTH_BYTES=16384 ;; esac
 # #1932: skill-review.sh returns this code (CCC_SKILL_REVIEW_SKIP_RC) when it
@@ -214,6 +224,10 @@ if [ "$MODE" = "status" ]; then
   else
     echo "curator: disabled (CCC_SKILL_CURATOR_ENABLED=${CCC_SKILL_CURATOR_ENABLED:-})"
   fi
+  # #1647: the effective drafting budget and where the total cap came from, so
+  # the 2-week re-measurement can tell default-capped nodes from opt-outs.
+  if [ "$TOTAL_MAX_SESSIONS" -gt 0 ]; then _total_desc="$TOTAL_MAX_SESSIONS"; else _total_desc="0 (no cap)"; fi
+  echo "drafting budget: per-branch max=$MAX_SESSIONS, total max=$_total_desc (source: $TOTAL_MAX_SOURCE; CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS, default 3, explicit 0 = no cap; #1824/#1647)"
   echo "pending skill drafts: $(pending_count)"
   # #1932: sweeps can report drafted_sessions>0 every day while no transcript
   # ever reaches the drafting LLM. skill-review-last.json is written only after
@@ -690,7 +704,7 @@ else
     done
   fi
   after="$(pending_count)"
-  log "sweep done drafted_sessions=$drafted codex_drafted=$codex_drafted piri_drafted=$piri_drafted danso_drafted=$danso_drafted pending_before=$before pending_after=$after skipped_unreviewable=$skipped_unreviewable total_drafted=$((drafted + codex_drafted + piri_drafted + danso_drafted)) max_sessions_per_branch=$MAX_SESSIONS total_max_sessions=$TOTAL_MAX_SESSIONS"
+  log "sweep done drafted_sessions=$drafted codex_drafted=$codex_drafted piri_drafted=$piri_drafted danso_drafted=$danso_drafted pending_before=$before pending_after=$after skipped_unreviewable=$skipped_unreviewable total_drafted=$((drafted + codex_drafted + piri_drafted + danso_drafted)) max_sessions_per_branch=$MAX_SESSIONS total_max_sessions=$TOTAL_MAX_SESSIONS total_max_source=$TOTAL_MAX_SOURCE"
 fi
 
 # --- 2b) auto mode (#355): machine-gate + install passing drafts -------------
