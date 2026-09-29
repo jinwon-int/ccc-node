@@ -41,6 +41,7 @@ import re
 import secrets
 import stat
 import time
+import traceback
 from typing import Any, Mapping, Protocol
 from urllib.parse import quote
 
@@ -70,8 +71,19 @@ from telegram_bot.core.matrix.state import (
     upgrade_saved_policy,
     wake_words,
 )
+from telegram_bot.utils.redaction import redact_credentials
 
 logger = logging.getLogger(__name__)
+
+
+def _raise_site(exc: BaseException) -> str:
+    """``file:line in function`` of the innermost frame, or ``unknown``."""
+
+    frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ else []
+    if not frames:
+        return "unknown"
+    frame = frames[-1]
+    return f"{Path(frame.filename).name}:{frame.lineno} in {frame.name}"
 
 FAMILY_NOTICE = "이 AI는 이 방을 읽을 수 있으며 답변에 필요한 내용(부른 메시지의 사진·파일 포함)이 제공업체에 전달될 수 있습니다."
 NOTICE_QUEUE_FULL = "대기 중인 요청이 많습니다. 잠시 후 다시 요청해 주세요."
@@ -1965,6 +1977,17 @@ class MatrixTransport:
         except Exception as exc:
             outcome = "timeout" if isinstance(exc, TimeoutError) else "error:" + type(exc).__name__
             self.turn_timed_out = isinstance(exc, TimeoutError)
+            if not self.turn_timed_out:
+                # #1819: the room only gets the generic NOTICE_TURN_ERROR and
+                # the outcome keeps just the type name, so without this line a
+                # runner exception left no trace anywhere. Body-free: redacted,
+                # bounded message plus the raise site, no chained traceback.
+                logger.error(
+                    "Matrix turn failed: error=%s: %s at=%s",
+                    type(exc).__name__,
+                    redact_credentials(" ".join(str(exc).split()))[:300],
+                    _raise_site(exc),
+                )
         finally:
             try:
                 await self._join(turn)

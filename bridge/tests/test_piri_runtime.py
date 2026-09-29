@@ -718,6 +718,43 @@ class PiriRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("raw-secret", str(caught.exception))
         self.assertEqual(factory.clients[0].close_calls, 1)
 
+    async def test_startup_failure_logs_exit_code_and_redacted_stderr(self) -> None:
+        """#1819: the wrapper's stderr and exit code reach the log and health."""
+
+        class DeadWrapperClient(FakePiriClient):
+            async def get_state(self) -> Mapping[str, Any]:
+                raise RuntimeError("Authorization: Bearer raw-secret-value-0123456789")
+
+            async def startup_failure_diagnostics(self) -> tuple[int | None, tuple[str, ...]]:
+                return 127, ("ccc-piri: real CLI unavailable",)
+
+        class DeadWrapperFactory(FakePiriFactory):
+            def __call__(self, config: PiriLaunchConfig) -> FakePiriClient:
+                client = DeadWrapperClient(config, session_id="unused")
+                self.clients.append(client)
+                return client
+
+        factory = DeadWrapperFactory()
+        runtime = PiriRuntime(client_factory=factory, process_environment={"A": "b"})
+
+        with self.assertLogs(level="ERROR") as logs:
+            with self.assertRaisesRegex(
+                RuntimeError, r"^Piri runtime failed to start \(exit 127\)$"
+            ) as caught:
+                await runtime.start_or_resume(SessionRequest(working_directory="/workspace"))
+
+        output = "\n".join(logs.output)
+        self.assertIn("exit=127", output)
+        self.assertIn("ccc-piri: real CLI unavailable", output)
+        self.assertIn("cause=RuntimeError", output)
+        self.assertNotIn("raw-secret-value", output)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertEqual(
+            getattr(caught.exception, "health_reason", None),
+            "Piri runtime failed to start (exit 127): ccc-piri: real CLI unavailable",
+        )
+        self.assertEqual(factory.clients[0].close_calls, 1)
+
     async def test_session_close_unregisters_it_from_runtime(self) -> None:
         session = await self.runtime.start_or_resume(
             SessionRequest(working_directory="/workspace")
@@ -1111,6 +1148,41 @@ print(json.dumps(response), flush=True)
                     )
             finally:
                 await client.close()
+
+    async def test_startup_failure_diagnostics_keep_a_bounded_redacted_stderr_tail(self) -> None:
+        """#1819: stderr was fully discarded, so exit 127 left no trace."""
+
+        child = """
+import sys
+sys.stderr.write("noise " * 2000 + "\\n")
+for index in range(20):
+    sys.stderr.write(f"line {index}\\n")
+sys.stderr.write("token sk-abcdefghijklmnopqrstuvwxyz0123\\n")
+sys.stderr.write("ccc-piri: real CLI unavailable\\n")
+sys.stderr.flush()
+raise SystemExit(127)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            client = PiriRpcProcessClient(
+                (sys.executable, "-u", "-c", child),
+                working_directory=str(Path(directory)),
+                request_timeout=5.0,
+            )
+            try:
+                await client.start()
+                with self.assertRaises(Exception):
+                    await client.get_state()
+                exit_code, lines = await client.startup_failure_diagnostics(timeout=5.0)
+            finally:
+                await client.close()
+
+        self.assertEqual(exit_code, 127)
+        self.assertEqual(lines[-1], "ccc-piri: real CLI unavailable")
+        self.assertLessEqual(len(lines), 8)
+        self.assertTrue(all(len(line) <= 300 for line in lines))
+        joined = "\n".join(lines)
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz0123", joined)
+        self.assertIn("[REDACTED_CREDENTIAL]", joined)
 
 
 if __name__ == "__main__":
