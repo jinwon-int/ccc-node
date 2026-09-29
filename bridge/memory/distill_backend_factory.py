@@ -9,6 +9,7 @@ from typing import Any, Literal, cast
 from .codex_exec_backend import CodexExecDistillBackend
 from .distill_extraction import DistillBackend
 from .runtime_cli_backend import RuntimeCliDistillBackend
+from telegram_bot.utils.wrapper_environment import with_wrapper_environment
 
 DistillProvider = Literal["claude", "codex", "piri", "danso"]
 
@@ -67,7 +68,9 @@ def build_distill_backend(
         provider,
         executable=executable,
         wiki_enabled=wiki_enabled,
-        environment=os.environ,
+        # #1771: ccc-piri reads CCC_PIRI_REAL_CLI_PATH only from its process
+        # environment; include the value configured in the .env files.
+        environment=with_wrapper_environment(os.environ, settings),
         model=model,
         timeout_seconds=timeout,
     )

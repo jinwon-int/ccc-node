@@ -9,6 +9,10 @@ from typing import Any
 
 from telegram_bot.utils.config import Settings, bind_config
 from telegram_bot.utils.logging_setup import setup_logging
+from telegram_bot.utils.wrapper_environment import (
+    missing_wrapper_environment,
+    with_wrapper_environment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +89,9 @@ def _build_piri_runtime(settings: Settings) -> Any:
     logger.info("Piri provider routed through unrestricted PiriRuntime RPC adapter")
     return PiriRuntime(
         executable=settings.piri_cli_path,
-        process_environment=os.environ,
+        # #1771: the ccc-piri wrapper reads its real-CLI/memory keys only from
+        # the process environment; hand over the ones set in the .env files.
+        process_environment=with_wrapper_environment(os.environ, settings),
         model_catalog_directory=str(Path(settings.project_root).resolve()),
         memory_materializer_path=settings.codex_memory_materializer_path,
         memory_bootstrap_timeout_seconds=(
@@ -265,6 +271,7 @@ def _build_skill_candidate_collector(
         backend = RuntimeCliSkillCandidateBackend(
             "piri",
             executable=settings.piri_cli_path,
+            environment=with_wrapper_environment(os.environ, settings),
             model=model,
             timeout_seconds=timeout,
         )
@@ -359,9 +366,14 @@ def _build_standard_context(
         from telegram_bot.utils.memory_policy import MEMORY_MODE_AUDIENCE_SCOPED
 
         def build_codex_runtime(process_environment=None):
+            # #1771: the ccc-codex wrapper reads its real-CLI/materializer keys
+            # only from the process environment. Add the ones configured in the
+            # .env files that os.environ lacks; an explicit value always wins.
+            wrapper_overlay = missing_wrapper_environment(settings, os.environ)
             if process_environment is None:
                 return CodexRuntime(
                     cli_path=settings.codex_cli_path,
+                    process_environment=wrapper_overlay or None,
                     working_state_environment=os.environ,
                     memory_materializer_path=settings.codex_memory_materializer_path,
                     memory_bootstrap_timeout_seconds=(
@@ -374,7 +386,7 @@ def _build_standard_context(
             ensure_private_directory(Path(process_environment["CODEX_SQLITE_HOME"]))
             return CodexRuntime(
                 cli_path=settings.codex_cli_path,
-                process_environment=process_environment,
+                process_environment={**wrapper_overlay, **process_environment},
                 memory_materializer_path=settings.codex_memory_materializer_path,
                 memory_bootstrap_timeout_seconds=(
                     settings.codex_memory_bootstrap_timeout_seconds
@@ -528,6 +540,7 @@ def _build_standard_context(
 
         distill_local_sink_worker = CodexDistillLocalSinkWorker(
             distill_journal,
+            environment=with_wrapper_environment(os.environ, settings),
             audience_root=shared_memory_audience(settings).root,
             indexer_path=(
                 Path(settings.codex_memory_materializer_path).expanduser().parent

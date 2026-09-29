@@ -658,6 +658,18 @@ class BotLifecycleMixin(MemoryDistillMixin):
 
         return False, "claude authentication unavailable"
 
+    def _wrapper_child_environment(self) -> dict[str, str]:
+        """Probe environment with the config's wrapper-only keys (#1771).
+
+        The probes run the same ccc-piri / ccc-codex wrapper as live turns, so
+        they must see the same wrapper settings or health reports a false
+        degraded (or a false healthy) state.
+        """
+
+        from telegram_bot.utils.wrapper_environment import with_wrapper_environment
+
+        return with_wrapper_environment(os.environ, self._config)
+
     def _probe_codex_readiness(self) -> tuple[bool, str]:
         configured_path = str(getattr(self._config, "codex_cli_path", "codex")).strip()
         cli_path = shutil.which(configured_path) or ""
@@ -671,6 +683,7 @@ class BotLifecycleMixin(MemoryDistillMixin):
                 capture_output=True,
                 timeout=float(os.getenv("CODEX_AUTH_STATUS_TIMEOUT", "15")),
                 check=False,
+                env=self._wrapper_child_environment(),
             )
         except subprocess.TimeoutExpired:
             return False, "codex login status timed out"
@@ -694,6 +707,7 @@ class BotLifecycleMixin(MemoryDistillMixin):
                 capture_output=True,
                 timeout=float(os.getenv("PIRI_VERSION_TIMEOUT", "15")),
                 check=False,
+                env=self._wrapper_child_environment(),
             )
         except subprocess.TimeoutExpired:
             return False, "piri version check timed out"
@@ -712,7 +726,7 @@ class BotLifecycleMixin(MemoryDistillMixin):
         async def probe() -> int:
             runtime = PiriRuntime(
                 executable=cli_path,
-                process_environment=os.environ,
+                process_environment=self._wrapper_child_environment(),
                 model_catalog_directory=str(
                     getattr(self._config, "project_root", os.getcwd())
                 ),

@@ -207,6 +207,7 @@ class TestConnectionResilience(unittest.TestCase):
             capture_output=True,
             timeout=15.0,
             check=False,
+            env=dict(os.environ),
         )
 
     @patch("telegram_bot.core.bot_lifecycle.shutil.which", return_value="/usr/bin/piri")
@@ -231,7 +232,50 @@ class TestConnectionResilience(unittest.TestCase):
             capture_output=True,
             timeout=15.0,
             check=False,
+            env=dict(os.environ),
         )
+
+    @patch("telegram_bot.core.bot_lifecycle.shutil.which", return_value="/usr/bin/piri")
+    @patch("telegram_bot.core.bot_lifecycle.subprocess.run")
+    def test_piri_readiness_hands_config_wrapper_keys_to_the_probe(self, mock_run, _mock_which):
+        """#1771: a key set only in the .env files must reach the wrapper probe."""
+        mock_run.return_value = types.SimpleNamespace(returncode=0, stdout="0.84.2\n", stderr="")
+        original_config = self.bot._config
+        wrapper_values = {
+            "CCC_PIRI_REAL_CLI_PATH": "/opt/piri/real-piri",
+            "CCC_PIRI_MEMORY_HOME": "/opt/piri/agent",
+        }
+        self.bot._config = types.SimpleNamespace(
+            **vars(original_config),
+            wrapper_environment=lambda: dict(wrapper_values),
+        )
+        self.addCleanup(setattr, self.bot, "_config", original_config)
+        self.bot._config.agent_provider = "piri"
+        captured = {}
+
+        class RecordingPiriRuntime:
+            def __init__(self, **kwargs):
+                captured.update(kwargs["process_environment"])
+
+            async def list_models(self):
+                return ("model",)
+
+            async def close(self):
+                return None
+
+        with patch.dict(os.environ, {"CCC_PIRI_MEMORY_HOME": "/explicit/agent"}), patch(
+            "telegram_bot.core.piri_runtime.PiriRuntime", RecordingPiriRuntime
+        ):
+            os.environ.pop("CCC_PIRI_REAL_CLI_PATH", None)
+            ready, reason = self.bot._probe_agent_readiness()
+
+        self.assertEqual((ready, reason), (True, ""))
+        probe_env = mock_run.call_args.kwargs["env"]
+        self.assertEqual(probe_env["CCC_PIRI_REAL_CLI_PATH"], "/opt/piri/real-piri")
+        # The process environment still outranks the .env-file value.
+        self.assertEqual(probe_env["CCC_PIRI_MEMORY_HOME"], "/explicit/agent")
+        self.assertEqual(captured["CCC_PIRI_REAL_CLI_PATH"], "/opt/piri/real-piri")
+        self.assertEqual(captured["CCC_PIRI_MEMORY_HOME"], "/explicit/agent")
 
     def test_piri_readiness_rejects_an_empty_model_catalog(self):
         class EmptyPiriRuntime:

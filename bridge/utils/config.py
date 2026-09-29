@@ -7,7 +7,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Annotated, Any, Literal, Optional, List
 from dotenv import dotenv_values
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     NoDecode,
@@ -28,6 +28,7 @@ from telegram_bot.utils.session_resource_guard import (
 from telegram_bot.utils.settings_heartbeat import HeartbeatSettingsMixin
 from telegram_bot.utils.settings_memory import MemorySettingsMixin
 from telegram_bot.utils.settings_voice import VoiceSettingsMixin
+from telegram_bot.utils.wrapper_environment import select_wrapper_environment
 
 BOT_PACKAGE_DIR = Path(__file__).resolve().parent.parent
 
@@ -196,9 +197,25 @@ class Config(
         )
         token = _LOAD_EXPLICIT_VALUES_ONLY.set(True)
         try:
-            return cls.model_validate(values)
+            loaded = cls.model_validate(values)
         finally:
             _LOAD_EXPLICIT_VALUES_ONLY.reset(token)
+        # #1771: wrapper-only keys are not settings fields; keep the allowlisted
+        # subset of the merged sources so spawn sites can hand it to children.
+        loaded._wrapper_environment = select_wrapper_environment(merged)
+        return loaded
+
+    _wrapper_environment: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    def wrapper_environment(self) -> dict[str, str]:
+        """Return the allowlisted wrapper-only keys from the merged sources.
+
+        ``load`` never exports to ``os.environ``; the ccc-piri / ccc-codex
+        wrappers read these keys only from their process environment, so every
+        spawn site adds them explicitly (see ``utils/wrapper_environment``).
+        """
+
+        return dict(self._wrapper_environment)
 
     agent_provider: Literal["claude", "codex", "crush", "piri", "danso", "grok"] = Field(
         default="claude",

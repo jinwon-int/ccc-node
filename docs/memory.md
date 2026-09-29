@@ -192,7 +192,14 @@ the Codex global block, including the managed nunchi merge when nunchi mode is
 Point `CCC_PIRI_CLI_PATH` at the installed `~/.claude/hooks/ccc-piri` and
 `CCC_PIRI_REAL_CLI_PATH` at the real Piri CLI (e.g. a model-selecting shim).
 `CCC_PIRI_MEMORY_MATERIALIZER_PATH` and `CCC_PIRI_MEMORY_HOME` override the
-materializer and target agent dir. Because the canonical loader output alone
+materializer and target agent dir. The wrappers read these keys (and
+`CCC_PIRI_MEMORY_SKIP`, `CCC_CODEX_REAL_CLI_PATH`,
+`CCC_CODEX_MEMORY_MATERIALIZER_PATH`) only from their own process environment,
+so the bridge hands exactly this allowlist from its merged settings — process
+env, project `.env`, then `bridge/.env` — to every wrapper child it spawns
+(readiness probes, provider runtimes, distill and skill-candidate lanes) for
+both the Telegram and Matrix frontends. A value already present in the process
+environment always wins, and nothing outside the allowlist is exported (#1771). Because the canonical loader output alone
 exceeds the 8192-byte materializer default on fleet nodes — which silently
 truncated the nunchi block — the launcher defaults
 `CCC_CODEX_MEMORY_MAX_BYTES` to `16384` (16 KiB; hard max 24576); an explicit
