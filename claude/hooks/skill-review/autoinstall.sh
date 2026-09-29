@@ -266,6 +266,30 @@ gate_lint() { # <skill.md>
   return 0
 }
 
+# Promotion frontmatter contract (#1822). The unattended install used to accept
+# frontmatter the promotion snapshot rejects (extra keys such as a nested
+# `metadata:` block, blank/comment lines, a padded `---`), so 42% of codex-lane
+# installs later stalled at promotion as skill_frontmatter_invalid after the
+# drafting cost was paid. The check runs the promoter's own validator
+# (ccc_skill_frontmatter.py strict_frontmatter_fields) — one contract, no
+# divergence. Unattended path only: an owner-approved `apply` keeps the
+# documented optional fields. Fails closed like the trigger gate.
+gate_promotable_frontmatter() { # <skill.md>
+  local code rc
+  if ! command -v python3 >/dev/null 2>&1 || [ ! -r "$SKILL_FM_TOOL" ]; then
+    printf 'lint frontmatter-unverifiable'; return 1
+  fi
+  code="$(python3 "$SKILL_FM_TOOL" check "$1" 2>/dev/null)"
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) printf 'lint frontmatter-not-promotable %s' \
+         "$(printf '%s' "${code:-skill_frontmatter_invalid}" | tr -c 'a-z0-9_' '_' | cut -c1-40)" ;;
+    *) printf 'lint frontmatter-unverifiable' ;;
+  esac
+  return 1
+}
+
 gate_size() { # <skill.md> — progressive disclosure: oversized bodies must split
   local f="$1" lines
   lines="$(wc -l < "$f" 2>/dev/null | tr -d '[:space:]')"
@@ -722,6 +746,9 @@ do_run() {
     fi
     f="$work/$id.yaml-safe.SKILL.md"
     if ! verdict="$(gate_lint "$f")"; then
+      record_block "$dir" "$id" "$verdict"; continue
+    fi
+    if ! verdict="$(gate_promotable_frontmatter "$f")"; then
       record_block "$dir" "$id" "$verdict"; continue
     fi
     if ! verdict="$(gate_size "$f")"; then

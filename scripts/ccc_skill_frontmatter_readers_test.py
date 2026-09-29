@@ -112,5 +112,32 @@ class ReaderAgreementTests(unittest.TestCase):
                     sys.modules["ccc_skill_frontmatter"] = saved_module
 
 
+class PromotionGateParityTests(unittest.TestCase):
+    """#1822: the install gate and the promotion snapshot share one validator."""
+
+    CASES = [
+        skill_md("Use when X: do Y after the rollout finishes"),
+        skill_md('"Use when X: do Y after the rollout finishes"'),
+        skill_md("Use when checking backups\nmetadata:\n  short-description: backups"),
+        skill_md("Use when checking backups\ncompatibility: any"),
+        skill_md("too short"),
+        skill_md("Use when checking the backup rotation", name="other-skill"),
+    ]
+
+    def test_promotion_and_shared_validator_agree(self):
+        for text in self.CASES:
+            with self.subTest(text=text):
+                try:
+                    shared = ("ok", sf.strict_frontmatter_fields(text, "demo-skill", require_yaml_safe=True))
+                except sf.FrontmatterError as error:
+                    shared = ("error", error.code)
+                try:
+                    promoted = ("ok", promotion._frontmatter_fields(
+                        text.encode(), "demo-skill", require_yaml_safe=True))
+                except promotion.PromotionError as error:
+                    promoted = ("error", error.code)
+                self.assertEqual(shared, promoted)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -276,3 +276,74 @@ def test_bridge_line_readers_decode_quoted_values():
     assert values["description"] == "Use when X: do Y and fix issue #42"
     assert skill_command._frontmatter_name(text) == "demo-skill"
     assert skill_command._frontmatter_name("---\nname: 'demo-skill'\n---\n") == "demo-skill"
+
+
+# --- #1822: one strict frontmatter contract for install and promotion --------
+
+_STRICT_BODY = "\n# Demo\n\n## Procedure\n1. Step.\n"
+_STRICT_OK = (
+    "---\nname: demo-skill\n"
+    'description: "Use when X: do Y after the rollout finishes"\n---\n' + _STRICT_BODY
+)
+
+
+def test_strict_frontmatter_accepts_the_promotion_shape():
+    description, raw = sf.strict_frontmatter_fields(_STRICT_OK, "demo-skill")
+    assert description == "Use when X: do Y after the rollout finishes"
+    assert raw == '"Use when X: do Y after the rollout finishes"'
+    assert sf.strict_frontmatter_fields(_STRICT_OK)[0] == description
+
+
+@pytest.mark.parametrize(
+    "frontmatter",
+    [
+        # Codex-style nested metadata block: installable before #1822, never promotable.
+        "name: demo-skill\ndescription: Use when checking the backup rotation\n"
+        "metadata:\n  short-description: backup rotation",
+        "name: demo-skill\ndescription: Use when checking the backup rotation\ncompatibility: any",
+        "name: demo-skill\n\ndescription: Use when checking the backup rotation",
+        "name: demo-skill\n# comment\ndescription: Use when checking the backup rotation",
+        "name: demo-skill\nname: demo-skill\ndescription: Use when checking the backup rotation",
+        "name: demo-skill\ndescription: too short",
+        "name: demo-skill\ndescription: >-",
+        "name: demo-skill",
+    ],
+)
+def test_strict_frontmatter_rejects_what_promotion_rejects(frontmatter):
+    with pytest.raises(sf.FrontmatterError) as caught:
+        sf.strict_frontmatter_fields(f"---\n{frontmatter}\n---\n{_STRICT_BODY}")
+    assert caught.value.code == "skill_frontmatter_invalid"
+
+
+def test_strict_frontmatter_structure_codes():
+    padded = _STRICT_OK.replace("---\nname", "--- \nname", 1)
+    with pytest.raises(sf.FrontmatterError):
+        sf.strict_frontmatter_fields(padded)
+    with pytest.raises(sf.FrontmatterError) as caught:
+        sf.strict_frontmatter_fields(_STRICT_OK, "other-skill")
+    assert caught.value.code == "skill_name_mismatch"
+    short_body = "---\nname: demo-skill\ndescription: Use when checking the backup rotation\n---\nx\n"
+    with pytest.raises(sf.FrontmatterError):
+        sf.strict_frontmatter_fields(short_body)
+    unsafe = "---\nname: demo-skill\ndescription: Use when X: do Y after the rollout\n---\n" + _STRICT_BODY
+    assert sf.strict_frontmatter_fields(unsafe)[0] == "Use when X: do Y after the rollout"
+    with pytest.raises(sf.FrontmatterError) as caught:
+        sf.strict_frontmatter_fields(unsafe, require_yaml_safe=True)
+    assert caught.value.code == "skill_description_yaml_unsafe"
+
+
+def test_cli_check(tmp_path):
+    env = {**os.environ, "PYTHONPATH": ""}
+    run = [sys.executable, str(MODULE_PATH), "check"]
+    good = tmp_path / "good.md"
+    good.write_text(_STRICT_OK, encoding="utf-8")
+    assert subprocess.run([*run, str(good)], env=env).returncode == 0
+    bad = tmp_path / "bad.md"
+    bad.write_text(_STRICT_OK.replace("---\n\n", "compatibility: any\n---\n\n", 1), encoding="utf-8")
+    result = subprocess.run([*run, str(bad)], env=env, capture_output=True, text=True)
+    assert (result.returncode, result.stdout) == (1, "skill_frontmatter_invalid\n")
+    binary = tmp_path / "binary.md"
+    binary.write_bytes(b"---\nname: \xff\n---\n")
+    result = subprocess.run([*run, str(binary)], env=env, capture_output=True, text=True)
+    assert (result.returncode, result.stdout) == (1, "skill_not_utf8\n")
+    assert subprocess.run([*run, str(tmp_path / "missing")], env=env).returncode == 2

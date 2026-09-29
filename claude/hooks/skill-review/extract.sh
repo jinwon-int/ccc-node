@@ -145,7 +145,7 @@ Criteria:
 - Check the existing skills list below (names and descriptions) for overlap first. Prefer improving an existing skill over creating a near-duplicate; this hook cannot patch, so return [] if an existing skill already covers or nearly covers it.
 - Do NOT capture one-off task narratives, PR numbers, transient errors, mutable live node facts, raw secrets, endpoints, tokens, private message text, or credentials.
 - Keep proposed skills node-agnostic and public-safe. Mention credential locations/handling rules only, never values.
-- A valid SKILL.md starts with YAML frontmatter containing name and description.
+- A valid SKILL.md starts with YAML frontmatter holding EXACTLY two single-line keys, name and description, between two lines that are exactly ---. No other keys (no metadata, compatibility, tags, version, allowed-tools), no nested or multi-line values, no blank or comment lines inside the frontmatter. Drafts with any other frontmatter shape are rejected at install and at promotion.
 - name: a general, reusable capability name (what kind of work it helps with), not one derived from the incident. No dates, PR/issue numbers, node or host names, or one-off error text in the name.
 - description: one line, at most 300 characters. It MUST START with the trigger, i.e. when to use the skill: "Use when <situation> ..." in English or "<상황>할 때 사용 ..." in Korean. Put what the skill does after the trigger. The agent picks skills from a truncated description listing, and a description without trigger wording is rejected at install and at promotion. No incident-specific numbers (counts, PR/issue numbers, versions, dates) and no node or host names.
 - The body should include: When to Use, Procedure, Safety, Verification.
