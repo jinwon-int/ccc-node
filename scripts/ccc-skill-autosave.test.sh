@@ -674,6 +674,7 @@ ok "#1932: sweep summary separates drafts from skips" \
 ok "#1932: skipped transcripts are ledgered so they are not revisited" \
   '[ "$(grep -c "^batch-[1-4]	" "$STATE14/skill-autosave.seen")" = 4 ]'
 for _ in $(seq 1 40); do [ -f "$STATE14/skill-review-last.json" ] && break; sleep 0.25; done
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(CCC_STATE_DIR="$STATE14" bash "$AUTOSAVE" status 2>&1)"
 ok "#1932: status reports the last real drafting review" \
   'printf "%s" "$out" | grep -Eq "^last drafting review: [0-9]{4}-[0-9]{2}-[0-9]{2}T"'

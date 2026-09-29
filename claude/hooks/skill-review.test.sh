@@ -256,7 +256,9 @@ payload sess-short "$SHORT" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE_SK
   CCC_SKILL_REVIEW_SKIP_RC=3 bash "$REVIEW" manual >/dev/null 2>&1; rc=$?
 ok "#1932: too-few-turns skip returns the requested skip code" '[ "$rc" = 3 ]'
 payload sess-short "$SHORT" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE_SKIP" CLAUDE_SKILLS_DIR="$SKILLS" \
-  CCC_SKILL_REVIEW_SKIP_RC=bogus bash "$REVIEW" manual >/dev/null 2>&1; rc=$?
+  CCC_SKILL_REVIEW_SKIP_RC=bogus bash "$REVIEW" manual >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "#1932: a malformed skip code falls back to exit 0" '[ "$rc" = 0 ]'
 ok "#1932: the skip is still logged as too-few-turns" \
   '[ "$(grep -c "skip reason=too-few-turns" "$STATE_SKIP/skill-review.log")" = 3 ]'
