@@ -143,6 +143,50 @@ dispatchers over canonical direct children named `shared` or
 `mempalace-home`. Unsafe owners/modes, symlinks, non-canonical names, and
 out-of-root transcript inputs fail closed. Provider provenance remains `piri`.
 
+A Claude-provider bridge enables the same scoped collection with
+`scripts/install-nunchi.sh --apply --claude --audience-scoped
+<absolute-memory-audience-root>` (#1921). Claude transcripts all share
+`~/.claude/projects`, so the audience cannot come from where a transcript
+lives. Instead, after every successful Claude turn the bridge writes one
+body-free sidecar, `<root>/<scope>/claude/session-map/<session_id>.json`
+(schema `ccc.claude.session-audience.v1`: `provider`, `session_id`,
+`memory_audience`, `memory_scope`, `updated_at` — no message content, no raw
+Telegram/Matrix ids; directory 0700, file 0600, atomic rename), using the same
+`resolve_memory_audience` route the session store records. Bridge-started
+turns that skip the normal session save (external-wait resume, continuation)
+record the route they ran under too, so a session reused across surfaces shows
+up as `ambiguous` rather than being routed by an older record.
+
+`ingest-cron.sh` then hands off to `claude-audience-feed.py`, which routes each
+bridge distill-journal job by its Claude session id into exactly one
+`<scope>/nunchi` store. A scope's own `<scope>/state/distill-history` (where
+bridge-session hooks write) is ingested only into that scope, and only when the
+sidecar maps the session there. The node-wide `~/.claude/state/distill-history`
+is **not** read in this mode: bridge-managed distill never writes it, so it
+holds only non-bridge sessions (terminal CLI, cron, workers), and routing those
+by session id alone would let `claude --resume <room session>` on the
+operator's terminal push private facts into the shared store.
+
+A session with no sidecar (`unmapped`), valid sidecars under two scopes
+(`ambiguous`), or a malformed, mislabelled, symlinked or group/other-readable
+sidecar — or a journal job whose own route is missing or disagrees with it,
+or a scope-history item whose sidecar maps elsewhere (`invalid`) — is skipped,
+left unseen for a later tick, and counted in `ingest.status.json`; nothing is
+ever written to the node-global store in this mode. The cron log only speaks
+when those counts change. Sidecars untouched for
+`CCC_NUNCHI_CLAUDE_SIDECAR_MAX_AGE_DAYS` (default 90, `0` disables) whose
+session has no pending input are pruned; a resumed session gets a fresh one on
+its next turn. The verbatim MemPalace sweep has no per-session router, so the
+installer does not wire it for this lane.
+
+`ccc-doctor` reports a `nunchi claude audience map` DEFECT row while the
+audience root holds no sidecar that parses as a valid record (the tick also
+carries `skipped: no-audience-sidecar`), when the cron's audience root differs
+from the bridge's (`CCC_BRIDGE_MEMORY_AUDIENCE_ROOT`, default
+`<bot-data-dir>/memory-audiences`), and when the runtime is Claude but the
+scoped lane is still another provider's. Codex and Danso remain refused with
+`--audience-scoped`.
+
 Recall follows one rule across Piri, Claude, and Codex materialization: a
 private route may read its own scoped Nunchi snapshot, the shared snapshot, and
 the original node-global snapshot as private-only migration input; a shared

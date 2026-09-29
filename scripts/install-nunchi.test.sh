@@ -404,6 +404,42 @@ out="$(run_install 2>&1)"; rc=$?
 ok "scoped collection row sorts the worst state first" \
   '[ "$rc" = 0 ] && grep -q "^collection: private-2222…(state=error exit_code=124 finished_at=1786000001) " <<<"$out"'
 
+# #1921: Claude audience-scoped collection. The installer used to refuse
+# `--claude --audience-scoped` outright ("currently requires Piri"), leaving an
+# audience-scoped Claude node with no re-apply path and collection frozen at 0.
+# It now wires the per-session sidecar router; other scoped combos still fail.
+# shellcheck disable=SC2034  # cron_before is read via eval inside ok()
+cron_before="$(cat "$cron_store")"
+out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" \
+  --apply --codex --audience-scoped "$audience_root" 2>&1)"; rc=$?
+ok "codex + audience-scoped is still refused, crontab untouched" \
+  '[ "$rc" = 2 ] && grep -q "supports Piri and Claude only" <<<"$out" && [ "$(cat "$cron_store")" = "$cron_before" ]'
+out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" \
+  --apply --danso --audience-scoped "$audience_root" 2>&1)"; rc=$?
+ok "danso + audience-scoped is still refused, crontab untouched" \
+  '[ "$rc" = 2 ] && grep -q "supports Piri and Claude only" <<<"$out" && [ "$(cat "$cron_store")" = "$cron_before" ]'
+out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" \
+  --apply --claude --audience-scoped "$audience_root" 2>&1)"; rc=$?
+ok "claude + audience-scoped is accepted" \
+  '[ "$rc" = 0 ] && grep -q "provider=claude, feed=ingest-cron.sh" <<<"$out"'
+ok "claude scoped feed cron carries the audience flag and root" \
+  'grep "ingest-cron.sh" "$cron_store" | grep -q "CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$audience_root"'
+ok "claude scoped install wires no unroutable verbatim MemPalace sweep" \
+  '! grep -q "mempalace-refresh.sh" "$cron_store" && grep -q "verbatim MemPalace refresh is not audience-routable" <<<"$out"'
+ok "claude scoped install warns while no sidecar exists yet" \
+  'grep -q "no Claude session->audience sidecar" <<<"$out"'
+ok "claude scoped apply materializes provider and audience flags into the install record" \
+  'jq -e --arg root "$audience_root" ".argv==[\"--apply\",\"--claude\",\"--audience-scoped\",\$root]" "$nrec" >/dev/null'
+mkdir -p "$shared_scope/claude/session-map"
+chmod 700 "$shared_scope/claude" "$shared_scope/claude/session-map"
+printf '{}\n' > "$shared_scope/claude/session-map/aaaaaaaa-0000-4000-8000-000000000001.json"
+out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" \
+  --apply --claude --audience-scoped "$audience_root" 2>&1)"; rc=$?
+ok "claude scoped install stops warning once a sidecar exists" \
+  '[ "$rc" = 0 ] && ! grep -q "no Claude session->audience sidecar" <<<"$out"'
+rm -rf "$shared_scope/claude"
+run_install --apply --piri --audience-scoped "$audience_root" >/dev/null 2>&1
+
 edge_status="$TMP/edge-refresh.status.json"
 timeout_capture="$TMP/timeout.args"
 write_exec_stub "$fake_bin/timeout" <<'SH'

@@ -60,6 +60,7 @@ from telegram_bot.core.external_wait import (
     default_active_turns_path as external_wait_active_turns_path,
     default_registry_path as external_wait_registry_path,
 )
+from telegram_bot.core.claude_audience_sidecar import record_bridge_started_turn
 from telegram_bot.core.continuation import ContinuationQueue, default_queue_path
 from telegram_bot.core.continuation_monitor import ContinuationMonitor
 from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
@@ -1538,6 +1539,14 @@ class BotLifecycleMixin(MemoryDistillMixin):
                     "External-wait resume turn failed: wait=%s", record.get("wait_id")
                 )
                 return False
+            # #1921: this turn skips _save_session_id; record the route it ran
+            # under so cross-surface session reuse is visible to nunchi.
+            await record_bridge_started_turn(
+                self._config,
+                user_id=int(record["user_id"]),
+                chat_id=int(record["chat_id"]),
+                response=response,
+            )
             content = str(getattr(response, "content", "") or "")
             # A successful interim-only turn already reached the conversation.
             # Do not mark it failed or resend its completed message.
@@ -1676,6 +1685,10 @@ class BotLifecycleMixin(MemoryDistillMixin):
                     "Continuation turn failed: %s", record.get("continuation_id")
                 )
                 return False
+            # #1921: same as the external-wait resume above.
+            await record_bridge_started_turn(
+                self._config, user_id=user_id, chat_id=chat_id, response=response
+            )
             content = str(getattr(response, "content", "") or "")
             # A successful interim-only turn already reached the conversation.
             # Do not mark it failed or resend its completed message.

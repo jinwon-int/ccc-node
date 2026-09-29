@@ -399,6 +399,7 @@ class TelegramBot(
                 "session_id": response.session_id,
             }
             remove_fields: set[str] = set()
+            audience = None
             if user_id is not None and chat_id is not None:
                 from telegram_bot.core.memory_audience import resolve_memory_audience
 
@@ -424,6 +425,15 @@ class TelegramBot(
                 remove_fields=remove_fields,
             )
             self._runtime_active_sessions.add(session_key)
+            # #1921: the nunchi collector can only route a Claude transcript
+            # through this per-turn session_id -> audience record.
+            from telegram_bot.core.claude_audience_sidecar import (
+                record_claude_turn_audience,
+            )
+
+            await record_claude_turn_audience(
+                self._active_provider(), audience, response.session_id
+            )
             if not is_paused_task:
                 try:
                     await self._record_codex_checkpoint(
