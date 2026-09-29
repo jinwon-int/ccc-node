@@ -479,7 +479,7 @@ u_skill() {
   python3 "$OWN" --provider claude --skills-dir "$U_SKILLS" --state-dir "$U_STATE" mark-created "$1" >/dev/null
 }
 u_ledger() { # <line...> — replace usage.jsonl with the given raw lines
-  mkdir -p -m 700 "$U_STATE/skill-usage"
+  [ -d "$U_STATE/skill-usage" ] || mkdir -m 700 "$U_STATE/skill-usage"
   printf '%s\n' "$@" > "$U_LEDGER"
   chmod 600 "$U_LEDGER"
 }
@@ -536,7 +536,9 @@ ok "union: missing usage.jsonl falls back to the Skill-tool ledger" \
 # use evidence, so no idle transition is made at all.
 u_ledger "{\"ts\":\"$(ts_at 1)\",\"skill\":\"u-read-only\",\"tool\":\"Read\"}"
 chmod 666 "$U_LEDGER"
-out="$(ut_at 80 run --dry-run)"; rc=$?
+out="$(ut_at 80 run --dry-run)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "union: an unreadable usage.jsonl holds every idle transition" \
   '[ "$rc" -eq 0 ] && jq -e ".usage_ledgers.evidence == \"unreadable\" and .counts.marked_stale == 0" >/dev/null <<<"$out" && [ "$(u_decision "$out" u-unused)" = "keep usage-ledger-unreadable" ]'
 rm -f "$U_LEDGER"
