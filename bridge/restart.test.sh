@@ -322,7 +322,8 @@ kill "$BW_OLD" 2>/dev/null
 recovery_window() { # <candidate-rc> [env assignments...]
     local rc="$1"; shift
     env -u CCC_BRIDGE_RESTART_READY_TIMEOUT -u CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT \
-        -u CCC_BRIDGE_RESTART_DEADLINE_EPOCH HOME="$TMP/home-win" "$@" bash -c '
+        -u CCC_BRIDGE_RESTART_DEADLINE_EPOCH -u TERMUX_VERSION -u PREFIX \
+        HOME="$TMP/home-win" "$@" bash -c '
         CCC_START_SH_LIB_ONLY=1 . "$1" --path "$2" >/dev/null
         restart_resolve_windows >/dev/null || exit 6
         restart_recovery_window "$3"' _ "$START" "$TMP/win-project" "$rc"
@@ -336,8 +337,16 @@ okc "$(recovery_window 2 CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT=300)" 300 "ex
 NOW="$(date -u +%s)"
 w="$(recovery_window 4 CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$((NOW + 60 + 120))")"
 ok "outer deadline shrinks the timeout recovery window (got $w)" '[ "$w" -ge 118 ] && [ "$w" -le 120 ]'
-okc "$(recovery_window 4 CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$((NOW + 10))")" 90 "outer deadline never shrinks below the candidate window"
+okc "$(recovery_window 4 CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$((NOW + 10))")" 1 "an exhausted outer deadline still wins (1s floor), before its group kill"
 okc "$(recovery_window 4 CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$((NOW + 3600))")" 180 "a roomy outer deadline changes nothing"
+# Owner decision on #1868 (option 3): Termux defaults to a 180s candidate
+# window, so a timed-out candidate's recovery gets 360s. Both detections count.
+okc "$(recovery_window 4 TERMUX_VERSION=0.118.0)" 360 "Termux timeout recovery default is max(2x180, 180) = 360"
+okc "$(recovery_window 2 PREFIX=/data/data/com.termux/files/usr)" 180 "Termux (PREFIX) start-error recovery keeps the 180s candidate window"
+okc "$(recovery_window 4 TERMUX_VERSION=0.118.0 CCC_BRIDGE_RESTART_READY_TIMEOUT=90)" 180 "explicit ready window still overrides the Termux default"
+okc "$(recovery_window 4 TERMUX_VERSION=0.118.0 CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$((NOW + 720))")" 360 "Termux 720s command budget leaves the full 360s recovery at its start"
+w="$(recovery_window 4 TERMUX_VERSION=0.118.0 CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$((NOW + 360))")"
+ok "a 360s outer budget clamps the Termux recovery inside the deadline (got $w)" '[ "$w" -ge 298 ] && [ "$w" -le 300 ]'
 
 # ---- #1868: candidate + recovery outcomes (real finish path, stubbed lifecycle)
 # Lifecycle predicates are fixtures; finish_prepared_restart_failure decides the
@@ -348,7 +357,7 @@ finish_case() { # <candidate-rc> <recovery-rc> <verify-rc> <serving: dead|alive|
     mkdir -p "$TMP/fin-project"
     rm -f "$TMP/fin-project/recovery.env"
     run env -u CCC_BRIDGE_RESTART_READY_TIMEOUT -u CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT \
-        -u CCC_BRIDGE_RESTART_DEADLINE_EPOCH HOME="$TMP/home-fin" \
+        -u CCC_BRIDGE_RESTART_DEADLINE_EPOCH -u TERMUX_VERSION -u PREFIX HOME="$TMP/home-fin" \
         FIN_RECOVERY_RC="$2" FIN_VERIFY_RC="$3" FIN_SERVING="$4" FIN_LIVE="$FIN_LIVE" \
         bash -c '
         CCC_START_SH_LIB_ONLY=1 . "$1" --path "$2" >/dev/null

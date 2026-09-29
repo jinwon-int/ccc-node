@@ -56,7 +56,10 @@
 #      CCC_SELF_UPDATE_AUTO_RECOVER (default 1; 0 restores the unconditional
 #      wrong-branch fail-closed abort, #1328),
 #      CCC_SELF_UPDATE_SYSTEMCTL (default systemctl; tests inject a fake),
-#      CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS (180; integer 1..900),
+#      CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS (180, 720 on Termux;
+#      integer 1..900. Termux: the #1868 owner decision gives the bridge a 180s
+#      candidate window and a 360s recovery window after a candidate timeout;
+#      720 = both plus stop/validation overhead and the 60s recovery margin),
 #      CCC_SELF_UPDATE_RESTART_WAIT_SECONDS (60; separate health-probe budget),
 #      The restart command receives CCC_BRIDGE_RESTART_DEADLINE_EPOCH (this
 #      budget's end) so a bridge recovery attempt can size itself to fit
@@ -105,7 +108,11 @@ REPO_FILE="$CLAUDE_DIR/self-update.repo"
 RESTART_CMD_FILE="${CCC_SELF_UPDATE_RESTART_CMD_FILE:-$CLAUDE_DIR/self-update.restart-cmd}"
 HEALTH_CMD_FILE="${CCC_SELF_UPDATE_HEALTH_CMD_FILE:-$CLAUDE_DIR/self-update.health-cmd}"
 RESTART_WAIT_SECONDS="${CCC_SELF_UPDATE_RESTART_WAIT_SECONDS:-60}"
-RESTART_COMMAND_TIMEOUT_SECONDS="${CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS-180}"
+RESTART_COMMAND_TIMEOUT_DEFAULT=180
+if [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]; then
+  RESTART_COMMAND_TIMEOUT_DEFAULT=720
+fi
+RESTART_COMMAND_TIMEOUT_SECONDS="${CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS-$RESTART_COMMAND_TIMEOUT_DEFAULT}"
 BRANCH="${CCC_SELF_UPDATE_BRANCH:-main}"
 SYSTEMCTL="${CCC_SELF_UPDATE_SYSTEMCTL:-systemctl}"
 

@@ -193,7 +193,7 @@ export CCC_TEST_DEADLINE_OUT="$TMP/deadline.out"
 selfup_bump double-timeout
 # shellcheck disable=SC2034  # before_epoch is read via eval inside ok()
 before_epoch="$(date -u +%s)"
-out="$(run_selfup run 2>&1)"; rc=$?
+out="$(CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS=240 run_selfup run 2>&1)"; rc=$?
 ok "double-timeout restart still exits 7 with result unchanged" '[ "$rc" = 7 ] && last_audit | jq -e ".result == \"restart-failures\"" >/dev/null'
 ok "double-timeout failure_kind is timeout" \
   'last_audit | jq -e ".failure_kind == \"timeout\" and .restart_outcome.restart_exit == 8 and .restart_outcome.recovery == \"timeout\" and .restart_outcome.recovery_window == 180 and .restart_outcome.serving == \"dead\" and .restart_outcome.serving_pid == null and .restart_outcome.previous_pid == 4321 and .restart_outcome.previous_alive == false" >/dev/null'
@@ -205,7 +205,7 @@ ok "double-timeout notification says the service is down" \
 # shellcheck disable=SC2034  # deadline is read via eval inside ok()
 deadline="$(cat "$TMP/deadline.out" 2>/dev/null)"
 ok "restart command receives the outer deadline epoch" \
-  '[ -n "$deadline" ] && [ "$deadline" -ge "$((before_epoch + 180))" ] && [ "$deadline" -le "$(( $(date -u +%s) + 180 ))" ]'
+  '[ -n "$deadline" ] && [ "$deadline" -ge "$((before_epoch + 240))" ] && [ "$deadline" -le "$(( $(date -u +%s) + 240 ))" ]'
 rm -rf "$STATE"/self-update-install-rollback.*
 
 cat > "$CLAUDE/self-update.restart-cmd" <<'CMD'
@@ -330,8 +330,20 @@ STUB
 printf '%s\n' 'exit 0' > "$CLAUDE/self-update.restart-cmd"
 printf '%s\n' 'exit 0' > "$CLAUDE/self-update.health-cmd"
 : > "$CCC_TEST_TIMEOUT_CALLS"
-out="$(run_selfup run --force 2>&1)"; rc=$?
+# Non-Termux default stays 180 even when this suite itself runs on Termux.
+out="$(TERMUX_VERSION='' PREFIX=/usr run_selfup run --force 2>&1)"; rc=$?
 ok "default external restart deadline remains180; health stays separate" '[ "$rc" = 0 ] && [ "$(sed -n "1p" "$CCC_TEST_TIMEOUT_CALLS")" = 180 ] && [ "$(sed -n "2p" "$CCC_TEST_TIMEOUT_CALLS")" -le 3 ]'
+# #1868 owner decision (option 3): Termux defaults to a 720s command budget so
+# the bridge's 180s candidate + 360s recovery windows fit before the watchdog.
+: > "$CCC_TEST_TIMEOUT_CALLS"
+out="$(TERMUX_VERSION=0.118.0 run_selfup run --force 2>&1)"; rc=$?
+ok "Termux (TERMUX_VERSION) default external restart budget is 720" '[ "$rc" = 0 ] && [ "$(sed -n "1p" "$CCC_TEST_TIMEOUT_CALLS")" = 720 ] && [ "$(sed -n "2p" "$CCC_TEST_TIMEOUT_CALLS")" -le 3 ]'
+: > "$CCC_TEST_TIMEOUT_CALLS"
+out="$(TERMUX_VERSION='' PREFIX=/data/data/com.termux/files/usr run_selfup run --force 2>&1)"; rc=$?
+ok "Termux (PREFIX) default external restart budget is 720" '[ "$rc" = 0 ] && [ "$(sed -n "1p" "$CCC_TEST_TIMEOUT_CALLS")" = 720 ]'
+: > "$CCC_TEST_TIMEOUT_CALLS"
+out="$(TERMUX_VERSION=0.118.0 CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS=360 run_selfup run --force 2>&1)"; rc=$?
+ok "explicit budget still overrides the Termux default" '[ "$rc" = 0 ] && [ "$(sed -n "1p" "$CCC_TEST_TIMEOUT_CALLS")" = 360 ]'
 for budget in 300 900; do
   : > "$CCC_TEST_TIMEOUT_CALLS"
   out="$(CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS="$budget" run_selfup run --force 2>&1)"; rc=$?

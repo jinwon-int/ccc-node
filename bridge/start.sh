@@ -1228,7 +1228,8 @@ cleanup_token_lock_if_safe() {
 #
 # Operator knobs (#1868; defaults preserve production behavior):
 #   CCC_BRIDGE_RESTART_READY_TIMEOUT  seconds to wait for "available" (90;
-#       integer 1..3600, validated before anything is stopped)
+#       180 on Termux per the #1868 owner decision; integer 1..3600,
+#       validated before anything is stopped)
 #   CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT  "available" window for the
 #       one-shot --recovery-source attempt (integer 1..3600). Unset: when the
 #       candidate failed by readiness TIMEOUT the recovery gets
@@ -1237,8 +1238,8 @@ cleanup_token_lock_if_safe() {
 #       start error it keeps the candidate window (unchanged behavior).
 #   CCC_BRIDGE_RESTART_DEADLINE_EPOCH  optional outer watchdog deadline (epoch
 #       seconds; ccc-self-update exports it). The recovery window is shrunk to
-#       fit inside it with a margin, but never below min(recovery, candidate)
-#       window — i.e. never shorter than the pre-#1868 behavior.
+#       end 60s before it (floor 1s): the watchdog's process-group kill would
+#       also take the recovery bridge, an early readiness verdict does not.
 # Test seams:
 #   CCC_BRIDGE_RESTART_STOP_TIMEOUT   seconds to wait for old-process exit (15)
 #   CCC_BRIDGE_RESTART_SPAWN          start command override (this start.sh)
@@ -1255,10 +1256,16 @@ cleanup_token_lock_if_safe() {
 RESTART_OLD_PID=""
 RESTART_OLD_SUPERVISOR_PID=""
 RESTART_READY_DEFAULT=90
+# Owner decision on #1868 (option 3): Termux devices get a 180s default.
+RESTART_READY_DEFAULT_TERMUX=180
 RESTART_READY_TIMEOUT="$RESTART_READY_DEFAULT"
 RESTART_RECOVERY_MIN_WINDOW=180
 # Reserve for the recovery's own stop/validation/launch inside an outer deadline.
 RESTART_DEADLINE_MARGIN=60
+
+restart_is_termux() {
+    [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]
+}
 
 restart_window_valid() { # <value> — integer seconds 1..3600, no leading zero
     [[ "$1" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$1" -le 3600 ]
@@ -1266,7 +1273,9 @@ restart_window_valid() { # <value> — integer seconds 1..3600, no leading zero
 
 # Validate the operator window knobs; called before anything is stopped.
 restart_resolve_windows() {
-    RESTART_READY_TIMEOUT="${CCC_BRIDGE_RESTART_READY_TIMEOUT:-$RESTART_READY_DEFAULT}"
+    local default="$RESTART_READY_DEFAULT"
+    restart_is_termux && default="$RESTART_READY_DEFAULT_TERMUX"
+    RESTART_READY_TIMEOUT="${CCC_BRIDGE_RESTART_READY_TIMEOUT:-$default}"
     if ! restart_window_valid "$RESTART_READY_TIMEOUT"; then
         echo "❌ Restart refused before stop: CCC_BRIDGE_RESTART_READY_TIMEOUT must be an integer in 1..3600 (got '${CCC_BRIDGE_RESTART_READY_TIMEOUT}')."
         return 1
@@ -1284,7 +1293,7 @@ restart_resolve_windows() {
 # fail the same window for the same reason; give it a longer one. Other
 # candidate failures keep the candidate window unless the operator set one.
 restart_recovery_window() { # <candidate-rc>
-    local candidate="$RESTART_READY_TIMEOUT" window floor deadline remaining
+    local candidate="$RESTART_READY_TIMEOUT" window deadline remaining
     if [ -n "${CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT:-}" ] \
         && restart_window_valid "$CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT"; then
         window="$CCC_BRIDGE_RESTART_RECOVERY_READY_TIMEOUT"
@@ -1294,16 +1303,16 @@ restart_recovery_window() { # <candidate-rc>
     else
         window="$candidate"
     fi
-    # Stay inside an outer watchdog (killing the recovery midway is worse than
-    # a shorter wait), but never below the pre-#1868 window.
+    # Stay inside an outer watchdog. Its kill takes the whole process group —
+    # including the freshly spawned recovery bridge — whereas a readiness
+    # window that ends early only reports failure and leaves that process
+    # running. So the deadline wins, down to a 1s floor.
     deadline="${CCC_BRIDGE_RESTART_DEADLINE_EPOCH:-}"
     if [[ "$deadline" =~ ^[1-9][0-9]{0,11}$ ]]; then
         remaining=$((deadline - $(date -u +%s) - RESTART_DEADLINE_MARGIN))
-        floor="$candidate"
-        [ "$window" -ge "$floor" ] || floor="$window"
         if [ "$remaining" -lt "$window" ]; then
             window="$remaining"
-            [ "$window" -ge "$floor" ] || window="$floor"
+            [ "$window" -ge 1 ] || window=1
         fi
     fi
     printf '%s\n' "$window"
@@ -1516,7 +1525,7 @@ do_restart() {
     # Ordinary Termux restarts used to discover incompatible installed wheels
     # only after stopping a healthy bridge (#1577). Observe the selected venv;
     # never install or repair packages underneath the running process.
-    if [ -z "$PREPARED_RUNTIME" ] && { [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]; }; then
+    if [ -z "$PREPARED_RUNTIME" ] && restart_is_termux; then
         if ! "$VENV_DIR/bin/python" -I -B "$SCRIPT_DIR/restart_preflight.py" \
             --bridge-dir "$SCRIPT_DIR" --venv-dir "$VENV_DIR" --project-env "$ENV_FILE" \
             "--process-unlocked=$DEPS_UNLOCKED_PROCESS"; then
