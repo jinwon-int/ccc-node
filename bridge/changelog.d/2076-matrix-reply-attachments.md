@@ -1,0 +1,1 @@
+- Matrix replies to encrypted attachments now include the original file or image in provider context. Reply originals are staged separately from new attachments with the existing integrity, size and cleanup checks; an unavailable original is marked explicitly.

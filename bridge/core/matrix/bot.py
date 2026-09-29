@@ -2021,7 +2021,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             # #1955: before attachment staging, command parsing or self-jobs.
             if self._refuses_non_owner_turn(user_id):
                 return _turn_result(NON_OWNER_TURN_REFUSED, None)
-            if job.get("attachment"):
+            if job.get("attachment") or job.get("reply_attachment"):
                 # #1795: a photo/file never goes through command parsing.
                 return await self._run_attachment(
                     job, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink
@@ -2066,50 +2066,63 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
     ) -> Any:
         """Stage a Matrix photo/file and run it with the Telegram prompt contract (#1795).
 
-        The decrypted file lives under ``<bot_data_dir>/matrix-media`` (0600)
-        only for this turn. A failure answers the room once and does not run
-        the agent; it never raises into the transport.
+        Decrypted files live under ``<bot_data_dir>/matrix-media`` (0600)
+        only for this turn. New-media failure answers once without running
+        the agent; a missing reply original is marked in the current prompt.
         """
-        from telegram_bot.core import media as core_media
         from telegram_bot.core.matrix import media as matrix_media
         from telegram_bot.core.matrix.attachments import decode_attachment
 
-        attachment = decode_attachment(job.get("attachment"))
-        if attachment is None:
-            logger.warning("Matrix attachment unavailable reason=invalid")
-            return _turn_result(ATTACHMENT_FAILED.get("invalid", ATTACHMENT_FAILED_DEFAULT), None)
         directory = self._data_dir() / matrix_media.MEDIA_DIRNAME
-        path: Path | None = None
+        paths: list[Path] = []
+        body = str(job.get("body") or "")
         try:
-            try:
-                path = await matrix_media.stage(self._transport, attachment, directory, self._settings)
-            except matrix_media.AttachmentError as exc:
-                logger.warning("Matrix attachment unavailable reason=%s kind=%s", exc.reason, attachment.get("kind"))
-                return _turn_result(ATTACHMENT_FAILED.get(exc.reason, ATTACHMENT_FAILED_DEFAULT), None)
-            # The caption is the job body (``(attachment)`` when there is none).
-            caption = str(job.get("body") or "") if attachment.get("captioned") else ""
-            if attachment.get("kind") == "image":
-                prompt = core_media.build_image_prompt(path, caption, channel="Matrix")
+            if job.get("attachment"):
+                attachment = decode_attachment(job.get("attachment"))
+                if attachment is None:
+                    return _turn_result(ATTACHMENT_FAILED["invalid"], None)
+                try:
+                    path = await matrix_media.stage(self._transport, attachment, directory, self._settings)
+                except matrix_media.AttachmentError as exc:
+                    logger.warning("Matrix attachment unavailable reason=%s kind=%s", exc.reason, attachment.get("kind"))
+                    return _turn_result(ATTACHMENT_FAILED.get(exc.reason, ATTACHMENT_FAILED_DEFAULT), None)
+                paths.append(path)
+                caption = body if attachment.get("captioned") else ""
+                prompt = self._attachment_prompt(path, attachment, caption)
             else:
-                prompt = core_media.build_document_prompt(
-                    path,
-                    display_name=str(attachment.get("name") or ""),
-                    mime_type=str(attachment.get("mimetype") or "") or None,
-                    size_bytes=path.stat().st_size,
-                    caption=caption,
-                    channel="Matrix",
-                )
-            logger.info("Matrix attachment staged kind=%s bytes=%d", attachment.get("kind"), path.stat().st_size)
+                prompt = body
+            if job.get("reply_attachment"):
+                parent = decode_attachment(job.get("reply_attachment"))
+                try:
+                    if parent is None:
+                        raise matrix_media.AttachmentError("invalid")
+                    path = await matrix_media.stage(self._transport, parent, directory, self._settings)
+                except matrix_media.AttachmentError as exc:
+                    logger.warning("Matrix reply attachment unavailable reason=%s", exc.reason)
+                    prompt = "[Reply attachment unavailable: do not infer its contents.]\n\n" + prompt
+                else:
+                    paths.append(path)
+                    parent_prompt = self._attachment_prompt(path, parent, "Use this earlier attachment as context for the user's reply below.")
+                    prompt = "[Reply context: the following attachment is the earlier message being replied to.]\n" + parent_prompt + "\n\n" + prompt
             return await self._run_message(
-                prompt,
-                user_id=user_id,
-                chat_id=chat_id,
-                room_id=room_id,
-                sink=sink,
+                prompt, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink,
                 turn_marker=str(job.get("event_id") or ""),
             )
         finally:
-            matrix_media.remove(path)
+            for path in paths:
+                matrix_media.remove(path)
+
+    @staticmethod
+    def _attachment_prompt(path: Path, attachment: Mapping[str, Any], caption: str) -> str:
+        from telegram_bot.core import media as core_media
+
+        if attachment.get("kind") == "image":
+            return core_media.build_image_prompt(path, caption, channel="Matrix")
+        return core_media.build_document_prompt(
+            path, display_name=str(attachment.get("name") or ""),
+            mime_type=str(attachment.get("mimetype") or "") or None,
+            size_bytes=path.stat().st_size, caption=caption, channel="Matrix",
+        )
 
     def _control_identity(self, job: Mapping[str, Any]) -> tuple[int, int]:
         room_id = str(job["room_id"])

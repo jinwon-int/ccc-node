@@ -15,6 +15,7 @@ import time
 import types
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import anyio
 import pytest
@@ -30,6 +31,8 @@ from telegram_bot.core.matrix.bot import (
     MatrixConfigError,
     MatrixTurnRunner,
 )
+from telegram_bot.core.matrix.state import Request
+from telegram_bot.core.matrix.transport import MatrixTransport, ReplyParent
 from telegram_bot.core.matrix_ids import MatrixIdMap
 from telegram_bot.core.project_chat_types import ChatResponse
 from telegram_bot.core.session_scope import is_group_conversation
@@ -1643,3 +1646,112 @@ async def test_restart_receipt_loop_delivers_then_archives_terminal_receipt(
     assert transport.notice_keys == [f"restart-receipt-{failed_rid}"]
     assert restart_handoff.read_receipt(data_dir) is None
     assert (data_dir / restart_handoff.ARCHIVE_NAME).is_file()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("provider", ["codex", "claude", "piri", "danso"])
+async def test_reply_report_is_available_in_provider_prompt_and_removed(
+    tmp_path: Path, matrix_config: dict[str, Any], provider: str,
+) -> None:
+    bot, chat, manager = _bot(tmp_path, agent_provider=provider, max_document_size_mb=10, image_context_guard=False)
+    _resume_existing_session(bot, manager)
+    payload = b"# Report\nRecommended: include reply originals."
+    ciphertext, file = _encrypted(payload)
+    bot._transport = _MediaTransport(ciphertext)
+    parent = _media_job({"msgtype": "m.file", "body": "report.md", "info": {"mimetype": "text/markdown"}, "file": file})
+    job = {**_job("What should we fix here?"), "reply_attachment": parent["attachment"]}
+    seen: list[Path] = []
+
+    async def on_process(kwargs: dict[str, Any]) -> None:
+        prompt = kwargs["user_message"]
+        paths = list((tmp_path / "data" / "matrix-media").iterdir())
+        assert len(paths) == 1 and paths[0].read_bytes() == payload
+        assert paths[0].stat().st_mode & 0o777 == 0o600
+        assert str(paths[0]) in prompt and '"report.md"' in prompt
+        assert "earlier message being replied to" in prompt
+        assert "What should we fix here?" in prompt
+        seen.extend(paths)
+
+    chat.on_process = on_process
+    await bot.run_turn(job, sink=FakeSink(), session_id=None, room_kind="direct")
+    assert len(chat.calls) == 1 and seen and not seen[0].exists()
+
+
+@pytest.mark.anyio
+async def test_reply_parent_failure_keeps_current_question_without_guessing(
+    tmp_path: Path, matrix_config: dict[str, Any],
+) -> None:
+    bot, chat, manager = _bot(tmp_path, max_document_size_mb=1, image_context_guard=False)
+    _resume_existing_session(bot, manager)
+    ciphertext, file = _encrypted(b"report")
+    bot._transport = _MediaTransport(ciphertext + b"tampered")
+    parent = _media_job({"msgtype": "m.file", "body": "report.md", "file": file})
+    await bot.run_turn({**_job("Explain the recommendations"), "reply_attachment": parent["attachment"]},
+                       sink=FakeSink(), session_id=None, room_kind="direct")
+    assert len(chat.calls) == 1
+    assert chat.calls[0]["user_message"] == "[Reply attachment unavailable: do not infer its contents.]\n\nExplain the recommendations"
+    assert not list((tmp_path / "data" / "matrix-media").glob("*"))
+
+
+@pytest.mark.anyio
+async def test_reply_and_current_media_are_both_staged_and_cleaned_on_cancellation(
+    tmp_path: Path, matrix_config: dict[str, Any],
+) -> None:
+    bot, chat, manager = _bot(tmp_path, max_document_size_mb=10, image_context_guard=False)
+    _resume_existing_session(bot, manager)
+    current_cipher, current_file = _encrypted(b"current report")
+    parent_cipher, parent_file = _encrypted(b"earlier report")
+    current_file["url"], parent_file["url"] = "mxc://example.org/current", "mxc://example.org/parent"
+
+    class TwoFiles(_MediaTransport):
+        async def download_media(self, mxc: str, *, max_bytes: int) -> bytes:
+            return current_cipher if mxc.endswith("/current") else parent_cipher
+
+    bot._transport = TwoFiles(current_cipher)
+    current = _media_job({"msgtype": "m.file", "body": "Compare them", "filename": "current.md", "file": current_file})
+    parent = _media_job({"msgtype": "m.file", "body": "earlier.md", "file": parent_file})
+    current["reply_attachment"] = parent["attachment"]
+
+    async def cancel(kwargs: dict[str, Any]) -> None:
+        prompt = kwargs["user_message"]
+        paths = list((tmp_path / "data" / "matrix-media").iterdir())
+        assert {p.read_bytes() for p in paths} == {b"current report", b"earlier report"}
+        assert all(str(p) in prompt for p in paths)
+        assert '"current.md"' in prompt and '"earlier.md"' in prompt and "Compare them" in prompt
+        raise asyncio.CancelledError()
+
+    chat.on_process = cancel
+    with pytest.raises(asyncio.CancelledError):
+        await bot.run_turn(current, sink=FakeSink(), session_id=None, room_kind="direct")
+    assert not list((tmp_path / "data" / "matrix-media").iterdir())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("media_parent", [False, True])
+async def test_captionless_media_reply_keeps_original_caption_in_provider_prompt(
+    tmp_path: Path, matrix_config: dict[str, Any], media_parent: bool,
+) -> None:
+    bot, chat, manager = _bot(tmp_path, max_document_size_mb=10, image_context_guard=False)
+    _resume_existing_session(bot, manager)
+    current_cipher, current_file = _encrypted(b"current screenshot")
+    parent_cipher, parent_file = _encrypted(b"report payload")
+    current_file["url"], parent_file["url"] = "mxc://example.org/current", "mxc://example.org/parent"
+
+    class TwoFiles(_MediaTransport):
+        async def download_media(self, mxc: str, *, max_bytes: int) -> bytes:
+            return current_cipher if mxc.endswith("/current") else parent_cipher
+
+    bot._transport = TwoFiles(current_cipher)
+    current = _media_job({"msgtype": "m.image", "body": "IMG.png", "info": {"mimetype": "image/png"}, "file": current_file})
+    caption = "Apply only recommendations 2 and 4"
+    parent = _media_job({"msgtype": "m.file", "body": caption, "filename": "report.md", "file": parent_file})
+    frontend = object.__new__(MatrixTransport)
+    frontend.c = {"account": "@bot:test.invalid"}
+    frontend.recent_text = {}
+    frontend._fetch_parent = AsyncMock(return_value=ReplyParent(OWNER, caption, parent["attachment"] if media_parent else None))
+    req = Request(current["event_id"], DM_ROOM, OWNER, current["body"], "direct", "$parent", current["attachment"])
+    enriched = await frontend.with_reply_context(req)
+    current.update(body=enriched.body, attachment=enriched.attachment, reply_attachment=enriched.reply_attachment)
+    await bot.run_turn(current, sink=FakeSink(), session_id=None, room_kind="direct")
+    assert caption in chat.calls[0]["user_message"]
+    assert not list((tmp_path / "data" / "matrix-media").iterdir())
