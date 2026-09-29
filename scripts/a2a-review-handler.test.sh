@@ -41,6 +41,12 @@ case "\${REVIEW_STUB_MODE:-approve}" in
   blocker)
     printf '{"verdict":"approve","findings":[{"severity":"blocker","area":"safety","note":"credential pattern"}],"head_sha":"%s","rubric_version":"2026-08-28.2"}' "\$REVIEW_STUB_HEAD"
     ;;
+  blocker_wronghead)
+    printf '{"verdict":"reject","findings":[{"severity":"blocker","area":"safety","note":"credential pattern"}],"head_sha":"%s","rubric_version":"2026-08-28.2"}' "\$REVIEW_STUB_OTHER_HEAD"
+    ;;
+  blocker_wrongskill)
+    printf '{"verdict":"approve","findings":[{"severity":"blocker","area":"safety","note":"credential pattern"}],"head_sha":"%s","skillName":"other-skill","rubric_version":"2026-08-28.2"}' "\$REVIEW_STUB_HEAD"
+    ;;
   prose)
     printf 'This candidate looks generally fine to me.'
     ;;
@@ -98,6 +104,18 @@ make_task "$HEAD_OK"
 REVIEW_STUB_MODE=blocker run_handler "$TMP/task.json" > "$TMP/out-blocker.json" 2>/dev/null; rc=$?
 ok "blocker finding forces reject" \
   '[ "$rc" = 0 ] && jq -e ".output.verdict == \"reject\"" >/dev/null "$TMP/out-blocker.json"'
+
+# #1883: a packet-binding mismatch may only make the verdict stricter. A blocker
+# (escalated to reject) combined with a binding mismatch — the more suspicious
+# state — used to come out as the weaker revise/fail.
+make_task "$HEAD_OK"
+REVIEW_STUB_MODE=blocker_wronghead run_handler "$TMP/task.json" > "$TMP/out-blocker-wronghead.json" 2>/dev/null; rc=$?
+ok "blocker + head_sha mismatch stays reject/block (#1883)" \
+  '[ "$rc" = 0 ] && jq -e ".output.verdict == \"reject\" and .validations[0].verdict == \"block\"
+    and any(.output.findings[]; .severity == \"major\" and .area == \"claims\")" >/dev/null "$TMP/out-blocker-wronghead.json"'
+REVIEW_STUB_MODE=blocker_wrongskill run_handler "$TMP/task.json" > "$TMP/out-blocker-wrongskill.json" 2>/dev/null; rc=$?
+ok "blocker + skillName binding mismatch stays reject/block (#1883)" \
+  '[ "$rc" = 0 ] && jq -e ".output.verdict == \"reject\" and .validations[0].verdict == \"block\"" >/dev/null "$TMP/out-blocker-wrongskill.json"'
 
 make_task "$HEAD_OK"
 REVIEW_STUB_MODE=crash run_handler "$TMP/task.json" >/dev/null 2>&1; rc=$?

@@ -308,11 +308,24 @@ if evidence_report["unmatched"]:
         ),
     })
 
+# Every handler-side verdict adjustment is monotonic: it may only make the
+# verdict STRICTER, never relax it. #1883: the packet-binding checks below used
+# to assign `verdict = "revise"` unconditionally, so a review with a blocker
+# (already escalated to reject) AND a binding mismatch — the more suspicious
+# state — came out as the weaker revise/fail instead of reject/block.
+_STRICTNESS = {"approve": 0, "revise": 1, "reject": 2}
+
+
+def _at_least(current, floor):
+    """The stricter of the two verdicts."""
+    return current if _STRICTNESS[current] >= _STRICTNESS[floor] else floor
+
+
 severities = [str(f.get("severity", "")).lower() for f in findings if isinstance(f, dict)]
-if "blocker" in severities and verdict != "reject":
-    verdict = "reject"
-elif "major" in severities and verdict == "approve":
-    verdict = "revise"
+if "blocker" in severities:
+    verdict = _at_least(verdict, "reject")
+elif "major" in severities:
+    verdict = _at_least(verdict, "revise")
 
 bindings = {"skillName": skill_name, "sourceTreeSha256": tree, "headPrefix": head_prefix}
 for key, expected in bindings.items():
@@ -324,11 +337,11 @@ for key, expected in bindings.items():
     elif current != expected:
         findings.append({"severity": "major", "area": "claims",
                          "note": f"verdict {key} binding does not match the packet ({current[:24]!r})"})
-        verdict = "revise"
+        verdict = _at_least(verdict, "revise")
 if "head_sha" in verdict_obj and str(verdict_obj.get("head_sha")) != head_sha:
     findings.append({"severity": "major", "area": "claims",
                      "note": "verdict head_sha does not match packet provenance"})
-    verdict = "revise"
+    verdict = _at_least(verdict, "revise")
 
 model_self = str(verdict_obj.get("model", "unknown"))
 # #2027 provenance: deterministic handler-side fields. An explicit --model in
