@@ -75,8 +75,9 @@
 #      Fail-open (missing/unreadable/stale health → proceed); --force bypasses.
 # Exit: 0 = up-to-date or updated cleanly; 7 = a restart (allowlisted service
 #      or external restart-cmd) or a recovery attempt failed; 8 = deferred
-#      (bridge busy, or — #1961, uncapped and not bypassed by --force — the
-#      managed checkout has linked worktrees or a non-empty .claude/worktrees);
+#      (bridge busy, or — #1961, uncapped and not bypassed by --force — a
+#      linked worktree lies INSIDE the managed checkout or its
+#      .claude/worktrees is non-empty; external worktrees never defer);
 #      11 = degraded (code updated but nothing restarted and no
 #      restart-cmd configured); 12 = installer re-apply failed (crontab was
 #      restored); 14 = activation incomplete (#1527): the installed generation
@@ -775,32 +776,35 @@ if [ -n "$REPO_OWNER_UID" ] && [ -n "$EUID_NOW" ] && [ "$REPO_OWNER_UID" != "$EU
   say "self-update: checkout $REPO is owned by uid $REPO_OWNER_UID but running as uid $EUID_NOW; aborting (fail-closed, #1426)" >&2
   exit 4
 fi
-# --- agent/dev worktree gate (#1961) -------------------------------------------
+# --- in-checkout worktree gate (#1961) ----------------------------------------
 # On a fleet node (2026-09-24) four Claude Code `Agent(isolation: worktree)` trees
 # under <checkout>/.claude/worktrees/ vanished right after a self-update tick
 # fast-forwarded the live checkout and reran setup. The deleting actor is still
 # unconfirmed. The dirty-tree guard below did not stop that run — suspected
 # (not proven) because an exclude rule hid those directories from
-# `git status --porcelain`. Whatever the
-# actor, work living in or hanging off the managed checkout must never share a
-# tick with the update. So before ANY tree mutation (wrong-branch recovery,
-# merge, setup, rollback reset) the run DEFERS — exit 8, same contract as the
-# bridge-busy gate: nothing fetched, merged, installed or restarted; the next
-# scheduled tick retries — while the checkout has either
-#   - a linked worktree (`git worktree list --porcelain` entries beyond the
-#     main one; an entry git reports `prunable` whose directory is already gone
-#     holds nothing to protect and is ignored), or
-#   - a non-empty known agent-worktree directory inside the checkout, detected
-#     on the filesystem so git ignore/exclude rules cannot hide it.
+# `git status --porcelain`. Whatever the actor, work living INSIDE the managed
+# checkout's directory tree must never share a tick with the update. So before
+# ANY tree mutation (wrong-branch recovery, merge, setup, rollback reset) the
+# run DEFERS — exit 8, same contract as the bridge-busy gate: nothing fetched,
+# merged, installed or restarted; the next scheduled tick retries — while
+#   - a linked worktree's real path is the checkout or lies under it, or
+#   - <checkout>/.claude/worktrees is non-empty (checked on the filesystem, so
+#     git ignore/exclude rules cannot hide it), or
+#   - `git worktree list` fails (cannot prove the checkout is safe).
 # Unlike the busy gate this defer is NOT capped and --force does NOT bypass it:
 # forcing through is exactly the shape that lost the work. Because cron treats
 # exit 8 as success, every deferring tick also notifies the owner with the
 # offending paths so a forgotten worktree cannot stall the node silently.
+# Linked worktrees OUTSIDE the checkout (the sanctioned ~/dev/<slug> recipe, a
+# Matrix runtime source tree, ...) are common across the fleet and are not
+# touched by an update of the main worktree: they never defer or notify; the
+# run only logs their count. A `prunable` entry whose directory is gone holds
+# nothing and is ignored.
 AGENT_WORKTREE_DIRS=(".claude/worktrees")
-# Hazards accumulate newline-separated in WORKTREE_HAZARDS (deduplicated, no
-# subshells: this runs on every tick). Paths containing a newline are not
-# supported.
+# Hazards accumulate newline-separated in WORKTREE_HAZARDS (deduplicated).
+# Paths containing a newline are not supported.
 WORKTREE_HAZARDS=""
+EXTERNAL_WORKTREES=0
 add_worktree_hazard() {
   case "
 $WORKTREE_HAZARDS
@@ -812,19 +816,38 @@ $1
   WORKTREE_HAZARDS="${WORKTREE_HAZARDS:+$WORKTREE_HAZARDS
 }$1"
 }
+# Physical path of an existing directory (symlinks resolved); fails otherwise.
+physical_dir() { (cd -P -- "$1" 2>/dev/null && pwd -P); }
 # <porcelain>: every block after the first (the main worktree) is a linked
-# worktree. A `prunable` entry whose directory is gone protects nothing.
+# worktree. Classify each existing one as inside (hazard) or external (count).
 collect_linked_worktrees() {
-  local line path="" prunable=0 blocks=0
+  local line path="" prunable=0 blocks=0 repo_real p real
+  local -a linked=()
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       "worktree "*)
-        if [ "$blocks" -gt 1 ] && { [ "$prunable" = 0 ] || [ -e "$path" ]; }; then add_worktree_hazard "$path"; fi
+        if [ "$blocks" -gt 1 ] && { [ "$prunable" = 0 ] || [ -e "$path" ]; }; then linked+=("$path"); fi
         blocks=$((blocks + 1)); path="${line#worktree }"; prunable=0 ;;
       prunable|"prunable "*) prunable=1 ;;
     esac
   done <<<"$1"
-  if [ "$blocks" -gt 1 ] && { [ "$prunable" = 0 ] || [ -e "$path" ]; }; then add_worktree_hazard "$path"; fi
+  if [ "$blocks" -gt 1 ] && { [ "$prunable" = 0 ] || [ -e "$path" ]; }; then linked+=("$path"); fi
+  [ "${#linked[@]}" -gt 0 ] || return 0
+  repo_real="$(physical_dir "$REPO")" || repo_real="$REPO"
+  for p in "${linked[@]}"; do
+    # Lexical match first (no fork); resolve symlinks only when needed. A
+    # directory that cannot be resolved (missing, unreadable) is judged by its
+    # recorded path alone.
+    case "$p/" in
+      "$REPO"/*|"$repo_real"/*) add_worktree_hazard "$p"; continue ;;
+    esac
+    if real="$(physical_dir "$p")"; then
+      case "$real/" in
+        "$repo_real"/*) add_worktree_hazard "$p"; continue ;;
+      esac
+    fi
+    EXTERNAL_WORKTREES=$((EXTERNAL_WORKTREES + 1))
+  done
 }
 collect_agent_worktree_dirs() { # each entry of a non-empty known agent dir
   local rel entry
@@ -836,7 +859,7 @@ collect_agent_worktree_dirs() { # each entry of a non-empty known agent dir
   done
 }
 if ! WT_PORCELAIN="$(git -C "$REPO" worktree list --porcelain 2>/dev/null)"; then
-  # Cannot prove there is no linked worktree: defer rather than guess.
+  # Cannot prove there is no in-checkout worktree: defer rather than guess.
   log "deferred reason=worktree-list-failed repo=$REPO"
   say "self-update: cannot list worktrees of $REPO — deferring, will retry next tick (#1961)" >&2
   notify "self-update 보류: $REPO 의 git worktree 목록을 읽지 못해 갱신을 미뤘습니다(#1961). ~/.claude/state/self-update.log" "deferred-worktree-list-failed"
@@ -849,13 +872,14 @@ if [ -n "$WORKTREE_HAZARDS" ]; then
   hazard_inline="$(printf '%s\n' "$WORKTREE_HAZARDS" | paste -sd ',' -)"
   hazard_notify="$(printf '%s\n' "$WORKTREE_HAZARDS" | awk 'NR <= 10 { printf "%s%s", (NR > 1 ? ", " : ""), $0 }')"
   [ "$hazard_count" -gt 10 ] && hazard_notify="$hazard_notify, … (총 ${hazard_count}개)"
-  log "deferred reason=agent-worktrees repo=$REPO count=$hazard_count paths=$hazard_inline"
-  say "self-update: live checkout $REPO has linked or agent worktrees — deferring, will retry next tick (#1961):" >&2
+  log "deferred reason=in-checkout-worktrees repo=$REPO count=$hazard_count paths=$hazard_inline external-worktrees=$EXTERNAL_WORKTREES"
+  say "self-update: worktrees inside the managed checkout $REPO — deferring, will retry next tick (#1961):" >&2
   printf '%s\n' "$WORKTREE_HAZARDS" | sed 's/^/  /' >&2
-  say "self-update: finish or remove them (git -C $REPO worktree remove <path>) and create worktrees outside the managed checkout — see CONTRIBUTING.md" >&2
-  notify "self-update 보류: 관리 체크아웃 $REPO 에 연결/에이전트 worktree가 있어 갱신을 미뤘습니다(#1961) — ${hazard_notify}. 작업을 마치고 제거하면 다음 틱에 적용됩니다. worktree는 관리 체크아웃 밖(별도 clone)에 만드세요." "deferred-worktrees"
+  say "self-update: finish or remove them (git -C $REPO worktree remove <path>); create worktrees OUTSIDE the managed checkout — see CONTRIBUTING.md" >&2
+  notify "self-update 보류: 관리 체크아웃 $REPO 안쪽에 worktree가 있어 갱신을 미뤘습니다(#1961) — ${hazard_notify}. 작업을 마치고 제거하면 다음 틱에 적용됩니다. worktree는 관리 체크아웃 바깥 경로(예: ~/dev/<slug>)에 만드세요." "deferred-worktrees"
   exit 8
 fi
+[ "$EXTERNAL_WORKTREES" -gt 0 ] && log "worktree-gate ok external-worktrees=$EXTERNAL_WORKTREES"
 CUR_BRANCH="$(git -C "$REPO" symbolic-ref --short HEAD 2>/dev/null || echo '?')"
 if [ "$CUR_BRANCH" != "$BRANCH" ]; then
   # #1328 proposal 2: a stray branch that is fully pushed with a clean tree is

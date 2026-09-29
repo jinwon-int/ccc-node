@@ -198,24 +198,33 @@ Independently of the root cause, the run now **defers before touching the
 tree** (before wrong-branch recovery, fetch, merge, setup, restart) while the
 managed checkout has either:
 
-- a **linked worktree** — any `git worktree list --porcelain` entry beyond the
-  main one, wherever it lives. An entry git marks `prunable` whose directory is
-  already gone holds nothing to protect and does not block; or
-- a **non-empty known agent-worktree directory** inside the checkout
-  (currently `.claude/worktrees`). This is a filesystem check, so
-  `.gitignore` / `.git/info/exclude` cannot hide it. An empty directory does
-  not block.
+- a **linked worktree inside the checkout** — a `git worktree list
+  --porcelain` entry (other than the main worktree) whose real path, with
+  symlinks resolved, is the checkout or lies under it; or
+- a **non-empty `.claude/worktrees`** inside the checkout (Claude Code's agent
+  worktree location). This is a filesystem check, so `.gitignore` /
+  `.git/info/exclude` cannot hide it. An empty directory does not block.
+
+If `git worktree list` itself fails, the run defers too (it cannot prove the
+checkout is safe).
+
+**Linked worktrees outside the checkout never defer and never notify.** A
+read-only fleet survey on 2026-09-29 found them on 11 of 12 nodes (up to 66
+entries on one node) — the documented `~/dev/<slug>` dev recipe, and on one
+node the Matrix runtime source tree is itself a linked worktree — and an update
+of the main worktree does not touch them. The run logs only their count, one
+line per run (`worktree-gate ok external-worktrees=N`), with no paths. An entry
+git marks `prunable` whose directory is already gone is ignored.
 
 The defer uses the same contract as the idle gate: exit `8`, a
-`deferred reason=agent-worktrees ... paths=...` log line, nothing fetched,
-merged, installed or restarted, and the next scheduled tick retries. The
-differences are deliberate: it is **not capped** by
+`deferred reason=in-checkout-worktrees ... paths=...` log line, nothing
+fetched, merged, installed or restarted, and the next scheduled tick retries.
+The differences are deliberate: it is **not capped** by
 `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` and **`--force` does not bypass it**
 (forcing through is exactly the shape that lost work). Because the scheduled
 task treats exit 8 as success, every deferring tick also queues an owner
 notification (dedup `SelfUpdate:deferred-worktrees`) that names the offending
-paths, so a forgotten worktree cannot stall a node silently. If
-`git worktree list` itself fails, the run defers the same way.
+paths, so a forgotten worktree cannot stall a node silently.
 
 To unblock: finish the work, then `git -C <checkout> worktree remove <path>`
 (or delete the `.claude/worktrees/<name>` directory once nothing needs it)
@@ -324,8 +333,8 @@ Exit codes: 0 ok/up-to-date · 3 lock held · 4 precondition failed · 5 fetch/f
 failed · 6 setup/snapshot failed (repo and managed artifacts were verified
 rolled back, or setup never started) · 7 service restart failure, external
 restart-cmd failure, or failed runtime recovery · 8 deferred
-(bridge busy, or linked/agent worktrees in the managed checkout — retry next
-tick; see "Worktree gate") · 9 repository or installed-artifact rollback
+(bridge busy, or worktrees inside the managed checkout — retry next tick;
+see "Worktree gate") · 9 repository or installed-artifact rollback
 was degraded · 10 successful-update recovery snapshot cleanup failed ·
 11 degraded — code updated but no allowlisted service restarted (services
 file missing/empty); running processes may still hold the old code, so this
