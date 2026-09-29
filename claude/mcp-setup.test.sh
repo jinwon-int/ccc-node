@@ -231,5 +231,62 @@ ok "fleet-browser: option-shaped host rejected" '! grep -q "add fleet-browser" "
 brun CCC_BROWSER_MCP_HOST=browser-pilot "CCC_BROWSER_MCP_COMMAND=/opt/x;id"
 ok "fleet-browser: shell metacharacters in command rejected" '! grep -q "add fleet-browser" "$TMP/claude.log"'
 
+# --browser-only (#2044): repoint fleet-browser without registering the other
+# servers. A full run adds family/searxng/context7/firecrawl to ~/.claude.json,
+# which on a bridge-bundle node is an unwanted change (Firecrawl key included).
+BHOME="$TMP/bhome"; mkdir -p "$BHOME"
+BDEST=/opt/fleet-mcp/current/deploy/bin/browser-mcp
+borun() { # borun <env assignments...> -- <mcp-setup args...>; sets bo_rc, bo_out
+  local envs=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
+  [ "${1:-}" = -- ] && shift
+  : > "$TMP/claude.log"
+  # shellcheck disable=SC2034  # bo_out/bo_rc are read via eval inside ok()
+  bo_out="$(env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$BHOME" ${envs[@]+"${envs[@]}"} bash "$SUT" "$@" 2>&1)"
+  # shellcheck disable=SC2034
+  bo_rc=$?
+}
+only_browser_calls() { ! grep -Ev "^mcp (add|remove) fleet-browser( |$)" "$TMP/claude.log" | grep -q .; }
+
+borun CCC_BROWSER_MCP_HOST=browser-pilot -- --browser-only
+ok "browser-only: exit 0" '[ "$bo_rc" = 0 ]'
+ok "browser-only: fleet-browser added with the given host" \
+  'grep -qx "mcp add fleet-browser -s user -- ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -- browser-pilot $BDEST" "$TMP/claude.log"'
+ok "browser-only: no other server touched, no health-checking mcp list" 'only_browser_calls'
+
+cat > "$BHOME/.claude.json" <<EOF
+{"mcpServers":{"fleet-browser":{"type":"stdio","command":"ssh","args":["-o","BatchMode=yes","-o","ConnectTimeout=10","-o","ServerAliveInterval=30","--","browser-pilot","$BDEST"],"env":{}},
+ "family-ops":{"type":"stdio","command":"/usr/bin/python3","args":["x"],"env":{}}}}
+EOF
+# shellcheck disable=SC2034  # read via eval inside ok()
+bcfg_before="$(cat "$BHOME/.claude.json")"
+borun CCC_BROWSER_MCP_HOST=browser-pilot -- --browser-only
+ok "browser-only: identical registration left untouched (no claude call)" \
+  '[ "$bo_rc" = 0 ] && [ ! -s "$TMP/claude.log" ] && grep -q "already registered (unchanged)" <<<"$bo_out" && [ "$(cat "$BHOME/.claude.json")" = "$bcfg_before" ]'
+borun CCC_BROWSER_MCP_HOST=browser-pilot-2 -- --browser-only
+ok "browser-only: repoint removes and re-adds fleet-browser only" \
+  '[ "$bo_rc" = 0 ] && grep -qx "mcp remove fleet-browser -s user" "$TMP/claude.log" && grep -q "^mcp add fleet-browser .* -- browser-pilot-2 $BDEST$" "$TMP/claude.log" && only_browser_calls'
+rm -f "$BHOME/.claude.json"
+
+borun CCC_BROWSER_MCP_HOST=off -- --browser-only
+ok "browser-only off: removes fleet-browser only" \
+  '[ "$bo_rc" = 0 ] && [ "$(cat "$TMP/claude.log")" = "mcp remove fleet-browser -s user" ]'
+borun -- --browser-only
+ok "browser-only without host: exit 2, nothing changed" \
+  '[ "$bo_rc" = 2 ] && [ ! -s "$TMP/claude.log" ] && grep -q "needs CCC_BROWSER_MCP_HOST" <<<"$bo_out"'
+borun CCC_BROWSER_MCP_HOST=browser-pilot -- --browser-only --family-only
+ok "browser-only + family-only: exit 2, nothing changed" \
+  '[ "$bo_rc" = 2 ] && [ ! -s "$TMP/claude.log" ] && grep -q "mutually exclusive" <<<"$bo_out"'
+borun "CCC_BROWSER_MCP_HOST=-oProxyCommand=sh" -- --browser-only
+ok "browser-only: option-shaped host rejected with exit 1" '[ "$bo_rc" = 1 ] && [ ! -s "$TMP/claude.log" ]'
+borun CCC_BROWSER_MCP_HOST=browser-pilot "CCC_BROWSER_MCP_COMMAND=/opt/x;id" -- --browser-only
+ok "browser-only: metacharacter command rejected with exit 1" '[ "$bo_rc" = 1 ] && [ ! -s "$TMP/claude.log" ]'
+borun CCC_BROWSER_MCP_HOST=browser-pilot CCC_NODE_ISOLATION_PROFILE=external -- --browser-only
+ok "browser-only: external isolation skips with exit 0" \
+  '[ "$bo_rc" = 0 ] && [ ! -s "$TMP/claude.log" ] && grep -q "SKIPPED (external isolation)" <<<"$bo_out"'
+borun "CCC_BROWSER_MCP_HOST=-oProxyCommand=sh" --
+ok "full run: a rejected browser host still does not fail the run" \
+  '[ "$bo_rc" = 0 ] && ! grep -q "fleet-browser" "$TMP/claude.log" && grep -q "^mcp list" "$TMP/claude.log"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

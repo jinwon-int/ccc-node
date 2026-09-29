@@ -20,16 +20,32 @@
 #          family-ops servers (no npx, network or keys). setup.sh runs this mode
 #          from the managed checkout (#2011 D); an identical registration is
 #          left untouched so re-runs do not rewrite ~/.claude.json.
+#        CCC_BROWSER_MCP_HOST=<ssh destination>|off ./claude/mcp-setup.sh --browser-only
+#          Register (or with =off remove) only the fleet-browser server. Every
+#          other user-scope server is left exactly as it is and `claude mcp list`
+#          is not run. Use this to repoint fleet-browser on a node that gets its
+#          other servers another way (e.g. the bridge bundle) — a full run would
+#          add them to ~/.claude.json, Firecrawl key included (#2044).
 set -uo pipefail
 
 FAMILY_ONLY=0
+BROWSER_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --family-only) FAMILY_ONLY=1 ;;
+    --browser-only) BROWSER_ONLY=1 ;;
     -h|--help) sed -n '2,/^set -uo/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "mcp-setup.sh: unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
+if [ "$FAMILY_ONLY" = 1 ] && [ "$BROWSER_ONLY" = 1 ]; then
+  echo "mcp-setup.sh: --family-only and --browser-only are mutually exclusive" >&2
+  exit 2
+fi
+if [ "$BROWSER_ONLY" = 1 ] && [ -z "${CCC_BROWSER_MCP_HOST:-}" ]; then
+  echo "mcp-setup.sh: --browser-only needs CCC_BROWSER_MCP_HOST=<ssh destination> (or =off to remove); nothing changed" >&2
+  exit 2
+fi
 
 IS_TERMUX=0
 case "${PREFIX:-}" in */com.termux/files/usr) IS_TERMUX=1 ;; esac
@@ -113,6 +129,40 @@ add_stdio() {
   fi
 }
 
+# fleet-browser — opt-in windowed-browser MCP on the fleet browser pilot node
+# (#2034; jinwon-int/fleet-mcp). Stdio over ssh, no secrets on this side.
+# CCC_BROWSER_MCP_HOST=<ssh destination> registers, =off removes, unset leaves
+# any existing registration untouched. Not pre-allowed in settings: under the
+# governed (non-bypass) path each call asks the owner (fleet-mcp decision E3).
+# Returns 1 only when the host/command is rejected or registration fails.
+register_browser() {
+  local host="${CCC_BROWSER_MCP_HOST:-}"
+  local cmd="${CCC_BROWSER_MCP_COMMAND:-/opt/fleet-mcp/current/deploy/bin/browser-mcp}"
+  if [ -z "$host" ]; then
+    echo "  - fleet-browser: SKIPPED (set CCC_BROWSER_MCP_HOST to opt in)"
+  elif [ "$host" = off ]; then
+    claude mcp remove fleet-browser -s user >/dev/null 2>&1 || true
+    echo "  - fleet-browser: removed (CCC_BROWSER_MCP_HOST=off)"
+  elif [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ]; then
+    echo "  - fleet-browser: SKIPPED (external isolation)"
+  elif ! printf '%s' "$host" | grep -Eq '^([A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*$' \
+    || ! printf '%s' "$cmd" | grep -Eq '^/[A-Za-z0-9._/-]+$'; then
+    echo "  ! fleet-browser: SKIPPED — CCC_BROWSER_MCP_HOST/COMMAND must be a plain ssh destination and absolute path" >&2
+    return 1
+  else
+    add_if_changed fleet-browser ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -- "$host" "$cmd" || return 1
+    echo "  - fleet-browser: ssh $host $cmd"
+  fi
+}
+
+if [ "$BROWSER_ONLY" = 1 ]; then
+  # No `claude mcp list`: it health-checks every server, including networked ones.
+  echo "==> Registering fleet-browser only (user scope)…"
+  register_browser; rc=$?
+  echo "==> Done (browser-only: family-skills, family-ops, family-wiki, searxng, context7, firecrawl untouched)."
+  exit "$rc"
+fi
+
 echo "==> Registering MCP servers (user scope)…"
 [ "$IS_TERMUX" = 1 ] && echo "  (Termux/Android detected: launching via 'node <cli>' — see #663)"
 
@@ -173,27 +223,9 @@ else
 fi
 unset FCKEY
 
-# fleet-browser — opt-in windowed-browser MCP on the fleet browser pilot node
-# (#2034; jinwon-int/fleet-mcp). Stdio over ssh, no secrets on this side.
-# CCC_BROWSER_MCP_HOST=<ssh destination> registers, =off removes, unset leaves
-# any existing registration untouched. Not pre-allowed in settings: under the
-# governed (non-bypass) path each call asks the owner (fleet-mcp decision E3).
-BROWSER_HOST="${CCC_BROWSER_MCP_HOST:-}"
-BROWSER_CMD="${CCC_BROWSER_MCP_COMMAND:-/opt/fleet-mcp/current/deploy/bin/browser-mcp}"
-if [ -z "$BROWSER_HOST" ]; then
-  echo "  - fleet-browser: SKIPPED (set CCC_BROWSER_MCP_HOST to opt in)"
-elif [ "$BROWSER_HOST" = off ]; then
-  claude mcp remove fleet-browser -s user >/dev/null 2>&1 || true
-  echo "  - fleet-browser: removed (CCC_BROWSER_MCP_HOST=off)"
-elif [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ]; then
-  echo "  - fleet-browser: SKIPPED (external isolation)"
-elif ! printf '%s' "$BROWSER_HOST" | grep -Eq '^([A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*$' \
-  || ! printf '%s' "$BROWSER_CMD" | grep -Eq '^/[A-Za-z0-9._/-]+$'; then
-  echo "  ! fleet-browser: SKIPPED — CCC_BROWSER_MCP_HOST/COMMAND must be a plain ssh destination and absolute path" >&2
-else
-  add_if_changed fleet-browser ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -- "$BROWSER_HOST" "$BROWSER_CMD"
-  echo "  - fleet-browser: ssh $BROWSER_HOST $BROWSER_CMD"
-fi
+# fleet-browser (see register_browser above). A full run keeps its old
+# behaviour: a rejected host is reported but does not fail the whole run.
+register_browser || true
 
 echo "==> Done. Verifying:"
 claude mcp list
