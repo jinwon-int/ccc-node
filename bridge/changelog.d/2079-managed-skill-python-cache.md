@@ -1,0 +1,1 @@
+- Recognize generated CPython caches backed by managed skill sources without hiding source drift; reconcile cached skills atomically so normal helper imports no longer block self-update.

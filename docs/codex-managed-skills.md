@@ -76,6 +76,13 @@ The provisioner preflights the entire set before writing:
   is never overwritten;
 - symlinks, hardlinks, wrong owner, unsafe modes, malformed provenance, and
   manual drift fail closed;
+- CPython `__pycache__/*.pyc` backed by a recorded `.py` file is recognized
+  after the same owner, mode and link checks; actual source hashes still must match;
+- a recognized generated cache schedules an atomic skill replacement even when
+  the source is unchanged, so apply removes unrecorded executable bytecode;
+  plan remains read-only, and failed apply restores the original cached tree;
+- caches generated beside a source file are excluded from source provenance
+  and staging; unrecognized files remain drift;
 - a legitimate repo source update replaces only an intact managed skill;
 - all changed skills stage before commit, and partial commit failure restores
   the previous complete set.
