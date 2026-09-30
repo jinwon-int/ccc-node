@@ -269,7 +269,7 @@ class CodexManagedSkillsTest(unittest.TestCase):
         repo = self.git_repo_surface()
         source = repo / "skills" / "web-routing"
         cache = source / "scripts" / "__pycache__" / "web_search.cpython-311.opt-1.pyc"
-        cache.parent.mkdir(mode=0o700)
+        cache.parent.mkdir(mode=0o700, exist_ok=True)
         cache.write_bytes(b"generated")
         result = self.apply(repo=repo)
         self.assertEqual(result.returncode, 0, result.stderr)
