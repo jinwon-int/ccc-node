@@ -1,11 +1,11 @@
 ---
 description: Read-only ccc-node security audit — classify permissions, settings allowlist, scanner integrity, spool/cache redaction, and already-collected fleet evidence without printing secrets.
-allowed-tools: Bash(/opt/ccc-node/scripts/ccc-security-audit.sh:*), Bash(/opt/ccc-node/scripts/ccc-security-audit-fleet-matrix.sh:*)
+allowed-tools: Bash(/opt/ccc-node/scripts/ccc-security-audit.sh:*), Bash(/opt/ccc-node/scripts/ccc-security-audit-fleet-matrix.sh:*), Bash(bash /opt/ccc-node/scripts/ccc-security-audit.sh:*), Bash(bash /opt/ccc-node/scripts/ccc-security-audit-fleet-matrix.sh:*)
 ---
 
 ## Live security audit
 
-!`/opt/ccc-node/scripts/ccc-security-audit.sh 2>&1`
+!`bash /opt/ccc-node/scripts/ccc-security-audit.sh 2>&1`
 
 ## Task
 
