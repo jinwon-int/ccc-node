@@ -1,11 +1,11 @@
 ---
 description: ccc-node harness doctor — classify settings/hook/output-style/statusline/bridge drift; supports local diagnostics and read-only fleet-matrix summarization; `--fix` and `--rollback` are dry-run, `--apply` writes only scoped settings or explicitly scoped file repairs after backup.
-allowed-tools: Bash(/opt/ccc-node/scripts/ccc-doctor.sh:*), Bash(/opt/ccc-node/scripts/ccc-doctor-fleet-matrix.sh:*)
+allowed-tools: Bash(/opt/ccc-node/scripts/ccc-doctor.sh:*), Bash(/opt/ccc-node/scripts/ccc-doctor-fleet-matrix.sh:*), Bash(bash /opt/ccc-node/scripts/ccc-doctor.sh:*), Bash(bash /opt/ccc-node/scripts/ccc-doctor-fleet-matrix.sh:*)
 ---
 
 ## Live diagnostics
 
-!`/opt/ccc-node/scripts/ccc-doctor.sh 2>&1`
+!`bash /opt/ccc-node/scripts/ccc-doctor.sh 2>&1`
 
 ## Task
 

@@ -1,23 +1,23 @@
 ---
 description: List, validate, dry-run-resolve, inspect local locks, manage task definitions (add/remove/enable/disable), and preview/describe agent-cron task execution boundaries.
-allowed-tools: Bash(/opt/ccc-node/scripts/agent-cron.sh:*)
+allowed-tools: Bash(/opt/ccc-node/scripts/agent-cron.sh:*), Bash(bash /opt/ccc-node/scripts/agent-cron.sh:*)
 ---
 
 ## Live agent-cron store
 
-!`/opt/ccc-node/scripts/agent-cron.sh list 2>&1`
+!`bash /opt/ccc-node/scripts/agent-cron.sh list 2>&1`
 
 ## Dry-run due plan
 
-!`/opt/ccc-node/scripts/agent-cron.sh due 2>&1 || true`
+!`bash /opt/ccc-node/scripts/agent-cron.sh due 2>&1 || true`
 
 ## Read-only status rollup
 
-!`/opt/ccc-node/scripts/agent-cron.sh status 2>&1 || true`
+!`bash /opt/ccc-node/scripts/agent-cron.sh status 2>&1 || true`
 
 ## Dry-run scheduler tick plan
 
-!`/opt/ccc-node/scripts/agent-cron.sh scheduler --dry-run 2>&1 || true`
+!`bash /opt/ccc-node/scripts/agent-cron.sh scheduler --dry-run 2>&1 || true`
 
 ## Lock and run boundary
 
