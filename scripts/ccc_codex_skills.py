@@ -218,6 +218,16 @@ def _frontmatter(path: Path) -> dict[str, str]:
     return values
 
 
+def _python_cache_source(relative: Path) -> Path | None:
+    """The sibling source for a PEP 3147/488 CPython cache, never arbitrary files."""
+    if relative.parent.name != "__pycache__":
+        return None
+    match = re.fullmatch(r"(.+)\.cpython-[0-9]+(?:\.opt-[0-9]+)?\.pyc", relative.name)
+    if match is None:
+        return None
+    return relative.parent.parent / (match[1] + ".py")
+
+
 def _source_files(source: Path) -> list[Path]:
     if not source.is_dir() or source.is_symlink():
         raise ContractError("codex_skill_source_invalid")
@@ -228,6 +238,9 @@ def _source_files(source: Path) -> list[Path]:
         if stat.S_ISLNK(metadata.st_mode):
             raise ContractError("codex_skill_source_invalid")
         if stat.S_ISREG(metadata.st_mode):
+            backing = _python_cache_source(path.relative_to(source))
+            if backing is not None and (source / backing).is_file():
+                continue
             total += metadata.st_size
             files.append(path)
         elif not stat.S_ISDIR(metadata.st_mode):
@@ -429,7 +442,7 @@ def _marker_for(name: str, source_raw: str, source: Path) -> dict[str, Any]:
     }
 
 
-def _validate_installed_target(target: Path, expected_name: str) -> dict[str, Any]:
+def _validate_installed_target(target: Path, expected_name: str) -> tuple[dict[str, Any], bool]:
     try:
         metadata = target.lstat()
     except FileNotFoundError:
@@ -466,6 +479,7 @@ def _validate_installed_target(target: Path, expected_name: str) -> dict[str, An
         raise ContractError("managed_drift")
 
     actual_files: dict[str, str] = {}
+    generated_cache = False
     for path in sorted(target.rglob("*")):
         relative = path.relative_to(target).as_posix()
         metadata = path.lstat()
@@ -478,10 +492,17 @@ def _validate_installed_target(target: Path, expected_name: str) -> dict[str, An
         if relative == _MARKER:
             continue
         _validate_private_file(path, error="unsafe_target")
+        backing = _python_cache_source(Path(relative))
+        if (relative not in marker["files"] and backing is not None
+                and backing.as_posix() in marker["files"]):
+            # Keep all metadata guards above. A cache is meaningful only when
+            # its recorded source also passes the hash comparison below.
+            generated_cache = True
+            continue
         actual_files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     if actual_files != marker["files"] or _tree_hash(actual_files) != marker["source_hash"]:
         raise ContractError("managed_drift")
-    return marker
+    return marker, generated_cache
 
 
 def _plan(repo: Path, codex_home: Path) -> tuple[list[dict[str, Any]], int]:
@@ -506,7 +527,7 @@ def _plan(repo: Path, codex_home: Path) -> tuple[list[dict[str, Any]], int]:
         expected = _marker_for(item["name"], item["source"], source)
         target = skills_root / item["name"]
         try:
-            existing = _validate_installed_target(target, item["name"])
+            existing, generated_cache = _validate_installed_target(target, item["name"])
         except FileNotFoundError:
             status = "create"
         else:
@@ -514,6 +535,7 @@ def _plan(repo: Path, codex_home: Path) -> tuple[list[dict[str, Any]], int]:
                 "unchanged"
                 if existing["source_hash"] == expected["source_hash"]
                 and existing.get("source") == expected["source"]
+                and not generated_cache
                 else "update"
             )
         result.append(

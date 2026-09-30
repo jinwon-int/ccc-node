@@ -234,6 +234,114 @@ class CodexManagedSkillsTest(unittest.TestCase):
         self.assertIn("managed_drift", result.stderr)
         self.assertEqual(tree_digest(self.home), before)
 
+    def import_managed_web_helper(self) -> Path:
+        scripts = self.home / "skills" / "web-routing" / "scripts"
+        result = subprocess.run(
+            ["python3", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import web_search", str(scripts)],
+            capture_output=True, text=True, check=False, umask=0o077,
+            env={name: value for name, value in os.environ.items() if name != "PYTHONDONTWRITEBYTECODE"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        caches = list((scripts / "__pycache__").glob("web_search.*.pyc"))
+        self.assertEqual(len(caches), 1)
+        return caches[0]
+
+    def test_real_python_import_is_reconciled_without_source_drift(self) -> None:
+        self.assertEqual(self.apply().returncode, 0)
+        baseline = tree_digest(self.home)
+        cache = self.import_managed_web_helper()
+        before = tree_digest(self.home)
+
+        planned = run_tool("plan", "--codex-home", str(self.home))
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        statuses = {item["name"]: item["status"] for item in json.loads(planned.stdout)["skills"]}
+        self.assertEqual(statuses["web-routing"], "update")
+        self.assertEqual(tree_digest(self.home), before, "plan must leave the live cache untouched")
+        result = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(cache.exists(), "apply must not retain unrecorded executable bytecode")
+        self.assertEqual(tree_digest(self.home), baseline)
+        again = self.apply()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertTrue(all(item["status"] == "unchanged" for item in json.loads(again.stdout)["skills"]))
+
+    def test_generated_source_cache_is_not_shipped_or_recorded(self) -> None:
+        repo = self.git_repo_surface()
+        source = repo / "skills" / "web-routing"
+        cache = source / "scripts" / "__pycache__" / "web_search.cpython-311.opt-1.pyc"
+        cache.parent.mkdir(mode=0o700, exist_ok=True)
+        cache.write_bytes(b"generated")
+        result = self.apply(repo=repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.home / "skills" / "web-routing"
+        marker = json.loads((target / ".ccc-node-managed.json").read_text())
+        self.assertNotIn(cache.relative_to(source).as_posix(), marker["files"])
+        self.assertFalse((target / "scripts" / "__pycache__").exists())
+
+    def test_cache_never_hides_real_source_drift_or_unrecognized_files(self) -> None:
+        self.assertEqual(self.apply().returncode, 0)
+        cache = self.import_managed_web_helper()
+        source = cache.parent.parent / "web_search.py"
+        original = source.read_bytes()
+        for scenario in ("source-edit", "unknown-source", "wrong-name", "extra-script"):
+            with self.subTest(scenario=scenario):
+                extra = None
+                if scenario == "source-edit":
+                    source.write_bytes(original + b"\n# manual edit\n")
+                else:
+                    name = {"unknown-source": "unknown.cpython-312.pyc", "wrong-name": "other.pyc", "extra-script": "extra.py"}[scenario]
+                    extra = cache.parent / name
+                    extra.write_bytes(b"unrecorded")
+                    extra.chmod(0o600)
+                before = tree_digest(self.home)
+                result = self.apply()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("managed_drift", result.stderr)
+                self.assertEqual(tree_digest(self.home), before)
+                source.write_bytes(original)
+                if extra is not None:
+                    extra.unlink()
+
+    def test_generated_cache_keeps_link_and_permission_guards(self) -> None:
+        self.assertEqual(self.apply().returncode, 0)
+        cache = self.import_managed_web_helper()
+        original = cache.read_bytes()
+        outside = self.base / "outside-bytecode"
+        outside.write_bytes(original)
+        outside.chmod(0o600)
+        for scenario in ("symlink", "hardlink", "writable", "directory-mode"):
+            with self.subTest(scenario=scenario):
+                cache.unlink()
+                if scenario == "symlink":
+                    cache.symlink_to(outside)
+                elif scenario == "hardlink":
+                    os.link(outside, cache)
+                else:
+                    cache.write_bytes(original)
+                    cache.chmod(0o666 if scenario == "writable" else 0o600)
+                if scenario == "directory-mode":
+                    cache.parent.chmod(0o777)
+                before = tree_digest(self.home)
+                result = self.apply()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("unsafe_target", result.stderr)
+                self.assertEqual(tree_digest(self.home), before)
+                cache.parent.chmod(0o700)
+        self.assertEqual(outside.read_bytes(), original)
+
+    def test_cache_reconciliation_failure_restores_cached_tree(self) -> None:
+        repo = self.copy_repo_surface()
+        self.assertEqual(self.apply(repo=repo).returncode, 0)
+        cache = self.import_managed_web_helper()
+        source = repo / "codex" / "skills" / "ccc-doctor" / "SKILL.md"
+        source.write_text(source.read_text() + "\n<!-- source update -->\n")
+        before = tree_digest(self.home)
+        result = self.apply(repo=repo, env={"CCC_CODEX_SKILLS_TEST_FAIL_AFTER": "2"})
+        self.assertEqual(result.returncode, 70)
+        self.assertIn("transaction_rolled_back", result.stderr)
+        self.assertEqual(tree_digest(self.home), before)
+        self.assertTrue(cache.exists())
+
     def test_partial_update_failure_rolls_back_every_skill(self) -> None:
         repo = self.copy_repo_surface()
         self.assertEqual(self.apply(repo=repo).returncode, 0)
