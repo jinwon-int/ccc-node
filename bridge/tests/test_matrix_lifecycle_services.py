@@ -168,8 +168,61 @@ def test_a_steady_crash_loop_keeps_its_streak_through_the_backoff(tmp_path: Path
         clock.now += decision.delay_seconds + uptime + 5  # back-off, run, RestartSec
     streaks = [d.streak for d in decisions]
     assert streaks == list(range(20)), streaks
-    assert sum(d.alert for d in decisions) == 1
+    # One first alert; the longer loops also cross the 10-min reminder (#2086).
+    assert sum(d.alert and d.stage == 0 for d in decisions) == 1
+    reminders = [d for d in decisions if d.alert and d.stage > 0]
+    assert [d.stage for d in reminders] == ([1] if decisions[-1].elapsed_seconds >= 600 else [])
     assert max(d.delay_seconds for d in decisions) == 30.0
+
+
+def test_a_lasting_crash_loop_is_reannounced_in_stages(tmp_path: Path) -> None:
+    """#2086: 10 min, 1 h, then every 6 h after the first crashing run started."""
+
+    clock = Clock()
+    budget = _budget(tmp_path, clock, max_rapid=3, max_delay_seconds=30)
+    budget.begin()
+    streak_began = clock.now
+    fired: list[tuple[int, int]] = []
+    while clock.now - streak_began < 8 * 3600:
+        budget.record_error(OSError("Temporary failure in name resolution"))
+        clock.now += 40  # within the 60 s rapid window
+        decision = budget.begin()
+        if decision.alert:
+            fired.append((decision.stage, int(decision.elapsed_seconds)))
+    assert [stage for stage, _ in fired] == [0, 1, 2, 3]
+    assert [elapsed for _, elapsed in fired[1:]] == [600, 3600, 25200]
+    assert decision.last_cause == ("dns", "OSError")
+    raw = (tmp_path / ml.CRASH_BUDGET_FILENAME).read_text(encoding="utf-8")
+    assert "name resolution" not in raw, "only kind and class names are persisted"
+    reminder = ml.CrashDecision(
+        streak=700, delay_seconds=30, alert=True, last_error="ExceptionGroup",
+        stage=3, elapsed_seconds=25200.0, last_cause=("dns", "ClientConnectorDNSError"),
+    )
+    alert = ml.crash_loop_alert(reminder)
+    assert alert.stage == 3 and alert.dedup_key().endswith(":stage3")
+    assert "still crash-looping: 700 rapid unclean exits over 25200s" in alert.message
+    assert "(reminder 3)" in alert.message
+    assert "Cause: dns (ClientConnectorDNSError)." in alert.message
+
+
+def test_an_orderly_stop_resets_the_reminder_stage(tmp_path: Path) -> None:
+    clock = Clock()
+    budget = _budget(tmp_path, clock, max_rapid=2)
+    budget.begin()
+    stages = []
+    for _ in range(20):  # 20 × 40 s crosses the 10-min reminder
+        clock.now += 40
+        decision = budget.begin()
+        if decision.alert:
+            stages.append(decision.stage)
+    assert stages == [0, 1]
+    budget.mark_clean()
+    clock.now += 40
+    budget.begin()
+    for _ in range(2):
+        clock.now += 40
+        decision = budget.begin()
+    assert (decision.alert, decision.stage) == (True, 0), "a new streak starts at stage 0"
 
 
 def test_a_corrupt_record_is_treated_as_a_first_start(tmp_path: Path) -> None:
@@ -182,6 +235,16 @@ def test_crash_loop_alert_is_numbers_and_class_names_only() -> None:
     alert = ml.crash_loop_alert(ml.CrashDecision(streak=5, delay_seconds=30, alert=True, last_error="SafetyStop"))
     assert alert.code == ml.CRASH_LOOP_ALERT_CODE
     assert "5 times" in alert.message and "SafetyStop" in alert.message and "30s" in alert.message
+    assert "Cause:" not in alert.message, "no classification recorded, none shown"
+    assert alert.dedup_key() == f"health-alert:{ml.CRASH_LOOP_ALERT_CODE}"
+    other = ml.crash_loop_alert(
+        ml.CrashDecision(streak=5, delay_seconds=30, alert=True, last_error="SafetyStop", last_cause=("other", "SafetyStop"))
+    )
+    assert "Cause:" not in other.message, "'other' repeats the class name"
+    dns = ml.crash_loop_alert(
+        ml.CrashDecision(streak=5, delay_seconds=30, alert=True, last_error="ExceptionGroup", last_cause=("dns", "ClientConnectorDNSError"))
+    )
+    assert "Cause: dns (ClientConnectorDNSError)." in dns.message
 
 
 @pytest.mark.anyio

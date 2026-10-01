@@ -24,13 +24,164 @@ from telegram_bot.utils.health_alerts import (
     AlertThresholds,
     HealthProbe,
     HealthSignals,
+    classify_network_failure,
     count_spool_backlog,
     evaluate_alerts,
     init_retry_loop_alert,
     init_retry_recovered_alert,
+    outage_realert_due_stage,
+    outage_realert_stage,
     probe_interval,
     write_alert_spool,
 )
+
+
+def _chain(*excs):
+    """Raise ``excs[0]`` from ``excs[1]`` from ... and return the outermost."""
+    inner = None
+    for exc in reversed(excs):
+        if inner is not None:
+            exc.__cause__ = inner
+        inner = exc
+    return inner
+
+
+class OutageRealertScheduleTests(unittest.TestCase):
+    """#2086: staged reminders for a persistent outage."""
+
+    def test_due_stage_follows_10min_1h_then_every_6h(self):
+        cases = {
+            0: 0,
+            599.9: 0,
+            600: 1,
+            3599: 1,
+            3600: 2,
+            3600 + 6 * 3600 - 1: 2,
+            3600 + 6 * 3600: 3,
+            3600 + 12 * 3600: 4,
+            36033: 3,  # the 10-hour ND-3626 outage
+        }
+        for elapsed, stage in cases.items():
+            with self.subTest(elapsed=elapsed):
+                self.assertEqual(outage_realert_due_stage(elapsed), stage)
+
+    def test_invalid_elapsed_is_never_due(self):
+        for elapsed in (-5, float("nan"), float("inf"), None, "soon"):
+            with self.subTest(elapsed=elapsed):
+                self.assertEqual(outage_realert_due_stage(elapsed), 0)
+
+    def test_next_stage_fires_once_per_stage_and_skips_to_the_highest(self):
+        self.assertIsNone(outage_realert_stage(300, 0))
+        self.assertEqual(outage_realert_stage(600, 0), 1)
+        self.assertIsNone(outage_realert_stage(900, 1))
+        self.assertEqual(outage_realert_stage(3600, 1), 2)
+        # A slow loop that missed 1 h and 7 h announces once, at stage 3.
+        self.assertEqual(outage_realert_stage(8 * 3600, 1), 3)
+        self.assertIsNone(outage_realert_stage(8 * 3600, 3))
+
+    def test_ten_hour_outage_yields_three_reminders(self):
+        stage, fired = 0, []
+        for elapsed in range(0, 36_034, 5):
+            nxt = outage_realert_stage(elapsed, stage)
+            if nxt is not None:
+                stage = nxt
+                fired.append(elapsed)
+        self.assertEqual(fired, [600, 3600, 25200])
+
+
+class ClassifyNetworkFailureTests(unittest.TestCase):
+    """#2086: the alert names the kind of failure."""
+
+    def test_dns_through_ptb_httpx_wrapping(self):
+        import socket
+
+        import httpx
+        import telegram.error
+
+        gai = socket.gaierror(-3, "Temporary failure in name resolution")
+        exc = _chain(
+            telegram.error.NetworkError("httpx.ConnectError: boom"),
+            httpx.ConnectError("boom"),
+            gai,
+        )
+        self.assertEqual(classify_network_failure(exc), ("dns", "gaierror"))
+
+    def test_dns_from_message_when_the_chain_is_lost(self):
+        import telegram.error
+
+        exc = telegram.error.NetworkError(
+            "httpx.ConnectError: [Errno -3] Temporary failure in name resolution"
+        )
+        self.assertEqual(classify_network_failure(exc), ("dns", "NetworkError"))
+
+    def test_dns_via_context_aiohttp_name_and_exception_group(self):
+        class ClientConnectorDNSError(OSError):
+            pass
+
+        try:
+            try:
+                raise ClientConnectorDNSError("Cannot connect to host")
+            except OSError:
+                raise RuntimeError("sync failed")
+        except RuntimeError as wrapped:
+            exc = wrapped
+        self.assertEqual(
+            classify_network_failure(exc), ("dns", "ClientConnectorDNSError")
+        )
+        group = ExceptionGroup("task group", [ValueError("x"), exc])
+        self.assertEqual(
+            classify_network_failure(group), ("dns", "ClientConnectorDNSError")
+        )
+
+    def test_other_kinds(self):
+        import ssl
+
+        import httpx
+        import telegram.error
+
+        cases = [
+            (
+                _chain(telegram.error.TimedOut("Pool timeout"), httpx.PoolTimeout("x")),
+                ("timeout", "TimedOut"),
+            ),
+            (httpx.ConnectTimeout("x"), ("timeout", "ConnectTimeout")),
+            (TimeoutError(), ("timeout", "TimeoutError")),
+            (
+                _chain(
+                    telegram.error.NetworkError("httpx.ConnectError: x"),
+                    ConnectionRefusedError(111, "Connection refused"),
+                ),
+                ("connection_refused", "ConnectionRefusedError"),
+            ),
+            (
+                _chain(
+                    telegram.error.NetworkError("x"),
+                    ssl.SSLCertVerificationError("certificate verify failed"),
+                ),
+                ("tls", "SSLCertVerificationError"),
+            ),
+            (telegram.error.NetworkError("Bad Gateway"), ("http_error", "NetworkError")),
+            (
+                _chain(telegram.error.NetworkError("x"), ValueError("y")),
+                ("other", "ValueError"),
+            ),
+        ]
+        for exc, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(classify_network_failure(exc), expected)
+
+    def test_dns_wins_over_a_timeout_in_the_same_chain(self):
+        import socket
+
+        import telegram.error
+
+        exc = _chain(telegram.error.TimedOut("Timed out"), socket.gaierror(-3, "x"))
+        self.assertEqual(classify_network_failure(exc)[0], "dns")
+
+    def test_cyclic_chain_terminates(self):
+        a, b = RuntimeError("a"), RuntimeError("b")
+        a.__cause__, b.__cause__ = b, a
+        self.assertEqual(classify_network_failure(a), ("other", "RuntimeError"))
 
 
 class EvaluateAlertsTests(unittest.TestCase):
@@ -257,6 +408,43 @@ class SpoolTests(unittest.TestCase):
         for alert in (loop, recovered):
             self.assertNotIn("/", alert.message)
             self.assertNotIn("token", alert.message.lower())
+
+    def test_init_retry_reminders_carry_stage_cause_and_their_own_dedup_key(self):
+        cause = ("dns", "gaierror")
+        first = init_retry_loop_alert(3, 30.0, cause=cause)
+        reminder = init_retry_loop_alert(7079, 36033.0, cause=cause, stage=3)
+        recovered = init_retry_recovered_alert(7079, 36033.0, cause=cause)
+
+        self.assertEqual(first.dedup_key(), "health-alert:telegram_init_retry_loop")
+        self.assertEqual(
+            reminder.dedup_key(), "health-alert:telegram_init_retry_loop:stage3"
+        )
+        self.assertIn("Cause: dns (gaierror).", first.message)
+        self.assertIn(
+            "still failing to initialize: 7079 failed attempts over 36033s (10h00m)",
+            reminder.message,
+        )
+        self.assertIn("(reminder 3)", reminder.message)
+        self.assertIn("Cause: dns (gaierror).", reminder.message)
+        self.assertIn("7079 failed attempt(s) over 36033s (10h00m)", recovered.message)
+        self.assertIn("Last failure cause: dns (gaierror).", recovered.message)
+        for alert in (first, reminder, recovered):
+            self.assertNotIn("/", alert.message)
+
+    def test_staged_reminders_survive_the_spool_consumer_dedup(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            keys = set()
+            for stage in (0, 1, 2):
+                # One dir per record: filenames are millisecond-stamped.
+                spool = Path(tmp) / f"spool{stage}"
+                write_alert_spool(
+                    spool, init_retry_loop_alert(3, 60.0, stage=stage), node="n"
+                )
+                (record,) = spool.glob("*.json")
+                keys.add(json.loads(record.read_text(encoding="utf-8"))["dedup"])
+            self.assertEqual(len(keys), 3)
 
     def test_alert_spools_as_push_notifier_record(self):
         import tempfile

@@ -325,17 +325,34 @@ class TestConnectionResilience(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.bot.run()
 
-    def _run_init_retry_scenario(self, initialize_effects, *, threshold, on_ready=None):
+    def _run_init_retry_scenario(
+        self, initialize_effects, *, threshold, on_ready=None, seconds_per_attempt=None
+    ):
         """Drive the polling loop through a streak of initialize() failures.
 
         Returns the spool calls captured from ``write_alert_spool``. The loop
         must end with a SystemExit raised by the scenario (a Conflict from
-        initialize() or from ``_on_ready``).
+        initialize() or from ``_on_ready``). With ``seconds_per_attempt`` the
+        bot clock is fake and every initialize() attempt advances it.
         """
         cfg = config_module.config
         cfg.alert_init_failure_threshold = threshold
         mock_app = Mock()
-        mock_app.initialize = AsyncMock(side_effect=initialize_effects)
+        if seconds_per_attempt is None:
+            mock_app.initialize = AsyncMock(side_effect=initialize_effects)
+        else:
+            now = [1_000_000.0]
+            effects = iter(initialize_effects)
+            self.bot._clock = types.SimpleNamespace(time=lambda: now[0])
+
+            async def attempt():
+                now[0] += seconds_per_attempt
+                effect = next(effects)
+                if isinstance(effect, BaseException):
+                    raise effect
+                return effect
+
+            mock_app.initialize = AsyncMock(side_effect=attempt)
         self.bot.application = mock_app
         self.bot.build = Mock()
         self.bot._graceful_shutdown = AsyncMock()
@@ -397,6 +414,55 @@ class TestConnectionResilience(unittest.TestCase):
             ["telegram_init_retry_loop", "telegram_init_recovered"],
         )
         self.assertIn("after 3 failed attempt(s)", alerts[1].message)
+
+    def test_init_retry_outage_is_reannounced_in_stages(self):
+        """#2086: a lasting outage re-alerts at 10 min, 1 h, then every 6 h
+        after it began — each reminder with its own dedup key, elapsed time,
+        failure count and failure kind — and the recovery notice carries the
+        total duration and count."""
+        dns = telegram.error.NetworkError(
+            "httpx.ConnectError: [Errno -3] Temporary failure in name resolution"
+        )
+        # One attempt per minute for 7h30m, then recovery.
+        attempts = 450
+        alerts = self._run_init_retry_scenario(
+            [dns] * attempts + [None],
+            threshold=3,
+            seconds_per_attempt=60.0,
+        )
+        codes = [a.code for a in alerts]
+        self.assertEqual(
+            codes,
+            ["telegram_init_retry_loop"] * 4 + ["telegram_init_recovered"],
+        )
+        self.assertEqual([a.stage for a in alerts[:4]], [0, 1, 2, 3])
+        self.assertEqual(
+            len({a.dedup_key() for a in alerts[:4]}), 4, "stages must not dedup"
+        )
+        # Attempt n fails n * 60 s after the outage began (its first start).
+        self.assertIn("3 times in a row over 180s (3m00s)", alerts[0].message)
+        self.assertIn("10 failed attempts over 600s (10m00s)", alerts[1].message)
+        self.assertIn("60 failed attempts over 3600s (1h00m)", alerts[2].message)
+        self.assertIn("420 failed attempts over 25200s (7h00m)", alerts[3].message)
+        self.assertIn("(reminder 3)", alerts[3].message)
+        for alert in alerts:
+            self.assertIn("dns (NetworkError)", alert.message)
+        self.assertIn(f"after {attempts} failed attempt(s)", alerts[4].message)
+        self.assertIn("over 27060s (7h31m)", alerts[4].message)
+
+    def test_init_retry_late_first_alert_is_not_chased_by_a_reminder(self):
+        """Slow attempts can reach the first alert after the 10-min offset;
+        that alert absorbs the due stage, so the next reminder is the 1 h one."""
+        timed_out = telegram.error.TimedOut("Pool timeout")
+        alerts = self._run_init_retry_scenario(
+            [timed_out] * 9 + [telegram.error.Conflict("duplicate")],
+            threshold=3,
+            seconds_per_attempt=400.0,
+        )
+        self.assertEqual([a.stage for a in alerts], [0, 2])
+        self.assertIn("over 1200s", alerts[0].message)
+        self.assertIn("over 3600s", alerts[1].message)
+        self.assertIn("Cause: timeout (TimedOut)", alerts[0].message)
 
     def test_start_polling_registers_error_callback(self):
         """Polling startup attaches the supervisor error callback."""

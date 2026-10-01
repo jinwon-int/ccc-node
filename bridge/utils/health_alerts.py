@@ -48,6 +48,8 @@ import json
 import logging
 import math
 import platform
+import socket
+import ssl
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -121,8 +123,14 @@ class AlertThresholds:
 class Alert:
     code: str
     message: str  # constant template + numbers only; redaction-safe by construction
+    # Re-alert stage of a persistent condition (#2086). Stage 0 keeps the
+    # historical dedup key; later stages get their own key so a staged
+    # reminder is never collapsed into the first alert by a spool consumer.
+    stage: int = 0
 
     def dedup_key(self) -> str:
+        if self.stage > 0:
+            return f"health-alert:{self.code}:stage{self.stage}"
         return f"health-alert:{self.code}"
 
 
@@ -190,32 +198,257 @@ def evaluate_alerts(signals: HealthSignals, thresholds: AlertThresholds) -> list
     return alerts
 
 
-def init_retry_loop_alert(failures: int, elapsed_seconds: float) -> Alert:
+# -- staged re-alerts for a persistent outage (#2086) ---------------------------
+#
+# A retry-loop alert used to fire once per outage episode. During a 10-hour
+# node DNS outage that meant one alert at minute one and silence for the next
+# 7,000 failures. A still-ongoing outage is now re-announced at fixed offsets
+# from its start, then periodically. Stage 0 is the first alert (raised by the
+# caller's own threshold); stage N >= 1 is the N-th reminder.
+
+#: Elapsed seconds since the outage began at which reminders 1, 2, ... fire.
+OUTAGE_REALERT_OFFSETS_SECONDS: tuple[float, ...] = (600.0, 3600.0)
+#: After the last fixed offset, one more reminder every this many seconds.
+OUTAGE_REALERT_INTERVAL_SECONDS = 6 * 3600.0
+
+
+def outage_realert_due_stage(elapsed_seconds: float) -> int:
+    """Highest reminder stage whose offset ``elapsed_seconds`` has reached.
+
+    0 = no reminder due yet. With the defaults: 10 min → 1, 1 h → 2,
+    7 h → 3, 13 h → 4, ...
+    """
+    try:
+        elapsed = float(elapsed_seconds)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(elapsed) or elapsed < 0:
+        return 0
+    stage = 0
+    for offset in OUTAGE_REALERT_OFFSETS_SECONDS:
+        if elapsed < offset:
+            return stage
+        stage += 1
+    last = OUTAGE_REALERT_OFFSETS_SECONDS[-1] if OUTAGE_REALERT_OFFSETS_SECONDS else 0.0
+    return stage + int((elapsed - last) // OUTAGE_REALERT_INTERVAL_SECONDS)
+
+
+def outage_realert_stage(elapsed_seconds: float, last_stage: int) -> Optional[int]:
+    """The reminder stage to announce now, or ``None`` when none is due.
+
+    ``last_stage`` is the stage most recently announced (0 = only the first
+    alert). A slow retry loop that skipped several offsets announces once, at
+    the highest due stage, instead of a burst of catch-up reminders.
+    """
+    due = outage_realert_due_stage(elapsed_seconds)
+    return due if due > int(last_stage) else None
+
+
+# -- failure-cause classification (#2086) ---------------------------------------
+
+FAILURE_DNS = "dns"
+FAILURE_TLS = "tls"
+FAILURE_CONNECTION_REFUSED = "connection_refused"
+FAILURE_HTTP_ERROR = "http_error"
+FAILURE_TIMEOUT = "timeout"
+FAILURE_OTHER = "other"
+
+_DNS_TYPE_NAMES = frozenset({"gaierror", "ClientConnectorDNSError"})
+_DNS_MARKERS = (
+    "temporary failure in name resolution",
+    "name or service not known",
+    "no address associated with hostname",
+    "nodename nor servname",
+    "getaddrinfo failed",
+    "could not resolve host",
+    "eai_again",
+    "eai_noname",
+    "[errno -2]",
+    "[errno -3]",
+    "[errno -5]",
+)
+_TLS_MARKERS = ("certificate_verify_failed", "[ssl", "ssl:", "tlsv1 alert")
+_REFUSED_MARKERS = ("connection refused", "[errno 111]", "[errno 61]")
+_HTTP_TYPE_NAMES = frozenset({"HTTPStatusError", "ClientResponseError"})
+_HTTP_MARKERS = (
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "internal server error",
+)
+_TIMEOUT_MARKERS = ("timed out", "timeout")
+_MAX_CHAIN = 32
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """``exc`` plus every exception reachable through cause/context/groups."""
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending and len(chain) < _MAX_CHAIN:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        linked: list[Any] = [current.__cause__, current.__context__]
+        # aiohttp's ClientConnectorError keeps the socket error on .os_error.
+        linked.append(getattr(current, "os_error", None))
+        group = getattr(current, "exceptions", None)
+        if isinstance(group, (tuple, list)):
+            linked.extend(group)
+        pending.extend(e for e in linked if isinstance(e, BaseException))
+    return chain
+
+
+def _text(exc: BaseException) -> str:
+    try:
+        return str(exc).lower()
+    except Exception:
+        return ""
+
+
+def _is_dns(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, socket.gaierror)
+        or type(exc).__name__ in _DNS_TYPE_NAMES
+        or any(m in _text(exc) for m in _DNS_MARKERS)
+    )
+
+
+def _is_tls(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    return (
+        isinstance(exc, ssl.SSLError)
+        or "SSL" in name
+        or "Certificate" in name
+        or any(m in _text(exc) for m in _TLS_MARKERS)
+    )
+
+
+def _is_refused(exc: BaseException) -> bool:
+    return isinstance(exc, ConnectionRefusedError) or any(
+        m in _text(exc) for m in _REFUSED_MARKERS
+    )
+
+
+def _is_http_error(exc: BaseException) -> bool:
+    return type(exc).__name__ in _HTTP_TYPE_NAMES or any(
+        m in _text(exc) for m in _HTTP_MARKERS
+    )
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    return (
+        isinstance(exc, TimeoutError)
+        or name == "TimedOut"
+        or name.endswith("Timeout")
+        or "TimeoutError" in name
+        or any(m in _text(exc) for m in _TIMEOUT_MARKERS)
+    )
+
+
+# Most specific first: a DNS failure that ends in a connect timeout is "dns".
+_CLASSIFIERS = (
+    (FAILURE_DNS, _is_dns),
+    (FAILURE_TLS, _is_tls),
+    (FAILURE_CONNECTION_REFUSED, _is_refused),
+    (FAILURE_HTTP_ERROR, _is_http_error),
+    (FAILURE_TIMEOUT, _is_timeout),
+)
+
+
+def classify_network_failure(exc: BaseException) -> tuple[str, str]:
+    """Classify a transport failure as ``(kind, exception type name)``.
+
+    ``kind`` is one of ``dns``, ``tls``, ``connection_refused``,
+    ``http_error``, ``timeout`` or ``other``. The whole ``__cause__`` /
+    ``__context__`` chain (and exception-group members) is searched, because
+    the interesting error is usually wrapped: PTB's ``NetworkError`` wraps
+    ``httpx.ConnectError`` wraps ``socket.gaierror``. The type name is that of
+    the exception that decided the kind (the innermost one for ``other``).
+    Only the kind and a class name ever reach an alert — never the message.
+    """
+    chain = _exception_chain(exc)
+    for kind, matches in _CLASSIFIERS:
+        for item in chain:
+            if matches(item):
+                return kind, type(item).__name__
+    return FAILURE_OTHER, type(chain[-1]).__name__
+
+
+def format_failure_cause(cause: Optional[tuple[str, str]]) -> str:
+    """`` Cause: dns (gaierror).`` or empty — appended to alert messages."""
+    if not cause:
+        return ""
+    kind, type_name = cause
+    return f" Cause: {kind} ({type_name})."
+
+
+def _format_duration(seconds: float) -> str:
+    """``61s (1m01s)`` / ``36033s (10h00m)``; the raw seconds always lead."""
+    total = int(max(0.0, seconds)) if math.isfinite(seconds) else 0
+    if total < 60:
+        return f"{total}s"
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    human = f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{secs:02d}s"
+    return f"{total}s ({human})"
+
+
+def init_retry_loop_alert(
+    failures: int,
+    elapsed_seconds: float,
+    *,
+    cause: Optional[tuple[str, str]] = None,
+    stage: int = 0,
+) -> Alert:
     """Bridge stuck retrying ``Application.initialize()`` — not receiving messages.
 
-    Raised by the polling lifecycle (core/bot_lifecycle.py) once the streak of
-    consecutive transient initialize() failures reaches
-    ``CCC_ALERT_INIT_FAILURES``; fired once per episode, numbers only.
+    Raised by the polling lifecycle (core/bot_lifecycle.py): stage 0 once the
+    streak of consecutive transient initialize() failures reaches
+    ``CCC_ALERT_INIT_FAILURES``, then a reminder per
+    :func:`outage_realert_stage` while the outage lasts. Numbers, a failure
+    kind and an exception class name only.
     """
+    duration = _format_duration(elapsed_seconds)
+    if stage > 0:
+        message = (
+            f"Telegram polling is still failing to initialize: {int(failures)} "
+            f"failed attempts over {duration} since the outage began "
+            f"(reminder {int(stage)}) — the bridge is not receiving messages."
+        )
+    else:
+        message = (
+            f"Telegram polling failed to initialize {int(failures)} times in a row "
+            f"over {duration} — the bridge is stuck in its "
+            "transport retry loop and is not receiving messages."
+        )
     return Alert(
         code="telegram_init_retry_loop",
-        message=(
-            f"Telegram polling failed to initialize {int(failures)} times in a row "
-            f"over {int(max(0.0, elapsed_seconds))}s — the bridge is stuck in its "
-            "transport retry loop and is not receiving messages."
-        ),
+        message=message + format_failure_cause(cause),
+        stage=max(0, int(stage)),
     )
 
 
-def init_retry_recovered_alert(failures: int, elapsed_seconds: float) -> Alert:
-    """Companion notice: initialize() succeeded after an alerted retry streak."""
-    return Alert(
-        code="telegram_init_recovered",
-        message=(
-            f"Telegram polling initialized after {int(failures)} failed attempt(s) "
-            f"over {int(max(0.0, elapsed_seconds))}s — messages are being received again."
-        ),
+def init_retry_recovered_alert(
+    failures: int,
+    elapsed_seconds: float,
+    *,
+    cause: Optional[tuple[str, str]] = None,
+) -> Alert:
+    """Companion notice: initialize() succeeded after an alerted retry streak.
+
+    Carries the outage's total duration, failure count and last failure kind.
+    """
+    message = (
+        f"Telegram polling initialized after {int(failures)} failed attempt(s) "
+        f"over {_format_duration(elapsed_seconds)} — messages are being received again."
     )
+    if cause:
+        message += f" Last failure cause: {cause[0]} ({cause[1]})."
+    return Alert(code="telegram_init_recovered", message=message)
 
 
 class AlertGate:
