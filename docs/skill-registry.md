@@ -122,6 +122,10 @@ blocks a read.
 
 Monthly retroactive audit (first cycle: 2026-08-28, #1347):
 
+Codex also records successful command reads through this logger; see
+[Codex capture rules and audience boundaries](codex-skill-telemetry.md). Usage
+counts show loads, not successful application of a skill.
+
 1. `bash ~/.claude/hooks/skill-usage-log.sh report 30` — per-skill load
    counts for the window.
 2. Diff against the registry: zero-load skills become cull/archive/keep

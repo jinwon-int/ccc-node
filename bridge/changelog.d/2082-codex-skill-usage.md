@@ -1,0 +1,1 @@
+- Codex now records successful, matched SKILL.md command reads in the shared skill-usage ledger for Telegram and Matrix. Capture excludes failed reads, path mentions and duplicate completions, preserves audience isolation, and bounds background logger work.

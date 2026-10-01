@@ -62,6 +62,7 @@ from .working_state_archive import (
     archive_working_state,
     select_working_state_environment,
 )
+from .codex_skill_usage import CodexSkillReads, SkillUsageSink
 from telegram_bot.memory.codex_rollout import (
     read_codex_rollout_candidates,
     validate_rollout_root,
@@ -328,6 +329,7 @@ class CodexSession:
         self._approvals_reviewer = approvals_reviewer
         self._sandbox_policy = cast(Mapping[str, JsonValue] | None, sandbox_policy)
         self._turn_lock = turn_lock
+        self._skill_usage_sink = runtime._skill_usage_sink.for_session(working_state_environment)
         self._working_state_environment = select_working_state_environment(
             working_state_environment
         )
@@ -346,6 +348,7 @@ class CodexSession:
         async def events() -> AsyncIterator[AgentEvent]:
             async with self._turn_lock:
                 active = _ActiveTurn(asyncio.Queue(), approval_handler)
+                skill_reads = CodexSkillReads(self._skill_usage_sink)
                 self._runtime._active_turns[self._thread_id] = active
                 try:
                     result = await self._runtime._client.turn_start(
@@ -371,6 +374,12 @@ class CodexSession:
                     self._runtime._flush_pending_notifications(active)
                     while True:
                         event = await active.queue.get()
+                        # Shared by Telegram and Matrix; accepted live events only.
+                        # Usage capture must never affect the conversation stream.
+                        try:
+                            skill_reads.observe(event)
+                        except Exception:
+                            logger.debug("Codex skill usage observation unavailable")
                         yield event
                         if isinstance(event, (CompletionEvent, ErrorEvent)):
                             return
@@ -500,6 +509,7 @@ class CodexRuntime:
         self._resume_diagnostics = CodexResumeDiagnostics()
         self._resume_diagnostics_observer: ResumeDiagnosticsObserver | None = None
         self._process_environment = bound_environment
+        self._skill_usage_sink = SkillUsageSink(bound_environment)
         self._working_state_environment = select_working_state_environment(
             working_state_environment
             if working_state_environment is not None
@@ -1233,6 +1243,7 @@ class CodexRuntime:
                 self._dispatcher_task = None
             self._started = False
             await self._client.close()
+            await self._skill_usage_sink.drain()
 
     async def recycle(self) -> bool:
         """Replace an idle app-server connection and its MCP subprocess tree.
