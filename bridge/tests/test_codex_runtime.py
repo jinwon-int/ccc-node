@@ -1398,7 +1398,7 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     working_directory="/workspace",
                     memory_environment={"CCC_MEMORY_AUDIENCE_SCOPED": "1", "CCC_STATE_DIR": str(scope)},
                 ))
-                data = {"id": "skill-read", "type": "commandExecution",
+                data: dict[str, Any] = {"id": "skill-read", "type": "commandExecution",
                         "command": "cat /example/skills/example/SKILL.md", "cwd": "/workspace",
                         "commandActions": [{"type": "read", "path": "/example/skills/example/SKILL.md"}],
                         "status": "completed", "exitCode": 0, "aggregatedOutput": "private skill body"}

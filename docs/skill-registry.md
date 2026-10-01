@@ -120,11 +120,11 @@ any `*/skills/*/SKILL.md` both count, which is how bridge-resolved skills
 actually load. Best-effort by contract: every failure exits 0 and never
 blocks a read.
 
-Monthly retroactive audit (first cycle: 2026-08-28, #1347):
-
 Codex also records successful command reads through this logger; see
 [Codex capture rules and audience boundaries](codex-skill-telemetry.md). Usage
 counts show loads, not successful application of a skill.
+
+Monthly retroactive audit (first cycle: 2026-08-28, #1347):
 
 1. `bash ~/.claude/hooks/skill-usage-log.sh report 30` — per-skill load
    counts for the window.
@@ -134,5 +134,5 @@ counts show loads, not successful application of a skill.
 3. Archive demotions land in `docs/archive/skills/`; removals re-render the
    registry (files + update command).
 
-Known gap: bridge sessions with audience-isolated settings may bypass host
-hooks — a bridge-side log line is the follow-up.
+Audience-scoped Codex reads stay in the audience ledger and are excluded from
+the owner audit. Other host-hook coverage gaps still require separate evidence.
