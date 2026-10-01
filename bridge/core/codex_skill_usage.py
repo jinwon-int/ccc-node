@@ -30,51 +30,101 @@ _ENV_KEYS = {
 }
 
 
-def _simple_read(command: object) -> bool:
+def _read_words(command: object) -> list[str]:
     if not isinstance(command, str) or not command or len(command) > 16384:
-        return False
+        return []
     if any(char in command for char in ("$", "`", "\n", "\r")):
-        return False
+        return []
     try:
         words = shlex.split(command)
-        if len(words) == 3 and Path(words[0]).name in {"bash", "sh"} and words[1] in {"-c", "-lc"}:
+        if len(words) == 3 and words[0] in {"bash", "sh", "/bin/bash", "/bin/sh"} and words[1] in {"-c", "-lc"}:
             command = words[2]
         lex = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
         lex.whitespace_split = True
         words = list(lex)
     except ValueError:
-        return False
-    return bool(
-        words
-        and Path(words[0]).name in {"cat", "head", "tail", "sed"}
-        and not any(word and all(c in ";&|<>()" for c in word) for word in words)
-        and not any(word in {"--help", "--version"} for word in words)
-    )
+        return []
+    if any(word and all(c in ";&|<>()" for c in word) for word in words):
+        return []
+    return words
+
+
+def _head_tail_operands(args: list[str]) -> list[str]:
+    # Exclude verbose/zero-byte reads and headers from multi-file invocations.
+    index = 0
+    while index < len(args) and args[index].startswith("-"):
+        word = args[index]
+        index += 1
+        if word == "--":
+            break
+        if word == "-q":
+            continue
+        if word in {"-n", "-c"}:
+            if index == len(args) or not re.fullmatch(r"[1-9][0-9]{0,8}", args[index]):
+                return []
+            index += 1
+        elif not re.fullmatch(r"-(?:n|c)?[1-9][0-9]{0,8}", word):
+            return []
+    operands = args[index:]
+    return operands if len(operands) == 1 else []
+
+
+def _command_operands(command: object) -> list[str]:
+    words = _read_words(command)
+    if not words:
+        return []
+    program = words[0]
+    if program not in {f"{prefix}{name}" for prefix in ("", "/bin/", "/usr/bin/") for name in ("cat", "head", "tail", "sed")}:
+        return []
+    args = words[1:]
+    name = Path(program).name
+    if name in {"head", "tail"}:
+        return _head_tail_operands(args)
+    if name == "sed":
+        if args[:1] == ["-n"]:
+            args = args[1:]
+        if args[:1] == ["-e"]:
+            args = args[1:]
+        if not args or not re.fullmatch(r"[1-9][0-9]{0,8}(?:,[1-9][0-9]{0,8})?p", args[0]):
+            return []
+        args = args[1:]
+        if args[:1] == ["--"]:
+            args = args[1:]
+        return args if len(args) == 1 and not args[0].startswith("-") else []
+    while args and args[0].startswith("-"):
+        flag, args = args[0], args[1:]
+        if flag == "--":
+            break
+        if not re.fullmatch(r"-[benstuvAET]+", flag):
+            return []
+    return args if args and all(arg != "-" and not arg.startswith("-") for arg in args) else []
+
+
+def _absolute_path(path: object, cwd: object) -> str | None:
+    if not isinstance(path, str) or len(path) > 4096 or not path:
+        return None
+    if not path.startswith("/"):
+        if not isinstance(cwd, str) or not cwd.startswith("/"):
+            return None
+        path = str(PurePosixPath(cwd) / path)
+    return None if ".." in PurePosixPath(path).parts else str(PurePosixPath(path))
 
 
 def _read_skills(item: Mapping[str, object]) -> frozenset[str]:
     actions = item.get("commandActions")
     if not isinstance(actions, (list, tuple)) or not 1 <= len(actions) <= 64:
         return frozenset()
-    if not _simple_read(item.get("command")):
-        return frozenset()
+    operands = _command_operands(item.get("command"))
+    paths = {_absolute_path(path, item.get("cwd")) for path in operands}
     skills: set[str] = set()
     for action in actions:
         if not isinstance(action, Mapping) or action.get("type") != "read":
             return frozenset()
-        path = action.get("path")
-        if not isinstance(path, str) or len(path) > 4096:
-            continue
-        if not path.startswith("/"):
-            cwd = item.get("cwd")
-            if not isinstance(cwd, str) or not cwd.startswith("/"):
-                continue
-            path = str(PurePosixPath(cwd) / path)
-        if ".." in PurePosixPath(path).parts:
-            continue
-        match = _NAME.search(path)
-        if match:
-            skills.add(match[1])
+        path = _absolute_path(action.get("path"), item.get("cwd"))
+        if path is not None and path in paths:
+            match = _NAME.search(path)
+            if match:
+                skills.add(match[1])
     return frozenset(skills)
 
 
@@ -179,7 +229,7 @@ class SkillUsageSink:
         except Exception:
             logger.debug("Codex skill usage write unavailable")
         finally:
-            if process is not None and process.returncode is None:
+            if process is not None:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:

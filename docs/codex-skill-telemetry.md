@@ -12,7 +12,10 @@ notifications are ignored. A separate subsequent read counts again. History
 and notifications rejected by the runtime's thread/turn routing cannot count.
 
 Capture is conservative: simple `cat`, `head`, `tail`, and `sed` commands,
-including a single `bash -c`/`bash -lc` wrapper, are supported. Searches,
+including a single `bash -c`/`bash -lc` wrapper, are supported. Actual operands
+must match the structured read paths. `head`/`tail` accept one file and positive
+limits without verbose headers; `sed` accepts one file and a numeric print
+range. Searches,
 listings, mere path mentions, shell control flow, redirects, unknown actions,
 missing success metadata, and arbitrary scripts or code execution are excluded.
 This is evidence that a skill was loaded, not proof it was followed or useful.
@@ -32,7 +35,8 @@ records are not combined into the owner's curator input.
 
 Logging is best effort and never awaited on the conversation event path. Each
 runtime permits at most four logger processes, with no overflow queue and a
-four-second deadline that kills the process group. A turn remembers at most
+four-second deadline. The owned process group is cleaned up after every exit,
+including a successful parent exit with surviving descendants. A turn remembers at most
 256 qualifying item IDs. Runtime shutdown drains the bounded pending writes.
 Logger absence, overload, or failure can therefore undercount usage; none may
 block a tool read. There is no historical backfill or fabricated use event.

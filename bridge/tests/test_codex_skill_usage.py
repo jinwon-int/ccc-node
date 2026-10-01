@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
@@ -51,6 +52,26 @@ class ReadEvidenceTests(unittest.TestCase):
         sink = Mock()
         pair(CodexSkillReads(sink), item(), success=False)
         sink.record.assert_not_called()
+
+    def test_real_header_only_and_mismatched_reads_are_not_evidence(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "skills/example/SKILL.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("ACTUAL_SKILL_BODY\n")
+            other = Path(raw) / "other.md"
+            other.write_text("UNRELATED_BODY\n")
+            for command in (f"head -v -n0 {path}", f"cat {other}"):
+                run = subprocess.run(command, shell=True, check=True, text=True, capture_output=True)
+                self.assertNotIn("ACTUAL_SKILL_BODY", run.stdout)
+                sink = Mock()
+                pair(CodexSkillReads(sink), item(str(path), command=command, aggregatedOutput=run.stdout))
+                sink.record.assert_not_called()
+            for command in (f"head -n 2 {path}", f"tail -n2 {path}", f"sed -n 1,80p {path}", f"cat -n {path}"):
+                run = subprocess.run(command, shell=True, check=True, text=True, capture_output=True)
+                self.assertIn("ACTUAL_SKILL_BODY", run.stdout)
+                sink = Mock()
+                pair(CodexSkillReads(sink), item(str(path), command=command, aggregatedOutput=run.stdout))
+                sink.record.assert_called_once_with("example")
 
     def test_orphan_and_changed_completion_not_counted(self):
         sink = Mock()
@@ -114,6 +135,27 @@ class SinkTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(sink._tasks), 4)
                 await asyncio.wait_for(sink.drain(), 2)
             self.assertFalse(sink._tasks)
+
+    async def test_logger_descendants_are_killed_even_after_parent_success(self):
+        with tempfile.TemporaryDirectory() as raw:
+            pidfile = Path(raw) / "child-pids"
+            script = Path(raw) / "spawn.sh"
+            script.write_text(f"#!/bin/bash\nsleep 30 &\necho $! >> {pidfile}\nexit 0\n")
+            sink = SkillUsageSink({"HOME": raw, "PATH": os.environ["PATH"], "CCC_SKILL_USAGE_LOGGER": str(script)})
+            for _ in range(3):
+                for _ in range(4):
+                    sink.record("test-skill")
+                await sink.drain()
+            self.assertFalse(sink._tasks)
+            for line in pidfile.read_text().splitlines():
+                stat_path = Path("/proc") / line / "stat"
+                # A killed orphan may briefly await reaping by container PID 1.
+                for _ in range(20):
+                    if not stat_path.exists() or stat_path.read_text().split()[2] == "Z":
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    self.fail("logger descendant is still running")
 
     async def test_missing_logger_is_best_effort(self):
         with tempfile.TemporaryDirectory() as raw:
