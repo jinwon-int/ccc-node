@@ -63,6 +63,7 @@ from telegram_bot.core.bot_voice import BotVoiceMixin
 from telegram_bot.core.bot_approvals import BotApprovalMixin
 from telegram_bot.core.bot_callbacks import BotCallbackMixin
 from telegram_bot.core.bot_danso_recovery import DansoRecoveryMixin
+from telegram_bot.core.bot_wait_status import BotWaitStatusMixin
 from telegram_bot.core.bot_ports import BotConfigPort
 
 
@@ -77,6 +78,7 @@ class TelegramBot(
     BotCallbackMixin,
     BotVoiceMixin,
     BotApprovalMixin,
+    BotWaitStatusMixin,
 ):
     # The intersection of the per-section config slices (#1509). mypy requires
     # the composed class to re-declare the attribute because sibling mixins
@@ -848,6 +850,9 @@ class TelegramBot(
                 reply_mode=next_reply_mode,
                 voice_input_preview=voice_input_preview,
             )
+            # The reply is in the chat; now show (or refresh) the one-line
+            # "still watching CI" status for this route (#2081, fail-open).
+            await self._sync_external_wait_status(user_id, chat.id)
             await self._offer_danso_recovery_if_failed(
                 response, conversation_key, user_id, chat.id
             )

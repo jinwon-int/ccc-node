@@ -310,6 +310,12 @@ class BotLifecycleMixin(MemoryDistillMixin):
         # transition it to `interrupted` and clean (or annotate) its status
         # message. Then drain any terminal ops left pending by failed cleanups.
         await self._reconcile_task_ledger(application)
+        # External-wait status messages (#2081): a previous run's message may
+        # now be stale (waits finished while down) or missing (run died
+        # between register and turn end). Bounded, fail-open.
+        reconcile_wait_status = getattr(self, "_reconcile_external_wait_status_on_start", None)
+        if callable(reconcile_wait_status):
+            await reconcile_wait_status()
         await self._recover_dead_session_notifications(application)
         recover_danso = getattr(self, "_recover_danso_tasks", None)
         if callable(recover_danso):
@@ -1552,6 +1558,9 @@ class BotLifecycleMixin(MemoryDistillMixin):
             # Do not mark it failed or resend its completed message.
             if (getattr(response, "success", False)
                     and getattr(response, "streamed", False) and not content.strip()):
+                await self._refresh_external_wait_status(
+                    int(record["user_id"]), int(record["chat_id"])
+                )
                 return True
             if getattr(response, "success", False) and content.strip():
                 delivered, reason = await self._send_external_chunked(
@@ -1568,6 +1577,11 @@ class BotLifecycleMixin(MemoryDistillMixin):
                         reason,
                     )
                     return False
+                # The continuation may have registered a follow-up wait
+                # (chained CI); refresh the route status after its reply.
+                await self._refresh_external_wait_status(
+                    int(record["user_id"]), int(record["chat_id"])
+                )
                 return True
             return False
 
@@ -1578,12 +1592,18 @@ class BotLifecycleMixin(MemoryDistillMixin):
             except Exception:
                 return None
 
+        # Terminal transitions refresh the route's status message (#2081);
+        # None when the status mixin is not composed or the flag is off.
+        syncer_factory = getattr(self, "_external_wait_status_syncer", None)
+        status_syncer = syncer_factory() if callable(syncer_factory) else None
+
         return ExternalWaitMonitor(
             registry,
             transport=GhCliTransport(),
             notifier=notify,
             resumer=resume,
             session_lookup=session_lookup,
+            status_syncer=status_syncer,
             resume_enabled=ExternalWaitMonitor.env_flag(
                 "CCC_EXTERNAL_WAIT_RESUME", default=True
             ),
@@ -1591,6 +1611,16 @@ class BotLifecycleMixin(MemoryDistillMixin):
                 "CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP", default=10
             ),
         )
+
+    async def _refresh_external_wait_status(self, user_id: int, chat_id: int) -> None:
+        """Refresh the route's wait status message when the mixin is composed (#2081).
+
+        The composed bot carries ``BotWaitStatusMixin``; lifecycle-only test
+        doubles do not, so this is a no-op there. The sync itself is fail-open.
+        """
+        sync_status = getattr(self, "_sync_external_wait_status", None)
+        if callable(sync_status):
+            await sync_status(int(user_id), int(chat_id))
 
     async def _send_external_chunked(self, chat_id: int, text: str) -> tuple[bool, Optional[str]]:
         """One logical send through the shared chunked path, retried once.
@@ -1694,6 +1724,7 @@ class BotLifecycleMixin(MemoryDistillMixin):
             # Do not mark it failed or resend its completed message.
             if (getattr(response, "success", False)
                     and getattr(response, "streamed", False) and not content.strip()):
+                await self._refresh_external_wait_status(user_id, chat_id)
                 return True
             if getattr(response, "success", False) and content.strip():
                 delivered, reason = await self._send_external_chunked(chat_id, content)
@@ -1704,6 +1735,9 @@ class BotLifecycleMixin(MemoryDistillMixin):
                         reason,
                     )
                     return False
+                # A continuation bundle often ends by registering a CI wait;
+                # show it right after its reply (#2081).
+                await self._refresh_external_wait_status(user_id, chat_id)
                 return True
             return False
 
