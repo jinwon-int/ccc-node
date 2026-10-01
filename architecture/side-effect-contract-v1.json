@@ -204,6 +204,31 @@
         "after_ack_before_terminal": "safe-replay",
         "duplicate_restart_replay": "reconcile"
       }
+    },
+    {
+      "operation": "telegram.external_wait_status",
+      "owner": "bridge external-wait status projection",
+      "registration": {
+        "kind": "python-symbol",
+        "path": "bridge/core/bot_wait_status.py",
+        "symbol": "BotWaitStatusMixin._sync_external_wait_status"
+      },
+      "external": true,
+      "idempotency": "local-ledger",
+      "idempotency_key": "status-messages.json entry keyed by user_id:chat_id holding the one live message id and a text hash; a matching hash is a no-op and edits or deletes only ever address the stored id",
+      "retry_class": "safe",
+      "ambiguous_window": "Telegram accepted the send before the message id was stored, so the next sync may post a second status message for the route; an edit or delete that landed before the store update is repeated until not-modified or not-found confirms the state",
+      "reconcile": "receipt",
+      "compensation": "delete",
+      "audit_surface": "body-free bridge debug logs naming the route and action kind only; status-messages.json holds message ids and a text hash, never wait summaries",
+      "approval_boundary": "automatic housekeeping limited to one bot-authored silent status message per conversation; user content is never edited or deleted",
+      "recovery": {
+        "before_intent": "safe-replay",
+        "after_intent_before_call": "safe-replay",
+        "after_external_success_before_ack": "reconcile",
+        "after_ack_before_terminal": "safe-replay",
+        "duplicate_restart_replay": "reconcile"
+      }
     }
   ]
 }
