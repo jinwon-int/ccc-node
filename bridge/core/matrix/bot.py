@@ -1070,9 +1070,19 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                     loop.add_signal_handler(sig, task.cancel)
                 except (NotImplementedError, RuntimeError):  # pragma: no cover - non-POSIX loops
                     pass
+            stable_watch: asyncio.Task[None] | None = None
             try:
                 await self._crash_backoff(decision)
-                await self.serve()
+                if budget is not None:
+                    stable_watch = asyncio.create_task(
+                        self._crash_stable_watch(budget), name="matrix-crash-stable-watch"
+                    )
+                try:
+                    await self.serve()
+                finally:
+                    if stable_watch is not None:
+                        stable_watch.cancel()
+                        await asyncio.gather(stable_watch, return_exceptions=True)
             except asyncio.CancelledError:
                 logger.info("Matrix frontend stopped")
             except BaseException as error:
@@ -1099,11 +1109,16 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         back-off the Telegram ``start.sh`` supervisor provides, with the same
         ``crash-policy.env`` numbers. One owner alert per streak, plus staged
         reminders while the streak lasts (#2086), rides the push spool
-        (delivered once the spool consumer is up; ``CCC_PUSH_ENABLED``).
+        (delivered once the spool consumer is up; ``CCC_PUSH_ENABLED``). A
+        start that finds the previous run outlived the rapid window sends the
+        alerted streak's recovery notice here; normally
+        :meth:`_crash_stable_watch` already did.
         """
 
         if decision is None:
             return
+        if decision.recovered is not None:
+            self._spool_crash_alert(matrix_lifecycle.crash_loop_recovered_alert(decision.recovered))
         if decision.streak:
             logger.warning(
                 "Matrix frontend: %d rapid unclean exit(s) in a row (last: %s); delaying start %ds",
@@ -1112,14 +1127,34 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                 int(decision.delay_seconds),
             )
         if decision.alert:
-            alert = matrix_lifecycle.crash_loop_alert(decision)
-            logger.error("Health alert [%s]: %s", alert.code, alert.message)
-            if getattr(self._settings, "push_enabled", False):
-                from telegram_bot.utils.health_alerts import write_alert_spool
-
-                write_alert_spool(spool_write_dir(self._settings), alert)
+            self._spool_crash_alert(matrix_lifecycle.crash_loop_alert(decision))
         if decision.delay_seconds > 0:
             await asyncio.sleep(decision.delay_seconds)
+
+    async def _crash_stable_watch(self, budget: "matrix_lifecycle.CrashBudget") -> None:
+        """Once this run has served for the rapid window, end any streak.
+
+        A crash after this point is no longer rapid, so an alerted streak is
+        over: its recovery notice goes out exactly once (the budget clears the
+        snapshot as it hands it back). Cancelled when serving ends sooner.
+        """
+
+        await asyncio.sleep(budget.window_seconds)
+        try:
+            recovery = budget.mark_stable()
+            if recovery is not None:
+                self._spool_crash_alert(matrix_lifecycle.crash_loop_recovered_alert(recovery))
+        except Exception as error:  # accounting must never take the frontend down
+            logger.warning("Matrix crash-loop recovery check failed: %s", type(error).__name__)
+
+    def _spool_crash_alert(self, alert: Any) -> None:
+        """Log a crash-budget alert and queue it on the push spool when push is on."""
+
+        logger.error("Health alert [%s]: %s", alert.code, alert.message)
+        if getattr(self._settings, "push_enabled", False):
+            from telegram_bot.utils.health_alerts import write_alert_spool
+
+            write_alert_spool(spool_write_dir(self._settings), alert)
 
     # -- outbound routing ----------------------------------------------------
 

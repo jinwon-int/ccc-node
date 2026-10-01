@@ -16,7 +16,9 @@ remaining ones for Matrix rather than porting them line by line:
   the next start exponentially, and raises an owner health alert when the
   streak reaches the strike count, then staged reminders while it lasts
   (10 min, 1 h, then every 6 h after it began — #2086), each naming the
-  failure kind of the last exit (``dns``, ``timeout``, ...).
+  failure kind of the last exit (``dns``, ``timeout``, ...). An alerted
+  streak ends with exactly one recovery notice once a run stays up past the
+  rapid window; a streak that never alerted ends silently.
 * **Task-ledger reconciliation** — the shared request lifecycle writes
   ``tasks.json`` in this data dir; nothing reconciled it, so a turn killed by
   a restart stayed ``working`` forever. The room already hears about the
@@ -55,10 +57,23 @@ logger = logging.getLogger(__name__)
 
 CRASH_BUDGET_FILENAME = "crash-budget.json"
 CRASH_LOOP_ALERT_CODE = "matrix_crash_loop"
+CRASH_LOOP_RECOVERED_ALERT_CODE = "matrix_crash_loop_recovered"
 MATRIX_NUDGE_PORT_ENV = "CCC_MATRIX_WEBHOOK_NUDGE_PORT"
 
 
 # -- rapid-crash budget ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CrashRecovery:
+    """An alerted rapid-crash streak that has ended: a run outlived the window."""
+
+    streak: int  # rapid unclean exits in the streak
+    # From when the streak's first crashing run started serving to when the
+    # run that stayed up started serving; ``None`` when the record predates
+    # ``streak_started_at``.
+    outage_seconds: Optional[float]
+    last_error: Optional[str]  # exception class name of the streak's last exit
 
 
 @dataclass(frozen=True)
@@ -75,6 +90,9 @@ class CrashDecision:
     elapsed_seconds: float = 0.0  # since the first run of the streak started
     # ``classify_network_failure`` of the last unclean exit: (kind, class name).
     last_cause: Optional[tuple[str, str]] = None
+    # Set when this start found that the previous run outlived the rapid
+    # window while an alerted streak was still unannounced as over.
+    recovered: Optional[CrashRecovery] = None
 
 
 class CrashBudget:
@@ -87,6 +105,16 @@ class CrashBudget:
     within ``window_seconds`` of the unclean run's own start. Only a streak
     of rapid unclean exits delays the next start, so a single crash after a
     long healthy run restarts at systemd's normal pace.
+
+    Once a streak has alerted, the record keeps an ``unrecovered`` snapshot
+    (streak length, when it began, last exit class) until the owner has been
+    told it is over. :meth:`mark_stable` — called once a run has served for
+    the rapid window — or the next :meth:`begin` that finds the previous run
+    was not rapid hands it back exactly once as a :class:`CrashRecovery`. An
+    orderly stop does not prove the frontend recovered (the owner may have
+    stopped a still-broken unit), so it carries the snapshot forward instead
+    of announcing it. Records written before the snapshot existed derive it
+    from ``alerted``/``streak``.
     """
 
     def __init__(
@@ -105,6 +133,55 @@ class CrashBudget:
         self._base = max(0.0, float(base_delay_seconds))
         self._max_delay = max(self._base, float(max_delay_seconds))
         self._clock = clock
+
+    @property
+    def window_seconds(self) -> float:
+        """How long a run must stay up before its exit no longer counts as rapid."""
+
+        return self._window
+
+    @staticmethod
+    def _unrecovered(record: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+        """The alerted streak the owner has not yet been told is over, if any."""
+
+        if "unrecovered" in record:
+            snapshot = record.get("unrecovered")
+            if not isinstance(snapshot, dict):
+                return None
+            streak = snapshot.get("streak")
+            if not isinstance(streak, int) or isinstance(streak, bool) or streak < 1:
+                return None
+            since = snapshot.get("since")
+            last_error = snapshot.get("last_error")
+            return {
+                "streak": streak,
+                "since": float(since) if isinstance(since, (int, float)) and not isinstance(since, bool) else None,
+                "last_error": last_error if isinstance(last_error, str) else None,
+            }
+        # A record written before ``unrecovered`` existed: an alerted streak in
+        # progress is still owed its recovery notice.
+        streak = record.get("streak")
+        if record.get("alerted") is True and isinstance(streak, int) and streak >= 1:
+            since = record.get("streak_started_at")
+            last_error = record.get("last_error")
+            return {
+                "streak": streak,
+                "since": float(since) if isinstance(since, (int, float)) else None,
+                "last_error": last_error if isinstance(last_error, str) else None,
+            }
+        return None
+
+    @staticmethod
+    def _recovery(snapshot: Mapping[str, Any], stable_started: Any) -> CrashRecovery:
+        since = snapshot.get("since")
+        outage = None
+        if isinstance(since, (int, float)) and isinstance(stable_started, (int, float)):
+            outage = max(0.0, float(stable_started) - float(since))
+        return CrashRecovery(
+            streak=int(snapshot["streak"]),
+            outage_seconds=outage,
+            last_error=snapshot.get("last_error"),
+        )
 
     def _read(self) -> dict[str, Any]:
         try:
@@ -139,6 +216,8 @@ class CrashBudget:
         )
 
         previous = self._read()
+        unrecovered = self._unrecovered(previous)
+        recovered: Optional[CrashRecovery] = None
         now = float(self._clock())
         streak = 0
         alerted = False
@@ -164,6 +243,11 @@ class CrashBudget:
                     streak_started = float(prior_start)
                 elif isinstance(started, (int, float)):
                     streak_started = float(started)
+            elif elapsed is not None and elapsed >= self._window and unrecovered is not None:
+                # The previous run outlived the window, so the alerted streak
+                # ended there; its stability timer never got to say so.
+                recovered = self._recovery(unrecovered, started)
+                unrecovered = None
             last_error = previous.get("last_error") if isinstance(previous.get("last_error"), str) else None
             cause = previous.get("last_cause")
             if isinstance(cause, list) and len(cause) == 2 and all(isinstance(c, str) for c in cause):
@@ -180,6 +264,10 @@ class CrashBudget:
                 reminder = outage_realert_stage(streak_elapsed, alert_stage)
                 if reminder is not None:
                     alert, stage, alert_stage = True, reminder, reminder
+        if streak and (alerted or alert):
+            # The current alerted streak supersedes an older one an orderly
+            # stop left unannounced: one recovery notice covers both.
+            unrecovered = {"streak": streak, "since": streak_started, "last_error": last_error}
         delay = self.delay_for(streak)
         self._write(
             {
@@ -197,6 +285,7 @@ class CrashBudget:
                 "streak_started_at": streak_started if streak else None,
                 "last_error": last_error if streak else None,
                 "last_cause": list(last_cause) if streak and last_cause else None,
+                "unrecovered": unrecovered,
             }
         )
         return CrashDecision(
@@ -207,7 +296,36 @@ class CrashBudget:
             stage=stage,
             elapsed_seconds=streak_elapsed,
             last_cause=last_cause,
+            recovered=recovered,
         )
+
+    def mark_stable(self) -> Optional[CrashRecovery]:
+        """This run has stayed up for the rapid window: any streak is over.
+
+        Returns the recovery to announce when the streak (or one an orderly
+        stop left unannounced) had alerted — once; ``None`` otherwise.
+        """
+
+        record = self._read()
+        if record.get("running") is not True:
+            return None
+        unrecovered = self._unrecovered(record)
+        if unrecovered is None:
+            return None
+        recovery = self._recovery(unrecovered, record.get("started_at"))
+        record.update(
+            {
+                "streak": 0,
+                "alerted": False,
+                "alert_stage": 0,
+                "streak_started_at": None,
+                "last_error": None,
+                "last_cause": None,
+                "unrecovered": None,
+            }
+        )
+        self._write(record)
+        return recovery
 
     def record_error(self, error: BaseException) -> None:
         """Remember what ended this run: class names and failure kind, never the message."""
@@ -222,7 +340,20 @@ class CrashBudget:
     def mark_clean(self) -> None:
         """This run ended in an orderly way: the streak is over."""
 
-        self._write({"v": 1, "running": False, "started_at": self._read().get("started_at"), "streak": 0, "alerted": False, "last_error": None})
+        record = self._read()
+        self._write(
+            {
+                "v": 1,
+                "running": False,
+                "started_at": record.get("started_at"),
+                "streak": 0,
+                "alerted": False,
+                "last_error": None,
+                # Stopping is not recovering: a still-alerted streak is
+                # announced as over only once a later run stays up.
+                "unrecovered": self._unrecovered(record),
+            }
+        )
 
 
 def crash_loop_alert(decision: CrashDecision) -> Any:
@@ -248,6 +379,25 @@ def crash_loop_alert(decision: CrashDecision) -> Any:
             f"{delayed}{cause}"
         )
     return Alert(code=CRASH_LOOP_ALERT_CODE, message=message, stage=decision.stage)
+
+
+def crash_loop_recovered_alert(recovery: CrashRecovery) -> Any:
+    """Owner notice that an alerted rapid-crash streak ended (constant template + numbers only).
+
+    Its own code — hence its own dedup key — so a spool consumer never folds
+    it into the crash-loop alert, and it never suppresses a later streak's.
+    """
+
+    from telegram_bot.utils.health_alerts import Alert
+
+    over = f" over {int(max(0.0, recovery.outage_seconds))}s" if recovery.outage_seconds is not None else ""
+    last_exit = f" (last exit: {recovery.last_error})" if recovery.last_error else ""
+    message = (
+        f"Matrix frontend recovered from its crash loop: a run stayed up past the "
+        f"{crash_policy.PROCESS_CRASH_WINDOW_SECONDS}s rapid window after "
+        f"{recovery.streak} rapid unclean exits{over}{last_exit}."
+    )
+    return Alert(code=CRASH_LOOP_RECOVERED_ALERT_CODE, message=message)
 
 
 # -- task ledger ------------------------------------------------------------------
@@ -411,11 +561,14 @@ def build_webhook_nudge_server(
 __all__ = [
     "CRASH_BUDGET_FILENAME",
     "CRASH_LOOP_ALERT_CODE",
+    "CRASH_LOOP_RECOVERED_ALERT_CODE",
     "CrashBudget",
     "CrashDecision",
+    "CrashRecovery",
     "MATRIX_NUDGE_PORT_ENV",
     "build_turn_stall_probe",
     "build_webhook_nudge_server",
     "crash_loop_alert",
+    "crash_loop_recovered_alert",
     "reconcile_task_ledger",
 ]

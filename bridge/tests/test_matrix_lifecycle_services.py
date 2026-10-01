@@ -312,6 +312,271 @@ def test_run_counts_a_start_up_check_failure_as_unclean(
     assert record["running"] is True and record["last_error"] == "SystemExit"
 
 
+# --- crash-loop recovery notice ----------------------------------------------------
+
+
+def _alerted_streak(budget: ml.CrashBudget, clock: Clock, crashes: int = 3) -> ml.CrashDecision:
+    """Run ``crashes`` rapid unclean exits; return the decision of the last start."""
+
+    decision = budget.begin()
+    for _ in range(crashes):
+        budget.record_error(RuntimeError("secret body must not persist"))
+        clock.now += 6 + decision.delay_seconds
+        decision = budget.begin()
+    return decision
+
+
+def test_a_run_that_outlives_the_window_announces_the_recovery_once(tmp_path: Path) -> None:
+    clock = Clock()
+    budget = _budget(tmp_path, clock)
+    streak_began = clock.now
+    last = _alerted_streak(budget, clock)
+    assert last.alert is True and last.streak == 3
+    stable_started = clock.now + last.delay_seconds
+    clock.now = stable_started + 60  # the run has served for the whole window
+    recovery = budget.mark_stable()
+    assert recovery == ml.CrashRecovery(
+        streak=3, outage_seconds=stable_started - streak_began, last_error="RuntimeError"
+    )
+    assert budget.mark_stable() is None, "exactly once per streak"
+    clock.now += 3600  # that run later dies after a long healthy life
+    after = budget.begin()
+    assert (after.streak, after.alert, after.recovered) == (0, False, None)
+
+
+def test_a_streak_that_never_alerted_ends_without_a_recovery_notice(tmp_path: Path) -> None:
+    clock = Clock()
+    budget = _budget(tmp_path, clock)
+    last = _alerted_streak(budget, clock, crashes=2)  # max_rapid=3: never alerted
+    assert last.streak == 2 and last.alert is False
+    clock.now += 600
+    assert budget.mark_stable() is None
+    clock.now += 3600
+    assert budget.begin().recovered is None
+
+
+def test_the_next_start_announces_a_recovery_the_stability_timer_missed(tmp_path: Path) -> None:
+    clock = Clock()
+    budget = _budget(tmp_path, clock)
+    streak_began = clock.now
+    last = _alerted_streak(budget, clock)
+    stable_started = clock.now + last.delay_seconds
+    budget.record_error(ValueError("later failure"))  # the long run's own exit
+    clock.now = stable_started + 900  # outlived the window, never marked stable
+    decision = budget.begin()
+    assert decision.streak == 0 and decision.alert is False
+    assert decision.recovered == ml.CrashRecovery(
+        streak=3, outage_seconds=stable_started - streak_began, last_error="RuntimeError"
+    ), "the streak's last exit, not the stable run's own"
+    assert budget.mark_stable() is None
+    clock.now += 900
+    assert budget.begin().recovered is None, "exactly once per streak"
+
+
+def test_an_orderly_stop_defers_the_recovery_to_the_next_stable_run(tmp_path: Path) -> None:
+    """Stopping a crash-looping unit is not recovering it."""
+
+    clock = Clock()
+    budget = _budget(tmp_path, clock)
+    _alerted_streak(budget, clock)
+    budget.mark_clean()
+    clock.now += 6
+    restarted = budget.begin()
+    assert (restarted.streak, restarted.alert, restarted.recovered) == (0, False, None)
+    # One more rapid crash below the strike count keeps the old streak owed.
+    budget.record_error(OSError())
+    clock.now += 6
+    assert budget.begin().streak == 1
+    clock.now += 60
+    recovery = budget.mark_stable()
+    assert recovery is not None and recovery.streak == 3
+    assert budget.mark_stable() is None
+
+
+def test_a_new_alerted_streak_after_an_orderly_stop_sends_one_recovery(tmp_path: Path) -> None:
+    clock = Clock()
+    budget = _budget(tmp_path, clock)
+    _alerted_streak(budget, clock)
+    budget.mark_clean()
+    clock.now += 6
+    second = _alerted_streak(budget, clock, crashes=4)
+    assert second.streak == 4
+    clock.now += second.delay_seconds + 60
+    recovery = budget.mark_stable()
+    assert recovery is not None and recovery.streak == 4, "the latest alerted streak is reported"
+    assert budget.mark_stable() is None
+
+
+def test_a_record_from_the_previous_version_is_still_owed_its_recovery(tmp_path: Path) -> None:
+    """Records written before ``unrecovered`` existed keep their meaning."""
+
+    path = tmp_path / ml.CRASH_BUDGET_FILENAME
+    legacy = {
+        "v": 1, "running": True, "started_at": 1_000.0, "streak": 5, "alerted": True,
+        "alert_stage": 0, "streak_started_at": 700.0, "last_error": "ExceptionGroup",
+        "last_cause": ["dns", "ClientConnectorDNSError"],
+    }
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    clock = Clock(1_000.0 + 20)
+    rapid = _budget(tmp_path, clock).begin()
+    assert (rapid.streak, rapid.alert, rapid.recovered) == (6, False, None), "no second first-alert"
+
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    clock.now = 1_000.0 + 3600
+    decision = _budget(tmp_path, clock).begin()
+    assert decision.recovered == ml.CrashRecovery(streak=5, outage_seconds=300.0, last_error="ExceptionGroup")
+
+    clean = {"v": 1, "running": False, "started_at": 1_000.0, "streak": 0, "alerted": False, "last_error": None}
+    path.write_text(json.dumps(clean), encoding="utf-8")
+    budget = _budget(tmp_path, clock)
+    assert budget.begin().recovered is None
+    clock.now += 60
+    assert budget.mark_stable() is None
+
+
+def test_a_record_without_a_streak_start_reports_no_duration(tmp_path: Path) -> None:
+    path = tmp_path / ml.CRASH_BUDGET_FILENAME
+    path.write_text(
+        json.dumps({"v": 1, "running": True, "started_at": 1_000.0, "streak": 4, "alerted": True, "last_error": None}),
+        encoding="utf-8",
+    )
+    decision = _budget(tmp_path, Clock(5_000.0)).begin()
+    assert decision.recovered == ml.CrashRecovery(streak=4, outage_seconds=None, last_error=None)
+    alert = ml.crash_loop_recovered_alert(decision.recovered)
+    assert " over " not in alert.message and "last exit" not in alert.message
+
+
+def test_crash_loop_recovered_alert_is_numbers_and_class_names_only(tmp_path: Path) -> None:
+    clock = Clock()
+    budget = _budget(tmp_path, clock)
+    _alerted_streak(budget, clock)
+    clock.now += 600
+    recovery = budget.mark_stable()
+    assert recovery is not None
+    alert = ml.crash_loop_recovered_alert(recovery)
+    assert alert.code == ml.CRASH_LOOP_RECOVERED_ALERT_CODE == "matrix_crash_loop_recovered"
+    assert alert.stage == 0
+    assert alert.dedup_key() == f"health-alert:{ml.CRASH_LOOP_RECOVERED_ALERT_CODE}"
+    assert alert.dedup_key() != ml.crash_loop_alert(
+        ml.CrashDecision(streak=3, delay_seconds=10, alert=True, last_error=None)
+    ).dedup_key(), "a recovery never collapses into (or suppresses) a crash-loop alert"
+    assert "3 rapid unclean exits" in alert.message and "RuntimeError" in alert.message
+    assert f"over {int(recovery.outage_seconds or 0)}s" in alert.message
+    assert "secret body" not in alert.message
+    raw = (tmp_path / ml.CRASH_BUDGET_FILENAME).read_text(encoding="utf-8")
+    assert "secret body" not in raw
+
+
+@pytest.mark.anyio
+async def test_crash_backoff_spools_a_recovery_the_previous_run_earned(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    spool = tmp_path / "spool"
+    bot, _chat = _bot(tmp_path, push_enabled=True, push_spool_dir=spool)
+    recovery = ml.CrashRecovery(streak=5, outage_seconds=120.0, last_error="RuntimeError")
+    await bot._crash_backoff(
+        ml.CrashDecision(streak=0, delay_seconds=0.0, alert=False, last_error=None, recovered=recovery)
+    )
+    records = [json.loads(p.read_text(encoding="utf-8")) for p in spool.glob("*.json")]
+    assert [r["dedup"] for r in records] == [f"health-alert:{ml.CRASH_LOOP_RECOVERED_ALERT_CODE}"]
+    assert "5 rapid unclean exits over 120s (last exit: RuntimeError)" in records[0]["text"]
+
+
+@pytest.mark.anyio
+async def test_stable_watch_spools_the_recovery_once_and_only_with_push(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(bot_module.asyncio, "sleep", fake_sleep)
+    clock = Clock()
+    budget = _budget(tmp_path / "quiet", clock)
+    _alerted_streak(budget, clock)
+    quiet_spool = tmp_path / "quiet-spool"
+    quiet, _chat = _bot(tmp_path, push_enabled=False, push_spool_dir=quiet_spool)
+    await quiet._crash_stable_watch(budget)
+    assert not quiet_spool.exists() or not list(quiet_spool.glob("*.json"))
+
+    clock = Clock()
+    budget = _budget(tmp_path, clock)
+    _alerted_streak(budget, clock)
+    spool = tmp_path / "spool"
+    bot, _chat = _bot(tmp_path, push_enabled=True, push_spool_dir=spool)
+    await bot._crash_stable_watch(budget)
+    await bot._crash_stable_watch(budget)
+    assert slept == [60.0] * 3, "sleeps for the budget's own rapid window"
+    records = [json.loads(p.read_text(encoding="utf-8")) for p in spool.glob("*.json")]
+    assert [r["dedup"] for r in records] == [f"health-alert:{ml.CRASH_LOOP_RECOVERED_ALERT_CODE}"]
+
+
+def _fast_budget(data: Path, **kwargs: Any) -> ml.CrashBudget:
+    params: dict[str, Any] = dict(max_rapid=1, base_delay_seconds=0, max_delay_seconds=0)
+    params.update(kwargs)
+    return ml.CrashBudget(data / ml.CRASH_BUDGET_FILENAME, **params)
+
+
+def test_run_announces_the_recovery_once_serving_outlives_the_window(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = tmp_path / "spool"
+    data = tmp_path / "data"
+    seed = _fast_budget(data, window_seconds=0.5)
+    seed.begin()
+    seed.record_error(RuntimeError())
+    assert seed.begin().alert is True  # an alerted streak is in progress
+    seed.record_error(RuntimeError())
+
+    transports: list[FakeTransport] = []
+
+    async def serve_a_while(transport: FakeTransport) -> None:
+        transports.append(transport)
+        await asyncio.sleep(1.0)
+
+    bot, _chat = _bot(tmp_path, push_enabled=True, push_spool_dir=spool, push_poll_interval=0.02)
+    monkeypatch.setattr(bot, "_crash_budget", lambda: _fast_budget(data, window_seconds=0.5))
+    bot._transport_factory = lambda config, runner: _PolicyTransport(config, runner, script=serve_a_while)
+    bot.run()
+    # The run's own spool notifier delivered it to the owner room: not deduped away.
+    delivered = [text for room, text in transports[0].notices if "recovered from its crash loop" in text]
+    assert len(delivered) == 1 and transports[0].notices[0][0] == DM_ROOM
+    assert "after 2 rapid unclean exits" in delivered[0], "sent by the serving run's watch"
+    assert not list(spool.glob("*.json")), "archived to sent/"
+    record = json.loads((data / ml.CRASH_BUDGET_FILENAME).read_text(encoding="utf-8"))
+    assert record["running"] is False and record["unrecovered"] is None
+
+
+def test_run_cancels_the_stable_watch_when_serving_ends_early(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    data = tmp_path / "data"
+    seed = _fast_budget(data)
+    seed.begin()
+    seed.record_error(RuntimeError())
+    assert seed.begin().alert is True
+    seed.record_error(RuntimeError())
+    spool = tmp_path / "spool"
+    bot, _chat = _bot(
+        tmp_path, push_enabled=True, push_spool_dir=spool, push_consume_spool_dir=tmp_path / "elsewhere"
+    )
+    monkeypatch.setattr(bot, "_crash_budget", lambda: _fast_budget(data))
+    bot._transport_factory = lambda config, runner: _PolicyTransport(config, runner, fail_run=True)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="sync loop died"):
+        bot.run()
+    assert time.monotonic() - started < 30, "a 60 s watch must not hold the exit open"
+    record = json.loads((data / ml.CRASH_BUDGET_FILENAME).read_text(encoding="utf-8"))
+    assert record["running"] is True and record["unrecovered"]["streak"] == 2
+    assert not list(spool.glob("*.json")) or all(
+        json.loads(p.read_text(encoding="utf-8"))["dedup"] != f"health-alert:{ml.CRASH_LOOP_RECOVERED_ALERT_CODE}"
+        for p in spool.glob("*.json")
+    )
+
+
 # --- task ledger --------------------------------------------------------------------
 
 
