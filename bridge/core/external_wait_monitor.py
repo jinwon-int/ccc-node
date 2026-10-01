@@ -203,6 +203,8 @@ def resume_prompt_text(record: Dict[str, Any]) -> str:
 NotifierCallback = Callable[[int, str], Awaitable[bool]]
 ResumerCallback = Callable[[Dict[str, Any], str], Awaitable[bool]]
 SessionLookup = Callable[[int, int], Awaitable[Optional[str]]]
+#: ``(user_id, chat_id)`` -> refresh that route's wait status message (#2081).
+StatusSyncer = Callable[[int, int], Awaitable[None]]
 
 
 class ExternalWaitMonitor:
@@ -216,6 +218,7 @@ class ExternalWaitMonitor:
         notifier: NotifierCallback,
         resumer: Optional[ResumerCallback] = None,
         session_lookup: Optional[SessionLookup] = None,
+        status_syncer: Optional[StatusSyncer] = None,
         resume_enabled: bool = True,
         resume_daily_cap: int = DEFAULT_RESUME_DAILY_CAP,
         tick_seconds: float = DEFAULT_TICK_SECONDS,
@@ -226,6 +229,7 @@ class ExternalWaitMonitor:
         self._notifier = notifier
         self._resumer = resumer
         self._session_lookup = session_lookup
+        self._status_syncer = status_syncer
         self._resume_enabled = resume_enabled
         self._resume_daily_cap = max(0, int(resume_daily_cap))
         self._tick_seconds = max(1.0, float(tick_seconds))
@@ -359,6 +363,7 @@ class ExternalWaitMonitor:
                 resumed=False,
                 skip_reason=skip_reason,
             )
+            await self._sync_status(record)
             return
 
         # Notify the owner as soon as the terminal result is known.  A Codex
@@ -366,6 +371,7 @@ class ExternalWaitMonitor:
         # turn and then block for minutes; putting the resumer first made a
         # prompt CI poll look like a missing GitHub event (#740 follow-up).
         delivered = await self._notify_wake(record, resumed=True)
+        await self._sync_status(record)
         if not delivered:
             # Do not run a continuation whose terminal notification did not
             # land.  Leave the wake pending so the next drain retries the
@@ -389,6 +395,19 @@ class ExternalWaitMonitor:
             resumed=False,
             skip_reason="resume_failed",
         )
+
+    async def _sync_status(self, record: Dict[str, Any]) -> None:
+        """Refresh the route's status message after a terminal transition (#2081).
+
+        Best-effort and strictly after the wake notification: the durable
+        wake journal stays authoritative, a status hiccup never blocks it.
+        """
+        if self._status_syncer is None:
+            return
+        try:
+            await self._status_syncer(int(record["user_id"]), int(record["chat_id"]))
+        except Exception:
+            logger.debug("External-wait status syncer raised: wait=%s", record.get("wait_id"))
 
     async def _notify_wake(
         self,
@@ -467,6 +486,7 @@ __all__ = [
     "GhCliTransport",
     "MAX_TRANSPORT_ERRORS",
     "PrState",
+    "StatusSyncer",
     "TransportError",
     "WaitTransport",
     "resume_prompt_text",

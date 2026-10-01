@@ -350,13 +350,24 @@ class BotCommandMixin:
         if not wait_id:
             await message.reply_text("Usage: /cancelwait <wait_id> — see /waits")
             return
-        cancelled = self._external_wait_registry().cancel(wait_id)
+        registry = self._external_wait_registry()
+        record = registry.get(wait_id)
+        cancelled = registry.cancel(wait_id)
         if cancelled:
             reply = f"Cancelled external wait `{wait_id}`."
         else:
             reply = f"No active external wait with id `{wait_id}`."
         await message.reply_text(reply, parse_mode="Markdown")
         log_debug(user_id, "bot", reply)
+        if cancelled and record is not None:
+            # Owner cancellation has no wake, so refresh the wait's own route
+            # status here (#2081; the composed bot carries the mixin).
+            sync_status = getattr(self, "_sync_external_wait_status", None)
+            if callable(sync_status):
+                try:
+                    await sync_status(int(record["user_id"]), int(record["chat_id"]))
+                except Exception:
+                    logger.debug("External-wait status sync after /cancelwait failed")
 
     async def _cmd_skills(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):

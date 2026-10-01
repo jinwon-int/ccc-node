@@ -536,6 +536,16 @@ class ExternalWaitRegistry:
         self._prune(records, now=self._clock())
         return list(records.values())
 
+    def records_for_route(self, user_id: int, chat_id: int) -> List[Dict[str, Any]]:
+        """Records bound to one conversation route, oldest first (#2081)."""
+        out = [
+            rec
+            for rec in self.records()
+            if rec.get("user_id") == int(user_id) and rec.get("chat_id") == int(chat_id)
+        ]
+        out.sort(key=lambda rec: (float(rec.get("created_epoch") or 0), str(rec.get("wait_id") or "")))
+        return out
+
     def get(self, wait_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             return self._read().get(wait_id)
