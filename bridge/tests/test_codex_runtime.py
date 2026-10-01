@@ -1380,6 +1380,47 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runtime.close()
 
+    async def test_live_skill_reads_use_session_audience_and_ignore_other_turns(self) -> None:
+        # Both frontends consume this same runtime event stream. Exercise the
+        # real shared logger through app-server notification routing.
+        import json
+        import os
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            runtime = CodexRuntime(client_factory=self.factory, process_environment={
+                "HOME": raw, "PATH": os.environ["PATH"],
+                "CCC_CLAUDE_DIR": str(root / ".claude"),
+                "CCC_SKILL_USAGE_LOGGER": str(Path(__file__).resolve().parents[2] / "claude/hooks/skill-usage-log.sh"),
+            })
+            try:
+                scope = root / "audiences/private-fixture/state"
+                session = await runtime.start_or_resume(SessionRequest(
+                    working_directory="/workspace",
+                    memory_environment={"CCC_MEMORY_AUDIENCE_SCOPED": "1", "CCC_STATE_DIR": str(scope)},
+                ))
+                data: dict[str, Any] = {"id": "skill-read", "type": "commandExecution",
+                        "command": "cat /example/skills/example/SKILL.md", "cwd": "/workspace",
+                        "commandActions": [{"type": "read", "path": "/example/skills/example/SKILL.md"}],
+                        "status": "completed", "exitCode": 0, "aggregatedOutput": "private skill body"}
+                notifications = []
+                for turn in ("turn-other", "turn-1"):
+                    for method in ("item/started", "item/completed", "item/completed"):
+                        notifications.append(CodexNotification(method, {"threadId": "thread-new", "turnId": turn, "item": data}))
+                notifications.append(CodexNotification("turn/completed", {
+                    "threadId": "thread-new", "turn": {"id": "turn-1", "status": "completed"},
+                }))
+                self.clients[-1].before_turn_response = notifications
+                events = [event async for event in session.send_turn("read")]
+                self.assertIsInstance(events[-1], CompletionEvent)
+                await runtime._skill_usage_sink.drain()
+                rows = [json.loads(line) for line in (scope / "skill-usage/usage.jsonl").read_text().splitlines()]
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["skill"], "example")
+                self.assertEqual(rows[0]["runtime"], "codex")
+                self.assertFalse((root / ".claude/state/skill-usage").exists())
+            finally:
+                await runtime.close()
+
     async def test_turn_maps_streamed_events_including_notifications_before_response(self) -> None:
         session = await self.runtime.start_or_resume(
             SessionRequest(
