@@ -16,6 +16,7 @@ from telegram_bot.core.agent_runtime import ModelInfo, SessionRequest, deny_appr
 from telegram_bot.core.danso_worker import DansoRuntime as WorkerRuntime
 from telegram_bot.core.danso_memory import prepare_memory_context
 from telegram_bot.core.memory_audience import audience_from_danso_environment, shared_memory_audience
+from telegram_bot.core.skill_usage import SkillUsageSink
 from telegram_bot.core.turn_stall import register_turn_liveness
 from telegram_bot.utils.config import Settings
 from telegram_bot.utils.secure_fs import atomic_write_text, ensure_private_directory
@@ -400,6 +401,8 @@ class DansoRuntime(WorkerRuntime):
                 kwargs.update(state_directory=self.root / audience.scope,
                               system_context_loader=loader,
                               native_memory_args=native_args)
+                if self.skill_usage_sink is not None:
+                    kwargs["skill_usage_sink"] = self.skill_usage_sink.for_session(audience.hook_environment(self.memory_settings))
                 worker = WorkerRuntime(**kwargs)
                 return self._track_for_liveness(
                     await worker.start_or_resume(replace(request, effort=effort, memory_environment=None)))
@@ -492,6 +495,10 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
         journals += "-audience"
     return DansoRuntime(binary=binary, state_directory=root / journals, memory_settings=memory_settings,
                         provider=provider, model=model,
+                        skill_usage_sink=SkillUsageSink({
+                            **os.environ,
+                            "CCC_CLAUDE_DIR": str(Path(settings.claude_settings_path).parent),
+                        }, runtime="danso"),
                         environment=environment, default_effort=settings.danso_effort,
                         sandbox=settings.danso_sandbox,
                         tool_home=str(tool_home) if tool_home is not None else None,

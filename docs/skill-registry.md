@@ -124,6 +124,9 @@ Codex also records successful command reads through this logger; see
 [Codex capture rules and audience boundaries](codex-skill-telemetry.md). Usage
 counts show loads, not successful application of a skill.
 
+Danso records correlated successful native reads through the same logger; see
+[Danso capture rules and verification](danso-skill-telemetry.md).
+
 Monthly retroactive audit (first cycle: 2026-08-28, #1347):
 
 1. `bash ~/.claude/hooks/skill-usage-log.sh report 30` — per-skill load

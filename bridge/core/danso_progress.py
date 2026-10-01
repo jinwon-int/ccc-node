@@ -47,15 +47,26 @@ def _interim(message):
 
 
 class ProgressDecoder:
-    def __init__(self):
+    def __init__(self, skill_reads=None):
         self.run_id = uuid.uuid4().hex
         self.sequence = 0
         self.active = None
         self.header = False
         self.final = None
+        self.skill_reads = skill_reads
 
     def feed(self, line):
         record = json.loads(line, object_pairs_hook=_object)
+        event = self._feed(record)
+        if self.skill_reads is not None:
+            try:
+                self.skill_reads.observe(record)
+            except Exception:
+                # Optional telemetry must not affect native event delivery.
+                self.skill_reads = None
+        return event
+
+    def _feed(self, record):
         if not isinstance(record, dict) or self.final is not None:
             raise ValueError('invalid progress stream')
         kind = record.get('type')
@@ -124,8 +135,8 @@ class ProgressDecoder:
         return self.final.encode('utf-8')
 
 
-async def read_progress(stream, queue):
-    decoder = ProgressDecoder()
+async def read_progress(stream, queue, skill_reads=None):
+    decoder = ProgressDecoder(skill_reads)
     pending = bytearray()
     total = 0
     while chunk := await stream.read(65536):
