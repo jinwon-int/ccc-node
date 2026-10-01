@@ -1048,10 +1048,46 @@ ok "cron audience root that differs from the bridge root is a DEFECT naming the 
 nc="$(run_map codex "$codex_cron")"
 ok "non-claude, non-scoped lanes get no audience-map row" \
   'jq -e ".klass == \"none\"" <<<"$nc" >/dev/null'
-# shellcheck disable=SC2034  # nc is read via eval inside ok()
 nc="$(run_nc claude "$claude_scoped_cron" "" "" "/usr/bin:/bin" "$fresh_ingest")"
 ok "claude scoped lane is not faulted for the MemPalace sweep it deliberately lacks" \
   'jq -e ".klass == \"정상\"" <<<"$nc" >/dev/null'
+
+# #2075: an audience-scoped bridge fed by a NON-scoped nunchi lane mixes owner
+# DM and family-room work into one node-wide store while every tick reads
+# healthy. The doctor must call that a defect and name the re-scope procedure.
+sed 's/r = d.rows\[0\] if d.rows else None/r = next((x for x in d.rows if x.item == "nunchi audience scope"), None)/' \
+  "$TMP/nunchi-collection.py" > "$TMP/nunchi-audience-scope.py"
+run_scope() {  # <provider> <cron-text> <bridge-memory-mode|empty>
+  CCC_BRIDGE_MEMORY_MODE="$3" CCC_BRIDGE_MEMORY_AUDIENCE_ROOT="$map_aud" \
+  CCC_DOCTOR_BRIDGE_PROJECT_ROOT="$TMP/nc-home" BOT_DATA_DIR="" \
+  ND_PROVIDER="$1" ND_CRON="$2" ND_STATUS_JSON="$ok_json" ND_MP="$nbin/mempalace" \
+  ND_HOME="$TMP/nc-home" ND_PATH="$nbin:/usr/bin:/bin" ND_INGEST_JSON="$fresh_ingest" \
+  ND_CRONTAB="$nbin/crontab" ND_CRON_STORE="$TMP/nc-cron" ND_STATUS="$TMP/nc-status.json" \
+  NUNCHI_COLL_REPO="$nrepo" DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" \
+  python3 "$TMP/nunchi-audience-scope.py" 2>/dev/null
+}
+nc="$(run_scope claude "$claude_cron" audience-scoped)"
+ok "audience-scoped bridge with a non-scoped claude lane is a DEFECT naming the re-scope procedure" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"DEFECT\") and contains(\"node-wide store\") and contains(\"claude\"))" <<<"$nc" >/dev/null'
+nc="$(run_scope codex "$codex_cron" audience-scoped)"
+ok "audience-scoped bridge with a non-scoped codex lane is a DEFECT too" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"DEFECT\") and contains(\"codex\"))" <<<"$nc" >/dev/null'
+nc="$(run_scope claude "$claude_scoped_cron" audience-scoped)"
+ok "audience-scoped bridge with a scoped lane gets no audience-scope row" \
+  'jq -e ".klass == \"none\"" <<<"$nc" >/dev/null'
+nc="$(run_scope claude "$claude_cron" "")"
+ok "a non-scoped lane on a bridge without audience-scoped memory gets no audience-scope row" \
+  'jq -e ".klass == \"none\"" <<<"$nc" >/dev/null'
+mkdir -p "$TMP/nc-home/.telegram_bot"
+printf 'CCC_BRIDGE_MEMORY_MODE="audience-scoped"\n' > "$TMP/nc-home/.telegram_bot/.env"
+nc="$(run_scope claude "$claude_cron" "")"
+ok "bridge memory mode is read from the bot data dir .env when the process env is unset" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"DEFECT\"))" <<<"$nc" >/dev/null'
+rm -f "$TMP/nc-home/.telegram_bot/.env"
+# shellcheck disable=SC2034  # nc is read via eval inside ok()
+nc="$(run_scope claude "" audience-scoped)"
+ok "no managed nunchi cron means nothing is mixed — no audience-scope row" \
+  'jq -e ".klass == \"none\"" <<<"$nc" >/dev/null'
 
 # #1081: doctor surfaces installer-managed cron entries frozen at older code.
 # One row per known marker (absent = opt-in 정상; gen match = 정상; unstamped

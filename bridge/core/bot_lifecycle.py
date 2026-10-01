@@ -223,6 +223,7 @@ class BotLifecycleMixin(MemoryDistillMixin):
     _setup_handlers: _SetupHandlers
     _error_handler: _ErrorHandler
     _deliver_markdown: _DeliverMarkdown
+    _conversation_key: Callable[[int, int | None], Any]
 
     async def _restart_receipt_loop(self, stop_event: asyncio.Event) -> None:
         """Deliver a terminal restart receipt after the replacement is healthy."""
@@ -1517,9 +1518,14 @@ class BotLifecycleMixin(MemoryDistillMixin):
             # moved on" and the ledger still marked the wake done. Chained CI
             # waits were therefore dropped structurally, not occasionally
             # (2026-07-30, PR #813 sat green and approved for ~3h).
+            # #2075: key the lookup by (user_id, chat_id) like an ordinary turn;
+            # get_session(user_id) is the DM row, so a group wait used to
+            # continue the owner's DM context inside the room.
             session_id = record.get("session_id")
             try:
-                current = await self._session_manager.get_session(int(record["user_id"]))
+                current = await self._session_manager.get_session(
+                    self._conversation_key(int(record["user_id"]), int(record["chat_id"]))
+                )
                 session_id = (current or {}).get("session_id") or session_id
             except Exception:
                 logger.warning(
@@ -1587,7 +1593,9 @@ class BotLifecycleMixin(MemoryDistillMixin):
 
         async def session_lookup(user_id: int, chat_id: int):
             try:
-                session = await self._session_manager.get_session(user_id)
+                session = await self._session_manager.get_session(
+                    self._conversation_key(user_id, chat_id)
+                )
                 return (session or {}).get("session_id")
             except Exception:
                 return None
@@ -1687,9 +1695,12 @@ class BotLifecycleMixin(MemoryDistillMixin):
             # the user-message path does (#740 resume precedent).
             user_id = int(record["user_id"])
             chat_id = int(record["chat_id"])
+            # #2075: the conversation's own row, never the DM row of user_id.
             session_id = record.get("session_id")
             try:
-                current = await self._session_manager.get_session(user_id)
+                current = await self._session_manager.get_session(
+                    self._conversation_key(user_id, chat_id)
+                )
                 session_id = (current or {}).get("session_id") or session_id
             except Exception:
                 logger.warning(

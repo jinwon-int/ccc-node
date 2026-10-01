@@ -271,10 +271,11 @@ async def test_collector_contract_routes_bridge_written_sidecars(tmp_path: Path)
 async def test_bridge_started_turn_records_its_route_so_reuse_is_ambiguous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
 ) -> None:
-    """External-wait resume / continuation look up the DM-keyed session and run
-    it in the record's chat without _save_session_id. Recording that run's
-    route makes a DM session reused in the family room ``ambiguous`` (skipped)
-    instead of being routed by its older private record."""
+    """External-wait resume / continuation run in the record's chat without
+    _save_session_id. They now look up the (user_id, chat_id) row (#2075), but
+    if that row still carries a session id first used in the DM (e.g. a
+    pre-#2075 row), recording the run's route makes the reuse ``ambiguous``
+    (skipped) instead of being routed by its older private record."""
 
     from telegram_bot.core import bot_delivery, bot_lifecycle
 
@@ -302,10 +303,12 @@ async def test_bridge_started_turn_records_its_route_so_reuse_is_ambiguous(
     )
     lifecycle.application = SimpleNamespace(bot=Bot())
 
-    async def lookup(user_id):
-        return {"session_id": SID}  # get_session(user_id): the DM session
+    async def lookup(key):
+        assert key == f"{OWNER}:{FAMILY_ROOM}"  # the room's row, not the DM row
+        return {"session_id": SID}  # a room row still carrying the DM session
 
     lifecycle._session_manager = SimpleNamespace(get_session=lookup)
+    lifecycle._conversation_key = dm._conversation_key
 
     class ProjectChat:
         async def process_message(self, *args, **kwargs):

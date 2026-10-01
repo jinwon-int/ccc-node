@@ -2934,6 +2934,7 @@ class Doctor:
             "~/.nunchi/*.cron.log and the cron PATH (#996/#1200 class)",
         )
         self._check_claude_audience_sidecars(cron, configured, claude_scoped)
+        self._check_bridge_scope_mismatch(cron, configured)
 
     def _check_claude_audience_sidecars(self, cron: str, configured: str, applies: bool) -> None:
         """Flag an audience-scoped Claude node whose collection is structurally 0 (#1921).
@@ -2990,6 +2991,61 @@ class Doctor:
             return
         self.add("정상", item, f"sidecars={count} valid>=1", "none")
 
+    def _check_bridge_scope_mismatch(self, cron: str, configured: str) -> None:
+        """Flag an audience-scoped bridge fed by a non-scoped nunchi lane (#2075).
+
+        Without ``CCC_NUNCHI_AUDIENCE_SCOPED=1`` the feed ingests every route's
+        work — owner DM and family rooms alike — into the one node-wide store,
+        while the bridge believes memory is partitioned by audience. The lane
+        still ticks healthily, so nothing else reports it. Re-applying with
+        ``--audience-scoped`` does not undo it: the shared ``ingested-files``
+        seen list carries over, so already-ingested jobs are never re-routed
+        and the node-wide store keeps the mixed facts until quarantined.
+        Body-free: lane name and the bridge root only.
+        """
+        if configured == "none" or re.search(r"\bCCC_NUNCHI_AUDIENCE_SCOPED=1\b", cron):
+            return
+        mode = (self._bridge_env_value("CCC_BRIDGE_MEMORY_MODE") or "off").strip().lower()
+        if mode != "audience-scoped":
+            return
+        root = self._bridge_memory_audience_root()
+        if configured in {"claude", "piri"}:
+            fix = (
+                f"re-run scripts/install-nunchi.sh --apply --{configured} --audience-scoped "
+                f"{root}; then quarantine the node-wide store and re-route ingested jobs "
+                "(docs/memory.md 'Re-scoping a non-scoped lane')"
+            )
+        else:
+            fix = (
+                f"the {configured} lane has no audience-scoped mode: remove it with "
+                "scripts/install-nunchi.sh --remove and quarantine the node-wide store "
+                "(docs/memory.md 'Re-scoping a non-scoped lane')"
+            )
+        self.add(
+            "경고",
+            "nunchi audience scope",
+            f"DEFECT: bridge memory mode is audience-scoped but the nunchi '{configured}' "
+            "lane is not — private and shared route work is ingested into one node-wide store",
+            fix,
+        )
+
+    def _bridge_env_files(self) -> tuple[str, list[Path]]:
+        """``(bot data dir, [data-dir .env, bridge/.env])`` in settings precedence."""
+        project = Path(
+            os.environ.get("CCC_DOCTOR_BRIDGE_PROJECT_ROOT")
+            or self.running_bridge_home()
+            or os.path.expanduser("~")
+        ).expanduser()
+        data_dir = os.environ.get("BOT_DATA_DIR") or str(project / ".telegram_bot")
+        return data_dir, [Path(data_dir) / ".env", self.repo / "bridge/.env"]
+
+    def _bridge_env_value(self, key: str) -> str | None:
+        """One bridge setting: process env, then the env files (never sourced)."""
+        _data_dir, files = self._bridge_env_files()
+        return os.environ.get(key) or next(
+            (v for v in (_dotenv_value(f, key) for f in files) if v), None
+        )
+
     def _bridge_memory_audience_root(self) -> str | None:
         """The bridge's audience root, mirroring settings precedence (#1921).
 
@@ -2998,17 +3054,8 @@ class Doctor:
         ``<bot-data-dir>/memory-audiences``. Only that one key (and
         ``BOT_DATA_DIR``) is read from an env file — never sourced, never shown.
         """
-        project = Path(
-            os.environ.get("CCC_DOCTOR_BRIDGE_PROJECT_ROOT")
-            or self.running_bridge_home()
-            or os.path.expanduser("~")
-        ).expanduser()
-        data_dir = os.environ.get("BOT_DATA_DIR") or str(project / ".telegram_bot")
-        files = [Path(data_dir) / ".env", self.repo / "bridge/.env"]
-        key = "CCC_BRIDGE_MEMORY_AUDIENCE_ROOT"
-        value = os.environ.get(key) or next(
-            (v for v in (_dotenv_value(f, key) for f in files) if v), None
-        )
+        data_dir, files = self._bridge_env_files()
+        value = self._bridge_env_value("CCC_BRIDGE_MEMORY_AUDIENCE_ROOT")
         if value:
             return value
         data_dir = next(
