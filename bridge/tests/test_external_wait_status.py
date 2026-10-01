@@ -232,6 +232,19 @@ def test_store_write_failure_is_swallowed(tmp_path: Path, monkeypatch: pytest.Mo
 # ---------------------------------------------------------------------------
 
 
+def test_reconcile_routes_puts_stored_first_and_skips_malformed() -> None:
+    from telegram_bot.core.external_wait_status import reconcile_routes
+
+    entries = {"8:80": {"user_id": 8, "chat_id": 80}, "junk": {"user_id": "x"}}
+    records = [
+        _wait("w1", user_id=7, chat_id=70),
+        _wait("w2", user_id=8, chat_id=80),  # already covered by its stored entry
+        _wait("w3", state=TERMINAL_SUCCESS, user_id=9, chat_id=90, completed=NOW),
+        {**_wait("w4"), "user_id": None},
+    ]
+    assert reconcile_routes(entries, records) == [(8, 80), (7, 70)]
+
+
 def test_plan_matrix() -> None:
     monitoring = [_wait()]
     recent = [_wait(state=TERMINAL_SUCCESS, completed=NOW - 5)]

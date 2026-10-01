@@ -125,9 +125,10 @@ class SideEffectContractTest(unittest.TestCase):
                 "service_control.restart",
                 "telegram.terminal_cleanup",
                 "telegram.external_wait_status",
+                "matrix.external_wait_status",
             ],
         )
-        self.assertEqual(len(observations), 45)
+        self.assertEqual(len(observations), 50)
         by_op = {
             operation.operation: {
                 item.boundary: item for item in observations if item.operation == operation.operation

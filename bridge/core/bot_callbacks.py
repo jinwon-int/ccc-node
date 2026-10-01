@@ -19,6 +19,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from telegram_bot.core.bot_delivery import MAX_SEND_FILE_BYTES
+from telegram_bot.core.bot_wait_status import refresh_wait_status
 from telegram_bot.memory.distill_types import DistillTrigger
 from telegram_bot.utils.chat_logger import log_debug
 
@@ -159,6 +160,8 @@ class BotCallbackMixin:
                         force_options=response.has_options,
                         streamed=response.streamed,
                     )
+                    # The choice is a turn like any other (#2081/#2088).
+                    await refresh_wait_status(self, user_id, chat_id)
                     # #1690: a Danso failure after an explicit numbered choice
                     # used to leave the user without the recovery buttons —
                     # only normal messages offered them. Same order as there:

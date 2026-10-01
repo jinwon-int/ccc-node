@@ -22,26 +22,24 @@ import telegram.error
 
 from telegram_bot.core.bot_ports import RuntimeDataConfigPort
 from telegram_bot.core.external_wait import (
-    STATE_MONITORING,
     ExternalWaitRegistry,
     default_registry_path,
 )
-from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor
 from telegram_bot.core.external_wait_status import (
+    MAX_RECONCILE_ROUTES,
+    STATUS_ENV_FLAG,
     ExternalWaitStatusStore,
     default_status_store_path,
     plan_status_update,
+    reconcile_routes,
     records_for_route,
+    status_enabled,
     text_hash_of,
 )
 from telegram_bot.utils.tg_errors import is_not_modified
 from telegram_bot.utils.tg_robust import send_with_retry
 
 logger = logging.getLogger(__name__)
-
-STATUS_ENV_FLAG = "CCC_EXTERNAL_WAIT_STATUS"
-#: Startup reconcile touches at most this many routes (one Telegram call each).
-MAX_RECONCILE_ROUTES = 50
 
 _GONE_FRAGMENTS = (
     "message to edit not found",
@@ -62,13 +60,29 @@ def _message_gone(error: BaseException) -> bool:
 StatusSyncer = Callable[[int, int], Awaitable[None]]
 
 
+async def refresh_wait_status(bot: Any, user_id: int, chat_id: int) -> None:
+    """Refresh one route's status after a reply, when the bot composes the sync (#2088).
+
+    The command/callback mixins run turns outside the main message path and
+    do not inherit :class:`BotWaitStatusMixin` themselves; test doubles of
+    those mixins do not carry it at all. Always fail-open.
+    """
+    sync_status = getattr(bot, "_sync_external_wait_status", None)
+    if not callable(sync_status):
+        return
+    try:
+        await sync_status(int(user_id), int(chat_id))
+    except Exception as exc:
+        logger.debug("External-wait status refresh failed: %s", type(exc).__name__)
+
+
 class BotWaitStatusMixin:
     _config: RuntimeDataConfigPort
     application: Any
 
     # -- wiring helpers ----------------------------------------------------------
     def _external_wait_status_enabled(self) -> bool:
-        return ExternalWaitMonitor.env_flag(STATUS_ENV_FLAG, default=True)
+        return status_enabled()
 
     def _external_wait_status_home(self) -> Path:
         data_dir = getattr(self._config, "bot_data_dir", None) or (
@@ -133,26 +147,16 @@ class BotWaitStatusMixin:
         if not self._external_wait_status_enabled():
             return
         try:
-            routes: Dict[str, tuple[int, int]] = {}
-            for key, entry in self._external_wait_status_store().entries().items():
-                try:
-                    routes[key] = (int(entry.get("user_id")), int(entry.get("chat_id")))
-                except (TypeError, ValueError):
-                    continue
-            for rec in self._external_wait_status_registry().records():
-                if rec.get("state") != STATE_MONITORING:
-                    continue
-                try:
-                    uid, cid = int(rec.get("user_id")), int(rec.get("chat_id"))
-                except (TypeError, ValueError):
-                    continue
-                routes.setdefault(f"{uid}:{cid}", (uid, cid))
+            routes = reconcile_routes(
+                self._external_wait_status_store().entries(),
+                self._external_wait_status_registry().records(),
+            )
         except Exception as exc:
             logger.debug("External-wait status reconcile skipped: %s", type(exc).__name__)
             return
         if not routes:
             return
-        selected = list(routes.values())[:MAX_RECONCILE_ROUTES]
+        selected = routes[:MAX_RECONCILE_ROUTES]
         for user_id, chat_id in selected:
             await self._sync_external_wait_status(user_id, chat_id)
         logger.info("External-wait status reconciled %d route(s) after restart", len(selected))
@@ -224,4 +228,10 @@ class BotWaitStatusMixin:
         store.pop(user_id, chat_id)
 
 
-__all__ = ["BotWaitStatusMixin", "MAX_RECONCILE_ROUTES", "STATUS_ENV_FLAG", "StatusSyncer"]
+__all__ = [
+    "BotWaitStatusMixin",
+    "MAX_RECONCILE_ROUTES",
+    "STATUS_ENV_FLAG",
+    "StatusSyncer",
+    "refresh_wait_status",
+]

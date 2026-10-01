@@ -343,6 +343,12 @@ class TurnResult:
 
 
 class TurnRunner(Protocol):
+    """``run``/``cancel`` are required. Optional hooks, looked up with ``getattr``:
+    ``stop_idle(job)``, and (#2088) ``turn_closed(job)`` once a turn's reply
+    row is queued and ``delivered(job)`` after an outbox row went out — both
+    run in the background and fail open.
+    """
+
     async def run(
         self,
         job: Mapping[str, Any],
@@ -1792,6 +1798,9 @@ class MatrixTransport:
                         continue
                 if not await self._deliver(job):
                     continue  # room muted mid-row: the rest waits, like a muted room's replies
+                # Bot-authored notices the runner tracks (the external-wait
+                # status, #2088) learn their event id only now.
+                self._runner_hook("delivered", job)
                 if "done" in self.turn_timing.get(job["event_id"], {}):
                     self.mark(job["event_id"], "delivered")
                     self._finish_timing(job["event_id"])
@@ -1846,7 +1855,7 @@ class MatrixTransport:
                     continue
                 self.delivery_rejections_streak = 0
                 self._remember_text(sent, room, self.c["account"], chunks[i])
-                self.store.mark_part(event_id, i + 1)
+                self.store.mark_part(event_id, i + 1, sent)
         failed = self.store.failed_parts(event_id)
         if failed and not self.store.is_failure_notice(event_id):
             # Queued before the row is marked delivered: a crash in between
@@ -1919,6 +1928,63 @@ class MatrixTransport:
             "/_matrix/client/v3/rooms/" + quote(room, safe="") + "/redact/" + quote(event_id, safe="") + "/" + txn,
             {},
         )
+
+    # -- bot-authored notice upkeep (#2088) ------------------------------------
+
+    def notice_event(self, row_id: str) -> tuple[str, str | None]:
+        """Where one queued notice stands: ``pending``, ``sent`` (+ event id) or ``gone``.
+
+        ``gone`` covers an unknown row and a row that completed without
+        producing an event (every part rejected, or the id predates #2088).
+        """
+        state, event = self.store.sent_event(row_id)
+        if state == "ready":
+            return "pending", None
+        if state == "done" and event:
+            return "sent", event
+        return "gone", None
+
+    async def edit_notice(self, room: str, event_id: str, text: str) -> bool:
+        """Replace a bot-authored event's text in place (``m.replace``), outside the outbox.
+
+        Like the progress bubble this is a direct, single-event send: the
+        caller keeps its own record of what the event shows and retries on
+        its next pass. ``False`` means the homeserver refused the edit for
+        good (a 4xx other than 401/403); a transient failure or a muted room
+        raises.
+        """
+        from telegram_bot.core.matrix.render import trim_to_event
+
+        bounded_text(text, MAX_REPLY_BYTES)
+        text = trim_to_event(text, edit=True)
+        async with self.matrix_lock:
+            if room in self.blocked:
+                raise ConnectionError("room-muted")
+            # A fresh txn per attempt: re-sending an earlier text (A -> B -> A)
+            # under a reused txn id would be deduplicated into the old edit.
+            txn = hashlib.sha256(("notice-edit-" + event_id + ":" + str(time.time_ns())).encode()).hexdigest()
+            try:
+                await self.encrypted_edit(room, text, event_id, txn)
+            except MatrixHTTPError as exc:
+                if exc.part_rejected:
+                    return False
+                raise
+        return True
+
+    async def redact_notice(self, room: str, event_id: str) -> bool:
+        """Redact a bot-authored event; ``False`` when it is already gone or not redactable.
+
+        A redaction carries no content, so a muted room does not hold it
+        back. Retries reuse one transaction id per event (idempotent).
+        """
+        async with self.matrix_lock:
+            try:
+                await self.redact(room, event_id, "notice-" + event_id)
+            except MatrixHTTPError as exc:
+                if exc.part_rejected:
+                    return False
+                raise
+        return True
 
     def expected_recipients(self, room: str) -> set[tuple[str, str]]:
         """Pinned devices of every room member; direct rooms keep owner-only pins."""
@@ -2040,6 +2106,28 @@ class MatrixTransport:
                 if not any(row["event_id"] == job["event_id"] for row in self.store.outbox()):
                     self._finish_timing(job["event_id"])  # else when send() delivers the reply
                 self.wake()  # the reply or closing notice is in the outbox now
+                if not shutting_down:
+                    # After the reply row is ready: anything the runner queues
+                    # from here sorts behind it in the outbox (#2088).
+                    self._runner_hook("turn_closed", job)
+
+    def _runner_hook(self, name: str, job: Mapping[str, Any]) -> None:
+        """Run the runner's optional ``name(job)`` hook in the background, fail-open.
+
+        Background so neither the work loop nor the send loop waits on the
+        hook's own homeserver calls; the task is cancelled on :meth:`close`.
+        """
+        hook = getattr(self.runner, name, None)
+        if not callable(hook):
+            return
+
+        async def call() -> None:
+            try:
+                await hook(job)
+            except Exception as exc:
+                logger.debug("Matrix runner hook %s failed: %s", name, type(exc).__name__)
+
+        self._spawn(call())
 
     def _close_interrupted(self, job: Mapping[str, Any], outcome: str) -> None:
         if not any(j["event_id"] == job["event_id"] for j in self.store.uncertain()):
