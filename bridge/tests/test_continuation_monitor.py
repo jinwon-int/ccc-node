@@ -23,6 +23,7 @@ from telegram_bot.core.continuation_monitor import (
     failure_stop_notification_text,
 )
 from telegram_bot.core.external_wait import default_active_turns_path
+from telegram_bot.core.session_scope import storage_key
 
 
 @pytest.fixture
@@ -246,7 +247,11 @@ def _lifecycle_for_continuation(tmp_path: Path, bot, monkeypatch) -> object:
         bot_data_dir=tmp_path, project_root=str(tmp_path)
     )
     lifecycle._session_manager = SimpleNamespace(  # type: ignore[assignment]
-        get_session=lambda user_id: _session_of({"session_id": "sess-1"})
+        get_session=lambda key: _session_of({"session_id": "sess-1"})
+    )
+    # The composed TelegramBot resolves this through session_scope.storage_key.
+    lifecycle._conversation_key = lambda user_id, chat_id=None: storage_key(  # type: ignore[attr-defined]
+        getattr(lifecycle._config, "telegram_session_scope", "per-user-chat"), user_id, chat_id
     )
     lifecycle._project_chat = SimpleNamespace()  # type: ignore[assignment]
     lifecycle.application = SimpleNamespace(bot=bot)
@@ -314,6 +319,91 @@ async def test_lifecycle_runner_binds_session_runs_and_delivers(
     assert calls[0]["session_id"] == "sess-1"
     assert calls[0]["prompt"].startswith("[external_event: continuation_queue")
     assert any(chunk["text"] for chunk in sent)  # result delivered
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("scope", "group_key"),
+    [("per-user-chat", "7:-100"), ("shared-groups", "0:-100")],
+)
+async def test_lifecycle_runner_binds_the_group_session_not_the_dm_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str, group_key: str
+) -> None:
+    """#2075: ``get_session(user_id)`` is the sender's DM row. A continuation
+    registered in a group must run under that group conversation's own row —
+    keyed exactly like an ordinary group turn — so DM context never continues
+    into the room."""
+    calls: list[dict] = []
+    keys: list[object] = []
+    rows = {7: {"session_id": "dm-session"}, group_key: {"session_id": "group-session"}}
+
+    async def get_session(key):
+        keys.append(key)
+        return rows.get(key, {})
+
+    class FakeBot:
+        async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
+            return None
+
+    class FakeProjectChat:
+        async def process_message(self, prompt, user_id, chat_id, **kwargs):
+            calls.append({"user_id": user_id, "chat_id": chat_id, **kwargs})
+            return SimpleNamespace(success=True, content="bundle done")
+
+    lifecycle = _lifecycle_for_continuation(tmp_path, FakeBot(), monkeypatch)
+    lifecycle._config.telegram_session_scope = scope  # type: ignore[attr-defined]
+    lifecycle._session_manager = SimpleNamespace(get_session=get_session)  # type: ignore[attr-defined]
+    lifecycle._project_chat = FakeProjectChat()  # type: ignore[attr-defined]
+    monitor = lifecycle._build_continuation_monitor()  # type: ignore[attr-defined]
+    assert monitor is not None
+
+    queue = ContinuationQueue(default_queue_path(tmp_path / "continuation"))
+    cid, _ = queue.register(
+        user_id=7, chat_id=-100, session_id="registered-session", prompt="finish the rollout"
+    )
+
+    await monitor._tick()
+
+    assert queue.get(cid)["state"] == STATE_DONE
+    assert keys == [group_key]
+    assert calls[0]["chat_id"] == -100
+    assert calls[0]["session_id"] == "group-session"
+
+
+@pytest.mark.anyio
+async def test_lifecycle_runner_dm_continuation_keeps_the_dm_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DM continuation (chat_id == user_id) still resolves the DM row (#2075)."""
+    calls: list[dict] = []
+    keys: list[object] = []
+
+    async def get_session(key):
+        keys.append(key)
+        return {"session_id": "dm-session"}
+
+    class FakeBot:
+        async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
+            return None
+
+    class FakeProjectChat:
+        async def process_message(self, prompt, user_id, chat_id, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(success=True, content="bundle done")
+
+    lifecycle = _lifecycle_for_continuation(tmp_path, FakeBot(), monkeypatch)
+    lifecycle._session_manager = SimpleNamespace(get_session=get_session)  # type: ignore[attr-defined]
+    lifecycle._project_chat = FakeProjectChat()  # type: ignore[attr-defined]
+    monitor = lifecycle._build_continuation_monitor()  # type: ignore[attr-defined]
+    assert monitor is not None
+
+    queue = ContinuationQueue(default_queue_path(tmp_path / "continuation"))
+    queue.register(user_id=7, chat_id=7, session_id="dm-session", prompt="finish the rollout")
+
+    await monitor._tick()
+
+    assert keys == [7]
+    assert calls[0]["session_id"] == "dm-session"
 
 
 @pytest.mark.anyio

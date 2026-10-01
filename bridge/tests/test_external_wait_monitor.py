@@ -26,6 +26,7 @@ from telegram_bot.core.external_wait_monitor import (
     resume_prompt_text,
     wake_notification_text,
 )
+from telegram_bot.core.session_scope import storage_key
 
 
 @pytest.fixture
@@ -529,7 +530,7 @@ async def test_resume_turn_binds_the_canonical_conversation_session(tmp_path: Pa
     lifecycle = _lifecycle_for_delivery(tmp_path, FakeBot())
     lifecycle._project_chat = FakeProjectChat()  # type: ignore[attr-defined]
     lifecycle._session_manager = SimpleNamespace(  # type: ignore[attr-defined]
-        get_session=lambda user_id: _session_of({"session_id": "canonical-session"})
+        get_session=lambda key: _session_of({"session_id": "canonical-session"})
     )
 
     monitor = lifecycle._build_external_wait_monitor()
@@ -555,6 +556,62 @@ async def test_resume_turn_binds_the_canonical_conversation_session(tmp_path: Pa
     # The whole point: the continuation is bound to the conversation, so a wait
     # registered inside it records an id the guard will still recognize.
     assert calls[0]["session_id"] == "canonical-session"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("scope", "group_key"),
+    [("per-user-chat", "7:-100"), ("shared-groups", "0:-100")],
+)
+async def test_group_resume_binds_the_group_session_not_the_dm_session(
+    tmp_path: Path, scope: str, group_key: str
+) -> None:
+    """#2075: ``get_session(user_id)`` is the sender's DM row. A wait registered
+    in a group must be guarded by, and resume under, that group conversation's
+    own row — keyed exactly like an ordinary group turn. The DM lookup both
+    skipped a valid group resume as ``session_moved`` and, whenever the ids
+    happened to agree, continued DM context inside the room."""
+    calls: list[dict] = []
+    keys: list[object] = []
+    rows = {7: {"session_id": "dm-session"}, group_key: {"session_id": "group-session"}}
+
+    async def get_session(key):
+        keys.append(key)
+        return rows.get(key, {})
+
+    class FakeProjectChat:
+        async def process_message(self, prompt, user_id, chat_id, **kwargs):
+            calls.append({"user_id": user_id, "chat_id": chat_id, **kwargs})
+            return type("R", (), {"success": True, "content": "done"})()
+
+    class FakeBot:
+        async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
+            return None
+
+    lifecycle = _lifecycle_for_delivery(tmp_path, FakeBot())
+    lifecycle._config.telegram_session_scope = scope  # type: ignore[attr-defined]
+    lifecycle._project_chat = FakeProjectChat()  # type: ignore[attr-defined]
+    lifecycle._session_manager = SimpleNamespace(get_session=get_session)  # type: ignore[attr-defined]
+
+    monitor = lifecycle._build_external_wait_monitor()  # type: ignore[attr-defined]
+    assert monitor is not None
+
+    record = {
+        "wait_id": "w-group",
+        "user_id": 7,
+        "chat_id": -100,
+        "session_id": "group-session",
+        "repo": "jinwon-int/ccc-node",
+        "pr_number": 2075,
+        "head_sha": "abc1234",
+        "terminal_status": TERMINAL_SUCCESS,
+        "summary": "squash-merge when green",
+    }
+    assert await monitor._resume_skip_reason(record) is None
+    assert await monitor._run_resume(record) is True
+    assert keys == [group_key, group_key]
+    assert calls[0]["chat_id"] == -100
+    assert calls[0]["session_id"] == "group-session"
 
 
 def test_skipped_notification_names_the_reason() -> None:
@@ -591,7 +648,11 @@ def _lifecycle_for_delivery(tmp_path: Path, bot) -> object:
         bot_data_dir=tmp_path, project_root=str(tmp_path)
     )
     lifecycle._session_manager = SimpleNamespace(  # type: ignore[assignment]
-        get_session=lambda user_id: _session_of({"session_id": "sess-1"})
+        get_session=lambda key: _session_of({"session_id": "sess-1"})
+    )
+    # The composed TelegramBot resolves this through session_scope.storage_key.
+    lifecycle._conversation_key = lambda user_id, chat_id=None: storage_key(  # type: ignore[attr-defined]
+        getattr(lifecycle._config, "telegram_session_scope", "per-user-chat"), user_id, chat_id
     )
     lifecycle._project_chat = SimpleNamespace()  # type: ignore[assignment]
     lifecycle.application = SimpleNamespace(bot=bot)

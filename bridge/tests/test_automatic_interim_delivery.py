@@ -7,6 +7,7 @@ import pytest
 
 from test_project_chat_codex import FakeRuntime, FakeSession, _handler
 from telegram_bot.core import bot_delivery, bot_lifecycle
+from telegram_bot.core.session_scope import storage_key
 from telegram_bot.core.agent_runtime import (
     CompletionEvent,
     ErrorEvent,
@@ -26,6 +27,10 @@ def anyio_backend():
 class Lifecycle(bot_lifecycle.BotLifecycleMixin, bot_delivery.BotDeliveryMixin):
     def _require_application(self):
         return self.application
+
+    def _conversation_key(self, user_id, chat_id=None):
+        # Same helper TelegramBot._conversation_key resolves through (#2075).
+        return storage_key("per-user-chat", user_id, chat_id)
 
 
 @pytest.mark.anyio
@@ -75,8 +80,8 @@ async def test_automatic_interim_delivery(tmp_path, monkeypatch, lane, outcome):
     )
     lifecycle.application = SimpleNamespace(bot=Bot())
 
-    async def lookup(user_id):
-        assert user_id == 7
+    async def lookup(key):
+        assert key == "7:70"  # the (user, chat) row, never the DM row 7 (#2075)
         return {"session_id": "canonical-session"}
 
     lifecycle._session_manager = SimpleNamespace(get_session=lookup)

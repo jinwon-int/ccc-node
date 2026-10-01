@@ -154,8 +154,11 @@ body-free sidecar, `<root>/<scope>/claude/session-map/<session_id>.json`
 Telegram/Matrix ids; directory 0700, file 0600, atomic rename), using the same
 `resolve_memory_audience` route the session store records. Bridge-started
 turns that skip the normal session save (external-wait resume, continuation)
-record the route they ran under too, so a session reused across surfaces shows
-up as `ambiguous` rather than being routed by an older record.
+resolve their session from the same `(user_id, chat_id)` conversation key an
+ordinary turn uses (#2075 — they used to read the sender's DM row and could
+continue DM context inside a group), and record the route they ran under too,
+so a session reused across surfaces shows up as `ambiguous` rather than being
+routed by an older record.
 
 `ingest-cron.sh` then hands off to `claude-audience-feed.py`, which routes each
 bridge distill-journal job by its Claude session id into exactly one
@@ -186,6 +189,37 @@ from the bridge's (`CCC_BRIDGE_MEMORY_AUDIENCE_ROOT`, default
 `<bot-data-dir>/memory-audiences`), and when the runtime is Claude but the
 scoped lane is still another provider's. Codex and Danso remain refused with
 `--audience-scoped`.
+
+#### Re-scoping a non-scoped lane
+
+A nunchi lane installed **without** `--audience-scoped` on a bridge running
+`CCC_BRIDGE_MEMORY_MODE=audience-scoped` ingests every route's work — owner DM
+and family rooms alike — into the one node-wide store (`~/.nunchi/facts.db`,
+`snapshot.md`), and every private route reads that node-global snapshot as
+legacy input. The lane still ticks healthily, so `ccc-doctor` reports it as a
+`nunchi audience scope` DEFECT row (#2075). Re-applying alone does not repair
+it: the node-wide `~/.nunchi/ingested-files` seen list carries over, so jobs
+already ingested are never re-routed, and the mixed facts stay in the
+node-wide store. With fresh approval for the live node:
+
+1. **Re-apply scoped.** Claude/Piri: `scripts/install-nunchi.sh --apply
+   --<claude|piri> --audience-scoped <bridge audience root>` (the root the
+   doctor row names). Codex/Danso have no scoped lane: `scripts/install-nunchi.sh
+   --remove` instead.
+2. **Quarantine the node-wide store.** Move `facts.db`, `snapshot.md` and the
+   lane's seen list (`ingested-files`; `piri-seen` on a Piri lane) from
+   `~/.nunchi` into an owner-only (0700) quarantine
+   directory such as `~/.nunchi/quarantine-<date>/`. Do not merge it into any
+   `<scope>/nunchi` store: its facts carry no audience and cannot be split
+   after the fact.
+3. **Re-route.** Claude: with `ingested-files` moved aside, the next scoped
+   tick reconsiders every bridge distill-journal job still on disk. Jobs whose
+   session has a valid sidecar are routed into exactly one scope; older jobs
+   without one stay `unmapped` and are skipped (fail-closed), as for any scoped
+   lane. Piri: the scoped feed reads each scope's own transcripts with its own
+   `<scope>/nunchi/piri-seen`, so nothing else needs re-routing.
+4. **Verify.** `ccc-doctor` shows no `nunchi audience scope` row, and the next
+   `ingest.status.json` tick reports `audience_scoped: true`.
 
 Recall follows one rule across Piri, Claude, and Codex materialization: a
 private route may read its own scoped Nunchi snapshot, the shared snapshot, and
