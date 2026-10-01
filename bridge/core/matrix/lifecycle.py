@@ -13,7 +13,10 @@ remaining ones for Matrix rather than porting them line by line:
   dies on start restarted every 5 s forever with no signal. :class:`CrashBudget`
   keeps a tiny durable record in the frontend's data dir, counts consecutive
   *rapid unclean* exits with the shared ``crash-policy.env`` numbers, delays
-  the next start exponentially, and raises one owner health alert per streak.
+  the next start exponentially, and raises an owner health alert when the
+  streak reaches the strike count, then staged reminders while it lasts
+  (10 min, 1 h, then every 6 h after it began — #2086), each naming the
+  failure kind of the last exit (``dns``, ``timeout``, ...).
 * **Task-ledger reconciliation** — the shared request lifecycle writes
   ``tasks.json`` in this data dir; nothing reconciled it, so a turn killed by
   a restart stayed ``working`` forever. The room already hears about the
@@ -64,8 +67,14 @@ class CrashDecision:
 
     streak: int  # consecutive rapid unclean exits, this start's predecessors
     delay_seconds: float  # back-off before serving
-    alert: bool  # True once per streak, when it reaches the strike count
+    # True when the streak reaches the strike count (stage 0), then again at
+    # each staged reminder while it lasts (#2086, ``outage_realert_stage``).
+    alert: bool
     last_error: Optional[str]  # exception class name of the last unclean exit
+    stage: int = 0  # 0 = first alert, N = N-th reminder
+    elapsed_seconds: float = 0.0  # since the first run of the streak started
+    # ``classify_network_failure`` of the last unclean exit: (kind, class name).
+    last_cause: Optional[tuple[str, str]] = None
 
 
 class CrashBudget:
@@ -124,11 +133,19 @@ class CrashBudget:
     def begin(self) -> CrashDecision:
         """Account for the previous run and mark this one as running."""
 
+        from telegram_bot.utils.health_alerts import (
+            outage_realert_due_stage,
+            outage_realert_stage,
+        )
+
         previous = self._read()
         now = float(self._clock())
         streak = 0
         alerted = False
+        alert_stage = 0
+        streak_started: Optional[float] = None
         last_error: Optional[str] = None
+        last_cause: Optional[tuple[str, str]] = None
         if previous.get("running") is True:
             started = previous.get("started_at")
             # ``started_at`` is when serving began (after any back-off), so a
@@ -139,8 +156,30 @@ class CrashBudget:
             if rapid:
                 streak = int(previous.get("streak") or 0) + 1
                 alerted = bool(previous.get("alerted"))
+                prior_stage = previous.get("alert_stage")
+                alert_stage = prior_stage if isinstance(prior_stage, int) else 0
+                prior_start = previous.get("streak_started_at")
+                # The streak began when its first crashing run started serving.
+                if streak > 1 and isinstance(prior_start, (int, float)):
+                    streak_started = float(prior_start)
+                elif isinstance(started, (int, float)):
+                    streak_started = float(started)
             last_error = previous.get("last_error") if isinstance(previous.get("last_error"), str) else None
-        alert = streak >= self._max_rapid and not alerted
+            cause = previous.get("last_cause")
+            if isinstance(cause, list) and len(cause) == 2 and all(isinstance(c, str) for c in cause):
+                last_cause = (cause[0], cause[1])
+        streak_elapsed = max(0.0, now - streak_started) if streak_started is not None else 0.0
+        alert = False
+        stage = 0
+        if streak >= self._max_rapid:
+            if not alerted:
+                alert = True
+                # Do not chase a late first alert with an immediate reminder.
+                alert_stage = outage_realert_due_stage(streak_elapsed)
+            else:
+                reminder = outage_realert_stage(streak_elapsed, alert_stage)
+                if reminder is not None:
+                    alert, stage, alert_stage = True, reminder, reminder
         delay = self.delay_for(streak)
         self._write(
             {
@@ -154,7 +193,10 @@ class CrashBudget:
                 "started_at": now + delay,
                 "streak": streak,
                 "alerted": alerted or alert,
+                "alert_stage": alert_stage if streak else 0,
+                "streak_started_at": streak_started if streak else None,
                 "last_error": last_error if streak else None,
+                "last_cause": list(last_cause) if streak and last_cause else None,
             }
         )
         return CrashDecision(
@@ -162,13 +204,19 @@ class CrashBudget:
             delay_seconds=delay,
             alert=alert,
             last_error=last_error,
+            stage=stage,
+            elapsed_seconds=streak_elapsed,
+            last_cause=last_cause,
         )
 
     def record_error(self, error: BaseException) -> None:
-        """Remember the class name of what ended this run (never the message)."""
+        """Remember what ended this run: class names and failure kind, never the message."""
+
+        from telegram_bot.utils.health_alerts import classify_network_failure
 
         record = self._read()
         record["last_error"] = type(error).__name__
+        record["last_cause"] = list(classify_network_failure(error))
         self._write(record)
 
     def mark_clean(self) -> None:
@@ -180,17 +228,26 @@ class CrashBudget:
 def crash_loop_alert(decision: CrashDecision) -> Any:
     """Owner alert for a rapid-crash streak (constant template + numbers only)."""
 
-    from telegram_bot.utils.health_alerts import Alert
+    from telegram_bot.utils.health_alerts import FAILURE_OTHER, Alert, format_failure_cause
 
-    cause = f" (last exit: {decision.last_error})" if decision.last_error else ""
-    return Alert(
-        code=CRASH_LOOP_ALERT_CODE,
-        message=(
+    last_exit = f" (last exit: {decision.last_error})" if decision.last_error else ""
+    # "other" adds nothing to the class name already shown as the last exit.
+    kind = decision.last_cause
+    cause = format_failure_cause(kind) if kind and kind[0] != FAILURE_OTHER else ""
+    delayed = f"Restarts are now delayed {int(decision.delay_seconds)}s."
+    if decision.stage > 0:
+        message = (
+            f"Matrix frontend is still crash-looping: {decision.streak} rapid unclean "
+            f"exits over {int(max(0.0, decision.elapsed_seconds))}s since the streak "
+            f"began (reminder {decision.stage}){last_exit}. {delayed}{cause}"
+        )
+    else:
+        message = (
             f"Matrix frontend exited uncleanly {decision.streak} times in a row, each "
-            f"within {crash_policy.PROCESS_CRASH_WINDOW_SECONDS}s of starting{cause}. "
-            f"Restarts are now delayed {int(decision.delay_seconds)}s."
-        ),
-    )
+            f"within {crash_policy.PROCESS_CRASH_WINDOW_SECONDS}s of starting{last_exit}. "
+            f"{delayed}{cause}"
+        )
+    return Alert(code=CRASH_LOOP_ALERT_CODE, message=message, stage=decision.stage)
 
 
 # -- task ledger ------------------------------------------------------------------

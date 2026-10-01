@@ -949,9 +949,11 @@ class Config(
         ge=0,
         alias="CCC_ALERT_INIT_FAILURES",
         description=(
-            "Consecutive Application.initialize() failures before one "
-            "telegram_init_retry_loop alert (plus a recovery notice) is written to "
-            "the channel-neutral push spool. Not gated on this process's "
+            "Consecutive Application.initialize() failures before a "
+            "telegram_init_retry_loop alert is written to the channel-neutral "
+            "push spool; a lasting outage is re-announced 10 min and 1 h after "
+            "it began, then every 6 h, and a recovery notice follows. Not gated "
+            "on this process's "
             "CCC_PUSH_ENABLED — a Matrix spool notifier on the node delivers it "
             "while Telegram is unreachable. 0 disables."
         ),

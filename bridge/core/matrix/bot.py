@@ -1091,8 +1091,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
 
         systemd restarts the unit every ``RestartSec`` forever; this is the
         back-off the Telegram ``start.sh`` supervisor provides, with the same
-        ``crash-policy.env`` numbers. One owner alert per streak rides the push
-        spool (delivered once the spool consumer is up; ``CCC_PUSH_ENABLED``).
+        ``crash-policy.env`` numbers. One owner alert per streak, plus staged
+        reminders while the streak lasts (#2086), rides the push spool
+        (delivered once the spool consumer is up; ``CCC_PUSH_ENABLED``).
         """
 
         if decision is None:

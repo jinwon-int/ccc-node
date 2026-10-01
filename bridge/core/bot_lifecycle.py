@@ -36,8 +36,11 @@ from telegram_bot.core.tool_policy import (
 from telegram_bot.core.session_isolation import apply_subprocess_session_isolation
 from telegram_bot.utils.health import health_reporter
 from telegram_bot.utils.health_alerts import (
+    classify_network_failure,
     init_retry_loop_alert,
     init_retry_recovered_alert,
+    outage_realert_due_stage,
+    outage_realert_stage,
     write_alert_spool,
 )
 from telegram_bot.core.task_ledger import (
@@ -809,11 +812,15 @@ class BotLifecycleMixin(MemoryDistillMixin):
 
         rapid_crash_count = 0
         # Consecutive Application.initialize() failures (transient network
-        # errors). A streak reaching the alert threshold is announced once
-        # via the channel-neutral push spool; the streak resets on success.
+        # errors). A streak reaching the alert threshold is announced via the
+        # channel-neutral push spool, then re-announced in stages while it
+        # lasts (#2086: 10 min, 1 h, then every 6 h after the outage began);
+        # the streak resets on success.
         init_failures = 0
         init_failure_started: Optional[float] = None
         init_alerted = False
+        init_alert_stage = 0
+        init_failure_cause: Optional[tuple[str, str]] = None
 
         while not stop_event.is_set():
             if not self.application:
@@ -850,6 +857,7 @@ class BotLifecycleMixin(MemoryDistillMixin):
                 init_failures += 1
                 if init_failure_started is None:
                     init_failure_started = start_time
+                init_failure_cause = classify_network_failure(e)
                 if isinstance(e, telegram.error.TimedOut):
                     health_reporter.record_telegram_error(
                         f"telegram timeout error: {e}",
@@ -871,13 +879,30 @@ class BotLifecycleMixin(MemoryDistillMixin):
                         e,
                         init_failures,
                     )
+                elapsed = self._clock.time() - init_failure_started
                 if not init_alerted and self._init_failure_alert_due(init_failures):
                     init_alerted = True
+                    # A first alert that only fires after a reminder offset
+                    # (very slow attempts) must not be chased by an
+                    # immediate reminder for the same moment.
+                    init_alert_stage = outage_realert_due_stage(elapsed)
                     self._spool_init_retry_alert(
                         init_retry_loop_alert(
-                            init_failures, self._clock.time() - init_failure_started
+                            init_failures, elapsed, cause=init_failure_cause
                         )
                     )
+                elif init_alerted:
+                    stage = outage_realert_stage(elapsed, init_alert_stage)
+                    if stage is not None:
+                        init_alert_stage = stage
+                        self._spool_init_retry_alert(
+                            init_retry_loop_alert(
+                                init_failures,
+                                elapsed,
+                                cause=init_failure_cause,
+                                stage=stage,
+                            )
+                        )
                 # Force cleanup to release leaked connections from pool
                 await self._graceful_shutdown(force=True)
                 await asyncio.sleep(5)
@@ -886,7 +911,9 @@ class BotLifecycleMixin(MemoryDistillMixin):
             if init_alerted and init_failure_started is not None:
                 self._spool_init_retry_alert(
                     init_retry_recovered_alert(
-                        init_failures, self._clock.time() - init_failure_started
+                        init_failures,
+                        self._clock.time() - init_failure_started,
+                        cause=init_failure_cause,
                     )
                 )
             if init_failures:
@@ -896,6 +923,8 @@ class BotLifecycleMixin(MemoryDistillMixin):
             init_failures = 0
             init_failure_started = None
             init_alerted = False
+            init_alert_stage = 0
+            init_failure_cause = None
 
             await self._on_ready(self.application)
 
@@ -1372,7 +1401,10 @@ class BotLifecycleMixin(MemoryDistillMixin):
         drains the spool — on a node also running the Matrix frontend that is
         the Matrix spool notifier (core/matrix/bot.py), i.e. a genuinely
         out-of-band channel. With no consumer the record simply waits in the
-        spool (one per outage episode, plus one recovery notice).
+        spool. Per outage episode: one first alert, staged reminders while it
+        lasts (``health_alerts.outage_realert_stage``: 10 min, 1 h, then every
+        6 h after the outage began — each with its own dedup key), and one
+        recovery notice. Every record names the failure kind (#2086).
         """
         logger.error("Health alert [%s]: %s", alert.code, alert.message)
         try:
