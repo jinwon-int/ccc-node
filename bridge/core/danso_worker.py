@@ -19,6 +19,7 @@ from telegram_bot.core.agent_runtime import (
     ResultEvent, TaskProgressEvent, TextDeltaEvent, deny_approval,
 )
 from telegram_bot.core.danso_progress import read_progress
+from telegram_bot.core.danso_skill_usage import DansoSkillReads
 
 CAP = 1024 * 1024
 # A checkpoint may be emitted at stage start and after each request, with a
@@ -499,7 +500,7 @@ class DansoRuntime:
                  long_task=False, task_stage_requests=16, task_max_requests=1024,
                  task_max_tokens=10_000_000, task_repeat_limit=3,
                  task_pause_after_stage=None, native_memory_args=None,
-                 progress_jsonl=False, task_followup=False):
+                 progress_jsonl=False, task_followup=False, skill_usage_sink=None):
         if provider not in PROVIDERS or not model or not isinstance(model, str):
             raise ValueError('invalid provider/model')
         if type(long_task) is not bool:
@@ -571,6 +572,7 @@ class DansoRuntime:
         if type(progress_jsonl) is not bool:
             raise ValueError('invalid progress setting')
         self.progress_jsonl = progress_jsonl
+        self.skill_usage_sink = skill_usage_sink
 
     async def list_models(self):
         return [ModelInfo(id=self.model, display_name=self.model, is_default=True,
@@ -937,8 +939,9 @@ class DansoSession:
         progress_queue = asyncio.Queue()
         tool_queue = asyncio.Queue(maxsize=128)
         use_jsonl = r.progress_jsonl
+        skill_reads = DansoSkillReads(r.skill_usage_sink, str(self.cwd)) if r.skill_usage_sink is not None else None
         stdout_task = asyncio.create_task(
-            read_progress(self._process.stdout, tool_queue) if use_jsonl else _read(self._process.stdout))
+            read_progress(self._process.stdout, tool_queue, skill_reads) if use_jsonl else _read(self._process.stdout))
         if r.long_task:
             stderr_task = asyncio.create_task(
                 _read_stderr(self._process.stderr, progress_queue, parse_progress=True))
@@ -1072,3 +1075,5 @@ class DansoSession:
             self._task_progress_ready = False
             self._task_progress_seen = False
             self._task_pause_requested = False
+            if self.runtime.skill_usage_sink is not None:
+                await self.runtime.skill_usage_sink.drain()

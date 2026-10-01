@@ -129,7 +129,7 @@ class SinkTests(unittest.IsolatedAsyncioTestCase):
             script = Path(raw) / "slow.sh"
             script.write_text("#!/bin/bash\nsleep 30\n")
             sink = SkillUsageSink({"HOME": raw, "PATH": os.environ["PATH"], "CCC_SKILL_USAGE_LOGGER": str(script)})
-            with patch("telegram_bot.core.codex_skill_usage._TIMEOUT_SECONDS", 0.05):
+            with patch("telegram_bot.core.skill_usage._TIMEOUT_SECONDS", 0.05):
                 for _ in range(20):
                     sink.record("test-skill")
                 self.assertEqual(len(sink._tasks), 4)
