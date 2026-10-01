@@ -63,6 +63,11 @@ from telegram_bot.core.matrix.attachments import (  # noqa: F401 - re-exported
 MAX_TEXT_BYTES = 16_384
 # Outbox rows whose ``reply`` is an outbound-file payload, not text (#2001).
 FILE_JOB_BODY = "file"
+# ``jobs.body`` of a ``$notice-`` row delivered as ``m.notice`` instead of
+# ``m.text`` (#2088): a bot status line clients should not notify on. Every
+# other notice row keeps ``"notice"`` and still goes out as ``m.text``.
+NOTICE_JOB_BODY = "notice"
+QUIET_NOTICE_JOB_BODY = "notice:m.notice"
 # Refusals the sender is told about (#2002) — see Policy.rejection.
 REJECT_TEXT_TOO_LARGE = "text-too-large"
 REJECT_EDIT = "edit"
@@ -309,6 +314,17 @@ def job_digest(
     if reply_attachment is not None:
         fields = [room_id, sender, body, attachment, reply_attachment]
     return hashlib.sha256(json.dumps(fields).encode()).hexdigest()
+
+
+def outbox_msgtype(job: Mapping[str, Any]) -> str:
+    """``m.notice`` for a quiet bot notice row (#2088), else ``m.text``.
+
+    Keyed on the row prefix as well as the body: a reply row's ``body`` is the
+    user's own text, which could be anything.
+    """
+    if job.get("body") == QUIET_NOTICE_JOB_BODY and str(job.get("event_id") or "").startswith("$notice-"):
+        return "m.notice"
+    return "m.text"
 
 
 REPLY_CONTEXT_MAX_CHARS = 2000
@@ -1391,10 +1407,20 @@ class MatrixStore(Store):
         event = "$notice-" + hashlib.sha256(json.dumps([event_id, key]).encode()).hexdigest()
         return self.db.execute("SELECT 1 FROM jobs WHERE event_id=?", (event,)).fetchone() is not None
 
-    def notice(self, req: Request, key: str, text: str) -> str:
-        """Queue a durable, idempotent notice for ``req``'s room; returns its outbox event id."""
+    def notice(self, req: Request, key: str, text: str, *, msgtype: str = "m.text") -> str:
+        """Queue a durable, idempotent notice for ``req``'s room; returns its outbox event id.
+
+        ``msgtype="m.notice"`` (#2088) marks the row so the sender delivers it
+        as an ``m.notice`` (see :func:`outbox_msgtype`).
+        """
         bounded_text(text, MAX_REPLY_BYTES)
-        return self._ready_row(req, key, text, prefix="$notice-", body="notice")
+        if msgtype == "m.text":
+            body = NOTICE_JOB_BODY
+        elif msgtype == "m.notice":
+            body = QUIET_NOTICE_JOB_BODY
+        else:
+            raise ValueError("unsupported-msgtype")
+        return self._ready_row(req, key, text, prefix="$notice-", body=body)
 
     def file_job(self, req: Request, key: str, payload: str) -> str:
         """Queue one outbound file (#2001) as a durable, idempotent outbox row.

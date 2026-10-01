@@ -400,25 +400,39 @@ _MAX_EVENT_ID = "$" + "x" * 254
 _TRUNCATION_MARK = "\n…"
 
 
-def event_content(text: str, *, plain: bool = False) -> dict[str, Any]:
-    """``m.text`` content with a Matrix-HTML ``formatted_body`` when the text has markup.
+#: Message types an outgoing text event may carry. ``m.notice`` is for
+#: bot-authored status lines (the external-wait status, #2088) that clients
+#: should not ping or notify on; replies stay ``m.text``. The size model
+#: (:func:`estimated_event_bytes`) always measures ``m.text``: the 2 extra
+#: bytes of ``m.notice`` sit well inside :data:`_ENVELOPE_RESERVE`.
+TEXT_MSGTYPES = ("m.text", "m.notice")
+
+
+def event_content(text: str, *, plain: bool = False, msgtype: str = "m.text") -> dict[str, Any]:
+    """``m.text`` (or ``m.notice``) content with a Matrix-HTML ``formatted_body`` when the text has markup.
 
     ``plain=True`` drops the HTML rendering (the 413 downgrade path): the
     ``body`` alone is roughly half the event.
     """
 
+    if msgtype not in TEXT_MSGTYPES:
+        raise ValueError("unsupported-msgtype")
     body, formatted = render_matrix_message(text)
-    content: dict[str, Any] = {"msgtype": "m.text", "body": body}
+    content: dict[str, Any] = {"msgtype": msgtype, "body": body}
     if formatted and not plain:
         content["format"] = "org.matrix.custom.html"
         content["formatted_body"] = formatted
     return content
 
 
-def edit_content(text: str, replaces: str, *, plain: bool = False) -> dict[str, Any]:
-    """``m.replace`` edit of ``replaces``: note the text travels twice (fallback + new content)."""
+def edit_content(text: str, replaces: str, *, plain: bool = False, msgtype: str = "m.text") -> dict[str, Any]:
+    """``m.replace`` edit of ``replaces``: note the text travels twice (fallback + new content).
 
-    new_content = event_content(text, plain=plain)
+    ``msgtype`` applies to both the fallback and ``m.new_content``, so an
+    edited ``m.notice`` stays a notice in every client.
+    """
+
+    new_content = event_content(text, plain=plain, msgtype=msgtype)
     content: dict[str, Any] = dict(new_content)
     content["body"] = "* " + text
     content["m.new_content"] = new_content

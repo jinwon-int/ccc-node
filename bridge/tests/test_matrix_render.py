@@ -376,3 +376,20 @@ def test_estimate_is_an_upper_bound_of_real_megolm_output() -> None:
             estimate = _render.estimated_event_bytes(text, edit=edit)
             # The estimate is the wire content plus the envelope reserve.
             assert real + 4_000 <= estimate <= real + 4_400
+
+
+def test_notice_msgtype_reaches_the_edit_fallback_and_new_content() -> None:
+    """The external-wait status line is an m.notice, edits included (#2088)."""
+    assert _render.event_content("hi") == {"msgtype": "m.text", "body": "hi"}
+    assert _render.event_content("hi", msgtype="m.notice") == {"msgtype": "m.notice", "body": "hi"}
+    edit = _render.edit_content("**ok**", "$status", msgtype="m.notice")
+    assert edit["msgtype"] == "m.notice" and edit["m.new_content"]["msgtype"] == "m.notice"
+    assert edit["body"] == "* **ok**" and "formatted_body" in edit["m.new_content"]
+    assert _render.edit_content("x", "$bubble")["m.new_content"]["msgtype"] == "m.text"
+    with pytest.raises(ValueError, match="unsupported-msgtype"):
+        _render.event_content("x", msgtype="m.emote")
+    # m.notice is two bytes longer than m.text, well inside the envelope reserve.
+    notice = _render.edit_content("가" * 3000, "$" + "e" * 254, msgtype="m.notice")
+    text = _render.edit_content("가" * 3000, "$" + "e" * 254)
+    assert len(str(notice)) - len(str(text)) == 4
+    assert _render._ENVELOPE_RESERVE >= 4_096
