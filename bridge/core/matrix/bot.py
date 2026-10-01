@@ -77,6 +77,7 @@ from telegram_bot.core.lifecycle_loops import (
 )
 from telegram_bot.core.matrix import lifecycle as matrix_lifecycle
 from telegram_bot.core.matrix.render import chunk_text, render_matrix_message
+from telegram_bot.core.matrix.wait_status import MatrixWaitStatusMixin
 from telegram_bot.core.matrix_ids import MatrixIdMap
 from telegram_bot.core.claude_audience_sidecar import record_claude_turn_audience
 from telegram_bot.core.memory_audience import resolve_memory_audience
@@ -515,7 +516,7 @@ class _NoticeApp:
         self.bot = _NoticeBotPort(bot)
 
 
-class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
+class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
     """Matrix frontend: ``TurnRunner`` over ``ProjectChatHandler``."""
 
     # True only while serve() owns the bound health reporter (#1820): per-turn
@@ -751,6 +752,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             cancel_on_stop.append(("matrix-continuation-monitor", lambda: continuation.run(stop)))
         if self._orphan_reaper_enabled():
             cancel_on_stop.append(("matrix-orphan-reaper", lambda: self._periodic_reaper()))
+        # #2088: one bounded pass over the external-wait status messages a
+        # previous run left (or never sent); background so it never delays serving.
+        cancel_on_stop.append(
+            ("matrix-external-wait-status-reconcile", self._reconcile_external_wait_status_on_start)
+        )
         if notifier.enabled:
             # ``MatrixSpoolNotifier.run`` polls forever without watching
             # ``stop``; as a stop-driven leg it held the group open after a
@@ -1226,6 +1232,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
             notifier=self._notify_chat,
             resumer=self._enqueue_external_wait_resume,
             session_lookup=self._external_wait_session_lookup,
+            # Terminal transitions edit the route's status message (#2088);
+            # None when CCC_EXTERNAL_WAIT_STATUS is off.
+            status_syncer=self._external_wait_status_syncer(),
             resume_enabled=ExternalWaitMonitor.env_flag(
                 "CCC_EXTERNAL_WAIT_RESUME", default=True
             ),
@@ -1507,6 +1516,14 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin):
         record = registry.get(wait_id)
         if record is None or not self._wait_is_requesters(record, user_id) or not registry.cancel(wait_id):
             return f"No active external wait with id `{wait_id}`."
+        # Owner cancellation has no wake: refresh the wait's own route (#2088),
+        # which need not be the room the command came from.
+        try:
+            route = (int(record["user_id"]), int(record["chat_id"]))
+        except (KeyError, TypeError, ValueError):
+            route = None
+        if route is not None:
+            await self._sync_external_wait_status(*route)
         return f"Cancelled external wait `{wait_id}`."
 
     # -- /memory_promote (#2004) -----------------------------------------------
@@ -3414,3 +3431,11 @@ class MatrixTurnRunner:
 
     async def stop_idle(self, job: Mapping[str, Any]) -> bool:
         return await self._bot.stop_idle(job)
+
+    async def turn_closed(self, job: Mapping[str, Any]) -> None:
+        """Transport hook: the turn ended and its reply row is queued (#2088)."""
+        await self._bot._wait_status_turn_closed(job)
+
+    async def delivered(self, job: Mapping[str, Any]) -> None:
+        """Transport hook: one outbox row was delivered (#2088)."""
+        await self._bot._wait_status_delivered(job)

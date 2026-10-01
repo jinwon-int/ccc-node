@@ -110,6 +110,29 @@ async def test_waits_commands_are_owner_only(tmp_path: Path, matrix_config: dict
     assert chat.calls == []
 
 
+async def test_cancelwait_refreshes_the_waits_status_message(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    """Owner cancellation has no wake: the command itself edits the status (#2088)."""
+    from telegram_bot.core.matrix.bot import MatrixTurnRunner
+    from test_matrix_wait_status import StatusTransport
+
+    bot, _chat, _manager = _bot(tmp_path)
+    transport = StatusTransport()
+    bot._transport = transport
+    bot._job_identity(_job("hi"), "direct")
+    owner = bot.ids.user_id(OWNER)
+    mine = _register(bot, user=OWNER, sha=SHA_A, summary="mine")
+    await bot._sync_external_wait_status(owner, owner)
+    event = transport.deliver("$notice-1")
+    await MatrixTurnRunner(bot).delivered({"event_id": "$notice-1"})
+
+    assert await _say(bot, f"/cancelwait {mine}") == f"Cancelled external wait `{mine}`."
+    assert transport.edits[-1][:2] == (DM_ROOM, event)
+    assert transport.edits[-1][2].startswith("🚫 cancelled by owner · PR #1998 CI")
+    # A refused cancel touches nothing.
+    assert await _say(bot, f"/cancelwait {mine}") == f"No active external wait with id `{mine}`."
+    assert len(transport.edits) == 1
+
+
 def test_telegram_and_matrix_share_one_renderer() -> None:
     from telegram_bot.core.bot_commands import BotCommandMixin
 

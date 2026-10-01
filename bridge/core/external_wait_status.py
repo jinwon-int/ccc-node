@@ -9,11 +9,11 @@ the owner has to run ``/waits`` to find out. This module projects the route's
 non-terminal waits into ONE status message that is sent once, edited as waits
 finish, and deleted when nothing is left to show.
 
-Channel-neutral by design: the renderer and the id store know nothing about
-Telegram. The Telegram wiring lives in :mod:`telegram_bot.core.bot_wait_status`;
-Matrix is a follow-up (its outbox sends currently return no event id, so a
-Matrix store entry cannot be created yet — the renderer and the store are
-ready for it once that lands).
+Channel-neutral by design: the renderer, the planner and the id store know
+nothing about a chat network. The Telegram projection lives in
+:mod:`telegram_bot.core.bot_wait_status` (stage 1, #2081) and the Matrix one
+in :mod:`telegram_bot.core.matrix.wait_status` (stage 2, #2088); both share
+the flag, the startup route selection and the plan below.
 
 Body-free by contract: the store holds message ids and a text hash, never the
 wait summary; the rendered summary passes through credential redaction.
@@ -42,6 +42,7 @@ from telegram_bot.core.external_wait import (
     conversation_key_of,
     validate_summary,
 )
+from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor
 from telegram_bot.utils.redaction import redact_credentials
 from telegram_bot.utils.secure_fs import (
     SessionStoreDurabilityError,
@@ -49,6 +50,11 @@ from telegram_bot.utils.secure_fs import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: One flag for every channel projection (default on; ``false`` disables).
+STATUS_ENV_FLAG = "CCC_EXTERNAL_WAIT_STATUS"
+#: Startup reconcile touches at most this many routes (one channel call each).
+MAX_RECONCILE_ROUTES = 50
 
 #: Terminal outcomes younger than this still appear on the message; older
 #: ones are dropped (and an all-stale message is deleted).
@@ -73,6 +79,11 @@ _TERMINAL_LINE = {
     TERMINAL_MONITOR_ERROR: "⚠️ CI watch failed",
     TERMINAL_OWNER_CANCEL: "🚫 cancelled by owner",
 }
+
+
+def status_enabled() -> bool:
+    """Whether the status projection is on (``CCC_EXTERNAL_WAIT_STATUS``, default true)."""
+    return ExternalWaitMonitor.env_flag(STATUS_ENV_FLAG, default=True)
 
 
 def default_status_store_path(home: Path) -> Path:
@@ -220,6 +231,32 @@ def plan_status_update(
     return "edit", text
 
 
+def reconcile_routes(
+    store_entries: Dict[str, Dict[str, Any]], records: Iterable[Dict[str, Any]]
+) -> List[Tuple[int, int]]:
+    """Routes a restart has to look at, stored messages first (unbounded; callers cap).
+
+    A stored entry may now be stale (waits finished while the bridge was
+    down) and a monitoring wait may have no message at all (the run died
+    between register and turn end). Malformed entries are skipped.
+    """
+    routes: Dict[str, Tuple[int, int]] = {}
+    for key, entry in store_entries.items():
+        try:
+            routes[key] = (int(entry.get("user_id")), int(entry.get("chat_id")))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+    for rec in records:
+        if rec.get("state") != STATE_MONITORING:
+            continue
+        try:
+            uid, cid = int(rec.get("user_id")), int(rec.get("chat_id"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        routes.setdefault(conversation_key_of(uid, cid), (uid, cid))
+    return list(routes.values())
+
+
 # --- durable id store ------------------------------------------------------------
 
 
@@ -310,13 +347,17 @@ class ExternalWaitStatusStore:
 
 
 __all__ = [
+    "MAX_RECONCILE_ROUTES",
     "MAX_STATUS_LINES",
     "RECENT_TERMINAL_SECONDS",
+    "STATUS_ENV_FLAG",
     "ExternalWaitStatusStore",
     "WaitStatusAction",
     "default_status_store_path",
     "plan_status_update",
+    "reconcile_routes",
     "records_for_route",
     "render_wait_status",
+    "status_enabled",
     "text_hash_of",
 ]

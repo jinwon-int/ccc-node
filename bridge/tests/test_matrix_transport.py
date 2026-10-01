@@ -2749,3 +2749,148 @@ async def test_captionless_current_media_preserves_trusted_original_caption(tmp_
         assert job is not None and caption in job["body"]
         assert json.loads(job["attachment"])["captioned"] is True
         assert bool(job["reply_attachment"]) is media_parent
+
+
+
+# --------------------------------------------------------------------------- #
+# Bot-authored notice upkeep: event id record, edit/redact, runner hooks (#2088)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_delivered_notice_records_its_first_event_id_and_fires_the_hook(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        outbox_ready(f)
+        events = iter(["$first", "$second", "$third"])
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            return {"event_id": next(events)}
+
+        f.raw = raw
+        delivered: list[str] = []
+
+        async def hook(job: Any) -> None:
+            delivered.append(job["event_id"])
+
+        h.runner.delivered = hook  # type: ignore[attr-defined]
+        row = f.enqueue_notice(room, "a" * 12_000 + "b" * 100)  # two parts
+        assert f.notice_event(row) == ("pending", None)
+        assert f.notice_event("$notice-unknown") == ("gone", None)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
+            h.start(f.retry(f.send))
+            await h.until(lambda: not f.store.outbox() and bool(delivered))
+        # The row keeps the event that starts it, not its last part.
+        assert f.notice_event(row) == ("sent", "$first")
+        assert delivered == [row]
+
+
+@pytest.mark.anyio
+async def test_a_row_whose_parts_were_all_rejected_reports_gone(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        outbox_ready(f)
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            raise t.MatrixHTTPError(400, "M_BAD_JSON")
+
+        f.raw = raw
+        row = f.enqueue_notice(room, "rejected")
+        assert await f._deliver(f.store.outbox()[0]) is True
+        assert f.notice_event(row) == ("gone", None)
+
+
+def test_store_migrates_the_sent_event_column(tmp_path: Path) -> None:
+    directory = tmp_path / "state"
+    with MatrixStore(directory, "@bot:test.invalid") as store:
+        store.db.execute("ALTER TABLE jobs DROP COLUMN sent_event")  # a pre-#2088 inbox
+    with MatrixStore(directory, "@bot:test.invalid") as store:
+        columns = {row[1] for row in store.db.execute("PRAGMA table_info(jobs)")}
+        assert "sent_event" in columns
+        assert store.sent_event("$missing") == (None, None)
+    with MatrixStore(directory, "@bot:test.invalid") as store:  # idempotent on reopen
+        assert "sent_event" in {row[1] for row in store.db.execute("PRAGMA table_info(jobs)")}
+
+
+@pytest.mark.anyio
+async def test_turn_closed_hook_runs_after_the_reply_row_is_ready(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        seen: list[tuple[str, list[str]]] = []
+
+        async def turn_closed(job: Any) -> None:
+            seen.append((job["event_id"], [row["reply"] for row in f.store.outbox()]))
+
+        h.runner.turn_closed = turn_closed  # type: ignore[attr-defined]
+        await f.input(request(f))
+        h.work()
+        await h.until(lambda: bool(seen))
+        assert seen == [("$request", ["synthetic answer"])]
+
+
+@pytest.mark.anyio
+async def test_runner_hook_failures_are_swallowed(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        calls: list[str] = []
+
+        async def turn_closed(job: Any) -> None:
+            calls.append(job["event_id"])
+            raise RuntimeError("synthetic hook failure")
+
+        h.runner.turn_closed = turn_closed  # type: ignore[attr-defined]
+        await f.input(request(f))
+        work = h.work()
+        await h.until(lambda: bool(calls) and not f.background)
+        assert not work.done() and h.replies() == ["synthetic answer"]
+
+
+@pytest.mark.anyio
+async def test_edit_and_redact_notice(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        outbox_ready(f)
+        paths: list[str] = []
+        failure: dict[str, Any] = {"exc": None}
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            paths.append(path)
+            if failure["exc"] is not None:
+                raise failure["exc"]
+            return {"event_id": "$edit"} if "/send/" in path else {}
+
+        f.raw = raw
+        assert await f.edit_notice(room, "$status", "✅ CI green → continuing") is True
+        edit = sent_bodies(f)[-1]
+        assert edit["m.relates_to"] == {"rel_type": "m.replace", "event_id": "$status"}
+        assert edit["m.new_content"]["body"] == "✅ CI green → continuing"
+        # Each attempt gets its own txn so A -> B -> A is never deduplicated.
+        assert await f.edit_notice(room, "$status", "✅ CI green → continuing") is True
+        assert paths[0] != paths[1]
+
+        assert await f.redact_notice(room, "$status") is True
+        assert "/redact/" in paths[-1]
+
+        # A permanent 4xx means the event cannot be edited/redacted: False.
+        failure["exc"] = t.MatrixHTTPError(404, "M_NOT_FOUND")
+        assert await f.edit_notice(room, "$status", "x") is False
+        assert await f.redact_notice(room, "$status") is False
+        # 401/403 and transient errors raise for the caller's retry.
+        failure["exc"] = t.MatrixHTTPError(403, "M_FORBIDDEN")
+        with pytest.raises(t.MatrixHTTPError):
+            await f.redact_notice(room, "$status")
+        failure["exc"] = ConnectionError("matrix-temporary-error")
+        with pytest.raises(ConnectionError):
+            await f.edit_notice(room, "$status", "x")
+
+        # A muted room holds edits (encrypted content) but not redactions.
+        failure["exc"] = None
+        f.blocked.add(room)
+        calls_before = len(paths)
+        with pytest.raises(ConnectionError, match="room-muted"):
+            await f.edit_notice(room, "$status", "x")
+        assert len(paths) == calls_before
+        assert await f.redact_notice(room, "$status") is True

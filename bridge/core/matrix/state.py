@@ -1001,6 +1001,11 @@ class Store:
                     self._db.execute("ALTER TABLE jobs ADD COLUMN attachment TEXT")
                 if "reply_attachment" not in columns:
                     self._db.execute("ALTER TABLE jobs ADD COLUMN reply_attachment TEXT")
+                # #2088: the Matrix event id an outbox row's first part became,
+                # so a bot-authored notice can be edited/redacted later. Older
+                # rows (and rows never sent) keep NULL.
+                if "sent_event" not in columns:
+                    self._db.execute("ALTER TABLE jobs ADD COLUMN sent_event TEXT")
                 # A crashed attachment turn also forgets its decryption keys.
                 self._db.execute("UPDATE jobs SET state='uncertain',attachment=NULL,reply_attachment=NULL WHERE state='running'")
         except BaseException:
@@ -1422,9 +1427,29 @@ class MatrixStore(Store):
         row = self.db.execute("SELECT part FROM deliveries WHERE event_id=?", (event,)).fetchone()
         return int(row[0]) if row else 0
 
-    def mark_part(self, event: str, part: int) -> None:
+    def mark_part(self, event: str, part: int, sent_event: str | None = None) -> None:
+        """Advance ``event``'s delivered part count; remember the first sent event id.
+
+        ``sent_event`` (#2088) is recorded in the same transaction as the part
+        acknowledgement and only while the row has none yet, so the row keeps
+        the id of the event that starts it. A crash before this commit resends
+        the part under the same transaction id, which the homeserver answers
+        with the same event id.
+        """
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO deliveries VALUES (?,?)", (event, part))
+            if sent_event:
+                self.db.execute(
+                    "UPDATE jobs SET sent_event=? WHERE event_id=? AND sent_event IS NULL",
+                    (bounded_text(sent_event, 255), event),
+                )
+
+    def sent_event(self, event: str) -> tuple[str | None, str | None]:
+        """``(state, matrix event id)`` of one outbox row; ``(None, None)`` if unknown (#2088)."""
+        row = self.db.execute("SELECT state,sent_event FROM jobs WHERE event_id=?", (event,)).fetchone()
+        if row is None:
+            return None, None
+        return str(row["state"]), (str(row["sent_event"]) if row["sent_event"] else None)
 
     def skip_part(self, event: str, index: int, status: int, errcode: str) -> None:
         """Record part ``index`` (0-based) as rejected and move past it in one transaction."""

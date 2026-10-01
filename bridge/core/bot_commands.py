@@ -51,6 +51,7 @@ from telegram_bot.core.project_chat_types import (
     StatusCallback,
 )
 from telegram_bot.core.task_queue import UserTaskQueue
+from telegram_bot.core.bot_wait_status import refresh_wait_status
 from telegram_bot.core.bot_ports import (
     AccessControlConfigPort,
     ClearUserQueueFn,
@@ -362,12 +363,12 @@ class BotCommandMixin:
         if cancelled and record is not None:
             # Owner cancellation has no wake, so refresh the wait's own route
             # status here (#2081; the composed bot carries the mixin).
-            sync_status = getattr(self, "_sync_external_wait_status", None)
-            if callable(sync_status):
-                try:
-                    await sync_status(int(record["user_id"]), int(record["chat_id"]))
-                except Exception:
-                    logger.debug("External-wait status sync after /cancelwait failed")
+            try:
+                route = (int(record["user_id"]), int(record["chat_id"]))
+            except (KeyError, TypeError, ValueError):
+                route = None
+            if route is not None:
+                await refresh_wait_status(self, *route)
 
     async def _cmd_skills(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):
@@ -416,6 +417,9 @@ class BotCommandMixin:
         # full /skills listing exceeds limit → "Message is too long" error.
         await self._reply_smart(message, response.content, parse_mode="HTML", user_id=user_id)
         log_debug(user_id, "bot", response.content)
+        # Same as the main message path (#2081): a turn that ends with CI
+        # waits still registered shows the route's status after its reply.
+        await refresh_wait_status(self, user_id, chat.id)
 
     async def _cmd_new(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):
@@ -1350,6 +1354,7 @@ class BotCommandMixin:
                 streamed=response.streamed,
                 user_id=user_id,
             )
+            await refresh_wait_status(self, user_id, chat.id)
             # #1690: /task_resume bypassed the recovery offer that normal
             # messages get — a failed native resume ended with the failure
             # text and no continue/new-task buttons. The shared helper runs
@@ -2050,6 +2055,7 @@ class BotCommandMixin:
                 streamed=response.streamed,
                 user_id=user_id,
             )
+            await refresh_wait_status(self, user_id, chat.id)
 
         async def on_overflow():
             reply = "⏳ Processing previous messages, please wait or send /stop to terminate."
@@ -2108,6 +2114,7 @@ class BotCommandMixin:
                     streamed=response.streamed,
                     user_id=user_id,
                 )
+                await refresh_wait_status(self, user_id, chat.id)
             except Exception as e:
                 logger.error(f"Skill execution failed: {e}", exc_info=True)
                 await message.reply_text(f"❌ Execution failed: {str(e)}")
