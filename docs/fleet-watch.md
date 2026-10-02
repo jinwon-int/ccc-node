@@ -35,6 +35,13 @@ after the reviewed fix is integrated into the normal checkout.
   `meta.health` sync state in the read-only SQLite store named by its config.
   Missing, stale or ambiguous evidence is `UNVERIFIED`. Matrix rows carry
   `channel=matrix`; Telegram rows retain their existing format.
+  The health snapshot keeps `service.state=degraded` from one failed agent
+  turn until the next turn succeeds, which on a quiet room can be days
+  (ccc-node#2098). When that degraded state is explained only by an agent
+  failure older than `--stale-error-secs` (default 3600) with no later
+  success, and the sync store is `ready`, the row is `OK reason=degraded-stale-error`
+  instead of `DEGRADED`; a failure inside the window, a different service
+  reason, or a transport retry still reports `DEGRADED`.
 - **Runtime source:** read from the worker, or its parent supervisor. Prepared
   launches must bind worker UID, parent PID, project path and interpreter to
   that supervisor. Another project's supervisor cannot supply the source.
