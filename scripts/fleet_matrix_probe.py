@@ -14,8 +14,8 @@ from urllib.parse import quote
 
 # A bridge health snapshot keeps `service.state == "degraded"` from the moment
 # an agent turn fails until the next turn succeeds. On a quiet channel that can
-# be days (nosuk, 2026-10-02: one danso timeout at 09:09 KST pinned the daily
-# 09:00 watch for as long as nobody wrote to the room; ccc-node#2098). Once the
+# be days (2026-10-02: one provider timeout minutes after the daily watch pinned
+# a node as DEGRADED until someone wrote to its room; ccc-node#2098). Once the
 # failure is older than this and the transport (sync DB) is ready, the node is
 # reported OK with the reason `degraded-stale-error` instead of DEGRADED — a
 # *new* failure inside the window is still DEGRADED, and a transport problem
