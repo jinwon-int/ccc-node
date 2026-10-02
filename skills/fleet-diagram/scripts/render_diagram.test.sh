@@ -3,8 +3,8 @@
 # Covers the three spec kinds, SVG content, PNG when Pillow is importable
 # (skipped otherwise), fail-closed exits on bad specs, name sanitisation and
 # the --format contract. No network, private output dir.
-set -uo pipefail
 # shellcheck disable=SC2034  # test variables are read inside the eval'd ok() conditions
+set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 R="$DIR/render_diagram.py"
 pass=0; fail=0
@@ -84,5 +84,5 @@ PY
 python3 "$R" --spec "$TMP/long.json" --out "$TMP/out" --name long --format svg >/dev/null
 ok "a 200-char label is truncated with an ellipsis" 'grep -q "rrrr…" "$TMP/out/long.svg" && ! grep -q "$(printf "r%.0s" $(seq 1 100))" "$TMP/out/long.svg"'
 
-echo "render_diagram: $pass passed, $fail failed (pillow=$has_pil)"
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
