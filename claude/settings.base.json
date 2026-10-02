@@ -54,6 +54,12 @@
           },
           {
             "type": "command",
+            "command": "bash /root/.claude/hooks/report-style-canary.sh SessionStart",
+            "timeout": 5,
+            "statusMessage": "Checking report-style canary flag (#2109)..."
+          },
+          {
+            "type": "command",
             "command": "bash /root/.claude/hooks/distill/pending-drain.sh >/dev/null 2>&1 &",
             "timeout": 5,
             "statusMessage": "Recovering pending memory distills (background)..."
@@ -87,6 +93,12 @@
             "command": "bash /root/.claude/hooks/load-memory.sh PostCompact",
             "timeout": 15,
             "statusMessage": "Re-injecting node memory after compaction..."
+          },
+          {
+            "type": "command",
+            "command": "bash /root/.claude/hooks/report-style-canary.sh PostCompact",
+            "timeout": 5,
+            "statusMessage": "Re-injecting report-style canary rule (#2109)..."
           },
           {
             "type": "command",
