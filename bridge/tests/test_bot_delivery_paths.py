@@ -289,6 +289,23 @@ class ResolvePathsExtensionTests(unittest.TestCase):
 
         self.assertEqual(sorted(resolved), sorted(names))
 
+    def test_html_is_a_deliverable_only_under_an_artifacts_directory(self):
+        # #2109 C: a generated single-file HTML report under …/artifacts/… is
+        # sent like a document; web source elsewhere (public/index.html) is
+        # not pushed every reply.
+        tmpdir = Path(tempfile.mkdtemp())
+        (tmpdir / "artifacts" / "nested").mkdir(parents=True)
+        (tmpdir / "public").mkdir()
+        report = tmpdir / "artifacts" / "fleet-matrix.html"
+        nested = tmpdir / "artifacts" / "nested" / "cost.htm"
+        source = tmpdir / "public" / "index.html"
+        for p in (report, nested, source):
+            p.write_text("<!doctype html>", encoding="utf-8")
+        content = f"report at {report}, also {nested}; I edited {source} and artifacts.html"
+        (tmpdir / "artifacts.html").write_text("x", encoding="utf-8")
+
+        self.assertEqual(sorted(self._resolve(tmpdir, content)), ["cost.htm", "fleet-matrix.html"])
+
     def test_source_code_files_are_not_auto_sent(self):
         # Files an ordinary coding turn edits must not be pushed every reply.
         tmpdir = Path(tempfile.mkdtemp())

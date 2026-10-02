@@ -72,6 +72,19 @@ def test_deliverable_paths_follow_the_telegram_rule(tmp_path: Path) -> None:
     assert deliverables.resolve_deliverable_paths(text, tmp_path, max_bytes=3) == []
 
 
+def test_html_reports_are_deliverables_only_under_artifacts(tmp_path: Path) -> None:
+    # #2109 C — shared rule, so Matrix inherits it unchanged.
+    (tmp_path / "artifacts").mkdir()
+    (tmp_path / "site").mkdir()
+    report = tmp_path / "artifacts" / "fleet-matrix.html"
+    report.write_text("<!doctype html>")
+    page = tmp_path / "site" / "index.html"
+    page.write_text("<!doctype html>")
+    text = f"report: {report} (edited {page} too)"
+    assert deliverables.resolve_deliverable_paths(text, tmp_path, max_bytes=100) == [report.resolve()]
+    assert "html" in deliverables.ARTIFACT_ONLY_EXTENSIONS and "html" not in deliverables.SENDABLE_FILE_EXTENSIONS
+
+
 def test_telegram_keeps_the_shared_rule() -> None:
     from telegram_bot.core.bot import TelegramBot
 
