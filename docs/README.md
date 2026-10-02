@@ -10,6 +10,7 @@ Living operator docs stay at the top level of `docs/`; historical closeouts and 
 | [`doctor.md`](doctor.md) | Doctor diagnostics, guarded repair, rollback, fleet matrix. |
 | [`security-audit.md`](security-audit.md) | Read-only security audit and fleet matrix reporting. |
 | [`agent-cron.md`](agent-cron.md) | Durable local task definitions, due/lock/run/scheduler commands. |
+| [`a2a-broker-worker-watch.md`](a2a-broker-worker-watch.md) | Broker-side worker staleness watch: pages long-stale A2A workers from `GET /workers` (#2086). |
 | [`skill-autosave.md`](skill-autosave.md) | Hermes-style auto-skillification: skill-review hook, daily sweep cron, Telegram approval flow. |
 | [`skill-registry.md`](skill-registry.md) | Generated single registry over all repo skill sources; CI-enforced freshness; lifecycle `status` field (#1338). |
 | [`skill-listing-budget.md`](skill-listing-budget.md) | Deterministic skill-listing budget: core + recently used skills keep descriptions, the rest `name-only` via owned `skillOverrides` (#2011). |
