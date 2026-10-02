@@ -68,8 +68,9 @@ ok "a missing rule file keeps the hook silent and exit 0" '[ "$rc" = 0 ] && [ -z
 
 # 6. distill subprocess guard
 cp "$HERE/lib/report-style-ste.txt" "$CCC_HOOK_DIR/lib/report-style-ste.txt"
+out="$(CLAUDE_DISTILL_INFLIGHT=1 run_hook SessionStart)"
 # shellcheck disable=SC2034  # rc is read inside the eval'd ok() condition
-out="$(CLAUDE_DISTILL_INFLIGHT=1 run_hook SessionStart)"; rc=$?
+rc=$?
 ok "distill subprocesses get nothing" '[ "$rc" = 0 ] && [ -z "$out" ]'
 
 echo "report-style-canary: $pass passed, $fail failed"
