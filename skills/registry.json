@@ -252,18 +252,18 @@
       "name": "gh-ci-wait",
       "source": "skills/gh-ci-wait",
       "status": "active",
-      "tree_sha256": "fdb704aa1a67bf7e718d385c78f511836932b04427c4b66da74b676a4f15b796"
+      "tree_sha256": "0c591a31ebcbff36f0dc705bd18251d6a5ba4821438c76a49a14e8acc2966111"
     },
     {
       "audience": "claude",
       "classification": "adapted",
       "description": "Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. PR-first — exact-head green checks, cross-account review (jinon86/seoseo-ai via relay) after fresh user approval, squash merge, cleanup. Not for Wiki edits (wiki-record).",
-      "files": 5,
+      "files": 7,
       "managed": false,
       "name": "gh-pr-flow",
       "source": "skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "c775e2e466d391b792ebf4f65d384c66ec187386005ba4a9dcbd60ad8172b04a"
+      "tree_sha256": "2c188b3a61bffe806a42faa10858ea9a1c79281917b91a24fef503081cc95767"
     },
     {
       "audience": "claude",

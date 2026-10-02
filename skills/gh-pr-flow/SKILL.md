@@ -278,7 +278,16 @@ so the account name is not an identity.
      allowed for this repository` — match it loosely, since GitHub does not
      document the string and a configured merge queue can produce it too.
      Enabling the setting is a repository-settings change and a separate
-     approval; without it, poll and merge in the foreground instead.
+     approval; without it, watch and merge in the foreground instead — with
+     `ci-watch.sh` (below), not a hand-rolled loop.
+   - **Watching checks without the bridge wait**: when `gh-ci-wait`
+     registration fails (`route-unavailable`), run
+     `bash "$HOME/.claude/skills/gh-pr-flow/ci-watch.sh" --repo <owner/repo> --pr <n> --head <sha>`
+     in the background and branch on its exit code (`0` green · `10` failed,
+     names the checks · `11` merged · `12` closed · `13` head moved · `20`
+     timeout). It derives the verdict inside jq; two ad-hoc loops on
+     2026-10-02 grepped `gh --jq` output for a key order gh never produces
+     and silently missed "green" twice (#2113, #2120).
    - `gh pr update-branch` only does something when the head is genuinely
      behind. Gate it on `viewerCanUpdateBranch`, which GitHub documents as
      `false` when the head is already up to date. The REST endpoint answers

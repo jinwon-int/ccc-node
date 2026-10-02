@@ -76,7 +76,23 @@ do not work around it.
 ## If registration fails (rc != 0)
 
 Never claim auto-resume anyway. Either:
-1. keep a **foreground** watch instead (`gh pr checks <n> --watch`), or
+1. run the deterministic watcher in the background and act on its exit code
+   — never a hand-rolled `until … grep` loop:
+
+   ```bash
+   # ci-watch.sh ships with the gh-pr-flow skill; <skills-dir> is the directory
+   # this skill was installed into (the runtime's skills root).
+   bash "<skills-dir>/gh-pr-flow/ci-watch.sh" --repo <owner/repo> --pr <n> --head <exact-head-sha>
+   # 0 green · 10 failed (names the checks) · 11 merged · 12 closed · 13 head moved · 20 timeout
+   ```
+
+   Two ad-hoc loops on 2026-10-02 never reported "green": their exit test
+   grepped `'"pending":0,"bad":0,"total":N'` in `gh --jq` output, but gh
+   sorts object keys alphabetically, so the pattern could not occur and the
+   loops reacted to FAILED/MERGED only (#2113, #2120 — the operator noticed
+   first). `ci-watch.sh` computes one verdict word inside jq and pins the
+   head, so a newer push ends the watch as `superseded` instead of reporting
+   a stale rollup. Or
 2. say plainly that auto-resume is unavailable and the user should ping you
    when CI ends.
 
