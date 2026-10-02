@@ -449,6 +449,68 @@ class OverBudgetReportTests(PolicyCase):
         self.assertNotIn("WARNING", proc.stdout)
 
 
+class ContextWindowTests(PolicyCase):
+    """The budget follows the settings.json model's context window unless overridden."""
+
+    def plan(self, *args: str, env: dict | None = None) -> dict:
+        proc = self.run_cli("plan", "--json", *args, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_model_mapping(self) -> None:
+        mod = load_module(SCRIPT, "ccc_skill_listing_policy_ctx")
+        one_m, k200 = 1_000_000, 200_000
+        cases = {
+            "claude-fable-5-1": one_m, "claude-fable-5": one_m, "claude-mythos-5-1": one_m,
+            "claude-opus-5-5": one_m, "claude-opus-5": one_m, "claude-opus-4-8": one_m,
+            "claude-opus-4-6": one_m, "claude-sonnet-5": one_m, "claude-sonnet-4-6": one_m,
+            "us.anthropic.claude-opus-5": one_m, "claude-opus-4-5[1m]": one_m,
+            "opus": one_m, "sonnet": one_m, "fable": one_m, "opusplan": one_m, "Opus": one_m,
+            "claude-opus-4-5": k200, "claude-opus-4-5-20251101": k200,
+            "claude-sonnet-4-20250514": k200, "claude-opus-4-1": k200,
+            "claude-haiku-4-5": k200, "haiku": k200,
+            "default": None, "gpt-5": None, "": None, None: None, 42: None,
+        }
+        for model, want in cases.items():
+            self.assertEqual(mod.context_tokens_for_model(model), want, model)
+
+    def test_plan_uses_model_window(self) -> None:
+        self.write_settings({"model": "claude-fable-5-1"})
+        plan = self.plan()
+        self.assertEqual(plan["context_tokens"], 1_000_000)
+        self.assertEqual(plan["context_source"], "model claude-fable-5-1")
+        self.assertEqual(plan["after"]["budget_chars"], int(0.02 * 1_000_000 * 4))
+
+    def test_unknown_or_missing_model_keeps_200k(self) -> None:
+        for doc, source in (({"model": "claude-haiku-4-5"}, "model claude-haiku-4-5"),
+                            ({"model": "default"}, "default (model 'default' not recognised)"),
+                            ({"theme": "dark"}, "default (no model in settings)")):
+            self.write_settings(doc)
+            plan = self.plan()
+            self.assertEqual(plan["context_tokens"], 200_000, doc)
+            self.assertEqual(plan["context_source"], source, doc)
+            self.assertEqual(plan["after"]["budget_chars"], int(0.02 * 200_000 * 4), doc)
+
+    def test_env_and_flag_override_model(self) -> None:
+        self.write_settings({"model": "claude-opus-5-5"})
+        plan = self.plan(env={"CCC_SKILL_LISTING_CONTEXT_TOKENS": "300000"})
+        self.assertEqual((plan["context_tokens"], plan["context_source"]),
+                         (300_000, "env CCC_SKILL_LISTING_CONTEXT_TOKENS"))
+        plan = self.plan("--context-tokens", "250000",
+                         env={"CCC_SKILL_LISTING_CONTEXT_TOKENS": "300000"})
+        self.assertEqual((plan["context_tokens"], plan["context_source"]),
+                         (250_000, "--context-tokens"))
+
+    def test_text_plan_and_apply_name_the_source(self) -> None:
+        self.write_settings({"model": "claude-opus-5-5"})
+        proc = self.run_cli("plan", "--summary")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("context window: 1000k (model claude-opus-5-5)", proc.stdout)
+        proc = self.apply()
+        self.assertIn("context window: 1000k (model claude-opus-5-5)", proc.stdout)
+        self.assertEqual(self.apply("--quiet").stdout.count("\n"), 1)
+
+
 class RepoCoreDescriptionTests(unittest.TestCase):
     """Core skills are described on every turn: keep them short and trigger-first."""
 
