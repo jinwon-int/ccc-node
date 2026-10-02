@@ -34,9 +34,11 @@ sys.modules[SPEC.name] = promotion
 SPEC.loader.exec_module(promotion)
 
 
-def envelope(node: str, name: str, created_at: str) -> dict:
+def envelope(
+    node: str, name: str, created_at: str, *,
+    description: str = "Use when testing fair candidate admission across collector sources",
+) -> dict:
     """A minimal envelope that survives `_candidate_from_envelope`."""
-    description = "a fixture skill description long enough to pass validation"
     body = (
         "---\n"
         f"name: {name}\n"
@@ -95,7 +97,7 @@ class CollectFairnessTests(unittest.TestCase):
         self.enterContext(patch.object(promotion, "_pending_envelopes", return_value=[]))
         self.enterContext(patch.object(
             promotion, "_remote_envelopes",
-            side_effect=lambda node, *, limit: self.remote[node][:limit]))
+            side_effect=lambda node, *, limit, blocked=None: self.remote[node][:limit]))
 
     def published_nodes(self):
         """The nodes whose envelopes actually reach a PR in one run."""
@@ -116,7 +118,7 @@ class CollectFairnessTests(unittest.TestCase):
         self.assertEqual(len(set(first_round)), 3, nodes)
 
     def test_starved_node_is_reached_when_an_earlier_node_fails(self):
-        def explode(node, *, limit):
+        def explode(node, *, limit, blocked=None):
             if node == "deep":
                 raise promotion.PromotionError("remote_export_failed")
             return self.remote[node][:limit]
@@ -225,7 +227,7 @@ class LocalBudgetFairnessTests(unittest.TestCase):
         }
         self.remote_limits: dict[str, int] = {}
 
-        def fake_remote(node, *, limit):
+        def fake_remote(node, *, limit, blocked=None):
             self.remote_limits[node] = limit
             return self.remote[node][:limit]
 
@@ -337,7 +339,7 @@ class CollectRunRotationTests(unittest.TestCase):
                                        side_effect=lambda config, record: self.ledger.append(record)))
 
     # -- stub edges ---------------------------------------------------------
-    def _remote(self, node, *, limit):
+    def _remote(self, node, *, limit, blocked=None):
         return self.remote[node][:limit]
 
     def _remote_ack(self, node, transport_id):
@@ -378,6 +380,44 @@ class CollectRunRotationTests(unittest.TestCase):
         return json.loads(self.cursor_path.read_text())
 
     # -- rotation -----------------------------------------------------------
+    def test_export_skips_legacy_head_without_mutation_or_starving_same_node(self):
+        self.config.collect_nodes = ()
+        invalid = envelope("publisher", "legacy-skill", "2026-08-01T00:00:00Z",
+                           description="Audit a shared interface for consistency.")
+        path = self.outbox / f"{invalid['transport_id']}.json"
+        path.write_text(json.dumps(invalid))
+        path.chmod(0o600)
+        self.stage_local("valid-skill", "2026-08-02T00:00:00Z")
+        before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.outbox.iterdir()}
+        result = promotion._export_result(self.config, limit=1)
+        self.assertEqual([r["name"] for r in result["envelopes"]], ["valid-skill"])
+        self.assertEqual(result["blocked"], [{"name": "legacy-skill", "code": "description_trigger_missing"}])
+        self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns)
+                                  for p in self.outbox.iterdir()})
+        self.assertFalse(list(self.sent.iterdir()))
+        result = self.collect()
+        self.assertFalse(result["ok"])
+        self.assertEqual([r["name"] for r in result["published"]], ["valid-skill"])
+        self.assertEqual(path.read_bytes(), before[path.name][0])
+        self.assertFalse(any(tid == invalid["transport_id"] for _, tid in self.acked))
+
+    def test_triggerless_legacy_envelope_is_preserved_and_does_not_block_peers(self):
+        invalid = envelope("deep", "legacy-skill", "2026-08-01T00:00:00Z",
+                           description="Audit a shared interface for consistency.")
+        self.remote["deep"] = [invalid]
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                result = self.collect(dry_run=dry_run)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["errors"], [{"source": "deep", "name": "legacy-skill",
+                                                    "code": "description_trigger_missing"}])
+                self.assertEqual([r["source"] for r in result["published"]], ["starved"])
+                self.assertEqual(self.remote["deep"], [invalid])
+                self.assertFalse(any(source == "deep" for source, _ in self.acked))
+                if dry_run:
+                    self.assertFalse(self.acked)
+                    self.assertFalse(self.cursor_path.exists())
+
     def test_missing_cursor_starts_at_the_canonical_first_source(self):
         self.stage_local("local-skill-a", "2026-08-01T00:00:00Z")
         result = self.collect()
@@ -431,7 +471,7 @@ class CollectRunRotationTests(unittest.TestCase):
         self.assertEqual(heads, ["local", "starved"])
 
     def test_failed_remote_export_does_not_starve_the_rest(self):
-        def explode(node, *, limit):
+        def explode(node, *, limit, blocked=None):
             if node == "deep":
                 raise promotion.PromotionError("remote_export_failed")
             return self.remote[node][:limit]
@@ -718,7 +758,7 @@ else:
                          ["existing-pr", "existing-pr"])
 
     def test_wrong_node_envelope_is_a_per_source_error_not_a_crash(self):
-        def liar(node, *, limit):
+        def liar(node, *, limit, blocked=None):
             if node != "deep":
                 return self.remote[node][:limit]
             # Self-consistent envelope claiming a different node than the SSH
@@ -734,7 +774,7 @@ else:
                          [])
 
     def test_malformed_remote_envelope_is_a_per_source_error(self):
-        def garbage(node, *, limit):
+        def garbage(node, *, limit, blocked=None):
             return [{"schema_version": 1, "not": "an envelope"}]
 
         self.enterContext(patch.object(promotion, "_remote_envelopes", side_effect=garbage))

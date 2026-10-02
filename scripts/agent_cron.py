@@ -1269,6 +1269,9 @@ _OWNER_REDACTION_HARDENING = (
 # exactly the non-canonical nodes it was reporting on.
 _OWNER_LONG_RUN_MIN = 24
 _OWNER_LONG_TOKEN_RUN = re.compile(r'[A-Za-z0-9_./+=-]{%d,}' % _OWNER_LONG_RUN_MIN)
+# Fixed public diagnostic vocabulary only; never exempt arbitrary snake_case.
+# Credential/assignment redaction still runs before this exact-token exception.
+_OWNER_DIAGNOSTIC_CODES = frozenset({"description_trigger_missing"})
 
 # Absolute paths anchored at a real filesystem root. Three constraints keep this
 # from becoming a smuggling channel:
@@ -1305,6 +1308,8 @@ def _mask_long_token_run(match, marker):
     short would never have been masked on its own.
     """
     run = match.group(0)
+    if run in _OWNER_DIAGNOSTIC_CODES:
+        return run
     pieces = []
     cursor = 0
     for path in _OWNER_SAFE_PATH.finditer(run):
@@ -1433,15 +1438,18 @@ def build_owner_text(task_id, run_id, scheduled_at, status, headless):
     stdout = stdout.strip()
     stderr = stderr.strip()
     lines = [
-        title or f"agent-cron task {task_id} finished with status={status}",
+        title or f"agent-cron task {task_id} finished with execution status={status}",
         f"scheduledAt={scheduled_at or ''}",
         f"runId={run_id}",
         f"exitCode={(headless or {}).get('exitCode', '')}",
     ]
     if stdout:
-        lines.append('stdout: ' + stdout.replace('\n', ' ')[:900])
-    if stderr:
-        lines.append('stderr: ' + stderr.replace('\n', ' ')[:900])
+        lines.append('stdout:\n' + stdout[:900])
+    # Successful CLI runs may emit their banner and full input prompt to stderr.
+    # Keep diagnostics for failures (or a run with no report), not beside a
+    # successful report where they obscure the application-level audit result.
+    if stderr and (status != 'success' or not stdout):
+        lines.append('stderr:\n' + stderr[:900])
     return '\n'.join(lines)
 
 

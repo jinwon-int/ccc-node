@@ -15,6 +15,7 @@ import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import itertools
 import json
 import os
@@ -31,6 +32,17 @@ from typing import Any, Iterator
 
 import ccc_secure_fs as _secure_fs
 import ccc_skill_frontmatter as _skill_frontmatter
+
+# Reuse the install/patch gate, including for candidates written by older nodes.
+# setup deploys the helper in the hook tree beside this installed publisher.
+_TRIGGER_PATH = Path(__file__).resolve().parent / "skill-review" / "description_trigger.py"
+if not _TRIGGER_PATH.is_file():
+    _TRIGGER_PATH = Path(__file__).resolve().parents[1] / "claude/hooks/skill-review/description_trigger.py"
+_TRIGGER_SPEC = importlib.util.spec_from_file_location("_promotion_description_trigger", _TRIGGER_PATH)
+if _TRIGGER_SPEC is None or _TRIGGER_SPEC.loader is None:
+    raise ImportError("skill_description_trigger_unavailable")
+_description_trigger = importlib.util.module_from_spec(_TRIGGER_SPEC)
+_TRIGGER_SPEC.loader.exec_module(_description_trigger)
 
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -928,6 +940,7 @@ def _snapshot(config: Config, provider: str, row: dict[str, Any]) -> Candidate: 
     if actual_skill_sha != skill_sha:
         raise PromotionError("skill_hash_mismatch")
     description = _frontmatter(files[0].content, name, require_yaml_safe=True)
+    _require_description_trigger(description)
     digest = hashlib.sha256()
     for item in files:
         digest.update(item.relative.encode())
@@ -1206,9 +1219,15 @@ def _require_private_repo(config: Config) -> None:
         raise PromotionError("target_repo_not_private")
 
 
+def _require_description_trigger(description: str) -> None:
+    if not _description_trigger.has_trigger_wording(description):
+        raise PromotionError("description_trigger_missing")
+
+
 def _publish(
     config: Config, candidate: Candidate, *, created_at: str
 ) -> dict[str, str]:
+    _require_description_trigger(candidate.description)
     branch = _branch(config, candidate)
     _run(["gh", "auth", "status", "--hostname", "github.com"])
     _require_private_repo(config)
@@ -1468,6 +1487,7 @@ def _state_payload(path: Path, *, trust_root: Path | None = None) -> dict[str, o
 
 
 def _stage_candidate(config: Config, candidate: Candidate) -> dict[str, str]:
+    _require_description_trigger(candidate.description)
     outbox = config.promotion_state_dir / "outbox"
     sent = config.promotion_state_dir / "sent"
     _private_state_dir(outbox)
@@ -1500,7 +1520,9 @@ def _stage_candidate(config: Config, candidate: Candidate) -> dict[str, str]:
     return {"outcome": "staged", "transport_id": transport_id}
 
 
-def _pending_envelopes(config: Config, *, limit: int) -> list[dict[str, object]]:
+def _pending_envelopes(
+    config: Config, *, limit: int, blocked: list[dict[str, str]] | None = None
+) -> list[dict[str, object]]:
     outbox = config.promotion_state_dir / "outbox"
     sent = config.promotion_state_dir / "sent"
     if not outbox.exists():
@@ -1512,10 +1534,9 @@ def _pending_envelopes(config: Config, *, limit: int) -> list[dict[str, object]]
     # in the alphabet sat behind every newer envelope forever. `created_at` is a
     # fixed-width UTC stamp, so a lexicographic sort is chronological.
     #
-    # Ordering reads only the cheap `created_at` field; full envelope validation
-    # still runs on the `limit` rows actually served, so one malformed envelope
-    # deeper in the queue cannot newly fail an otherwise healthy node. Envelopes
-    # with no usable stamp sort last for the same reason.
+    # Validate only until `limit` eligible rows are found. A triggerless legacy
+    # envelope remains untouched but cannot occupy the only export slot forever.
+    # Other malformed envelopes still fail closed; missing stamps sort last.
     staged: list[tuple[int, str, str, dict[str, object]]] = []
     for path in sorted(outbox.glob("*.json")):
         if (sent / path.name).exists():
@@ -1528,10 +1549,17 @@ def _pending_envelopes(config: Config, *, limit: int) -> list[dict[str, object]]
             staged.append((1, "", path.name, value))
     staged.sort(key=lambda row: (row[0], row[1], row[2]))
     rows: list[dict[str, object]] = []
-    for _, _, name, value in staged[:limit]:
-        _, _, transport_id = _candidate_from_envelope(value)
+    for _, _, name, value in staged:
+        if len(rows) >= limit:
+            break
+        candidate, _, transport_id = _candidate_from_envelope(value)
         if name != f"{transport_id}.json":
             raise PromotionError("outbox_filename_mismatch")
+        if not _description_trigger.has_trigger_wording(candidate.description):
+            if blocked is not None and len(blocked) < _MAX_CANDIDATES_PER_RUN:
+                blocked.append({"source": "local", "name": candidate.name,
+                                "code": "description_trigger_missing"})
+            continue
         rows.append(value)
     return rows
 
@@ -1578,7 +1606,9 @@ def _remote_command(node: str, arguments: list[str]) -> subprocess.CompletedProc
     )
 
 
-def _remote_envelopes(node: str, *, limit: int) -> list[dict[str, object]]:
+def _remote_envelopes(
+    node: str, *, limit: int, blocked: list[dict[str, str]] | None = None
+) -> list[dict[str, object]]:
     completed = _remote_command(node, ["export", "--limit", str(limit)])
     try:
         value = json.loads(completed.stdout)
@@ -1586,6 +1616,19 @@ def _remote_envelopes(node: str, *, limit: int) -> list[dict[str, object]]:
         raise PromotionError("remote_output_invalid") from None
     if not isinstance(value, dict) or value.get("ok") is not True:
         raise PromotionError("remote_export_failed")
+    rejections = value.get("blocked", [])
+    if not isinstance(rejections, list) or len(rejections) > _MAX_CANDIDATES_PER_RUN:
+        raise PromotionError("remote_output_invalid")
+    for rejection in rejections:
+        if (not isinstance(rejection, dict)
+                or not isinstance(rejection.get("name"), str)
+                or not _NAME_RE.fullmatch(rejection["name"])
+                or len(rejection["name"]) > 80
+                or rejection.get("code") != "description_trigger_missing"):
+            raise PromotionError("remote_output_invalid")
+        if blocked is not None:
+            blocked.append({"source": node, "name": rejection["name"],
+                            "code": "description_trigger_missing"})
     rows = value.get("envelopes")
     if not isinstance(rows, list) or len(rows) > limit:
         raise PromotionError("remote_output_invalid")
@@ -1727,12 +1770,14 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
 
 def _export_result(config: Config, *, limit: int) -> dict[str, object]:
     _private_state_dir(config.promotion_state_dir)
-    rows = _pending_envelopes(config, limit=limit)
+    blocked: list[dict[str, str]] = []
+    rows = _pending_envelopes(config, limit=limit, blocked=blocked)
     return {
         "ok": True,
         "mode": "export-read-only",
         "node": config.node,
         "envelopes": rows,
+        "blocked": [{"name": row["name"], "code": row["code"]} for row in blocked],
     }
 
 
@@ -4701,6 +4746,12 @@ def _promote_stage(
         raise PromotionError("promote_source_unreadable") from error
     if not paths:
         raise PromotionError("promote_source_missing")
+    primary_path = f"{source}/SKILL.md"
+    if primary_path not in paths:
+        raise PromotionError("promote_source_missing")
+    primary_blob = _run(["git", "show", f"FETCH_HEAD:{primary_path}"], cwd=work).stdout
+    description = _frontmatter(primary_blob, item["name"], require_yaml_safe=True)
+    _require_description_trigger(description)
     target = work / "approved" / audience / item["name"]
     for prefix in sorted(_AUDIENCES):
         if (work / "approved" / prefix / item["name"]).exists():
@@ -6245,11 +6296,11 @@ def _collect_envelopes(
         if label == "local":
             # A broken local state dir still fails the collect outright, as
             # before; remotes degrade to per-source errors.
-            gather(_pending_envelopes(config, limit=remaining), label, expected_node)
+            gather(_pending_envelopes(config, limit=remaining, blocked=errors), label, expected_node)
         else:
             try:
                 gather(
-                    _remote_envelopes(expected_node, limit=min(remaining, config.max_prs)),
+                    _remote_envelopes(expected_node, limit=min(remaining, config.max_prs), blocked=errors),
                     label,
                     expected_node,
                 )
@@ -6279,19 +6330,20 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
     for candidate, created_at, transport_id, source in collected:
         if opened >= config.max_prs:
             break
-        if dry_run:
-            outcome = {
-                "outcome": "would-open-private-intake-pr",
-                "branch": _branch(config, candidate),
-            }
-        else:
-            try:
+        try:
+            _require_description_trigger(candidate.description)
+            if dry_run:
+                outcome = {
+                    "outcome": "would-open-private-intake-pr",
+                    "branch": _branch(config, candidate),
+                }
+            else:
                 outcome = _publish(config, candidate, created_at=created_at)
-            except PromotionError as error:
-                errors.append(
-                    {"source": source, "name": candidate.name, "code": error.code}
-                )
-                continue
+        except PromotionError as error:
+            errors.append(
+                {"source": source, "name": candidate.name, "code": error.code}
+            )
+            continue
         row = {
             **outcome,
             "source": source,

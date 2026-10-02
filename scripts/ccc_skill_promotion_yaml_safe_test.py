@@ -174,6 +174,83 @@ class WriterTests(unittest.TestCase):
         if yaml is not None:
             self.assertEqual(yaml_frontmatter(payload)["description"], UNSAFE)
 
+class PromotionTriggerGateTests(unittest.TestCase):
+    """Legacy local/enveloped skills must fail before publication, not in CI."""
+    def candidate(self, description):
+        content = skill_md("demo-skill", description)
+        return promotion._candidate_from_envelope(
+            envelope("demo-skill", content, description))[0]
+
+    def test_legacy_candidate_cannot_write_an_outbox(self):
+        candidate = self.candidate("Audit adapters against a canonical implementation.")
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            config = SimpleNamespace(promotion_state_dir=state)
+            with self.assertRaises(promotion.PromotionError) as caught:
+                promotion._stage_candidate(config, candidate)
+            self.assertEqual(caught.exception.code, "description_trigger_missing")
+            self.assertFalse(state.exists())
+
+    def test_legacy_envelope_cannot_reach_github(self):
+        from unittest.mock import patch
+        candidate = self.candidate("Restore a saved service state and device identity.")
+        with patch.object(promotion, "_run") as run:
+            with self.assertRaises(promotion.PromotionError) as caught:
+                promotion._publish(SimpleNamespace(), candidate, created_at="2026-01-01T00:00:00Z")
+            self.assertEqual(caught.exception.code, "description_trigger_missing")
+            run.assert_not_called()
+
+    def test_trigger_is_read_from_description_not_body(self):
+        for description in ("Audit an interface to avoid inconsistent error handling.",
+                            "도구를 점검하기 때문에 안전성을 높입니다."):
+            with self.subTest(description=description):
+                with self.assertRaises(promotion.PromotionError):
+                    promotion._require_description_trigger(description)
+        for description in ("Use when auditing adapters against a shared interface.",
+                            "서비스 상태를 복원해야 할 때 사용합니다."):
+            promotion._require_description_trigger(description)
+
+    def test_remote_export_reports_only_bounded_known_rejections(self):
+        from unittest.mock import patch
+        rejection = {"name": "legacy-skill", "code": "description_trigger_missing"}
+        packet = {"ok": True, "envelopes": [], "blocked": [rejection]}
+        errors = []
+        with patch.object(promotion, "_remote_command", return_value=SimpleNamespace(
+                stdout=json.dumps(packet).encode())):
+            self.assertEqual(promotion._remote_envelopes("node-a", limit=1, blocked=errors), [])
+        self.assertEqual(errors, [{"source": "node-a", **rejection}])
+        for rejected in ([{**rejection, "name": "unsafe/name"}],
+                         [{**rejection, "code": "arbitrary-private-message"}],
+                         [rejection] * (promotion._MAX_CANDIDATES_PER_RUN + 1)):
+            with self.subTest(rejected=rejected), patch.object(
+                    promotion, "_remote_command", return_value=SimpleNamespace(
+                        stdout=json.dumps({**packet, "blocked": rejected}).encode())):
+                with self.assertRaises(promotion.PromotionError) as caught:
+                    promotion._remote_envelopes("node-a", limit=1, blocked=[])
+                self.assertEqual(caught.exception.code, "remote_output_invalid")
+        # Old exporters do not carry diagnostic metadata.
+        with patch.object(promotion, "_remote_command", return_value=SimpleNamespace(
+                stdout=b'{"ok": true, "envelopes": []}')):
+            self.assertEqual(promotion._remote_envelopes("node-a", limit=1), [])
+
+    def test_approved_legacy_intake_is_blocked_before_copy(self):
+        from unittest.mock import patch
+        name = "demo-skill"
+        item = {"name": name, "node": "node-a", "provider": "claude",
+                "tree_sha256": "a" * 64, "branch": "intake/demo"}
+        source = f"intake/node-a/claude/{name}-{'a' * 12}/skill/SKILL.md"
+        content = skill_md(name, "Audit adapters against a canonical implementation.")
+        content += b"\n## When to Use\nUse when checking adapter changes.\n"
+        def run(args, **kwargs):
+            if args[:2] == ["git", "ls-tree"]:
+                return SimpleNamespace(stdout=(source + "\n").encode())
+            return SimpleNamespace(stdout=content if args[:2] == ["git", "show"] else b"")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(promotion, "_run", side_effect=run):
+            with self.assertRaises(promotion.PromotionError) as caught:
+                promotion._promote_stage(Path(tmp), item, audience="shared")
+            self.assertEqual(caught.exception.code, "description_trigger_missing")
+            self.assertFalse((Path(tmp) / "approved").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

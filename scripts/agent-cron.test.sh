@@ -504,6 +504,25 @@ assert bounded is not None and private_key not in bounded
 assert module._canonical_redaction.REDACTION_MARKER in bounded
 json.loads(json.dumps({"text": module.redact_for_owner("safe\0text")}))
 
+# A known error code is readable, but it cannot exempt credential contexts,
+# adjacent tokens, unknown diagnostics, or URLs from the hardening boundary.
+code = "description_trigger_missing"
+assert module.redact_for_owner(code) == code
+for raw in ("password=" + code, "Bearer " + code, code + "A" * 24,
+            "https://example.test/" + code, "unknown_diagnostic_" + "x" * 30):
+    assert module._canonical_redaction.REDACTION_MARKER in module.redact_for_owner(raw)
+report = "스킬 점검: 일부 실패\n- " + code + " 2건\n- 동기화 정상"
+notice = module.build_owner_text("audit", "run", None, "success", {
+    "exitCode": 0, "stdout": report, "stderr": "CLI banner\nfull input prompt"})
+assert "execution status=success" in notice and report in notice
+assert "stderr:" not in notice and "full input prompt" not in notice
+for status, stdout in (("failed", report), ("success", "")):
+    notice = module.build_owner_text("audit", "run", None, status, {
+        "exitCode": 1 if status == "failed" else 0,
+        "stdout": stdout, "stderr": "diagnostic detail"})
+    assert "stderr:\ndiagnostic detail" in notice
+
+
 # Filesystem paths must survive the long-run catch-all. Masking them cost the
 # 2026-07-30 fleet-doctor sweep its only diagnostic field: the notification read
 # `DRIFT gongmyoung doctor_exit=1 [REDACTED_CREDENTIAL]`, where the marker had
@@ -657,7 +676,7 @@ generic = module.build_owner_text(
 )
 assert generic is not None
 assert generic.splitlines()[0] == (
-    "agent-cron task ordinary-task finished with status=failed"
+    "agent-cron task ordinary-task finished with execution status=failed"
 )
 leading_space = module.build_owner_text(
     "ordinary-task", "run-leading", "2026-01-01T00:00:00Z", "failed",
@@ -665,7 +684,7 @@ leading_space = module.build_owner_text(
 )
 assert leading_space is not None
 assert leading_space.splitlines()[0] == (
-    "agent-cron task ordinary-task finished with status=failed"
+    "agent-cron task ordinary-task finished with execution status=failed"
 )
 
 # Success text is unchanged even if successful output happens to contain a token.
@@ -675,7 +694,7 @@ success = module.build_owner_text(
 )
 assert success is not None
 assert success.splitlines()[0] == (
-    "agent-cron task adapter-fleet-watch finished with status=success"
+    "agent-cron task adapter-fleet-watch finished with execution status=success"
 )
 
 # Invalid ids cannot be promoted into the structured domain-alert title.
