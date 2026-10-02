@@ -216,6 +216,18 @@ External waits (#740): an agent's "I'll continue once CI finishes" is backed by 
 
 Webhook nudge (#1222, off by default): the wait monitor's backoff caps at 300s, so a CI run finishing late in the window sits undetected for up to five minutes. `CCC_WEBHOOK_NUDGE_ENABLED=true` starts a loopback-bound listener (`CCC_WEBHOOK_NUDGE_HOST`/`_PORT`, default `127.0.0.1:8791`, path `/nudge`) that accepts HMAC-signed GitHub webhook deliveries (`workflow_run`, `check_suite`, `pull_request`) and pulls the matching waits' next poll forward to "now". The payload is treated strictly as an untrusted hint: terminal classification, exact-head validation, wake journaling, and resume budgets all remain in the polling monitor, so a forged delivery can at most trigger one early authenticated `gh` read and a lost delivery degrades to today's polling behavior. `CCC_WEBHOOK_NUDGE_SECRET` is required — enabling without it refuses to start the listener (fail-closed) while the bridge boots normally (keep the value in the node's env file, never in the repo). Public ingress from GitHub to the loopback listener (tunnel/reverse proxy) and registering the webhook on the repo are per-node operational decisions outside the bridge; payload bodies are parsed in memory and never persisted.
 
+Coverage check (#1229 follow-up): the nudge hook is registered **per
+repository**, so every new repository needs one more hook — a rule that
+otherwise lives in memory (2026-10-02: 6 of 42 repositories had none, three
+of them weeks old). `scripts/nudge-hook-coverage.sh --org <org> --url-pattern
+<relay-url-substring>` lists each repository with its matching hook ids, skips
+repositories without CI workflows, and exits `10` when a CI repository has no
+hook; `--comment owner/repo#<issue>` posts a body-free summary to the tracker
+only when gaps exist. It needs an admin-scoped `gh` session (hook listing is
+admin-only), so run it where that session lives — the relay node — e.g. weekly
+from cron with `GH_CONFIG_DIR` pointing at that session. It never creates
+hooks; registration stays a separate, approved step.
+
 ## Group rows still holding a DM session (#2075)
 
 Before #2092, a group/room row in `sessions.json` could end up holding the
