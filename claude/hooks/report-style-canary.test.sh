@@ -3,6 +3,7 @@
 # A/B canary (#2109 A). Hermetic: private CCC_CLAUDE_DIR / CCC_HOOK_DIR, the
 # hook must stay silent without the flag, inject the rule text with it, echo a
 # bounded operator note, ignore other events, and always exit 0.
+# shellcheck disable=SC2034  # test variables are read inside the eval'd ok() conditions
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 HOOK="$HERE/report-style-canary.sh"
@@ -73,5 +74,5 @@ out="$(CLAUDE_DISTILL_INFLIGHT=1 run_hook SessionStart)"
 rc=$?
 ok "distill subprocesses get nothing" '[ "$rc" = 0 ] && [ -z "$out" ]'
 
-echo "report-style-canary: $pass passed, $fail failed"
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
