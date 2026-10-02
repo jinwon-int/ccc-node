@@ -965,6 +965,117 @@ ok "unknown service domain is unverified" 'grep -q "service-domain=unverified" "
 domain_probe UNKNOWN_ROOT=1
 ok "visible process with unknown root is not reported DOWN" 'grep -q "^AVAIL=unverified$" "$TMP/domain-out" && ! grep -q "^AVAIL=no$" "$TMP/domain-out"'
 
+# ---- change-based alerting: --state-file (#2086) ----------------------------
+# A daily watch that failed every day for a chronic issue hid a new outage for
+# hours. With a state file the run pages only on NEW/STILL/RECOVERED events and
+# its report leads with rows that name the node.
+STATE="$TMP/state/fleet-watch.json"
+run_state() { # <nodes> [extra env...]
+  OUT="$TMP/out"; RC=0
+  rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags
+  env CCC_FLEET_NODES="$1" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ \
+    CCC_FLEET_RETRY_DELAY=0 CCC_FLEET_MATRIX=0 "${@:2}" \
+    bash "$SC" --state-file "$STATE" >"$OUT" 2>"$TMP/err" || RC=$?
+}
+rm -f "$TMP"/reply/beta.2
+reply alpha /opt/ccc-node yes /opt/ccc-node
+reply beta /opt/ccc-node degraded /opt/ccc-node
+echo "AVAIL_REASON=health-stale" >> "$TMP/reply/beta"
+run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T00:00:00Z
+okc "$RC" 0 "state mode: a first abnormal answer does not page"
+ok "state mode: first abnormal answer is PENDING with its channel" \
+  'grep -q "^PENDING DEGRADED beta channel=telegram runtime=/opt/ccc-node reason=health-stale confirm=1/2$" "$OUT"'
+ok "state mode: OK rows are dropped, a summary remains" \
+  '! grep -q "^OK " "$OUT" && grep -q "^SUMMARY checked=2 ok=1 .*page=no$" "$OUT"'
+ok "state mode: the degraded recheck is off (confirmation replaces it)" \
+  '[ "$(wc -l < "$TMP/reply/beta.flags")" = 1 ]'
+ok "state mode: state file is owner-only" '[ "$(stat -c %a "$STATE")" = 600 ]'
+run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T00:15:00Z
+okc "$RC" 1 "state mode: a confirmed new abnormal pair pages"
+ok "state mode: the report leads with a NEW row naming the node" \
+  '[ "$(head -1 "$OUT")" = "NEW DEGRADED beta channel=telegram runtime=/opt/ccc-node reason=health-stale since=2026-10-01T00:00:00Z" ]'
+run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T00:30:00Z
+okc "$RC" 0 "state mode: a known issue stays quiet"
+ok "state mode: the known issue is still listed" 'grep -q "^KNOWN DEGRADED beta channel=telegram" "$OUT"'
+# The chronic beta issue must not hide a new one on alpha.
+reply alpha /opt/ccc-node no /opt/ccc-node
+run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T00:45:00Z
+run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:00:00Z
+okc "$RC" 1 "state mode: a new issue pages beside a known one"
+ok "state mode: NEW row first, KNOWN after it" \
+  '[ "$(sed -n 1p "$OUT")" = "NEW DOWN alpha channel=telegram since=2026-10-01T00:45:00Z" ] && sed -n 2p "$OUT" | grep -q "^KNOWN DEGRADED beta "'
+reply alpha /opt/ccc-node yes /opt/ccc-node
+run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:15:00Z
+run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:30:00Z
+okc "$RC" 1 "state mode: a confirmed recovery of an alerted node is reported"
+ok "state mode: RECOVERED names the node and its old verdict" \
+  'grep -q "^RECOVERED alpha channel=telegram was=DOWN since=2026-10-01T00:45:00Z for=0h45m$" "$OUT"'
+# An explicitly requested recheck still works in state mode.
+run_state "beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:45:00Z CCC_FLEET_DEGRADED_RECHECK=1
+ok "state mode: CCC_FLEET_DEGRADED_RECHECK=1 is honoured" '[ "$(wc -l < "$TMP/reply/beta.flags")" = 2 ]'
+# The env form selects the same mode.
+OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen
+CCC_FLEET_NODES="beta" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ CCC_FLEET_RETRY_DELAY=0 \
+  CCC_FLEET_WATCH_STATE="$STATE" CCC_FLEET_WATCH_NOW=2026-10-01T02:00:00Z bash "$SC" >"$OUT" 2>&1 || RC=$?
+ok "state mode: CCC_FLEET_WATCH_STATE selects change mode" 'grep -q "^KNOWN DEGRADED beta " "$OUT"'
+
+# A corrupt state file warns and starts over; it never crashes the watch.
+printf '{not json' > "$STATE"
+run_state "beta" CCC_FLEET_WATCH_NOW=2026-10-01T02:15:00Z
+okc "$RC" 0 "state mode: corrupt state restarts from empty state"
+ok "state mode: corrupt state is reported on stderr" 'grep -q "not valid JSON" "$TMP/err"'
+ok "state mode: corrupt state is replaced" 'python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$STATE"'
+
+# State that cannot be written falls back to the raw verdicts, loudly.
+printf 'x' > "$TMP/not-a-dir"
+OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen
+CCC_FLEET_NODES="alpha beta" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ CCC_FLEET_RETRY_DELAY=0 \
+  bash "$SC" --state-file "$TMP/not-a-dir/state.json" >"$OUT" 2>"$TMP/err" || RC=$?
+okc "$RC" 1 "state mode: unusable state pages"
+ok "state mode: unusable state names the watcher, then abnormal rows before OK rows" \
+  '[ "$(sed -n 1p "$OUT")" = "UNVERIFIED watcher state-file=unusable" ] && sed -n 2p "$OUT" | grep -q "^DEGRADED beta " && sed -n 3p "$OUT" | grep -q "^OK alpha "'
+
+# Without the option nothing changes, and a mistyped option is refused.
+run "alpha beta"
+ok "plain mode output is unchanged" 'grep -q "^OK alpha (/opt/ccc-node)$" "$OUT" && ! grep -qE "^(NEW|PENDING|SUMMARY) " "$OUT"'
+OUT="$TMP/out"; RC=0
+bash "$SC" --state-flie "$STATE" >"$OUT" 2>&1 || RC=$?
+okc "$RC" 2 "an unknown option is refused rather than ignored"
+OUT="$TMP/out"; RC=0
+bash "$SC" --state-file >"$OUT" 2>&1 || RC=$?
+okc "$RC" 2 "--state-file without a path is refused"
+
+# ---- --light cadence mode (#2086) -------------------------------------------
+# Never the doctor, fewer transport retries, and a run deadline.
+reply alpha /opt/ccc-node yes /opt/ccc-node
+OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags
+CCC_FLEET_NODES="alpha" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ CCC_FLEET_DOCTOR=1 \
+  bash "$SC" --light >"$OUT" 2>"$TMP/err" || RC=$?
+okc "$RC" 0 "light mode: a healthy node passes"
+ok "light mode: the doctor is never requested" '[ "$(cat "$TMP/reply/alpha.flags")" = "CCC_FLEET_DOCTOR=0" ]'
+ok "light mode: an ignored doctor request is said out loud" 'grep -q "CCC_FLEET_DOCTOR ignored" "$TMP/err"'
+: > "$TMP/calls"
+OUT="$TMP/out"; RC=0
+CCC_FLEET_NODES="ghost3" CCC_FLEET_SSH="$FLAKY" CCC_FLEET_SELF=_never_ CCC_FLEET_RETRY_DELAY=0 \
+  bash "$SC" --light >"$OUT" 2>&1 || RC=$?
+ok "light mode: one transport retry by default" '[ "$(grep -c "^ghost3$" "$TMP/calls")" = 2 ]'
+SLOW="$TMP/ssh-slow"
+cat > "$SLOW" <<SLOWEOF
+#!$(command -v bash)
+cat >/dev/null
+sleep 2
+printf 'RUNTIME=/opt/ccc-node\nAVAIL=yes\nUNIT=/opt/ccc-node\nPROBE_COMPLETE=1\n'
+SLOWEOF
+chmod +x "$SLOW"
+OUT="$TMP/out"; RC=0
+CCC_FLEET_NODES="slow1 slow2" CCC_FLEET_SSH="$SLOW" CCC_FLEET_SELF=_never_ CCC_FLEET_DEADLINE=1 \
+  bash "$SC" --light >"$OUT" 2>&1 || RC=$?
+okc "$RC" 1 "light mode: nodes past the deadline are not silently skipped"
+ok "light mode: the node probed in time is judged, the rest are UNVERIFIED" \
+  'grep -q "^OK slow1 " "$OUT" && grep -q "^UNVERIFIED slow2 inspection=deadline-1s$" "$OUT"'
+
+python3 "$ROOT/scripts/fleet_watch_state_test.py"
+okc "$?" 0 "change-based alert state transitions and state-file safety"
 python3 "$ROOT/scripts/fleet_watch_metadata_test.py"
 okc "$?" 0 "strict metadata and actual Git provenance regressions"
 python3 "$ROOT/scripts/fleet_watch_permissions_test.py"

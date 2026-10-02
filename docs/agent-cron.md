@@ -93,6 +93,19 @@ so an operator can tell `1` (findings) from `127` (command missing) at a
 glance. A task that declared **no** `retryPolicy` has no retry concept and is
 never labelled `retry-exhausted` — its failures stay plain `failed`.
 
+> **Warning: `--success-exit-codes 0,1` with a `*-on-failure` notify mode
+> silences every finding.** Exit 1 is then a success, and `*-on-failure` never
+> spools a successful run. The watch can find a node DOWN on every run and
+> nobody is told. Use `--success-exit-codes 0,1` only when findings reach a
+> person some other way, for example `--notify telegram-owner`, which reports
+> every run. For a watch whose findings should page, keep the default success
+> set and `telegram-owner-on-failure`. If a chronic finding would then page on
+> every run, make the watch report changes rather than states:
+> `fleet-bridge-watch.sh --state-file PATH` exits 1 only for NEW, STILL
+> (re-alert due) and RECOVERED events (docs/fleet-watch.md, #2086). Add
+> `--failure-alert-after 0` to such a task, because each nonzero exit already
+> pages.
+
 ## Notify modes
 
 - `none` (default) — no spool writes.
@@ -122,9 +135,19 @@ captured output to the spool.
 For a non-success run, the already-redacted, bounded stdout/stderr are also
 checked for the exact line-start fleet diagnostic tokens `DOWN`, `UNREACHABLE`,
 `DRIFT`, and `BOOTPATH`. If any are present, the first line identifies a fleet
-alert and includes only the validated task id plus deterministic token counts;
-node names, paths, credentials, and the rest of each diagnostic row remain out
-of the title. Failures with no recognized signal keep the generic status first
+alert and includes only the validated task id plus deterministic token counts,
+followed by the affected node names (#2086), e.g.
+`DEGRADED=2 UNVERIFIED=1 (node-a, node-b)`. A name is the field right after a
+counted token. It is taken from the already-redacted output and listed only if
+it is a hostname-shaped word of at most 32 characters (letters, digits, `-`,
+`_`). Up to six names are listed, then `+N more`. Paths, credentials, and the
+rest of each diagnostic row remain out of the title. Change-mode rows from
+`fleet-bridge-watch.sh --state-file` count under their own keys:
+`NEW-<TOKEN>`, `STILL-<TOKEN>` and `RECOVERED`. The non-paging context rows
+(`PENDING`, `KNOWN`, `RECOVERING`, `SUMMARY`) are not counted. For a fleet
+alert, the body lists the counted rows first, then other lines, then `OK` rows,
+before the display cap applies. Failures with no recognized signal keep the
+generic status first
 line. Generic titles label the **execution status**: success means the runner
 completed, not that an audit reported a healthy system. Report line breaks are
 preserved; successful runs with stdout omit CLI stderr banners and prompt echoes.
