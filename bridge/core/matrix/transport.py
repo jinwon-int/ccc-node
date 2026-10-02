@@ -65,6 +65,7 @@ from telegram_bot.core.matrix.state import (
     reply_context_body,
     saved_policy,
     identifier,
+    outbox_msgtype,
     scope_of,
     turn_id,
     turn_timeout_minutes,
@@ -295,18 +296,19 @@ class MatrixHTTPError(SafetyStop):
         return 400 <= self.status < 500 and self.status not in (401, 403) and self.status not in RETRYABLE_STATUSES
 
 
-def message_content(text: str) -> dict[str, Any]:
+def message_content(text: str, *, msgtype: str = "m.text") -> dict[str, Any]:
     """``m.text`` content with a Matrix-HTML ``formatted_body`` when the text has markup.
 
     Rendering happens at send time so every outgoing message (replies and
     notices alike) goes through the same escaping renderer; plain text stays
     a bare ``body``. Kept as the transport's name for
-    :func:`~telegram_bot.core.matrix.render.event_content`.
+    :func:`~telegram_bot.core.matrix.render.event_content`. ``msgtype``
+    ``m.notice`` is only for quiet bot status lines (#2088).
     """
 
     from telegram_bot.core.matrix.render import event_content
 
-    return event_content(text)
+    return event_content(text, msgtype=msgtype)
 
 
 # --------------------------------------------------------------------------- #
@@ -1053,13 +1055,17 @@ class MatrixTransport:
     def room_kind(self, room_id: str) -> str:
         return "family" if room_id in self.family_rooms else "direct"
 
-    def enqueue_notice(self, room_id: str, text: str, *, key: str | None = None) -> str:
+    def enqueue_notice(
+        self, room_id: str, text: str, *, key: str | None = None, msgtype: str = "m.text"
+    ) -> str:
         """Queue unsolicited output (async completion, reminders) for an allowed room.
 
         Delivered by :meth:`send` with the same chunking, pinning and room
         gate as a reply; a muted room keeps it until the gate reopens. A
         caller-supplied ``key`` makes the notice idempotent (same key + same
         text → queued once), e.g. the startup banner across restarts.
+        ``msgtype="m.notice"`` delivers it as a notice clients do not ping on
+        (the external-wait status line, #2088); the default stays ``m.text``.
         """
         if room_id not in self.c["rooms"]:
             raise ValueError("room-not-allowed")
@@ -1071,7 +1077,7 @@ class MatrixTransport:
             "notice",
             hashlib.sha256(json.dumps([self.c["account"], room_id, "unsolicited-notice"]).encode()).hexdigest(),
         )
-        event_id = self.store.notice(req, key or unique_key("unsolicited"), text)
+        event_id = self.store.notice(req, key or unique_key("unsolicited"), text, msgtype=msgtype)
         self.wake()
         return event_id
 
@@ -1693,10 +1699,19 @@ class MatrixTransport:
         return event.sender in self.senders and event.sender_key in set(self.trusted.get(event.sender, {}).values())
 
     def _trusted_text(self, event: Any) -> bool:
-        """A trusted text suitable for the bounded recent-text cache."""
-        from nio import RoomMessageText
+        """A trusted text suitable for the bounded recent-text cache.
 
-        return (isinstance(event, RoomMessageText)
+        Our own ``m.notice`` events (the external-wait status, #2088) count as
+        text too, so a reply to one is quoted like a reply to any bot message.
+        Other senders' notices stay out: those are never admitted (#2002).
+        """
+        import nio
+
+        kinds: tuple[type, ...] = (nio.RoomMessageText,)
+        notice = getattr(nio, "RoomMessageNotice", None)
+        if isinstance(notice, type) and getattr(event, "sender", None) == self.c["account"]:
+            kinds += (notice,)
+        return (isinstance(event, kinds)
                 and isinstance(getattr(event, "body", None), str)
                 and self._trusted_parent_sender(event))
 
@@ -1834,6 +1849,7 @@ class MatrixTransport:
         if job.get("body") == FILE_JOB_BODY and str(job["event_id"]).startswith("$file-"):
             return await self._deliver_file(job)
         event_id, room = job["event_id"], job["room_id"]
+        msgtype = outbox_msgtype(job)
         chunks = event_chunks(job["reply"])
         for i in range(self.store.delivered_parts(event_id), len(chunks)):
             async with self.matrix_lock:
@@ -1841,7 +1857,7 @@ class MatrixTransport:
                     return False
                 tx = hashlib.sha256((job["txn_id"] + ":" + str(i)).encode()).hexdigest()
                 try:
-                    sent = await self._send_part(room, chunks[i], tx)
+                    sent = await self._send_part(room, chunks[i], tx, msgtype=msgtype)
                 except MatrixHTTPError as exc:
                     if not exc.part_rejected:
                         raise
@@ -1867,7 +1883,7 @@ class MatrixTransport:
         self.store.delivered(event_id)
         return True
 
-    async def _send_part(self, room: str, text: str, txn: str) -> str:
+    async def _send_part(self, room: str, text: str, txn: str, *, msgtype: str = "m.text") -> str:
         """One outbox part; a too-large rejection is retried once as plain text.
 
         The size model should prevent 413s, but homeservers differ (some also
@@ -1876,14 +1892,16 @@ class MatrixTransport:
         rejected, so no event exists under ``txn`` to deduplicate against.
         """
         try:
-            return await self.encrypted_send(room, text, txn)
+            return await self.encrypted_send(room, text, txn, msgtype=msgtype)
         except MatrixHTTPError as exc:
             if not exc.too_large:
                 raise
         from telegram_bot.core.matrix.render import event_content
 
         plain_txn = hashlib.sha256((txn + ":plain").encode()).hexdigest()
-        return await self._encrypted_raw(room, "m.room.message", event_content(text, plain=True), plain_txn)
+        return await self._encrypted_raw(
+            room, "m.room.message", event_content(text, plain=True, msgtype=msgtype), plain_txn
+        )
 
     async def _encrypted_raw(self, room: str, kind: str, content: Mapping[str, Any], txn: str) -> str:
         # nio 0.25.2 room_send ignores incomplete key sharing. Confirm every
@@ -1912,14 +1930,18 @@ class MatrixTransport:
             self.mark(active["event_id"], "first_sent")
         return event_id
 
-    async def encrypted_send(self, room: str, text: str, txn: str) -> str:
-        return await self._encrypted_raw(room, "m.room.message", message_content(text), txn)
+    async def encrypted_send(self, room: str, text: str, txn: str, *, msgtype: str = "m.text") -> str:
+        return await self._encrypted_raw(room, "m.room.message", message_content(text, msgtype=msgtype), txn)
 
-    async def encrypted_edit(self, room: str, text: str, replaces: str, txn: str) -> str:
+    async def encrypted_edit(
+        self, room: str, text: str, replaces: str, txn: str, *, msgtype: str = "m.text"
+    ) -> str:
         """m.replace edit of ``replaces``; the bubble keeps its original event id."""
         from telegram_bot.core.matrix.render import edit_content
 
-        return await self._encrypted_raw(room, "m.room.message", edit_content(text, replaces), txn)
+        return await self._encrypted_raw(
+            room, "m.room.message", edit_content(text, replaces, msgtype=msgtype), txn
+        )
 
     async def redact(self, room: str, event_id: str, tag: str) -> None:
         txn = hashlib.sha256(("redact-" + tag).encode()).hexdigest()
@@ -1944,14 +1966,17 @@ class MatrixTransport:
             return "sent", event
         return "gone", None
 
-    async def edit_notice(self, room: str, event_id: str, text: str) -> bool:
+    async def edit_notice(self, room: str, event_id: str, text: str, *, msgtype: str = "m.text") -> bool:
         """Replace a bot-authored event's text in place (``m.replace``), outside the outbox.
 
         Like the progress bubble this is a direct, single-event send: the
         caller keeps its own record of what the event shows and retries on
         its next pass. ``False`` means the homeserver refused the edit for
         good (a 4xx other than 401/403); a transient failure or a muted room
-        raises.
+        raises. ``msgtype`` must match the edited event's (``m.notice`` for
+        the external-wait status, #2088); it is set on the fallback and on
+        ``m.new_content``. A successful edit also refreshes the reply-context
+        cache, so a reply to the event quotes what it shows now.
         """
         from telegram_bot.core.matrix.render import trim_to_event
 
@@ -1964,11 +1989,12 @@ class MatrixTransport:
             # under a reused txn id would be deduplicated into the old edit.
             txn = hashlib.sha256(("notice-edit-" + event_id + ":" + str(time.time_ns())).encode()).hexdigest()
             try:
-                await self.encrypted_edit(room, text, event_id, txn)
+                await self.encrypted_edit(room, text, event_id, txn, msgtype=msgtype)
             except MatrixHTTPError as exc:
                 if exc.part_rejected:
                     return False
                 raise
+            self._remember_text(event_id, room, self.c["account"], text)
         return True
 
     async def redact_notice(self, room: str, event_id: str) -> bool:

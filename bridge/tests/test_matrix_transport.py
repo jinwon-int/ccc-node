@@ -2894,3 +2894,136 @@ async def test_edit_and_redact_notice(tmp_path: Path) -> None:
             await f.edit_notice(room, "$status", "x")
         assert len(paths) == calls_before
         assert await f.redact_notice(room, "$status") is True
+
+
+# --------------------------------------------------------------------------- #
+# The external-wait status line is an m.notice, not an m.text (#2088)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_quiet_notice_rows_go_out_as_m_notice_and_others_stay_m_text(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        outbox_ready(f)
+        events = iter(["$status", "$plain"])
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            return {"event_id": next(events)}
+
+        f.raw = raw
+        quiet = f.enqueue_notice(room, "⏳ **Waiting** for results", key="wait-status-1", msgtype="m.notice")
+        plain = f.enqueue_notice(room, "평범한 알림")
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
+            h.start(f.retry(f.send))
+            await h.until(lambda: not f.store.outbox())
+        status, other = sent_bodies(f)
+        assert status["msgtype"] == "m.notice" and "formatted_body" in status
+        assert other == {"msgtype": "m.text", "body": "평범한 알림"}
+        assert f.notice_event(quiet) == ("sent", "$status") and f.notice_event(plain) == ("sent", "$plain")
+        # Our own notice still feeds the reply-context cache.
+        assert f.recent_text["$status"] == (room, f.c["account"], "⏳ **Waiting** for results")
+        with pytest.raises(ValueError, match="unsupported-msgtype"):
+            f.enqueue_notice(room, "x", msgtype="m.emote")
+
+
+@pytest.mark.anyio
+async def test_too_large_quiet_notice_keeps_m_notice_on_the_plain_retry(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        outbox_ready(f)
+        calls: list[str] = []
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            calls.append(path)
+            if len(calls) == 1:
+                raise t.MatrixHTTPError(413, "M_TOO_LARGE")
+            return {"event_id": "$plain"}
+
+        f.raw = raw
+        f.enqueue_notice(room, "**굵게** 상태", msgtype="m.notice")
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp()}):
+            h.start(f.retry(f.send))
+            await h.until(lambda: not f.store.outbox())
+        first, retry = sent_bodies(f)
+        assert first["msgtype"] == "m.notice" and retry == {"msgtype": "m.notice", "body": "**굵게** 상태"}
+
+
+def test_only_marked_notice_rows_are_quiet() -> None:
+    from telegram_bot.core.matrix.state import QUIET_NOTICE_JOB_BODY, outbox_msgtype
+
+    assert outbox_msgtype({"event_id": "$notice-abc", "body": QUIET_NOTICE_JOB_BODY}) == "m.notice"
+    assert outbox_msgtype({"event_id": "$notice-abc", "body": "notice"}) == "m.text"
+    # A reply row's body is the user's own text: never read as the marker.
+    assert outbox_msgtype({"event_id": "$request", "body": QUIET_NOTICE_JOB_BODY}) == "m.text"
+    assert outbox_msgtype({"event_id": "$file-abc", "body": QUIET_NOTICE_JOB_BODY}) == "m.text"
+
+
+@pytest.mark.anyio
+async def test_edit_notice_keeps_the_notice_msgtype_and_refreshes_the_reply_cache(tmp_path: Path) -> None:
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        outbox_ready(f)
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            return {"event_id": "$edit"}
+
+        f.raw = raw
+        f._remember_text("$status", room, f.c["account"], "⏳ Waiting for results")
+        assert await f.edit_notice(room, "$status", "✅ CI green → continuing", msgtype="m.notice") is True
+        edit = sent_bodies(f)[-1]
+        assert edit["msgtype"] == "m.notice" and edit["m.new_content"]["msgtype"] == "m.notice"
+        assert edit["m.relates_to"] == {"rel_type": "m.replace", "event_id": "$status"}
+        # A reply to the status now quotes what it shows, not the first text.
+        assert f.recent_text["$status"] == (room, f.c["account"], "✅ CI green → continuing")
+        # The default (and the progress bubble's encrypted_edit) stays m.text.
+        assert await f.edit_notice(room, "$other", "x") is True
+        default = sent_bodies(f)[-1]
+        assert default["msgtype"] == "m.text" and default["m.new_content"]["msgtype"] == "m.text"
+
+
+@pytest.mark.anyio
+async def test_own_notice_is_trusted_reply_context_but_others_are_not(tmp_path: Path) -> None:
+    async with family(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+
+        class RoomMessageNotice:
+            """nio's notice event: a sibling of RoomMessageText, not a subclass."""
+
+            def __init__(self, sender: str, body: str, sender_key: str = "", verified: bool = True) -> None:
+                self.sender = sender
+                self.body = body
+                self.sender_key = sender_key
+                self.verified = verified
+                self.decrypted = True
+                self.source: dict[str, Any] = {}
+
+        setattr(h.nio, "RoomMessageNotice", RoomMessageNotice)
+        mine = RoomMessageNotice(sender=h.account, body="⏳ Waiting for results")
+        theirs = RoomMessageNotice(sender=DAD, body="가족 알림", sender_key="c" * 43)
+        unverified = RoomMessageNotice(sender=h.account, body="x", verified=False)
+        assert f._trusted_text(mine) and not f._trusted_text(unverified)
+        # Another sender's notice is no reply parent (only RoomMessageText was, #1943).
+        assert not f._trusted_text(theirs)
+
+        # Cache miss (e.g. after a restart): the fetched parent is our own
+        # status notice, and the reply is quoted against it.
+        client_mock(f)
+        setattr(h.nio, "Event", types.SimpleNamespace(parse_encrypted_event=lambda raw: h.nio.MegolmEvent()))
+        f.client.decrypt_event = Mock(return_value=mine)
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            return {"event_id": "$parent", "type": "m.room.encrypted", "content": {}}
+
+        f.raw = raw
+        await f.input(_admit_reply(f))
+        job = f.store.claim()
+        assert job is not None and job["body"] == (
+            "[Reply context: the user is replying to your (the assistant's) earlier message]\n"
+            "> ⏳ Waiting for results\n\n이거 다시 설명해줘"
+        )
+        assert f.recent_text["$parent"] == (room, h.account, "⏳ Waiting for results")

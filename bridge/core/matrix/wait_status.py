@@ -6,7 +6,9 @@ the same channel-neutral renderer, planner, flag and id store
 (:mod:`telegram_bot.core.external_wait_status`). Only the three channel
 operations differ:
 
-* **send** goes through the durable outbox (``enqueue_notice``). The outbox
+* **send** goes through the durable outbox (``enqueue_notice``) as an
+  ``m.notice`` (:data:`STATUS_MSGTYPE`): a bot status line clients should not
+  ping or notify on, unlike an ``m.text`` reply. The outbox
   is one ``seq``-ordered queue, so a status queued after the turn's reply row
   is ready is delivered after that reply by construction, with the same
   device pinning, room gate, retry and crash-safe part acknowledgement as
@@ -14,7 +16,8 @@ operations differ:
   records the Matrix event id the row became (``jobs.sent_event``); the
   transport's ``delivered`` hook then swaps it in and re-plans the route.
 * **edit** is a direct ``m.replace`` of that event (``edit_notice``), like the
-  progress bubble's edits; the stored text hash only advances on success, so
+  progress bubble's edits, and stays an ``m.notice`` (fallback and
+  ``m.new_content``); the stored text hash only advances on success, so
   a failed edit is retried by the next sync.
 * **delete** is a redaction (``redact_notice``).
 
@@ -58,6 +61,8 @@ logger = logging.getLogger(__name__)
 PENDING_PREFIX = "outbox:"
 #: Outbox row ids of queued notices (``MatrixStore.notice``).
 _NOTICE_ROW_PREFIX = "$notice-"
+#: Message type of the status message and its edits: a notice, not a reply.
+STATUS_MSGTYPE = "m.notice"
 #: Upper bound for one direct edit or redaction.
 IO_TIMEOUT_S = 30.0
 #: Transport capabilities the projection needs; without them it stays silent
@@ -155,7 +160,7 @@ class MatrixWaitStatusMixin:
         elif action == "edit" and stored is not None and text is not None:
             event_id = str(stored.get("message_id"))
             async with asyncio.timeout(IO_TIMEOUT_S):
-                edited = await transport.edit_notice(room, event_id, text)
+                edited = await transport.edit_notice(room, event_id, text, msgtype=STATUS_MSGTYPE)
             if edited:
                 store.put(user_id, chat_id, message_id=event_id, text_hash=text_hash_of(text))
                 return
@@ -207,7 +212,7 @@ class MatrixWaitStatusMixin:
         # Notice rows are permanent and keyed: a fresh key per status message
         # (a reused key with different text is an identity conflict).
         key = f"wait-status-{time.time_ns()}-{secrets.token_hex(4)}"
-        row = transport.enqueue_notice(room, text, key=key)
+        row = transport.enqueue_notice(room, text, key=key, msgtype=STATUS_MSGTYPE)
         if not isinstance(row, str) or not row:
             logger.debug("Matrix external-wait status queued without a row id; not stored")
             return
@@ -264,4 +269,4 @@ class MatrixWaitStatusMixin:
             logger.info("Matrix external-wait status reconciled %d route(s) after start", len(selected))
 
 
-__all__ = ["IO_TIMEOUT_S", "MatrixWaitStatusMixin", "PENDING_PREFIX", "StatusSyncer"]
+__all__ = ["IO_TIMEOUT_S", "MatrixWaitStatusMixin", "PENDING_PREFIX", "STATUS_MSGTYPE", "StatusSyncer"]

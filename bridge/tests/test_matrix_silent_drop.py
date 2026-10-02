@@ -92,6 +92,19 @@ def test_family_rooms_only_answer_refusals_that_address_the_bot() -> None:
     assert policy().rejection(GROUP, edit, decrypted=True, now_ms=NOW) == REJECT_EDIT
 
 
+def test_the_bots_own_status_notice_and_its_edit_are_neither_run_nor_answered() -> None:
+    """The external-wait status line is an m.notice with m.replace edits (#2088)."""
+    status = {"msgtype": "m.notice", "body": "⏳ Waiting for results · PR #598 CI"}
+    edit = {"msgtype": "m.notice", "body": "* ✅ CI green",
+            "m.new_content": {"msgtype": "m.notice", "body": "✅ CI green"},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$status"}}
+    for content in (status, edit):
+        for room in (ROOM, GROUP):
+            raw = _with(content, sender=BOT)
+            assert policy().admit(room, raw, decrypted=True, now_ms=NOW) is None
+            assert policy().rejection(room, raw, decrypted=True, now_ms=NOW) is None
+
+
 def test_ineligible_events_stay_silent() -> None:
     oversize = {"msgtype": "m.text", "body": OVERSIZE}
     assert policy().rejection(ROOM, _with(oversize, sender=BOT), decrypted=True, now_ms=NOW) is None
@@ -182,6 +195,26 @@ async def test_stickers_get_one_notice_per_direct_room_and_untrusted_ones_none(t
         assert h.replies().count(NOTICE_UNSUPPORTED_KIND) == 1
         counts = f.store.get_meta("ignored_messages")
         assert counts["StickerEvent"] == 2 and counts["RoomMessageEmote"] == 1 and counts["RoomMessageNotice"] == 1
+
+
+async def test_the_bots_own_notices_echoed_by_sync_are_not_counted_or_answered(tmp_path: Path) -> None:
+    """Our m.notice status line and its edits come back through sync (#2088)."""
+    async with running(tmp_path) as h:
+        f = h.f
+        nio = _install_nio()
+        account, room = f.c["account"], f.c["rooms"][0]
+        f.c["not_before_ms"] = now = int(time.time() * 1000) - 1000
+        status = nio.RoomMessageNotice(account, "$status", "", now + 500)
+        status.source = {"content": {"msgtype": "m.notice", "body": "⏳ Waiting for results"}}
+        edit = nio.RoomMessageNotice(account, "$status-edit", "", now + 600)
+        edit.source = {"content": {"msgtype": "m.notice", "body": "* ✅ CI green",
+                                   "m.new_content": {"msgtype": "m.notice", "body": "✅ CI green"},
+                                   "m.relates_to": {"rel_type": "m.replace", "event_id": "$status"}}}
+        assert f.admit_event(room, status) is None
+        assert f.admit_event(room, edit) is None
+        assert h.replies() == []
+        assert f.store.get_meta("ignored_messages") is None
+        assert f.store.get_meta("unsupported_kind_counted") is None
 
 
 async def test_rewording_a_notice_in_a_later_release_never_stops_the_bridge(

@@ -66,10 +66,15 @@ class StatusTransport(FakeTransport):
         self.redactions: list[tuple[str, str]] = []
         self.edit_result: Any = True
         self.redact_result: Any = True
+        self.notice_msgtypes: list[str] = []
+        self.edit_msgtypes: list[str] = []
         self._seq = 0
 
-    def enqueue_notice(self, room_id: str, text: str, *, key: str | None = None) -> str:  # type: ignore[override]
+    def enqueue_notice(  # type: ignore[override]
+        self, room_id: str, text: str, *, key: str | None = None, msgtype: str = "m.text"
+    ) -> str:
         super().enqueue_notice(room_id, text, key=key)
+        self.notice_msgtypes.append(msgtype)
         self._seq += 1
         row = f"$notice-{self._seq}"
         self.rows[row] = {"room": room_id, "text": text, "state": "pending", "event": None}
@@ -86,8 +91,9 @@ class StatusTransport(FakeTransport):
             return "gone", None
         return row["state"], row["event"]
 
-    async def edit_notice(self, room: str, event_id: str, text: str) -> bool:
+    async def edit_notice(self, room: str, event_id: str, text: str, *, msgtype: str = "m.text") -> bool:
         self.edits.append((room, event_id, text))
+        self.edit_msgtypes.append(msgtype)
         if isinstance(self.edit_result, BaseException):
             raise self.edit_result
         return bool(self.edit_result)
@@ -170,6 +176,9 @@ async def test_send_is_queued_then_adopted_edited_and_redacted(
     await bot._sync_external_wait_status(uid, cid)
     assert len(transport.edits) == 1 and len(transport.notices) == 1
 
+    # A bot status line, not a reply: the send and its edit are m.notice (#2088).
+    assert transport.notice_msgtypes == ["m.notice"] and transport.edit_msgtypes == ["m.notice"]
+
     # Thirty-one minutes later nothing recent is left: redact and forget.
     later = time.time() + 31 * 60
     monkeypatch.setattr(wait_status, "time", SimpleNamespace(time=lambda: later, time_ns=time.time_ns))
@@ -218,6 +227,8 @@ async def test_edit_refused_resends_while_monitoring(tmp_path: Path, matrix_conf
     await bot._sync_external_wait_status(uid, cid)
     assert [e[1] for e in transport.edits] == ["$old"] and len(transport.notices) == 1
     assert store.get(uid, cid)["message_id"] == PENDING_PREFIX + "$notice-1"
+    # The re-post after a refused edit is a notice too.
+    assert transport.notice_msgtypes == ["m.notice"]
 
 
 async def test_edit_refused_without_monitoring_just_forgets(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
