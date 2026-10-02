@@ -34,14 +34,29 @@ SENDABLE_FILE_EXTENSIONS = (
     # video
     "mp4", "mov", "webm", "mkv", "avi", "m4v",
 )
+# Extensions that are deliverables ONLY under an ``artifacts/`` directory
+# (#2109 C). An HTML file is usually web source an ordinary coding turn edits
+# ("I changed public/index.html"), so it stays off the general list; a
+# generated single-file report the agent writes under
+# ``…/artifacts/…`` (e.g. ``~/.claude/state/artifacts/fleet-matrix.html``) is
+# the owner's deliverable and is sent like any document.
+ARTIFACT_ONLY_EXTENSIONS = ("html", "htm")
+ARTIFACT_DIR_NAME = "artifacts"
 # Match both absolute (/foo/bar.pdf) and relative (foo/bar.pdf) file paths.
 # A directory separator is required (reduces prose false-positives), and the
 # trailing (?![A-Za-z0-9]) makes the extension alternation order-independent
-# and stops partial matches (e.g. ".json" is not clipped to ".js").
+# and stops partial matches (e.g. ".json" is not clipped to ".js"). The second
+# alternative admits ARTIFACT_ONLY_EXTENSIONS only when an ``artifacts``
+# directory component precedes the file name. Inner groups are non-capturing
+# so ``findall`` keeps returning the whole path.
 FILE_PATH_RE = re.compile(
-    r"(/?(?:[\w.@-]+/)+[\w.@-]+\.(?:"
+    r"((?:/?(?:[\w.@-]+/)+[\w.@-]+\.(?:"
     + "|".join(SENDABLE_FILE_EXTENSIONS)
-    + r"))(?![A-Za-z0-9])",
+    + r"))|(?:/?(?:[\w.@-]+/)*"
+    + ARTIFACT_DIR_NAME
+    + r"/(?:[\w.@-]+/)*[\w.@-]+\.(?:"
+    + "|".join(ARTIFACT_ONLY_EXTENSIONS)
+    + r")))(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -71,4 +86,11 @@ def resolve_deliverable_paths(content: str, project_root: Path, *, max_bytes: in
     return paths
 
 
-__all__ = ["FILE_PATH_RE", "IMAGE_EXTS", "SENDABLE_FILE_EXTENSIONS", "resolve_deliverable_paths"]
+__all__ = [
+    "ARTIFACT_DIR_NAME",
+    "ARTIFACT_ONLY_EXTENSIONS",
+    "FILE_PATH_RE",
+    "IMAGE_EXTS",
+    "SENDABLE_FILE_EXTENSIONS",
+    "resolve_deliverable_paths",
+]

@@ -222,6 +222,17 @@
       "tree_sha256": "f611770784b65b749486c0152cd88ecd95295174ee55e95fdc8964adcacc878a"
     },
     {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Use when an owner-facing result is too wide or too long for a chat bubble — a multi-column fleet status matrix, a cost/usage dashboard, a per-node self-update table — and a throw-away single-file HTML page the owner can open on a phone or laptop would read better. Builds one self-contained HTML (inline CSS, no JavaScript, no external requests) from a small JSON spec, writes it under an artifacts/ directory, and names the path so the bridge attaches it to the Telegram/Matrix reply (#2109 C).",
+      "files": 3,
+      "managed": false,
+      "name": "fleet-html-report",
+      "source": "skills/fleet-html-report",
+      "status": "active",
+      "tree_sha256": "a3eaa2f88794222d1ca9ebb08b0cf07d1027eedca0d0073833d6f957258c9b40"
+    },
+    {
       "audience": "shared",
       "classification": "claude-only",
       "description": "Use when handing off unfinished multi-node work — mid-pilot, at session end with items outstanding, or moving a task to another node. Classify each item's approval gate, record where it may NOT run, verify each cited metric's counting method, and name prior errors so they aren't rediscovered.",

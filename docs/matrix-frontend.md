@@ -339,7 +339,8 @@ same prompt contract as Telegram (a local path in the prompt):
 
 As on Telegram, a real file an answer names — the shared rule in
 `core/deliverables.py` (documents, data, archives, images, audio, video; not
-source code) under `PROJECT_ROOT` — follows the answer. Matrix-specific:
+source code; `html`/`htm` only under an `artifacts/` directory, #2109 C)
+under `PROJECT_ROOT` — follows the answer. Matrix-specific:
 
 - **Encrypted**: the file is AES-256-CTR encrypted locally (`EncryptedFile`
   v2), only the ciphertext is uploaded (`/_matrix/media/v3/upload`, no file

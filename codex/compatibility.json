@@ -79,6 +79,12 @@
       "codex_skill": "fleet-disk-constraint-triage"
     },
     {
+      "pattern": "skills/fleet-html-report/**",
+      "compatibility": "claude-only",
+      "audience": "claude",
+      "reason": "Owner-facing single-file HTML report builder (#2109 C): the Claude bridge delivers html only from an artifacts/ path; a Codex/Piri port is a separate decision"
+    },
+    {
       "pattern": "skills/gh-ci-wait/**",
       "compatibility": "adapted",
       "audience": "shared",
