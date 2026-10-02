@@ -21,7 +21,9 @@ case "$1 $2" in
   "api repos/o/gamma/hooks") echo "" ;;
   "api repos/o/delta/hooks") exit 1 ;;
   "api repos/o/beta/contents/.github/workflows") echo 3 ;;
-  "api repos/o/gamma/contents/.github/workflows") exit 1 ;;
+  # a 404 from gh prints the error body on stdout AND exits non-zero (the
+  # 2026-10-02 live run misread this as "has workflows")
+  "api repos/o/gamma/contents/.github/workflows") echo '{"message":"Not Found","status":"404"}' | jq 'if type=="array" then length else 0 end'; exit 1 ;;
   "issue comment") echo "commented" ;;
   *) echo "stub gh: unexpected: $*" >&2; exit 1 ;;
 esac

@@ -58,8 +58,12 @@ while read -r name created pushed vis; do
   if [ -n "$hooks" ]; then
     rows+=("$name hooks=$hooks created=$created pushed=$pushed"); covered=$((covered+1)); continue
   fi
-  workflows="$(gh api "repos/$ORG/$name/contents/.github/workflows" --jq 'if type=="array" then length else 0 end' 2>/dev/null || echo 0)"
-  if [ "${workflows:-0}" = "0" ] && [ "$INCLUDE_NO_CI" = 0 ]; then
+  # A missing directory is a 404: gh still prints the error body on stdout and
+  # exits non-zero, so take the first line only and treat anything that is not
+  # a positive integer as "no workflows".
+  workflows="$(gh api "repos/$ORG/$name/contents/.github/workflows" --jq 'if type=="array" then length else 0 end' 2>/dev/null | head -1)"
+  case "$workflows" in ''|*[!0-9]*) workflows=0 ;; esac
+  if [ "$workflows" = "0" ] && [ "$INCLUDE_NO_CI" = 0 ]; then
     rows+=("$name hooks=- created=$created pushed=$pushed note=no-ci-workflows (skipped)"); skipped=$((skipped+1)); continue
   fi
   rows+=("$name hooks=MISSING created=$created pushed=$pushed workflows=${workflows:-0}")
