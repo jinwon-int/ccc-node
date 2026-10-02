@@ -200,6 +200,17 @@
       "tree_sha256": "095ccccf0e5bcbe7dba94a2d6e93f74feab1a3de90c24ba2f62531b3cde0ef56"
     },
     {
+      "audience": "claude",
+      "classification": "claude-only",
+      "description": "Use when an owner-facing answer would be clearer as a picture than as a table or prose — a fleet status matrix, an incident/canary timeline, or a PR/issue dependency graph. Renders a small JSON spec to PNG (and SVG) with no external renderer, saves it under the node's project root, and names the path so the bridge attaches it to the Telegram/Matrix reply (#2109 B).",
+      "files": 3,
+      "managed": false,
+      "name": "fleet-diagram",
+      "source": "skills/fleet-diagram",
+      "status": "active",
+      "tree_sha256": "3fcaaa554fe47a7c2f77cd52a6907a407a930826eb94d8e976106a68b4d7835e"
+    },
+    {
       "audience": "shared",
       "classification": "adapted",
       "description": "Audit disk usage across a fleet, classify severity, identify root causes per node, and delegate cleanup to node-local agents with durable Wiki tickets instead of centralized remote deletes. Use when a rollout/update is blocked by low disk, when doing periodic fleet health checks, or when a node reports \"no space\" — especially mixed fleets with Android/Termux nodes where df / misreports capacity.",
