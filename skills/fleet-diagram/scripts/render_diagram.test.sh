@@ -4,6 +4,7 @@
 # (skipped otherwise), fail-closed exits on bad specs, name sanitisation and
 # the --format contract. No network, private output dir.
 set -uo pipefail
+# shellcheck disable=SC2034  # test variables are read inside the eval'd ok() conditions
 DIR="$(cd "$(dirname "$0")" && pwd)"
 R="$DIR/render_diagram.py"
 pass=0; fail=0
@@ -16,7 +17,7 @@ has_pil=0
 python3 -c "import PIL" 2>/dev/null && has_pil=1
 
 cat > "$TMP/matrix.json" <<'EOF'
-{"kind":"matrix","title":"매트릭스 <t>","rows":["seoseo","yukson"],"cols":["harness","bridge"],
+{"kind":"matrix","title":"매트릭스 <t>","rows":["node-a","node-b"],"cols":["harness","bridge"],
  "cells":[["ok","warn"],["fail","n/a"]],"legend":{"ok":"green","warn":"amber","fail":"red","n/a":"grey"}}
 EOF
 cat > "$TMP/timeline.json" <<'EOF'

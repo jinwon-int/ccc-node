@@ -31,14 +31,14 @@ large graph reads worse than a list.
 
    ```json
    {"kind": "matrix", "title": "플릿 self-update 매트릭스",
-    "rows": ["seoseo", "yukson"], "cols": ["harness", "bridge"],
+    "rows": ["node-a", "node-b"], "cols": ["harness", "bridge"],
     "cells": [["ok", "ok"], ["ok", "warn"]],
     "legend": {"ok": "green", "warn": "amber", "fail": "red", "n/a": "grey"}}
    ```
    ```json
    {"kind": "timeline", "title": "#2295 카나리",
-    "events": [{"t": "13:25", "label": "nosuk 재시작", "lane": "nosuk", "status": "ok"},
-               {"t": "13:40", "label": "r1 provider_timeout", "lane": "nosuk", "status": "fail"}]}
+    "events": [{"t": "13:25", "label": "node-c 재시작", "lane": "node-c", "status": "ok"},
+               {"t": "13:40", "label": "r1 provider_timeout", "lane": "node-c", "status": "fail"}]}
    ```
    ```json
    {"kind": "dag", "title": "PR 의존",

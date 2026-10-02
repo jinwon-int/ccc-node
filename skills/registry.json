@@ -208,7 +208,7 @@
       "name": "fleet-diagram",
       "source": "skills/fleet-diagram",
       "status": "active",
-      "tree_sha256": "3177f71efce5c46c0dc594af953ed0f34daff1f78fc7bd0bc3c5ca34a850336b"
+      "tree_sha256": "70118d909f7b4fd3cdebbed67fa41483b08945a473d494cd53e611a04d0e2640"
     },
     {
       "audience": "shared",
