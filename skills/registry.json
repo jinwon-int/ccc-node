@@ -258,12 +258,12 @@
       "audience": "claude",
       "classification": "adapted",
       "description": "Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. PR-first — exact-head green checks, cross-account review (jinon86/seoseo-ai via relay) after fresh user approval, squash merge, cleanup. Not for Wiki edits (wiki-record).",
-      "files": 3,
+      "files": 5,
       "managed": false,
       "name": "gh-pr-flow",
       "source": "skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "026e8c2707005e3517f91df424657ae760278b4cb8485112c019d3e95191aa3a"
+      "tree_sha256": "c775e2e466d391b792ebf4f65d384c66ec187386005ba4a9dcbd60ad8172b04a"
     },
     {
       "audience": "claude",
