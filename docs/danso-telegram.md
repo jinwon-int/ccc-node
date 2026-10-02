@@ -406,6 +406,18 @@ on successful exit remains a protocol error. Native retry/replay rules do not
 change. Upgrade the bridge before the native binary; previous binaries remain
 compatible but cannot supply the new detail.
 
+Quota-exhaustion failures (the `http_diagnostic.rs` `quota_exhausted` code set:
+1113, 1308-1311, 1313-1321) additionally append a fixed code-derived hint as
+`zai_hint=<hint>` to the user-facing error line, so the chat states what to do
+without exposing provider prose. Window-reset codes (1308, 1310, 1316-1321)
+point to waiting for the window/cycle reset or moving the lane; account-action
+codes (1113, 1309, 1311, 1313-1315) state the required account step and that
+waiting will not clear it. The raw `zai_code` stays in the line for
+diagnostics; no reset *time* is ever claimed (the wire records remain
+body-free and `next_flush_time` is not parsed). Transient 429s (1302, 1305, or
+no provider code) and all other failure reasons keep the previous rendering
+with no hint.
+
 
 ## Restart and failure recovery confirmation (#1667)
 

@@ -134,6 +134,27 @@ TRANSPORT_PHASES = {'connect', 'before_response_headers', 'response_body'}
 # danso (#67 B) reports the bounded wire-retry attempt count: 1 on the first
 # try, more when bounded retries ran.
 TRANSPORT_KEYS = {'version', 'phase', 'elapsed_ms', 'request_bytes', 'attempts'}
+# Z.AI 429 quota codes rendered for users (#2090). Groups follow the danso
+# `HttpDiagnostic::quota_exhausted` contract and its docs/providers.md operator
+# table; transient 429s (1302, 1305, no code) keep the previous rendering. The
+# wire records stay body-free, so only this code-derived reset class is shown
+# and a reset *time* is never claimed.
+ZAI_QUOTA_HINTS = {
+    1308: 'usage window limit reached; wait for the window reset',
+    1310: 'weekly/monthly limit reached; wait for the cycle reset or move the lane',
+    1316: '5-hour window limit reached; wait for the window reset',
+    1317: '7-day window limit reached; usually move the lane instead of waiting',
+    1318: '5-hour window limit reached; wait for the window reset',
+    1319: '7-day window limit reached; usually move the lane instead of waiting',
+    1320: '5-hour window limit reached; wait for the window reset',
+    1321: '7-day window limit reached; usually move the lane instead of waiting',
+    1113: 'account action required: recharge or buy a resource package; waiting will not clear it',
+    1309: 'account action required: renew the expired subscription; waiting will not clear it',
+    1311: 'account action required: use a model the plan covers or upgrade the plan; waiting will not clear it',
+    1313: 'account action required: submit the fair-usage restore request; waiting will not clear it',
+    1314: 'account action required: contact the enterprise administrator about the expired package; waiting will not clear it',
+    1315: 'account action required: use a key that matches the product type; waiting will not clear it',
+}
 PROVIDER_REASONS = {
     'http_status', 'invalid_json', 'response_too_large', 'stream_ended',
     'invalid_stream', 'unsupported_stream_event', 'response_failed',
@@ -310,7 +331,9 @@ def _provider_detail(text, category, code):
 
 
 def _http_detail(text, category, code, provider_detail):
-    """Optional Z.AI metadata; cross-check the independently valid HTTP record."""
+    """Optional Z.AI metadata; cross-check the independently valid HTTP record.
+Quota-exhaustion codes gain a fixed user hint from ZAI_QUOTA_HINTS.
+"""
     if category != 'provider' or code != 3 or not provider_detail.startswith(', reason=http_status, http_status='):
         return ''
     lines = [line[len('DANSO_HTTP='):] for line in text.splitlines() if line.startswith('DANSO_HTTP=')]
@@ -335,6 +358,10 @@ def _http_detail(text, category, code, provider_detail):
         result = '' if provider_code is None else f', zai_code={provider_code}'
         if delay is not None:
             result += f', retry_after_seconds={delay}'
+        if provider_code is not None:
+            hint = ZAI_QUOTA_HINTS.get(provider_code)
+            if hint is not None:
+                result += f', zai_hint={hint}'
         return result
     except (ValueError, TypeError, RecursionError):
         return ''

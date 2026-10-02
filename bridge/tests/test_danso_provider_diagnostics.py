@@ -99,8 +99,48 @@ class ProviderDiagnostics(unittest.TestCase):
                 result = message(value)
                 self.assertIn('http_status=429', result)
                 self.assertNotIn('zai_code=', result)
+                self.assertNotIn('zai_hint=', result)
                 self.assertNotIn('PRIVATE', result)
         duplicate = primary + '\n' + '\n'.join(['DANSO_HTTP=' + json.dumps(valid)] * 2)
         self.assertNotIn('zai_code=', self.failure(duplicate).message)
         for delay in (None, 0, 86400):
             self.assertIn('zai_code=1305', message({**valid, 'retry_after_seconds': delay}))
+
+    def test_zai_quota_code_groups_render_user_hints(self):
+        primary = 'DANSO_PROVIDER=' + json.dumps({
+            'version': 1, 'reason': 'http_status', 'http_status': 429,
+            'output_tokens_max': None})
+
+        def message(code):
+            http = {'version': 1, 'provider': 'zai', 'http_status': 429,
+                    'provider_code': code, 'retry_after_seconds': None}
+            return self.failure(primary + '\nDANSO_HTTP=' + json.dumps(http)).message
+
+        window = {1308: 'usage window limit reached',
+                  1310: 'weekly/monthly limit reached',
+                  1316: '5-hour window limit reached', 1318: '5-hour window limit reached',
+                  1320: '5-hour window limit reached',
+                  1317: '7-day window limit reached', 1319: '7-day window limit reached',
+                  1321: '7-day window limit reached'}
+        account = {1113: 'recharge or buy a resource package',
+                   1309: 'renew the expired subscription',
+                   1311: 'use a model the plan covers',
+                   1313: 'submit the fair-usage restore request',
+                   1314: 'contact the enterprise administrator',
+                   1315: 'use a key that matches the product type'}
+        for code, phrase in window.items():
+            with self.subTest(code=code):
+                result = message(code)
+                self.assertIn(f'zai_code={code}, zai_hint={phrase}', result)
+                self.assertIn('wait', result)
+        for code, phrase in account.items():
+            with self.subTest(code=code):
+                result = message(code)
+                self.assertIn(f'zai_code={code}, zai_hint=account action required: {phrase}',
+                              result)
+                self.assertIn('waiting will not clear it', result)
+        for code in (None, 1302, 1305):
+            with self.subTest(code=code):
+                result = message(code)
+                self.assertNotIn('zai_hint=', result)
+                self.assertIn('No automatic replay.', result)
