@@ -453,6 +453,72 @@ ok "memory check accepts exactly one standalone hook for a Claude feed" '[ "$rc"
   .nunchi.status == "ok" and .nunchi.cron.feed == "claude"
   and .nunchi.standalone_sessionstart_hooks == 1
 '\'' >/dev/null <<<"$out"'
+
+# A Claude audience-scoped lane has no verbatim MemPalace refresh by design
+# (install-nunchi.sh skips it: ~/.claude/projects has no per-session audience
+# router). With the mempalace CLI installed the probe used to demand exactly
+# one refresh cron and report nunchi=degraded/refresh-count on a correctly
+# configured node (observed 2026-10-02). Per-scope refresh status files a
+# previous Piri lane left behind only age there and must not be judged.
+cs_root="$TMP/claude-scoped-root"
+cs_private="$cs_root/private-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+mkdir -p "$cs_root/shared/piri/sessions" "$cs_root/shared/nunchi" "$cs_private/piri/sessions"
+chmod 700 "$cs_root" "$cs_root/shared" "$cs_root/shared/piri/sessions" "$cs_root/shared/nunchi" \
+  "$cs_private" "$cs_private/piri/sessions"
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"piri","state":"ok","exit_code":0,"started_at":1,"finished_at":2}' \
+  > "$cs_root/shared/nunchi/mempalace-refresh.status.json"
+chmod 600 "$cs_root/shared/nunchi/mempalace-refresh.status.json"
+cs_env="CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$cs_root"
+cs_feed="*/10 * * * * $cs_env bash /tmp/ingest-cron.sh # nunchi:#816 gen=h_0123456789ab"
+cs_bench="7 11 * * 1 $cs_env bash /tmp/bench.sh # nunchi:#816 gen=h_0123456789ab"
+run_cs_probe() {  # <crontab-text>
+  HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+    CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CACHE_TTL_SEC=10 \
+    CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+    CCC_NUNCHI_CRONTAB_TEXT="$1" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1
+}
+out="$(run_cs_probe "$cs_feed"$'\n'"$cs_bench")"; rc=$?
+ok "claude audience-scoped lane without a refresh cron is not degraded for it" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.status == "ok" and .nunchi.reasons == [] and .nunchi.cron.feed == "claude"
+  and .nunchi.cron.managed_refresh_count == 0
+  and .nunchi.cron.refresh_contract == "absent-by-design"
+  and .nunchi.audience_scoped.enabled == true
+  and .mempalace.cli_installed == true and .mempalace.required == true
+  and .mempalace.status == "optional" and .mempalace.reasons == []
+'\'' >/dev/null <<<"$out"'
+ok "claude audience-scoped lane reports but does not judge leftover Piri refresh status" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.audience_scoped.session_roots == 2
+  and .nunchi.audience_scoped.mempalace_status_partitions == 1
+  and .nunchi.audience_scoped.refresh_stale == 1
+  and (.mempalace.reasons | index("refresh-count") == null and index("refresh-stale") == null)
+'\'' >/dev/null <<<"$out"'
+cs_refresh="17 * * * * $cs_env bash /tmp/mempalace-refresh.sh claude /tmp/projects # nunchi:#816 gen=h_0123456789ab"
+out="$(run_cs_probe "$cs_feed"$'\n'"$cs_refresh"$'\n'"$cs_bench")"; rc=$?
+ok "a refresh cron on the claude audience-scoped lane is flagged as unexpected" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.status == "degraded" and (.nunchi.reasons | index("refresh-unexpected")) != null
+  and (.nunchi.reasons | index("refresh-count")) == null
+  and .mempalace.status == "degraded" and (.mempalace.reasons | index("refresh-unexpected")) != null
+'\'' >/dev/null <<<"$out"'
+out="$(run_cs_probe "$cs_feed"$'\n17 * * * * mempalace sweep /tmp/projects # nunchi:#816\n'"$cs_bench")"; rc=$?
+ok "a legacy sweep on the claude audience-scoped lane still fails closed" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.status == "degraded" and (.nunchi.reasons | index("legacy-sweep")) != null
+  and .mempalace.status == "degraded" and (.mempalace.reasons | index("legacy-sweep")) != null
+'\'' >/dev/null <<<"$out"'
+cs_piri="*/10 * * * * $cs_env bash /tmp/piri-feed.sh # nunchi:#816"$'\n'"17 * * * * $cs_env bash /tmp/mempalace-refresh.sh piri $cs_root # nunchi:#816"$'\n'"$cs_bench"
+out="$(run_cs_probe "$cs_piri")"; rc=$?
+ok "a Piri audience-scoped lane still judges per-scope refresh status" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.cron.feed == "piri" and .nunchi.cron.refresh_contract == "required"
+  and (.nunchi.reasons | index("refresh-count")) == null
+  and .mempalace.status == "degraded"
+  and (.mempalace.reasons | index("refresh-count")) != null
+  and (.mempalace.reasons | index("refresh-stale")) != null
+'\'' >/dev/null <<<"$out"'
+out="$(run_cs_probe $'*/10 * * * * bash /tmp/ingest-cron.sh # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816')"; rc=$?
+ok "a non-scoped Claude lane still requires its refresh cron when the CLI is installed" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.status == "degraded" and (.nunchi.reasons | index("refresh-count")) != null
+  and .nunchi.cron.refresh_contract == "required"
+'\'' >/dev/null <<<"$out"'
+
 python3 - "$probe_palace/chroma.sqlite3" <<'PY'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM embeddings"); db.commit(); db.close()

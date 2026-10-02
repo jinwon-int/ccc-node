@@ -706,6 +706,39 @@ def nunchi_ingest_probe(path: Path, now: int) -> dict[str, object]:
     }
 
 
+def refresh_cron_reasons(
+    *,
+    feed_kind: str,
+    refreshes: list[tuple[str, str, dict[str, str]]],
+    legacy_sweep_count: int,
+    required: bool,
+    absent_by_design: bool,
+) -> list[str]:
+    """Judge the managed MemPalace refresh lines against the lane's contract."""
+    reasons: list[str] = []
+    if absent_by_design:
+        # The Claude audience-scoped lane has no verbatim MemPalace refresh by
+        # design (install-nunchi.sh skips it; mempalace-refresh.sh refuses
+        # scoped non-Piri runs), so zero is the contract and any refresh or
+        # legacy sweep line is a misconfiguration.
+        if refreshes:
+            reasons.append("refresh-unexpected")
+        if legacy_sweep_count != 0:
+            reasons.append("legacy-sweep")
+        return reasons
+    if not required:
+        return reasons
+    if len(refreshes) != 1:
+        reasons.append("refresh-count")
+    if legacy_sweep_count != 0:
+        reasons.append("legacy-sweep")
+    if len(refreshes) == 1 and refreshes[0][0] != feed_kind:
+        reasons.append("refresh-provider-arg")
+    if len(refreshes) == 1 and not refreshes[0][1]:
+        reasons.append("refresh-target-arg")
+    return reasons
+
+
 def nunchi_readiness_reasons(
     *,
     hook_installed: bool,
@@ -724,6 +757,7 @@ def nunchi_readiness_reasons(
     refresh_contract_required: bool,
     configuration_conflicts: list[str],
     ingest: dict[str, object],
+    refresh_absent_by_design: bool = False,
 ) -> list[str]:
     reasons: list[str] = []
     if not hook_installed:
@@ -736,15 +770,15 @@ def nunchi_readiness_reasons(
         reasons.append("facts-empty-stale")
     if feed_count != 1:
         reasons.append("feed-count")
-    if refresh_contract_required:
-        if len(refreshes) != 1:
-            reasons.append("refresh-count")
-        if legacy_sweep_count != 0:
-            reasons.append("legacy-sweep")
-        if len(refreshes) == 1 and refreshes[0][0] != feed_kind:
-            reasons.append("refresh-provider-arg")
-        if len(refreshes) == 1 and not refreshes[0][1]:
-            reasons.append("refresh-target-arg")
+    reasons.extend(
+        refresh_cron_reasons(
+            feed_kind=feed_kind,
+            refreshes=refreshes,
+            legacy_sweep_count=legacy_sweep_count,
+            required=refresh_contract_required,
+            absent_by_design=refresh_absent_by_design,
+        )
+    )
     if configuration_conflicts:
         reasons.append("cron-env-conflict")
     if bench_count != 1:
@@ -791,6 +825,17 @@ def nunchi_ingest_reasons(
     return ["ingest-unobserved"] if facts_age > ttl else []
 
 
+def refresh_absent_by_design(feed_kind: str, audience_scoped: bool) -> bool:
+    """True for the one lane whose MemPalace refresh cron is absent on purpose.
+
+    ``install-nunchi.sh --claude --audience-scoped`` never wires the verbatim
+    refresh: ``~/.claude/projects`` has no per-session audience router, so a
+    sweep would mix every audience into one palace. Piri scoped lanes and
+    non-scoped Claude lanes keep the refresh contract.
+    """
+    return audience_scoped and feed_kind == "claude"
+
+
 def probe_nunchi(
     state: Path,
     claude: Path,
@@ -804,6 +849,7 @@ def probe_nunchi(
     mempalace_required: bool,
     mempalace_cli_installed: bool,
     configuration_conflicts: list[str],
+    audience_scoped: bool = False,
 ) -> tuple[dict[str, object], str, str, int, int, dict[str, str]]:
     mode_file = state / "nunchi.mode"
     try:
@@ -839,6 +885,14 @@ def probe_nunchi(
         or managed_refresh_count != 0
         or legacy_sweep_count != 0
     )
+    refresh_absent = refresh_absent_by_design(feed_kind, audience_scoped)
+    refresh_contract = (
+        "absent-by-design"
+        if refresh_absent
+        else "required"
+        if refresh_contract_required
+        else "optional"
+    )
     standalone = standalone_hook_count(claude / "settings.local.json") if mode == "on" else 0
     hook_installed = (claude / "hooks/nunchi/nunchi.py").is_file()
 
@@ -866,6 +920,7 @@ def probe_nunchi(
             refresh_contract_required=refresh_contract_required,
             configuration_conflicts=configuration_conflicts,
             ingest=ingest,
+            refresh_absent_by_design=refresh_absent,
         )
         nunchi_status = "ok" if not nunchi_reasons else "degraded"
     else:
@@ -899,6 +954,7 @@ def probe_nunchi(
             "managed_refresh_count": managed_refresh_count,
             "legacy_sweep_count": legacy_sweep_count,
             "bench_count": bench_count,
+            "refresh_contract": refresh_contract,
         },
     }
     refresh_environment = refreshes[0][2] if managed_refresh_count == 1 else {}
@@ -1102,6 +1158,7 @@ def main() -> int:
         mempalace_required=required,
         mempalace_cli_installed=mp_cli.is_file(),
         configuration_conflicts=configuration_conflicts,
+        audience_scoped=audience_scoped,
     )
     nunchi["audience_scoped"] = audience_probe
     mempalace_environment = {**managed_environment, **refresh_environment}
@@ -1124,7 +1181,17 @@ def main() -> int:
             scoped_reasons.append("audience-invalid")
         expected = int(audience_probe["session_roots"])
         status_count = int(audience_probe["mempalace_status_partitions"])
-        if bool(mempalace["cli_installed"]) or bool(mempalace["required"]):
+        if refresh_absent_by_design(provider, audience_scoped):
+            # Nothing refreshes per-scope palaces on this lane, so per-scope
+            # status files (e.g. left by a previous Piri lane) only age; they
+            # are reported in the counts but are not judged. A refresh or
+            # legacy sweep line here is unexpected and still fails closed.
+            if managed_refresh_count != 0:
+                scoped_reasons.append("refresh-unexpected")
+            if legacy_sweep_count != 0:
+                scoped_reasons.append("legacy-sweep")
+            scoped_status = "degraded" if scoped_reasons else "optional"
+        elif bool(mempalace["cli_installed"]) or bool(mempalace["required"]):
             if expected != status_count:
                 scoped_reasons.append("refresh-count")
             if int(audience_probe["refresh_error"]):

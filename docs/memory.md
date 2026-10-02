@@ -180,7 +180,13 @@ when those counts change. Sidecars untouched for
 `CCC_NUNCHI_CLAUDE_SIDECAR_MAX_AGE_DAYS` (default 90, `0` disables) whose
 session has no pending input are pruned; a resumed session gets a fresh one on
 its next turn. The verbatim MemPalace sweep has no per-session router, so the
-installer does not wire it for this lane.
+installer does not wire it for this lane. `ccc-memory-check` treats that as
+the lane's contract (`nunchi.cron.refresh_contract: absent-by-design`,
+`mempalace: optional`) even with the MemPalace CLI installed, and neither it
+nor `ccc-doctor` judges refresh or ingest status files a previous Piri lane
+left under the audience root — nothing refreshes them any more. A refresh or
+legacy sweep line on this lane is still flagged (`refresh-unexpected` /
+`legacy-sweep`, doctor `refresh-cron-unexpected`).
 
 `ccc-doctor` reports a `nunchi claude audience map` DEFECT row while the
 audience root holds no sidecar that parses as a valid record (the tick also
