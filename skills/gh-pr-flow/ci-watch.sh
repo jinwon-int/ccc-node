@@ -78,7 +78,8 @@ while :; do
     sleep 5; continue
   fi
   misses=0
-  set -- $line; verdict="$1"; head="$2"; pending="$3"; bad="$4"; total="$5"; failing="$6"; merge="$7"
+  # fields: verdict head pending bad total failing merge (bad is folded into verdict by jq)
+  set -- $line; verdict="$1"; head="$2"; pending="$3"; total="$5"; failing="$6"; merge="$7"
   if [ -n "$HEAD" ] && [ "${head#"$HEAD"}" = "$head" ]; then
     emit superseded 13 "watched=$HEAD current=${head:0:12}"
   fi

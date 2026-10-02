@@ -80,7 +80,9 @@ Never claim auto-resume anyway. Either:
    — never a hand-rolled `until … grep` loop:
 
    ```bash
-   bash "$HOME/.claude/skills/gh-pr-flow/ci-watch.sh" --repo <owner/repo> --pr <n> --head <exact-head-sha>
+   # ci-watch.sh ships with the gh-pr-flow skill; <skills-dir> is the directory
+   # this skill was installed into (the runtime's skills root).
+   bash "<skills-dir>/gh-pr-flow/ci-watch.sh" --repo <owner/repo> --pr <n> --head <exact-head-sha>
    # 0 green · 10 failed (names the checks) · 11 merged · 12 closed · 13 head moved · 20 timeout
    ```
 
