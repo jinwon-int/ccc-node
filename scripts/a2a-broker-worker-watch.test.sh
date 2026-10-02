@@ -90,7 +90,7 @@ print(mod.fleet_diagnostic_title("a2a-worker-watch", "failed", out, ""))
 PY
 )"
 ok "agent-cron owner redaction leaves the output intact" '[ "$(printf "%s\n" "$title" | head -1)" = intact ]'
-ok "agent-cron fleet title counts exactly the DOWN line" '[ "$(printf "%s\n" "$title" | tail -1)" = "agent-cron fleet alert for task a2a-worker-watch: DOWN=1" ]'
+ok "agent-cron fleet title counts exactly the DOWN line and names its node" '[ "$(printf "%s\n" "$title" | tail -1)" = "agent-cron fleet alert for task a2a-worker-watch: DOWN=1 (alpha)" ]'
 run s2 --threshold 0s
 ok "same finding next run is held (exit 0, ONGOING)" '[ "$rc" = 0 ] && grep -q "^ONGOING alpha " "$TMP/out"'
 
