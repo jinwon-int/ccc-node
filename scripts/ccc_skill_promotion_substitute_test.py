@@ -91,6 +91,67 @@ class SubstituteDueTests(unittest.TestCase):
             self.assertFalse(promotion._revise_substitute_due(cfg, rows, "gwakga", "s1"))
 
 
+class NonWorkerAuthorTests(unittest.TestCase):
+    def config(self, days=7, authors=("broker-author",)):
+        cfg = config(days)
+        cfg.revise_non_worker_authors = authors
+        return cfg
+
+    def test_explicit_non_worker_is_due_without_aging_or_deferral(self):
+        self.assertTrue(promotion._revise_substitute_eligible(
+            self.config(), [], "broker-author", "sample"))
+
+    def test_regular_offline_author_still_waits(self):
+        self.assertFalse(promotion._revise_substitute_eligible(
+            self.config(), [aged_row("worker-author", "sample", iso(days_ago=0))],
+            "worker-author", "sample"))
+
+    def test_b2_off_disables_non_worker_delegation(self):
+        self.assertFalse(promotion._revise_substitute_eligible(
+            self.config(days=0), [], "broker-author", "sample"))
+
+    def test_allowlist_does_not_reset_one_substitute_limit(self):
+        rows = [{"kind": "a2a-revise-dispatch", "node": "broker-author",
+                 "name": "sample", "substitute": True}]
+        self.assertFalse(promotion._revise_substitute_eligible(
+            self.config(), rows, "broker-author", "sample"))
+
+    def test_online_author_wins_even_if_allowlisted(self):
+        with patch.object(promotion, "_revise_target_broker", return_value=None), \
+             patch.object(promotion, "_broker_id", return_value="primary"), \
+             patch.object(promotion, "_revise_substitute_pick") as pick:
+            result = promotion._resolve_revise_target(
+                self.config(), {}, [], "broker-author", "sample", "reviewer", "a" * 12, "secret")
+        self.assertEqual(result[3:], ("broker-author", None))
+        pick.assert_not_called()
+
+    def test_non_worker_uses_independent_trusted_substitute(self):
+        with patch.object(promotion, "_broker_online_worker_ids", return_value={"reviewer", "candidate", "untrusted"}), \
+             patch.object(promotion, "_remote_online_worker_ids", return_value=set()), \
+             patch.object(promotion, "_keyring_worker_ids", return_value=["reviewer", "candidate"]), \
+             patch.object(promotion, "_broker_id", return_value="primary"):
+            result = promotion._resolve_revise_target(
+                self.config(), {}, [], "broker-author", "sample", "reviewer", "a" * 12, "secret")
+        self.assertEqual(result[3:], ("candidate", "candidate"))
+
+    def test_no_independent_substitute_stays_deferred(self):
+        with patch.object(promotion, "_broker_online_worker_ids", return_value={"reviewer"}), \
+             patch.object(promotion, "_remote_online_worker_ids", return_value=set()), \
+             patch.object(promotion, "_keyring_worker_ids", return_value=["reviewer"]):
+            with self.assertRaisesRegex(promotion.PromotionError, "revise_author_offline"):
+                promotion._resolve_revise_target(
+                    self.config(), {}, [], "broker-author", "sample", "reviewer", "a" * 12, "secret")
+
+    def test_allowlist_parser_is_strict_and_deduplicated(self):
+        self.assertEqual(promotion._parse_non_worker_authors(" broker-a,broker-b,broker-a "),
+                         ("broker-a", "broker-b"))
+        self.assertEqual(promotion._parse_non_worker_authors(""), ())
+        for raw in ("Broker-A", "broker/a", "x" * 33, ",".join(f"n-{i}" for i in range(33))):
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                    promotion.PromotionError, "revise_non_worker_authors_invalid"):
+                promotion._parse_non_worker_authors(raw)
+
+
 class DeferralSchemaTests(unittest.TestCase):
     """#1767: the gate and its fixtures must read the row production writes.
 
