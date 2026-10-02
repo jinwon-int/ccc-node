@@ -22,12 +22,13 @@ ok() {
   else
     fail=$((fail + 1))
     echo "FAIL: $1"
-    # #1970: the count-based assertions cascade — one missed or extra wiki
-    # call from run N fails every later case — and CI kept only the FAIL
-    # lines, so two identical failures (main push + merge group,
-    # 2026-09-24) could not be told apart. Keep the evidence next to the
-    # verdict: the last hook exit code, the call count, and the hook's
-    # own output tail. validate-harness prints this block on failure.
+    # #1970: the count-based assertions used to cascade — one missed or extra
+    # wiki call from run N failed every later cumulative count, and CI kept
+    # only the FAIL lines, so the two identical failures (main push + merge
+    # group, 2026-09-24) could not be told apart. Counts are per-run now
+    # (run_refresh resets the log), so this block is self-contained evidence
+    # for exactly the failing run: the hook exit code, that run's wiki-call
+    # count, and the hook's own output tail. validate-harness prints it.
     echo "  diag: rc=${rc:-?} wiki_calls=$(wc -l < "$WIKI_CALL_LOG" 2>/dev/null || echo '?')"
     printf '%s\n' "${out:-}" | tail -12 | sed 's/^/  hook> /'
   fi
@@ -85,6 +86,10 @@ export WIKI_CALL_LOG="$TMP/wiki-calls.log"
 : > "$WIKI_CALL_LOG"
 
 run_refresh() {
+  # #1970: each run starts from an empty call log, so a count assertion only
+  # ever sees this run's calls — a missed or extra call in one run can no
+  # longer cascade into the assertions of every later run.
+  : > "$WIKI_CALL_LOG"
   PATH="$bin:$PATH" \
   HOME="$TMP/home" \
   CCC_STATE_DIR="$state" \
@@ -112,47 +117,47 @@ ok "status files are written atomically (no tmp leftovers) with integer duration
 printf 'prompt two should not churn the stable task key\n' > "$state/current-prompt.txt"
 out="$(run_refresh)"; rc=$?
 ok "fresh same-task refresh skips the wiki prefetch" \
-  '[ "$rc" = 0 ] && grep -q "wiki refresh skipped reason=fresh" <<<"$out" && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ]'
+  '[ "$rc" = 0 ] && grep -q "wiki refresh skipped reason=fresh" <<<"$out" && [ "$(wc -l < "$WIKI_CALL_LOG")" = 0 ]'
 ok "fresh skip does not advance refreshed_at" \
   '[ "$(jq -r ".refreshed_at" "$cache/.wiki.status.json")" = "$first_refreshed_at" ]'
 
 printf 'task beta\n' > "$state/current-task.txt"
 out="$(run_refresh)"; rc=$?
 ok "material task change refreshes the wiki prefetch" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 2 ]'
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ]'
 
 out="$(CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?
 ok "explicit wiki force refresh bypasses freshness" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 3 ]'
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ]'
 
 jq '.refreshed_at = "2000-01-01T00:00:00Z"' "$cache/.wiki.status.json" \
   > "$cache/.wiki.status.json.tmp" \
   && mv "$cache/.wiki.status.json.tmp" "$cache/.wiki.status.json"
 out="$(run_refresh)"; rc=$?
 ok "expired wiki status refreshes the prefetch" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 4 ]'
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ]'
 
 rm -f "$cache/wiki.txt"
 out="$(run_refresh)"; rc=$?
 ok "cleared wiki cache file repopulates despite a fresh ok status" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 5 ] && [ -s "$cache/wiki.txt" ]'
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ] && [ -s "$cache/wiki.txt" ]'
 
 # --- flock absent (Termux): mkdir fallback keeps the refresh running (#1480) --
 lockdir="$cache/.refresh.lock.d"
 out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?
 ok "no flock: refresh still runs its body via the mkdir fallback" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 6 ]'
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ]'
 ok "no flock: fallback is logged once and the lock dir is released on exit" \
   '[ "$(grep -c "flock unavailable; using mkdir fallback" <<<"$out")" = 1 ] && [ ! -d "$lockdir" ]'
 mkdir -p "$lockdir"
 out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?
 ok "no flock: a live lock dir keeps the run single-flight" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 6 ] && [ -d "$lockdir" ]'
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 0 ] && [ -d "$lockdir" ]'
 touch -d '-2 hours' "$lockdir"
 # shellcheck disable=SC2034  # out/rc are read via eval inside ok()
 { out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?; }
 ok "no flock: a stale lock dir from a dead holder is reclaimed" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 7 ] && [ ! -d "$lockdir" ]'
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ] && [ ! -d "$lockdir" ]'
 
 echo "----"
 echo "PASS=$pass FAIL=$fail"
