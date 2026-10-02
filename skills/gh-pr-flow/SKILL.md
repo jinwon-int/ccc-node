@@ -322,14 +322,26 @@ pr_id="$(gh pr view <n> --repo <owner/repo> --json id --jq .id)"
 gh api graphql \
   -f query='mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){clientMutationId}}' \
   -f id="$pr_id"
-# then poll until state MERGED (the queue evicts on failing group checks):
-gh pr view <n> --repo <owner/repo> --json state,mergeStateStatus
+# then watch BOTH the PR state and the queue entry — never "poll until MERGED":
+bash "$HOME/.claude/skills/gh-pr-flow/merge-queue-watch.sh" --repo <owner/repo> --pr <n>
 ```
 
+**Watch for eviction, not just for MERGED.** When the speculative group run
+fails, GitHub drops the queue entry silently: the PR stays `OPEN`/`CLEAN`
+with its approval intact and nothing on the PR changes, so a watch that only
+polls `state` waits forever (2026-10-02, ccc-node#2113 — evicted by a flaky
+shard test, noticed by the operator, not the watch). `merge-queue-watch.sh`
+polls the PR and the repo's `mergeQueue` entries together and exits on the
+first terminal event: `0` merged, `10` evicted (it names the failed
+`gh-readonly-queue/<branch>/pr-<n>-…` run and its failing jobs), `11` closed
+unmerged, `12` never enqueued, `20` timeout. Run it in the background and
+act on the exit code; on `10`, classify the failing job first — an unrelated
+flaky test means re-enqueue the same approved head (and record the flake on
+its issue); a real failure means push the fix, get fresh exact-head approval
+for the new head, then re-enqueue, as with any other push.
+
 Enqueue needs the head up to date and its checks green; a stale `BEHIND` head
-goes through the update-branch loop above first. If the group fails, the
-queue evicts the PR: push the fix, then get fresh exact-head approval for the
-new head before re-enqueueing, as with any other push.
+goes through the update-branch loop above first.
 
 **A queue merge does not clean up the head branch, and `--delete-branch`
 cannot be used to make it.** `gh pr merge -d` is refused outright on a queued
