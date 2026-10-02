@@ -49,9 +49,16 @@ nodes with 133–284 skills). The policy now fits recent skills into the budget:
    described while a more recent one is not.
 
 The budget is the one the settings will have after the run (the key may be set
-by that same run) for `--context-tokens` (default 200000, env
-`CCC_SKILL_LISTING_CONTEXT_TOKENS`); nodes on a larger context window may set
-it to their real window. The decision depends only on the inputs, so a second
+by that same run) for the node's context window, resolved in this order:
+`--context-tokens`, then env `CCC_SKILL_LISTING_CONTEXT_TOKENS`, then the
+window implied by `settings.json` `model` (#2108) — 1M for Fable / Mythos,
+Opus and Sonnet 4.6+, any `[1m]` id and the `opus` / `sonnet` / `fable` /
+`opusplan` aliases; 200000 for Haiku — and 200000 when the model is missing or
+unrecognised (a too-small budget only name-only's more, it never overflows).
+`plan` / `apply` print the window and its source (`plan --json`:
+`context_tokens`, `context_source`). Before #2108 the default was always
+200000, so 1M-context nodes were held to a fifth of their real budget and had
+recent skills name-only'd that would have fit. The decision depends only on the inputs, so a second
 `apply` is a no-op. A skill that fits again later (a skill was archived, the
 budget grew, a more recent skill aged out) gets its policy-owned entry removed.
 `release` removes every policy-owned entry, including these.
@@ -100,7 +107,7 @@ python3 ~/.claude/hooks/ccc-skill-listing-policy.py release         # remove eve
 `plan` prints an **estimate** of the listing size before/after
 (`- name: description` per skill, descriptions capped at
 `skillListingMaxDescChars`, default 1536) against a budget of
-`fraction × --context-tokens (200000) × 4` chars. Claude Code's exact
+`fraction × context window × 4` chars (window resolved as above). Claude Code's exact
 accounting differs; use `/context` in a session for the real number.
 
 The estimate breaks down into described chars (of which core), name-only

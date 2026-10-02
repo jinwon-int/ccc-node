@@ -31,6 +31,9 @@ Safety contract:
   does not own, or an owned key whose value an operator changed) always wins
   and is never modified;
 * ``skillListingBudgetFraction`` is set to 0.02 only when the key is absent;
+* the budget is computed for the context window from ``--context-tokens``,
+  env ``CCC_SKILL_LISTING_CONTEXT_TOKENS``, else the ``settings.json`` ``model``
+  (1M for Fable/Mythos and Opus/Sonnet 4.6+, 200k for Haiku or unknown; #2108);
 * ``settings.json`` is backed up and replaced atomically, only when the
   rendered result differs (a second ``apply`` is a no-op).
 
@@ -86,6 +89,15 @@ POLICY_BUDGET_FRACTION = 0.02
 DEFAULT_MAX_DESC_CHARS = 1536
 DEFAULT_DAYS = 30
 DEFAULT_CONTEXT_TOKENS = 200_000
+CONTEXT_1M_TOKENS = 1_000_000
+# Claude Code sizes the listing budget from the session model's real context
+# window, so a 1M-context node estimated at the 200k default was name-only'ing
+# recent skills that would have fit. Families with a 1M window:
+# Fable / Mythos, Opus and Sonnet 4.6 and later, any ``[1m]`` model id, and the
+# aliases that resolve to those. Haiku and anything unrecognised keep the 200k
+# default — a too-small assumed budget only name-only's more, never overflows.
+CONTEXT_1M_ALIASES = frozenset({"opus", "sonnet", "fable", "opusplan"})
+_MODEL_VERSION_RE = re.compile(r"^(opus|sonnet)-(\d+)(?:-(\d{1,2}))?(?=$|[-@])")
 CHARS_PER_TOKEN = 4
 REASON_OVER_BUDGET = "recent, over budget"
 
@@ -377,6 +389,48 @@ def effective_fraction(settings: dict[str, Any]) -> float:
     if not isinstance(fraction, (int, float)) or isinstance(fraction, bool) or not 0 < fraction <= 1:
         return DEFAULT_BUDGET_FRACTION
     return float(fraction)
+
+
+def context_tokens_for_model(model: Any) -> int | None:
+    """Context window implied by a ``settings.json`` ``model`` value, or None if unknown."""
+    if not isinstance(model, str) or not model.strip():
+        return None
+    m = model.strip().lower()
+    if m.endswith("[1m]"):
+        return CONTEXT_1M_TOKENS
+    m = re.sub(r"\[[^\]]*\]$", "", m)
+    if m in CONTEXT_1M_ALIASES:
+        return CONTEXT_1M_TOKENS
+    at = m.find("claude-")  # tolerate provider prefixes such as us.anthropic.claude-…
+    if at >= 0:
+        m = m[at + len("claude-"):]
+    if re.match(r"^(fable|mythos)(?=$|-)", m):
+        return CONTEXT_1M_TOKENS
+    if (v := _MODEL_VERSION_RE.match(m)):
+        major, minor = int(v.group(2)), int(v.group(3) or 0)
+        if major >= 5 or (major == 4 and minor >= 6):
+            return CONTEXT_1M_TOKENS
+        return DEFAULT_CONTEXT_TOKENS
+    if m.startswith("haiku"):
+        return DEFAULT_CONTEXT_TOKENS
+    return None
+
+
+def resolve_context_tokens(args: argparse.Namespace, settings_path: Path) -> None:
+    """Fill ``args.context_tokens``/``context_source``: flag > env > settings model > 200k."""
+    if args.context_tokens is not None:
+        return
+    if args.env_context_tokens is not None:
+        args.context_tokens, args.context_source = args.env_context_tokens, "env CCC_SKILL_LISTING_CONTEXT_TOKENS"
+        return
+    _, settings = load_settings(settings_path)
+    model = settings.get("model") if isinstance(settings, dict) else None
+    tokens = context_tokens_for_model(model)
+    if tokens is None:
+        args.context_tokens = DEFAULT_CONTEXT_TOKENS
+        args.context_source = f"default (model {model!r} not recognised)" if model else "default (no model in settings)"
+    else:
+        args.context_tokens, args.context_source = tokens, f"model {model}"
 
 
 def budget_chars_for(fraction: float, context_tokens: int) -> int:
@@ -710,6 +764,7 @@ def print_plan(args: argparse.Namespace, claude_dir: Path, raw: bytes | None,
     if args.json:
         print(json.dumps({
             "claude_dir": str(claude_dir), "recent_days": args.days,
+            "context_tokens": args.context_tokens, "context_source": args.context_source,
             "decisions": result["decisions"], "added": result["added"],
             "removed": result["removed"], "operator": sorted(result["operator"]),
             "budget_action": result["budget_action"], "before": before, "after": after,
@@ -722,6 +777,7 @@ def print_plan(args: argparse.Namespace, claude_dir: Path, raw: bytes | None,
             print(f"{d['decision']:<9} {d['skill']}  [{d['reason']}]")
     for line in summarize("plan", result, before, after, args.days, args.context_tokens):
         print(line)
+    print(f"  context window: {args.context_tokens // 1000}k ({args.context_source})")
 
 
 def write_result(claude_dir: Path, raw: bytes, result: dict[str, Any], stamp: str) -> str:
@@ -761,6 +817,7 @@ def run(args: argparse.Namespace) -> int:
     if cmd == "apply" and (why := disabled(claude_dir)):
         print(f"skill-listing-policy: disabled by {why}; nothing changed")
         return 0
+    resolve_context_tokens(args, settings_path)
 
     # release needs no core list: it only removes what this tool owns.
     core = [] if cmd == "release" else load_core(resolve_core_path(args.core))
@@ -797,6 +854,7 @@ def run(args: argparse.Namespace) -> int:
         after = estimate(result["settings"], skills, args.context_tokens, set(core))
         for line in summarize(cmd, result, before, after, args.days, args.context_tokens):
             print(line)
+        print(f"  context window: {args.context_tokens // 1000}k ({args.context_source})")
     return 0
 
 
@@ -824,7 +882,7 @@ def fraction(raw: str) -> float:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
-    defaults: dict[str, Any] = {"days": DEFAULT_DAYS, "context_tokens": DEFAULT_CONTEXT_TOKENS}
+    defaults: dict[str, Any] = {"days": DEFAULT_DAYS, "context_tokens": None}
     for key, env, check in (("days", "CCC_SKILL_LISTING_RECENT_DAYS", positive_days),
                             ("context_tokens", "CCC_SKILL_LISTING_CONTEXT_TOKENS", context_tokens)):
         raw = os.environ.get(env, "")
@@ -845,15 +903,18 @@ def main(argv: list[str] | None = None) -> int:
                        help="recent-use window in days (default 30; env CCC_SKILL_LISTING_RECENT_DAYS)")
         p.add_argument("--budget-fraction", type=fraction, default=POLICY_BUDGET_FRACTION,
                        help=f"{BUDGET_KEY} to set when the key is absent (default 0.02)")
-        p.add_argument("--context-tokens", type=context_tokens,
-                       default=defaults["context_tokens"],
+        p.add_argument("--context-tokens", type=context_tokens, default=None,
                        help="context window the budget (and the recent-skill fit) is computed "
-                            "for (default 200000; env CCC_SKILL_LISTING_CONTEXT_TOKENS)")
+                            "for (default: env CCC_SKILL_LISTING_CONTEXT_TOKENS, else inferred "
+                            "from the settings.json model — 1M for Fable/Mythos/Opus/Sonnet "
+                            "4.6+ — else 200000)")
         p.add_argument("--quiet", action="store_true", help="apply/release: one status line only")
         if name == "plan":
             p.add_argument("--summary", action="store_true", help="omit per-skill decision lines")
             p.add_argument("--json", action="store_true", help="machine-readable plan")
     args = parser.parse_args(argv)
+    args.env_context_tokens = defaults["context_tokens"]
+    args.context_source = "--context-tokens"
     try:
         return run(args)
     except PolicyError as exc:
