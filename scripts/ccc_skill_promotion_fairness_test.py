@@ -34,9 +34,11 @@ sys.modules[SPEC.name] = promotion
 SPEC.loader.exec_module(promotion)
 
 
-def envelope(node: str, name: str, created_at: str) -> dict:
+def envelope(
+    node: str, name: str, created_at: str, *,
+    description: str = "Use when testing fair candidate admission across collector sources",
+) -> dict:
     """A minimal envelope that survives `_candidate_from_envelope`."""
-    description = "a fixture skill description long enough to pass validation"
     body = (
         "---\n"
         f"name: {name}\n"
@@ -378,6 +380,23 @@ class CollectRunRotationTests(unittest.TestCase):
         return json.loads(self.cursor_path.read_text())
 
     # -- rotation -----------------------------------------------------------
+    def test_triggerless_legacy_envelope_is_preserved_and_does_not_block_peers(self):
+        invalid = envelope("deep", "legacy-skill", "2026-08-01T00:00:00Z",
+                           description="Audit a shared interface for consistency.")
+        self.remote["deep"] = [invalid]
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                result = self.collect(dry_run=dry_run)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["errors"], [{"source": "deep", "name": "legacy-skill",
+                                                    "code": "description_trigger_missing"}])
+                self.assertEqual([r["source"] for r in result["published"]], ["starved"])
+                self.assertEqual(self.remote["deep"], [invalid])
+                self.assertFalse(any(source == "deep" for source, _ in self.acked))
+                if dry_run:
+                    self.assertFalse(self.acked)
+                    self.assertFalse(self.cursor_path.exists())
+
     def test_missing_cursor_starts_at_the_canonical_first_source(self):
         self.stage_local("local-skill-a", "2026-08-01T00:00:00Z")
         result = self.collect()

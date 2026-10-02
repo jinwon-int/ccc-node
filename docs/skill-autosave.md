@@ -578,6 +578,15 @@ misclassified as fleet-shared. The private approved snapshot is also checked
 for normalized-name and description-similarity duplicates before a branch is
 published.
 
+The node snapshot/outbox and central publisher also require activation wording
+in the description, using the same `description_trigger.py` gate as the local
+installer. A legacy candidate without it fails with `description_trigger_missing`
+before creating an outbox or GitHub branch. Promotion checks the intake's actual
+`SKILL.md` before copying any approved files, so an old review cannot bypass this
+requirement. Write a meaningful usage condition and rerun the candidate's normal
+review path; automation does not invent trigger wording or rewrite signed source
+content to make validation pass.
+
 Each proposal writes exactly one candidate under
 `intake/<node>/<provider>/<candidate-id>/` on a content-addressed branch. Raw
 intake PRs are private and intentionally non-mergeable. An independent reviewer

@@ -48,7 +48,7 @@ write_skill() {
   local dir="$CLAUDE_SKILLS/$name" sha
   mkdir -p "$dir"
   chmod 700 "$dir"
-  printf -- '---\nname: %s\ndescription: Capture a reusable and safely shareable release verification procedure.\n---\n\n# Procedure\n\n1. Inspect the release state.\n2. Run the bounded verification.\n3. Record the result.\n%s\n' \
+  printf -- '---\nname: %s\ndescription: Use when verifying a release through a reusable and safely shareable procedure.\n---\n\n# Procedure\n\n1. Inspect the release state.\n2. Run the bounded verification.\n3. Record the result.\n%s\n' \
     "$name" "$body" > "$dir/SKILL.md"
   chmod 600 "$dir/SKILL.md"
   sha="$(sha256sum "$dir/SKILL.md" | awk '{print $1}')"
@@ -500,7 +500,7 @@ printf '%s\n' "$(printf '%s' "$body" | sed -E 's/claude -p/the coding agent CLI/
 STUB
 chmod +x "$BIN/claude"
 cat > "$TMP/case-coupling.json" <<'JSON'
-{"mode":"repair","call":"couplings","name":"demo-skill","old_sha":"old","content":"---\nname: demo-skill\ndescription: Run the model verify procedure against the live worker and record outputs.\n---\n\n## When to Use\n\nRun `claude -p` with CLAUDE_MODEL set and inspect the .claude/ config dir.\n"}
+{"mode":"repair","call":"couplings","name":"demo-skill","old_sha":"old","content":"---\nname: demo-skill\ndescription: Use when checking model readiness against a live worker and recording outputs.\n---\n\n## When to Use\n\nRun `claude -p` with CLAUDE_MODEL set and inspect the .claude/ config dir.\n"}
 JSON
 T_AUTOREPAIR=1 out="$(ar_case "$(cat "$TMP/case-coupling.json")")"
 ok "runtime coupling repair neutralizes text and re-stamps marker" \
@@ -560,7 +560,7 @@ cfg = m._config(env)
 skill_dir = home / ".claude" / "skills" / "llm-cmd-skill"
 skill_dir.mkdir(parents=True, exist_ok=True)
 (skill_dir / "SKILL.md").write_text(
-    "---\nname: llm-cmd-skill\ndescription: Run the model verify procedure against the live worker and record outputs.\n"
+    "---\nname: llm-cmd-skill\ndescription: Use when checking model readiness against a live worker and recording outputs.\n"
     "---\n\n## Steps\n\nRun `claude -p` and check CLAUDE_MODEL before continuing.\n", encoding="utf-8")
 try:
     m._autorepair_llm(skill_dir, "claude", cfg.review_llm_cmd)
@@ -777,7 +777,7 @@ write_revised() { # $1 source tree, $2 extra step line, $3 intake pr number
   python3 - "$CURL_STATE/revise-task-pr${3:-1}.json" "$1" "${2:-4}" <<'PY'
 import json, sys
 path, tree, marker = sys.argv[1], sys.argv[2], sys.argv[3]
-skill = ("---\nname: r2-skill\ndescription: Capture a reusable and safely shareable release verification procedure.\n"
+skill = ("---\nname: r2-skill\ndescription: Use when verifying a release through a reusable and safely shareable procedure.\n"
          "---\n\n# Procedure\n\n1. Inspect the release state.\n2. Run the bounded verification.\n"
          f"3. Record the result.\n{marker}. Generalize the evidence for any release, not one incident.\n")
 task = {"status": "succeeded", "result": {"output": {
@@ -927,7 +927,7 @@ pr_cap="$(jq -r '.published[0].url' <<<"$cap_out0" | grep -o '[0-9]*$')"
 python3 - "$CURL_STATE/revise-task-pr$pr_cap.json" "$tree_cap" <<'PY'
 import json, sys
 path, tree = sys.argv[1], sys.argv[2]
-skill = ("---\nname: r2-cap\ndescription: Capture a reusable and safely shareable release verification procedure.\n"
+skill = ("---\nname: r2-cap\ndescription: Use when verifying a release through a reusable and safely shareable procedure.\n"
          "---\n\n# Procedure\n\n1. Inspect the release state.\n2. Run the bounded verification.\n"
          "3. Record the result.\n4. Generalize the evidence for any release.\n")
 json.dump({"status": "succeeded", "result": {"output": {
@@ -937,7 +937,8 @@ json.dump({"status": "succeeded", "result": {"output": {
     open(path, "w"))
 PY
 out="$(env "${cap_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
-branch_cap2="$(git --git-dir="$REMOTE" for-each-ref --format='%(refname:short)' refs/heads | grep 'r2-cap' | sort | tail -1)"
+# Hash ordering is not revision ordering; select the newly published branch.
+branch_cap2="$(git --git-dir="$REMOTE" for-each-ref --format='%(refname:short)' refs/heads | grep 'r2-cap' | grep -Fvx "$branch_cap")"
 head_cap2="$(git --git-dir="$REMOTE" rev-parse "$branch_cap2")"
 write_verdict "$head_cap2" revise
 out="$(env "${cap_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
@@ -1862,7 +1863,7 @@ write_piri_skill() {
   local dir="$PIRI_SKILLS/$name" sha
   mkdir -p "$dir"
   chmod 700 "$dir"
-  printf -- '---\nname: %s\ndescription: Capture a reusable piri lane log triage workflow safely.\n---\n\n# Procedure\n\n1. Inspect the piri session tree.\n2. Run the bounded triage.\n3. Record the result.\n' \
+  printf -- '---\nname: %s\ndescription: Use when triaging piri lane logs through a reusable workflow safely.\n---\n\n# Procedure\n\n1. Inspect the piri session tree.\n2. Run the bounded triage.\n3. Record the result.\n' \
     "$name" > "$dir/SKILL.md"
   chmod 600 "$dir/SKILL.md"
   sha="$(sha256sum "$dir/SKILL.md" | awk '{print $1}')"
@@ -1992,7 +1993,7 @@ write_danso_skill() {
   local dir="$DANSO_SKILLS/$name" sha
   mkdir -p "$dir"
   chmod 700 "$dir"
-  printf -- '---\nname: %s\ndescription: Capture a reusable danso lane journal triage workflow safely.\n---\n\n# Procedure\n\n1. Inspect the danso journal tree.\n2. Run the bounded triage.\n3. Record the result.\n' \
+  printf -- '---\nname: %s\ndescription: Use when triaging danso lane journals through a reusable workflow safely.\n---\n\n# Procedure\n\n1. Inspect the danso journal tree.\n2. Run the bounded triage.\n3. Record the result.\n' \
     "$name" > "$dir/SKILL.md"
   chmod 600 "$dir/SKILL.md"
   sha="$(sha256sum "$dir/SKILL.md" | awk '{print $1}')"

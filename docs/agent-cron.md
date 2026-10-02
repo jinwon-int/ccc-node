@@ -125,7 +125,12 @@ checked for the exact line-start fleet diagnostic tokens `DOWN`, `UNREACHABLE`,
 alert and includes only the validated task id plus deterministic token counts;
 node names, paths, credentials, and the rest of each diagnostic row remain out
 of the title. Failures with no recognized signal keep the generic status first
-line, and successful notifications keep their existing text. This shared
+line. Generic titles label the **execution status**: success means the runner
+completed, not that an audit reported a healthy system. Report line breaks are
+preserved; successful runs with stdout omit CLI stderr banners and prompt echoes.
+Failed runs, and runs with no stdout, retain stderr diagnostics. The fixed public
+code `description_trigger_missing` survives the long-token mask; credential
+contexts and all unknown long strings remain redacted. This shared
 formatting applies to existing command tasks such as `adapter-fleet-watch` and
 `fleet-doctor-sweep` without a task-store field or migration.
 

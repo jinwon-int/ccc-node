@@ -15,6 +15,7 @@ import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import itertools
 import json
 import os
@@ -31,6 +32,17 @@ from typing import Any, Iterator
 
 import ccc_secure_fs as _secure_fs
 import ccc_skill_frontmatter as _skill_frontmatter
+
+# Reuse the install/patch gate, including for candidates written by older nodes.
+# setup deploys the helper in the hook tree beside this installed publisher.
+_TRIGGER_PATH = Path(__file__).resolve().parent / "skill-review" / "description_trigger.py"
+if not _TRIGGER_PATH.is_file():
+    _TRIGGER_PATH = Path(__file__).resolve().parents[1] / "claude/hooks/skill-review/description_trigger.py"
+_TRIGGER_SPEC = importlib.util.spec_from_file_location("_promotion_description_trigger", _TRIGGER_PATH)
+if _TRIGGER_SPEC is None or _TRIGGER_SPEC.loader is None:
+    raise ImportError("skill_description_trigger_unavailable")
+_description_trigger = importlib.util.module_from_spec(_TRIGGER_SPEC)
+_TRIGGER_SPEC.loader.exec_module(_description_trigger)
 
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -928,6 +940,7 @@ def _snapshot(config: Config, provider: str, row: dict[str, Any]) -> Candidate: 
     if actual_skill_sha != skill_sha:
         raise PromotionError("skill_hash_mismatch")
     description = _frontmatter(files[0].content, name, require_yaml_safe=True)
+    _require_description_trigger(description)
     digest = hashlib.sha256()
     for item in files:
         digest.update(item.relative.encode())
@@ -1206,9 +1219,15 @@ def _require_private_repo(config: Config) -> None:
         raise PromotionError("target_repo_not_private")
 
 
+def _require_description_trigger(description: str) -> None:
+    if not _description_trigger.has_trigger_wording(description):
+        raise PromotionError("description_trigger_missing")
+
+
 def _publish(
     config: Config, candidate: Candidate, *, created_at: str
 ) -> dict[str, str]:
+    _require_description_trigger(candidate.description)
     branch = _branch(config, candidate)
     _run(["gh", "auth", "status", "--hostname", "github.com"])
     _require_private_repo(config)
@@ -1468,6 +1487,7 @@ def _state_payload(path: Path, *, trust_root: Path | None = None) -> dict[str, o
 
 
 def _stage_candidate(config: Config, candidate: Candidate) -> dict[str, str]:
+    _require_description_trigger(candidate.description)
     outbox = config.promotion_state_dir / "outbox"
     sent = config.promotion_state_dir / "sent"
     _private_state_dir(outbox)
@@ -4701,6 +4721,12 @@ def _promote_stage(
         raise PromotionError("promote_source_unreadable") from error
     if not paths:
         raise PromotionError("promote_source_missing")
+    primary_path = f"{source}/SKILL.md"
+    if primary_path not in paths:
+        raise PromotionError("promote_source_missing")
+    primary_blob = _run(["git", "show", f"FETCH_HEAD:{primary_path}"], cwd=work).stdout
+    description = _frontmatter(primary_blob, item["name"], require_yaml_safe=True)
+    _require_description_trigger(description)
     target = work / "approved" / audience / item["name"]
     for prefix in sorted(_AUDIENCES):
         if (work / "approved" / prefix / item["name"]).exists():
@@ -6279,19 +6305,20 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
     for candidate, created_at, transport_id, source in collected:
         if opened >= config.max_prs:
             break
-        if dry_run:
-            outcome = {
-                "outcome": "would-open-private-intake-pr",
-                "branch": _branch(config, candidate),
-            }
-        else:
-            try:
+        try:
+            _require_description_trigger(candidate.description)
+            if dry_run:
+                outcome = {
+                    "outcome": "would-open-private-intake-pr",
+                    "branch": _branch(config, candidate),
+                }
+            else:
                 outcome = _publish(config, candidate, created_at=created_at)
-            except PromotionError as error:
-                errors.append(
-                    {"source": source, "name": candidate.name, "code": error.code}
-                )
-                continue
+        except PromotionError as error:
+            errors.append(
+                {"source": source, "name": candidate.name, "code": error.code}
+            )
+            continue
         row = {
             **outcome,
             "source": source,
