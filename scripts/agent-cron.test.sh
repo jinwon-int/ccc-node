@@ -600,9 +600,12 @@ headless = {
         "DRIFT second-hidden-node api_key=SECRET_LOOKING_VALUE\n"
     ),
 }
+# #2086: the affected node names follow the counts, in output order and
+# deduplicated; the rest of each row (paths, assignments) never does.
 expected_title = (
     "agent-cron fleet alert for task adapter-fleet-watch: "
-    "DOWN=2 UNREACHABLE=1 DRIFT=2 BOOTPATH=1"
+    "DOWN=2 UNREACHABLE=1 DRIFT=2 BOOTPATH=1 "
+    "(private-node, secret-node, duplicate-node, hidden-node, second-hidden-node)"
 )
 
 failed = module.build_owner_text(
@@ -611,35 +614,106 @@ failed = module.build_owner_text(
 assert failed is not None
 failed_lines = failed.splitlines()
 assert failed_lines[0] == expected_title, failed_lines[0]
-assert "private-node" not in failed_lines[0]
 assert "/private/path" not in failed_lines[0]
+assert "/secret" not in failed_lines[0]
+assert "should-not-title" not in failed_lines[0]
 assert "SECRET_LOOKING_VALUE" not in failed_lines[0]
 assert "ignored" not in failed_lines[0]
 assert "SECRET_LOOKING_VALUE" not in failed
 
-# Every watcher failure category is summarized without copying node details.
+# Every watcher failure category is summarized with its node, not its details.
 for category in ('DUALDOMAIN', 'NONCANONICAL', 'DEGRADED', 'UNVERIFIED'):
     result = module.build_owner_text(task_id, 'category', None, 'failed', {
         'exitCode': 1, 'stdout': category + ' private-node /secret/path\n',
         'stderr': category + ' second-node\n' + category + 'SUFFIX ignored\n'})
     assert result.splitlines()[0] == (
-        'agent-cron fleet alert for task adapter-fleet-watch: ' + category + '=2')
-    assert 'private-node' not in result.splitlines()[0]
+        'agent-cron fleet alert for task adapter-fleet-watch: ' + category
+        + '=2 (private-node, second-node)'), result.splitlines()[0]
+    assert '/secret/path' not in result.splitlines()[0]
 combined = module.fleet_diagnostic_title(task_id, 'failed',
     'DOWN phone1\nDOWN phone2\nDUALDOMAIN server details\n', '')
-assert combined.endswith('DOWN=2 DUALDOMAIN=1'), combined
+assert combined.endswith('DOWN=2 DUALDOMAIN=1 (phone1, phone2, server)'), combined
+
+# Only short hostname-shaped words become names: a path, dotted name, redaction
+# marker, over-long word or bare token contributes a count but no name.
+odd = module.fleet_diagnostic_title(task_id, 'failed', (
+    'DOWN /root/ccc-node\nDOWN host.example.com\nDOWN [REDACTED_CREDENTIAL]\n'
+    'DOWN ' + 'n' * 33 + '\nDOWN\nDOWN node-a\n'), '')
+assert odd.endswith(': DOWN=6 (node-a)'), odd
+# The list is bounded: six names, then a count of the rest.
+many = module.fleet_diagnostic_title(task_id, 'failed',
+    ''.join(f'DOWN node{i} detail\n' for i in range(40)), '')
+assert many.endswith(': DOWN=40 (node0, node1, node2, node3, node4, node5, +34 more)'), many
+assert module.safe_fleet_diagnostic_title(task_id, many) == many
+assert module.safe_fleet_diagnostic_title(task_id, combined) == combined
+prefix = 'agent-cron fleet alert for task adapter-fleet-watch: '
+for forged in (
+    prefix + 'DOWN=1 (/root/path)',
+    prefix + 'DOWN=1 (a, a)',
+    prefix + 'DOWN=1 (a\nspoof)',
+    prefix + 'DOWN=1 (a, b',
+    prefix + 'DOWN=1 ()',
+    prefix + 'DOWN=1 (a, +3 more)',
+    prefix + 'DOWN=1 (a, b, c, d, e, f, g)',
+    prefix + 'DOWN=1 (a) (b)',
+    prefix + 'NEW-OK=1 (a)',
+    prefix + 'RECOVERED=1 NEW-DOWN=1 (a)',
+):
+    assert module.safe_fleet_diagnostic_title(task_id, forged) is None, forged
+
+# Change-mode rows (#2086): NEW/STILL verdicts and RECOVERED are counted under
+# their own keys; PENDING/KNOWN/RECOVERING context and SUMMARY never are.
+change_out = (
+    'NEW DEGRADED node-a channel=telegram reason=health-stale since=2026-10-01T00:00:00Z\n'
+    'NEW UNVERIFIED node-a channel=matrix reason=health-pid since=2026-10-01T00:00:00Z\n'
+    'STILL DOWN node-b channel=matrix reason=no-process since=2026-09-28T00:00:00Z\n'
+    'RECOVERED node-c channel=telegram was=DEGRADED\n'
+    'PENDING DEGRADED node-d channel=telegram confirm=1/2\n'
+    'KNOWN DEGRADED node-e channel=matrix since=2026-09-28T00:00:00Z\n'
+    'RECOVERING node-f channel=telegram was=DOWN confirm=1/2\n'
+    'SUMMARY checked=24 ok=18 new=2 still=1 recovered=1 page=yes\n'
+)
+change_title = module.fleet_diagnostic_title('fleet-watch-15m', 'failed', change_out, '')
+assert change_title == (
+    'agent-cron fleet alert for task fleet-watch-15m: NEW-DEGRADED=1 NEW-UNVERIFIED=1 '
+    'STILL-DOWN=1 RECOVERED=1 (node-a, node-b, node-c)'), change_title
+assert module.safe_fleet_diagnostic_title('fleet-watch-15m', change_title) == change_title
+context_only = module.build_owner_text('fleet-watch-15m', 'ctx', None, 'failed', {
+    'exitCode': 1, 'stdout': 'KNOWN DEGRADED node-e channel=matrix\nSUMMARY page=no\n',
+    'stderr': ''})
+assert context_only.splitlines()[0].startswith('agent-cron task '), context_only
+
+# The body leads with the counted rows, so a late abnormal row survives the
+# ~900-character body cut; plain OK rows go last (#2086).
+interleaved = ''.join(
+    f'OK node{i} (/opt/ccc-node)\n' + (f'DEGRADED node{i} runtime=/opt/ccc-node reason=x\n'
+                                      if i in (3, 11) else '')
+    for i in range(12)) + ''.join(
+    f'OK node{i} channel=matrix reason=available\n' for i in range(12)
+) + 'UNVERIFIED node7 channel=matrix reason=health-pid\n'
+ordered = module.build_owner_text('adapter-fleet-watch', 'ordered', None, 'failed',
+                                  {'exitCode': 1, 'stdout': interleaved, 'stderr': ''})
+body = ordered.split('stdout:\n', 1)[1].splitlines()
+assert body[:3] == ['DEGRADED node3 runtime=/opt/ccc-node reason=x',
+                    'DEGRADED node11 runtime=/opt/ccc-node reason=x',
+                    'UNVERIFIED node7 channel=matrix reason=health-pid'], body[:4]
+assert body[3].startswith('OK node0 '), body[3]
+assert ordered.splitlines()[0].endswith('DEGRADED=2 UNVERIFIED=1 (node3, node11, node7)')
+plain = module.build_owner_text('ordinary-task', 'plain', None, 'failed',
+                                {'exitCode': 1, 'stdout': 'OK first\nsecond\n', 'stderr': ''})
+assert plain.split('stdout:\n', 1)[1] == 'OK first\nsecond', plain
 late_matrix = module.build_owner_text(
     'fleet-doctor-daily', 'run-late-matrix', None, 'failed',
     {'exitCode': 1, 'stdout': 'OK node channel=telegram\n' * 45
      + 'DOWN phone channel=matrix reason=no-process\n', 'stderr': ''})
 assert late_matrix is not None
-assert late_matrix.splitlines()[0].endswith('DOWN=1'), late_matrix.splitlines()[0]
+assert late_matrix.splitlines()[0].endswith('DOWN=1 (phone)'), late_matrix.splitlines()[0]
 very_late_matrix = module.build_owner_text(
     'fleet-doctor-daily', 'run-very-late-matrix', None, 'failed',
     {'exitCode': 1, 'stdout': 'OK node channel=telegram\n' * 180
      + 'DOWN phone channel=matrix reason=no-process\n', 'stderr': ''})
 assert very_late_matrix is not None
-assert very_late_matrix.splitlines()[0].endswith('DOWN=1')
+assert very_late_matrix.splitlines()[0].endswith('DOWN=1 (phone)')
 command_task = {
     'id': 'fleet-doctor-daily',
     'payload': {'kind': 'command', 'argv': [sys.executable, '-c',
@@ -650,7 +724,7 @@ actual_headless = module.run_headless(command_task)
 assert 'DOWN phone' not in actual_headless['stdout']  # ordinary field stays capped
 actual_text = module.build_owner_text(
     'fleet-doctor-daily', 'actual-late-matrix', None, 'failed', actual_headless)
-assert actual_text is not None and actual_text.splitlines()[0].endswith('DOWN=1')
+assert actual_text is not None and actual_text.splitlines()[0].endswith('DOWN=1 (phone)')
 forged_headless = dict(actual_headless, fleetDiagnosticTitle='DOWN secret\nspoofed')
 assert module.build_owner_text(
     'fleet-doctor-daily', 'forged', None, 'failed', forged_headless
@@ -666,7 +740,7 @@ timed_out = module.build_owner_text(
 )
 assert timed_out is not None
 assert timed_out.splitlines()[0] == (
-    "agent-cron fleet alert for task fleet-doctor-sweep: UNREACHABLE=1"
+    "agent-cron fleet alert for task fleet-doctor-sweep: UNREACHABLE=1 (private-node)"
 )
 
 # A failure without a recognized line-start token retains the existing fallback.
@@ -735,7 +809,7 @@ for payload in payloads:
 print(json.dumps({"title": expected_title, "payloads": len(payloads)}, sort_keys=True))
 PY
 )"; rc=$?
-ok "non-success fleet signals produce bounded allowlist-only owner/chat alert titles" \
+ok "non-success fleet signals produce bounded owner/chat alert titles naming validated nodes, abnormal rows first" \
   '[ "$rc" = 0 ] && jq -e ".payloads == 2 and (.title | contains(\"DOWN=2 UNREACHABLE=1 DRIFT=2 BOOTPATH=1\"))" <<<"$out" >/dev/null'
 
 ISOLATED="$TMP/redaction-unavailable"

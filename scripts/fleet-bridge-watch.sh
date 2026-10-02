@@ -61,7 +61,78 @@
 #   CCC_FLEET_DEGRADED_RECHECK_DELAY seconds before a degraded node is asked
 #                    again (default 75, capped at 300); CCC_FLEET_DEGRADED_RECHECK=0
 #                    pages on the first answer instead
+#   CCC_FLEET_DEADLINE seconds after start beyond which no further node is
+#                    probed; the rest report `UNVERIFIED <node> inspection=deadline`
+#                    (default 0 = none; 600 with --light; capped at 3000)
+#
+# Options (#2086):
+#   --light          cadence mode for frequent (e.g. 15-minute) runs: health and
+#                    ssh probes only. Forces CCC_FLEET_DOCTOR=0 and defaults to
+#                    CCC_FLEET_RETRIES=1, CCC_FLEET_RETRY_DELAY=5 and
+#                    CCC_FLEET_DEADLINE=600 so one run stays well inside the
+#                    interval. Env equivalent: CCC_FLEET_LIGHT=1.
+#   --state-file PATH  change-based alerting: verdicts are folded into an
+#                    owner-only state file by scripts/fleet_watch_state.py, the
+#                    report leads with NEW/STILL/RECOVERED rows that name the
+#                    node, OK rows are dropped, and the exit is nonzero only
+#                    when one of those events happened. Defaults the degraded
+#                    recheck off: N consecutive runs confirm instead. Env
+#                    equivalent: CCC_FLEET_WATCH_STATE. Without it, output and
+#                    exit codes are unchanged. See docs/fleet-watch.md.
 set -u
+
+STATE_FILE="${CCC_FLEET_WATCH_STATE:-}"
+LIGHT="${CCC_FLEET_LIGHT:-0}"
+PRINT_PROBE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --print-probe) PRINT_PROBE=1 ;;
+    --light) LIGHT=1 ;;
+    --state-file=*) STATE_FILE=${1#*=} ;;
+    --state-file)
+      [ $# -ge 2 ] || { echo 'fleet-bridge-watch: --state-file requires a path' >&2; exit 2; }
+      STATE_FILE=$2; shift ;;
+    # A mistyped option must not silently fall back to the noisy default.
+    *) echo "fleet-bridge-watch: unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# Change mode wraps an ordinary run: the child is this same script with the
+# state option cleared, so every verdict rule below is shared and the plain
+# mode stays byte-for-byte what it was. If the state helper cannot run (no
+# python3, unwritable or locked state), report the raw verdicts abnormal-first
+# under an explicit watcher row rather than going quiet.
+if [ -n "$STATE_FILE" ] && [ "$PRINT_PROBE" = 0 ]; then
+  export CCC_FLEET_LIGHT="$LIGHT"
+  export CCC_FLEET_DEGRADED_RECHECK="${CCC_FLEET_DEGRADED_RECHECK:-0}"
+  raw=$(CCC_FLEET_WATCH_STATE='' bash "${BASH_SOURCE[0]}"); raw_rc=$?
+  printf '%s\n' "$raw" | python3 "$(dirname "${BASH_SOURCE[0]}")/fleet_watch_state.py" \
+    --state-file "$STATE_FILE" --raw-exit "$raw_rc"
+  state_rc=$?
+  case "$state_rc" in 0|1) exit "$state_rc" ;; esac
+  echo "fleet-bridge-watch: state tracking failed (exit $state_rc); reporting raw verdicts" >&2
+  echo "UNVERIFIED watcher state-file=unusable"
+  if [ -n "$raw" ]; then
+    printf '%s\n' "$raw" | grep -v '^OK '
+    printf '%s\n' "$raw" | grep '^OK '
+  fi
+  exit 1
+fi
+
+if [ "$LIGHT" = 1 ]; then
+  if [ "${CCC_FLEET_DOCTOR:-0}" != 0 ]; then
+    echo 'fleet-bridge-watch: --light skips the doctor sweep; CCC_FLEET_DOCTOR ignored' >&2
+  fi
+  CCC_FLEET_DOCTOR=0
+  CCC_FLEET_RETRIES="${CCC_FLEET_RETRIES:-1}"
+  CCC_FLEET_RETRY_DELAY="${CCC_FLEET_RETRY_DELAY:-5}"
+  CCC_FLEET_DEADLINE="${CCC_FLEET_DEADLINE:-600}"
+fi
+DEADLINE="${CCC_FLEET_DEADLINE:-0}"
+case "$DEADLINE" in ''|*[!0-9]*) DEADLINE=0 ;; esac
+[ "$DEADLINE" -le 3000 ] || DEADLINE=3000
+past_deadline() { [ "$DEADLINE" -gt 0 ] && [ "$SECONDS" -ge "$DEADLINE" ]; }
 
 NODES="${CCC_FLEET_NODES:-seoseo dungae sogyo nosuk bangtong yukson soonwook gwakga jingun gongmyoung gongyung daegyo}"
 SSH_BIN="${CCC_FLEET_SSH:-ssh}"
@@ -535,7 +606,7 @@ META_FILE="$(cd "$(dirname "$0")" && pwd)/fleet_watch_metadata.py"
 META_SOURCE=$(cat "$META_FILE")
 PROBE="${PROBE%%__CCC_FLEET_METADATA_SOURCE__*}$META_SOURCE${PROBE#*__CCC_FLEET_METADATA_SOURCE__}"
 # Read-only seam used by tests to execute the exact transmitted probe.
-if [ "${1:-}" = --print-probe ]; then printf '%s\n' "$PROBE"; exit 0; fi
+if [ "$PRINT_PROBE" = 1 ]; then printf '%s\n' "$PROBE"; exit 0; fi
 
 # One unanswered probe is a transport blip, not a health signal: on 2026-07-31
 # and 2026-08-01 single SSH failures paged UNREACHABLE for nodes that were fine
@@ -575,6 +646,7 @@ $PROBE"
     [ -n "$out" ] && break
     attempt=$((attempt + 1))
     [ "$attempt" -gt "$RETRIES" ] && break
+    past_deadline && break
     [ "$RETRY_DELAY" -gt 0 ] && sleep "$RETRY_DELAY"
   done
 }
@@ -730,6 +802,12 @@ declare -A deferred_out=()
 deferred=""
 first_deferred_at=""
 for node in $NODES; do
+  # A bounded run reports what it could not reach in time instead of
+  # overrunning its schedule slot; one UNVERIFIED row is not a page in change
+  # mode, which confirms it over several runs.
+  if past_deadline; then
+    echo "UNVERIFIED $node inspection=deadline-${DEADLINE}s"; fail=1; continue
+  fi
   probe_node "$node" "${CCC_FLEET_DOCTOR:-0}"
   if [ "$RECHECK" != 0 ] && probe_complete \
       && [ "$(printf '%s\n' "$out" | sed -n 's/^AVAIL=//p' | head -1)" = degraded ]; then
@@ -747,6 +825,11 @@ if [ -n "$deferred" ]; then
   for node in $deferred; do
     first=${deferred_out[$node]}
     first_reason=$(printf '%s\n' "$first" | sed -n 's/^AVAIL_REASON=//p' | head -1)
+    if past_deadline; then
+      out=$first probe_rc=0
+      judge_node "$node" "" " recheck=deadline"
+      continue
+    fi
     probe_node "$node" 0
     if ! probe_complete; then
       # The recheck itself failed: keep the first answer, and say so.

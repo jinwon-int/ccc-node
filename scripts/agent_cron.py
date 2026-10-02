@@ -1360,65 +1360,137 @@ def notification_base(task):
 
 
 # Fleet command payloads emit one diagnostic row per affected node.  Only these
-# exact line-start tokens are safe to promote into a notification title: the
-# rest of each row contains untrusted node names, paths, and free-form details.
-# Keep the order fixed and counts capped so the title shape and length are
-# deterministic even if a future output cap is raised.
+# exact line-start tokens are counted into a notification title.  Keep the order
+# fixed and counts capped so the title shape and length are deterministic even
+# if a future output cap is raised.
 _FLEET_DIAGNOSTIC_TOKENS = ('DOWN', 'UNREACHABLE', 'DRIFT', 'BOOTPATH',
                             'DUALDOMAIN', 'NONCANONICAL', 'DEGRADED', 'UNVERIFIED')
-_FLEET_DIAGNOSTIC_LINE = re.compile(
-    r'^(?:' + '|'.join(_FLEET_DIAGNOSTIC_TOKENS) + r')(?=[ \t]|$)', re.MULTILINE
+# Change-mode rows (`fleet-bridge-watch.sh --state-file`, #2086) prefix a
+# verdict with NEW or STILL, and report `RECOVERED <node>`.  Their PENDING,
+# KNOWN and RECOVERING context rows do not page and are not counted, so a
+# chronic issue does not inflate the title of an alert about a new one.
+_FLEET_CHANGE_PREFIXES = ('NEW', 'STILL')
+_FLEET_RECOVERED = 'RECOVERED'
+_FLEET_TITLE_KEYS = (
+    tuple(f'{prefix}-{token}' for prefix in _FLEET_CHANGE_PREFIXES
+          for token in _FLEET_DIAGNOSTIC_TOKENS)
+    + _FLEET_DIAGNOSTIC_TOKENS + (_FLEET_RECOVERED,)
 )
+_FLEET_DIAGNOSTIC_LINE = re.compile(
+    r'^(?:(?:(?P<change>' + '|'.join(_FLEET_CHANGE_PREFIXES) + r')[ \t]+)?'
+    r'(?P<token>' + '|'.join(_FLEET_DIAGNOSTIC_TOKENS) + r')'
+    r'|(?P<recovered>' + _FLEET_RECOVERED + r'))'
+    r'(?=[ \t]|$)(?:[ \t]+(?P<node>[^ \t\r\n]+))?',
+    re.MULTILINE,
+)
+_FLEET_OK_LINE = re.compile(r'^OK(?=[ \t]|$)')
 _FLEET_DIAGNOSTIC_COUNT_MAX = 999
+# Affected node names make an alert readable at a glance (#2086: a ten-hour
+# outage hid behind `DEGRADED=2 UNVERIFIED=1`).  A name is the field right after
+# the token of a counted row, taken from already-redacted output, and is
+# promoted only when it is a short hostname-shaped word: no path, dot,
+# separator or redaction marker can pass.  At most _FLEET_TITLE_NAMES_MAX names
+# are listed, then `+N more`, so the title stays bounded.
+_FLEET_NODE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,31}')
+_FLEET_TITLE_NAMES_MAX = 6
+_FLEET_MORE_NAMES = re.compile(r'\+([1-9][0-9]{0,2}) more')
 _VALID_TASK_ID = re.compile(r'^[A-Za-z0-9_.-]{1,96}$')
 
 
+def _fleet_signals(outputs):
+    """Count title keys and collect validated node names, in output order."""
+    counts = {key: 0 for key in _FLEET_TITLE_KEYS}
+    names = []
+    for output in outputs:
+        for match in _FLEET_DIAGNOSTIC_LINE.finditer(output or ''):
+            if match.group('recovered'):
+                key = _FLEET_RECOVERED
+            elif match.group('change'):
+                key = f"{match.group('change')}-{match.group('token')}"
+            else:
+                key = match.group('token')
+            counts[key] = min(counts[key] + 1, _FLEET_DIAGNOSTIC_COUNT_MAX)
+            node = match.group('node') or ''
+            if _FLEET_NODE_NAME.fullmatch(node) and node not in names:
+                names.append(node)
+    return counts, names
+
+
+def _fleet_names_suffix(names):
+    if not names:
+        return ''
+    shown = names[:_FLEET_TITLE_NAMES_MAX]
+    extra = min(len(names) - len(shown), _FLEET_DIAGNOSTIC_COUNT_MAX)
+    return ' (' + ', '.join(shown + ([f'+{extra} more'] if extra else [])) + ')'
+
+
 def fleet_diagnostic_title(task_id, status, stdout, stderr):
-    """Return an allowlist-only fleet alert title for a non-success run.
+    """Return a bounded fleet alert title for a non-success run.
 
     ``stdout`` and ``stderr`` must already have passed through
-    ``redact_for_owner``.  No matched line content is copied: only fixed token
-    names and bounded occurrence counts leave this classifier.
+    ``redact_for_owner``.  Only fixed token names, bounded occurrence counts
+    and a bounded list of hostname-shaped node names leave this classifier;
+    paths and the rest of each row stay in the body.
     """
     if status == 'success' or _VALID_TASK_ID.fullmatch(str(task_id or '')) is None:
         return None
-    counts = {token: 0 for token in _FLEET_DIAGNOSTIC_TOKENS}
-    for output in (stdout, stderr):
-        for match in _FLEET_DIAGNOSTIC_LINE.finditer(output or ''):
-            token = match.group(0)
-            counts[token] = min(
-                counts[token] + 1, _FLEET_DIAGNOSTIC_COUNT_MAX
-            )
-    signals = [
-        f'{token}={counts[token]}'
-        for token in _FLEET_DIAGNOSTIC_TOKENS
-        if counts[token]
-    ]
+    counts, names = _fleet_signals((stdout, stderr))
+    signals = [f'{key}={counts[key]}' for key in _FLEET_TITLE_KEYS if counts[key]]
     if not signals:
         return None
-    return f"agent-cron fleet alert for task {task_id}: {' '.join(signals)}"
+    return (f"agent-cron fleet alert for task {task_id}: {' '.join(signals)}"
+            + _fleet_names_suffix(names))
+
+
+def _safe_fleet_names(raw):
+    """Validate the `a, b, +N more` list of a precomputed title."""
+    items = raw.split(', ')
+    if items and _FLEET_MORE_NAMES.fullmatch(items[-1]):
+        if len(items) != _FLEET_TITLE_NAMES_MAX + 1:
+            return False
+        items = items[:-1]
+    if not 1 <= len(items) <= _FLEET_TITLE_NAMES_MAX or len(set(items)) != len(items):
+        return False
+    return all(_FLEET_NODE_NAME.fullmatch(item) for item in items)
 
 
 def safe_fleet_diagnostic_title(task_id, candidate):
-    """Accept a precomputed title only when it contains fixed category counts."""
+    """Accept a precomputed title only when it has the exact generated shape."""
     if not isinstance(candidate, str) or _VALID_TASK_ID.fullmatch(str(task_id or '')) is None:
         return None
     prefix = f'agent-cron fleet alert for task {task_id}: '
     if not candidate.startswith(prefix):
         return None
-    fields = candidate[len(prefix):].split(' ')
+    body, sep, names = candidate[len(prefix):].partition(' (')
+    if sep and (not names.endswith(')') or not _safe_fleet_names(names[:-1])):
+        return None
     positions = []
-    for field in fields:
+    for field in body.split(' '):
         name, sep, count = field.partition('=')
-        if (not sep or name not in _FLEET_DIAGNOSTIC_TOKENS
+        if (not sep or name not in _FLEET_TITLE_KEYS
                 or not count.isdigit() or len(count) > 3):
             return None
         if not 1 <= int(count) <= _FLEET_DIAGNOSTIC_COUNT_MAX:
             return None
-        positions.append(_FLEET_DIAGNOSTIC_TOKENS.index(name))
+        positions.append(_FLEET_TITLE_KEYS.index(name))
     if not positions or positions != sorted(set(positions)):
         return None
     return candidate
+
+
+def fleet_rows_first(text):
+    """Reorder fleet output: counted rows, then context, then OK rows.
+
+    The owner body is cut at ~900 characters.  A plain watch prints one row per
+    node in fleet order, so on 2026-10-01 the OK rows filled the body and one
+    abnormal row was cut off (#2086).  The order within each group is kept.
+    """
+    lines = (text or '').splitlines()
+    counted = [line for line in lines if _FLEET_DIAGNOSTIC_LINE.match(line)]
+    rest = [line for line in lines if not _FLEET_DIAGNOSTIC_LINE.match(line)]
+    ok = [line for line in rest if _FLEET_OK_LINE.match(line)]
+    other = [line for line in rest if not _FLEET_OK_LINE.match(line)]
+    return '\n'.join(counted + other + ok)
 
 
 def build_owner_text(task_id, run_id, scheduled_at, status, headless):
@@ -1435,6 +1507,12 @@ def build_owner_text(task_id, run_id, scheduled_at, status, headless):
     title = (safe_fleet_diagnostic_title(
         task_id, (headless or {}).get('fleetDiagnosticTitle')) if status != 'success' else None)
     title = title or fleet_diagnostic_title(task_id, status, title_stdout, title_stderr)
+    if title and title.startswith('agent-cron fleet alert '):
+        # Re-redact after reordering: the masks are line-local, and this keeps
+        # the canonical defence-in-depth check on the exact text that ships.
+        stdout = redact_for_owner(fleet_rows_first(title_stdout), 900)
+        if stdout is None:
+            return None
     stdout = stdout.strip()
     stderr = stderr.strip()
     lines = [
