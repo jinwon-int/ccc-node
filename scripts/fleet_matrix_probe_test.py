@@ -59,7 +59,8 @@ class MatrixProbeTest(unittest.TestCase):
             "service": {"state": state},
         }
         if error_age is not None:
-            stamp = lambda seconds: datetime.fromtimestamp(self.now - seconds, timezone.utc).isoformat()
+            def stamp(seconds: int) -> str:
+                return datetime.fromtimestamp(self.now - seconds, timezone.utc).isoformat()
             error = "agent turn failed: danso_provider_timeout / Worker failed"
             snapshot["agent"] = {
                 "state": "degraded", "last_error": error, "last_error_at": stamp(error_age),
