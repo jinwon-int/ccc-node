@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Hermetic tests for skills/fleet-html-report/scripts/build_html_report.py (#2109 C).
 # Single-file output, escaping, status chips, the artifacts/ gate, limits, bad specs.
-set -uo pipefail
 # shellcheck disable=SC2034  # test variables are read inside the eval'd ok() conditions
+set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 B="$DIR/build_html_report.py"
 pass=0; fail=0
@@ -65,5 +65,5 @@ ok "a 900-char cell is truncated with an ellipsis" 'grep -q "vvv…" "$HOME/.cla
 python3 "$B" --spec "$TMP/big.json" --out "$HOME/.claude/state/artifacts" --name big >/dev/null; rc=$?
 ok "a 600-row table is refused (exit 2)" '[ "$rc" = 2 ]'
 
-echo "build_html_report: $pass passed, $fail failed"
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
