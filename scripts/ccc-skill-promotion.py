@@ -1520,7 +1520,9 @@ def _stage_candidate(config: Config, candidate: Candidate) -> dict[str, str]:
     return {"outcome": "staged", "transport_id": transport_id}
 
 
-def _pending_envelopes(config: Config, *, limit: int) -> list[dict[str, object]]:
+def _pending_envelopes(
+    config: Config, *, limit: int, blocked: list[dict[str, str]] | None = None
+) -> list[dict[str, object]]:
     outbox = config.promotion_state_dir / "outbox"
     sent = config.promotion_state_dir / "sent"
     if not outbox.exists():
@@ -1532,10 +1534,9 @@ def _pending_envelopes(config: Config, *, limit: int) -> list[dict[str, object]]
     # in the alphabet sat behind every newer envelope forever. `created_at` is a
     # fixed-width UTC stamp, so a lexicographic sort is chronological.
     #
-    # Ordering reads only the cheap `created_at` field; full envelope validation
-    # still runs on the `limit` rows actually served, so one malformed envelope
-    # deeper in the queue cannot newly fail an otherwise healthy node. Envelopes
-    # with no usable stamp sort last for the same reason.
+    # Validate only until `limit` eligible rows are found. A triggerless legacy
+    # envelope remains untouched but cannot occupy the only export slot forever.
+    # Other malformed envelopes still fail closed; missing stamps sort last.
     staged: list[tuple[int, str, str, dict[str, object]]] = []
     for path in sorted(outbox.glob("*.json")):
         if (sent / path.name).exists():
@@ -1548,10 +1549,17 @@ def _pending_envelopes(config: Config, *, limit: int) -> list[dict[str, object]]
             staged.append((1, "", path.name, value))
     staged.sort(key=lambda row: (row[0], row[1], row[2]))
     rows: list[dict[str, object]] = []
-    for _, _, name, value in staged[:limit]:
-        _, _, transport_id = _candidate_from_envelope(value)
+    for _, _, name, value in staged:
+        if len(rows) >= limit:
+            break
+        candidate, _, transport_id = _candidate_from_envelope(value)
         if name != f"{transport_id}.json":
             raise PromotionError("outbox_filename_mismatch")
+        if not _description_trigger.has_trigger_wording(candidate.description):
+            if blocked is not None and len(blocked) < _MAX_CANDIDATES_PER_RUN:
+                blocked.append({"source": "local", "name": candidate.name,
+                                "code": "description_trigger_missing"})
+            continue
         rows.append(value)
     return rows
 
@@ -1598,7 +1606,9 @@ def _remote_command(node: str, arguments: list[str]) -> subprocess.CompletedProc
     )
 
 
-def _remote_envelopes(node: str, *, limit: int) -> list[dict[str, object]]:
+def _remote_envelopes(
+    node: str, *, limit: int, blocked: list[dict[str, str]] | None = None
+) -> list[dict[str, object]]:
     completed = _remote_command(node, ["export", "--limit", str(limit)])
     try:
         value = json.loads(completed.stdout)
@@ -1606,6 +1616,19 @@ def _remote_envelopes(node: str, *, limit: int) -> list[dict[str, object]]:
         raise PromotionError("remote_output_invalid") from None
     if not isinstance(value, dict) or value.get("ok") is not True:
         raise PromotionError("remote_export_failed")
+    rejections = value.get("blocked", [])
+    if not isinstance(rejections, list) or len(rejections) > _MAX_CANDIDATES_PER_RUN:
+        raise PromotionError("remote_output_invalid")
+    for rejection in rejections:
+        if (not isinstance(rejection, dict)
+                or not isinstance(rejection.get("name"), str)
+                or not _NAME_RE.fullmatch(rejection["name"])
+                or len(rejection["name"]) > 80
+                or rejection.get("code") != "description_trigger_missing"):
+            raise PromotionError("remote_output_invalid")
+        if blocked is not None:
+            blocked.append({"source": node, "name": rejection["name"],
+                            "code": "description_trigger_missing"})
     rows = value.get("envelopes")
     if not isinstance(rows, list) or len(rows) > limit:
         raise PromotionError("remote_output_invalid")
@@ -1747,12 +1770,14 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
 
 def _export_result(config: Config, *, limit: int) -> dict[str, object]:
     _private_state_dir(config.promotion_state_dir)
-    rows = _pending_envelopes(config, limit=limit)
+    blocked: list[dict[str, str]] = []
+    rows = _pending_envelopes(config, limit=limit, blocked=blocked)
     return {
         "ok": True,
         "mode": "export-read-only",
         "node": config.node,
         "envelopes": rows,
+        "blocked": [{"name": row["name"], "code": row["code"]} for row in blocked],
     }
 
 
@@ -6271,11 +6296,11 @@ def _collect_envelopes(
         if label == "local":
             # A broken local state dir still fails the collect outright, as
             # before; remotes degrade to per-source errors.
-            gather(_pending_envelopes(config, limit=remaining), label, expected_node)
+            gather(_pending_envelopes(config, limit=remaining, blocked=errors), label, expected_node)
         else:
             try:
                 gather(
-                    _remote_envelopes(expected_node, limit=min(remaining, config.max_prs)),
+                    _remote_envelopes(expected_node, limit=min(remaining, config.max_prs), blocked=errors),
                     label,
                     expected_node,
                 )

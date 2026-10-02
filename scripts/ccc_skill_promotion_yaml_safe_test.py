@@ -210,6 +210,29 @@ class PromotionTriggerGateTests(unittest.TestCase):
                             "서비스 상태를 복원해야 할 때 사용합니다."):
             promotion._require_description_trigger(description)
 
+    def test_remote_export_reports_only_bounded_known_rejections(self):
+        from unittest.mock import patch
+        rejection = {"name": "legacy-skill", "code": "description_trigger_missing"}
+        packet = {"ok": True, "envelopes": [], "blocked": [rejection]}
+        errors = []
+        with patch.object(promotion, "_remote_command", return_value=SimpleNamespace(
+                stdout=json.dumps(packet).encode())):
+            self.assertEqual(promotion._remote_envelopes("node-a", limit=1, blocked=errors), [])
+        self.assertEqual(errors, [{"source": "node-a", **rejection}])
+        for rejected in ([{**rejection, "name": "unsafe/name"}],
+                         [{**rejection, "code": "arbitrary-private-message"}],
+                         [rejection] * (promotion._MAX_CANDIDATES_PER_RUN + 1)):
+            with self.subTest(rejected=rejected), patch.object(
+                    promotion, "_remote_command", return_value=SimpleNamespace(
+                        stdout=json.dumps({**packet, "blocked": rejected}).encode())):
+                with self.assertRaises(promotion.PromotionError) as caught:
+                    promotion._remote_envelopes("node-a", limit=1, blocked=[])
+                self.assertEqual(caught.exception.code, "remote_output_invalid")
+        # Old exporters do not carry diagnostic metadata.
+        with patch.object(promotion, "_remote_command", return_value=SimpleNamespace(
+                stdout=b'{"ok": true, "envelopes": []}')):
+            self.assertEqual(promotion._remote_envelopes("node-a", limit=1), [])
+
     def test_approved_legacy_intake_is_blocked_before_copy(self):
         from unittest.mock import patch
         name = "demo-skill"
