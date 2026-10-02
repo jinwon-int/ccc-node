@@ -48,7 +48,7 @@ repos="$(gh repo list "$ORG" --limit 200 --no-archived --json name,createdAt,pus
 [ -n "$repos" ] || { echo "nudge-hook-coverage: could not list repositories of $ORG" >&2; exit 3; }
 
 rows=(); gaps=(); errors=0; covered=0; skipped=0
-while read -r name created pushed vis; do
+while read -r name created pushed _; do
   [ -n "$name" ] || continue
   hooks="$(gh api "repos/$ORG/$name/hooks" --jq "[.[]|select(.config.url|test(\"$PATTERN\"))]|map(\"\(.id):\(if .active then \"active\" else \"inactive\" end)\")|join(\",\")" 2>/dev/null)"
   rc=$?
