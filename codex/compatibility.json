@@ -67,6 +67,12 @@
       "reason": "Claude hook and transcript pipeline"
     },
     {
+      "pattern": "skills/fleet-diagram/**",
+      "compatibility": "claude-only",
+      "audience": "claude",
+      "reason": "Owner-facing diagram renderer (#2109 B): the Claude bridge delivers the named PNG/SVG as an attachment; a Codex/Piri port is a separate decision"
+    },
+    {
       "pattern": "skills/fleet-disk-constraint-triage/**",
       "compatibility": "adapted",
       "audience": "shared",
