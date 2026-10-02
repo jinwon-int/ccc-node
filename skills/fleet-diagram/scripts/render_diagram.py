@@ -94,6 +94,85 @@ def _color_for(status, legend):
     return PALETTE.get(key) or COLOR_NAMES.get(key, DEFAULT_COLOR)
 
 
+def _load_matrix(spec: dict, max_nodes: int) -> None:
+    rows = spec.get("rows")
+    cols = spec.get("cols")
+    cells = spec.get("cells")
+    if not isinstance(rows, list) or not rows or not isinstance(cols, list) or not cols:
+        raise SpecError("matrix needs non-empty rows and cols")
+    if len(rows) * len(cols) > max_nodes * 4:
+        raise SpecError("matrix too large")
+    if not isinstance(cells, list) or len(cells) != len(rows) or any(
+        not isinstance(r, list) or len(r) != len(cols) for r in cells
+    ):
+        raise SpecError("cells must be rows x cols")
+    spec["rows"] = [_label(r) for r in rows]
+    spec["cols"] = [_label(c) for c in cols]
+    spec["cells"] = [[_label(c) for c in r] for r in cells]
+
+
+def _load_timeline(spec: dict, max_nodes: int) -> None:
+    events = spec.get("events")
+    if not isinstance(events, list) or not events:
+        raise SpecError("timeline needs non-empty events")
+    if len(events) > max_nodes:
+        raise SpecError("too many events")
+    norm = []
+    for ev in events:
+        if not isinstance(ev, dict) or not _text(ev.get("t")):
+            raise SpecError("each event needs t")
+        norm.append({
+            "t": _label(ev.get("t")),
+            "label": _label(ev.get("label")),
+            "lane": _label(ev.get("lane")) or "events",
+            "status": _text(ev.get("status")).lower(),
+        })
+    spec["events"] = sorted(norm, key=lambda e: e["t"])
+
+
+def _load_dag_nodes(nodes, max_nodes: int) -> tuple[list[str], dict]:
+    if not isinstance(nodes, list) or not nodes:
+        raise SpecError("dag needs non-empty nodes")
+    if len(nodes) > max_nodes:
+        raise SpecError("too many nodes")
+    ids: list[str] = []
+    norm: dict = {}
+    for n in nodes:
+        if not isinstance(n, dict) or not _text(n.get("id")):
+            raise SpecError("each node needs id")
+        nid = _text(n.get("id"))
+        if nid in norm:
+            raise SpecError(f"duplicate node id {nid}")
+        norm[nid] = {"id": nid, "label": _label(n.get("label")) or _label(nid), "status": _text(n.get("status")).lower()}
+        ids.append(nid)
+    return ids, norm
+
+
+def _load_dag_edges(edges, norm_nodes: dict) -> list[tuple[str, str]]:
+    out = []
+    for e in edges or []:
+        if not isinstance(e, (list, tuple)) or len(e) != 2:
+            raise SpecError("each edge is [from, to]")
+        a, b = _text(e[0]), _text(e[1])
+        if a not in norm_nodes or b not in norm_nodes:
+            raise SpecError(f"edge references unknown node: {a}->{b}")
+        if a == b:
+            raise SpecError("self edges are not allowed")
+        out.append((a, b))
+    return out
+
+
+def _load_dag(spec: dict, max_nodes: int) -> None:
+    ids, norm_nodes = _load_dag_nodes(spec.get("nodes"), max_nodes)
+    norm_edges = _load_dag_edges(spec.get("edges"), norm_nodes)
+    spec["nodes"] = [norm_nodes[i] for i in ids]
+    spec["edges"] = norm_edges
+    spec["layers"] = _layers(ids, norm_edges)
+
+
+_LOADERS = {"matrix": _load_matrix, "timeline": _load_timeline, "dag": _load_dag}
+
+
 def load_spec(path: Path, max_nodes: int) -> dict:
     try:
         spec = json.loads(path.read_text(encoding="utf-8"))
@@ -102,74 +181,13 @@ def load_spec(path: Path, max_nodes: int) -> dict:
     if not isinstance(spec, dict):
         raise SpecError("spec must be a JSON object")
     kind = _text(spec.get("kind")).lower()
-    if kind not in ("matrix", "timeline", "dag"):
+    if kind not in _LOADERS:
         raise SpecError("kind must be one of matrix, timeline, dag")
     spec["kind"] = kind
     spec["title"] = _label(spec.get("title"))
     legend = spec.get("legend")
     spec["legend"] = {str(k).lower(): str(v) for k, v in legend.items()} if isinstance(legend, dict) else {}
-    if kind == "matrix":
-        rows = spec.get("rows")
-        cols = spec.get("cols")
-        cells = spec.get("cells")
-        if not isinstance(rows, list) or not rows or not isinstance(cols, list) or not cols:
-            raise SpecError("matrix needs non-empty rows and cols")
-        if len(rows) * len(cols) > max_nodes * 4:
-            raise SpecError("matrix too large")
-        if not isinstance(cells, list) or len(cells) != len(rows) or any(
-            not isinstance(r, list) or len(r) != len(cols) for r in cells
-        ):
-            raise SpecError("cells must be rows x cols")
-        spec["rows"] = [_label(r) for r in rows]
-        spec["cols"] = [_label(c) for c in cols]
-        spec["cells"] = [[_label(c) for c in r] for r in cells]
-    elif kind == "timeline":
-        events = spec.get("events")
-        if not isinstance(events, list) or not events:
-            raise SpecError("timeline needs non-empty events")
-        if len(events) > max_nodes:
-            raise SpecError("too many events")
-        norm = []
-        for ev in events:
-            if not isinstance(ev, dict) or not _text(ev.get("t")):
-                raise SpecError("each event needs t")
-            norm.append({
-                "t": _label(ev.get("t")),
-                "label": _label(ev.get("label")),
-                "lane": _label(ev.get("lane")) or "events",
-                "status": _text(ev.get("status")).lower(),
-            })
-        spec["events"] = sorted(norm, key=lambda e: e["t"])
-    else:
-        nodes = spec.get("nodes")
-        edges = spec.get("edges") or []
-        if not isinstance(nodes, list) or not nodes:
-            raise SpecError("dag needs non-empty nodes")
-        if len(nodes) > max_nodes:
-            raise SpecError("too many nodes")
-        ids = []
-        norm_nodes = {}
-        for n in nodes:
-            if not isinstance(n, dict) or not _text(n.get("id")):
-                raise SpecError("each node needs id")
-            nid = _text(n.get("id"))
-            if nid in norm_nodes:
-                raise SpecError(f"duplicate node id {nid}")
-            norm_nodes[nid] = {"id": nid, "label": _label(n.get("label")) or _label(nid), "status": _text(n.get("status")).lower()}
-            ids.append(nid)
-        norm_edges = []
-        for e in edges:
-            if not isinstance(e, (list, tuple)) or len(e) != 2:
-                raise SpecError("each edge is [from, to]")
-            a, b = _text(e[0]), _text(e[1])
-            if a not in norm_nodes or b not in norm_nodes:
-                raise SpecError(f"edge references unknown node: {a}->{b}")
-            if a == b:
-                raise SpecError("self edges are not allowed")
-            norm_edges.append((a, b))
-        spec["nodes"] = [norm_nodes[i] for i in ids]
-        spec["edges"] = norm_edges
-        spec["layers"] = _layers(ids, norm_edges)
+    _LOADERS[kind](spec, max_nodes)
     return spec
 
 
@@ -202,91 +220,107 @@ def _layers(ids, edges):
 
 # --------------------------------------------------------------------------- scene
 
-def build_scene(spec: dict) -> dict:
+class _Scene:
     """Backend-neutral drawing list: rects, lines, texts; all coordinates in px."""
-    items = []
-    legend = spec["legend"]
+
+    def __init__(self, legend: dict):
+        self.items: list[dict] = []
+        self.legend = legend
+
+    def rect(self, x, y, w, h, fill, stroke=GRID, rx=4):
+        self.items.append({"op": "rect", "x": x, "y": y, "w": w, "h": h, "fill": fill, "stroke": stroke, "rx": rx})
+
+    def text(self, x, y, s, size=13, anchor="start", color=FG, bold=False):
+        self.items.append({"op": "text", "x": x, "y": y, "s": s, "size": size, "anchor": anchor, "color": color, "bold": bold})
+
+    def line(self, x1, y1, x2, y2, color=GRID, width=1.5, arrow=False):
+        self.items.append({"op": "line", "x1": x1, "y1": y1, "x2": x2, "y2": y2, "color": color, "width": width, "arrow": arrow})
+
+    def color(self, status):
+        return _color_for(status, self.legend)
+
+
+PAD = 16
+
+
+def _scene_matrix(spec: dict, sc: _Scene, title_h: int) -> tuple[float, float]:
+    rows, cols, cells = spec["rows"], spec["cols"], spec["cells"]
+    label_w = min(260, 16 + 8 * max(len(r) for r in rows))
+    cw = max(72, min(150, 20 + 7 * max(len(c) for c in cols)))
+    rh = 30
+    w = PAD + label_w + cw * len(cols) + PAD
+    h = title_h + 32 + rh * len(rows) + PAD
+    for j, c in enumerate(cols):
+        sc.text(PAD + label_w + j * cw + cw / 2, title_h + 20, c, 12, "middle", bold=True)
+    for i, r in enumerate(rows):
+        y = title_h + 32 + i * rh
+        sc.text(PAD, y + rh / 2 + 4, r, 12, "start", bold=True)
+        for j, v in enumerate(cells[i]):
+            x = PAD + label_w + j * cw
+            sc.rect(x + 2, y + 2, cw - 4, rh - 4, sc.color(v))
+            sc.text(x + cw / 2, y + rh / 2 + 4, v, 11, "middle", "#ffffff")
+    return w, h
+
+
+def _scene_timeline(spec: dict, sc: _Scene, title_h: int) -> tuple[float, float]:
+    events = spec["events"]
+    lane_w = min(200, 16 + 8 * max(len(e["lane"]) for e in events))
+    step = 28
+    w = PAD + lane_w + 20 + max(360, 9 * max(len(e["t"]) + len(e["label"]) + 2 for e in events)) + PAD
+    h = title_h + 16 + step * len(events) + PAD
+    axis_x = PAD + lane_w + 10
+    for k, e in enumerate(events):
+        y = title_h + 16 + k * step
+        sc.rect(axis_x - 6, y + 6, 12, 12, sc.color(e["status"]), rx=6)
+        sc.text(PAD, y + 16, e["lane"], 11, "start", "#5b6b7a")
+        sc.text(axis_x + 14, y + 16, f"{e['t']}  {e['label']}", 12, "start")
+        if k + 1 < len(events):
+            sc.line(axis_x, y + 18, axis_x, y + step + 6)
+    return w, h
+
+
+def _scene_dag(spec: dict, sc: _Scene, title_h: int) -> tuple[float, float]:
+    layers = spec["layers"]
+    nodes = {n["id"]: n for n in spec["nodes"]}
+    bw, bh, hgap, vgap = 150, 40, 36, 60
+    maxw = max(len(layer) for layer in layers)
+    w = PAD + maxw * (bw + hgap) - hgap + PAD
+    h = title_h + len(layers) * (bh + vgap) - vgap + PAD * 2
+    pos = {}
+    for li, layer in enumerate(layers):
+        row_w = len(layer) * (bw + hgap) - hgap
+        x0 = (w - row_w) / 2
+        for ni, nid in enumerate(layer):
+            pos[nid] = (x0 + ni * (bw + hgap), title_h + PAD + li * (bh + vgap))
+    for a, b in spec["edges"]:
+        ax, ay = pos[a]
+        bx, by = pos[b]
+        sc.line(ax + bw / 2, ay + bh, bx + bw / 2, by, "#7a8794", 1.5, arrow=True)
+    for nid, (x, y) in pos.items():
+        n = nodes[nid]
+        sc.rect(x, y, bw, bh, "#f4f6f8", sc.color(n["status"]) if n["status"] else "#7a8794", rx=8)
+        sc.text(x + bw / 2, y + bh / 2 + 4, n["label"], 12, "middle")
+    return w, h
+
+
+_SCENES = {"matrix": _scene_matrix, "timeline": _scene_timeline, "dag": _scene_dag}
+
+
+def build_scene(spec: dict) -> dict:
+    sc = _Scene(spec["legend"])
     title_h = 36 if spec["title"] else 12
-    pad = 16
-
-    def rect(x, y, w, h, fill, stroke=GRID, rx=4):
-        items.append({"op": "rect", "x": x, "y": y, "w": w, "h": h, "fill": fill, "stroke": stroke, "rx": rx})
-
-    def text(x, y, s, size=13, anchor="start", color=FG, bold=False):
-        items.append({"op": "text", "x": x, "y": y, "s": s, "size": size, "anchor": anchor, "color": color, "bold": bold})
-
-    def line(x1, y1, x2, y2, color=GRID, width=1.5, arrow=False):
-        items.append({"op": "line", "x1": x1, "y1": y1, "x2": x2, "y2": y2, "color": color, "width": width, "arrow": arrow})
-
-    if spec["kind"] == "matrix":
-        rows, cols, cells = spec["rows"], spec["cols"], spec["cells"]
-        label_w = min(260, 16 + 8 * max(len(r) for r in rows))
-        cw = max(72, min(150, 20 + 7 * max(len(c) for c in cols)))
-        rh = 30
-        w = pad + label_w + cw * len(cols) + pad
-        h = title_h + 32 + rh * len(rows) + pad
-        for j, c in enumerate(cols):
-            text(pad + label_w + j * cw + cw / 2, title_h + 20, c, 12, "middle", bold=True)
-        for i, r in enumerate(rows):
-            y = title_h + 32 + i * rh
-            text(pad, y + rh / 2 + 4, r, 12, "start", bold=True)
-            for j, v in enumerate(cells[i]):
-                x = pad + label_w + j * cw
-                rect(x + 2, y + 2, cw - 4, rh - 4, _color_for(v, legend))
-                text(x + cw / 2, y + rh / 2 + 4, v, 11, "middle", "#ffffff")
-    elif spec["kind"] == "timeline":
-        events = spec["events"]
-        lanes = []
-        for e in events:
-            if e["lane"] not in lanes:
-                lanes.append(e["lane"])
-        lane_w = min(200, 16 + 8 * max(len(l) for l in lanes))
-        step = 28
-        w = pad + lane_w + 20 + max(360, 9 * max(len(e["t"]) + len(e["label"]) + 2 for e in events)) + pad
-        h = title_h + 16 + step * len(events) + pad
-        axis_x = pad + lane_w + 10
-        for k, e in enumerate(events):
-            y = title_h + 16 + k * step
-            rect(axis_x - 6, y + 6, 12, 12, _color_for(e["status"], legend), rx=6)
-            text(pad, y + 16, e["lane"], 11, "start", "#5b6b7a")
-            text(axis_x + 14, y + 16, f"{e['t']}  {e['label']}", 12, "start")
-            if k + 1 < len(events):
-                line(axis_x, y + 18, axis_x, y + step + 6)
-    else:
-        layers = spec["layers"]
-        nodes = {n["id"]: n for n in spec["nodes"]}
-        bw, bh, hgap, vgap = 150, 40, 36, 60
-        maxw = max(len(l) for l in layers)
-        w = pad + maxw * (bw + hgap) - hgap + pad
-        h = title_h + len(layers) * (bh + vgap) - vgap + pad * 2
-        pos = {}
-        for li, layer in enumerate(layers):
-            row_w = len(layer) * (bw + hgap) - hgap
-            x0 = (w - row_w) / 2
-            for ni, nid in enumerate(layer):
-                x = x0 + ni * (bw + hgap)
-                y = title_h + pad + li * (bh + vgap)
-                pos[nid] = (x, y)
-        for a, b in spec["edges"]:
-            ax, ay = pos[a]
-            bx, by = pos[b]
-            line(ax + bw / 2, ay + bh, bx + bw / 2, by, "#7a8794", 1.5, arrow=True)
-        for nid, (x, y) in pos.items():
-            n = nodes[nid]
-            rect(x, y, bw, bh, "#f4f6f8", _color_for(n["status"], legend) if n["status"] else "#7a8794", rx=8)
-            text(x + bw / 2, y + bh / 2 + 4, n["label"], 12, "middle")
+    w, h = _SCENES[spec["kind"]](spec, sc, title_h)
     if spec["title"]:
-        items.insert(0, {"op": "text", "x": pad, "y": 24, "s": spec["title"], "size": 16, "anchor": "start", "color": FG, "bold": True})
-    legend_keys = [k for k in legend] if legend else []
-    if legend_keys:
-        lx = pad
-        ly = h - pad + 4
+        sc.items.insert(0, {"op": "text", "x": PAD, "y": 24, "s": spec["title"], "size": 16, "anchor": "start", "color": FG, "bold": True})
+    if spec["legend"]:
+        lx = PAD
+        ly = h - PAD + 4
         h += 24
-        for k in legend_keys:
-            rect(lx, ly, 12, 12, _color_for(k, legend), rx=3)
-            text(lx + 16, ly + 11, k, 11)
-            lx += 28 + 7 * len(k)
-    return {"w": int(w), "h": int(h), "items": items}
+        for key in spec["legend"]:
+            sc.rect(lx, ly, 12, 12, sc.color(key), rx=3)
+            sc.text(lx + 16, ly + 11, key, 11)
+            lx += 28 + 7 * len(key)
+    return {"w": int(w), "h": int(h), "items": sc.items}
 
 
 # --------------------------------------------------------------------------- backends
