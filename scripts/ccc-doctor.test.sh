@@ -1051,6 +1051,26 @@ ok "non-claude, non-scoped lanes get no audience-map row" \
 nc="$(run_nc claude "$claude_scoped_cron" "" "" "/usr/bin:/bin" "$fresh_ingest")"
 ok "claude scoped lane is not faulted for the MemPalace sweep it deliberately lacks" \
   'jq -e ".klass == \"정상\"" <<<"$nc" >/dev/null'
+# Refresh/ingest status a previous Piri lane left under the audience root (and
+# a node-wide refresh status) only age on the Claude scoped lane — nothing
+# refreshes them. They must neither read as sweep-tick-stale nor shadow the
+# live top-level ingest tick ingest-cron.sh writes.
+mkdir -p "$map_aud/shared/nunchi"
+printf '%s' "$stale_json" > "$map_aud/shared/nunchi/mempalace-refresh.status.json"
+printf '%s' "$stale_ingest" > "$map_aud/shared/nunchi/ingest.status.json"
+nc="$(run_nc claude "$claude_scoped_cron" "$stale_json" "$nbin/mempalace" "" "$fresh_ingest")"
+ok "claude scoped lane ignores leftover refresh/ingest status it never writes (정상)" \
+  'jq -e ".klass == \"정상\" and (.status | contains(\"collection=not-wired\") and (contains(\"STALE\") | not) and (contains(\"scopes=\") | not))" <<<"$nc" >/dev/null'
+nc="$(run_nc claude "$claude_scoped_cron" "$stale_json" "$nbin/mempalace" "" "$stale_ingest")"
+ok "claude scoped lane still ages its own top-level ingest tick" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"ingest-tick-stale\"))" <<<"$nc" >/dev/null'
+claude_scoped_refresh_cron="$claude_scoped_cron
+17 * * * * CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$map_aud bash /h/.claude/hooks/nunchi/mempalace-refresh.sh claude /h/.claude/projects >> /log 2>&1 # nunchi:#816"
+# shellcheck disable=SC2034  # nc is read via eval inside ok()
+nc="$(run_nc claude "$claude_scoped_refresh_cron" "$ok_json" "$nbin/mempalace" "" "$fresh_ingest")"
+ok "a refresh cron on the claude scoped lane is a 경고 (refresh-cron-unexpected)" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"refresh-cron-unexpected\"))" <<<"$nc" >/dev/null'
+rm -f "$map_aud/shared/nunchi/mempalace-refresh.status.json" "$map_aud/shared/nunchi/ingest.status.json"
 
 # #2075: an audience-scoped bridge fed by a NON-scoped nunchi lane mixes owner
 # DM and family-room work into one node-wide store while every tick reads

@@ -2917,9 +2917,16 @@ class Doctor:
                 ).stdout
                 version = (out.splitlines() or ["unknown"])[-1].strip() or "unknown"
 
+        claude_scoped = _claude_scoped_nunchi_lane(cron, configured, self.provider)
+        # A Claude audience-scoped lane has no verbatim MemPalace sweep by
+        # design (#1921: ~/.claude/projects is not audience-routable), so a
+        # missing binary/status is not a finding there; its health is the
+        # sidecar row below plus the ingest tick.
+        no_sweep_lane = claude_scoped and configured == "claude"
+
         # Last body-free collection state (mirrors _status_collection).
         nunchi_home = Path(os.environ.get("NUNCHI_HOME", Path.home() / ".nunchi"))
-        status_file = Path(
+        status_file: Path | None = Path(
             os.environ.get(
                 "CCC_NUNCHI_MEMPALACE_STATUS", nunchi_home / "mempalace-refresh.status.json"
             )
@@ -2931,7 +2938,14 @@ class Doctor:
         # lane as frozen forever (실측: 4 nodes, legacy file ~14 days old,
         # scoped files 5 minutes old). Prefer the NEWEST scoped status file.
         scope_count = 0
-        if re.search(r"\bCCC_NUNCHI_AUDIENCE_SCOPED=1\b", cron):
+        if no_sweep_lane:
+            # Nothing refreshes MemPalace on this lane, so any refresh status
+            # (node-wide, or per-scope files left by a previous Piri lane)
+            # only ages: reading it would turn into sweep-tick-stale and
+            # promote leftover per-scope ingest ticks over the live top-level
+            # one ingest-cron.sh writes. Judge the lane by its ingest tick.
+            status_file = None
+        elif re.search(r"\bCCC_NUNCHI_AUDIENCE_SCOPED=1\b", cron):
             m_root = re.search(r"\bCCC_NUNCHI_AUDIENCE_ROOT=(\S+)", cron)
             if m_root:
                 scoped = sorted(
@@ -2943,21 +2957,22 @@ class Doctor:
                 if scoped:
                     status_file = scoped[0]
 
-        collection = "none"
+        collection = "not-wired" if status_file is None else "none"
         coll_state = ""
         sweep_finished: int | None = None
-        try:
-            data = json.loads(status_file.read_text())
-            coll_state = str(data.get("state", ""))
-            collection = "state={} exit_code={} finished_at={}".format(
-                data.get("state", "?"),
-                data.get("exit_code", "?"),
-                data.get("finished_at", data.get("started_at", "?")),
-            )
-            with contextlib.suppress(TypeError, ValueError):
-                sweep_finished = int(data.get("finished_at", data.get("started_at")))
-        except Exception:
-            collection = "none"
+        if status_file is not None:
+            try:
+                data = json.loads(status_file.read_text())
+                coll_state = str(data.get("state", ""))
+                collection = "state={} exit_code={} finished_at={}".format(
+                    data.get("state", "?"),
+                    data.get("exit_code", "?"),
+                    data.get("finished_at", data.get("started_at", "?")),
+                )
+                with contextlib.suppress(TypeError, ValueError):
+                    sweep_finished = int(data.get("finished_at", data.get("started_at")))
+            except Exception:
+                collection = "none"
 
         # Scoped lanes write their ingest tick under the audience root too
         # (#1419); the top-level file is a claude-era leftover there and must
@@ -2967,12 +2982,18 @@ class Doctor:
             configured,
             nunchi_home,
             sweep_finished,
-            sweep_cron_present=m is not None,
+            sweep_cron_present=m is not None and not no_sweep_lane,
             scoped=scope_count > 0,
             ingest_status=scoped_ingest,
         )
         if scope_count:
             ticks = f"scopes={scope_count} {ticks}"
+        # The installer never wires a refresh line on this lane and
+        # mempalace-refresh.sh refuses scoped non-Piri runs, so one present is
+        # a hand edit or a stale install — flag it rather than ignore it.
+        unexpected_refresh = no_sweep_lane and m is not None
+        if unexpected_refresh:
+            ticks += " refresh-cron-unexpected"
 
         status = (
             "configured={}; runtime={}; match={}; source={} {}; "
@@ -2982,17 +3003,12 @@ class Doctor:
             collection, ticks,
         )
 
-        claude_scoped = _claude_scoped_nunchi_lane(cron, configured, self.provider)
-        # A Claude audience-scoped lane has no verbatim MemPalace sweep by
-        # design (#1921: ~/.claude/projects is not audience-routable), so a
-        # missing binary/status is not a finding there; its health is the
-        # sidecar row below plus the ingest tick.
-        mp_needed = not (claude_scoped and configured == "claude")
         healthy = (
             match == "ok"
-            and (mp_ok or not mp_needed)
+            and (mp_ok or no_sweep_lane)
             and coll_state in {"ok", "running", ""}
             and not stale
+            and not unexpected_refresh
         )
         self.add(
             "정상" if healthy else "경고",
