@@ -215,3 +215,41 @@ Empty normal completions (#775) are classified, not disguised as `(No response)`
 External waits (#740): an agent's "I'll continue once CI finishes" is backed by a durable registry at `<bot_data_dir>/external-wait/waits.json` (owner-only, previous-good backup). The bridge monitor polls GitHub checks pinned to the registered exact head SHA, journals terminal transitions before waking, notifies the owning conversation, and resumes through a bridge-owned `external_event` turn (autonomous-metered). Operators inspect with `/waits` and cancel with `/cancelwait <wait_id>`; agents register via `python -m telegram_bot.core.external_wait_cli register` (see the `gh-ci-wait` skill). Kill-switches: `CCC_EXTERNAL_WAIT_ENABLED=0`, `CCC_EXTERNAL_WAIT_RESUME=0`, `CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP` (default 10/day). Records and logs stay body-free — no prompts, tokens, or check logs.
 
 Webhook nudge (#1222, off by default): the wait monitor's backoff caps at 300s, so a CI run finishing late in the window sits undetected for up to five minutes. `CCC_WEBHOOK_NUDGE_ENABLED=true` starts a loopback-bound listener (`CCC_WEBHOOK_NUDGE_HOST`/`_PORT`, default `127.0.0.1:8791`, path `/nudge`) that accepts HMAC-signed GitHub webhook deliveries (`workflow_run`, `check_suite`, `pull_request`) and pulls the matching waits' next poll forward to "now". The payload is treated strictly as an untrusted hint: terminal classification, exact-head validation, wake journaling, and resume budgets all remain in the polling monitor, so a forged delivery can at most trigger one early authenticated `gh` read and a lost delivery degrades to today's polling behavior. `CCC_WEBHOOK_NUDGE_SECRET` is required — enabling without it refuses to start the listener (fail-closed) while the bridge boots normally (keep the value in the node's env file, never in the repo). Public ingress from GitHub to the loopback listener (tunnel/reverse proxy) and registering the webhook on the repo are per-node operational decisions outside the bridge; payload bodies are parsed in memory and never persisted.
+
+## Group rows still holding a DM session (#2075)
+
+Before #2092, a group/room row in `sessions.json` could end up holding the
+sender's DM session id: the first-use seed copies the legacy unscoped
+`<uid>` row into a new scoped row, and the old external-wait/continuation
+runners resumed the DM session on the room's stream, which the next room turn
+then saved. #2092 fixed the lookups, not the rows already written, so such a
+room keeps resuming a DM-derived session. `ccc-doctor` reports the count as
+the `session scope rows` warning (counts only, read-only).
+
+Detection is store-only and independent of `CCC_TELEGRAM_SESSION_SCOPE`: a
+room row (`<uid>:<chat>` or `0:<chat>`) is flagged when its `session_id` is
+also held by a DM/legacy `<uid>` row (`dm-session`) or by another room
+(`cross-room-session`). Two scope keys of the same room are not flagged; the
+`0:0` shared-all row is ignored. Once the DM row has moved on to a new
+session the store keeps no trace — the #2074 sidecar `ambiguous` count is the
+remaining signal for those.
+
+```bash
+python3 scripts/ccc_session_scope_audit.py            # dry-run: counts + row keys
+# stop the bridge that owns the store first (both frontends if both are flagged)
+python3 scripts/ccc_session_scope_audit.py --apply    # backup, then clear
+```
+
+Default stores are `$BOT_DATA_DIR/sessions.json`, `~/.telegram_bot/sessions.json`
+and `~/.ccc-matrix/sessions.json`; pass `--store PATH` (repeatable) otherwise.
+`--apply` gives each flagged room row exactly what `/new` persists
+(`session_id: null`, `new_session: true`) and keeps its other fields; the row
+is not deleted, because an empty row would be re-seeded from the DM row on the
+next turn. DM rows are never modified. It refuses while the bridge owning the
+store is running (`bot.pid`) and while a pending external wait or continuation
+in a flagged room is still bound to a flagged session id (its runner would fall
+back to that registered id; let it finish or cancel it), and it copies the audited bytes to
+`sessions.json.bak-2075-<utc>` (0600) before an atomic write. A second run is a
+no-op. Roll back by restoring that backup with the bridge stopped. The room's
+next turn starts a fresh session; the DM-derived transcript is not distilled
+under the room's audience.

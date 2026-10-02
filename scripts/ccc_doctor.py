@@ -844,6 +844,7 @@ class Doctor:
         self.check_bridge_status()
         self.check_bridge_boot_path()
         self.check_continuation_state()
+        self.check_session_scope_rows()
         self.check_memory_cache()
         self.check_nunchi_collection()
         self.check_cron_drift()
@@ -1665,20 +1666,28 @@ class Doctor:
                 "nothing restarts the bridge on reboot; install the systemd unit if this node should self-start",
             )
 
-    def check_continuation_state(self) -> None:
-        """Report the opt-in baton monitor and its owner-only state directory."""
+    def _served_project_root(self) -> Path:
+        """Bridge home this doctor diagnoses: override, live same-checkout home, or HOME.
 
+        The live bridge's home is trusted only when it runs from this doctor's
+        checkout, so a fixture or twin checkout never reads another node's state.
+        """
         project_override = os.environ.get("CCC_DOCTOR_BRIDGE_PROJECT_ROOT")
         running_root = self.running_bridge_root()
         same_live_checkout = (
             running_root is not None
             and Path(running_root).resolve() == self.repo.resolve()
         )
-        project_root = Path(
+        return Path(
             project_override
             or (self.running_bridge_home() if same_live_checkout else None)
             or self.claude_dir.parent
         ).expanduser()
+
+    def check_continuation_state(self) -> None:
+        """Report the opt-in baton monitor and its owner-only state directory."""
+
+        project_root = self._served_project_root()
         state_dir = project_root / ".telegram_bot" / "continuation"
         configured = self.bridge_unit_environment_value(
             "CCC_CONTINUATION_ENABLED"
@@ -1746,6 +1755,68 @@ class Doctor:
             f"configured={configuration}; state=private-{mode:04o}",
             "none",
         )
+
+    def _bridge_session_stores(self) -> list[Path]:
+        """Existing Telegram + Matrix ``sessions.json`` of the served bridge home."""
+        project = self._served_project_root()
+        candidates = [
+            project / ".telegram_bot" / "sessions.json",
+            project / ".ccc-matrix" / "sessions.json",
+        ]
+        if os.environ.get("BOT_DATA_DIR"):
+            # A doctor run from inside one frontend inherits only its data dir.
+            candidates.insert(0, Path(os.environ["BOT_DATA_DIR"]).expanduser() / "sessions.json")
+        stores: list[Path] = []
+        for candidate in candidates:
+            if candidate.exists() and candidate not in stores:
+                stores.append(candidate)
+        return stores
+
+    def check_session_scope_rows(self) -> None:
+        """Flag group rows still resuming a DM-derived session id (#2075).
+
+        #2092 keyed the runner lookups by conversation; rows a pre-fix seed or
+        runner already filled with a DM session id keep resuming it inside the
+        room. Read-only and body-free: counts only, never keys or session ids.
+        The fix is the operator-run ``scripts/ccc_session_scope_audit.py``.
+        """
+        stores = self._bridge_session_stores()
+        if not stores:
+            return
+        item = "session scope rows"
+        tool = "python3 scripts/ccc_session_scope_audit.py"
+        try:
+            here = str(Path(__file__).resolve().parent)
+            if here not in sys.path:
+                sys.path.insert(0, here)
+            import ccc_session_scope_audit as audit_mod
+        except Exception:
+            self.add("경고", item, "audit module unavailable", f"run {tool} from the checkout")
+            return
+        flagged = unreadable = 0
+        for store in stores:
+            try:
+                flagged += len(audit_mod.audit_store(store).flagged)
+            except Exception:
+                unreadable += 1
+        if flagged:
+            self.add(
+                "경고",
+                item,
+                f"DEFECT: {flagged} group/room session row(s) still resume a DM-derived "
+                f"session id (#2075); stores={len(stores)} unreadable={unreadable}",
+                f"review {tool} (dry-run), then stop the bridge and re-run it with "
+                "--apply (backs up first; docs/bridge-ops.md)",
+            )
+        elif unreadable:
+            self.add(
+                "경고",
+                item,
+                f"unreadable store(s)={unreadable} of {len(stores)}",
+                f"run {tool} as the bridge user",
+            )
+        else:
+            self.add("정상", item, f"stores={len(stores)} flagged=0", "none")
 
     # Aborts that a scheduled tick cannot clear on its own: a human has to put
     # the managed checkout back. These make the node fail doctor's exit code,
