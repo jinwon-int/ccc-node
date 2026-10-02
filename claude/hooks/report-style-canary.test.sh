@@ -50,6 +50,7 @@ ok "no operator note line is appended for an empty flag" \
 # 3. operator note inside the flag is echoed, bounded to 160 chars
 { printf '\n'; printf 'end: 2026-10-09 18:00 KST %s\n' "$(printf 'x%.0s' $(seq 1 400))"; } > "$FLAG"
 out="$(run_hook SessionStart)"
+# shellcheck disable=SC2034  # read inside the eval'd ok() conditions below
 note="$(printf "%s" "$out" | jq -r ".hookSpecificOutput.additionalContext" | grep "카나리 메모")"
 ok "the first non-empty flag line is echoed as the canary note" 'printf "%s" "$note" | grep -q "end: 2026-10-09 18:00 KST"'
 ok "the note is bounded (≤ 160 chars of flag text)" '[ "${#note}" -lt 200 ]'
@@ -67,6 +68,7 @@ ok "a missing rule file keeps the hook silent and exit 0" '[ "$rc" = 0 ] && [ -z
 
 # 6. distill subprocess guard
 cp "$HERE/lib/report-style-ste.txt" "$CCC_HOOK_DIR/lib/report-style-ste.txt"
+# shellcheck disable=SC2034  # rc is read inside the eval'd ok() condition
 out="$(CLAUDE_DISTILL_INFLIGHT=1 run_hook SessionStart)"; rc=$?
 ok "distill subprocesses get nothing" '[ "$rc" = 0 ] && [ -z "$out" ]'
 
