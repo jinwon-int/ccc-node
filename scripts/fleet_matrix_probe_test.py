@@ -44,9 +44,12 @@ class MatrixProbeTest(unittest.TestCase):
         )
         (target / "cgroup").write_text(f"0::{cgroup}\n")
 
-    def health(self, pid: int, state: str = "available", *, age: int = 0) -> None:
+    def health(
+        self, pid: int, state: str = "available", *, age: int = 0,
+        error_age: int | None = None, ok_age: int | None = None, reason: str | None = None,
+    ) -> None:
         path = self.data / "health.json"
-        path.write_text(json.dumps({
+        snapshot: dict = {
             "process": {
                 "pid": pid,
                 "started_at": datetime.fromtimestamp(
@@ -54,7 +57,17 @@ class MatrixProbeTest(unittest.TestCase):
                 ).isoformat(),
             },
             "service": {"state": state},
-        }))
+        }
+        if error_age is not None:
+            def stamp(seconds: int) -> str:
+                return datetime.fromtimestamp(self.now - seconds, timezone.utc).isoformat()
+            error = "agent turn failed: danso_provider_timeout / Worker failed"
+            snapshot["agent"] = {
+                "state": "degraded", "last_error": error, "last_error_at": stamp(error_age),
+                "last_ok_at": stamp(ok_age) if ok_age is not None else None,
+            }
+            snapshot["service"]["reason"] = reason if reason is not None else f"Danso: {error}"
+        path.write_text(json.dumps(snapshot))
         os.utime(path, (self.now - age, self.now - age))
 
     def db_health(self, state: str = "ready", *, age: int = 0) -> None:
@@ -110,6 +123,47 @@ class MatrixProbeTest(unittest.TestCase):
     def test_degraded_health_is_alerted(self) -> None:
         self.process(200, channel="matrix")
         self.health(200, state="degraded")
+        self.assertEqual(probe.probe(self.proc, now=self.now), ("DEGRADED", "health-degraded"))
+
+    # ccc-node#2098: the health snapshot stays degraded until the next turn
+    # succeeds, which on a quiet channel can be days after one provider timeout.
+    def test_old_agent_error_with_ready_transport_is_ok(self) -> None:
+        self.process(200, channel="matrix")
+        self.health(200, state="degraded", error_age=2 * 3600, ok_age=3 * 3600)
+        self.db_health("ready")
+        self.assertEqual(probe.probe(self.proc, now=self.now), ("OK", "degraded-stale-error"))
+
+    def test_recent_agent_error_is_still_degraded(self) -> None:
+        self.process(200, channel="matrix")
+        self.health(200, state="degraded", error_age=300, ok_age=3 * 3600)
+        self.db_health("ready")
+        self.assertEqual(probe.probe(self.proc, now=self.now), ("DEGRADED", "health-degraded"))
+        # The window is a parameter: a narrower one makes the same error stale.
+        self.assertEqual(
+            probe.probe(self.proc, now=self.now, max_error_age=60), ("OK", "degraded-stale-error")
+        )
+
+    def test_old_agent_error_cannot_mask_transport_retry(self) -> None:
+        self.process(200, channel="matrix")
+        self.health(200, state="degraded", error_age=2 * 3600)
+        self.db_health("network-retry")
+        # Transport is not ready: the stale-error exemption does not apply and
+        # the node stays DEGRADED (health verdict keeps its precedence).
+        self.assertEqual(probe.probe(self.proc, now=self.now), ("DEGRADED", "health-degraded"))
+
+    def test_degraded_for_another_reason_stays_degraded(self) -> None:
+        self.process(200, channel="matrix")
+        # An old agent error exists, but the service names a different cause.
+        self.health(200, state="degraded", error_age=2 * 3600, reason="Telegram: transport degraded")
+        self.db_health("ready")
+        self.assertEqual(probe.probe(self.proc, now=self.now), ("DEGRADED", "health-degraded"))
+        # And an agent error that is newer than the last success but has no
+        # parseable timestamp is not stale either.
+        self.health(200, state="degraded", error_age=2 * 3600)
+        path = self.data / "health.json"
+        snapshot = json.loads(path.read_text())
+        snapshot["agent"]["last_error_at"] = "not-a-timestamp"
+        path.write_text(json.dumps(snapshot))
         self.assertEqual(probe.probe(self.proc, now=self.now), ("DEGRADED", "health-degraded"))
 
     def test_fresh_process_health_cannot_mask_transport_retry(self) -> None:

@@ -40,7 +40,7 @@ for node in $NODES; do
   status=$(printf '%s\n' "$out" | sed -n 's/^MATRIX_STATUS=//p' | head -1)
   reason=$(printf '%s\n' "$out" | sed -n 's/^MATRIX_REASON=//p' | head -1)
   case "$status:$reason" in
-    OK:available|OK:db-ready|DOWN:no-process|DOWN:health-unavailable|DOWN:db-stopped|DEGRADED:health-degraded|DEGRADED:db-network-retry|UNVERIFIED:multiple-processes|UNVERIFIED:process-inspection|UNVERIFIED:data-directory|UNVERIFIED:health-size|UNVERIFIED:health-unreadable|UNVERIFIED:health-shape|UNVERIFIED:health-pid|UNVERIFIED:health-started|UNVERIFIED:matrix-config|UNVERIFIED:matrix-db|UNVERIFIED:matrix-db-stale|UNVERIFIED:matrix-db-before-process|UNVERIFIED:matrix-db-state) ;;
+    OK:available|OK:db-ready|OK:degraded-stale-error|DOWN:no-process|DOWN:health-unavailable|DOWN:db-stopped|DEGRADED:health-degraded|DEGRADED:db-network-retry|UNVERIFIED:multiple-processes|UNVERIFIED:process-inspection|UNVERIFIED:data-directory|UNVERIFIED:health-size|UNVERIFIED:health-unreadable|UNVERIFIED:health-shape|UNVERIFIED:health-pid|UNVERIFIED:health-started|UNVERIFIED:matrix-config|UNVERIFIED:matrix-db|UNVERIFIED:matrix-db-stale|UNVERIFIED:matrix-db-before-process|UNVERIFIED:matrix-db-state) ;;
     *) echo "UNVERIFIED $node channel=matrix inspection=malformed-result"; fail=1; continue ;;
   esac
   echo "$status $node channel=matrix reason=$reason"

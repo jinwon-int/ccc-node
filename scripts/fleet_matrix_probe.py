@@ -12,6 +12,46 @@ import sqlite3
 import time
 from urllib.parse import quote
 
+# A bridge health snapshot keeps `service.state == "degraded"` from the moment
+# an agent turn fails until the next turn succeeds. On a quiet channel that can
+# be days (2026-10-02: one provider timeout minutes after the daily watch pinned
+# a node as DEGRADED until someone wrote to its room; ccc-node#2098). Once the
+# failure is older than this and the transport (sync DB) is ready, the node is
+# reported OK with the reason `degraded-stale-error` instead of DEGRADED — a
+# *new* failure inside the window is still DEGRADED, and a transport problem
+# always wins.
+STALE_ERROR_SECS = 3600
+
+
+def _timestamp(value: object) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _agent_error_is_stale(data: dict, now: float, max_error_age: int) -> bool:
+    """True when the degraded state is explained only by an old agent failure."""
+    agent = data.get("agent")
+    service = data.get("service")
+    if not isinstance(agent, dict) or not isinstance(service, dict):
+        return False
+    last_error = agent.get("last_error")
+    reason = service.get("reason")
+    if not isinstance(last_error, str) or not last_error or not isinstance(reason, str):
+        return False
+    # The service reason must be the agent failure itself (`Danso: <error>`),
+    # not some other degradation that merely coincides with an old error.
+    if last_error not in reason:
+        return False
+    failed_at = _timestamp(agent.get("last_error_at"))
+    if failed_at is None or now - failed_at <= max_error_age:
+        return False
+    succeeded_at = _timestamp(agent.get("last_ok_at"))
+    return succeeded_at is None or succeeded_at <= failed_at
+
 
 def _fields(path: Path) -> list[bytes] | None:
     try:
@@ -97,7 +137,10 @@ def _db_health(
     return "UNVERIFIED", "matrix-db-state"
 
 
-def probe(proc_root: Path, *, now: float | None = None, max_age: int = 120) -> tuple[str, str]:
+def probe(
+    proc_root: Path, *, now: float | None = None, max_age: int = 120,
+    max_error_age: int = STALE_ERROR_SECS,
+) -> tuple[str, str]:
     matches, uncertain = _matrix_processes(proc_root)
     if len(matches) > 1:
         return "UNVERIFIED", "multiple-processes"
@@ -134,6 +177,8 @@ def probe(proc_root: Path, *, now: float | None = None, max_age: int = 120) -> t
     # agent health can say available even as meta.health says network-retry.
     # Recent transport state is therefore required for every OK verdict.
     if not stale and state == "degraded":
+        if db_status == "OK" and _agent_error_is_stale(data, observed, max_error_age):
+            return "OK", "degraded-stale-error"
         return "DEGRADED", "health-degraded"
     if not stale and state == "unavailable":
         return "DOWN", "health-unavailable"
@@ -143,8 +188,9 @@ def probe(proc_root: Path, *, now: float | None = None, max_age: int = 120) -> t
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--proc-root", type=Path, default=Path("/proc"))
+    parser.add_argument("--stale-error-secs", type=int, default=STALE_ERROR_SECS)
     args = parser.parse_args()
-    status, reason = probe(args.proc_root)
+    status, reason = probe(args.proc_root, max_error_age=args.stale_error_secs)
     print(f"MATRIX_STATUS={status}")
     print(f"MATRIX_REASON={reason}")
     print("PROBE_COMPLETE=1")
