@@ -154,6 +154,9 @@ class Config:
     # leaves the remote host. Empty tuple = single-broker behavior (default).
     remote_brokers: tuple[dict[str, str], ...] = ()
     revise_substitute_after_days: int = 0
+    # Explicit operator inventory: these authors intentionally have no worker.
+    # With B2 enabled, they can use its one-shot substitute without an outage wait.
+    revise_non_worker_authors: tuple[str, ...] = ()
     # Default OFF. This is the pipeline's first write to an intake PR's
     # lifecycle rather than its contents, so it stays opt-in per publisher.
     promote_autoclose_enabled: bool = False
@@ -234,6 +237,13 @@ def _parse_remote_brokers(raw: str) -> tuple[dict[str, str], ...]:
 
 _utc_now = _secure_fs.utc_now_iso
 _json_line = _secure_fs.json_line
+
+
+def _parse_non_worker_authors(raw: str) -> tuple[str, ...]:
+    authors = tuple(dict.fromkeys(part.strip() for part in raw.split(",") if part.strip()))
+    if len(authors) > 32 or any(not _NAME_RE.fullmatch(node) or len(node) > 32 for node in authors):
+        raise PromotionError("revise_non_worker_authors_invalid")
+    return authors
 
 
 def _safe_node(raw: str) -> str:
@@ -508,6 +518,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         revise_enabled=revise_enabled,
         revise_round_limit=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_ROUNDS", 2, 1, 2),
         revise_substitute_after_days=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_SUBSTITUTE_DAYS", 0, 0, 30),
+        revise_non_worker_authors=_parse_non_worker_authors(env.get("CCC_SKILL_PROMOTION_REVISE_NON_WORKER_AUTHORS", "")),
         promote_autoclose_enabled=promote_autoclose_enabled,
         supersede_autoclose_enabled=supersede_autoclose_enabled,
         auto_promote_enabled=auto_promote_enabled,
@@ -3324,6 +3335,9 @@ def _revise_substitute_eligible(
     """
     if _revise_substitute_used(rows, node, name):
         return False
+    if (getattr(config, "revise_substitute_after_days", 0) > 0
+            and node in getattr(config, "revise_non_worker_authors", ())):
+        return True
     return _revise_substitute_due(config, rows, node, name)
 
 
@@ -3563,6 +3577,9 @@ def _dispatch_intake_revise(
         "round": round_no,
         "reviser_node": reviser,
         "substitute": reviser != node,
+        **({"substitute_reason": (
+            "non_worker_author" if node in config.revise_non_worker_authors else "author_offline_aged"
+        )} if reviser != node else {}),
         "broker_id": broker_id,
         "broker": revise_rb["name"] if revise_rb else "primary",
     }

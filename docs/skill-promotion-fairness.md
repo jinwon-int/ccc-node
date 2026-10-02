@@ -108,3 +108,25 @@ the exporter CLI limit.
 Out of scope (unchanged): `max_prs`, daily caps, the collect schedule, trust
 and revision dispatch policy, fleet admission policy, and the #1647
 backlog-policy acceptance beyond this fairness slice.
+
+
+## Authors without a worker
+
+A broker-only node can author a candidate without registering an A2A worker.
+The publisher may list such identities in
+`CCC_SKILL_PROMOTION_REVISE_NON_WORKER_AUTHORS` (comma-separated node IDs,
+empty by default). The list is operator inventory; it must not be inferred
+from a transient absence in `/workers` or from candidate content.
+
+When B2 is enabled (`CCC_SKILL_PROMOTION_REVISE_SUBSTITUTE_DAYS` > 0), a listed
+author that is online nowhere can immediately use the existing independent
+substitute path. An online author still takes precedence. Unlisted offline
+authors retain the configured aging wait. Invalid IDs reject configuration.
+
+The trusted-worker filter, author/reviewer exclusions, one substitute per
+lineage, revision caps, revalidation and independent re-review remain in
+force. If no eligible worker is online, the original deferral remains.
+The dispatch ledger records `substitute_reason=non_worker_author` for this
+case, or `author_offline_aged` for the ordinary aged-offline route. Authorship
+and source-tree provenance are unchanged. This setting does not register a
+worker or install services on the author node.
