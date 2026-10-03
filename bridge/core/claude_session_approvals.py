@@ -42,6 +42,14 @@ logger = logging.getLogger("telegram_bot.core.claude_runtime")
 _NO_ACTIVE_APPROVAL_ROUTE = (
     "No active turn accepts approval requests; start a new user turn and retry"
 )
+# #2122: a between-turns autonomous continuation (the CLI resuming after a
+# background-task notification) has no user turn to carry an approval. Same
+# fail-closed decision, but named, so the agent and the log stop reading it
+# as a route that vanished mid-turn.
+_AUTONOMOUS_NO_APPROVAL_ROUTE = (
+    "Autonomous between-turns continuation has no approval route; actions "
+    "that need approval must wait for the next user turn"
+)
 
 
 def _approval_target_kind(tool_input: object) -> str:
@@ -140,14 +148,18 @@ class ClaudeSessionApprovalMixin:
 
         active = self._active_turn
         if active is None or active.finished:
+            autonomous = bool(getattr(self, "_unsolicited_inflight", False))
             logger.info(
                 "Approval request denied (no active route) provider=claude "
-                "tool=%s target_kind=%s request_id=%s turn=none outcome=denied-no-route",
+                "tool=%s target_kind=%s request_id=%s turn=%s outcome=denied-no-route",
                 tool_name,
                 _approval_target_kind(tool_input),
                 getattr(context, "tool_use_id", None),
+                "autonomous" if autonomous else "none",
             )
-            return PermissionResultDeny(message=_NO_ACTIVE_APPROVAL_ROUTE)
+            return PermissionResultDeny(
+                message=_AUTONOMOUS_NO_APPROVAL_ROUTE if autonomous else _NO_ACTIVE_APPROVAL_ROUTE
+            )
         generation = active.generation
         self._approval_counter += 1
         request_id = context.tool_use_id or f"approval-{self._approval_counter}"

@@ -2758,6 +2758,48 @@ async def test_unsolicited_seam_registers_and_delivers_through_the_bot(
     assert text.endswith("… (background result truncated)")
 
 
+class LifecycleFakeSession(UnsolicitedFakeSession):
+    """FakeSession that also exposes the between-turns lifecycle seam (#2122)."""
+
+    def __init__(self, session_id: str, events: list[AgentEvent] | None = None) -> None:
+        super().__init__(session_id, events)
+        self.lifecycle = None
+
+    def set_unsolicited_lifecycle(self, handler) -> None:
+        self.lifecycle = handler
+
+
+@pytest.mark.anyio
+async def test_autonomous_turn_publishes_and_clears_its_own_route(tmp_path: Path) -> None:
+    # #2122: the CLI continuing on its own after a background-task
+    # notification must find the conversation route, and closing that window
+    # must not erase a route a user turn re-published in between.
+    from telegram_bot.core.external_wait import publish_active_turn, resolve_active_route
+
+    session = LifecycleFakeSession("claude-bg")
+    handler = _handler(tmp_path, FakeRuntime([session]))
+    response = await handler.process_message("hello", 7, 70, bot=_RecordingBot())
+    assert response.success is True
+    assert session.lifecycle is not None
+    home = handler._external_wait_home()
+    assert resolve_active_route(home) is None  # the user turn cleared its route
+
+    await session.lifecycle("start", "claude-bg")
+    route = resolve_active_route(home)
+    assert route is not None
+    assert (route["user_id"], route["chat_id"], route["session_id"]) == (7, 70, "claude-bg")
+    assert route["owner"] == "autonomous"
+
+    await session.lifecycle("end", "claude-bg")
+    assert resolve_active_route(home) is None
+
+    await session.lifecycle("start", "claude-bg")
+    publish_active_turn(home, user_id=7, chat_id=70, session_id="claude-bg", owner="turn:9")
+    await session.lifecycle("end", "claude-bg")
+    kept = resolve_active_route(home)
+    assert kept is not None and kept["owner"] == "turn:9"
+
+
 @pytest.mark.anyio
 async def test_unsolicited_registration_skipped_without_bot_and_kept_across_turns(
     tmp_path: Path,

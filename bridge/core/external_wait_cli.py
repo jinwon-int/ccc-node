@@ -42,6 +42,7 @@ from telegram_bot.core.external_wait import (
     ExternalWaitRegistry,
     ExternalWaitValidationError,
     default_registry_path,
+    describe_route_unavailable,
     resolve_active_route,
     validate_head_sha,
     validate_pr_number,
@@ -183,6 +184,7 @@ def _cmd_register(home: Path, args: dict[str, Any]) -> int:
             {
                 "ok": False,
                 "code": "route-unavailable",
+                **describe_route_unavailable(home),
                 "message": (
                     "no single active conversation route; keep a foreground "
                     "watch or report that auto-resume is unavailable"

@@ -236,6 +236,17 @@ def _claim_request_terminal(request: _PendingRequest, phase: RequestPhase, *, ca
     return attempt.kind is TerminalAttemptKind.WON
 
 
+#: Route owner for the autonomous between-turns window (#2122).
+AUTONOMOUS_ROUTE_OWNER = "autonomous"
+
+
+def _turn_route_owner(turn_token: Any) -> Optional[str]:
+    """Owner stamp for a user turn's active-turn route (#2122)."""
+
+    generation = getattr(turn_token, "generation", None)
+    return None if generation is None else f"turn:{generation}"
+
+
 async def _await_offloaded_write(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> None:
     """Run a best-effort fsync-backed write in a worker thread, cancel-safely.
 
@@ -653,6 +664,7 @@ class ProjectChatProcessMixin:
         carries no bot never severs an existing delivery route.
         """
 
+        self._register_agent_unsolicited_lifecycle(session, user_id=user_id, chat_id=chat_id)
         setter = getattr(session, "set_unsolicited_handler", None)
         if not callable(setter):
             return
@@ -683,6 +695,47 @@ class ProjectChatProcessMixin:
             log_chat(user_id, session_id, "assistant", content, model=model)
 
         setter(deliver_unsolicited)
+
+    def _register_agent_unsolicited_lifecycle(
+        self, session: Any, *, user_id: int, chat_id: int
+    ) -> None:
+        """Publish the active-turn route for autonomous between-turns turns (#2122).
+
+        When the CLI continues on its own after a background-task
+        notification, no ``send_turn`` is in flight, so the user turn's route
+        was already cleared and the agent's external-wait / continuation
+        registrations failed ``route-unavailable``. The session announces
+        that window; the route is published for it under the ``autonomous``
+        owner and cleared only by the same owner, so a user turn that
+        re-publishes the conversation in between keeps its route.
+        """
+
+        setter = getattr(session, "set_unsolicited_lifecycle", None)
+        if not callable(setter):
+            return
+        home = self._external_wait_home()
+
+        async def unsolicited_lifecycle(phase: str, session_id: Optional[str]) -> None:
+            if phase == "start":
+                await _await_offloaded_write(
+                    publish_active_turn,
+                    home,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    session_id=session_id,
+                    owner=AUTONOMOUS_ROUTE_OWNER,
+                )
+            else:
+                await _await_offloaded_write(
+                    clear_active_turn,
+                    home,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    session_id=session_id,
+                    owner=AUTONOMOUS_ROUTE_OWNER,
+                )
+
+        setter(unsolicited_lifecycle)
 
     def _register_agent_frame_observer(self, session: Any, *, user_id: int, chat_id: int) -> None:
         """Feed adapter-path SDK frames into the /usage recorders.
@@ -1900,6 +1953,7 @@ class ProjectChatProcessMixin:
                     user_id=user_id,
                     chat_id=chat_id,
                     session_id=session.session_id if session is not None else None,
+                    owner=_turn_route_owner(turn_token),
                 )
             finally:
                 if turn_token is not None:
@@ -2074,6 +2128,7 @@ class ProjectChatProcessMixin:
                     user_id=user_id,
                     chat_id=chat_id,
                     session_id=session.session_id,
+                    owner=_turn_route_owner(turn_token),
                 )
                 generation = turn_token.generation
                 output = TurnOutputBuffer()
