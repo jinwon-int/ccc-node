@@ -57,11 +57,29 @@ SAFE_WORDS = set(
 SAFE_WORDS.update(
     """사용자는 사용자가 에이전트 노드 서버 서비스 작업 기억 분류 검토 수집 추출 저장 파이프라인 스키마 저널 스냅샷 데이터베이스 회귀 테스트 테스트가 테스트를 통과했다 통과했습니다 완료했다 완료했습니다 성공했다 성공했습니다 실패했다 실패했습니다 배포 배포했다 배포했습니다 패치 수정 수정했다 수정했습니다 오류 요청 응답 시간초과 재시도 예산 제한 활성화 비활성화 변경 변경했다 변경했습니다 유지한다 유지합니다 비공개 공유 영역 경로 인증 권한 거부 허용 로그 코드 커밋 브랜치 병합 병합했다 병합했습니다 확인 확인했다 확인했습니다 검증 필요하다 필요합니다 필수 금지 사용한다 사용합니다 선호한다 선호합니다 간결한 기술 요약 보고 결정 진행 상황 배경 사실 관찰 제약 정정 선호 절차 읽기 쓰기 저장했다 저장했습니다 중복 백업 복구 복구했다 복구했습니다 대기 실행 중지 정상 비정상 사용가능 버전 빌드 업데이트 롤백 재시작 상태 후 전 동안 먼저 다음 및 또는 다만 이유 때문에 때문에만 해야 한다 했다고 않았다 않는다 아닌""".split()
 )
+# Audited technical vocabulary, not arbitrary Korean words. Preserve the
+# original sentence; grammatical particles affect admission only, never the
+# meaning sent to the advisory classifier. Unknown names still fail closed.
+SAFE_WORDS.update(
+    """운영 머지 스쿼시 파일 정본 소스 승인 승격 설치 실패 현재 자동 기존 실제
+    로컬 모두 없다 있다 있고 않고 아직 재검토 보고서 기록 최종 비교 상세 시험
+    이번 수행하지 갱신된 저장되어 통과했으며 완료 독립 전체 최신 교차 원본 모델
+    설명 없이 뒤 의 시 두 새 a2a packages""".split()
+)
+PARTICLES = ("에서는", "에서", "으로", "은", "는", "이", "가", "을", "를", "의",
+             "에", "로", "와", "과", "도", "만", "이나", "나")
+
+
+def safe_word(word):
+    if word in SAFE_WORDS:
+        return True
+    return any(word.endswith(particle) and word[:-len(particle)] in SAFE_WORDS
+               for particle in PARTICLES)
 
 
 def safe_vocabulary(text):
     words = re.findall(r"[\w-]+", text.casefold())
-    return bool(words) and all(w in SAFE_WORDS for w in words)
+    return bool(words) and all(safe_word(w) for w in words)
 
 
 def sanitize(text):
@@ -77,7 +95,10 @@ def sanitize(text):
         "[reference]",
         text,
     )
-    text = re.sub(r"\b\d[\d:./_-]{3,}\b", "[number]", text)
+    # A Korean particle does not form a regex word boundary: PR #359의 and
+    # a commit hash followed by 로 must be redacted before vocabulary checks.
+    text = re.sub(r"(?<![A-Za-z0-9])[A-Fa-f0-9]{16,}(?![A-Za-z0-9])", "[reference]", text)
+    text = re.sub(r"\b\d[\d:./_-]*", "[number]", text)
     text = NAMES.sub("[node]", text)
     return text if safe_vocabulary(text) else None
 
@@ -133,7 +154,7 @@ def read_key(keypath):
     return key
 
 
-def run(home, bot, keypath, call=request):
+def run(home, bot, keypath, call=request, *, audience_root=None):
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = r.private_open(home / ".jev-review.lock", os.O_CREAT | os.O_RDWR)
     try:
@@ -149,7 +170,10 @@ def run(home, bot, keypath, call=request):
             "CREATE TABLE IF NOT EXISTS cursors(path TEXT PRIMARY KEY, inode TEXT NOT NULL, last_id INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS reviews(path TEXT,id INTEGER, fingerprint TEXT, day TEXT,status TEXT,kind TEXT,choice TEXT,confidence REAL,model TEXT,PRIMARY KEY(path,id,fingerprint));"
         )
         question = json.loads((HERE / "jev-kind-question.json").read_text())
-        paths = [home / "facts.db"] + sorted((bot / "memory-audiences").glob("*/nunchi/facts.db"))
+        root = Path(audience_root) if audience_root is not None else bot / "memory-audiences"
+        if not root.is_absolute():
+            raise ValueError("audience_root")
+        paths = [home / "facts.db"] + sorted(root.glob("*/nunchi/facts.db"))
         used = 0
         initialized = 0
         skipped = 0
@@ -257,6 +281,7 @@ if __name__ == "__main__":
                     "NUNCHI_JEV_KEY_FILE", str(Path.home() / ".secrets/typesafe-api-key")
                 )
             )
-            print(json.dumps(run(home, bot, key)))
+            print(json.dumps(run(home, bot, key,
+                                 audience_root=os.environ.get("CCC_NUNCHI_AUDIENCE_ROOT") or None)))
         except Exception:
             print(json.dumps({"status": "unavailable", "memory_unchanged": True}))

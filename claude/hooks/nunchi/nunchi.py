@@ -1227,9 +1227,23 @@ def backend_health_state():
     if not hist:
         return "ok", ""
     last = hist[-1]
+    # Calls can be days apart (the weekly bench is often the only caller).
+    # An old fallback is historical evidence, not a current authentication
+    # incident. Keep it visible as stale and retain the full history below.
+    cutoff = _float_env("NUNCHI_BACKEND_HEALTH_MAX_AGE_SEC", "86400")
+    cutoff = min(604800, max(600, cutoff))
+    def fresh(entry):
+        try:
+            stamp = datetime.fromisoformat(entry["ts"].replace("Z", "+00:00"))
+            elapsed = (datetime.now(timezone.utc) - stamp).total_seconds()
+            return 0 <= elapsed <= cutoff
+        except (KeyError, TypeError, ValueError):
+            return False
+    if not fresh(last):
+        return "stale", str(last.get("ts", "unknown"))
     if last["winner"] is None:
         return "outage", last["attempts"]
-    recent = hist[-_BACKEND_DEGRADED_WINDOW:]
+    recent = [entry for entry in hist[-_BACKEND_DEGRADED_WINDOW:] if fresh(entry)]
     degraded_n = sum(1 for h in recent if h["winner"] and h["winner"] != h["primary"])
     if degraded_n >= _BACKEND_DEGRADED_MIN:
         return "degraded", f"{last['primary']}→{last['winner']}"
@@ -1586,6 +1600,10 @@ def _snapshot_header(c):
         lines.append(
             f"- ⚠ nunchi 합성 백엔드가 fallback으로 강등됨({backend_detail}) —"
             " 1순위 인증 재확인 필요, `nunchi.py backend-status`로 확인")
+    elif backend_state == "stale":
+        lines.append(
+            f"- ⟳ 합성 상태 재확인 필요 — 마지막 실측 {backend_detail};"
+            " 과거 결과로 현재 장애를 단정하지 않는다.")
     if pending:
         if pending >= alert_at:
             lines.append(
