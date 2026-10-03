@@ -5,9 +5,12 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sqlite3
+import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -91,11 +94,101 @@ class Pipeline(unittest.TestCase):
         with self.assertRaises(ValueError):
             j.route({"memory_audience": "private", "memory_scope": scope}, root)
 
+    def routed_job(self, root, bot=None):
+        scope = "private-" + "b" * 32
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (root / scope).mkdir(mode=0o700, exist_ok=True)
+        jobs = (bot or self.bot) / "distill-journal"
+        jobs.mkdir(mode=0o700, parents=True, exist_ok=True)
+        job = jobs / "matrix-job.json"
+        job.write_text(json.dumps({
+            "memory_audience": "private", "memory_scope": scope,
+            "status": "extraction_done", "thread_id": "matrix-fixture",
+            "updated_at": "2026-10-03T00:00:00Z",
+            "extraction_output": {"honcho": [{"kind": "preference", "subject": "user",
+                                                "text": "The user prefers concise technical summaries."}]},
+        }))
+        job.chmod(0o600)
+        return job, root / scope / "nunchi" / "facts.db"
+
+    def test_matrix_uses_explicit_audience_root_and_is_idempotent(self):
+        root = self.p / "telegram-audiences"
+        job, db = self.routed_job(root)
+        result = j.run(self.home, self.bot, audience_root=root, channel="matrix")
+        self.assertEqual(result["mirrored_jobs"], 1)
+        self.assertTrue(db.exists())
+        self.assertFalse((self.home / "facts.db").exists())
+        self.assertFalse((self.bot / "memory-audiences").exists())
+        self.assertTrue((self.home / "matrix-journal-feed.status.json").exists())
+        self.assertEqual(j.run(self.home, self.bot, audience_root=root, channel="matrix")["mirrored_jobs"], 0)
+        self.assertEqual(job.stat().st_mode & 0o777, 0o600)
+
+    def test_fixed_destination_retries_without_erasing_failed_receipts(self):
+        root = self.p / "valid-audiences"
+        _job, db = self.routed_job(root)
+        wrong = self.p / "missing-audiences"
+        first = j.run(self.home, self.bot, audience_root=wrong, channel="matrix")
+        self.assertEqual(first["failed"], 1)
+        failed = list(self.home.glob("journal-matrix-*-receipts.jsonl"))[0]
+        before = failed.read_bytes()
+        self.assertEqual(j.run(self.home, self.bot, audience_root=root, channel="matrix")["mirrored_jobs"], 1)
+        self.assertEqual(failed.read_bytes(), before)
+        self.assertTrue(db.exists())
+
+    def test_non_private_destination_is_rejected(self):
+        root = self.p / "audiences"
+        _job, db = self.routed_job(root)
+        root.chmod(0o755)
+        self.assertEqual(j.run(self.home, self.bot, audience_root=root)["failed"], 1)
+        self.assertFalse(db.exists())
+
+    def test_scoped_danso_shell_mirrors_without_global_facts(self):
+        root = self.p / "audiences"
+        job, db = self.routed_job(root)
+        job.parent.rename(self.bot / "danso-distill-journal")
+        env = dict(os.environ, CCC_NUNCHI_MODE="on", CCC_NUNCHI_AUDIENCE_SCOPED="1",
+                   CCC_NUNCHI_AUDIENCE_ROOT=str(root), BOT_DATA_DIR=str(self.bot),
+                   CCC_STATE_DIR=str(self.p / "state"), NUNCHI_HOME=str(self.home),
+                   NUNCHI_DB=str(self.home / "facts.db"), NUNCHI_SNAPSHOT=str(self.home / "snapshot.md"))
+        result = subprocess.run(["bash", str(HERE / "danso-feed.sh")], env=env,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(db.exists())
+        self.assertFalse((self.home / "facts.db").exists())
+        status = json.loads((self.home / "ingest.status.json").read_text())
+        self.assertEqual(status["feed"], "danso")
+        self.assertEqual(status["ingested"], 1)
+
+    def test_korean_particles_preserve_sentence_and_exclude_unknown_names(self):
+        text = "PR 병합 후 운영 노드 업데이트와 서비스 재시작은 수행하지 않았다."
+        self.assertEqual(v.sanitize(text), text)
+        self.assertIsNone(v.sanitize("PR 병합 후 비공개인물은 서비스 재시작을 승인했다."))
+        self.assertIsNone(v.sanitize("PR 배포 후 환자 진단 기록을 저장했다."))
+        self.assertIsNone(v.sanitize("PR 배포 secret=abcdefghi 확인했다."))
+
+    def test_korean_attached_identifiers_are_redacted(self):
+        text = "PR #359의 갱신된 검토 기록은 저장되어 있다."
+        self.assertEqual(v.sanitize(text), "PR #[number]의 갱신된 검토 기록은 저장되어 있다.")
+        self.assertIsNone(v.sanitize("PR ABCPRIVATEIDENTIFIER의 검토 기록은 저장되어 있다."))
+
+    def test_backend_history_expires_and_fresh_call_recovers(self):
+        n = module("nunchi")
+        health = self.home / "health.json"
+        old = {"ts": "2000-01-01T00:00:00+00:00", "primary": "claude",
+               "winner": "codex", "attempts": "claude:exit-1"}
+        health.write_text(json.dumps({"history": [old] * 5}))
+        with patch.object(n, "BACKEND_HEALTH", str(health)):
+            self.assertEqual(n.backend_health_state()[0], "stale")
+            health.write_text(json.dumps({"history": [old] * 4 + [dict(old, ts=n.now(), winner="claude")]}))
+            self.assertEqual(n.backend_health_state()[0], "ok")
+
     def test_journal_storage_failure_is_not_acknowledged(self):
         scope = "private-" + "a" * 32
         target = self.bot / "memory-audiences" / scope / "nunchi"
         target.mkdir(mode=0o700, parents=True)
         target.parent.chmod(0o700)
+        target.parent.chmod(0o700)
+        target.parent.parent.chmod(0o700)
         db = target / "facts.db"
         db.write_text("bad")
         db.chmod(0o600)
@@ -141,6 +234,7 @@ class Pipeline(unittest.TestCase):
         scope = "private-" + "a" * 32
         target = self.bot / "memory-audiences" / scope
         target.mkdir(mode=0o700, parents=True)
+        target.parent.chmod(0o700)
         jobs = self.bot / "distill-journal"
         jobs.mkdir(mode=0o700)
         for i in range(20):

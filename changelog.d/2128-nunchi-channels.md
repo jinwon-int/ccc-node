@@ -1,0 +1,2 @@
+- Route completed channel journals to the bridge's configured audience root, preserve context-bound retry receipts, and expose held failures; support the same scoped mirror for Danso without enabling a mixed-audience verbatim index (#2128).
+- Admit audited Korean technical words with particles in advisory Jev review without rewriting the sentence or admitting unknown terms; expire historical synthesis health instead of presenting it as a current outage (#2128).

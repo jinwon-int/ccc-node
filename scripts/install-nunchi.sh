@@ -624,10 +624,11 @@ case "$ACTION" in
     if [ "$AUDIENCE_SCOPED" = 1 ]; then
       # Piri isolates transcripts per audience structurally; Claude is routed
       # per session through the bridge's session_id -> audience sidecar
-      # (#1921). Codex/Danso have no audience-routed nunchi feed — refuse.
+      # (#1921). Danso journals carry a validated route for journal-feed.py.
+      # Codex still has no audience-routed native transcript feed — refuse.
       case "$resolved_provider" in
-        piri|claude) ;;
-        *) echo "audience-scoped collection supports Piri and Claude only (resolved provider: $resolved_provider)" >&2; exit 2 ;;
+        piri|claude|danso) ;;
+        *) echo "audience-scoped collection supports Piri, Claude and Danso only (resolved provider: $resolved_provider)" >&2; exit 2 ;;
       esac
       case "$AUDIENCE_ROOT" in
         /*) ;;
@@ -654,6 +655,10 @@ case "$ACTION" in
     [ "$resolved_provider" = "codex" ] && feed="$HOOKS/codex-feed.sh"
     [ "$resolved_provider" = "piri" ]  && feed="$HOOKS/piri-feed.sh"
     [ "$resolved_provider" = "danso" ] && feed="$HOOKS/danso-feed.sh"
+    if [ "$resolved_provider" = danso ] && [ "$AUDIENCE_SCOPED" = 1 ]; then
+      [ -f "$HOOKS/journal-feed.py" ] && [ -f "$HOOKS/feed-receipt.py" ] \
+        || { echo "scoped journal helpers missing — run setup.sh first" >&2; exit 2; }
+    fi
     # The Piri feed resolves its extractor CLI at RUNTIME from
     # CCC_PIRI_CLI_PATH/PATH; cron's bare PATH has no piri entry, which made
     # every feed tick a silent no-op on real nodes. Resolve a runnable CLI at
@@ -698,10 +703,11 @@ case "$ACTION" in
     refresh_ready=0
     # The verbatim MemPalace sweep reads ~/.claude/projects wholesale and has
     # no per-session router, so a Claude audience-scoped node would mix every
-    # audience into one palace (and mempalace-refresh.sh refuses scoped
-    # non-Piri runs anyway). Fail closed: peer facts only for that lane.
+    # audience into one palace. Danso's native state tree is likewise not a
+    # per-audience input. Fail closed: peer facts only for those lanes.
     claude_scoped=0
     [ "$resolved_provider" = claude ] && [ "$AUDIENCE_SCOPED" = 1 ] && claude_scoped=1
+    [ "$resolved_provider" = danso ] && [ "$AUDIENCE_SCOPED" = 1 ] && claude_scoped=1
     if [ "$claude_scoped" = 1 ]; then
       :
     elif [ -n "$mp" ] && [ -f "$mp" ] && [ -x "$mp" ] && [ -d "$sweep_dir" ] && [ -x "$refresh" ]; then
@@ -726,7 +732,7 @@ case "$ACTION" in
       append_cron_line "17 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK gen=$GEN"
       echo "mempalace hourly refresh cron added ($resolved_provider: $sweep_dir)"
     elif [ "$claude_scoped" = 1 ]; then
-      echo "claude audience-scoped: verbatim MemPalace refresh is not audience-routable — refresh cron skipped (peer facts are routed per session via the bridge sidecar)"
+      echo "$resolved_provider audience-scoped: verbatim MemPalace refresh is not audience-routable — refresh cron skipped (peer facts use validated audience routes)"
     else
       echo "mempalace CLI, refresh hook or transcript dir missing — verbatim refresh cron skipped"
     fi

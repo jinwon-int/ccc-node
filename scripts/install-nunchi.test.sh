@@ -29,7 +29,7 @@ cron_store="$TMP/crontab"
 piri_sessions="$home/.piri/agent/sessions"
 mkdir -p "$hooks/nunchi" "$state" "$codex_home/sessions" "$piri_sessions" \
   "$home/.claude/projects" "$home/.local/bin" "$nunchi_home" "$fake_bin"
-cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,wiki-promote.py,judge-verdict.schema.json,codex-feed.sh,session-tail.py,feed-receipt.py,piri-feed.sh,danso-feed.sh,ingest-cron.sh,bridge-journal.py,feed-common.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
+cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,wiki-promote.py,judge-verdict.schema.json,codex-feed.sh,session-tail.py,feed-receipt.py,journal-feed.py,piri-feed.sh,danso-feed.sh,ingest-cron.sh,bridge-journal.py,feed-common.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
 cp "$ROOT/claude/hooks/scan-injection.sh" "$hooks/scan-injection.sh"
 # setup.sh installs bridge/utils/secure_fs.py verbatim as hooks/ccc_secure_fs.py;
 # nunchi.py/judge-batch.py/wiki-promote.py import it from the hooks root (#1508),
@@ -413,11 +413,11 @@ cron_before="$(cat "$cron_store")"
 out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" \
   --apply --codex --audience-scoped "$audience_root" 2>&1)"; rc=$?
 ok "codex + audience-scoped is still refused, crontab untouched" \
-  '[ "$rc" = 2 ] && grep -q "supports Piri and Claude only" <<<"$out" && [ "$(cat "$cron_store")" = "$cron_before" ]'
+  '[ "$rc" = 2 ] && grep -q "supports Piri, Claude and Danso only" <<<"$out" && [ "$(cat "$cron_store")" = "$cron_before" ]'
 out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" \
   --apply --danso --audience-scoped "$audience_root" 2>&1)"; rc=$?
-ok "danso + audience-scoped is still refused, crontab untouched" \
-  '[ "$rc" = 2 ] && grep -q "supports Piri and Claude only" <<<"$out" && [ "$(cat "$cron_store")" = "$cron_before" ]'
+ok "danso scoped mirror is installed without a mixed-audience refresh" \
+  '[ "$rc" = 0 ] && grep -q "danso-feed.sh" "$cron_store" && grep -q "CCC_NUNCHI_AUDIENCE_SCOPED=1" "$cron_store" && ! grep -q "mempalace-refresh.sh" "$cron_store"'
 out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" \
   --apply --claude --audience-scoped "$audience_root" 2>&1)"; rc=$?
 ok "claude + audience-scoped is accepted" \

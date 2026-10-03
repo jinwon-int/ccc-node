@@ -7,12 +7,14 @@ Legacy unrouted journals remain the responsibility of the legacy feed.
 """
 
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import stat
 import time
 
 HERE = Path(__file__).resolve().parent
@@ -36,9 +38,16 @@ def route(job, root):
     for p in [target, *target.parents]:
         if p.is_symlink():
             raise ValueError("unsafe_route")
-    if not target.is_dir() or target.stat().st_uid != os.geteuid() or target.stat().st_mode & 0o077:
-        raise ValueError("unsafe_route")
-    return target / "nunchi"
+    for directory in (root, target):
+        meta = directory.lstat()
+        if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.geteuid() or meta.st_mode & 0o077:
+            raise ValueError("unsafe_route")
+    result = target / "nunchi"
+    if result.exists() or result.is_symlink():
+        meta = result.lstat()
+        if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.geteuid() or meta.st_mode & 0o077:
+            raise ValueError("unsafe_target")
+    return result
 
 
 def record_failure(receipt, path, fp):
@@ -50,7 +59,7 @@ def record_failure(receipt, path, fp):
         pass
 
 
-def write_status(home, status):
+def write_status(home, status, name="journal-feed.status.json"):
     import tempfile
 
     fd, tmp = tempfile.mkstemp(prefix=".journal-status-", dir=home)
@@ -59,13 +68,27 @@ def write_status(home, status):
             json.dump(status, f)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, home / "journal-feed.status.json")
+        os.replace(tmp, home / name)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
 
 
-def run(home, bot):
+def run(home, bot, *, audience_root=None, channel=None):
+    """Mirror one explicitly configured channel into its original audience root.
+
+    Matrix may use a shared configured audience root rather than a child of
+    BOT_DATA_DIR. The job's opaque route remains authoritative; neither an
+    absent route nor a missing scope directory is inferred or created.
+    Receipts for explicit channels bind the input AND destination so a fixed
+    destination can retry previously held jobs without altering old evidence.
+    """
+    if channel not in (None, "telegram", "matrix"):
+        raise ValueError("invalid_channel")
+    root = Path(audience_root) if audience_root is not None else bot / "memory-audiences"
+    if not root.is_absolute():
+        raise ValueError("invalid_audience_root")
+    status_name = f"{channel}-journal-feed.status.json" if channel else "journal-feed.status.json"
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = r.private_open(home / ".journal-feed.lock", os.O_RDWR | os.O_CREAT)
     try:
@@ -74,6 +97,9 @@ def run(home, bot):
         except BlockingIOError:
             return {"skipped": "locked"}
         receipt = home / "journal-receipts.jsonl"
+        if channel or audience_root is not None:
+            context = hashlib.sha256(os.fsencode(str(bot) + "\0" + str(root))).hexdigest()[:16]
+            receipt = home / f"journal-{channel or 'configured'}-{context}-receipts.jsonl"
         seen = failed = unrouted = budgeted = 0
         files = sorted(
             list((bot / "distill-journal").glob("*.json"))
@@ -101,7 +127,7 @@ def run(home, bot):
                     job = json.load(f)
                 if job.get("status") != "extraction_done":
                     continue
-                target = route(job, bot / "memory-audiences")
+                target = route(job, root)
                 raw = job.get("extraction_output")
                 output = json.loads(raw) if isinstance(raw, str) else raw
                 items = output["honcho"]
@@ -162,8 +188,22 @@ def run(home, bot):
             "mirrored_jobs": seen,
             "failed": failed,
             "unrouted": unrouted,
+            "channel": channel,
+            "sources": len(files),
         }
-        write_status(home, status)
+        # Held failures remain visible after their three attempts, instead of
+        # making an empty successful tick look like recovery.
+        latest = {}
+        if receipt.exists():
+            with os.fdopen(r.private_open(receipt, os.O_RDONLY)) as handle:
+                if os.fstat(handle.fileno()).st_size > r.MAX_BYTES:
+                    raise ValueError("receipt_capacity")
+                for line in handle:
+                    row = json.loads(line)
+                    latest[row["key"]] = row
+        status["held"] = sum(row.get("status") == "failed" and row.get("attempts", 0) >= 3
+                             for row in latest.values())
+        write_status(home, status, status_name)
         return status
     finally:
         os.close(lock)
@@ -180,4 +220,8 @@ if __name__ == "__main__":
     if enabled == "on":
         home = Path(os.environ.get("NUNCHI_HOME", str(Path.home() / ".nunchi")))
         bot = Path(os.environ.get("BOT_DATA_DIR", str(Path.home() / ".telegram_bot")))
-        print(json.dumps(run(home, bot)))
+        print(json.dumps(run(
+            home, bot,
+            audience_root=os.environ.get("CCC_NUNCHI_AUDIENCE_ROOT") or None,
+            channel=os.environ.get("NUNCHI_JOURNAL_CHANNEL") or None,
+        )))
