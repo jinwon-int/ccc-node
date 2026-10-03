@@ -74,7 +74,76 @@ def write_status(home, status, name="journal-feed.status.json"):
             os.unlink(tmp)
 
 
-def run(home, bot, *, audience_root=None, channel=None):
+def mirror_job(job, root):
+    target = route(job, root)
+    raw = job.get("extraction_output")
+    output = json.loads(raw) if isinstance(raw, str) else raw
+    items = output["honcho"]
+    if not isinstance(items, list) or not all(
+        isinstance(x, dict) and isinstance(x.get("text"), str) for x in items
+    ):
+        raise ValueError("invalid_output")
+    target.mkdir(mode=0o700, exist_ok=True)
+    if target.is_symlink():
+        raise ValueError("unsafe_target")
+    db = target / "facts.db"
+    if db.exists() or db.is_symlink():
+        r.fingerprint(db)
+    env = os.environ.copy()
+    env.update(
+        NUNCHI_HOME=str(target),
+        NUNCHI_DB=str(db),
+        NUNCHI_SNAPSHOT=str(target / "snapshot.md"),
+        NUNCHI_NO_AUTO_SUPERSEDE="1",
+    )
+    payload = {
+        "session_id": job["thread_id"],
+        "distilled_at": (output.get("provenance") or {}).get("distilled_at")
+        or job["updated_at"],
+        "honcho": items,
+    }
+    p = subprocess.run(
+        ["python3", str(HERE / "nunchi.py"), "ingest", "-"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=30,
+    )
+    if p.returncode:
+        raise ValueError("ingest_failed")
+    subprocess.run(
+        ["python3", str(HERE / "nunchi.py"), "snapshot", "--limit", "25"],
+        env=env,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+
+
+def held_count(receipt, files):
+    latest = {}
+    if receipt.exists():
+        with os.fdopen(r.private_open(receipt, os.O_RDONLY)) as handle:
+            if os.fstat(handle.fileno()).st_size > r.MAX_BYTES:
+                raise ValueError("receipt_capacity")
+            for line in handle:
+                row = json.loads(line)
+                latest[row["key"]] = row
+    count = 0
+    for path in files:
+        try:
+            key, fingerprint, _ = r.fingerprint(path)
+        except (OSError, ValueError):
+            continue
+        row = latest.get(key, {})
+        if (row.get("fingerprint") == fingerprint and row.get("status") == "failed"
+                and row.get("attempts", 0) >= 3):
+            count += 1
+    return count
+
+
+def run(home, bot, *, audience_root=None, channel=None, journal_dir=None):
     """Mirror one explicitly configured channel into its original audience root.
 
     Matrix may use a shared configured audience root rather than a child of
@@ -97,15 +166,15 @@ def run(home, bot, *, audience_root=None, channel=None):
         except BlockingIOError:
             return {"skipped": "locked"}
         receipt = home / "journal-receipts.jsonl"
-        if channel or audience_root is not None:
-            context = hashlib.sha256(os.fsencode(str(bot) + "\0" + str(root))).hexdigest()[:16]
+        if channel or audience_root is not None or journal_dir is not None:
+            context = hashlib.sha256(os.fsencode(str(journal_dir or bot) + "\0" + str(root))).hexdigest()[:16]
             receipt = home / f"journal-{channel or 'configured'}-{context}-receipts.jsonl"
         seen = failed = unrouted = budgeted = 0
-        files = sorted(
-            list((bot / "distill-journal").glob("*.json"))
-            + list((bot / "danso-distill-journal").glob("*.json")),
-            key=lambda p: p.name,
-        )
+        dirs = [Path(journal_dir)] if journal_dir is not None else [
+            bot / "distill-journal", bot / "danso-distill-journal"
+        ]
+        files = sorted((p for directory in dirs for p in directory.glob("*.json")),
+                       key=lambda p: p.name)
         for path in files:
             if budgeted >= 20:
                 break
@@ -127,50 +196,7 @@ def run(home, bot, *, audience_root=None, channel=None):
                     job = json.load(f)
                 if job.get("status") != "extraction_done":
                     continue
-                target = route(job, root)
-                raw = job.get("extraction_output")
-                output = json.loads(raw) if isinstance(raw, str) else raw
-                items = output["honcho"]
-                if not isinstance(items, list) or not all(
-                    isinstance(x, dict) and isinstance(x.get("text"), str) for x in items
-                ):
-                    raise ValueError("invalid_output")
-                target.mkdir(mode=0o700, exist_ok=True)
-                if target.is_symlink():
-                    raise ValueError("unsafe_target")
-                db = target / "facts.db"
-                if db.exists() or db.is_symlink():
-                    r.fingerprint(db)
-                env = os.environ.copy()
-                env.update(
-                    NUNCHI_HOME=str(target),
-                    NUNCHI_DB=str(db),
-                    NUNCHI_SNAPSHOT=str(target / "snapshot.md"),
-                    NUNCHI_NO_AUTO_SUPERSEDE="1",
-                )
-                payload = {
-                    "session_id": job["thread_id"],
-                    "distilled_at": (output.get("provenance") or {}).get("distilled_at")
-                    or job["updated_at"],
-                    "honcho": items,
-                }
-                p = subprocess.run(
-                    ["python3", str(HERE / "nunchi.py"), "ingest", "-"],
-                    input=json.dumps(payload),
-                    text=True,
-                    capture_output=True,
-                    env=env,
-                    timeout=30,
-                )
-                if p.returncode:
-                    raise ValueError("ingest_failed")
-                subprocess.run(
-                    ["python3", str(HERE / "nunchi.py"), "snapshot", "--limit", "25"],
-                    env=env,
-                    capture_output=True,
-                    timeout=30,
-                    check=True,
-                )
+                mirror_job(job, root)
                 if r.main(["stored", str(receipt), str(path), fp]) != 0:
                     raise ValueError("changed_job")
                 seen += 1
@@ -193,16 +219,7 @@ def run(home, bot, *, audience_root=None, channel=None):
         }
         # Held failures remain visible after their three attempts, instead of
         # making an empty successful tick look like recovery.
-        latest = {}
-        if receipt.exists():
-            with os.fdopen(r.private_open(receipt, os.O_RDONLY)) as handle:
-                if os.fstat(handle.fileno()).st_size > r.MAX_BYTES:
-                    raise ValueError("receipt_capacity")
-                for line in handle:
-                    row = json.loads(line)
-                    latest[row["key"]] = row
-        status["held"] = sum(row.get("status") == "failed" and row.get("attempts", 0) >= 3
-                             for row in latest.values())
+        status["held"] = held_count(receipt, files)
         write_status(home, status, status_name)
         return status
     finally:
@@ -224,4 +241,5 @@ if __name__ == "__main__":
             home, bot,
             audience_root=os.environ.get("CCC_NUNCHI_AUDIENCE_ROOT") or None,
             channel=os.environ.get("NUNCHI_JOURNAL_CHANNEL") or None,
+            journal_dir=os.environ.get("CCC_BRIDGE_DISTILL_JOURNAL") or None,
         )))

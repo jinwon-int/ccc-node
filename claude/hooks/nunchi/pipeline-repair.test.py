@@ -159,6 +159,49 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(status["feed"], "danso")
         self.assertEqual(status["ingested"], 1)
 
+    def test_scoped_danso_exact_custom_path_and_missing_source(self):
+        root = self.p / "audiences"
+        job, db = self.routed_job(root)
+        custom = self.bot / "custom journal"
+        job.parent.rename(custom)
+        sibling = self.bot / "distill-journal"
+        sibling.mkdir(mode=0o700)
+        (sibling / "unrequested.json").write_text("{bad")
+        env = dict(os.environ, CCC_NUNCHI_MODE="on", CCC_NUNCHI_AUDIENCE_SCOPED="1",
+                   CCC_NUNCHI_AUDIENCE_ROOT=str(root), BOT_DATA_DIR=str(self.bot),
+                   CCC_BRIDGE_DISTILL_JOURNAL=str(custom),
+                   CCC_STATE_DIR=str(self.p / "state"), NUNCHI_HOME=str(self.home))
+        command = ["bash", str(HERE / "danso-feed.sh")]
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(db.exists())
+        self.assertEqual(json.loads(result.stdout)["mirrored_jobs"], 1)
+        self.assertEqual(json.loads(result.stdout)["sources"], 1)
+        self.assertEqual(json.loads(result.stdout)["failed"], 0)
+        env["CCC_BRIDGE_DISTILL_JOURNAL"] = str(self.bot / "missing")
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("no distill journal", result.stderr)
+        status = json.loads((self.home / "ingest.status.json").read_text())
+        self.assertEqual(status["skipped"], "distill-journal-missing")
+        empty = self.bot / "empty"
+        empty.mkdir(mode=0o700)
+        env["CCC_BRIDGE_DISTILL_JOURNAL"] = str(empty)
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("is empty", result.stderr)
+
+    def test_held_count_only_current_fingerprints(self):
+        source = self.file("failed-job.json", "{bad")
+        receipt = self.home / "receipts.jsonl"
+        fp = r.fingerprint(source)[1]
+        for _ in range(3):
+            self.receipt("failed", receipt, source, fp)
+        self.assertEqual(j.held_count(receipt, [source]), 1)
+        source.write_text("changed job")
+        self.assertEqual(j.held_count(receipt, [source]), 0)
+        self.assertEqual(j.held_count(receipt, []), 0)
+
     def test_korean_particles_preserve_sentence_and_exclude_unknown_names(self):
         text = "PR 병합 후 운영 노드 업데이트와 서비스 재시작은 수행하지 않았다."
         self.assertEqual(v.sanitize(text), text)
@@ -186,7 +229,6 @@ class Pipeline(unittest.TestCase):
         scope = "private-" + "a" * 32
         target = self.bot / "memory-audiences" / scope / "nunchi"
         target.mkdir(mode=0o700, parents=True)
-        target.parent.chmod(0o700)
         target.parent.chmod(0o700)
         target.parent.parent.chmod(0o700)
         db = target / "facts.db"

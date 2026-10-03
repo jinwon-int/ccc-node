@@ -53,25 +53,6 @@ touch "$SEEN"
 (
   flock -n 9 || exit 0
 
-  # Danso bridge journals already carry the audience route. Use the same
-  # strict mirror as Matrix instead of reading a stale Piri transcript tree
-  # or putting private facts in the node-global store.
-  if [ "${CCC_NUNCHI_AUDIENCE_SCOPED:-0}" = 1 ]; then
-    result="$(BOT_DATA_DIR="${JOURNAL%/*}" python3 "$HERE/journal-feed.py")" || exit 2
-    counts="$(printf '%s' "$result" | python3 -c 'import json,sys
-d=json.load(sys.stdin)
-if d.get("skipped") == "locked": sys.exit(3)
-print(d["sources"], d["mirrored_jobs"], d["failed"]+d["unrouted"], d["held"])')"
-    rc=$?
-    [ "$rc" = 3 ] && exit 0
-    [ "$rc" = 0 ] || exit 2
-    read -r sources ingested deferred held <<<"$counts"
-    nunchi_write_status "$STATUS" danso "$sources" "$ingested" 0 "$deferred" \
-      "\"audience_scoped\":true,\"held\":$held"
-    printf '%s\n' "$result"
-    exit 0
-  fi
-
   if [ ! -d "$JOURNAL" ]; then
     # Loud, not silent: a Danso node with bridge distill off produces no journal
     # at all, and that is a configuration answer the operator must see. Still a
@@ -81,6 +62,29 @@ print(d["sources"], d["mirrored_jobs"], d["failed"]+d["unrouted"], d["held"])')"
     nunchi_write_status "$STATUS" danso 0 0 0 0 '"skipped":"distill-journal-missing"'
     exit 0
   fi
+
+  # Danso bridge journals already carry the audience route. Use the same
+  # strict mirror as Matrix instead of reading a stale Piri transcript tree
+  # or putting private facts in the node-global store.
+  if [ "${CCC_NUNCHI_AUDIENCE_SCOPED:-0}" = 1 ]; then
+    result="$(CCC_BRIDGE_DISTILL_JOURNAL="$JOURNAL" python3 "$HERE/journal-feed.py")" || exit 2
+    counts="$(printf '%s' "$result" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+if d.get("skipped") == "locked": sys.exit(3)
+print(d["sources"], d["mirrored_jobs"], d["failed"]+d["unrouted"], d["held"])')"
+    rc=$?
+    [ "$rc" = 3 ] && exit 0
+    [ "$rc" = 0 ] || exit 2
+    read -r sources ingested deferred held <<<"$counts"
+    if [ "$sources" -eq 0 ]; then
+      echo "danso-feed: distill journal $JOURNAL is empty — the bridge has not completed a distill job yet" >&2
+    fi
+    nunchi_write_status "$STATUS" danso "$sources" "$ingested" 0 "$deferred" \
+      "\"audience_scoped\":true,\"held\":$held"
+    printf '%s\n' "$result"
+    exit 0
+  fi
+
 
   ingested=0 retired=0 deferred=0 sources=0
   # A job still in flight is left unseen so a later tick picks it up once

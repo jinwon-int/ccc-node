@@ -48,3 +48,5 @@ Synthesis health expires after 24 hours by default
 becomes `stale`; previous outcomes remain in the status history. A fresh
 connectivity probe is needed before treating an old fallback as a current
 provider outage.
+
+`CCC_BRIDGE_DISTILL_JOURNAL` selects an exact journal directory (including custom names); the scoped Danso mirror does not scan sibling journals. Missing or empty extraction journals keep their operator diagnostic. Held counts cover current source fingerprints only.
