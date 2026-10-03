@@ -1059,20 +1059,27 @@ OUT="$TMP/out"; RC=0
 CCC_FLEET_NODES="ghost3" CCC_FLEET_SSH="$FLAKY" CCC_FLEET_SELF=_never_ CCC_FLEET_RETRY_DELAY=0 \
   bash "$SC" --light >"$OUT" 2>&1 || RC=$?
 ok "light mode: one transport retry by default" '[ "$(grep -c "^ghost3$" "$TMP/calls")" = 2 ]'
+# The deadline is checked against bash $SECONDS, which is whole wall-clock
+# seconds truncated (time(NULL) - start), not elapsed time: it can read 1
+# a few milliseconds after start if a second boundary passes. With
+# DEADLINE=1 that skipped slow1 too on 6 of 60 local runs under ordinary
+# load (#2116, merge-queue eviction of #2113). DEADLINE=3 keeps slow1
+# inside the deadline unless startup takes >2s, and the 4s probe guarantees
+# slow2 lands past it.
 SLOW="$TMP/ssh-slow"
 cat > "$SLOW" <<SLOWEOF
 #!$(command -v bash)
 cat >/dev/null
-sleep 2
+sleep 4
 printf 'RUNTIME=/opt/ccc-node\nAVAIL=yes\nUNIT=/opt/ccc-node\nPROBE_COMPLETE=1\n'
 SLOWEOF
 chmod +x "$SLOW"
 OUT="$TMP/out"; RC=0
-CCC_FLEET_NODES="slow1 slow2" CCC_FLEET_SSH="$SLOW" CCC_FLEET_SELF=_never_ CCC_FLEET_DEADLINE=1 \
+CCC_FLEET_NODES="slow1 slow2" CCC_FLEET_SSH="$SLOW" CCC_FLEET_SELF=_never_ CCC_FLEET_DEADLINE=3 \
   bash "$SC" --light >"$OUT" 2>&1 || RC=$?
 okc "$RC" 1 "light mode: nodes past the deadline are not silently skipped"
 ok "light mode: the node probed in time is judged, the rest are UNVERIFIED" \
-  'grep -q "^OK slow1 " "$OUT" && grep -q "^UNVERIFIED slow2 inspection=deadline-1s$" "$OUT"'
+  'grep -q "^OK slow1 " "$OUT" && grep -q "^UNVERIFIED slow2 inspection=deadline-3s$" "$OUT"'
 
 python3 "$ROOT/scripts/fleet_watch_state_test.py"
 okc "$?" 0 "change-based alert state transitions and state-file safety"
