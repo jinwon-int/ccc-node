@@ -337,3 +337,34 @@ def test_register_never_supersedes_another_conversations_wait(
     assert payload["ok"] is True
     assert payload["superseded"] == []
     assert _wait_ids(home)[other_id]["state"] == "monitoring"
+
+
+def test_register_merge_queue_source_records_and_reports_it(
+    home: Path, capsys: pytest.CaptureFixture
+) -> None:
+    # #2118: a queued PR is watched for landing/eviction, not for its checks.
+    _publish(home)
+
+    rc = external_wait_cli.main(_register_args(source="merge-queue"))
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["source"] == "github_merge_queue"
+    assert "merge queue" in payload["message"]
+    record = ExternalWaitRegistry(default_registry_path(home)).get(payload["wait_id"])
+    assert record["source"] == "github_merge_queue"
+
+    assert external_wait_cli.main(["list"]) == 0
+    listed = json.loads(capsys.readouterr().out.strip())
+    assert listed["waits"][0]["source"] == "github_merge_queue"
+
+
+def test_register_rejects_an_unknown_source(home: Path, capsys: pytest.CaptureFixture) -> None:
+    _publish(home)
+
+    rc = external_wait_cli.main(_register_args(source="webhook"))
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["code"] == "validation" and "merge-queue" in payload["message"]
+    assert ExternalWaitRegistry(default_registry_path(home)).records() == []

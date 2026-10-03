@@ -15,8 +15,18 @@ Usage (inside an agent turn)::
     python -m telegram_bot.core.external_wait_cli register \
         --repo owner/name --pr 123 --head-sha def5678 \
         --summary "merge when green" --keep-previous 1
+    python -m telegram_bot.core.external_wait_cli register \
+        --repo owner/name --pr 123 --head-sha def5678 --source merge-queue \
+        --summary "clean up the branch once it lands"
     python -m telegram_bot.core.external_wait_cli list
     python -m telegram_bot.core.external_wait_cli cancel <wait_id>
+
+``--source merge-queue`` (#2118) watches an *enqueued* PR instead of its
+check rollup: the wait ends ``merged`` when it lands, ``evicted`` when the
+queue drops it (the speculative group run failed — the PR stays OPEN with its
+approval and no check changes, so the default source never wakes), or
+``closed``. An eviction records the failed merge-group run id for the
+resumed turn. Register right after enqueueing.
 
 A new registration for the same PR at a different head supersedes this
 conversation's older pending waits for that PR (#1110): a stale head must
@@ -37,6 +47,8 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from telegram_bot.core.external_wait import (
+    SOURCE_GITHUB_MERGE_QUEUE,
+    SOURCE_GITHUB_PR_CHECKS,
     STATE_MONITORING,
     TERMINAL_SUPERSEDED,
     ExternalWaitRegistry,
@@ -177,6 +189,22 @@ def _supersede_stale_waits(
     return superseded
 
 
+_SOURCE_ALIASES = {
+    "": SOURCE_GITHUB_PR_CHECKS,
+    "checks": SOURCE_GITHUB_PR_CHECKS,
+    SOURCE_GITHUB_PR_CHECKS: SOURCE_GITHUB_PR_CHECKS,
+    "merge-queue": SOURCE_GITHUB_MERGE_QUEUE,
+    SOURCE_GITHUB_MERGE_QUEUE: SOURCE_GITHUB_MERGE_QUEUE,
+}
+
+
+def _source_of(raw: Any) -> str:
+    key = str(raw or "").strip().lower()
+    if key not in _SOURCE_ALIASES:
+        raise ExternalWaitValidationError("source must be 'checks' or 'merge-queue'")
+    return _SOURCE_ALIASES[key]
+
+
 def _cmd_register(home: Path, args: dict[str, Any]) -> int:
     route = resolve_active_route(home)
     if route is None:
@@ -198,6 +226,7 @@ def _cmd_register(home: Path, args: dict[str, Any]) -> int:
         head_sha = resolve_full_head_sha(repo, validate_head_sha(str(args.get("head_sha", ""))))
         summary = validate_summary(args.get("summary"))
         timeout = float(args.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+        source = _source_of(args.get("source"))
     except ExternalWaitValidationError as exc:
         _emit({"ok": False, "code": "validation", "message": str(exc)})
         return RC_USAGE
@@ -216,6 +245,7 @@ def _cmd_register(home: Path, args: dict[str, Any]) -> int:
         summary=summary,
         timeout_seconds=timeout,
         poll_interval_seconds=DEFAULT_POLL_INTERVAL_SECONDS,
+        source=source,
     )
     if not wait_id:
         _emit({"ok": False, "code": "registry-error"})
@@ -238,10 +268,18 @@ def _cmd_register(home: Path, args: dict[str, Any]) -> int:
             "pr": pr_number,
             "head_sha": head_sha,
             "timeout_seconds": int(timeout),
+            "source": source,
             "superseded": superseded,
             "message": (
-                f"watching GitHub checks; conversation resumes on terminal "
-                f"state (wait_id={wait_id})"
+                (
+                    "watching the merge queue; conversation resumes when the PR "
+                    f"lands, is dropped, or closes (wait_id={wait_id})"
+                )
+                if source == SOURCE_GITHUB_MERGE_QUEUE
+                else (
+                    f"watching GitHub checks; conversation resumes on terminal "
+                    f"state (wait_id={wait_id})"
+                )
             ),
         }
     )
@@ -260,6 +298,7 @@ def _cmd_list(home: Path) -> int:
                     "repo": rec.get("repo"),
                     "pr": rec.get("pr_number"),
                     "head_sha": str(rec.get("head_sha") or "")[:8],
+                    "source": rec.get("source") or SOURCE_GITHUB_PR_CHECKS,
                     "state": rec.get("state"),
                     "summary": rec.get("summary") or "",
                     # Whether the promise actually continued, not just whether

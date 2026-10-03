@@ -26,9 +26,14 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional, Protocol
 
 from telegram_bot.core.external_wait import (
+    SOURCE_GITHUB_MERGE_QUEUE,
+    SOURCE_GITHUB_PR_CHECKS,
     TERMINAL_CANCELLED,
+    TERMINAL_CLOSED,
+    TERMINAL_EVICTED,
     TERMINAL_EXPIRED,
     TERMINAL_FAILURE,
+    TERMINAL_MERGED,
     TERMINAL_MONITOR_ERROR,
     TERMINAL_SUPERSEDED,
     TERMINAL_SUCCESS,
@@ -48,6 +53,17 @@ MAX_POLL_INTERVAL_SECONDS = 300.0
 MAX_TRANSPORT_ERRORS = 3
 DEFAULT_TIMEOUT_SECONDS = 6 * 60 * 60
 DEFAULT_RESUME_DAILY_CAP = 10
+#: A merge-queue wait whose PR was never seen in the queue is only judged
+#: evicted after this grace (the agent may register a moment before GitHub
+#: shows the entry); afterwards it ends ``evicted`` with reason never-enqueued.
+NOT_ENQUEUED_GRACE_SECONDS = 180.0
+#: Merge-queue polls back off to this ceiling (group runs take minutes).
+MERGE_QUEUE_MAX_POLL_INTERVAL_SECONDS = 120.0
+
+_MERGE_QUEUE_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
+    "{pullRequest(number:$number){state headRefOid isInMergeQueue}}}"
+)
 
 
 class TransportError(Exception):
@@ -66,8 +82,43 @@ class PrState:
     rollup: str  # pending | success | failure | cancelled
 
 
+@dataclass(frozen=True, slots=True)
+class MergeQueueState:
+    """Body-free merge-queue picture for one PR (#2118)."""
+
+    head_sha: str
+    pr_state: str  # OPEN | MERGED | CLOSED
+    in_queue: bool
+
+
 class WaitTransport(Protocol):
     async def fetch_pr_state(self, repo: str, pr_number: int) -> PrState: ...
+
+
+class MergeQueueTransport(Protocol):
+    async def fetch_merge_queue_state(self, repo: str, pr_number: int) -> MergeQueueState: ...
+
+    async def fetch_failed_queue_run(self, repo: str, pr_number: int) -> Optional[int]: ...
+
+
+async def _run_gh(*args: str, timeout: float = 60) -> bytes:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "gh",
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError:
+        raise TransportError("gh-unavailable")
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except TimeoutError:
+        process.kill()
+        raise TransportError("gh-timeout")
+    if process.returncode != 0:
+        raise TransportError(_classify_gh_error(stderr))
+    return stdout
 
 
 class GhCliTransport:
@@ -104,6 +155,81 @@ class GhCliTransport:
         if not head_sha:
             raise TransportError("malformed-response")
         return PrState(head_sha=head_sha, rollup=_normalize_rollup(payload))
+
+    async def fetch_merge_queue_state(self, repo: str, pr_number: int) -> MergeQueueState:
+        owner, name = repo.split("/", 1)
+        stdout = await _run_gh(
+            "api",
+            "graphql",
+            "-f",
+            f"query={_MERGE_QUEUE_QUERY}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={int(pr_number)}",
+        )
+        try:
+            payload = json.loads(stdout.decode("utf-8", "replace"))
+            pr = payload["data"]["repository"]["pullRequest"]
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+            raise TransportError("malformed-response")
+        return _merge_queue_state_from(pr)
+
+    async def fetch_failed_queue_run(self, repo: str, pr_number: int) -> Optional[int]:
+        """Newest failed ``merge_group`` run for this PR's queue branch, if any."""
+        stdout = await _run_gh(
+            "run",
+            "list",
+            "--repo",
+            repo,
+            "--event",
+            "merge_group",
+            "--limit",
+            "30",
+            "--json",
+            "databaseId,headBranch,conclusion",
+        )
+        try:
+            runs = json.loads(stdout.decode("utf-8", "replace"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise TransportError("malformed-response")
+        return _failed_queue_run_id(runs, pr_number)
+
+
+def _merge_queue_state_from(pr: Any) -> MergeQueueState:
+    if not isinstance(pr, dict):
+        raise TransportError("malformed-response")
+    head_sha = str(pr.get("headRefOid") or "").strip().lower()
+    pr_state = str(pr.get("state") or "").upper()
+    if not head_sha or pr_state not in {"OPEN", "MERGED", "CLOSED"}:
+        raise TransportError("malformed-response")
+    return MergeQueueState(head_sha=head_sha, pr_state=pr_state, in_queue=pr.get("isInMergeQueue") is True)
+
+
+def _failed_queue_run_id(runs: Any, pr_number: int) -> Optional[int]:
+    """``gh run list`` is newest-first; the queue branch embeds ``/pr-<n>-``."""
+    if not isinstance(runs, list):
+        return None
+    marker = f"/pr-{int(pr_number)}-"
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        branch = str(run.get("headBranch") or "")
+        if not branch.startswith("gh-readonly-queue/") or marker not in branch:
+            continue
+        if str(run.get("conclusion") or "").lower() not in {
+            "failure",
+            "timed_out",
+            "cancelled",
+            "startup_failure",
+        }:
+            continue
+        run_id = run.get("databaseId")
+        if isinstance(run_id, int) and run_id > 0:
+            return run_id
+    return None
 
 
 def _classify_gh_error(stderr: bytes) -> str:
@@ -154,6 +280,9 @@ _WAKE_HEADLINE = {
     TERMINAL_SUPERSEDED: "🔀 Watched head moved",
     TERMINAL_EXPIRED: "⏰ CI watch expired",
     TERMINAL_MONITOR_ERROR: "⚠️ CI watch failed (GitHub read error)",
+    TERMINAL_MERGED: "✅ Merged via merge queue",
+    TERMINAL_EVICTED: "❌ Dropped from merge queue",
+    TERMINAL_CLOSED: "⚠️ PR closed without merging",
 }
 
 
@@ -179,6 +308,9 @@ def wake_notification_text(
     headline = _WAKE_HEADLINE.get(record.get("terminal_status"), "ℹ️ CI watch ended")
     ref = f"{record.get('repo')}#{record.get('pr_number')} @ {str(record.get('head_sha') or '')[:8]}"
     lines = [f"{headline} — {ref}"]
+    detail_line = _detail_text(record)
+    if detail_line:
+        lines.append(detail_line)
     summary = str(record.get("summary") or "").strip()
     if summary:
         lines.append(f"Next: {summary}")
@@ -190,13 +322,32 @@ def wake_notification_text(
     return "\n".join(lines)
 
 
+def _detail_text(record: Dict[str, Any]) -> str:
+    detail = record.get("terminal_detail")
+    if not isinstance(detail, dict):
+        return ""
+    if detail.get("failed_run_id"):
+        return f"Failed merge-group run: {detail['failed_run_id']}"
+    if detail.get("reason") == "never-enqueued":
+        return "The PR was never seen in the merge queue."
+    return ""
+
+
 def resume_prompt_text(record: Dict[str, Any]) -> str:
     """Bridge-owned continuation input, clearly not user-authored (#740)."""
     summary = str(record.get("summary") or "").strip() or "continue the promised next step"
+    source = str(record.get("source") or SOURCE_GITHUB_PR_CHECKS)
+    extra = ""
+    detail = record.get("terminal_detail")
+    if isinstance(detail, dict):
+        if detail.get("failed_run_id"):
+            extra += f" failed_run={detail['failed_run_id']}"
+        if detail.get("reason"):
+            extra += f" reason={detail['reason']}"
     return (
-        f"[external_event: github_pr_checks terminal={record.get('terminal_status')} "
+        f"[external_event: {source} terminal={record.get('terminal_status')} "
         f"repo={record.get('repo')} pr={record.get('pr_number')} "
-        f"head={str(record.get('head_sha') or '')[:8]}]\n{summary}"
+        f"head={str(record.get('head_sha') or '')[:8]}{extra}]\n{summary}"
     )
 
 
@@ -299,22 +450,13 @@ class ExternalWaitMonitor:
         if now >= float(record.get("expires_epoch") or 0):
             self._registry.finish(wait_id, TERMINAL_EXPIRED, now=now)
             return
+        if record.get("source") == SOURCE_GITHUB_MERGE_QUEUE:
+            await self._poll_merge_queue(record, now)
+            return
         try:
             state = await self._transport.fetch_pr_state(record["repo"], int(record["pr_number"]))
         except TransportError as exc:
-            errors = self._transport_errors.get(wait_id, 0) + 1
-            self._transport_errors[wait_id] = errors
-            logger.warning(
-                "External-wait GitHub read failed (%s, attempt %d/%d): wait=%s",
-                exc.kind,
-                errors,
-                MAX_TRANSPORT_ERRORS,
-                wait_id,
-            )
-            if errors >= MAX_TRANSPORT_ERRORS:
-                self._registry.finish(wait_id, TERMINAL_MONITOR_ERROR, now=now)
-            else:
-                self._reschedule(record)
+            self._transport_failed(record, exc, now)
             return
         self._transport_errors.pop(wait_id, None)
         recorded = str(record.get("head_sha") or "")
@@ -335,9 +477,80 @@ class ExternalWaitMonitor:
             return
         self._reschedule(record)
 
-    def _reschedule(self, record: Dict[str, Any]) -> None:
+    def _transport_failed(self, record: Dict[str, Any], exc: TransportError, now: float) -> None:
+        wait_id = record["wait_id"]
+        errors = self._transport_errors.get(wait_id, 0) + 1
+        self._transport_errors[wait_id] = errors
+        logger.warning(
+            "External-wait GitHub read failed (%s, attempt %d/%d): wait=%s",
+            exc.kind,
+            errors,
+            MAX_TRANSPORT_ERRORS,
+            wait_id,
+        )
+        if errors >= MAX_TRANSPORT_ERRORS:
+            self._registry.finish(wait_id, TERMINAL_MONITOR_ERROR, now=now)
+        else:
+            self._reschedule(record)
+
+    async def _poll_merge_queue(self, record: Dict[str, Any], now: float) -> None:
+        """Watch one queued PR until it lands, is dropped, or closes (#2118).
+
+        An eviction changes neither the check rollup nor the PR state — the
+        entry just disappears — so the queue membership itself is polled.
+        """
+        wait_id = record["wait_id"]
+        repo = record["repo"]
+        pr_number = int(record["pr_number"])
+        fetch = getattr(self._transport, "fetch_merge_queue_state", None)
+        if fetch is None:
+            self._transport_failed(record, TransportError("unsupported-source"), now)
+            return
+        try:
+            state = await fetch(repo, pr_number)
+        except TransportError as exc:
+            self._transport_failed(record, exc, now)
+            return
+        self._transport_errors.pop(wait_id, None)
+        if state.pr_state == "MERGED":
+            self._registry.finish(wait_id, TERMINAL_MERGED, now=now)
+            return
+        if state.pr_state == "CLOSED":
+            self._registry.finish(wait_id, TERMINAL_CLOSED, now=now)
+            return
+        recorded = str(record.get("head_sha") or "")
+        if state.head_sha != recorded:
+            # A push removes the PR from the queue and needs a fresh approval;
+            # the watched head will never land.
+            self._registry.finish(wait_id, TERMINAL_SUPERSEDED, now=now)
+            return
+        if state.in_queue:
+            if not record.get("queue_seen"):
+                self._registry.mark_queue_seen(wait_id)
+            self._reschedule(record, ceiling=MERGE_QUEUE_MAX_POLL_INTERVAL_SECONDS)
+            return
+        if not record.get("queue_seen"):
+            if now - float(record.get("created_epoch") or now) < NOT_ENQUEUED_GRACE_SECONDS:
+                self._reschedule(record, ceiling=MERGE_QUEUE_MAX_POLL_INTERVAL_SECONDS)
+                return
+            self._registry.finish(
+                wait_id, TERMINAL_EVICTED, now=now, detail={"reason": "never-enqueued"}
+            )
+            return
+        detail: Dict[str, Any] = {"reason": "dropped"}
+        lookup = getattr(self._transport, "fetch_failed_queue_run", None)
+        if lookup is not None:
+            try:
+                run_id = await lookup(repo, pr_number)
+            except TransportError:
+                run_id = None
+            if run_id:
+                detail["failed_run_id"] = int(run_id)
+        self._registry.finish(wait_id, TERMINAL_EVICTED, now=now, detail=detail)
+
+    def _reschedule(self, record: Dict[str, Any], *, ceiling: float = MAX_POLL_INTERVAL_SECONDS) -> None:
         interval = min(
-            MAX_POLL_INTERVAL_SECONDS,
+            ceiling,
             float(record.get("poll_interval_seconds") or DEFAULT_POLL_INTERVAL_SECONDS) * 2,
         )
         self._registry.reschedule(
@@ -438,6 +651,8 @@ class ExternalWaitMonitor:
             TERMINAL_SUCCESS,
             TERMINAL_FAILURE,
             TERMINAL_CANCELLED,
+            TERMINAL_MERGED,
+            TERMINAL_EVICTED,
         }:
             return "non_terminal_rollup"
         summary = str(record.get("summary") or "").strip()
@@ -485,6 +700,9 @@ __all__ = [
     "ExternalWaitMonitor",
     "GhCliTransport",
     "MAX_TRANSPORT_ERRORS",
+    "MergeQueueState",
+    "MergeQueueTransport",
+    "NOT_ENQUEUED_GRACE_SECONDS",
     "PrState",
     "StatusSyncer",
     "TransportError",

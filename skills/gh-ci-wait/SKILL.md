@@ -42,6 +42,14 @@ python -m telegram_bot.core.external_wait_cli register \
   It becomes the continuation prompt: write it so future-you can act on it
   (e.g. "squash-merge PR #123 when green" or "inspect failing checks and fix").
 - Optional `--timeout-seconds` (default 6h).
+- **After enqueueing into a merge queue, add `--source merge-queue`.** A queue
+  that drops a PR (its speculative group run failed) leaves it OPEN, approved,
+  and with unchanged checks, so the default check-rollup wait never wakes on
+  it. The merge-queue wait ends `merged`, `evicted` (the wake names the failed
+  merge-group run id — `gh run view <id>` it, classify the failing job, and
+  re-enqueue an unchanged approved head only for an unrelated flake), or
+  `closed`. Register right after the enqueue mutation; a PR never seen in the
+  queue is reported `evicted` with `reason=never-enqueued` after a short grace.
 
 On success the CLI prints `{"ok": true, "wait_id": "..."}`.
 
@@ -54,6 +62,7 @@ CLI's source, not to memory — the CLI is a separate component and may move:
 | success shape `{"ok": true, "wait_id": ...}` | `grep -n '"wait_id": wait_id' bridge/core/external_wait_cli.py` (the `_emit` block) |
 | one-shot, exact-head-bound | `grep -n 'TERMINAL_SUPERSEDED\|head_sha' bridge/core/external_wait_cli.py` — a newer head finishes the old wait as superseded |
 | `route-unavailable` token | `grep -n 'route-unavailable' bridge/core/external_wait_cli.py` |
+| `--source merge-queue` and its `merged`/`evicted`/`closed` outcomes | `grep -n '_SOURCE_ALIASES\|_poll_merge_queue' bridge/core/external_wait_cli.py bridge/core/external_wait_monitor.py` |
 
 If a check disagrees with this table, the CLI is authoritative — fix this file,
 do not work around it.
