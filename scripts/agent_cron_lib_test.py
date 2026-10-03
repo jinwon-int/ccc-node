@@ -182,6 +182,70 @@ class OccurrenceTest(unittest.TestCase):
         self.assertTrue(truncated)
 
 
+class LatestWindowOnTruncationTest(unittest.TestCase):
+    """#2119: a truncated scan must keep the NEWEST windows, not the oldest."""
+
+    AT = _dt(2026, 10, 2, 11, 3)
+
+    def test_new_cron_step_task_is_due_at_its_latest_window(self):
+        for expr, minutes in (('*/5 * * * *', 5), ('*/15 * * * *', 15)):
+            for tz in ('UTC', 'Asia/Seoul'):
+                spec = lib.parse_schedule(expr, tz)
+                occ, truncated = lib.schedule_occurrences(spec, None, self.AT)
+                self.assertTrue(truncated, (expr, tz))
+                self.assertEqual(len(occ), lib.OCCURRENCE_SCAN_LIMIT, (expr, tz))
+                self.assertLessEqual(occ[-1], self.AT)
+                self.assertLess(self.AT - occ[-1], timedelta(minutes=minutes), (expr, tz))
+                self.assertEqual(occ, sorted(set(occ)))
+
+    def test_stale_last_run_converges_in_one_run(self):
+        # The observed poison: lastRunAt pinned months in the past by the bug.
+        spec = lib.parse_schedule('*/15 * * * *')
+        occ, truncated = lib.schedule_occurrences(spec, _dt(2026, 5, 18, 14, 30), self.AT)
+        self.assertTrue(truncated)
+        self.assertEqual(occ[-1], _dt(2026, 10, 2, 11, 0))
+        # Running occ[-1] records it as lastRunAt; the next tick has nothing due.
+        nxt, _ = lib.schedule_occurrences(spec, occ[-1], self.AT + timedelta(minutes=1))
+        self.assertEqual(nxt, [])
+
+    def test_matches_tail_of_exhaustive_reference(self):
+        for expr in ('*/5 * * * *', '0,30 8,20 * * 1,3,5', '* * * * *'):
+            spec = lib.parse_schedule(expr, 'America/New_York')
+            start, end = _dt(2026, 10, 25, 0, 0), _dt(2026, 11, 3, 0, 0)  # spans fall-back
+            want, _ = _slow_iter_occurrences(spec, start, end, cap=10 ** 7)
+            for cap in (1, 5, 37):
+                if len(want) <= cap:
+                    continue
+                first, truncated = lib.iter_occurrences(spec, start, end, cap)
+                self.assertTrue(truncated)
+                got = lib._latest_occurrences(spec, start, end, cap, first)
+                self.assertEqual(got, want[-cap:], (expr, cap))
+
+    def test_wide_cron_window_unaffected(self):
+        spec = lib.parse_schedule('0 6 * * *')
+        occ, truncated = lib.schedule_occurrences(spec, None, self.AT)
+        self.assertFalse(truncated)
+        self.assertEqual(occ[-1], _dt(2026, 10, 2, 6, 0))
+
+    def test_interval_with_stale_last_keeps_newest_phase_aligned(self):
+        spec = lib.parse_schedule('every 15m')
+        last = _dt(2026, 5, 18, 14, 30)
+        occ, truncated = lib.schedule_occurrences(spec, last, self.AT)
+        self.assertTrue(truncated)
+        self.assertEqual(len(occ), lib.OCCURRENCE_SCAN_LIMIT)
+        self.assertLessEqual(occ[-1], self.AT)
+        self.assertLess(self.AT - occ[-1], timedelta(minutes=15))
+        self.assertEqual((occ[-1] - last) % timedelta(minutes=15), timedelta(0))
+        self.assertEqual(occ[1] - occ[0], timedelta(minutes=15))
+
+    def test_interval_untruncated_matches_step_loop(self):
+        spec = lib.parse_schedule('every 30m')
+        anchor = _dt(2026, 8, 1, 0, 10)
+        occ, truncated = lib.schedule_occurrences(spec, None, _dt(2026, 8, 1, 2, 0), anchor)
+        self.assertFalse(truncated)
+        self.assertEqual(occ, [_dt(2026, 8, 1, 0, 40), _dt(2026, 8, 1, 1, 10), _dt(2026, 8, 1, 1, 40)])
+
+
 class RetryPolicyTest(unittest.TestCase):
     def test_defaults(self):
         p = lib.retry_policy({})

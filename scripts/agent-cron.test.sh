@@ -170,6 +170,16 @@ cat > "$TRUNC" <<'JSON'
 JSON
 out="$(CCC_AGENT_CRON_STORE="$TRUNC" bash "$CMD" due --json --at 2026-01-01T00:00:00Z)"; rc=$?
 ok "due reports when missed-run scan is truncated" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"dense\" and .missedRunsTruncated == true and .occurrenceScanLimit == 1000)" <<<"$out" >/dev/null'
+ok "truncated scan still schedules the latest window, not a year-old one (#2119)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"dense\" and .scheduledAt == \"2026-01-01T00:00:00Z\")" <<<"$out" >/dev/null'
+
+STEP="$TMP/cron-step.json"
+cat > "$STEP" <<'JSON'
+{"version":1,"tasks":[{"id":"step15","schedule":"*/15 * * * *","prompt":"a","enabled":true,"notify":"none"},{"id":"poisoned","schedule":"*/15 * * * *","prompt":"a","enabled":true,"notify":"none","lastRunAt":"2026-05-18T14:30:00Z"},{"id":"interval-poisoned","schedule":"every 15m","prompt":"a","enabled":true,"notify":"none","lastRunAt":"2026-05-18T14:30:00Z"}]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$STEP" bash "$CMD" due --json --at 2026-10-02T11:03:00Z)"; rc=$?
+ok "new */15 task is due once at its latest window (#2119)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"step15\" and .due == true and .dueCount == 1 and .scheduledAt == \"2026-10-02T11:00:00Z\")" <<<"$out" >/dev/null'
+ok "stale lastRunAt converges to the latest window instead of replaying the past (#2119)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"poisoned\" and .scheduledAt == \"2026-10-02T11:00:00Z\")" <<<"$out" >/dev/null'
+ok "interval schedule with stale lastRunAt converges too (#2119)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"interval-poisoned\" and .scheduledAt == \"2026-10-02T11:00:00Z\")" <<<"$out" >/dev/null'
 
 out="$(CCC_AGENT_CRON_STORE="$DUE" bash "$CMD" due --json --at not-a-date 2>&1)"; rc=$?
 ok "invalid --at fails closed without traceback" '[ "$rc" = 1 ] && grep -q -- "--at" <<<"$out" && ! grep -q "Traceback" <<<"$out"'
