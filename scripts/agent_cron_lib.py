@@ -9,6 +9,7 @@ names and dispatches only from ``main()``.
 """
 
 import re
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from zoneinfo import ZoneInfo
@@ -469,18 +470,51 @@ def schedule_occurrences(spec, last, at, anchor=None, cap=OCCURRENCE_SCAN_LIMIT)
         if anchor is None and last is None:
             return [at], False
         floor = last if (anchor is None or (last is not None and last > anchor)) else anchor
-        out = []
-        truncated = False
-        cur = _interval_next_after(spec, floor, anchor)
-        while cur <= at:
-            if len(out) >= cap:
-                truncated = True
-                break
-            out.append(cur)
-            cur += timedelta(seconds=spec['seconds'])
-        return out, truncated
+        first = _interval_next_after(spec, floor, anchor)
+        if first > at:
+            return [], False
+        step = timedelta(seconds=spec['seconds'])
+        count = (at - first) // step + 1
+        # Keep the NEWEST ``cap`` occurrences (#2119): the caller schedules
+        # occurrences[-1], so dropping the recent end would replay a stale
+        # window and pin lastRunAt in the past.
+        skip = max(0, count - cap)
+        return [first + step * i for i in range(skip, count)], skip > 0
     horizon = last or (at - timedelta(days=366))
-    return iter_occurrences(spec, horizon, at, cap)
+    out, truncated = iter_occurrences(spec, horizon, at, cap)
+    if truncated:
+        out = _latest_occurrences(spec, horizon, at, cap, out)
+    return out, truncated
+
+
+def _latest_occurrences(spec, start_exclusive, end_inclusive, cap, first_batch):
+    """Newest ``cap`` cron occurrences in (``start_exclusive``, ``end_inclusive``].
+
+    ``iter_occurrences`` truncates from the old end, which is right for an
+    exhaustive listing but wrong for scheduling: ``due_plan`` takes the last
+    element as ``scheduledAt``. Before #2119 a never-run ``*/15`` task got a
+    window from a year ago, ran, recorded that as ``lastRunAt``, and so ran
+    again on every scheduler tick until it caught up. Scan backwards in
+    widening windows (seeded by the span the first ``cap`` hits covered) so a
+    dense schedule stays a few thousand jumps instead of a full-year walk.
+    """
+    end = end_inclusive.replace(second=0, microsecond=0)
+    span = max(first_batch[-1] - first_batch[0], _ONE_MINUTE)
+    while True:
+        lo = end_inclusive - span
+        if lo <= start_exclusive:
+            lo = start_exclusive
+        window = deque(maxlen=cap)
+        cur = (lo + _ONE_MINUTE).replace(second=0, microsecond=0)
+        while True:
+            hit = _first_match(spec, cur, end)
+            if hit is None:
+                break
+            window.append(hit)
+            cur = hit + _ONE_MINUTE
+        if len(window) >= cap or lo == start_exclusive:
+            return list(window)
+        span *= 2
 
 
 def next_after(spec, at, anchor=None):
