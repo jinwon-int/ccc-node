@@ -347,6 +347,50 @@ ok "T11 curl stdin carries the escaped hostile header byte-exact" \
 ok "T11 remote script transit never embeds the secret value" \
   "$ASSERT $FIX/t11.json 'not d[\"ssh_secret\"]'"
 
+# ---- T12: #2114 — primary probe alone must send the sourced secret ----------
+# T11 shares one curl-stdin capture between the primary and remote paths, so
+# the remote header alone satisfied it while the primary path sent an empty
+# header (S never assigned → broker 401 → "broker-unreachable"). Probe the
+# primary path in isolation, and prove an empty secret stops before curl.
+
+T12="$TMP/t12"
+mkdir -p "$T12"
+printf "A2A_EDGE_SECRET='%s'\n" 'abc"def\ghi jkl' > "$T12/edge.env"
+printf "A2A_EDGE_SECRET=''\n" > "$T12/empty.env"
+cat > "$RB_BIN/curl" <<STUB
+#!/usr/bin/env bash
+cat >> "$T12/curl-stdin"
+printf '{"items":[{"nodeId":"alpha","status":"online"}]}'
+STUB
+chmod +x "$RB_BIN/curl"
+
+env -u A2A_EDGE_SECRET PATH="$RB_BIN:$PATH" python3 - "$TOOL" "$T12" > "$FIX/t12.json" <<'EOF'
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location("rot", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+d = sys.argv[2]
+ok_ids, ok_err = mod._broker_online_workers("http://127.0.0.1:8787", d + "/edge.env")
+stdin_ok = open(d + "/curl-stdin", encoding="utf-8").read()
+os.remove(d + "/curl-stdin")
+empty_ids, empty_err = mod._broker_online_workers("http://127.0.0.1:8787", d + "/empty.env")
+missing_ids, missing_err = mod._broker_online_workers("http://127.0.0.1:8787", d + "/absent.env")
+escaped = 'abc\\"def\\\\ghi jkl'
+print(json.dumps({
+    "ok_ids": ok_ids, "ok_err": ok_err,
+    "header_ok": ('header = "x-a2a-edge-secret: ' + escaped + '"\n') in stdin_ok,
+    "empty_header_sent": 'x-a2a-edge-secret: "' in stdin_ok,
+    "empty_err": empty_err, "missing_err": missing_err,
+    "curl_ran_without_secret": os.path.exists(d + "/curl-stdin"),
+}))
+EOF
+ok "T12 primary probe resolves workers with the sourced secret" \
+  "$ASSERT $FIX/t12.json 'd[\"ok_ids\"] == [\"alpha\"] and d[\"ok_err\"] is None'"
+ok "T12 primary curl stdin carries the env-file secret, not an empty header" \
+  "$ASSERT $FIX/t12.json 'd[\"header_ok\"] and not d[\"empty_header_sent\"]'"
+ok "T12 empty or absent secret fails closed as edge-secret-missing before curl" \
+  "$ASSERT $FIX/t12.json 'd[\"empty_err\"] == \"edge-secret-missing\" and d[\"missing_err\"] == \"edge-secret-missing\" and not d[\"curl_ran_without_secret\"]'"
+
 # ---- summary ----------------------------------------------------------------
 
 echo "PASS=$pass FAIL=$fail"
