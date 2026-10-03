@@ -32,9 +32,13 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 from telegram_bot.core.external_wait import (
     STATE_MONITORING,
+    SOURCE_GITHUB_MERGE_QUEUE,
     TERMINAL_CANCELLED,
+    TERMINAL_CLOSED,
+    TERMINAL_EVICTED,
     TERMINAL_EXPIRED,
     TERMINAL_FAILURE,
+    TERMINAL_MERGED,
     TERMINAL_MONITOR_ERROR,
     TERMINAL_OWNER_CANCEL,
     TERMINAL_SUCCESS,
@@ -78,6 +82,9 @@ _TERMINAL_LINE = {
     TERMINAL_EXPIRED: "⏰ expired",
     TERMINAL_MONITOR_ERROR: "⚠️ CI watch failed",
     TERMINAL_OWNER_CANCEL: "🚫 cancelled by owner",
+    TERMINAL_MERGED: "✅ merged → continuing",
+    TERMINAL_EVICTED: "❌ dropped from merge queue → investigating",
+    TERMINAL_CLOSED: "⚠️ closed without merging",
 }
 
 
@@ -136,6 +143,8 @@ def _duration(seconds: float) -> str:
 
 
 def _label(rec: Dict[str, Any]) -> str:
+    if rec.get("source") == SOURCE_GITHUB_MERGE_QUEUE:
+        return f"PR #{rec.get('pr_number')} merge queue"
     return f"PR #{rec.get('pr_number')} CI"
 
 

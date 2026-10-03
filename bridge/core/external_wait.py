@@ -42,6 +42,11 @@ from telegram_bot.utils.secure_fs import (
 logger = logging.getLogger(__name__)
 
 SOURCE_GITHUB_PR_CHECKS = "github_pr_checks"
+#: Merge-queue landing watch (#2118): a queued PR is dropped silently when its
+#: speculative group run fails — no check rollup or PR state changes — so the
+#: check-rollup source can never wake on it.
+SOURCE_GITHUB_MERGE_QUEUE = "github_merge_queue"
+SOURCES = frozenset({SOURCE_GITHUB_PR_CHECKS, SOURCE_GITHUB_MERGE_QUEUE})
 
 #: Non-terminal registry state.
 STATE_MONITORING = "monitoring"
@@ -58,6 +63,10 @@ TERMINAL_SUPERSEDED = "superseded"
 TERMINAL_MONITOR_ERROR = "monitor-error"
 TERMINAL_EXPIRED = "expired"
 TERMINAL_OWNER_CANCEL = "owner-cancel"
+#: Merge-queue outcomes (#2118).
+TERMINAL_MERGED = "merged"
+TERMINAL_EVICTED = "evicted"
+TERMINAL_CLOSED = "closed"
 
 TERMINAL_STATUSES = frozenset(
     {
@@ -68,6 +77,9 @@ TERMINAL_STATUSES = frozenset(
         TERMINAL_MONITOR_ERROR,
         TERMINAL_EXPIRED,
         TERMINAL_OWNER_CANCEL,
+        TERMINAL_MERGED,
+        TERMINAL_EVICTED,
+        TERMINAL_CLOSED,
     }
 )
 
@@ -131,6 +143,25 @@ def default_registry_path(home: Path) -> Path:
 
 def default_active_turns_path(home: Path) -> Path:
     return Path(home) / "active-turns.json"
+
+
+_DETAIL_KEY_RE = re.compile(r"^[a-z_]{1,32}$")
+_DETAIL_TEXT_RE = re.compile(r"^[A-Za-z0-9_.:/-]{1,64}$")
+
+
+def _bounded_detail(detail: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Keep only short identifier-shaped values (ids, reason codes)."""
+    out: Dict[str, Any] = {}
+    for key, value in (detail or {}).items():
+        if not isinstance(key, str) or not _DETAIL_KEY_RE.match(key) or len(out) >= 4:
+            continue
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and 0 <= value < 10**15:
+            out[key] = value
+        elif isinstance(value, str) and _DETAIL_TEXT_RE.match(value):
+            out[key] = value
+    return out
 
 
 class ExternalWaitRegistry:
@@ -237,14 +268,17 @@ class ExternalWaitRegistry:
         timeout_seconds: float,
         poll_interval_seconds: float,
         now: Optional[float] = None,
+        source: str = SOURCE_GITHUB_PR_CHECKS,
     ) -> str:
         """Register one wait; returns its id (idempotent per natural key)."""
+        if source not in SOURCES:
+            raise ExternalWaitValidationError(f"unknown wait source: {source}")
         repo = validate_repo(repo)
         pr_number = validate_pr_number(pr_number)
         head_sha = validate_head_sha(head_sha)
         summary = validate_summary(summary)
         now = self._clock() if now is None else float(now)
-        natural = (SOURCE_GITHUB_PR_CHECKS, repo, pr_number, head_sha, int(user_id), int(chat_id))
+        natural = (source, repo, pr_number, head_sha, int(user_id), int(chat_id))
 
         def _do(records):
             self._prune(records, now=now)
@@ -263,7 +297,7 @@ class ExternalWaitRegistry:
             wait_id = uuid.uuid4().hex[:12]
             records[wait_id] = {
                 "wait_id": wait_id,
-                "source": SOURCE_GITHUB_PR_CHECKS,
+                "source": source,
                 "repo": repo,
                 "pr_number": pr_number,
                 "head_sha": head_sha,
@@ -362,14 +396,41 @@ class ExternalWaitRegistry:
 
         return bool(self._mutate(_do))
 
-    def finish(self, wait_id: str, terminal_status: str, *, now: Optional[float] = None) -> bool:
+    def mark_queue_seen(self, wait_id: str) -> bool:
+        """Remember a merge-queue wait's PR was observed in the queue (#2118).
+
+        Leaving the queue only means eviction after the PR was seen in it;
+        before that it may simply not be enqueued yet.
+        """
+
+        def _do(records):
+            rec = records.get(wait_id)
+            if rec is None or rec.get("state") != STATE_MONITORING or rec.get("queue_seen"):
+                return False
+            rec["queue_seen"] = True
+            rec["updated_at"] = _utc_now_iso()
+            return True
+
+        return bool(self._mutate(_do))
+
+    def finish(
+        self,
+        wait_id: str,
+        terminal_status: str,
+        *,
+        now: Optional[float] = None,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Terminal transition, journaled before any wake. First write wins.
 
         Returns True only for the monitoring -> terminal transition; the wake
         is marked pending in the same durable write (exactly-once journal).
+        ``detail`` carries bounded, body-free facts about the outcome (#2118:
+        the failed merge-group run id, or ``reason``), never log content.
         """
         if terminal_status not in TERMINAL_STATUSES or terminal_status == TERMINAL_OWNER_CANCEL:
             raise ValueError(f"invalid terminal status: {terminal_status}")
+        clean_detail = _bounded_detail(detail)
 
         def _do(records):
             rec = records.get(wait_id)
@@ -381,6 +442,8 @@ class ExternalWaitRegistry:
             rec["completed_epoch"] = now_value
             rec["updated_at"] = _utc_now_iso()
             rec["wake"] = {"state": "pending", "attempts": 0}
+            if clean_detail:
+                rec["terminal_detail"] = clean_detail
             return True
 
         return bool(self._mutate(_do))
@@ -560,9 +623,10 @@ def render_waits(records: List[Dict[str, Any]]) -> str:
     for rec in records:
         state = rec.get("state")
         marker = "⏳" if state == STATE_MONITORING else "🏁"
+        kind = " (merge queue)" if rec.get("source") == SOURCE_GITHUB_MERGE_QUEUE else ""
         lines.append(
             f"{marker} `{rec.get('wait_id')}` — {rec.get('repo')}#{rec.get('pr_number')}"
-            f" @ {str(rec.get('head_sha') or '')[:8]} · {state}"
+            f"{kind} @ {str(rec.get('head_sha') or '')[:8]} · {state}"
         )
         summary = str(rec.get("summary") or "").strip()
         if summary:
@@ -679,9 +743,14 @@ __all__ = [
     "ACTIVE_ROUTE_TTL_SECONDS",
     "ExternalWaitRegistry",
     "ExternalWaitValidationError",
+    "SOURCE_GITHUB_MERGE_QUEUE",
     "SOURCE_GITHUB_PR_CHECKS",
+    "SOURCES",
     "STATE_MONITORING",
     "TERMINAL_CANCELLED",
+    "TERMINAL_CLOSED",
+    "TERMINAL_EVICTED",
+    "TERMINAL_MERGED",
     "TERMINAL_EXPIRED",
     "TERMINAL_FAILURE",
     "TERMINAL_MONITOR_ERROR",
