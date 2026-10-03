@@ -292,10 +292,16 @@ def _broker_online_workers(broker_url: str, edge_env_file: str) -> tuple[list[st
     value into curl's cmdline, readable from /proc/<pid>/cmdline while the
     request was in flight — #1917). curl-config escaping keeps quotes and
     backslashes inside the header value literal.
+    The env file exports A2A_EDGE_SECRET; it must be copied into S explicitly
+    — before #2114 S was never assigned, every request went out with an empty
+    header, the broker answered 401, and the probe misreported that as
+    broker-unreachable. An empty secret now exits 90 before curl runs and is
+    reported as edge-secret-missing.
     Returns (sorted ids, error).
     """
     script = (
         'EDGE_ENV="$1"; BROKER_URL="$2"; . "$EDGE_ENV"; '
+        'S=${A2A_EDGE_SECRET:-}; [ -n "$S" ] || exit 90; '
         'S=${S//\\\\/\\\\\\\\}; S=${S//\\"/\\\\\\"}; '
         'printf \'header = "x-a2a-edge-secret: %s"\\nurl = "%s/workers"\\n\' "$S" "$BROKER_URL" | curl -fsS --config -')
     try:
@@ -307,6 +313,8 @@ def _broker_online_workers(broker_url: str, edge_env_file: str) -> tuple[list[st
         )
     except (OSError, subprocess.TimeoutExpired):
         return [], "broker-unreachable"
+    if proc.returncode == 90:
+        return [], "edge-secret-missing"
     if proc.returncode != 0:
         return [], "broker-unreachable"
     try:
