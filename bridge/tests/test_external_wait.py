@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -472,3 +473,52 @@ def test_mark_delivery_failed_stamps_reason_and_ignores_unknown_wait(
     # The monitoring contract is untouched: the stamp is an audit side-record.
     assert stored["state"] == "monitoring"
     assert stored["wake"] is None
+
+
+def test_owner_scoped_clear_keeps_a_route_another_turn_republished(tmp_path: Path) -> None:
+    # #2122: an autonomous continuation and the next user turn share the
+    # session id; the autonomous window's end must not erase the user turn's
+    # freshly published route (and vice versa only for its own stamp).
+    publish_active_turn(
+        tmp_path, user_id=7, chat_id=70, session_id="s", now=1_000.0, owner="autonomous"
+    )
+    publish_active_turn(
+        tmp_path, user_id=7, chat_id=70, session_id="s", now=1_010.0, owner="turn:4"
+    )
+
+    clear_active_turn(tmp_path, user_id=7, chat_id=70, session_id="s", owner="autonomous")
+    route = resolve_active_route(tmp_path, now=1_020.0)
+    assert route is not None and route["owner"] == "turn:4"
+
+    clear_active_turn(tmp_path, user_id=7, chat_id=70, session_id="s", owner="turn:4")
+    assert resolve_active_route(tmp_path, now=1_020.0) is None
+
+
+def test_owner_less_clear_and_entries_keep_legacy_behaviour(tmp_path: Path) -> None:
+    publish_active_turn(tmp_path, user_id=7, chat_id=70, session_id="s", now=1_000.0)
+    clear_active_turn(tmp_path, user_id=7, chat_id=70, session_id="s", owner="turn:1")
+    assert resolve_active_route(tmp_path, now=1_010.0) is None
+
+    publish_active_turn(
+        tmp_path, user_id=7, chat_id=70, session_id="s", now=1_000.0, owner="turn:2"
+    )
+    clear_active_turn(tmp_path, user_id=7, chat_id=70, session_id="s")
+    assert resolve_active_route(tmp_path, now=1_010.0) is None
+
+
+def test_describe_route_unavailable_separates_none_from_ambiguous(tmp_path: Path) -> None:
+    from telegram_bot.core.external_wait import describe_route_unavailable
+
+    empty = describe_route_unavailable(tmp_path, now=1_000.0)
+    assert empty == {
+        "fresh_routes": 0,
+        "reason": "none",
+        "routes_path": str(default_active_turns_path(tmp_path)),
+    }
+
+    publish_active_turn(tmp_path, user_id=7, chat_id=70, session_id="a", now=1_000.0)
+    publish_active_turn(tmp_path, user_id=8, chat_id=80, session_id="b", now=1_000.0)
+    both = describe_route_unavailable(tmp_path, now=1_100.0)
+    assert both["fresh_routes"] == 2 and both["reason"] == "ambiguous"
+    # Body-free: counts and the path only, never conversation ids.
+    assert "70" not in json.dumps({k: v for k, v in both.items() if k != "routes_path"})

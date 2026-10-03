@@ -174,6 +174,9 @@ def test_register_fails_closed_without_an_active_route(
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload["ok"] is False
     assert payload["code"] == "route-unavailable"
+    # #2122: the refusal says which failure it saw and where it looked.
+    assert payload["reason"] == "none" and payload["fresh_routes"] == 0
+    assert payload["routes_path"].endswith("active-turns.json")
     # The contract: the failure itself tells the agent how to fall back, so a
     # missing monitor can never be reported as a kept promise.
     assert "foreground" in payload["message"] or "unavailable" in payload["message"]

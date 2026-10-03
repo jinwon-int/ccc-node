@@ -605,23 +605,29 @@ def publish_active_turn(
     chat_id: int,
     session_id: Optional[str],
     now: Optional[float] = None,
+    owner: Optional[str] = None,
 ) -> None:
     """Publish which conversation this turn serves (provider-neutral).
 
     The agent-side CLI binds registrations to this route. Best-effort: a
-    hiccup must never break the turn itself.
+    hiccup must never break the turn itself. ``owner`` names the publisher
+    (a user turn's generation, or the between-turns autonomous turn) so only
+    that publisher's ``clear_active_turn`` removes the entry (#2122).
     """
     path = default_active_turns_path(home)
     now_value = time.time() if now is None else float(now)
     try:
         with _active_turns_lock:
             entries = _read_active_turns(path)
-            entries[conversation_key_of(user_id, chat_id)] = {
+            entry: Dict[str, Any] = {
                 "user_id": int(user_id),
                 "chat_id": int(chat_id),
                 "session_id": session_id or None,
                 "heartbeat_epoch": now_value,
             }
+            if owner:
+                entry["owner"] = str(owner)
+            entries[conversation_key_of(user_id, chat_id)] = entry
             _write_active_turns(path, entries)
     except Exception as exc:  # pragma: no cover - deliberately fail-open
         logger.warning("External-wait active-turn publish failed: %s", type(exc).__name__)
@@ -633,8 +639,16 @@ def clear_active_turn(
     user_id: int,
     chat_id: int,
     session_id: Optional[str] = None,
+    owner: Optional[str] = None,
 ) -> None:
-    """Clear the route at turn end, only when it still names this session."""
+    """Clear the route at turn end, only when this publisher still owns it.
+
+    Same-session matching alone let one turn's ``finally`` erase a route
+    another turn of the same conversation had re-published (#2122): an
+    autonomous between-turns continuation and the next user turn share the
+    session id. With ``owner`` set, an entry stamped by a different owner is
+    left in place.
+    """
     path = default_active_turns_path(home)
     try:
         with _active_turns_lock:
@@ -645,6 +659,8 @@ def clear_active_turn(
                 return
             if session_id is not None and entry.get("session_id") not in (None, session_id):
                 return  # a newer turn already owns this conversation entry
+            if owner is not None and entry.get("owner") not in (None, str(owner)):
+                return  # another turn of this conversation re-published it
             entries.pop(key, None)
             _write_active_turns(path, entries)
     except Exception as exc:  # pragma: no cover - deliberately fail-open
@@ -660,18 +676,38 @@ def resolve_active_route(
     conversation is mid-turn, the CLI must refuse to register rather than
     bind a wait to a guessed conversation.
     """
+    fresh = _fresh_active_routes(home, now=now)
+    if len(fresh) != 1:
+        return None
+    return fresh[0]
+
+
+def _fresh_active_routes(home: Path, *, now: Optional[float] = None) -> List[Dict[str, Any]]:
     path = default_active_turns_path(home)
     now_value = time.time() if now is None else float(now)
     with _active_turns_lock:
         entries = _read_active_turns(path)
-    fresh = [
+    return [
         entry
         for entry in entries.values()
         if now_value - float(entry.get("heartbeat_epoch") or 0) <= ACTIVE_ROUTE_TTL_SECONDS
     ]
-    if len(fresh) != 1:
-        return None
-    return fresh[0]
+
+
+def describe_route_unavailable(home: Path, *, now: Optional[float] = None) -> Dict[str, Any]:
+    """Body-free diagnosis for a ``route-unavailable`` refusal (#2122).
+
+    ``none`` and ``ambiguous`` need different fixes (no turn published vs. a
+    stale or concurrent route), so the CLI reports which one it saw and the
+    file it scanned. Only counts and the path — never conversation ids.
+    """
+    path = default_active_turns_path(home)
+    fresh = _fresh_active_routes(home, now=now)
+    return {
+        "fresh_routes": len(fresh),
+        "reason": "none" if not fresh else "ambiguous",
+        "routes_path": str(path),
+    }
 
 
 __all__ = [
@@ -693,6 +729,7 @@ __all__ = [
     "conversation_key_of",
     "default_active_turns_path",
     "default_registry_path",
+    "describe_route_unavailable",
     "publish_active_turn",
     "resolve_active_route",
     "validate_head_sha",

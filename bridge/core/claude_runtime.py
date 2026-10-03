@@ -108,6 +108,13 @@ SdkClientFactory = Callable[[ClaudeAgentOptions], SdkClient]
 # autonomously continuing after a harness background-task notification).
 UnsolicitedHandler = Callable[[str, "str | None"], Awaitable[None]]
 
+# Between-turns lifecycle seam (#2122): async (phase, session_id) -> None with
+# phase "start" when an autonomous turn's first frame arrives and "end" after
+# its terminal ResultMessage. The bridge publishes the conversation's
+# active-turn route for that window so the agent-side external-wait and
+# continuation CLIs can bind to it like they do inside a user turn.
+UnsolicitedLifecycleHandler = Callable[[str, "str | None"], Awaitable[None]]
+
 # Optional observation-only seam (#584 C-1 follow-up): a synchronous callback
 # invoked with every raw SDK frame the session reads — turn-bearing and
 # between-turns flows alike — so the bridge can observe the same
@@ -303,6 +310,11 @@ class ClaudeSession(
         self._unsolicited_inflight = False
         self._unsolicited_texts: list[str] = []
         self._unsolicited_discard = False
+        #   * lifecycle — optional start/end seam for the autonomous turn
+        #     window; ``route_open`` remembers a delivered "start" so exactly
+        #     one "end" follows it (#2122).
+        self._unsolicited_lifecycle: UnsolicitedLifecycleHandler | None = None
+        self._unsolicited_route_open = False
         # Claude Code reports run-in-background Bash ownership in the tool
         # result and later closes it with a terminal <task-notification>.  Keep
         # Typed SDK lifecycle frames and the authoritative shell roster carry

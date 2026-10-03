@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Any
 from claude_agent_sdk import Message
 
 if TYPE_CHECKING:
-    from .claude_runtime import SdkFrameObserver, UnsolicitedHandler
+    from .claude_runtime import (
+        SdkFrameObserver,
+        UnsolicitedHandler,
+        UnsolicitedLifecycleHandler,
+    )
 
 
 # Preserve the established body-free trace channel after this pure move.
@@ -21,6 +25,7 @@ class ClaudeSessionObserversMixin:
 
     _sdk_frame_observer: SdkFrameObserver | None
     _unsolicited_handler: UnsolicitedHandler | None
+    _unsolicited_lifecycle: UnsolicitedLifecycleHandler | None
 
     def set_unsolicited_handler(self, handler: UnsolicitedHandler) -> None:
         """Register the between-turns delivery route (optional seam).
@@ -33,6 +38,17 @@ class ClaudeSessionObserversMixin:
         """
 
         self._unsolicited_handler = handler
+
+    def set_unsolicited_lifecycle(self, handler: UnsolicitedLifecycleHandler) -> None:
+        """Register the between-turns start/end seam (optional, #2122).
+
+        Same optional-seam style as ``set_unsolicited_handler``. The handler
+        is awaited with ``("start", session_id)`` when an autonomous turn's
+        first frame arrives and ``("end", session_id)`` after its terminal
+        ResultMessage; it is fail-open and never breaks the reader task.
+        """
+
+        self._unsolicited_lifecycle = handler
 
     def set_sdk_frame_observer(self, observer: SdkFrameObserver) -> None:
         """Register the raw-SDK-frame observation route (optional seam).

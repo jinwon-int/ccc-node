@@ -118,6 +118,9 @@ def test_register_fails_closed_without_an_active_route(
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload["ok"] is False
     assert payload["code"] == "route-unavailable"
+    # #2122: the refusal says which failure it saw and where it looked.
+    assert payload["reason"] == "none" and payload["fresh_routes"] == 0
+    assert payload["routes_path"].endswith("active-turns.json")
     # No continuation is recorded when the route cannot be bound.
     assert _queue(home).records() == []
 

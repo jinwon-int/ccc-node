@@ -983,6 +983,98 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
         self.assertEqual(self.delivered, [("second report", client.session_id)])
 
+    # -- autonomous turn route lifecycle (#2122) ----------------------------
+
+    async def test_lifecycle_brackets_each_autonomous_turn_once(self) -> None:
+        session, client = await self._start_session()
+        phases: list[tuple[str, str | None, int]] = []
+
+        async def lifecycle(phase: str, session_id: str | None) -> None:
+            phases.append((phase, session_id, len(self.delivered)))
+
+        session.set_unsolicited_lifecycle(lifecycle)
+        session.set_unsolicited_handler(self._handler)
+
+        client.emit_assistant("first chunk")
+        client.emit_assistant("second chunk")
+        client.emit_result(result=None)
+        await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
+        await self._drain(client)
+
+        # "start" before anything is delivered, exactly one "end" after it.
+        self.assertEqual(
+            phases,
+            [("start", client.session_id, 0), ("end", client.session_id, 1)],
+        )
+
+        # A normal user turn never touches the autonomous lifecycle.
+        await _collect(session.send_turn("hello"))
+        self.assertEqual(len(phases), 2)
+
+    async def test_lifecycle_failure_never_breaks_delivery(self) -> None:
+        session, client = await self._start_session()
+
+        async def broken(phase: str, session_id: str | None) -> None:
+            raise RuntimeError("route file exploded")
+
+        session.set_unsolicited_lifecycle(broken)
+        session.set_unsolicited_handler(self._handler)
+        client.emit_assistant("background report")
+        client.emit_result(result=None)
+        await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
+        self.assertEqual(self.delivered, [("background report", client.session_id)])
+        self.assertFalse(session._unsolicited_route_open)
+
+    async def test_abandoned_turn_swallow_emits_no_unpaired_end(self) -> None:
+        session, client = await self._start_session()
+        phases: list[str] = []
+
+        async def lifecycle(phase: str, session_id: str | None) -> None:
+            phases.append(phase)
+
+        session.set_unsolicited_lifecycle(lifecycle)
+        client.turn_scripts.append("hang")
+        iterator = session.send_turn("will be abandoned").__aiter__()
+        first_event = asyncio.create_task(iterator.__anext__())
+        await _wait_until(lambda: client.queries == ["will be abandoned"])
+        first_event.cancel()
+        await asyncio.gather(first_event, return_exceptions=True)
+
+        client.emit_assistant("late answer")
+        client.emit_result(result="late answer")
+        await self._drain(client)
+        self.assertEqual(phases, [])
+
+    async def test_approval_in_autonomous_turn_is_denied_with_its_own_reason(self) -> None:
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        can_use_tool = client.options.can_use_tool
+
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session._unsolicited_inflight)
+        with self.assertLogs("telegram_bot.core.claude_runtime", level="INFO") as logs:
+            decision = await can_use_tool(
+                "Bash",
+                {"command": "autonomous-command"},
+                ToolPermissionContext(tool_use_id="autonomous-approval"),
+            )
+        self.assertIsInstance(decision, PermissionResultDeny)
+        self.assertIn("Autonomous between-turns continuation", decision.message)
+        self.assertTrue(any("turn=autonomous" in line for line in logs.output))
+
+        client.emit_result(result=None)
+        await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
+        after = await can_use_tool(
+            "Bash",
+            {"command": "idle-command"},
+            ToolPermissionContext(tool_use_id="idle-approval"),
+        )
+        self.assertIsInstance(after, PermissionResultDeny)
+        self.assertEqual(
+            after.message,
+            "No active turn accepts approval requests; start a new user turn and retry",
+        )
+
     # -- ownership across interleaved turns --------------------------------
 
     async def test_inflight_autonomous_turn_keeps_frames_when_user_turn_arrives(

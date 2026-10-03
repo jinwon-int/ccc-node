@@ -38,6 +38,8 @@ class ClaudeSessionFrameRoutingMixin:
     _unsolicited_handler: Callable[[str, str | None], Awaitable[None]] | None
     _unsolicited_inflight: bool
     _unsolicited_texts: list[str]
+    _unsolicited_lifecycle: Callable[[str, str | None], Awaitable[None]] | None
+    _unsolicited_route_open: bool
     _observe_sdk_frame: Callable[[Message], None]
     _observe_background_task_notifications: Callable[[Message], None]
     _observe_result_deferring_task: Callable[
@@ -141,6 +143,7 @@ class ClaudeSessionFrameRoutingMixin:
                 self._unsolicited_discard = False
                 self._unsolicited_inflight = False
                 self._unsolicited_texts.clear()
+                await self._notify_unsolicited_lifecycle("end", message.session_id)
                 logger.warning(
                     "Swallowed late Claude ResultMessage after an abandoned turn: "
                     "session=%s",
@@ -150,10 +153,10 @@ class ClaudeSessionFrameRoutingMixin:
         if isinstance(message, StreamEvent):
             # The first token delta establishes turn ownership even though
             # unsolicited partials are intentionally not delivered.
-            self._unsolicited_inflight = True
+            await self._begin_unsolicited_turn(message)
             return
         if isinstance(message, AssistantMessage):
-            self._unsolicited_inflight = True
+            await self._begin_unsolicited_turn(message)
             self._unsolicited_texts.extend(
                 block.text for block in message.content if isinstance(block, TextBlock)
             )
@@ -164,18 +167,56 @@ class ClaudeSessionFrameRoutingMixin:
         self._unsolicited_texts.clear()
         self._unsolicited_inflight = False
         handler = self._unsolicited_handler
-        if handler is None:
-            logger.warning(
-                "Dropping unsolicited Claude result without a registered handler: "
-                "session=%s",
-                message.session_id,
-            )
-            return
         try:
-            await handler(raw, message.session_id)
+            if handler is None:
+                logger.warning(
+                    "Dropping unsolicited Claude result without a registered handler: "
+                    "session=%s",
+                    message.session_id,
+                )
+                return
+            try:
+                await handler(raw, message.session_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Fail-open: a broken delivery route must never take down the
+                # reader task that also serves in-turn frames.
+                logger.exception("Unsolicited Claude delivery handler failed")
+        finally:
+            await self._notify_unsolicited_lifecycle("end", message.session_id)
+
+    async def _begin_unsolicited_turn(self, message: Message) -> None:
+        """Mark autonomous-turn ownership; announce its start exactly once."""
+
+        if self._unsolicited_inflight:
+            return
+        self._unsolicited_inflight = True
+        session_id = getattr(message, "session_id", None) or self._session_id
+        await self._notify_unsolicited_lifecycle("start", session_id)
+
+    async def _notify_unsolicited_lifecycle(self, phase: str, session_id: str | None) -> None:
+        """Fail-open start/end seam for the autonomous turn window (#2122).
+
+        Only an "end" that follows a delivered "start" is forwarded, so an
+        abandoned turn's swallowed result never clears a route this window
+        did not publish.
+        """
+
+        lifecycle = self._unsolicited_lifecycle
+        if phase == "start":
+            if lifecycle is None or self._unsolicited_route_open:
+                return
+            self._unsolicited_route_open = True
+        else:
+            if not self._unsolicited_route_open:
+                return
+            self._unsolicited_route_open = False
+            if lifecycle is None:
+                return
+        try:
+            await lifecycle(phase, session_id)
         except asyncio.CancelledError:
             raise
         except Exception:
-            # Fail-open: a broken delivery route must never take down the
-            # reader task that also serves in-turn frames.
-            logger.exception("Unsolicited Claude delivery handler failed")
+            logger.exception("Unsolicited Claude lifecycle handler failed: phase=%s", phase)

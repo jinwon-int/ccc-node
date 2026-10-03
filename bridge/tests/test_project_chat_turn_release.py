@@ -18,6 +18,8 @@ attribute of the one this file imported does not reach the function.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import asyncio
 from pathlib import Path
 from typing import Any
@@ -303,12 +305,16 @@ def test_release_clears_authorizations_then_finalizes_clears_and_deactivates(
         host = _Host()
         clears = _patch_release(monkeypatch, host.log)
         session = _Session()
-        token = object()
+        token = SimpleNamespace(generation=5)
         await _release(host, _request(), session=session, turn_token=token,
                        resume=True, followup=True)
         assert session.cleared == ["followup", "resume"]
         assert host.log == ["finalize", "clear", "deactivate"]
-        assert clears == [{"user_id": 1, "chat_id": 2, "session_id": "sess-1"}]
+        # #2122: the clear is stamped with this turn's owner so it cannot
+        # erase a route another turn of the conversation re-published.
+        assert clears == [
+            {"user_id": 1, "chat_id": 2, "session_id": "sess-1", "owner": "turn:5"}
+        ]
         assert host._agent_session_registry.deactivated[0][0] is token
 
     asyncio.run(run())
@@ -339,7 +345,7 @@ def test_release_without_session_or_token_skips_what_it_cannot_touch(
         await _release(host, _request(), session=None, turn_token=None,
                        resume=True, followup=True)
         assert host.log == ["finalize", "clear"]
-        assert clears == [{"user_id": 1, "chat_id": 2, "session_id": None}]
+        assert clears == [{"user_id": 1, "chat_id": 2, "session_id": None, "owner": None}]
         assert host._agent_session_registry.deactivated == []
 
     asyncio.run(run())

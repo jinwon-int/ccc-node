@@ -33,7 +33,10 @@ from telegram_bot.core.continuation import (
     default_queue_path,
     validate_prompt,
 )
-from telegram_bot.core.external_wait import resolve_active_route
+from telegram_bot.core.external_wait import (
+    describe_route_unavailable,
+    resolve_active_route,
+)
 
 RC_OK = 0
 RC_USAGE = 2
@@ -86,6 +89,7 @@ def _cmd_register(home: Path, args: dict[str, Any]) -> int:
             {
                 "ok": False,
                 "code": "route-unavailable",
+                **describe_route_unavailable(_route_home()),
                 "message": (
                     "no single active conversation route; continue in this "
                     "turn or report that auto-continue is unavailable"
