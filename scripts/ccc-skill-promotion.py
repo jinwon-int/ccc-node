@@ -679,6 +679,10 @@ def _path_components_safe(
 
 
 def _safe_tool(path: Path, *, trust_root: Path | None = None) -> bool:
+    # A lexical HOME prefix must not anchor a traversal outside that HOME.
+    # Keep such operator-supplied paths on the full ancestor validation path.
+    if ".." in path.parts:
+        trust_root = None
     try:
         metadata = path.lstat()
         return (

@@ -414,6 +414,32 @@ class AndroidOwnershipTests(unittest.TestCase):
             self.assertFalse(promotion._safe_tool(linked_home / "hooks" / tool.name,
                                                   trust_root=linked_home))
 
+    def test_traversal_through_safe_parent_cannot_execute_outside_helper(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            system = Path(tmp) / "untrusted"
+            parent = system / "safe-parent"
+            home = parent / "app-home"
+            skills = home / ".claude/skills"
+            skills.mkdir(parents=True)
+            system.chmod(0o777)
+            parent.chmod(0o700)
+            home.chmod(0o700)
+            marker = parent / "executed"
+            outside = parent / "outside.py"
+            outside.write_text("from pathlib import Path\n"
+                               f"Path({str(marker)!r}).touch()\n"
+                               "print('{\"skills\":[]}')\n")
+            outside.chmod(0o600)
+            cfg = promotion._config({
+                "HOME": str(home), "CCC_NODE": "testnode",
+                "CCC_SKILL_PROMOTION_OWNERSHIP_TOOL": str(home / ".." / outside.name),
+            })
+            self.assertFalse(promotion._safe_tool(outside, trust_root=home))
+            with self.assertRaisesRegex(promotion.PromotionError, "ownership_tool_unsafe"):
+                promotion._ownership_rows(cfg, "claude")
+            self.assertFalse(marker.exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=0)
