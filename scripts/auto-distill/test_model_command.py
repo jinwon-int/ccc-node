@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -20,9 +21,13 @@ sys.path.insert(0, str(HERE))
 
 from model_command import (  # noqa: E402
     CLAUDE_ARGS,
+    CODEX_WRAPPER_FLAG,
     PIRI_ARGS,
     ModelCommandError,
     codex_scratch_home,
+    codex_wrapper_argv,
+    normalize_codex_usage,
+    parse_codex_events,
     parse_systemd_environment,
     read_bridge_unit_environment,
     resolve_explicit_model_command,
@@ -601,6 +606,195 @@ class LiteralHitsIndexTest(unittest.TestCase):
         # The wiki cache is static within a run; the cached lines must serve
         # repeat lookups without re-reading the file.
         self.assertEqual(AUTO_DISTILL.section_body(str(target), lineno=2), first)
+
+
+# Event shape live-captured from seoseo codex-cli 0.159.0 (2026-10-04, #1857).
+FAKE_CODEX = r"""#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+prompt = sys.stdin.read()
+mode = os.environ.get("FAKE_CODEX_MODE", "ok")
+with open(os.environ["FAKE_CODEX_ARGS"], "w") as fh:
+    json.dump({"args": args, "prompt": prompt, "pid": os.getpid()}, fh)
+    fh.flush()
+def emit(event):
+    print(json.dumps(event), flush=True)
+emit({"type": "thread.started", "thread_id": "t"})
+emit({"type": "turn.started"})
+if mode == "sleep":
+    time.sleep(60)
+if mode == "limit":
+    emit({"type": "error", "message": "You've hit your usage limit. Try again later."})
+    emit({"type": "turn.failed", "error": {"message": "usage limit reached"}})
+    sys.exit(1)
+answer = '{"items":[{"title":"t","fact":"f","evidence":["e"],"kind":"config"}]}'
+emit({"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": answer}})
+if mode != "no-usage":
+    emit({"type": "turn.completed", "usage": {"input_tokens": 17164, "cached_input_tokens": 9856,
+          "cache_write_input_tokens": 0, "output_tokens": 8, "reasoning_output_tokens": 0}})
+if mode != "no-last-file":
+    out = args[args.index("--output-last-message") + 1]
+    with open(out, "w") as fh:
+        fh.write(answer)
+print("codex progress noise", file=sys.stderr)
+"""
+
+
+class CodexUsageNormalizeTest(unittest.TestCase):
+    """codex usage maps onto Piri/Claude keys without inventing a cost (#1857)."""
+
+    def test_cached_reads_are_split_out_of_input(self) -> None:
+        usage = normalize_codex_usage({
+            "input_tokens": 17164, "cached_input_tokens": 9856,
+            "cache_write_input_tokens": 0, "output_tokens": 8,
+            "reasoning_output_tokens": 0,
+        })
+        self.assertEqual(usage["inputTokens"], 7308)
+        self.assertEqual(usage["cacheReadTokens"], 9856)
+        self.assertEqual(usage["outputTokens"], 8)
+        self.assertEqual(usage["totalTokens"], 17172)
+        self.assertEqual(usage["requests"], 1)
+        self.assertNotIn("costUsd", usage)
+        self.assertEqual(usage["costBasis"], "codex-unpriced")
+
+    def test_garbage_values_count_as_zero(self) -> None:
+        usage = normalize_codex_usage({"input_tokens": "x", "cached_input_tokens": -3,
+                                       "output_tokens": True})
+        self.assertEqual(usage["totalTokens"], 0)
+
+    def test_events_sum_turns_and_collect_errors(self) -> None:
+        stream = "\n".join([
+            "not json",
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 2}}),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "a"}}),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "b"}}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 1}}),
+            json.dumps({"type": "item.completed", "item": {"type": "error", "message": "e1"}}),
+            json.dumps({"type": "error", "message": "e2"}),
+            json.dumps({"type": "turn.failed", "error": {"message": "e3"}}),
+        ])
+        usage, last, errors = parse_codex_events(stream)
+        self.assertEqual(usage["inputTokens"], 15)
+        self.assertEqual(usage["outputTokens"], 3)
+        self.assertEqual(last, "b")
+        self.assertEqual(errors, ["e1", "e2", "e3"])
+
+    def test_no_turn_completed_means_no_usage(self) -> None:
+        usage, last, errors = parse_codex_events(json.dumps({"type": "turn.started"}))
+        self.assertIsNone(usage)
+        self.assertIsNone(last)
+        self.assertEqual(errors, [])
+
+
+class CodexUsageWrapperTest(unittest.TestCase):
+    """The wrapper keeps the stdout contract and feeds unchanged extract_json."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.codex = root / "codex"
+        self.codex.write_text(FAKE_CODEX, encoding="utf-8")
+        self.codex.chmod(0o755)
+        self.args_file = root / "args.json"
+        self.env = patch.dict(os.environ, {"FAKE_CODEX_ARGS": str(self.args_file)})
+        self.env.start()
+
+    def tearDown(self) -> None:
+        self.env.stop()
+        self.temp.cleanup()
+
+    def _run(self, mode: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            list(codex_wrapper_argv(str(self.codex))),
+            input="PROMPT", capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "FAKE_CODEX_MODE": mode},
+        )
+
+    def test_argv_runs_this_module_as_wrapper(self) -> None:
+        argv = codex_wrapper_argv("/usr/bin/codex")
+        self.assertEqual(Path(argv[1]).name, "model_command.py")
+        self.assertEqual(argv[2:], (CODEX_WRAPPER_FLAG, "/usr/bin/codex"))
+
+    def test_resolver_selects_wrapper_for_codex_provider(self) -> None:
+        home = Path(self.temp.name) / "home"
+        (home / ".codex").mkdir(parents=True)
+        (home / ".codex" / "auth.json").write_text("{}", encoding="utf-8")
+        with patch("model_command.Path.home", return_value=home):
+            selected = resolve_model_command(
+                process_environment={"CCC_AUTO_DISTILL_PROVIDER": "codex"},
+                unit_environment={},
+                which=lambda name: str(self.codex) if name == "codex" else None,
+            )
+        self.assertEqual(selected.engine, "codex")
+        self.assertEqual(selected.argv[2:], (CODEX_WRAPPER_FLAG, str(self.codex)))
+        self.assertEqual(
+            dict(selected.env_overrides)["CODEX_HOME"],
+            str(home / ".codex-auto-distill-scratch"),
+        )
+
+    def test_stdout_is_final_answer_only_and_usage_goes_to_stderr(self) -> None:
+        result = self._run("ok")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["items"][0]["title"], "t")
+        self.assertNotIn("turn.completed", result.stdout)
+        usage_lines = [line for line in result.stderr.splitlines() if line.startswith("PIRI_USAGE=")]
+        self.assertEqual(len(usage_lines), 1)
+        self.assertIn("codex progress noise", result.stderr)
+        seen = json.loads(self.args_file.read_text(encoding="utf-8"))
+        self.assertEqual(seen["prompt"], "PROMPT")
+        self.assertEqual(seen["args"][:3], ["exec", "--json", "--skip-git-repo-check"])
+        self.assertEqual(seen["args"][-1], "-")
+
+    def test_last_message_falls_back_to_agent_message_event(self) -> None:
+        result = self._run("no-last-file")
+        self.assertEqual(json.loads(result.stdout)["items"][0]["kind"], "config")
+
+    def test_unchanged_extract_json_now_records_usage(self) -> None:
+        argv = list(codex_wrapper_argv(str(self.codex)))
+        with patch.dict(os.environ, {"FAKE_CODEX_MODE": "ok"}):
+            parsed, (err, usage, _raw) = AUTO_DISTILL.extract_json("PROMPT", argv, 30)
+        self.assertIsNone(err)
+        self.assertEqual(parsed["items"][0]["title"], "t")
+        self.assertEqual(usage["inputTokens"], 7308)
+        self.assertEqual(usage["cacheReadTokens"], 9856)
+        self.assertEqual(usage["outputTokens"], 8)
+
+    def test_missing_usage_event_still_surfaces_usage_missing(self) -> None:
+        argv = list(codex_wrapper_argv(str(self.codex)))
+        with patch.dict(os.environ, {"FAKE_CODEX_MODE": "no-usage"}):
+            parsed, (err, usage, _raw) = AUTO_DISTILL.extract_json("PROMPT", argv, 30)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(usage, {})
+
+    def test_usage_limit_event_is_classified_as_transport_failure(self) -> None:
+        argv = list(codex_wrapper_argv(str(self.codex)))
+        with patch.dict(os.environ, {"FAKE_CODEX_MODE": "limit"}):
+            parsed, (err, usage, _raw) = AUTO_DISTILL.extract_json("PROMPT", argv, 30)
+        self.assertIsNone(parsed)
+        self.assertEqual(err, "model_unavailable:exit_1")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG is Linux-only")
+    def test_timeout_kills_codex_grandchild(self) -> None:
+        argv = list(codex_wrapper_argv(str(self.codex)))
+        with patch.dict(os.environ, {"FAKE_CODEX_MODE": "sleep"}):
+            parsed, (err, _usage, _raw) = AUTO_DISTILL.extract_json("PROMPT", argv, 2)
+        self.assertEqual(err, "timeout")
+        pid = json.loads(self.args_file.read_text(encoding="utf-8"))["pid"]
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.1)
+        os.kill(pid, 9)
+        self.fail("codex grandchild outlived the extract_json timeout")
+
+    def test_bad_wrapper_arguments_fail(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(HERE / "model_command.py"), CODEX_WRAPPER_FLAG],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 2)
 
 
 if __name__ == "__main__":
