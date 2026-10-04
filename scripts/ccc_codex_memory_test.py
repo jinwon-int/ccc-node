@@ -101,6 +101,48 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         }
         self.assertIn(("_secure_fs", "owner_only_regular_violation"), validator_calls)
 
+    def test_report_style_refresh_is_independent_of_memory_and_preserves_operator_text(self):
+        claude = self.home / ".claude"
+        (claude / "state").mkdir(parents=True)
+        (claude / "hooks/lib").mkdir(parents=True)
+        rule = claude / "hooks/lib/report-style-ste.txt"
+        rule.write_text("## STE rules\nOne idea per sentence.\n")
+        flag = claude / "state/report-style-canary.flag"
+        options = self.options()
+        self.codex_home.mkdir(mode=0o700)
+        target = self.codex_home / "AGENTS.override.md"
+        target.write_text("Operator instruction.\n")
+        target.chmod(0o600)
+        self.module.materialize_snapshot("MEMORY", options)
+        self.assertNotIn("STE rules", target.read_text())
+        flag.write_text("end: fixture")
+        self.assertFalse(self.module.snapshot_status(options).is_ready)
+        self.assertEqual(self.module.materialize_snapshot("MEMORY", options).status, "updated")
+        text = target.read_text()
+        self.assertTrue(text.startswith("Operator instruction.\n"))
+        self.assertLess(text.index("STE rules"), text.index(self.module.SNAPSHOT_DELIMITER))
+        self.assertEqual(self.module.parse_managed_block(text).snapshot, "MEMORY")
+        self.assertTrue(self.module.snapshot_status(options).is_ready)
+        self.assertEqual(self.module.materialize_snapshot("MEMORY", options).status, "unchanged")
+        rule.write_text("## STE rules\nRevised rule.\n")
+        self.assertEqual(self.module.materialize_snapshot("MEMORY", options).status, "updated")
+        self.assertIn("Revised rule", target.read_text())
+        flag.unlink()
+        self.assertFalse(self.module.snapshot_status(options).is_ready)
+        self.module.materialize_snapshot("MEMORY", options)
+        self.assertNotIn("STE rules", target.read_text())
+
+    def test_report_style_omitted_for_distill_and_danso_materializer(self):
+        claude = self.home / ".claude"
+        (claude / "state").mkdir(parents=True)
+        (claude / "hooks/lib").mkdir(parents=True)
+        (claude / "state/report-style-canary.flag").touch()
+        (claude / "hooks/lib/report-style-ste.txt").write_text("STE_SENTINEL")
+        for extra in ({"CLAUDE_DISTILL_INFLIGHT": "1"},
+                      {"CCC_MEMORY_MATERIALIZER_PROVIDER": "danso"}):
+            self.module.materialize_snapshot("MEMORY", self.options(**extra))
+            self.assertNotIn("STE_SENTINEL", (self.codex_home / "AGENTS.md").read_text())
+
     def test_shared_atomic_write_error_keeps_body_free_materializer_code(self) -> None:
         with mock.patch.object(
             self.module._secure_fs,

@@ -906,7 +906,8 @@ class DansoSession:
                     self._bootstrap_task = asyncio.create_task(r.system_context_loader())
                     context_file = await self._bootstrap_task
                     self._bootstrap_task = None
-                    command += ['--system-context-file', str(context_file)]
+                    if context_file is not None:
+                        command += ['--system-context-file', str(context_file)]
                 if self._interrupted:
                     events.append(ErrorEvent(code='danso_cancelled', message='Worker interrupted before dispatch.'))
                 else:

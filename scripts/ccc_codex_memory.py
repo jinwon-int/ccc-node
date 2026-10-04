@@ -27,6 +27,7 @@ import time
 from typing import Mapping
 
 import ccc_secure_fs as _secure_fs
+from ccc_report_style import read_report_style
 
 BEGIN_MARKER = "<!-- ccc-node:codex-memory:begin -->"
 END_MARKER = "<!-- ccc-node:codex-memory:end -->"
@@ -429,7 +430,15 @@ def _expected_working_state_policy(options: MaterializeOptions) -> str:
             else WORKING_STATE_POLICY_VERSION)
 
 
-def _render_block(snapshot: str, *, materialized_at: str, read_only: bool = False) -> tuple[str, str]:
+def _report_style(options: MaterializeOptions) -> str:
+    # Danso composes this separately, including its native-memory/off modes.
+    if options.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") == "danso":
+        return ""
+    return read_report_style(options.claude_dir, environ=options.environ)
+
+
+def _render_block(snapshot: str, *, materialized_at: str, read_only: bool = False,
+                  report_style: str = "") -> tuple[str, str]:
     digest = _snapshot_hash(snapshot)
     block = (
         f"{BEGIN_MARKER}\n"
@@ -441,10 +450,22 @@ def _render_block(snapshot: str, *, materialized_at: str, read_only: bool = Fals
         f"- working-state-policy: `{'memory-read-only-v1' if read_only else WORKING_STATE_POLICY_VERSION}`\n\n"
         f"{GITHUB_POLICY_BLOCK}\n"
         f"{READ_ONLY_MEMORY_POLICY_BLOCK if read_only else WORKING_STATE_POLICY_BLOCK}\n"
-        f"{SNAPSHOT_DELIMITER}{snapshot}\n"
+        # Operator-controlled prose policy must be outside untrusted memory.
+        + (f"{report_style}\n\n" if report_style else "")
+        + f"{SNAPSHOT_DELIMITER}{snapshot}\n"
         f"{END_MARKER}"
     )
     return block, digest
+
+
+def _policy_matches(text: str, parsed: _ParsedBlock, options: MaterializeOptions,
+                    report_style: str) -> bool:
+    expected, _ = _render_block(
+        parsed.snapshot or "", materialized_at=parsed.materialized_at or "",
+        read_only=options.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") == "danso",
+        report_style=report_style,
+    )
+    return text[parsed.start:parsed.end] == expected
 
 
 def _merge_block(text: str, parsed: _ParsedBlock | None, block: str) -> str:
@@ -559,7 +580,9 @@ def materialize_snapshot(snapshot: str, options: MaterializeOptions) -> Material
 
         bounded, truncated = _truncate_utf8(snapshot, options.memory_max_bytes)
         materialized_at = _secure_fs.utc_now_iso(timespec="auto")
+        report_style = _report_style(options)
         block, digest = _render_block(bounded, materialized_at=materialized_at,
+                                      report_style=report_style,
                                       read_only=options.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") == "danso")
         merged = _merge_block(existing_text, parsed, block)
         if len(merged.encode("utf-8")) > options.agents_budget_bytes:
@@ -572,6 +595,7 @@ def materialize_snapshot(snapshot: str, options: MaterializeOptions) -> Material
             if not bounded:
                 raise MaterializeError("codex_budget_exhausted")
             block, digest = _render_block(bounded, materialized_at=materialized_at,
+                                      report_style=report_style,
                                       read_only=options.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") == "danso")
             merged = _merge_block(existing_text, parsed, block)
             if len(merged.encode("utf-8")) > options.agents_budget_bytes:
@@ -584,6 +608,7 @@ def materialize_snapshot(snapshot: str, options: MaterializeOptions) -> Material
             and parsed.github_policy == GITHUB_POLICY_VERSION
             and parsed.working_state_policy == _expected_working_state_policy(options)
             and _snapshot_hash(parsed.snapshot) == digest
+            and _policy_matches(existing_text, parsed, options, report_style)
         )
         if existing_snapshot_matches:
             assert parsed is not None
@@ -697,6 +722,10 @@ def snapshot_status(options: MaterializeOptions) -> SnapshotStatus:
                 active_kind=active_kind,
                 file_bytes=len(existing.data),
             )
+        # A loader failure may reuse memory, but must not reuse stale canary
+        # policy after flag removal or a rule change.
+        if not _policy_matches(text, parsed, options, _report_style(options)):
+            return SnapshotStatus(status="missing", active_kind=active_kind)
         metadata = _read_named(dir_fd, METADATA_NAME)
         metadata_status = "missing"
         if metadata is not None:

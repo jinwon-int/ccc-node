@@ -615,6 +615,8 @@ fi
 # The setup transaction restores the previous hooks tree on any later failure.
 run atomic_install "$SRC/bridge/utils/secure_fs.py" "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
 run chmod 644 "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
+run atomic_install "$SRC/bridge/utils/report_style.py" "$CLAUDE_DIR/hooks/ccc_report_style.py"
+run chmod 644 "$CLAUDE_DIR/hooks/ccc_report_style.py"
 run atomic_install "$SRC/bridge/memory/journal_core.py" "$CLAUDE_DIR/hooks/ccc_journal_core.py"
 run chmod 644 "$CLAUDE_DIR/hooks/ccc_journal_core.py"
 # YAML-safe single-line SKILL.md frontmatter render/unquote (#2032): shared by
