@@ -332,5 +332,114 @@ class ResultsOnlyTests(unittest.TestCase):
             self.assertFalse((system / "escaped").exists())
 
 
+class AndroidOwnershipTests(unittest.TestCase):
+    def test_real_helper_stages_and_exports_under_app_home(self):
+        import hashlib
+        import shutil
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            system = Path(tmp) / "system"
+            home = system / "app-home"
+            hooks = home / ".claude" / "hooks"
+            helper = hooks / "skill-review" / "ownership.py"
+            helper.parent.mkdir(parents=True)
+            system.chmod(0o777)
+            repo = Path(__file__).resolve().parents[1]
+            shutil.copyfile(repo / "claude/hooks/skill-review/ownership.py", helper)
+            for source, installed in (("secure_fs.py", "ccc_secure_fs.py"),
+                                      ("skill_frontmatter.py", "ccc_skill_frontmatter.py")):
+                shutil.copyfile(repo / "bridge/utils" / source, hooks / installed)
+            skill = home / ".claude/skills/release-verification"
+            skill.mkdir(parents=True)
+            payload = ("---\nname: release-verification\n"
+                       "description: Use when verifying a release through a reusable procedure.\n"
+                       "---\n\n# Procedure\n\n1. Inspect the release.\n2. Verify the result.\n")
+            (skill / "SKILL.md").write_text(payload)
+            (skill / ".autosave-meta.json").write_text(json.dumps({
+                "schema_version": 2, "manager": "ccc-node-skill-autosave",
+                "ownership": "autosave-managed", "provider": "claude",
+                "name": skill.name, "target_id": hashlib.sha256(
+                    f"claude\0{hashlib.sha256(str(skill.parent).encode()).hexdigest()}\0{skill.name}".encode()
+                ).hexdigest(),
+                "skill_sha256": hashlib.sha256(payload.encode()).hexdigest(),
+                "created_by": "ccc-node", "provenance_revision": 1,
+                "rollback_eligible": True,
+            }))
+            for path in [home, *home.rglob("*")]:
+                path.chmod(0o700 if path.is_dir() else 0o600)
+            cfg = promotion._config({"HOME": str(home), "CCC_NODE": "testnode",
+                                     "CCC_SKILL_PROMOTION_ENABLED": "true",
+                                     "CCC_SKILL_PROMOTION_PROVIDERS": "claude"})
+            result = promotion._execute(cfg, dry_run=False)
+            self.assertEqual(result["errors"], [])
+            self.assertEqual(result["blocked"], [])
+            self.assertEqual(len(result["staged"]), 1)
+            exported = promotion._export_result(cfg, limit=1)
+            self.assertEqual(len(exported["envelopes"]), 1)
+            self.assertEqual(exported["envelopes"][0]["node"], "testnode")
+            again = promotion._execute(cfg, dry_run=False)
+            self.assertEqual(again["staged"][0]["outcome"], "already-staged")
+
+    def test_helper_anchor_keeps_unsafe_paths_closed(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            system = Path(tmp) / "system"
+            home = system / "app-home"
+            parent = home / "hooks"
+            parent.mkdir(parents=True)
+            system.chmod(0o777)
+            tool = parent / "ownership.py"
+            tool.write_text("print('{}')\n")
+            tool.chmod(0o600)
+            self.assertFalse(promotion._safe_tool(tool))
+            self.assertTrue(promotion._safe_tool(tool, trust_root=home))
+            for path in [tool, parent, home]:
+                original = path.stat().st_mode & 0o777
+                path.chmod(0o777)
+                self.assertFalse(promotion._safe_tool(tool, trust_root=home))
+                path.chmod(original)
+            link = home / "linked-tool"
+            link.symlink_to(tool)
+            self.assertFalse(promotion._safe_tool(link, trust_root=home))
+            linked_parent = home / "linked-parent"
+            linked_parent.symlink_to(parent, target_is_directory=True)
+            self.assertFalse(promotion._safe_tool(linked_parent / tool.name, trust_root=home))
+            outside = system / "outside.py"
+            outside.write_text("print('{}')\n")
+            outside.chmod(0o600)
+            self.assertFalse(promotion._safe_tool(outside, trust_root=home))
+            self.assertFalse(promotion._safe_tool(home / ".." / outside.name, trust_root=home))
+            linked_home = system / "linked-home"
+            linked_home.symlink_to(home, target_is_directory=True)
+            self.assertFalse(promotion._safe_tool(linked_home / "hooks" / tool.name,
+                                                  trust_root=linked_home))
+
+    def test_traversal_through_safe_parent_cannot_execute_outside_helper(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            system = Path(tmp) / "untrusted"
+            parent = system / "safe-parent"
+            home = parent / "app-home"
+            skills = home / ".claude/skills"
+            skills.mkdir(parents=True)
+            system.chmod(0o777)
+            parent.chmod(0o700)
+            home.chmod(0o700)
+            marker = parent / "executed"
+            outside = parent / "outside.py"
+            outside.write_text("from pathlib import Path\n"
+                               f"Path({str(marker)!r}).touch()\n"
+                               "print('{\"skills\":[]}')\n")
+            outside.chmod(0o600)
+            cfg = promotion._config({
+                "HOME": str(home), "CCC_NODE": "testnode",
+                "CCC_SKILL_PROMOTION_OWNERSHIP_TOOL": str(home / ".." / outside.name),
+            })
+            self.assertFalse(promotion._safe_tool(outside, trust_root=home))
+            with self.assertRaisesRegex(promotion.PromotionError, "ownership_tool_unsafe"):
+                promotion._ownership_rows(cfg, "claude")
+            self.assertFalse(marker.exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)

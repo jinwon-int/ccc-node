@@ -678,11 +678,15 @@ def _path_components_safe(
         return False
 
 
-def _safe_tool(path: Path) -> bool:
+def _safe_tool(path: Path, *, trust_root: Path | None = None) -> bool:
+    # A lexical HOME prefix must not anchor a traversal outside that HOME.
+    # Keep such operator-supplied paths on the full ancestor validation path.
+    if ".." in path.parts:
+        trust_root = None
     try:
         metadata = path.lstat()
         return (
-            _path_components_safe(path, final_kind="file")
+            _path_components_safe(path, final_kind="file", trust_root=trust_root)
             and
             stat.S_ISREG(metadata.st_mode)
             and not stat.S_ISLNK(metadata.st_mode)
@@ -765,7 +769,7 @@ def _edge_secret_header(secret: str) -> Iterator[list[str]]:
 
 
 def _ownership_rows(config: Config, provider: str) -> list[dict[str, Any]]:
-    if not _safe_tool(config.ownership_tool):
+    if not _safe_tool(config.ownership_tool, trust_root=config.home):
         raise PromotionError("ownership_tool_unsafe")
     root = config.provider_roots[provider]
     if not root.is_dir():
