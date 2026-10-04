@@ -303,6 +303,25 @@ async def test_concurrent_workers_extract_once_and_result_survives_reopen(
 
 
 @pytest.mark.anyio
+async def test_successful_trusted_usage_settles_and_survives_journal_reopen(tmp_path):
+    class AccountedBackend(SuccessfulBackend):
+        async def extract_accounted(self, extraction_input):
+            return await self.extract(extraction_input), dict(input_tokens=120, output_tokens=30, requests=1)
+
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal)
+    meter = UsageMeter(tmp_path / "usage.json", budgets={"codex": 100000})
+    result = await CodexDistillExtractionWorker(journal, AccountedBackend(), usage_meter=meter).extract_once(job_id=job.job_id)
+    assert result.status is DistillJobStatus.EXTRACTION_DONE
+    assert meter.used_tokens("codex") == 150
+    reopened = DistillJournal(tmp_path / "journal")
+    reopened.initialize()
+    assert reopened.get(job.job_id).extraction_accounting[0].actual_input_tokens == 120
+    assert reopened.diagnostics(job.job_id)["extraction_accounting"]["actual_tokens"] == 150
+
+
+@pytest.mark.anyio
 async def test_extraction_records_body_free_model_bytes_duration_and_cost_estimate(
     tmp_path: Path,
 ) -> None:
@@ -336,6 +355,8 @@ async def test_extraction_records_body_free_model_bytes_duration_and_cost_estima
         "snapshot_bytes": snapshot().byte_count,
         "duration_ms": 125,
         "estimated_max_tokens": 73854,
+        "actual_usage_attempts": 0,
+        "actual_tokens": 0,
     }
     rendered = repr(diagnostics)
     assert "harmless durable fact" not in rendered

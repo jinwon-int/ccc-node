@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from telegram_bot.core.danso_worker import _stop, _wait_owned
+from telegram_bot.core.danso_worker import _stop, _wait_owned, _usage
 from .codex_exec_backend import _DEFAULT_SCHEMA, DISTILL_EXTRACTION_PROMPT
 from .distill_extraction import (
     DistillExtractionInput,
@@ -45,6 +45,10 @@ class DansoDistillBackend:
         self.timeout = timeout_seconds
 
     async def extract(self, extraction_input: DistillExtractionInput):
+        output, _ = await self.extract_accounted(extraction_input)
+        return output
+
+    async def extract_accounted(self, extraction_input: DistillExtractionInput):
         schema = _load_schema_text(_DEFAULT_SCHEMA)
         prompt = DISTILL_EXTRACTION_PROMPT.replace(
             "supplied on stdin", "in the supplied reference"
@@ -52,6 +56,24 @@ class DansoDistillBackend:
         if not self.wiki_enabled:
             prompt += "\nWiki output is disabled for this run. Return wiki_candidates as [] exactly.\n"
         context = _context_bytes(extraction_input, prompt, schema)
+        payload = await self.generate(context, "Extract memory from the supplied reference; return only contract JSON.")
+        try:
+            result = validate_live_decision_reasons(
+                parse_extraction_output(_strip_markdown_fence(payload), wiki_enabled=self.wiki_enabled)
+            )
+            if (
+                result.provenance.provider != extraction_input.provider
+                or result.provenance.source_thread_hash != extraction_input.source_thread_hash
+                or result.provenance.trigger != extraction_input.trigger
+            ):
+                raise ValueError("provenance mismatch")
+            return result, getattr(payload, "usage", None)
+        except (TypeError, ValueError):
+            raise RuntimeDistillBackendError("distill_output_invalid") from None
+
+    async def generate(self, context: bytes, instruction: str):
+        if len(context) > 32768:
+            raise RuntimeDistillBackendError("distill_input_invalid")
         settings = self.settings
         environment = {"PATH": os.defpath}
         binary = _resolve_executable(settings.danso_cli_path, environment)
@@ -109,22 +131,10 @@ class DansoDistillBackend:
                 "--provider-timeout-seconds",
                 str(min(300, math.ceil(self.timeout))),
                 "-p",
-                "Extract memory from the supplied reference; return only contract JSON.",
+                instruction,
             ]
             payload = await _run(command, environment, cwd, self.timeout)
-        try:
-            result = validate_live_decision_reasons(
-                parse_extraction_output(_strip_markdown_fence(payload), wiki_enabled=self.wiki_enabled)
-            )
-            if (
-                result.provenance.provider != extraction_input.provider
-                or result.provenance.source_thread_hash != extraction_input.source_thread_hash
-                or result.provenance.trigger != extraction_input.trigger
-            ):
-                raise ValueError("provenance mismatch")
-            return result
-        except (TypeError, ValueError):
-            raise RuntimeDistillBackendError("distill_output_invalid") from None
+        return payload
 
 
 def _context_bytes(value: DistillExtractionInput, prompt: str, schema: str) -> bytes:
@@ -177,6 +187,15 @@ async def _bounded(stream, limit):
     return bytes(result)
 
 
+class NativeOutput(bytes):
+    """Bytes plus CLI-authenticated diagnostics; never model JSON usage."""
+
+    def __new__(cls, value, usage=None):
+        instance = super().__new__(cls, value)
+        instance.usage = usage
+        return instance
+
+
 async def _run(command, environment, cwd, timeout):
     process = None
     readers = []
@@ -215,7 +234,17 @@ async def _run(command, environment, cwd, timeout):
                     classify_provider_failure("danso", diagnostic) or "distill_backend_failed",
                     exit_status=process.returncode,
                 )
-            return output
+            try:
+                counts = _usage(diagnostic.decode("utf-8", errors="replace"))
+                usage = dict(
+                    input_tokens=counts["inputTokens"] + counts["cacheReadTokens"] + counts["cacheWriteTokens"],
+                    output_tokens=counts["outputTokens"], requests=counts["requests"],
+                )
+                if any(v > 10**12 for v in usage.values()):
+                    usage = None
+            except (ValueError, TypeError):
+                usage = None  # Unknown is conservatively charged, never free.
+            return NativeOutput(output, usage)
     except TimeoutError:
         raise RuntimeDistillBackendError("distill_timeout") from None
     except OSError:

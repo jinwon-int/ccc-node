@@ -535,7 +535,8 @@ class PersistenceFailureTests(UsageMeterTestCase):
         # Reviewer probe: two 9-token records against an unavailable state
         # path must report 18, not 9 — the failed-save deltas survive the
         # next mutation instead of being reloaded over, and the budget keeps
-        # gating on the merged in-memory state while degraded.
+        # interactive telemetry continues while degraded. Autonomous work
+        # must wait: another process cannot see a charge that never persisted.
         meter = self.make_meter(budgets={"codex": 10})
         self.path.mkdir()  # os.replace onto a directory fails on POSIX
         with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
@@ -544,7 +545,7 @@ class PersistenceFailureTests(UsageMeterTestCase):
         with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
             meter.record("codex", MODE_INTERACTIVE, input_tokens=9)
         self.assertEqual(meter.used_tokens("codex"), 18)
-        self.assertTrue(meter.reserve_autonomous_spend("codex", input_tokens=1).allowed)
+        self.assertFalse(meter.reserve_autonomous_spend("codex", input_tokens=1).allowed)
 
 
 class TransientSaveRecoveryTests(UsageMeterTestCase):

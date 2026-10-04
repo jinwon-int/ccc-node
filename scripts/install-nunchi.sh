@@ -45,8 +45,8 @@ JUDGE_APPLY="${CCC_NUNCHI_JUDGE_APPLY:-0}"
 # produce a cron line the batch would reject into fail-closed human mode.
 JUDGE_PROVIDER="${CCC_NUNCHI_JUDGE_PROVIDER:-}"
 case "$JUDGE_PROVIDER" in
-  ""|auto|claude|codex|typesafe) ;;
-  *) echo "CCC_NUNCHI_JUDGE_PROVIDER='$JUDGE_PROVIDER' invalid (auto|claude|codex|typesafe)" >&2; exit 2 ;;
+  ""|auto|claude|codex|danso|typesafe) ;;
+  *) echo "CCC_NUNCHI_JUDGE_PROVIDER='$JUDGE_PROVIDER' invalid (auto|claude|codex|danso|typesafe)" >&2; exit 2 ;;
 esac
 # Confidence gate for apply-mode verdicts (judge-batch reads it at runtime).
 # 0.0 = gate off (the default); a stamped value must be a sane float in (0,1].
@@ -133,6 +133,8 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
     CCC_NUNCHI_TIMEOUT_CLI="${CCC_NUNCHI_TIMEOUT_CLI:-}" \
     CCC_NUNCHI_FLOCK_CLI="${CCC_NUNCHI_FLOCK_CLI:-}" \
     CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC="${CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC:-3300}" \
+    CCC_NUNCHI_JUDGE="$JUDGE" CCC_NUNCHI_JUDGE_APPLY="$JUDGE_APPLY" \
+    CCC_NUNCHI_JUDGE_PROVIDER="$JUDGE_PROVIDER" CCC_NUNCHI_JUDGE_MIN_CONFIDENCE="$JUDGE_MIN_CONFIDENCE" \
     NUNCHI_SWEEP_DIR="${NUNCHI_SWEEP_DIR:-}" \
     bash "$0" "${ORIGINAL_ARGS[@]}"
 fi
@@ -759,14 +761,18 @@ case "$ACTION" in
       judge_apply_env=""
       if [ "$JUDGE_APPLY" = 1 ]; then judge_apply_env="NUNCHI_JUDGE_APPLY=1 "; fi
       judge_provider_env=""
+      if [ -z "$JUDGE_PROVIDER" ] && [ "$resolved_provider" = danso ]; then JUDGE_PROVIDER=danso; fi
       if [ -n "$JUDGE_PROVIDER" ] && [ "$JUDGE_PROVIDER" != auto ]; then judge_provider_env="NUNCHI_JUDGE_PROVIDER=$JUDGE_PROVIDER "; fi
+      if [ "$JUDGE_PROVIDER" = danso ]; then
+        judge_provider_env+="CCC_NUNCHI_JUDGE_BRIDGE_ROOT=$(cron_quote "$(cd "$NUNCHI_SELF_DIR/.." && pwd)") "
+      fi
       judge_gate_env=""
       if [ -n "$JUDGE_MIN_CONFIDENCE" ]; then judge_gate_env="NUNCHI_JUDGE_MIN_CONFIDENCE=$JUDGE_MIN_CONFIDENCE "; fi
-      append_cron_line "41 4 * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${judge_apply_env}${judge_provider_env}${judge_gate_env}${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$python3_bin") $(cron_quote "$HOOKS/judge-batch.py") >> $(cron_quote "$NUNCHI_DIR/judge.cron.log") 2>&1 $MARK gen=$GEN"
+      append_cron_line "41 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${judge_apply_env}${judge_provider_env}${judge_gate_env}${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$python3_bin") $(cron_quote "$HOOKS/judge-batch.py") >> $(cron_quote "$NUNCHI_DIR/judge.cron.log") 2>&1 $MARK gen=$GEN"
       if [ "$JUDGE_APPLY" = 1 ]; then
-        echo "daily judge-batch cron added (04:41, APPLY — mutates the fact store${judge_provider_env:+, provider $JUDGE_PROVIDER})"
+        echo "hourly judge-batch cron added (:41, APPLY — mutates the fact store, shared daily call cap${judge_provider_env:+, provider $JUDGE_PROVIDER})"
       else
-        echo "daily judge-batch cron added (04:41, dry-run${judge_provider_env:+, provider $JUDGE_PROVIDER})"
+        echo "hourly judge-batch cron added (:41, dry-run, shared daily call cap${judge_provider_env:+, provider $JUDGE_PROVIDER})"
       fi
     fi
     if [ "$WIKI_PROMOTE" = 1 ]; then

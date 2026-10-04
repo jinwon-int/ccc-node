@@ -47,6 +47,7 @@ class AutonomousSpendGate(Protocol):
         input_tokens: int = 0,
         output_tokens: int = 0,
         requests: int = 0,
+        purpose: Literal["routine", "recovery"] = "routine",
     ) -> _ReservationLike: ...
 
     def refund_reservation(self, reservation: object) -> None: ...
@@ -139,12 +140,14 @@ class CodexDistillExtractionWorker:
         provider_cooldown_seconds: int = 3600,
         retry_backoff_base_seconds: int = 300,
         retry_backoff_max_seconds: int = 6 * 3600,
+        budget_purpose: Literal["routine", "recovery"] = "routine",
     ) -> None:
         if (
             lease_seconds <= 0
             or max_attempts <= 0
             or type(wiki_enabled) is not bool
             or extractor_provider not in {"claude", "codex", "piri", "danso"}
+            or budget_purpose not in {"routine", "recovery"}
             or type(provider_cooldown_seconds) is not int
             or provider_cooldown_seconds <= 0
             or type(retry_backoff_base_seconds) is not int
@@ -171,6 +174,7 @@ class CodexDistillExtractionWorker:
             raise ValueError("invalid distill extraction worker model") from None
         self._model = model
         self._clock = clock
+        self._budget_purpose = budget_purpose
 
     def _accounting(
         self,
@@ -178,6 +182,7 @@ class CodexDistillExtractionWorker:
         snapshot_bytes: int,
         started_at: float,
         estimated_max_tokens: int,
+        actual_usage: dict[str, int] | None = None,
     ) -> DistillExtractionAccounting:
         elapsed = self._clock() - started_at
         duration_ms = (
@@ -190,6 +195,9 @@ class CodexDistillExtractionWorker:
             snapshot_bytes=snapshot_bytes,
             duration_ms=duration_ms,
             estimated_max_tokens=estimated_max_tokens,
+            actual_input_tokens=actual_usage["input_tokens"] if actual_usage else None,
+            actual_output_tokens=actual_usage["output_tokens"] if actual_usage else None,
+            actual_requests=actual_usage["requests"] if actual_usage else None,
         )
 
     def _accounted_model(self) -> str:
@@ -305,6 +313,36 @@ class CodexDistillExtractionWorker:
         except Exception:
             logger.exception("Usage reservation refund failed; keeping charge")
 
+    async def _invoke_backend(self, extraction_input):
+        accounted = getattr(self._backend, "extract_accounted", None)
+        if not callable(accounted):
+            return await self._backend.extract(extraction_input), None
+        output, usage = await accounted(extraction_input)
+        if not isinstance(usage, dict) or set(usage) != {"input_tokens", "output_tokens", "requests"}:
+            return output, None
+        if any(type(v) is not int or not 0 <= v <= 10**12 for v in usage.values()) or usage["requests"] < 1:
+            return output, None
+        return output, usage
+
+    def _reserve_estimated(self, estimated_max_tokens):
+        assert self._usage_meter is not None
+        if self._budget_purpose == "recovery":
+            return self._usage_meter.reserve_autonomous_spend(
+                self._extractor_provider, input_tokens=estimated_max_tokens, requests=1,
+                purpose="recovery")
+        return self._usage_meter.reserve_autonomous_spend(
+            self._extractor_provider, input_tokens=estimated_max_tokens, requests=1)
+
+    def _settle_observed_usage(self, reservation, actual_usage):
+        if actual_usage is None or self._usage_meter is None or reservation is None:
+            return
+        settle = getattr(self._usage_meter, "settle_reservation", None)
+        if callable(settle):
+            try:
+                settle(reservation, **actual_usage)
+            except Exception:
+                logger.exception("Usage settlement failed; keeping conservative charge")
+
     async def extract_once(self, *, job_id: str) -> DistillJob:
         reservation: _ReservationLike | None = None
         preview = await asyncio.to_thread(self._journal.get, job_id)
@@ -334,11 +372,7 @@ class CodexDistillExtractionWorker:
             # the cap stays deferred until the operator raises the budget.
             # A blocked decision leaves the job unclaimed, so no attempt is
             # burned and it replays once the daily window resets.
-            reservation = self._usage_meter.reserve_autonomous_spend(
-                self._extractor_provider,
-                input_tokens=estimated_max_tokens,
-                requests=1,
-            )
+            reservation = self._reserve_estimated(estimated_max_tokens)
             if not reservation.allowed:
                 logger.warning(
                     "Distill extraction deferred by usage budget: %s",
@@ -400,9 +434,10 @@ class CodexDistillExtractionWorker:
                     guard_decision.remaining_seconds(time.time()),
                 ),
             )
+        actual_usage = None
         try:
             started_at = self._clock()
-            output = await self._backend.extract(extraction_input)
+            output, actual_usage = await self._invoke_backend(extraction_input)
         except asyncio.CancelledError:
             await self._fail(
                 claimed,
@@ -452,7 +487,9 @@ class CodexDistillExtractionWorker:
             snapshot_bytes=snapshot.byte_count,
             started_at=started_at,
             estimated_max_tokens=estimated_max_tokens,
+            actual_usage=actual_usage,
         )
+        self._settle_observed_usage(reservation, actual_usage)
         if not isinstance(output, DistillExtractionOutput):
             return await self._fail(
                 claimed,

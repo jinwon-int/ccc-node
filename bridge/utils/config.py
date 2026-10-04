@@ -434,6 +434,10 @@ class Config(
         description="Optional native pause point for staged long-task testing/resume.",
     )
     usage_budget_tokens_danso: int = Field(default=0, ge=0, alias="CCC_USAGE_BUDGET_TOKENS_DANSO")
+    usage_recovery_reserve_percent: int = Field(
+        default=0, ge=0, le=50, alias="CCC_USAGE_RECOVERY_RESERVE_PERCENT",
+        description="Share of the finite autonomous cap reserved for explicit recovery work",
+    )
 
     usage_meter_enabled: bool = Field(
         default=True,

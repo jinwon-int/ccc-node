@@ -239,6 +239,19 @@ def test_input_enforces_total_snapshot_byte_limit() -> None:
         build_extraction_input(source, trigger=DistillTrigger.NEW_COMMAND)
 
 
+def test_exact_duplicates_collapse_only_within_same_provenance_and_reason() -> None:
+    data = valid_output()
+    fact = dict(kind="decision", text="Use bounded retries for this node", subject="node",
+                because="Provider calls have a daily limit")
+    different_reason = {**fact, "because": "The provider asks clients to back off"}
+    different_subject = {**fact, "subject": "session"}
+    data["honcho"] = [fact, dict(fact), different_reason, different_subject]
+    result = parse_extraction_output(json.dumps(data), wiki_enabled=True)
+    assert len(result.honcho) == 3
+    assert result.provenance.source_thread_hash == data["provenance"]["source_thread_hash"]
+    assert [item.because for item in result.honcho] == [fact["because"], different_reason["because"], fact["because"]]
+
+
 def test_parser_accepts_strict_bounded_output() -> None:
     parsed = parse_extraction_output(json.dumps(valid_output()), wiki_enabled=True)
 
