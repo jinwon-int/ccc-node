@@ -92,6 +92,21 @@ def test_unsafe_or_corrupt_meter_is_preserved_and_blocks_admission(tmp_path, dam
         assert path.read_text() == "{broken historical ledger"
 
 
+@pytest.mark.parametrize("raw", [
+    '{broken ledger', '{"version":1,"days":"broken history"}',
+    '{"version":1,"days":{"2026-10-04":{"danso":{"autonomous":{"requests":1,"input_tokens":-1,"output_tokens":0}}}}}',
+])
+def test_interactive_telemetry_cannot_erase_damage_or_reopen_admission(tmp_path, raw):
+    path = tmp_path / "usage.json"
+    path.write_text(raw)
+    meter = UsageMeter(path, budgets={"danso": 1000})
+    meter.record("danso", "interactive", input_tokens=10, requests=1)
+    assert path.read_text() == raw
+    assert not meter.reserve_autonomous_spend("danso", input_tokens=1).allowed
+    assert not meter.check_autonomous_spend("danso").allowed
+    assert path.read_text() == raw
+
+
 @pytest.mark.parametrize("diagnostic", ["valid", "missing", "mismatch", "duplicate"])
 def test_native_usage_is_only_from_matching_cli_diagnostics(tmp_path, diagnostic):
     counts = dict(requests=1, inputTokens=12, outputTokens=8,

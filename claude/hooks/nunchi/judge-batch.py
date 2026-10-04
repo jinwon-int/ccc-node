@@ -909,9 +909,10 @@ def judge_item(item, siblings):
         try:
             allowed, _ = judge_state.call_budget(STATE, DAILY_CAP)
         except (OSError, ValueError, ccc_secure_fs.SecureFsError):
-            allowed = False
+            attempts.append("budget:unavailable")
+            break
         if not allowed:
-            attempts.append("budget:unavailable-or-exhausted")
+            attempts.append("budget:exhausted")
             break
         if provider == "typesafe":
             # Typed backend: the adapter returns the decision itself, so there
@@ -1076,8 +1077,13 @@ def triage_queue(conn, queue):
             })
         else:
             verdict = judge_item(item, siblings)
+            category = "judge"
+            if verdict["attempts"] == ["budget:exhausted"]:
+                category = "budget-deferred"
+            elif verdict["attempts"] == ["budget:unavailable"]:
+                category = "budget-error"
             decisions.append({
-                "id": fid, "class": "judge",
+                "id": fid, "class": category,
                 "rationale": verdict["rationale"],
                 "verdict": verdict["verdict"],
                 "supersede_proposal": verdict["supersede_proposal"],
@@ -1314,6 +1320,8 @@ def run_single_db():
             "backend_failures": sum(d["class"] == "judge-unavailable" or
                                     (d["class"] == "judge" and not d.get("backend"))
                                     for d in decisions),
+            "budget_deferred": sum(d["class"] == "budget-deferred" for d in decisions),
+            "budget_errors": sum(d["class"] == "budget-error" for d in decisions),
             "daily_call_cap": DAILY_CAP, "daily_calls_remaining": remaining,
             **QUEUE_COUNTS,
         })

@@ -6,11 +6,38 @@ import json
 import os
 from pathlib import Path
 import sys
+from typing import Literal
 from dotenv import dotenv_values
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from telegram_bot.memory.danso_backend import DansoDistillBackend
-from telegram_bot.utils.config import Config
 from telegram_bot.utils.secure_fs import ensure_private_directory, read_owner_only_bytes
+
+
+class JudgeSettings(BaseModel):
+    """Only the native adapter's settings; no chat transport credentials."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    danso_cli_path: str = Field(default="danso", alias="CCC_DANSO_CLI_PATH")
+    danso_auth_mode: Literal["api-key", "chatgpt", "zai"] = Field(default="api-key", alias="CCC_DANSO_AUTH_MODE")
+    danso_model: str = Field(default="gpt-6-astra", alias="CCC_DANSO_MODEL", pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+    zai_api_key: str | None = Field(default=None, alias="ZAI_API_KEY", repr=False)
+    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY", repr=False)
+    danso_glm_base_url: str | None = Field(default=None, alias="DANSO_GLM_BASE_URL")
+    danso_glm_endpoint: Literal["general", "coding"] | None = Field(default=None, alias="DANSO_GLM_ENDPOINT")
+    danso_chatgpt_auth_file: str | None = Field(default=None, alias="DANSO_CHATGPT_AUTH_FILE")
+    danso_chatgpt_base_url: str | None = Field(default=None, alias="DANSO_CHATGPT_BASE_URL")
+    danso_base_url: str | None = Field(default=None, alias="DANSO_OPENAI_BASE_URL")
+
+    @model_validator(mode="after")
+    def require_selected_auth(self):
+        auth = {"zai": self.zai_api_key, "api-key": self.openai_api_key,
+                "chatgpt": self.danso_chatgpt_auth_file}[self.danso_auth_mode]
+        if not auth or not auth.strip():
+            raise ValueError("selected judge authentication unavailable")
+        if self.danso_auth_mode == "chatgpt" and not Path(auth).is_absolute():
+            raise ValueError("judge authentication path must be absolute")
+        return self
 
 
 def load_settings():
@@ -39,7 +66,7 @@ def load_settings():
                        if value is not None and (key.startswith(("CCC_DANSO_", "DANSO_")) or
                           key in {"ZAI_API_KEY", "OPENAI_API_KEY", "PROJECT_ROOT"})})
     values.update(os.environ)
-    return Config.load(project_root=values.get("PROJECT_ROOT") or Path.home(), environ=values)
+    return JudgeSettings.model_validate(values)
 
 
 async def judge(prompt: bytes, settings, *, timeout: float = 120):

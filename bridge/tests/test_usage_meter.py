@@ -80,13 +80,15 @@ class RecordingTests(UsageMeterTestCase):
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         self.assertEqual(list(raw["days"]), ["2026-07-17"])
 
-    def test_corrupt_state_fails_open_to_empty_counters(self) -> None:
+    def test_corrupt_state_keeps_interactive_telemetry_but_preserves_disk_for_recovery(self) -> None:
         self.path.write_text("{not json", encoding="utf-8")
         with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
             meter = self.make_meter()
         self.assertEqual(meter.used_tokens("claude"), 0)
         meter.record("claude", MODE_INTERACTIVE, input_tokens=5)
-        self.assertEqual(self.make_meter().used_tokens("claude"), 5)
+        self.assertEqual(meter.used_tokens("claude"), 5)
+        self.assertEqual(self.path.read_text(), "{not json")
+        self.assertFalse(meter.check_autonomous_spend("claude").allowed)
 
     def test_hostile_state_shapes_are_ignored(self) -> None:
         self.path.write_text(

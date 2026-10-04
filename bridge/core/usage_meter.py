@@ -193,6 +193,7 @@ class UsageMeter:
         self._lock_path = self._path.with_name(self._path.name + ".lock")
         self._flock_warned = False
         self._admission_safe = True
+        self._storage_safe = True
         # Signed counter deltas applied since the last successful save
         # (day -> provider -> mode -> key). While non-empty, every locked
         # mutation reloads the authoritative on-disk state and replays these
@@ -218,6 +219,7 @@ class UsageMeter:
 
     def _load(self) -> None:
         try:
+            self._path.lstat()  # Read-only composition must not create directories.
             ensure_private_directory(self._path.parent)
             payload, _ = read_owner_only_bytes(self._path, max_bytes=32 * 1024 * 1024)
             raw = json.loads(payload)
@@ -225,6 +227,7 @@ class UsageMeter:
             return
         except (OSError, UnicodeDecodeError, ValueError, SecureFsError):
             self._admission_safe = False
+            self._storage_safe = False
             logger.warning(
                 "Usage meter state at %s is unreadable; starting from empty counters",
                 self._path,
@@ -232,11 +235,48 @@ class UsageMeter:
             return
         if not isinstance(raw, Mapping):
             self._admission_safe = False
+            self._storage_safe = False
             return
+        self._storage_safe = self._valid_financial_state(raw)
+        self._admission_safe = self._admission_safe and self._storage_safe
         self._load_days(raw.get("days"))
         self._load_alerted(raw.get("alerted"))
         self._load_reservations(raw.get("reservations"))
         self._load_events(raw.get("events"))
+
+    @staticmethod
+    def _valid_counters(value: object) -> bool:
+        return isinstance(value, dict) and all(
+            type(value.get(key)) is int and 0 <= value[key] <= _MAX_COUNT
+            for key in _COUNTER_KEYS
+        )
+
+    @classmethod
+    def _valid_modes(cls, providers: object) -> bool:
+        if not isinstance(providers, dict):
+            return False
+        for provider, modes in providers.items():
+            if not isinstance(provider, str) or not _PROVIDER_RE.fullmatch(provider) or not isinstance(modes, dict):
+                return False
+            if any(mode not in _MODES or not cls._valid_counters(counts) for mode, counts in modes.items()):
+                return False
+        return True
+
+    @classmethod
+    def _valid_financial_state(cls, raw: Mapping) -> bool:
+        days, reservations = raw.get("days"), raw.get("reservations", {})
+        if raw.get("version", 1) != 1 or not isinstance(days, dict) or not isinstance(reservations, dict):
+            return False
+        if any(not cls._is_day_key(day) or not cls._valid_modes(providers) for day, providers in days.items()):
+            return False
+        for ident, record in reservations.items():
+            if not isinstance(ident, str) or not ident or not cls._valid_counters(record):
+                return False
+            if not cls._is_day_key(record.get("day")) or not _PROVIDER_RE.fullmatch(str(record.get("provider", ""))):
+                return False
+            if record.get("mode", MODE_AUTONOMOUS) not in (MODE_AUTONOMOUS, MODE_RECOVERY):
+                return False
+        return True
 
     def _load_events(self, events: object) -> None:
         if not isinstance(events, list):
@@ -333,6 +373,9 @@ class UsageMeter:
                     self._alerted.setdefault(day, {})[provider] = safe_kinds
 
     def _save(self) -> None:
+        if not self._storage_safe or not self._admission_safe:
+            logger.warning("Usage meter state or lock is unsafe; preserving disk state and pending telemetry")
+            return
         payload = json.dumps(
             {
                 "version": 1,
@@ -383,6 +426,7 @@ class UsageMeter:
 
         with self._lock:
             self._admission_safe = True
+            self._storage_safe = True
             handle = None
             try:
                 ensure_private_directory(self._path.parent)
@@ -835,6 +879,9 @@ class UsageMeter:
             day = self.current_day()
             budget = self._budgets.get(provider, 0)
             used = self._autonomous_used_tokens(provider, day)
+            safe = self._admission_safe
+        if not safe:
+            return BudgetDecision(provider, day, "blocked", False, used, budget)
         if budget <= 0:
             return BudgetDecision(provider, day, "ok", True, used, budget)
         if used >= budget:

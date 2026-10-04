@@ -39,7 +39,14 @@ def persist(conn, decisions, fingerprints, previous, stamp):
         fid = decision["id"]
         prior = previous.get(fid)
         attempts = prior[4] + 1 if prior and prior[0] == fingerprints[fid] else 1
-        if decision.get("applied"):
+        if decision.get("class") == "budget-deferred":
+            attempts -= 1  # No provider call or verdict was attempted.
+            local = datetime.fromtimestamp(stamp, timezone(timedelta(hours=9)))
+            reset = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            disposition, delay = "budget", reset.timestamp() - stamp
+        elif decision.get("class") == "budget-error":
+            disposition, delay = "retry", 900
+        elif decision.get("applied"):
             disposition, delay = "resolved", 0
         elif decision.get("class") == "skipped-stale":
             disposition, delay = "retry", 900

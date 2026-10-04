@@ -131,4 +131,20 @@ def test_each_fallback_consumes_a_shared_call_and_exhaustion_stops_dispatch(judg
     item = (1, "session:fixture", "fact", "synthetic policy", 1, "2020-01-01", None)
     result = judge.judge_item(item, [(2, "synthetic sibling", 0.7)])
     assert result["backend"] is None and calls == ["claude"]
-    assert result["attempts"][-1] == "budget:unavailable-or-exhausted"
+    assert result["attempts"][-1] == "budget:exhausted"
+
+
+def test_quota_wait_is_not_a_provider_failure_and_reopens_at_kst_midnight(judge, conn, monkeypatch):
+    monkeypatch.setattr(judge, "judge_available", lambda: True)
+    monkeypatch.setattr(judge, "judge_item", lambda *args: dict(
+        verdict="human", rationale="bounded wait", supersede_proposal=None,
+        backend=None, attempts=["budget:exhausted"]))
+    queue, _, _ = judge.fetch_queue(conn)
+    decisions = judge.triage_queue(conn, queue)
+    assert decisions[0]["class"] == "budget-deferred"
+    stamp = datetime(2026, 10, 4, 9, 0, tzinfo=timezone.utc).timestamp()  # 18:00 KST
+    prior = {1: (judge.QUEUE_FINGERPRINTS[1], "retry", stamp - 3600, stamp, 7)}
+    judge.judge_state.persist(conn, decisions, judge.QUEUE_FINGERPRINTS, prior, stamp)
+    record = judge.judge_state.load(conn)[1]
+    assert record[1] == "budget" and record[4] == 7
+    assert record[3] == datetime(2026, 10, 4, 15, tzinfo=timezone.utc).timestamp()

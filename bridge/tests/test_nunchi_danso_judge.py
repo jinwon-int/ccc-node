@@ -2,6 +2,9 @@
 
 import asyncio
 import json
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -24,14 +27,12 @@ def test_settings_use_ordered_owned_references_not_copied_credentials(tmp_path, 
     manifest.chmod(0o600)
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("ZAI_API_KEY", raising=False)
-    captured = {}
-    monkeypatch.setattr(nunchi_judge.Config, "load", lambda **kwargs: captured.update(kwargs))
-    nunchi_judge.load_settings()
-    env = captured["environ"]
-    assert env["ZAI_API_KEY"] == "synthetic-fixture-only"
-    assert env["CCC_DANSO_CLI_PATH"] == "/fixture/pinned-danso"
-    assert env["DANSO_GLM_ENDPOINT"] == "coding"
-    assert "TELEGRAM_BOT_TOKEN" not in env
+    settings = nunchi_judge.load_settings()
+    assert settings.zai_api_key == "synthetic-fixture-only"
+    assert settings.danso_cli_path == "/fixture/pinned-danso"
+    assert settings.danso_glm_endpoint == "coding"
+    assert not hasattr(settings, "telegram_bot_token")
+    assert "synthetic-fixture-only" not in repr(settings)
     assert "synthetic" not in manifest.read_text()
     auth.chmod(0o644)
     with pytest.raises(Exception, match="unsafe"):
@@ -57,5 +58,21 @@ print('{"verdict":"human","rationale":"synthetic","supersede_proposal":null}')
                                danso_glm_base_url=None, danso_glm_endpoint="coding")
     result = asyncio.run(nunchi_judge.judge(b"fixture judge input", settings, timeout=5))
     assert json.loads(result)["verdict"] == "human"
+    directory = tmp_path / ".config/ccc-node"
+    directory.mkdir(parents=True, mode=0o700)
+    envfile = directory / "bridge.env"
+    envfile.write_text(f"CCC_DANSO_CLI_PATH={script}\nCCC_DANSO_MODEL=fixture-model\n"
+                       "CCC_DANSO_AUTH_MODE=zai\nZAI_API_KEY=synthetic-fixture-only\n")
+    envfile.chmod(0o600)
+    # Exercise the real CLI entry point in a cron-like environment: no bot
+    # token, unrelated .env, authenticated shell, or patched settings loader.
+    completed = subprocess.run(
+        [sys.executable, "-m", "telegram_bot.memory.nunchi_judge"],
+        input="fixture judge input", text=True, capture_output=True, timeout=15,
+        cwd=tmp_path, env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin",
+                          "PYTHONPATH": str(Path(nunchi_judge.__file__).resolve().parents[2] / ".github/pythonpath")},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["verdict"] == "human"
     with pytest.raises(ValueError):
         asyncio.run(nunchi_judge.judge(b"x" * 32769, settings))
