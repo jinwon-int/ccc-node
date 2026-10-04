@@ -608,7 +608,7 @@ class LiteralHitsIndexTest(unittest.TestCase):
         self.assertEqual(AUTO_DISTILL.section_body(str(target), lineno=2), first)
 
 
-# Event shape live-captured from seoseo codex-cli 0.159.0 (2026-10-04, #1857).
+# Event shape live-captured from the codex-lane node, codex-cli 0.159.0 (2026-10-04, #1857).
 FAKE_CODEX = r"""#!/usr/bin/env python3
 import json, os, sys, time
 args = sys.argv[1:]
