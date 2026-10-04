@@ -902,6 +902,7 @@ def judge_item(item, siblings):
     """Try provider adapters in order; every exhausted path fails closed."""
     prompt = build_judge_prompt(item, siblings)
     attempts = []
+    provider_calls = 0
     for provider, command in judge_candidates():
         if not candidate_available(provider, command):
             attempts.append(f"{provider}:unavailable")
@@ -914,6 +915,7 @@ def judge_item(item, siblings):
         if not allowed:
             attempts.append("budget:exhausted")
             break
+        provider_calls += 1
         if provider == "typesafe":
             # Typed backend: the adapter returns the decision itself, so there
             # is no _parse_judge_result step to go wrong.
@@ -923,6 +925,7 @@ def judge_item(item, siblings):
                 continue
             parsed["backend"] = provider
             parsed["attempts"] = attempts
+            parsed["provider_calls"] = provider_calls
             return parsed
         if provider == "claude":
             output, failure = _claude_judge(command, prompt)
@@ -942,6 +945,7 @@ def judge_item(item, siblings):
         parsed["confidence"] = None
         parsed["backend"] = provider
         parsed["attempts"] = attempts
+        parsed["provider_calls"] = provider_calls
         return parsed
     return {
         "verdict": "human",
@@ -950,6 +954,7 @@ def judge_item(item, siblings):
         "confidence": None,
         "backend": None,
         "attempts": attempts,
+        "provider_calls": provider_calls,
     }
 
 
@@ -1078,9 +1083,11 @@ def triage_queue(conn, queue):
         else:
             verdict = judge_item(item, siblings)
             category = "judge"
-            if verdict["attempts"] == ["budget:exhausted"]:
+            no_calls = verdict.get("provider_calls", 0) == 0
+            last_attempt = verdict["attempts"][-1:]  # Missing CLI candidates did not spend.
+            if no_calls and last_attempt == ["budget:exhausted"]:
                 category = "budget-deferred"
-            elif verdict["attempts"] == ["budget:unavailable"]:
+            elif no_calls and last_attempt == ["budget:unavailable"]:
                 category = "budget-error"
             decisions.append({
                 "id": fid, "class": category,
@@ -1089,6 +1096,7 @@ def triage_queue(conn, queue):
                 "supersede_proposal": verdict["supersede_proposal"],
                 "backend": verdict["backend"],
                 "attempts": verdict["attempts"],
+                "provider_calls": verdict.get("provider_calls", 0),
                 # None for the free-text CLI backends, a calibrated float for
                 # the typed one; the gate distinguishes the two.
                 "confidence": verdict.get("confidence"),
@@ -1322,6 +1330,7 @@ def run_single_db():
                                     for d in decisions),
             "budget_deferred": sum(d["class"] == "budget-deferred" for d in decisions),
             "budget_errors": sum(d["class"] == "budget-error" for d in decisions),
+            "provider_calls": sum(d.get("provider_calls", 0) for d in decisions),
             "daily_call_cap": DAILY_CAP, "daily_calls_remaining": remaining,
             **QUEUE_COUNTS,
         })

@@ -148,3 +148,23 @@ def test_quota_wait_is_not_a_provider_failure_and_reopens_at_kst_midnight(judge,
     record = judge.judge_state.load(conn)[1]
     assert record[1] == "budget" and record[4] == 7
     assert record[3] == datetime(2026, 10, 4, 15, tzinfo=timezone.utc).timestamp()
+
+
+@pytest.mark.parametrize("first_available", [False, True])
+def test_auto_fallback_distinguishes_skipped_cli_from_real_failed_call(judge, conn, monkeypatch, first_available):
+    monkeypatch.setattr(judge, "judge_candidates", lambda: [("claude", "fake"), ("codex", "fake")])
+    monkeypatch.setattr(judge, "candidate_available", lambda provider, command: first_available or provider == "codex")
+    budgets = iter([(True, 0), (False, 0)] if first_available else [(False, 0)])
+    monkeypatch.setattr(judge.judge_state, "call_budget", lambda *args, **kwargs: next(budgets))
+    monkeypatch.setattr(judge, "_claude_judge", lambda *args: (None, "timeout"))
+    monkeypatch.setattr(judge, "_codex_judge", lambda *args: pytest.fail("exhausted budget invoked Codex"))
+    queue, _, _ = judge.fetch_queue(conn)
+    decision = judge.triage_queue(conn, queue)[0]
+    assert decision["provider_calls"] == int(first_available)
+    assert decision["class"] == ("judge" if first_available else "budget-deferred")
+    stamp = datetime(2026, 10, 4, 9, tzinfo=timezone.utc).timestamp()
+    prior = {1: (judge.QUEUE_FINGERPRINTS[1], "retry", stamp - 3600, stamp, 7)}
+    judge.judge_state.persist(conn, [decision], judge.QUEUE_FINGERPRINTS, prior, stamp)
+    state = judge.judge_state.load(conn)[1]
+    assert state[4] == (8 if first_available else 7)
+    assert state[3] == stamp + (86400 if first_available else 6 * 3600)
