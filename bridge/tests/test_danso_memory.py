@@ -68,6 +68,7 @@ async def test_report_style_reaches_each_dispatch_and_disarms(memory_settings, s
     _, before = await dispatch()
     assert "STE 80%" not in before
     flag.write_text("end: fixture")
+    flag.chmod(0o600)
     argv, armed = await dispatch()
     assert armed.count("STE 80% 규칙") == 1
     assert "STE 80%" not in json.dumps(argv)
@@ -94,6 +95,7 @@ async def test_optional_style_does_not_overflow_native_file_budget(memory_settin
     memory.write_text("x" * 32768)
     memory.chmod(0o600)
     (style_home / "state/report-style-canary.flag").touch()
+    (style_home / "state/report-style-canary.flag").chmod(0o600)
     settings = memory_settings.model_copy(update={"claude_settings_path": style_home / "settings.json"})
     loader = report_style_context_loader(settings, tmp_path / "context", AsyncMock(return_value=memory))
     assert await loader() == memory

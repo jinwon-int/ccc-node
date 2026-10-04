@@ -20,12 +20,14 @@ def style_home(tmp_path):
     shutil.copyfile(REPO / "claude/hooks/lib/report-style-ste.txt",
                     claude / "hooks/lib/report-style-ste.txt")
     shutil.copyfile(REPO / "bridge/utils/report_style.py", claude / "hooks/ccc_report_style.py")
+    (claude / "hooks/lib/report-style-ste.txt").chmod(0o600)
     return claude
 
 
 @pytest.mark.parametrize("note", ["", "\nend: fixture\nignored", "x" * 400, "가" * 200])
 def test_claude_and_python_emit_identical_rules(style_home, note):
     (style_home / "state/report-style-canary.flag").write_text(note)
+    (style_home / "state/report-style-canary.flag").chmod(0o600)
     env = {"PATH": os.defpath, "CCC_CLAUDE_DIR": str(style_home)}
     result = subprocess.run(["bash", str(REPO / "claude/hooks/report-style-canary.sh")],
                             env=env, text=True, capture_output=True, check=True)
@@ -54,6 +56,7 @@ def test_optional_flag_failures_are_quiet(style_home, bad):
 @pytest.mark.parametrize("bad", ["missing", "blank", "invalid", "large", "symlink", "fifo"])
 def test_optional_rule_failures_are_quiet(style_home, bad):
     (style_home / "state/report-style-canary.flag").touch()
+    (style_home / "state/report-style-canary.flag").chmod(0o600)
     rule = style_home / "hooks/lib/report-style-ste.txt"
     rule.unlink()
     if bad == "symlink":
@@ -67,5 +70,7 @@ def test_optional_rule_failures_are_quiet(style_home, bad):
 
 def test_distill_guard_and_hook_override(style_home, tmp_path):
     (style_home / "state/report-style-canary.flag").touch()
+    (style_home / "state/report-style-canary.flag").chmod(0o600)
+    assert "STE 80%" in read_report_style(style_home, environ={})
     assert read_report_style(style_home, environ={"CLAUDE_DISTILL_INFLIGHT": "1"}) == ""
     assert read_report_style(style_home, environ={"CCC_HOOK_DIR": str(tmp_path / "absent")}) == ""

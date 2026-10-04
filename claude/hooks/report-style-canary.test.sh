@@ -30,6 +30,7 @@ export CCC_CLAUDE_DIR="$HOME_DIR/.claude"
 export CCC_HOOK_DIR="$TMP/hooks"
 mkdir -p "$CCC_CLAUDE_DIR/state" "$CCC_HOOK_DIR/lib"
 cp "$HERE/lib/report-style-ste.txt" "$CCC_HOOK_DIR/lib/report-style-ste.txt"
+chmod 600 "$CCC_HOOK_DIR/lib/report-style-ste.txt"
 cp "$HERE/../../bridge/utils/report_style.py" "$CCC_HOOK_DIR/ccc_report_style.py"
 FLAG="$CCC_CLAUDE_DIR/state/report-style-canary.flag"
 
@@ -41,6 +42,7 @@ ok "without the flag the hook prints nothing and exits 0" '[ "$rc" = 0 ] && [ -z
 
 # 2. flag present → additionalContext carries the rule block
 : > "$FLAG"
+chmod 600 "$FLAG"
 out="$(run_hook SessionStart)"; rc=$?
 ok "with the flag the hook exits 0 and emits hookSpecificOutput" \
   '[ "$rc" = 0 ] && printf "%s" "$out" | jq -e ".hookSpecificOutput.hookEventName == \"SessionStart\"" >/dev/null'
@@ -70,6 +72,7 @@ ok "a missing rule file keeps the hook silent and exit 0" '[ "$rc" = 0 ] && [ -z
 
 # 6. distill subprocess guard
 cp "$HERE/lib/report-style-ste.txt" "$CCC_HOOK_DIR/lib/report-style-ste.txt"
+chmod 600 "$CCC_HOOK_DIR/lib/report-style-ste.txt"
 out="$(CLAUDE_DISTILL_INFLIGHT=1 run_hook SessionStart)"
 # shellcheck disable=SC2034  # rc is read inside the eval'd ok() condition
 rc=$?

@@ -107,6 +107,7 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         (claude / "hooks/lib").mkdir(parents=True)
         rule = claude / "hooks/lib/report-style-ste.txt"
         rule.write_text("## STE rules\nOne idea per sentence.\n")
+        rule.chmod(0o600)
         flag = claude / "state/report-style-canary.flag"
         options = self.options()
         self.codex_home.mkdir(mode=0o700)
@@ -116,6 +117,7 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.module.materialize_snapshot("MEMORY", options)
         self.assertNotIn("STE rules", target.read_text())
         flag.write_text("end: fixture")
+        flag.chmod(0o600)
         self.assertFalse(self.module.snapshot_status(options).is_ready)
         self.assertEqual(self.module.materialize_snapshot("MEMORY", options).status, "updated")
         text = target.read_text()
@@ -138,6 +140,9 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         (claude / "hooks/lib").mkdir(parents=True)
         (claude / "state/report-style-canary.flag").touch()
         (claude / "hooks/lib/report-style-ste.txt").write_text("STE_SENTINEL")
+        (claude / "state/report-style-canary.flag").chmod(0o600)
+        (claude / "hooks/lib/report-style-ste.txt").chmod(0o600)
+        self.assertEqual(self.module._report_style(self.options()), "STE_SENTINEL")
         for extra in ({"CLAUDE_DISTILL_INFLIGHT": "1"},
                       {"CCC_MEMORY_MATERIALIZER_PROVIDER": "danso"}):
             self.module.materialize_snapshot("MEMORY", self.options(**extra))
@@ -149,11 +154,14 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         (claude / "hooks/lib").mkdir(parents=True)
         shutil.copyfile(ROOT / "claude/hooks/lib/report-style-ste.txt",
                         claude / "hooks/lib/report-style-ste.txt")
+        (claude / "hooks/lib/report-style-ste.txt").chmod(0o600)
         options = self.options(CCC_CODEX_AGENTS_BUDGET_BYTES="2048")
         self.module.materialize_snapshot("SYNTHETIC MEMORY", options)
         target = self.codex_home / "AGENTS.md"
         original = target.read_text()
         (claude / "state/report-style-canary.flag").touch()
+        (claude / "state/report-style-canary.flag").chmod(0o600)
+        self.assertIn("STE 80%", self.module._report_style(options))
         self.assertTrue(self.module.snapshot_status(options).is_ready)
         self.assertEqual(self.module.materialize_snapshot("SYNTHETIC MEMORY", options).status, "unchanged")
         self.assertEqual(target.read_text(), original)
