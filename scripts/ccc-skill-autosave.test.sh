@@ -464,11 +464,12 @@ after10="$(grep -c "danso review ok" "$STATE_DANSO/skill-autosave.log")"
 ok "unchanged danso journal not re-drafted" '[ "$after10" = "$before10" ]'
 
 # Extra channel root with the same journal UUID must not collide with primary.
-DANSO_EXTRA="$TMP/danso-extra"
+DANSO_EXTRA="$DANSO_STATE_FIX/matrix"
 mkdir -p "$DANSO_EXTRA/journals"
 cp "$JROOT/1e0a9d2e-0000-4000-8000-000000000001.jsonl" "$DANSO_EXTRA/journals/1e0a9d2e-0000-4000-8000-000000000001.jsonl"
 CCC_SKILL_DANSO_ADDITIONAL_STATE_DIRS="$DANSO_EXTRA:$DANSO_STATE_FIX" run10
 ok "second channel same UUID is independently ledgered" '[ "$(wc -l < "$STATE_DANSO/skill-autosave.danso-seen")" = 2 ]'
+# shellcheck disable=SC2034  # used by the eval-based assertion
 extra_count="$(grep -c "danso review ok" "$STATE_DANSO/skill-autosave.log")"
 CCC_SKILL_DANSO_ADDITIONAL_STATE_DIRS="$DANSO_EXTRA:$DANSO_STATE_FIX" run10
 ok "channel rerun and duplicate root do not redraft" '[ "$(grep -c "danso review ok" "$STATE_DANSO/skill-autosave.log")" = "$extra_count" ]'

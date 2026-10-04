@@ -636,10 +636,14 @@ else
         [ "$danso_drafted" -ge "$MAX_SESSIONS" ] && break
         total_budget_spent danso && break
         [ -f "$journal" ] || continue
-        journal_state="$danso_state"
+        journal_state=""
         source_tag=""
+        # A channel root can be nested under the primary; use the most
+        # specific match so identical UUIDs retain separate ledger keys.
         for _source in "${danso_sources[@]}"; do
-          case "$journal" in "${_source%/}"/*) journal_state="$_source"; break ;; esac
+          case "$journal" in "${_source%/}"/*)
+            if [ "${#_source}" -gt "${#journal_state}" ]; then journal_state="$_source"; fi ;;
+          esac
         done
         if [ "${journal_state%/}" != "${danso_state%/}" ]; then
           source_tag="$(printf '%s' "$journal_state" | sha256sum | cut -c1-12)-"
