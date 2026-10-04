@@ -80,13 +80,15 @@ class RecordingTests(UsageMeterTestCase):
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         self.assertEqual(list(raw["days"]), ["2026-07-17"])
 
-    def test_corrupt_state_fails_open_to_empty_counters(self) -> None:
+    def test_corrupt_state_keeps_interactive_telemetry_but_preserves_disk_for_recovery(self) -> None:
         self.path.write_text("{not json", encoding="utf-8")
         with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
             meter = self.make_meter()
         self.assertEqual(meter.used_tokens("claude"), 0)
         meter.record("claude", MODE_INTERACTIVE, input_tokens=5)
-        self.assertEqual(self.make_meter().used_tokens("claude"), 5)
+        self.assertEqual(meter.used_tokens("claude"), 5)
+        self.assertEqual(self.path.read_text(), "{not json")
+        self.assertFalse(meter.check_autonomous_spend("claude").allowed)
 
     def test_hostile_state_shapes_are_ignored(self) -> None:
         self.path.write_text(
@@ -535,7 +537,8 @@ class PersistenceFailureTests(UsageMeterTestCase):
         # Reviewer probe: two 9-token records against an unavailable state
         # path must report 18, not 9 — the failed-save deltas survive the
         # next mutation instead of being reloaded over, and the budget keeps
-        # gating on the merged in-memory state while degraded.
+        # interactive telemetry continues while degraded. Autonomous work
+        # must wait: another process cannot see a charge that never persisted.
         meter = self.make_meter(budgets={"codex": 10})
         self.path.mkdir()  # os.replace onto a directory fails on POSIX
         with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
@@ -544,7 +547,7 @@ class PersistenceFailureTests(UsageMeterTestCase):
         with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
             meter.record("codex", MODE_INTERACTIVE, input_tokens=9)
         self.assertEqual(meter.used_tokens("codex"), 18)
-        self.assertTrue(meter.reserve_autonomous_spend("codex", input_tokens=1).allowed)
+        self.assertFalse(meter.reserve_autonomous_spend("codex", input_tokens=1).allowed)
 
 
 class TransientSaveRecoveryTests(UsageMeterTestCase):

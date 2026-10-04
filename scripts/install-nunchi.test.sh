@@ -126,8 +126,8 @@ ok "Codex refresh uses the native incremental conversation miner with --wing cod
 # dry-run by design (no NUNCHI_JUDGE_APPLY — flipping to apply is a fresh,
 # per-node approval, never an installer default).
 out="$(run_install --apply --codex --judge 2>&1)"; rc=$?
-ok "--judge adds a managed daily judge-batch cron alongside feed/refresh/bench" \
-  '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 4 ] && grep -q "judge-batch.py" "$cron_store"'
+ok "--judge adds a managed hourly judge-batch cron alongside feed/refresh/bench" \
+  '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 4 ] && grep "judge-batch.py" "$cron_store" | grep -q "^41 \\* \\* \\* \\* "'
 ok "judge cron is dry-run only (no APPLY env) and keeps the gen stamp" \
   '! grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY" && grep "judge-batch.py" "$cron_store" | grep -qE "gen=h_[0-9a-f]{12}$"'
 # The install record is what self-update replays. If --judge is not

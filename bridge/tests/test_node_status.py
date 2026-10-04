@@ -203,11 +203,16 @@ def test_remote_command_has_no_cli_flags_and_probes_fleet_checkouts() -> None:
     assert calls[0][-1].startswith("for s in '/srv/x y/scripts/ccc-node-status.py' ")
 
 
-def test_remote_command_execs_the_first_checkout_found(tmp_path: Path) -> None:
+def test_remote_command_execs_the_first_checkout_found(tmp_path: Path, monkeypatch) -> None:
     """Run the snippet in a real shell: a Termux-style $HOME checkout is found
     and executed; nothing found reports where it looked and exits 127."""
     import shutil
     from telegram_bot.core.node_status import remote_command
+
+    # Fleet hosts actually have /opt/ccc-node. Isolate the candidate filesystem
+    # while exercising the real generated shell, including the missing case.
+    candidates = (str(tmp_path / "opt/ccc-node"), str(tmp_path / "root/ccc-node"), "$HOME/ccc-node")
+    monkeypatch.setattr("telegram_bot.core.node_status.REMOTE_CHECKOUT_CANDIDATES", candidates)
 
     home = tmp_path / "home"
     script = home / "ccc-node" / "scripts" / "ccc-node-status.py"
@@ -223,4 +228,4 @@ def test_remote_command_execs_the_first_checkout_found(tmp_path: Path) -> None:
 
     empty = subprocess.run([sh, "-c", remote_command(None)], env={**env, "HOME": str(tmp_path / "nowhere")}, capture_output=True, text=True, timeout=30)
     assert empty.returncode == 127
-    assert "not found under /opt/ccc-node, /root/ccc-node, $HOME/ccc-node" in empty.stderr
+    assert "not found under " + ", ".join(candidates) in empty.stderr

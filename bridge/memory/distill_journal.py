@@ -1071,6 +1071,9 @@ class DistillJournal(JsonJournalCore):
                 "estimated_max_tokens": sum(
                     item.estimated_max_tokens for item in job.extraction_accounting
                 ),
+                "actual_usage_attempts": sum(item.actual_requests is not None for item in job.extraction_accounting),
+                "actual_tokens": sum((item.actual_input_tokens or 0) + (item.actual_output_tokens or 0)
+                                     for item in job.extraction_accounting),
             },
             "honcho_count": len(extraction.honcho) if extraction is not None else 0,
             "wiki_candidate_count": (

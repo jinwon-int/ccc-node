@@ -325,6 +325,7 @@ class ProjectChatHandler(
                         "danso": int(getattr(self._config, "usage_budget_tokens_danso", 0) or 0),
                     },
                     warn_percent=int(getattr(self._config, "usage_budget_warn_percent", 80) or 80),
+                    recovery_reserve_percent=int(getattr(self._config, "usage_recovery_reserve_percent", 0) or 0),
                     alert_sink=self._write_usage_alert_spool,
                 )
             except Exception:

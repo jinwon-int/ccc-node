@@ -127,6 +127,9 @@ class DistillExtractionAccounting:
     snapshot_bytes: int
     duration_ms: int
     estimated_max_tokens: int
+    actual_input_tokens: int | None = None
+    actual_output_tokens: int | None = None
+    actual_requests: int | None = None
 
     def __post_init__(self) -> None:
         if not _DISTILL_MODEL_RE.fullmatch(self.model):
@@ -135,14 +138,25 @@ class DistillExtractionAccounting:
             value = getattr(self, name)
             if type(value) is not int or value < 0 or value > 10**12:
                 raise ValueError(f"invalid distill extraction accounting: {name}")
+        actual = (self.actual_input_tokens, self.actual_output_tokens, self.actual_requests)
+        if any(v is not None for v in actual):
+            if any(type(v) is not int or not 0 <= v <= 10**12 for v in actual):
+                raise ValueError("invalid actual extraction usage")
+            if self.actual_requests is None or self.actual_requests < 1:
+                raise ValueError("invalid actual extraction requests")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "model": self.model,
             "snapshot_bytes": self.snapshot_bytes,
             "duration_ms": self.duration_ms,
             "estimated_max_tokens": self.estimated_max_tokens,
         }
+        if self.actual_requests is not None:
+            result.update(actual_input_tokens=self.actual_input_tokens,
+                          actual_output_tokens=self.actual_output_tokens,
+                          actual_requests=self.actual_requests)
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> DistillExtractionAccounting:
@@ -161,7 +175,9 @@ class DistillExtractionAccounting:
             or isinstance(estimated_max_tokens, bool)
         ):
             raise ValueError("invalid distill extraction accounting counters")
-        return cls(model, snapshot_bytes, duration_ms, estimated_max_tokens)
+        return cls(model, snapshot_bytes, duration_ms, estimated_max_tokens,
+                   value.get("actual_input_tokens"), value.get("actual_output_tokens"),
+                   value.get("actual_requests"))
 
     @classmethod
     def parse_many(cls, value: object) -> tuple[DistillExtractionAccounting, ...]:

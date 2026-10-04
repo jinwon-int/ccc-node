@@ -56,6 +56,7 @@ owned, non-group-accessible) and re-runs per scope that has a facts.db.
 """
 
 import fcntl
+from contextlib import closing
 import json
 import os
 import re
@@ -81,6 +82,7 @@ import nunchi  # noqa: E402
 # bridge/utils/secure_fs.py as ccc_secure_fs.py) on sys.path, or registered the
 # canonical repo module under that name, so the plain import resolves here.
 import ccc_secure_fs  # noqa: E402
+import judge_state  # noqa: E402
 
 DB = os.environ.get("NUNCHI_DB", os.path.expanduser("~/.nunchi/facts.db"))
 HOME_DIR = os.environ.get("NUNCHI_HOME", os.path.expanduser("~/.nunchi"))
@@ -102,6 +104,10 @@ CAP = ccc_secure_fs.bounded_int_env(os.environ, "NUNCHI_JUDGE_CAP", 10, 1, 50, c
 MIN_AGE_HOURS = ccc_secure_fs.bounded_int_env(os.environ, "NUNCHI_JUDGE_MIN_AGE_HOURS", 24, 1, 24 * 30, clamp=True)
 JUDGE_TIMEOUT = ccc_secure_fs.bounded_int_env(os.environ, "NUNCHI_JUDGE_TIMEOUT_SEC", 120, 10, 600, clamp=True)
 MAX_SCOPES = ccc_secure_fs.bounded_int_env(os.environ, "CCC_NUNCHI_MAX_SCOPES_PER_RUN", 64, 1, 64, clamp=True)
+DAILY_CAP = ccc_secure_fs.bounded_int_env(os.environ, "NUNCHI_JUDGE_DAILY_CAP", 50, 1, 1000, clamp=True)
+QUEUE_STATE = {}
+QUEUE_FINGERPRINTS = {}
+QUEUE_COUNTS = {}
 
 
 def bounded_float_env(env, key, default, minimum, maximum, clamp=False):
@@ -138,7 +144,7 @@ DUP_THRESHOLD = bounded_float_env(
     os.environ, "NUNCHI_G3_DUP_THRESHOLD", 0.85, 0.6, 1.0, clamp=True)
 
 VERDICTS = ("clear", "conflict", "human")
-PROVIDERS = ("claude", "codex", "typesafe")
+PROVIDERS = ("claude", "codex", "danso", "typesafe")
 # TypeSafe Jev (typed decision backend). Pinned in code, never taken from the
 # environment: the endpoint is where a bearer key is sent, so a redirectable /
 # overridable URL would be a key-exfiltration seam.
@@ -271,6 +277,12 @@ def fetch_queue(conn):
         " ORDER BY id",
         (cutoff,),
     )
+    QUEUE_STATE.clear()
+    QUEUE_STATE.update(judge_state.load(conn))
+    QUEUE_FINGERPRINTS.clear()
+    QUEUE_COUNTS.clear()
+    QUEUE_COUNTS.update(cooldown=0, human_hold=0, retry_wait=0, eligible=0)
+    stamp = datetime.now(timezone.utc).timestamp()
     queue = []
     deferred = []
     duplicates = []
@@ -280,7 +292,8 @@ def fetch_queue(conn):
         if nunchi._g5_reasonless_decision(row[2], row[3], row[6]):
             deferred.append(row[0])
             continue
-        dup = duplicate_candidate(row[3], live_conflict(conn, row[0], row[1], row[3], row[2]))
+        siblings = live_conflict(conn, row[0], row[1], row[3], row[2])
+        dup = duplicate_candidate(row[3], siblings)
         if dup is not None:
             sid, ratio, direction = dup
             if direction == "fold_sibling":
@@ -296,9 +309,19 @@ def fetch_queue(conn):
                 seen_dups.add(dup_id)
                 duplicates.append((row[0], sid, ratio, dup_id, survivor))
             continue  # held out of the CAP either way (the pair is already proposed)
-        if len(queue) < CAP:
-            queue.append(row)
-    return queue, deferred, duplicates
+        fingerprint = judge_state.fingerprint(conn, row, siblings)
+        QUEUE_FINGERPRINTS[row[0]] = fingerprint
+        previous = QUEUE_STATE.get(row[0])
+        if previous and previous[0] == fingerprint and previous[3] > stamp:
+            QUEUE_COUNTS["cooldown"] += 1
+            QUEUE_COUNTS["human_hold" if previous[1] == "human" else "retry_wait"] += 1
+            continue
+        queue.append(row)
+    queue.sort(key=lambda row: (
+        QUEUE_STATE[row[0]][2] if row[0] in QUEUE_STATE
+        and QUEUE_STATE[row[0]][0] == QUEUE_FINGERPRINTS[row[0]] else 0, row[0]))
+    QUEUE_COUNTS["eligible"] = len(queue)
+    return queue[:CAP], deferred, duplicates
 
 
 def live_conflict(conn, fact_id, observed, text, kind=None):
@@ -475,10 +498,13 @@ def judge_candidates():
     command — its availability is the key, not PATH (see judge_available) — so
     a NUNCHI_JUDGE_CMD override is meaningless for it and is ignored.
     """
-    if JUDGE_PROVIDER not in {"auto", "claude", "codex", "typesafe"}:
+    if JUDGE_PROVIDER not in {"auto", *PROVIDERS}:
         return []
     if JUDGE_PROVIDER == "typesafe":
         return [("typesafe", "")]
+    if JUDGE_PROVIDER == "danso":
+        root = os.environ.get("CCC_NUNCHI_JUDGE_BRIDGE_ROOT", "")
+        return [("danso", os.path.join(root, "bridge/venv/bin/python"))] if root else []
     if JUDGE_CMD_OVERRIDE:
         provider = (JUDGE_PROVIDER if JUDGE_PROVIDER != "auto"
                     else (_provider_for_command(JUDGE_CMD_OVERRIDE) or "claude"))
@@ -555,6 +581,23 @@ def judge_available():
         candidate_available(provider, command)
         for provider, command in judge_candidates()
     )
+
+
+def _danso_judge(command, prompt):
+    env = dict(os.environ)
+    root = os.environ["CCC_NUNCHI_JUDGE_BRIDGE_ROOT"]
+    env["PYTHONPATH"] = os.path.join(root, ".github/pythonpath")
+    try:
+        result = subprocess.run([command, "-m", "telegram_bot.memory.nunchi_judge"],
+                                input=prompt, text=True, capture_output=True,
+                                timeout=JUDGE_TIMEOUT + 5, env=env)
+        if result.returncode:
+            return None, "cli-failed"
+        return result.stdout, None
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except OSError:
+        return None, "spawn-failed"
 
 
 def _claude_judge(command, prompt):
@@ -859,10 +902,20 @@ def judge_item(item, siblings):
     """Try provider adapters in order; every exhausted path fails closed."""
     prompt = build_judge_prompt(item, siblings)
     attempts = []
+    provider_calls = 0
     for provider, command in judge_candidates():
         if not candidate_available(provider, command):
             attempts.append(f"{provider}:unavailable")
             continue
+        try:
+            allowed, _ = judge_state.call_budget(STATE, DAILY_CAP)
+        except (OSError, ValueError, ccc_secure_fs.SecureFsError):
+            attempts.append("budget:unavailable")
+            break
+        if not allowed:
+            attempts.append("budget:exhausted")
+            break
+        provider_calls += 1
         if provider == "typesafe":
             # Typed backend: the adapter returns the decision itself, so there
             # is no _parse_judge_result step to go wrong.
@@ -872,9 +925,12 @@ def judge_item(item, siblings):
                 continue
             parsed["backend"] = provider
             parsed["attempts"] = attempts
+            parsed["provider_calls"] = provider_calls
             return parsed
         if provider == "claude":
             output, failure = _claude_judge(command, prompt)
+        elif provider == "danso":
+            output, failure = _danso_judge(command, prompt)
         else:
             output, failure = _codex_judge(command, prompt)
         if failure:
@@ -889,6 +945,7 @@ def judge_item(item, siblings):
         parsed["confidence"] = None
         parsed["backend"] = provider
         parsed["attempts"] = attempts
+        parsed["provider_calls"] = provider_calls
         return parsed
     return {
         "verdict": "human",
@@ -897,6 +954,7 @@ def judge_item(item, siblings):
         "confidence": None,
         "backend": None,
         "attempts": attempts,
+        "provider_calls": provider_calls,
     }
 
 
@@ -911,10 +969,14 @@ def audit(entry):
 
 
 def backup_db():
-    os.makedirs(BACKUP_DIR, exist_ok=True)
+    ccc_secure_fs.ensure_private_directory(Path(BACKUP_DIR))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    dest = os.path.join(BACKUP_DIR, f"facts-prejudge-{stamp}.db")
-    shutil.copy2(DB, dest)
+    descriptor, dest = tempfile.mkstemp(prefix=f"facts-prejudge-{stamp}-", suffix=".db", dir=BACKUP_DIR)
+    os.close(descriptor)
+    # SQLite's backup includes committed WAL frames; copying facts.db alone
+    # can omit the very rows whose flags are about to be changed.
+    with closing(sqlite3.connect(DB)) as source, closing(sqlite3.connect(dest)) as target:
+        source.backup(target)
     return dest
 
 
@@ -959,17 +1021,24 @@ def apply_clear(conn, fact_id, decision=None):
         "SELECT review, valid_to FROM peer_facts WHERE id=?", (fact_id,)).fetchone()
     if not row or row[0] != 1 or row[1] is not None:
         return False
+    if fact_id in QUEUE_FINGERPRINTS:
+        item = conn.execute("SELECT id,observed,kind,fact,source_rank,created_at,because "
+                            "FROM peer_facts WHERE id=?", (fact_id,)).fetchone()
+        siblings = live_conflict(conn, fact_id, item[1], item[3], item[2])
+        if judge_state.fingerprint(conn, item, siblings) != QUEUE_FINGERPRINTS[fact_id]:
+            return False
     conn.execute("UPDATE peer_facts SET review=0 WHERE id=?", (fact_id,))
     return True
 
 
-def write_report(payload, human_items):
+def write_report(payload, human_items, pending_count=None):
     os.makedirs(STATE, exist_ok=True)
     with open(REPORT, "w", encoding="utf-8") as fh:
         fh.write(payload)
-    if human_items:
+    count = len(human_items) if pending_count is None else pending_count
+    if count:
         with open(FLAG, "w", encoding="utf-8") as fh:
-            fh.write(f"{len(human_items)} human-pending item(s) as of {now()}\n")
+            fh.write(f"{count} human-pending item(s) as of {now()}\n")
     elif os.path.exists(FLAG):
         os.unlink(FLAG)
 
@@ -1013,13 +1082,21 @@ def triage_queue(conn, queue):
             })
         else:
             verdict = judge_item(item, siblings)
+            category = "judge"
+            no_calls = verdict.get("provider_calls", 0) == 0
+            last_attempt = verdict["attempts"][-1:]  # Missing CLI candidates did not spend.
+            if no_calls and last_attempt == ["budget:exhausted"]:
+                category = "budget-deferred"
+            elif no_calls and last_attempt == ["budget:unavailable"]:
+                category = "budget-error"
             decisions.append({
-                "id": fid, "class": "judge",
+                "id": fid, "class": category,
                 "rationale": verdict["rationale"],
                 "verdict": verdict["verdict"],
                 "supersede_proposal": verdict["supersede_proposal"],
                 "backend": verdict["backend"],
                 "attempts": verdict["attempts"],
+                "provider_calls": verdict.get("provider_calls", 0),
                 # None for the free-text CLI backends, a calibrated float for
                 # the typed one; the gate distinguishes the two.
                 "confidence": verdict.get("confidence"),
@@ -1055,6 +1132,7 @@ def apply_decisions(conn, decisions):
     backup = ""
     if APPLY and clears:
         backup = backup_db()
+        conn.execute("BEGIN IMMEDIATE")
         for d in clears:
             if apply_clear(conn, d["id"], d):
                 applied += 1
@@ -1173,8 +1251,8 @@ def run_single_db():
     if not os.path.isfile(DB):
         print(f"judge-batch: no fact store at {DB} — nothing to do")
         return 0
-    os.makedirs(HOME_DIR, exist_ok=True)
-    with open(LOCK, "w", encoding="utf-8") as lock:
+    ccc_secure_fs.ensure_private_directory(Path(HOME_DIR))
+    with os.fdopen(ccc_secure_fs.open_lock_descriptor(LOCK), "r+b") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -1184,6 +1262,9 @@ def run_single_db():
         queue, deferred, duplicates = fetch_queue(conn)
         decisions = triage_queue(conn, queue)
         clears, applied, backup, held = apply_decisions(conn, decisions)
+        if APPLY:
+            judge_state.persist(conn, decisions, QUEUE_FINGERPRINTS, QUEUE_STATE,
+                                datetime.now(timezone.utc).timestamp())
         humans = [d for d in decisions if d["verdict"] != "clear"]
         stamp = now()
         if deferred:
@@ -1227,9 +1308,32 @@ def run_single_db():
             })
         write_report(
             build_report(stamp, decisions, clears, humans, applied, backup,
-                         deferred, held, duplicates=duplicates),
+                         deferred, held, duplicates=duplicates)
+            + f"\nQueue: {QUEUE_COUNTS['eligible']} eligible, "
+              f"{QUEUE_COUNTS['human_hold']} held for human review, "
+              f"{QUEUE_COUNTS['retry_wait']} waiting for retry. "
+              f"Shared daily provider-call cap: {DAILY_CAP}.\n",
             humans,
+            pending_count=len(humans) + len(held) + len(deferred) + len(duplicates)
+                          + QUEUE_COUNTS["human_hold"],
         )
+        try:
+            _, remaining = judge_state.call_budget(STATE, DAILY_CAP, charge=False)
+        except (OSError, ValueError, ccc_secure_fs.SecureFsError):
+            remaining = None
+        judge_state.status(HOME_DIR, {
+            "schema_version": 1, "updated_at": stamp, "apply": APPLY,
+            "processed": len(decisions), "applied": applied,
+            "source_reason_missing": len(deferred), "duplicate_candidates": len(duplicates),
+            "backend_failures": sum(d["class"] == "judge-unavailable" or
+                                    (d["class"] == "judge" and not d.get("backend"))
+                                    for d in decisions),
+            "budget_deferred": sum(d["class"] == "budget-deferred" for d in decisions),
+            "budget_errors": sum(d["class"] == "budget-error" for d in decisions),
+            "provider_calls": sum(d.get("provider_calls", 0) for d in decisions),
+            "daily_call_cap": DAILY_CAP, "daily_calls_remaining": remaining,
+            **QUEUE_COUNTS,
+        })
         conn.close()
         mode = "APPLY" if APPLY else "dry-run"
         scope = os.environ.get("CCC_NUNCHI_AUDIENCE_SCOPE", "")

@@ -604,6 +604,14 @@ def parse_extraction_output(
     result = DistillExtractionOutput.model_validate(raw)
     if not wiki_enabled and result.wiki_candidates:
         raise ValueError("wiki_candidates must be empty when Wiki output is disabled")
+    # Remove only byte-equivalent structured claims within this one provenance
+    # packet. Different reasons, subjects or conditions remain independent;
+    # no cross-audience/global semantic merge happens at extraction time.
+    unique: dict[str, HonchoFact] = {}
+    for fact in result.honcho:
+        unique.setdefault(fact.model_dump_json(), fact)
+    if len(unique) != len(result.honcho):
+        result = result.model_copy(update={"honcho": tuple(unique.values())})
     return result
 
 

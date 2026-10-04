@@ -32,12 +32,16 @@ import time
 from typing import Literal
 
 from .usage import UsageSnapshot
+from telegram_bot.utils.secure_fs import (
+    SecureFsError, ensure_private_directory, open_lock_descriptor, read_owner_only_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
 MODE_INTERACTIVE = "interactive"
 MODE_AUTONOMOUS = "autonomous"
-_MODES = (MODE_INTERACTIVE, MODE_AUTONOMOUS)
+MODE_RECOVERY = "autonomous_recovery"
+_MODES = (MODE_INTERACTIVE, MODE_AUTONOMOUS, MODE_RECOVERY)
 
 # KST day buckets match the repo-wide reporting convention (fixed offset, no
 # DST, deterministic in tests).
@@ -167,11 +171,15 @@ class UsageMeter:
         alert_sink: Callable[[str], None] | None = None,
         retention_days: int = _DEFAULT_RETENTION_DAYS,
         clock: Callable[[], float] = time.time,
+        recovery_reserve_percent: int = 0,
     ) -> None:
         if not (1 <= warn_percent <= 99):
             raise ValueError("warn_percent must be within [1, 99]")
         if retention_days <= 0:
             raise ValueError("retention_days must be positive")
+        if type(recovery_reserve_percent) is not int or not 0 <= recovery_reserve_percent <= 50:
+            raise ValueError("recovery reserve must be within [0, 50]")
+        self._recovery_percent = recovery_reserve_percent
         self._path = Path(path)
         self._warn_percent = warn_percent
         self._alert_sink = alert_sink
@@ -184,6 +192,8 @@ class UsageMeter:
         self._lock = threading.Lock()
         self._lock_path = self._path.with_name(self._path.name + ".lock")
         self._flock_warned = False
+        self._admission_safe = True
+        self._storage_safe = True
         # Signed counter deltas applied since the last successful save
         # (day -> provider -> mode -> key). While non-empty, every locked
         # mutation reloads the authoritative on-disk state and replays these
@@ -209,21 +219,64 @@ class UsageMeter:
 
     def _load(self) -> None:
         try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            self._path.lstat()  # Read-only composition must not create directories.
+            ensure_private_directory(self._path.parent)
+            payload, _ = read_owner_only_bytes(self._path, max_bytes=32 * 1024 * 1024)
+            raw = json.loads(payload)
         except FileNotFoundError:
             return
-        except (OSError, UnicodeDecodeError, ValueError):
+        except (OSError, UnicodeDecodeError, ValueError, SecureFsError):
+            self._admission_safe = False
+            self._storage_safe = False
             logger.warning(
                 "Usage meter state at %s is unreadable; starting from empty counters",
                 self._path,
             )
             return
         if not isinstance(raw, Mapping):
+            self._admission_safe = False
+            self._storage_safe = False
             return
+        self._storage_safe = self._valid_financial_state(raw)
+        self._admission_safe = self._admission_safe and self._storage_safe
         self._load_days(raw.get("days"))
         self._load_alerted(raw.get("alerted"))
         self._load_reservations(raw.get("reservations"))
         self._load_events(raw.get("events"))
+
+    @staticmethod
+    def _valid_counters(value: object) -> bool:
+        return isinstance(value, dict) and all(
+            type(value.get(key)) is int and 0 <= value[key] <= _MAX_COUNT
+            for key in _COUNTER_KEYS
+        )
+
+    @classmethod
+    def _valid_modes(cls, providers: object) -> bool:
+        if not isinstance(providers, dict):
+            return False
+        for provider, modes in providers.items():
+            if not isinstance(provider, str) or not _PROVIDER_RE.fullmatch(provider) or not isinstance(modes, dict):
+                return False
+            if any(mode not in _MODES or not cls._valid_counters(counts) for mode, counts in modes.items()):
+                return False
+        return True
+
+    @classmethod
+    def _valid_financial_state(cls, raw: Mapping) -> bool:
+        days, reservations = raw.get("days"), raw.get("reservations", {})
+        if raw.get("version", 1) != 1 or not isinstance(days, dict) or not isinstance(reservations, dict):
+            return False
+        if any(not cls._is_day_key(day) or not cls._valid_modes(providers) for day, providers in days.items()):
+            return False
+        for ident, record in reservations.items():
+            if not isinstance(ident, str) or not ident or not cls._valid_counters(record):
+                return False
+            if not cls._is_day_key(record.get("day")) or not _PROVIDER_RE.fullmatch(str(record.get("provider", ""))):
+                return False
+            if record.get("mode", MODE_AUTONOMOUS) not in (MODE_AUTONOMOUS, MODE_RECOVERY):
+                return False
+        return True
 
     def _load_events(self, events: object) -> None:
         if not isinstance(events, list):
@@ -272,6 +325,7 @@ class UsageMeter:
             self._reservations[reservation_id] = {
                 "day": day,
                 "provider": provider,
+                "mode": MODE_RECOVERY if record.get("mode") == MODE_RECOVERY else MODE_AUTONOMOUS,
                 **{key: _clamped_count(record.get(key)) for key in _COUNTER_KEYS},
             }
 
@@ -319,6 +373,9 @@ class UsageMeter:
                     self._alerted.setdefault(day, {})[provider] = safe_kinds
 
     def _save(self) -> None:
+        if not self._storage_safe or not self._admission_safe:
+            logger.warning("Usage meter state or lock is unsafe; preserving disk state and pending telemetry")
+            return
         payload = json.dumps(
             {
                 "version": 1,
@@ -331,7 +388,9 @@ class UsageMeter:
             sort_keys=True,
         )
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
+            ensure_private_directory(self._path.parent)
+            if self._path.is_symlink():
+                raise OSError("unsafe usage state destination")
             fd, tmp_name = tempfile.mkstemp(
                 prefix=f".{self._path.name}.", dir=str(self._path.parent)
             )
@@ -348,7 +407,7 @@ class UsageMeter:
                 except OSError:
                     pass
                 raise
-        except OSError:
+        except (OSError, SecureFsError):
             logger.warning(
                 "Usage meter state could not be persisted to %s; keeping "
                 "in-memory counters",
@@ -356,7 +415,7 @@ class UsageMeter:
             )
 
     @contextmanager
-    def _locked_state(self, *, save: bool = True) -> Iterator[None]:
+    def _locked_state(self, *, save: bool = True, require_safe: bool = False) -> Iterator[None]:
         """Hold the thread + interprocess lock around one reload/apply/write.
 
         The on-disk state is authoritative: it is re-read under the lock so
@@ -366,15 +425,16 @@ class UsageMeter:
         """
 
         with self._lock:
+            self._admission_safe = True
+            self._storage_safe = True
             handle = None
             try:
-                self._path.parent.mkdir(parents=True, exist_ok=True)
-                fd = os.open(
-                    self._lock_path, os.O_CREAT | os.O_RDWR, 0o600
-                )
+                ensure_private_directory(self._path.parent)
+                fd = open_lock_descriptor(self._lock_path)
                 handle = os.fdopen(fd, "r+b")
                 fcntl.flock(handle, fcntl.LOCK_EX)
-            except OSError:
+            except (OSError, SecureFsError):
+                self._admission_safe = False
                 if handle is not None:
                     handle.close()
                     handle = None
@@ -393,7 +453,7 @@ class UsageMeter:
                 self._load()
                 self._replay_pending_deltas()
                 yield
-                if save:
+                if save and (not require_safe or self._admission_safe):
                     self._save()
             finally:
                 if handle is not None:
@@ -420,7 +480,11 @@ class UsageMeter:
                     for key, value in changes.items():
                         bucket[key] = max(0, min(bucket[key] + value, _MAX_COUNT))
         for reservation_id, record in self._pending_reservation_ops.items():
-            if record is None:
+            if record is not None and "settlement" in record:
+                consumed = self._reservations.pop(reservation_id, None)
+                if consumed is not None:
+                    self._replace_reserved_counts(consumed, record["settlement"])
+            elif record is None:
                 # Unpersisted refund: replay it only by consuming the
                 # authoritative record. If another process already consumed
                 # it (and persisted that), the record is absent and nothing
@@ -428,7 +492,7 @@ class UsageMeter:
                 consumed = self._reservations.pop(reservation_id, None)
                 if consumed is not None:
                     bucket = self._bucket(
-                        str(consumed["day"]), str(consumed["provider"]), MODE_AUTONOMOUS
+                        str(consumed["day"]), str(consumed["provider"]), consumed.get("mode", MODE_AUTONOMOUS)
                     )
                     for key in _COUNTER_KEYS:
                         bucket[key] = max(
@@ -479,9 +543,11 @@ class UsageMeter:
     def _autonomous_used_tokens(self, provider: str, day: str) -> int:
         """Input+output tokens charged to one provider's autonomous allowance."""
 
-        counters = (
-            self._days.get(day, {}).get(provider, {}).get(MODE_AUTONOMOUS, {})
-        )
+        return sum(self._mode_used_tokens(provider, day, mode)
+                   for mode in (MODE_AUTONOMOUS, MODE_RECOVERY))
+
+    def _mode_used_tokens(self, provider: str, day: str, mode: str) -> int:
+        counters = self._days.get(day, {}).get(provider, {}).get(mode, {})
         return _clamped_count(counters.get("input_tokens")) + _clamped_count(
             counters.get("output_tokens")
         )
@@ -584,7 +650,7 @@ class UsageMeter:
         self._note_pending_delta(day, provider, mode, added, 1)
         alerts = (
             self._collect_alerts(provider, day)
-            if mode == MODE_AUTONOMOUS
+            if mode in (MODE_AUTONOMOUS, MODE_RECOVERY)
             else ()
         )
         self._prune(day)
@@ -597,6 +663,7 @@ class UsageMeter:
         input_tokens: int = 0,
         output_tokens: int = 0,
         requests: int = 0,
+        purpose: Literal["routine", "recovery"] = "routine",
     ) -> UsageReservation:
         """Atomically admit-and-charge one autonomous attempt, prospectively.
 
@@ -613,34 +680,47 @@ class UsageMeter:
         """
 
         self._validate_provider(provider)
+        if purpose not in ("routine", "recovery"):
+            raise ValueError("invalid autonomous purpose")
+        mode = MODE_RECOVERY if purpose == "recovery" else MODE_AUTONOMOUS
         added = {
             "input_tokens": _clamped_count(input_tokens),
             "output_tokens": _clamped_count(output_tokens),
             "requests": _clamped_count(requests),
         }
         reserved_tokens = added["input_tokens"] + added["output_tokens"]
-        with self._locked_state():
+        with self._locked_state(require_safe=True):
             day = self.current_day()
             budget = self._budgets.get(provider, 0)
             used = self._autonomous_used_tokens(provider, day)
-            if budget > 0 and used + reserved_tokens > budget:
+            recovery_limit = budget * self._recovery_percent // 100
+            purpose_limit = recovery_limit if purpose == "recovery" else budget - recovery_limit
+            purpose_used = self._mode_used_tokens(provider, day, mode)
+            if (not self._admission_safe or (purpose == "recovery" and recovery_limit <= 0)
+                    or (budget > 0 and (used + reserved_tokens > budget
+                        or purpose_used + reserved_tokens > purpose_limit))):
                 decision = BudgetDecision(provider, day, "blocked", False, used, budget)
                 return UsageReservation(
                     provider, day, added["input_tokens"], added["output_tokens"],
                     added["requests"], decision,
                 )
-            alerts = self._apply_record(provider, MODE_AUTONOMOUS, added, day)
+            alerts = self._apply_record(provider, mode, added, day)
             state: BudgetState = "ok"
             if budget > 0 and used >= self._warn_threshold(budget):
                 state = "warn"
             decision = BudgetDecision(provider, day, state, True, used, budget)
             reservation_id = secrets.token_hex(16)
-            record = {"day": day, "provider": provider, **added}
+            record = {"day": day, "provider": provider, "mode": mode, **added}
             self._reservations[reservation_id] = record
             self._reservations = dict(tuple(self._reservations.items())[-512:])
             self._pending_reservation_ops[reservation_id] = dict(record)
         for alert in alerts:
             self._emit(alert)
+        if reservation_id in self._pending_reservation_ops:
+            # An admission must be visible to the other channel before the
+            # caller starts spending. Interactive telemetry still degrades
+            # gracefully; autonomous work waits for durable state recovery.
+            decision = BudgetDecision(provider, day, "blocked", False, used, budget)
         return UsageReservation(
             provider, day, added["input_tokens"], added["output_tokens"],
             added["requests"], decision, reservation_id,
@@ -663,7 +743,7 @@ class UsageMeter:
 
         if not reservation.allowed or not reservation.reservation_id:
             return
-        with self._locked_state():
+        with self._locked_state(require_safe=True):
             record = self._reservations.pop(reservation.reservation_id, None)
             if record is None:
                 # Unknown, forged, or already-consumed handle: refunding it
@@ -675,13 +755,46 @@ class UsageMeter:
             self._pending_reservation_ops[reservation.reservation_id] = None
             day = str(record["day"])
             provider = str(record["provider"])
-            bucket = self._bucket(day, provider, MODE_AUTONOMOUS)
+            bucket = self._bucket(day, provider, record.get("mode", MODE_AUTONOMOUS))
             # The subtraction is deliberately NOT a pending counter delta: if
             # this save fails, the consume op above replays the refund
             # conditionally on the authoritative record still existing, so a
             # refund another process persisted meanwhile is never reapplied.
             for key in _COUNTER_KEYS:
                 bucket[key] = max(0, bucket[key] - _clamped_count(record.get(key)))
+
+    def _replace_reserved_counts(self, record: dict, actual: Mapping[str, int]) -> None:
+        bucket = self._bucket(str(record["day"]), str(record["provider"]), record.get("mode", MODE_AUTONOMOUS))
+        for key in _COUNTER_KEYS:
+            bucket[key] = min(_MAX_COUNT, max(0, bucket[key] - record[key]) + actual[key])
+
+    def settle_reservation(
+        self, reservation: UsageReservation, *, input_tokens: int,
+        output_tokens: int, requests: int,
+    ) -> bool:
+        """Replace a reservation with trusted, out-of-band provider usage once.
+
+        Unknown usage must never call this method. The authoritative record
+        pins the original day and provider, including across midnight. A
+        failed write replays only while that record still exists, so another
+        process settling/refunding the handle cannot cause a second discount.
+        Actual overages are recorded in full, even above the admission cap.
+        """
+        actual = dict(input_tokens=input_tokens, output_tokens=output_tokens, requests=requests)
+        if any(type(v) is not int or not 0 <= v <= _MAX_COUNT for v in actual.values()) or requests < 1:
+            raise ValueError("invalid trusted provider usage")
+        if not reservation.allowed or not reservation.reservation_id:
+            return False
+        with self._locked_state(require_safe=True):
+            record = self._reservations.pop(reservation.reservation_id, None)
+            if record is None:
+                return False
+            self._replace_reserved_counts(record, actual)
+            self._pending_reservation_ops[reservation.reservation_id] = {"settlement": actual}
+            alerts = self._collect_alerts(str(record["provider"]), str(record["day"]))
+        for alert in alerts:
+            self._emit(alert)
+        return True
 
     def record_codex_thread_usage(
         self,
@@ -766,6 +879,9 @@ class UsageMeter:
             day = self.current_day()
             budget = self._budgets.get(provider, 0)
             used = self._autonomous_used_tokens(provider, day)
+            safe = self._admission_safe
+        if not safe:
+            return BudgetDecision(provider, day, "blocked", False, used, budget)
         if budget <= 0:
             return BudgetDecision(provider, day, "ok", True, used, budget)
         if used >= budget:
@@ -812,13 +928,15 @@ class UsageMeter:
                         totals[mode][key] += _clamped_count(modes.get(mode, {}).get(key))
             today_key = window[0]
             decision = self.check_autonomous_spend(provider)
+            autonomous = {key: totals[MODE_AUTONOMOUS][key] + totals[MODE_RECOVERY][key]
+                          for key in _COUNTER_KEYS}
             lines.append(
                 f"{provider} · today {self.used_tokens(provider, today_key)} tok · "
                 f"{days}d interactive "
                 f"{totals[MODE_INTERACTIVE]['input_tokens'] + totals[MODE_INTERACTIVE]['output_tokens']}"
                 f" tok/{totals[MODE_INTERACTIVE]['requests']} req · autonomous "
-                f"{totals[MODE_AUTONOMOUS]['input_tokens'] + totals[MODE_AUTONOMOUS]['output_tokens']}"
-                f" tok/{totals[MODE_AUTONOMOUS]['requests']} req"
+                f"{autonomous['input_tokens'] + autonomous['output_tokens']}"
+                f" tok/{autonomous['requests']} req"
             )
             if rolling_seconds > 0:
                 rolling = self.rolling_usage(window_seconds=rolling_seconds).get(
