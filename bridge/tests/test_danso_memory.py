@@ -11,6 +11,7 @@ from telegram_bot.core.agent_runtime import SessionRequest
 from telegram_bot.core.danso_runtime import build_danso_runtime, probe_danso_readiness
 from telegram_bot.core.memory_audience import MemoryAudience, audience_from_danso_environment
 from test_danso_runtime import configured, anyio_backend  # noqa: F401
+from test_report_style import style_home  # noqa: F401
 
 
 @pytest.fixture
@@ -39,6 +40,65 @@ def route(settings, scope='private-'+'a'*32):
 def request(settings, environment, session_id=None):
     return SessionRequest(working_directory=settings.danso_workspace,
                           memory_environment=environment, session_id=session_id)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["off", "materializer", "native-read"])
+async def test_report_style_reaches_each_dispatch_and_disarms(memory_settings, style_home, mode):  # noqa: F811
+    updates = {"claude_settings_path": style_home / "settings.json"}
+    if mode == "off":
+        updates["bridge_memory_mode"] = "off"
+    if mode == "native-read":
+        updates["danso_native_memory"] = "native-read"
+    settings = memory_settings.model_copy(update=updates)
+    runtime = build_danso_runtime(settings)
+    session = await runtime.start_or_resume(request(settings, None if mode == "off" else route(settings)))
+    flag = style_home / "state/report-style-canary.flag"
+
+    async def dispatch():
+        events = [e async for e in session.send_turn("synthetic")]
+        assert events[-1].kind == "completion", events
+        argv = json.loads((Path(settings.danso_workspace) / "argv.json").read_text())
+        if "--system-context-file" not in argv:
+            return argv, ""
+        path = Path(argv[argv.index("--system-context-file") + 1])
+        assert path.stat().st_mode & 0o777 == 0o600
+        return argv, path.read_text()
+
+    _, before = await dispatch()
+    assert "STE 80%" not in before
+    flag.write_text("end: fixture")
+    flag.chmod(0o600)
+    argv, armed = await dispatch()
+    assert armed.count("STE 80% 규칙") == 1
+    assert "STE 80%" not in json.dumps(argv)
+    assert Path(session.runtime.environment["HOME"]) != style_home.parent
+    if mode == "materializer":
+        assert "PRIVATE_SENTINEL" in armed
+        shared = await runtime.start_or_resume(request(settings, route(settings, "shared")))
+        shared_path = await shared.runtime.system_context_loader()
+        shared_text = shared_path.read_text()
+        assert "SHARED_SENTINEL" in shared_text and "PRIVATE_SENTINEL" not in shared_text
+    if mode == "native-read":
+        assert argv[argv.index("--memory") + 1] == "read"
+    flag.unlink()
+    _, disarmed = await dispatch()
+    assert "STE 80%" not in disarmed
+    if mode == "materializer":
+        assert "PRIVATE_SENTINEL" in disarmed
+
+
+@pytest.mark.anyio
+async def test_optional_style_does_not_overflow_native_file_budget(memory_settings, style_home, tmp_path):  # noqa: F811
+    from telegram_bot.core.danso_memory import report_style_context_loader
+    memory = tmp_path / "memory.md"
+    memory.write_text("x" * 32768)
+    memory.chmod(0o600)
+    (style_home / "state/report-style-canary.flag").touch()
+    (style_home / "state/report-style-canary.flag").chmod(0o600)
+    settings = memory_settings.model_copy(update={"claude_settings_path": style_home / "settings.json"})
+    loader = report_style_context_loader(settings, tmp_path / "context", AsyncMock(return_value=memory))
+    assert await loader() == memory
 
 
 @pytest.mark.anyio

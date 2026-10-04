@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 from telegram_bot.core.agent_runtime import ModelInfo, SessionRequest, deny_approval
 from telegram_bot.core.danso_worker import DansoRuntime as WorkerRuntime
-from telegram_bot.core.danso_memory import prepare_memory_context
+from telegram_bot.core.danso_memory import prepare_memory_context, report_style_context_loader
 from telegram_bot.core.memory_audience import audience_from_danso_environment, shared_memory_audience
 from telegram_bot.core.skill_usage import SkillUsageSink
 from telegram_bot.core.turn_stall import register_turn_liveness
@@ -399,7 +399,8 @@ class DansoRuntime(WorkerRuntime):
                     loader = load_context
                 kwargs = dict(self._worker_kwargs)
                 kwargs.update(state_directory=self.root / audience.scope,
-                              system_context_loader=loader,
+                              system_context_loader=report_style_context_loader(
+                                  self.memory_settings, self.root / audience.scope, loader),
                               native_memory_args=native_args)
                 if self.skill_usage_sink is not None:
                     kwargs["skill_usage_sink"] = self.skill_usage_sink.for_session(audience.hook_environment(self.memory_settings))
@@ -494,6 +495,7 @@ def build_danso_runtime(settings: Settings) -> DansoRuntime:
     if memory_settings is not None:
         journals += "-audience"
     return DansoRuntime(binary=binary, state_directory=root / journals, memory_settings=memory_settings,
+                        system_context_loader=report_style_context_loader(settings, root / journals),
                         provider=provider, model=model,
                         skill_usage_sink=SkillUsageSink({
                             **os.environ,

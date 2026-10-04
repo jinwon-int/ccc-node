@@ -9,6 +9,36 @@ from telegram_bot.core.danso_worker import _read, _stop, _wait_owned
 from telegram_bot.core.memory_audience import MemoryAudience
 from telegram_bot.utils.config import Settings
 from telegram_bot.utils.secure_fs import ensure_private_directory, read_owner_only_bytes, SecureFsError
+from telegram_bot.utils.secure_fs import atomic_write_text
+from telegram_bot.utils.report_style import read_report_style
+
+
+def report_style_context_loader(settings: Settings, root: Path, memory_loader=None):
+    """Compose style before untrusted memory; keep every audience file separate.
+
+    Invoked for every native dispatch, including resumed turns. The optional
+    style never requires memory mode or access to the private provider HOME.
+    """
+    async def load_context() -> Path | None:
+        memory = await memory_loader() if memory_loader is not None else None
+        style = read_report_style(Path(settings.claude_settings_path).expanduser().parent,
+                                  environ=os.environ)
+        if not style:
+            return memory
+        body = style + "\n\n"
+        if memory is not None:
+            data, _ = read_owner_only_bytes(memory, max_bytes=32768, exact_mode=0o600,
+                                           require_nonempty=True)
+            body += data.decode("utf-8")
+        if len(body.encode("utf-8")) > 32768:
+            # Native system-context files have a finite budget. Preserve the
+            # valid memory snapshot when optional prose policy cannot fit.
+            return memory
+        ensure_private_directory(root)
+        target = root / "report-style-context.md"
+        atomic_write_text(target, body, mode=0o600)
+        return target
+    return load_context
 
 
 async def prepare_memory_context(settings: Settings, audience: MemoryAudience) -> Path:
