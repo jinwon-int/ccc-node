@@ -18,21 +18,7 @@ case "$EVENT" in SessionStart|PostCompact) ;; *) exit 0 ;; esac
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
 HOOK_DIR="${CCC_HOOK_DIR:-$CLAUDE_DIR/hooks}"
-FLAG="$CLAUDE_DIR/state/report-style-canary.flag"
-RULE="$HOOK_DIR/lib/report-style-ste.txt"
-
-[ -f "$FLAG" ] || exit 0
-rule="$(cat "$RULE" 2>/dev/null)"
-[ -n "$rule" ] || exit 0   # rule text missing: stay silent rather than inject a stub
-
-# First non-empty line of the flag, if any, is the operator's window note
-# (e.g. "end: 2026-10-09 18:00 KST"); bounded so a stray large file cannot
-# bloat the context.
-note="$(grep -m1 -E '\S' "$FLAG" 2>/dev/null | cut -c1-160)"
-ctx="$rule"
-[ -n "$note" ] && ctx="$ctx
-(카나리 메모: $note)"
-
-jq -n --arg ctx "$ctx" --arg event "$EVENT" \
-  '{hookSpecificOutput:{hookEventName:$event,additionalContext:$ctx}}' 2>/dev/null
+# setup installs the shared reader before the hook tree. All three providers
+# use identical bounded reads and Unicode-safe note clipping.
+python3 "$HOOK_DIR/ccc_report_style.py" "$CLAUDE_DIR" "$EVENT" 2>/dev/null
 exit 0

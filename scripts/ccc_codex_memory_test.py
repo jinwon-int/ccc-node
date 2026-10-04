@@ -143,6 +143,29 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
             self.module.materialize_snapshot("MEMORY", self.options(**extra))
             self.assertNotIn("STE_SENTINEL", (self.codex_home / "AGENTS.md").read_text())
 
+    def test_report_style_does_not_block_low_budget_or_evict_memory(self):
+        claude = self.home / ".claude"
+        (claude / "state").mkdir(parents=True)
+        (claude / "hooks/lib").mkdir(parents=True)
+        shutil.copyfile(ROOT / "claude/hooks/lib/report-style-ste.txt",
+                        claude / "hooks/lib/report-style-ste.txt")
+        options = self.options(CCC_CODEX_AGENTS_BUDGET_BYTES="2048")
+        self.module.materialize_snapshot("SYNTHETIC MEMORY", options)
+        target = self.codex_home / "AGENTS.md"
+        original = target.read_text()
+        (claude / "state/report-style-canary.flag").touch()
+        self.assertTrue(self.module.snapshot_status(options).is_ready)
+        self.assertEqual(self.module.materialize_snapshot("SYNTHETIC MEMORY", options).status, "unchanged")
+        self.assertEqual(target.read_text(), original)
+        # Operator text consumes a larger configured budget in the same way.
+        target.write_text("Operator rule.\n" * 140 + original)
+        expanded = self.options(CCC_CODEX_AGENTS_BUDGET_BYTES="4096")
+        self.module.materialize_snapshot("SYNTHETIC MEMORY", expanded)
+        self.assertIn("SYNTHETIC MEMORY", target.read_text())
+        self.assertTrue(target.read_text().startswith("Operator rule.\n" * 140))
+        self.assertNotIn("STE 80%", target.read_text())
+        self.assertTrue(self.module.snapshot_status(expanded).is_ready)
+
     def test_shared_atomic_write_error_keeps_body_free_materializer_code(self) -> None:
         with mock.patch.object(
             self.module._secure_fs,

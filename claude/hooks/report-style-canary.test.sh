@@ -30,6 +30,7 @@ export CCC_CLAUDE_DIR="$HOME_DIR/.claude"
 export CCC_HOOK_DIR="$TMP/hooks"
 mkdir -p "$CCC_CLAUDE_DIR/state" "$CCC_HOOK_DIR/lib"
 cp "$HERE/lib/report-style-ste.txt" "$CCC_HOOK_DIR/lib/report-style-ste.txt"
+cp "$HERE/../../bridge/utils/report_style.py" "$CCC_HOOK_DIR/ccc_report_style.py"
 FLAG="$CCC_CLAUDE_DIR/state/report-style-canary.flag"
 
 run_hook() { bash "$HOOK" "$@"; }

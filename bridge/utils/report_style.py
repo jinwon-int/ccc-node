@@ -46,3 +46,15 @@ def read_report_style(claude_dir: Path, *, environ: Mapping[str, str]) -> str:
         return rule + (f"\n(카나리 메모: {note})" if note else "")
     except (OSError, UnicodeError, ValueError):
         return ""
+
+
+if __name__ == "__main__":
+    import json
+    import sys
+
+    if len(sys.argv) == 3 and sys.argv[2] in {"SessionStart", "PostCompact"}:
+        context = read_report_style(Path(sys.argv[1]), environ=os.environ)
+        if context:
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": sys.argv[2], "additionalContext": context,
+            }}, ensure_ascii=False))

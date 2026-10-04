@@ -19,16 +19,20 @@ def style_home(tmp_path):
     (claude / "hooks/lib").mkdir(parents=True)
     shutil.copyfile(REPO / "claude/hooks/lib/report-style-ste.txt",
                     claude / "hooks/lib/report-style-ste.txt")
+    shutil.copyfile(REPO / "bridge/utils/report_style.py", claude / "hooks/ccc_report_style.py")
     return claude
 
 
-@pytest.mark.parametrize("note", ["", "\nend: fixture\nignored", "x" * 400])
+@pytest.mark.parametrize("note", ["", "\nend: fixture\nignored", "x" * 400, "가" * 200])
 def test_claude_and_python_emit_identical_rules(style_home, note):
     (style_home / "state/report-style-canary.flag").write_text(note)
     env = {"PATH": os.defpath, "CCC_CLAUDE_DIR": str(style_home)}
     result = subprocess.run(["bash", str(REPO / "claude/hooks/report-style-canary.sh")],
                             env=env, text=True, capture_output=True, check=True)
     assert read_report_style(style_home, environ=env) == json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+    if note.startswith("가"):
+        assert "가" * 160 in read_report_style(style_home, environ=env)
+        assert "가" * 161 not in read_report_style(style_home, environ=env)
 
 
 @pytest.mark.parametrize("bad", ["missing", "symlink", "directory", "fifo", "writable", "large", "invalid"])

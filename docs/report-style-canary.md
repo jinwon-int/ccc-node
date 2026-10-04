@@ -23,13 +23,15 @@ reports before changing the fleet-wide `ccc-report` output style.
   `ccc-codex` runs and bridge session starts/resumes. It puts the prose policy
   **before** the untrusted memory section. Flag/rule changes invalidate the
   otherwise unchanged snapshot, and stale policy cannot pass fallback readiness.
+  Memory and operator instructions get the byte budget first; when the optional
+  style does not fit, it is omitted without blocking the invocation.
 - Danso's Telegram/Matrix bridge composes a private `--system-context-file`
   on each dispatch, including resumed turns, in memory-off, materializer and
   native-read modes. It uses the node's `claude_settings_path`, not the isolated
   provider HOME. Audience files remain separate; the style precedes memory.
   If style plus memory exceeds the native 32 KiB file budget, memory is retained
   and the optional style is omitted. Raw standalone Danso runs are not wired.
-- Python consumers use `bridge/utils/report_style.py` (also installed as
+- All three providers use `bridge/utils/report_style.py` (also installed as
   `hooks/ccc_report_style.py`). The text still has one source. Missing, invalid,
   symlinked or group/world-writable flag/rule files are ignored. The flag is
   bounded to 4 KiB, the rule to 16 KiB, and the note to 160 characters.

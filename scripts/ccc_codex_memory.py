@@ -463,9 +463,18 @@ def _policy_matches(text: str, parsed: _ParsedBlock, options: MaterializeOptions
     expected, _ = _render_block(
         parsed.snapshot or "", materialized_at=parsed.materialized_at or "",
         read_only=options.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") == "danso",
-        report_style=report_style,
     )
+    expected = _add_optional_style(expected, text, parsed, report_style, options.agents_budget_bytes)
     return text[parsed.start:parsed.end] == expected
+
+
+def _add_optional_style(block: str, text: str, parsed: _ParsedBlock | None,
+                        report_style: str, budget: int) -> str:
+    if report_style:
+        styled = block.replace(SNAPSHOT_DELIMITER, report_style + "\n\n" + SNAPSHOT_DELIMITER, 1)
+        if len(_merge_block(text, parsed, styled).encode("utf-8")) <= budget:
+            return styled
+    return block
 
 
 def _merge_block(text: str, parsed: _ParsedBlock | None, block: str) -> str:
@@ -582,7 +591,6 @@ def materialize_snapshot(snapshot: str, options: MaterializeOptions) -> Material
         materialized_at = _secure_fs.utc_now_iso(timespec="auto")
         report_style = _report_style(options)
         block, digest = _render_block(bounded, materialized_at=materialized_at,
-                                      report_style=report_style,
                                       read_only=options.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") == "danso")
         merged = _merge_block(existing_text, parsed, block)
         if len(merged.encode("utf-8")) > options.agents_budget_bytes:
@@ -595,11 +603,15 @@ def materialize_snapshot(snapshot: str, options: MaterializeOptions) -> Material
             if not bounded:
                 raise MaterializeError("codex_budget_exhausted")
             block, digest = _render_block(bounded, materialized_at=materialized_at,
-                                      report_style=report_style,
                                       read_only=options.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER") == "danso")
             merged = _merge_block(existing_text, parsed, block)
             if len(merged.encode("utf-8")) > options.agents_budget_bytes:
                 raise MaterializeError("codex_budget_exhausted")
+
+        # Fit memory/operator instructions first. Optional prose style must
+        # neither evict memory nor turn a supported low budget into exit 78.
+        block = _add_optional_style(block, existing_text, parsed, report_style, options.agents_budget_bytes)
+        merged = _merge_block(existing_text, parsed, block)
 
         existing_snapshot_matches = (
             parsed is not None
