@@ -395,5 +395,18 @@ run env -u CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS bash "$SC" --apply --reset-lane
 ok "#1647: --reset-lane drops the baked cap (sweep default 3 applies again)" \
   '! grep -q "CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS" "$CRON_STORE"'
 
+run bash "$SC" --apply --danso-additional-state-dirs /var/lib/danso-matrix:/var/lib/danso-other
+ok "extra channel source roots are baked" 'grep -qF "CCC_SKILL_DANSO_ADDITIONAL_STATE_DIRS=\"/var/lib/danso-matrix:/var/lib/danso-other\"" "$CRON_STORE"'
+run bash "$SC" --apply
+ok "extra channel roots survive installer rerun" 'grep -qF "CCC_SKILL_DANSO_ADDITIONAL_STATE_DIRS=\"/var/lib/danso-matrix:/var/lib/danso-other\"" "$CRON_STORE"'
+cp "$CRON_STORE" "$TMP/crontab.before-channels"
+run bash "$SC" --apply --danso-additional-state-dirs '/x:relative'
+okc "$RC" 2 "relative additional root rejected"
+ok "bad extra roots preserve installed cron" 'cmp -s "$CRON_STORE" "$TMP/crontab.before-channels"'
+run bash "$SC" --apply --danso-additional-state-dirs '/x:$(id)'
+okc "$RC" 2 "command expansion in additional root rejected"
+run bash "$SC" --apply --reset-lane
+ok "reset removes additional roots" '! grep -q "CCC_SKILL_DANSO_ADDITIONAL_STATE_DIRS" "$CRON_STORE"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -535,9 +535,16 @@ def _config(environment: dict[str, str] | None = None) -> Config:
     )
 
 
-def _private_state_dir(path: Path) -> None:
-    current = Path(path.anchor)
-    for component in path.parts[1:]:
+def _private_state_dir(path: Path, *, trust_root: Path | None = None) -> None:
+    # Android's system-owned /data ancestors need not be owned by the app UID.
+    # Reuse the existing validated HOME anchor; everything below it stays checked.
+    anchored = _anchored_walk(path.absolute(), trust_root) if trust_root is not None else None
+    if anchored is not None and ".." in anchored[1]:
+        anchored = None
+    current, components = anchored if anchored is not None else (Path(path.anchor), path.parts[1:])
+    if not components and stat.S_IMODE(current.lstat().st_mode) & 0o077:
+        raise PromotionError("state_path_unsafe")
+    for component in components:
         current /= component
         try:
             metadata = current.lstat()
@@ -570,7 +577,7 @@ def _promotion_lock(config: Config) -> Iterator[bool]:
     to the ledger or the drop-report state now shares this one lock; read-only
     previews (`collect --dry-run`) deliberately do not take it.
     """
-    _private_state_dir(config.promotion_state_dir)
+    _private_state_dir(config.promotion_state_dir, trust_root=config.home)
     lock_path = config.promotion_state_dir / "promotion.lock"
     try:
         with _secure_fs.flock_guard(lock_path, owner_id=os.geteuid(), exact_mode=0o600) as acquired:
@@ -1501,8 +1508,8 @@ def _stage_candidate(config: Config, candidate: Candidate) -> dict[str, str]:
     _require_description_trigger(candidate.description)
     outbox = config.promotion_state_dir / "outbox"
     sent = config.promotion_state_dir / "sent"
-    _private_state_dir(outbox)
-    _private_state_dir(sent)
+    _private_state_dir(outbox, trust_root=config.home)
+    _private_state_dir(sent, trust_root=config.home)
     transport_id = _transport_id(candidate)
     destination = outbox / f"{transport_id}.json"
     sent_path = sent / destination.name
@@ -1580,8 +1587,8 @@ def _ack_local(config: Config, transport_id: str) -> bool:
         raise PromotionError("ack_id_invalid")
     outbox = config.promotion_state_dir / "outbox"
     sent = config.promotion_state_dir / "sent"
-    _private_state_dir(outbox)
-    _private_state_dir(sent)
+    _private_state_dir(outbox, trust_root=config.home)
+    _private_state_dir(sent, trust_root=config.home)
     source = outbox / f"{transport_id}.json"
     destination = sent / source.name
     if destination.exists():
@@ -1780,7 +1787,7 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
 
 
 def _export_result(config: Config, *, limit: int) -> dict[str, object]:
-    _private_state_dir(config.promotion_state_dir)
+    _private_state_dir(config.promotion_state_dir, trust_root=config.home)
     blocked: list[dict[str, str]] = []
     rows = _pending_envelopes(config, limit=limit, blocked=blocked)
     return {
@@ -5965,7 +5972,7 @@ def _drop_process_acks(
 ) -> list[dict[str, object]]:
     """Record human-processed task ids in the ack state file (local
     bookkeeping only — never touches the ledger or a PR)."""
-    _private_state_dir(config.promotion_state_dir)
+    _private_state_dir(config.promotion_state_dir, trust_root=config.home)
     ack_results = []
     for task_id in acks:
         already = task_id in acked
@@ -6068,7 +6075,8 @@ def _drop_report_unlocked(config: Config, *, acks: list[str]) -> dict[str, objec
     return result
 
 
-def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:
+def _collect(config: Config, *, dry_run: bool, results_only: bool = False) -> dict[str, object]:
+    collector = _collect_results_unlocked if results_only else _collect_unlocked
     if not config.publisher_enabled:
         return {
             "ok": True,
@@ -6095,8 +6103,8 @@ def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:
         # the verdict/revise passes only report `would-poll-*`. It therefore
         # skips promotion.lock so a manual preview neither blocks nor is
         # blocked by the nightly collect waiting on CI (#1477).
-        _private_state_dir(config.promotion_state_dir)
-        return _collect_unlocked(config, dry_run=True)
+        _private_state_dir(config.promotion_state_dir, trust_root=config.home)
+        return collector(config, dry_run=True)
     with _promotion_lock(config) as acquired:
         if not acquired:
             return {
@@ -6108,7 +6116,7 @@ def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:
                 "published": [],
                 "errors": [],
             }
-        return _collect_unlocked(config, dry_run=False)
+        return collector(config, dry_run=False)
 
 
 def _collect_sources(config: Config) -> tuple[tuple[str, str], ...]:
@@ -6402,6 +6410,35 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
             # Publication/ACK/ledger effects are already real. Preserve them;
             # a failed sync can mean the cursor changed but is not durable.
             errors.append({"source": "collect-cursor", "code": error.code})
+    return {
+        "ok": not errors,
+        "mode": "collect-dry-run" if dry_run else "collect",
+        "publisher_enabled": True,
+        "autonomy": config.autonomy,
+        "repo": config.repo,
+        "published": published,
+        "errors": errors,
+        **_collect_completed(config, dry_run=dry_run),
+    }
+
+
+def _collect_results_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
+    """Consume completed work without reading/acking outboxes or admitting new candidates."""
+    _run(["gh", "auth", "status", "--hostname", "github.com"])
+    _require_private_repo(config)
+    return {
+        "ok": True,
+        "mode": "collect-results-dry-run" if dry_run else "collect-results",
+        "publisher_enabled": True,
+        "autonomy": config.autonomy,
+        "repo": config.repo,
+        "published": [],
+        "errors": [],
+        **_collect_completed(config, dry_run=dry_run),
+    }
+
+
+def _collect_completed(config: Config, *, dry_run: bool) -> dict[str, object]:
     revise: dict[str, object] | None = None
     if config.revise_enabled:
         # Three ledger reads on purpose, in this order: _process_verdicts
@@ -6426,17 +6463,7 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
     # rounds switched off, and it must see any verdict rows the passes above
     # appended in this same cycle.
     drain = _collect_drain(config, dry_run=dry_run)
-    return {
-        "ok": not errors,
-        "mode": "collect-dry-run" if dry_run else "collect",
-        "publisher_enabled": True,
-        "autonomy": config.autonomy,
-        "repo": config.repo,
-        "published": published,
-        "errors": errors,
-        "revise": revise,
-        **drain,
-    }
+    return {"revise": revise, **drain}
 
 
 def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
@@ -6468,6 +6495,8 @@ def _parser() -> argparse.ArgumentParser:
     ack_parser.add_argument("transport_id")
     collect_parser = subparsers.add_parser("collect")
     collect_parser.add_argument("--dry-run", action="store_true")
+    collect_parser.add_argument("--results-only", action="store_true",
+                                help="consume reviews/revisions and promote without new outbox intake")
     promote_parser = subparsers.add_parser(
         "promote",
         help=(
@@ -6523,7 +6552,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "backfill-republished":
             result = _backfill_republished(config, dry_run=args.dry_run)
         else:
-            result = _collect(config, dry_run=args.dry_run)
+            result = _collect(config, dry_run=args.dry_run, results_only=args.results_only)
     except PromotionError as error:
         result = {"ok": False, "code": error.code}
     except (OSError, TypeError, ValueError, RecursionError):

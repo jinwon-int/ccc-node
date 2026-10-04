@@ -1178,3 +1178,26 @@ handler failure and handler signals therefore retain no payload pathname.
 Missing handlers fail without dispatch; an unlink failure is reported and also
 prevents dispatch. The existing handler PID, stdout and exit-status contract is
 preserved. This affects review, revise and default routes alike.
+
+
+### Frequent review-result collection
+
+A publisher can run `ccc-skill-promotion.py collect --results-only` every 15 minutes
+with its normal publisher edge environment. This takes the same promotion lock,
+honors publisher opt-in, autonomy kill/dry-run and private-repository validation,
+and consumes review/revision results plus the normal promotion drain. It does not
+read or acknowledge local/remote outboxes, publish new outbox candidates, or advance
+the intake rotation cursor. The daily full collect remains the sole new-outbox
+admission schedule. Existing daily revision/lineage budgets and protected PR approval
+requirements still apply. A locked run is a clean skip; retry at the next interval.
+
+For separate Danso channel journals, install with `--danso-additional-state-dirs
+/absolute/channel-state:/absolute/another-state` alongside the existing
+`--danso-state-dir` and `--danso-drafting`. The installer preserves this setting on
+rerun; `--reset-lane` clears it. Sources share the same total draft budget and primary
+install target. Additional roots get distinct projection/seen-ledger namespaces,
+so identical journal IDs in two channel roots do not suppress each other.
+
+Staging failures now include a body-free error code in the autosave log. Android
+state directory creation uses the same validated app-HOME anchor as read-side checks;
+unsafe permissions or symlinks below the anchor still fail closed.
