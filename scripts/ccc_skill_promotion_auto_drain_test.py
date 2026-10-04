@@ -270,5 +270,67 @@ class PromoteMergeSweepTests(unittest.TestCase):
         self.assertEqual([r["outcome"] for r in out], ["merge-failed"])
 
 
+class ResultsOnlyTests(unittest.TestCase):
+    def test_results_only_never_reads_or_acks_outboxes(self):
+        from tempfile import TemporaryDirectory
+        from contextlib import ExitStack
+        with TemporaryDirectory() as tmp, ExitStack() as stack:
+            cfg = promotion._config({"HOME": tmp, "CCC_NODE": "testnode",
+                                     "CCC_SKILL_PROMOTION_PUBLISHER": "true"})
+            stack.enter_context(patch.object(promotion, "_run"))
+            private = stack.enter_context(patch.object(promotion, "_require_private_repo"))
+            completed = stack.enter_context(patch.object(promotion, "_collect_completed", return_value={"revise": None}))
+            for name in ("_collect_envelopes", "_write_collect_cursor", "_publish", "_remote_ack", "_ack_local"):
+                stack.enter_context(patch.object(promotion, name, side_effect=AssertionError("new intake forbidden")))
+            result = promotion._collect(cfg, dry_run=False, results_only=True)
+            self.assertEqual(result["mode"], "collect-results")
+            self.assertEqual(result["published"], [])
+            private.assert_called_once_with(cfg)
+            completed.assert_called_once_with(cfg, dry_run=False)
+            self.assertFalse((cfg.promotion_state_dir / "outbox").exists())
+
+    def test_results_only_honors_disabled_kill_dryrun_and_lock(self):
+        from tempfile import TemporaryDirectory
+        from dataclasses import replace
+        with TemporaryDirectory() as tmp:
+            cfg = promotion._config({"HOME": tmp, "CCC_NODE": "testnode",
+                                     "CCC_SKILL_PROMOTION_PUBLISHER": "true"})
+            with patch.object(promotion, "_collect_results_unlocked", return_value={"ok": True}) as run:
+                promotion._collect(replace(cfg, publisher_enabled=False), dry_run=False, results_only=True)
+                promotion._collect(replace(cfg, autonomy="kill"), dry_run=False, results_only=True)
+                run.assert_not_called()
+                with promotion._promotion_lock(cfg) as acquired:
+                    self.assertTrue(acquired)
+                    result = promotion._collect(cfg, dry_run=False, results_only=True)
+                    self.assertEqual(result["status"], "locked")
+                run.assert_not_called()
+                promotion._collect(replace(cfg, autonomy="dry-run"), dry_run=False, results_only=True)
+                run.assert_called_once_with(replace(cfg, autonomy="dry-run"), dry_run=True)
+
+    def test_android_state_anchor_preserves_descendant_checks(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            system = Path(tmp) / "system"
+            home = system / "app-home"
+            home.mkdir(parents=True, mode=0o700)
+            system.chmod(0o777)
+            state = home / "state" / "promotion"
+            with self.assertRaises(promotion.PromotionError):
+                promotion._private_state_dir(state)
+            promotion._private_state_dir(state, trust_root=home)
+            self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+            (home / "state").chmod(0o777)
+            with self.assertRaises(promotion.PromotionError):
+                promotion._private_state_dir(state, trust_root=home)
+            (home / "state").chmod(0o700)
+            link = home / "link"
+            link.symlink_to(state, target_is_directory=True)
+            with self.assertRaises(promotion.PromotionError):
+                promotion._private_state_dir(link / "child", trust_root=home)
+            with self.assertRaises(promotion.PromotionError):
+                promotion._private_state_dir(home / ".." / "escaped", trust_root=home)
+            self.assertFalse((system / "escaped").exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)

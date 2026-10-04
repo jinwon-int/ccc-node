@@ -609,6 +609,19 @@ else
     if [ ! -f "$danso_normalizer" ]; then
       log "danso skipped reason=no-normalizer"
     else
+      # Additional channel roots share the same draft budget and install target.
+      danso_sources=("$danso_state")
+      IFS=: read -r -a _danso_extra <<< "${CCC_SKILL_DANSO_ADDITIONAL_STATE_DIRS:-}"
+      for _source in "${_danso_extra[@]}"; do
+        case "$_source" in /*) ;; *) continue ;; esac
+        [[ "$_source" != *$'\n'* ]] || continue
+        _source="${_source%/}"
+        _duplicate=0
+        for _known in "${danso_sources[@]}"; do
+          [ "${_known%/}" = "$_source" ] && _duplicate=1
+        done
+        [ "$_duplicate" = 1 ] || danso_sources+=("$_source")
+      done
       danso_tree="$STATE_DIR/danso-normalized"
       danso_ledger="$STATE_DIR/skill-autosave.danso-seen"
       mkdir -p "$danso_tree" 2>/dev/null
@@ -623,7 +636,15 @@ else
         [ "$danso_drafted" -ge "$MAX_SESSIONS" ] && break
         total_budget_spent danso && break
         [ -f "$journal" ] || continue
-        jid="$(basename "$journal" .jsonl)"
+        journal_state="$danso_state"
+        source_tag=""
+        for _source in "${danso_sources[@]}"; do
+          case "$journal" in "${_source%/}"/*) journal_state="$_source"; break ;; esac
+        done
+        if [ "${journal_state%/}" != "${danso_state%/}" ]; then
+          source_tag="$(printf '%s' "$journal_state" | sha256sum | cut -c1-12)-"
+        fi
+        jid="$source_tag$(basename "$journal" .jsonl)"
         size="$(wc -c < "$journal" 2>/dev/null | tr -d '[:space:]')"
         case "$size" in ''|*[!0-9]*) size=0 ;; esac
         last_size="$(awk -F'\t' -v s="$jid" '$1==s {sz=$3} END {print sz+0}' "$danso_ledger" 2>/dev/null)"
@@ -631,8 +652,8 @@ else
         if [ "$last_size" -gt 0 ] && [ $((size - last_size)) -lt "$REGROWTH_BYTES" ]; then
           continue
         fi
-        rel="${journal#"$danso_state"/}"
-        project_enc="$(printf '%s' "${rel%/*}" | sed -E 's|[^A-Za-z0-9._]|-|g' | cut -c1-96)"
+        rel="${journal#"${journal_state%/}"/}"
+        project_enc="$(printf '%s' "$source_tag${rel%/*}" | sed -E 's|[^A-Za-z0-9._]|-|g' | cut -c1-96)"
         summary="$(python3 "$danso_normalizer" "$journal" --out-dir "$danso_tree" --lock --project-enc "$project_enc" 2>>"$LOG")" || {
           log "danso normalize failed session=$jid (non-fatal)"
           continue
@@ -674,10 +695,12 @@ else
           log "danso review failed session=$jid (non-fatal)"
         fi
       done < <(
-        for _danso_root in "$danso_state/journals" "$danso_state/journals-audience" \
-                            "$danso_state/chatgpt-journals" "$danso_state/chatgpt-journals-audience" \
-                            "$danso_state/glm-journals" "$danso_state/glm-journals-audience"; do
-          find "$_danso_root" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" -print0 2>/dev/null
+        for _source in "${danso_sources[@]}"; do
+          for _danso_root in "$_source/journals" "$_source/journals-audience" \
+                              "$_source/chatgpt-journals" "$_source/chatgpt-journals-audience" \
+                              "$_source/glm-journals" "$_source/glm-journals-audience"; do
+            find "$_danso_root" -name '*.jsonl' -type f -mtime -"$WINDOW_DAYS" -print0 2>/dev/null
+          done
         done | xargs -0 -r ls -t 2>/dev/null
       )
       log "danso sweep done drafted_sessions=$danso_drafted"
@@ -765,7 +788,7 @@ if [ -f "$PROMOTER" ] && command -v python3 >/dev/null 2>&1; then
   [ "$AUTONOMY_STATE" = "dry-run" ] && promotion_args="run --dry-run"
   summary="$(python3 "$PROMOTER" $promotion_args 2>>"$LOG")" \
     && log "promotion-stage $(printf '%s' "$summary" | head -c 500)" \
-    || log "promotion-stage failed (non-fatal)"
+    || log "promotion-stage failed (non-fatal) code=$(printf '%s' "$summary" | jq -r '(.code // "unknown") | if test("^[a-z0-9_]+$") then . else "unknown" end' 2>/dev/null)"
   collect_args="collect"
   [ "$AUTONOMY_STATE" = "dry-run" ] && collect_args="collect --dry-run"
   # #1766: only `collect` dispatches the A2A intake review round, and that needs

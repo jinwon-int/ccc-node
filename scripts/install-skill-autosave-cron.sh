@@ -56,6 +56,7 @@ OPT_PROMOTION_PROVIDERS=""
 # baked into the entry itself, exactly like the #1655 provider lane.
 OPT_DANSO_DRAFTING=0
 OPT_DANSO_STATE_DIR=""
+OPT_DANSO_ADDITIONAL_STATE_DIRS=""
 # #1867: a re-run without the lane flags used to re-render the managed block
 # from scratch and silently drop the provider/drafting/state-dir env the
 # previous install baked (a piri node lost CCC_SKILL_PROVIDER=piri and
@@ -211,6 +212,7 @@ Options:
   --codex-drafting Bake CCC_SKILL_CODEX_DRAFTING=1 into the entry.
   --danso-drafting Bake CCC_SKILL_DANSO_DRAFTING=1 into the entry (opt-in
                    danso journal drafting sweep branch, #1660).
+  --danso-additional-state-dirs PATH:PATH  Additional channel journal sources; shared budget
   --danso-state-dir PATH
                    Bake CCC_DANSO_STATE_DIR=PATH into the entry so the
                    scheduled sweep resolves the bridge-fixed danso HOME
@@ -276,6 +278,10 @@ while [ $# -gt 0 ]; do
     --codex-drafting) OPT_CODEX_DRAFTING=1 ;;
     --danso-drafting) OPT_DANSO_DRAFTING=1 ;;
     --reset-lane) OPT_RESET_LANE=1 ;;
+    --danso-additional-state-dirs)
+      ccc_cron_need_val "$1" "${2:-}"
+      OPT_DANSO_ADDITIONAL_STATE_DIRS="$2"
+      shift ;;
     --danso-state-dir)
       ccc_cron_need_val "$1" "${2:-}"
       OPT_DANSO_STATE_DIR="$2"
@@ -413,6 +419,24 @@ if [ "$CRON_PROVIDER" = "danso" ] && [ -z "$CRON_DANSO_STATE_DIR" ]; then
 fi
 [ -n "$CRON_DANSO_STATE_DIR" ] && CRON_ENV="$CRON_ENV CCC_DANSO_STATE_DIR=\"$CRON_DANSO_STATE_DIR\""
 [ "$OPT_DANSO_DRAFTING" = 1 ] && CRON_ENV="$CRON_ENV CCC_SKILL_DANSO_DRAFTING=1"
+
+# Preserve explicit additional channel sources across installer reruns.
+CRON_DANSO_ADDITIONAL="$OPT_DANSO_ADDITIONAL_STATE_DIRS"
+if [ -z "$CRON_DANSO_ADDITIONAL" ]; then
+  CRON_DANSO_ADDITIONAL="$(baked_value CCC_SKILL_DANSO_ADDITIONAL_STATE_DIRS)"
+fi
+if [ -n "$CRON_DANSO_ADDITIONAL" ]; then
+  IFS=: read -r -a _extra_sources <<< "$CRON_DANSO_ADDITIONAL"
+  for _source in "${_extra_sources[@]}"; do
+    if ! danso_state_dir_ok "$_source" || [[ "$_source" = *$'\n'* ]] || [[ "$_source" = *$'\r'* ]]; then
+      echo "invalid --danso-additional-state-dirs (colon-separated absolute paths)" >&2
+      exit 2
+    fi
+  done
+  [[ "$CRON_DANSO_ADDITIONAL" != *$'\n'* && "$CRON_DANSO_ADDITIONAL" != *$'\r'* ]] || exit 2
+  CRON_ENV="$CRON_ENV CCC_SKILL_DANSO_ADDITIONAL_STATE_DIRS=\"$CRON_DANSO_ADDITIONAL\""
+fi
+
 # --promotion-providers > inherited \$CCC_SKILL_PROMOTION_PROVIDERS > omitted
 CRON_PROMOTION_PROVIDERS="$OPT_PROMOTION_PROVIDERS"
 if [ -z "$CRON_PROMOTION_PROVIDERS" ] && [ -n "${CCC_SKILL_PROMOTION_PROVIDERS:-}" ]; then
@@ -471,6 +495,7 @@ record_argv=(--apply --schedule "$SCHEDULE")
 [ "$OPT_CODEX_DRAFTING" = 1 ] && record_argv+=(--codex-drafting)
 [ "$OPT_DANSO_DRAFTING" = 1 ] && record_argv+=(--danso-drafting)
 [ -n "$CRON_DANSO_STATE_DIR" ] && record_argv+=(--danso-state-dir "$CRON_DANSO_STATE_DIR")
+[ -n "$CRON_DANSO_ADDITIONAL" ] && record_argv+=(--danso-additional-state-dirs "$CRON_DANSO_ADDITIONAL")
 [ -n "$CRON_PROMOTION_PROVIDERS" ] && record_argv+=(--promotion-providers "$CRON_PROMOTION_PROVIDERS")
 [ -n "$CRON_TOTAL_MAX_SESSIONS" ] && record_argv+=(--total-max-sessions "$CRON_TOTAL_MAX_SESSIONS")
 

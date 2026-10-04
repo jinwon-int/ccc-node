@@ -463,6 +463,20 @@ run10
 after10="$(grep -c "danso review ok" "$STATE_DANSO/skill-autosave.log")"
 ok "unchanged danso journal not re-drafted" '[ "$after10" = "$before10" ]'
 
+# Extra channel root with the same journal UUID must not collide with primary.
+DANSO_EXTRA="$TMP/danso-extra"
+mkdir -p "$DANSO_EXTRA/journals"
+cp "$JROOT/1e0a9d2e-0000-4000-8000-000000000001.jsonl" "$DANSO_EXTRA/journals/1e0a9d2e-0000-4000-8000-000000000001.jsonl"
+CCC_SKILL_DANSO_ADDITIONAL_STATE_DIRS="$DANSO_EXTRA:$DANSO_STATE_FIX" run10
+ok "second channel same UUID is independently ledgered" '[ "$(wc -l < "$STATE_DANSO/skill-autosave.danso-seen")" = 2 ]'
+extra_count="$(grep -c "danso review ok" "$STATE_DANSO/skill-autosave.log")"
+CCC_SKILL_DANSO_ADDITIONAL_STATE_DIRS="$DANSO_EXTRA:$DANSO_STATE_FIX" run10
+ok "channel rerun and duplicate root do not redraft" '[ "$(grep -c "danso review ok" "$STATE_DANSO/skill-autosave.log")" = "$extra_count" ]'
+# Existing shared budget applies across both roots.
+rm "$STATE_DANSO/skill-autosave.danso-seen"
+CCC_SKILL_DANSO_ADDITIONAL_STATE_DIRS="$DANSO_EXTRA" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=1 run10
+ok "channel roots share the total budget" '[ "$(wc -l < "$STATE_DANSO/skill-autosave.danso-seen")" = 1 ]'
+
 # 9d) opt-in on a node without piri sessions is a clean no-op.
 STATE10="$TMP/state10"; mkdir -p "$STATE10"; chmod 700 "$STATE10"
 printf '1\n' > "$STATE10/skill-autosave.piri-drafting"
