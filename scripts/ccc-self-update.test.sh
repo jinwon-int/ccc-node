@@ -788,6 +788,18 @@ ok "--force bypasses the worker gate" '[ "$rc" != 8 ]'
 clr_defer
 out="$(CCC_SELF_UPDATE_BUSY_MAX_SECONDS=1 run_selfup run 2>&1)"; rc=$?
 ok "handler older than busy-max proceeds (hung task)" '[ "$rc" = 0 ]'
+# A leftover child older than busy-max must not mask a fresh handler.
+sleep 300 & wleft=$!
+sleep 4.2
+sleep 300 & wfresh=$!
+clr_defer; printf '%s\n%s\n%s\n' "$wmain" "$wleft" "$wfresh" > "$WPROCS"
+out="$(CCC_SELF_UPDATE_BUSY_MAX_SECONDS=4 run_selfup run 2>&1)"; rc=$?
+ok "old leftover child does not mask a fresh handler" '[ "$rc" = 8 ] && grep -q "procs=1 " <<<"$out"'
+clr_defer; printf '%s\n%s\n' "$wmain" "$wleft" > "$WPROCS"
+out="$(CCC_SELF_UPDATE_BUSY_MAX_SECONDS=4 run_selfup run 2>&1)"; rc=$?
+ok "old leftover child alone does not defer" '[ "$rc" = 0 ]'
+kill "$wleft" "$wfresh" 2>/dev/null; wait "$wleft" "$wfresh" 2>/dev/null
+printf '%s\n%s\n' "$wmain" "$whandler" > "$WPROCS"
 echo "$(( $(date +%s) - 7200 ))" > "$STATE/self-update.deferred-since"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "worker deferral cap exceeded proceeds" '[ "$rc" = 0 ] && [ ! -f "$STATE/self-update.deferred-since" ]'

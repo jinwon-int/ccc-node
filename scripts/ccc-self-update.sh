@@ -803,9 +803,12 @@ worker_cgroup_procs() {
   return 1
 }
 
-# Echo "procs=N oldest=Ss" and return 0 when the cgroup holds handler children
-# (every pid but the longest-lived one, the worker itself) younger than the
-# busy-max; return 1 otherwise.
+# Echo "procs=N oldest=Ss" and return 0 when the cgroup holds at least one
+# handler child (any pid but the longest-lived one, the worker itself) younger
+# than the busy-max; return 1 otherwise. Every child is judged on its own: a
+# long-lived leftover (an orphaned helper from an earlier task) must neither
+# mask a fresh handler nor keep the gate busy past the busy-max. N and S cover
+# only the children under the busy-max.
 worker_cgroup_busy() {
   python3 - "$1" "$BUSY_MAX_SECONDS" <<'PY'
 import os, sys
@@ -825,10 +828,10 @@ for pid in pids:
         continue  # exited between the two reads
     ages.append(uptime - start / tick)
 ages.sort(reverse=True)
-children = ages[1:]
-if not children or children[0] >= busy_max:
+live = [age for age in ages[1:] if age < busy_max]
+if not live:
     sys.exit(1)
-print("procs=%d oldest=%ds" % (len(children), int(children[0])))
+print("procs=%d oldest=%ds" % (len(live), int(max(live))))
 PY
 }
 
