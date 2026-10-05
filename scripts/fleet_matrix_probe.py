@@ -53,6 +53,50 @@ def _agent_error_is_stale(data: dict, now: float, max_error_age: int) -> bool:
     return succeeded_at is None or succeeded_at <= failed_at
 
 
+# The Matrix frontend keeps a body-free rapid-crash record next to health.json
+# (bridge/core/matrix/lifecycle.py CrashBudget). A `streak` of this many rapid
+# unclean exits in a row means the unit is crash-looping: on 2026-10-01 jingun
+# restarted 957 times on a DNS failure and every daily watch saw a fresh
+# process that had not yet written health.json, so the verdict read
+# `UNVERIFIED health-pid` instead of naming the outage (ccc-node#2141).
+CRASH_LOOP_STREAK = 2
+CRASH_BUDGET_FILENAME = "crash-budget.json"
+
+
+def _crash_streak(data_dir: Path) -> int:
+    """Rapid unclean exits recorded before the running process; 0 when unknown."""
+    path = data_dir / CRASH_BUDGET_FILENAME
+    try:
+        if path.stat().st_size > 64 * 1024:
+            return 0
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(record, dict) or record.get("running") is not True:
+        return 0
+    streak = record.get("streak")
+    if isinstance(streak, bool) or not isinstance(streak, int):
+        return 0
+    return max(0, streak)
+
+
+def _pid_mismatch(proc_root: Path, data_dir: Path, recorded: object) -> tuple[str, str]:
+    """Classify a running Matrix process whose pid is not the one in health.json."""
+    if _crash_streak(data_dir) >= CRASH_LOOP_STREAK:
+        return "DOWN", "crash-loop"
+    writer_alive = (
+        isinstance(recorded, int)
+        and not isinstance(recorded, bool)
+        and recorded > 0
+        and (proc_root / str(recorded)).exists()
+    )
+    if writer_alive:
+        # Another live process owns this health.json — a second writer.
+        return "UNVERIFIED", "health-pid"
+    # The writer is gone and its successor has not reported yet: a restart.
+    return "UNVERIFIED", "health-pid-restarting"
+
+
 def _fields(path: Path) -> list[bytes] | None:
     try:
         return [part for part in path.read_bytes().split(b"\0") if part]
@@ -165,7 +209,7 @@ def probe(
         return "UNVERIFIED", "health-shape"
     process = data["process"]
     if process.get("pid") != pid:
-        return "UNVERIFIED", "health-pid"
+        return _pid_mismatch(proc_root, data_dir, process.get("pid"))
     try:
         started = datetime.fromisoformat(process["started_at"].replace("Z", "+00:00")).timestamp()
     except (KeyError, AttributeError, ValueError):
