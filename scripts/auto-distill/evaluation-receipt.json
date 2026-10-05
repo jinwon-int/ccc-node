@@ -3,9 +3,9 @@
  "pipeline": 6,
  "subject": {
   "path": "scripts/auto-distill/auto-distill.py",
-  "sha256": "124e89be288c7bd90508030aa920f12b37386b5b1210f91de6e50f8313a4b85a",
+  "sha256": "bf16022640bfd7146408dea1db1841ffe33d010c67c1c65c405159f577903c1a",
   "surface_schema": "ccc.auto-distill.canon-surface.v1",
-  "surface_sha256": "9894a32ba4d262512a8f44eb4f00a10486adcb7b01d7131816b646f85ebadc28",
+  "surface_sha256": "be987eac04cc4bbc1429ebbf9eae6e4c7243e189e17ef34de7ae1214cc25297c",
   "surface_members": [
    "assign:PIPELINE",
    "assign:CANON_PROMPT",
@@ -28,16 +28,16 @@
   ]
  },
  "evaluation": {
-  "id": "TM-3448",
-  "evaluated_source_sha256": "124e89be288c7bd90508030aa920f12b37386b5b1210f91de6e50f8313a4b85a",
-  "completed_at": "2026-09-19T14:56:58Z",
+  "id": "TM-3657",
+  "evaluated_source_sha256": "bf16022640bfd7146408dea1db1841ffe33d010c67c1c65c405159f577903c1a",
+  "completed_at": "2026-10-05T12:30:22Z",
   "provider": "claude-code-oauth",
   "model": "claude-haiku-4-5-20251001",
   "model_resolution": {
    "alias": "claude-haiku-4-5-20251001",
    "resolved_id": "claude-haiku-4-5-20251001",
    "resolved_by": "claude-json-modelUsage:envelopes (47/47 calls)",
-   "resolved_at": "2026-09-19T14:56:58Z"
+   "resolved_at": "2026-10-05T12:30:22Z"
   },
   "corpus": {
    "sample": "sample-v4.json",
@@ -49,28 +49,28 @@
    "cases": 47
   },
   "harness": {
-   "eval_canon_sha256": "f401aaa01360e0b727b86c2806e398158a6a86b2015a692cd06aea7e6ec1a69d",
+   "eval_canon_sha256": "fb6a49d72e003254c3f0ddf093f6864d5e40c6f03ae04b83349c520ee4321716",
    "recheck_addr_sha256": "698599263790d4826416b6a6474d2a572d6791178488773990ecc433d011df5e"
   },
   "artifacts": {
-   "eval_log_sha256": "fb3fa8616d0f770bfa58ebf94b9abf4b3b3bd485f90e54868d7e444c4555b0eb",
-   "eval_result_sha256": "2ad41722f04f43d52ad25b96ca41eb1a0f047bfed5e934745377c391a0306452",
-   "recheck_log_sha256": "48eec24b369c7a1799e1c39f38bbc781be4fd9e24ac773f941ec4c77398a6dfc"
+   "eval_log_sha256": "360a16ec7cc18b27866be6212374e89da67c7d832f241712d698f9766e6bc693",
+   "eval_result_sha256": "aa5fbf2b8ff4da34c59c4a7a4233dabf753219f11b8a7c7f35d05a02a1421cae",
+   "recheck_log_sha256": "643f9ab824e204cad2437fe8dc57c8d1189efaa27da5991dc53acb60c1a95fb2"
   },
   "recheck": {
    "baseline_duplicates": 1,
-   "duplicates": 4,
+   "duplicates": 7,
    "cases": 12,
    "suspect": 0
   },
   "confusion": {
-   "tp": 15,
+   "tp": 13,
    "fp": 2,
-   "fn": 8,
+   "fn": 10,
    "tn": 22
   },
   "collateral_damage": 0,
   "passed": true
  },
- "issued_at": "2026-09-19T23:58:09+09:00"
+ "issued_at": "2026-10-05T21:31:54+09:00"
 }
