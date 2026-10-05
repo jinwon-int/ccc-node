@@ -94,7 +94,9 @@
 #      restored); 14 = activation incomplete (#1527): the installed generation
 #      was never verified active — a pending-activation record exists (or its
 #      bookkeeping failed) and the tick refuses to report convergence from
-#      health alone; other non-zero = aborted (reason logged).
+#      health alone, or (#2142) an external restart came back serving a
+#      generation other than the installed target; other non-zero = aborted
+#      (reason logged).
 # Audit records keep `result` unchanged; an external restart failure adds
 #      `failure_kind` (timeout | start-error | stop-failed | rejected |
 #      command-timeout | health-timeout | command-failed | ...) and a
@@ -336,7 +338,10 @@ serving_generation_matches() { [ "$1" = "$2" ] && [ "$2" = "$NEW_SHA" ]; }
 #   3 = runtime is DOWN — caller defers to the existing #971 recovery policy
 report_pending_activation() {
   local serving hcmd
-  if serving="$(resolve_serving_generation)"; then
+  # Operator probe first; else the live bridge's frozen startup source head
+  # (#2142) — generation provenance from the running process, not health
+  # availability, so the health-only rule below still holds.
+  if serving="$(resolve_serving_generation)" || serving="$(serving_head_since 0)"; then
     if ! serving_generation_matches "$serving" "$PENDING_TARGET_SHA"; then
       log "pending-activation result=incomplete reason=serving-mismatch target=$PENDING_TARGET_SHA serving=$serving outcome=${PENDING_OUTCOME:-unknown}"
       audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
@@ -451,9 +456,60 @@ restart_failure_summary() {
 # Restart must succeed, then health-cmd must pass within a wall-time budget.
 # RESTART_WAIT_SECONDS includes probe execution and retry sleeps; timeout may
 # use one extra second to kill TERM-resistant descendants in its process group.
+# --- serving generation after an external restart (#2142) ----------------------
+# A restart command that exits 0 and a health probe that says "available" do
+# not prove the NEW code serves: on Termux the bridge runs a prepared
+# generation (~/.ccc-node/preparations/<gen>/source) chosen by the restart
+# command, so a launcher pinned to an older preparation restarts the old code
+# and the run used to record outcome=activated anyway (two nodes, 2026-10-02
+# and again 2026-10-04: target 03b5590, serving dbf3465). The bridge freezes
+# its startup source identity into health.json runtime_generation.source_git;
+# when a live process started at/after the restart reports one, it must equal
+# the installed target. Unknown (no fresh identity) keeps the restart+health
+# rule. The same identity lets a later unchanged tick reconcile the pending
+# record once the operator has switched the bridge to the target generation
+# (report_pending_activation), because the operator probe's checkout-path
+# rule can never match a prepared runtime's source directory.
+#   CCC_SELF_UPDATE_SERVING_HEALTH_FILE (default: the idle-gate health file)
+RESTART_BEGIN_EPOCH=0
+serving_head_since() { # <epoch>: print the full serving head, or return 1 when unknown
+  python3 - "${CCC_SELF_UPDATE_SERVING_HEALTH_FILE:-$HEALTH_FILE}" "$1" <<'PY_SERVING'
+import json, os, sys
+from datetime import datetime
+path, since = sys.argv[1], float(sys.argv[2])
+try:
+    if os.path.getsize(path) > 1024 * 1024:
+        sys.exit(1)
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    started = datetime.fromisoformat(
+        str(data["process"]["started_at"]).replace("Z", "+00:00")
+    ).timestamp()
+    head = data["runtime_generation"]["source_git"]["head"]
+    pid = data["process"]["pid"]
+    if type(pid) is not int or pid <= 1:
+        sys.exit(1)
+    try:
+        os.kill(pid, 0)  # the writer must still be the live bridge
+    except PermissionError:
+        pass
+except Exception:
+    sys.exit(1)
+if (
+    started < since - 2
+    or not isinstance(head, str)
+    or len(head) != 40
+    or any(c not in "0123456789abcdef" for c in head)
+):
+    sys.exit(1)
+print(head)
+PY_SERVING
+}
+
 run_external_restart() {
   local rcmd hcmd rc deadline remaining pause started log_offset
   RESTART_FAILURE_JSON=""
+  RESTART_BEGIN_EPOCH="$(date -u +%s)"
   rcmd="$(resolve_restart_cmd)" || return 1
   hcmd="$(resolve_health_cmd || true)"
   started=$SECONDS
@@ -1506,6 +1562,21 @@ if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && [ "$RESTARTED" -eq 0 ];
     if run_external_restart; then
       RESTARTED=1
       SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c '. + [{"name":"external-restart","ok":true,"scope":"external"}]')"
+      if serving_head="$(serving_head_since "$RESTART_BEGIN_EPOCH")"; then
+        if [ "$serving_head" != "$NEW_SHA" ]; then
+          KEEP_INSTALL_SNAPSHOT=1
+          write_pending_activation "external-restart-serving-mismatch" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
+          log "pending-activation result=incomplete reason=serving-mismatch target=$NEW_SHA serving=$serving_head"
+          audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
+          log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=serving-mismatch"
+          notify "self-update ${SHORT_NEW}: 외부 재시작은 성공했지만 재시작된 브리지가 이전 세대(${serving_head:0:7})를 서빙 중입니다 — 설치 목표 ${SHORT_NEW}와 다릅니다. 재시작 명령이 고정된 prepared 런타임 세대를 띄우는지 확인하고, 새 세대를 준비(termux_prepare)·전환해야 합니다. 활성화로 기록하지 않았습니다. 로그: ~/.claude/state/self-update.log" "pending-$NEW_SHA"
+          say "self-update: external restart succeeded but the bridge serves ${serving_head:0:7}, not ${SHORT_NEW}; activation incomplete" >&2
+          exit 14
+        fi
+        log "external-restart serving=$serving_head matches target"
+      else
+        log "external-restart serving-generation unknown (no fresh runtime_generation in health); accepted on restart+health"
+      fi
       log "external-restart ok; proceeding to cleanup"
     else
       KEEP_INSTALL_SNAPSHOT=1

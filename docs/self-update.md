@@ -319,6 +319,7 @@ still does not include a complete previous dependency environment.
 | `CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS` | `180` | complete external restart command budget (integer 1..900 seconds), shared by update and recovery; timeout remains a failure |
 | `CCC_SELF_UPDATE_RESTART_WAIT_SECONDS` | `60` | wall-time budget for the up-to-date health probe and, separately, post-restart polling (integer 1..86400 seconds); includes command execution and sleeps |
 | `CCC_SELF_UPDATE_HEALTH_FILE` | `~/.telegram_bot/health.json` | bridge health file the idle gate reads |
+| `CCC_SELF_UPDATE_SERVING_HEALTH_FILE` | `CCC_SELF_UPDATE_HEALTH_FILE` | bridge health file whose `runtime_generation.source_git.head` (from a live process started after the restart) must equal the installed target after an external restart (#2142); point it at the bridge's `<project>/.telegram_bot/health.json` when `start.sh --path` is not `$HOME`, or at a nonexistent path to opt out |
 | `CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS` | `90` | max age of `health.json` for its workload to count |
 | `CCC_SELF_UPDATE_BUSY_MAX_SECONDS` | `1800` | never defer for a task older than this |
 | `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` | `3600` | cap total deferral so continuous load can't starve updates |
@@ -344,6 +345,12 @@ snapshot; the repo/harness stay at the new SHA (setup already succeeded).
 13 incoming tip signature could not be verified and
 `CCC_SELF_UPDATE_SIGNATURE_MODE=enforce` — nothing was merged, so the node
 stays on its current SHA (see "Tip signature verification" below).
+14 activation incomplete (#1527) — the installed generation was never verified
+serving; also (#2142) an external restart succeeded but the bridge came back
+serving a different `runtime_generation.source_git.head` (e.g. a Termux launcher
+pinned to an older prepared generation). Switch the bridge to a preparation of
+the target commit; the next tick reconciles from the live bridge's startup
+head, or a new upstream commit retries.
 On exit 9, the validated private recovery snapshot is retained under
 `~/.claude/state/self-update-install-rollback.*/` (`0700` directory containing
 `0600` Claude and Hermes archives) for local operator

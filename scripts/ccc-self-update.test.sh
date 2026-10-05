@@ -41,6 +41,8 @@ export CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$TMP/no-such-matrix-health.json"
 # And for the A2A worker gate (#2138): never read the node's real unit cgroups,
 # or a fixture run on a worker node mid-task would defer.
 export CCC_SELF_UPDATE_CGROUP_ROOT="$TMP/no-such-cgroup"
+# And for the serving-generation check after an external restart (#2142).
+export CCC_SELF_UPDATE_SERVING_HEALTH_FILE="$TMP/no-such-serving-health.json"
 
 # Fixture: origin repo with a stub setup.sh, plus a node-side clone.
 ORIGIN="$TMP/origin.git"
@@ -182,6 +184,62 @@ ok "external restart failure retains recovery snapshot" 'compgen -G "$STATE/self
 ok "outcome-less restart failure is classified command-failed (#1868)" \
   'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"restart-failures\" and .failure_kind == \"command-failed\" and .restart_outcome.restart_exit == 1" >/dev/null'
 rm -rf "$STATE"/self-update-install-rollback.*
+
+# (2a) #2142: a restart that comes back serving another generation is not an
+#      activation. The fake restart command plays a bridge that freezes its
+#      startup source head (CCC_TEST_SERVING_HEAD) into health.json.
+SERVING_HEALTH="$TMP/serving-health.json"
+export CCC_SELF_UPDATE_SERVING_HEALTH_FILE="$SERVING_HEALTH"
+# shellcheck disable=SC2034  # PENDING_JSON is read via eval inside ok()
+PENDING_JSON="$STATE/self-update.pending-activation.json"
+# The health names this test shell as its (live) bridge pid.
+cat > "$CLAUDE/self-update.restart-cmd" <<CMD
+python3 -c 'import json,sys,datetime as d; json.dump({"process":{"pid":int(sys.argv[3]),"started_at":d.datetime.now(d.timezone.utc).isoformat()},"runtime_generation":{"source_git":{"head":sys.argv[1]}}}, open(sys.argv[2],"w"))' "\$CCC_TEST_SERVING_HEAD" "$SERVING_HEALTH" "$$"
+CMD
+bump2142() { echo "$1" > "$TMP/seed/$1.txt"; git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm "$1" && git -C "$TMP/seed" push -q origin main; }
+bump2142 serving-mismatch
+: > "$STATE/self-update.log"; rm -f "$TMP/spool"/*.json
+out="$(CCC_TEST_SERVING_HEAD=dbf34652dbf34652dbf34652dbf34652dbf34652 run_selfup run 2>&1)"; rc=$?
+ok "restart serving an older generation exits 14, not ok" '[ "$rc" = 14 ] && grep -q "bridge serves dbf3465" <<<"$out"'
+ok "serving mismatch keeps a pending record, not activated" \
+  'jq -e ".outcome == \"external-restart-serving-mismatch\" and .target_sha == \"$(git -C "$TMP/seed" rev-parse HEAD)\"" "$PENDING_JSON" >/dev/null'
+ok "serving mismatch logged and audited as activation-incomplete" \
+  'grep -q "reason=serving-mismatch target=$(git -C "$TMP/seed" rev-parse HEAD) serving=dbf34652" "$STATE/self-update.log" && grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"activation-incomplete\"" >/dev/null'
+ok "serving mismatch notifies the owner" 'cat "$TMP/spool"/*.json 2>/dev/null | jq -r .text | grep -q "이전 세대(dbf3465)를 서빙"'
+ok "serving mismatch retains the recovery snapshot" 'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "next unchanged tick still refuses to report up-to-date" '[ "$rc" = 14 ] && ! grep -q "already up to date" <<<"$out" && grep -q "reason=serving-mismatch" "$STATE/self-update.log"'
+# A dead writer's identity proves nothing: back to identity-unknown.
+python3 - "$SERVING_HEALTH" <<'PY2142'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["process"]["pid"] = 2 ** 22 + 7; json.dump(d, open(p, "w"))
+PY2142
+: > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "dead serving pid is identity-unknown, still incomplete" '[ "$rc" = 14 ] && grep -q "reason=identity-unknown" "$STATE/self-update.log"'
+# The operator switches the bridge to the target generation by hand: the next
+# unchanged tick reconciles from the live bridge's startup head (#2142).
+CCC_TEST_SERVING_HEAD="$(git -C "$TMP/seed" rev-parse HEAD)" bash "$CLAUDE/self-update.restart-cmd"
+: > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "operator-switched generation reconciles on the next tick" \
+  '[ "$rc" = 0 ] && grep -q "pending-activation result=reconciled" "$STATE/self-update.log" && jq -e ".outcome == \"activated\"" "$PENDING_JSON" >/dev/null'
+rm -rf "$STATE"/self-update-install-rollback.*
+bump2142 serving-match
+: > "$STATE/self-update.log"
+out="$(CCC_TEST_SERVING_HEAD="$(git -C "$TMP/seed" rev-parse HEAD)" run_selfup run 2>&1)"; rc=$?
+ok "restart serving the installed target is activated" \
+  '[ "$rc" = 0 ] && grep -q "serving=$(git -C "$TMP/seed" rev-parse HEAD) matches target" "$STATE/self-update.log" && jq -e ".outcome == \"activated\"" "$PENDING_JSON" >/dev/null'
+# Health from a process that predates the restart proves nothing either way.
+printf 'true\n' > "$CLAUDE/self-update.restart-cmd"
+printf '{"process":{"started_at":"2026-01-01T00:00:00Z"},"runtime_generation":{"source_git":{"head":"%s"}}}' dbf34652dbf34652dbf34652dbf34652dbf34652 > "$SERVING_HEALTH"
+bump2142 serving-stale
+: > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "pre-restart health keeps the restart+health rule" \
+  '[ "$rc" = 0 ] && grep -q "serving-generation unknown" "$STATE/self-update.log" && jq -e ".outcome == \"activated\"" "$PENDING_JSON" >/dev/null'
+rm -f "$SERVING_HEALTH"
+export CCC_SELF_UPDATE_SERVING_HEALTH_FILE="$TMP/no-such-serving-health.json"
 
 # (2b) #1868: timeout vs start-error failures are distinguishable, and the
 #      "Candidate and recovery failed" outcome says whether a bridge serves.
