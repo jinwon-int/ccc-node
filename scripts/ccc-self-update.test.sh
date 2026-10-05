@@ -190,9 +190,11 @@ rm -rf "$STATE"/self-update-install-rollback.*
 #      startup source head (CCC_TEST_SERVING_HEAD) into health.json.
 SERVING_HEALTH="$TMP/serving-health.json"
 export CCC_SELF_UPDATE_SERVING_HEALTH_FILE="$SERVING_HEALTH"
+# shellcheck disable=SC2034  # PENDING_JSON is read via eval inside ok()
 PENDING_JSON="$STATE/self-update.pending-activation.json"
+# The health names this test shell as its (live) bridge pid.
 cat > "$CLAUDE/self-update.restart-cmd" <<CMD
-python3 -c 'import json,sys,datetime as d; json.dump({"process":{"started_at":d.datetime.now(d.timezone.utc).isoformat()},"runtime_generation":{"source_git":{"head":sys.argv[1]}}}, open(sys.argv[2],"w"))' "\$CCC_TEST_SERVING_HEAD" "$SERVING_HEALTH"
+python3 -c 'import json,sys,datetime as d; json.dump({"process":{"pid":int(sys.argv[3]),"started_at":d.datetime.now(d.timezone.utc).isoformat()},"runtime_generation":{"source_git":{"head":sys.argv[1]}}}, open(sys.argv[2],"w"))' "\$CCC_TEST_SERVING_HEAD" "$SERVING_HEALTH" "$$"
 CMD
 bump2142() { echo "$1" > "$TMP/seed/$1.txt"; git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm "$1" && git -C "$TMP/seed" push -q origin main; }
 bump2142 serving-mismatch
@@ -206,7 +208,22 @@ ok "serving mismatch logged and audited as activation-incomplete" \
 ok "serving mismatch notifies the owner" 'cat "$TMP/spool"/*.json 2>/dev/null | jq -r .text | grep -q "이전 세대(dbf3465)를 서빙"'
 ok "serving mismatch retains the recovery snapshot" 'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
 out="$(run_selfup run 2>&1)"; rc=$?
-ok "next unchanged tick still refuses to report up-to-date" '[ "$rc" = 14 ] && ! grep -q "already up to date" <<<"$out"'
+ok "next unchanged tick still refuses to report up-to-date" '[ "$rc" = 14 ] && ! grep -q "already up to date" <<<"$out" && grep -q "reason=serving-mismatch" "$STATE/self-update.log"'
+# A dead writer's identity proves nothing: back to identity-unknown.
+python3 - "$SERVING_HEALTH" <<'PY2142'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["process"]["pid"] = 2 ** 22 + 7; json.dump(d, open(p, "w"))
+PY2142
+: > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "dead serving pid is identity-unknown, still incomplete" '[ "$rc" = 14 ] && grep -q "reason=identity-unknown" "$STATE/self-update.log"'
+# The operator switches the bridge to the target generation by hand: the next
+# unchanged tick reconciles from the live bridge's startup head (#2142).
+CCC_TEST_SERVING_HEAD="$(git -C "$TMP/seed" rev-parse HEAD)" bash "$CLAUDE/self-update.restart-cmd"
+: > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "operator-switched generation reconciles on the next tick" \
+  '[ "$rc" = 0 ] && grep -q "pending-activation result=reconciled" "$STATE/self-update.log" && jq -e ".outcome == \"activated\"" "$PENDING_JSON" >/dev/null'
 rm -rf "$STATE"/self-update-install-rollback.*
 bump2142 serving-match
 : > "$STATE/self-update.log"

@@ -338,7 +338,10 @@ serving_generation_matches() { [ "$1" = "$2" ] && [ "$2" = "$NEW_SHA" ]; }
 #   3 = runtime is DOWN — caller defers to the existing #971 recovery policy
 report_pending_activation() {
   local serving hcmd
-  if serving="$(resolve_serving_generation)"; then
+  # Operator probe first; else the live bridge's frozen startup source head
+  # (#2142) — generation provenance from the running process, not health
+  # availability, so the health-only rule below still holds.
+  if serving="$(resolve_serving_generation)" || serving="$(serving_head_since 0)"; then
     if ! serving_generation_matches "$serving" "$PENDING_TARGET_SHA"; then
       log "pending-activation result=incomplete reason=serving-mismatch target=$PENDING_TARGET_SHA serving=$serving outcome=${PENDING_OUTCOME:-unknown}"
       audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
@@ -461,8 +464,12 @@ restart_failure_summary() {
 # and the run used to record outcome=activated anyway (two nodes, 2026-10-02
 # and again 2026-10-04: target 03b5590, serving dbf3465). The bridge freezes
 # its startup source identity into health.json runtime_generation.source_git;
-# when a process started at/after the restart reports one, it must equal the
-# installed target. Unknown (no fresh identity) keeps the restart+health rule.
+# when a live process started at/after the restart reports one, it must equal
+# the installed target. Unknown (no fresh identity) keeps the restart+health
+# rule. The same identity lets a later unchanged tick reconcile the pending
+# record once the operator has switched the bridge to the target generation
+# (report_pending_activation), because the operator probe's checkout-path
+# rule can never match a prepared runtime's source directory.
 #   CCC_SELF_UPDATE_SERVING_HEALTH_FILE (default: the idle-gate health file)
 RESTART_BEGIN_EPOCH=0
 serving_head_since() { # <epoch>: print the full serving head, or return 1 when unknown
@@ -479,6 +486,13 @@ try:
         str(data["process"]["started_at"]).replace("Z", "+00:00")
     ).timestamp()
     head = data["runtime_generation"]["source_git"]["head"]
+    pid = data["process"]["pid"]
+    if type(pid) is not int or pid <= 1:
+        sys.exit(1)
+    try:
+        os.kill(pid, 0)  # the writer must still be the live bridge
+    except PermissionError:
+        pass
 except Exception:
     sys.exit(1)
 if (
