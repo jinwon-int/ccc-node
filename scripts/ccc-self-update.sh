@@ -81,6 +81,9 @@
 #      (1800 — never defer a task older than this), CCC_SELF_UPDATE_MAX_DEFER_SECONDS
 #      (3600 — cap total deferral so continuous load can't starve updates).
 #      Fail-open (missing/unreadable/stale health → proceed); --force bypasses.
+#      It also defers while an allowlisted A2A worker unit (a2a-*worker*) runs
+#      a task — its cgroup holds a handler child besides the worker (#2138);
+#      CCC_SELF_UPDATE_CGROUP_ROOT (/sys/fs/cgroup). Same caps and --force.
 # Exit: 0 = up-to-date or updated cleanly; 7 = a restart (allowlisted service
 #      or external restart-cmd) or a recovery attempt failed; 8 = deferred
 #      (bridge busy, or — #1961, uncapped and not bypassed by --force — a
@@ -713,8 +716,8 @@ fi
 HEALTH_FILE="${CCC_SELF_UPDATE_HEALTH_FILE:-${HOME:-/root}/.telegram_bot/health.json}"
 # The Matrix frontend (ccc-matrix-bridge, BOT_DATA_DIR=~/.ccc-matrix) writes the
 # same workload snapshot to its own data dir. It is consulted only when that unit
-# is allowlisted: this script restarts nothing else, so a busy Matrix turn is
-# only at risk when the Matrix unit itself is in the restart set.
+# is allowlisted: a busy Matrix turn is only at risk when the Matrix unit itself
+# is in the restart set. Allowlisted A2A worker units get their own gate below.
 MATRIX_HEALTH_FILE="${CCC_SELF_UPDATE_MATRIX_HEALTH_FILE:-${HOME:-/root}/.ccc-matrix/health.json}"
 FRESH_SECONDS="${CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS:-90}"
 BUSY_MAX_SECONDS="${CCC_SELF_UPDATE_BUSY_MAX_SECONDS:-1800}"
@@ -767,19 +770,111 @@ bridge_is_busy() {
   return 1
 }
 
-if [ "$FORCE" != "1" ] && busy_reason="$(bridge_is_busy)"; then
+# --- A2A worker gate (#2138) ---------------------------------------------------
+# An allowlisted A2A worker unit (a2a-*worker*, e.g. a2a-hermes-worker) is
+# restarted by this script too, and the worker's stop() neither drains nor
+# waits for its active task: a restart inside a 10-25 min patch lane kills the
+# task's handler. The worker spawns that handler as a child process, so while a
+# task runs the unit's cgroup holds more than the worker's own process (idle
+# worker = exactly one pid). The gate reads the cgroup directly — no broker
+# call, no systemctl invocation — and defers like a busy bridge. A handler
+# older than CCC_SELF_UPDATE_BUSY_MAX_SECONDS counts as hung and does not
+# defer; the shared CCC_SELF_UPDATE_MAX_DEFER_SECONDS cap still applies.
+# Fail-open: unit cgroup not found/unreadable → proceed.
+#   CCC_SELF_UPDATE_CGROUP_ROOT (default /sys/fs/cgroup; v1 uses its systemd/ subtree)
+CGROUP_ROOT="${CCC_SELF_UPDATE_CGROUP_ROOT:-/sys/fs/cgroup}"
+
+# Print the cgroup.procs path of <scope> <unit>; return 1 when none is readable.
+worker_cgroup_procs() {
+  local scope="$1" unit="$2" uid f
+  case "$unit" in *.service) ;; *) unit="$unit.service" ;; esac
+  if [ "$scope" = user ]; then
+    uid="$(id -u)"
+    for f in "$CGROUP_ROOT"/user.slice/user-"$uid".slice/user@"$uid".service/*/"$unit"/cgroup.procs \
+             "$CGROUP_ROOT"/systemd/user.slice/user-"$uid".slice/user@"$uid".service/*/"$unit"/cgroup.procs; do
+      [ -r "$f" ] && { printf '%s\n' "$f"; return 0; }
+    done
+  else
+    for f in "$CGROUP_ROOT/system.slice/$unit/cgroup.procs" \
+             "$CGROUP_ROOT/systemd/system.slice/$unit/cgroup.procs"; do
+      [ -r "$f" ] && { printf '%s\n' "$f"; return 0; }
+    done
+  fi
+  return 1
+}
+
+# Echo "procs=N oldest=Ss" and return 0 when the cgroup holds handler children
+# (every pid but the longest-lived one, the worker itself) younger than the
+# busy-max; return 1 otherwise.
+worker_cgroup_busy() {
+  python3 - "$1" "$BUSY_MAX_SECONDS" <<'PY'
+import os, sys
+path, busy_max = sys.argv[1], float(sys.argv[2])
+try:
+    pids = [int(x) for x in open(path, encoding="ascii").read().split()]
+    uptime = float(open("/proc/uptime", encoding="ascii").read().split()[0])
+    tick = os.sysconf("SC_CLK_TCK")
+except Exception:
+    sys.exit(1)
+ages = []
+for pid in pids:
+    try:
+        stat = open("/proc/%d/stat" % pid, encoding="ascii", errors="replace").read()
+        start = int(stat.rsplit(")", 1)[1].split()[19])  # field 22: starttime
+    except Exception:
+        continue  # exited between the two reads
+    ages.append(uptime - start / tick)
+ages.sort(reverse=True)
+children = ages[1:]
+if not children or children[0] >= busy_max:
+    sys.exit(1)
+print("procs=%d oldest=%ds" % (len(children), int(children[0])))
+PY
+}
+
+worker_is_busy() {
+  local svc scope procs r
+  [ -f "$SERVICES_FILE" ] || return 1
+  while IFS= read -r svc; do
+    svc="${svc%%#*}"; svc="$(printf '%s' "$svc" | tr -d '[:space:]')"
+    scope=system
+    case "$svc" in
+      user:*) scope=user; svc="${svc#user:}" ;;
+      system:*) svc="${svc#system:}" ;;
+    esac
+    case "${svc%.service}" in a2a-*worker*) ;; *) continue ;; esac
+    printf '%s' "$svc" | grep -Eq '^[A-Za-z0-9@._:-]+$' || continue
+    procs="$(worker_cgroup_procs "$scope" "$svc")" || continue
+    if r="$(worker_cgroup_busy "$procs")"; then
+      printf 'unit=%s %s\n' "${svc%.service}" "$r"
+      return 0
+    fi
+  done < "$SERVICES_FILE"
+  return 1
+}
+
+busy_kind=""
+if [ "$FORCE" != "1" ]; then
+  if busy_reason="$(bridge_is_busy)"; then
+    busy_kind=bridge
+  elif busy_reason="$(worker_is_busy)"; then
+    busy_kind=worker
+  fi
+fi
+if [ -n "$busy_kind" ]; then
+  busy_label="bridge"; [ "$busy_kind" = worker ] && busy_label="a2a worker"
   now_epoch="$(date +%s)"
   since="$(cat "$DEFER_MARK" 2>/dev/null)"
   case "$since" in ''|*[!0-9]*) since="" ;; esac
   [ -n "$since" ] || { since="$now_epoch"; printf '%s' "$now_epoch" > "$DEFER_MARK" 2>/dev/null; }
   waited=$(( now_epoch - since ))
   if [ "$waited" -lt "$MAX_DEFER_SECONDS" ]; then
-    log "deferred reason=bridge-busy $busy_reason waited=${waited}s"
-    say "self-update: bridge busy ($busy_reason) — deferring, will retry next tick"
+    log "deferred reason=${busy_kind}-busy $busy_reason waited=${waited}s"
+    say "self-update: $busy_label busy ($busy_reason) — deferring, will retry next tick"
     exit 8
   fi
   log "proceed reason=defer-cap-exceeded waited=${waited}s $busy_reason"
-  say "self-update: bridge busy but deferred ${waited}s ≥ ${MAX_DEFER_SECONDS}s cap — proceeding"
+  say "self-update: $busy_label busy but deferred ${waited}s ≥ ${MAX_DEFER_SECONDS}s cap — proceeding"
 fi
 # Not busy (or forced, or cap exceeded) → clear any deferral marker and continue.
 rm -f "$DEFER_MARK" 2>/dev/null
