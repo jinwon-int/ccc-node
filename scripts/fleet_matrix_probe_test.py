@@ -115,10 +115,93 @@ class MatrixProbeTest(unittest.TestCase):
             probe.probe(self.proc, now=self.now), ("UNVERIFIED", "matrix-db-before-process")
         )
 
+    def crash_budget(self, streak: int, *, running: bool = True, age: float = 5) -> None:
+        (self.data / "crash-budget.json").write_text(json.dumps({
+            "v": 1, "running": running, "started_at": self.now - age, "streak": streak,
+        }))
+
     def test_foreign_health_pid_is_unverified(self) -> None:
+        # The recorded writer is still alive (a non-bridge process here, so
+        # it does not count as a second Matrix match): a second writer.
+        (self.proc / "100").mkdir()
         self.process(200, channel="matrix")
         self.health(100)
         self.assertEqual(probe.probe(self.proc, now=self.now), ("UNVERIFIED", "health-pid"))
+
+    def test_dead_health_writer_is_a_restart(self) -> None:
+        self.process(200, channel="matrix")
+        self.health(100)
+        self.assertEqual(
+            probe.probe(self.proc, now=self.now), ("UNVERIFIED", "health-pid-restarting")
+        )
+
+    def test_single_rapid_crash_is_still_a_restart(self) -> None:
+        self.process(200, channel="matrix")
+        self.health(100)
+        self.crash_budget(1)
+        self.assertEqual(
+            probe.probe(self.proc, now=self.now), ("UNVERIFIED", "health-pid-restarting")
+        )
+
+    def test_crash_streak_with_unreported_process_is_crash_loop(self) -> None:
+        # ccc-node#2141: one node on 2026-10-01, 957 DNS crash-restarts; every watch
+        # saw a fresh process that had not yet written health.json.
+        self.process(200, channel="matrix")
+        self.health(100, age=40)
+        self.crash_budget(776)
+        self.assertEqual(probe.probe(self.proc, now=self.now), ("DOWN", "crash-loop"))
+
+    def test_run_in_back_off_delay_is_still_crash_loop(self) -> None:
+        # started_at includes the back-off delay: a sleeping run is in the future.
+        self.process(200, channel="matrix")
+        self.health(100)
+        self.crash_budget(4, age=-20)
+        self.assertEqual(probe.probe(self.proc, now=self.now), ("DOWN", "crash-loop"))
+
+    def test_stale_streak_of_a_stable_run_is_not_a_crash_loop(self) -> None:
+        # A sub-alert streak survives mark_stable(); once the run has outlived
+        # the crash window it is a recovered process, not a crash loop.
+        self.process(200, channel="matrix")
+        self.health(100)
+        self.crash_budget(2, age=3600)
+        self.assertEqual(
+            probe.probe(self.proc, now=self.now), ("UNVERIFIED", "health-pid-restarting")
+        )
+        self.crash_budget(2, age=probe.CRASH_WINDOW_SECS)
+        self.assertEqual(
+            probe.probe(self.proc, now=self.now), ("UNVERIFIED", "health-pid-restarting")
+        )
+
+    def test_crash_loop_wins_over_live_foreign_writer(self) -> None:
+        (self.proc / "100").mkdir()
+        self.process(200, channel="matrix")
+        self.health(100)
+        self.crash_budget(3)
+        self.assertEqual(probe.probe(self.proc, now=self.now), ("DOWN", "crash-loop"))
+
+    def test_crash_streak_ignored_when_health_pid_matches(self) -> None:
+        self.process(200, channel="matrix")
+        self.health(200)
+        self.db_health()
+        self.crash_budget(5)
+        self.assertEqual(probe.probe(self.proc, now=self.now), ("OK", "db-ready"))
+
+    def test_malformed_or_stopped_crash_budget_is_ignored(self) -> None:
+        self.process(200, channel="matrix")
+        self.health(100)
+        for payload in ("not json", json.dumps({"running": True, "streak": True}),
+                        json.dumps({"running": True, "streak": "9"}), json.dumps([1]),
+                        json.dumps({"running": True, "streak": 9}),
+                        json.dumps({"running": True, "streak": 9, "started_at": "x"})):
+            (self.data / "crash-budget.json").write_text(payload)
+            self.assertEqual(
+                probe.probe(self.proc, now=self.now), ("UNVERIFIED", "health-pid-restarting"),
+                payload,
+            )
+        self.crash_budget(9, running=False)
+        self.assertEqual(
+            probe.probe(self.proc, now=self.now), ("UNVERIFIED", "health-pid-restarting")
+        )
 
     def test_degraded_health_is_alerted(self) -> None:
         self.process(200, channel="matrix")
