@@ -38,6 +38,9 @@ unset CODEX_HOME
 export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
 # Same for the Matrix frontend's health file (never the node's real ~/.ccc-matrix).
 export CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$TMP/no-such-matrix-health.json"
+# And for the A2A worker gate (#2138): never read the node's real unit cgroups,
+# or a fixture run on a worker node mid-task would defer.
+export CCC_SELF_UPDATE_CGROUP_ROOT="$TMP/no-such-cgroup"
 
 # Fixture: origin repo with a stub setup.sh, plus a node-side clone.
 ORIGIN="$TMP/origin.git"
@@ -754,6 +757,73 @@ out="$(run_selfup run 2>&1)"; rc=$?
 ok "idle matrix proceeds when allowlisted" '[ "$rc" = 0 ]'
 clr_defer; rm -f "$MHFILE" "$CLAUDE/self-update.services"
 export CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$TMP/no-such-matrix-health.json"
+
+# A2A worker gate (#2138): an allowlisted a2a-*worker* unit whose cgroup holds a
+# handler child besides the worker defers; the worker alone proceeds.
+mk_health "$(now_iso)" 0 0
+CG="$TMP/cgroup"
+export CCC_SELF_UPDATE_CGROUP_ROOT="$CG"
+WPROCS="$CG/system.slice/a2a-hermes-worker.service/cgroup.procs"
+mkdir -p "$(dirname "$WPROCS")"
+sleep 300 & wmain=$!
+sleep 0.3
+sleep 300 & whandler=$!
+sleep 1.2
+printf '%s\n' 'hermes-broker' 'a2a-hermes-worker' > "$CLAUDE/self-update.services"
+clr_defer; : > "$STATE/self-update.log"; echo "$wmain" > "$WPROCS"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "idle a2a worker (worker pid only) proceeds" '[ "$rc" = 0 ]'
+clr_defer; printf '%s\n%s\n' "$wmain" "$whandler" > "$WPROCS"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "busy a2a worker defers (exit 8)" '[ "$rc" = 8 ] && grep -q "a2a worker busy (unit=a2a-hermes-worker procs=1 oldest=" <<<"$out"'
+ok "worker defer writes audit log" 'grep -q "deferred reason=worker-busy unit=a2a-hermes-worker procs=1" "$STATE/self-update.log"'
+ok "worker defer records the shared defer marker" '[ -f "$STATE/self-update.deferred-since" ]'
+# Order of pids in cgroup.procs must not matter: the oldest pid is the worker.
+clr_defer; printf '%s\n%s\n' "$whandler" "$wmain" > "$WPROCS"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "worker identified by age, not cgroup.procs order" '[ "$rc" = 8 ]'
+clr_defer
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "--force bypasses the worker gate" '[ "$rc" != 8 ]'
+clr_defer
+out="$(CCC_SELF_UPDATE_BUSY_MAX_SECONDS=1 run_selfup run 2>&1)"; rc=$?
+ok "handler older than busy-max proceeds (hung task)" '[ "$rc" = 0 ]'
+# A leftover child older than busy-max must not mask a fresh handler.
+sleep 300 & wleft=$!
+sleep 4.2
+sleep 300 & wfresh=$!
+clr_defer; printf '%s\n%s\n%s\n' "$wmain" "$wleft" "$wfresh" > "$WPROCS"
+out="$(CCC_SELF_UPDATE_BUSY_MAX_SECONDS=4 run_selfup run 2>&1)"; rc=$?
+ok "old leftover child does not mask a fresh handler" '[ "$rc" = 8 ] && grep -q "procs=1 " <<<"$out"'
+clr_defer; printf '%s\n%s\n' "$wmain" "$wleft" > "$WPROCS"
+out="$(CCC_SELF_UPDATE_BUSY_MAX_SECONDS=4 run_selfup run 2>&1)"; rc=$?
+ok "old leftover child alone does not defer" '[ "$rc" = 0 ]'
+kill "$wleft" "$wfresh" 2>/dev/null; wait "$wleft" "$wfresh" 2>/dev/null
+printf '%s\n%s\n' "$wmain" "$whandler" > "$WPROCS"
+echo "$(( $(date +%s) - 7200 ))" > "$STATE/self-update.deferred-since"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "worker deferral cap exceeded proceeds" '[ "$rc" = 0 ] && [ ! -f "$STATE/self-update.deferred-since" ]'
+clr_defer; printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "busy worker ignored when no a2a worker unit is allowlisted" '[ "$rc" = 0 ]'
+# A second worker unit under the user manager.
+WUSER="$CG/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/a2a-hermes-worker-t1.service/cgroup.procs"
+mkdir -p "$(dirname "$WUSER")"; printf '%s\n%s\n' "$wmain" "$whandler" > "$WUSER"
+clr_defer; printf '%s\n' 'user:a2a-hermes-worker-t1.service' > "$CLAUDE/self-update.services"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "busy user-scope a2a worker defers" '[ "$rc" = 8 ] && grep -q "unit=a2a-hermes-worker-t1" <<<"$out"'
+# A handler that exited between listing and inspection is not a task.
+kill "$whandler" 2>/dev/null; wait "$whandler" 2>/dev/null
+clr_defer; printf '%s\n' 'a2a-hermes-worker' > "$CLAUDE/self-update.services"
+printf '%s\n%s\n' "$wmain" "$whandler" > "$WPROCS"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "exited handler pid does not defer" '[ "$rc" = 0 ]'
+clr_defer; rm -f "$WPROCS"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "missing worker cgroup fails open" '[ "$rc" = 0 ]'
+kill "$wmain" 2>/dev/null; wait "$wmain" 2>/dev/null
+clr_defer; rm -rf "$CG" "$CLAUDE/self-update.services"
+export CCC_SELF_UPDATE_CGROUP_ROOT="$TMP/no-such-cgroup"
 
 # Back to the hermetic nonexistent health file (never the node's real one).
 rm -f "$HFILE"; export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
