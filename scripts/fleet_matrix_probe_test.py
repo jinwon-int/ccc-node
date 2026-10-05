@@ -144,7 +144,7 @@ class MatrixProbeTest(unittest.TestCase):
         )
 
     def test_crash_streak_with_unreported_process_is_crash_loop(self) -> None:
-        # ccc-node#2141: jingun 2026-10-01, 957 DNS crash-restarts; every watch
+        # ccc-node#2141: one node on 2026-10-01, 957 DNS crash-restarts; every watch
         # saw a fresh process that had not yet written health.json.
         self.process(200, channel="matrix")
         self.health(100, age=40)

@@ -55,7 +55,7 @@ def _agent_error_is_stale(data: dict, now: float, max_error_age: int) -> bool:
 
 # The Matrix frontend keeps a body-free rapid-crash record next to health.json
 # (bridge/core/matrix/lifecycle.py CrashBudget). A `streak` of this many rapid
-# unclean exits in a row means the unit is crash-looping: on 2026-10-01 jingun
+# unclean exits in a row means the unit is crash-looping: on 2026-10-01 one node
 # restarted 957 times on a DNS failure and every daily watch saw a fresh
 # process that had not yet written health.json, so the verdict read
 # `UNVERIFIED health-pid` instead of naming the outage (ccc-node#2141).
