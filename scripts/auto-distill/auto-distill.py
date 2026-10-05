@@ -1161,11 +1161,18 @@ def self_canon_sections(digest, limit=6, focus=""):
 
 def canon_snippets(query, limit=4, timeout=60):
     """Wiki 정본에서 관련 발췌를 가져온다. 실패하면 None (= 판정 불가)."""
+    # `--` keeps a query that starts with "-" (e.g. a title like "--apply ...")
+    # from being parsed as a find option (exit 64); --no-notify keeps this
+    # internal lookup from paging the operator. A nonzero exit is a failed
+    # search, not "no canon match" — return None so canon_dedup records it.
     try:
-        out = subprocess.run(["wiki-agent", "find", query], capture_output=True,
-                             text=True, timeout=timeout).stdout
+        r = subprocess.run(["wiki-agent", "--no-notify", "find", "--", query],
+                           capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None
+    if r.returncode != 0:
+        return None
+    out = r.stdout
     snips, cur = [], None
     for line in out.splitlines():
         m = re.match(r"\s*\d+\. score=[\d.]+ (\S+)", line)
