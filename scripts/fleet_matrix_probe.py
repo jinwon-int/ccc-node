@@ -61,10 +61,17 @@ def _agent_error_is_stale(data: dict, now: float, max_error_age: int) -> bool:
 # `UNVERIFIED health-pid` instead of naming the outage (ccc-node#2141).
 CRASH_LOOP_STREAK = 2
 CRASH_BUDGET_FILENAME = "crash-budget.json"
+# CCC_PROCESS_CRASH_WINDOW_SECONDS (bridge/crash-policy.env). The streak only
+# describes the current run while that run is younger than this: a streak below
+# the alert threshold is never reset once a run turns stable (mark_stable keeps
+# it), so an old run with `streak: 2` is a recovered process, not a crash loop.
+# `started_at` includes the back-off delay, so a run still sleeping before it
+# serves has a future timestamp and counts as young.
+CRASH_WINDOW_SECS = 60
 
 
-def _crash_streak(data_dir: Path) -> int:
-    """Rapid unclean exits recorded before the running process; 0 when unknown."""
+def _crash_streak(data_dir: Path, now: float) -> int:
+    """Rapid unclean exits before a run still inside the crash window; else 0."""
     path = data_dir / CRASH_BUDGET_FILENAME
     try:
         if path.stat().st_size > 64 * 1024:
@@ -75,14 +82,21 @@ def _crash_streak(data_dir: Path) -> int:
     if not isinstance(record, dict) or record.get("running") is not True:
         return 0
     streak = record.get("streak")
+    started = record.get("started_at")
     if isinstance(streak, bool) or not isinstance(streak, int):
+        return 0
+    if isinstance(started, bool) or not isinstance(started, (int, float)):
+        return 0
+    if now - started >= CRASH_WINDOW_SECS:
         return 0
     return max(0, streak)
 
 
-def _pid_mismatch(proc_root: Path, data_dir: Path, recorded: object) -> tuple[str, str]:
+def _pid_mismatch(
+    proc_root: Path, data_dir: Path, recorded: object, now: float
+) -> tuple[str, str]:
     """Classify a running Matrix process whose pid is not the one in health.json."""
-    if _crash_streak(data_dir) >= CRASH_LOOP_STREAK:
+    if _crash_streak(data_dir, now) >= CRASH_LOOP_STREAK:
         return "DOWN", "crash-loop"
     writer_alive = (
         isinstance(recorded, int)
@@ -209,7 +223,7 @@ def probe(
         return "UNVERIFIED", "health-shape"
     process = data["process"]
     if process.get("pid") != pid:
-        return _pid_mismatch(proc_root, data_dir, process.get("pid"))
+        return _pid_mismatch(proc_root, data_dir, process.get("pid"), observed)
     try:
         started = datetime.fromisoformat(process["started_at"].replace("Z", "+00:00")).timestamp()
     except (KeyError, AttributeError, ValueError):
