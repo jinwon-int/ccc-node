@@ -39,7 +39,7 @@ Use this when work produces reusable operating knowledge (a decision, runbook, n
      nodes index; some historical slugs carry digits/hyphens. `<seq>` is always
      the trailing `-N`.
    - `<seq>` starts at `1` and is `max(seq)+1` among entries for the same KST date and node — counting **both** regions below, which share one id space.
-   - Prepend the entry at the **top of `pages/log.md`**, directly above the newest existing `## [LOG-...]` heading entry. The `- [LOG-...]` bullet region below the `[LOG-00]` block is the older form: still valid and still auto-merged, but new entries go at the top.
+   - Prepend the entry at the **top of `pages/log.md`** — below the digest block (the `> **에이전트 다이제스트**` blockquote under the H1), directly above the newest existing `## [LOG-...]` heading entry. Never insert right under the H1: that pushes the digest down (seoyoon-family-wiki#6481). The `- [LOG-...]` bullet region below the `[LOG-00]` block is the older form: still valid and still auto-merged, but new entries go at the top.
    - Never edit the `[LOG-00]` rule block itself — it is the merge anchor, and changing it makes a concurrent-edit rebase fail closed. Rule changes belong in their own PR.
    - Never assign a new numeric `LOG-NNNN` ID or renumber an old one. When citing an old numeric entry, include its date and title.
 
