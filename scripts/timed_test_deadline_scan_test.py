@@ -443,24 +443,24 @@ NOW_1006 = dt.datetime(2026, 10, 6, 9, 20)
 # ccc-node#2109, reduced: a claim with a PR ETA, then the real booking in the
 # future-ending-test-issue-tracking template.
 CLAIM_2109 = (
-    "<!-- issue-claim:v1 node=seoseo session=ste100-provider-pilot-20261005 state=takeover prev=468c3987 -->\n"
-    "착수: seoseo (ste100-provider-pilot-20261005) — 오너 요청으로 A 보고 문체 규칙을 육손 1노드에 "
+    "<!-- issue-claim:v1 node=node-a session=ste100-provider-pilot-20261005 state=takeover prev=468c3987 -->\n"
+    "착수: node-a (ste100-provider-pilot-20261005) — 오너 요청으로 A 보고 문체 규칙을 카나리 1노드에 "
     "시범 적용합니다. 예상 PR: 2026-10-05 09:30 KST. 실제 활성화 후 7일 창의 시작·종료 시각과 "
     "지표를 별도 기록합니다."
 )
 BOOKING_2109 = (
     "<!-- future-ending-test-issue-tracking: open -->\n"
-    "**Test/task**: 육손 STE 보고 문체 7일 전후 비교\n"
+    "**Test/task**: 카나리 노드 STE 보고 문체 7일 전후 비교\n"
     "**Tracking model**: clock-based\n"
     "**Start time**: 2026-10-05 07:44:53 KST\n"
     "**Expected end time**: 2026-10-12 07:44:53 KST\n"
-    "**Next action on completion**: 서서 관찰기가 최종 수치를 이 이슈에 기록."
+    "**Next action on completion**: 관찰기가 최종 수치를 이 이슈에 기록."
 )
 
 # ccc-node#2083, reduced: a result report whose heading states the test end
 # three minutes after posting and whose verdict sits at the end.
 REPORT_2083 = (
-    "**jingun DNS 수정 재부팅 지속성 — 정적 점검** (jingun, 테스트 종료 2026-10-05 10:40 UTC / 19:40 KST)\n\n"
+    "**node-b DNS 수정 재부팅 지속성 — 정적 점검** (node-b, 테스트 종료 2026-10-05 10:40 UTC / 19:40 KST)\n\n"
     "재부팅은 하지 않았습니다. 부팅 때 다시 읽히는 설정만 확인했습니다.\n\n"
     "- `systemd-resolved` enabled\n- 현재 `getent hosts api.telegram.org` 정상\n\n"
     "판정: 통과(정적 근거). 실제 재부팅을 거쳐 본 것은 아님."
@@ -523,7 +523,7 @@ class FalsePositive2150Tests(unittest.TestCase):
         self.assertIsNone(scanner.judge_issue(issue, NOW_1006, "expired"))
 
     def test_verdict_labels_that_book_or_assign_are_not_verdicts(self) -> None:
-        for line in ("판정: 합격 기준은 deleted N≥1", "판정 주체: 곽가", "판정: 오너가 종료 후 결정"):
+        for line in ("판정: 합격 기준은 deleted N≥1", "판정 주체: 담당 노드", "판정: 오너가 종료 후 결정"):
             with self.subTest(line=line):
                 issue = _issue(
                     comments=[_comment(f"종료 일시: 2026-10-05 12:00 KST\n{line}", "2026-09-29T04:13:00Z")]
