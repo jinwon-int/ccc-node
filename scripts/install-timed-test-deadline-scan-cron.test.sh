@@ -49,7 +49,7 @@ out="$(bash "$INSTALLER" --apply 2>&1)"; rc=$?
 ok "apply exits 0" '[ "$rc" = 0 ]'
 ok "apply installs one marker line" '[ "$(marker_count)" = 1 ]'
 ok "apply wraps the entry in a managed block" '[ "$(block_count)" = 1 ] && grep -qF "# ccc-node:timed-test-deadline-scan:end" "$FAKE_CRON"'
-ok "installed line carries default schedule" 'grep -qF "20 9 * * *" "$FAKE_CRON"'
+ok "installed line carries default schedule" 'grep -qF "20 9,13,19 * * *" "$FAKE_CRON"'
 ok "installed line loads login PATH via bash -lc" 'grep -qF "bash -lc" "$FAKE_CRON"'
 ok "installed line invokes the scanner" 'grep -qF "timed_test_deadline_scan.py" "$FAKE_CRON"'
 
@@ -89,7 +89,7 @@ ok "re-apply keeps the same gen stamp" 'grep -qF "gen=$want_gen" "$FAKE_CRON"'
 bash "$INSTALLER" --apply --schedule "5 * * * *" >/dev/null 2>&1
 ok "custom schedule still single line" '[ "$(marker_count)" = 1 ]'
 ok "custom schedule applied" 'grep -qF "5 * * * *" "$FAKE_CRON"'
-ok "old schedule removed" '! grep -qF "20 9 * * *" "$FAKE_CRON"'
+ok "old schedule removed" '! grep -qF "20 9,13,19 * * *" "$FAKE_CRON"'
 
 # relative mode is selectable and lands in the rendered line
 bash "$INSTALLER" --apply --mode relative >/dev/null 2>&1

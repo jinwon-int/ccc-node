@@ -91,10 +91,15 @@ EXIT_NOT_CONFIGURED = 3
 # scanner's own name (`timed_test_deadline_scan.py`,
 # `timed-test-deadline-scan.repos`), and any issue that quotes the command
 # next to a timestamp — ccc-node#1873 did — became a high-confidence finding.
+#
+# "Expected end time" is the field the fleet's own future-ending-test-issue-
+# tracking template writes. Without it ccc-node#2109's real booking
+# (2026-10-12 07:44 KST) was invisible and an unrelated claim ETA won (#2150).
 DEADLINE_KEYWORD = re.compile(
     r"(종료\s*(일시|시각|예정|시점)"
     r"|관측\s*종료|테스트\s*종료|검증\s*종료|예정\s*종료"
-    r"|(?<![\w./-])deadline(?![\w./-])|observation\s+window|planned\s+end)",
+    r"|(?<![\w./-])deadline(?![\w./-])|observation\s+window|planned\s+end"
+    r"|expected\s+end(?:\s+time)?|(?<![\w./-])end\s+time(?![\w./-]))",
     re.IGNORECASE,
 )
 
@@ -197,6 +202,26 @@ ISSUE_REFERENCE = re.compile(r"(?:#|/(?:issues|pull)/)(\d{1,7})\b")
 # code spans; the dates are still read from the full paragraph so a real
 # booking that formats only its timestamp as code keeps its deadline.
 INLINE_CODE = re.compile(r"`[^`\n]*`")
+
+# An issue-claim comment (DOC-3508) carries the claimant's PR ETA, not a timed
+# test's end. ccc-node#2109's claim read "예상 PR: 2026-10-05 09:30 KST. 실제
+# 활성화 후 7일 창의 시작·종료 시각과 지표를 별도 기록합니다." — a deadline
+# keyword and a date in one paragraph, unrelated to each other — and was
+# reported at high confidence (#2150). Demote, keep.
+CLAIM_MARKER = re.compile(r"<!--\s*issue-claim:v1\b")
+CLAIM_ETA = re.compile(r"(예상\s*PR|PR\s*ETA)\s*\**\s*[:：]", re.IGNORECASE)
+
+# A result report that states its own verdict on a line of its own. The
+# heading checks (VERDICT, EARLY_VERDICT) only read the top of a comment, and
+# ccc-node#2083's report put "판정: 통과(정적 근거)" at the end, under a heading
+# that also stated the test end three minutes after posting — so the report
+# booked itself and its own verdict could never follow the booking (#2150).
+# The verdict word must end the label ("판정: 합격 기준은 …" is a booking).
+SELF_VERDICT_LINE = re.compile(
+    r"^[\s>*_-]*판정\s*\**\s*[:：]\s*\**\s*(통과|합격|불합격|PASS|FAIL)\**"
+    r"(?=\s*(?:[(（.,·—–-]|$))",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 @dataclass(frozen=True)
@@ -348,6 +373,7 @@ def collect_hits(issue: dict[str, Any]) -> tuple[list[Hit], list[str]]:
         # The issue body is not a completion report no matter what it says,
         # so only comments contribute a header signal.
         header = text[:SETTLED_HEADER_CHARS] if posted is not None else ""
+        is_claim = posted is not None and bool(CLAIM_MARKER.search(text))
         for paragraph in _iter_paragraphs(text):
             if not DEADLINE_KEYWORD.search(INLINE_CODE.sub("", paragraph)):
                 continue
@@ -355,6 +381,8 @@ def collect_hits(issue: dict[str, Any]) -> tuple[list[Hit], list[str]]:
             if not dates:
                 continue
             reason = classify_false_positive(paragraph, number, header)
+            if reason is None and (is_claim or CLAIM_ETA.search(paragraph)):
+                reason = "claim-eta"
             # A paragraph may render the same instant twice (KST and UTC);
             # _dates_in already normalised marked UTC, so both agree. Keep the
             # latest, which is also the KST rendering of an unmarked UTC pair.
@@ -452,13 +480,16 @@ def judge_issue(issue: dict[str, Any], now: dt.datetime, mode: str) -> Finding |
     )
     judged = []
     for comment, posted in zip(comments, comment_times):
-        head = (comment.get("body") or "")[:VERDICT_HEADER_CHARS]
+        body = comment.get("body") or ""
+        head = body[:VERDICT_HEADER_CHARS]
+        self_verdict = bool(SELF_VERDICT_LINE.search(body))
         if posted > latest.deadline:
-            if VERDICT.search(head):
+            if VERDICT.search(head) or self_verdict:
                 judged.append(comment)
-        elif (booked_at is None or posted > booked_at) and EARLY_VERDICT.search(
-            _first_line(comment.get("body") or "")
-        ):
+        elif (booked_at is None or posted > booked_at) and EARLY_VERDICT.search(_first_line(body)):
+            judged.append(comment)
+        elif self_verdict and (booked_at is None or posted >= booked_at):
+            # A report that booked and judged in one comment (ccc-node#2083).
             judged.append(comment)
     if judged:
         return None

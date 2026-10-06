@@ -2,7 +2,7 @@
 
 `scripts/timed_test_deadline_scan.py` reports timed tests (canary, observation
 window, trial) whose absolute KST end datetime has passed with no verdict
-comment. `scripts/install-timed-test-deadline-scan-cron.sh` runs it daily.
+comment. `scripts/install-timed-test-deadline-scan-cron.sh` runs it three times a day.
 
 ## Install
 
@@ -11,7 +11,8 @@ scripts/install-timed-test-deadline-scan-cron.sh --dry-run   # preview
 scripts/install-timed-test-deadline-scan-cron.sh --apply     # write the crontab entry
 ```
 
-Default: `20 9 * * *`, `--mode expired`, `--notify high`. The installer does
+Default: `20 9,13,19 * * *` (09:20 / 13:20 / 19:20 KST — daytime only; worst-case
+delay for a daytime deadline about 6 h, #2150), `--mode expired`, `--notify high`. The installer does
 **not** create `~/.claude/timed-test-deadline-scan.repos` (one `owner/name` per
 line, operator-owned); until it exists the scan exits 3 (not configured).
 
