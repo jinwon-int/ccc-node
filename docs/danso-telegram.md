@@ -450,6 +450,19 @@ offer would only add noise; this was reviewed when wiring the two paths above an
 the offer set stays closed until a path is observed to strand a failed long task.
 `/task_recover` requests a fresh offer on demand.
 
+The evidence-first **Continue** prompt carries a bounded, redacted *read ledger*
+(#2157): the files the interrupted run already read (up to 40 paths with counts),
+its read/write totals and the last three agent notes, taken from the same locked
+journal read that produces the summary. The model is told not to re-read listed
+files; when the run only read and never wrote (≥60 reads, 0 writes) it is asked
+to write a checkpoint file (`NOTES-<task>.md`) and the first deliverable before
+any further reading. This closes the loop seen on 2026-10-06 where four resumes
+of one lane re-read the same eight files 18–22 times without producing a line.
+Safe `/task_resume` (native journal resume) is unchanged, and mid-turn repeat
+detection stays native (`--task-repeat-limit`): the bridge never sees tool
+bodies, only the journal at recovery time. Long-task failures are logged with
+the last body-free `DANSO_TASK` checkpoint (state/stage/requests/tokens/elapsed).
+
 Restart-only automatic resume (opt-in `CCC_TELEGRAM_DANSO_RECOVERY_AUTO_RESUME`,
 owner decision 2026-09-21): when the startup scan validates a journal as
 `ready`/`paused` with `resume_allowed=true`, the bridge posts a body-free notice

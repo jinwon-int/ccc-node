@@ -793,6 +793,14 @@ if [ -f "$PROMOTER" ] && command -v python3 >/dev/null 2>&1; then
   summary="$(python3 "$PROMOTER" $promotion_args 2>>"$LOG")" \
     && log "promotion-stage $(printf '%s' "$summary" | head -c 500)" \
     || log "promotion-stage failed (non-fatal) code=$(printf '%s' "$summary" | jq -r '(.code // "unknown") | if test("^[a-z0-9_]+$") then . else "unknown" end' 2>/dev/null)"
+  # #2153: the promotion-stage line above is cut at 500 chars, so a stranded
+  # outbox (collector dialling the wrong account, node dropped from the collect
+  # list, dead publisher) gets its own line. Values are re-validated by shape
+  # before logging; anything unexpected is simply not logged.
+  stale_line="$(printf '%s' "$summary" | jq -r 'select(.outbox.stale == true) | "pending=\(.outbox.pending) oldest=\(.outbox.oldest_created_at) after_hours=\(.outbox.stale_after_hours)"' 2>/dev/null)"
+  case "$stale_line" in
+    pending=[0-9]*" oldest="[0-9][0-9][0-9][0-9]-*Z" after_hours="[0-9]*) log "promotion-outbox-stale $stale_line" ;;
+  esac
   collect_args="collect"
   [ "$AUTONOMY_STATE" = "dry-run" ] && collect_args="collect --dry-run"
   # #1766: only `collect` dispatches the A2A intake review round, and that needs

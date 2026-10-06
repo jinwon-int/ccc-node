@@ -169,6 +169,13 @@ class Config:
     # Default OFF. collect() may mark-ready + squash-merge a mechanical
     # promote PR (no identity hits, CI green). Identity-hit batches stay draft.
     auto_merge_promote_enabled: bool = False
+    # #2153: `identity=alias` collect entries. The identity is what an envelope's
+    # `node` must match (#1067); the alias is what export/ack actually dial, and
+    # so which remote account's outbox is read. Absent = dial the identity.
+    collect_aliases: tuple[tuple[str, str], ...] = ()
+    # #2153: an uncollected servable envelope older than this is reported as
+    # `outbox.stale` so a collector reading the wrong account is not silent.
+    outbox_stale_hours: int = 72
 
 
 @dataclass(frozen=True)
@@ -257,6 +264,44 @@ def _safe_node(raw: str) -> str:
     """
     value = re.sub(r"[^a-z0-9-]+", "-", raw.lower()).strip("-")
     return re.sub(r"-+", "-", value)[:32].rstrip("-")
+
+
+def _parse_collect_entries(
+    entries: tuple[str, ...] | list[str],
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    """Split collect entries into identities and dial-alias overrides (#2153).
+
+    `identity` dials `identity` (the pre-#2153 form). `identity=alias` still
+    requires the envelope's node to equal `identity`, but export/ack dial
+    `alias` — e.g. a lane owned by an account other than the one the identity
+    alias logs in as. Both halves use the node-name grammar (no colon, so the
+    `remote:local` source label cannot collide). One identity may not name two
+    different aliases; a repeated identical entry is de-duplicated as before.
+    """
+    identities: list[str] = []
+    aliases: dict[str, str] = {}
+    for entry in entries:
+        identity, separator, alias = (part.strip() for part in entry.partition("="))
+        if not _NAME_RE.fullmatch(identity) or len(identity) > 32:
+            raise PromotionError("collector_nodes_invalid")
+        if separator and (not _NAME_RE.fullmatch(alias) or len(alias) > 64):
+            raise PromotionError("collector_nodes_invalid")
+        dial = alias if separator else identity
+        if identity in aliases and aliases[identity] != dial:
+            raise PromotionError("collector_nodes_invalid")
+        if identity not in aliases:
+            identities.append(identity)
+        aliases[identity] = dial
+    if len(identities) > 32:
+        raise PromotionError("collector_nodes_invalid")
+    overrides = tuple((node, dial) for node, dial in aliases.items() if dial != node)
+    return tuple(identities), overrides
+
+
+def _collect_dial(config: Config, node: str) -> str:
+    """The SSH alias export/ack dial for a collect identity (#2153)."""
+    # getattr: test doubles (SimpleNamespace configs) predate this field.
+    return dict(getattr(config, "collect_aliases", ())).get(node, node)
 
 
 def _read_enabled_file(path: Path, *, trust_root: Path | None = None) -> bool:
@@ -454,16 +499,12 @@ def _config(environment: dict[str, str] | None = None) -> Config:
             raise PromotionError("review_llm_cmd_invalid")
         review_llm_cmd = tuple(tokens)
     collect_raw = env.get("CCC_SKILL_PROMOTION_COLLECT_NODES")
-    collect_nodes = (
+    collect_entries = (
         tuple(part.strip() for part in collect_raw.split(",") if part.strip())
         if collect_raw is not None
         else _private_lines(state_dir / "skill-promotion.collect-nodes", trust_root=home)
     )
-    collect_nodes = tuple(dict.fromkeys(collect_nodes))
-    if len(collect_nodes) > 32 or any(
-        not _NAME_RE.fullmatch(node) or len(node) > 32 for node in collect_nodes
-    ):
-        raise PromotionError("collector_nodes_invalid")
+    collect_nodes, collect_aliases = _parse_collect_entries(collect_entries)
     tool_default = claude_dir / "hooks" / "skill-review" / "ownership.py"
     provider_roots: dict[str, Path] = {
         "claude": Path(
@@ -508,6 +549,8 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         enabled=enabled,
         publisher_enabled=publisher_enabled,
         collect_nodes=collect_nodes,
+        collect_aliases=collect_aliases,
+        outbox_stale_hours=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_OUTBOX_STALE_HOURS", 72, 1, 720),
         dispatch_enabled=dispatch_enabled,
         broker_url=env.get("CCC_SKILL_PROMOTION_BROKER_URL", "http://127.0.0.1:8787").rstrip("/"),
         a2a_nexus_dir=Path(
@@ -1586,6 +1629,56 @@ def _pending_envelopes(
     return rows
 
 
+def _outbox_summary(config: Config) -> dict[str, object]:
+    """Report uncollected servable envelopes and whether they look stranded.
+
+    #2153: a collector dialling the wrong remote account reads an empty outbox
+    and reports ok, while the node's own sweep logs `promotion-stage ok`, so
+    nothing ever shows the gap. The node is the one place that can see its
+    envelopes ageing. Triggerless legacy envelopes are excluded because export
+    never serves them (#315), so they would otherwise look stale forever.
+    Best-effort: a broken outbox reports its error code instead of failing run.
+    """
+    summary: dict[str, object] = {
+        "pending": 0,
+        "oldest_created_at": None,
+        "stale": False,
+        "stale_after_hours": getattr(config, "outbox_stale_hours", 72),
+    }
+    outbox = config.promotion_state_dir / "outbox"
+    sent = config.promotion_state_dir / "sent"
+    if not outbox.exists():
+        return summary
+    try:
+        if not _path_components_safe(outbox, final_kind="dir", trust_root=config.home):
+            raise PromotionError("outbox_path_unsafe")
+        stamps: list[str] = []
+        for path in sorted(outbox.glob("*.json")):
+            if (sent / path.name).exists():
+                continue
+            candidate, created_at, _ = _candidate_from_envelope(
+                _state_payload(path, trust_root=config.home)
+            )
+            if not _description_trigger.has_trigger_wording(candidate.description):
+                continue
+            stamps.append(created_at)
+    except PromotionError as error:
+        summary["error"] = error.code
+        return summary
+    if not stamps:
+        return summary
+    oldest = min(stamps)
+    age = datetime.now(timezone.utc) - datetime.strptime(oldest, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    summary.update(
+        pending=len(stamps),
+        oldest_created_at=oldest,
+        stale=age.total_seconds() > int(summary["stale_after_hours"]) * 3600,
+    )
+    return summary
+
+
 def _ack_local(config: Config, transport_id: str) -> bool:
     if not _SAFE_COMPONENT_RE.fullmatch(transport_id):
         raise PromotionError("ack_id_invalid")
@@ -1688,6 +1781,8 @@ def _status(config: Config) -> dict[str, object]:
         "repo": config.repo,
         "max_prs_per_run": config.max_prs,
         "collect_nodes": list(config.collect_nodes),
+        "collect_aliases": dict(config.collect_aliases),
+        "outbox": _outbox_summary(config),
         "remote_brokers": [rb["name"] for rb in config.remote_brokers],
         "revise_enabled": config.revise_enabled,
         "revise_round_limit": config.revise_round_limit,
@@ -1787,6 +1882,7 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
             "blocked": blocked,
             "repaired": repaired,
             "errors": errors,
+            "outbox": _outbox_summary(config),
         }
 
 
@@ -6329,7 +6425,11 @@ def _collect_envelopes(
         else:
             try:
                 gather(
-                    _remote_envelopes(expected_node, limit=min(remaining, config.max_prs), blocked=errors),
+                    _remote_envelopes(
+                        _collect_dial(config, expected_node),
+                        limit=min(remaining, config.max_prs),
+                        blocked=errors,
+                    ),
                     label,
                     expected_node,
                 )
@@ -6391,7 +6491,7 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
                     if not _ack_local(config, transport_id):
                         raise PromotionError("local_ack_failed")
                 else:
-                    _remote_ack(candidate.node, transport_id)
+                    _remote_ack(_collect_dial(config, candidate.node), transport_id)
                 _append_ledger(config, {"ts": _utc_now(), **row})
             except PromotionError as error:
                 errors.append(

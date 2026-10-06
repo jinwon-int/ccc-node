@@ -385,3 +385,72 @@ def test_recovery_summary_explicitly_requires_user_input(state, allowed):
     else:
         assert '/task_resume 으로 재개할 수 없습니다' in text
         assert '선택 전에는 실행하지 않습니다' in text
+
+
+# ---- #2157: read ledger handed back on evidence-first resume ----
+
+def _journal(rows):
+    return '\n'.join(map(json.dumps, rows)).encode()
+
+
+def _assistant(text, calls=()):
+    content = [{'type': 'text', 'text': text}] if text else []
+    for name, arguments in calls:
+        content.append({'type': 'toolCall', 'id': 'c', 'name': name, 'arguments': arguments})
+    return {'type': 'message', 'message': {'role': 'assistant', 'content': content}}
+
+
+def test_summary_builds_bounded_read_ledger_and_write_count():
+    rows = [{'type': 'message', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': 'port L3'}]}}]
+    for i in range(22):
+        rows.append(_assistant(f'reading {i}', [('read', {'path': '/repo/Relay/RelayTransport.swift'})]))
+    rows.append(_assistant('look', [('read', {'path': '/repo/CONTRACTS.md'}),
+                                    ('read', {'file_path': '/repo/Engine/MlsEngine.swift'}),
+                                    ('bash', {'command': 'ls Sources'})]))
+    rows.append(_assistant('write', [('write', {'path': '/repo/Policy/CommitPolicy.swift', 'content': 'x'}),
+                                     ('bash', {'command': 'cd /repo && git add -A && git commit -m wip'})]))
+    result = _summarize(_journal(rows), snapshot())
+    assert result.reads == 24 and result.writes == 2
+    assert result.read_paths[0] == ('/repo/Relay/RelayTransport.swift', 22)
+    assert result.max_repeat == 22 and not result.stalled
+    assert result.recent_notes[-1] == 'write' and len(result.recent_notes) == 3
+    text = result.continuation()
+    assert '"files_already_read"' in text and '"times": 22' in text and 'do not re-read' in text
+    assert 'recent_agent_notes' in text
+    assert '읽기 24회(고유 파일 3개, 최다 반복 22회) · 쓰기 2회' in result.render()
+
+
+def test_stalled_reading_resume_asks_for_a_checkpoint_file_before_more_reading():
+    rows = [{'type': 'message', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': 'port L3'}]}}]
+    for i in range(70):
+        rows.append(_assistant('', [('read', {'path': f'/repo/file{i % 7}.swift'})]))
+    result = _summarize(_journal(rows), snapshot())
+    assert result.reads == 70 and result.writes == 0 and result.stalled
+    text = result.continuation()
+    assert 'write a checkpoint file' in text and 'NOTES-<task>.md' in text
+    assert '쓰기 없이 읽기만 반복됐습니다' in result.render()
+    assert 'First inspect' in text and 'reference data' in text
+
+
+def test_read_ledger_is_redacted_bounded_and_reset_per_user_turn():
+    rows = [{'type': 'message', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': 'first'}]}},
+            _assistant('', [('read', {'path': '/old/file.txt'})]),
+            {'type': 'message', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': 'second'}]}}]
+    for i in range(50):
+        rows.append(_assistant('', [('read', {'path': f'/repo/f{i:02d}.swift'})]))
+    rows.append(_assistant('', [('read', {'path': '/repo/secret?api_key=' + 'k' * 60})]))
+    rows.append(_assistant('', [('read', {'path': 'x' * 5000})]))
+    rows.append(_assistant('', [('read', 'not-a-dict'), ('read', {'path': 7})]))
+    result = _summarize(_journal(rows), snapshot())
+    assert len(result.read_paths) == 40 and result.reads == 52
+    assert all(path != '/old/file.txt' for path, _ in result.read_paths)
+    assert 'k' * 20 not in result.continuation()
+    assert all(len(path) <= 200 for path, _ in result.read_paths)
+
+
+def test_journal_without_tool_calls_keeps_the_original_continuation_shape():
+    rows = [{'type': 'message', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': 'hi'}]}},
+            _assistant('done')]
+    result = _summarize(_journal(rows), snapshot())
+    assert result.reads == 0 and result.writes == 0 and result.read_paths == ()
+    assert 'read_ledger' not in result.continuation() and result.ledger_lines() == ''
