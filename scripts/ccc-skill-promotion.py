@@ -300,7 +300,8 @@ def _parse_collect_entries(
 
 def _collect_dial(config: Config, node: str) -> str:
     """The SSH alias export/ack dial for a collect identity (#2153)."""
-    return dict(config.collect_aliases).get(node, node)
+    # getattr: test doubles (SimpleNamespace configs) predate this field.
+    return dict(getattr(config, "collect_aliases", ())).get(node, node)
 
 
 def _read_enabled_file(path: Path, *, trust_root: Path | None = None) -> bool:
@@ -1642,7 +1643,7 @@ def _outbox_summary(config: Config) -> dict[str, object]:
         "pending": 0,
         "oldest_created_at": None,
         "stale": False,
-        "stale_after_hours": config.outbox_stale_hours,
+        "stale_after_hours": getattr(config, "outbox_stale_hours", 72),
     }
     outbox = config.promotion_state_dir / "outbox"
     sent = config.promotion_state_dir / "sent"
@@ -1673,7 +1674,7 @@ def _outbox_summary(config: Config) -> dict[str, object]:
     summary.update(
         pending=len(stamps),
         oldest_created_at=oldest,
-        stale=age.total_seconds() > config.outbox_stale_hours * 3600,
+        stale=age.total_seconds() > int(summary["stale_after_hours"]) * 3600,
     )
     return summary
 
