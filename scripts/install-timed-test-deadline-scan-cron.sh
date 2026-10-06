@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install a daily timed-test deadline scan cron for ccc-node (ccc-node#1870).
+# Install the timed-test deadline scan cron for ccc-node (ccc-node#1870, #2150).
 #
 # The owner rule (2026-09-11) requires an absolute KST end datetime on every
 # timed test. Writing it down and waking up at it are separate problems: the
@@ -49,9 +49,13 @@ SCAN_CMD="${CCC_TIMED_TEST_SCAN_CMD:-$SELF_DIR/timed_test_deadline_scan.py}"
 REPOS="${CCC_TIMED_TEST_SCAN_REPOS:-$CLAUDE_DIR/timed-test-deadline-scan.repos}"
 MODE="${CCC_TIMED_TEST_SCAN_MODE:-expired}"
 NOTIFY="${CCC_TIMED_TEST_SCAN_NOTIFY:-high}"
-# 09:20 KST daily: late enough that an overnight deadline has actually passed,
-# early enough that a finding still has a working day attached to it.
-SCHEDULE="${CCC_TIMED_TEST_SCAN_CRON:-20 9 * * *}"
+# 09:20 / 13:20 / 19:20 KST: the 09:20 run still catches overnight deadlines
+# with a working day attached; the two later runs cut the worst-case delay for
+# a daytime deadline from ~24 h to ~6 h. Once a day, fleet-mcp#17 (12:00) and
+# piri#27 (18:00) sat unjudged for 21 h and 15 h unnoticed (#2150). Daytime
+# only, so a new finding never pings the owner at night; an unchanged set is
+# still re-sent only every NOTIFY_REMIND_AFTER_DAYS calendar days.
+SCHEDULE="${CCC_TIMED_TEST_SCAN_CRON:-20 9,13,19 * * *}"
 LOG="${CCC_TIMED_TEST_SCAN_CRON_LOG:-$STATE_DIR/timed-test-deadline-scan.cron.log}"
 CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
 MARKER="# ccc-node:timed-test-deadline-scan"
