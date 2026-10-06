@@ -250,6 +250,71 @@ ok "central collector publishes a matching remote-node envelope" \
 ok "remote candidate is acknowledged only after PR publication" \
   'grep -q " ack $remote_transport" "$REMOTE_SSH_STATE/calls"'
 
+# ─── #2153: `identity=alias` dials alias, still matches identity ─────────────
+# A lane owned by a different remote account than the identity alias logs in
+# as must be collectable without re-pointing that alias. Export and ack dial the
+# override; the envelope node is still checked against the identity (#1067).
+write_skill alias-check ""
+write_status alias-check
+env "${remote_stage_env[@]}" python3 "$PROMOTER" run >/dev/null
+ALIAS_EXPORT="$TMP/alias-export.json"
+env "${remote_stage_env[@]}" python3 "$PROMOTER" export --limit 1 > "$ALIAS_EXPORT"
+alias_transport="$(jq -r '.envelopes[0].transport_id' "$ALIAS_EXPORT")"
+env "${remote_stage_env[@]}" python3 "$PROMOTER" ack "$alias_transport" >/dev/null
+ALIAS_SSH_STATE="$TMP/alias-ssh-state"
+mkdir -p "$ALIAS_SSH_STATE"
+alias_collect_env=(
+  "${publish_env[@]}"
+  "GH_TEST_STATE=$TMP/alias-gh-state"
+  "CCC_SKILL_PROMOTION_COLLECT_NODES=remotenode=remotenode-lane"
+  "SSH_TEST_STATE=$ALIAS_SSH_STATE"
+  "SSH_TEST_EXPORT=$ALIAS_EXPORT"
+)
+out="$(env "${alias_collect_env[@]}" python3 "$PROMOTER" collect)"; rc=$?
+ok "#2153: identity=alias publishes the envelope under its identity" \
+  '[ "$rc" = 0 ] && jq -e ".published[0].source == \"remotenode\" and .published[0].node == \"remotenode\" and .published[0].outcome == \"pr-opened\"" >/dev/null <<<"$out"'
+ok "#2153: export and ack dial the alias, never the identity" \
+  'grep -q " remotenode-lane python3 .* export " "$ALIAS_SSH_STATE/calls" && grep -q " remotenode-lane python3 .* ack $alias_transport" "$ALIAS_SSH_STATE/calls" && ! grep -q " remotenode python3 " "$ALIAS_SSH_STATE/calls"'
+out="$(env "${alias_collect_env[@]}" python3 "$PROMOTER" status)"; rc=$?
+ok "#2153: status lists identities and alias overrides separately" \
+  '[ "$rc" = 0 ] && jq -e "(.collect_nodes | index(\"remotenode\")) != null and .collect_aliases.remotenode == \"remotenode-lane\"" >/dev/null <<<"$out"'
+MISMATCH_SSH_STATE="$TMP/mismatch-ssh-state"
+mkdir -p "$MISMATCH_SSH_STATE"
+out="$(env "${publish_env[@]}" "GH_TEST_STATE=$TMP/mismatch-gh-state" \
+  "CCC_SKILL_PROMOTION_COLLECT_NODES=othernode=remotenode-lane" \
+  "SSH_TEST_STATE=$MISMATCH_SSH_STATE" "SSH_TEST_EXPORT=$ALIAS_EXPORT" \
+  python3 "$PROMOTER" collect)"; rc=$?
+ok "#2153: an alias cannot launder another node's envelope (#1067 guard kept)" \
+  'jq -e "([.errors[] | select(.source == \"othernode\" and .code == \"remote_node_mismatch\")] | length) == 1 and (.published | length) == 0" >/dev/null <<<"$out" && ! grep -q " ack " "$MISMATCH_SSH_STATE/calls"'
+for bad in "remotenode=bad.alias" "remotenode=" "remotenode=a:b" "remotenode=one,remotenode=two"; do
+  out="$(env "${publish_env[@]}" "CCC_SKILL_PROMOTION_COLLECT_NODES=$bad" python3 "$PROMOTER" status)"; rc=$?
+  ok "#2153: invalid collect entry '$bad' fails closed" \
+    '[ "$rc" = 2 ] && jq -e ".code == \"collector_nodes_invalid\"" >/dev/null <<<"$out"'
+done
+out="$(env "${publish_env[@]}" "CCC_SKILL_PROMOTION_COLLECT_NODES=remotenode,remotenode=remotenode" python3 "$PROMOTER" status)"; rc=$?
+ok "#2153: identity=identity is the bare form, not an override" \
+  '[ "$rc" = 0 ] && jq -e ".collect_aliases == {} and .collect_nodes == [\"remotenode\"]" >/dev/null <<<"$out"'
+
+# ─── #2153: node reports an outbox nobody collects ───────────────────────────
+write_skill stale-check ""
+write_status stale-check
+out="$(env "${stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
+stale_transport="$(jq -r '.staged[0].transport_id' <<<"$out")"
+stale_file="$STATE/skill-promotion/outbox/$stale_transport.json"
+ok "#2153: a freshly staged envelope is pending but not stale" \
+  '[ "$rc" = 0 ] && jq -e ".outbox.pending >= 1 and .outbox.stale == false and .outbox.stale_after_hours == 72" >/dev/null <<<"$out"'
+sed -i -E 's/"created_at":"[^"]*"/"created_at":"2020-01-01T00:00:00Z"/' "$stale_file"
+out="$(env "${stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
+ok "#2153: an envelope uncollected past the threshold is reported stale" \
+  '[ "$rc" = 0 ] && [ "$(stat -c %a "$stale_file")" = 600 ] && jq -e ".outbox.stale == true and .outbox.oldest_created_at == \"2020-01-01T00:00:00Z\"" >/dev/null <<<"$out"'
+out="$(env "${stage_env[@]}" python3 "$PROMOTER" status)"; rc=$?
+ok "#2153: status carries the same outbox signal" \
+  '[ "$rc" = 0 ] && jq -e ".outbox.stale == true" >/dev/null <<<"$out"'
+env "${stage_env[@]}" python3 "$PROMOTER" ack "$stale_transport" >/dev/null
+out="$(env "${stage_env[@]}" python3 "$PROMOTER" status)"; rc=$?
+ok "#2153: acknowledging the envelope clears the stale signal" \
+  '[ "$rc" = 0 ] && jq -e ".outbox.stale == false" >/dev/null <<<"$out"'
+
 # ─── #1477: collect / drop-report --ack share promotion.lock with run ─────────
 # A second collect while another holds the lock must report status=locked and
 # touch nothing (no PR, no ack, no ledger row); collect --dry-run is read-only
