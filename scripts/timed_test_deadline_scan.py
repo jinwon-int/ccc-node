@@ -217,8 +217,12 @@ CLAIM_ETA = re.compile(r"(예상\s*PR|PR\s*ETA)\s*\**\s*[:：]", re.IGNORECASE)
 # that also stated the test end three minutes after posting — so the report
 # booked itself and its own verdict could never follow the booking (#2150).
 # The verdict word must end the label ("판정: 합격 기준은 …" is a booking).
+# The English closing template of future-ending-test-issue-tracking writes
+# "**Verdict**: FAIL" (ccc-node#2130, judged 23 min after its deadline and
+# still reported expired-unjudged), so "Verdict" is a label too, and
+# INCOMPLETE is a verdict — the observation was closed with a decision.
 SELF_VERDICT_LINE = re.compile(
-    r"^[\s>*_-]*판정\s*\**\s*[:：]\s*\**\s*(통과|합격|불합격|PASS|FAIL)\**"
+    r"^[\s>*_-]*(?:판정|verdict)\s*\**\s*[:：]\s*\**\s*(통과|합격|불합격|PASS|FAIL|INCOMPLETE)\**"
     r"(?=\s*(?:[(（.,·—–-]|$))",
     re.IGNORECASE | re.MULTILINE,
 )

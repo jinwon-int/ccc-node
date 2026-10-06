@@ -540,6 +540,77 @@ class FalsePositive2150Tests(unittest.TestCase):
         self.assertIsNotNone(scanner.judge_issue(issue, NOW_1006, "expired"))
 
 
+# ccc-node#2130, reduced (node names generalized): the English tracking
+# template booked a 48h window and closed it with "**Verdict**: FAIL" 23 minutes
+# after the deadline.
+BOOKING_2130 = (
+    "<!-- future-ending-test-issue-tracking: open -->\n"
+    "**Test/task**: Nunchi PR2132 natural-run acceptance\n"
+    "**Tracking model**: clock-based\n"
+    "**Start time**: 2026-10-04T19:02:15.323514+09:00 (KST)\n"
+    "**Expected end time**: 2026-10-06T19:02:15.323514+09:00 (KST)\n"
+    "**Next action on completion**: publish PASS/FAIL/INCOMPLETE."
+)
+CLOSE_2130 = (
+    "<!-- future-ending-test-issue-tracking: closed -->\n"
+    "**Test/task**: Nunchi PR2132 natural-run acceptance\n"
+    "**Actual end time**: 2026-10-06T19:25:16.168598+09:00 (KST)\n"
+    "**Verdict**: FAIL\n"
+    "**Summary**: The bounded 48h read-only window ended."
+)
+
+
+class EnglishVerdictTests(unittest.TestCase):
+    """Follow-up to #2150: the English closing template is a verdict."""
+
+    def test_issue_2130_english_verdict_after_deadline_is_judged(self) -> None:
+        issue = _issue(
+            number=2130,
+            comments=[
+                _comment(BOOKING_2130, "2026-10-04T10:02:29Z"),
+                _comment(CLOSE_2130, "2026-10-06T10:25:17Z"),
+            ],
+        )
+        self.assertIsNone(scanner.judge_issue(issue, dt.datetime(2026, 10, 7, 9, 20), "expired"))
+
+    def test_issue_2130_before_the_verdict_is_still_reported(self) -> None:
+        issue = _issue(number=2130, comments=[_comment(BOOKING_2130, "2026-10-04T10:02:29Z")])
+        finding = scanner.judge_issue(issue, dt.datetime(2026, 10, 6, 19, 20), "expired")
+        assert finding is not None
+        self.assertEqual(finding.deadline, dt.datetime(2026, 10, 6, 19, 2))
+        self.assertEqual(finding.confidence, "high")
+
+    def test_incomplete_and_pass_close_the_window(self) -> None:
+        for word in ("INCOMPLETE", "PASS", "pass"):
+            with self.subTest(word=word):
+                close = CLOSE_2130.replace("**Verdict**: FAIL", f"**Verdict**: {word}")
+                issue = _issue(
+                    comments=[
+                        _comment(BOOKING_2130, "2026-10-04T10:02:29Z"),
+                        _comment(close, "2026-10-06T10:25:17Z"),
+                    ]
+                )
+                self.assertIsNone(scanner.judge_issue(issue, dt.datetime(2026, 10, 7, 9, 20), "expired"))
+
+    def test_verdict_before_the_booking_does_not_count(self) -> None:
+        early = CLOSE_2130.replace("Nunchi PR2132 natural-run acceptance", "activation readiness").replace(
+            "2026-10-06T19:25:16.168598", "2026-10-04T17:58:31.415481"
+        )
+        issue = _issue(
+            comments=[
+                _comment(early.replace("FAIL", "INCOMPLETE"), "2026-10-04T08:58:32Z"),
+                _comment(BOOKING_2130, "2026-10-04T10:02:29Z"),
+            ]
+        )
+        self.assertIsNotNone(scanner.judge_issue(issue, dt.datetime(2026, 10, 7, 9, 20), "expired"))
+
+    def test_verdict_labels_that_book_are_not_verdicts(self) -> None:
+        for line in ("**Verdict**: PASS criteria are listed below", "Verdict owner: operator", "**Verdict**: TBD"):
+            with self.subTest(line=line):
+                issue = _issue(comments=[_comment(BOOKING_2130 + "\n" + line, "2026-10-04T10:02:29Z")])
+                self.assertIsNotNone(scanner.judge_issue(issue, dt.datetime(2026, 10, 7, 9, 20), "expired"))
+
+
 class RelativeModeTests(unittest.TestCase):
     def test_relative_duration_without_absolute_time_is_reported(self) -> None:
         # family-messenger#104: "며칠 관찰 후 완전 삭제" — unschedulable.
