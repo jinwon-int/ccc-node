@@ -7,6 +7,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 import hashlib
+import logging
 import math
 import os
 from pathlib import Path
@@ -20,6 +21,22 @@ from telegram_bot.core.agent_runtime import (
 )
 from telegram_bot.core.danso_progress import read_progress
 from telegram_bot.core.danso_skill_usage import DansoSkillReads
+
+logger = logging.getLogger(__name__)
+
+# #2157: failures that interrupt a long task are logged with the last body-free
+# DANSO_TASK checkpoint so an operator can tell "died after 193 requests at stage 0"
+# from "died before the first request" without opening the journal.
+DIAGNOSED_FAILURES = ('danso_timeout', 'danso_compaction', 'danso_provider',
+                      'danso_provider_timeout', 'danso_adapter_error')
+
+
+def _failure_context(code, progress):
+    if progress is None:
+        return f'code={code} last_task_progress=none'
+    return (f'code={code} last_task_progress=state:{progress.state} stage:{progress.stage} '
+            f'requests:{progress.requests} tokens:{progress.reported_tokens} '
+            f'elapsed_s:{progress.elapsed_seconds}')
 
 CAP = 1024 * 1024
 # A checkpoint may be emitted at stage start and after each request, with a
@@ -640,6 +657,7 @@ class DansoSession:
         self._dispatch_guard = None
         self._task_progress_ready = False
         self._task_progress_seen = False
+        self._last_task_progress = None
         self._task_pause_requested = False
 
     def set_dispatch_guard(self, guard):
@@ -782,6 +800,7 @@ class DansoSession:
             self._task_progress_ready = False
             self._task_progress_seen = False
             self._task_pause_requested = False
+            self._last_task_progress = None
             readers, events = [], []
             self._stop_task = None
             effective_timeout = r.timeout
@@ -937,6 +956,9 @@ class DansoSession:
             except (OSError, ValueError):
                 events.append(ErrorEvent(code='danso_adapter_error', message='Worker output or startup failed validation.'))
             finally:
+                for event in events:
+                    if isinstance(event, ErrorEvent) and event.code in DIAGNOSED_FAILURES:
+                        logger.warning('Danso long task failed: %s', _failure_context(event.code, self._last_task_progress))
                 _, cancelled = await _wait_owned(asyncio.create_task(self._cleanup(readers)))
                 if cancelled:
                     raise asyncio.CancelledError
@@ -1016,6 +1038,7 @@ class DansoSession:
                             progress_task = None
                         else:
                             last_progress = item
+                            self._last_task_progress = item
                             prefer_task_progress = False
                             if item.state == 'checkpoint' and not self._task_progress_seen:
                                 self._task_progress_seen = True
