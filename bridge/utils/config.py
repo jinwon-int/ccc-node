@@ -809,6 +809,25 @@ class Config(
             "path (host settings + audit trail); set per node and reversible."
         ),
     )
+    claude_progress_thinking: bool = Field(
+        default=True,
+        alias="CCC_CLAUDE_PROGRESS_THINKING",
+        description=(
+            "Render the progress-update thinking blocks that Claude Fable 5.x / "
+            "Mythos 5.x / Opus 5.5 return between tool calls as user-visible "
+            "interim text (#2161). Those models no longer emit that narration "
+            "as text blocks; off keeps every thinking block private."
+        ),
+    )
+    claude_progress_thinking_models: str = Field(
+        default="claude-fable-5,claude-mythos-5,claude-opus-5-5",
+        alias="CCC_CLAUDE_PROGRESS_THINKING_MODELS",
+        description=(
+            "Comma-separated model-id prefixes whose non-empty thinking blocks "
+            "are progress updates rather than reasoning summaries (#2161). "
+            "Other models keep thinking private."
+        ),
+    )
     telegram_session_scope: Literal[
         "per-user-chat", "shared-groups", "shared-all"
     ] = Field(
