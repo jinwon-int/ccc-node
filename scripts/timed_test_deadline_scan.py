@@ -188,6 +188,12 @@ SETTLED = re.compile(
 # inside this window, while unrelated later prose does not leak in.
 SETTLED_HEADER_CHARS = 150
 
+# Demotion reasons that mean "this mention records a deadline, it does not
+# book one". Such hits never move the early-verdict window (#2149): a verdict
+# restating the deadline it beat, a report inside a completion comment, or a
+# time that had already passed when the comment was posted.
+NOT_A_BOOKING = frozenset({"already-settled", "already-settled-comment", "past-at-posting"})
+
 # Relative-only durations the owner rule forbids.
 RELATIVE_DURATION = re.compile(
     r"(며칠|몇\s*일|수일|여러\s*날|1~2주|한두\s*주|몇\s*주|수주간|당분간"
@@ -477,9 +483,17 @@ def judge_issue(issue: dict[str, Any], now: dt.datetime, mode: str) -> Finding |
     after = [t for t in comment_times if t > latest.deadline]
     # The early-verdict window opens at the *last* comment that stated this
     # deadline, so a re-affirmed booking resets it. The issue body (posted_at
-    # None) predates every comment.
+    # None) predates every comment. Only hits that can be a booking count:
+    # a verdict or completion report that restates the deadline it beat
+    # ("예약 종료 시각(10-08 09:00 KST)보다 앞당겨 끝냈다", a2a-nexus#2315)
+    # is a record of the booking, not a new one — counting it moved
+    # booked_at onto the verdict itself and the verdict was ignored (#2149).
     booked_at = max(
-        (hit.posted_at for hit in hits if hit.deadline == latest.deadline and hit.posted_at),
+        (
+            hit.posted_at
+            for hit in hits
+            if hit.deadline == latest.deadline and hit.posted_at and hit.weak_reason not in NOT_A_BOOKING
+        ),
         default=None,
     )
     judged = []

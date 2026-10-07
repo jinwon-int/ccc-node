@@ -293,6 +293,37 @@ class ExpiredModeTests(unittest.TestCase):
         )
         self.assertIsNotNone(scanner.judge_issue(issue, NOW, "expired"))
 
+    def test_early_verdict_restating_the_deadline_does_not_move_the_window(self) -> None:
+        # a2a-nexus#2315 (#2149): the verdict comment's first paragraph quoted
+        # the booked end time it beat. That mention was demoted
+        # (already-settled) but still counted as a booking, so booked_at
+        # landed on the verdict itself, `posted > booked_at` failed and the
+        # issue came back as expired-unjudged at high confidence.
+        issue = _issue(
+            number=2315,
+            repo="jinwon-int/a2a-nexus",
+            comments=[
+                _comment(
+                    "## 관측 예약\n\n| 항목 | 값 |\n|---|---|\n| 종료 일시 | **2026-10-08 09:00 KST** |",
+                    "2026-10-05T02:10:00Z",
+                ),
+                _comment(
+                    "## 관측 종료 판정 — 합격(PASS) · 조기 종료\n\n"
+                    "예약 종료 시각(2026-10-08 09:00 KST)보다 앞당겨 끝냈다 — 필요한 관측 7건을 모두 확보했다.",
+                    "2026-10-05T09:40:00Z",
+                ),
+            ],
+        )
+        now = dt.datetime(2026, 10, 8, 10, 0)
+        self.assertIsNone(scanner.judge_issue(issue, now, "expired"))
+        # Dropping the restatement must not hide a genuinely unjudged booking.
+        unjudged = _issue(
+            number=2315,
+            repo="jinwon-int/a2a-nexus",
+            comments=[issue["comments"][0], _comment("진행 중 — 관측 3/7", "2026-10-06T00:00:00Z")],
+        )
+        self.assertIsNotNone(scanner.judge_issue(unjudged, now, "expired"))
+
     def test_early_progress_headings_are_not_verdicts(self) -> None:
         # ccc-node#1528 was cleared by "판정표" when the 200-char window was
         # read before the deadline; interim and pending calls are not results.
