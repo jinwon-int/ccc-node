@@ -811,8 +811,13 @@ if [ -f "$PROMOTER" ] && command -v python3 >/dev/null 2>&1; then
   # dispatches). Absent file stays non-fatal: an ordinary node has none and
   # reports publisher_enabled=false anyway.
   if [ -f "$EDGE_ENV" ]; then edge_state=loaded; else edge_state=absent; fi
+  # The cron log keeps a truncated digest; the full collect result goes to
+  # skill-promotion/last-collect.json (0600) so dispatch skip codes are
+  # readable after the fact — the 500-byte cut hid `dispatch_broker_unreachable`
+  # for three days (2026-10-05~07) while nine intake PRs waited unreviewed.
   summary="$(collect_with_edge_env $collect_args)" \
-    && log "promotion-collect edge-env=$edge_state $(printf '%s' "$summary" | head -c 500)" \
+    && { if [ -d "$STATE_DIR/skill-promotion" ]; then (umask 077; printf '%s\n' "$summary" > "$STATE_DIR/skill-promotion/last-collect.json") 2>/dev/null || :; fi
+         log "promotion-collect edge-env=$edge_state $(printf '%s' "$summary" | head -c 1500)"; } \
     || log "promotion-collect failed (non-fatal) edge-env=$edge_state"
 else
   log "promotion skipped reason=missing-runtime"

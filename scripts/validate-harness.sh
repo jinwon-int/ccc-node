@@ -528,6 +528,18 @@ else
   err "doctor skill-promotion backlog verdict tests failed"
   tail -10 "$TMP/doctor-promotion-backlog-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_dispatch_gap_test.py >"$TMP/doctor-dispatch-gap-test.out" 2>&1; then
+  say "  ok doctor skill-promotion dispatch-gap verdict tests"
+else
+  err "doctor skill-promotion dispatch-gap verdict tests failed (an undispatched intake PR would stay invisible)"
+  tail -10 "$TMP/doctor-dispatch-gap-test.out" 2>/dev/null
+fi
+if python3 scripts/ccc_skill_promotion_redispatch_test.py >"$TMP/skill-promotion-redispatch-test.out" 2>&1; then
+  say "  ok skill-promotion dispatch-skip ledger + redispatch selection tests"
+else
+  err "skill-promotion dispatch-skip ledger + redispatch selection tests failed"
+  tail -10 "$TMP/skill-promotion-redispatch-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_fleet_sync_test.py >"$TMP/doctor-fleet-sync-test.out" 2>&1; then
   say "  ok doctor fleet-skills sync verdict tests"
 else
