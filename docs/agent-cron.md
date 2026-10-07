@@ -73,7 +73,9 @@ Each task runs one payload (default: `prompt`, backward compatible):
 - **prompt** (default): the existing headless Claude run of `prompt` via
   `claude/headless.sh`. Optional `payload.model` is passed through as
   `--model` (via `CCC_MODEL`). Wall-clock timeout `payload.timeoutSec`
-  (default 3600s).
+  (default 3600s) is handed to the runner as `CCC_HEADLESS_TIMEOUT` (an
+  explicit value already in the environment wins), so the runner's own
+  1500s default no longer caps longer tasks (#2156).
 - **command**: `payload.argv` runs directly (no shell interpolation, no LLM
   token spend — watchdog/maintenance jobs). Optional `cwd`,
   `timeoutSec` (default 600s), `outputMaxBytes` (default 64 KiB, capped
@@ -248,7 +250,9 @@ Two independent caps exist:
   `CCC_AGENT_CRON_TIMEOUT_START`, `infinity` to opt out).
 - Both headless runners wrap the provider CLI in `timeout` — `CCC_HEADLESS_TIMEOUT`
   seconds (default `1500`, `0` disables), exiting `124` when tripped. This is the
-  only cap on Termux nodes, which have no systemd.
+  only cap on Termux nodes, which have no systemd. agent-cron prompt tasks set
+  it to their `timeoutSec` and wait `timeoutSec + 60s` themselves, so the
+  runner's kill grace (`-k 30`) fires first and reports the timeout.
 
 Task prompts must not instruct the agent to block on an external condition.
 An observed real failure: a task told the agent to wait for a PR to become
