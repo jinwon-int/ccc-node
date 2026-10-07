@@ -120,6 +120,12 @@ NOTICE_TEXT_TOO_LARGE = "⚠️ 메시지가 너무 길어 읽지 않았습니�
 NOTICE_EDIT_IGNORED = "✏️ 수정한 메시지는 다시 읽지 않습니다. 고친 내용을 새 메시지로 보내 주세요."
 NOTICE_THREAD_IGNORED = "🧵 스레드 안의 답글은 읽지 않습니다. 방에 바로 보내 주세요."
 NOTICE_UNSUPPORTED_KIND = "스티커·이모트·알림 형식 메시지는 읽지 않습니다. 글로 보내 주세요."
+# #2159: a trusted sender's attachment that is never run — plaintext ``url``
+# media (#1795 policy) or a media event nio could not validate (BadEvent).
+NOTICE_ATTACHMENT_REFUSED = (
+    "📎 첨부를 읽지 못했습니다. 암호화되지 않은 첨부이거나 형식이 맞지 않습니다. "
+    "내용을 글로 붙여 넣거나, 첨부를 암호화해 보내는 앱(Element 등)에서 다시 보내 주세요."
+)
 NOTICE_TIMEOUT = "⏳ 시간 제한({minutes}분)을 넘겨 작업을 중단했습니다. 요청을 나눠서 다시 보내 주세요."
 
 
@@ -1618,14 +1624,35 @@ class MatrixTransport:
             for cls in (getattr(nio, "RoomEncryptedMedia", None), getattr(nio, "RoomMessageMedia", None))
             if isinstance(cls, type)
         )
-        return bool(kinds) and isinstance(event, kinds)
+        if kinds and isinstance(event, kinds):
+            return True
+        return MatrixTransport._is_malformed_media(event)
+
+    @staticmethod
+    def _is_malformed_media(event: Any) -> bool:
+        """A decrypted media message nio could not validate (#2159).
+
+        nio parses every decrypted ``m.image``/``m.file``/... as
+        ``RoomEncrypted*``, whose schema requires ``content.file``; a client
+        that sends plaintext ``url`` media inside an encrypted room therefore
+        yields a ``BadEvent``, which used to fall through without a trace.
+        """
+        import nio
+
+        bad = getattr(nio, "BadEvent", None)
+        if not isinstance(bad, type) or not isinstance(event, bad) or not getattr(event, "decrypted", False):
+            return False
+        source = getattr(event, "source", None)
+        content = source.get("content") if isinstance(source, dict) else None
+        return isinstance(content, dict) and content.get("msgtype") in MEDIA_MSGTYPES
 
     def _admit_media(self, room: str, event: Any) -> Request | None:
         """Admit a photo/file under the text rules (#1795); never a new stop path.
 
         Media used to be dropped silently, so an unverified device is ignored
         (with the cross-signing notice) rather than raising ``SafetyStop``, and
-        plaintext ``url`` media is refused and recorded, never executed.
+        plaintext ``url`` media is refused and recorded, never executed. A
+        trusted sender is told once per refused event (#2159).
         """
         source = getattr(event, "source", None)
         content = source.get("content") if isinstance(source, dict) else None
@@ -1633,6 +1660,7 @@ class MatrixTransport:
         kind = MEDIA_MSGTYPES.get(msgtype, "unknown") if isinstance(msgtype, str) else "unknown"
         if not event.decrypted or not isinstance(content, dict) or not isinstance(content.get("file"), dict):
             self._media_ignored(room, "plaintext-attachment-refused", kind)
+            self._attachment_refused(room, event)
             return None
         trusted = self.trusted.get(event.sender, {})
         if not event.verified or event.sender_key not in set(trusted.values()):
@@ -1641,6 +1669,10 @@ class MatrixTransport:
             elif event.sender != self.c["owner"]:
                 self._untrusted_sender(room, event, pinned=True)
             self._media_ignored(room, "untrusted-device", kind)
+            return None
+        if self._is_malformed_media(event):
+            self._media_ignored(room, "malformed-attachment", kind)
+            self._attachment_refused(room, event)
             return None
         req = self.policy.admit(room, source, decrypted=True, now_ms=int(time.time() * 1000))
         if req is None or req.attachment is None:
@@ -1653,6 +1685,38 @@ class MatrixTransport:
         """Body-free record of a dropped attachment (no file name, URL or key)."""
         logger.info("matrix media ignored reason=%s kind=%s room=%s", reason, kind, room)
         self.store.set_meta("media_ignored", {"room": room, "reason": reason, "kind": kind, "updated": time.time()})
+
+    def _attachment_refused(self, room: str, event: Any) -> None:
+        """Tell a trusted sender once per event that an attachment was not read (#2159).
+
+        Only a decrypted event from a verified, trusted device of an allowed
+        sender gets a reply, within the 24 h admission window, and only where
+        the bot would have read it: a direct room, or a family room that
+        addresses the bot. Anything else stays a body-free record.
+        """
+        if not getattr(event, "decrypted", False) or not getattr(event, "verified", False):
+            return
+        sender = str(getattr(event, "sender", "") or "")
+        if sender not in self.policy.users:
+            return
+        if getattr(event, "sender_key", None) not in set(self.trusted.get(sender, {}).values()):
+            return
+        stamp = getattr(event, "server_timestamp", None)
+        if not isinstance(stamp, int) or stamp < int(time.time() * 1000) - 86_400_000:
+            return
+        source = getattr(event, "source", None)
+        content = source.get("content") if isinstance(source, dict) else None
+        if not isinstance(content, dict):
+            return
+        if self.policy.rooms.get(room) != "direct" and not self.policy.addressed(content, media_caption(content)):
+            return
+        raw_id = source.get("event_id") if isinstance(source, dict) else None
+        event_id = str(getattr(event, "event_id", "") or raw_id or "")
+        if not identifier(event_id, "$"):
+            return
+        req = Request(event_id, room, sender, "notice", scope_of(self.c["account"], room, sender))
+        if self._notice_once(req, "attachment-refused", NOTICE_ATTACHMENT_REFUSED):
+            self._count_ignored(room, "attachment-refused")
 
     def _untrusted_sender(self, room: str, event: Any, *, pinned: bool = False) -> None:
         """Ignore a message from an unsigned/unpinned device; tell the room once per device.

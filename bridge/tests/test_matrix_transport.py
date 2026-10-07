@@ -2649,6 +2649,60 @@ async def test_media_admission_mirrors_text_rules_without_new_stop_paths(tmp_pat
         assert f.store.job_exists("$stopphoto")
 
 
+@pytest.mark.anyio
+async def test_malformed_or_plaintext_media_tells_trusted_sender_once(tmp_path: Path) -> None:
+    """#2159: a decrypted media BadEvent (plaintext url in an E2EE room) is no longer dropped silently."""
+    async with family(tmp_path) as h:
+        f = h.f
+        _with_media_classes(h.nio)
+        bad = type("BadEvent", (h.nio.RoomMessageText,), {})
+        h.nio.BadEvent = bad
+        direct = f.c["rooms"][0]
+
+        def event(sender: str, key: str, content: dict[str, Any], *, event_id: str, verified: bool = True,
+                  decrypted: bool = True, ts: int | None = None) -> Any:
+            stamp = h.now if ts is None else ts
+            source = {"type": "m.room.message", "event_id": event_id, "sender": sender, "origin_server_ts": stamp,
+                      "content": content}
+            return bad(sender=sender, source=source, verified=verified, decrypted=decrypted, sender_key=key, ts=stamp)
+
+        def refused() -> int:
+            return sum(t.NOTICE_ATTACHMENT_REFUSED == r for r in h.replies())
+
+        plain = {"msgtype": "m.file", "body": "macro.json", "url": "mxc://test.invalid/Plain",
+                 "info": {"mimetype": "application/json", "size": 10}}
+        assert f._is_media(event(h.owner, "b" * 43, plain, event_id="$plain"))
+        assert f.admit_event(direct, event(h.owner, "b" * 43, plain, event_id="$plain")) is None
+        assert f.store.get_meta("media_ignored")["reason"] == "plaintext-attachment-refused"
+        assert "macro" not in json.dumps(f.store.get_meta("media_ignored"))  # body-free record
+        assert refused() == 1
+        assert not f.store.job_exists("$plain")
+        # A replayed sync batch does not repeat the notice.
+        assert f.admit_event(direct, event(h.owner, "b" * 43, plain, event_id="$plain")) is None
+        assert refused() == 1
+        # EncryptedFile present but invalid (no hashes): its own reason, its own notice.
+        broken = dict(_media_file())
+        del broken["hashes"]
+        malformed = {"msgtype": "m.image", "body": "a.jpg", "file": broken}
+        assert f.admit_event(direct, event(h.owner, "b" * 43, malformed, event_id="$broken")) is None
+        assert f.store.get_meta("media_ignored")["reason"] == "malformed-attachment"
+        assert refused() == 2
+        # Never a reply for: an untrusted key, an undecrypted event, a stale event,
+        # or an unaddressed family-room attachment.
+        assert f.admit_event(direct, event(h.owner, "z" * 43, plain, event_id="$untrusted")) is None
+        assert f.admit_event(direct, event(h.owner, "b" * 43, plain, event_id="$undecrypted", decrypted=False)) is None
+        assert not f._is_media(event(h.owner, "b" * 43, plain, event_id="$undecrypted", decrypted=False))
+        assert f.admit_event(direct, event(h.owner, "b" * 43, plain, event_id="$stale",
+                                           ts=int(time.time() * 1000) - 2 * 86_400_000)) is None
+        assert f.admit_event(FAMILY, event(DAD, "c" * 43, plain, event_id="$fam-plain")) is None
+        assert refused() == 2
+        # A family-room attachment that addresses the bot does get the notice.
+        addressed = {"msgtype": "m.file", "body": "@bot 이거 봐줘", "filename": "macro.json",
+                     "url": "mxc://test.invalid/Plain"}
+        assert f.admit_event(FAMILY, event(DAD, "c" * 43, addressed, event_id="$fam-addr")) is None
+        assert refused() == 3
+
+
 # Attachment reply originals (#2076): the parent is not a RoomMessageText.
 def _reply_media_parent(h: Any, *, sender: str | None = None, verified: bool = True, key: str = "b" * 43) -> Any:
     class EncryptedMedia:
