@@ -33,7 +33,7 @@ markdown-it-py==4.2.0
 mdurl==0.1.2
 mempalace==3.10.0
 mmh3==5.2.1
-multidict==6.7.1
+multidict==6.9.1
 numpy==2.4.6
 oauthlib==4.0.0
 onnxruntime==1.28.0
