@@ -1745,13 +1745,17 @@ rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlin
 assert len([r for r in rows if r.get("kind") == "a2a-dispatch-skipped"]) == 2, rows
 print("SECRET-SKIP-TRAIL-OK")
 
-# With the secret present the gate is passed and this record is never written —
-# the dispatch fails later, for its own reason, exactly as before.
+# With the secret present the gate is passed and the secret-missing record is
+# not written again — the dispatch fails later, for its own reason. Since
+# 2026-10-07 that later skip is recorded too (code `dispatch_head_unavailable`,
+# never `dispatch_secret_missing`), so a third row with the real cause appears.
 os.environ["A2A_EDGE_SECRET"] = "fixture-edge-secret-value"
 result = m._dispatch_intake_review(config, candidate, outcome, transport_id=transport)
 assert result["code"] == "dispatch_head_unavailable", result
 rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
-assert len([r for r in rows if r.get("kind") == "a2a-dispatch-skipped"]) == 2, rows
+skipped = [r for r in rows if r.get("kind") == "a2a-dispatch-skipped"]
+assert len([r for r in skipped if r.get("code") == "dispatch_secret_missing"]) == 2, rows
+assert [r.get("code") for r in skipped][-1] == "dispatch_head_unavailable", rows
 # Nothing this path records may carry the secret itself.
 assert "fixture-edge-secret-value" not in ledger.read_text(encoding="utf-8")
 print("SECRET-PRESENT-OK")

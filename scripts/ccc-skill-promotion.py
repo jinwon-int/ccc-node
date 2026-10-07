@@ -2625,7 +2625,9 @@ def _dispatch_intake_review(
     and the `_sweep_missing_dispatch` retry read.
     """
     result = _dispatch_intake_review_attempt(config, candidate, outcome, transport_id=transport_id)
-    if result.get("outcome") == "dispatch-skipped":
+    # `dispatch_secret_missing` already writes its own durable row (#1766, inside
+    # the attempt) — do not record it twice.
+    if result.get("outcome") == "dispatch-skipped" and result.get("code") != "dispatch_secret_missing":
         try:
             _append_ledger(
                 config,

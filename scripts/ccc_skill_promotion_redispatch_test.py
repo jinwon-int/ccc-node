@@ -119,6 +119,11 @@ class SkipRowRecording(unittest.TestCase):
         self.assertEqual(row["node"], "nodea")
         self.assertRegex(row["ts"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
+    def test_secret_missing_is_not_double_recorded(self) -> None:
+        # #1766 records that skip itself inside the attempt; the wrapper must not add a second row.
+        rows = self.run_wrapper({"outcome": "dispatch-skipped", "code": "dispatch_secret_missing"})
+        self.assertEqual(rows, [])
+
     def test_success_writes_nothing(self) -> None:
         rows = self.run_wrapper({"outcome": "dispatched", "task_id": "t", "dispatched_task": "t", "reviewer_node": "nodee", "round_id": "r"})
         self.assertEqual(rows, [])
