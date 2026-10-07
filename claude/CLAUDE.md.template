@@ -32,21 +32,22 @@ Summary of MEMORY.md · USER.md from `$HOME/.hermes/memories/`. Operational fact
 - PRs by `<USER_GH>` need a `seoseo-ai` reviewer/merger when applicable.
 
 ## Memory Stack
-- Current stack: **built-in MEMORY/USER + Honcho + Family Wiki + session_search**.
+- Current stack: **built-in MEMORY/USER + nunchi (local working memory) + Family Wiki + session_search**.
+- **Honcho is retired fleet-wide** (2026-09-01, TM-2029 phase 3; plumbing removed in #1436) — do not query it or treat a missing `~/.hermes/honcho.json` as a fault.
 - **Supermemory is retired/legacy** — do not use unless explicitly approved for a specific incident lookup.
 - Cleanup policy: latest instructions win; delete/compress boilerplate, duplicates, stale PR/process states, and mutable facts first.
 
 ## Live Memory Usage (every session — DO THIS)
-The SessionStart hook (`~/.claude/hooks/load-memory.sh`) auto-injects a snapshot at startup: built-in MEMORY/USER + **cached Family Wiki prefetch** + **cached Honcho working memory** (caches refresh in the background each session). The snapshot is a **starting point, not a substitute** — actively query both sources during work, and the injected Wiki snippets are *candidates* that must be verified before any operational claim.
+The SessionStart hook (`~/.claude/hooks/load-memory.sh`) auto-injects a snapshot at startup: built-in MEMORY/USER + **cached Family Wiki prefetch** + the **nunchi working-memory snapshot** where nunchi is enabled (caches refresh in the background each session). The snapshot is a **starting point, not a substitute** — actively query both sources during work, and the injected Wiki snippets are *candidates* that must be verified before any operational claim.
 
 **Family Wiki — consult FIRST (before web / GitHub / session_search):**
 - Search: `wiki-agent find "<query>"`. Verify: `wiki-agent load --lines A:B <path>`. Quick context: `wiki-agent prefetch "<query>"`.
 - Durable update: `wiki-agent write-path` → edit in the PR worktree → `wiki-agent pr` (PR-first; never raw secrets, only locations/handling).
 
-**Honcho — working/relational memory:**
-- Recall (dialectic): `POST {baseUrl}/v3/workspaces/<workspace>/peers/<peerName>/chat` with `{"query":"…","target":"<target>","reasoning_level":"low"}`. `baseUrl` is in `~/.hermes/honcho.json` — never log credential/endpoint values.
+**nunchi — local working/relational memory (per node):**
+- Recall: `python3 ~/.claude/hooks/nunchi/nunchi.py recall "<query>" [--target <peer>] [--limit N]`; synthesized answer: `nunchi.py dialectic "<query>"`. Facts are per-node candidates — verify before operational claims.
 
-**Routing:** durable facts / nodes / runbooks / decisions → Family Wiki. Relational & evolving working memory → Honcho.
+**Routing:** durable facts / nodes / runbooks / decisions → Family Wiki (the cross-node layer). Relational & evolving working memory → nunchi (per node, fed by distill).
 
 ## Fresh Approval Required
 secrets · releases · DB/replay/migration/prune · manual ACKs · emergency hotfixes · provider sends/canaries · host power-down (poweroff/halt/shutdown-without-`-r`, any host) · reboot of an unlisted remote host · non-fleet service lifecycle and config-changing verbs · cross-broker mutations (unless pre-approved in-task).
@@ -101,7 +102,7 @@ These orders define what this node may do autonomously, what requires fresh appr
 
 | Workstream | Autonomy scope | Trigger | Approval gate | Escalation |
 |---|---|---|---|---|
-| Wiki / memory reads | Read Family Wiki, Honcho, local MEMORY/USER, and session history; verify Wiki snippets with source loads before operational claims. | User asks about infra, nodes, A2A, Hermes, Gateway, runbooks, durable knowledge, or prior context. | No approval needed for reads. Wiki writes still use PR-first `wiki-agent write-path/pr`; raw secrets are never stored. | If Wiki and live state disagree, live-check first, then update Wiki through PR with dated evidence. |
+| Wiki / memory reads | Read Family Wiki, nunchi, local MEMORY/USER, and session history; verify Wiki snippets with source loads before operational claims. | User asks about infra, nodes, A2A, Hermes, Gateway, runbooks, durable knowledge, or prior context. | No approval needed for reads. Wiki writes still use PR-first `wiki-agent write-path/pr`; raw secrets are never stored. | If Wiki and live state disagree, live-check first, then update Wiki through PR with dated evidence. |
 | GitHub issue / PR hygiene | Inventory open issues/PRs, classify trackers, create branches, open PRs, run local/CI verification, and squash-merge green mergeable PRs with cleanup. | User asks to clean up repo work, continue issue batches, review/land a fix, or PR-first implementation is the safe lane. | No approval needed for repo PR flow once in scope. Fresh approval is required for releases/tags, admin bypass, secret movement, or risky emergency hotfixes. | If checks fail or rules require external approval, report blocker with PR/check IDs and stop before bypassing. |
 | A2A source-only evidence | Dispatch source-only/no-live Team1/Team2 analysis lanes with broker/worker attribution and classify outputs before acting. | User requests A2A/A2AD/team rounds, multi-worker review, or issue cleanup needing worker evidence. | Allowed when the user requested the round. No deploy/restart/DB/ACK/replay/provider canary is included unless separately approved. | Exclude wrapper-only, queued, failed, or source-blocked lanes from quorum; retry one compact supplement or fall back to finalizer direct verification. |
 | Local diagnostics / dry runs | Run read-only checks, `setup.sh --dry-run`, harness validation, syntax tests, and drift detection. | Before changing files, validating a repo, diagnosing hook/settings/statusline/bridge drift, or preparing a PR. | No approval needed for read-only diagnostics. `--fix`, writes outside the repo, service restarts, or remote node changes need scope-specific approval. | If diagnostics touch mutable live state or secrets, stop and ask with explicit numbered approval phrases. |
