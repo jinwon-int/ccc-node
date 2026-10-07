@@ -8,7 +8,7 @@
 - New Family Wiki log entries are prepended at the TOP of `pages/log.md` — below the digest block, directly above the newest entry (never right under the H1) — as a level-2 heading `## [LOG-YYYYMMDD-<node>-<same-day-seq>] YYYY-MM-DD KST — title`. The older `- [LOG-...]` bullets under `[LOG-00]` stay valid; count both regions for the seq; never edit the `[LOG-00]` block; never create a new global numeric `LOG-NNNN` ID or renumber old entries.
 - A2A/Nexus: canonical repo jinwon-int/a2a-nexus; durable changes use PR-first + real broker-backed worker evidence.
 - A2A fleet boundaries: T1 = Seoseo broker, T2 = Gwakga broker; persistent workers use private broker tunnels where configured.
-- Supermemory is retired/legacy. Current memory stack: built-in MEMORY/USER + Honcho + Family Wiki + session_search.
+- Supermemory is retired/legacy. Honcho is retired fleet-wide (2026-09-01). Current memory stack: built-in MEMORY/USER + nunchi + Family Wiki + session_search.
 - GitHub repo hygiene: operational repos under jinwon-int; older personal-account duplicates archived/marked legacy.
 
 # <Add node-specific durable facts below>

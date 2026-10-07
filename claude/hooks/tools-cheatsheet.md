@@ -33,10 +33,10 @@ A2A 태스크를 claim하면 업무량에 맞춰 소환(예산 0–3, 하드캡 
   - 워크트리: `$HOME/.wiki-agent/wiki-pr-work/seoyoon-family-wiki`
   - ID 규칙: 새 섹션 ID = `max(TM-/ND-)+1`; 새 로그 = `[LOG-YYYYMMDD-<node>-<same-day-seq>]`(노드별 1부터), `## [LOG-…]` 레벨2 헤딩으로 `pages/log.md` 최상단(다이제스트 블록 아래·가장 최근 항목 바로 위, H1 바로 아래 금지)에 prepend, `[LOG-00]` 블록은 수정 금지; 신규 `LOG-NNNN` 금지; **raw secret 금지**(위치/취급만)
 
-## Honcho (관계/working memory)
-- baseUrl은 `~/.hermes/honcho.json` (엔드포인트/크레덴셜 값 로그 금지)
-- recall: `POST {baseUrl}/v3/workspaces/<WORKSPACE>/peers/<NODE>/chat`
-  body `{"query":"…","target":"<USER_PEER>","reasoning_level":"low"}`
+## nunchi (관계/working memory — 노드 로컬)
+- recall: `python3 ~/.claude/hooks/nunchi/nunchi.py recall "<query>" [--target <peer>] [--limit N]`
+- 합성 답변: `nunchi.py dialectic "<query>"` · 검토대기: `nunchi.py review`
+- Honcho는 2026-09-01 fleet 전체 퇴역(TM-2029, #1436) — 조회하지 말 것
 
 ## Telegram bridge (이 노드가 채널을 운영할 때만)
 - 배포: `/opt/ccc-node/bridge` (repo `jinwon-int/ccc-node`)
