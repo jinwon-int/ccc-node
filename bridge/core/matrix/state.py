@@ -1209,10 +1209,12 @@ class MatrixStore(Store):
     """Store plus sync replay, chunked-delivery progress, control dedup and operator audit."""
 
     def __init__(self, directory: Path | str, account: str) -> None:
+        self.directory = Path(directory)
         super().__init__(directory, account)
         try:
             self.db.executescript(_MATRIX_SCHEMA)
             self._settle_held_files()
+            self._cleanup_voice_replies()
         except BaseException:
             self.close()
             raise
@@ -1242,6 +1244,26 @@ class MatrixStore(Store):
     def _discard_files(self, parent: str) -> None:
         with self.db:
             self.db.execute("DELETE FROM held_files WHERE parent=?", (parent,))
+        self._cleanup_voice_replies()
+
+    def _cleanup_voice_replies(self) -> None:
+        """Keep speech referenced by held/ready files; remove settled and crash orphans."""
+        from telegram_bot.core.matrix.voice import REPLY_DIRNAME, cleanup_replies, reply_name
+
+        if not (self.directory / REPLY_DIRNAME).exists():
+            return
+        rows = self.db.execute(
+            "SELECT payload FROM held_files UNION ALL "
+            "SELECT reply FROM jobs WHERE state='ready' AND body=?", (FILE_JOB_BODY,)
+        )
+        retained = {name for row in rows if (name := reply_name(row[0])) is not None}
+        cleanup_replies(self.directory, retained)
+
+    def delivered(self, event_id: str) -> None:
+        row = self.db.execute("SELECT body FROM jobs WHERE event_id=?", (event_id,)).fetchone()
+        super().delivered(event_id)
+        if row is not None and row[0] == FILE_JOB_BODY:
+            self._cleanup_voice_replies()
 
     def _settle_held_files(self) -> None:
         """After a crash: release files of answered turns, drop the rest (never re-run a turn)."""

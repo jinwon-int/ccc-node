@@ -79,7 +79,7 @@ def media_attachment(content: Mapping[str, Any]) -> dict[str, Any] | None:
     def count(value: Any) -> int | None:
         return value if type(value) is int and 0 <= value <= 2**53 else None
 
-    return {
+    attachment = {
         "kind": kind,
         "name": name[:255] if isinstance(name, str) else "",
         "mimetype": mimetype[:127] if isinstance(mimetype, str) else "",
@@ -89,6 +89,9 @@ def media_attachment(content: Mapping[str, Any]) -> dict[str, Any] | None:
         "captioned": bool(media_caption(content)),
         "file": file,
     }
+    if kind == "audio":
+        attachment["duration"] = count(info.get("duration"))  # Matrix milliseconds
+    return attachment
 
 
 def encode_attachment(attachment: Mapping[str, Any]) -> str:

@@ -6,6 +6,8 @@ import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from telegram_bot.utils.audio_processor import communicate_audio_process
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,7 +48,7 @@ class MacOSTtsSynthesizer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await communicate_audio_process(process)
         if process.returncode != 0:
             raise TtsSynthesisError(
                 f"Failed to list macOS voices: {stderr.decode('utf-8', errors='ignore').strip()}"
@@ -116,7 +118,7 @@ class MacOSTtsSynthesizer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await process.communicate()
+        _, stderr = await communicate_audio_process(process)
         if process.returncode != 0:
             raise TtsSynthesisError(
                 f"macOS say synthesis failed: {stderr.decode('utf-8', errors='ignore').strip()}"
@@ -141,7 +143,7 @@ class MacOSTtsSynthesizer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await process.communicate()
+        _, stderr = await communicate_audio_process(process)
         if process.returncode != 0:
             raise TtsSynthesisError(
                 f"ffmpeg voice conversion failed: {stderr.decode('utf-8', errors='ignore').strip()}"

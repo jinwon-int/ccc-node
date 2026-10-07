@@ -1,0 +1,1 @@
+- Matrix encrypted audio messages now use Whisper transcription, a voice preview and the ordinary agent turn, with declared and actual duration limits, bounded local conversion, cancellation and private-file cleanup. On macOS, eligible replies also use the existing TTS backend and durable encrypted audio outbox after the text answer; other environments retain text replies.
