@@ -304,7 +304,31 @@ write_pending_activation() {
     return 1
   fi
 }
-clear_pending_activation() { activation_state clear "$NEW_SHA"; }
+clear_pending_activation() { activation_state clear "$NEW_SHA" && clear_activation_notice; }
+
+# One owner notice per unresolved target generation (#2148). A Termux bridge
+# runs a prepared generation that self-update cannot rebuild, so after an
+# operator aligns it, every new main commit makes the next changed tick fail
+# activation and every unchanged tick after it re-report the same mismatch —
+# two alarms a day per node for one cause, outside the notifier's 300s dedup
+# window. The marker below records the target the owner was already told
+# about; later ticks for that target only log and keep exiting 14. A new
+# target, or a verified activation/reconciliation, starts over.
+ACTIVATION_NOTIFIED_FILE="$STATE_DIR/self-update.activation-notified"
+activation_notice_sent() { # <target-sha>
+  [ -n "$1" ] && [ -f "$ACTIVATION_NOTIFIED_FILE" ] \
+    && [ "$(head -n1 "$ACTIVATION_NOTIFIED_FILE" 2>/dev/null)" = "$1" ]
+}
+mark_activation_notice() { printf '%s\n' "$1" > "$ACTIVATION_NOTIFIED_FILE" 2>/dev/null || :; }
+clear_activation_notice() { rm -f "$ACTIVATION_NOTIFIED_FILE" 2>/dev/null || :; }
+notify_activation_incomplete() { # <target-sha> <text> <dedup-suffix>
+  if activation_notice_sent "$1"; then
+    log "pending-activation notify=suppressed reason=already-notified target=$1"
+    return 0
+  fi
+  notify "$2" "$3"
+  mark_activation_notice "$1"
+}
 load_pending_activation() {
   local rec rc
   PENDING_TARGET_SHA=""; PENDING_OUTCOME=""; PENDING_SERVICES='[]'
@@ -345,7 +369,7 @@ report_pending_activation() {
     if ! serving_generation_matches "$serving" "$PENDING_TARGET_SHA"; then
       log "pending-activation result=incomplete reason=serving-mismatch target=$PENDING_TARGET_SHA serving=$serving outcome=${PENDING_OUTCOME:-unknown}"
       audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
-      notify "self-update: ${PENDING_TARGET_SHA:0:7} 세대 활성화가 아직 완료되지 않았습니다 — 서빙 세대($(printf '%.7s' "$serving"))가 설치 목표와 다릅니다. 건강한 구버전 런타임을 임의로 재시작하지 않습니다; 확인 후 수동 개입이 필요합니다. 로그: ~/.claude/state/self-update.log" "pending-$PENDING_TARGET_SHA"
+      notify_activation_incomplete "$PENDING_TARGET_SHA" "self-update: ${PENDING_TARGET_SHA:0:7} 세대 활성화가 아직 완료되지 않았습니다 — 서빙 세대($(printf '%.7s' "$serving"))가 설치 목표와 다릅니다. 건강한 구버전 런타임을 임의로 재시작하지 않습니다; 확인 후 수동 개입이 필요합니다. 로그: ~/.claude/state/self-update.log" "pending-$PENDING_TARGET_SHA"
       say "self-update: activation incomplete — serving ${serving:0:7} != installed target ${PENDING_TARGET_SHA:0:7}; not reporting up-to-date" >&2
       return 2
     fi
@@ -373,7 +397,7 @@ report_pending_activation() {
   fi
   log "pending-activation result=incomplete reason=identity-unknown target=$PENDING_TARGET_SHA outcome=${PENDING_OUTCOME:-unknown}"
   audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
-  notify "self-update: ${PENDING_TARGET_SHA:0:7} 세대 설치는 완료됐지만 활성화(재시작) 완료 증거가 없습니다(마지막 시도: ${PENDING_OUTCOME:-unknown}). 구버전 런타임이 건강해 보여도 수렴으로 보지 않습니다 — 서빙 세대 확인 또는 self-update.serving-generation-cmd 설정이 필요합니다. 로그: ~/.claude/state/self-update.log" "pending-$PENDING_TARGET_SHA"
+  notify_activation_incomplete "$PENDING_TARGET_SHA" "self-update: ${PENDING_TARGET_SHA:0:7} 세대 설치는 완료됐지만 활성화(재시작) 완료 증거가 없습니다(마지막 시도: ${PENDING_OUTCOME:-unknown}). 구버전 런타임이 건강해 보여도 수렴으로 보지 않습니다 — 서빙 세대 확인 또는 self-update.serving-generation-cmd 설정이 필요합니다. 로그: ~/.claude/state/self-update.log" "pending-$PENDING_TARGET_SHA"
   say "self-update: activation incomplete — ${PENDING_TARGET_SHA:0:7} installed but never verified active (outcome=${PENDING_OUTCOME:-unknown}); not reporting up-to-date" >&2
   return 2
 }
@@ -1545,7 +1569,7 @@ if [ "$FAILED" -gt 0 ]; then
   write_pending_activation "restart-failed" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
   audit "restart-failures" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
   log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=restart-failure"
-  notify "self-update ${SHORT_NEW}: 서비스 ${FAILED}개 재시작 실패 (${RESTARTED}개 성공, 재시도 후). 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log 확인 필요." "fail-$NEW_SHA"
+  notify_activation_incomplete "$NEW_SHA" "self-update ${SHORT_NEW}: 서비스 ${FAILED}개 재시작 실패 (${RESTARTED}개 성공, 재시도 후). 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log 확인 필요." "fail-$NEW_SHA"
   say "self-update: updated to $SHORT_NEW but $FAILED service(s) failed to restart; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
   exit 7
 fi
@@ -1569,7 +1593,7 @@ if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && [ "$RESTARTED" -eq 0 ];
           log "pending-activation result=incomplete reason=serving-mismatch target=$NEW_SHA serving=$serving_head"
           audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
           log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=serving-mismatch"
-          notify "self-update ${SHORT_NEW}: 외부 재시작은 성공했지만 재시작된 브리지가 이전 세대(${serving_head:0:7})를 서빙 중입니다 — 설치 목표 ${SHORT_NEW}와 다릅니다. 재시작 명령이 고정된 prepared 런타임 세대를 띄우는지 확인하고, 새 세대를 준비(termux_prepare)·전환해야 합니다. 활성화로 기록하지 않았습니다. 로그: ~/.claude/state/self-update.log" "pending-$NEW_SHA"
+          notify_activation_incomplete "$NEW_SHA" "self-update ${SHORT_NEW}: 외부 재시작은 성공했지만 재시작된 브리지가 이전 세대(${serving_head:0:7})를 서빙 중입니다 — 설치 목표 ${SHORT_NEW}와 다릅니다. 재시작 명령이 고정된 prepared 런타임 세대를 띄우는지 확인하고, 새 세대를 준비(termux_prepare)·전환해야 합니다. 활성화로 기록하지 않았습니다. 로그: ~/.claude/state/self-update.log" "pending-$NEW_SHA"
           say "self-update: external restart succeeded but the bridge serves ${serving_head:0:7}, not ${SHORT_NEW}; activation incomplete" >&2
           exit 14
         fi
@@ -1585,7 +1609,7 @@ if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && [ "$RESTARTED" -eq 0 ];
       audit "restart-failures" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON" "$RESTART_FAILURE_JSON"
       log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=external-restart-failure"
       FAILURE_SUMMARY="$(restart_failure_summary)"
-      notify "self-update ${SHORT_NEW}: 코드 갱신 후 외부 재시작 명령이 실패했습니다${FAILURE_SUMMARY:+ (${FAILURE_SUMMARY})} — 브리지가 남아있는지 즉시 확인 필요. 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log" "fail-$NEW_SHA"
+      notify_activation_incomplete "$NEW_SHA" "self-update ${SHORT_NEW}: 코드 갱신 후 외부 재시작 명령이 실패했습니다${FAILURE_SUMMARY:+ (${FAILURE_SUMMARY})} — 브리지가 남아있는지 즉시 확인 필요. 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log" "fail-$NEW_SHA"
       say "self-update: updated to $SHORT_NEW but the external restart command failed; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
       exit 7
     fi

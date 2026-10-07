@@ -209,6 +209,11 @@ ok "serving mismatch notifies the owner" 'cat "$TMP/spool"/*.json 2>/dev/null | 
 ok "serving mismatch retains the recovery snapshot" 'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "next unchanged tick still refuses to report up-to-date" '[ "$rc" = 14 ] && ! grep -q "already up to date" <<<"$out" && grep -q "reason=serving-mismatch" "$STATE/self-update.log"'
+# #2148: the owner heard about this target on the changed tick; the unchanged
+# ticks that follow keep the exit code and the log line but do not page again.
+ok "unchanged tick does not re-notify the same unresolved target (#2148)" \
+  '[ "$(jq -r .dedup "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | grep -c "SelfUpdate:pending-")" = 1 ] && grep -q "pending-activation notify=suppressed reason=already-notified target=$(git -C "$TMP/seed" rev-parse HEAD)" "$STATE/self-update.log"'
+ok "once-per-target marker names the notified target" '[ "$(head -n1 "$STATE/self-update.activation-notified")" = "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
 # A dead writer's identity proves nothing: back to identity-unknown.
 python3 - "$SERVING_HEALTH" <<'PY2142'
 import json, sys
@@ -224,6 +229,7 @@ CCC_TEST_SERVING_HEAD="$(git -C "$TMP/seed" rev-parse HEAD)" bash "$CLAUDE/self-
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "operator-switched generation reconciles on the next tick" \
   '[ "$rc" = 0 ] && grep -q "pending-activation result=reconciled" "$STATE/self-update.log" && jq -e ".outcome == \"activated\"" "$PENDING_JSON" >/dev/null'
+ok "reconciliation clears the once-per-target notice marker (#2148)" '[ ! -e "$STATE/self-update.activation-notified" ]'
 rm -rf "$STATE"/self-update-install-rollback.*
 bump2142 serving-match
 : > "$STATE/self-update.log"
@@ -1368,7 +1374,12 @@ ok "healthy-old second tick is audited as activation-incomplete" \
   'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"activation-incomplete\" and .changed == false" >/dev/null'
 ok "healthy-old second tick restarts and retries nothing" '[ ! -s "$TMP/systemctl.calls" ]'
 ok "healthy-old second tick keeps the pending record" '[ -f "$PENDING" ]'
-ok "healthy-old second tick notifies the owner" 'jq -r .text "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | grep -q "활성화"'
+# #2148: the changed tick already paged the owner about this target (the
+# restart-failure notice); the healthy-old tick keeps exit 14, the audit row
+# and the log line but does not page again for the same unresolved target.
+ok "healthy-old second tick does not page again for the same target (#2148)" \
+  '! compgen -G "$TMP/spool/*SelfUpdate*.json" >/dev/null && grep -q "pending-activation notify=suppressed reason=already-notified target=$pending_target" "$STATE/self-update.log"'
+ok "healthy-old second tick keeps the once-per-target marker" '[ "$(head -n1 "$STATE/self-update.activation-notified")" = "$pending_target" ]'
 ok "status reports the pending activation read-only" \
   'run_selfup status | grep -q "pending activation: INCOMPLETE target=${pending_target:0:7}"'
 

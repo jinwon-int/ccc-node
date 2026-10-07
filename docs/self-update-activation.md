@@ -43,3 +43,16 @@ the bounded terminal receipt remains on disk so unlink failure cannot erase the
 only evidence. Do not use file existence alone as a pending-state check.
 An unsupported directory fsync is a persistence failure. Recovery snapshots are
 never automatically restored by pending-state reconciliation.
+
+## One owner notice per unresolved target (#2148)
+
+An activation that fails or stays unverified pages the owner once per target
+generation. The updater records the notified target in
+`self-update.activation-notified` (next to the pending record); later ticks for
+the same target still log `pending-activation notify=suppressed
+reason=already-notified`, audit `activation-incomplete` and exit 14, but spool no
+new notice. The marker is removed when the pending record is cleared (verified
+activation or reconciliation) and is simply replaced when a different target
+fails, so each new main commit that a Termux prepared-generation bridge cannot
+serve costs at most one alarm instead of one per tick. Unhealthy-runtime and
+corrupt-record notices are outside this rule and still report every tick.
