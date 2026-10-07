@@ -2606,7 +2606,54 @@ def _record_dispatch_secret_missing(
     }
 
 
-def _dispatch_intake_review(  # noqa: C901
+def _dispatch_intake_review(
+    config: Config,
+    candidate: Candidate,
+    outcome: dict[str, object],
+    *,
+    transport_id: str,
+) -> dict[str, object]:
+    """Dispatch the intake review round and *record* every skip.
+
+    Until 2026-10-07 a skipped dispatch left no trace: the intake PR opened,
+    the `dispatch-skipped` dict went into a 500-byte-truncated cron log line,
+    and nothing retried. Field case: the T1 edge secret was rotated on
+    2026-10-05 without the publisher's `~/.a2a-broker-edge.env`, every
+    `/workers` read came back 401 (`dispatch_broker_unreachable`), and nine
+    intake PRs sat unreviewed for three days with no alert. The skip row
+    written here is what `ccc_doctor.check_skill_promotion_dispatch_gap`
+    and the `_sweep_missing_dispatch` retry read.
+    """
+    result = _dispatch_intake_review_attempt(config, candidate, outcome, transport_id=transport_id)
+    # `dispatch_secret_missing` already writes its own durable row (#1766, inside
+    # the attempt) — do not record it twice.
+    if result.get("outcome") == "dispatch-skipped" and result.get("code") != "dispatch_secret_missing":
+        try:
+            _append_ledger(
+                config,
+                {
+                    "ts": _utc_now(),
+                    "kind": _DISPATCH_SKIPPED_KIND,
+                    "transport_id": transport_id,
+                    "code": str(result.get("code", "")),
+                    "detail": str(result.get("detail", ""))[:160],
+                    "pr_url": str(outcome.get("url", "")),
+                    "branch": str(outcome.get("branch", "")),
+                    "node": candidate.node,
+                    "provider": candidate.provider,
+                    "name": candidate.name,
+                    "tree_sha256": candidate.tree_sha256,
+                },
+            )
+        except PromotionError:
+            pass
+    return result
+
+
+_DISPATCH_SKIPPED_KIND = "a2a-dispatch-skipped"
+
+
+def _dispatch_intake_review_attempt(  # noqa: C901
     config: Config,
     candidate: Candidate,
     outcome: dict[str, object],
@@ -2614,7 +2661,8 @@ def _dispatch_intake_review(  # noqa: C901
     transport_id: str,
 ) -> dict[str, object]:
     """Best-effort fail-safe: never raises, never closes the PR. Skips are
-    recorded so the next collect cycle can retry non-terminal failures."""
+    returned (and recorded by the wrapper above) so a later collect cycle can
+    retry non-terminal failures."""
     url = outcome.get("url")
     branch = outcome.get("branch")
     if not isinstance(url, str) or not url:
@@ -6570,8 +6618,150 @@ def _collect_completed(config: Config, *, dry_run: bool) -> dict[str, object]:
     return {"revise": revise, **drain}
 
 
+_INTAKE_BRANCH_RE = re.compile(
+    r"^skill-intake/(?P<node>[a-z][a-z0-9_-]{1,31})/(?P<name>[a-z0-9]+(?:-[a-z0-9]+)*)"
+    r"-(?P<provider>claude|codex|piri|danso)-(?P<suffix>[0-9a-f]{12})$"
+)
+_REDISPATCH_LIMIT = 3
+_REDISPATCH_MIN_AGE_SEC = 600
+
+
+def _intake_branch_parts(branch: str) -> dict[str, str] | None:
+    """`skill-intake/<node>/<name>-<provider>-<tree12>` -> parts, else None."""
+    match = _INTAKE_BRANCH_RE.match(branch or "")
+    return match.groupdict() if match else None
+
+
+def _missing_dispatch_prs(
+    rows: list[dict[str, object]],
+    open_prs: list[dict[str, object]],
+    *,
+    now: float,
+    min_age_sec: int = _REDISPATCH_MIN_AGE_SEC,
+    limit: int = _REDISPATCH_LIMIT,
+) -> list[dict[str, object]]:
+    """Open intake PRs whose exact head never got a review round.
+
+    Pure selection (no network) so it is unit-testable: a PR is owed a
+    dispatch when no `a2a-dispatch`, `a2a-receipt` or `a2a-verdict` row
+    names its head. PRs younger than `min_age_sec` are left to the publish
+    path that just opened them; the oldest debt is paid first; `limit`
+    bounds the per-cycle CI wait (each dispatch may block up to
+    DISPATCH_CI_WAIT_SEC on the `skills` check).
+    """
+    settled: set[str] = set()
+    for row in rows:
+        if row.get("kind") in {"a2a-dispatch", "a2a-receipt", "a2a-verdict"}:
+            head = row.get("head_sha")
+            if isinstance(head, str):
+                settled.add(head)
+    owed: list[dict[str, object]] = []
+    for pr in open_prs:
+        head = pr.get("head")
+        branch = pr.get("branch")
+        created = pr.get("created_at")
+        if not isinstance(head, str) or not isinstance(branch, str) or not isinstance(created, (int, float)):
+            continue
+        if head in settled or _intake_branch_parts(branch) is None:
+            continue
+        if now - float(created) < min_age_sec:
+            continue
+        owed.append(pr)
+    owed.sort(key=lambda item: float(item["created_at"]))
+    return owed[:limit]
+
+
+def _open_intake_prs(config: Config) -> list[dict[str, object]]:
+    completed = _run(
+        [
+            "gh", "pr", "list", "--repo", config.repo, "--state", "open", "--limit", "100",
+            "--json", "number,url,headRefName,headRefOid,createdAt",
+        ]
+    )
+    try:
+        items = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PromotionError("github_output_invalid") from error
+    prs: list[dict[str, object]] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        branch = item.get("headRefName")
+        if not isinstance(branch, str) or _intake_branch_parts(branch) is None:
+            continue
+        created = item.get("createdAt")
+        try:
+            created_ts = datetime.strptime(str(created), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+        prs.append(
+            {
+                "number": str(item.get("number")),
+                "url": str(item.get("url", "")),
+                "branch": branch,
+                "head": str(item.get("headRefOid", "")),
+                "created_at": created_ts,
+            }
+        )
+    return prs
+
+
+def _sweep_missing_dispatch(
+    config: Config, *, dry_run: bool, now: float | None = None
+) -> list[dict[str, object]]:
+    """Retry the A2A review dispatch for open intake PRs that never got one.
+
+    The publish path dispatches exactly once, at PR-open time; a skip there
+    (secret drift, broker down, CI not yet green, no reviewer online) used to
+    be final. This sweep runs in `_collect_drain` — so both the nightly
+    collect and the results-only cycle retry — rebuilds the candidate from
+    the PR head through the same envelope gates a revision uses, binds it to
+    the intake manifest tree, and hands it to the normal dispatch (which is
+    idempotent per transport_id + head).
+    """
+    if not getattr(config, "dispatch_enabled", False):
+        return []
+    rows = _ledger_rows(config)
+    try:
+        open_prs = _open_intake_prs(config)
+    except PromotionError as error:
+        return [{"outcome": "redispatch-skipped", "code": error.code}]
+    out: list[dict[str, object]] = []
+    for pr in _missing_dispatch_prs(rows, open_prs, now=time.time() if now is None else now):
+        parts = _intake_branch_parts(str(pr["branch"])) or {}
+        row: dict[str, object] = {"pr": pr["number"], "branch": pr["branch"], "head": pr["head"]}
+        if dry_run:
+            out.append({**row, "outcome": "would-redispatch"})
+            continue
+        try:
+            candidate_id = f"{parts['name']}-{parts['suffix']}"
+            manifest_tree = _pr_manifest_tree(
+                config, node=parts["node"], provider=parts["provider"], candidate_id=candidate_id, head=str(pr["head"])
+            )
+            files = _pr_skill_files(
+                config, node=parts["node"], provider=parts["provider"], candidate_id=candidate_id, head=str(pr["head"])
+            )
+            candidate = _candidate_from_revised_files(
+                parts["node"], parts["provider"], parts["name"],
+                [(relative, content) for relative, content, _ in files],
+                {relative: executable for relative, _, executable in files},
+            )
+        except PromotionError as error:
+            out.append({**row, "outcome": "redispatch-skipped", "code": error.code})
+            continue
+        if candidate.tree_sha256 != manifest_tree:
+            out.append({**row, "outcome": "redispatch-skipped", "code": "redispatch_tree_mismatch"})
+            continue
+        result = _dispatch_intake_review(
+            config, candidate, {"url": pr["url"], "branch": pr["branch"]}, transport_id=_transport_id(candidate)
+        )
+        out.append({**row, "outcome": "redispatch", "dispatch": result})
+    return out
+
+
 def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
-    """Intake-state / autoclose / supersede / auto-promote / auto-merge."""
+    """Redispatch / intake-state / autoclose / supersede / auto-promote / auto-merge."""
+    redispatched = _sweep_missing_dispatch(config, dry_run=dry_run)
     intake_states = _sweep_intake_states(config, dry_run=dry_run)
     promoted_intakes = _sweep_promoted_intakes(config, dry_run=dry_run)
     superseded_intakes = _sweep_superseded_intakes(config, dry_run=dry_run)
@@ -6579,6 +6769,7 @@ def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
     if getattr(config, "auto_promote_enabled", False):
         auto_promote = _promote(config, dry_run=dry_run, limit=8)
     return {
+        "redispatched": redispatched,
         "intake_states": intake_states,
         "promoted_intakes": promoted_intakes,
         "superseded_intakes": superseded_intakes,

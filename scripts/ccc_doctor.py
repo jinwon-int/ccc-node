@@ -851,6 +851,7 @@ class Doctor:
         self.check_provider_readiness()
         self.check_distill_readiness()
         self.check_skill_promotion_backlog()
+        self.check_skill_promotion_dispatch_gap()
         self.check_fleet_skills_sync()
         self.check_skill_promotion_revise_stall()
         self.check_skill_promotion_unpromoted()
@@ -1899,6 +1900,109 @@ class Doctor:
             "skill-promotion.collect-nodes, that its collect cron still runs, "
             "and that max_prs_per_run keeps up with the fleet's staging rate",
         )
+
+    _DISPATCH_GAP_WINDOW_DAYS = 14
+    _DISPATCH_GAP_MIN_AGE_HOURS = 2
+    _DISPATCH_GAP_LEDGER_MAX_BYTES = 32 * 1024 * 1024
+    _DISPATCH_GAP_HINTS = {
+        "dispatch_broker_unreachable": (
+            "the publisher cannot read the T1 broker's /workers (401/unreachable) — "
+            "after an edge-secret rotation re-sync A2A_EDGE_SECRET in the publisher's "
+            "~/.a2a-broker-edge.env from the broker .env (runbook RB-990) and rerun collect"
+        ),
+        "dispatch_secret_missing": (
+            "A2A_EDGE_SECRET is absent from the collect environment — restore the "
+            "publisher edge env file (CCC_A2A_EDGE_ENV) and rerun collect"
+        ),
+        "dispatch_no_reviewer_online": (
+            "no keyring reviewer other than the author is online on the T1 broker — "
+            "check the reviewer workers' a2a-hermes-worker units and broker tunnels"
+        ),
+        "dispatch_ci_not_green": (
+            "the `skills` check on the intake head is not green — fix the intake "
+            "validation failure; the redispatch sweep retries once it passes"
+        ),
+    }
+
+    def check_skill_promotion_dispatch_gap(self) -> None:
+        """Publisher-side: intake PRs opened but never handed to an A2A reviewer.
+
+        The publish path dispatches the review round once, when the intake PR
+        opens, and a skip used to be final and invisible (the cron log kept a
+        500-byte digest). Field case 2026-10-05~07: a T1 edge-secret rotation
+        missed the publisher's env file, every dispatch skipped with
+        `dispatch_broker_unreachable`, and nine intake PRs waited unreviewed
+        with no alert. This check reads the publisher ledger: `pr-opened`
+        rows in the window without an `a2a-dispatch` row for the same branch
+        are a gap; the latest `a2a-dispatch-skipped` code names the cause.
+        Ordinary nodes have no ledger — absence is not drift.
+        """
+        item = "skill-promotion dispatch gap"
+        state_dir = Path(
+            os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")
+        ).expanduser()
+        ledger = state_dir / "skill-promotion" / "ledger.jsonl"
+        if ledger.is_symlink() or not ledger.is_file():
+            self.add("정상", item, "ledger=absent", "none")
+            return
+        try:
+            if ledger.stat().st_size > self._DISPATCH_GAP_LEDGER_MAX_BYTES:
+                self.add("경고", item, "ledger=oversized", f"rotate or archive {ledger}; dispatch gap cannot be verified")
+                return
+            text = ledger.read_text(encoding="utf-8")
+        except OSError:
+            self.add("수동필요", item, "ledger=unreadable", f"inspect {ledger} permissions; dispatch gap cannot be verified")
+            return
+        now = time.time()
+        window_start = now - self._DISPATCH_GAP_WINDOW_DAYS * 86400
+        opened: dict[str, float] = {}
+        dispatched: set[str] = set()
+        last_skip: tuple[float, str] | None = None
+        for line in text.splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            ts = self._parse_ledger_ts(row.get("ts"))
+            kind = row.get("kind")
+            branch = row.get("branch")
+            if kind is None and row.get("outcome") in {"pr-opened", "existing-pr"}:
+                if isinstance(branch, str) and branch.startswith("skill-intake/") and ts is not None and ts >= window_start:
+                    opened[branch] = min(ts, opened.get(branch, ts))
+            elif kind == "a2a-dispatch" and isinstance(branch, str):
+                dispatched.add(branch)
+            elif kind == "a2a-dispatch-skipped" and ts is not None:
+                code = str(row.get("code", "")) or "unknown"
+                if last_skip is None or ts >= last_skip[0]:
+                    last_skip = (ts, code)
+        if not opened:
+            self.add("정상", item, f"intake=0 (window {self._DISPATCH_GAP_WINDOW_DAYS}d)", "none")
+            return
+        min_age = self._DISPATCH_GAP_MIN_AGE_HOURS * 3600
+        gap = [b for b, ts in opened.items() if b not in dispatched and now - ts >= min_age]
+        if not gap:
+            self.add("정상", item, f"intake={len(opened)}; undispatched=0", "none")
+            return
+        oldest_hours = int((now - min(opened[b] for b in gap)) // 3600)
+        code = last_skip[1] if last_skip else "unrecorded"
+        status = f"undispatched={len(gap)}/{len(opened)}; oldest={oldest_hours}h; last_skip={code}"
+        hint = self._DISPATCH_GAP_HINTS.get(
+            code,
+            "run `ccc-skill-promotion.py collect` on the publisher — the redispatch sweep retries "
+            "up to 3 owed intake PRs per cycle; read skill-promotion/last-collect.json for the skip code",
+        )
+        self.add("경고", item, status, hint)
+
+    @staticmethod
+    def _parse_ledger_ts(value: object) -> float | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return None
 
     # The daily fleet-skills apply used to leave its verdict only as one JSON
     # line in the cron log. Field case: three nodes failed every apply for 17
