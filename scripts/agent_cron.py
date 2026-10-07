@@ -954,6 +954,9 @@ def run_dry_plan(data):
 
 DEFAULT_PROMPT_TIMEOUT_SEC = 3600
 DEFAULT_COMMAND_TIMEOUT_SEC = 600
+# Extra seconds the prompt path waits beyond timeoutSec so ccc-headless's own
+# `timeout -k 30` fires first and the run is reported as the runner's 124 (#2156).
+HEADLESS_TIMEOUT_GRACE_SEC = 60
 DEFAULT_OUTPUT_MAX_BYTES = 65536
 
 
@@ -1212,11 +1215,18 @@ def run_headless(task):
         env['CCC_PERMISSION_MODE'] = perm
     if payload['model']:
         env['CCC_MODEL'] = payload['model']
+    # The headless runner wraps the provider CLI in its own `timeout` with a
+    # 1500s default (CCC_HEADLESS_TIMEOUT). Without this hand-off a task with
+    # timeoutSec > 1500 was killed at 25 minutes regardless (#2156). An
+    # explicit CCC_HEADLESS_TIMEOUT in the environment still wins; the outer
+    # wait leaves room for the runner's own kill grace (-k 30) so the runner,
+    # not this process, reports the timeout with exit 124.
+    env.setdefault('CCC_HEADLESS_TIMEOUT', str(payload['timeoutSec']))
     prompt = task.get('prompt') or ''
     try:
         proc = subprocess.run(
             cmd + [prompt], text=True, input='', capture_output=True, env=env,
-            timeout=payload['timeoutSec'],
+            timeout=payload['timeoutSec'] + HEADLESS_TIMEOUT_GRACE_SEC,
         )
     except subprocess.TimeoutExpired:
         return {**meta, 'exitCode': 124, 'stdout': '',

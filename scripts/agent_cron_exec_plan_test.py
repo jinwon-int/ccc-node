@@ -148,5 +148,71 @@ class BootIdCacheTest(unittest.TestCase):
         self.assertEqual(reads, ["/proc/sys/kernel/random/boot_id"])
 
 
+
+
+class HeadlessTimeoutHandoffTest(unittest.TestCase):
+    """#2156: the prompt path must hand timeoutSec to ccc-headless.
+
+    ccc-headless wraps the provider CLI in its own ``timeout`` with a 1500s
+    default (CCC_HEADLESS_TIMEOUT); agent-cron only ever used timeoutSec for
+    the outer subprocess wait, so a task asking for 10800s was killed at 25
+    minutes. The fake runner below records the environment it was given.
+    """
+
+    RUNNER = (
+        "import os, sys\n"
+        "print('TMO=' + os.environ.get('CCC_HEADLESS_TIMEOUT', '<unset>'))\n"
+        "sys.exit(0)\n"
+    )
+
+    def setUp(self):
+        import tempfile
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        runner = os.path.join(self._dir.name, "fake_headless.py")
+        with open(runner, "w", encoding="utf-8") as fh:
+            fh.write(self.RUNNER)
+        self._env = dict(os.environ)
+        self.addCleanup(self._restore_env)
+        os.environ["CCC_HEADLESS_CMD"] = f"{sys.executable} {runner}"
+        os.environ.pop("CCC_HEADLESS_TIMEOUT", None)
+        self.task = {"id": "long", "prompt": "hi", "payload": {"kind": "prompt", "timeoutSec": 1800}}
+
+    def _restore_env(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    def test_timeout_sec_reaches_the_runner(self):
+        result = agent_cron.run_headless(self.task)
+        self.assertEqual(result["exitCode"], 0)
+        self.assertIn("TMO=1800", result["stdout"])
+
+    def test_default_prompt_timeout_reaches_the_runner(self):
+        result = agent_cron.run_headless({"id": "d", "prompt": "hi"})
+        self.assertIn(f"TMO={agent_cron.DEFAULT_PROMPT_TIMEOUT_SEC}", result["stdout"])
+
+    def test_explicit_environment_value_still_wins(self):
+        os.environ["CCC_HEADLESS_TIMEOUT"] = "900"
+        result = agent_cron.run_headless(self.task)
+        self.assertIn("TMO=900", result["stdout"])
+
+    def test_outer_wait_leaves_room_for_the_runner_kill_grace(self):
+        seen = {}
+        real_run = agent_cron.subprocess.run
+
+        def spy(*args, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            seen["env_timeout"] = kwargs.get("env", {}).get("CCC_HEADLESS_TIMEOUT")
+            return real_run(*args, **kwargs)
+
+        agent_cron.subprocess.run = spy
+        try:
+            agent_cron.run_headless(self.task)
+        finally:
+            agent_cron.subprocess.run = real_run
+        self.assertEqual(seen["env_timeout"], "1800")
+        self.assertEqual(seen["timeout"], 1800 + agent_cron.HEADLESS_TIMEOUT_GRACE_SEC)
+
+
 if __name__ == "__main__":
     unittest.main()
