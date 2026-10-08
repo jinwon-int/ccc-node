@@ -295,3 +295,106 @@ async def test_stale_fan_out_temp_files_are_swept(tmp_path: Path) -> None:
     (tmp_path / "spool").mkdir(parents=True, exist_ok=True)
     await notifier._drain(DIRECT, tmp_path / "spool" / "sent")
     assert not old.exists() and fresh.exists(), "only crash leftovers older than an hour"
+
+
+# --- fleet alert relay mode (#2182): records go to the relay, never to the agent room ---
+
+def _relay_settings(tmp_path: Path, secret_file: Path | None = None, **over):
+    base = dict(push_fleet_relay_url="http://relay.ts:8795/v1/alerts", push_fleet_node="node-a")
+    if secret_file is not None:
+        base["push_fleet_relay_secret_file"] = str(secret_file)
+    base.update(over)
+    return _settings(tmp_path, **base)
+
+
+def _secret(tmp_path: Path) -> Path:
+    import os
+    f = tmp_path / "relay.secret"
+    f.write_text("k", encoding="utf-8")
+    os.chmod(f, 0o600)
+    return f
+
+
+class _FakeRelay:
+    def __init__(self, fail: Exception | None = None) -> None:
+        self.url = "http://relay.ts:8795/v1/alerts"
+        self.node = "node-a"
+        self.fail = fail
+        self.posted: list[dict] = []
+
+    def post(self, payload: dict) -> None:
+        if self.fail is not None:
+            raise self.fail
+        self.posted.append(payload)
+
+
+@pytest.mark.anyio
+async def test_relay_mode_posts_to_relay_and_never_to_the_agent_room(tmp_path: Path) -> None:
+    settings = _relay_settings(tmp_path, _secret(tmp_path))
+    t, enqueued = _transport({DIRECT: "direct"})
+    notifier = MatrixSpoolNotifier(settings, t)
+    assert notifier.relay_mode and notifier._relay is not None and notifier._relay.node == "node-a"
+    relay = _FakeRelay()
+    notifier._relay = relay
+    data = {"event": "SelfUpdate", "node": "node-a", "text": "업데이트 완료", "dedup": "SelfUpdate:x", "ts": "T"}
+    _record(tmp_path, "a.json", data)
+    (tmp_path / "spool" / "sent").mkdir(parents=True, exist_ok=True)
+    await notifier._drain(DIRECT, tmp_path / "spool" / "sent")
+    assert enqueued == [], "relay mode must not post into the owner/agent room"
+    assert len(relay.posted) == 1
+    p = relay.posted[0]
+    assert p["node"] == "node-a" and p["dedup"] == "node-a:SelfUpdate:x" and p["text"] == PushNotifier._format(data)
+    assert (tmp_path / "spool" / "sent" / "a.json").exists()
+
+
+@pytest.mark.anyio
+async def test_relay_mode_keeps_record_on_transient_and_archives_on_rejected(tmp_path: Path) -> None:
+    from telegram_bot.core.fleet_alert_relay import RelayError, RelayRejected
+    settings = _relay_settings(tmp_path, _secret(tmp_path))
+    t, enqueued = _transport({DIRECT: "direct"})
+    notifier = MatrixSpoolNotifier(settings, t)
+    notifier._relay = _FakeRelay(RelayError("down"))
+    _record(tmp_path, "retry.json", {"event": "x", "text": "t"})
+    (tmp_path / "spool" / "sent").mkdir(parents=True, exist_ok=True)
+    await notifier._drain(DIRECT, tmp_path / "spool" / "sent")
+    assert (tmp_path / "spool" / "retry.json").exists() and notifier._relay_fail_streak == 1
+    assert enqueued == []
+    notifier._relay = _FakeRelay(RelayRejected("401"))
+    await notifier._drain(DIRECT, tmp_path / "spool" / "sent")
+    assert not (tmp_path / "spool" / "retry.json").exists(), "rejected = poison → archived"
+    assert (tmp_path / "spool" / "sent" / "retry.json").exists() and enqueued == []
+
+
+@pytest.mark.anyio
+async def test_relay_mode_misconfigured_keeps_records_and_stays_silent(tmp_path: Path) -> None:
+    # URL set but no secret file: fail closed — nothing in the agent room, records kept.
+    settings = _relay_settings(tmp_path)
+    t, enqueued = _transport({DIRECT: "direct"})
+    notifier = MatrixSpoolNotifier(settings, t)
+    assert notifier.relay_mode and notifier._relay is None and "SECRET_FILE" in (notifier._relay_error or "")
+    _record(tmp_path, "kept.json", {"event": "x", "text": "t"})
+    (tmp_path / "spool" / "sent").mkdir(parents=True, exist_ok=True)
+    await notifier._drain(DIRECT, tmp_path / "spool" / "sent")
+    assert (tmp_path / "spool" / "kept.json").exists() and enqueued == []
+
+
+@pytest.mark.anyio
+async def test_relay_mode_runs_without_any_owner_room(tmp_path: Path) -> None:
+    import asyncio
+    settings = _relay_settings(tmp_path, _secret(tmp_path), push_poll_interval=0.01)
+    t, enqueued = _transport({})  # no direct/family room at all
+    notifier = MatrixSpoolNotifier(settings, t)
+    relay = _FakeRelay()
+    notifier._relay = relay
+    _record(tmp_path, "a.json", {"event": "x", "text": "t"})
+    task = asyncio.create_task(notifier.run())
+    for _ in range(50):
+        await asyncio.sleep(0.02)
+        if relay.posted:
+            break
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert len(relay.posted) == 1 and enqueued == []

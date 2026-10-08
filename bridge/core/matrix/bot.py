@@ -82,6 +82,13 @@ from telegram_bot.core.matrix_ids import MatrixIdMap
 from telegram_bot.core.claude_audience_sidecar import record_claude_turn_audience
 from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core.project_chat_types import ChatResponse
+from telegram_bot.core.fleet_alert_relay import (
+    FleetAlertRelay,
+    RelayError,
+    RelayRejected,
+    build_payload,
+    relay_from_settings,
+)
 from telegram_bot.core.push_notifier import (
     _DEDUP_WINDOW_SECONDS,
     _SENT_RETENTION_SECONDS,
@@ -374,6 +381,19 @@ class MatrixSpoolNotifier:
         self.mirror_dirs: list[Path] = mirror_dirs_from(settings, self.spool_dir, write_dir)
         self._recent: dict[str, float] = {}
         self._sent_times: list[float] = []
+        # Fleet alert relay (#2182). ``relay_mode`` is true whenever the URL is
+        # set — even when building the client failed (missing/unsafe secret
+        # file): the records are then *kept*, not posted into the agent room,
+        # and the misconfiguration is logged each cycle until fixed.
+        self.relay_mode: bool = bool((getattr(settings, "push_fleet_relay_url", None) or "").strip())
+        self._relay: Optional[FleetAlertRelay] = None
+        self._relay_error: Optional[str] = None
+        self._relay_fail_streak: int = 0
+        if self.relay_mode:
+            try:
+                self._relay = relay_from_settings(settings)
+            except (OSError, ValueError) as e:
+                self._relay_error = str(e)
 
     def _owner_room(self) -> Optional[str]:
         rooms = self._transport.policy.rooms
@@ -388,7 +408,9 @@ class MatrixSpoolNotifier:
             logger.info("Matrix spool notifier disabled (push_enabled is false)")
             return
         room = self._owner_room()
-        if room is None:
+        if self.relay_mode:
+            room = room or ""  # relay mode never writes to a room; the value is unused
+        elif room is None:
             logger.warning(
                 "Matrix spool notifier enabled but no direct/family room is configured; not sending"
             )
@@ -402,8 +424,9 @@ class MatrixSpoolNotifier:
             return
         self._prune_sent(sent_dir)
         logger.info(
-            "Matrix spool notifier active → room %s, spool %s, fan-out %s",
-            room,
+            "Matrix spool notifier active → %s, spool %s, fan-out %s",
+            f"fleet relay {self._relay.url} as {self._relay.node}" if self._relay else
+            ("fleet relay MISCONFIGURED (records kept)" if self.relay_mode else f"room {room}"),
             self.spool_dir,
             [str(d) for d in self.mirror_dirs] or "none",
         )
@@ -445,20 +468,54 @@ class MatrixSpoolNotifier:
             if len(self._sent_times) >= self.max_per_minute:
                 logger.warning("Matrix spool rate limit reached (%d/min); deferring", self.max_per_minute)
                 return
-            try:
-                self._transport.enqueue_notice(room, PushNotifier._format(data))
-            except ValueError as e:
-                # A room this process may never write (not-allowed/too long)
-                # stays failing forever — archive instead of looping on it.
-                logger.warning("Matrix spool record undeliverable, archived: %s", e)
-                self._archive(p, sent_dir)
-                continue
-            except Exception:
-                logger.warning("Matrix spool send failed (will retry next cycle)", exc_info=True)
+            outcome = await (self._deliver_relay(p, data) if self.relay_mode else self._deliver_room(room, data))
+            if outcome == "stop":
                 return  # keep file; stop this cycle to preserve order
-            self._recent[key] = now
-            self._sent_times.append(now)
-            self._archive(p, sent_dir)
+            if outcome == "sent":
+                self._recent[key] = now
+                self._sent_times.append(now)
+            self._archive(p, sent_dir)  # "sent" or "archive" (poison)
+
+    async def _deliver_room(self, room: str, data: dict) -> str:
+        """Owner-room delivery as the agent (pre-#2182 behaviour)."""
+        try:
+            self._transport.enqueue_notice(room, PushNotifier._format(data))
+        except ValueError as e:
+            # A room this process may never write (not-allowed/too long)
+            # stays failing forever — archive instead of looping on it.
+            logger.warning("Matrix spool record undeliverable, archived: %s", e)
+            return "archive"
+        except Exception:
+            logger.warning("Matrix spool send failed (will retry next cycle)", exc_info=True)
+            return "stop"
+        return "sent"
+
+    async def _deliver_relay(self, p: Path, data: dict) -> str:
+        """Relay mode (#2182): never post into the agent room.
+
+        A misconfigured relay keeps the records (logged once per cycle); a
+        refused record is poison and is archived; a transient failure stops
+        this cycle, preserving order.
+        """
+        if self._relay is None:
+            logger.error("Matrix spool fleet relay misconfigured; records kept: %s", self._relay_error)
+            return "stop"
+        payload = build_payload(self._relay.node, p.name, data, PushNotifier._format(data))
+        try:
+            await asyncio.to_thread(self._relay.post, payload)
+        except RelayRejected as e:
+            logger.warning("fleet relay refused spool record %s, archived: %s", p.name, e)
+            return "archive"
+        except RelayError as e:
+            self._relay_fail_streak += 1
+            if self._relay_fail_streak in (1, 10) or self._relay_fail_streak % 100 == 0:
+                logger.warning(
+                    "fleet relay delivery failed (streak %d, will retry): %s",
+                    self._relay_fail_streak, e,
+                )
+            return "stop"
+        self._relay_fail_streak = 0
+        return "sent"
 
     @staticmethod
     def _archive(p: Path, sent_dir: Path) -> None:

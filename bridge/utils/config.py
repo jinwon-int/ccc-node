@@ -941,6 +941,32 @@ class Config(
         alias="CCC_PUSH_MAX_PER_MINUTE",
         description="Rate limit: max push messages delivered per minute.",
     )
+    # Fleet alert relay (#2182): when set, the Matrix spool notifier forwards every
+    # record to the central relay (signed POST) instead of posting it into the
+    # owner's direct room as the agent, so agent rooms stay free of notices.
+    push_fleet_relay_url: Optional[str] = Field(
+        default=None,
+        alias="CCC_PUSH_FLEET_RELAY_URL",
+        description=(
+            "Fleet alert relay endpoint (http(s), Tailscale-internal). Unset = deliver "
+            "to the owner room as before. Set = relay mode; the owner room is not used."
+        ),
+    )
+    push_fleet_relay_secret_file: Optional[Path] = Field(
+        default=None,
+        alias="CCC_PUSH_FLEET_RELAY_SECRET_FILE",
+        description="Owner-only (0600) file holding the shared HMAC secret for the fleet relay.",
+    )
+    push_fleet_node: str = Field(
+        default="",
+        alias="CCC_PUSH_FLEET_NODE",
+        description="Node name sent to the fleet relay. Empty = CCC_NODE or the short hostname.",
+    )
+    push_fleet_relay_timeout: float = Field(
+        default=10.0,
+        alias="CCC_PUSH_FLEET_RELAY_TIMEOUT",
+        description="Seconds to wait for the fleet relay per record.",
+    )
     # Telegram HTTPX transport timeouts (seconds). Connect/pool defaults were
     # raised from 5s/3s: on a mobile or Tailscale uplink a fresh TLS handshake
     # to api.telegram.org can exceed 3s, which PTB reports as

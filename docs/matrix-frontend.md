@@ -101,6 +101,36 @@ mirror again, while Matrix still posts them to the owner room. A record
 the matrix side keeps failing to send for longer than the 7-day `sent/`
 retention can be mirrored a second time.
 
+### Fleet alert relay mode (#2182)
+
+The owner's direct room is also where the agent posts its progress bubbles,
+so a spool notice posted there *as the agent* can bury the work in flight.
+Set `CCC_PUSH_FLEET_RELAY_URL` on the matrix unit and the notifier forwards
+every record to the central fleet alert relay instead — an HMAC-signed
+`POST` (`X-Fleet-Node`, `X-Fleet-Timestamp`, `X-Fleet-Signature:
+sha256=HMAC(secret, "<ts>." + body)`, schema `ccc.fleet-alert.v1`, text
+already formatted, `dedup` namespaced `node:dedup`). A dedicated bot
+(`@fleet-alerts`) then posts it into the owner's **🔔 플릿 알림** room; the
+agent room receives nothing.
+
+| Variable | Meaning |
+|---|---|
+| `CCC_PUSH_FLEET_RELAY_URL` | relay endpoint (Tailscale-internal http(s)); unset = owner-room delivery as before |
+| `CCC_PUSH_FLEET_RELAY_SECRET_FILE` | owner-only (0600, no symlink) file with the shared secret |
+| `CCC_PUSH_FLEET_NODE` | node name in the payload; empty = `CCC_NODE` or short hostname |
+| `CCC_PUSH_FLEET_RELAY_TIMEOUT` | seconds per record (default 10) |
+
+Semantics are otherwise unchanged: `sent/` archive, dedup window, rate
+limit and fan-out mirrors behave exactly as in owner-room mode. A 2xx
+archives the record; a transient failure (5xx, 408/429, connection error)
+keeps it and stops the cycle to preserve order (logged at streak 1, 10, then
+every 100th); a refusal (other 4xx) is poison and is archived. A relay URL
+with a missing, empty or group-readable secret file **fails closed**: the
+records are kept and the misconfiguration is logged — the notifier never
+falls back to the agent room. The owner room is not required in relay mode.
+The Telegram notifier and the fan-out mirror are untouched (Telegram
+delivery is stage 2).
+
 `turn_timeout_minutes` (optional, default 360 — 6 h —, allowed 5–360) caps one
 running turn; a timed-out turn still resolves uncertain exactly as
 before — only the ceiling moves. Set it to 360 (6 h) for genuinely long
