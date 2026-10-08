@@ -227,18 +227,21 @@ def _parse_bind(value: str) -> tuple[str, int]:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--bind", type=_parse_bind, default=("127.0.0.1", 8795), help="host:port (default 127.0.0.1:8795)")
-    parser.add_argument("--secrets-dir", required=True, type=Path, help="directory of <node> secret files (0600)")
+    parser.add_argument(
+        "--secrets-dir", dest="nodes_dir", required=True, type=Path, help="directory of <node> secret files (0600)"
+    )
     parser.add_argument("--queue", required=True, type=Path, help="owner-only queue directory shared with the sender")
     parser.add_argument("--skew", type=float, default=DEFAULT_SKEW_S, help="max |now - X-Fleet-Timestamp| in seconds")
     parser.add_argument("--max-body", type=int, default=DEFAULT_MAX_BODY)
     args = parser.parse_args(argv)
     os.umask(0o077)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    if not args.secrets_dir.is_dir():
-        log.error("secrets dir missing: %s", args.secrets_dir)
+    if not args.nodes_dir.is_dir():
+        # The directory path is not sensitive (its *contents* are, and are never logged).
+        log.error("node key directory missing (--secrets-dir)")
         return 2
     outbox.pending_count(args.queue)  # fail fast on an unsafe queue directory
-    receiver = Receiver(secrets_dir=args.secrets_dir, queue_dir=args.queue, skew=args.skew, max_body=args.max_body)
+    receiver = Receiver(secrets_dir=args.nodes_dir, queue_dir=args.queue, skew=args.skew, max_body=args.max_body)
     host, port = args.bind
     httpd = serve(receiver, host, port)
     log.info("fleet alert receiver listening on %s:%d", host, port)
