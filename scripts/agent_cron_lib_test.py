@@ -334,6 +334,46 @@ class ApplyRetryTransitionTest(unittest.TestCase):
         self.assertEqual(task['retryState']['lastStatus'], 'exhausted')
 
 
+    def test_auth_and_cli_failures_never_schedule_a_retry(self):
+        # #1821: a rejected credential or a missing CLI fails the same way on a
+        # backoff retry, so no retry is scheduled even with attempts left.
+        for klass in ('auth_failed', 'cli_missing'):
+            task = {'retryPolicy': {'maxAttempts': 3, 'backoffSec': 60}}
+            res = lib.apply_retry_transition(task, '2026-06-28T00:00:00Z', 1, 'run1', 'failed',
+                                             _dt(2026, 6, 28, 0, 0), failure_class=klass)
+            self.assertTrue(res['exhausted'], klass)
+            self.assertEqual(res['notRetryable'], klass)
+            self.assertIsNone(res['retryEligibleAt'])
+            self.assertEqual(task['retryState']['lastStatus'], 'not-retryable')
+            self.assertIsNone(task['retryState']['retryEligibleAt'])
+            view = lib.retry_view(task, _dt(2026, 6, 28, 0, 5))
+            self.assertFalse(view['ready'])
+            self.assertTrue(view['exhausted'])
+
+    def test_timeout_and_other_failures_still_retry(self):
+        for klass in ('timeout', 'other', None):
+            task = {'retryPolicy': {'maxAttempts': 3, 'backoffSec': 60}}
+            res = lib.apply_retry_transition(task, '2026-06-28T00:00:00Z', 1, 'run1', 'failed',
+                                             _dt(2026, 6, 28, 0, 0), failure_class=klass)
+            self.assertFalse(res['exhausted'], klass)
+            self.assertEqual(task['retryState']['retryEligibleAt'], '2026-06-28T00:01:00Z')
+
+    def test_non_retryable_class_without_policy_records_nothing(self):
+        # #911 still wins: no declared retryPolicy means no retry state at all.
+        task = {}
+        res = lib.apply_retry_transition(task, '2026-06-28T00:00:00Z', 1, 'run1', 'failed',
+                                         _dt(2026, 6, 28, 0, 0), failure_class='auth_failed')
+        self.assertFalse(res['exhausted'])
+        self.assertNotIn('retryState', task)
+
+    def test_success_clears_state_whatever_the_class(self):
+        task = {'retryPolicy': {'maxAttempts': 3}, 'retryState': {'attempt': 1, 'lastStatus': 'not-retryable'}}
+        res = lib.apply_retry_transition(task, '2026-06-28T00:00:00Z', 1, 'run1', 'success',
+                                         _dt(2026, 6, 28, 0, 0), failure_class=None)
+        self.assertTrue(res['cleared'])
+        self.assertNotIn('retryState', task)
+
+
 class RetryViewTest(unittest.TestCase):
     def test_no_state_returns_none(self):
         self.assertIsNone(lib.retry_view({}, _dt(2026, 6, 28, 0, 0)))

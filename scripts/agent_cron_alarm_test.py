@@ -297,6 +297,73 @@ class Integration(unittest.TestCase):
         self.assertEqual(sorted(reasons), ['node=threshold', 'task=threshold', 'task=threshold'])
         self.assertLessEqual(len(box.alarms()), 3)
 
+    def test_auth_and_cli_failures_skip_the_backoff_retry(self) -> None:
+        # #1821: with attempts left, auth_failed / cli_missing record no retry;
+        # a generic failure still schedules one.
+        policy = {'retryPolicy': {'maxAttempts': 3, 'backoffSec': 60}}
+        extra = [{'id': tid, 'schedule': '* * * * *', 'prompt': tid, 'enabled': True,
+                  'notify': 'none', 'lastRunAt': '2026-01-01T00:00:00Z', **policy}
+                 for tid in ('auth', 'cli', 'generic')]
+        box = self.sandbox([], extra_tasks=extra)
+        for tid, mode in (('auth', 'auth'), ('cli', 'exit127'), ('generic', 'exit1')):
+            box.run(tid, mode)
+        tasks = {t['id']: t for t in json.loads(box.store.read_text())['tasks']}
+        for tid in ('auth', 'cli'):
+            state = tasks[tid]['retryState']
+            self.assertEqual(state['lastStatus'], 'not-retryable', tid)
+            self.assertIsNone(state['retryEligibleAt'], tid)
+        self.assertIsNotNone(tasks['generic']['retryState']['retryEligibleAt'])
+        self.assertEqual(box.alarm_state()['tasks']['auth']['failureClass'], 'auth_failed')
+
+    def _no_retry_task(self, tid: str, schedule: str, **extra) -> dict:
+        task = {'id': tid, 'schedule': schedule, 'prompt': tid, 'enabled': True, 'notify': 'none',
+                'retryPolicy': {'maxAttempts': 3, 'backoffSec': 60}}
+        task.update(extra)
+        return task
+
+    def test_skipped_retry_alerts_on_the_first_failure(self) -> None:
+        # #1821 review F1: retries were what reached the threshold within
+        # minutes. Without them a daily task would alert days later and a
+        # one-shot never, so a not-retryable prompt failure alerts at once.
+        extra = [self._no_retry_task('daily', '0 0 * * *', lastRunAt='2025-12-31T00:00:00Z'),
+                 self._no_retry_task('once', 'at 2026-01-01T00:00:00Z')]
+        box = self.sandbox([], extra_tasks=extra)
+        box.run('daily', 'auth', advance=0)
+        box.run('once', 'exit127', advance=0)
+        alarms = {a['taskId']: a for a in box.alarms()}
+        self.assertEqual(sorted(alarms), ['daily', 'once'])
+        for tid in ('daily', 'once'):
+            self.assertIn('task=threshold', alarms[tid]['reasons'])
+        state = box.alarm_state()['tasks']
+        self.assertEqual(state['daily']['alertedClass'], 'auth_failed')
+        self.assertEqual(state['once']['alertedClass'], 'cli_missing')
+        # Deduped: the next occurrence's failure raises no second task alarm
+        # (the node-wide counter may still fire on its own 3-run threshold).
+        box.run('daily', 'auth', advance=1440)
+        task_alarms = [a for a in box.alarms()
+                       if a['taskId'] == 'daily' and 'task=threshold' in a['reasons']]
+        self.assertEqual(len(task_alarms), 1)
+
+    def test_opted_out_task_stays_silent_even_without_retry(self) -> None:
+        extra = [self._no_retry_task('quiet', '* * * * *', lastRunAt='2026-01-01T00:00:00Z',
+                                     failureAlertAfter=0)]
+        box = self.sandbox([], extra_tasks=extra)
+        box.run('quiet', 'auth')
+        self.assertEqual(box.alarms(), [])
+
+    def test_command_task_auth_stderr_keeps_its_retry(self) -> None:
+        # #1821 review F2: a command task's own stderr (a 401 from a service
+        # that is restarting) is not proof of a permanent credential failure.
+        script = 'import sys; sys.stderr.write("HTTP 401 Unauthorized\\n"); sys.exit(1)'
+        extra = [self._no_retry_task('cmd', '* * * * *', lastRunAt='2026-01-01T00:00:00Z',
+                                     payload={'kind': 'command', 'argv': [sys.executable, '-c', script]})]
+        box = self.sandbox([], extra_tasks=extra)
+        box.run('cmd', 'ok')
+        task = json.loads(box.store.read_text())['tasks'][0]
+        self.assertEqual(box.alarm_state()['tasks']['cmd']['failureClass'], 'auth_failed')
+        self.assertIsNotNone(task['retryState']['retryEligibleAt'])
+        self.assertEqual(box.alarms(), [])
+
     def test_per_task_class_flapping_is_bounded(self) -> None:
         # Review finding 2: exit 1 <-> 127 alerted on every run.
         box = self.sandbox(['flappy'])
