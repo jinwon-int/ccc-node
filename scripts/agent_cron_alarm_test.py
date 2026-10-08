@@ -297,6 +297,24 @@ class Integration(unittest.TestCase):
         self.assertEqual(sorted(reasons), ['node=threshold', 'task=threshold', 'task=threshold'])
         self.assertLessEqual(len(box.alarms()), 3)
 
+    def test_auth_and_cli_failures_skip_the_backoff_retry(self) -> None:
+        # #1821: with attempts left, auth_failed / cli_missing record no retry;
+        # a generic failure still schedules one.
+        policy = {'retryPolicy': {'maxAttempts': 3, 'backoffSec': 60}}
+        extra = [{'id': tid, 'schedule': '* * * * *', 'prompt': tid, 'enabled': True,
+                  'notify': 'none', 'lastRunAt': '2026-01-01T00:00:00Z', **policy}
+                 for tid in ('auth', 'cli', 'generic')]
+        box = self.sandbox([], extra_tasks=extra)
+        for tid, mode in (('auth', 'auth'), ('cli', 'exit127'), ('generic', 'exit1')):
+            box.run(tid, mode)
+        tasks = {t['id']: t for t in json.loads(box.store.read_text())['tasks']}
+        for tid in ('auth', 'cli'):
+            state = tasks[tid]['retryState']
+            self.assertEqual(state['lastStatus'], 'not-retryable', tid)
+            self.assertIsNone(state['retryEligibleAt'], tid)
+        self.assertIsNotNone(tasks['generic']['retryState']['retryEligibleAt'])
+        self.assertEqual(box.alarm_state()['tasks']['auth']['failureClass'], 'auth_failed')
+
     def test_per_task_class_flapping_is_bounded(self) -> None:
         # Review finding 2: exit 1 <-> 127 alerted on every run.
         box = self.sandbox(['flappy'])
