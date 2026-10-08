@@ -146,10 +146,10 @@ import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
 for i in range(60):
     c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,dedup,created_at,source_rank,review,mutability)"
-              " VALUES ('family-assistant','daegyo','context',?,?, '2026-10-08T00:00:00Z', ?, '2026-10-08T00:00:00Z',1,0,'live-check')",
+              " VALUES ('family-assistant','node-a','context',?,?, '2026-10-08T00:00:00Z', ?, '2026-10-08T00:00:00Z',1,0,'live-check')",
               (f"자동 추출 사실 번호 {i} " + "가" * 40, f"auto-distill:distill:bulk{i}", f"bulk{i}"))
 c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,dedup,created_at,source_rank,review,mutability)"
-          " VALUES ('family-assistant','daegyo','procedure','대화 기억 사실 CONVERSATION','distill:conv', '2026-10-07T00:00:00Z','conv','2026-10-07T00:00:00Z',1,0,'static')")
+          " VALUES ('family-assistant','node-a','procedure','대화 기억 사실 CONVERSATION','distill:conv', '2026-10-07T00:00:00Z','conv','2026-10-07T00:00:00Z',1,0,'static')")
 c.commit()
 PY
 asm="$(python3 "$NP" assemble --budget 3000)"
@@ -199,7 +199,7 @@ python3 - "$NUNCHI_DB" <<'PY'
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
 ins = ("INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,dedup,created_at,source_rank,review,mutability)"
-       " VALUES ('family-assistant','daegyo',?,?,?,'2026-10-08T00:00:00Z',?,'2026-10-08T00:00:00Z',1,0,?)")
+       " VALUES ('family-assistant','node-a',?,?,?,'2026-10-08T00:00:00Z',?,'2026-10-08T00:00:00Z',1,0,?)")
 for i in range(5):
     c.execute(ins, ("procedure", f"대화 기억 CONV{i}", f"distill:c{i}", f"c{i}", "static"))
 for i in range(30):

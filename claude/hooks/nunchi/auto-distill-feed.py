@@ -5,7 +5,7 @@ auto-distill (scripts/auto-distill/auto-distill.py, cron) extracts evidence-
 backed operational facts from session transcripts and runs them through its
 structure / value / canon-dedup / entailment gates. Until #2186 the survivors
 only landed in a node-local AUTO.md that waited for a human verdict that never
-came (2026-10-08: ~920 Wiki items, 57 judged; daegyo 952 local, 0 judged; no
+came (2026-10-08: ~920 Wiki items, 57 judged; one node 952 local, 0 judged; no
 runtime reader at all). This feed hands the gate survivors to nunchi instead,
 where the session-start `assemble` injection already reaches every agent and
 nunchi's own machinery (G1-G5, judge-batch, live-check marker, TTL) replaces

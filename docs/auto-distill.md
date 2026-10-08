@@ -173,7 +173,7 @@ never model stderr or source text.
 
 Owner decision 2026-10-08 (#2186): the human verdict step on AUTO.md is
 abolished. Measured that day, the Wiki AUTO.md pages had not changed since
-2026-08-27, about 57 of ~920 items had a human verdict, daegyo held 952 local
+2026-08-27, about 57 of ~920 items had a human verdict, one node held 952 local
 items with none, and no runtime code read either file. Gate survivors are now
 handed to nunchi, whose session-start `assemble` already reaches every agent
 and whose own machinery (G1-G5 write gates, the hourly judge-batch, the ⟳
