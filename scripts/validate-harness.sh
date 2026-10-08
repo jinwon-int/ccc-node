@@ -528,6 +528,12 @@ else
   err "doctor skill-promotion backlog verdict tests failed"
   tail -10 "$TMP/doctor-promotion-backlog-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_pending_backlog_test.py >"$TMP/doctor-pending-backlog-test.out" 2>&1; then
+  say "  ok doctor skill-autosave pending-backlog verdict tests"
+else
+  err "doctor skill-autosave pending-backlog verdict tests failed (an unreviewed draft queue would reach the 90-day expiry unseen, #2184)"
+  tail -10 "$TMP/doctor-pending-backlog-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_dispatch_gap_test.py >"$TMP/doctor-dispatch-gap-test.out" 2>&1; then
   say "  ok doctor skill-promotion dispatch-gap verdict tests"
 else
