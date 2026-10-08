@@ -42,17 +42,40 @@ GRACE_SECONDS="${BRIDGE_WATCHDOG_GRACE_SECONDS:-90}"
 # bridge running on the same host).
 PROCESS_MATCH="${BRIDGE_WATCHDOG_PROCESS_MATCH:-python -m telegram_bot}"
 
+# Channel filter (#2176): a Matrix frontend runs the very same
+# `python -m telegram_bot --path $HOME` command line (CCC_CHANNEL=matrix, own
+# BOT_DATA_DIR), so a bare pgrep match counted it as "the Telegram bridge is
+# up" and the watchdog never restarted a dead Telegram bridge while Matrix was
+# healthy (a Termux node, 2026-10-08). Apply bridge/start.sh's rule
+# (_environ_bridge_channel): a process whose environ says CCC_CHANNEL=matrix
+# is a different service; unreadable environ, a missing key or any other value
+# means telegram -- the conservative reading, which never turns a live bridge
+# into a false "down". PROC_ROOT is a test seam only.
+PROC_ROOT="${BRIDGE_WATCHDOG_PROC_ROOT:-/proc}"
+is_matrix_process() {
+  local env_file="$PROC_ROOT/$1/environ" arg
+  [ -r "$env_file" ] || return 1
+  while IFS= read -r -d '' arg; do
+    case "$arg" in
+      CCC_CHANNEL=matrix) return 0 ;;
+      CCC_CHANNEL=*) return 1 ;;
+    esac
+  done 2>/dev/null < "$env_file"
+  return 1
+}
+
 # Alive check: bot.pid points at a live python -m telegram_bot process
 if [ -f "$PID_FILE" ]; then
   pid="$(cat "$PID_FILE" 2>/dev/null)"
-  if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+  if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null && ! is_matrix_process "$pid"; then
     exit 0
   fi
 fi
-# Fallback: process match (covers stale/missing pid file)
-if pgrep -f "$PROCESS_MATCH" >/dev/null 2>&1; then
+# Fallback: process match (covers stale/missing pid file), Telegram only
+for cand in $(pgrep -f "$PROCESS_MATCH" 2>/dev/null); do
+  is_matrix_process "$cand" && continue
   exit 0
-fi
+done
 
 # Start lock (#970): the debounce below covers restart racing restart, but
 # during a dependency build there is no bot.pid at all, so every tick used to
@@ -92,8 +115,19 @@ if [ -x "$START" ]; then
   # fd 9 and held the "start lock" for its whole life, so a healthy running
   # bridge logged "another start is in flight" whenever pgrep missed it
   # (a2a-termux-native-worker.sh closes its lock fd the same way).
-  bash "$START" --path "$HOME" --daemon >> "$LOG" 2>&1 9>&-
-  echo "[$(ts)] bridge watchdog: start.sh exit=$?" >> "$LOG"
+  #
+  # Start from a neutral channel (#2176/#2177): this script only ever restarts
+  # the Telegram bridge, but a crond launched from a Matrix provider shell
+  # passes that shell's CCC_CHANNEL=matrix (and the frontend's session/config
+  # paths) on to its jobs, which would make start.sh act on the Matrix channel
+  # -- or, with the #2177 guard, refuse every tick. `env -u` works on start.sh
+  # builds with and without --channel.
+  env -u CCC_CHANNEL -u SESSION_STORE_PATH -u CCC_BOT_ENV_FILE -u CCC_MATRIX_CONFIG_PATH \
+    bash "$START" --path "$HOME" --daemon >> "$LOG" 2>&1 9>&-
+  # Capture before the log line: `$(ts)` is a command substitution that resets
+  # $?, so the old `exit=$?` always logged 0 and hid start failures.
+  start_rc=$?
+  echo "[$(ts)] bridge watchdog: start.sh exit=$start_rc" >> "$LOG"
 else
   echo "[$(ts)] bridge watchdog: $START not found/executable" >> "$LOG"
 fi
