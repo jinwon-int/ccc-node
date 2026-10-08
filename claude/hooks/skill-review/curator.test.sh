@@ -219,6 +219,18 @@ ok "auto run proceeds after the interval" 'jq -e ".counts.seeded == 1" >/dev/nul
 CCC_SKILL_CURATOR_NOW="$(python3 -c "from datetime import datetime,timedelta,timezone; print((datetime.now(timezone.utc)+timedelta(days=3)).isoformat())")" ntool bump --event use --name zeta >/dev/null
 out="$(CCC_SKILL_CURATOR_NOW="$(python3 -c "from datetime import datetime,timedelta,timezone; print((datetime.now(timezone.utc)+timedelta(days=3,hours=1)).isoformat())")" ntool run --auto)"
 ok "auto run skips while the node is active within min-idle" 'jq -e ".skipped == \"node-active-within-min-idle\"" >/dev/null <<<"$out"'
+# The idle gate judges the same usage-ledger union as the stale decision
+# (#1739): a recent Read|Skill row in usage.jsonl alone defers the auto run,
+# even when the Skill-tool record has been quiet for days.
+n_at() { python3 -c "from datetime import datetime,timedelta,timezone; print((datetime.now(timezone.utc)+timedelta(days=$1,hours=$2)).strftime('%Y-%m-%dT%H:%M:%SZ'))"; }
+mkdir -m 700 "$NSTATE/skill-usage"
+printf '{"ts":"%s","skill":"zeta","tool":"Read"}\n' "$(n_at 10 -1)" > "$NSTATE/skill-usage/usage.jsonl"
+chmod 600 "$NSTATE/skill-usage/usage.jsonl"
+out="$(CCC_SKILL_CURATOR_NOW="$(n_at 10 0)" ntool run --auto)"
+ok "auto idle gate counts a recent usage.jsonl row (union, #1739)" 'jq -e ".skipped == \"node-active-within-min-idle\"" >/dev/null <<<"$out"'
+printf '{"ts":"%s","skill":"zeta","tool":"Read"}\n' "$(n_at 10 -5)" > "$NSTATE/skill-usage/usage.jsonl"
+out="$(CCC_SKILL_CURATOR_NOW="$(n_at 10 0)" ntool run --auto)"
+ok "auto idle gate proceeds once usage.jsonl activity is older than min-idle" 'jq -e "(.skipped // null) == null and .ok == true and .usage_ledgers.usage_jsonl == \"present\"" >/dev/null <<<"$out"'
 rm -rf "$NEWTMP"
 
 # --- 10. configuration + fail-closed boundaries --------------------------------
