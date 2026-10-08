@@ -1,0 +1,39 @@
+# Fleet alert Matrix sender (#2182) — systemd unit example for the relay host.
+#
+# Send-only E2EE bot (@fleet-alerts) draining /var/lib/fleet-alerts/queue into
+# the owner's "🔔 플릿 알림" room. Install: copy to
+# /etc/systemd/system/fleet-alerts-sender.service, then
+#   /opt/ccc-node/bridge/venv/bin/python /opt/ccc-node/scripts/fleet-alerts/fleet_alerts_sender.py \
+#     --config /etc/fleet-alerts/matrix.json --queue /var/lib/fleet-alerts/queue --initialize
+#   systemctl daemon-reload && systemctl enable --now fleet-alerts-sender
+# Prerequisites (see scripts/fleet-alerts/README.md): bridge venv with the
+# matrix extra (requirements-matrix.txt), the bot account, a private 0600
+# config JSON with exactly one room, state_directory under /var/lib/fleet-alerts.
+# Tokens / pickle key live only in the config file — never in this unit.
+[Unit]
+Description=Fleet alert Matrix sender (@fleet-alerts, send-only, E2EE)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ccc-node/scripts/fleet-alerts
+Environment=PYTHONPATH=/opt/ccc-node/.github/pythonpath
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/ccc-node/bridge/venv/bin/python /opt/ccc-node/scripts/fleet-alerts/fleet_alerts_sender.py \
+  --config /etc/fleet-alerts/matrix.json \
+  --queue /var/lib/fleet-alerts/queue
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/fleet-alerts
+
+[Install]
+WantedBy=multi-user.target
