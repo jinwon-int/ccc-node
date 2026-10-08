@@ -1755,3 +1755,36 @@ async def test_captionless_media_reply_keeps_original_caption_in_provider_prompt
     await bot.run_turn(current, sink=FakeSink(), session_id=None, room_kind="direct")
     assert caption in chat.calls[0]["user_message"]
     assert not list((tmp_path / "data" / "matrix-media").iterdir())
+
+
+@pytest.mark.anyio
+async def test_startup_banner_goes_to_the_push_spool_in_fleet_relay_mode(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2182: with a fleet relay configured the banner is a spool record, never an agent-room notice."""
+    import json as _json
+
+    spool = tmp_path / "spool"
+    bot, _chat, _manager = _bot(
+        tmp_path,
+        matrix_startup_banner=True,
+        push_fleet_relay_url="http://relay.ts:8795/v1/alerts",
+        push_fleet_node="node-a",
+        push_spool_dir=spool,
+    )
+    monkeypatch.setattr(type(bot), "_bridge_revision", staticmethod(lambda: "abc1234"))
+    holder = await _attach(bot)
+
+    async def body(transport: FakeTransport) -> None:
+        return None
+
+    holder["body"] = body
+    await bot.serve()
+    assert holder["transport"].notices == [], "relay mode: nothing is posted as the agent"
+    records = sorted(spool.glob("Startup-*.json"))
+    assert len(records) == 1 and not list(spool.glob("*.tmp"))
+    data = _json.loads(records[0].read_text(encoding="utf-8"))
+    assert data["event"] == "Startup" and data["node"] == "node-a"
+    assert data["text"] == bot.startup_banner() and data["text"].startswith("🟢 ")
+    assert data["dedup"].startswith("startup-") and data["ts"]
+    assert (records[0].stat().st_mode & 0o777) == 0o600
