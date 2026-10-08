@@ -130,10 +130,9 @@ records are kept and the misconfiguration is logged — the notifier never
 falls back to the agent room. The owner room is not required in relay mode.
 The Telegram notifier and the fan-out mirror are untouched (Telegram
 delivery is stage 2).
-In relay mode the startup banner (`🟢 … Matrix 프론트엔드 기동 …`) is also a
-fleet notice: it is written to the push spool as an `event: Startup` record
-(same hourly dedup key) and relayed, instead of being posted into the owner's
-room as the agent.
+The startup banner (`🟢 … Matrix 프론트엔드 기동 …`) is **not** relayed: it
+describes this agent, so it is always posted in the agent's own room (owner
+decision 2026-10-09; #2192's spool routing was reverted).
 
 `turn_timeout_minutes` (optional, default 360 — 6 h —, allowed 5–360) caps one
 running turn; a timed-out turn still resolves uncertain exactly as

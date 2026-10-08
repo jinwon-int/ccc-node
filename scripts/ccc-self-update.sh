@@ -25,6 +25,10 @@
 #      startup identity. It is the only supported way to reconcile a pending
 #      activation record on an unchanged tick; without it
 #      the serving identity is unknown and stays pending (#1527).)
+#   ~/.claude/self-update.notify (optional: `all` (default) or `none`. `none`
+#      queues no owner notification at all — success, warning or stall — and
+#      only logs `notify=suppressed`; the audit log and status are unchanged.
+#      Env override: CCC_SELF_UPDATE_NOTIFY. Unknown values mean `all`.)
 #   ~/.claude/self-update.no-reapply (optional: operator kill-switch; when this
 #      file exists, installer-managed cron is never rewritten. Env override:
 #      CCC_SELF_UPDATE_REAPPLY=0. Agent must not write the file.)
@@ -231,7 +235,19 @@ resolve_repo() {
   printf '%s' "${HOME:-/root}/ccc-node"
 }
 
+notify_mode() { # all (default) | none — env CCC_SELF_UPDATE_NOTIFY, else operator file
+  local m="${CCC_SELF_UPDATE_NOTIFY:-}"
+  [ -n "$m" ] || m="$(read_operator_cmd "$CLAUDE_DIR/self-update.notify" 2>/dev/null || true)"
+  case "$m" in none|off) printf none ;; *) printf all ;; esac
+}
+
 notify() { # <text> <dedup-suffix>
+  if [ "$(notify_mode)" = none ]; then
+    # Operator opted this node out of owner pushes (e.g. a node whose channel
+    # must stay quiet). The decision is still auditable here.
+    log "notify=suppressed reason=operator-notify-none dedup=SelfUpdate:$2"
+    return 0
+  fi
   mkdir -p "$SPOOL" 2>/dev/null || return 0
   local node now fname
   node="${CCC_NODE:-$(hostname -s 2>/dev/null || echo node)}"

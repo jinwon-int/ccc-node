@@ -1642,5 +1642,26 @@ run_selfup run >/dev/null 2>&1; rc=$?
 ok "symlink at lock path fails closed and survives" '[ "$rc" = 3 ] && [ -L "$LOCKP" ] && grep -q "kind=other" "$STATE/self-update.log"'
 rm -f -- "$LOCKP"
 
+# --- notify mode: operator file `none` queues no owner push, only a log line ----
+# Fresh claude/state dirs: earlier cases leave activation evidence that makes
+# the script (correctly) refuse mutations, which is not what this case tests.
+CLAUDE="$TMP/claude-notify"; STATE="$CLAUDE/state"; mkdir -p "$STATE"
+printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
+rm -f "$TMP/spool"/*.json 2>/dev/null
+printf '%s\n' '# quiet node' 'none' > "$CLAUDE/self-update.notify"
+echo notify-none > "$TMP/seed/file.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm notify-none && git -C "$TMP/seed" push -q origin main
+run_selfup run >/dev/null 2>&1; rc=$?
+ok "notify=none: update still applied" '[ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
+ok "notify=none: no SelfUpdate record queued" '! ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&1'
+ok "notify=none: suppression is logged" 'grep -q "notify=suppressed reason=operator-notify-none" "$STATE/self-update.log"'
+# env override wins over the file
+rm -f "$TMP/spool"/*.json 2>/dev/null
+echo notify-env > "$TMP/seed/file.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm notify-env && git -C "$TMP/seed" push -q origin main
+CCC_SELF_UPDATE_NOTIFY=all run_selfup run >/dev/null 2>&1; rc=$?
+ok "CCC_SELF_UPDATE_NOTIFY=all overrides the file" 'ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&1'
+rm -f "$CLAUDE/self-update.notify"
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
