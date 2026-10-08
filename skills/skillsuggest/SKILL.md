@@ -36,6 +36,19 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
      sed -n '1,220p' "$STATE/pending-skills/<id>/SKILL.md"
    fi
    ```
+   A draft with a `prescreen.json` was already read by the fleet intake
+   reviewer (rubric 2026-08-28.2, #2183). Read its verdict first — it tells
+   you where to look, it does not decide for you:
+   ```bash
+   jq '{verdict, max_severity, status, findings: (.findings // [] | map("\(.severity)/\(.area): \(.note)"))}' "$STATE/pending-skills/<id>/prescreen.json" 2>/dev/null
+   ```
+   `approve` = nothing found, skim and decide; `revise` = read the listed
+   findings against the draft; `status: error` = the reviewer could not run,
+   review as if unscreened. Drafts the reviewer rejected with a blocker are
+   not in this queue any more — they sit under
+   `$STATE/skill-autosave-archive/prescreen-reject-<date>/` with the blocker
+   text in `manifest.jsonl`; `ccc-skill-autosave.sh pending-restore <id>`
+   brings one back if the reviewer was wrong.
    For a v2 proposal, approve only after checking its exact target, expected
    hashes, provenance and full diff/content. Never copy v2 content by hand:
    ```bash

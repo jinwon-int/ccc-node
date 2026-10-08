@@ -49,6 +49,11 @@ CURATOR="${CCC_SKILL_CURATOR_CMD:-$CLAUDE_DIR/hooks/skill-review/curator.py}"
 # #2184: 90-day expiry of undecided drafts (rename into the archive root with a
 # manifest row; never deletes). CCC_SKILL_PENDING_EXPIRE_DAYS=0 turns it off.
 PENDING_EXPIRE="${CCC_SKILL_PENDING_EXPIRE_CMD:-$CLAUDE_DIR/hooks/skill-review/pending_expire.py}"
+# #2183: pre-screen undecided drafts with the fleet intake reviewer (local
+# handler call, no broker). Only `reject`+blocker leaves the queue (archived
+# with a manifest row); everything else stays and /skillsuggest shows the
+# verdict. CCC_SKILL_PRESCREEN_MAX_PER_RUN=0 turns the step off.
+PRESCREEN="${CCC_SKILL_PRESCREEN_CMD:-$CLAUDE_DIR/hooks/skill-review/prescreen.py}"
 PROMOTER="${CCC_SKILL_PROMOTION_CMD:-$CLAUDE_DIR/hooks/ccc-skill-promotion.py}"
 # Publisher edge env (#1766): the env file that exports A2A_EDGE_SECRET for the
 # intake review dispatch in block 2d. HOME-relative default — no node-specific
@@ -247,6 +252,27 @@ if [ "$MODE" = "pending-expire" ] || [ "$MODE" = "pending-restore" ]; then
   exit "$rc"
 fi
 
+# --- prescreen: manual entry point for #2183 -----------------------------------
+# Same helper the sweep runs in step 2c3. `--dry-run` lists the drafts the
+# next sweep would hand to the reviewer without calling it.
+if [ "$MODE" = "prescreen" ]; then
+  if [ ! -f "$PRESCREEN" ] || ! command -v python3 >/dev/null 2>&1; then
+    echo "prescreen: helper unavailable ($PRESCREEN / python3)" >&2
+    exit 1
+  fi
+  ps_args="run"
+  case "${2:-}" in
+    --dry-run) ps_args="run --dry-run" ;;
+    '') ;;
+    *) echo "usage: ccc-skill-autosave.sh prescreen [--dry-run]" >&2; exit 2 ;;
+  esac
+  # shellcheck disable=SC2086  # ps_args is a fixed word list built above
+  out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" CCC_NODE="${CCC_NODE:-$(hostname -s 2>/dev/null || echo node)}" python3 "$PRESCREEN" $ps_args)"; rc=$?
+  log "prescreen manual $(printf '%s' "$out" | head -c 500)"
+  printf '%s\n' "$out"
+  exit "$rc"
+fi
+
 if [ "$MODE" = "status" ]; then
   echo "mode: $(resolve_mode) (source: $(mode_source); approve/review = human review before install [default], auto = machine gate + post-hoc notify)"
   [ "$(resolve_mode)" = "auto" ] && echo "advisory: $AUTO_ADVISORY"
@@ -267,6 +293,11 @@ if [ "$MODE" = "status" ]; then
   if [ -f "$PENDING_EXPIRE" ] && command -v python3 >/dev/null 2>&1; then
     _pe="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" python3 "$PENDING_EXPIRE" status 2>/dev/null)" \
       && echo "pending expiry: $(printf '%s' "$_pe" | jq -r '"days=\(.expire_days // "off") undecided=\(.undecided) <7d=\(.buckets.lt7d) 7-30d=\(.buckets.d7_30) 30-60d=\(.buckets.d30_60) 60-90d=\(.buckets.d60_90) >=90d=\(.buckets.ge90d) oldest=\(.oldest_days // "-")d archived=\(.archived)"' 2>/dev/null) (CCC_SKILL_PENDING_EXPIRE_DAYS; pending-expire [--dry-run] / pending-restore <name>; #2184)"
+  fi
+  # #2183: what the pre-screen did last and how much of the queue carries a verdict.
+  if [ -f "$PRESCREEN" ] && command -v python3 >/dev/null 2>&1; then
+    _ps="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" python3 "$PRESCREEN" status 2>/dev/null)" \
+      && echo "prescreen: $(printf '%s' "$_ps" | jq -r '"last=\(.last.ts // "never") status=\(.last.status // "-") reviewed=\(.last.reviewed // 0) archived=\((.last.archived // []) | length) errors=\(.last.errors // 0) | queue approve=\(.queue.approve) revise=\(.queue.revise) reject=\(.queue.reject) error=\(.queue.error) unscreened=\(.queue.unscreened) | max/run=\(.max_per_run // "off")"' 2>/dev/null) (CCC_SKILL_PRESCREEN_MAX_PER_RUN; prescreen [--dry-run]; #2183)"
   fi
   # #1932: sweeps can report drafted_sessions>0 every day while no transcript
   # ever reaches the drafting LLM. skill-review-last.json is written only after
@@ -839,6 +870,25 @@ if [ -f "$PENDING_EXPIRE" ] && command -v python3 >/dev/null 2>&1; then
     || log "pending-expire failed (non-fatal) $(printf '%s' "$summary" | head -c 300)"
 else
   log "pending-expire skipped reason=missing-runtime"
+fi
+
+# --- 2c3) pre-screen undecided drafts (#2183) ----------------------------------
+# The same independent reviewer the fleet-skills intake uses (rubric A-H)
+# reads each undecided draft before a human does: reject+blocker is archived
+# under skill-autosave-archive/prescreen-reject-<date>/ (manifest row,
+# restorable), everything else stays with its verdict in prescreen.json for
+# /skillsuggest. Runs the handler locally — no broker, no edge secret. A
+# reviewer failure never moves a draft (fail-open toward the human gate), and
+# three consecutive failures stop the run. Bounded per run; nothing installs.
+if [ -f "$PRESCREEN" ] && command -v python3 >/dev/null 2>&1; then
+  prescreen_args="run"
+  [ "$AUTONOMY_STATE" = "dry-run" ] && prescreen_args="run --dry-run"
+  # shellcheck disable=SC2086  # prescreen_args is a fixed word list built above
+  summary="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" CCC_NODE="${CCC_NODE:-$(hostname -s 2>/dev/null || echo node)}" python3 "$PRESCREEN" $prescreen_args 2>>"$LOG")" \
+    && log "prescreen $(printf '%s' "$summary" | head -c 600)" \
+    || log "prescreen failed (non-fatal) $(printf '%s' "$summary" | head -c 300)"
+else
+  log "prescreen skipped reason=missing-runtime"
 fi
 
 # --- 2d) private skill intake (explicit opt-in) ------------------------------

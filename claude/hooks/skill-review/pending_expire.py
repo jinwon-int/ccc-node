@@ -56,7 +56,9 @@ MAX_MOVES_PER_RUN = 200  # bounded work per sweep; the rest goes next night
 
 _DECIDED_RE = re.compile(r"\.(approved|rejected|installed)-[0-9]+$")
 _STAMP_RE = re.compile(r"^(\d{8})-(\d{6})-")
-_ARCHIVE_DIR_RE = re.compile(r"^pending-90d-\d{8}$")
+# Archive dirs this module may restore from: its own expiry dirs and the
+# pre-screen reject dirs (#2183) — same root, same manifest shape.
+_ARCHIVE_DIR_RE = re.compile(r"^(pending-90d|prescreen-reject)-\d{8}$")
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 
 
@@ -150,13 +152,18 @@ def _append_manifest(archive_dir: Path, row: dict[str, Any]) -> None:
         os.close(fd)
 
 
-def _prepare_archive(state: Path, now: float) -> Path:
+def prepare_archive(state: Path, now: float, *, prefix: str = ARCHIVE_PREFIX) -> Path:
+    """Create (0700) and return `<state>/skill-autosave-archive/<prefix><YYYYMMDD>/`.
+
+    Shared with prescreen.py (#2183) so every automatic move out of the queue
+    lands under one root with one manifest shape and one restore path.
+    """
     root = state / ARCHIVE_DIR
     root.mkdir(mode=0o700, exist_ok=True)
     if root.is_symlink():
         raise OSError(f"archive root is a symlink: {root}")
     os.chmod(root, 0o700)
-    target = root / (ARCHIVE_PREFIX + time.strftime("%Y%m%d", time.gmtime(now)))
+    target = root / (prefix + time.strftime("%Y%m%d", time.gmtime(now)))
     target.mkdir(mode=0o700, exist_ok=True)
     if target.is_symlink():
         raise OSError(f"archive dir is a symlink: {target}")
@@ -256,7 +263,7 @@ def run(state: Path, *, dry_run: bool, now: float | None = None, node: str = "")
         result["status"] = "dry-run"
         return result
     try:
-        archive_dir = _prepare_archive(state, now)
+        archive_dir = prepare_archive(state, now)
     except OSError as error:
         result["status"] = "archive-unavailable"
         result["error"] = str(error)
@@ -265,6 +272,10 @@ def run(state: Path, *, dry_run: bool, now: float | None = None, node: str = "")
     _move_eligible(batch, archive_dir, pending, result, now=now, days=days, node=node)
     result["status"] = "moved" if result["moved"] else "failed"
     return result
+
+
+# Public aliases for prescreen.py (#2183); the underscored names stay for callers inside this module.
+append_manifest = _append_manifest
 
 
 def restore(state: Path, name: str, *, now: float | None = None, node: str = "") -> dict[str, Any]:
