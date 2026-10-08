@@ -41,36 +41,6 @@ _DEDUP_WINDOW_SECONDS = 300
 _SENT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
-def write_spool_record(
-    spool_dir: Path, event: str, text: str, *, dedup: str = "", node: str = ""
-) -> Optional[Path]:
-    """Atomically queue one owner push record (the notify-hook contract).
-
-    Mirrors ``ProjectChatHandler._write_owner_notice_spool``: ``{event, ts,
-    text, dedup[, node]}`` written as ``<event>-<ns>.json`` (0600) via a tmp
-    file + rename so a notifier never reads a half-written record. Returns the
-    record path, or ``None`` when the spool is unwritable (caller logs).
-    """
-    payload: Dict[str, str] = {
-        "event": event,
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "text": text,
-        "dedup": dedup,
-    }
-    if node:
-        payload["node"] = node
-    try:
-        spool_dir.mkdir(parents=True, exist_ok=True)
-        target = spool_dir / f"{event}-{time.time_ns()}.json"
-        tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, target)
-        return target
-    except OSError:
-        return None
-
-
 def mirror_dirs_from(settings, *own_dirs: Path) -> List[Path]:
     """Parse ``push_mirror_dirs`` (``os.pathsep``/comma separated) into mirror spool dirs.
 

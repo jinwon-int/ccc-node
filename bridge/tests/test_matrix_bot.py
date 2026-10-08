@@ -1758,12 +1758,10 @@ async def test_captionless_media_reply_keeps_original_caption_in_provider_prompt
 
 
 @pytest.mark.anyio
-async def test_startup_banner_goes_to_the_push_spool_in_fleet_relay_mode(
+async def test_startup_banner_stays_in_the_agent_room_in_fleet_relay_mode(
     tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#2182: with a fleet relay configured the banner is a spool record, never an agent-room notice."""
-    import json as _json
-
+    """Owner decision 2026-10-09: the banner is per-agent, so it is posted in the agent's own room even when spool records go to the fleet relay."""
     spool = tmp_path / "spool"
     bot, _chat, _manager = _bot(
         tmp_path,
@@ -1780,11 +1778,7 @@ async def test_startup_banner_goes_to_the_push_spool_in_fleet_relay_mode(
 
     holder["body"] = body
     await bot.serve()
-    assert holder["transport"].notices == [], "relay mode: nothing is posted as the agent"
-    records = sorted(spool.glob("Startup-*.json"))
-    assert len(records) == 1 and not list(spool.glob("*.tmp"))
-    data = _json.loads(records[0].read_text(encoding="utf-8"))
-    assert data["event"] == "Startup" and data["node"] == "node-a"
-    assert data["text"] == bot.startup_banner() and data["text"].startswith("🟢 ")
-    assert data["dedup"].startswith("startup-") and data["ts"]
-    assert (records[0].stat().st_mode & 0o777) == 0o600
+    notices = holder["transport"].notices
+    assert [room for room, _ in notices] == [DM_ROOM]
+    assert notices[0][1] == bot.startup_banner()
+    assert not list(spool.glob("Startup-*.json")), "the banner never goes through the fleet spool"

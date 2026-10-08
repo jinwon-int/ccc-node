@@ -324,6 +324,7 @@ still does not include a complete previous dependency environment.
 | `CCC_SELF_UPDATE_BUSY_MAX_SECONDS` | `1800` | never defer for a task older than this |
 | `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` | `3600` | cap total deferral so continuous load can't starve updates |
 | `CCC_SELF_UPDATE_REAPPLY` | `1` | set to `0` to skip installer cron re-apply; equivalent operator file: `~/.claude/self-update.no-reapply` |
+| `CCC_SELF_UPDATE_NOTIFY` | `all` | `none` queues no owner notification (success, warning or stall); only `notify=suppressed` is logged. Equivalent operator file: `~/.claude/self-update.notify` (first non-comment line) |
 | `CCC_SELF_UPDATE_CRONTAB_CMD` | `crontab` | crontab binary (tests inject a stub) |
 | `CCC_SELF_UPDATE_FLOCK` | `flock` | flock(1) binary used to probe a foreign regular-file lock; missing → 30-minute mtime rule (#1945) |
 | `CCC_SELF_UPDATE_SIGNATURE_MODE` | `warn` | tip signature policy: `warn` (verify + report, still apply), `enforce` (refuse an unverified tip, exit 13), `off` (skip) |
