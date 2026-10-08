@@ -385,6 +385,13 @@ def _is_mutable_ops_fact(text):
 _KINDS = ("preference", "decision", "observation", "context",
           "task-progress", "procedure", "constraint")
 _INTERNAL_KINDS = ("correction",)
+# #2186 — producers allowed to tag their rows' `evidence` with a source prefix
+# (`<source>:<base evidence>`). The tag is what `assemble` caps by and what
+# the usage measurement counts; an unknown value is ignored, never trusted.
+_EVIDENCE_SOURCES = ("auto-distill",)
+# Share of the assemble budget that tagged auto-distill rows may take, so a
+# bulk machine-extracted feed cannot crowd out conversation memory.
+_AUTO_DISTILL_SHARE_DEFAULT = 0.33
 # Legacy kinds grandfathered at ingest: the extractor no longer emits them,
 # but mass-flagging every existing legacy row would flood all 12 review
 # queues on rollout (the #1270/#1078 lesson). They store as-is; `retag` is
@@ -813,6 +820,9 @@ def ingest(path):
         sys.exit(f"ingest: invalid payload JSON ({exc})")
     sid = payload.get("session_id", "unknown")
     items = payload.get("honcho", [])
+    evidence_source = payload.get("evidence_source")
+    if evidence_source not in _EVIDENCE_SOURCES:
+        evidence_source = None
     strict_decision_reasons = (
         payload.get("decision_reason_contract") == _DECISION_REASON_CONTRACT
     )
@@ -873,6 +883,8 @@ def ingest(path):
         evidence = (f"auto:correction:{sid}" if kind == "correction" and superseded is not None
                     else f"auto:update:{sid}" if superseded is not None
                     else f"distill:{sid}")
+        if evidence_source:
+            evidence = f"{evidence_source}:{evidence}"
         try:
             cur = c.execute(
                 "INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,"
@@ -1650,6 +1662,16 @@ def snapshot(limit):
     print(text)
 
 
+def _auto_distill_share():
+    """NUNCHI_AUTO_DISTILL_SHARE in [0, 1]; anything else → the default."""
+    raw = os.environ.get("NUNCHI_AUTO_DISTILL_SHARE", "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return _AUTO_DISTILL_SHARE_DEFAULT
+    return value if 0.0 <= value <= 1.0 else _AUTO_DISTILL_SHARE_DEFAULT
+
+
 def assemble(budget, hint, limit=25):
     """P2-7 — task-conditioned ranked snapshot assembly, bounded in bytes.
 
@@ -1684,7 +1706,7 @@ def assemble(budget, hint, limit=25):
     if hint:
         hint_ids = [r[0] for r in search(c, hint, limit=limit, include_history=False)]
     rest_rows = c.execute(
-        "SELECT id,observed,kind,fact,mutability FROM peer_facts WHERE valid_to IS NULL"
+        "SELECT id,observed,kind,fact,mutability,evidence FROM peer_facts WHERE valid_to IS NULL"
         " AND kind NOT IN ('constraint','observation') ORDER BY id DESC", ()).fetchall()
     rest = {r[0]: r for r in rest_rows}
     ordered, seen = [], set()
@@ -1696,15 +1718,26 @@ def assemble(budget, hint, limit=25):
         if r[0] not in seen:
             ordered.append(r)
             seen.add(r[0])
+    # #2186 — machine-extracted auto-distill rows are labelled `·auto` and
+    # capped to a share of the budget, after relevance ordering, so they add
+    # recall without displacing conversation memory.
+    auto_cap = int(budget * _auto_distill_share())
+    auto_used = 0
     fact_lines = []  # (rendered line, is_live) — budget-filtered in order
-    for fid, o, k, f, m in ordered:
+    for fid, o, k, f, m, ev in ordered:
         marker = "" if m == "static" else "⟳ "
-        line = f"- {marker}({o}/{k}) {f}"
+        is_auto = str(ev or "").startswith("auto-distill:")
+        label = f"{o}/{k}·auto" if is_auto else f"{o}/{k}"
+        line = f"- {marker}({label}) {f}"
         b = len(line.encode()) + 1
         if fact_lines and used + b > budget:
             continue
+        if is_auto and auto_used + b > auto_cap:
+            continue
         fact_lines.append((line, marker != ""))
         used += b
+        if is_auto:
+            auto_used += b
     facts_added = len(fact_lines)
     if facts_added:
         live_included = sum(1 for _l, is_live in fact_lines if is_live)
