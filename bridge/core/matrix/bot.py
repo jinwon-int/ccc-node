@@ -2199,24 +2199,36 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         the agent; a missing reply original is marked in the current prompt.
         """
         from telegram_bot.core.matrix import media as matrix_media
+        from telegram_bot.core.matrix import voice as matrix_voice
         from telegram_bot.core.matrix.attachments import decode_attachment
 
         directory = self._data_dir() / matrix_media.MEDIA_DIRNAME
         paths: list[Path] = []
         body = str(job.get("body") or "")
+        voice_input = False
         try:
             if job.get("attachment"):
                 attachment = decode_attachment(job.get("attachment"))
                 if attachment is None:
                     return _turn_result(ATTACHMENT_FAILED["invalid"], None)
                 try:
+                    if attachment.get("kind") == "audio":
+                        matrix_voice.check_configuration(self._settings)
                     path = await matrix_media.stage(self._transport, attachment, directory, self._settings)
                 except matrix_media.AttachmentError as exc:
                     logger.warning("Matrix attachment unavailable reason=%s kind=%s", exc.reason, attachment.get("kind"))
-                    return _turn_result(ATTACHMENT_FAILED.get(exc.reason, ATTACHMENT_FAILED_DEFAULT), None)
+                    return _turn_result(matrix_voice.VOICE_FAILURES.get(exc.reason) or ATTACHMENT_FAILED.get(exc.reason, ATTACHMENT_FAILED_DEFAULT), None)
                 paths.append(path)
                 caption = body if attachment.get("captioned") else ""
-                prompt = self._attachment_prompt(path, attachment, caption)
+                if attachment.get("kind") == "audio":
+                    transcript, error = await self._transcribe_voice(path)
+                    if error:
+                        return _turn_result(error, None)
+                    await sink.interim(f"🎤 Voice: {transcript}")
+                    prompt = f"{caption}\n\n[Voice transcript]\n{transcript}" if caption else transcript
+                    voice_input = True
+                else:
+                    prompt = self._attachment_prompt(path, attachment, caption)
             else:
                 prompt = body
             if job.get("reply_attachment"):
@@ -2232,13 +2244,52 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                     paths.append(path)
                     parent_prompt = self._attachment_prompt(path, parent, "Use this earlier attachment as context for the user's reply below.")
                     prompt = "[Reply context: the following attachment is the earlier message being replied to.]\n" + parent_prompt + "\n\n" + prompt
-            return await self._run_message(
+            responses: list[Any] = []
+            result = await self._run_message(
                 prompt, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink,
                 turn_marker=str(job.get("event_id") or ""),
+                responses=responses,
             )
+            if voice_input and responses:
+                await self._queue_voice_reply(responses[0], room_id, directory)
+            return result
         finally:
             for path in paths:
                 matrix_media.remove(path)
+
+    async def _transcribe_voice(self, path: Path) -> tuple[str, str | None]:
+        from telegram_bot.core.matrix import media, voice
+
+        try:
+            text = (await voice.transcribe(path, self._settings)).strip()
+            if not text:
+                raise ValueError("empty-transcription")
+            return text, None
+        except media.AttachmentError as exc:
+            return "", voice.VOICE_FAILURES.get(exc.reason, voice.VOICE_FAILED)
+        except Exception as exc:
+            logger.warning("Matrix voice transcription failed error=%s", type(exc).__name__)
+            return "", voice.VOICE_FAILED
+
+    async def _queue_voice_reply(self, response: Any, room_id: str, directory: Path) -> None:
+        from telegram_bot.core import media
+        from telegram_bot.core.matrix import voice
+
+        transport = self._transport
+        enqueue = getattr(transport, "enqueue_voice", None)
+        content = str(getattr(response, "content", "") or "")
+        if not (getattr(response, "success", True) and content.strip() and media.is_macos()):
+            return
+        if not callable(enqueue) or transport.room_kind(room_id) != "direct":
+            return
+        if media.voice_delivery_strategy(content) == "text_only":
+            return
+        try:
+            data = await voice.synthesize(content, self._settings, directory)
+            enqueue(room_id, data, key=f"voice-{self._active_turn_id}", after=self._active_turn_id)
+        except Exception as exc:
+            # The complete text reply is still the parent outbox row.
+            logger.warning("Matrix voice reply unavailable error=%s", type(exc).__name__)
 
     @staticmethod
     def _attachment_prompt(path: Path, attachment: Mapping[str, Any], caption: str) -> str:

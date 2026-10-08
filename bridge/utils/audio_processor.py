@@ -3,9 +3,23 @@ import logging
 import shutil
 import time
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 logger = logging.getLogger(__name__)
+
+
+async def communicate_audio_process(process: Any) -> tuple[bytes, bytes]:
+    """Reap audio subprocesses when their caller is cancelled or times out."""
+    try:
+        return await process.communicate()
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        await process.communicate()
+        raise
 
 
 class AudioProcessor:
@@ -19,9 +33,11 @@ class AudioProcessor:
         self,
         ffmpeg_path: Optional[str] = None,
         ffmpeg_args: Optional[Sequence[str]] = None,
+        input_args: Optional[Sequence[str]] = None,
     ) -> None:
         self.ffmpeg_path = (ffmpeg_path or "ffmpeg").strip() or "ffmpeg"
         self.ffmpeg_args = list(ffmpeg_args or ("-ac", "1", "-ar", "16000"))
+        self.input_args = list(input_args or ())
 
     async def check_ffmpeg_available(self) -> bool:
         """Check ffmpeg availability from PATH or configured absolute path."""
@@ -61,6 +77,7 @@ class AudioProcessor:
         command = [
             self.ffmpeg_path,
             "-y",
+            *self.input_args,
             "-i",
             str(input_path),
             *self.ffmpeg_args,
@@ -74,7 +91,7 @@ class AudioProcessor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await communicate_audio_process(process)
         elapsed_ms = int((time.perf_counter() - start) * 1000)
 
         if process.returncode != 0:

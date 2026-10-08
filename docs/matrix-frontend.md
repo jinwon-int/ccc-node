@@ -444,9 +444,46 @@ It is a preview, not the delivery (`core/matrix/streaming.py`):
 Next stage (not yet): deliver the final answer *as* the last edit of the
 draft through the outbox, which needs the outbox to record sent event ids.
 
+## Voice messages (#2005)
+
+Encrypted `m.audio` inputs, including `org.matrix.msc3245.voice` messages,
+use the same sender, device-trust, room and replay gates as other attachments.
+The bridge stages and decrypts the audio privately, transcribes it with the
+existing `WhisperTranscriber`, posts a `🎤 Voice:` preview, and sends the
+transcript through the ordinary agent turn. Spoken commands and captions are
+agent input; they cannot execute bridge commands such as `/new`. An audio
+attachment in an earlier message being replied to remains file context.
+
+- Requires `TRANSCRIPTION_PROVIDER=whisper`, `OPENAI_API_KEY`, and ffmpeg
+  (`FFMPEG_PATH` optional). `OPENAI_BASE_URL` and `WHISPER_MODEL` retain their
+  existing meanings. Unsupported providers and a missing key get a short
+  answer before any download; the bridge never silently switches providers.
+- `MAX_VOICE_DURATION` (seconds, default 300) checks both the declared Matrix
+  `info.duration` (milliseconds) and the actual decoded WAV duration before
+  Whisper runs. Decode is capped at the limit plus one second, the conversion
+  and transcription share a 120-second ceiling, and ffmpeg only accepts local
+  audio containers (no network URLs or playlists). Existing byte caps also apply.
+- `/stop`, timeout and shutdown cancel transcription with the runner task.
+  Audio subprocesses are killed and reaped; original input, converted WAV and
+  partial synthesis files are removed on every exit. Transcription errors or
+  empty speech answer without starting an agent turn.
+- On macOS, successful voice turns may also produce a reply with the existing
+  `MacOSTtsSynthesizer` and `VOICE_REPLY_PERSONA`. The same long-reply threshold
+  applies. Other platforms and failed synthesis keep the text answer. Speech
+  is sent only to direct rooms, as an encrypted Ogg/Opus `m.audio` event with
+  the voice marker, **after the complete text answer** through the durable
+  file outbox. This retains a readable answer even if speech delivery fails.
+- Generated replies are held privately under
+  `<state_directory>/voice-replies/` (0700 directory, 0600 files), retained
+  across restart while referenced by the outbox, and deleted after delivery,
+  terminal delivery failure or cancellation. Startup also removes orphaned
+  generated speech files without following directory symlinks.
+
+Source tests use mocked providers and synthetic encrypted media. They do not
+claim a production Whisper request, macOS voice synthesis or room delivery.
+
 ## Not yet
 
-- Voice transcription for `m.audio` (handled as a file today).
 - Draft edits (`m.replace`) for streamed text: **opt-in preview only** (#1796, below);
   the final answer is still a separate message, not the edited draft.
 - Approval buttons: approvals are `/approve <turn> <nonce>` replies in the

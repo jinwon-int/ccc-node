@@ -1088,7 +1088,8 @@ class MatrixTransport:
         return event_id
 
     def enqueue_file(
-        self, room_id: str, path: str, *, key: str, after: str | None = None, root: str | None = None
+        self, room_id: str, path: str, *, key: str, after: str | None = None,
+        root: str | None = None, voice: bool = False,
     ) -> str:
         """Queue one agent deliverable for a *direct* room (#2001); idempotent per ``key``.
 
@@ -1104,6 +1105,8 @@ class MatrixTransport:
         if not file_path.is_absolute():
             raise ValueError("file-path-not-absolute")
         record: dict[str, Any] = {"v": 1, "path": str(file_path), "name": file_path.name}
+        if voice:
+            record["voice"] = True
         if root:
             record["root"] = str(root)
         payload = json.dumps(record, ensure_ascii=False)
@@ -1122,6 +1125,23 @@ class MatrixTransport:
         event_id = self.store.file_job(req, key, payload)
         self.wake()
         return event_id
+
+    def enqueue_voice(self, room_id: str, data: bytes, *, key: str, after: str) -> None:
+        """Persist generated speech privately until its durable outbox row is settled."""
+        from telegram_bot.core.matrix import media, voice
+
+        if room_id not in self.c["rooms"] or self.room_kind(room_id) != "direct":
+            raise ValueError("voice-room-not-direct")
+        if not data or len(data) > MAX_OUTBOUND_FILE_BYTES:
+            raise ValueError("voice-size-invalid")
+        directory = Path(self.c["state_directory"]) / voice.REPLY_DIRNAME
+        path = media.store(directory, data, {"name": "voice.ogg", "mimetype": "audio/ogg"})
+        try:
+            self.enqueue_file(room_id, str(path.resolve()), key=key, after=after, root=str(directory.resolve()), voice=True)
+            self.store._cleanup_voice_replies()  # duplicate keys must not leave a second file
+        except BaseException:
+            media.remove(path)
+            raise
 
     async def _upload_cap(self) -> int:
         """Bridge cap (50 MB, as Telegram) or the homeserver's ``m.upload.size`` if lower."""
@@ -1170,7 +1190,7 @@ class MatrixTransport:
             plaintext = await asyncio.to_thread(read_deliverable, path, max_bytes=cap, root=root)
             ciphertext, file_info = await asyncio.to_thread(encrypt, plaintext)
             mxc = await upload(self.http, self.c["homeserver"], ciphertext)
-            content = file_content(name, mimetype_of(path), len(plaintext), mxc, file_info)
+            content = file_content(name, mimetype_of(path), len(plaintext), mxc, file_info, voice=payload.get("voice") is True)
             async with self.matrix_lock:
                 if room in self.blocked:
                     return False
