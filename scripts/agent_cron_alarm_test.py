@@ -30,7 +30,9 @@ from agent_cron_alarm import (  # noqa: E402
     alarm_text,
     classify_failure,
     node_transition,
+    resolve_stale_days,
     resolve_threshold,
+    stale_transition,
     task_transition,
     trailing_failures,
 )
@@ -203,6 +205,64 @@ class NodeTransition(unittest.TestCase):
         self.assertEqual([r for r in reasons if r], [])
 
 
+class StaleTransition(unittest.TestCase):
+    """#1821 proposal 1: no prompt success for D days -> one node alarm."""
+
+    def step(self, prev, *, failed=True, at='2026-01-08T00:00:00Z',
+             last_success='2026-01-01T00:00:00Z', first_run=None, days=7):
+        return stale_transition(prev, failed=failed, at=at, last_success=last_success,
+                                first_run=first_run, days=days)
+
+    def test_days_resolution(self) -> None:
+        self.assertEqual(resolve_stale_days(''), 7)
+        self.assertEqual(resolve_stale_days('0'), 0)
+        self.assertEqual(resolve_stale_days('3'), 3)
+        self.assertEqual(resolve_stale_days('junk'), 7)
+        self.assertEqual(resolve_stale_days('99999'), 366)
+
+    def test_alerts_once_at_the_threshold(self) -> None:
+        state, event = self.step({}, at='2026-01-07T23:59:00Z')
+        self.assertIsNone(event)
+        state, event = self.step(state)
+        self.assertEqual(event['reason'], 'stale')
+        self.assertEqual((event['ageDays'], event['basis']), (7, 'last-success'))
+        state, event = self.step(state, at='2026-01-20T00:00:00Z')
+        self.assertIsNone(event)
+
+    def test_success_clears_and_a_new_stretch_alerts_again(self) -> None:
+        state, _ = self.step({})
+        state, event = self.step(state, failed=False, at='2026-01-09T00:00:00Z')
+        self.assertIsNone(event)
+        self.assertNotIn('staleAlertedAt', state)
+        _state, event = self.step(state, at='2026-01-17T00:00:00Z',
+                                  last_success='2026-01-09T00:00:00Z')
+        self.assertEqual(event['ageDays'], 8)
+
+    def test_unseen_later_success_unlatches(self) -> None:
+        state, _ = self.step({})
+        _state, event = self.step(state, at='2026-01-17T00:00:00Z',
+                                  last_success='2026-01-09T00:00:00Z')
+        self.assertEqual(event['reason'], 'stale')
+
+    def test_no_success_uses_the_first_recorded_run(self) -> None:
+        _state, event = self.step({}, last_success=None, first_run='2026-01-01T00:00:00Z')
+        self.assertEqual(event['basis'], 'no-success-since-first-run')
+        _state, event = self.step({}, last_success=None, first_run=None)
+        self.assertIsNone(event)
+
+    def test_disabled_and_bad_stamps_never_alert(self) -> None:
+        self.assertIsNone(self.step({}, days=0)[1])
+        self.assertIsNone(self.step({}, at='not-a-time')[1])
+
+    def test_text_names_the_stretch_and_the_opt_out(self) -> None:
+        event = {'reason': 'stale', 'days': 7, 'ageDays': 9, 'basis': 'last-success',
+                 'since': '2026-01-01T00:00:00Z'}
+        text = alarm_text('weekly', None, None, None, stale_event=event, failure_class='other')
+        self.assertIn('no prompt task has succeeded for 9d (threshold 7d)', text)
+        self.assertIn('last prompt success: 2026-01-01T00:00:00Z', text)
+        self.assertIn('CCC_AGENT_CRON_PROMPT_STALE_DAYS=0', text)
+
+
 class AlarmText(unittest.TestCase):
     def test_task_auth_hint_does_not_claim_every_prompt_task(self) -> None:
         event = {'reason': 'threshold', 'consecutiveFailures': 3, 'failureClass': 'auth_failed'}
@@ -363,6 +423,39 @@ class Integration(unittest.TestCase):
         self.assertEqual(box.alarm_state()['tasks']['cmd']['failureClass'], 'auth_failed')
         self.assertIsNotNone(task['retryState']['retryEligibleAt'])
         self.assertEqual(box.alarms(), [])
+
+    def _sparse_task(self, tid: str) -> dict:
+        # A weekly prompt task whose last success is 8 days back: the
+        # consecutive counters (threshold 3) would need weeks to fire.
+        old = {'runId': 'old', 'scheduledAt': '2025-12-24T00:00:00Z',
+               'startedAt': '2025-12-24T00:00:00Z', 'finishedAt': '2025-12-24T00:00:00Z',
+               'status': 'success', 'exitCode': 0, 'attempt': 1, 'notifyState': 'none'}
+        return {'id': tid, 'schedule': '* * * * *', 'prompt': tid, 'enabled': True,
+                'notify': 'none', 'lastRunAt': '2026-01-01T00:00:00Z', 'runHistory': [old]}
+
+    def test_prompt_stale_alarm_fires_once_and_rearms_after_success(self) -> None:
+        box = self.sandbox([], extra_tasks=[self._sparse_task('weekly')])
+        first = box.run('weekly', 'exit1')
+        self.assertEqual(first['failureAlarm']['reasons'], ['node=stale'])
+        self.assertIn('no prompt task has succeeded for 8d', box.alarms()[0]['text'])
+        second = box.run('weekly', 'exit1')
+        self.assertEqual(second['failureAlarm']['state'], 'no-alert')
+        box.run('weekly', 'ok')
+        self.assertNotIn('staleAlertedAt', box.alarm_state()['node'])
+        box.run('weekly', 'exit1', advance=7 * 1440)
+        self.assertEqual(len([a for a in box.alarms() if 'node=stale' in a['reasons']]), 2)
+
+    def test_prompt_stale_alarm_respects_the_opt_outs(self) -> None:
+        box = self.sandbox([], extra_tasks=[self._sparse_task('weekly')])
+        box.env['CCC_AGENT_CRON_PROMPT_STALE_DAYS'] = '0'
+        self.assertEqual(box.run('weekly', 'exit1')['failureAlarm']['state'], 'no-alert')
+        quiet = {**self._sparse_task('quiet'), 'failureAlertAfter': 0}
+        box = self.sandbox([], extra_tasks=[quiet])
+        self.assertEqual(box.run('quiet', 'exit1')['failureAlarm']['state'], 'no-alert')
+
+    def test_first_ever_prompt_failure_is_not_stale(self) -> None:
+        box = self.sandbox(['fresh'])
+        self.assertEqual(box.run('fresh', 'exit1')['failureAlarm']['state'], 'no-alert')
 
     def test_per_task_class_flapping_is_bounded(self) -> None:
         # Review finding 2: exit 1 <-> 127 alerted on every run.
