@@ -246,15 +246,8 @@ def run(args) -> int:
         lock.close()
 
 
-def _run_locked(args, log: Path, state_path: Path) -> int:
-    try:
-        st = log.stat()
-        state = _load_state(state_path)
-    except FileNotFoundError:
-        return 0  # auto-distill not installed or never ran on this node
-    except ValueError as exc:
-        print(f"auto-distill-feed: refused — {exc}", file=sys.stderr)
-        return 2
+def _start(args, st, state: dict, state_path: Path):
+    """(offset, cutoff, fail_count) to read from, or None after initialising."""
     try:
         offset = int(state["offset"])
         first_run = offset < 0
@@ -270,66 +263,94 @@ def _run_locked(args, log: Path, state_path: Path) -> int:
                                  "updated_at": int(time.time())})
         print(f"auto-distill-feed: initialised at end of log (offset={st.st_size}); "
               "use --backfill-days N to feed older records")
-        return 0
-    if first_run:
-        offset = 0
+        return None
     # A backfill cutoff is kept in the state until the backlog reaches EOF, so
     # a backfill larger than --max-records stays bounded on later ticks too.
-    cutoff = state.get("backfill_cutoff")
     if first_run:
-        cutoff = time.time() - args.backfill_days * 86400
-    fail_offset = state.get("fail_offset")
-    fail_count = int(state.get("fail_count") or 0) if fail_offset == offset else 0
+        return 0, time.time() - args.backfill_days * 86400, 0
+    fail_count = int(state.get("fail_count") or 0) if state.get("fail_offset") == offset else 0
+    return offset, state.get("backfill_cutoff"), fail_count
 
-    records = items = fed_records = 0
+
+class _Progress:
+    """Offset + counters of one tick, persisted after every consumed record."""
+
+    def __init__(self, st, state_path: Path, offset: int, cutoff, fail_count: int):
+        self.st, self.state_path = st, state_path
+        self.offset, self.cutoff, self.fail_count = offset, cutoff, fail_count
+        self.records = self.fed_records = self.items = 0
+
+    def save(self, at_end: bool) -> None:
+        data = {"inode": self.st.st_ino, "offset": self.offset,
+                "updated_at": int(time.time()),
+                "last_run": {"records": self.records, "fed_records": self.fed_records,
+                             "items": self.items}}
+        if self.cutoff is not None and not at_end:
+            data["backfill_cutoff"] = self.cutoff
+        if self.fail_count:
+            data["fail_offset"], data["fail_count"] = self.offset, self.fail_count
+        _save_state(self.state_path, data)
+
+
+def _consume(args, prog: _Progress, line: bytes) -> bool:
+    """Feed one complete log line; False when ingest failed and must be retried."""
+    try:
+        record = json.loads(line.decode("utf-8", "replace"))
+    except ValueError:
+        record = None
+    payload = (payload_for(record, redact_fn)
+               if isinstance(record, dict) and (prog.cutoff is None or _recent(record, prog.cutoff))
+               else None)
+    if payload is None:
+        return True
+    if _ingest(Path(args.nunchi_py), payload):
+        prog.fed_records += 1
+        prog.items += len(payload["honcho"])
+        return True
+    prog.fail_count += 1
+    if prog.fail_count < POISON_AFTER:
+        return False
+    print(f"auto-distill-feed: skipping record at offset {prog.offset} after "
+          f"{prog.fail_count} failed ingests", file=sys.stderr)
+    return True
+
+
+def _run_locked(args, log: Path, state_path: Path) -> int:
+    try:
+        st = log.stat()
+        state = _load_state(state_path)
+    except FileNotFoundError:
+        return 0  # auto-distill not installed or never ran on this node
+    except ValueError as exc:
+        print(f"auto-distill-feed: refused — {exc}", file=sys.stderr)
+        return 2
+    start = _start(args, st, state, state_path)
+    if start is None:
+        return 0
+    prog = _Progress(st, state_path, *start)
     rc = 0
     at_eof = False
-
-    def save(at_end: bool) -> None:
-        data = {"inode": st.st_ino, "offset": offset, "updated_at": int(time.time()),
-                "last_run": {"records": records, "fed_records": fed_records, "items": items}}
-        if cutoff is not None and not at_end:
-            data["backfill_cutoff"] = cutoff
-        if fail_count:
-            data["fail_offset"], data["fail_count"] = offset, fail_count
-        _save_state(state_path, data)
-
     with open(log, "rb") as fh:
-        fh.seek(offset)
-        while records < args.max_records:
+        fh.seek(prog.offset)
+        while prog.records < args.max_records:
             line = fh.readline()
             if not line or not line.endswith(b"\n"):
                 at_eof = True  # EOF, or a record still being written
                 break
             next_offset = fh.tell()
-            records += 1
-            try:
-                record = json.loads(line.decode("utf-8", "replace"))
-            except ValueError:
-                record = None
-            payload = (payload_for(record, redact_fn)
-                       if isinstance(record, dict) and (cutoff is None or _recent(record, cutoff))
-                       else None)
-            if payload is not None:
-                if not _ingest(Path(args.nunchi_py), payload):
-                    fail_count += 1
-                    if fail_count < POISON_AFTER:
-                        rc = 3
-                        break
-                    print(f"auto-distill-feed: skipping record at offset {offset} after "
-                          f"{fail_count} failed ingests", file=sys.stderr)
-                else:
-                    fed_records += 1
-                    items += len(payload["honcho"])
-            fail_count = 0
-            offset = next_offset
-            save(False)
+            prog.records += 1
+            if not _consume(args, prog, line):
+                rc = 3
+                break
+            prog.fail_count = 0
+            prog.offset = next_offset
+            prog.save(False)
         else:
             at_eof = fh.tell() >= st.st_size
-    save(at_eof and rc == 0)
-    if records or rc:
-        print(f"auto-distill-feed: records={records} fed_records={fed_records} "
-              f"items={items} offset={offset}" + (" ingest-failed" if rc else ""))
+    prog.save(at_eof and rc == 0)
+    if prog.records or rc:
+        print(f"auto-distill-feed: records={prog.records} fed_records={prog.fed_records} "
+              f"items={prog.items} offset={prog.offset}" + (" ingest-failed" if rc else ""))
     return rc
 
 
