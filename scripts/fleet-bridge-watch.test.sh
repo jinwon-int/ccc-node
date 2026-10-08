@@ -540,6 +540,28 @@ run "dg"
 okc "$RC" 1 "prepared job does not vouch for a foreign root"
 ok "foreign root with a job nearby is NONCANONICAL" 'grep -q "^NONCANONICAL dg runtime=/work/agent-codebench/ccc-node-pr833" "$OUT"'
 
+# A retry job (gongyung 2026-10-08): the first `<prep>/job` failed its receipt,
+# the preparation was re-run into `<prep>/job2` and the bridge was handed that
+# one. Same source sibling, same preparation root — it must pass like `job`.
+reply_p dg "$TX/.ccc-node/preparations/main-e707baf-20261008/source" yes - "$TX/.ccc-node/preparations/main-e707baf-20261008/job2"
+run "dg"
+okc "$RC" 0 "activated retry job (job2) passes"
+ok "retry job launch is OK and names the preparation" \
+  'grep -q "^OK dg ($TX/.ccc-node/preparations/main-e707baf-20261008/source, prepared:main-e707baf-20261008)$" "$OUT"'
+ok "retry job launch is not NONCANONICAL" '! grep -q "^NONCANONICAL dg" "$OUT"'
+
+# The retry name still has to be a job directory: a receipt beside some other
+# sibling (here `<prep>/runtime`) does not make the source an activated runtime.
+reply_p dg "$TX/.ccc-node/preparations/main-e707baf-20261008/source" yes - "$TX/.ccc-node/preparations/main-e707baf-20261008/runtime"
+run "dg"
+okc "$RC" 1 "a non-job sibling does not vouch for the source"
+ok "non-job sibling is NONCANONICAL" 'grep -q "^NONCANONICAL dg runtime=$TX/.ccc-node/preparations/main-e707baf-20261008/source$" "$OUT"'
+
+# And a retry job does not vouch for a foreign root either.
+reply_p dg /work/agent-codebench/ccc-node-pr833 yes - "$TX/.ccc-node/preparations/main-e707baf-20261008/job2"
+run "dg"
+okc "$RC" 1 "retry job does not vouch for a foreign root"
+
 # A preparation source without a completed job (PREPARED=-) is a plain
 # non-canonical checkout: the probe withholds the job when the receipt is not
 # ready, and the caller must not infer readiness from the path alone.

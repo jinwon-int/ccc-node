@@ -167,6 +167,10 @@ is_canonical_root() {
 # Activated Termux prepared runtime (#1527, #1761). The self-update stages a
 # checkout of the target sha under `<prep>/source` and its venv under
 # `<prep>/job`, then hands the bridge to `start.sh --prepared-runtime <prep>/job`.
+# A preparation whose first job failed its receipt is re-run into a sibling
+# `<prep>/job2`, `<prep>/job3`, … and the bridge is handed that one instead
+# (gongyung 2026-10-08: `job` failed on native wheels, `job2` served — and was
+# paged NONCANONICAL because this check accepted the name `job` alone).
 # Accepted only when all three hold: the probe reported a completed job (its
 # receipt says ready), the job sits under a preparation root, and the serving
 # root is that job's own `source` sibling. Patterns, never resolved paths: the
@@ -193,8 +197,10 @@ is_canonical_danso_exe() {
 is_prepared_runtime() {
   _root=$1 _job=$2 _hit=1
   [ -n "$_job" ] && [ "$_job" != "-" ] || return 1
-  case "$_job" in */job) ;; *) return 1 ;; esac
-  _prep=${_job%/job}
+  # `job` or a retry `job<N>` (N >= 2). The name is only a layout check; the
+  # receipt (probe side) and the `source` sibling test below carry the verdict.
+  case "${_job##*/}" in job|job[2-9]|job[1-9][0-9]) ;; *) return 1 ;; esac
+  _prep=${_job%/*}
   [ "$_root" = "$_prep/source" ] || return 1
   set -f
   for _pat in $PREPARED_ROOTS; do
