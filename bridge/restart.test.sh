@@ -5,6 +5,10 @@
 # CCC_BRIDGE_RESTART_SPAWN fake start command — the real bridge on this node is
 # never probed, signaled, or started.
 set -uo pipefail
+# A caller running from a Matrix provider shell inherits CCC_CHANNEL=matrix and
+# that frontend's settings; start.sh then refuses lifecycle actions (#2177).
+# These suites exercise the Telegram bridge, so start from a neutral channel.
+unset CCC_CHANNEL SESSION_STORE_PATH CCC_BOT_ENV_FILE BOT_DATA_DIR LOGS_DIR ${!CCC_MATRIX_@}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 START="$HERE/start.sh"
 SSD="$HERE/service-systemd.sh"

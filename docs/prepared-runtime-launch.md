@@ -198,6 +198,7 @@ failure never triggers another automatic attempt.
 | `7` | Candidate failed; the previous generation was verified restored. |
 | `8` | Candidate failed and recovery was not verified successful. |
 | `9` | Transition evidence could not be persisted; inspect retained state. |
+| `10` | Target channel resolved to matrix; `start.sh` manages only Telegram (#2177). |
 
 Exit `7` is deliberately nonzero: a recovered service is still a failed
 candidate update. These additional outcomes apply only when recovery is

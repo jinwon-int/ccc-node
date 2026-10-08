@@ -91,6 +91,7 @@ if [ ! -f "$REQ_FILE" ]; then
 fi
 
 ACTION="run"
+REQUESTED_CHANNEL=""  # --channel (#2177); empty = inherit CCC_CHANNEL
 DAEMON_MODE=0  # Default to foreground mode
 PROCESS_MODE="foreground"
 RUN_AS_DAEMON_SUPERVISOR=0
@@ -120,6 +121,14 @@ while [ $# -gt 0 ]; do
         --recovery-source|--recovery-runtime)
             [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "$1 requires a directory" >&2; exit 2; }
             if [ "$1" = --recovery-source ]; then RECOVERY_SOURCE="$2"; else RECOVERY_RUNTIME="$2"; fi
+            shift 2
+            ;;
+        --channel)
+            [ "$#" -ge 2 ] || { echo "--channel requires telegram or matrix" >&2; exit 2; }
+            case "$2" in
+                telegram|matrix) REQUESTED_CHANNEL="$2" ;;
+                *) echo "--channel must be telegram or matrix (got '$2')" >&2; exit 2 ;;
+            esac
             shift 2
             ;;
         --debug)
@@ -199,6 +208,13 @@ Options:
   --prepared-runtime <dir>  Use a sealed preparation job without installing dependencies
   --recovery-source <dir>   Previous bridge source for one opt-in recovery attempt
   --recovery-runtime <dir>  Previous preparation job (requires prepared --restart)
+  --channel <name>    Channel this command targets: telegram | matrix. Overrides
+                      an inherited CCC_CHANNEL and drops the other channel's
+                      SESSION_STORE_PATH / CCC_BOT_ENV_FILE / CCC_MATRIX_*.
+                      start.sh manages only the Telegram bridge: start/stop/
+                      restart resolving to matrix (inherited or --channel
+                      matrix) exit 10; restart the Matrix service instead.
+                      --status works for both. See #2177.
   --debug             Enable debug/verbose logging
   --status            Show whether the bot is running
   --stop              Stop the running bot
@@ -1225,6 +1241,7 @@ cleanup_token_lock_if_safe() {
 #   4  not-available-within-timeout
 #   5  self-invoked       (caller is inside the target bridge process tree)
 #   6  refused before stop (preflight, prepared runtime, invalid window value)
+#  10  wrong-channel     (resolves to matrix: start.sh manages only Telegram; #2177)
 #
 # Operator knobs (#1868; defaults preserve production behavior):
 #   CCC_BRIDGE_RESTART_READY_TIMEOUT  seconds to wait for "available" (90;
@@ -1470,7 +1487,7 @@ do_restart() {
         [ "$(id -u)" = "0" ] || scope_flag=" --user"
         [ "$DAEMON_MODE" -eq 1 ] && daemon_hint=" -d"
         echo "⚠️  Restart refused: this command is running inside the target bridge process tree."
-        echo "   owner=target-bridge caller=descendant action=refused-before-stop"
+        echo "   owner=target-bridge caller=descendant action=refused-before-stop target-channel=$(_this_bridge_channel)"
         echo "   Stopping it here would terminate the restart driver before start/readiness verification."
         echo "💡 Re-run from a shell outside the bridge tree:"
         echo "   systemctl${scope_flag} restart $unit    # systemd installation"
@@ -1583,6 +1600,7 @@ do_restart() {
     local spawn_args=("--path" "$PROJECT_ROOT")
     [ -n "$PREPARED_RUNTIME" ] && spawn_args+=("--prepared-runtime" "$PREPARED_RUNTIME")
     [ -n "$BOT_DEBUG" ] && spawn_args+=("--debug")
+    [ -n "$REQUESTED_CHANNEL" ] && spawn_args+=("--channel" "$REQUESTED_CHANNEL")
     if [ "$DAEMON_MODE" -eq 1 ]; then
         # Same path as `start.sh --path <p> --daemon`.
         if ! "${spawn_launcher[@]}" "$spawn_cmd" "${spawn_args[@]}" --daemon; then
@@ -1700,6 +1718,52 @@ redact_url_userinfo() { # <url>
 if [ -n "${CCC_START_SH_LIB_ONLY:-}" ]; then
     return 0 2>/dev/null || exit 0
 fi
+
+# ── Channel resolution (#2177) ──
+# A provider shell spawned by the Matrix frontend inherits CCC_CHANNEL=matrix
+# plus that frontend's SESSION_STORE_PATH / CCC_MATRIX_* settings. Running a
+# Telegram restart there made start.sh act on the Matrix channel: it stopped
+# the live Matrix frontend and launched a second Matrix frontend that crash-
+# looped on the MatrixStore lock (a Termux node, 2026-10-08). The Matrix frontend is
+# never started through start.sh (systemd/runit exec python directly), so a
+# lifecycle action that resolves to matrix (inherited or --channel matrix) is
+# refused (exit 10). --channel telegram overrides the inherited channel and
+# drops the Matrix-scoped settings so they cannot leak into the started bridge.
+_CHANNEL_SCOPED_VARS="SESSION_STORE_PATH CCC_BOT_ENV_FILE"
+apply_requested_channel() {
+    local inherited var
+    [ -n "$REQUESTED_CHANNEL" ] || return 0
+    inherited="$(_this_bridge_channel)"
+    if [ "$REQUESTED_CHANNEL" != "$inherited" ]; then
+        for var in $_CHANNEL_SCOPED_VARS ${!CCC_MATRIX_@}; do
+            unset "$var"
+        done
+        echo "🔀 Channel: inherited $inherited -> requested $REQUESTED_CHANNEL (dropped inherited channel settings)"
+    fi
+    if [ "$REQUESTED_CHANNEL" = matrix ]; then
+        export CCC_CHANNEL=matrix
+    else
+        unset CCC_CHANNEL   # telegram is the default; the Telegram unit never sets it
+    fi
+}
+guard_inherited_channel() {
+    local source="inherited CCC_CHANNEL=matrix"
+    [ "$INTERNAL_RUN" -eq 0 ] || return 0
+    case "$ACTION" in run|stop|restart) ;; *) return 0 ;; esac
+    [ "$(_this_bridge_channel)" = matrix ] || return 0
+    [ "$REQUESTED_CHANNEL" = matrix ] && source="--channel matrix"
+    # start.sh's state is Telegram's whatever the channel (BOT_DATA_DIR is
+    # always <path>/.telegram_bot: pid, supervisor and token-lock files), so
+    # acting "as matrix" would stop or shadow the Telegram bridge as well.
+    echo "❌ Refused: action=$ACTION target-channel=matrix ($source)."
+    echo "   start.sh manages only the Telegram bridge; the Matrix frontend runs under its own"
+    echo "   service. A provider shell of the Matrix bridge inherits CCC_CHANNEL=matrix."
+    echo "💡 Telegram bridge:  $0 --path \"$PROJECT_ROOT\" --$( [ "$ACTION" = run ] && echo daemon || echo "$ACTION" ) --channel telegram"
+    echo "   Matrix frontend:  systemctl restart ccc-matrix-bridge  (Termux: sv restart ccc-matrix-bridge)"
+    exit 10
+}
+apply_requested_channel
+guard_inherited_channel
 
 # ── Dispatch action ──
 

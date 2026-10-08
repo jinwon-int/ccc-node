@@ -186,6 +186,14 @@ reviewed `scripts/ccc-self-update.sh` path. See
 > refused before stop (exit 5), because stopping the ancestor would also kill
 > the restart driver. For systemd installations use `systemctl restart
 > ccc-telegram-bridge.service`.
+>
+> **Channel (#2177).** `start.sh` manages only the Telegram bridge. A shell
+> spawned by the Matrix frontend inherits `CCC_CHANNEL=matrix`; `--restart`,
+> `--stop` and starts that resolve to matrix (inherited or `--channel matrix`)
+> are refused before stop with exit `10`. From such a shell pass
+> `--channel telegram`, which also drops the inherited Matrix settings
+> (`SESSION_STORE_PATH`, `CCC_BOT_ENV_FILE`, `CCC_MATRIX_*`). Restart the
+> Matrix frontend through its own service. `--status` works for both channels.
 
 ## Usage Examples
 
