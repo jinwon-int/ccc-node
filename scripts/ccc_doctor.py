@@ -852,6 +852,7 @@ class Doctor:
         self.check_distill_readiness()
         self.check_skill_promotion_backlog()
         self.check_skill_pending_backlog()
+        self.check_skill_prescreen()
         self.check_skill_promotion_dispatch_gap()
         self.check_fleet_skills_sync()
         self.check_skill_promotion_revise_stall()
@@ -1901,6 +1902,55 @@ class Doctor:
             "skill-promotion.collect-nodes, that its collect cron still runs, "
             "and that max_prs_per_run keeps up with the fleet's staging rate",
         )
+
+    _PRESCREEN_STALE_DAYS = 3
+
+    def check_skill_prescreen(self) -> None:
+        """Pre-screen reviewer health for the undecided draft queue (#2183).
+
+        `prescreen.py` writes `state/prescreen-last.json` after every run.
+        Absent means the step never ran here (not drift on a node without a
+        queue). A last run older than 3 days while undecided drafts exist, a
+        run that ended `reviewer-down`/`handler-unavailable`/
+        `procedure-unavailable`, or a run where every attempt errored means
+        the human gate is back to reading everything unaided.
+        """
+        item = "skill-autosave prescreen"
+        state_dir = Path(
+            os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")
+        ).expanduser()
+        last_path = state_dir / "prescreen-last.json"
+        pending = state_dir / "pending-skills"
+        has_queue = pending.is_dir() and not pending.is_symlink()
+        if last_path.is_symlink() or not last_path.is_file():
+            self.add("정상", item, "last=never" + ("; queue=present" if has_queue else "; queue=absent"), "none")
+            return
+        try:
+            last = json.loads(last_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.add("수동필요", item, "last=unreadable", f"inspect {last_path}")
+            return
+        if not isinstance(last, dict):
+            self.add("수동필요", item, "last=malformed", f"inspect {last_path}")
+            return
+        status = str(last.get("status", "unknown"))
+        ts = self._parse_ledger_ts(last.get("ts"))
+        age_days = None if ts is None else int((time.time() - ts) // 86400)
+        reviewed = int(last.get("reviewed") or 0)
+        errors = int(last.get("errors") or 0)
+        archived = len(last.get("archived") or [])
+        summary = f"last={age_days}d status={status} reviewed={reviewed} archived={archived} errors={errors}"
+        hint = "run `ccc-skill-autosave.sh prescreen --dry-run`, then check REVIEW_AGENT_BIN/ARGS and the handler path in the sweep log"
+        if status in {"reviewer-down", "handler-unavailable", "procedure-unavailable"}:
+            self.add("경고", item, summary, hint)
+            return
+        if reviewed == 0 and errors > 0:
+            self.add("경고", item, summary, hint)
+            return
+        if has_queue and age_days is not None and age_days >= self._PRESCREEN_STALE_DAYS:
+            self.add("경고", item, summary, "the nightly sweep has not pre-screened for 3+ days; check the skill-autosave cron and the sweep log")
+            return
+        self.add("정상", item, summary, "none")
 
     _PENDING_BACKLOG_WARN_DAYS = 60
     _PENDING_DECIDED_RE = re.compile(r"\.(approved|rejected|installed)-[0-9]+$")

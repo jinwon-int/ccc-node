@@ -528,6 +528,12 @@ else
   err "doctor skill-promotion backlog verdict tests failed"
   tail -10 "$TMP/doctor-promotion-backlog-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_prescreen_test.py >"$TMP/doctor-prescreen-test.out" 2>&1; then
+  say "  ok doctor skill-autosave prescreen verdict tests"
+else
+  err "doctor skill-autosave prescreen verdict tests failed (a dead pre-screen reviewer would go unnoticed, #2183)"
+  tail -10 "$TMP/doctor-prescreen-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_pending_backlog_test.py >"$TMP/doctor-pending-backlog-test.out" 2>&1; then
   say "  ok doctor skill-autosave pending-backlog verdict tests"
 else
