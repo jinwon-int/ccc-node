@@ -300,7 +300,9 @@ build_memory_query() {
   local query_tool
   query_tool="$(find_memory_tool ccc-memory-query.sh 2>/dev/null || true)"
   if [ -n "$query_tool" ]; then
-    CCC_WORKTREE="${CCC_WORKTREE:-$(pwd 2>/dev/null || true)}" "$query_tool" --mode local 2>/dev/null && return 0
+    # bash, not exec: the `#!/usr/bin/env` shebang dies with 126 on Termux
+    # and the task query silently fell back to current-task.txt (#2191).
+    CCC_WORKTREE="${CCC_WORKTREE:-$(pwd 2>/dev/null || true)}" bash "$query_tool" --mode local 2>/dev/null && return 0
   fi
   cat "$STATE_DIR/current-task.txt" 2>/dev/null || printf 'current task'
 }

@@ -20,6 +20,9 @@ case "${CCC_MEMORY_AUDIENCE_SCOPED:-0}" in
 esac
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+HOOKDIR="$(cd "$HERE/.." && pwd)"
+# shellcheck source=claude/hooks/lib/hook-common.sh
+. "$HOOKDIR/lib/hook-common.sh" 2>/dev/null || true
 NUNCHI_HOME="${NUNCHI_HOME:-$HOME/.nunchi}"
 SNAP="${NUNCHI_SNAPSHOT:-$NUNCHI_HOME/snapshot.md}"
 [ -f "$SNAP" ] || exit 0
@@ -34,23 +37,43 @@ SNAP="${NUNCHI_SNAPSHOT:-$NUNCHI_HOME/snapshot.md}"
 # legacy `head -c 3000`, so the worst case stays today's behavior.
 inject_legacy() { head -c 3000 "$SNAP" 2>/dev/null || true; }
 
+# #2191: the injected block now carries machine-extracted auto-distill rows
+# (#2186), so it goes through the same runtime scanner load-memory.sh uses
+# (credential redaction + prompt-injection neutralization). Run it through
+# bash — exec'ing its `#!/usr/bin/env` shebang dies with 126 on Termux
+# (#1157). Fail-open like load-memory.sh, but say so on stderr (#1160).
+scan_block() { # <text>
+  local text="$1" scanned
+  if [ ! -f "$HOOKDIR/scan-injection.sh" ]; then
+    printf '%s\n' "$text"
+    return
+  fi
+  if scanned="$(printf '%s' "$text" | bash "$HOOKDIR/scan-injection.sh" nunchi 2>/dev/null)"; then
+    printf '%s\n' "$scanned"
+  else
+    printf 'nunchi sessionstart: scan-injection failed; injecting UNSCANNED block\n' >&2
+    printf '%s\n' "$text"
+  fi
+}
+
 if [ "${CCC_NUNCHI_ASSEMBLE:-1}" = "0" ] || [ "${CCC_NUNCHI_ASSEMBLE:-1}" = "false" ]; then
-  inject_legacy
+  block="$(inject_legacy)"
 else
+  # #2191: was `"$d" --mode local` — it executed the DIRECTORY, and looked in
+  # a scripts/ dir the deployed tree does not have, so the task hint was
+  # always empty. Resolve the tool like load-memory.sh and run it via bash.
   hint=""
-  for d in "${CCC_MEMORY_TOOLS_DIR:-}" "$HERE/../../scripts"; do
-    [ -n "$d" ] || continue
-    if [ -f "$d/ccc-memory-query.sh" ]; then
-      hint="$("$d" --mode local 2>/dev/null || true)"
-      break
-    fi
-  done
+  if command -v find_memory_tool >/dev/null 2>&1 \
+      && query_tool="$(find_memory_tool ccc-memory-query.sh 2>/dev/null)"; then
+    hint="$(bash "$query_tool" --mode local 2>/dev/null || true)"
+  fi
   [ -n "$hint" ] || hint="$(cat "${STATE}/current-task.txt" 2>/dev/null || true)"
-  if ! python3 "$HERE/nunchi.py" assemble \
-       --budget "${CCC_NUNCHI_ASSEMBLE_BUDGET:-3000}" --hint "$hint" 2>/dev/null; then
-    inject_legacy
+  if ! block="$(python3 "$HERE/nunchi.py" assemble \
+       --budget "${CCC_NUNCHI_ASSEMBLE_BUDGET:-3000}" --hint "$hint" 2>/dev/null)"; then
+    block="$(inject_legacy)"
   fi
 fi
+[ -n "$block" ] && scan_block "$block"
 
 # Regenerate asynchronously if stale (>15min); cron refreshes every 10min normally.
 # The background refresh updates the snapshot for the next session; this session
