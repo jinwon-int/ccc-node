@@ -177,9 +177,12 @@ def stale_transition(prev: Any, *, failed: bool, at: str, last_success: str | No
     now_epoch, since_epoch = _epoch(at), _epoch(since)
     if now_epoch is None or since_epoch is None:
         return state, None
-    age_days = int((now_epoch - since_epoch) // 86400)
-    if age_days < days:
+    # Strictly older than the window, in seconds -- the same boundary as the
+    # ccc-doctor check, so a weekly task's on-time run (exactly 7d00m) is not
+    # stale.
+    if now_epoch - since_epoch <= days * 86400:
         return state, None
+    age_days = int((now_epoch - since_epoch) // 86400)
     state['staleAlertedAt'] = at
     return state, {'reason': 'stale', 'days': days, 'ageDays': age_days,
                    'basis': basis, 'since': since}
@@ -353,8 +356,10 @@ def alarm_text(task_id: str, task_event: dict[str, Any] | None,
         lines.append(f"agent-cron stale alarm: no prompt task has succeeded for "
                      f"{stale_event['ageDays']}d (threshold {stale_event['days']}d); "
                      f"{since}; latest failure: task {task_id}, class={cls}")
-        if not node_event or node_event['reason'] == 'recovered':
-            lines.append(NODE_HINTS.get(cls, NODE_HINTS['other']))
+        # Another alarm on this run already carries its hint. Alone, the stale
+        # alarm may stand on a single failed task, so it uses the task wording.
+        if not (task_event or node_event):
+            lines.append(TASK_HINTS.get(cls, TASK_HINTS['other']))
     if task_event and task_event['reason'] == 'recovered':
         lines.append(f"agent-cron failure alarm cleared: task {task_id} succeeded after "
                      f"{task_event['consecutiveFailures']} consecutive failures "

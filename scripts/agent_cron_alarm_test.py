@@ -220,17 +220,20 @@ class StaleTransition(unittest.TestCase):
         self.assertEqual(resolve_stale_days('junk'), 7)
         self.assertEqual(resolve_stale_days('99999'), 366)
 
-    def test_alerts_once_at_the_threshold(self) -> None:
-        state, event = self.step({}, at='2026-01-07T23:59:00Z')
+    def test_alerts_once_strictly_past_the_threshold(self) -> None:
+        # Exactly 7d00m (a weekly task's on-time run) is not stale -- same
+        # boundary as ccc-doctor (#2178 review).
+        state, event = self.step({})
         self.assertIsNone(event)
-        state, event = self.step(state)
+        state, event = self.step(state, at='2026-01-08T00:01:00Z')
         self.assertEqual(event['reason'], 'stale')
         self.assertEqual((event['ageDays'], event['basis']), (7, 'last-success'))
         state, event = self.step(state, at='2026-01-20T00:00:00Z')
         self.assertIsNone(event)
 
     def test_success_clears_and_a_new_stretch_alerts_again(self) -> None:
-        state, _ = self.step({})
+        state, _ = self.step({}, at='2026-01-08T00:01:00Z')
+        self.assertIn('staleAlertedAt', state)
         state, event = self.step(state, failed=False, at='2026-01-09T00:00:00Z')
         self.assertIsNone(event)
         self.assertNotIn('staleAlertedAt', state)
@@ -239,19 +242,21 @@ class StaleTransition(unittest.TestCase):
         self.assertEqual(event['ageDays'], 8)
 
     def test_unseen_later_success_unlatches(self) -> None:
-        state, _ = self.step({})
+        state, _ = self.step({}, at='2026-01-08T00:01:00Z')
+        self.assertIn('staleAlertedAt', state)
         _state, event = self.step(state, at='2026-01-17T00:00:00Z',
                                   last_success='2026-01-09T00:00:00Z')
         self.assertEqual(event['reason'], 'stale')
 
     def test_no_success_uses_the_first_recorded_run(self) -> None:
-        _state, event = self.step({}, last_success=None, first_run='2026-01-01T00:00:00Z')
+        _state, event = self.step({}, at='2026-01-09T00:00:00Z', last_success=None,
+                                  first_run='2026-01-01T00:00:00Z')
         self.assertEqual(event['basis'], 'no-success-since-first-run')
         _state, event = self.step({}, last_success=None, first_run=None)
         self.assertIsNone(event)
 
     def test_disabled_and_bad_stamps_never_alert(self) -> None:
-        self.assertIsNone(self.step({}, days=0)[1])
+        self.assertIsNone(self.step({}, at='2026-01-09T00:00:00Z', days=0)[1])
         self.assertIsNone(self.step({}, at='not-a-time')[1])
 
     def test_text_names_the_stretch_and_the_opt_out(self) -> None:
@@ -261,6 +266,10 @@ class StaleTransition(unittest.TestCase):
         self.assertIn('no prompt task has succeeded for 9d (threshold 7d)', text)
         self.assertIn('last prompt success: 2026-01-01T00:00:00Z', text)
         self.assertIn('CCC_AGENT_CRON_PROMPT_STALE_DAYS=0', text)
+        self.assertNotIn('several prompt tasks', text)
+        task_event = {'reason': 'threshold', 'consecutiveFailures': 3, 'failureClass': 'timeout'}
+        both = alarm_text('weekly', task_event, None, None, stale_event=event, failure_class='timeout')
+        self.assertEqual(both.count('runs are hitting their timeout'), 1)
 
 
 class AlarmText(unittest.TestCase):
@@ -442,7 +451,7 @@ class Integration(unittest.TestCase):
         self.assertEqual(second['failureAlarm']['state'], 'no-alert')
         box.run('weekly', 'ok')
         self.assertNotIn('staleAlertedAt', box.alarm_state()['node'])
-        box.run('weekly', 'exit1', advance=7 * 1440)
+        box.run('weekly', 'exit1', advance=7 * 1440 + 1)
         self.assertEqual(len([a for a in box.alarms() if 'node=stale' in a['reasons']]), 2)
 
     def test_prompt_stale_alarm_respects_the_opt_outs(self) -> None:
