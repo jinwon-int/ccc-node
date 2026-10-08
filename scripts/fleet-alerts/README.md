@@ -47,6 +47,12 @@ signature `sha256=HMAC-SHA256(secret, "<unix-ts>." + body)`.
 `GET /healthz` → `200 {"ok":true}` (no auth, body-free). Logs never contain
 alert text — only node, event, txn and refusal reason.
 
+**Sender prefix.** Every queued alert starts with `[<name>] ` so the owner sees
+which agent it came from in the first line. `<name>` comes from the optional
+`--labels` JSON file (`{"<node>": "<agent display name>"}`, kept on the relay
+host — fleet names stay out of the repo); unknown nodes show their node id.
+The file is re-read when it changes (no restart).
+
 ## Provisioning (one-time, owner approval; never record secrets in docs)
 
 1. **Secrets.** On the relay host: `install -d -m 0700 /etc/fleet-alerts/nodes`.

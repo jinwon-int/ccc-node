@@ -118,13 +118,53 @@ def check_request(
     return Decision(202, "ok", node, payload)
 
 
-def queue_payload(queue_dir: Path, payload: dict) -> tuple[str, bool]:
+class NodeLabels:
+    """``{node: display name}`` from a node-local JSON file, re-read when it changes.
+
+    The relay host keeps fleet display names (agent names the owner knows)
+    outside the repo on purpose; the file is optional and a missing/invalid
+    file just means the node id is shown.
+    """
+
+    def __init__(self, path: Optional[Path]) -> None:
+        self.path = path
+        self._mtime: Optional[float] = None
+        self._labels: dict[str, str] = {}
+
+    def _reload(self) -> None:
+        if self.path is None:
+            return
+        try:
+            mtime = self.path.stat().st_mtime
+        except OSError:
+            self._labels, self._mtime = {}, None
+            return
+        if mtime == self._mtime:
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self._labels = {str(k): str(v) for k, v in data.items() if isinstance(v, str) and v.strip()}
+            self._mtime = mtime
+        except (OSError, ValueError, AttributeError):
+            log.warning("node label file unreadable; showing node ids")
+            self._labels, self._mtime = {}, None
+
+    def label(self, node: str) -> str:
+        self._reload()
+        return self._labels.get(node) or node
+
+
+def queue_payload(queue_dir: Path, payload: dict, labels: Optional[NodeLabels] = None) -> tuple[str, bool]:
     node = str(payload.get("node") or "")
+    text = payload["text"]
+    label = labels.label(node) if labels is not None else node
+    if label:
+        text = f"[{label}] {text}"  # the owner reads the sender in the first line
     key = str(payload.get("record") or payload.get("dedup") or "")
     fp = outbox.fingerprint(node, key) if key else None
     return outbox.enqueue(
         queue_dir,
-        payload["text"],
+        text,
         node=node,
         event=str(payload.get("event") or ""),
         fingerprint=fp,
@@ -142,12 +182,14 @@ class Receiver:
         skew: float = DEFAULT_SKEW_S,
         max_body: int = DEFAULT_MAX_BODY,
         clock: Callable[[], float] = time.time,
+        labels: Optional[NodeLabels] = None,
     ) -> None:
         self.secrets_dir = secrets_dir
         self.queue_dir = queue_dir
         self.skew = skew
         self.max_body = max_body
         self.clock = clock
+        self.labels = labels
 
     def handle(self, method: str, path: str, headers: Mapping[str, str], body: bytes) -> tuple[int, dict]:
         if method == "GET" and path == HEALTH_PATH:
@@ -162,7 +204,7 @@ class Receiver:
             return d.status, {"error": d.reason}
         assert d.payload is not None
         try:
-            txn, dup = queue_payload(self.queue_dir, d.payload)
+            txn, dup = queue_payload(self.queue_dir, d.payload, self.labels)
         except Exception as exc:  # queue unsafe/unwritable → node keeps the record
             log.error("queue failure node=%s reason=%s", d.node, exc.__class__.__name__)
             return 503, {"error": "queue-unavailable"}
@@ -233,6 +275,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--queue", required=True, type=Path, help="owner-only queue directory shared with the sender")
     parser.add_argument("--skew", type=float, default=DEFAULT_SKEW_S, help="max |now - X-Fleet-Timestamp| in seconds")
     parser.add_argument("--max-body", type=int, default=DEFAULT_MAX_BODY)
+    parser.add_argument(
+        "--labels", type=Path, default=None,
+        help="optional JSON {node: display name}; the name is prefixed as '[name] ' to every alert",
+    )
     args = parser.parse_args(argv)
     os.umask(0o077)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -241,7 +287,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.error("node key directory missing (--secrets-dir)")
         return 2
     outbox.pending_count(args.queue)  # fail fast on an unsafe queue directory
-    receiver = Receiver(secrets_dir=args.nodes_dir, queue_dir=args.queue, skew=args.skew, max_body=args.max_body)
+    receiver = Receiver(
+        secrets_dir=args.nodes_dir, queue_dir=args.queue, skew=args.skew, max_body=args.max_body,
+        labels=NodeLabels(args.labels),
+    )
     host, port = args.bind
     httpd = serve(receiver, host, port)
     log.info("fleet alert receiver listening on %s:%d", host, port)
