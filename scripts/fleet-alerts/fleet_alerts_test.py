@@ -156,6 +156,30 @@ class AdmissionTest(_Base):
         self.assertEqual(self.check(h, b"x" * 70_000).status, 413)
 
 
+class NodeLabelTest(_Base):
+    def test_label_prefix_from_file_with_fallback_and_reload(self) -> None:
+        f = self.root / "labels.json"
+        f.write_text(json.dumps({"node-a": "에이전트A", "node-c": ""}), encoding="utf-8")
+        labels = rx.NodeLabels(f)
+        self.assertEqual(labels.label("node-a"), "에이전트A")
+        self.assertEqual(labels.label("node-b"), "node-b")  # unknown → id
+        self.assertEqual(labels.label("node-c"), "node-c")  # empty name → id
+        txn, _ = rx.queue_payload(self.queue, _payload(), labels)
+        self.assertEqual(outbox.pending(self.queue), (txn, "[에이전트A] 🔔 formatted"))
+        f.write_text(json.dumps({"node-a": "새이름"}), encoding="utf-8")
+        os.utime(f, (time.time() + 5, time.time() + 5))  # force a different mtime
+        self.assertEqual(labels.label("node-a"), "새이름")
+
+    def test_missing_or_invalid_label_file_shows_node_id(self) -> None:
+        self.assertEqual(rx.NodeLabels(self.root / "nope.json").label("node-a"), "node-a")
+        self.assertEqual(rx.NodeLabels(None).label("node-a"), "node-a")
+        bad = self.root / "bad.json"
+        bad.write_text("not json", encoding="utf-8")
+        self.assertEqual(rx.NodeLabels(bad).label("node-a"), "node-a")
+        txn, _ = rx.queue_payload(self.queue, _payload(), None)
+        self.assertEqual(outbox.pending(self.queue), (txn, "[node-a] 🔔 formatted"))
+
+
 class HttpRoundTripTest(_Base):
     """The bridge's FleetAlertRelay client (PR 1) against this receiver, end to end."""
 
@@ -177,7 +201,7 @@ class HttpRoundTripTest(_Base):
         relay.post(payload)
         relay.post(payload)  # lost-2xx retry
         self.assertEqual(outbox.pending_count(self.queue), 1)
-        self.assertEqual(outbox.pending(self.queue)[1], "🔔 formatted")
+        self.assertEqual(outbox.pending(self.queue)[1], "[node-a] 🔔 formatted")
         relay.post(R.build_payload("node-a", "r2.json", {"event": "x", "text": "t"}, "second"))
         self.assertEqual(outbox.pending_count(self.queue), 2)
 

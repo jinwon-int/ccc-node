@@ -5,6 +5,7 @@
 # fleet-alerts-receiver`. Prerequisites (see scripts/fleet-alerts/README.md):
 #   install -d -m 0700 /etc/fleet-alerts/nodes /var/lib/fleet-alerts
 #   # one owner-only secret file per node: /etc/fleet-alerts/nodes/<node> (0600)
+#   # optional /etc/fleet-alerts/node-labels.json {"<node>": "<agent display name>"} — shown as "[name] " prefix
 # The bind address must be Tailscale-internal; never expose this on a public
 # interface. Nodes point CCC_PUSH_FLEET_RELAY_URL at http://<bind>/v1/alerts.
 [Unit]
@@ -22,7 +23,8 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /opt/ccc-node/scripts/fleet-alerts/fleet_alerts_receiver.py \
   --bind <tailscale-ip>:8795 \
   --secrets-dir /etc/fleet-alerts/nodes \
-  --queue /var/lib/fleet-alerts/queue
+  --queue /var/lib/fleet-alerts/queue \
+  --labels /etc/fleet-alerts/node-labels.json
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15
