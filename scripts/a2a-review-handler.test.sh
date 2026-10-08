@@ -265,15 +265,15 @@ ok "missing bindings are filled node-side from the packet (#1460)" \
 
 make_revise_task
 REVIEW_STUB_MODE=wrongbinding run_revise_handler >/dev/null 2>&1; rc=$?
-ok "contradicting skillName binding is a handler failure, never a revision (#1460)" '[ "$rc" != 0 ]'
+ok "contradicting skillName binding is a deterministic handler failure (exit 3, #1460)" '[ "$rc" = 3 ]'
 
 make_revise_task
 REVIEW_STUB_MODE=unsafepath run_revise_handler >/dev/null 2>&1; rc=$?
-ok "unsafe candidate path (../) is rejected (#1460)" '[ "$rc" != 0 ]'
+ok "unsafe candidate path (../) is rejected with exit 3 (#1460)" '[ "$rc" = 3 ]'
 
 make_revise_task
 REVIEW_STUB_MODE=nofiles run_revise_handler >/dev/null 2>&1; rc=$?
-ok "revised outcome without skillFiles is a handler failure (#1460)" '[ "$rc" != 0 ]'
+ok "revised outcome without skillFiles is a deterministic handler failure (exit 3, #1460)" '[ "$rc" = 3 ]'
 
 make_revise_task
 REVIEW_STUB_MODE=droprec run_revise_handler > "$TMP/out-droprec.json" 2>/dev/null; rc=$?
@@ -283,11 +283,11 @@ ok "drop_recommendation outcome composes a bounded result (#1460)" \
 
 make_revise_task
 REVIEW_STUB_MODE=prose run_revise_handler >/dev/null 2>&1; rc=$?
-ok "prose-only reviser output is a handler failure (#1460)" '[ "$rc" != 0 ]'
+ok "prose-only reviser output is a deterministic handler failure (exit 3, #1460)" '[ "$rc" = 3 ]'
 
 make_revise_task
 REVIEW_STUB_MODE=crash run_revise_handler >/dev/null 2>&1; rc=$?
-ok "reviser agent crash is a retryable handler failure (#1460)" '[ "$rc" != 0 ]'
+ok "reviser agent crash is an environment failure (exit 1, not 3; #1460)" '[ "$rc" = 1 ]'
 
 # non-revise intents stay rejected by the revise handler
 printf '{"id":"x","intent":"skills_intake_review","payload":{}}\n' | \
@@ -320,7 +320,7 @@ run_revise_p1() {
 make_revise_task
 REVIEW_STUB_MODE=two-outcomes run_revise_p1 > "$TMP/out-two.json" 2>"$TMP/err-two.txt"; rc=$?
 ok "two distinct outcome objects fail closed instead of last-wins (#1460 P1)" \
-  '[ "$rc" != 0 ] && [ ! -s "$TMP/out-two.json" ] && grep -q "distinct outcome objects" "$TMP/err-two.txt"'
+  '[ "$rc" = 3 ] && [ ! -s "$TMP/out-two.json" ] && grep -q "distinct outcome objects" "$TMP/err-two.txt"'
 
 make_revise_task
 REVIEW_STUB_MODE=dup-outcome run_revise_p1 > "$TMP/out-dup.json" 2>/dev/null; rc=$?
@@ -330,7 +330,7 @@ ok "an identical repeated outcome object is deduped, not rejected (#1460 P1)" \
 make_revise_task
 REVIEW_STUB_MODE=noop run_revise_p1 > "$TMP/out-noop.json" 2>"$TMP/err-noop.txt"; rc=$?
 ok "revised result byte-identical to the packet is a no-op failure, never a pass (#1460 P1)" \
-  '[ "$rc" != 0 ] && [ ! -s "$TMP/out-noop.json" ] && grep -q "no-op revision" "$TMP/err-noop.txt"'
+  '[ "$rc" = 3 ] && [ ! -s "$TMP/out-noop.json" ] && grep -q "no-op revision" "$TMP/err-noop.txt"'
 
 # ─── dispatcher revise routing (#1460) ──────────────────────────────────
 printf '#!/usr/bin/env bash\necho REVISE-HANDLER-CALLED\n' > "$BIN/revise-route-stub"

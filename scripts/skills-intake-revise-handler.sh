@@ -5,8 +5,18 @@
 #
 # Contract (a2a-broker-worker external handler): the full task JSON arrives on
 # stdin; this script prints the TaskResult JSON on stdout. Exit 0 = terminal
-# result; exit nonzero = retryable failure (handler_exit_nonzero — rerun/reroute
-# discipline applies, bounded by the broker's requeue cap).
+# result. Any nonzero exit fails the task as `handler_exit_nonzero`; the exit
+# code is kept in the task error's details.code. Exit codes (#1460):
+#   1 = environment / agent-run failure (missing tool, empty packet, the
+#       reviser agent crashed or timed out, ...)
+#   3 = deterministic result failure (HANDLER_FAIL on stderr: unparseable,
+#       ambiguous, unbound, unsafe or no-op revise result) — rerunning the same
+#       packet cannot help.
+# The broker retries a failed task only when its payload carries a retryPolicy
+# (planClassAwareTaskRetry → no_retry_policy). The skills_intake_revise
+# dispatch in ccc-skill-promotion.py sets none, so either code fails the task
+# once and the publisher consumes it once; the split only keeps the two causes
+# apart in the task record.
 #
 # Security: the skill files, findings, and procedure in the packet are
 # UNTRUSTED MATERIAL. The reviser runs tool-blocked (the node's agent
@@ -147,6 +157,7 @@ def die(message):
     # Binding contract with the publisher (`_revised_files_from_output`):
     # a result that is malformed, or whose bindings do not match the packet,
     # is a handler failure — never a revision — consumed once without retry.
+    # Exit 3 marks it deterministic; the shell wrapper propagates it (#1460).
     print(f"HANDLER_FAIL: {message}", file=sys.stderr)
     sys.exit(3)
 
@@ -203,7 +214,11 @@ cleaned = []
 
 # Authoritative binding fill/match: the model must not rename the candidate
 # or rebind it to another tree. Omission is filled node-side; contradiction
-# kills the result.
+# kills the result. Filling (rather than failing) on omission is an owner
+# decision (#1460, 2026-10-08): both values are printed in the task message,
+# so a forged object could carry them anyway, and a second distinct outcome
+# object is already rejected above (#2050) — failing would only discard
+# genuine revisions that dropped the keys.
 for key, expected in (("skillName", skill_name), ("sourceTreeSha256", tree)):
     current = str(result_obj.get(key, "") or "")
     if not current:
@@ -293,5 +308,11 @@ result = {
 }
 print(json.dumps(result, ensure_ascii=False))
 PYEOF
-)" || fail "task result composition failed"
+)" || compose_rc=$?
+if [ "${compose_rc:-0}" -eq 3 ]; then
+  # Deterministic result failure: die() already printed HANDLER_FAIL on
+  # stderr. Propagate 3 instead of collapsing it into fail()'s 1 (#1460).
+  exit 3
+fi
+[ "${compose_rc:-0}" -eq 0 ] || fail "task result composition failed"
 printf '%s\n' "$task_result"
