@@ -29,6 +29,12 @@ NATIVE = ("cryptography", "jiter", "pydantic-core", "rpds-py", "pyromark")
 BUILD_TOOLS = ("setuptools", "packaging", "cffi", "pycparser")
 MATURIN_VERSION = "1.14.1"
 MIN_FREE_BYTES = 2 * 1024**3
+# Same-node wheel reuse (#2175): the prior receipt must match on every input
+# that determines the native build output. Toolchain hashes pin the node's
+# compiler/backend binaries, so another node's (different) wheels never match.
+REUSE_MATCH_FIELDS = ("android_api", "linker_threads", "lock_sha256", "toolchain")
+MAX_RECEIPT_BYTES = 1024**2
+MAX_REUSE_CACHE_BYTES = 256 * 1024**2
 # Cargo jobs do not constrain LLD's internal relocation-scanning threads.
 # Keep the Android workaround job-local; never change the system compiler.
 SERIAL_LINK_ARG = "-Wl,--threads=1"
@@ -53,19 +59,153 @@ def private_write(path: Path, data: str) -> None:
         stream.write(data)
 
 
-def fresh_workspace(path: Path) -> Path:
-    path = Path(os.path.abspath(path))
+def require_base_interpreter() -> None:
+    """Refuse a venv interpreter: the backend and toolchain live in the base prefix.
+
+    An inherited PATH whose first ``python3`` is an old runtime venv made the
+    backend-provenance probe fail with a bare ``No module named 'maturin'``.
+    """
+    if sys.prefix != sys.base_prefix:
+        raise PreparationError("must_run_with_base_interpreter")
+
+
+def _check_ancestors(path: Path, reason: str) -> None:
     # No resolve(): following a symlink would defeat the rejection below.
     for parent in reversed(path.parents):
         info = parent.lstat()
         if not stat.S_ISDIR(info.st_mode) or (info.st_mode & stat.S_IWOTH and not info.st_mode & stat.S_ISVTX):
-            raise PreparationError("unsafe_workspace_parent")
+            raise PreparationError(reason)
+
+
+def fresh_workspace(path: Path) -> Path:
+    path = Path(os.path.abspath(path))
+    _check_ancestors(path, "unsafe_workspace_parent")
     info = path.parent.stat()
     if info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise PreparationError("workspace_parent_must_be_owner_private")
     path.mkdir(mode=0o700)  # Atomic claim; existing successes/failures are never reused.
     path.chmod(0o700)
     return path
+
+
+def _owner_private(info: os.stat_result) -> bool:
+    return info.st_uid == os.getuid() and not info.st_mode & 0o077
+
+
+def _sha256(path: Path) -> str:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        return hashlib.sha256(stream.read()).hexdigest()
+
+
+def _dist_name(wheel: str) -> str:
+    return re.sub(r"[-_.]+", "-", wheel.split("-", 1)[0]).lower()
+
+
+def load_reuse_source(path: Path) -> dict:
+    """Validate a prior job before claiming a workspace; return its receipt.
+
+    Only an owner-private, non-symlinked job on this filesystem whose receipt
+    says ``ready`` with a passing fresh install is eligible. Build-input
+    equality is checked later, once this run has measured its own toolchain.
+    """
+    path = Path(os.path.abspath(path))
+    _check_ancestors(path, "unsafe_reuse_source")
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or not _owner_private(info):
+        raise PreparationError("reuse_source_must_be_owner_private_dir")
+    receipt_path = path / "receipt.json"
+    info = receipt_path.lstat()
+    if not stat.S_ISREG(info.st_mode) or not _owner_private(info) or info.st_size > MAX_RECEIPT_BYTES:
+        raise PreparationError("reuse_receipt_invalid")
+    raw = receipt_path.read_bytes()
+    try:
+        receipt = json.loads(raw)
+    except ValueError:
+        raise PreparationError("reuse_receipt_invalid") from None
+    if (not isinstance(receipt, dict) or receipt.get("schema") != "ccc.termux-preparation.v1"
+            or receipt.get("status") != "ready"
+            or (receipt.get("scenarios") or {}).get("fresh_install") != "pass"):
+        raise PreparationError("reuse_receipt_not_ready")
+    if receipt.get("work_dir") != str(path):
+        raise PreparationError("reuse_receipt_work_dir_mismatch")
+    wheels = receipt.get("wheels")
+    if (not isinstance(wheels, dict)
+            or not all(isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) for v in wheels.values())
+            or not all(isinstance(k, str) and re.fullmatch(r"[A-Za-z0-9_.+-]+\.whl", k) for k in wheels)
+            or sorted(_dist_name(name) for name in wheels) != sorted(NATIVE)):
+        raise PreparationError("reuse_receipt_wheels_invalid")
+    receipt["_path"] = str(path)
+    receipt["_sha256"] = hashlib.sha256(raw).hexdigest()
+    return receipt
+
+
+def _private_copy(source: Path, target: Path) -> int:
+    info = source.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise PreparationError("reuse_cache_entry_invalid")
+    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        data = stream.read()
+    out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(out, "wb") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write(data)
+    return len(data)
+
+
+def native_cache_wheels(cache: Path) -> dict[str, list[str]]:
+    """Map each native wheel filename in pip's wheel cache to its digests."""
+    found: dict[str, list[str]] = {}
+    for path in sorted(cache.rglob("*.whl")):
+        if _dist_name(path.name) in NATIVE:
+            found.setdefault(path.name, []).append(_sha256(path))
+    return found
+
+
+def reuse_native_wheels(work: Path, receipt: dict, report: dict) -> None:
+    """Seed this job's private caches from a matching prior job (#2175).
+
+    pip's wheel cache (``pip-cache/wheels``) is what ordinary hash-locked
+    bootstrap consumes: each entry's ``origin.json`` keeps the original sdist
+    hash, so ``--require-hashes`` still checks the lock. The wheelhouse copy is
+    evidence only. Every native wheel must match the prior receipt's digest.
+    """
+    for field in REUSE_MATCH_FIELDS:
+        if report.get(field) != receipt.get(field):
+            raise PreparationError(f"reuse_{field}_mismatch")
+    prior = Path(receipt["_path"])
+    source_cache, target_cache = prior / "pip-cache" / "wheels", work / "pip-cache" / "wheels"
+    info = source_cache.lstat()
+    if not stat.S_ISDIR(info.st_mode) or not _owner_private(info):
+        raise PreparationError("reuse_cache_missing")
+    total = 0
+    for root, dirs, files in os.walk(source_cache):
+        relative = Path(root).relative_to(source_cache)
+        (target_cache / relative).mkdir(mode=0o700, exist_ok=relative == Path("."))
+        for name in dirs:
+            if Path(root, name).is_symlink():  # os.walk lists, but never follows, these.
+                raise PreparationError("reuse_cache_entry_invalid")
+        for name in files:
+            total += _private_copy(Path(root, name), target_cache / relative / name)
+            if total > MAX_REUSE_CACHE_BYTES:
+                raise PreparationError("reuse_cache_too_large")
+    expected = receipt["wheels"]
+    if native_cache_wheels(target_cache) != {name: [digest] for name, digest in expected.items()}:
+        raise PreparationError("reuse_wheel_hash_mismatch")
+    for name, digest in expected.items():
+        _private_copy(prior / "wheelhouse" / name, work / "wheelhouse" / name)
+        if _sha256(work / "wheelhouse" / name) != digest:
+            raise PreparationError("reuse_wheel_hash_mismatch")
+    report["native_wheels"] = {"mode": "reused", "from": receipt["_path"],
+                               "receipt_sha256": receipt["_sha256"]}
+
+
+def verify_reused_wheels_used(work: Path, report: dict) -> None:
+    """Fail if bootstrap rebuilt a native package instead of using the cache."""
+    expected = {name: [digest] for name, digest in report["wheels"].items()}
+    if native_cache_wheels(work / "pip-cache" / "wheels") != expected:
+        raise PreparationError("reused_wheels_not_used")
 
 
 def lock_subset(path: Path, names: tuple[str, ...]) -> str:
@@ -180,7 +320,8 @@ def provenance(runner: Runner) -> dict:
     return result
 
 
-def prepare(runner: Runner, source: Path, report: dict, reinstall: bool) -> None:
+def prepare(runner: Runner, source: Path, report: dict, reinstall: bool,
+            reuse: dict | None = None) -> None:
     work = runner.work
     report["source_seal"] = source_seal(source)
     report["toolchain"] = provenance(runner)
@@ -195,15 +336,27 @@ def prepare(runner: Runner, source: Path, report: dict, reinstall: bool) -> None
                                for name in ("termux_prepare.py", "dependency_bootstrap.py",
                                             "runtime_readiness.py", "requirements.txt", "pyproject.toml")}
     base = [sys.executable, "-I", "-B", "-m", "venv"]
-    runner.run("builder-venv", [*base, "--system-site-packages", str(work / "builder")])
-    builder = str(work / "builder/bin/python")
-    pip = [builder, "-I", "-B", "-m", "pip"]
-    runner.run("build-tools", [*pip, "install", "--require-hashes", "-r", str(work / "build-tools.lock.txt")])
-    # pip validates pyproject build requirements against the prepared builder;
-    # a future minimum maturin bump fails rather than silently ignoring it.
-    runner.run("native-wheels", [*pip, "wheel", "--no-build-isolation", "--check-build-dependencies",
-                               "--no-deps", "--require-hashes", "-r", str(work / "native.lock.txt"),
-                               "--wheel-dir", str(work / "wheelhouse")])
+    if reuse is None:
+        runner.run("builder-venv", [*base, "--system-site-packages", str(work / "builder")])
+        builder = str(work / "builder/bin/python")
+        pip = [builder, "-I", "-B", "-m", "pip"]
+        runner.run("build-tools", [*pip, "install", "--require-hashes", "-r", str(work / "build-tools.lock.txt")])
+        # pip validates pyproject build requirements against the prepared builder;
+        # a future minimum maturin bump fails rather than silently ignoring it.
+        runner.run("native-wheels", [*pip, "wheel", "--no-build-isolation", "--check-build-dependencies",
+                                   "--no-deps", "--require-hashes", "-r", str(work / "native.lock.txt"),
+                                   "--wheel-dir", str(work / "wheelhouse")])
+        report["native_wheels"] = {"mode": "built"}
+    else:
+        started = time.monotonic()
+        stage = {"id": "native-wheels-reuse", "status": "error"}
+        runner.stages.append(stage)
+        print("termux-prepare: native-wheels-reuse", file=sys.stderr, flush=True)
+        try:
+            reuse_native_wheels(work, reuse, report)
+            stage["status"] = "pass"
+        finally:
+            stage["duration_ms"] = round((time.monotonic() - started) * 1000)
     report["wheels"] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                         for path in sorted((work / "wheelhouse").glob("*.whl"))}
     runner.run("runtime-venv", [*base, str(work / "runtime")])
@@ -213,6 +366,8 @@ def prepare(runner: Runner, source: Path, report: dict, reinstall: bool) -> None
                  "--project-env", str(work / "absent.env"), "--process-unlocked", "0"]
     report["scenarios"]["fresh_install"] = "in_progress"
     runner.run("fresh-install", bootstrap)
+    if reuse is not None:
+        verify_reused_wheels_used(work, report)
     verify_runtime(runner, runtime, "fresh-readiness")
     report["scenarios"]["fresh_install"] = "pass"
     if reinstall:
@@ -221,6 +376,8 @@ def prepare(runner: Runner, source: Path, report: dict, reinstall: bool) -> None
                                       "--force-reinstall", "--require-hashes", "-r",
                                       str(source / "requirements.lock.txt")])
         runner.run("reinstall-reconcile", bootstrap)
+        if reuse is not None:
+            verify_reused_wheels_used(work, report)
         verify_runtime(runner, runtime, "reinstall-readiness")
         report["scenarios"]["reinstall"] = "pass"
     if source_seal(source) != report["source_seal"]:
@@ -252,6 +409,9 @@ def main(argv=None) -> int:
     parser.add_argument("--timeout-seconds", type=timeout_value, default=3600)
     parser.add_argument("--jobs", type=int, choices=(1, 2), default=1)
     parser.add_argument("--verify-reinstall", action="store_true")
+    parser.add_argument("--reuse-wheels-from", type=Path, metavar="PRIOR_JOB",
+                        help="reuse native wheels from a ready job on this node whose locks, "
+                             "toolchain, API and linker profile match exactly (else refuse)")
     args = parser.parse_args(argv)
     report = {"schema": "ccc.termux-preparation.v1", "status": "error", "stages": [],
               "scenarios": {name: "not_run" for name in
@@ -259,6 +419,8 @@ def main(argv=None) -> int:
     runner = None
     previous_handler = signal.signal(signal.SIGTERM, cancel)
     try:
+        require_base_interpreter()
+        reuse = load_reuse_source(args.reuse_wheels_from) if args.reuse_wheels_from else None
         api = android_build_api()
         if os.environ.get("ANDROID_API_LEVEL", str(api)) != str(api):
             raise PreparationError("android_api_override_mismatch")
@@ -269,9 +431,13 @@ def main(argv=None) -> int:
             (work / name).mkdir(mode=0o700)
         runner = Runner(work, build_environment(work, api, args.jobs), args.timeout_seconds)
         report.update(android_api=api, jobs=args.jobs, linker_threads=1, work_dir=str(work),
-                      cache_scope="new_private_pip_and_cargo_target; shared_default_cargo_registry",
+                      cache_scope=("new_private_pip_and_cargo_target; shared_default_cargo_registry"
+                                   if reuse is None else
+                                   "reused_prior_job_wheel_cache; new_private_pip_http_cache; "
+                                   "shared_default_cargo_registry"),
                       stages=runner.stages)
-        prepare(runner, Path(__file__).resolve().parent, report, args.verify_reinstall)
+        prepare(runner, Path(__file__).resolve().parent, report, args.verify_reinstall,
+                **({} if reuse is None else {"reuse": reuse}))
         report["status"] = "ready"
     except PreparationError as exc:
         report["reason"] = str(exc)
