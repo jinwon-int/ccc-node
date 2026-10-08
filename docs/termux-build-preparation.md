@@ -98,8 +98,8 @@ remain applicable.
 
 ## Reusing native wheels from a prior job on the same node
 
-The native build is about 90% of a full preparation (gongyung: 2702 of
-3015 seconds), and three consecutive builds of an unchanged lock on that node
+The native build is about 90% of a full preparation (2702 of 3015 seconds on one
+Termux node), and three consecutive builds of an unchanged lock on that node
 produced bit-identical wheels. When nothing that determines the build output
 changed, point the new job at a previous **ready** job on the same node:
 
@@ -122,8 +122,8 @@ are replaced by a `native-wheels-reuse` stage, which:
   `linker_threads`, both `lock_sha256` values and the complete `toolchain`
   record (versions and binary hashes) are identical — any change means a full
   build (rerun without the flag). Toolchain hashes keep the reuse on one node:
-  another node's builds differ (daegyo's pydantic-core wheel hash is not
-  gongyung's);
+  another node's builds differ (a second Termux node's pydantic-core wheel
+  hash differs from the first's);
 - copies the prior job's pip wheel cache (`pip-cache/wheels`, regular files
   only, bounded) into this job's private cache and the wheelhouse evidence
   copy, then requires every native wheel to match the prior receipt's digest;
@@ -134,7 +134,7 @@ pip's cached wheels keep their original sdist hash in `origin.json`, so the
 ordinary bootstrap still enforces `--require-hashes` against the lock. The
 receipt records `native_wheels: {"mode": "reused", "from": ..., "receipt_sha256": ...}`
 (`{"mode": "built"}` otherwise) and a `cache_scope` naming the reuse. Measured
-on gongyung (2026-10-09, reusing the 55f6b7bc job): **262 seconds** instead of
+on that node (2026-10-09, reusing the 55f6b7bc job): **262 seconds** instead of
 3015, wheels identical. Reuse is a same-node shortcut, not cross-node wheel
 distribution or a signature; keep the prior job until the new one has served.
 
