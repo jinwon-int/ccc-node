@@ -10,7 +10,7 @@ import shlex as _shlex
 import sys as _sys
 from pathlib import Path as _Path
 
-_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [--name N] [--timezone IANA] [--notify none|telegram-owner|telegram-owner-on-failure|telegram-chat|telegram-chat-on-failure] [--notify-chat-id ID] [--allowed-tools a,b] [--success-exit-codes 0,1] [--permission-mode M] [--catch-up-policy P] [--max-catchup N] [--lock-timeout-sec N] [--anchor-at ISO] [--not-before ISO] [--max-runs N] [--failure-alert-after N] [--keep-after-run] [--disabled] [--argv WORD ...] [--cwd DIR] [--model M] [--timeout-sec N] [--output-max-bytes N] [--json]\n       agent-cron.sh edit <task-id> [same flags as add; set-only partial update] [--json]\n       agent-cron.sh remove|enable|disable <task-id> [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure (a prompt task's\n  auth_failed/cli_missing skips the retry and alerts at once), clears retryState on success, and releases the lock in all normal failure/success\n  paths. Failed runs get a bounded failureClass\n  (auth_failed|cli_missing|timeout|other) in failure-alarm.json next to the\n  store (never in tasks.json); after N consecutive failures (failureAlertAfter,\n  default 3, 0 disables) one owner alarm is spooled regardless of notify. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
+_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [--name N] [--timezone IANA] [--notify none|telegram-owner|telegram-owner-on-failure|telegram-chat|telegram-chat-on-failure] [--notify-chat-id ID] [--allowed-tools a,b] [--success-exit-codes 0,1] [--permission-mode M] [--catch-up-policy P] [--max-catchup N] [--lock-timeout-sec N] [--anchor-at ISO] [--not-before ISO] [--max-runs N] [--failure-alert-after N] [--keep-after-run] [--disabled] [--argv WORD ...] [--cwd DIR] [--model M] [--timeout-sec N] [--output-max-bytes N] [--json]\n       agent-cron.sh edit <task-id> [same flags as add; set-only partial update] [--json]\n       agent-cron.sh remove|enable|disable <task-id> [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure (a prompt task's\n  auth_failed/cli_missing skips the retry and alerts at once), clears retryState on success, and releases the lock in all normal failure/success\n  paths. Failed runs get a bounded failureClass\n  (auth_failed|cli_missing|timeout|other) in failure-alarm.json next to the\n  store (never in tasks.json); after N consecutive failures (failureAlertAfter,\n  default 3, 0 disables) one owner alarm is spooled regardless of notify;\n  a failing prompt run with no prompt success for more than 7 days (CCC_AGENT_CRON_PROMPT_STALE_DAYS,\n  0 disables) spools one node stale alarm per stale stretch. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
 
 
 def _die(message, code=2):
@@ -96,7 +96,9 @@ from agent_cron_alarm import (  # noqa: E402
     alarm_text,
     classify_failure,
     node_transition,
+    resolve_stale_days,
     resolve_threshold,
+    stale_transition,
     task_transition,
     trailing_failures,
 )
@@ -1713,6 +1715,21 @@ def _prompt_last_success(tasks, state):
     return max(valid) if valid else None
 
 
+def _prompt_first_run(tasks, state):
+    """Oldest recorded prompt-task run, the stale alarm's basis with no success."""
+    stamps = []
+    for item in tasks:
+        if not isinstance(item, dict) or task_payload(item)['kind'] != 'prompt':
+            continue
+        stamps.extend(entry.get('startedAt') for entry in item.get('runHistory') or []
+                      if isinstance(entry, dict))
+        stamps.extend(row.get('startedAt') for row in
+                      (state['tasks'].get(str(item.get('id'))) or {}).get('runs') or []
+                      if isinstance(row, dict))
+    valid = [stamp for stamp in stamps if isinstance(stamp, str)]
+    return min(valid) if valid else None
+
+
 def write_failure_alarm_spool(task_id, run_id, text, reasons, at):
     spool = push_spool_dir()
     ts = fmt_dt(at) or _secure_fs.utc_now_iso()
@@ -1789,7 +1806,7 @@ def _advance_failure_alarm(state, task_id, current, tasks, run_id, status, failu
     )
     _record_task_run(task_state, run_id, at_s, status, failure_class)
     state['tasks'][task_id] = task_state
-    node_event = None
+    node_event = stale_event = None
     result = {'failureClass': failure_class, 'threshold': threshold,
               'consecutiveFailures': task_state['consecutiveFailures']}
     if _node_eligible(current, env_threshold):
@@ -1802,7 +1819,13 @@ def _advance_failure_alarm(state, task_id, current, tasks, run_id, status, failu
             runnable_ids=_node_runnable_ids(tasks, env_threshold) if live_store else None,
         )
         result['nodeConsecutiveFailures'] = state['node']['consecutiveFailures']
-    return task_event, node_event, result
+        state['node'], stale_event = stale_transition(
+            state['node'], failed=failed, at=at_s,
+            last_success=_prompt_last_success(tasks, state),
+            first_run=_prompt_first_run(tasks, state),
+            days=resolve_stale_days(os.environ.get('CCC_AGENT_CRON_PROMPT_STALE_DAYS', '')),
+        )
+    return task_event, node_event, stale_event, result
 
 
 # ccc-side-effect: agent_cron.failure_alarm
@@ -1837,23 +1860,25 @@ def record_failure_alarm(task_id, task, run_id, status, failure_class, at, immed
             if live is not None:
                 for key in [k for k in state['tasks'] if k not in live]:
                     del state['tasks'][key]
-            task_event, node_event, result = _advance_failure_alarm(
+            task_event, node_event, stale_event, result = _advance_failure_alarm(
                 state, task_id, current, tasks, run_id, status, failure_class, at_s,
                 live_store=live is not None, immediate=immediate)
             last_success = _prompt_last_success(tasks, state) if node_event else None
             try:
                 _write_failure_alarm_state(state)
             except Exception as e:
-                suppressed = bool(task_event or node_event)
+                suppressed = bool(task_event or node_event or stale_event)
                 print(f'agent-cron: failure-alarm state not persisted; '
                       f'{"alert suppressed" if suppressed else "counters not advanced"}: '
                       f'{short_text(str(e), 200)}', file=sys.stderr)
                 return {**result, 'state': 'state-write-failed', 'alertSuppressed': suppressed}
-        if not (task_event or node_event):
+        if not (task_event or node_event or stale_event):
             return {**result, 'state': 'no-alert'}
         reasons = sorted(f'{name}={event["reason"]}' for name, event in
-                         (('task', task_event), ('node', node_event)) if event)
-        text = alarm_text(task_id, task_event, node_event, last_success)
+                         (('task', task_event), ('node', node_event), ('node', stale_event))
+                         if event)
+        text = alarm_text(task_id, task_event, node_event, last_success,
+                          stale_event=stale_event, failure_class=failure_class)
         spooled = write_failure_alarm_spool(task_id, run_id, text, reasons, at)
         state_name = 'alerted' if spooled.get('delivery') == 'spooled' else 'alert-lost'
         return {**result, 'state': state_name, 'reasons': reasons, **spooled}

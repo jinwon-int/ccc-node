@@ -36,6 +36,11 @@ FAILURE_ALERT_AFTER_MAX = 1000
 CLASS_CHANGE_REALERT = ('auth_failed', 'cli_missing')
 CLASS_CHANGE_COOLDOWN_SEC = 24 * 3600
 NODE_MIN_DISTINCT_TASKS = 2
+# Node stale alarm (#1821 proposal 1): no prompt task has succeeded for this
+# many days while prompt runs keep failing. Same default as the ccc-doctor
+# check; CCC_AGENT_CRON_PROMPT_STALE_DAYS overrides, 0 disables.
+DEFAULT_PROMPT_STALE_DAYS = 7
+PROMPT_STALE_DAYS_MAX = 366
 NODE_TASK_IDS_MAX = 50
 
 # Provider/runner authentication failures, matched on stderr only. The model's
@@ -133,6 +138,54 @@ def resolve_threshold(task_value: Any, env_value: Any) -> int:
     if raw.isdigit():
         return min(int(raw), FAILURE_ALERT_AFTER_MAX)
     return DEFAULT_FAILURE_ALERT_AFTER
+
+
+def resolve_stale_days(env_value: Any) -> int:
+    """``CCC_AGENT_CRON_PROMPT_STALE_DAYS``; default 7, 0 disables, capped."""
+    raw = str(env_value or '').strip()
+    if raw.isdigit():
+        return min(int(raw), PROMPT_STALE_DAYS_MAX)
+    return DEFAULT_PROMPT_STALE_DAYS
+
+
+def stale_transition(prev: Any, *, failed: bool, at: str, last_success: str | None,
+                     first_run: str | None, days: int
+                     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Node "no prompt success for D days" alarm, once per stale stretch.
+
+    ``prev`` is the node state; only ``staleAlertedAt`` is read or written. A
+    prompt success clears it. A failing prompt run alerts when the newest
+    prompt success -- or, with none recorded, the oldest recorded prompt run --
+    is at least ``days`` old. This catches sparse tasks the consecutive
+    counters reach only after weeks; it cannot fire while no prompt run is
+    attempted at all (ccc-doctor's check covers a node that simply stopped).
+    """
+    state = dict(prev) if isinstance(prev, dict) else {}
+    if not failed:
+        state.pop('staleAlertedAt', None)
+        return state, None
+    alerted_epoch = _epoch(state.get('staleAlertedAt'))
+    success_epoch = _epoch(last_success)
+    if alerted_epoch is not None and success_epoch is not None and success_epoch > alerted_epoch:
+        # A prompt success this counter did not see (an opted-out task, or a
+        # lost state write) still ends the stale stretch.
+        state.pop('staleAlertedAt', None)
+    if days <= 0 or state.get('staleAlertedAt'):
+        return state, None
+    basis, since = (('last-success', last_success) if last_success
+                    else ('no-success-since-first-run', first_run))
+    now_epoch, since_epoch = _epoch(at), _epoch(since)
+    if now_epoch is None or since_epoch is None:
+        return state, None
+    # Strictly older than the window, in seconds -- the same boundary as the
+    # ccc-doctor check, so a weekly task's on-time run (exactly 7d00m) is not
+    # stale.
+    if now_epoch - since_epoch <= days * 86400:
+        return state, None
+    age_days = int((now_epoch - since_epoch) // 86400)
+    state['staleAlertedAt'] = at
+    return state, {'reason': 'stale', 'days': days, 'ageDays': age_days,
+                   'basis': basis, 'since': since}
 
 
 def trailing_failures(entries: Any) -> int:
@@ -268,7 +321,9 @@ def _id_list(ids: list[str], limit: int = 5) -> str:
 
 
 def alarm_text(task_id: str, task_event: dict[str, Any] | None,
-               node_event: dict[str, Any] | None, node_last_success: str | None) -> str:
+               node_event: dict[str, Any] | None, node_last_success: str | None,
+               stale_event: dict[str, Any] | None = None,
+               failure_class: str | None = None) -> str:
     """Owner text built only from task ids, enums, counts and timestamps.
 
     No stdout/stderr is ever included, so nothing here needs redaction.
@@ -291,6 +346,20 @@ def alarm_text(task_id: str, task_event: dict[str, Any] | None,
                      f"prompt-task failures across {len(ids)} tasks ({_id_list(ids)}), "
                      f"latest class={cls}; last prompt success: {node_last_success or 'none recorded'}")
         lines.append(NODE_HINTS.get(cls, NODE_HINTS['other']))
+    if stale_event:
+        firing = True
+        since = ('last prompt success: ' + stale_event['since']
+                 if stale_event['basis'] == 'last-success'
+                 else 'no prompt success recorded since the first prompt run at '
+                 + stale_event['since'])
+        cls = failure_class if failure_class in FAILURE_CLASSES else 'other'
+        lines.append(f"agent-cron stale alarm: no prompt task has succeeded for "
+                     f"{stale_event['ageDays']}d (threshold {stale_event['days']}d); "
+                     f"{since}; latest failure: task {task_id}, class={cls}")
+        # Another alarm on this run already carries its hint. Alone, the stale
+        # alarm may stand on a single failed task, so it uses the task wording.
+        if not (task_event or node_event):
+            lines.append(TASK_HINTS.get(cls, TASK_HINTS['other']))
     if task_event and task_event['reason'] == 'recovered':
         lines.append(f"agent-cron failure alarm cleared: task {task_id} succeeded after "
                      f"{task_event['consecutiveFailures']} consecutive failures "
@@ -303,4 +372,6 @@ def alarm_text(task_id: str, task_event: dict[str, Any] | None,
     if firing:
         lines.append('this alarm ignores the task notify setting; opt a task out '
                      'with failureAlertAfter=0')
+    if stale_event:
+        lines.append('turn the stale alarm off node-wide with CCC_AGENT_CRON_PROMPT_STALE_DAYS=0')
     return '\n'.join(lines)
