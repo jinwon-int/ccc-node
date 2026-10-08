@@ -24,7 +24,9 @@
 #                          (default: node <this dir>/a2a-task-handler.mjs)
 #
 # Exit code and stdout/stderr semantics are the handler contract's: result JSON
-# on stdout, exit 0 = terminal result, nonzero = retryable failure.
+# on stdout, exit 0 = terminal result, nonzero = failed task
+# (handler_exit_nonzero, exit code in details.code). The broker retries a
+# failed task only when its payload carries a retryPolicy (#1460).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,8 +63,8 @@ case "$intent" in
     # #1460: without this route the generic handler acked revise tasks and the
     # collect consumed the acks as invalid — the R2 lane was a dispatch-only
     # no-op. A node without the revise handler must fail LOUDLY here
-    # (handler_exit_nonzero, bounded by the broker requeue cap) so the
-    # failure is visible on the PR, never a silent ack.
+    # (handler_exit_nonzero; the revise dispatch sets no retryPolicy, so the
+    # task fails once) so the failure is visible on the PR, never a silent ack.
     if [ ! -x "$INTAKE_REVISE_HANDLER" ]; then
       log "revise handler not installed or not executable: $INTAKE_REVISE_HANDLER (revise-unsupported node)"
       exit 1
