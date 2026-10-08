@@ -28,6 +28,7 @@ from telegram_bot.utils.session_resource_guard import (
 from telegram_bot.utils.settings_heartbeat import HeartbeatSettingsMixin
 from telegram_bot.utils.settings_memory import MemorySettingsMixin
 from telegram_bot.utils.settings_voice import VoiceSettingsMixin
+from telegram_bot.utils.channel_environment import drop_blank_channel_selection
 from telegram_bot.utils.wrapper_environment import select_wrapper_environment
 
 BOT_PACKAGE_DIR = Path(__file__).resolve().parent.parent
@@ -136,7 +137,12 @@ class Config(
         effective environment (used by subprocess tests to isolate a node's
         real package ``.env``); ``bot_env_file`` still wins when passed.
         """
-        process_values = dict(os.environ if environ is None else environ)
+        # #2177: a provider child of a frontend carries blank selection keys
+        # (CCC_CHANNEL="" ...) because its transport could not delete them.
+        # Blank means unset, so a tool-shell load resolves the default channel.
+        process_values = drop_blank_channel_selection(
+            os.environ if environ is None else environ
+        )
         root_value = project_root if project_root is not None else process_values.get("PROJECT_ROOT")
         if root_value is None or not str(root_value).strip():
             raise ValueError("PROJECT_ROOT must be non-empty to load runtime settings")

@@ -195,7 +195,7 @@ def _configuration(settings: Settings) -> tuple[str, Path]:  # noqa: C901 -- pro
     protected = (Path(settings.bot_data_dir), Path(settings.session_store_path),
                  Path(settings.project_root) / ".telegram_bot",
                  Path(__file__).resolve().parents[1] / ".env",
-                 Path(os.environ.get("CCC_BOT_ENV_FILE", str(Path(__file__).resolve().parents[1] / ".env"))))
+                 Path(os.environ.get("CCC_BOT_ENV_FILE") or str(Path(__file__).resolve().parents[1] / ".env")))
     if any(cwd.is_relative_to(p.resolve()) or p.resolve().is_relative_to(cwd) for p in protected):
         raise ValueError("Danso workspace must not expose bridge configuration or session storage")
     _validate_authentication(settings, cwd)
