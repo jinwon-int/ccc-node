@@ -540,7 +540,7 @@ run "dg"
 okc "$RC" 1 "prepared job does not vouch for a foreign root"
 ok "foreign root with a job nearby is NONCANONICAL" 'grep -q "^NONCANONICAL dg runtime=/work/agent-codebench/ccc-node-pr833" "$OUT"'
 
-# A retry job (gongyung 2026-10-08): the first `<prep>/job` failed its receipt,
+# A retry job (a Termux node, 2026-10-08): the first `<prep>/job` failed its receipt,
 # the preparation was re-run into `<prep>/job2` and the bridge was handed that
 # one. Same source sibling, same preparation root — it must pass like `job`.
 reply_p dg "$TX/.ccc-node/preparations/main-e707baf-20261008/source" yes - "$TX/.ccc-node/preparations/main-e707baf-20261008/job2"

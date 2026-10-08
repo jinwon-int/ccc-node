@@ -169,8 +169,8 @@ is_canonical_root() {
 # `<prep>/job`, then hands the bridge to `start.sh --prepared-runtime <prep>/job`.
 # A preparation whose first job failed its receipt is re-run into a sibling
 # `<prep>/job2`, `<prep>/job3`, … and the bridge is handed that one instead
-# (gongyung 2026-10-08: `job` failed on native wheels, `job2` served — and was
-# paged NONCANONICAL because this check accepted the name `job` alone).
+# (a Termux node, 2026-10-08: `job` failed on native wheels, `job2` served —
+# and was paged NONCANONICAL because this check accepted the name `job` alone).
 # Accepted only when all three hold: the probe reported a completed job (its
 # receipt says ready), the job sits under a preparation root, and the serving
 # root is that job's own `source` sibling. Patterns, never resolved paths: the
