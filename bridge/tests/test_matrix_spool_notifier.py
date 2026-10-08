@@ -300,7 +300,7 @@ async def test_stale_fan_out_temp_files_are_swept(tmp_path: Path) -> None:
 # --- fleet alert relay mode (#2182): records go to the relay, never to the agent room ---
 
 def _relay_settings(tmp_path: Path, secret_file: Path | None = None, **over):
-    base = dict(push_fleet_relay_url="http://relay.ts:8795/v1/alerts", push_fleet_node="jingun")
+    base = dict(push_fleet_relay_url="http://relay.ts:8795/v1/alerts", push_fleet_node="node-a")
     if secret_file is not None:
         base["push_fleet_relay_secret_file"] = str(secret_file)
     base.update(over)
@@ -318,7 +318,7 @@ def _secret(tmp_path: Path) -> Path:
 class _FakeRelay:
     def __init__(self, fail: Exception | None = None) -> None:
         self.url = "http://relay.ts:8795/v1/alerts"
-        self.node = "jingun"
+        self.node = "node-a"
         self.fail = fail
         self.posted: list[dict] = []
 
@@ -333,17 +333,17 @@ async def test_relay_mode_posts_to_relay_and_never_to_the_agent_room(tmp_path: P
     settings = _relay_settings(tmp_path, _secret(tmp_path))
     t, enqueued = _transport({DIRECT: "direct"})
     notifier = MatrixSpoolNotifier(settings, t)
-    assert notifier.relay_mode and notifier._relay is not None and notifier._relay.node == "jingun"
+    assert notifier.relay_mode and notifier._relay is not None and notifier._relay.node == "node-a"
     relay = _FakeRelay()
     notifier._relay = relay
-    data = {"event": "SelfUpdate", "node": "jingun", "text": "업데이트 완료", "dedup": "SelfUpdate:x", "ts": "T"}
+    data = {"event": "SelfUpdate", "node": "node-a", "text": "업데이트 완료", "dedup": "SelfUpdate:x", "ts": "T"}
     _record(tmp_path, "a.json", data)
     (tmp_path / "spool" / "sent").mkdir(parents=True, exist_ok=True)
     await notifier._drain(DIRECT, tmp_path / "spool" / "sent")
     assert enqueued == [], "relay mode must not post into the owner/agent room"
     assert len(relay.posted) == 1
     p = relay.posted[0]
-    assert p["node"] == "jingun" and p["dedup"] == "jingun:SelfUpdate:x" and p["text"] == PushNotifier._format(data)
+    assert p["node"] == "node-a" and p["dedup"] == "node-a:SelfUpdate:x" and p["text"] == PushNotifier._format(data)
     assert (tmp_path / "spool" / "sent" / "a.json").exists()
 
 

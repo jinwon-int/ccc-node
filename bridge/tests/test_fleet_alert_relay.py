@@ -23,12 +23,12 @@ def test_sign_is_deterministic_and_verify_round_trips() -> None:
 
 
 def test_build_payload_namespaces_dedup_and_keeps_only_known_raw_keys() -> None:
-    data = {"ts": "2026-10-08T00:00:00Z", "event": "SelfUpdate", "node": "gwakga", "text": "x",
+    data = {"ts": "2026-10-08T00:00:00Z", "event": "SelfUpdate", "node": "node-a", "text": "x",
             "dedup": "SelfUpdate:pending-abc", "secret_looking": "nope"}
-    p = R.build_payload("gwakga", "r1.json", data, "[gwakga] formatted")
-    assert p["schema"] == R.SCHEMA and p["node"] == "gwakga" and p["record"] == "r1.json"
-    assert p["event"] == "SelfUpdate" and p["text"] == "[gwakga] formatted"
-    assert p["dedup"] == "gwakga:SelfUpdate:pending-abc"
+    p = R.build_payload("node-a", "r1.json", data, "[node-a] formatted")
+    assert p["schema"] == R.SCHEMA and p["node"] == "node-a" and p["record"] == "r1.json"
+    assert p["event"] == "SelfUpdate" and p["text"] == "[node-a] formatted"
+    assert p["dedup"] == "node-a:SelfUpdate:pending-abc"
     assert "secret_looking" not in p["raw"] and p["raw"]["event"] == "SelfUpdate"
     assert R.build_payload("n", "r", {"text": "t"}, "t")["dedup"] == ""
 
@@ -62,8 +62,8 @@ def test_relay_from_settings_off_without_url_and_fails_closed_without_secret(tmp
     f.write_text("k", encoding="utf-8")
     os.chmod(f, 0o600)
     relay = R.relay_from_settings(SimpleNamespace(
-        push_fleet_relay_url="http://relay:8795/v1/alerts", push_fleet_relay_secret_file=f, push_fleet_node="seoseo"))
-    assert relay is not None and relay.node == "seoseo" and relay.url.endswith("/v1/alerts")
+        push_fleet_relay_url="http://relay:8795/v1/alerts", push_fleet_relay_secret_file=f, push_fleet_node="node-b"))
+    assert relay is not None and relay.node == "node-b" and relay.url.endswith("/v1/alerts")
     with pytest.raises(ValueError, match="http"):
         R.FleetAlertRelay("ftp://x", "k", "n")
 
@@ -106,12 +106,12 @@ def server():
 
 
 def test_post_sends_signed_request_and_accepts_2xx(server: _Server) -> None:
-    relay = R.FleetAlertRelay(server.url, "k", "gwakga", clock=lambda: 1700000000.9)
+    relay = R.FleetAlertRelay(server.url, "k", "node-a", clock=lambda: 1700000000.9)
     relay.post({"schema": R.SCHEMA, "text": "hi"})
     assert len(server.requests) == 1
     req = server.requests[0]
     assert req["path"] == "/v1/alerts"
-    assert req["headers"][R.NODE_HEADER] == "gwakga"
+    assert req["headers"][R.NODE_HEADER] == "node-a"
     assert req["headers"][R.TIMESTAMP_HEADER] == "1700000000"
     assert R.verify("k", 1700000000, req["body"], req["headers"][R.SIGNATURE_HEADER])
     assert json.loads(req["body"])["text"] == "hi"
