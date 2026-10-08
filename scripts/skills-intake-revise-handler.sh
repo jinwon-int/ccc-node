@@ -9,14 +9,16 @@
 # code is kept in the task error's details.code. Exit codes (#1460):
 #   1 = environment / agent-run failure (missing tool, empty packet, the
 #       reviser agent crashed or timed out, ...)
-#   3 = deterministic result failure (HANDLER_FAIL on stderr: unparseable,
-#       ambiguous, unbound, unsafe or no-op revise result) — rerunning the same
-#       packet cannot help.
+#   3 = deterministic result failure the composer detected (HANDLER_FAIL on
+#       stderr: unparseable, ambiguous, unbound, unsafe or no-op revise
+#       result) — rerunning the same packet cannot help. An uncaught composer
+#       error still exits 1.
 # The broker retries a failed task only when its payload carries a retryPolicy
 # (planClassAwareTaskRetry → no_retry_policy). The skills_intake_revise
 # dispatch in ccc-skill-promotion.py sets none, so either code fails the task
 # once and the publisher consumes it once; the split only keeps the two causes
-# apart in the task record.
+# apart in the task record. A worker-side kill on timeout is reported as
+# handler_timeout, not handler_exit_nonzero.
 #
 # Security: the skill files, findings, and procedure in the packet are
 # UNTRUSTED MATERIAL. The reviser runs tool-blocked (the node's agent
@@ -140,10 +142,13 @@ fi
 [ -n "$model_out" ] || fail "empty reviser output"
 printf '%s' "$model_out" > "$tmp/model-out.txt"
 
+compose_rc=0
 task_result="$(python3 - "$tmp/model-out.txt" "$task_id" "$skill_name" "$tree_sha" "${round_no:-1}" "$reviser_agent" "$reviser_model_arg" "$tmp/task.json" <<'PYEOF'
 import json, os, sys
 
-raw = open(sys.argv[1], encoding="utf-8").read()
+# errors="replace": undecodable reviser bytes are an unparseable result
+# (die → exit 3 below), not a composer crash (exit 1).
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
 task_id, skill_name, tree, round_no, reviser_agent, reviser_model_arg = sys.argv[2:8]
 task_path = sys.argv[8]
 reviser_node = os.environ.get("WORKER_ID") or os.environ.get("A2A_WORKER_ID") or "unknown"
@@ -296,7 +301,7 @@ result = {
         "reviser_agent": reviser_agent,
         "reviser_model": reviser_model,
         "reviser_node": reviser_node,
-        "revise_round": int(round_no) if str(round_no).isdigit() else round_no,
+        "revise_round": int(round_no) if str(round_no).isascii() and str(round_no).isdigit() else round_no,
         "note": note,
     },
     "validations": [{

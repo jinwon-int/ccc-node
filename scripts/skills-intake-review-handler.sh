@@ -12,8 +12,9 @@
 #
 # Contract (a2a-broker-worker external handler): the full task JSON arrives on
 # stdin; this script prints the TaskResult JSON on stdout. Exit 0 = terminal
-# result; exit nonzero = retryable failure (handler_exit_nonzero — rerun/reroute
-# discipline applies).
+# result; exit nonzero = failed task (handler_exit_nonzero, exit code in
+# details.code). The broker retries it only when the task payload carries a
+# retryPolicy (#1460); rerun/reroute beyond that is an operator decision.
 #
 # Agent selection (worker/main alignment, owner decision 2026-08-30):
 #   REVIEW_AGENT_BIN   agent executable          (default: claude)

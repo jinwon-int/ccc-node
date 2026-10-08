@@ -223,7 +223,10 @@ case "\${REVIEW_STUB_MODE:-revised}" in
   prose)
     printf 'I revised the skill and it looks great now.'
     ;;
-  crash) exit 1 ;;
+  # exit 3 on purpose: the handler must report an agent crash as 1 (an
+  # environment failure), never pass the agent's own code through (#1460).
+  crash) exit 3 ;;
+  badutf8) printf '\377\376 not utf-8' ;;
 esac
 STUB
 chmod +x "$BIN/revise-stub-agent"
@@ -288,6 +291,16 @@ ok "prose-only reviser output is a deterministic handler failure (exit 3, #1460)
 make_revise_task
 REVIEW_STUB_MODE=crash run_revise_handler >/dev/null 2>&1; rc=$?
 ok "reviser agent crash is an environment failure (exit 1, not 3; #1460)" '[ "$rc" = 1 ]'
+
+make_revise_task
+REVIEW_STUB_MODE=badutf8 run_revise_handler >/dev/null 2>"$TMP/err-badutf8.txt"; rc=$?
+ok "undecodable reviser output is a deterministic result failure (exit 3, #1460)" \
+  '[ "$rc" = 3 ] && grep -q "HANDLER_FAIL" "$TMP/err-badutf8.txt"'
+
+make_revise_task
+compose_rc=3 REVIEW_STUB_MODE=revised run_revise_handler > "$TMP/out-envleak.json" 2>/dev/null; rc=$?
+ok "an inherited compose_rc cannot turn a valid revision into a failure (#1460)" \
+  '[ "$rc" = 0 ] && jq -e ".output.outcome == \"revised\"" >/dev/null "$TMP/out-envleak.json"'
 
 # non-revise intents stay rejected by the revise handler
 printf '{"id":"x","intent":"skills_intake_review","payload":{}}\n' | \
