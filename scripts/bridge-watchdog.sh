@@ -46,7 +46,7 @@ PROCESS_MATCH="${BRIDGE_WATCHDOG_PROCESS_MATCH:-python -m telegram_bot}"
 # `python -m telegram_bot --path $HOME` command line (CCC_CHANNEL=matrix, own
 # BOT_DATA_DIR), so a bare pgrep match counted it as "the Telegram bridge is
 # up" and the watchdog never restarted a dead Telegram bridge while Matrix was
-# healthy (daegyo, 2026-10-08). Apply bridge/start.sh's rule
+# healthy (a Termux node, 2026-10-08). Apply bridge/start.sh's rule
 # (_environ_bridge_channel): a process whose environ says CCC_CHANNEL=matrix
 # is a different service; unreadable environ, a missing key or any other value
 # means telegram -- the conservative reading, which never turns a live bridge
@@ -115,8 +115,19 @@ if [ -x "$START" ]; then
   # fd 9 and held the "start lock" for its whole life, so a healthy running
   # bridge logged "another start is in flight" whenever pgrep missed it
   # (a2a-termux-native-worker.sh closes its lock fd the same way).
-  bash "$START" --path "$HOME" --daemon >> "$LOG" 2>&1 9>&-
-  echo "[$(ts)] bridge watchdog: start.sh exit=$?" >> "$LOG"
+  #
+  # Start from a neutral channel (#2176/#2177): this script only ever restarts
+  # the Telegram bridge, but a crond launched from a Matrix provider shell
+  # passes that shell's CCC_CHANNEL=matrix (and the frontend's session/config
+  # paths) on to its jobs, which would make start.sh act on the Matrix channel
+  # -- or, with the #2177 guard, refuse every tick. `env -u` works on start.sh
+  # builds with and without --channel.
+  env -u CCC_CHANNEL -u SESSION_STORE_PATH -u CCC_BOT_ENV_FILE -u CCC_MATRIX_CONFIG_PATH \
+    bash "$START" --path "$HOME" --daemon >> "$LOG" 2>&1 9>&-
+  # Capture before the log line: `$(ts)` is a command substitution that resets
+  # $?, so the old `exit=$?` always logged 0 and hid start failures.
+  start_rc=$?
+  echo "[$(ts)] bridge watchdog: start.sh exit=$start_rc" >> "$LOG"
 else
   echo "[$(ts)] bridge watchdog: $START not found/executable" >> "$LOG"
 fi

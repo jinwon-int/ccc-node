@@ -17,7 +17,7 @@ STARTSTUB="$TMP/start.sh"
 MARKER="$TMP/restart.marker"
 cat > "$STARTSTUB" <<STUB
 #!/usr/bin/env bash
-echo "restart args: \$*" >> "$MARKER"
+echo "restart args: \$* channel=\${CCC_CHANNEL:-<unset>}" >> "$MARKER"
 exit 0
 STUB
 chmod +x "$STARTSTUB"
@@ -116,22 +116,25 @@ ok  "missing start.sh: logs not-found" 'grep -q "not found/executable" "$LOG"'
 # watchdog reads them exactly as it reads a live bridge.
 FAKE_MARK="__ccc_wd_fakebridge_$$_${RANDOM}__"
 FAKE_PIDS=()
-spawn_fake() { # $1 = matrix | telegram ; prints the pid
-  local p
+FAKE_LAST=""
+# A single process per stand-in: python3 keeps the marker in its own cmdline
+# (`bash -c 'sleep …'` forked a sleep that outlived the kill). The pid goes to
+# a global, not stdout, so the caller's FAKE_PIDS sees it (no subshell).
+spawn_fake() { # $1 = matrix | telegram ; sets FAKE_LAST
   if [ "$1" = matrix ]; then
-    env CCC_CHANNEL=matrix bash -c 'sleep 300; :' "$FAKE_MARK" >/dev/null 2>&1 &
+    env CCC_CHANNEL=matrix python3 -c 'import time; time.sleep(300)' "$FAKE_MARK" >/dev/null 2>&1 &
   else
-    env -u CCC_CHANNEL bash -c 'sleep 300; :' "$FAKE_MARK" >/dev/null 2>&1 &
+    env -u CCC_CHANNEL python3 -c 'import time; time.sleep(300)' "$FAKE_MARK" >/dev/null 2>&1 &
   fi
-  p=$!
-  FAKE_PIDS+=("$p")
-  printf '%s' "$p"
+  FAKE_LAST=$!
+  FAKE_PIDS+=("$FAKE_LAST")
 }
 reap_fakes() {
   local p
   for p in "${FAKE_PIDS[@]}"; do kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; done
   FAKE_PIDS=()
 }
+trap 'reap_fakes; rm -rf "$TMP"' EXIT
 run_wd_match() { # like run_wd, but the fallback matches the stand-in processes
   rm -f "$MARKER"
   local rc=0
@@ -148,23 +151,23 @@ run_wd_match() { # like run_wd, but the fallback matches the stand-in processes
 }
 stale_pidfile() { printf '%s' "$(dead_pid)" > "$PID_FILE"; touch -d '2000-01-01 00:00:00' "$PID_FILE"; }
 
-if [ -r "/proc/$$/environ" ]; then
+if [ -r "/proc/$$/environ" ] && command -v python3 >/dev/null 2>&1; then
   # Telegram down (stale bot.pid), only a Matrix frontend alive -> restart.
   stale_pidfile
-  matrix_pid="$(spawn_fake matrix)"; sleep 0.3
+  spawn_fake matrix; sleep 0.3
   okc "$(run_wd_match)" "matrix-only alive: exits 0"
   ok  "matrix-only alive: Telegram is judged down and restarted (#2176)" '[ -f "$MARKER" ]'
 
   # A Telegram-channel bridge alive alongside Matrix -> still healthy.
   stale_pidfile
-  spawn_fake telegram >/dev/null; sleep 0.3
+  spawn_fake telegram; sleep 0.3
   okc "$(run_wd_match)" "telegram alive next to matrix: exits 0"
   ok  "telegram alive next to matrix: does NOT restart" '[ ! -f "$MARKER" ]'
   reap_fakes
 
   # bot.pid recycled onto the live Matrix frontend -> not proof of Telegram.
-  matrix_pid="$(spawn_fake matrix)"; sleep 0.3
-  printf '%s' "$matrix_pid" > "$PID_FILE"; touch -d '2000-01-01 00:00:00' "$PID_FILE"
+  spawn_fake matrix; sleep 0.3
+  printf '%s' "$FAKE_LAST" > "$PID_FILE"; touch -d '2000-01-01 00:00:00' "$PID_FILE"
   okc "$(run_wd_match)" "bot.pid on matrix pid: exits 0"
   ok  "bot.pid on matrix pid: Telegram is judged down and restarted" '[ -f "$MARKER" ]'
 
@@ -176,9 +179,26 @@ if [ -r "/proc/$$/environ" ]; then
   ok  "unreadable environ: treated as telegram, does NOT restart" '[ ! -f "$MARKER" ]'
   unset WD_PROC_ROOT
   reap_fakes
+
+  # Watchdog launched with a Matrix shell's environment (e.g. a crond started
+  # there): start.sh must still be called for the Telegram channel.
+  stale_pidfile
+  CCC_CHANNEL=matrix SESSION_STORE_PATH=/nonexistent/sessions.json run_wd_match >/dev/null
+  ok  "matrix caller env: restart still attempted" '[ -f "$MARKER" ]'
+  ok  "matrix caller env: start.sh gets no inherited CCC_CHANNEL" 'grep -q "channel=<unset>" "$MARKER"'
 else
-  echo "SKIP: channel filter cases (no readable /proc/<pid>/environ on this host)"
+  echo "SKIP: channel filter cases (needs readable /proc/<pid>/environ and python3)"
 fi
+
+# ---- start.sh exit code is logged, not masked by $(ts) -----------------------
+FAILSTUB="$TMP/start-fail.sh"
+printf '#!/usr/bin/env bash\nexit 3\n' > "$FAILSTUB"; chmod +x "$FAILSTUB"
+rm -f "$PID_FILE"; : > "$LOG"
+HOME="$TMP" BRIDGE_WATCHDOG_LOG="$LOG" BRIDGE_WATCHDOG_PID_FILE="$PID_FILE" \
+  BRIDGE_WATCHDOG_START="$FAILSTUB" BRIDGE_WATCHDOG_LOCK="$TMP/wd-rc.lock" \
+  BRIDGE_WATCHDOG_PROCESS_MATCH="__ccc_wd_no_such_process_zzz__" \
+  bash "$WD" >/dev/null 2>&1
+ok  "failed start: logs the real start.sh exit code" 'grep -q "start.sh exit=3" "$LOG"'
 
 # ---- unset HOME (cron/systemd context) -> still runs -------------------------
 # Regression (#869 sweep): every default below `set -u` dereferenced $HOME, so
