@@ -3,6 +3,10 @@
 # and a virtual clock. No live process lookup, signals, services or bot calls.
 # harness: umask-rerun
 set -uo pipefail
+# A caller running from a Matrix provider shell inherits CCC_CHANNEL=matrix and
+# that frontend's settings; start.sh then refuses lifecycle actions (#2177).
+# These suites exercise the Telegram bridge, so start from a neutral channel.
+unset CCC_CHANNEL SESSION_STORE_PATH CCC_BOT_ENV_FILE BOT_DATA_DIR LOGS_DIR ${!CCC_MATRIX_@}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

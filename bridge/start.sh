@@ -208,11 +208,13 @@ Options:
   --prepared-runtime <dir>  Use a sealed preparation job without installing dependencies
   --recovery-source <dir>   Previous bridge source for one opt-in recovery attempt
   --recovery-runtime <dir>  Previous preparation job (requires prepared --restart)
-  --channel <name>    Bridge channel to act on: telegram | matrix. Overrides an
-                      inherited CCC_CHANNEL (and drops that channel's
-                      SESSION_STORE_PATH / CCC_BOT_ENV_FILE / CCC_MATRIX_*).
-                      Required to start/stop/restart with CCC_CHANNEL=matrix
-                      (exit 7 otherwise) -- see #2177.
+  --channel <name>    Channel this command targets: telegram | matrix. Overrides
+                      an inherited CCC_CHANNEL and drops the other channel's
+                      SESSION_STORE_PATH / CCC_BOT_ENV_FILE / CCC_MATRIX_*.
+                      start.sh manages only the Telegram bridge: start/stop/
+                      restart resolving to matrix (inherited or --channel
+                      matrix) exit 10; restart the Matrix service instead.
+                      --status works for both. See #2177.
   --debug             Enable debug/verbose logging
   --status            Show whether the bot is running
   --stop              Stop the running bot
@@ -1239,7 +1241,7 @@ cleanup_token_lock_if_safe() {
 #   4  not-available-within-timeout
 #   5  self-invoked       (caller is inside the target bridge process tree)
 #   6  refused before stop (preflight, prepared runtime, invalid window value)
-#   7  channel-unconfirmed (inherited CCC_CHANNEL=matrix without --channel; #2177)
+#  10  wrong-channel     (resolves to matrix: start.sh manages only Telegram; #2177)
 #
 # Operator knobs (#1868; defaults preserve production behavior):
 #   CCC_BRIDGE_RESTART_READY_TIMEOUT  seconds to wait for "available" (90;
@@ -1486,8 +1488,6 @@ do_restart() {
         [ "$DAEMON_MODE" -eq 1 ] && daemon_hint=" -d"
         echo "⚠️  Restart refused: this command is running inside the target bridge process tree."
         echo "   owner=target-bridge caller=descendant action=refused-before-stop target-channel=$(_this_bridge_channel)"
-        echo "   A provider shell inherits its bridge's CCC_CHANNEL; leaving the process tree alone keeps that"
-        echo "   channel. If you meant the Telegram bridge, pass --channel telegram (#2177)."
         echo "   Stopping it here would terminate the restart driver before start/readiness verification."
         echo "💡 Re-run from a shell outside the bridge tree:"
         echo "   systemctl${scope_flag} restart $unit    # systemd installation"
@@ -1724,18 +1724,18 @@ fi
 # plus that frontend's SESSION_STORE_PATH / CCC_MATRIX_* settings. Running a
 # Telegram restart there made start.sh act on the Matrix channel: it stopped
 # the live Matrix frontend and launched a second Matrix frontend that crash-
-# looped on the MatrixStore lock (gongyung, 2026-10-08). The Matrix frontend is
+# looped on the MatrixStore lock (a Termux node, 2026-10-08). The Matrix frontend is
 # never started through start.sh (systemd/runit exec python directly), so a
-# lifecycle action that resolves to matrix without an explicit --channel is
-# refused. --channel overrides the inherited channel and drops the other
-# channel's scoped settings so they cannot leak into the started bridge.
+# lifecycle action that resolves to matrix (inherited or --channel matrix) is
+# refused (exit 10). --channel telegram overrides the inherited channel and
+# drops the Matrix-scoped settings so they cannot leak into the started bridge.
 _CHANNEL_SCOPED_VARS="SESSION_STORE_PATH CCC_BOT_ENV_FILE"
 apply_requested_channel() {
     local inherited var
     [ -n "$REQUESTED_CHANNEL" ] || return 0
     inherited="$(_this_bridge_channel)"
     if [ "$REQUESTED_CHANNEL" != "$inherited" ]; then
-        for var in $_CHANNEL_SCOPED_VARS $(compgen -e | grep '^CCC_MATRIX_' || true); do
+        for var in $_CHANNEL_SCOPED_VARS ${!CCC_MATRIX_@}; do
             unset "$var"
         done
         echo "🔀 Channel: inherited $inherited -> requested $REQUESTED_CHANNEL (dropped inherited channel settings)"
@@ -1747,17 +1747,20 @@ apply_requested_channel() {
     fi
 }
 guard_inherited_channel() {
+    local source="inherited CCC_CHANNEL=matrix"
     [ "$INTERNAL_RUN" -eq 0 ] || return 0
-    [ -z "$REQUESTED_CHANNEL" ] || return 0
     case "$ACTION" in run|stop|restart) ;; *) return 0 ;; esac
     [ "$(_this_bridge_channel)" = matrix ] || return 0
-    echo "❌ Refused: action=$ACTION target-channel=matrix (inherited CCC_CHANNEL=matrix, no --channel)."
-    echo "   This shell inherited the Matrix frontend's environment (e.g. a provider shell of the"
-    echo "   Matrix bridge). start.sh would act on the Matrix channel, not the Telegram bridge."
+    [ "$REQUESTED_CHANNEL" = matrix ] && source="--channel matrix"
+    # start.sh's state is Telegram's whatever the channel (BOT_DATA_DIR is
+    # always <path>/.telegram_bot: pid, supervisor and token-lock files), so
+    # acting "as matrix" would stop or shadow the Telegram bridge as well.
+    echo "❌ Refused: action=$ACTION target-channel=matrix ($source)."
+    echo "   start.sh manages only the Telegram bridge; the Matrix frontend runs under its own"
+    echo "   service. A provider shell of the Matrix bridge inherits CCC_CHANNEL=matrix."
     echo "💡 Telegram bridge:  $0 --path \"$PROJECT_ROOT\" --$( [ "$ACTION" = run ] && echo daemon || echo "$ACTION" ) --channel telegram"
-    echo "   Matrix frontend:  restart its service (systemctl restart ccc-matrix-bridge / sv restart ccc-matrix-bridge),"
-    echo "                     or pass --channel matrix if you really mean start.sh to manage it."
-    exit 7
+    echo "   Matrix frontend:  systemctl restart ccc-matrix-bridge  (Termux: sv restart ccc-matrix-bridge)"
+    exit 10
 }
 apply_requested_channel
 guard_inherited_channel
