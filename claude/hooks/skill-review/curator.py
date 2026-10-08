@@ -21,7 +21,8 @@ Scope and safety contract:
   ledger ``skill-usage/usage.jsonl``. Either one showing use in the window
   keeps a skill active; a missing ledger falls back to the other; when
   neither has recorded any use (or usage.jsonl is unreadable) no idle
-  transition is made.
+  transition is made. The ``--auto`` min-idle gate uses the same union: a
+  recent use in either ledger defers the run.
 - Telemetry is body-free: counters, ISO timestamps and state flags only. Bump
   is fail-open (telemetry failure never blocks a foreground skill call);
   lifecycle mutations are fail-closed when telemetry/provenance is unreadable.
@@ -1501,7 +1502,20 @@ def _decide_mark_only(
     return "keep", "stale-observing"
 
 
-def _node_recently_active(usage: dict[str, Any], now: datetime, min_idle_hours: int) -> bool:
+def _node_recently_active(
+    usage: dict[str, Any],
+    now: datetime,
+    min_idle_hours: int,
+    ledger_uses: dict[str, datetime] | None = None,
+) -> bool:
+    """Whether any skill was active within ``min_idle_hours`` (#1739).
+
+    Judged on the same UNION as the stale decision: the Skill-tool record in
+    ``skill-autosave-usage.json`` and the latest per-skill use in
+    ``usage.jsonl`` (``ledger_uses``). A use recorded in either ledger keeps
+    the auto run deferred. An unreadable usage.jsonl contributes nothing here;
+    its ``unreadable`` evidence already holds every idle transition.
+    """
     if min_idle_hours <= 0:
         return False
     floor = now - timedelta(hours=min_idle_hours)
@@ -1509,7 +1523,7 @@ def _node_recently_active(usage: dict[str, Any], now: datetime, min_idle_hours: 
         activity = _last_activity(record)
         if activity is not None and activity > floor:
             return True
-    return False
+    return any(when > floor for when in (ledger_uses or {}).values())
 
 
 def _run_auto_skip(
@@ -1701,13 +1715,17 @@ def _command_run(context, *, dry_run: bool, auto: bool) -> dict[str, Any]:
         if recoveries:
             report["recoveries"] = recoveries
         _sync_patches_from_ledger(context, usage, ledger_rows=ledger_rows)
-        if auto and _node_recently_active(usage, now, config["min_idle_hours"]):
+        # Read usage.jsonl before the idle gate so the gate and the stale
+        # decision judge the same ledger union (#1739).
+        ledger_status, ledger_uses = _read_usage_ledger(context)
+        if auto and _node_recently_active(
+            usage, now, config["min_idle_hours"], ledger_uses
+        ):
             _save_usage(context, usage)
             report["skipped"] = "node-active-within-min-idle"
             return report
         controls = ownership._preload_controls(context)
         created_index = _ledger_created_index(context, ledger_rows)
-        ledger_status, ledger_uses = _read_usage_ledger(context)
         evidence = _usage_evidence(usage, ledger_status)
         report["usage_ledgers"] = {"usage_jsonl": ledger_status, "evidence": evidence}
         classifications: dict[str, dict[str, Any]] = {}

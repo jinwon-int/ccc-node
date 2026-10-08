@@ -238,7 +238,14 @@ def retry_view(task, at):
     }
 
 
-def apply_retry_transition(task, scheduled_at, attempt, run_id, status, at):
+# Failure classes a timed retry cannot fix (#1821): a rejected credential or a
+# missing/non-executable CLI fails the same way minutes later, so retrying only
+# burns attempts and delays the consecutive-failure alarm. The next regular
+# schedule occurrence still runs; only the backoff retry is skipped.
+NON_RETRYABLE_FAILURE_CLASSES = frozenset({'auth_failed', 'cli_missing'})
+
+
+def apply_retry_transition(task, scheduled_at, attempt, run_id, status, at, failure_class=None):
     if status == 'success':
         existed = 'retryState' in task
         task.pop('retryState', None)
@@ -255,6 +262,19 @@ def apply_retry_transition(task, scheduled_at, attempt, run_id, status, at):
         task.pop('retryState', None)
         return {'cleared': existed, 'attempt': attempt, 'retryEligibleAt': None, 'exhausted': False, 'noPolicy': True}
     policy = retry_policy(task)
+    if failure_class in NON_RETRYABLE_FAILURE_CLASSES:
+        # Same shape as exhaustion (retryEligibleAt=None) so every reader --
+        # retry_view, due, health -- already treats it as "no retry pending";
+        # lastStatus records why. The store schema forbids extra retryState keys.
+        task['retryState'] = {
+            'scheduledAt': scheduled_at,
+            'attempt': attempt,
+            'retryEligibleAt': None,
+            'lastStatus': 'not-retryable',
+            'lastRunId': run_id,
+        }
+        return {'cleared': False, 'attempt': attempt, 'retryEligibleAt': None, 'exhausted': True,
+                'notRetryable': failure_class, 'policy': policy}
     if attempt >= policy['maxAttempts']:
         task['retryState'] = {
             'scheduledAt': scheduled_at,
