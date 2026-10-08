@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # nunchi SessionStart injection (#816).
 # Prints the latest peer_facts snapshot so it lands in session context.
-# Fail-open, fast (<1s): never blocks session start; byte-capped at 3000.
+# Fail-open: never blocks session start; byte-capped at 3000. Typically ~1s on
+# a phone node (assemble + task query + injection scan, #2191; hook timeout 5s).
 # No-op unless nunchi is enabled (state/nunchi.mode=on or CCC_NUNCHI_MODE=on).
 #
 # Snapshot regeneration is asynchronous (background) when stale (#893):
@@ -42,13 +43,13 @@ inject_legacy() { head -c 3000 "$SNAP" 2>/dev/null || true; }
 # (credential redaction + prompt-injection neutralization). Run it through
 # bash — exec'ing its `#!/usr/bin/env` shebang dies with 126 on Termux
 # (#1157). Fail-open like load-memory.sh, but say so on stderr (#1160).
-scan_block() { # <text>
-  local text="$1" scanned
+scan_block() { # <text> [max-bytes]
+  local text="$1" cap="${2:-}" scanned
   if [ ! -f "$HOOKDIR/scan-injection.sh" ]; then
     printf '%s\n' "$text"
     return
   fi
-  if scanned="$(printf '%s' "$text" | bash "$HOOKDIR/scan-injection.sh" nunchi 2>/dev/null)"; then
+  if scanned="$(printf '%s' "$text" | bash "$HOOKDIR/scan-injection.sh" nunchi "$cap" 2>/dev/null)"; then
     printf '%s\n' "$scanned"
   else
     printf 'nunchi sessionstart: scan-injection failed; injecting UNSCANNED block\n' >&2
@@ -56,8 +57,28 @@ scan_block() { # <text>
   fi
 }
 
+# ccc-memory-query.sh always prints a labelled line ("task: current task;
+# node: <host>; cwd: <path>; git_branch: ...") — fine for Wiki prefetch, but
+# as an FTS hint the labels, the node name and the "current task" placeholder
+# match generic facts and reorder the few fact slots (#2193 review). Keep only
+# the real task text and the git branch / changed paths.
+hint_terms() { # <query-line>
+  local raw="$1" out="" field key val IFS=';'
+  for field in $raw; do
+    field="${field# }"; key="${field%%:*}"; val="${field#*: }"
+    [ "$key" = "$field" ] && continue
+    case "$key" in
+      task) [ "$val" = "current task" ] || out="$out $val" ;;
+      git_branch|git_changed_paths) out="$out $val" ;;
+    esac
+  done
+  printf '%s' "${out# }"
+}
+
+cap=""
 if [ "${CCC_NUNCHI_ASSEMBLE:-1}" = "0" ] || [ "${CCC_NUNCHI_ASSEMBLE:-1}" = "false" ]; then
   block="$(inject_legacy)"
+  cap=3000
 else
   # #2191: was `"$d" --mode local` — it executed the DIRECTORY, and looked in
   # a scripts/ dir the deployed tree does not have, so the task hint was
@@ -65,15 +86,16 @@ else
   hint=""
   if command -v find_memory_tool >/dev/null 2>&1 \
       && query_tool="$(find_memory_tool ccc-memory-query.sh 2>/dev/null)"; then
-    hint="$(bash "$query_tool" --mode local 2>/dev/null || true)"
+    hint="$(hint_terms "$(bash "$query_tool" --mode local 2>/dev/null || true)")"
   fi
   [ -n "$hint" ] || hint="$(cat "${STATE}/current-task.txt" 2>/dev/null || true)"
   if ! block="$(python3 "$HERE/nunchi.py" assemble \
        --budget "${CCC_NUNCHI_ASSEMBLE_BUDGET:-3000}" --hint "$hint" 2>/dev/null)"; then
     block="$(inject_legacy)"
+    cap=3000
   fi
 fi
-[ -n "$block" ] && scan_block "$block"
+[ -n "$block" ] && scan_block "$block" "$cap"
 
 # Regenerate asynchronously if stale (>15min); cron refreshes every 10min normally.
 # The background refresh updates the snapshot for the next session; this session

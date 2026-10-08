@@ -20,6 +20,8 @@ STATE="$TMP/state"
 # CCC_MEMORY_AUDIENCE_SCOPED=0 explicitly: the ambient value on live nodes is
 # 1, and sessionstart.sh exits 0 for the global snapshot on scoped nodes (the
 # scoped lanes inject their own per-scope snapshot).
+# The injection scanner audits hits; keep test events out of the real log.
+export CCC_AUDIT_LOG="$TMP/audit.jsonl"
 export CCC_STATE_DIR="$STATE" CCC_NUNCHI_MODE=on CCC_NODE=nosuk CCC_MEMORY_AUDIENCE_SCOPED=0
 mkdir -p "$NUNCHI_HOME" "$STATE"
 
@@ -47,7 +49,7 @@ PY
 # task-conditioned hint source: stub mirrors ccc-memory-query.sh --mode local
 QBINDIR="$TMP/qbin"; mkdir -p "$QBINDIR"
 write_exec_stub "$QBINDIR/ccc-memory-query.sh" <<'STUB'
-printf 'HINTED-DECISION 직접 연결'
+printf 'task: HINTED-DECISION 직접 연결; node: n1; cwd: /w'
 STUB
 export CCC_MEMORY_TOOLS_DIR="$QBINDIR"
 
@@ -92,16 +94,16 @@ PY
 # A shebang that cannot exec anywhere: only a `bash <tool>` call can run it
 # (the Termux /usr/bin/env 126 case, #1157).
 QBIN2="$TMP/qbin2"; mkdir -p "$QBIN2"
-printf '#!/nonexistent/interpreter\nprintf "called" > "%s/query-called"\nprintf "HINTED-DECISION 직접 연결"\n' "$TMP" > "$QBIN2/ccc-memory-query.sh"
+printf '#!/nonexistent/interpreter\nprintf "called" > "%s/query-called"\nprintf "task: HINTED-DECISION 직접 연결; node: n1; cwd: /w"\n' "$TMP" > "$QBIN2/ccc-memory-query.sh"
 chmod +x "$QBIN2/ccc-memory-query.sh"
 out="$(CCC_MEMORY_TOOLS_DIR="$QBIN2" bash "$HERE/sessionstart.sh" 2>/dev/null)"
 ok "query tool is run via bash (non-exec shebang still works, #2191)" '[ -f "$TMP/query-called" ]'
 ok "hint reaches assemble: older hinted decision beats newer filler (#2191)" 'grep -q "HINTED-DECISION" <<<"$out"'
 QBIN3="$TMP/qbin3"; mkdir -p "$QBIN3"
-printf '#!/nonexistent/interpreter\nprintf "UNRELATED-TOPIC 날씨"\n' > "$QBIN3/ccc-memory-query.sh"; chmod +x "$QBIN3/ccc-memory-query.sh"
+printf '#!/nonexistent/interpreter\nprintf "task: current task; node: n1; cwd: /w"\n' > "$QBIN3/ccc-memory-query.sh"; chmod +x "$QBIN3/ccc-memory-query.sh"
 # shellcheck disable=SC2034  # read via eval inside ok()
 out_nohint="$(CCC_MEMORY_TOOLS_DIR="$QBIN3" bash "$HERE/sessionstart.sh" 2>/dev/null)"
-ok "control: an unrelated hint lets the newer filler crowd the decision out" '! grep -q "HINTED-DECISION" <<<"$out_nohint"'
+ok "placeholder-only query yields no hint, so newer facts win (#2193 review P2)" '! grep -q "HINTED-DECISION" <<<"$out_nohint"'
 out="$(CCC_MEMORY_TOOLS_DIR="$QBIN2" CCC_NUNCHI_ASSEMBLE_BUDGET=20000 bash "$HERE/sessionstart.sh" 2>/dev/null)"
 ok "injected block passes scan-injection (#2191)" \
   'grep -q "INJECT-PROBE" <<<"$out" && grep -q "REDACTED:prompt-injection" <<<"$out" && ! grep -qi "ignore all previous instructions" <<<"$out"'
@@ -109,6 +111,15 @@ ok "injected block passes scan-injection (#2191)" \
 # shellcheck disable=SC2034  # read via eval inside ok()
 out="$(CCC_NUNCHI_ASSEMBLE=0 bash "$HERE/sessionstart.sh" 2>/dev/null)"
 ok "legacy path is scanned too" 'grep -q "LEGACY-PROBE" <<<"$out" && ! grep -qi "ignore all previous instructions" <<<"$out"'
+
+# hint_terms keeps only the real task text and git context.
+# shellcheck disable=SC2034  # read via eval inside ok()
+ht="$(bash -c '. "$1"; hint_terms "task: current task; node: n1; cwd: /x; git_branch: fix/a-b; git_changed_paths: a.sh b.py"' _ <(sed -n '/^hint_terms()/,/^}/p' "$HERE/sessionstart.sh"))"
+ok "hint_terms drops labels, node, cwd and the placeholder" '[ "$ht" = "fix/a-b a.sh b.py" ]'
+ok "test scanner events stay out of the real audit log" '[ -s "$TMP/audit.jsonl" ]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+legacy_bytes="$(CCC_NUNCHI_ASSEMBLE=0 bash "$HERE/sessionstart.sh" 2>/dev/null | wc -c)"
+ok "legacy path keeps its 3000-byte cap after scanning" '[ "$legacy_bytes" -le 3001 ]'
 
 echo "----"
 echo "PASS=$pass FAIL=$fail"
