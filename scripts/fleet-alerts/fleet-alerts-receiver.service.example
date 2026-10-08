@@ -1,0 +1,37 @@
+# Fleet alert relay receiver (#2182) — systemd unit example for the relay host.
+#
+# Install: copy to /etc/systemd/system/fleet-alerts-receiver.service, set the
+# Tailscale bind address, `systemctl daemon-reload && systemctl enable --now
+# fleet-alerts-receiver`. Prerequisites (see scripts/fleet-alerts/README.md):
+#   install -d -m 0700 /etc/fleet-alerts/nodes /var/lib/fleet-alerts
+#   # one owner-only secret file per node: /etc/fleet-alerts/nodes/<node> (0600)
+# The bind address must be Tailscale-internal; never expose this on a public
+# interface. Nodes point CCC_PUSH_FLEET_RELAY_URL at http://<bind>/v1/alerts.
+[Unit]
+Description=Fleet alert relay receiver (signed POST from node bridges -> owner-only queue)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ccc-node/scripts/fleet-alerts
+Environment=PYTHONPATH=/opt/ccc-node/.github/pythonpath
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/ccc-node/scripts/fleet-alerts/fleet_alerts_receiver.py \
+  --bind <tailscale-ip>:8795 \
+  --secrets-dir /etc/fleet-alerts/nodes \
+  --queue /var/lib/fleet-alerts/queue
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/fleet-alerts
+
+[Install]
+WantedBy=multi-user.target
