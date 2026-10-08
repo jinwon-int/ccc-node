@@ -552,6 +552,9 @@ def run_single_db():
             "SELECT id, observed, kind, fact, because, source_refs,"
             " mutability, created_at FROM peer_facts"
             " WHERE valid_to IS NULL AND review=0 AND supersedes IS NULL"
+            # #2186: auto-distill rows reach agents through nunchi injection;
+            # the human Wiki-candidate queue is the path #2186 retired.
+            " AND COALESCE(evidence, '') NOT LIKE 'auto-distill:%'"
             " ORDER BY created_at ASC, id ASC").fetchall()
         conn.close()
 

@@ -189,8 +189,10 @@ condition that V2 automatic promotion needs separate owner approval.
   runbook → `procedure`; text and first quote are secret-redacted with the
   extractor's patterns (`jevlib/redact.py`) and the feed refuses to run without
   them; rows are tagged `evidence = auto-distill:...`;
-- injection: `assemble` labels those rows `·auto` and caps them at
-  `NUNCHI_AUTO_DISTILL_SHARE` of the budget (default 0.33);
+- injection: `assemble` and `snapshot` (Codex / fallback) label those rows
+  `·auto` and cap them at `NUNCHI_AUTO_DISTILL_SHARE` (default 0.33) of the
+  fact block / snapshot rows; tagged rows never run nunchi's G1 auto-close or
+  G3 conflict flag and never enter `wiki-promote`'s human queue;
 - opt-in per node: `NUNCHI_AUTO_DISTILL_FEED=1` or
   `$CCC_STATE_DIR/nunchi.auto-distill-feed` containing `on`; never in
   audience-scoped mode. The first run starts at the end of the log;

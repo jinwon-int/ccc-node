@@ -168,5 +168,82 @@ printf '{"session_id":"x1","evidence_source":"evil","honcho":[{"kind":"procedure
 ok "unknown evidence_source is not used as a tag" \
   '[ "$(rows "select count(*) from peer_facts where fact like '"'"'%UNKNOWN-SOURCE%'"'"' and evidence like '"'"'distill:%'"'"'")" = 1 ]'
 
+# ---- 12. review fixes (#2189 adversarial review) ---------------------------
+# Fresh DB for these cases.
+export NUNCHI_DB="$NUNCHI_HOME/review.db"; python3 "$NP" init >/dev/null 2>&1
+echo on > "$CCC_STATE_DIR/nunchi.auto-distill-feed"
+rm -f "$STATE"; : > "$LOG"
+feed >/dev/null   # initialise at EOF
+python3 - "$TMP/sessions/g1.jsonl" >> "$LOG" <<'PY'
+import json, sys
+open(sys.argv[1], "w").write('{"type":"user"}\n')
+print(json.dumps({"session": "g1", "path": sys.argv[1], "kept": [
+    {"title": "gpu 러너", "kind": "config", "fact": "gpu 러너 롤아웃 배포 완료 확인함",
+     "_evidence_text": "['assistant: 배포 완료']"}]}, ensure_ascii=False))
+PY
+feed >/dev/null
+printf '{"session_id":"conv1","honcho":[{"kind":"context","subject":"node","text":"gpu 러너 롤아웃 재배포 진행 중"}]}' \
+  | python3 "$NP" ingest - >/dev/null
+cp "$LOG" "$LOG.new" && mv "$LOG.new" "$LOG"   # rotation → the auto row is re-fed
+feed >/dev/null
+ok "re-fed auto row never closes a newer conversation fact (P1-a)" \
+  '[ "$(rows "select count(*) from peer_facts where fact like '"'"'%재배포 진행 중%'"'"' and valid_to is null")" = 1 ]'
+ok "re-fed auto row stores no duplicate" \
+  '[ "$(rows "select count(*) from peer_facts where fact like '"'"'%배포 완료 확인함%'"'"'")" = 1 ]'
+ok "auto rows are never G3-flagged for review" \
+  '[ "$(rows "select count(*) from peer_facts where evidence like '"'"'auto-distill:%'"'"' and review=1")" = 0 ]'
+ok "valid_from is the session time, not the feed time" \
+  '[ "$(rows "select count(*) from peer_facts where evidence like '"'"'auto-distill:%'"'"' and valid_from like '"'"'20%Z'"'"'")" -ge 1 ]'
+
+python3 - "$NUNCHI_DB" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+ins = ("INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,dedup,created_at,source_rank,review,mutability)"
+       " VALUES ('family-assistant','daegyo',?,?,?,'2026-10-08T00:00:00Z',?,'2026-10-08T00:00:00Z',1,0,?)")
+for i in range(5):
+    c.execute(ins, ("procedure", f"대화 기억 CONV{i}", f"distill:c{i}", f"c{i}", "static"))
+for i in range(30):
+    c.execute(ins, ("context", f"자동 사실 AUTO{i}", f"auto-distill:distill:a{i}", f"a{i}", "live-check"))
+for i in range(12):
+    c.execute(ins, ("constraint", f"제약 규칙 {i} " + "나" * 60, f"distill:k{i}", f"k{i}", "static"))
+c.commit()
+PY
+snap="$(python3 "$NP" snapshot 25)"
+ok "snapshot labels and caps auto rows (P1-b)" \
+  '[ "$(grep -c "·auto" <<<"$snap")" -le 8 ] && [ "$(grep -c "·auto" <<<"$snap")" -ge 1 ] && [ "$(grep -c "CONV" <<<"$snap")" = 5 ]'
+asmc="$(python3 "$NP" assemble --budget 3000)"
+ok "assemble keeps conversation memory beside a long constraint list (P2-a)" 'grep -q "CONV" <<<"$asmc"'
+
+out="$(feed --backfill-days 7)"
+ok "backfill on an initialised feed says it was ignored (P2-b)" 'grep -q "backfill-days ignored" <<<"$out"'
+python3 - "$NUNCHI_HOME/.auto-distill-feed.lock" <<'PY' &
+import fcntl, sys, time
+fh = open(sys.argv[1], "a"); fcntl.flock(fh, fcntl.LOCK_EX); time.sleep(4)
+PY
+sleep 1
+out="$(feed)"
+wait
+ok "a concurrent run skips instead of double-feeding (P2-b)" 'grep -q "another run holds the lock" <<<"$out"'
+
+printf '{"offset":"junk","inode":1}' > "$STATE"
+out="$(feed)"; rc=$?
+ok "corrupt state restarts cleanly (P3)" '[ "$rc" = 0 ] && grep -q "initialised at end of log" <<<"$out"'
+
+record poison1 INDIA >> "$LOG"
+for _ in 1 2 3; do python3 "$FEED" --log "$LOG" --state "$STATE" --state-dir "$CCC_STATE_DIR" --nunchi-py /nonexistent/nunchi.py >/dev/null 2>"$TMP/poison.err"; done
+ok "a record failing ingest 3 ticks in a row is skipped, not stuck (P3)" \
+  'grep -q "skipping record" "$TMP/poison.err" && python3 -c "import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if d[\"offset\"]==__import__(\"os\").path.getsize(sys.argv[2]) else 1)" "$STATE" "$LOG"'
+
+mkdir -p "$TMP/wp-cache"
+CCC_MEMORY_CACHE_DIR="$TMP/wp-cache" python3 "$ROOT/claude/hooks/nunchi/wiki-promote.py" >/dev/null 2>&1
+rep="$CCC_STATE_DIR/nunchi-wiki-promote-report.md"
+auto_hits=0
+for i in $(rows "select group_concat(id, ' ') from peer_facts where evidence like 'auto-distill:%'"); do
+  grep -q "#$i |" "$rep" 2>/dev/null && auto_hits=$((auto_hits+1))
+done
+conv_id="$(rows "select id from peer_facts where fact = '대화 기억 CONV0'")"
+ok "wiki-promote never even considers auto-distill rows (P2-c)" \
+  '[ -f "$rep" ] && grep -q "#$conv_id |" "$rep" && [ "$auto_hits" = 0 ]'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

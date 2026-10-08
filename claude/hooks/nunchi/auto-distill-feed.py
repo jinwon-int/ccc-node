@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fcntl
 import json
 import os
 import subprocess
@@ -59,6 +60,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+redact_fn = None  # set by run() once the redaction module has loaded
 KIND_MAP = {
     "config": "context",
     "incident": "context",
@@ -68,6 +70,9 @@ KIND_MAP = {
 TEXT_MAX = 600
 QUOTE_MAX = 260
 MAX_RECORDS_DEFAULT = 50
+# A record that fails ingest this many ticks in a row is skipped (logged), so
+# one poison record cannot block every later record forever.
+POISON_AFTER = 3
 
 
 def _redactor():
@@ -140,9 +145,15 @@ def payload_for(record: dict, redact) -> dict | None:
         "honcho": items,
         "evidence_source": "auto-distill",
     }
+    # valid_from = when the session last changed, not when the feed ran, so a
+    # backfilled row does not look newer than it is.
     path = record.get("path")
-    if isinstance(path, str) and path:
-        payload["transcript_path"] = path
+    try:
+        mtime = os.path.getmtime(path) if isinstance(path, str) and path else None
+    except OSError:
+        mtime = None
+    if mtime is not None:
+        payload["distilled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))
     return payload
 
 
@@ -182,12 +193,27 @@ def _recent(record: dict, cutoff: float) -> bool:
 
 
 def _ingest(nunchi_py: Path, payload: dict) -> bool:
-    proc = subprocess.run(
-        [sys.executable, str(nunchi_py), "ingest", "-"],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True, text=True, timeout=300,
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(nunchi_py), "ingest", "-"],
+            input=json.dumps(payload, ensure_ascii=False),
+            capture_output=True, text=True, timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
     return proc.returncode == 0
+
+
+def _locked(lock_path: Path):
+    """Non-blocking exclusive lock; None when another feed run holds it."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a", encoding="utf-8")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
 
 
 def run(args) -> int:
@@ -197,8 +223,9 @@ def run(args) -> int:
     if os.environ.get("CCC_NUNCHI_AUDIENCE_SCOPED", "0") == "1":
         print("auto-distill-feed: skipped (audience-scoped mode, #1921)")
         return 0
-    redact = _redactor()
-    if redact is None:
+    global redact_fn
+    redact_fn = _redactor()
+    if redact_fn is None:
         print("auto-distill-feed: refused — jevlib/redact.py missing beside the "
               "nunchi hooks; re-run setup.sh (never ingest unredacted text)", file=sys.stderr)
         return 2
@@ -207,6 +234,19 @@ def run(args) -> int:
     if log.is_symlink():
         print(f"auto-distill-feed: refused — log is a symlink: {log}", file=sys.stderr)
         return 2
+    # Own lock (not ingest-cron's, which the cron caller already holds): a
+    # manual backfill and a cron tick must never feed the same records twice.
+    lock = _locked(state_path.parent / ".auto-distill-feed.lock")
+    if lock is None:
+        print("auto-distill-feed: another run holds the lock — skipping")
+        return 0
+    try:
+        return _run_locked(args, log, state_path)
+    finally:
+        lock.close()
+
+
+def _run_locked(args, log: Path, state_path: Path) -> int:
     try:
         st = log.stat()
         state = _load_state(state_path)
@@ -215,31 +255,45 @@ def run(args) -> int:
     except ValueError as exc:
         print(f"auto-distill-feed: refused — {exc}", file=sys.stderr)
         return 2
-    first_run = "offset" not in state
-    offset = int(state.get("offset") or 0)
+    try:
+        offset = int(state["offset"])
+        first_run = offset < 0
+    except (KeyError, TypeError, ValueError):
+        offset, first_run = 0, True  # absent or corrupt state: start fresh
+    if not first_run and args.backfill_days is not None:
+        print("auto-distill-feed: --backfill-days ignored — already initialised "
+              f"(offset={offset}); remove {state_path} first to backfill")
     if state.get("inode") != st.st_ino or offset > st.st_size:
-        offset = 0  # rotated/truncated: re-read; nunchi dedup absorbs repeats
+        offset = 0  # rotated/truncated: a fresh log holds only new records
     if first_run and args.backfill_days is None:
         _save_state(state_path, {"inode": st.st_ino, "offset": st.st_size,
                                  "updated_at": int(time.time())})
         print(f"auto-distill-feed: initialised at end of log (offset={st.st_size}); "
               "use --backfill-days N to feed older records")
         return 0
+    if first_run:
+        offset = 0
     # A backfill cutoff is kept in the state until the backlog reaches EOF, so
     # a backfill larger than --max-records stays bounded on later ticks too.
     cutoff = state.get("backfill_cutoff")
     if first_run:
         cutoff = time.time() - args.backfill_days * 86400
-
-    def save(at_eof: bool) -> None:
-        data = {"inode": st.st_ino, "offset": offset, "updated_at": int(time.time())}
-        if cutoff is not None and not at_eof:
-            data["backfill_cutoff"] = cutoff
-        _save_state(state_path, data)
+    fail_offset = state.get("fail_offset")
+    fail_count = int(state.get("fail_count") or 0) if fail_offset == offset else 0
 
     records = items = fed_records = 0
     rc = 0
     at_eof = False
+
+    def save(at_end: bool) -> None:
+        data = {"inode": st.st_ino, "offset": offset, "updated_at": int(time.time()),
+                "last_run": {"records": records, "fed_records": fed_records, "items": items}}
+        if cutoff is not None and not at_end:
+            data["backfill_cutoff"] = cutoff
+        if fail_count:
+            data["fail_offset"], data["fail_count"] = offset, fail_count
+        _save_state(state_path, data)
+
     with open(log, "rb") as fh:
         fh.seek(offset)
         while records < args.max_records:
@@ -253,15 +307,21 @@ def run(args) -> int:
                 record = json.loads(line.decode("utf-8", "replace"))
             except ValueError:
                 record = None
-            payload = (payload_for(record, redact)
+            payload = (payload_for(record, redact_fn)
                        if isinstance(record, dict) and (cutoff is None or _recent(record, cutoff))
                        else None)
             if payload is not None:
                 if not _ingest(Path(args.nunchi_py), payload):
-                    rc = 3
-                    break
-                fed_records += 1
-                items += len(payload["honcho"])
+                    fail_count += 1
+                    if fail_count < POISON_AFTER:
+                        rc = 3
+                        break
+                    print(f"auto-distill-feed: skipping record at offset {offset} after "
+                          f"{fail_count} failed ingests", file=sys.stderr)
+                else:
+                    fed_records += 1
+                    items += len(payload["honcho"])
+            fail_count = 0
             offset = next_offset
             save(False)
         else:

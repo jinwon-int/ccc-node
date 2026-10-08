@@ -827,7 +827,10 @@ def ingest(path):
         payload.get("decision_reason_contract") == _DECISION_REASON_CONTRACT
     )
     auto_supersede = os.environ.get("NUNCHI_NO_AUTO_SUPERSEDE") != "1"
-    transcript, transcript_ref = _transcript_load(payload)  # once per run (#1264 P1-3)
+    # #2186 — a tagged machine feed never uses G2 (no `source`), so skip the
+    # up-to-64 MiB transcript read/hash it would otherwise cost per record.
+    transcript, transcript_ref = (("", None) if evidence_source
+                                  else _transcript_load(payload))  # once per run (#1264 P1-3)
     c = db()
     pool = _OpenPool(c)  # #1478 — G1/G3/B2 candidates, tokenised once per scope
     n = 0
@@ -850,6 +853,13 @@ def ingest(path):
             continue
         rank, review = _verify_rank(it, transcript)
         because = (it.get("because") or "").strip() or None
+        dedup = hashlib.sha1(f"{OBSERVER}|{it.get('subject')}|{text}".encode()).hexdigest()
+        if evidence_source and c.execute(
+                "SELECT 1 FROM peer_facts WHERE dedup=?", (dedup,)).fetchone():
+            # #2186 review P1-a: a re-fed machine row must be a no-op. Checked
+            # BEFORE G1, which would otherwise close a newer conversation fact
+            # even though the INSERT below then fails on the dedup UNIQUE.
+            continue
         # G5 (#1264): legacy payloads remain flag-not-reject. Producers that
         # declare the live required-v1 contract have already promised a
         # structured reason, so violating it is rejected before DB insertion;
@@ -870,14 +880,19 @@ def ingest(path):
             review = 1
             flagged_unknown_kind += 1
         superseded = None
-        if auto_supersede:
+        # #2186: tagged machine-extracted rows never close or flag other facts
+        # (G1/G3). They are rank-1, capped at injection and labelled `·auto`;
+        # letting a bulk feed auto-close conversation facts or flood the G3
+        # review queue (measured: 116/675 flagged) is exactly what must not
+        # happen without a human in the loop.
+        if auto_supersede and not evidence_source:
             if kind == "correction":
                 superseded = _auto_supersede(c, pool, observed, text, sid)
             else:
                 superseded = _update_supersede(c, pool, observed, text, rank)
-        if superseded is None and kind not in ("correction", "constraint", "observation"):
+        if (superseded is None and not evidence_source
+                and kind not in ("correction", "constraint", "observation")):
             review = review or _conflict_review(pool, observed, text, kind)
-        dedup = hashlib.sha1(f"{OBSERVER}|{it.get('subject')}|{text}".encode()).hexdigest()
         mut = _mutability(kind)
         source_refs = _source_refs(sid, it, transcript_ref)
         evidence = (f"auto:correction:{sid}" if kind == "correction" and superseded is not None
@@ -1634,9 +1649,23 @@ def _snapshot_header(c):
 def snapshot(limit):
     c = db()
     _sweep_expired_observations(c)  # #1478 — read-only on lock contention
-    rows = c.execute(
-        "SELECT observed,kind,fact,mutability FROM peer_facts WHERE valid_to IS NULL"
-        " AND kind NOT IN ('constraint','observation') ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    # #2186 review P1-b: snapshot.md feeds Codex (codex-loader) and the
+    # sessionstart fallback, so tagged auto-distill rows get the same `·auto`
+    # label and share cap as `assemble` — newest-first they would otherwise
+    # take every one of the `limit` slots.
+    auto_max = int(limit * _auto_distill_share())
+    rows, auto_taken = [], 0
+    for o, k, f, m, ev in c.execute(
+            "SELECT observed,kind,fact,mutability,evidence FROM peer_facts WHERE valid_to IS NULL"
+            " AND kind NOT IN ('constraint','observation') ORDER BY id DESC"):
+        if len(rows) >= limit:
+            break
+        if str(ev or "").startswith("auto-distill:"):
+            if auto_taken >= auto_max:
+                continue
+            auto_taken += 1
+            k = f"{k}·auto"
+        rows.append((o, k, f, m))
     # G4 — constraints are never crowded out by recency: a rule you must not
     # break is exactly the fact whose miss is an incident, not a staleness.
     cons = c.execute(
@@ -1721,7 +1750,10 @@ def assemble(budget, hint, limit=25):
     # #2186 — machine-extracted auto-distill rows are labelled `·auto` and
     # capped to a share of the budget, after relevance ordering, so they add
     # recall without displacing conversation memory.
-    auto_cap = int(budget * _auto_distill_share())
+    # Share of the FACT block (budget left after header + constraints), so a
+    # long constraint list cannot let auto rows take the whole block (#2186
+    # review P2-a).
+    auto_cap = int(max(0, budget - used) * _auto_distill_share())
     auto_used = 0
     fact_lines = []  # (rendered line, is_live) — budget-filtered in order
     for fid, o, k, f, m, ev in ordered:
