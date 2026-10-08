@@ -169,7 +169,44 @@ metadata separately. Dry runs report failures without consuming the persistent
 budget, and audit/summary records contain only the sanitized failure class,
 never model stderr or source text.
 
+## nunchi feed (#2186) — replaces the human AUTO.md review
+
+Owner decision 2026-10-08 (#2186): the human verdict step on AUTO.md is
+abolished. Measured that day, the Wiki AUTO.md pages had not changed since
+2026-08-27, about 57 of ~920 items had a human verdict, one node held 952 local
+items with none, and no runtime code read either file. Gate survivors are now
+handed to nunchi, whose session-start `assemble` already reaches every agent
+and whose own machinery (G1-G5 write gates, the hourly judge-batch, the ⟳
+live-check marker, TTL) stands in for the review. This supersedes the TM-2380
+condition that V2 automatic promotion needs separate owner approval.
+
+`claude/hooks/nunchi/auto-distill-feed.py` runs inside `ingest-cron.sh`:
+
+- input: `~/.hermes/logs/auto-distill-dryrun.jsonl` (`NUNCHI_AUTO_DISTILL_LOG`),
+  read incrementally by byte offset; only `kept[]` items are fed —
+  `quarantined[]` (entailment failed) never reaches agents;
+- mapping: config / incident / decision → nunchi `context` (live-check),
+  runbook → `procedure`; text and first quote are secret-redacted with the
+  extractor's patterns (`jevlib/redact.py`) and the feed refuses to run without
+  them; rows are tagged `evidence = auto-distill:...`;
+- injection: `assemble` and `snapshot` (Codex / fallback) label those rows
+  `·auto` and cap them at `NUNCHI_AUTO_DISTILL_SHARE` (default 0.33) of the
+  fact block / snapshot rows; tagged rows never run nunchi's G1 auto-close or
+  G3 conflict flag and never enter `wiki-promote`'s human queue;
+- opt-in per node: `NUNCHI_AUTO_DISTILL_FEED=1` or
+  `$CCC_STATE_DIR/nunchi.auto-distill-feed` containing `on`; never in
+  audience-scoped mode. The first run starts at the end of the log;
+  `--backfill-days N` feeds records whose transcript changed in the last N days.
+
+`auto-distill.py` is unchanged by the feed, so its evaluation receipt stays
+valid. Enabling the feed on a node is a per-node operator action.
+
 ## Eleven-node Wiki publication
+
+> Retired by #2186 (2026-10-08): agents consume auto-distill output through the
+> nunchi feed above. The collector below is kept for reference; do not schedule
+> it, and do not reopen human verdicts on Wiki AUTO.md.
+
 
 Extraction and publication are intentionally separate. Each canary writes only
 `~/.hermes/logs/auto-<node>.md`; it does not touch a Wiki worktree or create a

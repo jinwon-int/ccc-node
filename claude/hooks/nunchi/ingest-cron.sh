@@ -113,6 +113,12 @@ print(d.get("unmapped", "-"), d.get("ambiguous", "-"), d.get("invalid", "-"), d.
     esac
   done
 
+  # auto-distill lane (#2186): opt-in per node (the feed checks its own switch
+  # and refuses audience-scoped mode). Fail-open — a feed failure is logged and
+  # never blocks the distill-history / journal lanes above.
+  python3 "$HERE/auto-distill-feed.py" --nunchi-py "$FM" --state-dir "$STATE" \
+    || echo "nunchi ingest: auto-distill-feed exited $? (offset kept; retried next tick)" >&2
+
   # #1018 was invisible because the mirror ran happily with no input at all and
   # still looked healthy. Two things fix that: say what a tick did, and leave a
   # machine-readable receipt the readiness probe can judge.
