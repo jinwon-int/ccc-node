@@ -87,6 +87,7 @@ from telegram_bot.core.fleet_alert_relay import (
     RelayError,
     RelayRejected,
     build_payload,
+    default_node_name,
     relay_from_settings,
 )
 from telegram_bot.core.push_notifier import (
@@ -95,6 +96,7 @@ from telegram_bot.core.push_notifier import (
     PushNotifier,
     fan_out_pending,
     mirror_dirs_from,
+    write_spool_record,
 )
 from telegram_bot.core.session_scope import storage_key
 from telegram_bot.core.turn_notices import session_start_notice_text, session_start_reason
@@ -1080,6 +1082,20 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         # must not queue one banner per restart (nine piled up on 2026-09-18).
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
         key = f"startup-{digest}-{int(time.time() // 3600)}"
+        if (getattr(self._settings, "push_fleet_relay_url", None) or "").strip():
+            # Fleet alert relay mode (#2182): the banner is a fleet notice, so it
+            # goes through the push spool (relayed to @fleet-alerts) instead of
+            # being posted into the owner's room as the agent. The spool
+            # notifier applies the same dedup key, so a crash loop still posts
+            # one banner per hour.
+            spool_dir = Path(
+                getattr(self._settings, "push_spool_dir", None)
+                or (Path.home() / ".claude" / "state" / "telegram-spool")
+            )
+            node = (getattr(self._settings, "push_fleet_node", None) or "").strip() or default_node_name()
+            if write_spool_record(spool_dir, "Startup", text, dedup=key, node=node) is None:
+                logger.warning("startup banner spool write failed; banner stays log-only")
+            return
         for room in direct_rooms:
             try:
                 try:
