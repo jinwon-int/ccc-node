@@ -108,6 +108,78 @@ HOME="$TMP" BRIDGE_WATCHDOG_LOG="$LOG" BRIDGE_WATCHDOG_PID_FILE="$PID_FILE" \
 okc "$missing_rc" "missing start.sh: exits 0 (no crash)"
 ok  "missing start.sh: logs not-found" 'grep -q "not found/executable" "$LOG"'
 
+# ---- channel filter (#2176): a Matrix frontend is not the Telegram bridge ----
+# The Matrix frontend runs the same `python -m telegram_bot --path $HOME`
+# command line, so the pgrep fallback used to count it as "Telegram is up" and
+# never restarted a dead Telegram bridge. Spawn real stand-in processes whose
+# cmdline carries a unique marker and whose environ carries the channel, so the
+# watchdog reads them exactly as it reads a live bridge.
+FAKE_MARK="__ccc_wd_fakebridge_$$_${RANDOM}__"
+FAKE_PIDS=()
+spawn_fake() { # $1 = matrix | telegram ; prints the pid
+  local p
+  if [ "$1" = matrix ]; then
+    env CCC_CHANNEL=matrix bash -c 'sleep 300; :' "$FAKE_MARK" >/dev/null 2>&1 &
+  else
+    env -u CCC_CHANNEL bash -c 'sleep 300; :' "$FAKE_MARK" >/dev/null 2>&1 &
+  fi
+  p=$!
+  FAKE_PIDS+=("$p")
+  printf '%s' "$p"
+}
+reap_fakes() {
+  local p
+  for p in "${FAKE_PIDS[@]}"; do kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; done
+  FAKE_PIDS=()
+}
+run_wd_match() { # like run_wd, but the fallback matches the stand-in processes
+  rm -f "$MARKER"
+  local rc=0
+  HOME="$TMP" \
+  BRIDGE_WATCHDOG_LOG="$LOG" \
+  BRIDGE_WATCHDOG_PID_FILE="$PID_FILE" \
+  BRIDGE_WATCHDOG_START="$STARTSTUB" \
+  BRIDGE_WATCHDOG_LOCK="$TMP/wd-chan.lock" \
+  BRIDGE_WATCHDOG_GRACE_SECONDS=90 \
+  BRIDGE_WATCHDOG_PROCESS_MATCH="$FAKE_MARK" \
+  BRIDGE_WATCHDOG_PROC_ROOT="${WD_PROC_ROOT:-/proc}" \
+  bash "$WD" || rc=$?
+  printf '%s' "$rc"
+}
+stale_pidfile() { printf '%s' "$(dead_pid)" > "$PID_FILE"; touch -d '2000-01-01 00:00:00' "$PID_FILE"; }
+
+if [ -r "/proc/$$/environ" ]; then
+  # Telegram down (stale bot.pid), only a Matrix frontend alive -> restart.
+  stale_pidfile
+  matrix_pid="$(spawn_fake matrix)"; sleep 0.3
+  okc "$(run_wd_match)" "matrix-only alive: exits 0"
+  ok  "matrix-only alive: Telegram is judged down and restarted (#2176)" '[ -f "$MARKER" ]'
+
+  # A Telegram-channel bridge alive alongside Matrix -> still healthy.
+  stale_pidfile
+  spawn_fake telegram >/dev/null; sleep 0.3
+  okc "$(run_wd_match)" "telegram alive next to matrix: exits 0"
+  ok  "telegram alive next to matrix: does NOT restart" '[ ! -f "$MARKER" ]'
+  reap_fakes
+
+  # bot.pid recycled onto the live Matrix frontend -> not proof of Telegram.
+  matrix_pid="$(spawn_fake matrix)"; sleep 0.3
+  printf '%s' "$matrix_pid" > "$PID_FILE"; touch -d '2000-01-01 00:00:00' "$PID_FILE"
+  okc "$(run_wd_match)" "bot.pid on matrix pid: exits 0"
+  ok  "bot.pid on matrix pid: Telegram is judged down and restarted" '[ -f "$MARKER" ]'
+
+  # Unreadable environ -> conservative telegram reading, never a false "down".
+  stale_pidfile
+  mkdir -p "$TMP/empty-proc"
+  WD_PROC_ROOT="$TMP/empty-proc"
+  okc "$(run_wd_match)" "unreadable environ: exits 0"
+  ok  "unreadable environ: treated as telegram, does NOT restart" '[ ! -f "$MARKER" ]'
+  unset WD_PROC_ROOT
+  reap_fakes
+else
+  echo "SKIP: channel filter cases (no readable /proc/<pid>/environ on this host)"
+fi
+
 # ---- unset HOME (cron/systemd context) -> still runs -------------------------
 # Regression (#869 sweep): every default below `set -u` dereferenced $HOME, so
 # a watchdog started by cron/systemd without HOME died on "unbound variable"

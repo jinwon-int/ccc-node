@@ -42,17 +42,40 @@ GRACE_SECONDS="${BRIDGE_WATCHDOG_GRACE_SECONDS:-90}"
 # bridge running on the same host).
 PROCESS_MATCH="${BRIDGE_WATCHDOG_PROCESS_MATCH:-python -m telegram_bot}"
 
+# Channel filter (#2176): a Matrix frontend runs the very same
+# `python -m telegram_bot --path $HOME` command line (CCC_CHANNEL=matrix, own
+# BOT_DATA_DIR), so a bare pgrep match counted it as "the Telegram bridge is
+# up" and the watchdog never restarted a dead Telegram bridge while Matrix was
+# healthy (daegyo, 2026-10-08). Apply bridge/start.sh's rule
+# (_environ_bridge_channel): a process whose environ says CCC_CHANNEL=matrix
+# is a different service; unreadable environ, a missing key or any other value
+# means telegram -- the conservative reading, which never turns a live bridge
+# into a false "down". PROC_ROOT is a test seam only.
+PROC_ROOT="${BRIDGE_WATCHDOG_PROC_ROOT:-/proc}"
+is_matrix_process() {
+  local env_file="$PROC_ROOT/$1/environ" arg
+  [ -r "$env_file" ] || return 1
+  while IFS= read -r -d '' arg; do
+    case "$arg" in
+      CCC_CHANNEL=matrix) return 0 ;;
+      CCC_CHANNEL=*) return 1 ;;
+    esac
+  done 2>/dev/null < "$env_file"
+  return 1
+}
+
 # Alive check: bot.pid points at a live python -m telegram_bot process
 if [ -f "$PID_FILE" ]; then
   pid="$(cat "$PID_FILE" 2>/dev/null)"
-  if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+  if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null && ! is_matrix_process "$pid"; then
     exit 0
   fi
 fi
-# Fallback: process match (covers stale/missing pid file)
-if pgrep -f "$PROCESS_MATCH" >/dev/null 2>&1; then
+# Fallback: process match (covers stale/missing pid file), Telegram only
+for cand in $(pgrep -f "$PROCESS_MATCH" 2>/dev/null); do
+  is_matrix_process "$cand" && continue
   exit 0
-fi
+done
 
 # Start lock (#970): the debounce below covers restart racing restart, but
 # during a dependency build there is no bot.pid at all, so every tick used to
