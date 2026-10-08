@@ -46,6 +46,9 @@ REVIEW="${CCC_SKILL_REVIEW_CMD:-$CLAUDE_DIR/hooks/skill-review.sh}"
 SCAN="${CCC_SKILL_SCAN_CMD:-$CLAUDE_DIR/skills/skillsuggest/scan.sh}"
 AUTOINSTALL="${CCC_SKILL_AUTOINSTALL_CMD:-$CLAUDE_DIR/hooks/skill-review/autoinstall.sh}"
 CURATOR="${CCC_SKILL_CURATOR_CMD:-$CLAUDE_DIR/hooks/skill-review/curator.py}"
+# #2184: 90-day expiry of undecided drafts (rename into the archive root with a
+# manifest row; never deletes). CCC_SKILL_PENDING_EXPIRE_DAYS=0 turns it off.
+PENDING_EXPIRE="${CCC_SKILL_PENDING_EXPIRE_CMD:-$CLAUDE_DIR/hooks/skill-review/pending_expire.py}"
 PROMOTER="${CCC_SKILL_PROMOTION_CMD:-$CLAUDE_DIR/hooks/ccc-skill-promotion.py}"
 # Publisher edge env (#1766): the env file that exports A2A_EDGE_SECRET for the
 # intake review dispatch in block 2d. HOME-relative default — no node-specific
@@ -214,6 +217,36 @@ if [ "$MODE" = "set-mode" ]; then
   exit 0
 fi
 
+# --- pending-expire / pending-restore: manual entry points for #2184 ----------
+# Same helper the sweep runs in step 2c2. `pending-expire` honours --dry-run
+# and CCC_SKILL_PENDING_EXPIRE_DAYS; `pending-restore <name>` moves one
+# archived draft back into the queue (and logs a manifest row). Both print
+# the helper's JSON and exit with its code, so an operator sees exactly what
+# the nightly sweep would do.
+if [ "$MODE" = "pending-expire" ] || [ "$MODE" = "pending-restore" ]; then
+  if [ ! -f "$PENDING_EXPIRE" ] || ! command -v python3 >/dev/null 2>&1; then
+    echo "$MODE: helper unavailable ($PENDING_EXPIRE / python3)" >&2
+    exit 1
+  fi
+  if [ "$MODE" = "pending-expire" ]; then
+    pe_args="run"
+    case "${2:-}" in
+      --dry-run) pe_args="run --dry-run" ;;
+      '') ;;
+      *) echo "usage: ccc-skill-autosave.sh pending-expire [--dry-run]" >&2; exit 2 ;;
+    esac
+    # shellcheck disable=SC2086  # pe_args is a fixed word list built above
+    out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" python3 "$PENDING_EXPIRE" $pe_args)"; rc=$?
+    log "pending-expire manual $(printf '%s' "$out" | head -c 500)"
+  else
+    [ -n "${2:-}" ] || { echo "usage: ccc-skill-autosave.sh pending-restore <draft-dir-name>" >&2; exit 2; }
+    out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" python3 "$PENDING_EXPIRE" restore "$2")"; rc=$?
+    log "pending-restore manual $(printf '%s' "$out" | head -c 500)"
+  fi
+  printf '%s\n' "$out"
+  exit "$rc"
+fi
+
 if [ "$MODE" = "status" ]; then
   echo "mode: $(resolve_mode) (source: $(mode_source); approve/review = human review before install [default], auto = machine gate + post-hoc notify)"
   [ "$(resolve_mode)" = "auto" ] && echo "advisory: $AUTO_ADVISORY"
@@ -229,6 +262,12 @@ if [ "$MODE" = "status" ]; then
   if [ "$TOTAL_MAX_SESSIONS" -gt 0 ]; then _total_desc="$TOTAL_MAX_SESSIONS"; else _total_desc="0 (no cap)"; fi
   echo "drafting budget: per-branch max=$MAX_SESSIONS, total max=$_total_desc (source: $TOTAL_MAX_SOURCE; CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS, default 3, explicit 0 = no cap; #1824/#1647)"
   echo "pending skill drafts: $(pending_count)"
+  # #2184: age profile of the undecided queue and the expiry setting, so a
+  # backlog is visible before doctor's 60-day warning fires.
+  if [ -f "$PENDING_EXPIRE" ] && command -v python3 >/dev/null 2>&1; then
+    _pe="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" python3 "$PENDING_EXPIRE" status 2>/dev/null)" \
+      && echo "pending expiry: $(printf '%s' "$_pe" | jq -r '"days=\(.expire_days // "off") undecided=\(.undecided) <7d=\(.buckets.lt7d) 7-30d=\(.buckets.d7_30) 30-60d=\(.buckets.d30_60) 60-90d=\(.buckets.d60_90) >=90d=\(.buckets.ge90d) oldest=\(.oldest_days // "-")d archived=\(.archived)"' 2>/dev/null) (CCC_SKILL_PENDING_EXPIRE_DAYS; pending-expire [--dry-run] / pending-restore <name>; #2184)"
+  fi
   # #1932: sweeps can report drafted_sessions>0 every day while no transcript
   # ever reaches the drafting LLM. skill-review-last.json is written only after
   # a real drafting call, so its age is the honest "is drafting alive" signal.
@@ -248,7 +287,7 @@ if [ "$MODE" = "status" ]; then
 fi
 
 if [ "$MODE" != "run" ]; then
-  echo "usage: ccc-skill-autosave.sh [run|status|set-mode review|approve|auto]" >&2
+  echo "usage: ccc-skill-autosave.sh [run|status|set-mode review|approve|auto|pending-expire [--dry-run]|pending-restore <name>]" >&2
   exit 0
 fi
 
@@ -780,6 +819,26 @@ else
       && log "curator $(printf '%s' "$summary" | head -c 500)" \
       || log "curator failed (non-fatal)"
   fi
+fi
+
+# --- 2c2) pending-draft expiry (#2184) ---------------------------------------
+# The human gate keeps every draft until someone reviews it, so the queue only
+# grew (603 drafts fleet-wide on 2026-10-08, 211 past 30 days). Drafts older
+# than CCC_SKILL_PENDING_EXPIRE_DAYS (default 90) are renamed into
+# skill-autosave-archive/pending-90d-<date>/ with a manifest row — the same
+# move the owner approved by hand on 2026-10-07 (4c). Decided, human-approved
+# and incremental-proposal entries are never touched; nothing is deleted;
+# `pending-restore <name>` brings a draft back. Under autonomy dry-run the
+# helper only reports. Failure is non-fatal: the queue simply keeps the draft.
+if [ -f "$PENDING_EXPIRE" ] && command -v python3 >/dev/null 2>&1; then
+  expire_args="run"
+  [ "$AUTONOMY_STATE" = "dry-run" ] && expire_args="run --dry-run"
+  # shellcheck disable=SC2086  # expire_args is a fixed word list built above
+  summary="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" python3 "$PENDING_EXPIRE" $expire_args 2>>"$LOG")" \
+    && log "pending-expire $(printf '%s' "$summary" | head -c 500)" \
+    || log "pending-expire failed (non-fatal) $(printf '%s' "$summary" | head -c 300)"
+else
+  log "pending-expire skipped reason=missing-runtime"
 fi
 
 # --- 2d) private skill intake (explicit opt-in) ------------------------------

@@ -851,6 +851,7 @@ class Doctor:
         self.check_provider_readiness()
         self.check_distill_readiness()
         self.check_skill_promotion_backlog()
+        self.check_skill_pending_backlog()
         self.check_skill_promotion_dispatch_gap()
         self.check_fleet_skills_sync()
         self.check_skill_promotion_revise_stall()
@@ -1900,6 +1901,97 @@ class Doctor:
             "skill-promotion.collect-nodes, that its collect cron still runs, "
             "and that max_prs_per_run keeps up with the fleet's staging rate",
         )
+
+    _PENDING_BACKLOG_WARN_DAYS = 60
+    _PENDING_DECIDED_RE = re.compile(r"\.(approved|rejected|installed)-[0-9]+$")
+    _PENDING_STAMP_RE = re.compile(r"^(\d{8})-(\d{6})-")
+
+    def check_skill_pending_backlog(self) -> None:
+        """Undecided autosave drafts that have waited past 60 days (#2184).
+
+        The human gate (#2011-B) keeps a draft in `state/pending-skills/`
+        until `/skillsuggest` decides it; the nightly sweep now expires
+        drafts past 90 days into the archive root. This check fires before
+        that: an undecided draft older than 60 days means the queue is not
+        being reviewed and the 90-day expiry is about to discard work nobody
+        looked at. Decided (`.approved-/.rejected-/.installed-`),
+        human-approved (`meta.approved.json`) and incremental-proposal
+        (`proposal.json`) entries are not part of the undecided queue. Age
+        is `meta.json:staged_at`, then the directory stamp, then mtime —
+        the same order `pending_expire.py` uses, so the two agree.
+        """
+        item = "skill-autosave pending backlog"
+        state_dir = Path(
+            os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")
+        ).expanduser()
+        pending = state_dir / "pending-skills"
+        if pending.is_symlink() or not pending.is_dir():
+            self.add("정상", item, "queue=absent", "none")
+            return
+        expire_raw = os.environ.get("CCC_SKILL_PENDING_EXPIRE_DAYS", "")
+        expire = "off" if expire_raw == "0" else (expire_raw if expire_raw.isdigit() else "90")
+        now = time.time()
+        undecided = 0
+        over = 0
+        oldest: float | None = None
+        try:
+            entries = sorted(pending.iterdir(), key=lambda p: p.name)
+        except OSError:
+            self.add("수동필요", item, "queue=unreadable", f"inspect {pending} permissions")
+            return
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if self._PENDING_DECIDED_RE.search(entry.name):
+                continue
+            if (entry / "meta.approved.json").exists() or (entry / "proposal.json").exists():
+                continue
+            staged = self._pending_staged_at(entry)
+            if staged is None:
+                continue
+            undecided += 1
+            if oldest is None or staged < oldest:
+                oldest = staged
+            if now - staged >= self._PENDING_BACKLOG_WARN_DAYS * 86400:
+                over += 1
+        if undecided == 0:
+            self.add("정상", item, f"undecided=0; expire={expire}d", "none")
+            return
+        oldest_days = int((now - (oldest or now)) // 86400)
+        status = f"undecided={undecided}; over{self._PENDING_BACKLOG_WARN_DAYS}d={over}; oldest={oldest_days}d; expire={expire}d"
+        if over == 0:
+            self.add("정상", item, status, "none")
+            return
+        self.add(
+            "경고",
+            item,
+            status,
+            "review the queue with /skillsuggest before the 90-day expiry archives it "
+            "(ccc-skill-autosave.sh pending-expire --dry-run lists what the next sweep "
+            "would move; pending-restore <name> brings a draft back)",
+        )
+
+    def _pending_staged_at(self, entry: Path) -> float | None:
+        meta = entry / "meta.json"
+        try:
+            if meta.is_file() and not meta.is_symlink() and meta.stat().st_size <= 65536:
+                data = json.loads(meta.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    parsed = self._parse_ledger_ts(data.get("staged_at"))
+                    if parsed is not None:
+                        return parsed
+        except (OSError, ValueError):
+            pass
+        match = self._PENDING_STAMP_RE.match(entry.name)
+        if match:
+            try:
+                return time.mktime(time.strptime(match.group(1) + match.group(2), "%Y%m%d%H%M%S")) - time.timezone
+            except (ValueError, OverflowError):
+                pass
+        try:
+            return entry.lstat().st_mtime
+        except OSError:
+            return None
 
     _DISPATCH_GAP_WINDOW_DAYS = 14
     _DISPATCH_GAP_MIN_AGE_HOURS = 2
