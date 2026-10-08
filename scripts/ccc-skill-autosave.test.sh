@@ -106,6 +106,24 @@ ok "owner notification queued in spool" 'ls "$SPOOL"/*SkillAutosave*.json >/dev/
 ok "notification counts pending drafts" 'jq -r ".text" "$SPOOL"/*SkillAutosave*.json 2>/dev/null | grep -q "1건"'
 ok "notification has dedup key" 'jq -r ".dedup" "$SPOOL"/*SkillAutosave*.json 2>/dev/null | grep -q "SkillAutosave:1"'
 
+# --- 1b) #2184: the sweep expires a 90-day-old undecided draft, keeps the fresh one
+OLD_DRAFT="20260101-000000-00000000-0000-0000-0000-000000000000-ancient-draft"
+mkdir -p "$STATE/pending-skills/$OLD_DRAFT"
+printf -- '---\nname: ancient\ndescription: Use when testing expiry.\n---\n# ancient\n' > "$STATE/pending-skills/$OLD_DRAFT/SKILL.md"
+printf '{"name":"ancient","staged_at":"2026-01-01T00:00:00Z","status":"pending"}\n' > "$STATE/pending-skills/$OLD_DRAFT/meta.json"
+CCC_SKILL_PENDING_EXPIRE_CMD="$HERE/../claude/hooks/skill-review/pending_expire.py" run_autosave
+ok "#2184: sweep logs the expiry step" 'grep -q "pending-expire {" "$STATE/skill-autosave.log"'
+ok "#2184: ancient draft left the queue" '[ ! -e "$STATE/pending-skills/$OLD_DRAFT" ]'
+ok "#2184: ancient draft sits in the dated archive with a manifest row" \
+  'ls -d "$STATE/skill-autosave-archive/pending-90d-"*/"$OLD_DRAFT"/SKILL.md >/dev/null 2>&1 && grep -q "\"name\": \"$OLD_DRAFT\"" "$STATE/skill-autosave-archive/pending-90d-"*/manifest.jsonl'
+ok "#2184: fresh draft still pending" 'find "$STATE/pending-skills" -name SKILL.md 2>/dev/null | grep -q .'
+ok "#2184: status shows the age profile" 'CCC_STATE_DIR="$STATE" CCC_SKILL_PENDING_EXPIRE_CMD="$HERE/../claude/hooks/skill-review/pending_expire.py" bash "$AUTOSAVE" status 2>&1 | grep "^pending expiry: days=90 undecided=1 " >/dev/null'
+ok "#2184: dry-run entry point moves nothing and exits 0" \
+  'CCC_STATE_DIR="$STATE" CCC_SKILL_PENDING_EXPIRE_CMD="$HERE/../claude/hooks/skill-review/pending_expire.py" bash "$AUTOSAVE" pending-expire --dry-run | jq -e ".status == \"clean\"" >/dev/null'
+ok "#2184: pending-restore brings the draft back" \
+  'CCC_STATE_DIR="$STATE" CCC_SKILL_PENDING_EXPIRE_CMD="$HERE/../claude/hooks/skill-review/pending_expire.py" bash "$AUTOSAVE" pending-restore "$OLD_DRAFT" | jq -e ".status == \"restored\"" >/dev/null && [ -f "$STATE/pending-skills/$OLD_DRAFT/SKILL.md" ]'
+rm -rf "$STATE/pending-skills/$OLD_DRAFT"
+
 # --- 2) rerun without transcript growth: no re-draft, no duplicate notify ----
 # shellcheck disable=SC2034  # before_drafts is read via eval inside ok()
 before_drafts="$(find "$STATE/pending-skills" -name SKILL.md 2>/dev/null | wc -l | tr -d '[:space:]')"
