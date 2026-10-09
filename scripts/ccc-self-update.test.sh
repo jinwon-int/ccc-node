@@ -1663,5 +1663,51 @@ CCC_SELF_UPDATE_NOTIFY=all run_selfup run >/dev/null 2>&1; rc=$?
 ok "CCC_SELF_UPDATE_NOTIFY=all overrides the file" 'ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&1'
 rm -f "$CLAUDE/self-update.notify"
 
+# --- #2207 ③: prepare-cmd runs after setup.sh and before any restart ---------
+# Termux serves a prepared generation; the operator's prepare command builds
+# the generation for the new SHA and moves the pointer. It must run first, and
+# its failure must skip every restart (the old generation keeps serving).
+export CCC_SELF_UPDATE_SERVING_HEALTH_FILE="$TMP/no-such-serving-health.json"
+unset REPO_OVERRIDE
+rm -f "$CLAUDE/self-update.services" "$CLAUDE/self-update.health-cmd" "$CLAUDE/self-update.notify" \
+      "$STATE/self-update.pending-activation.json" "$STATE/self-update.activation-notice"*
+rm -rf "$STATE"/self-update-install-rollback.*
+SEQ="$TMP/prepare-seq.log"; : > "$SEQ"
+printf 'echo "prepare target=$CCC_SELF_UPDATE_TARGET_SHA prev=$CCC_SELF_UPDATE_PREVIOUS_SHA repo=$CCC_SELF_UPDATE_REPO_DIR" >> %s\n' "$SEQ" > "$CLAUDE/self-update.prepare-cmd"
+printf 'echo restart >> %s\n' "$SEQ" > "$CLAUDE/self-update.restart-cmd"
+out="$(run_selfup status 2>&1)"
+ok "status names the configured prepare command and its budget" 'grep -q "prepare command: configured (timeout 3600s)" <<<"$out"'
+bump2142 prepare-ok
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "prepare-cmd runs before the external restart and the tick exits 0" \
+  '[ "$rc" = 0 ] && [ "$(sed -n 1p "$SEQ" | cut -d" " -f1)" = prepare ] && [ "$(sed -n 2p "$SEQ")" = restart ]'
+ok "prepare-cmd receives the target, previous SHA and checkout" \
+  'grep -q "target=$(git -C "$TMP/seed" rev-parse HEAD) prev=" "$SEQ" && grep -q "repo=$REPO" "$SEQ"'
+ok "audit lists prepare ok ahead of the external restart" \
+  'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"ok\" and .services[0].name == \"prepare\" and .services[0].ok == true and .services[0].scope == \"external\" and .services[1].name == \"external-restart\"" >/dev/null'
+ok "up-to-date tick does not re-run the prepare command" ': > "$SEQ"; run_selfup run >/dev/null 2>&1; [ ! -s "$SEQ" ]'
+
+printf 'exit 3\n' > "$CLAUDE/self-update.prepare-cmd"
+: > "$SEQ"
+bump2142 prepare-fail
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "failing prepare-cmd exits 15 and restarts nothing" '[ "$rc" = 15 ] && ! grep -q restart "$SEQ" && grep -q "prepare command failed (rc=3)" <<<"$out"'
+ok "prepare failure is audited with its exit code and budget" \
+  'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"prepare-failed\" and .prepare_exit == 3 and .prepare_budget_seconds == 3600 and .services[0].name == \"prepare\" and .services[0].ok == false" >/dev/null'
+ok "prepare failure leaves a pending activation and the recovery snapshot" \
+  '[ "$(jq -r .outcome "$STATE/self-update.pending-activation.json")" = prepare-failed ] && compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "prepare failure notifies the owner naming prepare-cmd" 'grep -rh "prepare-cmd" "$TMP/spool" >/dev/null 2>&1'
+ok "checkout stayed fast-forwarded (the old generation serving is runtime state)" \
+  '[ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
+# `status` is read-only and skips budget validation (as for the restart budget);
+# `run` refuses before touching the lock or the checkout.
+# shellcheck disable=SC2034  # budget_head is read via eval inside ok()
+budget_head="$(git -C "$REPO" rev-parse HEAD)"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS=9999 run_selfup run 2>&1)"; rc=$?
+ok "prepare budget above 7200s is refused by run" '[ "$rc" = 2 ] && grep -q "1..7200" <<<"$out" && [ "$(git -C "$REPO" rev-parse HEAD)" = "$budget_head" ]'
+rm -f "$CLAUDE/self-update.prepare-cmd" "$CLAUDE/self-update.restart-cmd" "$STATE/self-update.pending-activation.json"
+rm -rf "$STATE"/self-update-install-rollback.*
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
