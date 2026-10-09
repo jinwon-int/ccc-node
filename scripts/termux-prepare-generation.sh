@@ -27,8 +27,14 @@
 #      native wheels when bridge/requirements.lock.txt is unchanged between the
 #      two SHAs (minutes instead of ~1 h; the tool itself re-verifies the
 #      toolchain and refuses a stale reuse).
-#   5. Receipt must say `ready`; then the previous pointer target is recorded
-#      in <ccc-node>/bridge-current.prev-<ts> and the symlink is repointed.
+#   5. Receipt must say `ready`, AND — when this node runs the Matrix
+#      frontend (~/.ccc-matrix or the runit service exists) — the runtime must
+#      import the Matrix extra (`aiohttp`, `nio`): `termux_prepare.py` only
+#      installs it with `--extra matrix` (ccc-node#2202), which is passed when
+#      the tool supports it. A generation without it is never promoted: the
+#      2026-10-09 switch to such a generation crash-looped Matrix on both
+#      Termux nodes twice (ccc-node#2175). Then the previous pointer target is
+#      recorded in <ccc-node>/bridge-current.prev-<ts> and the symlink moves.
 #   The restart is NOT done here — self-update's restart-cmd (restart-frontends)
 #   or the operator does it; the pointer is what every launcher reads.
 #
@@ -39,9 +45,10 @@
 #        interpreter; termux_prepare.py refuses a venv python),
 #        CCC_TERMUX_PREPARE_TIMEOUT (3300 s, passed to the tool),
 #        CCC_TERMUX_PREPARE_JOBS (1), CCC_TERMUX_PREPARE_LOG
-#        (~/.claude/state/termux-prepare.log).
+#        (~/.claude/state/termux-prepare.log), CCC_TERMUX_MATRIX_FRONTEND
+#        (1/0 — override the Matrix-frontend detection).
 # Exit:  0 ok (serving or repointed) · 2 usage/precondition · 3 build failed ·
-#        4 receipt not ready · 5 pointer switch failed.
+#        4 receipt not ready or Matrix extra missing · 5 pointer switch failed.
 set -euo pipefail
 
 H="${HOME:?}"
@@ -94,6 +101,26 @@ PYEOF
 
 gen_head() { git -C "$1/source" rev-parse HEAD 2>/dev/null || printf ''; }
 
+matrix_frontend_configured() {
+  case "${CCC_TERMUX_MATRIX_FRONTEND:-}" in 1) return 0 ;; 0) return 1 ;; esac
+  [ -d "$H/.ccc-matrix" ] || [ -e "${PREFIX:-/usr}/var/service/ccc-matrix-bridge" ]
+}
+
+# The Matrix frontend imports aiohttp/matrix-nio at startup (transport.py); a
+# runtime without them crash-loops within seconds while the Telegram bridge
+# looks perfectly healthy. Gate every promotion on a real import.
+matrix_extra_present() { # <gen-dir>
+  local rpy="$1/job/runtime/bin/python"
+  [ -x "$rpy" ] || return 1
+  "$rpy" -c "import aiohttp, nio" >/dev/null 2>&1
+}
+
+gate_generation() { # <gen-dir> — refuse to promote a generation this node's frontends cannot run
+  if matrix_frontend_configured && ! matrix_extra_present "$1"; then
+    die 4 "generation $(basename "$1") lacks the Matrix extra (aiohttp/matrix-nio) and this node runs the Matrix frontend — not promoting (needs termux_prepare.py --extra matrix, ccc-node#2202); pointer unchanged"
+  fi
+}
+
 REPO="$(resolve_repo)"
 [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die 2 "checkout not found: $REPO"
 [ -n "$TARGET" ] || TARGET="$(git -C "$REPO" rev-parse HEAD)"
@@ -141,6 +168,7 @@ switch_pointer() { # <gen-dir>
 
 if [ -n "$GEN" ]; then
   [ "$DRY" = 1 ] && { say "dry-run: would repoint to existing ready generation $(basename "$GEN")"; exit 0; }
+  gate_generation "$GEN"
   switch_pointer "$GEN"
   exit 0
 fi
@@ -157,24 +185,36 @@ if [ -n "$SERVING_HEAD" ] && [ "$(receipt_status "$SERVING/job")" = "ready" ] \
    && git -C "$REPO" diff --quiet "$SERVING_HEAD" "$TARGET" -- bridge/requirements.lock.txt 2>/dev/null; then
   REUSE=(--reuse-wheels-from "$SERVING/job")
 fi
+EXTRA=()
+if matrix_frontend_configured; then
+  # Pass --extra matrix when the target's termux_prepare.py supports it
+  # (ccc-node#2202). Older tools cannot install the extra; the build still
+  # runs but the gate below refuses to promote the result.
+  if git -C "$REPO" show "$TARGET:bridge/termux_prepare.py" 2>/dev/null | grep -q -- '"--extra"'; then
+    EXTRA=(--extra matrix)
+  else
+    say "note: termux_prepare.py at $SHORT has no --extra support; the build cannot include the Matrix extra and will not be promoted"
+  fi
+fi
 if [ "$DRY" = 1 ]; then
-  say "dry-run: would build $(basename "$GEN") from $SERVING_HEAD -> $SHORT reuse=${REUSE[*]:-none} timeout=${TIMEOUT_S}s"
+  say "dry-run: would build $(basename "$GEN") from $SERVING_HEAD -> $SHORT reuse=${REUSE[*]:-none} extra=${EXTRA[*]:-none} timeout=${TIMEOUT_S}s"
   exit 0
 fi
 
 umask 077
 mkdir -p "$PREP" "$GEN"
 chmod 700 "$PREP" "$GEN"
-say "building $(basename "$GEN") (serving $(basename "$SERVING") @${SERVING_HEAD:0:7}; reuse=${REUSE[*]:-none})"
+say "building $(basename "$GEN") (serving $(basename "$SERVING") @${SERVING_HEAD:0:7}; reuse=${REUSE[*]:-none}; extra=${EXTRA[*]:-none})"
 git -C "$REPO" worktree add --detach "$GEN/source" "$TARGET" >>"$GEN/prepare.log" 2>&1 \
   || die 3 "git worktree add failed (see $GEN/prepare.log)"
 install -m 600 "$SERVING/source/bridge/.env" "$GEN/source/bridge/.env" || die 3 "could not inherit bridge/.env"
 started=$SECONDS
 if ! "$PY" -B "$GEN/source/bridge/termux_prepare.py" --work-dir "$GEN/job" --verify-reinstall \
-     --timeout-seconds "$TIMEOUT_S" --jobs "$JOBS" "${REUSE[@]}" >>"$GEN/prepare.log" 2>&1; then
+     --timeout-seconds "$TIMEOUT_S" --jobs "$JOBS" "${REUSE[@]}" "${EXTRA[@]}" >>"$GEN/prepare.log" 2>&1; then
   die 3 "termux_prepare.py failed after $((SECONDS - started))s (log: $GEN/prepare.log); pointer unchanged"
 fi
 status="$(receipt_status "$GEN/job")"
 [ "$status" = "ready" ] || die 4 "receipt status is '${status:-missing}', not ready (log: $GEN/prepare.log); pointer unchanged"
 say "built $(basename "$GEN") in $((SECONDS - started))s (receipt ready)"
+gate_generation "$GEN"
 switch_pointer "$GEN"

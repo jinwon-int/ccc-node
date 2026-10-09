@@ -50,6 +50,13 @@ if [ "${FAKE_PREPARE_FAIL:-0}" = 1 ]; then
   printf '{"status":"failed"}\n' > "$work/receipt.json"; echo "build failed" ; exit 1
 fi
 printf '{"status":"ready","work_dir":"%s"}\n' "$work" > "$work/receipt.json"
+mkdir -p "$work/runtime/bin"
+cat > "$work/runtime/bin/python" <<'SHIM'
+#!/usr/bin/env bash
+# runtime python shim: `-c "import aiohttp, nio"` succeeds only when the build included the Matrix extra
+case "$*" in *aiohttp*) [ "${FAKE_MATRIX_OK:-0}" = 1 ] ;; *) exit 0 ;; esac
+SHIM
+chmod +x "$work/runtime/bin/python"
 PY
 chmod +x "$FAKEBIN/python3"
 export CCC_TERMUX_PYTHON="$FAKEBIN/python3" FAKE_CALLS="$TMP/prepare.calls"
@@ -124,6 +131,40 @@ rm "$GOOD/source/bridge/.env"
 # make GOOD the serving gen without an .env, then ask for a new target
 out="$(run)"; rc=$?
 ok "missing serving .env fails closed before building" '[ "$rc" = 2 ] && grep -q "no bridge/.env" <<<"$out"'
+
+
+# 9) Matrix frontend configured: a generation without the Matrix extra is never promoted
+mkdir -p "$HOME/.ccc-matrix"
+git -C "$REPO" checkout -q "$D"
+# the serving generation is GOOD (D) without .env now; restore an .env there so builds can inherit
+printf 'TELEGRAM_BOT_TOKEN=secret-token-marker\n' > "$GOOD/source/bridge/.env"; chmod 600 "$GOOD/source/bridge/.env"
+echo f > "$REPO/f.txt"; git -C "$REPO" add -A && git -C "$REPO" commit -qm F
+F="$(git -C "$REPO" rev-parse HEAD)"
+ptr_before="$(readlink "$CN/bridge-current")"
+ok "dry-run says the extra cannot be included by this tool" 'run --dry-run | grep -q "extra=none"'
+out="$(run)"; rc=$?
+ok "tool without --extra: build runs but the generation is refused (exit 4) and the pointer stays" \
+  '[ "$rc" = 4 ] && grep -q "lacks the Matrix extra" <<<"$out" && [ "$(readlink "$CN/bridge-current")" = "$ptr_before" ]'
+ok "no --extra flag was passed to a tool that does not support it" '! grep -q -- "--extra matrix" "$FAKE_CALLS"'
+# the refused generation stays on disk (diagnosis) and a rerun does not promote it either
+out="$(run)"; rc=$?
+ok "an existing ready generation without the extra is not repointed on rerun" '[ "$rc" = 4 ] && [ "$(readlink "$CN/bridge-current")" = "$ptr_before" ]'
+
+# 10) tool with --extra support + a build that includes the extra -> promoted with --extra matrix
+printf '#!/usr/bin/env python3\n# parser.add_argument("--extra", action="append")\n' > "$REPO/bridge/termux_prepare.py"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm G
+G="$(git -C "$REPO" rev-parse HEAD)"
+out="$(FAKE_MATRIX_OK=1 run)"; rc=$?
+ok "tool with --extra: built with --extra matrix and promoted" \
+  '[ "$rc" = 0 ] && grep -q -- "--extra matrix" "$FAKE_CALLS" && [ "$(git -C "$(readlink -e "$CN/bridge-current")/source" rev-parse HEAD)" = "$G" ]'
+ok "dry-run reports extra=--extra matrix when supported" 'echo h > "$REPO/h.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm H; run --dry-run | grep -q "extra=--extra matrix"'
+
+# 11) Matrix frontend not configured -> no gate, no --extra
+rm -rf "$HOME/.ccc-matrix"
+: > "$FAKE_CALLS"
+out="$(run)"; rc=$?
+ok "without a Matrix frontend the build is promoted without the extra gate" '[ "$rc" = 0 ] && ! grep -q -- "--extra" "$FAKE_CALLS"'
+ok "CCC_TERMUX_MATRIX_FRONTEND=1 forces the gate" 'echo i > "$REPO/i.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm I; CCC_TERMUX_MATRIX_FRONTEND=1 run >/dev/null 2>&1; [ "$?" = 4 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
