@@ -336,3 +336,40 @@ do not yet persist a selected generation. Managed systemd/launchd restarts
 continue to use their service-manager boundary. Actual production transition,
 workload-drain guarantees, rollback failure injection and downtime measurement
 remain required before closing #1527.
+
+## Termux generation lifecycle (`scripts/termux-bridge-generation.sh`)
+
+On Termux a node serves from a *prepared generation*,
+`~/.ccc-node/preparations/<gen>/{source,job[,serving]}`: a detached worktree of
+one commit plus the `termux_prepare.py` job holding its runtime venv (`serving`
+optionally selects a retry job such as `job2`). One symlink,
+`~/.ccc-node/bridge-current -> preparations/<gen>`, names the serving
+generation. Every lifecycle caller (self-update `restart-cmd`, Termux:Boot,
+health self-heal, the runit Matrix runner) resolves it through this script, so
+switching generations is "repoint one symlink + restart" (#2175 C).
+
+| Subcommand | Does |
+| --- | --- |
+| `print-source` / `print-job` | Resolve the pointer to **real** paths (this file's gates refuse symlinked ancestors). `--print-*` aliases kept. |
+| `launch <start.sh args>` | `flock`-serialised `start.sh --prepared-runtime <job> …` for the Telegram frontend, with `CCC_CHANNEL`, Matrix data dirs and `CCC_MATRIX_*` dropped (a shell spawned by the Matrix bridge otherwise launches a second Matrix frontend). Bare `--path …` arguments also mean `launch`, so an operator wrapper can be one `exec` line. |
+| `status` | Pointer, its source head, and the generation/idle state each frontend's `health.json` reports. |
+| `prepare <rev> [--name N] [--reuse auto\|none\|<job>] [--extra matrix] [--no-reinstall]` | New generation dir, worktree at `<rev>` from the managed checkout, provider `bridge/.env` linked from the checkout (gitignored, outside the seal; without it `start.sh` refuses the restart with exit 6), then `termux_prepare.py` with the base interpreter and a clean `PATH`/`VIRTUAL_ENV`. `--reuse auto` (default) passes the serving job to `--reuse-wheels-from`; if termux_prepare refuses the reuse (`reuse_*`), it builds fully into `job2` and adds `serving -> job2`. Ends with the serving gate (`prepared-gate.json`). Never restarts anything. |
+| `promote <gen> [--wait-idle S] [--matrix\|--no-matrix] [--matrix-wait S] [--dry-run]` | Gate (exit 6, nothing changed) → wait until Telegram reports no active/waiting turn (exit 75, nothing changed) → atomic pointer swap → `launch --restart -d` with `--recovery-source/--recovery-runtime` set to the previous generation → on any non-zero exit, pointer rolled back and the exit returned (7 = previous generation verified restored). Then, when the runit Matrix service exists (or `--matrix`), a **detached** `matrix-follow`: run from a Matrix session, restarting that frontend ends the caller. |
+| `matrix-follow [--wait S]` | If the Matrix frontend reports another generation, wait for it to be idle (exit 75 on timeout), `sv restart`, and verify its health now reports the pointer's source (exit 4 otherwise). |
+
+Typical update on a Termux node:
+
+```bash
+G="$(bash scripts/termux-bridge-generation.sh prepare origin/main --extra matrix)"
+bash scripts/termux-bridge-generation.sh promote "$G" --dry-run
+bash scripts/termux-bridge-generation.sh promote "$G"
+bash scripts/termux-bridge-generation.sh status
+```
+
+To move an existing operator wrapper onto the repository copy, keep the
+wrapper path every caller already uses and make it a single line, e.g.
+`exec bash "$HOME/ccc-node/scripts/termux-bridge-generation.sh" "$@"`; the
+`restart-cmd` can stay `… --path "$HOME" --restart -d`. Generations are never
+deleted by this script; retain the previous one at least through the health
+observation window. Wiring `prepare`/`promote` into the self-updater is
+tracked separately (#2175 D).
