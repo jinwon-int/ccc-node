@@ -981,8 +981,8 @@ health_home="$TMP/home-backend-health"; mkdir -p "$health_home"
 health_bin="$TMP/bin-health"; mkdir -p "$health_bin"
 HDB="$health_home/.nunchi/facts.db"
 HSNAP="$health_home/.nunchi/snapshot.md"
-hdialectic() { NUNCHI_DB="$HDB" NUNCHI_SNAPSHOT="$HSNAP" PATH="$health_bin:/usr/bin:/bin" HOME="$health_home" python3 "$NP" dialectic "모델" >/dev/null 2>&1; }
-hstatus()    { NUNCHI_DB="$HDB" NUNCHI_SNAPSHOT="$HSNAP" PATH="$health_bin:/usr/bin:/bin" HOME="$health_home" python3 "$NP" backend-status 2>&1; }
+hdialectic() { NUNCHI_DB="$HDB" NUNCHI_SNAPSHOT="$HSNAP" PATH="$health_bin:/usr/bin:/bin" NUNCHI_PIRI=0 HOME="$health_home" python3 "$NP" dialectic "모델" >/dev/null 2>&1; }
+hstatus()    { NUNCHI_DB="$HDB" NUNCHI_SNAPSHOT="$HSNAP" PATH="$health_bin:/usr/bin:/bin" NUNCHI_PIRI=0 HOME="$health_home" python3 "$NP" backend-status 2>&1; }
 hsnapshot()  { NUNCHI_DB="$HDB" NUNCHI_SNAPSHOT="$HSNAP" python3 "$NP" snapshot --limit 1; }
 
 cat > "$health_bin/claude" <<'EOF'
