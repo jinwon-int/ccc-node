@@ -164,7 +164,7 @@ _OWNER_ONLY_COMMANDS = frozenset(
 MAX_FILES_PER_TURN = 10
 FILES_DIRECT_ONLY = "📎 답변에 파일 {count}개가 있지만, 파일은 개인 대화방에서만 보냅니다."
 FILES_SKIPPED = "📎 파일 {count}개는 보내지 않았습니다(프로젝트 폴더 밖이거나 한 번에 보낼 수 있는 {limit}개 초과).".replace("{limit}", str(MAX_FILES_PER_TURN))
-STATUS_MIN_INTERVAL_S = 15.0  # match Telegram CCC_HEARTBEAT_* defaults
+STATUS_MIN_INTERVAL_S = 10.0  # match Telegram CCC_HEARTBEAT_* defaults (15 -> 10, owner 2026-10-09)
 _HEALTH_INTERVAL_S = 10.0  # match bot_lifecycle._WORKLOAD_INTERVAL
 # #1820: a /sync long-poll returns within ~25s (40s HTTP ceiling), so a commit
 # older than this means the receive leg is stuck; the same budget covers the

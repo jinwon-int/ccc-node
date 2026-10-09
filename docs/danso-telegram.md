@@ -226,7 +226,7 @@ bridge is a separate operational step; source development does not switch a node
   in-flight status operation to return its ID before final cleanup. Telegram
   does not provide an idempotency key: a transport failure after accepting a
   send but before returning its ID can still leave an unidentifiable message.
-  The status continues updating at the configured heartbeat interval (15s by
+  The status continues updating at the configured heartbeat interval (10s by
   default). Setting the silence threshold to 0 disables the waiting indicator.
   Completion, failure, cancellation, and startup reconciliation still own status
   cleanup. This shared heartbeat behavior also applies to other providers.

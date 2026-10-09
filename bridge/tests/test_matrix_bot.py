@@ -757,7 +757,7 @@ async def test_status_callback_forwards_new_text_after_interval(
 def test_status_min_interval_matches_telegram_heartbeat() -> None:
     from telegram_bot.core.matrix import bot as bot_module
 
-    assert bot_module.STATUS_MIN_INTERVAL_S == 15.0
+    assert bot_module.STATUS_MIN_INTERVAL_S == 10.0
 
 
 @pytest.mark.anyio

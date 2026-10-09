@@ -129,7 +129,7 @@ Status: 설계 문서만 있음. **구현하지 않았고 운영 반영 승인�
   이벤트마다 `input()`이 들어간다. `input()`은 다시 `with_reply_context` →
   `_fetch_parent` GET (`1648-1661`)과 `control()` → `_cancel_active` →
   `await runner.cancel(job)` (`1266-1275`)을 부른다. 후자는 **타임아웃이 없다** (#1959 항목).
-- 병렬 턴에서는 `/stop`이 더 자주 쓰이고 status bubble 경쟁도 늘어난다(턴마다 15초 간격,
+- 병렬 턴에서는 `/stop`이 더 자주 쓰이고 status bubble 경쟁도 늘어난다(턴마다 10초 간격,
   `bot.py:152`). 그러면 **#1959의 "/stop이 락을 쥔 채 무한 대기" 문제가 모든 lane을
   얼린다.** 병렬화 전에 반드시 먼저 고쳐야 한다(§4 PR-2).
 
