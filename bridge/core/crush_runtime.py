@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from telegram_bot.utils.channel_environment import without_channel_selection
+
 from .agent_runtime import (
     AgentEvent,
     AgentSession,
@@ -210,8 +212,11 @@ class CrushServerClient:
             # The caller owns the whole environment, staging included.
             self._env = dict(process_environment)
         else:
+            # #2177: nor the frontend's channel selection (CCC_CHANNEL ...).
             self._env = {
-                k: v for k, v in os.environ.items() if k not in _INHERITED_ENV_BLOCKLIST
+                k: v
+                for k, v in without_channel_selection(os.environ).items()
+                if k not in _INHERITED_ENV_BLOCKLIST
             }
             # The crush server learns the fleet providers and the read-only
             # permission set only from CRUSH_GLOBAL_CONFIG. Without it crush

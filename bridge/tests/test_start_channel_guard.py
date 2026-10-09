@@ -133,6 +133,30 @@ class InheritedChannelGuardTests(unittest.TestCase):
         self.assertIsNone(telegram.poll(), "--channel matrix --stop killed the Telegram bridge")
         self.assertIsNone(matrix.poll(), "--channel matrix --stop killed the Matrix frontend")
 
+    def test_provider_child_shell_of_matrix_frontend_targets_telegram(self):
+        # #2177 proposal 1: the bridge now blanks the selection keys in its
+        # provider children (BOT_DATA_DIR stays for the memory hooks). A
+        # Telegram --stop typed in that tool shell needs no --channel and
+        # never reaches the Matrix frontend.
+        from telegram_bot.utils.channel_environment import channel_selection_blank_overlay
+
+        telegram = self._telegram_bridge()
+        matrix = self._matrix_frontend()
+        frontend = {**MATRIX_SCOPED, "BOT_DATA_DIR": "/nonexistent/.ccc-matrix"}
+        env = self._clean_env()
+        env.update(frontend)
+        env.update(channel_selection_blank_overlay(frontend))
+        r = subprocess.run(
+            ["bash", str(self.start_script), "--path", self.root, "--stop"],
+            cwd=self.repo_root, text=True, capture_output=True, check=False,
+            env=env, timeout=120,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Refused: action=", r.stdout)
+        time.sleep(0.5)
+        self.assertIsNotNone(telegram.poll(), "--stop from a provider child left Telegram running")
+        self.assertIsNone(matrix.poll(), "--stop from a provider child killed the Matrix frontend")
+
     def test_status_is_not_guarded(self):
         r = self._start_sh("--status", inherit_matrix=True)
         self.assertNotEqual(r.returncode, 10, r.stdout + r.stderr)

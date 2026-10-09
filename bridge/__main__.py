@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from telegram_bot.utils.channel_environment import (
+    channel_selection_blank_overlay,
+    without_channel_selection,
+)
 from telegram_bot.utils.config import Settings, bind_config
 from telegram_bot.utils.logging_setup import setup_logging
 from telegram_bot.utils.wrapper_environment import (
@@ -117,7 +121,11 @@ def _build_piri_runtime(settings: Settings) -> Any:
         executable=settings.piri_cli_path,
         # #1771: the ccc-piri wrapper reads its real-CLI/memory keys only from
         # the process environment; hand over the ones set in the .env files.
-        process_environment=with_wrapper_environment(os.environ, settings),
+        # #2177: the agent's tool shell must not inherit the frontend's
+        # channel selection.
+        process_environment=without_channel_selection(
+            with_wrapper_environment(os.environ, settings)
+        ),
         model_catalog_directory=str(Path(settings.project_root).resolve()),
         memory_materializer_path=settings.codex_memory_materializer_path,
         memory_bootstrap_timeout_seconds=(
@@ -395,7 +403,12 @@ def _build_standard_context(
             # #1771: the ccc-codex wrapper reads its real-CLI/materializer keys
             # only from the process environment. Add the ones configured in the
             # .env files that os.environ lacks; an explicit value always wins.
-            wrapper_overlay = missing_wrapper_environment(settings, os.environ)
+            # #2177: CodexRuntime merges os.environ under this overlay, so the
+            # frontend's channel selection is blanked rather than removed.
+            wrapper_overlay = {
+                **channel_selection_blank_overlay(os.environ),
+                **missing_wrapper_environment(settings, os.environ),
+            }
             if process_environment is None:
                 # Without an overlay the runtime keeps inheriting os.environ
                 # exactly as before; only a configured key opts into the

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -15,6 +16,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import SandboxSettings
 
+from telegram_bot.utils.channel_environment import channel_selection_blank_overlay
 from telegram_bot.utils.memory_policy import MEMORY_MODE_AUDIENCE_SCOPED, MEMORY_MODE_OFF
 from telegram_bot.utils.orphan_reaper import BRIDGE_CHILD_ENV_VALUE, BRIDGE_CHILD_ENV_VAR
 
@@ -122,7 +124,12 @@ class ClaudeRuntimeOptionsMixin:
         # carrying this marker, so it can never reach those. Set unconditionally
         # (outside the settings guard) so every bridge-spawned child is
         # attributable, and last so an execution profile cannot drop it.
+        #
+        # #2177: the SDK merges os.environ under options.env, so the frontend's
+        # channel selection (CCC_CHANNEL=matrix ...) can only be blanked, not
+        # removed. A key an execution profile set explicitly still wins.
         options.env = {
+            **channel_selection_blank_overlay(os.environ),
             **(dict(options.env) if options.env is not None else {}),
             BRIDGE_CHILD_ENV_VAR: BRIDGE_CHILD_ENV_VALUE,
         }
