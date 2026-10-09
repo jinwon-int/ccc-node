@@ -1742,10 +1742,12 @@ def _constraint_lines(c, hint_ids, budget):
     ordered, seen = [], set()
     for fid in hint_ids:
         if fid in by_id and fid not in seen:
-            ordered.append(by_id[fid]); seen.add(fid)
+            ordered.append(by_id[fid])
+            seen.add(fid)
     for r in rows:
         if r[0] not in seen:
-            ordered.append(r); seen.add(r[0])
+            ordered.append(r)
+            seen.add(r[0])
     folded, extra, by_key = [], {}, {}
     for fid, o, f in ordered:
         k = _constraint_key(f)
