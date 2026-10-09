@@ -1701,13 +1701,105 @@ def _auto_distill_share():
     return value if 0.0 <= value <= 1.0 else _AUTO_DISTILL_SHARE_DEFAULT
 
 
+CONSTRAINT_BUDGET_DEFAULT = 12000  # bytes ≈ 3k tokens; 0 = unbounded (pre-#2216)
+
+
+def _constraint_budget():
+    """Byte budget for the assembled constraint block (#2216).
+
+    Env CCC_NUNCHI_CONSTRAINT_BUDGET; non-integer or negative falls back to
+    the default, 0 disables the bound (legacy G4 "inject every constraint").
+    """
+    raw = os.environ.get("CCC_NUNCHI_CONSTRAINT_BUDGET", "").strip()
+    if not raw:
+        return CONSTRAINT_BUDGET_DEFAULT
+    try:
+        v = int(raw)
+    except ValueError:
+        return CONSTRAINT_BUDGET_DEFAULT
+    return v if v >= 0 else CONSTRAINT_BUDGET_DEFAULT
+
+
+def _constraint_key(text):
+    """Normalised identity for folding near-duplicate constraints: case- and
+    whitespace-insensitive, first 40 chars. Session-scoped rules get
+    re-extracted with small wording drifts ("fresh approval 필수" ×5)."""
+    return " ".join(str(text or "").lower().split())[:40]
+
+
+def _constraint_lines(c, hint_ids, budget):
+    """Render the constraint block: hint matches first, then recency (id
+    DESC), near-duplicates folded (newest kept, `(+N 유사)` appended), bounded
+    to `budget` bytes with a tail line counting what was left out. The first
+    constraint is always emitted so a tiny budget degrades to one rule, not
+    none. `budget` 0 keeps every open constraint (legacy)."""
+    rows = c.execute(
+        "SELECT id,observed,fact FROM peer_facts WHERE valid_to IS NULL"
+        " AND kind = 'constraint' ORDER BY id DESC").fetchall()
+    if not rows:
+        return []
+    by_id = {r[0]: r for r in rows}
+    ordered, seen = [], set()
+    for fid in hint_ids:
+        if fid in by_id and fid not in seen:
+            ordered.append(by_id[fid])
+            seen.add(fid)
+    for r in rows:
+        if r[0] not in seen:
+            ordered.append(r)
+            seen.add(r[0])
+    folded, extra, by_key = [], {}, {}
+    for fid, o, f in ordered:
+        k = _constraint_key(f)
+        if k in by_key:
+            extra[by_key[k]] = extra.get(by_key[k], 0) + 1
+            continue
+        by_key[k] = fid
+        folded.append((fid, o, f))
+    out, used, omitted = [], 0, 0
+    for fid, o, f in folded:
+        line = f"- [제약/{o}] {f}"
+        if extra.get(fid):
+            line += f" (+{extra[fid]} 유사)"
+        b = len(line.encode()) + 1
+        if budget and out and used + b > budget:
+            omitted += 1
+            continue
+        out.append(line)
+        used += b
+    if omitted:
+        out.append(
+            f"- [제약] {omitted}건 생략(예산 {budget}B, 열린 제약 {len(rows)}건)"
+            " — 전체: nunchi.py constraints")
+    return out
+
+
+def constraints_cmd(all_rows=False):
+    """List open constraints (newest first) — the full view the assembled
+    block points at when its budget folds or omits rows (#2216)."""
+    c = db()
+    rows = c.execute(
+        "SELECT id,observed,fact,created_at FROM peer_facts WHERE valid_to IS NULL"
+        " AND kind = 'constraint' ORDER BY id DESC").fetchall()
+    for fid, o, f, at in rows:
+        print(f"#{fid} {str(at)[:10]} [제약/{o}] {f}")
+    print(f"{len(rows)} open constraints")
+
+
 def assemble(budget, hint, limit=25):
     """P2-7 — task-conditioned ranked snapshot assembly, bounded in bytes.
 
     Fixed ranking contract (#1264 P2-7):
       1. header warnings (backend state, review-queue surface) — always
-      2. constraints — always, never dropped to fit the budget (G4: a rule
-         you must not break is exactly the fact whose miss is an incident)
+      2. constraints — always ahead of facts and never crowded out BY FACTS
+         (G4: a rule you must not break is exactly the fact whose miss is an
+         incident). Since #2216 the constraint block has its OWN byte budget
+         (CCC_NUNCHI_CONSTRAINT_BUDGET, default 12000; 0 = unbounded legacy):
+         hint-matched constraints first, then recency; near-duplicates fold
+         into one line; what does not fit is counted in a one-line tail that
+         points at `nunchi.py constraints`. Rationale: on one node the open
+         constraint list reached 1,221 rows = 169 KB per SessionStart while
+         the fact block stayed capped at 3,000 bytes.
       3. facts ranked: --hint FTS matches first (bm25 relevance via the
          P2-6-widened search), then plain recency (id DESC) filling what
          remains. Each fact line keeps its P1-4 ⟳ live-check marker inline
@@ -1724,16 +1816,12 @@ def assemble(budget, hint, limit=25):
     c = db()
     _sweep_expired_observations(c)  # #1478 — read-only on lock contention
     lines = _snapshot_header(c)
-    cons = c.execute(
-        "SELECT observed,fact FROM peer_facts WHERE valid_to IS NULL"
-        " AND kind = 'constraint' ORDER BY id DESC").fetchall()
-    for o, f in cons:
-        lines.append(f"- [제약/{o}] {f}")
-    used = sum(len(ln.encode()) + 1 for ln in lines)
     hint = (hint or "").strip()
     hint_ids = []
     if hint:
         hint_ids = [r[0] for r in search(c, hint, limit=limit, include_history=False)]
+    lines.extend(_constraint_lines(c, hint_ids, _constraint_budget()))
+    used = sum(len(ln.encode()) + 1 for ln in lines)
     rest_rows = c.execute(
         "SELECT id,observed,kind,fact,mutability,evidence FROM peer_facts WHERE valid_to IS NULL"
         " AND kind NOT IN ('constraint','observation') ORDER BY id DESC", ()).fetchall()
@@ -1926,6 +2014,8 @@ if __name__ == "__main__":
     elif cmd == "assemble":
         assemble(int(flag("--budget", "4096")), flag("--hint", ""),
                  int(flag("--limit", "25")))
+    elif cmd == "constraints":
+        constraints_cmd()
     elif cmd == "review":
         pos = [a for a in args if not a.startswith("--")]
         review(int(pos[0]) if pos else None, clear="--clear" in args)

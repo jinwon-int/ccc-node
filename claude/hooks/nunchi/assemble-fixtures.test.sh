@@ -94,8 +94,8 @@ ok "F-02 denser hint match ranks first among matches" \
 # ---- F-03 G4: constraints never dropped, always before facts ----------------
 fixture_db f03
 sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review,mutability) VALUES
- ('family-assistant','yukson','constraint','CONSTRAINT-OLD 규칙','2026-08-07','c1','2026-08-07T00:00:00+00:00',3,0,'static'),
- ('family-assistant','yukson','constraint','CONSTRAINT-NEW 규칙','2026-08-08','c2','2026-08-08T00:00:00+00:00',3,0,'static');"
+ ('family-assistant','node-a','constraint','CONSTRAINT-OLD 규칙','2026-08-07','c1','2026-08-07T00:00:00+00:00',3,0,'static'),
+ ('family-assistant','node-a','constraint','CONSTRAINT-NEW 규칙','2026-08-08','c2','2026-08-08T00:00:00+00:00',3,0,'static');"
 seed fact user "FILLER-NEW 최신 사실"
 seed fact user "FILLER-OLD 오래된 사실"
 run_asm 300 ""
@@ -268,6 +268,63 @@ ok "F-15 user-peer row assembles" 'grep -q "USER-PREF" <<<"$ASM"'
 ok "F-15 node-peer row assembles" 'grep -q "NODE-FACT" <<<"$ASM"'
 ok "F-15 recency tail order holds across peers" \
   '[ "$(line_of "NODE-FACT")" -lt "$(line_of "USER-PREF")" ]'
+
+# ---- F-16 constraint block has its own byte budget (#2216) -----------------
+# 1,221 open constraints = 169 KB per SessionStart on one node while the fact
+# block stayed at 3,000 B. Constraints keep priority over facts (G4) but the
+# block itself is bounded: newest first, a tail line counts the omitted rows.
+fixture_db f16
+for i in $(seq 1 12); do
+  sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review) VALUES
+   ('family-assistant','node-a','constraint','CB-RULE-$i 이 규칙은 길이를 맞추기 위한 채움 문장입니다 $i','2026-08-07','cb-$i','2026-08-07T00:00:00+00:00',3,0);"
+done
+export CCC_NUNCHI_CONSTRAINT_BUDGET=300
+run_asm 8192 ""
+unset CCC_NUNCHI_CONSTRAINT_BUDGET
+ok "F-16 newest constraint survives the budget" 'grep -q "CB-RULE-12 " <<<"$ASM"'
+ok "F-16 block is bounded: fewer than 12 constraint lines" \
+  '[ "$(grep -c "^- \[제약/" <<<"$ASM")" -lt 12 ]'
+ok "F-16 tail counts the omitted rows and points at the full view" \
+  'grep -q "^- \[제약\] [0-9]*건 생략(예산 300B, 열린 제약 12건) — 전체: nunchi.py constraints" <<<"$ASM"'
+ok "F-16 constraint lines + tail stay within budget" \
+  '[ "$(grep "^- \[제약/" <<<"$ASM" | wc -c)" -le 300 ]'
+ok "F-16 constraints subcommand lists every open rule" \
+  '[ "$(python3 "$NP" constraints | grep -c "^#")" = 12 ]'
+
+# ---- F-17 hint-matched constraint outranks a newer one ---------------------
+fixture_db f17
+sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review) VALUES
+ ('family-assistant','node-a','constraint','CH-OLD HINTWORD-ZETA 관련 규칙','2026-08-07','ch-old','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','CH-NEW 무관한 최신 규칙','2026-08-08','ch-new','2026-08-08T00:00:00+00:00',3,0);"
+run_asm 8192 "HINTWORD-ZETA"
+ok "F-17 hint-matched constraint comes first" \
+  '[ -n "$(line_of "CH-OLD")" ] && [ "$(line_of "CH-OLD")" -lt "$(line_of "CH-NEW")" ]'
+run_asm 8192 ""
+ok "F-17 without a hint recency order holds" \
+  '[ "$(line_of "CH-NEW")" -lt "$(line_of "CH-OLD")" ]'
+
+# ---- F-18 near-duplicate constraints fold into one line --------------------
+fixture_db f18
+sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review) VALUES
+ ('family-assistant','node-a','constraint','receiver 수정(설정 변경 + 서비스 재시작)에는 신선한 승인 필수 — 세션 A','2026-08-07','cd-1','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','receiver 수정(설정 변경 + 서비스 재시작)에는 신선한 승인 필수 — 세션 B','2026-08-08','cd-2','2026-08-08T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','CD-OTHER 전혀 다른 규칙','2026-08-09','cd-3','2026-08-09T00:00:00+00:00',3,0);"
+run_asm 8192 ""
+ok "F-18 duplicates fold to one line with a count" \
+  '[ "$(grep -c "receiver 수정" <<<"$ASM")" = 1 ] && grep -q "세션 B (+1 유사)" <<<"$ASM"'
+ok "F-18 unrelated constraint untouched" 'grep -q "CD-OTHER" <<<"$ASM"'
+
+# ---- F-19 budget 0 keeps the legacy unbounded block -------------------------
+fixture_db f19
+for i in $(seq 1 6); do
+  sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review) VALUES
+   ('family-assistant','node-a','constraint','CZ-RULE-$i 규칙 $i','2026-08-07','cz-$i','2026-08-07T00:00:00+00:00',3,0);"
+done
+export CCC_NUNCHI_CONSTRAINT_BUDGET=0
+run_asm 8192 ""
+unset CCC_NUNCHI_CONSTRAINT_BUDGET
+ok "F-19 budget 0: every constraint present, no tail" \
+  '[ "$(grep -c "^- \[제약/" <<<"$ASM")" = 6 ] && ! grep -q "건 생략" <<<"$ASM"'
 
 echo "----"
 echo "PASS=$pass FAIL=$fail"

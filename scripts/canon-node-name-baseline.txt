@@ -61,7 +61,7 @@
 1 claude/hooks/jev/README.md
 1 claude/hooks/lib/test-stub.test.sh
 4 claude/hooks/load-memory.sh
-12 claude/hooks/nunchi/assemble-fixtures.test.sh
+10 claude/hooks/nunchi/assemble-fixtures.test.sh
 14 claude/hooks/nunchi/bench-qset.tsv
 5 claude/hooks/nunchi/bench.sh
 5 claude/hooks/nunchi/bench.test.sh
