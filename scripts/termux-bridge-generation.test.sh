@@ -6,7 +6,11 @@
 # are checked without a real bridge.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT_REPO="$(cd "$HERE/.." && pwd)"
 SUT="$HERE/termux-bridge-generation.sh"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$ROOT_REPO/claude/hooks/lib/test-stub.sh"
+ccc_test_reset_hook_env
 pass=0; fail=0
 ok()  { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 okc() { if [ "$1" = "$2" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $3 (rc=$1 want=$2)"; fi; }
@@ -14,17 +18,15 @@ okc() { if [ "$1" = "$2" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "
 command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 not available"; echo "PASS=0 FAIL=0"; exit 0; }
 command -v flock >/dev/null 2>&1 || { echo "SKIP: flock not available"; echo "PASS=0 FAIL=0"; exit 0; }
 
-TMP="$(mktemp -d)"
+TMP="$(ccc_test_tmpdir)" || exit 1
 trap '[ -n "${KEEP:-}" ] || rm -rf "$TMP"' EXIT
-TMP="$(readlink -e "$TMP")"
 ROOT="$TMP/root"; CALLS="$TMP/calls"; BIN="$TMP/bin"
 mkdir -p "$ROOT/preparations" "$BIN"
 
-# Stubs are exec'd directly; Termux has no /usr/bin/env unless termux-exec is
-# preloaded, so write the real bash path into each shebang.
-SHEBANG="#!$(command -v bash)"
+# Stubs are exec'd directly; write_exec_stub resolves the real bash for the
+# shebang (Termux has no /usr/bin/env without termux-exec).
 # runtime python stub: answers the serving gate from $TMP/gate-<gen>, else defers to python3
-{ echo "$SHEBANG"; cat <<'EOF'
+write_exec_stub "$TMP/runtime-python" <<'EOF'
 for a in "$@"; do
   case "$a" in */prepared_runtime.py)
     gen="$(basename "$(dirname "$(dirname "$(dirname "$a")")")")"
@@ -34,8 +36,6 @@ for a in "$@"; do
 done
 exec python3 "$@"
 EOF
-} > "$TMP/runtime-python"
-chmod +x "$TMP/runtime-python"
 
 # start.sh stub: logs args + channel env, exits with $TMP/start-rc (default 0)
 cat > "$TMP/start.sh" <<'EOF'
@@ -67,13 +67,11 @@ health "$TG" "$ROOT/preparations/genA/source/bridge" 0
 health "$MX" "$ROOT/preparations/genA/source/bridge" 0
 
 # sv stub: records and makes the Matrix health report the pointer's generation
-{ echo "$SHEBANG"; cat <<'EOF'
+write_exec_stub "$BIN/sv" <<'EOF'
 echo "sv $*" >> "$STUB_DIR/calls"
 src="$(readlink -e "$STUB_ROOT/bridge-current")/source/bridge"
 printf '{"workload":{"active_requests":0},"runtime_generation":{"source_dir":"%s"}}\n' "$src" > "$STUB_MX"
 EOF
-} > "$BIN/sv"
-chmod +x "$BIN/sv"
 mkdir -p "$TMP/service/ccc-matrix-bridge"
 
 PY3="$(command -v python3)"
