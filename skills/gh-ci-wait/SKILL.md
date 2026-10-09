@@ -101,7 +101,9 @@ Never claim auto-resume anyway. Either:
    loops reacted to FAILED/MERGED only (#2113, #2120 — the operator noticed
    first). `ci-watch.sh` computes one verdict word inside jq and pins the
    head, so a newer push ends the watch as `superseded` instead of reporting
-   a stale rollup. Or
+   a stale rollup. It reports green only once every required context of the
+   base branch is present and successful, not merely when nothing is pending
+   (#2200). Or
 2. say plainly that auto-resume is unavailable and the user should ping you
    when CI ends.
 

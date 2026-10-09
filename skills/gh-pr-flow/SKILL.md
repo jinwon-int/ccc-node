@@ -287,7 +287,15 @@ so the account name is not an identity.
      names the checks · `11` merged · `12` closed · `13` head moved · `20`
      timeout). It derives the verdict inside jq; two ad-hoc loops on
      2026-10-02 grepped `gh --jq` output for a key order gh never produces
-     and silently missed "green" twice (#2113, #2120).
+     and silently missed "green" twice (#2113, #2120). Green also requires
+     every required context of the base branch (branch protection plus
+     rulesets) to be present and successful: right after a push or
+     `update-branch` only CodeQL had registered, "nothing pending" held, and
+     an older version reported green on a head whose required check later
+     failed (#2200). When the required set cannot be read it falls back to
+     green on `--settle` (default 2) consecutive polls; `--required-context`
+     pins the set explicitly. `approve-via-relay.sh` refuses a head with a
+     required check not yet reported, for the same reason.
    - `gh pr update-branch` only does something when the head is genuinely
      behind. Gate it on `viewerCanUpdateBranch`, which GitHub documents as
      `false` when the head is already up to date. The REST endpoint answers

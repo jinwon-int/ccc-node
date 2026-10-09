@@ -186,6 +186,24 @@ bad_checks="$(jq '[.statusCheckRollup[]? | select(
 )] | length' <<<"$pr_json")"
 [ "$bad_checks" -eq 0 ] \
   || { echo "ERROR: pending or unsuccessful checks exist" >&2; exit 65; }
+# "Every reported check succeeded" also holds in the short window after a push
+# or update-branch when only the first workflows have registered (#2200), so
+# every required context of the base branch (classic protection, readable
+# without admin through the branch endpoint, plus rulesets) must be present.
+# An unreadable required set fails closed.
+required_classic="$(review_gh api "repos/$repo/branches/$default_branch" \
+  --jq '[.protection.required_status_checks.contexts // [] | .[]]')" \
+  || { echo "ERROR: could not read the base branch's required checks" >&2; exit 65; }
+required_rules="$(review_gh api "repos/$repo/rules/branches/$default_branch" \
+  --jq '[.[]? | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context]')" \
+  || { echo "ERROR: could not read the base branch's rulesets" >&2; exit 65; }
+missing_required="$(jq -r --argjson a "$required_classic" --argjson b "$required_rules" \
+  '[.statusCheckRollup[]? | (.name // .context // empty)] as $have
+   | ($a + $b | unique) | map(select(. as $c | ($have | index($c)) == null)) | join(",")' \
+  <<<"$pr_json")" \
+  || { echo "ERROR: could not evaluate required checks" >&2; exit 65; }
+[ -z "$missing_required" ] \
+  || { echo "ERROR: required checks not yet reported on the exact head: $missing_required" >&2; exit 65; }
 
 if [ "$dry_run" -eq 1 ]; then
   jq -n --arg repo "$repo" --argjson pr "$pr" --arg actor "$actor" \

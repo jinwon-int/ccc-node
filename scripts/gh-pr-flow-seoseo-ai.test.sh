@@ -48,6 +48,14 @@ elif [ "$1" = "api" ] && [[ "$2" == repos/* ]] && [[ " $* " == *" .default_branc
 elif [ "$1" = "api" ] && [[ "$2" == repos/*/commits/* ]]; then
   # When the head commit was created; an approval must postdate it (#1765).
   printf '%s\n' "${MOCK_HEAD_COMMITTED_AT-2026-09-16T10:23:31Z}"
+elif [ "$1" = "api" ] && [[ "$2" == repos/*/rules/branches/* ]]; then
+  # Ruleset-required contexts (#2200); "FAIL" simulates an unreadable answer.
+  [ "${MOCK_REQUIRED_RULES-[]}" != FAIL ] || exit 1
+  printf '%s\n' "${MOCK_REQUIRED_RULES-[]}"
+elif [ "$1" = "api" ] && [[ "$2" == repos/*/branches/* ]]; then
+  # Classic-protection required contexts via the non-admin branch endpoint (#2200).
+  [ "${MOCK_REQUIRED_CLASSIC-[]}" != FAIL ] || exit 1
+  printf '%s\n' "${MOCK_REQUIRED_CLASSIC-[]}"
 elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" author,baseRefName,state,isDraft,headRefOid,mergeable,reviewRequests,statusCheckRollup "* ]]; then
   jq -n \
     --arg author "${MOCK_AUTHOR:-jinon86}" \
@@ -57,7 +65,7 @@ elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" author,baseRefName,state,isDraft
     '{author:{login:$author},baseRefName:$base,state:"OPEN",isDraft:false,
       headRefOid:$head,mergeable:"MERGEABLE",
       reviewRequests:[{login:$reviewer}],
-      statusCheckRollup:[{status:"COMPLETED",conclusion:"SUCCESS"}]}'
+      statusCheckRollup:[{status:"COMPLETED",conclusion:"SUCCESS",name:"validate-harness"}]}'
 elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" headRefOid,reviews "* ]]; then
   jq -n --arg head "${MOCK_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
     --argjson reviews "${MOCK_BEFORE_REVIEWS:-[]}" \
@@ -252,6 +260,20 @@ elif [ -e "$MOCK_REVIEW_MARKER" ]; then
   bad "helper submitted a review with an unsafe credential file"
 else
   ok
+fi
+
+#2200 regression: right after a push only the first workflows have reported,
+# so "every reported check succeeded" holds while required checks are missing.
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_REQUIRED_CLASSIC='["validate-harness","bridge-tests (3.11)"]' \
+   run_helper >"$TMP/missing-required.out" 2>&1; then
+  bad "helper approved while a required check had not reported"
+elif [ -e "$MOCK_REVIEW_MARKER" ]; then
+  bad "helper submitted a review before refusing missing required checks"
+elif grep -Fq "required checks not yet reported on the exact head: bridge-tests (3.11)" "$TMP/missing-required.out"; then
+  ok
+else
+  bad "helper failed for the wrong reason with a missing required check"
 fi
 
 if grep -Fq 'auth token' "$MOCK_GH_LOG"; then
