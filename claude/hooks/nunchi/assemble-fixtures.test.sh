@@ -94,8 +94,8 @@ ok "F-02 denser hint match ranks first among matches" \
 # ---- F-03 G4: constraints never dropped, always before facts ----------------
 fixture_db f03
 sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review,mutability) VALUES
- ('family-assistant','yukson','constraint','CONSTRAINT-OLD 규칙','2026-08-07','c1','2026-08-07T00:00:00+00:00',3,0,'static'),
- ('family-assistant','yukson','constraint','CONSTRAINT-NEW 규칙','2026-08-08','c2','2026-08-08T00:00:00+00:00',3,0,'static');"
+ ('family-assistant','node-a','constraint','CONSTRAINT-OLD 규칙','2026-08-07','c1','2026-08-07T00:00:00+00:00',3,0,'static'),
+ ('family-assistant','node-a','constraint','CONSTRAINT-NEW 규칙','2026-08-08','c2','2026-08-08T00:00:00+00:00',3,0,'static');"
 seed fact user "FILLER-NEW 최신 사실"
 seed fact user "FILLER-OLD 오래된 사실"
 run_asm 300 ""
@@ -270,13 +270,13 @@ ok "F-15 recency tail order holds across peers" \
   '[ "$(line_of "NODE-FACT")" -lt "$(line_of "USER-PREF")" ]'
 
 # ---- F-16 constraint block has its own byte budget (#2216) -----------------
-# 1,221 open constraints = 169 KB per SessionStart on yukson while the fact
+# 1,221 open constraints = 169 KB per SessionStart on one node while the fact
 # block stayed at 3,000 B. Constraints keep priority over facts (G4) but the
 # block itself is bounded: newest first, a tail line counts the omitted rows.
 fixture_db f16
 for i in $(seq 1 12); do
   sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review) VALUES
-   ('family-assistant','yukson','constraint','CB-RULE-$i 이 규칙은 길이를 맞추기 위한 채움 문장입니다 $i','2026-08-07','cb-$i','2026-08-07T00:00:00+00:00',3,0);"
+   ('family-assistant','node-a','constraint','CB-RULE-$i 이 규칙은 길이를 맞추기 위한 채움 문장입니다 $i','2026-08-07','cb-$i','2026-08-07T00:00:00+00:00',3,0);"
 done
 export CCC_NUNCHI_CONSTRAINT_BUDGET=300
 run_asm 8192 ""
@@ -294,8 +294,8 @@ ok "F-16 constraints subcommand lists every open rule" \
 # ---- F-17 hint-matched constraint outranks a newer one ---------------------
 fixture_db f17
 sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review) VALUES
- ('family-assistant','yukson','constraint','CH-OLD HINTWORD-ZETA 관련 규칙','2026-08-07','ch-old','2026-08-07T00:00:00+00:00',3,0),
- ('family-assistant','yukson','constraint','CH-NEW 무관한 최신 규칙','2026-08-08','ch-new','2026-08-08T00:00:00+00:00',3,0);"
+ ('family-assistant','node-a','constraint','CH-OLD HINTWORD-ZETA 관련 규칙','2026-08-07','ch-old','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','CH-NEW 무관한 최신 규칙','2026-08-08','ch-new','2026-08-08T00:00:00+00:00',3,0);"
 run_asm 8192 "HINTWORD-ZETA"
 ok "F-17 hint-matched constraint comes first" \
   '[ -n "$(line_of "CH-OLD")" ] && [ "$(line_of "CH-OLD")" -lt "$(line_of "CH-NEW")" ]'
@@ -306,9 +306,9 @@ ok "F-17 without a hint recency order holds" \
 # ---- F-18 near-duplicate constraints fold into one line --------------------
 fixture_db f18
 sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review) VALUES
- ('family-assistant','yukson','constraint','receiver 수정(설정 변경 + 서비스 재시작)에는 신선한 승인 필수 — 세션 A','2026-08-07','cd-1','2026-08-07T00:00:00+00:00',3,0),
- ('family-assistant','yukson','constraint','receiver 수정(설정 변경 + 서비스 재시작)에는 신선한 승인 필수 — 세션 B','2026-08-08','cd-2','2026-08-08T00:00:00+00:00',3,0),
- ('family-assistant','yukson','constraint','CD-OTHER 전혀 다른 규칙','2026-08-09','cd-3','2026-08-09T00:00:00+00:00',3,0);"
+ ('family-assistant','node-a','constraint','receiver 수정(설정 변경 + 서비스 재시작)에는 신선한 승인 필수 — 세션 A','2026-08-07','cd-1','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','receiver 수정(설정 변경 + 서비스 재시작)에는 신선한 승인 필수 — 세션 B','2026-08-08','cd-2','2026-08-08T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','CD-OTHER 전혀 다른 규칙','2026-08-09','cd-3','2026-08-09T00:00:00+00:00',3,0);"
 run_asm 8192 ""
 ok "F-18 duplicates fold to one line with a count" \
   '[ "$(grep -c "receiver 수정" <<<"$ASM")" = 1 ] && grep -q "세션 B (+1 유사)" <<<"$ASM"'
@@ -318,7 +318,7 @@ ok "F-18 unrelated constraint untouched" 'grep -q "CD-OTHER" <<<"$ASM"'
 fixture_db f19
 for i in $(seq 1 6); do
   sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review) VALUES
-   ('family-assistant','yukson','constraint','CZ-RULE-$i 규칙 $i','2026-08-07','cz-$i','2026-08-07T00:00:00+00:00',3,0);"
+   ('family-assistant','node-a','constraint','CZ-RULE-$i 규칙 $i','2026-08-07','cz-$i','2026-08-07T00:00:00+00:00',3,0);"
 done
 export CCC_NUNCHI_CONSTRAINT_BUDGET=0
 run_asm 8192 ""

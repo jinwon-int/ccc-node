@@ -1797,7 +1797,7 @@ def assemble(budget, hint, limit=25):
          (CCC_NUNCHI_CONSTRAINT_BUDGET, default 12000; 0 = unbounded legacy):
          hint-matched constraints first, then recency; near-duplicates fold
          into one line; what does not fit is counted in a one-line tail that
-         points at `nunchi.py constraints`. Rationale: on yukson the open
+         points at `nunchi.py constraints`. Rationale: on one node the open
          constraint list reached 1,221 rows = 169 KB per SessionStart while
          the fact block stayed capped at 3,000 bytes.
       3. facts ranked: --hint FTS matches first (bm25 relevance via the
