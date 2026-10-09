@@ -928,3 +928,100 @@ async def test_serve_returns_when_the_transport_ends_with_the_spool_notifier_on(
     bot._transport_factory = lambda config, runner: _PolicyTransport(config, runner, script=script)
     with anyio.fail_after(5):
         await bot.serve()
+
+
+# --- #2207: relay-mode spool drains before/without the transport ---------------
+
+def _relay_bot(tmp_path: Path, url: str, **over: Any) -> tuple[MatrixBot, Path]:
+    secret = tmp_path / "relay.secret"
+    secret.write_text("s3cret\n", encoding="utf-8")
+    secret.chmod(0o600)
+    spool = tmp_path / "spool"
+    bot, _chat = _bot(
+        tmp_path,
+        push_enabled=True,
+        push_spool_dir=spool,
+        push_poll_interval=0.01,
+        push_fleet_relay_url=url,
+        push_fleet_relay_secret_file=secret,
+        push_fleet_node="testnode",
+        push_fleet_relay_timeout=2.0,
+        push_fleet_relay_exit_drain_seconds=5.0,
+        **over,
+    )
+    return bot, spool
+
+
+def _spool_record(spool: Path, name: str, text: str) -> None:
+    spool.mkdir(parents=True, exist_ok=True)
+    (spool / name).write_text(json.dumps({"text": text, "dedup": f"d:{name}"}), encoding="utf-8")
+
+
+class _OpenFailsTransport(FakeTransport):
+    async def open(self, initialize: bool = False) -> None:
+        self.events.append("open-failed")
+        raise ConnectionError("Cannot connect to host matrix.example.org: name resolution")
+
+
+@pytest.mark.anyio
+async def test_serve_drains_the_spool_to_the_relay_when_the_transport_cannot_open(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    """DNS-down shape (#2207): the homeserver lookup fails before the notifier
+    used to start, so spooled alerts stayed on the node. In relay mode the
+    notifier now runs first and the open failure waits for the drain."""
+    from test_fleet_alert_relay import _Server
+
+    server = _Server()
+    try:
+        bot, spool = _relay_bot(tmp_path, server.url)
+        _spool_record(spool, "0001-init-loop.json", "Telegram polling failed to initialize")
+        bot._transport_factory = lambda config, runner: _OpenFailsTransport(config, runner)
+        with anyio.fail_after(10):
+            with pytest.raises(ConnectionError):
+                await bot.serve()
+        assert len(server.requests) == 1, "the alert reached the relay although Matrix never opened"
+        assert not list(spool.glob("*.json")) and (spool / "sent" / "0001-init-loop.json").exists()
+    finally:
+        server.close()
+
+
+@pytest.mark.anyio
+async def test_serve_open_failure_without_relay_does_not_wait(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    spool = tmp_path / "spool"
+    bot, _chat = _bot(tmp_path, push_enabled=True, push_spool_dir=spool, push_fleet_relay_exit_drain_seconds=5.0)
+    _spool_record(spool, "0001.json", "room-mode record stays")
+    bot._transport_factory = lambda config, runner: _OpenFailsTransport(config, runner)
+    with anyio.fail_after(3):
+        with pytest.raises(ConnectionError):
+            await bot.serve()
+    assert (spool / "0001.json").exists(), "room mode has no transport-free delivery; record is kept"
+
+
+@pytest.mark.anyio
+async def test_serve_relay_notifier_is_not_registered_twice(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_fleet_alert_relay import _Server
+
+    server = _Server()
+    try:
+        bot, spool = _relay_bot(tmp_path, server.url)
+        started: list[str] = []
+        real_legs = bot._background_legs
+
+        def spy(stop: asyncio.Event, notifier: Any):
+            cancel_on_stop, stop_driven = real_legs(stop, notifier)
+            started.extend(name for name, _f in cancel_on_stop)
+            started.append(f"running_early={notifier.running_early}")
+            return cancel_on_stop, stop_driven
+
+        monkeypatch.setattr(bot, "_background_legs", spy)
+        _spool_record(spool, "0001.json", "delivered by the early notifier while serving")
+        await _serve_briefly(bot)
+        assert "matrix-spool-notifier" not in started and "running_early=True" in started
+        assert len(server.requests) == 1 and (spool / "sent" / "0001.json").exists()
+    finally:
+        server.close()
