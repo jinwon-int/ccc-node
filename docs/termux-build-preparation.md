@@ -38,7 +38,11 @@ version/hash. The system compiler and serving environment are unchanged.
 
 ## Prerequisites and invocation
 
-Run with Termux's base Python, with consistent Android build metadata. The
+Run with Termux's base Python (`$PREFIX/bin/python3`), with consistent Android
+build metadata. A venv interpreter is refused before any workspace is claimed
+(`must_run_with_base_interpreter`): an inherited `PATH` whose first `python3`
+was an old runtime venv otherwise failed the backend probe with a bare
+`No module named 'maturin'`. The
 reviewed backend profile requires **maturin 1.14.1**, both its system Python
 module and `$PREFIX/bin/maturin`. Rust, the Android Rust standard library,
 clang and patchelf must already be installed through the node's package
@@ -91,6 +95,48 @@ Python/Rust/Cargo environment overrides are removed from child processes;
 Rust and linker flags are replaced with the fixed serial-link profile.
 Operator network/proxy settings and the default Cargo configuration/registry
 remain applicable.
+
+## Reusing native wheels from a prior job on the same node
+
+The native build is about 90% of a full preparation (2702 of 3015 seconds on one
+Termux node), and three consecutive builds of an unchanged lock on that node
+produced bit-identical wheels. When nothing that determines the build output
+changed, point the new job at a previous **ready** job on the same node:
+
+```bash
+python -B bridge/termux_prepare.py \
+  --work-dir "$HOME/.ccc-node/preparations/<gen>/job" --verify-reinstall \
+  --reuse-wheels-from "$HOME/.ccc-node/preparations/<prior-gen>/job"
+```
+
+The new job still gets its own source seal, runtime venv, receipt, fresh
+install, readiness probes and (with `--verify-reinstall`) a real forced
+reinstall. Only the builder venv, build-tool install and `native-wheels` stage
+are replaced by a `native-wheels-reuse` stage, which:
+
+- refuses, before claiming the workspace, a prior job that is not an
+  owner-private non-symlinked directory, or whose owner-private receipt is not
+  `ready` with `fresh_install: pass`, names another `work_dir`, or does not
+  list exactly the five native wheels;
+- after measuring this run's own toolchain, refuses unless `android_api`,
+  `linker_threads`, both `lock_sha256` values and the complete `toolchain`
+  record (versions and binary hashes) are identical — any change means a full
+  build (rerun without the flag). Toolchain hashes keep the reuse on one node:
+  another node's builds differ (a second Termux node's pydantic-core wheel
+  hash differs from the first's);
+- copies the prior job's pip wheel cache (`pip-cache/wheels`, regular files
+  only, bounded) into this job's private cache and the wheelhouse evidence
+  copy, then requires every native wheel to match the prior receipt's digest;
+- after fresh install and reinstall, requires the cache to still hold exactly
+  those wheels (`reused_wheels_not_used` if pip built a native package again).
+
+pip's cached wheels keep their original sdist hash in `origin.json`, so the
+ordinary bootstrap still enforces `--require-hashes` against the lock. The
+receipt records `native_wheels: {"mode": "reused", "from": ..., "receipt_sha256": ...}`
+(`{"mode": "built"}` otherwise) and a `cache_scope` naming the reuse. Measured
+on that node (2026-10-09, reusing the 55f6b7bc job): **262 seconds** instead of
+3015, wheels identical. Reuse is a same-node shortcut, not cross-node wheel
+distribution or a signature; keep the prior job until the new one has served.
 
 ## Time, disk and receipts
 

@@ -10,6 +10,13 @@ import pytest
 from telegram_bot import termux_prepare as prep
 
 
+@pytest.fixture(autouse=True)
+def _base_interpreter(monkeypatch, request):
+    # The suite may run inside a venv; only the guard test exercises the check.
+    if "base_interpreter_guard" not in request.node.name:
+        monkeypatch.setattr(prep, "require_base_interpreter", lambda: None)
+
+
 def pin(name, version="1"):
     return f"{name}=={version} \\\n    --hash=sha256:{'a' * 64}\n"
 
@@ -206,6 +213,7 @@ sys.path.insert(0, {str(source.parent)!r})
 spec = importlib.util.spec_from_file_location("preparation_fixture", {str(source)!r})
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 m.android_build_api = lambda: 24
+m.require_base_interpreter = lambda: None
 m.PROBES = (("blocked", ("-c", "import os,time; from pathlib import Path; Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(30)")),)
 def prepare(runner, source, report, reinstall):
     report["scenarios"]["fresh_install"] = "in_progress"
@@ -290,3 +298,194 @@ def test_cancellation_kills_workers_after_group_leader_exits(tmp_path):
                     except ProcessLookupError:
                         pass
             driver.wait()
+
+
+# --- #2175: same-node native wheel reuse and base-interpreter guard ---------
+
+WHEELS = {
+    "cryptography-50.0.1-cp314-abi3-android_24_arm64_v8a.whl": b"crypto",
+    "jiter-0.16.0-cp314-cp314-android_24_arm64_v8a.whl": b"jiter",
+    "pydantic_core-2.46.5-cp314-cp314-android_24_arm64_v8a.whl": b"pydantic",
+    "pyromark-0.9.13-cp314-cp314-android_24_arm64_v8a.whl": b"pyromark",
+    "rpds_py-2026.6.3-cp314-cp314-android_24_arm64_v8a.whl": b"rpds",
+}
+INPUTS = {"android_api": 24, "linker_threads": 1, "lock_sha256": {"native": "n", "build-tools": "b"},
+          "toolchain": {"rustc": {"binary_sha256": "r"}, "python": "3.14.6"}}
+
+
+def sha(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def prior_job(root, **overrides):
+    root.chmod(0o700)
+    job = root / "prior"
+    job.mkdir(mode=0o700)
+    for name in ("wheelhouse", "pip-cache"):
+        (job / name).mkdir(mode=0o700)
+    (job / "pip-cache/wheels").mkdir(mode=0o700)
+    for index, (name, data) in enumerate(WHEELS.items()):
+        entry = job / "pip-cache/wheels" / f"{index:02x}" / "key"
+        entry.mkdir(parents=True, mode=0o700)
+        (entry / name).write_bytes(data)
+        (entry / "origin.json").write_text('{"archive_info": {}}')
+        (job / "wheelhouse" / name).write_bytes(data)
+    extra = job / "pip-cache/wheels/ff/key"
+    extra.mkdir(parents=True, mode=0o700)
+    (extra / "cffi-2.1.1-cp314-cp314-android_24_arm64_v8a.whl").write_bytes(b"cffi")
+    receipt = {"schema": "ccc.termux-preparation.v1", "status": "ready", "work_dir": str(job),
+               "scenarios": {"fresh_install": "pass"}, **INPUTS,
+               "wheels": {name: sha(data) for name, data in WHEELS.items()}}
+    receipt.update(overrides)
+    prep.private_write(job / "receipt.json", json.dumps(receipt))
+    return job
+
+
+def new_work(root):
+    work = root / "new"
+    work.mkdir(mode=0o700)
+    for name in ("wheelhouse", "pip-cache", "tmp", "cargo-target"):
+        (work / name).mkdir(mode=0o700)
+    return work
+
+
+def test_base_interpreter_guard_refuses_venv_before_workspace(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(prep.sys, "prefix", str(tmp_path / "venv"))
+    monkeypatch.setattr(prep.sys, "base_prefix", str(tmp_path / "base"))
+    assert prep.main(["--work-dir", str(tmp_path / "run")]) == 1
+    assert not (tmp_path / "run").exists()
+    assert json.loads(capsys.readouterr().out)["reason"] == "must_run_with_base_interpreter"
+
+
+def test_base_interpreter_guard_accepts_base_prefix(monkeypatch):
+    monkeypatch.setattr(prep.sys, "prefix", prep.sys.base_prefix)
+    prep.require_base_interpreter()
+
+
+def test_reuse_copies_private_cache_and_records_source(tmp_path):
+    job = prior_job(tmp_path)
+    receipt = prep.load_reuse_source(job)
+    work = new_work(tmp_path)
+    report = dict(INPUTS)
+    prep.reuse_native_wheels(work, receipt, report)
+    assert report["native_wheels"]["mode"] == "reused"
+    assert report["native_wheels"]["from"] == str(job)
+    assert report["native_wheels"]["receipt_sha256"] == sha((job / "receipt.json").read_bytes())
+    cache = prep.native_cache_wheels(work / "pip-cache/wheels")
+    assert cache == {name: [sha(data)] for name, data in WHEELS.items()}
+    assert (work / "pip-cache/wheels/ff/key/cffi-2.1.1-cp314-cp314-android_24_arm64_v8a.whl").exists()
+    assert (work / "pip-cache/wheels/00/key/origin.json").exists()
+    for path in (work / "pip-cache/wheels").rglob("*"):
+        assert path.stat().st_mode & 0o077 == 0
+    assert sorted(p.name for p in (work / "wheelhouse").iterdir()) == sorted(WHEELS)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("android_api", 33), ("linker_threads", 2),
+    ("lock_sha256", {"native": "changed", "build-tools": "b"}),
+    ("toolchain", {"rustc": {"binary_sha256": "other-node"}, "python": "3.14.6"}),
+])
+def test_reuse_refuses_any_build_input_mismatch(tmp_path, field, value):
+    receipt = prep.load_reuse_source(prior_job(tmp_path))
+    work = new_work(tmp_path)
+    report = {**INPUTS, field: value}
+    with pytest.raises(prep.PreparationError, match=f"reuse_{field}_mismatch"):
+        prep.reuse_native_wheels(work, receipt, report)
+    assert not (work / "pip-cache/wheels").exists()
+
+
+@pytest.mark.parametrize("overrides,reason", [
+    ({"status": "error"}, "reuse_receipt_not_ready"),
+    ({"scenarios": {"fresh_install": "fail"}}, "reuse_receipt_not_ready"),
+    ({"schema": "other"}, "reuse_receipt_not_ready"),
+    ({"work_dir": "/elsewhere/job"}, "reuse_receipt_work_dir_mismatch"),
+    ({"wheels": {"cryptography-1-x.whl": "a" * 64}}, "reuse_receipt_wheels_invalid"),
+    ({"wheels": {**{n: sha(d) for n, d in WHEELS.items()}, "extra-1-x.whl": "a" * 64}},
+     "reuse_receipt_wheels_invalid"),
+    ({"wheels": {n: "short" for n in WHEELS}}, "reuse_receipt_wheels_invalid"),
+])
+def test_reuse_source_receipt_must_be_ready_and_complete(tmp_path, overrides, reason):
+    job = prior_job(tmp_path, **overrides)
+    with pytest.raises(prep.PreparationError, match=reason):
+        prep.load_reuse_source(job)
+
+
+def test_reuse_source_rejects_symlink_and_shared_permissions(tmp_path):
+    job = prior_job(tmp_path)
+    link = tmp_path / "link"
+    link.symlink_to(job, target_is_directory=True)
+    with pytest.raises(prep.PreparationError, match="reuse_source_must_be_owner_private_dir"):
+        prep.load_reuse_source(link)
+    (job / "receipt.json").chmod(0o644)
+    with pytest.raises(prep.PreparationError, match="reuse_receipt_invalid"):
+        prep.load_reuse_source(job)
+    (job / "receipt.json").chmod(0o600)
+    job.chmod(0o750)
+    with pytest.raises(prep.PreparationError, match="reuse_source_must_be_owner_private_dir"):
+        prep.load_reuse_source(job)
+
+
+def test_reuse_refuses_tampered_or_symlinked_cache(tmp_path):
+    job = prior_job(tmp_path)
+    receipt = prep.load_reuse_source(job)
+    victim = next((job / "pip-cache/wheels").rglob("jiter-*.whl"))
+    victim.write_bytes(b"tampered")
+    with pytest.raises(prep.PreparationError, match="reuse_wheel_hash_mismatch"):
+        prep.reuse_native_wheels(new_work(tmp_path), receipt, dict(INPUTS))
+
+    other = tmp_path / "other"
+    other.mkdir()
+    job2 = prior_job(other)
+    receipt2 = prep.load_reuse_source(job2)
+    (job2 / "pip-cache/wheels/evil").symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(prep.PreparationError, match="reuse_cache_entry_invalid"):
+        prep.reuse_native_wheels(new_work(other), receipt2, dict(INPUTS))
+
+
+def test_prepare_with_reuse_skips_build_and_detects_rebuild(tmp_path, monkeypatch):
+    source = Path(prep.__file__).resolve().parent
+    receipt = prep.load_reuse_source(prior_job(tmp_path))
+    work = new_work(tmp_path)
+    monkeypatch.setattr(prep, "provenance", lambda runner: INPUTS["toolchain"])
+    real_lock = prep.hashlib.sha256((source / "requirements.lock.txt").read_bytes()).hexdigest()
+    real_tools = prep.hashlib.sha256((source.parent / ".github/requirements/bridge-ci.txt").read_bytes()).hexdigest()
+    receipt["lock_sha256"] = {"build-tools": real_tools, "native": real_lock}
+    runner = prep.Runner(work, {}, 30)
+    calls = []
+    monkeypatch.setattr(runner, "run", lambda name, argv: calls.append(name))
+    report = {"android_api": 24, "linker_threads": 1,
+              "scenarios": {"fresh_install": "not_run", "reinstall": "not_run"}}
+    prep.prepare(runner, source, report, True, reuse=receipt)
+    assert not {"builder-venv", "build-tools", "native-wheels"} & set(calls)
+    assert "fresh-install" in calls and "force-reinstall" in calls
+    assert runner.stages[-1]["id"] == "native-wheels-reuse" and runner.stages[-1]["status"] == "pass"
+    assert report["wheels"] == receipt["wheels"]
+    assert report["scenarios"] == {"fresh_install": "pass", "reinstall": "pass"}
+
+    # A bootstrap that ignored the seeded cache would add a freshly built wheel.
+    work2 = tmp_path / "new2"
+    work2.mkdir(mode=0o700)
+    for name in ("wheelhouse", "pip-cache"):
+        (work2 / name).mkdir(mode=0o700)
+    runner2 = prep.Runner(work2, {}, 30)
+
+    def run(name, argv):
+        if name == "fresh-install":
+            rebuilt = work2 / "pip-cache/wheels/zz/key"
+            rebuilt.mkdir(parents=True)
+            (rebuilt / next(iter(WHEELS))).write_bytes(b"rebuilt")
+    monkeypatch.setattr(runner2, "run", run)
+    report2 = {"android_api": 24, "linker_threads": 1, "scenarios": {"fresh_install": "not_run"}}
+    with pytest.raises(prep.PreparationError, match="reused_wheels_not_used"):
+        prep.prepare(runner2, source, report2, False, reuse=receipt)
+
+
+def test_invalid_reuse_source_claims_no_workspace(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(prep, "android_build_api", lambda: 24)
+    monkeypatch.delenv("ANDROID_API_LEVEL", raising=False)
+    tmp_path.chmod(0o700)
+    target = tmp_path / "run"
+    assert prep.main(["--work-dir", str(target), "--reuse-wheels-from", str(tmp_path / "missing")]) == 1
+    assert not target.exists()
+    assert json.loads(capsys.readouterr().out)["reason"] == "preflight_or_io_error"
