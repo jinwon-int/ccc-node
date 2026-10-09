@@ -24,6 +24,7 @@ this module and its tests do not depend on that file being present.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import functools
@@ -368,8 +369,13 @@ class MatrixSpoolNotifier:
 
     def __init__(self, settings: Any, transport: Any) -> None:
         # ``transport`` is a MatrixTransport; imported lazily in _build_transport
-        # (bot/transport import cycle), so the annotation stays Any here.
+        # (bot/transport import cycle), so the annotation stays Any here. In
+        # relay mode it may be ``None`` (#2207): relay delivery never touches
+        # Matrix, so the notifier can run before the transport exists.
         self._transport = transport
+        # Set by MatrixBot.serve() when this notifier was started ahead of the
+        # transport; serve() then must not register it as a task-group leg too.
+        self.running_early: bool = False
         self.enabled: bool = bool(getattr(settings, "push_enabled", False))
         write_dir = spool_write_dir(settings)
         consume = getattr(settings, "push_consume_spool_dir", None)
@@ -395,7 +401,16 @@ class MatrixSpoolNotifier:
             except (OSError, ValueError) as e:
                 self._relay_error = str(e)
 
+    def pending_count(self) -> int:
+        """Records still waiting in the consumed spool (0 when the dir is absent)."""
+        try:
+            return sum(1 for p in self.spool_dir.glob("*.json") if p.is_file())
+        except OSError:
+            return 0
+
     def _owner_room(self) -> Optional[str]:
+        if self._transport is None:
+            return None
         rooms = self._transport.policy.rooms
         direct = [r for r, mode in rooms.items() if mode == "direct"]
         if direct:
@@ -719,13 +734,27 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         self._transport = transport
         self._project_chat.set_async_completion_sender(self.async_completion_sender)
         initialize = bool(getattr(self._settings, "matrix_initialize", False))
+        # #2207: in relay mode the spool notifier needs no Matrix session, so it
+        # starts now — before the homeserver is even resolved. When DNS is down
+        # the transport open below raises and the process exits; the drain window
+        # in the except branch is what lets the Telegram bridge's outage alerts
+        # (already in the spool) reach the relay over its tailnet IP first.
+        early_notifier = self._early_relay_notifier()
+        early_task: Optional[asyncio.Task[None]] = None
+        if early_notifier is not None:
+            early_task = asyncio.create_task(early_notifier.run(), name="matrix-spool-notifier")
         try:
             # First run of a NEW bot device (CCC_MATRIX_INITIALIZE=1): create the
             # crypto store, upload keys, pin devices and gate rooms, then exit
             # without serving. The pilot's `--initialize` had the same contract;
             # a normal start refuses an empty store (explicit-new-device-
             # initialization-required) so a lost store is never recreated silently.
-            await transport.open(initialize=initialize)
+            try:
+                await transport.open(initialize=initialize)
+            except BaseException:
+                if early_notifier is not None and early_task is not None:
+                    await self._relay_exit_drain(early_notifier, early_task)
+                raise
             if initialize:
                 logger.info("Matrix frontend initialised a new bot device; start again without CCC_MATRIX_INITIALIZE")
                 return
@@ -737,7 +766,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             await self._startup_lifecycle_sweeps()
             await self._startup_danso_recovery_scan()
             await self._startup_dead_session_recovery()
-            notifier = MatrixSpoolNotifier(self._settings, transport)
+            # Relay mode keeps the early notifier (already running); room mode
+            # builds the transport-backed one here as before.
+            notifier = early_notifier or MatrixSpoolNotifier(self._settings, transport)
             # Same TaskGroup semantics as transport.run(): a leg that dies
             # stops the service so systemd restarts it whole. Legs are built
             # before the listener binds, so a failing builder cannot leave the
@@ -771,11 +802,59 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                 if nudge_server is not None:
                     await nudge_server.close()
         finally:
+            if early_task is not None and not early_task.done():
+                early_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await early_task
             if not initialize:
                 await self._enqueue_shutdown_distills()
             self._transport = None
             self._stop_health_reporting()
             await transport.close()
+
+    def _early_relay_notifier(self) -> Optional["MatrixSpoolNotifier"]:
+        """The relay-mode spool notifier to start ahead of the transport (#2207).
+
+        ``None`` outside relay mode or when push is disabled: room delivery
+        needs the transport, so it keeps starting after ``open()`` as a leg.
+        """
+
+        notifier = MatrixSpoolNotifier(self._settings, None)
+        if not (notifier.enabled and notifier.relay_mode):
+            return None
+        notifier.running_early = True
+        return notifier
+
+    async def _relay_exit_drain(self, notifier: "MatrixSpoolNotifier", task: "asyncio.Task[None]") -> None:
+        """Give the early relay notifier a bounded window to empty the spool before exit.
+
+        Called only when ``transport.open()`` failed. Returns as soon as the
+        spool is empty, the notifier task ended, or the window
+        (``CCC_PUSH_FLEET_RELAY_EXIT_DRAIN``, default 15 s) elapsed; the task is
+        cancelled by ``serve()``'s ``finally`` either way.
+        """
+
+        try:
+            window = float(getattr(self._settings, "push_fleet_relay_exit_drain_seconds", 15.0))
+        except (TypeError, ValueError):
+            window = 15.0
+        if window <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + window
+        pending = notifier.pending_count()
+        if pending:
+            logger.warning(
+                "Matrix transport failed to open; draining %d spool record(s) to the fleet relay for up to %.0fs",
+                pending, window,
+            )
+        while pending and not task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning("fleet relay exit drain window elapsed with %d record(s) left", pending)
+                return
+            await asyncio.sleep(min(0.25, remaining))
+            pending = notifier.pending_count()
 
     def _background_legs(
         self, stop: asyncio.Event, notifier: "MatrixSpoolNotifier"
@@ -816,10 +895,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         cancel_on_stop.append(
             ("matrix-external-wait-status-reconcile", self._reconcile_external_wait_status_on_start)
         )
-        if notifier.enabled:
+        if notifier.enabled and not notifier.running_early:
             # ``MatrixSpoolNotifier.run`` polls forever without watching
             # ``stop``; as a stop-driven leg it held the group open after a
-            # clean transport return.
+            # clean transport return. A relay-mode notifier started ahead of
+            # the transport (#2207) is already running and is not a leg.
             cancel_on_stop.append(("matrix-spool-notifier", notifier.run))
 
         stop_driven.append(("matrix-health-reporter", lambda: self._health_reporter_loop(stop)))

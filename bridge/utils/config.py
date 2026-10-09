@@ -973,6 +973,20 @@ class Config(
         alias="CCC_PUSH_FLEET_RELAY_TIMEOUT",
         description="Seconds to wait for the fleet relay per record.",
     )
+    # #2207: in relay mode the spool notifier starts BEFORE the Matrix transport
+    # opens (the relay needs no Matrix session), and when the open fails the
+    # process waits up to this long for the spool to drain before exiting.
+    # Without this, a node whose DNS is down crash-loops on the homeserver
+    # lookup and the Telegram bridge's own outage alerts never leave the node —
+    # even though the relay is reachable by tailnet IP.
+    push_fleet_relay_exit_drain_seconds: float = Field(
+        default=15.0,
+        alias="CCC_PUSH_FLEET_RELAY_EXIT_DRAIN",
+        description=(
+            "Relay mode only: seconds to keep draining the push spool to the fleet relay "
+            "after the Matrix transport failed to open, before the process exits. 0 = off."
+        ),
+    )
     # Telegram HTTPX transport timeouts (seconds). Connect/pool defaults were
     # raised from 5s/3s: on a mobile or Tailscale uplink a fresh TLS handshake
     # to api.telegram.org can exceed 3s, which PTB reports as

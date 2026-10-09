@@ -398,3 +398,46 @@ async def test_relay_mode_runs_without_any_owner_room(tmp_path: Path) -> None:
     except asyncio.CancelledError:
         pass
     assert len(relay.posted) == 1 and enqueued == []
+
+
+# --- #2207: relay mode runs without a Matrix transport -------------------------
+
+def _relay_settings_2207(tmp_path: Path, url: str, **over):
+    secret = tmp_path / "relay.secret"
+    secret.write_text("s3cret\n", encoding="utf-8")
+    secret.chmod(0o600)
+    return _settings(
+        tmp_path,
+        push_fleet_relay_url=url,
+        push_fleet_relay_secret_file=secret,
+        push_fleet_node="testnode",
+        push_fleet_relay_timeout=2.0,
+        **over,
+    )
+
+
+@pytest.mark.anyio
+async def test_relay_mode_drains_without_a_transport(tmp_path: Path) -> None:
+    """The Telegram bridge's outage alerts must reach the relay even when the
+    Matrix session never comes up: relay delivery needs no transport (#2207)."""
+    from test_fleet_alert_relay import _Server
+
+    server = _Server()
+    try:
+        n = MatrixSpoolNotifier(_relay_settings_2207(tmp_path, server.url), None)
+        assert n.relay_mode and n._owner_room() is None
+        _record(tmp_path, "0001-alert.json", {"text": "Telegram polling failed", "dedup": "health-alert:x"})
+        assert n.pending_count() == 1
+        sent_dir = n.spool_dir / "sent"
+        sent_dir.mkdir(parents=True, exist_ok=True)
+        await n._drain("", sent_dir)
+        assert len(server.requests) == 1
+        assert server.requests[0]["headers"].get("X-Fleet-Node") == "testnode"
+        assert n.pending_count() == 0 and (sent_dir / "0001-alert.json").exists()
+    finally:
+        server.close()
+
+
+def test_pending_count_is_zero_for_a_missing_spool(tmp_path: Path) -> None:
+    n = MatrixSpoolNotifier(_settings(tmp_path), None)
+    assert n.pending_count() == 0
