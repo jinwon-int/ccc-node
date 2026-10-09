@@ -31,12 +31,12 @@ class HeartbeatSettingsMixin:
         description="Enable fail-open long-running task heartbeat messages.",
     )
     heartbeat_threshold_seconds: float = Field(
-        default=15.0,
+        default=10.0,
         alias="CCC_HEARTBEAT_THRESHOLD_SECONDS",
         description="Seconds before sending the first long-running task heartbeat.",
     )
     heartbeat_update_interval_seconds: float = Field(
-        default=15.0,
+        default=10.0,
         alias="CCC_HEARTBEAT_UPDATE_INTERVAL_SECONDS",
         description="Minimum seconds between silent heartbeat replacements at the bottom of the chat.",
     )
