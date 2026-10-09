@@ -14,6 +14,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import time
 
 if __package__:
@@ -34,6 +35,56 @@ MIN_FREE_BYTES = 2 * 1024**3
 # compiler/backend binaries, so another node's (different) wheels never match.
 REUSE_MATCH_FIELDS = ("android_api", "linker_threads", "lock_sha256", "toolchain")
 MAX_RECEIPT_BYTES = 1024**2
+# Optional frontend extras (#2175 B). They stay outside the hash lock by design
+# (see each requirements file), so they are installed *constrained to the core
+# runtime's own freeze*: an extra may add packages but never move a core pin.
+EXTRAS = {
+    "matrix": {
+        "requirements": "requirements-matrix.txt",
+        "probe": ("import aiohttp, nio, nio.crypto, olm; "
+                  "from nio import AsyncClient, AsyncClientConfig; "
+                  "assert nio.crypto.ENCRYPTION_ENABLED, 'matrix-nio built without e2e'"),
+        "termux_olm": True,
+    },
+}
+# python-olm's sdist builds a bundled C++ libolm 3.2.16 that current Termux
+# toolchains cannot compile (CMake >= 4 refuses its cmake_minimum_required, and
+# clang 21 rejects include/olm/list.hh). Termux ships a patched libolm 3.2.16
+# package, so the binding is built against that instead: hash-pinned sdist,
+# exact-hash build script, three fixed edits (system include/lib, no bundled
+# build). No crypto source is changed.
+# Fetched directly: `pip download` of an sdist prepares its metadata, which runs
+# the very olm_build.py (bundled CMake build) this patch exists to avoid.
+OLM_SDIST_URL = ("https://files.pythonhosted.org/packages/b8/eb/23ca73cbdc8c7466a774e515dfd917d9"
+                 "fbe747c1257059246fdc63093f04/python-olm-3.2.16.tar.gz")
+OLM_SDIST_SHA256 = "a1c47fce2505b7a16841e17694cbed4ed484519646ede96ee9e89545a49643c9"
+OLM_FETCH = ("import hashlib,sys,urllib.request; url,dest,want=sys.argv[1:4]; "
+             "data=urllib.request.urlopen(url, timeout=120).read(); "
+             "assert hashlib.sha256(data).hexdigest() == want, 'sdist hash mismatch'; "
+             "open(dest,'xb').write(data)")
+OLM_SDIST_DIR = "python-olm-3.2.16"
+OLM_BUILD_SCRIPT_SHA256 = "49803289396d08f25cb6b2bc31394340ca437ba85e8ad3fd1dc71aa8e8c7aedc"
+OLM_BUNDLED_BUILD = """# Try to build with cmake first, fall back to GNU make
+try:
+    subprocess.run(
+        ["cmake", ".", "-Bbuild", "-DBUILD_SHARED_LIBS=NO"],
+        cwd="libolm", check=True,
+    )
+    subprocess.run(
+        ["cmake", "--build", "build"],
+        cwd="libolm", check=True,
+    )
+except FileNotFoundError:
+    try:
+        # try "gmake" first because some systems have a non-GNU make
+        # installed as "make"
+        subprocess.run(["gmake", "static"], cwd="libolm", check=True)
+    except FileNotFoundError:
+        # some systems have GNU make installed without the leading "g"
+        # so give that a try (though this may fail if it isn't GNU make)
+        subprocess.run(["make", "static"], cwd="libolm", check=True)
+"""
+MAX_EXTRA_REQUIREMENTS_BYTES = 64 * 1024
 MAX_REUSE_CACHE_BYTES = 256 * 1024**2
 # Cargo jobs do not constrain LLD's internal relocation-scanning threads.
 # Keep the Android workaround job-local; never change the system compiler.
@@ -321,7 +372,7 @@ def provenance(runner: Runner) -> dict:
 
 
 def prepare(runner: Runner, source: Path, report: dict, reinstall: bool,
-            reuse: dict | None = None) -> None:
+            reuse: dict | None = None, extras: list[str] | None = None) -> None:
     work = runner.work
     report["source_seal"] = source_seal(source)
     report["toolchain"] = provenance(runner)
@@ -380,8 +431,110 @@ def prepare(runner: Runner, source: Path, report: dict, reinstall: bool,
             verify_reused_wheels_used(work, report)
         verify_runtime(runner, runtime, "reinstall-readiness")
         report["scenarios"]["reinstall"] = "pass"
+    if extras:
+        install_extras(runner, source, runtime, extras, report)
     if source_seal(source) != report["source_seal"]:
         raise PreparationError("source_changed_during_preparation")
+
+
+def _freeze_lines(text: str) -> set[str]:
+    return {line.strip() for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")}
+
+
+def _freeze_names(lines: set[str]) -> dict[str, str]:
+    found = {}
+    for line in lines:
+        name = re.split(r"\s*(?:==|@)\s*", line, maxsplit=1)[0]
+        found[re.sub(r"[-_.]+", "-", name).lower()] = line
+    return found
+
+
+def patch_olm_build(text: str, prefix: Path) -> str:
+    """Point python-olm's cffi build at the system libolm; fail closed on drift."""
+    edits = (
+        ('compile_args = ["-Ilibolm/include"]', f"compile_args = [{'-I' + str(prefix / 'include')!r}]"),
+        (OLM_BUNDLED_BUILD, "# termux_prepare: link the installed system libolm; no bundled C++ build.\n"),
+        ('library_dirs=[os.path.join("libolm", "build")]', f"library_dirs=[{str(prefix / 'lib')!r}]"),
+    )
+    for old, new in edits:
+        if text.count(old) != 1:
+            raise PreparationError("extra_matrix_olm_build_script_unexpected")
+        text = text.replace(old, new)
+    return text
+
+
+def build_termux_olm(runner: Runner, pip: list[str]) -> dict:
+    """Build and install python-olm against the system libolm (Termux)."""
+    work = runner.work
+    prefix = Path(sys.base_prefix)
+    library, header = prefix / "lib/libolm.so", prefix / "include/olm/olm.h"
+    if not library.is_file() or not header.is_file():
+        raise PreparationError("extra_matrix_system_libolm_missing")
+    root = work / "extra-matrix-olm"
+    root.mkdir(mode=0o700)
+    archive_path = root / "python-olm-3.2.16.tar.gz"
+    runner.run("extra-matrix-olm-download", [pip[0], "-I", "-B", "-c", OLM_FETCH,
+                                             OLM_SDIST_URL, str(archive_path), OLM_SDIST_SHA256])
+    if not archive_path.is_file() or _sha256(archive_path) != OLM_SDIST_SHA256:
+        raise PreparationError("extra_matrix_olm_sdist_hash_mismatch")
+    with tarfile.open(archive_path) as archive:
+        archive.extractall(root / "src", filter="data")
+    script = root / "src" / OLM_SDIST_DIR / "olm_build.py"
+    original = script.read_bytes()
+    if hashlib.sha256(original).hexdigest() != OLM_BUILD_SCRIPT_SHA256:
+        raise PreparationError("extra_matrix_olm_build_script_unexpected")
+    script.write_text(patch_olm_build(original.decode(), prefix))
+    runner.run("extra-matrix-olm-wheel", [*pip, "wheel", "--no-deps", str(script.parent),
+                                          "-w", str(root / "wheel")])
+    wheels = sorted((root / "wheel").glob("python_olm-*.whl"))
+    if len(wheels) != 1:
+        raise PreparationError("extra_matrix_olm_wheel_missing")
+    runner.run("extra-matrix-olm-install", [*pip, "install", "--no-deps", str(wheels[0])])
+    return {"sdist_sha256": _sha256(archive_path),
+            "build_script_sha256": OLM_BUILD_SCRIPT_SHA256,
+            "patched_build_script_sha256": _sha256(script),
+            "system_libolm_sha256": _sha256(library),
+            "wheel": wheels[0].name, "wheel_sha256": _sha256(wheels[0])}
+
+
+def install_extras(runner: Runner, source: Path, runtime: str, extras: list[str], report: dict) -> None:
+    """Install optional frontend extras into the prepared runtime (#2175 B).
+
+    The core runtime is frozen first and that freeze is passed as pip
+    constraints, so an extra can only add distributions. Afterwards every
+    core line must still be present unchanged, the extra's own probe must
+    import, ``pip check`` must pass and the core readiness probes run again.
+    """
+    work = runner.work
+    pip = [runtime, "-I", "-B", "-m", "pip"]
+    results = report.setdefault("extras", {})
+    for name in extras:
+        spec = EXTRAS[name]
+        results[name] = {"status": "in_progress"}
+        requirements = source / spec["requirements"]
+        info = requirements.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_EXTRA_REQUIREMENTS_BYTES:
+            raise PreparationError(f"extra_{name}_requirements_invalid")
+        before = _freeze_lines(runner.run(f"extra-{name}-freeze", [*pip, "freeze", "--exclude-editable"]).read_text())
+        constraints = work / f"extra-{name}-constraints.txt"
+        private_write(constraints, "".join(f"{line}\n" for line in sorted(before)))
+        olm = build_termux_olm(runner, pip) if spec.get("termux_olm") else None
+        runner.run(f"extra-{name}-install", [*pip, "install", "--require-virtualenv",
+                                             "-r", str(requirements), "-c", str(constraints)])
+        after = _freeze_lines(runner.run(f"extra-{name}-freeze-after",
+                                         [*pip, "freeze", "--exclude-editable"]).read_text())
+        if not before <= after:
+            raise PreparationError(f"extra_{name}_changed_core")
+        runner.run(f"extra-{name}-imports", [runtime, "-I", "-B", "-c", spec["probe"]])
+        runner.run(f"extra-{name}-pip-check", [*pip, "check"])
+        added = _freeze_names(after - before)
+        results[name] = {"status": "pass",
+                         "requirements_sha256": hashlib.sha256(requirements.read_bytes()).hexdigest(),
+                         "added": dict(sorted(added.items()))}
+        if olm is not None:
+            results[name]["olm"] = olm
+    verify_runtime(runner, runtime, "extras-readiness")
 
 
 def verify_runtime(runner: Runner, runtime: str, name: str) -> None:
@@ -409,6 +562,9 @@ def main(argv=None) -> int:
     parser.add_argument("--timeout-seconds", type=timeout_value, default=3600)
     parser.add_argument("--jobs", type=int, choices=(1, 2), default=1)
     parser.add_argument("--verify-reinstall", action="store_true")
+    parser.add_argument("--extra", action="append", choices=sorted(EXTRAS), default=[],
+                        help="also install an optional frontend extra, constrained to the core "
+                             "runtime freeze (repeatable)")
     parser.add_argument("--reuse-wheels-from", type=Path, metavar="PRIOR_JOB",
                         help="reuse native wheels from a ready job on this node whose locks, "
                              "toolchain, API and linker profile match exactly (else refuse)")
@@ -436,8 +592,12 @@ def main(argv=None) -> int:
                                    "reused_prior_job_wheel_cache; new_private_pip_http_cache; "
                                    "shared_default_cargo_registry"),
                       stages=runner.stages)
-        prepare(runner, Path(__file__).resolve().parent, report, args.verify_reinstall,
-                **({} if reuse is None else {"reuse": reuse}))
+        options: dict = {}
+        if reuse is not None:
+            options["reuse"] = reuse
+        if args.extra:
+            options["extras"] = list(dict.fromkeys(args.extra))
+        prepare(runner, Path(__file__).resolve().parent, report, args.verify_reinstall, **options)
         report["status"] = "ready"
     except PreparationError as exc:
         report["reason"] = str(exc)
@@ -450,6 +610,9 @@ def main(argv=None) -> int:
     for scenario, status in report["scenarios"].items():
         if status == "in_progress":
             report["scenarios"][scenario] = "fail"
+    for extra in (report.get("extras") or {}).values():
+        if extra.get("status") == "in_progress":
+            extra["status"] = "fail"
     if runner:
         report["duration_ms"] = round((time.monotonic() - runner.started) * 1000)
         try:

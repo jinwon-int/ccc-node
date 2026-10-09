@@ -138,6 +138,49 @@ on that node (2026-10-09, reusing the 55f6b7bc job): **262 seconds** instead of
 3015, wheels identical. Reuse is a same-node shortcut, not cross-node wheel
 distribution or a signature; keep the prior job until the new one has served.
 
+## Optional frontend extras (`--extra matrix`)
+
+A node that also serves the Matrix frontend (`CCC_CHANNEL=matrix`) needs
+`bridge/requirements-matrix.txt` (`matrix-nio[e2e]`, which builds against the
+system `libolm`) in the same runtime. That extra is deliberately outside the
+hash lock (see the file's header), so it used to be installed by hand after
+preparation. `--extra matrix` (repeatable flag; `matrix` is the only extra
+today) does it inside the job, after the fresh-install and reinstall
+scenarios:
+
+1. `pip freeze --exclude-editable` of the finished core runtime is written to
+   `extra-matrix-constraints.txt` (0600) and passed to `pip install -r
+   requirements-matrix.txt -c <that file>`, so the extra can **add**
+   distributions but never move a core pin;
+2. a second freeze must still contain every core line unchanged
+   (`extra_matrix_changed_core` otherwise);
+3. an import probe requires `nio`, `olm`, `aiohttp` and
+   `nio.crypto.ENCRYPTION_ENABLED` (an e2e-less `matrix-nio` fails), then
+   `pip check`;
+4. the core readiness probes run once more (`extras-readiness-*`).
+
+Before step 1's install, python-olm is built against the **system** libolm.
+Its sdist otherwise builds a bundled C++ libolm 3.2.16 that current Termux
+toolchains reject (CMake 4 refuses its `cmake_minimum_required`; clang 21
+rejects `include/olm/list.hh`), while Termux's `libolm` package carries the
+fix. The driver fetches the pinned `python-olm-3.2.16.tar.gz` from its PyPI
+file URL and checks its SHA-256 (not `pip download`: preparing an sdist's
+metadata would run the unpatched bundled build), requires `olm_build.py` to match its
+recorded SHA-256, applies three fixed edits (system include dir, system lib
+dir, no bundled build — no crypto source changes), builds the wheel and
+installs it. It needs `$PREFIX/lib/libolm.so` and `$PREFIX/include/olm/olm.h`
+(`pkg install libolm`; else `extra_matrix_system_libolm_missing`); any
+upstream drift fails as `extra_matrix_olm_build_script_unexpected`. The
+receipt's `extras.matrix.olm` records the sdist, original/patched build
+script, system libolm and wheel hashes.
+
+The receipt's `extras.matrix` records `status`, the requirements file's
+SHA-256 and the exact distributions it added. These versions come from the
+index at preparation time; they are recorded evidence, not a lock. Extra
+wheels built in the job's private pip cache are carried forward by
+`--reuse-wheels-from` like any other cached wheel. The serving gate
+(`prepared_runtime.py`) is unchanged: it never inspected extras.
+
 ## Time, disk and receipts
 
 One shared command deadline (maximum two hours) covers tool checks, builds,
