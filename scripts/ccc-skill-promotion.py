@@ -6504,6 +6504,14 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
 
     published: list[dict[str, str]] = []
     opened = 0
+    # #2203: the source that received this run's last PR slot. The cursor is
+    # advanced to it (not to `start_source`), so the next run resumes right
+    # after the last source actually served — a true round-robin. Persisting
+    # the start source instead moved the rotation one source per run whatever
+    # `max_prs` was, so with a backlog on the first few sources a node late in
+    # `collect_nodes` waited up to len(sources) runs for its first slot, and an
+    # empty start source let the same busy neighbour win consecutive runs.
+    last_opened_source: str | None = None
     for candidate, created_at, transport_id, source in collected:
         if opened >= config.max_prs:
             break
@@ -6533,6 +6541,7 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
         published.append(row)
         if outcome["outcome"] == "pr-opened":
             opened += 1
+            last_opened_source = source
         if not dry_run and outcome["outcome"] in {"pr-opened", "existing-pr"}:
             try:
                 if source == "local":
@@ -6555,9 +6564,11 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
         # never rewind it: an envelope that failed to publish stays pending
         # (unacked) at its source's head and is retried when the rotation
         # returns. A single-source fleet has nothing to rotate and writes
-        # nothing.
+        # nothing. #2203: a run that opened PRs rotates past the last source
+        # it served; a run that opened none still steps past its start source
+        # so an all-empty or all-failing head cannot pin the rotation.
         try:
-            _write_collect_cursor(config, start_source)
+            _write_collect_cursor(config, last_opened_source or start_source)
         except PromotionError as error:
             # Publication/ACK/ledger effects are already real. Preserve them;
             # a failed sync can mean the cursor changed but is not durable.
