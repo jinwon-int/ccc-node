@@ -489,3 +489,215 @@ def test_invalid_reuse_source_claims_no_workspace(tmp_path, monkeypatch, capsys)
     assert prep.main(["--work-dir", str(target), "--reuse-wheels-from", str(tmp_path / "missing")]) == 1
     assert not target.exists()
     assert json.loads(capsys.readouterr().out)["reason"] == "preflight_or_io_error"
+
+
+# --- #2175 B: optional frontend extras constrained to the core freeze -------
+
+class FakeRunner:
+    """Records stages; freeze output is scripted per call, other stages pass."""
+
+    def __init__(self, work, freezes):
+        self.work, self.freezes, self.calls, self.stages = work, list(freezes), [], []
+        self.env, self.envs = {"BASE": "1"}, {}
+
+    def run(self, name, argv):
+        self.calls.append((name, argv))
+        self.envs[name] = dict(self.env)
+        log = self.work / f"{name}.log"
+        log.write_text(self.freezes.pop(0) if name.startswith("extra-") and "-freeze" in name else "")
+        return log
+
+
+CORE = "aiohappyeyeballs==2.6.1\ncryptography==50.0.1\nh11==0.16.0\n"
+WITH_MATRIX = CORE + "matrix-nio==0.25.2\npython-olm==3.2.16\naiohttp==3.14.4\n"
+
+
+@pytest.fixture
+def fake_olm(monkeypatch):
+    def build(runner, pip):
+        runner.olm_calls = getattr(runner, "olm_calls", 0) + 1
+        return {"fixture": True}
+    monkeypatch.setattr(prep, "build_termux_olm", build)
+
+
+def test_extra_matrix_is_constrained_to_core_freeze_and_rechecked(tmp_path, fake_olm):
+    source = Path(prep.__file__).resolve().parent
+    runner = FakeRunner(tmp_path, [CORE, WITH_MATRIX])
+    report = {}
+    prep.install_extras(runner, source, "/runtime/python", ["matrix"], report)
+    names = [name for name, _ in runner.calls]
+    assert names[:5] == ["extra-matrix-freeze", "extra-matrix-install", "extra-matrix-freeze-after",
+                         "extra-matrix-imports", "extra-matrix-pip-check"]
+    assert "extras-readiness-all-native" in names  # core readiness repeated afterwards
+    install = dict(runner.calls)["extra-matrix-install"]
+    constraints = tmp_path / "extra-matrix-constraints.txt"
+    assert install[install.index("-c") + 1] == str(constraints)
+    assert install[install.index("-r") + 1] == str(source / "requirements-matrix.txt")
+    assert "--require-virtualenv" in install
+    assert constraints.read_text().splitlines() == sorted(CORE.splitlines())
+    assert constraints.stat().st_mode & 0o777 == 0o600
+    assert "nio.crypto.ENCRYPTION_ENABLED" in dict(runner.calls)["extra-matrix-imports"][-1]
+    result = report["extras"]["matrix"]
+    assert result["status"] == "pass"
+    assert result["added"] == {"aiohttp": "aiohttp==3.14.4", "matrix-nio": "matrix-nio==0.25.2",
+                               "python-olm": "python-olm==3.2.16"}
+    assert len(result["requirements_sha256"]) == 64
+    assert result["olm"] == {"fixture": True}
+    assert runner.olm_calls == 1
+
+
+def test_extra_that_moves_a_core_pin_is_refused(tmp_path, fake_olm):
+    source = Path(prep.__file__).resolve().parent
+    moved = CORE.replace("h11==0.16.0", "h11==0.14.0") + "matrix-nio==0.25.2\n"
+    runner = FakeRunner(tmp_path, [CORE, moved])
+    report = {}
+    with pytest.raises(prep.PreparationError, match="extra_matrix_changed_core"):
+        prep.install_extras(runner, source, "/runtime/python", ["matrix"], report)
+    assert report["extras"]["matrix"]["status"] == "in_progress"  # main() turns this into "fail"
+    assert "extra-matrix-imports" not in [name for name, _ in runner.calls]
+
+
+def test_extra_requirements_symlink_refused(tmp_path):
+    source = tmp_path / "bridge"
+    source.mkdir()
+    (tmp_path / "real.txt").write_text("matrix-nio[e2e]==0.25.2\n")
+    (source / "requirements-matrix.txt").symlink_to(tmp_path / "real.txt")
+    with pytest.raises(prep.PreparationError, match="extra_matrix_requirements_invalid"):
+        prep.install_extras(FakeRunner(tmp_path, []), source, "/runtime/python", ["matrix"], {})
+
+
+def test_prepare_runs_extras_after_reinstall_and_main_marks_failure(tmp_path, monkeypatch, capsys):
+    source = Path(prep.__file__).resolve().parent
+    monkeypatch.setattr(prep, "provenance", lambda runner: {"fixture": True})
+    (tmp_path / "wheelhouse").mkdir()
+    order = []
+    monkeypatch.setattr(prep, "install_extras",
+                        lambda runner, src, runtime, extras, report: order.append(("extras", extras)))
+    runner = prep.Runner(tmp_path, {}, 30)
+    monkeypatch.setattr(runner, "run", lambda name, argv: order.append(name))
+    report = {"scenarios": {"fresh_install": "not_run", "reinstall": "not_run"}}
+    prep.prepare(runner, source, report, True, extras=["matrix"])
+    assert order[-1] == ("extras", ["matrix"])
+    assert order.index("reinstall-readiness-all-native") < len(order) - 1
+
+    monkeypatch.setattr(prep, "android_build_api", lambda: 24)
+    monkeypatch.delenv("ANDROID_API_LEVEL", raising=False)
+    seen = {}
+
+    def failing(runner, src, report, reinstall, **options):
+        seen.update(options)
+        report.setdefault("extras", {})["matrix"] = {"status": "in_progress"}
+        raise prep.PreparationError("extra-matrix-install_fail")
+    monkeypatch.setattr(prep, "prepare", failing)
+    tmp_path.chmod(0o700)
+    assert prep.main(["--work-dir", str(tmp_path / "job"), "--extra", "matrix", "--extra", "matrix"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert seen == {"extras": ["matrix"]}
+    assert out["extras"]["matrix"]["status"] == "fail"
+    assert out["reason"] == "extra-matrix-install_fail"
+
+
+def test_unknown_extra_rejected_by_cli():
+    with pytest.raises(SystemExit):
+        prep.main(["--work-dir", "/nonexistent/x", "--extra", "voice"])
+
+
+OLM_SCRIPT = """import os
+import subprocess
+
+from cffi import FFI
+
+compile_args = ["-Ilibolm/include"]
+
+""" + prep.OLM_BUNDLED_BUILD + """
+ffibuilder.set_source(
+    "_libolm",
+    libraries=["olm"],
+    library_dirs=[os.path.join("libolm", "build")],
+    extra_compile_args=compile_args,
+)
+"""
+
+
+def test_olm_build_script_points_at_system_libolm(tmp_path):
+    patched = prep.patch_olm_build(OLM_SCRIPT, Path("/prefix"))
+    assert 'compile_args = [\'-I/prefix/include\']' in patched
+    assert "library_dirs=['/prefix/lib']" in patched
+    assert "cmake" not in patched and '"make", "static"' not in patched
+    assert 'libraries=["olm"]' in patched  # still links libolm, now the system one
+
+
+@pytest.mark.parametrize("drop", ['compile_args = ["-Ilibolm/include"]', "cmake", 'os.path.join("libolm", "build")'])
+def test_olm_build_script_drift_fails_closed(drop):
+    text = OLM_SCRIPT.replace(drop, "changed", 1)
+    with pytest.raises(prep.PreparationError, match="extra_matrix_olm_build_script_unexpected"):
+        prep.patch_olm_build(text, Path("/prefix"))
+
+
+def test_build_termux_olm_requires_system_libolm(tmp_path, monkeypatch):
+    monkeypatch.setattr(prep.sys, "base_prefix", str(tmp_path / "noprefix"))
+    with pytest.raises(prep.PreparationError, match="extra_matrix_system_libolm_missing"):
+        prep.build_termux_olm(FakeRunner(tmp_path, []), ["pip"])
+
+
+def test_build_termux_olm_pins_sdist_and_checks_build_script(tmp_path, monkeypatch):
+    import io
+    import tarfile
+    prefix = tmp_path / "prefix"
+    (prefix / "lib").mkdir(parents=True)
+    (prefix / "include/olm").mkdir(parents=True)
+    (prefix / "lib/libolm.so").write_bytes(b"lib")
+    (prefix / "include/olm/olm.h").write_text("")
+    monkeypatch.setattr(prep.sys, "base_prefix", str(prefix))
+    work = tmp_path / "work"
+    work.mkdir()
+
+    class OlmRunner(FakeRunner):
+        def run(self, name, argv):
+            log = super().run(name, argv)
+            if name == "extra-matrix-olm-download":
+                data = OLM_SCRIPT.encode()
+                with tarfile.open(argv[-2], "w:gz") as archive:
+                    info = tarfile.TarInfo(prep.OLM_SDIST_DIR + "/olm_build.py")
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+                monkeypatch.setattr(prep, "OLM_SDIST_SHA256", prep._sha256(Path(argv[-2])))
+            if name == "extra-matrix-olm-wheel":
+                out = Path(argv[argv.index("-w") + 1])
+                out.mkdir()
+                (out / "python_olm-3.2.16-cp314-cp314-android_24_arm64_v8a.whl").write_bytes(b"whl")
+            return log
+
+    # The fixture script is not upstream's, so its hash must be refused ...
+    runner = OlmRunner(work, [])
+    with pytest.raises(prep.PreparationError, match="extra_matrix_olm_build_script_unexpected"):
+        prep.build_termux_olm(runner, ["pip"])
+    download = dict(runner.calls)["extra-matrix-olm-download"]
+    assert download[:4] == ["pip", "-I", "-B", "-c"]
+    assert download[-3] == prep.OLM_SDIST_URL and download[-3].endswith("/python-olm-3.2.16.tar.gz")
+    assert "extra-matrix-olm-wheel" not in dict(runner.calls)
+
+    # ... and accepted once it is the pinned script.
+    import shutil
+    shutil.rmtree(work / "extra-matrix-olm")
+    monkeypatch.setattr(prep, "OLM_BUILD_SCRIPT_SHA256", prep.hashlib.sha256(OLM_SCRIPT.encode()).hexdigest())
+    runner = OlmRunner(work, [])
+    result = prep.build_termux_olm(runner, ["pip"])
+    names = [name for name, _ in runner.calls]
+    assert names == ["extra-matrix-olm-download", "extra-matrix-olm-wheel", "extra-matrix-olm-install"]
+    assert "library_dirs=['" + str(prefix / "lib") + "']" in (work / "extra-matrix-olm/src" / prep.OLM_SDIST_DIR / "olm_build.py").read_text()
+    assert dict(runner.calls)["extra-matrix-olm-install"][-1].endswith(".whl")
+    assert result["wheel"].startswith("python_olm-3.2.16") and len(result["system_libolm_sha256"]) == 64
+
+
+def test_olm_sdist_pin_and_fetch_hash_check(tmp_path):
+    assert prep.OLM_SDIST_SHA256 == "a1c47fce2505b7a16841e17694cbed4ed484519646ede96ee9e89545a49643c9"
+    src = tmp_path / "sdist"
+    src.write_bytes(b"payload")
+    import subprocess
+    good = subprocess.run([sys.executable, "-I", "-c", prep.OLM_FETCH, src.as_uri(), str(tmp_path / "ok"),
+                           prep.hashlib.sha256(b"payload").hexdigest()])
+    assert good.returncode == 0 and (tmp_path / "ok").read_bytes() == b"payload"
+    bad = subprocess.run([sys.executable, "-I", "-c", prep.OLM_FETCH, src.as_uri(), str(tmp_path / "bad"), "0" * 64],
+                         capture_output=True)
+    assert bad.returncode != 0 and not (tmp_path / "bad").exists()
