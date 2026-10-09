@@ -54,6 +54,53 @@ printf '110786586317 validate-harness-shard (4)\n110788510595 validate-harness\n
 out="$(bash "$W" --repo o/r --pr 2113 --interval 0 --timeout 60)"; rc=$?
 ok "eviction → exit 10 naming the failed run and jobs" '[ "$rc" = 10 ] && printf "%s" "$out" | grep -q "evicted pr=2113" && printf "%s" "$out" | grep -q "run=36990888999 harness-ci=failure jobs=\[110786586317 validate-harness-shard (4);110788510595 validate-harness\]"'
 
+# 2b. race (#2208): the queue squash-lands between the PR read (OPEN) and the
+#     queue read (empty). The settle re-read sees MERGED → merged, never evicted.
+reset_stub
+printf 'OPEN CLEAN abc123abc123 -\n' > "$STUB_DIR/prview.1"
+printf 'OPEN CLEAN abc123abc123 -\n' > "$STUB_DIR/prview.2"
+printf 'MERGED UNKNOWN abc123abc123 99d2c8946b00\n' > "$STUB_DIR/prview.last"
+printf 'QUEUED 1\n' > "$STUB_DIR/queue.1"
+: > "$STUB_DIR/queue.last"
+out="$(bash "$W" --repo o/r --pr 154 --interval 0 --timeout 60)"; rc=$?
+ok "merged between PR read and queue read → exit 0 merged, not evicted" '[ "$rc" = 0 ] && printf "%s" "$out" | grep -q "merged pr=154 merge=99d2c8946b00" && ! printf "%s" "$out" | grep -q evicted'
+
+# 2c. same race on the very first poll → merged, not not-enqueued
+reset_stub
+printf 'OPEN CLEAN abc123abc123 -\n' > "$STUB_DIR/prview.1"
+printf 'MERGED UNKNOWN abc123abc123 deadbeefdead\n' > "$STUB_DIR/prview.last"
+: > "$STUB_DIR/queue.last"
+out="$(bash "$W" --repo o/r --pr 7 --interval 0)"; rc=$?
+ok "merged before the first queue read → exit 0, not exit 12" '[ "$rc" = 0 ] && printf "%s" "$out" | grep -q "merged pr=7"'
+
+# 2d. a transient empty queue answer while still queued → keep watching
+reset_stub
+printf 'OPEN CLEAN abc123abc123 -\n' > "$STUB_DIR/prview.1"
+printf 'OPEN CLEAN abc123abc123 -\n' > "$STUB_DIR/prview.2"
+printf 'OPEN CLEAN abc123abc123 -\n' > "$STUB_DIR/prview.3"
+printf 'MERGED UNKNOWN abc123abc123 deadbeefdead\n' > "$STUB_DIR/prview.last"
+printf 'QUEUED 1\n' > "$STUB_DIR/queue.1"
+: > "$STUB_DIR/queue.2"
+printf 'AWAITING_CHECKS 1\n' > "$STUB_DIR/queue.last"
+out="$(bash "$W" --repo o/r --pr 7 --interval 0 --timeout 60)"; rc=$?
+ok "entry missing once then back → not evicted, ends merged" '[ "$rc" = 0 ] && ! printf "%s" "$out" | grep -q evicted'
+
+# 2e. eviction is still reported after the settle window, and only then
+reset_stub
+printf 'OPEN CLEAN abc123abc123 -\n' > "$STUB_DIR/prview.last"
+printf 'QUEUED 1\n' > "$STUB_DIR/queue.1"
+: > "$STUB_DIR/queue.last"
+out="$(bash "$W" --repo o/r --pr 7 --interval 0 --settle-tries 3)"; rc=$?
+ok "real eviction → exit 10 after re-reading the PR settle-tries times" '[ "$rc" = 10 ] && [ "$(cat "$STUB_DIR/.count.prview")" = 5 ]'
+
+# 2f. --settle-tries 0 restores the old immediate verdict
+reset_stub
+printf 'OPEN CLEAN abc123abc123 -\n' > "$STUB_DIR/prview.last"
+printf 'QUEUED 1\n' > "$STUB_DIR/queue.1"
+: > "$STUB_DIR/queue.last"
+out="$(bash "$W" --repo o/r --pr 7 --interval 0 --settle-tries 0)"; rc=$?
+ok "--settle-tries 0 → immediate evicted" '[ "$rc" = 10 ] && [ "$(cat "$STUB_DIR/.count.prview")" = 2 ]'
+
 # 3. closed without merge
 reset_stub
 printf 'CLOSED UNKNOWN abc123abc123 -\n' > "$STUB_DIR/prview.last"

@@ -351,7 +351,10 @@ shard test, noticed by the operator, not the watch). `merge-queue-watch.sh`
 polls the PR and the repo's `mergeQueue` entries together and exits on the
 first terminal event: `0` merged, `10` evicted (it names the failed
 `gh-readonly-queue/<branch>/pr-<n>-…` run and its failing jobs), `11` closed
-unmerged, `12` never enqueued, `20` timeout. Run it in the background and
+unmerged, `12` never enqueued, `20` timeout. The queue deletes the entry the
+moment it squash-lands, so an empty entry is re-confirmed against the PR state
+(`--settle-tries`, default 3 × 5 s) before it becomes `10`/`12` — a PR that
+merged between the two reads reports `merged` (#2208, pr-shepherd#154). Run it in the background and
 act on the exit code; on `10`, classify the failing job first — an unrelated
 flaky test means re-enqueue the same approved head (and record the flake on
 its issue); a real failure means push the fix, get fresh exact-head approval

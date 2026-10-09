@@ -15,6 +15,10 @@
 # Usage:
 #   merge-queue-watch.sh --repo <owner/repo> --pr <n> [--branch main]
 #                        [--interval 45] [--timeout 3600] [--json]
+#                        [--settle-delay 5] [--settle-tries 3]
+# An empty queue entry is confirmed --settle-tries times (--settle-delay s
+# apart, capped at --interval) by re-reading the PR before any verdict: a PR
+# that merged between the two reads is "merged", not "evicted" (#2208).
 # Exit codes:
 #   0 merged · 10 evicted (queue entry gone, PR still open) · 11 closed
 #   unmerged · 12 never enqueued (no entry on first poll) · 20 timeout ·
@@ -24,20 +28,25 @@
 set -uo pipefail
 
 REPO=""; PR=""; BRANCH="main"; INTERVAL=45; TIMEOUT=3600; JSON=0
+SETTLE_DELAY=5; SETTLE_TRIES=3
 while [ $# -gt 0 ]; do
   case "$1" in
+    --settle-delay) SETTLE_DELAY="${2:-}"; shift 2 ;;
+    --settle-tries) SETTLE_TRIES="${2:-}"; shift 2 ;;
     --repo) REPO="${2:-}"; shift 2 ;;
     --pr) PR="${2:-}"; shift 2 ;;
     --branch) BRANCH="${2:-}"; shift 2 ;;
     --interval) INTERVAL="${2:-}"; shift 2 ;;
     --timeout) TIMEOUT="${2:-}"; shift 2 ;;
     --json) JSON=1; shift ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "merge-queue-watch: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 [ -n "$REPO" ] && [ -n "$PR" ] || { echo "merge-queue-watch: --repo and --pr are required" >&2; exit 2; }
-case "$PR$INTERVAL$TIMEOUT" in *[!0-9]*) echo "merge-queue-watch: --pr/--interval/--timeout must be integers" >&2; exit 2 ;; esac
+case "$PR$INTERVAL$TIMEOUT$SETTLE_DELAY$SETTLE_TRIES" in *[!0-9]*) echo "merge-queue-watch: --pr/--interval/--timeout/--settle-* must be integers" >&2; exit 2 ;; esac
+# The settle pause never outlasts one poll interval, so --interval 0 stays instant.
+[ "$SETTLE_DELAY" -le "$INTERVAL" ] || SETTLE_DELAY="$INTERVAL"
 OWNER="${REPO%%/*}"; NAME="${REPO#*/}"
 
 pr_state() { # prints: <state> <mergeStateStatus> <headSha12> <mergeSha12>
@@ -79,6 +88,25 @@ while :; do
     CLOSED) emit closed 11 "head=$head" ;;
   esac
   q="$(queue_entry)" || q=""
+  # An empty entry is not yet a verdict. The queue removes the entry when it
+  # squash-lands, so a merge between the PR read above and this queue read
+  # looks exactly like an eviction (pr-shepherd#154, 2026-10-09: reported
+  # "evicted", actually MERGED — #2208). Re-read the PR, and the queue for a
+  # transient miss, before calling it.
+  tries=0
+  while [ -z "$q" ] && [ "$tries" -lt "$SETTLE_TRIES" ]; do
+    tries=$((tries + 1))
+    sleep "$SETTLE_DELAY"
+    again="$(pr_state)" || again=""
+    if [ -n "$again" ]; then
+      pr="$again"; set -- $pr; state="$1"; ms="$2"; head="$3"; merge="$4"
+      case "$state" in
+        MERGED) emit merged 0 "merge=$merge head=$head" ;;
+        CLOSED) emit closed 11 "head=$head" ;;
+      esac
+    fi
+    q="$(queue_entry)" || q=""
+  done
   if [ -z "$q" ]; then
     if [ "$first" = 1 ]; then emit not-enqueued 12 "head=$head mergeStateStatus=$ms"; fi
     detail="head=$head mergeStateStatus=$ms"
