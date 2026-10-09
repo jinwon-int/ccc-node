@@ -1699,10 +1699,11 @@ ok "prepare failure leaves a pending activation and the recovery snapshot" \
 ok "prepare failure notifies the owner naming prepare-cmd" 'grep -rh "prepare-cmd" "$TMP/spool" >/dev/null 2>&1'
 ok "checkout stayed fast-forwarded (the old generation serving is runtime state)" \
   '[ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
-# shellcheck disable=SC2034  # out is read via eval inside ok()
 # `status` is read-only and skips budget validation (as for the restart budget);
 # `run` refuses before touching the lock or the checkout.
+# shellcheck disable=SC2034  # budget_head is read via eval inside ok()
 budget_head="$(git -C "$REPO" rev-parse HEAD)"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS=9999 run_selfup run 2>&1)"; rc=$?
 ok "prepare budget above 7200s is refused by run" '[ "$rc" = 2 ] && grep -q "1..7200" <<<"$out" && [ "$(git -C "$REPO" rev-parse HEAD)" = "$budget_head" ]'
 rm -f "$CLAUDE/self-update.prepare-cmd" "$CLAUDE/self-update.restart-cmd" "$STATE/self-update.pending-activation.json"
