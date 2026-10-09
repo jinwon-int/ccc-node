@@ -16,6 +16,9 @@
 #      `bridge/start.sh --path "$HOME" --restart -d`. Runs INSIDE this script's
 #      audit/notify boundary so its failure can never be discarded the way the
 #      hand-chained cron `... ; exit 0` discarded it on daegyo (#971).)
+#   ~/.claude/self-update.prepare-cmd (optional: one runtime-preparation command
+#       run after setup.sh and before any restart on a changed tick — #2207 ③;
+#       env CCC_SELF_UPDATE_TARGET_SHA/PREVIOUS_SHA/REPO_DIR are passed to it)
 #   ~/.claude/self-update.health-cmd  (optional: one runtime health probe, exit
 #      0 = healthy. With both files present, an up-to-date tick that finds the
 #      runtime DOWN attempts one recovery restart — so the second daily slot
@@ -95,7 +98,12 @@
 #      .claude/worktrees is non-empty; external worktrees never defer);
 #      11 = degraded (code updated but nothing restarted and no
 #      restart-cmd configured); 12 = installer re-apply failed (crontab was
-#      restored); 14 = activation incomplete (#1527): the installed generation
+#      restored); 15 = prepare-cmd failed (#2207): the
+#      runtime-preparation command (self-update.prepare-cmd, e.g. a Termux
+#      prepared-generation build) exited non-zero or hit
+#      CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS (3600, max 7200) —
+#      nothing was restarted, the previous generation keeps serving;
+#      14 = activation incomplete (#1527): the installed generation
 #      was never verified active — a pending-activation record exists (or its
 #      bookkeeping failed) and the tick refuses to report convergence from
 #      health alone, or (#2142) an external restart came back serving a
@@ -119,6 +127,14 @@ SERVICES_FILE="${CCC_SELF_UPDATE_SERVICES:-$CLAUDE_DIR/self-update.services}"
 REPO_FILE="$CLAUDE_DIR/self-update.repo"
 RESTART_CMD_FILE="${CCC_SELF_UPDATE_RESTART_CMD_FILE:-$CLAUDE_DIR/self-update.restart-cmd}"
 HEALTH_CMD_FILE="${CCC_SELF_UPDATE_HEALTH_CMD_FILE:-$CLAUDE_DIR/self-update.health-cmd}"
+# Optional runtime-preparation command (#2207 ③, Termux prepared generations):
+# runs after setup.sh and BEFORE any restart on a changed tick, bounded by its
+# own budget (builds take minutes; a full native build up to ~1 h). A failure
+# skips every restart so the old generation keeps serving, records a
+# `prepare-failed` pending activation and exits 15. Ships with
+# scripts/termux-prepare-generation.sh as the Termux implementation.
+PREPARE_CMD_FILE="${CCC_SELF_UPDATE_PREPARE_CMD_FILE:-$CLAUDE_DIR/self-update.prepare-cmd}"
+PREPARE_COMMAND_TIMEOUT_SECONDS="${CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS:-3600}"
 RESTART_WAIT_SECONDS="${CCC_SELF_UPDATE_RESTART_WAIT_SECONDS:-60}"
 RESTART_COMMAND_TIMEOUT_DEFAULT=180
 if [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]; then
@@ -294,6 +310,11 @@ resolve_restart_cmd() {
 resolve_health_cmd() {
   if [ -n "${CCC_SELF_UPDATE_HEALTH_CMD:-}" ]; then printf '%s' "$CCC_SELF_UPDATE_HEALTH_CMD"; return 0; fi
   read_operator_cmd "$HEALTH_CMD_FILE"
+}
+
+resolve_prepare_cmd() {
+  if [ -n "${CCC_SELF_UPDATE_PREPARE_CMD:-}" ]; then printf '%s' "$CCC_SELF_UPDATE_PREPARE_CMD"; return 0; fi
+  read_operator_cmd "$PREPARE_CMD_FILE"
 }
 
 # --- pending-activation evidence (#1527) --------------------------------------
@@ -756,6 +777,7 @@ if [ "$MODE" = "status" ]; then
   say "lock: $(lock_status)"
   say "services file: $SERVICES_FILE $([ -f "$SERVICES_FILE" ] && echo "($(grep -cv '^[[:space:]]*\(#\|$\)' "$SERVICES_FILE" 2>/dev/null || true) services)" || echo '(missing)')"
   say "external restart command timeout: ${RESTART_COMMAND_TIMEOUT_SECONDS}s"
+  say "prepare command: $(resolve_prepare_cmd >/dev/null 2>&1 && echo "configured (timeout ${PREPARE_COMMAND_TIMEOUT_SECONDS}s)" || echo none)"
   say "post-restart health budget: ${RESTART_WAIT_SECONDS}s"
   pending_rc=0
   load_pending_activation || pending_rc=$?
@@ -786,6 +808,12 @@ fi
 # lock's 30-minute stale threshold. This is not a deadline for the whole tick.
 if [[ ! "$RESTART_COMMAND_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$RESTART_COMMAND_TIMEOUT_SECONDS" -gt 900 ]; then
   say "self-update: CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS must be an integer in 1..900" >&2
+  exit 2
+fi
+# The prepare budget is separate: a native wheel build on Termux can take up
+# to ~1 h. It is still shorter than the 2 h cap so one tick cannot run away.
+if [[ ! "$PREPARE_COMMAND_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,3}$ ]] || [ "$PREPARE_COMMAND_TIMEOUT_SECONDS" -gt 7200 ]; then
+  say "self-update: CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS must be an integer in 1..7200" >&2
   exit 2
 fi
 
@@ -1532,8 +1560,38 @@ else
   [ "$REAPPLY_COUNT" -gt 0 ] && REAPPLY_NOTE=", cron 재적용 ${REAPPLY_COUNT}건"
 fi
 
+# --- runtime preparation (#2207 ③) --------------------------------------------
+# Termux serves a prepared generation (~/.ccc-node/preparations/<gen>), so a
+# fast-forward of the checkout changes nothing until a generation for the new
+# SHA is built and the bridge-current pointer moves. The operator's prepare
+# command does exactly that (scripts/termux-prepare-generation.sh); it must
+# succeed before anything is restarted, or the restart would re-launch the OLD
+# generation and the tick would end `activation incomplete (serving-mismatch)`.
+PREPARE_JSON='[]'
+if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && pcmd="$(resolve_prepare_cmd)"; then
+  prepare_started=$SECONDS
+  log "prepare begin timeout=${PREPARE_COMMAND_TIMEOUT_SECONDS}s target=$NEW_SHA"
+  prepare_rc=0
+  CCC_SELF_UPDATE_TARGET_SHA="$NEW_SHA" CCC_SELF_UPDATE_PREVIOUS_SHA="$OLD_SHA" CCC_SELF_UPDATE_REPO_DIR="$REPO" \
+    run_bounded_operator_cmd "$PREPARE_COMMAND_TIMEOUT_SECONDS" "$pcmd" || prepare_rc=$?
+  log "prepare exit=$prepare_rc elapsed=$((SECONDS - prepare_started))s"
+  if [ "$prepare_rc" -ne 0 ]; then
+    SHORT_NEW="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+    PREPARE_JSON='[{"name":"prepare","ok":false,"scope":"external"}]'
+    KEEP_INSTALL_SNAPSHOT=1
+    write_pending_activation "prepare-failed" "$PREPARE_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
+    audit "prepare-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$PREPARE_JSON" \
+      "$(jq -nc --argjson rc "$prepare_rc" --argjson budget "$PREPARE_COMMAND_TIMEOUT_SECONDS" '{prepare_exit:$rc, prepare_budget_seconds:$budget}')"
+    log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=prepare-failure"
+    notify_activation_incomplete "$NEW_SHA" "self-update ${SHORT_NEW}: 런타임 준비 명령(prepare-cmd)이 실패해(rc=${prepare_rc}) 재시작을 건너뜁니다. 이전 세대가 계속 서빙되며 롤백 자료는 ${INSTALL_SNAPSHOT_DIR}에 있습니다. ~/.claude/state/self-update.log 확인 필요." "prepare-fail-$NEW_SHA"
+    say "self-update: prepare command failed (rc=$prepare_rc); restarts skipped, previous generation keeps serving; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
+    exit 15
+  fi
+  PREPARE_JSON='[{"name":"prepare","ok":true,"scope":"external"}]'
+fi
+
 # --- restart allowlisted services ----------------------------------------------
-SERVICES_JSON='[]'
+SERVICES_JSON="$PREPARE_JSON"
 FAILED=0
 RESTARTED=0
 if [ -f "$SERVICES_FILE" ]; then
