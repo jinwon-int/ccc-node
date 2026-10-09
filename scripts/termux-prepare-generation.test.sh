@@ -6,10 +6,12 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/termux-prepare-generation.sh"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$HERE/../claude/hooks/lib/test-stub.sh"
+ccc_test_reset_hook_env
 pass=0; fail=0
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
-TMP_BASE="${TMPDIR:-$(dirname "$HERE")}"; mkdir -p "$TMP_BASE"
-TMP="$(mktemp -d "$TMP_BASE/termux-prep-test.XXXXXX")"
+TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export HOME="$TMP/home"; mkdir -p "$HOME/.claude/state"

@@ -65,7 +65,7 @@ while [ $# -gt 0 ]; do
 done
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-log() { mkdir -p "$(dirname "$LOGF")" 2>/dev/null || :; printf '%s %s\n' "$(ts)" "$*" >> "$LOGF" 2>/dev/null || :; }
+log() { mkdir -p "$(dirname "$LOGF")" 2>/dev/null || :; printf '%s %s\n' "$(ts)" "$*" 2>/dev/null >> "$LOGF" || :; }
 say() { printf 'termux-prepare-generation: %s\n' "$*"; log "$*"; }
 die() { say "$2" >&2; exit "$1"; }
 
