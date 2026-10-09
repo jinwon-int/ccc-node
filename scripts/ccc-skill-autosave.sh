@@ -166,6 +166,31 @@ collect_with_edge_env() {
   )
 }
 
+# #2203: keep the full collect result readable after the fact, success or not.
+# Only a JSON object is written, so a crashed child (empty or traceback-free
+# stdout) never clobbers the previous result with garbage.
+persist_collect_summary() { # <summary-json>
+  [ -d "$STATE_DIR/skill-promotion" ] || return 0
+  printf '%s' "$1" | jq -e 'type == "object"' >/dev/null 2>&1 || return 0
+  (umask 077; printf '%s\n' "$1" > "$STATE_DIR/skill-promotion/last-collect.json") 2>/dev/null || :
+}
+
+# #2203: a failed collect used to log one fixed line and drop the summary, so
+# the 2026-10-08 publisher failure cause was unrecoverable. Emit a shape-checked
+# digest: the top-level `code` and up to 8 `source:code` error pairs. Anything
+# that does not match the expected label/code charset is dropped, not logged.
+collect_failure_digest() { # <summary-json>
+  printf '%s' "$1" | jq -r '
+    def safe_code: if type == "string" and test("^[a-z0-9_]{1,64}$") then . else "unknown" end;
+    def safe_source: if type == "string" and test("^[A-Za-z0-9._:-]{1,64}$") then . else "-" end;
+    [ (if has("code") then " code=\(.code | safe_code)" else empty end),
+      (if (.errors | type) == "array" and (.errors | length) > 0
+       then " errors=\(.errors | length)[\([.errors[:8][] | select(type == "object")
+              | "\(.source | safe_source):\(.code | safe_code)"] | join(","))]"
+       else empty end)
+    ] | join("")' 2>/dev/null || :
+}
+
 # Curator switches (#2011). The curator itself validates the exact values and
 # fails closed on garbage; the sweep only needs the off-switch direction.
 curator_enabled() {
@@ -924,10 +949,16 @@ if [ -f "$PROMOTER" ] && command -v python3 >/dev/null 2>&1; then
   # skill-promotion/last-collect.json (0600) so dispatch skip codes are
   # readable after the fact — the 500-byte cut hid `dispatch_broker_unreachable`
   # for three days (2026-10-05~07) while nine intake PRs waited unreviewed.
-  summary="$(collect_with_edge_env $collect_args)" \
-    && { if [ -d "$STATE_DIR/skill-promotion" ]; then (umask 077; printf '%s\n' "$summary" > "$STATE_DIR/skill-promotion/last-collect.json") 2>/dev/null || :; fi
-         log "promotion-collect edge-env=$edge_state $(printf '%s' "$summary" | head -c 1500)"; } \
-    || log "promotion-collect failed (non-fatal) edge-env=$edge_state"
+  # #2203: the failure branch persists the summary too and logs a shape-checked
+  # code/errors digest instead of a bare "failed" line.
+  # shellcheck disable=SC2086  # collect_args is a fixed word list built above
+  if summary="$(collect_with_edge_env $collect_args)"; then
+    persist_collect_summary "$summary"
+    log "promotion-collect edge-env=$edge_state $(printf '%s' "$summary" | head -c 1500)"
+  else
+    persist_collect_summary "$summary"
+    log "promotion-collect failed (non-fatal) edge-env=$edge_state$(collect_failure_digest "$summary")"
+  fi
 else
   log "promotion skipped reason=missing-runtime"
 fi

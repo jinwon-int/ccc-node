@@ -50,6 +50,17 @@ after the source the previous real collect rotated to. Repeated `max_prs=1`
 runs therefore cycle through every local and remote source instead of always
 beginning with the local outbox (#1647).
 
+The cursor records the **last source that received a PR slot** in the run,
+so the next run resumes right after it (#2203). A run that opened no PR
+records its start source instead, which keeps the pre-#2203 one-step advance
+when there is nothing to serve or every head failed to publish. Recording
+the start source unconditionally (as #1647 originally did) moved the
+rotation one source per run regardless of `max_prs`. With a backlog on the
+first few sources, a node late in `collect_nodes` then waited up to
+`len(sources)` runs for its first slot. In the 2026-10-08 publisher run,
+with `max_prs=3`, the waiting node was sixth in the first round. It was
+projected to wait five more nights.
+
 The rotation point is persisted in
 `<promotion-state-dir>/collect-cursor.json`, an owner-only (0600) JSON
 record written atomically with the repository's safe-FS primitives:

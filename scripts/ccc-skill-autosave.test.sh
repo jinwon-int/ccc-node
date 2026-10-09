@@ -71,6 +71,10 @@ if secret_touch:
     state = "present" if os.environ.get("A2A_EDGE_SECRET") else "absent"
     with Path(secret_touch).open("a", encoding="utf-8") as handle:
         handle.write(args + " secret=" + state + "\n")
+# #2203: a collect child can be told to fail with a given stdout and exit code.
+if sys.argv[1:2] == ["collect"] and "PROMOTION_COLLECT_RC" in os.environ:
+    sys.stdout.write(os.environ.get("PROMOTION_COLLECT_OUT", ""))
+    sys.exit(int(os.environ["PROMOTION_COLLECT_RC"]))
 print('{"ok":true}')
 PY
 chmod +x "$PROMOTER"
@@ -786,6 +790,54 @@ ok "#1647: status shows the effective drafting budget and its source" \
 out="$(CCC_STATE_DIR="$TMP/state15d" CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS=0 bash "$AUTOSAVE" status 2>&1)"
 ok "#1647: status names the explicit opt-out" \
   'printf "%s" "$out" | grep -q "^drafting budget: per-branch max=3, total max=0 (no cap) (source: env;"'
+
+# --- 16) #2203: a failed collect keeps its summary and logs why -------------
+# The bare "promotion-collect failed (non-fatal)" line made the 2026-10-08
+# publisher failure unrecoverable. These cases pin the digest, the charset guard,
+# the persisted last-collect.json, and that a crashed child clobbers nothing.
+run16() { # <state> [env...]
+  local state="$1"; shift
+  mkdir -p "$state/skill-promotion"; chmod 700 "$state" "$state/skill-promotion"
+  env "$@" CCC_STATE_DIR="$state" CLAUDE_PROJECTS_DIR="$TMP/projects16" \
+    CCC_PUSH_SPOOL="$TMP/spool16" CCC_SKILL_REVIEW_CMD="$REVIEW" \
+    CCC_SKILL_SCAN_CMD="$SCAN" SCAN_TOUCH="$TMP/scan16.touched" \
+    CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion16.touched" \
+    CCC_A2A_EDGE_ENV="$TMP/no-such-edge.env" CLAUDE_SKILLS_DIR="$TMP/skills16" \
+    CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode bash "$AUTOSAVE" run
+}
+STATE16="$TMP/state16"
+FAIL16='{"ok":false,"mode":"collect","published":[],"errors":[{"source":"node-a","code":"remote_export_failed"},{"source":"bad source; rm -rf","code":"Weird Code $(id)"},{"source":"collect-cursor","code":"collect_cursor_unsafe"}]}'
+run16 "$STATE16" PROMOTION_COLLECT_RC=2 PROMOTION_COLLECT_OUT="$FAIL16"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "#2203: a failed collect stays non-fatal" '[ "$rc" = 0 ]'
+ok "#2203: the failure line carries the shape-checked error digest" \
+  'grep -q "promotion-collect failed (non-fatal) edge-env=absent errors=3\[node-a:remote_export_failed,-:unknown,collect-cursor:collect_cursor_unsafe\]$" "$STATE16/skill-autosave.log"'
+ok "#2203: off-charset source/code values never reach the log" \
+  '! grep -q "rm -rf\|Weird\|(id)" "$STATE16/skill-autosave.log"'
+ok "#2203: the failed summary is persisted to last-collect.json (0600)" \
+  'jq -e ".ok == false and (.errors | length) == 3" "$STATE16/skill-promotion/last-collect.json" >/dev/null && [ "$(stat -c %a "$STATE16/skill-promotion/last-collect.json")" = 600 ]'
+
+STATE16B="$TMP/state16b"
+run16 "$STATE16B" PROMOTION_COLLECT_RC=2 PROMOTION_COLLECT_OUT='{"ok":false,"code":"gh_auth_failed"}'
+ok "#2203: a top-level failure code is logged" \
+  'grep -q "promotion-collect failed (non-fatal) edge-env=absent code=gh_auth_failed$" "$STATE16B/skill-autosave.log"'
+
+# A crashed child (no JSON on stdout) keeps the previous result and the bare line.
+printf '{"ok":true,"published":[]}\n' > "$STATE16B/skill-promotion/last-collect.json"
+run16 "$STATE16B" PROMOTION_COLLECT_RC=1 PROMOTION_COLLECT_OUT=''
+ok "#2203: a crashed collect logs the bare failure line" \
+  '[ "$(grep -c "promotion-collect failed (non-fatal) edge-env=absent$" "$STATE16B/skill-autosave.log")" = 1 ]'
+ok "#2203: a crashed collect does not clobber last-collect.json" \
+  'jq -e ".ok == true" "$STATE16B/skill-promotion/last-collect.json" >/dev/null'
+
+# Success still persists and logs exactly as before.
+STATE16C="$TMP/state16c"
+run16 "$STATE16C"
+ok "#2203: a successful collect still persists last-collect.json" \
+  'jq -e ".ok == true" "$STATE16C/skill-promotion/last-collect.json" >/dev/null'
+ok "#2203: a successful collect still logs the summary line" \
+  'grep -q "promotion-collect edge-env=absent {\"ok\":true}" "$STATE16C/skill-autosave.log"'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

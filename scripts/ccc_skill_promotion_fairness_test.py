@@ -456,6 +456,45 @@ class CollectRunRotationTests(unittest.TestCase):
         second = [self.collect()["published"][0]["name"] for _ in range(3)]
         self.assertEqual(second[0], "local-skill-b")
 
+    def test_cursor_advances_past_the_source_actually_served(self):
+        # #2203: the start source (local) is empty, so `deep` takes the slot.
+        # The cursor must record `deep`, not the empty start source; otherwise
+        # the next run starts at `deep` again and `starved` waits a full cycle.
+        heads = []
+        for _ in range(2):
+            heads.append(self.collect()["published"][0]["source"])
+            if len(heads) == 1:
+                self.assertEqual(self.read_cursor()["last_source"], "deep")
+        self.assertEqual(heads, ["deep", "starved"])
+
+    def test_multi_slot_run_resumes_after_the_last_opened_source(self):
+        # #2203 (publisher run 2026-10-08): max_prs=3 with backlog on the first
+        # sources. The next run must resume after the third served source, so
+        # a node late in `collect_nodes` gets a slot on the very next run
+        # instead of after len(sources) runs of one-step rotation.
+        self.config.max_prs = 3
+        self.config.collect_nodes = ("n1", "n2", "n3", "n4", "late")
+        self.remote = {
+            node: [envelope(node, f"{node}-skill-{i}", "2026-08-02T00:00:00Z")
+                   for i in range(3)]
+            for node in self.config.collect_nodes
+        }
+        first = [row["source"] for row in self.collect()["published"]]
+        self.assertEqual(first, ["n1", "n2", "n3"])
+        self.assertEqual(self.read_cursor()["last_source"], "n3")
+        second = [row["source"] for row in self.collect()["published"]]
+        self.assertEqual(second, ["n4", "late", "n1"])
+        self.assertEqual(self.read_cursor()["last_source"], "n1")
+
+    def test_run_that_opens_nothing_still_steps_past_its_start_source(self):
+        # #2203: with no PR opened there is no served source; the cursor keeps
+        # the pre-#2203 one-step advance so a failing head cannot pin it.
+        self.fail_nodes = {"deep", "starved"}
+        self.write_cursor("local")  # next run starts at deep
+        result = self.collect()
+        self.assertEqual(result["published"], [])
+        self.assertEqual(self.read_cursor()["last_source"], "deep")
+
     def test_unknown_cursor_label_falls_back_to_canonical_order(self):
         # A removed or renamed source must not wedge the rotation: the run
         # falls back to the canonical local-first order.
