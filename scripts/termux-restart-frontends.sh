@@ -65,7 +65,7 @@ MIN_WINDOW="${CCC_MATRIX_MIN_WINDOW_SECONDS:-20}"
 FOLLOWER_WAIT="${CCC_TERMUX_FOLLOWER_WAIT_SECONDS:-3600}"
 
 now() { date +%s; }
-log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || :; printf '%s %s\n' "$(date -Is)" "$*" >> "$LOG" 2>/dev/null || :; }
+log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || :; printf '%s %s\n' "$(date -Is)" "$*" 2>/dev/null >> "$LOG" || :; }
 want() { basename "$(readlink -f "$POINTER" 2>/dev/null)"; }
 
 # health.json → "pid started_epoch state generation" ("-" for anything unknown).
