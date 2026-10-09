@@ -17,11 +17,25 @@ def rehearsal(tmp_path):
     try:
         r.prepare("previous")
         r.prepare("candidate")
+        # The initial start never exercises the ready timeout, so give it room:
+        # a cold generation (copied without __pycache__) needs ~3-5s to report
+        # available even on a fast host (#2179).
+        r.env["CCC_BRIDGE_RESTART_READY_TIMEOUT"] = UNTESTED_READY_WINDOW
         rc, output = r.command("previous")
         assert rc == 0, output
+        r.env["CCC_BRIDGE_RESTART_READY_TIMEOUT"] = TESTED_READY_WINDOW
         yield r
     finally:
         r.close()
+
+
+# #2179: bridge-tests (3.14) once failed the ready/ready case with rc != 0.
+# A cold candidate takes ~3-5s to report available locally (a 3s window fails
+# with not-available-within-timeout), so the 12s window left only a 2-4x margin
+# on a slow runner. Cases that expect the timeout keep the short window; cases
+# where the candidate is ready must not depend on it.
+TESTED_READY_WINDOW = "12"
+UNTESTED_READY_WINDOW = "60"
 
 
 def controlled(r, daemon=False):
@@ -56,6 +70,8 @@ def test_controlled_candidate_and_single_recovery(rehearsal, candidate_mode, rec
     old = r.health()
     (r.project / "candidate.mode").write_text(candidate_mode)
     (r.project / "previous.mode").write_text(recovery_mode)
+    if candidate_mode == "ready":
+        r.env["CCC_BRIDGE_RESTART_READY_TIMEOUT"] = UNTESTED_READY_WINDOW
     rc, output = controlled(r, daemon)
     assert rc == expected, output
     evidence = records(r)
