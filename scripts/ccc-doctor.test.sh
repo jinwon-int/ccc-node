@@ -1347,7 +1347,7 @@ ok "no worker env file is 해당 없음, not a finding" \
 
 # --- dns resolver mode (#2207) ----------------------------------------------
 # A tailscale-written /etc/resolv.conf that only lists MagicDNS is the shape
-# that turned two reboots (dungae, jingun) into node-wide SERVFAIL; the doctor
+# that turned three fleet reboots into node-wide SERVFAIL (#2207); the doctor
 # must warn on it before the reboot, stay 정상 on the resolved stub, and treat
 # a node without tailscale state as 해당 없음. The resolution probe is pointed
 # at a fake getent so the fixture never touches the network.

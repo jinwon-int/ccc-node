@@ -2737,8 +2737,8 @@ class Doctor:
     def check_dns_resolver_mode(self) -> None:
         """Warn when a reboot would leave tailscaled with no upstream DNS (#2207).
 
-        Twice on dungae (2026-09-22, 2026-10-09) and once on jingun (2026-10-01)
-        a reboot ended in ``tailscaled: dns: resolver: forward: no upstream
+        Three times across the fleet (2026-09-22, 2026-10-01, 2026-10-09) a
+        reboot ended in ``tailscaled: dns: resolver: forward: no upstream
         resolvers set, returning SERVFAIL`` for every public name: the Telegram
         bridge looped in ``Application.initialize()`` for 48 min / 10 h, the
         Matrix frontend crash-looped, and both alert channels were inside the
@@ -2767,7 +2767,7 @@ class Doctor:
         remedy = (
             "back up the file, then `ln -sfn ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf` "
             "+ /etc/systemd/resolved.conf.d/10-upstream.conf (DNS=1.1.1.1 8.8.8.8) and restart tailscaled "
-            "so it reports `using \"systemd-resolved\" mode` (ccc-node#2207, dungae ND-3758)"
+            "so it reports `using \"systemd-resolved\" mode` (ccc-node#2207)"
         )
         resolved_owned = False
         if not state.exists():
