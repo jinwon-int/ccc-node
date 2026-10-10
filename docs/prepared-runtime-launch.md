@@ -98,6 +98,49 @@ compatibility check; it does not lock source/packages against other writers,
 preflight provider authentication, switch generations automatically or restore
 shared configuration. The child still performs its normal bootstrap checks.
 
+## Termux generation pointer and lifecycle scripts
+
+On the Termux nodes the retained pairs live under one state directory and a
+single symlink names the serving one:
+
+```
+~/.ccc-node/preparations/<gen>/source   # detached git worktree of one commit
+~/.ccc-node/preparations/<gen>/job      # termux_prepare.py work dir (job/runtime = venv)
+~/.ccc-node/preparations/<gen>/serving  # optional link selecting another job dir
+~/.ccc-node/bridge-current -> preparations/<gen>
+```
+
+Three repo scripts own the lifecycle; the node files are one-line `exec`s to
+them, so a generation switch is "repoint one symlink + restart":
+
+| Script | Role | Who runs it |
+| --- | --- | --- |
+| `scripts/termux-bridge-current.sh` | Resolves the pointer to **real paths** (`--print-source`, `--print-job`, `--print-generation`; `prepared_runtime.py` refuses symlinked ancestors) and launches the serving generation's `start.sh --prepared-runtime <job> <args>` under the lifecycle lock (`flock`, or an atomic mkdir claim where Termux has no util-linux flock). It drops the channel-scoped variables a Matrix-spawned shell leaks (`CCC_CHANNEL`, `BOT_DATA_DIR`, `CCC_MATRIX_*`, `VIRTUAL_ENV`, …) and appends `--channel telegram` when that generation's `start.sh` understands it. Never moves the pointer. | Every caller that needs the Telegram frontend: `termux-restart-frontends.sh`, Termux:Boot, health self-heal. The node copy is `~/.ccc-node/scripts/bridge-current.sh`. |
+| `scripts/termux-prepare-generation.sh` | self-update `prepare-cmd`: builds `main-<sha7>-<date>` for the target commit (inheriting `bridge/.env` from the serving generation, reusing its native wheels when the lock file is unchanged, `--extra matrix` on Matrix nodes), gates the result (`ready` receipt + `import aiohttp, nio`), records `bridge-current.prev-<ts>` and repoints. Runs `termux_prepare.py` with `VIRTUAL_ENV`/`PYTHONPATH`/`PYTHONHOME` unset and venv/generation `bin` entries removed from `PATH`. | `~/.claude/self-update.prepare-cmd` |
+| `scripts/termux-restart-frontends.sh` | self-update `restart-cmd`: restarts Telegram through the launcher, then makes the runit Matrix frontend follow the pointer and **proves** the new process survives (exit 3 otherwise). | `~/.claude/self-update.restart-cmd` |
+
+### Recovery and pointer rollback in the automatic flow
+
+`termux-prepare-generation.sh` moves the pointer *before* the restart, so by the
+time `termux-restart-frontends.sh` runs, the live Telegram process still serves
+the previous generation while the pointer names the candidate. The restart step
+reads `~/.telegram_bot/health.json` (`runtime_generation.source_dir` /
+`python_prefix`) and, when the live generation differs from the pointer and is
+still a complete retained pair, passes it as `--recovery-source <gen>/source/bridge
+--recovery-runtime <gen>/job` — the one-shot recovery described below. Then:
+
+- `start.sh` exit `0`: the candidate serves; the Matrix step follows the pointer.
+- `start.sh` exit `7` (candidate failed, previous generation verified restored):
+  the pointer is moved **back** to the restored generation and the failed target
+  is written to `~/.ccc-node/bridge-current.rolledback-<ts>`. The Matrix step then
+  sees pointer == running generation and does not restart it. self-update records
+  the tick as failed with rc 7.
+- any other failure: the pointer is left where `prepare-cmd` put it; the previous
+  target is in `bridge-current.prev-<ts>` and the decision is the operator's.
+
+`CCC_TERMUX_RECOVERY=0` turns the arming (and therefore the rollback) off;
+`CCC_TERMUX_LAUNCHER` points the restart step at another launcher.
+
 ## Receipts and recovery
 
 After validation under the token lock, each launch appends a private receipt

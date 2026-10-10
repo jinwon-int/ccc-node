@@ -44,6 +44,7 @@ if [ "${1:-}" = "-" ]; then
   exec /usr/bin/env python3 - "$2"
 fi
 printf '%s\n' "$*" >> "${FAKE_CALLS:?}"
+printf 'VIRTUAL_ENV=%s PYTHONPATH=%s PATH=%s\n' "${VIRTUAL_ENV-unset}" "${PYTHONPATH-unset}" "$PATH" > "${FAKE_CALLS}.env"
 work=""; while [ $# -gt 0 ]; do [ "$1" = "--work-dir" ] && work="$2"; shift; done
 mkdir -p "$work"
 if [ "${FAKE_PREPARE_FAIL:-0}" = 1 ]; then
@@ -165,6 +166,16 @@ rm -rf "$HOME/.ccc-matrix"
 out="$(run)"; rc=$?
 ok "without a Matrix frontend the build is promoted without the extra gate" '[ "$rc" = 0 ] && ! grep -q -- "--extra" "$FAKE_CALLS"'
 ok "CCC_TERMUX_MATRIX_FRONTEND=1 forces the gate" 'echo i > "$REPO/i.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm I; CCC_TERMUX_MATRIX_FRONTEND=1 run >/dev/null 2>&1; [ "$?" = 4 ]'
+
+# 10) the build never inherits a venv / generation runtime environment
+echo j > "$REPO/j.txt"; git -C "$REPO" add -A && git -C "$REPO" commit -qm J
+rm -f "$FAKE_CALLS.env"
+out="$(VIRTUAL_ENV="$TMP/venv" PYTHONPATH=/x/site PATH="$TMP/venv/bin:$PREP/main-deadbee-20260101/job/runtime/bin:$PATH" run)"; rc=$?
+ok "termux_prepare.py runs with VIRTUAL_ENV/PYTHONPATH unset" '[ "$rc" = 0 ] && grep -q "^VIRTUAL_ENV=unset PYTHONPATH=unset " "$FAKE_CALLS.env"'
+ok "venv and generation runtime bin entries are dropped from PATH, the rest is kept" '! grep -q "$TMP/venv/bin" "$FAKE_CALLS.env" && ! grep -q "/preparations/" "$FAKE_CALLS.env" && grep -q "PATH=.*/bin" "$FAKE_CALLS.env"'
+echo k > "$REPO/k.txt"; git -C "$REPO" add -A && git -C "$REPO" commit -qm K
+out="$(CCC_TERMUX_PREPARE_PATH="/only/this:$FAKEBIN:/usr/bin:/bin" run)"; rc=$?
+ok "CCC_TERMUX_PREPARE_PATH replaces the build PATH verbatim" '[ "$rc" = 0 ] && grep -q "PATH=/only/this:$FAKEBIN:/usr/bin:/bin$" "$FAKE_CALLS.env"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

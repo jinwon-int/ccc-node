@@ -176,6 +176,69 @@ rm -f "$HOME/.ccc-matrix/health.json"
 out="$(run --verify 2)"; rc=$?
 ok "--verify without health.json → exit 3" '[ "$rc" = 3 ] && [[ "$out" == *"no health.json"* ]]'
 
+# ---------------------------------------------------------------- recovery arming + rollback (#2175 C remnant)
+GA="$HOME/.ccc-node/preparations/gen-A"; GB="$HOME/.ccc-node/preparations/gen-B"
+mkdir -p "$GA/source/bridge" "$GA/job/runtime/bin" "$GB/source/bridge" "$GB/job/runtime/bin" "$HOME/.telegram_bot"
+printf '#!/usr/bin/env bash\nprintf "genA-start %%s\\n" "$*" >> "$CALLS"; exit 0\n' > "$GA/source/bridge/start.sh"
+for f in "$GA/job/runtime/bin/python" "$GB/source/bridge/start.sh" "$GB/job/runtime/bin/python"; do printf '#!/usr/bin/env bash\nexit 0\n' > "$f"; done
+chmod +x "$GA/source/bridge/start.sh" "$GA/job/runtime/bin/python" "$GB/source/bridge/start.sh" "$GB/job/runtime/bin/python"
+tg_health() { # <pid> <gen>: the live Telegram process and the generation it serves
+  python3 - "$HOME/.telegram_bot/health.json" "$1" "$HOME/.ccc-node/preparations/$2" <<'PY'
+import json, sys
+path, pid, gen = sys.argv[1:4]
+json.dump({"process": {"pid": int(pid), "started_at": "2026-10-10T00:00:00Z"},
+           "runtime_generation": {"source_dir": f"{gen}/source/bridge", "python_prefix": f"{gen}/job/runtime"}}, open(path, "w"))
+PY
+}
+
+# live Telegram on gen-A, pointer moved to gen-B → recovery armed to gen-A
+reset; point gen-B; tg_health "$LIVE1" gen-A
+write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-B 0; setfake
+out="$(run)"; rc=$?
+ok "pointer != live generation: recovery args name the live generation" '[ "$rc" = 0 ] && grep -q -- "bridge-current --path $HOME --restart -d --recovery-source $(readlink -f "$GA")/source/bridge --recovery-runtime $(readlink -f "$GA")/job" "$CALLS"'
+ok "arming is logged" 'grep -q "recovery armed: candidate=gen-B previous=gen-A" "$LOG"'
+ok "a successful restart leaves the pointer on the candidate" '[ "$(readlink "$HOME/.ccc-node/bridge-current")" = "preparations/gen-B" ] && ! compgen -G "$HOME/.ccc-node/bridge-current.rolledback-*" >/dev/null'
+
+# same, but start.sh reports 7 (candidate failed, previous restored) → pointer rolled back, Matrix untouched
+reset; point gen-B; tg_health "$LIVE1" gen-A
+write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0; setfake "FAKE_TG_RC=7"
+out="$(run)"; rc=$?
+ok "rc 7 with recovery armed → exit 7 and pointer back on the restored generation" '[ "$rc" = 7 ] && [ "$(readlink "$HOME/.ccc-node/bridge-current")" = "preparations/gen-A" ]'
+ok "the failed target is recorded" 'compgen -G "$HOME/.ccc-node/bridge-current.rolledback-*" >/dev/null && grep -qx "preparations/gen-B" "$HOME"/.ccc-node/bridge-current.rolledback-*'
+ok "rollback is logged and the Matrix step sees an up-to-date pointer (no restart)" 'grep -q "pointer rolled back preparations/gen-B -> preparations/gen-A" "$LOG" && ! grep -q "sv restart" "$CALLS" && grep -q "matrix up to date (gen-A)" "$LOG"'
+rm -f "$HOME"/.ccc-node/bridge-current.rolledback-*
+
+# rc 7 WITHOUT recovery armed (live == pointer) → no rollback, status propagates as before
+reset; point gen-A; tg_health "$LIVE1" gen-A
+write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0; setfake "FAKE_TG_RC=7"
+out="$(run)"; rc=$?
+ok "live generation == pointer: no recovery args" '[ "$rc" = 7 ] && grep -q -- "bridge-current --path $HOME --restart -d$" "$CALLS"'
+ok "no rollback without an armed recovery" '[ "$(readlink "$HOME/.ccc-node/bridge-current")" = "preparations/gen-A" ] && ! compgen -G "$HOME/.ccc-node/bridge-current.rolledback-*" >/dev/null && ! grep -q "rolled back" "$LOG"'
+
+# dead Telegram pid / disabled / incomplete previous pair → not armed
+reset; point gen-B; tg_health "$DEAD" gen-A; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-B 0; setfake
+out="$(run)"
+ok "a dead Telegram pid in health.json arms nothing" '! grep -q -- "--recovery-source" "$CALLS"'
+reset; tg_health "$LIVE1" gen-A
+out="$(CCC_TERMUX_RECOVERY=0 run)"
+ok "CCC_TERMUX_RECOVERY=0 arms nothing" '! grep -q -- "--recovery-source" "$CALLS"'
+reset; chmod -x "$GA/job/runtime/bin/python"
+out="$(run)"
+ok "a previous pair without a runtime is not armed (logged)" '! grep -q -- "--recovery-source" "$CALLS" && grep -q "recovery not armed" "$LOG"'
+chmod +x "$GA/job/runtime/bin/python"
+
+# ---------------------------------------------------------------- launcher resolution
+reset; point gen-A; tg_health "$LIVE1" gen-A; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0; setfake
+mv "$HOME/.ccc-node/scripts/bridge-current.sh" "$TMP/bridge-current.sh.keep"
+out="$(CCC_TERMUX_LAUNCH_FLOCK=0 run)"; rc=$?
+ok "without a node bridge-current.sh the repo termux-bridge-current.sh launches the serving generation" '[ "$rc" = 0 ] && grep -q -- "genA-start --prepared-runtime $(readlink -e "$GA/job") --path $HOME --restart -d" "$CALLS" && ! grep -q "^bridge-current" "$CALLS"'
+reset
+printf '#!/usr/bin/env bash\nprintf "custom %%s\\n" "$*" >> "$CALLS"; exit 0\n' > "$TMP/custom-launcher.sh"
+out="$(CCC_TERMUX_LAUNCHER="$TMP/custom-launcher.sh" run)"; rc=$?
+ok "CCC_TERMUX_LAUNCHER overrides the launcher" '[ "$rc" = 0 ] && grep -q "^custom --path $HOME --restart -d" "$CALLS"'
+mv "$TMP/bridge-current.sh.keep" "$HOME/.ccc-node/scripts/bridge-current.sh"
+rm -f "$HOME/.telegram_bot/health.json"
+
 # ---------------------------------------------------------------- usage
 out="$(run --bogus)"; rc=$?
 ok "unknown argument → exit 2" '[ "$rc" = 2 ]'
