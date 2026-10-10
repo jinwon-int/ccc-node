@@ -109,6 +109,8 @@ T2 레인은 **역할마다 lineage 1개**에 묶는다(PR×역할). lineage는 
 `scripts/lib/nclex-lineage-spec.mjs`(#2363)와 `scripts/lib/review-lineage-client.mjs`.
 **브로커 호스트에서 실행**(edge secret은 `A2A_EDGE_SECRET` env로만, 0절 규칙 동일)하고,
 그 호스트의 nclex 체크아웃에 base·head 커밋을 fetch해 `--repo`로 준다.
+- shallow 사본은 `--repo`로 쓸 수 없다 — `git -C <체크아웃> rev-parse --is-shallow-repository`가 `true`면 full clone 체크아웃을 쓴다.
+- PR head는 브랜치명이 아니라 `git -C <체크아웃> fetch origin pull/<n>/head`로 받는다(받은 뒤 `git -C <체크아웃> rev-parse FETCH_HEAD`가 요청서 headSha와 같은지 확인).
 
 1. 첫 head 디스패치 전, 레인 역할마다:
    ```bash

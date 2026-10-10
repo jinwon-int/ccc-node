@@ -351,7 +351,7 @@
       "name": "nclex-a2a-content-pipeline",
       "source": "skills/nclex-a2a-content-pipeline",
       "status": "active",
-      "tree_sha256": "4c9957434589df034779db42545867be81000403a706026f672894d1dd785154"
+      "tree_sha256": "c39927f3ad0fb8fb6157b576f0ec2d3f755dea82eac42f969fbc502c1ca7e202"
     },
     {
       "audience": "claude",
