@@ -441,3 +441,125 @@ async def test_relay_mode_drains_without_a_transport(tmp_path: Path) -> None:
 def test_pending_count_is_zero_for_a_missing_spool(tmp_path: Path) -> None:
     n = MatrixSpoolNotifier(_settings(tmp_path), None)
     assert n.pending_count() == 0
+
+
+# --- #2227: listed events stay in the owner room even in relay mode ------------
+
+def _direct_settings(tmp_path: Path, events: str = "mail,schedule-brief", **over):
+    return _relay_settings(tmp_path, _secret(tmp_path), push_fleet_relay_direct_events=events, **over)
+
+
+def test_direct_events_parse_and_only_apply_in_relay_mode(tmp_path: Path) -> None:
+    n = MatrixSpoolNotifier(_direct_settings(tmp_path, " mail , ,schedule-brief "), None)
+    assert n.direct_events == frozenset({"mail", "schedule-brief"})
+    assert n._is_direct({"event": "mail"}) and not n._is_direct({"event": "SelfUpdate"})
+    assert not n._is_direct({"text": "no event"})
+    room_mode = MatrixSpoolNotifier(_settings(tmp_path, push_fleet_relay_direct_events="mail"), None)
+    assert not room_mode._is_direct({"event": "mail"}), "outside relay mode every record is a room record"
+    assert MatrixSpoolNotifier(_relay_settings(tmp_path, _secret(tmp_path)), None).direct_events == frozenset()
+
+
+@pytest.mark.anyio
+async def test_relay_mode_sends_listed_events_to_the_owner_room_and_the_rest_to_the_relay(tmp_path: Path) -> None:
+    t, enqueued = _transport({DIRECT: "direct"})
+    notifier = MatrixSpoolNotifier(_direct_settings(tmp_path), t)
+    relay = _FakeRelay()
+    notifier._relay = relay
+    mail = {"event": "mail", "node": "node-a", "text": "중요메일 2건", "dedup": "mail-important:1"}
+    ops = {"event": "SelfUpdate", "node": "node-a", "text": "업데이트 완료", "dedup": "SelfUpdate:1"}
+    _record(tmp_path, "mail-important-1.json", mail)
+    _record(tmp_path, "SelfUpdate-1.json", ops)
+    sent = tmp_path / "spool" / "sent"
+    sent.mkdir(parents=True, exist_ok=True)
+    await notifier._drain("", sent)
+    assert enqueued == [(DIRECT, PushNotifier._format(mail))]
+    assert [p["text"] for p in relay.posted] == [PushNotifier._format(ops)]
+    assert not list((tmp_path / "spool").glob("*.json"))
+    assert (sent / "mail-important-1.json").exists() and (sent / "SelfUpdate-1.json").exists()
+
+
+@pytest.mark.anyio
+async def test_direct_record_waits_for_the_transport_without_blocking_relay_records(tmp_path: Path) -> None:
+    """Early start (#2207): no session yet. The personal notice stays queued in
+    order; the outage alert behind it still reaches the relay."""
+    notifier = MatrixSpoolNotifier(_direct_settings(tmp_path), None)
+    relay = _FakeRelay()
+    notifier._relay = relay
+    _record(tmp_path, "a-mail.json", {"event": "mail", "text": "메일 1", "dedup": "m1"})
+    _record(tmp_path, "b-mail.json", {"event": "mail", "text": "메일 2", "dedup": "m2"})
+    _record(tmp_path, "c-alert.json", {"event": "health-alert", "text": "Telegram polling failed", "dedup": "h1"})
+    sent = tmp_path / "spool" / "sent"
+    sent.mkdir(parents=True, exist_ok=True)
+    await notifier._drain("", sent)
+    assert [p["text"] for p in relay.posted] == [PushNotifier._format({"event": "health-alert", "text": "Telegram polling failed"})]
+    assert sorted(p.name for p in (tmp_path / "spool").glob("*.json")) == ["a-mail.json", "b-mail.json"]
+    assert notifier.pending_count() == 2 and notifier.pending_count(relay_only=True) == 0
+    t, enqueued = _transport({DIRECT: "direct"})
+    notifier.attach_transport(t)
+    await notifier._drain("", sent)
+    assert [text for _room, text in enqueued] == [
+        PushNotifier._format({"event": "mail", "text": "메일 1"}),
+        PushNotifier._format({"event": "mail", "text": "메일 2"}),
+    ]
+    assert notifier.pending_count() == 0 and len(relay.posted) == 1
+
+
+@pytest.mark.anyio
+async def test_direct_record_transient_room_failure_keeps_it_and_relay_keeps_flowing(tmp_path: Path) -> None:
+    class _Flaky:
+        policy = SimpleNamespace(rooms={DIRECT: "direct"})
+
+        def __init__(self) -> None:
+            self.fail = True
+            self.sent: list[tuple[str, str]] = []
+
+        def enqueue_notice(self, room: str, text: str) -> None:
+            if self.fail:
+                raise RuntimeError("outbox busy")
+            self.sent.append((room, text))
+
+    t = _Flaky()
+    notifier = MatrixSpoolNotifier(_direct_settings(tmp_path), t)
+    relay = _FakeRelay()
+    notifier._relay = relay
+    _record(tmp_path, "a-mail.json", {"event": "mail", "text": "메일", "dedup": "m"})
+    _record(tmp_path, "b-ops.json", {"event": "SelfUpdate", "text": "업데이트", "dedup": "s"})
+    sent = tmp_path / "spool" / "sent"
+    sent.mkdir(parents=True, exist_ok=True)
+    await notifier._drain("", sent)
+    assert (tmp_path / "spool" / "a-mail.json").exists() and len(relay.posted) == 1
+    t.fail = False
+    await notifier._drain("", sent)
+    assert t.sent == [(DIRECT, PushNotifier._format({"event": "mail", "text": "메일"}))]
+    assert not list((tmp_path / "spool").glob("*.json"))
+
+
+@pytest.mark.anyio
+async def test_direct_record_without_an_owner_room_falls_back_to_the_relay(tmp_path: Path) -> None:
+    t, enqueued = _transport({})
+    notifier = MatrixSpoolNotifier(_direct_settings(tmp_path), t)
+    relay = _FakeRelay()
+    notifier._relay = relay
+    _record(tmp_path, "a-mail.json", {"event": "mail", "text": "메일", "dedup": "m"})
+    sent = tmp_path / "spool" / "sent"
+    sent.mkdir(parents=True, exist_ok=True)
+    await notifier._drain("", sent)
+    assert enqueued == [] and len(relay.posted) == 1, "never dropped: no owner room → fleet room"
+    assert (sent / "a-mail.json").exists()
+
+
+@pytest.mark.anyio
+async def test_direct_events_share_dedup_and_rate_limit(tmp_path: Path) -> None:
+    t, enqueued = _transport({DIRECT: "direct"})
+    notifier = MatrixSpoolNotifier(_direct_settings(tmp_path, push_max_per_minute=1), t)
+    relay = _FakeRelay()
+    notifier._relay = relay
+    _record(tmp_path, "a-mail.json", {"event": "mail", "text": "메일", "dedup": "same"})
+    _record(tmp_path, "b-mail.json", {"event": "mail", "text": "메일", "dedup": "same"})
+    _record(tmp_path, "c-ops.json", {"event": "SelfUpdate", "text": "업데이트", "dedup": "s"})
+    sent = tmp_path / "spool" / "sent"
+    sent.mkdir(parents=True, exist_ok=True)
+    await notifier._drain("", sent)
+    assert len(enqueued) == 1, "duplicate dedup key archived without a second send"
+    assert (sent / "b-mail.json").exists()
+    assert relay.posted == [] and (tmp_path / "spool" / "c-ops.json").exists(), "1/min budget shared"

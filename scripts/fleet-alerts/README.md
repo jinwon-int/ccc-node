@@ -84,6 +84,10 @@ The file is re-read when it changes (no restart).
    restart), confirm one alert arrives in the room as the bot and nothing in
    the agent room, then repeat per node.
 
+Owner-personal notices (important mail, schedule brief) can stay in the
+node's own agent room: set `CCC_PUSH_FLEET_RELAY_DIRECT_EVENTS` to their
+record `event` values on that node (#2227, see `docs/matrix-frontend.md`).
+
 Rollback per node = unset `CCC_PUSH_FLEET_RELAY_URL` and restart the matrix
 unit (records go back to the owner room as before). The queue and the
 bot's encryption state are never deleted or auto-reinitialised.
