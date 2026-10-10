@@ -1302,5 +1302,66 @@ bh_left="$(find "$cc_home" -name '*backend-health.json.*' ! -name 'backend-healt
 ok "#1478 8 concurrent health appends all land (flock RMW)" '[ "$bh_n" = 8 ]'
 ok "#1478 health file replaced atomically: no temp leftovers" '[ "$bh_left" = 0 ]'
 
+# --- #2222 constraints-triage: fold cross-session near-duplicates, retire
+# phase-scoped rules; dry-run by default, reversible, never DELETE.
+TRI_DB="$TMP/triage.db"
+NUNCHI_DB="$TRI_DB" python3 "$NP" init >/dev/null 2>&1
+python3 - "$TRI_DB" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+old, new = "2026-08-10T00:00:00+00:00", "2099-01-01T00:00:00+00:00"
+rows = [
+    # 1-3: one rule re-extracted by three sessions (particle drift); 3 is rank 3 -> survivor
+    (1, "session:a", "H2 구현 시 create()는 무인자 — H1 코드 복사 금지", old, 1),
+    (2, "session:b", "H2 구현 시 create()은 무인자, H1 코드를 복사 금지", old, 2),
+    (3, "session:c", "H2 구현 시 create()는 무인자이며 H1 코드 복사 금지", old, 3),
+    # 4-5: same template, different PRs -> #1890 guard keeps them apart
+    (4, "session:d", "PR #1941 머지는 교차계정 신선 승인 필수", new, 2),
+    (5, "session:e", "PR #1942 머지는 교차계정 신선 승인 필수", new, 2),
+    # 6: phase-scoped (§), old, rank 1 -> retire candidate
+    (6, "session:f", "§2.5 타깃은 level-trigger 구조여야 함", old, 1),
+    # 7: phase-scoped but user-stated -> kept unless --include-user-stated
+    (7, "owner-peer", "#1504 W11 검토자는 W1~W10 미참여자만", old, 3),
+    # 8: anchored but young -> kept
+    (8, "session:g", "#2222 적용은 노드 1대 먼저", new, 1),
+    # 9: durable, no anchor -> kept
+    (9, "node-a", "토큰 값은 위키에 기록 금지 — 위치만 기록", old, 2),
+]
+for fid, obs, fact, at, rank in rows:
+    c.execute("INSERT INTO peer_facts(id,observer,observed,kind,fact,evidence,valid_from,dedup,created_at,"
+              "source_rank,mutability) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+              (fid, "family-assistant", obs, "constraint", fact, f"distill:{obs}", at, f"d{fid}", at, rank, "static"))
+c.commit()
+PY
+tri_open() { python3 -c "import sqlite3;print(sqlite3.connect('$TRI_DB').execute(\"SELECT GROUP_CONCAT(id) FROM (SELECT id FROM peer_facts WHERE valid_to IS NULL AND kind='constraint' ORDER BY id)\").fetchone()[0])"; }
+out="$(NUNCHI_DB="$TRI_DB" python3 "$NP" constraints-triage 2>&1)"; rc=$?
+ok "#2222 triage dry-run reports fold/retire counts" '[ "$rc" = 0 ] && grep -q "open=9 clusters=1 fold=2 retire=1 open_after=6" <<<"$out"'
+ok "#2222 dry-run changes nothing" '[ "$(tri_open)" = "1,2,3,4,5,6,7,8,9" ]'
+ok "#2222 rank-3 row survives its cluster (G2)" 'grep -q "fold #1 -> #3" <<<"$out" && grep -q "fold #2 -> #3" <<<"$out"'
+ok "#2222 different PR numbers never fold (#1890 guard)" '! grep -qE "fold #(4|5) " <<<"$out"'
+ok "#2222 user-stated phase rule kept by default" '! grep -q "retire #7 " <<<"$out" && grep -q "retire #6 rank=1 \[§2.5\]" <<<"$out"'
+ok "#2222 young anchored rule not retired" '! grep -q "retire #8 " <<<"$out"'
+out="$(NUNCHI_DB="$TRI_DB" python3 "$NP" constraints-triage --include-user-stated --json 2>&1)"
+ok "#2222 --include-user-stated adds the rank-3 phase rule" 'grep -q "\"retire\": 2" <<<"$out" && grep -q "\"3\": 1" <<<"$out"'
+out="$(NUNCHI_DB="$TRI_DB" python3 "$NP" constraints-triage --threshold 2 2>&1)"; rc=$?
+ok "#2222 out-of-range threshold rejected" '[ "$rc" != 0 ] && grep -q "threshold" <<<"$out"'
+# shellcheck disable=SC2034  # before_rows is read via eval inside ok()
+before_rows="$(python3 -c "import sqlite3;print(sqlite3.connect('$TRI_DB').execute('SELECT COUNT(*) FROM peer_facts').fetchone()[0])")"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(NUNCHI_DB="$TRI_DB" python3 "$NP" constraints-triage --apply 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "#2222 apply closes folded + retired rows" '[ "$rc" = 0 ] && [ "$(tri_open)" = "3,4,5,7,8,9" ] && grep -q "open constraints now 6" <<<"$out"'
+# shellcheck disable=SC2034  # after_rows is read via eval inside ok()
+after_rows="$(python3 -c "import sqlite3;print(sqlite3.connect('$TRI_DB').execute('SELECT COUNT(*) FROM peer_facts').fetchone()[0])")"
+ok "#2222 apply never deletes rows" '[ "$before_rows" = "$after_rows" ]'
+# shellcheck disable=SC2034  # lineage is read via eval inside ok()
+lineage="$(python3 -c "import sqlite3;c=sqlite3.connect('$TRI_DB');print(c.execute('SELECT evidence FROM peer_facts WHERE id=3').fetchone()[0], '|', c.execute('SELECT evidence FROM peer_facts WHERE id=1').fetchone()[0], '|', c.execute('SELECT because FROM peer_facts WHERE id=6').fetchone()[0])")"
+ok "#2222 lineage: merge markers on both sides, retire reason in because" \
+  'grep -q "merged:#1" <<<"$lineage" && grep -q "merged:#2" <<<"$lineage" && grep -q "merged-away:#3" <<<"$lineage" && grep -q "phase-scoped: §2.5" <<<"$lineage"'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(NUNCHI_DB="$TRI_DB" python3 "$NP" constraints-triage --apply 2>&1)"
+ok "#2222 second apply is a no-op" 'grep -q "fold=0 retire=0 open_after=6" <<<"$out" && [ "$(tri_open)" = "3,4,5,7,8,9" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
