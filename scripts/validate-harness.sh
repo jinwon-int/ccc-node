@@ -516,6 +516,12 @@ else
   err "doctor agent-cron stale prompt-task success verdict tests failed"
   tail -10 "$TMP/doctor-agent-cron-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_push_spool_test.py >"$TMP/doctor-push-spool-test.out" 2>&1; then
+  say "  ok doctor push spool dwell verdict tests (#2223)"
+else
+  err "doctor push spool dwell verdict tests failed (an orphaned notification spool may go unseen)"
+  tail -10 "$TMP/doctor-push-spool-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_cli_floor_test.py >"$TMP/doctor-cli-floor-test.out" 2>&1; then
   say "  ok doctor worker Claude CLI floor verdict tests (a2a-nexus#2275)"
 else

@@ -169,6 +169,35 @@ alert is a one-shot event. After #1061 documented the worktree discipline the
 same stall still recurred on two nodes (#1328), because nothing surfaced a node
 that had quietly stopped updating days earlier.
 
+## Push spool dwell
+
+One `push spool dwell` row (#2223). Push consumers — the Telegram
+`PushNotifier` and the Matrix `MatrixSpoolNotifier` — poll their spool every
+few seconds, so a `*.json` record still pending after the threshold means no
+running process drains that directory. Writers cannot see this (`delivery:
+spooled` is their success), and the bridge health probe only counts the
+directory its own process consumes.
+
+Directories checked, deduplicated by resolved path (a symlinked orphan counts once):
+
+- the writers' default `$CCC_STATE_DIR/telegram-spool` (or this process's `CCC_PUSH_SPOOL`), marked `writer-default`;
+- every `*-spool` dir in the doctor's state dir and in other accounts' state dirs it can read (`/root/.claude/state`, `/home/*/.claude/state`) — writer lanes of a different account, e.g. a root crontab next to a user-lane bridge;
+- `CCC_PUSH_CONSUME_SPOOL` / `CCC_PUSH_MIRROR_DIRS` from this process, and each spool's subdirs except `sent/` (fan-out mirrors).
+
+| State | Class |
+|---|---|
+| no spool dir | `정상` (해당 없음) |
+| no record older than the threshold | `정상` |
+| records older than the threshold | `경고` — lists up to five dirs, oldest first, with count and age |
+
+Only file names and modification times are read; record bodies and other
+processes' environments are not. `CCC_DOCTOR_PUSH_SPOOL_DWELL_MINUTES` sets the
+threshold (default 30, `0` disables the row); `CCC_DOCTOR_PUSH_STATE_ROOTS`
+(`os.pathsep`-separated, globs allowed) replaces the extra state dirs.
+The usual remedy is to point the remaining consumer at the writers' directory, or
+to symlink the orphan directory to the consumed one, and to move the stale records into `sent/`
+rather than delivering day-old notices.
+
 ## Fleet matrix
 
 `ccc-doctor-fleet-matrix.sh` summarizes already-collected doctor output; it does not SSH or mutate nodes.
