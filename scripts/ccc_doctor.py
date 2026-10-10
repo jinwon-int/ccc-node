@@ -2876,7 +2876,12 @@ class Doctor:
             age_h = (now - oldest) / 3600
             age = f"{age_h:.0f}h" if age_h >= 1 else f"{(now - oldest) / 60:.0f}m"
             default = " writer-default" if spool == writer_default else ""
-            return f"{_printable(str(spool), 80)}(n={count},oldest={age}{default})"
+            # Keep the tail: the spool's own name is what tells dirs apart, so a
+            # long prefix (deep home, CI temp dir) is what gets elided.
+            shown = _printable(str(spool), 1 << 16)
+            if len(shown) > 80:
+                shown = "..." + shown[-77:]
+            return f"{shown}(n={count},oldest={age}{default})"
 
         shown = ", ".join(label(*row) for row in stale[:5])
         more = f" (+{len(stale) - 5} more)" if len(stale) > 5 else ""

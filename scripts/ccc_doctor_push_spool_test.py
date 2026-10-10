@@ -134,8 +134,17 @@ class PushSpoolDwellCheck(unittest.TestCase):
             self.run_check({"CCC_DOCTOR_PUSH_STATE_ROOTS": str(self.base / "*" / ".claude" / "state")})
         )
         self.assertEqual(row.klass, "경고", row.status)
-        self.assertIn(str(other / "telegram-spool"), row.status)
+        self.assertIn("other-home/.claude/state/telegram-spool(n=1", row.status)
         self.assertNotIn("writer-default", row.status)
+
+    def test_long_path_keeps_the_spool_name(self) -> None:
+        """A deep prefix is elided, never the dir name that tells spools apart."""
+        deep = self.base / ("d" * 60) / ("e" * 60) / "orphan-spool"
+        record(deep, "a.json", 90)
+        row = self.row(self.run_check({"CCC_PUSH_SPOOL": str(deep)}))
+        self.assertEqual(row.klass, "경고", row.status)
+        self.assertIn("...", row.status)
+        self.assertIn("/orphan-spool(n=1,oldest=2h writer-default)", row.status)
 
     def test_symlinked_orphan_counts_once(self) -> None:
         """After the remedy (orphan dir -> consumed dir) a record is reported once."""
