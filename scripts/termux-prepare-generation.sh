@@ -101,6 +101,18 @@ PYEOF
 
 gen_head() { git -C "$1/source" rev-parse HEAD 2>/dev/null || printf ''; }
 
+prepare_path() { # PATH for termux_prepare.py: no venv bin, no generation runtime bin
+  if [ -n "${CCC_TERMUX_PREPARE_PATH:-}" ]; then printf '%s' "$CCC_TERMUX_PREPARE_PATH"; return; fi
+  local out="" p
+  local IFS=:
+  for p in $PATH; do
+    [ -n "${VIRTUAL_ENV:-}" ] && [ "$p" = "$VIRTUAL_ENV/bin" ] && continue
+    case "$p" in "$PREP"/*) continue ;; esac
+    out="${out:+$out:}$p"
+  done
+  printf '%s' "$out"
+}
+
 matrix_frontend_configured() {
   case "${CCC_TERMUX_MATRIX_FRONTEND:-}" in 1) return 0 ;; 0) return 1 ;; esac
   [ -d "$H/.ccc-matrix" ] || [ -e "${PREFIX:-/usr}/var/service/ccc-matrix-bridge" ]
@@ -209,7 +221,12 @@ git -C "$REPO" worktree add --detach "$GEN/source" "$TARGET" >>"$GEN/prepare.log
   || die 3 "git worktree add failed (see $GEN/prepare.log)"
 install -m 600 "$SERVING/source/bridge/.env" "$GEN/source/bridge/.env" || die 3 "could not inherit bridge/.env"
 started=$SECONDS
-if ! "$PY" -B "$GEN/source/bridge/termux_prepare.py" --work-dir "$GEN/job" --verify-reinstall \
+# The tool must see the BASE interpreter's environment: a shell spawned by a
+# running bridge carries VIRTUAL_ENV / a generation runtime first in PATH, and
+# with those the backend probe failed (2026-10-08). Drop the venv variables and
+# any venv/generation bin entries from PATH (CCC_TERMUX_PREPARE_PATH overrides).
+if ! env -u VIRTUAL_ENV -u PYTHONPATH -u PYTHONHOME -u ANDROID_API_LEVEL PATH="$(prepare_path)" \
+     "$PY" -B "$GEN/source/bridge/termux_prepare.py" --work-dir "$GEN/job" --verify-reinstall \
      --timeout-seconds "$TIMEOUT_S" --jobs "$JOBS" "${REUSE[@]}" "${EXTRA[@]}" >>"$GEN/prepare.log" 2>&1; then
   die 3 "termux_prepare.py failed after $((SECONDS - started))s (log: $GEN/prepare.log); pointer unchanged"
 fi

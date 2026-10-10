@@ -5,9 +5,19 @@
 # own restart controller) and the runit Matrix frontend (ccc-matrix-bridge,
 # launched by run-matrix through the same pointer).
 #
-#   1. Restart Telegram through bridge-current.sh --restart -d (verified by the
-#      bridge's own controller; its exit status is this script's unless the
-#      Matrix step below fails).
+#   1. Restart Telegram through the pointer launcher — the node's
+#      ~/.ccc-node/scripts/bridge-current.sh when present, else the repo's
+#      scripts/termux-bridge-current.sh (CCC_TERMUX_LAUNCHER overrides) —
+#      with --restart -d (verified by the bridge's own controller; its exit
+#      status is this script's unless the Matrix step below fails). When the
+#      LIVE Telegram process (~/.telegram_bot/health.json runtime_generation)
+#      serves a different generation than the pointer, that generation is
+#      armed as start.sh's one-shot recovery (--recovery-source/--recovery-
+#      runtime). If start.sh then exits 7 (candidate failed, previous
+#      generation verified restored) the pointer is moved BACK to the restored
+#      generation and the failed target is recorded in
+#      ~/.ccc-node/bridge-current.rolledback-<ts>, so pointer, serving process
+#      and the Matrix step below agree (CCC_TERMUX_RECOVERY=0 disables).
 #   2. Make the Matrix frontend follow bridge-current: restart it only when the
 #      generation it is RUNNING differs from the pointer, idle-gated on
 #      ~/.ccc-matrix/health.json workload.active_requests. If it stays busy
@@ -34,7 +44,9 @@
 #        termux-restart-frontends.sh --verify [survive_seconds]   (read-only:
 #            judge the CURRENT Matrix process with the same rule; no restart)
 #        termux-restart-frontends.sh --dry-run                    (read-only)
-# Env:   CCC_TERMUX_CCC_NODE_DIR (~/.ccc-node), CCC_TERMUX_MATRIX_DIR
+# Env:   CCC_TERMUX_CCC_NODE_DIR (~/.ccc-node), CCC_TERMUX_LAUNCHER (see 1.),
+#        CCC_TERMUX_TELEGRAM_HEALTH (~/.telegram_bot/health.json),
+#        CCC_TERMUX_RECOVERY (1), CCC_TERMUX_MATRIX_DIR
 #        (~/.ccc-matrix), CCC_TERMUX_MATRIX_SERVICE (ccc-matrix-bridge), SVDIR
 #        ($PREFIX/var/service), CCC_TERMUX_RESTART_LOG
 #        (~/.claude/state/restart-frontends.log), CCC_MATRIX_SURVIVE_SECONDS
@@ -57,6 +69,7 @@ HEALTH="$MDIR/health.json"
 SVC="${CCC_TERMUX_MATRIX_SERVICE:-ccc-matrix-bridge}"
 SVDIR_="${SVDIR:-${PREFIX:-/usr}/var/service}"
 LOG="${CCC_TERMUX_RESTART_LOG:-$H/.claude/state/restart-frontends.log}"
+TG_HEALTH="${CCC_TERMUX_TELEGRAM_HEALTH:-$H/.telegram_bot/health.json}"
 SURVIVE="${CCC_MATRIX_SURVIVE_SECONDS:-60}"
 START_WAIT="${CCC_MATRIX_START_SECONDS:-90}"
 POLL="${CCC_MATRIX_POLL_SECONDS:-5}"
@@ -163,6 +176,65 @@ survives() {
   return 0
 }
 
+launcher() { # the pointer launcher this node uses for the Telegram frontend
+  if [ -n "${CCC_TERMUX_LAUNCHER:-}" ]; then printf '%s' "$CCC_TERMUX_LAUNCHER"; return; fi
+  if [ -f "$CN/scripts/bridge-current.sh" ]; then printf '%s' "$CN/scripts/bridge-current.sh"; return; fi
+  printf '%s' "$(cd "$(dirname "$0")" && pwd)/termux-bridge-current.sh"
+}
+
+# Telegram health.json → "pid source_dir runtime_dir" of the LIVE process
+# ("-" for anything unknown). source_dir is the generation's source/bridge,
+# runtime_dir its job dir (parent of python_prefix = <job>/runtime).
+telegram_fields() {
+  python3 - "$TG_HEALTH" <<'PY' 2>/dev/null || printf -- '- - -\n'
+import json, os, sys
+pid = src = job = "-"
+try:
+    h = json.load(open(sys.argv[1], encoding="utf-8"))
+    p = h.get("process") or {}
+    if type(p.get("pid")) is int and p["pid"] > 1:
+        pid = str(p["pid"])
+    rg = h.get("runtime_generation") or {}
+    s = rg.get("source_dir"); pre = rg.get("python_prefix")
+    if isinstance(s, str) and s.startswith("/") and " " not in s:
+        src = s
+    if isinstance(pre, str) and pre.startswith("/") and " " not in pre:
+        job = os.path.dirname(pre.rstrip("/"))
+except Exception:
+    pass
+print(pid, src, job)
+PY
+}
+
+# arm_recovery → sets RECOVERY_GEN + RECOVERY_ARGS when the live Telegram
+# process serves another (retained) generation than the pointer: that is the
+# generation start.sh may fall back to once if the candidate fails.
+RECOVERY_GEN=""; RECOVERY_ARGS=()
+arm_recovery() {
+  [ "${CCC_TERMUX_RECOVERY:-1}" = 1 ] || return 0
+  local pid src job gen cur
+  read -r pid src job < <(telegram_fields)
+  alive "$pid" || return 0
+  [ "$src" != "-" ] && [ "$job" != "-" ] || return 0
+  gen="$(readlink -f "$src/../..")"; cur="$(readlink -f "$POINTER" 2>/dev/null)"
+  [ -n "$gen" ] && [ -n "$cur" ] && [ "$gen" != "$cur" ] || return 0
+  [ -f "$src/start.sh" ] && [ -x "$job/runtime/bin/python" ] || { log "recovery not armed: live generation $gen lacks start.sh or runtime"; return 0; }
+  RECOVERY_GEN="$gen"; RECOVERY_ARGS=(--recovery-source "$src" --recovery-runtime "$job")
+  log "recovery armed: candidate=$(basename "$cur") previous=$(basename "$gen")"
+}
+
+rollback_pointer() { # after start.sh exit 7: the previous generation is serving again
+  local failed target ts
+  failed="$(readlink "$POINTER" 2>/dev/null)"; ts="$(date +%Y%m%dT%H%M%S)"
+  case "$RECOVERY_GEN" in "$CN"/*) target="${RECOVERY_GEN#"$CN"/}" ;; *) target="$RECOVERY_GEN" ;; esac
+  printf '%s\n' "$failed" > "$CN/bridge-current.rolledback-$ts" 2>/dev/null || :
+  if ln -sfn "$target" "$POINTER" && [ "$(readlink -f "$POINTER")" = "$RECOVERY_GEN" ]; then
+    log "telegram candidate failed, previous generation restored by start.sh (rc=7): pointer rolled back $failed -> $target (failed target in bridge-current.rolledback-$ts)"
+  else
+    log "telegram candidate failed (rc=7) but the pointer could NOT be rolled back to $target — pointer=$(readlink "$POINTER" 2>/dev/null), operator decision"
+  fi
+}
+
 matrix_follow() { # <until_epoch> → 0 ok · 2 busy until deadline · 3 unhealthy
   local w h restart_epoch rc; w="$(want)"; h="$(have)"
   if [ "$h" = "$w" ]; then log "matrix up to date ($h)"; return 0; fi
@@ -195,8 +267,10 @@ case "${1:-}" in
   *) echo "termux-restart-frontends: unknown argument $1" >&2; exit 2 ;;
 esac
 
-bash "$CN/scripts/bridge-current.sh" --path "$H" --restart -d; rc=$?
-log "telegram restart rc=$rc"
+arm_recovery
+bash "$(launcher)" --path "$H" --restart -d ${RECOVERY_ARGS[@]+"${RECOVERY_ARGS[@]}"}; rc=$?
+log "telegram restart rc=$rc${RECOVERY_GEN:+ (recovery armed to $(basename "$RECOVERY_GEN"))}"
+[ "$rc" = 7 ] && [ -n "$RECOVERY_GEN" ] && rollback_pointer
 deadline_m=$(( ${CCC_BRIDGE_RESTART_DEADLINE_EPOCH:-$(( $(now) + 300 ))} - 30 ))
 matrix_follow "$deadline_m"; m=$?
 if [ "$m" = 2 ]; then
