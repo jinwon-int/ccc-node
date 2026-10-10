@@ -1345,14 +1345,21 @@ out="$(NUNCHI_DB="$TRI_DB" python3 "$NP" constraints-triage --include-user-state
 ok "#2222 --include-user-stated adds the rank-3 phase rule" 'grep -q "\"retire\": 2" <<<"$out" && grep -q "\"3\": 1" <<<"$out"'
 out="$(NUNCHI_DB="$TRI_DB" python3 "$NP" constraints-triage --threshold 2 2>&1)"; rc=$?
 ok "#2222 out-of-range threshold rejected" '[ "$rc" != 0 ] && grep -q "threshold" <<<"$out"'
+# shellcheck disable=SC2034  # before_rows is read via eval inside ok()
 before_rows="$(python3 -c "import sqlite3;print(sqlite3.connect('$TRI_DB').execute('SELECT COUNT(*) FROM peer_facts').fetchone()[0])")"
-out="$(NUNCHI_DB="$TRI_DB" python3 "$NP" constraints-triage --apply 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(NUNCHI_DB="$TRI_DB" python3 "$NP" constraints-triage --apply 2>&1)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "#2222 apply closes folded + retired rows" '[ "$rc" = 0 ] && [ "$(tri_open)" = "3,4,5,7,8,9" ] && grep -q "open constraints now 6" <<<"$out"'
+# shellcheck disable=SC2034  # after_rows is read via eval inside ok()
 after_rows="$(python3 -c "import sqlite3;print(sqlite3.connect('$TRI_DB').execute('SELECT COUNT(*) FROM peer_facts').fetchone()[0])")"
 ok "#2222 apply never deletes rows" '[ "$before_rows" = "$after_rows" ]'
+# shellcheck disable=SC2034  # lineage is read via eval inside ok()
 lineage="$(python3 -c "import sqlite3;c=sqlite3.connect('$TRI_DB');print(c.execute('SELECT evidence FROM peer_facts WHERE id=3').fetchone()[0], '|', c.execute('SELECT evidence FROM peer_facts WHERE id=1').fetchone()[0], '|', c.execute('SELECT because FROM peer_facts WHERE id=6').fetchone()[0])")"
 ok "#2222 lineage: merge markers on both sides, retire reason in because" \
   'grep -q "merged:#1" <<<"$lineage" && grep -q "merged:#2" <<<"$lineage" && grep -q "merged-away:#3" <<<"$lineage" && grep -q "phase-scoped: §2.5" <<<"$lineage"'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(NUNCHI_DB="$TRI_DB" python3 "$NP" constraints-triage --apply 2>&1)"
 ok "#2222 second apply is a no-op" 'grep -q "fold=0 retire=0 open_after=6" <<<"$out" && [ "$(tri_open)" = "3,4,5,7,8,9" ]'
 
