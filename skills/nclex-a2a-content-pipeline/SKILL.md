@@ -130,7 +130,7 @@ T2 레인은 **역할마다 lineage 1개**에 묶는다(PR×역할). lineage는 
    왜곡된다 — 그 레인은 `reviewLineageRecord` 없이 보낸다. 핸들러 크래시처럼 보고가
    없었던 재시도는 같은 record로 bind해도 된다.
 5. 확인: 워커 로그 `"event":"review_lineage_report"`(outcome `reported` 정상,
-   `skipped|rejected|failed`는 jingun 일일 재측정이 알림) · `GET /review-lineages/<lineageId>`.
+   `skipped|rejected|failed`는 운영 노드의 일일 lineage 재측정이 알림) · `GET /review-lineages/<lineageId>`.
    lineage는 관측(record mode) 전용이라 `a2a/receipts`·머지 판정에 영향이 없다.
 
 ## 5. receipt 게시와 마감
