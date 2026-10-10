@@ -101,6 +101,38 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
    `a2a-hermes-worker` 저널 확인(취소 태스크 zombie heartbeat면 서비스 재시작 —
    fleet-service 자율 범위).
 
+### 4-1. review lineage 부착 (T2, a2a-nexus #2362 · #2274 scorecard)
+
+T2 레인은 **역할마다 lineage 1개**에 묶는다(PR×역할). lineage는 리뷰어 1명의
+흐름이라 같은 head의 역할 레인끼리 공유하면 첫 보고만 반영되고 나머지는
+`report_out_of_state`로 거부된다. 도구는 a2a-nexus main의
+`scripts/lib/nclex-lineage-spec.mjs`(#2363)와 `scripts/lib/review-lineage-client.mjs`.
+**브로커 호스트에서 실행**(edge secret은 `A2A_EDGE_SECRET` env로만, 0절 규칙 동일)하고,
+그 호스트의 nclex 체크아웃에 base·head 커밋을 fetch해 `--repo`로 준다.
+
+1. 첫 head 디스패치 전, 레인 역할마다:
+   ```bash
+   node scripts/lib/nclex-lineage-spec.mjs --pr <n> --role <content_clinical|evidence_adversarial|high_risk_safety> \
+     --base <요청서 baseSha> --head <요청서 headSha> --body-file <PR 본문> --repo <nclex 체크아웃> \
+     --broker-url <T2 broker> --requester-id <manifest requester.id> --out spec-pr<n>-<role>.json
+   A2A_EDGE_SECRET=... node scripts/lib/review-lineage-client.mjs create --spec spec-pr<n>-<role>.json \
+     --out lineage-pr<n>-<role>.json --dry-run   # 확인 후 --dry-run 제거(HTTP 201 applied)
+   ```
+   lineageId는 `nclex-pr<n>-<role>`로 결정적이다 — 이미 있으면 새로 만들지 않고 기존 record를 쓴다.
+2. manifest의 해당 역할 레인에 `"reviewLineageRecord": "lineage-pr<n>-<role>.json"`을
+   적는다(상대 경로는 manifest 디렉터리 기준, 레인 1개 = record 1개). `a2a-dispatch-round.mjs --dry-run`이 binding 오류를
+   provider 호출 전에 막는다.
+3. 저자 수정으로 **새 head**가 오면 lineage를 새로 만들지 않는다:
+   `review-lineage-client.mjs correct --record lineage-pr<n>-<role>.json --generation-ref <수정 ref>
+   --head <new head> --repo <nclex 체크아웃>` 후 재리뷰 레인에 같은 record를 적는다.
+4. **bind 금지**: 같은 (PR, head, 역할)에서 review-report가 이미 나간 뒤의 재실행
+   (결과 보존 재실행 등). 다시 bind하면 reviewer run이 부풀어 #2274 예산 데이터가
+   왜곡된다 — 그 레인은 `reviewLineageRecord` 없이 보낸다. 핸들러 크래시처럼 보고가
+   없었던 재시도는 같은 record로 bind해도 된다.
+5. 확인: 워커 로그 `"event":"review_lineage_report"`(outcome `reported` 정상,
+   `skipped|rejected|failed`는 운영 노드의 일일 lineage 재측정이 알림) · `GET /review-lineages/<lineageId>`.
+   lineage는 관측(record mode) 전용이라 `a2a/receipts`·머지 판정에 영향이 없다.
+
 ## 5. receipt 게시와 마감
 
 1. 각 PASS 태스크의 전체 JSON에서 receipt 구성:
