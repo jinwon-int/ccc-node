@@ -465,8 +465,8 @@ async def test_relay_mode_sends_listed_events_to_the_owner_room_and_the_rest_to_
     notifier = MatrixSpoolNotifier(_direct_settings(tmp_path), t)
     relay = _FakeRelay()
     notifier._relay = relay
-    mail = {"event": "mail", "node": "daegyo", "text": "중요메일 2건", "dedup": "mail-important:1"}
-    ops = {"event": "SelfUpdate", "node": "daegyo", "text": "업데이트 완료", "dedup": "SelfUpdate:1"}
+    mail = {"event": "mail", "node": "node-a", "text": "중요메일 2건", "dedup": "mail-important:1"}
+    ops = {"event": "SelfUpdate", "node": "node-a", "text": "업데이트 완료", "dedup": "SelfUpdate:1"}
     _record(tmp_path, "mail-important-1.json", mail)
     _record(tmp_path, "SelfUpdate-1.json", ops)
     sent = tmp_path / "spool" / "sent"
