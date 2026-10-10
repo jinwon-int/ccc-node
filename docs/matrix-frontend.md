@@ -74,6 +74,18 @@ override on each unit (`Environment=CCC_PUSH_ENABLED=true` on the matrix
 unit, `=false` on the telegram unit) so exactly one process consumes the
 spool; real environment beats the shared `.env`.
 
+**When you turn one frontend's push off, the remaining consumer must drain
+the writers' directory.** Cron and hook writers (self-update, skill
+autosave, PR status poll, agent-cron, security audit, `notify.sh`) use
+`${CCC_PUSH_SPOOL:-<state>/telegram-spool}` from *their own* environment,
+which normally does not carry a unit's override. If the matrix unit
+consumes a different directory (for example an overridden
+`CCC_PUSH_SPOOL=…/matrix-spool`) and the telegram unit stops consuming,
+every writer keeps queueing into `telegram-spool` and nothing delivers it
+(#2223). Keep the consumer on the default directory, or symlink the orphan
+directory to the consumed one. `ccc-doctor` reports undrained records in
+its `push spool dwell` row.
+
 To deliver every record on **both** frontends, keep one consumer per dir
 and fan out instead of sharing the spool:
 

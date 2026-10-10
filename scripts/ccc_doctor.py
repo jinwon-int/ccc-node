@@ -860,6 +860,7 @@ class Doctor:
         self.check_skill_usage_telemetry()
         self.check_self_update_stall()
         self.check_agent_cron_prompt_success()
+        self.check_push_spool_dwell()
         self.check_dns_resolver_mode()
         self.check_worker_claude_cli_floor()
         # Managed Codex skills are provider-native (#647): diagnose them only on
@@ -2732,6 +2733,169 @@ class Doctor:
             "run `agent-cron.sh status` and read failure-alarm.json next to the store; "
             "class=auth_failed means that task's claude login/credential is broken, "
             "cli_missing means the runner/PATH is broken",
+        )
+
+    _PUSH_SPOOL_DWELL_MINUTES_DEFAULT = 30
+    # Bounds the directory walk: a spool is normally empty within seconds, so
+    # thousands of entries already means "orphaned" without counting further.
+    _PUSH_SPOOL_SCAN_MAX_ENTRIES = 5000
+
+    def _push_spool_state_roots(self) -> list[Path]:
+        """State dirs whose ``*-spool`` children are push spools.
+
+        The doctor's own state dir always counts. Writers also run in other
+        accounts' lanes on the same node (a root crontab next to a user-lane
+        bridge, #2223 variant B), so ``/root`` and ``/home/*`` state dirs are
+        added when this account can read them. ``CCC_DOCTOR_PUSH_STATE_ROOTS``
+        (``os.pathsep``-separated, globs allowed) replaces that extra set.
+        """
+        roots = [Path(os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")).expanduser()]
+        raw = os.environ.get("CCC_DOCTOR_PUSH_STATE_ROOTS")
+        patterns = raw.split(os.pathsep) if raw is not None else ["/root/.claude/state", "/home/*/.claude/state"]
+        for pattern in (p.strip() for p in patterns):
+            if not pattern:
+                continue
+            if any(ch in pattern for ch in "*?["):
+                anchor = Path(pattern).anchor or "."
+                with contextlib.suppress(OSError, ValueError):
+                    roots.extend(sorted(Path(anchor).glob(str(Path(pattern).relative_to(anchor)))))
+            else:
+                roots.append(Path(pattern).expanduser())
+        return roots
+
+    def _push_spool_dirs(self) -> tuple[list[Path], Path]:
+        """Every push spool dir on the node, plus the writers' default dir.
+
+        A spool dir is ``<state>/*-spool`` (``telegram-spool`` is the default of
+        every cron/hook writer; ``matrix-spool`` and similar are per-node
+        overrides) or a dir named by this process's ``CCC_PUSH_SPOOL`` /
+        ``CCC_PUSH_CONSUME_SPOOL`` / ``CCC_PUSH_MIRROR_DIRS``. Fan-out mirrors
+        live as subdirs of a spool (``telegram-spool/fanout-telegram``), so
+        each spool's subdirs other than ``sent`` are included too. Symlinked
+        dirs collapse to their target, so a merged orphan dir counts once.
+        """
+        state = Path(os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")).expanduser()
+        writer_default = Path(os.environ.get("CCC_PUSH_SPOOL") or (state / "telegram-spool")).expanduser()
+        candidates: list[Path] = [writer_default]
+        for key in ("CCC_PUSH_CONSUME_SPOOL", "CCC_PUSH_MIRROR_DIRS"):
+            for part in re.split(r"[,%s]" % re.escape(os.pathsep), os.environ.get(key, "")):
+                if part.strip():
+                    candidates.append(Path(part.strip()).expanduser())
+        for root in self._push_spool_state_roots():
+            with contextlib.suppress(OSError):
+                candidates.extend(sorted(p for p in root.glob("*-spool") if p.is_dir()))
+        spools: list[Path] = []
+        seen: set[str] = set()
+
+        def keep(path: Path) -> None:
+            try:
+                key = str(path.resolve())
+            except (OSError, RuntimeError):
+                key = str(path)
+            if key not in seen and path.is_dir():
+                seen.add(key)
+                spools.append(path)
+
+        for spool in candidates:
+            keep(spool)
+            with contextlib.suppress(OSError):
+                for child in sorted(spool.iterdir()):
+                    if child.name != "sent" and not child.name.startswith(".") and child.is_dir():
+                        keep(child)
+        return spools, writer_default
+
+    def _push_spool_stale(self, spool: Path, cutoff: float) -> tuple[int, float] | None:
+        """(stale record count, oldest mtime) for one dir; None when unreadable."""
+        count, oldest, seen = 0, cutoff, 0
+        try:
+            with os.scandir(spool) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > self._PUSH_SPOOL_SCAN_MAX_ENTRIES:
+                        break
+                    if entry.name.startswith(".") or not entry.name.endswith(".json"):
+                        continue
+                    try:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        mtime = entry.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        continue
+                    if mtime < cutoff:
+                        count += 1
+                        oldest = min(oldest, mtime)
+        except OSError:
+            return None
+        return count, oldest
+
+    def check_push_spool_dwell(self) -> None:
+        """Warn when push spool records sit undelivered: nobody drains that dir (#2223).
+
+        Consumers (the Telegram ``PushNotifier`` / Matrix ``MatrixSpoolNotifier``)
+        poll every few seconds, so a record still pending after N minutes means
+        no running process consumes its dir. On 2026-10-10 one node held 9
+        undelivered notices for a day: its Telegram push was turned off, the
+        Matrix consumer drained an overridden ``matrix-spool``, and every
+        cron/hook writer kept its default ``telegram-spool``. Writers saw
+        ``delivery: spooled``; the bridge health probe only counts the dir its
+        own process consumes, so nothing anywhere looked wrong. A second node
+        had the same orphan in a root-lane spool next to a user-lane bridge.
+
+        Read-only: lists ``*.json`` records directly inside each spool dir
+        (``sent/`` is the archive and is skipped). Never reads a record body or
+        another process's environment. ``CCC_DOCTOR_PUSH_SPOOL_DWELL_MINUTES``
+        sets the threshold (default 30; ``0`` disables the row).
+        """
+        item = "push spool dwell"
+        raw = os.environ.get("CCC_DOCTOR_PUSH_SPOOL_DWELL_MINUTES", "").strip()
+        minutes = int(raw) if raw.isdigit() else self._PUSH_SPOOL_DWELL_MINUTES_DEFAULT
+        if minutes == 0:
+            self.add("정상", item, "해당 없음 (disabled)", "none")
+            return
+        spools, writer_default = self._push_spool_dirs()
+        if not spools:
+            self.add("정상", item, "해당 없음 (no push spool dir)", "none")
+            return
+        now = time.time()
+        cutoff = now - minutes * 60
+        stale: list[tuple[int, float, Path]] = []
+        unreadable = 0
+        for spool in spools:
+            found = self._push_spool_stale(spool, cutoff)
+            if found is None:
+                unreadable += 1
+            elif found[0]:
+                stale.append((found[0], found[1], spool))
+        skipped = f"; unreadable={unreadable}" if unreadable else ""
+        if not stale:
+            self.add("정상", item, f"dirs={len(spools)}; stale=0; threshold={minutes}m{skipped}", "none")
+            return
+        stale.sort(key=lambda row: row[1])
+
+        def label(count: int, oldest: float, spool: Path) -> str:
+            age_h = (now - oldest) / 3600
+            age = f"{age_h:.0f}h" if age_h >= 1 else f"{(now - oldest) / 60:.0f}m"
+            default = " writer-default" if spool == writer_default else ""
+            # Keep the tail: the spool's own name is what tells dirs apart, so a
+            # long prefix (deep home, CI temp dir) is what gets elided.
+            shown = _printable(str(spool), 1 << 16)
+            if len(shown) > 80:
+                shown = "..." + shown[-77:]
+            return f"{shown}(n={count},oldest={age}{default})"
+
+        shown = ", ".join(label(*row) for row in stale[:5])
+        more = f" (+{len(stale) - 5} more)" if len(stale) > 5 else ""
+        total = sum(row[0] for row in stale)
+        self.add(
+            "경고",
+            item,
+            f"stale={total} in {len(stale)} dir(s); threshold={minutes}m; {shown}{more}{skipped}",
+            "no running consumer drains these dirs. Cron/hook writers default to "
+            "<state>/telegram-spool unless CCC_PUSH_SPOOL is set in their own environment; "
+            "the consumer is the bridge with CCC_PUSH_ENABLED=true, reading "
+            "CCC_PUSH_CONSUME_SPOOL or CCC_PUSH_SPOOL. Point the remaining consumer at the "
+            "writers' dir (or symlink the orphan dir to the consumed one), and move stale "
+            "records into sent/ instead of delivering outdated notices (ccc-node#2223)",
         )
 
     def check_dns_resolver_mode(self) -> None:
