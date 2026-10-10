@@ -1025,3 +1025,72 @@ async def test_serve_relay_notifier_is_not_registered_twice(
         assert len(server.requests) == 1 and (spool / "sent" / "0001.json").exists()
     finally:
         server.close()
+
+
+@pytest.mark.anyio
+async def test_serve_relay_mode_delivers_direct_events_to_the_owner_room_once_open(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    """#2227: the early relay notifier gets the opened transport, so a listed
+    event (important mail) lands in the agent's own room while operational
+    records still go to the fleet relay."""
+    from test_fleet_alert_relay import _Server
+
+    server = _Server()
+    try:
+        bot, spool = _relay_bot(tmp_path, server.url, push_fleet_relay_direct_events="mail")
+        spool.mkdir(parents=True, exist_ok=True)
+        (spool / "0001-mail.json").write_text(
+            json.dumps({"event": "mail", "text": "중요메일 1건", "dedup": "mail:1"}), encoding="utf-8"
+        )
+        _spool_record(spool, "0002-ops.json", "self-update done")
+
+        async def script(transport: FakeTransport) -> None:
+            for _ in range(200):
+                if not list(spool.glob("*.json")):
+                    break
+                await anyio.sleep(0.02)
+
+        holder: dict[str, Any] = {}
+
+        def factory(config: Any, runner: Any) -> FakeTransport:
+            holder["t"] = _PolicyTransport(config, runner, script=script)
+            return holder["t"]
+
+        bot._transport_factory = factory
+        with anyio.fail_after(10):
+            await bot.serve()
+        mail_notices = [n for n in holder["t"].notices if "중요메일 1건" in n[1]]
+        assert [room for room, _text in mail_notices] == [DM_ROOM]
+        assert len(server.requests) == 1, "the operational record went to the relay"
+        assert not list(spool.glob("*.json"))
+    finally:
+        server.close()
+
+
+@pytest.mark.anyio
+async def test_serve_open_failure_exit_drain_does_not_wait_on_direct_events(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    """A direct record needs the session that failed: the exit drain returns
+    once the relay-bound records are out instead of burning its window."""
+    from test_fleet_alert_relay import _Server
+
+    server = _Server()
+    try:
+        bot, spool = _relay_bot(tmp_path, server.url, push_fleet_relay_direct_events="mail")
+        spool.mkdir(parents=True, exist_ok=True)
+        (spool / "0001-mail.json").write_text(
+            json.dumps({"event": "mail", "text": "kept for the next start", "dedup": "mail:1"}), encoding="utf-8"
+        )
+        _spool_record(spool, "0002-alert.json", "Telegram polling failed")
+        bot._transport_factory = lambda config, runner: _OpenFailsTransport(config, runner)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with anyio.fail_after(10):
+            with pytest.raises(ConnectionError):
+                await bot.serve()
+        assert loop.time() - started < 3.0, "did not wait the 5 s window for an undeliverable direct record"
+        assert len(server.requests) == 1 and (spool / "0001-mail.json").exists()
+    finally:
+        server.close()

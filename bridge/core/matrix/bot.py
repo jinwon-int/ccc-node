@@ -400,13 +400,48 @@ class MatrixSpoolNotifier:
                 self._relay = relay_from_settings(settings)
             except (OSError, ValueError) as e:
                 self._relay_error = str(e)
+        # #2227: events that stay in the owner room even in relay mode
+        # (owner-personal notices such as important mail). Ignored outside
+        # relay mode, where every record already goes to the owner room.
+        self.direct_events: frozenset[str] = frozenset(
+            e.strip()
+            for e in str(getattr(settings, "push_fleet_relay_direct_events", "") or "").split(",")
+            if e.strip()
+        )
 
-    def pending_count(self) -> int:
-        """Records still waiting in the consumed spool (0 when the dir is absent)."""
+    def attach_transport(self, transport: Any) -> None:
+        """Give an early-started relay notifier (#2207) the opened transport.
+
+        Until this runs, direct-event records (#2227) wait in the spool while
+        relay records keep flowing.
+        """
+
+        self._transport = transport
+
+    def _is_direct(self, data: dict) -> bool:
+        return self.relay_mode and str(data.get("event") or "") in self.direct_events
+
+    def pending_count(self, relay_only: bool = False) -> int:
+        """Records still waiting in the consumed spool (0 when the dir is absent).
+
+        ``relay_only`` skips direct-event records (#2227): they need the Matrix
+        session, so the transport-failed exit drain must not wait on them.
+        """
         try:
-            return sum(1 for p in self.spool_dir.glob("*.json") if p.is_file())
+            files = [p for p in self.spool_dir.glob("*.json") if p.is_file()]
         except OSError:
             return 0
+        if not (relay_only and self.relay_mode and self.direct_events):
+            return len(files)
+        count = 0
+        for p in files:
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = None
+            if not (isinstance(data, dict) and self._is_direct(data)):
+                count += 1
+        return count
 
     def _owner_room(self) -> Optional[str]:
         if self._transport is None:
@@ -422,10 +457,15 @@ class MatrixSpoolNotifier:
         if not self.enabled:
             logger.info("Matrix spool notifier disabled (push_enabled is false)")
             return
-        room = self._owner_room()
         if self.relay_mode:
-            room = room or ""  # relay mode never writes to a room; the value is unused
-        elif room is None:
+            # Relay mode never uses this value; direct events (#2227) resolve
+            # the owner room per record, once the transport is attached. Not
+            # looked up here: the early task may start after attach, and a
+            # failed lookup must not take the relay drain down with it.
+            room = ""
+        else:
+            room = self._owner_room()
+        if room is None:
             logger.warning(
                 "Matrix spool notifier enabled but no direct/family room is configured; not sending"
             )
@@ -439,11 +479,12 @@ class MatrixSpoolNotifier:
             return
         self._prune_sent(sent_dir)
         logger.info(
-            "Matrix spool notifier active → %s, spool %s, fan-out %s",
+            "Matrix spool notifier active → %s, spool %s, fan-out %s, direct events %s",
             f"fleet relay {self._relay.url} as {self._relay.node}" if self._relay else
             ("fleet relay MISCONFIGURED (records kept)" if self.relay_mode else f"room {room}"),
             self.spool_dir,
             [str(d) for d in self.mirror_dirs] or "none",
+            (sorted(self.direct_events) if self.relay_mode else None) or "none",
         )
         while True:
             try:
@@ -454,6 +495,11 @@ class MatrixSpoolNotifier:
 
     async def _drain(self, room: str, sent_dir: Path) -> None:
         ready = fan_out_pending(self.spool_dir, self.mirror_dirs) if self.mirror_dirs else None
+        # #2227: once a direct-event record defers (no session yet / transient
+        # room failure), later direct records wait too — their order holds —
+        # while relay records keep draining (#2207 outage alerts never queue
+        # behind a personal notice).
+        direct_deferred = False
         for p in sorted(self.spool_dir.glob("*.json")):
             if not p.is_file():
                 continue
@@ -471,6 +517,9 @@ class MatrixSpoolNotifier:
                 continue
             if ready is not None and p.name not in ready:
                 return  # not mirrored yet; keep file, preserve order
+            direct = self._is_direct(data)
+            if direct and direct_deferred:
+                continue  # keep file; an earlier direct record is still waiting
             now = time.time()
             key = data.get("dedup") or text
             if key in self._recent and now - self._recent[key] < _DEDUP_WINDOW_SECONDS:
@@ -483,7 +532,15 @@ class MatrixSpoolNotifier:
             if len(self._sent_times) >= self.max_per_minute:
                 logger.warning("Matrix spool rate limit reached (%d/min); deferring", self.max_per_minute)
                 return
-            outcome = await (self._deliver_relay(p, data) if self.relay_mode else self._deliver_room(room, data))
+            if direct:
+                outcome = await self._deliver_direct(p, data)
+                if outcome == "defer":
+                    direct_deferred = True
+                    continue  # keep file; relay records behind it still drain
+            elif self.relay_mode:
+                outcome = await self._deliver_relay(p, data)
+            else:
+                outcome = await self._deliver_room(room, data)
             if outcome == "stop":
                 return  # keep file; stop this cycle to preserve order
             if outcome == "sent":
@@ -504,6 +561,32 @@ class MatrixSpoolNotifier:
             logger.warning("Matrix spool send failed (will retry next cycle)", exc_info=True)
             return "stop"
         return "sent"
+
+    async def _deliver_direct(self, p: Path, data: dict) -> str:
+        """Relay mode, listed event (#2227): the owner room as the agent.
+
+        ``"defer"`` keeps the record for a later cycle without blocking relay
+        records — before the transport is attached (early start, #2207) and on
+        a transient room failure. With no owner room configured at all the
+        notice goes to the fleet relay rather than nowhere.
+        """
+        if self._transport is None:
+            return "defer"
+        try:
+            room = self._owner_room()
+        except Exception:
+            # A lookup failure must not abort the drain cycle — relay records
+            # (outage alerts) queue behind this one otherwise.
+            logger.warning("Matrix spool owner-room lookup failed; treating as no owner room", exc_info=True)
+            room = None
+        if room is None:
+            logger.warning(
+                "Matrix spool direct event %r has no owner room; sending via the fleet relay",
+                data.get("event"),
+            )
+            return await self._deliver_relay(p, data)
+        outcome = await self._deliver_room(room, data)
+        return "defer" if outcome == "stop" else outcome
 
     async def _deliver_relay(self, p: Path, data: dict) -> str:
         """Relay mode (#2182): never post into the agent room.
@@ -758,6 +841,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             if initialize:
                 logger.info("Matrix frontend initialised a new bot device; start again without CCC_MATRIX_INITIALIZE")
                 return
+            if early_notifier is not None:
+                # #2227: direct-event records waited for the session; they can go now.
+                early_notifier.attach_transport(transport)
             if self._distill_journal is not None:
                 self._distill_journal.validate_path()
                 self._distill_journal.initialize()
@@ -842,7 +928,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             return
         loop = asyncio.get_running_loop()
         deadline = loop.time() + window
-        pending = notifier.pending_count()
+        # Direct-event records (#2227) need the session that just failed; only
+        # relay-bound records can leave now, so only they are waited for.
+        pending = notifier.pending_count(relay_only=True)
         if pending:
             logger.warning(
                 "Matrix transport failed to open; draining %d spool record(s) to the fleet relay for up to %.0fs",
@@ -854,7 +942,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                 logger.warning("fleet relay exit drain window elapsed with %d record(s) left", pending)
                 return
             await asyncio.sleep(min(0.25, remaining))
-            pending = notifier.pending_count()
+            pending = notifier.pending_count(relay_only=True)
 
     def _background_legs(
         self, stop: asyncio.Event, notifier: "MatrixSpoolNotifier"

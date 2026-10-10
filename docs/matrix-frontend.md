@@ -131,6 +131,20 @@ agent room receives nothing.
 | `CCC_PUSH_FLEET_RELAY_SECRET_FILE` | owner-only (0600, no symlink) file with the shared secret |
 | `CCC_PUSH_FLEET_NODE` | node name in the payload; empty = `CCC_NODE` or short hostname |
 | `CCC_PUSH_FLEET_RELAY_TIMEOUT` | seconds per record (default 10) |
+| `CCC_PUSH_FLEET_RELAY_DIRECT_EVENTS` | comma-separated record `event` values kept in the owner room as the agent (#2227); empty (default) = everything to the relay |
+
+**Owner-personal notices (#2227).** Relay mode is meant for operational
+alerts. Notices that are the owner's own business rather than fleet state —
+important mail (`event: mail`), the daily schedule brief (`schedule-brief`),
+lotto results — can stay in the agent's own room: list their `event` values
+in `CCC_PUSH_FLEET_RELAY_DIRECT_EVENTS`. Those records take the pre-#2182
+owner-room path (same format, dedup window and rate limit); everything else
+still goes to the relay. Until the transport is open (the notifier starts
+early in relay mode, #2207) and on a transient room failure, a listed record
+waits in the spool — later listed records wait behind it so their order
+holds — while relay records keep draining, and the transport-failed exit
+drain does not wait on them. With no direct/family room configured a listed
+record goes to the relay instead of being dropped.
 
 Semantics are otherwise unchanged: `sent/` archive, dedup window, rate
 limit and fan-out mirrors behave exactly as in owner-room mode. A 2xx

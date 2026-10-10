@@ -973,6 +973,18 @@ class Config(
         alias="CCC_PUSH_FLEET_RELAY_TIMEOUT",
         description="Seconds to wait for the fleet relay per record.",
     )
+    # #2227: relay mode moved *every* spool record into the fleet room, including
+    # owner-personal notices (important mail, schedule brief) that used to reach
+    # the agent's own room. Listed events keep the pre-#2182 owner-room path.
+    push_fleet_relay_direct_events: str = Field(
+        default="",
+        alias="CCC_PUSH_FLEET_RELAY_DIRECT_EVENTS",
+        description=(
+            "Relay mode only: comma-separated spool record `event` values delivered to the "
+            "owner room as the agent instead of the fleet relay (e.g. `mail,schedule-brief`). "
+            "Empty (default) = every record goes to the relay."
+        ),
+    )
     # #2207: in relay mode the spool notifier starts BEFORE the Matrix transport
     # opens (the relay needs no Matrix session), and when the open fails the
     # process waits up to this long for the spool to drain before exiting.
