@@ -70,6 +70,9 @@ Usage:
   nunchi.py annotate <fact_id> --because <reason>  # backfill a decision's reason
   nunchi.py snapshot [--limit N]             # SessionStart-ready summary
   nunchi.py review-stale [--close]           # G1 retro pass over old facts
+  nunchi.py constraints-triage [--apply] [--threshold F] [--retire-age-days N]
+            [--fold-only|--retire-only] [--include-user-stated] [--sample N] [--json]
+                                             # fold near-dup / retire phase constraints (#2222)
   nunchi.py metrics                          # body-free counters for bench
   nunchi.py backend-status                   # synthesis backend health (#1263)
   nunchi.py stats
@@ -1786,6 +1789,192 @@ def constraints_cmd(all_rows=False):
     print(f"{len(rows)} open constraints")
 
 
+TRIAGE_THRESHOLD_DEFAULT = 0.6
+TRIAGE_RETIRE_AGE_DAYS_DEFAULT = 30
+_TRIAGE_PUNCT = re.compile(r"[`'\"“”‘’.,;:!?()\[\]{}<>]")
+# Phase anchors (#2222): a spec section ("§2.4"), or an issue/PR number
+# ("#2216", "PR #1941", "a2a-nexus#2317") — the same _IDENT the G1 guard uses.
+_SECTION = re.compile(r"§\s?\d+(?:\.\d+)*")
+
+
+# Trailing Korean particles: re-extractions of one rule differ mostly here
+# ("승인은" / "승인이" / "승인을"), which whitespace tokens count as different
+# words. Longest first; a token is never stripped below two characters.
+_TRIAGE_PARTICLES = ("으로", "에서", "에게", "까지", "부터", "보다", "처럼",
+                     "은", "는", "이", "가", "을", "를", "의", "에", "로",
+                     "와", "과", "도", "만")
+
+
+def _triage_tokens(text):
+    """Whitespace tokens, lowercased, stripped of quoting/punctuation and of
+    one trailing Korean particle."""
+    out = set()
+    for w in str(text or "").lower().split():
+        w = _TRIAGE_PUNCT.sub("", w)
+        for p in _TRIAGE_PARTICLES:
+            if w.endswith(p) and len(w) - len(p) >= 2:
+                w = w[: -len(p)]
+                break
+        if len(w) > 1:
+            out.add(w)
+    return out
+
+
+def _phase_anchors(text):
+    """Section and issue/PR anchors that tie a constraint to one project phase."""
+    found = [m.replace(" ", "") for m in _SECTION.findall(str(text or ""))]
+    found += [f"#{n}" for n in sorted(_identifiers(text), key=int)]
+    return found
+
+
+def _constraint_rows(c):
+    return c.execute(
+        "SELECT id, observed, fact, created_at, COALESCE(source_rank, 1)"
+        " FROM peer_facts WHERE valid_to IS NULL AND kind = 'constraint'").fetchall()
+
+
+def _triage_fold_plan(rows, threshold):
+    """Leader clustering of near-duplicate constraints (#2222 step 1).
+
+    Rows are visited survivor-first — highest source_rank, then newest — so a
+    leader never ranks below a member it absorbs (G2: an inference must not
+    bury a user statement). A row joins the first leader that shares its
+    normalised 40-char key (#2216) or reaches token Jaccard >= threshold,
+    unless the two name issue/PR numbers and share none (#1890 guard): two
+    phase rules worded alike about different PRs are different rules.
+    Greedy, not transitive, so one fuzzy pair cannot chain unrelated rules
+    into one cluster. Returns [(survivor_row, [member_rows])], members only.
+    """
+    ordered = sorted(rows, key=lambda r: (-int(r[4] or 1), -r[0]))
+    leaders = []  # (row, tokens, key, members)
+    for row in ordered:
+        toks = _triage_tokens(row[2])
+        key = _constraint_key(row[2])
+        home = None
+        for leader in leaders:
+            lrow, ltoks, lkey, _members = leader
+            if _different_work(lrow[2], row[2]):
+                continue
+            if key == lkey:
+                home = leader
+                break
+            if toks and ltoks and len(toks & ltoks) / len(toks | ltoks) >= threshold:
+                home = leader
+                break
+        if home is None:
+            leaders.append((row, toks, key, []))
+        else:
+            home[3].append(row)
+    return [(lrow, members) for lrow, _t, _k, members in leaders if members]
+
+
+def _triage_retire_plan(rows, folded_ids, age_days, now_dt, include_user_stated=False):
+    """Phase-scoped retirement candidates (#2222 step 2).
+
+    A candidate carries a phase anchor (§ section or issue/PR number), is at
+    least `age_days` old, and is not user-stated: rank 3 stays unless the
+    owner passes `include_user_stated` after reading the sample (G2 — an
+    owner rule is retired by the owner, not by a lexical match alone). Rows
+    already folded in step 1 are excluded so one row is never closed twice.
+    """
+    from datetime import timedelta
+    cutoff = now_dt - timedelta(days=age_days)
+    out = []
+    for row in rows:
+        fid, _o, fact, created, rank = row
+        if fid in folded_ids or (int(rank or 1) >= 3 and not include_user_stated):
+            continue
+        anchors = _phase_anchors(fact)
+        if not anchors:
+            continue
+        try:
+            stamp = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        if stamp <= cutoff:
+            out.append((row, anchors))
+    return out
+
+
+def constraints_triage(apply=False, threshold=TRIAGE_THRESHOLD_DEFAULT,
+                       age_days=TRIAGE_RETIRE_AGE_DAYS_DEFAULT, sample=30,
+                       do_fold=True, do_retire=True, as_json=False,
+                       include_user_stated=False):
+    """`constraints-triage` — shrink the open constraint set reversibly (#2222).
+
+    Measured on one node: 1,221 open constraints, 1,027 of them from one
+    2026-08 backfill, re-extracted per worker session (one rule ×132
+    sessions). Step 1 folds cross-session near-duplicates into one survivor
+    via merge() (lineage markers, no new text). Step 2 retires phase-scoped
+    rules (anchored to a spec section or issue/PR, older than `age_days`):
+    valid_to is set and `because` records `phase-scoped: <anchors>`. Nothing
+    is deleted; clearing valid_to undoes either step. Dry-run by default —
+    the owner reviews the sample before --apply.
+    """
+    c = db()
+    rows = _constraint_rows(c)
+    plan = _triage_fold_plan(rows, threshold) if do_fold else []
+    folded_ids = {m[0] for _s, members in plan for m in members}
+    retire = (_triage_retire_plan(rows, folded_ids, age_days, datetime.now(timezone.utc),
+                                  include_user_stated) if do_retire else [])
+    after = len(rows) - len(folded_ids) - len(retire)
+    report = {
+        "mode": "apply" if apply else "dry-run",
+        "open_constraints": len(rows),
+        "threshold": threshold,
+        "retire_age_days": age_days,
+        "retire_includes_user_stated": include_user_stated,
+        "retire_by_rank": {str(k): sum(1 for r, _a in retire if int(r[4] or 1) == k) for k in (1, 2, 3)},
+        "clusters": len(plan),
+        "fold": len(folded_ids),
+        "retire": len(retire),
+        "open_after": after,
+        "fold_sample": [
+            {"survivor": s[0], "dup": m[0], "dup_text": m[2][:120]}
+            for s, members in plan for m in members][:sample],
+        "retire_sample": [
+            {"id": r[0], "rank": int(r[4] or 1), "anchors": a, "text": r[2][:120]}
+            for r, a in retire][:sample],
+    }
+    if apply:
+        stamp = now()
+        for survivor, members in plan:
+            for m in members:
+                c.execute("UPDATE peer_facts SET valid_to=?, evidence=TRIM(COALESCE(evidence,'')"
+                          " || ' merged-away:#' || ?) WHERE id=? AND valid_to IS NULL",
+                          (stamp, survivor[0], m[0]))
+            marks = " ".join(f"merged:#{m[0]}" for m in members)
+            c.execute("UPDATE peer_facts SET evidence=TRIM(COALESCE(evidence,'') || ' ' || ?)"
+                      " WHERE id=?", (marks, survivor[0]))
+        for row, anchors in retire:
+            note = "phase-scoped: " + ",".join(anchors[:4])
+            c.execute("UPDATE peer_facts SET valid_to=?, because=CASE"
+                      " WHEN because IS NULL OR because='' THEN ? ELSE because || ' | ' || ? END"
+                      " WHERE id=? AND valid_to IS NULL", (stamp, note, note, row[0]))
+        c.commit()
+        report["open_after_measured"] = len(_constraint_rows(c))
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return report
+    print(f"constraints-triage ({report['mode']}): open={len(rows)}"
+          f" clusters={len(plan)} fold={len(folded_ids)} retire={len(retire)}"
+          f" open_after={after} (threshold={threshold}, retire_age={age_days}d,"
+          f" retire_by_rank={report['retire_by_rank']},"
+          f" user_stated={'included' if include_user_stated else 'kept'})")
+    for item in report["fold_sample"]:
+        print(f"  fold #{item['dup']} -> #{item['survivor']}: {item['dup_text']}")
+    for item in report["retire_sample"]:
+        print(f"  retire #{item['id']} rank={item['rank']} [{','.join(item['anchors'][:4])}]: {item['text']}")
+    if apply:
+        print(f"applied: open constraints now {report['open_after_measured']}"
+              " (reversible: clear valid_to; lineage in evidence/because)")
+    else:
+        print("dry-run — nothing changed. Back up the DB, then: nunchi.py constraints-triage --apply")
+    return report
+
+
 def assemble(budget, hint, limit=25):
     """P2-7 — task-conditioned ranked snapshot assembly, bounded in bytes.
 
@@ -2016,6 +2205,21 @@ if __name__ == "__main__":
                  int(flag("--limit", "25")))
     elif cmd == "constraints":
         constraints_cmd()
+    elif cmd == "constraints-triage":
+        if "--fold-only" in args and "--retire-only" in args:
+            sys.exit("constraints-triage: --fold-only and --retire-only are exclusive")
+        try:
+            threshold = float(flag("--threshold", str(TRIAGE_THRESHOLD_DEFAULT)))
+            age = int(flag("--retire-age-days", str(TRIAGE_RETIRE_AGE_DAYS_DEFAULT)))
+            sample_n = int(flag("--sample", "30"))
+        except ValueError:
+            sys.exit("constraints-triage: --threshold is a float, --retire-age-days/--sample are integers")
+        if not 0.0 < threshold <= 1.0 or age < 0 or sample_n < 0:
+            sys.exit("constraints-triage: need 0 < --threshold <= 1, --retire-age-days >= 0, --sample >= 0")
+        constraints_triage(apply="--apply" in args, threshold=threshold, age_days=age,
+                           sample=sample_n, do_fold="--retire-only" not in args,
+                           do_retire="--fold-only" not in args, as_json="--json" in args,
+                           include_user_stated="--include-user-stated" in args)
     elif cmd == "review":
         pos = [a for a in args if not a.startswith("--")]
         review(int(pos[0]) if pos else None, clear="--clear" in args)
