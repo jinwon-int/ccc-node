@@ -462,7 +462,7 @@ class MatrixSpoolNotifier:
             # the owner room per record, once the transport is attached. Not
             # looked up here: the early task may start after attach, and a
             # failed lookup must not take the relay drain down with it.
-            room = ""
+            room: Optional[str] = ""
         else:
             room = self._owner_room()
         if room is None:
