@@ -926,15 +926,27 @@ def _parse_judge_result(output, truncate_rationale=False):
     except ValueError:
         return None, "json-unparseable"
     required = {"verdict", "rationale", "supersede_proposal"}
-    if not isinstance(parsed, dict) or set(parsed) != required:
-        return None, "schema-invalid"
+    # Body-free diagnostics (#2250): only the contract's own field names and a
+    # count ever reach the audit. Key names the model invented are untrusted
+    # output, so an extra key is counted, never named.
+    if not isinstance(parsed, dict):
+        return None, "schema-invalid:not-object"
+    if set(parsed) != required:
+        parts = []
+        missing = sorted(required - set(parsed))
+        if missing:
+            parts.append("missing=" + ",".join(missing))
+        extra = len(set(parsed) - required)
+        if extra:
+            parts.append(f"extra={extra}")
+        return None, "schema-invalid:" + ";".join(parts)
     verdict = parsed.get("verdict")
     if verdict not in VERDICTS:
         return None, "verdict-outside-rubric"
     rationale = parsed["rationale"]
     proposal = parsed["supersede_proposal"]
     if not isinstance(rationale, str):
-        return None, "schema-invalid"
+        return None, "schema-invalid:type=rationale"
     truncated = False
     if len(rationale) > RATIONALE_MAX:
         if not truncate_rationale:
@@ -942,7 +954,7 @@ def _parse_judge_result(output, truncate_rationale=False):
         rationale = rationale[:RATIONALE_MAX - 1] + "…"
         truncated = True
     if proposal is not None and not isinstance(proposal, str):
-        return None, "schema-invalid"
+        return None, "schema-invalid:type=supersede_proposal"
     if proposal is not None and len(proposal) > 200:
         return None, "proposal-too-long"
     result = {

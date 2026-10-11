@@ -460,7 +460,7 @@ printf '%s\n' extra >"$TMP/codex-mode"
 out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=codex)"
 ok "local parser rejects schema-extra Codex output fail-closed" '[ "$(review_of "$idc5")" = 1 ]'
 ok "schema failure is body-free in audit" \
-  'grep -q '\''"codex:schema-invalid"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "unexpected" "$NUNCHI_HOME/judge-audit.jsonl"'
+  'grep -q '\''"codex:schema-invalid:extra=1"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "unexpected" "$NUNCHI_HOME/judge-audit.jsonl"'
 
 reset_db
 # shellcheck disable=SC2034  # idc7 is read via eval inside ok()
@@ -991,6 +991,37 @@ out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude)"
 ok "overlong claude proposal fails closed to human" '[ "$(review_of "$idk7")" = 1 ]'
 ok "overlong claude proposal is classed proposal-too-long, body-free" \
   'grep -q '\''"claude:proposal-too-long"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "zzzzzzzzzzzzzzzz" "$NUNCHI_HOME/judge-audit.jsonl"'
+
+# ---- #2250: schema-invalid says which contract field broke, body-free ------
+# Only the contract's own field names and a count may reach the audit; a key
+# the model invented is untrusted output and is counted, never named.
+schema_case() { # schema_case <python-dict-literal> <dedup-tag>
+  cat >"$TMP/bin/claude" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null
+python3 -c 'import json; print(json.dumps($1))'
+STUB
+  chmod +x "$TMP/bin/claude"
+  reset_db
+  # shellcheck disable=SC2034  # SCHEMA_ID is read via eval inside ok()
+  SCHEMA_ID="$(seed peer-k "스키마 진단 형제 $2" "$OLD" 1 1 "s$2a")"
+  seed peer-k "스키마 진단 형제 $2" "$OLD" 1 0 "s$2b" >/dev/null
+  run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude >/dev/null
+}
+schema_case '{"verdict":"clear","rationale":"dup"}' m1
+ok "missing contract key fails closed and is named" \
+  '[ "$(review_of "$SCHEMA_ID")" = 1 ] && grep -q '\''"claude:schema-invalid:missing=supersede_proposal"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
+schema_case '{"verdict":"clear","rationale":"dup","supersede_proposal":None,"bogusfieldname":1,"otherbogus":2}' e2
+ok "extra model keys are counted, never named" \
+  '[ "$(review_of "$SCHEMA_ID")" = 1 ] && grep -q '\''"claude:schema-invalid:extra=2"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "bogus" "$NUNCHI_HOME/judge-audit.jsonl"'
+schema_case '{"verdict":"clear","supersede_proposal":None,"reason":"dup"}' b3
+ok "missing and extra are reported together" \
+  'grep -q '\''"claude:schema-invalid:missing=rationale;extra=1"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "\"reason\"" "$NUNCHI_HOME/judge-audit.jsonl"'
+schema_case '{"verdict":"clear","rationale":7,"supersede_proposal":None}' t4
+ok "wrong field type is named by contract field" \
+  'grep -q '\''"claude:schema-invalid:type=rationale"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
+schema_case '[{"verdict":"clear"}]' o5
+ok "non-object JSON fails closed" '[ "$(review_of "$SCHEMA_ID")" = 1 ]'
 
 printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

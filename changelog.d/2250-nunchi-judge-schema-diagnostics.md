@@ -1,0 +1,1 @@
+- nunchi judge: `schema-invalid` now carries a body-free reason — `missing=<contract field>`, `extra=<count>` (model-invented key names are never recorded), `type=<contract field>`, `not-object` — so a failing verdict contract can be diagnosed from the audit without storing model output (#2250).
