@@ -53,8 +53,9 @@ ccc_installer_gen_inputs() {
     # (install-cost-ledger-cron.sh also sources the lib but is deliberately NOT
     # listed: adding it would re-stamp 12 already-correct fleet entries.
     # install-timed-test-deadline-scan-cron.sh carries no such cost — it is
-    # listed from its first commit because no node has installed it yet.)
-    install-memory-refresh-cron.sh|install-pr-status-poll-cron.sh|install-skill-autosave-cron.sh|install-fleet-skills-sync-cron.sh|install-tunnel-audit-cron.sh|install-timed-test-deadline-scan-cron.sh)
+    # listed from its first commit because no node has installed it yet.
+    # install-skill-promotion-results-cron.sh (#2239) likewise.)
+    install-memory-refresh-cron.sh|install-pr-status-poll-cron.sh|install-skill-autosave-cron.sh|install-fleet-skills-sync-cron.sh|install-tunnel-audit-cron.sh|install-timed-test-deadline-scan-cron.sh|install-skill-promotion-results-cron.sh)
       extras="installer-cron-common.sh" ;;
   esac
   printf '%s\n' "$self"

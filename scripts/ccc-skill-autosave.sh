@@ -59,6 +59,23 @@ PROMOTER="${CCC_SKILL_PROMOTION_CMD:-$CLAUDE_DIR/hooks/ccc-skill-promotion.py}"
 # intake review dispatch in block 2d. HOME-relative default — no node-specific
 # absolute path lives in this repo — and only the publisher actually has one.
 EDGE_ENV="${CCC_A2A_EDGE_ENV:-${HOME:-/root}/.a2a-broker-edge.env}"
+# #2239: optional publisher config file for the CCC_SKILL_PROMOTION_* knobs.
+# The promoter reads it itself (whitelist, process env wins); the collect
+# subshell exports it too so the child sees the same values the 15-minute
+# results cron bakes in. Sourced only when it is a regular, owner-only file we
+# own — anything else is left alone and shows up in the promoter's status as
+# `config_file.error`. Logged by presence, never by content.
+PROMOTION_ENV="${CCC_SKILL_PROMOTION_ENV_FILE:-${HOME:-/root}/.config/ccc-node/skill-promotion.env}"
+promotion_env_file_ok() { # regular file, owned by us, no group/other bits
+  [ -f "$PROMOTION_ENV" ] && [ ! -L "$PROMOTION_ENV" ] && [ -O "$PROMOTION_ENV" ] || return 1
+  case "$(stat -c %a "$PROMOTION_ENV" 2>/dev/null)" in [0-7]00) return 0 ;; esac
+  return 1
+}
+promotion_env_file_state() { # present | absent | unsafe (presence only, #1766 rule)
+  if promotion_env_file_ok; then echo present
+  elif [ -e "$PROMOTION_ENV" ] || [ -L "$PROMOTION_ENV" ]; then echo unsafe
+  else echo absent; fi
+}
 
 # Fleet-wide autonomy guard (#386): a single kill-switch/dry-run above every
 # no-approval write. The installed layout keeps the lib under the claude tree;
@@ -164,6 +181,26 @@ AUTO_ADVISORY="auto mode installs LLM-drafted skills without pre-install human r
 # aborting the subshell under this script's `set -u`.
 collect_with_edge_env() {
   (
+    # #2239: the publisher config file goes first so the edge env (next) and
+    # the process env (restored below) both win over it. `set -a` sourcing
+    # would otherwise let the file clobber a knob the cron line baked or the
+    # operator exported, so every CCC_SKILL_PROMOTION_* value already in the
+    # environment is remembered and re-exported afterwards — the same
+    # precedence the promoter's own loader applies.
+    if promotion_env_file_ok; then
+      _keep=()
+      for _k in $(compgen -e CCC_SKILL_PROMOTION_ 2>/dev/null || true); do
+        _keep+=("$_k=${!_k}")
+      done
+      set +u
+      set -a
+      # shellcheck disable=SC1090
+      . "$PROMOTION_ENV" >/dev/null 2>&1 || :
+      set +a
+      set -u
+      [ "${#_keep[@]}" -eq 0 ] || export "${_keep[@]}"
+      unset _keep _k
+    fi
     if [ -f "$EDGE_ENV" ]; then
       set +u
       set -a
@@ -345,6 +382,9 @@ if [ "$MODE" = "status" ]; then
   # Presence only, never the value (#1766): absent on a publisher is exactly the
   # wiring gap that stalled six intake PRs, so it has to be visible at a glance.
   echo "a2a edge env: $([ -f "$EDGE_ENV" ] && echo present || echo absent) ($EDGE_ENV — exports A2A_EDGE_SECRET for the 2d intake review dispatch; publisher only)"
+  # #2239: same presence-only rule. `unsafe` = exists but is not a regular
+  # owner-only file we own, so neither the sweep nor the promoter reads it.
+  echo "promotion env file: $(promotion_env_file_state) ($PROMOTION_ENV — CCC_SKILL_PROMOTION_* knobs for the 2d collect and the results cron; process env wins; python3 \"$PROMOTER\" status shows config_file/effective)"
   echo "candidates report: $(ls -la "$STATE_DIR/skill-candidates.md" 2>/dev/null || echo none)"
   echo "-- ledger (last 5) --";      tail -5 "$LEDGER" 2>/dev/null
   echo "-- autosave installs (last 5) --"; tail -5 "$STATE_DIR/skill-autosave-install.jsonl" 2>/dev/null
@@ -956,6 +996,13 @@ if [ -f "$PROMOTER" ] && command -v python3 >/dev/null 2>&1; then
   # dispatches). Absent file stays non-fatal: an ordinary node has none and
   # reports publisher_enabled=false anyway.
   if [ -f "$EDGE_ENV" ]; then edge_state=loaded; else edge_state=absent; fi
+  # #2239: one presence line for the publisher config file (path and state,
+  # never a value). `unsafe` means it exists but was not sourced.
+  case "$(promotion_env_file_state)" in
+    present) log "promotion-env file=$PROMOTION_ENV present=yes sourced=yes" ;;
+    unsafe) log "promotion-env file=$PROMOTION_ENV present=yes sourced=no reason=not-owner-only" ;;
+    *) log "promotion-env file=$PROMOTION_ENV present=no" ;;
+  esac
   # The cron log keeps a truncated digest; the full collect result goes to
   # skill-promotion/last-collect.json (0600) so dispatch skip codes are
   # readable after the fact — the 500-byte cut hid `dispatch_broker_unreachable`

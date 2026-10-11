@@ -71,6 +71,14 @@ if secret_touch:
     state = "present" if os.environ.get("A2A_EDGE_SECRET") else "absent"
     with Path(secret_touch).open("a", encoding="utf-8") as handle:
         handle.write(args + " secret=" + state + "\n")
+# #2239: record the values of named probe variables as seen by this child —
+# fixture-only names, so the sourcing order (promotion env file < edge env <
+# process env) can be asserted without ever echoing a real secret.
+probe_touch = os.environ.get("PROMOTION_PROBE_TOUCH")
+if probe_touch:
+    names = os.environ.get("PROMOTION_PROBE_VARS", "").split()
+    with Path(probe_touch).open("a", encoding="utf-8") as handle:
+        handle.write(args + "".join(f" {n}={os.environ.get(n, '<unset>')}" for n in names) + "\n")
 # #2203: a collect child can be told to fail with a given stdout and exit code.
 if sys.argv[1:2] == ["collect"] and "PROMOTION_COLLECT_RC" in os.environ:
     sys.stdout.write(os.environ.get("PROMOTION_COLLECT_OUT", ""))
@@ -879,6 +887,73 @@ ok "#2232: a lock_timeout collect takes the failure branch with its code" \
   'grep -q "promotion-collect failed (non-fatal) edge-env=absent code=lock_timeout$" "$STATE17E/skill-autosave.log"'
 ok "#2232: the lock_timeout result is persisted as ok=false" \
   'jq -e ".ok == false and .code == \"lock_timeout\" and .status == \"locked\"" "$STATE17E/skill-promotion/last-collect.json" >/dev/null'
+
+# --- 18) #2239: the publisher config file is sourced before the edge env ------
+# Block 2d loads <CCC_SKILL_PROMOTION_ENV_FILE> into the collect child first,
+# then the edge env, and restores whatever the process env already carried —
+# so the order is file < edge env < process env, the file reaches collect only
+# (never the staging child), and a file that is not owner-only is left alone.
+PENV18="$TMP/promotion18.env"
+EDGE18="$TMP/edge18.env"
+printf 'export CCC_SKILL_PROMOTION_ORDER_PROBE="file"\nCCC_SKILL_PROMOTION_COLLECT_WINDOW=7\nCCC_SKILL_PROMOTION_FILE_ONLY=from-file\n' > "$PENV18"
+chmod 600 "$PENV18"
+printf 'export A2A_EDGE_SECRET=edge-secret-fixture-2239\nexport CCC_SKILL_PROMOTION_ORDER_PROBE=edge\n' > "$EDGE18"
+chmod 600 "$EDGE18"
+run18() { # <state> <probe-touch> [env...]
+  local state="$1" touch="$2"; shift 2
+  mkdir -p "$state/skill-promotion"; chmod 700 "$state" "$state/skill-promotion"
+  env "$@" CCC_STATE_DIR="$state" CLAUDE_PROJECTS_DIR="$TMP/projects18" \
+    CCC_PUSH_SPOOL="$TMP/spool18" CCC_SKILL_REVIEW_CMD="$REVIEW" \
+    CCC_SKILL_SCAN_CMD="$SCAN" SCAN_TOUCH="$TMP/scan18.touched" \
+    CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion18.touched" \
+    PROMOTION_PROBE_TOUCH="$touch" \
+    PROMOTION_PROBE_VARS="CCC_SKILL_PROMOTION_ORDER_PROBE CCC_SKILL_PROMOTION_COLLECT_WINDOW CCC_SKILL_PROMOTION_FILE_ONLY A2A_EDGE_SECRET" \
+    CLAUDE_SKILLS_DIR="$TMP/skills18" CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 \
+    CCC_NODE=testnode bash "$AUTOSAVE" run
+}
+# 18a) file + edge env + a process-env value: edge env wins over the file, the
+# process env wins over both, file-only keys reach the collect child.
+STATE18A="$TMP/state18a"
+run18 "$STATE18A" "$TMP/probe18a" CCC_SKILL_PROMOTION_ENV_FILE="$PENV18" CCC_A2A_EDGE_ENV="$EDGE18" \
+  CCC_SKILL_PROMOTION_COLLECT_WINDOW=9
+rc=$?
+ok "#2239: sweep with a promotion env file exits 0" '[ "$rc" = 0 ]'
+ok "#2239: file is sourced before the edge env (edge wins the shared key) and the process env wins the baked knob" \
+  'grep -qx "collect --lock-wait 120 CCC_SKILL_PROMOTION_ORDER_PROBE=edge CCC_SKILL_PROMOTION_COLLECT_WINDOW=9 CCC_SKILL_PROMOTION_FILE_ONLY=from-file A2A_EDGE_SECRET=edge-secret-fixture-2239" "$TMP/probe18a"'
+ok "#2239: the staging child sees neither file (only collect loads them)" \
+  'grep -qx "run --lock-wait 120 CCC_SKILL_PROMOTION_ORDER_PROBE=<unset> CCC_SKILL_PROMOTION_COLLECT_WINDOW=9 CCC_SKILL_PROMOTION_FILE_ONLY=<unset> A2A_EDGE_SECRET=<unset>" "$TMP/probe18a"'
+ok "#2239: presence line is logged with the path and without values" \
+  'grep -q "promotion-env file=$PENV18 present=yes sourced=yes" "$STATE18A/skill-autosave.log" && ! grep -q "from-file" "$STATE18A/skill-autosave.log"'
+ok "#2239: the edge secret still never reaches the log" '! grep -q "edge-secret-fixture-2239" "$STATE18A/skill-autosave.log"'
+# 18b) file only (no edge env): the file's own value shows, proving it was sourced.
+STATE18B="$TMP/state18b"
+run18 "$STATE18B" "$TMP/probe18b" CCC_SKILL_PROMOTION_ENV_FILE="$PENV18" CCC_A2A_EDGE_ENV="$TMP/no-such-edge.env"
+ok "#2239: without an edge env the file value stands" \
+  'grep -qx "collect --lock-wait 120 CCC_SKILL_PROMOTION_ORDER_PROBE=file CCC_SKILL_PROMOTION_COLLECT_WINDOW=7 CCC_SKILL_PROMOTION_FILE_ONLY=from-file A2A_EDGE_SECRET=<unset>" "$TMP/probe18b"'
+# 18c) a group/other-readable file is not sourced and the log says so.
+PENV18C="$TMP/promotion18c.env"; cp "$PENV18" "$PENV18C"; chmod 644 "$PENV18C"
+STATE18C="$TMP/state18c"
+run18 "$STATE18C" "$TMP/probe18c" CCC_SKILL_PROMOTION_ENV_FILE="$PENV18C" CCC_A2A_EDGE_ENV="$TMP/no-such-edge.env"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "#2239: a 0644 promotion env file is non-fatal" '[ "$rc" = 0 ]'
+ok "#2239: a 0644 promotion env file is not sourced" \
+  'grep -qx "collect --lock-wait 120 CCC_SKILL_PROMOTION_ORDER_PROBE=<unset> CCC_SKILL_PROMOTION_COLLECT_WINDOW=<unset> CCC_SKILL_PROMOTION_FILE_ONLY=<unset> A2A_EDGE_SECRET=<unset>" "$TMP/probe18c"'
+ok "#2239: the unsafe file is logged as present but not sourced" \
+  'grep -q "promotion-env file=$PENV18C present=yes sourced=no reason=not-owner-only" "$STATE18C/skill-autosave.log"'
+# 18d) absent file: logged as present=no; status shows presence next to the edge env line.
+STATE18D="$TMP/state18d"
+run18 "$STATE18D" "$TMP/probe18d" CCC_SKILL_PROMOTION_ENV_FILE="$TMP/no-such-promotion.env" CCC_A2A_EDGE_ENV="$TMP/no-such-edge.env"
+ok "#2239: an absent promotion env file is logged as present=no" \
+  'grep -q "promotion-env file=$TMP/no-such-promotion.env present=no" "$STATE18D/skill-autosave.log"'
+# shellcheck disable=SC2034  # read via eval inside ok()
+status18="$(CCC_STATE_DIR="$STATE18A" CCC_SKILL_PROMOTION_ENV_FILE="$PENV18" CCC_A2A_EDGE_ENV="$EDGE18" bash "$AUTOSAVE" status 2>&1)"
+ok "#2239: status reports the promotion env file as present next to the edge env line, never its content" \
+  'printf "%s" "$status18" | grep -q "^promotion env file: present" && printf "%s" "$status18" | grep -q "^a2a edge env: present" && ! printf "%s" "$status18" | grep -q "from-file"'
+# shellcheck disable=SC2034  # read via eval inside ok()
+status18c="$(CCC_STATE_DIR="$STATE18C" CCC_SKILL_PROMOTION_ENV_FILE="$PENV18C" bash "$AUTOSAVE" status 2>&1)"
+ok "#2239: status reports a 0644 promotion env file as unsafe" \
+  'printf "%s" "$status18c" | grep -q "^promotion env file: unsafe"'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -1160,10 +1160,10 @@ run_cd() {  # <cron-text> [repo-dir]
 }
 
 cd_out="$(run_cd "")"
-ok "empty crontab: nine opt-in rows, all 정상" \
-  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 9 ]'
-ok "empty crontab: rows are the nine known markers" \
-  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen tunnel-audit\", \"cron gen t2-starvation-observe\", \"cron gen nunchi\", \"cron gen timed-test-deadline-scan\"]" <<<"$cd_out" >/dev/null'
+ok "empty crontab: ten opt-in rows, all 정상" \
+  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 10 ]'
+ok "empty crontab: rows are the ten known markers" \
+  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen tunnel-audit\", \"cron gen t2-starvation-observe\", \"cron gen nunchi\", \"cron gen timed-test-deadline-scan\", \"cron gen skill-promotion-results\"]" <<<"$cd_out" >/dev/null'
 
 full_cron="# ccc-node:memory-refresh:begin
 */30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=$gen_mr

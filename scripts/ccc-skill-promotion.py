@@ -122,6 +122,35 @@ class PromotionError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ConfigFile:
+    """Where the publisher knobs came from (#2239), for `status`.
+
+    Key names and counts only — never a value — so the block is safe to log.
+    ``error`` is set when the file exists but was ignored (not a regular
+    owner-only file we own, too large, not UTF-8); the sweep never fails on it.
+    """
+
+    path: str
+    present: bool
+    error: str | None = None
+    applied_keys: tuple[str, ...] = ()
+    overridden_keys: tuple[str, ...] = ()
+    ignored_keys: int = 0
+    malformed_lines: int = 0
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "present": self.present,
+            "error": self.error,
+            "applied_keys": list(self.applied_keys),
+            "overridden_keys": list(self.overridden_keys),
+            "ignored_keys": self.ignored_keys,
+            "malformed_lines": self.malformed_lines,
+        }
+
+
+@dataclass(frozen=True)
 class Config:
     home: Path
     state_dir: Path
@@ -176,6 +205,8 @@ class Config:
     # #2153: an uncollected servable envelope older than this is reported as
     # `outbox.stale` so a collector reading the wrong account is not silent.
     outbox_stale_hours: int = 72
+    # #2239: the optional publisher config file this Config was resolved with.
+    config_file: ConfigFile | None = None
 
 
 @dataclass(frozen=True)
@@ -408,9 +439,87 @@ def _danso_root(env: dict[str, str]) -> Path | None:
     return Path(raw).absolute() if raw else None
 
 
+# #2239: optional publisher config file. The knobs above used to live only in
+# the process environment, so a cron line and an interactive `status` could
+# resolve different values and nothing showed which. The file is read on every
+# `_config`, keys are applied with setdefault semantics (process env wins), and
+# only `CCC_SKILL_PROMOTION_*` keys are accepted — anything else (an edge secret
+# in the wrong file, HOME, PATH) is counted and dropped, never applied. A file
+# that is not a regular owner-only file we own is ignored and reported in
+# `status.config_file`; it never fails the sweep.
+_CONFIG_FILE_DEFAULT_REL = (".config", "ccc-node", "skill-promotion.env")
+_CONFIG_FILE_MAX_BYTES = 16384
+_CONFIG_FILE_KEY_PREFIX = "CCC_SKILL_PROMOTION_"
+_CONFIG_FILE_PATH_KEY = "CCC_SKILL_PROMOTION_ENV_FILE"
+_CONFIG_FILE_LINE_RE = re.compile(r"^(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)$")
+
+
+def _config_file_path(env: dict[str, str], home: Path) -> Path:
+    raw = env.get(_CONFIG_FILE_PATH_KEY)
+    return Path(raw).absolute() if raw else home.joinpath(*_CONFIG_FILE_DEFAULT_REL)
+
+
+def _config_file_value(raw: str) -> str:
+    """One `KEY=value` right-hand side: simple surrounding quotes are stripped;
+    an unquoted value ends at a ` # comment`, as it would for `. file`."""
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
+
+
+def _apply_config_file(env: dict[str, str], home: Path) -> ConfigFile:
+    path = _config_file_path(env, home)
+    try:
+        payload, _ = _secure_fs.read_owner_only_bytes(
+            path, max_bytes=_CONFIG_FILE_MAX_BYTES, owner_id=os.geteuid(), unsafe_mode_mask=0o077
+        )
+        text = payload.decode("utf-8")
+    except FileNotFoundError:
+        return ConfigFile(path=str(path), present=False)
+    except _secure_fs.SecureFsError as error:
+        return ConfigFile(path=str(path), present=True, error=f"config_file_{error.reason}")
+    except OSError:
+        return ConfigFile(path=str(path), present=True, error="config_file_unreadable")
+    except UnicodeDecodeError:
+        return ConfigFile(path=str(path), present=True, error="config_file_not_utf8")
+    applied: list[str] = []
+    overridden: list[str] = []
+    ignored = malformed = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _CONFIG_FILE_LINE_RE.match(line)
+        if match is None:
+            malformed += 1
+            continue
+        key = match.group(1)
+        if not key.startswith(_CONFIG_FILE_KEY_PREFIX) or key == _CONFIG_FILE_PATH_KEY:
+            ignored += 1
+            continue
+        if key in applied:  # repeated in the file: the later line wins, like `. file`
+            env[key] = _config_file_value(match.group(2))
+        elif key in env:  # process env wins over the file
+            if key not in overridden:
+                overridden.append(key)
+        else:
+            env[key] = _config_file_value(match.group(2))
+            applied.append(key)
+    return ConfigFile(
+        path=str(path),
+        present=True,
+        applied_keys=tuple(applied),
+        overridden_keys=tuple(overridden),
+        ignored_keys=ignored,
+        malformed_lines=malformed,
+    )
+
+
 def _config(environment: dict[str, str] | None = None) -> Config:
     env = dict(os.environ if environment is None else environment)
     home = (Path(env["HOME"]) if env.get("HOME") else Path.home()).absolute()
+    config_file = _apply_config_file(env, home)
     claude_dir = Path(env.get("CCC_CLAUDE_DIR", home / ".claude")).absolute()
     state_dir = Path(env.get("CCC_STATE_DIR", claude_dir / "state")).absolute()
     promotion_state_dir = Path(
@@ -575,6 +684,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         review_llm_cmd=review_llm_cmd,
         autonomy=_autonomy_state(env, state_dir, trust_root=home),
         remote_brokers=_parse_remote_brokers(env.get("CCC_SKILL_PROMOTION_REMOTE_BROKERS", "")),
+        config_file=config_file,
     )
 
 
@@ -1768,6 +1878,27 @@ def _remote_ack(node: str, transport_id: str) -> None:
         raise PromotionError("remote_ack_failed")
 
 
+def _effective_knobs(config: Config) -> dict[str, object]:
+    """The bounded knobs exactly as a cron run resolves them (#2239): env,
+    config file and defaults already combined, so `status` and the scheduled
+    collect cannot disagree silently."""
+    return {
+        "max_prs_per_run": config.max_prs,
+        "revise_daily_cap": config.revise_daily_cap,
+        "revise_round_limit": config.revise_round_limit,
+        "collect_window": config.collect_window,
+        "outbox_stale_hours": config.outbox_stale_hours,
+        "dispatch_ci_wait_sec": config.dispatch_ci_wait_sec,
+        "remote_brokers": len(config.remote_brokers),
+        "providers": list(config.providers),
+        "collect_nodes": len(config.collect_nodes),
+    }
+
+
+def _config_file_summary(config: Config) -> dict[str, object] | None:
+    return config.config_file.summary() if config.config_file is not None else None
+
+
 def _status(config: Config) -> dict[str, object]:
     if not config.enabled:
         return {
@@ -1776,6 +1907,8 @@ def _status(config: Config) -> dict[str, object]:
             "enabled": False,
             "publisher_enabled": config.publisher_enabled,
             "autonomy": config.autonomy,
+            "config_file": _config_file_summary(config),
+            "effective": _effective_knobs(config),
             "candidates": [],
             "blocked": [],
         }
@@ -1786,6 +1919,8 @@ def _status(config: Config) -> dict[str, object]:
         "enabled": True,
         "publisher_enabled": config.publisher_enabled,
         "autonomy": config.autonomy,
+        "config_file": _config_file_summary(config),
+        "effective": _effective_knobs(config),
         "repo": config.repo,
         "max_prs_per_run": config.max_prs,
         "collect_nodes": list(config.collect_nodes),
