@@ -976,13 +976,16 @@ class Config(
     # #2227: relay mode moved *every* spool record into the fleet room, including
     # owner-personal notices (important mail, schedule brief) that used to reach
     # the agent's own room. Listed events keep the pre-#2182 owner-room path.
+    # #2242: ccc-node self-update notices belong to the node they describe, so
+    # `SelfUpdate` is listed by default. An explicit value replaces the default.
     push_fleet_relay_direct_events: str = Field(
-        default="",
+        default="SelfUpdate",
         alias="CCC_PUSH_FLEET_RELAY_DIRECT_EVENTS",
         description=(
             "Relay mode only: comma-separated spool record `event` values delivered to the "
             "owner room as the agent instead of the fleet relay (e.g. `mail,schedule-brief`). "
-            "Empty (default) = every record goes to the relay."
+            "Default `SelfUpdate`; an explicit value replaces it (list `SelfUpdate` to keep "
+            "it); empty = every record goes to the relay."
         ),
     )
     # #2207: in relay mode the spool notifier starts BEFORE the Matrix transport

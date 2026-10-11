@@ -131,7 +131,7 @@ agent room receives nothing.
 | `CCC_PUSH_FLEET_RELAY_SECRET_FILE` | owner-only (0600, no symlink) file with the shared secret |
 | `CCC_PUSH_FLEET_NODE` | node name in the payload; empty = `CCC_NODE` or short hostname |
 | `CCC_PUSH_FLEET_RELAY_TIMEOUT` | seconds per record (default 10) |
-| `CCC_PUSH_FLEET_RELAY_DIRECT_EVENTS` | comma-separated record `event` values kept in the owner room as the agent (#2227); empty (default) = everything to the relay |
+| `CCC_PUSH_FLEET_RELAY_DIRECT_EVENTS` | comma-separated record `event` values kept in the owner room as the agent (#2227); default `SelfUpdate` (#2242); an explicit value replaces the default; empty = everything to the relay |
 
 **Owner-personal notices (#2227).** Relay mode is meant for operational
 alerts. Notices that are the owner's own business rather than fleet state —
@@ -145,6 +145,13 @@ waits in the spool — later listed records wait behind it so their order
 holds — while relay records keep draining, and the transport-failed exit
 drain does not wait on them. With no direct/family room configured a listed
 record goes to the relay instead of being dropped.
+
+**Self-update notices (#2242).** `SelfUpdate` is listed by default, so each
+node's ccc-node self-update notice lands in that node's own room rather than
+the fleet room. A node that sets the variable explicitly replaces the
+default — keep `SelfUpdate` in its list to keep this behaviour, or set an
+empty value to send everything to the relay. A node whose
+`~/.claude/self-update.notify` is `none` writes no `SelfUpdate` record at all.
 
 Semantics are otherwise unchanged: `sent/` archive, dedup window, rate
 limit and fan-out mirrors behave exactly as in owner-room mode. A 2xx

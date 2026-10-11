@@ -166,6 +166,8 @@ FILES_DIRECT_ONLY = "📎 답변에 파일 {count}개가 있지만, 파일은 �
 FILES_SKIPPED = "📎 파일 {count}개는 보내지 않았습니다(프로젝트 폴더 밖이거나 한 번에 보낼 수 있는 {limit}개 초과).".replace("{limit}", str(MAX_FILES_PER_TURN))
 STATUS_MIN_INTERVAL_S = 5.0  # match Telegram CCC_HEARTBEAT_* defaults (15 -> 10 owner 2026-10-09, 10 -> 5 owner 2026-10-11)
 _HEALTH_INTERVAL_S = 10.0  # match bot_lifecycle._WORKLOAD_INTERVAL
+# #2242: matches the `push_fleet_relay_direct_events` config default.
+DEFAULT_FLEET_RELAY_DIRECT_EVENTS = "SelfUpdate"
 # #1820: a /sync long-poll returns within ~25s (40s HTTP ceiling), so a commit
 # older than this means the receive leg is stuck; the same budget covers the
 # first sync after start. An outbox head undelivered this long is stuck too.
@@ -403,9 +405,13 @@ class MatrixSpoolNotifier:
         # #2227: events that stay in the owner room even in relay mode
         # (owner-personal notices such as important mail). Ignored outside
         # relay mode, where every record already goes to the owner room.
+        # #2242: the fallback follows the config default (`SelfUpdate`); an
+        # explicit empty value still means "everything to the relay".
         self.direct_events: frozenset[str] = frozenset(
             e.strip()
-            for e in str(getattr(settings, "push_fleet_relay_direct_events", "") or "").split(",")
+            for e in str(
+                getattr(settings, "push_fleet_relay_direct_events", DEFAULT_FLEET_RELAY_DIRECT_EVENTS) or ""
+            ).split(",")
             if e.strip()
         )
 
