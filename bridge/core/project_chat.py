@@ -123,7 +123,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-TYPING_INTERVAL = 4  # Telegram typing status expires after ~5s
+# Turn-loop tick: typing refresh (Telegram typing status expires after ~5s) and
+# the heartbeat check share it. 2.5 divides the 5s heartbeat default so the
+# "Working" bubble refreshes on a 5s cadence instead of the next 4s tick (8s).
+TYPING_INTERVAL = 2.5
 TYPING_MAX_NO_PROGRESS_SECONDS = _env_int("CCC_TYPING_MAX_NO_PROGRESS_SECONDS", 600)
 
 from telegram_bot.core.project_chat_history import ProjectChatHistoryMixin  # noqa: E402
@@ -1359,8 +1362,8 @@ class ProjectChatHandler(
             if last_event > 0 and now - last_event >= stall_seconds:
                 silent_seconds = now - last_event
 
-        threshold = float(getattr(config, "heartbeat_threshold_seconds", 10.0))
-        interval = float(getattr(config, "heartbeat_update_interval_seconds", 10.0))
+        threshold = float(getattr(config, "heartbeat_threshold_seconds", 5.0))
+        interval = float(getattr(config, "heartbeat_update_interval_seconds", 5.0))
         if not should_update_heartbeat(
             now=now,
             started_at=req.started_at,
