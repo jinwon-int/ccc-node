@@ -613,6 +613,54 @@ out="$(tool_torn automatic-usage 2>/dev/null)"
 rc=$?
 ok "torn tail inside a multi-byte character is tolerated" '[ "$rc" = 0 ] && jq -e ".ownership_ledger_torn_tail == 1" >/dev/null <<<"$out"'
 
+# --- fleet-skills sync marker (#2239) -----------------------------------------
+# A .ccc-fleet-skill.json install is its own class: reported, never
+# autonomous-writable, never adoptable into the autosave lifecycle.
+fleet_marker() { # <name> [manager] [provider] — the sync's marker() shape
+  jq -nc --arg n "$1" --arg m "${2:-ccc-node-fleet-skills}" --arg p "${3:-claude}" '{
+    schema_version: 1, manager: $m, repo: "jinwon-int/fleet-skills",
+    commit: "0123456789abcdef0123456789abcdef01234567", provider: $p,
+    audience: "all", name: $n, tree_sha256: "00", source_candidate_id: null,
+    source_tree_sha256: "00", reviewed_by: null
+  }' > "$SKILLS/$1/.ccc-fleet-skill.json"
+  chmod 600 "$SKILLS/$1/.ccc-fleet-skill.json"
+}
+make_skill fleet-one
+fleet_marker fleet-one
+out="$(tool status fleet-one)"
+ok "fleet marker classifies fleet-managed" 'jq -e ".skills[0].classification == \"fleet-managed\" and .skills[0].base_classification == \"fleet-managed\" and .skills[0].reason == \"fleet-skills-marker\"" >/dev/null <<<"$out"'
+ok "fleet-managed skill is autonomous read-only" 'jq -e "(.skills[0].autonomous_write_allowed | not) and .skills[0].provenance_revision == 1" >/dev/null <<<"$out"'
+out="$(tool list-unmanaged)"
+ok "list-unmanaged reports the fleet-managed skill" 'jq -e "[.skills[] | select(.name == \"fleet-one\" and .base_classification == \"fleet-managed\")] | length == 1" >/dev/null <<<"$out"'
+out="$(tool adopt fleet-one)"; rc=$?
+ok "fleet-managed skill cannot be adopted into autosave" '[ "$rc" != 0 ] && jq -e ".code == \"adopt_denied_fleet-managed\"" >/dev/null <<<"$out"'
+out="$(tool mark-created fleet-one)"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "fleet-managed skill cannot be marked autosave-created" '[ "$rc" != 0 ] && jq -e ".code == \"mark_created_denied\"" >/dev/null <<<"$out"'
+out="$(tool pin fleet-one)"
+ok "fleet-managed skill stays pinnable" 'jq -e ".changed == true" >/dev/null <<<"$out"'
+out="$(tool unpin fleet-one)"
+ok "fleet-managed pin stays removable" 'jq -e ".changed == true" >/dev/null <<<"$out"'
+make_skill fleet-adopted
+tool adopt fleet-adopted >/dev/null
+fleet_marker fleet-adopted
+out="$(tool status fleet-adopted)"
+ok "fleet marker outranks an autosave marker" 'jq -e ".skills[0].base_classification == \"fleet-managed\" and .skills[0].reason == \"fleet-marker-conflicts-with-autosave\" and (.skills[0].autonomous_write_allowed | not)" >/dev/null <<<"$out"'
+make_skill fleet-loose
+fleet_marker fleet-loose
+chmod 644 "$SKILLS/fleet-loose/.ccc-fleet-skill.json"
+out="$(tool status fleet-loose)"
+ok "non-0600 fleet marker fails closed" 'jq -e ".skills[0].classification == \"unknown/unreadable\"" >/dev/null <<<"$out"'
+make_skill fleet-foreign
+fleet_marker fleet-foreign some-other-manager
+out="$(tool status fleet-foreign)"
+ok "foreign-manager fleet marker fails closed" 'jq -e ".skills[0].classification == \"unknown/unreadable\" and .skills[0].reason == \"fleet_metadata_invalid\"" >/dev/null <<<"$out"'
+make_skill fleet-codex
+fleet_marker fleet-codex ccc-node-fleet-skills codex
+out="$(tool status fleet-codex)"
+ok "fleet marker for another provider fails closed" 'jq -e ".skills[0].classification == \"unknown/unreadable\"" >/dev/null <<<"$out"'
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

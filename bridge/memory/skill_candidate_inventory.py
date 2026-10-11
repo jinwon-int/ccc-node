@@ -32,6 +32,8 @@ _SAFE_CLASSIFICATIONS = {
     "autosave-managed",
     "pinned",
     "managed/bundled",
+    # ownership.py's fleet-skills sync class (#2239); read-only like the rest.
+    "fleet-managed",
     "external/repo-installed",
     "user-owned",
     "unknown/unreadable",
