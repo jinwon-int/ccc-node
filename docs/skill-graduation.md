@@ -17,6 +17,12 @@ graduates into ccc-node, and the fleet-skills copy retires.
 
 - [ ] **Dwell time**: at least 2 weeks in fleet-skills `approved/` after its
       intake PR merged, with recorded real usage (which nodes ran it).
+      `scripts/ccc-skill-usage-report.py aggregate` lists fleet-managed
+      skills used on at least 2 nodes or 3 times in the window, together
+      with the earliest install time on the fleet. A `dwell: met` there
+      proves at least 14 days on a node; `unconfirmed` means check the
+      intake PR merge date. See
+      [`skill-usage-report.md`](skill-usage-report.md).
 - [ ] **No node-specific facts**: `/home/<user>` paths, IPs, emails,
       internal hostnames — the autosave gates check this at intake; re-check
       by eye before making it public.
@@ -95,6 +101,7 @@ repo-managed  (setup.sh install / codex provisioner; provenance:
 | `ccc-fleet-skills-sync.py` | target carries repo ownership (manifest entry for the claude root, `.ccc-node-managed.json` for the codex root) → reports `skip-repo-managed`, installs nothing. A fleet marker-less target that is the autosave layer's own draft (`.autosave-meta.json` naming the skill) or a byte-identical copy → `adopt` (backup-and-replace, prior bytes kept in `backups/<commit>/`). Any other marker-less target → `skip-user-owned` for that one skill; the rest of the apply proceeds and the skip is listed in `skipped_user_owned` and the `state/fleet-skills/last-run.json` receipt for doctor. |
 | `setup.sh` (`install_repo_skills_into`) | a fleet-installed copy of a repo skill is absorbed: repo bytes replace it, the fleet marker disappears, and the absorption is logged. |
 | autosave installer | already refuses to overwrite non-autosave directories (dedup gate). |
+| `skill-review/ownership.py` + `curator.py` | a `.ccc-fleet-skill.json` copy is its own class, `fleet-managed` (#2239). It ranks above an autosave marker in the same directory, is never autonomous-writable or adoptable, and is reported but never archived by the local curator. Retiring it means moving it out of `approved/` in fleet-skills. |
 
 The transition window (a graduated PR merged on main, nodes not yet
 re-run setup) is safe by construction: fleet-sync keeps updating the

@@ -175,6 +175,33 @@ def test_every_status_metadata_field_is_sanitized(tmp_path: Path) -> None:
     assert row["description_excluded_reason"] == "metadata_injected_directive"
 
 
+def test_fleet_managed_classification_is_reported_verbatim(tmp_path: Path) -> None:
+    """#2239: ownership.py's fleet-skills class is a known, safe label."""
+    skills = tmp_path / "skills"
+    state = tmp_path / "state"
+    skills.mkdir(mode=0o700)
+    state.mkdir(mode=0o700)
+    builder = _builder(skills, state)
+    builder._status = lambda: [  # type: ignore[method-assign]
+        {
+            "name": "fleet-one",
+            "classification": "fleet-managed",
+            "reason": "fleet-skills-marker",
+            "description": "A fleet-approved workflow.",
+            "autonomous_write_allowed": False,
+            "base_classification": "fleet-managed",
+            "pinned": False,
+        }
+    ]
+
+    inventory = builder.build()
+
+    assert inventory["writable"] == []
+    row = inventory["read_only_overlaps"][0]
+    assert row["classification"] == "fleet-managed"
+    assert "classification_excluded_reason" not in row
+
+
 def test_overlap_description_decodes_yaml_quoted_line(tmp_path: Path) -> None:
     """#2032: a writer-quoted description reaches the inventory without quotes."""
     skills, state = _make_managed_skill(tmp_path)

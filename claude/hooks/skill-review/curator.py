@@ -4,8 +4,9 @@
 Scope and safety contract:
 
 - Only ``autosave-managed`` skills (ownership provenance from ownership.py) are
-  lifecycle-eligible. user-owned, managed/bundled, external/repo-installed and
-  unknown skills are observed for telemetry but never auto-transitioned.
+  lifecycle-eligible. user-owned, managed/bundled, fleet-managed,
+  external/repo-installed and unknown skills are observed for telemetry but
+  never auto-transitioned.
 - No permanent deletion anywhere: the maximum destructive action is an atomic
   move into the owner-only archive root on the same filesystem, and every
   archived skill can be restored.
@@ -13,9 +14,16 @@ Scope and safety contract:
   skills idle past the stale window as ``stale`` (an observation/candidate
   list — nothing moves) and, once a stale skill has stayed idle for a full
   recheck window, reports it as an ``archive-candidate``. Automatic archive
-  moves happen only with CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true; otherwise an
-  archive move is an operator action (PR-first + owner approval). Backup pruning follows an explicit retention
+  moves happen only with CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true, and even
+  then only for a stage-2 candidate (#2239): a skill already marked stale,
+  at least RECHECK_AFTER_DAYS past that mark, unused since the mark and idle
+  past the ARCHIVE_AFTER_DAYS floor. The opt-in never skips the stale mark.
+  Otherwise an archive move is an operator action (PR-first + owner
+  approval). Backup pruning follows an explicit retention
   cap and never touches the newest ``keep`` snapshots.
+- fleet-managed skills (``.ccc-fleet-skill.json``, written by
+  ccc-fleet-skills-sync.py) are reported but never transitioned here: their
+  retirement goes through the fleet-skills repo's ``retired/`` flow.
 - "Idle" is judged on the UNION of two usage ledgers (owner decision #1739):
   the Skill-tool record in ``skill-autosave-usage.json`` and the Read|Skill
   ledger ``skill-usage/usage.jsonl``. Either one showing use in the window
@@ -1416,7 +1424,9 @@ def _decide(
     Mirrors the Hermes semantics: anchor = last activity or created_at;
     never-used skills younger than the stale window get a grace pass; stale
     skills with fresh activity reactivate. With archive disabled (the default,
-    #2011) the decision is mark-only and never returns ``archive``.
+    #2011) the decision is mark-only and never returns ``archive``; with it
+    enabled ``archive`` is returned only for a stage-2 candidate past the
+    ARCHIVE_AFTER_DAYS floor (#2239), never for an unmarked skill.
 
     Owner decision #1739: activity is the union of the Skill-tool record and
     ``ledger_used_at`` (latest usage.jsonl row for this skill). When
@@ -1456,31 +1466,37 @@ def _decide_union(
         if state == "stale":
             return "reactivate", "never-used-grace"
         return "keep", "never-used-grace"
-    if not config.get("archive_enabled", False):
-        return _decide_mark_only(record, now, config, anchor, stale_cutoff)
+    action, reason = _decide_two_stage(record, now, config, anchor, stale_cutoff)
+    if action != "archive-candidate" or not config.get("archive_enabled", False):
+        return action, reason
+    # Explicit archive opt-in (#2239): only a stage-2 candidate may move, and
+    # never before the ARCHIVE_AFTER_DAYS idle floor — enabling archive can
+    # only make the lifecycle slower than mark-only, never skip a stage.
     if anchor <= archive_cutoff:
-        return "archive", f"idle>{config['archive_after_days']}d"
-    if anchor <= stale_cutoff and state == "active":
-        return "mark-stale", f"idle>{config['stale_after_days']}d"
-    if anchor > stale_cutoff and state == "stale":
-        return "reactivate", "fresh-activity"
-    return "keep", "within-window"
+        return "archive", f"stale>={config['recheck_after_days']}d-still-idle"
+    return (
+        "archive-candidate",
+        f"stale>={config['recheck_after_days']}d-still-idle;"
+        f"below-archive-floor-{config['archive_after_days']}d",
+    )
 
 
-def _decide_mark_only(
+def _decide_two_stage(
     record: dict[str, Any],
     now: datetime,
     config: dict[str, Any],
     anchor: datetime,
     stale_cutoff: datetime,
 ) -> tuple[str, str]:
-    """Two-stage mark-only lifecycle (#2011, owner decision #1739).
+    """Two-stage lifecycle (#2011, owner decision #1739, #2239).
 
     Stage 1: idle past the stale window -> ``mark-stale`` (observation list;
     the skill stays live). Stage 2: still idle after staying stale for a full
-    recheck window -> ``archive-candidate``, a report-only decision. Nothing
-    is ever moved here: the archive move itself stays an operator action
-    (PR-first + owner approval) or the explicit ARCHIVE_ENABLED opt-in.
+    recheck window, with no use since the mark -> ``archive-candidate``. This
+    function never returns ``archive``: _decide_union upgrades a stage-2
+    candidate to an archive move only under the explicit ARCHIVE_ENABLED
+    opt-in; otherwise the move stays an operator action (PR-first + owner
+    approval).
     """
     state = record["state"]
     if anchor > stale_cutoff:
@@ -1494,10 +1510,16 @@ def _decide_mark_only(
         # Stale since before the two-stage clock existed: start its recheck
         # window now instead of promoting it straight to a candidate.
         return "mark-stale", "recheck-window-start"
+    if anchor > marked_at:
+        # Used after the mark but idle again past the stale window (no run
+        # saw the use in between): the recheck clock restarts from now — a
+        # use inside the recheck window always resets stage 2.
+        return "mark-stale", "used-since-mark-recheck-restart"
     if marked_at <= now - timedelta(days=config["recheck_after_days"]):
+        suffix = "" if config.get("archive_enabled", False) else ";archive-disabled"
         return (
             "archive-candidate",
-            f"stale>={config['recheck_after_days']}d-still-idle;archive-disabled",
+            f"stale>={config['recheck_after_days']}d-still-idle{suffix}",
         )
     return "keep", "stale-observing"
 

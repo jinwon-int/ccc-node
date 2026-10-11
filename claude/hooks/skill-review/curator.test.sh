@@ -26,8 +26,10 @@ SKILLS="$TMP/skills"
 mkdir -m 700 "$STATE" "$SKILLS"
 
 # Sections 1-12 pin the automatic archive contract (#752), which since #2011 is
-# an explicit opt-in. The default two-stage mark-only lifecycle (#1739) is
-# covered by section 13, which unsets this again.
+# an explicit opt-in and since #2239 only moves a skill already marked stale
+# for a full recheck window (so every archive below is preceded by a marking
+# run). The default two-stage mark-only lifecycle (#1739) is covered by
+# section 13, which unsets this again; section 15 pins the opt-in stages.
 export CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true
 
 tool() {
@@ -124,16 +126,20 @@ ok "managed/bundled skill is never auto-archived" '[ -d "$SKILLS/managedone" ] &
 # --- 5. dry-run is mutation-free ----------------------------------------------
 make_managed gamma
 tool run >/dev/null
+out="$(at 300 run)"
+ok "archive opt-in: an unmarked skill far past the floor is only marked (#2239)" 'jq -e "[.decisions[] | select(.name == \"gamma\") | .action] == [\"mark-stale\"]" >/dev/null <<<"$out" && [ -d "$SKILLS/gamma" ]'
 # shellcheck disable=SC2034  # before_ledger is read via eval inside ok()
 before_ledger="$(ledger_rows)"
 # shellcheck disable=SC2034  # before_backups is read via eval inside ok()
 before_backups="$(ls "$STATE/skill-autosave-curator-backups" 2>/dev/null | wc -l)"
-out="$(at 300 run --dry-run)"
-ok "dry-run reports the would-archive" 'jq -e ".counts.archived == 1 and .dry_run == true" >/dev/null <<<"$out"'
+# shellcheck disable=SC2034  # before_runs is read via eval inside ok()
+before_runs="$(jq -r .run_count "$STATE/skill-autosave-curator-state.json")"
+out="$(at 331 run --dry-run)"
+ok "dry-run reports the would-archive" 'jq -e "([.decisions[] | select(.name == \"gamma\" and .action == \"archive\")] | length == 1) and .dry_run == true" >/dev/null <<<"$out"'
 ok "dry-run leaves the skill live" '[ -d "$SKILLS/gamma" ]'
 ok "dry-run appends no ledger rows" '[ "$(ledger_rows)" = "$before_ledger" ]'
 ok "dry-run takes no backup" '[ "$(ls "$STATE/skill-autosave-curator-backups" 2>/dev/null | wc -l)" = "$before_backups" ]'
-ok "dry-run does not advance run state" '! grep -q "run_count.: .[1-9]" "$STATE/skill-autosave-curator-state.json" 2>/dev/null'
+ok "dry-run does not advance run state" '[ "$(jq -r .run_count "$STATE/skill-autosave-curator-state.json")" = "$before_runs" ]'
 
 # --- 6. manual archive / restore fail-closed ----------------------------------
 out="$(tool archive gamma)"
@@ -162,8 +168,9 @@ ok "list-backups is readable" 'jq -e "[.backups[] | select(.readable)] | length 
 # rollback: archive beta-class skill, then roll back to the pre-archive backup
 make_managed delta
 tool run >/dev/null
-out="$(at 400 run)"
-ok "delta archived at 400d" 'jq -e "[.decisions[] | select(.name == \"delta\" and .action == \"archive\")] | length == 1" >/dev/null <<<"$out" && [ ! -e "$SKILLS/delta" ]'
+at 400 run >/dev/null  # stage 1: mark delta stale (#2239)
+out="$(at 431 run)"
+ok "delta archived one recheck window after its mark" 'jq -e "[.decisions[] | select(.name == \"delta\" and .action == \"archive\")] | length == 1" >/dev/null <<<"$out" && [ ! -e "$SKILLS/delta" ]'
 pre_archive_backup="$(jq -r ".backup.backup_id" <<<"$out")"
 out="$(at 400 rollback --id "$pre_archive_backup" --dry-run)"
 ok "rollback dry-run plans restore-archived" 'jq -e "[.planned[] | select(.name == \"delta\" and .action == \"restore-archived\")] | length == 1" >/dev/null <<<"$out"'
@@ -171,8 +178,10 @@ ok "rollback dry-run changes nothing" '[ ! -e "$SKILLS/delta" ]'
 out="$(at 400 rollback --id "$pre_archive_backup")"
 ok "rollback restores the archived skill" 'jq -e ".changed == true" >/dev/null <<<"$out" && [ -f "$SKILLS/delta/SKILL.md" ]'
 ok "rollback takes a safety snapshot first" 'jq -e ".safety_backup_id != \"$pre_archive_backup\"" >/dev/null <<<"$out"'
-out="$(at 400 status delta)"
-ok "rolled-back skill is active again" 'jq -e ".skills[0].telemetry.state == \"active\"" >/dev/null <<<"$out"'
+out="$(at 431 status delta)"
+# The pre-archive backup holds delta's stage-1 mark, so the rollback returns it
+# to that live, stale-observing state (#2239) rather than to archived.
+ok "rolled-back skill is live in its pre-archive stale state" 'jq -e ".skills[0].telemetry.state == \"stale\"" >/dev/null <<<"$out" && [ -f "$SKILLS/delta/SKILL.md" ]'
 out="$(at 400 rollback --id "bad id")"; rc=$?
 ok "rollback rejects a malformed id" '[ "$rc" -eq 2 ] && jq -e ".code == \"backup_id_invalid\"" >/dev/null <<<"$out"'
 out="$(at 400 rollback --id "2000-01-01T00-00-00Z")"; rc=$?
@@ -252,9 +261,10 @@ ok "curator exposes pin via the ownership contract" 'jq -e ".command == \"pin\" 
 # 11a. directory-symlink member → quarantined, never copied, run proceeds
 make_managed theta
 tool run >/dev/null
+at 800 run >/dev/null  # stage 1: mark theta stale (#2239)
 mkdir "$TMP/outside-data" && printf 'x' > "$TMP/outside-data/blob.bin"
 ln -s "$TMP/outside-data" "$SKILLS/theta/linked-dir"
-out="$(at 800 run)"
+out="$(at 831 run)"
 ok "dir-symlink skill is quarantined, not archived" 'jq -e "[.decisions[] | select(.name == \"theta\" and .action == \"quarantine\")] | length == 1" >/dev/null <<<"$out" && [ -d "$SKILLS/theta" ]'
 ok "quarantine is reported at the top level" 'jq -e ".quarantined == [\"theta\"]" >/dev/null <<<"$out"'
 # shellcheck disable=SC2034  # backup_dir is read via eval inside ok()
@@ -262,7 +272,7 @@ backup_dir="$(jq -r '.backup.backup_id' <<<"$out")"
 ok "quarantined skill is absent from the snapshot" '[ ! -e "$STATE/skill-autosave-curator-backups/$backup_dir/skills/theta" ]'
 ok "outside data never enters the backup" '[ ! -e "$STATE/skill-autosave-curator-backups/$backup_dir/skills/theta/linked-dir/blob.bin" ]'
 rm "$SKILLS/theta/linked-dir"
-out="$(at 800 run)"
+out="$(at 831 run)"
 ok "after repair the skill transitions again" 'jq -e "[.decisions[] | select(.name == \"theta\" and .action == \"archive\")] | length == 1" >/dev/null <<<"$out"'
 
 # 11b. rollback partial failure records conflict, not a clean abort
@@ -458,7 +468,9 @@ install -m 600 "$MO_TMP/usage.json" "$MO_STATE/skill-autosave-usage.json"
 out="$(mo_at 400 run)"
 ok "mark-only: a legacy unstamped stale record restarts its recheck window" 'jq -e "[.decisions[] | select(.name == \"mo-idle\") | .reason] == [\"recheck-window-start\"]" >/dev/null <<<"$out"'
 out="$(CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true mo_at 400 run --dry-run)"
-ok "explicit archive opt-in restores the automatic archive decision" '[ "$(mo_decision "$out" mo-idle)" = "archive" ]'
+ok "archive opt-in: a freshly restarted recheck window is only observed (#2239)" 'jq -e "[.decisions[] | select(.name == \"mo-idle\") | [.action, .reason]] == [[\"keep\", \"stale-observing\"]]" >/dev/null <<<"$out"'
+out="$(CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true mo_at 431 run --dry-run)"
+ok "explicit archive opt-in archives a stage-2 candidate" '[ "$(mo_decision "$out" mo-idle)" = "archive" ]'
 out="$(CCC_SKILL_CURATOR_RECHECK_AFTER_DAYS=0 mo_at 400 run)"; rc=$?
 ok "out-of-range recheck window fails closed" '[ "$rc" -eq 2 ] && jq -e ".code == \"invalid_config_CCC_SKILL_CURATOR_RECHECK_AFTER_DAYS\"" >/dev/null <<<"$out"'
 out="$(CCC_SKILL_CURATOR_ARCHIVE_ENABLED=maybe mo_at 400 run)"
@@ -569,6 +581,113 @@ out="$(ut_at 5 run --dry-run)"
 ok "union: a pre-creation usage row does not end the never-used grace" '[ "$(u_decision "$out" u-young)" = "keep never-used-grace" ]'
 ok "union: archive stays off throughout" '[ -z "$(ls -A "$U_STATE/skill-autosave-archive" 2>/dev/null)" ] && [ -f "$U_SKILLS/u-unused/SKILL.md" ]'
 rm -rf "$U_TMP"
+
+# --- 15. archive opt-in keeps both stages (#2239, owner decision #1739) -------
+# CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true may only move a skill that was
+# already marked stale, has stayed stale for a full recheck window, has not
+# been used since the mark, and is idle past the ARCHIVE_AFTER_DAYS floor.
+# fleet-managed installs (.ccc-fleet-skill.json) are reported, never moved.
+A_TMP="$(mktemp -d)"; A_STATE="$A_TMP/state"; A_SKILLS="$A_TMP/skills"
+mkdir -m 700 "$A_STATE" "$A_SKILLS"
+at_tool() { # <days-from-now> <archive-enabled: true|unset> <cmd...>
+  local days="$1" arch="$2"; shift 2
+  local now
+  now="$(python3 -c "from datetime import datetime,timedelta,timezone; print((datetime.now(timezone.utc)+timedelta(days=$days)).isoformat())")"
+  if [ "$arch" = true ]; then
+    CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true CCC_SKILL_CURATOR_NOW="$now" \
+      python3 "$TOOL" --provider claude --skills-dir "$A_SKILLS" --state-dir "$A_STATE" "$@"
+  else
+    CCC_SKILL_CURATOR_NOW="$now" \
+      python3 "$TOOL" --provider claude --skills-dir "$A_SKILLS" --state-dir "$A_STATE" "$@"
+  fi
+}
+a_skill() {
+  mkdir -m 700 "$A_SKILLS/$1"
+  printf -- '---\nname: %s\ndescription: A sufficiently detailed recurring workflow for archive opt-in tests.\n---\n\n# %s\n' "$1" "$1" > "$A_SKILLS/$1/SKILL.md"
+  chmod 600 "$A_SKILLS/$1/SKILL.md"
+}
+a_decision() { # <json> <name> — "action reason" for one skill
+  jq -r --arg n "$2" '[.decisions[] | select(.name == $n) | "\(.action) \(.reason)"] | first // "none"' <<<"$1"
+}
+mkdir -m 700 "$A_STATE/skill-usage"
+printf '{"ts":"%s","skill":"unrelated-skill","tool":"Read"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$A_STATE/skill-usage/usage.jsonl"
+chmod 600 "$A_STATE/skill-usage/usage.jsonl"
+for name in a-idle a-used; do
+  a_skill "$name"
+  python3 "$OWN" --provider claude --skills-dir "$A_SKILLS" --state-dir "$A_STATE" mark-created "$name" >/dev/null
+done
+a_skill a-fleet
+jq -nc '{schema_version: 1, manager: "ccc-node-fleet-skills", repo: "jinwon-int/fleet-skills",
+  commit: "0123456789abcdef0123456789abcdef01234567", provider: "claude", audience: "all",
+  name: "a-fleet", tree_sha256: "00", source_candidate_id: null, source_tree_sha256: "00",
+  reviewed_by: null}' > "$A_SKILLS/a-fleet/.ccc-fleet-skill.json"
+chmod 600 "$A_SKILLS/a-fleet/.ccc-fleet-skill.json"
+at_tool 0 true run >/dev/null  # first sight seeds the autosave records
+
+out="$(at_tool 100 true run)"
+ok "opt-in: an unmarked skill past every window is only marked" \
+  '[ "$(a_decision "$out" a-idle)" = "mark-stale idle>30d" ] && jq -e ".counts.archived == 0" >/dev/null <<<"$out" && [ -f "$A_SKILLS/a-idle/SKILL.md" ]'
+ok "opt-in: fleet-managed skill is protected and reported" \
+  '[ "$(a_decision "$out" a-fleet)" = "protect fleet-managed" ] && [ -f "$A_SKILLS/a-fleet/SKILL.md" ]'
+at_tool 105 true bump --event use --name a-used >/dev/null
+out="$(at_tool 110 true run)"
+ok "opt-in: marked inside the recheck window is kept" '[ "$(a_decision "$out" a-idle)" = "keep stale-observing" ]'
+ok "opt-in: a use after the mark reactivates instead of archiving" '[ "$(a_decision "$out" a-used)" = "reactivate fresh-activity" ]'
+out="$(at_tool 110 true status a-used)"
+ok "opt-in: reactivation clears stale_marked_at" 'jq -e ".skills[0].telemetry.state == \"active\" and .skills[0].telemetry.stale_marked_at == null" >/dev/null <<<"$out"'
+out="$(at_tool 131 unset run)"
+ok "default off: the same stage-2 skill is only an archive candidate" \
+  '[ "$(a_decision "$out" a-idle)" = "archive-candidate stale>=30d-still-idle;archive-disabled" ] && jq -e ".counts.archived == 0" >/dev/null <<<"$out" && [ -f "$A_SKILLS/a-idle/SKILL.md" ]'
+out="$(CCC_SKILL_CURATOR_ARCHIVE_AFTER_DAYS=200 at_tool 131 true run --dry-run)"
+ok "opt-in: a stage-2 candidate below the ARCHIVE_AFTER_DAYS floor is not moved" \
+  '[ "$(a_decision "$out" a-idle)" = "archive-candidate stale>=30d-still-idle;below-archive-floor-200d" ]'
+out="$(at_tool 131 true run)"
+ok "opt-in: marked >= recheck window and still idle is archived" \
+  '[ "$(a_decision "$out" a-idle)" = "archive stale>=30d-still-idle" ] && [ ! -e "$A_SKILLS/a-idle" ] && (jq -e ".backup.backup_id | type == \"string\"" >/dev/null <<<"$out")'
+ok "opt-in: the reused skill and the fleet skill stay live" \
+  '[ "$(a_decision "$out" a-used)" = "keep within-window" ] && [ -f "$A_SKILLS/a-used/SKILL.md" ] && [ -f "$A_SKILLS/a-fleet/SKILL.md" ]'
+out="$(at_tool 131 true restore a-idle)"
+ok "opt-in: an auto-archived skill restores" 'jq -e ".changed == true" >/dev/null <<<"$out" && [ -f "$A_SKILLS/a-idle/SKILL.md" ]'
+out="$(at_tool 132 true run)"
+ok "opt-in: a restored skill restarts at stage 1, never re-archived at once" '[ "$(a_decision "$out" a-idle)" = "mark-stale idle>30d" ] && [ -f "$A_SKILLS/a-idle/SKILL.md" ]'
+out="$(at_tool 132 true archive a-fleet)"; rc=$?
+ok "opt-in: manual curator archive of a fleet-managed skill is denied" '[ "$rc" -eq 2 ] && jq -e ".code == \"lifecycle_denied_fleet-managed\"" >/dev/null <<<"$out"'
+out="$(at_tool 132 true report)"
+ok "report counts fleet-managed and never lists it as a candidate" \
+  'jq -e ".totals.by_classification[\"fleet-managed\"] == 1 and ([.lifecycle_candidates[] | select(.name == \"a-fleet\")] | length == 0)" >/dev/null <<<"$out"'
+# Pure decision table: a use after the mark that no run saw (the skill is idle
+# again by the next run) restarts the recheck clock instead of archiving.
+TOOL_PATH="$TOOL" python3 - <<'PY'
+import importlib.util
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+spec = importlib.util.spec_from_file_location("curator_two_stage_test", os.environ["TOOL_PATH"])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+day0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+def at(days: int) -> datetime:
+    return day0 + timedelta(days=days)
+config = {"stale_after_days": 30, "recheck_after_days": 30, "archive_after_days": 30,
+          "archive_enabled": True}
+record = module._empty_record("t", module._ts(day0))
+record.update(state="stale", use_count=1, last_used_at=module._ts(at(41)),
+              stale_marked_at=module._ts(at(40)))
+assert module._decide(record, at(80), config) == ("mark-stale", "used-since-mark-recheck-restart")
+# The same record via the usage.jsonl ledger alone (Skill-tool record quiet).
+record.update(last_used_at=module._ts(at(1)))
+assert module._decide(record, at(80), config, ledger_used_at=at(41))[1] == "used-since-mark-recheck-restart"
+assert module._decide(record, at(80), config)[0] == "archive"
+# Missing usage evidence holds even a stage-2 archive.
+assert module._decide(record, at(80), config, evidence="missing") == ("keep", "usage-ledger-missing")
+PY
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "decision table: use since the mark restarts the recheck; no evidence holds" '[ "$rc" = 0 ]'
+rm -rf "$A_TMP"
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

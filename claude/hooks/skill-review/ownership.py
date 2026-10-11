@@ -84,6 +84,13 @@ _NON_CLAUDE_PROVIDERS = ("codex", "piri", "danso")
 _ATTEMPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _AUTOSAVE_MARKER = ".autosave-meta.json"
 _MANAGED_MARKER = ".ccc-node-managed.json"
+# Fleet-skills sync receipt (scripts/ccc-fleet-skills-sync.py marker()): an
+# approved fleet-skills install. Its own class, ``fleet-managed`` (#2239):
+# never autonomous-writable, never a local curator lifecycle target (fleet
+# retirement goes through the fleet-skills repo's retired/ flow), but still
+# reported so usage and graduation evidence can be aggregated.
+_FLEET_MARKER = ".ccc-fleet-skill.json"
+_FLEET_MANAGER = "ccc-node-fleet-skills"
 _CONTROL_FILE = "skill-autosave-control.json"
 _LEDGER_FILE = "skill-autosave-ownership.jsonl"
 _RECEIPT_DIR = "skill-autosave-read-receipts"
@@ -582,6 +589,21 @@ def _validate_managed_marker(context: Context, name: str, path: Path) -> dict[st
     return marker
 
 
+def _validate_fleet_marker(context: Context, name: str, path: Path) -> dict[str, Any]:
+    # The sync writes this marker owner-only (0600) and refuses to touch an
+    # installed copy whose marker is anything else, so the same bar applies.
+    marker = _safe_json_file(path, owner=context.uid, exact_mode=0o600)
+    if (
+        type(marker.get("schema_version")) is not int
+        or marker["schema_version"] != 1
+        or marker.get("manager") != _FLEET_MANAGER
+        or marker.get("name") != name
+        or marker.get("provider") != context.provider
+    ):
+        raise ContractError("fleet_metadata_invalid")
+    return marker
+
+
 def _validate_autosave_marker(
     context: Context,
     name: str,
@@ -641,8 +663,10 @@ def _classification(
             controls = _load_controls(context)
         pin = _control_record(context, controls, name)
         managed_path = skill_dir / _MANAGED_MARKER
+        fleet_path = skill_dir / _FLEET_MARKER
         autosave_path = skill_dir / _AUTOSAVE_MARKER
         managed_exists = _lstat(managed_path) is not None
+        fleet_exists = _lstat(fleet_path) is not None
         autosave_exists = _lstat(autosave_path) is not None
         external_exists = any(
             _lstat(skill_dir / marker) is not None
@@ -660,6 +684,16 @@ def _classification(
             provenance_sha = _sha256(_canonical_json(managed))
             if autosave_exists:
                 reason = "managed-marker-conflicts-with-autosave"
+        elif fleet_exists:
+            # Precedence follows the sync's own layering (#1344): repo-managed
+            # > fleet-approved > autosave-owned > user-owned.
+            fleet = _validate_fleet_marker(context, name, fleet_path)
+            base = "fleet-managed"
+            reason = "fleet-skills-marker"
+            revision = 1
+            provenance_sha = _sha256(_canonical_json(fleet))
+            if autosave_exists:
+                reason = "fleet-marker-conflicts-with-autosave"
         elif autosave_exists:
             if external_exists:
                 raise ContractError("conflicting_external_autosave_metadata")
@@ -1554,10 +1588,15 @@ def _command_rollback_archive(context: Context, name: str) -> dict[str, Any]:
     }
 
 
+# fleet-managed stays pinnable: before #2239 a fleet install classified as
+# user-owned, so an existing pin on one must still be removable.
+_PINNABLE_CLASSES = frozenset({"user-owned", "autosave-managed", "fleet-managed"})
+
+
 def _command_pin(context: Context, name: str, pin: bool, dry_run: bool) -> dict[str, Any]:
     verb = "pin" if pin else "unpin"
     before = _classification(context, name)
-    if before["base_classification"] not in {"user-owned", "autosave-managed"}:
+    if before["base_classification"] not in _PINNABLE_CLASSES:
         raise ContractError(f"{verb}_denied_{before['base_classification'].replace('/', '_')}")
     if before["pinned"] == pin:
         return {
@@ -1582,7 +1621,7 @@ def _command_pin(context: Context, name: str, pin: bool, dry_run: bool) -> dict[
         }
     with _MutationLock(context):
         current = _classification(context, name)
-        if current["base_classification"] not in {"user-owned", "autosave-managed"}:
+        if current["base_classification"] not in _PINNABLE_CLASSES:
             raise ContractError(f"{verb}_state_changed")
         if current["pinned"] == pin:
             return {

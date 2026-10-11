@@ -637,6 +637,12 @@ else
   err "fleet inventory descriptor offline validator tests failed"
   tail -10 "$TMP/fleet-topology-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_skill_usage_report_test.py >"$TMP/skill-usage-report-test.out" 2>&1; then
+  say "  ok read-only skill usage node report + fleet aggregation tests (#2239)"
+else
+  err "skill usage report tests failed (missing telemetry may read as non-use)"
+  tail -10 "$TMP/skill-usage-report-test.out" 2>/dev/null
+fi
 fi # phase_static, inline python checks
 # A suite must not inherit the harness environment of the node it runs on
 # (#1064). The per-suite guard `ccc_test_reset_hook_env` (#1023) only reaches
