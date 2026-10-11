@@ -12,6 +12,14 @@
 #                              #   plugin registered them. Node-local hooks stay in settings.
 #   ./setup.sh --dry-run       # show what would happen, change nothing (combine with above)
 #   ./setup.sh --no-backup     # skip the durable operator backup (failure rollback remains enabled)
+#   ./setup.sh --refresh-guidance [--dry-run]
+#                              # ONLY refresh retired-memory guidance in the node-owned
+#                              #   ~/.claude/CLAUDE.md and MEMORY.md files (#2238), then exit:
+#                              #   back up each file (*.bak-refresh-guidance-<UTC>), replace the
+#                              #   marker-delimited Memory Stack block (or a marker-less span that
+#                              #   is a known old template version) and the old memory-stack line.
+#                              #   Customized spans/lines are refused and left untouched.
+#                              #   Combine with --dry-run to preview; no other flag applies.
 #
 # Node-identity seeding (optional): when these are given, freshly-seeded CLAUDE.md / MEMORY.md /
 # USER.md have their <PLACEHOLDER> tokens substituted automatically (existing files are never
@@ -40,7 +48,7 @@ if [ -z "${HOME:-}" ]; then
   export HOME
 fi
 
-DRY=0; WITH_PLUGIN=0; BACKUP=1
+DRY=0; WITH_PLUGIN=0; BACKUP=1; REFRESH_GUIDANCE=0
 OPT_NODE=""; OPT_DISPLAY=""; OPT_SLOT=""; OPT_FLEET_ROLE=""; OPT_LANG=""
 OPT_USER_NAME=""; OPT_USER_GH=""; OPT_USER_TZ=""; OPT_USER_CONTEXT=""
 need_val() { [ -n "${2:-}" ] || { echo "Flag $1 requires a value" >&2; exit 2; }; }
@@ -128,6 +136,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1 ;;
     --with-plugin) WITH_PLUGIN=1 ;;
     --no-backup) BACKUP=0 ;;
+    --refresh-guidance) REFRESH_GUIDANCE=1 ;;
     --node)         need_val "$1" "${2:-}"; OPT_NODE="$2"; shift ;;
     --display)      need_val "$1" "${2:-}"; OPT_DISPLAY="$2"; shift ;;
     --slot)         need_val "$1" "${2:-}"; OPT_SLOT="$2"; shift ;;
@@ -196,6 +205,21 @@ fi
 . "$HARNESS_PATHS_LIB"
 
 ccc_validate_setup_roots "$CLAUDE_DIR" "$HERMES_ROOT" || exit 2
+
+# --refresh-guidance (#2238): seed() never overwrites node-owned CLAUDE.md /
+# MEMORY.md, so a template fix (e.g. the Honcho retirement) never reaches an
+# already-seeded node. This standalone mode refreshes only the managed Memory
+# Stack guidance — detection is shared with ccc-doctor's stale-memory-guidance
+# row via scripts/ccc_memory_guidance.py — and exits before any install step.
+if [ "$REFRESH_GUIDANCE" = 1 ]; then
+  if [ "$WITH_PLUGIN" = 1 ] || [ "$BACKUP" != 1 ] || [ -n "$OPT_NODE$OPT_DISPLAY$OPT_SLOT$OPT_FLEET_ROLE$OPT_LANG$OPT_USER_NAME$OPT_USER_GH$OPT_USER_TZ$OPT_USER_CONTEXT" ]; then
+    echo "--refresh-guidance runs alone (only --dry-run combines with it); it always backs up what it rewrites." >&2
+    exit 2
+  fi
+  refresh_args=(--repo "$SRC" --claude-dir "$CLAUDE_DIR" --hermes-dir "$HERMES_ROOT")
+  [ "$DRY" = 1 ] && refresh_args+=(--dry-run)
+  exec python3 "$SRC/scripts/ccc_memory_guidance.py" "${refresh_args[@]}"
+fi
 
 # The canonical-path rewrite embeds $SRC verbatim into installed slash-command
 # shell text (allowed-tools patterns and !`...` inline commands), where quoting

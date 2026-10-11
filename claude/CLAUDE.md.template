@@ -31,6 +31,7 @@ Summary of MEMORY.md · USER.md from `$HOME/.hermes/memories/`. Operational fact
 - Workflow: PR-first. When CI/validation green & mergeable → squash merge + branch cleanup are automatic.
 - PRs by `<USER_GH>` need a `seoseo-ai` reviewer/merger when applicable.
 
+<!-- ccc:memory-stack:begin -->
 ## Memory Stack
 - Current stack: **built-in MEMORY/USER + nunchi (local working memory) + Family Wiki + session_search**.
 - **Honcho is retired fleet-wide** (2026-09-01, TM-2029 phase 3; plumbing removed in #1436) — do not query it or treat a missing `~/.hermes/honcho.json` as a fault.
@@ -48,6 +49,7 @@ The SessionStart hook (`~/.claude/hooks/load-memory.sh`) auto-injects a snapshot
 - Recall: `python3 ~/.claude/hooks/nunchi/nunchi.py recall "<query>" [--target <peer>] [--limit N]`; synthesized answer: `nunchi.py dialectic "<query>"`. Facts are per-node candidates — verify before operational claims.
 
 **Routing:** durable facts / nodes / runbooks / decisions → Family Wiki (the cross-node layer). Relational & evolving working memory → nunchi (per node, fed by distill).
+<!-- ccc:memory-stack:end -->
 
 ## Fresh Approval Required
 secrets · releases · DB/replay/migration/prune · manual ACKs · emergency hotfixes · provider sends/canaries · host power-down (poweroff/halt/shutdown-without-`-r`, any host) · reboot of an unlisted remote host · non-fleet service lifecycle and config-changing verbs · cross-broker mutations (unless pre-approved in-task).
