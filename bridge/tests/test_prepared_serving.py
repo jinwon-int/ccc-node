@@ -132,6 +132,32 @@ def test_regular_health_read_and_unsafe_inputs(tmp_path):
         serving.read_health(alias / "health.json")
 
 
+def test_health_replaced_between_open_and_fstat_is_read(tmp_path, monkeypatch):
+    # #2230: the bot publishes health with os.replace(); a heartbeat right
+    # after open() unlinks the opened inode (st_nlink 0). That snapshot is the
+    # one the path named at open() time and must not read as unsafe.
+    path = tmp_path / "health.json"
+    path.write_text('{"schema_version": 1, "updated_at": "old"}')
+    newer = tmp_path / "health.json.tmp"
+    real_open = os.open
+    replaced = []
+
+    def open_then_heartbeat(target, *args, **kwargs):
+        fd = real_open(target, *args, **kwargs)
+        if os.fspath(target) == os.fspath(path) and not replaced:
+            replaced.append(True)
+            newer.write_text('{"schema_version": 1, "updated_at": "new"}')
+            os.replace(newer, path)
+            assert os.fstat(fd).st_nlink == 0
+        return fd
+
+    monkeypatch.setattr(serving.os, "open", open_then_heartbeat)
+    assert serving.read_health(path) == {"schema_version": 1, "updated_at": "old"}
+    assert replaced
+    monkeypatch.undo()
+    assert serving.read_health(path) == {"schema_version": 1, "updated_at": "new"}
+
+
 def test_cli_success_and_body_free_failure(candidate, tmp_path, monkeypatch, capsys):
     expected, health, now = candidate
     path = tmp_path / "health.json"
