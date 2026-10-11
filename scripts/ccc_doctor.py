@@ -511,6 +511,83 @@ def read_env_file_keys(path: Path, keys: frozenset[str]) -> dict[str, str]:
     return out
 
 
+# Retired memory layers described as *current* in node-owned guidance (#2238).
+# setup.sh seeds ~/.claude/CLAUDE.md and the MEMORY.md files once and never
+# overwrites them, so nodes seeded before the Honcho retirement (2026-09-01,
+# #1436) kept telling every session to recall from Honcho. Each pattern is one
+# shape the old templates used; ``label`` names it in the report row.
+_RETIRED_LAYER = r"(?:Honcho|Supermemory)"
+_STALE_MEMORY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # "built-in MEMORY/USER + Honcho + Family Wiki + session_search"
+    ("stack-list", re.compile(rf"\+\s*\**{_RETIRED_LAYER}\b|\b{_RETIRED_LAYER}\**\s*\+")),
+    # "**cached Honcho working memory**" (SessionStart snapshot description)
+    ("cached-layer", re.compile(rf"\bcached\s+{_RETIRED_LAYER}\b", re.IGNORECASE)),
+    # "**Honcho — working/relational memory:**" section heading
+    ("layer-heading", re.compile(rf"\b{_RETIRED_LAYER}\**\s*[—–-]+\s*working", re.IGNORECASE)),
+    # "POST {baseUrl}/v3/workspaces/<ws>/peers/<peer>/chat" Honcho recall API
+    ("recall-endpoint", re.compile(r"/v3/workspaces/\S*/peers/")),
+    # "`baseUrl` is in `~/.hermes/honcho.json`"
+    ("honcho-config", re.compile(r"honcho\.json", re.IGNORECASE)),
+    # "Relational & evolving working memory → Honcho."
+    ("routing", re.compile(rf"(?:→|->|=>)\s*\**{_RETIRED_LAYER}\b")),
+    # "Current memory stack: ... Honcho ..."
+    ("current-stack", re.compile(rf"\bcurrent\s+(?:memory\s+)?stack\b.*\b{_RETIRED_LAYER}\b", re.IGNORECASE)),
+    # "Read Family Wiki, Honcho, local MEMORY/USER, ..." (reads table row)
+    ("read-source", re.compile(rf"\bRead\b[^|]*?\b{_RETIRED_LAYER}\b")),
+)
+# A sentence that says the layer is retired is the *fix*, not drift: the
+# current template names honcho.json in "Honcho is retired ... do not query it".
+_RETIRED_CONTEXT = re.compile(
+    r"retire|퇴역|은퇴|legacy|deprecat|decommission|removed|폐기|제거|no longer"
+    r"|do not (?:query|use)|don't (?:query|use)|사용\s*(?:금지|하지)",
+    re.IGNORECASE,
+)
+# Sentence boundary inside one line; a period inside a path (honcho.json) is not.
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?。])\s+")
+_STALE_MEMORY_READ_LIMIT = 1 << 20
+
+
+def stale_memory_guidance_hits(text: str) -> list[tuple[int, list[str]]]:
+    """``(line number, pattern labels)`` for lines that present a retired layer as current.
+
+    Scanned per sentence so "Supermemory is retired. Current stack: ... + Honcho
+    + ..." (the old MEMORY.md line) still flags its second sentence, while a
+    sentence carrying a retirement word is exempt.
+    """
+    hits: list[tuple[int, list[str]]] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        labels: list[str] = []
+        for sentence in _SENTENCE_BREAK.split(line):
+            if _RETIRED_CONTEXT.search(sentence):
+                continue
+            for label, pattern in _STALE_MEMORY_PATTERNS:
+                if label not in labels and pattern.search(sentence):
+                    labels.append(label)
+        if labels:
+            hits.append((lineno, labels))
+    return hits
+
+
+_MEMORY_STACK_START = "## Memory Stack"
+_MEMORY_STACK_END = "## Fresh Approval Required"
+
+
+def memory_stack_span(text: str) -> str | None:
+    """The ``## Memory Stack`` .. (not including) ``## Fresh Approval Required`` span.
+
+    That span holds every memory-layer instruction in CLAUDE.md (Memory Stack +
+    Live Memory Usage); it is what the #2238 remediation replaces wholesale.
+    None when either heading is missing.
+    """
+    lines = [line.rstrip() for line in text.splitlines()]
+    try:
+        start = next(i for i, line in enumerate(lines) if line == _MEMORY_STACK_START)
+        end = next(i for i in range(start + 1, len(lines)) if lines[i] == _MEMORY_STACK_END)
+    except StopIteration:
+        return None
+    return "\n".join(lines[start:end]).strip()
+
+
 def _printable(value: str, limit: int = 120) -> str:
     """Control-free, bounded rendering of a path/image value for a report row."""
     cleaned = "".join(ch if ch.isprintable() else "?" for ch in value)
@@ -854,6 +931,7 @@ class Doctor:
         self.check_continuation_state()
         self.check_session_scope_rows()
         self.check_memory_cache()
+        self.check_stale_memory_guidance()
         self.check_nunchi_collection()
         self.check_cron_drift()
         self.check_provider_readiness()
@@ -3498,6 +3576,91 @@ class Doctor:
                 self.add("경고", "memory cache", "diagnostic unavailable", "run scripts/ccc-memory-check.sh manually")
         else:
             self.add("경고", "memory cache", "ccc-memory-check.sh missing", "complete checkout or reinstall scripts")
+
+    def _stale_memory_guidance_files(self) -> list[tuple[str, Path]]:
+        """Node-owned guidance files setup.sh seeds once and never overwrites.
+
+        The Hermes home defaults to the sibling of the Claude dir (``~/.hermes``
+        next to ``~/.claude``); ``CCC_DOCTOR_HERMES_HOME`` overrides it.
+        """
+        hermes = Path(os.environ.get("CCC_DOCTOR_HERMES_HOME") or (self.claude_dir.parent / ".hermes")).expanduser()
+        return [
+            ("CLAUDE.md", self.claude_dir / "CLAUDE.md"),
+            ("memories/MEMORY.md", self.claude_dir / "memories" / "MEMORY.md"),
+            ("hermes:memories/MEMORY.md", hermes / "memories" / "MEMORY.md"),
+        ]
+
+    def check_stale_memory_guidance(self) -> None:
+        """Warn when node-owned guidance presents a retired memory layer as current (#2238).
+
+        ``setup.sh`` seeds CLAUDE.md / MEMORY.md only when absent, so template
+        fixes never reach an already-seeded node. After the Honcho retirement
+        (2026-09-01, #1436) nine nodes still told every session to recall from
+        Honcho (recall endpoint, ``~/.hermes/honcho.json``, Routing → Honcho).
+
+        Read-only and warn-only: never rewrites a node-owned file. Reports line
+        numbers and pattern labels, never file text. For CLAUDE.md it also says
+        whether the memory span still matches the repo template.
+        """
+        item = "stale-memory-guidance"
+        template_span: str | None = None
+        template = self.repo / "claude" / "CLAUDE.md.template"
+        with contextlib.suppress(OSError, UnicodeDecodeError):
+            template_span = memory_stack_span(template.read_text(encoding="utf-8"))
+        scanned = 0
+        unreadable: list[str] = []
+        stale: list[tuple[str, list[tuple[int, list[str]]]]] = []
+        span_state = ""
+        for name, path in self._stale_memory_guidance_files():
+            if not path.is_file():
+                continue
+            try:
+                with path.open("rb") as handle:
+                    text = handle.read(_STALE_MEMORY_READ_LIMIT).decode("utf-8", errors="replace")
+            except OSError:
+                unreadable.append(name)
+                continue
+            scanned += 1
+            hits = stale_memory_guidance_hits(text)
+            if hits:
+                stale.append((name, hits))
+            if name == "CLAUDE.md" and template_span is not None:
+                node_span = memory_stack_span(text)
+                span_state = (
+                    "absent" if node_span is None else "template" if node_span == template_span else "differs"
+                )
+        skipped = f"; unreadable={','.join(unreadable)}" if unreadable else ""
+        span = f"; CLAUDE.md memory-span={span_state}" if span_state else ""
+        if not scanned:
+            self.add("정상", item, f"해당 없음 (no node-owned guidance files){skipped}", "none")
+            return
+        if not stale:
+            self.add("정상", item, f"files={scanned}; stale=0{span}{skipped}", "none")
+            return
+
+        def describe(name: str, hits: list[tuple[int, list[str]]]) -> str:
+            lines = ",".join(f"L{lineno}" for lineno, _ in hits[:6])
+            more = f"+{len(hits) - 6}" if len(hits) > 6 else ""
+            labels: list[str] = []
+            for _, found in hits:
+                labels.extend(label for label in found if label not in labels)
+            return f"{name}:{lines}{more}({'/'.join(labels)})"
+
+        total = sum(len(hits) for _, hits in stale)
+        detail = "; ".join(describe(name, hits) for name, hits in stale)
+        self.add(
+            "경고",
+            item,
+            f"stale={total} line(s) in {len(stale)} file(s); {detail}{span}{skipped}",
+            "node-owned guidance still describes retired Honcho/Supermemory as the current "
+            "memory stack, and setup.sh never overwrites seeded files. Back up each file, then "
+            "in ~/.claude/CLAUDE.md replace the span from '## Memory Stack' up to (not "
+            "including) '## Fresh Approval Required' with the same span of "
+            "claude/CLAUDE.md.template; in MEMORY.md rewrite the memory-stack line from "
+            "hermes/memories/MEMORY.template.md (built-in MEMORY/USER + nunchi + Family Wiki + "
+            "session_search); fix any other flagged line by hand. Doctor never rewrites these "
+            "files (ccc-node#2238)",
+        )
 
     def check_nunchi_collection(self) -> None:
         """Surface the nunchi MemPalace collection lane for the live provider.

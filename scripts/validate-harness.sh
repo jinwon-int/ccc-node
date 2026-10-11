@@ -522,6 +522,12 @@ else
   err "doctor push spool dwell verdict tests failed (an orphaned notification spool may go unseen)"
   tail -10 "$TMP/doctor-push-spool-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_stale_memory_test.py >"$TMP/doctor-stale-memory-test.out" 2>&1; then
+  say "  ok doctor stale-memory-guidance verdict tests (#2238)"
+else
+  err "doctor stale-memory-guidance verdict tests failed (seeded guidance may keep presenting retired Honcho as current)"
+  tail -10 "$TMP/doctor-stale-memory-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_cli_floor_test.py >"$TMP/doctor-cli-floor-test.out" 2>&1; then
   say "  ok doctor worker Claude CLI floor verdict tests (a2a-nexus#2275)"
 else

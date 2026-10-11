@@ -169,6 +169,36 @@ alert is a one-shot event. After #1061 documented the worktree discipline the
 same stall still recurred on two nodes (#1328), because nothing surfaced a node
 that had quietly stopped updating days earlier.
 
+## Stale memory guidance
+
+One `stale-memory-guidance` row (#2238). `setup.sh` seeds the node-owned
+`~/.claude/CLAUDE.md`, `~/.claude/memories/MEMORY.md` (and Hermes'
+`~/.hermes/memories/MEMORY.md`) only when they are absent, so a template fix
+never reaches an already-seeded node. After the Honcho retirement (2026-09-01,
+#1436) nine nodes still told every session to recall from Honcho.
+
+Each file is scanned per sentence for the old template shapes: `+ Honcho +`
+stack lists, `cached Honcho`, the `Honcho — working` heading, the Honcho recall
+endpoint, `honcho.json`, `→ Honcho` routing, a "current stack" naming
+Honcho/Supermemory, and a reads row naming them. A sentence that also says
+retired / legacy / deprecated / removed / 퇴역 / 폐기 / "do not query" is the fix,
+not drift, so the current template line about a missing `honcho.json` stays quiet.
+
+| State | Class |
+|---|---|
+| none of the files exist | `정상` (해당 없음) |
+| no stale sentence | `정상` |
+| stale sentences | `경고` — file, line numbers and pattern labels (never file text) |
+
+For CLAUDE.md the row also reports `memory-span=template|differs|absent`: whether
+the span from `## Memory Stack` up to `## Fresh Approval Required` still equals
+the repo template. `differs` alone is informational (nodes may customize it).
+The doctor never rewrites these files. Remedy: back up the file, replace that span with the
+same span of `claude/CLAUDE.md.template`, rewrite the memory-stack line in
+MEMORY.md from `hermes/memories/MEMORY.template.md`, and fix any other flagged
+line by hand. `CCC_DOCTOR_HERMES_HOME` overrides the Hermes home (default: the
+sibling `.hermes` of the Claude dir).
+
 ## Push spool dwell
 
 One `push spool dwell` row (#2223). Push consumers — the Telegram
