@@ -24,6 +24,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -720,6 +722,60 @@ else:
         self.assertEqual(result["published"], [])
         self.assertFalse(self.cursor_path.exists())
         self.assertEqual(self.acked, [])
+
+    def test_lock_wait_timeout_fails_visibly_and_writes_nothing(self):
+        # #2232: a caller that asked to wait must not see an ok-looking no-op.
+        self.stage_local("local-skill-a", "2026-08-01T00:00:00Z")
+        with promotion._secure_fs.flock_guard(
+                self.config.promotion_state_dir / "promotion.lock",
+                owner_id=os.geteuid(), exact_mode=0o600):
+            started = time.monotonic()
+            result = promotion._collect(self.config, dry_run=False, lock_wait=1)
+            waited = time.monotonic() - started
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "lock_timeout")
+        self.assertEqual(result["status"], "locked")
+        self.assertEqual(result["lock_wait_sec"], 1)
+        self.assertGreaterEqual(waited, 0.9)
+        self.assertEqual(result["published"], [])
+        self.assertFalse(self.cursor_path.exists())
+        self.assertEqual(self.acked, [])
+
+    def test_lock_wait_acquires_once_holder_releases(self):
+        # #2232: a short overlap (the field case held the lock ~17 s) is
+        # absorbed: the waiter takes the lock after release and runs normally.
+        self.stage_local("local-skill-a", "2026-08-01T00:00:00Z")
+        lock_path = self.config.promotion_state_dir / "promotion.lock"
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with promotion._secure_fs.flock_guard(lock_path, owner_id=os.geteuid(), exact_mode=0o600):
+                held.set()
+                release.wait(10)
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        try:
+            self.assertTrue(held.wait(10))
+            threading.Timer(0.3, release.set).start()
+            result = promotion._collect(self.config, dry_run=False, lock_wait=10)
+        finally:
+            release.set()
+            thread.join(10)
+        self.assertTrue(result["ok"])
+        self.assertNotEqual(result.get("status"), "locked")
+        self.assertNotIn("code", result)
+
+    def test_run_lock_wait_timeout_fails_visibly(self):
+        with promotion._secure_fs.flock_guard(
+                self.config.promotion_state_dir / "promotion.lock",
+                owner_id=os.geteuid(), exact_mode=0o600):
+            result = promotion._execute(self.config, dry_run=False, lock_wait=1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "lock_timeout")
+        self.assertEqual(result["mode"], "run")
+        self.assertEqual(result["staged"], [])
 
     # -- publish / ACK outcome bookkeeping ----------------------------------
     def test_publish_error_is_reported_and_source_not_acked(self):

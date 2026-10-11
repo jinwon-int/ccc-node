@@ -98,7 +98,7 @@ run_autosave() {
 run_autosave; rc=$?
 ok "autosave exits 0" '[ "$rc" = 0 ]'
 ok "scanner invoked" '[ -f "$TMP/scan.touched" ]'
-ok "active sweep invokes central promoter in live mode" 'grep -qx "run" "$TMP/promotion.touched"'
+ok "active sweep invokes central promoter in live mode" 'grep -qx "run --lock-wait 120" "$TMP/promotion.touched"'
 for _ in $(seq 1 40); do
   find "$STATE/pending-skills" -name SKILL.md 2>/dev/null | grep -q . && break
   sleep 0.25
@@ -539,9 +539,9 @@ run11() { # $1 = CCC_A2A_EDGE_ENV value (may point at a missing file)
 run11 "$EDGE_ENV_FILE"; rc=$?
 ok "#1766: sweep with an edge env file still exits 0" '[ "$rc" = 0 ]'
 ok "#1766: collect child sees A2A_EDGE_SECRET" \
-  'grep -qx "collect secret=present" "$TMP/promotion11.secret"'
+  'grep -qx "collect --lock-wait 120 secret=present" "$TMP/promotion11.secret"'
 ok "#1766: staging child is left alone (only collect dispatches)" \
-  'grep -qx "run secret=absent" "$TMP/promotion11.secret"'
+  'grep -qx "run --lock-wait 120 secret=absent" "$TMP/promotion11.secret"'
 ok "#1766: edge-env state is logged without the secret value" \
   'grep -q "promotion-collect edge-env=loaded" "$STATE11/skill-autosave.log"'
 ok "#1766: the secret value never reaches the autosave log" \
@@ -580,7 +580,7 @@ env CCC_STATE_DIR="$STATE11B" CLAUDE_PROJECTS_DIR="$TMP/projects11" \
 rc=$?
 ok "#1766: a missing edge env file is non-fatal" '[ "$rc" = 0 ]'
 ok "#1766: collect still runs without an edge env file" \
-  'grep -qx "collect secret=absent" "$TMP/promotion11.secret"'
+  'grep -qx "collect --lock-wait 120 secret=absent" "$TMP/promotion11.secret"'
 ok "#1766: the absent edge env is logged as such" \
   'grep -q "promotion-collect edge-env=absent" "$STATE11B/skill-autosave.log"'
 
@@ -599,7 +599,7 @@ env CCC_STATE_DIR="$STATE11C" CLAUDE_PROJECTS_DIR="$TMP/projects11" \
 rc=$?
 ok "#1766: a malformed edge env file is non-fatal" '[ "$rc" = 0 ]'
 ok "#1766: a malformed edge env file still runs collect" \
-  'grep -qx "collect secret=absent" "$TMP/promotion11.secret"'
+  'grep -qx "collect --lock-wait 120 secret=absent" "$TMP/promotion11.secret"'
 ok "#1766: edge env output never reaches the summary or the log" \
   '! grep -rq "leaked-edge-secret-1766" "$STATE11C" 2>/dev/null'
 
@@ -838,6 +838,47 @@ ok "#2203: a successful collect still persists last-collect.json" \
   'jq -e ".ok == true" "$STATE16C/skill-promotion/last-collect.json" >/dev/null'
 ok "#2203: a successful collect still logs the summary line" \
   'grep -q "promotion-collect edge-env=absent {\"ok\":true}" "$STATE16C/skill-autosave.log"'
+
+# --- 17) #2232: stage/collect wait for promotion.lock, then fail visibly ------
+# A frequent results-only collect held promotion.lock for ~17 s exactly when the
+# nightly sweep reached block 2d; both children returned ok=true/status=locked
+# and the cycle vanished. The sweep now passes a bounded --lock-wait to both,
+# and a lock_timeout result goes through the failure branch.
+run17() { # <state> <touch> [env...]
+  local state="$1" touch="$2"; shift 2
+  mkdir -p "$state/skill-promotion"; chmod 700 "$state" "$state/skill-promotion"
+  env "$@" CCC_STATE_DIR="$state" CLAUDE_PROJECTS_DIR="$TMP/projects17" \
+    CCC_PUSH_SPOOL="$TMP/spool17" CCC_SKILL_REVIEW_CMD="$REVIEW" \
+    CCC_SKILL_SCAN_CMD="$SCAN" SCAN_TOUCH="$TMP/scan17.touched" \
+    CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$touch" \
+    CCC_A2A_EDGE_ENV="$TMP/no-such-edge.env" CLAUDE_SKILLS_DIR="$TMP/skills17" \
+    CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode bash "$AUTOSAVE" run
+}
+run17 "$TMP/state17a" "$TMP/promotion17a.touched" CCC_SKILL_PROMOTION_LOCK_WAIT_SEC=30
+ok "#2232: an explicit lock wait reaches stage and collect" \
+  'grep -qx "run --lock-wait 30" "$TMP/promotion17a.touched" && grep -qx "collect --lock-wait 30" "$TMP/promotion17a.touched"'
+run17 "$TMP/state17b" "$TMP/promotion17b.touched" CCC_SKILL_PROMOTION_LOCK_WAIT_SEC=garbage
+ok "#2232: a malformed lock wait falls back to the default" \
+  'grep -qx "run --lock-wait 120" "$TMP/promotion17b.touched" && grep -qx "collect --lock-wait 120" "$TMP/promotion17b.touched"'
+run17 "$TMP/state17c" "$TMP/promotion17c.touched" CCC_SKILL_PROMOTION_LOCK_WAIT_SEC=99999
+ok "#2232: an out-of-range lock wait falls back to the default" \
+  'grep -qx "collect --lock-wait 120" "$TMP/promotion17c.touched"'
+run17 "$TMP/state17f" "$TMP/promotion17f.touched" CCC_SKILL_PROMOTION_LOCK_WAIT_SEC=601
+ok "#2232: one past the promoter's 600 s bound falls back to the default" \
+  'grep -qx "collect --lock-wait 120" "$TMP/promotion17f.touched"'
+run17 "$TMP/state17d" "$TMP/promotion17d.touched" CCC_SKILL_PROMOTION_LOCK_WAIT_SEC=0
+ok "#2232: 0 keeps the single-try lock" \
+  'grep -qx "collect --lock-wait 0" "$TMP/promotion17d.touched"'
+STATE17E="$TMP/state17e"
+run17 "$STATE17E" "$TMP/promotion17e.touched" PROMOTION_COLLECT_RC=2 \
+  PROMOTION_COLLECT_OUT='{"ok":false,"mode":"collect","status":"locked","code":"lock_timeout","lock_wait_sec":120,"published":[],"errors":[]}'
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "#2232: a lock_timeout collect stays non-fatal" '[ "$rc" = 0 ]'
+ok "#2232: a lock_timeout collect takes the failure branch with its code" \
+  'grep -q "promotion-collect failed (non-fatal) edge-env=absent code=lock_timeout$" "$STATE17E/skill-autosave.log"'
+ok "#2232: the lock_timeout result is persisted as ok=false" \
+  'jq -e ".ok == false and .code == \"lock_timeout\" and .status == \"locked\"" "$STATE17E/skill-promotion/last-collect.json" >/dev/null'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
