@@ -87,6 +87,9 @@ The file is re-read when it changes (no restart).
 Owner-personal notices (important mail, schedule brief) can stay in the
 node's own agent room: set `CCC_PUSH_FLEET_RELAY_DIRECT_EVENTS` to their
 record `event` values on that node (#2227, see `docs/matrix-frontend.md`).
+Its default is `SelfUpdate` (#2242): self-update notices go to each node's
+own room, not this room. An explicit list replaces the default, so include
+`SelfUpdate` in it to keep that.
 
 Rollback per node = unset `CCC_PUSH_FLEET_RELAY_URL` and restart the matrix
 unit (records go back to the owner room as before). The queue and the

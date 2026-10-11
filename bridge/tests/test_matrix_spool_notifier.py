@@ -336,14 +336,15 @@ async def test_relay_mode_posts_to_relay_and_never_to_the_agent_room(tmp_path: P
     assert notifier.relay_mode and notifier._relay is not None and notifier._relay.node == "node-a"
     relay = _FakeRelay()
     notifier._relay = relay
-    data = {"event": "SelfUpdate", "node": "node-a", "text": "업데이트 완료", "dedup": "SelfUpdate:x", "ts": "T"}
+    # Any record outside the direct list (#2242 lists SelfUpdate by default).
+    data = {"event": "PrStatusPoll", "node": "node-a", "text": "PR 상태", "dedup": "PrStatusPoll:x", "ts": "T"}
     _record(tmp_path, "a.json", data)
     (tmp_path / "spool" / "sent").mkdir(parents=True, exist_ok=True)
     await notifier._drain(DIRECT, tmp_path / "spool" / "sent")
     assert enqueued == [], "relay mode must not post into the owner/agent room"
     assert len(relay.posted) == 1
     p = relay.posted[0]
-    assert p["node"] == "node-a" and p["dedup"] == "node-a:SelfUpdate:x" and p["text"] == PushNotifier._format(data)
+    assert p["node"] == "node-a" and p["dedup"] == "node-a:PrStatusPoll:x" and p["text"] == PushNotifier._format(data)
     assert (tmp_path / "spool" / "sent" / "a.json").exists()
 
 
@@ -456,7 +457,52 @@ def test_direct_events_parse_and_only_apply_in_relay_mode(tmp_path: Path) -> Non
     assert not n._is_direct({"text": "no event"})
     room_mode = MatrixSpoolNotifier(_settings(tmp_path, push_fleet_relay_direct_events="mail"), None)
     assert not room_mode._is_direct({"event": "mail"}), "outside relay mode every record is a room record"
-    assert MatrixSpoolNotifier(_relay_settings(tmp_path, _secret(tmp_path)), None).direct_events == frozenset()
+    # #2242: unset = SelfUpdate stays in the node's own room; empty = all to the relay.
+    assert MatrixSpoolNotifier(_relay_settings(tmp_path, _secret(tmp_path)), None).direct_events == frozenset(
+        {"SelfUpdate"}
+    )
+    assert MatrixSpoolNotifier(_direct_settings(tmp_path, ""), None).direct_events == frozenset()
+
+
+def test_direct_events_default_matches_the_config_default() -> None:
+    from telegram_bot.core.matrix import bot as bot_module
+    from telegram_bot.utils.config import Settings
+
+    field = Settings.model_fields["push_fleet_relay_direct_events"]
+    assert field.default == bot_module.DEFAULT_FLEET_RELAY_DIRECT_EVENTS == "SelfUpdate"
+
+
+@pytest.mark.anyio
+async def test_default_relay_mode_sends_self_update_to_the_owner_room(tmp_path: Path) -> None:
+    """#2242: with no explicit list, a node's own self-update notice lands in its
+    own room; operational alerts still go to the fleet relay."""
+    t, enqueued = _transport({DIRECT: "direct"})
+    notifier = MatrixSpoolNotifier(_relay_settings(tmp_path, _secret(tmp_path)), t)
+    relay = _FakeRelay()
+    notifier._relay = relay
+    upd = {"event": "SelfUpdate", "node": "node-a", "text": "업데이트 완료", "dedup": "SelfUpdate:1"}
+    alert = {"event": "health-alert", "node": "node-a", "text": "Telegram polling failed", "dedup": "h1"}
+    _record(tmp_path, "a-upd.json", upd)
+    _record(tmp_path, "b-alert.json", alert)
+    sent = tmp_path / "spool" / "sent"
+    sent.mkdir(parents=True, exist_ok=True)
+    await notifier._drain("", sent)
+    assert enqueued == [(DIRECT, PushNotifier._format(upd))]
+    assert [p["text"] for p in relay.posted] == [PushNotifier._format(alert)]
+
+
+@pytest.mark.anyio
+async def test_explicit_empty_direct_events_relays_self_update(tmp_path: Path) -> None:
+    t, enqueued = _transport({DIRECT: "direct"})
+    notifier = MatrixSpoolNotifier(_direct_settings(tmp_path, ""), t)
+    relay = _FakeRelay()
+    notifier._relay = relay
+    upd = {"event": "SelfUpdate", "node": "node-a", "text": "업데이트 완료", "dedup": "SelfUpdate:1"}
+    _record(tmp_path, "a-upd.json", upd)
+    sent = tmp_path / "spool" / "sent"
+    sent.mkdir(parents=True, exist_ok=True)
+    await notifier._drain("", sent)
+    assert enqueued == [] and [p["text"] for p in relay.posted] == [PushNotifier._format(upd)]
 
 
 @pytest.mark.anyio
