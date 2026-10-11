@@ -124,5 +124,20 @@ ok "collision leaves both sides intact" '[ -f "$PENDING/20260610-000000-aaaa-old
 out="$(CCC_STATE_DIR="$TMP/nostate" run_pe run --now "$NOW")"; rc=$?
 ok "no queue -> no-queue, exit 0" '[ "$rc" = 0 ] && printf "%s" "$out" | jq -e ".status == \"no-queue\"" >/dev/null'
 
+# --- 9) #2239 draft-rejected/: restore reaches it, status does not count it ---------
+# Drafts the staging hook turned away at draft time never entered the queue, so
+# the status "archived" figure (queue departures) must not grow with them,
+# while `restore <id>` still brings one back for a human second look.
+before="$(run_pe status | jq -r .archived)"
+mkdir -p "$ARCHIVE/draft-rejected/20261011-000000-sess-x-draft-gate-reject"
+printf -- '---\nname: draft-gate-reject\ndescription: Captures a procedure.\n---\n# x\n' \
+  > "$ARCHIVE/draft-rejected/20261011-000000-sess-x-draft-gate-reject/SKILL.md"
+ok "#2239 status archived count ignores draft-rejected/" '[ "$(run_pe status | jq -r .archived)" = "$before" ]'
+out="$(run_pe restore 20261011-000000-sess-x-draft-gate-reject)"; rc=$?
+ok "#2239 restore reaches draft-rejected/" \
+  '[ "$rc" = 0 ] && printf "%s" "$out" | jq -e ".status == \"restored\"" >/dev/null && [ -f "$PENDING/20261011-000000-sess-x-draft-gate-reject/SKILL.md" ] && [ ! -e "$ARCHIVE/draft-rejected/20261011-000000-sess-x-draft-gate-reject" ]'
+ok "#2239 restore from draft-rejected/ logs a manifest row there" \
+  'jq -e "select(.reason == \"restore\") | .name == \"20261011-000000-sess-x-draft-gate-reject\"" "$ARCHIVE/draft-rejected/manifest.jsonl" >/dev/null'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -71,6 +71,43 @@ run_skill_review_bg() {
     fi
   fi
 
+  # Draft-time gates (#2239). Until now a draft only had to carry a name and a
+  # frontmatter fence to enter pending-skills/; trigger wording and duplication
+  # were caught downstream (autoinstall in auto mode, the fleet intake reviewer
+  # in review mode), where 85%+ of verdicts came back "revise" for exactly those
+  # two reasons. The same checks now run before staging. A failing draft is
+  # never deleted: it goes to skill-autosave-archive/draft-rejected/<id>/ with
+  # a reject.json so a human can inspect or restore it.
+  #   CCC_SKILL_REVIEW_DRAFT_GATES=off      bypass all three gates (default on)
+  #   CCC_SKILL_REVIEW_MAX_CANDIDATES=N     staged drafts per session (default
+  #                                         1; 0 = no cap)
+  #   CCC_SKILL_DEDUP_*                     thresholds, see gates-lib.sh
+  local GATES=1 MAX_CANDIDATES REJECT_ROOT WORK DESC_TRIGGER_TOOL
+  is_disabled "${CCC_SKILL_REVIEW_DRAFT_GATES:-on}" && GATES=0
+  MAX_CANDIDATES="${CCC_SKILL_REVIEW_MAX_CANDIDATES:-1}"
+  case "$MAX_CANDIDATES" in ''|*[!0-9]*) MAX_CANDIDATES=1 ;; esac
+  REJECT_ROOT="${CCC_SKILL_REVIEW_REJECT_DIR:-$STATE_DIR/skill-autosave-archive/draft-rejected}"
+  DESC_TRIGGER_TOOL="$HOOKDIR/skill-review/description_trigger.py"
+  if [ "$GATES" = 1 ]; then
+    if [ -r "$HOOKDIR/skill-review/gates-lib.sh" ]; then
+      # shellcheck source=claude/hooks/skill-review/gates-lib.sh
+      . "$HOOKDIR/skill-review/gates-lib.sh"
+    fi
+    # A stale deployed tree without the lib (or its frontmatter reader) cannot
+    # run the gates; say so once and stage as before rather than reject blind.
+    if ! declare -f ccc_fm_field >/dev/null 2>&1 || ! declare -f ccc_skill_dedup_installed >/dev/null 2>&1; then
+      log "draft-gates off reason=gates-lib-missing trigger=$TRIGGER"
+      GATES=0
+    fi
+  fi
+  local INSTALLED_ROOT=""
+  if declare -f ccc_skills_dir >/dev/null 2>&1; then
+    INSTALLED_ROOT="$(ccc_skills_dir "$STAGE_PROVIDER")"
+  else
+    INSTALLED_ROOT="${CLAUDE_SKILLS_DIR:-}"
+  fi
+  local rej_trigger=0 rej_duplicate=0 rej_cap=0
+
   local PIPE_PID OUT ec STASH count i staged item name skill_md id safe_id dest fm_tool
   PIPE_PID="${BASHPID:-$$}"
   OUT="$(bash "$HOOKDIR/skill-review/extract.sh" 2>>"$LOG")"
@@ -107,17 +144,46 @@ run_skill_review_bg() {
     id="$(date -u +%Y%m%d-%H%M%S)-${SESSION_ID}-${name}"
     safe_id="$(printf '%s' "$id" | sed -E 's/[^A-Za-z0-9._-]+/-/g' | cut -c1-160)"
     dest="$PENDING_DIR/$safe_id"
-    mkdir -p "$dest" 2>/dev/null || { i=$((i + 1)); continue; }
-    printf '%s\n' "$skill_md" > "$dest/SKILL.md"
+    # The draft is built in an owner-only work dir first (#2239): the gates
+    # need the normalized description, and a rejected draft must never have
+    # touched pending-skills/ (the collector and /skillsuggest read it live).
+    WORK="$STATE_DIR/.skill-review-work-$PIPE_PID"
+    rm -rf "$WORK" 2>/dev/null
+    ( umask 077; mkdir -p "$WORK" ) 2>/dev/null || { i=$((i + 1)); continue; }
+    printf '%s\n' "$skill_md" > "$WORK/SKILL.md"
     # YAML-safe description line (#2032) so a human `/skillsuggest` approve
     # copies a draft fleet-skills can parse. Best-effort: autoinstall.sh
     # re-normalizes (fail-closed) before any automatic install.
     fm_tool="$HOOKDIR/ccc_skill_frontmatter.py"
     [ -r "$fm_tool" ] || fm_tool="$HOOKDIR/../../bridge/utils/skill_frontmatter.py"
     if [ -r "$fm_tool" ]; then
-      python3 "$fm_tool" normalize "$dest/SKILL.md" >/dev/null 2>&1 \
+      python3 "$fm_tool" normalize "$WORK/SKILL.md" >/dev/null 2>&1 \
         || log "candidate normalize-failed name=$name trigger=$TRIGGER pid=$PIPE_PID"
     fi
+    if [ "$GATES" = 1 ]; then
+      local reason="" match="" desc=""
+      desc="$(ccc_fm_field "$WORK/SKILL.md" description)"
+      if ! skill_review_gate_trigger "$desc"; then
+        reason="description-trigger"
+      elif ! match="$(skill_review_gate_duplicate "$name" "$desc" "$WORK")"; then
+        reason="duplicate"
+      elif [ "$MAX_CANDIDATES" -gt 0 ] && [ "$staged" -ge "$MAX_CANDIDATES" ]; then
+        reason="session-cap"
+      fi
+      if [ -n "$reason" ]; then
+        skill_review_reject_draft "$safe_id" "$name" "$reason" "$match" "$WORK/SKILL.md" "$item"
+        case "$reason" in
+          description-trigger) rej_trigger=$((rej_trigger + 1)) ;;
+          duplicate) rej_duplicate=$((rej_duplicate + 1)) ;;
+          session-cap) rej_cap=$((rej_cap + 1)) ;;
+        esac
+        rm -rf "$WORK" 2>/dev/null
+        i=$((i + 1)); continue
+      fi
+    fi
+    mkdir -p "$dest" 2>/dev/null || { rm -rf "$WORK" 2>/dev/null; i=$((i + 1)); continue; }
+    mv -f "$WORK/SKILL.md" "$dest/SKILL.md" 2>/dev/null || { rm -rf "$WORK" 2>/dev/null; i=$((i + 1)); continue; }
+    rm -rf "$WORK" 2>/dev/null
     printf '%s' "$item" | jq -c \
       --arg id "$safe_id" \
       --arg session "$SESSION_ID" \
@@ -159,7 +225,110 @@ run_skill_review_bg() {
         >> "$STATE_DIR/approval-needed.log" 2>/dev/null || true
     fi
   fi
-  log "done staged=$staged trigger=$TRIGGER pid=$PIPE_PID"
+  # Gate tallies into the stash (#2239) so the sweep and a human can see how
+  # many candidates the draft-time gates turned away and why. Rewritten
+  # atomically beside the stash; a jq failure leaves the raw stash in place.
+  if jq -c --argjson staged "$staged" --argjson t "$rej_trigger" --argjson d "$rej_duplicate" --argjson c "$rej_cap" \
+       --arg gates "$([ "$GATES" = 1 ] && printf on || printf off)" \
+       '. + {staged:$staged, draft_gates:$gates, rejected:{trigger:$t, duplicate:$d, session_cap:$c}}' \
+       "$STASH" > "$STASH.tmp" 2>/dev/null; then
+    mv -f "$STASH.tmp" "$STASH" 2>/dev/null || rm -f "$STASH.tmp" 2>/dev/null
+  else
+    rm -f "$STASH.tmp" 2>/dev/null
+  fi
+  log "done staged=$staged rejected_trigger=$rej_trigger rejected_duplicate=$rej_duplicate rejected_session_cap=$rej_cap gates=$([ "$GATES" = 1 ] && printf on || printf off) trigger=$TRIGGER pid=$PIPE_PID"
+  return 0
+}
+
+# --- draft-time gate helpers (#2239) -----------------------------------------
+# Called from inside run_skill_review_bg, so they see its locals (bash dynamic
+# scoping): DESC_TRIGGER_TOOL, INSTALLED_ROOT, PENDING_DIR, REJECT_ROOT,
+# SESSION_ID, TRIGGER, PIPE_PID, STAGE_PROVIDER.
+
+# skill_review_gate_trigger <description> — 0 when the description carries
+# trigger wording (description_trigger.py, the fleet-skills TRIGGER_RE copy),
+# 1 when it does not. Unlike the install gate this one passes through when the
+# check itself cannot run (no python3 / helper missing): it is a pre-filter,
+# and autoinstall + promotion still fail closed behind it. The pass-through is
+# logged so a node silently skipping the gate is visible.
+skill_review_gate_trigger() {
+  local rc
+  if ! command -v python3 >/dev/null 2>&1 || [ ! -r "${DESC_TRIGGER_TOOL:-}" ]; then
+    log "draft-gate description-trigger unverifiable (python3 or helper missing) pass-through pid=${PIPE_PID:-$$}"
+    return 0
+  fi
+  printf '%s' "$1" | python3 "$DESC_TRIGGER_TOOL" check >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) log "draft-gate description-trigger unverifiable rc=$rc pass-through pid=${PIPE_PID:-$$}"; return 0 ;;
+  esac
+}
+
+# skill_review_gate_duplicate <name> <description> <workdir> — 0 when nothing
+# installed (INSTALLED_ROOT, the drafting provider's skills dir) or waiting in
+# PENDING_DIR resembles the candidate. On a hit prints
+# "<installed|pending> <already-exists|name-similar|description-similar> <name>"
+# and returns 1. Passes through (logged) when gates-lib.sh did not load.
+skill_review_gate_duplicate() {
+  local verdict
+  if ! declare -f ccc_skill_dedup_installed >/dev/null 2>&1; then
+    log "draft-gate duplicate unverifiable (gates-lib.sh missing) pass-through pid=${PIPE_PID:-$$}"
+    return 0
+  fi
+  if ! verdict="$(ccc_skill_dedup_installed "$1" "$2" "$3" "${INSTALLED_ROOT:-}")"; then
+    printf 'installed %s' "$verdict"; return 1
+  fi
+  if ! verdict="$(ccc_skill_dedup_pending "$1" "$2" "$3" "${PENDING_DIR:-}")"; then
+    printf 'pending %s' "$verdict"; return 1
+  fi
+  return 0
+}
+
+# skill_review_reject_draft <id> <name> <reason> <match> <skill.md> <item-json>
+#   Moves a gate-rejected draft to REJECT_ROOT/<id>/ (dirs 0700, files 0600):
+#   SKILL.md (normalized), meta.json (the candidate record, status=rejected)
+#   and reject.json {reason, session, ts, name, id, trigger, provider [,
+#   matched, match{scope,kind}]}; appends a manifest.jsonl row in the
+#   pending-expire shape so `ccc-skill-autosave.sh pending-restore <id>` can
+#   put it back into the queue. Nothing is ever deleted here.
+skill_review_reject_draft() {
+  local id="$1" name="$2" reason="$3" match="$4" src="$5" item="$6"
+  local dir="${REJECT_ROOT:-}/$id" scope="" kind="" matched="" now
+  now="$(ts)"
+  if [ -n "$match" ]; then
+    read -r scope kind matched <<<"$match"
+  fi
+  if [ -z "${REJECT_ROOT:-}" ] || ! ( umask 077; mkdir -p "$dir" ) 2>/dev/null; then
+    log "candidate rejected reason=$reason name=$name id=$id archive=failed trigger=${TRIGGER:-} pid=${PIPE_PID:-$$}"
+    return 1
+  fi
+  chmod 700 "$dir" 2>/dev/null || true
+  mv -f "$src" "$dir/SKILL.md" 2>/dev/null || cp -f "$src" "$dir/SKILL.md" 2>/dev/null || true
+  chmod 600 "$dir/SKILL.md" 2>/dev/null || true
+  printf '%s' "$item" | jq -c \
+    --arg id "$id" --arg session "${SESSION_ID:-unknown}" --arg trigger "${TRIGGER:-}" \
+    --arg at "$now" --arg provider "${STAGE_PROVIDER:-}" --arg reason "$reason" \
+    'del(.skill_md) + {id:$id,status:"rejected",reject_reason:$reason,session_id:$session,trigger:$trigger,staged_at:$at,provider:$provider}' \
+    > "$dir/meta.json" 2>/dev/null || true
+  jq -nc --arg reason "$reason" --arg session "${SESSION_ID:-unknown}" --arg ts "$now" \
+    --arg name "$name" --arg id "$id" --arg trigger "${TRIGGER:-}" --arg provider "${STAGE_PROVIDER:-}" \
+    --arg scope "$scope" --arg kind "$kind" --arg matched "$matched" \
+    '{reason:$reason, session:$session, ts:$ts, name:$name, id:$id, trigger:$trigger, provider:$provider}
+     + (if $matched != "" then {matched:$matched, match:{scope:$scope, kind:$kind}} else {} end)' \
+    > "$dir/reject.json" 2>/dev/null || true
+  jq -nc --arg ts "$now" --arg name "$id" --arg reason "$reason" --arg skill "$name" \
+    --arg session "${SESSION_ID:-unknown}" --arg matched "$matched" --arg node "${CCC_NODE:-}" \
+    '{ts:$ts, node:$node, name:$name, reason:("draft-gate:" + $reason), skill:$skill, session:$session}
+     + (if $matched != "" then {matched:$matched} else {} end)' \
+    >> "$REJECT_ROOT/manifest.jsonl" 2>/dev/null || true
+  chmod 600 "$dir/meta.json" "$dir/reject.json" "$REJECT_ROOT/manifest.jsonl" 2>/dev/null || true
+  if [ -n "$matched" ]; then
+    log "candidate rejected reason=$reason name=$name id=$id matched=$matched match=$scope/$kind trigger=${TRIGGER:-} pid=${PIPE_PID:-$$}"
+  else
+    log "candidate rejected reason=$reason name=$name id=$id trigger=${TRIGGER:-} pid=${PIPE_PID:-$$}"
+  fi
   return 0
 }
 
