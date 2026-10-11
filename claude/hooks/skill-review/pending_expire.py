@@ -59,6 +59,11 @@ _STAMP_RE = re.compile(r"^(\d{8})-(\d{6})-")
 # Archive dirs this module may restore from: its own expiry dirs and the
 # pre-screen reject dirs (#2183) — same root, same manifest shape.
 _ARCHIVE_DIR_RE = re.compile(r"^(pending-90d|prescreen-reject)-\d{8}$")
+# Restore additionally reaches into `draft-rejected/` (#2239): drafts the
+# staging hook turned away at draft time. They never entered the queue, so the
+# `status` archived count (which uses _ARCHIVE_DIR_RE) deliberately excludes
+# them; only `restore` may pull one back for a human second look.
+_RESTORE_DIR_RE = re.compile(r"^(pending-90d|prescreen-reject)-\d{8}$|^draft-rejected$")
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 
 
@@ -289,7 +294,7 @@ def restore(state: Path, name: str, *, now: float | None = None, node: str = "")
     found: Path | None = None
     if root.is_dir() and not root.is_symlink():
         for archive_dir in sorted(root.iterdir(), key=lambda p: p.name, reverse=True):
-            if not _ARCHIVE_DIR_RE.match(archive_dir.name) or archive_dir.is_symlink():
+            if not _RESTORE_DIR_RE.match(archive_dir.name) or archive_dir.is_symlink():
                 continue
             candidate = archive_dir / name
             if candidate.is_dir() and not candidate.is_symlink():

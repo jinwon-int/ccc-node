@@ -62,8 +62,8 @@ KEBAB='^[a-z0-9]+(-[a-z0-9]+)*$'
 DESC_MIN=20
 DESC_MAX=1024
 BODY_MIN_LINES=5
-DUP_JACCARD_PCT=60
-DUP_MIN_UNION=6
+# DUP_JACCARD_PCT / DUP_MIN_UNION come from skill-review/gates-lib.sh (#2239),
+# shared with the draft-time gate in skill-review.sh.
 
 mkdir -p "$STATE_DIR" 2>/dev/null
 AUTOINSTALL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || AUTOINSTALL_LIB_DIR="${HOME:-/root}/.claude/hooks/skill-review"
@@ -75,6 +75,10 @@ AUTOINSTALL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pw
 . "$AUTOINSTALL_LIB_DIR/../lib/autonomy-guard.sh" 2>/dev/null || true
 # shellcheck source=claude/hooks/lib/skill-frontmatter.sh
 . "$AUTOINSTALL_LIB_DIR/../lib/skill-frontmatter.sh" || exit 0
+# Dedup gate pieces (norm_name, desc_tokens, gate_dedup, thresholds), shared
+# with the draft-time gate in skill-review.sh (#2239).
+# shellcheck source=claude/hooks/skill-review/gates-lib.sh
+. "$AUTOINSTALL_LIB_DIR/gates-lib.sh" || exit 0
 OWNERSHIP_TOOL="$AUTOINSTALL_LIB_DIR/ownership.py"
 # YAML-safe description renderer (#2032): installed beside the hooks root as
 # ccc_skill_frontmatter.py; a repository checkout uses the canonical module.
@@ -471,40 +475,10 @@ claim_urls() { # <skill.md> — every citable URL, deduped, scheme-normalized
     | grep -E '^https?://[^/]+\.[A-Za-z]{2,24}(/|$)' | sort -u
 }
 
-norm_name() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -dc 'a-z0-9'; }
-
-# Trigger-first descriptions all open with the same "Use when ..." clause, so
-# those words would count as shared tokens in every pair and push unrelated
-# skills toward the similarity threshold. Drop them, as the fleet-skills
-# near-duplicate advisory does (its SIMILARITY_STOPWORDS covers these).
-DESC_TRIGGER_STOPWORDS=' use using when whenever while before after this '
-desc_tokens() { # <text> — one lowercase token (len>=3) per line, unique+sorted
-  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '\n' \
-    | awk -v stop="$DESC_TRIGGER_STOPWORDS" 'length($0) >= 3 && index(stop, " " $0 " ") == 0' | sort -u
-}
-
-gate_dedup() { # <name> <description> <workdir>
-  local name="$1" desc="$2" work="$3" f ex_name ex_desc inter union
-  if [ -e "$SKILLS_DIR/$name" ]; then printf 'dedup already-exists %s' "$name"; return 1; fi
-  desc_tokens "$desc" > "$work/draft.tok"
-  while IFS= read -r f; do
-    ex_name="$(fm_field "$f" name)"
-    [ -n "$ex_name" ] || continue
-    if [ "$(norm_name "$ex_name")" = "$(norm_name "$name")" ]; then
-      printf 'dedup name-similar %s' "$ex_name"; return 1
-    fi
-    ex_desc="$(fm_field "$f" description)"
-    [ -n "$ex_desc" ] || continue
-    desc_tokens "$ex_desc" > "$work/exist.tok"
-    inter="$(comm -12 "$work/draft.tok" "$work/exist.tok" 2>/dev/null | wc -l | tr -d '[:space:]')"
-    union="$(sort -u "$work/draft.tok" "$work/exist.tok" 2>/dev/null | wc -l | tr -d '[:space:]')"
-    if [ "${union:-0}" -ge "$DUP_MIN_UNION" ] \
-       && [ $((inter * 100)) -ge $((union * DUP_JACCARD_PCT)) ]; then
-      printf 'dedup description-similar %s' "$ex_name"; return 1
-    fi
-  done < <(find "$SKILLS_DIR" -maxdepth 2 -name SKILL.md 2>/dev/null | sort)
-  return 0
-}
+# norm_name / desc_tokens / gate_dedup <name> <description> <workdir> live in
+# skill-review/gates-lib.sh (#2239) — sourced above, contract unchanged:
+# gate_dedup reads the routed SKILLS_DIR global and prints
+# "dedup already-exists|name-similar|description-similar <existing>" on a hit.
 
 # ---------------------------------------------------------------------------
 # run — gate + install

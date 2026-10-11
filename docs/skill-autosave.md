@@ -361,6 +361,60 @@ the hint to act on. The effect of both measures on the staging backlog is
 re-measured two weeks after the default change (2026-10-13) to decide whether
 #1647 can close.
 
+## Draft-time gates (#2239)
+
+The drafting hook (`claude/hooks/skill-review.sh`, both the manual verb and the
+SessionEnd hook — they share one staging loop) runs three cheap gates over
+every model candidate **before** it is written into `pending-skills/`. Until
+#2239 a candidate only needed a name and a frontmatter fence to be staged, and
+the two defects behind 85%+ of fleet intake "revise" verdicts — missing trigger
+wording and duplication — were only caught downstream (auto-mode installer,
+intake reviewer, or a human). A candidate is rejected when:
+
+1. **`description-trigger`** — the normalized `description` has no trigger
+   wording. Same single pattern as the install and promotion gates
+   (`skill-review/description_trigger.py`, the fleet-skills `TRIGGER_RE`
+   copy). Unlike those gates this one is a pre-filter, so when the check
+   cannot run (no `python3`, helper missing) it logs
+   `draft-gate description-trigger unverifiable ... pass-through` and stages
+   the draft; the fail-closed gates behind it are unchanged.
+2. **`duplicate`** — the name (normalized) or description resembles
+   (i) an installed skill in the drafting provider's skills root (the same
+   root `autoinstall.sh` routes that draft to; an existing `<root>/<name>` dir
+   counts too), at description-token Jaccard ≥ `CCC_SKILL_DEDUP_JACCARD_PCT`
+   (default 60, shared with the installer's `dedup` gate), or (ii) an
+   undecided draft already in `pending-skills/`, at the **stricter**
+   `CCC_SKILL_DEDUP_PENDING_JACCARD_PCT` (default 75 — pending drafts are
+   unreviewed variations, so the installed-level threshold would reject too
+   many genuinely different follow-ups). `CCC_SKILL_DEDUP_MIN_UNION`
+   (default 6) is the minimum token-union size before the Jaccard test
+   applies. Tokens drop the shared trigger words, as before. The matched
+   skill name is recorded in `reject.json` (`matched`, `match.scope`
+   `installed|pending`, `match.kind` `already-exists|name-similar|description-similar`).
+3. **`session-cap`** — more than `CCC_SKILL_REVIEW_MAX_CANDIDATES` candidates
+   (default **1**; `0` = no cap) have already been staged from this session.
+   The quality gates run first, so a capped candidate is one that would
+   otherwise have been staged.
+
+Rejected drafts are **never deleted**. Each goes to
+`~/.claude/state/skill-autosave-archive/draft-rejected/<id>/` (dirs 0700,
+files 0600; `CCC_SKILL_REVIEW_REJECT_DIR` overrides the root) with the
+normalized `SKILL.md`, `meta.json` (the candidate record, `status: rejected`)
+and `reject.json` `{reason, session, ts, name, id, trigger, provider[, matched,
+match]}`; the root keeps a `manifest.jsonl` row per rejection in the
+pending-expire shape, so `ccc-skill-autosave.sh pending-restore <id>` moves one
+back into the queue for a human second look. The review log gets one line per
+rejection, `candidate rejected reason=<reason> name=<name> id=<id> [matched=…]`,
+and `skill-review-last.json` carries `staged`, `draft_gates: on|off` and
+`rejected: {trigger, duplicate, session_cap}` for the run.
+
+`CCC_SKILL_REVIEW_DRAFT_GATES=off` (also `0|false|no`) bypasses all three gates
+for tests and operations; the default is on. A deployed tree that lacks
+`skill-review/gates-lib.sh` logs `draft-gates off reason=gates-lib-missing` and
+stages as before rather than rejecting blind. The dedup helpers (`norm_name`,
+`desc_tokens`, `gate_dedup`, the thresholds) live in that shared lib; the
+installer sources it and its `dedup …` verdicts are unchanged.
+
 ## Auto mode — unattended install with post-hoc review (#355)
 
 Opt in per node (default stays `approve`/review; existing nodes are unchanged).
