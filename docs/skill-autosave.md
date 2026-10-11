@@ -806,6 +806,65 @@ If any open promote PR cannot be read, the run opens nothing
 (`open-promote-pr-unreadable`). This stops the daily duplicate drafts
 (fleet-skills #289/#298/#302/#310/#314 all staged the same 8 skills).
 
+#### Auto-approval of mechanical promote PRs (#2239 L3, default OFF)
+
+`auto-merge` alone cannot land a promote PR: fleet-skills `main` needs one
+approving review, and `gh-pr-flow` reserves relay approvals for fresh per-call
+user approval. L3 adds one narrow **standing approval** the owner turns on
+explicitly — the same exception is written into the `gh-pr-flow` skill
+(codex and claude copies), which stays the policy source:
+
+```bash
+# off (default/absent) | dry-run | true — owner-created, 0600
+printf 'dry-run\n' > ~/.claude/state/skill-promotion.auto-approve
+chmod 600 ~/.claude/state/skill-promotion.auto-approve
+# true mode also needs the relay ssh alias (no default) — publisher config file:
+#   CCC_SKILL_PROMOTION_APPROVE_SSH_TARGET=<relay-ssh-alias>
+#   CCC_SKILL_PROMOTION_APPROVE_PROFILE=seoseo-ai     # default
+#   CCC_SKILL_PROMOTION_APPROVE_CMD=<path>            # default: managed codex
+#                                                     # gh-pr-flow approve-via-relay.sh
+```
+
+Env equivalent: `CCC_SKILL_PROMOTION_AUTO_APPROVE` (process env > config file >
+flag file). `status` shows `auto_approve: {mode, cmd_present, profile,
+ssh_target_set, blocker}` — presence only, never the target or path.
+
+- **Scope:** only `promote/auto-*` PRs this publisher opened (ledger
+  `a2a-promote-pr`) in the promotion repo, during the collect / results-only
+  sweep with `auto-merge` on. Nothing else gains standing approval.
+- **Reviewer:** with the mode not off, `promote` requests the profile's actor
+  as reviewer at PR creation (the relay helper refuses non-requested
+  reviewers); the sweep re-requests it if missing. Off keeps the `gh pr create`
+  call unchanged.
+- **Gates, on the exact head:** no creation-time identity hits; checks green
+  and `MERGEABLE`; the full `gh pr diff` touches only
+  `approved/<audience>/<staged skill>/…` (binary, symlink, submodule or
+  unparseable entries block); every added line in every file passes the intake
+  scanner (credentials, home paths, IPv4, email, runtime coupling) and the
+  fleet-identity scan; `approval.json` has the generator's exact shape and a
+  reviewed tree; the head is unchanged across the diff read. A PR the sweep
+  just marked ready waits one sweep (`autoapprove-deferred`).
+- **Outcomes:** any failed gate → `needs-human-autoapprove-blocked` with reason
+  codes (never values) and today's flow continues. `dry-run` →
+  `would-approve-promote-pr` plus one ledger row `a2a-promote-autoapprove`
+  `{pr, head_sha, mode: "dry-run", ts}` per head. `true` → runs
+  `approve-via-relay.sh --review-profile P --repo R --pr N --expected-head HEAD
+  --operator-approved --ssh-target T` with `CCC_EXPLICIT_USER_APPROVAL=1`,
+  records `{mode: "approved", profile}`, then `gh pr merge --squash
+  --match-head-commit HEAD` (the merge queue enqueues; `--delete-branch` is
+  omitted because gh refuses it on a merge-queue branch and the repo deletes
+  merged heads itself; never `--admin`) → `promote-pr-merge-requested`; the next
+  sweep's live read records `MERGED`. Not configured →
+  `approve-not-configured` (`approve_cmd_missing`, `approve_ssh_target_unset`).
+  Relay failure → `approve-failed` with an exit code, a ledger row, and today's
+  merge attempt; at most 3 failed attempts per head.
+- **Owner notice:** a first-time approval (or dry-run would-approve) writes one
+  push-spool line `SkillPromoteAutoApprove` with counts and PR numbers only —
+  from the promoter itself, so the 15-minute results cron reports too.
+  `CCC_SKILL_AUTOSAVE_NOTIFY=0` silences it.
+- **Revoke:** delete the flag file (or write `off`); the next sweep is back to
+  the pre-L3 flow. No restart.
+
 ### Installing approved private skills
 
 Setup installs the consumer beside the autosave hooks, but does not run it.
