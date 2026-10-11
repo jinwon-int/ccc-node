@@ -77,6 +77,46 @@ promotion_env_file_state() { # present | absent | unsafe (presence only, #1766 r
   else echo absent; fi
 }
 
+# Curator settings file (#2239 L1). The curator is configured by environment
+# only and the managed autosave cron line has no curator options, so a node's
+# owner-approved lifecycle choice (e.g. archive on, 60-day floor = #1739 v2)
+# lives in this owner-only file. It is PARSED, never sourced: only the
+# allow-listed CCC_SKILL_CURATOR_* keys with a short [A-Za-z0-9._-] value are
+# taken, and a value already in the environment (cron line, operator export)
+# wins. Same file-safety rule as the promotion env above. The curator still
+# validates every value itself and fails closed on garbage.
+CURATOR_ENV="${CCC_SKILL_CURATOR_ENV_FILE:-${HOME:-/root}/.config/ccc-node/skill-curator.env}"
+CURATOR_ENV_KEYS="ENABLED ARCHIVE_ENABLED ARCHIVE_AFTER_DAYS STALE_AFTER_DAYS RECHECK_AFTER_DAYS BACKUP_KEEP"
+CURATOR_ENV_APPLIED=""
+curator_env_file_ok() { # regular file, owned by us, no group/other bits
+  [ -f "$CURATOR_ENV" ] && [ ! -L "$CURATOR_ENV" ] && [ -O "$CURATOR_ENV" ] || return 1
+  case "$(stat -c %a "$CURATOR_ENV" 2>/dev/null)" in [0-7]00) return 0 ;; esac
+  return 1
+}
+curator_env_file_state() { # present | absent | unsafe (presence only)
+  if curator_env_file_ok; then echo present
+  elif [ -e "$CURATOR_ENV" ] || [ -L "$CURATOR_ENV" ]; then echo unsafe
+  else echo absent; fi
+}
+load_curator_env() {
+  curator_env_file_ok || return 0
+  local line key value short
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    line="${line#export }"
+    key="${line%%=*}"; value="${line#*=}"
+    [ "$key" != "$line" ] || continue
+    short="${key#CCC_SKILL_CURATOR_}"
+    [ "$short" != "$key" ] || continue
+    case " $CURATOR_ENV_KEYS " in *" $short "*) ;; *) continue ;; esac
+    [[ "$value" =~ ^[A-Za-z0-9._-]{1,16}$ ]] || continue
+    [ -z "${!key+x}" ] || continue
+    export "$key=$value"
+    CURATOR_ENV_APPLIED="${CURATOR_ENV_APPLIED:+$CURATOR_ENV_APPLIED,}$short"
+  done < "$CURATOR_ENV"
+}
+load_curator_env
+
 # Fleet-wide autonomy guard (#386): a single kill-switch/dry-run above every
 # no-approval write. The installed layout keeps the lib under the claude tree;
 # the repo checkout keeps it beside this script's ../claude. Sourced fail-open —
@@ -385,6 +425,7 @@ if [ "$MODE" = "status" ]; then
   # #2239: same presence-only rule. `unsafe` = exists but is not a regular
   # owner-only file we own, so neither the sweep nor the promoter reads it.
   echo "promotion env file: $(promotion_env_file_state) ($PROMOTION_ENV — CCC_SKILL_PROMOTION_* knobs for the 2d collect and the results cron; process env wins; python3 \"$PROMOTER\" status shows config_file/effective)"
+  echo "curator env file: $(curator_env_file_state) ($CURATOR_ENV — allow-listed CCC_SKILL_CURATOR_* keys; process env wins) applied=${CURATOR_ENV_APPLIED:-none} archive_after_days=${CCC_SKILL_CURATOR_ARCHIVE_AFTER_DAYS:-90(default)}"
   echo "candidates report: $(ls -la "$STATE_DIR/skill-candidates.md" 2>/dev/null || echo none)"
   echo "-- ledger (last 5) --";      tail -5 "$LEDGER" 2>/dev/null
   echo "-- autosave installs (last 5) --"; tail -5 "$STATE_DIR/skill-autosave-install.jsonl" 2>/dev/null
@@ -921,6 +962,7 @@ else
   else
     curator_args="run --auto"
     [ "$AUTONOMY_STATE" = "dry-run" ] && curator_args="run --auto --dry-run"
+    log "curator config file=$(curator_env_file_state) applied=${CURATOR_ENV_APPLIED:-none} archive=$(curator_archive_state) archive_after_days=${CCC_SKILL_CURATOR_ARCHIVE_AFTER_DAYS:-90}"
     summary="$(python3 "$CURATOR" $curator_args 2>>"$LOG")" \
       && log "curator $(printf '%s' "$summary" | head -c 500)" \
       || log "curator failed (non-fatal)"

@@ -154,6 +154,32 @@ effective 30 + 30 days in #1739 v2. A stage-2 skill below the minimum is
 reported as `archive-candidate` with reason
 `…;below-archive-floor-<N>d`.
 
+### Where a node sets these
+
+The managed autosave cron line has no curator options, so the nightly sweep
+(`scripts/ccc-skill-autosave.sh`) reads an owner-only settings file:
+
+```bash
+# ~/.config/ccc-node/skill-curator.env  (mode 0600, owned by the sweep's user)
+CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true
+CCC_SKILL_CURATOR_ARCHIVE_AFTER_DAYS=60
+```
+
+- Override the path with `CCC_SKILL_CURATOR_ENV_FILE`.
+- The file is **parsed, never sourced**. Only `ENABLED`, `ARCHIVE_ENABLED`,
+  `ARCHIVE_AFTER_DAYS`, `STALE_AFTER_DAYS`, `RECHECK_AFTER_DAYS` and
+  `BACKUP_KEEP` (each prefixed `CCC_SKILL_CURATOR_`) with a short
+  `[A-Za-z0-9._-]` value are taken; any other line is ignored.
+- A value already in the environment (cron line, operator export) wins.
+- A symlink, a file owned by someone else, or one with group/other bits is
+  ignored and shown as `unsafe` in `ccc-skill-autosave.sh status`.
+- Each sweep logs `curator config file=<state> applied=<key names>` and the
+  effective archive state and floor. Values are not logged.
+
+Turning archive on is an owner decision (#1739: PR-first, owner approval,
+move only, never delete). Running `curator.py` by hand does not read this
+file; export the same variables for a manual `run --dry-run`.
+
 Usage clears or restarts the mark:
 
 - A use seen by the next run reactivates the skill: the state returns to
