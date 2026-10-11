@@ -10,7 +10,7 @@ This document covers the Claude Code harness pieces installed by `setup.sh`: set
 | `claude/settings.local.template.json` | Local permission allowlist template. |
 | `claude/hooks/enforcement-overlay.json` | Portable enforcement/observability hook overlay for standalone installs. |
 | `claude/CLAUDE.md.template` | Operating-policy skeleton with placeholders for node/user identity. |
-| `claude/hooks/` | Memory loading, tool loading, guard/audit/redact/notify, distill, skill-review, statusline, evidence gate. |
+| `claude/hooks/` | Memory loading, tool loading, guard/audit/redact/notify, distill, skill-review, statusline, evidence gate, post-edit lint (`post-edit-lint.sh`, ruff/py_compile after `.py` edits) and identical-call streak reminder (`tool-streak.sh`) — both PostToolUse, reminder-only (#2261). |
 | `claude/output-styles/ccc-report.md` | Korean structured-reporting default. |
 | `hermes/` | Hermes-side local config templates; real values stay node-local. |
 
