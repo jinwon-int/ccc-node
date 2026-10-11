@@ -951,22 +951,46 @@ ok "claude login failure fails closed to human" '[ "$(review_of "$idk3")" = 1 ]'
 ok "claude login failure is classed body-free in audit" \
   'grep -q '\''"claude:exit-1:not_logged_in"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "Please run" "$NUNCHI_HOME/judge-audit.jsonl"'
 
-# An overlong rationale is told apart from a key-set mismatch.
+# #2248: an otherwise valid Claude verdict with an overlong rationale is kept
+# with the rationale cut to the limit (display text), and the cut is noted.
+# Measured: Haiku overshoots 200 chars even isolated and told 160, and every
+# such verdict used to fall through to the Codex/GPT fallback.
 cat >"$TMP/bin/claude" <<'STUB'
 #!/usr/bin/env bash
 cat >/dev/null
-python3 -c 'import json; print(json.dumps({"verdict":"clear","rationale":"y"*201,"supersede_proposal":None}))'
+python3 -c 'import json; print(json.dumps({"verdict":"clear","rationale":"y"*450,"supersede_proposal":None}))'
 STUB
 chmod +x "$TMP/bin/claude"
 reset_db
 # shellcheck disable=SC2034  # idk5 is read via eval inside ok()
 idk5="$(seed peer-k "긴 근거 형제 갈등" "$OLD" 1 1 dk5)"
 seed peer-k "긴 근거 형제 갈등" "$OLD" 1 0 dk6 >/dev/null
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude)"
+ok "overlong claude rationale keeps the verdict (no fallback)" \
+  '[ "$(review_of "$idk5")" = 0 ] && grep -q '\''"backend": "claude"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
+ok "overlong claude rationale is cut to 200 chars and noted" \
+  '[ "$(python3 -c "import json,sys
+rs=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+r=[x for x in rs if x.get(\"backend\")==\"claude\"][-1]
+print(len(r[\"rationale\"]), r[\"rationale\"].endswith(\"…\"), \"claude:rationale-truncated\" in r[\"attempts\"])" "$NUNCHI_HOME/judge-audit.jsonl")" = "200 True True" ]'
+
+# The supersede proposal is a human's decision input: an overlong one still
+# fails closed, and the Codex lane (schema enforced in its CLI) stays strict.
+cat >"$TMP/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+python3 -c 'import json; print(json.dumps({"verdict":"conflict","rationale":"contradiction","supersede_proposal":"z"*201}))'
+STUB
+chmod +x "$TMP/bin/claude"
+reset_db
+# shellcheck disable=SC2034  # idk7 is read via eval inside ok()
+idk7="$(seed peer-k "긴 제안 형제 갈등" "$OLD" 1 1 dk9)"
+seed peer-k "긴 제안 형제 갈등" "$OLD" 1 0 dk10 >/dev/null
 # shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude)"
-ok "overlong claude rationale fails closed to human" '[ "$(review_of "$idk5")" = 1 ]'
-ok "overlong claude rationale is classed rationale-too-long, body-free" \
-  'grep -q '\''"claude:rationale-too-long"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "yyyyyyyyyyyyyyyy" "$NUNCHI_HOME/judge-audit.jsonl"'
+ok "overlong claude proposal fails closed to human" '[ "$(review_of "$idk7")" = 1 ]'
+ok "overlong claude proposal is classed proposal-too-long, body-free" \
+  'grep -q '\''"claude:proposal-too-long"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "zzzzzzzzzzzzzzzz" "$NUNCHI_HOME/judge-audit.jsonl"'
 
 printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

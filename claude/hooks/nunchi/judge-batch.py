@@ -902,7 +902,22 @@ def _typesafe_judge(prompt_item, siblings):
     }, None
 
 
-def _parse_judge_result(output):
+RATIONALE_MAX = 200
+
+
+def _parse_judge_result(output, truncate_rationale=False):
+    """Parse one verdict object; every structural defect fails closed.
+
+    ``truncate_rationale`` (Claude only, #2248): the Claude CLI has no schema
+    enforcement on this path, and Haiku keeps overshooting the 200-char
+    rationale even when isolated and told 160 — every such verdict used to
+    fail closed and fall through to the Codex/GPT fallback. The rationale is
+    display text for the audit/report, so an otherwise valid verdict keeps it
+    cut to the limit instead. The key set, the verdict rubric and the
+    supersede proposal (a human's decision input) stay strict. Codex enforces
+    the schema in its CLI, so an overlong Codex field still means a broken
+    backend and still fails closed.
+    """
     match = re.search(r"\{.*\}", output, re.DOTALL)
     if not match:
         return None, "no-json"
@@ -920,17 +935,24 @@ def _parse_judge_result(output):
     proposal = parsed["supersede_proposal"]
     if not isinstance(rationale, str):
         return None, "schema-invalid"
-    if len(rationale) > 200:
-        return None, "rationale-too-long"
+    truncated = False
+    if len(rationale) > RATIONALE_MAX:
+        if not truncate_rationale:
+            return None, "rationale-too-long"
+        rationale = rationale[:RATIONALE_MAX - 1] + "…"
+        truncated = True
     if proposal is not None and not isinstance(proposal, str):
         return None, "schema-invalid"
     if proposal is not None and len(proposal) > 200:
         return None, "proposal-too-long"
-    return {
+    result = {
         "verdict": verdict,
         "rationale": rationale,
         "supersede_proposal": proposal,
-    }, None
+    }
+    if truncated:
+        result["rationale_truncated"] = True
+    return result, None
 
 
 def judge_item(item, siblings):
@@ -971,10 +993,15 @@ def judge_item(item, siblings):
         if failure:
             attempts.append(f"{provider}:{failure}")
             continue
-        parsed, failure = _parse_judge_result(output)
+        parsed, failure = _parse_judge_result(
+            output, truncate_rationale=(provider == "claude"))
         if failure:
             attempts.append(f"{provider}:{failure}")
             continue
+        # Body-free audit note: the verdict stood, only its display text was
+        # cut. A note, not a failure — the backend still answered.
+        if parsed.pop("rationale_truncated", False):
+            attempts.append(f"{provider}:rationale-truncated")
         # The CLI backends answer in free text and report no confidence. None
         # (not 0.0) is the honest value, and the gate must let it through.
         parsed["confidence"] = None
