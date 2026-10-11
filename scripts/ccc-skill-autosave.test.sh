@@ -955,5 +955,64 @@ status18c="$(CCC_STATE_DIR="$STATE18C" CCC_SKILL_PROMOTION_ENV_FILE="$PENV18C" b
 ok "#2239: status reports a 0644 promotion env file as unsafe" \
   'printf "%s" "$status18c" | grep -q "^promotion env file: unsafe"'
 
+# --- 19) #2239 L1: owner-only curator settings file, parsed not sourced ----
+CURATOR_STUB19="$TMP/curator-stub19.py"
+cat > "$CURATOR_STUB19" <<'PY19'
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+keys = ("ARCHIVE_ENABLED", "ARCHIVE_AFTER_DAYS", "NOW", "CONSOLIDATE")
+line = " ".join(k + "=" + os.environ.get("CCC_SKILL_CURATOR_" + k, "unset") for k in keys)
+line += " FOO=" + os.environ.get("FOO19", "unset")
+Path(os.environ["CURATOR_TOUCH"]).write_text(line + "\n", encoding="utf-8")
+print('{"ok":true,"command":"run"}')
+PY19
+STATE19="$TMP/state19"; mkdir -p "$STATE19"; chmod 700 "$STATE19"
+CENV19="$TMP/skill-curator19.env"
+run19() {
+  env CCC_STATE_DIR="$STATE19" CLAUDE_PROJECTS_DIR="$TMP/projects19" \
+    CCC_PUSH_SPOOL="$TMP/spool19" CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
+    SCAN_TOUCH="$TMP/scan19.touched" CCC_SKILL_PROMOTION_CMD="$PROMOTER" \
+    PROMOTION_TOUCH="$TMP/promotion19.touched" CCC_SKILL_CURATOR_CMD="$CURATOR_STUB19" \
+    CURATOR_TOUCH="$TMP/curator19.touched" CLAUDE_SKILLS_DIR="$TMP/skills19" \
+    CCC_SKILL_CURATOR_ENV_FILE="$CENV19" \
+    CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 CCC_NODE=testnode "$@" bash "$AUTOSAVE" run
+}
+cat > "$CENV19" <<EOF19
+# owner decision: archive on, #1739 v2 floor
+CCC_SKILL_CURATOR_ARCHIVE_ENABLED=true
+export CCC_SKILL_CURATOR_ARCHIVE_AFTER_DAYS=60
+CCC_SKILL_CURATOR_NOW=2030-01-01T00:00:00Z
+CCC_SKILL_CURATOR_CONSOLIDATE=true
+FOO19=leak
+CCC_SKILL_CURATOR_STALE_AFTER_DAYS=\$(touch $TMP/injected19)
+CCC_SKILL_CURATOR_RECHECK_AFTER_DAYS=30;touch $TMP/injected19b
+EOF19
+chmod 600 "$CENV19"
+run19
+ok "#2239: curator env file sets allow-listed keys for the curator" \
+  'grep -q "ARCHIVE_ENABLED=true ARCHIVE_AFTER_DAYS=60 " "$TMP/curator19.touched"'
+ok "#2239: curator env file never sets a non-allow-listed key" \
+  'grep -q "NOW=unset CONSOLIDATE=unset FOO=unset" "$TMP/curator19.touched"'
+ok "#2239: curator env file is parsed, never executed" \
+  '[ ! -e "$TMP/injected19" ] && [ ! -e "$TMP/injected19b" ]'
+ok "#2239: the sweep logs which curator keys the file applied (names only)" \
+  'grep -q "curator config file=present applied=ARCHIVE_ENABLED,ARCHIVE_AFTER_DAYS archive=ENABLED archive_after_days=60" "$STATE19/skill-autosave.log"'
+run19 CCC_SKILL_CURATOR_ARCHIVE_AFTER_DAYS=90
+ok "#2239: a value already in the environment wins over the file" \
+  'grep -q "ARCHIVE_ENABLED=true ARCHIVE_AFTER_DAYS=90 " "$TMP/curator19.touched"'
+# shellcheck disable=SC2034  # read via eval inside ok()
+out19="$(CCC_STATE_DIR="$STATE19" CCC_SKILL_CURATOR_ENV_FILE="$CENV19" bash "$AUTOSAVE" status 2>&1)"
+ok "#2239: status shows the curator env file and the effective floor" \
+  'printf "%s" "$out19" | grep -q "^curator env file: present .*applied=ARCHIVE_ENABLED,ARCHIVE_AFTER_DAYS archive_after_days=60" && printf "%s" "$out19" | grep -q "^curator: enabled, archive moves ENABLED"'
+chmod 644 "$CENV19"
+run19
+ok "#2239: a group/other-readable curator env file is ignored" \
+  'grep -q "ARCHIVE_ENABLED=unset ARCHIVE_AFTER_DAYS=unset " "$TMP/curator19.touched"'
+# shellcheck disable=SC2034  # read via eval inside ok()
+status19b="$(CCC_STATE_DIR="$STATE19" CCC_SKILL_CURATOR_ENV_FILE="$CENV19" bash "$AUTOSAVE" status 2>&1)"
+ok "#2239: status reports a 0644 curator env file as unsafe" \
+  'printf "%s" "$status19b" | grep -q "^curator env file: unsafe"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
