@@ -97,7 +97,8 @@ Collecting is left to the caller. Gather one JSON line per node, then
 aggregate:
 
 ```bash
-for n in seoseo gwakga daegyo; do
+# NODES: your ssh aliases, e.g. read from the node-local topology config
+for n in $NODES; do
   ssh "$n" 'python3 ~/ccc-node/scripts/ccc-skill-usage-report.py node --json'
 done > /tmp/skill-usage.jsonl
 python3 scripts/ccc-skill-usage-report.py aggregate /tmp/skill-usage.jsonl
