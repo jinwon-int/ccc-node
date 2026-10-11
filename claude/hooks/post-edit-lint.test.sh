@@ -104,5 +104,5 @@ ctx="$(jq -r ".hookSpecificOutput.additionalContext" <<<"$out")"
 ok "oversized findings are cut at the byte cap but the total count is kept" \
   '[ "$rc" = 0 ] && [ "${#ctx}" -lt 1000 ] && grep -q "200 finding(s)" <<<"$ctx" && grep -q "truncated; 200 findings total" <<<"$ctx"'
 
-echo "post-edit-lint.test.sh: pass=$pass fail=$fail"
-[ "$fail" -eq 0 ]
+echo "----"; echo "PASS=$pass FAIL=$fail"
+[ "$fail" = 0 ]

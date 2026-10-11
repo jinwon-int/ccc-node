@@ -96,5 +96,5 @@ ok "malformed stdin is fail-open" '[ "$rc" = 0 ] && [ -z "$out" ]'
 rc=0; out="$(run_hook "$(jq -nc '{tool_name:"Bash", tool_input:{command:"x"}}')")" || rc=$?
 ok "a call without session_id is ignored" '[ "$rc" = 0 ] && [ -z "$out" ]'
 
-echo "tool-streak.test.sh: pass=$pass fail=$fail"
-[ "$fail" -eq 0 ]
+echo "----"; echo "PASS=$pass FAIL=$fail"
+[ "$fail" = 0 ]
