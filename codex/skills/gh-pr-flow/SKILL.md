@@ -191,7 +191,7 @@ the owner has switched it on, and it covers only this case:
   `seoseo-ai` profile (the publisher authors as `jinon86`). An interactive
   session never uses it.
 - **Owner switch:** the owner-created `0600` flag file
-  `~/.claude/state/skill-promotion.auto-approve` reading `true` on the
+  the publisher state-dir flag `$CCC_STATE_DIR/skill-promotion.auto-approve` reading `true` on the
   publisher (or `CCC_SKILL_PROMOTION_AUTO_APPROVE=true` in its owner-only
   config file). `dry-run` approves nothing and only records
   `would-approve-promote-pr`. Absent/`off` = no standing approval.
