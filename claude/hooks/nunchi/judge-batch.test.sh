@@ -471,7 +471,7 @@ printf '%s\n' long >"$TMP/codex-mode"
 out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=codex)"
 ok "local parser rejects overlong Codex rationale fail-closed" '[ "$(review_of "$idc7")" = 1 ]'
 ok "overlong output body is absent from audit" \
-  'grep -q '\''"codex:schema-invalid"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "xxxxxxxxxxxxxxxx" "$NUNCHI_HOME/judge-audit.jsonl"'
+  'grep -q '\''"codex:rationale-too-long"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "xxxxxxxxxxxxxxxx" "$NUNCHI_HOME/judge-audit.jsonl"'
 
 # ---- #1336: TTL-imminent observation evidence is annotated, not silent -----
 TTLFIX="$TMP/ttl-fixture.py"
@@ -906,6 +906,67 @@ ok "audit records a null confidence for backends that report none" \
   'grep -q "\"confidence\": null" "$NUNCHI_HOME/judge-audit.jsonl"'
 ok "no gate line in the report when the gate is unset" \
   '! grep -q "confidence gate" "$CCC_STATE_DIR/nunchi-review-report.md"'
+
+# ---- #2245: Claude verdict runs isolated; failures are classed body-free ----
+# The verdict call must not inherit the node harness (CLAUDE.md, SessionStart
+# memory, output style, hooks) and must not run at the node-global effort.
+cat >"$TMP/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' "$@" >"$(dirname "$0")/../claude-args"
+printf '%s\n' '{"verdict":"clear","rationale":"duplicate restatement","supersede_proposal":null}'
+STUB
+chmod +x "$TMP/bin/claude"
+reset_db
+# shellcheck disable=SC2034  # idk1 is read via eval inside ok()
+idk1="$(seed dungae "격리 판정 형제 갈등" "$OLD" 1 1 dk1)"
+seed dungae "격리 판정 형제 갈등" "$OLD" 1 0 dk2 >/dev/null
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude)"
+ok "claude verdict call runs in --safe-mode" \
+  '[ "$(review_of "$idk1")" = 0 ] && grep -qx -- "--safe-mode" "$TMP/claude-args"'
+ok "claude verdict call pins low effort by default" \
+  '[ "$(grep -x -A1 -- "--effort" "$TMP/claude-args" | tail -n 1)" = low ]'
+reset_db
+seed dungae "격리 판정 효과 형제" "$OLD" 1 1 dk7 >/dev/null
+seed dungae "격리 판정 효과 형제" "$OLD" 1 0 dk8 >/dev/null
+rm -f "$TMP/claude-args"
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude NUNCHI_JUDGE_EFFORT=medium)"
+ok "NUNCHI_JUDGE_EFFORT overrides the judge effort" \
+  '[ "$(grep -x -A1 -- "--effort" "$TMP/claude-args" | tail -n 1)" = medium ]'
+
+# A login failure is recorded by class, never by stderr body.
+cat >"$TMP/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+echo "Not logged in · Please run /login" >&2
+exit 1
+STUB
+chmod +x "$TMP/bin/claude"
+reset_db
+# shellcheck disable=SC2034  # idk3 is read via eval inside ok()
+idk3="$(seed dungae "로그인 실패 형제 갈등" "$OLD" 1 1 dk3)"
+seed dungae "로그인 실패 형제 갈등" "$OLD" 1 0 dk4 >/dev/null
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude)"
+ok "claude login failure fails closed to human" '[ "$(review_of "$idk3")" = 1 ]'
+ok "claude login failure is classed body-free in audit" \
+  'grep -q '\''"claude:exit-1:not_logged_in"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "Please run" "$NUNCHI_HOME/judge-audit.jsonl"'
+
+# An overlong rationale is told apart from a key-set mismatch.
+cat >"$TMP/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+python3 -c 'import json; print(json.dumps({"verdict":"clear","rationale":"y"*201,"supersede_proposal":None}))'
+STUB
+chmod +x "$TMP/bin/claude"
+reset_db
+# shellcheck disable=SC2034  # idk5 is read via eval inside ok()
+idk5="$(seed dungae "긴 근거 형제 갈등" "$OLD" 1 1 dk5)"
+seed dungae "긴 근거 형제 갈등" "$OLD" 1 0 dk6 >/dev/null
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude)"
+ok "overlong claude rationale fails closed to human" '[ "$(review_of "$idk5")" = 1 ]'
+ok "overlong claude rationale is classed rationale-too-long, body-free" \
+  'grep -q '\''"claude:rationale-too-long"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "yyyyyyyyyyyyyyyy" "$NUNCHI_HOME/judge-audit.jsonl"'
 
 printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
