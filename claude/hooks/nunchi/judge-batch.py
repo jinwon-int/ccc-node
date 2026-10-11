@@ -91,6 +91,10 @@ APPLY = os.environ.get("NUNCHI_JUDGE_APPLY") == "1"
 JUDGE_PROVIDER = os.environ.get("NUNCHI_JUDGE_PROVIDER", "auto").strip().lower()
 JUDGE_CMD_OVERRIDE = os.environ.get("NUNCHI_JUDGE_CMD", "").strip()
 JUDGE_MODEL = os.environ.get("NUNCHI_JUDGE_MODEL", "haiku")
+# A verdict is a one-line classification; the node-global effort (often
+# "high" via settings env) only buys longer rationales that overflow the
+# 200-char contract.
+JUDGE_EFFORT = os.environ.get("NUNCHI_JUDGE_EFFORT", "low").strip() or "low"
 JUDGE_CODEX_MODEL = os.environ.get("NUNCHI_JUDGE_CODEX_MODEL", "").strip()
 JUDGE_SCHEMA = os.path.join(HERE, "judge-verdict.schema.json")
 AUDIT = os.path.join(HOME_DIR, "judge-audit.jsonl")
@@ -471,7 +475,7 @@ Decide one verdict:
 - "human": anything ambiguous or unsafe to decide.
 
 Answer with exactly one JSON object:
-{{"verdict":"clear|conflict|human","rationale":"<=200 chars","supersede_proposal":null|"<=200 chars"}}"""
+{{"verdict":"clear|conflict|human","rationale":"<=160 chars","supersede_proposal":null|"<=160 chars"}}"""
 
 
 def _provider_for_command(command):
@@ -600,14 +604,39 @@ def _danso_judge(command, prompt):
         return None, "spawn-failed"
 
 
+# Same buckets as claude/hooks/distill/provider-guard.sh. Only the class name
+# reaches the audit; the stderr body never does.
+_CLAUDE_FAILURE_CLASSES = (
+    (("Not logged in", "Please run /login"), "not_logged_in"),
+    (("OAuth session expired", "could not be refreshed"), "oauth_expired"),
+    (("weekly limit", "Weekly limit"), "weekly_limit"),
+    (("rate limit", "Rate limit", "rate_limit"), "rate_limited"),
+)
+
+
+def _classify_claude_failure(text):
+    for needles, name in _CLAUDE_FAILURE_CLASSES:
+        if any(needle in (text or "") for needle in needles):
+            return name
+    return ""
+
+
 def _claude_judge(command, prompt):
+    # --safe-mode: the verdict call must not inherit the node harness — no
+    # CLAUDE.md, SessionStart memory injection, output style or hooks (#2245).
+    # Those turned the one-object JSON contract into Korean reports
+    # (schema-invalid), and the SessionEnd distill hook re-distilled an
+    # unrelated transcript on every verdict. OAuth login is unaffected
+    # (unlike --bare, which is API-key only).
     argv = [
         command, "-p",
+        "--safe-mode",
         "--tools", "",
         "--disallowedTools", "mcp__*",
         "--strict-mcp-config",
         "--permission-mode", "dontAsk",
         "--model", JUDGE_MODEL,
+        "--effort", JUDGE_EFFORT,
         "--no-session-persistence",
         "--output-format", "text",
         "--append-system-prompt", JUDGE_SYSTEM,
@@ -624,8 +653,11 @@ def _claude_judge(command, prompt):
         return None, "spawn-failed"
     except subprocess.TimeoutExpired:
         return None, "timeout"
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return None, f"exit-{proc.returncode}" if proc.returncode != 0 else "empty"
+    if proc.returncode != 0:
+        cls = _classify_claude_failure(f"{proc.stderr}\n{proc.stdout}")
+        return None, f"exit-{proc.returncode}" + (f":{cls}" if cls else "")
+    if not proc.stdout.strip():
+        return None, "empty"
     return proc.stdout, None
 
 
@@ -886,11 +918,14 @@ def _parse_judge_result(output):
         return None, "verdict-outside-rubric"
     rationale = parsed["rationale"]
     proposal = parsed["supersede_proposal"]
-    if not isinstance(rationale, str) or len(rationale) > 200:
+    if not isinstance(rationale, str):
         return None, "schema-invalid"
-    if proposal is not None and (
-            not isinstance(proposal, str) or len(proposal) > 200):
+    if len(rationale) > 200:
+        return None, "rationale-too-long"
+    if proposal is not None and not isinstance(proposal, str):
         return None, "schema-invalid"
+    if proposal is not None and len(proposal) > 200:
+        return None, "proposal-too-long"
     return {
         "verdict": verdict,
         "rationale": rationale,
