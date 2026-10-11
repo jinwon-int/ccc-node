@@ -642,7 +642,205 @@ class EnglishVerdictTests(unittest.TestCase):
                 self.assertIsNotNone(scanner.judge_issue(issue, dt.datetime(2026, 10, 7, 9, 20), "expired"))
 
 
+# a2a-nexus#1504 Phase 7-B, reduced (#2252): the booking names only a start
+# ("실행 예약 … OnCalendar=2026-10-09 22:00:00 KST") and offsets ("T+1/6/12/24h"),
+# never an end. Its heading says "합격" (the pre-checks passed) and an earlier
+# paragraph carries an unrelated OnCalendar (the reboot-hold expiry, 10-11).
+BOOKING_1504 = (
+    "## Phase 7-B 사전 조회 합격 + 실행 예약 (2026-10-08 18:30 KST · node-a)\n\n"
+    "**사전 점검(읽기 전용) — 모두 통과**\n"
+    "| B1 / 게이트 4 | shadow snapshot **pass**: 44.2h 창, unexplained 0/0 |\n\n"
+    "**재부팅 보류 재설정**: 해제는 transient 타이머 `a2a-p7b-reboot-hold-expire`"
+    "(`OnCalendar=2026-10-11 22:00 KST`)가 자동으로 합니다.\n\n"
+    "**실행 예약**: `a2a-p7b-execute.timer`가 `OnCalendar=2026-10-09 22:00:00 KST`에 "
+    "`run-b.sh execute`를 실행합니다.\n"
+    "- **승인 창 고정**: 2026-10-09 21:59~23:00 KST 밖에서는 실행을 거부합니다.\n"
+    "- **B5**: shadow 삭제 + `RATE=on` 1줄 + 930초 드레인\n"
+    "- **B8**: `OnCalendar` 관측 타이머 T+1/6/12/24h + T+5m 즉시 관측\n"
+    "- 시작·중단·롤백·완료는 텔레그램 spool로 알립니다."
+)
+BOOKING_1504_AT = "2026-10-08T09:31:05Z"
+# The verdict that was finally written by hand on 2026-10-11.
+VERDICT_1504 = (
+    "<!-- future-ending-test-issue-tracking: closed -->\n"
+    "## Phase 7-B 실행 결과 — **INCOMPLETE (B1에서 중단, 변경 없음)** · 보고 누락 정정\n\n"
+    "**Test/task**: T1 브로커 Phase 7-B — RATE=on 전환 + T+24h 관측\n"
+    "**Actual end time**: 2026-10-09 22:00:04 KST (예약 22:00:00 → 4초 만에 중단)\n"
+    "**Verdict**: INCOMPLETE\n"
+)
+NOW_1011 = dt.datetime(2026, 10, 11, 9, 1)
+
+
+class AnchorOffset2252Tests(unittest.TestCase):
+    """ccc-node#2252: an absolute start plus relative offsets is a deadline."""
+
+    def test_issue_1504_booking_infers_anchor_plus_largest_offset(self) -> None:
+        issue = _issue(
+            number=1504,
+            repo="jinwon-int/a2a-nexus",
+            comments=[_comment(BOOKING_1504, BOOKING_1504_AT)],
+        )
+        finding = scanner.judge_issue(issue, NOW_1011, "expired")
+        assert finding is not None
+        self.assertEqual(finding.kind, "expired-unjudged")
+        # Nearest preceding anchor (10-09 22:00), not the reboot-hold one (10-11).
+        self.assertEqual(finding.deadline, dt.datetime(2026, 10, 10, 22, 0))
+        self.assertEqual(finding.confidence, "low")
+        self.assertEqual(finding.weak_reason, "anchor-offset")
+        self.assertEqual(len(scanner.scan([issue], NOW_1011, "expired", "low")), 1)
+        self.assertEqual(scanner.scan([issue], NOW_1011, "expired", "high"), [])
+
+    def test_issue_1504_is_left_alone_before_the_inferred_deadline(self) -> None:
+        issue = _issue(number=1504, comments=[_comment(BOOKING_1504, BOOKING_1504_AT)])
+        self.assertIsNone(scanner.judge_issue(issue, dt.datetime(2026, 10, 10, 21, 59), "expired"))
+
+    def test_issue_1504_verdict_after_the_inferred_deadline_clears_it(self) -> None:
+        issue = _issue(
+            number=1504,
+            comments=[
+                _comment(BOOKING_1504, BOOKING_1504_AT),
+                _comment(VERDICT_1504, "2026-10-11T00:09:15Z"),
+            ],
+        )
+        self.assertIsNone(scanner.judge_issue(issue, dt.datetime(2026, 10, 11, 9, 20), "expired"))
+
+    def test_judged_explicit_window_does_not_hide_a_later_inferred_one(self) -> None:
+        # The live a2a-nexus#1504 thread also booked "보류 종료 일시:
+        # 2026-10-10 18:00 KST" (high) and carried Phase 7 verdicts after it.
+        # Preferring only that strong deadline cleared the issue and hid the
+        # 7-B window closing at 22:00.
+        hold = "**보류 종료 일시: 2026-10-10 18:00 KST** — 관측창이 먼저 끝나면 그때 해제합니다."
+        comments = [
+            _comment(hold, "2026-09-26T02:17:39Z"),
+            _comment("## Phase 7-A 관측 판정 — 합격", "2026-10-01T00:00:00Z"),
+            _comment(BOOKING_1504, BOOKING_1504_AT),
+        ]
+        issue = _issue(number=1504, comments=comments)
+        finding = scanner.judge_issue(issue, NOW_1011, "expired")
+        assert finding is not None
+        self.assertEqual(finding.deadline, dt.datetime(2026, 10, 10, 22, 0))
+        self.assertEqual(finding.weak_reason, "anchor-offset")
+        # An unjudged explicit window still wins and keeps its high confidence.
+        # (The 7-B heading's "사전 조회 합격" would read as an early verdict.)
+        plain = _comment(BOOKING_1504.replace("사전 조회 합격 + ", ""), BOOKING_1504_AT)
+        issue = _issue(number=1504, comments=[comments[0], plain])
+        finding = scanner.judge_issue(issue, NOW_1011, "expired")
+        assert finding is not None
+        self.assertEqual(finding.deadline, dt.datetime(2026, 10, 10, 18, 0))
+        self.assertEqual(finding.confidence, "high")
+
+    def test_offset_forms_take_the_largest(self) -> None:
+        anchor = dt.datetime(2026, 10, 9, 22, 0)
+        for line, offset in (
+            ("관측 T+24h", dt.timedelta(hours=24)),
+            ("관측 T+1h/6h/48h", dt.timedelta(hours=48)),
+            ("48시간 후 판정", dt.timedelta(hours=48)),
+            ("12시간 뒤 확인, +36h 재확인", dt.timedelta(hours=36)),
+            ("72h 관측", dt.timedelta(hours=72)),
+            ("3일 관측", dt.timedelta(days=3)),
+            ("실행 후 6시간 관측", dt.timedelta(hours=6)),
+        ):
+            with self.subTest(line=line):
+                body = f"실행 예약: 2026-10-09 22:00 KST\n- {line}"
+                hits, _ = scanner.collect_hits(_issue(comments=[_comment(body, BOOKING_1504_AT)]))
+                self.assertEqual([hit.deadline for hit in hits], [anchor + offset])
+
+    def test_anchor_and_offset_in_one_paragraph(self) -> None:
+        body = "Canary starts at 2026-10-09 22:00 KST and is read again at T+24h."
+        hits, _ = scanner.collect_hits(_issue(comments=[_comment(body, BOOKING_1504_AT)]))
+        self.assertEqual([hit.deadline for hit in hits], [dt.datetime(2026, 10, 10, 22, 0)])
+
+    def test_korean_date_followed_by_hu_is_not_an_offset(self) -> None:
+        body = "실행 예약: 2026년 10월 9일 22:00 KST. 2026년 10월 9일 후속 점검은 별도."
+        hits, _ = scanner.collect_hits(_issue(comments=[_comment(body, BOOKING_1504_AT)]))
+        self.assertEqual(hits, [])
+
+    def test_anchor_without_offset_or_offset_without_anchor_is_ignored(self) -> None:
+        for body in ("실행 예약: OnCalendar=2026-10-09 22:00 KST", "관측 타이머 T+1/6/12/24h"):
+            with self.subTest(body=body):
+                hits, _ = scanner.collect_hits(_issue(comments=[_comment(body, BOOKING_1504_AT)]))
+                self.assertEqual(hits, [])
+
+    def test_explicit_end_in_the_same_comment_is_not_double_detected(self) -> None:
+        # ② of #2252: the explicit end is the booking; T+48h beside it must
+        # not add a second, later deadline that outlives the verdict.
+        body = (
+            "실행 예약: OnCalendar=2026-10-09 22:00 KST\n"
+            "- 관측 타이머 T+1/6/12/24h, 필요하면 +48h 추가 관측\n"
+            "| 관측 종료 일시 | **2026-10-10 22:00 KST** |"
+        )
+        issue = _issue(
+            comments=[
+                _comment(body, BOOKING_1504_AT),
+                _comment("## 관측 종료 판정 — 합격", "2026-10-10T14:30:00Z"),
+            ]
+        )
+        hits, dropped = scanner.collect_hits(issue)
+        self.assertEqual([hit.deadline for hit in hits], [dt.datetime(2026, 10, 10, 22, 0)])
+        self.assertEqual(hits[0].confidence, "high")
+        self.assertFalse(any(item.startswith("anchor-offset") for item in dropped))
+        self.assertIsNone(scanner.judge_issue(issue, NOW_1011, "expired"))
+
+    def test_early_verdict_restating_the_offsets_does_not_move_the_window(self) -> None:
+        # ③ of #2252, the #2149 trap: an early verdict that recounts the
+        # plan's anchor and offsets must not become the booking itself.
+        for start in ("22:00:00", "22:05"):
+            with self.subTest(start=start):
+                verdict = (
+                    "## Phase 7-B 판정 — 불합격 (B1 실패, 변경 없음)\n\n"
+                    f"실행 예약대로 OnCalendar=2026-10-09 {start} KST에 시작했으나 B1에서 중단.\n"
+                    "- B8 관측 타이머 T+1/6/12/24h는 시작되지 않음."
+                )
+                issue = _issue(
+                    number=1504,
+                    comments=[
+                        _comment(BOOKING_1504, BOOKING_1504_AT),
+                        _comment(verdict, "2026-10-09T23:30:00Z"),
+                    ],
+                )
+                self.assertIsNone(scanner.judge_issue(issue, NOW_1011, "expired"))
+
+    def test_progress_note_restating_the_offsets_keeps_the_finding(self) -> None:
+        # Dropping restatements as bookings must not hide a real miss.
+        note = "진행 메모: 실행 예약 OnCalendar=2026-10-09 22:00 KST 확인, T+24h 관측 대기 중."
+        issue = _issue(
+            number=1504,
+            comments=[
+                _comment(BOOKING_1504, BOOKING_1504_AT),
+                _comment(note, "2026-10-09T23:30:00Z"),
+            ],
+        )
+        finding = scanner.judge_issue(issue, NOW_1011, "expired")
+        assert finding is not None
+        self.assertEqual(finding.deadline, dt.datetime(2026, 10, 10, 22, 0))
+
+
 class RelativeModeTests(unittest.TestCase):
+    def test_hour_offsets_without_absolute_time_are_reported(self) -> None:
+        # #2252: a2a-nexus#1504's B8 line has offsets and no date.
+        for line in (
+            "- **B8**: `OnCalendar` 관측 타이머 T+1/6/12/24h + T+5m 즉시 관측",
+            "배포 후 24시간 관측한 뒤 판정",
+            "48시간 후 결과 확인",
+            "24h·48h 관측 후 정리",
+            "관측은 T+72h까지",
+        ):
+            with self.subTest(line=line):
+                issue = _issue(comments=[_comment(line, BOOKING_1504_AT)])
+                finding = scanner.judge_issue(issue, NOW, "relative")
+                assert finding is not None
+                self.assertEqual(finding.kind, "relative-duration-only")
+
+    def test_hour_offsets_next_to_an_absolute_time_are_compliant(self) -> None:
+        issue = _issue(comments=[_comment("2026-10-09 22:00 KST 시작, T+24h 관측", BOOKING_1504_AT)])
+        self.assertIsNone(scanner.judge_issue(issue, NOW, "relative"))
+
+    def test_non_offset_hours_are_not_relative_durations(self) -> None:
+        for line in ("shadow snapshot 44.2h 창", "UTC+9h 기준 표기", "평균 처리 3시간"):
+            with self.subTest(line=line):
+                issue = _issue(comments=[_comment(line, BOOKING_1504_AT)])
+                self.assertIsNone(scanner.judge_issue(issue, NOW, "relative"))
+
     def test_relative_duration_without_absolute_time_is_reported(self) -> None:
         # family-messenger#104: "며칠 관찰 후 완전 삭제" — unschedulable.
         issue = _issue(
