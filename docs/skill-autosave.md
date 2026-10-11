@@ -602,6 +602,46 @@ same branch and PR already exist, the next sweep reuses it and acknowledges the
 local envelope. `CCC_AUTONOMY=dry-run` previews staging/collection and
 `CCC_AUTONOMY=kill` stops both with the rest of the autosave sweep.
 
+### Publisher config file (#2239)
+
+The publisher's `CCC_SKILL_PROMOTION_*` knobs (`MAX_PRS_PER_RUN`,
+`REVISE_DAILY_CAP`, `REVISE_ROUNDS`, `COLLECT_WINDOW`, `OUTBOX_STALE_HOURS`,
+`DISPATCH_CI_WAIT_SEC`, `REMOTE_BROKERS`, `PROVIDERS`, …) can live in one
+owner-only file instead of being baked into each cron line:
+
+```bash
+mkdir -p ~/.config/ccc-node
+cat > ~/.config/ccc-node/skill-promotion.env <<'EOF'
+# publisher knobs — KEY=value or export KEY=value, # comments, simple quotes
+CCC_SKILL_PROMOTION_COLLECT_WINDOW=64
+export CCC_SKILL_PROMOTION_REVISE_DAILY_CAP="4"
+EOF
+chmod 600 ~/.config/ccc-node/skill-promotion.env
+python3 ~/.claude/hooks/ccc-skill-promotion.py status | jq '{config_file, effective}'
+```
+
+- **Precedence:** process env > file > built-in default. The file only fills
+  knobs the environment leaves unset, so a value baked into a cron line or
+  exported by the operator always wins. `CCC_SKILL_PROMOTION_ENV_FILE`
+  overrides the path.
+- **Whitelist:** only `CCC_SKILL_PROMOTION_*` keys are applied. Anything else
+  (an edge secret in the wrong file, `HOME`, `CCC_STATE_DIR`) is counted in
+  `config_file.ignored_keys` and dropped; the edge secret stays in
+  `~/.a2a-broker-edge.env`.
+- **0600:** the file must be a regular file owned by the current user with no
+  group/other bits. Otherwise it is ignored — never fatal — and `status`
+  reports `config_file.error` (`config_file_unsafe`, `config_file_too_large`,
+  `config_file_not_utf8`).
+- `status` shows `config_file` (path, present, error, applied/overridden key
+  names, ignored count — never a value) and `effective` (the resolved knobs),
+  so an interactive status and the scheduled runs cannot disagree silently.
+- The nightly sweep sources the same file into its collect child before the
+  edge env (owner-only check; the process env's own `CCC_SKILL_PROMOTION_*`
+  values are restored afterwards), logs
+  `promotion-env file=<path> present=yes|no …`, and `ccc-skill-autosave.sh
+  status` lists it next to the `a2a edge env:` line. The 15-minute results
+  collector below sources it the same way.
+
 ### Drop-recommendation sweep report (#1363)
 
 When the auto-revision gate's reviser answers `outcome: drop_recommendation`,
@@ -1182,8 +1222,35 @@ preserved. This affects review, revise and default routes alike.
 
 ### Frequent review-result collection
 
-A publisher can run `ccc-skill-promotion.py collect --results-only` every 15 minutes
-with its normal publisher edge environment. This takes the same promotion lock,
+A publisher runs `ccc-skill-promotion.py collect --results-only` every 15 minutes
+with its normal publisher edge environment. Install it with the managed
+installer (#2239) rather than a hand-written crontab line:
+
+```bash
+scripts/install-skill-promotion-results-cron.sh            # dry-run preview
+scripts/install-skill-promotion-results-cron.sh --apply    # publisher only
+scripts/install-skill-promotion-results-cron.sh --status
+scripts/install-skill-promotion-results-cron.sh --remove --apply
+```
+
+The rendered `# ccc-node:skill-promotion-results:begin/end` block carries a
+`*/15 * * * *` entry that, inside `bash -lc`, sources the publisher config file
+(when it is a regular owner-only file), then the edge env the same way the
+sweep's `collect_with_edge_env` does, then runs
+`collect --results-only --lock-wait 0` with `CCC_NODE`/`CCC_CLAUDE_DIR` baked
+in; output goes to `<state>/skill-promotion.results.cron.log`. The block is
+placed directly below the autosave block so it inherits that `CRON_TZ` pin, or
+opens with its own `CRON_TZ=Asia/Seoul` when no autosave block exists. The
+entry is gen-stamped and recorded like the other cron lanes, and ccc-doctor
+knows the marker. `--apply` refuses (exit 5) unless
+`<state>/skill-promotion.publisher` reads `true`; removal needs no flag. The
+installer also detects the legacy ad-hoc line that pointed at the
+`skill-pipeline-repair-20261004/run-results.py` worktree — reported as
+`legacy_results_cron: present` — and replaces it only with
+`--apply --migrate-legacy` (exit 6 until then, so two collectors never run
+side by side).
+
+The results-only collect takes the same promotion lock,
 honors publisher opt-in, autonomy kill/dry-run and private-repository validation,
 and consumes review/revision results plus the normal promotion drain. It does not
 read or acknowledge local/remote outboxes, publish new outbox candidates, or advance
@@ -1191,14 +1258,15 @@ the intake rotation cursor. The daily full collect remains the sole new-outbox
 admission schedule. Existing daily revision/lineage budgets and protected PR approval
 requirements still apply. A locked run is a clean skip; retry at the next interval.
 
-Keep this cron off the nightly autosave window anyway (#2232). The sweep's stage and
+The installer passes `--lock-wait 0` on purpose (#2232). The sweep's stage and
 collect wait up to `CCC_SKILL_PROMOTION_LOCK_WAIT_SEC` (default 120 s, `0` = single
 try) for the same lock. If the lock is still held after that, they fail with
 `code: lock_timeout` instead of reporting a benign `ok: true, status: "locked"`
 skip. The full result is in `skill-promotion/last-collect.json`, and the doctor row
 `skill-promotion last collect` warns until the next good cycle overwrites it. The
 full collect can hold the lock for several minutes while it waits on intake CI,
-so an overlapping results-only run is the one that should yield.
+so the overlapping results-only run is the one that yields: with a single try it
+reports the benign locked skip and the next tick retries.
 
 For separate Danso channel journals, install with `--danso-additional-state-dirs
 /absolute/channel-state:/absolute/another-state` alongside the existing

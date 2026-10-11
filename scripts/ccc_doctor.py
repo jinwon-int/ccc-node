@@ -128,6 +128,12 @@ CRON_MARKER_INSTALLERS = (
      "scripts/install-timed-test-deadline-scan-cron.sh",
      "run scripts/install-timed-test-deadline-scan-cron.sh --apply "
      "(needs ~/.claude/timed-test-deadline-scan.repos; the scan exits 3 until it exists)"),
+    # skill-promotion-results (#2239): the publisher's 15-minute
+    # `collect --results-only` lane, previously an ad-hoc crontab line nobody
+    # rendered. Registered in the same commit as the installer.
+    ("skill-promotion-results", "# ccc-node:skill-promotion-results",
+     "scripts/install-skill-promotion-results-cron.sh",
+     "run scripts/install-skill-promotion-results-cron.sh --apply (publisher only)"),
 )
 # Managed markers that carry no generation stamp by design: the installers'
 # block guards are exact-match parsed by the shared block awk (#1077).
@@ -148,6 +154,8 @@ CRON_AUX_MARKERS = (
     "# ccc-node:t2-starvation-observe:end",
     "# ccc-node:timed-test-deadline-scan:begin",
     "# ccc-node:timed-test-deadline-scan:end",
+    "# ccc-node:skill-promotion-results:begin",
+    "# ccc-node:skill-promotion-results:end",
 )
 # Hand-installed markers the repo documents but no installer renders: the
 # self-update and live-backups schedule lines are operator-placed by design

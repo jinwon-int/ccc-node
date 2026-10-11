@@ -564,6 +564,12 @@ else
   err "skill-promotion dispatch-skip ledger + redispatch selection tests failed"
   tail -10 "$TMP/skill-promotion-redispatch-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_skill_promotion_config_file_test.py >"$TMP/skill-promotion-config-file-test.out" 2>&1; then
+  say "  ok skill-promotion publisher config file tests (#2239)"
+else
+  err "skill-promotion publisher config file tests failed (a cron run and status could resolve different knobs unseen, #2239)"
+  tail -10 "$TMP/skill-promotion-config-file-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_fleet_sync_test.py >"$TMP/doctor-fleet-sync-test.out" 2>&1; then
   say "  ok doctor fleet-skills sync verdict tests"
 else
