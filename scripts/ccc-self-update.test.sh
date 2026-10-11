@@ -35,6 +35,12 @@ unset CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS
 unset CCC_SELF_UPDATE_BUSY_MAX_SECONDS CCC_SELF_UPDATE_MAX_DEFER_SECONDS
 unset CCC_SELF_UPDATE_REAPPLY CCC_SELF_UPDATE_CRONTAB_CMD
 unset CODEX_HOME
+# The bridge runtime preflight (bridge/runtime_config_check.py) prefers the
+# process environment over the fixture bridge/.env. A shell launched by the
+# Telegram bridge inherits a valid CLAUDE_PROCESS_TIMEOUT, which masks the
+# fixture's invalid value and turns the preflight-rollback cases into false
+# FAILs (#2236). Drop both keys the preflight reads.
+unset CLAUDE_PROCESS_TIMEOUT CCC_DELEGATED_TASK_STALL_SECONDS
 export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
 # Same for the Matrix frontend's health file (never the node's real ~/.ccc-matrix).
 export CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$TMP/no-such-matrix-health.json"
