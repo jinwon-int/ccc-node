@@ -1,0 +1,1 @@
+- nunchi judge: an otherwise valid Claude verdict whose rationale overshoots 200 chars is now kept with the rationale cut to the limit and noted as `claude:rationale-truncated`, instead of failing closed into the Codex/GPT fallback; the key set, verdict rubric and supersede proposal stay strict, and the Codex lane (schema enforced in its CLI) is unchanged (#2248).
