@@ -65,16 +65,20 @@ def mimetype_of(path: Path) -> str:
     return guessed or "application/octet-stream"
 
 
-def file_content(name: str, mimetype: str, size: int, mxc: str, file_info: Mapping[str, Any]) -> dict[str, Any]:
+def file_content(name: str, mimetype: str, size: int, mxc: str, file_info: Mapping[str, Any], *, voice: bool = False) -> dict[str, Any]:
     """The ``m.room.message`` content for an encrypted image or file."""
     msgtype = "m.image" if mimetype in IMAGE_MIMETYPES else "m.file"
-    return {
+    content = {
         "msgtype": msgtype,
         "body": name,
         "filename": name,
         "info": {"mimetype": mimetype, "size": size},
         "file": {**dict(file_info), "url": mxc, "mimetype": mimetype},
     }
+    if voice:
+        content["msgtype"] = "m.audio"
+        content["org.matrix.msc3245.voice"] = {}
+    return content
 
 
 def _timeout_kwargs() -> dict[str, Any]:
