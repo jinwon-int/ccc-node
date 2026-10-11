@@ -90,7 +90,7 @@ async def synthesize(text: str, settings: Any, directory: Path) -> bytes:
             )
             from telegram_bot.core.matrix.outbound_media import read_deliverable
 
-            return read_deliverable(path.resolve(), max_bytes=50_000_000, root=Path(temporary))
+            return read_deliverable(path.resolve(), max_bytes=50_000_000, root=Path(temporary).resolve())
 
 
 def reply_name(payload: str) -> str | None:

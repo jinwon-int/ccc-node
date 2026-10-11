@@ -499,7 +499,15 @@ attachment in an earlier message being replied to remains file context.
   Audio subprocesses are killed and reaped; original input, converted WAV and
   partial synthesis files are removed on every exit. Transcription errors or
   empty speech answer without starting an agent turn.
-- On macOS, successful voice turns may also produce a reply with the existing
+- Only Matrix **voice notes** (events carrying the MSC3245
+  `org.matrix.msc3245.voice` marker) are transcribed. Other `m.audio` events
+  (music, podcasts, recordings sent as files) keep the ordinary file path, so
+  they need no transcription key and no duration limit applies to them.
+- Voice replies are **opt-in**: `MATRIX_VOICE_REPLY=true` (default `false`).
+  Synthesis still runs inside the agent turn, so an enabled reply can hold the
+  finished text answer back for up to 120 seconds; moving it after the turn
+  needs an outbox change and is tracked as a #2005 follow-up.
+- When enabled on macOS, successful voice turns may also produce a reply with the existing
   `MacOSTtsSynthesizer` and `VOICE_REPLY_PERSONA`. The same long-reply threshold
   applies. Other platforms and failed synthesis keep the text answer. Speech
   is sent only to direct rooms, as an encrypted Ogg/Opus `m.audio` event with

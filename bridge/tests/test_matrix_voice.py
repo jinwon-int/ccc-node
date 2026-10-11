@@ -33,13 +33,14 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
-def audio_job(*, duration: Any = 1000, caption: str = "") -> tuple[dict[str, Any], bytes]:
+def audio_job(*, duration: Any = 1000, caption: str = "", voice_note: bool = True) -> tuple[dict[str, Any], bytes]:
     ciphertext, file = _encrypted(b"OggS synthetic speech")
     content = {
         "msgtype": "m.audio", "body": caption or "voice.ogg", "file": file,
         "info": {"mimetype": "audio/ogg", "duration": duration},
-        "org.matrix.msc3245.voice": {},
     }
+    if voice_note:
+        content["org.matrix.msc3245.voice"] = {}
     if caption:
         content["filename"] = "voice.ogg"
     return _media_job(content), ciphertext
@@ -207,7 +208,7 @@ async def test_cancel_reaps_audio_subprocess() -> None:
 async def test_voice_reply_uses_existing_platform_gate_and_text_survives_tts_failure(
     tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch, supported: bool,
 ) -> None:
-    bot, chat, manager = _bot(tmp_path, openai_api_key="test-key")
+    bot, chat, manager = _bot(tmp_path, openai_api_key="test-key", matrix_voice_reply=True)
     _resume_existing_session(bot, manager)
     job, ciphertext = audio_job()
     transport = _MediaTransport(ciphertext)
@@ -387,3 +388,75 @@ async def test_failed_voice_upload_keeps_only_retryable_speech_files(tmp_path: P
             assert await transport._deliver(row)
         assert not path.exists()
         assert not [job for job in transport.store.outbox() if job["body"] == FILE_JOB_BODY]
+
+
+# --- #2253 review follow-ups -------------------------------------------------
+
+def test_admission_records_msc3245_voice_marker() -> None:
+    _, file = _encrypted(b"x")
+    voice_note = media_attachment({"msgtype": "m.audio", "file": file, "org.matrix.msc3245.voice": {}})
+    plain = media_attachment({"msgtype": "m.audio", "file": file})
+    assert voice_note is not None and voice_note["voice"] is True
+    assert plain is not None and plain["voice"] is False
+
+
+@pytest.mark.anyio
+async def test_non_voice_audio_stays_an_ordinary_file(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No OPENAI_API_KEY and a duration far over the voice limit: a plain m.audio file
+    # (music, podcast) must still reach the agent as a file, never as a transcript.
+    bot, chat, manager = _bot(tmp_path, max_voice_duration=1)
+    _resume_existing_session(bot, manager)
+    job, ciphertext = audio_job(duration=3_600_000, voice_note=False)
+    transport = _MediaTransport(ciphertext)
+    bot._transport = transport
+    transcribe = AsyncMock(return_value="should not run")
+    monkeypatch.setattr(voice, "transcribe", transcribe)
+    sink = FakeSink()
+    result = await bot.run_turn(job, sink=sink, session_id=None, room_kind="direct")
+    assert transcribe.await_count == 0 and sink.interims == []
+    assert transport.downloads == 1 and len(chat.calls) == 1
+    assert "[Voice transcript]" not in chat.calls[0]["user_message"]
+    assert result.text == "answer"
+
+
+@pytest.mark.anyio
+async def test_voice_reply_is_off_by_default(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot, chat, manager = _bot(tmp_path, openai_api_key="test-key")
+    _resume_existing_session(bot, manager)
+    job, ciphertext = audio_job()
+    bot._transport = _MediaTransport(ciphertext)
+    monkeypatch.setattr(core_media, "is_macos", lambda: True)
+    monkeypatch.setattr(voice, "transcribe", AsyncMock(return_value="hello"))
+    synthesis = AsyncMock(return_value=b"OggS reply")
+    monkeypatch.setattr(voice, "synthesize", synthesis)
+    result = await bot.run_turn(job, sink=FakeSink(), session_id=None, room_kind="direct")
+    assert result.text == "answer" and synthesis.await_count == 0
+
+
+@pytest.mark.anyio
+async def test_say_never_reads_a_leading_dash_as_an_option(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from telegram_bot.utils import tts as tts_module
+
+    seen: list[tuple[Any, ...]] = []
+
+    class _Proc:
+        returncode = 0
+
+    async def fake_exec(*args: Any, **kwargs: Any) -> _Proc:
+        seen.append(args)
+        return _Proc()
+
+    async def fake_communicate(process: Any) -> tuple[bytes, bytes]:
+        return b"", b""
+
+    monkeypatch.setattr(tts_module.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(tts_module, "communicate_audio_process", fake_communicate)
+    synth = tts_module.MacOSTtsSynthesizer()
+    await synth._run_say(text="-f oops", voice_name="Tingting", output_path=tmp_path / "x.aiff")
+    await synth._run_say(text="plain", voice_name="Tingting", output_path=tmp_path / "y.aiff")
+    assert not seen[0][-1].startswith("-") and seen[0][-1].strip() == "-f oops"
+    assert seen[1][-1] == "plain"

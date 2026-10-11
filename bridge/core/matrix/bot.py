@@ -2370,7 +2370,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                 if attachment is None:
                     return _turn_result(ATTACHMENT_FAILED["invalid"], None)
                 try:
-                    if attachment.get("kind") == "audio":
+                    is_voice = attachment.get("kind") == "audio" and bool(attachment.get("voice"))
+                    if is_voice:
                         matrix_voice.check_configuration(self._settings)
                     path = await matrix_media.stage(self._transport, attachment, directory, self._settings)
                 except matrix_media.AttachmentError as exc:
@@ -2378,7 +2379,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                     return _turn_result(matrix_voice.VOICE_FAILURES.get(exc.reason) or ATTACHMENT_FAILED.get(exc.reason, ATTACHMENT_FAILED_DEFAULT), None)
                 paths.append(path)
                 caption = body if attachment.get("captioned") else ""
-                if attachment.get("kind") == "audio":
+                if is_voice:
                     transcript, error = await self._transcribe_voice(path)
                     if error:
                         return _turn_result(error, None)
@@ -2436,6 +2437,10 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         transport = self._transport
         enqueue = getattr(transport, "enqueue_voice", None)
         content = str(getattr(response, "content", "") or "")
+        # Opt-in (MATRIX_VOICE_REPLY, default off): synthesis currently runs inside the turn and
+        # holds back the finished text reply for up to VOICE_TIMEOUT_S (#2253 review, follow-up).
+        if not getattr(self._settings, "matrix_voice_reply", False):
+            return
         if not (getattr(response, "success", True) and content.strip() and media.is_macos()):
             return
         if not callable(enqueue) or transport.room_kind(room_id) != "direct":

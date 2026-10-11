@@ -91,6 +91,9 @@ def media_attachment(content: Mapping[str, Any]) -> dict[str, Any] | None:
     }
     if kind == "audio":
         attachment["duration"] = count(info.get("duration"))  # Matrix milliseconds
+        # MSC3245 voice message flag: only recorded voice notes are transcribed; other
+        # m.audio (music, podcasts, recordings sent as files) stays an ordinary file (#2253 review).
+        attachment["voice"] = isinstance(content.get("org.matrix.msc3245.voice"), dict)
     return attachment
 
 

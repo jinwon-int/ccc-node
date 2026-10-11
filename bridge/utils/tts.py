@@ -114,7 +114,8 @@ class MacOSTtsSynthesizer:
             voice_name,
             "-o",
             str(output_path),
-            text,
+            # A reply starting with "-" would be parsed as a say option (#2253 review).
+            (" " + text) if text.startswith("-") else text,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

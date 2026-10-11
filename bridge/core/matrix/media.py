@@ -73,7 +73,7 @@ def check_declared(attachment: Mapping[str, Any], settings: Any) -> int:
     """Reject by the sender-declared size/pixels before downloading anything."""
     limit = size_limit(attachment, settings)
     duration = attachment.get("duration")
-    if attachment.get("kind") == "audio" and type(duration) is int:
+    if attachment.get("kind") == "audio" and attachment.get("voice") and type(duration) is int:
         if duration > int(getattr(settings, "max_voice_duration", 300)) * 1000:
             raise AttachmentError("duration")
     size = attachment.get("size")
