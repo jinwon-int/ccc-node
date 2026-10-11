@@ -607,11 +607,16 @@ def _private_state_dir(path: Path, *, trust_root: Path | None = None) -> None:
 
 
 @contextlib.contextmanager
-def _promotion_lock(config: Config) -> Iterator[bool]:
+def _promotion_lock(config: Config, *, wait_sec: int | None = None) -> Iterator[bool]:
     """Hold `promotion.lock` (owner-only, `flock LOCK_EX|LOCK_NB`) for the
     duration of one state-mutating command. Yields True when acquired and
     False on contention, in which case the caller reports `status: "locked"`
     and touches nothing.
+
+    #2232: ``wait_sec`` polls for up to that many seconds instead of trying
+    once. Interactive and frequent callers keep the single try; the nightly
+    autosave passes a bounded wait so a short overlap with another lock
+    holder no longer drops the whole cycle.
 
     #1477: `run` always held this lock but `collect` did not, so an overlapping
     cron/manual collect snapshotted the same pending ledger rows, then both
@@ -622,8 +627,11 @@ def _promotion_lock(config: Config) -> Iterator[bool]:
     """
     _private_state_dir(config.promotion_state_dir, trust_root=config.home)
     lock_path = config.promotion_state_dir / "promotion.lock"
+    timeout = float(wait_sec) if wait_sec else None
     try:
-        with _secure_fs.flock_guard(lock_path, owner_id=os.geteuid(), exact_mode=0o600) as acquired:
+        with _secure_fs.flock_guard(
+            lock_path, owner_id=os.geteuid(), exact_mode=0o600, timeout=timeout
+        ) as acquired:
             yield acquired
     except _secure_fs.SecureFsError:
         raise PromotionError("lock_unsafe") from None
@@ -1806,7 +1814,28 @@ def _status(config: Config) -> dict[str, object]:
     }
 
 
-def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
+def _locked_result(base: dict[str, object], wait_sec: int | None) -> dict[str, object]:
+    """Contention outcome for run/collect.
+
+    Without a wait the caller asked for a single try, so contention stays the
+    historical benign `ok: true, status: "locked"`. With a wait (#2232) the
+    caller needs this cycle to run: still losing the lock after the bounded
+    wait is a failure (`ok: false`, `code: lock_timeout`, exit 2), so the
+    sweep's failure branch and doctor see the skipped cycle instead of an
+    ok-looking no-op.
+    """
+    result = dict(base)
+    result["status"] = "locked"
+    if wait_sec:
+        result["ok"] = False
+        result["code"] = "lock_timeout"
+        result["lock_wait_sec"] = wait_sec
+    else:
+        result["ok"] = True
+    return result
+
+
+def _execute(config: Config, *, dry_run: bool, lock_wait: int | None = None) -> dict[str, object]:
     if not config.enabled:
         return {
             "ok": True,
@@ -1836,18 +1865,16 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
     if not config.node:
         raise PromotionError("node_identity_unresolved")
     dry_run = dry_run or config.autonomy == "dry-run"
-    with _promotion_lock(config) as acquired:
+    with _promotion_lock(config, wait_sec=lock_wait) as acquired:
         if not acquired:
-            return {
-                "ok": True,
+            return _locked_result({
                 "mode": "run",
                 "enabled": True,
                 "autonomy": config.autonomy,
-                "status": "locked",
                 "staged": [],
                 "blocked": [],
                 "errors": [],
-            }
+            }, lock_wait)
         candidates, blocked, repaired = _discover(config)
         staged: list[dict[str, str]] = []
         errors: list[dict[str, str]] = []
@@ -6223,7 +6250,9 @@ def _drop_report_unlocked(config: Config, *, acks: list[str]) -> dict[str, objec
     return result
 
 
-def _collect(config: Config, *, dry_run: bool, results_only: bool = False) -> dict[str, object]:
+def _collect(
+    config: Config, *, dry_run: bool, results_only: bool = False, lock_wait: int | None = None
+) -> dict[str, object]:
     collector = _collect_results_unlocked if results_only else _collect_unlocked
     if not config.publisher_enabled:
         return {
@@ -6253,17 +6282,15 @@ def _collect(config: Config, *, dry_run: bool, results_only: bool = False) -> di
         # blocked by the nightly collect waiting on CI (#1477).
         _private_state_dir(config.promotion_state_dir, trust_root=config.home)
         return collector(config, dry_run=True)
-    with _promotion_lock(config) as acquired:
+    with _promotion_lock(config, wait_sec=lock_wait) as acquired:
         if not acquired:
-            return {
-                "ok": True,
+            return _locked_result({
                 "mode": "collect",
                 "publisher_enabled": True,
                 "autonomy": config.autonomy,
-                "status": "locked",
                 "published": [],
                 "errors": [],
-            }
+            }, lock_wait)
         return collector(config, dry_run=False)
 
 
@@ -6789,12 +6816,34 @@ def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
     }
 
 
+# #2232: upper bound for `--lock-wait`. A nightly collect can legitimately hold
+# the lock for DISPATCH_CI_WAIT_SEC; waiting longer than a few minutes behind
+# it would only stack sweeps, so contention past this is reported instead.
+_LOCK_WAIT_MAX_SEC = 600
+_LOCK_WAIT_HELP = (
+    "wait up to SEC seconds for promotion.lock (0 = single try, default); "
+    "if still held, report ok=false code=lock_timeout"
+)
+
+
+def _lock_wait_seconds(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if not 0 <= seconds <= _LOCK_WAIT_MAX_SEC:
+        raise argparse.ArgumentTypeError(f"must be between 0 and {_LOCK_WAIT_MAX_SEC}")
+    return seconds
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("status")
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("--dry-run", action="store_true")
+    run_parser.add_argument("--lock-wait", type=_lock_wait_seconds, default=0,
+                            metavar="SEC", help=_LOCK_WAIT_HELP)
     export_parser = subparsers.add_parser("export")
     export_parser.add_argument("--limit", type=int, default=3, choices=range(1, 4))
     ack_parser = subparsers.add_parser("ack")
@@ -6803,6 +6852,8 @@ def _parser() -> argparse.ArgumentParser:
     collect_parser.add_argument("--dry-run", action="store_true")
     collect_parser.add_argument("--results-only", action="store_true",
                                 help="consume reviews/revisions and promote without new outbox intake")
+    collect_parser.add_argument("--lock-wait", type=_lock_wait_seconds, default=0,
+                                metavar="SEC", help=_LOCK_WAIT_HELP)
     promote_parser = subparsers.add_parser(
         "promote",
         help=(
@@ -6846,7 +6897,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             result = _status(config)
         elif args.command == "run":
-            result = _execute(config, dry_run=args.dry_run)
+            result = _execute(config, dry_run=args.dry_run, lock_wait=args.lock_wait or None)
         elif args.command == "export":
             result = _export_result(config, limit=args.limit)
         elif args.command == "ack":
@@ -6858,7 +6909,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "backfill-republished":
             result = _backfill_republished(config, dry_run=args.dry_run)
         else:
-            result = _collect(config, dry_run=args.dry_run, results_only=args.results_only)
+            result = _collect(
+                config,
+                dry_run=args.dry_run,
+                results_only=args.results_only,
+                lock_wait=args.lock_wait or None,
+            )
     except PromotionError as error:
         result = {"ok": False, "code": error.code}
     except (OSError, TypeError, ValueError, RecursionError):

@@ -854,6 +854,7 @@ class Doctor:
         self.check_skill_pending_backlog()
         self.check_skill_prescreen()
         self.check_skill_promotion_dispatch_gap()
+        self.check_skill_promotion_last_collect()
         self.check_fleet_skills_sync()
         self.check_skill_promotion_revise_stall()
         self.check_skill_promotion_unpromoted()
@@ -2138,6 +2139,81 @@ class Doctor:
             "up to 3 owed intake PRs per cycle; read skill-promotion/last-collect.json for the skip code",
         )
         self.add("경고", item, status, hint)
+
+    _LAST_COLLECT_MAX_BYTES = 1024 * 1024
+    _LAST_COLLECT_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+    _LAST_COLLECT_HINTS = {
+        "lock_timeout": (
+            "the nightly collect could not take promotion.lock within its bounded wait — "
+            "another holder (a frequent `collect --results-only` cron or a manual collect) "
+            "overlapped the autosave window; move that job off the window or raise "
+            "CCC_SKILL_PROMOTION_LOCK_WAIT_SEC, then rerun collect"
+        ),
+    }
+
+    def check_skill_promotion_last_collect(self) -> None:
+        """Publisher-side: did the most recent autosave collect actually run?
+
+        #2232: a collect that lost `promotion.lock` used to report
+        `ok: true, status: "locked"`, so a whole nightly cycle was skipped with
+        nothing failing anywhere. The sweep now persists every collect result to
+        `skill-promotion/last-collect.json` (#2203) and fails a bounded-wait
+        collect with `code: lock_timeout`; this row reads that file so a
+        skipped or failed cycle is visible. The file is overwritten each cycle,
+        so the warning clears on the next good run. Ordinary nodes never write
+        it — absence is not drift.
+        """
+        item = "skill-promotion last collect"
+        state_dir = Path(
+            os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")
+        ).expanduser()
+        path = state_dir / "skill-promotion" / "last-collect.json"
+        if path.is_symlink() or not path.is_file():
+            self.add("정상", item, "last-collect=absent", "none")
+            return
+        try:
+            info = path.stat()
+            if info.st_size > self._LAST_COLLECT_MAX_BYTES:
+                self.add("경고", item, "last-collect=oversized", f"inspect {path}; the last collect cannot be verified")
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except OSError:
+            self.add("수동필요", item, "last-collect=unreadable", f"inspect {path} permissions; the last collect cannot be verified")
+            return
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            self.add("경고", item, "last-collect=malformed", f"inspect {path}; rerun collect to rewrite it")
+            return
+        age = f"age={int(max(0.0, time.time() - info.st_mtime) // 3600)}h"
+        raw_code = data.get("code")
+        code = raw_code if isinstance(raw_code, str) and self._LAST_COLLECT_CODE_RE.match(raw_code) else None
+        if data.get("ok") is not True:
+            errors = data.get("errors")
+            error_count = len(errors) if isinstance(errors, list) else 0
+            self.add(
+                "경고",
+                item,
+                f"ok=false; code={code or 'none'}; errors={error_count}; {age}",
+                self._LAST_COLLECT_HINTS.get(
+                    code or "",
+                    f"read {path} (code/errors) and the autosave log's promotion-collect line, "
+                    "fix the cause, then rerun collect",
+                ),
+            )
+            return
+        if data.get("status") == "locked":
+            self.add(
+                "경고",
+                item,
+                f"status=locked (cycle skipped); {age}",
+                "the last collect lost promotion.lock and processed nothing; check which job "
+                "held the lock at that time and rerun collect",
+            )
+            return
+        published = data.get("published")
+        count = len(published) if isinstance(published, list) else 0
+        self.add("정상", item, f"ok; published={count}; {age}", "none")
 
     @staticmethod
     def _parse_ledger_ts(value: object) -> float | None:

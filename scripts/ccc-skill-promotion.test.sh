@@ -359,6 +359,18 @@ ok "#1477: locked collect makes no GitHub call, no ack, no ledger row" \
 out="$(env "${stage_env[@]}" python3 "$PROMOTER" run)"; rc=$?
 ok "#1477: run under a held promotion.lock still reports locked" \
   '[ "$rc" = 0 ] && jq -e ".ok and .mode == \"run\" and .status == \"locked\" and .staged == []" >/dev/null <<<"$out"'
+# #2232: a caller that passes --lock-wait gets a visible failure, not ok=true.
+out="$(env "${lock_env[@]}" python3 "$PROMOTER" collect --lock-wait 1)"; rc=$?
+ok "#2232: collect --lock-wait under a held lock fails with lock_timeout (exit 2)" \
+  '[ "$rc" = 2 ] && jq -e "(.ok | not) and .mode == \"collect\" and .status == \"locked\" and .code == \"lock_timeout\" and .lock_wait_sec == 1 and .published == []" >/dev/null <<<"$out"'
+ok "#2232: a lock_timeout collect makes no GitHub call, no ack, no ledger row" \
+  '[ ! -e "$LOCK_GH_STATE/calls" ] && [ ! -e "$STATE/skill-promotion/sent/$lock_transport.json" ] && [ "$(grep -c . "$STATE/skill-promotion/ledger.jsonl")" = "$ledger_lines_locked" ]'
+out="$(env "${stage_env[@]}" python3 "$PROMOTER" run --lock-wait 1)"; rc=$?
+ok "#2232: run --lock-wait under a held lock fails with lock_timeout (exit 2)" \
+  '[ "$rc" = 2 ] && jq -e "(.ok | not) and .mode == \"run\" and .code == \"lock_timeout\" and .staged == []" >/dev/null <<<"$out"'
+out="$(env "${stage_env[@]}" python3 "$PROMOTER" run --lock-wait 601 2>&1)"; rc=$?
+ok "#2232: --lock-wait is bounded" \
+  '[ "$rc" = 2 ] && grep -q "must be between 0 and 600" <<<"$out"'
 out="$(env "${lock_env[@]}" python3 "$PROMOTER" collect --dry-run)"; rc=$?
 ok "#1477: collect --dry-run is read-only and skips the lock" \
   '[ "$rc" = 0 ] && jq -e ".mode == \"collect-dry-run\" and (.status // \"\") != \"locked\" and .published[0].outcome == \"would-open-private-intake-pr\" and .published[0].name == \"lock-check\"" >/dev/null <<<"$out"'

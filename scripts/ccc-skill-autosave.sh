@@ -83,6 +83,16 @@ WINDOW_DAYS="${CCC_SKILL_AUTOSAVE_WINDOW_DAYS:-2}"
 REGROWTH_BYTES="${CCC_SKILL_AUTOSAVE_REGROWTH_BYTES:-16384}"
 NOTIFY="${CCC_SKILL_AUTOSAVE_NOTIFY:-1}"
 case "$MAX_SESSIONS" in ''|*[!0-9]*) MAX_SESSIONS=3 ;; esac
+# #2232: bounded wait for promotion.lock in block 2d. Another holder (a
+# frequent `collect --results-only` cron, a manual collect) used to make stage
+# and collect return `status: locked` with ok=true, so the nightly cycle was
+# skipped without any failure signal. Now both wait up to this many seconds
+# and, if still locked, fail (`code=lock_timeout`) through the failure branch.
+# Non-numeric or out-of-range values fall back to the default; 0 restores the
+# single try (and the benign ok=true locked result).
+PROMOTION_LOCK_WAIT="${CCC_SKILL_PROMOTION_LOCK_WAIT_SEC:-120}"
+case "$PROMOTION_LOCK_WAIT" in ''|*[!0-9]*) PROMOTION_LOCK_WAIT=120 ;; esac
+[ "${#PROMOTION_LOCK_WAIT}" -le 3 ] && [ "$PROMOTION_LOCK_WAIT" -le 600 ] || PROMOTION_LOCK_WAIT=120
 # #1824: MAX_SESSIONS is a per-branch budget, so N enabled branches can draft
 # up to N x MAX_SESSIONS per run. This cross-branch cap bounds the sum;
 # branches run in the fixed order claude, codex, piri, danso and each stops
@@ -922,8 +932,9 @@ fi
 # draft PRs after verifying that fleet-skills is PRIVATE. Non-publisher nodes
 # perform no GitHub operation. Fleet autonomy dry-run covers both boundaries.
 if [ -f "$PROMOTER" ] && command -v python3 >/dev/null 2>&1; then
-  promotion_args="run"
+  promotion_args="run --lock-wait $PROMOTION_LOCK_WAIT"
   [ "$AUTONOMY_STATE" = "dry-run" ] && promotion_args="run --dry-run"
+  # shellcheck disable=SC2086  # promotion_args is a fixed word list built above
   summary="$(python3 "$PROMOTER" $promotion_args 2>>"$LOG")" \
     && log "promotion-stage $(printf '%s' "$summary" | head -c 500)" \
     || log "promotion-stage failed (non-fatal) code=$(printf '%s' "$summary" | jq -r '(.code // "unknown") | if test("^[a-z0-9_]+$") then . else "unknown" end' 2>/dev/null)"
@@ -935,7 +946,7 @@ if [ -f "$PROMOTER" ] && command -v python3 >/dev/null 2>&1; then
   case "$stale_line" in
     pending=[0-9]*" oldest="[0-9][0-9][0-9][0-9]-*Z" after_hours="[0-9]*) log "promotion-outbox-stale $stale_line" ;;
   esac
-  collect_args="collect"
+  collect_args="collect --lock-wait $PROMOTION_LOCK_WAIT"
   [ "$AUTONOMY_STATE" = "dry-run" ] && collect_args="collect --dry-run"
   # #1766: only `collect` dispatches the A2A intake review round, and that needs
   # A2A_EDGE_SECRET. The dedicated intake cron sources the publisher edge env

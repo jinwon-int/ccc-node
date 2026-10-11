@@ -1191,6 +1191,15 @@ the intake rotation cursor. The daily full collect remains the sole new-outbox
 admission schedule. Existing daily revision/lineage budgets and protected PR approval
 requirements still apply. A locked run is a clean skip; retry at the next interval.
 
+Keep this cron off the nightly autosave window anyway (#2232). The sweep's stage and
+collect wait up to `CCC_SKILL_PROMOTION_LOCK_WAIT_SEC` (default 120 s, `0` = single
+try) for the same lock. If the lock is still held after that, they fail with
+`code: lock_timeout` instead of reporting a benign `ok: true, status: "locked"`
+skip. The full result is in `skill-promotion/last-collect.json`, and the doctor row
+`skill-promotion last collect` warns until the next good cycle overwrites it. The
+full collect can hold the lock for several minutes while it waits on intake CI,
+so an overlapping results-only run is the one that should yield.
+
 For separate Danso channel journals, install with `--danso-additional-state-dirs
 /absolute/channel-state:/absolute/another-state` alongside the existing
 `--danso-state-dir` and `--danso-drafting`. The installer preserves this setting on
