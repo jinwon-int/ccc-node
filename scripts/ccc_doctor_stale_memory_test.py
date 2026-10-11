@@ -180,7 +180,7 @@ class StaleMemoryGuidanceCheck(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.claude_dir.rglob("*") if p.is_file()), ["CLAUDE.md", "MEMORY.md"])
 
     def test_only_hermes_memory_stale_still_warns(self) -> None:
-        """daegyo shape: Claude files clean, Hermes MEMORY.md stale."""
+        """One surveyed node shape: Claude files clean, Hermes MEMORY.md stale."""
         self.place("clean-CLAUDE.md", self.claude_dir / "CLAUDE.md")
         self.place("stale-hermes-MEMORY.md", self.hermes / "memories" / "MEMORY.md")
         row = self.row(self.run_check())
