@@ -23,12 +23,14 @@ Two modes:
 
 ``expired``
     Deadline is in the past and no verdict-shaped comment followed it — or
-    preceded it, for a test run early and judged after its booking.
+    preceded it, for a test run early and judged after its booking. A comment
+    that books only a start ("실행 예약 … 22:00 KST") plus offsets ("T+24h")
+    gets an inferred deadline of start + largest offset, at low confidence.
 
 ``relative``
-    A timed test described only in relative terms ("며칠", "1~2주") with no
-    absolute datetime anywhere in the paragraph. These violate the rule at
-    write time, so they can never be judged on schedule.
+    A timed test described only in relative terms ("며칠", "1~2주", "T+24h",
+    "24시간 후") with no absolute datetime anywhere in the paragraph. These
+    violate the rule at write time, so they can never be judged on schedule.
 
 Input is a JSONL dump (one issue object per line, ``--input``), a live ``gh``
 query (``--repo``), or an operator-owned allowlist file (``--repos-file``).
@@ -195,10 +197,55 @@ SETTLED_HEADER_CHARS = 150
 NOT_A_BOOKING = frozenset({"already-settled", "already-settled-comment", "past-at-posting"})
 
 # Relative-only durations the owner rule forbids.
+#
+# Hour offsets ("T+24h", "24시간 후", "48h 관측") are relative too: with no
+# absolute datetime in the paragraph nobody can schedule the judgement.
+# a2a-nexus#1504's "B8: 관측 타이머 T+1/6/12/24h" went unjudged for two days
+# and this mode never saw it (#2252).
 RELATIVE_DURATION = re.compile(
     r"(며칠|몇\s*일|수일|여러\s*날|1~2주|한두\s*주|몇\s*주|수주간|당분간"
-    r"|a\s+few\s+days|couple\s+of\s+(days|weeks)|in\s+a\s+week)",
+    r"|a\s+few\s+days|couple\s+of\s+(days|weeks)|in\s+a\s+week"
+    r"|(?<![A-Za-z])T\s*\+\s*\d+(?:\s*h)?(?:\s*[/,·]\s*\d+(?:\s*h)?)*\s*h(?![A-Za-z])"
+    r"|(?<![\d.])\d+\s*시간\s*(?:후|뒤|관측)"
+    r"|(?<![\d.])\d+\s*h\s*관측)",
+    re.IGNORECASE,
 )
+
+# Anchor + offset bookings (#2252). a2a-nexus#1504 booked Phase 7-B as
+# "실행 예약: … OnCalendar=2026-10-09 22:00:00 KST" with "B8: 관측 타이머
+# T+1/6/12/24h" a few lines below. No end-word was written, so DEADLINE_KEYWORD
+# never fired, and the run's failure sat unjudged for about two days. Within
+# one comment, a start anchor plus offsets infer a deadline of anchor + the
+# largest offset. The inference is a guess, so it is always low confidence and
+# never used when the same comment already states an explicit end.
+ANCHOR_KEYWORD = re.compile(
+    r"(실행\s*(?:예약|일시|시각|예정)|시작|OnCalendar|start(?:s|ed)?\s+at|run\s+at)",
+    re.IGNORECASE,
+)
+# Each pattern yields one number (or a "1/6/12/24" list) in group 1 and is
+# scaled by its unit. "T+5m" is deliberately absent: a minutes offset never
+# outlasts the hour offsets it accompanies.
+_HOUR = dt.timedelta(hours=1)
+_DAY = dt.timedelta(days=1)
+OFFSET_PATTERNS: tuple[tuple[re.Pattern[str], dt.timedelta], ...] = (
+    (
+        re.compile(
+            r"(?<![A-Za-z])T\s*\+\s*(\d+(?:\s*h)?(?:\s*[/,·]\s*\d+(?:\s*h)?)*)\s*h(?![A-Za-z])",
+            re.IGNORECASE,
+        ),
+        _HOUR,
+    ),
+    (re.compile(r"(?<![A-Za-z])T\s*\+\s*(\d+)\s*d(?![A-Za-z])", re.IGNORECASE), _DAY),
+    (re.compile(r"(?<![\w+])\+\s*(\d+)\s*h(?![A-Za-z])", re.IGNORECASE), _HOUR),
+    (re.compile(r"(?<![\d.])(\d+)\s*시간\s*(?:후|뒤|관측)"), _HOUR),
+    (re.compile(r"(?:실행|시작)\s*후\s*(\d+)\s*시간"), _HOUR),
+    (re.compile(r"(?<![\d.])(\d+)\s*h\s*관측", re.IGNORECASE), _HOUR),
+    # "9일 후" right after "10월" is a date, not an offset.
+    (re.compile(r"(?<![\d.월])(?<!월\s)(\d+)\s*일\s*(?:후|뒤|관측)"), _DAY),
+    (re.compile(r"(?:실행|시작)\s*후\s*(\d+)\s*일"), _DAY),
+)
+# The inferred hit's own weak_reason when nothing more specific applies.
+ANCHOR_OFFSET = "anchor-offset"
 
 ISSUE_REFERENCE = re.compile(r"(?:#|/(?:issues|pull)/)(\d{1,7})\b")
 
@@ -368,6 +415,73 @@ def classify_false_positive(
     return None
 
 
+def _anchor_in(paragraph: str) -> dt.datetime | None:
+    """The absolute start time a paragraph schedules, if it schedules one.
+
+    The first datetime at or after the anchor keyword wins ("실행 예약: …
+    OnCalendar=2026-10-09 22:00:00 KST"); a bare date is not an anchor.
+    """
+    keyword = ANCHOR_KEYWORD.search(paragraph)
+    if keyword is None:
+        return None
+    for start in (keyword.start(), 0):
+        for match in DEADLINE_DATE.finditer(paragraph, start):
+            dates = _dates_in(match.group(0))
+            if dates and dates[0][1]:
+                return dates[0][0]
+    return None
+
+
+def _largest_offset(paragraph: str) -> dt.timedelta | None:
+    """The longest relative offset in a paragraph ("T+1/6/12/24h" → 24h)."""
+    largest: dt.timedelta | None = None
+    for pattern, unit in OFFSET_PATTERNS:
+        for match in pattern.finditer(paragraph):
+            for number in re.findall(r"\d+", match.group(1)):
+                offset = unit * int(number)
+                if offset and (largest is None or offset > largest):
+                    largest = offset
+    return largest
+
+
+def _infer_anchor_offset(
+    text: str,
+) -> tuple[dt.datetime, dt.datetime, dt.timedelta, str, str] | None:
+    """Infer anchor + largest offset within one comment (#2252).
+
+    Each offset pairs with the nearest anchor stated at or before it — the
+    offsets in a plan hang off the step just scheduled, and a2a-nexus#1504's
+    booking also carried an unrelated earlier ``OnCalendar`` (the reboot-hold
+    expiry) that must not be the anchor. An offset with no anchor above it
+    falls back to the first anchor below. Returns (deadline, anchor, offset,
+    anchor paragraph, offset paragraph) for the latest inferred deadline.
+    """
+    anchors: list[tuple[int, dt.datetime, str]] = []
+    offsets: list[tuple[int, dt.timedelta, str]] = []
+    for index, paragraph in enumerate(_iter_paragraphs(text)):
+        anchor = _anchor_in(paragraph)
+        if anchor is not None:
+            anchors.append((index, anchor, paragraph))
+        offset = _largest_offset(paragraph)
+        if offset is not None:
+            offsets.append((index, offset, paragraph))
+    if not anchors or not offsets:
+        return None
+    best: tuple[dt.datetime, dt.datetime, dt.timedelta, str, str] | None = None
+    for index, offset, offset_paragraph in offsets:
+        above = [item for item in anchors if item[0] <= index]
+        _, anchor, anchor_paragraph = above[-1] if above else anchors[0]
+        candidate = (anchor + offset, anchor, offset, anchor_paragraph, offset_paragraph)
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    return best
+
+
+def _format_offset(offset: dt.timedelta) -> str:
+    hours = int(offset.total_seconds() // 3600)
+    return f"{hours // 24}d" if hours % 24 == 0 and hours >= 48 else f"{hours}h"
+
+
 def collect_hits(issue: dict[str, Any]) -> tuple[list[Hit], list[str]]:
     """Extract deadline candidates, separating keepers from filtered ones."""
     number = int(issue.get("number", 0))
@@ -384,6 +498,7 @@ def collect_hits(issue: dict[str, Any]) -> tuple[list[Hit], list[str]]:
         # so only comments contribute a header signal.
         header = text[:SETTLED_HEADER_CHARS] if posted is not None else ""
         is_claim = posted is not None and bool(CLAIM_MARKER.search(text))
+        explicit_hits = len(hits)
         for paragraph in _iter_paragraphs(text):
             if not DEADLINE_KEYWORD.search(INLINE_CODE.sub("", paragraph)):
                 continue
@@ -424,7 +539,53 @@ def collect_hits(issue: dict[str, Any]) -> tuple[list[Hit], list[str]]:
                     weak_reason=reason,
                 )
             )
+        # An explicit end in this comment is the booking; an anchor + offset
+        # beside it would only double-detect the same window (#2252).
+        if len(hits) == explicit_hits:
+            inferred = _infer_anchor_offset(text)
+            if inferred is not None:
+                hit = _inferred_hit(inferred, number, header, source_url, posted)
+                dropped.append(f"{hit.weak_reason}: {hit.paragraph[:90]}")
+                hits.append(hit)
     return hits, dropped
+
+
+def _inferred_hit(
+    inferred: tuple[dt.datetime, dt.datetime, dt.timedelta, str, str],
+    issue_number: int,
+    header: str,
+    source_url: str,
+    posted: dt.datetime | None,
+) -> Hit:
+    """Turn an anchor + offset inference into a (always low-confidence) Hit.
+
+    A comment whose anchor still lay ahead when it was posted is scheduling
+    something, whatever else its heading reports — a2a-nexus#1504's booking
+    was titled "사전 조회 합격 + 실행 예약". One whose anchor had already
+    passed and that reads like a report is restating the plan it judged, and
+    must not become a booking that moves the early-verdict window (#2149).
+    """
+    deadline, anchor, offset, anchor_paragraph, offset_paragraph = inferred
+    joined = anchor_paragraph
+    if offset_paragraph != anchor_paragraph:
+        joined += " " + offset_paragraph
+    reason = classify_false_positive(joined, issue_number, header)
+    anchor_passed = posted is not None and anchor <= posted
+    if reason in ("already-settled", "already-settled-comment") and not anchor_passed:
+        reason = None
+    if reason is None and posted is not None and deadline <= posted:
+        reason = "past-at-posting"
+    summary = f"[추론] {anchor:%Y-%m-%d %H:%M} + {_format_offset(offset)} ← {anchor_paragraph[:80]}"
+    if offset_paragraph != anchor_paragraph:
+        summary += f" / {offset_paragraph[:80]}"
+    return Hit(
+        deadline=deadline,
+        paragraph=summary,
+        source_url=source_url,
+        posted_at=posted,
+        had_explicit_time=True,
+        weak_reason=reason or ANCHOR_OFFSET,
+    )
 
 
 def find_relative_only(issue: dict[str, Any]) -> list[str]:
@@ -444,6 +605,43 @@ def find_relative_only(issue: dict[str, Any]) -> list[str]:
                 continue  # an absolute datetime is right there; rule satisfied
             offenders.append(paragraph[:160])
     return offenders
+
+
+def _is_judged(
+    latest: Hit,
+    hits: Sequence[Hit],
+    comments: Sequence[dict[str, Any]],
+    comment_times: Sequence[dt.datetime],
+) -> bool:
+    """Whether a verdict-shaped comment settles the window ending at ``latest``."""
+    # The early-verdict window opens at the *last* comment that stated this
+    # deadline, so a re-affirmed booking resets it. The issue body (posted_at
+    # None) predates every comment. Only hits that can be a booking count:
+    # a verdict or completion report that restates the deadline it beat
+    # ("예약 종료 시각(10-08 09:00 KST)보다 앞당겨 끝냈다", a2a-nexus#2315)
+    # is a record of the booking, not a new one — counting it moved
+    # booked_at onto the verdict itself and the verdict was ignored (#2149).
+    booked_at = max(
+        (
+            hit.posted_at
+            for hit in hits
+            if hit.deadline == latest.deadline and hit.posted_at and hit.weak_reason not in NOT_A_BOOKING
+        ),
+        default=None,
+    )
+    for comment, posted in zip(comments, comment_times):
+        body = comment.get("body") or ""
+        head = body[:VERDICT_HEADER_CHARS]
+        self_verdict = bool(SELF_VERDICT_LINE.search(body))
+        if posted > latest.deadline:
+            if VERDICT.search(head) or self_verdict:
+                return True
+        elif (booked_at is None or posted > booked_at) and EARLY_VERDICT.search(_first_line(body)):
+            return True
+        elif self_verdict and (booked_at is None or posted >= booked_at):
+            # A report that booked and judged in one comment (ccc-node#2083).
+            return True
+    return False
 
 
 def judge_issue(issue: dict[str, Any], now: dt.datetime, mode: str) -> Finding | None:
@@ -477,41 +675,28 @@ def judge_issue(issue: dict[str, Any], now: dt.datetime, mode: str) -> Finding |
     # flagged as lower confidence.
     strong = [hit for hit in hits if hit.confidence == "high"]
     latest = max(strong or hits, key=lambda hit: hit.deadline)
-    if latest.deadline >= now:
-        return None  # still running; not our business
-
-    after = [t for t in comment_times if t > latest.deadline]
-    # The early-verdict window opens at the *last* comment that stated this
-    # deadline, so a re-affirmed booking resets it. The issue body (posted_at
-    # None) predates every comment. Only hits that can be a booking count:
-    # a verdict or completion report that restates the deadline it beat
-    # ("예약 종료 시각(10-08 09:00 KST)보다 앞당겨 끝냈다", a2a-nexus#2315)
-    # is a record of the booking, not a new one — counting it moved
-    # booked_at onto the verdict itself and the verdict was ignored (#2149).
-    booked_at = max(
-        (
-            hit.posted_at
-            for hit in hits
-            if hit.deadline == latest.deadline and hit.posted_at and hit.weak_reason not in NOT_A_BOOKING
-        ),
-        default=None,
-    )
-    judged = []
-    for comment, posted in zip(comments, comment_times):
-        body = comment.get("body") or ""
-        head = body[:VERDICT_HEADER_CHARS]
-        self_verdict = bool(SELF_VERDICT_LINE.search(body))
-        if posted > latest.deadline:
-            if VERDICT.search(head) or self_verdict:
-                judged.append(comment)
-        elif (booked_at is None or posted > booked_at) and EARLY_VERDICT.search(_first_line(body)):
-            judged.append(comment)
-        elif self_verdict and (booked_at is None or posted >= booked_at):
-            # A report that booked and judged in one comment (ccc-node#2083).
-            judged.append(comment)
-    if judged:
+    candidates = [latest]
+    # An anchor + offset inference is a separate window, never a restatement
+    # of an explicit end (the same comment never yields both). When it runs
+    # past the strongest explicit deadline, judge it on its own too:
+    # a2a-nexus#1504's earlier "보류 종료 일시: 2026-10-10 18:00 KST" was
+    # cleared by the Phase 7 verdicts around it, and preferring it alone hid
+    # the Phase 7-B window that closed four hours later (#2252).
+    inferred = [
+        hit for hit in hits if hit.weak_reason == ANCHOR_OFFSET and hit.deadline > latest.deadline
+    ]
+    if strong and inferred:
+        candidates.append(max(inferred, key=lambda hit: hit.deadline))
+    for candidate in candidates:
+        if candidate.deadline >= now:
+            continue  # still running; not our business
+        if not _is_judged(candidate, hits, comments, comment_times):
+            latest = candidate
+            break
+    else:
         return None
 
+    after = [t for t in comment_times if t > latest.deadline]
     return Finding(
         repo=repo,
         number=number,
