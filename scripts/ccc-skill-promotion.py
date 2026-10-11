@@ -413,7 +413,10 @@ def _approve_cmd(env: dict[str, str], home: Path) -> tuple[tuple[str, ...], bool
         roots = (
             Path(env.get("CODEX_HOME") or home / ".codex"),
             Path(__file__).resolve().parent.parent / "codex",
-            Path("/opt/ccc-node/codex"),
+            # No absolute checkout root here: setup.sh rewrites canonical
+            # install paths inside installed hooks, so a literal one would make
+            # the installed promoter differ from the repo copy. A publisher
+            # whose helper lives elsewhere sets CCC_SKILL_PROMOTION_APPROVE_CMD.
             home / "ccc-node" / "codex",
         )
         for root in roots:
