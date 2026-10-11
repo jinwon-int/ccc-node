@@ -944,7 +944,17 @@ _SCHEMA = """
         state TEXT NOT NULL CHECK(state IN ('queued','running','uncertain','ready','done')),
         reply TEXT, txn_id TEXT NOT NULL UNIQUE);
     CREATE TABLE IF NOT EXISTS sessions (scope TEXT PRIMARY KEY, session_id TEXT NOT NULL);
+    -- #1959: body-free tombstone of a pruned 'done' job. Keeps the event id
+    -- dedupe (and the digest identity check) and the sent event id after the
+    -- row's body and reply are gone.
+    CREATE TABLE IF NOT EXISTS pruned_jobs(event_id TEXT PRIMARY KEY, digest TEXT NOT NULL,
+        sent_event TEXT, done_at REAL NOT NULL);
 """
+
+# #1959: a 'done' job row is pruned (to a tombstone) this long after it
+# completed — well outside the 24 h admission window, so the row can no
+# longer be needed for anything but its identity, which the tombstone keeps.
+PRUNE_AFTER_S = 2 * 86_400.0
 
 _MATRIX_SCHEMA = """
     CREATE TABLE IF NOT EXISTS deliveries(event_id TEXT PRIMARY KEY, part INTEGER NOT NULL);
@@ -1022,6 +1032,11 @@ class Store:
                 # rows (and rows never sent) keep NULL.
                 if "sent_event" not in columns:
                     self._db.execute("ALTER TABLE jobs ADD COLUMN sent_event TEXT")
+                # #1959: when a row became 'done', so it can be pruned later.
+                # Rows done before this column existed start their clock now.
+                if "done_at" not in columns:
+                    self._db.execute("ALTER TABLE jobs ADD COLUMN done_at REAL")
+                self._db.execute("UPDATE jobs SET done_at=? WHERE state='done' AND done_at IS NULL", (time.time(),))
                 # A crashed attachment turn also forgets its decryption keys.
                 self._db.execute("UPDATE jobs SET state='uncertain',attachment=NULL,reply_attachment=NULL WHERE state='running'")
         except BaseException:
@@ -1075,9 +1090,9 @@ class Store:
                 if req.reply_attachment is not None and decode_attachment(req.reply_attachment) is None:
                     raise ValueError("invalid reply attachment")
                 digest = job_digest(req.room_id, req.sender, req.body, req.attachment, req.reply_attachment)
-                old = self.db.execute("SELECT digest FROM jobs WHERE event_id=?", (req.event_id,)).fetchone()
-                if old:
-                    if old[0] != digest:
+                old = self._known_digest(req.event_id)
+                if old is not None:
+                    if old != digest:
                         raise ValueError("event identity conflict")
                     continue
                 count, scoped = self.db.execute(
@@ -1095,8 +1110,16 @@ class Store:
             if next_token is not None:
                 self.db.execute("INSERT OR REPLACE INTO meta VALUES ('sync_token',?)", (next_token,))
 
+    def _known_digest(self, event_id: str) -> str | None:
+        """Digest of a stored or pruned job (#1959), or None for an unseen event."""
+        for table in ("jobs", "pruned_jobs"):
+            row = self.db.execute(f"SELECT digest FROM {table} WHERE event_id=?", (event_id,)).fetchone()
+            if row:
+                return str(row[0])
+        return None
+
     def job_exists(self, event_id: str) -> bool:
-        return self.db.execute("SELECT 1 FROM jobs WHERE event_id=?", (event_id,)).fetchone() is not None
+        return self._known_digest(event_id) is not None
 
     def pending_before(self, event_id: str) -> int:
         """Real (non-notice) undelivered jobs of the same scope queued earlier."""
@@ -1135,8 +1158,8 @@ class Store:
             # The attachment carries the media decryption key; drop it once the
             # turn has a result (the digest still pins the event identity).
             self.db.execute(
-                "UPDATE jobs SET state=?,reply=?,attachment=NULL,reply_attachment=NULL WHERE event_id=?",
-                ("ready" if deliver else "done", reply, event_id),
+                "UPDATE jobs SET state=?,reply=?,attachment=NULL,reply_attachment=NULL,done_at=? WHERE event_id=?",
+                ("ready" if deliver else "done", reply, None if deliver else time.time(), event_id),
             )
             if session_id is not None:
                 self.db.execute("INSERT OR REPLACE INTO sessions VALUES (?,?)", (row["scope"], session_id))
@@ -1151,7 +1174,7 @@ class Store:
     def delivered(self, event_id: str) -> None:
         with self.db:
             changed = self.db.execute(
-                "UPDATE jobs SET state='done' WHERE event_id=? AND state='ready'", (event_id,)
+                "UPDATE jobs SET state='done',done_at=? WHERE event_id=? AND state='ready'", (time.time(), event_id)
             ).rowcount
             if changed != 1:
                 raise ValueError("only a pending reply can be acknowledged")
@@ -1173,9 +1196,9 @@ class Store:
         digest = hashlib.sha256(json.dumps([room_id, sender, body]).encode()).hexdigest()
         txn = hashlib.sha256(json.dumps([self.account, event, "reply-v1"]).encode()).hexdigest()
         with self.db:
-            old = self.db.execute("SELECT digest FROM jobs WHERE event_id=?", (event,)).fetchone()
-            if old:
-                if old[0] != digest:
+            old = self._known_digest(event)
+            if old is not None:
+                if old != digest:
                     raise SafetyStop("self-job-identity-conflict")
                 return event
             count, scoped = self.db.execute(
@@ -1368,6 +1391,29 @@ class MatrixStore(Store):
         if fs.f_bavail * fs.f_frsize < 268_435_456 or size > 134_217_728:
             raise SafetyStop("pilot-storage-limit")
 
+    def prune(self, *, now: float | None = None, after: float = PRUNE_AFTER_S) -> int:
+        """Replace 'done' jobs finished more than ``after`` seconds ago by tombstones (#1959).
+
+        Only completed rows go: queued, running, uncertain and ready work is
+        never touched. The tombstone keeps the event id, digest and sent event
+        id, so a replayed sync, a re-queued self-job or notice key and a
+        status-message lookup behave exactly as with the full row. Their
+        delivery bookkeeping goes with them. Freed pages are reused by SQLite,
+        which stops the file growing; it is not VACUUMed. Returns the number
+        of rows pruned.
+        """
+        cutoff = (time.time() if now is None else now) - after
+        old = "SELECT event_id FROM jobs WHERE state='done' AND done_at IS NOT NULL AND done_at<?"
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO pruned_jobs(event_id,digest,sent_event,done_at) "
+                "SELECT event_id,digest,sent_event,done_at FROM jobs WHERE event_id IN (" + old + ")",
+                (cutoff,),
+            )
+            for table in ("deliveries", "delivery_failures", "delivery_failure_notices"):
+                self.db.execute(f"DELETE FROM {table} WHERE event_id IN (" + old + ")", (cutoff,))
+            return int(self.db.execute("DELETE FROM jobs WHERE event_id IN (" + old + ")", (cutoff,)).rowcount)
+
     # -- sync replay ----------------------------------------------------------
 
     def stage_sync(self, raw: Any) -> None:
@@ -1405,7 +1451,7 @@ class MatrixStore(Store):
     def has_notice(self, event_id: str, key: str) -> bool:
         """Whether :meth:`notice` already queued ``key`` for ``event_id``."""
         event = "$notice-" + hashlib.sha256(json.dumps([event_id, key]).encode()).hexdigest()
-        return self.db.execute("SELECT 1 FROM jobs WHERE event_id=?", (event,)).fetchone() is not None
+        return self.job_exists(event)
 
     def notice(self, req: Request, key: str, text: str, *, msgtype: str = "m.text") -> str:
         """Queue a durable, idempotent notice for ``req``'s room; returns its outbox event id.
@@ -1437,9 +1483,9 @@ class MatrixStore(Store):
         txn = hashlib.sha256(json.dumps([self.account, event, "reply-v1"]).encode()).hexdigest()
         digest = hashlib.sha256(reply.encode()).hexdigest()
         with self.db:
-            old = self.db.execute("SELECT digest FROM jobs WHERE event_id=?", (event,)).fetchone()
-            if old:
-                if old[0] != digest:
+            old = self._known_digest(event)
+            if old is not None:
+                if old != digest:
                     raise SafetyStop("notice-identity-conflict")
                 return event
             self.db.execute(
@@ -1473,6 +1519,11 @@ class MatrixStore(Store):
     def sent_event(self, event: str) -> tuple[str | None, str | None]:
         """``(state, matrix event id)`` of one outbox row; ``(None, None)`` if unknown (#2088)."""
         row = self.db.execute("SELECT state,sent_event FROM jobs WHERE event_id=?", (event,)).fetchone()
+        if row is None:
+            # A pruned row (#1959) was 'done'; its tombstone keeps the event id.
+            row = self.db.execute(
+                "SELECT 'done' AS state,sent_event FROM pruned_jobs WHERE event_id=?", (event,)
+            ).fetchone()
         if row is None:
             return None, None
         return str(row["state"]), (str(row["sent_event"]) if row["sent_event"] else None)

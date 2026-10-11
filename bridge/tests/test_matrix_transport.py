@@ -411,6 +411,22 @@ class TestConstruction:
         f = MatrixTransport(c, FakeRunner())
         f.store.close()
 
+    def test_inbox_prune_runs_hourly_records_meta_and_never_raises(self, tmp_path: Path) -> None:
+        # #1959: the sync loop prunes old 'done' rows; housekeeping cannot stop sync.
+        f = MatrixTransport(config(tmp_path), FakeRunner())
+        try:
+            f.store.prune = Mock(return_value=3)
+            f.prune_inbox()
+            f.prune_inbox()  # within the interval: no second pass
+            assert f.store.prune.call_count == 1
+            assert f.store.get_meta("inbox_pruned")["removed"] == 3
+            f.next_inbox_prune = 0.0
+            f.store.prune = Mock(side_effect=RuntimeError("disk"))
+            f.prune_inbox()  # logged, not raised
+            assert f.next_inbox_prune > time.monotonic()
+        finally:
+            f.store.close()
+
     def test_turn_timeout_comes_from_config(self, tmp_path: Path) -> None:
         f = MatrixTransport(config(tmp_path), FakeRunner())
         assert f.turn_timeout == 21600.0  # fleet default: 6 h

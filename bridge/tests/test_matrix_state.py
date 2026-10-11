@@ -474,6 +474,10 @@ def uncertain_job(store: MatrixStore, event_id: str = "$job", sender: str = OWNE
     store.uncertain_job(event_id)
 
 
+def time_of_done(store: MatrixStore, event_id: str) -> float:
+    return float(store.db.execute("SELECT done_at FROM jobs WHERE event_id=?", (event_id,)).fetchone()[0])
+
+
 class TestMatrixStore:
     def test_raw_pending_survives_reopen_and_atomic_commit(self, tmp_path: Path) -> None:
         with MatrixStore(tmp_path / "state", BOT) as store:
@@ -601,6 +605,61 @@ class TestMatrixStore:
             assert block is not None and block["blocked_scopes"] == [SCOPE]
             assert s.audit() == []
             assert len(s.uncertain()) == 1
+
+    def test_prune_tombstones_old_done_rows_and_keeps_dedupe(self, tmp_path: Path) -> None:
+        # #1959: old 'done' rows lose body/reply but keep their identity.
+        directory = tmp_path / "state"
+        with MatrixStore(directory, BOT) as s:
+            s.accept_batch([request("$old")], "t1")
+            s.claim()
+            s.finish("$old", "synthetic response")
+            s.mark_part("$old", 1, "$sent-old")
+            s.skip_part("$old", 1, 413, "M_TOO_LARGE")
+            s.delivered("$old")
+            notice = s.notice(request("$old"), "k", "안내")
+            s.delivered(notice)
+            self_job = s.self_job(ROOM, OWNER, "{}", key="resume")
+            s.claim()
+            s.finish(self_job, "")
+            s.accept_batch([request("$open", sender=OTHER)], "t2")
+            assert s.prune() == 0  # nothing is old yet
+            later = time_of_done(s, "$old") + m.PRUNE_AFTER_S + 1
+            assert s.prune(now=later) == 3
+            remaining = [row[0] for row in s.db.execute("SELECT event_id FROM jobs")]
+            assert remaining == ["$open"]  # live work is never pruned
+            assert s.delivered_parts("$old") == 0 and s.failed_parts("$old") == []
+            assert s.prune(now=later) == 0
+        with MatrixStore(directory, BOT) as s:
+            # Replayed sync, re-queued self-job and notice keys stay deduplicated.
+            assert s.job_exists("$old")
+            s.accept_batch([request("$old")], "t3")
+            assert s.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+            with pytest.raises(ValueError, match="event identity conflict"):
+                s.accept_batch([Request("$old", ROOM, OWNER, "changed", SCOPE)], None)
+            assert s.self_job(ROOM, OWNER, "{}", key="resume") == self_job
+            with pytest.raises(SafetyStop, match="self-job-identity-conflict"):
+                s.self_job(ROOM, OWNER, "other", key="resume")
+            assert s.has_notice("$old", "k")
+            assert s.notice(request("$old"), "k", "안내") == notice
+            with pytest.raises(SafetyStop, match="notice-identity-conflict"):
+                s.notice(request("$old"), "k", "다른 안내")
+            assert s.claim() is not None and s.claim() is None  # only "$open" runs
+            assert s.sent_event("$old") == ("done", "$sent-old")
+            assert s.sent_event(notice) == ("done", None)
+
+    def test_prune_starts_the_clock_for_rows_done_before_the_column(self, tmp_path: Path) -> None:
+        directory = tmp_path / "state"
+        with MatrixStore(directory, BOT) as s:
+            s.accept_batch([request()], "t")
+            s.claim()
+            s.finish("$one", "")
+            s.db.execute("UPDATE jobs SET done_at=NULL")
+            s.db.commit()
+        with MatrixStore(directory, BOT) as s:
+            stamped = time_of_done(s, "$one")
+            assert stamped > 0
+            assert s.prune(now=stamped + 60) == 0
+            assert s.prune(now=stamped + m.PRUNE_AFTER_S + 1) == 1
 
     def test_operator_name_falls_back_to_uid(self) -> None:
         assert operator_name({"SUDO_USER": "alice"}) == "alice#" + str(os.getuid())
