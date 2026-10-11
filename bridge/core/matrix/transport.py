@@ -215,6 +215,8 @@ APPROVAL_TIMEOUT_S = 120.0
 # runner's graceful stop is bounded so a hung provider cannot freeze sync and
 # sending. The task cancellation that follows stays authoritative.
 RUNNER_CANCEL_TIMEOUT_S = 10.0
+# #1959: how often the sync loop prunes old 'done' inbox rows to tombstones.
+INBOX_PRUNE_INTERVAL_S = 3600.0
 # ``_RoomSink.approval_outcome`` results (#1959).
 APPROVAL_ALLOW = "allow"
 APPROVAL_DENY = "deny"
@@ -542,6 +544,7 @@ class MatrixTransport:
         self.senders = frozenset([config["owner"]]) | self.family_users
         self.family_allowed = self.senders | frozenset([config["account"]])
         self.store = MatrixStore(config["state_directory"], config["account"])
+        self.next_inbox_prune = 0.0  # monotonic; the first sync pass prunes
         # A saved inbox must never be silently rerouted by editing configuration.
         policy = saved_policy(config)
         old = self.store.get_meta("policy")
@@ -1393,9 +1396,28 @@ class MatrixTransport:
 
     # -- sync -----------------------------------------------------------------
 
+    def prune_inbox(self) -> None:
+        """Hourly housekeeping (#1959): old 'done' rows become body-free tombstones.
+
+        A failure is logged and retried next interval; it never stops sync.
+        """
+        now = time.monotonic()
+        if now < self.next_inbox_prune:
+            return
+        self.next_inbox_prune = now + INBOX_PRUNE_INTERVAL_S
+        try:
+            removed = self.store.prune()
+        except Exception as exc:  # noqa: BLE001 - housekeeping must not stop sync
+            logger.warning("matrix inbox prune failed: %s", type(exc).__name__)
+            return
+        if removed:
+            self.store.set_meta("inbox_pruned", {"removed": removed, "updated": time.time()})
+            logger.info("matrix inbox pruned rows=%d", removed)
+
     async def receive(self) -> None:
         while True:
             self.store.storage_gate()
+            self.prune_inbox()
             raw = self.store.get_meta("pending_sync")
             if raw is None:
                 params = {

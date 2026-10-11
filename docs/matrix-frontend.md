@@ -706,7 +706,16 @@ notice twice.
 - **Logs** — `nio`/`aiohttp`/`httpx`/`httpcore` records have their message,
   args and traceback withheld, as on the Grok frontends.
 - `group-key-share-incomplete` already surfaces in health as a send retry label
-  (#1820/#1963). Pruning old `inbox.sqlite3` rows is deliberately not done here.
+  (#1820/#1963).
+- **Inbox pruning** — the sync loop, at most hourly, replaces `done` job rows
+  finished more than 48 h ago (outside the 24 h admission window) with a
+  body-free tombstone (`pruned_jobs`: event id, digest, sent event id). A
+  replayed sync, a re-queued self-job or notice key and a status-message
+  lookup behave as with the full row; queued, running, uncertain and ready
+  work is never touched. Rows done before the upgrade start their 48 h clock
+  at the first open. SQLite reuses the freed pages, so `inbox.sqlite3` stops
+  growing; it is not VACUUMed (the file does not shrink). The last non-empty
+  pass is in meta `inbox_pruned`.
 
 ## Grok (`CCC_AGENT_PROVIDER=grok`) — owner direct room, opt-in family rooms
 
