@@ -919,16 +919,16 @@ STUB
 chmod +x "$TMP/bin/claude"
 reset_db
 # shellcheck disable=SC2034  # idk1 is read via eval inside ok()
-idk1="$(seed dungae "격리 판정 형제 갈등" "$OLD" 1 1 dk1)"
-seed dungae "격리 판정 형제 갈등" "$OLD" 1 0 dk2 >/dev/null
+idk1="$(seed peer-k "격리 판정 형제 갈등" "$OLD" 1 1 dk1)"
+seed peer-k "격리 판정 형제 갈등" "$OLD" 1 0 dk2 >/dev/null
 out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude)"
 ok "claude verdict call runs in --safe-mode" \
   '[ "$(review_of "$idk1")" = 0 ] && grep -qx -- "--safe-mode" "$TMP/claude-args"'
 ok "claude verdict call pins low effort by default" \
   '[ "$(grep -x -A1 -- "--effort" "$TMP/claude-args" | tail -n 1)" = low ]'
 reset_db
-seed dungae "격리 판정 효과 형제" "$OLD" 1 1 dk7 >/dev/null
-seed dungae "격리 판정 효과 형제" "$OLD" 1 0 dk8 >/dev/null
+seed peer-k "격리 판정 효과 형제" "$OLD" 1 1 dk7 >/dev/null
+seed peer-k "격리 판정 효과 형제" "$OLD" 1 0 dk8 >/dev/null
 rm -f "$TMP/claude-args"
 out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude NUNCHI_JUDGE_EFFORT=medium)"
 ok "NUNCHI_JUDGE_EFFORT overrides the judge effort" \
@@ -944,8 +944,8 @@ STUB
 chmod +x "$TMP/bin/claude"
 reset_db
 # shellcheck disable=SC2034  # idk3 is read via eval inside ok()
-idk3="$(seed dungae "로그인 실패 형제 갈등" "$OLD" 1 1 dk3)"
-seed dungae "로그인 실패 형제 갈등" "$OLD" 1 0 dk4 >/dev/null
+idk3="$(seed peer-k "로그인 실패 형제 갈등" "$OLD" 1 1 dk3)"
+seed peer-k "로그인 실패 형제 갈등" "$OLD" 1 0 dk4 >/dev/null
 out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude)"
 ok "claude login failure fails closed to human" '[ "$(review_of "$idk3")" = 1 ]'
 ok "claude login failure is classed body-free in audit" \
@@ -960,8 +960,8 @@ STUB
 chmod +x "$TMP/bin/claude"
 reset_db
 # shellcheck disable=SC2034  # idk5 is read via eval inside ok()
-idk5="$(seed dungae "긴 근거 형제 갈등" "$OLD" 1 1 dk5)"
-seed dungae "긴 근거 형제 갈등" "$OLD" 1 0 dk6 >/dev/null
+idk5="$(seed peer-k "긴 근거 형제 갈등" "$OLD" 1 1 dk5)"
+seed peer-k "긴 근거 형제 갈등" "$OLD" 1 0 dk6 >/dev/null
 # shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude)"
 ok "overlong claude rationale fails closed to human" '[ "$(review_of "$idk5")" = 1 ]'
