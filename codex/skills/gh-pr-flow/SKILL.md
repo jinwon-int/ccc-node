@@ -102,7 +102,9 @@ the new head, then re-run the relay approval — it is commit-bound to
 ## Relay-held cross-account review
 
 Use the allowlisted review profile matching the PR author. Both directions
-require fresh explicit approval for the exact repository, PR, and head:
+require fresh explicit approval for the exact repository, PR, and head (sole
+exception: the standing approval for mechanical fleet-skills promote PRs at
+the end of this skill):
 
 | PR author | Review profile | Expected reviewer | Remote gh config |
 | --- | --- | --- | --- |
@@ -170,10 +172,40 @@ its state. `--dry-run` checks every gate without submitting.
 
 - Require fresh explicit approval for every helper invocation and review
   profile. Approval does not carry to another repository, PR, changed head, or
-  opposite credential.
+  opposite credential. The only exception is the standing approval below.
 - Never read, print, copy, export, re-login, or place the token in arguments.
 - Keep shell tracing disabled. Return only body-free gate results.
 - Stop on credential owner/mode drift, wrong actor, self-review, head drift,
   missing review request, missing checks, or non-green checks.
 - Review approval and merge are separate writes unless the current user
   instruction explicitly authorizes both for that exact PR.
+
+## Standing approval for mechanical fleet-skills promote PRs (#2239 L3)
+
+The single exception to per-invocation fresh approval. It exists only while
+the owner has switched it on, and it covers only this case:
+
+- **Scope:** `jinwon-int/fleet-skills` PRs on `promote/auto-*` branches opened
+  by the skill-promotion publisher (`ccc-skill-promotion.py`, ledger kind
+  `a2a-promote-pr`), approved by that publisher's own collect sweep with the
+  `seoseo-ai` profile (the publisher authors as `jinon86`). An interactive
+  session never uses it.
+- **Owner switch:** the owner-created `0600` flag file
+  `~/.claude/state/skill-promotion.auto-approve` reading `true` on the
+  publisher (or `CCC_SKILL_PROMOTION_AUTO_APPROVE=true` in its owner-only
+  config file). `dry-run` approves nothing and only records
+  `would-approve-promote-pr`. Absent/`off` = no standing approval.
+- **Conditions, all on the exact head:** no creation-time identity hits; every
+  path in the full PR diff under `approved/<audience>/<staged skill>/`; every
+  added line rescanned clean (credentials, home paths, IPs, emails, runtime
+  coupling, fleet identities) and `approval.json` in the generator's exact
+  shape; checks green and `MERGEABLE`; the helper re-verifies with
+  `--expected-head`, and the merge uses `--match-head-commit` (never
+  `--admin`).
+- **Everything else** — another repository, any non-promote PR, a blocked
+  or changed head, a promote PR a check rejected, a merge outside the queue —
+  still needs fresh per-PR approval as above. Each decision is recorded in
+  the publisher ledger (`a2a-promote-autoapprove`) and the owner is notified
+  afterwards (PR numbers only).
+- **Revoke:** delete the flag file or write `off`; the next sweep stops
+  approving. No restart.

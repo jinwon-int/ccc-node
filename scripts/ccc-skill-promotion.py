@@ -23,6 +23,7 @@ from pathlib import Path
 import random
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -207,6 +208,16 @@ class Config:
     outbox_stale_hours: int = 72
     # #2239: the optional publisher config file this Config was resolved with.
     config_file: ConfigFile | None = None
+    # #2239 L3: policy-gated approval of mechanical promote PRs. "off"
+    # (default) keeps the pre-L3 flow byte-identical; "dry-run" records what
+    # would be approved; "true" approves through the relay helper.
+    auto_approve_mode: str = "off"
+    approve_cmd: tuple[str, ...] = ()
+    approve_cmd_present: bool = False
+    approve_profile: str = "seoseo-ai"
+    approve_ssh_target: str = ""
+    # Owner push spool (bridge PushNotifier); None = post-hoc notify disabled.
+    push_spool: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -335,7 +346,9 @@ def _collect_dial(config: Config, node: str) -> str:
     return dict(getattr(config, "collect_aliases", ())).get(node, node)
 
 
-def _read_enabled_file(path: Path, *, trust_root: Path | None = None) -> bool:
+def _read_flag_value(path: Path, *, trust_root: Path | None = None) -> str | None:
+    """The lower-cased content of an owner-only 0600 flag file, or None when it
+    is absent, unsafe or unreadable (the caller's fail-safe default)."""
     try:
         metadata = path.lstat()
         if (
@@ -348,10 +361,84 @@ def _read_enabled_file(path: Path, *, trust_root: Path | None = None) -> bool:
             or stat.S_IMODE(metadata.st_mode) != 0o600
             or metadata.st_size > 32
         ):
-            return False
-        return path.read_text(encoding="utf-8").strip().lower() == "true"
+            return None
+        return path.read_text(encoding="utf-8").strip().lower()
     except (OSError, UnicodeDecodeError):
-        return False
+        return None
+
+
+def _read_enabled_file(path: Path, *, trust_root: Path | None = None) -> bool:
+    return _read_flag_value(path, trust_root=trust_root) == "true"
+
+
+# #2239 L3: auto-approval of mechanical promote PRs.
+_AUTO_APPROVE_TRUE = frozenset({"1", "true", "yes"})
+_AUTO_APPROVE_DRY = frozenset({"dry-run", "dryrun"})
+_AUTO_APPROVE_OFF = frozenset({"", "0", "false", "no", "off"})
+# Profiles approve-via-relay.sh accepts; the profile name is also the GitHub
+# login that must be the requested reviewer.
+_APPROVE_PROFILES = frozenset({"seoseo-ai", "jinon86"})
+_APPROVE_SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,128}$")
+_APPROVE_SCRIPT_REL = ("skills", "gh-pr-flow", "scripts", "approve-via-relay.sh")
+
+
+def _auto_approve_mode(raw: str | None, state_file: Path, *, trust_root: Path | None = None) -> str:
+    """off | dry-run | true. The env value must be valid (a typo fails the run
+    like every other tri-state knob); the owner flag file fails safe to off."""
+    if raw is None:
+        value = _read_flag_value(state_file, trust_root=trust_root)
+        if value in _AUTO_APPROVE_TRUE:
+            return "true"
+        return "dry-run" if value in _AUTO_APPROVE_DRY else "off"
+    value = raw.strip().lower()
+    if value in _AUTO_APPROVE_TRUE:
+        return "true"
+    if value in _AUTO_APPROVE_DRY:
+        return "dry-run"
+    if value in _AUTO_APPROVE_OFF:
+        return "off"
+    raise PromotionError("auto_approve_invalid")
+
+
+def _approve_cmd(env: dict[str, str], home: Path) -> tuple[tuple[str, ...], bool]:
+    """(argv prefix, present) for the relay approval helper.
+
+    Default: the managed Codex skill copy (`$CODEX_HOME/skills/gh-pr-flow`,
+    what setup.sh installs), then this checkout's `codex/` tree, then the same
+    checkout roots gh-pr-flow's RELAY_FLOW_DIR probes. Unresolvable -> ((),
+    False) and the sweep reports `approve_cmd_missing` instead of approving.
+    """
+    raw = env.get("CCC_SKILL_PROMOTION_APPROVE_CMD")
+    if raw is None:
+        roots = (
+            Path(env.get("CODEX_HOME") or home / ".codex"),
+            Path(__file__).resolve().parent.parent / "codex",
+            Path("/opt/ccc-node/codex"),
+            home / "ccc-node" / "codex",
+        )
+        for root in roots:
+            script = root.joinpath(*_APPROVE_SCRIPT_REL)
+            if script.is_file():
+                return ("bash", str(script)), True
+        return (), False
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        raise PromotionError("approve_cmd_invalid") from None
+    if not tokens or len(tokens) > 8 or any(not token.strip() or len(token) > 512 for token in tokens):
+        raise PromotionError("approve_cmd_invalid")
+    if tokens[0].endswith(".sh"):
+        tokens = ["bash", *tokens]
+    target = tokens[1] if tokens[0] in {"bash", "sh"} and len(tokens) > 1 else tokens[0]
+    present = Path(target).is_file() if "/" in target else bool(shutil.which(target))
+    return tuple(tokens), present
+
+
+def _push_spool(env: dict[str, str], state_dir: Path) -> Path | None:
+    """Same opt-out and path as the autosave sweep's owner notification."""
+    if env.get("CCC_SKILL_AUTOSAVE_NOTIFY", "1") == "0":
+        return None
+    return Path(env.get("CCC_PUSH_SPOOL") or state_dir / "telegram-spool").absolute()
 
 
 def _tri_state_enabled(
@@ -595,6 +682,15 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         trust_root=home,
         error_code="auto_merge_invalid",
     )
+    auto_approve_mode = _auto_approve_mode(
+        env.get("CCC_SKILL_PROMOTION_AUTO_APPROVE"),
+        state_dir / "skill-promotion.auto-approve",
+        trust_root=home,
+    )
+    approve_cmd, approve_cmd_present = _approve_cmd(env, home)
+    approve_profile = env.get("CCC_SKILL_PROMOTION_APPROVE_PROFILE", "seoseo-ai").strip()
+    if approve_profile not in _APPROVE_PROFILES:
+        raise PromotionError("approve_profile_invalid")
     raw_llm_cmd = env.get("CCC_SKILL_REVIEW_LLM_CMD")
     if raw_llm_cmd is None:
         review_llm_cmd: tuple[str, ...] = ("claude", "-p", "--disallowed-tools", "*")
@@ -685,6 +781,12 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         autonomy=_autonomy_state(env, state_dir, trust_root=home),
         remote_brokers=_parse_remote_brokers(env.get("CCC_SKILL_PROMOTION_REMOTE_BROKERS", "")),
         config_file=config_file,
+        auto_approve_mode=auto_approve_mode,
+        approve_cmd=approve_cmd,
+        approve_cmd_present=approve_cmd_present,
+        approve_profile=approve_profile,
+        approve_ssh_target=env.get("CCC_SKILL_PROMOTION_APPROVE_SSH_TARGET", "").strip(),
+        push_spool=_push_spool(env, state_dir),
     )
 
 
@@ -1892,6 +1994,32 @@ def _effective_knobs(config: Config) -> dict[str, object]:
         "remote_brokers": len(config.remote_brokers),
         "providers": list(config.providers),
         "collect_nodes": len(config.collect_nodes),
+        "auto_approve": _auto_approve_summary(config),
+    }
+
+
+def _auto_approve_blocker(config: Config) -> str | None:
+    """Why `true` mode cannot approve on this node (a code, never a value)."""
+    if not getattr(config, "approve_cmd_present", False) or not getattr(config, "approve_cmd", ()):
+        return "approve_cmd_missing"
+    target = str(getattr(config, "approve_ssh_target", "") or "")
+    if not target:
+        return "approve_ssh_target_unset"
+    if not _APPROVE_SSH_TARGET_RE.fullmatch(target):
+        return "approve_ssh_target_invalid"
+    return None
+
+
+def _auto_approve_summary(config: Config) -> dict[str, object]:
+    """#2239 L3 status block: presence/booleans only — the ssh target and the
+    command path are configuration, not something status needs to echo."""
+    mode = str(getattr(config, "auto_approve_mode", "off"))
+    return {
+        "mode": mode,
+        "cmd_present": bool(getattr(config, "approve_cmd_present", False)),
+        "profile": str(getattr(config, "approve_profile", "seoseo-ai")),
+        "ssh_target_set": bool(getattr(config, "approve_ssh_target", "")),
+        "blocker": _auto_approve_blocker(config) if mode != "off" else None,
     }
 
 
@@ -1909,6 +2037,7 @@ def _status(config: Config) -> dict[str, object]:
             "autonomy": config.autonomy,
             "config_file": _config_file_summary(config),
             "effective": _effective_knobs(config),
+            "auto_approve": _auto_approve_summary(config),
             "candidates": [],
             "blocked": [],
         }
@@ -1934,6 +2063,7 @@ def _status(config: Config) -> dict[str, object]:
         "supersede_autoclose_enabled": config.supersede_autoclose_enabled,
         "auto_promote_enabled": config.auto_promote_enabled,
         "auto_merge_promote_enabled": config.auto_merge_promote_enabled,
+        "auto_approve": _auto_approve_summary(config),
         "candidates": [
             {
                 "node": item.node,
@@ -4903,7 +5033,9 @@ def _sweep_promote_merge(
             {"outcome": "would-hold-identity-hits", "pr": row.get("pr")}
             for row in pending if row.get("identity_hits")
         ]
+    mode = str(getattr(config, "auto_approve_mode", "off"))
     processed: list[dict[str, object]] = []
+    notify: dict[str, list[str]] = {"approved": [], "dry-run": []}
     for row in pending:
         pr = str(row.get("pr") or "")
         if not pr:
@@ -4914,7 +5046,8 @@ def _sweep_promote_merge(
         try:
             viewed = _run([
                 "gh", "pr", "view", pr, "--repo", config.repo,
-                "--json", "isDraft,mergeable,mergeStateStatus,statusCheckRollup,state",
+                "--json",
+                "isDraft,mergeable,mergeStateStatus,statusCheckRollup,state,headRefOid,reviewRequests",
             ])
             payload = json.loads(viewed.stdout.decode("utf-8"))
         except (PromotionError, UnicodeDecodeError, json.JSONDecodeError):
@@ -4941,21 +5074,370 @@ def _sweep_promote_merge(
         if green is None or str(payload.get("mergeable")) not in {"MERGEABLE"}:
             processed.append({"outcome": "waiting-checks", "pr": pr})
             continue
-        try:
-            _run([
-                "gh", "pr", "merge", pr, "--repo", config.repo,
-                "--squash", "--delete-branch",
-            ])
-        except PromotionError as error:
-            processed.append({"outcome": "merge-failed", "pr": pr, "code": error.code})
-            continue
-        _append_ledger(
-            config,
-            {"ts": _utc_now(), "kind": _PROMOTE_PR_KIND, "pr": pr,
-             "state": "MERGED", "url": row.get("url")},
-        )
-        processed.append({"outcome": "promote-pr-merged", "pr": pr})
+        processed += _approve_and_merge_promote_pr(config, row, payload, mode=mode, notify=notify)
+    _notify_promote_autoapprove(config, notify)
     return processed
+
+
+def _approve_and_merge_promote_pr(
+    config: Config,
+    row: dict[str, object],
+    payload: dict[str, object],
+    *,
+    mode: str,
+    notify: dict[str, list[str]],
+) -> list[dict[str, object]]:
+    """The green + MERGEABLE tail of the sweep: optional #2239 L3 approval,
+    then the merge attempt. Off = exactly the pre-L3 merge call."""
+    pr = str(row.get("pr") or "")
+    out: list[dict[str, object]] = []
+    merge_argv = [
+        # No --delete-branch: fleet-skills main has a merge queue and gh
+        # refuses -d there (every pre-#2239 sweep merge failed on it); the
+        # repo deletes merged branches itself (delete_branch_on_merge).
+        "gh", "pr", "merge", pr, "--repo", config.repo, "--squash",
+    ]
+    approved_head = ""
+    if mode != "off":
+        approval = _promote_autoapprove(
+            config, row, payload, mode=mode, was_draft=payload.get("isDraft") is True
+        )
+        out.append(approval)
+        if approval.get("new") is True:
+            notify["approved" if mode == "true" else "dry-run"].append(pr)
+        if approval["outcome"] == "promote-autoapproved":
+            approved_head = str(approval["head_sha"])
+            # fleet-skills main has a merge queue: gh refuses `-d` there
+            # (the repo deletes merged heads itself) and `merge` enqueues.
+            # --match-head-commit binds the merge to the approved head.
+            merge_argv = [
+                "gh", "pr", "merge", pr, "--repo", config.repo,
+                "--squash", "--match-head-commit", approved_head,
+            ]
+    try:
+        _run(merge_argv)
+    except PromotionError as error:
+        return [*out, {"outcome": "merge-failed", "pr": pr, "code": error.code}]
+    if approved_head:
+        # A merge queue only enqueues here, so MERGED is not known yet: the
+        # next sweep's live read records the terminal state (and a still-
+        # queued PR re-enqueues as a no-op, its approval already recorded).
+        return [*out, {"outcome": "promote-pr-merge-requested", "pr": pr, "head_sha": approved_head}]
+    _append_ledger(
+        config,
+        {"ts": _utc_now(), "kind": _PROMOTE_PR_KIND, "pr": pr,
+         "state": "MERGED", "url": row.get("url")},
+    )
+    return [*out, {"outcome": "promote-pr-merged", "pr": pr}]
+
+
+# #2239 L3 — policy-gated approval of mechanical promote PRs. The owner's
+# standing approval (flag file / env `true`) replaces the per-call fresh
+# approval of gh-pr-flow ONLY for promote PRs this publisher opened, and only
+# after every check below passed on the exact head being approved.
+_PROMOTE_AUTOAPPROVE_KIND = "a2a-promote-autoapprove"
+_AUTOAPPROVE_MAX_FAILURES = 3
+_AUTOAPPROVE_TIMEOUT_SEC = 180
+_HEAD_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_DIFF_GIT_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$")
+
+
+def _autoapprove_rows(config: Config, pr: str, head: str, mode: str) -> list[dict[str, object]]:
+    return [
+        row for row in _ledger_rows(config)
+        if row.get("kind") == _PROMOTE_AUTOAPPROVE_KIND
+        and str(row.get("pr")) == pr and row.get("head_sha") == head and row.get("mode") == mode
+    ]
+
+
+def _parse_pr_diff(text: str) -> tuple[list[str], dict[str, list[str]], set[str]]:
+    """(every path the diff touches, added lines per file, reason codes).
+
+    Fail-closed: anything this parser does not recognise is a reason, not a
+    skip — quoted/space paths, binary patches, symlinks and submodules all
+    need a human.
+    """
+    paths: list[str] = []
+    added: dict[str, list[str]] = {}
+    reasons: set[str] = set()
+    current: str | None = None
+    in_hunk = False
+    for line in text.split("\n"):
+        if line.startswith("diff --git "):
+            in_hunk = False
+            match = _DIFF_GIT_RE.match(line)
+            if match is None:
+                reasons.add("diff_header_unparsed")
+                current = None
+                continue
+            paths += [match.group(1), match.group(2)]
+            current = match.group(2)
+            added.setdefault(current, [])
+            continue
+        if current is None:
+            if line.strip():
+                reasons.add("diff_header_unparsed")
+            continue
+        if in_hunk:
+            if line.startswith("+"):
+                added[current].append(line[1:])
+            elif not (line == "" or line.startswith((" ", "-", "\\", "@@"))):
+                reasons.add("diff_line_unparsed")
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+        else:
+            _diff_header_line(line, paths, reasons)
+    if not paths:
+        reasons.add("diff_empty")
+    return paths, added, reasons
+
+
+def _diff_header_line(line: str, paths: list[str], reasons: set[str]) -> None:
+    """One extended-header line of a file section (before its first hunk)."""
+    if line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+        paths.append(line.split(" ", 2)[2])
+    elif line.startswith(("--- a/", "+++ b/")):
+        paths.append(line[6:])
+    elif line.startswith(("Binary files ", "GIT binary patch")):
+        reasons.add("diff_binary_file")
+    elif "mode 120000" in line:
+        reasons.add("diff_symlink")
+    elif "mode 160000" in line:
+        reasons.add("diff_submodule")
+
+
+def _autoapprove_path_ok(path: str, names: set[str]) -> bool:
+    parts = path.split("/")
+    return (
+        len(parts) >= 4
+        and parts[0] == "approved"
+        and parts[1] in _AUDIENCES
+        and parts[2] in names
+        and all(part not in {"", ".", ".."} for part in parts)
+    )
+
+
+def _autoapprove_scan(config: Config, row: dict[str, object], pr: str, head: str) -> list[str]:
+    """Reason codes that block auto-approval of this exact head ([] = clear).
+
+    The creation-time identity scan saw only each staged SKILL.md; this one
+    sees the full PR diff as it stands now, so support files and any later
+    human commit are covered. Codes only — never a matched value.
+    """
+    staged_names = row.get("staged_names")
+    names = {
+        name for name in staged_names if isinstance(name, str)
+    } if isinstance(staged_names, list) else set()
+    if not names:
+        return ["staged_names_missing"]
+    try:
+        diff = _run(["gh", "pr", "diff", pr, "--repo", config.repo, "--color", "never"])
+        text = diff.stdout.decode("utf-8")
+        reread = _run(["gh", "pr", "view", pr, "--repo", config.repo, "--json", "headRefOid"])
+        after = json.loads(reread.stdout.decode("utf-8"))
+    except PromotionError as error:
+        return [f"diff_{error.code}"]
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ["diff_unreadable"]
+    # The diff carries no head: bracketing it between two reads of the same
+    # head pins it to exactly the commit the relay is asked to approve.
+    if str(after.get("headRefOid") or "").lower() != head:
+        return ["head_changed"]
+    paths, added, reasons = _parse_pr_diff(text)
+    if any(not _autoapprove_path_ok(path, names) for path in paths):
+        reasons.add("path_outside_allowlist")
+    candidates = row.get("candidates")
+    trees = {
+        str(key).split(":", 1)[1] for key in candidates if ":" in str(key)
+    } if isinstance(candidates, list) else set()
+    nodes = _promote_worker_nodes(config)
+    for path, lines in added.items():
+        content = "\n".join(lines)
+        parts = path.split("/")
+        if len(parts) == 4 and parts[3] == "approval.json":
+            # Generator-owned and hash-bearing (the 64-hex tree trips the
+            # generic `possible-token` pattern), so it gets an exact-shape
+            # check instead of the free-text scan.
+            if not _approval_json_ok(content, parts[2], trees):
+                reasons.add("approval_json_invalid")
+        else:
+            try:
+                _scan_text(content.encode("utf-8"))
+            except PromotionError as error:
+                reasons.add(f"scan_{error.code}")
+        for hit in _promote_identity_hits(content, nodes):
+            reasons.add(f"identity_{str(hit.get('kind')).replace('-', '_')}")
+    return sorted(reasons)
+
+
+_APPROVED_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
+
+
+def _approval_json_ok(content: str, name: str, trees: set[str]) -> bool:
+    """Exactly what `_promote_stage` writes for `name`, bound to a reviewed
+    tree of this batch when the ledger row recorded the candidate set."""
+    try:
+        value = json.loads(content)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version", "source_candidate_id", "source_tree_sha256", "approved_at",
+    }:
+        return False
+    tree = value.get("source_tree_sha256")
+    return (
+        value.get("schema_version") == 1
+        and isinstance(tree, str)
+        and re.fullmatch(r"[0-9a-f]{64}", tree) is not None
+        and value.get("source_candidate_id") == f"{name}-{tree[:12]}"
+        and isinstance(value.get("approved_at"), str)
+        and _APPROVED_AT_RE.fullmatch(str(value["approved_at"])) is not None
+        and (not trees or tree in trees)
+    )
+
+
+def _promote_autoapprove(
+    config: Config, row: dict[str, object], payload: dict[str, object], *, mode: str, was_draft: bool
+) -> dict[str, object]:
+    """Decide (dry-run) or perform (true) the relay approval of one promote PR.
+
+    Every return carries an `outcome`; `new: True` marks a first-time event
+    for the owner notification. The caller keeps today's merge attempt either
+    way, so a blocked or failed approval degrades to the pre-L3 behavior.
+    """
+    pr = str(row.get("pr") or "")
+    head = str(payload.get("headRefOid") or "").lower()
+    if not _HEAD_SHA_RE.fullmatch(head):
+        return {"outcome": "needs-human-autoapprove-blocked", "pr": pr, "reasons": ["head_unreadable"]}
+    if mode == "true":
+        blocker = _auto_approve_blocker(config)
+        if blocker:
+            return {"outcome": "approve-not-configured", "pr": pr, "code": blocker}
+        if _autoapprove_rows(config, pr, head, "approved"):
+            return {"outcome": "promote-autoapproved", "pr": pr, "head_sha": head, "new": False}
+        if len(_autoapprove_rows(config, pr, head, "approve-failed")) >= _AUTOAPPROVE_MAX_FAILURES:
+            return {"outcome": "approve-failed", "pr": pr, "code": "approve_attempts_exhausted"}
+    elif _autoapprove_rows(config, pr, head, "dry-run"):
+        return {"outcome": "would-approve-promote-pr", "pr": pr, "head_sha": head, "new": False}
+    if was_draft:
+        # Marked ready a moment ago: let the live state settle before the
+        # relay re-verifies it, rather than spend an attempt on a race.
+        return {"outcome": "autoapprove-deferred", "pr": pr, "code": "just_marked_ready"}
+    reasons = _autoapprove_scan(config, row, pr, head)
+    if reasons:
+        return {"outcome": "needs-human-autoapprove-blocked", "pr": pr, "reasons": reasons}
+    if mode == "dry-run":
+        _append_ledger(config, {
+            "ts": _utc_now(), "kind": _PROMOTE_AUTOAPPROVE_KIND, "pr": pr,
+            "head_sha": head, "mode": "dry-run",
+        })
+        result: dict[str, object] = {
+            "outcome": "would-approve-promote-pr", "pr": pr, "head_sha": head, "new": True,
+        }
+        blocker = _auto_approve_blocker(config)
+        if blocker:
+            result["not_ready"] = blocker
+        return result
+    profile = str(config.approve_profile)
+    code = _run_relay_approval(config, payload, pr=pr, head=head, profile=profile)
+    if code:
+        _append_ledger(config, {
+            "ts": _utc_now(), "kind": _PROMOTE_AUTOAPPROVE_KIND, "pr": pr,
+            "head_sha": head, "mode": "approve-failed", "code": code, "profile": profile,
+        })
+        return {"outcome": "approve-failed", "pr": pr, "code": code}
+    _append_ledger(config, {
+        "ts": _utc_now(), "kind": _PROMOTE_AUTOAPPROVE_KIND, "pr": pr,
+        "head_sha": head, "mode": "approved", "profile": profile,
+    })
+    return {"outcome": "promote-autoapproved", "pr": pr, "head_sha": head, "new": True}
+
+
+def _run_relay_approval(
+    config: Config, payload: dict[str, object], *, pr: str, head: str, profile: str
+) -> str | None:
+    """Request the reviewer if needed, then run approve-via-relay.sh for this
+    exact head. Returns None on a verified approval, else a failure code."""
+    requests = payload.get("reviewRequests")
+    requested = {
+        str(item.get("login")) for item in requests if isinstance(item, dict)
+    } if isinstance(requests, list) else set()
+    if profile not in requested:
+        try:
+            _run(["gh", "pr", "edit", pr, "--repo", config.repo, "--add-reviewer", profile])
+        except PromotionError:
+            return "reviewer_request_failed"
+    env = dict(os.environ)
+    env["CCC_EXPLICIT_USER_APPROVAL"] = "1"
+    argv = [
+        *config.approve_cmd, "--review-profile", profile, "--repo", config.repo,
+        "--pr", pr, "--expected-head", head, "--operator-approved",
+        "--ssh-target", config.approve_ssh_target,
+    ]
+    try:
+        completed = _run(argv, check=False, env=env, timeout=_AUTOAPPROVE_TIMEOUT_SEC)
+    except PromotionError as error:
+        return f"approve_{error.code}"
+    returncode = int(getattr(completed, "returncode", 0) or 0)
+    if returncode != 0:
+        return f"approve_exit_{returncode}"
+    try:
+        lines = [line for line in completed.stdout.decode("utf-8").splitlines() if line.strip()]
+        result = json.loads(lines[-1])
+    except (UnicodeDecodeError, json.JSONDecodeError, IndexError):
+        return "approve_output_invalid"
+    if (
+        not isinstance(result, dict)
+        or result.get("ok") is not True
+        or result.get("approved") is not True
+        or str(result.get("head") or "").lower() != head
+    ):
+        return "approve_output_invalid"
+    return None
+
+
+def _notify_promote_autoapprove(config: Config, notify: dict[str, list[str]]) -> None:
+    """Post-hoc owner notice (counts + PR numbers only) via the push spool —
+    same contract as the autosave sweep: this process never sees the bot
+    token; the bridge PushNotifier (opt-in) delivers the file. Written from
+    here, not the sweep script, so the 15-minute results cron reports too."""
+    approved, would = notify.get("approved") or [], notify.get("dry-run") or []
+    if not (approved or would):
+        return
+    parts: list[str] = []
+    if approved:
+        parts.append(
+            f"스킬 승격 PR 자동 승인 {len(approved)}건: "
+            + ", ".join(f"#{pr}" for pr in approved) + " (머지 큐 요청)"
+        )
+    if would:
+        parts.append(
+            f"자동 승인 dry-run — 승인 대상 {len(would)}건: "
+            + ", ".join(f"#{pr}" for pr in would) + " (실제 승인 없음)"
+        )
+    text = " · ".join(parts) + " — 끄기: skill-promotion.auto-approve 삭제"
+    dedup = "SkillPromoteAutoApprove:" + ",".join(approved) + ":" + ",".join(would)
+    _push_notify(config, event="SkillPromoteAutoApprove", text=text, dedup=dedup[:120])
+
+
+def _push_notify(config: Config, *, event: str, text: str, dedup: str) -> bool:
+    spool = getattr(config, "push_spool", None)
+    if spool is None:
+        return False
+    now = _utc_now()
+    record = {"ts": now, "event": event, "node": str(config.node), "text": text, "dedup": dedup}
+    try:
+        spool.mkdir(parents=True, exist_ok=True)
+        descriptor, raw = tempfile.mkstemp(prefix=".", suffix=".tmp", dir=spool)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        # Same readability as the sweep's jq-written spool files.
+        os.chmod(raw, 0o644)
+        os.replace(raw, spool / f"{now.replace(':', '-')}-{event}-{os.getpid()}.json")
+    except OSError:
+        return False
+    return True
 
 
 # `shared` installs a skill under every provider root this node consumes, a
@@ -5409,9 +5891,15 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
         "promoted content is what was reviewed. Intake PRs are left open; "
         "`CCC_SKILL_PROMOTION_AUTOCLOSE` closes them once this merges.",
     ]
+    # #2239 L3: approve-via-relay.sh only approves for a *requested* reviewer,
+    # so request the configured profile's actor up front. Off = the pre-L3
+    # command, unchanged.
+    reviewer: list[str] = []
+    if getattr(config, "auto_approve_mode", "off") != "off":
+        reviewer = ["--reviewer", str(getattr(config, "approve_profile", "seoseo-ai"))]
     completed = _run(
         ["gh", "pr", "create", "--repo", config.repo, "--base", config.base,
-         "--head", branch, "--draft", "--title",
+         "--head", branch, "--draft", *reviewer, "--title",
          f"promote: {len(staged)} approved intake candidates", "--body", "\n".join(lines)]
     )
     try:
@@ -5433,6 +5921,9 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
                 for row in flagged
             ],
             "staged_prs": [str(row["pr"]) for row in staged],
+            # #2239 L3: the auto-approve path allowlist — every changed path
+            # must sit under approved/<audience>/<one of these>/.
+            "staged_names": [str(row["name"]) for row in staged],
             # The whole batch this run tried to stage (#2011 dedupe key) — not
             # just what staged: a candidate that errors every run must not
             # make each day's batch look new.

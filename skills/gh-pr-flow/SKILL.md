@@ -30,6 +30,8 @@ symmetrically:
 
 Every cross-account review or merge is a privileged credential use and needs
 fresh explicit user approval in the current conversation, in both directions.
+The sole exception is the owner-switched standing approval for mechanical
+fleet-skills promote PRs at the end of this skill (#2239 L3).
 
 ## GitHub transport policy
 
@@ -537,8 +539,40 @@ environment, or a follow-up release.
   `gh auth switch` to it, and never reuse one approval for a second invocation
   or a different head.
 - An approval flag records a fresh user decision; it does not grant standing
-  authority. Set it for one approved invocation only. Review approval and merge
+  authority (the only standing approval is the #2239 L3 owner switch below).
+  Set it for one approved invocation only. Review approval and merge
   approval are separate privileged writes unless the user's current instruction
   explicitly authorizes both for that exact PR.
 - A merge instruction authorizes the merge, not token disclosure, credential
   transfer, release/publish, deploy, restart, migration, or another mutation.
+
+## Standing approval for mechanical fleet-skills promote PRs (#2239 L3)
+
+Same policy as the codex copy (`codex/skills/gh-pr-flow/SKILL.md`, same
+heading); keep both in step. It is the single exception to the
+fresh-approval rules above and exists only while the owner has switched it on:
+
+- **Scope:** `jinwon-int/fleet-skills` PRs on `promote/auto-*` branches opened
+  by the skill-promotion publisher (`ccc-skill-promotion.py`, ledger kind
+  `a2a-promote-pr`), approved by that publisher's own collect sweep with the
+  `seoseo-ai` profile (the publisher authors as `jinon86`). An interactive
+  session never uses it.
+- **Owner switch:** the owner-created `0600` flag file
+  `~/.claude/state/skill-promotion.auto-approve` reading `true` on the
+  publisher (or `CCC_SKILL_PROMOTION_AUTO_APPROVE=true` in its owner-only
+  config file). `dry-run` approves nothing and only records
+  `would-approve-promote-pr`. Absent/`off` = no standing approval.
+- **Conditions, all on the exact head:** no creation-time identity hits; every
+  path in the full PR diff under `approved/<audience>/<staged skill>/`; every
+  added line rescanned clean (credentials, home paths, IPs, emails, runtime
+  coupling, fleet identities) and `approval.json` in the generator's exact
+  shape; checks green and `MERGEABLE`; the helper re-verifies with
+  `--expected-head`, and the merge uses `--match-head-commit` (never
+  `--admin`).
+- **Everything else** — another repository, any non-promote PR, a blocked
+  or changed head, a promote PR a check rejected, a merge outside the queue —
+  still needs fresh per-PR approval as above. Each decision is recorded in
+  the publisher ledger (`a2a-promote-autoapprove`) and the owner is notified
+  afterwards (PR numbers only).
+- **Revoke:** delete the flag file or write `off`; the next sweep stops
+  approving. No restart.

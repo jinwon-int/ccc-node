@@ -175,7 +175,7 @@ class PromotableTests(unittest.TestCase):
 
 
 class PromoteFlowTests(unittest.TestCase):
-    def run_promote(self, rows, *, promoted=None, dry_run=False, limit=8):
+    def run_promote(self, rows, *, promoted=None, dry_run=False, limit=8, ledger=None, **extra):
         calls: list[list[str]] = []
 
         def fake_run(args, **kwargs):
@@ -188,7 +188,8 @@ class PromoteFlowTests(unittest.TestCase):
         cfg = types.SimpleNamespace(
             node="seoseo", collect_nodes=(), repo="jinwon-int/fleet-skills",
             base="main", remote="https://example.invalid/fleet-skills.git",
-            promotion_state_dir=Path("/tmp"))
+            promotion_state_dir=Path("/tmp"), **extra)
+        sink = ledger if ledger is not None else []
         with patch.object(promotion, "_ledger_rows", return_value=rows), \
              patch.object(promotion, "_promoted_source_trees",
                           return_value=promoted or {}), \
@@ -197,10 +198,44 @@ class PromoteFlowTests(unittest.TestCase):
                           side_effect=lambda work, item, *, audience: (
                               work / "approved" / audience / item["name"],
                               "on gwakga")), \
-             patch.object(promotion, "_append_ledger", lambda *_a, **_k: None), \
+             patch.object(promotion, "_append_ledger",
+                          side_effect=lambda _c, record: sink.append(record)), \
              patch.object(promotion, "_run", side_effect=fake_run):
             out = promotion._promote(cfg, dry_run=dry_run, limit=limit)
         return out, calls
+
+    @staticmethod
+    def create_call(calls) -> list[str]:
+        return [c for c in calls if c[:3] == ["gh", "pr", "create"]][0]
+
+    def test_no_reviewer_is_requested_when_auto_approve_is_off(self) -> None:
+        """#2239 L3: off keeps the pre-L3 `gh pr create` argv unchanged."""
+        for extra in ({}, {"auto_approve_mode": "off", "approve_profile": "seoseo-ai"}):
+            with self.subTest(extra=extra):
+                _, calls = self.run_promote(lineage("140", TREE_A), **extra)
+                create = self.create_call(calls)
+                self.assertNotIn("--reviewer", create)
+                self.assertEqual(create[:9], ["gh", "pr", "create", "--repo",
+                                              "jinwon-int/fleet-skills", "--base", "main",
+                                              "--head", create[8]])
+                self.assertEqual(create[9:11], ["--draft", "--title"])
+
+    def test_reviewer_is_requested_when_auto_approve_is_on(self) -> None:
+        for mode in ("dry-run", "true"):
+            with self.subTest(mode=mode):
+                _, calls = self.run_promote(
+                    lineage("140", TREE_A), auto_approve_mode=mode, approve_profile="seoseo-ai")
+                create = self.create_call(calls)
+                self.assertEqual(create[create.index("--reviewer") + 1], "seoseo-ai")
+                self.assertIn("--draft", create)
+                self.assertEqual(create[-2], "--body", "the body stays the last argument")
+
+    def test_ledger_row_records_staged_names_for_the_path_allowlist(self) -> None:
+        ledger: list[dict] = []
+        self.run_promote(lineage("140", TREE_A, name="s1") + lineage("141", TREE_B, name="s2"),
+                         ledger=ledger)
+        opened = [r for r in ledger if r.get("kind") == "a2a-promote-pr"]
+        self.assertEqual(opened[0]["staged_names"], ["s1", "s2"])
 
     def test_nothing_to_promote_touches_github(self) -> None:
         out, calls = self.run_promote(

@@ -270,6 +270,338 @@ class PromoteMergeSweepTests(unittest.TestCase):
         self.assertEqual([r["outcome"] for r in out], ["merge-failed"])
 
 
+AA_HEAD = "c" * 40
+AA_TREE = "d" * 64
+AA_SCRIPT = "/opt/example/codex/skills/gh-pr-flow/scripts/approve-via-relay.sh"
+
+
+def aa_diff(files: dict[str, str], *, extra_header: str = "") -> str:
+    """A `gh pr diff` body that adds each file whole (like a promote PR)."""
+    out: list[str] = []
+    for path, content in files.items():
+        lines = content.split("\n")
+        out += [f"diff --git a/{path} b/{path}", "new file mode 100644"]
+        if extra_header:
+            out.append(extra_header)
+        out += ["index 0000000..1111111", "--- /dev/null", f"+++ b/{path}",
+                f"@@ -0,0 +1,{len(lines)} @@"]
+        out += ["+" + line for line in lines]
+    return "\n".join(out) + "\n"
+
+
+def aa_files(name: str = "s1", *, support: str = "echo ok", tree: str = AA_TREE) -> dict[str, str]:
+    approval = {
+        "schema_version": 1,
+        "source_candidate_id": f"{name}-{tree[:12]}",
+        "source_tree_sha256": tree,
+        "approved_at": "2026-10-08T14:00:10Z",
+    }
+    return {
+        f"approved/shared/{name}/SKILL.md":
+            f"---\nname: {name}\ndescription: Use when checking things\n---\n# {name}\nSteps.",
+        f"approved/shared/{name}/approval.json": json.dumps(approval, indent=2),
+        f"approved/shared/{name}/scripts/run.sh": support,
+    }
+
+
+class PromoteAutoApproveTests(unittest.TestCase):
+    """#2239 L3: policy-gated approval of mechanical promote PRs.
+
+    Off must be byte-identical to the pre-L3 sweep; dry-run only records;
+    true approves through the relay helper on the exact head after a full-diff
+    path allowlist + rescan, and any doubt degrades to today's flow.
+    """
+
+    def sweep(self, *, mode="true", rows=None, diff=None, view=None, ssh_target="relay-node",
+              approve_rc=0, approve_out=None, merge_fails=False, head_after=None,
+              cmd_present=True, spool=None):
+        written: list[dict] = []
+        calls: list[list[str]] = []
+        envs: list[dict] = []
+        payload = view or {
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}],
+            "state": "OPEN", "headRefOid": AA_HEAD, "reviewRequests": [],
+        }
+        diff_text = aa_diff(aa_files()) if diff is None else diff
+        views = {"n": 0}
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if args[:3] == ["gh", "pr", "view"]:
+                views["n"] += 1
+                if views["n"] > 1 and head_after is not None:
+                    return types.SimpleNamespace(stdout=json.dumps({"headRefOid": head_after}).encode())
+                return types.SimpleNamespace(stdout=json.dumps(payload).encode())
+            if args[:3] == ["gh", "pr", "diff"]:
+                return types.SimpleNamespace(stdout=diff_text.encode())
+            if args[:3] == ["gh", "pr", "merge"] and merge_fails:
+                raise promotion.PromotionError("merge_denied")
+            if args[:2] == ["bash", AA_SCRIPT]:
+                envs.append(dict(kwargs.get("env") or {}))
+                out = approve_out if approve_out is not None else json.dumps(
+                    {"ok": True, "approved": True, "head": AA_HEAD, "pr": 999})
+                return types.SimpleNamespace(stdout=out.encode(), returncode=approve_rc)
+            return types.SimpleNamespace(stdout=b"", returncode=0)
+
+        cfg = types.SimpleNamespace(
+            node="publisher", repo="jinwon-int/fleet-skills", collect_window=32,
+            auto_merge_promote_enabled=True, auto_approve_mode=mode,
+            approve_cmd=("bash", AA_SCRIPT) if cmd_present else (),
+            approve_cmd_present=cmd_present, approve_profile="seoseo-ai",
+            approve_ssh_target=ssh_target, push_spool=spool,
+        )
+        ledger = rows if rows is not None else [self.promote_row()]
+        with patch.object(promotion, "_ledger_rows", return_value=ledger), \
+             patch.object(promotion, "_append_ledger",
+                          side_effect=lambda _c, row: written.append(row)), \
+             patch.object(promotion, "_promote_worker_nodes", return_value=["workerx"]), \
+             patch.object(promotion, "_run", side_effect=fake_run):
+            out = promotion._sweep_promote_merge(cfg, dry_run=False)
+        return out, written, calls, envs
+
+    @staticmethod
+    def promote_row(**extra) -> dict:
+        row = {
+            "kind": "a2a-promote-pr", "pr": "999", "state": "OPEN",
+            "url": "https://github.com/jinwon-int/fleet-skills/pull/999",
+            "identity_hits": [], "staged_prs": ["140"], "staged_names": ["s1"],
+            "candidates": [f"140:{AA_TREE}"],
+        }
+        row.update(extra)
+        return row
+
+    @staticmethod
+    def outcomes(out) -> list[str]:
+        return [r["outcome"] for r in out]
+
+    @staticmethod
+    def verbs(calls) -> list[str]:
+        return [c[2] if c[:2] == ["gh", "pr"] else c[0] for c in calls]
+
+    def merge_call(self, calls) -> list[str]:
+        merges = [c for c in calls if c[:3] == ["gh", "pr", "merge"]]
+        self.assertEqual(len(merges), 1)
+        return merges[0]
+
+    def test_off_is_the_pre_l3_flow(self) -> None:
+        out, written, calls, _ = self.sweep(mode="off")
+        self.assertEqual(self.outcomes(out), ["promote-pr-merged"])
+        self.assertEqual(self.verbs(calls), ["view", "merge"])
+        self.assertNotIn("--delete-branch", self.merge_call(calls))
+        self.assertNotIn("--match-head-commit", self.merge_call(calls))
+        self.assertEqual([r["kind"] for r in written], ["a2a-promote-pr"])
+
+    def test_dry_run_records_would_approve_and_never_approves(self) -> None:
+        out, written, calls, _ = self.sweep(mode="dry-run")
+        self.assertEqual(self.outcomes(out), ["would-approve-promote-pr", "promote-pr-merged"])
+        self.assertTrue(out[0]["new"])
+        self.assertNotIn("bash", self.verbs(calls))
+        self.assertNotIn("edit", self.verbs(calls))
+        aa = [r for r in written if r["kind"] == "a2a-promote-autoapprove"]
+        self.assertEqual(len(aa), 1)
+        self.assertEqual((aa[0]["pr"], aa[0]["head_sha"], aa[0]["mode"]), ("999", AA_HEAD, "dry-run"))
+        self.assertIn("ts", aa[0])
+        # today's merge attempt is unchanged
+        self.assertNotIn("--delete-branch", self.merge_call(calls))
+
+    def test_dry_run_already_recorded_for_head_is_not_rescanned(self) -> None:
+        rows = [self.promote_row(), {"kind": "a2a-promote-autoapprove", "pr": "999",
+                                     "head_sha": AA_HEAD, "mode": "dry-run"}]
+        out, written, calls, _ = self.sweep(mode="dry-run", rows=rows)
+        self.assertEqual(out[0]["outcome"], "would-approve-promote-pr")
+        self.assertFalse(out[0]["new"])
+        self.assertNotIn("diff", self.verbs(calls))
+        self.assertFalse([r for r in written if r["kind"] == "a2a-promote-autoapprove"])
+
+    def test_dry_run_reports_missing_true_mode_config(self) -> None:
+        out, _, _, _ = self.sweep(mode="dry-run", ssh_target="")
+        self.assertEqual(out[0]["not_ready"], "approve_ssh_target_unset")
+
+    def test_true_clean_approves_then_merges_the_exact_head(self) -> None:
+        out, written, calls, envs = self.sweep()
+        self.assertEqual(self.outcomes(out), ["promote-autoapproved", "promote-pr-merge-requested"])
+        self.assertEqual(self.verbs(calls), ["view", "diff", "view", "edit", "bash", "merge"])
+        edit = [c for c in calls if c[:3] == ["gh", "pr", "edit"]][0]
+        self.assertEqual(edit[-2:], ["--add-reviewer", "seoseo-ai"])
+        approve = [c for c in calls if c[:1] == ["bash"]][0]
+        self.assertEqual(approve[2:], [
+            "--review-profile", "seoseo-ai", "--repo", "jinwon-int/fleet-skills", "--pr", "999",
+            "--expected-head", AA_HEAD, "--operator-approved", "--ssh-target", "relay-node",
+        ])
+        self.assertEqual(envs[0].get("CCC_EXPLICIT_USER_APPROVAL"), "1")
+        merge = self.merge_call(calls)
+        self.assertIn("--squash", merge)
+        self.assertEqual(merge[merge.index("--match-head-commit") + 1], AA_HEAD)
+        self.assertNotIn("--admin", merge)
+        self.assertNotIn("--delete-branch", merge, "gh refuses -d on a merge-queue branch")
+        aa = [r for r in written if r["kind"] == "a2a-promote-autoapprove"]
+        self.assertEqual([(r["mode"], r["profile"], r["head_sha"]) for r in aa],
+                         [("approved", "seoseo-ai", AA_HEAD)])
+        self.assertFalse([r for r in written if r.get("state") == "MERGED"],
+                         "an enqueue is not a merge; the next live read records it")
+
+    def test_requested_reviewer_is_not_requested_again(self) -> None:
+        view = {
+            "isDraft": False, "mergeable": "MERGEABLE", "state": "OPEN",
+            "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}],
+            "headRefOid": AA_HEAD, "reviewRequests": [{"login": "seoseo-ai"}],
+        }
+        _, _, calls, _ = self.sweep(view=view)
+        self.assertNotIn("edit", self.verbs(calls))
+
+    def test_already_approved_head_skips_the_relay(self) -> None:
+        rows = [self.promote_row(), {"kind": "a2a-promote-autoapprove", "pr": "999",
+                                     "head_sha": AA_HEAD, "mode": "approved"}]
+        out, written, calls, _ = self.sweep(rows=rows)
+        self.assertEqual(self.outcomes(out), ["promote-autoapproved", "promote-pr-merge-requested"])
+        self.assertFalse(out[0]["new"])
+        self.assertNotIn("bash", self.verbs(calls))
+        self.assertNotIn("diff", self.verbs(calls))
+        self.assertEqual(written, [])
+
+    def test_identity_hit_in_a_support_file_blocks(self) -> None:
+        diff = aa_diff(aa_files(support="ssh workerx uptime"))
+        out, written, calls, _ = self.sweep(diff=diff)
+        self.assertEqual(out[0]["outcome"], "needs-human-autoapprove-blocked")
+        self.assertEqual(out[0]["reasons"], ["identity_node_name"])
+        self.assertNotIn("workerx", json.dumps(out), "reason codes only, never values")
+        self.assertNotIn("bash", self.verbs(calls))
+        self.assertNotIn("--delete-branch", self.merge_call(calls), "merge-queue repo: gh refuses -d")
+        self.assertFalse([r for r in written if r["kind"] == "a2a-promote-autoapprove"])
+
+    def test_secret_shaped_support_file_blocks(self) -> None:
+        diff = aa_diff(aa_files(support="export TOKEN=" + "Q" * 30))
+        out, _, calls, _ = self.sweep(diff=diff)
+        self.assertEqual(out[0]["outcome"], "needs-human-autoapprove-blocked")
+        self.assertTrue(all(code.startswith("scan_secret_") for code in out[0]["reasons"]))
+        self.assertNotIn("bash", self.verbs(calls))
+
+    def test_path_outside_the_allowlist_blocks(self) -> None:
+        for path in (".github/workflows/ci.yml", "approved/shared/other/SKILL.md",
+                     "intake/n/claude/s1/skill/SKILL.md", "approved/nowhere/s1/SKILL.md"):
+            with self.subTest(path=path):
+                files = aa_files()
+                files[path] = "harmless"
+                out, _, calls, _ = self.sweep(diff=aa_diff(files))
+                self.assertEqual(out[0]["outcome"], "needs-human-autoapprove-blocked")
+                self.assertIn("path_outside_allowlist", out[0]["reasons"])
+                self.assertNotIn("bash", self.verbs(calls))
+
+    def test_row_without_staged_names_blocks(self) -> None:
+        rows = [self.promote_row(staged_names=None)]
+        out, _, calls, _ = self.sweep(rows=rows)
+        self.assertEqual(out[0]["reasons"], ["staged_names_missing"])
+        self.assertNotIn("diff", self.verbs(calls))
+
+    def test_tampered_approval_json_blocks(self) -> None:
+        diff = aa_diff(aa_files(tree="e" * 64))  # not a reviewed tree of this batch
+        out, _, _, _ = self.sweep(diff=diff)
+        self.assertEqual(out[0]["reasons"], ["approval_json_invalid"])
+
+    def test_binary_and_symlink_entries_block(self) -> None:
+        binary = aa_diff(aa_files()) + (
+            "diff --git a/approved/shared/s1/logo.png b/approved/shared/s1/logo.png\n"
+            "new file mode 100644\nindex 0000000..2222222\n"
+            "Binary files /dev/null and b/approved/shared/s1/logo.png differ\n")
+        out, _, _, _ = self.sweep(diff=binary)
+        self.assertIn("diff_binary_file", out[0]["reasons"])
+        link = aa_diff({"approved/shared/s1/link": "../../x"}).replace(
+            "new file mode 100644", "new file mode 120000")
+        out, _, _, _ = self.sweep(diff=link)
+        self.assertIn("diff_symlink", out[0]["reasons"])
+
+    def test_head_moving_during_the_diff_blocks(self) -> None:
+        out, _, calls, _ = self.sweep(head_after="f" * 40)
+        self.assertEqual(out[0]["reasons"], ["head_changed"])
+        self.assertNotIn("bash", self.verbs(calls))
+
+    def test_just_marked_ready_defers_one_sweep(self) -> None:
+        view = {
+            "isDraft": True, "mergeable": "MERGEABLE", "state": "OPEN",
+            "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}],
+            "headRefOid": AA_HEAD, "reviewRequests": [],
+        }
+        out, _, calls, _ = self.sweep(view=view)
+        self.assertEqual(out[0]["outcome"], "autoapprove-deferred")
+        self.assertNotIn("bash", self.verbs(calls))
+
+    def test_unset_ssh_target_is_not_configured(self) -> None:
+        out, written, calls, _ = self.sweep(ssh_target="")
+        self.assertEqual(out[0], {"outcome": "approve-not-configured", "pr": "999",
+                                  "code": "approve_ssh_target_unset"})
+        self.assertNotIn("diff", self.verbs(calls))
+        self.assertNotIn("bash", self.verbs(calls))
+        self.assertNotIn("--delete-branch", self.merge_call(calls))
+        self.assertFalse([r for r in written if r["kind"] == "a2a-promote-autoapprove"])
+
+    def test_missing_approve_cmd_is_not_configured(self) -> None:
+        out, _, calls, _ = self.sweep(cmd_present=False)
+        self.assertEqual(out[0]["code"], "approve_cmd_missing")
+        self.assertNotIn("bash", self.verbs(calls))
+
+    def test_approve_failure_falls_back_to_todays_merge_attempt(self) -> None:
+        out, written, calls, _ = self.sweep(approve_rc=65, approve_out="", merge_fails=True)
+        self.assertEqual(self.outcomes(out), ["approve-failed", "merge-failed"])
+        self.assertEqual(out[0]["code"], "approve_exit_65")
+        aa = [r for r in written if r["kind"] == "a2a-promote-autoapprove"]
+        self.assertEqual([(r["mode"], r["code"]) for r in aa], [("approve-failed", "approve_exit_65")])
+        merge = self.merge_call(calls)
+        self.assertNotIn("--delete-branch", merge)
+        self.assertNotIn("--match-head-commit", merge)
+        self.assertNotIn("--admin", merge)
+
+    def test_unverifiable_relay_output_is_a_failure(self) -> None:
+        out, _, _, _ = self.sweep(approve_out=json.dumps({"ok": True, "approved": True, "head": "0" * 40}))
+        self.assertEqual(out[0]["outcome"], "approve-failed")
+        self.assertEqual(out[0]["code"], "approve_output_invalid")
+
+    def test_failed_attempts_are_capped_per_head(self) -> None:
+        rows = [self.promote_row()] + [
+            {"kind": "a2a-promote-autoapprove", "pr": "999", "head_sha": AA_HEAD,
+             "mode": "approve-failed", "code": "approve_exit_65"}
+        ] * 3
+        out, _, calls, _ = self.sweep(rows=rows)
+        self.assertEqual(out[0]["code"], "approve_attempts_exhausted")
+        self.assertNotIn("bash", self.verbs(calls))
+
+    def test_owner_is_notified_once_with_pr_numbers_only(self) -> None:
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            spool = Path(tmp) / "spool"
+            self.sweep(spool=spool)
+            files = sorted(spool.glob("*.json"))
+            self.assertEqual(len(files), 1)
+            record = json.loads(files[0].read_text(encoding="utf-8"))
+            self.assertEqual(record["event"], "SkillPromoteAutoApprove")
+            self.assertIn("#999", record["text"])
+            self.assertIn("1건", record["text"])
+            self.assertNotIn(AA_HEAD, record["text"])
+            self.assertFalse(list(spool.glob(".*.tmp")))
+            # second sweep: approval already recorded -> no new notice
+            rows = [self.promote_row(), {"kind": "a2a-promote-autoapprove", "pr": "999",
+                                         "head_sha": AA_HEAD, "mode": "approved"}]
+            self.sweep(rows=rows, spool=spool)
+            self.assertEqual(len(list(spool.glob("*.json"))), 1)
+
+    def test_dry_run_notice_says_nothing_was_approved(self) -> None:
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            spool = Path(tmp) / "spool"
+            self.sweep(mode="dry-run", spool=spool)
+            record = json.loads(next(spool.glob("*.json")).read_text(encoding="utf-8"))
+            self.assertIn("dry-run", record["text"])
+            self.assertIn("#999", record["text"])
+
+    def test_blocked_or_off_never_notifies(self) -> None:
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            spool = Path(tmp) / "spool"
+            self.sweep(mode="off", spool=spool)
+            self.sweep(diff=aa_diff(aa_files(support="workerx")), spool=spool)
+            self.assertFalse(spool.exists() and list(spool.glob("*.json")))
+
+
 class ResultsOnlyTests(unittest.TestCase):
     def test_results_only_never_reads_or_acks_outboxes(self):
         from tempfile import TemporaryDirectory

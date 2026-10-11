@@ -18,6 +18,7 @@ showing which. These tests pin the loader's contract:
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -224,6 +225,123 @@ class ConfigFileTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(captured), 1)
         self.assertIn('"error": "config_file_unsafe"', captured[0].replace('":"', '": "'))
+
+
+class AutoApproveConfigTests(unittest.TestCase):
+    """#2239 L3: `auto_approve_promote` tri-state + relay knobs + status block."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        os.chmod(self.home, 0o700)
+        self.state = self.home / ".claude" / "state"
+        self.state.mkdir(parents=True, mode=0o700)
+        self.flag = self.state / "skill-promotion.auto-approve"
+        self.script = self.home / "approve-via-relay.sh"
+        self.script.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def env(self, **extra: str) -> dict[str, str]:
+        base = {"HOME": str(self.home), "CCC_NODE": "testnode",
+                "CCC_SKILL_PROMOTION_APPROVE_CMD": str(self.script)}
+        base.update(extra)
+        return base
+
+    def test_default_is_off(self) -> None:
+        cfg = promotion._config(self.env())
+        self.assertEqual(cfg.auto_approve_mode, "off")
+        self.assertEqual(cfg.approve_profile, "seoseo-ai")
+        self.assertEqual(cfg.approve_ssh_target, "")
+
+    def test_env_tri_state(self) -> None:
+        for raw, mode in (("true", "true"), ("1", "true"), ("dry-run", "dry-run"),
+                          ("DRY-RUN", "dry-run"), ("off", "off"), ("false", "off"), ("0", "off")):
+            with self.subTest(raw=raw):
+                cfg = promotion._config(self.env(CCC_SKILL_PROMOTION_AUTO_APPROVE=raw))
+                self.assertEqual(cfg.auto_approve_mode, mode)
+        with self.assertRaises(promotion.PromotionError) as caught:
+            promotion._config(self.env(CCC_SKILL_PROMOTION_AUTO_APPROVE="maybe"))
+        self.assertEqual(caught.exception.code, "auto_approve_invalid")
+
+    def test_owner_flag_file(self) -> None:
+        for content, mode in (("true\n", "true"), ("dry-run\n", "dry-run"), ("off\n", "off"),
+                              ("garbage\n", "off")):
+            with self.subTest(content=content):
+                self.flag.write_text(content, encoding="utf-8")
+                self.flag.chmod(0o600)
+                self.assertEqual(promotion._config(self.env()).auto_approve_mode, mode)
+        self.flag.write_text("true\n", encoding="utf-8")
+        self.flag.chmod(0o644)
+        self.assertEqual(promotion._config(self.env()).auto_approve_mode, "off",
+                         "a flag file others can write is not the owner's approval")
+        self.flag.chmod(0o600)
+        self.assertEqual(
+            promotion._config(self.env(CCC_SKILL_PROMOTION_AUTO_APPROVE="off")).auto_approve_mode,
+            "off", "process env wins over the flag file")
+
+    def test_config_file_can_set_the_knobs(self) -> None:
+        path = self.home / ".config" / "ccc-node" / "skill-promotion.env"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            "CCC_SKILL_PROMOTION_AUTO_APPROVE=dry-run\n"
+            "CCC_SKILL_PROMOTION_APPROVE_PROFILE=jinon86\n"
+            "CCC_SKILL_PROMOTION_APPROVE_SSH_TARGET=relay-node\n", encoding="utf-8")
+        path.chmod(0o600)
+        cfg = promotion._config(self.env())
+        self.assertEqual((cfg.auto_approve_mode, cfg.approve_profile, cfg.approve_ssh_target),
+                         ("dry-run", "jinon86", "relay-node"))
+
+    def test_invalid_profile_fails(self) -> None:
+        with self.assertRaises(promotion.PromotionError) as caught:
+            promotion._config(self.env(CCC_SKILL_PROMOTION_APPROVE_PROFILE="someone"))
+        self.assertEqual(caught.exception.code, "approve_profile_invalid")
+
+    def test_approve_cmd_resolution(self) -> None:
+        cfg = promotion._config(self.env())
+        self.assertEqual(cfg.approve_cmd, ("bash", str(self.script)))
+        self.assertTrue(cfg.approve_cmd_present)
+        cfg = promotion._config(self.env(CCC_SKILL_PROMOTION_APPROVE_CMD=str(self.home / "nope.sh")))
+        self.assertFalse(cfg.approve_cmd_present)
+        env = self.env()
+        del env["CCC_SKILL_PROMOTION_APPROVE_CMD"]
+        codex = self.home / "codex-home"
+        script = codex.joinpath(*promotion._APPROVE_SCRIPT_REL)
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\n", encoding="utf-8")
+        cfg = promotion._config({**env, "CODEX_HOME": str(codex)})
+        self.assertEqual(cfg.approve_cmd, ("bash", str(script)), "managed codex skill copy first")
+        self.assertTrue(cfg.approve_cmd_present)
+
+    def test_status_block_when_disabled_and_enabled(self) -> None:
+        cfg = promotion._config(self.env(CCC_SKILL_PROMOTION_AUTO_APPROVE="true"))
+        status = promotion._status(cfg)
+        expected = {"mode": "true", "cmd_present": True, "profile": "seoseo-ai",
+                    "ssh_target_set": False, "blocker": "approve_ssh_target_unset"}
+        self.assertEqual(status["auto_approve"], expected)
+        effective = status["effective"]
+        assert isinstance(effective, dict)
+        self.assertEqual(effective["auto_approve"], expected)
+        cfg = promotion._config(self.env(
+            CCC_SKILL_PROMOTION_ENABLED="1", CCC_SKILL_PROMOTION_AUTO_APPROVE="true",
+            CCC_SKILL_PROMOTION_APPROVE_SSH_TARGET="relay-node"))
+        with patch.object(promotion, "_discover", return_value=([], [], [])), \
+                patch.object(promotion, "_outbox_summary", return_value={}):
+            status = promotion._status(cfg)
+        block = status["auto_approve"]
+        assert isinstance(block, dict)
+        self.assertEqual((block["ssh_target_set"], block["blocker"]), (True, None))
+        self.assertNotIn("relay-node", json.dumps(status), "presence only, never the target")
+        cfg = promotion._config(self.env(CCC_SKILL_PROMOTION_APPROVE_CMD=str(self.home / "nope.sh"),
+                                         CCC_SKILL_PROMOTION_AUTO_APPROVE="dry-run",
+                                         CCC_SKILL_PROMOTION_APPROVE_SSH_TARGET="relay-node"))
+        block = promotion._status(cfg)["auto_approve"]
+        assert isinstance(block, dict)
+        self.assertEqual((block["cmd_present"], block["blocker"]), (False, "approve_cmd_missing"))
+        off = promotion._status(promotion._config(self.env()))["auto_approve"]
+        assert isinstance(off, dict)
+        self.assertEqual((off["mode"], off["blocker"]), ("off", None))
 
 
 if __name__ == "__main__":
