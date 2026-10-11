@@ -528,6 +528,12 @@ else
   err "doctor stale-memory-guidance verdict tests failed (seeded guidance may keep presenting retired Honcho as current)"
   tail -10 "$TMP/doctor-stale-memory-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_memory_guidance_refresh_test.py >"$TMP/refresh-guidance-test.out" 2>&1; then
+  say "  ok setup --refresh-guidance tests (#2238)"
+else
+  err "setup --refresh-guidance tests failed (a refresh may rewrite node-customized guidance or miss stale guidance)"
+  tail -10 "$TMP/refresh-guidance-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_cli_floor_test.py >"$TMP/doctor-cli-floor-test.out" 2>&1; then
   say "  ok doctor worker Claude CLI floor verdict tests (a2a-nexus#2275)"
 else

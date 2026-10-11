@@ -192,12 +192,39 @@ not drift, so the current template line about a missing `honcho.json` stays quie
 
 For CLAUDE.md the row also reports `memory-span=template|differs|absent`: whether
 the span from `## Memory Stack` up to `## Fresh Approval Required` still equals
-the repo template. `differs` alone is informational (nodes may customize it).
-The doctor never rewrites these files. Remedy: back up the file, replace that span with the
-same span of `claude/CLAUDE.md.template`, rewrite the memory-stack line in
-MEMORY.md from `hermes/memories/MEMORY.template.md`, and fix any other flagged
-line by hand. `CCC_DOCTOR_HERMES_HOME` overrides the Hermes home (default: the
-sibling `.hermes` of the Claude dir).
+the repo template (the `ccc:memory-stack` marker comment lines are ignored, so a
+refreshed file and a hand-fixed one both read `template`). `differs` alone is
+informational (nodes may customize it). `CCC_DOCTOR_HERMES_HOME` overrides the
+Hermes home (default: the sibling `.hermes` of the Claude dir). The patterns
+live in `scripts/ccc_memory_guidance.py`, shared with the refresh below.
+
+The doctor never rewrites these files. Remedy:
+
+```bash
+./setup.sh --refresh-guidance --dry-run   # preview: per file, what would change
+./setup.sh --refresh-guidance             # back up + rewrite managed guidance only
+```
+
+`--refresh-guidance` is a standalone mode: it installs nothing else, exits
+after the three files above, and only `--dry-run` combines with it. Per file it
+writes a `<file>.bak-refresh-guidance-<UTC timestamp>` backup first, then:
+
+| Shape | Action |
+|---|---|
+| CLAUDE.md with `<!-- ccc:memory-stack:begin -->` … `<!-- ccc:memory-stack:end -->` | replace that block with the template's block |
+| CLAUDE.md without markers, span stale **and** equal to a known old template version | replace `## Memory Stack` … (not including) `## Fresh Approval Required` with the marked template block |
+| CLAUDE.md without markers, span already the current template text | no-op |
+| CLAUDE.md without markers, any other span (node-customized) / unbalanced markers | `refused` — file untouched |
+| A line equal to a known old template line (Standing Orders reads row, MEMORY.md memory-stack line) | replace with the current template line |
+| MEMORY.md stale lines that are not an exact known line | `refused` — file untouched |
+
+Comparison ignores trailing spaces and blank-line runs only. Everything outside
+the managed block / known lines — every node-specific section — is preserved,
+and a second run is a no-op (`current`, no new backup). Stale lines left after
+the refresh are listed as `still stale, fix by hand`. Exit 0 when every present
+file is current/refreshed and clean, 1 when anything needs a hand fix, 2 when
+the repo template lacks its markers. The report names files, line numbers and
+pattern labels only. A symlinked MEMORY.md is rewritten once, at its target.
 
 ## Push spool dwell
 

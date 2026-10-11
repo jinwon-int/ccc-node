@@ -32,6 +32,11 @@ from pathlib import Path
 from typing import Any
 
 import ccc_secure_fs as _secure_fs
+from ccc_memory_guidance import (
+    STALE_MEMORY_READ_LIMIT,
+    memory_stack_span,
+    stale_memory_guidance_hits,
+)
 
 # Fallback only. The live list is walked from the repo (see hook_files) using the
 # same rule as ccc_hook_tree_files in scripts/lib/harness-paths.sh, which setup.sh
@@ -514,78 +519,10 @@ def read_env_file_keys(path: Path, keys: frozenset[str]) -> dict[str, str]:
 # Retired memory layers described as *current* in node-owned guidance (#2238).
 # setup.sh seeds ~/.claude/CLAUDE.md and the MEMORY.md files once and never
 # overwrites them, so nodes seeded before the Honcho retirement (2026-09-01,
-# #1436) kept telling every session to recall from Honcho. Each pattern is one
-# shape the old templates used; ``label`` names it in the report row.
-_RETIRED_LAYER = r"(?:Honcho|Supermemory)"
-_STALE_MEMORY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    # "built-in MEMORY/USER + Honcho + Family Wiki + session_search"
-    ("stack-list", re.compile(rf"\+\s*\**{_RETIRED_LAYER}\b|\b{_RETIRED_LAYER}\**\s*\+")),
-    # "**cached Honcho working memory**" (SessionStart snapshot description)
-    ("cached-layer", re.compile(rf"\bcached\s+{_RETIRED_LAYER}\b", re.IGNORECASE)),
-    # "**Honcho — working/relational memory:**" section heading
-    ("layer-heading", re.compile(rf"\b{_RETIRED_LAYER}\**\s*[—–-]+\s*working", re.IGNORECASE)),
-    # "POST {baseUrl}/v3/workspaces/<ws>/peers/<peer>/chat" Honcho recall API
-    ("recall-endpoint", re.compile(r"/v3/workspaces/\S*/peers/")),
-    # "`baseUrl` is in `~/.hermes/honcho.json`"
-    ("honcho-config", re.compile(r"honcho\.json", re.IGNORECASE)),
-    # "Relational & evolving working memory → Honcho."
-    ("routing", re.compile(rf"(?:→|->|=>)\s*\**{_RETIRED_LAYER}\b")),
-    # "Current memory stack: ... Honcho ..."
-    ("current-stack", re.compile(rf"\bcurrent\s+(?:memory\s+)?stack\b.*\b{_RETIRED_LAYER}\b", re.IGNORECASE)),
-    # "Read Family Wiki, Honcho, local MEMORY/USER, ..." (reads table row)
-    ("read-source", re.compile(rf"\bRead\b[^|]*?\b{_RETIRED_LAYER}\b")),
-)
-# A sentence that says the layer is retired is the *fix*, not drift: the
-# current template names honcho.json in "Honcho is retired ... do not query it".
-_RETIRED_CONTEXT = re.compile(
-    r"retire|퇴역|은퇴|legacy|deprecat|decommission|removed|폐기|제거|no longer"
-    r"|do not (?:query|use)|don't (?:query|use)|사용\s*(?:금지|하지)",
-    re.IGNORECASE,
-)
-# Sentence boundary inside one line; a period inside a path (honcho.json) is not.
-_SENTENCE_BREAK = re.compile(r"(?<=[.!?。])\s+")
-_STALE_MEMORY_READ_LIMIT = 1 << 20
-
-
-def stale_memory_guidance_hits(text: str) -> list[tuple[int, list[str]]]:
-    """``(line number, pattern labels)`` for lines that present a retired layer as current.
-
-    Scanned per sentence so "Supermemory is retired. Current stack: ... + Honcho
-    + ..." (the old MEMORY.md line) still flags its second sentence, while a
-    sentence carrying a retirement word is exempt.
-    """
-    hits: list[tuple[int, list[str]]] = []
-    for lineno, line in enumerate(text.splitlines(), 1):
-        labels: list[str] = []
-        for sentence in _SENTENCE_BREAK.split(line):
-            if _RETIRED_CONTEXT.search(sentence):
-                continue
-            for label, pattern in _STALE_MEMORY_PATTERNS:
-                if label not in labels and pattern.search(sentence):
-                    labels.append(label)
-        if labels:
-            hits.append((lineno, labels))
-    return hits
-
-
-_MEMORY_STACK_START = "## Memory Stack"
-_MEMORY_STACK_END = "## Fresh Approval Required"
-
-
-def memory_stack_span(text: str) -> str | None:
-    """The ``## Memory Stack`` .. (not including) ``## Fresh Approval Required`` span.
-
-    That span holds every memory-layer instruction in CLAUDE.md (Memory Stack +
-    Live Memory Usage); it is what the #2238 remediation replaces wholesale.
-    None when either heading is missing.
-    """
-    lines = [line.rstrip() for line in text.splitlines()]
-    try:
-        start = next(i for i, line in enumerate(lines) if line == _MEMORY_STACK_START)
-        end = next(i for i in range(start + 1, len(lines)) if lines[i] == _MEMORY_STACK_END)
-    except StopIteration:
-        return None
-    return "\n".join(lines[start:end]).strip()
+# #1436) kept telling every session to recall from Honcho. The patterns live in
+# ccc_memory_guidance so `setup.sh --refresh-guidance` reuses the exact same
+# detection instead of a second copy that could drift.
+_STALE_MEMORY_READ_LIMIT = STALE_MEMORY_READ_LIMIT
 
 
 def _printable(value: str, limit: int = 120) -> str:
@@ -3653,13 +3590,15 @@ class Doctor:
             item,
             f"stale={total} line(s) in {len(stale)} file(s); {detail}{span}{skipped}",
             "node-owned guidance still describes retired Honcho/Supermemory as the current "
-            "memory stack, and setup.sh never overwrites seeded files. Back up each file, then "
-            "in ~/.claude/CLAUDE.md replace the span from '## Memory Stack' up to (not "
-            "including) '## Fresh Approval Required' with the same span of "
-            "claude/CLAUDE.md.template; in MEMORY.md rewrite the memory-stack line from "
-            "hermes/memories/MEMORY.template.md (built-in MEMORY/USER + nunchi + Family Wiki + "
-            "session_search); fix any other flagged line by hand. Doctor never rewrites these "
-            "files (ccc-node#2238)",
+            "memory stack, and setup.sh never overwrites seeded files. Preview with "
+            "`./setup.sh --refresh-guidance --dry-run`, then run `./setup.sh --refresh-guidance`: "
+            "it backs up each file (*.bak-refresh-guidance-<UTC>) and replaces only the "
+            "marker-delimited Memory Stack block of claude/CLAUDE.md.template (or, without "
+            "markers, the '## Memory Stack' .. '## Fresh Approval Required' span when it is a "
+            "known old template version) and the MEMORY.md memory-stack line from "
+            "hermes/memories/MEMORY.template.md when it matches the old line exactly. Anything it "
+            "refuses (customized span/line) needs the same edit by hand. Doctor never rewrites "
+            "these files (ccc-node#2238)",
         )
 
     def check_nunchi_collection(self) -> None:
