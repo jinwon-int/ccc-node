@@ -427,8 +427,8 @@ export TELEGRAM_BOT_TOKEN="synthetic-must-not-cross"
 # shellcheck disable=SC2034  # idc1 is read via eval inside ok()
 idc1="$(seed dungae "Codex 폴백 형제 갈등" "$OLD" 1 1 dc1)"
 seed dungae "Codex 폴백 형제 갈등" "$OLD" 1 0 dc2 >/dev/null
-out="$(run_batch NUNCHI_JUDGE_APPLY=1)"
-ok "auto mode falls back from failed Claude to Codex" '[ "$(review_of "$idc1")" = 0 ]'
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_CODEX_FALLBACK=1)"
+ok "auto mode falls back from failed Claude to Codex when opted in (#2271)" '[ "$(review_of "$idc1")" = 0 ]'
 ok "Codex is the body-free audit winner" \
   'grep -q '\''"backend": "codex"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && grep -q '\''"claude:exit-1"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
 ok "Codex adapter uses the isolated strict-output contract" \
@@ -439,6 +439,21 @@ ok "Codex adapter strips unrelated fleet secrets from the child environment" \
   '! grep -q "TELEGRAM_BOT_TOKEN\|synthetic-must-not-cross" "$TMP/codex-env"'
 ok "winning Codex backend appears in the local report" \
   'grep -q "judge backends: claude=0, codex=1" "$CCC_STATE_DIR/nunchi-review-report.md"'
+
+# #2271: without the opt-in, auto mode is Claude-only — a failed Claude
+# verdict fails closed to human and Codex/GPT is never spawned.
+reset_db
+rm -f "$TMP/codex-args"
+# shellcheck disable=SC2034  # idg1 is read via eval inside ok()
+idg1="$(seed peer-g "GPT 폴백 차단 형제 갈등" "$OLD" 1 1 dg1)"
+seed peer-g "GPT 폴백 차단 형제 갈등" "$OLD" 1 0 dg2 >/dev/null
+out="$(run_batch NUNCHI_JUDGE_APPLY=1)"
+ok "auto mode without the opt-in never spawns Codex (no GPT fallback)" \
+  '[ "$(review_of "$idg1")" = 1 ] && [ ! -e "$TMP/codex-args" ] && ! grep -q '\''"backend": "codex"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
+ok "the Claude failure is still audited body-free" \
+  'grep -q '\''"claude:exit-1"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_CODEX_FALLBACK=yes)"
+ok "only the literal 1 opts in (any other value keeps GPT off)" '[ ! -e "$TMP/codex-args" ]'
 
 # A structurally invalid Codex response must not clear a flag, even in APPLY.
 reset_db
@@ -1064,6 +1079,48 @@ ok "absent proposal plus absent rationale still fails closed" \
 schema_case '{"verdict":"maybe","rationale":"dup"}' p5
 ok "absent proposal on an out-of-rubric verdict is not defaulted" \
   '[ "$(review_of "$SCHEMA_ID")" = 1 ] && grep -q '\''"claude:schema-invalid:missing=supersede_proposal"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "proposal-defaulted" "$NUNCHI_HOME/judge-audit.jsonl"'
+
+# ---- #2271: Claude verdicts use CLI structured output ----------------------
+cat >"$TMP/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' "$@" >"$(dirname "$0")/../claude-args"
+case "$(cat "$(dirname "$0")/../claude-mode" 2>/dev/null || printf envelope)" in
+  error) printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"result":"boom"}' ;;
+  textonly) printf '%s\n' '{"type":"result","is_error":false,"result":"{\"verdict\":\"clear\",\"rationale\":\"dup\",\"supersede_proposal\":null}"}' ;;
+  raw) printf '%s\n' '{"verdict":"clear","rationale":"dup","supersede_proposal":null}' ;;
+  *) printf '%s\n' '{"type":"result","is_error":false,"result":"ignored prose","structured_output":{"verdict":"clear","rationale":"dup","supersede_proposal":null}}' ;;
+esac
+STUB
+chmod +x "$TMP/bin/claude"
+struct_case() { # struct_case <mode> <tag> [extra env...]
+  printf '%s\n' "$1" >"$TMP/claude-mode"
+  reset_db
+  # shellcheck disable=SC2034  # STRUCT_ID is read via eval inside ok()
+  STRUCT_ID="$(seed peer-s "구조화 출력 형제 $2" "$OLD" 1 1 "t$2a")"
+  seed peer-s "구조화 출력 형제 $2" "$OLD" 1 0 "t$2b" >/dev/null
+  shift 2
+  run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude "$@" >/dev/null
+}
+struct_case envelope s1
+ok "claude verdict call asks for JSON output with the verdict schema" \
+  '[ "$(grep -x -A1 -- "--output-format" "$TMP/claude-args" | tail -n 1)" = json ] && grep -qx -- "--json-schema" "$TMP/claude-args"'
+grep -x -A1 -- "--json-schema" "$TMP/claude-args" | tail -n 1 >"$TMP/claude-schema-arg"
+ok "the --json-schema argument drops the \$schema meta reference" \
+  'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if \"\$schema\" not in d and sorted(d[\"required\"])==[\"rationale\",\"supersede_proposal\",\"verdict\"] else 1)" "$TMP/claude-schema-arg"'
+ok "structured_output from the envelope is the verdict" \
+  '[ "$(review_of "$STRUCT_ID")" = 0 ] && grep -q '\''"backend": "claude"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
+struct_case textonly s2
+ok "an envelope without structured_output falls back to the strict result parse" '[ "$(review_of "$STRUCT_ID")" = 0 ]'
+struct_case raw s3
+ok "a non-envelope verdict (older CLI or wrapper) still parses" '[ "$(review_of "$STRUCT_ID")" = 0 ]'
+struct_case error s4
+ok "an is_error envelope fails closed as result-error, body-free" \
+  '[ "$(review_of "$STRUCT_ID")" = 1 ] && grep -q '\''"claude:result-error"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "boom" "$NUNCHI_HOME/judge-audit.jsonl"'
+struct_case raw s5 NUNCHI_JUDGE_CLAUDE_STRUCTURED=0
+ok "NUNCHI_JUDGE_CLAUDE_STRUCTURED=0 restores the text contract" \
+  '[ "$(grep -x -A1 -- "--output-format" "$TMP/claude-args" | tail -n 1)" = text ] && ! grep -qx -- "--json-schema" "$TMP/claude-args" && [ "$(review_of "$STRUCT_ID")" = 0 ]'
+rm -f "$TMP/claude-mode"
 
 printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
