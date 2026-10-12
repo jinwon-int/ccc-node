@@ -119,7 +119,7 @@ set -uo pipefail
 # A launcher that does not inherit the shell environment (systemd-run without
 # --property=Environment=HOME=…, some supervisors) hands us no HOME. Every path
 # default below and every installer re-applied by this script assumes one and
-# dies under `set -u` otherwise (#2275: install-nunchi.sh line 149 on seoseo,
+# dies under `set -u` otherwise (#2275: install-nunchi.sh line 149 on a fleet node,
 # 2026-10-12). Derive it from the shell's own tilde fallback (bash consults the
 # passwd entry when HOME is unset; Termux has no getent) and export it so the
 # children inherit the same value. Never override a HOME the caller did set.
