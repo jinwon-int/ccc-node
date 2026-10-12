@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import journal_silence_watch as jsw
 
 NOW = 1_791_767_000.0  # fixed epoch for deterministic runs
-SECRET = "SENSITIVE_BODY_MARKER 1,234원 승인"
+BODY_MARKER = "SENSITIVE_BODY_MARKER 1,234원 승인"
 
 
 class Harness:
@@ -73,7 +73,7 @@ class Harness:
 
 
 def req(ts: float) -> tuple[float, str]:
-    return ts, f'[알림] {SECRET} INFO: 1.2.3.4:0 - "POST /notification HTTP/1.1" 200'
+    return ts, f'[알림] {BODY_MARKER} INFO: 1.2.3.4:0 - "POST /notification HTTP/1.1" 200'
 
 
 class JournalSilenceWatchTest(unittest.TestCase):
