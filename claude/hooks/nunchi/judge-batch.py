@@ -903,9 +903,13 @@ def _typesafe_judge(prompt_item, siblings):
 
 
 RATIONALE_MAX = 200
+# Verdicts whose contract never needs a supersede proposal: "clear" keeps both
+# facts and "human" defers the call. Only "conflict" carries one (#2267).
+PROPOSAL_FREE_VERDICTS = frozenset({"clear", "human"})
 
 
-def _parse_judge_result(output, truncate_rationale=False):
+def _parse_judge_result(output, truncate_rationale=False,
+                        default_absent_proposal=False):
     """Parse one verdict object; every structural defect fails closed.
 
     ``truncate_rationale`` (Claude only, #2248): the Claude CLI has no schema
@@ -917,6 +921,14 @@ def _parse_judge_result(output, truncate_rationale=False):
     supersede proposal (a human's decision input) stay strict. Codex enforces
     the schema in its CLI, so an overlong Codex field still means a broken
     backend and still fails closed.
+
+    ``default_absent_proposal`` (Claude only, #2267): measured after #2251,
+    Haiku drops the ``supersede_proposal`` key on verdicts that have nothing
+    to propose. When that key is the *only* deviation (no other key missing,
+    no extra key) and the verdict is in PROPOSAL_FREE_VERDICTS, the absent
+    proposal is read as the null it would have been. A "conflict" verdict
+    without one still fails closed — there the proposal is the human's
+    decision input — as does any other key-set defect.
     """
     match = re.search(r"\{.*\}", output, re.DOTALL)
     if not match:
@@ -931,6 +943,12 @@ def _parse_judge_result(output, truncate_rationale=False):
     # output, so an extra key is counted, never named.
     if not isinstance(parsed, dict):
         return None, "schema-invalid:not-object"
+    proposal_defaulted = False
+    if (default_absent_proposal
+            and set(parsed) == required - {"supersede_proposal"}
+            and parsed.get("verdict") in PROPOSAL_FREE_VERDICTS):
+        parsed = {**parsed, "supersede_proposal": None}
+        proposal_defaulted = True
     if set(parsed) != required:
         parts = []
         missing = sorted(required - set(parsed))
@@ -964,6 +982,8 @@ def _parse_judge_result(output, truncate_rationale=False):
     }
     if truncated:
         result["rationale_truncated"] = True
+    if proposal_defaulted:
+        result["proposal_defaulted"] = True
     return result, None
 
 
@@ -1006,7 +1026,8 @@ def judge_item(item, siblings):
             attempts.append(f"{provider}:{failure}")
             continue
         parsed, failure = _parse_judge_result(
-            output, truncate_rationale=(provider == "claude"))
+            output, truncate_rationale=(provider == "claude"),
+            default_absent_proposal=(provider == "claude"))
         if failure:
             attempts.append(f"{provider}:{failure}")
             continue
@@ -1014,6 +1035,10 @@ def judge_item(item, siblings):
         # cut. A note, not a failure — the backend still answered.
         if parsed.pop("rationale_truncated", False):
             attempts.append(f"{provider}:rationale-truncated")
+        # Same kind of note (#2267): a proposal-free verdict omitted the null
+        # proposal key and was read as null.
+        if parsed.pop("proposal_defaulted", False):
+            attempts.append(f"{provider}:proposal-defaulted")
         # The CLI backends answer in free text and report no confidence. None
         # (not 0.0) is the honest value, and the gate must let it through.
         parsed["confidence"] = None
