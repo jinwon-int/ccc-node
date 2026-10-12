@@ -1,6 +1,8 @@
 import sys
 import unittest
+from importlib import metadata
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -12,7 +14,21 @@ from telegram_bot.utils.tg_readable import (
     part_marker,
 )
 
+from telegram_bot.utils import tg_readable as _tg_readable_mod
+
 NB = GAP_FILLER_LINE  # U+00A0 — invisible filler for gaps wider than one line
+
+
+def _list_blank(kept: bool):
+    """Pin which converter model the gap compensation assumes.
+
+    telegramify-markdown < 1.3.0 ate the real blank line after a list item;
+    1.3.0+ keeps it. Golden strings below depend on that, so each list-boundary
+    case runs under both models instead of whatever the venv happens to hold.
+    """
+    return mock.patch.object(
+        _tg_readable_mod, "converter_keeps_list_blank", return_value=kept
+    )
 
 
 class ToReadableTests(unittest.TestCase):
@@ -86,8 +102,8 @@ class ToReadableTests(unittest.TestCase):
             "- nosuk healthy\n"
             "- soonwook healthy\n"
             "\n"
-            # Filler compensates the converter eating the blank after a list
-            # item, so the rendered gap stays one blank line like the others.
+            # telegramify-markdown < 1.3.0 eats the blank after a list item;
+            # the filler compensates so the rendered gap stays one blank line.
             f"{NB}\n"
             "## 변경\n"
             "\n"
@@ -97,7 +113,11 @@ class ToReadableTests(unittest.TestCase):
             "\n"
             "재시작 확인"
         )
-        self.assertEqual(to_readable(before), after)
+        with _list_blank(kept=False):
+            self.assertEqual(to_readable(before), after)
+        # 1.3.0+ keeps that blank, so the list-end gap needs no filler (#2279).
+        with _list_blank(kept=True):
+            self.assertEqual(to_readable(before), after.replace(f"\n\n{NB}\n## 변경", "\n\n## 변경"))
 
 
 class LooseSpacingTests(unittest.TestCase):
@@ -168,10 +188,25 @@ class SpacingLinesTests(unittest.TestCase):
         self.assertEqual(to_readable("a\n\nb", spacing=2), f"a\n\n{NB}\nb")
 
     def test_spacing_two_widens_list_item_gaps_in_loose(self):
-        self.assertEqual(
-            to_readable("- a\n- b", loose=True, spacing=2),
-            f"- a\n\n{NB}\n- b",
-        )
+        # Between two items the gap is filler only, no real blank: a real
+        # blank keeps the items in one tight list (renders 0), and blank +
+        # filler renders differently across telegramify versions (#2279).
+        # Filler alone renders `spacing - 1` lines on every version, so the
+        # output does not depend on the converter model.
+        for kept in (False, True):
+            with self.subTest(list_blank_kept=kept), _list_blank(kept):
+                self.assertEqual(
+                    to_readable("- a\n- b", loose=True, spacing=2),
+                    f"- a\n{NB}\n- b",
+                )
+                self.assertEqual(
+                    to_readable("- a\n- b", loose=True, spacing=3),
+                    f"- a\n{NB}\n{NB}\n- b",
+                )
+                self.assertEqual(
+                    to_readable("1. a\n2. b", loose=True, spacing=2),
+                    f"1. a\n{NB}\n2. b",
+                )
 
     def test_spacing_two_widens_blank_before_heading(self):
         # Before the heading: spacing-wide gap. Under the heading: always
@@ -188,13 +223,38 @@ class SpacingLinesTests(unittest.TestCase):
         )
 
     def test_list_end_gap_gets_extra_filler(self):
-        # The converter eats the blank after a list item, so the gap from a
-        # list item to a non-item block carries `spacing` filler lines (one
+        # Legacy converter ate the blank after a list item, so the gap from a
+        # list item to a non-item block carried `spacing` filler lines (one
         # more than a paragraph gap) to render at the same width.
-        self.assertEqual(
-            to_readable("- a\n\nBBB", spacing=2),
-            f"- a\n\n{NB}\n{NB}\nBBB",
-        )
+        with _list_blank(kept=False):
+            self.assertEqual(
+                to_readable("- a\n\nBBB", spacing=2),
+                f"- a\n\n{NB}\n{NB}\nBBB",
+            )
+
+    def test_list_end_gap_matches_paragraph_gap_when_blank_kept(self):
+        # telegramify-markdown 1.3.0+ keeps that blank, so the list-end gap is
+        # filled exactly like a paragraph gap (#2279: the legacy extra filler
+        # rendered a 3-line gap).
+        with _list_blank(kept=True):
+            self.assertEqual(
+                to_readable("- a\n\nBBB", spacing=2), f"- a\n\n{NB}\nBBB"
+            )
+            self.assertEqual(
+                to_readable("a\n\nb", spacing=2), f"a\n\n{NB}\nb"
+            )
+
+    def test_blank_kept_spacing_one_never_goes_negative(self):
+        with _list_blank(kept=True):
+            self.assertEqual(
+                to_readable("- a\n- b", loose=True, spacing=1), "- a\n\n- b"
+            )
+
+    def test_blank_kept_output_is_idempotent(self):
+        src = "## T\n\nintro\n\n- one\n- two\n\nclosing"
+        with _list_blank(kept=True):
+            once = to_readable(src, loose=True, spacing=2)
+            self.assertEqual(once, to_readable(once, loose=True, spacing=2))
 
     def test_spacing_does_not_space_soft_wrapped_prose(self):
         # No blank between the lines, so no gap is created (only gaps widen).
@@ -300,3 +360,46 @@ class RenderForDeliveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConverterVersionDetectionTests(unittest.TestCase):
+    """converter_keeps_list_blank follows the installed telegramify (#2279)."""
+
+    def setUp(self):
+        _tg_readable_mod.converter_keeps_list_blank.cache_clear()
+        self.addCleanup(_tg_readable_mod.converter_keeps_list_blank.cache_clear)
+
+    def _detect(self, version=None, error=None):
+        def fake(name):
+            self.assertEqual(name, "telegramify-markdown")
+            if error is not None:
+                raise error
+            return version
+
+        with mock.patch.object(_tg_readable_mod.metadata, "version", side_effect=fake):
+            _tg_readable_mod.converter_keeps_list_blank.cache_clear()
+            return _tg_readable_mod.converter_keeps_list_blank()
+
+    def test_before_1_3_eats_the_blank(self):
+        self.assertFalse(self._detect("1.2.0"))
+        self.assertFalse(self._detect("0.5.4"))
+        self.assertFalse(self._detect("1.2.99"))
+
+    def test_from_1_3_keeps_the_blank(self):
+        self.assertTrue(self._detect("1.3.0"))
+        self.assertTrue(self._detect("1.4.0"))
+        self.assertTrue(self._detect("1.3.0rc1"))
+        self.assertTrue(self._detect("2.0"))
+
+    def test_missing_or_unparseable_counts_as_kept(self):
+        self.assertTrue(self._detect(error=metadata.PackageNotFoundError("x")))
+        self.assertTrue(self._detect("dev"))
+
+    def test_result_is_cached(self):
+        with mock.patch.object(
+            _tg_readable_mod.metadata, "version", return_value="1.2.0"
+        ) as fake:
+            _tg_readable_mod.converter_keeps_list_blank.cache_clear()
+            _tg_readable_mod.converter_keeps_list_blank()
+            _tg_readable_mod.converter_keeps_list_blank()
+            self.assertEqual(fake.call_count, 1)
