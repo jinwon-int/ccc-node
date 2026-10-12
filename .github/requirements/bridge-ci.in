@@ -14,3 +14,10 @@ pytest-timeout
 # never fetches an unhashed setuptools at build time (bridge/pyproject.toml
 # requires setuptools>=68).
 setuptools>=68
+# Termux native build backend cap (bridge/termux_prepare.py MATURIN_VERSION).
+# Termux nodes compile these sdists with the reviewed system maturin 1.14.1;
+# jiter>=0.17 and pydantic-core>=2.50 (pulled by pydantic>=2.14) declare
+# maturin>=1.15 and fail `native-wheels` with --check-build-dependencies.
+# Lift these caps only together with a reviewed MATURIN_VERSION bump.
+jiter<0.17
+pydantic<2.14

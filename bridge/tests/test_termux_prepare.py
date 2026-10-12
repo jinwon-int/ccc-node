@@ -32,6 +32,30 @@ def test_repository_lock_subsets_include_every_native_backend():
     assert all(f"{name}==" in tools for name in prep.BUILD_TOOLS)
 
 
+# First version of each native package whose sdist requires maturin>=1.15.
+# The Termux builder runs pip with --check-build-dependencies against the
+# reviewed system maturin, so a lock that crosses these floors fails the
+# `native-wheels` stage on every Termux node (2026-10-12, f08a68ed).
+MATURIN_115_FLOORS = {"jiter": (0, 17), "pydantic-core": (2, 50)}
+
+
+def _release(version):
+    return tuple(int(part) for part in version.split(".")[:2])
+
+
+def test_native_lock_stays_buildable_with_reviewed_maturin():
+    if _release(prep.MATURIN_VERSION) >= (1, 15):
+        pytest.skip("reviewed maturin already satisfies the 1.15 floors")
+    source = Path(prep.__file__).resolve().parent
+    native = prep.lock_subset(source / "requirements.lock.txt", prep.NATIVE)
+    for name, floor in MATURIN_115_FLOORS.items():
+        version = next(line.split("==", 1)[1].split()[0]
+                       for line in native.splitlines() if line.startswith(f"{name}=="))
+        assert _release(version) < floor, (
+            f"{name}=={version} needs maturin>=1.15 but Termux builds with "
+            f"maturin {prep.MATURIN_VERSION}; keep the cap in bridge-ci.in")
+
+
 @pytest.mark.parametrize("content", [
     "thing>=1", "thing==1", "-r other.txt", "--index-url https://invalid.example",
     pin("thing") + pin("thing"), pin("thing") + "--extra-index-url https://invalid.example",
