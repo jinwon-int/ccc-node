@@ -1234,6 +1234,35 @@ ok "re-apply stamps the current gen onto the managed line" 'grep -qF "# ccc-node
 ok "re-apply preserves unrelated crontab lines" 'grep -qF "echo keepme" "$FAKE_CRON"'
 ok "re-apply is mentioned in the success notify" 'grep -rh "cron 재적용" "$TMP/spool" >/dev/null 2>&1'
 
+# HOME-less launcher (#2275): systemd-run hands the script no HOME; the installer
+# it re-applies must still see one (install-nunchi.sh died on `$HOME` under set -u).
+cat > "$TMP/seed/scripts/install-fake-home.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=/dev/null
+. "$ROOT/scripts/lib/installer-gen-stamp.sh"
+GEN="$(ccc_installer_gen_stamp "$ROOT/scripts/install-fake-home.sh")"
+MARKER="# ccc-node:fakehome"
+CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
+printf '%s\n' "$HOME" > "${CCC_TEST_HOME_MARKER:?}"
+current="$("$CRONTAB" -l 2>/dev/null || true)"
+without="$(printf '%s\n' "$current" | grep -vF "$MARKER" || true)"
+printf '%s\n%s\n' "$without" "0 5 * * * echo fakehome $MARKER gen=$GEN" | "$CRONTAB" -
+SH
+chmod +x "$TMP/seed/scripts/install-fake-home.sh"
+echo home-reapply > "$TMP/seed/file.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm reapply-home && git -C "$TMP/seed" push -q origin main
+export CCC_TEST_HOME_MARKER="$TMP/home.marker"
+rm -f "$CCC_TEST_HOME_MARKER" "$TMP/spool"/*.json
+jq -nc '{schema:"ccc.install-record.v1",installer:"scripts/install-fake-home.sh",marker:"# ccc-node:fakehome",gen:"h_000000000000",argv:[],applied_at:"2026-01-01T00:00:00Z"}' \
+  > "$STATE/install-fake-home.json"
+out="$( (unset HOME; run_selfup run) 2>&1)"; rc=$?
+ok "a HOME-less launcher still completes the tick (#2275)" '[ "$rc" = 0 ] && ! grep -q "unbound variable" <<<"$out"'
+ok "the re-applied installer inherits a derived HOME (#2275)" \
+  '[ -s "$CCC_TEST_HOME_MARKER" ] && [ "$(cat "$CCC_TEST_HOME_MARKER")" != "~" ] && [ "$(cat "$CCC_TEST_HOME_MARKER")" = "$(printf "%s" ~)" ]'
+rm -f "$STATE/install-fake-home.json"
+
 # kill-switch file
 echo noswitch > "$TMP/seed/file.txt"
 git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm reapply-killfile && git -C "$TMP/seed" push -q origin main

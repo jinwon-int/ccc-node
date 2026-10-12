@@ -806,5 +806,20 @@ ok "status reports backend_auth=ok once a backend is authenticated" \
 
 run_install --remove >/dev/null 2>&1
 
+# --- #2275: a HOME-less launcher (systemd-run without Environment=HOME) used
+# to kill the installer at `CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"` with
+# "HOME: unbound variable" and fail the whole self-update re-apply. The guard
+# derives HOME from the passwd entry; only the absence of the crash is asserted.
+no_home_env=()
+for kv in "${common_env[@]}"; do
+  case "$kv" in HOME=*|CODEX_HOME=*) ;; *) no_home_env+=("$kv") ;; esac
+done
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=0
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(env -u HOME -u CODEX_HOME "${no_home_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" 2>&1)" || rc=$?
+ok "status (no args) without HOME in the environment does not die on an unbound HOME (#2275)" \
+  '! grep -q "unbound variable" <<<"$out" && [ "$rc" = 0 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

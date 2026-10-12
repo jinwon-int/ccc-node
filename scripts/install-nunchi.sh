@@ -35,6 +35,16 @@
 # installed entries were rendered by an older installer.
 set -euo pipefail
 
+# Standalone or re-applied from a HOME-less launcher (#2275): `$HOME` below is a
+# `set -u` fatal without this. Bash's tilde falls back to the passwd entry when
+# HOME is unset (Termux has no getent); a HOME the caller set is kept as is.
+if [ -z "${HOME:-}" ]; then
+  _nunchi_home="$(printf '%s' ~)"
+  [ -n "$_nunchi_home" ] && [ "$_nunchi_home" != "~" ] || _nunchi_home=/root
+  export HOME="$_nunchi_home"
+  unset _nunchi_home
+fi
+
 ACTION="status"
 PROVIDER="${CCC_NUNCHI_PROVIDER:-auto}"
 TARGET_USER="${CCC_NUNCHI_TARGET_USER:-}"
