@@ -25,6 +25,11 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
    STATE="${CCC_SKILL_REVIEW_STATE_DIR:-$HOME/.claude/state}"
    find "$STATE/pending-skills" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort
    ```
+   `$STATE/pending-skills/index.jsonl` is the one-row-per-draft ledger
+   (status from the approve/install/reject rename suffix, prescreen verdict,
+   `archived:<kind>` rows from the archive manifests). The nightly sweep
+   rebuilds it; if it looks stale or empty, `ccc-skill-autosave.sh reindex`
+   rebuilds it on demand (#2283).
    For a chosen `<id>`:
    ```bash
    STATE="${CCC_SKILL_REVIEW_STATE_DIR:-$HOME/.claude/state}"

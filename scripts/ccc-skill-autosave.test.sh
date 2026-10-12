@@ -118,6 +118,66 @@ ok "owner notification queued in spool" 'ls "$SPOOL"/*SkillAutosave*.json >/dev/
 ok "notification counts pending drafts" 'jq -r ".text" "$SPOOL"/*SkillAutosave*.json 2>/dev/null | grep -q "1건"'
 ok "notification has dedup key" 'jq -r ".dedup" "$SPOOL"/*SkillAutosave*.json 2>/dev/null | grep -q "SkillAutosave:1"'
 
+# --- 1a) #2283: the index is written (jq -n) and rebuilt by the sweep ---------
+# Before #2283 the per-draft append emitted nothing (jq read a drained stdin),
+# so index.jsonl was 0 bytes on every node. The sweep now also rebuilds the
+# index, so the append itself is asserted in isolation first: drive
+# skill-review.sh directly (no sweep, no rebuild) into a fresh state dir and
+# require exactly one row, keyed by the draft directory, written by the
+# staging site (a rebuilt row would carry `reindexed_at`). Dropping `-n` at
+# the staging site makes these three fail; the sweep assertions below do not.
+STATE_IDX="$TMP/state-idx"
+mkdir -p "$STATE_IDX"
+make_transcript "$PROJECTS/-root--idx/direct-sess-1.jsonl" 6
+jq -nc --arg tp "$PROJECTS/-root--idx/direct-sess-1.jsonl" '{session_id:"direct-sess-1", transcript_path:$tp}' \
+  | CCC_SKILL_REVIEW_STATE_DIR="$STATE_IDX" CLAUDE_SKILLS_DIR="$TMP/skills" bash "$REVIEW" manual >/dev/null 2>&1
+for _ in $(seq 1 40); do
+  find "$STATE_IDX/pending-skills" -name SKILL.md 2>/dev/null | grep -q . && break
+  sleep 0.25
+done
+# shellcheck disable=SC2034  # read inside the ok() eval strings below
+idx_direct_dir="$(find "$STATE_IDX/pending-skills" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null | head -1)"
+ok "#2283: direct staging appends exactly one index row" \
+  '[ -n "$idx_direct_dir" ] && [ "$(wc -l < "$STATE_IDX/pending-skills/index.jsonl" 2>/dev/null | tr -d "[:space:]")" = 1 ]'
+ok "#2283: direct index row id equals the draft directory name" \
+  'jq -r ".id" "$STATE_IDX/pending-skills/index.jsonl" 2>/dev/null | grep -qx "$(basename "$idx_direct_dir")"'
+ok "#2283: direct index row came from the staging site (status=pending, provider set, not a rebuild)" \
+  'jq -e "select(.status == \"pending\" and (.provider // \"\") != \"\" and (has(\"reindexed_at\") | not))" "$STATE_IDX/pending-skills/index.jsonl" >/dev/null 2>&1'
+
+# Sweep path: one row per staged draft whose id is the draft directory name,
+# and the rebuild step ran.
+# shellcheck disable=SC2034  # read inside the ok() eval strings below
+staged_dir="$(find "$STATE/pending-skills" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null | head -1)"
+ok "#2283: index.jsonl is non-empty after staging" '[ -s "$STATE/pending-skills/index.jsonl" ]'
+ok "#2283: index row id equals the draft directory name" \
+  'jq -r ".id" "$STATE/pending-skills/index.jsonl" 2>/dev/null | grep -qx "$(basename "$staged_dir")"'
+ok "#2283: index row carries status=pending and a provider" \
+  'jq -e "select(.status == \"pending\" and (.provider // \"\") != \"\")" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
+ok "#2283: sweep logged the index rebuild" 'grep -q "^[0-9T:Z-]* reindex {\"status\":\"reindexed\"" "$STATE/skill-autosave.log"'
+
+# Manual rebuild: a renamed (installed) draft, a prescreened one and an
+# archived one are all represented; the previous index is kept as .bak.
+IDX_INST="20260102-000000-sess-idx-installed-skill.installed-20260103000000"
+mkdir -p "$STATE/pending-skills/$IDX_INST"
+printf -- '---\nname: idx-installed-skill\ndescription: Use when testing reindex.\n---\n# x\n' > "$STATE/pending-skills/$IDX_INST/SKILL.md"
+printf '{"name":"idx-installed-skill","staged_at":"2026-01-02T00:00:00Z","status":"pending","provider":"claude","session_id":"sess"}\n' > "$STATE/pending-skills/$IDX_INST/meta.json"
+printf '{"verdict":"revise","status":"ok"}\n' > "$STATE/pending-skills/$IDX_INST/prescreen.json"
+mkdir -p "$STATE/skill-autosave-archive/pending-90d-20260401"
+printf '{"ts":"2026-04-01T00:00:00Z","node":"testnode","from":"%s","name":"20260101-000000-sess-idx-expired-skill","reason":"test expiry"}\n' "$STATE/pending-skills" \
+  > "$STATE/skill-autosave-archive/pending-90d-20260401/manifest.jsonl"
+# shellcheck disable=SC2034  # read inside the ok() eval strings below
+reindex_rc=0
+# shellcheck disable=SC2034  # read inside the ok() eval strings below
+reindex_out="$(CCC_STATE_DIR="$STATE" CCC_SKILL_REVIEW_CMD="$REVIEW" bash "$AUTOSAVE" reindex 2>/dev/null)" || reindex_rc=$?
+ok "#2283: manual reindex exits 0 with a summary" '[ "$reindex_rc" = 0 ] && printf "%s" "$reindex_out" | jq -e ".status == \"reindexed\" and .installed == 1 and .archived == 1" >/dev/null'
+ok "#2283: installed draft row has status=installed, id without the suffix and the prescreen verdict" \
+  'jq -e "select(.dir == \"$IDX_INST\" and .status == \"installed\" and .id == \"20260102-000000-sess-idx-installed-skill\" and .prescreen == \"revise\")" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
+ok "#2283: archived draft row has status=archived:pending-90d" \
+  'jq -e "select(.status == \"archived:pending-90d\" and .id == \"20260101-000000-sess-idx-expired-skill\")" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
+ok "#2283: previous non-empty index kept as .bak" 'ls "$STATE/pending-skills/index.jsonl.bak-"* >/dev/null 2>&1'
+ok "#2283: no temp file left behind" '! ls "$STATE/pending-skills/.index.jsonl."* >/dev/null 2>&1'
+rm -rf "$STATE/pending-skills/$IDX_INST" "$STATE/skill-autosave-archive/pending-90d-20260401"
+
 # --- 1b) #2184: the sweep expires a 90-day-old undecided draft, keeps the fresh one
 OLD_DRAFT="20260101-000000-00000000-0000-0000-0000-000000000000-ancient-draft"
 mkdir -p "$STATE/pending-skills/$OLD_DRAFT"

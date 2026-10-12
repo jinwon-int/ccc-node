@@ -34,6 +34,96 @@ SKILL_REVIEW_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && p
 # shellcheck source=claude/hooks/lib/hook-common.sh
 . "$SKILL_REVIEW_LIB_DIR/lib/hook-common.sh" || exit 0
 
+# --- reindex (#2283): rebuild pending-skills/index.jsonl from the queue -------
+# The index is the one cross-draft ledger, but the per-draft append never ran
+# (missing `jq -n`, fixed above at the staging site), so every node carries a
+# 0-byte index. This rebuilds it from what is actually on disk — one row per
+# draft directory — so the fleet usage report can read a lifecycle table
+# without SSH-ing into each node. Status comes from the directory-name suffix
+# the approve/install/reject paths already use (`.approved-<ts>` /
+# `.installed-<ts>` / `.rejected-<ts>`; none = pending) and the prescreen
+# verdict is carried along when present. Rows for drafts that already left the
+# queue come from the archive manifests (status `archived:<kind>`).
+# Atomic: written to a temp file in the same directory, then renamed; a
+# previous non-empty index is kept beside it as index.jsonl.bak-<ts>. Prints a
+# one-line JSON summary; exit 1 only when the queue directory is unwritable.
+# `CCC_SKILL_REVIEW_PENDING_DIR` and `CCC_SKILL_REVIEW_STATE_DIR` are honoured
+# like everywhere else in this hook. The sweep runs it after drafting; it is
+# also a manual entry point: `skill-review.sh reindex`.
+skill_review_reindex() {
+  local dir="${CCC_SKILL_REVIEW_PENDING_DIR:-$PENDING_DIR}" index tmp entry base id status verdict rows=0
+  local n_pending=0 n_approved=0 n_installed=0 n_rejected=0 n_archived=0 manifest kind now
+  index="$dir/index.jsonl"
+  mkdir -p "$dir" 2>/dev/null
+  tmp="$(mktemp "$dir/.index.jsonl.XXXXXX" 2>/dev/null)" || {
+    log "reindex failed reason=unwritable dir=$dir"
+    printf '{"status":"error","code":"unwritable","dir":"%s"}\n' "$dir"
+    return 1
+  }
+  now="$(ts)"
+  for entry in "$dir"/*/; do
+    [ -d "$entry" ] || continue
+    base="$(basename "$entry")"
+    case "$base" in .*) continue ;; esac
+    [ -f "$entry/meta.json" ] || [ -f "$entry/SKILL.md" ] || continue
+    case "$base" in
+      *.approved-*)  status=approved;  id="${base%.approved-*}";  n_approved=$((n_approved + 1)) ;;
+      *.installed-*) status=installed; id="${base%.installed-*}"; n_installed=$((n_installed + 1)) ;;
+      *.rejected-*)  status=rejected;  id="${base%.rejected-*}";  n_rejected=$((n_rejected + 1)) ;;
+      *)             status=pending;   id="$base";                n_pending=$((n_pending + 1)) ;;
+    esac
+    verdict=""
+    [ -f "$entry/prescreen.json" ] && verdict="$(jq -r '.verdict // empty' "$entry/prescreen.json" 2>/dev/null)"
+    if [ -f "$entry/meta.json" ] && jq -e 'type == "object"' "$entry/meta.json" >/dev/null 2>&1; then
+      jq -c --arg id "$id" --arg dir "$base" --arg status "$status" --arg verdict "$verdict" --arg at "$now" \
+        '{id:$id, name:(.name // $id), status:$status, session_id:(.session_id // null), trigger:(.trigger // null),
+          staged_at:(.staged_at // null), provider:(.provider // null), dir:$dir,
+          prescreen:(if $verdict == "" then null else $verdict end), reindexed_at:$at}' \
+        "$entry/meta.json" >> "$tmp" 2>/dev/null \
+        || jq -nc --arg id "$id" --arg dir "$base" --arg status "$status" --arg at "$now" \
+             '{id:$id,name:$id,status:$status,dir:$dir,reindexed_at:$at,meta:"unreadable"}' >> "$tmp"
+    else
+      jq -nc --arg id "$id" --arg dir "$base" --arg status "$status" --arg at "$now" \
+        '{id:$id,name:$id,status:$status,dir:$dir,reindexed_at:$at,meta:"missing"}' >> "$tmp"
+    fi
+    rows=$((rows + 1))
+  done
+  # Drafts that left the queue: one row per archive manifest entry (#2184
+  # expiry, #2183 prescreen reject, #2239 draft-rejected share the root).
+  for manifest in "$STATE_DIR"/skill-autosave-archive/*/manifest.jsonl; do
+    [ -f "$manifest" ] || continue
+    kind="$(basename "$(dirname "$manifest")")"
+    kind="${kind%-20[0-9][0-9][0-9][0-9][0-9][0-9]}"
+    if jq -c --arg kind "$kind" --arg at "$now" \
+         'select(type == "object" and (.name // "") != "" and (.restored_to // "") == "")
+          | {id:(.name | sub("\\.(approved|installed|rejected)-[0-9]+$"; "")), name:(.name | sub("^[0-9]{8}-[0-9]{6}-"; "") | sub("\\.(approved|installed|rejected)-[0-9]+$"; "")),
+             status:("archived:" + $kind), dir:.name, archived_at:(.ts // null), reason:(.reason // null), reindexed_at:$at}' \
+         "$manifest" >> "$tmp" 2>/dev/null; then
+      n_archived=$((n_archived + $(jq -c 'select(type == "object" and (.name // "") != "" and (.restored_to // "") == "")' "$manifest" 2>/dev/null | wc -l | tr -d '[:space:]')))
+    fi
+  done
+  if [ -s "$index" ]; then
+    cp -p "$index" "$index.bak-$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
+  fi
+  chmod 0644 "$tmp" 2>/dev/null || true
+  if ! mv -f "$tmp" "$index" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    log "reindex failed reason=rename dir=$dir"
+    printf '{"status":"error","code":"rename","dir":"%s"}\n' "$dir"
+    return 1
+  fi
+  log "reindex ok rows=$rows pending=$n_pending approved=$n_approved installed=$n_installed rejected=$n_rejected archived=$n_archived index=$index"
+  jq -nc --arg index "$index" --argjson rows "$rows" --argjson p "$n_pending" --argjson a "$n_approved" \
+    --argjson i "$n_installed" --argjson r "$n_rejected" --argjson ar "$n_archived" \
+    '{status:"reindexed",index:$index,rows:$rows,pending:$p,approved:$a,installed:$i,rejected:$r,archived:$ar}'
+  return 0
+}
+
+if [ "$TRIGGER" = "reindex" ]; then
+  skill_review_reindex
+  exit $?
+fi
+
 # The emergency off-switch must win even when a SessionEnd hook inherits the
 # detached runner marker from its parent `claude -p` process.
 if [ -f "$STATE_DIR/skill-review.disabled" ]; then
@@ -195,8 +285,11 @@ run_skill_review_bg() {
       --arg provider "$STAGE_PROVIDER" \
       'del(.skill_md) + {id:$id,status:"pending",session_id:$session,trigger:$trigger,source_cwd:$source_cwd,source_project:$source_project,staged_at:$staged_at,target_skill_path:$skill_path,provider:$provider}' \
       > "$dest/meta.json" 2>/dev/null || true
-    jq -c --arg id "$safe_id" --arg name "$name" --arg session "$SESSION_ID" --arg trigger "$TRIGGER" --arg at "$(ts)" \
-      '{id:$id,name:$name,status:"pending",session_id:$session,trigger:$trigger,staged_at:$at}' \
+    # #2283: `-n` is load-bearing. Without it jq reads stdin, which the hook
+    # entry already drained (HOOK_INPUT="$(cat)"), so it emitted nothing and
+    # index.jsonl stayed 0 bytes on every node from #183 (2026-06-26) on.
+    jq -nc --arg id "$safe_id" --arg name "$name" --arg session "$SESSION_ID" --arg trigger "$TRIGGER" --arg at "$(ts)" --arg provider "$STAGE_PROVIDER" \
+      '{id:$id,name:$name,status:"pending",session_id:$session,trigger:$trigger,staged_at:$at,provider:$provider}' \
       >> "$PENDING_DIR/index.jsonl" 2>/dev/null || true
     staged=$((staged + 1))
     log "staged id=$safe_id name=$name trigger=$TRIGGER pid=$PIPE_PID"
