@@ -116,6 +116,20 @@
 #      and whether a bridge is still serving: available | alive | dead) (#1868).
 set -uo pipefail
 
+# A launcher that does not inherit the shell environment (systemd-run without
+# --property=Environment=HOME=…, some supervisors) hands us no HOME. Every path
+# default below and every installer re-applied by this script assumes one and
+# dies under `set -u` otherwise (#2275: install-nunchi.sh line 149 on a fleet node,
+# 2026-10-12). Derive it from the shell's own tilde fallback (bash consults the
+# passwd entry when HOME is unset; Termux has no getent) and export it so the
+# children inherit the same value. Never override a HOME the caller did set.
+if [ -z "${HOME:-}" ]; then
+  _ccc_home="$(printf '%s' ~)"
+  [ -n "$_ccc_home" ] && [ "$_ccc_home" != "~" ] || _ccc_home=/root
+  export HOME="$_ccc_home"
+  unset _ccc_home
+fi
+
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
 HERMES_ROOT="${CCC_HERMES_DIR:-${HOME:-/root}/.hermes}"
 CODEX_DIR="${CODEX_HOME:-${HOME:-/root}/.codex}"
