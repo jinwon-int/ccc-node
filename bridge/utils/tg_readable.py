@@ -27,8 +27,10 @@ inline-code wrapping of paths/SHAs, chunk part headers.
 
 from __future__ import annotations
 
+import functools
 import logging
 import re
+from importlib import metadata
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +55,10 @@ _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+\S")
 # blank line (and removes blank lines between list items entirely) — silently
 # undoing any widening done here. A line holding a single NO-BREAK SPACE is a
 # real (invisible) paragraph to the converter, so it survives conversion intact
-# and renders as an empty line in Telegram. The first line of every gap stays a
-# genuine blank line so Markdown block structure is unchanged.
+# and renders as an empty line in Telegram. The first line of a gap stays a
+# genuine blank line so Markdown block structure is unchanged — except between
+# two list items, where filler alone (a lazy continuation of the item) is the
+# only form that renders the same on every telegramify version (_gap_lines).
 GAP_FILLER_LINE = "\u00a0"  # NO-BREAK SPACE
 
 
@@ -66,24 +70,83 @@ def _is_section_heading(line: str) -> bool:
     return bool(_HEADING_RE.match(line) or _BOLD_ONLY_RE.match(line))
 
 
-def _gap_filler_count(prev_line: str, next_line: str, spacing: int) -> int:
-    """Filler lines a gap needs so the *rendered* gap is uniform.
+# telegramify-markdown 1.3.0 (2026-09-25) fixed "Blocks after a list keep their
+# blank line": before it, the converter dropped the real blank line of a gap
+# that follows a list item. The compensation below depends on which behavior is
+# installed, and a node's venv can lag its checkout, so it is detected at
+# runtime instead of assumed.
+_LIST_BLANK_KEPT_SINCE = (1, 3, 0)
 
-    The telegramify Markdown converter eats the gap's real blank line whenever
-    the gap follows a list item (lazy-continuation parsing) but keeps it
-    everywhere else, so a fixed filler count renders unevenly (the exact
-    inconsistency reported on GitHub issue #34 follow-ups). Compensate per
-    boundary so every rendered gap between blocks is `spacing` blank lines,
-    list items sit one step tighter at `spacing - 1`, and a heading/section
-    label always has exactly one blank line under it.
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for piece in version.split(".")[:3]:
+        digits = re.match(r"\d+", piece)
+        if not digits:
+            break
+        parts.append(int(digits.group()))
+    return tuple(parts)
+
+
+@functools.lru_cache(maxsize=1)
+def converter_keeps_list_blank() -> bool:
+    """True when a gap's real blank line survives conversion after a list item.
+
+    False only for an installed telegramify-markdown older than 1.3.0, which
+    ate that blank. Without telegramify the text is sent unconverted, so the
+    blank is kept as typed; an unreadable version is treated the same way
+    (current upstream behavior).
+    """
+    try:
+        installed = metadata.version("telegramify-markdown")
+    except metadata.PackageNotFoundError:
+        return True
+    except Exception:  # pragma: no cover - metadata backend failure
+        return True
+    parsed = _version_tuple(installed)
+    if not parsed:
+        return True
+    return parsed >= _LIST_BLANK_KEPT_SINCE
+
+
+def _gap_lines(
+    prev_line: str,
+    next_line: str,
+    spacing: int,
+    *,
+    list_blank_kept: bool | None = None,
+) -> list[str]:
+    """Lines to emit for one gap so the *rendered* gap is uniform.
+
+    Target: every gap between blocks renders as `spacing` blank lines, list
+    items sit one step tighter at `spacing - 1`, and a heading/section label
+    always has exactly one blank line under it. Measured renderings
+    (MarkdownV2 and entity paths, telegramify-markdown 1.2.0 and 1.4.0, #2279):
+
+    - heading -> anything: one real blank renders 1 on both.
+    - list item -> list item: a real blank keeps both items in one tight list
+      (renders 0); on 1.3.0+ a real blank followed by filler splits the list
+      and renders 1 + filler, on 1.2.0 the blank is eaten and renders filler.
+      Filler lines WITHOUT the real blank render exactly filler on both
+      versions (the filler is a lazy continuation of the item), so that form
+      is used whenever the gap must show at least one line.
+    - list item -> other block: < 1.3.0 eats the real blank (renders filler),
+      1.3.0+ keeps it (renders 1 + filler) — "Blocks after a list keep their
+      blank line". *list_blank_kept* selects the model, defaulting to
+      :func:`converter_keeps_list_blank`.
+    - everything else: the real blank is kept (renders 1 + filler).
     """
     if _is_section_heading(prev_line):
-        return 0  # heading gap stays a single real blank -> renders as 1
+        return [""]
+    if _is_list_item(prev_line) and _is_list_item(next_line):
+        wanted = spacing - 1
+        return [GAP_FILLER_LINE] * wanted if wanted > 0 else [""]
     if _is_list_item(prev_line):
-        if _is_list_item(next_line):
-            return spacing - 1  # blank eaten -> renders as spacing - 1
-        return spacing  # blank eaten -> renders as spacing
-    return spacing - 1  # blank kept -> renders as spacing
+        if list_blank_kept is None:
+            list_blank_kept = converter_keeps_list_blank()
+        extra = spacing - 1 if list_blank_kept else spacing
+        return [""] + [GAP_FILLER_LINE] * extra
+    return [""] + [GAP_FILLER_LINE] * (spacing - 1)
 
 
 def to_readable(text: str, loose: bool = False, spacing: int = 1) -> str:
@@ -99,10 +162,11 @@ def to_readable(text: str, loose: bool = False, spacing: int = 1) -> str:
     ``spacing - 1``, and a heading/section label always has exactly one blank
     line under it. Gaps are emitted as one real blank line plus a
     boundary-dependent number of invisible :data:`GAP_FILLER_LINE` lines
-    (see :func:`_gap_filler_count`) to compensate for the downstream
+    (see :func:`_gap_lines`) to compensate for the downstream
     Markdown -> MarkdownV2 / entity conversion, which collapses runs of truly
-    blank lines and eats the blank after list items — the correction that
-    keeps the rendered spacing uniform across boundary types.
+    blank lines and (telegramify-markdown < 1.3.0 only) eats the blank after
+    list items — the correction that keeps the rendered spacing uniform across
+    boundary types.
 
     Fail-open: on any unexpected error the original *text* is returned unchanged.
     """
@@ -226,9 +290,10 @@ def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:  # noqa
             loose_lines.append(line)
         pass2 = loose_lines
 
-    # Pass 3: normalize every run of blank lines (outside fences) to exactly one
-    # real blank line plus a boundary-dependent number of GAP_FILLER_LINE lines
-    # (see _gap_filler_count) so the gap the USER SEES after the downstream
+    # Pass 3: normalize every run of blank lines (outside fences) to the
+    # canonical gap for its boundary — normally one real blank line plus a
+    # boundary-dependent number of GAP_FILLER_LINE lines
+    # (see _gap_lines) so the gap the USER SEES after the downstream
     # Markdown -> MarkdownV2 / entity conversion is uniform: `spacing` blank
     # lines between blocks, `spacing - 1` between list items, exactly one under
     # a heading. The filler is needed because the converter collapses runs of
@@ -258,12 +323,10 @@ def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:  # noqa
                 and pass2[j].strip() == ""
             ):
                 j += 1
-            pass3.append("")
-            if pass3[:-1] and j < n:
-                pass3.extend(
-                    [GAP_FILLER_LINE]
-                    * _gap_filler_count(pass3[-2], pass2[j], spacing)
-                )
+            if pass3 and j < n:
+                pass3.extend(_gap_lines(pass3[-1], pass2[j], spacing))
+            else:
+                pass3.append("")
             i = j
         else:
             pass3.append(line)
