@@ -1,0 +1,1 @@
+- nunchi judge: on the Claude lane, a `clear`/`human` verdict that omits only the `supersede_proposal` key is now read as a null proposal (audit note `claude:proposal-defaulted`) instead of failing closed to the Codex/GPT fallback; a `conflict` verdict without a proposal, any other missing/extra key, and the whole Codex lane stay strict (#2267).

@@ -416,6 +416,7 @@ case "$(cat "$stub_root/codex-mode" 2>/dev/null || printf valid)" in
   bad) printf '%s\n' 'not-json' >"$output" ;;
   extra) printf '%s\n' '{"verdict":"clear","rationale":"same fact","supersede_proposal":null,"unexpected":true}' >"$output" ;;
   long) printf '{"verdict":"clear","rationale":"%s","supersede_proposal":null}\n' "$(printf '%201s' '' | tr ' ' x)" >"$output" ;;
+  missingprop) printf '%s\n' '{"verdict":"clear","rationale":"same fact"}' >"$output" ;;
   *) printf '%s\n' '{"verdict":"clear","rationale":"same fact","supersede_proposal":null}' >"$output" ;;
 esac
 printf '%s\n' "$PWD" >"$cwd_file"
@@ -472,6 +473,18 @@ out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=codex)"
 ok "local parser rejects overlong Codex rationale fail-closed" '[ "$(review_of "$idc7")" = 1 ]'
 ok "overlong output body is absent from audit" \
   'grep -q '\''"codex:rationale-too-long"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "xxxxxxxxxxxxxxxx" "$NUNCHI_HOME/judge-audit.jsonl"'
+
+# #2267: the absent-proposal default is Claude-only. Codex enforces the schema
+# in its CLI, so a Codex answer without the key is a broken backend.
+reset_db
+# shellcheck disable=SC2034  # idc9 is read via eval inside ok()
+idc9="$(seed peer-k "Codex 제안 누락 형제 갈등" "$OLD" 1 1 dc9)"
+seed peer-k "Codex 제안 누락 형제 갈등" "$OLD" 1 0 dc10 >/dev/null
+printf '%s\n' missingprop >"$TMP/codex-mode"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=codex)"
+ok "codex clear without proposal key still fails closed" \
+  '[ "$(review_of "$idc9")" = 1 ] && grep -q '\''"codex:schema-invalid:missing=supersede_proposal"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "proposal-defaulted" "$NUNCHI_HOME/judge-audit.jsonl"'
 
 # ---- #1336: TTL-imminent observation evidence is annotated, not silent -----
 TTLFIX="$TMP/ttl-fixture.py"
@@ -1008,9 +1021,11 @@ STUB
   seed peer-k "스키마 진단 형제 $2" "$OLD" 1 0 "s$2b" >/dev/null
   run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=claude >/dev/null
 }
-schema_case '{"verdict":"clear","rationale":"dup"}' m1
+# A conflict verdict needs its proposal (a human's decision input): dropping
+# the key there still fails closed and is named (#2267 keeps this strict).
+schema_case '{"verdict":"conflict","rationale":"contradiction"}' m1
 ok "missing contract key fails closed and is named" \
-  '[ "$(review_of "$SCHEMA_ID")" = 1 ] && grep -q '\''"claude:schema-invalid:missing=supersede_proposal"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
+  '[ "$(review_of "$SCHEMA_ID")" = 1 ] && grep -q '\''"claude:schema-invalid:missing=supersede_proposal"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "proposal-defaulted" "$NUNCHI_HOME/judge-audit.jsonl"'
 schema_case '{"verdict":"clear","rationale":"dup","supersede_proposal":None,"bogusfieldname":1,"otherbogus":2}' e2
 ok "extra model keys are counted, never named" \
   '[ "$(review_of "$SCHEMA_ID")" = 1 ] && grep -q '\''"claude:schema-invalid:extra=2"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "bogus" "$NUNCHI_HOME/judge-audit.jsonl"'
@@ -1022,6 +1037,33 @@ ok "wrong field type is named by contract field" \
   'grep -q '\''"claude:schema-invalid:type=rationale"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
 schema_case '[{"verdict":"clear"}]' o5
 ok "non-object JSON fails closed" '[ "$(review_of "$SCHEMA_ID")" = 1 ]'
+
+# ---- #2267: proposal-free verdicts may omit the null proposal key ---------
+# Measured after #2251: Haiku drops supersede_proposal on clear/human verdicts
+# and each one fell through to Codex/GPT. Only that single omission, only on a
+# proposal-free verdict, is read as null — and noted body-free.
+proposal_backend() { # verdict backend + whether the default note was recorded
+  python3 -c "import json,sys
+rs=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+r=[x for x in rs if x.get(\"id\")==int(sys.argv[2])][-1]
+print(r.get(\"backend\"), r.get(\"verdict\"), r.get(\"supersede_proposal\"), \"claude:proposal-defaulted\" in r.get(\"attempts\",[]))" \
+    "$NUNCHI_HOME/judge-audit.jsonl" "$SCHEMA_ID"
+}
+schema_case '{"verdict":"clear","rationale":"dup"}' p1
+ok "claude clear without proposal key keeps the verdict (no fallback)" \
+  '[ "$(review_of "$SCHEMA_ID")" = 0 ] && [ "$(proposal_backend)" = "claude clear None True" ]'
+schema_case '{"verdict":"human","rationale":"ambiguous"}' p2
+ok "claude human without proposal key keeps the verdict, flag stays" \
+  '[ "$(review_of "$SCHEMA_ID")" = 1 ] && [ "$(proposal_backend)" = "claude human None True" ]'
+schema_case '{"verdict":"clear","rationale":"dup","note":1}' p3
+ok "absent proposal plus an extra key still fails closed" \
+  '[ "$(review_of "$SCHEMA_ID")" = 1 ] && grep -q '\''"claude:schema-invalid:missing=supersede_proposal;extra=1"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "proposal-defaulted" "$NUNCHI_HOME/judge-audit.jsonl"'
+schema_case '{"verdict":"clear"}' p4
+ok "absent proposal plus absent rationale still fails closed" \
+  '[ "$(review_of "$SCHEMA_ID")" = 1 ] && grep -q '\''"claude:schema-invalid:missing=rationale,supersede_proposal"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
+schema_case '{"verdict":"maybe","rationale":"dup"}' p5
+ok "absent proposal on an out-of-rubric verdict is not defaulted" \
+  '[ "$(review_of "$SCHEMA_ID")" = 1 ] && grep -q '\''"claude:schema-invalid:missing=supersede_proposal"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "proposal-defaulted" "$NUNCHI_HOME/judge-audit.jsonl"'
 
 printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
