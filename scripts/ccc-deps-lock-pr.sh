@@ -35,9 +35,25 @@
 #      and approves them with the job's GITHUB_TOKEN (actions: write). See
 #      approve_pending_runs for what is and is not verified about that.
 #
+# PR writes (#2276): since 2026-09-14 the repository setting "Allow GitHub
+# Actions to create and approve pull requests" is off, so `gh pr create` with
+# GITHUB_TOKEN fails ("GitHub Actions is not permitted to create or approve
+# pull requests"). That switch also lets every workflow's GITHUB_TOKEN approve
+# PRs, so it stays off; the workflow instead mints a one-hour installation
+# token of the deps-bot GitHub App (pull_requests: write, contents: read, this
+# repo only) and hands it over as CCC_DEPS_LOCK_PR_GH_TOKEN. gh_pr uses it for
+# the PR calls only. The App cannot delete branches (contents: read), so a
+# superseded PR is closed with the App token and its bot branch is deleted
+# with `git push --delete` over the checkout credentials.
+#
 # Everything network-facing goes through `git push` and `gh`, so a test can
 # point the remote at a local bare repo and put a stub `gh` on PATH.
 set -euo pipefail
+
+PR_TOKEN="${CCC_DEPS_LOCK_PR_GH_TOKEN:-}"
+gh_pr() { # gh for PR writes: the PR-writer token when one was handed over
+    if [ -n "$PR_TOKEN" ]; then GH_TOKEN="$PR_TOKEN" gh "$@"; else gh "$@"; fi
+}
 
 usage() {
     cat >&2 <<'USAGE'
@@ -65,6 +81,11 @@ environment:
                               wait; "skip" = do not approve at all)
   CCC_DEPS_LOCK_PR_APPROVE_POLL
                               poll interval in seconds (default: 5)
+  CCC_DEPS_LOCK_PR_GH_TOKEN   token for the PR writes only (gh pr list/create/
+                              edit/close) — the deps-bot GitHub App installation
+                              token in CI (#2276). Empty = GH_TOKEN. Pushes,
+                              branch deletes, dispatch and run approval keep
+                              GH_TOKEN / the checkout credentials.
   GH_TOKEN / GH_REPO          consumed by gh as usual
 USAGE
 }
@@ -263,26 +284,37 @@ GitHub may still register this PR's own \`pull_request\` runs and park them at *
 Refs #$ISSUE
 EOF
 
-EXISTING="$(gh pr list --state open --base "$BASE" --head "$BRANCH" --json number --jq '.[0].number // empty')"
+EXISTING="$(gh_pr pr list --state open --base "$BASE" --head "$BRANCH" --json number --jq '.[0].number // empty')"
 if [ -n "$EXISTING" ]; then
-    gh pr edit "$EXISTING" --title "$TITLE" --body-file "$BODY_FILE" >/dev/null
+    gh_pr pr edit "$EXISTING" --title "$TITLE" --body-file "$BODY_FILE" >/dev/null
     PR_NUMBER="$EXISTING"
     echo "== deps-lock-pr: updated PR #$PR_NUMBER =="
 else
-    PR_URL="$(gh pr create --base "$BASE" --head "$BRANCH" --title "$TITLE" --body-file "$BODY_FILE")"
+    PR_URL="$(gh_pr pr create --base "$BASE" --head "$BRANCH" --title "$TITLE" --body-file "$BODY_FILE")"
     PR_NUMBER="${PR_URL##*/}"
     echo "== deps-lock-pr: opened PR #$PR_NUMBER ($PR_URL) =="
 fi
 
 # Older bot PRs (a previous week's branch) are superseded by this one.
-STALE="$(gh pr list --state open --base "$BASE" --limit 100 --json number,headRefName \
-    --jq ".[] | select(.headRefName | startswith(\"$BRANCH_PREFIX\")) | select(.headRefName != \"$BRANCH\") | .number")"
-for stale in $STALE; do
+# `<number>\t<head branch>` per superseded bot PR.
+STALE="$(gh_pr pr list --state open --base "$BASE" --limit 100 --json number,headRefName \
+    --jq ".[] | select(.headRefName | startswith(\"$BRANCH_PREFIX\")) | select(.headRefName != \"$BRANCH\") | \"\\(.number)\\t\\(.headRefName)\"")"
+while IFS=$'\t' read -r stale stale_head; do
+    [ -n "$stale" ] || continue
     [ "$stale" = "$PR_NUMBER" ] && continue
-    gh pr close "$stale" --comment "Superseded by #$PR_NUMBER (newer lock-pair regeneration)." --delete-branch >/dev/null \
-        && echo "== deps-lock-pr: closed superseded PR #$stale ==" \
-        || echo "⚠ could not close superseded PR #$stale (continuing)" >&2
-done
+    if gh_pr pr close "$stale" --comment "Superseded by #$PR_NUMBER (newer lock-pair regeneration)." >/dev/null; then
+        echo "== deps-lock-pr: closed superseded PR #$stale =="
+    else
+        echo "⚠ could not close superseded PR #$stale (continuing)" >&2
+        continue
+    fi
+    case "$stale_head" in
+        "$BRANCH_PREFIX"*)
+            git push -q "$REMOTE" --delete "$stale_head" 2>/dev/null \
+                && echo "== deps-lock-pr: deleted superseded branch $stale_head ==" \
+                || echo "⚠ could not delete superseded branch $stale_head (continuing)" >&2 ;;
+    esac
+done <<<"$STALE"
 
 # --- 4. trigger CI on the bot branch --------------------------------------
 for wf in $DISPATCH; do
