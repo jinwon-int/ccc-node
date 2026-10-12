@@ -364,6 +364,20 @@ if [ "$MODE" = "pending-expire" ] || [ "$MODE" = "pending-restore" ]; then
   exit "$rc"
 fi
 
+# --- reindex: manual entry point for #2283 -------------------------------------
+# Same rebuild the sweep runs in step 2a'. Prints the JSON summary and exits
+# with the helper's code so an operator can heal a node's index on demand.
+if [ "$MODE" = "reindex" ]; then
+  if [ ! -f "$REVIEW" ]; then
+    echo "reindex: helper unavailable ($REVIEW)" >&2
+    exit 1
+  fi
+  out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" bash "$REVIEW" reindex)"; rc=$?
+  log "reindex manual $(printf '%s' "$out" | head -c 300)"
+  printf '%s\n' "$out"
+  exit "$rc"
+fi
+
 # --- prescreen: manual entry point for #2183 -----------------------------------
 # Same helper the sweep runs in step 2c3. `--dry-run` lists the drafts the
 # next sweep would hand to the reviewer without calling it.
@@ -434,7 +448,7 @@ if [ "$MODE" = "status" ]; then
 fi
 
 if [ "$MODE" != "run" ]; then
-  echo "usage: ccc-skill-autosave.sh [run|status|set-mode review|approve|auto|pending-expire [--dry-run]|pending-restore <name>]" >&2
+  echo "usage: ccc-skill-autosave.sh [run|status|set-mode review|approve|auto|pending-expire [--dry-run]|pending-restore <name>|prescreen [--dry-run]|reindex]" >&2
   exit 0
 fi
 
@@ -918,6 +932,18 @@ else
   fi
   after="$(pending_count)"
   log "sweep done drafted_sessions=$drafted codex_drafted=$codex_drafted piri_drafted=$piri_drafted danso_drafted=$danso_drafted pending_before=$before pending_after=$after skipped_unreviewable=$skipped_unreviewable total_drafted=$((drafted + codex_drafted + piri_drafted + danso_drafted)) max_sessions_per_branch=$MAX_SESSIONS total_max_sessions=$TOTAL_MAX_SESSIONS total_max_source=$TOTAL_MAX_SOURCE"
+fi
+
+# --- 2a') index rebuild (#2283) ----------------------------------------------
+# pending-skills/index.jsonl was 0 bytes fleet-wide (the per-draft append had
+# no `jq -n`). Rebuilding it from the queue every sweep heals every node on
+# its next nightly run without a manual visit and keeps the index honest
+# about approve/install/reject renames, which never touched it. Deterministic,
+# no provider call, non-fatal.
+if [ -f "$REVIEW" ] && [ ! -f "$STATE_DIR/skill-review.disabled" ]; then
+  summary="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" bash "$REVIEW" reindex 2>>"$LOG")" \
+    && log "reindex $(printf '%s' "$summary" | head -c 300)" \
+    || log "reindex failed (non-fatal) $(printf '%s' "$summary" | head -c 200)"
 fi
 
 # --- 2b) auto mode (#355): machine-gate + install passing drafts -------------
