@@ -5117,6 +5117,14 @@ def _approve_and_merge_promote_pr(
                 "gh", "pr", "merge", pr, "--repo", config.repo,
                 "--squash", "--match-head-commit", approved_head,
             ]
+    if not approved_head and str(payload.get("mergeStateStatus") or "") == "BLOCKED":
+        # Branch protection still wants something this sweep did not provide
+        # (a review, typically). On a repo with auto-merge allowed, `gh pr
+        # merge` would not fail here: it enables auto-merge and exits 0, and
+        # the ledger used to record that as MERGED — hiding a still-open
+        # batch from `_open_promote_prs`, which then opened a duplicate every
+        # tick (fleet-skills #435–#456, #2264). Wait for the human instead.
+        return [*out, {"outcome": "waiting-review", "pr": pr}]
     try:
         _run(merge_argv)
     except PromotionError as error:
@@ -5126,12 +5134,41 @@ def _approve_and_merge_promote_pr(
         # next sweep's live read records the terminal state (and a still-
         # queued PR re-enqueues as a no-op, its approval already recorded).
         return [*out, {"outcome": "promote-pr-merge-requested", "pr": pr, "head_sha": approved_head}]
-    _append_ledger(
-        config,
-        {"ts": _utc_now(), "kind": _PROMOTE_PR_KIND, "pr": pr,
-         "state": "MERGED", "url": row.get("url")},
-    )
-    return [*out, {"outcome": "promote-pr-merged", "pr": pr}]
+    # `gh pr merge` exiting 0 is not proof of a merge: it also returns 0 after
+    # enqueueing (merge queue) or after enabling auto-merge. Record MERGED only
+    # when GitHub says so; anything else leaves the row OPEN for the next
+    # sweep's live read (#2264).
+    landed = _promote_merge_landed(config, pr)
+    if landed is None:
+        return [*out, {"outcome": "promote-pr-merge-unverified", "pr": pr}]
+    state, auto_merge = landed
+    if state == "MERGED":
+        _append_ledger(
+            config,
+            {"ts": _utc_now(), "kind": _PROMOTE_PR_KIND, "pr": pr,
+             "state": "MERGED", "url": row.get("url")},
+        )
+        return [*out, {"outcome": "promote-pr-merged", "pr": pr}]
+    if auto_merge:
+        return [*out, {"outcome": "promote-pr-auto-merge-enabled", "pr": pr}]
+    return [*out, {"outcome": "promote-pr-merge-pending", "pr": pr, "state": state}]
+
+
+def _promote_merge_landed(config: Config, pr: str) -> tuple[str, bool] | None:
+    """Live ``(state, auto_merge_enabled)`` of a promote PR right after a merge
+    attempt, or None when GitHub cannot be read (then nothing is recorded)."""
+    try:
+        viewed = _run([
+            "gh", "pr", "view", pr, "--repo", config.repo,
+            "--json", "state,autoMergeRequest",
+        ])
+        payload = json.loads(viewed.stdout.decode("utf-8"))
+    except (PromotionError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    state = str(payload.get("state") or "")
+    if state not in {"OPEN", "CLOSED", "MERGED"}:
+        return None
+    return state, bool(payload.get("autoMergeRequest"))
 
 
 # #2239 L3 — policy-gated approval of mechanical promote PRs. The owner's

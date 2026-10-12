@@ -854,7 +854,16 @@ ssh_target_set, blocker}` — presence only, never the target or path.
   --match-head-commit HEAD` (the merge queue enqueues; `--delete-branch` is
   omitted because gh refuses it on a merge-queue branch and the repo deletes
   merged heads itself; never `--admin`) → `promote-pr-merge-requested`; the next
-  sweep's live read records `MERGED`. Not configured →
+  sweep's live read records `MERGED`. Without an approval of its own (`off` or
+  `dry-run`) the sweep does not call `gh pr merge` on a PR whose
+  `mergeStateStatus` is `BLOCKED` (branch protection still wants a review) →
+  `waiting-review`; on a repo that allows auto-merge gh would otherwise enable
+  auto-merge and exit 0, which the sweep once recorded as `MERGED` and then
+  opened a duplicate batch every tick (fleet-skills #435–#456, #2264). After any
+  merge call the sweep re-reads `state,autoMergeRequest` live and records
+  `MERGED` only when GitHub says so; an OPEN result is
+  `promote-pr-auto-merge-enabled` / `promote-pr-merge-pending` (row stays OPEN),
+  an unreadable one `promote-pr-merge-unverified`. Not configured →
   `approve-not-configured` (`approve_cmd_missing`, `approve_ssh_target_unset`).
   Relay failure → `approve-failed` with an exit code, a ledger row, and today's
   merge attempt; at most 3 failed attempts per head.

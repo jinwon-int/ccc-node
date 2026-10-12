@@ -163,7 +163,12 @@ class SupersedeSweepTests(unittest.TestCase):
 
 
 class PromoteMergeSweepTests(unittest.TestCase):
-    def sweep(self, rows, *, view=None, dry_run=False, enabled=True, merge_fails=False):
+    def sweep(self, rows, *, view=None, dry_run=False, enabled=True, merge_fails=False,
+              after_merge=None):
+        """`after_merge` is the live `gh pr view` payload once `gh pr merge`
+        returned 0 (#2264). Default: GitHub reports the PR MERGED, i.e. a
+        direct squash landed. Pass an OPEN payload (with or without
+        `autoMergeRequest`) to model a merge queue / auto-merge enable."""
         written: list[dict] = []
         calls: list[list[str]] = []
         payload = view or {
@@ -173,13 +178,18 @@ class PromoteMergeSweepTests(unittest.TestCase):
             "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}],
             "state": "OPEN",
         }
+        post_merge = after_merge or {"state": "MERGED", "autoMergeRequest": None}
+        merged = {"called": False}
 
         def fake_run(args, **kwargs):
             calls.append(list(args))
             if args[:3] == ["gh", "pr", "view"]:
-                return types.SimpleNamespace(stdout=json.dumps(payload).encode())
-            if args[:3] == ["gh", "pr", "merge"] and merge_fails:
-                raise promotion.PromotionError("merge_denied")
+                live = post_merge if merged["called"] else payload
+                return types.SimpleNamespace(stdout=json.dumps(live).encode())
+            if args[:3] == ["gh", "pr", "merge"]:
+                if merge_fails:
+                    raise promotion.PromotionError("merge_denied")
+                merged["called"] = True
             return types.SimpleNamespace(stdout=b"")
 
         cfg = types.SimpleNamespace(
@@ -219,9 +229,55 @@ class PromoteMergeSweepTests(unittest.TestCase):
         self.assertEqual([r["outcome"] for r in out], ["promote-pr-merged"])
         self.assertEqual(written[0]["state"], "MERGED")
         verbs = [c[2] for c in calls if c[:2] == ["gh", "pr"]]
-        self.assertEqual(verbs, ["view", "ready", "merge"])
-        self.assertIn("--squash", calls[-1])
-        self.assertNotIn("--admin", calls[-1])
+        # The trailing view is the #2264 live confirmation of the merge.
+        self.assertEqual(verbs, ["view", "ready", "merge", "view"])
+        merge = [c for c in calls if c[:3] == ["gh", "pr", "merge"]][0]
+        self.assertIn("--squash", merge)
+        self.assertNotIn("--admin", merge)
+
+    def test_auto_merge_enabled_is_not_recorded_as_merged(self) -> None:
+        # fleet-skills allows auto-merge: on a PR that cannot land yet, `gh pr
+        # merge` enables auto-merge and exits 0. That used to be written to the
+        # ledger as MERGED, hiding the open batch and opening a duplicate every
+        # tick (fleet-skills #435–#456, #2264).
+        auto = {"enabledAt": "2026-10-11T23:30:20Z"}
+        out, written, calls = self.sweep(
+            [self.open_promote()], after_merge={"state": "OPEN", "autoMergeRequest": auto},
+        )
+        self.assertEqual([r["outcome"] for r in out], ["promote-pr-auto-merge-enabled"])
+        self.assertEqual(written, [], "the row must stay OPEN for _open_promote_prs")
+        verbs = [c[2] for c in calls if c[:2] == ["gh", "pr"]]
+        self.assertEqual(verbs, ["view", "ready", "merge", "view"])
+
+    def test_queued_merge_stays_pending_without_a_ledger_row(self) -> None:
+        out, written, _ = self.sweep(
+            [self.open_promote()], after_merge={"state": "OPEN", "autoMergeRequest": None},
+        )
+        self.assertEqual([r["outcome"] for r in out], ["promote-pr-merge-pending"])
+        self.assertEqual(written, [])
+
+    def test_unreadable_post_merge_view_records_nothing(self) -> None:
+        out, written, _ = self.sweep(
+            [self.open_promote()], after_merge={"state": "WEIRD"},
+        )
+        self.assertEqual([r["outcome"] for r in out], ["promote-pr-merge-unverified"])
+        self.assertEqual(written, [])
+
+    def test_blocked_by_branch_protection_waits_for_review(self) -> None:
+        # REVIEW_REQUIRED shows as mergeable=MERGEABLE + mergeStateStatus=BLOCKED.
+        # Without an approval of our own there is nothing to merge: do not call
+        # `gh pr merge` (it would enable auto-merge) and leave the row OPEN.
+        out, written, calls = self.sweep(
+            [self.open_promote()],
+            view={
+                "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+                "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}],
+                "state": "OPEN",
+            },
+        )
+        self.assertEqual([r["outcome"] for r in out], ["waiting-review"])
+        self.assertEqual(written, [])
+        self.assertEqual([c[2] for c in calls if c[:2] == ["gh", "pr"]], ["view"])
 
     def test_pending_checks_do_not_merge(self) -> None:
         out, written, _ = self.sweep(
@@ -314,7 +370,7 @@ class PromoteAutoApproveTests(unittest.TestCase):
 
     def sweep(self, *, mode="true", rows=None, diff=None, view=None, ssh_target="relay-node",
               approve_rc=0, approve_out=None, merge_fails=False, head_after=None,
-              cmd_present=True, spool=None):
+              cmd_present=True, spool=None, after_merge=None):
         written: list[dict] = []
         calls: list[list[str]] = []
         envs: list[dict] = []
@@ -325,18 +381,25 @@ class PromoteAutoApproveTests(unittest.TestCase):
         }
         diff_text = aa_diff(aa_files()) if diff is None else diff
         views = {"n": 0}
+        # Live view after `gh pr merge` returned 0 (#2264); default = landed.
+        post_merge = after_merge or {"state": "MERGED", "autoMergeRequest": None}
+        merged = {"called": False}
 
         def fake_run(args, **kwargs):
             calls.append(list(args))
             if args[:3] == ["gh", "pr", "view"]:
+                if merged["called"]:
+                    return types.SimpleNamespace(stdout=json.dumps(post_merge).encode())
                 views["n"] += 1
                 if views["n"] > 1 and head_after is not None:
                     return types.SimpleNamespace(stdout=json.dumps({"headRefOid": head_after}).encode())
                 return types.SimpleNamespace(stdout=json.dumps(payload).encode())
             if args[:3] == ["gh", "pr", "diff"]:
                 return types.SimpleNamespace(stdout=diff_text.encode())
-            if args[:3] == ["gh", "pr", "merge"] and merge_fails:
-                raise promotion.PromotionError("merge_denied")
+            if args[:3] == ["gh", "pr", "merge"]:
+                if merge_fails:
+                    raise promotion.PromotionError("merge_denied")
+                merged["called"] = True
             if args[:2] == ["bash", AA_SCRIPT]:
                 envs.append(dict(kwargs.get("env") or {}))
                 out = approve_out if approve_out is not None else json.dumps(
@@ -387,7 +450,8 @@ class PromoteAutoApproveTests(unittest.TestCase):
     def test_off_is_the_pre_l3_flow(self) -> None:
         out, written, calls, _ = self.sweep(mode="off")
         self.assertEqual(self.outcomes(out), ["promote-pr-merged"])
-        self.assertEqual(self.verbs(calls), ["view", "merge"])
+        # Trailing view = #2264 live confirmation that the merge landed.
+        self.assertEqual(self.verbs(calls), ["view", "merge", "view"])
         self.assertNotIn("--delete-branch", self.merge_call(calls))
         self.assertNotIn("--match-head-commit", self.merge_call(calls))
         self.assertEqual([r["kind"] for r in written], ["a2a-promote-pr"])
@@ -404,6 +468,32 @@ class PromoteAutoApproveTests(unittest.TestCase):
         self.assertIn("ts", aa[0])
         # today's merge attempt is unchanged
         self.assertNotIn("--delete-branch", self.merge_call(calls))
+
+    def test_dry_run_on_a_review_blocked_pr_never_calls_merge(self) -> None:
+        # The fleet-skills #435–#456 shape (#2264): dry-run approves nothing,
+        # branch protection still wants a review (BLOCKED). The old sweep ran
+        # `gh pr merge`, gh enabled auto-merge, and MERGED was recorded.
+        blocked = {
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}],
+            "state": "OPEN", "headRefOid": AA_HEAD, "reviewRequests": [],
+        }
+        out, written, calls, _ = self.sweep(mode="dry-run", view=blocked)
+        self.assertEqual(self.outcomes(out), ["would-approve-promote-pr", "waiting-review"])
+        self.assertNotIn("merge", self.verbs(calls))
+        self.assertFalse([r for r in written if r.get("state") == "MERGED"])
+
+    def test_true_on_a_review_blocked_pr_approves_then_merges(self) -> None:
+        # The approval is exactly what BLOCKED was waiting for, so the merge
+        # (enqueue) still goes ahead on the approved head.
+        blocked = {
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}],
+            "state": "OPEN", "headRefOid": AA_HEAD, "reviewRequests": [],
+        }
+        out, _, calls, _ = self.sweep(mode="true", view=blocked)
+        self.assertEqual(self.outcomes(out), ["promote-autoapproved", "promote-pr-merge-requested"])
+        self.assertIn("--match-head-commit", self.merge_call(calls))
 
     def test_dry_run_already_recorded_for_head_is_not_rescanned(self) -> None:
         rows = [self.promote_row(), {"kind": "a2a-promote-autoapprove", "pr": "999",
