@@ -177,6 +177,20 @@ for bad in 0 1.5 abc -0.5; do
     '[ "$rc" = 2 ] && ! grep -q "NUNCHI_JUDGE_MIN_CONFIDENCE=$bad " "$cron_store"'
 done
 
+# --- #2271: auto-mode judge is Claude-only; the GPT fallback is opt-in -------
+out="$(run_install --apply --codex --judge 2>&1)"; rc=$?
+ok "a Codex-runtime node stamps NUNCHI_JUDGE_PROVIDER=codex on the judge line" \
+  '[ "$rc" = 0 ] && grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_PROVIDER=codex "'
+out="$(run_install --apply --claude --judge 2>&1)"; rc=$?
+ok "a Claude node keeps auto (no provider stamp) and no Codex fallback" \
+  '[ "$rc" = 0 ] && ! grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_PROVIDER=" && ! grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_CODEX_FALLBACK"'
+out="$(CCC_NUNCHI_JUDGE_CODEX_FALLBACK=1 run_install --apply --claude --judge 2>&1)"; rc=$?
+ok "CCC_NUNCHI_JUDGE_CODEX_FALLBACK=1 opts the judge line into the Codex fallback" \
+  '[ "$rc" = 0 ] && grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_CODEX_FALLBACK=1 "'
+out="$(CCC_NUNCHI_JUDGE_CODEX_FALLBACK=yes run_install --apply --claude --judge 2>&1)"; rc=$?
+ok "an invalid CCC_NUNCHI_JUDGE_CODEX_FALLBACK is a hard error (exit 2)" '[ "$rc" = 2 ]'
+run_install --apply --codex --judge >/dev/null 2>&1
+
 # --- APPLY mode (#1264): dry-run is the default and apply is opt-in per node.
 # The flag exists so an approved apply pilot SURVIVES a re-apply — before it,
 # the only way to enable apply was hand-editing the managed cron line, which

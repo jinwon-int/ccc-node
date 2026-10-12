@@ -7,7 +7,7 @@ an LLM is not needed for. So the batch FIRST re-runs the write gate's own
 sibling-conflict rule (G3, _conflict_review: same-observed open sibling with
 >= 0.6 token overlap) at batch time. An item with no live conflicting sibling
 is cleared without any LLM call; only items with a live conflict go to the
-judge (Claude-first, isolated Codex fallback, strict rubric). The semantic
+judge (Claude, opt-in isolated Codex fallback #2271, strict rubric). The semantic
 contract is nunchi.py's
 write gate itself — this script imports it instead of copying the rule, so the
 two can never drift.
@@ -32,6 +32,9 @@ Guard rails (issue #1204 contract):
   second copy of the rule in SQL, and clears itself the moment the owner
   supplies the reason.
 - judge failure / unparseable verdict is fail-closed (human-approval)
+- auto mode never spends GPT unless NUNCHI_JUDGE_CODEX_FALLBACK=1 (#2271);
+  Claude verdicts use CLI structured output (NUNCHI_JUDGE_CLAUDE_STRUCTURED=0
+  opts out)
 - NUNCHI_JUDGE_APPLY=1 to mutate; default is dry-run
 - NUNCHI_JUDGE_PROVIDER=typesafe swaps the free-text JSON contract for a typed
   decision (TypeSafe Jev): the backend returns a chosen verdict plus a
@@ -96,6 +99,19 @@ JUDGE_MODEL = os.environ.get("NUNCHI_JUDGE_MODEL", "haiku")
 # 200-char contract.
 JUDGE_EFFORT = os.environ.get("NUNCHI_JUDGE_EFFORT", "low").strip() or "low"
 JUDGE_CODEX_MODEL = os.environ.get("NUNCHI_JUDGE_CODEX_MODEL", "").strip()
+# #2271 — auto mode is Claude-only unless the Codex/GPT fallback is opted into.
+# Measured after #2249/#2251: every remaining auto-mode GPT call was a Claude
+# verdict that failed the free-text contract, not a Claude outage. The owner
+# decision (2026-10-12) is that auxiliary pipelines do not silently spend GPT;
+# a failed Claude verdict fails closed to human instead. An explicit
+# NUNCHI_JUDGE_PROVIDER=codex (a Codex-primary node) is unaffected.
+JUDGE_CODEX_FALLBACK = os.environ.get("NUNCHI_JUDGE_CODEX_FALLBACK", "0").strip() == "1"
+# #2271 — Claude verdicts use the CLI's structured output (--json-schema), so
+# the key set is enforced by the CLI instead of hoped for in prose. Opt-out
+# for a CLI without the flag.
+JUDGE_CLAUDE_STRUCTURED = (
+    os.environ.get("NUNCHI_JUDGE_CLAUDE_STRUCTURED", "1").strip() != "0"
+)
 JUDGE_SCHEMA = os.path.join(HERE, "judge-verdict.schema.json")
 AUDIT = os.path.join(HOME_DIR, "judge-audit.jsonl")
 REPORT = os.path.join(STATE, "nunchi-review-report.md")
@@ -491,9 +507,10 @@ def judge_candidates():
     """Ordered provider commands; unknown configuration has no candidates.
 
     An explicit command keeps the pre-#1278 single-backend override semantics.
-    With no override, auto mode is Claude-first and only falls back to Codex
-    after an invocation/output failure. A valid `human` verdict is a result,
-    not a failure, so it never spends a second model call.
+    With no override, auto mode is Claude-only; it falls back to Codex after
+    an invocation/output failure only when NUNCHI_JUDGE_CODEX_FALLBACK=1
+    (#2271 — opt-in, so no auxiliary GPT spend by default). A valid `human`
+    verdict is a result, not a failure, so it never spends a second model call.
 
     `typesafe` (Jev) is opt-in only and deliberately NOT part of `auto`: auto is
     what every unattended cron already runs, and silently re-routing it the
@@ -513,9 +530,11 @@ def judge_candidates():
         provider = (JUDGE_PROVIDER if JUDGE_PROVIDER != "auto"
                     else (_provider_for_command(JUDGE_CMD_OVERRIDE) or "claude"))
         return [(provider, JUDGE_CMD_OVERRIDE)]
-    providers = (
-        ("claude", "codex") if JUDGE_PROVIDER == "auto" else (JUDGE_PROVIDER,)
-    )
+    if JUDGE_PROVIDER == "auto":
+        # #2271: the GPT fallback is opt-in; default auto is Claude-only.
+        providers = ("claude", "codex") if JUDGE_CODEX_FALLBACK else ("claude",)
+    else:
+        providers = (JUDGE_PROVIDER,)
     return [(provider, provider) for provider in providers]
 
 
@@ -638,9 +657,16 @@ def _claude_judge(command, prompt):
         "--model", JUDGE_MODEL,
         "--effort", JUDGE_EFFORT,
         "--no-session-persistence",
-        "--output-format", "text",
-        "--append-system-prompt", JUDGE_SYSTEM,
     ]
+    schema = _claude_schema_argument() if JUDGE_CLAUDE_STRUCTURED else None
+    if schema:
+        # #2271: CLI-enforced key set. Haiku dropped a null supersede_proposal
+        # key in free text, which failed the contract and spent the GPT
+        # fallback; structured output always carries it.
+        argv.extend(("--output-format", "json", "--json-schema", schema))
+    else:
+        argv.extend(("--output-format", "text"))
+    argv.extend(("--append-system-prompt", JUDGE_SYSTEM))
     try:
         proc = subprocess.run(
             argv,
@@ -658,7 +684,53 @@ def _claude_judge(command, prompt):
         return None, f"exit-{proc.returncode}" + (f":{cls}" if cls else "")
     if not proc.stdout.strip():
         return None, "empty"
+    if schema:
+        return _claude_structured_payload(proc.stdout)
     return proc.stdout, None
+
+
+def _claude_schema_argument():
+    """The verdict schema as a --json-schema argument, or None when unusable.
+
+    The CLI rejects the draft-2020-12 ``$schema`` meta reference ("no schema
+    with key or ref"), so it is dropped; the contract itself is unchanged.
+    """
+    try:
+        with open(JUDGE_SCHEMA, encoding="utf-8") as fh:
+            schema = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(schema, dict):
+        return None
+    schema.pop("$schema", None)
+    return json.dumps(schema, separators=(",", ":"))
+
+
+def _claude_structured_payload(stdout):
+    """Unwrap the ``--output-format json`` result envelope.
+
+    ``structured_output`` (schema-validated by the CLI) wins; otherwise the
+    free-text ``result`` goes through the normal strict parser. Output that is
+    not an envelope at all (an older CLI or a wrapper printing the verdict
+    directly) is passed through unchanged for the same parser.
+    """
+    try:
+        envelope = json.loads(stdout)
+    except ValueError:
+        return stdout, None
+    if not isinstance(envelope, dict) or not (
+        "structured_output" in envelope or envelope.get("type") == "result"
+    ):
+        return stdout, None
+    if envelope.get("is_error"):
+        return None, "result-error"
+    structured = envelope.get("structured_output")
+    if isinstance(structured, dict):
+        return json.dumps(structured, ensure_ascii=False), None
+    result = envelope.get("result")
+    if isinstance(result, str) and result.strip():
+        return result, None
+    return None, "empty"
 
 
 def _codex_environment(private_root):

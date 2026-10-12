@@ -48,6 +48,12 @@ case "$JUDGE_PROVIDER" in
   ""|auto|claude|codex|danso|typesafe) ;;
   *) echo "CCC_NUNCHI_JUDGE_PROVIDER='$JUDGE_PROVIDER' invalid (auto|claude|codex|danso|typesafe)" >&2; exit 2 ;;
 esac
+# #2271 — auto-mode judge never falls back to Codex/GPT unless opted in here.
+JUDGE_CODEX_FALLBACK="${CCC_NUNCHI_JUDGE_CODEX_FALLBACK:-0}"
+case "$JUDGE_CODEX_FALLBACK" in
+  0|1) ;;
+  *) echo "CCC_NUNCHI_JUDGE_CODEX_FALLBACK='$JUDGE_CODEX_FALLBACK' invalid (0|1)" >&2; exit 2 ;;
+esac
 # Confidence gate for apply-mode verdicts (judge-batch reads it at runtime).
 # 0.0 = gate off (the default); a stamped value must be a sane float in (0,1].
 JUDGE_MIN_CONFIDENCE="${CCC_NUNCHI_JUDGE_MIN_CONFIDENCE:-}"
@@ -135,6 +141,7 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
     CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC="${CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC:-3300}" \
     CCC_NUNCHI_JUDGE="$JUDGE" CCC_NUNCHI_JUDGE_APPLY="$JUDGE_APPLY" \
     CCC_NUNCHI_JUDGE_PROVIDER="$JUDGE_PROVIDER" CCC_NUNCHI_JUDGE_MIN_CONFIDENCE="$JUDGE_MIN_CONFIDENCE" \
+    CCC_NUNCHI_JUDGE_CODEX_FALLBACK="$JUDGE_CODEX_FALLBACK" \
     NUNCHI_SWEEP_DIR="${NUNCHI_SWEEP_DIR:-}" \
     bash "$0" "${ORIGINAL_ARGS[@]}"
 fi
@@ -762,7 +769,12 @@ case "$ACTION" in
       if [ "$JUDGE_APPLY" = 1 ]; then judge_apply_env="NUNCHI_JUDGE_APPLY=1 "; fi
       judge_provider_env=""
       if [ -z "$JUDGE_PROVIDER" ] && [ "$resolved_provider" = danso ]; then JUDGE_PROVIDER=danso; fi
+      # #2271: auto mode is Claude-only now, so a Codex-runtime node judges
+      # with its own runtime instead of failing closed on a Claude it may not
+      # be logged in to.
+      if [ -z "$JUDGE_PROVIDER" ] && [ "$resolved_provider" = codex ]; then JUDGE_PROVIDER=codex; fi
       if [ -n "$JUDGE_PROVIDER" ] && [ "$JUDGE_PROVIDER" != auto ]; then judge_provider_env="NUNCHI_JUDGE_PROVIDER=$JUDGE_PROVIDER "; fi
+      if [ "$JUDGE_CODEX_FALLBACK" = 1 ]; then judge_provider_env+="NUNCHI_JUDGE_CODEX_FALLBACK=1 "; fi
       if [ "$JUDGE_PROVIDER" = danso ]; then
         judge_provider_env+="CCC_NUNCHI_JUDGE_BRIDGE_ROOT=$(cron_quote "$(cd "$NUNCHI_SELF_DIR/.." && pwd)") "
       fi
