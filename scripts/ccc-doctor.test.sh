@@ -1394,6 +1394,27 @@ ok "plain file with a real upstream is 정상" \
 dn_out="$(dn_json "$dn/resolv.tailscale" "$dn/bin/getent-ok" "$dn/bin/resolvectl-up" "$dn/no-such-state")"
 ok "no tailscale state is 해당 없음 even on a MagicDNS-only file" \
   'jq -e ".rows[] | select(.item == \"dns resolver mode\" and .class == \"정상\") | .status | contains(\"해당 없음\")" <<<"$dn_out" >/dev/null'
+# #2268: /var/lib/tailscale is 0700 root, so a non-root doctor (User=<user> bridge)
+# got PermissionError from Path.exists() and the whole run aborted with a
+# traceback. A 000 directory reproduces that for a non-root user; root bypasses
+# directory permissions, so the case is skipped there.
+mkdir -p "$dn/locked" && : > "$dn/locked/tailscaled.state" && chmod 000 "$dn/locked"
+if [ "$(id -u)" != 0 ]; then
+  dn_out="$(dn_json "$dn/resolv.stub" "$dn/bin/getent-ok" "$dn/bin/resolvectl-up" "$dn/locked/tailscaled.state" 2>"$dn/locked.err")"
+  # shellcheck disable=SC2034  # dn_rc is read via eval inside ok()
+  dn_rc=$?
+  ok "unreadable tailscale state does not abort the doctor (#2268)" \
+    '[ "$dn_rc" = 0 ] && ! grep -q Traceback "$dn/locked.err" && jq -e ".rows[] | select(.item == \"dns resolution\")" <<<"$dn_out" >/dev/null'
+  ok "unreadable tailscale state with a clean resolv.conf is a 확인 불가 경고" \
+    'jq -e ".rows[] | select(.item == \"dns resolver mode\" and .class == \"경고\") | (.status | contains(\"확인 불가\") and contains(\"systemd-resolved stub\")) and (.action | contains(\"#2268\"))" <<<"$dn_out" >/dev/null'
+  # shellcheck disable=SC2034  # dn_out is read via eval inside ok()
+  dn_out="$(dn_json "$dn/resolv.tailscale" "$dn/bin/getent-ok" "$dn/bin/resolvectl-up" "$dn/locked/tailscaled.state")"
+  ok "unreadable tailscale state still flags the #2207 MagicDNS-only shape" \
+    'jq -e ".rows[] | select(.item == \"dns resolver mode\" and .class == \"경고\") | (.status | contains(\"tailscale-written\") and contains(\"SERVFAIL\"))" <<<"$dn_out" >/dev/null'
+else
+  echo "skip: #2268 unreadable-state cases need a non-root user"
+fi
+chmod 700 "$dn/locked"
 # shellcheck disable=SC2034  # dn_out is read via eval inside ok()
 dn_out="$(DN_PROBE_HOST='' dn_json "$dn/resolv.stub" "$dn/bin/getent-fail" "$dn/bin/resolvectl-up")"
 ok "empty probe host disables the resolution probe" \
