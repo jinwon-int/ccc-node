@@ -9,7 +9,7 @@
 python-telegram-bot==22.8
 telegramify-markdown==1.4.0
 python-dotenv==1.2.4
-pydantic==2.14.1
+pydantic==2.13.5
 pydantic-settings==2.15.0
 claude-agent-sdk==0.2.165
 opentelemetry-api==1.45.1
