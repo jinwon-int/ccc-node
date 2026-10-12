@@ -26,6 +26,8 @@ cat > "$TMP/bin/gh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "${FAKE_GH_LOG:?}"
+# which token each call ran under (#2276: PR writes vs. everything else)
+printf '%s %s tok=%s\n' "${1:-}" "${2:-}" "${GH_TOKEN:-none}" >> "${FAKE_GH_TOKLOG:-/dev/null}"
 case "${1:-} ${2:-}" in
   "pr list")
     case " $* " in
@@ -119,13 +121,14 @@ LOCK
 run() { # <repo> <args...>  (stdout+stderr -> $TMP/out, rc -> $rc, job summary -> $TMP/summary.md)
   local work="$1"; shift
   export FAKE_GH_LOG="$TMP/gh.log" FAKE_GH_BODY="$TMP/body.md" FAKE_LOCK_ARGS="$TMP/lock.args" \
-    FAKE_GH_LIST_COUNT="$TMP/gh.list-count"
-  : > "$FAKE_GH_LOG"; : > "$TMP/summary.md"; rm -f "$FAKE_GH_BODY" "$FAKE_LOCK_ARGS" "$FAKE_GH_LIST_COUNT"
+    FAKE_GH_LIST_COUNT="$TMP/gh.list-count" FAKE_GH_TOKLOG="$TMP/gh.tok"
+  : > "$FAKE_GH_LOG"; : > "$FAKE_GH_TOKLOG"; : > "$TMP/summary.md"; rm -f "$FAKE_GH_BODY" "$FAKE_LOCK_ARGS" "$FAKE_GH_LIST_COUNT"
   # One look at the pull_request runs, no waiting, unless a case sets its own.
   (cd "$work" && CCC_DEPS_LOCK_SCRIPT="$TMP/lock.sh" CCC_DEPS_LOCK_PR_DATE=20260905 \
       CCC_DEPS_LOCK_PR_APPROVE_WAIT="${CCC_DEPS_LOCK_PR_APPROVE_WAIT-0}" \
       CCC_DEPS_LOCK_PR_APPROVE_POLL="${CCC_DEPS_LOCK_PR_APPROVE_POLL-1}" \
-      GITHUB_STEP_SUMMARY="$TMP/summary.md" \
+      GITHUB_STEP_SUMMARY="$TMP/summary.md" GH_TOKEN=job-tok \
+      CCC_DEPS_LOCK_PR_GH_TOKEN="${CCC_DEPS_LOCK_PR_GH_TOKEN-}" \
       bash scripts/ccc-deps-lock-pr.sh "$@") > "$TMP/out" 2>&1
   rc=$?
 }
@@ -168,14 +171,38 @@ check "summary names the PR and head" 'grep -q "PR #77 head ${HEAD_SHA:0:12}" "$
 # --- 3. same-day rerun: existing PR updated, branch force-refreshed, stale closed
 FIRST_SHA="$HEAD_SHA"
 git -C "$W" switch -q main
-FAKE_LOCK_MODE=bump FAKE_EXISTING_PR=55 FAKE_STALE_PRS=$'41\n42' run "$W"
+git -C "$W" push -q origin main:refs/heads/deps/lock-pair-20260829 main:refs/heads/deps/lock-pair-20260822
+FAKE_LOCK_MODE=bump FAKE_EXISTING_PR=55 \
+  FAKE_STALE_PRS=$'41\tdeps/lock-pair-20260829\n42\tdeps/lock-pair-20260822' run "$W"
 check "rerun exits 0" '[ "$rc" -eq 0 ]'
 check "rerun edits the existing PR" 'grep -q "^pr edit 55 --title deps: regenerate lock pair (2026-09-05) --body-file " "$TMP/gh.log"'
 check "rerun does not create a PR" '! grep -q "^pr create" "$TMP/gh.log"'
 check "rerun force-refreshes the branch (new head, single commit over main)" \
   '[ "$(git -C "$TMP/bump.git" rev-parse refs/heads/deps/lock-pair-20260905)" != "$FIRST_SHA" ] && [ "$(git -C "$W" rev-list --count main..HEAD)" -eq 1 ]'
 check "stale bot PRs closed as superseded" 'grep -q "^pr close 41 --comment Superseded by #55" "$TMP/gh.log" && grep -q "^pr close 42 --comment Superseded by #55" "$TMP/gh.log"'
+# #2276: the PR writer (a GitHub App with contents: read) cannot delete
+# branches, so the close carries no --delete-branch and the bot branch goes
+# through git push --delete on the checkout credentials instead.
+check "stale close no longer asks gh to delete the branch" '! grep -q -- "--delete-branch" "$TMP/gh.log"'
+check "stale bot branches deleted with git push --delete" \
+  '! git -C "$TMP/bump.git" show-ref --verify -q refs/heads/deps/lock-pair-20260829 && ! git -C "$TMP/bump.git" show-ref --verify -q refs/heads/deps/lock-pair-20260822'
+check "current bot branch survives the stale sweep" 'git -C "$TMP/bump.git" show-ref --verify -q refs/heads/deps/lock-pair-20260905'
+check "without a PR-writer token every gh call keeps GH_TOKEN" '! grep -vq "tok=job-tok$" "$TMP/gh.tok"'
 check "rerun records upgrade-all mode" 'git -C "$W" log -1 --format=%B | grep -q "Mode: upgrade-all"'
+
+# --- 3b. PR-writer token (#2276): PR calls use it, the rest keeps GH_TOKEN --
+W="$(fresh_repo apptoken)"
+git -C "$W" push -q origin main:refs/heads/deps/lock-pair-20260829
+CCC_DEPS_LOCK_PR_GH_TOKEN=app-tok FAKE_LOCK_MODE=bump \
+  FAKE_STALE_PRS=$'41\tdeps/lock-pair-20260829' FAKE_GH_RUNS=$'900\t.github/workflows/ci.yml' run "$W"
+check "app token: exits 0" '[ "$rc" -eq 0 ]'
+check "app token: pr list/create/close run under the PR-writer token" \
+  'grep -qx "pr list tok=app-tok" "$TMP/gh.tok" && grep -qx "pr create tok=app-tok" "$TMP/gh.tok" && grep -qx "pr close tok=app-tok" "$TMP/gh.tok"'
+check "app token: no PR call falls back to GH_TOKEN" '! grep -q "^pr .* tok=job-tok$" "$TMP/gh.tok"'
+check "app token: dispatch keeps GH_TOKEN" '[ "$(grep -c "^workflow run tok=job-tok$" "$TMP/gh.tok")" -eq 2 ] && ! grep -q "^workflow run tok=app-tok" "$TMP/gh.tok"'
+check "app token: run approval keeps GH_TOKEN" 'grep -q "^api .* tok=job-tok$" "$TMP/gh.tok" && ! grep -q "^api .* tok=app-tok" "$TMP/gh.tok"'
+check "app token: stale branch still deleted via git" '! git -C "$TMP/apptoken.git" show-ref --verify -q refs/heads/deps/lock-pair-20260829'
+check "app token: the token value never reaches the log" '! grep -q app-tok "$TMP/out"'
 
 # --- 4. dry run: regenerate + table, no branch/push/gh ---------------------
 W="$(fresh_repo dry)"

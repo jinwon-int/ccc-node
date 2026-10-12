@@ -128,7 +128,23 @@ logic in `scripts/ccc-deps-lock-pr.sh`, tested by
    force-refreshed on a same-day rerun — force-push is confined to that
    prefix), opens or updates the PR against `main` with a per-package pin
    table and `Refs #1483`, and closes any older open `deps/lock-pair-*` PR as
-   superseded;
+   superseded (its branch is deleted with `git push --delete`);
+
+   **PR writer (#2276).** Since 2026-09-14 the repository setting "Allow
+   GitHub Actions to create and approve pull requests" is off
+   (`can_approve_pull_request_reviews=false`), and it stays off: the same
+   switch would let every workflow's `GITHUB_TOKEN` approve PRs. The PR
+   writes (`gh pr list/create/edit/close`) therefore run under a one-hour
+   installation token of the org-owned **`jinwon-deps-bot`** GitHub App
+   (`pull_requests: write`, `contents: read`, installed on this repository
+   only), minted per run by `actions/create-github-app-token` from repo
+   variable `DEPS_BOT_APP_CLIENT_ID` and secret `DEPS_BOT_APP_PRIVATE_KEY`
+   and handed to the script as `CCC_DEPS_LOCK_PR_GH_TOKEN`. Pushes, branch
+   deletes, dispatch and run approval keep `GITHUB_TOKEN`, whose
+   `pull-requests` scope is now `read`. Missing credentials fail the run
+   with an error naming #2276. Key rotation: generate a new key under the
+   App's *Credentials → Key pairs*, `gh secret set DEPS_BOT_APP_PRIVATE_KEY`,
+   then delete the old key there;
 4. dispatches `ci.yml` and `codeql.yml` on the branch. Pushes and PRs made
    with `GITHUB_TOKEN` never trigger `pull_request`/`push` workflows, but
    `workflow_dispatch` does, and check runs attach to the head SHA under the

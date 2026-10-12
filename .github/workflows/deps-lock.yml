@@ -51,7 +51,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write       # push deps/lock-pair-<date>
-      pull-requests: write  # open/update/close the bot PR
+      pull-requests: read   # PR writes go through the deps-bot App token (#2276)
       actions: write        # gh workflow run ci.yml / codeql.yml --ref <branch>;
                             # also POST /actions/runs/<id>/approve for the PR's
                             # own action_required pull_request runs (#1483)
@@ -64,9 +64,34 @@ jobs:
         with:
           # scripts/ccc-deps-lock.sh compiles the locks on CPython 3.11 only.
           python-version: "3.11"
+      # #2276: GITHUB_TOKEN may not create PRs here — the repository setting
+      # "Allow GitHub Actions to create and approve pull requests" stays off,
+      # because it would also let every workflow's token approve PRs. The PR
+      # writes use a one-hour installation token of the org-owned deps-bot
+      # GitHub App instead (pull_requests: write, contents: read, installed on
+      # this repo only); pushes, branch deletes, dispatch and run approval keep
+      # GITHUB_TOKEN. The action revokes the token in its post step.
+      - name: Require the deps-bot App credentials (#2276)
+        env:
+          CLIENT_ID: ${{ vars.DEPS_BOT_APP_CLIENT_ID }}
+          HAS_KEY: ${{ secrets.DEPS_BOT_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ "$HAS_KEY" != true ]; then
+            echo "::error::deps-bot App credentials missing: repo variable DEPS_BOT_APP_CLIENT_ID and secret DEPS_BOT_APP_PRIVATE_KEY are required to open the bot PR (#2276)"
+            exit 1
+          fi
+      - name: Mint the deps-bot PR token (#2276)
+        id: pr-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.DEPS_BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DEPS_BOT_APP_PRIVATE_KEY }}
+          permission-pull-requests: write
+          permission-contents: read
       - name: Regenerate lock pair and open/update the bot PR
         env:
           GH_TOKEN: ${{ github.token }}
+          CCC_DEPS_LOCK_PR_GH_TOKEN: ${{ steps.pr-token.outputs.token }}
           GH_REPO: ${{ github.repository }}
           CCC_DEPS_LOCK_PYTHON: python
           CCC_DEPS_LOCK_PR_UPGRADE: ${{ inputs.upgrade }}
