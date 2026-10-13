@@ -74,13 +74,13 @@ class SkillPromotionLastCollectCheck(unittest.TestCase):
 
     def test_ok_cycle_with_blocked_legacy_envelopes_warns(self) -> None:
         doctor = self.run_check({"ok": True, "mode": "collect", "published": [{}], "errors": [],
-                                 "blocked": [{"source": "gongmyoung-lane", "name": "legacy-a",
+                                 "blocked": [{"source": "peer-lane", "name": "legacy-a",
                                               "code": "description_trigger_missing"},
-                                             {"source": "gongmyoung-lane", "name": "legacy-b",
+                                             {"source": "peer-lane", "name": "legacy-b",
                                               "code": "description_trigger_missing"},
                                              {"source": "bad source $(id)", "name": "x",
                                               "code": "description_trigger_missing"}]})
-        row = self.assert_row(doctor, "경고", "ok; published=1; blocked=3 sources=gongmyoung-lane")
+        row = self.assert_row(doctor, "경고", "ok; published=1; blocked=3 sources=peer-lane")
         self.assertNotIn("$(id)", row.status)
         self.assertIn("dropped-*", row.action)
 

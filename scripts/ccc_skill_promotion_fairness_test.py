@@ -428,7 +428,7 @@ class CollectRunRotationTests(unittest.TestCase):
         """#2285: a current exporter leaves a triggerless legacy envelope in
         place and reports it in `blocked`. The collector keeps that visible in
         its own `blocked` field instead of folding it into `errors`, so the
-        run is `ok` while peers publish normally (field: gongmyoung-lane,
+        run is `ok` while peers publish normally (field: one lane source,
         2026-10-08..12 alternating `failed`)."""
         def exporter(node, *, limit, blocked=None):
             if node == "deep" and blocked is not None:
