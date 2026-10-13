@@ -4,15 +4,20 @@
 # Secret-free in this repo: the Firecrawl API key is read at runtime from ~/.hermes/.env
 # (node-local, gitignored) — never hardcoded here.
 #
-# Requires: `claude` CLI on PATH, node/npm (npx on non-Termux). SearXNG also
+# Requires: `claude` CLI on PATH, node/npm (npx only as the Linux fallback). SearXNG also
 # requires Tailscale up.
 #
 # Termux/Android: the package bins start with `#!/usr/bin/env node`, and the
 # agent's MCP spawn context does not carry termux-exec (Claude Code subprocess;
 # Codex `rmcp` `env_clear()`), so `/usr/bin/env` is unresolved and
 # `npx -y <pkg>` fails with "<bin>: not found". There we install the package
-# globally and launch it via `node <abs cli>`, which bypasses the shebang.
-# Linux keeps `npx -y <pkg>`. (#663)
+# globally and launch it via `node <abs cli>`, which bypasses the shebang
+# (#663). Linux does the same (#2299): `npx -y <pkg>` leaves a resident
+# `npm exec` wrapper (~80 MiB) per server per session, so `npx -y` is only the
+# fallback when the global install is unavailable. The bridge's curated web MCP
+# (bridge/core/web_mcp.py) launches from the same global install when present.
+# Global installs are not upgraded by re-running this script; refresh them
+# with `npm install -g <pkg>@latest`.
 #
 # Usage: ./claude/mcp-setup.sh   (or from anywhere: bash mcp-setup.sh)
 #        ./claude/mcp-setup.sh --family-only
@@ -112,19 +117,21 @@ global_cli() { # global_cli <npm-pkg>
 }
 
 # add_stdio <name> <npm-pkg> [extra claude-mcp-add flags...]
-# Termux: global-install + `node <cli>`; elsewhere: `npx -y <pkg>`.
+# Every platform: global-install + `node <cli>`. Linux falls back to
+# `npx -y <pkg>` when the global install cannot be made or resolved (e.g. no
+# write access to the npm prefix); Termux has no such fallback (#663).
 add_stdio() {
   local name="$1" pkg="$2"; shift 2
-  if [ "$IS_TERMUX" = 1 ]; then
-    npm ls -g "$pkg" >/dev/null 2>&1 || npm install -g "$pkg" >/dev/null 2>&1 || true
-    local cli
-    cli="$(global_cli "$pkg")"
-    if [ -z "$cli" ] || [ ! -f "$cli" ]; then
-      echo "  ! $name: SKIPPED — could not install/resolve $pkg globally"
-      return 1
-    fi
+  npm ls -g "$pkg" >/dev/null 2>&1 || npm install -g "$pkg" >/dev/null 2>&1 || true
+  local cli
+  cli="$(global_cli "$pkg")"
+  if [ -n "$cli" ] && [ -f "$cli" ]; then
     add "$name" "$@" -- node "$cli"
+  elif [ "$IS_TERMUX" = 1 ]; then
+    echo "  ! $name: SKIPPED — could not install/resolve $pkg globally"
+    return 1
   else
+    echo "  ! $name: global install of $pkg unavailable — falling back to npx -y (keeps a resident npm exec wrapper, #2299)"
     add "$name" "$@" -- npx -y "$pkg"
   fi
 }
