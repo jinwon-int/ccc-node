@@ -70,6 +70,25 @@ class SkillPromotionLastCollectCheck(unittest.TestCase):
         row = self.assert_row(doctor, "정상", "published=2")
         self.assertIn("age=1h", row.status)
 
+    # --- #2285: exporter skips are visible but not a failed collect ----------
+
+    def test_ok_cycle_with_blocked_legacy_envelopes_warns(self) -> None:
+        doctor = self.run_check({"ok": True, "mode": "collect", "published": [{}], "errors": [],
+                                 "blocked": [{"source": "gongmyoung-lane", "name": "legacy-a",
+                                              "code": "description_trigger_missing"},
+                                             {"source": "gongmyoung-lane", "name": "legacy-b",
+                                              "code": "description_trigger_missing"},
+                                             {"source": "bad source $(id)", "name": "x",
+                                              "code": "description_trigger_missing"}]})
+        row = self.assert_row(doctor, "경고", "ok; published=1; blocked=3 sources=gongmyoung-lane")
+        self.assertNotIn("$(id)", row.status)
+        self.assertIn("dropped-*", row.action)
+
+    def test_ok_cycle_with_empty_blocked_is_normal(self) -> None:
+        doctor = self.run_check({"ok": True, "mode": "collect", "published": [], "errors": [],
+                                 "blocked": []})
+        self.assert_row(doctor, "정상", "published=0")
+
     # --- the field case: lock contention -------------------------------------
 
     def test_lock_timeout_warns_with_lock_hint(self) -> None:

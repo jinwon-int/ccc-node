@@ -2165,6 +2165,7 @@ class Doctor:
 
     _LAST_COLLECT_MAX_BYTES = 1024 * 1024
     _LAST_COLLECT_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+    _LAST_COLLECT_SOURCE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
     _LAST_COLLECT_HINTS = {
         "lock_timeout": (
             "the nightly collect could not take promotion.lock within its bounded wait — "
@@ -2236,6 +2237,26 @@ class Doctor:
             return
         published = data.get("published")
         count = len(published) if isinstance(published, list) else 0
+        blocked = data.get("blocked")
+        if isinstance(blocked, list) and blocked:
+            # #2285: an exporter skip (triggerless legacy envelope left in place
+            # at its source) no longer fails the collect, but it never drains on
+            # its own either — surface it until someone fixes or quarantines it.
+            sources = sorted({
+                str(row.get("source")) for row in blocked
+                if isinstance(row, dict) and isinstance(row.get("source"), str)
+                and self._LAST_COLLECT_SOURCE_RE.match(row["source"])
+            })
+            self.add(
+                "경고",
+                item,
+                f"ok; published={count}; blocked={len(blocked)} sources={','.join(sources[:8]) or 'unknown'}; {age}",
+                f"read {path} `blocked` (source/name/code). A triggerless legacy envelope stays "
+                "at its source and is never exported: add a usage condition through the "
+                "candidate's normal review path, or move the envelope out of that node's "
+                "skill-promotion/outbox into a dated dropped-* directory",
+            )
+            return
         self.add("정상", item, f"ok; published={count}; {age}", "none")
 
     @staticmethod

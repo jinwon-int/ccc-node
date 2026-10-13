@@ -642,7 +642,14 @@ review path; automation does not invent trigger wording or rewrite signed source
 content to make validation pass. The read-only exporter leaves rejected
 legacy envelopes in place, reports up to 64 bounded name/code diagnostics, and
 applies its export limit to eligible candidates so one blocked head cannot starve
-later candidates from the same node. Roll out the exporter change to source
+later candidates from the same node. The collector reports those diagnostics in
+a separate `blocked` list (`{source, name, code}`) of the collect result — not
+in `errors` — so a deliberate skip does not turn the run `failed` (#2285). The
+nightly sweep logs them on their own `promotion-collect-blocked count=N [...]`
+line, and `ccc-doctor` warns while `last-collect.json` still lists any. Such an
+envelope never drains by itself: fix its description through the normal review
+path (which stages a new envelope), or move it out of that node's
+`skill-promotion/outbox` into a dated `dropped-*` directory. Roll out the exporter change to source
 nodes as well as the publisher: an older exporter can still return only its
 blocked head, which the publisher reports but cannot look past remotely.
 
