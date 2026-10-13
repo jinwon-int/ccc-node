@@ -206,6 +206,86 @@ async def test_global_route_adopts_unroutable_once_and_never_routed_work(
     assert routed_journal.get(routed.job_id).local_sink_status is DistillLocalSinkStatus.PENDING
 
 
+@pytest.mark.anyio
+async def test_prune_keeps_unadopted_unroutable_jobs_while_global_route_exists(
+    tmp_path: Path,
+) -> None:
+    """#2296: retention must not delete orphans before global adoption."""
+
+    from datetime import datetime, timedelta, timezone
+
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    orphan = await extracted_job(
+        journal, memory_audience=None, memory_scope=None, wiki_enabled=False
+    )
+    assert orphan.local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+    later = datetime.now(timezone.utc) + timedelta(days=30)
+
+    assert journal.prune_terminal_jobs(
+        older_than_seconds=60, now=later, keep_unroutable=True
+    ) == ()
+    assert journal.get(orphan.job_id).local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+
+    # Once adopted (DONE) it is ordinary terminal work again.
+    claimed = journal.claim_local_sink(
+        orphan.job_id, owner_token="global", audience_routes=False, global_route=True
+    )
+    assert claimed is not None
+    journal.mark_local_sink_done(
+        orphan.job_id,
+        owner_token="global",
+        lease_epoch=claimed.local_sink_lease_epoch,
+    )
+    assert journal.prune_terminal_jobs(
+        older_than_seconds=60, now=later, keep_unroutable=True
+    ) == (orphan.job_id,)
+
+    # Without a global route the historical behavior is unchanged.
+    legacy = DistillJournal(tmp_path / "legacy")
+    legacy.initialize()
+    other = await extracted_job(
+        legacy, memory_audience=None, memory_scope=None, wiki_enabled=False
+    )
+    assert legacy.prune_terminal_jobs(older_than_seconds=60, now=later) == (
+        other.job_id,
+    )
+
+
+@pytest.mark.anyio
+async def test_sweep_prune_keeps_orphans_only_with_global_sink(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from telegram_bot.core.bot import TelegramBot
+
+    calls: list[dict[str, object]] = []
+
+    class _Journal:
+        def recover_stale_running(self):
+            return 0
+
+        def prune_terminal_jobs(self, **kwargs):
+            calls.append(kwargs)
+            return ()
+
+        def list_jobs(self):
+            return ()
+
+    for worker, expected in (
+        (SimpleNamespace(global_route_enabled=True), True),
+        (SimpleNamespace(global_route_enabled=False), False),
+        (None, False),
+    ):
+        bot = TelegramBot.__new__(TelegramBot)
+        bot._distill_journal = _Journal()
+        bot._distill_local_sink_worker = worker
+        bot._config = SimpleNamespace(distill_job_retention_seconds=3600.0)
+        calls.clear()
+        await bot._distill_sweep_jobs(0.0)
+        assert calls, "sweep did not prune"
+        assert calls[-1].get("keep_unroutable", False) is expected
+
+
 def test_route_free_local_sink_may_not_start_pending(tmp_path: Path) -> None:
     journal = DistillJournal(tmp_path / "journal")
     journal.initialize()

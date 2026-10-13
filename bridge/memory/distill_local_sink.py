@@ -27,6 +27,9 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _WORD_RE = re.compile(r"[0-9a-z가-힣]+")
 _SUPPORTED_AUDIENCES = frozenset({"private", "shared"})
 _MAX_EXISTING_FACT_BYTES = 8 * 1024 * 1024
+_RESUME_CAPTURED_AT_RE = re.compile(
+    r"^<!-- ccc-node:distill .* captured_at=(\S+) -->$"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,8 +86,11 @@ class CodexLocalMemorySink:
         self.max_facts = max_facts
         self.max_resume_bytes = max_resume_bytes
         # The node-global state (#2296) is shared with the hook path and may
-        # receive replayed older jobs: never let an older extraction replace a
-        # newer resume.md. Facts are still merged (they are deduplicated).
+        # receive replayed jobs in journal (hash) order: never let an older
+        # capture replace a newer bridge resume.md. Ordering uses the
+        # bridge-controlled snapshot ``captured_at`` recorded in the resume
+        # header, never the model-authored ``distilled_at`` or file mtime.
+        # Facts are still merged (they are deduplicated).
         self.resume_never_regresses = resume_never_regresses
         self._facts_path = self.state_dir / "memory-facts.jsonl"
         self._resume_path = self.state_dir / "resume.md"
@@ -225,7 +231,12 @@ class CodexLocalMemorySink:
         payload = ("\n".join(bounded_lines) + "\n").encode("utf-8")
         return payload, len(added)
 
-    def _render_resume(self, output: DistillExtractionOutput) -> bytes | None:
+    def _render_resume(
+        self,
+        output: DistillExtractionOutput,
+        *,
+        captured_at: str | None = None,
+    ) -> bytes | None:
         resume = output.resume
         rows = (
             ("마지막 작업", resume.last_activity),
@@ -246,48 +257,71 @@ class CodexLocalMemorySink:
             f"schema={output.schema_version} provider={provenance.provider} "
             f"thread_hash={provenance.source_thread_hash} "
             f"trigger={provenance.trigger.value} "
-            f"distilled_at={provenance.distilled_at} -->\n"
+            f"distilled_at={provenance.distilled_at}"
+            + (f" captured_at={captured_at}" if captured_at is not None else "")
+            + " -->\n"
         )
         return _bounded_utf8(header + "\n".join(lines) + "\n", self.max_resume_bytes)
 
-    def _resume_is_newer(self, output: DistillExtractionOutput) -> bool:
-        """True when the existing resume.md postdates this extraction."""
-        if not self.resume_never_regresses:
-            return False
+    @staticmethod
+    def _parse_capture_time(value: str | None) -> datetime | None:
+        if not isinstance(value, str) or not value or len(value) > 64:
+            return None
         try:
-            current_mtime = self._resume_path.lstat().st_mtime
-        except FileNotFoundError:
-            return False
-        distilled = datetime.fromisoformat(
-            output.provenance.distilled_at.replace("Z", "+00:00")
-        )
-        if distilled.tzinfo is None:
-            distilled = distilled.replace(tzinfo=timezone.utc)
-        return current_mtime > distilled.timestamp()
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _current_resume_captured_at(cls, payload: bytes | None) -> datetime | None:
+        """The ``captured_at`` of the current resume.md header, if parseable."""
+        if not payload:
+            return None
+        first_line = payload.split(b"\n", 1)[0].decode("utf-8", errors="replace")
+        match = _RESUME_CAPTURED_AT_RE.match(first_line)
+        return cls._parse_capture_time(match.group(1)) if match else None
 
     def write(
         self,
         output: DistillExtractionOutput,
         *,
         job_id: str,
+        captured_at: str | None = None,
     ) -> LocalSinkWriteResult:
+        """Merge facts and write resume.md.
+
+        ``captured_at`` (the bridge-recorded snapshot time) only matters for a
+        ``resume_never_regresses`` sink: it is stamped into the resume header
+        and an extraction never replaces a current resume whose header
+        carries a strictly later capture time.
+        """
         if not isinstance(output, DistillExtractionOutput):
             raise ValueError("output must be a validated DistillExtractionOutput")
         if not isinstance(job_id, str) or not _SHA256_RE.fullmatch(job_id):
             raise ValueError("job_id must be a SHA-256 hex digest")
+        ordered = self.resume_never_regresses
+        new_capture = self._parse_capture_time(captured_at) if ordered else None
         with self._exclusive():
             self._validate_regular_file(self._facts_path)
             self._validate_regular_file(self._resume_path)
-            resume_payload = self._render_resume(output)
-            if resume_payload is not None and self._resume_is_newer(output):
-                resume_payload = None
+            resume_payload = self._render_resume(
+                output,
+                captured_at=(
+                    new_capture.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                    if new_capture is not None
+                    else None
+                ),
+            )
             resume_written = resume_payload is not None
             facts_added = 0
 
             def transform(
                 current: dict[str, bytes | None],
             ) -> dict[str, bytes | None]:
-                nonlocal facts_added
+                nonlocal facts_added, resume_written
                 desired: dict[str, bytes | None] = {}
                 facts_payload, facts_added = self._render_facts(
                     output,
@@ -296,7 +330,20 @@ class CodexLocalMemorySink:
                 )
                 if facts_payload is not None:
                     desired["memory-facts.jsonl"] = facts_payload
-                if resume_payload is not None:
+                write_resume = resume_payload is not None
+                if write_resume and ordered:
+                    # Decided under the transaction lock against the CURRENT
+                    # resume: a header-less/unparseable resume is overwritten;
+                    # a strictly newer capture is kept.
+                    current_capture = self._current_resume_captured_at(
+                        current["resume.md"]
+                    )
+                    if current_capture is not None and (
+                        new_capture is None or current_capture > new_capture
+                    ):
+                        write_resume = False
+                resume_written = write_resume
+                if write_resume:
                     desired["resume.md"] = resume_payload
                 return desired
 

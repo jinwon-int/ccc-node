@@ -236,8 +236,13 @@ class DistillJournal(JsonJournalCore):
         *,
         older_than_seconds: float,
         now: datetime | None = None,
+        keep_unroutable: bool = False,
     ) -> tuple[str, ...]:
         """Remove fully-terminal jobs whose last update is older than the cutoff.
+
+        ``keep_unroutable`` is set while a node-global local sink exists
+        (#2296): an UNROUTABLE job with extraction output is still pending
+        adoption there, so it must survive retention until it is adopted.
 
         Nothing ever deleted finished jobs before, so the journal grew without
         bound and every sweep in every pipeline loop re-read and re-validated
@@ -259,6 +264,12 @@ class DistillJournal(JsonJournalCore):
                 except (KeyError, ValueError, PermissionError, OSError):
                     continue
                 if not self._job_fully_terminal(job):
+                    continue
+                if (
+                    keep_unroutable
+                    and job.local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+                    and job.extraction_output is not None
+                ):
                     continue
                 if (current_time - updated_at).total_seconds() < older_than_seconds:
                     continue

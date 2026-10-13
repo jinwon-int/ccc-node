@@ -95,20 +95,26 @@ def nunchi_last_ingest(path: Path, now: int) -> tuple[str | None, int]:
 
 
 def local_facts_probe(path: Path, now: int) -> dict[str, object]:
-    """Latest ``observed_at`` in the node's local facts file (body-free)."""
+    """When the node's local facts file was last written (body-free).
+
+    The last write (mtime) is the ingest signal: a replayed or late fact may
+    carry an old ``observed_at`` while still proving the writer is alive. The
+    newest ``observed_at`` is reported alongside for context only.
+    """
     payload: dict[str, object] = {
         "exists": path.is_file(),
         "facts": 0,
         "last_ingest_at": None,
         "age_seconds": -1,
+        "newest_observed_at": None,
         "source": "none",
     }
     if not payload["exists"]:
         return payload
-    latest: int | None = None
     try:
-        size = path.stat().st_size
-        if size <= _MAX_LOCAL_FACTS_SCAN_BYTES:
+        metadata = path.stat()
+        newest: int | None = None
+        if metadata.st_size <= _MAX_LOCAL_FACTS_SCAN_BYTES:
             facts = 0
             with path.open("r", encoding="utf-8", errors="replace") as handle:
                 for line in handle:
@@ -123,16 +129,15 @@ def local_facts_probe(path: Path, now: int) -> dict[str, object]:
                     facts += 1
                     stamp = _iso_epoch(value.get("observed_at"))
                     if stamp is not None and stamp <= now + 300:
-                        latest = stamp if latest is None else max(latest, stamp)
+                        newest = stamp if newest is None else max(newest, stamp)
             payload["facts"] = facts
-            if latest is not None:
-                payload["source"] = "observed_at"
-        if latest is None:
-            latest = int(path.stat().st_mtime)
-            payload["source"] = "mtime"
+        payload["newest_observed_at"] = _freshness(newest, now)[0]
+        payload["source"] = "mtime"
+        payload["last_ingest_at"], payload["age_seconds"] = _freshness(
+            int(metadata.st_mtime), now
+        )
     except OSError:
         return payload
-    payload["last_ingest_at"], payload["age_seconds"] = _freshness(latest, now)
     return payload
 
 

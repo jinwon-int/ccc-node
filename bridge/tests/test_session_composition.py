@@ -1121,9 +1121,18 @@ os.environ.update({{
     "HOME": str(root / "home"),
     "CCC_CLAUDE_DIR": str(root / "claude"),
     "CCC_BRIDGE_MEMORY_MODE": "{mode}",
+    "CCC_BRIDGE_EXECUTION_PROFILE": "owner-operator",
     "CCC_LOCAL_FACTS_MAX": "1500",
 }})
 os.environ.pop("CCC_STATE_DIR", None)
+
+import logging
+records = []
+class _Capture(logging.Handler):
+    def emit(self, record):
+        records.append(record.getMessage())
+logging.getLogger("telegram_bot.__main__").addHandler(_Capture())
+logging.getLogger("telegram_bot.__main__").setLevel(logging.INFO)
 
 from telegram_bot.__main__ import build_context, create_app, load_runtime_settings
 from telegram_bot.memory.distill_local_worker import CodexDistillLocalSinkWorker
@@ -1150,6 +1159,26 @@ assert create_app(context)._distill_local_sink_worker is worker
 os.environ["CCC_STATE_DIR"] = str(root / "explicit-state")
 explicit = build_context(load_runtime_settings()).distill_local_sink_worker
 assert explicit._global_route.state_dir == root / "explicit-state"
+assert not any("not composed" in message for message in records)
+
+# Privacy gate: non-owner profiles never write the owner's node memory.
+for profile in ("strict-project", "disabled"):
+    os.environ["CCC_BRIDGE_EXECUTION_PROFILE"] = profile
+    assert build_context(load_runtime_settings()).distill_local_sink_worker is None
+# owner-operator that degrades (no single allowlisted owner) is not owner.
+os.environ["CCC_BRIDGE_EXECUTION_PROFILE"] = "owner-operator"
+os.environ["ALLOWED_USER_IDS"] = "1,2"
+assert build_context(load_runtime_settings()).distill_local_sink_worker is None
+os.environ["ALLOWED_USER_IDS"] = "1"
+if "{mode}" == "off":
+    # shared-all mixes every sender into one conversation: no global sink.
+    os.environ["CCC_TELEGRAM_SESSION_SCOPE"] = "shared-all"
+    assert build_context(load_runtime_settings()).distill_local_sink_worker is None
+    os.environ.pop("CCC_TELEGRAM_SESSION_SCOPE")
+assert any(
+    "not composed" in message and "owner-operator" in message for message in records
+), records
+assert build_context(load_runtime_settings()).distill_local_sink_worker is not None
 
 # Distill off: nothing is extracted, so no sink is composed.
 os.environ["CCC_MEMORY_DISTILL_PROVIDER"] = "off"

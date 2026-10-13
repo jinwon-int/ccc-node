@@ -194,7 +194,11 @@ def _build_global_local_sink_worker(
     """Node-global local sink for off/curated bridge memory modes (#2296).
 
     Returns ``None`` when bridge distill is off (nothing is extracted) or the
-    mode is not one of the unpartitioned ``off``/``curated`` modes.
+    mode is not one of the unpartitioned ``off``/``curated`` modes. Privacy
+    gate: the node-global memory is the owner's own, so it is written only
+    for a (resolved) ``owner-operator`` bridge whose session scope is not
+    ``shared-all``; strict/non-owner profiles never loaded node memory in
+    ``off`` and keep the previous route-free (unroutable) behavior.
 
     ``off``/``curated`` mean "no audience partition", not "stop saving
     memory": the bridge owns distill (``CCC_BRIDGE_DISTILL_MANAGED``), so the
@@ -209,6 +213,31 @@ def _build_global_local_sink_worker(
         "off",
         "curated",
     }:
+        return None
+    from telegram_bot.core import tool_policy
+    from telegram_bot.core.session_scope import (
+        SESSION_SCOPE_SHARED_ALL,
+        normalize_session_scope,
+    )
+
+    profile = tool_policy.resolve_execution_profile(
+        settings.execution_profile,
+        allowed_user_ids=settings.allowed_user_ids,
+        require_allowlist=settings.require_allowlist,
+    )
+    scope = normalize_session_scope(settings.telegram_session_scope)
+    if (
+        profile != tool_policy.EXECUTION_OWNER_OPERATOR
+        or scope == SESSION_SCOPE_SHARED_ALL
+    ):
+        logger.info(
+            "Distill node-global local sink not composed: bridge_memory_mode=%s "
+            "requires execution_profile=owner-operator and a session scope other "
+            "than shared-all (profile=%s, scope=%s); route-free jobs stay unroutable",
+            settings.bridge_memory_mode,
+            profile,
+            scope,
+        )
         return None
     from telegram_bot.core.state_contract import default_state_dir
     from telegram_bot.memory.distill_local_worker import (

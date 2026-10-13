@@ -351,8 +351,9 @@ fi
 
 # Ingest freshness (#2296): readiness alone reported `nunchi: ok` for a DB that
 # had stored nothing for weeks. Judge when nunchi last stored a fact
-# (max peer_facts.created_at) and when local facts last advanced (max
-# observed_at). Timestamps only — never a fact body.
+# (max peer_facts.created_at; only while nunchi mode is on) and, independently
+# of nunchi, when memory-facts.jsonl was last written. A missing facts file is
+# `unknown`, never `ok`. Timestamps only — never a fact body.
 STALE_HOURS="${CCC_MEMORY_STALE_HOURS:-72}"
 case "$STALE_HOURS" in ''|*[!0-9]*|0) STALE_HOURS=72 ;; esac
 freshness_json="$(jq -c --argjson stale_hours "$STALE_HOURS" '
@@ -361,17 +362,16 @@ freshness_json="$(jq -c --argjson stale_hours "$STALE_HOURS" '
   | (.nunchi.db.last_ingest_age_seconds // -1) as $n_age
   | (.local_facts.age_seconds // -1) as $l_age
   | (if $mode == "on" then judge($n_age) else "off" end) as $n_status
-  | (if (.local_facts.exists // false) then judge($l_age) else "missing" end) as $l_status
+  | (if (.local_facts.exists // false) then judge($l_age) else "unknown" end) as $l_status
   | {
       status:(
-        if $mode != "on" then "off"
-        elif $n_status == "stale" or $l_status == "stale" then "stale"
-        elif $n_status == "ok" then "ok"
-        else "unknown" end
+        if $n_status == "stale" or $l_status == "stale" then "stale"
+        elif $n_status == "unknown" or $l_status == "unknown" then "unknown"
+        else "ok" end
       ),
       stale_hours:$stale_hours,
       nunchi:{status:$n_status, last_ingest_at:(.nunchi.db.last_ingest_at // null), age_seconds:$n_age},
-      local_facts:{status:$l_status, last_ingest_at:(.local_facts.last_ingest_at // null), age_seconds:$l_age, source:(.local_facts.source // "none")}
+      local_facts:{status:$l_status, last_ingest_at:(.local_facts.last_ingest_at // null), age_seconds:$l_age, newest_observed_at:(.local_facts.newest_observed_at // null), source:(.local_facts.source // "none")}
     }' <<<"$memory_probe_json" 2>/dev/null)"
 [ -n "$freshness_json" ] || freshness_json="{\"status\":\"unknown\",\"stale_hours\":$STALE_HOURS}"
 

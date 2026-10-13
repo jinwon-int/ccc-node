@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
+import re
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from test_distill_local_journal import extracted_job
+import test_distill_worker as fixtures
 
 from telegram_bot.core.bot import TelegramBot
 from telegram_bot.memory.distill_journal import DistillJournal
@@ -18,7 +21,9 @@ from telegram_bot.memory.distill_local_worker import (
     CodexDistillLocalSinkWorker,
     GlobalLocalMemoryRoute,
 )
-from telegram_bot.memory.distill_types import DistillLocalSinkStatus
+from telegram_bot.memory.distill_extraction import DistillExtractionOutput
+from telegram_bot.memory.distill_types import DistillLocalSinkStatus, DistillTrigger
+from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
 
 
 @pytest.mark.anyio
@@ -436,38 +441,178 @@ async def test_global_route_replays_unroutable_job_into_node_state_once(
     assert len((route.state_dir / "memory-facts.jsonl").read_text().splitlines()) == 1
 
 
-@pytest.mark.anyio
-async def test_global_replay_never_regresses_a_newer_resume(tmp_path: Path) -> None:
-    """Replayed orphans run in journal order; an older one must not win resume.md."""
+class _ResumeBackend:
+    """Successful extractor with a chosen (untrusted) distilled_at and resume."""
 
-    import os
+    def __init__(self, distilled_at: str, activity: str) -> None:
+        self._distilled_at = distilled_at
+        self._activity = activity
+
+    async def extract(self, extraction_input):
+        payload = fixtures.output_for(extraction_input).model_dump(mode="json")
+        payload["provenance"]["distilled_at"] = self._distilled_at
+        payload["resume"]["last_activity"] = self._activity
+        payload["honcho"][0]["text"] = f"Fact from {self._activity}."
+        return DistillExtractionOutput.model_validate(payload)
+
+
+async def _global_job(
+    journal: DistillJournal,
+    *,
+    thread_id: str,
+    captured_at: str,
+    distilled_at: str,
+    activity: str,
+):
+    queued = journal.enqueue_once(
+        provider="codex",
+        thread_id=thread_id,
+        trigger=DistillTrigger.NEW_COMMAND,
+    )
+    claimed = journal.claim(queued.job_id, owner_token="snap", now=fixtures.utc())
+    assert claimed is not None
+    journal.mark_snapshot_done(
+        queued.job_id,
+        owner_token="snap",
+        lease_epoch=claimed.lease_epoch,
+        snapshot=dataclasses.replace(
+            fixtures.snapshot(thread_id), captured_at=captured_at
+        ),
+        now=fixtures.utc(1),
+    )
+    done = await CodexDistillExtractionWorker(
+        journal,
+        _ResumeBackend(distilled_at, activity),
+        usage_meter=None,
+        owner_token="extract",
+        wiki_enabled=True,
+    ).extract_once(job_id=queued.job_id)
+    assert done.local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+    return done
+
+
+@pytest.mark.anyio
+async def test_global_replay_newest_capture_wins_resume_in_any_order(
+    tmp_path: Path,
+) -> None:
+    """Replay runs in job-hash order and distilled_at is model-authored.
+
+    Only the bridge-recorded snapshot capture time orders resume.md: the
+    newest capture wins even when it is processed first and carries a stale
+    distilled_at, and a far-future distilled_at on an old capture never
+    suppresses anything.
+    """
 
     journal = DistillJournal(tmp_path / "journal")
     journal.initialize()
-    job = await extracted_job(journal, memory_audience=None, memory_scope=None)
+    jobs = {
+        "old": await _global_job(
+            journal,
+            thread_id="thread-old",
+            captured_at="2026-10-01T09:00:00Z",
+            distilled_at="2099-01-01T00:00:00Z",
+            activity="old session",
+        ),
+        "mid": await _global_job(
+            journal,
+            thread_id="thread-mid",
+            captured_at="2026-10-05T09:00:00.250000Z",
+            distilled_at="2026-10-05T00:00:00Z",
+            activity="mid session",
+        ),
+        "new": await _global_job(
+            journal,
+            thread_id="thread-new",
+            captured_at="2026-10-09T09:00:00Z",
+            distilled_at="2020-01-01T00:00:00Z",
+            activity="new session",
+        ),
+    }
+    route = _global_route(tmp_path)
+    resume = route.state_dir / "resume.md"
+    worker = CodexDistillLocalSinkWorker(
+        journal, global_route=route, owner_token="global-worker"
+    )
+
+    for name in ("new", "old", "mid"):
+        result = await worker.write_once(job_id=jobs[name].job_id)
+        assert result.local_sink_status is DistillLocalSinkStatus.DONE
+
+    text = resume.read_text()
+    assert "new session" in text
+    assert "captured_at=2026-10-09T09:00:00.000000Z" in text.splitlines()[0]
+    # Every job's facts are still merged.
+    facts = (route.state_dir / "memory-facts.jsonl").read_text()
+    assert all(f"Fact from {name} session." in facts for name in jobs)
+
+    # Sweep order (sorted job ids) gives the same answer from scratch.
+    other_route = _global_route(tmp_path / "sorted")
+    other_journal = DistillJournal(tmp_path / "journal-sorted")
+    other_journal.initialize()
+    for name, captured in (
+        ("old", "2026-10-01T09:00:00Z"),
+        ("mid", "2026-10-05T09:00:00Z"),
+        ("new", "2026-10-09T09:00:00Z"),
+    ):
+        await _global_job(
+            other_journal,
+            thread_id=f"thread-{name}",
+            captured_at=captured,
+            distilled_at="2026-10-13T00:00:00Z",
+            activity=f"{name} session",
+        )
+    await _drive_local_sink_loop(
+        CodexDistillLocalSinkWorker(
+            other_journal, global_route=other_route, owner_token="sweep"
+        ),
+        other_journal,
+        until=lambda: all(
+            job.local_sink_status is DistillLocalSinkStatus.DONE
+            for job in other_journal.list_jobs()
+        ),
+    )
+    assert "new session" in (other_route.state_dir / "resume.md").read_text()
+
+
+@pytest.mark.anyio
+async def test_global_sink_overwrites_headerless_or_uncaptured_resume(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    first = await _global_job(
+        journal,
+        thread_id="thread-a",
+        captured_at="2026-07-16T04:00:00Z",
+        distilled_at="2026-07-16T04:01:00Z",
+        activity="bridge session a",
+    )
+    second = await _global_job(
+        journal,
+        thread_id="thread-b",
+        captured_at="2026-07-16T03:00:00Z",
+        distilled_at="2026-07-16T03:01:00Z",
+        activity="bridge session b",
+    )
     route = _global_route(tmp_path)
     route.state_dir.mkdir(parents=True, mode=0o700)
     resume = route.state_dir / "resume.md"
-    resume.write_text("- 마지막 작업: newer CLI session\n")
-    resume.chmod(0o600)  # mtime is now, after the fixture's 2026-07-16 extraction
-
-    result = await CodexDistillLocalSinkWorker(
+    # A hook-path resume has no header: it is overwritten (mtime is ignored).
+    resume.write_text("- 마지막 작업: hook-path CLI session\n")
+    resume.chmod(0o600)
+    worker = CodexDistillLocalSinkWorker(
         journal, global_route=route, owner_token="global-worker"
-    ).write_once(job_id=job.job_id)
+    )
 
-    assert result.local_sink_status is DistillLocalSinkStatus.DONE
-    assert resume.read_text() == "- 마지막 작업: newer CLI session\n"
-    assert len((route.state_dir / "memory-facts.jsonl").read_text().splitlines()) == 1
+    await worker.write_once(job_id=first.job_id)
+    assert "bridge session a" in resume.read_text()
 
-    # An older resume.md is replaced as usual.
-    other_journal = DistillJournal(tmp_path / "journal-2")
-    other_journal.initialize()
-    second = await extracted_job(other_journal, memory_audience=None, memory_scope=None)
-    os.utime(resume, (0, 0))
-    await CodexDistillLocalSinkWorker(
-        other_journal, global_route=route, owner_token="global-worker"
-    ).write_once(job_id=second.job_id)
-    assert "ccc-node:distill" in resume.read_text()
+    # A bridge header without captured_at (audience-style) is overwritten too.
+    lines = resume.read_text().splitlines()
+    header = re.sub(r" captured_at=\S+", "", lines[0])
+    resume.write_text("\n".join([header, "- 마지막 작업: uncaptured"]) + "\n")
+    await worker.write_once(job_id=second.job_id)
+    assert "bridge session b" in resume.read_text()
 
 
 @pytest.mark.anyio

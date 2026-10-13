@@ -532,7 +532,16 @@ class CodexDistillLocalSinkWorker:
                 # global nunchi lane reads the journal via ingest-cron.sh.
                 global_sink = self._global_sink()
                 await asyncio.to_thread(
-                    global_sink.write, output, job_id=claimed.job_id
+                    global_sink.write,
+                    output,
+                    job_id=claimed.job_id,
+                    # Bridge-recorded capture time orders replayed resumes;
+                    # the model-authored distilled_at is not trusted for it.
+                    captured_at=(
+                        claimed.snapshot.captured_at
+                        if claimed.snapshot is not None
+                        else None
+                    ),
                 )
                 await self.refresh_global()
             else:

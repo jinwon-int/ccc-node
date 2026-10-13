@@ -392,10 +392,20 @@ class MemoryDistillMixin:
                 or 0.0
             )
             if recover and prune is not None and retention > 0:
-                try:
-                    pruned = await asyncio.to_thread(
-                        prune, older_than_seconds=retention
+                prune_kwargs: dict[str, Any] = {"older_than_seconds": retention}
+                if (
+                    getattr(
+                        getattr(self, "_distill_local_sink_worker", None),
+                        "global_route_enabled",
+                        False,
                     )
+                    is True
+                ):
+                    # #2296: orphans awaiting node-global adoption survive
+                    # retention until the local-sink sweep adopts them.
+                    prune_kwargs["keep_unroutable"] = True
+                try:
+                    pruned = await asyncio.to_thread(prune, **prune_kwargs)
                 except Exception:
                     logger.warning(
                         "Distill journal prune failed; continuing", exc_info=True
