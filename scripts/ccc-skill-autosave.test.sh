@@ -891,6 +891,22 @@ run16 "$STATE16B" PROMOTION_COLLECT_RC=2 PROMOTION_COLLECT_OUT='{"ok":false,"cod
 ok "#2203: a top-level failure code is logged" \
   'grep -q "promotion-collect failed (non-fatal) edge-env=absent code=gh_auth_failed$" "$STATE16B/skill-autosave.log"'
 
+# #2285: exporter skip diagnostics live in `blocked`, not `errors`. An ok
+# collect keeps its normal line and adds one shape-checked blocked digest line.
+STATE16C="$TMP/state16c"
+BLOCKED16='{"ok":true,"mode":"collect","published":[],"errors":[],"blocked":[{"source":"peer-lane","name":"legacy-skill","code":"description_trigger_missing"},{"source":"bad source; rm -rf","name":"Weird $(id)","code":"x"}]}'
+run16 "$STATE16C" PROMOTION_COLLECT_RC=0 PROMOTION_COLLECT_OUT="$BLOCKED16"
+ok "#2285: an ok collect with blocked envelopes is not logged as failed" \
+  '! grep -q "promotion-collect failed" "$STATE16C/skill-autosave.log" && grep -q "promotion-collect edge-env=absent " "$STATE16C/skill-autosave.log"'
+ok "#2285: blocked envelopes get their own shape-checked digest line" \
+  'grep -q "promotion-collect-blocked count=2 \[peer-lane:legacy-skill:description_trigger_missing,-:-:x\]$" "$STATE16C/skill-autosave.log"'
+ok "#2285: off-charset blocked values never reach the blocked line" \
+  'grep "promotion-collect-blocked" "$STATE16C/skill-autosave.log" | grep -q . && ! grep "promotion-collect-blocked" "$STATE16C/skill-autosave.log" | grep -q "rm -rf\|Weird\|(id)"'
+STATE16D="$TMP/state16d"
+run16 "$STATE16D" PROMOTION_COLLECT_RC=0 PROMOTION_COLLECT_OUT='{"ok":true,"mode":"collect","published":[],"errors":[],"blocked":[]}'
+ok "#2285: no blocked line when nothing is blocked" \
+  '! grep -q "promotion-collect-blocked" "$STATE16D/skill-autosave.log"'
+
 # A crashed child (no JSON on stdout) keeps the previous result and the bare line.
 printf '{"ok":true,"published":[]}\n' > "$STATE16B/skill-promotion/last-collect.json"
 run16 "$STATE16B" PROMOTION_COLLECT_RC=1 PROMOTION_COLLECT_OUT=''

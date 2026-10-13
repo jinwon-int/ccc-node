@@ -7111,6 +7111,8 @@ def _collect_envelopes(
     config: Config,
     errors: list[dict[str, str]],
     cursor_source: str | None = None,
+    *,
+    blocked: list[dict[str, str]] | None = None,
 ) -> list[tuple[Candidate, str, str, str]]:
     """Gather local + remote pending envelopes, de-duplicated by transport id.
 
@@ -7126,13 +7128,21 @@ def _collect_envelopes(
       runs, instead of always beginning with the local queue;
     - a remote that fails to export only loses its own share (reported in
       `errors`) — the other sources are still fetched, and the failed one is
-      retried when the rotation comes back around.
+      retried when the rotation comes back around;
+    - an exporter's `blocked` diagnostics (a triggerless legacy envelope it
+      deliberately leaves in place, #2099) go to `blocked`, never `errors`
+      (#2285). The skip is the designed outcome, not a failed source: folding
+      it into `errors` turned the whole collect `failed` on every run whose
+      rotation happened to reach that outbox, while the same run published the
+      other sources normally.
 
     `collect_nodes` order remains the within-round tie-break, a single-source
     fleet keeps the exact pre-#1647 behavior (share = full budget), and the
     per-remote fetch stays bounded by `max_prs` (1..3) so the exporter CLI's
     `--limit 1..3` contract holds.
     """
+    if blocked is None:
+        blocked = []
     sources = _rotate_sources(_collect_sources(config), cursor_source)
     share, remainder = divmod(_MAX_CANDIDATES_PER_RUN, len(sources))
     per_source: list[list[tuple[Candidate, str, str, str]]] = []
@@ -7162,14 +7172,14 @@ def _collect_envelopes(
         if label == "local":
             # A broken local state dir still fails the collect outright, as
             # before; remotes degrade to per-source errors.
-            gather(_pending_envelopes(config, limit=remaining, blocked=errors), label, expected_node)
+            gather(_pending_envelopes(config, limit=remaining, blocked=blocked), label, expected_node)
         else:
             try:
                 gather(
                     _remote_envelopes(
                         _collect_dial(config, expected_node),
                         limit=min(remaining, config.max_prs),
-                        blocked=errors,
+                        blocked=blocked,
                     ),
                     label,
                     expected_node,
@@ -7187,13 +7197,16 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
     _run(["gh", "auth", "status", "--hostname", "github.com"])
     _require_private_repo(config)
     errors: list[dict[str, str]] = []
+    # #2285: exporter skip diagnostics (triggerless legacy envelopes left in
+    # place at their source) are reported, but do not fail the collect.
+    blocked: list[dict[str, str]] = []
     # #1647: resume the source rotation where the previous real collect
     # stopped. The cursor is read in dry-run too so the preview matches what a
     # real run would admit; only the locked, real run below ever advances it —
     # dry-run neither writes the cursor nor acks.
     cursor_source = _read_collect_cursor(config)
     start_source = _rotate_sources(_collect_sources(config), cursor_source)[0][0]
-    collected = _collect_envelopes(config, errors, cursor_source)
+    collected = _collect_envelopes(config, errors, cursor_source, blocked=blocked)
 
     published: list[dict[str, str]] = []
     opened = 0
@@ -7274,6 +7287,7 @@ def _collect_unlocked(config: Config, *, dry_run: bool) -> dict[str, object]:
         "repo": config.repo,
         "published": published,
         "errors": errors,
+        "blocked": blocked,
         **_collect_completed(config, dry_run=dry_run),
     }
 

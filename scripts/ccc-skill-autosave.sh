@@ -278,6 +278,21 @@ collect_failure_digest() { # <summary-json>
     ] | join("")' 2>/dev/null || :
 }
 
+# #2285: exporter skip diagnostics (a triggerless legacy envelope left in place
+# at its source) are reported in `blocked`, separate from `errors`, so they no
+# longer turn the collect line into `failed`. Keep them visible on their own
+# line: count plus up to 8 shape-checked `source:name` pairs.
+collect_blocked_digest() { # <summary-json>
+  printf '%s' "$1" | jq -r '
+    def safe_source: if type == "string" and test("^[A-Za-z0-9._:-]{1,64}$") then . else "-" end;
+    def safe_name: if type == "string" and test("^[a-z0-9][a-z0-9-]{0,79}$") then . else "-" end;
+    def safe_code: if type == "string" and test("^[a-z0-9_]{1,64}$") then . else "unknown" end;
+    select((.blocked | type) == "array" and (.blocked | length) > 0)
+    | "count=\(.blocked | length) [\([.blocked[:8][] | select(type == "object")
+        | "\(.source | safe_source):\(.name | safe_name):\(.code | safe_code)"] | join(","))]"
+  ' 2>/dev/null || :
+}
+
 # Curator switches (#2011). The curator itself validates the exact values and
 # fails closed on garbage; the sweep only needs the off-switch direction.
 curator_enabled() {
@@ -1085,6 +1100,8 @@ if [ -f "$PROMOTER" ] && command -v python3 >/dev/null 2>&1; then
     persist_collect_summary "$summary"
     log "promotion-collect failed (non-fatal) edge-env=$edge_state$(collect_failure_digest "$summary")"
   fi
+  blocked_line="$(collect_blocked_digest "$summary")"
+  if [ -n "$blocked_line" ]; then log "promotion-collect-blocked $blocked_line"; fi
 else
   log "promotion skipped reason=missing-runtime"
 fi

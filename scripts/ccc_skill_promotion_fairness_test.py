@@ -398,7 +398,11 @@ class CollectRunRotationTests(unittest.TestCase):
                                   for p in self.outbox.iterdir()})
         self.assertFalse(list(self.sent.iterdir()))
         result = self.collect()
-        self.assertFalse(result["ok"])
+        # #2285: the deliberate skip is reported in `blocked`, not as a failure.
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["blocked"], [{"source": "local", "name": "legacy-skill",
+                                              "code": "description_trigger_missing"}])
         self.assertEqual([r["name"] for r in result["published"]], ["valid-skill"])
         self.assertEqual(path.read_bytes(), before[path.name][0])
         self.assertFalse(any(tid == invalid["transport_id"] for _, tid in self.acked))
@@ -419,6 +423,44 @@ class CollectRunRotationTests(unittest.TestCase):
                 if dry_run:
                     self.assertFalse(self.acked)
                     self.assertFalse(self.cursor_path.exists())
+
+    def test_remote_exporter_blocked_diagnostic_does_not_fail_collect(self):
+        """#2285: a current exporter leaves a triggerless legacy envelope in
+        place and reports it in `blocked`. The collector keeps that visible in
+        its own `blocked` field instead of folding it into `errors`, so the
+        run is `ok` while peers publish normally (field: one lane source,
+        2026-10-08..12 alternating `failed`)."""
+        def exporter(node, *, limit, blocked=None):
+            if node == "deep" and blocked is not None:
+                blocked.append({"source": node, "name": "legacy-skill",
+                                "code": "description_trigger_missing"})
+            return self.remote[node][:limit]
+        self.enterContext(patch.object(promotion, "_remote_envelopes", side_effect=exporter))
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                result = self.collect(dry_run=dry_run)
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(result["blocked"], [{"source": "deep", "name": "legacy-skill",
+                                                     "code": "description_trigger_missing"}])
+                self.assertTrue(result["published"])
+
+    def test_blocked_never_leaks_into_errors_via_collect_envelopes(self):
+        errors: list[dict[str, str]] = []
+        blocked: list[dict[str, str]] = []
+
+        def exporter(node, *, limit, blocked=None):
+            if blocked is not None:
+                blocked.append({"source": node, "name": "legacy-skill",
+                                "code": "description_trigger_missing"})
+            return self.remote[node][:limit]
+        self.enterContext(patch.object(promotion, "_remote_envelopes", side_effect=exporter))
+        promotion._collect_envelopes(self.config, errors, blocked=blocked)
+        self.assertEqual(errors, [])
+        self.assertTrue(blocked)
+        errors_only: list[dict[str, str]] = []
+        promotion._collect_envelopes(self.config, errors_only)
+        self.assertEqual(errors_only, [])
 
     def test_missing_cursor_starts_at_the_canonical_first_source(self):
         self.stage_local("local-skill-a", "2026-08-01T00:00:00Z")
