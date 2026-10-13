@@ -114,13 +114,21 @@ def _install_fake_pkg(prefix: Path, pkg: str, rel: str) -> Path:
     return d / rel
 
 
+def _isolate_global_roots(monkeypatch, node_prefix: Path | None = None) -> None:
+    """Pin every global-root input so the host's real installs never leak in."""
+    for var in ("PREFIX", "npm_config_prefix", "NPM_CONFIG_PREFIX"):
+        monkeypatch.delenv(var, raising=False)
+    root = None if node_prefix is None else node_prefix / "lib" / "node_modules"
+    monkeypatch.setattr(web_mcp, "_node_global_root", lambda: root)
+
+
 def test_termux_launches_servers_via_node(tmp_path: Path, monkeypatch) -> None:
     # #663: on Termux the `#!/usr/bin/env node` bin shebang is unresolved in the
     # agent MCP spawn context, so launch the global install via `node <cli>`.
     prefix = tmp_path / "usr"
     sx_cli = _install_fake_pkg(prefix, "mcp-searxng", "dist/cli.js")
     fc_cli = _install_fake_pkg(prefix, "firecrawl-mcp", "dist/index.js")
-    monkeypatch.setattr(web_mcp, "_is_termux", lambda: True)
+    _isolate_global_roots(monkeypatch)
     monkeypatch.setenv("PREFIX", str(prefix))
     opts = build_curated_web_mcp(_settings(tmp_path))
     assert opts is not None
@@ -132,8 +140,55 @@ def test_termux_launches_servers_via_node(tmp_path: Path, monkeypatch) -> None:
     assert "env" not in fc
 
 
-def test_non_termux_uses_npx(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(web_mcp, "_is_termux", lambda: False)
+def test_linux_global_install_launches_via_node_not_npx(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # #2299: `npx -y` keeps a resident `npm exec` wrapper per server per
+    # session (~80 MiB each); a global install under the node prefix is
+    # launched directly instead.
+    node_prefix = tmp_path / "usr"
+    sx_cli = _install_fake_pkg(node_prefix, "mcp-searxng", "dist/cli.js")
+    fc_cli = _install_fake_pkg(node_prefix, "firecrawl-mcp", "dist/index.js")
+    _isolate_global_roots(monkeypatch, node_prefix)
+    opts = build_curated_web_mcp(_settings(tmp_path))
+    assert opts is not None
+    assert opts["mcp_servers"]["searxng"] == {
+        "type": "stdio",
+        "command": "node",
+        "args": [str(sx_cli)],
+        "env": {"SEARXNG_URL": "https://search.example.com"},
+    }
+    assert opts["mcp_servers"]["firecrawl"] == {
+        "type": "stdio",
+        "command": "node",
+        "args": [str(fc_cli)],
+    }
+
+
+def test_npm_config_prefix_is_honoured(tmp_path: Path, monkeypatch) -> None:
+    prefix = tmp_path / "npm-global"
+    fc_cli = _install_fake_pkg(prefix, "firecrawl-mcp", "dist/index.js")
+    _isolate_global_roots(monkeypatch)
+    monkeypatch.setenv("npm_config_prefix", str(prefix))
+    opts = build_curated_web_mcp(_settings(tmp_path, mode="firecrawl"))
+    assert opts is not None
+    assert opts["mcp_servers"]["firecrawl"]["args"] == [str(fc_cli)]
+
+
+def test_partial_global_install_mixes_node_and_npx(tmp_path: Path, monkeypatch) -> None:
+    node_prefix = tmp_path / "usr"
+    _install_fake_pkg(node_prefix, "mcp-searxng", "dist/cli.js")
+    _isolate_global_roots(monkeypatch, node_prefix)
+    opts = build_curated_web_mcp(_settings(tmp_path))
+    assert opts is not None
+    assert opts["mcp_servers"]["searxng"]["command"] == "node"
+    assert opts["mcp_servers"]["firecrawl"]["command"] == "npx"
+    assert opts["mcp_servers"]["firecrawl"]["args"] == ["-y", "firecrawl-mcp"]
+
+
+def test_without_global_install_falls_back_to_npx(tmp_path: Path, monkeypatch) -> None:
+    _isolate_global_roots(monkeypatch, tmp_path / "empty-usr")  # no node_modules
+    monkeypatch.setenv("PREFIX", str(tmp_path / "empty-termux-usr"))
     opts = build_curated_web_mcp(_settings(tmp_path))
     assert opts is not None
     assert opts["mcp_servers"]["searxng"]["command"] == "npx"
@@ -141,11 +196,27 @@ def test_non_termux_uses_npx(tmp_path: Path, monkeypatch) -> None:
     assert opts["mcp_servers"]["firecrawl"]["command"] == "npx"
 
 
-def test_termux_without_global_install_falls_back_to_npx(
-    tmp_path: Path, monkeypatch
-) -> None:
-    monkeypatch.setattr(web_mcp, "_is_termux", lambda: True)
-    monkeypatch.setenv("PREFIX", str(tmp_path / "empty-usr"))  # no node_modules
-    opts = build_curated_web_mcp(_settings(tmp_path))
+def test_unreadable_package_json_falls_back_to_npx(tmp_path: Path, monkeypatch) -> None:
+    node_prefix = tmp_path / "usr"
+    pkg = node_prefix / "lib" / "node_modules" / "firecrawl-mcp"
+    pkg.mkdir(parents=True)
+    (pkg / "package.json").write_text("not json", encoding="utf-8")
+    _isolate_global_roots(monkeypatch, node_prefix)
+    opts = build_curated_web_mcp(_settings(tmp_path, mode="firecrawl"))
     assert opts is not None
-    assert opts["mcp_servers"]["searxng"]["command"] == "npx"
+    assert opts["mcp_servers"]["firecrawl"]["command"] == "npx"
+
+
+def test_node_global_root_follows_node_symlink(tmp_path: Path, monkeypatch) -> None:
+    real_bin = tmp_path / "opt" / "node-v22" / "bin"
+    real_bin.mkdir(parents=True)
+    (real_bin / "node").write_text("", encoding="utf-8")
+    link_dir = tmp_path / "bin"
+    link_dir.mkdir()
+    (link_dir / "node").symlink_to(real_bin / "node")
+    monkeypatch.setattr(web_mcp.shutil, "which", lambda name: str(link_dir / "node"))
+    assert web_mcp._node_global_root() == (
+        tmp_path / "opt" / "node-v22" / "lib" / "node_modules"
+    )
+    monkeypatch.setattr(web_mcp.shutil, "which", lambda name: None)
+    assert web_mcp._node_global_root() is None

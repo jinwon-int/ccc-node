@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Tests for claude/mcp-setup.sh platform branching (#663): Termux/Android must
-# register stdio MCP servers as `node <abs cli>`; other platforms keep
-# `npx -y <pkg>`. Uses fake `claude`/`npm`/`uname` on PATH so the assertion runs
+# Tests for claude/mcp-setup.sh stdio launch (#663, #2299): every platform
+# registers a global install as `node <abs cli>`; Linux falls back to
+# `npx -y <pkg>` when no global install is possible, Termux skips. Uses fake `claude`/`npm`/`uname` on PATH so the assertion runs
 # anywhere (including on a Termux host, where real `uname -o` would otherwise
 # force Termux detection).
 set -uo pipefail
@@ -41,9 +41,13 @@ cat > "$BIN/claude" <<EOF
 echo "\$*" >> "$TMP/claude.log"
 exit 0
 EOF
+# FAKE_NPM_ROOT repoints `npm root -g`; FAKE_NPM_FAIL=1 makes `ls -g` and
+# `install -g` fail (no global install possible, e.g. no prefix write access).
 cat > "$BIN/npm" <<EOF
 #!$BASH_BIN
-if [ "\$1" = "root" ] && [ "\$2" = "-g" ]; then echo "$GROOT"; exit 0; fi
+echo "\$*" >> "$TMP/npm.log"
+if [ "\$1" = "root" ] && [ "\$2" = "-g" ]; then echo "\${FAKE_NPM_ROOT:-$GROOT}"; exit 0; fi
+[ "\${FAKE_NPM_FAIL:-0}" = 1 ] && exit 1
 exit 0
 EOF
 cat > "$BIN/uname" <<EOF
@@ -55,12 +59,13 @@ chmod +x "$BIN/claude" "$BIN/npm" "$BIN/uname"
 FHOME="$TMP/home"; mkdir -p "$FHOME/.hermes"
 echo 'FIRECRAWL_API_KEY=fc-test-key' > "$FHOME/.hermes/.env"
 
-run() { # run <1=termux|0=linux>
-  : > "$TMP/claude.log"
+run() { # run <1=termux|0=linux> [extra env...]
+  : > "$TMP/claude.log"; : > "$TMP/npm.log"
   local extra=()
   [ "$1" = 1 ] && extra=(TERMUX_VERSION=0.test)
-  env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" "${extra[@]}" \
-    bash "$SUT" >/dev/null 2>&1 || true
+  shift
+  env -i PATH="$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$FHOME" ${extra[@]+"${extra[@]}"} "$@" \
+    bash "$SUT" >"$TMP/run.out" 2>&1 || true
 }
 
 # Termux/Android → node <cli>
@@ -71,11 +76,30 @@ ok "termux: firecrawl via node cli" 'grep -Eq "add firecrawl .* -- node .*/firec
 ok "termux: no npx used"            '! grep -q -- "-- npx" "$TMP/claude.log"'
 ok "termux: searxng env preserved"  'grep -q "SEARXNG_URL=" "$TMP/claude.log"'
 
-# Non-Termux → npx -y
+# Linux with a resolvable global install → node <cli> too (#2299: npx -y keeps
+# a resident `npm exec` wrapper, ~80 MiB per server per session)
 run 0
-ok "linux: searxng via npx -y"      'grep -Eq "add searxng .* -- npx -y mcp-searxng" "$TMP/claude.log"'
-ok "linux: firecrawl via npx -y"    'grep -Eq "add firecrawl .* -- npx -y firecrawl-mcp" "$TMP/claude.log"'
-ok "linux: no node-cli launch"      '! grep -q -- "-- node " "$TMP/claude.log"'
+ok "linux: searxng via node cli"    'grep -Eq "add searxng .* -- node .*/mcp-searxng/dist/cli.js" "$TMP/claude.log"'
+ok "linux: context7 via node cli"   'grep -Eq "add context7 .* -- node .*/@upstash/context7-mcp/dist/cli.js" "$TMP/claude.log"'
+ok "linux: firecrawl via node cli"  'grep -Eq "add firecrawl .* -- node .*/firecrawl-mcp/dist/cli.js" "$TMP/claude.log"'
+ok "linux: no npx used"             '! grep -q -- "-- npx" "$TMP/claude.log"'
+ok "linux: searxng env preserved"   'grep -Eq "add searxng -s user -e SEARXNG_URL=.* -- node " "$TMP/claude.log"'
+ok "linux: already-installed pkg not reinstalled" '! grep -q "^install -g" "$TMP/npm.log"'
+
+# Linux without a possible global install → npx -y fallback, with a notice
+EMPTY_GROOT="$TMP/empty-gmodules"; mkdir -p "$EMPTY_GROOT"
+run 0 FAKE_NPM_ROOT="$EMPTY_GROOT" FAKE_NPM_FAIL=1
+ok "linux fallback: searxng via npx -y"   'grep -Eq "add searxng .* -- npx -y mcp-searxng" "$TMP/claude.log"'
+ok "linux fallback: context7 via npx -y"  'grep -Eq "add context7 .* -- npx -y @upstash/context7-mcp" "$TMP/claude.log"'
+ok "linux fallback: firecrawl via npx -y" 'grep -Eq "add firecrawl .* -- npx -y firecrawl-mcp" "$TMP/claude.log"'
+ok "linux fallback: no node-cli launch"   '! grep -q -- "-- node " "$TMP/claude.log"'
+ok "linux fallback: install was attempted" 'grep -q "^install -g mcp-searxng" "$TMP/npm.log"'
+ok "linux fallback: notice printed"       'grep -q "falling back to npx -y" "$TMP/run.out"'
+
+# Termux without a possible global install → skipped, never npx (#663)
+run 1 FAKE_NPM_ROOT="$EMPTY_GROOT" FAKE_NPM_FAIL=1
+ok "termux fallback: no npx used"         '! grep -q -- "-- npx" "$TMP/claude.log"'
+ok "termux fallback: servers skipped"     'grep -q "SKIPPED — could not install/resolve mcp-searxng globally" "$TMP/run.out"'
 
 # family-skills + family-wiki (#1678). The absolute python3 path launches the
 # in-repo stdlib server; wiki registers only when wiki-agent is on PATH and

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-import sys
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -55,45 +55,70 @@ def _secret_value(value: Any) -> str:
     return str(getter() if callable(getter) else value or "").strip()
 
 
-def _is_termux() -> bool:
-    if os.environ.get("TERMUX_VERSION"):
-        return True
-    if sys.platform.startswith("android"):
-        return True
-    return os.environ.get("PREFIX", "").endswith("/com.termux/files/usr")
-
-
-def _global_node_cli(pkg: str) -> str | None:
-    """Absolute path to a globally-installed package's first bin entry under the
-    Termux prefix, or None. Reads `bin` from the package's own package.json."""
-    prefix = os.environ.get("PREFIX")
-    if not prefix:
+def _node_global_root() -> Path | None:
+    """`<node prefix>/lib/node_modules` for the `node` on PATH (the npm default
+    global root, e.g. /usr/lib/node_modules or an nvm prefix), or None."""
+    node = shutil.which("node")
+    if not node:
         return None
-    pkg_dir = Path(prefix) / "lib" / "node_modules" / pkg
+    return Path(os.path.realpath(node)).parent.parent / "lib" / "node_modules"
+
+
+def _global_module_roots() -> list[Path]:
+    """Candidate npm global roots, most specific first: the Termux `$PREFIX`,
+    an explicit npm prefix, then the prefix of the `node` on PATH."""
+    roots: list[Path] = []
+    for prefix in (
+        os.environ.get("PREFIX"),
+        os.environ.get("npm_config_prefix") or os.environ.get("NPM_CONFIG_PREFIX"),
+    ):
+        if prefix:
+            roots.append(Path(prefix) / "lib" / "node_modules")
+    node_root = _node_global_root()
+    if node_root is not None:
+        roots.append(node_root)
+    return list(dict.fromkeys(roots))
+
+
+def _package_cli(pkg_dir: Path) -> str | None:
+    """Absolute path to a package's first bin entry (from its package.json)."""
     try:
         meta = json.loads((pkg_dir / "package.json").read_text(encoding="utf-8"))
-    except OSError:
+    except (OSError, ValueError):
         return None
-    bin_field = meta.get("bin")
+    bin_field = meta.get("bin") if isinstance(meta, dict) else None
     rel = bin_field if isinstance(bin_field, str) else next(iter((bin_field or {}).values()), None)
-    if not rel:
+    if not isinstance(rel, str) or not rel:
         return None
     cli = pkg_dir / rel
     return str(cli) if cli.is_file() else None
 
 
+def _global_node_cli(pkg: str) -> str | None:
+    """Absolute path to a globally-installed package's first bin entry, or None."""
+    for root in _global_module_roots():
+        cli = _package_cli(root / pkg)
+        if cli:
+            return cli
+    return None
+
+
 def _stdio_server(pkg: str, env: dict[str, str] | None = None) -> dict[str, Any]:
     """Build a stdio MCP server launcher for an npm package.
 
-    The package bins start with `#!/usr/bin/env node`; on Termux/Android the
-    agent's MCP spawn context does not carry termux-exec, so `/usr/bin/env` is
-    unresolved and `npx -y <pkg>` fails with "<bin>: not found". There, launch
-    the globally-installed package via `node <abs cli>` (bypasses the shebang);
-    fall back to `npx -y <pkg>` elsewhere and when the global cli is unresolved.
-    (#663)
+    A globally-installed package is launched as `node <abs cli>` on every
+    platform:
+    - Termux/Android (#663): the bins start with `#!/usr/bin/env node`, and
+      the agent's MCP spawn context does not carry termux-exec, so `npx -y`
+      fails with "<bin>: not found".
+    - Linux (#2299): `npx -y` keeps a resident `npm exec` wrapper (~80 MiB)
+      per server per session. On 4 GiB nodes that is a quarter of the
+      session-guard RSS limit.
+
+    `npx -y <pkg>` remains the fallback when no global install resolves.
     """
     server: dict[str, Any] = {"type": "stdio"}
-    cli = _global_node_cli(pkg) if _is_termux() else None
+    cli = _global_node_cli(pkg)
     if cli:
         server["command"] = "node"
         server["args"] = [cli]
