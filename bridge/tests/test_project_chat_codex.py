@@ -131,6 +131,7 @@ class ProviderWorkFakeSession(CloseableFakeSession):
         self.background_age = 30.0
         self.probe_error = False
         self.reader_alive = True
+        self._task_ages: list[float] | None = None
 
     def provider_reader_alive(self) -> bool:
         return self.reader_alive
@@ -139,6 +140,15 @@ class ProviderWorkFakeSession(CloseableFakeSession):
         if self.probe_error:
             raise RuntimeError("probe failed")
         return self.inflight
+
+    def recent_background_task_count(self, now: float, max_age: float) -> int:
+        return sum(1 for age in self.task_ages if age < max_age)
+
+    @property
+    def task_ages(self) -> list[float]:
+        return self._task_ages if self._task_ages is not None else (
+            [self.background_age] * self.background
+        )
 
     def background_workload_snapshot(self, now: float) -> tuple[int, float]:
         return self.background, self.background_age if self.background else 0.0
@@ -938,6 +948,43 @@ async def test_session_guard_ignores_background_tasks_older_than_a_day(
 
     assert session.close_calls == 1
     assert snapshot["evictions"] == 1
+
+
+@pytest.mark.anyio
+async def test_session_guard_fresh_background_task_survives_a_forgotten_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-task age: a >24 h task must not unpin a fresh one in the same session."""
+
+    handler, _runtime = _rss_pressure_handler(tmp_path, monkeypatch)
+    session = ProviderWorkFakeSession("mixed-background")
+    session._task_ages = [25 * 60 * 60.0, 60.0]
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=session, last_used_at=10.0)
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=300.0)
+
+    assert session.close_calls == 0
+    assert snapshot["busy_deferrals"] == 1
+
+
+@pytest.mark.anyio
+async def test_busy_deferrals_count_only_sessions_under_eviction_pressure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler, _runtime = _rss_pressure_handler(tmp_path, monkeypatch, rss_mb=0.0)
+    session = ProviderWorkFakeSession("busy-but-unpressured")
+    session.inflight = True
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=session, last_used_at=290.0)
+    )
+
+    for tick in range(3):
+        snapshot = await handler.enforce_session_resource_limits(now=300.0 + tick)
+
+    assert session.close_calls == 0
+    assert snapshot["busy_deferrals"] == 0
 
 
 @pytest.mark.anyio

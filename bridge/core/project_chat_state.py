@@ -608,6 +608,16 @@ class ProjectChatStateMixin:
                     type(session).__name__,
                 )
                 return True
+        recent = getattr(session, "recent_background_task_count", None)
+        if callable(recent):
+            try:
+                return int(recent(now, cls._BACKGROUND_BUSY_MAX_AGE_SECONDS)) > 0
+            except Exception:
+                logger.debug(
+                    "Recent background task probe failed: provider=%s",
+                    type(session).__name__,
+                )
+                return True
         snapshot = getattr(session, "background_workload_snapshot", None)
         if callable(snapshot):
             try:
@@ -627,22 +637,40 @@ class ProjectChatStateMixin:
 
     def _spare_busy_candidates(
         self, idle: tuple[IdleSessionCandidate, ...], now: float
-    ) -> tuple[list[IdleSessionCandidate], int]:
-        """Split idle candidates into evictable ones and a busy count.
+    ) -> tuple[list[IdleSessionCandidate], list[IdleSessionCandidate]]:
+        """Split idle candidates into evictable and busy ones.
 
         Done before TTL/LRU/RSS selection so a busy session never occupies a
         slot the LRU cap would otherwise fill with a genuinely idle one.
         """
 
         free: list[IdleSessionCandidate] = []
-        busy = 0
+        busy: list[IdleSessionCandidate] = []
         for candidate in idle:
             entry = self._agent_session_registry.peek_idle_cached_if_same(candidate)
             if entry is not None and self._provider_session_busy(entry.session, now):
-                busy += 1
+                busy.append(candidate)
             else:
                 free.append(candidate)
         return free, busy
+
+    @staticmethod
+    def _count_pressured_busy(
+        busy: list[IdleSessionCandidate],
+        now: float,
+        ttl: int,
+        under_pressure: bool,
+    ) -> int:
+        """Count busy sessions the guard would have evicted were they idle.
+
+        ``busy_deferrals`` must mean "work spared from eviction", not "a busy
+        session existed during a quiet tick": TTL expiry, or cap/memory
+        pressure that applies to every idle session.
+        """
+
+        if under_pressure:
+            return len(busy)
+        return sum(1 for candidate in busy if now - candidate.last_used_at >= ttl)
 
     def _any_resident_provider_busy(self, now: float) -> bool:
         return any(
@@ -741,8 +769,15 @@ class ProjectChatStateMixin:
                     if candidate not in candidates:
                         candidates.append(candidate)
 
+            deferred = self._count_pressured_busy(
+                busy,
+                current,
+                ttl,
+                metrics.resident_sessions > maximum
+                or (memory_high and metrics.active_sessions == 0),
+            )
             evicted = await self._evict_guard_candidates(
-                candidates, current, rss_mb, deferred=busy
+                candidates, current, rss_mb, deferred=deferred
             )
             if evicted:
                 self._session_guard_evictions += evicted

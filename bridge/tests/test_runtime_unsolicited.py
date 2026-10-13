@@ -428,6 +428,20 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
             (0, 0.0),
         )
 
+    async def test_recent_background_task_count_is_per_task(self) -> None:
+        """#2291: the guard's age cap applies per task, not to the oldest."""
+
+        session, client = await self._start_session()
+        client.turn_scripts.append("background")
+        await _collect(session.send_turn("run validation"))
+        now = asyncio.get_running_loop().time()
+        self.assertEqual(session.recent_background_task_count(now, 60.0), 1)
+
+        # A second, much older task: only the fresh one is within the cap.
+        session._background_tasks["bg-forgotten"] = now - 25 * 60 * 60
+        self.assertEqual(session.recent_background_task_count(now, 24 * 60 * 60), 1)
+        self.assertEqual(session.background_workload_snapshot(now)[0], 2)
+
     async def test_typed_task_updates_release_only_terminal_background_work(self) -> None:
         session, client = await self._start_session()
         for task_id in ("completed", "killed", "running"):
