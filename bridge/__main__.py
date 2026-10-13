@@ -175,6 +175,69 @@ def _build_distill_environment(
     return environment
 
 
+def _bounded_int_env(
+    environment: Mapping[str, str], name: str, default: int, minimum: int
+) -> int:
+    raw = (environment.get(name) or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        return default
+    return value if value >= minimum else default
+
+
+def _build_global_local_sink_worker(
+    settings: Settings,
+    distill_journal: Any,
+    distill_provider: str | None,
+) -> Any:
+    """Node-global local sink for off/curated bridge memory modes (#2296).
+
+    Returns ``None`` when bridge distill is off (nothing is extracted) or the
+    mode is not one of the unpartitioned ``off``/``curated`` modes.
+
+    ``off``/``curated`` mean "no audience partition", not "stop saving
+    memory": the bridge owns distill (``CCC_BRIDGE_DISTILL_MANAGED``), so the
+    hook path stands down and this sink writes the extraction into the node's
+    unscoped state dir (``$CCC_STATE_DIR`` else ``<claude-root>/state``, the
+    ``state_contract.default_state_dir`` convention) with the same bounds the
+    hook path uses. No audience nunchi feed is kicked: the global nunchi lane
+    reads the journal via ``claude/hooks/nunchi/ingest-cron.sh``.
+    """
+
+    if distill_provider is None or settings.bridge_memory_mode not in {
+        "off",
+        "curated",
+    }:
+        return None
+    from telegram_bot.core.state_contract import default_state_dir
+    from telegram_bot.memory.distill_local_worker import (
+        CodexDistillLocalSinkWorker,
+        GlobalLocalMemoryRoute,
+    )
+
+    environment = with_wrapper_environment(os.environ, settings)
+    claude_root = Path(settings.claude_settings_path).expanduser().parent
+    route = GlobalLocalMemoryRoute(
+        state_dir=Path(os.path.abspath(default_state_dir(settings, environment))),
+        cache_dir=Path(os.path.abspath(claude_root / "hooks" / "cache")),
+        memory_dir=Path(os.path.abspath(claude_root / "memories")),
+    )
+    return CodexDistillLocalSinkWorker(
+        distill_journal,
+        global_route=route,
+        environment=environment,
+        max_facts=_bounded_int_env(environment, "CCC_LOCAL_FACTS_MAX", 1000, 1),
+        max_resume_bytes=_bounded_int_env(
+            environment, "CCC_RESUME_WRITE_MAX_BYTES", 4000, 256
+        ),
+        indexer_path=(
+            Path(settings.codex_memory_materializer_path).expanduser().parent
+            / "ccc-memory-index.sh"
+        ),
+    )
+
+
 def _finite_autonomous_spend_gate(
     settings: Settings,
     usage_meter: Any,
@@ -603,6 +666,12 @@ def _build_standard_context(
 
         memory_promoter = CodexMemoryPromoter(
             shared_memory_audience(settings).root,
+        )
+    else:
+        distill_local_sink_worker = _build_global_local_sink_worker(
+            settings,
+            distill_journal,
+            distill_provider,
         )
     distill_wiki_sink_worker = None
     if (

@@ -1085,6 +1085,8 @@ worker = context.distill_local_sink_worker
 assert isinstance(worker, CodexDistillLocalSinkWorker), type(worker)
 assert isinstance(context.memory_promoter, CodexMemoryPromoter), type(context.memory_promoter)
 assert worker._audience_root == root / "audiences"
+assert worker._global_route is None
+assert worker.global_route_enabled is False
 assert worker._indexer_path == (
     Path(settings.codex_memory_materializer_path).parent / "ccc-memory-index.sh"
 )
@@ -1097,6 +1099,67 @@ print("COMPOSED-LOCAL-SINK-WORKER-OK")
     )
     assert result.returncode == 0, result.stderr
     assert "COMPOSED-LOCAL-SINK-WORKER-OK" in result.stdout
+
+
+@pytest.mark.parametrize("mode", ["off", "curated"])
+def test_build_context_composes_node_global_local_sink_for_unpartitioned_modes(
+    tmp_path, mode
+):
+    """#2296: off/curated mean "no audience partition", not "no memory"."""
+
+    result = _run_probe(
+        f"""
+import os
+from pathlib import Path
+
+root = Path(os.environ["PROBE_ROOT"])
+(root / "project").mkdir(parents=True, exist_ok=True)
+os.environ.update({{
+    "PROJECT_ROOT": str(root / "project"),
+    "TELEGRAM_BOT_TOKEN": "123456:test",
+    "ALLOWED_USER_IDS": "1",
+    "HOME": str(root / "home"),
+    "CCC_CLAUDE_DIR": str(root / "claude"),
+    "CCC_BRIDGE_MEMORY_MODE": "{mode}",
+    "CCC_LOCAL_FACTS_MAX": "1500",
+}})
+os.environ.pop("CCC_STATE_DIR", None)
+
+from telegram_bot.__main__ import build_context, create_app, load_runtime_settings
+from telegram_bot.memory.distill_local_worker import CodexDistillLocalSinkWorker
+
+settings = load_runtime_settings()
+context = build_context(settings)
+worker = context.distill_local_sink_worker
+assert isinstance(worker, CodexDistillLocalSinkWorker), type(worker)
+assert context.memory_promoter is None
+assert worker._audience_root is None
+assert worker.global_route_enabled is True
+route = worker._global_route
+assert route.state_dir == root / "claude" / "state", route
+assert route.cache_dir == root / "claude" / "hooks" / "cache", route
+assert route.memory_dir == root / "claude" / "memories", route
+assert worker._nunchi_feed_path is None
+assert worker._max_facts == 1500
+assert worker._indexer_path == (
+    Path(settings.codex_memory_materializer_path).parent / "ccc-memory-index.sh"
+)
+assert create_app(context)._distill_local_sink_worker is worker
+
+# An explicit CCC_STATE_DIR wins, matching state_contract.default_state_dir.
+os.environ["CCC_STATE_DIR"] = str(root / "explicit-state")
+explicit = build_context(load_runtime_settings()).distill_local_sink_worker
+assert explicit._global_route.state_dir == root / "explicit-state"
+
+# Distill off: nothing is extracted, so no sink is composed.
+os.environ["CCC_MEMORY_DISTILL_PROVIDER"] = "off"
+assert build_context(load_runtime_settings()).distill_local_sink_worker is None
+print("COMPOSED-GLOBAL-LOCAL-SINK-OK")
+""",
+        probe_root=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "COMPOSED-GLOBAL-LOCAL-SINK-OK" in result.stdout
 
 
 def test_build_context_composes_wiki_sink_only_when_policy_enabled(tmp_path):

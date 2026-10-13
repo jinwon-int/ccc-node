@@ -135,6 +135,92 @@ async def test_extraction_marks_routed_work_pending_and_missing_route_unroutable
 
 
 @pytest.mark.anyio
+async def test_global_route_adopts_unroutable_once_and_never_routed_work(
+    tmp_path: Path,
+) -> None:
+    """#2296: the node-global sink replays orphaned UNROUTABLE jobs exactly once."""
+
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    orphan = await extracted_job(journal, memory_audience=None, memory_scope=None)
+    assert orphan.local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+
+    # Audience-only and explicitly audience-only claims leave it alone.
+    assert journal.claim_local_sink(orphan.job_id, owner_token="aud") is None
+    assert (
+        journal.claim_local_sink(
+            orphan.job_id, owner_token="aud", audience_routes=True, global_route=False
+        )
+        is None
+    )
+    assert journal.get(orphan.job_id).local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+
+    claimed = journal.claim_local_sink(
+        orphan.job_id,
+        owner_token="global",
+        audience_routes=False,
+        global_route=True,
+        now=fixtures.utc(2),
+    )
+    assert claimed is not None
+    assert claimed.local_sink_status is DistillLocalSinkStatus.RUNNING
+    assert claimed.memory_audience is None and claimed.memory_scope is None
+    # A route-free retry survives a reopen (the record validates on read).
+    failed = journal.mark_local_sink_retryable_failed(
+        orphan.job_id,
+        owner_token="global",
+        lease_epoch=claimed.local_sink_lease_epoch,
+        error_code="local_sink_io_failed",
+    )
+    reopened = DistillJournal(journal.root)
+    reopened.initialize()
+    assert reopened.get(orphan.job_id) == failed
+    assert journal.claim_local_sink(orphan.job_id, owner_token="aud") is None
+    retried = journal.claim_local_sink(
+        orphan.job_id, owner_token="global", audience_routes=False, global_route=True
+    )
+    assert retried is not None and retried.local_sink_attempts == 2
+    done = journal.mark_local_sink_done(
+        orphan.job_id,
+        owner_token="global",
+        lease_epoch=retried.local_sink_lease_epoch,
+    )
+    assert done.local_sink_status is DistillLocalSinkStatus.DONE
+    # Idempotent: a DONE job is never claimed again by any route.
+    assert (
+        journal.claim_local_sink(
+            orphan.job_id, owner_token="again", audience_routes=True, global_route=True
+        )
+        is None
+    )
+
+    routed_journal = DistillJournal(tmp_path / "routed")
+    routed_journal.initialize()
+    routed = await extracted_job(routed_journal)
+    assert (
+        routed_journal.claim_local_sink(
+            routed.job_id, owner_token="global", audience_routes=False, global_route=True
+        )
+        is None
+    )
+    assert routed_journal.get(routed.job_id).local_sink_status is DistillLocalSinkStatus.PENDING
+
+
+def test_route_free_local_sink_may_not_start_pending(tmp_path: Path) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = journal.enqueue_once(
+        provider="codex",
+        thread_id="thread-pending-routeless",
+        trigger=DistillTrigger.NEW_COMMAND,
+    )
+    payload = job.to_dict()
+    payload["local_sink_status"] = "pending"
+    with pytest.raises(ValueError, match="requires a memory route"):
+        DistillJob.from_dict(payload)
+
+
+@pytest.mark.anyio
 async def test_local_sink_lease_is_fenced_recoverable_and_independent(
     tmp_path: Path,
 ) -> None:

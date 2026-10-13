@@ -100,13 +100,21 @@ class MemoryDistillMixin:
             if isinstance(stored_audience, str) and isinstance(stored_scope, str):
                 memory_audience = stored_audience
                 memory_scope = stored_scope
-        if memory_audience is None and not getattr(
-            self, "_local_sink_unroutable_warned", False
+        if (
+            memory_audience is None
+            and not getattr(self, "_local_sink_unroutable_warned", False)
+            and getattr(
+                getattr(self, "_distill_local_sink_worker", None),
+                "global_route_enabled",
+                False,
+            )
+            is not True
         ):
             # The journal marks a routeless job UNROUTABLE with no error_code and
             # no log line, so a node whose memory mode yields no audience loses the
             # local lane (resume.md, memory facts) silently. The wiki sink is
-            # unaffected. Warn once per process so the gap is observable.
+            # unaffected. Warn once per process so the gap is observable. A
+            # node-global sink (off/curated, #2296) adopts such jobs instead.
             self._local_sink_unroutable_warned = True
             logger.warning(
                 "distill local sink unroutable: bridge_memory_mode=%r resolves no memory "
@@ -508,16 +516,21 @@ class MemoryDistillMixin:
         interval = float(
             getattr(_memory_settings(self), "distill_extraction_poll_interval", 300.0) or 300.0
         )
+        eligible = {
+            DistillLocalSinkStatus.PENDING,
+            DistillLocalSinkStatus.RETRYABLE_FAILED,
+        }
+        if getattr(worker, "global_route_enabled", False) is True:
+            # off/curated (#2296): route-free work goes to the node-global
+            # sink, and previously orphaned UNROUTABLE jobs are adopted once.
+            eligible.add(DistillLocalSinkStatus.UNROUTABLE)
         while not stop_event.is_set():
             try:
                 jobs = await self._distill_sweep_jobs(interval)
                 for job in jobs:
                     if stop_event.is_set():
                         break
-                    if job.local_sink_status not in (
-                        DistillLocalSinkStatus.PENDING,
-                        DistillLocalSinkStatus.RETRYABLE_FAILED,
-                    ):
+                    if job.local_sink_status not in eligible:
                         continue
                     await worker.write_once(job_id=job.job_id)
             except asyncio.CancelledError:

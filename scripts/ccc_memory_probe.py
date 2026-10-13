@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 import re
@@ -42,6 +43,97 @@ def sqlite_probe(path: Path, count_sql: str) -> tuple[str, int]:
         return "ok", count
     except (OSError, sqlite3.Error, TypeError, ValueError):
         return "error", 0
+
+
+_MAX_LOCAL_FACTS_SCAN_BYTES = 8 * 1024 * 1024
+
+
+def _iso_epoch(value: object) -> int | None:
+    """Parse one ISO-8601 timestamp (naive = UTC) into epoch seconds."""
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
+def _epoch_iso(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _freshness(epoch: int | None, now: int) -> tuple[str | None, int]:
+    # Cron and the probe may straddle a clock correction (five minutes, the
+    # ingest receipt's tolerance); a farther-future stamp is not "fresh".
+    if epoch is None or epoch <= 0 or epoch > now + 300:
+        return None, -1
+    return _epoch_iso(epoch), max(0, now - epoch)
+
+
+def nunchi_last_ingest(path: Path, now: int) -> tuple[str | None, int]:
+    """``max(created_at)`` of ``peer_facts`` — when nunchi last stored a fact.
+
+    The DB file's mtime is not this signal: snapshot/maintenance writes touch
+    the file while nothing new is ingested (#2296). Body-free: one aggregate.
+    """
+    if not path.is_file():
+        return None, -1
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+        try:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("PRAGMA busy_timeout=200")
+            row = db.execute("SELECT MAX(created_at) FROM peer_facts").fetchone()
+        finally:
+            db.close()
+    except (OSError, sqlite3.Error):
+        return None, -1
+    return _freshness(_iso_epoch(row[0] if row else None), now)
+
+
+def local_facts_probe(path: Path, now: int) -> dict[str, object]:
+    """Latest ``observed_at`` in the node's local facts file (body-free)."""
+    payload: dict[str, object] = {
+        "exists": path.is_file(),
+        "facts": 0,
+        "last_ingest_at": None,
+        "age_seconds": -1,
+        "source": "none",
+    }
+    if not payload["exists"]:
+        return payload
+    latest: int | None = None
+    try:
+        size = path.stat().st_size
+        if size <= _MAX_LOCAL_FACTS_SCAN_BYTES:
+            facts = 0
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        value = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(value, dict):
+                        continue
+                    facts += 1
+                    stamp = _iso_epoch(value.get("observed_at"))
+                    if stamp is not None and stamp <= now + 300:
+                        latest = stamp if latest is None else max(latest, stamp)
+            payload["facts"] = facts
+            if latest is not None:
+                payload["source"] = "observed_at"
+        if latest is None:
+            latest = int(path.stat().st_mtime)
+            payload["source"] = "mtime"
+    except OSError:
+        return payload
+    payload["last_ingest_at"], payload["age_seconds"] = _freshness(latest, now)
+    return payload
 
 
 def _termux_palace_error() -> dict[str, object]:
@@ -927,6 +1019,11 @@ def probe_nunchi(
         nunchi_reasons = []
         nunchi_status = "off"
 
+    last_ingest_at, last_ingest_age = (
+        nunchi_last_ingest(db_path, now)
+        if mode == "on" and db_integrity == "ok"
+        else (None, -1)
+    )
     payload: dict[str, object] = {
         "status": nunchi_status,
         "mode": mode,
@@ -939,6 +1036,8 @@ def probe_nunchi(
             "facts": facts,
             "bytes": db_path.stat().st_size if db_path.is_file() else 0,
             "age_seconds": age_seconds(db_path, now),
+            "last_ingest_at": last_ingest_at,
+            "last_ingest_age_seconds": last_ingest_age,
         },
         "snapshot": {
             "exists": snapshot.is_file(),
@@ -1217,9 +1316,13 @@ def main() -> int:
                 "audience_scoped": audience_probe,
             }
         )
+    facts_file = Path(
+        os.environ.get("CCC_MEMORY_FACTS_FILE") or state / "memory-facts.jsonl"
+    )
     payload = {
         "nunchi": nunchi,
         "mempalace": mempalace,
+        "local_facts": local_facts_probe(facts_file, now),
     }
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     return 0

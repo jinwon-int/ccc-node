@@ -349,6 +349,32 @@ if ! is_disabled "$wiki_enabled"; then
   wiki_status="$(status_for "$wiki_file" "$WIKI_TTL")"
 fi
 
+# Ingest freshness (#2296): readiness alone reported `nunchi: ok` for a DB that
+# had stored nothing for weeks. Judge when nunchi last stored a fact
+# (max peer_facts.created_at) and when local facts last advanced (max
+# observed_at). Timestamps only — never a fact body.
+STALE_HOURS="${CCC_MEMORY_STALE_HOURS:-72}"
+case "$STALE_HOURS" in ''|*[!0-9]*|0) STALE_HOURS=72 ;; esac
+freshness_json="$(jq -c --argjson stale_hours "$STALE_HOURS" '
+  def judge($age): if $age < 0 then "unknown" elif $age > ($stale_hours * 3600) then "stale" else "ok" end;
+  (.nunchi.mode // "unknown") as $mode
+  | (.nunchi.db.last_ingest_age_seconds // -1) as $n_age
+  | (.local_facts.age_seconds // -1) as $l_age
+  | (if $mode == "on" then judge($n_age) else "off" end) as $n_status
+  | (if (.local_facts.exists // false) then judge($l_age) else "missing" end) as $l_status
+  | {
+      status:(
+        if $mode != "on" then "off"
+        elif $n_status == "stale" or $l_status == "stale" then "stale"
+        elif $n_status == "ok" then "ok"
+        else "unknown" end
+      ),
+      stale_hours:$stale_hours,
+      nunchi:{status:$n_status, last_ingest_at:(.nunchi.db.last_ingest_at // null), age_seconds:$n_age},
+      local_facts:{status:$l_status, last_ingest_at:(.local_facts.last_ingest_at // null), age_seconds:$l_age, source:(.local_facts.source // "none")}
+    }' <<<"$memory_probe_json" 2>/dev/null)"
+[ -n "$freshness_json" ] || freshness_json="{\"status\":\"unknown\",\"stale_hours\":$STALE_HOURS}"
+
 if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
   jq -n \
     --arg profile "$PROFILE" \
@@ -365,6 +391,7 @@ if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
     --arg journal_provider "$CCC_CHECK_JOURNAL_PROVIDER" \
     --arg journal_source "$CCC_CHECK_JOURNAL_SOURCE" \
     --argjson writeback "$writeback_json" \
+    --argjson freshness "$freshness_json" \
     --arg index_db "$index_db" \
     --argjson ttl "$TTL" \
     --argjson wiki_age "$(age_for "$wiki_file")" \
@@ -377,7 +404,8 @@ if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
       nunchi:$nunchi,
       mempalace:$mempalace,
       journal_selection:{path:$journal_path, reason:$journal_reason, provider:$journal_provider, source:$journal_source},
-      writeback_queue:$writeback}'
+      writeback_queue:$writeback,
+      freshness:$freshness}'
   exit 0
 fi
 
@@ -428,6 +456,18 @@ printf -- '- nunchi_audiences: enabled=%s root=%s scopes=%s private=%s shared=%s
   "${probe_f[14]:-}" "${probe_f[15]:-}"
 printf -- '- mempalace: %s required=%s embeddings=%s reasons=%s\n' \
   "${probe_f[16]:-}" "${probe_f[17]:-}" "${probe_f[18]:-}" "${probe_f[19]:-}"
+mapfile -t fresh_f < <(jq -r '
+  (try (.status) catch ""),
+  (try (.stale_hours) catch ""),
+  (try (.nunchi.status // "unknown") catch ""),
+  (try (.nunchi.last_ingest_at // "none") catch ""),
+  (try (.nunchi.age_seconds // -1) catch ""),
+  (try (.local_facts.status // "unknown") catch ""),
+  (try (.local_facts.last_ingest_at // "none") catch ""),
+  (try (.local_facts.age_seconds // -1) catch "")' <<<"$freshness_json")
+printf -- '- freshness: %s stale_hours=%s nunchi=%s nunchi_last=%s nunchi_age=%ss local_facts=%s local_facts_last=%s local_facts_age=%ss\n' \
+  "${fresh_f[0]:-}" "${fresh_f[1]:-}" "${fresh_f[2]:-}" "${fresh_f[3]:-}" \
+  "${fresh_f[4]:-}" "${fresh_f[5]:-}" "${fresh_f[6]:-}" "${fresh_f[7]:-}"
 mapfile -t wb_f < <(jq -r '
   (try (.status) catch ""),
   (try (.jobs) catch ""),

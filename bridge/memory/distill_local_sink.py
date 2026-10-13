@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -67,7 +68,10 @@ class CodexLocalMemorySink:
         audience: str,
         max_facts: int = 1000,
         max_resume_bytes: int = 4000,
+        resume_never_regresses: bool = False,
     ) -> None:
+        if type(resume_never_regresses) is not bool:
+            raise ValueError("resume_never_regresses must be boolean")
         if audience not in _SUPPORTED_AUDIENCES:
             raise ValueError("local memory sink audience must be private or shared")
         if type(max_facts) is not int or max_facts <= 0:
@@ -78,6 +82,10 @@ class CodexLocalMemorySink:
         self.audience = audience
         self.max_facts = max_facts
         self.max_resume_bytes = max_resume_bytes
+        # The node-global state (#2296) is shared with the hook path and may
+        # receive replayed older jobs: never let an older extraction replace a
+        # newer resume.md. Facts are still merged (they are deduplicated).
+        self.resume_never_regresses = resume_never_regresses
         self._facts_path = self.state_dir / "memory-facts.jsonl"
         self._resume_path = self.state_dir / "resume.md"
         self._lock_path = self.state_dir / ".local-memory-sink.lock"
@@ -242,6 +250,21 @@ class CodexLocalMemorySink:
         )
         return _bounded_utf8(header + "\n".join(lines) + "\n", self.max_resume_bytes)
 
+    def _resume_is_newer(self, output: DistillExtractionOutput) -> bool:
+        """True when the existing resume.md postdates this extraction."""
+        if not self.resume_never_regresses:
+            return False
+        try:
+            current_mtime = self._resume_path.lstat().st_mtime
+        except FileNotFoundError:
+            return False
+        distilled = datetime.fromisoformat(
+            output.provenance.distilled_at.replace("Z", "+00:00")
+        )
+        if distilled.tzinfo is None:
+            distilled = distilled.replace(tzinfo=timezone.utc)
+        return current_mtime > distilled.timestamp()
+
     def write(
         self,
         output: DistillExtractionOutput,
@@ -256,6 +279,8 @@ class CodexLocalMemorySink:
             self._validate_regular_file(self._facts_path)
             self._validate_regular_file(self._resume_path)
             resume_payload = self._render_resume(output)
+            if resume_payload is not None and self._resume_is_newer(output):
+                resume_payload = None
             resume_written = resume_payload is not None
             facts_added = 0
 

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
@@ -32,6 +33,18 @@ _INDEX_ENV_ALLOWLIST = (
 _NUNCHI_FEED_ENV_PASSTHROUGH = (
     "CCC_PIRI_CLI_PATH",
     "CCC_PIRI_REAL_CLI_PATH",
+)
+# The node-global index (#2296) keeps the operator's own index policy: unlike
+# an audience refresh it must not force Wiki off (that would evict Wiki rows
+# from the node's hot-memory index). Embedding commands are deliberately not
+# forwarded — the hook-path refresh owns them and absent vectors are kept.
+_GLOBAL_INDEX_ENV_PASSTHROUGH = (
+    "CCC_WIKI_MEMORY_ENABLED",
+    "CCC_NODE_ISOLATION_PROFILE",
+    "CCC_MEMORY_INDEX_DISTILL",
+    "CCC_MEMORY_DISABLE_FTS5",
+    "CCC_MEMORY_VOLATILE_TTL_DAYS",
+    "CCC_MEMORY_RETENTION_POLICY",
 )
 _MAX_INDEXER_BYTES = 1024 * 1024
 _MAX_NUNCHI_FEED_BYTES = 256 * 1024
@@ -73,14 +86,45 @@ async def _stop_indexer(process: asyncio.subprocess.Process) -> None:
         pass
 
 
+@dataclass(frozen=True, slots=True)
+class GlobalLocalMemoryRoute:
+    """The node-global (unscoped) local memory target (#2296).
+
+    ``off``/``curated`` bridge memory modes have no audience partition: one
+    integrated memory lives in the node's default state dir, exactly where the
+    Claude distill hook writes when the bridge does not own distill.
+    """
+
+    state_dir: Path
+    cache_dir: Path | None = None
+    memory_dir: Path | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("state_dir", "cache_dir", "memory_dir"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            text = os.fspath(value)
+            if "\x00" in text or not os.path.isabs(text):
+                raise ValueError("global local memory paths must be absolute")
+            object.__setattr__(self, name, Path(os.path.abspath(text)))
+
+
 class CodexDistillLocalSinkWorker:
-    """Apply one retained extraction to its journal-bound audience scope."""
+    """Apply one retained extraction to its journal-bound memory route.
+
+    Audience-routed jobs land in their opaque audience scope. When a
+    ``global_route`` is configured (off/curated modes, #2296), route-free jobs —
+    including ones extraction already marked UNROUTABLE — land in the
+    node-global state instead.
+    """
 
     def __init__(
         self,
         journal: DistillJournal,
         *,
-        audience_root: Path,
+        audience_root: Path | None = None,
+        global_route: GlobalLocalMemoryRoute | None = None,
         owner_token: str | None = None,
         lease_seconds: int = 300,
         max_attempts: int = 5,
@@ -112,8 +156,19 @@ class CodexDistillLocalSinkWorker:
             or nunchi_feed_timeout_seconds > 3600
         ):
             raise ValueError("invalid nunchi feed kick timeout")
+        if audience_root is None and global_route is None:
+            raise ValueError("local sink worker needs an audience root or global route")
+        if global_route is not None and not isinstance(
+            global_route, GlobalLocalMemoryRoute
+        ):
+            raise ValueError("invalid global local memory route")
         self._journal = journal
-        self._audience_root = Path(os.path.abspath(os.fspath(audience_root)))
+        self._audience_root = (
+            Path(os.path.abspath(os.fspath(audience_root)))
+            if audience_root is not None
+            else None
+        )
+        self._global_route = global_route
         self._owner_token = owner_token or secrets.token_hex(16)
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
@@ -127,6 +182,12 @@ class CodexDistillLocalSinkWorker:
         self._nunchi_feed_timeout_seconds = float(nunchi_feed_timeout_seconds)
         self._nunchi_tasks: set[asyncio.Task[None]] = set()
         self._environment = dict(os.environ if environment is None else environment)
+
+    @property
+    def global_route_enabled(self) -> bool:
+        """True when route-free (incl. UNROUTABLE) jobs are this worker's work."""
+
+        return self._global_route is not None
 
     async def _fail(
         self,
@@ -153,14 +214,31 @@ class CodexDistillLocalSinkWorker:
         scope = claimed.memory_scope
         if audience not in {"private", "shared"} or scope is None:
             raise ValueError("local sink job has no safe audience route")
-        state_dir = self._audience_root / scope / "state"
-        if state_dir.parent.parent != self._audience_root:
+        audience_root = self._audience_root
+        if audience_root is None:
+            raise ValueError("local sink worker has no audience root")
+        state_dir = audience_root / scope / "state"
+        if state_dir.parent.parent != audience_root:
             raise PermissionError("local sink scope escaped its audience root")
         return CodexLocalMemorySink(
             state_dir,
             audience=audience,
             max_facts=self._max_facts,
             max_resume_bytes=self._max_resume_bytes,
+        )
+
+    def _global_sink(self) -> CodexLocalMemorySink:
+        route = self._global_route
+        if route is None:
+            raise ValueError("local sink job has no safe audience route")
+        # The unscoped hook path labels node-global facts ``private`` as well
+        # (claude/hooks/distill/local-memory-commit.py).
+        return CodexLocalMemorySink(
+            route.state_dir,
+            audience="private",
+            max_facts=self._max_facts,
+            max_resume_bytes=self._max_resume_bytes,
+            resume_never_regresses=True,
         )
 
     def _validated_indexer(self) -> Path | None:
@@ -220,6 +298,8 @@ class CodexDistillLocalSinkWorker:
         try:
             validate_memory_route(audience, scope)
         except ValueError:
+            raise _LocalIndexError(terminal=True)
+        if self._audience_root is None:
             raise _LocalIndexError(terminal=True)
         scope_root = self._audience_root / scope
         nunchi_home = scope_root / "nunchi"
@@ -310,6 +390,8 @@ class CodexDistillLocalSinkWorker:
             validate_memory_route(audience, scope)
         except ValueError:
             raise _LocalIndexError(terminal=True)
+        if self._audience_root is None:
+            raise _LocalIndexError(terminal=True)
         scope_root = self._audience_root / scope
         state_dir = scope_root / "state"
         environment = {
@@ -338,6 +420,42 @@ class CodexDistillLocalSinkWorker:
         )
         return environment
 
+    def _global_index_environment(self) -> dict[str, str]:
+        route = self._global_route
+        if route is None:
+            raise _LocalIndexError(terminal=True)
+        environment = {
+            name: value
+            for name in _INDEX_ENV_ALLOWLIST + _GLOBAL_INDEX_ENV_PASSTHROUGH
+            if isinstance((value := self._environment.get(name)), str)
+            and "\x00" not in value
+        }
+        environment.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+        environment.update(
+            {
+                "CCC_STATE_DIR": str(route.state_dir),
+                "CCC_MEMORY_INDEX_DB": str(route.state_dir / "memory-index.sqlite"),
+                "CCC_MEMORY_FACTS_FILE": str(route.state_dir / "memory-facts.jsonl"),
+                "CCC_MEMORY_NO_REFRESH": "1",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+        if route.cache_dir is not None:
+            environment["CCC_MEMORY_CACHE_DIR"] = str(route.cache_dir)
+        if route.memory_dir is not None:
+            environment["CCC_MEMORY_DIR"] = str(route.memory_dir)
+        return environment
+
+    async def refresh_global(self) -> None:
+        """Refresh the node-global index (#2296) without exposing index output."""
+
+        if self._global_route is None:
+            raise _LocalIndexError(terminal=True)
+        indexer = self._validated_indexer()
+        if indexer is None:
+            return
+        await self._run_indexer(indexer, self._global_index_environment)
+
     async def refresh_route(self, *, audience: str, scope: str) -> None:
         """Refresh one validated local audience without exposing index output."""
 
@@ -348,6 +466,16 @@ class CodexDistillLocalSinkWorker:
         indexer = self._validated_indexer()
         if indexer is None:
             return
+        await self._run_indexer(
+            indexer,
+            lambda: self._index_environment(audience=audience, scope=scope),
+        )
+
+    async def _run_indexer(
+        self,
+        indexer: Path,
+        environment_factory: Callable[[], dict[str, str]],
+    ) -> None:
         try:
             process = await asyncio.create_subprocess_exec(
                 str(indexer),
@@ -355,7 +483,7 @@ class CodexDistillLocalSinkWorker:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
-                env=self._index_environment(audience=audience, scope=scope),
+                env=environment_factory(),
                 start_new_session=True,
             )
         except _LocalIndexError:
@@ -383,6 +511,8 @@ class CodexDistillLocalSinkWorker:
             owner_token=self._owner_token,
             lease_seconds=self._lease_seconds,
             max_attempts=self._max_attempts,
+            audience_routes=self._audience_root is not None,
+            global_route=self._global_route is not None,
         )
         if claimed is None:
             return await asyncio.to_thread(self._journal.get, job_id)
@@ -397,14 +527,23 @@ class CodexDistillLocalSinkWorker:
                 claimed.extraction_output,
                 wiki_enabled=True,
             )
-            sink = self._sink_for(claimed)
-            await asyncio.to_thread(sink.write, output, job_id=claimed.job_id)
-            audience = claimed.memory_audience
-            scope = claimed.memory_scope
-            if audience is None or scope is None:
-                raise ValueError("local sink job has no safe audience route")
-            await self.refresh_route(audience=audience, scope=scope)
-            self.kick_nunchi_feed(audience=audience, scope=scope)
+            if claimed.memory_audience is None and claimed.memory_scope is None:
+                # Node-global route (#2296). No audience nunchi kick here: the
+                # global nunchi lane reads the journal via ingest-cron.sh.
+                global_sink = self._global_sink()
+                await asyncio.to_thread(
+                    global_sink.write, output, job_id=claimed.job_id
+                )
+                await self.refresh_global()
+            else:
+                sink = self._sink_for(claimed)
+                await asyncio.to_thread(sink.write, output, job_id=claimed.job_id)
+                audience = claimed.memory_audience
+                scope = claimed.memory_scope
+                if audience is None or scope is None:
+                    raise ValueError("local sink job has no safe audience route")
+                await self.refresh_route(audience=audience, scope=scope)
+                self.kick_nunchi_feed(audience=audience, scope=scope)
         except asyncio.CancelledError:
             await self._fail(
                 claimed,
@@ -450,4 +589,4 @@ class CodexDistillLocalSinkWorker:
         )
 
 
-__all__ = ["CodexDistillLocalSinkWorker"]
+__all__ = ["CodexDistillLocalSinkWorker", "GlobalLocalMemoryRoute"]
