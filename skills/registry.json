@@ -367,13 +367,13 @@
     {
       "audience": "shared",
       "classification": "claude-only",
-      "description": "Schedule a verification/check to run at a future time, choosing the DURABLE scheduler first (systemd-run transient timer, systemd timer, crontab) and treating session-bounded CronCreate as a last resort. Use when a check must fire at a known future time, when a scheduled check silently never ran, or before claiming a node \"cannot schedule durably\".",
+      "description": "Schedule a verification/check to run at a future time, choosing a scheduler that survives what can happen before it fires — a persistent systemd timer/crontab when the wait can cross a reboot (any multi-hour or overnight wait), a systemd-run transient timer only for short waits — and treating session-bounded CronCreate as a last resort. Use when a check must fire at a known future time, when a scheduled check silently never ran, or before claiming a node \"cannot schedule durably\".",
       "files": 1,
       "managed": false,
       "name": "scheduled-verification-with-session-fallback",
       "source": "skills/scheduled-verification-with-session-fallback",
       "status": "active",
-      "tree_sha256": "e51de28e76b73da61b4852d9ba1e68178b5eda86ec4e7cf59cbdb0a74d2e1650"
+      "tree_sha256": "341a3b300d52527d5c58a636b0e49e810cf8c3750c7b1b241fae31d57040efa0"
     },
     {
       "audience": "shared",
