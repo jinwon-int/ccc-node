@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
+import re
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from test_distill_local_journal import extracted_job
+import test_distill_worker as fixtures
 
 from telegram_bot.core.bot import TelegramBot
 from telegram_bot.memory.distill_journal import DistillJournal
-from telegram_bot.memory.distill_local_worker import CodexDistillLocalSinkWorker
-from telegram_bot.memory.distill_types import DistillLocalSinkStatus
+from telegram_bot.memory.distill_local_worker import (
+    CodexDistillLocalSinkWorker,
+    GlobalLocalMemoryRoute,
+)
+from telegram_bot.memory.distill_extraction import DistillExtractionOutput
+from telegram_bot.memory.distill_types import DistillLocalSinkStatus, DistillTrigger
+from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
 
 
 @pytest.mark.anyio
@@ -374,3 +382,431 @@ async def test_failing_nunchi_feed_never_affects_the_sink_job(
     assert result.local_sink_status is DistillLocalSinkStatus.DONE
     if worker._nunchi_tasks:
         await asyncio.gather(*worker._nunchi_tasks)
+
+
+# --- #2296: node-global route for off/curated bridge memory modes -----------
+
+
+def _global_route(tmp_path: Path) -> GlobalLocalMemoryRoute:
+    return GlobalLocalMemoryRoute(
+        state_dir=tmp_path / "claude" / "state",
+        cache_dir=tmp_path / "claude" / "hooks" / "cache",
+        memory_dir=tmp_path / "claude" / "memories",
+    )
+
+
+def test_worker_requires_a_route_and_absolute_global_paths(tmp_path: Path) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    with pytest.raises(ValueError, match="audience root or global route"):
+        CodexDistillLocalSinkWorker(journal)
+    with pytest.raises(ValueError, match="absolute"):
+        GlobalLocalMemoryRoute(state_dir=Path("relative/state"))
+
+
+@pytest.mark.anyio
+async def test_global_route_replays_unroutable_job_into_node_state_once(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal, memory_audience=None, memory_scope=None)
+    assert job.local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+    route = _global_route(tmp_path)
+    worker = CodexDistillLocalSinkWorker(
+        journal,
+        global_route=route,
+        owner_token="global-worker",
+    )
+    assert worker.global_route_enabled is True
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.local_sink_status is DistillLocalSinkStatus.DONE
+    assert result.local_sink_attempts == 1
+    facts = [
+        json.loads(line)
+        for line in (route.state_dir / "memory-facts.jsonl").read_text().splitlines()
+    ]
+    assert len(facts) == 1
+    assert facts[0]["privacy"] == "private"
+    assert facts[0]["source"]["job_id"] == job.job_id
+    assert (route.state_dir / "resume.md").is_file()
+
+    # Replay is idempotent: a second pass (or a second worker) is a no-op.
+    again = await CodexDistillLocalSinkWorker(
+        journal, global_route=route, owner_token="other"
+    ).write_once(job_id=job.job_id)
+    assert again.local_sink_status is DistillLocalSinkStatus.DONE
+    assert again.local_sink_attempts == 1
+    assert len((route.state_dir / "memory-facts.jsonl").read_text().splitlines()) == 1
+
+
+class _ResumeBackend:
+    """Successful extractor with a chosen (untrusted) distilled_at and resume."""
+
+    def __init__(self, distilled_at: str, activity: str) -> None:
+        self._distilled_at = distilled_at
+        self._activity = activity
+
+    async def extract(self, extraction_input):
+        payload = fixtures.output_for(extraction_input).model_dump(mode="json")
+        payload["provenance"]["distilled_at"] = self._distilled_at
+        payload["resume"]["last_activity"] = self._activity
+        payload["honcho"][0]["text"] = f"Fact from {self._activity}."
+        return DistillExtractionOutput.model_validate(payload)
+
+
+async def _global_job(
+    journal: DistillJournal,
+    *,
+    thread_id: str,
+    captured_at: str,
+    distilled_at: str,
+    activity: str,
+):
+    queued = journal.enqueue_once(
+        provider="codex",
+        thread_id=thread_id,
+        trigger=DistillTrigger.NEW_COMMAND,
+    )
+    claimed = journal.claim(queued.job_id, owner_token="snap", now=fixtures.utc())
+    assert claimed is not None
+    journal.mark_snapshot_done(
+        queued.job_id,
+        owner_token="snap",
+        lease_epoch=claimed.lease_epoch,
+        snapshot=dataclasses.replace(
+            fixtures.snapshot(thread_id), captured_at=captured_at
+        ),
+        now=fixtures.utc(1),
+    )
+    done = await CodexDistillExtractionWorker(
+        journal,
+        _ResumeBackend(distilled_at, activity),
+        usage_meter=None,
+        owner_token="extract",
+        wiki_enabled=True,
+    ).extract_once(job_id=queued.job_id)
+    assert done.local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+    return done
+
+
+@pytest.mark.anyio
+async def test_global_replay_newest_capture_wins_resume_in_any_order(
+    tmp_path: Path,
+) -> None:
+    """Replay runs in job-hash order and distilled_at is model-authored.
+
+    Only the bridge-recorded snapshot capture time orders resume.md: the
+    newest capture wins even when it is processed first and carries a stale
+    distilled_at, and a far-future distilled_at on an old capture never
+    suppresses anything.
+    """
+
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    jobs = {
+        "old": await _global_job(
+            journal,
+            thread_id="thread-old",
+            captured_at="2026-10-01T09:00:00Z",
+            distilled_at="2099-01-01T00:00:00Z",
+            activity="old session",
+        ),
+        "mid": await _global_job(
+            journal,
+            thread_id="thread-mid",
+            captured_at="2026-10-05T09:00:00.250000Z",
+            distilled_at="2026-10-05T00:00:00Z",
+            activity="mid session",
+        ),
+        "new": await _global_job(
+            journal,
+            thread_id="thread-new",
+            captured_at="2026-10-09T09:00:00Z",
+            distilled_at="2020-01-01T00:00:00Z",
+            activity="new session",
+        ),
+    }
+    route = _global_route(tmp_path)
+    resume = route.state_dir / "resume.md"
+    worker = CodexDistillLocalSinkWorker(
+        journal, global_route=route, owner_token="global-worker"
+    )
+
+    for name in ("new", "old", "mid"):
+        result = await worker.write_once(job_id=jobs[name].job_id)
+        assert result.local_sink_status is DistillLocalSinkStatus.DONE
+
+    text = resume.read_text()
+    assert "new session" in text
+    assert "captured_at=2026-10-09T09:00:00.000000Z" in text.splitlines()[0]
+    # Every job's facts are still merged.
+    facts = (route.state_dir / "memory-facts.jsonl").read_text()
+    assert all(f"Fact from {name} session." in facts for name in jobs)
+
+    # Sweep order (sorted job ids) gives the same answer from scratch.
+    other_route = _global_route(tmp_path / "sorted")
+    other_journal = DistillJournal(tmp_path / "journal-sorted")
+    other_journal.initialize()
+    for name, captured in (
+        ("old", "2026-10-01T09:00:00Z"),
+        ("mid", "2026-10-05T09:00:00Z"),
+        ("new", "2026-10-09T09:00:00Z"),
+    ):
+        await _global_job(
+            other_journal,
+            thread_id=f"thread-{name}",
+            captured_at=captured,
+            distilled_at="2026-10-13T00:00:00Z",
+            activity=f"{name} session",
+        )
+    await _drive_local_sink_loop(
+        CodexDistillLocalSinkWorker(
+            other_journal, global_route=other_route, owner_token="sweep"
+        ),
+        other_journal,
+        until=lambda: all(
+            job.local_sink_status is DistillLocalSinkStatus.DONE
+            for job in other_journal.list_jobs()
+        ),
+    )
+    assert "new session" in (other_route.state_dir / "resume.md").read_text()
+
+
+@pytest.mark.anyio
+async def test_global_sink_overwrites_headerless_or_uncaptured_resume(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    first = await _global_job(
+        journal,
+        thread_id="thread-a",
+        captured_at="2026-07-16T04:00:00Z",
+        distilled_at="2026-07-16T04:01:00Z",
+        activity="bridge session a",
+    )
+    second = await _global_job(
+        journal,
+        thread_id="thread-b",
+        captured_at="2026-07-16T03:00:00Z",
+        distilled_at="2026-07-16T03:01:00Z",
+        activity="bridge session b",
+    )
+    route = _global_route(tmp_path)
+    route.state_dir.mkdir(parents=True, mode=0o700)
+    resume = route.state_dir / "resume.md"
+    # A hook-path resume has no header: it is overwritten (mtime is ignored).
+    resume.write_text("- 마지막 작업: hook-path CLI session\n")
+    resume.chmod(0o600)
+    worker = CodexDistillLocalSinkWorker(
+        journal, global_route=route, owner_token="global-worker"
+    )
+
+    await worker.write_once(job_id=first.job_id)
+    assert "bridge session a" in resume.read_text()
+
+    # A bridge header without captured_at (audience-style) is overwritten too.
+    lines = resume.read_text().splitlines()
+    header = re.sub(r" captured_at=\S+", "", lines[0])
+    resume.write_text("\n".join([header, "- 마지막 작업: uncaptured"]) + "\n")
+    await worker.write_once(job_id=second.job_id)
+    assert "bridge session b" in resume.read_text()
+
+
+@pytest.mark.anyio
+async def test_audience_worker_never_writes_route_free_job_globally(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal, memory_audience=None, memory_scope=None)
+    worker = CodexDistillLocalSinkWorker(
+        journal,
+        audience_root=tmp_path / "audiences",
+        owner_token="audience-worker",
+    )
+    assert worker.global_route_enabled is False
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+    assert not (tmp_path / "audiences").exists()
+    assert not (tmp_path / "claude").exists()
+
+
+@pytest.mark.anyio
+async def test_global_only_worker_leaves_audience_routed_job_pending(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal)
+    indexer = tmp_path / "ccc-memory-index.sh"
+    indexer.write_text("#!/bin/sh\nexit 0\n")
+    indexer.chmod(0o700)
+    route = _global_route(tmp_path)
+    worker = CodexDistillLocalSinkWorker(
+        journal,
+        global_route=route,
+        owner_token="global-worker",
+        indexer_path=indexer,
+    )
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.local_sink_status is DistillLocalSinkStatus.PENDING
+    assert not (route.state_dir / "memory-facts.jsonl").exists()
+    # No audience root: an audience refresh fails closed instead of guessing.
+    with pytest.raises(RuntimeError, match="local_sink_index_unsafe"):
+        await worker.refresh_route(audience="shared", scope="shared")
+
+
+@pytest.mark.anyio
+async def test_global_index_refresh_targets_node_state_without_audience_env(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal, memory_audience=None, memory_scope=None)
+    marker = tmp_path / "index-env"
+    indexer = tmp_path / "ccc-memory-index.sh"
+    indexer.write_text(f"#!/bin/sh\nenv > {marker}\nexit 0\n")
+    indexer.chmod(0o700)
+    feed_marker = tmp_path / "feed-ran"
+    feed = tmp_path / "piri-feed.sh"
+    feed.write_text(f"#!/bin/sh\ntouch {feed_marker}\n")
+    feed.chmod(0o700)
+    route = _global_route(tmp_path)
+    worker = CodexDistillLocalSinkWorker(
+        journal,
+        global_route=route,
+        owner_token="global-worker",
+        indexer_path=indexer,
+        nunchi_feed_path=feed,
+        environment={
+            "HOME": str(tmp_path / "home"),
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "CCC_WIKI_MEMORY_ENABLED": "1",
+            "CCC_MEMORY_EMBED_CMD": "RAW_EMBED_CMD_MUST_NOT_CROSS",
+            "CCC_MEMORY_AUDIENCE_SCOPED": "1",
+            "TELEGRAM_BOT_TOKEN": "RAW_TELEGRAM_TOKEN_MUST_NOT_CROSS",
+        },
+    )
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.local_sink_status is DistillLocalSinkStatus.DONE
+    if worker._nunchi_tasks:
+        await asyncio.gather(*worker._nunchi_tasks)
+    env = dict(
+        line.split("=", 1) for line in marker.read_text().splitlines() if "=" in line
+    )
+    assert env["CCC_STATE_DIR"] == str(route.state_dir)
+    assert env["CCC_MEMORY_INDEX_DB"] == str(route.state_dir / "memory-index.sqlite")
+    assert env["CCC_MEMORY_FACTS_FILE"] == str(route.state_dir / "memory-facts.jsonl")
+    assert env["CCC_MEMORY_CACHE_DIR"] == str(route.cache_dir)
+    assert env["CCC_MEMORY_DIR"] == str(route.memory_dir)
+    # The node's own Wiki policy is kept (an audience refresh forces it off).
+    assert env["CCC_WIKI_MEMORY_ENABLED"] == "1"
+    assert "CCC_MEMORY_AUDIENCE_SCOPED" not in env
+    assert "CCC_MEMORY_SCOPE" not in env
+    assert "CCC_MEMORY_EMBED_CMD" not in env
+    assert "TELEGRAM_BOT_TOKEN" not in env
+    # Global nunchi is fed from the journal by ingest-cron.sh, never kicked here.
+    assert not feed_marker.exists()
+
+
+@pytest.mark.anyio
+async def test_global_index_failure_retries_without_duplicating_fact(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal, memory_audience=None, memory_scope=None)
+    indexer = tmp_path / "ccc-memory-index.sh"
+    indexer.write_text("#!/bin/sh\nexit 9\n")
+    indexer.chmod(0o700)
+    route = _global_route(tmp_path)
+    worker = CodexDistillLocalSinkWorker(
+        journal,
+        global_route=route,
+        owner_token="global-worker",
+        indexer_path=indexer,
+    )
+
+    failed = await worker.write_once(job_id=job.job_id)
+    assert failed.local_sink_status is DistillLocalSinkStatus.RETRYABLE_FAILED
+    assert failed.error_code == "local_sink_index_failed"
+
+    indexer.write_text("#!/bin/sh\nexit 0\n")
+    indexer.chmod(0o700)
+    completed = await worker.write_once(job_id=job.job_id)
+    assert completed.local_sink_status is DistillLocalSinkStatus.DONE
+    assert len((route.state_dir / "memory-facts.jsonl").read_text().splitlines()) == 1
+
+
+async def _drive_local_sink_loop(
+    worker: CodexDistillLocalSinkWorker,
+    journal: DistillJournal,
+    *,
+    until=None,
+) -> None:
+    bot = TelegramBot.__new__(TelegramBot)
+    bot._distill_journal = journal
+    bot._distill_local_sink_worker = worker
+    bot._config = SimpleNamespace(distill_extraction_poll_interval=0.02)
+    stop = asyncio.Event()
+    task = asyncio.create_task(bot._distill_local_sink_loop(stop))
+    try:
+        deadline = asyncio.get_running_loop().time() + 2
+        while asyncio.get_running_loop().time() < deadline:
+            if until is not None and until():
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
+
+
+@pytest.mark.anyio
+async def test_lifecycle_loop_adopts_unroutable_jobs_only_with_global_route(
+    tmp_path: Path,
+) -> None:
+    global_journal = DistillJournal(tmp_path / "global-journal")
+    global_journal.initialize()
+    replay = await extracted_job(global_journal, memory_audience=None, memory_scope=None)
+    route = _global_route(tmp_path)
+    await _drive_local_sink_loop(
+        CodexDistillLocalSinkWorker(global_journal, global_route=route, owner_token="g"),
+        global_journal,
+        until=lambda: global_journal.get(replay.job_id).local_sink_status
+        is DistillLocalSinkStatus.DONE,
+    )
+    assert global_journal.get(replay.job_id).local_sink_status is DistillLocalSinkStatus.DONE
+    assert (route.state_dir / "memory-facts.jsonl").is_file()
+
+    audience_journal = DistillJournal(tmp_path / "audience-journal")
+    audience_journal.initialize()
+    orphan = await extracted_job(audience_journal, memory_audience=None, memory_scope=None)
+    calls: list[str] = []
+    audience_worker = CodexDistillLocalSinkWorker(
+        audience_journal, audience_root=tmp_path / "audiences", owner_token="a"
+    )
+    original = audience_worker.write_once
+
+    async def counting_write_once(*, job_id: str):
+        calls.append(job_id)
+        return await original(job_id=job_id)
+
+    audience_worker.write_once = counting_write_once  # type: ignore[method-assign]
+    await _drive_local_sink_loop(
+        audience_worker, audience_journal, until=lambda: False
+    )
+    # Audience-scoped composition never even offers UNROUTABLE work.
+    assert calls == []
+    assert (
+        audience_journal.get(orphan.job_id).local_sink_status
+        is DistillLocalSinkStatus.UNROUTABLE
+    )

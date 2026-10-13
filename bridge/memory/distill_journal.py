@@ -236,8 +236,13 @@ class DistillJournal(JsonJournalCore):
         *,
         older_than_seconds: float,
         now: datetime | None = None,
+        keep_unroutable: bool = False,
     ) -> tuple[str, ...]:
         """Remove fully-terminal jobs whose last update is older than the cutoff.
+
+        ``keep_unroutable`` is set while a node-global local sink exists
+        (#2296): an UNROUTABLE job with extraction output is still pending
+        adoption there, so it must survive retention until it is adopted.
 
         Nothing ever deleted finished jobs before, so the journal grew without
         bound and every sweep in every pipeline loop re-read and re-validated
@@ -259,6 +264,12 @@ class DistillJournal(JsonJournalCore):
                 except (KeyError, ValueError, PermissionError, OSError):
                     continue
                 if not self._job_fully_terminal(job):
+                    continue
+                if (
+                    keep_unroutable
+                    and job.local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+                    and job.extraction_output is not None
+                ):
                     continue
                 if (current_time - updated_at).total_seconds() < older_than_seconds:
                     continue
@@ -602,24 +613,44 @@ class DistillJournal(JsonJournalCore):
         now: datetime | None = None,
         lease_seconds: int = 300,
         max_attempts: int = 5,
+        audience_routes: bool = True,
+        global_route: bool = False,
     ) -> DistillJob | None:
+        """Lease one local write-back.
+
+        ``audience_routes`` claims audience-routed jobs (the historical
+        contract). ``global_route`` lets a node-global sink (#2296, off/curated
+        modes) claim route-free jobs, including ones extraction already marked
+        UNROUTABLE — that adoption is the one-time replay of orphaned work.
+        Once adopted a job is DONE or a failure state, never UNROUTABLE again.
+        """
         if not owner_token:
             raise ValueError("owner_token must not be empty")
         if lease_seconds <= 0 or max_attempts <= 0:
             raise ValueError("lease_seconds and max_attempts must be positive")
+        if type(audience_routes) is not bool or type(global_route) is not bool:
+            raise ValueError("local sink route flags must be boolean")
         current_time = _normalize_time(now or _utc_now())
         with self._exclusive():
             job = self._read_unlocked(job_id)
-            if job.local_sink_status not in {
+            routed = job.memory_audience is not None or job.memory_scope is not None
+            claimable = {
                 DistillLocalSinkStatus.PENDING,
                 DistillLocalSinkStatus.RETRYABLE_FAILED,
-            }:
+            }
+            if global_route and not routed:
+                claimable.add(DistillLocalSinkStatus.UNROUTABLE)
+            if job.local_sink_status not in claimable:
+                return None
+            if (routed and not audience_routes) or (not routed and not global_route):
                 return None
             if (
                 job.status is not DistillJobStatus.EXTRACTION_DONE
                 or job.extraction_output is None
-                or job.memory_audience is None
-                or job.memory_scope is None
+                or (
+                    routed
+                    and (job.memory_audience is None or job.memory_scope is None)
+                )
             ):
                 raise ValueError("local sink job is missing extraction or route")
             if job.local_sink_attempts >= max_attempts:

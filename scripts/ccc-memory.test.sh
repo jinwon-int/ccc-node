@@ -76,6 +76,71 @@ ok "memory check reports healthy nunchi and MemPalace scalars" '[ "$rc" = 0 ] &&
 '\'' >/dev/null <<<"$out"'
 ok "memory readiness JSON never exposes snapshot, fact or refresh bodies" '! grep -q "PROBE_SECRET_BODY\|PROBE_SECRET_FACT\|PROBE_SECRET_REFRESH" <<<"$out"'
 
+# #2296: readiness alone said `nunchi: ok` for a DB that had stored nothing for
+# weeks. Freshness judges max(peer_facts.created_at) (nunchi on) and, on its
+# own, the last write of memory-facts.jsonl against CCC_MEMORY_STALE_HOURS
+# (default 72), body-free.
+set_mtime() { python3 -c 'import os, sys; t = int(sys.argv[2]); os.utime(sys.argv[1], (t, t))' "$1" "$2"; }
+fresh_db="$TMP/fresh-nunchi/facts.db"
+fresh_facts="$TMP/fresh-state/memory-facts.jsonl"
+mkdir -p "$(dirname "$fresh_db")" "$(dirname "$fresh_facts")"
+python3 - "$fresh_db" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("CREATE TABLE peer_facts(id INTEGER PRIMARY KEY, fact TEXT, created_at TEXT NOT NULL)")
+db.execute("INSERT INTO peer_facts(fact, created_at) VALUES ('FRESH_SECRET_FACT', '2026-07-01T00:00:00+00:00')")
+db.execute("INSERT INTO peer_facts(fact, created_at) VALUES ('FRESH_SECRET_FACT', '2026-07-20T00:00:00+00:00')")
+db.commit(); db.close()
+PY
+# Old observed_at, recent write: the write is the ingest signal.
+printf '%s\n' '{"id":"distill-a","text":"FRESH_SECRET_LOCAL","observed_at":"2026-06-01T00:00:00Z"}' > "$fresh_facts"
+set_mtime "$fresh_facts" 1785196800  # 2026-07-28T00:00:00Z
+fresh_check() {
+  HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+    CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" NUNCHI_DB="$fresh_db" \
+    CCC_MEMORY_FACTS_FILE="$fresh_facts" CCC_MEMORY_CHECK_NOW_EPOCH=1785312000 \
+    CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+    CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" "$@" 2>&1
+}
+out="$(fresh_check --json)"; rc=$?
+ok "freshness warns stale when nunchi stored nothing for >72h (default)" '[ "$rc" = 0 ] && jq -e '\''
+  .freshness.status == "stale" and .freshness.stale_hours == 72
+  and .freshness.nunchi.status == "stale"
+  and .freshness.nunchi.last_ingest_at == "2026-07-20T00:00:00Z"
+  and .freshness.nunchi.age_seconds == 1785312000 - 1784505600
+  and .nunchi.db.last_ingest_at == "2026-07-20T00:00:00Z"
+  and .freshness.local_facts.status == "ok"
+  and .freshness.local_facts.last_ingest_at == "2026-07-28T00:00:00Z"
+  and .freshness.local_facts.newest_observed_at == "2026-06-01T00:00:00Z"
+  and .freshness.local_facts.source == "mtime"
+'\'' >/dev/null <<<"$out"'
+ok "freshness never exposes nunchi or local fact bodies" '! grep -q "FRESH_SECRET_FACT\|FRESH_SECRET_LOCAL" <<<"$out"'
+out="$(CCC_MEMORY_STALE_HOURS=480 fresh_check --json)"
+ok "CCC_MEMORY_STALE_HOURS widens the freshness window" 'jq -e ".freshness.status == \"ok\" and .freshness.stale_hours == 480 and .freshness.nunchi.status == \"ok\"" >/dev/null <<<"$out"'
+out="$(CCC_MEMORY_STALE_HOURS=bogus fresh_check --json)"
+ok "invalid CCC_MEMORY_STALE_HOURS falls back to 72" 'jq -e ".freshness.stale_hours == 72" >/dev/null <<<"$out"'
+set_mtime "$fresh_facts" 1782864000  # 2026-07-01T00:00:00Z
+out="$(CCC_MEMORY_STALE_HOURS=480 fresh_check --json)"
+ok "stale local facts alone raise the freshness warning while nunchi is on" 'jq -e ".freshness.status == \"stale\" and .freshness.nunchi.status == \"ok\" and .freshness.local_facts.status == \"stale\"" >/dev/null <<<"$out"'
+out="$(fresh_check)"
+ok "text report prints the freshness warning line" 'grep -q "^- freshness: stale stale_hours=72 nunchi=stale nunchi_last=2026-07-20T00:00:00Z" <<<"$out" && ! grep -q "FRESH_SECRET" <<<"$out"'
+# Local facts are judged on their own when nunchi is off.
+off_state="$TMP/fresh-off-state"; mkdir -p "$off_state"
+off_check() {
+  HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$off_state" \
+    CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" NUNCHI_DB="$fresh_db" \
+    CCC_MEMORY_CHECK_NOW_EPOCH=1785312000 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1
+}
+out="$(off_check)"
+ok "missing local facts are unknown, not ok, while nunchi is off" 'jq -e ".freshness.status == \"unknown\" and .freshness.nunchi.status == \"off\" and .freshness.local_facts.status == \"unknown\"" >/dev/null <<<"$out"'
+cp "$fresh_facts" "$off_state/memory-facts.jsonl"
+set_mtime "$off_state/memory-facts.jsonl" 1782864000
+out="$(off_check)"
+ok "stale local facts warn even when nunchi is off" 'jq -e ".freshness.status == \"stale\" and .freshness.nunchi.status == \"off\" and .freshness.local_facts.status == \"stale\"" >/dev/null <<<"$out"'
+set_mtime "$off_state/memory-facts.jsonl" 1785196800
+out="$(off_check)"
+ok "fresh local facts are ok while nunchi is off" 'jq -e ".freshness.status == \"ok\" and .freshness.local_facts.status == \"ok\"" >/dev/null <<<"$out"'
+
 # Regression: mempalace-refresh.sh writes `state=degraded, exit_code=0` on the
 # documented #865 MemPalace-absent path; the unscoped probe used to reject the
 # record as refresh-invalid (file corrupt) instead of reporting the state.

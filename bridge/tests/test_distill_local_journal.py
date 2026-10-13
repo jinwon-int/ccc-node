@@ -135,6 +135,172 @@ async def test_extraction_marks_routed_work_pending_and_missing_route_unroutable
 
 
 @pytest.mark.anyio
+async def test_global_route_adopts_unroutable_once_and_never_routed_work(
+    tmp_path: Path,
+) -> None:
+    """#2296: the node-global sink replays orphaned UNROUTABLE jobs exactly once."""
+
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    orphan = await extracted_job(journal, memory_audience=None, memory_scope=None)
+    assert orphan.local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+
+    # Audience-only and explicitly audience-only claims leave it alone.
+    assert journal.claim_local_sink(orphan.job_id, owner_token="aud") is None
+    assert (
+        journal.claim_local_sink(
+            orphan.job_id, owner_token="aud", audience_routes=True, global_route=False
+        )
+        is None
+    )
+    assert journal.get(orphan.job_id).local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+
+    claimed = journal.claim_local_sink(
+        orphan.job_id,
+        owner_token="global",
+        audience_routes=False,
+        global_route=True,
+        now=fixtures.utc(2),
+    )
+    assert claimed is not None
+    assert claimed.local_sink_status is DistillLocalSinkStatus.RUNNING
+    assert claimed.memory_audience is None and claimed.memory_scope is None
+    # A route-free retry survives a reopen (the record validates on read).
+    failed = journal.mark_local_sink_retryable_failed(
+        orphan.job_id,
+        owner_token="global",
+        lease_epoch=claimed.local_sink_lease_epoch,
+        error_code="local_sink_io_failed",
+    )
+    reopened = DistillJournal(journal.root)
+    reopened.initialize()
+    assert reopened.get(orphan.job_id) == failed
+    assert journal.claim_local_sink(orphan.job_id, owner_token="aud") is None
+    retried = journal.claim_local_sink(
+        orphan.job_id, owner_token="global", audience_routes=False, global_route=True
+    )
+    assert retried is not None and retried.local_sink_attempts == 2
+    done = journal.mark_local_sink_done(
+        orphan.job_id,
+        owner_token="global",
+        lease_epoch=retried.local_sink_lease_epoch,
+    )
+    assert done.local_sink_status is DistillLocalSinkStatus.DONE
+    # Idempotent: a DONE job is never claimed again by any route.
+    assert (
+        journal.claim_local_sink(
+            orphan.job_id, owner_token="again", audience_routes=True, global_route=True
+        )
+        is None
+    )
+
+    routed_journal = DistillJournal(tmp_path / "routed")
+    routed_journal.initialize()
+    routed = await extracted_job(routed_journal)
+    assert (
+        routed_journal.claim_local_sink(
+            routed.job_id, owner_token="global", audience_routes=False, global_route=True
+        )
+        is None
+    )
+    assert routed_journal.get(routed.job_id).local_sink_status is DistillLocalSinkStatus.PENDING
+
+
+@pytest.mark.anyio
+async def test_prune_keeps_unadopted_unroutable_jobs_while_global_route_exists(
+    tmp_path: Path,
+) -> None:
+    """#2296: retention must not delete orphans before global adoption."""
+
+    from datetime import datetime, timedelta, timezone
+
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    orphan = await extracted_job(
+        journal, memory_audience=None, memory_scope=None, wiki_enabled=False
+    )
+    assert orphan.local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+    later = datetime.now(timezone.utc) + timedelta(days=30)
+
+    assert journal.prune_terminal_jobs(
+        older_than_seconds=60, now=later, keep_unroutable=True
+    ) == ()
+    assert journal.get(orphan.job_id).local_sink_status is DistillLocalSinkStatus.UNROUTABLE
+
+    # Once adopted (DONE) it is ordinary terminal work again.
+    claimed = journal.claim_local_sink(
+        orphan.job_id, owner_token="global", audience_routes=False, global_route=True
+    )
+    assert claimed is not None
+    journal.mark_local_sink_done(
+        orphan.job_id,
+        owner_token="global",
+        lease_epoch=claimed.local_sink_lease_epoch,
+    )
+    assert journal.prune_terminal_jobs(
+        older_than_seconds=60, now=later, keep_unroutable=True
+    ) == (orphan.job_id,)
+
+    # Without a global route the historical behavior is unchanged.
+    legacy = DistillJournal(tmp_path / "legacy")
+    legacy.initialize()
+    other = await extracted_job(
+        legacy, memory_audience=None, memory_scope=None, wiki_enabled=False
+    )
+    assert legacy.prune_terminal_jobs(older_than_seconds=60, now=later) == (
+        other.job_id,
+    )
+
+
+@pytest.mark.anyio
+async def test_sweep_prune_keeps_orphans_only_with_global_sink(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from telegram_bot.core.bot import TelegramBot
+
+    calls: list[dict[str, object]] = []
+
+    class _Journal:
+        def recover_stale_running(self):
+            return 0
+
+        def prune_terminal_jobs(self, **kwargs):
+            calls.append(kwargs)
+            return ()
+
+        def list_jobs(self):
+            return ()
+
+    for worker, expected in (
+        (SimpleNamespace(global_route_enabled=True), True),
+        (SimpleNamespace(global_route_enabled=False), False),
+        (None, False),
+    ):
+        bot = TelegramBot.__new__(TelegramBot)
+        bot._distill_journal = _Journal()
+        bot._distill_local_sink_worker = worker
+        bot._config = SimpleNamespace(distill_job_retention_seconds=3600.0)
+        calls.clear()
+        await bot._distill_sweep_jobs(0.0)
+        assert calls, "sweep did not prune"
+        assert calls[-1].get("keep_unroutable", False) is expected
+
+
+def test_route_free_local_sink_may_not_start_pending(tmp_path: Path) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = journal.enqueue_once(
+        provider="codex",
+        thread_id="thread-pending-routeless",
+        trigger=DistillTrigger.NEW_COMMAND,
+    )
+    payload = job.to_dict()
+    payload["local_sink_status"] = "pending"
+    with pytest.raises(ValueError, match="requires a memory route"):
+        DistillJob.from_dict(payload)
+
+
+@pytest.mark.anyio
 async def test_local_sink_lease_is_fenced_recoverable_and_independent(
     tmp_path: Path,
 ) -> None:

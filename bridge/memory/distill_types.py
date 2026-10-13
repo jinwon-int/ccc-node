@@ -412,9 +412,13 @@ class DistillJob:
         if self.local_sink_status is DistillLocalSinkStatus.UNROUTABLE:
             if self.memory_audience is not None or self.memory_scope is not None:
                 raise ValueError("unroutable local sink must not carry a route")
-        elif self.local_sink_status is not None and (
-            self.memory_audience is None or self.memory_scope is None
+        elif (
+            self.local_sink_status is DistillLocalSinkStatus.PENDING
+            and (self.memory_audience is None or self.memory_scope is None)
         ):
+            # Route-free work never starts PENDING: extraction marks it
+            # UNROUTABLE, and only a node-global sink (#2296, off/curated
+            # modes) may adopt it into RUNNING/DONE/failed states.
             raise ValueError("routable local sink status requires a memory route")
         _validate_wiki_sink_lease(
             self.wiki_sink_status,
