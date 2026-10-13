@@ -2084,6 +2084,20 @@ class MatrixTransport:
         ``m.new_content``. A successful edit also refreshes the reply-context
         cache, so a reply to the event quotes what it shows now.
         """
+        return await self.edit_notice_event(room, event_id, text, msgtype=msgtype) is not None
+
+    async def edit_notice_event(
+        self, room: str, event_id: str, text: str, *, msgtype: str = "m.text"
+    ) -> str | None:
+        """:meth:`edit_notice` that returns the edit event's id (``None`` when refused).
+
+        The ``m.replace`` event is a timeline event of its own, so a caller
+        that decides placement by "is my message still the newest event in
+        the room" (the external-wait status, #2288) has to recognise its own
+        edit as well as the original; the progress bubble keeps the same
+        pair as ``_bubble`` / ``_bubble_tail``. Like the bubble, the edit is
+        recorded as the room's newest event until the next sync says otherwise.
+        """
         from telegram_bot.core.matrix.render import trim_to_event
 
         bounded_text(text, MAX_REPLY_BYTES)
@@ -2095,13 +2109,14 @@ class MatrixTransport:
             # under a reused txn id would be deduplicated into the old edit.
             txn = hashlib.sha256(("notice-edit-" + event_id + ":" + str(time.time_ns())).encode()).hexdigest()
             try:
-                await self.encrypted_edit(room, text, event_id, txn, msgtype=msgtype)
+                edit_id = await self.encrypted_edit(room, text, event_id, txn, msgtype=msgtype)
             except MatrixHTTPError as exc:
                 if exc.part_rejected:
-                    return False
+                    return None
                 raise
             self._remember_text(event_id, room, self.c["account"], text)
-        return True
+            self.last_room_event[room] = edit_id
+        return edit_id
 
     async def redact_notice(self, room: str, event_id: str) -> bool:
         """Redact a bot-authored event; ``False`` when it is already gone or not redactable.

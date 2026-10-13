@@ -447,3 +447,216 @@ async def test_current_entry_is_left_alone(tmp_path: Path, matrix_config: dict[s
     store.put(uid, cid, message_id="$live", text_hash=text_hash_of(current))
     await bot._reconcile_external_wait_status_on_start()
     assert transport.notices == [] and transport.edits == [] and transport.redactions == []
+
+
+# --- placement: repost at the bottom when buried (#2288) ---------------------------
+
+
+class PlacementTransport(StatusTransport):
+    """StatusTransport plus the newest-event map and the edit-id seam the placement check uses."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_room_event: dict[str, str] = {}
+        self._edit_seq = 0
+
+    async def edit_notice_event(self, room: str, event_id: str, text: str, *, msgtype: str = "m.text") -> str | None:
+        edited = await self.edit_notice(room, event_id, text, msgtype=msgtype)
+        if not edited:
+            return None
+        self._edit_seq += 1
+        edit_id = f"$edit-{self._edit_seq}"
+        self.last_room_event[room] = edit_id
+        return edit_id
+
+
+def _placement_setup(
+    tmp_path: Path,
+) -> tuple[MatrixBot, PlacementTransport, ExternalWaitRegistry, ExternalWaitStatusStore, int, int]:
+    bot, _transport, registry, store, uid, cid = _setup(tmp_path)
+    transport = PlacementTransport()
+    bot._transport = transport
+    return bot, transport, registry, store, uid, cid
+
+
+def _age_status(store: ExternalWaitStatusStore, uid: int, cid: int, seconds: float) -> None:
+    """Pretend the stored status was posted ``seconds`` ago (past the move guard)."""
+    entry = store.get(uid, cid)
+    assert entry is not None
+    store.put(
+        uid,
+        cid,
+        message_id=entry["message_id"],
+        text_hash=entry["text_hash"],
+        tail=entry.get("tail"),
+        posted_epoch=time.time() - seconds,
+    )
+
+
+async def test_buried_status_is_redacted_and_reposted_through_the_outbox(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, transport, registry, store, uid, cid = _placement_setup(tmp_path)
+    _register(registry, uid, cid)
+    await bot._sync_external_wait_status(uid, cid)
+    event = await _deliver(bot, transport, "$notice-1")
+    transport.last_room_event[DM_ROOM] = event
+    _age_status(store, uid, cid, 60)
+
+    # Still the newest event: nothing to do.
+    await bot._sync_external_wait_status(uid, cid)
+    assert transport.redactions == [] and len(transport.notices) == 1
+
+    # The owner's next message and the reply land after it: move it down.
+    transport.last_room_event[DM_ROOM] = "$owner-message"
+    await bot._sync_external_wait_status(uid, cid)
+    assert transport.redactions == [(DM_ROOM, event)]
+    assert len(transport.notices) == 2 and transport.notices[1][1] == transport.notices[0][1]
+    assert transport.notice_msgtypes == ["m.notice", "m.notice"]
+    stored = store.get(uid, cid)
+    assert stored is not None and stored["message_id"] == PENDING_PREFIX + "$notice-2"
+    assert transport.edits == []
+
+    # Delivery adopts the new id and never moves, even though the echo of the
+    # fresh row has not updated last_room_event yet.
+    event2 = await _deliver(bot, transport, "$notice-2")
+    assert store.get(uid, cid)["message_id"] == event2
+    assert len(transport.notices) == 2 and len(transport.redactions) == 1
+
+
+async def test_recently_posted_status_is_not_moved(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    bot, transport, registry, store, uid, cid = _placement_setup(tmp_path)
+    _register(registry, uid, cid)
+    await bot._sync_external_wait_status(uid, cid)
+    await _deliver(bot, transport, "$notice-1")
+    transport.last_room_event[DM_ROOM] = "$something-newer"
+    # Posted just now: the guard holds (the echo may simply not be in yet).
+    await bot._sync_external_wait_status(uid, cid)
+    assert transport.redactions == [] and len(transport.notices) == 1
+    _age_status(store, uid, cid, wait_status.MOVE_MIN_INTERVAL_S + 1)
+    await bot._sync_external_wait_status(uid, cid)
+    assert len(transport.redactions) == 1 and len(transport.notices) == 2
+
+
+async def test_own_edit_is_not_mistaken_for_a_burying_event(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, transport, registry, store, uid, cid = _placement_setup(tmp_path)
+    wait_id = _register(registry, uid, cid)
+    await bot._sync_external_wait_status(uid, cid)
+    event = await _deliver(bot, transport, "$notice-1")
+    transport.last_room_event[DM_ROOM] = event
+    _age_status(store, uid, cid, 60)
+
+    # Terminal transition while still the newest event: an edit in place, and
+    # the edit's own event id becomes the stored tail.
+    registry.finish(wait_id, TERMINAL_SUCCESS)
+    await bot._sync_external_wait_status(uid, cid)
+    assert len(transport.edits) == 1 and transport.redactions == []
+    stored = store.get(uid, cid)
+    assert stored is not None and stored["tail"] == "$edit-1" and stored["message_id"] == event
+    assert transport.last_room_event[DM_ROOM] == "$edit-1"
+
+    # The edit is the newest event: still not buried.
+    await bot._sync_external_wait_status(uid, cid)
+    assert len(transport.edits) == 1 and transport.redactions == [] and len(transport.notices) == 1
+
+    # Buried after the edit: only finished waits are left, so the result line
+    # stays where it is (the resume turn's reply announced it) and expires.
+    transport.last_room_event[DM_ROOM] = "$reply"
+    await bot._sync_external_wait_status(uid, cid)
+    assert len(transport.edits) == 1 and transport.redactions == [] and len(transport.notices) == 1
+
+
+async def test_last_wait_finishing_while_buried_edits_in_place(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, transport, registry, store, uid, cid = _placement_setup(tmp_path)
+    wait_id = _register(registry, uid, cid)
+    await bot._sync_external_wait_status(uid, cid)
+    event = await _deliver(bot, transport, "$notice-1")
+    _age_status(store, uid, cid, 60)
+    transport.last_room_event[DM_ROOM] = "$owner-message"
+    registry.finish(wait_id, TERMINAL_SUCCESS)
+    # The monitor's syncer: nothing is watched any more, so no repost — the
+    # result replaces the waiting line where it stands.
+    await bot._sync_external_wait_status(uid, cid)
+    assert transport.redactions == [] and len(transport.notices) == 1
+    assert len(transport.edits) == 1 and transport.edits[0][:2] == (DM_ROOM, event)
+    assert transport.edits[0][2].startswith("✅ CI green → continuing")
+
+
+async def test_finished_wait_beside_a_watched_one_moves_with_it(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, transport, registry, store, uid, cid = _placement_setup(tmp_path)
+    first = _register(registry, uid, cid, pr=598)
+    _register(registry, uid, cid, pr=599)
+    await bot._sync_external_wait_status(uid, cid)
+    event = await _deliver(bot, transport, "$notice-1")
+    _age_status(store, uid, cid, 60)
+    transport.last_room_event[DM_ROOM] = "$owner-message"
+    registry.finish(first, TERMINAL_SUCCESS)
+    await bot._sync_external_wait_status(uid, cid)
+    assert transport.redactions == [(DM_ROOM, event)] and transport.edits == []
+    lines = transport.notices[1][1].splitlines()
+    assert lines[0].startswith("✅ CI green → continuing · PR #598 CI")
+    assert lines[1].startswith("⏳ Waiting for results · PR #599 CI")
+
+
+async def test_turn_closed_moves_a_buried_status_after_the_reply(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, transport, registry, store, uid, cid = _placement_setup(tmp_path)
+    _register(registry, uid, cid)
+    await bot._sync_external_wait_status(uid, cid)
+    event = await _deliver(bot, transport, "$notice-1")
+    _age_status(store, uid, cid, 60)
+    # A later turn: its user message is the room's newest event at turn close.
+    transport.last_room_event[DM_ROOM] = "$next-user-message"
+    await MatrixTurnRunner(bot).turn_closed(_job("and now?"))
+    assert transport.redactions == [(DM_ROOM, event)]
+    assert len(transport.notices) == 2  # queued after the reply row by outbox order
+
+
+async def test_placement_without_a_newest_event_map_never_moves(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    """A transport without ``last_room_event`` (or nothing synced yet) keeps the edit-only behaviour."""
+    bot, transport, registry, store, uid, cid = _setup(tmp_path)
+    _register(registry, uid, cid)
+    await bot._sync_external_wait_status(uid, cid)
+    await _deliver(bot, transport, "$notice-1")
+    _age_status(store, uid, cid, 60)
+    await bot._sync_external_wait_status(uid, cid)
+    assert transport.redactions == [] and len(transport.notices) == 1
+
+
+async def test_move_redaction_refused_for_good_still_reposts(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    bot, transport, registry, store, uid, cid = _placement_setup(tmp_path)
+    _register(registry, uid, cid)
+    await bot._sync_external_wait_status(uid, cid)
+    await _deliver(bot, transport, "$notice-1")
+    _age_status(store, uid, cid, 60)
+    transport.last_room_event[DM_ROOM] = "$newer"
+    transport.redact_result = False  # already gone
+    await bot._sync_external_wait_status(uid, cid)
+    assert len(transport.notices) == 2
+    assert store.get(uid, cid)["message_id"] == PENDING_PREFIX + "$notice-2"
+
+
+async def test_move_transient_redaction_failure_keeps_the_entry(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, transport, registry, store, uid, cid = _placement_setup(tmp_path)
+    _register(registry, uid, cid)
+    await bot._sync_external_wait_status(uid, cid)
+    event = await _deliver(bot, transport, "$notice-1")
+    _age_status(store, uid, cid, 60)
+    transport.last_room_event[DM_ROOM] = "$newer"
+    transport.redact_result = ConnectionError("boom")
+    await bot._sync_external_wait_status(uid, cid)  # swallowed, fail-open
+    assert len(transport.notices) == 1 and store.get(uid, cid)["message_id"] == event
+    transport.redact_result = True
+    await bot._sync_external_wait_status(uid, cid)
+    assert len(transport.notices) == 2

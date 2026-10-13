@@ -671,3 +671,37 @@ async def test_lifecycle_refresh_is_a_noop_without_the_mixin(tmp_path: Path) -> 
         pass
 
     await _LifecycleOnly()._refresh_external_wait_status(7, 70)
+
+
+def test_plan_buried_moves_regardless_of_text_change() -> None:
+    """#2288: a buried message is moved (redact + repost) even when its text is unchanged."""
+    monitoring = [_wait()]
+    recent = [_wait(state=TERMINAL_SUCCESS, completed=NOW - 5)]
+    stale = [_wait(state=TERMINAL_SUCCESS, completed=NOW - 5000)]
+    text = render_wait_status(monitoring, NOW)
+    assert text is not None
+    stored = {"message_id": 1, "text_hash": text_hash_of(text)}
+
+    assert plan_status_update(monitoring, stored, NOW, buried=True) == ("move", text)
+    assert plan_status_update(monitoring, {"message_id": 1, "text_hash": "old"}, NOW, buried=True) == ("move", text)
+    # Only finished waits left: the result line is edited in place, never moved.
+    action, final = plan_status_update(recent, stored, NOW, buried=True)
+    assert action == "edit" and final is not None and final.startswith("✅")
+    # Nothing to show wins over placement; no message cannot be buried.
+    assert plan_status_update(stale, stored, NOW, buried=True) == ("delete", None)
+    assert plan_status_update(monitoring, None, NOW, buried=True) == ("send", text)
+    assert plan_status_update([], None, NOW, buried=True) == ("noop", None)
+    # Default (Telegram) is unchanged.
+    assert plan_status_update(monitoring, stored, NOW) == ("noop", text)
+
+
+def test_store_keeps_optional_placement_facts(tmp_path: Path) -> None:
+    """#2288: ``tail`` / ``posted_epoch`` are stored only when given; the stage-1 shape is unchanged."""
+    store = ExternalWaitStatusStore(default_status_store_path(tmp_path / "external-wait"), clock=lambda: NOW)
+    store.put(7, 70, message_id="$a", text_hash="abcd")
+    assert "tail" not in store.get(7, 70) and "posted_epoch" not in store.get(7, 70)
+    store.put(7, 70, message_id="$a", text_hash="abcd", tail="$a-edit", posted_epoch=NOW - 30)
+    entry = store.get(7, 70)
+    assert entry["tail"] == "$a-edit" and entry["posted_epoch"] == NOW - 30
+    store.put(7, 70, message_id="$a", text_hash="abcd", tail=None, posted_epoch=None)
+    assert "tail" not in store.get(7, 70) and "posted_epoch" not in store.get(7, 70)
