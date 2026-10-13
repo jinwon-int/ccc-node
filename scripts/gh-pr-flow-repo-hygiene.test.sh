@@ -17,6 +17,10 @@ pass() { PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
 mkdir -p "$TMP/bin" "$TMP/state"
+# Behaves like OpenSSH: the remote command arguments are joined with spaces
+# into ONE string that the relay's login shell re-parses (`sh -c "$*"`). An
+# earlier fake ran `exec "$@"`, which skipped that re-parse and hid a
+# separator that the real remote shell executed as a pipe (#2292 review).
 cat > "$TMP/bin/ssh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -27,7 +31,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 shift
-exec "$@"
+exec sh -c "$*"
 SH
 # Fake gh backed by per-repo state under $FAKE_STATE, keyed by OWNER_REPO
 # (slash replaced):
@@ -243,14 +247,24 @@ else
   fail "protect-branch second apply not idempotent: $(cat "$TMP/out")"
 fi
 
-# 13) A same-name branch ruleset that is weaker in ONE way — a bypass actor,
-#     or no last-push approval — is a conflict, never overwritten. One defect
-#     per case, so each acceptance condition is pinned on its own.
-good_rs='{"id":9,"name":"protected-branch-stable","enforcement":"active","bypass_actors":[],"conditions":{"ref_name":{"include":["refs/heads/stable"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"pull_request","parameters":{"required_approving_review_count":1,"require_last_push_approval":true,"dismiss_stale_reviews_on_push":true}}]}'
+# 13) A same-name branch ruleset that is weaker in ONE respect is a conflict,
+#     never overwritten. One defect per case, so each acceptance condition is
+#     pinned on its own (#2292 review: exclude/target/merge/bypass slipped by).
+good_rs='{"id":9,"name":"protected-branch-stable","target":"branch","enforcement":"active","bypass_actors":[],"current_user_can_bypass":"never","conditions":{"ref_name":{"include":["refs/heads/stable"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"pull_request","parameters":{"required_approving_review_count":1,"require_last_push_approval":true,"dismiss_stale_reviews_on_push":true,"allowed_merge_methods":["merge"]}}]}'
+pr='(.rules[] | select(.type == "pull_request") | .parameters'
 for weak in '.bypass_actors = [{"actor_id":1,"actor_type":"RepositoryRole","bypass_mode":"always"}]' \
-  '(.rules[] | select(.type == "pull_request") | .parameters.require_last_push_approval) = false' \
-  '(.rules[] | select(.type == "pull_request") | .parameters.required_approving_review_count) = 0' \
-  '.conditions.ref_name.include = ["refs/heads/stable","refs/heads/other"]'; do
+  'del(.bypass_actors)' \
+  '.current_user_can_bypass = "always"' \
+  '.enforcement = "evaluate"' \
+  '.target = "tag"' \
+  '.conditions.ref_name.exclude = ["refs/heads/stable"]' \
+  '.conditions.ref_name.include = ["refs/heads/stable","refs/heads/other"]' \
+  '.rules += [{"type":"creation"}]' \
+  "$pr.require_last_push_approval) = false" \
+  "$pr.dismiss_stale_reviews_on_push) = false" \
+  "$pr.required_approving_review_count) = 0" \
+  "$pr.required_approving_review_count) = null" \
+  "$pr.allowed_merge_methods) = [\"merge\",\"squash\"]"; do
   reset_state
   mkdir -p "$FAKE_STATE/example-org_repo-p.rs"
   jq -c "$weak" <<<"$good_rs" > "$FAKE_STATE/example-org_repo-p.rs/9.json"
@@ -286,10 +300,66 @@ else
   fail "default-branch refusal or branch merge invalid (rc=$rc): $(cat "$TMP/out")"
 fi
 
+# 14b) An unknown default branch (field missing) fails closed for every
+#      protect-branch: never risk PR-gating what might be the default branch.
+reset_state
+cat > "$TMP/bin/gh-nodefault" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = api ] && [ "${2:-}" = repos/example-org/repo-p ]; then
+  echo '{"permissions":{"admin":true},"archived":false}'; exit 0
+fi
+exec "$FAKE_GH_REAL" "$@"
+SH
+chmod +x "$TMP/bin/gh-nodefault"
+mkdir -p "$TMP/bin-nodefault"; cp "$TMP/bin/ssh" "$TMP/bin-nodefault/ssh"
+ln -sf "$TMP/bin/gh-nodefault" "$TMP/bin-nodefault/gh"
+FAKE_GH_REAL="$TMP/bin/gh" PATH="$TMP/bin-nodefault:$PATH" \
+  bash "$SCRIPT" --operator-approved --apply --allowlist "$TMP/pb-allowlist" --repo example-org/repo-p >"$TMP/out" 2>"$TMP/err" && rc=0 || rc=$?
+if [ "$rc" -eq 4 ] && jq -se '.[0].protected_branches == ["stable:refused-default-branch"]' "$TMP/out" >/dev/null \
+  && ! grep -q 'protected-branch-stable' "$FAKE_STATE/mutations" 2>/dev/null; then
+  pass
+else
+  fail "unknown default branch did not fail closed (rc=$rc): $(cat "$TMP/out" "$TMP/err")"
+fi
+
+# 14c) Names that look like shell commands are only ever names: through the
+#      realistic ssh re-parse nothing executes, plain lines still work, and
+#      each repo keeps its own branch list (#2292 review reproduction).
+reset_state
+cat > "$TMP/inj-allowlist" <<LIST
+example-org/repo-a protect-branch=touch
+example-org/repo-b protect-branch=cat
+example-org/repo-c
+LIST
+( cd "$TMP" && bash "$SCRIPT" --operator-approved --apply --allowlist "$TMP/inj-allowlist" >"$TMP/out" 2>"$TMP/err" ) && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$TMP/example-org" ] \
+  && jq -se '(.[-1].summary and .[-1].ok) and (map(select(.repo)) as $r
+      | ($r | length) == 3
+      and $r[0].protected_branches == ["touch:created(#43)"]
+      and $r[1].protected_branches == ["cat:created(#43)"]
+      and $r[2].protected_branches == [])' "$TMP/out" >/dev/null; then
+  pass
+else
+  fail "shell-looking names were not handled as plain names (rc=$rc): $(cat "$TMP/out" "$TMP/err")"
+fi
+
+# 14d) A '#' starts a comment only at a field boundary; inside a branch token it
+#      is refused, never silently truncated to another branch name.
+reset_state
+printf 'example-org/repo-p protect-branch=fix#123\n' > "$TMP/hash-allowlist"
+if bash "$SCRIPT" --operator-approved --allowlist "$TMP/hash-allowlist" >"$TMP/out" 2>"$TMP/err"; then
+  fail "a '#' inside a branch token was accepted"
+elif grep -q 'invalid protect-branch name' "$TMP/err" && [ ! -e "$FAKE_STATE/mutations" ]; then
+  pass
+else
+  fail "'#' inside a branch token not refused explicitly: $(cat "$TMP/err")"
+fi
+
 # 15) Unsafe protect-branch values and unknown tokens are refused locally,
 #     before any remote call.
 for bad in 'protect-branch=master' 'protect-branch=Main' 'protect-branch=refs/heads/stable' \
-  'protect-branch=../stable' 'protect-branch=-x' 'protect-branch=' 'protect=stable' 'protect-branch=a;b'; do
+  'protect-branch=../stable' 'protect-branch=-x' 'protect-branch=' 'protect=stable' 'protect-branch=a;b' \
+  'protect-branch=stäble' 'protect-branch=a|b' 'protect-branch=a:b'; do
   reset_state
   printf 'example-org/repo-p %s\n' "$bad" > "$TMP/bad-pb"
   if bash "$SCRIPT" --operator-approved --allowlist "$TMP/bad-pb" >"$TMP/out" 2>"$TMP/err"; then

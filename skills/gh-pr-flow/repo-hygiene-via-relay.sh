@@ -23,6 +23,11 @@
 # names. Dry-run is the default; --apply mutates. Both need --operator-approved
 # because every use of the relay-held credential is a privileged action.
 set -euo pipefail
+# Name checks below are bracket regexes; under a UTF-8 locale [A-Za-z] can
+# match non-ASCII letters (#2292 review), so pin the C locale.
+export LC_ALL=C
+# declare -A and ${var,,} below; refuse rather than misparse on bash 3.
+[ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "refusing: bash >= 4 is required" >&2; exit 2; }
 
 usage() {
   cat <<'EOF'
@@ -67,9 +72,17 @@ done
 allowlist=()
 declare -A protect_branches=()
 while IFS= read -r line || [ -n "$line" ]; do
-  line="${line%%#*}"
-  read -r -a fields <<<"$line"
-  [ "${#fields[@]}" -gt 0 ] || continue
+  read -r -a raw_fields <<<"$line"
+  # '#' starts a comment only at a field boundary (or inside the repo field,
+  # which cannot contain it); a '#' inside a branch token is kept and then
+  # refused below instead of silently truncating the name (#2292 review).
+  fields=()
+  for f in "${raw_fields[@]+"${raw_fields[@]}"}"; do
+    [[ "$f" == '#'* ]] && break
+    if [ "${#fields[@]}" -eq 0 ] && [[ "$f" == *'#'* ]]; then fields+=("${f%%#*}"); break; fi
+    fields+=("$f")
+  done
+  [ "${#fields[@]}" -gt 0 ] && [ -n "${fields[0]}" ] || continue
   repo_entry="${fields[0]}"
   [[ "$repo_entry" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
     echo "refusing: invalid allowlist entry (expected OWNER/REPO): ${line//[[:space:]]/ }" >&2
@@ -108,10 +121,13 @@ else
 fi
 command -v ssh >/dev/null 2>&1 || { echo "ssh is required" >&2; exit 2; }
 
-# Remote arguments are `OWNER/REPO|b1,b2` (empty after '|' = no extra branch);
-# every name was validated above against a strict character set.
+# Remote arguments are `OWNER/REPO:b1,b2` (nothing after ':' = no extra
+# branch). ssh joins its arguments into ONE string that the relay's login shell
+# re-parses, so the separators must be shell-inert: ':' and ',' are, and
+# neither can occur in a validated repo or branch name. ('|' was a pipe there —
+# #2292 review.) Every name was validated above against a strict ASCII set.
 remote_args=()
-for r in "${selected[@]}"; do remote_args+=("$r|${protect_branches[$r]:-}"); done
+for r in "${selected[@]}"; do remote_args+=("$r:${protect_branches[$r]:-}"); done
 
 ssh -o BatchMode=yes -o ConnectTimeout="${CCC_RELAY_SSH_TIMEOUT:-8}" \
   "$ssh_target" bash -s -- \
@@ -134,8 +150,9 @@ actor="$(gh api user | jq -r .login)"
 # A ruleset matches only when it is active on ~DEFAULT_BRANCH with exactly the
 # two expected rule types; anything else under our name is a conflict we report
 # and never overwrite.
-matches='(.enforcement == "active")
+matches='(.enforcement == "active") and (.target == "branch")
   and (.conditions.ref_name.include == ["~DEFAULT_BRANCH"])
+  and ((.conditions.ref_name.exclude // []) == [])
   and ([.rules[].type] | sort == ["deletion","non_fast_forward"])'
 
 # 0 = enabled, 1 = disabled (HTTP 404 with admin), 2 = unknown error.
@@ -161,14 +178,20 @@ branch_payload() {
         required_review_thread_resolution:false, allowed_merge_methods:["merge"]}}]}'
 }
 branch_match() {
-  printf '%s' '(.enforcement == "active")
+  # Every property the SKILL.md promises is checked here: an exclude pattern,
+  # a tag target, a missing/non-empty bypass list, a non-"never" bypass for the
+  # caller, or other merge methods each make the ruleset weaker (#2292 review).
+  printf '%s' '(.enforcement == "active") and (.target == "branch")
     and (.conditions.ref_name.include == ['"$(jq -cn --arg r "refs/heads/$1" '$r')"'])
-    and (((.bypass_actors // []) | length) == 0)
+    and ((.conditions.ref_name.exclude // []) == [])
+    and ((.bypass_actors | type) == "array") and ((.bypass_actors | length) == 0)
+    and ((.current_user_can_bypass // "never") == "never")
     and ([.rules[].type] | sort == ["deletion","non_fast_forward","pull_request"])
     and ([.rules[] | select(.type == "pull_request") | .parameters
-          | (.required_approving_review_count >= 1)
+          | ((.required_approving_review_count // 0) >= 1)
             and (.require_last_push_approval == true)
-            and (.dismiss_stale_reviews_on_push == true)] | all)'
+            and (.dismiss_stale_reviews_on_push == true)
+            and (.allowed_merge_methods == ["merge"])] | all)'
 }
 
 # Ensure one named ruleset. Sets ens_status; returns 1 unless compliant (or, in
@@ -200,8 +223,9 @@ ensure_ruleset() {
 
 failed=0
 for entry in "$@"; do
-  repo="${entry%%|*}"
-  extra_branches="${entry#*|}"
+  repo="${entry%%:*}"
+  extra_branches=""
+  case "$entry" in *:*) extra_branches="${entry#*:}" ;; esac
   row() { jq -cn --arg repo "$repo" "$@"; }
   meta="$(gh api "repos/$repo")" || { row '{repo:$repo,status:"error",reason:"repo-read-failed"}'; failed=1; continue; }
   if [ "$(jq -r '.permissions.admin // false' <<<"$meta")" != "true" ]; then

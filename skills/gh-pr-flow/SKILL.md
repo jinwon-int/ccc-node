@@ -493,10 +493,16 @@ someone other than the last pusher (stale approvals dismissed, merge commits
 only, no bypass actors). Promotion then becomes a PR into that branch,
 reviewed cross-account like any other. The helper refuses `master`/`main` (any
 case) locally and the repository's actual default branch remotely, because a
-PR requirement there would break node automation. An existing ruleset of that
-name that is weaker in any of those respects is a `conflict-mismatch` and is
-left untouched. Each repository row reports `protected_branches` as
-`NAME:<state>` entries.
+PR requirement there would break node automation; an unknown default branch
+fails closed the same way. An existing ruleset of that name is accepted only
+if it is active, targets branches, includes exactly `refs/heads/NAME` with no
+exclude, has an empty bypass list (and `current_user_can_bypass` `never`), and
+carries exactly those three rules with those pull-request parameters; anything
+weaker is a `conflict-mismatch` and is left untouched. Each repository row
+reports `protected_branches` as `NAME:<state>` entries. The helper needs bash
+4+ locally and validates names in the C locale; repository and branch lists
+travel to the relay as shell-inert `OWNER/REPO:b1,b2` arguments, because ssh
+re-parses the remote command line with the relay's login shell.
 
 ## Environment deployment approval
 
