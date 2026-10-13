@@ -1,6 +1,6 @@
 ---
 name: scheduled-verification-with-session-fallback
-description: Schedule a verification/check to run at a future time, choosing the DURABLE scheduler first (systemd-run transient timer, systemd timer, crontab) and treating session-bounded CronCreate as a last resort. Use when a check must fire at a known future time, when a scheduled check silently never ran, or before claiming a node "cannot schedule durably".
+description: Schedule a verification/check to run at a future time, choosing a scheduler that survives what can happen before it fires — a persistent systemd timer/crontab when the wait can cross a reboot (any multi-hour or overnight wait), a systemd-run transient timer only for short waits — and treating session-bounded CronCreate as a last resort. Use when a check must fire at a known future time, when a scheduled check silently never ran, or before claiming a node "cannot schedule durably".
 ---
 
 ## When to Use
@@ -13,6 +13,13 @@ description: Schedule a verification/check to run at a future time, choosing the
 ## Core rule (read this first)
 
 **If `systemd-run` is available, do NOT use a session-bounded scheduler (CronCreate).**
+
+**A `systemd-run` timer is transient: its unit lives under `/run/systemd/transient/`
+and is gone after a reboot — it survives session death, not a reboot.** If the
+wait can cross a reboot (unattended-upgrades `Automatic-Reboot`, kernel updates,
+maintenance windows such as 03:15 KST), use a persistent unit or crontab
+(tier 2). Treat any overnight or multi-hour wait as reboot-crossing unless you
+have checked that no reboot is pending or allowed in the window.
 
 Session-bounded scheduling is a fallback for nodes with *no* durable mechanism —
 not a default. Choosing it while `systemd-run` exists is a silent data-loss bug:
@@ -50,10 +57,31 @@ systemctl list-timers --all --no-legend | grep probe-
 
 | Priority | Mechanism | Use when |
 |---|---|---|
-| 1 | `systemd-run --on-calendar=` / `--on-active=` transient timer | `systemd-run` exists and system is running. **Default.** |
-| 2 | Persistent systemd timer unit / crontab entry | The check recurs, or must survive reboot. |
+| 1 | `systemd-run --on-calendar=` / `--on-active=` transient timer | Short waits that cannot cross a reboot (same window, no pending/allowed reboot before it fires). **Default only for these.** |
+| 2 | Persistent systemd timer unit (`/etc/systemd/system`, `Persistent=true`) / crontab entry | The check recurs, **or the wait can cross a reboot — any multi-hour or overnight wait, any end-of-observation or hold-expiry action.** |
 | 3 | agent-cron durable task | The check needs an agent session and durable registration exists. |
 | 4 | Session-bounded one-shot (CronCreate) | **Only** when 1–3 are all unavailable. Must be reported to the user as best-effort. |
+
+Before choosing tier 1 for a long wait, check what can reboot the node first:
+
+```sh
+ls /run/systemd/shutdown/scheduled 2>/dev/null && cat /run/systemd/shutdown/scheduled  # a reboot already queued
+ls /var/run/reboot-required 2>/dev/null                                              # updates waiting for a reboot
+grep -h 'Automatic-Reboot' /etc/apt/apt.conf.d/* 2>/dev/null                          # unattended reboot policy/time
+```
+
+An already-queued `shutdown -r` is **not** cancelled by later setting
+`Unattended-Upgrade::Automatic-Reboot "false"` — that only stops new ones. If a
+change must hold reboots, cancel the queued one (`shutdown -c`) and re-check,
+or stop before starting.
+
+Tier 2 is not one mechanism. A persistent timer unit with an absolute
+`OnCalendar=` and `Persistent=true` also catches up: if the node was down at
+the fire time, it runs right after boot. A crontab entry does not — a missed
+minute is simply skipped — and it has no year field, so a one-shot entry must
+remove its own line after it runs or it fires again next year. Prefer the
+persistent unit when the fire time itself may fall inside a reboot or outage,
+and disable a one-shot unit after it has run so stale units do not pile up.
 
 Record which tier you selected **and why the higher tiers were rejected**, with
 the command output that justified the rejection. "I didn't see any timers" is
@@ -110,6 +138,18 @@ used — the explicit session-boundary risk. Never promise auto-resume for tier 
 
 Two lessons, both encoded above: probe **capability**, not inventory; and a wrong
 premise propagates into memory faster than it gets corrected.
+
+### Second failure — a transient timer across a reboot (2026-10-13)
+
+A 24 h production observation scheduled its T+24h snapshot and its reboot-hold
+expiry as `systemd-run --on-calendar` transient timers. unattended-upgrades had
+already queued a 03:15 reboot (`Reboot scheduled …`) **hours before** the
+hold file (`Automatic-Reboot "false"`) was written; the queued reboot still ran.
+Both transient timers vanished with `/run`: the T+24h row was never written
+(the automatic verdict came back INCOMPLETE), and the hold file outlived its
+approved window because its expiry timer was gone. Lessons: a transient timer
+survives session death but not a reboot; a reboot hold does not cancel a
+reboot that is already queued.
 
 ## Safety
 
