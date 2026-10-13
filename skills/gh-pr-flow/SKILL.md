@@ -482,6 +482,28 @@ every selected repository ends compliant. Widening the ruleset is a code change
 through this skill's PR flow; editing the allowlist is an operator decision
 recorded with the run's approval.
 
+**Promotion branches (#2292).** A branch that nodes deploy from — for example a
+`stable` ref that a scheduled self-update follows while the default branch is
+auto-merged — must not be movable by a plain push. Opt a repository in with
+`protect-branch=NAME` tokens on its allowlist line
+(`OWNER/REPO protect-branch=NAME [protect-branch=NAME2]`). For each name the
+helper ensures a `protected-branch-NAME` ruleset on `refs/heads/NAME`:
+deletion and force-push blocked, plus a pull request with one approval from
+someone other than the last pusher (stale approvals dismissed, merge commits
+only, no bypass actors). Promotion then becomes a PR into that branch,
+reviewed cross-account like any other. The helper refuses `master`/`main` (any
+case) locally and the repository's actual default branch remotely, because a
+PR requirement there would break node automation; an unknown default branch
+fails closed the same way. An existing ruleset of that name is accepted only
+if it is active, targets branches, includes exactly `refs/heads/NAME` with no
+exclude, has an empty bypass list (and `current_user_can_bypass` `never`), and
+carries exactly those three rules with those pull-request parameters; anything
+weaker is a `conflict-mismatch` and is left untouched. Each repository row
+reports `protected_branches` as `NAME:<state>` entries. The helper needs bash
+4+ locally and validates names in the C locale; repository and branch lists
+travel to the relay as shell-inert `OWNER/REPO:b1,b2` arguments, because ssh
+re-parses the remote command line with the relay's login shell.
+
 ## Environment deployment approval
 
 A workflow job gated by a GitHub Actions environment with required reviewers
