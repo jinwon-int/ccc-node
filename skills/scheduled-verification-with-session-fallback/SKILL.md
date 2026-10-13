@@ -75,6 +75,14 @@ An already-queued `shutdown -r` is **not** cancelled by later setting
 change must hold reboots, cancel the queued one (`shutdown -c`) and re-check,
 or stop before starting.
 
+Tier 2 is not one mechanism. A persistent timer unit with an absolute
+`OnCalendar=` and `Persistent=true` also catches up: if the node was down at
+the fire time, it runs right after boot. A crontab entry does not — a missed
+minute is simply skipped — and it has no year field, so a one-shot entry must
+remove its own line after it runs or it fires again next year. Prefer the
+persistent unit when the fire time itself may fall inside a reboot or outage,
+and disable a one-shot unit after it has run so stale units do not pile up.
+
 Record which tier you selected **and why the higher tiers were rejected**, with
 the command output that justified the rejection. "I didn't see any timers" is
 not a justification.
@@ -135,7 +143,7 @@ premise propagates into memory faster than it gets corrected.
 
 A 24 h production observation scheduled its T+24h snapshot and its reboot-hold
 expiry as `systemd-run --on-calendar` transient timers. unattended-upgrades had
-already queued a 03:15 reboot (`Reboot scheduled …`) **four hours before** the
+already queued a 03:15 reboot (`Reboot scheduled …`) **hours before** the
 hold file (`Automatic-Reboot "false"`) was written; the queued reboot still ran.
 Both transient timers vanished with `/run`: the T+24h row was never written
 (the automatic verdict came back INCOMPLETE), and the hold file outlived its

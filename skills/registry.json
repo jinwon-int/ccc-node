@@ -373,7 +373,7 @@
       "name": "scheduled-verification-with-session-fallback",
       "source": "skills/scheduled-verification-with-session-fallback",
       "status": "active",
-      "tree_sha256": "341a3b300d52527d5c58a636b0e49e810cf8c3750c7b1b241fae31d57040efa0"
+      "tree_sha256": "056c6678fb576f131202e92a037aa75c629dc57c2b102fc4f3e730feaa0bd327"
     },
     {
       "audience": "shared",
