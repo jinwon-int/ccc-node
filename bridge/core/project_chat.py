@@ -286,6 +286,8 @@ class ProjectChatHandler(
         self._usage_write_lock = asyncio.Lock()
         self._usage_write_tasks: set[asyncio.Task[Any]] = set()
         self._session_guard_evictions = 0
+        self._session_guard_busy_deferrals = 0
+        self._session_guard_last_busy_deferred = 0
         self._session_guard_runtime_recycles = 0
         self._session_guard_last_tree_rss_mb = 0.0
         self._agent_session_attachments = 0

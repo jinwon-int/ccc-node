@@ -172,6 +172,29 @@ class AgentSessionRegistry:
         ]
         return tuple(sorted(candidates, key=lambda candidate: candidate.last_used_at))
 
+    def peek_idle_cached_if_same(
+        self,
+        candidate: IdleSessionCandidate,
+    ) -> AgentSessionEntry | None:
+        """Return the candidate's cached entry without changing the cache.
+
+        Same identity checks as :meth:`drop_idle_cached_if_same`, so a caller
+        can ask the provider session whether it still owns work before it
+        decides to drop it (#2291). No await may separate the peek from the
+        drop for the answer to stay valid.
+        """
+
+        record = self._records.get(candidate.key)
+        slot = record.cached if record is not None else None
+        if (
+            record is None
+            or record.active is not None
+            or slot is None
+            or slot.token != candidate.token
+        ):
+            return None
+        return slot.entry
+
     def drop_idle_cached_if_same(
         self,
         candidate: IdleSessionCandidate,

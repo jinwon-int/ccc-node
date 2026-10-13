@@ -428,6 +428,20 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
             (0, 0.0),
         )
 
+    async def test_recent_background_task_count_is_per_task(self) -> None:
+        """#2291: the guard's age cap applies per task, not to the oldest."""
+
+        session, client = await self._start_session()
+        client.turn_scripts.append("background")
+        await _collect(session.send_turn("run validation"))
+        now = asyncio.get_running_loop().time()
+        self.assertEqual(session.recent_background_task_count(now, 60.0), 1)
+
+        # A second, much older task: only the fresh one is within the cap.
+        session._background_tasks["bg-forgotten"] = now - 25 * 60 * 60
+        self.assertEqual(session.recent_background_task_count(now, 24 * 60 * 60), 1)
+        self.assertEqual(session.background_workload_snapshot(now)[0], 2)
+
     async def test_typed_task_updates_release_only_terminal_background_work(self) -> None:
         session, client = await self._start_session()
         for task_id in ("completed", "killed", "running"):
@@ -1074,6 +1088,34 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
             after.message,
             "No active turn accepts approval requests; start a new user turn and retry",
         )
+
+    async def test_autonomous_turn_inflight_spans_the_autonomous_turn(self) -> None:
+        """#2291: the session-guard busy seam follows the autonomous turn window."""
+
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        self.assertFalse(session.autonomous_turn_inflight())
+
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session.autonomous_turn_inflight())
+
+        client.emit_result(result=None)
+        await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
+        self.assertFalse(session.autonomous_turn_inflight())
+
+    async def test_autonomous_turn_inflight_clears_when_the_reader_dies(self) -> None:
+        """#2291: a dead reader cannot pin its session as busy forever."""
+
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session.autonomous_turn_inflight())
+        self.assertTrue(session.provider_reader_alive())
+
+        client.emit(None)  # stream ends mid autonomous turn, no ResultMessage
+        await _wait_until(lambda: not session.provider_reader_alive())
+        self.assertTrue(session._unsolicited_inflight)
+        self.assertFalse(session.autonomous_turn_inflight())
 
     # -- ownership across interleaved turns --------------------------------
 

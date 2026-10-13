@@ -543,6 +543,8 @@ class ProjectChatStateMixin:
     _agent_session_registry: AgentSessionRegistry
     _config: Any
     _session_guard_evictions: int
+    _session_guard_busy_deferrals: int
+    _session_guard_last_busy_deferred: int
     _session_guard_last_tree_rss_mb: float
     _session_guard_lock: asyncio.Lock
     _session_guard_runtime_recycles: int
@@ -561,9 +563,163 @@ class ProjectChatStateMixin:
             "active_sessions": metrics.active_sessions,
             "tree_rss_mb": self._session_guard_last_tree_rss_mb,
             "evictions": self._session_guard_evictions,
+            "busy_deferrals": self._session_guard_busy_deferrals,
             "runtime_recycles": self._session_guard_runtime_recycles,
             "codex_attachments": self._agent_session_attachments,
         }
+
+    # A run-in-background task older than this no longer pins its session:
+    # a forgotten server or `tail -f` must not keep a CLI resident forever.
+    _BACKGROUND_BUSY_MAX_AGE_SECONDS = 24 * 60 * 60
+
+    @classmethod
+    def _provider_session_busy(cls, session: object, now: float) -> bool:
+        """Return True while a provider session owns work the bridge did not submit.
+
+        The registry marks only bridge-submitted turns active. A Claude CLI
+        that continues on its own after a ``<task-notification>`` (an
+        autonomous turn), or that still owns run-in-background tasks, is not
+        idle: closing it SIGKILLs the running tool and destroys the work
+        (#2291, #1277). Both seams are optional so other providers keep the
+        old behaviour. A probe that raises counts as busy: never evict on
+        doubt; the next guard tick asks again.
+        """
+
+        alive = getattr(session, "provider_reader_alive", None)
+        if callable(alive):
+            try:
+                if not alive():
+                    # A dead reader can never clear its own work state; the
+                    # session is reclaimable like before #2291.
+                    return False
+            except Exception:
+                logger.debug(
+                    "Provider liveness probe failed: provider=%s",
+                    type(session).__name__,
+                )
+        inflight = getattr(session, "autonomous_turn_inflight", None)
+        if callable(inflight):
+            try:
+                if inflight():
+                    return True
+            except Exception:
+                logger.debug(
+                    "Autonomous-turn probe failed: provider=%s",
+                    type(session).__name__,
+                )
+                return True
+        recent = getattr(session, "recent_background_task_count", None)
+        if callable(recent):
+            try:
+                return int(recent(now, cls._BACKGROUND_BUSY_MAX_AGE_SECONDS)) > 0
+            except Exception:
+                logger.debug(
+                    "Recent background task probe failed: provider=%s",
+                    type(session).__name__,
+                )
+                return True
+        snapshot = getattr(session, "background_workload_snapshot", None)
+        if callable(snapshot):
+            try:
+                count, oldest_age = snapshot(now)
+                if (
+                    int(count) > 0
+                    and float(oldest_age) < cls._BACKGROUND_BUSY_MAX_AGE_SECONDS
+                ):
+                    return True
+            except Exception:
+                logger.debug(
+                    "Background workload probe failed: provider=%s",
+                    type(session).__name__,
+                )
+                return True
+        return False
+
+    def _spare_busy_candidates(
+        self, idle: tuple[IdleSessionCandidate, ...], now: float
+    ) -> tuple[list[IdleSessionCandidate], list[IdleSessionCandidate]]:
+        """Split idle candidates into evictable and busy ones.
+
+        Done before TTL/LRU/RSS selection so a busy session never occupies a
+        slot the LRU cap would otherwise fill with a genuinely idle one.
+        """
+
+        free: list[IdleSessionCandidate] = []
+        busy: list[IdleSessionCandidate] = []
+        for candidate in idle:
+            entry = self._agent_session_registry.peek_idle_cached_if_same(candidate)
+            if entry is not None and self._provider_session_busy(entry.session, now):
+                busy.append(candidate)
+            else:
+                free.append(candidate)
+        return free, busy
+
+    @staticmethod
+    def _count_pressured_busy(
+        busy: list[IdleSessionCandidate],
+        now: float,
+        ttl: int,
+        under_pressure: bool,
+    ) -> int:
+        """Count busy sessions the guard would have evicted were they idle.
+
+        ``busy_deferrals`` must mean "work spared from eviction", not "a busy
+        session existed during a quiet tick": TTL expiry, or cap/memory
+        pressure that applies to every idle session.
+        """
+
+        if under_pressure:
+            return len(busy)
+        return sum(1 for candidate in busy if now - candidate.last_used_at >= ttl)
+
+    def _any_resident_provider_busy(self, now: float) -> bool:
+        return any(
+            self._provider_session_busy(entry.session, now)
+            for entry in self._agent_session_registry.resident_entries_snapshot()
+        )
+
+    async def _evict_guard_candidates(
+        self,
+        candidates: list[IdleSessionCandidate],
+        now: float,
+        rss_mb: float,
+        deferred: int = 0,
+    ) -> int:
+        """Close idle candidates, sparing those whose provider still owns work.
+
+        Idle to the registry is not idle to the provider: an autonomous turn
+        or a run-in-background task may be running (#2291). Peek and drop
+        are synchronous with no await between them, so the busy answer holds
+        for the drop it guards.
+        """
+
+        evicted = 0
+        for candidate in candidates:
+            peeked = self._agent_session_registry.peek_idle_cached_if_same(candidate)
+            if peeked is not None and self._provider_session_busy(
+                peeked.session, now
+            ):
+                deferred += 1
+                continue
+            entry = self._agent_session_registry.drop_idle_cached_if_same(candidate)
+            if entry is None:
+                continue
+            await self._close_agent_session(entry.session)
+            evicted += 1
+        self._session_guard_busy_deferrals += deferred
+        if deferred != self._session_guard_last_busy_deferred:
+            # Log on change only: a long autonomous turn would otherwise
+            # repeat this line on every guard tick.
+            self._session_guard_last_busy_deferred = deferred
+            if deferred:
+                logger.info(
+                    "Session resource guard deferred %d session(s) with "
+                    "in-flight provider work (autonomous turn or background "
+                    "task); rss_mb=%.1f",
+                    deferred,
+                    rss_mb,
+                )
+        return evicted
 
     async def enforce_session_resource_limits(
         self, *, now: float | None = None
@@ -580,7 +736,9 @@ class ProjectChatStateMixin:
         current = asyncio.get_running_loop().time() if now is None else float(now)
         async with self._session_guard_lock:
             metrics = self._agent_session_registry.metrics()
-            idle = self._agent_session_registry.idle_lru_candidates()
+            idle, busy = self._spare_busy_candidates(
+                self._agent_session_registry.idle_lru_candidates(), current
+            )
 
             ttl = int(getattr(self._config, "session_idle_ttl_seconds", 4 * 60 * 60))
             candidates: list[IdleSessionCandidate] = [
@@ -611,15 +769,16 @@ class ProjectChatStateMixin:
                     if candidate not in candidates:
                         candidates.append(candidate)
 
-            evicted = 0
-            for candidate in candidates:
-                entry = self._agent_session_registry.drop_idle_cached_if_same(
-                    candidate
-                )
-                if entry is None:
-                    continue
-                await self._close_agent_session(entry.session)
-                evicted += 1
+            deferred = self._count_pressured_busy(
+                busy,
+                current,
+                ttl,
+                metrics.resident_sessions > maximum
+                or (memory_high and metrics.active_sessions == 0),
+            )
+            evicted = await self._evict_guard_candidates(
+                candidates, current, rss_mb, deferred=deferred
+            )
             if evicted:
                 self._session_guard_evictions += evicted
                 if getattr(self._config, "agent_provider", "claude") == "codex":
@@ -645,6 +804,7 @@ class ProjectChatStateMixin:
             if (
                 getattr(self._config, "agent_provider", "claude") == "codex"
                 and self._agent_session_registry.metrics().active_sessions == 0
+                and not self._any_resident_provider_busy(current)
                 and (
                     memory_high
                     or attachment_high
@@ -678,7 +838,9 @@ class ProjectChatStateMixin:
     async def _recycle_agent_runtime_locked(self, reason: str) -> bool:
         """Restart a shared idle runtime while preserving durable thread ids."""
 
-        if self._agent_session_registry.metrics().active_sessions:
+        if self._agent_session_registry.metrics().active_sessions or (
+            self._any_resident_provider_busy(asyncio.get_running_loop().time())
+        ):
             self._agent_runtime_recycle_pending = True
             return False
         recycle = getattr(self._agent_runtime, "recycle", None)

@@ -62,6 +62,19 @@ class ClaudeSessionTaskTrackingMixin:
         oldest_started = min(self._background_tasks.values())
         return len(self._background_tasks), max(0.0, float(now) - oldest_started)
 
+    def recent_background_task_count(self, now: float, max_age: float) -> int:
+        """Count tracked background tasks started less than ``max_age`` ago.
+
+        Per task, unlike :meth:`background_workload_snapshot`'s oldest age:
+        one forgotten long-running task must not unpin a fresh one (#2291).
+        """
+
+        return sum(
+            1
+            for started in self._background_tasks.values()
+            if float(now) - started < max_age
+        )
+
     def _observe_background_task_result(self, result: JsonValue) -> None:
         for text in self._content_texts(result):
             match = _BACKGROUND_TASK_STARTED.search(text)

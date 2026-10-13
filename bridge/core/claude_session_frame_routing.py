@@ -32,6 +32,7 @@ class ClaudeSessionFrameRoutingMixin:
 
     _active_turn: _ActiveTurn | None
     _closed: bool
+    _reader_task: asyncio.Task[None] | None
     _session_id: str | None
     _session_ready: asyncio.Event
     _unsolicited_discard: bool
@@ -50,6 +51,34 @@ class ClaudeSessionFrameRoutingMixin:
     _route_tool_results: Callable[[_ActiveTurn, UserMessage], None]
     _complete_turn: Callable[[_ActiveTurn, ResultMessage], None]
     _fail_active_turn: Callable[[str, str], None]
+
+    def provider_reader_alive(self) -> bool:
+        """Return True while this session can still receive provider frames.
+
+        A closed session, or one whose reader task has ended (stream end,
+        transport or parse failure), will never see the terminal frame that
+        clears its autonomous-turn or background-task state. The session guard
+        must not treat such a session as busy forever (#2291).
+        """
+
+        reader = self._reader_task
+        return not self._closed and reader is not None and not reader.done()
+
+    def autonomous_turn_inflight(self) -> bool:
+        """Return True while the CLI runs a turn the bridge did not submit.
+
+        After a run-in-background task finishes, Claude Code injects its
+        ``<task-notification>`` and continues on its own. The registry only
+        marks bridge-submitted (``send_turn``) turns active, so without this
+        seam the session resource guard treats such a session as idle and
+        closing it SIGKILLs the running tool (#2291). The discard window of
+        an abandoned ``send_turn`` counts too: the CLI is still producing
+        that turn's frames. Body-free and read-only.
+        """
+
+        if not self.provider_reader_alive():
+            return False
+        return bool(self._unsolicited_inflight or self._unsolicited_discard)
 
     async def _read_frames(self, client: SdkClient) -> None:
         stream_failure: str | None = None
