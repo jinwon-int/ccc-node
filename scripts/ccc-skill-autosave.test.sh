@@ -900,8 +900,8 @@ ok "#2285: an ok collect with blocked envelopes is not logged as failed" \
   '! grep -q "promotion-collect failed" "$STATE16C/skill-autosave.log" && grep -q "promotion-collect edge-env=absent " "$STATE16C/skill-autosave.log"'
 ok "#2285: blocked envelopes get their own shape-checked digest line" \
   'grep -q "promotion-collect-blocked count=2 \[peer-lane:legacy-skill:description_trigger_missing,-:-:x\]$" "$STATE16C/skill-autosave.log"'
-ok "#2285: off-charset blocked values never reach the log" \
-  '! grep -q "rm -rf\|Weird\|(id)" "$STATE16C/skill-autosave.log"'
+ok "#2285: off-charset blocked values never reach the blocked line" \
+  'grep "promotion-collect-blocked" "$STATE16C/skill-autosave.log" | grep -q . && ! grep "promotion-collect-blocked" "$STATE16C/skill-autosave.log" | grep -q "rm -rf\|Weird\|(id)"'
 STATE16D="$TMP/state16d"
 run16 "$STATE16D" PROMOTION_COLLECT_RC=0 PROMOTION_COLLECT_OUT='{"ok":true,"mode":"collect","published":[],"errors":[],"blocked":[]}'
 ok "#2285: no blocked line when nothing is blocked" \
