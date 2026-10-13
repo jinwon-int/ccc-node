@@ -543,6 +543,8 @@ class ProjectChatStateMixin:
     _agent_session_registry: AgentSessionRegistry
     _config: Any
     _session_guard_evictions: int
+    _session_guard_busy_deferrals: int
+    _session_guard_last_busy_deferred: int
     _session_guard_last_tree_rss_mb: float
     _session_guard_lock: asyncio.Lock
     _session_guard_runtime_recycles: int
@@ -561,9 +563,97 @@ class ProjectChatStateMixin:
             "active_sessions": metrics.active_sessions,
             "tree_rss_mb": self._session_guard_last_tree_rss_mb,
             "evictions": self._session_guard_evictions,
+            "busy_deferrals": self._session_guard_busy_deferrals,
             "runtime_recycles": self._session_guard_runtime_recycles,
             "codex_attachments": self._agent_session_attachments,
         }
+
+    @staticmethod
+    def _provider_session_busy(session: object, now: float) -> bool:
+        """Return True while a provider session owns work the bridge did not submit.
+
+        The registry marks only bridge-submitted turns active. A Claude CLI
+        that continues on its own after a ``<task-notification>`` (an
+        autonomous turn), or that still owns run-in-background tasks, is not
+        idle: closing it SIGKILLs the running tool and destroys the work
+        (#2291, #1277). Both seams are optional so other providers keep the
+        old behaviour. A probe that raises counts as busy: never evict on
+        doubt; the next guard tick asks again.
+        """
+
+        inflight = getattr(session, "autonomous_turn_inflight", None)
+        if callable(inflight):
+            try:
+                if inflight():
+                    return True
+            except Exception:
+                logger.debug(
+                    "Autonomous-turn probe failed: provider=%s",
+                    type(session).__name__,
+                )
+                return True
+        snapshot = getattr(session, "background_workload_snapshot", None)
+        if callable(snapshot):
+            try:
+                count, _oldest_age = snapshot(now)
+                if int(count) > 0:
+                    return True
+            except Exception:
+                logger.debug(
+                    "Background workload probe failed: provider=%s",
+                    type(session).__name__,
+                )
+                return True
+        return False
+
+    def _any_resident_provider_busy(self, now: float) -> bool:
+        return any(
+            self._provider_session_busy(entry.session, now)
+            for entry in self._agent_session_registry.resident_entries_snapshot()
+        )
+
+    async def _evict_guard_candidates(
+        self,
+        candidates: list[IdleSessionCandidate],
+        now: float,
+        rss_mb: float,
+    ) -> int:
+        """Close idle candidates, sparing those whose provider still owns work.
+
+        Idle to the registry is not idle to the provider: an autonomous turn
+        or a run-in-background task may be running (#2291). Peek and drop
+        are synchronous with no await between them, so the busy answer holds
+        for the drop it guards.
+        """
+
+        evicted = 0
+        deferred = 0
+        for candidate in candidates:
+            peeked = self._agent_session_registry.peek_idle_cached_if_same(candidate)
+            if peeked is not None and self._provider_session_busy(
+                peeked.session, now
+            ):
+                deferred += 1
+                continue
+            entry = self._agent_session_registry.drop_idle_cached_if_same(candidate)
+            if entry is None:
+                continue
+            await self._close_agent_session(entry.session)
+            evicted += 1
+        self._session_guard_busy_deferrals += deferred
+        if deferred != self._session_guard_last_busy_deferred:
+            # Log on change only: a long autonomous turn would otherwise
+            # repeat this line on every guard tick.
+            self._session_guard_last_busy_deferred = deferred
+            if deferred:
+                logger.info(
+                    "Session resource guard deferred %d session(s) with "
+                    "in-flight provider work (autonomous turn or background "
+                    "task); rss_mb=%.1f",
+                    deferred,
+                    rss_mb,
+                )
+        return evicted
 
     async def enforce_session_resource_limits(
         self, *, now: float | None = None
@@ -611,15 +701,7 @@ class ProjectChatStateMixin:
                     if candidate not in candidates:
                         candidates.append(candidate)
 
-            evicted = 0
-            for candidate in candidates:
-                entry = self._agent_session_registry.drop_idle_cached_if_same(
-                    candidate
-                )
-                if entry is None:
-                    continue
-                await self._close_agent_session(entry.session)
-                evicted += 1
+            evicted = await self._evict_guard_candidates(candidates, current, rss_mb)
             if evicted:
                 self._session_guard_evictions += evicted
                 if getattr(self._config, "agent_provider", "claude") == "codex":
@@ -645,6 +727,7 @@ class ProjectChatStateMixin:
             if (
                 getattr(self._config, "agent_provider", "claude") == "codex"
                 and self._agent_session_registry.metrics().active_sessions == 0
+                and not self._any_resident_provider_busy(current)
                 and (
                     memory_high
                     or attachment_high
@@ -678,7 +761,9 @@ class ProjectChatStateMixin:
     async def _recycle_agent_runtime_locked(self, reason: str) -> bool:
         """Restart a shared idle runtime while preserving durable thread ids."""
 
-        if self._agent_session_registry.metrics().active_sessions:
+        if self._agent_session_registry.metrics().active_sessions or (
+            self._any_resident_provider_busy(asyncio.get_running_loop().time())
+        ):
             self._agent_runtime_recycle_pending = True
             return False
         recycle = getattr(self._agent_runtime, "recycle", None)

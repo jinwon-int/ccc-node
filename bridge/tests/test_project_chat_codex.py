@@ -121,6 +121,24 @@ class CloseableFakeSession(FakeSession):
         self.close_calls += 1
 
 
+class ProviderWorkFakeSession(CloseableFakeSession):
+    """Idle to the registry, but may own provider work (#2291 seams)."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.inflight = False
+        self.background = 0
+        self.probe_error = False
+
+    def autonomous_turn_inflight(self) -> bool:
+        if self.probe_error:
+            raise RuntimeError("probe failed")
+        return self.inflight
+
+    def background_workload_snapshot(self, now: float) -> tuple[int, float]:
+        return self.background, 30.0 if self.background else 0.0
+
+
 class BlockingInterruptSession(FakeSession):
     def __init__(self, session_id: str) -> None:
         super().__init__(session_id)
@@ -727,6 +745,155 @@ async def test_session_guard_closes_expired_idle_session_but_protects_active(
     assert snapshot["resident_sessions"] == 1
     assert snapshot["active_sessions"] == 1
     assert snapshot["evictions"] == 1
+
+
+def _rss_pressure_handler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    provider: str = "claude",
+    rss_mb: float = 1057.9,
+) -> tuple[ProjectChatHandler, FakeRuntime]:
+    """The 2026-10-13 incident shape: 4 GiB host, 1024 MiB floor, tree above it."""
+
+    settings = _settings(tmp_path, provider=provider)
+    settings.session_guard_enabled = True
+    settings.session_idle_ttl_seconds = 4 * 60 * 60
+    settings.max_resident_sessions = 2
+    settings.session_tree_rss_limit_mb = 1024
+    settings.codex_max_session_attachments = 0
+    runtime = FakeRuntime()
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    monkeypatch.setitem(
+        handler.enforce_session_resource_limits.__func__.__globals__,
+        "process_tree_rss_mb",
+        lambda: rss_mb,
+    )
+    return handler, runtime
+
+
+@pytest.mark.anyio
+async def test_session_guard_keeps_session_running_an_autonomous_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2291: RSS pressure must not kill a CLI mid autonomous turn."""
+
+    handler, _runtime = _rss_pressure_handler(tmp_path, monkeypatch)
+    busy = ProviderWorkFakeSession("autonomous")
+    busy.inflight = True
+    idle = ProviderWorkFakeSession("idle")
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=busy, last_used_at=10.0)
+    )
+    handler._agent_session_registry.put_cached(
+        (7, 71), AgentSessionEntry(session=idle, last_used_at=20.0)
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=300.0)
+
+    assert busy.close_calls == 0
+    assert handler._agent_session_registry.get_cached((7, 70)) is not None
+    # Per-session decision: a genuinely idle neighbour is still reclaimed.
+    assert idle.close_calls == 1
+    assert snapshot["evictions"] == 1
+    assert snapshot["busy_deferrals"] == 1
+
+
+@pytest.mark.anyio
+async def test_session_guard_keeps_session_owning_background_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler, _runtime = _rss_pressure_handler(tmp_path, monkeypatch)
+    session = ProviderWorkFakeSession("background")
+    session.background = 1
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=session, last_used_at=10.0)
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=300.0)
+
+    assert session.close_calls == 0
+    assert snapshot["evictions"] == 0
+    assert snapshot["busy_deferrals"] == 1
+
+
+@pytest.mark.anyio
+async def test_session_guard_evicts_once_the_autonomous_turn_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler, _runtime = _rss_pressure_handler(tmp_path, monkeypatch)
+    session = ProviderWorkFakeSession("autonomous")
+    session.inflight = True
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=session, last_used_at=10.0)
+    )
+
+    first = await handler.enforce_session_resource_limits(now=300.0)
+    session.inflight = False
+    second = await handler.enforce_session_resource_limits(now=360.0)
+
+    assert first["evictions"] == 0
+    assert session.close_calls == 1
+    assert second["evictions"] == 1
+    assert second["busy_deferrals"] == 1
+    assert handler._agent_session_registry.get_cached((7, 70)) is None
+
+
+@pytest.mark.anyio
+async def test_session_guard_treats_a_failing_busy_probe_as_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler, _runtime = _rss_pressure_handler(tmp_path, monkeypatch)
+    session = ProviderWorkFakeSession("broken-probe")
+    session.probe_error = True
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=session, last_used_at=10.0)
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=300.0)
+
+    assert session.close_calls == 0
+    assert snapshot["busy_deferrals"] == 1
+
+
+@pytest.mark.anyio
+async def test_session_guard_ttl_eviction_also_spares_provider_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler, _runtime = _rss_pressure_handler(tmp_path, monkeypatch, rss_mb=0.0)
+    session = ProviderWorkFakeSession("long-background")
+    session.background = 2
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=session, last_used_at=0.0)
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=5 * 60 * 60)
+
+    assert session.close_calls == 0
+    assert snapshot["evictions"] == 0
+
+
+@pytest.mark.anyio
+async def test_session_guard_defers_codex_runtime_recycle_while_provider_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler, runtime = _rss_pressure_handler(
+        tmp_path, monkeypatch, provider="codex", rss_mb=2048.0
+    )
+    session = ProviderWorkFakeSession("thread-busy")
+    session.inflight = True
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=session, last_used_at=10.0)
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=300.0)
+    recycled = await handler._recycle_agent_runtime_locked("rss-high")
+
+    assert runtime.recycle_calls == 0
+    assert recycled is False
+    assert session.close_calls == 0
+    assert snapshot["runtime_recycles"] == 0
+    assert handler._agent_runtime_recycle_pending is True
 
 
 def test_busy_for_seconds_is_scoped_to_active_chat(tmp_path: Path) -> None:

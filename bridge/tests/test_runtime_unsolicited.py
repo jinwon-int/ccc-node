@@ -1075,6 +1075,20 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
             "No active turn accepts approval requests; start a new user turn and retry",
         )
 
+    async def test_autonomous_turn_inflight_spans_the_autonomous_turn(self) -> None:
+        """#2291: the session-guard busy seam follows the autonomous turn window."""
+
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        self.assertFalse(session.autonomous_turn_inflight())
+
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session.autonomous_turn_inflight())
+
+        client.emit_result(result=None)
+        await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
+        self.assertFalse(session.autonomous_turn_inflight())
+
     # -- ownership across interleaved turns --------------------------------
 
     async def test_inflight_autonomous_turn_keeps_frames_when_user_turn_arrives(

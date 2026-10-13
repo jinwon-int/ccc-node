@@ -51,6 +51,20 @@ class ClaudeSessionFrameRoutingMixin:
     _complete_turn: Callable[[_ActiveTurn, ResultMessage], None]
     _fail_active_turn: Callable[[str, str], None]
 
+    def autonomous_turn_inflight(self) -> bool:
+        """Return True while the CLI runs a turn the bridge did not submit.
+
+        After a run-in-background task finishes, Claude Code injects its
+        ``<task-notification>`` and continues on its own. The registry only
+        marks bridge-submitted (``send_turn``) turns active, so without this
+        seam the session resource guard treats such a session as idle and
+        closing it SIGKILLs the running tool (#2291). The discard window of
+        an abandoned ``send_turn`` counts too: the CLI is still producing
+        that turn's frames. Body-free and read-only.
+        """
+
+        return bool(self._unsolicited_inflight or self._unsolicited_discard)
+
     async def _read_frames(self, client: SdkClient) -> None:
         stream_failure: str | None = None
         try:
