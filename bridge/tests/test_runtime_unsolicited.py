@@ -1089,6 +1089,20 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
         self.assertFalse(session.autonomous_turn_inflight())
 
+    async def test_autonomous_turn_inflight_clears_when_the_reader_dies(self) -> None:
+        """#2291: a dead reader cannot pin its session as busy forever."""
+
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session.autonomous_turn_inflight())
+        self.assertTrue(session.provider_reader_alive())
+
+        client.emit(None)  # stream ends mid autonomous turn, no ResultMessage
+        await _wait_until(lambda: not session.provider_reader_alive())
+        self.assertTrue(session._unsolicited_inflight)
+        self.assertFalse(session.autonomous_turn_inflight())
+
     # -- ownership across interleaved turns --------------------------------
 
     async def test_inflight_autonomous_turn_keeps_frames_when_user_turn_arrives(

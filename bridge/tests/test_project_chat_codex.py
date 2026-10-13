@@ -128,7 +128,12 @@ class ProviderWorkFakeSession(CloseableFakeSession):
         super().__init__(session_id)
         self.inflight = False
         self.background = 0
+        self.background_age = 30.0
         self.probe_error = False
+        self.reader_alive = True
+
+    def provider_reader_alive(self) -> bool:
+        return self.reader_alive
 
     def autonomous_turn_inflight(self) -> bool:
         if self.probe_error:
@@ -136,7 +141,7 @@ class ProviderWorkFakeSession(CloseableFakeSession):
         return self.inflight
 
     def background_workload_snapshot(self, now: float) -> tuple[int, float]:
-        return self.background, 30.0 if self.background else 0.0
+        return self.background, self.background_age if self.background else 0.0
 
 
 class BlockingInterruptSession(FakeSession):
@@ -871,6 +876,68 @@ async def test_session_guard_ttl_eviction_also_spares_provider_work(
 
     assert session.close_calls == 0
     assert snapshot["evictions"] == 0
+
+
+@pytest.mark.anyio
+async def test_session_guard_reclaims_session_whose_reader_died_mid_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dead reader never clears its busy state; it must stay reclaimable."""
+
+    handler, _runtime = _rss_pressure_handler(tmp_path, monkeypatch)
+    session = ProviderWorkFakeSession("dead-reader")
+    session.inflight = True
+    session.background = 1
+    session.reader_alive = False
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=session, last_used_at=10.0)
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=300.0)
+
+    assert session.close_calls == 1
+    assert snapshot["evictions"] == 1
+    assert snapshot["busy_deferrals"] == 0
+
+
+@pytest.mark.anyio
+async def test_session_guard_lru_cap_skips_busy_and_fills_from_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler, _runtime = _rss_pressure_handler(tmp_path, monkeypatch, rss_mb=0.0)
+    oldest_busy = ProviderWorkFakeSession("a-busy")
+    oldest_busy.inflight = True
+    middle = ProviderWorkFakeSession("b-idle")
+    newest = ProviderWorkFakeSession("c-idle")
+    for index, session in enumerate((oldest_busy, middle, newest)):
+        handler._agent_session_registry.put_cached(
+            (7, 70 + index),
+            AgentSessionEntry(session=session, last_used_at=10.0 + index),
+        )
+
+    snapshot = await handler.enforce_session_resource_limits(now=100.0)
+
+    assert [s.close_calls for s in (oldest_busy, middle, newest)] == [0, 1, 0]
+    assert snapshot["resident_sessions"] == 2
+    assert snapshot["busy_deferrals"] == 1
+
+
+@pytest.mark.anyio
+async def test_session_guard_ignores_background_tasks_older_than_a_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler, _runtime = _rss_pressure_handler(tmp_path, monkeypatch)
+    session = ProviderWorkFakeSession("forgotten-tail")
+    session.background = 1
+    session.background_age = 25 * 60 * 60.0
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=session, last_used_at=10.0)
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=300.0)
+
+    assert session.close_calls == 1
+    assert snapshot["evictions"] == 1
 
 
 @pytest.mark.anyio

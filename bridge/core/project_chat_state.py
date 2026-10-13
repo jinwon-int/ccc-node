@@ -568,8 +568,12 @@ class ProjectChatStateMixin:
             "codex_attachments": self._agent_session_attachments,
         }
 
-    @staticmethod
-    def _provider_session_busy(session: object, now: float) -> bool:
+    # A run-in-background task older than this no longer pins its session:
+    # a forgotten server or `tail -f` must not keep a CLI resident forever.
+    _BACKGROUND_BUSY_MAX_AGE_SECONDS = 24 * 60 * 60
+
+    @classmethod
+    def _provider_session_busy(cls, session: object, now: float) -> bool:
         """Return True while a provider session owns work the bridge did not submit.
 
         The registry marks only bridge-submitted turns active. A Claude CLI
@@ -581,6 +585,18 @@ class ProjectChatStateMixin:
         doubt; the next guard tick asks again.
         """
 
+        alive = getattr(session, "provider_reader_alive", None)
+        if callable(alive):
+            try:
+                if not alive():
+                    # A dead reader can never clear its own work state; the
+                    # session is reclaimable like before #2291.
+                    return False
+            except Exception:
+                logger.debug(
+                    "Provider liveness probe failed: provider=%s",
+                    type(session).__name__,
+                )
         inflight = getattr(session, "autonomous_turn_inflight", None)
         if callable(inflight):
             try:
@@ -595,8 +611,11 @@ class ProjectChatStateMixin:
         snapshot = getattr(session, "background_workload_snapshot", None)
         if callable(snapshot):
             try:
-                count, _oldest_age = snapshot(now)
-                if int(count) > 0:
+                count, oldest_age = snapshot(now)
+                if (
+                    int(count) > 0
+                    and float(oldest_age) < cls._BACKGROUND_BUSY_MAX_AGE_SECONDS
+                ):
                     return True
             except Exception:
                 logger.debug(
@@ -605,6 +624,25 @@ class ProjectChatStateMixin:
                 )
                 return True
         return False
+
+    def _spare_busy_candidates(
+        self, idle: tuple[IdleSessionCandidate, ...], now: float
+    ) -> tuple[list[IdleSessionCandidate], int]:
+        """Split idle candidates into evictable ones and a busy count.
+
+        Done before TTL/LRU/RSS selection so a busy session never occupies a
+        slot the LRU cap would otherwise fill with a genuinely idle one.
+        """
+
+        free: list[IdleSessionCandidate] = []
+        busy = 0
+        for candidate in idle:
+            entry = self._agent_session_registry.peek_idle_cached_if_same(candidate)
+            if entry is not None and self._provider_session_busy(entry.session, now):
+                busy += 1
+            else:
+                free.append(candidate)
+        return free, busy
 
     def _any_resident_provider_busy(self, now: float) -> bool:
         return any(
@@ -617,6 +655,7 @@ class ProjectChatStateMixin:
         candidates: list[IdleSessionCandidate],
         now: float,
         rss_mb: float,
+        deferred: int = 0,
     ) -> int:
         """Close idle candidates, sparing those whose provider still owns work.
 
@@ -627,7 +666,6 @@ class ProjectChatStateMixin:
         """
 
         evicted = 0
-        deferred = 0
         for candidate in candidates:
             peeked = self._agent_session_registry.peek_idle_cached_if_same(candidate)
             if peeked is not None and self._provider_session_busy(
@@ -670,7 +708,9 @@ class ProjectChatStateMixin:
         current = asyncio.get_running_loop().time() if now is None else float(now)
         async with self._session_guard_lock:
             metrics = self._agent_session_registry.metrics()
-            idle = self._agent_session_registry.idle_lru_candidates()
+            idle, busy = self._spare_busy_candidates(
+                self._agent_session_registry.idle_lru_candidates(), current
+            )
 
             ttl = int(getattr(self._config, "session_idle_ttl_seconds", 4 * 60 * 60))
             candidates: list[IdleSessionCandidate] = [
@@ -701,7 +741,9 @@ class ProjectChatStateMixin:
                     if candidate not in candidates:
                         candidates.append(candidate)
 
-            evicted = await self._evict_guard_candidates(candidates, current, rss_mb)
+            evicted = await self._evict_guard_candidates(
+                candidates, current, rss_mb, deferred=busy
+            )
             if evicted:
                 self._session_guard_evictions += evicted
                 if getattr(self._config, "agent_provider", "claude") == "codex":
