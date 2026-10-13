@@ -263,7 +263,7 @@
       "name": "gh-pr-flow",
       "source": "skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "abb61c8b47b2c1f3882215b54ba32bd5b2cd4da94aed5f1e00b49763e52f1e5d"
+      "tree_sha256": "a26b330a25ad979dc24934f9dda90fa22d218f8a13035202bde868abfdfc2f8e"
     },
     {
       "audience": "claude",

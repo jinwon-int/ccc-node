@@ -29,12 +29,14 @@ done
 shift
 exec "$@"
 SH
-# Fake gh backed by per-repo state files under $FAKE_STATE, keyed by
-# OWNER_REPO (slash replaced):
-#   <key>.noadmin   repo read reports admin=false
-#   <key>.alerts    Dependabot alerts enabled
-#   <key>.ruleset   JSON of an existing ruleset named like ours
-# Every mutation appends a line to $FAKE_STATE/mutations.
+# Fake gh backed by per-repo state under $FAKE_STATE, keyed by OWNER_REPO
+# (slash replaced):
+#   <key>.noadmin        repo read reports admin=false
+#   <key>.alerts         Dependabot alerts enabled
+#   <key>.default        default branch name (else "master")
+#   <key>.rs/<id>.json   existing rulesets (POST allocates 42, 43, ... per repo)
+# Every mutation appends a line to $FAKE_STATE/mutations; every POSTed ruleset
+# body is also kept as $FAKE_STATE/posted-<key>-<id>.json.
 cat > "$TMP/bin/gh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -46,20 +48,27 @@ path="$2"
 if [ "$path" = user ]; then printf '{"login":"%s"}\n' "${FAKE_ACTOR:-jinon86}"; exit 0; fi
 IFS=/ read -r _ owner repo rest <<<"$path"
 k="${owner}_${repo}"
+mkdir -p "$S/$k.rs"
 case "$method ${rest:-}" in
   "GET vulnerability-alerts")
     [ -e "$S/$k.alerts" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; } ;;
   "PUT vulnerability-alerts")
     echo "PUT alerts $owner/$repo" >> "$S/mutations"; : > "$S/$k.alerts" ;;
   "GET rulesets")
-    if [ -e "$S/$k.ruleset" ]; then jq -c '[{id:.id,name:.name}]' "$S/$k.ruleset"; else echo '[]'; fi ;;
+    if compgen -G "$S/$k.rs/*.json" >/dev/null; then jq -cs '[.[] | {id, name}]' "$S/$k.rs"/*.json; else echo '[]'; fi ;;
   "POST rulesets")
-    echo "POST ruleset $owner/$repo" >> "$S/mutations"
-    jq -c '. + {id: 42}' > "$S/$k.ruleset"; echo '{"id":42}' ;;
-  GET\ rulesets/*) cat "$S/$k.ruleset" ;;
+    n=$(( $(find "$S/$k.rs" -name '*.json' | wc -l) + 42 ))
+    body="$(cat)"
+    echo "POST ruleset $owner/$repo $(jq -r .name <<<"$body")" >> "$S/mutations"
+    printf '%s\n' "$body" > "$S/posted-$k-$n.json"
+    jq -c --argjson id "$n" '. + {id: $id}' <<<"$body" > "$S/$k.rs/$n.json"; printf '{"id":%s}\n' "$n" ;;
+  GET\ rulesets/*) cat "$S/$k.rs/${rest#rulesets/}.json" ;;
   "GET ")
     if [ -e "$S/$k.noadmin" ]; then echo '{"permissions":{"admin":false}}'
-    else echo '{"permissions":{"admin":true},"archived":false}'; fi ;;
+    else
+      d=master; [ -e "$S/$k.default" ] && d="$(cat "$S/$k.default")"
+      jq -cn --arg d "$d" '{permissions:{admin:true},archived:false,default_branch:$d}'
+    fi ;;
   *) echo "unexpected fake gh invocation: $method $path" >&2; exit 90 ;;
 esac
 SH
@@ -146,11 +155,12 @@ fi
 
 # 7) An existing same-name ruleset with different rules is reported, never overwritten.
 reset_state
+mkdir -p "$FAKE_STATE/example-org_repo-c.rs"
 echo '{"id":7,"name":"default-branch-no-delete-no-force-push","enforcement":"evaluate","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"}]}' \
-  > "$FAKE_STATE/example-org_repo-c.ruleset"
+  > "$FAKE_STATE/example-org_repo-c.rs/7.json"
 bash "$SCRIPT" --operator-approved --apply --repo example-org/repo-c >"$TMP/out" 2>"$TMP/err" && rc=0 || rc=$?
 if [ "$rc" -eq 4 ] && jq -se '.[0].status == "incomplete" and .[0].ruleset == "conflict-mismatch(#7)"' "$TMP/out" >/dev/null \
-  && ! grep -q 'POST ruleset' "$FAKE_STATE/mutations"; then
+  && ! grep -q 'POST ruleset' "$FAKE_STATE/mutations" 2>/dev/null; then
   pass
 else
   fail "mismatched ruleset was not reported as conflict (rc=$rc)"
@@ -186,6 +196,110 @@ elif grep -q 'invalid allowlist entry' "$TMP/err"; then
 else
   fail "malformed allowlist refusal was not explicit"
 fi
+
+# --- protect-branch= (#2292): PR-only ruleset on a promotion branch ---------
+cat > "$TMP/pb-allowlist" <<'LIST'
+example-org/repo-p protect-branch=stable   # promotion branch
+example-org/repo-q
+example-org/repo-q protect-branch=release protect-branch=stable protect-branch=release
+LIST
+
+# 10) Dry run reports the extra ruleset and mutates nothing.
+reset_state
+if bash "$SCRIPT" --operator-approved --allowlist "$TMP/pb-allowlist" --repo example-org/repo-p >"$TMP/out" 2>"$TMP/err" \
+  && jq -se '.[0].ruleset == "would-create" and .[0].protected_branches == ["stable:would-create"]' "$TMP/out" >/dev/null \
+  && [ ! -e "$FAKE_STATE/mutations" ]; then
+  pass
+else
+  fail "protect-branch dry run invalid: $(cat "$TMP/out" "$TMP/err")"
+fi
+
+# 11) Apply creates both rulesets; the branch ruleset targets exactly
+#     refs/heads/stable with an independent-approval PR rule and no bypass.
+reset_state
+if bash "$SCRIPT" --operator-approved --apply --allowlist "$TMP/pb-allowlist" --repo example-org/repo-p >"$TMP/out" 2>"$TMP/err" \
+  && jq -se '.[0].status == "ok" and .[0].ruleset == "created(#42)" and .[0].protected_branches == ["stable:created(#43)"]' "$TMP/out" >/dev/null \
+  && jq -e '.name == "protected-branch-stable"
+      and .conditions.ref_name.include == ["refs/heads/stable"]
+      and .bypass_actors == []
+      and ([.rules[].type] | sort == ["deletion","non_fast_forward","pull_request"])
+      and (.rules[] | select(.type == "pull_request") | .parameters
+           | .required_approving_review_count == 1 and .require_last_push_approval
+             and .dismiss_stale_reviews_on_push and .allowed_merge_methods == ["merge"])' \
+     "$FAKE_STATE/posted-example-org_repo-p-43.json" >/dev/null \
+  && [ "$(grep -c 'POST ruleset' "$FAKE_STATE/mutations")" -eq 2 ]; then
+  pass
+else
+  fail "protect-branch apply invalid: $(cat "$TMP/out" "$TMP/err")"
+fi
+
+# 12) Second apply is idempotent for the branch ruleset too.
+: > "$FAKE_STATE/mutations"
+if bash "$SCRIPT" --operator-approved --apply --allowlist "$TMP/pb-allowlist" --repo example-org/repo-p >"$TMP/out" 2>"$TMP/err" \
+  && jq -se '.[0].protected_branches == ["stable:already-present(#43)"]' "$TMP/out" >/dev/null \
+  && [ ! -s "$FAKE_STATE/mutations" ]; then
+  pass
+else
+  fail "protect-branch second apply not idempotent: $(cat "$TMP/out")"
+fi
+
+# 13) A same-name branch ruleset that is weaker in ONE way — a bypass actor,
+#     or no last-push approval — is a conflict, never overwritten. One defect
+#     per case, so each acceptance condition is pinned on its own.
+good_rs='{"id":9,"name":"protected-branch-stable","enforcement":"active","bypass_actors":[],"conditions":{"ref_name":{"include":["refs/heads/stable"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"pull_request","parameters":{"required_approving_review_count":1,"require_last_push_approval":true,"dismiss_stale_reviews_on_push":true}}]}'
+for weak in '.bypass_actors = [{"actor_id":1,"actor_type":"RepositoryRole","bypass_mode":"always"}]' \
+  '(.rules[] | select(.type == "pull_request") | .parameters.require_last_push_approval) = false' \
+  '(.rules[] | select(.type == "pull_request") | .parameters.required_approving_review_count) = 0' \
+  '.conditions.ref_name.include = ["refs/heads/stable","refs/heads/other"]'; do
+  reset_state
+  mkdir -p "$FAKE_STATE/example-org_repo-p.rs"
+  jq -c "$weak" <<<"$good_rs" > "$FAKE_STATE/example-org_repo-p.rs/9.json"
+  bash "$SCRIPT" --operator-approved --apply --allowlist "$TMP/pb-allowlist" --repo example-org/repo-p >"$TMP/out" 2>"$TMP/err" && rc=0 || rc=$?
+  if [ "$rc" -eq 4 ] && jq -se '.[0].status == "incomplete" and .[0].protected_branches == ["stable:conflict-mismatch(#9)"]' "$TMP/out" >/dev/null \
+    && ! grep -q 'protected-branch-stable' "$FAKE_STATE/mutations" 2>/dev/null; then
+    pass
+  else
+    fail "weaker branch ruleset ($weak) not reported as conflict (rc=$rc): $(cat "$TMP/out")"
+  fi
+done
+# ...and the same ruleset without the defect is accepted as already present.
+reset_state
+mkdir -p "$FAKE_STATE/example-org_repo-p.rs"
+printf '%s\n' "$good_rs" > "$FAKE_STATE/example-org_repo-p.rs/9.json"
+if bash "$SCRIPT" --operator-approved --allowlist "$TMP/pb-allowlist" --repo example-org/repo-p >"$TMP/out" 2>"$TMP/err" \
+  && jq -se '.[0].protected_branches == ["stable:already-present(#9)"]' "$TMP/out" >/dev/null; then
+  pass
+else
+  fail "a compliant existing branch ruleset was not accepted: $(cat "$TMP/out")"
+fi
+
+# 14) The repository's default branch is refused even under another name, and
+#     duplicate repo lines merge their branch lists (release, stable once each).
+reset_state
+echo release > "$FAKE_STATE/example-org_repo-q.default"
+bash "$SCRIPT" --operator-approved --apply --allowlist "$TMP/pb-allowlist" --repo example-org/repo-q >"$TMP/out" 2>"$TMP/err" && rc=0 || rc=$?
+if [ "$rc" -eq 4 ] \
+  && jq -se '.[0].protected_branches == ["release:refused-default-branch","stable:created(#43)"]' "$TMP/out" >/dev/null \
+  && ! grep -q 'protected-branch-release' "$FAKE_STATE/mutations"; then
+  pass
+else
+  fail "default-branch refusal or branch merge invalid (rc=$rc): $(cat "$TMP/out")"
+fi
+
+# 15) Unsafe protect-branch values and unknown tokens are refused locally,
+#     before any remote call.
+for bad in 'protect-branch=master' 'protect-branch=Main' 'protect-branch=refs/heads/stable' \
+  'protect-branch=../stable' 'protect-branch=-x' 'protect-branch=' 'protect=stable' 'protect-branch=a;b'; do
+  reset_state
+  printf 'example-org/repo-p %s\n' "$bad" > "$TMP/bad-pb"
+  if bash "$SCRIPT" --operator-approved --allowlist "$TMP/bad-pb" >"$TMP/out" 2>"$TMP/err"; then
+    fail "unsafe allowlist token accepted: $bad"
+  elif [ ! -e "$FAKE_STATE/mutations" ] && grep -q 'refusing:' "$TMP/err"; then
+    pass
+  else
+    fail "unsafe token refusal not explicit: $bad"
+  fi
+done
 
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

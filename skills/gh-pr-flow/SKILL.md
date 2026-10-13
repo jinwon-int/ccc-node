@@ -482,6 +482,22 @@ every selected repository ends compliant. Widening the ruleset is a code change
 through this skill's PR flow; editing the allowlist is an operator decision
 recorded with the run's approval.
 
+**Promotion branches (#2292).** A branch that nodes deploy from — for example a
+`stable` ref that a scheduled self-update follows while the default branch is
+auto-merged — must not be movable by a plain push. Opt a repository in with
+`protect-branch=NAME` tokens on its allowlist line
+(`OWNER/REPO protect-branch=NAME [protect-branch=NAME2]`). For each name the
+helper ensures a `protected-branch-NAME` ruleset on `refs/heads/NAME`:
+deletion and force-push blocked, plus a pull request with one approval from
+someone other than the last pusher (stale approvals dismissed, merge commits
+only, no bypass actors). Promotion then becomes a PR into that branch,
+reviewed cross-account like any other. The helper refuses `master`/`main` (any
+case) locally and the repository's actual default branch remotely, because a
+PR requirement there would break node automation. An existing ruleset of that
+name that is weaker in any of those respects is a `conflict-mismatch` and is
+left untouched. Each repository row reports `protected_branches` as
+`NAME:<state>` entries.
+
 ## Environment deployment approval
 
 A workflow job gated by a GitHub Actions environment with required reviewers
