@@ -71,7 +71,7 @@ _MAX_SUMMARY_DISPLAY_CHARS = 80
 #: as in ``usage_meter``) so the HH:MM stamps match the rest of the bridge.
 _KST = timezone(timedelta(hours=9), name="KST")
 
-WaitStatusAction = Literal["send", "edit", "delete", "noop"]
+WaitStatusAction = Literal["send", "edit", "delete", "move", "noop"]
 
 #: Terminal line wording mirrors ``external_wait_monitor._WAKE_HEADLINE``.
 _TERMINAL_LINE = {
@@ -214,6 +214,7 @@ def plan_status_update(
     now_epoch: float,
     *,
     recent_terminal_seconds: float = RECENT_TERMINAL_SECONDS,
+    buried: bool = False,
 ) -> Tuple[WaitStatusAction, Optional[str]]:
     """Decide what the channel should do for one route (pure, no I/O).
 
@@ -221,6 +222,14 @@ def plan_status_update(
       (a route with no waits and no message stays silent; a route whose
       waits already finished is covered by the wake notification);
     - stored message, nothing left to show: ``delete``;
+    - stored message that newer events have ``buried`` while a wait is still
+      monitored (#2288): ``move`` — the channel removes it and posts the
+      current text again at the bottom, like the "⏳ Working" bubble, whether
+      or not the text changed. A status that only shows finished waits is not
+      moved: the resume turn's reply already announces the result, so the
+      line is edited in place and expires as before. Only channels whose edits
+      keep the original timeline position (Matrix) report ``buried``; Telegram
+      never does and keeps editing in place;
     - stored message, same text hash: ``noop``;
     - otherwise ``edit``.
     """
@@ -235,6 +244,8 @@ def plan_status_update(
         return "noop", None
     if text is None:
         return "delete", None
+    if buried and monitoring:
+        return "move", text
     if stored.get("text_hash") == text_hash_of(text):
         return "noop", text
     return "edit", text
@@ -326,14 +337,27 @@ class ExternalWaitStatusStore:
         message_id: Any,
         text_hash: str,
         now: Optional[float] = None,
+        tail: Optional[str] = None,
+        posted_epoch: Optional[float] = None,
     ) -> None:
-        entry = {
+        """Record the route's message; ``tail`` / ``posted_epoch`` are optional placement facts (#2288).
+
+        ``tail`` is the id of the message's latest edit event on channels
+        where an edit is a timeline event of its own; ``posted_epoch`` is when
+        the message itself was last posted (first send or a move). Both are
+        omitted from the entry when unknown, so the stage-1 shape is unchanged.
+        """
+        entry: Dict[str, Any] = {
             "message_id": message_id,
             "chat_id": int(chat_id),
             "user_id": int(user_id),
             "updated_epoch": self._clock() if now is None else float(now),
             "text_hash": str(text_hash),
         }
+        if tail:
+            entry["tail"] = str(tail)
+        if posted_epoch is not None:
+            entry["posted_epoch"] = float(posted_epoch)
         try:
             with self._lock:
                 entries = self._read()

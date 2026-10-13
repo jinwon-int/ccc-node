@@ -3097,3 +3097,34 @@ async def test_own_notice_is_trusted_reply_context_but_others_are_not(tmp_path: 
             "> ⏳ Waiting for results\n\n이거 다시 설명해줘"
         )
         assert f.recent_text["$parent"] == (room, h.account, "⏳ Waiting for results")
+
+
+@pytest.mark.anyio
+async def test_edit_notice_event_returns_the_edit_id_and_marks_it_newest(tmp_path: Path) -> None:
+    """#2288: the placement check needs the edit's own event id; ``edit_notice`` stays a bool."""
+    async with running(tmp_path) as h:
+        f = h.f
+        room = f.c["rooms"][0]
+        outbox_ready(f)
+        failure: dict[str, Any] = {"exc": None}
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            if failure["exc"] is not None:
+                raise failure["exc"]
+            return {"event_id": "$edit-1"} if "/send/" in path else {}
+
+        f.raw = raw
+        f.last_room_event[room] = "$status"
+        assert await f.edit_notice_event(room, "$status", "✅ CI green → continuing", msgtype="m.notice") == "$edit-1"
+        assert f.last_room_event[room] == "$edit-1"
+        edit = sent_bodies(f)[-1]
+        assert edit["m.relates_to"] == {"rel_type": "m.replace", "event_id": "$status"}
+        assert edit["msgtype"] == "m.notice" and edit["m.new_content"]["msgtype"] == "m.notice"
+        assert await f.edit_notice(room, "$status", "x", msgtype="m.notice") is True
+
+        failure["exc"] = t.MatrixHTTPError(404, "M_NOT_FOUND")
+        assert await f.edit_notice_event(room, "$status", "x") is None
+        assert f.last_room_event[room] == "$edit-1"  # a refused edit is not an event
+        failure["exc"] = ConnectionError("matrix-temporary-error")
+        with pytest.raises(ConnectionError):
+            await f.edit_notice_event(room, "$status", "x")

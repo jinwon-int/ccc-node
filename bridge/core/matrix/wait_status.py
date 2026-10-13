@@ -15,16 +15,32 @@ operations differ:
   every reply. The row id is stored as ``outbox:<row id>`` until the sender
   records the Matrix event id the row became (``jobs.sent_event``); the
   transport's ``delivered`` hook then swaps it in and re-plans the route.
-* **edit** is a direct ``m.replace`` of that event (``edit_notice``), like the
-  progress bubble's edits, and stays an ``m.notice`` (fallback and
+* **edit** is a direct ``m.replace`` of that event (``edit_notice_event``),
+  like the progress bubble's edits, and stays an ``m.notice`` (fallback and
   ``m.new_content``); the stored text hash only advances on success, so
-  a failed edit is retried by the next sync.
+  a failed edit is retried by the next sync. The edit event's id is kept as
+  the entry's ``tail`` so the next placement check recognises it.
+* **move** (#2288) is a redaction of the current event followed by a fresh
+  outbox send of the same text, so the status lands at the room's bottom
+  again — the "⏳ Working" bubble's rule (edit while newest, repost when
+  buried) applied to the status line. An edit keeps the original timeline
+  position, so once the user's next message and the reply have landed the
+  status would otherwise stay buried under them for good.
 * **delete** is a redaction (``redact_notice``).
+
+Placement (``buried``) is decided from the transport's ``last_room_event``
+(newest timeline event per room, fed by ``/sync`` — the bot's own echoes
+included): the status is buried when that event is neither the stored
+message nor its latest edit. Two guards keep this from looping: the
+``delivered`` hook never moves (it runs before the echo of the row it just
+delivered can arrive, so the fresh status would look buried), and a status
+posted less than :data:`MOVE_MIN_INTERVAL_S` ago is left where it is.
 
 Triggers: the transport's ``turn_closed`` hook (every turn, including the
 external-wait resume and continuation self-jobs, after the reply row is
 queued), every terminal transition in ``ExternalWaitMonitor``
-(``status_syncer``), ``/cancelwait``, and a bounded reconcile after start.
+(``status_syncer``), ``/cancelwait``, and a bounded reconcile after start
+(``last_room_event`` is empty right after start, so a reconcile never moves).
 
 Fail-open everywhere and body-free logs (route ids and action kinds only).
 Syncs are serialized per bot so the monitor and a closing turn cannot both
@@ -65,6 +81,11 @@ _NOTICE_ROW_PREFIX = "$notice-"
 STATUS_MSGTYPE = "m.notice"
 #: Upper bound for one direct edit or redaction.
 IO_TIMEOUT_S = 30.0
+#: A status posted (sent or moved) less recently than this may be moved again;
+#: a younger one is left alone even when it looks buried, so a sync that runs
+#: between the delivery of a fresh status and its ``/sync`` echo cannot
+#: redact-and-repost it a second time (#2288).
+MOVE_MIN_INTERVAL_S = 10.0
 #: Transport capabilities the projection needs; without them it stays silent
 #: rather than posting messages it could never edit or remove.
 _REQUIRED_TRANSPORT = ("enqueue_notice", "notice_event", "edit_notice", "redact_notice")
@@ -76,6 +97,14 @@ def _capable(transport: Any) -> bool:
     return transport is not None and all(
         callable(getattr(transport, name, None)) for name in _REQUIRED_TRANSPORT
     )
+
+
+def _posted_epoch(stored: Mapping[str, Any]) -> float:
+    """When the stored status was last posted; entries from before #2288 fall back to ``updated_epoch``."""
+    try:
+        return float(stored.get("posted_epoch") or stored.get("updated_epoch") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class MatrixWaitStatusMixin:
@@ -116,13 +145,19 @@ class MatrixWaitStatusMixin:
 
     # -- the one entry point -----------------------------------------------------
     # ccc-side-effect: matrix.external_wait_status
-    async def _sync_external_wait_status(self, user_id: int, chat_id: int) -> None:
-        """Bring the route's status message in line with the registry (fail-open)."""
+    async def _sync_external_wait_status(
+        self, user_id: int, chat_id: int, *, allow_move: bool = True
+    ) -> None:
+        """Bring the route's status message in line with the registry (fail-open).
+
+        ``allow_move=False`` (the ``delivered`` hook) adopts ids and edits but
+        never reposts: see the module notes on the echo race (#2288).
+        """
         if not status_enabled():
             return
         try:
             async with self._wait_status_lock():
-                await self._wait_status_sync_route(int(user_id), int(chat_id))
+                await self._wait_status_sync_route(int(user_id), int(chat_id), allow_move=allow_move)
         except Exception as exc:
             logger.debug(
                 "Matrix external-wait status sync failed: route=%s:%s error=%s",
@@ -131,7 +166,7 @@ class MatrixWaitStatusMixin:
                 type(exc).__name__,
             )
 
-    async def _wait_status_sync_route(self, user_id: int, chat_id: int) -> None:
+    async def _wait_status_sync_route(self, user_id: int, chat_id: int, *, allow_move: bool = True) -> None:
         transport = self._transport
         if not _capable(transport):
             return
@@ -145,10 +180,17 @@ class MatrixWaitStatusMixin:
                 # hook re-runs this sync once the row is out.
                 return
         records = records_for_route(self._external_wait_registry().records(), user_id, chat_id)
-        action, text = plan_status_update(records, stored, time.time())
+        room = self.room_for_chat(chat_id)
+        now = time.time()
+        buried = (
+            allow_move
+            and stored is not None
+            and room is not None
+            and self._wait_status_buried(transport, room, stored, now)
+        )
+        action, text = plan_status_update(records, stored, now, buried=buried)
         if action == "noop":
             return
-        room = self.room_for_chat(chat_id)
         if room is None:
             logger.debug("Matrix external-wait status: no room for route=%s:%s", user_id, chat_id)
             if action == "delete":
@@ -160,9 +202,16 @@ class MatrixWaitStatusMixin:
         elif action == "edit" and stored is not None and text is not None:
             event_id = str(stored.get("message_id"))
             async with asyncio.timeout(IO_TIMEOUT_S):
-                edited = await transport.edit_notice(room, event_id, text, msgtype=STATUS_MSGTYPE)
+                edited, tail = await self._wait_status_edit(transport, room, event_id, text)
             if edited:
-                store.put(user_id, chat_id, message_id=event_id, text_hash=text_hash_of(text))
+                store.put(
+                    user_id,
+                    chat_id,
+                    message_id=event_id,
+                    text_hash=text_hash_of(text),
+                    tail=tail,
+                    posted_epoch=_posted_epoch(stored),
+                )
                 return
             # Refused for good (event gone): forget it and post a fresh one
             # only while something is still monitored, as on Telegram.
@@ -170,11 +219,49 @@ class MatrixWaitStatusMixin:
             fresh_action, fresh = plan_status_update(records, None, time.time())
             if fresh_action == "send" and fresh is not None:
                 self._wait_status_send(transport, store, user_id, chat_id, room, fresh)
+        elif action == "move" and stored is not None and text is not None:
+            # Buried by later events: take the old one down and post the
+            # current text again through the outbox, so it lands after the
+            # reply that buried it. A redaction that fails for good (event
+            # already gone) changes nothing; a transient failure raises and
+            # leaves the stored entry for the next sync.
+            async with asyncio.timeout(IO_TIMEOUT_S):
+                await transport.redact_notice(room, str(stored.get("message_id")))
+            store.pop(user_id, chat_id)
+            self._wait_status_send(transport, store, user_id, chat_id, room, text)
         elif action == "delete" and stored is not None:
             async with asyncio.timeout(IO_TIMEOUT_S):
                 await transport.redact_notice(room, str(stored.get("message_id")))
             # Redacted, or already gone / not redactable: nothing left to clean.
             store.pop(user_id, chat_id)
+
+    @staticmethod
+    def _wait_status_buried(transport: Any, room: str, stored: Mapping[str, Any], now: float) -> bool:
+        """Whether newer room events hide the stored status (#2288).
+
+        Unknown newest event (nothing synced yet, or a transport without the
+        map) reads as not buried; so does a status posted within
+        :data:`MOVE_MIN_INTERVAL_S`.
+        """
+        latest = (getattr(transport, "last_room_event", None) or {}).get(room)
+        if not isinstance(latest, str) or not latest:
+            return False
+        if now - _posted_epoch(stored) < MOVE_MIN_INTERVAL_S:
+            return False
+        own = {str(stored.get("message_id") or ""), str(stored.get("tail") or "")}
+        return latest not in own
+
+    @staticmethod
+    async def _wait_status_edit(
+        transport: Any, room: str, event_id: str, text: str
+    ) -> Tuple[bool, Optional[str]]:
+        """``(edited, edit event id)``; the id is ``None`` on a transport without ``edit_notice_event``."""
+        edit_event = getattr(transport, "edit_notice_event", None)
+        if callable(edit_event):
+            tail = await edit_event(room, event_id, text, msgtype=STATUS_MSGTYPE)
+            return tail is not None, (str(tail) if tail else None)
+        edited = await transport.edit_notice(room, event_id, text, msgtype=STATUS_MSGTYPE)
+        return bool(edited), None
 
     def _wait_status_resolve(
         self,
@@ -193,8 +280,9 @@ class MatrixWaitStatusMixin:
             return stored, True
         if state == "sent" and event_id:
             text_hash = str(stored.get("text_hash") or "")
-            store.put(user_id, chat_id, message_id=event_id, text_hash=text_hash)
-            return {**stored, "message_id": event_id}, False
+            posted = _posted_epoch(stored)
+            store.put(user_id, chat_id, message_id=event_id, text_hash=text_hash, posted_epoch=posted)
+            return {**stored, "message_id": event_id, "posted_epoch": posted}, False
         # The row is unknown or produced no event (every part rejected):
         # there is nothing to edit, so plan as if no message existed.
         store.pop(user_id, chat_id)
@@ -216,7 +304,13 @@ class MatrixWaitStatusMixin:
         if not isinstance(row, str) or not row:
             logger.debug("Matrix external-wait status queued without a row id; not stored")
             return
-        store.put(user_id, chat_id, message_id=PENDING_PREFIX + row, text_hash=text_hash_of(text))
+        store.put(
+            user_id,
+            chat_id,
+            message_id=PENDING_PREFIX + row,
+            text_hash=text_hash_of(text),
+            posted_epoch=time.time(),
+        )
 
     # -- transport hooks (via MatrixTurnRunner) ------------------------------------
     async def _wait_status_turn_closed(self, job: Mapping[str, Any]) -> None:
@@ -243,7 +337,10 @@ class MatrixWaitStatusMixin:
                 user_id, chat_id = int(entry["user_id"]), int(entry["chat_id"])
             except (KeyError, TypeError, ValueError):
                 return
-            await self._sync_external_wait_status(user_id, chat_id)
+            # Adopt the id and apply any pending change, but never move here:
+            # the row's own /sync echo has not arrived yet, so the fresh
+            # status would read as buried and be reposted again (#2288).
+            await self._sync_external_wait_status(user_id, chat_id, allow_move=False)
             return
 
     async def _reconcile_external_wait_status_on_start(self) -> None:
