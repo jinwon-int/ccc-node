@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import stat
@@ -12,18 +14,94 @@ from typing import Any, Literal, Mapping
 
 from .distill_types import CodexTranscriptSnapshot, TranscriptBounds, TranscriptMessage
 
+logger = logging.getLogger(__name__)
+
 _MAX_SCAN_BYTES = 8 * 1024 * 1024
 
 
+def ensure_private_transcripts_dir(path: Path) -> bool:
+    """Validate the transcripts directory, tightening group/other bits if needed.
+
+    Claude Code creates ``~/.claude/projects/<slug>`` with the process umask
+    (0755/0775), which the distill snapshot refused outright: every job then
+    terminalized as ``invalid_snapshot_request`` with no log line (#2306).
+    A real directory owned by this euid only loses its group/other bits — the
+    mode is narrowed, never widened — through an ``O_NOFOLLOW`` descriptor, so
+    a path swapped for a symlink cannot redirect the ``fchmod``. A symlink, a
+    non-directory or a foreign owner is still refused with ``ValueError``. Each
+    transcript file keeps its own uid/nlink/mode check, so tightening the
+    directory never admits a file another user planted.
+
+    Returns True when the mode was tightened. A missing directory raises
+    ``FileNotFoundError`` (retryable for the snapshot worker), as before.
+    """
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ValueError("Claude transcript directory is unsafe") from None
+        raise
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise ValueError("Claude transcript directory is unsafe")
+        mode = stat.S_IMODE(metadata.st_mode)
+        if not mode & 0o077:
+            return False
+        os.fchmod(descriptor, mode & 0o700)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) & 0o077:
+            raise ValueError("Claude transcript directory is unsafe")
+    finally:
+        os.close(descriptor)
+    logger.warning(
+        "Claude transcript directory was group/other-accessible (mode %04o); "
+        "tightened to %04o so distill snapshots can read it (#2306): %s",
+        mode,
+        mode & 0o700,
+        path,
+    )
+    return True
+
+
 def _validate_directory(path: Path) -> None:
-    metadata = path.lstat()
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or stat.S_IMODE(metadata.st_mode) & 0o077
-    ):
-        raise ValueError("Claude transcript directory is unsafe")
+    ensure_private_transcripts_dir(path)
+
+
+def prepare_transcripts_dir(path: Path) -> None:
+    """Bridge-start hook: make the served transcripts directory private.
+
+    An existing directory is tightened (see ``ensure_private_transcripts_dir``);
+    a missing one is created 0700 when its parent exists, so Claude Code's first
+    session lands in a directory the distill snapshot accepts. Never raises: a
+    problem here must not stop the bridge, and the snapshot path re-checks.
+    """
+    try:
+        ensure_private_transcripts_dir(path)
+        return
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "Claude transcript directory check failed at bridge start (%s); distill "
+            "snapshots will be refused until it is a private directory owned by this "
+            "user (#2306): %s",
+            exc,
+            path,
+        )
+        return
+    try:
+        if path.parent.is_dir():
+            path.mkdir(mode=0o700)
+    except OSError as exc:
+        logger.warning(
+            "could not pre-create Claude transcript directory (%s): %s", exc, path
+        )
 
 
 def _bounded_text(value: str, limit: int) -> tuple[str, bool]:
@@ -208,4 +286,4 @@ def read_claude_snapshot(
     )
 
 
-__all__ = ["read_claude_snapshot"]
+__all__ = ["ensure_private_transcripts_dir", "prepare_transcripts_dir", "read_claude_snapshot"]
