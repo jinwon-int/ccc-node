@@ -124,6 +124,49 @@ class HealthRenderTests(unittest.TestCase):
         self.assertIn("   Telegram: healthy", lines)  # reason suppressed when healthy
         self.assertIn("   Claude: healthy", lines)
 
+    def test_transport_label_names_the_matrix_frontend_on_every_branch(self):
+        """#2312: a Matrix frontend's health.json keeps its sync transport in
+        the ``telegram`` block; ``--channel matrix --status`` labels it Matrix."""
+        fresh = self._write(self._fresh())
+        stale = self.dir / "stale.json"
+        stale.write_text(
+            json.dumps(self._fresh(updated_at="2026-07-15T10:00:00Z")),
+            encoding="utf-8",
+        )
+        cases = {
+            "fresh": fresh,
+            "stale": stale,
+            "missing": self.dir / "absent.json",
+        }
+        for name, path in cases.items():
+            with self.subTest(name):
+                lines = render_status_lines(
+                    path, "4242", 90, "claude", now=self.now, transport_label="Matrix"
+                )
+                self.assertTrue(any(line.startswith("   Matrix: ") for line in lines))
+                self.assertFalse(any(line.startswith("   Telegram: ") for line in lines))
+
+    def test_cli_transport_label_argument_is_optional(self):
+        from telegram_bot.utils import health_render
+
+        path = self._write(self._fresh())
+        for argv, label in (
+            ([str(path), "1", "90", "claude"], "Telegram"),
+            ([str(path), "1", "90", "claude", ""], "Telegram"),
+            ([str(path), "1", "90", "claude", "Matrix"], "Matrix"),
+        ):
+            with self.subTest(argv=argv[4:]):
+                rendered: list[str] = []
+                original = health_render.render_status_lines
+                try:
+                    health_render.render_status_lines = (  # type: ignore[assignment]
+                        lambda *a, **k: rendered.append(k["transport_label"]) or []
+                    )
+                    self.assertEqual(health_render.main(argv), 0)
+                finally:
+                    health_render.render_status_lines = original  # type: ignore[assignment]
+                self.assertEqual(rendered, [label])
+
     def test_health_without_dead_session_wakeup_section_is_backward_compatible(self):
         lines = self._render(self._write(self._fresh()))
 
