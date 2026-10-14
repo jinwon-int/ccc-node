@@ -410,7 +410,11 @@ class CodexLocalMemorySink:
                         # (header-less) or a pre-#2297 audience header. Its file
                         # mtime and the bridge capture are both host-clock times
                         # (never model output), so a replayed backlog older than
-                        # the file must not replace it.
+                        # the file must not replace it. The mtime is a proxy and
+                        # leans toward keeping the file: it is when the hook's
+                        # extraction landed (after the CLI session), and a
+                        # transaction rollback/recovery rewrite also bumps it.
+                        # The next bridge capture after that write still wins.
                         current_mtime = self._resume_mtime()
                         if current_mtime is not None and current_mtime > new_capture:
                             write_resume = False

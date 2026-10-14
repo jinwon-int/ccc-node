@@ -611,6 +611,13 @@ async def test_global_sink_orders_unstamped_resume_by_file_mtime(
         distilled_at="2026-10-14T07:01:00Z",
         activity="newest bridge session",
     )
+    equal = await _global_job(
+        journal,
+        thread_id="thread-equal",
+        captured_at="2026-10-14T08:00:00Z",
+        distilled_at="2026-10-14T08:01:00Z",
+        activity="equal-time bridge session",
+    )
     route = _global_route(tmp_path)
     route.state_dir.mkdir(parents=True, mode=0o700)
     resume = route.state_dir / "resume.md"
@@ -638,10 +645,15 @@ async def test_global_sink_orders_unstamped_resume_by_file_mtime(
     # A bridge header without captured_at (audience-style) follows the same rule.
     lines = resume.read_text().splitlines()
     header = re.sub(r" ?captured_at=\S+", "", lines[0]).replace("distill  ", "distill ")
-    resume.write_text("\n".join([header, "- 마지막 작업: uncaptured"]) + "\n")
-    _set_mtime(resume, "2026-10-14T06:00:00Z")
+    uncaptured = "\n".join([header, "- 마지막 작업: uncaptured"]) + "\n"
+    resume.write_text(uncaptured)
+    # Kept while its mtime is later than the capture (pre-#2297 header)…
+    _set_mtime(resume, "2026-10-14T08:00:00Z")
     await worker.write_once(job_id=newest.job_id)
-    assert "newest bridge session" in resume.read_text()
+    assert resume.read_text() == uncaptured
+    # …and replaced once the capture is not older (equal time: capture wins).
+    await worker.write_once(job_id=equal.job_id)
+    assert "equal-time bridge session" in resume.read_text()
 
 
 def test_unstamped_resume_without_new_capture_is_overwritten(tmp_path: Path) -> None:
