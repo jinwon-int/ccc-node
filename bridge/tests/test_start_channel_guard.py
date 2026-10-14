@@ -13,6 +13,7 @@ The Matrix frontend is a decoy process whose cmdline matches
 CCC_CHANNEL=matrix -- exactly what start.sh's process match reads.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 MATRIX_SCOPED = {
@@ -62,13 +64,14 @@ class InheritedChannelGuardTests(unittest.TestCase):
     def _matrix_frontend(self) -> subprocess.Popen:
         return self._decoy(MATRIX_SCOPED)
 
-    def _decoy(self, extra_env: dict[str, str]) -> subprocess.Popen:
+    def _decoy(self, extra_env: dict[str, str], cwd: str | None = None) -> subprocess.Popen:
         env = self._clean_env()
         env.update(extra_env)
         p = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(60)",
              "-m", "telegram_bot", "--path", self.root],
             env=env,
+            cwd=cwd,
         )
         self._procs.append(p)
         time.sleep(0.5)
@@ -161,6 +164,106 @@ class InheritedChannelGuardTests(unittest.TestCase):
         r = self._start_sh("--status", inherit_matrix=True)
         self.assertNotEqual(r.returncode, 10, r.stdout + r.stderr)
         self.assertNotIn("Refused: action=", r.stdout)
+
+    # -- --status for the Matrix channel (#2312) ------------------------------
+    # start.sh's HEALTH_FILE is always <root>/.telegram_bot/health.json, so
+    # `--channel matrix --status` used to render the Telegram bridge's idle
+    # occupancy while a Matrix turn ran.
+
+    @staticmethod
+    def _write_health(data_dir: Path, pid: int, occupancy: str) -> None:
+        now = datetime.now(timezone.utc)
+        stamp = now.isoformat().replace("+00:00", "Z")
+        occ: dict = {"state": occupancy, "observed_at": stamp}
+        if occupancy == "occupied":
+            occ["oldest_turn_started_at"] = (now - timedelta(minutes=3)).isoformat().replace(
+                "+00:00", "Z"
+            )
+            occ["elapsed_seconds"] = 180
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "health.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "updated_at": stamp,
+                    "process": {"pid": pid},
+                    "service": {"state": "available", "reason": ""},
+                    "telegram": {"state": "healthy", "last_error": ""},
+                    "agent": {"state": "healthy", "provider": "claude", "last_error": ""},
+                    "workload": {
+                        "active_requests": 1 if occupancy == "occupied" else 0,
+                        "oldest_request_age_seconds": 180 if occupancy == "occupied" else 0,
+                        "waiting_for_turn": 0,
+                        "turn_occupancy": occ,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _telegram_idle(self) -> subprocess.Popen:
+        telegram = self._telegram_bridge()
+        self._write_health(Path(self.root) / ".telegram_bot", telegram.pid, "idle")
+        return telegram
+
+    def test_matrix_status_renders_the_frontend_health_not_telegram(self):
+        self._telegram_idle()
+        data_dir = Path(self.root) / ".ccc-matrix"
+        matrix = self._decoy({**MATRIX_SCOPED, "BOT_DATA_DIR": str(data_dir)})
+        self._write_health(data_dir, matrix.pid, "occupied")
+
+        for label, args, inherit in (
+            ("--channel matrix", ("--status", "--channel", "matrix"), False),
+            ("inherited CCC_CHANNEL=matrix", ("--status",), True),
+        ):
+            with self.subTest(label):
+                r = self._start_sh(*args, inherit_matrix=inherit)
+                out = r.stdout + r.stderr
+                self.assertEqual(r.returncode, 0, out)
+                self.assertIn(f"health: {data_dir}/health.json", r.stdout)
+                self.assertIn(f"Process: alive (PID: {matrix.pid})", r.stdout)
+                self.assertIn("Turn occupancy: occupied (1 active turn;", r.stdout)
+                self.assertIn("   Matrix: healthy", r.stdout)
+                self.assertNotIn("   Telegram:", r.stdout)
+        self.assertIsNone(matrix.poll(), "--status must not touch the Matrix frontend")
+
+    def test_matrix_status_resolves_a_relative_data_dir_against_the_frontend_cwd(self):
+        matrix = self._decoy(
+            {**MATRIX_SCOPED, "BOT_DATA_DIR": ".ccc-matrix"}, cwd=self.root
+        )
+        self._write_health(Path(self.root) / ".ccc-matrix", matrix.pid, "occupied")
+        r = self._start_sh("--status", "--channel", "matrix", inherit_matrix=False)
+        self.assertIn("Turn occupancy: occupied", r.stdout, r.stdout + r.stderr)
+
+    def test_matrix_status_without_frontend_is_unavailable_not_telegram(self):
+        self._telegram_idle()
+        r = self._start_sh("--status", "--channel", "matrix", inherit_matrix=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Bot status: unavailable", r.stdout)
+        self.assertIn("no Matrix frontend for this --path", r.stdout)
+        self.assertNotIn("Turn occupancy: idle", r.stdout)
+
+    def test_matrix_status_without_data_dir_never_falls_back_to_telegram(self):
+        self._telegram_idle()
+        matrix = self._matrix_frontend()  # no BOT_DATA_DIR in its environment
+        r = self._start_sh("--status", "--channel", "matrix", inherit_matrix=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Bot status: degraded", r.stdout)
+        self.assertIn(f"PID: {matrix.pid}", r.stdout)
+        self.assertIn("Matrix data dir unknown", r.stdout)
+        self.assertNotIn("Turn occupancy: idle", r.stdout)
+
+    def test_telegram_status_ignores_a_matrix_frontend(self):
+        telegram = self._telegram_idle()
+        (Path(self.root) / ".telegram_bot" / "bot.pid").write_text(str(telegram.pid))
+        data_dir = Path(self.root) / ".ccc-matrix"
+        matrix = self._decoy({**MATRIX_SCOPED, "BOT_DATA_DIR": str(data_dir)})
+        self._write_health(data_dir, matrix.pid, "occupied")
+        r = self._start_sh("--status", inherit_matrix=False)
+        self.assertIn(f"Process: alive (PID: {telegram.pid})", r.stdout, r.stdout + r.stderr)
+        self.assertIn("Turn occupancy: idle", r.stdout)
+        self.assertIn("   Telegram: healthy", r.stdout)
+        self.assertNotIn("Channel: matrix", r.stdout)
 
     def test_telegram_shell_is_unaffected(self):
         r = self._start_sh("--stop", inherit_matrix=False)

@@ -407,6 +407,20 @@ _environ_is_this_channel() {
     [ "$(_environ_bridge_channel "$1")" = "$(_this_bridge_channel)" ]
 }
 
+# Print the value of NAME from a NUL-delimited environ file; fails when the file
+# is unreadable or NAME is absent. Used to locate a Matrix frontend's data dir,
+# which only lives in that process's unit environment (#2312).
+_environ_value() { # <environ-file> <NAME>
+    local file="$1" name="$2" arg
+    [ -r "$file" ] || return 1
+    while IFS= read -r -d '' arg; do
+        case "$arg" in
+            "$name="*) printf '%s\n' "${arg#"$name="}"; return 0 ;;
+        esac
+    done 2>/dev/null < "$file"
+    return 1
+}
+
 # PIDs of `python -m telegram_bot --path $PROJECT_ROOT` processes for THIS
 # project root AND this CCC_CHANNEL, regardless of pid-file state. Covers
 # unmanaged instances whose pid file was lost (pid-file race between concurrent
@@ -577,7 +591,7 @@ render_status_from_health() {
     # formatting are single-sourced in bridge/utils/health_render.py (#455). It
     # is run by path with the system python3 (no venv/import required) so the
     # --status fallback behavior is unchanged.
-    python3 "$SCRIPT_DIR/utils/health_render.py" "$1" "$2" "$3" "$4"
+    python3 "$SCRIPT_DIR/utils/health_render.py" "$1" "$2" "$3" "$4" ${5:+"$5"}
 }
 
 render_turn_occupancy_from_health() {
@@ -639,8 +653,60 @@ report_unmanaged_or_dead() {
     print_component_status "$agent_label" "unavailable" "process not running"
 }
 
+# --status for the Matrix channel (#2312). start.sh's own state (pid file,
+# HEALTH_FILE) is always the Telegram bridge's, so rendering it for
+# `--channel matrix` (or an inherited CCC_CHANNEL=matrix) showed Telegram's turn
+# occupancy as the Matrix frontend's -- an operator checking "is Matrix idle?"
+# saw idle while a Matrix turn ran. The frontend writes health.json under its
+# own BOT_DATA_DIR, which only exists in its unit environment, so read it from
+# the live process found by the channel-aware find_project_bot_pids. Never fall
+# back to the Telegram file: an unknown data dir is reported as such.
+do_status_matrix() {
+    local live_pids pid count data_dir cwd provider
+    live_pids="$(find_project_bot_pids | tr '\n' ' ' | sed 's/ $//')"
+    count=0
+    for pid in $live_pids; do count=$((count + 1)); done
+    if [ "$count" -eq 0 ]; then
+        echo "🔴 Bot status: unavailable"
+        print_component_status "Process" "dead" "no Matrix frontend for this --path"
+        print_component_status "Service" "unavailable" "process not running"
+        print_component_status "Matrix" "unavailable" "process not running"
+        echo "💡 Matrix frontend:  systemctl status ccc-matrix-bridge  (Termux: sv status ccc-matrix-bridge)"
+        return 0
+    fi
+    if [ "$count" -gt 1 ]; then
+        echo "🟡 Bot status: degraded"
+        print_component_status "Process" "alive" "multiple Matrix frontends: $live_pids"
+        print_component_status "Service" "degraded" "ambiguous Matrix frontend; inspect each unit"
+        return 0
+    fi
+    pid="$live_pids"
+    if ! data_dir="$(_environ_value "/proc/$pid/environ" BOT_DATA_DIR)" || [ -z "$data_dir" ]; then
+        echo "🟡 Bot status: degraded"
+        print_component_status "Process" "alive" "PID: $pid"
+        print_component_status "Service" "degraded" "Matrix data dir unknown (BOT_DATA_DIR not readable from the frontend environment)"
+        return 0
+    fi
+    case "$data_dir" in
+        /*) ;;
+        *)
+            cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)" || cwd=""
+            data_dir="${cwd:-$PROJECT_ROOT}/$data_dir"
+            ;;
+    esac
+    provider="$(_environ_value "/proc/$pid/environ" CCC_AGENT_PROVIDER 2>/dev/null)" \
+        || provider="$(configured_agent_provider)"
+    echo "📡 Channel: matrix (health: $data_dir/health.json)"
+    render_status_from_health \
+        "$data_dir/health.json" "$pid" "$HEALTH_STALE_SECONDS" "$(printf '%s' "${provider:-claude}" | tr '[:upper:]' '[:lower:]')" "Matrix"
+}
+
 do_status() {
     local pid
+    if [ "$(_this_bridge_channel)" = matrix ]; then
+        do_status_matrix
+        exit 0
+    fi
     pid="$(read_pid)"
     if [ -z "$pid" ]; then
         report_unmanaged_or_dead "no PID file"

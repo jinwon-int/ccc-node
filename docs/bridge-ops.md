@@ -54,6 +54,15 @@ exits `0` only when the bridge reports idle. A missing field makes jq print
 `bridge/start.sh --path <project> --status` shows the same data in its
 `Turn occupancy` line and reports `unknown` when the observation is stale.
 
+A Matrix frontend on the same `--path` writes its own `health.json` under the
+`BOT_DATA_DIR` of its unit, not under `~/.telegram_bot`; point the commands
+above at that file to check it. `bridge/start.sh --path <project> --channel
+matrix --status` finds the live Matrix frontend for the path, reads
+`BOT_DATA_DIR` from that process's environment and renders its file, printing
+the path it used (#2312). It never falls back to the Telegram file: with no
+Matrix frontend it reports `unavailable`, and with an unreadable data dir it
+reports `degraded`.
+
 How to read the result:
 
 - **`idle`, and `updated_at` is recent**: safe to restart. While the bridge

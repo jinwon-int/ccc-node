@@ -343,9 +343,15 @@ def render_status_lines(
     configured_provider: str,
     *,
     now: Optional[datetime] = None,
+    transport_label: str = "Telegram",
 ) -> List[str]:
     """Return the ``--status`` lines for a health snapshot (byte-identical to the
-    former start.sh heredoc). ``now`` is injectable for deterministic tests."""
+    former start.sh heredoc). ``now`` is injectable for deterministic tests.
+
+    ``transport_label`` names the chat transport line. A Matrix frontend writes
+    its sync-transport state into the same ``telegram`` block of its own
+    health.json, so ``start.sh --channel matrix --status`` passes ``Matrix``
+    (#2312); the default keeps the Telegram output unchanged."""
     configured_label = _agent_label(configured_provider)
     reference = now or datetime.now(timezone.utc)
 
@@ -356,7 +362,7 @@ def render_status_lines(
             _line("Service", "degraded", "health missing"),
             _line("Turn occupancy", "unknown", "health missing"),
             _line("Dead-session wakeup", "unknown", "health missing"),
-            _line("Telegram", "degraded", "health missing"),
+            _line(transport_label, "degraded", "health missing"),
             _line(configured_label, "degraded", "health missing"),
         ]
         if str(configured_provider).strip().lower() == "codex":
@@ -372,7 +378,7 @@ def render_status_lines(
             _line("Service", "degraded", f"invalid health file: {exc}"),
             _line("Turn occupancy", "unknown", "health unreadable"),
             _line("Dead-session wakeup", "unknown", "health unreadable"),
-            _line("Telegram", "degraded", "health unreadable"),
+            _line(transport_label, "degraded", "health unreadable"),
             _line(configured_label, "degraded", "health unreadable"),
         ]
         if str(configured_provider).strip().lower() == "codex":
@@ -400,7 +406,7 @@ def render_status_lines(
             _line("Service", "degraded", detail),
             _line("Turn occupancy", "unknown", detail),
             _line("Dead-session wakeup", "unknown", detail),
-            _line("Telegram", "degraded", detail),
+            _line(transport_label, "degraded", detail),
             _line(agent_label, "degraded", detail),
         ]
         if provider == "codex":
@@ -429,7 +435,7 @@ def render_status_lines(
             stale_seconds=stale_seconds,
         ),
         _line(
-            "Telegram",
+            transport_label,
             telegram_state,
             telegram_reason if telegram_state != "healthy" else "",
         ),
@@ -446,10 +452,17 @@ def render_status_lines(
 
 def main(argv: List[str]) -> int:
     if len(argv) < 4:
-        print("usage: health_render.py <health.json> <pid> <stale_s> <provider>", file=sys.stderr)
+        print(
+            "usage: health_render.py <health.json> <pid> <stale_s> <provider> [transport_label]",
+            file=sys.stderr,
+        )
         return 2
     lines = render_status_lines(
-        Path(argv[0]), argv[1], int(argv[2]), argv[3]
+        Path(argv[0]),
+        argv[1],
+        int(argv[2]),
+        argv[3],
+        transport_label=argv[4] if len(argv) > 4 and argv[4] else "Telegram",
     )
     for entry in lines:
         print(entry)
