@@ -505,3 +505,31 @@ async def test_transport_flags_turn_timeout_before_cancelling_the_runner(tmp_pat
         await f.input(request(f, "$next"))
         await h.until(lambda: (f.store.get_meta("last_turn") or {}).get("event_id") == "$next")
         assert f.turn_timed_out is False
+
+
+# --- #2305: provider autonomous turns keep the Matrix tick busy --------------
+
+
+def test_workload_snapshot_counts_provider_autonomous_turn(tmp_path: Path) -> None:
+    """A task-notification continuation owns no registry turn and no transport
+    job, yet the Matrix health tick must publish it as in-flight work so a
+    restart that trusts ``turn_occupancy`` does not kill it. Runs the real
+    ``ProjectChatHandler`` aggregation, not a fake ``workload_snapshot``."""
+    from types import SimpleNamespace
+
+    from telegram_bot.core.agent_session_registry import AgentSessionEntry
+    from test_project_chat_codex import FakeRuntime, _handler
+
+    bot, _chat, _manager = _bot(tmp_path)
+    handler = _handler(tmp_path / "chat", FakeRuntime())
+    bot._project_chat = handler
+    assert bot._workload_snapshot(100.0) == (0, 0.0, 0)
+
+    handler._agent_session_registry.put_cached(
+        (7, 70),
+        AgentSessionEntry(
+            session=SimpleNamespace(autonomous_workload_snapshot=lambda now: (1, 42.0)),
+            last_used_at=1.0,
+        ),
+    )
+    assert bot._workload_snapshot(100.0) == (1, 42.0, 0)

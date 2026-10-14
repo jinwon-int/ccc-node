@@ -344,6 +344,46 @@ class WorkloadReporterLoopTests(unittest.IsolatedAsyncioTestCase):
             waiting_for_turn=1,
         )
 
+    async def test_reporter_publishes_provider_autonomous_turn_as_busy(self):
+        """#2305: a task-notification continuation owns no registry turn; the
+        Telegram reporter must still publish it, through the real handler."""
+        import tempfile
+        from pathlib import Path
+
+        from telegram_bot.core.agent_session_registry import AgentSessionEntry
+        from telegram_bot.core.bot_lifecycle import BotLifecycleMixin
+        from test_project_chat_codex import FakeRuntime, _handler
+
+        stop = asyncio.Event()
+
+        def autonomous(now):
+            return 1, 42.0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = _handler(Path(tmp), FakeRuntime())
+            handler._agent_session_registry.put_cached(
+                (7, 70),
+                AgentSessionEntry(
+                    session=SimpleNamespace(autonomous_workload_snapshot=autonomous),
+                    last_used_at=1.0,
+                ),
+            )
+            bot = type("Bot", (BotLifecycleMixin,), {})()
+            bot._project_chat = handler
+            bot.application = None
+            bot._WORKLOAD_INTERVAL = 0
+
+            # Stop on the first publish (not inside the probe) so a regression
+            # that never consults the autonomous seam fails on the published
+            # values instead of spinning the interval-0 loop forever.
+            with patch(
+                "telegram_bot.core.bot_lifecycle.health_reporter.record_workload",
+                side_effect=lambda *args, **kwargs: stop.set(),
+            ) as record_workload:
+                await asyncio.wait_for(bot._workload_reporter(stop), timeout=5.0)
+
+        record_workload.assert_called_once_with(1, 42.0, waiting_for_turn=0)
+
 
 class SessionResourceGuardLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_guard_loop_runs_enforcement_and_stops_cleanly(self):

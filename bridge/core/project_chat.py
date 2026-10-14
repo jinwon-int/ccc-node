@@ -1162,20 +1162,60 @@ class ProjectChatHandler(
         # case).  Keep this optional so Codex and future runtimes retain the
         # same provider-neutral session contract.
         for entry in self._agent_session_registry.resident_entries_snapshot():
-            snapshot = getattr(entry.session, "background_workload_snapshot", None)
-            if not callable(snapshot):
-                continue
-            try:
-                background_count, background_oldest_age = snapshot(now)
-            except Exception:
-                logger.debug(
-                    "Provider background workload snapshot failed: provider=%s",
-                    type(entry.session).__name__,
-                )
-                continue
-            count += max(0, int(background_count))
-            oldest_age = max(oldest_age, max(0.0, float(background_oldest_age)))
+            for probe in (
+                self._provider_background_workload,
+                self._provider_autonomous_workload,
+            ):
+                extra_count, extra_oldest_age = probe(entry.session, now)
+                count += extra_count
+                oldest_age = max(oldest_age, extra_oldest_age)
         return count, oldest_age
+
+    @staticmethod
+    def _provider_background_workload(session: object, now: float) -> tuple[int, float]:
+        """Tracked run-in-background work the provider still owns."""
+
+        snapshot = getattr(session, "background_workload_snapshot", None)
+        if not callable(snapshot):
+            return 0, 0.0
+        try:
+            background_count, background_oldest_age = snapshot(now)
+        except Exception:
+            logger.debug(
+                "Provider background workload snapshot failed: provider=%s",
+                type(session).__name__,
+            )
+            return 0, 0.0
+        return max(0, int(background_count)), max(0.0, float(background_oldest_age))
+
+    @staticmethod
+    def _provider_autonomous_workload(session: object, now: float) -> tuple[int, float]:
+        """A turn the provider runs on its own, outside the registry (#2305).
+
+        After a run-in-background task finishes, Claude Code injects its
+        ``<task-notification>`` and continues without a bridge-submitted
+        turn, so the registry reports the session idle while tools are still
+        running.  The session resource guard already honours that window
+        (#2291); restart gating must too, or a self-update or operator
+        restart that trusts ``turn_occupancy: idle`` kills the turn.  Prefer
+        the aged snapshot; fall back to the boolean seam with an unknown
+        (zero) age for runtimes that only expose that.
+        """
+
+        snapshot = getattr(session, "autonomous_workload_snapshot", None)
+        try:
+            if callable(snapshot):
+                autonomous_count, autonomous_age = snapshot(now)
+                return max(0, int(autonomous_count)), max(0.0, float(autonomous_age))
+            inflight = getattr(session, "autonomous_turn_inflight", None)
+            if callable(inflight) and inflight():
+                return 1, 0.0
+        except Exception:
+            logger.debug(
+                "Provider autonomous workload probe failed: provider=%s",
+                type(session).__name__,
+            )
+        return 0, 0.0
 
     def foreground_workload_snapshot(self, now: float) -> tuple[int, float]:
         """Return ``(active_turn_count, oldest_active_turn_age_seconds)``.
@@ -1189,7 +1229,9 @@ class ProjectChatHandler(
         comparison: restart gating wants background work counted (a SIGTERM
         would destroy it), while the health probe's request-lifetime alert
         compares against exactly that per-turn timeout and must see only
-        interactive turns. Clock contract is identical: ``now`` must come
+        interactive turns. Provider-initiated autonomous turns (#2305) are
+        excluded for the same reason: no bridge ``wait_for`` bounds them, so
+        they belong to restart gating only. Clock contract is identical: ``now`` must come
         from the event-loop clock so it is comparable to recorded turn start
         times.
         """
