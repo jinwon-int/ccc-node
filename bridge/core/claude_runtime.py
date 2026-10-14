@@ -308,6 +308,9 @@ class ClaudeSession(
         #     (the adapter counterpart of ``stall_swallow_result``).
         self._unsolicited_handler: UnsolicitedHandler | None = None
         self._unsolicited_inflight = False
+        #   * started_at — event-loop time the current autonomous turn began,
+        #     so restart gating can report its age (#2305); None outside one.
+        self._unsolicited_started_at: float | None = None
         self._unsolicited_texts: list[str] = []
         self._unsolicited_discard = False
         #   * lifecycle — optional start/end seam for the autonomous turn

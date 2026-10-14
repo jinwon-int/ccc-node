@@ -249,6 +249,73 @@ def test_workload_snapshot_includes_optional_provider_background_work(
     assert handler.workload_snapshot(100.0) == (1, 23.0)
 
 
+def test_workload_snapshot_counts_provider_autonomous_turn(tmp_path: Path) -> None:
+    """#2305: a task-notification continuation is idle to the registry but
+    must keep restart gating busy, aged by the provider's own snapshot."""
+    handler = _handler(tmp_path, FakeRuntime())
+    session = SimpleNamespace(
+        autonomous_workload_snapshot=lambda now: (1, 42.0),
+        autonomous_turn_inflight=lambda: True,
+    )
+    handler._agent_session_registry.put_cached(
+        (7, 70),
+        AgentSessionEntry(session=session, last_used_at=1.0),
+    )
+
+    assert handler.workload_snapshot(100.0) == (1, 42.0)
+    assert handler.foreground_workload_snapshot(100.0) == (0, 0.0)
+
+
+def test_workload_snapshot_falls_back_to_autonomous_inflight_seam(
+    tmp_path: Path,
+) -> None:
+    handler = _handler(tmp_path, FakeRuntime())
+    busy = ProviderWorkFakeSession("busy")
+    busy.inflight = True
+    idle = ProviderWorkFakeSession("idle")
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=busy, last_used_at=1.0)
+    )
+    handler._agent_session_registry.put_cached(
+        (8, 80), AgentSessionEntry(session=idle, last_used_at=1.0)
+    )
+
+    assert handler.workload_snapshot(100.0) == (1, 0.0)
+
+
+def test_workload_snapshot_sums_autonomous_turn_with_background_and_active(
+    tmp_path: Path,
+) -> None:
+    handler = _handler(tmp_path, FakeRuntime())
+    session = SimpleNamespace(
+        background_workload_snapshot=lambda now: (1, 23.0),
+        autonomous_workload_snapshot=lambda now: (1, 42.0),
+    )
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=session, last_used_at=1.0)
+    )
+    handler._agent_session_registry.register_active((8, 80), object(), started_at=90.0)
+
+    assert handler.workload_snapshot(100.0) == (3, 42.0)
+
+
+def test_workload_snapshot_skips_a_failing_autonomous_probe(tmp_path: Path) -> None:
+    handler = _handler(tmp_path, FakeRuntime())
+
+    def broken(now: float) -> tuple[int, float]:
+        raise RuntimeError("probe failed")
+
+    session = SimpleNamespace(
+        background_workload_snapshot=lambda now: (1, 23.0),
+        autonomous_workload_snapshot=broken,
+    )
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=session, last_used_at=1.0)
+    )
+
+    assert handler.workload_snapshot(100.0) == (1, 23.0)
+
+
 def test_foreground_workload_snapshot_excludes_provider_background_work(
     tmp_path: Path,
 ) -> None:

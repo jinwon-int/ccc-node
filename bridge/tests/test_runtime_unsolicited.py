@@ -1117,6 +1117,40 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session._unsolicited_inflight)
         self.assertFalse(session.autonomous_turn_inflight())
 
+    async def test_autonomous_workload_snapshot_reports_the_turn_with_its_age(self) -> None:
+        """#2305: restart gating sees the autonomous turn, aged from its first frame."""
+
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        loop = asyncio.get_running_loop()
+        self.assertEqual(session.autonomous_workload_snapshot(loop.time()), (0, 0.0))
+
+        before = loop.time()
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session.autonomous_turn_inflight())
+        count, age = session.autonomous_workload_snapshot(loop.time() + 30.0)
+        self.assertEqual(count, 1)
+        self.assertGreaterEqual(age, 30.0)
+        self.assertLessEqual(age, 30.0 + (loop.time() - before))
+
+        client.emit_result(result=None)
+        await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
+        self.assertEqual(session.autonomous_workload_snapshot(loop.time()), (0, 0.0))
+        self.assertIsNone(session._unsolicited_started_at)
+
+    async def test_autonomous_workload_snapshot_clears_when_the_reader_dies(self) -> None:
+        """#2305: a dead reader must not pin restart gating busy forever."""
+
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session.autonomous_turn_inflight())
+
+        client.emit(None)
+        await _wait_until(lambda: not session.provider_reader_alive())
+        loop = asyncio.get_running_loop()
+        self.assertEqual(session.autonomous_workload_snapshot(loop.time()), (0, 0.0))
+
     # -- ownership across interleaved turns --------------------------------
 
     async def test_inflight_autonomous_turn_keeps_frames_when_user_turn_arrives(

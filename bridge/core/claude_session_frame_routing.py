@@ -38,6 +38,7 @@ class ClaudeSessionFrameRoutingMixin:
     _unsolicited_discard: bool
     _unsolicited_handler: Callable[[str, str | None], Awaitable[None]] | None
     _unsolicited_inflight: bool
+    _unsolicited_started_at: float | None
     _unsolicited_texts: list[str]
     _unsolicited_lifecycle: Callable[[str, str | None], Awaitable[None]] | None
     _unsolicited_route_open: bool
@@ -79,6 +80,26 @@ class ClaudeSessionFrameRoutingMixin:
         if not self.provider_reader_alive():
             return False
         return bool(self._unsolicited_inflight or self._unsolicited_discard)
+
+    def autonomous_workload_snapshot(self, now: float) -> tuple[int, float]:
+        """Return ``(count, age_seconds)`` for the autonomous turn window.
+
+        The restart-gating counterpart of :meth:`autonomous_turn_inflight`
+        (#2305): the registry-based workload snapshot only counts
+        bridge-submitted turns, so without this a task-notification
+        continuation published ``turn_occupancy: idle`` while the CLI was
+        still running tools. ``now`` must come from the event-loop clock,
+        like every other workload snapshot. The age is 0.0 when the window
+        has no recorded start (an abandoned ``send_turn``'s discard window).
+        Body-free and read-only.
+        """
+
+        if not self.autonomous_turn_inflight():
+            return 0, 0.0
+        started = self._unsolicited_started_at
+        if started is None:
+            return 1, 0.0
+        return 1, max(0.0, float(now) - started)
 
     async def _read_frames(self, client: SdkClient) -> None:
         stream_failure: str | None = None
@@ -171,6 +192,7 @@ class ClaudeSessionFrameRoutingMixin:
             if isinstance(message, ResultMessage):
                 self._unsolicited_discard = False
                 self._unsolicited_inflight = False
+                self._unsolicited_started_at = None
                 self._unsolicited_texts.clear()
                 await self._notify_unsolicited_lifecycle("end", message.session_id)
                 logger.warning(
@@ -195,6 +217,7 @@ class ClaudeSessionFrameRoutingMixin:
         raw = message.result or "\n".join(self._unsolicited_texts)
         self._unsolicited_texts.clear()
         self._unsolicited_inflight = False
+        self._unsolicited_started_at = None
         handler = self._unsolicited_handler
         try:
             if handler is None:
@@ -221,6 +244,7 @@ class ClaudeSessionFrameRoutingMixin:
         if self._unsolicited_inflight:
             return
         self._unsolicited_inflight = True
+        self._unsolicited_started_at = asyncio.get_running_loop().time()
         session_id = getattr(message, "session_id", None) or self._session_id
         await self._notify_unsolicited_lifecycle("start", session_id)
 
