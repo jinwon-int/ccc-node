@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
 from types import SimpleNamespace
@@ -574,45 +576,100 @@ async def test_global_replay_newest_capture_wins_resume_in_any_order(
     assert "new session" in (other_route.state_dir / "resume.md").read_text()
 
 
+def _set_mtime(path: Path, iso: str) -> None:
+    stamp = datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    os.utime(path, (stamp, stamp))
+
+
 @pytest.mark.anyio
-async def test_global_sink_overwrites_headerless_or_uncaptured_resume(
+async def test_global_sink_orders_unstamped_resume_by_file_mtime(
     tmp_path: Path,
 ) -> None:
+    """#2301 L3: a resume with no stamped capture (hook-path CLI resume, or a
+    pre-#2297 audience header) is replaced only by a strictly newer capture —
+    compared against its file mtime, both host-clock times."""
     journal = DistillJournal(tmp_path / "journal")
     journal.initialize()
-    first = await _global_job(
+    old = await _global_job(
         journal,
-        thread_id="thread-a",
-        captured_at="2026-07-16T04:00:00Z",
-        distilled_at="2026-07-16T04:01:00Z",
-        activity="bridge session a",
+        thread_id="thread-old",
+        captured_at="2026-09-14T04:00:00Z",
+        distilled_at="2099-01-01T00:00:00Z",
+        activity="month-old backlog",
     )
-    second = await _global_job(
+    newer = await _global_job(
         journal,
-        thread_id="thread-b",
-        captured_at="2026-07-16T03:00:00Z",
-        distilled_at="2026-07-16T03:01:00Z",
-        activity="bridge session b",
+        thread_id="thread-new",
+        captured_at="2026-10-14T05:00:00Z",
+        distilled_at="2020-01-01T00:00:00Z",
+        activity="newer bridge session",
+    )
+    newest = await _global_job(
+        journal,
+        thread_id="thread-newest",
+        captured_at="2026-10-14T07:00:00Z",
+        distilled_at="2026-10-14T07:01:00Z",
+        activity="newest bridge session",
+    )
+    equal = await _global_job(
+        journal,
+        thread_id="thread-equal",
+        captured_at="2026-10-14T08:00:00Z",
+        distilled_at="2026-10-14T08:01:00Z",
+        activity="equal-time bridge session",
     )
     route = _global_route(tmp_path)
     route.state_dir.mkdir(parents=True, mode=0o700)
     resume = route.state_dir / "resume.md"
-    # A hook-path resume has no header: it is overwritten (mtime is ignored).
-    resume.write_text("- 마지막 작업: hook-path CLI session\n")
-    resume.chmod(0o600)
     worker = CodexDistillLocalSinkWorker(
         journal, global_route=route, owner_token="global-worker"
     )
 
-    await worker.write_once(job_id=first.job_id)
-    assert "bridge session a" in resume.read_text()
+    # Today's CLI resume (header-less) survives a month-old replayed capture…
+    cli = "- 마지막 작업: hook-path CLI session today\n"
+    resume.write_text(cli)
+    resume.chmod(0o600)
+    _set_mtime(resume, "2026-10-14T04:30:00Z")
+    result = await worker.write_once(job_id=old.job_id)
+    assert result.local_sink_status is DistillLocalSinkStatus.DONE
+    assert resume.read_text() == cli
+    # …and every job's facts are still merged.
+    assert "Fact from month-old backlog." in (
+        route.state_dir / "memory-facts.jsonl"
+    ).read_text()
 
-    # A bridge header without captured_at (audience-style) is overwritten too.
+    # A capture strictly newer than the file replaces it.
+    await worker.write_once(job_id=newer.job_id)
+    assert "newer bridge session" in resume.read_text()
+
+    # A bridge header without captured_at (audience-style) follows the same rule.
     lines = resume.read_text().splitlines()
-    header = re.sub(r" captured_at=\S+", "", lines[0])
-    resume.write_text("\n".join([header, "- 마지막 작업: uncaptured"]) + "\n")
-    await worker.write_once(job_id=second.job_id)
-    assert "bridge session b" in resume.read_text()
+    header = re.sub(r" ?captured_at=\S+", "", lines[0]).replace("distill  ", "distill ")
+    uncaptured = "\n".join([header, "- 마지막 작업: uncaptured"]) + "\n"
+    resume.write_text(uncaptured)
+    # Kept while its mtime is later than the capture (pre-#2297 header)…
+    _set_mtime(resume, "2026-10-14T08:00:00Z")
+    await worker.write_once(job_id=newest.job_id)
+    assert resume.read_text() == uncaptured
+    # …and replaced once the capture is not older (equal time: capture wins).
+    await worker.write_once(job_id=equal.job_id)
+    assert "equal-time bridge session" in resume.read_text()
+
+
+def test_unstamped_resume_without_new_capture_is_overwritten(tmp_path: Path) -> None:
+    """No bridge capture time means nothing to order by: unchanged behavior."""
+    from telegram_bot.memory.distill_local_sink import CodexLocalMemorySink
+    from test_distill_local_sink import extraction_output
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    resume = state / "resume.md"
+    resume.write_text("- 마지막 작업: cli\n")
+    resume.chmod(0o600)
+    sink = CodexLocalMemorySink(state, audience="private", resume_never_regresses=True)
+    result = sink.write(extraction_output(), job_id="9" * 64, captured_at=None)
+    assert result.resume_written
+    assert "cli" not in resume.read_text()
 
 
 @pytest.mark.anyio
