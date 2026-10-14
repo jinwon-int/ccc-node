@@ -372,3 +372,47 @@ def test_pre_2301_header_with_trailing_captured_at_still_orders(tmp_path: Path) 
     )
     assert result.resume_written
     assert "newer capture" in resume.read_text()
+
+
+@pytest.mark.parametrize(
+    "distilled_at", ["0001-01-01T00:00:00+05:00", "9999-12-31T23:00:00-05:00"]
+)
+def test_out_of_range_distilled_at_never_aborts_the_write(
+    tmp_path: Path, distilled_at: str
+) -> None:
+    """Valid ISO input that overflows on UTC conversion must not lose facts."""
+    state_dir = tmp_path / "state"
+    sink = CodexLocalMemorySink(
+        state_dir, audience="private", resume_never_regresses=True
+    )
+    result = sink.write(
+        _output_with_distilled_at(distilled_at, "edge offset"),
+        job_id="6" * 64,
+        captured_at="2026-10-14T00:00:00Z",
+    )
+    assert result.facts_added == 1 and result.resume_written
+    first_line = (state_dir / "resume.md").read_text().splitlines()[0]
+    assert first_line.startswith(
+        "<!-- ccc-node:distill captured_at=2026-10-14T00:00:00.000000Z "
+    )
+    assert "distilled_at=" not in first_line
+
+
+def test_pre_1000_capture_time_keeps_its_ordering_key(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    sink = CodexLocalMemorySink(
+        state_dir, audience="private", resume_never_regresses=True
+    )
+    sink.write(extraction_output(), job_id="7" * 64, captured_at="0999-01-01T00:00:00Z")
+    first_line = (state_dir / "resume.md").read_text().splitlines()[0]
+    assert first_line.startswith("<!-- ccc-node:distill captured_at=0999-01-01T00:00:00.000000Z ")
+    assert CodexLocalMemorySink._current_resume_captured_at(first_line.encode()) is not None
+
+
+def test_hostile_resume_first_line_is_rejected_in_linear_time() -> None:
+    import time
+
+    hostile = ("<!-- ccc-node:distill " + "captured_at=x " * 20000).encode()
+    started = time.monotonic()
+    assert CodexLocalMemorySink._current_resume_captured_at(hostile) is None
+    assert time.monotonic() - started < 0.5

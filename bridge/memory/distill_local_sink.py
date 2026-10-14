@@ -28,10 +28,11 @@ _WORD_RE = re.compile(r"[0-9a-z가-힣]+")
 _SUPPORTED_AUDIENCES = frozenset({"private", "shared"})
 _MAX_EXISTING_FACT_BYTES = 8 * 1024 * 1024
 # ``captured_at`` leads the header since #2301 so no budget truncation can cut
-# it; headers written before that carry it last. Both orders are read.
-_RESUME_CAPTURED_AT_RE = re.compile(
-    r"^<!-- ccc-node:distill (?:\S+ )*?captured_at=(\S+)(?: \S+)* -->$"
-)
+# it; headers written before that carry it last. Both orders are read, by a
+# linear token split (no regex backtracking under the sink lock).
+_RESUME_HEADER_PREFIX = "<!-- ccc-node:distill "
+_RESUME_HEADER_SUFFIX = " -->"
+_CAPTURED_AT_KEY = "captured_at="
 _RESUME_TRUNCATION_SUFFIX = "\n… [truncated by CCC resume budget]\n"
 
 
@@ -72,11 +73,14 @@ def _normalized_timestamp(value: str | None) -> str | None:
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        if parsed.tzinfo is None:
+            return None
+        # Edge offsets (0001-01-01T00:00+05:00) overflow on conversion.
+        utc = parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    # strftime("%Y") does not zero-pad years < 1000 on glibc.
+    return f"{utc.year:04d}" + utc.strftime("-%m-%dT%H:%M:%S.%fZ")
 
 
 class CodexLocalMemorySink:
@@ -293,7 +297,7 @@ class CodexLocalMemorySink:
             fields.append(f"distilled_at={distilled}")
         keep = 1 if captured is not None else 0
         while True:
-            header = "<!-- ccc-node:distill " + " ".join(fields) + " -->\n"
+            header = _RESUME_HEADER_PREFIX + " ".join(fields) + _RESUME_HEADER_SUFFIX + "\n"
             if len(header.encode("utf-8")) <= self.max_resume_bytes or len(fields) <= keep:
                 break
             fields.pop()
@@ -309,11 +313,11 @@ class CodexLocalMemorySink:
             return None
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
+            if parsed.tzinfo is None:
+                return None
+            return parsed.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
             return None
-        if parsed.tzinfo is None:
-            return None
-        return parsed.astimezone(timezone.utc)
 
     @classmethod
     def _current_resume_captured_at(cls, payload: bytes | None) -> datetime | None:
@@ -321,8 +325,16 @@ class CodexLocalMemorySink:
         if not payload:
             return None
         first_line = payload.split(b"\n", 1)[0].decode("utf-8", errors="replace")
-        match = _RESUME_CAPTURED_AT_RE.match(first_line)
-        return cls._parse_capture_time(match.group(1)) if match else None
+        if not (
+            first_line.startswith(_RESUME_HEADER_PREFIX)
+            and first_line.endswith(_RESUME_HEADER_SUFFIX)
+        ):
+            return None
+        fields = first_line[len(_RESUME_HEADER_PREFIX) : -len(_RESUME_HEADER_SUFFIX)]
+        for token in fields.split(" "):
+            if token.startswith(_CAPTURED_AT_KEY):
+                return cls._parse_capture_time(token[len(_CAPTURED_AT_KEY) :])
+        return None
 
     def write(
         self,
@@ -350,7 +362,7 @@ class CodexLocalMemorySink:
             resume_payload = self._render_resume(
                 output,
                 captured_at=(
-                    new_capture.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                    _normalized_timestamp(captured_at)
                     if new_capture is not None
                     else None
                 ),

@@ -874,6 +874,11 @@ for hdr in \
   ok "load-memory strips the distill sink header from injected resume (${hdr:0:40}…)" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | (contains(\"ccc-node:distill\") | not) and contains(\"▶ 직전 세션에서 이어서:\") and contains(\"배포 진행할까요?\")" >/dev/null <<<"$out"'
   ok "load-memory leaves the distill header in resume.md (${hdr:0:40}…)" '[ "$(head -n1 "$state/resume.md")" = "$hdr" ]'
 done
+# A pre-#2301 resume that was only a budget-cut header holds nothing but the
+# truncation marker once the header is dropped: no resume block at all.
+printf '%s\n… [truncated by CCC resume budget]\n' '<!-- ccc-node:distill schema=1 provider=claude distilled_at=2026-10-14T00:00:00.0000000' > "$state/resume.md"
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "load-memory injects no resume block for a header-plus-marker-only resume" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | (contains(\"직전 세션에서 이어서\") | not) and (contains(\"truncated by CCC resume budget\") | not)" >/dev/null <<<"$out"'
 printf '%s\n' "$resume_plain" > "$state/resume.md"
 
 caller_state="$TMP/caller-state"

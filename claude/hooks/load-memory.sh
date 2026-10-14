@@ -370,9 +370,15 @@ fi
 # (`<!-- ccc-node:distill captured_at=… -->`) that it reads back for ordering.
 # It is useless to the model and eats MAX_RESUME, so drop it at injection time
 # only — the file keeps it (#2301 L4). A pre-#2301 header cut by the budget has
-# no closing `-->`, hence the prefix match.
+# no closing `-->`, hence the prefix match; such a file then holds only the
+# sink's truncation marker, which is not a resume either.
 read_resume() {
-  sed '1{/^<!-- ccc-node:distill /d;}' "$1" 2>/dev/null
+  local r
+  r="$(sed '1{/^<!-- ccc-node:distill /d;}' "$1" 2>/dev/null)"
+  case "$(printf '%s' "$r" | tr -d '[:space:]')" in
+    '…[truncatedbyCCCresumebudget]') r="" ;;
+  esac
+  printf '%s' "$r"
 }
 resume="$(read_resume "$RESUME_FILE")"
 if ! is_disabled "$AUDIENCE_SCOPED" && [ "$MEMORY_AUDIENCE" = "private" ]; then
