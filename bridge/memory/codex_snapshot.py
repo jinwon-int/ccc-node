@@ -74,10 +74,11 @@ class CodexThreadSnapshotter:
         except ValueError as exc:
             # Terminal and never retried: say why, or a node silently loses
             # every session's memory (#2306 — an 0755 transcript directory
-            # failed every job for days with no log line). Readers raise plain
-            # ValueError with fixed reason strings; subclasses (pydantic
-            # ValidationError, JSONDecodeError) can echo input, so only their
-            # class name is logged.
+            # failed every job for days with no log line). Plain ValueError
+            # reasons are reader/route messages (some name a local config path,
+            # never transcript text); subclasses (pydantic ValidationError,
+            # JSONDecodeError) can echo input, so only their class name is
+            # logged.
             logger.warning(
                 "distill snapshot refused job %s (provider %s): %s — job "
                 "terminalized as invalid_snapshot_request",

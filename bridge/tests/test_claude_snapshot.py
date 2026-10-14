@@ -165,3 +165,43 @@ def test_prepare_creates_tightens_and_never_raises(
     with caplog.at_level("WARNING", logger="telegram_bot.memory.claude_snapshot"):
         prepare_transcripts_dir(link)
     assert "check failed at bridge start" in caplog.text
+
+
+def test_error_classification_matches_pre_2306(tmp_path: Path) -> None:
+    """Parent-component errors stay retryable OSError; only the final component
+    being unsafe is a terminal ValueError; an unreadable (0300) dir still reads."""
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    with pytest.raises(OSError) as raised:
+        read_claude_snapshot(blocker / "child", "session-1", bounds=TranscriptBounds())
+    assert not isinstance(raised.value, ValueError)
+
+    exec_only = tmp_path / "exec-only"
+    exec_only.mkdir()
+    _write_transcript(exec_only / "session-1.jsonl")
+    exec_only.chmod(0o300)
+    try:
+        if os.access(exec_only, os.R_OK):
+            pytest.skip("running with read access to 0300 dirs (root)")
+        snapshot = read_claude_snapshot(
+            exec_only,
+            "session-1",
+            bounds=TranscriptBounds(),
+            now=datetime(2026, 8, 5, 0, 1, tzinfo=timezone.utc),
+        )
+        assert [m.text for m in snapshot.messages] == ["question", "answer"]
+        assert exec_only.stat().st_mode & 0o777 == 0o300
+    finally:
+        exec_only.chmod(0o700)
+
+
+def test_failed_fchmod_is_refused_as_before(tmp_path: Path) -> None:
+    directory = tmp_path / "ro"
+    directory.mkdir()
+    directory.chmod(0o755)
+    with patch(
+        "telegram_bot.memory.claude_snapshot.os.fchmod",
+        side_effect=OSError(30, "Read-only file system"),
+    ):
+        with pytest.raises(ValueError, match="directory is unsafe"):
+            ensure_private_transcripts_dir(directory)

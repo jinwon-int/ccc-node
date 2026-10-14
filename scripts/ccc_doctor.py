@@ -526,7 +526,12 @@ _STALE_MEMORY_READ_LIMIT = STALE_MEMORY_READ_LIMIT
 # #2306: distill journal scan for terminal snapshot refusals.
 _SNAPSHOT_REFUSAL_WINDOW_SECONDS = 7 * 86400
 _SNAPSHOT_REFUSAL_MAX_FILES = 500
-_SNAPSHOT_REFUSAL_JOURNALS = (".telegram_bot/distill-journal", ".ccc-matrix/distill-journal")
+_SNAPSHOT_REFUSAL_JOURNALS = (
+    ".telegram_bot/distill-journal",
+    ".ccc-matrix/distill-journal",
+    ".telegram_bot/danso-distill-journal",
+    ".ccc-matrix/danso-distill-journal",
+)
 
 
 def claude_project_slug(project_root: Path) -> str:
@@ -1426,12 +1431,18 @@ class Doctor:
             if not journal.is_dir():
                 continue
             candidates: list[tuple[float, Path]] = []
-            with contextlib.suppress(OSError):
-                for path in journal.glob("*.json"):
-                    with contextlib.suppress(OSError):
-                        mtime = path.stat().st_mtime
-                        if mtime >= cutoff:
-                            candidates.append((mtime, path))
+            try:
+                entries = list(os.scandir(journal))
+            except OSError:
+                unreadable += 1  # a refusal hidden behind an unreadable dir is not "0"
+                continue
+            for entry in entries:
+                if not entry.name.endswith(".json"):
+                    continue
+                with contextlib.suppress(OSError):
+                    mtime = entry.stat(follow_symlinks=False).st_mtime
+                    if mtime >= cutoff:
+                        candidates.append((mtime, Path(entry.path)))
             candidates.sort(reverse=True)
             for _, path in candidates[:_SNAPSHOT_REFUSAL_MAX_FILES]:
                 try:
@@ -1445,6 +1456,15 @@ class Doctor:
                     refused.append((stamp, rel.split("/", 1)[0].lstrip(".")))
         extra = f"; unreadable={unreadable}" if unreadable else ""
         if not refused:
+            if unreadable:
+                self.add(
+                    "경고",
+                    item,
+                    f"recent=0 (7d, scanned={scanned}){extra}",
+                    "a distill journal (dir or job file) could not be read as this user; "
+                    "run ccc-doctor as the bridge user to see snapshot refusals",
+                )
+                return
             self.add("정상", item, f"recent=0 (7d, scanned={scanned}){extra}", "none")
             return
         latest = max(stamp for stamp, _ in refused)
@@ -1455,7 +1475,8 @@ class Doctor:
             f"invalid_snapshot_request={len(refused)} in 7d (latest {latest}, {channels}){extra}",
             "those sessions were not distilled. Find the reason in the bridge log "
             "('distill snapshot refused'), fix it (e.g. the claude transcripts dir mode), "
-            "and decide any replay separately — replay needs explicit approval",
+            "and decide any replay separately — replay needs explicit approval. The count "
+            "covers the last 7 days, so it clears on its own a week after the cause is fixed",
         )
 
     def normalize_hook_manifest(self, path: Path) -> list[dict[str, Any]]:

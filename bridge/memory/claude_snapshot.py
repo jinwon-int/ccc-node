@@ -19,6 +19,18 @@ logger = logging.getLogger(__name__)
 _MAX_SCAN_BYTES = 8 * 1024 * 1024
 
 
+def _validate_directory_lstat(path: Path) -> None:
+    """The pre-#2306 check: refuse, never repair (lstat errors propagate)."""
+    metadata = path.lstat()
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise ValueError("Claude transcript directory is unsafe")
+
+
 def ensure_private_transcripts_dir(path: Path) -> bool:
     """Validate the transcripts directory, tightening group/other bits if needed.
 
@@ -44,9 +56,14 @@ def ensure_private_transcripts_dir(path: Path) -> bool:
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise ValueError("Claude transcript directory is unsafe") from None
-        raise
+        # Keep the pre-#2306 retryable/terminal split: only the final path
+        # component being a symlink or non-directory is "unsafe" (terminal).
+        # The same errno from a parent component, or a directory this user
+        # cannot open for reading (0300), is decided by the old lstat check.
+        if exc.errno not in (errno.ELOOP, errno.ENOTDIR, errno.EACCES):
+            raise
+        _validate_directory_lstat(path)
+        return False
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
@@ -54,7 +71,11 @@ def ensure_private_transcripts_dir(path: Path) -> bool:
         mode = stat.S_IMODE(metadata.st_mode)
         if not mode & 0o077:
             return False
-        os.fchmod(descriptor, mode & 0o700)
+        try:
+            os.fchmod(descriptor, mode & 0o700)
+        except OSError:
+            # e.g. a read-only filesystem: refused (terminal) as before #2306.
+            raise ValueError("Claude transcript directory is unsafe") from None
         if stat.S_IMODE(os.fstat(descriptor).st_mode) & 0o077:
             raise ValueError("Claude transcript directory is unsafe")
     finally:

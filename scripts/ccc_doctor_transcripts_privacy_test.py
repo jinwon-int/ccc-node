@@ -125,6 +125,28 @@ class TranscriptsPrivacyCheck(unittest.TestCase):
         self.assertIn("unreadable=1", row.status)
         self.assertIn("explicit approval", row.action)
 
+    def test_danso_journal_counted_and_action_says_it_clears(self) -> None:
+        journal = self.base / ".ccc-matrix" / "danso-distill-journal"
+        self._job(journal, "a", {"error_code": "invalid_snapshot_request", "created_at": "2026-10-07T13:49:00Z"})
+        row = self.row(self.run_checks(), REFUSAL_ITEM)
+        self.assertEqual(row.klass, "경고")
+        self.assertIn("invalid_snapshot_request=1", row.status)
+        self.assertIn("clears on its own", row.action)
+
+    def test_unreadable_journal_dir_is_not_reported_as_zero(self) -> None:
+        journal = self.base / ".ccc-matrix" / "distill-journal"
+        self._job(journal, "a", {"error_code": "invalid_snapshot_request"})
+        journal.chmod(0)
+        try:
+            if os.access(journal, os.R_OK):
+                self.skipTest("running with read access to mode-0 dirs (root)")
+            row = self.row(self.run_checks(), REFUSAL_ITEM)
+        finally:
+            journal.chmod(0o700)
+        self.assertEqual(row.klass, "경고")
+        self.assertIn("unreadable=1", row.status)
+        self.assertIn("bridge user", row.action)
+
     def test_only_other_errors_is_ok(self) -> None:
         journal = self.base / ".ccc-matrix" / "distill-journal"
         self._job(journal, "a", {"error_code": "snapshot_read_failed"})
