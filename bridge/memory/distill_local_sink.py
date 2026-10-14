@@ -319,6 +319,13 @@ class CodexLocalMemorySink:
         except (ValueError, OverflowError):
             return None
 
+    def _resume_mtime(self) -> datetime | None:
+        try:
+            stamp = os.stat(self._resume_path, follow_symlinks=False).st_mtime
+        except OSError:
+            return None
+        return datetime.fromtimestamp(stamp, timezone.utc)
+
     @classmethod
     def _current_resume_captured_at(cls, payload: bytes | None) -> datetime | None:
         """The ``captured_at`` of the current resume.md header, if parseable."""
@@ -348,7 +355,8 @@ class CodexLocalMemorySink:
         ``captured_at`` (the bridge-recorded snapshot time) only matters for a
         ``resume_never_regresses`` sink: it is stamped into the resume header
         and an extraction never replaces a current resume whose header
-        carries a strictly later capture time.
+        carries a strictly later capture time, nor a resume without a stamped
+        capture (hook-path CLI resume) whose file mtime is later (#2301 L3).
         """
         if not isinstance(output, DistillExtractionOutput):
             raise ValueError("output must be a validated DistillExtractionOutput")
@@ -385,8 +393,7 @@ class CodexLocalMemorySink:
                 write_resume = resume_payload is not None
                 if write_resume and ordered:
                     # Decided under the transaction lock against the CURRENT
-                    # resume: a header-less/unparseable resume is overwritten;
-                    # a strictly newer capture is kept.
+                    # resume: a strictly newer stamped capture is kept.
                     current_capture = self._current_resume_captured_at(
                         current["resume.md"]
                     )
@@ -394,6 +401,19 @@ class CodexLocalMemorySink:
                         new_capture is None or current_capture > new_capture
                     ):
                         write_resume = False
+                    elif (
+                        current_capture is None
+                        and current["resume.md"]
+                        and new_capture is not None
+                    ):
+                        # #2301 L3: no stamped capture — a hook-path CLI resume
+                        # (header-less) or a pre-#2297 audience header. Its file
+                        # mtime and the bridge capture are both host-clock times
+                        # (never model output), so a replayed backlog older than
+                        # the file must not replace it.
+                        current_mtime = self._resume_mtime()
+                        if current_mtime is not None and current_mtime > new_capture:
+                            write_resume = False
                 resume_written = write_resume
                 if write_resume:
                     desired["resume.md"] = resume_payload
