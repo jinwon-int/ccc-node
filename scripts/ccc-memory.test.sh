@@ -863,6 +863,19 @@ ok "resume-write preserves previous resume on empty resume object" '[ "$(cat "$s
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "load-memory injects resume pointer at the top of session context" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | startswith(\"# test-node session memory\") and contains(\"▶ 직전 세션에서 이어서:\") and contains(\"배포 진행할까요?\")" >/dev/null <<<"$out"'
 
+# #2301 L4: the bridge sink's provenance header stays in the file (ordering)
+# but never reaches the injected context — closed or budget-truncated.
+resume_plain="$(cat "$state/resume.md")"
+for hdr in \
+  '<!-- ccc-node:distill captured_at=2026-10-14T00:00:00.000000Z schema=1 provider=claude thread_hash=abc trigger=shutdown -->' \
+  '<!-- ccc-node:distill schema=1 provider=claude thread_hash=abc trigger=shutdown distilled_at=2026-10-14T00:00:00.00000000000'; do
+  printf '%s\n%s\n' "$hdr" "$resume_plain" > "$state/resume.md"
+  out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+  ok "load-memory strips the distill sink header from injected resume (${hdr:0:40}…)" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | (contains(\"ccc-node:distill\") | not) and contains(\"▶ 직전 세션에서 이어서:\") and contains(\"배포 진행할까요?\")" >/dev/null <<<"$out"'
+  ok "load-memory leaves the distill header in resume.md (${hdr:0:40}…)" '[ "$(head -n1 "$state/resume.md")" = "$hdr" ]'
+done
+printf '%s\n' "$resume_plain" > "$state/resume.md"
+
 caller_state="$TMP/caller-state"
 mkdir -p "$caller_state"
 printf 'keep\n' > "$caller_state/marker.txt"

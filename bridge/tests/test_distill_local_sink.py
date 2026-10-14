@@ -272,3 +272,103 @@ def test_fact_durability_follows_kind(
     facts = read_facts(tmp_path / "state" / "memory-facts.jsonl")
     assert facts[0]["kind"] == kind
     assert facts[0]["durability"] == expected_durability
+
+
+def _output_with_distilled_at(distilled_at: str, activity: str) -> DistillExtractionOutput:
+    payload = extraction_output(last_activity=activity).model_dump(mode="json")
+    payload["provenance"]["distilled_at"] = distilled_at
+    return DistillExtractionOutput.model_validate(payload)
+
+
+@pytest.mark.parametrize("max_resume_bytes", [256, 300, 512, 4000])
+@pytest.mark.parametrize(
+    "distilled_at",
+    [
+        "2026-10-14T00:00:00Z",
+        # #2301 L1: model-authored, fromisoformat accepts unbounded fractions.
+        "2026-10-14T00:00:00." + "1" * 4000 + "+00:00",
+    ],
+    ids=["plain", "4000-digit-fraction"],
+)
+def test_captured_at_survives_any_distilled_at_and_budget(
+    tmp_path: Path, max_resume_bytes: int, distilled_at: str
+) -> None:
+    """#2301 L1/L2: the ordering key is never truncated, and an older replay
+    never overwrites a newer resume — whatever the budget or model output."""
+    state_dir = tmp_path / "state"
+    sink = CodexLocalMemorySink(
+        state_dir,
+        audience="private",
+        max_resume_bytes=max_resume_bytes,
+        resume_never_regresses=True,
+    )
+    newer = sink.write(
+        _output_with_distilled_at(distilled_at, "newer session " + "x" * 140),
+        job_id="1" * 64,
+        captured_at="2026-10-14T09:00:00Z",
+    )
+    resume = state_dir / "resume.md"
+    payload = resume.read_bytes()
+    first_line = payload.split(b"\n", 1)[0].decode()
+    assert newer.resume_written
+    assert len(payload) <= max_resume_bytes
+    assert first_line.startswith(
+        "<!-- ccc-node:distill captured_at=2026-10-14T09:00:00.000000Z "
+    )
+    assert first_line.endswith(" -->")
+    assert "1" * 100 not in first_line
+
+    older = sink.write(
+        _output_with_distilled_at(distilled_at, "older replay"),
+        job_id="2" * 64,
+        captured_at="2026-10-01T09:00:00Z",
+    )
+    assert not older.resume_written
+    assert resume.read_bytes() == payload
+
+
+def test_distilled_at_is_normalized_in_header(tmp_path: Path) -> None:
+    sink = CodexLocalMemorySink(tmp_path / "state", audience="private")
+    sink.write(
+        _output_with_distilled_at("2026-10-14T09:00:00.123456789+09:00", "activity"),
+        job_id="3" * 64,
+    )
+    first_line = (tmp_path / "state" / "resume.md").read_text().splitlines()[0]
+    # Audience sinks stamp no capture time; provenance order is unchanged.
+    assert first_line == (
+        "<!-- ccc-node:distill schema=1 provider=codex "
+        f"thread_hash={THREAD_HASH} trigger=new_command "
+        "distilled_at=2026-10-14T00:00:00.123456Z -->"
+    )
+
+
+def test_pre_2301_header_with_trailing_captured_at_still_orders(tmp_path: Path) -> None:
+    """Resumes written before #2301 carry captured_at last; still honored."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    resume = state_dir / "resume.md"
+    legacy = (
+        "<!-- ccc-node:distill schema=1 provider=claude "
+        f"thread_hash={THREAD_HASH} trigger=shutdown "
+        "distilled_at=2026-10-13T00:00:00Z captured_at=2026-10-13T10:47:00.000000Z -->\n"
+        "- 마지막 작업: legacy newer resume\n"
+    )
+    resume.write_text(legacy)
+    resume.chmod(0o600)
+    sink = CodexLocalMemorySink(
+        state_dir, audience="private", resume_never_regresses=True
+    )
+    result = sink.write(
+        extraction_output(last_activity="older replay"),
+        job_id="4" * 64,
+        captured_at="2026-10-01T00:00:00Z",
+    )
+    assert not result.resume_written
+    assert resume.read_text() == legacy
+    result = sink.write(
+        extraction_output(last_activity="newer capture"),
+        job_id="5" * 64,
+        captured_at="2026-10-14T00:00:00Z",
+    )
+    assert result.resume_written
+    assert "newer capture" in resume.read_text()

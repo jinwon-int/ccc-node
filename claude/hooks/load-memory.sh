@@ -366,9 +366,17 @@ if ! is_disabled "$WIKI_ENABLED"; then
     wiki="$(cat "$LEGACY_CACHE_DIR/wiki.txt" 2>/dev/null)"
   fi
 fi
-resume="$(cat "$RESUME_FILE" 2>/dev/null)"
+# The bridge distill sink stamps a first-line provenance comment
+# (`<!-- ccc-node:distill captured_at=… -->`) that it reads back for ordering.
+# It is useless to the model and eats MAX_RESUME, so drop it at injection time
+# only — the file keeps it (#2301 L4). A pre-#2301 header cut by the budget has
+# no closing `-->`, hence the prefix match.
+read_resume() {
+  sed '1{/^<!-- ccc-node:distill /d;}' "$1" 2>/dev/null
+}
+resume="$(read_resume "$RESUME_FILE")"
 if ! is_disabled "$AUDIENCE_SCOPED" && [ "$MEMORY_AUDIENCE" = "private" ]; then
-  legacy_resume="$(cat "$LEGACY_RESUME_FILE" 2>/dev/null)"
+  legacy_resume="$(read_resume "$LEGACY_RESUME_FILE")"
   resume="$(printf '%s\n%s' "$legacy_resume" "$resume")"
 fi
 # Working-state: same resolution as checkpoint.sh (#1155) — the scoped file

@@ -27,9 +27,12 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _WORD_RE = re.compile(r"[0-9a-z가-힣]+")
 _SUPPORTED_AUDIENCES = frozenset({"private", "shared"})
 _MAX_EXISTING_FACT_BYTES = 8 * 1024 * 1024
+# ``captured_at`` leads the header since #2301 so no budget truncation can cut
+# it; headers written before that carry it last. Both orders are read.
 _RESUME_CAPTURED_AT_RE = re.compile(
-    r"^<!-- ccc-node:distill .* captured_at=(\S+) -->$"
+    r"^<!-- ccc-node:distill (?:\S+ )*?captured_at=(\S+)(?: \S+)* -->$"
 )
+_RESUME_TRUNCATION_SUFFIX = "\n… [truncated by CCC resume budget]\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,13 +50,33 @@ def _single_line(text: str) -> str:
 
 
 def _bounded_utf8(text: str, max_bytes: int) -> bytes:
+    """Bound ``text`` to ``max_bytes``; the result never exceeds the bound."""
     payload = text.encode("utf-8")
     if len(payload) <= max_bytes:
         return payload
-    suffix = "\n… [truncated by CCC resume budget]\n".encode()
-    budget = max(0, max_bytes - len(suffix))
+    suffix = _RESUME_TRUNCATION_SUFFIX.encode()
+    if max_bytes < len(suffix):
+        return payload[: max(0, max_bytes)].decode("utf-8", errors="ignore").encode("utf-8")
+    budget = max_bytes - len(suffix)
     prefix = payload[:budget].decode("utf-8", errors="ignore").encode("utf-8")
     return prefix + suffix
+
+
+def _normalized_timestamp(value: str | None) -> str | None:
+    """Render an aware ISO-8601 time as fixed-width UTC (27 chars), else None.
+
+    ``distilled_at`` is model output and ``fromisoformat`` accepts any number of
+    fractional digits, so the raw value is unbounded (#2301 L1).
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 class CodexLocalMemorySink:
@@ -252,16 +275,33 @@ class CodexLocalMemorySink:
         if not lines:
             return None
         provenance = output.provenance
-        header = (
-            "<!-- ccc-node:distill "
-            f"schema={output.schema_version} provider={provenance.provider} "
-            f"thread_hash={provenance.source_thread_hash} "
-            f"trigger={provenance.trigger.value} "
-            f"distilled_at={provenance.distilled_at}"
-            + (f" captured_at={captured_at}" if captured_at is not None else "")
-            + " -->\n"
+        # Fields in priority order: captured_at first, so ordering survives
+        # any budget, then provenance. Every value is bounded (enums, SHA-256,
+        # normalized timestamps); the header itself is never truncated (#2301).
+        fields: list[str] = []
+        captured = _normalized_timestamp(captured_at)
+        if captured is not None:
+            fields.append(f"captured_at={captured}")
+        fields += [
+            f"schema={output.schema_version}",
+            f"provider={provenance.provider}",
+            f"thread_hash={provenance.source_thread_hash}",
+            f"trigger={provenance.trigger.value}",
+        ]
+        distilled = _normalized_timestamp(provenance.distilled_at)
+        if distilled is not None:
+            fields.append(f"distilled_at={distilled}")
+        keep = 1 if captured is not None else 0
+        while True:
+            header = "<!-- ccc-node:distill " + " ".join(fields) + " -->\n"
+            if len(header.encode("utf-8")) <= self.max_resume_bytes or len(fields) <= keep:
+                break
+            fields.pop()
+        header_bytes = header.encode("utf-8")
+        body = _bounded_utf8(
+            "\n".join(lines) + "\n", max(0, self.max_resume_bytes - len(header_bytes))
         )
-        return _bounded_utf8(header + "\n".join(lines) + "\n", self.max_resume_bytes)
+        return header_bytes + body
 
     @staticmethod
     def _parse_capture_time(value: str | None) -> datetime | None:
