@@ -321,3 +321,47 @@ def test_diagnostics_never_expose_thread_or_transcript_body(tmp_path: Path) -> N
     assert "raw transcript secret" not in diagnostics
     assert "worker-secret-token" not in diagnostics
     assert "turn-secret" not in diagnostics
+
+
+@pytest.mark.anyio
+async def test_snapshotter_logs_terminal_refusal_reason_without_echoing_input(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#2306: a refused snapshot terminalizes — it must say why, safely."""
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    jobs = [
+        journal.enqueue_once(
+            provider="claude", thread_id=f"thread-{n}", trigger=DistillTrigger.AUTO_NEW
+        )
+        for n in range(2)
+    ]
+
+    class Echoing(ValueError):
+        pass
+
+    errors = iter(
+        [
+            ValueError("Claude transcript directory is unsafe"),
+            Echoing("input_value='private transcript text'"),
+        ]
+    )
+
+    class Runtime:
+        async def read_session_snapshot(self, session_id, *, bounds):
+            del session_id, bounds
+            raise next(errors)
+
+    with caplog.at_level("WARNING", logger="telegram_bot.memory.codex_snapshot"):
+        for job in jobs:
+            result = await CodexThreadSnapshotter(
+                journal, Runtime(), owner_token="snapshot-worker"
+            ).snapshot_once(job_id=job.job_id)
+            assert result.status is DistillJobStatus.TERMINAL_FAILED
+            assert result.error_code == "invalid_snapshot_request"
+
+    assert "Claude transcript directory is unsafe" in caplog.text
+    assert jobs[0].job_id[:12] in caplog.text and "provider claude" in caplog.text
+    assert "Echoing" in caplog.text
+    assert "private transcript text" not in caplog.text
+    assert "thread-0" not in caplog.text

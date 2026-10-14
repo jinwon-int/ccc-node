@@ -523,6 +523,20 @@ def read_env_file_keys(path: Path, keys: frozenset[str]) -> dict[str, str]:
 # ccc_memory_guidance so `setup.sh --refresh-guidance` reuses the exact same
 # detection instead of a second copy that could drift.
 _STALE_MEMORY_READ_LIMIT = STALE_MEMORY_READ_LIMIT
+# #2306: distill journal scan for terminal snapshot refusals.
+_SNAPSHOT_REFUSAL_WINDOW_SECONDS = 7 * 86400
+_SNAPSHOT_REFUSAL_MAX_FILES = 500
+_SNAPSHOT_REFUSAL_JOURNALS = (
+    ".telegram_bot/distill-journal",
+    ".ccc-matrix/distill-journal",
+    ".telegram_bot/danso-distill-journal",
+    ".ccc-matrix/danso-distill-journal",
+)
+
+
+def claude_project_slug(project_root: Path) -> str:
+    """Mirror of bridge/core/conversation_paths.claude_project_dir_name."""
+    return str(project_root).replace("/", "-").replace("_", "-").replace(".", "-")
 
 
 def _printable(value: str, limit: int = 120) -> str:
@@ -873,6 +887,8 @@ class Doctor:
         self.check_cron_drift()
         self.check_provider_readiness()
         self.check_distill_readiness()
+        self.check_claude_transcripts_privacy()
+        self.check_snapshot_refusals()
         self.check_skill_promotion_backlog()
         self.check_skill_pending_backlog()
         self.check_skill_prescreen()
@@ -1348,6 +1364,119 @@ class Doctor:
             "distill extractor",
             f"configured={configured}; effective={effective}; executable=available; live auth unproven",
             "run one explicitly approved body-free distill canary before production activation",
+        )
+
+    def _served_transcripts_dir(self) -> Path:
+        root = self._served_project_root()
+        with contextlib.suppress(OSError, RuntimeError):
+            root = root.resolve()
+        return self.claude_dir / "projects" / claude_project_slug(root)
+
+    def check_claude_transcripts_privacy(self) -> None:
+        """Warn when the served Claude transcripts dir is group/other-accessible (#2306).
+
+        The distill snapshot refuses such a directory, so every job terminalized
+        as ``invalid_snapshot_request`` while nothing logged it (two nodes lost
+        days of memory). Read-only: reports the mode, never lists transcripts.
+        """
+        item = "claude transcripts dir"
+        directory = self._served_transcripts_dir()
+        try:
+            metadata = directory.lstat()
+        except FileNotFoundError:
+            self.add("정상", item, f"해당 없음 (not created yet: {directory})", "none")
+            return
+        except OSError as exc:
+            self.add("수동필요", item, f"unreadable: {type(exc).__name__}", f"inspect {directory}")
+            return
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            self.add(
+                "수동필요",
+                item,
+                f"not a real directory: {directory}",
+                "replace it with a private directory owned by the bridge user; the distill "
+                "snapshot refuses symlinks and non-directories",
+            )
+            return
+        if metadata.st_uid != os.geteuid():
+            self.add(
+                "수동필요",
+                item,
+                f"owner uid={metadata.st_uid} != {os.geteuid()}: {directory}",
+                "chown it to the bridge user; the distill snapshot refuses a foreign-owned directory",
+            )
+            return
+        if mode & 0o077:
+            self.add(
+                "경고",
+                item,
+                f"mode={mode:04o} (group/other bits): {directory}",
+                f"chmod 700 '{directory}' — until then every Claude distill snapshot is refused "
+                "(invalid_snapshot_request). A bridge with #2306 tightens it at start and on read.",
+            )
+            return
+        self.add("정상", item, f"mode={mode:04o}: {directory}", "none")
+
+    def check_snapshot_refusals(self) -> None:
+        """Count distill jobs terminalized as invalid_snapshot_request in the last 7 days (#2306)."""
+        item = "distill snapshot refusals"
+        root = self._served_project_root()
+        cutoff = time.time() - _SNAPSHOT_REFUSAL_WINDOW_SECONDS
+        scanned = 0
+        refused: list[tuple[str, str]] = []
+        unreadable = 0
+        for rel in _SNAPSHOT_REFUSAL_JOURNALS:
+            journal = root / rel
+            if not journal.is_dir():
+                continue
+            candidates: list[tuple[float, Path]] = []
+            try:
+                entries = list(os.scandir(journal))
+            except OSError:
+                unreadable += 1  # a refusal hidden behind an unreadable dir is not "0"
+                continue
+            for entry in entries:
+                if not entry.name.endswith(".json"):
+                    continue
+                with contextlib.suppress(OSError):
+                    mtime = entry.stat(follow_symlinks=False).st_mtime
+                    if mtime >= cutoff:
+                        candidates.append((mtime, Path(entry.path)))
+            candidates.sort(reverse=True)
+            for _, path in candidates[:_SNAPSHOT_REFUSAL_MAX_FILES]:
+                try:
+                    job = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    unreadable += 1
+                    continue
+                scanned += 1
+                if isinstance(job, dict) and job.get("error_code") == "invalid_snapshot_request":
+                    stamp = str(job.get("updated_at") or job.get("created_at") or "")[:16]
+                    refused.append((stamp, rel.split("/", 1)[0].lstrip(".")))
+        extra = f"; unreadable={unreadable}" if unreadable else ""
+        if not refused:
+            if unreadable:
+                self.add(
+                    "경고",
+                    item,
+                    f"recent=0 (7d, scanned={scanned}){extra}",
+                    "a distill journal (dir or job file) could not be read as this user; "
+                    "run ccc-doctor as the bridge user to see snapshot refusals",
+                )
+                return
+            self.add("정상", item, f"recent=0 (7d, scanned={scanned}){extra}", "none")
+            return
+        latest = max(stamp for stamp, _ in refused)
+        channels = ",".join(sorted({channel for _, channel in refused}))
+        self.add(
+            "경고",
+            item,
+            f"invalid_snapshot_request={len(refused)} in 7d (latest {latest}, {channels}){extra}",
+            "those sessions were not distilled. Find the reason in the bridge log "
+            "('distill snapshot refused'), fix it (e.g. the claude transcripts dir mode), "
+            "and decide any replay separately — replay needs explicit approval. The count "
+            "covers the last 7 days, so it clears on its own a week after the cause is fixed",
         )
 
     def normalize_hook_manifest(self, path: Path) -> list[dict[str, Any]]:

@@ -19,6 +19,9 @@ def _run_probe(script: str, *, probe_root: Path) -> subprocess.CompletedProcess[
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONPATH": str(PYTHONPATH_SHIM),
         "PROBE_ROOT": str(probe_root),
+        # Without HOME the probe falls back to the real home, and bridge start
+        # (#2306 prepare_transcripts_dir) would create dirs under it.
+        "HOME": str(probe_root / "home"),
     }
     return subprocess.run(
         [sys.executable, "-c", script],

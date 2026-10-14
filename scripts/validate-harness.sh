@@ -528,6 +528,12 @@ else
   err "doctor stale-memory-guidance verdict tests failed (seeded guidance may keep presenting retired Honcho as current)"
   tail -10 "$TMP/doctor-stale-memory-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_transcripts_privacy_test.py >"$TMP/doctor-transcripts-privacy-test.out" 2>&1; then
+  say "  ok doctor claude transcripts dir / snapshot refusal verdict tests (#2306)"
+else
+  err "doctor transcripts privacy tests failed (an 0755 transcripts dir may silently refuse every distill snapshot again)"
+  tail -10 "$TMP/doctor-transcripts-privacy-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_memory_guidance_refresh_test.py >"$TMP/refresh-guidance-test.out" 2>&1; then
   say "  ok setup --refresh-guidance tests (#2238)"
 else

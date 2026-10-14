@@ -561,14 +561,21 @@ def _build_standard_context(
         from telegram_bot.core.claude_runtime import ClaudeRuntime
         from telegram_bot.core.conversation_paths import claude_project_dir_name
 
+        from telegram_bot.memory.claude_snapshot import prepare_transcripts_dir
+
         logger.info("Claude provider routed through ClaudeRuntime adapter (#346)")
+        transcripts_dir = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / claude_project_dir_name(Path(settings.project_root).resolve())
+        )
+        # #2306: a umask-0755/0775 directory made every distill snapshot fail.
+        prepare_transcripts_dir(transcripts_dir)
         agent_runtime = ClaudeRuntime(
             sdk_client_factory=sdk_factory,
             settings=settings,
-            transcripts_dir=Path.home()
-            / ".claude"
-            / "projects"
-            / claude_project_dir_name(Path(settings.project_root).resolve()),
+            transcripts_dir=transcripts_dir,
         )
     elif settings.agent_provider == "piri" and agent_runtime is None:
         agent_runtime = _build_piri_runtime(settings)

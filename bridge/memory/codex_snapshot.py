@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Protocol
 import secrets
 
 from .distill_journal import DistillJournal
 from .distill_types import CodexTranscriptSnapshot, DistillJob, TranscriptBounds
+
+
+logger = logging.getLogger(__name__)
+
+
+def _refusal_reason(exc: ValueError) -> str:
+    if type(exc) is ValueError:
+        return str(exc).splitlines()[0][:200] if str(exc) else "ValueError"
+    return type(exc).__name__
 
 
 class SnapshotRuntime(Protocol):
@@ -61,7 +71,21 @@ class CodexThreadSnapshotter:
                     memory_audience=claimed.memory_audience,
                     memory_scope=claimed.memory_scope,
                 )
-        except ValueError:
+        except ValueError as exc:
+            # Terminal and never retried: say why, or a node silently loses
+            # every session's memory (#2306 — an 0755 transcript directory
+            # failed every job for days with no log line). Plain ValueError
+            # reasons are reader/route messages (some name a local config path,
+            # never transcript text); subclasses (pydantic ValidationError,
+            # JSONDecodeError) can echo input, so only their class name is
+            # logged.
+            logger.warning(
+                "distill snapshot refused job %s (provider %s): %s — job "
+                "terminalized as invalid_snapshot_request",
+                job_id[:12],
+                claimed.provider,
+                _refusal_reason(exc),
+            )
             return await asyncio.to_thread(
                 self._journal.mark_terminal_failed,
                 job_id,
