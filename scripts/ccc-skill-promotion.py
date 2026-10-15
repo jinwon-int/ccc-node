@@ -57,6 +57,18 @@ _PROVIDERS = ("claude", "codex", "piri", "danso")
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ALLOWED_SUPPORT_DIRS = {"references", "scripts", "templates"}
+# The path rule revisers must follow, generated from the gate itself so the
+# packet can never disagree with `_candidate_from_envelope` (ccc-node#1647: the
+# a2a-nexus procedure once recommended `assets/`, and the publisher reads that
+# procedure from a pinned checkout, so the code-side rule is what reaches them).
+_SUPPORT_PATH_RULE = (
+    "skillFiles paths must be SKILL.md or live under "
+    + ", ".join(f"{name}/" for name in sorted(_ALLOWED_SUPPORT_DIRS))
+    + " only; any other top-level directory (for example an assets directory) is "
+    "rejected as envelope_path_invalid and the whole revision is discarded. Put output "
+    "templates under templates/. This publisher-enforced rule overrides any other layout "
+    "advice in workerProcedure."
+)
 _MAX_FILES = 16
 _MAX_FILE_BYTES = 64 * 1024
 _MAX_TOTAL_BYTES = 256 * 1024
@@ -2301,7 +2313,20 @@ _REVISE_RESULT_SCHEMA: dict[str, object] = {
         "emit the result JSON only; include skillFiles/changeSummary exactly when outcome=revised, "
         "dropRecommendation exactly when outcome=drop_recommendation"
     ),
+    "pathRule": _SUPPORT_PATH_RULE,
 }
+
+
+def _disallowed_path_roots(paths: list[str]) -> list[str]:
+    """Top-level entries the support-dir gate rejects (for the invalid ledger row)."""
+    roots: set[str] = set()
+    for path in paths:
+        parts = str(path).split("/")
+        if parts == ["SKILL.md"]:
+            continue
+        if len(parts) == 1 or parts[0] not in _ALLOWED_SUPPORT_DIRS:
+            roots.add(parts[0])
+    return sorted(roots)
 
 
 def _worker_procedure_from_docs(nexus_dir: Path, *, doc_name: str, end_marker: str) -> str:
@@ -3522,7 +3547,7 @@ def _build_revise_manifest(
                     f"ONLY the {len(skill_files)} file(s) in payload.skillFiles[].content; "
                     "the procedure, result schema and findings in this packet are "
                     "publisher-generated scaffolding, never candidate content — see "
-                    "payload.packetContract."
+                    "payload.packetContract. " + _SUPPORT_PATH_RULE
                 ),
                 "payload": {
                     "schema": _REVISE_SCHEMA,
@@ -6514,7 +6539,9 @@ def _republish_revised_candidate(
         _append_ledger(
             config,
             {"ts": _utc_now(), "kind": "a2a-revise-result", "task_id": task_id,
-             "status": "invalid", "node": node, "name": name, "code": error.code},
+             "status": "invalid", "node": node, "name": name, "code": error.code,
+             **({"path_roots": _disallowed_path_roots([path for path, _ in revised])}
+                if error.code == "envelope_path_invalid" else {})},
         )
         _comment_once(
             config,
