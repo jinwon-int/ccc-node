@@ -30,7 +30,7 @@ printf '%s\0' "$@" >> "${CCC_TEST_PROOT_LOG:?}"
 printf '\n' >> "${CCC_TEST_PROOT_LOG:?}"
 if [ "${1:-}" = install ]; then
   root="${CCC_TEST_CONTAINER_ROOT:?}"
-  mkdir -p "$root/opt/ccc-mempalace/venv/bin" "$root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.10.0.dist-info"
+  mkdir -p "$root/opt/ccc-mempalace/venv/bin" "$root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.11.0.dist-info"
   cat > "$root/opt/ccc-mempalace/venv/bin/mempalace" <<'EOF'
 #!/bin/sh
 exit 0
@@ -41,12 +41,19 @@ EOF
   exit 0
 fi
 if [ "${1:-}" = login ] && [ -f "${CCC_TEST_CONTAINER_ROOT:?}/opt/ccc-mempalace/requirements.input.lock" ]; then
+  # Mimic the guest pip: the venv ends up on exactly the pin the input lock names.
+  pin="$(sed -n 's/^mempalace==//p' "${CCC_TEST_CONTAINER_ROOT:?}/opt/ccc-mempalace/requirements.input.lock" | head -1)"
+  if [ -n "$pin" ]; then
+    site="${CCC_TEST_CONTAINER_ROOT:?}/opt/ccc-mempalace/venv/lib/python3.11/site-packages"
+    find "$site" -maxdepth 1 -type d -name 'mempalace-*.dist-info' ! -name "mempalace-$pin.dist-info" -exec rm -rf {} + 2>/dev/null
+    mkdir -p "$site/mempalace-$pin.dist-info"
+  fi
   cp "${CCC_TEST_CONTAINER_ROOT:?}/opt/ccc-mempalace/requirements.input.lock" \
     "${CCC_TEST_CONTAINER_ROOT:?}/opt/ccc-mempalace/requirements.lock"
   chmod 600 "${CCC_TEST_CONTAINER_ROOT:?}/opt/ccc-mempalace/requirements.lock"
 fi
 case " $* " in
-  *" /opt/ccc-mempalace/venv/bin/mempalace --version "*) echo 'mempalace 3.10.0' ;;
+  *" /opt/ccc-mempalace/venv/bin/mempalace --version "*) echo 'mempalace 3.11.0' ;;
 esac
 exit 0
 SH
@@ -213,7 +220,7 @@ catchup_root="$TMP/catchup-root"
 mkdir -p "$catchup_home/.codex/sessions" \
   "$catchup_home/.claude/hooks/nunchi" \
   "$catchup_root/opt/ccc-mempalace/venv/bin" \
-  "$catchup_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.10.0.dist-info"
+  "$catchup_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.11.0.dist-info"
 chmod 700 "$catchup_root/opt/ccc-mempalace"
 printf '{}\n' > "$catchup_home/.codex/sessions/a.jsonl"
 printf '%s\n' 'ccc-node #867 managed container' > "$catchup_root/opt/ccc-mempalace/.ccc-node-managed"
@@ -224,7 +231,7 @@ cat > "$catchup_root/opt/ccc-mempalace/venv/bin/mempalace" <<'EOF'
 exit 0
 EOF
 chmod 700 "$catchup_root/opt/ccc-mempalace/venv/bin/mempalace"
-sed 's/^mempalace==3.10.0$/mempalace==3.6.0/' \
+sed 's/^mempalace==3.11.0$/mempalace==3.6.0/' \
   "$ROOT/scripts/termux-mempalace-requirements.txt" \
   > "$catchup_root/opt/ccc-mempalace/requirements.lock"
 chmod 600 "$catchup_root/opt/ccc-mempalace/.ccc-node-managed" \
@@ -238,7 +245,7 @@ ok "a managed venv already on the pin may catch up a mempalace-only lock delta" 
 stale_home="$TMP/stale-lock-home"
 stale_root="$TMP/stale-lock-root"
 mkdir -p "$stale_home/.codex/sessions" \
-  "$stale_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.10.0.dist-info"
+  "$stale_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.11.0.dist-info"
 chmod 700 "$stale_root/opt/ccc-mempalace"
 printf '{}\n' > "$stale_home/.codex/sessions/a.jsonl"
 printf '%s\n' 'ccc-node #867 managed container' > "$stale_root/opt/ccc-mempalace/.ccc-node-managed"
@@ -250,6 +257,56 @@ out="$(env "${common_env[@]}" HOME="$stale_home" \
   bash "$ROOT/scripts/install-termux-mempalace.sh" --apply --codex 2>&1)"; rc=$?
 ok "matching dist-info does not overwrite an unrelated drifted lock" \
   '[ "$rc" = 2 ] && grep -q "dependency lock drift" <<<"$out" && grep -qx "unexpected dependency set" "$stale_root/opt/ccc-mempalace/requirements.lock"'
+
+# In-place upgrade from a listed previous pin: venv on 3.10.0, installed lock =
+# managed freeze with mempalace==3.10.0 (the only delta a pin bump produces).
+mk_prev_root() { # <home> <root> <dist-version> <lock-mode: delta|drift>
+  mkdir -p "$1/.codex/sessions" "$1/.claude/hooks/nunchi" \
+    "$2/opt/ccc-mempalace/venv/bin" \
+    "$2/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-$3.dist-info"
+  chmod 700 "$2/opt/ccc-mempalace"
+  printf '{}\n' > "$1/.codex/sessions/a.jsonl"
+  printf '%s\n' 'ccc-node #867 managed container' > "$2/opt/ccc-mempalace/.ccc-node-managed"
+  cp "$home/.claude/hooks/nunchi/mempalace-refresh.sh" "$1/.claude/hooks/nunchi/mempalace-refresh.sh"
+  printf '#!/bin/sh\nexit 0\n' > "$2/opt/ccc-mempalace/venv/bin/mempalace"
+  chmod 700 "$2/opt/ccc-mempalace/venv/bin/mempalace"
+  if [ "$4" = delta ]; then
+    sed "s/^mempalace==3.11.0$/mempalace==$3/" "$ROOT/scripts/termux-mempalace-requirements.txt" \
+      > "$2/opt/ccc-mempalace/requirements.lock"
+  else
+    { sed "s/^mempalace==3.11.0$/mempalace==$3/" "$ROOT/scripts/termux-mempalace-requirements.txt"; echo 'extra-dep==1.0'; } \
+      > "$2/opt/ccc-mempalace/requirements.lock"
+  fi
+  chmod 600 "$2/opt/ccc-mempalace/.ccc-node-managed" "$2/opt/ccc-mempalace/requirements.lock"
+}
+
+up_home="$TMP/upgrade-home"; up_root="$TMP/upgrade-root"
+mk_prev_root "$up_home" "$up_root" 3.10.0 delta
+out="$(env "${common_env[@]}" HOME="$up_home" \
+  CCC_TERMUX_MEMPALACE_CONTAINER_ROOT="$up_root" CCC_TEST_CONTAINER_ROOT="$up_root" \
+  bash "$ROOT/scripts/install-termux-mempalace.sh" --apply --codex 2>&1)"; rc=$?
+ok "a managed venv on the previous pin upgrades in place when the lock delta is mempalace-only" \
+  '[ "$rc" = 0 ] && grep -q "upgrading MemPalace 3.10.0 -> 3.11.0" <<<"$out" && cmp -s "$ROOT/scripts/termux-mempalace-requirements.txt" "$up_root/opt/ccc-mempalace/requirements.lock"'
+ok "the upgraded venv carries exactly the new dist-info" \
+  '[ -d "$up_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.11.0.dist-info" ] && [ ! -d "$up_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.10.0.dist-info" ]'
+ok "the upgrade ran the guest pip install from the new input lock" \
+  'grep -q "mempalace==3.11.0" "$up_root/opt/ccc-mempalace/requirements.input.lock" && grep -aq "pip install" "$proot_log"'
+
+old_home="$TMP/oldpin-home"; old_root="$TMP/oldpin-root"
+mk_prev_root "$old_home" "$old_root" 3.9.0 delta
+out="$(env "${common_env[@]}" HOME="$old_home" \
+  CCC_TERMUX_MEMPALACE_CONTAINER_ROOT="$old_root" CCC_TEST_CONTAINER_ROOT="$old_root" \
+  bash "$ROOT/scripts/install-termux-mempalace.sh" --apply --codex 2>&1)"; rc=$?
+ok "a venv on a pin that is not listed as upgradable still fails closed" \
+  '[ "$rc" = 2 ] && grep -q "version drift" <<<"$out" && [ -d "$old_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.9.0.dist-info" ] && grep -q "^mempalace==3.9.0$" "$old_root/opt/ccc-mempalace/requirements.lock"'
+
+dr_home="$TMP/upgrade-drift-home"; dr_root="$TMP/upgrade-drift-root"
+mk_prev_root "$dr_home" "$dr_root" 3.10.0 drift
+out="$(env "${common_env[@]}" HOME="$dr_home" \
+  CCC_TERMUX_MEMPALACE_CONTAINER_ROOT="$dr_root" CCC_TEST_CONTAINER_ROOT="$dr_root" \
+  bash "$ROOT/scripts/install-termux-mempalace.sh" --apply --codex 2>&1)"; rc=$?
+ok "a previous-pin venv with an unrelated lock drift is not upgraded" \
+  '[ "$rc" = 2 ] && grep -q "version drift" <<<"$out" && [ -d "$dr_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.10.0.dist-info" ] && grep -q "^extra-dep==1.0$" "$dr_root/opt/ccc-mempalace/requirements.lock"'
 
 unmanaged="$TMP/unmanaged-home"
 mkdir -p "$unmanaged/.codex/sessions" "$unmanaged/.local/bin"
