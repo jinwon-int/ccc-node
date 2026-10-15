@@ -454,6 +454,34 @@ def _bind_resume_diagnostics(agent_runtime: Any, health_reporter: Any) -> None:
         setter(health_reporter.record_codex_resume_diagnostics)
 
 
+def _claude_transcripts_dir(settings: Settings) -> Path:
+    """The served Claude transcripts dir (ProjectChatHandler.conversations_dir)."""
+    from telegram_bot.core.conversation_paths import claude_project_dir_name
+
+    return (
+        Path.home()
+        / ".claude"
+        / "projects"
+        / claude_project_dir_name(Path(settings.project_root).resolve())
+    )
+
+
+def _distill_fallback_snapshot_readers(settings: Settings) -> dict[str, Any]:
+    """Read-only distill readers for jobs a provider switch left behind (#2316).
+
+    Only Claude qualifies: its transcripts live in one served directory that is
+    not partitioned by memory audience, so reading them from another provider's
+    bridge is exactly what ClaudeRuntime would do. Codex/Piri/Danso transcripts
+    live behind audience-bound homes, so their jobs get no fallback here and stay
+    retryable (snapshot_provider_mismatch) rather than meet a foreign reader.
+    """
+    if settings.agent_provider == "claude":
+        return {}
+    from telegram_bot.core.claude_session_browser import ClaudeTranscriptSnapshotReader
+
+    return {"claude": ClaudeTranscriptSnapshotReader(_claude_transcripts_dir(settings))}
+
+
 def _build_standard_context(
     settings: Settings, *, sdk_factory: Any = None, agent_runtime: Any = None,
     telegram_port: Any = None, clock: Any = None,
@@ -559,17 +587,11 @@ def _build_standard_context(
         # are gone (rollback = git revert). The transcripts browsing directory
         # matches ~/.claude/projects (ProjectChatHandler.conversations_dir).
         from telegram_bot.core.claude_runtime import ClaudeRuntime
-        from telegram_bot.core.conversation_paths import claude_project_dir_name
 
         from telegram_bot.memory.claude_snapshot import prepare_transcripts_dir
 
         logger.info("Claude provider routed through ClaudeRuntime adapter (#346)")
-        transcripts_dir = (
-            Path.home()
-            / ".claude"
-            / "projects"
-            / claude_project_dir_name(Path(settings.project_root).resolve())
-        )
+        transcripts_dir = _claude_transcripts_dir(settings)
         # #2306: a umask-0755/0775 directory made every distill snapshot fail.
         prepare_transcripts_dir(transcripts_dir)
         agent_runtime = ClaudeRuntime(
@@ -673,6 +695,8 @@ def _build_standard_context(
         distill_snapshot_worker = CodexThreadSnapshotter(
             distill_journal,
             agent_runtime,
+            provider=settings.agent_provider,
+            provider_readers=_distill_fallback_snapshot_readers(settings),
         )
     distill_local_sink_worker = None
     memory_promoter = None

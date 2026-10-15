@@ -113,3 +113,18 @@ class ClaudeSessionBrowserMixin:
             if text and not text.startswith("<"):
                 return text[:100]
         return None
+
+
+class ClaudeTranscriptSnapshotReader(ClaudeSessionBrowserMixin):
+    """Read-only Claude distill snapshot reader for a bridge serving another provider.
+
+    After a claude->codex/piri switch the departing Claude session's distill
+    job must still be read by the Claude reader, not the new runtime (#2316).
+    This reads the same transcripts directory, through the same validation, as
+    ``ClaudeRuntime`` would, so it widens no memory-audience partition: Claude
+    transcripts are never audience-partitioned on disk, and the job keeps its
+    own journal-bound route for the sinks.
+    """
+
+    def __init__(self, transcripts_dir: Path) -> None:
+        self._transcripts_dir = Path(transcripts_dir)

@@ -12,7 +12,12 @@ from pathlib import Path
 import stat
 from typing import Any, Literal, Mapping
 
-from .distill_types import CodexTranscriptSnapshot, TranscriptBounds, TranscriptMessage
+from .distill_types import (
+    CodexTranscriptSnapshot,
+    SnapshotUnavailableError,
+    TranscriptBounds,
+    TranscriptMessage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -251,9 +256,9 @@ def read_claude_snapshot(
     try:
         path.lstat()
     except FileNotFoundError:
-        return CodexTranscriptSnapshot(
-            thread_hash, None, (), 0, False, captured.isoformat().replace("+00:00", "Z")
-        )
+        # Never an empty snapshot (#2316): it would complete the job with no
+        # memory. Retryable, so a gone transcript ends as max_attempts_exceeded.
+        raise SnapshotUnavailableError("Claude transcript is not available") from None
     payload, metadata = _read_private_tail(path, bounds)
     fallback = datetime.fromtimestamp(metadata.st_mtime, tz=timezone.utc)
     newest: list[TranscriptMessage] = []

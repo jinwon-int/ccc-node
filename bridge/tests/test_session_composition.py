@@ -982,6 +982,9 @@ os.environ.pop("CCC_CODEX_SKILL_COLLECTOR")
 os.environ["CCC_AGENT_PROVIDER"] = "claude"
 claude_context = build_context(load_runtime_settings())
 assert claude_context.skill_candidate_collector_worker is None
+# #2316: a Claude bridge reads Claude jobs with its own runtime and nothing else.
+assert claude_context.distill_snapshot_worker._provider == "claude"
+assert claude_context.distill_snapshot_worker._provider_readers == {}
 print("CODEX-SKILL-COLLECTOR-DEFAULT-ON-OK")
 """,
         probe_root=tmp_path,
@@ -1291,6 +1294,9 @@ context = build_context(settings)
 worker = context.distill_snapshot_worker
 assert isinstance(worker, CodexThreadSnapshotter), type(worker)
 assert worker._runtime is context.agent_runtime
+# #2316: jobs are read only by their own provider's reader.
+assert worker._provider == "codex"
+assert set(worker._provider_readers) == {"claude"}
 assert context.agent_runtime._route_environment_factory is not None
 bot = create_app(context)
 assert bot._distill_snapshot_worker is worker
@@ -1330,6 +1336,8 @@ assert context.agent_runtime._route_environment_factory is not None
 assert context.agent_runtime._memory_environment_validator is not None
 assert isinstance(context.distill_snapshot_worker, CodexThreadSnapshotter)
 assert context.distill_snapshot_worker._runtime is context.agent_runtime
+assert context.distill_snapshot_worker._provider == "piri"
+assert set(context.distill_snapshot_worker._provider_readers) == {"claude"}
 assert context.distill_local_sink_worker is not None
 assert context.distill_wiki_sink_worker is not None
 assert context.distill_extraction_worker._extractor_provider == "piri"

@@ -11,7 +11,7 @@ from telegram_bot.memory.claude_snapshot import (
     prepare_transcripts_dir,
     read_claude_snapshot,
 )
-from telegram_bot.memory.distill_types import TranscriptBounds
+from telegram_bot.memory.distill_types import SnapshotUnavailableError, TranscriptBounds
 
 
 def _write_transcript(path: Path) -> None:
@@ -126,6 +126,17 @@ def test_non_directory_and_foreign_owner_are_still_refused(tmp_path: Path) -> No
 def test_missing_transcripts_dir_stays_retryable(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         read_claude_snapshot(tmp_path / "absent", "session-1", bounds=TranscriptBounds())
+
+
+def test_missing_transcript_file_is_unavailable_not_empty(tmp_path: Path) -> None:
+    """#2316: an absent transcript used to come back as an empty snapshot, so the
+    job completed with no memory. It must raise the retryable contract error."""
+    tmp_path.chmod(0o700)
+    with pytest.raises(SnapshotUnavailableError) as raised:
+        read_claude_snapshot(tmp_path, "session-absent", bounds=TranscriptBounds())
+    # Retryable for the snapshot worker, never a terminal refusal.
+    assert not isinstance(raised.value, ValueError)
+    assert "session-absent" not in str(raised.value)
 
 
 def test_tightened_dir_still_refuses_unsafe_transcript_file(tmp_path: Path) -> None:
