@@ -246,6 +246,15 @@ _RECENT_TERMINAL_TURN_LIMIT = 512
 # on a hard crash and how stale the durable meter can run behind a long turn.
 _USAGE_COALESCE_MAX_AGE_SECONDS = 5.0
 _ASYNC_DIAGNOSTIC_COUNTER_MAX = (1 << 31) - 1
+# Speech item spellings: app-server v2 camelCase and the core TurnItem
+# PascalCase that Codex CLI 0.149+ rollouts use (#2316).
+_USER_SPEECH_ITEM_TYPES = frozenset({"userMessage", "UserMessage"})
+_AGENT_SPEECH_ITEM_TYPES = frozenset({"agentMessage", "AgentMessage"})
+# ``UserInput::Text`` is ``text``; ``AgentMessageContent::Text`` is ``Text``.
+_TEXT_PART_TYPES = frozenset({"text", "Text", "input_text", "output_text"})
+# Raw thread items a snapshot may walk. Only speech counts against
+# TranscriptBounds.max_items, so this keeps a tool-heavy thread bounded.
+_SNAPSHOT_MAX_SCANNED_ITEMS = 20_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -942,19 +951,10 @@ class CodexRuntime:
             for item in items[:200]:
                 if not isinstance(item, Mapping):
                     continue
-                item_type = item.get("type")
-                role: Literal["user", "assistant"]
-                text: object
-                if item_type == "userMessage":
-                    text = self._user_message_text(item.get("content"))
-                    role = "user"
-                elif item_type == "agentMessage":
-                    text = item.get("text")
-                    role = "assistant"
-                else:
+                speech = self._speech_item(item)
+                if speech is None:
                     continue
-                if not isinstance(text, str):
-                    continue
+                role, text = speech
                 bounded_text = text[:2000].strip()
                 if not bounded_text:
                     continue
@@ -1011,6 +1011,25 @@ class CodexRuntime:
         messages, byte_count, byte_truncation = self._bound_snapshot_messages(
             newest_messages, limits
         )
+        if not messages:
+            # The thread exists but yielded no speech. That is how Codex CLI
+            # 0.160's item format surfaced (#2316): every layer recorded
+            # extraction_done with snapshot_bytes=0 and the session was lost.
+            # Try the rollout file, then fail closed (retryable) rather than
+            # hand the extractor an empty transcript as if it were the session.
+            disk = await asyncio.to_thread(
+                self._rollout_snapshot, session_id, limits, captured, thread_hash
+            )
+            if disk is not None:
+                return disk
+            logger.warning(
+                "codex snapshot has no speech thread=%s turns=%d",
+                thread_hash,
+                len(thread.turns),
+            )
+            raise SnapshotUnavailableError(
+                f"Codex thread has no readable speech for snapshot: {thread_hash}"
+            )
         return CodexTranscriptSnapshot(
             thread_hash=thread_hash,
             last_turn_id=last_turn_id,
@@ -1105,14 +1124,24 @@ class CodexRuntime:
 
         newest_messages: list[TranscriptMessage] = []
         items_seen = 0
+        items_scanned = 0
         for turn in reversed(selected_turns):
             turn_timestamp = cls._history_timestamp(turn.get("createdAt"))
             items = turn.get("items")
             if not isinstance(items, (list, tuple)):
                 continue
             for item in reversed(items):
-                if items_seen >= limits.max_items:
+                # Only speech counts against max_items (#2316): a tool-heavy
+                # turn used to exhaust the budget before reaching any message.
+                # The raw scan stays bounded separately.
+                if (
+                    items_seen >= limits.max_items
+                    or items_scanned >= _SNAPSHOT_MAX_SCANNED_ITEMS
+                ):
                     return newest_messages, last_turn_id, True
+                items_scanned += 1
+                if not isinstance(item, Mapping) or cls._speech_item(item) is None:
+                    continue
                 items_seen += 1
                 message, excluded_by_age = cls._snapshot_item(
                     item, turn_timestamp, captured, limits.max_age_seconds
@@ -1135,18 +1164,11 @@ class CodexRuntime:
     ) -> tuple[TranscriptMessage | None, bool]:
         if not isinstance(item, Mapping):
             return None, False
-        item_type = item.get("type")
-        role: Literal["user", "assistant"]
-        text: object
-        if item_type == "userMessage":
-            text = cls._user_message_text(item.get("content"))
-            role = "user"
-        elif item_type == "agentMessage":
-            text = item.get("text")
-            role = "assistant"
-        else:
+        speech = cls._speech_item(item)
+        if speech is None:
             return None, False
-        if not isinstance(text, str) or not (text := text.strip()):
+        role, text = speech
+        if not (text := text.strip()):
             return None, False
         timestamp = cls._history_timestamp(item.get("timestamp")) or turn_timestamp
         parsed_timestamp = cls._parse_snapshot_time(timestamp)
@@ -1207,6 +1229,32 @@ class CodexRuntime:
     def _format_snapshot_time(value: datetime) -> str:
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
+    @classmethod
+    def _speech_item(
+        cls, item: Mapping[str, object]
+    ) -> tuple[Literal["user", "assistant"], str] | None:
+        """Map one thread item to (role, text), or None if it is not speech.
+
+        ``thread/read`` (app-server v2, verified against the Codex CLI 0.160.1
+        schema) still returns ``userMessage`` with a ``UserInput`` list and
+        ``agentMessage`` with a ``text`` string. The core ``TurnItem`` spelling
+        that 0.149+ rollouts use (``UserMessage``/``AgentMessage`` with a
+        ``content`` part list) is accepted too, so a server that forwards that
+        form cannot silently empty the snapshot again (#2316).
+        """
+
+        item_type = item.get("type")
+        if item_type in _USER_SPEECH_ITEM_TYPES:
+            text = cls._user_message_text(cast(JsonValue, item.get("content")))
+            return ("user", text) if text else None
+        if item_type in _AGENT_SPEECH_ITEM_TYPES:
+            raw_text = item.get("text")
+            if isinstance(raw_text, str) and raw_text.strip():
+                return "assistant", raw_text
+            text = cls._user_message_text(cast(JsonValue, item.get("content")))
+            return ("assistant", text) if text else None
+        return None
+
     @staticmethod
     def _user_message_text(content: JsonValue) -> str | None:
         if isinstance(content, str):
@@ -1217,7 +1265,7 @@ class CodexRuntime:
         for block in content[:50]:
             if not isinstance(block, Mapping):
                 continue
-            if block.get("type") not in {"text", "input_text"}:
+            if block.get("type") not in _TEXT_PART_TYPES:
                 continue
             text = block.get("text")
             if isinstance(text, str):

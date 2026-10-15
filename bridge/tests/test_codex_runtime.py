@@ -1380,6 +1380,174 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runtime.close()
 
+    def _hermetic_codex_home(self, raw: str) -> Path:
+        codex_home = Path(raw)
+        (codex_home / "sessions").mkdir(mode=0o755, parents=True)
+        (codex_home / "sessions").chmod(0o755)
+        return codex_home
+
+    async def test_snapshot_reads_core_turn_item_spelling(self) -> None:
+        """PascalCase UserMessage/AgentMessage with content parts map like v2 (#2316)."""
+
+        from telegram_bot.core.codex_app_server import CodexThread
+        from telegram_bot.memory.distill_types import TranscriptBounds
+
+        self.clients[0].thread_reads["thread-0160"] = CodexThread(
+            id="thread-0160",
+            turns=(
+                {
+                    "id": "turn-1",
+                    "createdAt": "2026-10-11T11:00:00Z",
+                    "items": (
+                        {"type": "UserMessage", "id": "u", "content": [{"type": "text", "text": "synthetic question"}]},
+                        {"type": "Reasoning", "id": "r", "summary_text": ["SYNTHETIC-REASONING"]},
+                        {"type": "AgentMessage", "id": "a", "content": [{"type": "Text", "text": "synthetic answer"}], "phase": "final_answer"},
+                    ),
+                },
+            ),
+        )
+
+        result = await self.runtime.read_session_snapshot(
+            "thread-0160",
+            bounds=TranscriptBounds(),
+            now=datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(
+            [(m.role, m.text) for m in result.messages],
+            [("user", "synthetic question"), ("assistant", "synthetic answer")],
+        )
+        self.assertNotIn("SYNTHETIC-REASONING", repr(result))
+
+    async def test_snapshot_tool_heavy_turn_does_not_exhaust_the_item_budget(self) -> None:
+        """Only speech counts against max_items; 250 tool items must not hide it."""
+
+        from telegram_bot.core.codex_app_server import CodexThread
+        from telegram_bot.memory.distill_types import TranscriptBounds
+
+        tools = tuple(
+            {"type": "commandExecution", "id": f"c{index}", "aggregatedOutput": "SYNTHETIC-TOOL"}
+            for index in range(250)
+        )
+        self.clients[0].thread_reads["thread-tools"] = CodexThread(
+            id="thread-tools",
+            turns=(
+                {
+                    "id": "turn-1",
+                    "createdAt": "2026-10-11T11:00:00Z",
+                    "items": (
+                        {"type": "userMessage", "content": [{"type": "text", "text": "synthetic question"}]},
+                        {"type": "agentMessage", "text": "synthetic answer"},
+                        *tools,
+                    ),
+                },
+            ),
+        )
+
+        result = await self.runtime.read_session_snapshot(
+            "thread-tools",
+            bounds=TranscriptBounds(),
+            now=datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(
+            [(m.role, m.text) for m in result.messages],
+            [("user", "synthetic question"), ("assistant", "synthetic answer")],
+        )
+
+    async def test_snapshot_of_a_thread_without_speech_raises_unavailable(self) -> None:
+        """A readable thread with zero speech is not an empty success (#2316).
+
+        Four live Codex jobs ended extraction_done with snapshot_bytes=0 this
+        way: the thread existed, nothing in it mapped to a message, and every
+        layer reported success while the session was discarded.
+        """
+
+        from telegram_bot.core.codex_app_server import CodexThread
+        from telegram_bot.memory.distill_types import (
+            SnapshotUnavailableError,
+            TranscriptBounds,
+        )
+
+        with tempfile.TemporaryDirectory() as raw:
+            codex_home = self._hermetic_codex_home(raw)
+            runtime = CodexRuntime(
+                client_factory=self.factory,
+                process_environment={"CODEX_HOME": str(codex_home)},
+            )
+            try:
+                await runtime._ensure_started()
+                client = self.clients[-1]
+                client.thread_reads["thread-silent"] = CodexThread(
+                    id="thread-silent",
+                    turns=(
+                        {
+                            "id": "turn-1",
+                            "createdAt": "2026-10-11T11:00:00Z",
+                            "items": (
+                                {"type": "commandExecution", "aggregatedOutput": "SYNTHETIC-TOOL"},
+                                {"type": "reasoning", "summary": []},
+                                {"type": "unknownFutureSpeech", "text": "unmapped"},
+                            ),
+                        },
+                    ),
+                )
+                with self.assertRaises(SnapshotUnavailableError):
+                    await runtime.read_session_snapshot(
+                        "thread-silent",
+                        bounds=TranscriptBounds(),
+                        now=datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc),
+                    )
+            finally:
+                await runtime.close()
+
+    async def test_snapshot_of_a_thread_without_speech_falls_back_to_rollout(self) -> None:
+        """The 0.160 rollout still holds the speech the RPC read did not map."""
+
+        import shutil
+
+        from telegram_bot.core.codex_app_server import CodexThread
+        from telegram_bot.memory.distill_types import TranscriptBounds
+
+        fixture = Path(__file__).parent / "fixtures" / "codex_rollout_0_160_1.jsonl"
+        thread_id = "00000000-0000-7000-8000-000000002316"
+        with tempfile.TemporaryDirectory() as raw:
+            codex_home = self._hermetic_codex_home(raw)
+            day = codex_home / "sessions" / "2026" / "10" / "11"
+            day.mkdir(mode=0o755, parents=True)
+            rollout = day / f"rollout-2026-10-11T11-00-00-{thread_id}.jsonl"
+            shutil.copyfile(fixture, rollout)
+            rollout.chmod(0o644)
+            runtime = CodexRuntime(
+                client_factory=self.factory,
+                process_environment={"CODEX_HOME": str(codex_home)},
+            )
+            try:
+                await runtime._ensure_started()
+                self.clients[-1].thread_reads[thread_id] = CodexThread(
+                    id=thread_id,
+                    turns=({"id": "turn-0002", "createdAt": "2026-10-11T11:10:00Z", "items": ()},),
+                )
+                result = await runtime.read_session_snapshot(
+                    thread_id,
+                    bounds=TranscriptBounds(),
+                    now=datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc),
+                )
+            finally:
+                await runtime.close()
+
+        self.assertEqual(
+            [(m.role, m.text) for m in result.messages],
+            [
+                ("user", "synthetic question one"),
+                ("assistant", "synthetic answer one"),
+                ("user", "synthetic question two"),
+                ("assistant", "synthetic progress note"),
+                ("assistant", "synthetic answer two"),
+            ],
+        )
+        self.assertGreater(result.byte_count, 0)
+
     async def test_live_skill_reads_use_session_audience_and_ignore_other_turns(self) -> None:
         # Both frontends consume this same runtime event stream. Exercise the
         # real shared logger through app-server notification routing.

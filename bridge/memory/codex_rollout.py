@@ -21,6 +21,7 @@ mode of.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -32,6 +33,7 @@ from .distill_types import TranscriptBounds, TranscriptMessage
 
 _MAX_HEADER_BYTES = 64 * 1024
 _MAX_SCAN_BYTES = 16 * 1024 * 1024
+_DEDUPE_NEIGHBOURHOOD = 8
 _MAX_LINE_BYTES = 4 * 1024 * 1024
 
 
@@ -79,14 +81,26 @@ def _parse_time(value: object) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _scan_window(limits: TranscriptBounds) -> int:
+    return min(
+        _MAX_SCAN_BYTES,
+        max(
+            1024 * 1024,
+            limits.max_bytes * 16,
+            limits.max_message_bytes * limits.max_items,
+        ),
+    )
+
+
 def _read_identified_tail(
-    path: Path, session_id: str, limits: TranscriptBounds
-) -> bytes:
+    path: Path, session_id: str, scan_bytes: int
+) -> tuple[bytes, bool]:
     """Confirm the file really is this session, then return a bounded tail.
 
     The filename embeds the thread id, but a filename is not identity: the
     ``session_meta`` header is checked so a renamed or copied rollout cannot be
-    attributed to another session.
+    attributed to another session. The flag says whether the tail started
+    after the beginning of the file, i.e. whether a wider read could see more.
     """
 
     descriptor, metadata = _open_rollout(path)
@@ -107,49 +121,172 @@ def _read_identified_tail(
             or session_id not in {payload.get("id"), payload.get("session_id")}
         ):
             raise ValueError("Codex rollout identity does not match")
-        scan_bytes = min(
-            _MAX_SCAN_BYTES,
-            max(
-                1024 * 1024,
-                limits.max_bytes * 16,
-                limits.max_message_bytes * limits.max_items,
-            ),
-        )
         offset = max(0, metadata.st_size - scan_bytes)
         body = os.pread(descriptor, metadata.st_size - offset, offset)
         if offset:
             # A tail read almost certainly starts mid-record; drop the partial.
             newline = body.find(b"\n")
             body = b"" if newline < 0 else body[newline + 1 :]
-        return body
+        return body, offset > 0
     finally:
         os.close(descriptor)
 
 
+_Role = Literal["user", "assistant"]
+_Source = Literal["legacy", "item"]
+# ``event_msg`` legacy speech events (Codex CLI before ~0.149).
+_LEGACY_SPEECH: Mapping[str, _Role] = {
+    "user_message": "user",
+    "agent_message": "assistant",
+}
+# ``event_msg`` / ``item_completed`` turn items. Codex CLI 0.149+/0.160 records
+# speech only here (core ``TurnItem``: ``UserMessage``/``AgentMessage`` with a
+# ``content`` part list); the camelCase spelling is the app-server v2 form and
+# is accepted so either serialization maps the same way.
+_ITEM_SPEECH: Mapping[str, _Role] = {
+    "UserMessage": "user",
+    "AgentMessage": "assistant",
+    "userMessage": "user",
+    "agentMessage": "assistant",
+}
+# ``UserInput::Text`` serializes as ``text``; ``AgentMessageContent::Text`` is
+# an internally tagged variant (``Text``). The response-item spellings are
+# accepted too so a future rename does not empty the snapshot again (#2316).
+_TEXT_PART_TYPES = frozenset({"text", "Text", "input_text", "output_text"})
+_MAX_CONTENT_PARTS = 64
+
+
+def _content_text(content: object) -> str | None:
+    """Join the text parts of a turn item's ``content``; images etc. are skipped."""
+
+    if isinstance(content, str):
+        return content.strip() or None
+    if not isinstance(content, (list, tuple)):
+        return None
+    parts: list[str] = []
+    for block in content[:_MAX_CONTENT_PARTS]:
+        if not isinstance(block, Mapping) or block.get("type") not in _TEXT_PART_TYPES:
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and (text := text.strip()):
+            parts.append(text)
+    return "\n".join(parts) or None
+
+
 def _message_from(
     payload: Mapping[str, object],
-) -> tuple[Literal["user", "assistant"], str] | None:
-    """Map one rollout record to (role, text), or None if it is not a message.
+) -> tuple[_Role, str, _Source] | None:
+    """Map one rollout record to (role, text, source), or None if not speech.
 
-    ``event_msg`` carries what the user and agent actually said.
+    Only ``event_msg`` payloads carry what the user and agent actually said:
+    the legacy ``user_message``/``agent_message`` events, and since Codex CLI
+    0.149 the ``item_completed`` ``UserMessage``/``AgentMessage`` turn items
+    (0.160.1 rollouts contain no ``user_message`` event at all, #2316).
     ``response_item`` messages are deliberately ignored: their ``user`` role
     also holds injected context blocks (recommended-plugins, permission
     preambles) that were never user speech, and their ``assistant`` text
-    duplicates ``agent_message``. Tool calls, tool output and reasoning are
+    duplicates the agent message. Tool calls, tool output and reasoning are
     excluded here exactly as ``_snapshot_item`` excludes them on the RPC path.
     """
 
     kind = payload.get("type")
-    if kind == "user_message":
-        role: Literal["user", "assistant"] = "user"
-    elif kind == "agent_message":
-        role = "assistant"
-    else:
+    if isinstance(kind, str) and kind in _LEGACY_SPEECH:
+        text = payload.get("message")
+        if not isinstance(text, str) or not (text := text.strip()):
+            return None
+        return _LEGACY_SPEECH[kind], text, "legacy"
+    if kind != "item_completed":
         return None
-    text = payload.get("message")
-    if not isinstance(text, str) or not (text := text.strip()):
+    item = payload.get("item")
+    if not isinstance(item, Mapping):
         return None
-    return role, text
+    item_type = item.get("type")
+    if not isinstance(item_type, str) or item_type not in _ITEM_SPEECH:
+        return None
+    role = _ITEM_SPEECH[item_type]
+    raw_text = item.get("text") if role == "assistant" else None
+    if isinstance(raw_text, str) and raw_text.strip():
+        return role, raw_text.strip(), "item"
+    text = _content_text(item.get("content"))
+    if text is None:
+        return None
+    return role, text, "item"
+
+
+def _speech_candidates(
+    body: bytes,
+) -> tuple[list[tuple[Mapping[str, object], _Role, str]], str | None]:
+    """Parse a tail into file-ordered speech candidates and the newest turn id.
+
+    A rollout can hold both spellings of one utterance (an older CLI that
+    emitted the legacy event beside the turn item, or a 0.160 file that still
+    has a few ``agent_message`` events). Turn items are authoritative; a
+    legacy event is dropped when an as-yet-unmatched turn item of the same
+    role carries the same text, and kept otherwise so legacy-only speech is
+    never lost.
+    """
+
+    last_turn_id: str | None = None
+    parsed: list[tuple[Mapping[str, object], _Role, str, _Source]] = []
+    positions: list[int] = []  # raw record index of each parsed utterance
+    for position, raw_line in enumerate(body.splitlines()):
+        if not raw_line.strip():
+            continue
+        if len(raw_line) > _MAX_LINE_BYTES:
+            raise ValueError("Codex rollout line exceeds its safe bound")
+        try:
+            value = json.loads(raw_line)
+        except (UnicodeError, ValueError):
+            # A rollout is appended to live; a trailing partial record is
+            # expected rather than exceptional.
+            continue
+        if not isinstance(value, Mapping):
+            continue
+        payload = value.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        turn_id = payload.get("turn_id")
+        if isinstance(turn_id, str) and turn_id:
+            last_turn_id = turn_id
+        # ``response_item`` also has an ``agent_message`` variant (inter-agent
+        # traffic with a ``content`` list), so the record type gates speech.
+        message = _message_from(payload) if value.get("type") == "event_msg" else None
+        if message is not None:
+            parsed.append((value, *message))
+            positions.append(position)
+
+    # A legacy event and an item carry the same utterance only when they are
+    # written next to each other in the file (measured in raw records, not in
+    # utterances); matching across the whole file dropped a repeated short
+    # message ("ok") from an earlier turn (#2316 review).
+    keys = [_dedupe_key(role, text) for _value, role, text, _source in parsed]
+    consumed: set[int] = set()
+    dropped: set[int] = set()
+    for index, (_value, _role, _text, source) in enumerate(parsed):
+        if source != "legacy":
+            continue
+        low = bisect_left(positions, positions[index] - _DEDUPE_NEIGHBOURHOOD)
+        high = bisect_right(positions, positions[index] + _DEDUPE_NEIGHBOURHOOD)
+        for other in range(low, high):
+            if (
+                other not in consumed
+                and parsed[other][3] == "item"
+                and keys[other] == keys[index]
+            ):
+                consumed.add(other)
+                dropped.add(index)
+                break
+    candidates = [
+        (value, role, text)
+        for index, (value, role, text, _source) in enumerate(parsed)
+        if index not in dropped
+    ]
+    return candidates, last_turn_id
+
+
+def _dedupe_key(role: _Role, text: str) -> tuple[_Role, str]:
+    # Whitespace-insensitive: a multi-part item joins its parts with newlines.
+    return role, "".join(text.split())
 
 
 def read_codex_rollout_candidates(
@@ -166,44 +303,36 @@ def read_codex_rollout_candidates(
     identically bounded snapshots.
     """
 
-    body = _read_identified_tail(path, session_id, limits)
-    records: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
-    for raw_line in body.splitlines():
-        if not raw_line.strip():
-            continue
-        if len(raw_line) > _MAX_LINE_BYTES:
-            raise ValueError("Codex rollout line exceeds its safe bound")
-        try:
-            value = json.loads(raw_line)
-        except (UnicodeError, ValueError):
-            # A rollout is appended to live; a trailing partial record is
-            # expected rather than exceptional.
-            continue
-        if not isinstance(value, Mapping):
-            continue
-        payload = value.get("payload")
-        records.append((value, payload if isinstance(payload, Mapping) else {}))
-
-    last_turn_id: str | None = None
-    for _value, payload in reversed(records):
-        candidate = payload.get("turn_id")
-        if isinstance(candidate, str) and candidate:
-            last_turn_id = candidate
-            break
+    window = _scan_window(limits)
+    body, partial = _read_identified_tail(path, session_id, window)
+    candidates, last_turn_id = _speech_candidates(body)
+    if (
+        partial
+        and window < _MAX_SCAN_BYTES
+        and not any(role == "user" for _value, role, _text in candidates)
+    ):
+        # An agentic tail can be megabytes of tool output and reasoning with
+        # no user turn in it — only agent progress messages — so the turn
+        # that started the work sits before the window. Widen once to the
+        # hard scan bound, so the work stays bounded by bytes rather than by
+        # record count (#2316 review: a tail with agent speech only dropped
+        # every user turn and still reported the snapshot complete).
+        body, partial = _read_identified_tail(path, session_id, _MAX_SCAN_BYTES)
+        candidates, last_turn_id = _speech_candidates(body)
 
     horizon = captured - timedelta(seconds=limits.max_age_seconds)
     newest: list[TranscriptMessage] = []
-    truncated = False
+    # A tail read that did not reach the start of the file may have left
+    # older speech unread: never present it as the whole conversation.
+    truncated = partial
     items_seen = 0
-    for value, payload in reversed(records):
+    for value, role, text in reversed(candidates):
+        # Only speech counts against max_items (#2316): tool, reasoning and
+        # token_count records used to exhaust the budget before any message.
         if items_seen >= limits.max_items:
             truncated = True
             break
         items_seen += 1
-        message = _message_from(payload)
-        if message is None:
-            continue
-        role, text = message
         timestamp = value.get("timestamp")
         parsed = _parse_time(timestamp)
         if parsed is None or parsed < horizon:

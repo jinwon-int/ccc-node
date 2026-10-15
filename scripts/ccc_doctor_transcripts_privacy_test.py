@@ -29,6 +29,7 @@ from ccc_doctor import Doctor, claude_project_slug  # noqa: E402
 REPO = Path(__file__).resolve().parent.parent
 DIR_ITEM = "claude transcripts dir"
 REFUSAL_ITEM = "distill snapshot refusals"
+EMPTY_ITEM = "distill empty snapshots"
 
 
 class TranscriptsPrivacyCheck(unittest.TestCase):
@@ -48,6 +49,7 @@ class TranscriptsPrivacyCheck(unittest.TestCase):
         with patch.dict("os.environ", self.env, clear=True):
             doctor.check_claude_transcripts_privacy()
             doctor.check_snapshot_refusals()
+            doctor.check_empty_snapshot_successes()
         return doctor
 
     def row(self, doctor: Doctor, item: str):
@@ -248,6 +250,79 @@ class TranscriptsPrivacyCheck(unittest.TestCase):
         self.assertEqual(row.klass, "정상")
         self.assertIn("scanned=2", row.status)
 
+
+    # --- #2316: zero-byte "successes" ----------------------------------------
+
+    @staticmethod
+    def _done(status: str, sizes: list[int] | None, *, byte_count: int | None = None, when: str = "2026-10-11T19:45:00Z") -> dict:
+        job: dict = {"status": status, "error_code": None, "updated_at": when}
+        if sizes is not None:
+            job["extraction_accounting"] = [
+                {"model": "provider-default", "snapshot_bytes": size, "duration_ms": 1, "estimated_max_tokens": 1}
+                for size in sizes
+            ]
+        if byte_count is not None:
+            job["snapshot"] = {"messages": [], "byte_count": byte_count}
+        return job
+
+    def test_no_journals_reports_zero_empty_snapshots(self) -> None:
+        row = self.row(self.run_checks(), EMPTY_ITEM)
+        self.assertEqual(row.klass, "정상")
+        self.assertIn("recent=0 (7d, scanned=0)", row.status)
+
+    def test_zero_byte_successes_warn_per_journal_and_body_free(self) -> None:
+        matrix = self.base / ".ccc-matrix" / "distill-journal"
+        telegram = self.base / ".telegram_bot" / "distill-journal"
+        self._job(matrix, "a", self._done("extraction_done", [0], when="2026-10-11T11:48:00Z"))
+        self._job(matrix, "b", self._done("extraction_done", [0, 0], when="2026-10-11T19:45:00Z"))
+        self._job(telegram, "c", self._done("snapshot_done", None, byte_count=0, when="2026-10-10T04:17:00Z"))
+        # Not empty successes: real bytes, a mixed retry, a failure, an old job.
+        self._job(matrix, "d", self._done("extraction_done", [512]))
+        self._job(matrix, "e", self._done("extraction_done", [0, 512]))
+        self._job(matrix, "f", {**self._done("terminal_failed", [0]), "error_code": "max_attempts_exceeded"})
+        self._job(telegram, "g", self._done("extraction_done", [0]), age_days=8)
+        self._job(telegram, "h", self._done("extraction_done", None, byte_count=2048))
+        doctor = self.run_checks()
+        row = self.row(doctor, EMPTY_ITEM)
+        self.assertEqual(row.klass, "경고")
+        self.assertIn("snapshot_bytes=0 successes=3 in 7d", row.status)
+        self.assertIn("(latest 2026-10-11T19:45, ccc-matrix,telegram_bot)", row.status)
+        self.assertIn("explicit approval", row.action)
+        self.assertNotIn("provider-default", row.status + row.action)
+        # The refusal row is independent and unaffected.
+        self.assertEqual(self.row(doctor, REFUSAL_ITEM).klass, "정상")
+
+    def test_danso_zero_byte_success_is_labelled_danso(self) -> None:
+        self._job(self.base / ".ccc-matrix" / "danso-distill-journal", "a", self._done("extraction_done", [0]))
+        row = self.row(self.run_checks(), EMPTY_ITEM)
+        self.assertIn("successes=1", row.status)
+        self.assertIn(", ccc-matrix/danso)", row.status)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo") and hasattr(signal, "SIGALRM"), "needs mkfifo and SIGALRM")
+    def test_empty_snapshot_scan_skips_fifo_and_symlink_entries(self) -> None:
+        journal = self.base / ".ccc-matrix" / "distill-journal"
+        journal.mkdir(parents=True)
+        outside = self.base / "outside.json"
+        outside.write_text(json.dumps(self._done("extraction_done", [0])))
+        os.mkfifo(journal / "fifo.json")
+        (journal / "link.json").symlink_to(outside)
+        with self.deadline():
+            row = self.row(self.run_checks(), EMPTY_ITEM)
+        self.assertEqual(row.klass, "정상")
+        self.assertIn("recent=0 (7d, scanned=0)", row.status)
+
+    def test_unreadable_journal_is_not_reported_as_zero_empty_snapshots(self) -> None:
+        journal = self.base / ".ccc-matrix" / "distill-journal"
+        self._job(journal, "a", self._done("extraction_done", [0]))
+        journal.chmod(0)
+        try:
+            if os.access(journal, os.R_OK):
+                self.skipTest("running with read access to mode-0 dirs (root)")
+            row = self.row(self.run_checks(), EMPTY_ITEM)
+        finally:
+            journal.chmod(0o700)
+        self.assertEqual(row.klass, "경고")
+        self.assertIn("unreadable=1", row.status)
 
 if __name__ == "__main__":
     unittest.main()
