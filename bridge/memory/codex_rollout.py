@@ -21,7 +21,7 @@ mode of.
 
 from __future__ import annotations
 
-from collections import Counter
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -33,6 +33,7 @@ from .distill_types import TranscriptBounds, TranscriptMessage
 
 _MAX_HEADER_BYTES = 64 * 1024
 _MAX_SCAN_BYTES = 16 * 1024 * 1024
+_DEDUPE_NEIGHBOURHOOD = 8
 _MAX_LINE_BYTES = 4 * 1024 * 1024
 
 
@@ -227,7 +228,8 @@ def _speech_candidates(
 
     last_turn_id: str | None = None
     parsed: list[tuple[Mapping[str, object], _Role, str, _Source]] = []
-    for raw_line in body.splitlines():
+    positions: list[int] = []  # raw record index of each parsed utterance
+    for position, raw_line in enumerate(body.splitlines()):
         if not raw_line.strip():
             continue
         if len(raw_line) > _MAX_LINE_BYTES:
@@ -251,17 +253,34 @@ def _speech_candidates(
         message = _message_from(payload) if value.get("type") == "event_msg" else None
         if message is not None:
             parsed.append((value, *message))
+            positions.append(position)
 
-    unmatched_items = Counter(
-        _dedupe_key(role, text) for _value, role, text, source in parsed if source == "item"
-    )
-    candidates: list[tuple[Mapping[str, object], _Role, str]] = []
-    for value, role, text, source in parsed:
-        key = _dedupe_key(role, text)
-        if source == "legacy" and unmatched_items[key] > 0:
-            unmatched_items[key] -= 1
+    # A legacy event and an item carry the same utterance only when they are
+    # written next to each other in the file (measured in raw records, not in
+    # utterances); matching across the whole file dropped a repeated short
+    # message ("ok") from an earlier turn (#2316 review).
+    keys = [_dedupe_key(role, text) for _value, role, text, _source in parsed]
+    consumed: set[int] = set()
+    dropped: set[int] = set()
+    for index, (_value, _role, _text, source) in enumerate(parsed):
+        if source != "legacy":
             continue
-        candidates.append((value, role, text))
+        low = bisect_left(positions, positions[index] - _DEDUPE_NEIGHBOURHOOD)
+        high = bisect_right(positions, positions[index] + _DEDUPE_NEIGHBOURHOOD)
+        for other in range(low, high):
+            if (
+                other not in consumed
+                and parsed[other][3] == "item"
+                and keys[other] == keys[index]
+            ):
+                consumed.add(other)
+                dropped.add(index)
+                break
+    candidates = [
+        (value, role, text)
+        for index, (value, role, text, _source) in enumerate(parsed)
+        if index not in dropped
+    ]
     return candidates, last_turn_id
 
 
@@ -287,16 +306,25 @@ def read_codex_rollout_candidates(
     window = _scan_window(limits)
     body, partial = _read_identified_tail(path, session_id, window)
     candidates, last_turn_id = _speech_candidates(body)
-    if not candidates and partial and window < _MAX_SCAN_BYTES:
+    if (
+        partial
+        and window < _MAX_SCAN_BYTES
+        and not any(role == "user" for _value, role, _text in candidates)
+    ):
         # An agentic tail can be megabytes of tool output and reasoning with
-        # no speech in it. Widen once to the hard scan bound before giving up,
-        # so the work stays bounded by bytes rather than by record count.
+        # no user turn in it — only agent progress messages — so the turn
+        # that started the work sits before the window. Widen once to the
+        # hard scan bound, so the work stays bounded by bytes rather than by
+        # record count (#2316 review: a tail with agent speech only dropped
+        # every user turn and still reported the snapshot complete).
         body, partial = _read_identified_tail(path, session_id, _MAX_SCAN_BYTES)
         candidates, last_turn_id = _speech_candidates(body)
 
     horizon = captured - timedelta(seconds=limits.max_age_seconds)
     newest: list[TranscriptMessage] = []
-    truncated = False
+    # A tail read that did not reach the start of the file may have left
+    # older speech unread: never present it as the whole conversation.
+    truncated = partial
     items_seen = 0
     for value, role, text in reversed(candidates):
         # Only speech counts against max_items (#2316): tool, reasoning and

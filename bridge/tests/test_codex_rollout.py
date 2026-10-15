@@ -359,3 +359,103 @@ def test_item_budget_counts_speech_only(tmp_path: Path) -> None:
 
     assert [(m.role, m.text) for m in messages] == SPEECH_0160_NEWEST_FIRST[:2]
     assert truncated is True
+
+
+def _bulky_tool_output(when: str, size: int = 512 * 1024) -> str:
+    return json.dumps(
+        {
+            "timestamp": when,
+            "type": "response_item",
+            "payload": {"type": "function_call_output", "call_id": "c", "output": "x" * size},
+        }
+    )
+
+
+def _speech_item(role: str, text: str, minutes_ago: int) -> str:
+    kind, part = ("UserMessage", "text") if role == "user" else ("AgentMessage", "Text")
+    return _line(
+        "event_msg",
+        {
+            "type": "item_completed",
+            "turn_id": "turn-1",
+            "item": {"type": kind, "id": f"{role}-{minutes_ago}", "content": [{"type": part, "text": text}]},
+        },
+        NOW - timedelta(minutes=minutes_ago),
+    )
+
+
+def test_agent_only_tail_widens_to_recover_the_user_turn(tmp_path: Path) -> None:
+    """#2316 review MED: progress messages in the tail must not hide the user turn."""
+
+    path = _write_rollout(
+        tmp_path,
+        "sess-agent-tail",
+        [
+            _speech_item("user", "the request that started the work", 30),
+            *[_bulky_tool_output("2026-08-19T11:40:00Z")] * 4,  # ~2 MiB, past the default window
+            _speech_item("assistant", "progress update", 5),
+            _speech_item("assistant", "final answer", 1),
+        ],
+    )
+
+    messages, _turn, truncated = read_codex_rollout_candidates(
+        path, "sess-agent-tail", limits=TranscriptBounds(), captured=NOW
+    )
+
+    assert [(m.role, m.text) for m in messages] == [
+        ("assistant", "final answer"),
+        ("assistant", "progress update"),
+        ("user", "the request that started the work"),
+    ]
+    assert truncated is False  # the widened read reached the start of the file
+
+
+def test_a_tail_read_that_misses_the_file_start_is_flagged_truncated(tmp_path: Path) -> None:
+    path = _write_rollout(
+        tmp_path,
+        "sess-partial",
+        [
+            _speech_item("user", "older question", 60),
+            *[_bulky_tool_output("2026-08-19T11:10:00Z")] * 4,
+            _speech_item("user", "newer question", 2),
+            _speech_item("assistant", "newer answer", 1),
+        ],
+    )
+
+    messages, _turn, truncated = read_codex_rollout_candidates(
+        path, "sess-partial", limits=TranscriptBounds(), captured=NOW
+    )
+
+    assert [(m.role, m.text) for m in messages] == [
+        ("assistant", "newer answer"),
+        ("user", "newer question"),
+    ]
+    assert truncated is True
+
+
+def test_repeated_short_message_in_another_turn_is_not_deduplicated(tmp_path: Path) -> None:
+    """#2316 review LOW: dedupe pairs neighbouring records only, not the whole file."""
+
+    path = _write_rollout(
+        tmp_path,
+        "sess-repeat",
+        [
+            _line("event_msg", {"type": "user_message", "message": "ok"}, NOW - timedelta(minutes=50)),
+            *[
+                _line("event_msg", {"type": "token_count", "info": None}, NOW - timedelta(minutes=40))
+                for _ in range(20)
+            ],
+            _speech_item("assistant", "between", 20),
+            _speech_item("user", "ok", 3),
+        ],
+    )
+
+    messages, _turn, _truncated = read_codex_rollout_candidates(
+        path, "sess-repeat", limits=TranscriptBounds(), captured=NOW
+    )
+
+    assert [(m.role, m.text) for m in messages] == [
+        ("user", "ok"),
+        ("assistant", "between"),
+        ("user", "ok"),
+    ]
