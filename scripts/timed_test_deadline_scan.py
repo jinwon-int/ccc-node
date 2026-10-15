@@ -39,8 +39,12 @@ judgement against a frozen snapshot; the allowlist is what the cron installer
 wires up, so adding a repository never requires re-running the installer.
 
 Exit codes: 0 clean, 1 findings exist (with ``--exit-nonzero-on-findings``),
-3 not configured. The third one matters — a scheduled scan whose repo list is
-missing or empty must not report a reassuring "0건".
+2 unusable repo list, 3 not configured, 4 partial scan. The third one matters —
+a scheduled scan whose repo list is missing or empty must not report a
+reassuring "0건". So does the fourth: a repo that cannot be read (Issues
+disabled, gh failure, timeout) is skipped and listed under ``repo_errors``
+while every other repo is still scanned, and the run exits 4 even when the
+findings flag would have said 1 (#2324).
 
 Owner notification (``--notify {off,high,low}``, env
 ``CCC_TIMED_TEST_SCAN_NOTIFY``, default off; the cron installer renders
@@ -86,6 +90,13 @@ KST = dt.timezone(dt.timedelta(hours=9))
 # Reserved so a scheduled run can tell "nothing to report" (0) apart from
 # "nobody told me what to scan" (3). --exit-nonzero-on-findings owns 1.
 EXIT_NOT_CONFIGURED = 3
+# At least one repo could not be read (Issues disabled, gh failure, timeout,
+# unparsable output). The remaining repos are still scanned and reported, but
+# the result is known to be incomplete, so this outranks the findings code 1
+# (#2324: a single Issues-disabled repo used to abort the whole run).
+EXIT_PARTIAL_SCAN = 4
+# Failures isolated per repo. Anything else is a scanner bug and should crash.
+REPO_FETCH_ERRORS = (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError)
 
 # Paragraph must mention a timed test before a date in it counts as a deadline.
 #
@@ -1053,16 +1064,35 @@ def _save_notify_state(path: Path, fingerprints: Sequence[str], notified_at: str
     ccc_secure_fs.atomic_write_text(path, json.dumps(state, ensure_ascii=False) + "\n", mode=0o600)
 
 
-def notify_owner(findings: Sequence[Finding], now: dt.datetime, mode: str, level: str) -> str:
+def notify_owner(
+    findings: Sequence[Finding],
+    now: dt.datetime,
+    mode: str,
+    level: str,
+    skipped_repos: Iterable[str] = (),
+) -> str:
     """Spool an owner notice when warranted; return a one-line outcome for the log.
 
     The dedup state is only advanced after the spool file exists, so a failed
     write is retried on the next run instead of being marked as sent.
+
+    On a partial scan, fingerprints already in the state for a repo that could
+    not be read are carried over: an unreadable repo says nothing about whether
+    its findings were resolved, and dropping them would re-announce them as new
+    once the repo is readable again (#2324).
     """
     candidates = notify_candidates(findings, level)
     current = [finding_fingerprint(f) for f in candidates]
     state_path = notify_state_path(mode)
     state = load_notify_state(state_path)
+    skipped = set(skipped_repos)
+    if skipped:
+        seen = set(current)
+        current += [
+            str(fp)
+            for fp in state.get("fingerprints", [])
+            if str(fp).split("#", 1)[0] in skipped and str(fp) not in seen
+        ]
     reason, new = decide_notification(current, state, now)
     if reason is None:
         previous = sorted(str(fp) for fp in state.get("fingerprints", []))
@@ -1130,6 +1160,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else dt.datetime.now(KST).replace(tzinfo=None)
     )
 
+    repo_errors: list[dict[str, str]] = []
     if args.input:
         issues = load_jsonl(args.input)
     else:
@@ -1148,7 +1179,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             repos = list(args.repo or [])
         issues = []
         for repo in repos:
-            issues.extend(fetch_via_gh(repo, args.limit))
+            try:
+                issues.extend(fetch_via_gh(repo, args.limit))
+            except REPO_FETCH_ERRORS as exc:
+                detail = " ".join(str(exc).split())[:400] or type(exc).__name__
+                repo_errors.append({"repo": repo, "error": f"{type(exc).__name__}: {detail}"})
+                print(f"repo skipped (scan continues): {repo}: {type(exc).__name__}: {detail}",
+                      file=sys.stderr)
 
     findings = scan(issues, now, args.mode, args.min_confidence)
 
@@ -1161,10 +1198,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "issue_count": len(issues),
             "finding_count": len(findings),
             "findings": [f.to_dict() for f in findings],
+            "repo_errors": repo_errors,
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(format_report(findings, now, args.mode))
+        if repo_errors:
+            print(f"⚠ 부분 스캔 — 조회 실패 {len(repo_errors)}개 레포는 결과에 없음:")
+            for err in repo_errors:
+                print(f"  - {err['repo']}: {err['error']}")
     sys.stdout.flush()
 
     level = resolve_notify_level(args.notify)
@@ -1172,10 +1214,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Never let the notice mask the scan: whatever happens here, the exit
         # code below still reports what the scan found.
         try:
-            print(notify_owner(findings, now, args.mode, level), file=sys.stderr)
+            skipped = [err["repo"] for err in repo_errors]
+            print(notify_owner(findings, now, args.mode, level, skipped), file=sys.stderr)
         except Exception as exc:  # any failure is non-fatal by contract
             print(f"notify failed (scan result unaffected): {type(exc).__name__}: {exc}", file=sys.stderr)
 
+    if repo_errors:
+        return EXIT_PARTIAL_SCAN
     if findings and args.exit_nonzero_on_findings:
         return 1
     return 0
