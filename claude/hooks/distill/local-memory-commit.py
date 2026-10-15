@@ -180,7 +180,44 @@ def _clean(value: object) -> str:
     )[:1000]
 
 
-def _render_resume(document: Mapping[str, object], max_bytes: int) -> bytes | None:
+# Same first-line header the bridge sink writes and reads back for ordering
+# (bridge/memory/distill_local_sink.py); load-memory.sh drops it at injection.
+_RESUME_HEADER_PREFIX = "<!-- ccc-node:distill "
+_RESUME_HEADER_SUFFIX = " -->"
+
+
+def _capture_header(value: str | None) -> bytes:
+    """Resume header carrying the job's capture time, or b"" without one.
+
+    #2310 L1: a hook resume used to be header-less, so the bridge sink ordered
+    it by file mtime — when extraction finished, not when the CLI session was
+    captured. ``CLAUDE_DISTILL_CAPTURED_AT`` is set by the pending journal from
+    the job's enqueue time (the transcript hash pin), a host-clock time that a
+    replay keeps unchanged; it is rendered as the bridge's fixed-width UTC.
+    Unset or unparseable -> no header (mtime ordering, as before).
+    """
+    if not value or len(value) > 64:
+        return b""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return b""
+        utc = parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return b""
+    stamp = f"{utc.year:04d}" + utc.strftime("-%m-%dT%H:%M:%S.%fZ")
+    return (
+        f"{_RESUME_HEADER_PREFIX}captured_at={stamp} provider=claude"
+        f"{_RESUME_HEADER_SUFFIX}\n"
+    ).encode()
+
+
+def _render_resume(
+    document: Mapping[str, object],
+    max_bytes: int,
+    *,
+    header: bytes = b"",
+) -> bytes | None:
     resume = document.get("resume")
     if not isinstance(resume, dict):
         return None
@@ -201,11 +238,13 @@ def _render_resume(document: Mapping[str, object], max_bytes: int) -> bytes | No
     if not lines:
         return None
     payload = ("\n".join(lines) + "\n").encode()
+    # The header is never truncated; only the body is budgeted (as in the sink).
+    max_bytes -= len(header)
     if len(payload) <= max_bytes:
-        return payload
+        return header + payload
     suffix = "\n… [truncated by CCC resume budget]\n".encode()
     prefix = payload[: max(0, max_bytes - len(suffix))]
-    return prefix.decode("utf-8", errors="ignore").encode() + suffix
+    return header + prefix.decode("utf-8", errors="ignore").encode() + suffix
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -221,6 +260,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if max_facts <= 0 or max_resume < 256:
             raise ValueError("local-memory bounds are invalid")
         transaction_module = _load_transaction_module()
+        header = _capture_header(os.environ.get("CLAUDE_DISTILL_CAPTURED_AT"))
         facts_added = 0
 
         def transform(current: Mapping[str, bytes | None]) -> Mapping[str, bytes | None]:
@@ -236,7 +276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if facts is not None:
                     desired["memory-facts.jsonl"] = facts
             if args.mode in {"both", "resume"}:
-                resume = _render_resume(document, max_resume)
+                resume = _render_resume(document, max_resume, header=header)
                 if resume is not None:
                     desired["resume.md"] = resume
             return desired

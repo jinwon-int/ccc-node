@@ -483,6 +483,17 @@ def _child_environment(record: Mapping[str, Any]) -> dict[str, str]:
         }
     )
     env.pop("CLAUDE_DISTILL_INFLIGHT", None)
+    # #2310 L1: the job's capture time, stamped into the resume.md header so
+    # the bridge sink orders a hook resume by it instead of by file mtime
+    # (= when extraction finished). It is the record's created_at: the moment
+    # the hook hash-pinned the transcript, i.e. the hook's analog of the
+    # bridge's snapshot captured_at. It is written once at enqueue and kept by
+    # dedup and retries, so a pending-drain replay of an old backlog carries
+    # the ORIGINAL capture time, never the replay time. Never inherited.
+    env.pop("CLAUDE_DISTILL_CAPTURED_AT", None)
+    captured = _parse_iso(str(record["created_at"]))
+    if captured is not None:
+        env["CLAUDE_DISTILL_CAPTURED_AT"] = captured.isoformat().replace("+00:00", "Z")
     scoped, audience, scope = _route(record)
     if scoped:
         inherited = (

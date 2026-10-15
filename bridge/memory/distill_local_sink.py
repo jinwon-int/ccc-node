@@ -356,7 +356,8 @@ class CodexLocalMemorySink:
         ``resume_never_regresses`` sink: it is stamped into the resume header
         and an extraction never replaces a current resume whose header
         carries a strictly later capture time, nor a resume without a stamped
-        capture (hook-path CLI resume) whose file mtime is later (#2301 L3).
+        capture whose file mtime is later (#2301 L3). Hook-path CLI resumes
+        carry the hook job's capture time in the same header since #2310.
         """
         if not isinstance(output, DistillExtractionOutput):
             raise ValueError("output must be a validated DistillExtractionOutput")
@@ -407,13 +408,16 @@ class CodexLocalMemorySink:
                         and new_capture is not None
                     ):
                         # #2301 L3: no stamped capture — a hook-path CLI resume
-                        # (header-less) or a pre-#2297 audience header. Its file
-                        # mtime and the bridge capture are both host-clock times
-                        # (never model output), so a replayed backlog older than
-                        # the file must not replace it. The mtime is a proxy and
-                        # leans toward keeping the file: it is when the hook's
-                        # extraction landed (after the CLI session), and a
-                        # transaction rollback/recovery rewrite also bumps it.
+                        # written before #2310 or outside the pending journal
+                        # (header-less), or a pre-#2297 audience header. Its
+                        # file mtime and the bridge capture are both host-clock
+                        # times (never model output), so a replayed backlog
+                        # older than the file must not replace it. The mtime is
+                        # a proxy and leans toward keeping the file: it is when
+                        # the hook's extraction landed (after the CLI session).
+                        # Since #2310 hook resumes carry their capture time and
+                        # a rollback/recovery no longer rewrites an unchanged
+                        # resume, so this fallback only covers legacy files.
                         # The next bridge capture after that write still wins.
                         current_mtime = self._resume_mtime()
                         if current_mtime is not None and current_mtime > new_capture:

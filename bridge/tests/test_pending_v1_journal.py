@@ -269,3 +269,49 @@ def test_successful_run_still_completes_and_leaves_no_dead_letter(
     assert rc == 0
     assert not journal.record_path(job_id).is_file()
     assert not (journal.root / "dead").exists()
+
+
+def test_child_capture_time_is_the_record_enqueue_time_never_inherited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2310 L1: the resume capture time is the job's created_at."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("body", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_DISTILL_CAPTURED_AT", "2099-01-01T00:00:00Z")
+
+    child = pending._child_environment(record(transcript))
+    assert child["CLAUDE_DISTILL_CAPTURED_AT"] == "2026-08-01T00:00:00Z"
+
+    unparseable = dict(record(transcript), created_at="not-a-time")
+    assert "CLAUDE_DISTILL_CAPTURED_AT" not in pending._child_environment(unparseable)
+
+
+def test_replayed_job_keeps_its_original_capture_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2310 L1: a pending-drain replay hands the re-entered distill.sh the
+    capture time recorded at enqueue — not the replay time — even after a
+    failed attempt rewrote the record."""
+    from datetime import datetime, timedelta, timezone
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("body", encoding="utf-8")
+    journal = pending.PendingV1Journal(tmp_path / "queue")
+    journal.initialize()
+    enqueued = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+    enqueued = enqueued.replace("+00:00", "Z")
+    job_id, _ = journal.enqueue(dict(record(transcript), created_at=enqueued))
+    seen = tmp_path / "captured"
+    monkeypatch.setenv("CCC_DISTILL_PENDING_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("CCC_DISTILL_PENDING_MAX_AGE_HOURS", "48")
+    job = str(journal.record_path(job_id))
+
+    failing = _write_script(tmp_path / "fail.sh", "exit 1")
+    assert pending.main(["run", str(journal.root), job, str(failing)]) == 1
+    replay = _write_script(
+        tmp_path / "replay.sh",
+        f'printf %s "$CLAUDE_DISTILL_CAPTURED_AT" > {seen}\nexit {pending.SUCCESS_TOKEN}',
+    )
+    assert pending.main(["run", str(journal.root), job, str(replay)]) == 0
+
+    assert seen.read_text() == enqueued

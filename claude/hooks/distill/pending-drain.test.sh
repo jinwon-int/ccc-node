@@ -173,6 +173,36 @@ wait_for 'grep -q "pending retained reason=pipeline-failed job=$failed_id" "$STA
 ok "failed extraction keeps one retryable pending job" \
   '[ -f "$failed_job" ]'
 
+# --- #2310 L1: a replayed backlog stamps its ORIGINAL capture time ------------
+# Non-dry-run state: the replay below writes resume.md through distill.sh ->
+# local-memory-commit.py. The job's created_at is aged 2h to stand in for an
+# old backlog; the header must carry that time, not the replay time.
+STAMP_STATE="$TMP/state-stamp"
+mkdir -p "$STAMP_STATE"
+TRANSCRIPT_STAMP="$PROJECT/sess-stamp.jsonl"
+make_transcript "$TRANSCRIPT_STAMP" stamp
+printf '%s\n' fail > "$CLAUDE_STUB_MODE_FILE"
+payload sess-stamp "$TRANSCRIPT_STAMP" | \
+  HOME="$TMP/home" CCC_STATE_DIR="$STAMP_STATE" CCC_DISTILL_SCOPE_CWDS="/root/workspace" \
+  CCC_NODE_ISOLATION_PROFILE=external \
+  bash "$DISTILL" sessionend >/dev/null 2>&1
+wait_for '[ "$(find "$STAMP_STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ]'
+stamp_job="$(find "$STAMP_STATE/distill-pending" -maxdepth 1 -type f -name '*.json' | head -1)"
+# shellcheck disable=SC2034  # stamp_id is read via eval inside wait_for()
+stamp_id="$(basename "$stamp_job" .json)"
+wait_for 'grep -q "pending retained reason=pipeline-failed job=$stamp_id" "$STAMP_STATE/distill.log" && [ -e "$stamp_job.lock" ] && flock -n "$stamp_job.lock" true 2>/dev/null'
+old_capture="$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+jq -c --arg c "$old_capture" '.created_at = $c' "$stamp_job" > "$stamp_job.tmp" && mv "$stamp_job.tmp" "$stamp_job"
+printf '%s\n' success > "$CLAUDE_STUB_MODE_FILE"
+HOME="$TMP/home" CCC_STATE_DIR="$STAMP_STATE" \
+  CCC_DISTILL_PENDING_NPROC=3 \
+  CCC_DISTILL_PENDING_LOADAVG_PATH="$TMP/loadavg.cool" \
+  CCC_DISTILL_PENDING_MEMINFO_PATH="$TMP/meminfo.ok" \
+  bash "$DRAIN" >/dev/null 2>&1
+wait_for '[ ! -f "$stamp_job" ] && [ -s "$STAMP_STATE/resume.md" ]' || tail -20 "$STAMP_STATE/distill.log" 2>/dev/null
+ok "replayed job stamps its original capture time into resume.md" \
+  '[ "$(head -1 "$STAMP_STATE/resume.md")" = "<!-- ccc-node:distill captured_at=${old_capture%Z}.000000Z provider=claude -->" ] && [ "$(sed -n 2p "$STAMP_STATE/resume.md")" = "- 마지막 작업: ok" ]'
+
 # setup.sh deploys (and chmods) the whole claude/hooks tree via the shared
 # hook-tree walk (#569) — assert the launcher is in the walk's deployable set.
 ok "setup installs and chmods the recovery launcher" \

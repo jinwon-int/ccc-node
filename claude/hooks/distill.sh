@@ -164,6 +164,8 @@ run_bg_pipeline() {
   # One provider-neutral local-memory transaction owns resume + facts together.
   # It persists owner-only pre-images and a body-free rollback head before
   # returning success; no external sink call runs while its lock is held.
+  # CLAUDE_DISTILL_CAPTURED_AT (the job's enqueue time, set by the pending
+  # journal) is stamped into the resume.md header for ordering (#2310).
   python3 "$HOOKDIR/distill/local-memory-commit.py" --mode both < "$STASH" >> "$LOG" 2>&1 || \
     log "local-memory-commit non-zero"
 
